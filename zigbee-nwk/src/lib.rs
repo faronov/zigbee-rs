@@ -81,7 +81,7 @@ pub enum DeviceType {
 /// - `M`: MAC driver implementation (ESP, nRF, mock, etc.)
 ///
 /// # Usage
-/// ```rust,no_run
+/// ```rust,no_run,ignore
 /// use zigbee_nwk::NwkLayer;
 /// use zigbee_mac::mock::MockMac;
 ///

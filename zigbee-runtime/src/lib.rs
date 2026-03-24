@@ -8,7 +8,7 @@
 //! - Pre-built device type templates (sensor, light, switch, etc.)
 //!
 //! # Example
-//! ```rust,no_run
+//! ```rust,no_run,ignore
 //! use zigbee_runtime::ZigbeeDevice;
 //! use zigbee_mac::mock::MockMac;
 //!

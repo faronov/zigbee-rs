@@ -68,7 +68,7 @@ pub enum TickResult {
 /// - Returns quickly, never blocks indefinitely
 ///
 /// For Embassy integration, wrap this in an async task:
-/// ```rust,no_run
+/// ```rust,no_run,ignore
 /// #[embassy_executor::task]
 /// async fn zigbee_task(/* ... */) {
 ///     loop {

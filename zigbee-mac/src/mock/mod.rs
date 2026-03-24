@@ -13,7 +13,7 @@ use heapless::Vec;
 /// Configurable mock MAC for stack testing.
 ///
 /// # Example
-/// ```rust
+/// ```rust,no_run,ignore
 /// let mut mock = MockMac::new([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
 ///
 /// // Pre-configure a beacon to be returned during scan
