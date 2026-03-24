@@ -59,3 +59,4 @@ cc2652 = [
     # Requires cc13x2_26x2_pac
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
 ]
+serial = []
