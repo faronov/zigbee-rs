@@ -107,6 +107,7 @@ pub struct ZigbeeDevice<M: MacDriver> {
     manufacturer_name: &'static str,
     model_identifier: &'static str,
     sw_build_id: &'static str,
+    date_code: &'static str,
     /// Channel mask for network scanning.
     channel_mask: ChannelMask,
     /// Queued ZCL responses to send in next tick().
@@ -224,6 +225,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// The software build identifier.
     pub fn sw_build_id(&self) -> &str {
         self.sw_build_id
+    }
+
+    /// The date code (Basic cluster attribute).
+    pub fn date_code(&self) -> &str {
+        self.date_code
     }
 
     /// Access the power manager (for sleep decisions).

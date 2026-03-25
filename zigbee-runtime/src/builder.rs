@@ -18,6 +18,7 @@ pub struct DeviceBuilder<M: MacDriver> {
     manufacturer_name: &'static str,
     model_identifier: &'static str,
     sw_build_id: &'static str,
+    date_code: &'static str,
     channel_mask: ChannelMask,
     power_mode: PowerMode,
 }
@@ -31,6 +32,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             manufacturer_name: "zigbee-rs",
             model_identifier: "Generic",
             sw_build_id: "0.1.0",
+            date_code: "",
             channel_mask: ChannelMask::ALL_2_4GHZ,
             power_mode: PowerMode::AlwaysOn,
         }
@@ -57,6 +59,12 @@ impl<M: MacDriver> DeviceBuilder<M> {
     /// Set the software build ID.
     pub fn sw_build(mut self, build: &'static str) -> Self {
         self.sw_build_id = build;
+        self
+    }
+
+    /// Set the date code (Basic cluster attribute, e.g. "20260325").
+    pub fn date_code(mut self, code: &'static str) -> Self {
+        self.date_code = code;
         self
     }
 
@@ -118,6 +126,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             manufacturer_name: self.manufacturer_name,
             model_identifier: self.model_identifier,
             sw_build_id: self.sw_build_id,
+            date_code: self.date_code,
             channel_mask: self.channel_mask,
             pending_responses: heapless::Vec::new(),
         }
