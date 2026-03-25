@@ -74,8 +74,11 @@ pub struct OtaManager<F: FirmwareWriter> {
 impl<F: FirmwareWriter> OtaManager<F> {
     /// Create a new OTA manager.
     pub fn new(writer: F, config: OtaConfig) -> Self {
-        let mut cluster =
-            OtaCluster::new(config.manufacturer_code, config.image_type, config.current_version);
+        let mut cluster = OtaCluster::new(
+            config.manufacturer_code,
+            config.image_type,
+            config.current_version,
+        );
         cluster.set_block_size(config.block_size);
 
         Self {
@@ -187,9 +190,7 @@ impl<F: FirmwareWriter> OtaManager<F> {
                     Ok(()) => {
                         self.need_next_block = true;
                         let progress = self.cluster.progress_percent();
-                        Some(StackEvent::OtaProgress {
-                            percent: progress,
-                        })
+                        Some(StackEvent::OtaProgress { percent: progress })
                     }
                     Err(e) => {
                         log::warn!("[OTA] Write failed at offset {}: {:?}", offset, e);
@@ -205,15 +206,13 @@ impl<F: FirmwareWriter> OtaManager<F> {
                 self.build_and_queue_end_request(&req);
                 None
             }
-            OtaAction::ActivateImage => {
-                match self.writer.activate() {
-                    Ok(()) => Some(StackEvent::OtaComplete),
-                    Err(e) => {
-                        log::warn!("[OTA] Activate failed: {:?}", e);
-                        Some(StackEvent::OtaFailed)
-                    }
+            OtaAction::ActivateImage => match self.writer.activate() {
+                Ok(()) => Some(StackEvent::OtaComplete),
+                Err(e) => {
+                    log::warn!("[OTA] Activate failed: {:?}", e);
+                    Some(StackEvent::OtaFailed)
                 }
-            }
+            },
             OtaAction::Wait(_secs) => None,
             OtaAction::None => None,
         }
@@ -221,12 +220,8 @@ impl<F: FirmwareWriter> OtaManager<F> {
 
     fn build_and_queue_request(&mut self, cmd_id: CommandId, req: &QueryNextImageRequest) {
         let seq = self.next_seq();
-        let mut frame = ZclFrame::new_cluster_specific(
-            seq,
-            cmd_id,
-            ClusterDirection::ClientToServer,
-            false,
-        );
+        let mut frame =
+            ZclFrame::new_cluster_specific(seq, cmd_id, ClusterDirection::ClientToServer, false);
         let mut buf = [0u8; 16];
         let len = req.serialize(&mut buf);
         for &b in &buf[..len] {

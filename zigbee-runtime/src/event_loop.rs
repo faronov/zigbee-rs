@@ -72,14 +72,9 @@ pub enum StackEvent {
     /// Attribute report was sent successfully.
     ReportSent,
     /// OTA: New image available from server.
-    OtaImageAvailable {
-        version: u32,
-        size: u32,
-    },
+    OtaImageAvailable { version: u32, size: u32 },
     /// OTA: Download progress update.
-    OtaProgress {
-        percent: u8,
-    },
+    OtaProgress { percent: u8 },
     /// OTA: Upgrade completed successfully — reboot to apply.
     OtaComplete,
     /// OTA: Upgrade failed.

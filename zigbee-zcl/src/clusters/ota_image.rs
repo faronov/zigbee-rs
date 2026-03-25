@@ -213,7 +213,8 @@ impl OtaImageHeader {
 
     /// The size of the payload data (total - header).
     pub fn payload_size(&self) -> u32 {
-        self.total_image_size.saturating_sub(self.header_length as u32)
+        self.total_image_size
+            .saturating_sub(self.header_length as u32)
     }
 
     /// Get the header string as a UTF-8 str (trimmed of null bytes).

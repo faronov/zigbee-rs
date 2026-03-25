@@ -348,7 +348,10 @@ impl MacDriver for Bl702Mac {
                     if let Some(channel) = zigbee_types::Channel::from_number(ch) {
                         if req.channel_mask.contains(channel) {
                             let energy = self.scan_channel_ed(ch).await;
-                            let _ = energy_list.push(EdValue { channel: ch, energy });
+                            let _ = energy_list.push(EdValue {
+                                channel: ch,
+                                energy,
+                            });
                         }
                     }
                 }

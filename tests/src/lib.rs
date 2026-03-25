@@ -11,6 +11,8 @@ mod mac_tests;
 #[cfg(test)]
 mod nwk_tests;
 #[cfg(test)]
+mod ota_tests;
+#[cfg(test)]
 mod runtime_tests;
 #[cfg(test)]
 mod serial_tests;
@@ -20,5 +22,3 @@ mod types_tests;
 mod zcl_tests;
 #[cfg(test)]
 mod zdo_tests;
-#[cfg(test)]
-mod ota_tests;

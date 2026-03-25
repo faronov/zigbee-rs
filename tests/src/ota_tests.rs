@@ -51,19 +51,13 @@ fn parse_ota_header_minimal() {
 #[test]
 fn parse_ota_header_bad_magic() {
     let data = [0u8; 64];
-    assert_eq!(
-        OtaImageHeader::parse(&data),
-        Err(OtaImageError::BadMagic)
-    );
+    assert_eq!(OtaImageHeader::parse(&data), Err(OtaImageError::BadMagic));
 }
 
 #[test]
 fn parse_ota_header_too_short() {
     let data = [0u8; 10];
-    assert_eq!(
-        OtaImageHeader::parse(&data),
-        Err(OtaImageError::TooShort)
-    );
+    assert_eq!(OtaImageHeader::parse(&data), Err(OtaImageError::TooShort));
 }
 
 #[test]
@@ -141,10 +135,7 @@ fn block_request_serialize() {
     let mut buf = [0u8; 16];
     let len = req.serialize(&mut buf);
     assert_eq!(len, 14);
-    assert_eq!(
-        u32::from_le_bytes([buf[9], buf[10], buf[11], buf[12]]),
-        256
-    );
+    assert_eq!(u32::from_le_bytes([buf[9], buf[10], buf[11], buf[12]]), 256);
     assert_eq!(buf[13], 48);
 }
 
@@ -268,10 +259,7 @@ fn ota_cluster_image_available_starts_download() {
 
     let action = cluster.process_server_command(0x02, &resp);
     match cluster.state() {
-        OtaState::Downloading {
-            offset,
-            total_size,
-        } => {
+        OtaState::Downloading { offset, total_size } => {
             assert_eq!(offset, 0);
             assert_eq!(total_size, 256);
         }
@@ -420,7 +408,12 @@ fn ota_manager_full_download_flow() {
         block[5..9].copy_from_slice(&0x00000002u32.to_le_bytes());
         block[9..13].copy_from_slice(&(offset as u32).to_le_bytes());
         block[13] = 4;
-        block[14..18].copy_from_slice(&[(i * 4 + 1) as u8, (i * 4 + 2) as u8, (i * 4 + 3) as u8, (i * 4 + 4) as u8]);
+        block[14..18].copy_from_slice(&[
+            (i * 4 + 1) as u8,
+            (i * 4 + 2) as u8,
+            (i * 4 + 3) as u8,
+            (i * 4 + 4) as u8,
+        ]);
 
         let event = mgr.handle_incoming(0x05, &block);
         assert!(event.is_some()); // Progress event

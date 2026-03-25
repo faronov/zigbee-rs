@@ -507,13 +507,14 @@ impl OtaCluster {
     /// Handles WaitForData countdown.
     pub fn tick(&mut self, elapsed_secs: u16) -> OtaAction {
         match &mut self.state {
-            OtaState::WaitForData { delay_secs, elapsed } => {
+            OtaState::WaitForData {
+                delay_secs,
+                elapsed,
+            } => {
                 *elapsed += elapsed_secs as u32;
                 if *elapsed >= *delay_secs {
                     // Retry: send another block request
-                    if let OtaState::Downloading { offset, total_size } =
-                        self.state
-                    {
+                    if let OtaState::Downloading { offset, total_size } = self.state {
                         return self.build_block_request(offset, total_size);
                     }
                     // If not downloading, just go idle
@@ -542,9 +543,7 @@ impl OtaCluster {
         let _ = self
             .store
             .set(ATTR_IMAGE_UPGRADE_STATUS, ZclValue::Enum8(STATUS_NORMAL));
-        let _ = self
-            .store
-            .set(ATTR_FILE_OFFSET, ZclValue::U32(0xFFFFFFFF));
+        let _ = self.store.set(ATTR_FILE_OFFSET, ZclValue::U32(0xFFFFFFFF));
     }
 
     /// Mark download as complete and transition to Verifying.
@@ -554,9 +553,10 @@ impl OtaCluster {
             ATTR_IMAGE_UPGRADE_STATUS,
             ZclValue::Enum8(STATUS_DOWNLOAD_COMPLETE),
         );
-        let _ = self
-            .store
-            .set(ATTR_DOWNLOADED_FILE_VERSION, ZclValue::U32(self.target_version));
+        let _ = self.store.set(
+            ATTR_DOWNLOADED_FILE_VERSION,
+            ZclValue::U32(self.target_version),
+        );
     }
 
     /// Mark verification passed, move to WaitingActivate.
@@ -607,7 +607,10 @@ impl OtaCluster {
         };
 
         if resp.status != 0x00 {
-            log::info!("[OTA] No new image available (status=0x{:02X})", resp.status);
+            log::info!(
+                "[OTA] No new image available (status=0x{:02X})",
+                resp.status
+            );
             self.state = OtaState::Idle;
             return OtaAction::None;
         }
@@ -656,9 +659,7 @@ impl OtaCluster {
                     offset: new_offset,
                     total_size: total,
                 };
-                let _ = self
-                    .store
-                    .set(ATTR_FILE_OFFSET, ZclValue::U32(new_offset));
+                let _ = self.store.set(ATTR_FILE_OFFSET, ZclValue::U32(new_offset));
 
                 log::debug!(
                     "[OTA] Block: offset={} size={} progress={}%",
