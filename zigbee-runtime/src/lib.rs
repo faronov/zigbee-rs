@@ -268,7 +268,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// Process an incoming MAC frame through the full stack.
     ///
     /// MAC → NWK → APS → ZDO (endpoint 0) or ZCL (app endpoints).
-    pub fn process_incoming(
+    /// Async because ZDO handling sends responses directly through the stack.
+    pub async fn process_incoming(
         &mut self,
         indication: &McpsDataIndication,
     ) -> Option<event_loop::StackEvent> {
@@ -319,21 +320,26 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         };
 
         if dst_ep == 0x00 {
-            // ZDO endpoint — handle ZDP commands
+            // ZDO endpoint — dispatch to ZDP handler which sends responses
+            // directly through the APS layer.
             log::debug!(
-                "[Runtime] ZDO frame: cluster=0x{:04X} from 0x{:04X}",
+                "[Runtime] ZDO frame: cluster=0x{:04X} from 0x{:04X} len={}",
                 cluster_id,
-                src_addr
-            );
-            // TODO: dispatch to ZDO handler
-            return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
-                endpoint: 0,
-                cluster_id,
-                command_id: 0,
-                seq_number: 0,
-                payload: heapless::Vec::new(),
-            });
+                aps_indication.payload.len(),
+            );
+            match self.bdb.zdo_mut().handle_indication(&aps_indication).await {
+                Ok(()) => log::debug!(
+                    "[Runtime] ZDO handled cluster 0x{:04X} OK",
+                    cluster_id,
+                ),
+                Err(e) => log::warn!(
+                    "[Runtime] ZDO error on cluster 0x{:04X}: {:?}",
+                    cluster_id,
+                    e,
+                ),
+            }
+            return None;
         }
 
         // Application endpoint — parse ZCL frame
