@@ -10,3 +10,5 @@ mod nwk_tests;
 mod runtime_tests;
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod serial_tests;
