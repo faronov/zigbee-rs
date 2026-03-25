@@ -85,6 +85,27 @@ jobs:
           path: |
             examples/nrf52840-sensor/target/thumbv7em-none-eabihf/release/nrf52840-sensor
 
+  build-nrf52833:
+    name: Build nRF52833 sensor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/nrf52833-sensor
+      - name: Build nRF52833 sensor (release)
+        working-directory: examples/nrf52833-sensor
+        run: cargo build --release
+      - name: Upload nRF52833 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: nrf52833-sensor-firmware
+          path: |
+            examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor
+
   build-esp32c6:
     name: Build ESP32-C6 sensor
     runs-on: ubuntu-latest

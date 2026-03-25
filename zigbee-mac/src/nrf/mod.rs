@@ -1,7 +1,7 @@
-//! nRF52840 MAC backend.
+//! nRF MAC backend.
 //!
 //! Implements `MacDriver` using Embassy's ieee802154 radio driver for
-//! Nordic nRF52840/nRF52833. The nRF52840 has a hardware 802.15.4
+//! Nordic nRF52840/nRF52833. Both chips share the same 802.15.4
 //! radio with DMA-driven TX/RX and hardware address filtering.
 //!
 //! # Hardware features used
@@ -12,14 +12,12 @@
 //! - RSSI measurement
 //!
 //! # Dependencies
-//! - `embassy-nrf` with nrf52840 feature
+//! - `embassy-nrf` with nrf52840 or nrf52833 feature
 //! - Embassy async executor
 //!
 //! # Supported boards
-//! - nRF52840-DK (~$40)
-//! - nRF52840-Dongle (~$12)
-//! - Seeed XIAO nRF52840 (~$10)
-//! - Adafruit Feather nRF52840
+//! - nRF52840-DK, nRF52840-Dongle, Seeed XIAO nRF52840
+//! - nRF52833-DK, Thingy:53
 
 use crate::pib::{self, PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
@@ -29,7 +27,12 @@ use zigbee_types::*;
 use embassy_futures::select;
 use embassy_time::Timer;
 
-// Embassy nRF radio types (conditionally compiled)
+// Re-export embassy-nrf from the correct renamed dependency.
+#[cfg(all(feature = "nrf52833", not(feature = "nrf52840")))]
+use embassy_nrf52833 as embassy_nrf;
+#[cfg(feature = "nrf52840")]
+use embassy_nrf52840 as embassy_nrf;
+
 use embassy_nrf::radio::Instance;
 use embassy_nrf::radio::ieee802154::{Packet, Radio};
 

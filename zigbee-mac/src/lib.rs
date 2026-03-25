@@ -31,7 +31,7 @@ pub mod primitives;
 #[cfg(feature = "esp32c6")]
 pub mod esp;
 
-#[cfg(feature = "nrf52840")]
+#[cfg(any(feature = "nrf52840", feature = "nrf52833"))]
 pub mod nrf;
 
 #[cfg(feature = "stm32wb55")]

@@ -18,6 +18,7 @@ members = [
 ]
 exclude = [
     "examples/nrf52840-sensor",
+    "examples/nrf52833-sensor",
     "examples/nrf52840-bridge",
     "examples/esp32c6-sensor",
     "examples/bl702-sensor",

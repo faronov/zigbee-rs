@@ -16,8 +16,12 @@ esp-radio = { version = "0.17.0", features = ["ieee802154", "unstable"], default
 esp-alloc = { version = "0.9.0", optional = true }
 esp-sync = { version = "0.1.0", optional = true }
 
-# ── nRF52840 backend ────────────────────────────────────────
-embassy-nrf = { version = "0.3", features = ["nrf52840"], optional = true }
+# ── nRF backends ─────────────────────────────────────────────
+# Each chip variant needs its own embassy-nrf instance with the
+# correct chip feature flag. We use Cargo renamed deps so both
+# can coexist in Cargo.toml (only one is activated at a time).
+embassy-nrf52840 = { package = "embassy-nrf", version = "0.3", features = ["nrf52840"], optional = true }
+embassy-nrf52833 = { package = "embassy-nrf", version = "0.3", features = ["nrf52833"], optional = true }
 
 # ── BL702 backend ─────────────────────────────────────────────
 # Uses FFI to Bouffalo's lmac154 C library (liblmac154.a).
@@ -51,7 +55,11 @@ esp32c6 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
 ]
 nrf52840 = [
-    "dep:embassy-nrf",
+    "dep:embassy-nrf52840",
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+]
+nrf52833 = [
+    "dep:embassy-nrf52833",
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
 ]
 stm32wb55 = [

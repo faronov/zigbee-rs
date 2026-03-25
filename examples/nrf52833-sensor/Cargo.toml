@@ -1,0 +1,30 @@
+[package]
+name = "nrf52833-sensor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["nrf52833"] }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-zcl = { path = "../../zigbee-zcl" }
+zigbee-runtime = { path = "../../zigbee-runtime" }
+
+# nRF52833 Embassy HAL
+embassy-nrf = { version = "0.3", features = ["nrf52833", "time-driver-rtc1", "gpiote"] }
+embassy-executor = { version = "0.7", features = ["task-arena-size-32768", "arch-cortex-m", "executor-thread"] }
+embassy-time = "0.5"
+embassy-futures = "0.1"
+static_cell = "2"
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+defmt = "0.3"
+defmt-rtt = "0.4"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+embedded-hal = "1.0"
+
+[profile.release]
+opt-level = "s"
+debug = 2
+lto = true
