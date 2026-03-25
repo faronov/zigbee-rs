@@ -450,6 +450,32 @@ impl ZclValue {
     }
 }
 
+impl ZclValue {
+    /// Check if the absolute difference between `self` and `other` exceeds a threshold.
+    /// Used by the reporting engine for reportable_change comparison.
+    /// Returns `true` if |self - other| >= threshold, `false` otherwise.
+    /// For non-numeric types, always returns `true` if values differ.
+    pub fn exceeds_threshold(&self, other: &ZclValue, threshold: &ZclValue) -> bool {
+        match (self, other, threshold) {
+            (ZclValue::U8(a), ZclValue::U8(b), ZclValue::U8(t)) => a.abs_diff(*b) >= *t,
+            (ZclValue::U16(a), ZclValue::U16(b), ZclValue::U16(t)) => a.abs_diff(*b) >= *t,
+            (ZclValue::U32(a), ZclValue::U32(b), ZclValue::U32(t)) => a.abs_diff(*b) >= *t,
+            (ZclValue::U64(a), ZclValue::U64(b), ZclValue::U64(t)) => a.abs_diff(*b) >= *t,
+            (ZclValue::I8(a), ZclValue::I8(b), ZclValue::I8(t)) => {
+                ((*a as i16) - (*b as i16)).unsigned_abs() >= *t as u16
+            }
+            (ZclValue::I16(a), ZclValue::I16(b), ZclValue::I16(t)) => {
+                ((*a as i32) - (*b as i32)).unsigned_abs() >= *t as u32
+            }
+            (ZclValue::I32(a), ZclValue::I32(b), ZclValue::I32(t)) => {
+                ((*a as i64) - (*b as i64)).unsigned_abs() >= *t as u64
+            }
+            // For non-numeric or mismatched types, any difference triggers
+            _ => self != other,
+        }
+    }
+}
+
 /// Convenience free function: serialize a value into `buf`.
 /// Returns the number of bytes written.
 pub fn serialize_value(val: &ZclValue, buf: &mut [u8]) -> usize {

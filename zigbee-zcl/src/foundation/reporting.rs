@@ -313,13 +313,14 @@ impl ReportingEngine {
             // Value changed beyond threshold?
             if state.elapsed >= state.config.min_interval {
                 if let Some(ref last) = state.last_value {
-                    if last != current {
-                        if let Some(ref _change) = state.config.reportable_change {
-                            // Simplified: any change triggers report.
-                            should_report = true;
-                        } else {
+                    if let Some(ref change) = state.config.reportable_change {
+                        // Analog type: check if change exceeds threshold
+                        if current.exceeds_threshold(last, change) {
                             should_report = true;
                         }
+                    } else if last != current {
+                        // Discrete type or no threshold: any change triggers
+                        should_report = true;
                     }
                 } else {
                     // No previous value — first report.
@@ -398,7 +399,11 @@ impl ReportingEngine {
 
             if state.elapsed >= state.config.min_interval {
                 if let Some(ref last) = state.last_value {
-                    if last != current {
+                    if let Some(ref change) = state.config.reportable_change {
+                        if current.exceeds_threshold(last, change) {
+                            should_report = true;
+                        }
+                    } else if last != current {
                         should_report = true;
                     }
                 } else {
