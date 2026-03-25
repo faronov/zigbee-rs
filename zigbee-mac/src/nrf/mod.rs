@@ -100,6 +100,12 @@ impl<'a, T: Instance> NrfMac<'a, T> {
         self.radio.set_channel(channel);
     }
 
+    /// Set radio TX power in dBm. nRF52840 supports -40 to +8 dBm.
+    pub fn set_tx_power(&mut self, dbm: i8) {
+        self.tx_power = dbm;
+        self.radio.set_transmission_power(dbm);
+    }
+
     /// Configure hardware address filtering on the radio.
     fn update_address_filter(&mut self) {
         // nRF52840 radio supports hardware PAN ID and short address filtering
@@ -400,6 +406,7 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             PibAttribute::PhyTransmitPower => {
                 if let PibValue::I8(p) = value {
                     self.tx_power = p;
+                    self.radio.set_transmission_power(p);
                 }
             }
             _ => {}

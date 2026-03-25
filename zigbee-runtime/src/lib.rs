@@ -325,6 +325,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 endpoint: 0,
                 cluster_id,
                 command_id: 0,
+                payload: heapless::Vec::new(),
             });
         }
 
@@ -402,6 +403,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
+                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice()).unwrap_or_default(),
             });
         }
 
@@ -455,6 +457,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
+                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice()).unwrap_or_default(),
             });
         }
 
@@ -478,6 +481,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             endpoint: dst_ep,
             cluster_id,
             command_id: cmd_id,
+            payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice()).unwrap_or_default(),
         })
     }
 

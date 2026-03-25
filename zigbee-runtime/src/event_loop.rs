@@ -64,6 +64,7 @@ pub enum StackEvent {
         endpoint: u8,
         cluster_id: u16,
         command_id: u8,
+        payload: heapless::Vec<u8, 64>,
     },
     /// BDB commissioning completed.
     CommissioningComplete { success: bool },
