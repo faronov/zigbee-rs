@@ -126,7 +126,9 @@ impl AnalogOutputCluster {
 
     /// Set the output value.
     pub fn set_present_value(&mut self, val: f32) {
-        let _ = self.store.set_raw(ATTR_PRESENT_VALUE, ZclValue::Float32(val));
+        let _ = self
+            .store
+            .set_raw(ATTR_PRESENT_VALUE, ZclValue::Float32(val));
     }
 }
 

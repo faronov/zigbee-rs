@@ -63,9 +63,7 @@ impl IlluminanceLevelCluster {
 
     /// Set the level status.
     pub fn set_level_status(&mut self, status: u8) {
-        let _ = self
-            .store
-            .set_raw(ATTR_LEVEL_STATUS, ZclValue::U8(status));
+        let _ = self.store.set_raw(ATTR_LEVEL_STATUS, ZclValue::U8(status));
     }
 }
 
