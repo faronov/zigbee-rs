@@ -117,9 +117,9 @@ impl ReadAttributesResponse {
     }
 }
 
-/// Process a Read Attributes request against an attribute store.
-pub fn process_read<const N: usize>(
-    store: &AttributeStore<N>,
+/// Process a Read Attributes request using a type-erased attribute store.
+pub fn process_read_dyn(
+    store: &dyn crate::clusters::AttributeStoreAccess,
     request: &ReadAttributesRequest,
 ) -> ReadAttributesResponse {
     let mut records = heapless::Vec::new();

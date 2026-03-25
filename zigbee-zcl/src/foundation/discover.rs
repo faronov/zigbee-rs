@@ -69,27 +69,30 @@ impl DiscoverAttributesResponse {
     }
 }
 
-/// Process a discover request against an attribute store.
-pub fn process_discover<const N: usize>(
-    store: &AttributeStore<N>,
+/// Process a discover request using a type-erased attribute store.
+pub fn process_discover_dyn(
+    store: &dyn crate::clusters::AttributeStoreAccess,
     request: &DiscoverAttributesRequest,
 ) -> DiscoverAttributesResponse {
+    let ids = store.all_ids();
     let mut attributes = heapless::Vec::new();
     let max = request.max_results as usize;
     let mut count = 0;
     let mut complete = true;
 
-    for attr in store.iter() {
-        if attr.definition.id.0 >= request.start_id.0 {
+    for id in &ids {
+        if id.0 >= request.start_id.0 {
             if count >= max {
                 complete = false;
                 break;
             }
-            let _ = attributes.push(DiscoverAttributeInfo {
-                id: attr.definition.id,
-                data_type: attr.definition.data_type,
-            });
-            count += 1;
+            if let Some(def) = store.find(*id) {
+                let _ = attributes.push(DiscoverAttributeInfo {
+                    id: *id,
+                    data_type: def.data_type,
+                });
+                count += 1;
+            }
         }
     }
 

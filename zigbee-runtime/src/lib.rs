@@ -331,6 +331,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 endpoint: 0,
                 cluster_id,
                 command_id: 0,
+                seq_number: 0,
                 payload: heapless::Vec::new(),
             });
         }
@@ -409,6 +410,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
+                seq_number: zcl_frame.header.seq_number,
                 payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice()).unwrap_or_default(),
             });
         }
@@ -463,6 +465,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
+                seq_number: zcl_frame.header.seq_number,
                 payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice()).unwrap_or_default(),
             });
         }
@@ -487,6 +490,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             endpoint: dst_ep,
             cluster_id,
             command_id: cmd_id,
+            seq_number: zcl_frame.header.seq_number,
             payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice()).unwrap_or_default(),
         })
     }
@@ -681,6 +685,48 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.send_report(endpoint, cluster_id, &report)
             .await
             .is_ok()
+    }
+
+    // ── ZCL global command response helpers ──────────────────
+
+    /// Queue a ZCL global command response for sending in the next tick.
+    ///
+    /// Used by applications to respond to Read Attributes (0x00→0x01),
+    /// Write Attributes (0x02→0x04), and Discover Attributes (0x0C→0x0D).
+    pub fn queue_global_response(
+        &mut self,
+        dst_addr: u16,
+        dst_endpoint: u8,
+        src_endpoint: u8,
+        cluster_id: u16,
+        seq: u8,
+        response_cmd: u8,
+        payload: &[u8],
+    ) {
+        let mut frame = ZclFrame::new_global(
+            seq,
+            CommandId(response_cmd),
+            ClusterDirection::ServerToClient,
+            true,
+        );
+        for &b in payload {
+            let _ = frame.payload.push(b);
+        }
+
+        let mut zcl_buf = [0u8; 256];
+        if let Ok(len) = frame.serialize(&mut zcl_buf) {
+            let mut data = heapless::Vec::new();
+            for &b in &zcl_buf[..len] {
+                let _ = data.push(b);
+            }
+            let _ = self.pending_responses.push(PendingZclResponse {
+                dst_addr: ShortAddress(dst_addr),
+                dst_endpoint,
+                src_endpoint,
+                cluster_id,
+                zcl_data: data,
+            });
+        }
     }
 
     // ── Layer access (for advanced use) ─────────────────────

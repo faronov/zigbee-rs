@@ -166,11 +166,25 @@ pub fn process_write_undivided<const N: usize>(
     WriteAttributesResponse { records }
 }
 
-/// Process a Write Attributes No Response request (command 0x05).
-///
-/// Same as normal write but no response frame is generated.
-pub fn process_write_no_response<const N: usize>(
-    store: &mut AttributeStore<N>,
+/// Process a Write Attributes request using a type-erased attribute store.
+pub fn process_write_dyn(
+    store: &mut dyn crate::clusters::AttributeStoreMutAccess,
+    request: &WriteAttributesRequest,
+) -> WriteAttributesResponse {
+    let mut records = heapless::Vec::new();
+    for rec in &request.records {
+        let status = match store.set(rec.id, rec.value.clone()) {
+            Ok(()) => ZclStatus::Success,
+            Err(e) => e,
+        };
+        let _ = records.push(WriteAttributeStatusRecord { status, id: rec.id });
+    }
+    WriteAttributesResponse { records }
+}
+
+/// Process a Write Attributes No Response request (command 0x05) using type-erased store.
+pub fn process_write_no_response_dyn(
+    store: &mut dyn crate::clusters::AttributeStoreMutAccess,
     request: &WriteAttributesRequest,
 ) {
     for rec in &request.records {

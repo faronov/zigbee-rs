@@ -64,6 +64,8 @@ pub enum StackEvent {
         endpoint: u8,
         cluster_id: u16,
         command_id: u8,
+        /// ZCL sequence number (needed for response frames).
+        seq_number: u8,
         payload: heapless::Vec<u8, 64>,
     },
     /// BDB commissioning completed.

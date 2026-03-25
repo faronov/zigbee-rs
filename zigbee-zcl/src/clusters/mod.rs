@@ -80,6 +80,10 @@ pub trait AttributeStoreAccess {
     fn find(&self, id: crate::AttributeId) -> Option<&crate::attribute::AttributeDefinition>;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool;
+    /// Return all attribute IDs in the store (for discover attributes).
+    fn all_ids(&self) -> heapless::Vec<crate::AttributeId, 32> {
+        heapless::Vec::new() // default empty, overridden by real stores
+    }
 }
 
 /// Type-erased write access to an attribute store.
@@ -108,6 +112,13 @@ impl<const N: usize> AttributeStoreAccess for AttributeStore<N> {
     }
     fn is_empty(&self) -> bool {
         self.is_empty()
+    }
+    fn all_ids(&self) -> heapless::Vec<crate::AttributeId, 32> {
+        let mut ids = heapless::Vec::new();
+        for attr in self.iter() {
+            let _ = ids.push(attr.definition.id);
+        }
+        ids
     }
 }
 
