@@ -4,8 +4,17 @@
 //! command IDs, and a struct that implements the [`Cluster`] trait.
 
 pub mod alarms;
+pub mod analog_input;
+pub mod analog_output;
+pub mod analog_value;
+pub mod ballast_config;
 pub mod basic;
+pub mod binary_input;
+pub mod binary_output;
+pub mod binary_value;
+pub mod carbon_dioxide;
 pub mod color_control;
+pub mod device_temp_config;
 pub mod diagnostics;
 pub mod door_lock;
 pub mod electrical;
@@ -19,6 +28,7 @@ pub mod ias_wd;
 pub mod ias_zone;
 pub mod identify;
 pub mod illuminance;
+pub mod illuminance_level;
 pub mod level_control;
 pub mod metering;
 pub mod multistate_input;
@@ -27,10 +37,12 @@ pub mod on_off;
 pub mod on_off_switch_config;
 pub mod ota;
 pub mod ota_image;
+pub mod pm25;
 pub mod poll_control;
 pub mod power_config;
 pub mod pressure;
 pub mod scenes;
+pub mod soil_moisture;
 pub mod temperature;
 pub mod thermostat;
 pub mod thermostat_ui;

@@ -18,35 +18,54 @@ pub mod reporting;
 pub struct ClusterId(pub u16);
 
 impl ClusterId {
+    // General
     pub const BASIC: Self = Self(0x0000);
     pub const POWER_CONFIG: Self = Self(0x0001);
-    pub const ON_OFF_SWITCH_CONFIG: Self = Self(0x0007);
+    pub const DEVICE_TEMP_CONFIG: Self = Self(0x0002);
     pub const IDENTIFY: Self = Self(0x0003);
     pub const GROUPS: Self = Self(0x0004);
     pub const SCENES: Self = Self(0x0005);
     pub const ON_OFF: Self = Self(0x0006);
+    pub const ON_OFF_SWITCH_CONFIG: Self = Self(0x0007);
     pub const LEVEL_CONTROL: Self = Self(0x0008);
     pub const ALARMS: Self = Self(0x0009);
     pub const TIME: Self = Self(0x000A);
+    pub const ANALOG_INPUT: Self = Self(0x000C);
+    pub const ANALOG_OUTPUT: Self = Self(0x000D);
+    pub const ANALOG_VALUE: Self = Self(0x000E);
+    pub const BINARY_INPUT: Self = Self(0x000F);
+    pub const BINARY_OUTPUT: Self = Self(0x0010);
+    pub const BINARY_VALUE: Self = Self(0x0011);
     pub const MULTISTATE_INPUT: Self = Self(0x0012);
     pub const OTA_UPGRADE: Self = Self(0x0019);
     pub const POLL_CONTROL: Self = Self(0x0020);
     pub const GREEN_POWER: Self = Self(0x0021);
+    // Closures
     pub const DOOR_LOCK: Self = Self(0x0101);
     pub const WINDOW_COVERING: Self = Self(0x0102);
+    // HVAC
     pub const THERMOSTAT: Self = Self(0x0201);
     pub const FAN_CONTROL: Self = Self(0x0202);
     pub const THERMOSTAT_UI: Self = Self(0x0204);
+    // Lighting
     pub const COLOR_CONTROL: Self = Self(0x0300);
+    pub const BALLAST_CONFIG: Self = Self(0x0301);
+    // Measurement & Sensing
     pub const ILLUMINANCE: Self = Self(0x0400);
-    pub const FLOW_MEASUREMENT: Self = Self(0x0404);
+    pub const ILLUMINANCE_LEVEL_SENSING: Self = Self(0x0401);
     pub const TEMPERATURE: Self = Self(0x0402);
     pub const PRESSURE: Self = Self(0x0403);
+    pub const FLOW_MEASUREMENT: Self = Self(0x0404);
     pub const HUMIDITY: Self = Self(0x0405);
     pub const OCCUPANCY: Self = Self(0x0406);
+    pub const SOIL_MOISTURE: Self = Self(0x0408);
+    pub const CARBON_DIOXIDE: Self = Self(0x040D);
+    pub const PM25_MEASUREMENT: Self = Self(0x042A);
+    // Security
     pub const IAS_ZONE: Self = Self(0x0500);
     pub const IAS_ACE: Self = Self(0x0501);
     pub const IAS_WD: Self = Self(0x0502);
+    // Smart Energy
     pub const METERING: Self = Self(0x0702);
     pub const ELECTRICAL_MEASUREMENT: Self = Self(0x0B04);
     pub const DIAGNOSTICS: Self = Self(0x0B05);
