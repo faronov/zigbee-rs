@@ -239,8 +239,7 @@ impl<T> SyncUnsafeCell<T> {
     }
 }
 
-static RX_BUF: SyncUnsafeCell<[u8; MAX_FRAME_LEN]> =
-    SyncUnsafeCell::new([0u8; MAX_FRAME_LEN]);
+static RX_BUF: SyncUnsafeCell<[u8; MAX_FRAME_LEN]> = SyncUnsafeCell::new([0u8; MAX_FRAME_LEN]);
 static RX_LEN: AtomicU8 = AtomicU8::new(0);
 static RX_CRC_FAIL: AtomicBool = AtomicBool::new(false);
 

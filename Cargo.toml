@@ -16,6 +16,12 @@ members = [
     "examples/mock-sleepy-sensor",
     "tests",
 ]
+exclude = [
+    "examples/nrf52840-sensor",
+    "examples/nrf52840-bridge",
+    "examples/esp32c6-sensor",
+    "examples/bl702-sensor",
+]
 
 [workspace.package]
 edition = "2024"

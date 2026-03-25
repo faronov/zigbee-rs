@@ -22,7 +22,9 @@ embassy-nrf = { version = "0.3", features = ["nrf52840"], optional = true }
 # ── BL702 backend ─────────────────────────────────────────────
 # Uses FFI to Bouffalo's lmac154 C library (liblmac154.a).
 # Firmware must link liblmac154.a from BL IoT SDK.
-bl702-hal = { version = "0.0.3", optional = true }
+# No Rust HAL dependency — bl702-hal pins embedded-hal 1.0.0-alpha.5
+# which conflicts with the modern ecosystem. Clock/GPIO init is done
+# via the C SDK or a future compatible HAL.
 
 # ── STM32WB55 backend ───────────────────────────────────────
 # embassy-stm32 with wpan feature for 802.15.4 coprocessor
@@ -65,7 +67,6 @@ cc2652 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
 ]
 bl702 = [
-    "dep:bl702-hal",
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
 ]
 serial = []

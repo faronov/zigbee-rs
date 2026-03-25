@@ -176,8 +176,7 @@ impl Bl702Mac {
         let mut results = heapless::Vec::new();
 
         // Switch to target channel
-        self.driver
-            .update_config(|cfg| cfg.channel = channel);
+        self.driver.update_config(|cfg| cfg.channel = channel);
 
         // Send beacon request
         let beacon_req = self.beacon_request_frame();
@@ -207,8 +206,7 @@ impl Bl702Mac {
 
     /// Scan a single channel for energy (ED scan).
     async fn scan_channel_ed(&mut self, channel: u8) -> u8 {
-        self.driver
-            .update_config(|cfg| cfg.channel = channel);
+        self.driver.update_config(|cfg| cfg.channel = channel);
 
         match self.driver.energy_detect() {
             Ok((rssi, _busy)) => rssi.wrapping_add(128) as u8, // Convert to unsigned energy level
@@ -256,7 +254,7 @@ impl Bl702Mac {
 
         // Destination addressing mode
         match dst_address {
-            MacAddress::Short(_, _) => fc |= 0x0800,   // Short address
+            MacAddress::Short(_, _) => fc |= 0x0800,    // Short address
             MacAddress::Extended(_, _) => fc |= 0x0C00, // Extended address
         }
 
@@ -360,8 +358,7 @@ impl MacDriver for Bl702Mac {
         req: MlmeAssociateRequest,
     ) -> Result<MlmeAssociateConfirm, MacError> {
         // Switch to coordinator's channel
-        self.driver
-            .update_config(|cfg| cfg.channel = req.channel);
+        self.driver.update_config(|cfg| cfg.channel = req.channel);
 
         // Build and send association request
         let frame = self.association_request_frame(&req.coord_address, &req.capability_info);
@@ -415,10 +412,7 @@ impl MacDriver for Bl702Mac {
         Err(MacError::Unsupported)
     }
 
-    async fn mlme_disassociate(
-        &mut self,
-        _req: MlmeDisassociateRequest,
-    ) -> Result<(), MacError> {
+    async fn mlme_disassociate(&mut self, _req: MlmeDisassociateRequest) -> Result<(), MacError> {
         // TODO: Build and send Disassociation Notification MAC command.
         //
         // Steps:
