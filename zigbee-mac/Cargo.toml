@@ -54,6 +54,12 @@ esp32c6 = [
     "esp-radio/esp32c6", "esp-hal/esp32c6", "esp-alloc/esp32c6", "esp-sync/esp32c6",
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
 ]
+esp32h2 = [
+    "alloc",
+    "dep:esp-radio", "dep:esp-hal", "dep:esp-alloc", "dep:esp-sync",
+    "esp-radio/esp32h2", "esp-hal/esp32h2", "esp-alloc/esp32h2", "esp-sync/esp32h2",
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+]
 nrf52840 = [
     "dep:embassy-nrf52840",
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",

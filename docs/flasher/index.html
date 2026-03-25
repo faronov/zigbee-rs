@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zigbee-RS ESP Web Flasher</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --red: #f85149;
+      --orange: #d29922;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+    h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
+    .subtitle { color: var(--muted); margin-bottom: 2rem; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 2rem;
+      max-width: 520px;
+      width: 100%;
+    }
+    .card h2 { font-size: 1.1rem; margin-bottom: 1rem; }
+    .step {
+      display: flex;
+      align-items: flex-start;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    .step-num {
+      background: var(--accent);
+      color: var(--bg);
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 0.85rem;
+      flex-shrink: 0;
+    }
+    .step-content { flex: 1; }
+    .step-content label { display: block; font-weight: 600; margin-bottom: 0.4rem; }
+    .step-content p { color: var(--muted); font-size: 0.85rem; line-height: 1.4; }
+    select, input[type="file"] {
+      width: 100%;
+      padding: 0.6rem 0.8rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 0.9rem;
+      margin-top: 0.4rem;
+    }
+    select:focus, input[type="file"]:focus { outline: 2px solid var(--accent); }
+    button {
+      padding: 0.7rem 1.5rem;
+      border: none;
+      border-radius: 6px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.2s;
+      width: 100%;
+    }
+    button:hover { opacity: 0.85; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-connect {
+      background: var(--accent);
+      color: var(--bg);
+      margin-bottom: 0.8rem;
+    }
+    .btn-flash {
+      background: var(--green);
+      color: var(--bg);
+    }
+    .btn-disconnect {
+      background: var(--border);
+      color: var(--text);
+      margin-bottom: 0.8rem;
+    }
+    #log {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1rem;
+      margin-top: 1.5rem;
+      max-height: 300px;
+      overflow-y: auto;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.8rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .log-info { color: var(--accent); }
+    .log-ok { color: var(--green); }
+    .log-err { color: var(--red); }
+    .log-warn { color: var(--orange); }
+    .progress-bar {
+      width: 100%;
+      height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      margin-top: 0.8rem;
+      overflow: hidden;
+      display: none;
+    }
+    .progress-fill {
+      height: 100%;
+      background: var(--green);
+      border-radius: 3px;
+      width: 0%;
+      transition: width 0.3s;
+    }
+    .chip-info {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.8rem;
+      margin-bottom: 1rem;
+      display: none;
+    }
+    .chip-info span { color: var(--green); font-weight: 600; }
+    .warning {
+      background: rgba(210, 153, 34, 0.1);
+      border: 1px solid var(--orange);
+      border-radius: 6px;
+      padding: 0.8rem;
+      font-size: 0.85rem;
+      color: var(--orange);
+      margin-top: 1.5rem;
+      line-height: 1.4;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .footer { margin-top: 2rem; color: var(--muted); font-size: 0.8rem; }
+    .unsupported {
+      text-align: center;
+      padding: 3rem;
+      color: var(--red);
+    }
+  </style>
+</head>
+<body>
+  <h1>⚡ Zigbee-RS ESP Web Flasher</h1>
+  <p class="subtitle">Flash Zigbee firmware to ESP32-C6 / ESP32-H2 from your browser</p>
+
+  <div class="card" id="main-card">
+    <div id="unsupported" class="unsupported" style="display:none">
+      <h2>Browser Not Supported</h2>
+      <p style="margin-top:1rem; color:var(--muted)">
+        Web Serial API is required. Please use <strong>Chrome 89+</strong> or <strong>Edge 89+</strong> on desktop.
+      </p>
+    </div>
+
+    <div id="app">
+      <div class="chip-info" id="chip-info">
+        Connected: <span id="chip-name">—</span>
+      </div>
+
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-content">
+          <label for="offset">Flash address</label>
+          <select id="offset">
+            <option value="0x0" selected>0x0 — Direct boot / merged image</option>
+            <option value="0x10000">0x10000 — App partition (with bootloader)</option>
+          </select>
+          <p>Use 0x0 for firmware built with <code>esp-hal</code> direct boot</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-content">
+          <label for="firmware">Select firmware (.bin)</label>
+          <input type="file" id="firmware" accept=".bin">
+          <p>Download .bin from <a href="https://github.com/faronov/zigbee-rs/actions" target="_blank">CI artifacts</a> or build locally</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-content">
+          <label>Connect &amp; Flash</label>
+          <button class="btn-connect" id="btn-connect">🔌 Connect to ESP device</button>
+          <button class="btn-disconnect" id="btn-disconnect" style="display:none">Disconnect</button>
+          <button class="btn-flash" id="btn-flash" disabled>⚡ Flash firmware</button>
+          <div class="progress-bar" id="progress-bar">
+            <div class="progress-fill" id="progress-fill"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="log"></div>
+
+      <div class="warning">
+        ⚠️ Hold the <strong>BOOT</strong> button on your ESP board while clicking Connect
+        if the device doesn't enter download mode automatically.
+      </div>
+    </div>
+  </div>
+
+  <p class="footer">
+    <a href="https://github.com/faronov/zigbee-rs" target="_blank">zigbee-rs</a> •
+    Powered by <a href="https://github.com/nicholasgasior/esptool-js" target="_blank">esptool-js</a> •
+    Requires Chrome/Edge 89+
+  </p>
+
+  <script type="module">
+    // esptool-js ESM import from CDN
+    import { ESPLoader, Transport } from 'https://unpkg.com/esptool-js@0.5.0/bundle.js';
+
+    const logEl = document.getElementById('log');
+    const btnConnect = document.getElementById('btn-connect');
+    const btnDisconnect = document.getElementById('btn-disconnect');
+    const btnFlash = document.getElementById('btn-flash');
+    const fileInput = document.getElementById('firmware');
+    const offsetSelect = document.getElementById('offset');
+    const chipInfoEl = document.getElementById('chip-info');
+    const chipNameEl = document.getElementById('chip-name');
+    const progressBar = document.getElementById('progress-bar');
+    const progressFill = document.getElementById('progress-fill');
+
+    let transport = null;
+    let esploader = null;
+    let connected = false;
+
+    // Check Web Serial support
+    if (!('serial' in navigator)) {
+      document.getElementById('app').style.display = 'none';
+      document.getElementById('unsupported').style.display = 'block';
+    }
+
+    function log(msg, cls = 'log-info') {
+      const line = document.createElement('div');
+      line.className = cls;
+      line.textContent = msg;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function updateButtons() {
+      btnConnect.style.display = connected ? 'none' : 'block';
+      btnDisconnect.style.display = connected ? 'block' : 'none';
+      btnFlash.disabled = !connected || !fileInput.files.length;
+    }
+
+    fileInput.addEventListener('change', updateButtons);
+
+    btnConnect.addEventListener('click', async () => {
+      try {
+        log('Requesting serial port…');
+        const port = await navigator.serial.requestPort();
+        transport = new Transport(port, true);
+        esploader = new ESPLoader({
+          transport,
+          baudrate: 115200,
+          romBaudrate: 115200,
+        });
+
+        log('Connecting to ESP ROM bootloader…');
+        const chip = await esploader.main();
+        log(`✓ Connected: ${chip}`, 'log-ok');
+
+        chipNameEl.textContent = chip;
+        chipInfoEl.style.display = 'block';
+        connected = true;
+        updateButtons();
+
+        // Try to increase baudrate for faster flashing
+        try {
+          await esploader.changeBaud(921600);
+          log('Baudrate increased to 921600', 'log-info');
+        } catch {
+          log('Using default baudrate 115200', 'log-warn');
+        }
+      } catch (e) {
+        log(`✗ Connection failed: ${e.message}`, 'log-err');
+      }
+    });
+
+    btnDisconnect.addEventListener('click', async () => {
+      try {
+        await transport.disconnect();
+      } catch { /* ignore */ }
+      connected = false;
+      chipInfoEl.style.display = 'none';
+      progressBar.style.display = 'none';
+      updateButtons();
+      log('Disconnected', 'log-info');
+    });
+
+    btnFlash.addEventListener('click', async () => {
+      if (!esploader || !fileInput.files.length) return;
+
+      const file = fileInput.files[0];
+      const offset = parseInt(offsetSelect.value, 16);
+
+      log(`Reading ${file.name} (${(file.size / 1024).toFixed(1)} KB)…`);
+      const data = await file.arrayBuffer();
+      const binaryStr = Array.from(new Uint8Array(data))
+        .map(b => String.fromCharCode(b))
+        .join('');
+
+      progressBar.style.display = 'block';
+      progressFill.style.width = '0%';
+      btnFlash.disabled = true;
+
+      try {
+        log(`Erasing flash at 0x${offset.toString(16)}…`);
+
+        await esploader.writeFlash({
+          fileArray: [{ data: binaryStr, address: offset }],
+          flashSize: 'keep',
+          flashMode: 'keep',
+          flashFreq: 'keep',
+          eraseAll: false,
+          compress: true,
+          reportProgress: (fileIndex, written, total) => {
+            const pct = Math.round((written / total) * 100);
+            progressFill.style.width = pct + '%';
+            if (pct % 25 === 0) {
+              log(`  ${pct}% (${(written / 1024).toFixed(0)} / ${(total / 1024).toFixed(0)} KB)`);
+            }
+          },
+        });
+
+        progressFill.style.width = '100%';
+        log('✓ Flash complete!', 'log-ok');
+        log('Resetting device…');
+
+        try {
+          await esploader.hardReset();
+          log('✓ Device reset — firmware running', 'log-ok');
+        } catch {
+          log('Manual reset may be needed (press RST button)', 'log-warn');
+        }
+      } catch (e) {
+        log(`✗ Flash failed: ${e.message}`, 'log-err');
+        progressFill.style.width = '0%';
+      } finally {
+        btnFlash.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

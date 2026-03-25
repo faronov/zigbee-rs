@@ -148,3 +148,30 @@ jobs:
           name: esp32c6-sensor-firmware
           path: |
             examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/release/esp32c6-sensor.bin
+
+  build-esp32h2:
+    name: Build ESP32-H2 sensor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: riscv32imac-unknown-none-elf
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/esp32h2-sensor
+      - name: Build ESP32-H2 sensor (release)
+        working-directory: examples/esp32h2-sensor
+        run: cargo build --release -Z build-std=core,alloc
+      - name: Create firmware artifacts
+        run: |
+          ELF=examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor
+          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          $OBJCOPY -O binary $ELF ${ELF}.bin
+      - name: Upload ESP32-H2 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32h2-sensor-firmware
+          path: |
+            examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.bin

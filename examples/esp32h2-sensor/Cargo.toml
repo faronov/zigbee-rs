@@ -1,0 +1,24 @@
+[package]
+name = "esp32h2-sensor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["esp32h2"] }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-zcl = { path = "../../zigbee-zcl" }
+zigbee-runtime = { path = "../../zigbee-runtime" }
+
+# ESP32-H2 HAL and runtime — versions aligned with zigbee-mac
+esp-hal = { version = "1.0.0", features = ["esp32h2", "unstable"] }
+esp-radio = { version = "0.17.0", features = ["esp32h2", "ieee802154", "unstable"] }
+esp-backtrace = { version = "0.14", features = ["esp32h2", "panic-handler", "println"] }
+esp-println = { version = "0.12", features = ["esp32h2"] }
+static_cell = "2"
+embedded-hal = "1.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
