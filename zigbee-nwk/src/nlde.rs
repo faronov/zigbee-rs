@@ -73,15 +73,51 @@ impl<M: MacDriver> NwkLayer<M> {
         let mut nwk_buf = [0u8; 128];
         let hdr_len = header.serialize(&mut nwk_buf);
 
-        // Copy payload
-        if hdr_len + payload.len() > nwk_buf.len() {
-            return Err(NwkStatus::FrameTooLong);
-        }
-        nwk_buf[hdr_len..hdr_len + payload.len()].copy_from_slice(payload);
-        let total_len = hdr_len + payload.len();
+        let total_len;
+        if security_enable && self.nib.security_enabled {
+            // Build NWK security auxiliary header
+            let sec_hdr = crate::security::NwkSecurityHeader {
+                security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
+                frame_counter: self.nib.next_frame_counter(),
+                source_address: self.nib.ieee_address,
+                key_seq_number: self.nib.active_key_seq_number,
+            };
 
-        // TODO: If security_enable, encrypt with NWK key here
-        // let encrypted = self.security.encrypt(...);
+            // Serialize security header right after NWK header
+            let sec_hdr_len = sec_hdr.serialize(&mut nwk_buf[hdr_len..]);
+
+            // Build authenticated data (a = NWK header || security aux header)
+            let aad_len = hdr_len + sec_hdr_len;
+
+            // Encrypt payload with NWK key
+            if let Some(key_entry) = self.security.active_key() {
+                if let Some(encrypted) =
+                    self.security
+                        .encrypt(&nwk_buf[..aad_len], payload, &key_entry.key, &sec_hdr)
+                {
+                    // Append encrypted payload + MIC after security header
+                    if aad_len + encrypted.len() > nwk_buf.len() {
+                        return Err(NwkStatus::FrameTooLong);
+                    }
+                    nwk_buf[aad_len..aad_len + encrypted.len()]
+                        .copy_from_slice(&encrypted);
+                    total_len = aad_len + encrypted.len();
+                } else {
+                    log::warn!("[NWK] Encryption failed");
+                    return Err(NwkStatus::InvalidRequest);
+                }
+            } else {
+                log::warn!("[NWK] No active network key for encryption");
+                return Err(NwkStatus::InvalidRequest);
+            }
+        } else {
+            // No security — copy plaintext payload directly
+            if hdr_len + payload.len() > nwk_buf.len() {
+                return Err(NwkStatus::FrameTooLong);
+            }
+            nwk_buf[hdr_len..hdr_len + payload.len()].copy_from_slice(payload);
+            total_len = hdr_len + payload.len();
+        }
 
         // Determine MAC-level next hop
         let next_hop = self.resolve_next_hop(dst_addr)?;
@@ -120,8 +156,6 @@ impl<M: MacDriver> NwkLayer<M> {
         // Parse NWK header
         let (header, consumed) = NwkHeader::parse(mac_payload)?;
 
-        // TODO: decrypt if security bit is set
-
         let dst = header.dst_addr;
         let src = header.src_addr;
         let is_for_us = dst == self.nib.network_address
@@ -129,14 +163,54 @@ impl<M: MacDriver> NwkLayer<M> {
             || dst == ShortAddress(0xFFFF);
 
         if is_for_us {
-            // Deliver to upper layer
+            if header.frame_control.security {
+                // Parse NWK security auxiliary header
+                let after_header = &mac_payload[consumed..];
+                let (sec_hdr, sec_consumed) =
+                    crate::security::NwkSecurityHeader::parse(after_header)?;
+
+                // Look up key
+                let key = self.security.key_by_seq(sec_hdr.key_seq_number)?.key;
+
+                // Replay protection
+                if !self.security.check_frame_counter(
+                    &sec_hdr.source_address,
+                    sec_hdr.frame_counter,
+                ) {
+                    log::warn!("[NWK] Frame counter replay");
+                    return None;
+                }
+
+                // Decrypt
+                let aad_len = consumed + sec_consumed;
+                let plaintext = self.security.decrypt(
+                    &mac_payload[..aad_len],
+                    &after_header[sec_consumed..],
+                    &key,
+                    &sec_hdr,
+                )?;
+
+                // Return decrypted indication
+                // Note: we can't return a slice into the decrypted Vec directly
+                // since it's a local. For now, log and return None — the runtime
+                // path handles decryption with its own owned buffer.
+                log::debug!(
+                    "[NWK] Decrypted frame from 0x{:04X} ({} bytes)",
+                    src.0,
+                    plaintext.len()
+                );
+                // TODO: return decrypted payload once we refactor to owned buffer
+                return None;
+            }
+
+            // Unsecured frame — deliver directly
             let payload = &mac_payload[consumed..];
             return Some(NldeDataIndication {
                 dst_addr: dst,
                 src_addr: src,
                 payload,
                 lqi,
-                security_use: header.frame_control.security,
+                security_use: false,
             });
         }
 

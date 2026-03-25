@@ -147,4 +147,14 @@ impl<M: MacDriver> NwkLayer<M> {
     pub fn mac_mut(&mut self) -> &mut M {
         &mut self.mac
     }
+
+    /// Get reference to the NWK security context.
+    pub fn security(&self) -> &security::NwkSecurity {
+        &self.security
+    }
+
+    /// Get mutable reference to the NWK security context.
+    pub fn security_mut(&mut self) -> &mut security::NwkSecurity {
+        &mut self.security
+    }
 }

@@ -391,10 +391,45 @@ impl<M: MacDriver> NwkLayer<M> {
         };
 
         let hdr_len = header.serialize(&mut nwk_frame_buf);
-        // Rejoin Request command: command_id(1) + capability_info(1)
-        nwk_frame_buf[hdr_len] = 0x06; // Rejoin Request
-        nwk_frame_buf[hdr_len + 1] = cap_byte.to_byte();
-        let total_len = hdr_len + 2;
+
+        // Rejoin Request command payload: command_id(1) + capability_info(1)
+        let cmd_payload = [0x06u8, cap_byte.to_byte()];
+        let total_len;
+
+        if self.nib.security_enabled {
+            // Encrypt rejoin request with network key
+            let sec_hdr = crate::security::NwkSecurityHeader {
+                security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
+                frame_counter: self.nib.next_frame_counter(),
+                source_address: self.nib.ieee_address,
+                key_seq_number: self.nib.active_key_seq_number,
+            };
+            let sec_hdr_len = sec_hdr.serialize(&mut nwk_frame_buf[hdr_len..]);
+            let aad_len = hdr_len + sec_hdr_len;
+
+            if let Some(key_entry) = self.security.active_key() {
+                if let Some(encrypted) = self.security.encrypt(
+                    &nwk_frame_buf[..aad_len],
+                    &cmd_payload,
+                    &key_entry.key,
+                    &sec_hdr,
+                ) {
+                    if aad_len + encrypted.len() > nwk_frame_buf.len() {
+                        return Err(NwkStatus::FrameTooLong);
+                    }
+                    nwk_frame_buf[aad_len..aad_len + encrypted.len()]
+                        .copy_from_slice(&encrypted);
+                    total_len = aad_len + encrypted.len();
+                } else {
+                    return Err(NwkStatus::InvalidRequest);
+                }
+            } else {
+                return Err(NwkStatus::InvalidRequest);
+            }
+        } else {
+            nwk_frame_buf[hdr_len..hdr_len + 2].copy_from_slice(&cmd_payload);
+            total_len = hdr_len + 2;
+        }
 
         // Send via MAC
         let _ = self

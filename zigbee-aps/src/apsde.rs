@@ -264,7 +264,7 @@ impl<M: MacDriver> ApsLayer<M> {
     /// Parses the APS header from the NWK payload and returns an
     /// `ApsdeDataIndication` for the upper layer.
     pub fn process_incoming_aps_frame<'a>(
-        &self,
+        &mut self,
         nwk_payload: &'a [u8],
         nwk_src: ShortAddress,
         nwk_dst: ShortAddress,
@@ -283,8 +283,31 @@ impl<M: MacDriver> ApsLayer<M> {
                 return None;
             }
             ApsFrameType::Command => {
-                // TODO: process APS command (key transport, etc.)
-                log::debug!("APS command received");
+                // APS command frame — parse command ID and handle key management
+                let cmd_payload = &nwk_payload[consumed..];
+                if cmd_payload.is_empty() {
+                    log::warn!("APS command frame with empty payload");
+                    return None;
+                }
+                let cmd_id = cmd_payload[0];
+                let cmd_data = &cmd_payload[1..];
+                match crate::frames::ApsCommandId::from_u8(cmd_id) {
+                    Some(crate::frames::ApsCommandId::TransportKey) => {
+                        self.handle_transport_key(cmd_data, nwk_src);
+                    }
+                    Some(crate::frames::ApsCommandId::VerifyKey) => {
+                        log::debug!("APS Verify-Key from 0x{:04X}", nwk_src.0);
+                    }
+                    Some(crate::frames::ApsCommandId::ConfirmKey) => {
+                        log::debug!("APS Confirm-Key from 0x{:04X}", nwk_src.0);
+                    }
+                    Some(other) => {
+                        log::debug!("APS command {:?} from 0x{:04X}", other, nwk_src.0);
+                    }
+                    None => {
+                        log::debug!("Unknown APS command 0x{:02X}", cmd_id);
+                    }
+                }
                 return None;
             }
             ApsFrameType::InterPan => {
@@ -328,5 +351,67 @@ impl<M: MacDriver> ApsLayer<M> {
             security_status: header.frame_control.security || nwk_security,
             lqi,
         })
+    }
+
+    /// Handle an incoming APS Transport-Key command.
+    ///
+    /// Parses the key data and installs it into the appropriate security
+    /// context (NWK key → NwkSecurity, link key → APS security table).
+    fn handle_transport_key(&mut self, data: &[u8], src: ShortAddress) {
+        // Transport-Key payload: key_type(1) + key(16) + ...
+        // For Network Key: key_type(1) + key(16) + key_seq(1) + dst_addr(8) + src_addr(8)
+        // Minimum: 1 + 16 = 17 bytes
+        if data.len() < 17 {
+            log::warn!("[APS] Transport-Key too short ({} bytes)", data.len());
+            return;
+        }
+
+        let key_type = data[0];
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&data[1..17]);
+
+        match key_type {
+            0x01 => {
+                // Standard Network Key
+                let key_seq = if data.len() > 17 { data[17] } else { 0 };
+                log::info!(
+                    "[APS] Transport-Key: Network Key (seq={}) from 0x{:04X}",
+                    key_seq,
+                    src.0,
+                );
+                // Install into NWK security
+                self.nwk_mut().security_mut().set_network_key(key, key_seq);
+                self.nwk_mut().nib_mut().active_key_seq_number = key_seq;
+                log::info!("[APS] Network key installed");
+            }
+            0x03 => {
+                // Trust Center Link Key
+                log::info!(
+                    "[APS] Transport-Key: TC Link Key from 0x{:04X}",
+                    src.0,
+                );
+                let entry = crate::security::ApsLinkKeyEntry {
+                    partner_address: [0u8; 8], // TC address
+                    key,
+                    key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+                    outgoing_frame_counter: 0,
+                    incoming_frame_counter: 0,
+                };
+                let _ = self.security_mut().add_key(entry);
+            }
+            0x04 => {
+                // Application Link Key
+                log::info!(
+                    "[APS] Transport-Key: App Link Key from 0x{:04X}",
+                    src.0,
+                );
+            }
+            _ => {
+                log::debug!(
+                    "[APS] Transport-Key: unknown key_type=0x{:02X}",
+                    key_type,
+                );
+            }
+        }
     }
 }

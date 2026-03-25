@@ -275,7 +275,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     ) -> Option<event_loop::StackEvent> {
         let mac_payload = indication.payload.as_slice();
 
-        // NWK layer: parse NWK header, check if frame is for us
+        // NWK layer: parse NWK header, check if frame is for us, decrypt if secured
         let nwk_indication = {
             let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
             let (header, consumed) = zigbee_nwk::frames::NwkHeader::parse(mac_payload)?;
@@ -292,17 +292,75 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 return None;
             }
 
-            let payload = &mac_payload[consumed..];
+            let after_header = &mac_payload[consumed..];
             let mut buf = [0u8; 128];
-            let len = payload.len().min(128);
-            buf[..len].copy_from_slice(&payload[..len]);
+            let len;
+
+            if header.frame_control.security {
+                // Parse NWK security auxiliary header
+                let (sec_hdr, sec_consumed) =
+                    match zigbee_nwk::security::NwkSecurityHeader::parse(after_header) {
+                        Some(v) => v,
+                        None => {
+                            log::warn!("[NWK] Failed to parse security header");
+                            return None;
+                        }
+                    };
+
+                // Look up decryption key by sequence number
+                let key = match nwk.security().key_by_seq(sec_hdr.key_seq_number) {
+                    Some(k) => k.key,
+                    None => {
+                        log::warn!(
+                            "[NWK] No key for seq {}",
+                            sec_hdr.key_seq_number
+                        );
+                        return None;
+                    }
+                };
+
+                // Replay protection
+                if !nwk.security_mut().check_frame_counter(
+                    &sec_hdr.source_address,
+                    sec_hdr.frame_counter,
+                ) {
+                    log::warn!("[NWK] Frame counter replay detected");
+                    return None;
+                }
+
+                // Build authenticated data (a = NWK header || security aux header)
+                let aad_len = consumed + sec_consumed;
+                let ciphertext_and_mic = &after_header[sec_consumed..];
+
+                // Decrypt
+                match nwk.security().decrypt(
+                    &mac_payload[..aad_len],
+                    ciphertext_and_mic,
+                    &key,
+                    &sec_hdr,
+                ) {
+                    Some(plaintext) => {
+                        len = plaintext.len().min(128);
+                        buf[..len].copy_from_slice(&plaintext[..len]);
+                    }
+                    None => {
+                        log::warn!("[NWK] Decryption failed (MIC mismatch)");
+                        return None;
+                    }
+                }
+            } else {
+                // No security — pass through
+                len = after_header.len().min(128);
+                buf[..len].copy_from_slice(&after_header[..len]);
+            }
+
             (dst, src, header.frame_control.security, buf, len)
         };
 
         let (dst, src, nwk_security, buf, len) = nwk_indication;
 
         // APS layer: parse APS header
-        let aps_indication = self.bdb.zdo().aps().process_incoming_aps_frame(
+        let aps_indication = self.bdb.zdo_mut().aps_mut().process_incoming_aps_frame(
             &buf[..len],
             src,
             dst,

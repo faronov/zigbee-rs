@@ -25,11 +25,27 @@ pub const CMD_REMOVE_GROUP_RESPONSE: CommandId = CommandId(0x03);
 /// Maximum number of groups a device can belong to.
 pub const MAX_GROUPS: usize = 16;
 
+/// Actions that the Groups cluster triggers for the APS group table.
+/// The runtime or application should apply these to the APS layer.
+#[derive(Debug, Clone)]
+pub enum GroupAction {
+    /// Group was added — call APSME-ADD-GROUP
+    Added(u16),
+    /// Group was removed — call APSME-REMOVE-GROUP
+    Removed(u16),
+    /// All groups removed — call APSME-REMOVE-ALL-GROUPS
+    RemovedAll,
+    /// No APS action needed
+    None,
+}
+
 /// Groups cluster implementation.
 pub struct GroupsCluster {
     store: AttributeStore<4>,
     /// List of group IDs this endpoint belongs to.
     groups: heapless::Vec<u16, MAX_GROUPS>,
+    /// Last group action — consumed by runtime to sync APS group table.
+    last_action: GroupAction,
 }
 
 impl Default for GroupsCluster {
@@ -53,26 +69,41 @@ impl GroupsCluster {
         Self {
             store,
             groups: heapless::Vec::new(),
+            last_action: GroupAction::None,
         }
     }
 
     fn add_group(&mut self, group_id: u16) -> u8 {
         if self.groups.contains(&group_id) {
+            self.last_action = GroupAction::None;
             return 0x8A; // DUPLICATE_EXISTS
         }
         match self.groups.push(group_id) {
-            Ok(()) => ZclStatus::Success as u8,
-            Err(_) => ZclStatus::InsufficientSpace as u8,
+            Ok(()) => {
+                self.last_action = GroupAction::Added(group_id);
+                ZclStatus::Success as u8
+            }
+            Err(_) => {
+                self.last_action = GroupAction::None;
+                ZclStatus::InsufficientSpace as u8
+            }
         }
     }
 
     fn remove_group(&mut self, group_id: u16) -> u8 {
         if let Some(pos) = self.groups.iter().position(|&g| g == group_id) {
             self.groups.swap_remove(pos);
+            self.last_action = GroupAction::Removed(group_id);
             ZclStatus::Success as u8
         } else {
+            self.last_action = GroupAction::None;
             ZclStatus::NotFound as u8
         }
+    }
+
+    /// Take the last group action (consumed once).
+    pub fn take_action(&mut self) -> GroupAction {
+        core::mem::replace(&mut self.last_action, GroupAction::None)
     }
 }
 
@@ -167,6 +198,7 @@ impl Cluster for GroupsCluster {
             }
             CMD_REMOVE_ALL_GROUPS => {
                 self.groups.clear();
+                self.last_action = GroupAction::RemovedAll;
                 Ok(heapless::Vec::new())
             }
             CMD_ADD_GROUP_IF_IDENTIFYING => {

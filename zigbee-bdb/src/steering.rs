@@ -126,10 +126,15 @@ impl<M: MacDriver> BdbLayer<M> {
                 }
 
                 // Step 5b: TC link key exchange
-                // TODO: Implement APSME-REQUEST-KEY for Trust Center link key
-                // and wait for APSME-TRANSPORT-KEY indication.
-                // For now, we use the default global TC link key.
-                log::debug!("[BDB:Steering] TC link key exchange (TODO — using default key)");
+                // Zigbee 3.0: coordinator sends APS Transport-Key command
+                // containing the network key after we join. This is handled
+                // automatically by process_incoming_aps_frame() which parses
+                // Transport-Key commands and installs the NWK key into
+                // NwkSecurity. The well-known TC link key (ZigBeeAlliance09)
+                // is pre-installed in ApsSecurity.
+                //
+                // For Install Code devices, APSME-REQUEST-KEY would be needed.
+                log::debug!("[BDB:Steering] Awaiting Transport-Key from coordinator");
 
                 // Success!
                 self.attributes.node_is_on_a_network = true;
