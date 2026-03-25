@@ -25,10 +25,11 @@ pub const BDB_MIN_COMMISSIONING_TIME: u16 = 180;
 // ── Node join link key type ─────────────────────────────────
 
 /// How the joining node's link key was obtained (BDB spec Table 5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum NodeJoinLinkKeyType {
     /// Default global Trust Center link key ("ZigBeeAlliance09")
+    #[default]
     DefaultGlobalTrustCenterLinkKey = 0x00,
     /// IC-derived Trust Center link key (install code)
     IcDerivedTrustCenterLinkKey = 0x01,
@@ -36,12 +37,6 @@ pub enum NodeJoinLinkKeyType {
     AppTrustCenterLinkKey = 0x02,
     /// Touchlink preconfigured link key
     TouchlinkPreconfiguredLinkKey = 0x03,
-}
-
-impl Default for NodeJoinLinkKeyType {
-    fn default() -> Self {
-        Self::DefaultGlobalTrustCenterLinkKey
-    }
 }
 
 // ── BDB commissioning status ────────────────────────────────

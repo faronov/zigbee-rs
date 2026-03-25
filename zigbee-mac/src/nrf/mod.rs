@@ -237,7 +237,10 @@ impl MacDriver for NrfMac<'_> {
                     self.set_channel(ch);
                     // nRF52840 supports hardware ED measurement
                     // TODO: use radio.energy_detection() when available
-                    let _ = energy_list.push(EdValue { channel: ch, energy: 0 });
+                    let _ = energy_list.push(EdValue {
+                        channel: ch,
+                        energy: 0,
+                    });
                 }
                 ScanType::Orphan => {
                     log::warn!("[nRF] Orphan scan not yet implemented");
@@ -245,7 +248,9 @@ impl MacDriver for NrfMac<'_> {
             }
         }
 
-        if matches!(req.scan_type, ScanType::Active | ScanType::Passive) && pan_descriptors.is_empty() {
+        if matches!(req.scan_type, ScanType::Active | ScanType::Passive)
+            && pan_descriptors.is_empty()
+        {
             return Err(MacError::NoBeacon);
         }
 
@@ -273,7 +278,10 @@ impl MacDriver for NrfMac<'_> {
         pkt.copy_from_slice(&frame);
 
         // Transmit
-        self.radio.transmit(&mut pkt).await.map_err(|_| MacError::RadioError)?;
+        self.radio
+            .transmit(&mut pkt)
+            .await
+            .map_err(|_| MacError::RadioError)?;
 
         // Wait for Association Response with timeout
         let timeout_us = (pib::A_BASE_SUPERFRAME_DURATION as u64) * 32 * 1_000_000
@@ -283,7 +291,8 @@ impl MacDriver for NrfMac<'_> {
         let result = select::select(
             Timer::after_micros(timeout_us),
             self.wait_assoc_response(&mut rx_pkt),
-        ).await;
+        )
+        .await;
 
         match result {
             select::Either::Second(Ok(confirm)) => Ok(confirm),
@@ -300,10 +309,7 @@ impl MacDriver for NrfMac<'_> {
         Err(MacError::Unsupported)
     }
 
-    async fn mlme_disassociate(
-        &mut self,
-        _req: MlmeDisassociateRequest,
-    ) -> Result<(), MacError> {
+    async fn mlme_disassociate(&mut self, _req: MlmeDisassociateRequest) -> Result<(), MacError> {
         self.short_address = ShortAddress(0xFFFF);
         self.pan_id = PanId(0xFFFF);
         Ok(())
@@ -337,7 +343,9 @@ impl MacDriver for NrfMac<'_> {
         match attr {
             PibAttribute::MacShortAddress => Ok(PibValue::ShortAddress(self.short_address)),
             PibAttribute::MacPanId => Ok(PibValue::PanId(self.pan_id)),
-            PibAttribute::MacExtendedAddress => Ok(PibValue::ExtendedAddress(self.extended_address)),
+            PibAttribute::MacExtendedAddress => {
+                Ok(PibValue::ExtendedAddress(self.extended_address))
+            }
             PibAttribute::MacRxOnWhenIdle => Ok(PibValue::Bool(self.rx_on_when_idle)),
             PibAttribute::MacAssociationPermit => Ok(PibValue::Bool(self.association_permit)),
             PibAttribute::MacAutoRequest => Ok(PibValue::Bool(self.auto_request)),
@@ -414,7 +422,10 @@ impl MacDriver for NrfMac<'_> {
         let mut pkt = Packet::new();
         pkt.copy_from_slice(&frame_buf[..len]);
 
-        self.radio.transmit(&mut pkt).await.map_err(|_| MacError::RadioError)?;
+        self.radio
+            .transmit(&mut pkt)
+            .await
+            .map_err(|_| MacError::RadioError)?;
 
         Ok(McpsDataConfirm {
             msdu_handle: req.msdu_handle,
@@ -425,7 +436,10 @@ impl MacDriver for NrfMac<'_> {
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
         let mut rx_pkt = Packet::new();
         loop {
-            self.radio.receive(&mut rx_pkt).await.map_err(|_| MacError::RadioError)?;
+            self.radio
+                .receive(&mut rx_pkt)
+                .await
+                .map_err(|_| MacError::RadioError)?;
 
             let data = rx_pkt.as_ref();
             if data.len() < 5 {
@@ -481,7 +495,10 @@ impl NrfMac<'_> {
         pkt: &mut Packet,
     ) -> Result<MlmeAssociateConfirm, MacError> {
         for _ in 0..10 {
-            self.radio.receive(pkt).await.map_err(|_| MacError::RadioError)?;
+            self.radio
+                .receive(pkt)
+                .await
+                .map_err(|_| MacError::RadioError)?;
             let data = pkt.as_ref();
             if data.len() < 5 {
                 continue;

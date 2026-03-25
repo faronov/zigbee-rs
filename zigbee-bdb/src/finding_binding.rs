@@ -65,10 +65,7 @@ impl<M: MacDriver> BdbLayer<M> {
     /// simple descriptors, and creates bindings for matching clusters.
     ///
     /// The procedure runs for up to [`BDB_MIN_COMMISSIONING_TIME`] seconds.
-    pub async fn finding_binding_initiator(
-        &mut self,
-        local_endpoint: u8,
-    ) -> Result<(), BdbStatus> {
+    pub async fn finding_binding_initiator(&mut self, local_endpoint: u8) -> Result<(), BdbStatus> {
         if !self.attributes.node_is_on_a_network {
             return Err(BdbStatus::NotOnNetwork);
         }
@@ -103,10 +100,7 @@ impl<M: MacDriver> BdbLayer<M> {
 
         // Step 2–4: For each target, get simple descriptors and create bindings
         for target in &targets {
-            match self
-                .process_target(target, &local_desc)
-                .await
-            {
+            match self.process_target(target, &local_desc).await {
                 Ok(count) if count > 0 => {
                     log::info!(
                         "[BDB:F&B] Created {} binding(s) with 0x{:04X}",
@@ -288,11 +282,15 @@ impl<M: MacDriver> BdbLayer<M> {
         entry: &BindingEntry,
     ) -> Result<(), BdbStatus> {
         // Add to local binding table
-        if self.zdo.aps_mut().binding_table_mut().add(entry.clone()).is_err() {
-            if self.zdo.aps().binding_table().is_full() {
-                return Err(BdbStatus::BindingTableFull);
-            }
-            // Duplicate — not an error
+        if self
+            .zdo
+            .aps_mut()
+            .binding_table_mut()
+            .add(entry.clone())
+            .is_err()
+            && self.zdo.aps().binding_table().is_full()
+        {
+            return Err(BdbStatus::BindingTableFull);
         }
 
         log::debug!(
@@ -319,10 +317,7 @@ impl<M: MacDriver> BdbLayer<M> {
     ///
     /// The target stays in Identify mode for [`BDB_MIN_COMMISSIONING_TIME`]
     /// seconds (180 s).
-    pub async fn finding_binding_target(
-        &mut self,
-        local_endpoint: u8,
-    ) -> Result<(), BdbStatus> {
+    pub async fn finding_binding_target(&mut self, local_endpoint: u8) -> Result<(), BdbStatus> {
         if !self.attributes.node_is_on_a_network {
             return Err(BdbStatus::NotOnNetwork);
         }
@@ -347,8 +342,7 @@ impl<M: MacDriver> BdbLayer<M> {
         // The device's normal APS/ZCL processing handles incoming
         // Simple_Desc_req and Bind_req from the initiator.
 
-        self.attributes.commissioning_status =
-            crate::attributes::BdbCommissioningStatus::Success;
+        self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::Success;
         Ok(())
     }
 }

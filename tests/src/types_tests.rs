@@ -41,8 +41,10 @@ fn test_channel_number() {
 fn test_channel_mask_all_2_4ghz() {
     let mask = ChannelMask::ALL_2_4GHZ;
     for ch in 11..=26 {
-        assert!(mask.contains(Channel::from_number(ch).unwrap()),
-            "Channel {ch} should be in ALL_2_4GHZ mask");
+        assert!(
+            mask.contains(Channel::from_number(ch).unwrap()),
+            "Channel {ch} should be in ALL_2_4GHZ mask"
+        );
     }
 }
 
@@ -76,4 +78,3 @@ fn test_channel_mask_preferred() {
     assert!(pref.contains(Channel::Ch20));
     assert!(pref.contains(Channel::Ch25));
 }
-

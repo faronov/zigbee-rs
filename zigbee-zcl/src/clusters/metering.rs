@@ -46,43 +46,93 @@ impl MeteringCluster {
     pub fn new(unit: u8, multiplier: u32, divisor: u32) -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_CURRENT_SUMMATION_DELIVERED, data_type: ZclDataType::U48, access: AttributeAccess::Reportable, name: "CurrentSummationDelivered" },
+            AttributeDefinition {
+                id: ATTR_CURRENT_SUMMATION_DELIVERED,
+                data_type: ZclDataType::U48,
+                access: AttributeAccess::Reportable,
+                name: "CurrentSummationDelivered",
+            },
             ZclValue::U48(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_CURRENT_SUMMATION_RECEIVED, data_type: ZclDataType::U48, access: AttributeAccess::Reportable, name: "CurrentSummationReceived" },
+            AttributeDefinition {
+                id: ATTR_CURRENT_SUMMATION_RECEIVED,
+                data_type: ZclDataType::U48,
+                access: AttributeAccess::Reportable,
+                name: "CurrentSummationReceived",
+            },
             ZclValue::U48(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_UNIT_OF_MEASURE, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadOnly, name: "UnitOfMeasure" },
+            AttributeDefinition {
+                id: ATTR_UNIT_OF_MEASURE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadOnly,
+                name: "UnitOfMeasure",
+            },
             ZclValue::Enum8(unit),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MULTIPLIER, data_type: ZclDataType::U24, access: AttributeAccess::ReadOnly, name: "Multiplier" },
+            AttributeDefinition {
+                id: ATTR_MULTIPLIER,
+                data_type: ZclDataType::U24,
+                access: AttributeAccess::ReadOnly,
+                name: "Multiplier",
+            },
             ZclValue::U24(multiplier),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_DIVISOR, data_type: ZclDataType::U24, access: AttributeAccess::ReadOnly, name: "Divisor" },
+            AttributeDefinition {
+                id: ATTR_DIVISOR,
+                data_type: ZclDataType::U24,
+                access: AttributeAccess::ReadOnly,
+                name: "Divisor",
+            },
             ZclValue::U24(divisor),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_SUMMATION_FORMATTING, data_type: ZclDataType::Bitmap8, access: AttributeAccess::ReadOnly, name: "SummationFormatting" },
+            AttributeDefinition {
+                id: ATTR_SUMMATION_FORMATTING,
+                data_type: ZclDataType::Bitmap8,
+                access: AttributeAccess::ReadOnly,
+                name: "SummationFormatting",
+            },
             ZclValue::Bitmap8(0x00),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_DEMAND_FORMATTING, data_type: ZclDataType::Bitmap8, access: AttributeAccess::ReadOnly, name: "DemandFormatting" },
+            AttributeDefinition {
+                id: ATTR_DEMAND_FORMATTING,
+                data_type: ZclDataType::Bitmap8,
+                access: AttributeAccess::ReadOnly,
+                name: "DemandFormatting",
+            },
             ZclValue::Bitmap8(0x00),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_METERING_DEVICE_TYPE, data_type: ZclDataType::Bitmap8, access: AttributeAccess::ReadOnly, name: "MeteringDeviceType" },
+            AttributeDefinition {
+                id: ATTR_METERING_DEVICE_TYPE,
+                data_type: ZclDataType::Bitmap8,
+                access: AttributeAccess::ReadOnly,
+                name: "MeteringDeviceType",
+            },
             ZclValue::Bitmap8(0x00),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_INSTANTANEOUS_DEMAND, data_type: ZclDataType::I32, access: AttributeAccess::Reportable, name: "InstantaneousDemand" },
+            AttributeDefinition {
+                id: ATTR_INSTANTANEOUS_DEMAND,
+                data_type: ZclDataType::I32,
+                access: AttributeAccess::Reportable,
+                name: "InstantaneousDemand",
+            },
             ZclValue::I32(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_POWER_FACTOR, data_type: ZclDataType::I8, access: AttributeAccess::ReadOnly, name: "PowerFactor" },
+            AttributeDefinition {
+                id: ATTR_POWER_FACTOR,
+                data_type: ZclDataType::I8,
+                access: AttributeAccess::ReadOnly,
+                name: "PowerFactor",
+            },
             ZclValue::I8(0),
         );
         Self { store }
@@ -94,12 +144,17 @@ impl MeteringCluster {
             Some(ZclValue::U48(v)) => *v,
             _ => 0,
         };
-        let _ = self.store.set_raw(ATTR_CURRENT_SUMMATION_DELIVERED, ZclValue::U48(current.saturating_add(wh)));
+        let _ = self.store.set_raw(
+            ATTR_CURRENT_SUMMATION_DELIVERED,
+            ZclValue::U48(current.saturating_add(wh)),
+        );
     }
 
     /// Set the instantaneous demand in watts (signed).
     pub fn set_instantaneous_demand(&mut self, watts: i32) {
-        let _ = self.store.set_raw(ATTR_INSTANTANEOUS_DEMAND, ZclValue::I32(watts));
+        let _ = self
+            .store
+            .set_raw(ATTR_INSTANTANEOUS_DEMAND, ZclValue::I32(watts));
     }
 
     /// Get the total energy delivered counter.
@@ -112,12 +167,22 @@ impl MeteringCluster {
 }
 
 impl Cluster for MeteringCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId::METERING }
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId::METERING
+    }
 
-    fn handle_command(&mut self, _cmd_id: CommandId, _payload: &[u8]) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+    fn handle_command(
+        &mut self,
+        _cmd_id: CommandId,
+        _payload: &[u8],
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
         Err(ZclStatus::UnsupClusterCommand)
     }
 
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

@@ -8,8 +8,8 @@
 use heapless::Vec;
 use zigbee_types::{IeeeAddress, ShortAddress};
 
-use crate::descriptors::{NodeDescriptor, PowerDescriptor, SimpleDescriptor};
 use crate::ZdoError;
+use crate::descriptors::{NodeDescriptor, PowerDescriptor, SimpleDescriptor};
 
 // ── NWK_addr (0x0000 / 0x8000) ─────────────────────────────────
 
@@ -86,11 +86,12 @@ impl NwkAddrRsp {
     pub const MIN_SIZE: usize = 11;
 
     pub fn serialize(&self, buf: &mut [u8]) -> Result<usize, ZdoError> {
-        let total = Self::MIN_SIZE + if self.num_assoc_dev > 0 {
-            2 + self.assoc_dev_list.len() * 2
-        } else {
-            0
-        };
+        let total = Self::MIN_SIZE
+            + if self.num_assoc_dev > 0 {
+                2 + self.assoc_dev_list.len() * 2
+            } else {
+                0
+            };
         if buf.len() < total {
             return Err(ZdoError::BufferTooSmall);
         }
@@ -115,12 +116,10 @@ impl NwkAddrRsp {
         if data.len() < Self::MIN_SIZE {
             return Err(ZdoError::InvalidLength);
         }
-        let status =
-            crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
+        let status = crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
         let mut ieee_addr = [0u8; 8];
         ieee_addr.copy_from_slice(&data[1..9]);
-        let nwk_addr =
-            ShortAddress(u16::from_le_bytes([data[9], data[10]]));
+        let nwk_addr = ShortAddress(u16::from_le_bytes([data[9], data[10]]));
         let mut num_assoc_dev = 0u8;
         let mut start_index = 0u8;
         let mut assoc_dev_list = Vec::new();
@@ -179,8 +178,7 @@ impl IeeeAddrReq {
         if data.len() < Self::MIN_SIZE {
             return Err(ZdoError::InvalidLength);
         }
-        let nwk_addr_of_interest =
-            ShortAddress(u16::from_le_bytes([data[0], data[1]]));
+        let nwk_addr_of_interest = ShortAddress(u16::from_le_bytes([data[0], data[1]]));
         let request_type = match data[2] {
             0 => RequestType::Single,
             1 => RequestType::Extended,
@@ -221,9 +219,7 @@ impl NodeDescReq {
             return Err(ZdoError::InvalidLength);
         }
         Ok(Self {
-            nwk_addr_of_interest: ShortAddress(u16::from_le_bytes([
-                data[0], data[1],
-            ])),
+            nwk_addr_of_interest: ShortAddress(u16::from_le_bytes([data[0], data[1]])),
         })
     }
 }
@@ -256,15 +252,14 @@ impl NodeDescRsp {
         if data.len() < 3 {
             return Err(ZdoError::InvalidLength);
         }
-        let status =
-            crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
-        let nwk_addr_of_interest =
-            ShortAddress(u16::from_le_bytes([data[1], data[2]]));
-        let node_descriptor = if status == crate::ZdpStatus::Success && data.len() >= 3 + NodeDescriptor::WIRE_SIZE {
-            Some(NodeDescriptor::parse(&data[3..])?)
-        } else {
-            None
-        };
+        let status = crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
+        let nwk_addr_of_interest = ShortAddress(u16::from_le_bytes([data[1], data[2]]));
+        let node_descriptor =
+            if status == crate::ZdpStatus::Success && data.len() >= 3 + NodeDescriptor::WIRE_SIZE {
+                Some(NodeDescriptor::parse(&data[3..])?)
+            } else {
+                None
+            };
         Ok(Self {
             status,
             nwk_addr_of_interest,
@@ -305,11 +300,11 @@ impl PowerDescRsp {
         if data.len() < 3 {
             return Err(ZdoError::InvalidLength);
         }
-        let status =
-            crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
-        let nwk_addr_of_interest =
-            ShortAddress(u16::from_le_bytes([data[1], data[2]]));
-        let power_descriptor = if status == crate::ZdpStatus::Success && data.len() >= 3 + PowerDescriptor::WIRE_SIZE {
+        let status = crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
+        let nwk_addr_of_interest = ShortAddress(u16::from_le_bytes([data[1], data[2]]));
+        let power_descriptor = if status == crate::ZdpStatus::Success
+            && data.len() >= 3 + PowerDescriptor::WIRE_SIZE
+        {
             Some(PowerDescriptor::parse(&data[3..])?)
         } else {
             None
@@ -348,9 +343,7 @@ impl SimpleDescReq {
             return Err(ZdoError::InvalidLength);
         }
         Ok(Self {
-            nwk_addr_of_interest: ShortAddress(u16::from_le_bytes([
-                data[0], data[1],
-            ])),
+            nwk_addr_of_interest: ShortAddress(u16::from_le_bytes([data[0], data[1]])),
             endpoint: data[2],
         })
     }
@@ -386,10 +379,8 @@ impl SimpleDescRsp {
         if data.len() < 4 {
             return Err(ZdoError::InvalidLength);
         }
-        let status =
-            crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
-        let nwk_addr_of_interest =
-            ShortAddress(u16::from_le_bytes([data[1], data[2]]));
+        let status = crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
+        let nwk_addr_of_interest = ShortAddress(u16::from_le_bytes([data[1], data[2]]));
         let desc_len = data[3] as usize;
         let simple_descriptor = if desc_len > 0 && data.len() >= 4 + desc_len {
             Some(SimpleDescriptor::parse(&data[4..4 + desc_len])?)
@@ -434,10 +425,8 @@ impl ActiveEpRsp {
         if data.len() < 4 {
             return Err(ZdoError::InvalidLength);
         }
-        let status =
-            crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
-        let nwk_addr_of_interest =
-            ShortAddress(u16::from_le_bytes([data[1], data[2]]));
+        let status = crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
+        let nwk_addr_of_interest = ShortAddress(u16::from_le_bytes([data[1], data[2]]));
         let count = data[3] as usize;
         if data.len() < 4 + count {
             return Err(ZdoError::InvalidLength);
@@ -477,8 +466,7 @@ impl MatchDescReq {
             return Err(ZdoError::BufferTooSmall);
         }
         let mut off = 0;
-        buf[off..off + 2]
-            .copy_from_slice(&self.nwk_addr_of_interest.0.to_le_bytes());
+        buf[off..off + 2].copy_from_slice(&self.nwk_addr_of_interest.0.to_le_bytes());
         off += 2;
         buf[off..off + 2].copy_from_slice(&self.profile_id.to_le_bytes());
         off += 2;
@@ -502,8 +490,7 @@ impl MatchDescReq {
             return Err(ZdoError::InvalidLength);
         }
         let mut off = 0;
-        let nwk_addr_of_interest =
-            ShortAddress(u16::from_le_bytes([data[off], data[off + 1]]));
+        let nwk_addr_of_interest = ShortAddress(u16::from_le_bytes([data[off], data[off + 1]]));
         off += 2;
         let profile_id = u16::from_le_bytes([data[off], data[off + 1]]);
         off += 2;
@@ -566,10 +553,8 @@ impl MatchDescRsp {
         if data.len() < 4 {
             return Err(ZdoError::InvalidLength);
         }
-        let status =
-            crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
-        let nwk_addr_of_interest =
-            ShortAddress(u16::from_le_bytes([data[1], data[2]]));
+        let status = crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
+        let nwk_addr_of_interest = ShortAddress(u16::from_le_bytes([data[1], data[2]]));
         let count = data[3] as usize;
         if data.len() < 4 + count {
             return Err(ZdoError::InvalidLength);

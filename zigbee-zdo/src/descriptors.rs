@@ -115,8 +115,7 @@ impl NodeDescriptor {
         if data.len() < Self::WIRE_SIZE {
             return Err(ZdoError::InvalidLength);
         }
-        let logical_type =
-            LogicalType::from_u8(data[0] & 0x07).ok_or(ZdoError::InvalidData)?;
+        let logical_type = LogicalType::from_u8(data[0] & 0x07).ok_or(ZdoError::InvalidData)?;
         Ok(Self {
             logical_type,
             complex_desc_available: data[0] & 0x08 != 0,
@@ -172,10 +171,8 @@ impl PowerDescriptor {
         if buf.len() < Self::WIRE_SIZE {
             return Err(ZdoError::BufferTooSmall);
         }
-        buf[0] = (self.current_power_mode & 0x0F)
-            | ((self.available_power_sources & 0x0F) << 4);
-        buf[1] = (self.current_power_source & 0x0F)
-            | ((self.current_power_level & 0x0F) << 4);
+        buf[0] = (self.current_power_mode & 0x0F) | ((self.available_power_sources & 0x0F) << 4);
+        buf[1] = (self.current_power_source & 0x0F) | ((self.current_power_level & 0x0F) << 4);
         Ok(Self::WIRE_SIZE)
     }
 
@@ -223,9 +220,7 @@ impl SimpleDescriptor {
 
     /// Calculate the serialized size.
     pub fn wire_size(&self) -> usize {
-        Self::MIN_WIRE_SIZE
-            + self.input_clusters.len() * 2
-            + self.output_clusters.len() * 2
+        Self::MIN_WIRE_SIZE + self.input_clusters.len() * 2 + self.output_clusters.len() * 2
     }
 
     pub fn serialize(&self, buf: &mut [u8]) -> Result<usize, ZdoError> {
@@ -323,9 +318,7 @@ pub struct ComplexDescriptor {
 
 impl Default for ComplexDescriptor {
     fn default() -> Self {
-        Self {
-            data: Vec::new(),
-        }
+        Self { data: Vec::new() }
     }
 }
 
@@ -358,9 +351,7 @@ pub struct UserDescriptor {
 
 impl Default for UserDescriptor {
     fn default() -> Self {
-        Self {
-            data: Vec::new(),
-        }
+        Self { data: Vec::new() }
     }
 }
 

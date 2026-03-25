@@ -32,7 +32,7 @@ pub struct ReadAttributesResponse {
 impl ReadAttributesRequest {
     /// Parse from ZCL payload bytes (list of little-endian u16 attribute IDs).
     pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() % 2 != 0 {
+        if !data.len().is_multiple_of(2) {
             return None;
         }
         let mut attributes = heapless::Vec::new();
@@ -72,12 +72,12 @@ impl ReadAttributesResponse {
             buf[pos] = rec.status as u8;
             pos += 1;
             // On success: data type + value
-            if rec.status == ZclStatus::Success {
-                if let Some(ref val) = rec.value {
-                    buf[pos] = rec.data_type as u8;
-                    pos += 1;
-                    pos += val.serialize(&mut buf[pos..]);
-                }
+            if rec.status == ZclStatus::Success
+                && let Some(ref val) = rec.value
+            {
+                buf[pos] = rec.data_type as u8;
+                pos += 1;
+                pos += val.serialize(&mut buf[pos..]);
             }
         }
         pos

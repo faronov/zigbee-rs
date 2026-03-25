@@ -11,15 +11,15 @@
 //!
 //! Run with: cargo run -p mock-sensor
 
+use zigbee_mac::MacDriver;
 use zigbee_mac::mock::MockMac;
 use zigbee_mac::primitives::*;
-use zigbee_mac::MacDriver;
 use zigbee_runtime::templates;
 use zigbee_types::*;
+use zigbee_zcl::clusters::Cluster;
 use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
-use zigbee_zcl::clusters::Cluster;
 use zigbee_zcl::data_types::ZclValue;
 
 fn main() {
@@ -35,8 +35,14 @@ fn main() {
     let mut mac = MockMac::new(ieee_addr);
     println!(
         "  Created MockMac with IEEE address: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        ieee_addr[0], ieee_addr[1], ieee_addr[2], ieee_addr[3],
-        ieee_addr[4], ieee_addr[5], ieee_addr[6], ieee_addr[7]
+        ieee_addr[0],
+        ieee_addr[1],
+        ieee_addr[2],
+        ieee_addr[3],
+        ieee_addr[4],
+        ieee_addr[5],
+        ieee_addr[6],
+        ieee_addr[7]
     );
 
     // Simulate a coordinator beacon on channel 15
@@ -70,7 +76,10 @@ fn main() {
         },
     };
     mac.add_beacon(beacon);
-    println!("  Added coordinator beacon: PAN 0x{:04X}, channel 15, LQI 220", coordinator_pan.0);
+    println!(
+        "  Added coordinator beacon: PAN 0x{:04X}, channel 15, LQI 220",
+        coordinator_pan.0
+    );
 
     // Pre-configure a successful association response
     let assigned_address = ShortAddress(0x796F);
@@ -175,12 +184,15 @@ fn main() {
             capability_info: CapabilityInfo {
                 device_type_ffd: false, // End device
                 mains_powered: false,   // Battery
-                rx_on_when_idle: false,  // Sleepy
+                rx_on_when_idle: false, // Sleepy
                 security_capable: false,
                 allocate_address: true,
             },
         };
-        let assoc_confirm = mac2.mlme_associate(assoc_req).await.expect("Association failed");
+        let assoc_confirm = mac2
+            .mlme_associate(assoc_req)
+            .await
+            .expect("Association failed");
         println!(
             "  [3c] MLME-ASSOCIATE.request → status={:?}, short_addr=0x{:04X}",
             assoc_confirm.status, assoc_confirm.short_address.0
@@ -190,13 +202,16 @@ fn main() {
         let start_req = MlmeStartRequest {
             pan_id: coordinator_pan,
             channel: best.channel,
-            beacon_order: 15,    // Non-beacon network
+            beacon_order: 15, // Non-beacon network
             superframe_order: 15,
             pan_coordinator: false,
             battery_life_ext: false,
         };
         mac2.mlme_start(start_req).await.expect("Start failed");
-        println!("  [3d] MLME-START.request → joined PAN 0x{:04X} on channel {}", coordinator_pan.0, best.channel);
+        println!(
+            "  [3d] MLME-START.request → joined PAN 0x{:04X} on channel {}",
+            coordinator_pan.0, best.channel
+        );
     });
     println!();
 
@@ -204,12 +219,7 @@ fn main() {
     println!("── Step 4: ZCL Cluster Configuration ──");
 
     // Basic cluster
-    let mut basic = BasicCluster::new(
-        b"zigbee-rs",
-        b"MockTempHumid-01",
-        b"20250101",
-        b"0.1.0",
-    );
+    let mut basic = BasicCluster::new(b"zigbee-rs", b"MockTempHumid-01", b"20250101", b"0.1.0");
     basic.set_power_source(0x03); // Battery
     println!("  Basic cluster: manufacturer='zigbee-rs', model='MockTempHumid-01'");
     println!("  Power source: Battery (0x03)");
@@ -227,10 +237,10 @@ fn main() {
     println!("── Step 5: Simulate Sensor Readings ──");
 
     let readings: &[(i16, u16)] = &[
-        (2350, 6500),  // 23.50°C, 65.00%
-        (2410, 6380),  // 24.10°C, 63.80%
-        (2275, 7100),  // 22.75°C, 71.00%
-        (1890, 8250),  // 18.90°C, 82.50%
+        (2350, 6500), // 23.50°C, 65.00%
+        (2410, 6380), // 24.10°C, 63.80%
+        (2275, 7100), // 22.75°C, 71.00%
+        (1890, 8250), // 18.90°C, 82.50%
     ];
 
     for (i, &(t, h)) in readings.iter().enumerate() {
@@ -238,8 +248,12 @@ fn main() {
         humid.set_humidity(h);
 
         // Read back via the Cluster trait
-        let temp_val = temp.attributes().get(zigbee_zcl::clusters::temperature::ATTR_MEASURED_VALUE);
-        let humid_val = humid.attributes().get(zigbee_zcl::clusters::humidity::ATTR_MEASURED_VALUE);
+        let temp_val = temp
+            .attributes()
+            .get(zigbee_zcl::clusters::temperature::ATTR_MEASURED_VALUE);
+        let humid_val = humid
+            .attributes()
+            .get(zigbee_zcl::clusters::humidity::ATTR_MEASURED_VALUE);
 
         let temp_display = match temp_val {
             Some(ZclValue::I16(v)) => format!("{:.2}°C", *v as f64 / 100.0),

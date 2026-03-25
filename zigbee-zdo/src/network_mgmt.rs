@@ -137,8 +137,7 @@ impl MgmtLqiRsp {
         if data.len() < 4 {
             return Err(ZdoError::InvalidLength);
         }
-        let status =
-            crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
+        let status = crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
         let neighbor_table_entries = data[1];
         let start_index = data[2];
         let list_count = data[3] as usize;
@@ -245,8 +244,7 @@ impl MgmtRtgRsp {
         if data.len() < 4 {
             return Err(ZdoError::InvalidLength);
         }
-        let status =
-            crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
+        let status = crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
         let routing_table_entries = data[1];
         let start_index = data[2];
         let list_count = data[3] as usize;
@@ -396,8 +394,7 @@ impl MgmtBindRsp {
         if data.len() < 4 {
             return Err(ZdoError::InvalidLength);
         }
-        let status =
-            crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
+        let status = crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
         let binding_table_entries = data[1];
         let start_index = data[2];
         let list_count = data[3] as usize;
@@ -440,8 +437,7 @@ impl MgmtLeaveReq {
             return Err(ZdoError::BufferTooSmall);
         }
         buf[0..8].copy_from_slice(&self.device_address);
-        buf[8] = if self.remove_children { 0x40 } else { 0 }
-            | if self.rejoin { 0x80 } else { 0 };
+        buf[8] = if self.remove_children { 0x40 } else { 0 } | if self.rejoin { 0x80 } else { 0 };
         Ok(Self::SIZE)
     }
 
@@ -479,8 +475,7 @@ impl MgmtLeaveRsp {
             return Err(ZdoError::InvalidLength);
         }
         Ok(Self {
-            status: crate::ZdpStatus::from_u8(data[0])
-                .ok_or(ZdoError::InvalidData)?,
+            status: crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?,
         })
     }
 }
@@ -629,9 +624,7 @@ impl MgmtNwkUpdateReq {
                 Ok(Self::ManagerChange {
                     scan_channels,
                     nwk_update_id: data[5],
-                    nwk_manager_addr: ShortAddress(u16::from_le_bytes([
-                        data[6], data[7],
-                    ])),
+                    nwk_manager_addr: ShortAddress(u16::from_le_bytes([data[6], data[7]])),
                 })
             }
             _ => Err(ZdoError::InvalidData),
@@ -673,10 +666,8 @@ impl MgmtNwkUpdateRsp {
         if data.len() < 10 {
             return Err(ZdoError::InvalidLength);
         }
-        let status =
-            crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
-        let scanned_channels =
-            u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+        let status = crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
+        let scanned_channels = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
         let total_transmissions = u16::from_le_bytes([data[5], data[6]]);
         let transmission_failures = u16::from_le_bytes([data[7], data[8]]);
         let count = data[9] as usize;

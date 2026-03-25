@@ -74,11 +74,22 @@ pub struct IasAceCluster {
     store: AttributeStore<1>,
 }
 
+impl Default for IasAceCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IasAceCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_PANEL_STATUS, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadOnly, name: "PanelStatus" },
+            AttributeDefinition {
+                id: ATTR_PANEL_STATUS,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadOnly,
+                name: "PanelStatus",
+            },
             ZclValue::Enum8(PANEL_STATUS_DISARMED),
         );
         Self { store }
@@ -91,16 +102,18 @@ impl IasAceCluster {
             _ => PANEL_STATUS_DISARMED,
         };
         let mut resp = heapless::Vec::new();
-        let _ = resp.push(panel_status);    // panel_status
-        let _ = resp.push(0x00);            // seconds_remaining
-        let _ = resp.push(0x00);            // audible_notification (default mute)
-        let _ = resp.push(alarm_status);    // alarm_status
+        let _ = resp.push(panel_status); // panel_status
+        let _ = resp.push(0x00); // seconds_remaining
+        let _ = resp.push(0x00); // audible_notification (default mute)
+        let _ = resp.push(alarm_status); // alarm_status
         resp
     }
 }
 
 impl Cluster for IasAceCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId(0x0501) }
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId(0x0501)
+    }
 
     fn handle_command(
         &mut self,
@@ -115,19 +128,27 @@ impl Cluster for IasAceCluster {
                 let arm_mode = payload[0];
                 let notification = match arm_mode {
                     ARM_MODE_DISARM => {
-                        let _ = self.store.set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_DISARMED));
+                        let _ = self
+                            .store
+                            .set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_DISARMED));
                         ARM_NOTIF_ALL_ZONES_DISARMED
                     }
                     ARM_MODE_ARM_DAY_ZONES_ONLY => {
-                        let _ = self.store.set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_ARMED_STAY));
+                        let _ = self
+                            .store
+                            .set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_ARMED_STAY));
                         ARM_NOTIF_ONLY_DAY_ZONES_ARMED
                     }
                     ARM_MODE_ARM_NIGHT_ZONES_ONLY => {
-                        let _ = self.store.set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_ARMED_NIGHT));
+                        let _ = self
+                            .store
+                            .set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_ARMED_NIGHT));
                         ARM_NOTIF_ONLY_NIGHT_ZONES_ARMED
                     }
                     ARM_MODE_ARM_ALL_ZONES => {
-                        let _ = self.store.set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_ARMED_AWAY));
+                        let _ = self
+                            .store
+                            .set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_ARMED_AWAY));
                         ARM_NOTIF_ALL_ZONES_ARMED
                     }
                     _ => ARM_NOTIF_INVALID_ARM_CODE,
@@ -138,24 +159,32 @@ impl Cluster for IasAceCluster {
                 Ok(resp)
             }
             CMD_EMERGENCY => {
-                let _ = self.store.set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_IN_ALARM));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_IN_ALARM));
                 Ok(self.build_panel_status_payload(ALARM_STATUS_EMERGENCY))
             }
             CMD_FIRE => {
-                let _ = self.store.set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_IN_ALARM));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_IN_ALARM));
                 Ok(self.build_panel_status_payload(ALARM_STATUS_FIRE))
             }
             CMD_PANIC => {
-                let _ = self.store.set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_IN_ALARM));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_IN_ALARM));
                 Ok(self.build_panel_status_payload(ALARM_STATUS_POLICE_PANIC))
             }
-            CMD_GET_PANEL_STATUS => {
-                Ok(self.build_panel_status_payload(ALARM_STATUS_NO_ALARM))
-            }
+            CMD_GET_PANEL_STATUS => Ok(self.build_panel_status_payload(ALARM_STATUS_NO_ALARM)),
             _ => Err(ZclStatus::UnsupClusterCommand),
         }
     }
 
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

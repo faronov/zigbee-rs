@@ -32,6 +32,12 @@ pub struct GroupsCluster {
     groups: heapless::Vec<u16, MAX_GROUPS>,
 }
 
+impl Default for GroupsCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GroupsCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();

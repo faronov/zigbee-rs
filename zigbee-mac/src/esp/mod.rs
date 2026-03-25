@@ -189,7 +189,11 @@ impl<'a> EspMac<'a> {
         descriptors: &mut heapless::Vec<PanDescriptor, MAX_PAN_DESCRIPTORS>,
     ) -> Result<(), MacError> {
         for _ in 0..MAX_PAN_DESCRIPTORS {
-            let received = self.driver.receive().await.map_err(|_| MacError::RadioError)?;
+            let received = self
+                .driver
+                .receive()
+                .await
+                .map_err(|_| MacError::RadioError)?;
 
             // Parse the IEEE 802.15.4 frame
             if let Ok(frame) = Frame::try_unpack(&received.data[..received.len], false) {
@@ -198,12 +202,10 @@ impl<'a> EspMac<'a> {
                     if let Some(payload) = frame.payload {
                         if payload.len() >= 15 {
                             let zigbee_beacon = parse_zigbee_beacon(payload);
-                            let source = frame.header.source.unwrap_or(
-                                mac::Address::Short(
-                                    mac::ShortAddress(0xFFFF),
-                                    mac::ShortAddress(0xFFFF),
-                                ),
-                            );
+                            let source = frame.header.source.unwrap_or(mac::Address::Short(
+                                mac::ShortAddress(0xFFFF),
+                                mac::ShortAddress(0xFFFF),
+                            ));
 
                             let coord_address = convert_mac_address(&source);
                             let superframe_spec =
@@ -262,7 +264,9 @@ impl MacDriver for EspMac<'_> {
             }
         }
 
-        if matches!(req.scan_type, ScanType::Active | ScanType::Passive) && pan_descriptors.is_empty() {
+        if matches!(req.scan_type, ScanType::Active | ScanType::Passive)
+            && pan_descriptors.is_empty()
+        {
             return Err(MacError::NoBeacon);
         }
 
@@ -317,10 +321,7 @@ impl MacDriver for EspMac<'_> {
         Err(MacError::Unsupported)
     }
 
-    async fn mlme_disassociate(
-        &mut self,
-        _req: MlmeDisassociateRequest,
-    ) -> Result<(), MacError> {
+    async fn mlme_disassociate(&mut self, _req: MlmeDisassociateRequest) -> Result<(), MacError> {
         // TODO: Send Disassociation Notification command
         self.short_address = ShortAddress(0xFFFF);
         self.pan_id = PanId(0xFFFF);
@@ -388,9 +389,7 @@ impl MacDriver for EspMac<'_> {
             PibAttribute::PhyTransmitPower => Ok(PibValue::I8(self.tx_power)),
             PibAttribute::PhyChannelsSupported => Ok(PibValue::U32(ChannelMask::ALL_2_4GHZ.0)),
             PibAttribute::PhyCurrentPage => Ok(PibValue::U8(0)), // 2.4 GHz
-            PibAttribute::MacBeaconPayload => {
-                Ok(PibValue::Payload(self.beacon_payload.clone()))
-            }
+            PibAttribute::MacBeaconPayload => Ok(PibValue::Payload(self.beacon_payload.clone())),
             _ => Ok(PibValue::U8(0)),
         }
     }
@@ -481,7 +480,11 @@ impl MacDriver for EspMac<'_> {
 
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
         loop {
-            let received = self.driver.receive().await.map_err(|_| MacError::RadioError)?;
+            let received = self
+                .driver
+                .receive()
+                .await
+                .map_err(|_| MacError::RadioError)?;
 
             // Parse IEEE 802.15.4 frame
             if let Ok(frame) = Frame::try_unpack(&received.data[..received.len], false) {
@@ -532,7 +535,11 @@ impl EspMac<'_> {
     /// Wait for an Association Response command frame.
     async fn wait_for_assoc_response(&mut self) -> Result<MlmeAssociateConfirm, MacError> {
         for _ in 0..10 {
-            let received = self.driver.receive().await.map_err(|_| MacError::RadioError)?;
+            let received = self
+                .driver
+                .receive()
+                .await
+                .map_err(|_| MacError::RadioError)?;
 
             if let Ok(frame) = Frame::try_unpack(&received.data[..received.len], false) {
                 if let FrameContent::Command(cmd) = &frame.content {
@@ -540,8 +547,7 @@ impl EspMac<'_> {
                     if cmd.id == mac::command::Id::AssociationResponse {
                         if let Some(payload) = frame.payload {
                             if payload.len() >= 3 {
-                                let short_addr =
-                                    u16::from_le_bytes([payload[0], payload[1]]);
+                                let short_addr = u16::from_le_bytes([payload[0], payload[1]]);
                                 let status = match payload[2] {
                                     0x00 => AssociationStatus::Success,
                                     0x01 => AssociationStatus::PanAtCapacity,
@@ -550,13 +556,14 @@ impl EspMac<'_> {
 
                                 if status == AssociationStatus::Success {
                                     self.short_address = ShortAddress(short_addr);
-                                    self.pan_id =
-                                        frame.header.source.map(|a| {
-                                            match a {
-                                                mac::Address::Short(pan, _) => PanId(pan.0),
-                                                mac::Address::Extended(pan, _) => PanId(pan.0),
-                                            }
-                                        }).unwrap_or(self.pan_id);
+                                    self.pan_id = frame
+                                        .header
+                                        .source
+                                        .map(|a| match a {
+                                            mac::Address::Short(pan, _) => PanId(pan.0),
+                                            mac::Address::Extended(pan, _) => PanId(pan.0),
+                                        })
+                                        .unwrap_or(self.pan_id);
                                 }
 
                                 return Ok(MlmeAssociateConfirm {
@@ -589,7 +596,7 @@ impl EspMac<'_> {
         fc |= 0x0040;
         // Destination addressing mode
         match req.dst_address {
-            MacAddress::Short(_, _) => fc |= 0x0800, // Short
+            MacAddress::Short(_, _) => fc |= 0x0800,    // Short
             MacAddress::Extended(_, _) => fc |= 0x0C00, // Extended
         }
         // Source addressing mode (use short if we have one, else extended)
@@ -655,12 +662,8 @@ impl EspMac<'_> {
 /// Convert ieee802154 crate Address to our MacAddress type.
 fn convert_mac_address(addr: &mac::Address) -> MacAddress {
     match addr {
-        mac::Address::Short(pan, short) => {
-            MacAddress::Short(PanId(pan.0), ShortAddress(short.0))
-        }
-        mac::Address::Extended(pan, ext) => {
-            MacAddress::Extended(PanId(pan.0), ext.0.to_le_bytes())
-        }
+        mac::Address::Short(pan, short) => MacAddress::Short(PanId(pan.0), ShortAddress(short.0)),
+        mac::Address::Extended(pan, ext) => MacAddress::Extended(PanId(pan.0), ext.0.to_le_bytes()),
     }
 }
 

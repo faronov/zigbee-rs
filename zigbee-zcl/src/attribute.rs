@@ -16,10 +16,7 @@ pub enum AttributeAccess {
 impl AttributeAccess {
     /// Whether reads are allowed.
     pub fn is_readable(&self) -> bool {
-        matches!(
-            self,
-            Self::ReadOnly | Self::ReadWrite | Self::Reportable
-        )
+        matches!(self, Self::ReadOnly | Self::ReadWrite | Self::Reportable)
     }
 
     /// Whether writes are allowed.
@@ -55,6 +52,12 @@ pub struct AttributeValue {
 #[derive(Debug, Clone)]
 pub struct AttributeStore<const N: usize> {
     attrs: heapless::Vec<AttributeValue, N>,
+}
+
+impl<const N: usize> Default for AttributeStore<N> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<const N: usize> AttributeStore<N> {

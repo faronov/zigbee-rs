@@ -33,10 +33,10 @@
 #![allow(async_fn_in_trait)]
 
 pub mod frames;
+pub mod neighbor;
 pub mod nib;
 pub mod nlde;
 pub mod nlme;
-pub mod neighbor;
 pub mod routing;
 pub mod security;
 

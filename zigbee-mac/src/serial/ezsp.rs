@@ -38,7 +38,11 @@ pub const ASH_MAX_FRAME_SIZE: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AshFrameType {
     /// DATA frame: carries EZSP payload. Contains frmNum (3 bits) and ackNum (3 bits).
-    Data { frm_num: u8, retransmit: bool, ack_num: u8 },
+    Data {
+        frm_num: u8,
+        retransmit: bool,
+        ack_num: u8,
+    },
     /// ACK frame: acknowledges received DATA frames.
     Ack { ack_num: u8, not_ready: bool },
     /// NAK frame: negative acknowledgement — requests retransmission.
@@ -277,6 +281,12 @@ pub struct EzspCodec {
     pub protocol_version: u8,
 }
 
+impl Default for EzspCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EzspCodec {
     pub fn new() -> Self {
         Self {
@@ -330,11 +340,7 @@ impl EzspCodec {
 
     /// Build an ASH DATA frame carrying an EZSP command.
     /// Returns bytes written to `out` and advances send_seq.
-    pub fn build_data(
-        &mut self,
-        ezsp: &EzspFrame,
-        out: &mut [u8],
-    ) -> Result<usize, SerialError> {
+    pub fn build_data(&mut self, ezsp: &EzspFrame, out: &mut [u8]) -> Result<usize, SerialError> {
         let mut ezsp_bytes = [0u8; 210];
         let ezsp_len = ezsp.serialize(&mut ezsp_bytes)?;
 
@@ -381,11 +387,8 @@ impl EzspCodec {
             return Err(SerialError::IoError);
         }
         // Rebuild with retransmit flag set
-        let ctrl = ash_encode_data_control(
-            (self.send_seq.wrapping_sub(1)) & 0x07,
-            true,
-            self.recv_seq,
-        );
+        let ctrl =
+            ash_encode_data_control((self.send_seq.wrapping_sub(1)) & 0x07, true, self.recv_seq);
         self.last_data[0] = ctrl;
         // Recompute CRC
         let data_end = self.last_data_len - 2;
@@ -463,10 +466,7 @@ impl EzspCodec {
     /// Process a complete unstuffed ASH frame in rx_buf.
     fn process_ash_frame(
         &mut self,
-    ) -> Result<
-        Option<(AshFrameType, heapless::Vec<u8, ASH_MAX_FRAME_SIZE>)>,
-        SerialError,
-    > {
+    ) -> Result<Option<(AshFrameType, heapless::Vec<u8, ASH_MAX_FRAME_SIZE>)>, SerialError> {
         if self.rx_pos < 3 {
             // Minimum: control + CRC16
             return Ok(None);
@@ -499,11 +499,9 @@ impl EzspCodec {
                 // Advance receive sequence
                 self.recv_seq = (self.recv_seq + 1) & 0x07;
             }
-            AshFrameType::RstAck { .. } | AshFrameType::Error { .. } => {
+            AshFrameType::RstAck { .. } | AshFrameType::Error { .. } if data_end > 1 => {
                 // Include raw data for version/code extraction
-                if data_end > 1 {
-                    let _ = ezsp_data.extend_from_slice(&self.rx_buf[1..data_end]);
-                }
+                let _ = ezsp_data.extend_from_slice(&self.rx_buf[1..data_end]);
             }
             _ => {}
         }
@@ -763,8 +761,7 @@ impl EzspCodec {
         }
         let ver = ezsp.payload[0];
         let stack_type = ezsp.payload[1];
-        let stack_ver =
-            u16::from_le_bytes([ezsp.payload[2], ezsp.payload[3]]);
+        let stack_ver = u16::from_le_bytes([ezsp.payload[2], ezsp.payload[3]]);
         Ok((ver, stack_type, stack_ver))
     }
 

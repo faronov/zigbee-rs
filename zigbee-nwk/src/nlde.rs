@@ -7,7 +7,7 @@
 
 use crate::frames::{NwkFrameControl, NwkFrameType, NwkHeader};
 use crate::{DeviceType, NwkLayer, NwkStatus};
-use zigbee_mac::{MacDriver, McpsDataRequest, AddressMode, TxOptions};
+use zigbee_mac::{AddressMode, MacDriver, McpsDataRequest, TxOptions};
 use zigbee_types::*;
 
 /// NWK data indication — received NWK-level data.

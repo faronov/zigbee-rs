@@ -294,9 +294,8 @@ impl Cluster for GreenPowerCluster {
                     return Err(ZclStatus::MalformedCommand);
                 }
                 let _options = u16::from_le_bytes([payload[0], payload[1]]);
-                let _gpd_src_id = u32::from_le_bytes([
-                    payload[2], payload[3], payload[4], payload[5],
-                ]);
+                let _gpd_src_id =
+                    u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
                 // Forwarded to sink processing (application layer).
                 Ok(heapless::Vec::new())
             }
@@ -306,12 +305,10 @@ impl Cluster for GreenPowerCluster {
                     return Err(ZclStatus::MalformedCommand);
                 }
                 let _options = u16::from_le_bytes([payload[0], payload[1]]);
-                let _gpd_src_id = u32::from_le_bytes([
-                    payload[2], payload[3], payload[4], payload[5],
-                ]);
-                let _security_frame_counter = u32::from_le_bytes([
-                    payload[6], payload[7], payload[8], payload[9],
-                ]);
+                let _gpd_src_id =
+                    u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+                let _security_frame_counter =
+                    u32::from_le_bytes([payload[6], payload[7], payload[8], payload[9]]);
                 Ok(heapless::Vec::new())
             }
             CMD_GP_PAIRING_SEARCH

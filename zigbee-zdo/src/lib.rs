@@ -34,8 +34,8 @@ pub mod discovery;
 pub mod handler;
 pub mod network_mgmt;
 
-use zigbee_aps::binding::BindingEntry;
 use zigbee_aps::ApsLayer;
+use zigbee_aps::binding::BindingEntry;
 use zigbee_mac::MacDriver;
 use zigbee_nwk::nlme::{JoinMethod, NetworkDescriptor};
 use zigbee_nwk::{NwkLayer, NwkStatus};
@@ -96,10 +96,9 @@ pub const MGMT_NWK_UPDATE_RSP: u16 = 0x8038;
 /// Legacy module re-exporting cluster IDs for backwards compatibility.
 pub mod cluster_id {
     pub use super::{
-        ACTIVE_EP_REQ, ACTIVE_EP_RSP, BIND_REQ, BIND_RSP, DEVICE_ANNCE,
-        MATCH_DESC_REQ, MATCH_DESC_RSP, MGMT_LEAVE_REQ,
-        MGMT_PERMIT_JOINING_REQ, MGMT_PERMIT_JOINING_RSP, SIMPLE_DESC_REQ,
-        SIMPLE_DESC_RSP, UNBIND_REQ, UNBIND_RSP,
+        ACTIVE_EP_REQ, ACTIVE_EP_RSP, BIND_REQ, BIND_RSP, DEVICE_ANNCE, MATCH_DESC_REQ,
+        MATCH_DESC_RSP, MGMT_LEAVE_REQ, MGMT_PERMIT_JOINING_REQ, MGMT_PERMIT_JOINING_RSP,
+        SIMPLE_DESC_REQ, SIMPLE_DESC_RSP, UNBIND_REQ, UNBIND_RSP,
     };
 }
 
@@ -404,14 +403,8 @@ impl<M: MacDriver> ZdoLayer<M> {
         buf[0] = self.next_seq();
         buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
         buf[3] = endpoint;
-        log::debug!(
-            "[ZDO] Simple_Desc_req dst=0x{:04X} ep={}",
-            dst.0,
-            endpoint,
-        );
-        let _ = self
-            .send_zdp_unicast(dst, SIMPLE_DESC_REQ, &buf)
-            .await;
+        log::debug!("[ZDO] Simple_Desc_req dst=0x{:04X} ep={}", dst.0, endpoint,);
+        let _ = self.send_zdp_unicast(dst, SIMPLE_DESC_REQ, &buf).await;
         Err(ZdpStatus::Timeout)
     }
 
@@ -425,9 +418,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         buf[0] = self.next_seq();
         buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
         log::debug!("[ZDO] Active_EP_req dst=0x{:04X}", dst.0);
-        let _ = self
-            .send_zdp_unicast(dst, ACTIVE_EP_REQ, &buf)
-            .await;
+        let _ = self.send_zdp_unicast(dst, ACTIVE_EP_REQ, &buf).await;
         Err(ZdpStatus::Timeout)
     }
 

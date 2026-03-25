@@ -118,9 +118,9 @@ impl PowerManager {
     /// Check if it's time to send a MAC poll (for SEDs).
     pub fn should_poll(&self, now_ms: u32) -> bool {
         match self.mode {
-            PowerMode::Sleepy { poll_interval_ms, .. } => {
-                now_ms.wrapping_sub(self.last_poll_ms) >= poll_interval_ms
-            }
+            PowerMode::Sleepy {
+                poll_interval_ms, ..
+            } => now_ms.wrapping_sub(self.last_poll_ms) >= poll_interval_ms,
             _ => false,
         }
     }

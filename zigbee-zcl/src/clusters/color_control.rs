@@ -54,71 +54,157 @@ pub struct ColorControlCluster {
     store: AttributeStore<20>,
 }
 
+impl Default for ColorControlCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ColorControlCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_CURRENT_HUE, data_type: ZclDataType::U8, access: AttributeAccess::Reportable, name: "CurrentHue" },
+            AttributeDefinition {
+                id: ATTR_CURRENT_HUE,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::Reportable,
+                name: "CurrentHue",
+            },
             ZclValue::U8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_CURRENT_SATURATION, data_type: ZclDataType::U8, access: AttributeAccess::Reportable, name: "CurrentSaturation" },
+            AttributeDefinition {
+                id: ATTR_CURRENT_SATURATION,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::Reportable,
+                name: "CurrentSaturation",
+            },
             ZclValue::U8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_REMAINING_TIME, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "RemainingTime" },
+            AttributeDefinition {
+                id: ATTR_REMAINING_TIME,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "RemainingTime",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_CURRENT_X, data_type: ZclDataType::U16, access: AttributeAccess::Reportable, name: "CurrentX" },
+            AttributeDefinition {
+                id: ATTR_CURRENT_X,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::Reportable,
+                name: "CurrentX",
+            },
             ZclValue::U16(0x616B), // Default per spec
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_CURRENT_Y, data_type: ZclDataType::U16, access: AttributeAccess::Reportable, name: "CurrentY" },
+            AttributeDefinition {
+                id: ATTR_CURRENT_Y,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::Reportable,
+                name: "CurrentY",
+            },
             ZclValue::U16(0x607D), // Default per spec
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_COLOR_TEMPERATURE_MIREDS, data_type: ZclDataType::U16, access: AttributeAccess::Reportable, name: "ColorTemperatureMireds" },
+            AttributeDefinition {
+                id: ATTR_COLOR_TEMPERATURE_MIREDS,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::Reportable,
+                name: "ColorTemperatureMireds",
+            },
             ZclValue::U16(250),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_COLOR_MODE, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadOnly, name: "ColorMode" },
+            AttributeDefinition {
+                id: ATTR_COLOR_MODE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadOnly,
+                name: "ColorMode",
+            },
             ZclValue::Enum8(COLOR_MODE_XY),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_OPTIONS, data_type: ZclDataType::Bitmap8, access: AttributeAccess::ReadWrite, name: "Options" },
+            AttributeDefinition {
+                id: ATTR_OPTIONS,
+                data_type: ZclDataType::Bitmap8,
+                access: AttributeAccess::ReadWrite,
+                name: "Options",
+            },
             ZclValue::Bitmap8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_ENHANCED_CURRENT_HUE, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "EnhancedCurrentHue" },
+            AttributeDefinition {
+                id: ATTR_ENHANCED_CURRENT_HUE,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "EnhancedCurrentHue",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_ENHANCED_COLOR_MODE, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadOnly, name: "EnhancedColorMode" },
+            AttributeDefinition {
+                id: ATTR_ENHANCED_COLOR_MODE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadOnly,
+                name: "EnhancedColorMode",
+            },
             ZclValue::Enum8(COLOR_MODE_XY),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_COLOR_LOOP_ACTIVE, data_type: ZclDataType::U8, access: AttributeAccess::ReadOnly, name: "ColorLoopActive" },
+            AttributeDefinition {
+                id: ATTR_COLOR_LOOP_ACTIVE,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::ReadOnly,
+                name: "ColorLoopActive",
+            },
             ZclValue::U8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_COLOR_LOOP_DIRECTION, data_type: ZclDataType::U8, access: AttributeAccess::ReadOnly, name: "ColorLoopDirection" },
+            AttributeDefinition {
+                id: ATTR_COLOR_LOOP_DIRECTION,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::ReadOnly,
+                name: "ColorLoopDirection",
+            },
             ZclValue::U8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_COLOR_LOOP_TIME, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ColorLoopTime" },
+            AttributeDefinition {
+                id: ATTR_COLOR_LOOP_TIME,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ColorLoopTime",
+            },
             ZclValue::U16(25),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_COLOR_CAPABILITIES, data_type: ZclDataType::Bitmap16, access: AttributeAccess::ReadOnly, name: "ColorCapabilities" },
+            AttributeDefinition {
+                id: ATTR_COLOR_CAPABILITIES,
+                data_type: ZclDataType::Bitmap16,
+                access: AttributeAccess::ReadOnly,
+                name: "ColorCapabilities",
+            },
             ZclValue::Bitmap16(0x001F), // All capabilities
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_COLOR_TEMP_PHYSICAL_MIN, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ColorTempPhysicalMinMireds" },
+            AttributeDefinition {
+                id: ATTR_COLOR_TEMP_PHYSICAL_MIN,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ColorTempPhysicalMinMireds",
+            },
             ZclValue::U16(153), // ~6500K
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_COLOR_TEMP_PHYSICAL_MAX, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ColorTempPhysicalMaxMireds" },
+            AttributeDefinition {
+                id: ATTR_COLOR_TEMP_PHYSICAL_MAX,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ColorTempPhysicalMaxMireds",
+            },
             ZclValue::U16(500), // ~2000K
         );
         Self { store }
@@ -144,7 +230,9 @@ impl Cluster for ColorControlCluster {
                 let _direction = payload[1];
                 let _transition = u16::from_le_bytes([payload[2], payload[3]]);
                 let _ = self.store.set_raw(ATTR_CURRENT_HUE, ZclValue::U8(hue));
-                let _ = self.store.set_raw(ATTR_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_HUE_SAT));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_HUE_SAT));
                 Ok(heapless::Vec::new())
             }
             CMD_MOVE_TO_SATURATION => {
@@ -153,8 +241,12 @@ impl Cluster for ColorControlCluster {
                 }
                 let sat = payload[0];
                 let _transition = u16::from_le_bytes([payload[1], payload[2]]);
-                let _ = self.store.set_raw(ATTR_CURRENT_SATURATION, ZclValue::U8(sat));
-                let _ = self.store.set_raw(ATTR_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_HUE_SAT));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_CURRENT_SATURATION, ZclValue::U8(sat));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_HUE_SAT));
                 Ok(heapless::Vec::new())
             }
             CMD_MOVE_TO_HUE_AND_SATURATION => {
@@ -165,8 +257,12 @@ impl Cluster for ColorControlCluster {
                 let sat = payload[1];
                 let _transition = u16::from_le_bytes([payload[2], payload[3]]);
                 let _ = self.store.set_raw(ATTR_CURRENT_HUE, ZclValue::U8(hue));
-                let _ = self.store.set_raw(ATTR_CURRENT_SATURATION, ZclValue::U8(sat));
-                let _ = self.store.set_raw(ATTR_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_HUE_SAT));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_CURRENT_SATURATION, ZclValue::U8(sat));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_HUE_SAT));
                 Ok(heapless::Vec::new())
             }
             CMD_MOVE_TO_COLOR => {
@@ -178,7 +274,9 @@ impl Cluster for ColorControlCluster {
                 let _transition = u16::from_le_bytes([payload[4], payload[5]]);
                 let _ = self.store.set_raw(ATTR_CURRENT_X, ZclValue::U16(x));
                 let _ = self.store.set_raw(ATTR_CURRENT_Y, ZclValue::U16(y));
-                let _ = self.store.set_raw(ATTR_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_XY));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_XY));
                 Ok(heapless::Vec::new())
             }
             CMD_MOVE_TO_COLOR_TEMPERATURE => {
@@ -187,8 +285,12 @@ impl Cluster for ColorControlCluster {
                 }
                 let mireds = u16::from_le_bytes([payload[0], payload[1]]);
                 let _transition = u16::from_le_bytes([payload[2], payload[3]]);
-                let _ = self.store.set_raw(ATTR_COLOR_TEMPERATURE_MIREDS, ZclValue::U16(mireds));
-                let _ = self.store.set_raw(ATTR_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_TEMPERATURE));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_COLOR_TEMPERATURE_MIREDS, ZclValue::U16(mireds));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_TEMPERATURE));
                 Ok(heapless::Vec::new())
             }
             CMD_ENHANCED_MOVE_TO_HUE => {
@@ -198,8 +300,12 @@ impl Cluster for ColorControlCluster {
                 let ehue = u16::from_le_bytes([payload[0], payload[1]]);
                 let _direction = payload[2];
                 let _transition = u16::from_le_bytes([payload[3], payload[4]]);
-                let _ = self.store.set_raw(ATTR_ENHANCED_CURRENT_HUE, ZclValue::U16(ehue));
-                let _ = self.store.set_raw(ATTR_ENHANCED_COLOR_MODE, ZclValue::Enum8(0x03));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_ENHANCED_CURRENT_HUE, ZclValue::U16(ehue));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_ENHANCED_COLOR_MODE, ZclValue::Enum8(0x03));
                 Ok(heapless::Vec::new())
             }
             CMD_COLOR_LOOP_SET => {
@@ -212,13 +318,20 @@ impl Cluster for ColorControlCluster {
                 let time = u16::from_le_bytes([payload[3], payload[4]]);
                 let _start_hue = u16::from_le_bytes([payload[5], payload[6]]);
                 if update_flags & 0x01 != 0 {
-                    let _ = self.store.set_raw(ATTR_COLOR_LOOP_ACTIVE, ZclValue::U8(if action > 0 { 1 } else { 0 }));
+                    let _ = self.store.set_raw(
+                        ATTR_COLOR_LOOP_ACTIVE,
+                        ZclValue::U8(if action > 0 { 1 } else { 0 }),
+                    );
                 }
                 if update_flags & 0x02 != 0 {
-                    let _ = self.store.set_raw(ATTR_COLOR_LOOP_DIRECTION, ZclValue::U8(direction));
+                    let _ = self
+                        .store
+                        .set_raw(ATTR_COLOR_LOOP_DIRECTION, ZclValue::U8(direction));
                 }
                 if update_flags & 0x04 != 0 {
-                    let _ = self.store.set_raw(ATTR_COLOR_LOOP_TIME, ZclValue::U16(time));
+                    let _ = self
+                        .store
+                        .set_raw(ATTR_COLOR_LOOP_TIME, ZclValue::U16(time));
                 }
                 Ok(heapless::Vec::new())
             }

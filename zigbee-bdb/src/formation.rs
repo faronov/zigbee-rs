@@ -117,8 +117,7 @@ impl<M: MacDriver> BdbLayer<M> {
             .await;
 
         self.attributes.node_is_on_a_network = true;
-        self.attributes.commissioning_status =
-            crate::attributes::BdbCommissioningStatus::Success;
+        self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::Success;
 
         log::info!(
             "[BDB:Formation] Network ready, permit joining open for {}s",

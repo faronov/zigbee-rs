@@ -13,12 +13,12 @@
 //! Run with: cargo run -p mock-coordinator
 
 use zigbee::coordinator::{Coordinator, CoordinatorConfig};
-use zigbee::trust_center::{TrustCenter, DEFAULT_TC_LINK_KEY};
+use zigbee::trust_center::{DEFAULT_TC_LINK_KEY, TrustCenter};
+use zigbee_mac::MacDriver;
 use zigbee_mac::mock::MockMac;
 use zigbee_mac::primitives::*;
-use zigbee_mac::MacDriver;
-use zigbee_runtime::builder::DeviceBuilder;
 use zigbee_nwk::DeviceType;
+use zigbee_runtime::builder::DeviceBuilder;
 use zigbee_types::*;
 
 fn main() {
@@ -34,16 +34,34 @@ fn main() {
     let mut mac = MockMac::new(coord_ieee);
     println!(
         "  IEEE address: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        coord_ieee[0], coord_ieee[1], coord_ieee[2], coord_ieee[3],
-        coord_ieee[4], coord_ieee[5], coord_ieee[6], coord_ieee[7]
+        coord_ieee[0],
+        coord_ieee[1],
+        coord_ieee[2],
+        coord_ieee[3],
+        coord_ieee[4],
+        coord_ieee[5],
+        coord_ieee[6],
+        coord_ieee[7]
     );
 
     // Add energy scan results — lower energy = quieter channel
     let ed_results = [
-        EdValue { channel: 11, energy: 180 }, // Noisy
-        EdValue { channel: 15, energy: 45 },  // Quiet — best choice
-        EdValue { channel: 20, energy: 90 },  // Moderate
-        EdValue { channel: 25, energy: 60 },  // Fairly quiet
+        EdValue {
+            channel: 11,
+            energy: 180,
+        }, // Noisy
+        EdValue {
+            channel: 15,
+            energy: 45,
+        }, // Quiet — best choice
+        EdValue {
+            channel: 20,
+            energy: 90,
+        }, // Moderate
+        EdValue {
+            channel: 25,
+            energy: 60,
+        }, // Fairly quiet
     ];
     for ed in &ed_results {
         mac.add_energy(*ed);
@@ -73,14 +91,24 @@ fn main() {
         let mut best_channel = 11u8;
         let mut lowest_energy = 255u8;
         for ed in &scan_result.energy_list {
-            let marker = if ed.energy < lowest_energy { " ← best" } else { "" };
-            println!("    Channel {}: energy level {}{}", ed.channel, ed.energy, marker);
+            let marker = if ed.energy < lowest_energy {
+                " ← best"
+            } else {
+                ""
+            };
+            println!(
+                "    Channel {}: energy level {}{}",
+                ed.channel, ed.energy, marker
+            );
             if ed.energy < lowest_energy {
                 lowest_energy = ed.energy;
                 best_channel = ed.channel;
             }
         }
-        println!("  Selected channel {} (energy={})", best_channel, lowest_energy);
+        println!(
+            "  Selected channel {} (energy={})",
+            best_channel, lowest_energy
+        );
         best_channel
     });
     println!();
@@ -93,7 +121,7 @@ fn main() {
         let start_req = MlmeStartRequest {
             pan_id,
             channel: selected_channel,
-            beacon_order: 15,    // Non-beacon network (ZigBee PRO)
+            beacon_order: 15, // Non-beacon network (ZigBee PRO)
             superframe_order: 15,
             pan_coordinator: true,
             battery_life_ext: false,
@@ -145,7 +173,10 @@ fn main() {
     // Set up Trust Center
     let mut tc = TrustCenter::new(*nwk_key);
     tc.set_require_install_codes(false);
-    println!("  TC link key: {:02X?} (ZigBeeAlliance09)", DEFAULT_TC_LINK_KEY);
+    println!(
+        "  TC link key: {:02X?} (ZigBeeAlliance09)",
+        DEFAULT_TC_LINK_KEY
+    );
     println!("  Install codes: NOT required");
 
     // Mark network as formed
@@ -157,9 +188,18 @@ fn main() {
     println!("── Step 5: Simulate Device Joining ──");
 
     let joining_devices = [
-        ([0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44], "Temp/Humidity Sensor"),
-        ([0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80], "Dimmable Light"),
-        ([0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE], "Smart Plug"),
+        (
+            [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44],
+            "Temp/Humidity Sensor",
+        ),
+        (
+            [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80],
+            "Dimmable Light",
+        ),
+        (
+            [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE],
+            "Smart Plug",
+        ),
     ];
 
     for (ieee, name) in &joining_devices {
@@ -168,7 +208,11 @@ fn main() {
 
             // TC provides the link key for the joining device
             let link_key = tc.link_key_for_device(ieee);
-            let _ = tc.set_link_key(*ieee, link_key, zigbee::trust_center::TcKeyType::DefaultGlobal);
+            let _ = tc.set_link_key(
+                *ieee,
+                link_key,
+                zigbee::trust_center::TcKeyType::DefaultGlobal,
+            );
 
             println!(
                 "  Device '{}' joined: IEEE {:02X?} → short 0x{:04X}",
@@ -202,8 +246,14 @@ fn main() {
     // ── Step 7: Network Summary ─────────────────────────────────────
     println!("── Network Summary ──");
     println!("  ┌─────────────────────────────────────────────┐");
-    println!("  │ PAN ID:            0x{:04X}                  │", pan_id.0);
-    println!("  │ Channel:           {}                      │", selected_channel);
+    println!(
+        "  │ PAN ID:            0x{:04X}                  │",
+        pan_id.0
+    );
+    println!(
+        "  │ Channel:           {}                      │",
+        selected_channel
+    );
     println!("  │ Coordinator:       0x0000                   │");
     println!("  │ Security:          Centralized (TC)         │");
     println!("  │ Joined devices:    3                        │");

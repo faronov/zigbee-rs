@@ -129,7 +129,7 @@ impl BindingTable {
         if self.find_exact(&entry).is_some() {
             return Err(entry);
         }
-        self.entries.push(entry).map_err(|e| e)
+        self.entries.push(entry)
     }
 
     /// Remove a binding entry matching all fields. Returns true if found.
@@ -163,9 +163,7 @@ impl BindingTable {
         cluster_id: u16,
     ) -> impl Iterator<Item = &BindingEntry> {
         self.entries.iter().filter(move |e| {
-            e.src_addr == *src_addr
-                && e.src_endpoint == src_endpoint
-                && e.cluster_id == cluster_id
+            e.src_addr == *src_addr && e.src_endpoint == src_endpoint && e.cluster_id == cluster_id
         })
     }
 

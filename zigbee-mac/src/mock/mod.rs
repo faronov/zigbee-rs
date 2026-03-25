@@ -3,7 +3,7 @@
 //! Implements `MacDriver` with configurable responses — no hardware required.
 //! Use this to test NWK, APS, ZCL, and BDB logic without a radio.
 
-use crate::pib::{PibAttribute, PibValue, PibPayload};
+use crate::pib::{PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use crate::{MacCapabilities, MacDriver, MacError};
 use zigbee_types::*;
@@ -132,7 +132,10 @@ impl MacDriver for MockMac {
                 // Filter beacons by channel mask
                 let mut pds = Vec::new();
                 for pd in &self.scan_beacons {
-                    if req.channel_mask.contains(Channel::from_number(pd.channel).unwrap_or(Channel::Ch11)) {
+                    if req
+                        .channel_mask
+                        .contains(Channel::from_number(pd.channel).unwrap_or(Channel::Ch11))
+                    {
                         let _ = pds.push(pd.clone());
                     }
                 }
@@ -189,10 +192,7 @@ impl MacDriver for MockMac {
         Ok(())
     }
 
-    async fn mlme_disassociate(
-        &mut self,
-        _req: MlmeDisassociateRequest,
-    ) -> Result<(), MacError> {
+    async fn mlme_disassociate(&mut self, _req: MlmeDisassociateRequest) -> Result<(), MacError> {
         self.short_address = ShortAddress(0xFFFF);
         self.pan_id = PanId(0xFFFF);
         Ok(())

@@ -6,7 +6,7 @@
 use zigbee_mac::MacDriver;
 use zigbee_types::{IeeeAddress, ShortAddress};
 
-use crate::{ZdoError, ZdoLayer, DEVICE_ANNCE};
+use crate::{DEVICE_ANNCE, ZdoError, ZdoLayer};
 
 // ── Device_annce payload ────────────────────────────────────────
 

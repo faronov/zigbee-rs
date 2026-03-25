@@ -31,19 +31,40 @@ pub struct ThermostatUiCluster {
     store: AttributeStore<3>,
 }
 
+impl Default for ThermostatUiCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ThermostatUiCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_TEMPERATURE_DISPLAY_MODE, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadWrite, name: "TemperatureDisplayMode" },
+            AttributeDefinition {
+                id: ATTR_TEMPERATURE_DISPLAY_MODE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadWrite,
+                name: "TemperatureDisplayMode",
+            },
             ZclValue::Enum8(DISPLAY_CELSIUS),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_KEYPAD_LOCKOUT, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadWrite, name: "KeypadLockout" },
+            AttributeDefinition {
+                id: ATTR_KEYPAD_LOCKOUT,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadWrite,
+                name: "KeypadLockout",
+            },
             ZclValue::Enum8(KEYPAD_NO_LOCKOUT),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_SCHEDULE_PROGRAMMING_VISIBILITY, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadWrite, name: "ScheduleProgrammingVisibility" },
+            AttributeDefinition {
+                id: ATTR_SCHEDULE_PROGRAMMING_VISIBILITY,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadWrite,
+                name: "ScheduleProgrammingVisibility",
+            },
             ZclValue::Enum8(SCHEDULE_ENABLED),
         );
         Self { store }
@@ -59,7 +80,9 @@ impl ThermostatUiCluster {
 
     /// Set temperature display mode.
     pub fn set_display_mode(&mut self, mode: u8) {
-        let _ = self.store.set_raw(ATTR_TEMPERATURE_DISPLAY_MODE, ZclValue::Enum8(mode));
+        let _ = self
+            .store
+            .set_raw(ATTR_TEMPERATURE_DISPLAY_MODE, ZclValue::Enum8(mode));
     }
 
     /// Get current keypad lockout level.
@@ -72,17 +95,29 @@ impl ThermostatUiCluster {
 
     /// Set keypad lockout level.
     pub fn set_keypad_lockout(&mut self, level: u8) {
-        let _ = self.store.set_raw(ATTR_KEYPAD_LOCKOUT, ZclValue::Enum8(level));
+        let _ = self
+            .store
+            .set_raw(ATTR_KEYPAD_LOCKOUT, ZclValue::Enum8(level));
     }
 }
 
 impl Cluster for ThermostatUiCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId(0x0204) }
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId(0x0204)
+    }
 
-    fn handle_command(&mut self, _cmd_id: CommandId, _payload: &[u8]) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+    fn handle_command(
+        &mut self,
+        _cmd_id: CommandId,
+        _payload: &[u8],
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
         Err(ZclStatus::UnsupClusterCommand)
     }
 
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

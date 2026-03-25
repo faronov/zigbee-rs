@@ -114,7 +114,14 @@ async fn run() {
 
         // ── Phase 5: Poll Control Check-In ──────────────────
         if cycle % CHECK_IN_CYCLE_INTERVAL == 0 {
-            phase_checkin(&mut mac, &mut poll_control, &nv, sim_time_ms, &mut power_mgr).await;
+            phase_checkin(
+                &mut mac,
+                &mut poll_control,
+                &nv,
+                sim_time_ms,
+                &mut power_mgr,
+            )
+            .await;
         } else {
             let elapsed_min = (cycle as f32 * SLEEP_DURATION_S as f32) / 60.0;
             let interval_min = (CHECK_IN_CYCLE_INTERVAL as f32 * SLEEP_DURATION_S as f32) / 60.0;
@@ -242,7 +249,7 @@ async fn phase_poll_parent(mac: &mut MockMac, cycle: u32) -> bool {
         }
         Ok(None) => {
             // On even cycles, simulate receiving a pending frame
-            if cycle % 2 == 0 {
+            if cycle.is_multiple_of(2) {
                 println!("  {MAGENTA}[POLL]{RESET} Received 1 pending frame");
                 true
             } else {
@@ -382,9 +389,7 @@ async fn phase_checkin(
     power_mgr: &mut PowerManager,
 ) {
     println!();
-    println!(
-        "  {CYAN}{BOLD}[POLL_CTRL]{RESET} Check-in interval reached! Sending CheckIn..."
-    );
+    println!("  {CYAN}{BOLD}[POLL_CTRL]{RESET} Check-in interval reached! Sending CheckIn...");
 
     // Build and "send" CheckIn command
     let _checkin_payload = poll_control.trigger_checkin();
@@ -406,7 +411,11 @@ async fn phase_checkin(
 
     // Simulate receiving CheckInResponse: start_fast_poll=true, timeout=40 qs (10s)
     let fast_poll_timeout_qs: u16 = 40; // 10 seconds in quarter-seconds
-    let response_payload = [0x01, fast_poll_timeout_qs as u8, (fast_poll_timeout_qs >> 8) as u8];
+    let response_payload = [
+        0x01,
+        fast_poll_timeout_qs as u8,
+        (fast_poll_timeout_qs >> 8) as u8,
+    ];
     let _ = poll_control.handle_command(
         zigbee_zcl::CommandId(0x00), // CMD_CHECK_IN_RESPONSE
         &response_payload,
@@ -445,9 +454,7 @@ async fn phase_checkin(
         zigbee_zcl::CommandId(0x01), // CMD_FAST_POLL_STOP
         &[],
     );
-    println!(
-        "  {MAGENTA}[POLL]{RESET} Fast poll complete, returning to long poll"
-    );
+    println!("  {MAGENTA}[POLL]{RESET} Fast poll complete, returning to long poll");
 }
 
 /// Phase 6: Power manager sleep decision.
@@ -456,7 +463,9 @@ fn phase_sleep_decision(power_mgr: &PowerManager, now_ms: u32, nv: &mut RamNvSto
     let decision = power_mgr.decide(now_ms);
     match decision {
         SleepDecision::StayAwake => {
-            println!("  {RED}[POWER]{RESET} Sleep decision: {BOLD}STAY AWAKE{RESET} (pending work)");
+            println!(
+                "  {RED}[POWER]{RESET} Sleep decision: {BOLD}STAY AWAKE{RESET} (pending work)"
+            );
         }
         SleepDecision::LightSleep(ms) => {
             println!(
@@ -549,14 +558,11 @@ fn create_mock_mac(cycle: u32) -> MockMac {
     });
 
     // On some cycles, enqueue a pending RX frame to simulate indirect data
-    if cycle % 3 == 0 {
+    if cycle.is_multiple_of(3) {
         if let Some(frame) = MacFrame::from_slice(&[0x08, 0x01, 0x00, 0x20, 0x00]) {
             mac.enqueue_rx(McpsDataIndication {
                 src_address: MacAddress::Short(PanId(SIM_PAN_ID), ShortAddress::COORDINATOR),
-                dst_address: MacAddress::Short(
-                    PanId(SIM_PAN_ID),
-                    ShortAddress(SIM_ASSIGNED_ADDR),
-                ),
+                dst_address: MacAddress::Short(PanId(SIM_PAN_ID), ShortAddress(SIM_ASSIGNED_ADDR)),
                 lqi: 200,
                 payload: frame,
                 security_use: false,
@@ -578,7 +584,7 @@ fn build_attribute_report(temp: i16, humidity: u16) -> [u8; 16] {
     buf[0] = 0x18;
     buf[1] = 0x01; // sequence number
     buf[2] = 0x0A; // Report Attributes command (0x0A)
-    // Temperature attribute: ID=0x0000, type=0x29 (I16), value
+                   // Temperature attribute: ID=0x0000, type=0x29 (I16), value
     buf[3] = 0x00;
     buf[4] = 0x00; // attr id
     buf[5] = 0x29; // data type I16
@@ -611,9 +617,17 @@ fn print_banner() {
     println!("{DIM}  Using MockMac — no hardware required{RESET}");
     println!("{BOLD}{CYAN}═══════════════════════════════════════════════════{RESET}");
     println!();
-    println!("{DIM}  Device IEEE:  {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}{RESET}",
-        DEVICE_IEEE[0], DEVICE_IEEE[1], DEVICE_IEEE[2], DEVICE_IEEE[3],
-        DEVICE_IEEE[4], DEVICE_IEEE[5], DEVICE_IEEE[6], DEVICE_IEEE[7]);
+    println!(
+        "{DIM}  Device IEEE:  {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}{RESET}",
+        DEVICE_IEEE[0],
+        DEVICE_IEEE[1],
+        DEVICE_IEEE[2],
+        DEVICE_IEEE[3],
+        DEVICE_IEEE[4],
+        DEVICE_IEEE[5],
+        DEVICE_IEEE[6],
+        DEVICE_IEEE[7]
+    );
     println!("{DIM}  Device type:  Sleepy End Device (SED){RESET}");
     println!("{DIM}  Power mode:   Deep Sleep ({SLEEP_DURATION_S}s intervals){RESET}");
     println!("{DIM}  Clusters:     Temperature (0x0402), Humidity (0x0405),{RESET}");

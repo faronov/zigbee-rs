@@ -12,20 +12,11 @@ use crate::{MacCapabilities, MacDriver, MacError};
 use zigbee_types::TxPower;
 
 use super::{
+    CMD_ASSOCIATE_CONF, CMD_ASSOCIATE_REQ, CMD_ASSOCIATE_RSP, CMD_DATA_CONF, CMD_DATA_IND,
+    CMD_DATA_REQ, CMD_DISASSOCIATE_REQ, CMD_GET_CONF, CMD_GET_REQ, CMD_POLL_CONF, CMD_POLL_REQ,
+    CMD_RESET_CONF, CMD_RESET_REQ, CMD_SCAN_CONF, CMD_SCAN_REQ, CMD_SET_CONF, CMD_SET_REQ,
+    CMD_START_REQ, CMD_STATUS, MAX_FRAME_SIZE, MAX_PAYLOAD_SIZE, PayloadBuilder, PayloadParser,
     SerialCodec, SerialError, SerialFrame, SerialPort,
-    PayloadBuilder, PayloadParser,
-    MAX_FRAME_SIZE, MAX_PAYLOAD_SIZE,
-    CMD_RESET_REQ, CMD_RESET_CONF,
-    CMD_SCAN_REQ, CMD_SCAN_CONF,
-    CMD_ASSOCIATE_REQ, CMD_ASSOCIATE_CONF,
-    CMD_ASSOCIATE_RSP,
-    CMD_DISASSOCIATE_REQ,
-    CMD_START_REQ,
-    CMD_GET_REQ, CMD_GET_CONF,
-    CMD_SET_REQ, CMD_SET_CONF,
-    CMD_POLL_REQ, CMD_POLL_CONF,
-    CMD_DATA_REQ, CMD_DATA_CONF, CMD_DATA_IND,
-    CMD_STATUS,
 };
 
 // ── Helper: SerialError → MacError ──────────────────────────────
@@ -81,14 +72,17 @@ impl<S: SerialPort> IoState<S> {
 
     /// SAFETY: caller must guarantee exclusive access (single-threaded executor).
     #[inline]
+    #[allow(clippy::mut_from_ref)]
     fn port_mut(&self) -> &mut S {
         unsafe { &mut *self.port.get() }
     }
     #[inline]
+    #[allow(clippy::mut_from_ref)]
     fn codec_mut(&self) -> &mut SerialCodec {
         unsafe { &mut *self.codec.get() }
     }
     #[inline]
+    #[allow(clippy::mut_from_ref)]
     fn seq_mut(&self) -> &mut u8 {
         unsafe { &mut *self.seq.get() }
     }
@@ -153,12 +147,14 @@ impl<S: SerialPort> SerialMac<S> {
             if n == 0 {
                 return Err(MacError::Other);
             }
-            if let Some(rsp_frame) =
-                self.io.codec_mut().feed(&rx_buf[..n]).map_err(to_mac_error)?
+            if let Some(rsp_frame) = self
+                .io
+                .codec_mut()
+                .feed(&rx_buf[..n])
+                .map_err(to_mac_error)?
             {
                 if rsp_frame.cmd == CMD_STATUS {
-                    let status =
-                        PayloadParser::status(&rsp_frame.payload).map_err(to_mac_error)?;
+                    let status = PayloadParser::status(&rsp_frame.payload).map_err(to_mac_error)?;
                     status_to_mac_error(status)?;
                 }
                 if rsp_frame.cmd == expected_rsp {
@@ -182,10 +178,14 @@ impl<S: SerialPort> SerialMac<S> {
             if n == 0 {
                 return Err(MacError::Other);
             }
-            if let Some(frame) = self.io.codec_mut().feed(&rx_buf[..n]).map_err(to_mac_error)? {
-                if frame.cmd == expected_cmd {
-                    return Ok(frame);
-                }
+            if let Some(frame) = self
+                .io
+                .codec_mut()
+                .feed(&rx_buf[..n])
+                .map_err(to_mac_error)?
+                && frame.cmd == expected_cmd
+            {
+                return Ok(frame);
             }
         }
     }
@@ -197,7 +197,9 @@ impl<S: SerialPort> MacDriver for SerialMac<S> {
     async fn mlme_scan(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
         let mut payload_buf = [0u8; MAX_PAYLOAD_SIZE];
         let plen = PayloadBuilder::scan_req(&req, &mut payload_buf);
-        let rsp = self.transact(CMD_SCAN_REQ, &payload_buf[..plen], CMD_SCAN_CONF).await?;
+        let rsp = self
+            .transact(CMD_SCAN_REQ, &payload_buf[..plen], CMD_SCAN_CONF)
+            .await?;
         PayloadParser::scan_conf(&rsp.payload).map_err(to_mac_error)
     }
 
@@ -226,10 +228,7 @@ impl<S: SerialPort> MacDriver for SerialMac<S> {
         status_to_mac_error(status)
     }
 
-    async fn mlme_disassociate(
-        &mut self,
-        req: MlmeDisassociateRequest,
-    ) -> Result<(), MacError> {
+    async fn mlme_disassociate(&mut self, req: MlmeDisassociateRequest) -> Result<(), MacError> {
         let mut payload_buf = [0u8; MAX_PAYLOAD_SIZE];
         let plen = PayloadBuilder::disassociate_req(&req, &mut payload_buf);
         let rsp = self

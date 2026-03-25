@@ -29,75 +29,166 @@ pub struct ElectricalMeasurementCluster {
     store: AttributeStore<20>,
 }
 
+impl Default for ElectricalMeasurementCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ElectricalMeasurementCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MEASUREMENT_TYPE, data_type: ZclDataType::U32, access: AttributeAccess::ReadOnly, name: "MeasurementType" },
+            AttributeDefinition {
+                id: ATTR_MEASUREMENT_TYPE,
+                data_type: ZclDataType::U32,
+                access: AttributeAccess::ReadOnly,
+                name: "MeasurementType",
+            },
             ZclValue::U32(0x00000008),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_DC_VOLTAGE, data_type: ZclDataType::I16, access: AttributeAccess::ReadOnly, name: "DCVoltage" },
+            AttributeDefinition {
+                id: ATTR_DC_VOLTAGE,
+                data_type: ZclDataType::I16,
+                access: AttributeAccess::ReadOnly,
+                name: "DCVoltage",
+            },
             ZclValue::I16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_DC_CURRENT, data_type: ZclDataType::I16, access: AttributeAccess::ReadOnly, name: "DCCurrent" },
+            AttributeDefinition {
+                id: ATTR_DC_CURRENT,
+                data_type: ZclDataType::I16,
+                access: AttributeAccess::ReadOnly,
+                name: "DCCurrent",
+            },
             ZclValue::I16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_DC_POWER, data_type: ZclDataType::I16, access: AttributeAccess::ReadOnly, name: "DCPower" },
+            AttributeDefinition {
+                id: ATTR_DC_POWER,
+                data_type: ZclDataType::I16,
+                access: AttributeAccess::ReadOnly,
+                name: "DCPower",
+            },
             ZclValue::I16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_AC_FREQUENCY, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ACFrequency" },
+            AttributeDefinition {
+                id: ATTR_AC_FREQUENCY,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ACFrequency",
+            },
             ZclValue::U16(50),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_RMS_VOLTAGE, data_type: ZclDataType::U16, access: AttributeAccess::Reportable, name: "RMSVoltage" },
+            AttributeDefinition {
+                id: ATTR_RMS_VOLTAGE,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::Reportable,
+                name: "RMSVoltage",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_RMS_CURRENT, data_type: ZclDataType::U16, access: AttributeAccess::Reportable, name: "RMSCurrent" },
+            AttributeDefinition {
+                id: ATTR_RMS_CURRENT,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::Reportable,
+                name: "RMSCurrent",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_ACTIVE_POWER, data_type: ZclDataType::I16, access: AttributeAccess::Reportable, name: "ActivePower" },
+            AttributeDefinition {
+                id: ATTR_ACTIVE_POWER,
+                data_type: ZclDataType::I16,
+                access: AttributeAccess::Reportable,
+                name: "ActivePower",
+            },
             ZclValue::I16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_REACTIVE_POWER, data_type: ZclDataType::I16, access: AttributeAccess::ReadOnly, name: "ReactivePower" },
+            AttributeDefinition {
+                id: ATTR_REACTIVE_POWER,
+                data_type: ZclDataType::I16,
+                access: AttributeAccess::ReadOnly,
+                name: "ReactivePower",
+            },
             ZclValue::I16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_APPARENT_POWER, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ApparentPower" },
+            AttributeDefinition {
+                id: ATTR_APPARENT_POWER,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ApparentPower",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_POWER_FACTOR, data_type: ZclDataType::I8, access: AttributeAccess::ReadOnly, name: "PowerFactor" },
+            AttributeDefinition {
+                id: ATTR_POWER_FACTOR,
+                data_type: ZclDataType::I8,
+                access: AttributeAccess::ReadOnly,
+                name: "PowerFactor",
+            },
             ZclValue::I8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_AC_VOLTAGE_MULTIPLIER, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ACVoltageMultiplier" },
+            AttributeDefinition {
+                id: ATTR_AC_VOLTAGE_MULTIPLIER,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ACVoltageMultiplier",
+            },
             ZclValue::U16(1),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_AC_VOLTAGE_DIVISOR, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ACVoltageDivisor" },
+            AttributeDefinition {
+                id: ATTR_AC_VOLTAGE_DIVISOR,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ACVoltageDivisor",
+            },
             ZclValue::U16(1),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_AC_CURRENT_MULTIPLIER, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ACCurrentMultiplier" },
+            AttributeDefinition {
+                id: ATTR_AC_CURRENT_MULTIPLIER,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ACCurrentMultiplier",
+            },
             ZclValue::U16(1),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_AC_CURRENT_DIVISOR, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ACCurrentDivisor" },
+            AttributeDefinition {
+                id: ATTR_AC_CURRENT_DIVISOR,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ACCurrentDivisor",
+            },
             ZclValue::U16(1),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_AC_POWER_MULTIPLIER, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ACPowerMultiplier" },
+            AttributeDefinition {
+                id: ATTR_AC_POWER_MULTIPLIER,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ACPowerMultiplier",
+            },
             ZclValue::U16(1),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_AC_POWER_DIVISOR, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ACPowerDivisor" },
+            AttributeDefinition {
+                id: ATTR_AC_POWER_DIVISOR,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ACPowerDivisor",
+            },
             ZclValue::U16(1),
         );
         Self { store }
@@ -112,10 +203,20 @@ impl ElectricalMeasurementCluster {
 }
 
 impl Cluster for ElectricalMeasurementCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId::ELECTRICAL_MEASUREMENT }
-    fn handle_command(&mut self, _cmd_id: CommandId, _payload: &[u8]) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId::ELECTRICAL_MEASUREMENT
+    }
+    fn handle_command(
+        &mut self,
+        _cmd_id: CommandId,
+        _payload: &[u8],
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
         Err(ZclStatus::UnsupClusterCommand)
     }
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

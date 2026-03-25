@@ -3,16 +3,16 @@
 //! Routes incoming APS frames on endpoint 0 to the appropriate ZDP handler,
 //! builds the response, and sends it back through the APS layer.
 
+use zigbee_aps::ApsAddress;
 use zigbee_aps::apsde::ApsdeDataIndication;
 use zigbee_aps::binding::{BindingDst, BindingDstMode, BindingEntry};
-use zigbee_aps::ApsAddress;
 use zigbee_mac::MacDriver;
 use zigbee_types::ShortAddress;
 
 use crate::binding_mgmt::{BindReq, BindTarget};
 use crate::discovery::*;
 use crate::network_mgmt::*;
-use crate::{ZdoError, ZdoLayer, ZdpStatus, ZDO_ENDPOINT};
+use crate::{ZDO_ENDPOINT, ZdoError, ZdoLayer, ZdpStatus};
 
 // ── Main dispatcher ─────────────────────────────────────────────
 
@@ -111,13 +111,11 @@ impl<M: MacDriver> ZdoLayer<M> {
                 (crate::MGMT_LEAVE_RSP, 1 + n)
             }
             crate::MGMT_PERMIT_JOINING_REQ => {
-                let n =
-                    self.handle_mgmt_permit_joining_req(payload, &mut rsp_buf[1..])?;
+                let n = self.handle_mgmt_permit_joining_req(payload, &mut rsp_buf[1..])?;
                 (crate::MGMT_PERMIT_JOINING_RSP, 1 + n)
             }
             crate::MGMT_NWK_UPDATE_REQ => {
-                let n =
-                    self.handle_mgmt_nwk_update_req(payload, &mut rsp_buf[1..])?;
+                let n = self.handle_mgmt_nwk_update_req(payload, &mut rsp_buf[1..])?;
                 (crate::MGMT_NWK_UPDATE_RSP, 1 + n)
             }
 
@@ -141,11 +139,7 @@ impl<M: MacDriver> ZdoLayer<M> {
 impl<M: MacDriver> ZdoLayer<M> {
     // ── Discovery ───────────────────────────────────────────────
 
-    fn handle_nwk_addr_req(
-        &self,
-        payload: &[u8],
-        rsp: &mut [u8],
-    ) -> Result<usize, ZdoError> {
+    fn handle_nwk_addr_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = NwkAddrReq::parse(payload)?;
         let rsp_data = if req.ieee_addr == self.local_ieee_addr() {
             NwkAddrRsp {
@@ -169,11 +163,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         rsp_data.serialize(rsp)
     }
 
-    fn handle_ieee_addr_req(
-        &self,
-        payload: &[u8],
-        rsp: &mut [u8],
-    ) -> Result<usize, ZdoError> {
+    fn handle_ieee_addr_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = IeeeAddrReq::parse(payload)?;
         let rsp_data = if req.nwk_addr_of_interest == self.local_nwk_addr() {
             NwkAddrRsp {
@@ -197,11 +187,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         rsp_data.serialize(rsp)
     }
 
-    fn handle_node_desc_req(
-        &self,
-        payload: &[u8],
-        rsp: &mut [u8],
-    ) -> Result<usize, ZdoError> {
+    fn handle_node_desc_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = NodeDescReq::parse(payload)?;
         let rsp_data = if req.nwk_addr_of_interest == self.local_nwk_addr() {
             NodeDescRsp {
@@ -219,11 +205,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         rsp_data.serialize(rsp)
     }
 
-    fn handle_power_desc_req(
-        &self,
-        payload: &[u8],
-        rsp: &mut [u8],
-    ) -> Result<usize, ZdoError> {
+    fn handle_power_desc_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = NodeDescReq::parse(payload)?; // same layout as PowerDescReq
         let rsp_data = if req.nwk_addr_of_interest == self.local_nwk_addr() {
             PowerDescRsp {
@@ -241,11 +223,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         rsp_data.serialize(rsp)
     }
 
-    fn handle_simple_desc_req(
-        &self,
-        payload: &[u8],
-        rsp: &mut [u8],
-    ) -> Result<usize, ZdoError> {
+    fn handle_simple_desc_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = SimpleDescReq::parse(payload)?;
         if req.nwk_addr_of_interest != self.local_nwk_addr() {
             let rsp_data = SimpleDescRsp {
@@ -280,11 +258,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         }
     }
 
-    fn handle_active_ep_req(
-        &self,
-        payload: &[u8],
-        rsp: &mut [u8],
-    ) -> Result<usize, ZdoError> {
+    fn handle_active_ep_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = NodeDescReq::parse(payload)?; // same layout
         if req.nwk_addr_of_interest != self.local_nwk_addr() {
             let rsp_data = ActiveEpRsp {
@@ -306,11 +280,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         rsp_data.serialize(rsp)
     }
 
-    fn handle_match_desc_req(
-        &self,
-        payload: &[u8],
-        rsp: &mut [u8],
-    ) -> Result<usize, ZdoError> {
+    fn handle_match_desc_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = MatchDescReq::parse(payload)?;
         if req.nwk_addr_of_interest != self.local_nwk_addr()
             && req.nwk_addr_of_interest != ShortAddress(0xFFFF)
@@ -331,7 +301,7 @@ impl<M: MacDriver> ZdoLayer<M> {
             let mut matched = false;
             // Check input clusters
             for &req_cluster in req.input_clusters.iter() {
-                if sd.input_clusters.iter().any(|&c| c == req_cluster) {
+                if sd.input_clusters.contains(&req_cluster) {
                     matched = true;
                     break;
                 }
@@ -339,7 +309,7 @@ impl<M: MacDriver> ZdoLayer<M> {
             // Check output clusters
             if !matched {
                 for &req_cluster in req.output_clusters.iter() {
-                    if sd.output_clusters.iter().any(|&c| c == req_cluster) {
+                    if sd.output_clusters.contains(&req_cluster) {
                         matched = true;
                         break;
                     }
@@ -364,11 +334,7 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     // ── Binding management ──────────────────────────────────────
 
-    fn handle_bind_req(
-        &mut self,
-        payload: &[u8],
-        rsp: &mut [u8],
-    ) -> Result<usize, ZdoError> {
+    fn handle_bind_req(&mut self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = BindReq::parse(payload)?;
         let entry = bind_req_to_entry(&req);
         let status = match self.aps_mut().binding_table_mut().add(entry) {
@@ -382,11 +348,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         Ok(1)
     }
 
-    fn handle_unbind_req(
-        &mut self,
-        payload: &[u8],
-        rsp: &mut [u8],
-    ) -> Result<usize, ZdoError> {
+    fn handle_unbind_req(&mut self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = BindReq::parse(payload)?;
         let dst = bind_target_to_dst(&req.dst);
         let removed = self.aps_mut().binding_table_mut().remove(
@@ -409,11 +371,7 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     // ── Network management ──────────────────────────────────────
 
-    fn handle_mgmt_lqi_req(
-        &self,
-        payload: &[u8],
-        rsp: &mut [u8],
-    ) -> Result<usize, ZdoError> {
+    fn handle_mgmt_lqi_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let _req = MgmtLqiReq::parse(payload)?;
         // TODO: populate from NWK neighbor table
         let rsp_data = MgmtLqiRsp {
@@ -425,11 +383,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         rsp_data.serialize(rsp)
     }
 
-    fn handle_mgmt_rtg_req(
-        &self,
-        payload: &[u8],
-        rsp: &mut [u8],
-    ) -> Result<usize, ZdoError> {
+    fn handle_mgmt_rtg_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let _req = MgmtRtgReq::parse(payload)?;
         // TODO: populate from NWK routing table
         let rsp_data = MgmtRtgRsp {
@@ -441,11 +395,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         rsp_data.serialize(rsp)
     }
 
-    fn handle_mgmt_bind_req(
-        &self,
-        payload: &[u8],
-        rsp: &mut [u8],
-    ) -> Result<usize, ZdoError> {
+    fn handle_mgmt_bind_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = MgmtBindReq::parse(payload)?;
         let entries = self.aps().binding_table().entries();
         let total = entries.len() as u8;
@@ -466,11 +416,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         rsp_data.serialize(rsp)
     }
 
-    fn handle_mgmt_leave_req(
-        &self,
-        payload: &[u8],
-        rsp: &mut [u8],
-    ) -> Result<usize, ZdoError> {
+    fn handle_mgmt_leave_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let _req = MgmtLeaveReq::parse(payload)?;
         // TODO: invoke nlme_leave on the NWK layer
         log::info!("Mgmt_Leave_req received (stub)");
@@ -520,12 +466,9 @@ impl<M: MacDriver> ZdoLayer<M> {
 /// Convert a ZDP [`BindReq`] into an APS [`BindingEntry`].
 fn bind_req_to_entry(req: &BindReq) -> BindingEntry {
     match req.dst {
-        BindTarget::Group(group) => BindingEntry::group(
-            req.src_addr,
-            req.src_endpoint,
-            req.cluster_id,
-            group,
-        ),
+        BindTarget::Group(group) => {
+            BindingEntry::group(req.src_addr, req.src_endpoint, req.cluster_id, group)
+        }
         BindTarget::Unicast {
             dst_addr,
             dst_endpoint,
@@ -556,10 +499,7 @@ fn bind_target_to_dst(target: &BindTarget) -> BindingDst {
 /// Convert an APS [`BindingEntry`] into a ZDP [`BindingTableRecord`].
 fn aps_binding_to_record(entry: &BindingEntry) -> BindingTableRecord {
     let (dst_addr_mode, dst) = match entry.dst {
-        BindingDst::Group(g) => (
-            BindingDstMode::Group as u8,
-            BindTarget::Group(g),
-        ),
+        BindingDst::Group(g) => (BindingDstMode::Group as u8, BindTarget::Group(g)),
         BindingDst::Unicast {
             dst_addr,
             dst_endpoint,

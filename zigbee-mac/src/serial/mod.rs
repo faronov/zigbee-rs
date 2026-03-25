@@ -17,7 +17,7 @@
 pub mod driver;
 pub mod ezsp;
 
-use crate::pib::{PibAttribute, PibValue, PibPayload};
+use crate::pib::{PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use zigbee_types::{MacAddress, PanId, ShortAddress};
 
@@ -119,8 +119,13 @@ impl SerialFrame {
     /// Create a new frame with the given command, sequence number, and payload.
     pub fn new(cmd: u8, seq: u8, payload: &[u8]) -> Result<Self, SerialError> {
         let mut v = heapless::Vec::new();
-        v.extend_from_slice(payload).map_err(|_| SerialError::FrameTooLong)?;
-        Ok(Self { cmd, seq, payload: v })
+        v.extend_from_slice(payload)
+            .map_err(|_| SerialError::FrameTooLong)?;
+        Ok(Self {
+            cmd,
+            seq,
+            payload: v,
+        })
     }
 
     /// Serialize this frame into a byte buffer. Returns the number of bytes written.
@@ -191,6 +196,12 @@ pub struct SerialCodec {
     pos: usize,
 }
 
+impl Default for SerialCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SerialCodec {
     pub fn new() -> Self {
         Self {
@@ -223,8 +234,7 @@ impl SerialCodec {
 
             // Need at least header to know payload length
             if self.pos >= FRAME_HEADER_SIZE {
-                let payload_len =
-                    ((self.buf[3] as usize) << 8) | (self.buf[4] as usize);
+                let payload_len = ((self.buf[3] as usize) << 8) | (self.buf[4] as usize);
                 let total = FRAME_OVERHEAD + payload_len;
 
                 if total > MAX_FRAME_SIZE {
@@ -484,45 +494,74 @@ impl PayloadBuilder {
         }
         match buf[0] {
             0x00 => {
-                if buf.len() < 2 { return Err(SerialError::PayloadError); }
+                if buf.len() < 2 {
+                    return Err(SerialError::PayloadError);
+                }
                 Ok((PibValue::Bool(buf[1] != 0), 2))
             }
             0x01 => {
-                if buf.len() < 2 { return Err(SerialError::PayloadError); }
+                if buf.len() < 2 {
+                    return Err(SerialError::PayloadError);
+                }
                 Ok((PibValue::U8(buf[1]), 2))
             }
             0x02 => {
-                if buf.len() < 3 { return Err(SerialError::PayloadError); }
+                if buf.len() < 3 {
+                    return Err(SerialError::PayloadError);
+                }
                 Ok((PibValue::U16(u16::from_le_bytes([buf[1], buf[2]])), 3))
             }
             0x03 => {
-                if buf.len() < 5 { return Err(SerialError::PayloadError); }
-                Ok((PibValue::U32(u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]])), 5))
+                if buf.len() < 5 {
+                    return Err(SerialError::PayloadError);
+                }
+                Ok((
+                    PibValue::U32(u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]])),
+                    5,
+                ))
             }
             0x04 => {
-                if buf.len() < 2 { return Err(SerialError::PayloadError); }
+                if buf.len() < 2 {
+                    return Err(SerialError::PayloadError);
+                }
                 Ok((PibValue::I8(buf[1] as i8), 2))
             }
             0x05 => {
-                if buf.len() < 3 { return Err(SerialError::PayloadError); }
-                Ok((PibValue::ShortAddress(ShortAddress(u16::from_le_bytes([buf[1], buf[2]]))), 3))
+                if buf.len() < 3 {
+                    return Err(SerialError::PayloadError);
+                }
+                Ok((
+                    PibValue::ShortAddress(ShortAddress(u16::from_le_bytes([buf[1], buf[2]]))),
+                    3,
+                ))
             }
             0x06 => {
-                if buf.len() < 3 { return Err(SerialError::PayloadError); }
-                Ok((PibValue::PanId(PanId(u16::from_le_bytes([buf[1], buf[2]]))), 3))
+                if buf.len() < 3 {
+                    return Err(SerialError::PayloadError);
+                }
+                Ok((
+                    PibValue::PanId(PanId(u16::from_le_bytes([buf[1], buf[2]]))),
+                    3,
+                ))
             }
             0x07 => {
-                if buf.len() < 9 { return Err(SerialError::PayloadError); }
+                if buf.len() < 9 {
+                    return Err(SerialError::PayloadError);
+                }
                 let mut addr = [0u8; 8];
                 addr.copy_from_slice(&buf[1..9]);
                 Ok((PibValue::ExtendedAddress(addr), 9))
             }
             0x08 => {
-                if buf.len() < 2 { return Err(SerialError::PayloadError); }
+                if buf.len() < 2 {
+                    return Err(SerialError::PayloadError);
+                }
                 let len = buf[1] as usize;
-                if buf.len() < 2 + len { return Err(SerialError::PayloadError); }
-                let payload = PibPayload::from_slice(&buf[2..2 + len])
-                    .ok_or(SerialError::PayloadError)?;
+                if buf.len() < 2 + len {
+                    return Err(SerialError::PayloadError);
+                }
+                let payload =
+                    PibPayload::from_slice(&buf[2..2 + len]).ok_or(SerialError::PayloadError)?;
                 Ok((PibValue::Payload(payload), 2 + len))
             }
             _ => Err(SerialError::PayloadError),
@@ -747,10 +786,7 @@ impl PayloadParser {
         let msdu_handle = payload[1];
         let timestamp = if payload.len() >= 6 {
             Some(u32::from_le_bytes([
-                payload[2],
-                payload[3],
-                payload[4],
-                payload[5],
+                payload[2], payload[3], payload[4], payload[5],
             ]))
         } else {
             None
@@ -828,8 +864,8 @@ mod tests {
 
     #[test]
     fn codec_feed_incremental() {
-        let frame = SerialFrame::new(CMD_SCAN_REQ, 0x02, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x03])
-            .unwrap();
+        let frame =
+            SerialFrame::new(CMD_SCAN_REQ, 0x02, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x03]).unwrap();
         let mut buf = [0u8; MAX_FRAME_SIZE];
         let len = frame.serialize(&mut buf).unwrap();
 
@@ -852,6 +888,9 @@ mod tests {
         let len = frame.serialize(&mut buf).unwrap();
         // Corrupt CRC
         buf[len - 1] ^= 0xFF;
-        assert_eq!(SerialFrame::parse(&buf[..len]).unwrap_err(), SerialError::CrcError);
+        assert_eq!(
+            SerialFrame::parse(&buf[..len]).unwrap_err(),
+            SerialError::CrcError
+        );
     }
 }

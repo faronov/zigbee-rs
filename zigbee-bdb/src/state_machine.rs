@@ -105,7 +105,7 @@ impl<M: MacDriver> BdbLayer<M> {
         log::info!("[BDB] Initializing…");
 
         // Reset lower layers
-        if let Err(_) = self.zdo.nlme_reset(false).await {
+        if self.zdo.nlme_reset(false).await.is_err() {
             self.state = BdbState::Idle;
             return Err(BdbStatus::NotPermitted);
         }
@@ -113,21 +113,15 @@ impl<M: MacDriver> BdbLayer<M> {
         // Determine commissioning capabilities based on device type
         let device_type = self.zdo.nwk().device_type();
         let cap = match device_type {
-            DeviceType::Coordinator => {
-                CommissioningMode::STEERING
-                    .or(CommissioningMode::FORMATION)
-                    .or(CommissioningMode::FINDING_BINDING)
-            }
-            DeviceType::Router => {
-                CommissioningMode::STEERING
-                    .or(CommissioningMode::FINDING_BINDING)
-                    .or(CommissioningMode::TOUCHLINK)
-            }
-            DeviceType::EndDevice => {
-                CommissioningMode::STEERING
-                    .or(CommissioningMode::FINDING_BINDING)
-                    .or(CommissioningMode::TOUCHLINK)
-            }
+            DeviceType::Coordinator => CommissioningMode::STEERING
+                .or(CommissioningMode::FORMATION)
+                .or(CommissioningMode::FINDING_BINDING),
+            DeviceType::Router => CommissioningMode::STEERING
+                .or(CommissioningMode::FINDING_BINDING)
+                .or(CommissioningMode::TOUCHLINK),
+            DeviceType::EndDevice => CommissioningMode::STEERING
+                .or(CommissioningMode::FINDING_BINDING)
+                .or(CommissioningMode::TOUCHLINK),
         };
         self.attributes.node_commissioning_capability = cap;
 
@@ -135,7 +129,11 @@ impl<M: MacDriver> BdbLayer<M> {
         self.attributes.node_is_on_a_network = self.zdo.nwk().is_joined();
 
         self.state = BdbState::Idle;
-        log::info!("[BDB] Initialized (type={:?}, cap=0x{:02X})", device_type, cap.0);
+        log::info!(
+            "[BDB] Initialized (type={:?}, cap=0x{:02X})",
+            device_type,
+            cap.0
+        );
         Ok(())
     }
 

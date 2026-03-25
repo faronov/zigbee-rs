@@ -101,6 +101,7 @@ impl RoutingTable {
     }
 
     /// Add or update a route entry.
+    #[allow(clippy::result_unit_err)]
     pub fn update_route(
         &mut self,
         destination: ShortAddress,
@@ -108,7 +109,11 @@ impl RoutingTable {
         cost: u8,
     ) -> Result<(), ()> {
         // Update existing
-        if let Some(entry) = self.routes.iter_mut().find(|r| r.active && r.destination == destination) {
+        if let Some(entry) = self
+            .routes
+            .iter_mut()
+            .find(|r| r.active && r.destination == destination)
+        {
             entry.next_hop = next_hop;
             entry.path_cost = cost;
             entry.status = RouteStatus::Active;
@@ -132,7 +137,9 @@ impl RoutingTable {
             Ok(())
         } else {
             // Evict oldest inactive or highest-cost route
-            if let Some(victim) = self.routes.iter_mut()
+            if let Some(victim) = self
+                .routes
+                .iter_mut()
                 .filter(|r| r.active && r.status != RouteStatus::Active)
                 .max_by_key(|r| r.age)
             {
@@ -156,20 +163,29 @@ impl RoutingTable {
 
     /// Mark a route as discovery underway.
     pub fn mark_discovery(&mut self, destination: ShortAddress) {
-        if let Some(entry) = self.routes.iter_mut().find(|r| r.active && r.destination == destination) {
+        if let Some(entry) = self
+            .routes
+            .iter_mut()
+            .find(|r| r.active && r.destination == destination)
+        {
             entry.status = RouteStatus::DiscoveryUnderway;
         }
     }
 
     /// Remove a route.
     pub fn remove(&mut self, destination: ShortAddress) {
-        if let Some(entry) = self.routes.iter_mut().find(|r| r.active && r.destination == destination) {
+        if let Some(entry) = self
+            .routes
+            .iter_mut()
+            .find(|r| r.active && r.destination == destination)
+        {
             entry.active = false;
             entry.status = RouteStatus::Inactive;
         }
     }
 
     /// Add a pending route discovery.
+    #[allow(clippy::result_unit_err)]
     pub fn add_discovery(&mut self, discovery: RouteDiscovery) -> Result<(), ()> {
         if let Some(slot) = self.discoveries.iter_mut().find(|d| !d.active) {
             *slot = discovery;
@@ -182,12 +198,18 @@ impl RoutingTable {
 
     /// Find a pending route discovery by request ID.
     pub fn find_discovery(&self, request_id: u8) -> Option<&RouteDiscovery> {
-        self.discoveries.iter().find(|d| d.active && d.request_id == request_id)
+        self.discoveries
+            .iter()
+            .find(|d| d.active && d.request_id == request_id)
     }
 
     /// Complete a route discovery (remove from pending).
     pub fn complete_discovery(&mut self, request_id: u8) {
-        if let Some(d) = self.discoveries.iter_mut().find(|d| d.active && d.request_id == request_id) {
+        if let Some(d) = self
+            .discoveries
+            .iter_mut()
+            .find(|d| d.active && d.request_id == request_id)
+        {
             d.active = false;
         }
     }
@@ -259,7 +281,7 @@ fn cskip_value(depth: u8, max_routers: u8, max_depth: u8) -> u16 {
     }
     let cm = 20u32; // max_children default
     let remaining = max_depth as u32 - depth as u32 - 1;
-    let rm_pow = rm.pow(remaining as u32);
+    let rm_pow = rm.pow(remaining);
     let numerator = 1 + cm - rm - cm * rm_pow;
     let denominator = 1u32.wrapping_sub(rm);
     if denominator == 0 {

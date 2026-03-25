@@ -76,12 +76,24 @@ impl NwkFrameControl {
         fc |= (self.frame_type as u16) & 0x03;
         fc |= ((self.protocol_version as u16) & 0x0F) << 2;
         fc |= ((self.discover_route as u16) & 0x03) << 6;
-        if self.multicast { fc |= 1 << 8; }
-        if self.security { fc |= 1 << 9; }
-        if self.source_route { fc |= 1 << 10; }
-        if self.dst_ieee_present { fc |= 1 << 11; }
-        if self.src_ieee_present { fc |= 1 << 12; }
-        if self.end_device_initiator { fc |= 1 << 13; }
+        if self.multicast {
+            fc |= 1 << 8;
+        }
+        if self.security {
+            fc |= 1 << 9;
+        }
+        if self.source_route {
+            fc |= 1 << 10;
+        }
+        if self.dst_ieee_present {
+            fc |= 1 << 11;
+        }
+        if self.src_ieee_present {
+            fc |= 1 << 12;
+        }
+        if self.end_device_initiator {
+            fc |= 1 << 13;
+        }
         fc
     }
 }
@@ -244,7 +256,6 @@ impl NwkHeader {
 }
 
 /// NWK command payloads
-
 /// Leave command (NWK command ID 0x04)
 #[derive(Debug, Clone, Copy)]
 pub struct LeaveCommand {
@@ -266,8 +277,12 @@ impl LeaveCommand {
 
     pub fn serialize(&self) -> u8 {
         let mut cmd_opts: u8 = 0;
-        if self.remove_children { cmd_opts |= 1 << 6; }
-        if self.rejoin { cmd_opts |= 1 << 5; }
+        if self.remove_children {
+            cmd_opts |= 1 << 6;
+        }
+        if self.rejoin {
+            cmd_opts |= 1 << 5;
+        }
         cmd_opts
     }
 }

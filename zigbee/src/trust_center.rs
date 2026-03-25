@@ -12,14 +12,12 @@ use zigbee_types::IeeeAddress;
 /// Well-known default Trust Center link key (ZigBeeAlliance09).
 /// Used when install codes are not required.
 pub const DEFAULT_TC_LINK_KEY: [u8; 16] = [
-    0x5A, 0x69, 0x67, 0x42, 0x65, 0x65, 0x41, 0x6C,
-    0x6C, 0x69, 0x61, 0x6E, 0x63, 0x65, 0x30, 0x39,
+    0x5A, 0x69, 0x67, 0x42, 0x65, 0x65, 0x41, 0x6C, 0x6C, 0x69, 0x61, 0x6E, 0x63, 0x65, 0x30, 0x39,
 ];
 
 /// Distributed security global link key.
 pub const DISTRIBUTED_SECURITY_KEY: [u8; 16] = [
-    0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7,
-    0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF,
+    0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF,
 ];
 
 /// Install code derived key (placeholder — real derivation uses MMO hash).
@@ -110,6 +108,7 @@ impl TrustCenter {
     }
 
     /// Add or update a link key entry for a device.
+    #[allow(clippy::result_unit_err)]
     pub fn set_link_key(
         &mut self,
         ieee: IeeeAddress,
@@ -117,7 +116,12 @@ impl TrustCenter {
         key_type: TcKeyType,
     ) -> Result<(), ()> {
         // Update existing entry
-        if let Some(entry) = self.link_keys.iter_mut().flatten().find(|e| e.ieee_address == ieee) {
+        if let Some(entry) = self
+            .link_keys
+            .iter_mut()
+            .flatten()
+            .find(|e| e.ieee_address == ieee)
+        {
             entry.key = key;
             entry.key_type = key_type;
             entry.verified = false;
@@ -142,16 +146,23 @@ impl TrustCenter {
 
     /// Remove a device's link key (on device removal).
     pub fn remove_link_key(&mut self, ieee: &IeeeAddress) {
-        if let Some(slot) = self.link_keys.iter_mut().find(|s| {
-            s.as_ref().map_or(false, |e| &e.ieee_address == ieee)
-        }) {
+        if let Some(slot) = self
+            .link_keys
+            .iter_mut()
+            .find(|s| s.as_ref().is_some_and(|e| &e.ieee_address == ieee))
+        {
             *slot = None;
         }
     }
 
     /// Mark a device's key as verified.
     pub fn mark_key_verified(&mut self, ieee: &IeeeAddress) {
-        if let Some(entry) = self.link_keys.iter_mut().flatten().find(|e| &e.ieee_address == ieee) {
+        if let Some(entry) = self
+            .link_keys
+            .iter_mut()
+            .flatten()
+            .find(|e| &e.ieee_address == ieee)
+        {
             entry.verified = true;
         }
     }
@@ -170,7 +181,12 @@ impl TrustCenter {
 
     /// Update incoming frame counter for a device (replay protection).
     pub fn update_frame_counter(&mut self, ieee: &IeeeAddress, counter: u32) -> bool {
-        if let Some(entry) = self.link_keys.iter_mut().flatten().find(|e| &e.ieee_address == ieee) {
+        if let Some(entry) = self
+            .link_keys
+            .iter_mut()
+            .flatten()
+            .find(|e| &e.ieee_address == ieee)
+        {
             if counter > entry.incoming_frame_counter {
                 entry.incoming_frame_counter = counter;
                 return true;

@@ -11,17 +11,15 @@
 //!
 //! Run with: cargo run -p mock-light
 
+use zigbee_mac::MacDriver;
 use zigbee_mac::mock::MockMac;
 use zigbee_mac::primitives::*;
-use zigbee_mac::MacDriver;
 use zigbee_runtime::templates;
 use zigbee_types::*;
-use zigbee_zcl::clusters::basic::BasicCluster;
-use zigbee_zcl::clusters::level_control::{
-    self, LevelControlCluster, CMD_MOVE_TO_LEVEL, CMD_STEP,
-};
-use zigbee_zcl::clusters::on_off::{self, OnOffCluster, CMD_OFF, CMD_ON, CMD_TOGGLE};
 use zigbee_zcl::clusters::Cluster;
+use zigbee_zcl::clusters::basic::BasicCluster;
+use zigbee_zcl::clusters::level_control::{self, CMD_MOVE_TO_LEVEL, CMD_STEP, LevelControlCluster};
+use zigbee_zcl::clusters::on_off::{self, CMD_OFF, CMD_ON, CMD_TOGGLE, OnOffCluster};
 
 /// Print the current light state in a visual format.
 fn print_light_state(on_off: &OnOffCluster, level: &LevelControlCluster) {
@@ -110,7 +108,7 @@ fn main() {
                 channel: best.channel,
                 coord_address: best.coord_address,
                 capability_info: CapabilityInfo {
-                    device_type_ffd: true,   // Lights are routers (FFD)
+                    device_type_ffd: true, // Lights are routers (FFD)
                     mains_powered: true,
                     rx_on_when_idle: true,
                     security_capable: false,

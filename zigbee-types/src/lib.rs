@@ -103,9 +103,8 @@ impl ChannelMask {
     pub const ALL_2_4GHZ: Self = Self(0x07FFF800);
 
     /// Zigbee preferred channels: 11, 14, 15, 19, 20, 24, 25
-    pub const PREFERRED: Self = Self(
-        (1 << 11) | (1 << 14) | (1 << 15) | (1 << 19) | (1 << 20) | (1 << 24) | (1 << 25),
-    );
+    pub const PREFERRED: Self =
+        Self((1 << 11) | (1 << 14) | (1 << 15) | (1 << 19) | (1 << 20) | (1 << 24) | (1 << 25));
 
     pub fn contains(self, channel: Channel) -> bool {
         self.0 & (1 << channel.number()) != 0

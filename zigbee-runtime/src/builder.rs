@@ -1,6 +1,6 @@
 //! Device builder — fluent API for configuring a Zigbee device.
 
-use crate::{DeviceConfig, EndpointConfig, ZigbeeDevice, MAX_CLUSTERS_PER_ENDPOINT, MAX_ENDPOINTS};
+use crate::{DeviceConfig, EndpointConfig, MAX_CLUSTERS_PER_ENDPOINT, MAX_ENDPOINTS, ZigbeeDevice};
 use zigbee_mac::MacDriver;
 use zigbee_nwk::DeviceType;
 use zigbee_types::*;

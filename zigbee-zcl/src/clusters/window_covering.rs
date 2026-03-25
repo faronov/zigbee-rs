@@ -46,39 +46,84 @@ impl WindowCoveringCluster {
     pub fn new(covering_type: u8) -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_WINDOW_COVERING_TYPE, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadOnly, name: "WindowCoveringType" },
+            AttributeDefinition {
+                id: ATTR_WINDOW_COVERING_TYPE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadOnly,
+                name: "WindowCoveringType",
+            },
             ZclValue::Enum8(covering_type),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_CONFIG_STATUS, data_type: ZclDataType::Bitmap8, access: AttributeAccess::ReadOnly, name: "ConfigStatus" },
+            AttributeDefinition {
+                id: ATTR_CONFIG_STATUS,
+                data_type: ZclDataType::Bitmap8,
+                access: AttributeAccess::ReadOnly,
+                name: "ConfigStatus",
+            },
             ZclValue::Bitmap8(0x03),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_CURRENT_POSITION_LIFT_PERCENTAGE, data_type: ZclDataType::U8, access: AttributeAccess::Reportable, name: "CurrentPositionLiftPercentage" },
+            AttributeDefinition {
+                id: ATTR_CURRENT_POSITION_LIFT_PERCENTAGE,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::Reportable,
+                name: "CurrentPositionLiftPercentage",
+            },
             ZclValue::U8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_CURRENT_POSITION_TILT_PERCENTAGE, data_type: ZclDataType::U8, access: AttributeAccess::Reportable, name: "CurrentPositionTiltPercentage" },
+            AttributeDefinition {
+                id: ATTR_CURRENT_POSITION_TILT_PERCENTAGE,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::Reportable,
+                name: "CurrentPositionTiltPercentage",
+            },
             ZclValue::U8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_INSTALLED_OPEN_LIMIT_LIFT, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "InstalledOpenLimitLift" },
+            AttributeDefinition {
+                id: ATTR_INSTALLED_OPEN_LIMIT_LIFT,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "InstalledOpenLimitLift",
+            },
             ZclValue::U16(0x0000),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_INSTALLED_CLOSED_LIMIT_LIFT, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "InstalledClosedLimitLift" },
+            AttributeDefinition {
+                id: ATTR_INSTALLED_CLOSED_LIMIT_LIFT,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "InstalledClosedLimitLift",
+            },
             ZclValue::U16(0xFFFF),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_INSTALLED_OPEN_LIMIT_TILT, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "InstalledOpenLimitTilt" },
+            AttributeDefinition {
+                id: ATTR_INSTALLED_OPEN_LIMIT_TILT,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "InstalledOpenLimitTilt",
+            },
             ZclValue::U16(0x0000),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_INSTALLED_CLOSED_LIMIT_TILT, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "InstalledClosedLimitTilt" },
+            AttributeDefinition {
+                id: ATTR_INSTALLED_CLOSED_LIMIT_TILT,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "InstalledClosedLimitTilt",
+            },
             ZclValue::U16(0xFFFF),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MODE, data_type: ZclDataType::Bitmap8, access: AttributeAccess::ReadWrite, name: "Mode" },
+            AttributeDefinition {
+                id: ATTR_MODE,
+                data_type: ZclDataType::Bitmap8,
+                access: AttributeAccess::ReadWrite,
+                name: "Mode",
+            },
             ZclValue::Bitmap8(0x00),
         );
         Self { store }
@@ -101,16 +146,22 @@ impl WindowCoveringCluster {
     }
 
     fn set_lift_percentage(&mut self, pct: u8) {
-        let _ = self.store.set_raw(ATTR_CURRENT_POSITION_LIFT_PERCENTAGE, ZclValue::U8(pct));
+        let _ = self
+            .store
+            .set_raw(ATTR_CURRENT_POSITION_LIFT_PERCENTAGE, ZclValue::U8(pct));
     }
 
     fn set_tilt_percentage(&mut self, pct: u8) {
-        let _ = self.store.set_raw(ATTR_CURRENT_POSITION_TILT_PERCENTAGE, ZclValue::U8(pct));
+        let _ = self
+            .store
+            .set_raw(ATTR_CURRENT_POSITION_TILT_PERCENTAGE, ZclValue::U8(pct));
     }
 }
 
 impl Cluster for WindowCoveringCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId::WINDOW_COVERING }
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId::WINDOW_COVERING
+    }
 
     fn handle_command(
         &mut self,
@@ -171,6 +222,10 @@ impl Cluster for WindowCoveringCluster {
         }
     }
 
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

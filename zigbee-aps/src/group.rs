@@ -55,7 +55,11 @@ impl GroupTable {
     /// Returns `false` if the group table is full or the endpoint list is full.
     pub fn add_group(&mut self, group_address: u16, endpoint: u8) -> bool {
         // Find existing group
-        if let Some(group) = self.groups.iter_mut().find(|g| g.group_address == group_address) {
+        if let Some(group) = self
+            .groups
+            .iter_mut()
+            .find(|g| g.group_address == group_address)
+        {
             // Already a member?
             if group.endpoint_list.contains(&endpoint) {
                 return true;

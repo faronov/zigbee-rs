@@ -1,11 +1,11 @@
 //! Tests for the runtime: builder API, NV storage, power management, templates.
 
-use zigbee_runtime::*;
+use zigbee_mac::mock::MockMac;
+use zigbee_nwk::DeviceType;
 use zigbee_runtime::nv_storage::*;
 use zigbee_runtime::power::*;
 use zigbee_runtime::templates;
-use zigbee_mac::mock::MockMac;
-use zigbee_nwk::DeviceType;
+use zigbee_runtime::*;
 use zigbee_types::*;
 
 fn make_mock() -> MockMac {
@@ -35,8 +35,7 @@ fn test_device_builder_with_endpoints() {
                 .cluster_server(0x0402) // Temperature
         })
         .endpoint(2, 0x0104, 0x0301, |ep| {
-            ep.cluster_server(0x0000)
-                .cluster_server(0x0405) // Humidity
+            ep.cluster_server(0x0000).cluster_server(0x0405) // Humidity
         })
         .build();
 
@@ -49,9 +48,7 @@ fn test_device_builder_with_endpoints() {
 #[test]
 fn test_device_builder_channel_mask() {
     let mask = ChannelMask(1 << 15 | 1 << 20 | 1 << 25);
-    let device = ZigbeeDevice::builder(make_mock())
-        .channels(mask)
-        .build();
+    let device = ZigbeeDevice::builder(make_mock()).channels(mask).build();
 
     assert_eq!(device.config.channel_mask, mask);
 }
@@ -109,7 +106,10 @@ fn test_ram_nv_write_read() {
 fn test_ram_nv_not_found() {
     let nv = RamNvStorage::new();
     let mut buf = [0u8; 8];
-    assert_eq!(nv.read(NvItemId::NwkChannel, &mut buf), Err(NvError::NotFound));
+    assert_eq!(
+        nv.read(NvItemId::NwkChannel, &mut buf),
+        Err(NvError::NotFound)
+    );
 }
 
 #[test]
@@ -136,7 +136,8 @@ fn test_ram_nv_delete() {
 #[test]
 fn test_ram_nv_item_length() {
     let mut nv = RamNvStorage::new();
-    nv.write(NvItemId::NwkIeeeAddress, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+    nv.write(NvItemId::NwkIeeeAddress, &[1, 2, 3, 4, 5, 6, 7, 8])
+        .unwrap();
     assert_eq!(nv.item_length(NvItemId::NwkIeeeAddress), Ok(8));
 }
 
@@ -200,8 +201,7 @@ fn test_should_poll_timing() {
     });
     pm.record_poll(0);
 
-    assert!(!pm.should_poll(500));  // Too early
-    assert!(pm.should_poll(1000));  // Exactly on time
-    assert!(pm.should_poll(1500));  // Overdue
-
+    assert!(!pm.should_poll(500)); // Too early
+    assert!(pm.should_poll(1000)); // Exactly on time
+    assert!(pm.should_poll(1500)); // Overdue
 }

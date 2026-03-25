@@ -56,10 +56,17 @@ impl<M: MacDriver> BdbLayer<M> {
             }
 
             let set_name = if idx == 0 { "primary" } else { "secondary" };
-            log::debug!("[BDB:Steering] Scanning {} channels: 0x{:08X}", set_name, channel_mask.0);
+            log::debug!(
+                "[BDB:Steering] Scanning {} channels: 0x{:08X}",
+                set_name,
+                channel_mask.0
+            );
 
             // Step 1: Network discovery
-            let networks = match self.zdo.nlme_network_discovery(channel_mask, SCAN_DURATION).await
+            let networks = match self
+                .zdo
+                .nlme_network_discovery(channel_mask, SCAN_DURATION)
+                .await
             {
                 Ok(n) => n,
                 Err(_) => {
@@ -129,10 +136,7 @@ impl<M: MacDriver> BdbLayer<M> {
                 self.attributes.commissioning_status =
                     crate::attributes::BdbCommissioningStatus::Success;
 
-                log::info!(
-                    "[BDB:Steering] Joined successfully as 0x{:04X}",
-                    nwk_addr.0,
-                );
+                log::info!("[BDB:Steering] Joined successfully as 0x{:04X}", nwk_addr.0,);
                 return Ok(());
             }
         }
@@ -181,13 +185,9 @@ impl<M: MacDriver> BdbLayer<M> {
             .await
             .map_err(|_| BdbStatus::SteeringFailure)?;
 
-        self.attributes.commissioning_status =
-            crate::attributes::BdbCommissioningStatus::Success;
+        self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::Success;
 
-        log::info!(
-            "[BDB:Steering] Permit joining opened for {}s",
-            duration,
-        );
+        log::info!("[BDB:Steering] Permit joining opened for {}s", duration,);
         Ok(())
     }
 }

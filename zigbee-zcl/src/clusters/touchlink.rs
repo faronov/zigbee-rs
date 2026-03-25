@@ -65,6 +65,12 @@ pub struct TouchlinkCluster {
     store: AttributeStore<4>,
 }
 
+impl Default for TouchlinkCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TouchlinkCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();
@@ -97,9 +103,8 @@ impl Cluster for TouchlinkCluster {
                 if payload.len() < 6 {
                     return Err(ZclStatus::MalformedCommand);
                 }
-                let _inter_pan_transaction_id = u32::from_le_bytes([
-                    payload[0], payload[1], payload[2], payload[3],
-                ]);
+                let _inter_pan_transaction_id =
+                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 let _zigbee_information = payload[4];
                 let _touchlink_information = payload[5];
                 let _ = self
@@ -112,9 +117,8 @@ impl Cluster for TouchlinkCluster {
                 if payload.len() < 6 {
                     return Err(ZclStatus::MalformedCommand);
                 }
-                let _inter_pan_transaction_id = u32::from_le_bytes([
-                    payload[0], payload[1], payload[2], payload[3],
-                ]);
+                let _inter_pan_transaction_id =
+                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 let _identify_duration = u16::from_le_bytes([payload[4], payload[5]]);
                 let _ = self
                     .store

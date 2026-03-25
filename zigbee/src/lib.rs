@@ -55,15 +55,15 @@ pub mod router;
 pub mod trust_center;
 
 // Re-export all sub-crates for convenience
-pub use zigbee_types as types;
+pub use zigbee_aps as aps;
+pub use zigbee_bdb as bdb;
 pub use zigbee_mac as mac;
 pub use zigbee_nwk as nwk;
-pub use zigbee_aps as aps;
-pub use zigbee_zdo as zdo;
-pub use zigbee_bdb as bdb;
-pub use zigbee_zcl as zcl;
 pub use zigbee_runtime as runtime;
+pub use zigbee_types as types;
+pub use zigbee_zcl as zcl;
+pub use zigbee_zdo as zdo;
 
 // Re-export commonly used types at top level
-pub use zigbee_types::{IeeeAddress, ShortAddress, PanId, MacAddress, Channel, ChannelMask};
 pub use zigbee_runtime::ZigbeeDevice;
+pub use zigbee_types::{Channel, ChannelMask, IeeeAddress, MacAddress, PanId, ShortAddress};

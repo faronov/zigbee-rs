@@ -80,67 +80,147 @@ impl DoorLockCluster {
     pub fn new(lock_type: u8) -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_LOCK_STATE, data_type: ZclDataType::Enum8, access: AttributeAccess::Reportable, name: "LockState" },
+            AttributeDefinition {
+                id: ATTR_LOCK_STATE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::Reportable,
+                name: "LockState",
+            },
             ZclValue::Enum8(LOCK_STATE_UNDEFINED),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_LOCK_TYPE, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadOnly, name: "LockType" },
+            AttributeDefinition {
+                id: ATTR_LOCK_TYPE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadOnly,
+                name: "LockType",
+            },
             ZclValue::Enum8(lock_type),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_ACTUATOR_ENABLED, data_type: ZclDataType::Bool, access: AttributeAccess::ReadOnly, name: "ActuatorEnabled" },
+            AttributeDefinition {
+                id: ATTR_ACTUATOR_ENABLED,
+                data_type: ZclDataType::Bool,
+                access: AttributeAccess::ReadOnly,
+                name: "ActuatorEnabled",
+            },
             ZclValue::Bool(true),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_DOOR_STATE, data_type: ZclDataType::Enum8, access: AttributeAccess::Reportable, name: "DoorState" },
+            AttributeDefinition {
+                id: ATTR_DOOR_STATE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::Reportable,
+                name: "DoorState",
+            },
             ZclValue::Enum8(DOOR_STATE_UNDEFINED),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_DOOR_OPEN_EVENTS, data_type: ZclDataType::U32, access: AttributeAccess::ReadWrite, name: "DoorOpenEvents" },
+            AttributeDefinition {
+                id: ATTR_DOOR_OPEN_EVENTS,
+                data_type: ZclDataType::U32,
+                access: AttributeAccess::ReadWrite,
+                name: "DoorOpenEvents",
+            },
             ZclValue::U32(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_DOOR_CLOSED_EVENTS, data_type: ZclDataType::U32, access: AttributeAccess::ReadWrite, name: "DoorClosedEvents" },
+            AttributeDefinition {
+                id: ATTR_DOOR_CLOSED_EVENTS,
+                data_type: ZclDataType::U32,
+                access: AttributeAccess::ReadWrite,
+                name: "DoorClosedEvents",
+            },
             ZclValue::U32(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_OPEN_PERIOD, data_type: ZclDataType::U16, access: AttributeAccess::ReadWrite, name: "OpenPeriod" },
+            AttributeDefinition {
+                id: ATTR_OPEN_PERIOD,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadWrite,
+                name: "OpenPeriod",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_NUM_LOG_RECORDS_SUPPORTED, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "NumberOfLogRecordsSupported" },
+            AttributeDefinition {
+                id: ATTR_NUM_LOG_RECORDS_SUPPORTED,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "NumberOfLogRecordsSupported",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_NUM_TOTAL_USERS_SUPPORTED, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "NumberOfTotalUsersSupported" },
+            AttributeDefinition {
+                id: ATTR_NUM_TOTAL_USERS_SUPPORTED,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "NumberOfTotalUsersSupported",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_NUM_PIN_USERS_SUPPORTED, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "NumberOfPINUsersSupported" },
+            AttributeDefinition {
+                id: ATTR_NUM_PIN_USERS_SUPPORTED,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "NumberOfPINUsersSupported",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_NUM_RFID_USERS_SUPPORTED, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "NumberOfRFIDUsersSupported" },
+            AttributeDefinition {
+                id: ATTR_NUM_RFID_USERS_SUPPORTED,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "NumberOfRFIDUsersSupported",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MAX_PIN_CODE_LENGTH, data_type: ZclDataType::U8, access: AttributeAccess::ReadOnly, name: "MaxPINCodeLength" },
+            AttributeDefinition {
+                id: ATTR_MAX_PIN_CODE_LENGTH,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::ReadOnly,
+                name: "MaxPINCodeLength",
+            },
             ZclValue::U8(8),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MIN_PIN_CODE_LENGTH, data_type: ZclDataType::U8, access: AttributeAccess::ReadOnly, name: "MinPINCodeLength" },
+            AttributeDefinition {
+                id: ATTR_MIN_PIN_CODE_LENGTH,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::ReadOnly,
+                name: "MinPINCodeLength",
+            },
             ZclValue::U8(4),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_LANGUAGE, data_type: ZclDataType::CharString, access: AttributeAccess::ReadWrite, name: "Language" },
+            AttributeDefinition {
+                id: ATTR_LANGUAGE,
+                data_type: ZclDataType::CharString,
+                access: AttributeAccess::ReadWrite,
+                name: "Language",
+            },
             ZclValue::CharString(heapless::Vec::from_slice(b"en").unwrap_or_default()),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_AUTO_RELOCK_TIME, data_type: ZclDataType::U32, access: AttributeAccess::ReadWrite, name: "AutoRelockTime" },
+            AttributeDefinition {
+                id: ATTR_AUTO_RELOCK_TIME,
+                data_type: ZclDataType::U32,
+                access: AttributeAccess::ReadWrite,
+                name: "AutoRelockTime",
+            },
             ZclValue::U32(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_OPERATING_MODE, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadWrite, name: "OperatingMode" },
+            AttributeDefinition {
+                id: ATTR_OPERATING_MODE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadWrite,
+                name: "OperatingMode",
+            },
             ZclValue::Enum8(OPERATING_MODE_NORMAL),
         );
         Self { store }
@@ -172,7 +252,9 @@ impl DoorLockCluster {
 }
 
 impl Cluster for DoorLockCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId::DOOR_LOCK }
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId::DOOR_LOCK
+    }
 
     fn handle_command(
         &mut self,
@@ -209,6 +291,10 @@ impl Cluster for DoorLockCluster {
         }
     }
 
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

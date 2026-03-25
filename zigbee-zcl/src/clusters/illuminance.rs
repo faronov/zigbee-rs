@@ -21,23 +21,48 @@ impl IlluminanceCluster {
     pub fn new(min: u16, max: u16) -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MEASURED_VALUE, data_type: ZclDataType::U16, access: AttributeAccess::Reportable, name: "MeasuredValue" },
+            AttributeDefinition {
+                id: ATTR_MEASURED_VALUE,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::Reportable,
+                name: "MeasuredValue",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MIN_MEASURED_VALUE, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "MinMeasuredValue" },
+            AttributeDefinition {
+                id: ATTR_MIN_MEASURED_VALUE,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "MinMeasuredValue",
+            },
             ZclValue::U16(min),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MAX_MEASURED_VALUE, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "MaxMeasuredValue" },
+            AttributeDefinition {
+                id: ATTR_MAX_MEASURED_VALUE,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "MaxMeasuredValue",
+            },
             ZclValue::U16(max),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_TOLERANCE, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "Tolerance" },
+            AttributeDefinition {
+                id: ATTR_TOLERANCE,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "Tolerance",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_LIGHT_SENSOR_TYPE, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadOnly, name: "LightSensorType" },
+            AttributeDefinition {
+                id: ATTR_LIGHT_SENSOR_TYPE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadOnly,
+                name: "LightSensorType",
+            },
             ZclValue::Enum8(0xFF), // Unknown
         );
         Self { store }
@@ -45,15 +70,27 @@ impl IlluminanceCluster {
 
     /// Update the measured illuminance (in 10000 × log10(lux) + 1 units).
     pub fn set_illuminance(&mut self, value: u16) {
-        let _ = self.store.set_raw(ATTR_MEASURED_VALUE, ZclValue::U16(value));
+        let _ = self
+            .store
+            .set_raw(ATTR_MEASURED_VALUE, ZclValue::U16(value));
     }
 }
 
 impl Cluster for IlluminanceCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId::ILLUMINANCE }
-    fn handle_command(&mut self, _cmd_id: CommandId, _payload: &[u8]) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId::ILLUMINANCE
+    }
+    fn handle_command(
+        &mut self,
+        _cmd_id: CommandId,
+        _payload: &[u8],
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
         Err(ZclStatus::UnsupClusterCommand)
     }
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

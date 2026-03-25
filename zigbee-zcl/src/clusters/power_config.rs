@@ -20,39 +20,85 @@ pub struct PowerConfigCluster {
     store: AttributeStore<12>,
 }
 
+impl Default for PowerConfigCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PowerConfigCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_BATTERY_VOLTAGE, data_type: ZclDataType::U8, access: AttributeAccess::Reportable, name: "BatteryVoltage" },
+            AttributeDefinition {
+                id: ATTR_BATTERY_VOLTAGE,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::Reportable,
+                name: "BatteryVoltage",
+            },
             ZclValue::U8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_BATTERY_PERCENTAGE_REMAINING, data_type: ZclDataType::U8, access: AttributeAccess::Reportable, name: "BatteryPercentageRemaining" },
+            AttributeDefinition {
+                id: ATTR_BATTERY_PERCENTAGE_REMAINING,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::Reportable,
+                name: "BatteryPercentageRemaining",
+            },
             ZclValue::U8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_BATTERY_SIZE, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadWrite, name: "BatterySize" },
+            AttributeDefinition {
+                id: ATTR_BATTERY_SIZE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadWrite,
+                name: "BatterySize",
+            },
             ZclValue::Enum8(0xFF), // Unknown
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_BATTERY_QUANTITY, data_type: ZclDataType::U8, access: AttributeAccess::ReadWrite, name: "BatteryQuantity" },
+            AttributeDefinition {
+                id: ATTR_BATTERY_QUANTITY,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::ReadWrite,
+                name: "BatteryQuantity",
+            },
             ZclValue::U8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_BATTERY_RATED_VOLTAGE, data_type: ZclDataType::U8, access: AttributeAccess::ReadWrite, name: "BatteryRatedVoltage" },
+            AttributeDefinition {
+                id: ATTR_BATTERY_RATED_VOLTAGE,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::ReadWrite,
+                name: "BatteryRatedVoltage",
+            },
             ZclValue::U8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_BATTERY_ALARM_MASK, data_type: ZclDataType::Bitmap8, access: AttributeAccess::ReadWrite, name: "BatteryAlarmMask" },
+            AttributeDefinition {
+                id: ATTR_BATTERY_ALARM_MASK,
+                data_type: ZclDataType::Bitmap8,
+                access: AttributeAccess::ReadWrite,
+                name: "BatteryAlarmMask",
+            },
             ZclValue::Bitmap8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_BATTERY_VOLTAGE_MIN_THRESHOLD, data_type: ZclDataType::U8, access: AttributeAccess::ReadWrite, name: "BatteryVoltageMinThreshold" },
+            AttributeDefinition {
+                id: ATTR_BATTERY_VOLTAGE_MIN_THRESHOLD,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::ReadWrite,
+                name: "BatteryVoltageMinThreshold",
+            },
             ZclValue::U8(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_BATTERY_ALARM_STATE, data_type: ZclDataType::Bitmap32, access: AttributeAccess::ReadOnly, name: "BatteryAlarmState" },
+            AttributeDefinition {
+                id: ATTR_BATTERY_ALARM_STATE,
+                data_type: ZclDataType::Bitmap32,
+                access: AttributeAccess::ReadOnly,
+                name: "BatteryAlarmState",
+            },
             ZclValue::Bitmap32(0),
         );
         Self { store }
@@ -60,20 +106,35 @@ impl PowerConfigCluster {
 
     /// Update battery voltage (in 100 mV units, e.g. 33 = 3.3 V).
     pub fn set_battery_voltage(&mut self, voltage_100mv: u8) {
-        let _ = self.store.set_raw(ATTR_BATTERY_VOLTAGE, ZclValue::U8(voltage_100mv));
+        let _ = self
+            .store
+            .set_raw(ATTR_BATTERY_VOLTAGE, ZclValue::U8(voltage_100mv));
     }
 
     /// Update battery percentage (in 0.5% units, e.g. 200 = 100%).
     pub fn set_battery_percentage(&mut self, half_percent: u8) {
-        let _ = self.store.set_raw(ATTR_BATTERY_PERCENTAGE_REMAINING, ZclValue::U8(half_percent));
+        let _ = self.store.set_raw(
+            ATTR_BATTERY_PERCENTAGE_REMAINING,
+            ZclValue::U8(half_percent),
+        );
     }
 }
 
 impl Cluster for PowerConfigCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId::POWER_CONFIG }
-    fn handle_command(&mut self, _cmd_id: CommandId, _payload: &[u8]) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId::POWER_CONFIG
+    }
+    fn handle_command(
+        &mut self,
+        _cmd_id: CommandId,
+        _payload: &[u8],
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
         Err(ZclStatus::UnsupClusterCommand)
     }
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

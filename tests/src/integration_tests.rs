@@ -1,8 +1,8 @@
 //! Tests for the Trust Center and coordinator/router modules.
 
-use zigbee::trust_center::*;
 use zigbee::coordinator::*;
 use zigbee::router::*;
+use zigbee::trust_center::*;
 use zigbee_types::*;
 
 // ── Trust Center Tests ───────────────────────────────
@@ -60,7 +60,8 @@ fn test_tc_join_acceptance() {
     assert!(!tc.should_accept_join(&dev));
 
     // Provision install code key
-    tc.set_link_key(dev, [0x42; 16], TcKeyType::InstallCode).unwrap();
+    tc.set_link_key(dev, [0x42; 16], TcKeyType::InstallCode)
+        .unwrap();
     assert!(tc.should_accept_join(&dev));
 }
 
@@ -68,7 +69,8 @@ fn test_tc_join_acceptance() {
 fn test_tc_frame_counter() {
     let mut tc = TrustCenter::new([0; 16]);
     let dev: IeeeAddress = [1; 8];
-    tc.set_link_key(dev, [0; 16], TcKeyType::DefaultGlobal).unwrap();
+    tc.set_link_key(dev, [0; 16], TcKeyType::DefaultGlobal)
+        .unwrap();
 
     assert!(tc.update_frame_counter(&dev, 1));
     assert!(tc.update_frame_counter(&dev, 5));
@@ -157,9 +159,14 @@ fn test_router_capacity_limit() {
     };
     let mut router = Router::new(config);
 
-    router.add_child([1; 8], ShortAddress(1), false, true).unwrap();
-    router.add_child([2; 8], ShortAddress(2), false, true).unwrap();
+    router
+        .add_child([1; 8], ShortAddress(1), false, true)
+        .unwrap();
+    router
+        .add_child([2; 8], ShortAddress(2), false, true)
+        .unwrap();
     assert!(!router.can_accept_child());
-    assert!(router.add_child([3; 8], ShortAddress(3), false, true).is_err());
-
+    assert!(router
+        .add_child([3; 8], ShortAddress(3), false, true)
+        .is_err());
 }

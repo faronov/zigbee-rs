@@ -110,10 +110,7 @@ pub fn process_write<const N: usize>(
             Ok(()) => ZclStatus::Success,
             Err(e) => e,
         };
-        let _ = records.push(WriteAttributeStatusRecord {
-            status,
-            id: rec.id,
-        });
+        let _ = records.push(WriteAttributeStatusRecord { status, id: rec.id });
     }
     WriteAttributesResponse { records }
 }
@@ -145,10 +142,7 @@ pub fn process_write_undivided<const N: usize>(
         if status != ZclStatus::Success {
             all_ok = false;
         }
-        let _ = records.push(WriteAttributeStatusRecord {
-            status,
-            id: rec.id,
-        });
+        let _ = records.push(WriteAttributeStatusRecord { status, id: rec.id });
     }
 
     // Second pass: apply if all valid
@@ -164,7 +158,9 @@ pub fn process_write_undivided<const N: usize>(
                 id: rec.id,
             });
         }
-        return WriteAttributesResponse { records: ok_records };
+        return WriteAttributesResponse {
+            records: ok_records,
+        };
     }
 
     WriteAttributesResponse { records }

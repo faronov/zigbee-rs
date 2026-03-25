@@ -30,6 +30,12 @@ pub struct LevelControlCluster {
     store: AttributeStore<10>,
 }
 
+impl Default for LevelControlCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LevelControlCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();

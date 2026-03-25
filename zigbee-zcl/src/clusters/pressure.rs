@@ -25,39 +25,84 @@ impl PressureCluster {
     pub fn new(min_tenth_kpa: i16, max_tenth_kpa: i16) -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MEASURED_VALUE, data_type: ZclDataType::I16, access: AttributeAccess::Reportable, name: "MeasuredValue" },
+            AttributeDefinition {
+                id: ATTR_MEASURED_VALUE,
+                data_type: ZclDataType::I16,
+                access: AttributeAccess::Reportable,
+                name: "MeasuredValue",
+            },
             ZclValue::I16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MIN_MEASURED_VALUE, data_type: ZclDataType::I16, access: AttributeAccess::ReadOnly, name: "MinMeasuredValue" },
+            AttributeDefinition {
+                id: ATTR_MIN_MEASURED_VALUE,
+                data_type: ZclDataType::I16,
+                access: AttributeAccess::ReadOnly,
+                name: "MinMeasuredValue",
+            },
             ZclValue::I16(min_tenth_kpa),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MAX_MEASURED_VALUE, data_type: ZclDataType::I16, access: AttributeAccess::ReadOnly, name: "MaxMeasuredValue" },
+            AttributeDefinition {
+                id: ATTR_MAX_MEASURED_VALUE,
+                data_type: ZclDataType::I16,
+                access: AttributeAccess::ReadOnly,
+                name: "MaxMeasuredValue",
+            },
             ZclValue::I16(max_tenth_kpa),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_TOLERANCE, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "Tolerance" },
+            AttributeDefinition {
+                id: ATTR_TOLERANCE,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "Tolerance",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_SCALED_VALUE, data_type: ZclDataType::I16, access: AttributeAccess::Reportable, name: "ScaledValue" },
+            AttributeDefinition {
+                id: ATTR_SCALED_VALUE,
+                data_type: ZclDataType::I16,
+                access: AttributeAccess::Reportable,
+                name: "ScaledValue",
+            },
             ZclValue::I16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MIN_SCALED_VALUE, data_type: ZclDataType::I16, access: AttributeAccess::ReadOnly, name: "MinScaledValue" },
+            AttributeDefinition {
+                id: ATTR_MIN_SCALED_VALUE,
+                data_type: ZclDataType::I16,
+                access: AttributeAccess::ReadOnly,
+                name: "MinScaledValue",
+            },
             ZclValue::I16(min_tenth_kpa),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MAX_SCALED_VALUE, data_type: ZclDataType::I16, access: AttributeAccess::ReadOnly, name: "MaxScaledValue" },
+            AttributeDefinition {
+                id: ATTR_MAX_SCALED_VALUE,
+                data_type: ZclDataType::I16,
+                access: AttributeAccess::ReadOnly,
+                name: "MaxScaledValue",
+            },
             ZclValue::I16(max_tenth_kpa),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_SCALED_TOLERANCE, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ScaledTolerance" },
+            AttributeDefinition {
+                id: ATTR_SCALED_TOLERANCE,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ScaledTolerance",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_SCALE, data_type: ZclDataType::I8, access: AttributeAccess::ReadOnly, name: "Scale" },
+            AttributeDefinition {
+                id: ATTR_SCALE,
+                data_type: ZclDataType::I8,
+                access: AttributeAccess::ReadOnly,
+                name: "Scale",
+            },
             ZclValue::I8(0),
         );
         Self { store }
@@ -65,15 +110,27 @@ impl PressureCluster {
 
     /// Update the measured pressure (in 0.1 kPa units, e.g. 10132 = 1013.2 hPa).
     pub fn set_pressure(&mut self, tenth_kpa: i16) {
-        let _ = self.store.set_raw(ATTR_MEASURED_VALUE, ZclValue::I16(tenth_kpa));
+        let _ = self
+            .store
+            .set_raw(ATTR_MEASURED_VALUE, ZclValue::I16(tenth_kpa));
     }
 }
 
 impl Cluster for PressureCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId::PRESSURE }
-    fn handle_command(&mut self, _cmd_id: CommandId, _payload: &[u8]) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId::PRESSURE
+    }
+    fn handle_command(
+        &mut self,
+        _cmd_id: CommandId,
+        _payload: &[u8],
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
         Err(ZclStatus::UnsupClusterCommand)
     }
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

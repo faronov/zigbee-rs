@@ -142,8 +142,7 @@ impl BindRsp {
         if data.is_empty() {
             return Err(ZdoError::InvalidLength);
         }
-        let status =
-            crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
+        let status = crate::ZdpStatus::from_u8(data[0]).ok_or(ZdoError::InvalidData)?;
         Ok(Self { status })
     }
 }

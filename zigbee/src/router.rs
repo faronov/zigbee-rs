@@ -72,6 +72,7 @@ impl Router {
     }
 
     /// Add a child device.
+    #[allow(clippy::result_unit_err)]
     pub fn add_child(
         &mut self,
         ieee: IeeeAddress,
@@ -102,9 +103,11 @@ impl Router {
 
     /// Remove a child device by short address.
     pub fn remove_child(&mut self, addr: ShortAddress) {
-        if let Some(slot) = self.children.iter_mut().find(|c| {
-            c.as_ref().map_or(false, |d| d.short_address == addr)
-        }) {
+        if let Some(slot) = self
+            .children
+            .iter_mut()
+            .find(|c| c.as_ref().is_some_and(|d| d.short_address == addr))
+        {
             *slot = None;
             self.child_count = self.child_count.saturating_sub(1);
         }
@@ -112,17 +115,26 @@ impl Router {
 
     /// Find a child by short address.
     pub fn find_child(&self, addr: ShortAddress) -> Option<&ChildDevice> {
-        self.children.iter().flatten().find(|c| c.short_address == addr)
+        self.children
+            .iter()
+            .flatten()
+            .find(|c| c.short_address == addr)
     }
 
     /// Find a child by IEEE address.
     pub fn find_child_by_ieee(&self, ieee: &IeeeAddress) -> Option<&ChildDevice> {
-        self.children.iter().flatten().find(|c| &c.ieee_address == ieee)
+        self.children
+            .iter()
+            .flatten()
+            .find(|c| &c.ieee_address == ieee)
     }
 
     /// Check if a frame destination is one of our children.
     pub fn is_child(&self, addr: ShortAddress) -> bool {
-        self.children.iter().flatten().any(|c| c.short_address == addr)
+        self.children
+            .iter()
+            .flatten()
+            .any(|c| c.short_address == addr)
     }
 
     /// Whether we can accept more children.
@@ -146,7 +158,12 @@ impl Router {
 
     /// Record activity from a child (reset age).
     pub fn child_activity(&mut self, addr: ShortAddress) {
-        if let Some(child) = self.children.iter_mut().flatten().find(|c| c.short_address == addr) {
+        if let Some(child) = self
+            .children
+            .iter_mut()
+            .flatten()
+            .find(|c| c.short_address == addr)
+        {
             child.age = 0;
         }
     }

@@ -2,7 +2,7 @@
 
 use zigbee_mac::mock::MockMac;
 use zigbee_mac::primitives::*;
-use zigbee_mac::{MacDriver, AddressMode, TxOptions};
+use zigbee_mac::{AddressMode, MacDriver, TxOptions};
 use zigbee_types::*;
 
 fn make_mock() -> MockMac {
@@ -14,11 +14,13 @@ fn make_mock() -> MockMac {
 #[tokio::test]
 async fn test_mock_scan_empty() {
     let mut mac = make_mock();
-    let result = mac.mlme_scan(MlmeScanRequest {
-        scan_type: ScanType::Active,
-        channel_mask: ChannelMask::ALL_2_4GHZ,
-        scan_duration: 3,
-    }).await;
+    let result = mac
+        .mlme_scan(MlmeScanRequest {
+            scan_type: ScanType::Active,
+            channel_mask: ChannelMask::ALL_2_4GHZ,
+            scan_duration: 3,
+        })
+        .await;
 
     // Mock returns NoBeacon when no beacons are configured
     assert!(result.is_err());
@@ -55,11 +57,14 @@ async fn test_mock_scan_with_beacon() {
         },
     });
 
-    let result = mac.mlme_scan(MlmeScanRequest {
-        scan_type: ScanType::Active,
-        channel_mask: ChannelMask::ALL_2_4GHZ,
-        scan_duration: 3,
-    }).await.unwrap();
+    let result = mac
+        .mlme_scan(MlmeScanRequest {
+            scan_type: ScanType::Active,
+            channel_mask: ChannelMask::ALL_2_4GHZ,
+            scan_duration: 3,
+        })
+        .await
+        .unwrap();
 
     assert_eq!(result.pan_descriptors.len(), 1);
     assert_eq!(result.pan_descriptors[0].channel, 15);
@@ -78,17 +83,19 @@ async fn test_mock_associate_default() {
         status: AssociationStatus::Success,
     });
 
-    let result = mac.mlme_associate(MlmeAssociateRequest {
-        channel: 15,
-        coord_address: MacAddress::Short(PanId(0x1234), ShortAddress::COORDINATOR),
-        capability_info: CapabilityInfo {
-            device_type_ffd: false,
-            mains_powered: false,
-            rx_on_when_idle: false,
-            security_capable: false,
-            allocate_address: true,
-        },
-    }).await;
+    let result = mac
+        .mlme_associate(MlmeAssociateRequest {
+            channel: 15,
+            coord_address: MacAddress::Short(PanId(0x1234), ShortAddress::COORDINATOR),
+            capability_info: CapabilityInfo {
+                device_type_ffd: false,
+                mains_powered: false,
+                rx_on_when_idle: false,
+                security_capable: false,
+                allocate_address: true,
+            },
+        })
+        .await;
 
     assert!(result.is_ok());
     let confirm = result.unwrap();
@@ -103,13 +110,15 @@ async fn test_mock_data_tx() {
     let mut mac = make_mock();
     let payload = [0x01, 0x02, 0x03, 0x04];
 
-    let result = mac.mcps_data(zigbee_mac::McpsDataRequest {
-        src_addr_mode: AddressMode::Short,
-        dst_address: MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
-        payload: &payload,
-        msdu_handle: 1,
-        tx_options: TxOptions::default(),
-    }).await;
+    let result = mac
+        .mcps_data(zigbee_mac::McpsDataRequest {
+            src_addr_mode: AddressMode::Short,
+            dst_address: MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
+            payload: &payload,
+            msdu_handle: 1,
+            tx_options: TxOptions::default(),
+        })
+        .await;
 
     assert!(result.is_ok());
 
@@ -143,10 +152,12 @@ async fn test_mock_pib_get_set() {
     }
 
     // Set short address
-    let result = mac.mlme_set(
-        PibAttribute::MacShortAddress,
-        PibValue::ShortAddress(ShortAddress(0x1234)),
-    ).await;
+    let result = mac
+        .mlme_set(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x1234)),
+        )
+        .await;
     assert!(result.is_ok());
 }
 
@@ -177,5 +188,4 @@ fn test_capability_info_to_byte() {
     assert_eq!(byte & 0x04, 0x04); // mains_powered
     assert_eq!(byte & 0x08, 0x08); // rx_on_when_idle
     assert_eq!(byte & 0x80, 0x80); // allocate_address
-
 }

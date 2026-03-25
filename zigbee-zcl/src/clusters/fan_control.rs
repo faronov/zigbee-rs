@@ -30,15 +30,31 @@ pub struct FanControlCluster {
     store: AttributeStore<2>,
 }
 
+impl Default for FanControlCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FanControlCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_FAN_MODE, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadWrite, name: "FanMode" },
+            AttributeDefinition {
+                id: ATTR_FAN_MODE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadWrite,
+                name: "FanMode",
+            },
             ZclValue::Enum8(FAN_MODE_AUTO),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_FAN_MODE_SEQUENCE, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadWrite, name: "FanModeSequence" },
+            AttributeDefinition {
+                id: ATTR_FAN_MODE_SEQUENCE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadWrite,
+                name: "FanModeSequence",
+            },
             ZclValue::Enum8(FAN_SEQ_LOW_MED_HIGH_AUTO),
         );
         Self { store }
@@ -59,12 +75,22 @@ impl FanControlCluster {
 }
 
 impl Cluster for FanControlCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId(0x0202) }
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId(0x0202)
+    }
 
-    fn handle_command(&mut self, _cmd_id: CommandId, _payload: &[u8]) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+    fn handle_command(
+        &mut self,
+        _cmd_id: CommandId,
+        _payload: &[u8],
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
         Err(ZclStatus::UnsupClusterCommand)
     }
 
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

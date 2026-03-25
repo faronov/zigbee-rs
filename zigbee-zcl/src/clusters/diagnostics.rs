@@ -29,6 +29,12 @@ pub struct DiagnosticsCluster {
     store: AttributeStore<15>,
 }
 
+impl Default for DiagnosticsCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DiagnosticsCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();

@@ -47,11 +47,22 @@ pub struct IasWdCluster {
     pub warning_duration: u16,
 }
 
+impl Default for IasWdCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IasWdCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MAX_DURATION, data_type: ZclDataType::U16, access: AttributeAccess::ReadWrite, name: "MaxDuration" },
+            AttributeDefinition {
+                id: ATTR_MAX_DURATION,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadWrite,
+                name: "MaxDuration",
+            },
             ZclValue::U16(240),
         );
         Self {
@@ -86,7 +97,9 @@ impl IasWdCluster {
 }
 
 impl Cluster for IasWdCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId(0x0502) }
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId(0x0502)
+    }
 
     fn handle_command(
         &mut self,
@@ -122,6 +135,10 @@ impl Cluster for IasWdCluster {
         }
     }
 
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

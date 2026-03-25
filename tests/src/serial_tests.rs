@@ -2,11 +2,11 @@
 
 #[cfg(test)]
 mod tests {
+    use zigbee_mac::serial::ezsp::{AshFrameType, EzspCodec, EzspFrame, ASH_FLAG, EZSP_VERSION};
     use zigbee_mac::serial::{
         crc16_ccitt, SerialCodec, SerialError, SerialFrame, CMD_DATA_REQ, CMD_RESET_REQ,
         CMD_SCAN_REQ, FRAME_START, MAX_FRAME_SIZE,
     };
-    use zigbee_mac::serial::ezsp::{AshFrameType, EzspCodec, EzspFrame, ASH_FLAG, EZSP_VERSION};
     use zigbee_nwk::security::{NwkSecurity, NwkSecurityHeader};
 
     // ── 1. CRC16-CCITT ──────────────────────────────────────────
@@ -182,7 +182,8 @@ mod tests {
 
     #[test]
     fn ash_rst_frame_roundtrip() {
-        let codec = EzspCodec::new();        let mut out = [0u8; 64];
+        let codec = EzspCodec::new();
+        let mut out = [0u8; 64];
         let len = codec.build_rst(&mut out[..]).unwrap();
 
         // Frame must be delimited by FLAG bytes

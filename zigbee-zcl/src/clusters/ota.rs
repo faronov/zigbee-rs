@@ -37,43 +37,93 @@ impl OtaCluster {
     pub fn new(current_version: u32) -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_UPGRADE_SERVER_ID, data_type: ZclDataType::IeeeAddr, access: AttributeAccess::ReadOnly, name: "UpgradeServerID" },
+            AttributeDefinition {
+                id: ATTR_UPGRADE_SERVER_ID,
+                data_type: ZclDataType::IeeeAddr,
+                access: AttributeAccess::ReadOnly,
+                name: "UpgradeServerID",
+            },
             ZclValue::IeeeAddr(0xFFFFFFFFFFFFFFFF),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_FILE_OFFSET, data_type: ZclDataType::U32, access: AttributeAccess::ReadOnly, name: "FileOffset" },
+            AttributeDefinition {
+                id: ATTR_FILE_OFFSET,
+                data_type: ZclDataType::U32,
+                access: AttributeAccess::ReadOnly,
+                name: "FileOffset",
+            },
             ZclValue::U32(0xFFFFFFFF),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_CURRENT_FILE_VERSION, data_type: ZclDataType::U32, access: AttributeAccess::ReadOnly, name: "CurrentFileVersion" },
+            AttributeDefinition {
+                id: ATTR_CURRENT_FILE_VERSION,
+                data_type: ZclDataType::U32,
+                access: AttributeAccess::ReadOnly,
+                name: "CurrentFileVersion",
+            },
             ZclValue::U32(current_version),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_CURRENT_STACK_VERSION, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "CurrentZigbeeStackVersion" },
+            AttributeDefinition {
+                id: ATTR_CURRENT_STACK_VERSION,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "CurrentZigbeeStackVersion",
+            },
             ZclValue::U16(0x0002), // Zigbee PRO
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_DOWNLOADED_FILE_VERSION, data_type: ZclDataType::U32, access: AttributeAccess::ReadOnly, name: "DownloadedFileVersion" },
+            AttributeDefinition {
+                id: ATTR_DOWNLOADED_FILE_VERSION,
+                data_type: ZclDataType::U32,
+                access: AttributeAccess::ReadOnly,
+                name: "DownloadedFileVersion",
+            },
             ZclValue::U32(0xFFFFFFFF),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_DOWNLOADED_STACK_VERSION, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "DownloadedZigbeeStackVersion" },
+            AttributeDefinition {
+                id: ATTR_DOWNLOADED_STACK_VERSION,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "DownloadedZigbeeStackVersion",
+            },
             ZclValue::U16(0xFFFF),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_IMAGE_UPGRADE_STATUS, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadOnly, name: "ImageUpgradeStatus" },
+            AttributeDefinition {
+                id: ATTR_IMAGE_UPGRADE_STATUS,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadOnly,
+                name: "ImageUpgradeStatus",
+            },
             ZclValue::Enum8(0x00), // Normal
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MANUFACTURER_ID, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ManufacturerID" },
+            AttributeDefinition {
+                id: ATTR_MANUFACTURER_ID,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ManufacturerID",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_IMAGE_TYPE_ID, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "ImageTypeID" },
+            AttributeDefinition {
+                id: ATTR_IMAGE_TYPE_ID,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "ImageTypeID",
+            },
             ZclValue::U16(0xFFFF),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MIN_BLOCK_PERIOD, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "MinimumBlockPeriod" },
+            AttributeDefinition {
+                id: ATTR_MIN_BLOCK_PERIOD,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "MinimumBlockPeriod",
+            },
             ZclValue::U16(0),
         );
         Self { store }
@@ -81,11 +131,21 @@ impl OtaCluster {
 }
 
 impl Cluster for OtaCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId::OTA_UPGRADE }
-    fn handle_command(&mut self, _cmd_id: CommandId, _payload: &[u8]) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId::OTA_UPGRADE
+    }
+    fn handle_command(
+        &mut self,
+        _cmd_id: CommandId,
+        _payload: &[u8],
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
         // OTA is complex; real implementation would be in the application layer.
         Err(ZclStatus::UnsupClusterCommand)
     }
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

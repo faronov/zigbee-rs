@@ -7,9 +7,7 @@
 //! - `APSDE-DATA.confirm`:    transmission result
 //! - `APSDE-DATA.indication`: received data delivered to upper layer
 
-use crate::frames::{
-    ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader,
-};
+use crate::frames::{ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader};
 use crate::{ApsAddress, ApsAddressMode, ApsLayer, ApsStatus, ApsTxOptions};
 use zigbee_mac::MacDriver;
 use zigbee_nwk::NwkStatus;

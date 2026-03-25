@@ -115,9 +115,7 @@ pub fn data_type_size(dt: ZclDataType) -> Option<usize> {
         | ZclDataType::Bitmap32
         | ZclDataType::Float32
         | ZclDataType::UtcTime
-        | ZclDataType::BacNetOid => {
-            Some(4)
-        }
+        | ZclDataType::BacNetOid => Some(4),
         ZclDataType::TimeOfDay | ZclDataType::Date => Some(4),
         ZclDataType::U48 => Some(6),
         ZclDataType::U64

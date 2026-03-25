@@ -99,9 +99,7 @@ impl MultistateInputCluster {
 
     /// Set the present value of the multistate input.
     pub fn set_value(&mut self, value: u16) {
-        let _ = self
-            .store
-            .set_raw(ATTR_PRESENT_VALUE, ZclValue::U16(value));
+        let _ = self.store.set_raw(ATTR_PRESENT_VALUE, ZclValue::U16(value));
     }
 
     /// Get the current present value.

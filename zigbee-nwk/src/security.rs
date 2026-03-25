@@ -121,7 +121,11 @@ impl NwkSecurity {
     /// Check and update incoming frame counter (replay protection).
     /// Returns true if the frame counter is valid (newer than last seen).
     pub fn check_frame_counter(&mut self, source: &IeeeAddress, counter: u32) -> bool {
-        if let Some(entry) = self.frame_counter_table.iter_mut().find(|e| e.source == *source) {
+        if let Some(entry) = self
+            .frame_counter_table
+            .iter_mut()
+            .find(|e| e.source == *source)
+        {
             if counter > entry.counter {
                 entry.counter = counter;
                 true
@@ -196,8 +200,8 @@ impl Default for NwkSecurity {
 // Zigbee uses Security Level 5: ENC-MIC-32 (M=4 byte MIC, L=2).
 
 use aes::Aes128;
-use ccm::aead::generic_array::GenericArray;
 use ccm::aead::AeadInPlace;
+use ccm::aead::generic_array::GenericArray;
 use ccm::consts::{U4, U13};
 use ccm::{Ccm, KeyInit};
 

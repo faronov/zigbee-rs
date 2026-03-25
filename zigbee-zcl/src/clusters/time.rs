@@ -34,6 +34,12 @@ pub struct TimeCluster {
     store: AttributeStore<10>,
 }
 
+impl Default for TimeCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TimeCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();

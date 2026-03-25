@@ -141,6 +141,7 @@ impl NeighborTable {
     }
 
     /// Add or update a neighbor entry. Returns Ok if added, Err if table full.
+    #[allow(clippy::result_unit_err)]
     pub fn add_or_update(&mut self, entry: NeighborEntry) -> Result<(), ()> {
         // Check if already present
         if let Some(existing) = self.entries[..self.count]
@@ -162,8 +163,13 @@ impl NeighborTable {
             Ok(())
         } else {
             // Table full — try to evict oldest non-parent, non-child
-            if let Some(victim) = self.entries.iter_mut()
-                .filter(|e| e.active && !matches!(e.relationship, Relationship::Parent | Relationship::Child))
+            if let Some(victim) = self
+                .entries
+                .iter_mut()
+                .filter(|e| {
+                    e.active
+                        && !matches!(e.relationship, Relationship::Parent | Relationship::Child)
+                })
                 .max_by_key(|e| e.age)
             {
                 *victim = entry;
@@ -177,7 +183,11 @@ impl NeighborTable {
 
     /// Remove a neighbor by short address.
     pub fn remove(&mut self, addr: ShortAddress) {
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.active && e.network_address == addr) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.active && e.network_address == addr)
+        {
             entry.active = false;
         }
     }

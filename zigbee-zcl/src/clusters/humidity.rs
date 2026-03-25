@@ -20,19 +20,39 @@ impl HumidityCluster {
     pub fn new(min_hundredths: u16, max_hundredths: u16) -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MEASURED_VALUE, data_type: ZclDataType::U16, access: AttributeAccess::Reportable, name: "MeasuredValue" },
+            AttributeDefinition {
+                id: ATTR_MEASURED_VALUE,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::Reportable,
+                name: "MeasuredValue",
+            },
             ZclValue::U16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MIN_MEASURED_VALUE, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "MinMeasuredValue" },
+            AttributeDefinition {
+                id: ATTR_MIN_MEASURED_VALUE,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "MinMeasuredValue",
+            },
             ZclValue::U16(min_hundredths),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_MAX_MEASURED_VALUE, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "MaxMeasuredValue" },
+            AttributeDefinition {
+                id: ATTR_MAX_MEASURED_VALUE,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "MaxMeasuredValue",
+            },
             ZclValue::U16(max_hundredths),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_TOLERANCE, data_type: ZclDataType::U16, access: AttributeAccess::ReadOnly, name: "Tolerance" },
+            AttributeDefinition {
+                id: ATTR_TOLERANCE,
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::ReadOnly,
+                name: "Tolerance",
+            },
             ZclValue::U16(0),
         );
         Self { store }
@@ -40,15 +60,27 @@ impl HumidityCluster {
 
     /// Update the measured humidity (in 0.01% RH units).
     pub fn set_humidity(&mut self, hundredths: u16) {
-        let _ = self.store.set_raw(ATTR_MEASURED_VALUE, ZclValue::U16(hundredths));
+        let _ = self
+            .store
+            .set_raw(ATTR_MEASURED_VALUE, ZclValue::U16(hundredths));
     }
 }
 
 impl Cluster for HumidityCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId::HUMIDITY }
-    fn handle_command(&mut self, _cmd_id: CommandId, _payload: &[u8]) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId::HUMIDITY
+    }
+    fn handle_command(
+        &mut self,
+        _cmd_id: CommandId,
+        _payload: &[u8],
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
         Err(ZclStatus::UnsupClusterCommand)
     }
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

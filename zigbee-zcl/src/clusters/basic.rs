@@ -30,12 +30,7 @@ pub struct BasicCluster {
 }
 
 impl BasicCluster {
-    pub fn new(
-        manufacturer: &[u8],
-        model: &[u8],
-        date_code: &[u8],
-        sw_build: &[u8],
-    ) -> Self {
+    pub fn new(manufacturer: &[u8], model: &[u8], date_code: &[u8], sw_build: &[u8]) -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
             AttributeDefinition {
@@ -132,7 +127,9 @@ impl BasicCluster {
 
     /// Set the power source enum value.
     pub fn set_power_source(&mut self, source: u8) {
-        let _ = self.store.set_raw(ATTR_POWER_SOURCE, ZclValue::Enum8(source));
+        let _ = self
+            .store
+            .set_raw(ATTR_POWER_SOURCE, ZclValue::Enum8(source));
     }
 }
 

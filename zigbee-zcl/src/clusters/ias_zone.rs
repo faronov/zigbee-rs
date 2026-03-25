@@ -49,31 +49,66 @@ impl IasZoneCluster {
     pub fn new(zone_type: u16) -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
-            AttributeDefinition { id: ATTR_ZONE_STATE, data_type: ZclDataType::Enum8, access: AttributeAccess::ReadOnly, name: "ZoneState" },
+            AttributeDefinition {
+                id: ATTR_ZONE_STATE,
+                data_type: ZclDataType::Enum8,
+                access: AttributeAccess::ReadOnly,
+                name: "ZoneState",
+            },
             ZclValue::Enum8(ZONE_STATE_NOT_ENROLLED),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_ZONE_TYPE, data_type: ZclDataType::Enum16, access: AttributeAccess::ReadOnly, name: "ZoneType" },
+            AttributeDefinition {
+                id: ATTR_ZONE_TYPE,
+                data_type: ZclDataType::Enum16,
+                access: AttributeAccess::ReadOnly,
+                name: "ZoneType",
+            },
             ZclValue::Enum16(zone_type),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_ZONE_STATUS, data_type: ZclDataType::Bitmap16, access: AttributeAccess::ReadOnly, name: "ZoneStatus" },
+            AttributeDefinition {
+                id: ATTR_ZONE_STATUS,
+                data_type: ZclDataType::Bitmap16,
+                access: AttributeAccess::ReadOnly,
+                name: "ZoneStatus",
+            },
             ZclValue::Bitmap16(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_IAS_CIE_ADDRESS, data_type: ZclDataType::IeeeAddr, access: AttributeAccess::ReadWrite, name: "IAS_CIE_Address" },
+            AttributeDefinition {
+                id: ATTR_IAS_CIE_ADDRESS,
+                data_type: ZclDataType::IeeeAddr,
+                access: AttributeAccess::ReadWrite,
+                name: "IAS_CIE_Address",
+            },
             ZclValue::IeeeAddr(0),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_ZONE_ID, data_type: ZclDataType::U8, access: AttributeAccess::ReadOnly, name: "ZoneID" },
+            AttributeDefinition {
+                id: ATTR_ZONE_ID,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::ReadOnly,
+                name: "ZoneID",
+            },
             ZclValue::U8(0xFF),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_NUM_ZONE_SENSITIVITY_LEVELS, data_type: ZclDataType::U8, access: AttributeAccess::ReadOnly, name: "NumberOfZoneSensitivityLevelsSupported" },
+            AttributeDefinition {
+                id: ATTR_NUM_ZONE_SENSITIVITY_LEVELS,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::ReadOnly,
+                name: "NumberOfZoneSensitivityLevelsSupported",
+            },
             ZclValue::U8(2),
         );
         let _ = store.register(
-            AttributeDefinition { id: ATTR_CURRENT_ZONE_SENSITIVITY_LEVEL, data_type: ZclDataType::U8, access: AttributeAccess::ReadWrite, name: "CurrentZoneSensitivityLevel" },
+            AttributeDefinition {
+                id: ATTR_CURRENT_ZONE_SENSITIVITY_LEVEL,
+                data_type: ZclDataType::U8,
+                access: AttributeAccess::ReadWrite,
+                name: "CurrentZoneSensitivityLevel",
+            },
             ZclValue::U8(0),
         );
         Self { store }
@@ -81,12 +116,16 @@ impl IasZoneCluster {
 
     /// Update zone status bits.
     pub fn set_zone_status(&mut self, status: u16) {
-        let _ = self.store.set_raw(ATTR_ZONE_STATUS, ZclValue::Bitmap16(status));
+        let _ = self
+            .store
+            .set_raw(ATTR_ZONE_STATUS, ZclValue::Bitmap16(status));
     }
 }
 
 impl Cluster for IasZoneCluster {
-    fn cluster_id(&self) -> ClusterId { ClusterId::IAS_ZONE }
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId::IAS_ZONE
+    }
 
     fn handle_command(
         &mut self,
@@ -102,14 +141,14 @@ impl Cluster for IasZoneCluster {
                 let zone_id = payload[1];
                 if enroll_response_code == 0x00 {
                     // Success
-                    let _ = self.store.set_raw(ATTR_ZONE_STATE, ZclValue::Enum8(ZONE_STATE_ENROLLED));
+                    let _ = self
+                        .store
+                        .set_raw(ATTR_ZONE_STATE, ZclValue::Enum8(ZONE_STATE_ENROLLED));
                     let _ = self.store.set_raw(ATTR_ZONE_ID, ZclValue::U8(zone_id));
                 }
                 Ok(heapless::Vec::new())
             }
-            CMD_INITIATE_NORMAL_OP_MODE => {
-                Ok(heapless::Vec::new())
-            }
+            CMD_INITIATE_NORMAL_OP_MODE => Ok(heapless::Vec::new()),
             CMD_INITIATE_TEST_MODE => {
                 // Payload: test mode duration (u8) + current zone sensitivity level (u8)
                 Ok(heapless::Vec::new())
@@ -118,6 +157,10 @@ impl Cluster for IasZoneCluster {
         }
     }
 
-    fn attributes(&self) -> &dyn AttributeStoreAccess { &self.store }
-    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess { &mut self.store }
+    fn attributes(&self) -> &dyn AttributeStoreAccess {
+        &self.store
+    }
+    fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
+        &mut self.store
+    }
 }

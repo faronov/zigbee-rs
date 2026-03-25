@@ -110,14 +110,13 @@ impl ConfigureReportingRequest {
                 let max_interval = u16::from_le_bytes([data[i], data[i + 1]]);
                 i += 2;
                 // Reportable change only for analog types
-                let reportable_change =
-                    if data_types::is_analog_type(dt) {
-                        let (val, consumed) = ZclValue::deserialize(dt, &data[i..])?;
-                        i += consumed;
-                        Some(val)
-                    } else {
-                        None
-                    };
+                let reportable_change = if data_types::is_analog_type(dt) {
+                    let (val, consumed) = ZclValue::deserialize(dt, &data[i..])?;
+                    i += consumed;
+                    Some(val)
+                } else {
+                    None
+                };
                 configs
                     .push(ReportingConfig {
                         direction,
@@ -165,6 +164,12 @@ struct ReportState {
 #[derive(Debug)]
 pub struct ReportingEngine {
     states: heapless::Vec<ReportState, MAX_REPORT_CONFIGS>,
+}
+
+impl Default for ReportingEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReportingEngine {

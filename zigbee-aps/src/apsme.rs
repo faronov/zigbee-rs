@@ -182,18 +182,19 @@ impl<M: MacDriver> ApsLayer<M> {
     /// APSME-BIND.request — add a binding table entry.
     pub fn apsme_bind(&mut self, req: &ApsmeBindRequest) -> ApsmeBindConfirm {
         let entry = match req.dst_addr_mode {
-            BindingDstMode::Group => {
-                BindingEntry::group(req.src_addr, req.src_endpoint, req.cluster_id, req.group_address)
-            }
-            BindingDstMode::Extended => {
-                BindingEntry::unicast(
-                    req.src_addr,
-                    req.src_endpoint,
-                    req.cluster_id,
-                    req.dst_addr,
-                    req.dst_endpoint,
-                )
-            }
+            BindingDstMode::Group => BindingEntry::group(
+                req.src_addr,
+                req.src_endpoint,
+                req.cluster_id,
+                req.group_address,
+            ),
+            BindingDstMode::Extended => BindingEntry::unicast(
+                req.src_addr,
+                req.src_endpoint,
+                req.cluster_id,
+                req.dst_addr,
+                req.dst_endpoint,
+            ),
         };
 
         let status = match self.binding_table.add(entry) {
@@ -258,11 +259,10 @@ impl<M: MacDriver> ApsLayer<M> {
     }
 
     /// APSME-REMOVE-GROUP.request — remove an endpoint from a group.
-    pub fn apsme_remove_group(
-        &mut self,
-        req: &ApsmeRemoveGroupRequest,
-    ) -> ApsmeRemoveGroupConfirm {
-        let removed = self.group_table.remove_group(req.group_address, req.endpoint);
+    pub fn apsme_remove_group(&mut self, req: &ApsmeRemoveGroupRequest) -> ApsmeRemoveGroupConfirm {
+        let removed = self
+            .group_table
+            .remove_group(req.group_address, req.endpoint);
         ApsmeRemoveGroupConfirm {
             status: if removed {
                 ApsStatus::Success
@@ -292,10 +292,7 @@ impl<M: MacDriver> ApsLayer<M> {
     ///
     /// Builds an APS Transport Key command frame and sends it secured
     /// with the Trust Center link key (or NWK key for network key transport).
-    pub async fn apsme_transport_key(
-        &mut self,
-        req: &ApsmeTransportKeyRequest,
-    ) -> ApsStatus {
+    pub async fn apsme_transport_key(&mut self, req: &ApsmeTransportKeyRequest) -> ApsStatus {
         // Store the key locally
         match req.key_type {
             ApsKeyType::TrustCenterLinkKey | ApsKeyType::ApplicationLinkKey => {
@@ -327,10 +324,7 @@ impl<M: MacDriver> ApsLayer<M> {
     }
 
     /// APSME-REQUEST-KEY.request — request a key from the Trust Center.
-    pub async fn apsme_request_key(
-        &mut self,
-        req: &ApsmeRequestKeyRequest,
-    ) -> ApsStatus {
+    pub async fn apsme_request_key(&mut self, req: &ApsmeRequestKeyRequest) -> ApsStatus {
         // TODO: Build APS command frame (Request Key) and send to TC
         log::debug!(
             "APSME-REQUEST-KEY: type={:?}, dst={:02X?}",
@@ -341,10 +335,7 @@ impl<M: MacDriver> ApsLayer<M> {
     }
 
     /// APSME-SWITCH-KEY.request — switch to a new active network key.
-    pub async fn apsme_switch_key(
-        &mut self,
-        req: &ApsmeSwitchKeyRequest,
-    ) -> ApsStatus {
+    pub async fn apsme_switch_key(&mut self, req: &ApsmeSwitchKeyRequest) -> ApsStatus {
         // TODO: Build APS Switch Key command and broadcast
         log::debug!(
             "APSME-SWITCH-KEY: seq={}, dst={:02X?}",
@@ -355,10 +346,7 @@ impl<M: MacDriver> ApsLayer<M> {
     }
 
     /// APSME-VERIFY-KEY.request — initiate key verification with TC.
-    pub async fn apsme_verify_key(
-        &mut self,
-        req: &ApsmeVerifyKeyRequest,
-    ) -> ApsStatus {
+    pub async fn apsme_verify_key(&mut self, req: &ApsmeVerifyKeyRequest) -> ApsStatus {
         // TODO: Build APS Verify Key command frame
         log::debug!(
             "APSME-VERIFY-KEY: type={:?}, dst={:02X?}",

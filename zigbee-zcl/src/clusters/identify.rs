@@ -21,6 +21,12 @@ pub struct IdentifyCluster {
     store: AttributeStore<4>,
 }
 
+impl Default for IdentifyCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IdentifyCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();
@@ -40,7 +46,9 @@ impl IdentifyCluster {
     pub fn tick(&mut self, elapsed_secs: u16) {
         if let Some(ZclValue::U16(t)) = self.store.get(ATTR_IDENTIFY_TIME) {
             let remaining = t.saturating_sub(elapsed_secs);
-            let _ = self.store.set_raw(ATTR_IDENTIFY_TIME, ZclValue::U16(remaining));
+            let _ = self
+                .store
+                .set_raw(ATTR_IDENTIFY_TIME, ZclValue::U16(remaining));
         }
     }
 
@@ -72,12 +80,12 @@ impl Cluster for IdentifyCluster {
             CMD_IDENTIFY_QUERY => {
                 // Respond with IdentifyQueryResponse if identifying.
                 let mut resp = heapless::Vec::new();
-                if let Some(ZclValue::U16(t)) = self.store.get(ATTR_IDENTIFY_TIME) {
-                    if *t > 0 {
-                        let b = t.to_le_bytes();
-                        let _ = resp.push(b[0]);
-                        let _ = resp.push(b[1]);
-                    }
+                if let Some(ZclValue::U16(t)) = self.store.get(ATTR_IDENTIFY_TIME)
+                    && *t > 0
+                {
+                    let b = t.to_le_bytes();
+                    let _ = resp.push(b[0]);
+                    let _ = resp.push(b[1]);
                 }
                 Ok(resp)
             }

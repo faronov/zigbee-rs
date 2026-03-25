@@ -32,6 +32,12 @@ pub struct PollControlCluster {
     fast_polling: bool,
 }
 
+impl Default for PollControlCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PollControlCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();
@@ -155,8 +161,7 @@ impl Cluster for PollControlCluster {
                 if payload.len() < 4 {
                     return Err(ZclStatus::MalformedCommand);
                 }
-                let interval =
-                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let interval = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 let _ = self
                     .store
                     .set_raw(ATTR_LONG_POLL_INTERVAL, ZclValue::U32(interval));

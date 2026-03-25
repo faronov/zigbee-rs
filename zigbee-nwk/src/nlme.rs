@@ -14,8 +14,8 @@ use crate::frames::{NwkFrameControl, NwkFrameType, NwkHeader};
 use crate::neighbor::{NeighborDeviceType, NeighborEntry, Relationship};
 use crate::nib::Nib;
 use crate::{DeviceType, NwkLayer, NwkStatus};
-use zigbee_mac::primitives::*;
 use zigbee_mac::pib::{PibAttribute, PibValue};
+use zigbee_mac::primitives::*;
 use zigbee_mac::{MacDriver, MacError};
 use zigbee_types::*;
 
@@ -81,7 +81,10 @@ impl<M: MacDriver> NwkLayer<M> {
         scan_duration: u8,
     ) -> Result<heapless::Vec<NetworkDescriptor, 16>, NwkStatus> {
         // Set macAutoRequest = false during scan
-        let _ = self.mac.mlme_set(PibAttribute::MacAutoRequest, PibValue::Bool(false)).await;
+        let _ = self
+            .mac
+            .mlme_set(PibAttribute::MacAutoRequest, PibValue::Bool(false))
+            .await;
 
         let scan_result = self
             .mac
@@ -94,7 +97,10 @@ impl<M: MacDriver> NwkLayer<M> {
             .map_err(|_| NwkStatus::NoNetworks)?;
 
         // Restore macAutoRequest
-        let _ = self.mac.mlme_set(PibAttribute::MacAutoRequest, PibValue::Bool(true)).await;
+        let _ = self
+            .mac
+            .mlme_set(PibAttribute::MacAutoRequest, PibValue::Bool(true))
+            .await;
 
         let mut networks = heapless::Vec::new();
         for pd in &scan_result.pan_descriptors {
@@ -111,7 +117,7 @@ impl<M: MacDriver> NwkLayer<M> {
         }
 
         // Sort by LQI (best signal first)
-        networks.sort_unstable_by(|a, b| b.lqi.cmp(&a.lqi));
+        networks.sort_unstable_by_key(|n| core::cmp::Reverse(n.lqi));
 
         Ok(networks)
     }
@@ -155,11 +161,20 @@ impl<M: MacDriver> NwkLayer<M> {
         let pan_id = PanId(generate_pan_id());
 
         // Configure MAC
-        self.mac.mlme_set(PibAttribute::MacShortAddress, PibValue::ShortAddress(ShortAddress::COORDINATOR)).await
+        self.mac
+            .mlme_set(
+                PibAttribute::MacShortAddress,
+                PibValue::ShortAddress(ShortAddress::COORDINATOR),
+            )
+            .await
             .map_err(|_| NwkStatus::StartupFailure)?;
-        self.mac.mlme_set(PibAttribute::MacPanId, PibValue::PanId(pan_id)).await
+        self.mac
+            .mlme_set(PibAttribute::MacPanId, PibValue::PanId(pan_id))
+            .await
             .map_err(|_| NwkStatus::StartupFailure)?;
-        self.mac.mlme_set(PibAttribute::MacRxOnWhenIdle, PibValue::Bool(true)).await
+        self.mac
+            .mlme_set(PibAttribute::MacRxOnWhenIdle, PibValue::Bool(true))
+            .await
             .map_err(|_| NwkStatus::StartupFailure)?;
 
         // Start PAN
@@ -182,7 +197,9 @@ impl<M: MacDriver> NwkLayer<M> {
         self.nib.depth = 0;
 
         // Read our IEEE address from MAC
-        if let Ok(PibValue::ExtendedAddress(addr)) = self.mac.mlme_get(PibAttribute::MacExtendedAddress).await {
+        if let Ok(PibValue::ExtendedAddress(addr)) =
+            self.mac.mlme_get(PibAttribute::MacExtendedAddress).await
+        {
             self.nib.ieee_address = addr;
             self.nib.extended_pan_id = addr; // Use own IEEE as extended PAN ID
         }
@@ -273,7 +290,9 @@ impl<M: MacDriver> NwkLayer<M> {
         self.nib.parent_address = ShortAddress::COORDINATOR;
 
         // Read our IEEE address
-        if let Ok(PibValue::ExtendedAddress(addr)) = self.mac.mlme_get(PibAttribute::MacExtendedAddress).await {
+        if let Ok(PibValue::ExtendedAddress(addr)) =
+            self.mac.mlme_get(PibAttribute::MacExtendedAddress).await
+        {
             self.nib.ieee_address = addr;
         }
 
@@ -281,8 +300,13 @@ impl<M: MacDriver> NwkLayer<M> {
         self.nib.depth = 1; // Simplified — real depth comes from beacon
 
         // Update MAC PIB
-        let _ = self.mac.mlme_set(PibAttribute::MacRxOnWhenIdle,
-            PibValue::Bool(self.device_type != DeviceType::EndDevice)).await;
+        let _ = self
+            .mac
+            .mlme_set(
+                PibAttribute::MacRxOnWhenIdle,
+                PibValue::Bool(self.device_type != DeviceType::EndDevice),
+            )
+            .await;
 
         // Add parent to neighbor table
         let parent = NeighborEntry {
@@ -321,10 +345,17 @@ impl<M: MacDriver> NwkLayer<M> {
         // This is used when a device has been disconnected but still knows the network key
 
         // Switch to the target channel
-        let _ = self.mac.mlme_set(PibAttribute::PhyCurrentChannel,
-            PibValue::U8(network.logical_channel)).await;
-        let _ = self.mac.mlme_set(PibAttribute::MacPanId,
-            PibValue::PanId(network.pan_id)).await;
+        let _ = self
+            .mac
+            .mlme_set(
+                PibAttribute::PhyCurrentChannel,
+                PibValue::U8(network.logical_channel),
+            )
+            .await;
+        let _ = self
+            .mac
+            .mlme_set(PibAttribute::MacPanId, PibValue::PanId(network.pan_id))
+            .await;
 
         // Build NWK Rejoin Request frame
         let cap_byte = CapabilityInfo {
@@ -438,7 +469,10 @@ impl<M: MacDriver> NwkLayer<M> {
                 dst_address: MacAddress::Short(self.nib.pan_id, self.nib.parent_address),
                 payload: &buf[..total],
                 msdu_handle: seq,
-                tx_options: zigbee_mac::TxOptions { ack_tx: true, ..Default::default() },
+                tx_options: zigbee_mac::TxOptions {
+                    ack_tx: true,
+                    ..Default::default()
+                },
             })
             .await
             .map_err(|_| NwkStatus::SyncFailure)?;
@@ -479,7 +513,10 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // Update MAC
         self.mac
-            .mlme_set(PibAttribute::MacAssociationPermit, PibValue::Bool(duration != 0))
+            .mlme_set(
+                PibAttribute::MacAssociationPermit,
+                PibValue::Bool(duration != 0),
+            )
             .await
             .map_err(|_| NwkStatus::InvalidRequest)?;
 
@@ -512,9 +549,16 @@ impl<M: MacDriver> NwkLayer<M> {
             .map_err(|_| NwkStatus::StartupFailure)?;
 
         // Ensure RX on when idle
-        let _ = self.mac.mlme_set(PibAttribute::MacRxOnWhenIdle, PibValue::Bool(true)).await;
+        let _ = self
+            .mac
+            .mlme_set(PibAttribute::MacRxOnWhenIdle, PibValue::Bool(true))
+            .await;
 
-        log::info!("[NWK] Router started on PAN 0x{:04X} ch {}", self.nib.pan_id.0, self.nib.logical_channel);
+        log::info!(
+            "[NWK] Router started on PAN 0x{:04X} ch {}",
+            self.nib.pan_id.0,
+            self.nib.logical_channel
+        );
         Ok(())
     }
 
@@ -530,7 +574,9 @@ impl<M: MacDriver> NwkLayer<M> {
             self.joined = false;
         }
 
-        self.mac.mlme_reset(!warm_start).await
+        self.mac
+            .mlme_reset(!warm_start)
+            .await
             .map_err(|_| NwkStatus::InvalidRequest)?;
 
         Ok(())

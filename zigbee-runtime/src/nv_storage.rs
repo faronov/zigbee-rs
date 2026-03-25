@@ -115,7 +115,11 @@ impl Default for RamNvStorage {
 
 impl NvStorage for RamNvStorage {
     fn read(&self, id: NvItemId, buf: &mut [u8]) -> Result<usize, NvError> {
-        let item = self.items.iter().find(|i| i.id == id).ok_or(NvError::NotFound)?;
+        let item = self
+            .items
+            .iter()
+            .find(|i| i.id == id)
+            .ok_or(NvError::NotFound)?;
         if buf.len() < item.data.len() {
             return Err(NvError::BufferTooSmall);
         }
@@ -127,7 +131,9 @@ impl NvStorage for RamNvStorage {
         // Update existing
         if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
             item.data.clear();
-            item.data.extend_from_slice(data).map_err(|_| NvError::Full)?;
+            item.data
+                .extend_from_slice(data)
+                .map_err(|_| NvError::Full)?;
             return Ok(());
         }
         // New item
@@ -153,7 +159,11 @@ impl NvStorage for RamNvStorage {
     }
 
     fn item_length(&self, id: NvItemId) -> Result<usize, NvError> {
-        self.items.iter().find(|i| i.id == id).map(|i| i.data.len()).ok_or(NvError::NotFound)
+        self.items
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| i.data.len())
+            .ok_or(NvError::NotFound)
     }
 
     fn compact(&mut self) -> Result<(), NvError> {

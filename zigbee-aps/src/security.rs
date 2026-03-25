@@ -101,18 +101,17 @@ pub const SEC_LEVEL_ENC_MIC_64: u8 = 0x06;
 pub const SEC_LEVEL_ENC_MIC_128: u8 = 0x07;
 
 /// Key identifier values (Zigbee spec Table 4-29)
-pub const KEY_ID_DATA_KEY: u8 = 0x00;       // Link key
-pub const KEY_ID_NETWORK_KEY: u8 = 0x01;    // Network key
-pub const KEY_ID_KEY_TRANSPORT: u8 = 0x02;  // Key-transport key
-pub const KEY_ID_KEY_LOAD: u8 = 0x03;       // Key-load key
+pub const KEY_ID_DATA_KEY: u8 = 0x00; // Link key
+pub const KEY_ID_NETWORK_KEY: u8 = 0x01; // Network key
+pub const KEY_ID_KEY_TRANSPORT: u8 = 0x02; // Key-transport key
+pub const KEY_ID_KEY_LOAD: u8 = 0x03; // Key-load key
 
 impl ApsSecurityHeader {
     /// APS security default: Security Level 5 (ENC-MIC-32), Key ID = Data Key
     pub const APS_DEFAULT: u8 = SEC_LEVEL_ENC_MIC_32 | (KEY_ID_DATA_KEY << 3);
 
     /// APS security with extended nonce
-    pub const APS_DEFAULT_EXT_NONCE: u8 =
-        SEC_LEVEL_ENC_MIC_32 | (KEY_ID_DATA_KEY << 3) | (1 << 5);
+    pub const APS_DEFAULT_EXT_NONCE: u8 = SEC_LEVEL_ENC_MIC_32 | (KEY_ID_DATA_KEY << 3) | (1 << 5);
 
     /// Extract security level from security control byte.
     pub fn security_level(sc: u8) -> u8 {
@@ -271,7 +270,11 @@ impl ApsSecurity {
     }
 
     /// Find a link key for a partner device.
-    pub fn find_key(&self, partner: &IeeeAddress, key_type: ApsKeyType) -> Option<&ApsLinkKeyEntry> {
+    pub fn find_key(
+        &self,
+        partner: &IeeeAddress,
+        key_type: ApsKeyType,
+    ) -> Option<&ApsLinkKeyEntry> {
         self.key_table
             .iter()
             .find(|e| e.partner_address == *partner && e.key_type == key_type)

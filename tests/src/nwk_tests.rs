@@ -8,12 +8,12 @@
 //! - Neighbor table management
 
 use zigbee_mac::mock::MockMac;
-use zigbee_nwk::*;
 use zigbee_nwk::frames::*;
 use zigbee_nwk::neighbor::*;
+use zigbee_nwk::nib::*;
 use zigbee_nwk::routing::*;
 use zigbee_nwk::security::*;
-use zigbee_nwk::nib::*;
+use zigbee_nwk::*;
 use zigbee_types::*;
 
 fn make_mock_mac() -> MockMac {
@@ -190,9 +190,13 @@ fn test_neighbor_table_aging() {
 #[test]
 fn test_routing_table_add_and_lookup() {
     let mut rt = RoutingTable::new();
-    rt.update_route(ShortAddress(0x1234), ShortAddress(0x0001), 3).unwrap();
+    rt.update_route(ShortAddress(0x1234), ShortAddress(0x0001), 3)
+        .unwrap();
 
-    assert_eq!(rt.next_hop(ShortAddress(0x1234)), Some(ShortAddress(0x0001)));
+    assert_eq!(
+        rt.next_hop(ShortAddress(0x1234)),
+        Some(ShortAddress(0x0001))
+    );
     assert_eq!(rt.next_hop(ShortAddress(0x9999)), None);
     assert_eq!(rt.len(), 1);
 }
@@ -200,18 +204,24 @@ fn test_routing_table_add_and_lookup() {
 #[test]
 fn test_routing_table_update_existing() {
     let mut rt = RoutingTable::new();
-    rt.update_route(ShortAddress(0x1234), ShortAddress(0x0001), 5).unwrap();
-    rt.update_route(ShortAddress(0x1234), ShortAddress(0x0002), 3).unwrap();
+    rt.update_route(ShortAddress(0x1234), ShortAddress(0x0001), 5)
+        .unwrap();
+    rt.update_route(ShortAddress(0x1234), ShortAddress(0x0002), 3)
+        .unwrap();
 
     // Should have updated next_hop
-    assert_eq!(rt.next_hop(ShortAddress(0x1234)), Some(ShortAddress(0x0002)));
+    assert_eq!(
+        rt.next_hop(ShortAddress(0x1234)),
+        Some(ShortAddress(0x0002))
+    );
     assert_eq!(rt.len(), 1); // Still one entry
 }
 
 #[test]
 fn test_routing_table_remove() {
     let mut rt = RoutingTable::new();
-    rt.update_route(ShortAddress(0x1234), ShortAddress(0x0001), 3).unwrap();
+    rt.update_route(ShortAddress(0x1234), ShortAddress(0x0001), 3)
+        .unwrap();
     rt.remove(ShortAddress(0x1234));
     assert_eq!(rt.next_hop(ShortAddress(0x1234)), None);
     assert!(rt.is_empty());
@@ -264,11 +274,11 @@ fn test_frame_counter_replay_protection() {
     let mut sec = NwkSecurity::new();
     let source = [1u8; 8];
 
-    assert!(sec.check_frame_counter(&source, 1));  // First frame
-    assert!(sec.check_frame_counter(&source, 2));  // Newer
+    assert!(sec.check_frame_counter(&source, 1)); // First frame
+    assert!(sec.check_frame_counter(&source, 2)); // Newer
     assert!(!sec.check_frame_counter(&source, 2)); // Replay
     assert!(!sec.check_frame_counter(&source, 1)); // Old frame
-    assert!(sec.check_frame_counter(&source, 3));  // Newer again
+    assert!(sec.check_frame_counter(&source, 3)); // Newer again
 }
 
 // ── NIB Tests ────────────────────────────────────────
@@ -312,5 +322,4 @@ fn test_leave_command_serialize() {
     let byte = cmd.serialize();
     assert_eq!(byte & 0x20, 0x20); // Rejoin bit set
     assert_eq!(byte & 0x40, 0x00); // Remove children bit clear
-
 }

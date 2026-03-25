@@ -25,6 +25,12 @@ pub struct OnOffCluster {
     store: AttributeStore<8>,
 }
 
+impl Default for OnOffCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OnOffCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();
@@ -116,12 +122,16 @@ impl Cluster for OnOffCluster {
                 }
                 // Effect ID (u8) + Effect Variant (u8) — we just turn off.
                 self.set_on_off(false);
-                let _ = self.store.set_raw(ATTR_GLOBAL_SCENE_CONTROL, ZclValue::Bool(false));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_GLOBAL_SCENE_CONTROL, ZclValue::Bool(false));
                 Ok(heapless::Vec::new())
             }
             CMD_ON_WITH_RECALL_GLOBAL_SCENE => {
                 self.set_on_off(true);
-                let _ = self.store.set_raw(ATTR_GLOBAL_SCENE_CONTROL, ZclValue::Bool(true));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_GLOBAL_SCENE_CONTROL, ZclValue::Bool(true));
                 Ok(heapless::Vec::new())
             }
             CMD_ON_WITH_TIMED_OFF => {
@@ -137,7 +147,9 @@ impl Cluster for OnOffCluster {
                 }
                 self.set_on_off(true);
                 let _ = self.store.set_raw(ATTR_ON_TIME, ZclValue::U16(on_time));
-                let _ = self.store.set_raw(ATTR_OFF_WAIT_TIME, ZclValue::U16(off_wait));
+                let _ = self
+                    .store
+                    .set_raw(ATTR_OFF_WAIT_TIME, ZclValue::U16(off_wait));
                 Ok(heapless::Vec::new())
             }
             _ => Err(ZclStatus::UnsupClusterCommand),

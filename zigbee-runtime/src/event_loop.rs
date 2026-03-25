@@ -35,18 +35,11 @@ pub enum StackEvent {
         command_id: u8,
     },
     /// BDB commissioning completed.
-    CommissioningComplete {
-        success: bool,
-    },
+    CommissioningComplete { success: bool },
     /// Permit joining status changed.
-    PermitJoinChanged {
-        open: bool,
-    },
+    PermitJoinChanged { open: bool },
     /// OTA image available.
-    OtaImageAvailable {
-        version: u32,
-        size: u32,
-    },
+    OtaImageAvailable { version: u32, size: u32 },
 }
 
 /// Stack tick result — tells the application what to do next.
@@ -81,9 +74,7 @@ pub enum TickResult {
 ///     }
 /// }
 /// ```
-pub async fn stack_tick<M: MacDriver>(
-    _device: &mut crate::ZigbeeDevice<M>,
-) -> TickResult {
+pub async fn stack_tick<M: MacDriver>(_device: &mut crate::ZigbeeDevice<M>) -> TickResult {
     // Phase 1: Check MAC for incoming frames
     // TODO: call mac.mcps_data_indication() with timeout
 

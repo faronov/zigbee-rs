@@ -1,8 +1,8 @@
 //! Discover Attributes command (0x0C) and Discover Attributes Response (0x0D).
 
+use crate::AttributeId;
 use crate::attribute::AttributeStore;
 use crate::data_types::ZclDataType;
-use crate::AttributeId;
 
 /// Maximum attributes returned in a single discover response.
 pub const MAX_DISCOVER: usize = 16;

@@ -25,6 +25,12 @@ pub struct AlarmsCluster {
     store: AttributeStore<1>,
 }
 
+impl Default for AlarmsCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AlarmsCluster {
     pub fn new() -> Self {
         let mut store = AttributeStore::new();

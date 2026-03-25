@@ -130,13 +130,10 @@ pub trait MacDriver {
     /// response (with assigned short address or denial) back to the
     /// requesting device.
     async fn mlme_associate_response(&mut self, rsp: MlmeAssociateResponse)
-        -> Result<(), MacError>;
+    -> Result<(), MacError>;
 
     /// MLME-DISASSOCIATE.request — leave the PAN.
-    async fn mlme_disassociate(
-        &mut self,
-        req: MlmeDisassociateRequest,
-    ) -> Result<(), MacError>;
+    async fn mlme_disassociate(&mut self, req: MlmeDisassociateRequest) -> Result<(), MacError>;
 
     // ── MLME: Start / Reset ─────────────────────────────────
 
