@@ -5,6 +5,17 @@ on:
     branches: [main, master]
   pull_request:
 
+# Allow deploying to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deploy at a time
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -175,3 +186,60 @@ jobs:
           name: esp32h2-sensor-firmware
           path: |
             examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.bin
+
+  # ── Deploy Web Flasher to GitHub Pages ──────────────────────
+  # Bundles the flasher HTML with latest ESP firmware binaries
+  # so users can flash directly from the browser.
+  deploy-flasher:
+    name: Deploy Web Flasher
+    needs: [build-esp32c6, build-esp32h2]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download ESP32-C6 firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: esp32c6-sensor-firmware
+          path: docs/flasher/firmware
+
+      - name: Download ESP32-H2 firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: esp32h2-sensor-firmware
+          path: docs/flasher/firmware
+
+      - name: Generate firmware manifest
+        run: |
+          cat > docs/flasher/manifest.json << 'EOF'
+          {
+            "name": "Zigbee-RS Sensor Firmware",
+            "version": "${{ github.sha }}",
+            "builds": [
+              {
+                "chipFamily": "ESP32-C6",
+                "parts": [{ "path": "./firmware/esp32c6-sensor.bin", "offset": 0 }]
+              },
+              {
+                "chipFamily": "ESP32-H2",
+                "parts": [{ "path": "./firmware/esp32h2-sensor.bin", "offset": 0 }]
+              }
+            ]
+          }
+          EOF
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/flasher
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

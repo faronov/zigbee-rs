@@ -158,11 +158,72 @@
       padding: 3rem;
       color: var(--red);
     }
+    .quick-install {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 2rem;
+      max-width: 520px;
+      width: 100%;
+      margin-bottom: 1.5rem;
+      text-align: center;
+    }
+    .quick-install h2 { font-size: 1.1rem; margin-bottom: 1rem; }
+    .quick-install p { color: var(--muted); font-size: 0.85rem; margin-top: 0.8rem; }
+    .install-row {
+      display: flex;
+      gap: 1rem;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    esp-web-install-button {
+      display: inline-block;
+    }
+    esp-web-install-button button {
+      background: var(--green);
+      color: var(--bg);
+      border: none;
+      border-radius: 6px;
+      padding: 0.8rem 1.5rem;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    esp-web-install-button button:hover { opacity: 0.85; }
+    .divider {
+      max-width: 520px;
+      width: 100%;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.85rem;
+      margin-bottom: 1.5rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    .divider::before, .divider::after {
+      content: '';
+      flex: 1;
+      border-top: 1px solid var(--border);
+    }
   </style>
 </head>
 <body>
   <h1>⚡ Zigbee-RS ESP Web Flasher</h1>
   <p class="subtitle">Flash Zigbee firmware to ESP32-C6 / ESP32-H2 from your browser</p>
+
+  <!-- Quick install with pre-built firmware (ESP Web Tools) -->
+  <div class="quick-install" id="quick-install">
+    <h2>🚀 One-click install (latest CI build)</h2>
+    <div class="install-row">
+      <esp-web-install-button manifest="./manifest.json">
+        <button slot="activate">Install Zigbee Sensor</button>
+      </esp-web-install-button>
+    </div>
+    <p>Auto-detects ESP32-C6 or ESP32-H2 • Plug in your board via USB and click install</p>
+  </div>
+
+  <div class="divider">or flash a custom .bin file</div>
 
   <div class="card" id="main-card">
     <div id="unsupported" class="unsupported" style="display:none">
@@ -222,9 +283,13 @@
 
   <p class="footer">
     <a href="https://github.com/faronov/zigbee-rs" target="_blank">zigbee-rs</a> •
-    Powered by <a href="https://github.com/nicholasgasior/esptool-js" target="_blank">esptool-js</a> •
+    Powered by <a href="https://esphome.github.io/esp-web-tools/" target="_blank">ESP Web Tools</a>
+    &amp; <a href="https://github.com/nicholasgasior/esptool-js" target="_blank">esptool-js</a> •
     Requires Chrome/Edge 89+
   </p>
+
+  <!-- ESP Web Tools for one-click install -->
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
 
   <script type="module">
     // esptool-js ESM import from CDN
