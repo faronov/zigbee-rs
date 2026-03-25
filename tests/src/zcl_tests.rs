@@ -843,9 +843,159 @@ fn report_attributes_serialize() {
     assert_eq!(buf[3], 0x01); // value true
 }
 
-// ---------------------------------------------------------------------------
-// 8. Foundation command IDs
-// ---------------------------------------------------------------------------
+#[test]
+fn reporting_engine_cluster_aware() {
+    // Two clusters on different endpoints, each with a MeasuredValue (attr 0x0000)
+    let mut store_temp: AttributeStore<4> = AttributeStore::new();
+    store_temp
+        .register(
+            AttributeDefinition {
+                id: AttributeId(0x0000),
+                data_type: ZclDataType::I16,
+                access: AttributeAccess::Reportable,
+                name: "TempValue",
+            },
+            ZclValue::I16(2200),
+        )
+        .unwrap();
+
+    let mut store_hum: AttributeStore<4> = AttributeStore::new();
+    store_hum
+        .register(
+            AttributeDefinition {
+                id: AttributeId(0x0000),
+                data_type: ZclDataType::U16,
+                access: AttributeAccess::Reportable,
+                name: "HumValue",
+            },
+            ZclValue::U16(5000),
+        )
+        .unwrap();
+
+    let mut engine = ReportingEngine::new();
+
+    // Configure temp (ep=1, cluster=0x0402) and humidity (ep=1, cluster=0x0405)
+    engine
+        .configure_for_cluster(
+            1,
+            0x0402,
+            ReportingConfig {
+                direction: ReportDirection::Send,
+                attribute_id: AttributeId(0x0000),
+                data_type: ZclDataType::I16,
+                min_interval: 0,
+                max_interval: 60,
+                reportable_change: None,
+            },
+        )
+        .unwrap();
+
+    engine
+        .configure_for_cluster(
+            1,
+            0x0405,
+            ReportingConfig {
+                direction: ReportDirection::Send,
+                attribute_id: AttributeId(0x0000),
+                data_type: ZclDataType::U16,
+                min_interval: 0,
+                max_interval: 60,
+                reportable_change: None,
+            },
+        )
+        .unwrap();
+
+    // Check temp cluster only — should get temp report
+    let report = engine.check_and_report_cluster(1, 0x0402, &store_temp);
+    assert!(report.is_some());
+    assert_eq!(report.unwrap().reports[0].value, ZclValue::I16(2200));
+
+    // Check humidity cluster only — should get humidity report
+    let report = engine.check_and_report_cluster(1, 0x0405, &store_hum);
+    assert!(report.is_some());
+    assert_eq!(report.unwrap().reports[0].value, ZclValue::U16(5000));
+
+    // No repeat report without time or value change
+    let report = engine.check_and_report_cluster(1, 0x0402, &store_temp);
+    assert!(report.is_none());
+}
+
+#[test]
+fn reporting_engine_get_config() {
+    let mut engine = ReportingEngine::new();
+    engine
+        .configure_for_cluster(
+            1,
+            0x0402,
+            ReportingConfig {
+                direction: ReportDirection::Send,
+                attribute_id: AttributeId(0x0000),
+                data_type: ZclDataType::I16,
+                min_interval: 10,
+                max_interval: 300,
+                reportable_change: None,
+            },
+        )
+        .unwrap();
+
+    // Should find it
+    let cfg = engine.get_config(1, 0x0402, ReportDirection::Send, AttributeId(0x0000));
+    assert!(cfg.is_some());
+    assert_eq!(cfg.unwrap().min_interval, 10);
+    assert_eq!(cfg.unwrap().max_interval, 300);
+
+    // Wrong cluster — should not find
+    let cfg = engine.get_config(1, 0x0405, ReportDirection::Send, AttributeId(0x0000));
+    assert!(cfg.is_none());
+
+    // Wrong endpoint — should not find
+    let cfg = engine.get_config(2, 0x0402, ReportDirection::Send, AttributeId(0x0000));
+    assert!(cfg.is_none());
+}
+
+#[test]
+fn configure_reporting_response_serialize() {
+    use zigbee_zcl::foundation::reporting::{
+        ConfigureReportingResponse, ConfigureReportingStatusRecord,
+    };
+
+    // All success → single byte
+    let response = ConfigureReportingResponse {
+        records: {
+            let mut v = heapless::Vec::new();
+            let _ = v.push(ConfigureReportingStatusRecord {
+                status: ZclStatus::Success,
+                direction: ReportDirection::Send,
+                attribute_id: AttributeId(0x0000),
+            });
+            v
+        },
+    };
+    let mut buf = [0u8; 64];
+    let len = response.serialize(&mut buf);
+    assert_eq!(len, 1);
+    assert_eq!(buf[0], 0x00); // Success
+
+    // Mixed results → individual records
+    let response = ConfigureReportingResponse {
+        records: {
+            let mut v = heapless::Vec::new();
+            let _ = v.push(ConfigureReportingStatusRecord {
+                status: ZclStatus::Success,
+                direction: ReportDirection::Send,
+                attribute_id: AttributeId(0x0000),
+            });
+            let _ = v.push(ConfigureReportingStatusRecord {
+                status: ZclStatus::UnsupportedAttribute,
+                direction: ReportDirection::Send,
+                attribute_id: AttributeId(0x0001),
+            });
+            v
+        },
+    };
+    let len = response.serialize(&mut buf);
+    assert_eq!(len, 8); // 2 records × (status + direction + attr_id) = 2×4
+}
 
 #[test]
 fn foundation_command_id_from_u8() {

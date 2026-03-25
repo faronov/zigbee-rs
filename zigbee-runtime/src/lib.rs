@@ -355,6 +355,109 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             });
         }
 
+        // Check if this is Configure Reporting (0x06) — coordinator configuring our reports
+        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
+            && cmd_id == 0x06
+        {
+            use zigbee_zcl::foundation::reporting::{
+                ConfigureReportingRequest, ConfigureReportingResponse,
+                ConfigureReportingStatusRecord,
+            };
+            if let Some(req) = ConfigureReportingRequest::parse(zcl_frame.payload.as_slice()) {
+                let mut response = ConfigureReportingResponse {
+                    records: heapless::Vec::new(),
+                };
+                for cfg in &req.configs {
+                    let result =
+                        self.reporting
+                            .configure_for_cluster(dst_ep, cluster_id, cfg.clone());
+                    let status = match result {
+                        Ok(()) => ZclStatus::Success,
+                        Err(s) => s,
+                    };
+                    let _ = response.records.push(ConfigureReportingStatusRecord {
+                        status,
+                        direction: cfg.direction,
+                        attribute_id: cfg.attribute_id,
+                    });
+                }
+                // Queue Configure Reporting Response (0x07)
+                self.queue_reporting_response(
+                    ShortAddress(src_addr),
+                    aps_indication.src_endpoint,
+                    dst_ep,
+                    cluster_id,
+                    zcl_frame.header.seq_number,
+                    &response,
+                );
+                log::info!(
+                    "[Runtime] Configure Reporting: ep={} cluster=0x{:04X} ({} attrs)",
+                    dst_ep,
+                    cluster_id,
+                    req.configs.len()
+                );
+            }
+            return Some(event_loop::StackEvent::CommandReceived {
+                src_addr,
+                endpoint: dst_ep,
+                cluster_id,
+                command_id: cmd_id,
+            });
+        }
+
+        // Check if this is Read Reporting Config (0x08)
+        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
+            && cmd_id == 0x08
+        {
+            use zigbee_zcl::foundation::reporting::{
+                ReadReportingConfigRequest, ReadReportingConfigResponse,
+                ReadReportingConfigResponseRecord,
+            };
+            if let Some(req) = ReadReportingConfigRequest::parse(zcl_frame.payload.as_slice()) {
+                let mut response = ReadReportingConfigResponse {
+                    records: heapless::Vec::new(),
+                };
+                for rec in &req.records {
+                    if let Some(cfg) = self.reporting.get_config(
+                        dst_ep,
+                        cluster_id,
+                        rec.direction,
+                        rec.attribute_id,
+                    ) {
+                        let _ = response.records.push(ReadReportingConfigResponseRecord {
+                            status: ZclStatus::Success,
+                            direction: rec.direction,
+                            attribute_id: rec.attribute_id,
+                            config: Some(cfg.clone()),
+                            timeout: None,
+                        });
+                    } else {
+                        let _ = response.records.push(ReadReportingConfigResponseRecord {
+                            status: ZclStatus::UnsupportedAttribute,
+                            direction: rec.direction,
+                            attribute_id: rec.attribute_id,
+                            config: None,
+                            timeout: None,
+                        });
+                    }
+                }
+                self.queue_read_reporting_response(
+                    ShortAddress(src_addr),
+                    aps_indication.src_endpoint,
+                    dst_ep,
+                    cluster_id,
+                    zcl_frame.header.seq_number,
+                    &response,
+                );
+            }
+            return Some(event_loop::StackEvent::CommandReceived {
+                src_addr,
+                endpoint: dst_ep,
+                cluster_id,
+                command_id: cmd_id,
+            });
+        }
+
         // Cluster-specific or other global command
         // Queue a ZCL Default Response if the sender wants one
         if !zcl_frame.header.disable_default_response()
@@ -396,6 +499,74 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         );
         let _ = frame.payload.push(0x00); // command that triggered this
         let _ = frame.payload.push(status as u8);
+
+        let mut zcl_buf = [0u8; 128];
+        if let Ok(len) = frame.serialize(&mut zcl_buf) {
+            let mut data = heapless::Vec::new();
+            for &b in &zcl_buf[..len] {
+                let _ = data.push(b);
+            }
+            let _ = self.pending_responses.push(PendingZclResponse {
+                dst_addr,
+                dst_endpoint,
+                src_endpoint,
+                cluster_id,
+                zcl_data: data,
+            });
+        }
+    }
+
+    /// Queue a Configure Reporting Response (0x07).
+    fn queue_reporting_response(
+        &mut self,
+        dst_addr: ShortAddress,
+        dst_endpoint: u8,
+        src_endpoint: u8,
+        cluster_id: u16,
+        seq: u8,
+        response: &zigbee_zcl::foundation::reporting::ConfigureReportingResponse,
+    ) {
+        let mut frame =
+            ZclFrame::new_global(seq, CommandId(0x07), ClusterDirection::ServerToClient, true);
+        let mut payload_buf = [0u8; 64];
+        let payload_len = response.serialize(&mut payload_buf);
+        for &b in &payload_buf[..payload_len] {
+            let _ = frame.payload.push(b);
+        }
+
+        let mut zcl_buf = [0u8; 128];
+        if let Ok(len) = frame.serialize(&mut zcl_buf) {
+            let mut data = heapless::Vec::new();
+            for &b in &zcl_buf[..len] {
+                let _ = data.push(b);
+            }
+            let _ = self.pending_responses.push(PendingZclResponse {
+                dst_addr,
+                dst_endpoint,
+                src_endpoint,
+                cluster_id,
+                zcl_data: data,
+            });
+        }
+    }
+
+    /// Queue a Read Reporting Configuration Response (0x09).
+    fn queue_read_reporting_response(
+        &mut self,
+        dst_addr: ShortAddress,
+        dst_endpoint: u8,
+        src_endpoint: u8,
+        cluster_id: u16,
+        seq: u8,
+        response: &zigbee_zcl::foundation::reporting::ReadReportingConfigResponse,
+    ) {
+        let mut frame =
+            ZclFrame::new_global(seq, CommandId(0x09), ClusterDirection::ServerToClient, true);
+        let mut payload_buf = [0u8; 128];
+        let payload_len = response.serialize(&mut payload_buf);
+        for &b in &payload_buf[..payload_len] {
+            let _ = frame.payload.push(b);
+        }
 
         let mut zcl_buf = [0u8; 128];
         if let Ok(len) = frame.serialize(&mut zcl_buf) {
@@ -459,6 +630,47 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// Mutable access to the reporting engine.
     pub fn reporting_mut(&mut self) -> &mut ReportingEngine {
         &mut self.reporting
+    }
+
+    /// Check if any attribute reports are due for a cluster and send them.
+    ///
+    /// Call this after updating cluster attributes (e.g., after reading sensors).
+    /// The reporting engine checks configured min/max intervals and value changes,
+    /// then sends a ZCL Report Attributes (0x0A) frame if needed.
+    ///
+    /// Returns `true` if a report was sent.
+    ///
+    /// # Example
+    /// ```rust,no_run,ignore
+    /// temp_cluster.set_temperature(2350);
+    /// let sent = device.check_and_send_cluster_reports(
+    ///     1,          // endpoint
+    ///     0x0402,     // Temperature Measurement cluster
+    ///     temp_cluster.attributes(),
+    /// ).await;
+    /// ```
+    pub async fn check_and_send_cluster_reports(
+        &mut self,
+        endpoint: u8,
+        cluster_id: u16,
+        store: &dyn zigbee_zcl::clusters::AttributeStoreAccess,
+    ) -> bool {
+        // We need to work through the reporting engine, which requires AttributeStore<N>.
+        // Since we have a trait object, we build reports manually by checking each config.
+        use zigbee_zcl::foundation::reporting::{AttributeReport, ReportAttributes};
+
+        let mut reports: heapless::Vec<AttributeReport, 16> = heapless::Vec::new();
+        self.reporting
+            .check_and_collect_dyn(endpoint, cluster_id, store, &mut reports);
+
+        if reports.is_empty() {
+            return false;
+        }
+
+        let report = ReportAttributes { reports };
+        self.send_report(endpoint, cluster_id, &report)
+            .await
+            .is_ok()
     }
 
     // ── Layer access (for advanced use) ─────────────────────

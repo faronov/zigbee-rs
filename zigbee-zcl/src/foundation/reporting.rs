@@ -1,6 +1,7 @@
 //! ZCL attribute reporting — configuration, engine, and wire formats.
 
 use crate::attribute::AttributeStore;
+use crate::clusters::AttributeStoreAccess;
 use crate::data_types::{self, ZclDataType, ZclValue};
 use crate::{AttributeId, ZclStatus};
 
@@ -48,6 +49,33 @@ pub struct ConfigureReportingStatusRecord {
 #[derive(Debug, Clone)]
 pub struct ConfigureReportingResponse {
     pub records: heapless::Vec<ConfigureReportingStatusRecord, MAX_REPORT_CONFIGS>,
+}
+
+impl ConfigureReportingResponse {
+    /// Serialize to ZCL payload bytes.
+    ///
+    /// Per ZCL spec: if all statuses are Success, send a single record with
+    /// status=Success only. Otherwise, send individual status records.
+    pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        // Check if all succeeded
+        let all_success = self.records.iter().all(|r| r.status == ZclStatus::Success);
+        if all_success {
+            buf[0] = ZclStatus::Success as u8;
+            return 1;
+        }
+        let mut pos = 0;
+        for rec in &self.records {
+            buf[pos] = rec.status as u8;
+            pos += 1;
+            buf[pos] = rec.direction as u8;
+            pos += 1;
+            let b = rec.attribute_id.0.to_le_bytes();
+            buf[pos] = b[0];
+            buf[pos + 1] = b[1];
+            pos += 2;
+        }
+        pos
+    }
 }
 
 /// An attribute report record (used in Report Attributes command 0x0A).
@@ -153,6 +181,8 @@ impl ConfigureReportingRequest {
 /// Internal state for a single configured report.
 #[derive(Debug, Clone)]
 struct ReportState {
+    endpoint: u8,
+    cluster_id: u16,
     config: ReportingConfig,
     /// Seconds elapsed since the last report was sent.
     elapsed: u16,
@@ -179,11 +209,23 @@ impl ReportingEngine {
         }
     }
 
-    /// Add or replace a reporting configuration.
+    /// Add or replace a reporting configuration (legacy, no cluster tracking).
     pub fn configure(&mut self, config: ReportingConfig) -> Result<(), ZclStatus> {
-        // Replace existing config for the same attribute
+        self.configure_for_cluster(0, 0, config)
+    }
+
+    /// Add or replace a reporting configuration for a specific cluster.
+    pub fn configure_for_cluster(
+        &mut self,
+        endpoint: u8,
+        cluster_id: u16,
+        config: ReportingConfig,
+    ) -> Result<(), ZclStatus> {
+        // Replace existing config for the same attribute on the same cluster
         for state in self.states.iter_mut() {
-            if state.config.attribute_id == config.attribute_id
+            if state.endpoint == endpoint
+                && state.cluster_id == cluster_id
+                && state.config.attribute_id == config.attribute_id
                 && state.config.direction == config.direction
             {
                 state.config = config;
@@ -194,6 +236,8 @@ impl ReportingEngine {
         }
         self.states
             .push(ReportState {
+                endpoint,
+                cluster_id,
                 config,
                 elapsed: 0,
                 last_value: None,
@@ -214,11 +258,43 @@ impl ReportingEngine {
         &mut self,
         store: &AttributeStore<N>,
     ) -> Option<ReportAttributes> {
+        self.check_and_report_filtered(None, None, store)
+    }
+
+    /// Check reports for a specific cluster and generate a `ReportAttributes`
+    /// payload if any are due.
+    pub fn check_and_report_cluster<const N: usize>(
+        &mut self,
+        endpoint: u8,
+        cluster_id: u16,
+        store: &AttributeStore<N>,
+    ) -> Option<ReportAttributes> {
+        self.check_and_report_filtered(Some(endpoint), Some(cluster_id), store)
+    }
+
+    fn check_and_report_filtered<const N: usize>(
+        &mut self,
+        filter_ep: Option<u8>,
+        filter_cluster: Option<u16>,
+        store: &AttributeStore<N>,
+    ) -> Option<ReportAttributes> {
         let mut reports: heapless::Vec<AttributeReport, MAX_REPORT_CONFIGS> = heapless::Vec::new();
 
         for state in self.states.iter_mut() {
             if state.config.direction != ReportDirection::Send {
                 continue;
+            }
+
+            // Filter by endpoint/cluster if specified
+            if let Some(ep) = filter_ep {
+                if state.endpoint != ep {
+                    continue;
+                }
+            }
+            if let Some(cl) = filter_cluster {
+                if state.cluster_id != cl {
+                    continue;
+                }
             }
 
             let current = store.get(state.config.attribute_id);
@@ -268,6 +344,79 @@ impl ReportingEngine {
             None
         } else {
             Some(ReportAttributes { reports })
+        }
+    }
+
+    /// Look up the reporting configuration for a specific attribute.
+    pub fn get_config(
+        &self,
+        endpoint: u8,
+        cluster_id: u16,
+        direction: ReportDirection,
+        attr_id: AttributeId,
+    ) -> Option<&ReportingConfig> {
+        self.states
+            .iter()
+            .find(|s| {
+                s.endpoint == endpoint
+                    && s.cluster_id == cluster_id
+                    && s.config.direction == direction
+                    && s.config.attribute_id == attr_id
+            })
+            .map(|s| &s.config)
+    }
+
+    /// Check reports for a cluster using a type-erased attribute store (trait object).
+    ///
+    /// Appends due reports to the provided `out` vec. Used by the runtime to
+    /// work with `dyn AttributeStoreAccess` without knowing the concrete `N`.
+    pub fn check_and_collect_dyn(
+        &mut self,
+        endpoint: u8,
+        cluster_id: u16,
+        store: &dyn AttributeStoreAccess,
+        out: &mut heapless::Vec<AttributeReport, MAX_REPORT_CONFIGS>,
+    ) {
+        for state in self.states.iter_mut() {
+            if state.config.direction != ReportDirection::Send {
+                continue;
+            }
+            if state.endpoint != endpoint || state.cluster_id != cluster_id {
+                continue;
+            }
+
+            let current = match store.get(state.config.attribute_id) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let mut should_report = false;
+
+            if state.config.max_interval != 0xFFFF && state.elapsed >= state.config.max_interval {
+                should_report = true;
+            }
+
+            if state.elapsed >= state.config.min_interval {
+                if let Some(ref last) = state.last_value {
+                    if last != current {
+                        should_report = true;
+                    }
+                } else {
+                    should_report = true;
+                }
+            }
+
+            if should_report {
+                state.elapsed = 0;
+                state.last_value = Some(current.clone());
+                if let Some(def) = store.find(state.config.attribute_id) {
+                    let _ = out.push(AttributeReport {
+                        id: state.config.attribute_id,
+                        data_type: def.data_type,
+                        value: current.clone(),
+                    });
+                }
+            }
         }
     }
 }
