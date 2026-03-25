@@ -160,11 +160,14 @@ jobs:
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
 
+          echo "=== Firmware sizes ==="
+          ls -la ${ELF}.bin ${ELF}.hex
+
           # Download uf2conv.py from Microsoft's UF2 repo
           curl -sL https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2conv.py -o uf2conv.py
           curl -sL https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2families.json -o uf2families.json
-          # Convert .bin → .uf2 (family=0xADA52840, base address=0x26000)
-          python uf2conv.py -c -f 0xADA52840 -b 0x26000 ${ELF}.bin -o ${ELF}.uf2
+          # Convert .hex → .uf2 (hex already contains base address info)
+          python uf2conv.py -c -f 0xADA52840 ${ELF}.hex -o ${ELF}.uf2
       - name: Upload nRF52840 UF2 firmware
         uses: actions/upload-artifact@v4
         with:
