@@ -309,8 +309,16 @@ impl<M: MacDriver> NwkLayer<M> {
             .await;
 
         // Add parent to neighbor table
+        // Try to get coordinator IEEE from MAC PIB (cached from association)
+        let parent_ieee = if let Ok(PibValue::ExtendedAddress(addr)) =
+            self.mac.mlme_get(PibAttribute::MacCoordExtendedAddress).await
+        {
+            addr
+        } else {
+            [0; 8] // Will be updated when we receive a frame with source IEEE
+        };
         let parent = NeighborEntry {
-            ieee_address: [0; 8], // TODO: get from association
+            ieee_address: parent_ieee,
             network_address: ShortAddress::COORDINATOR,
             device_type: NeighborDeviceType::Coordinator,
             rx_on_when_idle: true,

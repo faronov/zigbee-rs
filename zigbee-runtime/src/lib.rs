@@ -479,13 +479,25 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 let mut response = ConfigureReportingResponse {
                     records: heapless::Vec::new(),
                 };
+                // Find matching cluster to validate attribute existence
+                let cluster_ref = clusters.iter().find(|c| {
+                    c.endpoint == dst_ep && c.cluster.cluster_id() == zigbee_zcl::ClusterId(cluster_id)
+                });
                 for cfg in &req.configs {
-                    let result =
-                        self.reporting
-                            .configure_for_cluster(dst_ep, cluster_id, cfg.clone());
-                    let status = match result {
-                        Ok(()) => ZclStatus::Success,
-                        Err(s) => s,
+                    // Validate attribute exists in the cluster before configuring
+                    let attr_exists = cluster_ref
+                        .as_ref()
+                        .and_then(|c| c.cluster.attributes().get(cfg.attribute_id))
+                        .is_some();
+                    let status = if !attr_exists {
+                        ZclStatus::UnsupportedAttribute
+                    } else {
+                        match self.reporting
+                            .configure_for_cluster(dst_ep, cluster_id, cfg.clone())
+                        {
+                            Ok(()) => ZclStatus::Success,
+                            Err(s) => s,
+                        }
                     };
                     let _ = response.records.push(ConfigureReportingStatusRecord {
                         status,

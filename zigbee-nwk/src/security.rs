@@ -134,10 +134,12 @@ impl NwkSecurity {
             }
         } else {
             // First frame from this source
-            let _ = self.frame_counter_table.push(FrameCounterEntry {
+            if self.frame_counter_table.push(FrameCounterEntry {
                 source: *source,
                 counter,
-            });
+            }).is_err() {
+                log::warn!("[NWK] Replay table full, cannot track new source");
+            }
             true
         }
     }
