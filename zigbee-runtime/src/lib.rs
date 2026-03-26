@@ -766,11 +766,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::ClusterSpecific {
             let mut cmd_status = ZclStatus::Success;
             let mut response_payload: Option<heapless::Vec<u8, 64>> = None;
+            let mut cluster_found = false;
 
             if let Some(cr) = clusters
                 .iter_mut()
                 .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
             {
+                cluster_found = true;
                 match cr
                     .cluster
                     .handle_command(CommandId(cmd_id), zcl_frame.payload.as_slice())
@@ -849,8 +851,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         zcl_data: data,
                     });
                 }
-            } else if !zcl_frame.header.disable_default_response() {
-                // Send default response with the command status
+            } else if cluster_found && !zcl_frame.header.disable_default_response() {
+                // Only send Default Response for clusters we handle in ClusterRef.
+                // Unmatched clusters (e.g. OTA 0x0019) are app-handled — don't
+                // send spurious Default Responses that confuse the coordinator.
                 self.queue_default_response(
                     ShortAddress(src_addr),
                     aps_indication.src_endpoint,
