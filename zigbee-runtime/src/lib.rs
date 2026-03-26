@@ -258,6 +258,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         &mut self.power
     }
 
+    /// Whether this device is configured as a sleepy end device.
+    pub fn is_sleepy(&self) -> bool {
+        !matches!(self.power.mode(), power::PowerMode::AlwaysOn)
+    }
+
     // ── MAC proxy ───────────────────────────────────────────
 
     /// Wait for an incoming MAC frame. Blocks until a frame arrives.
@@ -277,6 +282,32 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             .mac_mut()
             .mcps_data_indication()
             .await
+    }
+
+    /// Poll the parent for pending data (Sleepy End Device).
+    ///
+    /// Sends a MAC Data Request to the coordinator/parent and returns
+    /// any queued frame. Returns `None` if no data is pending.
+    /// After calling this, feed the result into `process_incoming()`.
+    pub async fn poll(&mut self) -> Result<Option<McpsDataIndication>, MacError> {
+        let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
+        match mac.mlme_poll().await? {
+            Some(frame) => {
+                // Wrap the raw poll response in a McpsDataIndication.
+                // The parent address comes from NIB; LQI is unknown from poll.
+                let parent = self.bdb.zdo().nwk().nib().parent_address;
+                let pan_id = self.bdb.zdo().nwk().nib().pan_id;
+                let our_addr = self.bdb.zdo().nwk().nib().network_address;
+                Ok(Some(McpsDataIndication {
+                    src_address: zigbee_types::MacAddress::Short(pan_id, parent),
+                    dst_address: zigbee_types::MacAddress::Short(pan_id, our_addr),
+                    lqi: 0, // not available from poll
+                    payload: frame,
+                    security_use: false,
+                }))
+            }
+            None => Ok(None),
+        }
     }
 
     // ── Incoming frame processing ───────────────────────────

@@ -111,7 +111,15 @@ impl<M: MacDriver> DeviceBuilder<M> {
     /// Build the ZigbeeDevice with the full BDB→ZDO→APS→NWK→MAC stack.
     pub fn build(self) -> ZigbeeDevice<M> {
         // Construct the layer stack: MAC → NWK → APS → ZDO → BDB
-        let nwk = NwkLayer::new(self.mac, self.device_type);
+        let mut nwk = NwkLayer::new(self.mac, self.device_type);
+
+        // For sleepy/deep-sleep modes, set rx_on_when_idle = false so the
+        // association capability info correctly tells the coordinator we're a SED.
+        let rx_on = match self.power_mode {
+            PowerMode::AlwaysOn => true,
+            PowerMode::Sleepy { .. } | PowerMode::DeepSleep { .. } => false,
+        };
+        nwk.set_rx_on_when_idle(rx_on);
         let aps = ApsLayer::new(nwk);
         let mut zdo = ZdoLayer::new(aps);
 
