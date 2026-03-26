@@ -28,7 +28,7 @@ use {defmt_rtt as _, panic_probe as _};
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
-use zigbee_runtime::{UserAction, ZigbeeDevice};
+use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
 use zigbee_zcl::clusters::humidity::HumidityCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
@@ -90,7 +90,11 @@ async fn main(_spawner: Spawner) {
         {
             // ── Incoming MAC frame ──────────────────────────────
             Either3::First(Ok(indication)) => {
-                if let Some(event) = device.process_incoming(&indication) {
+                let mut clusters = [
+                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                ];
+                if let Some(event) = device.process_incoming(&indication, &mut clusters).await {
                     log_event(&event);
                 }
             }
@@ -106,7 +110,11 @@ async fn main(_spawner: Spawner) {
                     info!("Button → joining network…");
                 }
                 device.user_action(UserAction::Toggle);
-                if let TickResult::Event(ref e) = device.tick(0).await {
+                let mut clusters = [
+                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                ];
+                if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
                     log_event(e);
                 }
                 // Debounce
@@ -137,7 +145,10 @@ async fn main(_spawner: Spawner) {
                     );
                 }
                 if let TickResult::Event(ref e) =
-                    device.tick(REPORT_INTERVAL_SECS as u16).await
+                    device.tick(REPORT_INTERVAL_SECS as u16, &mut [
+                        ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                        ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                    ]).await
                 {
                     log_event(e);
                 }

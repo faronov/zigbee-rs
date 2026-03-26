@@ -494,7 +494,7 @@ fn process_read_existing_attribute() {
     };
     req.attributes.push(AttributeId(0x0000)).unwrap();
 
-    let resp = read_attributes::process_read(&store, &req);
+    let resp = read_attributes::process_read_dyn(&store, &req);
     assert_eq!(resp.records.len(), 1);
     assert_eq!(resp.records[0].status, ZclStatus::Success);
     assert_eq!(resp.records[0].value, Some(ZclValue::U8(8)));
@@ -508,7 +508,7 @@ fn process_read_unsupported_attribute() {
     };
     req.attributes.push(AttributeId(0xFFFF)).unwrap();
 
-    let resp = read_attributes::process_read(&store, &req);
+    let resp = read_attributes::process_read_dyn(&store, &req);
     assert_eq!(resp.records.len(), 1);
     assert_eq!(resp.records[0].status, ZclStatus::UnsupportedAttribute);
     assert_eq!(resp.records[0].value, None);
@@ -533,7 +533,7 @@ fn read_attributes_response_serialize_parse_roundtrip() {
         attributes: heapless::Vec::new(),
     };
     req.attributes.push(AttributeId(0x0000)).unwrap();
-    let resp = read_attributes::process_read(&store, &req);
+    let resp = read_attributes::process_read_dyn(&store, &req);
 
     let mut buf = [0u8; 128];
     let len = resp.serialize(&mut buf);
@@ -672,7 +672,7 @@ fn discover_attributes_all() {
         start_id: AttributeId(0x0000),
         max_results: 10,
     };
-    let resp = discover::process_discover(&store, &req);
+    let resp = discover::process_discover_dyn(&store, &req);
     assert!(resp.complete);
     assert_eq!(resp.attributes.len(), 2);
     assert_eq!(resp.attributes[0].id, AttributeId(0x0000));
@@ -701,7 +701,7 @@ fn discover_attributes_partial() {
         start_id: AttributeId(0x0000),
         max_results: 3,
     };
-    let resp = discover::process_discover(&store, &req);
+    let resp = discover::process_discover_dyn(&store, &req);
     assert!(!resp.complete); // more attributes remain
     assert_eq!(resp.attributes.len(), 3);
 }
