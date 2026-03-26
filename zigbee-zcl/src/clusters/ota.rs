@@ -81,6 +81,10 @@ pub enum OtaState {
         delay_secs: u32,
         /// Timer countdown.
         elapsed: u32,
+        /// Saved download offset to resume from.
+        download_offset: u32,
+        /// Saved download total size.
+        download_total: u32,
     },
     /// OTA completed successfully.
     Done,
@@ -261,9 +265,17 @@ impl ParsedBlockResponse {
                 let version = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
                 let offset = u32::from_le_bytes([data[9], data[10], data[11], data[12]]);
                 let data_size = data[13];
+                // Validate that the payload actually contains data_size bytes
+                if data.len() < 14 + data_size as usize {
+                    log::warn!(
+                        "[OTA] Block truncated: expected {} bytes, got {}",
+                        data_size,
+                        data.len() - 14
+                    );
+                    return None;
+                }
                 let mut block_data = heapless::Vec::new();
-                let end = (14 + data_size as usize).min(data.len());
-                for &b in &data[14..end] {
+                for &b in &data[14..14 + data_size as usize] {
                     let _ = block_data.push(b);
                 }
                 Some(Self::Success(ImageBlockResponse {
@@ -468,6 +480,11 @@ impl OtaCluster {
         self.state
     }
 
+    /// Get the target firmware version being downloaded.
+    pub fn target_version(&self) -> u32 {
+        self.target_version
+    }
+
     /// Set the block size for image block requests.
     pub fn set_block_size(&mut self, size: u8) {
         self.block_size = size.min(64);
@@ -505,23 +522,32 @@ impl OtaCluster {
     }
 
     /// Tick the OTA engine (called periodically).
-    /// Handles WaitForData countdown.
+    /// Handles WaitForData countdown and resumes download.
     pub fn tick(&mut self, elapsed_secs: u16) -> OtaAction {
-        match &mut self.state {
+        match self.state {
             OtaState::WaitForData {
                 delay_secs,
                 elapsed,
+                download_offset,
+                download_total,
             } => {
-                *elapsed += elapsed_secs as u32;
-                if *elapsed >= *delay_secs {
-                    // Retry: send another block request
-                    if let OtaState::Downloading { offset, total_size } = self.state {
-                        return self.build_block_request(offset, total_size);
-                    }
-                    // If not downloading, just go idle
-                    self.state = OtaState::Idle;
+                let new_elapsed = elapsed + elapsed_secs as u32;
+                if new_elapsed >= delay_secs {
+                    // Timer expired — restore Downloading state and retry
+                    self.state = OtaState::Downloading {
+                        offset: download_offset,
+                        total_size: download_total,
+                    };
+                    self.build_block_request(download_offset, download_total)
+                } else {
+                    self.state = OtaState::WaitForData {
+                        delay_secs,
+                        elapsed: new_elapsed,
+                        download_offset,
+                        download_total,
+                    };
+                    OtaAction::None
                 }
-                OtaAction::None
             }
             _ => OtaAction::None,
         }
@@ -583,7 +609,7 @@ impl OtaCluster {
             .store
             .set(ATTR_IMAGE_UPGRADE_STATUS, ZclValue::Enum8(STATUS_NORMAL));
         OtaAction::SendEndRequest(UpgradeEndRequest {
-            status: 0x95, // INVALID_IMAGE
+            status: 0x96, // INVALID_IMAGE per ZCL spec §11.13.9.5
             manufacturer_code: self.manufacturer_code,
             image_type: self.image_type,
             file_version: version,
@@ -598,6 +624,12 @@ impl OtaCluster {
     }
 
     fn handle_query_response(&mut self, payload: &[u8]) -> OtaAction {
+        // State guard: only accept query response when we're waiting for one
+        if self.state != OtaState::QuerySent {
+            log::warn!("[OTA] Query Response in wrong state {:?}, ignoring", self.state);
+            return OtaAction::None;
+        }
+
         let resp = match QueryNextImageResponse::parse(payload) {
             Some(r) => r,
             None => {
@@ -642,6 +674,15 @@ impl OtaCluster {
     }
 
     fn handle_block_response(&mut self, payload: &[u8]) -> OtaAction {
+        // State guard: only accept block responses during download or wait
+        match self.state {
+            OtaState::Downloading { .. } | OtaState::WaitForData { .. } => {}
+            _ => {
+                log::warn!("[OTA] Block Response in wrong state {:?}, ignoring", self.state);
+                return OtaAction::None;
+            }
+        }
+
         let parsed = match ParsedBlockResponse::parse(payload) {
             Some(p) => p,
             None => {
@@ -678,9 +719,16 @@ impl OtaCluster {
             ParsedBlockResponse::WaitForData(wait) => {
                 let delay = wait.minimum_block_period.max(1) as u32;
                 log::debug!("[OTA] Server says wait {} seconds", delay);
+                // Save current download position so we can resume
+                let (offset, total) = match self.state {
+                    OtaState::Downloading { offset, total_size } => (offset, total_size),
+                    _ => (0, 0),
+                };
                 self.state = OtaState::WaitForData {
                     delay_secs: delay,
                     elapsed: 0,
+                    download_offset: offset,
+                    download_total: total,
                 };
                 OtaAction::Wait(delay)
             }

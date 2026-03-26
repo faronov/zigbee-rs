@@ -368,6 +368,33 @@ fn mock_firmware_writer_abort() {
 
 // ── OTA Manager tests ───────────────────────────────────────────
 
+/// Build a valid OTA file: [header(56B)] [sub-element(6B)] [firmware payload]
+fn build_ota_file(mfg: u16, img_type: u16, version: u32, firmware: &[u8]) -> heapless::Vec<u8, 512> {
+    let total_size = 56 + 6 + firmware.len() as u32; // header + sub-element header + payload
+    let mut file = heapless::Vec::<u8, 512>::new();
+
+    // OTA header (56 bytes)
+    for &b in &0x0BEEF11Eu32.to_le_bytes() { let _ = file.push(b); } // magic
+    for &b in &0x0100u16.to_le_bytes() { let _ = file.push(b); }     // header version
+    for &b in &56u16.to_le_bytes() { let _ = file.push(b); }         // header length
+    for &b in &0u16.to_le_bytes() { let _ = file.push(b); }          // field control
+    for &b in &mfg.to_le_bytes() { let _ = file.push(b); }           // manufacturer
+    for &b in &img_type.to_le_bytes() { let _ = file.push(b); }      // image type
+    for &b in &version.to_le_bytes() { let _ = file.push(b); }       // file version
+    for &b in &0x0002u16.to_le_bytes() { let _ = file.push(b); }     // stack version
+    for _ in 0..32 { let _ = file.push(0); }                          // header string
+    for &b in &total_size.to_le_bytes() { let _ = file.push(b); }    // total image size
+
+    // Sub-element header (6 bytes): tag=0x0000 (UpgradeImage) + length
+    for &b in &0x0000u16.to_le_bytes() { let _ = file.push(b); }
+    for &b in &(firmware.len() as u32).to_le_bytes() { let _ = file.push(b); }
+
+    // Firmware payload
+    for &b in firmware { let _ = file.push(b); }
+
+    file
+}
+
 #[test]
 fn ota_manager_full_download_flow() {
     use zigbee_runtime::firmware_writer::{FirmwareWriter, MockFirmwareWriter};
@@ -379,52 +406,58 @@ fn ota_manager_full_download_flow() {
         image_type: 0x0001,
         current_version: 0x00000001,
         endpoint: 1,
-        block_size: 4,
+        block_size: 48,
         auto_accept: true,
     };
     let mut mgr = OtaManager::new(writer, config);
+
+    // Build a real OTA file: 56B header + 6B sub-element + 64B firmware = 126B total
+    let firmware_payload: [u8; 64] = core::array::from_fn(|i| (i + 0x10) as u8);
+    let ota_file = build_ota_file(0x1234, 0x0001, 0x00000002, &firmware_payload);
+    let ota_total = ota_file.len() as u32; // 126
 
     // 1. Start query
     mgr.start_query();
     assert!(mgr.take_pending_frame().is_some()); // Query request queued
 
-    // 2. Receive query response: image available, 12 bytes
+    // 2. Receive query response: image available
     let mut resp = [0u8; 13];
     resp[0] = 0x00;
     resp[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
     resp[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
     resp[5..9].copy_from_slice(&0x00000002u32.to_le_bytes());
-    resp[9..13].copy_from_slice(&12u32.to_le_bytes()); // 12 byte image
-    mgr.handle_incoming(0x02, &resp);
+    resp[9..13].copy_from_slice(&ota_total.to_le_bytes());
+    let event = mgr.handle_incoming(0x02, &resp);
+    // First block request should emit OtaImageAvailable
+    assert!(event.is_some());
     assert!(mgr.take_pending_frame().is_some()); // Block request queued
 
-    // 3. Receive 3 blocks of 4 bytes each
-    for i in 0..3 {
-        let offset = i * 4;
-        let mut block = [0u8; 18];
-        block[0] = 0x00;
+    // 3. Send OTA file data in 48-byte blocks
+    let mut offset = 0u32;
+    while offset < ota_total {
+        let end = ((offset + 48) as usize).min(ota_file.len());
+        let chunk = &ota_file[offset as usize..end];
+        let chunk_len = chunk.len();
+
+        let mut block = [0u8; 64];
+        block[0] = 0x00; // success
         block[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
         block[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
         block[5..9].copy_from_slice(&0x00000002u32.to_le_bytes());
-        block[9..13].copy_from_slice(&(offset as u32).to_le_bytes());
-        block[13] = 4;
-        block[14..18].copy_from_slice(&[
-            (i * 4 + 1) as u8,
-            (i * 4 + 2) as u8,
-            (i * 4 + 3) as u8,
-            (i * 4 + 4) as u8,
-        ]);
+        block[9..13].copy_from_slice(&offset.to_le_bytes());
+        block[13] = chunk_len as u8;
+        block[14..14 + chunk_len].copy_from_slice(chunk);
 
-        let event = mgr.handle_incoming(0x05, &block);
+        let event = mgr.handle_incoming(0x05, &block[..14 + chunk_len]);
         assert!(event.is_some()); // Progress event
 
-        // Tick to process the write → next block request
+        // Tick to process write → next block request
         mgr.tick(0);
-        // Should have a pending frame (next block request or end request)
+
+        offset += chunk_len as u32;
     }
 
-    // At this point download should be complete (12/12 bytes)
-    // The last tick should have triggered verify + end request
+    // Download complete — tick should have triggered verify + end request
     assert!(mgr.take_pending_frame().is_some()); // End request
 
     // 4. Receive upgrade end response: upgrade NOW
@@ -436,6 +469,115 @@ fn ota_manager_full_download_flow() {
     end_resp[12..16].copy_from_slice(&0u32.to_le_bytes()); // upgrade NOW
 
     let event = mgr.handle_incoming(0x07, &end_resp);
-    // Should get OtaComplete
-    assert!(event.is_some());
+    assert!(event.is_some()); // OtaComplete
+}
+
+#[test]
+fn ota_manager_rejects_wrong_manufacturer() {
+    use zigbee_runtime::firmware_writer::MockFirmwareWriter;
+    use zigbee_runtime::ota::{OtaConfig, OtaManager};
+    use zigbee_runtime::event_loop::StackEvent;
+
+    let writer = MockFirmwareWriter::new(4096);
+    let config = OtaConfig {
+        manufacturer_code: 0x1234,
+        image_type: 0x0001,
+        current_version: 0x00000001,
+        endpoint: 1,
+        block_size: 64,
+        auto_accept: true,
+    };
+    let mut mgr = OtaManager::new(writer, config);
+
+    // Build OTA file with WRONG manufacturer
+    let firmware: [u8; 32] = [0xAA; 32];
+    let ota_file = build_ota_file(0x9999, 0x0001, 0x00000002, &firmware);
+    let ota_total = ota_file.len() as u32; // 94 bytes
+
+    mgr.start_query();
+    mgr.take_pending_frame();
+
+    // Query response
+    let mut resp = [0u8; 13];
+    resp[0] = 0x00;
+    resp[1..3].copy_from_slice(&0x9999u16.to_le_bytes()); // wrong mfg in response too
+    resp[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    resp[5..9].copy_from_slice(&0x00000002u32.to_le_bytes());
+    resp[9..13].copy_from_slice(&ota_total.to_le_bytes());
+    mgr.handle_incoming(0x02, &resp);
+    mgr.take_pending_frame();
+
+    // Send first block — must be >= 56 bytes to trigger header parsing
+    let chunk_len = 64.min(ota_file.len());
+    let chunk = &ota_file[..chunk_len];
+    let mut block = [0u8; 80];
+    block[0] = 0x00;
+    block[1..3].copy_from_slice(&0x9999u16.to_le_bytes());
+    block[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    block[5..9].copy_from_slice(&0x00000002u32.to_le_bytes());
+    block[9..13].copy_from_slice(&0u32.to_le_bytes());
+    block[13] = chunk_len as u8;
+    block[14..14 + chunk_len].copy_from_slice(chunk);
+
+    let event = mgr.handle_incoming(0x05, &block[..14 + chunk_len]);
+    // Should get OtaFailed because manufacturer mismatch
+    assert!(matches!(event, Some(StackEvent::OtaFailed)));
+}
+
+#[test]
+fn ota_wait_for_data_resumes_download() {
+    let mut cluster = OtaCluster::new(0x1234, 0x0001, 0x00000001);
+    cluster.start_query();
+
+    // Query response: 1000 byte image
+    let mut resp = [0u8; 13];
+    resp[0] = 0x00;
+    resp[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    resp[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    resp[5..9].copy_from_slice(&0x00000002u32.to_le_bytes());
+    resp[9..13].copy_from_slice(&1000u32.to_le_bytes());
+    cluster.process_server_command(0x02, &resp);
+
+    // Receive first block (offset=0, 48 bytes)
+    let mut block = [0u8; 64];
+    block[0] = 0x00;
+    block[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    block[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    block[5..9].copy_from_slice(&0x00000002u32.to_le_bytes());
+    block[9..13].copy_from_slice(&0u32.to_le_bytes());
+    block[13] = 48;
+    // fill dummy data
+    for i in 14..62 { block[i] = i as u8; }
+    cluster.process_server_command(0x05, &block[..62]);
+
+    // State should be Downloading at offset=48
+    assert!(matches!(cluster.state(), OtaState::Downloading { offset: 48, total_size: 1000 }));
+
+    // Server sends WAIT_FOR_DATA
+    let mut wait = [0u8; 11];
+    wait[0] = 0x97; // WAIT_FOR_DATA status
+    wait[1..5].copy_from_slice(&1000u32.to_le_bytes());
+    wait[5..9].copy_from_slice(&1010u32.to_le_bytes());
+    wait[9..11].copy_from_slice(&5u16.to_le_bytes()); // wait 5 seconds
+    let action = cluster.process_server_command(0x05, &wait);
+    assert!(matches!(action, OtaAction::Wait(5)));
+    assert!(matches!(
+        cluster.state(),
+        OtaState::WaitForData { download_offset: 48, download_total: 1000, .. }
+    ));
+
+    // Tick 3 seconds — should still be waiting
+    let action = cluster.tick(3);
+    assert!(matches!(action, OtaAction::None));
+
+    // Tick 3 more seconds — should resume with block request at offset=48
+    let action = cluster.tick(3);
+    match action {
+        OtaAction::SendBlockRequest(req) => {
+            assert_eq!(req.file_offset, 48);
+        }
+        a => panic!("Expected SendBlockRequest, got {:?}", a),
+    }
+    // State should be back to Downloading
+    assert!(matches!(cluster.state(), OtaState::Downloading { offset: 48, .. }));
 }
