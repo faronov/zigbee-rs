@@ -277,7 +277,13 @@ impl<M: MacDriver> NwkLayer<M> {
         let hdr_len = new_header.serialize(&mut relay_buf);
 
         // Copy original payload (everything after header)
-        let (_, orig_hdr_len) = NwkHeader::parse(original).unwrap();
+        let (_, orig_hdr_len) = match NwkHeader::parse(original) {
+            Some(parsed) => parsed,
+            None => {
+                log::warn!("[NWK] Failed to re-parse NWK header for relay");
+                return Err(NwkStatus::InvalidParameter);
+            }
+        };
         let payload = &original[orig_hdr_len..];
         if hdr_len + payload.len() > relay_buf.len() {
             return Err(NwkStatus::FrameTooLong);

@@ -296,7 +296,7 @@ impl<F: FirmwareWriter> OtaManager<F> {
                     Some(StackEvent::OtaFailed)
                 }
             },
-            OtaAction::Wait(_secs) => None,
+            OtaAction::Wait(secs) => Some(StackEvent::OtaDelayedActivation { delay_secs: secs }),
             OtaAction::None => None,
         }
     }

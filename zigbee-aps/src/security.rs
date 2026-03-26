@@ -297,27 +297,42 @@ impl ApsSecurity {
         self.key_table.len()
     }
 
-    /// Check and update incoming frame counter (replay protection).
+    /// Check incoming frame counter for replay (read-only — does NOT update state).
     /// Returns true if the frame counter is valid (newer than last seen).
+    /// Call `commit_frame_counter()` only after successful MIC verification.
     pub fn check_frame_counter(
-        &mut self,
+        &self,
         partner: &IeeeAddress,
         key_type: ApsKeyType,
         counter: u32,
     ) -> bool {
         if let Some(entry) = self
             .key_table
-            .iter_mut()
+            .iter()
             .find(|e| e.partner_address == *partner && e.key_type == key_type)
         {
-            if counter > entry.incoming_frame_counter {
-                entry.incoming_frame_counter = counter;
-                true
-            } else {
-                false // Replay
-            }
+            counter > entry.incoming_frame_counter
         } else {
-            false // Unknown partner
+            // Unknown partner — allow with default TC link key (first contact)
+            true
+        }
+    }
+
+    /// Commit frame counter after successful decryption + MIC verification.
+    /// This is the second phase of the two-phase replay protection.
+    pub fn commit_frame_counter(
+        &mut self,
+        partner: &IeeeAddress,
+        key_type: ApsKeyType,
+        counter: u32,
+    ) {
+        if let Some(entry) = self
+            .key_table
+            .iter_mut()
+            .find(|e| e.partner_address == *partner && e.key_type == key_type)
+            .filter(|e| counter > e.incoming_frame_counter)
+        {
+            entry.incoming_frame_counter = counter;
         }
     }
 
@@ -397,6 +412,7 @@ impl Default for ApsSecurity {
 // APS uses Security Level 5: ENC-MIC-32 (M=4 byte MIC, L=2).
 
 use aes::Aes128;
+use aes::cipher::BlockEncrypt;
 use ccm::aead::AeadInPlace;
 use ccm::aead::generic_array::GenericArray;
 use ccm::consts::{U4, U13};
@@ -458,4 +474,80 @@ fn aps_aes_ccm_decrypt(
     let mut out = heapless::Vec::new();
     out.extend_from_slice(&buf[..mic_start]).ok()?;
     Some(out)
+}
+
+// ── Matyas-Meyer-Oseas Hash & HMAC-MMO ──────────────────────────
+// Used for APS key derivation (Zigbee spec Appendix B).
+
+/// Matyas-Meyer-Oseas AES-128 block cipher hash (Zigbee spec B.1.3).
+///
+/// Processes `data` in 16-byte blocks:
+///   H_0 = 0
+///   H_i = AES(H_{i-1}, M_i) XOR M_i
+///
+/// Input is padded per B.6: append 0x80, zeros, then 16-bit big-endian bit-length.
+fn matyas_meyer_oseas_hash(data: &[u8]) -> [u8; 16] {
+    let bit_len = (data.len() as u16).wrapping_mul(8);
+
+    // Build padded message: data || 0x80 || zeros || bit_len_be16
+    // Pad to next multiple of 16 bytes
+    let padded_len = (data.len() + 1 + 2).div_ceil(16) * 16;
+    let mut padded = [0u8; 80]; // Max 80 bytes (enough for HMAC inputs)
+    padded[..data.len()].copy_from_slice(data);
+    padded[data.len()] = 0x80;
+    padded[padded_len - 2] = (bit_len >> 8) as u8;
+    padded[padded_len - 1] = bit_len as u8;
+
+    let mut hash = [0u8; 16];
+
+    for chunk in padded[..padded_len].chunks(16) {
+        let cipher = <Aes128 as KeyInit>::new(GenericArray::from_slice(&hash));
+        let mut block = GenericArray::clone_from_slice(chunk);
+        cipher.encrypt_block(&mut block);
+        // H_i = E(H_{i-1}, M_i) XOR M_i
+        for j in 0..16 {
+            hash[j] = block[j] ^ chunk[j];
+        }
+    }
+
+    hash
+}
+
+/// HMAC-MMO keyed hash (Zigbee spec B.1.4).
+///
+/// HMAC(Key, M) = Hash( (Key XOR opad) || Hash( (Key XOR ipad) || M ) )
+fn hmac_mmo(key: &[u8; 16], message: &[u8]) -> [u8; 16] {
+    let mut ipad_key = [0x36u8; 16];
+    let mut opad_key = [0x5Cu8; 16];
+    for i in 0..16 {
+        ipad_key[i] ^= key[i];
+        opad_key[i] ^= key[i];
+    }
+
+    // Inner hash: Hash(ipad_key || message)
+    let mut inner_input = [0u8; 48]; // 16 + max 16 bytes message
+    inner_input[..16].copy_from_slice(&ipad_key);
+    let inner_len = 16 + message.len();
+    inner_input[16..inner_len].copy_from_slice(message);
+    let inner_hash = matyas_meyer_oseas_hash(&inner_input[..inner_len]);
+
+    // Outer hash: Hash(opad_key || inner_hash)
+    let mut outer_input = [0u8; 32];
+    outer_input[..16].copy_from_slice(&opad_key);
+    outer_input[16..32].copy_from_slice(&inner_hash);
+    matyas_meyer_oseas_hash(&outer_input)
+}
+
+/// Derive Key-Transport Key from TC link key (Zigbee spec §4.5.3.4).
+///
+/// Key-Transport Key = HMAC-MMO(Link Key, 0x00)
+pub fn derive_key_transport_key(link_key: &AesKey) -> AesKey {
+    hmac_mmo(link_key, &[0x00])
+}
+
+/// Derive Key-Load Key from TC link key (Zigbee spec §4.5.3.4).
+///
+/// Key-Load Key = HMAC-MMO(Link Key, 0x02)
+pub fn derive_key_load_key(link_key: &AesKey) -> AesKey {
+    hmac_mmo(link_key, &[0x02])
 }

@@ -740,8 +740,8 @@ impl OtaCluster {
             }
             ParsedBlockResponse::Error(status) => {
                 log::warn!("[OTA] Block response error: 0x{:02X}", status);
-                self.state = OtaState::Failed;
-                OtaAction::None
+                // Transition to failed and send Upgrade End Request so server stops waiting
+                self.mark_failed()
             }
         }
     }

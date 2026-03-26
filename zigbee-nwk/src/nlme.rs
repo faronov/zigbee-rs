@@ -336,7 +336,7 @@ impl<M: MacDriver> NwkLayer<M> {
             )
             .await;
 
-        // Add parent to neighbor table
+        // Add parent to neighbor table — use actual join target info
         // Try to get coordinator IEEE from MAC PIB (cached from association)
         let parent_ieee = if let Ok(PibValue::ExtendedAddress(addr)) = self
             .mac
@@ -347,10 +347,16 @@ impl<M: MacDriver> NwkLayer<M> {
         } else {
             [0; 8] // Will be updated when we receive a frame with source IEEE
         };
+        // Use actual join target address and determine device type from address
+        let parent_device_type = if join_target == ShortAddress::COORDINATOR {
+            NeighborDeviceType::Coordinator
+        } else {
+            NeighborDeviceType::Router
+        };
         let parent = NeighborEntry {
             ieee_address: parent_ieee,
-            network_address: ShortAddress::COORDINATOR,
-            device_type: NeighborDeviceType::Coordinator,
+            network_address: join_target,
+            device_type: parent_device_type,
             rx_on_when_idle: true,
             relationship: Relationship::Parent,
             lqi: network.lqi,

@@ -891,12 +891,24 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                                         .unwrap_or(false)
                             });
                             if is_identifying {
+                                // Add to APS group table
                                 let _ = self.bdb.zdo_mut().aps_mut().apsme_add_group(
                                     &zigbee_aps::apsme::ApsmeAddGroupRequest {
                                         group_address: gid,
                                         endpoint: dst_ep,
                                     },
                                 );
+                                // Also add to GroupsCluster internal list via CMD_ADD_GROUP
+                                // (cluster's handle_command for 0x05 is a no-op; use 0x00 to sync)
+                                for c in clusters.iter_mut() {
+                                    if c.endpoint == dst_ep && c.cluster.cluster_id().0 == 0x0004 {
+                                        let add_payload = gid.to_le_bytes();
+                                        let _ = c.cluster.handle_command(
+                                            CommandId(0x00), // CMD_ADD_GROUP
+                                            &add_payload,
+                                        );
+                                    }
+                                }
                             }
                         }
                         _ => {}

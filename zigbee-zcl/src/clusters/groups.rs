@@ -90,6 +90,18 @@ impl GroupsCluster {
         }
     }
 
+    /// Add a group externally (called by runtime for AddGroupIfIdentifying).
+    /// Does not trigger GroupAction — caller is responsible for APS table sync.
+    pub fn add_group_external(&mut self, group_id: u16) -> u8 {
+        if self.groups.contains(&group_id) {
+            return 0x8A; // DUPLICATE_EXISTS
+        }
+        match self.groups.push(group_id) {
+            Ok(()) => ZclStatus::Success as u8,
+            Err(_) => ZclStatus::InsufficientSpace as u8,
+        }
+    }
+
     fn remove_group(&mut self, group_id: u16) -> u8 {
         if let Some(pos) = self.groups.iter().position(|&g| g == group_id) {
             self.groups.swap_remove(pos);
@@ -202,14 +214,17 @@ impl Cluster for GroupsCluster {
                 Ok(heapless::Vec::new())
             }
             CMD_ADD_GROUP_IF_IDENTIFYING => {
-                // Only add if the identify cluster has IdentifyTime > 0.
-                // Since we don't have cross-cluster access here, just accept.
+                // Don't add to cluster's internal group list here.
+                // The runtime handles this: checks IdentifyTime > 0, then adds
+                // to both APS group table AND calls add_group_external().
+                // This avoids state mismatch where cluster list has groups
+                // that the APS table doesn't (when IdentifyTime == 0).
                 if payload.len() < 2 {
                     return Err(ZclStatus::MalformedCommand);
                 }
-                let group_id = u16::from_le_bytes([payload[0], payload[1]]);
-                let _ = self.add_group(group_id);
-                Ok(heapless::Vec::new()) // No response for this command
+                // No response for this command per ZCL spec
+                self.last_action = GroupAction::None;
+                Ok(heapless::Vec::new())
             }
             _ => Err(ZclStatus::UnsupClusterCommand),
         }

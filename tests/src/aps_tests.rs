@@ -544,12 +544,18 @@ fn test_security_frame_counter_replay_protection() {
     };
     sec.add_key(entry).unwrap();
 
+    // Two-phase pattern: check (read-only) then commit after MIC verify
     // Counter 10 should be accepted (> 0)
     assert!(sec.check_frame_counter(&partner, ApsKeyType::ApplicationLinkKey, 10));
+    // Commit after successful MIC verification
+    sec.commit_frame_counter(&partner, ApsKeyType::ApplicationLinkKey, 10);
     // Counter 5 should be rejected (replay, 5 <= 10)
     assert!(!sec.check_frame_counter(&partner, ApsKeyType::ApplicationLinkKey, 5));
     // Counter 11 should be accepted
     assert!(sec.check_frame_counter(&partner, ApsKeyType::ApplicationLinkKey, 11));
+    sec.commit_frame_counter(&partner, ApsKeyType::ApplicationLinkKey, 11);
+    // Counter 11 again should be rejected (equal, not greater)
+    assert!(!sec.check_frame_counter(&partner, ApsKeyType::ApplicationLinkKey, 11));
 }
 
 #[test]

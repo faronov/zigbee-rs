@@ -310,21 +310,49 @@ impl<M: MacDriver> ApsLayer<M> {
                     *self.security.default_tc_link_key()
                 }
             } else if key_id == crate::security::KEY_ID_KEY_TRANSPORT {
-                // Key-transport key: derive from TC link key via hash
-                // For simplicity, use the default TC link key directly
-                // (Zigbee 3.0 uses well-known key for initial transport)
-                *self.security.default_tc_link_key()
+                // Key-Transport Key: derive from TC link key via HMAC-MMO (spec §4.5.3.4)
+                crate::security::derive_key_transport_key(self.security.default_tc_link_key())
+            } else if key_id == crate::security::KEY_ID_KEY_LOAD {
+                // Key-Load Key: derive from TC link key via HMAC-MMO
+                crate::security::derive_key_load_key(self.security.default_tc_link_key())
             } else {
                 log::warn!("[APS] Unsupported key_id={} in APS security", key_id);
                 return None;
             };
 
-            // Decrypt
+            // Two-phase replay protection: check BEFORE decrypt, commit AFTER
+            let replay_key_type = if key_id == crate::security::KEY_ID_DATA_KEY {
+                crate::security::ApsKeyType::TrustCenterLinkKey
+            } else {
+                crate::security::ApsKeyType::NetworkKey
+            };
+            if let Some(addr) = &sec_hdr.source_address
+                && !self
+                    .security
+                    .check_frame_counter(addr, replay_key_type, sec_hdr.frame_counter)
+            {
+                log::warn!(
+                    "[APS] Replay detected: frame counter {} from src",
+                    sec_hdr.frame_counter
+                );
+                return None;
+            }
+
+            // Decrypt (includes MIC verification)
             match self.security.decrypt(aad, ciphertext, &key, &sec_hdr) {
                 Some(plaintext) => {
+                    // MIC verified — commit frame counter (phase 2 of replay protection)
+                    if let Some(addr) = &sec_hdr.source_address {
+                        self.security.commit_frame_counter(
+                            addr,
+                            replay_key_type,
+                            sec_hdr.frame_counter,
+                        );
+                    }
                     // Copy to owned buffer
                     let pt_len = plaintext.len().min(decrypted_buf.data.len());
                     decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
+                    decrypted_buf.len = pt_len;
                     decrypted_buf.len = pt_len;
                     log::debug!(
                         "[APS] Decrypted APS frame ({} bytes) from 0x{:04X}",

@@ -92,6 +92,8 @@ pub enum StackEvent {
     OtaComplete,
     /// OTA: Upgrade failed.
     OtaFailed,
+    /// OTA: Server requested delayed activation — reboot after `delay_secs`.
+    OtaDelayedActivation { delay_secs: u32 },
     /// Basic cluster: factory reset requested by coordinator.
     FactoryResetRequested,
 }
