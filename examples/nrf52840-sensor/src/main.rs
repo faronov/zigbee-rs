@@ -32,6 +32,7 @@ use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
+use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
@@ -61,6 +62,12 @@ async fn main(_spawner: Spawner) {
     info!("Radio ready");
 
     // ZCL cluster instances
+    let mut basic_cluster = BasicCluster::new(
+        b"Zigbee-RS",
+        b"nRF52840-Sensor",
+        b"20260326",
+        b"0.1.0",
+    );
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
 
@@ -94,6 +101,7 @@ async fn main(_spawner: Spawner) {
             // ── Incoming MAC frame ──────────────────────────────
             Either3::First(Ok(indication)) => {
                 let mut clusters = [
+                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                 ];
@@ -114,6 +122,7 @@ async fn main(_spawner: Spawner) {
                 }
                 device.user_action(UserAction::Toggle);
                 let mut clusters = [
+                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                 ];
@@ -153,6 +162,7 @@ async fn main(_spawner: Spawner) {
                 }
                 if let TickResult::Event(ref e) =
                     device.tick(REPORT_INTERVAL_SECS as u16, &mut [
+                        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                     ]).await

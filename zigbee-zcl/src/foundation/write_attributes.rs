@@ -191,3 +191,51 @@ pub fn process_write_no_response_dyn(
         let _ = store.set(rec.id, rec.value.clone());
     }
 }
+
+/// Process a Write Attributes Undivided request (command 0x03) using type-erased store.
+///
+/// All-or-nothing: validates every write first; if any would fail, none are applied.
+pub fn process_write_undivided_dyn(
+    store: &mut dyn crate::clusters::AttributeStoreMutAccess,
+    request: &WriteAttributesRequest,
+) -> WriteAttributesResponse {
+    // First pass: validate all attributes exist and are writable
+    let mut records = heapless::Vec::new();
+    let mut all_ok = true;
+    for rec in &request.records {
+        let status = match store.find(rec.id) {
+            Some(def) => {
+                if !def.access.is_writable() {
+                    ZclStatus::ReadOnly
+                } else if rec.data_type != def.data_type {
+                    ZclStatus::InvalidDataType
+                } else {
+                    ZclStatus::Success
+                }
+            }
+            None => ZclStatus::UnsupportedAttribute,
+        };
+        if status != ZclStatus::Success {
+            all_ok = false;
+        }
+        let _ = records.push(WriteAttributeStatusRecord { status, id: rec.id });
+    }
+
+    if !all_ok {
+        return WriteAttributesResponse { records };
+    }
+
+    // Second pass: all validated OK, apply writes
+    let mut write_records = heapless::Vec::new();
+    for rec in &request.records {
+        let status = match store.set(rec.id, rec.value.clone()) {
+            Ok(()) => ZclStatus::Success,
+            Err(e) => e,
+        };
+        let _ = write_records.push(WriteAttributeStatusRecord { status, id: rec.id });
+    }
+
+    WriteAttributesResponse {
+        records: write_records,
+    }
+}

@@ -443,6 +443,30 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             });
         }
 
+        // Check if this is a Default Response (0x0B) — received from remote
+        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
+            && cmd_id == 0x0B
+        {
+            let (resp_cmd, resp_status) = if zcl_frame.payload.len() >= 2 {
+                (zcl_frame.payload[0], zcl_frame.payload[1])
+            } else {
+                (0, 0)
+            };
+            log::debug!(
+                "[Runtime] Default Response for cmd 0x{:02X} status=0x{:02X} from 0x{:04X}",
+                resp_cmd,
+                resp_status,
+                src_addr,
+            );
+            return Some(event_loop::StackEvent::DefaultResponse {
+                src_addr,
+                endpoint: dst_ep,
+                cluster_id,
+                command_id: resp_cmd,
+                status: resp_status,
+            });
+        }
+
         // Check if this is Configure Reporting (0x06) — coordinator configuring our reports
         if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
             && cmd_id == 0x06
@@ -631,6 +655,47 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             });
         }
 
+        // ── Write Attributes Undivided (0x03) ────────────────────
+        // All-or-nothing: if any attribute fails, none are written.
+        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
+            && cmd_id == 0x03
+        {
+            if let Some(req) =
+                zigbee_zcl::foundation::write_attributes::WriteAttributesRequest::parse(
+                    zcl_frame.payload.as_slice(),
+                )
+                && let Some(cr) = clusters
+                    .iter_mut()
+                    .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
+            {
+                let response =
+                    zigbee_zcl::foundation::write_attributes::process_write_undivided_dyn(
+                        cr.cluster.attributes_mut(),
+                        &req,
+                    );
+                let mut payload_buf = [0u8; 128];
+                let payload_len = response.serialize(&mut payload_buf);
+                self.queue_global_response(
+                    src_addr,
+                    aps_indication.src_endpoint,
+                    dst_ep,
+                    cluster_id,
+                    zcl_frame.header.seq_number,
+                    0x04, // Write Attributes Response (same response cmd for undivided)
+                    &payload_buf[..payload_len],
+                );
+            }
+            return Some(event_loop::StackEvent::CommandReceived {
+                src_addr,
+                endpoint: dst_ep,
+                cluster_id,
+                command_id: cmd_id,
+                seq_number: zcl_frame.header.seq_number,
+                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
+                    .unwrap_or_default(),
+            });
+        }
+
         // ── Write Attributes No Response (0x05) ─────────────────
         if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
             && cmd_id == 0x05
@@ -792,6 +857,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     dst_ep,
                     cluster_id,
                     zcl_frame.header.seq_number,
+                    cmd_id,
                     cmd_status,
                 );
             }
@@ -826,6 +892,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         src_endpoint: u8,
         cluster_id: u16,
         seq: u8,
+        triggering_cmd: u8,
         status: ZclStatus,
     ) {
         let mut frame = ZclFrame::new_global(
@@ -834,7 +901,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             ClusterDirection::ServerToClient,
             true,
         );
-        let _ = frame.payload.push(0x00); // command that triggered this
+        let _ = frame.payload.push(triggering_cmd);
         let _ = frame.payload.push(status as u8);
 
         let mut zcl_buf = [0u8; 128];

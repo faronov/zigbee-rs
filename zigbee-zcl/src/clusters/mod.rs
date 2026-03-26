@@ -98,6 +98,8 @@ pub trait AttributeStoreMutAccess {
         id: crate::AttributeId,
         value: crate::data_types::ZclValue,
     ) -> Result<(), ZclStatus>;
+    /// Look up an attribute definition for validation (needed by Write Undivided).
+    fn find(&self, id: crate::AttributeId) -> Option<&crate::attribute::AttributeDefinition>;
 }
 
 impl<const N: usize> AttributeStoreAccess for AttributeStore<N> {
@@ -136,5 +138,8 @@ impl<const N: usize> AttributeStoreMutAccess for AttributeStore<N> {
         value: crate::data_types::ZclValue,
     ) -> Result<(), ZclStatus> {
         self.set_raw(id, value)
+    }
+    fn find(&self, id: crate::AttributeId) -> Option<&crate::attribute::AttributeDefinition> {
+        self.find(id)
     }
 }

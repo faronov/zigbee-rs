@@ -70,6 +70,16 @@ pub enum StackEvent {
     },
     /// BDB commissioning completed.
     CommissioningComplete { success: bool },
+    /// Default Response received from a remote device.
+    DefaultResponse {
+        src_addr: u16,
+        endpoint: u8,
+        cluster_id: u16,
+        /// The command ID that this is responding to.
+        command_id: u8,
+        /// Status code from the remote device.
+        status: u8,
+    },
     /// Permit joining status changed.
     PermitJoinChanged { open: bool },
     /// Attribute report was sent successfully.
