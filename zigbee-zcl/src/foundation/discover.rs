@@ -43,6 +43,9 @@ impl DiscoverAttributesRequest {
     }
 
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        if buf.len() < 3 {
+            return 0;
+        }
         let b = self.start_id.0.to_le_bytes();
         buf[0] = b[0];
         buf[1] = b[1];
@@ -54,9 +57,16 @@ impl DiscoverAttributesRequest {
 impl DiscoverAttributesResponse {
     /// Serialize the response to ZCL payload bytes.
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
         buf[0] = if self.complete { 1 } else { 0 };
         let mut pos = 1;
         for info in &self.attributes {
+            // Need 2 (id) + 1 (type) = 3 bytes
+            if pos + 3 > buf.len() {
+                break;
+            }
             let b = info.id.0.to_le_bytes();
             buf[pos] = b[0];
             buf[pos + 1] = b[1];

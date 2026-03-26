@@ -184,6 +184,29 @@ pub struct PendingApsAck {
     pub aps_counter: u8,
 }
 
+/// Maximum entries in APS duplicate rejection table
+const APS_DUP_TABLE_SIZE: usize = 16;
+
+/// APS duplicate rejection entry
+#[derive(Debug, Clone, Copy)]
+struct ApsDuplicateEntry {
+    src_addr: u16,
+    aps_counter: u8,
+    age: u16,
+    active: bool,
+}
+
+impl ApsDuplicateEntry {
+    const fn empty() -> Self {
+        Self {
+            src_addr: 0,
+            aps_counter: 0,
+            age: 0,
+            active: false,
+        }
+    }
+}
+
 /// The APS layer — owns the NWK layer and all APS state.
 ///
 /// Generic over `M: MacDriver` (the hardware abstraction).
@@ -202,6 +225,8 @@ pub struct ApsLayer<M: MacDriver> {
     aps_counter: u8,
     /// Pending APS ACK to send after processing incoming frame
     pending_aps_ack: Option<PendingApsAck>,
+    /// APS duplicate rejection table
+    dup_table: [ApsDuplicateEntry; APS_DUP_TABLE_SIZE],
 }
 
 impl<M: MacDriver> ApsLayer<M> {
@@ -215,6 +240,7 @@ impl<M: MacDriver> ApsLayer<M> {
             security: security::ApsSecurity::new(),
             aps_counter: 0,
             pending_aps_ack: None,
+            dup_table: [ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE],
         }
     }
 
@@ -223,6 +249,53 @@ impl<M: MacDriver> ApsLayer<M> {
         let c = self.aps_counter;
         self.aps_counter = self.aps_counter.wrapping_add(1);
         c
+    }
+
+    /// Check if an APS frame is a duplicate. Returns true if duplicate.
+    /// If not a duplicate, records it in the table.
+    pub fn is_aps_duplicate(&mut self, src_addr: u16, aps_counter: u8) -> bool {
+        // Check existing entries
+        for entry in self.dup_table.iter() {
+            if entry.active && entry.src_addr == src_addr && entry.aps_counter == aps_counter {
+                return true; // Duplicate
+            }
+        }
+        // Not a duplicate — record it
+        // Find inactive slot first, else evict oldest
+        let mut best_idx: Option<usize> = None;
+        let mut best_age: u16 = 0;
+        for (i, entry) in self.dup_table.iter().enumerate() {
+            if !entry.active {
+                best_idx = Some(i);
+                break;
+            }
+            if entry.age >= best_age {
+                best_age = entry.age;
+                best_idx = Some(i);
+            }
+        }
+        if let Some(idx) = best_idx {
+            self.dup_table[idx] = ApsDuplicateEntry {
+                src_addr,
+                aps_counter,
+                age: 0,
+                active: true,
+            };
+        }
+        false
+    }
+
+    /// Age the APS duplicate rejection table. Call periodically (e.g. every second).
+    pub fn age_dup_table(&mut self) {
+        let timeout = self.aib.aps_duplicate_rejection_timeout;
+        for entry in self.dup_table.iter_mut() {
+            if entry.active {
+                entry.age = entry.age.saturating_add(1);
+                if entry.age >= timeout {
+                    entry.active = false;
+                }
+            }
+        }
     }
 
     /// Reference to the underlying NWK layer.

@@ -79,6 +79,15 @@ impl NeighborEntry {
         }
     }
 
+    /// Create a minimal neighbor entry from a Device_annce.
+    pub fn new_from_annce(nwk_addr: ShortAddress, ieee_addr: IeeeAddress) -> Self {
+        let mut e = Self::empty();
+        e.network_address = nwk_addr;
+        e.ieee_address = ieee_addr;
+        e.active = true;
+        e
+    }
+
     /// Calculate outgoing cost from LQI (Zigbee spec Section 3.6.3.1)
     pub fn update_cost_from_lqi(&mut self) {
         self.outgoing_cost = match self.lqi {
@@ -211,6 +220,11 @@ impl NeighborTable {
     /// Iterate all active neighbors.
     pub fn iter(&self) -> impl Iterator<Item = &NeighborEntry> {
         self.entries.iter().filter(|e| e.active)
+    }
+
+    /// Iterate all active neighbors (mutable).
+    pub fn iter_mut_all(&mut self) -> impl Iterator<Item = &mut NeighborEntry> {
+        self.entries.iter_mut().filter(|e| e.active)
     }
 }
 

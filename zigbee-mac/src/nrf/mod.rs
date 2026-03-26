@@ -66,6 +66,8 @@ pub struct NrfMac<'a, T: Instance> {
     max_frame_retries: u8,
     promiscuous: bool,
     tx_power: i8,
+    /// macCoordShortAddress — short address of the coordinator/parent
+    coord_short_address: ShortAddress,
 }
 
 impl<'a, T: Instance> NrfMac<'a, T> {
@@ -85,6 +87,7 @@ impl<'a, T: Instance> NrfMac<'a, T> {
             max_frame_retries: 3,
             promiscuous: false,
             tx_power: 0,
+            coord_short_address: ShortAddress(0x0000),
         }
     }
 
@@ -334,7 +337,9 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         let _ = self.radio.try_send(&mut dreq_pkt).await;
 
         // Fix 10: Wait for Association Response with generous timeout
-        let timeout_us: u64 = 2_000_000; // 2 seconds
+        // macResponseWaitTime = 32 * aBaseSuperframeDuration = ~491ms at 250kbps
+        // Use 3 seconds to account for indirect frame delays and slow coordinators
+        let timeout_us: u64 = 3_000_000;
 
         let mut rx_pkt = Packet::new();
         let result = select::select(
@@ -448,14 +453,76 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                     self.radio.set_transmission_power(p);
                 }
             }
+            PibAttribute::MacCoordShortAddress => {
+                if let PibValue::ShortAddress(addr) = value {
+                    self.coord_short_address = addr;
+                }
+            }
             _ => {}
         }
         Ok(())
     }
 
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
-        // TODO: Send Data Request command to parent
-        Ok(None)
+        // Build and send MAC Data Request to parent (coordinator)
+        let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
+        let data_req = build_data_request(
+            self.next_dsn(),
+            &parent,
+            &self.extended_address,
+        );
+        let mut pkt = Packet::new();
+        pkt.copy_from_slice(&data_req);
+
+        // Transmit Data Request with CSMA-CA
+        self.radio
+            .try_send(&mut pkt)
+            .await
+            .map_err(|_| MacError::RadioError)?;
+
+        // Wait for response — parent may reply with data or empty ACK
+        // Use a short timeout since this is a poll
+        let mut rx_pkt = Packet::new();
+        let result = select::select(
+            Timer::after_millis(500),
+            self.radio.receive(&mut rx_pkt),
+        )
+        .await;
+
+        match result {
+            select::Either::Second(Ok(())) => {
+                let data = rx_pkt.as_ref();
+                if data.len() < 5 {
+                    return Ok(None);
+                }
+                let fc = u16::from_le_bytes([data[0], data[1]]);
+                let frame_type = fc & 0x07;
+
+                // Generate ACK if requested
+                let ack_requested = (fc >> 5) & 1 != 0;
+                if ack_requested {
+                    let seq = data[2];
+                    let mut ack_pkt = Packet::new();
+                    ack_pkt.copy_from_slice(&[0x02, 0x00, seq]);
+                    let _ = self.radio.try_send(&mut ack_pkt).await;
+                }
+
+                // Only deliver data frames (type 1)
+                if frame_type != 1 {
+                    return Ok(None);
+                }
+
+                let header_len = 3 + addressing_size(fc);
+                if data.len() <= header_len {
+                    return Ok(None);
+                }
+
+                let payload_data = &data[header_len..];
+                Ok(MacFrame::from_slice(payload_data))
+            }
+            // Timeout or receive error — no pending data
+            select::Either::First(_) | select::Either::Second(Err(_)) => Ok(None),
+        }
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {

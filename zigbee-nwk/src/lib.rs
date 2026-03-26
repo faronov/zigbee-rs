@@ -41,6 +41,7 @@ pub mod routing;
 pub mod security;
 
 use zigbee_mac::MacDriver;
+use zigbee_types::{IeeeAddress, ShortAddress};
 
 /// NWK layer status codes (Zigbee spec Table 3-70)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,5 +176,22 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Get mutable reference to the NWK security context.
     pub fn security_mut(&mut self) -> &mut security::NwkSecurity {
         &mut self.security
+    }
+
+    /// Update or insert a neighbor entry when a Device_annce is received.
+    /// This keeps the NWK address → IEEE address mapping current.
+    pub fn update_neighbor_address(&mut self, nwk_addr: ShortAddress, ieee_addr: IeeeAddress) {
+        // Try to update existing entry by NWK addr or IEEE addr
+        for entry in self.neighbors.iter_mut_all() {
+            if entry.network_address == nwk_addr || entry.ieee_address == ieee_addr {
+                entry.network_address = nwk_addr;
+                entry.ieee_address = ieee_addr;
+                return;
+            }
+        }
+        // Not found — add a new entry via add_or_update
+        let mut entry = neighbor::NeighborEntry::new_from_annce(nwk_addr, ieee_addr);
+        entry.active = true;
+        let _ = self.neighbors.add_or_update(entry);
     }
 }

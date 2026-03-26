@@ -70,8 +70,7 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     /// Process an incoming `Device_annce` (called by the handler).
     ///
-    /// Logs the announcement.  A full implementation would update the
-    /// neighbor table / address map in the NWK layer.
+    /// Updates the NWK neighbor table with the announced address mapping.
     pub(crate) fn process_device_annce(
         &mut self,
         payload: &[u8],
@@ -83,7 +82,8 @@ impl<M: MacDriver> ZdoLayer<M> {
             annce.ieee_addr,
             annce.capability,
         );
-        // TODO: update NWK address map / neighbor table
+        // Update NWK neighbor table with the announced short/IEEE address mapping
+        self.nwk_mut().update_neighbor_address(annce.nwk_addr, annce.ieee_addr);
         Ok(annce)
     }
 }

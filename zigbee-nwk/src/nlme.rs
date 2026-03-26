@@ -35,10 +35,16 @@ pub struct NetworkDescriptor {
     pub update_id: u8,
     /// LQI to the coordinator/router
     pub lqi: u8,
+    /// Short address of the beacon sender (coordinator or router)
+    pub router_address: ShortAddress,
 }
 
 impl From<&PanDescriptor> for NetworkDescriptor {
     fn from(pd: &PanDescriptor) -> Self {
+        let router_address = match pd.coord_address {
+            MacAddress::Short(_, addr) => addr,
+            MacAddress::Extended(_, _) => ShortAddress(0xFFFF),
+        };
         Self {
             extended_pan_id: pd.zigbee_beacon.extended_pan_id,
             pan_id: pd.coord_address.pan_id(),
@@ -52,6 +58,7 @@ impl From<&PanDescriptor> for NetworkDescriptor {
             end_device_capacity: pd.zigbee_beacon.end_device_capacity,
             update_id: pd.zigbee_beacon.update_id,
             lqi: pd.lqi,
+            router_address,
         }
     }
 }
@@ -106,6 +113,10 @@ impl<M: MacDriver> NwkLayer<M> {
         for pd in &scan_result.pan_descriptors {
             // Filter: only Zigbee PRO beacons (protocol_id = 0, stack_profile = 2)
             if pd.zigbee_beacon.protocol_id != 0 {
+                continue;
+            }
+            if pd.zigbee_beacon.stack_profile != 2 {
+                log::info!("[NWK] Skipping non-PRO beacon (stack_profile={})", pd.zigbee_beacon.stack_profile);
                 continue;
             }
             let nd = NetworkDescriptor::from(pd);
@@ -261,8 +272,13 @@ impl<M: MacDriver> NwkLayer<M> {
             allocate_address: true,
         };
 
-        // Perform MAC association
-        let coord_addr = MacAddress::Short(network.pan_id, ShortAddress::COORDINATOR);
+        // Perform MAC association — use discovered router address, not hardcoded coordinator
+        let join_target = if network.router_address.0 != 0xFFFF {
+            network.router_address
+        } else {
+            ShortAddress::COORDINATOR
+        };
+        let coord_addr = MacAddress::Short(network.pan_id, join_target);
         let result = self
             .mac
             .mlme_associate(MlmeAssociateRequest {
@@ -287,7 +303,16 @@ impl<M: MacDriver> NwkLayer<M> {
         self.nib.extended_pan_id = network.extended_pan_id;
         self.nib.update_id = network.update_id;
         self.nib.stack_profile = network.stack_profile;
-        self.nib.parent_address = ShortAddress::COORDINATOR;
+        self.nib.parent_address = join_target;
+
+        // Set macCoordShortAddress so MAC layer knows the parent for mlme_poll
+        let _ = self
+            .mac
+            .mlme_set(
+                PibAttribute::MacCoordShortAddress,
+                PibValue::ShortAddress(join_target),
+            )
+            .await;
 
         // Read our IEEE address
         if let Ok(PibValue::ExtendedAddress(addr)) =
@@ -509,6 +534,8 @@ impl<M: MacDriver> NwkLayer<M> {
                 if rejoin_status == 0x00 {
                     log::info!("[NWK] Rejoin accepted, new addr=0x{:04X}", new_addr);
                     self.nib.network_address = ShortAddress(new_addr);
+                    // Refresh parent address to the sender of the rejoin response
+                    self.nib.parent_address = hdr.src_addr;
                     let _ = self
                         .mac
                         .mlme_set(
@@ -631,11 +658,20 @@ impl<M: MacDriver> NwkLayer<M> {
             })
             .await;
 
-        // Reset state
+        // Reset state — clear all network-scoped state
         self.joined = false;
         self.nib.network_address = ShortAddress(0xFFFF);
         self.nib.pan_id = PanId(0xFFFF);
         self.nib.parent_address = ShortAddress(0xFFFF);
+        self.nib.logical_channel = 0;
+        self.nib.depth = 0;
+        self.nib.extended_pan_id = [0u8; 8];
+        self.neighbors = crate::neighbor::NeighborTable::new();
+        self.routing = crate::routing::RoutingTable::new();
+        if !rejoin {
+            // Full leave — also clear security state
+            self.security = crate::security::NwkSecurity::new();
+        }
 
         log::info!("[NWK] Left network, rejoin={rejoin}");
 

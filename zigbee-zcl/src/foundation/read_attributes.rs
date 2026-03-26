@@ -44,10 +44,13 @@ impl ReadAttributesRequest {
         Some(Self { attributes })
     }
 
-    /// Serialize to ZCL payload bytes.
+    /// Serialize to ZCL payload bytes. Returns bytes written.
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         let mut pos = 0;
         for attr in &self.attributes {
+            if pos + 2 > buf.len() {
+                break;
+            }
             let b = attr.0.to_le_bytes();
             buf[pos] = b[0];
             buf[pos + 1] = b[1];
@@ -58,10 +61,15 @@ impl ReadAttributesRequest {
 }
 
 impl ReadAttributesResponse {
-    /// Serialize the response to ZCL payload bytes.
+    /// Serialize the response to ZCL payload bytes. Returns bytes written.
+    /// Stops serializing records if the buffer would overflow.
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         let mut pos = 0;
         for rec in &self.records {
+            // Minimum record: 2 (attr id) + 1 (status) = 3 bytes
+            if pos + 3 > buf.len() {
+                break;
+            }
             // Attribute ID
             let b = rec.id.0.to_le_bytes();
             buf[pos] = b[0];
@@ -74,9 +82,17 @@ impl ReadAttributesResponse {
             if rec.status == ZclStatus::Success
                 && let Some(ref val) = rec.value
             {
+                // Need at least 1 byte for data type
+                if pos + 1 > buf.len() {
+                    break;
+                }
                 buf[pos] = rec.data_type as u8;
                 pos += 1;
-                pos += val.serialize(&mut buf[pos..]);
+                let remaining = &mut buf[pos..];
+                if remaining.is_empty() {
+                    break;
+                }
+                pos += val.serialize(remaining);
             }
         }
         pos

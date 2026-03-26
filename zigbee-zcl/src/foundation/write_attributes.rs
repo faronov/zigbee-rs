@@ -57,17 +57,25 @@ impl WriteAttributesRequest {
         Some(Self { records })
     }
 
-    /// Serialize to ZCL payload bytes.
+    /// Serialize to ZCL payload bytes. Returns bytes written.
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         let mut pos = 0;
         for rec in &self.records {
+            // Need at least 2 (id) + 1 (type) = 3 bytes
+            if pos + 3 > buf.len() {
+                break;
+            }
             let b = rec.id.0.to_le_bytes();
             buf[pos] = b[0];
             buf[pos + 1] = b[1];
             pos += 2;
             buf[pos] = rec.data_type as u8;
             pos += 1;
-            pos += rec.value.serialize(&mut buf[pos..]);
+            let remaining = &mut buf[pos..];
+            if remaining.is_empty() {
+                break;
+            }
+            pos += rec.value.serialize(remaining);
         }
         pos
     }
@@ -81,12 +89,19 @@ impl WriteAttributesResponse {
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         let all_success = self.records.iter().all(|r| r.status == ZclStatus::Success);
         if all_success {
+            if buf.is_empty() {
+                return 0;
+            }
             buf[0] = ZclStatus::Success as u8;
             return 1;
         }
         let mut pos = 0;
         for rec in &self.records {
             if rec.status != ZclStatus::Success {
+                // Need 1 (status) + 2 (id) = 3 bytes
+                if pos + 3 > buf.len() {
+                    break;
+                }
                 buf[pos] = rec.status as u8;
                 pos += 1;
                 let b = rec.id.0.to_le_bytes();

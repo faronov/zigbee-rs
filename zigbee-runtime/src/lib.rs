@@ -505,12 +505,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 });
                 for cfg in &req.configs {
                     // Validate attribute exists in the cluster before configuring
-                    let attr_exists = cluster_ref
+                    let attr_def = cluster_ref
                         .as_ref()
-                        .and_then(|c| c.cluster.attributes().get(cfg.attribute_id))
-                        .is_some();
-                    let status = if !attr_exists {
+                        .and_then(|c| c.cluster.attributes().find(cfg.attribute_id));
+                    let status = if attr_def.is_none() {
                         ZclStatus::UnsupportedAttribute
+                    } else if cfg.direction == zigbee_zcl::foundation::reporting::ReportDirection::Send
+                        && !attr_def.unwrap().access.is_reportable()
+                    {
+                        ZclStatus::UnreportableAttribute
                     } else {
                         match self.reporting
                             .configure_for_cluster(dst_ep, cluster_id, cfg.clone())
@@ -571,13 +574,24 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         rec.direction,
                         rec.attribute_id,
                     ) {
-                        let _ = response.records.push(ReadReportingConfigResponseRecord {
-                            status: ZclStatus::Success,
-                            direction: rec.direction,
-                            attribute_id: rec.attribute_id,
-                            config: Some(cfg.clone()),
-                            timeout: None,
-                        });
+                        if rec.direction == zigbee_zcl::foundation::reporting::ReportDirection::Send {
+                            let _ = response.records.push(ReadReportingConfigResponseRecord {
+                                status: ZclStatus::Success,
+                                direction: rec.direction,
+                                attribute_id: rec.attribute_id,
+                                config: Some(cfg.clone()),
+                                timeout: None,
+                            });
+                        } else {
+                            // Receive direction: return timeout only
+                            let _ = response.records.push(ReadReportingConfigResponseRecord {
+                                status: ZclStatus::Success,
+                                direction: rec.direction,
+                                attribute_id: rec.attribute_id,
+                                config: None,
+                                timeout: Some(cfg.max_interval),
+                            });
+                        }
                     } else {
                         let _ = response.records.push(ReadReportingConfigResponseRecord {
                             status: ZclStatus::UnsupportedAttribute,
@@ -624,7 +638,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         cr.cluster.attributes(),
                         &req,
                     );
-                    let mut payload_buf = [0u8; 220];
+                    let mut payload_buf = [0u8; 253]; // Max ZCL payload size
                     let payload_len = response.serialize(&mut payload_buf).min(payload_buf.len());
                     self.queue_global_response(
                         src_addr,
@@ -854,15 +868,26 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                             );
                         }
                         0x05 if zcl_frame.payload.len() >= 2 => {
-                            // Add Group If Identifying — sync APS table
+                            // Add Group If Identifying — only add if Identify cluster
+                            // on this endpoint has IdentifyTime > 0
                             let gid =
                                 u16::from_le_bytes([zcl_frame.payload[0], zcl_frame.payload[1]]);
-                            let _ = self.bdb.zdo_mut().aps_mut().apsme_add_group(
-                                &zigbee_aps::apsme::ApsmeAddGroupRequest {
-                                    group_address: gid,
-                                    endpoint: dst_ep,
-                                },
-                            );
+                            let is_identifying = clusters.iter().any(|c| {
+                                c.endpoint == dst_ep
+                                    && c.cluster.cluster_id().0 == 0x0003
+                                    && c.cluster.attributes()
+                                        .get(zigbee_zcl::AttributeId(0x0000))
+                                        .map(|v| matches!(v, zigbee_zcl::data_types::ZclValue::U16(t) if *t > 0))
+                                        .unwrap_or(false)
+                            });
+                            if is_identifying {
+                                let _ = self.bdb.zdo_mut().aps_mut().apsme_add_group(
+                                    &zigbee_aps::apsme::ApsmeAddGroupRequest {
+                                        group_address: gid,
+                                        endpoint: dst_ep,
+                                    },
+                                );
+                            }
                         }
                         _ => {}
                     }
@@ -935,7 +960,19 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             });
         }
 
-        // Other global commands — pass through as event
+        // Other global commands — send Default Response for unsupported, then pass through
+        if !zcl_frame.header.disable_default_response() {
+            // Send UNSUP_GENERAL_COMMAND for unhandled foundation commands
+            self.queue_default_response(
+                ShortAddress(src_addr),
+                aps_indication.src_endpoint,
+                dst_ep,
+                cluster_id,
+                zcl_frame.header.seq_number,
+                cmd_id,
+                ZclStatus::UnsupGeneralCommand,
+            );
+        }
         Some(event_loop::StackEvent::CommandReceived {
             src_addr,
             endpoint: dst_ep,

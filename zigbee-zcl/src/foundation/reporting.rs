@@ -60,11 +60,18 @@ impl ConfigureReportingResponse {
         // Check if all succeeded
         let all_success = self.records.iter().all(|r| r.status == ZclStatus::Success);
         if all_success {
+            if buf.is_empty() {
+                return 0;
+            }
             buf[0] = ZclStatus::Success as u8;
             return 1;
         }
         let mut pos = 0;
         for rec in &self.records {
+            // Need 1 (status) + 1 (direction) + 2 (attr_id) = 4 bytes
+            if pos + 4 > buf.len() {
+                break;
+            }
             buf[pos] = rec.status as u8;
             pos += 1;
             buf[pos] = rec.direction as u8;
@@ -97,13 +104,21 @@ impl ReportAttributes {
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         let mut pos = 0;
         for rpt in &self.reports {
+            // Need at least 2 (id) + 1 (type) = 3 bytes
+            if pos + 3 > buf.len() {
+                break;
+            }
             let b = rpt.id.0.to_le_bytes();
             buf[pos] = b[0];
             buf[pos + 1] = b[1];
             pos += 2;
             buf[pos] = rpt.data_type as u8;
             pos += 1;
-            pos += rpt.value.serialize(&mut buf[pos..]);
+            let remaining = &mut buf[pos..];
+            if remaining.is_empty() {
+                break;
+            }
+            pos += rpt.value.serialize(remaining);
         }
         pos
     }
@@ -490,9 +505,15 @@ pub struct ReadReportingConfigResponseRecord {
 
 impl ReadReportingConfigResponse {
     /// Serialize the response to ZCL payload bytes.
+    /// Direction-aware: Send records get data_type/min/max/change,
+    /// Receive records get timeout only (per ZCL spec §2.5.7.1.6).
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         let mut pos = 0;
         for rec in &self.records {
+            // Minimum: 1 (status) + 1 (direction) + 2 (attr_id) = 4 bytes
+            if pos + 4 > buf.len() {
+                break;
+            }
             buf[pos] = rec.status as u8;
             pos += 1;
             buf[pos] = rec.direction as u8;
@@ -503,26 +524,40 @@ impl ReadReportingConfigResponse {
             pos += 2;
 
             if rec.status == ZclStatus::Success {
-                if let Some(ref cfg) = rec.config {
-                    buf[pos] = cfg.data_type as u8;
-                    pos += 1;
-                    let b = cfg.min_interval.to_le_bytes();
-                    buf[pos] = b[0];
-                    buf[pos + 1] = b[1];
-                    pos += 2;
-                    let b = cfg.max_interval.to_le_bytes();
-                    buf[pos] = b[0];
-                    buf[pos + 1] = b[1];
-                    pos += 2;
-                    if let Some(ref change) = cfg.reportable_change {
-                        pos += change.serialize(&mut buf[pos..]);
+                if rec.direction == ReportDirection::Send {
+                    // Send direction: data_type(1) + min_interval(2) + max_interval(2) = 5 bytes min
+                    if let Some(ref cfg) = rec.config {
+                        if pos + 5 > buf.len() {
+                            break;
+                        }
+                        buf[pos] = cfg.data_type as u8;
+                        pos += 1;
+                        let b = cfg.min_interval.to_le_bytes();
+                        buf[pos] = b[0];
+                        buf[pos + 1] = b[1];
+                        pos += 2;
+                        let b = cfg.max_interval.to_le_bytes();
+                        buf[pos] = b[0];
+                        buf[pos + 1] = b[1];
+                        pos += 2;
+                        if let Some(ref change) = cfg.reportable_change {
+                            let remaining = &mut buf[pos..];
+                            if !remaining.is_empty() {
+                                pos += change.serialize(remaining);
+                            }
+                        }
                     }
-                }
-                if let Some(timeout) = rec.timeout {
-                    let b = timeout.to_le_bytes();
-                    buf[pos] = b[0];
-                    buf[pos + 1] = b[1];
-                    pos += 2;
+                } else {
+                    // Receive direction: timeout(2) only
+                    if let Some(timeout) = rec.timeout {
+                        if pos + 2 > buf.len() {
+                            break;
+                        }
+                        let b = timeout.to_le_bytes();
+                        buf[pos] = b[0];
+                        buf[pos + 1] = b[1];
+                        pos += 2;
+                    }
                 }
             }
         }

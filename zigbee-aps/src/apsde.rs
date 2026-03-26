@@ -349,7 +349,13 @@ impl<M: MacDriver> ApsLayer<M> {
         // Only deliver Data frames to the upper layer
         let ft = crate::frames::ApsFrameType::from_u8(header.frame_control.frame_type)?;
         match ft {
-            ApsFrameType::Data => {}
+            ApsFrameType::Data => {
+                // APS duplicate rejection — drop duplicate data frames
+                if self.is_aps_duplicate(nwk_src.0, header.aps_counter) {
+                    log::debug!("APS duplicate rejected: src=0x{:04X} counter={}", nwk_src.0, header.aps_counter);
+                    return None;
+                }
+            }
             ApsFrameType::Ack => {
                 // TODO: match APS ack to pending request
                 log::debug!("APS ACK received (counter={})", header.aps_counter);

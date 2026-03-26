@@ -28,6 +28,9 @@ impl DefaultResponse {
 
     /// Serialize to ZCL payload bytes. Returns bytes written (always 2).
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        if buf.len() < 2 {
+            return 0;
+        }
         buf[0] = self.command_id;
         buf[1] = self.status as u8;
         2

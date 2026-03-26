@@ -133,8 +133,10 @@ impl<M: MacDriver> BdbLayer<M> {
                 log::info!("[BDB:Steering] Waiting for Transport-Key from TC...");
 
                 let mut key_received = false;
-                // Poll for incoming frames for up to ~5 seconds
-                for _attempt in 0..50 {
+                // Poll for incoming frames — wait up to ~10s for Transport-Key
+                // Each iteration waits for a MAC frame (blocks on receive with timeout)
+                const MAX_KEY_WAIT_ATTEMPTS: usize = 100;
+                for _attempt in 0..MAX_KEY_WAIT_ATTEMPTS {
                     // Small delay between polls (~100ms worth of iterations)
                     // Try to receive a MAC frame
                     match self.zdo.aps_mut().nwk_mut().mac_mut().mcps_data_indication().await {
