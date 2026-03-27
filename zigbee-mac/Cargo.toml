@@ -30,10 +30,6 @@ embassy-nrf52833 = { package = "embassy-nrf", version = "0.3", features = ["nrf5
 # which conflicts with the modern ecosystem. Clock/GPIO init is done
 # via the C SDK or a future compatible HAL.
 
-# ── STM32WB55 backend ───────────────────────────────────────
-# embassy-stm32 with wpan feature for 802.15.4 coprocessor
-embassy-stm32 = { version = "0.2", optional = true }
-
 # ── Shared Embassy async primitives (used by multiple backends)
 embassy-sync = { version = "0.7", optional = true }
 embassy-time = { version = "0.5", optional = true }
@@ -68,18 +64,7 @@ nrf52833 = [
     "dep:embassy-nrf52833",
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
 ]
-stm32wb55 = [
-    "dep:embassy-stm32",
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
-]
-efr32mg24 = [
-    # Requires external RAIL library linked at build time
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
-]
-cc2652 = [
-    # Requires cc13x2_26x2_pac
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
-]
+
 bl702 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
 ]

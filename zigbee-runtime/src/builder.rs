@@ -193,13 +193,23 @@ pub struct EndpointBuilder {
 impl EndpointBuilder {
     /// Add a server-side cluster.
     pub fn cluster_server(mut self, cluster_id: u16) -> Self {
-        let _ = self.server_clusters.push(cluster_id);
+        if self.server_clusters.push(cluster_id).is_err() {
+            log::warn!(
+                "EndpointBuilder: server cluster table full, dropping cluster 0x{:04X}",
+                cluster_id,
+            );
+        }
         self
     }
 
     /// Add a client-side cluster.
     pub fn cluster_client(mut self, cluster_id: u16) -> Self {
-        let _ = self.client_clusters.push(cluster_id);
+        if self.client_clusters.push(cluster_id).is_err() {
+            log::warn!(
+                "EndpointBuilder: client cluster table full, dropping cluster 0x{:04X}",
+                cluster_id,
+            );
+        }
         self
     }
 

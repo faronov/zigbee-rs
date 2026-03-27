@@ -372,25 +372,84 @@ impl<M: MacDriver> ZdoLayer<M> {
     // ── Network management ──────────────────────────────────────
 
     fn handle_mgmt_lqi_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
-        let _req = MgmtLqiReq::parse(payload)?;
-        // TODO: populate from NWK neighbor table
+        let req = MgmtLqiReq::parse(payload)?;
+        let neighbor_table = self.nwk().neighbor_table();
+        let total = neighbor_table.len() as u8;
+        let start = req.start_index as usize;
+        let mut list: heapless::Vec<NeighborTableRecord, 16> = heapless::Vec::new();
+        for entry in neighbor_table.iter().skip(start) {
+            if list.is_full() {
+                break;
+            }
+            use zigbee_nwk::neighbor::{NeighborDeviceType, Relationship};
+            let device_type = match entry.device_type {
+                NeighborDeviceType::Coordinator => 0,
+                NeighborDeviceType::Router => 1,
+                NeighborDeviceType::EndDevice => 2,
+                NeighborDeviceType::Unknown => 3,
+            };
+            let rx_on = u8::from(entry.rx_on_when_idle);
+            let relationship = match entry.relationship {
+                Relationship::Parent => 0,
+                Relationship::Child => 1,
+                Relationship::Sibling => 2,
+                Relationship::PreviousChild => 4,
+                Relationship::UnauthenticatedChild => 3,
+            };
+            let permit = if entry.permit_joining { 1 } else { 0 };
+            let _ = list.push(NeighborTableRecord {
+                extended_pan_id: entry.extended_pan_id,
+                extended_addr: entry.ieee_address,
+                network_addr: entry.network_address,
+                device_type,
+                rx_on_when_idle: rx_on,
+                relationship,
+                permit_joining: permit,
+                depth: entry.depth,
+                lqi: entry.lqi,
+            });
+        }
         let rsp_data = MgmtLqiRsp {
             status: ZdpStatus::Success,
-            neighbor_table_entries: 0,
-            start_index: 0,
-            neighbor_table_list: heapless::Vec::new(),
+            neighbor_table_entries: total,
+            start_index: req.start_index,
+            neighbor_table_list: list,
         };
         rsp_data.serialize(rsp)
     }
 
     fn handle_mgmt_rtg_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
-        let _req = MgmtRtgReq::parse(payload)?;
-        // TODO: populate from NWK routing table
+        let req = MgmtRtgReq::parse(payload)?;
+        let routing_table = self.nwk().routing_table();
+        let total = routing_table.len() as u8;
+        let start = req.start_index as usize;
+        let mut list: heapless::Vec<RoutingTableRecord, 16> = heapless::Vec::new();
+        for entry in routing_table.iter().skip(start) {
+            if list.is_full() {
+                break;
+            }
+            use zigbee_nwk::routing::RouteStatus;
+            let status = match entry.status {
+                RouteStatus::Active => 0,
+                RouteStatus::DiscoveryUnderway => 1,
+                RouteStatus::DiscoveryFailed => 2,
+                RouteStatus::Inactive => 3,
+                RouteStatus::ValidationUnderway => 4,
+            };
+            let _ = list.push(RoutingTableRecord {
+                dst_addr: entry.destination,
+                status,
+                memory_constrained: false,
+                many_to_one: entry.many_to_one,
+                route_record_required: entry.route_record_required,
+                next_hop: entry.next_hop,
+            });
+        }
         let rsp_data = MgmtRtgRsp {
             status: ZdpStatus::Success,
-            routing_table_entries: 0,
-            start_index: 0,
-            routing_table_list: heapless::Vec::new(),
+            routing_table_entries: total,
+            start_index: req.start_index,
+            routing_table_list: list,
         };
         rsp_data.serialize(rsp)
     }
@@ -435,12 +494,13 @@ impl<M: MacDriver> ZdoLayer<M> {
         rsp: &mut [u8],
     ) -> Result<usize, ZdoError> {
         let _req = MgmtPermitJoiningReq::parse(payload)?;
-        // TODO: invoke nlme_permit_joining on the NWK layer
-        log::info!("Mgmt_Permit_Joining_req received (stub)");
+        // Cannot invoke nlme_permit_joining here (handler is &self, NWK op is async).
+        // Return NotSupported until async handler refactor or queue mechanism is added.
+        log::warn!("Mgmt_Permit_Joining_req: not yet wired to NWK (returning NotSupported)");
         if rsp.is_empty() {
             return Err(ZdoError::BufferTooSmall);
         }
-        rsp[0] = ZdpStatus::Success as u8;
+        rsp[0] = ZdpStatus::NotSupported as u8;
         Ok(1)
     }
 
@@ -450,10 +510,11 @@ impl<M: MacDriver> ZdoLayer<M> {
         rsp: &mut [u8],
     ) -> Result<usize, ZdoError> {
         let _req = MgmtNwkUpdateReq::parse(payload)?;
-        // TODO: perform ED scan / channel change
-        log::info!("Mgmt_NWK_Update_req received (stub)");
+        // ED scan / channel change / manager change not yet implemented.
+        // Return NotSupported instead of fake Success.
+        log::warn!("Mgmt_NWK_Update_req: not yet implemented (returning NotSupported)");
         let rsp_data = MgmtNwkUpdateRsp {
-            status: ZdpStatus::Success,
+            status: ZdpStatus::NotSupported,
             scanned_channels: 0,
             total_transmissions: 0,
             transmission_failures: 0,

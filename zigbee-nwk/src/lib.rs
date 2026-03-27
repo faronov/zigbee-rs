@@ -178,6 +178,21 @@ impl<M: MacDriver> NwkLayer<M> {
         &mut self.security
     }
 
+    /// Read-only access to the neighbor table.
+    pub fn neighbor_table(&self) -> &neighbor::NeighborTable {
+        &self.neighbors
+    }
+
+    /// Read-only access to the routing table.
+    pub fn routing_table(&self) -> &routing::RoutingTable {
+        &self.routing
+    }
+
+    /// Look up a short address by IEEE address from the neighbor table.
+    pub fn find_short_by_ieee(&self, ieee: &IeeeAddress) -> Option<ShortAddress> {
+        self.neighbors.find_by_ieee(ieee).map(|e| e.network_address)
+    }
+
     /// Update or insert a neighbor entry when a Device_annce is received.
     /// This keeps the NWK address → IEEE address mapping current.
     pub fn update_neighbor_address(&mut self, nwk_addr: ShortAddress, ieee_addr: IeeeAddress) {

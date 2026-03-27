@@ -182,10 +182,17 @@ impl NwkHeader {
             let relay_index = data[offset + 1];
             offset += 2;
             let mut relay_list = heapless::Vec::new();
-            for _ in 0..relay_count {
+            for i in 0..relay_count {
                 if data.len() >= offset + 2 {
                     let relay = ShortAddress(u16::from_le_bytes([data[offset], data[offset + 1]]));
-                    let _ = relay_list.push(relay);
+                    if relay_list.push(relay).is_err() {
+                        log::warn!(
+                            "NWK source route: relay list full (capacity={}, have={})",
+                            relay_list.capacity(),
+                            i,
+                        );
+                        break;
+                    }
                     offset += 2;
                 }
             }

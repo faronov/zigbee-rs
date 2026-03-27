@@ -151,9 +151,15 @@ impl<M: MacDriver> ApsLayer<M> {
                 (ShortAddress(0xFFFF), ApsDeliveryMode::Group)
             }
             ApsAddressMode::Extended => {
-                // TODO: resolve IEEE → short address via address map
-                // For now, return error (upper layer should resolve first)
-                return Err(ApsStatus::NoShortAddress);
+                // Resolve IEEE → short address via NWK neighbor table
+                let ieee = match req.dst_address {
+                    ApsAddress::Extended(addr) => addr,
+                    _ => return Err(ApsStatus::InvalidParameter),
+                };
+                match self.nwk.find_short_by_ieee(&ieee) {
+                    Some(short) => (short, ApsDeliveryMode::Unicast),
+                    None => return Err(ApsStatus::NoShortAddress),
+                }
             }
             ApsAddressMode::Indirect => {
                 // Look up binding table to find destinations

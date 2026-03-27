@@ -20,7 +20,13 @@ pub const DISTRIBUTED_SECURITY_KEY: [u8; 16] = [
     0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF,
 ];
 
-/// Install code derived key (placeholder — real derivation uses MMO hash).
+/// Install code derived key placeholder.
+///
+/// **WARNING**: This is NOT a real install-code-derived key. Real derivation
+/// requires the Matyas-Meyer-Oseas (MMO) hash of the install code + CRC.
+/// This constant exists only as a structural placeholder — do NOT use it
+/// for actual security. The `should_accept_join()` method will reject
+/// install-code joins since no real derivation is performed.
 pub const INSTALL_CODE_DERIVED_KEY: [u8; 16] = [0; 16];
 
 /// Key type for TC link keys.

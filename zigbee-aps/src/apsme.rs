@@ -313,9 +313,9 @@ impl<M: MacDriver> ApsLayer<M> {
             _ => {}
         }
 
-        // TODO: Build APS command frame (Transport Key) and send via APSDE
-        // For now, just store the key locally
-        log::debug!(
+        // TODO: Build APS Transport Key command frame and send via APSDE.
+        // Key is stored locally above, but OTA frame is NOT sent to dst_address.
+        log::warn!(
             "APSME-TRANSPORT-KEY: type={:?}, dst={:02X?}",
             req.key_type,
             req.dst_address
@@ -324,36 +324,39 @@ impl<M: MacDriver> ApsLayer<M> {
     }
 
     /// APSME-REQUEST-KEY.request — request a key from the Trust Center.
+    ///
+    /// Not yet implemented — APS command frame construction required.
     pub async fn apsme_request_key(&mut self, req: &ApsmeRequestKeyRequest) -> ApsStatus {
-        // TODO: Build APS command frame (Request Key) and send to TC
-        log::debug!(
-            "APSME-REQUEST-KEY: type={:?}, dst={:02X?}",
+        log::warn!(
+            "APSME-REQUEST-KEY: not implemented (type={:?}, dst={:02X?})",
             req.key_type,
             req.dst_address
         );
-        ApsStatus::Success
+        ApsStatus::IllegalRequest
     }
 
     /// APSME-SWITCH-KEY.request — switch to a new active network key.
+    ///
+    /// Not yet implemented — APS command frame construction required.
     pub async fn apsme_switch_key(&mut self, req: &ApsmeSwitchKeyRequest) -> ApsStatus {
-        // TODO: Build APS Switch Key command and broadcast
-        log::debug!(
-            "APSME-SWITCH-KEY: seq={}, dst={:02X?}",
+        log::warn!(
+            "APSME-SWITCH-KEY: not implemented (seq={}, dst={:02X?})",
             req.key_seq_number,
             req.dst_address
         );
-        ApsStatus::Success
+        ApsStatus::IllegalRequest
     }
 
     /// APSME-VERIFY-KEY.request — initiate key verification with TC.
+    ///
+    /// Not yet implemented — APS command frame construction required.
     pub async fn apsme_verify_key(&mut self, req: &ApsmeVerifyKeyRequest) -> ApsStatus {
-        // TODO: Build APS Verify Key command frame
-        log::debug!(
-            "APSME-VERIFY-KEY: type={:?}, dst={:02X?}",
+        log::warn!(
+            "APSME-VERIFY-KEY: not implemented (type={:?}, dst={:02X?})",
             req.key_type,
             req.dst_address
         );
-        ApsStatus::Success
+        ApsStatus::IllegalRequest
     }
 
     // ── APSME-GET / APSME-SET ───────────────────────────────

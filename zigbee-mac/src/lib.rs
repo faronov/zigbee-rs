@@ -15,7 +15,7 @@
 //! └────────────────┬────────────────────────┘
 //!                  │ MacDriver trait
 //! ┌────────────────┴────────────────────────┐
-//! │  MAC backends: esp / nrf / stm32wb / …  │  platform-specific
+//! │  MAC backends: esp / nrf / bl702 / …     │  platform-specific
 //! └─────────────────────────────────────────┘
 //! ```
 
@@ -33,15 +33,6 @@ pub mod esp;
 
 #[cfg(any(feature = "nrf52840", feature = "nrf52833"))]
 pub mod nrf;
-
-#[cfg(feature = "stm32wb55")]
-pub mod stm32wb;
-
-#[cfg(feature = "efr32mg24")]
-pub mod efr32;
-
-#[cfg(feature = "cc2652")]
-pub mod cc26xx;
 
 #[cfg(feature = "bl702")]
 pub mod bl702;

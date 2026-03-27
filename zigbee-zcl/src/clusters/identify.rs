@@ -19,6 +19,9 @@ pub const CMD_IDENTIFY_QUERY_RESPONSE: CommandId = CommandId(0x00);
 /// Identify cluster implementation.
 pub struct IdentifyCluster {
     store: AttributeStore<4>,
+    /// Pending trigger effect: (effect_id, effect_variant).
+    /// Set by TriggerEffect command, cleared by application via `take_pending_effect()`.
+    pending_effect: Option<(u8, u8)>,
 }
 
 impl Default for IdentifyCluster {
@@ -39,7 +42,10 @@ impl IdentifyCluster {
             },
             ZclValue::U16(0),
         );
-        Self { store }
+        Self {
+            store,
+            pending_effect: None,
+        }
     }
 
     /// Tick down identify timer by `elapsed_secs`.
@@ -55,6 +61,17 @@ impl IdentifyCluster {
     /// Whether the device is currently identifying.
     pub fn is_identifying(&self) -> bool {
         matches!(self.store.get(ATTR_IDENTIFY_TIME), Some(ZclValue::U16(t)) if *t > 0)
+    }
+
+    /// Returns the pending trigger effect if one was received, or `None`.
+    /// Calling this clears the pending effect.
+    pub fn take_pending_effect(&mut self) -> Option<(u8, u8)> {
+        self.pending_effect.take()
+    }
+
+    /// Check if there is a pending trigger effect (without consuming it).
+    pub fn has_pending_effect(&self) -> bool {
+        self.pending_effect.is_some()
     }
 }
 
@@ -91,7 +108,10 @@ impl Cluster for IdentifyCluster {
             }
             CMD_TRIGGER_EFFECT => {
                 // Payload: effect_id (u8) + effect_variant (u8)
-                // Application callback would handle actual effect.
+                if payload.len() < 2 {
+                    return Err(ZclStatus::MalformedCommand);
+                }
+                self.pending_effect = Some((payload[0], payload[1]));
                 Ok(heapless::Vec::new())
             }
             _ => Err(ZclStatus::UnsupClusterCommand),

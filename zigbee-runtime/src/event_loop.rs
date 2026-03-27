@@ -155,7 +155,7 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
 
         // Phase 2: Send any queued ZCL responses
         while let Some(resp) = self.pending_responses.pop() {
-            let _ = self
+            if let Err(_e) = self
                 .send_zcl_frame(
                     resp.dst_addr,
                     resp.dst_endpoint,
@@ -163,7 +163,15 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                     resp.cluster_id,
                     &resp.zcl_data,
                 )
-                .await;
+                .await
+            {
+                log::warn!(
+                    "[Runtime] ZCL response send failed: dst=0x{:04X} ep={} cluster=0x{:04X}",
+                    resp.dst_addr.0,
+                    resp.dst_endpoint,
+                    resp.cluster_id,
+                );
+            }
         }
 
         // Phase 3: Only do reporting/maintenance if joined

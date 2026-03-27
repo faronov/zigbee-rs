@@ -423,37 +423,57 @@ impl<M: MacDriver> ZdoLayer<M> {
     }
 
     /// Create a binding on a remote device via Bind_req (0x0021).
+    ///
+    /// NOTE: response waiting is not yet implemented — the request is sent
+    /// but the result is unknown. Returns `Err(ZdpStatus::Timeout)`.
     pub async fn bind_req(
         &mut self,
         dst: ShortAddress,
         entry: &BindingEntry,
     ) -> Result<(), ZdpStatus> {
-        // TODO: serialize full BindingEntry, implement response waiting
-        let _seq = self.next_seq();
+        // TODO: implement response waiting (needs ZDO req-resp mechanism)
+        let mut buf = [0u8; 32];
+        buf[0] = self.next_seq();
+        // Src IEEE (8) + src EP (1) + cluster (2) + dst addr mode (1) + dst (variable)
+        buf[1..9].copy_from_slice(&entry.src_addr);
+        buf[9] = entry.src_endpoint;
+        buf[10..12].copy_from_slice(&entry.cluster_id.to_le_bytes());
         log::debug!(
             "[ZDO] Bind_req dst=0x{:04X} cluster=0x{:04X}",
             dst.0,
             entry.cluster_id,
         );
-        Ok(())
+        let _ = self.send_zdp_unicast(dst, BIND_REQ, &buf[..12]).await;
+        Err(ZdpStatus::Timeout)
     }
 
     /// Remove a binding on a remote device via Unbind_req (0x0022).
+    ///
+    /// NOTE: response waiting is not yet implemented — the request is sent
+    /// but the result is unknown. Returns `Err(ZdpStatus::Timeout)`.
     pub async fn unbind_req(
         &mut self,
         dst: ShortAddress,
         entry: &BindingEntry,
     ) -> Result<(), ZdpStatus> {
-        let _seq = self.next_seq();
+        let mut buf = [0u8; 32];
+        buf[0] = self.next_seq();
+        buf[1..9].copy_from_slice(&entry.src_addr);
+        buf[9] = entry.src_endpoint;
+        buf[10..12].copy_from_slice(&entry.cluster_id.to_le_bytes());
         log::debug!(
             "[ZDO] Unbind_req dst=0x{:04X} cluster=0x{:04X}",
             dst.0,
             entry.cluster_id,
         );
-        Ok(())
+        let _ = self.send_zdp_unicast(dst, UNBIND_REQ, &buf[..12]).await;
+        Err(ZdpStatus::Timeout)
     }
 
     /// Send Match_Desc_req to discover endpoints with matching clusters.
+    ///
+    /// NOTE: response waiting is not yet implemented — the request is sent
+    /// but the result is unknown. Returns `Err(ZdpStatus::Timeout)`.
     pub async fn match_desc_req(
         &mut self,
         dst: ShortAddress,
@@ -461,7 +481,22 @@ impl<M: MacDriver> ZdoLayer<M> {
         input_clusters: &[u16],
         output_clusters: &[u16],
     ) -> Result<heapless::Vec<u8, 32>, ZdpStatus> {
-        let _seq = self.next_seq();
+        let mut buf = [0u8; 64];
+        buf[0] = self.next_seq();
+        buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
+        buf[3..5].copy_from_slice(&profile_id.to_le_bytes());
+        buf[5] = input_clusters.len() as u8;
+        let mut off = 6;
+        for &c in input_clusters {
+            buf[off..off + 2].copy_from_slice(&c.to_le_bytes());
+            off += 2;
+        }
+        buf[off] = output_clusters.len() as u8;
+        off += 1;
+        for &c in output_clusters {
+            buf[off..off + 2].copy_from_slice(&c.to_le_bytes());
+            off += 2;
+        }
         log::debug!(
             "[ZDO] Match_Desc_req dst=0x{:04X} profile=0x{:04X} in={} out={}",
             dst.0,
@@ -469,8 +504,10 @@ impl<M: MacDriver> ZdoLayer<M> {
             input_clusters.len(),
             output_clusters.len(),
         );
-        let _ = (dst, profile_id, input_clusters, output_clusters);
-        Ok(heapless::Vec::new())
+        let _ = self
+            .send_zdp_unicast(dst, MATCH_DESC_REQ, &buf[..off])
+            .await;
+        Err(ZdpStatus::Timeout)
     }
 
     // ── NWK primitive wrappers ──────────────────────────────

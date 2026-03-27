@@ -267,6 +267,11 @@ impl RoutingTable {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Iterate over active route entries.
+    pub fn iter(&self) -> impl Iterator<Item = &RouteEntry> {
+        self.routes.iter().filter(|r| r.active)
+    }
 }
 
 /// CSkip value calculation for tree addressing.
