@@ -315,11 +315,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         // Network identity
         let _ = nv.write(NvItemId::NwkPanId, &nib.pan_id.0.to_le_bytes());
         let _ = nv.write(NvItemId::NwkChannel, &[nib.logical_channel]);
-        let _ = nv.write(NvItemId::NwkShortAddress, &nib.network_address.0.to_le_bytes());
+        let _ = nv.write(
+            NvItemId::NwkShortAddress,
+            &nib.network_address.0.to_le_bytes(),
+        );
         let _ = nv.write(NvItemId::NwkExtendedPanId, &nib.extended_pan_id);
         let _ = nv.write(NvItemId::NwkIeeeAddress, &nib.ieee_address);
         let _ = nv.write(NvItemId::NwkDepth, &[nib.depth]);
-        let _ = nv.write(NvItemId::NwkParentAddress, &nib.parent_address.0.to_le_bytes());
+        let _ = nv.write(
+            NvItemId::NwkParentAddress,
+            &nib.parent_address.0.to_le_bytes(),
+        );
         let _ = nv.write(NvItemId::NwkUpdateId, &[nib.update_id]);
 
         // NWK security — active key + frame counter
@@ -333,13 +339,29 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         // BDB state
         let on_network: u8 = if self.bdb.is_on_network() { 1 } else { 0 };
         let _ = nv.write(NvItemId::BdbNodeIsOnNetwork, &[on_network]);
-        let _ = nv.write(NvItemId::BdbCommissioningMode, &[self.bdb.attributes().commissioning_mode.0]);
-        let _ = nv.write(NvItemId::BdbPrimaryChannelSet, &self.bdb.attributes().primary_channel_set.0.to_le_bytes());
-        let _ = nv.write(NvItemId::BdbSecondaryChannelSet, &self.bdb.attributes().secondary_channel_set.0.to_le_bytes());
-        let _ = nv.write(NvItemId::BdbCommissioningGroupId, &self.bdb.attributes().commissioning_group_id.to_le_bytes());
+        let _ = nv.write(
+            NvItemId::BdbCommissioningMode,
+            &[self.bdb.attributes().commissioning_mode.0],
+        );
+        let _ = nv.write(
+            NvItemId::BdbPrimaryChannelSet,
+            &self.bdb.attributes().primary_channel_set.0.to_le_bytes(),
+        );
+        let _ = nv.write(
+            NvItemId::BdbSecondaryChannelSet,
+            &self.bdb.attributes().secondary_channel_set.0.to_le_bytes(),
+        );
+        let _ = nv.write(
+            NvItemId::BdbCommissioningGroupId,
+            &self.bdb.attributes().commissioning_group_id.to_le_bytes(),
+        );
 
-        log::debug!("[NV] Saved network state (PAN=0x{:04X}, ch={}, addr=0x{:04X})",
-            nib.pan_id.0, nib.logical_channel, nib.network_address.0);
+        log::debug!(
+            "[NV] Saved network state (PAN=0x{:04X}, ch={}, addr=0x{:04X})",
+            nib.pan_id.0,
+            nib.logical_channel,
+            nib.network_address.0
+        );
     }
 
     /// Restore network state from non-volatile storage.
@@ -412,10 +434,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 Ok(4) => u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
                 _ => 0,
             };
-            self.bdb.zdo_mut().nwk_mut().security_mut()
+            self.bdb
+                .zdo_mut()
+                .nwk_mut()
+                .security_mut()
                 .set_network_key(key_buf, seq);
             // Restore frame counter in NIB
-            self.bdb.zdo_mut().nwk_mut().nib_mut().outgoing_frame_counter = fc;
+            self.bdb
+                .zdo_mut()
+                .nwk_mut()
+                .nib_mut()
+                .outgoing_frame_counter = fc;
         }
 
         // Mark as on-network in BDB
@@ -423,8 +452,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
         // Restore BDB attributes
         if let Ok(1) = nv.read(NvItemId::BdbCommissioningMode, &mut buf) {
-            self.bdb.attributes_mut().commissioning_mode =
-                zigbee_bdb::CommissioningMode(buf[0]);
+            self.bdb.attributes_mut().commissioning_mode = zigbee_bdb::CommissioningMode(buf[0]);
         }
         if let Ok(4) = nv.read(NvItemId::BdbPrimaryChannelSet, &mut buf) {
             self.bdb.attributes_mut().primary_channel_set =
@@ -435,13 +463,14 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 ChannelMask(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
         }
         if let Ok(2) = nv.read(NvItemId::BdbCommissioningGroupId, &mut buf) {
-            self.bdb.attributes_mut().commissioning_group_id =
-                u16::from_le_bytes([buf[0], buf[1]]);
+            self.bdb.attributes_mut().commissioning_group_id = u16::from_le_bytes([buf[0], buf[1]]);
         }
 
         log::info!(
             "[NV] Restored network state (PAN=0x{:04X}, ch={}, addr=0x{:04X})",
-            pan_id.0, channel, short_addr.0
+            pan_id.0,
+            channel,
+            short_addr.0
         );
         true
     }

@@ -49,8 +49,10 @@ impl<M: MacDriver> BdbLayer<M> {
                 crate::attributes::BdbCommissioningStatus::SteeringFormationFailure;
             return Err(BdbStatus::SteeringFailure);
         }
-        self.attributes.steering_attempts_remaining =
-            self.attributes.steering_attempts_remaining.saturating_sub(1);
+        self.attributes.steering_attempts_remaining = self
+            .attributes
+            .steering_attempts_remaining
+            .saturating_sub(1);
 
         log::info!(
             "[BDB:Steering] Scanning for open networks… (attempts left: {})",
