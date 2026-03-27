@@ -99,6 +99,11 @@ pub struct BdbLayer<M: MacDriver> {
     pub fb_target_request: Option<(u8, u16)>,
     /// Collected F&B identify query responses: (nwk_addr, endpoint).
     pub fb_identify_responses: heapless::Vec<(u16, u8), 8>,
+    /// F&B initiator window — seconds remaining to collect responses.
+    /// When > 0, the initiator is waiting for Identify Query Responses.
+    pub fb_window_remaining: u16,
+    /// Endpoint being used for F&B initiator procedure.
+    fb_initiator_endpoint: u8,
 }
 
 impl<M: MacDriver> BdbLayer<M> {
@@ -110,6 +115,8 @@ impl<M: MacDriver> BdbLayer<M> {
             state: BdbState::Idle,
             fb_target_request: None,
             fb_identify_responses: heapless::Vec::new(),
+            fb_window_remaining: 0,
+            fb_initiator_endpoint: 0,
         }
     }
 
@@ -138,5 +145,18 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Whether the device is currently on a Zigbee network.
     pub fn is_on_network(&self) -> bool {
         self.attributes.node_is_on_a_network
+    }
+
+    /// Reset BDB attributes to factory defaults.
+    ///
+    /// Called as part of factory reset — restores all BDB attributes
+    /// to their default values and clears internal F&B state.
+    pub fn reset_attributes(&mut self) {
+        self.attributes = BdbAttributes::default();
+        self.fb_target_request = None;
+        self.fb_identify_responses.clear();
+        self.fb_window_remaining = 0;
+        self.fb_initiator_endpoint = 0;
+        self.state = BdbState::Idle;
     }
 }

@@ -42,7 +42,20 @@ impl<M: MacDriver> BdbLayer<M> {
 
     /// Steering when the device is NOT on a network — join an existing PAN.
     async fn steer_off_network(&mut self) -> Result<(), BdbStatus> {
-        log::info!("[BDB:Steering] Scanning for open networks…");
+        // Check retry budget
+        if self.attributes.steering_attempts_remaining == 0 {
+            log::warn!("[BDB:Steering] No steering attempts remaining");
+            self.attributes.commissioning_status =
+                crate::attributes::BdbCommissioningStatus::SteeringFormationFailure;
+            return Err(BdbStatus::SteeringFailure);
+        }
+        self.attributes.steering_attempts_remaining =
+            self.attributes.steering_attempts_remaining.saturating_sub(1);
+
+        log::info!(
+            "[BDB:Steering] Scanning for open networks… (attempts left: {})",
+            self.attributes.steering_attempts_remaining,
+        );
 
         // Try primary channels first, then secondary
         let channel_sets = [

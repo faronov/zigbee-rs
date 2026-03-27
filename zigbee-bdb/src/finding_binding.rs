@@ -65,20 +65,27 @@ struct IdentifyTarget {
 impl<M: MacDriver> BdbLayer<M> {
     /// Run Finding & Binding as **initiator** on the given local endpoint.
     ///
-    /// The initiator discovers targets in Identify mode, reads their
-    /// simple descriptors, and creates bindings for matching clusters.
+    /// The initiator sends an Identify Query broadcast and starts a response
+    /// collection window. Responses arrive asynchronously via the runtime's
+    /// ZCL dispatch into `fb_identify_responses`.
     ///
-    /// The procedure runs for up to [`BDB_MIN_COMMISSIONING_TIME`] seconds.
+    /// Call [`BdbLayer::tick_finding_binding`] each second from the event loop.
+    /// When the window expires, it processes collected responses, reads
+    /// simple descriptors, and creates bindings for matching clusters.
     pub async fn finding_binding_initiator(&mut self, local_endpoint: u8) -> Result<(), BdbStatus> {
         if !self.attributes.node_is_on_a_network {
             return Err(BdbStatus::NotOnNetwork);
         }
 
         // Verify we have a local simple descriptor for this endpoint
+        if self.zdo.get_local_descriptor(local_endpoint).is_none() {
+            return Err(BdbStatus::NotPermitted);
+        }
+
         let local_desc = self
             .zdo
             .get_local_descriptor(local_endpoint)
-            .ok_or(BdbStatus::NotPermitted)?
+            .unwrap()
             .clone();
 
         log::info!(
@@ -88,21 +95,69 @@ impl<M: MacDriver> BdbLayer<M> {
             local_desc.output_clusters.len(),
         );
 
-        // Step 1: Broadcast Identify Query
-        let targets = self.send_identify_query().await?;
+        // Clear stale responses and send Identify Query broadcast
+        self.fb_identify_responses.clear();
+        self.send_identify_query_broadcast().await?;
 
-        if targets.is_empty() {
-            log::info!("[BDB:F&B] No identifying targets found");
-            self.attributes.commissioning_status =
-                crate::attributes::BdbCommissioningStatus::NoIdentifyQueryResponse;
-            return Err(BdbStatus::NoIdentifyResponse);
+        // Start the response collection window
+        self.fb_window_remaining = FB_WINDOW_SECONDS;
+        self.fb_initiator_endpoint = local_endpoint;
+
+        // The actual binding creation happens when tick_finding_binding()
+        // detects the window has expired and calls finalize_finding_binding().
+        Ok(())
+    }
+
+    /// Tick the F&B response collection window. Call once per second from tick().
+    ///
+    /// Returns `true` if the F&B procedure just completed (window expired and
+    /// responses were processed).
+    pub async fn tick_finding_binding(&mut self, elapsed_secs: u16) -> bool {
+        if self.fb_window_remaining == 0 {
+            return false;
         }
 
-        log::info!("[BDB:F&B] Found {} identifying target(s)", targets.len());
+        self.fb_window_remaining = self.fb_window_remaining.saturating_sub(elapsed_secs);
+
+        if self.fb_window_remaining > 0 {
+            return false;
+        }
+
+        // Window expired — process collected responses
+        log::info!(
+            "[BDB:F&B] Window expired — {} response(s) collected",
+            self.fb_identify_responses.len(),
+        );
+
+        if self.fb_identify_responses.is_empty() {
+            self.attributes.commissioning_status =
+                crate::attributes::BdbCommissioningStatus::NoIdentifyQueryResponse;
+            return true;
+        }
+
+        // Build target list from collected responses
+        let mut targets: Vec<IdentifyTarget, 8> = Vec::new();
+        for &(addr, ep) in &self.fb_identify_responses {
+            if let Some(t) = targets.iter_mut().find(|t| t.nwk_addr.0 == addr) {
+                let _ = t.endpoints.push(ep);
+            } else {
+                let mut eps = Vec::new();
+                let _ = eps.push(ep);
+                let _ = targets.push(IdentifyTarget {
+                    nwk_addr: ShortAddress(addr),
+                    endpoints: eps,
+                });
+            }
+        }
+
+        let local_ep = self.fb_initiator_endpoint;
+        let local_desc = match self.zdo.get_local_descriptor(local_ep) {
+            Some(d) => d.clone(),
+            None => return true,
+        };
 
         let mut any_binding_created = false;
 
-        // Step 2–4: For each target, get simple descriptors and create bindings
         for target in &targets {
             match self.process_target(target, &local_desc).await {
                 Ok(count) if count > 0 => {
@@ -129,31 +184,28 @@ impl<M: MacDriver> BdbLayer<M> {
             }
         }
 
+        self.fb_identify_responses.clear();
+
         if any_binding_created {
             self.attributes.commissioning_status =
                 crate::attributes::BdbCommissioningStatus::Success;
-            Ok(())
         } else {
             self.attributes.commissioning_status =
                 crate::attributes::BdbCommissioningStatus::NoIdentifyQueryResponse;
-            Err(BdbStatus::NoIdentifyResponse)
         }
+
+        true
     }
 
-    /// Broadcast Identify Query and collect responding targets.
+    /// Broadcast Identify Query to find F&B targets.
     ///
-    /// Builds a real ZCL Identify Query frame and sends it via APS broadcast.
-    /// In the current cooperative async model, we send the broadcast and return
-    /// an empty list — responses will be collected by the ZCL layer as they
-    /// arrive and should be fed back via a target accumulation mechanism.
-    async fn send_identify_query(&mut self) -> Result<Vec<IdentifyTarget, 8>, BdbStatus> {
+    /// Sends the ZCL broadcast and returns immediately. Responses will be
+    /// collected asynchronously into `fb_identify_responses` by the runtime.
+    async fn send_identify_query_broadcast(&mut self) -> Result<(), BdbStatus> {
         log::debug!(
             "[BDB:F&B] Broadcasting Identify Query (window={}s)",
             FB_WINDOW_SECONDS,
         );
-
-        // Clear any stale responses
-        self.fb_identify_responses.clear();
 
         // Build ZCL Identify Query frame:
         // Frame control: cluster-specific, client-to-server, disable default response
@@ -183,31 +235,13 @@ impl<M: MacDriver> BdbLayer<M> {
         match self.zdo.aps_mut().apsde_data_request(&req).await {
             Ok(_) => {
                 log::debug!("[BDB:F&B] Identify Query broadcast sent");
+                Ok(())
             }
             Err(e) => {
                 log::warn!("[BDB:F&B] Identify Query broadcast failed: {:?}", e);
-                return Err(BdbStatus::NotPermitted);
+                Err(BdbStatus::NotPermitted)
             }
         }
-
-        // Responses arrive asynchronously via the runtime's ZCL dispatch,
-        // which pushes (addr, endpoint) into self.fb_identify_responses.
-        // Convert collected pairs into IdentifyTarget structs.
-        let mut targets: Vec<IdentifyTarget, 8> = Vec::new();
-        for &(addr, ep) in &self.fb_identify_responses {
-            if let Some(t) = targets.iter_mut().find(|t| t.nwk_addr.0 == addr) {
-                let _ = t.endpoints.push(ep);
-            } else {
-                let mut eps = Vec::new();
-                let _ = eps.push(ep);
-                let _ = targets.push(IdentifyTarget {
-                    nwk_addr: ShortAddress(addr),
-                    endpoints: eps,
-                });
-            }
-        }
-
-        Ok(targets)
     }
 
     /// Process a single identifying target: read descriptors, match clusters, bind.

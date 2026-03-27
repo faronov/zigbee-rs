@@ -37,6 +37,9 @@ pub enum NvItemId {
     // BDB parameters
     BdbNodeIsOnNetwork = 0x0040,
     BdbCommissioningMode = 0x0041,
+    BdbPrimaryChannelSet = 0x0042,
+    BdbSecondaryChannelSet = 0x0043,
+    BdbCommissioningGroupId = 0x0044,
 
     // Application data (0x0100+)
     AppEndpoint1 = 0x0100,

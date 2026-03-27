@@ -184,6 +184,46 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         Ok(())
     }
 
+    /// Factory reset: leave network, clear all state, wipe NV.
+    ///
+    /// After this the device is in a "fresh out of box" state and
+    /// must be commissioned again.
+    pub async fn factory_reset(&mut self, nv: Option<&mut dyn NvStorage>) {
+        log::info!("[Runtime] Factory reset…");
+
+        // BDB factory_reset handles leave + state clearing
+        let _ = self.bdb.factory_reset().await;
+
+        // Clear NV storage if provided
+        if let Some(nv) = nv {
+            let items = [
+                NvItemId::NwkPanId,
+                NvItemId::NwkChannel,
+                NvItemId::NwkShortAddress,
+                NvItemId::NwkExtendedPanId,
+                NvItemId::NwkIeeeAddress,
+                NvItemId::NwkKey,
+                NvItemId::NwkKeySeqNum,
+                NvItemId::NwkFrameCounter,
+                NvItemId::NwkDepth,
+                NvItemId::NwkParentAddress,
+                NvItemId::NwkUpdateId,
+                NvItemId::BdbNodeIsOnNetwork,
+                NvItemId::BdbCommissioningMode,
+                NvItemId::BdbPrimaryChannelSet,
+                NvItemId::BdbSecondaryChannelSet,
+                NvItemId::BdbCommissioningGroupId,
+                NvItemId::ApsBindingTable,
+                NvItemId::ApsGroupTable,
+            ];
+            for id in &items {
+                let _ = nv.delete(*id);
+            }
+        }
+
+        log::info!("[Runtime] Factory reset complete");
+    }
+
     // ── User action API ─────────────────────────────────────
 
     /// Queue a user action (e.g., from a button press).
@@ -293,6 +333,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         // BDB state
         let on_network: u8 = if self.bdb.is_on_network() { 1 } else { 0 };
         let _ = nv.write(NvItemId::BdbNodeIsOnNetwork, &[on_network]);
+        let _ = nv.write(NvItemId::BdbCommissioningMode, &[self.bdb.attributes().commissioning_mode.0]);
+        let _ = nv.write(NvItemId::BdbPrimaryChannelSet, &self.bdb.attributes().primary_channel_set.0.to_le_bytes());
+        let _ = nv.write(NvItemId::BdbSecondaryChannelSet, &self.bdb.attributes().secondary_channel_set.0.to_le_bytes());
+        let _ = nv.write(NvItemId::BdbCommissioningGroupId, &self.bdb.attributes().commissioning_group_id.to_le_bytes());
 
         log::debug!("[NV] Saved network state (PAN=0x{:04X}, ch={}, addr=0x{:04X})",
             nib.pan_id.0, nib.logical_channel, nib.network_address.0);
@@ -376,6 +420,24 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
         // Mark as on-network in BDB
         self.bdb.attributes_mut().node_is_on_a_network = true;
+
+        // Restore BDB attributes
+        if let Ok(1) = nv.read(NvItemId::BdbCommissioningMode, &mut buf) {
+            self.bdb.attributes_mut().commissioning_mode =
+                zigbee_bdb::CommissioningMode(buf[0]);
+        }
+        if let Ok(4) = nv.read(NvItemId::BdbPrimaryChannelSet, &mut buf) {
+            self.bdb.attributes_mut().primary_channel_set =
+                ChannelMask(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
+        }
+        if let Ok(4) = nv.read(NvItemId::BdbSecondaryChannelSet, &mut buf) {
+            self.bdb.attributes_mut().secondary_channel_set =
+                ChannelMask(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
+        }
+        if let Ok(2) = nv.read(NvItemId::BdbCommissioningGroupId, &mut buf) {
+            self.bdb.attributes_mut().commissioning_group_id =
+                u16::from_le_bytes([buf[0], buf[1]]);
+        }
 
         log::info!(
             "[NV] Restored network state (PAN=0x{:04X}, ch={}, addr=0x{:04X})",

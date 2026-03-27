@@ -122,6 +122,11 @@ impl BindingTable {
         self.entries.is_full()
     }
 
+    /// Remove all binding entries.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// Add a binding entry. Returns `Err(entry)` if the table is full
     /// or the entry already exists.
     pub fn add(&mut self, entry: BindingEntry) -> Result<(), BindingEntry> {

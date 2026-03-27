@@ -49,6 +49,11 @@ impl GroupTable {
         self.groups.is_empty()
     }
 
+    /// Remove all groups.
+    pub fn clear(&mut self) {
+        self.groups.clear();
+    }
+
     /// Add an endpoint to a group. Creates the group if it doesn't exist.
     ///
     /// Returns `true` if the endpoint was added (or already present).

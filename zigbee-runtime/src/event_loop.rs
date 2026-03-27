@@ -214,6 +214,9 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
             }
         }
 
+        // Phase 5c: Tick F&B initiator response window
+        let _ = self.bdb.tick_finding_binding(elapsed_secs).await;
+
         // Phase 6: Check and send due attribute reports for each cluster
         for cr in clusters.iter() {
             let ep = cr.endpoint;
@@ -283,8 +286,7 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
             }
             UserAction::FactoryReset => {
                 log::info!("[Runtime] User action: Factory Reset");
-                let _ = self.leave().await;
-                let _ = self.bdb.zdo_mut().nlme_reset(false).await;
+                self.factory_reset(None).await;
                 TickResult::Event(StackEvent::Left)
             }
         }

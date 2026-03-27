@@ -148,12 +148,25 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Returns `Ok` if at least one method succeeded.
     pub async fn commission(&mut self) -> Result<(), BdbStatus> {
         let mode = self.attributes.commissioning_mode;
-        log::info!("[BDB] Commissioning start (mode=0x{:02X})", mode.0);
+        let cap = self.attributes.node_commissioning_capability;
+        // Gate requested mode by device capabilities (BDB spec §8.2)
+        let effective = CommissioningMode(mode.0 & cap.0);
+        log::info!(
+            "[BDB] Commissioning start (requested=0x{:02X}, cap=0x{:02X}, effective=0x{:02X})",
+            mode.0,
+            cap.0,
+            effective.0,
+        );
+
+        if effective.is_empty() {
+            log::warn!("[BDB] No commissioning methods available for this device type");
+            return Err(BdbStatus::NotPermitted);
+        }
 
         let mut any_success = false;
 
         // ── 1. Touchlink ────────────────────────────────────
-        if mode.contains(CommissioningMode::TOUCHLINK) {
+        if effective.contains(CommissioningMode::TOUCHLINK) {
             self.state = BdbState::Touchlink;
             match self.touchlink_commissioning().await {
                 Ok(()) => {
@@ -167,7 +180,7 @@ impl<M: MacDriver> BdbLayer<M> {
         }
 
         // ── 2. Network Steering ─────────────────────────────
-        if mode.contains(CommissioningMode::STEERING) {
+        if effective.contains(CommissioningMode::STEERING) {
             self.state = BdbState::NetworkSteering;
             match self.network_steering().await {
                 Ok(()) => {
@@ -181,7 +194,7 @@ impl<M: MacDriver> BdbLayer<M> {
         }
 
         // ── 3. Network Formation ────────────────────────────
-        if mode.contains(CommissioningMode::FORMATION) {
+        if effective.contains(CommissioningMode::FORMATION) {
             self.state = BdbState::NetworkFormation;
             match self.network_formation().await {
                 Ok(()) => {
@@ -195,7 +208,7 @@ impl<M: MacDriver> BdbLayer<M> {
         }
 
         // ── 4. Finding & Binding ────────────────────────────
-        if mode.contains(CommissioningMode::FINDING_BINDING) {
+        if effective.contains(CommissioningMode::FINDING_BINDING) {
             self.state = BdbState::FindingBinding;
             match self.finding_binding_initiator(1).await {
                 Ok(()) => {
@@ -215,6 +228,75 @@ impl<M: MacDriver> BdbLayer<M> {
         } else {
             Err(BdbStatus::SteeringFailure)
         }
+    }
+
+    /// BDB factory reset procedure (BDB spec §9.5).
+    ///
+    /// Performs a full factory reset:
+    /// 1. Leave the current network (if joined)
+    /// 2. Clear all NWK, APS, and BDB state
+    /// 3. Reset all BDB attributes to defaults
+    ///
+    /// After factory reset the device is in a "fresh out of box" state
+    /// and must be commissioned again.
+    pub async fn factory_reset(&mut self) -> Result<(), BdbStatus> {
+        log::info!("[BDB] Factory reset…");
+        self.state = BdbState::Initializing;
+
+        // Step 1: Leave the network if we are on one
+        if self.attributes.node_is_on_a_network {
+            let _ = self.zdo.nwk_mut().nlme_leave(false).await;
+        }
+
+        // Step 2: Reset lower layers (NWK + MAC) — clears neighbor table,
+        // security material, routing table, frame counters
+        let _ = self.zdo.nlme_reset(true).await;
+
+        // Step 3: Clear APS state — binding table, group table, key table
+        self.zdo.aps_mut().binding_table_mut().clear();
+        self.zdo.aps_mut().group_table_mut().clear();
+
+        // Step 4: Reset all BDB attributes to defaults
+        self.reset_attributes();
+
+        log::info!("[BDB] Factory reset complete — device is in fresh state");
+        Ok(())
+    }
+
+    /// Leave the current network and immediately attempt to rejoin.
+    ///
+    /// Useful for recovering from communication problems — performs
+    /// a clean leave followed by rejoin with the stored NWK key.
+    pub async fn leave_and_rejoin(&mut self) -> Result<(), BdbStatus> {
+        if !self.attributes.node_is_on_a_network {
+            return Err(BdbStatus::NotOnNetwork);
+        }
+
+        log::info!("[BDB] Leave-and-rejoin…");
+
+        // Remember key material before leaving (leave clears NWK state)
+        let channel = self.zdo.nwk().nib().logical_channel;
+        let _epid = self.zdo.nwk().nib().extended_pan_id;
+
+        // Leave (but keep BDB on-network flag so rejoin knows we had a network)
+        let _ = self.zdo.nwk_mut().nlme_leave(false).await;
+
+        // The device still considers itself "on a network" for rejoin purposes
+        // (node_is_on_a_network stays true so rejoin() works)
+
+        // Attempt rejoin on the last-known channel first
+        let result = self.rejoin().await;
+
+        if result.is_err() {
+            // Full rejoin failed — try steering from scratch
+            log::warn!("[BDB] Leave-and-rejoin: rejoin failed, trying full steering");
+            self.attributes.node_is_on_a_network = false;
+            // Restore last-known channel in primary set for targeted scan
+            self.attributes.primary_channel_set = zigbee_types::ChannelMask(1u32 << channel);
+            return self.network_steering().await;
+        }
+
+        result
     }
 
     /// BDB rejoin procedure — attempt to rejoin the previous network using
