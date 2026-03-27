@@ -40,9 +40,26 @@ pub const CMD_CLEAR_WEEKLY_SCHEDULE: CommandId = CommandId(0x03);
 // Command IDs (server to client)
 pub const CMD_GET_WEEKLY_SCHEDULE_RESPONSE: CommandId = CommandId(0x00);
 
+/// A single schedule transition (time + setpoints).
+#[derive(Debug, Clone)]
+pub struct ScheduleTransition {
+    pub transition_time: u16, // minutes since midnight
+    pub heat_setpoint: Option<i16>,
+    pub cool_setpoint: Option<i16>,
+}
+
+/// A weekly schedule entry for one or more days.
+#[derive(Debug, Clone)]
+pub struct WeeklyScheduleEntry {
+    pub days_of_week: u8, // bitmask: bit0=Sunday .. bit6=Saturday
+    pub mode: u8,         // 0x01=heat, 0x02=cool, 0x03=both
+    pub transitions: heapless::Vec<ScheduleTransition, 10>,
+}
+
 /// Thermostat cluster implementation.
 pub struct ThermostatCluster {
     store: AttributeStore<18>,
+    schedule: heapless::Vec<WeeklyScheduleEntry, 16>,
 }
 
 impl Default for ThermostatCluster {
@@ -198,7 +215,10 @@ impl ThermostatCluster {
             },
             ZclValue::Enum8(0x00), // Off
         );
-        Self { store }
+        Self {
+            store,
+            schedule: heapless::Vec::new(),
+        }
     }
 
     /// Update the local temperature reading (in 0.01 deg C).
@@ -247,9 +267,63 @@ impl Cluster for ThermostatCluster {
             }
             CMD_SET_WEEKLY_SCHEDULE => {
                 // Payload: num_transitions(u8) + day_of_week(u8) + mode(u8) + transitions
-                // Stub: accept but do nothing beyond acknowledging.
                 if payload.len() < 3 {
                     return Err(ZclStatus::MalformedCommand);
+                }
+                let num_transitions = payload[0] as usize;
+                let day_of_week = payload[1];
+                let mode = payload[2];
+                let mut offset = 3;
+                let mut transitions: heapless::Vec<ScheduleTransition, 10> = heapless::Vec::new();
+                for _ in 0..num_transitions {
+                    if offset + 2 > payload.len() {
+                        return Err(ZclStatus::MalformedCommand);
+                    }
+                    let transition_time =
+                        u16::from_le_bytes([payload[offset], payload[offset + 1]]);
+                    offset += 2;
+                    let heat_setpoint = if mode & 0x01 != 0 {
+                        if offset + 2 > payload.len() {
+                            return Err(ZclStatus::MalformedCommand);
+                        }
+                        let v = i16::from_le_bytes([payload[offset], payload[offset + 1]]);
+                        offset += 2;
+                        Some(v)
+                    } else {
+                        None
+                    };
+                    let cool_setpoint = if mode & 0x02 != 0 {
+                        if offset + 2 > payload.len() {
+                            return Err(ZclStatus::MalformedCommand);
+                        }
+                        let v = i16::from_le_bytes([payload[offset], payload[offset + 1]]);
+                        offset += 2;
+                        Some(v)
+                    } else {
+                        None
+                    };
+                    let _ = transitions.push(ScheduleTransition {
+                        transition_time,
+                        heat_setpoint,
+                        cool_setpoint,
+                    });
+                }
+                let entry = WeeklyScheduleEntry {
+                    days_of_week: day_of_week,
+                    mode,
+                    transitions,
+                };
+                // Replace any existing entry for same days+mode, or append
+                let mut replaced = false;
+                for existing in self.schedule.iter_mut() {
+                    if existing.days_of_week == day_of_week && existing.mode == mode {
+                        *existing = entry.clone();
+                        replaced = true;
+                        break;
+                    }
+                }
+                if !replaced {
+                    let _ = self.schedule.push(entry);
                 }
                 Ok(heapless::Vec::new())
             }
@@ -258,14 +332,44 @@ impl Cluster for ThermostatCluster {
                 if payload.len() < 2 {
                     return Err(ZclStatus::MalformedCommand);
                 }
-                // Return empty schedule
+                let days_to_return = payload[0];
+                let mode_to_return = payload[1];
+                // Find first matching entry
                 let mut resp = heapless::Vec::new();
-                let _ = resp.push(0); // number of transitions
-                let _ = resp.push(payload[0]); // days
-                let _ = resp.push(payload[1]); // mode
+                let mut found = false;
+                for entry in self.schedule.iter() {
+                    if entry.days_of_week & days_to_return != 0 && entry.mode & mode_to_return != 0
+                    {
+                        let _ = resp.push(entry.transitions.len() as u8);
+                        let _ = resp.push(entry.days_of_week);
+                        let _ = resp.push(entry.mode);
+                        for t in entry.transitions.iter() {
+                            let _ = resp.extend_from_slice(&t.transition_time.to_le_bytes());
+                            if entry.mode & 0x01 != 0 {
+                                let sp = t.heat_setpoint.unwrap_or(0);
+                                let _ = resp.extend_from_slice(&sp.to_le_bytes());
+                            }
+                            if entry.mode & 0x02 != 0 {
+                                let sp = t.cool_setpoint.unwrap_or(0);
+                                let _ = resp.extend_from_slice(&sp.to_le_bytes());
+                            }
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    // Return empty schedule for requested days/mode
+                    let _ = resp.push(0);
+                    let _ = resp.push(days_to_return);
+                    let _ = resp.push(mode_to_return);
+                }
                 Ok(resp)
             }
-            CMD_CLEAR_WEEKLY_SCHEDULE => Ok(heapless::Vec::new()),
+            CMD_CLEAR_WEEKLY_SCHEDULE => {
+                self.schedule.clear();
+                Ok(heapless::Vec::new())
+            }
             _ => Err(ZclStatus::UnsupClusterCommand),
         }
     }

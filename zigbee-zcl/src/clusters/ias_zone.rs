@@ -120,6 +120,35 @@ impl IasZoneCluster {
             .store
             .set_raw(ATTR_ZONE_STATUS, ZclValue::Bitmap16(status));
     }
+
+    /// Read the current zone status from the attribute store.
+    pub fn get_zone_status(&self) -> u16 {
+        match self.store.get(ATTR_ZONE_STATUS) {
+            Some(ZclValue::Bitmap16(v)) => *v,
+            _ => 0,
+        }
+    }
+
+    /// Read the current zone ID from the attribute store.
+    pub fn get_zone_id(&self) -> u8 {
+        match self.store.get(ATTR_ZONE_ID) {
+            Some(ZclValue::U8(v)) => *v,
+            _ => 0xFF,
+        }
+    }
+
+    /// Build a Zone Status Change Notification (command ID 0x00, server → client).
+    /// Returns the payload bytes: zone_status(2) + extended_status(1) + zone_id(1) + delay(2)
+    pub fn build_zone_status_change_notification(&self) -> heapless::Vec<u8, 6> {
+        let mut buf = heapless::Vec::new();
+        let status = self.get_zone_status();
+        let _ = buf.extend_from_slice(&status.to_le_bytes());
+        let _ = buf.push(0x00); // extended_status
+        let zone_id = self.get_zone_id();
+        let _ = buf.push(zone_id);
+        let _ = buf.extend_from_slice(&0u16.to_le_bytes()); // delay
+        buf
+    }
 }
 
 impl Cluster for IasZoneCluster {
@@ -151,6 +180,15 @@ impl Cluster for IasZoneCluster {
             CMD_INITIATE_NORMAL_OP_MODE => Ok(heapless::Vec::new()),
             CMD_INITIATE_TEST_MODE => {
                 // Payload: test mode duration (u8) + current zone sensitivity level (u8)
+                if payload.len() < 2 {
+                    return Err(ZclStatus::MalformedCommand);
+                }
+                let _test_mode_duration = payload[0];
+                let current_zone_sensitivity = payload[1];
+                let _ = self.store.set_raw(
+                    ATTR_CURRENT_ZONE_SENSITIVITY_LEVEL,
+                    ZclValue::U8(current_zone_sensitivity),
+                );
                 Ok(heapless::Vec::new())
             }
             _ => Err(ZclStatus::UnsupClusterCommand),

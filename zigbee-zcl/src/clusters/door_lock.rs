@@ -71,9 +71,18 @@ pub const OPERATING_MODE_PRIVACY: u8 = 0x02;
 pub const OPERATING_MODE_NO_RF_LOCK: u8 = 0x03;
 pub const OPERATING_MODE_PASSAGE: u8 = 0x04;
 
+/// A PIN code entry for a user.
+#[derive(Debug, Clone)]
+pub struct PinEntry {
+    pub status: u8,    // 0=available, 1=occupied_enabled, 3=occupied_disabled
+    pub user_type: u8, // 0=unrestricted, 1=year_day, 2=week_day, 3=master
+    pub pin: heapless::Vec<u8, 8>,
+}
+
 /// Door Lock cluster.
 pub struct DoorLockCluster {
     store: AttributeStore<16>,
+    pins: heapless::Vec<(u16, PinEntry), 8>,
 }
 
 impl DoorLockCluster {
@@ -223,7 +232,10 @@ impl DoorLockCluster {
             },
             ZclValue::Enum8(OPERATING_MODE_NORMAL),
         );
-        Self { store }
+        Self {
+            store,
+            pins: heapless::Vec::new(),
+        }
     }
 
     /// Get current lock state.
@@ -259,7 +271,7 @@ impl Cluster for DoorLockCluster {
     fn handle_command(
         &mut self,
         cmd_id: CommandId,
-        _payload: &[u8],
+        payload: &[u8],
     ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
         match cmd_id {
             CMD_LOCK_DOOR => {
@@ -280,12 +292,109 @@ impl Cluster for DoorLockCluster {
                 Ok(Self::build_status_response(0x00))
             }
             CMD_UNLOCK_WITH_TIMEOUT => {
-                if _payload.len() < 2 {
+                if payload.len() < 2 {
                     return Err(ZclStatus::MalformedCommand);
                 }
-                // timeout is u16 LE in payload; we unlock and leave timeout to the application layer
                 self.set_lock_state(LOCK_STATE_UNLOCKED);
                 Ok(Self::build_status_response(0x00))
+            }
+            CMD_SET_PIN_CODE => {
+                // Payload: user_id(2) + user_status(1) + user_type(1) + pin_len(1) + pin[]
+                if payload.len() < 5 {
+                    return Err(ZclStatus::MalformedCommand);
+                }
+                let user_id = u16::from_le_bytes([payload[0], payload[1]]);
+                let user_status = payload[2];
+                let user_type = payload[3];
+                let pin_len = payload[4] as usize;
+                if payload.len() < 5 + pin_len {
+                    return Err(ZclStatus::MalformedCommand);
+                }
+                let mut pin = heapless::Vec::new();
+                let _ = pin.extend_from_slice(&payload[5..5 + pin_len]);
+                let entry = PinEntry {
+                    status: user_status,
+                    user_type,
+                    pin,
+                };
+                // Update existing or insert new
+                let mut found = false;
+                for (id, existing) in self.pins.iter_mut() {
+                    if *id == user_id {
+                        *existing = entry.clone();
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    let _ = self.pins.push((user_id, entry));
+                }
+                Ok(Self::build_status_response(0x00)) // success
+            }
+            CMD_GET_PIN_CODE => {
+                // Payload: user_id(2)
+                if payload.len() < 2 {
+                    return Err(ZclStatus::MalformedCommand);
+                }
+                let user_id = u16::from_le_bytes([payload[0], payload[1]]);
+                let mut resp = heapless::Vec::new();
+                let _ = resp.extend_from_slice(&user_id.to_le_bytes());
+                if let Some((_, entry)) = self.pins.iter().find(|(id, _)| *id == user_id) {
+                    let _ = resp.push(entry.status);
+                    let _ = resp.push(entry.user_type);
+                    let _ = resp.push(entry.pin.len() as u8);
+                    let _ = resp.extend_from_slice(&entry.pin);
+                } else {
+                    let _ = resp.push(0x00); // available
+                    let _ = resp.push(0x00); // unrestricted
+                    let _ = resp.push(0x00); // no pin
+                }
+                Ok(resp)
+            }
+            CMD_CLEAR_PIN_CODE => {
+                // Payload: user_id(2)
+                if payload.len() < 2 {
+                    return Err(ZclStatus::MalformedCommand);
+                }
+                let user_id = u16::from_le_bytes([payload[0], payload[1]]);
+                self.pins.retain(|(id, _)| *id != user_id);
+                Ok(Self::build_status_response(0x00))
+            }
+            CMD_CLEAR_ALL_PIN_CODES => {
+                self.pins.clear();
+                Ok(Self::build_status_response(0x00))
+            }
+            CMD_SET_USER_STATUS => {
+                // Payload: user_id(2) + status(1)
+                if payload.len() < 3 {
+                    return Err(ZclStatus::MalformedCommand);
+                }
+                let user_id = u16::from_le_bytes([payload[0], payload[1]]);
+                let new_status = payload[2];
+                for (id, entry) in self.pins.iter_mut() {
+                    if *id == user_id {
+                        entry.status = new_status;
+                        break;
+                    }
+                }
+                Ok(Self::build_status_response(0x00))
+            }
+            CMD_GET_USER_STATUS => {
+                // Payload: user_id(2)
+                if payload.len() < 2 {
+                    return Err(ZclStatus::MalformedCommand);
+                }
+                let user_id = u16::from_le_bytes([payload[0], payload[1]]);
+                let mut resp = heapless::Vec::new();
+                let _ = resp.extend_from_slice(&user_id.to_le_bytes());
+                let status = self
+                    .pins
+                    .iter()
+                    .find(|(id, _)| *id == user_id)
+                    .map(|(_, e)| e.status)
+                    .unwrap_or(0x00); // available if not found
+                let _ = resp.push(status);
+                Ok(resp)
             }
             _ => Err(ZclStatus::UnsupClusterCommand),
         }
