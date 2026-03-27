@@ -322,16 +322,19 @@ mod level_control {
     #[test]
     fn move_to_level_with_on_off_also_sets_level() {
         let mut c = LevelControlCluster::new();
+        // transition_time=10 starts a transition; tick to completion
         c.handle_command(CMD_MOVE_TO_LEVEL_WITH_ON_OFF, &[200, 0x0A, 0x00])
             .unwrap();
+        c.tick(10); // complete the transition
         assert_eq!(c.current_level(), 200);
     }
 
     #[test]
     fn move_up_jumps_to_max() {
         let mut c = LevelControlCluster::new();
-        // mode=0 (up), rate=10
+        // mode=0 (up), rate=10 — starts transition
         c.handle_command(CMD_MOVE, &[0x00, 10]).unwrap();
+        c.tick(0xFFFF); // complete
         assert_eq!(c.current_level(), 0xFE);
     }
 
@@ -340,7 +343,8 @@ mod level_control {
         let mut c = LevelControlCluster::new();
         c.handle_command(CMD_MOVE_TO_LEVEL, &[100, 0, 0]).unwrap();
         c.handle_command(CMD_MOVE, &[0x01, 10]).unwrap(); // mode=1 (down)
-        assert_eq!(c.current_level(), 0x01);
+        c.tick(0xFFFF); // complete
+        assert_eq!(c.current_level(), 0x00);
     }
 
     #[test]

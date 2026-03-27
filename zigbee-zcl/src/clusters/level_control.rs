@@ -3,6 +3,7 @@
 use crate::attribute::{AttributeAccess, AttributeDefinition, AttributeStore};
 use crate::clusters::{AttributeStoreAccess, AttributeStoreMutAccess, Cluster};
 use crate::data_types::{ZclDataType, ZclValue};
+use crate::transition::TransitionManager;
 use crate::{AttributeId, ClusterId, CommandId, ZclStatus};
 
 // Attribute IDs
@@ -28,6 +29,7 @@ pub const CMD_STOP_WITH_ON_OFF: CommandId = CommandId(0x07);
 /// Level Control cluster implementation.
 pub struct LevelControlCluster {
     store: AttributeStore<10>,
+    pub transitions: TransitionManager<2>,
 }
 
 impl Default for LevelControlCluster {
@@ -109,9 +111,12 @@ impl LevelControlCluster {
                 access: AttributeAccess::ReadWrite,
                 name: "StartUpCurrentLevel",
             },
-            ZclValue::U8(0xFF), // Previous
+            ZclValue::U8(0xFF),
         );
-        Self { store }
+        Self {
+            store,
+            transitions: TransitionManager::new(),
+        }
     }
 
     /// Get the current level.
@@ -124,6 +129,24 @@ impl LevelControlCluster {
 
     fn set_level(&mut self, level: u8) {
         let _ = self.store.set_raw(ATTR_CURRENT_LEVEL, ZclValue::U8(level));
+    }
+
+    /// Advance all active transitions by `elapsed_ds` deciseconds.
+    /// Updates CurrentLevel and RemainingTime attributes.
+    pub fn tick(&mut self, elapsed_ds: u16) {
+        let updates = self.transitions.tick(elapsed_ds);
+        for (attr_id, value) in &updates {
+            if *attr_id == ATTR_CURRENT_LEVEL.0 {
+                let clamped = (*value).clamp(0, 254) as u8;
+                let _ = self
+                    .store
+                    .set_raw(ATTR_CURRENT_LEVEL, ZclValue::U8(clamped));
+            }
+        }
+        let remaining = self.transitions.max_remaining_ds();
+        let _ = self
+            .store
+            .set_raw(ATTR_REMAINING_TIME, ZclValue::U16(remaining));
     }
 }
 
@@ -143,9 +166,23 @@ impl Cluster for LevelControlCluster {
                     return Err(ZclStatus::MalformedCommand);
                 }
                 let level = payload[0];
-                let _transition_time = u16::from_le_bytes([payload[1], payload[2]]);
-                // Instant move (transition would be ticked externally).
-                self.set_level(level);
+                let transition_time = u16::from_le_bytes([payload[1], payload[2]]);
+                if transition_time == 0 {
+                    self.set_level(level);
+                    self.transitions.stop(ATTR_CURRENT_LEVEL.0);
+                    let _ = self.store.set_raw(ATTR_REMAINING_TIME, ZclValue::U16(0));
+                } else {
+                    let current = self.current_level() as i32;
+                    self.transitions.start(
+                        ATTR_CURRENT_LEVEL.0,
+                        current,
+                        level as i32,
+                        transition_time,
+                    );
+                    let _ = self
+                        .store
+                        .set_raw(ATTR_REMAINING_TIME, ZclValue::U16(transition_time));
+                }
                 Ok(heapless::Vec::new())
             }
             CMD_MOVE | CMD_MOVE_WITH_ON_OFF => {
@@ -153,10 +190,31 @@ impl Cluster for LevelControlCluster {
                     return Err(ZclStatus::MalformedCommand);
                 }
                 let mode = payload[0]; // 0=up, 1=down
-                let _rate = payload[1];
-                // Simplified: jump to min or max.
-                let level = if mode == 0 { 0xFE } else { 0x01 };
-                self.set_level(level);
+                let rate = payload[1];
+                let current = self.current_level();
+                let target: u8 = if mode == 0 { 0xFE } else { 0x00 };
+                if rate == 0 {
+                    self.set_level(target);
+                    self.transitions.stop(ATTR_CURRENT_LEVEL.0);
+                    let _ = self.store.set_raw(ATTR_REMAINING_TIME, ZclValue::U16(0));
+                } else {
+                    let diff = if mode == 0 {
+                        (target as u16).saturating_sub(current as u16)
+                    } else {
+                        (current as u16).saturating_sub(target as u16)
+                    };
+                    // rate is in units/second, time in deciseconds
+                    let time_ds = (diff * 10 / (rate as u16)).max(1);
+                    self.transitions.start(
+                        ATTR_CURRENT_LEVEL.0,
+                        current as i32,
+                        target as i32,
+                        time_ds,
+                    );
+                    let _ = self
+                        .store
+                        .set_raw(ATTR_REMAINING_TIME, ZclValue::U16(time_ds));
+                }
                 Ok(heapless::Vec::new())
             }
             CMD_STEP | CMD_STEP_WITH_ON_OFF => {
@@ -165,18 +223,32 @@ impl Cluster for LevelControlCluster {
                 }
                 let mode = payload[0];
                 let step_size = payload[1];
-                let _transition_time = u16::from_le_bytes([payload[2], payload[3]]);
+                let transition_time = u16::from_le_bytes([payload[2], payload[3]]);
                 let current = self.current_level();
                 let new_level = if mode == 0 {
                     current.saturating_add(step_size).min(0xFE)
                 } else {
                     current.saturating_sub(step_size).max(0x01)
                 };
-                self.set_level(new_level);
+                if transition_time == 0 {
+                    self.set_level(new_level);
+                    self.transitions.stop(ATTR_CURRENT_LEVEL.0);
+                    let _ = self.store.set_raw(ATTR_REMAINING_TIME, ZclValue::U16(0));
+                } else {
+                    self.transitions.start(
+                        ATTR_CURRENT_LEVEL.0,
+                        current as i32,
+                        new_level as i32,
+                        transition_time,
+                    );
+                    let _ = self
+                        .store
+                        .set_raw(ATTR_REMAINING_TIME, ZclValue::U16(transition_time));
+                }
                 Ok(heapless::Vec::new())
             }
             CMD_STOP | CMD_STOP_WITH_ON_OFF => {
-                // Stop any ongoing transition.
+                self.transitions.stop_all();
                 let _ = self.store.set_raw(ATTR_REMAINING_TIME, ZclValue::U16(0));
                 Ok(heapless::Vec::new())
             }

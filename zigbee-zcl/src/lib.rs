@@ -12,6 +12,7 @@ pub mod data_types;
 pub mod foundation;
 pub mod frame;
 pub mod reporting;
+pub mod transition;
 
 /// A 16-bit Zigbee Cluster identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
