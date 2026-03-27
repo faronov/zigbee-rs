@@ -216,4 +216,72 @@ impl<M: MacDriver> BdbLayer<M> {
             Err(BdbStatus::SteeringFailure)
         }
     }
+
+    /// BDB rejoin procedure — attempt to rejoin the previous network using
+    /// the stored NWK key (BDB spec §8.3 "steering on network" fallback).
+    ///
+    /// Call this when the device loses its parent or detects network loss.
+    /// It performs:
+    /// 1. NWK discovery on the last-known channel
+    /// 2. NLME-JOIN with Rejoin method (uses stored NWK key)
+    /// 3. Device announce
+    ///
+    /// Falls back to full steering if rejoin fails.
+    pub async fn rejoin(&mut self) -> Result<(), BdbStatus> {
+        if !self.attributes.node_is_on_a_network {
+            return Err(BdbStatus::NotOnNetwork);
+        }
+
+        self.state = BdbState::NetworkSteering;
+        log::info!("[BDB] Attempting rejoin on previous network…");
+
+        // Get last-known channel from NWK NIB
+        let channel = self.zdo.nwk().nib().logical_channel;
+        let channel_mask = zigbee_types::ChannelMask(1u32 << channel);
+
+        // Scan for networks on the last-known channel
+        let networks = match self.zdo.nlme_network_discovery(channel_mask, 3).await {
+            Ok(n) => n,
+            Err(_) => {
+                log::warn!("[BDB] Rejoin: no networks found on channel {}", channel);
+                self.state = BdbState::Idle;
+                // Fall back to full steering
+                return self.network_steering().await;
+            }
+        };
+
+        // Try rejoin on each discovered network
+        for network in &networks {
+            log::info!(
+                "[BDB] Rejoin: trying PAN 0x{:04X} ch {}",
+                network.pan_id.0,
+                network.logical_channel,
+            );
+
+            match self.zdo.nlme_rejoin(network).await {
+                Ok(nwk_addr) => {
+                    // Re-announce
+                    let ieee = self.zdo.nwk().nib().ieee_address;
+                    let _ = self.zdo.device_annce(nwk_addr, ieee).await;
+
+                    log::info!("[BDB] Rejoin successful as 0x{:04X}", nwk_addr.0);
+                    self.attributes.commissioning_status =
+                        crate::attributes::BdbCommissioningStatus::Success;
+                    self.state = BdbState::Idle;
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[BDB] Rejoin failed on PAN 0x{:04X}: {:?}",
+                        network.pan_id.0,
+                        e
+                    );
+                }
+            }
+        }
+
+        log::warn!("[BDB] All rejoin attempts failed — falling back to steering");
+        self.state = BdbState::Idle;
+        self.network_steering().await
+    }
 }

@@ -200,7 +200,7 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         if let Some((ep, time_secs)) = self.bdb.fb_target_request.take() {
             for cr in clusters.iter_mut() {
                 if cr.endpoint == ep && cr.cluster.cluster_id().0 == 0x0003 {
-                    let _ = cr.cluster.set_attribute(
+                    let _ = cr.cluster.attributes_mut().set(
                         zigbee_zcl::AttributeId(0x0000), // IdentifyTime
                         zigbee_zcl::data_types::ZclValue::U16(time_secs),
                     );

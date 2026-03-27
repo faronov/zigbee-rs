@@ -95,6 +95,10 @@ pub struct BdbLayer<M: MacDriver> {
     zdo: ZdoLayer<M>,
     attributes: BdbAttributes,
     state: BdbState,
+    /// Pending Find & Bind target request: (endpoint, identify_time_secs)
+    pub fb_target_request: Option<(u8, u16)>,
+    /// Collected F&B identify query responses: (nwk_addr, endpoint).
+    pub fb_identify_responses: heapless::Vec<(u16, u8), 8>,
 }
 
 impl<M: MacDriver> BdbLayer<M> {
@@ -104,6 +108,8 @@ impl<M: MacDriver> BdbLayer<M> {
             zdo,
             attributes: BdbAttributes::default(),
             state: BdbState::Idle,
+            fb_target_request: None,
+            fb_identify_responses: heapless::Vec::new(),
         }
     }
 
