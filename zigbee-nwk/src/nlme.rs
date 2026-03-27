@@ -560,12 +560,11 @@ impl<M: MacDriver> NwkLayer<M> {
                         )
                         .await;
                     // Update parent neighbor entry
-                    let parent_device_type =
-                        if hdr.src_addr == ShortAddress::COORDINATOR {
-                            NeighborDeviceType::Coordinator
-                        } else {
-                            NeighborDeviceType::Router
-                        };
+                    let parent_device_type = if hdr.src_addr == ShortAddress::COORDINATOR {
+                        NeighborDeviceType::Coordinator
+                    } else {
+                        NeighborDeviceType::Router
+                    };
                     let parent_ieee = hdr.src_ieee.unwrap_or([0; 8]);
                     let parent = NeighborEntry {
                         ieee_address: parent_ieee,
