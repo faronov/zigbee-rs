@@ -29,28 +29,6 @@ pub struct ApsmeTransportKeyRequest {
     pub key: [u8; 16],
 }
 
-/// APSME-UPDATE-DEVICE.request — notify Trust Center of a device's status.
-#[derive(Debug)]
-pub struct ApsmeUpdateDeviceRequest {
-    /// Trust Center address
-    pub dst_address: IeeeAddress,
-    /// Device whose status changed
-    pub device_address: IeeeAddress,
-    /// Device's short address
-    pub device_short_address: zigbee_types::ShortAddress,
-    /// Status: 0=joined-secured, 1=joined-unsecured, 2=left, 3=trust-center-rejoin
-    pub status: u8,
-}
-
-/// APSME-REMOVE-DEVICE.request — instruct Trust Center to remove a device.
-#[derive(Debug)]
-pub struct ApsmeRemoveDeviceRequest {
-    /// Trust Center address
-    pub dst_address: IeeeAddress,
-    /// Device to be removed
-    pub target_address: IeeeAddress,
-}
-
 /// APSME-REQUEST-KEY.request — request a key from the Trust Center.
 #[derive(Debug)]
 pub struct ApsmeRequestKeyRequest {
@@ -77,17 +55,6 @@ pub struct ApsmeVerifyKeyRequest {
     /// Trust Center address
     pub dst_address: IeeeAddress,
     /// Key type to verify
-    pub key_type: ApsKeyType,
-}
-
-/// APSME-CONFIRM-KEY.indication — received confirmation of key verification.
-#[derive(Debug)]
-pub struct ApsmeConfirmKeyIndication {
-    /// Status of the verification
-    pub status: ApsStatus,
-    /// Address of the confirming device
-    pub src_address: IeeeAddress,
-    /// Key type that was verified
     pub key_type: ApsKeyType,
 }
 

@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 zigbee-types = { path = "../zigbee-types" }
-zigbee-mac = { path = "../zigbee-mac", features = ["mock", "serial"] }
+zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }
 zigbee-nwk = { path = "../zigbee-nwk" }
 zigbee-aps = { path = "../zigbee-aps" }
 zigbee-zdo = { path = "../zigbee-zdo" }

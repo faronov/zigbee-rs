@@ -37,9 +37,6 @@ pub mod nrf;
 #[cfg(feature = "bl702")]
 pub mod bl702;
 
-#[cfg(feature = "serial")]
-pub mod serial;
-
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 

@@ -124,13 +124,6 @@ pub struct SourceRoute {
     pub relay_list: heapless::Vec<ShortAddress, 16>,
 }
 
-/// Complete NWK frame (header + payload)
-#[derive(Debug)]
-pub struct NwkFrame {
-    pub header: NwkHeader,
-    pub payload: heapless::Vec<u8, 128>,
-}
-
 impl NwkHeader {
     /// Parse a NWK header from raw bytes. Returns (header, bytes_consumed).
     pub fn parse(data: &[u8]) -> Option<(Self, usize)> {
@@ -339,11 +332,4 @@ pub struct RouteReply {
     pub path_cost: u8,
     pub originator_ieee: Option<IeeeAddress>,
     pub responder_ieee: Option<IeeeAddress>,
-}
-
-/// Network Status command (NWK command ID 0x03)
-#[derive(Debug, Clone, Copy)]
-pub struct NetworkStatusCommand {
-    pub status_code: u8,
-    pub dst_addr: ShortAddress,
 }

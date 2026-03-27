@@ -68,4 +68,4 @@ nrf52833 = [
 bl702 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
 ]
-serial = []
+

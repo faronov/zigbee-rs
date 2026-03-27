@@ -17,8 +17,6 @@ mod ota_tests;
 #[cfg(test)]
 mod runtime_tests;
 #[cfg(test)]
-mod serial_tests;
-#[cfg(test)]
 mod types_tests;
 #[cfg(test)]
 mod zcl_tests;
