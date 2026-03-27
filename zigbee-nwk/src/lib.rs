@@ -37,6 +37,7 @@ pub mod neighbor;
 pub mod nib;
 pub mod nlde;
 pub mod nlme;
+pub mod nwk_commands;
 pub mod routing;
 pub mod security;
 

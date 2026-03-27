@@ -33,6 +33,28 @@ pub enum NwkCommandId {
     LinkPowerDelta = 0x0D,
 }
 
+impl NwkCommandId {
+    /// Parse a command ID byte. Returns None for unknown IDs.
+    pub fn from_u8(val: u8) -> Option<Self> {
+        match val {
+            0x01 => Some(Self::RouteRequest),
+            0x02 => Some(Self::RouteReply),
+            0x03 => Some(Self::NetworkStatus),
+            0x04 => Some(Self::Leave),
+            0x05 => Some(Self::RouteRecord),
+            0x06 => Some(Self::RejoinRequest),
+            0x07 => Some(Self::RejoinResponse),
+            0x08 => Some(Self::LinkStatus),
+            0x09 => Some(Self::NetworkReport),
+            0x0A => Some(Self::NetworkUpdate),
+            0x0B => Some(Self::EdTimeoutRequest),
+            0x0C => Some(Self::EdTimeoutResponse),
+            0x0D => Some(Self::LinkPowerDelta),
+            _ => None,
+        }
+    }
+}
+
 /// NWK frame control field (16 bits)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NwkFrameControl {
@@ -322,6 +344,48 @@ pub struct RouteRequest {
     pub dst_ieee: Option<IeeeAddress>,
 }
 
+impl RouteRequest {
+    /// Parse a Route Request from the payload (after command ID byte).
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 5 {
+            return None;
+        }
+        let command_options = data[0];
+        let route_request_id = data[1];
+        let dst_addr = ShortAddress(u16::from_le_bytes([data[2], data[3]]));
+        let path_cost = data[4];
+        let dst_ieee = if command_options & (1 << 5) != 0 && data.len() >= 13 {
+            let mut addr = [0u8; 8];
+            addr.copy_from_slice(&data[5..13]);
+            Some(addr)
+        } else {
+            None
+        };
+        Some(Self {
+            command_options,
+            route_request_id,
+            dst_addr,
+            path_cost,
+            dst_ieee,
+        })
+    }
+
+    /// Serialize to buffer. Returns bytes written.
+    pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.command_options;
+        buf[1] = self.route_request_id;
+        buf[2] = (self.dst_addr.0 & 0xFF) as u8;
+        buf[3] = ((self.dst_addr.0 >> 8) & 0xFF) as u8;
+        buf[4] = self.path_cost;
+        let mut offset = 5;
+        if let Some(ref ieee) = self.dst_ieee {
+            buf[offset..offset + 8].copy_from_slice(ieee);
+            offset += 8;
+        }
+        offset
+    }
+}
+
 /// Route Reply command (NWK command ID 0x02)
 #[derive(Debug, Clone)]
 pub struct RouteReply {
@@ -332,4 +396,119 @@ pub struct RouteReply {
     pub path_cost: u8,
     pub originator_ieee: Option<IeeeAddress>,
     pub responder_ieee: Option<IeeeAddress>,
+}
+
+impl RouteReply {
+    /// Parse a Route Reply from the payload (after command ID byte).
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 7 {
+            return None;
+        }
+        let command_options = data[0];
+        let route_request_id = data[1];
+        let originator = ShortAddress(u16::from_le_bytes([data[2], data[3]]));
+        let responder = ShortAddress(u16::from_le_bytes([data[4], data[5]]));
+        let path_cost = data[6];
+        let mut offset = 7;
+        let originator_ieee = if command_options & (1 << 4) != 0 && data.len() >= offset + 8 {
+            let mut addr = [0u8; 8];
+            addr.copy_from_slice(&data[offset..offset + 8]);
+            offset += 8;
+            Some(addr)
+        } else {
+            None
+        };
+        let responder_ieee = if command_options & (1 << 5) != 0 && data.len() >= offset + 8 {
+            let mut addr = [0u8; 8];
+            addr.copy_from_slice(&data[offset..offset + 8]);
+            Some(addr)
+        } else {
+            None
+        };
+        Some(Self {
+            command_options,
+            route_request_id,
+            originator,
+            responder,
+            path_cost,
+            originator_ieee,
+            responder_ieee,
+        })
+    }
+
+    /// Serialize to buffer. Returns bytes written.
+    pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.command_options;
+        buf[1] = self.route_request_id;
+        buf[2] = (self.originator.0 & 0xFF) as u8;
+        buf[3] = ((self.originator.0 >> 8) & 0xFF) as u8;
+        buf[4] = (self.responder.0 & 0xFF) as u8;
+        buf[5] = ((self.responder.0 >> 8) & 0xFF) as u8;
+        buf[6] = self.path_cost;
+        let mut offset = 7;
+        if let Some(ref ieee) = self.originator_ieee {
+            buf[offset..offset + 8].copy_from_slice(ieee);
+            offset += 8;
+        }
+        if let Some(ref ieee) = self.responder_ieee {
+            buf[offset..offset + 8].copy_from_slice(ieee);
+            offset += 8;
+        }
+        offset
+    }
+}
+
+/// Link status entry (one neighbor's link quality)
+#[derive(Debug, Clone, Copy)]
+pub struct LinkStatusEntry {
+    pub address: ShortAddress,
+    pub incoming_cost: u8,
+    pub outgoing_cost: u8,
+}
+
+/// Link Status command (NWK command ID 0x08)
+#[derive(Debug, Clone)]
+pub struct LinkStatusCommand {
+    pub entries: heapless::Vec<LinkStatusEntry, 16>,
+}
+
+impl LinkStatusCommand {
+    /// Parse Link Status from payload (after command ID byte).
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.is_empty() {
+            return None;
+        }
+        let count = (data[0] & 0x1F) as usize;
+        let mut entries = heapless::Vec::new();
+        let mut offset = 1;
+        for _ in 0..count {
+            if data.len() < offset + 3 {
+                break;
+            }
+            let address = ShortAddress(u16::from_le_bytes([data[offset], data[offset + 1]]));
+            let cost_byte = data[offset + 2];
+            let incoming_cost = cost_byte & 0x07;
+            let outgoing_cost = (cost_byte >> 3) & 0x07;
+            let _ = entries.push(LinkStatusEntry {
+                address,
+                incoming_cost,
+                outgoing_cost,
+            });
+            offset += 3;
+        }
+        Some(Self { entries })
+    }
+
+    /// Serialize to buffer. Returns bytes written.
+    pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.entries.len() as u8;
+        let mut offset = 1;
+        for entry in &self.entries {
+            buf[offset] = (entry.address.0 & 0xFF) as u8;
+            buf[offset + 1] = ((entry.address.0 >> 8) & 0xFF) as u8;
+            buf[offset + 2] = (entry.incoming_cost & 0x07) | ((entry.outgoing_cost & 0x07) << 3);
+            offset += 3;
+        }
+        offset
+    }
 }

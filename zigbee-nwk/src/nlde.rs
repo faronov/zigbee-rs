@@ -5,7 +5,7 @@
 //! - NLDE-DATA.indication: receive NWK data from the network
 //! - Frame relay for routers/coordinators
 
-use crate::frames::{NwkFrameControl, NwkFrameType, NwkHeader};
+use crate::frames::{NwkCommandId, NwkFrameControl, NwkFrameType, NwkHeader};
 use crate::{DeviceType, NwkLayer, NwkStatus};
 use zigbee_mac::{AddressMode, MacDriver, McpsDataRequest, TxOptions};
 use zigbee_types::*;
@@ -66,12 +66,13 @@ impl<M: MacDriver> NwkLayer<M> {
         let seq = self.nib.next_seq();
 
         // Build NWK header
+        let is_multicast = dst_addr.0 >= 0xFFF8;
         let header = NwkHeader {
             frame_control: NwkFrameControl {
                 frame_type: NwkFrameType::Data as u8,
                 protocol_version: 0x02,
                 discover_route: if discover_route { 1 } else { 0 },
-                multicast: false,
+                multicast: is_multicast,
                 security: security_enable && self.nib.security_enabled,
                 source_route: false,
                 dst_ieee_present: false,
@@ -224,6 +225,12 @@ impl<M: MacDriver> NwkLayer<M> {
                             pt.len()
                         );
 
+                        // NWK command frames are handled internally, not passed to APS
+                        if header.frame_control.frame_type == NwkFrameType::Command as u8 {
+                            self.dispatch_nwk_command(src, &pt);
+                            return None;
+                        }
+
                         return Some(NwkIndication::Owned(NldeDataIndicationOwned {
                             dst_addr: dst,
                             src_addr: src,
@@ -240,8 +247,15 @@ impl<M: MacDriver> NwkLayer<M> {
                 }
             }
 
-            // Unsecured frame — deliver directly
+            // Unsecured frame
             let payload = &mac_payload[consumed..];
+
+            // NWK command frames are handled internally, not passed to APS
+            if header.frame_control.frame_type == NwkFrameType::Command as u8 {
+                self.dispatch_nwk_command(src, payload);
+                return None;
+            }
+
             return Some(NwkIndication::Borrowed(NldeDataIndication {
                 dst_addr: dst,
                 src_addr: src,
@@ -316,7 +330,10 @@ impl<M: MacDriver> NwkLayer<M> {
     /// 2. If destination is in routing table → use next_hop
     /// 3. If we're an end device → send to parent
     /// 4. For broadcast → send to all neighbors (simplified: send to parent)
-    fn resolve_next_hop(&self, destination: ShortAddress) -> Result<ShortAddress, NwkStatus> {
+    pub(crate) fn resolve_next_hop(
+        &self,
+        destination: ShortAddress,
+    ) -> Result<ShortAddress, NwkStatus> {
         // Broadcast: send to parent (end device) or all neighbors (router)
         if destination.0 >= 0xFFF8 {
             if self.device_type == DeviceType::EndDevice {
@@ -357,6 +374,249 @@ impl<M: MacDriver> NwkLayer<M> {
             Ok(self.nib.parent_address)
         } else {
             Err(NwkStatus::RouteError)
+        }
+    }
+
+    // ── NWK Command Dispatch ─────────────────────────────────
+
+    /// Dispatch an incoming NWK command frame to the appropriate handler.
+    fn dispatch_nwk_command(&mut self, src: ShortAddress, payload: &[u8]) {
+        if payload.is_empty() {
+            log::warn!("[NWK] Empty NWK command payload from 0x{:04X}", src.0);
+            return;
+        }
+
+        let cmd_id_byte = payload[0];
+        let cmd_payload = &payload[1..];
+
+        match NwkCommandId::from_u8(cmd_id_byte) {
+            Some(NwkCommandId::Leave) => self.handle_nwk_leave(src, cmd_payload),
+            Some(NwkCommandId::RouteRequest) => self.handle_route_request(src, cmd_payload),
+            Some(NwkCommandId::RouteReply) => self.handle_route_reply(src, cmd_payload),
+            Some(NwkCommandId::RouteRecord) => self.handle_route_record(src, cmd_payload),
+            Some(NwkCommandId::LinkStatus) => self.handle_link_status(src, cmd_payload),
+            Some(other) => {
+                log::debug!(
+                    "[NWK] Ignoring NWK command {:?} from 0x{:04X}",
+                    other,
+                    src.0
+                );
+            }
+            None => {
+                log::warn!(
+                    "[NWK] Unknown NWK command ID 0x{:02X} from 0x{:04X}",
+                    cmd_id_byte,
+                    src.0
+                );
+            }
+        }
+    }
+
+    // ── NWK Command Handlers ─────────────────────────────────
+
+    /// Handle incoming NWK Leave command.
+    fn handle_nwk_leave(&mut self, src: ShortAddress, payload: &[u8]) {
+        let Some(leave) = crate::frames::LeaveCommand::parse(payload) else {
+            log::warn!("[NWK] Malformed Leave command from 0x{:04X}", src.0);
+            return;
+        };
+
+        log::info!(
+            "[NWK] Leave from 0x{:04X} (remove_children={}, rejoin={})",
+            src.0,
+            leave.remove_children,
+            leave.rejoin
+        );
+
+        if leave.remove_children {
+            // We are being asked to leave the network
+            log::warn!(
+                "[NWK] Received leave-with-remove-children from 0x{:04X}",
+                src.0
+            );
+            self.joined = false;
+        }
+
+        // Remove the leaving device from our neighbor table
+        self.neighbors.remove(src);
+    }
+
+    /// Handle incoming Route Request (RREQ).
+    fn handle_route_request(&mut self, src: ShortAddress, payload: &[u8]) {
+        let Some(rreq) = crate::frames::RouteRequest::parse(payload) else {
+            log::warn!("[NWK] Malformed RREQ from 0x{:04X}", src.0);
+            return;
+        };
+
+        log::debug!(
+            "[NWK] RREQ from 0x{:04X}: id={}, dst=0x{:04X}, cost={}",
+            src.0,
+            rreq.route_request_id,
+            rreq.dst_addr.0,
+            rreq.path_cost
+        );
+
+        let our_addr = self.nib.network_address;
+
+        // If destination is us, or we have a route, we can reply
+        let have_route =
+            rreq.dst_addr == our_addr || self.routing.next_hop(rreq.dst_addr).is_some();
+
+        if have_route {
+            // Record route discovery and complete it
+            let _ = self.routing.add_discovery(crate::routing::RouteDiscovery {
+                request_id: rreq.route_request_id,
+                destination: rreq.dst_addr,
+                sender: src,
+                forward_cost: rreq.path_cost,
+                residual_cost: 0,
+                timestamp: 0,
+                active: true,
+            });
+            self.routing.complete_discovery(rreq.route_request_id);
+
+            // Update route back to the originator via the sender
+            let _ = self.routing.update_route(src, src, rreq.path_cost);
+
+            log::info!(
+                "[NWK] RREQ destination 0x{:04X} reachable — should send RREP",
+                rreq.dst_addr.0
+            );
+        } else if self.device_type != DeviceType::EndDevice {
+            // Router: record discovery and rebroadcast with incremented cost
+            let link_cost = self
+                .neighbors
+                .find_by_short(src)
+                .map(|n| n.outgoing_cost)
+                .unwrap_or(7);
+            let new_cost = rreq.path_cost.saturating_add(link_cost);
+
+            let _ = self.routing.add_discovery(crate::routing::RouteDiscovery {
+                request_id: rreq.route_request_id,
+                destination: rreq.dst_addr,
+                sender: src,
+                forward_cost: new_cost,
+                residual_cost: 0xFF,
+                timestamp: 0,
+                active: true,
+            });
+
+            log::debug!(
+                "[NWK] Rebroadcasting RREQ for 0x{:04X} with cost {}",
+                rreq.dst_addr.0,
+                new_cost
+            );
+        }
+    }
+
+    /// Handle incoming Route Reply (RREP).
+    fn handle_route_reply(&mut self, src: ShortAddress, payload: &[u8]) {
+        let Some(rrep) = crate::frames::RouteReply::parse(payload) else {
+            log::warn!("[NWK] Malformed RREP from 0x{:04X}", src.0);
+            return;
+        };
+
+        log::debug!(
+            "[NWK] RREP from 0x{:04X}: id={}, orig=0x{:04X}, resp=0x{:04X}, cost={}",
+            src.0,
+            rrep.route_request_id,
+            rrep.originator.0,
+            rrep.responder.0,
+            rrep.path_cost
+        );
+
+        // Update routing table: route to responder via the sender
+        let _ = self
+            .routing
+            .update_route(rrep.responder, src, rrep.path_cost);
+
+        // Complete the route discovery
+        self.routing.complete_discovery(rrep.route_request_id);
+
+        let our_addr = self.nib.network_address;
+
+        if rrep.originator != our_addr {
+            // Not the originator — should forward RREP toward originator
+            log::debug!(
+                "[NWK] Forwarding RREP toward originator 0x{:04X}",
+                rrep.originator.0
+            );
+        } else {
+            log::info!(
+                "[NWK] Route discovered to 0x{:04X} via 0x{:04X} (cost={})",
+                rrep.responder.0,
+                src.0,
+                rrep.path_cost
+            );
+        }
+    }
+
+    /// Handle incoming Route Record.
+    fn handle_route_record(&mut self, src: ShortAddress, payload: &[u8]) {
+        if payload.is_empty() {
+            log::warn!("[NWK] Malformed RouteRecord from 0x{:04X}", src.0);
+            return;
+        }
+
+        let relay_count = payload[0] as usize;
+        let expected_len = 1 + relay_count * 2;
+        if payload.len() < expected_len {
+            log::warn!(
+                "[NWK] RouteRecord too short from 0x{:04X}: need {}, have {}",
+                src.0,
+                expected_len,
+                payload.len()
+            );
+            return;
+        }
+
+        log::debug!(
+            "[NWK] RouteRecord from 0x{:04X}: {} relays",
+            src.0,
+            relay_count
+        );
+
+        // Store the source route in the routing table
+        // For many-to-one routing, update route to the source through the first relay
+        if relay_count > 0 {
+            let first_relay = u16::from_le_bytes([payload[1], payload[2]]);
+            let _ = self
+                .routing
+                .update_route(src, ShortAddress(first_relay), relay_count as u8);
+        } else {
+            // Direct neighbor, no relays
+            let _ = self.routing.update_route(src, src, 0);
+        }
+    }
+
+    /// Handle incoming Link Status command.
+    fn handle_link_status(&mut self, src: ShortAddress, payload: &[u8]) {
+        let Some(ls) = crate::frames::LinkStatusCommand::parse(payload) else {
+            log::warn!("[NWK] Malformed LinkStatus from 0x{:04X}", src.0);
+            return;
+        };
+
+        log::debug!(
+            "[NWK] LinkStatus from 0x{:04X}: {} entries",
+            src.0,
+            ls.entries.len()
+        );
+
+        // Check if any entry references us, and update the neighbor's cost
+        let our_addr = self.nib.network_address;
+        for entry in &ls.entries {
+            if entry.address == our_addr {
+                // This neighbor reports its cost to/from us
+                if let Some(neighbor) = self.neighbors.find_by_short_mut(src) {
+                    neighbor.outgoing_cost = entry.incoming_cost.clamp(1, 7);
+                    log::debug!(
+                        "[NWK] Updated link cost to 0x{:04X}: outgoing={}",
+                        src.0,
+                        neighbor.outgoing_cost
+                    );
+                }
+                break;
+            }
         }
     }
 }
