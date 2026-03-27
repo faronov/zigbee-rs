@@ -591,12 +591,18 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 }
 
                 // Build authenticated data (a = NWK header || security aux header)
+                // AAD must use ACTUAL security level (5), not OTA value (0).
                 let aad_len = consumed + sec_consumed;
+                let mut aad_buf = [0u8; 64];
+                let aad_copy_len = aad_len.min(aad_buf.len());
+                aad_buf[..aad_copy_len].copy_from_slice(&mac_payload[..aad_copy_len]);
+                // Patch security control byte at offset `consumed` with actual level 5
+                aad_buf[consumed] = (aad_buf[consumed] & !0x07) | 0x05;
                 let ciphertext_and_mic = &after_header[sec_consumed..];
 
                 // Decrypt
                 match nwk.security().decrypt(
-                    &mac_payload[..aad_len],
+                    &aad_buf[..aad_copy_len],
                     ciphertext_and_mic,
                     &key,
                     &sec_hdr,
@@ -1491,7 +1497,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             cluster_id,
             src_endpoint,
             payload: zcl_data,
-            tx_options: zigbee_aps::ApsTxOptions::default(),
+            tx_options: zigbee_aps::ApsTxOptions {
+                use_nwk_key: true,
+                ..zigbee_aps::ApsTxOptions::default()
+            },
             radius: 0,
             alias_src_addr: None,
             alias_seq: None,

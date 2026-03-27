@@ -385,18 +385,30 @@ impl ApsSecurity {
         security_header: &ApsSecurityHeader,
     ) -> Option<heapless::Vec<u8, 128>> {
         let nonce = self.build_nonce(security_header);
+        #[cfg(feature = "defmt")]
+        {
+            defmt::info!("[APS-SEC] key: {:02x}", key);
+            defmt::info!("[APS-SEC] nonce: {:02x}", &nonce[..]);
+            defmt::info!("[APS-SEC] aad({} bytes): {:02x}", aps_header.len(), aps_header);
+            defmt::info!("[APS-SEC] ciphertext({} bytes): {:02x}", ciphertext.len(), ciphertext);
+        }
         aps_aes_ccm_decrypt(key, &nonce, aps_header, ciphertext)
     }
 
     /// Build CCM* nonce from APS security header.
     /// Nonce (13 bytes) = source_address(8) || frame_counter(4) || security_control(1)
+    ///
+    /// Per Zigbee spec B.4.1: the SecurityLevel in the nonce must use the ACTUAL
+    /// security level (5 = ENC-MIC-32), not the OTA value (always 0 on the wire).
     fn build_nonce(&self, hdr: &ApsSecurityHeader) -> [u8; 13] {
         let mut nonce = [0u8; 13];
         if let Some(ref addr) = hdr.source_address {
             nonce[0..8].copy_from_slice(addr);
         }
         nonce[8..12].copy_from_slice(&hdr.frame_counter.to_le_bytes());
-        nonce[12] = hdr.security_control;
+        // Replace OTA security level (0) with actual level (5 = ENC-MIC-32)
+        let actual_sc = (hdr.security_control & !0x07) | SEC_LEVEL_ENC_MIC_32;
+        nonce[12] = actual_sc;
         nonce
     }
 }

@@ -124,6 +124,8 @@ impl<M: MacDriver> NwkLayer<M> {
                     }
                     nwk_buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
                     total_len = aad_len + encrypted.len();
+                    // Zero security level bits for OTA transmission (spec §4.3.1.2)
+                    nwk_buf[hdr_len] &= !0x07;
                 } else {
                     log::warn!("[NWK] Encryption failed");
                     return Err(NwkStatus::InvalidRequest);
@@ -144,8 +146,15 @@ impl<M: MacDriver> NwkLayer<M> {
         // Determine MAC-level next hop
         let next_hop = self.resolve_next_hop(dst_addr)?;
 
+        log::info!(
+            "[NWK TX] dst=0x{:04X} next_hop=0x{:04X} sec={} len={}",
+            dst_addr.0, next_hop.0,
+            security_enable && self.nib.security_enabled,
+            total_len
+        );
+
         // Send via MAC
-        self.mac
+        let mac_result = self.mac
             .mcps_data(McpsDataRequest {
                 src_addr_mode: AddressMode::Short,
                 dst_address: MacAddress::Short(self.nib.pan_id, next_hop),
@@ -157,8 +166,13 @@ impl<M: MacDriver> NwkLayer<M> {
                     ..Default::default()
                 },
             })
-            .await
-            .map_err(|_| NwkStatus::RouteError)?;
+            .await;
+
+        if let Err(ref e) = mac_result {
+            log::warn!("[NWK TX] MAC send failed: {:?}", e);
+        }
+
+        mac_result.map_err(|_| NwkStatus::RouteError)?;
 
         Ok(NldeDataConfirm {
             status: NwkStatus::Success,
@@ -195,6 +209,13 @@ impl<M: MacDriver> NwkLayer<M> {
                 // Look up key
                 let key = self.security.key_by_seq(sec_hdr.key_seq_number)?.key;
 
+                log::info!(
+                    "[NWK SEC] sc=0x{:02X} fc={} key_seq={}",
+                    sec_hdr.security_control,
+                    sec_hdr.frame_counter,
+                    sec_hdr.key_seq_number,
+                );
+
                 // Step 1: Check frame counter WITHOUT committing (replay protection)
                 if !self
                     .security
@@ -206,8 +227,14 @@ impl<M: MacDriver> NwkLayer<M> {
 
                 // Step 2: Decrypt and verify MIC
                 let aad_len = consumed + sec_consumed;
+                // AAD must use ACTUAL security level (5), not OTA value (0).
+                // The security control byte in the aux header is at offset `consumed`.
+                let mut aad_buf = [0u8; 64];
+                let aad_copy_len = aad_len.min(aad_buf.len());
+                aad_buf[..aad_copy_len].copy_from_slice(&mac_payload[..aad_copy_len]);
+                aad_buf[consumed] = (aad_buf[consumed] & !0x07) | 0x05;
                 let plaintext = self.security.decrypt(
-                    &mac_payload[..aad_len],
+                    &aad_buf[..aad_copy_len],
                     &after_header[sec_consumed..],
                     &key,
                     &sec_hdr,

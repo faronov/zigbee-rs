@@ -72,12 +72,15 @@ pub struct NrfMac<'a, T: Instance> {
 
 impl<'a, T: Instance> NrfMac<'a, T> {
     pub fn new(radio: Radio<'a, T>) -> Self {
+        // Read factory-programmed IEEE address from FICR registers
+        let ieee = Self::read_ficr_ieee();
+
         Self {
             radio,
             short_address: ShortAddress(0xFFFF),
             pan_id: PanId(0xFFFF),
             channel: 11,
-            extended_address: [0u8; 8],
+            extended_address: ieee,
             rx_on_when_idle: false,
             association_permit: false,
             auto_request: true,
@@ -89,6 +92,20 @@ impl<'a, T: Instance> NrfMac<'a, T> {
             tx_power: 0,
             coord_short_address: ShortAddress(0x0000),
         }
+    }
+
+    /// Read the unique device IEEE (EUI-64) address from nRF52840 FICR registers.
+    /// FICR.DEVICEID[0] at 0x10000060 (low 32 bits)
+    /// FICR.DEVICEID[1] at 0x10000064 (high 32 bits)
+    fn read_ficr_ieee() -> IeeeAddress {
+        const FICR_DEVICEID0: *const u32 = 0x1000_0060 as *const u32;
+        const FICR_DEVICEID1: *const u32 = 0x1000_0064 as *const u32;
+        let lo = unsafe { core::ptr::read_volatile(FICR_DEVICEID0) };
+        let hi = unsafe { core::ptr::read_volatile(FICR_DEVICEID1) };
+        let mut addr = [0u8; 8];
+        addr[0..4].copy_from_slice(&lo.to_le_bytes());
+        addr[4..8].copy_from_slice(&hi.to_le_bytes());
+        addr
     }
 
     fn next_dsn(&mut self) -> u8 {
@@ -249,11 +266,17 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         let mut pan_descriptors = heapless::Vec::new();
         let mut energy_list = heapless::Vec::new();
 
+        log::info!("[nRF MLME-SCAN] Starting {:?} scan, duration={}", req.scan_type, req.scan_duration);
+
         for channel in req.channel_mask.iter() {
             let ch = channel.number();
+            log::debug!("[nRF MLME-SCAN] Scanning ch {}…", ch);
             match req.scan_type {
                 ScanType::Active => match self.scan_channel_active(ch, req.scan_duration).await {
                     Ok(pds) => {
+                        if !pds.is_empty() {
+                            log::info!("[nRF MLME-SCAN] ch {}: {} beacon(s) found", ch, pds.len());
+                        }
                         for pd in pds {
                             let _ = pan_descriptors.push(pd);
                         }
@@ -289,8 +312,11 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         if matches!(req.scan_type, ScanType::Active | ScanType::Passive)
             && pan_descriptors.is_empty()
         {
+            log::warn!("[nRF MLME-SCAN] No beacons found on any channel");
             return Err(MacError::NoBeacon);
         }
+
+        log::info!("[nRF MLME-SCAN] Scan complete: {} PAN descriptor(s)", pan_descriptors.len());
 
         Ok(MlmeScanConfirm {
             scan_type: req.scan_type,
@@ -453,6 +479,11 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                     self.coord_short_address = addr;
                 }
             }
+            PibAttribute::MacExtendedAddress => {
+                if let PibValue::ExtendedAddress(addr) = value {
+                    self.extended_address = addr;
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -563,46 +594,21 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             }
         }
 
-        // Fix 7: If ACK requested, wait for it and retry on failure
+        // NOTE: Software ACK reception is unreliable on embassy-nrf because
+        // try_send() ends with radio DISABLED (via PHYEND→DISABLE shortcut).
+        // The time to restart RX (~200-500μs software overhead) exceeds the
+        // ACK turnaround window (~192μs). ACKs are consistently missed.
+        //
+        // For now: fire-and-forget TX. Re-send the frame a few times for
+        // reliability without waiting for ACK. Higher layers (APS ACK,
+        // application retry) handle end-to-end reliability.
+        // TODO: implement DISABLED→RXEN hardware shortcut for proper ACK.
         if ack_requested {
-            let ack_wait_us: u64 = 864; // macAckWaitDuration = 54 symbols * 16μs
-            let mut retries = 0u8;
-            let max_retries = self.max_frame_retries;
-
-            loop {
-                // Listen for ACK
-                let mut ack_pkt = Packet::new();
-                let got_ack = match select::select(
-                    Timer::after_micros(ack_wait_us),
-                    self.radio.receive(&mut ack_pkt),
-                )
-                .await
-                {
-                    select::Either::Second(Ok(())) => {
-                        let ack_data = ack_pkt.as_ref();
-                        // ACK frame: FC(2) + Seq(1), frame_type = 2, seq must match
-                        ack_data.len() >= 3
-                            && (ack_data[0] & 0x07) == 0x02
-                            && ack_data[2] == frame_buf[2] // seq number match
-                    }
-                    _ => false,
-                };
-
-                if got_ack {
-                    break;
-                }
-
-                retries += 1;
-                if retries > max_retries {
-                    return Err(MacError::NoAck);
-                }
-
-                // Retransmit (with CSMA-CA again)
+            // Best-effort retransmit 2 more times with short delay
+            for _ in 0..2 {
+                Timer::after_micros(1_500).await; // inter-frame spacing
                 pkt.copy_from_slice(&frame_buf[..len]);
-                // Simple retry — single CCA attempt for retransmission
-                if self.radio.try_send(&mut pkt).await.is_err() {
-                    continue; // channel busy, try again
-                }
+                let _ = self.radio.try_send(&mut pkt).await;
             }
         }
 
@@ -614,14 +620,44 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
 
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
         let mut rx_pkt = Packet::new();
+        // Absolute deadline — filtered frames don't reset the clock
+        const RX_TIMEOUT_MS: u64 = 5000;
+        let deadline = embassy_time::Instant::now()
+            + embassy_time::Duration::from_millis(RX_TIMEOUT_MS);
+
         loop {
-            // Fix 1: CRC failure should not kill receive loop
-            if self.radio.receive(&mut rx_pkt).await.is_err() {
-                continue; // CRC failure or radio error — discard and keep listening
+            let now = embassy_time::Instant::now();
+            if now >= deadline {
+                return Err(MacError::NoData);
+            }
+            let remaining = deadline - now;
+
+            // Use remaining time, not a fresh 5s timer
+            let rx_result = select::select(
+                self.radio.receive(&mut rx_pkt),
+                Timer::after(remaining),
+            )
+            .await;
+
+            match rx_result {
+                select::Either::Second(_) => {
+                    // Timeout — no frame received
+                    log::debug!("[nRF RX] Timeout ({}ms) — no frame", RX_TIMEOUT_MS);
+                    return Err(MacError::NoData);
+                }
+                select::Either::First(Err(_)) => {
+                    // CRC failure or radio error — discard and keep listening
+                    log::debug!("[nRF RX] CRC/radio error, retrying");
+                    continue;
+                }
+                select::Either::First(Ok(())) => {
+                    // Frame received — process it below
+                }
             }
 
             let data = rx_pkt.as_ref();
             if data.len() < 5 {
+                log::debug!("[nRF RX] Runt frame ({} bytes), skip", data.len());
                 continue;
             }
 
@@ -633,14 +669,12 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                 continue;
             }
 
-            // Fix 8: Generate ACK if requested (bit 5 of FC)
+            // Generate ACK if requested (bit 5 of FC)
             let ack_requested = (fc >> 5) & 1 != 0;
             if ack_requested {
                 let seq = data[2];
                 let mut ack_pkt = Packet::new();
-                // ACK frame: FC=0x0002 (type=2, no fields), seq number
                 ack_pkt.copy_from_slice(&[0x02, 0x00, seq]);
-                // Best-effort ACK — don't fail the receive if ACK TX fails
                 let _ = self.radio.try_send(&mut ack_pkt).await;
             }
 
@@ -658,10 +692,13 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             if !self.promiscuous {
                 match &dst {
                     MacAddress::Short(pan, addr) => {
-                        // Accept: our PAN or broadcast PAN, AND our address or broadcast
                         let pan_ok = pan.0 == self.pan_id.0 || pan.0 == 0xFFFF;
                         let addr_ok = addr.0 == self.short_address.0 || addr.0 == 0xFFFF;
                         if !pan_ok || !addr_ok {
+                            log::info!(
+                                "[nRF RX] Filtered short dst: pan=0x{:04X} addr=0x{:04X} (ours: pan=0x{:04X} addr=0x{:04X})",
+                                pan.0, addr.0, self.pan_id.0, self.short_address.0
+                            );
                             continue;
                         }
                     }
@@ -669,11 +706,17 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                         let pan_ok = pan.0 == self.pan_id.0 || pan.0 == 0xFFFF;
                         let addr_ok = *addr == self.extended_address;
                         if !pan_ok || !addr_ok {
+                            log::info!(
+                                "[nRF RX] Filtered ext dst: pan=0x{:04X} (ours: 0x{:04X})",
+                                pan.0, self.pan_id.0
+                            );
                             continue;
                         }
                     }
                 }
             }
+
+            log::info!("[nRF RX] Accepted frame {} bytes, LQI {}", data.len(), rx_pkt.lqi());
 
             let payload_data = &data[header_len..];
             if let Some(mac_frame) = MacFrame::from_slice(payload_data) {

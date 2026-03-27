@@ -482,7 +482,27 @@ impl<M: MacDriver> ApsLayer<M> {
         nwk_security: bool,
         decrypted_buf: &'a mut ApsFrameBuffer,
     ) -> Option<ApsdeDataIndication<'a>> {
+        log::info!(
+            "[APS RX] process_incoming_aps_frame: {} bytes from 0x{:04X}",
+            nwk_payload.len(),
+            nwk_src.0,
+        );
+        if nwk_payload.len() >= 2 {
+            log::info!(
+                "[APS RX] FC=0x{:02X} (type={}, sec={})",
+                nwk_payload[0],
+                nwk_payload[0] & 0x03,
+                (nwk_payload[0] >> 5) & 1,
+            );
+        }
+
         let (header, consumed) = ApsHeader::parse(nwk_payload)?;
+        log::info!(
+            "[APS RX] Parsed: type={:?}, sec={}, consumed={}",
+            header.frame_control.frame_type,
+            header.frame_control.security,
+            consumed,
+        );
 
         let aps_secured = header.frame_control.security;
         let after_header = &nwk_payload[consumed..];
@@ -490,13 +510,39 @@ impl<M: MacDriver> ApsLayer<M> {
 
         // Phase 1: APS security decryption
         if aps_secured {
-            let (sec_hdr, sec_consumed) = crate::security::ApsSecurityHeader::parse(after_header)?;
+            log::info!("[APS RX] APS security enabled, parsing security header...");
+            let parsed = crate::security::ApsSecurityHeader::parse(after_header);
+            if parsed.is_none() {
+                log::warn!("[APS RX] APS security header parse FAILED, after_header len={}", after_header.len());
+                if after_header.len() >= 2 {
+                    log::warn!("[APS RX] sec_ctrl=0x{:02X} next=0x{:02X}", after_header[0], after_header[1]);
+                }
+                return None;
+            }
+            let (sec_hdr, sec_consumed) = parsed.unwrap();
+            log::info!(
+                "[APS RX] APS sec header: ctrl=0x{:02X}, fc={}, sec_consumed={}, ct_len={}",
+                sec_hdr.security_control,
+                sec_hdr.frame_counter,
+                sec_consumed,
+                after_header.len() - sec_consumed,
+            );
             let ciphertext = &after_header[sec_consumed..];
             let aad_end = consumed + sec_consumed;
-            let aad = &nwk_payload[..aad_end];
+            // AAD must use the ACTUAL security level (5 = ENC-MIC-32), not the OTA value (0).
+            // The sender computes CCM* with actual level, then zeroes it for transmission.
+            // Copy AAD and patch the security control byte with actual level.
+            let mut aad_buf_patched = [0u8; 64];
+            let aad_len = aad_end.min(aad_buf_patched.len());
+            aad_buf_patched[..aad_len].copy_from_slice(&nwk_payload[..aad_len]);
+            // The security control byte is at offset `consumed` (first byte of aux header)
+            aad_buf_patched[consumed] =
+                (aad_buf_patched[consumed] & !0x07) | crate::security::SEC_LEVEL_ENC_MIC_32;
+            let aad = &aad_buf_patched[..aad_len];
 
             let key_id =
                 crate::security::ApsSecurityHeader::key_identifier(sec_hdr.security_control);
+            log::info!("[APS RX] key_id={}", key_id);
             let key = if key_id == crate::security::KEY_ID_DATA_KEY {
                 if let Some(addr) = &sec_hdr.source_address {
                     if let Some(entry) = self.security.find_any_key(addr) {
@@ -535,6 +581,7 @@ impl<M: MacDriver> ApsLayer<M> {
 
             match self.security.decrypt(aad, ciphertext, &key, &sec_hdr) {
                 Some(plaintext) => {
+                    log::info!("[APS RX] APS decrypt SUCCESS, plaintext {} bytes", plaintext.len());
                     if let Some(addr) = &sec_hdr.source_address {
                         self.security.commit_frame_counter(
                             addr,
@@ -642,6 +689,7 @@ impl<M: MacDriver> ApsLayer<M> {
                 return None;
             }
             ApsFrameType::Command => {
+                log::info!("[APS RX] APS Command frame, sec={}", aps_secured);
                 let cmd_payload = if used_decrypted_buf {
                     &decrypted_buf.data[..decrypted_buf.len]
                 } else {
@@ -653,6 +701,7 @@ impl<M: MacDriver> ApsLayer<M> {
                 }
                 let cmd_id = cmd_payload[0];
                 let cmd_data = &cmd_payload[1..];
+                log::info!("[APS RX] Command ID=0x{:02X}, data_len={}", cmd_id, cmd_data.len());
                 match crate::frames::ApsCommandId::from_u8(cmd_id) {
                     Some(crate::frames::ApsCommandId::TransportKey) => {
                         self.handle_transport_key(cmd_data, nwk_src);

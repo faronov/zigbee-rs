@@ -406,7 +406,10 @@ impl<M: MacDriver> ZdoLayer<M> {
             cluster_id,
             src_endpoint: ZDO_ENDPOINT,
             payload,
-            tx_options: ApsTxOptions::default(),
+            tx_options: ApsTxOptions {
+                use_nwk_key: true,
+                ..ApsTxOptions::default()
+            },
             radius: 0,
             alias_src_addr: None,
             alias_seq: None,

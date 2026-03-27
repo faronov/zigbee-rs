@@ -81,6 +81,8 @@ pub enum MacError {
     PanAtCapacity,
     /// Unknown error
     Other,
+    /// No data frame received within timeout
+    NoData,
 }
 
 // ── The MAC Driver trait ────────────────────────────────────────

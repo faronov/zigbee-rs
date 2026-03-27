@@ -320,6 +320,21 @@ impl<M: MacDriver> NwkLayer<M> {
             )
             .await;
 
+        // Set MAC PAN ID — critical for outgoing frames to have correct PAN
+        let _ = self
+            .mac
+            .mlme_set(PibAttribute::MacPanId, PibValue::PanId(network.pan_id))
+            .await;
+
+        // Set our MAC short address — needed for source addressing in TX frames
+        let _ = self
+            .mac
+            .mlme_set(
+                PibAttribute::MacShortAddress,
+                PibValue::ShortAddress(result.short_address),
+            )
+            .await;
+
         // Read our IEEE address
         if let Ok(PibValue::ExtendedAddress(addr)) =
             self.mac.mlme_get(PibAttribute::MacExtendedAddress).await

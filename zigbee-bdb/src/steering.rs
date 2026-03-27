@@ -148,12 +148,65 @@ impl<M: MacDriver> BdbLayer<M> {
                 log::info!("[BDB:Steering] Waiting for Transport-Key from TC...");
 
                 let mut key_received = false;
-                // Poll for incoming frames — wait up to ~10s for Transport-Key
-                // Each iteration waits for a MAC frame (blocks on receive with timeout)
-                const MAX_KEY_WAIT_ATTEMPTS: usize = 100;
-                for _attempt in 0..MAX_KEY_WAIT_ATTEMPTS {
-                    // Small delay between polls (~100ms worth of iterations)
-                    // Try to receive a MAC frame
+                // Poll parent for pending frames — wait up to ~30s for Transport-Key.
+                // Because we declared rx_on_when_idle=false, the parent uses indirect
+                // delivery: it stores frames for us and only sends them when we poll
+                // with a MAC Data Request command.
+                const MAX_KEY_WAIT_ATTEMPTS: usize = 15;
+                for attempt in 0..MAX_KEY_WAIT_ATTEMPTS {
+                    log::info!(
+                        "[BDB:Steering] Key wait attempt {}/{} — polling parent...",
+                        attempt + 1,
+                        MAX_KEY_WAIT_ATTEMPTS
+                    );
+
+                    // Send MAC Data Request to parent to retrieve pending indirect frames.
+                    // The parent will respond with any buffered Transport-Key frame.
+                    match self
+                        .zdo
+                        .aps_mut()
+                        .nwk_mut()
+                        .mac_mut()
+                        .mlme_poll()
+                        .await
+                    {
+                        Ok(Some(mac_frame)) => {
+                            let mac_payload = mac_frame.as_slice();
+                            log::info!(
+                                "[BDB:Steering] Poll returned frame, {} bytes",
+                                mac_payload.len(),
+                            );
+                            if let Some((nwk_hdr, nwk_consumed)) =
+                                zigbee_nwk::frames::NwkHeader::parse(mac_payload)
+                            {
+                                log::info!(
+                                    "[BDB:Steering] Poll NWK: src=0x{:04X} dst=0x{:04X} sec={}",
+                                    nwk_hdr.src_addr.0,
+                                    nwk_hdr.dst_addr.0,
+                                    nwk_hdr.frame_control.security,
+                                );
+                                if let Some(true) = self.process_key_wait_frame(
+                                    mac_payload, &nwk_hdr, nwk_consumed, 0,
+                                ) {
+                                    key_received = true;
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            log::info!("[BDB:Steering] Poll: no pending data from parent");
+                        }
+                        Err(e) => {
+                            log::warn!("[BDB:Steering] Poll failed: {:?}", e);
+                        }
+                    }
+
+                    if key_received {
+                        break;
+                    }
+
+                    // Also listen passively for a short time — the Transport-Key might
+                    // arrive as a direct transmission (if parent treats us as RxOnWhenIdle)
                     match self
                         .zdo
                         .aps_mut()
@@ -163,78 +216,33 @@ impl<M: MacDriver> BdbLayer<M> {
                         .await
                     {
                         Ok(mac_ind) => {
+                            log::info!(
+                                "[BDB:Steering] Got MAC frame, payload {} bytes, LQI {}",
+                                mac_ind.payload.as_slice().len(),
+                                mac_ind.lqi,
+                            );
                             let mac_payload = mac_ind.payload.as_slice();
-                            // Parse NWK header
                             if let Some((nwk_hdr, nwk_consumed)) =
                                 zigbee_nwk::frames::NwkHeader::parse(mac_payload)
                             {
-                                let after_nwk = &mac_payload[nwk_consumed..];
-                                let mut buf = [0u8; 128];
-                                let payload_data;
-
-                                if nwk_hdr.frame_control.security {
-                                    // Parse NWK security header
-                                    if let Some((sec_hdr, sec_consumed)) =
-                                        zigbee_nwk::security::NwkSecurityHeader::parse(after_nwk)
-                                    {
-                                        if let Some(key_entry) = self
-                                            .zdo
-                                            .aps()
-                                            .nwk()
-                                            .security()
-                                            .key_by_seq(sec_hdr.key_seq_number)
-                                        {
-                                            let key = key_entry.key;
-                                            let aad_len = nwk_consumed + sec_consumed;
-                                            if let Some(pt) =
-                                                self.zdo.aps().nwk().security().decrypt(
-                                                    &mac_payload[..aad_len],
-                                                    &after_nwk[sec_consumed..],
-                                                    &key,
-                                                    &sec_hdr,
-                                                )
-                                            {
-                                                let len = pt.len().min(128);
-                                                buf[..len].copy_from_slice(&pt[..len]);
-                                                payload_data = Some((buf, len));
-                                            } else {
-                                                payload_data = None;
-                                            }
-                                        } else {
-                                            payload_data = None;
-                                        }
-                                    } else {
-                                        payload_data = None;
-                                    }
-                                } else {
-                                    let len = after_nwk.len().min(128);
-                                    buf[..len].copy_from_slice(&after_nwk[..len]);
-                                    payload_data = Some((buf, len));
+                                log::info!(
+                                    "[BDB:Steering] NWK frame: src=0x{:04X} dst=0x{:04X} sec={}",
+                                    nwk_hdr.src_addr.0,
+                                    nwk_hdr.dst_addr.0,
+                                    nwk_hdr.frame_control.security,
+                                );
+                                if let Some(true) = self.process_key_wait_frame(
+                                    mac_payload, &nwk_hdr, nwk_consumed, mac_ind.lqi,
+                                ) {
+                                    key_received = true;
+                                    break;
                                 }
-
-                                if let Some((data, len)) = payload_data {
-                                    // Try to parse as APS frame
-                                    let mut aps_buf = zigbee_aps::apsde::ApsFrameBuffer::new();
-                                    let _ = self.zdo.aps_mut().process_incoming_aps_frame(
-                                        &data[..len],
-                                        nwk_hdr.src_addr,
-                                        nwk_hdr.dst_addr,
-                                        mac_ind.lqi,
-                                        nwk_hdr.frame_control.security,
-                                        &mut aps_buf,
-                                    );
-
-                                    // Check if NWK key was installed
-                                    if self.zdo.aps().nwk().security().active_key().is_some() {
-                                        log::info!("[BDB:Steering] NWK key received from TC!");
-                                        key_received = true;
-                                        break;
-                                    }
-                                }
+                            } else {
+                                log::warn!("[BDB:Steering] NWK header parse failed");
                             }
                         }
-                        _ => {
-                            // No frame available — short wait then retry
+                        Err(e) => {
+                            log::debug!("[BDB:Steering] Key wait: rx error {:?}", e);
                         }
                     }
                 }
@@ -244,7 +252,13 @@ impl<M: MacDriver> BdbLayer<M> {
                     // Continue anyway — the key might arrive later
                 }
 
-                // Step 5c: Send APSME-REQUEST-KEY to TC for unique link key
+                // Step 5c: Re-send Device_annce now that we have the NWK key
+                // (first attempt was pre-key and likely failed with NoAck)
+                if let Err(e) = self.zdo.device_annce(nwk_addr, ieee).await {
+                    log::warn!("[BDB:Steering] Device_annce (post-key) failed: {:?}", e);
+                }
+
+                // Step 5d: Send APSME-REQUEST-KEY to TC for unique link key
                 // Z2M requires this within ~10s of joining
                 let tc_addr = zigbee_types::ShortAddress::COORDINATOR;
                 if let Err(e) = self.zdo.aps_mut().send_request_key(tc_addr).await {
@@ -310,5 +324,100 @@ impl<M: MacDriver> BdbLayer<M> {
 
         log::info!("[BDB:Steering] Permit joining opened for {}s", duration,);
         Ok(())
+    }
+
+    /// Process a received MAC frame during Transport-Key wait.
+    ///
+    /// Parses NWK header and security, attempts decrypt if needed, then processes
+    /// via APS layer. Returns `Some(true)` if NWK key was installed (Transport-Key
+    /// received), `Some(false)` if frame was processed but no key, `None` if
+    /// parsing/decrypt failed.
+    fn process_key_wait_frame(
+        &mut self,
+        mac_payload: &[u8],
+        nwk_hdr: &zigbee_nwk::frames::NwkHeader,
+        nwk_consumed: usize,
+        lqi: u8,
+    ) -> Option<bool> {
+        let after_nwk = &mac_payload[nwk_consumed..];
+        let mut buf = [0u8; 128];
+        let payload_data;
+
+        if nwk_hdr.frame_control.security {
+            if let Some((sec_hdr, sec_consumed)) =
+                zigbee_nwk::security::NwkSecurityHeader::parse(after_nwk)
+            {
+                if let Some(key_entry) = self
+                    .zdo
+                    .aps()
+                    .nwk()
+                    .security()
+                    .key_by_seq(sec_hdr.key_seq_number)
+                {
+                    let key = key_entry.key;
+                    let aad_len = nwk_consumed + sec_consumed;
+                    if let Some(pt) = self.zdo.aps().nwk().security().decrypt(
+                        &mac_payload[..aad_len],
+                        &after_nwk[sec_consumed..],
+                        &key,
+                        &sec_hdr,
+                    ) {
+                        let len = pt.len().min(128);
+                        buf[..len].copy_from_slice(&pt[..len]);
+                        payload_data = Some((buf, len));
+                    } else {
+                        log::warn!("[BDB:Steering] NWK decrypt failed");
+                        payload_data = None;
+                    }
+                } else {
+                    log::warn!(
+                        "[BDB:Steering] No key for seq {}",
+                        sec_hdr.key_seq_number
+                    );
+                    payload_data = None;
+                }
+            } else {
+                log::warn!("[BDB:Steering] NWK security header parse failed");
+                payload_data = None;
+            }
+        } else {
+            // NWK security OFF — this is what Transport-Key looks like
+            log::info!(
+                "[BDB:Steering] NWK unsecured frame! {} bytes — possible Transport-Key",
+                after_nwk.len()
+            );
+            let len = after_nwk.len().min(128);
+            buf[..len].copy_from_slice(&after_nwk[..len]);
+            payload_data = Some((buf, len));
+        }
+
+        if let Some((data, len)) = payload_data {
+            let mut aps_buf = zigbee_aps::apsde::ApsFrameBuffer::new();
+            // Log first 20 bytes hex for debugging APS parsing
+            if len >= 4 {
+                log::info!(
+                    "[BDB:Steering] APS payload hex: {:02X} {:02X} {:02X} {:02X} (len={})",
+                    data[0], data[1], data[2], data[3], len,
+                );
+            }
+
+            let _ = self.zdo.aps_mut().process_incoming_aps_frame(
+                &data[..len],
+                nwk_hdr.src_addr,
+                nwk_hdr.dst_addr,
+                lqi,
+                nwk_hdr.frame_control.security,
+                &mut aps_buf,
+            );
+
+            if self.zdo.aps().nwk().security().active_key().is_some() {
+                log::info!("[BDB:Steering] NWK key received from TC!");
+                return Some(true);
+            }
+            log::info!("[BDB:Steering] APS processed but no key installed yet");
+            Some(false)
+        } else {
+            None
+        }
     }
 }

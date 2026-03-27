@@ -196,11 +196,16 @@ impl NwkSecurity {
 
     /// Build CCM* nonce from security header.
     /// Nonce = source_address(8) || frame_counter(4) || security_control(1)
+    ///
+    /// Per Zigbee spec §4.3.1.2: the SecurityLevel in the nonce must use the
+    /// ACTUAL security level (5 = ENC-MIC-32), not the OTA value (always 0).
     fn build_nonce(&self, hdr: &NwkSecurityHeader) -> [u8; 13] {
         let mut nonce = [0u8; 13];
         nonce[0..8].copy_from_slice(&hdr.source_address);
         nonce[8..12].copy_from_slice(&hdr.frame_counter.to_le_bytes());
-        nonce[12] = hdr.security_control;
+        // Replace OTA security level (0) with actual level (5 = ENC-MIC-32)
+        let actual_sc = (hdr.security_control & !0x07) | 0x05;
+        nonce[12] = actual_sc;
         nonce
     }
 }
