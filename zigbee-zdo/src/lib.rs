@@ -285,7 +285,7 @@ impl<M: MacDriver> ZdoLayer<M> {
     }
 
     /// Check if a pending request at the given slot has completed and take the result.
-    fn take_response(&mut self, slot: usize) -> Option<heapless::Vec<u8, 128>> {
+    pub fn take_response(&mut self, slot: usize) -> Option<heapless::Vec<u8, 128>> {
         if slot < MAX_PENDING_ZDP && self.pending_responses[slot].completed {
             self.pending_responses[slot].active = false;
             self.pending_responses[slot].completed = false;
@@ -298,7 +298,7 @@ impl<M: MacDriver> ZdoLayer<M> {
     }
 
     /// Cancel a pending request slot.
-    fn cancel_pending(&mut self, slot: usize) {
+    pub fn cancel_pending(&mut self, slot: usize) {
         if slot < MAX_PENDING_ZDP {
             self.pending_responses[slot].active = false;
             self.pending_responses[slot].completed = false;
