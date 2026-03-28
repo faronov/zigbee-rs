@@ -162,14 +162,7 @@ impl<M: MacDriver> BdbLayer<M> {
 
                     // Send MAC Data Request to parent to retrieve pending indirect frames.
                     // The parent will respond with any buffered Transport-Key frame.
-                    match self
-                        .zdo
-                        .aps_mut()
-                        .nwk_mut()
-                        .mac_mut()
-                        .mlme_poll()
-                        .await
-                    {
+                    match self.zdo.aps_mut().nwk_mut().mac_mut().mlme_poll().await {
                         Ok(Some(mac_frame)) => {
                             let mac_payload = mac_frame.as_slice();
                             log::info!(
@@ -186,7 +179,10 @@ impl<M: MacDriver> BdbLayer<M> {
                                     nwk_hdr.frame_control.security,
                                 );
                                 if let Some(true) = self.process_key_wait_frame(
-                                    mac_payload, &nwk_hdr, nwk_consumed, 0,
+                                    mac_payload,
+                                    &nwk_hdr,
+                                    nwk_consumed,
+                                    0,
                                 ) {
                                     key_received = true;
                                     break;
@@ -232,7 +228,10 @@ impl<M: MacDriver> BdbLayer<M> {
                                     nwk_hdr.frame_control.security,
                                 );
                                 if let Some(true) = self.process_key_wait_frame(
-                                    mac_payload, &nwk_hdr, nwk_consumed, mac_ind.lqi,
+                                    mac_payload,
+                                    &nwk_hdr,
+                                    nwk_consumed,
+                                    mac_ind.lqi,
                                 ) {
                                     key_received = true;
                                     break;
@@ -375,10 +374,7 @@ impl<M: MacDriver> BdbLayer<M> {
                         payload_data = None;
                     }
                 } else {
-                    log::warn!(
-                        "[BDB:Steering] No key for seq {}",
-                        sec_hdr.key_seq_number
-                    );
+                    log::warn!("[BDB:Steering] No key for seq {}", sec_hdr.key_seq_number);
                     payload_data = None;
                 }
             } else {
@@ -402,7 +398,11 @@ impl<M: MacDriver> BdbLayer<M> {
             if len >= 4 {
                 log::info!(
                     "[BDB:Steering] APS payload hex: {:02X} {:02X} {:02X} {:02X} (len={})",
-                    data[0], data[1], data[2], data[3], len,
+                    data[0],
+                    data[1],
+                    data[2],
+                    data[3],
+                    len,
                 );
             }
 

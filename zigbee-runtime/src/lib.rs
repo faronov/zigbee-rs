@@ -663,11 +663,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             );
             match self.bdb.zdo_mut().handle_indication(&aps_indication).await {
                 Ok(()) => log::info!("[Runtime] ZDO OK cluster=0x{:04X}", cluster_id),
-                Err(e) => log::warn!(
-                    "[Runtime] ZDO FAIL cluster=0x{:04X}: {:?}",
-                    cluster_id,
-                    e,
-                ),
+                Err(e) => log::warn!("[Runtime] ZDO FAIL cluster=0x{:04X}: {:?}", cluster_id, e,),
             }
 
             // After ZDO processes Mgmt_Leave_req, execute the actual leave
@@ -692,7 +688,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         // Application endpoint — parse ZCL frame
         log::info!(
             "[Runtime] ZCL frame: ep={} cluster=0x{:04X} from 0x{:04X} len={}",
-            dst_ep, cluster_id, src_addr, aps_indication.payload.len()
+            dst_ep,
+            cluster_id,
+            src_addr,
+            aps_indication.payload.len()
         );
         let zcl_frame = match ZclFrame::parse(aps_indication.payload) {
             Ok(f) => f,

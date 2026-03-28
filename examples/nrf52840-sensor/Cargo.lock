@@ -927,6 +927,8 @@ dependencies = [
 name = "zigbee-aps"
 version = "0.1.0"
 dependencies = [
+ "aes",
+ "ccm",
  "heapless 0.9.2",
  "log",
  "zigbee-mac",
@@ -944,6 +946,7 @@ dependencies = [
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-types",
+ "zigbee-zcl",
  "zigbee-zdo",
 ]
 

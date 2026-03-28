@@ -266,7 +266,11 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         let mut pan_descriptors = heapless::Vec::new();
         let mut energy_list = heapless::Vec::new();
 
-        log::info!("[nRF MLME-SCAN] Starting {:?} scan, duration={}", req.scan_type, req.scan_duration);
+        log::info!(
+            "[nRF MLME-SCAN] Starting {:?} scan, duration={}",
+            req.scan_type,
+            req.scan_duration
+        );
 
         for channel in req.channel_mask.iter() {
             let ch = channel.number();
@@ -316,7 +320,10 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             return Err(MacError::NoBeacon);
         }
 
-        log::info!("[nRF MLME-SCAN] Scan complete: {} PAN descriptor(s)", pan_descriptors.len());
+        log::info!(
+            "[nRF MLME-SCAN] Scan complete: {} PAN descriptor(s)",
+            pan_descriptors.len()
+        );
 
         Ok(MlmeScanConfirm {
             scan_type: req.scan_type,
@@ -624,8 +631,8 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         let mut rx_pkt = Packet::new();
         // Absolute deadline — filtered frames don't reset the clock
         const RX_TIMEOUT_MS: u64 = 5000;
-        let deadline = embassy_time::Instant::now()
-            + embassy_time::Duration::from_millis(RX_TIMEOUT_MS);
+        let deadline =
+            embassy_time::Instant::now() + embassy_time::Duration::from_millis(RX_TIMEOUT_MS);
 
         loop {
             let now = embassy_time::Instant::now();
@@ -635,11 +642,8 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             let remaining = deadline - now;
 
             // Use remaining time, not a fresh 5s timer
-            let rx_result = select::select(
-                self.radio.receive(&mut rx_pkt),
-                Timer::after(remaining),
-            )
-            .await;
+            let rx_result =
+                select::select(self.radio.receive(&mut rx_pkt), Timer::after(remaining)).await;
 
             match rx_result {
                 select::Either::Second(_) => {
@@ -699,7 +703,10 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                         if !pan_ok || !addr_ok {
                             log::trace!(
                                 "[nRF RX] Filtered short dst: pan=0x{:04X} addr=0x{:04X} (ours: pan=0x{:04X} addr=0x{:04X})",
-                                pan.0, addr.0, self.pan_id.0, self.short_address.0
+                                pan.0,
+                                addr.0,
+                                self.pan_id.0,
+                                self.short_address.0
                             );
                             continue;
                         }
@@ -710,7 +717,8 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                         if !pan_ok || !addr_ok {
                             log::info!(
                                 "[nRF RX] Filtered ext dst: pan=0x{:04X} (ours: 0x{:04X})",
-                                pan.0, self.pan_id.0
+                                pan.0,
+                                self.pan_id.0
                             );
                             continue;
                         }
@@ -718,7 +726,11 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                 }
             }
 
-            log::info!("[nRF RX] Accepted frame {} bytes, LQI {}", data.len(), rx_pkt.lqi());
+            log::info!(
+                "[nRF RX] Accepted frame {} bytes, LQI {}",
+                data.len(),
+                rx_pkt.lqi()
+            );
 
             let payload_data = &data[header_len..];
             if let Some(mac_frame) = MacFrame::from_slice(payload_data) {

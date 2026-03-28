@@ -264,11 +264,7 @@ impl MacDriver for EspMac<'_> {
             .map_err(|_| MacError::RadioError)?;
 
         // Wait for response — parent may reply with data or empty ACK
-        let result = select::select(
-            Timer::after_millis(500),
-            self.driver.receive(),
-        )
-        .await;
+        let result = select::select(Timer::after_millis(500), self.driver.receive()).await;
 
         match result {
             select::Either::Second(Ok(received)) => {
@@ -279,8 +275,8 @@ impl MacDriver for EspMac<'_> {
                 if frame_type != 0x01 {
                     return Ok(None); // Not a data frame
                 }
-                let payload = MacFrame::from_slice(&received.data[..received.len])
-                    .unwrap_or_default();
+                let payload =
+                    MacFrame::from_slice(&received.data[..received.len]).unwrap_or_default();
                 Ok(Some(payload))
             }
             _ => Ok(None), // Timeout or error

@@ -138,7 +138,9 @@ impl<M: MacDriver> ZdoLayer<M> {
         // --- Send response ---
         log::info!(
             "[ZDO TX] rsp cluster=0x{:04X} to 0x{:04X} len={}",
-            rsp_cluster, src_short.0, rsp_len
+            rsp_cluster,
+            src_short.0,
+            rsp_len
         );
         self.send_zdp_unicast(src_short, rsp_cluster, &rsp_buf[..rsp_len])
             .await

@@ -163,14 +163,16 @@ impl<M: MacDriver> NwkLayer<M> {
 
         log::info!(
             "[NWK TX] dst=0x{:04X} next_hop=0x{:04X} sec={} len={} hdr={:02X?}",
-            dst_addr.0, next_hop.0,
+            dst_addr.0,
+            next_hop.0,
             security_enable && self.nib.security_enabled,
             total_len,
             &nwk_buf[..core::cmp::min(8, total_len)],
         );
 
         // Send via MAC
-        let mac_result = self.mac
+        let mac_result = self
+            .mac
             .mcps_data(McpsDataRequest {
                 src_addr_mode: AddressMode::Short,
                 dst_address: MacAddress::Short(self.nib.pan_id, next_hop),

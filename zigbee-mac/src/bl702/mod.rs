@@ -565,11 +565,7 @@ impl MacDriver for Bl702Mac {
             .map_err(|_| MacError::RadioError)?;
 
         // Wait for response — parent may reply with data or empty ACK
-        let result = select::select(
-            Timer::after_millis(500),
-            self.driver.receive(),
-        )
-        .await;
+        let result = select::select(Timer::after_millis(500), self.driver.receive()).await;
 
         match result {
             select::Either::Second(Ok(received)) => {

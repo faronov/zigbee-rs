@@ -299,8 +299,10 @@ impl<M: MacDriver> ApsLayer<M> {
 
         log::info!(
             "[APS TX] ep={}/{} cl=0x{:04X} prof=0x{:04X} cnt={} hdr={:02X?}",
-            req.src_endpoint, req.dst_endpoint,
-            req.cluster_id, req.profile_id,
+            req.src_endpoint,
+            req.dst_endpoint,
+            req.cluster_id,
+            req.profile_id,
             aps_counter,
             &aps_buf[..core::cmp::min(12, total_len)],
         );
@@ -521,9 +523,16 @@ impl<M: MacDriver> ApsLayer<M> {
             log::info!("[APS RX] APS security enabled, parsing security header...");
             let parsed = crate::security::ApsSecurityHeader::parse(after_header);
             if parsed.is_none() {
-                log::warn!("[APS RX] APS security header parse FAILED, after_header len={}", after_header.len());
+                log::warn!(
+                    "[APS RX] APS security header parse FAILED, after_header len={}",
+                    after_header.len()
+                );
                 if after_header.len() >= 2 {
-                    log::warn!("[APS RX] sec_ctrl=0x{:02X} next=0x{:02X}", after_header[0], after_header[1]);
+                    log::warn!(
+                        "[APS RX] sec_ctrl=0x{:02X} next=0x{:02X}",
+                        after_header[0],
+                        after_header[1]
+                    );
                 }
                 return None;
             }
@@ -589,7 +598,10 @@ impl<M: MacDriver> ApsLayer<M> {
 
             match self.security.decrypt(aad, ciphertext, &key, &sec_hdr) {
                 Some(plaintext) => {
-                    log::info!("[APS RX] APS decrypt SUCCESS, plaintext {} bytes", plaintext.len());
+                    log::info!(
+                        "[APS RX] APS decrypt SUCCESS, plaintext {} bytes",
+                        plaintext.len()
+                    );
                     if let Some(addr) = &sec_hdr.source_address {
                         self.security.commit_frame_counter(
                             addr,
@@ -709,7 +721,11 @@ impl<M: MacDriver> ApsLayer<M> {
                 }
                 let cmd_id = cmd_payload[0];
                 let cmd_data = &cmd_payload[1..];
-                log::info!("[APS RX] Command ID=0x{:02X}, data_len={}", cmd_id, cmd_data.len());
+                log::info!(
+                    "[APS RX] Command ID=0x{:02X}, data_len={}",
+                    cmd_id,
+                    cmd_data.len()
+                );
                 match crate::frames::ApsCommandId::from_u8(cmd_id) {
                     Some(crate::frames::ApsCommandId::TransportKey) => {
                         self.handle_transport_key(cmd_data, nwk_src);
