@@ -28,8 +28,6 @@
 #![no_std]
 #![no_main]
 
-extern crate alloc;
-
 use panic_halt as _;
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
@@ -52,10 +50,6 @@ mod time_driver {
     struct Bl702TimeDriver {
         alarm_at: AtomicU64,
     }
-
-    static DRIVER: Bl702TimeDriver = Bl702TimeDriver {
-        alarm_at: AtomicU64::new(u64::MAX),
-    };
 
     // BL702 TIMER registers (TIMER_CH0)
     const TIMER_BASE: usize = 0x4000_A500;
@@ -103,7 +97,9 @@ mod time_driver {
         }
     }
 
-    embassy_time_driver::time_driver_impl!(static DRIVER: Bl702TimeDriver);
+    embassy_time_driver::time_driver_impl!(static DRIVER: Bl702TimeDriver = Bl702TimeDriver {
+        alarm_at: AtomicU64::new(u64::MAX),
+    });
 }
 
 // ── BL702 GPIO helper for button ───────────────────────────────
@@ -130,9 +126,22 @@ mod gpio {
 
 // ── UART logger for debug output ───────────────────────────────
 mod uart_log {
+    use core::fmt::Write;
+
     const UART_BASE: usize = 0x4000_A000;
     const UART_FIFO_WDATA: *mut u32 = (UART_BASE + 0x88) as *mut u32;
     const UART_FIFO_STATUS: *const u32 = (UART_BASE + 0x84) as *const u32;
+
+    struct UartWriter;
+
+    impl Write for UartWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for b in s.bytes() {
+                write_byte(b);
+            }
+            Ok(())
+        }
+    }
 
     pub struct Bl702Logger;
 
@@ -143,12 +152,8 @@ mod uart_log {
 
         fn log(&self, record: &log::Record) {
             if self.enabled(record.metadata()) {
-                let _ = write_str("[");
-                let _ = write_str(record.level().as_str());
-                let _ = write_str("] ");
-                // Simple: just print the message as debug format
-                let _ = write_str(&format_args_to_str(record.args()));
-                let _ = write_str("\r\n");
+                let mut w = UartWriter;
+                let _ = write!(w, "[{}] {}\r\n", record.level(), record.args());
             }
         }
 
@@ -157,7 +162,7 @@ mod uart_log {
 
     fn write_byte(b: u8) {
         unsafe {
-            // Wait for TX FIFO not full (bit 6 = tx_fifo_cnt > 0 means space)
+            // Wait for TX FIFO not full
             for _ in 0..10000u32 {
                 let status = core::ptr::read_volatile(UART_FIFO_STATUS);
                 if (status >> 8) & 0x3F < 32 {
@@ -166,18 +171,6 @@ mod uart_log {
             }
             core::ptr::write_volatile(UART_FIFO_WDATA, b as u32);
         }
-    }
-
-    fn write_str(s: &str) -> core::fmt::Result {
-        for b in s.bytes() {
-            write_byte(b);
-        }
-        Ok(())
-    }
-
-    fn format_args_to_str(_args: &core::fmt::Arguments) -> &'static str {
-        // Simplified: actual formatting would need alloc or a static buffer
-        ""
     }
 
     static LOGGER: Bl702Logger = Bl702Logger;
