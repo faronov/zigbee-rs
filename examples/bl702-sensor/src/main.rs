@@ -31,6 +31,10 @@
 #[cfg(feature = "stubs")]
 mod stubs;
 
+// Always include HAL implementations for vendor library dependencies
+// (delay, IRQ, GPIO, memcpy). These are needed even with real vendor libs.
+mod hal;
+
 use panic_halt as _;
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
