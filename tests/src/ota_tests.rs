@@ -439,6 +439,7 @@ fn ota_manager_full_download_flow() {
         endpoint: 1,
         block_size: 48,
         auto_accept: true,
+        hardware_version: None,
     };
     let mut mgr = OtaManager::new(writer, config);
 
@@ -458,7 +459,7 @@ fn ota_manager_full_download_flow() {
     resp[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
     resp[5..9].copy_from_slice(&0x00000002u32.to_le_bytes());
     resp[9..13].copy_from_slice(&ota_total.to_le_bytes());
-    let event = mgr.handle_incoming(0x02, &resp);
+    let event = mgr.handle_incoming(0x02, &resp, None);
     // First block request should emit OtaImageAvailable
     assert!(event.is_some());
     assert!(mgr.take_pending_frame().is_some()); // Block request queued
@@ -479,7 +480,7 @@ fn ota_manager_full_download_flow() {
         block[13] = chunk_len as u8;
         block[14..14 + chunk_len].copy_from_slice(chunk);
 
-        let event = mgr.handle_incoming(0x05, &block[..14 + chunk_len]);
+        let event = mgr.handle_incoming(0x05, &block[..14 + chunk_len], None);
         assert!(event.is_some()); // Progress event
 
         // Tick to process write → next block request
@@ -499,7 +500,7 @@ fn ota_manager_full_download_flow() {
     end_resp[8..12].copy_from_slice(&1000u32.to_le_bytes()); // current_time
     end_resp[12..16].copy_from_slice(&0u32.to_le_bytes()); // upgrade NOW
 
-    let event = mgr.handle_incoming(0x07, &end_resp);
+    let event = mgr.handle_incoming(0x07, &end_resp, None);
     assert!(event.is_some()); // OtaComplete
 }
 
@@ -517,6 +518,7 @@ fn ota_manager_rejects_wrong_manufacturer() {
         endpoint: 1,
         block_size: 64,
         auto_accept: true,
+        hardware_version: None,
     };
     let mut mgr = OtaManager::new(writer, config);
 
@@ -535,7 +537,7 @@ fn ota_manager_rejects_wrong_manufacturer() {
     resp[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
     resp[5..9].copy_from_slice(&0x00000002u32.to_le_bytes());
     resp[9..13].copy_from_slice(&ota_total.to_le_bytes());
-    mgr.handle_incoming(0x02, &resp);
+    mgr.handle_incoming(0x02, &resp, None);
     mgr.take_pending_frame();
 
     // Send first block — must be >= 56 bytes to trigger header parsing
@@ -550,7 +552,7 @@ fn ota_manager_rejects_wrong_manufacturer() {
     block[13] = chunk_len as u8;
     block[14..14 + chunk_len].copy_from_slice(chunk);
 
-    let event = mgr.handle_incoming(0x05, &block[..14 + chunk_len]);
+    let event = mgr.handle_incoming(0x05, &block[..14 + chunk_len], None);
     // Should get OtaFailed because manufacturer mismatch
     assert!(matches!(event, Some(StackEvent::OtaFailed)));
 }

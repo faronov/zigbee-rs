@@ -18,7 +18,7 @@ use zigbee_zcl::clusters::ota::{
     self, ImageBlockRequest, OtaAction, OtaCluster, OtaState, QueryNextImageRequest,
     UpgradeEndRequest,
 };
-use zigbee_zcl::clusters::ota_image::OtaImageHeader;
+use zigbee_zcl::clusters::ota_image::{OtaImageHeader, OtaSubElement, OtaTagId};
 use zigbee_zcl::frame::ZclFrame;
 use zigbee_zcl::{ClusterDirection, CommandId};
 
@@ -37,6 +37,8 @@ pub struct OtaConfig {
     pub block_size: u8,
     /// Auto-accept OTA images (if false, app must call accept_ota()).
     pub auto_accept: bool,
+    /// Hardware version (included in QueryNextImageRequest if set).
+    pub hardware_version: Option<u16>,
 }
 
 impl Default for OtaConfig {
@@ -48,6 +50,7 @@ impl Default for OtaConfig {
             endpoint: 1,
             block_size: ota::DEFAULT_BLOCK_SIZE,
             auto_accept: true,
+            hardware_version: None,
         }
     }
 }
@@ -83,6 +86,8 @@ pub struct OtaManager<F: FirmwareWriter> {
     zcl_seq: u8,
     /// Download context — tracks header parsing and payload offset.
     download_ctx: OtaDownloadCtx,
+    /// Whether an image query was accepted (for auto_accept=false mode).
+    query_pending_accept: bool,
 }
 
 /// Tracks OTA file header parsing and firmware write offset during download.
@@ -90,8 +95,8 @@ struct OtaDownloadCtx {
     /// Whether the OTA image header has been parsed from initial blocks.
     header_parsed: bool,
     /// Buffer for accumulating header bytes from early blocks.
-    header_buf: heapless::Vec<u8, 72>,
-    /// Bytes to skip at start of OTA file (header_length + 6 for sub-element header).
+    header_buf: heapless::Vec<u8, 128>,
+    /// Bytes to skip at start of OTA file (header + sub-element headers before firmware).
     skip_bytes: u32,
     /// Actual firmware payload size (total_image_size - skip_bytes).
     firmware_size: u32,
@@ -132,6 +137,9 @@ impl<F: FirmwareWriter> OtaManager<F> {
             config.current_version,
         );
         cluster.set_block_size(config.block_size);
+        if let Some(hw) = config.hardware_version {
+            cluster.set_hardware_version(hw);
+        }
 
         Self {
             cluster,
@@ -141,6 +149,7 @@ impl<F: FirmwareWriter> OtaManager<F> {
             need_next_block: false,
             zcl_seq: 0,
             download_ctx: OtaDownloadCtx::new(),
+            query_pending_accept: false,
         }
     }
 
@@ -172,7 +181,18 @@ impl<F: FirmwareWriter> OtaManager<F> {
     }
 
     /// Process an incoming OTA server→client command.
-    pub fn handle_incoming(&mut self, cmd_id: u8, payload: &[u8]) -> Option<StackEvent> {
+    ///
+    /// `server_ieee` is the IEEE address of the sender (for UpgradeServerID).
+    pub fn handle_incoming(
+        &mut self,
+        cmd_id: u8,
+        payload: &[u8],
+        server_ieee: Option<u64>,
+    ) -> Option<StackEvent> {
+        // Update UpgradeServerID from the server that sent us a command
+        if let Some(ieee) = server_ieee {
+            self.cluster.set_upgrade_server_id(ieee);
+        }
         let action = self.cluster.process_server_command(cmd_id, payload);
         self.process_action(action)
     }
@@ -230,6 +250,24 @@ impl<F: FirmwareWriter> OtaManager<F> {
         self.pending_frame = None;
         self.need_next_block = false;
         self.download_ctx.reset();
+        self.query_pending_accept = false;
+    }
+
+    /// Accept a pending OTA image (for auto_accept=false mode).
+    /// Call this after receiving OtaImageAvailable to start the download.
+    pub fn accept_ota(&mut self) -> Option<StackEvent> {
+        if self.query_pending_accept {
+            self.query_pending_accept = false;
+            // Re-query — the cluster will transition to Downloading
+            self.start_query()
+        } else {
+            None
+        }
+    }
+
+    /// Set the OTA server's IEEE address (UpgradeServerID attribute).
+    pub fn set_upgrade_server_id(&mut self, ieee: u64) {
+        self.cluster.set_upgrade_server_id(ieee);
     }
 
     /// Process an OtaAction into a StackEvent and/or queue an outgoing frame.
@@ -242,6 +280,25 @@ impl<F: FirmwareWriter> OtaManager<F> {
                 None
             }
             OtaAction::SendBlockRequest(req) => {
+                // If auto_accept is false and this is the start of download,
+                // pause and wait for app to call accept_ota()
+                if !self.config.auto_accept
+                    && req.file_offset == 0
+                    && !self.download_ctx.slot_erased
+                {
+                    self.query_pending_accept = true;
+                    let version = self.cluster.target_version();
+                    let total = match self.cluster.state() {
+                        OtaState::Downloading { total_size, .. } => total_size,
+                        _ => 0,
+                    };
+                    self.cluster.abort(); // go back to idle until accepted
+                    return Some(StackEvent::OtaImageAvailable {
+                        version,
+                        size: total,
+                    });
+                }
+
                 // Erase slot before first block if not done yet
                 if !self.download_ctx.slot_erased {
                     match self.writer.erase_slot() {
@@ -341,9 +398,41 @@ impl<F: FirmwareWriter> OtaManager<F> {
                             return Err(FirmwareError::VerifyFailed);
                         }
 
-                        // Sub-element header is 6 bytes (tag u16 + length u32)
-                        let skip = header_len as u32 + 6;
-                        let fw_size = header.total_image_size.saturating_sub(skip);
+                        // Scan sub-element headers to find the UpgradeImage payload.
+                        // OTA file layout: [header][sub-elem1][sub-elem2]...
+                        // Each sub-element: tag(2) + length(4) + data(length)
+                        let mut scan_offset = header_len;
+                        let mut found_upgrade_image = false;
+                        let mut fw_size = 0u32;
+
+                        while scan_offset + 6 <= self.download_ctx.header_buf.len() {
+                            match OtaSubElement::parse(&self.download_ctx.header_buf[scan_offset..])
+                            {
+                                Ok((sub_elem, _)) => {
+                                    if sub_elem.tag == OtaTagId::UpgradeImage {
+                                        // Found the firmware payload sub-element
+                                        fw_size = sub_elem.length;
+                                        found_upgrade_image = true;
+                                        scan_offset += 6; // skip sub-element header
+                                        break;
+                                    }
+                                    // Skip this sub-element entirely (header + data)
+                                    scan_offset += 6 + sub_elem.length as usize;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+
+                        if !found_upgrade_image {
+                            // Fallback: assume single sub-element right after header
+                            scan_offset = header_len + 6;
+                            fw_size = header.total_image_size.saturating_sub(scan_offset as u32);
+                            log::warn!(
+                                "[OTA] No UpgradeImage tag found, assuming single sub-element"
+                            );
+                        }
+
+                        let skip = scan_offset as u32;
 
                         log::info!(
                             "[OTA] Header parsed: version=0x{:08X} header={}B skip={}B firmware={}B",
@@ -373,7 +462,7 @@ impl<F: FirmwareWriter> OtaManager<F> {
                             let payload_start = skip as usize;
                             let buf_ref = &self.download_ctx.header_buf;
                             // Copy payload bytes to a temp buffer to avoid borrow conflict
-                            let mut tmp = [0u8; 72];
+                            let mut tmp = [0u8; 128];
                             let plen = buf_ref.len() - payload_start;
                             tmp[..plen].copy_from_slice(&buf_ref[payload_start..]);
                             self.writer.write_block(0, &tmp[..plen])?;

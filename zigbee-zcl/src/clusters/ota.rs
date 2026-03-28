@@ -368,6 +368,8 @@ pub struct OtaCluster {
     target_size: u32,
     /// Block size to request.
     block_size: u8,
+    /// Hardware version (included in QueryNextImageRequest if set).
+    hardware_version: Option<u16>,
 }
 
 impl OtaCluster {
@@ -472,6 +474,7 @@ impl OtaCluster {
             target_version: 0,
             target_size: 0,
             block_size: DEFAULT_BLOCK_SIZE,
+            hardware_version: None,
         }
     }
 
@@ -490,18 +493,31 @@ impl OtaCluster {
         self.block_size = size.min(64);
     }
 
+    /// Set the hardware version for this device (sent in QueryNextImageRequest).
+    pub fn set_hardware_version(&mut self, hw_version: u16) {
+        self.hardware_version = Some(hw_version);
+    }
+
+    /// Set the UpgradeServerID attribute (IEEE address of the OTA server).
+    pub fn set_upgrade_server_id(&mut self, ieee: u64) {
+        let _ = self
+            .store
+            .set(ATTR_UPGRADE_SERVER_ID, ZclValue::IeeeAddr(ieee));
+    }
+
     /// Build a Query Next Image Request to initiate an OTA check.
     pub fn start_query(&mut self) -> OtaAction {
         self.state = OtaState::QuerySent;
         let _ = self
             .store
             .set(ATTR_IMAGE_UPGRADE_STATUS, ZclValue::Enum8(STATUS_NORMAL));
+        let hw = self.hardware_version;
         OtaAction::SendQuery(QueryNextImageRequest {
-            field_control: 0x00,
+            field_control: if hw.is_some() { 0x01 } else { 0x00 },
             manufacturer_code: self.manufacturer_code,
             image_type: self.image_type,
             current_file_version: self.current_version,
-            hardware_version: None,
+            hardware_version: hw,
         })
     }
 
@@ -618,7 +634,36 @@ impl OtaCluster {
 
     // ── Private command handlers ─────────────────────────────
 
-    fn handle_image_notify(&mut self, _payload: &[u8]) -> OtaAction {
+    fn handle_image_notify(&mut self, payload: &[u8]) -> OtaAction {
+        // ImageNotify payload type determines what fields are present:
+        //   0 = jitter only, 1 = +mfg, 2 = +image_type, 3 = +version
+        // If fields are present and don't match our device, ignore.
+        if !payload.is_empty() {
+            let payload_type = payload[0];
+
+            if payload_type >= 1 && payload.len() >= 4 {
+                let mfg = u16::from_le_bytes([payload[2], payload[3]]);
+                if mfg != 0xFFFF && mfg != self.manufacturer_code {
+                    log::debug!("[OTA] ImageNotify mfg 0x{:04X} not for us", mfg);
+                    return OtaAction::None;
+                }
+            }
+            if payload_type >= 2 && payload.len() >= 6 {
+                let img = u16::from_le_bytes([payload[4], payload[5]]);
+                if img != 0xFFFF && img != self.image_type {
+                    log::debug!("[OTA] ImageNotify type 0x{:04X} not for us", img);
+                    return OtaAction::None;
+                }
+            }
+            if payload_type >= 3 && payload.len() >= 10 {
+                let ver = u32::from_le_bytes([payload[6], payload[7], payload[8], payload[9]]);
+                if ver != 0xFFFFFFFF && ver == self.current_version {
+                    log::debug!("[OTA] ImageNotify version matches current, ignoring");
+                    return OtaAction::None;
+                }
+            }
+        }
+
         log::info!("[OTA] Image Notify received — starting query");
         self.start_query()
     }
@@ -812,12 +857,41 @@ impl Cluster for OtaCluster {
 
     fn handle_command(
         &mut self,
-        _cmd_id: CommandId,
-        _payload: &[u8],
+        cmd_id: CommandId,
+        payload: &[u8],
     ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
-        // OTA commands are handled by process_server_command() through the runtime,
-        // not through the generic Cluster dispatch.
-        Err(ZclStatus::UnsupClusterCommand)
+        // Route server→client OTA commands through the state machine.
+        // The result is an OtaAction which the runtime must pick up via
+        // process_server_command() — here we just validate the command is known.
+        match cmd_id.0 {
+            0x00 | 0x02 | 0x05 | 0x07 => {
+                // Known server→client commands: ImageNotify, QueryResponse,
+                // BlockResponse, EndResponse — processed via process_server_command()
+                let _ = self.process_server_command(cmd_id.0, payload);
+                // Return empty response — OTA doesn't send ZCL default responses
+                Ok(heapless::Vec::new())
+            }
+            _ => Err(ZclStatus::UnsupClusterCommand),
+        }
+    }
+
+    fn received_commands(&self) -> heapless::Vec<u8, 32> {
+        // Server→client commands this cluster receives
+        let mut cmds = heapless::Vec::new();
+        let _ = cmds.push(CMD_IMAGE_NOTIFY.0);
+        let _ = cmds.push(CMD_QUERY_NEXT_IMAGE_RESPONSE.0);
+        let _ = cmds.push(CMD_IMAGE_BLOCK_RESPONSE.0);
+        let _ = cmds.push(CMD_UPGRADE_END_RESPONSE.0);
+        cmds
+    }
+
+    fn generated_commands(&self) -> heapless::Vec<u8, 32> {
+        // Client→server commands this cluster generates
+        let mut cmds = heapless::Vec::new();
+        let _ = cmds.push(CMD_QUERY_NEXT_IMAGE_REQUEST.0);
+        let _ = cmds.push(CMD_IMAGE_BLOCK_REQUEST.0);
+        let _ = cmds.push(CMD_UPGRADE_END_REQUEST.0);
+        cmds
     }
 
     fn attributes(&self) -> &dyn AttributeStoreAccess {
