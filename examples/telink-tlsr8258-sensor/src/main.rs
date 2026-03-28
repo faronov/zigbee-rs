@@ -26,6 +26,9 @@
 #![no_std]
 #![no_main]
 
+#[cfg(feature = "stubs")]
+mod stubs;
+
 use panic_halt as _;
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;

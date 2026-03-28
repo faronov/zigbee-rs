@@ -21,6 +21,10 @@
 #![no_std]
 #![no_main]
 
+#[cfg(feature = "stubs")]
+mod stubs;
+
+use cortex_m as _;
 use panic_halt as _;
 
 use embassy_executor::Spawner;

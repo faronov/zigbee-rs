@@ -30,6 +30,10 @@ log = "0.4"
 # Panic handler for embedded target
 panic-halt = "1.0"
 
+[features]
+default = []
+stubs = []
+
 [profile.release]
 opt-level = "s"
 lto = true

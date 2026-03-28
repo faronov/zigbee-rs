@@ -33,6 +33,10 @@ panic-halt = "1.0"
 # Portable-atomic for single-core RISC-V
 portable-atomic = { version = "1", features = ["unsafe-assume-single-core"] }
 
+[features]
+default = []
+stubs = []
+
 [profile.release]
 opt-level = "s"
 lto = true

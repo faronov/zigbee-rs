@@ -30,6 +30,10 @@ panic-halt = "1.0"
 # Portable atomics for Cortex-M0+ (no native atomics)
 portable-atomic = { version = "1", features = ["unsafe-assume-single-core"] }
 
+[features]
+default = []
+stubs = []
+
 [profile.release]
 opt-level = "s"
 lto = true

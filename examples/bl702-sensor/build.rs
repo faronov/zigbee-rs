@@ -11,6 +11,7 @@ fn main() {
 
     // Linker script
     println!("cargo:rustc-link-arg=-Tmemory.x");
+    println!("cargo:rustc-link-arg=-Tlink.x");
 
     // Link the Bouffalo lmac154 static library (downloaded in CI or placed manually)
     if let Ok(lib_dir) = env::var("LMAC154_LIB_DIR") {

@@ -238,18 +238,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: riscv32imac-unknown-none-elf
-          components: rust-src
+          components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: examples/bl702-sensor
-      - name: Check BL702 sensor compiles
+      - name: Build BL702 sensor (release)
         working-directory: examples/bl702-sensor
+        run: cargo build --release --features stubs -Z build-std=core,alloc
+      - name: Create firmware artifacts
         run: |
-          # BL702 uses FFI to liblmac154.a (compiled for riscv32imafc with FPU).
-          # Full link requires matching float ABI + the precompiled library.
-          # CI verifies compilation; full firmware build is done locally with
-          # the Bouffalo toolchain.
-          cargo check --release -Z build-std=core,alloc
+          ELF=examples/bl702-sensor/target/riscv32imac-unknown-none-elf/release/bl702-sensor
+          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          $OBJCOPY -O binary $ELF ${ELF}.bin
+          $OBJCOPY -O ihex   $ELF ${ELF}.hex
+      - name: Upload BL702 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: bl702-sensor-firmware
+          path: |
+            examples/bl702-sensor/target/riscv32imac-unknown-none-elf/release/bl702-sensor.bin
+            examples/bl702-sensor/target/riscv32imac-unknown-none-elf/release/bl702-sensor.hex
 
   # ── CC2340 (TI, ARM Cortex-M0+) ────────────────────────────
   build-cc2340:
@@ -260,17 +268,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: thumbv6m-none-eabi
-          components: rust-src
+          components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: examples/cc2340-sensor
-      - name: Check CC2340 sensor compiles
+      - name: Build CC2340 sensor (release)
         working-directory: examples/cc2340-sensor
+        run: cargo build --release --features stubs
+      - name: Create firmware artifacts
         run: |
-          # CC2340 uses FFI to TI's RCL library (rcl_cc23x0r5.a) and
-          # RF firmware patches. Full link requires TI SimpleLink SDK.
-          # CI verifies compilation; full firmware build is done locally.
-          cargo check --release
+          ELF=examples/cc2340-sensor/target/thumbv6m-none-eabi/release/cc2340-sensor
+          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          $OBJCOPY -O binary $ELF ${ELF}.bin
+          $OBJCOPY -O ihex   $ELF ${ELF}.hex
+      - name: Upload CC2340 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc2340-sensor-firmware
+          path: |
+            examples/cc2340-sensor/target/thumbv6m-none-eabi/release/cc2340-sensor.bin
+            examples/cc2340-sensor/target/thumbv6m-none-eabi/release/cc2340-sensor.hex
 
   build-telink-b91:
     name: Build Telink B91 sensor
@@ -280,17 +297,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: riscv32imc-unknown-none-elf
-          components: rust-src
+          components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: examples/telink-b91-sensor
-      - name: Check Telink B91 sensor compiles
+      - name: Build Telink B91 sensor (release)
         working-directory: examples/telink-b91-sensor
+        run: cargo build --release --features stubs
+      - name: Create firmware artifacts
         run: |
-          # Telink B91 uses FFI to Telink's tl_zigbee_sdk radio driver
-          # (libdrivers_b91.a). Full link requires Telink SDK.
-          # CI verifies compilation; full firmware build is done locally.
-          cargo check --release
+          ELF=examples/telink-b91-sensor/target/riscv32imc-unknown-none-elf/release/telink-b91-sensor
+          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          $OBJCOPY -O binary $ELF ${ELF}.bin
+          $OBJCOPY -O ihex   $ELF ${ELF}.hex
+      - name: Upload Telink B91 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: telink-b91-sensor-firmware
+          path: |
+            examples/telink-b91-sensor/target/riscv32imc-unknown-none-elf/release/telink-b91-sensor.bin
+            examples/telink-b91-sensor/target/riscv32imc-unknown-none-elf/release/telink-b91-sensor.hex
 
   build-telink-tlsr8258:
     name: Build Telink TLSR8258 sensor
@@ -300,17 +326,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: thumbv6m-none-eabi
-          components: rust-src
+          components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: examples/telink-tlsr8258-sensor
-      - name: Check Telink TLSR8258 sensor compiles
+      - name: Build Telink TLSR8258 sensor (release)
         working-directory: examples/telink-tlsr8258-sensor
+        run: cargo build --release --features stubs
+      - name: Create firmware artifacts
         run: |
-          # TLSR8258 uses Telink's tc32 ISA (no Rust target). We use
-          # thumbv6m-none-eabi as a cargo check stand-in to verify Rust
-          # code compiles. Real builds use the Telink tc32 GCC toolchain.
-          cargo check --release
+          ELF=examples/telink-tlsr8258-sensor/target/thumbv6m-none-eabi/release/telink-tlsr8258-sensor
+          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          $OBJCOPY -O binary $ELF ${ELF}.bin
+          $OBJCOPY -O ihex   $ELF ${ELF}.hex
+      - name: Upload Telink TLSR8258 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: telink-tlsr8258-sensor-firmware
+          path: |
+            examples/telink-tlsr8258-sensor/target/thumbv6m-none-eabi/release/telink-tlsr8258-sensor.bin
+            examples/telink-tlsr8258-sensor/target/thumbv6m-none-eabi/release/telink-tlsr8258-sensor.hex
 
   # ── Deploy Web Flasher to GitHub Pages ──────────────────────
   # Bundles the flasher HTML with latest ESP firmware binaries
