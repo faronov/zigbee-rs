@@ -313,10 +313,9 @@ impl ThermostatCluster {
             }
             _ => SYSTEM_MODE_OFF,
         };
-        let _ = self.store.set_raw(
-            ATTR_THERMOSTAT_RUNNING_MODE,
-            ZclValue::Enum8(running_mode),
-        );
+        let _ = self
+            .store
+            .set_raw(ATTR_THERMOSTAT_RUNNING_MODE, ZclValue::Enum8(running_mode));
     }
 }
 

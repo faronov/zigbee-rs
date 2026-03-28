@@ -765,8 +765,12 @@ impl Cluster for ColorControlCluster {
                         } else {
                             1
                         };
-                        self.transitions
-                            .start(ATTR_COLOR_TEMPERATURE_MIREDS.0, current as i32, target as i32, time_ds);
+                        self.transitions.start(
+                            ATTR_COLOR_TEMPERATURE_MIREDS.0,
+                            current as i32,
+                            target as i32,
+                            time_ds,
+                        );
                     }
                     0x03 => {
                         // Move down
@@ -777,8 +781,12 @@ impl Cluster for ColorControlCluster {
                         } else {
                             1
                         };
-                        self.transitions
-                            .start(ATTR_COLOR_TEMPERATURE_MIREDS.0, current as i32, target as i32, time_ds);
+                        self.transitions.start(
+                            ATTR_COLOR_TEMPERATURE_MIREDS.0,
+                            current as i32,
+                            target as i32,
+                            time_ds,
+                        );
                     }
                     _ => {
                         // Stop
@@ -816,8 +824,12 @@ impl Cluster for ColorControlCluster {
                         .store
                         .set_raw(ATTR_COLOR_TEMPERATURE_MIREDS, ZclValue::U16(target as u16));
                 } else {
-                    self.transitions
-                        .start(ATTR_COLOR_TEMPERATURE_MIREDS.0, current, target, transition);
+                    self.transitions.start(
+                        ATTR_COLOR_TEMPERATURE_MIREDS.0,
+                        current,
+                        target,
+                        transition,
+                    );
                 }
                 Ok(heapless::Vec::new())
             }

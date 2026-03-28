@@ -97,16 +97,7 @@ impl<'a> EspMac<'a> {
 
         // Convert MAC-48 to EUI-64 by inserting FF:FE in middle
         // and flipping the universal/local bit (bit 1 of byte 0)
-        [
-            mac0 ^ 0x02,
-            mac1,
-            mac2,
-            0xFF,
-            0xFE,
-            mac3,
-            mac4,
-            mac5,
-        ]
+        [mac0 ^ 0x02, mac1, mac2, 0xFF, 0xFE, mac3, mac4, mac5]
     }
 
     fn next_dsn(&mut self) -> u8 {

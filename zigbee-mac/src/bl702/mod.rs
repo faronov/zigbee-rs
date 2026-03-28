@@ -194,9 +194,11 @@ impl Bl702Mac {
             loop {
                 match self.driver.receive().await {
                     Ok(rx_frame) => {
-                        if let Some(desc) =
-                            Self::parse_beacon(&rx_frame.data[..rx_frame.len], rx_frame.lqi, channel)
-                        {
+                        if let Some(desc) = Self::parse_beacon(
+                            &rx_frame.data[..rx_frame.len],
+                            rx_frame.lqi,
+                            channel,
+                        ) {
                             let _ = results.push(desc);
                         }
                     }
@@ -239,8 +241,10 @@ impl Bl702Mac {
             return None;
         }
 
-        let sf_raw =
-            u16::from_le_bytes([frame_data[superframe_offset], frame_data[superframe_offset + 1]]);
+        let sf_raw = u16::from_le_bytes([
+            frame_data[superframe_offset],
+            frame_data[superframe_offset + 1],
+        ]);
         let superframe_spec = SuperframeSpec::from_raw(sf_raw);
 
         // Zigbee beacon payload follows superframe + GTS(1) + pending(1)
@@ -452,10 +456,8 @@ impl MacDriver for Bl702Mac {
                         }
                         // Association Response = command ID 0x02
                         if data[cmd_offset] == 0x02 {
-                            let short_addr = u16::from_le_bytes([
-                                data[cmd_offset + 1],
-                                data[cmd_offset + 2],
-                            ]);
+                            let short_addr =
+                                u16::from_le_bytes([data[cmd_offset + 1], data[cmd_offset + 2]]);
                             let status = match data[cmd_offset + 3] {
                                 0x00 => AssociationStatus::Success,
                                 0x01 => AssociationStatus::PanAtCapacity,
@@ -720,8 +722,7 @@ impl MacDriver for Bl702Mac {
             }
             let remaining = deadline - now;
 
-            let rx_result =
-                select::select(self.driver.receive(), Timer::after(remaining)).await;
+            let rx_result = select::select(self.driver.receive(), Timer::after(remaining)).await;
 
             match rx_result {
                 select::Either::Second(_) => {

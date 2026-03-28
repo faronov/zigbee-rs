@@ -368,8 +368,7 @@ impl<M: MacDriver> ApsLayer<M> {
             }
         };
         let local_ieee = self.nwk.nib().ieee_address;
-        let hash =
-            crate::security::compute_verify_key_hash(&local_ieee, &key);
+        let hash = crate::security::compute_verify_key_hash(&local_ieee, &key);
         let key_type_byte = req.key_type as u8;
         match self
             .send_verify_key(dst_short, &local_ieee, key_type_byte, &hash)

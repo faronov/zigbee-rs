@@ -346,11 +346,8 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
 
                     // Brief listen to let AGC settle and capture RSSI
                     let mut dummy = Packet::new();
-                    let _ = select::select(
-                        Timer::after_millis(2),
-                        self.radio.receive(&mut dummy),
-                    )
-                    .await;
+                    let _ = select::select(Timer::after_millis(2), self.radio.receive(&mut dummy))
+                        .await;
 
                     // Read RSSISAMPLE (value is positive dBm magnitude, negate for actual)
                     let rssi_raw = unsafe { core::ptr::read_volatile(RSSISAMPLE) } as u8;
