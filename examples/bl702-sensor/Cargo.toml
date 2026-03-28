@@ -11,11 +11,27 @@ zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 
-# BL702 PAC (register-level access for clock/GPIO init)
+# BL702 PAC (register-level access for clock/GPIO/timer init)
 bl702-pac = "0.0.3"
+
+# Embassy async runtime (executor + time driver)
+embassy-executor = { version = "0.7", features = ["arch-riscv32"] }
+embassy-time = { version = "0.5" }
+embassy-time-driver = "0.2"
+embassy-futures = "0.1"
+
+# RISC-V support
+riscv = { version = "0.12", features = ["critical-section-single-hart"] }
+riscv-rt = "0.13"
+
+# Logging
+log = "0.4"
 
 # Panic handler for embedded target
 panic-halt = "1.0"
+
+# Portable-atomic for single-core RISC-V
+portable-atomic = { version = "1", features = ["unsafe-assume-single-core"] }
 
 [profile.release]
 opt-level = "s"
