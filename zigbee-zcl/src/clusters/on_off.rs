@@ -90,6 +90,52 @@ impl OnOffCluster {
     fn set_on_off(&mut self, on: bool) {
         let _ = self.store.set_raw(ATTR_ON_OFF, ZclValue::Bool(on));
     }
+
+    /// Tick the On/Off cluster timers (call every 100ms = 1/10th second).
+    ///
+    /// OnTime and OffWaitTime are in 1/10th seconds per ZCL spec.
+    /// When OnTime reaches 0 while the device is on, it turns off and
+    /// OffWaitTime begins counting down.
+    pub fn tick(&mut self) {
+        let on_time = match self.store.get(ATTR_ON_TIME) {
+            Some(ZclValue::U16(v)) => *v,
+            _ => 0,
+        };
+        let off_wait = match self.store.get(ATTR_OFF_WAIT_TIME) {
+            Some(ZclValue::U16(v)) => *v,
+            _ => 0,
+        };
+
+        if self.is_on() && on_time > 0 {
+            let new_on = on_time.saturating_sub(1);
+            let _ = self.store.set_raw(ATTR_ON_TIME, ZclValue::U16(new_on));
+            if new_on == 0 {
+                // OnTime expired — turn off, start off-wait countdown
+                self.set_on_off(false);
+            }
+        } else if !self.is_on() && off_wait > 0 {
+            let new_wait = off_wait.saturating_sub(1);
+            let _ = self
+                .store
+                .set_raw(ATTR_OFF_WAIT_TIME, ZclValue::U16(new_wait));
+        }
+    }
+
+    /// Apply StartUpOnOff on device power-on (ZCL spec §3.8.2.2.5).
+    ///
+    /// 0x00 = Off, 0x01 = On, 0x02 = Toggle, 0xFF = Previous (no change).
+    pub fn apply_startup(&mut self, previous_on: bool) {
+        let startup = match self.store.get(ATTR_START_UP_ON_OFF) {
+            Some(ZclValue::Enum8(v)) => *v,
+            _ => 0xFF,
+        };
+        match startup {
+            0x00 => self.set_on_off(false),
+            0x01 => self.set_on_off(true),
+            0x02 => self.set_on_off(!previous_on),
+            _ => self.set_on_off(previous_on), // 0xFF = previous
+        }
+    }
 }
 
 impl Cluster for OnOffCluster {

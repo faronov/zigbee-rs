@@ -30,6 +30,10 @@ pub const CMD_SET_SHORT_POLL_INTERVAL: CommandId = CommandId(0x03);
 pub struct PollControlCluster {
     store: AttributeStore<7>,
     fast_polling: bool,
+    /// Ticks since last check-in (1 tick = 1 quarter-second = 250ms).
+    ticks_since_checkin: u32,
+    /// Remaining fast-poll ticks (quarter-seconds).
+    fast_poll_remaining: u16,
 }
 
 impl Default for PollControlCluster {
@@ -107,6 +111,8 @@ impl PollControlCluster {
         Self {
             store,
             fast_polling: false,
+            ticks_since_checkin: 0,
+            fast_poll_remaining: 0,
         }
     }
 
@@ -115,11 +121,42 @@ impl PollControlCluster {
         heapless::Vec::new()
     }
 
+    /// Tick the poll control cluster (call every quarter-second = 250ms).
+    ///
+    /// Returns `true` when a CheckIn command should be sent to the bound client.
+    pub fn tick(&mut self) -> bool {
+        // Fast-poll timeout countdown
+        if self.fast_polling && self.fast_poll_remaining > 0 {
+            self.fast_poll_remaining = self.fast_poll_remaining.saturating_sub(1);
+            if self.fast_poll_remaining == 0 {
+                self.fast_polling = false;
+            }
+        }
+
+        // Check-in interval countdown
+        let check_in_interval = match self.store.get(ATTR_CHECK_IN_INTERVAL) {
+            Some(ZclValue::U32(v)) => *v,
+            _ => 14400,
+        };
+        if check_in_interval == 0 {
+            return false; // disabled
+        }
+
+        self.ticks_since_checkin += 1;
+        if self.ticks_since_checkin >= check_in_interval {
+            self.ticks_since_checkin = 0;
+            true // time to send CheckIn
+        } else {
+            false
+        }
+    }
+
     /// Enter fast-polling mode with the given timeout (in quarter-seconds).
     pub fn set_fast_polling(&mut self, timeout: u16) {
         let _ = self
             .store
             .set_raw(ATTR_FAST_POLL_TIMEOUT, ZclValue::U16(timeout));
+        self.fast_poll_remaining = timeout;
         self.fast_polling = true;
     }
 
@@ -179,6 +216,21 @@ impl Cluster for PollControlCluster {
             }
             _ => Err(ZclStatus::UnsupClusterCommand),
         }
+    }
+
+    fn received_commands(&self) -> heapless::Vec<u8, 32> {
+        let mut v = heapless::Vec::new();
+        let _ = v.push(CMD_CHECK_IN_RESPONSE.0);
+        let _ = v.push(CMD_FAST_POLL_STOP.0);
+        let _ = v.push(CMD_SET_LONG_POLL_INTERVAL.0);
+        let _ = v.push(CMD_SET_SHORT_POLL_INTERVAL.0);
+        v
+    }
+
+    fn generated_commands(&self) -> heapless::Vec<u8, 32> {
+        let mut v = heapless::Vec::new();
+        let _ = v.push(CMD_CHECK_IN.0);
+        v
     }
 
     fn attributes(&self) -> &dyn AttributeStoreAccess {

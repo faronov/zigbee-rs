@@ -143,6 +143,34 @@ impl PowerConfigCluster {
             ZclValue::U8(voltage_100mv),
         );
     }
+
+    /// Recalculate BatteryAlarmState from current voltage vs threshold.
+    ///
+    /// Call this after updating the battery voltage. Sets bit 0 of
+    /// BatteryAlarmState if voltage < min threshold (and alarm mask allows it).
+    pub fn update_alarm_state(&mut self) {
+        let voltage = match self.store.get(ATTR_BATTERY_VOLTAGE) {
+            Some(ZclValue::U8(v)) => *v,
+            _ => 0,
+        };
+        let threshold = match self.store.get(ATTR_BATTERY_VOLTAGE_MIN_THRESHOLD) {
+            Some(ZclValue::U8(v)) => *v,
+            _ => 0,
+        };
+        let alarm_mask = match self.store.get(ATTR_BATTERY_ALARM_MASK) {
+            Some(ZclValue::Bitmap8(v)) => *v,
+            _ => 0,
+        };
+
+        let mut alarm_state: u32 = 0;
+        // Bit 0: battery voltage below min threshold
+        if threshold > 0 && voltage < threshold && (alarm_mask & 0x01) != 0 {
+            alarm_state |= 0x01;
+        }
+        let _ = self
+            .store
+            .set_raw(ATTR_BATTERY_ALARM_STATE, ZclValue::Bitmap32(alarm_state));
+    }
 }
 
 impl Cluster for PowerConfigCluster {
