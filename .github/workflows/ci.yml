@@ -237,7 +237,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          targets: riscv32imafc-unknown-none-elf
+          targets: riscv32imac-unknown-none-elf
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@v2
         with:
@@ -253,7 +253,7 @@ jobs:
         run: LMAC154_LIB_DIR=$PWD/lib cargo build --release -Z build-std=core,alloc
       - name: Create firmware artifacts
         run: |
-          ELF=examples/bl702-sensor/target/riscv32imafc-unknown-none-elf/release/bl702-sensor
+          ELF=examples/bl702-sensor/target/riscv32imac-unknown-none-elf/release/bl702-sensor
           OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
           $OBJCOPY -O binary $ELF ${ELF}.bin
       - name: Upload BL702 firmware
@@ -261,7 +261,7 @@ jobs:
         with:
           name: bl702-sensor-firmware
           path: |
-            examples/bl702-sensor/target/riscv32imafc-unknown-none-elf/release/bl702-sensor.bin
+            examples/bl702-sensor/target/riscv32imac-unknown-none-elf/release/bl702-sensor.bin
 
   # ── Deploy Web Flasher to GitHub Pages ──────────────────────
   # Bundles the flasher HTML with latest ESP firmware binaries
