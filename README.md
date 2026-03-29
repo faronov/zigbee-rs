@@ -5,7 +5,7 @@ A complete Zigbee PRO R22 protocol stack written in Rust, targeting embedded
 Embassy and other embedded async runtimes.
 
 ```text
-30,900+ lines of Rust · 127 source files · 9 crates · 33 ZCL clusters
+47,800+ lines of Rust · 161 source files · 9 crates · 33 ZCL clusters · 8 hardware platforms
 ```
 
 ## Architecture
@@ -30,7 +30,7 @@ Embassy and other embedded async runtimes.
 │      frames · routing (AODV+tree) · security · NIB   │
 ├──────────────────────────────────────────────────────┤
 │                    zigbee-mac                          │
-│  MacDriver trait · MockMac · ESP32 · nRF · BL702    │
+│  MacDriver trait · 8 backends (see table below)      │
 ├──────────────────────────────────────────────────────┤
 │                   zigbee-types                         │
 │     IeeeAddress · ShortAddress · PanId · Channel     │
@@ -59,7 +59,7 @@ cargo run -p mock-sleepy-sensor
 
 ```bash
 cargo build
-cargo test    # (tests in progress)
+cargo test
 ```
 
 ### ESP32-C6 / ESP32-H2 firmware
@@ -90,18 +90,55 @@ cargo build --release
 # Double-tap RESET → copy .uf2 to the "NICENANO" USB drive
 ```
 
+### BL702 firmware
+
+```bash
+cd examples/bl702-sensor
+cargo build --release --features stubs  # vendor libs linked at build time
+```
+
+### CC2340 firmware
+
+```bash
+cd examples/cc2340-sensor
+cargo build --release --features stubs
+```
+
+### Telink B91 / TLSR8258 firmware
+
+```bash
+cd examples/telink-b91-sensor
+cargo build --release --features stubs
+
+cd examples/telink-tlsr8258-sensor
+cargo build --release --features stubs
+```
+
+### PHY6222 firmware (pure Rust — no vendor SDK!)
+
+```bash
+cd examples/phy6222-sensor
+cargo build --release   # no stubs, no vendor blobs needed
+```
+
 ## MAC Backends
 
-| Backend | Status | Target |
-|---------|--------|--------|
-| **MockMac** | ✅ Complete | Host (macOS/Linux/Windows) |
-| **ESP32-C6/H2/C5** | ✅ Complete | `riscv32imac-unknown-none-elf` |
-| **nRF52840** | ✅ Complete | `thumbv7em-none-eabihf` |
-| **nRF52833** | ✅ Complete | `thumbv7em-none-eabihf` |
-| **BL702** | ✅ FFI to lmac154 | `riscv32imac-unknown-none-elf` |
-| STM32WB55 | 🔲 Skeleton | `thumbv7em-none-eabihf` |
-| EFR32MG24 | 🔲 Skeleton | `thumbv7em-none-eabihf` |
-| CC2652 | 🔲 Skeleton | `thumbv7em-none-eabihf` |
+| Backend | Radio driver | Target | Notes |
+|---------|-------------|--------|-------|
+| **MockMac** | ✅ Simulation | Host (macOS/Linux/Windows) | Full protocol sim, no hardware |
+| **ESP32-C6** | ✅ esp-ieee802154 | `riscv32imac-unknown-none-elf` | Native 802.15.4 radio |
+| **ESP32-H2** | ✅ esp-ieee802154 | `riscv32imac-unknown-none-elf` | Native 802.15.4 radio |
+| **nRF52840** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
+| **nRF52833** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
+| **BL702** | ✅ lmac154 FFI | `riscv32imac-unknown-none-elf` | Vendor libs (`liblmac154.a` + `libbl702_rf.a`) included |
+| **CC2340** | ⚡ ZBOSS FFI | `thumbv6m-none-eabi` | TI SimpleLink SDK stubs (50+ RTOS deps) |
+| **Telink B91** | ⚡ Telink FFI | `riscv32imac-unknown-none-elf` | Telink SDK stubs |
+| **Telink TLSR8258** | ⚡ Telink FFI | `riscv32-unknown-none-elf` | Telink SDK stubs (tc32 ISA) |
+| **PHY6222** | 🦀 **Pure Rust** | `thumbv6m-none-eabi` | Zero vendor blobs — direct register access! |
+
+> **Legend:** ✅ = fully functional radio driver · ⚡ = compiles with stubs, needs vendor SDK for real RF · 🦀 = pure Rust (no FFI)
+
+All 10 firmware targets build in CI and produce downloadable artifacts.
 
 ## ZCL Clusters (33)
 
@@ -127,46 +164,74 @@ Diagnostics
 
 - **`#![no_std]`** everywhere — no heap allocation, `heapless` for bounded collections
 - **`async` MacDriver trait** — 13 methods, no `Send`/`Sync` requirement
-- **Platform-agnostic** — same stack code runs on mock, ESP32, nRF52840
+- **Platform-agnostic** — same stack code runs on mock, ESP32, nRF, BL702, CC2340, Telink, PHY6222
 - **Manual frame parsing** — no `serde`, bitfield encode/decode for all frame types
 - **Embassy-compatible** — designed for single-threaded async executors
 - **Layered crates** — each layer wraps the one below: `NwkLayer<M: MacDriver>`
+- **CI-enforced** — every push builds all 10 firmware targets + clippy + fmt + tests
 
 ## Project Structure
 
 ```
-zigbee-rs-fork/
-├── zigbee-types/          # Core types (addresses, channels)
-├── zigbee-mac/            # MAC layer + platform backends
-│   └── src/mock/          # Full mock for host testing
-├── zigbee-nwk/            # Network layer (routing, security)
-├── zigbee-aps/            # Application Support (binding, groups)
-├── zigbee-zdo/            # Device Objects (discovery, mgmt)
-├── zigbee-bdb/            # Base Device Behavior (commissioning)
-├── zigbee-zcl/            # Zigbee Cluster Library (33 clusters)
-├── zigbee-runtime/        # Device builder, power, NV storage
-├── zigbee/                # Top-level: coordinator, router
-├── tests/                 # Integration tests
+zigbee-rs/
+├── zigbee-types/              # Core types (addresses, channels)
+├── zigbee-mac/                # MAC layer + platform backends
+│   └── src/
+│       ├── mock/              # Full mock for host testing
+│       ├── esp/               # ESP32-C6/H2 (esp-ieee802154)
+│       ├── nrf/               # nRF52840/52833 (radio peripheral)
+│       ├── bl702/             # BL702 (lmac154 FFI)
+│       ├── cc2340/            # CC2340 (ZBOSS FFI stubs)
+│       ├── telink/            # Telink B91 + TLSR8258 (SDK stubs)
+│       └── phy6222/           # PHY6222 (pure Rust radio driver!)
+├── zigbee-nwk/                # Network layer (routing, security)
+├── zigbee-aps/                # Application Support (binding, groups)
+├── zigbee-zdo/                # Device Objects (discovery, mgmt)
+├── zigbee-bdb/                # Base Device Behavior (commissioning)
+├── zigbee-zcl/                # Zigbee Cluster Library (33 clusters)
+├── zigbee-runtime/            # Device builder, power, NV storage
+├── zigbee/                    # Top-level: coordinator, router
+├── tests/                     # Integration tests
 ├── examples/
-│   ├── mock-sensor/       # Host: temp+humidity sensor
-│   ├── mock-coordinator/  # Host: coordinator
-│   ├── mock-light/        # Host: dimmable light
-│   ├── mock-sleepy-sensor/# Host: SED demo
-│   ├── esp32c6-sensor/    # ESP32-C6 + button join/leave
-│   ├── esp32h2-sensor/    # ESP32-H2 + button join/leave
-│   ├── nrf52840-sensor/   # nRF52840-DK (probe-rs)
-│   ├── nrf52840-sensor-uf2/ # nice!nano / ProMicro (UF2 drag-drop)
-│   ├── nrf52833-sensor/   # nRF52833-DK (probe-rs)
-│   └── bl702-sensor/      # BL702 temp sensor (needs lmac154.a)
-├── docs/flasher/          # ESP web flasher (GitHub Pages)
-└── BUILD.md               # Comprehensive build guide
+│   ├── mock-sensor/           # Host: temp+humidity sensor
+│   ├── mock-coordinator/      # Host: coordinator
+│   ├── mock-light/            # Host: dimmable light
+│   ├── mock-sleepy-sensor/    # Host: SED demo
+│   ├── esp32c6-sensor/        # ESP32-C6 firmware
+│   ├── esp32h2-sensor/        # ESP32-H2 firmware
+│   ├── nrf52840-sensor/       # nRF52840-DK (probe-rs)
+│   ├── nrf52840-sensor-uf2/   # nice!nano / ProMicro (UF2 drag-drop)
+│   ├── nrf52833-sensor/       # nRF52833-DK (probe-rs)
+│   ├── nrf52840-bridge/       # nRF52840 coordinator bridge
+│   ├── bl702-sensor/          # BL702 (vendor libs included)
+│   ├── cc2340-sensor/         # TI CC2340R5 (stubs)
+│   ├── telink-b91-sensor/     # Telink B91 (stubs)
+│   ├── telink-tlsr8258-sensor/# Telink TLSR8258 (stubs)
+│   └── phy6222-sensor/        # PHY6222 — pure Rust, no vendor SDK!
+├── docs/flasher/              # ESP web flasher (GitHub Pages)
+└── BUILD.md                   # Comprehensive build guide
 ```
+
+## CI / Firmware Artifacts
+
+Every push builds **10 firmware targets** plus workspace checks:
+
+| Job | What it does |
+|-----|-------------|
+| Check | `cargo check --workspace` |
+| Test | `cargo test --workspace` |
+| Clippy | `cargo clippy --workspace` |
+| Format | `cargo fmt --check` |
+| Doc | `cargo doc --workspace --no-deps` |
+| Build × 10 | Each platform produces a downloadable firmware artifact |
+| Deploy | Web flasher published to GitHub Pages |
+
+Download firmware artifacts from the [Actions tab](https://github.com/faronov/zigbee-rs/actions).
 
 ## Known Limitations
 
-- **BL702** backend compiles but requires `liblmac154.a` from Bouffalo's BL IoT SDK at link time — not included in this repo
-- **STM32WB55 / EFR32MG24 / CC2652** backends are skeletons (waiting for Rust ecosystem maturity)
-- **No USB serial MAC** — can't bridge host ↔ dongle for real RF from desktop (yet)
+- **CC2340 / Telink B91 / Telink TLSR8258** backends compile with stub FFI — real RF requires linking vendor SDK libraries (blocked by complex RTOS dependencies or proprietary toolchains)
+- **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence
 - **Test coverage** is basic — the mock examples exercise more than the test crate
 - **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal
 - **OTA** — cluster defined but no actual firmware upgrade flow implemented
