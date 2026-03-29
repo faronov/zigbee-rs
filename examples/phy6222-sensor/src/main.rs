@@ -34,7 +34,9 @@ use embassy_time::{Duration, Timer};
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::phy6222::Phy6222Mac;
 use zigbee_nwk::DeviceType;
-use zigbee_runtime::{UserAction, ZigbeeDevice};
+use zigbee_runtime::event_loop::{StackEvent, TickResult};
+use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
+use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
@@ -138,6 +140,12 @@ async fn main(_spawner: Spawner) {
     let mac = Phy6222Mac::new();
 
     // ZCL cluster instances
+    let mut basic_cluster = BasicCluster::new(
+        b"Zigbee-RS",       // manufacturer
+        b"PHY6222-Sensor",  // model
+        b"20250101",        // date code
+        b"0.1.0",           // sw build
+    );
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
 
@@ -157,8 +165,17 @@ async fn main(_spawner: Spawner) {
 
     log::info!("[PHY6222] Device ready — press PROG button to join/leave");
 
+    // Initial tick to start commissioning state machine
+    let mut clusters = [
+        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+        ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+        ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+    ];
+    let _ = device.tick(0, &mut clusters).await;
+
     let mut button_was_pressed = false;
     let mut tick: u32 = 0;
+    const REPORT_INTERVAL_SECS: u16 = 30;
 
     loop {
         // ── Button handling (edge detection) ─────────────────
@@ -170,19 +187,27 @@ async fn main(_spawner: Spawner) {
                 log::info!("[PHY6222] Button → joining network");
             }
             device.user_action(UserAction::Toggle);
+            // Immediate tick to process the user action
+            let mut clusters = [
+                ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+            ];
+            if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
+                log_event(e);
+            }
             Timer::after(Duration::from_millis(300)).await;
         }
         button_was_pressed = pressed;
 
         // ── Simulated sensor readings ────────────────────────
-        let temp_hundredths: i16 = 2250 + ((tick % 50) as i16 - 25);
-        let hum_hundredths: u16 = 5000 + ((tick % 100) as u16) * 10;
-
-        temp_cluster.set_temperature(temp_hundredths);
-        hum_cluster.set_humidity(hum_hundredths);
-
         if device.is_joined() {
-            // Green LED on when joined
+            let temp_hundredths: i16 = 2250 + ((tick % 50) as i16 - 25);
+            let hum_hundredths: u16 = 5000 + ((tick % 100) as u16) * 10;
+
+            temp_cluster.set_temperature(temp_hundredths);
+            hum_cluster.set_humidity(hum_hundredths);
+
             led_on();
             log::info!(
                 "[PHY6222] T={}.{:02}°C  H={}.{:02}%",
@@ -195,7 +220,32 @@ async fn main(_spawner: Spawner) {
             led_off();
         }
 
+        // ── Drive the Zigbee stack ───────────────────────────
+        let mut clusters = [
+            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+        ];
+        if let TickResult::Event(ref e) = device.tick(REPORT_INTERVAL_SECS, &mut clusters).await {
+            log_event(e);
+        }
+
         tick = tick.wrapping_add(1);
-        Timer::after(Duration::from_secs(30)).await;
+        Timer::after(Duration::from_secs(REPORT_INTERVAL_SECS as u64)).await;
+    }
+}
+
+/// Log stack events to serial
+fn log_event(event: &StackEvent) {
+    match event {
+        StackEvent::Joined { short_address, channel, .. } => {
+            log::info!("[PHY6222] ✓ Joined network — addr=0x{:04X} ch={}", short_address, channel);
+        }
+        StackEvent::Left => {
+            log::info!("[PHY6222] Left network");
+        }
+        _ => {
+            log::info!("[PHY6222] Event: {:?}", event);
+        }
     }
 }
