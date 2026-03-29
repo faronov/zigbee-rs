@@ -1,0 +1,39 @@
+[package]
+name = "phy6222-sensor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["phy6222"] }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-zcl = { path = "../../zigbee-zcl" }
+zigbee-runtime = { path = "../../zigbee-runtime" }
+
+# Embassy async runtime
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
+embassy-time = { version = "0.5" }
+embassy-time-driver = "0.2"
+embassy-futures = "0.1"
+
+# ARM Cortex-M0 support
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+
+# Logging
+log = "0.4"
+
+# Panic handler for embedded target
+panic-halt = "1.0"
+
+# Portable atomics for Cortex-M0 (no native atomics)
+portable-atomic = { version = "1", features = ["unsafe-assume-single-core"] }
+
+[features]
+default = []
+stubs = []
+
+[profile.release]
+opt-level = "s"
+lto = true

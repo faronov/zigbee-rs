@@ -43,6 +43,9 @@ pub mod cc2340;
 #[cfg(feature = "telink")]
 pub mod telink;
 
+#[cfg(feature = "phy6222")]
+pub mod phy6222;
+
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 

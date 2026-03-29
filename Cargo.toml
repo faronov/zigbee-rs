@@ -27,6 +27,7 @@ exclude = [
     "examples/cc2340-sensor",
     "examples/telink-b91-sensor",
     "examples/telink-tlsr8258-sensor",
+    "examples/phy6222-sensor",
 ]
 
 [workspace.package]

@@ -347,6 +347,35 @@ jobs:
             examples/telink-tlsr8258-sensor/target/thumbv6m-none-eabi/release/telink-tlsr8258-sensor.bin
             examples/telink-tlsr8258-sensor/target/thumbv6m-none-eabi/release/telink-tlsr8258-sensor.hex
 
+  build-phy6222:
+    name: Build PHY6222 sensor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: thumbv6m-none-eabi
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/phy6222-sensor
+      - name: Build PHY6222 sensor (release)
+        working-directory: examples/phy6222-sensor
+        run: cargo build --release
+      - name: Create firmware artifacts
+        run: |
+          ELF=examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor
+          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          $OBJCOPY -O binary $ELF ${ELF}.bin
+          $OBJCOPY -O ihex   $ELF ${ELF}.hex
+      - name: Upload PHY6222 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: phy6222-sensor-firmware
+          path: |
+            examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor.bin
+            examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor.hex
+
   # ── Deploy Web Flasher to GitHub Pages ──────────────────────
   # Bundles the flasher HTML with latest ESP firmware binaries
   # so users can flash directly from the browser.
