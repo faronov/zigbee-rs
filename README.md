@@ -94,32 +94,105 @@ cargo build --release
 
 ```bash
 cd examples/bl702-sensor
-cargo build --release --features stubs  # vendor libs linked at build time
+
+# CI mode (stubs — no vendor libs needed):
+cargo build --release --features stubs
+
+# Real radio (requires vendor libs — see "Vendor Libraries" below):
+cargo build --release
 ```
 
 ### CC2340 firmware
 
 ```bash
 cd examples/cc2340-sensor
+
+# CI mode (stubs):
 cargo build --release --features stubs
+
+# Real radio (requires TI SDK — see "Vendor Libraries" below):
+CC2340_SDK_DIR=/path/to/simplelink_lowpower_f3_sdk cargo build --release
 ```
 
 ### Telink B91 / TLSR8258 firmware
 
 ```bash
-cd examples/telink-b91-sensor
-cargo build --release --features stubs
+# CI mode (stubs):
+cd examples/telink-b91-sensor && cargo build --release --features stubs
+cd examples/telink-tlsr8258-sensor && cargo build --release --features stubs
 
-cd examples/telink-tlsr8258-sensor
-cargo build --release --features stubs
+# Real radio (requires Telink SDK — see "Vendor Libraries" below):
+TELINK_SDK_DIR=/path/to/tl_zigbee_sdk cargo build --release
 ```
 
 ### PHY6222 firmware (pure Rust — no vendor SDK!)
 
 ```bash
 cd examples/phy6222-sensor
-cargo build --release   # no stubs, no vendor blobs needed
+cargo build --release   # no stubs, no vendor blobs needed!
 ```
+
+### Vendor Libraries
+
+Four backends require vendor radio libraries for **real RF** operation. Without them, use `--features stubs` for CI/development builds.
+
+#### BL702 — Bouffalo `lmac154` + `bl702_rf`
+
+The BL702 needs two pre-compiled libraries from the [Bouffalo IoT SDK](https://github.com/bouffalolab/bl_iot_sdk):
+
+```bash
+# Option 1: Point to full SDK
+git clone https://github.com/bouffalolab/bl_iot_sdk.git
+export BL_IOT_SDK_DIR=/path/to/bl_iot_sdk
+cd examples/bl702-sensor && cargo build --release
+
+# Option 2: Copy libs manually into vendor_libs/
+mkdir -p examples/bl702-sensor/vendor_libs
+cp bl_iot_sdk/components/network/lmac154/lib/liblmac154.a examples/bl702-sensor/vendor_libs/
+cp bl_iot_sdk/components/platform/soc/bl702/bl702_rf/lib/libbl702_rf.a examples/bl702-sensor/vendor_libs/
+cargo build --release
+
+# Option 3: Explicit env vars
+export LMAC154_LIB_DIR=/path/to/lmac154/lib
+export BL702_RF_LIB_DIR=/path/to/bl702_rf/lib
+cargo build --release
+```
+
+> **Note:** The SDK libs are compiled with `rv32imfc/ilp32f` (hard-float ABI). Since Rust targets
+> `riscv32imac/ilp32` (soft-float), you may need to strip the float-ABI flag:
+> `python3 scripts/strip_float_abi.py input.a output.a`
+
+#### CC2340 — TI SimpleLink Low Power F3 SDK
+
+```bash
+# Download TI SimpleLink SDK from https://www.ti.com/tool/SIMPLELINK-LOWPOWER-F3-SDK
+export CC2340_SDK_DIR=/path/to/simplelink_lowpower_f3_sdk
+cd examples/cc2340-sensor && cargo build --release
+```
+
+The build script links: `librcl_cc23x0r5.a` (Radio Control Layer) and RF firmware patches.
+
+#### Telink B91 — Telink Zigbee SDK
+
+```bash
+# Clone the Telink Zigbee SDK
+git clone https://github.com/telink-semi/tl_zigbee_sdk.git
+export TELINK_SDK_DIR=/path/to/tl_zigbee_sdk
+cd examples/telink-b91-sensor && cargo build --release
+```
+
+The build script links: `libdrivers_b91.a` from `$TELINK_SDK_DIR/platform/lib/`.
+
+#### Telink TLSR8258 — Telink Zigbee SDK
+
+```bash
+export TELINK_SDK_DIR=/path/to/tl_zigbee_sdk
+cd examples/telink-tlsr8258-sensor && cargo build --release
+```
+
+The build script links: `libdrivers_8258.a` from `$TELINK_SDK_DIR/platform/lib/`.
+
+> **PHY6222** and **nRF52840/52833** and **ESP32-C6/H2** do **not** need any vendor libraries.
 
 ## MAC Backends
 
