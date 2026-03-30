@@ -1,7 +1,7 @@
 //! PHY6222 Zigbee Temperature/Humidity Sensor Example
 //!
 //! A complete Zigbee End Device firmware for PHY6222/6252-based boards
-//! (Ai-Thinker TB-03F, Tuya THB2/TH05F/BTH01 sensor devices).
+//! (Ai-Thinker PB-03F, Tuya THB2/TH05F/BTH01 sensor devices).
 //!
 //! This is the first zigbee-rs example with a **100% pure-Rust radio driver** —
 //! no vendor SDK, no binary blobs, no C FFI. All radio hardware access is
@@ -11,7 +11,7 @@
 //! - PHY6222 (ARM Cortex-M0, 512KB Flash, 64KB SRAM)
 //! - 2.4 GHz radio with IEEE 802.15.4 + BLE support
 //! - I2C sensor: CHT8215/CHT8310/SHT30/AHT20 (configurable)
-//! - Common boards: TB-03F ($1.50), THB2, TH05F, BTH01
+//! - Common boards: PB-03F ($1.50), THB2, TH05F, BTH01
 //!
 //! # Build
 //! ```bash
@@ -45,12 +45,12 @@ use zigbee_zcl::clusters::temperature::TemperatureCluster;
 /// PHY6222 GPIO register base
 const GPIO_BASE: u32 = 0x4000_8000;
 
-/// GPIO pin assignments (varies by board — TB-03F defaults)
+/// GPIO pin assignments (varies by board — PB-03F defaults)
 mod pins {
-    pub const LED_R: u8 = 11; // Red LED (TB-03F)
-    pub const LED_G: u8 = 12; // Green LED (TB-03F)
-    pub const LED_B: u8 = 14; // Blue LED (TB-03F)
-    pub const BTN: u8 = 15; // PROG button (TB-03F)
+    pub const LED_R: u8 = 11; // Red LED (PB-03F)
+    pub const LED_G: u8 = 12; // Green LED (PB-03F)
+    pub const LED_B: u8 = 14; // Blue LED (PB-03F)
+    pub const BTN: u8 = 15; // PROG button (PB-03F)
 }
 
 // ── Minimal GPIO helpers ────────────────────────────────────────
@@ -84,7 +84,7 @@ fn gpio_read(pin: u8) -> bool {
 }
 
 fn led_on() {
-    gpio_write(pins::LED_G, false); // Active low on TB-03F
+    gpio_write(pins::LED_G, false); // Active low on PB-03F
 }
 
 fn led_off() {

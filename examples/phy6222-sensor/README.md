@@ -11,9 +11,9 @@ is through direct register writes in Rust.
 
 - **MCU:** PHY6222 — ARM Cortex-M0, 512KB Flash, 64KB SRAM
 - **Radio:** Built-in 2.4 GHz IEEE 802.15.4 + BLE (pure Rust driver)
-- **Boards:** Ai-Thinker TB-03F (~$1.50), Tuya THB2, TH05F, BTH01
-- **Button:** GPIO15 (PROG button on TB-03F) — join/leave network
-- **LEDs:** GPIO11 (red), GPIO12 (green), GPIO14 (blue) — active low on TB-03F
+- **Boards:** Ai-Thinker PB-03F (~$1.50), Tuya THB2, TH05F, BTH01
+- **Button:** GPIO15 (PROG button on PB-03F) — join/leave network
+- **LEDs:** GPIO11 (red), GPIO12 (green), GPIO14 (blue) — active low on PB-03F
 
 ## Prerequisites
 
