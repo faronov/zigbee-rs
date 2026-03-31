@@ -139,6 +139,8 @@ static RX_FRAME_LEN: AtomicU8 = AtomicU8::new(0);
 static RX_FRAME_RSSI: AtomicI8 = AtomicI8::new(-127);
 static RX_FRAME_TIMESTAMP: AtomicU32 = AtomicU32::new(0);
 static RX_CRC_FAIL: AtomicBool = AtomicBool::new(false);
+/// Monotonic counter incremented on each received frame (for relative ordering).
+static RX_COUNTER: AtomicU8 = AtomicU8::new(0);
 
 // DMA RX buffer given to the radio hardware (must be aligned and static).
 static mut RF_RX_DMA_BUF: [u8; RF_PKT_BUFF_LEN] = [0u8; RF_PKT_BUFF_LEN];
@@ -442,15 +444,21 @@ pub extern "C" fn rf_rx_irq_handler() {
     let rssi_raw = unsafe { *p.add(4) } as i8;
     let rssi_dbm = (rssi_raw as i16 - 110) as i8;
 
-    // Timestamp: for simplicity, use a zero placeholder; the actual
-    // timestamp location varies by chip family and is extracted via
-    // ZB_RADIO_TIMESTAMP_GET() in C — we'd need chip-specific offsets.
-    // Downstream code can override this with platform timer if needed.
-    let timestamp: u32 = 0;
+    // Use a monotonic counter as a timestamp proxy — the actual hardware
+    // timer location varies by chip family (TLSR8258 vs B91) and isn't
+    // available portably. This provides frame ordering at minimum.
+    // Monotonic counter — safe to do load+store since we're in ISR context
+    let count = RX_COUNTER.load(Ordering::Relaxed);
+    RX_COUNTER.store(count.wrapping_add(1), Ordering::Relaxed);
+    let timestamp = count as u32;
 
-    // The PSDU length from the radio includes the 2-byte FCS. The actual
-    // MAC frame payload length is payloadLen - 2 (FCS stripped by upper layer).
-    let frame_len = payload_len.min(MAX_FRAME_LEN);
+    // The PSDU length from the radio includes the 2-byte FCS.
+    // Strip it here so upper layers receive only the MAC frame.
+    let frame_len = if payload_len >= 2 {
+        (payload_len - 2).min(MAX_FRAME_LEN)
+    } else {
+        0
+    };
 
     RX_CRC_FAIL.store(false, Ordering::Release);
     RX_FRAME_LEN.store(frame_len as u8, Ordering::Release);

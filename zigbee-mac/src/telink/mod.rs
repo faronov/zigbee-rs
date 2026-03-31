@@ -36,6 +36,27 @@ use zigbee_types::*;
 use embassy_futures::select;
 use embassy_time::Timer;
 
+// ── IEEE 802.15.4 MAC timing constants (2.4 GHz) ──────────────
+
+/// Symbol period in microseconds (62.5 ksym/s at 2.4 GHz).
+const SYMBOL_PERIOD_US: u64 = 16;
+
+/// Unit backoff period in symbols (aUnitBackoffPeriod).
+const UNIT_BACKOFF_SYMBOLS: u64 = 20;
+
+/// ACK wait timeout in microseconds.
+/// aTurnaroundTime (192µs) + ACK duration (~352µs) + software margin.
+const ACK_WAIT_US: u64 = 1500;
+
+/// Association response wait timeout in milliseconds.
+const ASSOC_RESPONSE_WAIT_MS: u64 = 3000;
+
+/// RX indication timeout in milliseconds.
+const RX_INDICATION_TIMEOUT_MS: u64 = 5000;
+
+/// Poll response wait timeout in milliseconds.
+const POLL_RESPONSE_WAIT_MS: u64 = 500;
+
 /// Telink 802.15.4 MAC driver.
 ///
 /// Built on Telink radio HAL — uses the Telink SoC's hardware radio with
@@ -62,6 +83,7 @@ pub struct TelinkMac {
     rx_on_when_idle: bool,
     association_permit: bool,
     auto_request: bool,
+    pan_coordinator: bool,
     dsn: u8,
     bsn: u8,
     beacon_payload: PibPayload,
@@ -90,6 +112,7 @@ impl TelinkMac {
             rx_on_when_idle: false,
             association_permit: false,
             auto_request: true,
+            pan_coordinator: false,
             dsn: 0,
             bsn: 0,
             beacon_payload: PibPayload::new(),
@@ -194,7 +217,41 @@ impl TelinkMac {
                             let _ = results.push(desc);
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => continue, // ignore RX errors, keep scanning
+                }
+            }
+        };
+
+        let _ = select::select(deadline, collect).await;
+        results
+    }
+
+    /// Scan a single channel for beacons (passive scan — listen only, no TX).
+    async fn scan_channel_passive(
+        &mut self,
+        channel: u8,
+        duration_ms: u32,
+    ) -> heapless::Vec<PanDescriptor, 8> {
+        let mut results = heapless::Vec::new();
+
+        self.driver.update_config(|cfg| cfg.channel = channel);
+        self.driver.enable_rx();
+
+        let deadline = Timer::after(embassy_time::Duration::from_millis(duration_ms as u64));
+
+        let collect = async {
+            loop {
+                match self.driver.receive().await {
+                    Ok(rx_frame) => {
+                        if let Some(desc) = Self::parse_beacon(
+                            &rx_frame.data[..rx_frame.len],
+                            rx_frame.lqi,
+                            channel,
+                        ) {
+                            let _ = results.push(desc);
+                        }
+                    }
+                    Err(_) => continue, // ignore RX errors, keep listening
                 }
             }
         };
@@ -339,9 +396,6 @@ impl TelinkMac {
         } else {
             0
         };
-        // 802.15.4 timing constants for 2.4 GHz
-        const SYMBOL_PERIOD_US: u64 = 16; // 62.5 ksym/s
-        const UNIT_BACKOFF_SYMBOLS: u64 = 20; // aUnitBackoffPeriod
 
         for attempt in 0..=max_retries {
             // ── Unslotted CSMA-CA ──
@@ -354,8 +408,7 @@ impl TelinkMac {
                 let seed = self.dsn.wrapping_add(nb).wrapping_add(attempt);
                 let random = Self::prng(seed);
                 let backoff = (random % (max_val + 1)) as u64;
-                let delay_us = backoff * UNIT_BACKOFF_SYMBOLS * SYMBOL_PERIOD_US;
-                if delay_us > 0 {
+                let delay_us = backoff * UNIT_BACKOFF_SYMBOLS * SYMBOL_PERIOD_US;                if delay_us > 0 {
                     Timer::after_micros(delay_us).await;
                 }
 
@@ -395,7 +448,7 @@ impl TelinkMac {
             // Spec: aTurnaroundTime (192µs) + ACK frame duration (~352µs).
             // Allow 1.5ms total for software overhead.
             let seq = frame[2];
-            let ack_result = select::select(self.driver.receive(), Timer::after_micros(1500)).await;
+            let ack_result = select::select(self.driver.receive(), Timer::after_micros(ACK_WAIT_US)).await;
 
             if let select::Either::First(Ok(rx)) = ack_result {
                 if rx.len >= 3 {
@@ -450,7 +503,7 @@ impl MacDriver for TelinkMac {
         let scan_duration_ms = ((1u32 << req.scan_duration) + 1) * 15; // ~aBaseSuperframeDuration
 
         match req.scan_type {
-            ScanType::Active | ScanType::Passive => {
+            ScanType::Active => {
                 let mut pan_descriptors: PanDescriptorList = heapless::Vec::new();
 
                 for ch in 11u8..=26 {
@@ -464,7 +517,32 @@ impl MacDriver for TelinkMac {
                     }
                 }
 
-                // Restore original channel
+                self.sync_radio_config();
+
+                if pan_descriptors.is_empty() {
+                    Err(MacError::NoBeacon)
+                } else {
+                    Ok(MlmeScanConfirm {
+                        scan_type: req.scan_type,
+                        pan_descriptors,
+                        energy_list: heapless::Vec::new(),
+                    })
+                }
+            }
+            ScanType::Passive => {
+                let mut pan_descriptors: PanDescriptorList = heapless::Vec::new();
+
+                for ch in 11u8..=26 {
+                    if let Some(channel) = zigbee_types::Channel::from_number(ch) {
+                        if req.channel_mask.contains(channel) {
+                            let beacons = self.scan_channel_passive(ch, scan_duration_ms).await;
+                            for desc in beacons {
+                                let _ = pan_descriptors.push(desc);
+                            }
+                        }
+                    }
+                }
+
                 self.sync_radio_config();
 
                 if pan_descriptors.is_empty() {
@@ -544,8 +622,8 @@ impl MacDriver for TelinkMac {
             build_data_request(self.next_dsn(), &req.coord_address, &self.extended_address);
         self.csma_ca_transmit(&data_req, true).await?;
 
-        // Wait for Association Response with generous timeout (3 seconds)
-        let timeout = Timer::after(embassy_time::Duration::from_millis(3000));
+        // Wait for Association Response
+        let timeout = Timer::after(embassy_time::Duration::from_millis(ASSOC_RESPONSE_WAIT_MS));
 
         let wait_response = async {
             for _ in 0..10 {
@@ -689,6 +767,7 @@ impl MacDriver for TelinkMac {
             self.max_frame_retries = 3;
             self.promiscuous = false;
             self.tx_power = 0;
+            self.pan_coordinator = false;
         }
 
         self.sync_radio_config();
@@ -698,12 +777,26 @@ impl MacDriver for TelinkMac {
     async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
         self.pan_id = req.pan_id;
         self.channel = req.channel;
+        self.pan_coordinator = req.pan_coordinator;
+
+        // Coordinators must be rx-on-when-idle to receive association requests
+        if req.pan_coordinator {
+            self.rx_on_when_idle = true;
+            self.association_permit = true;
+        }
 
         self.sync_radio_config();
+
+        // Enable receiver if rx_on_when_idle
+        if self.rx_on_when_idle {
+            self.driver.enable_rx();
+        }
+
         log::info!(
-            "telink: started PAN 0x{:04X} on channel {}",
+            "telink: started PAN 0x{:04X} on channel {} (coordinator={})",
             self.pan_id.0,
-            self.channel
+            self.channel,
+            self.pan_coordinator,
         );
         Ok(())
     }
@@ -791,7 +884,7 @@ impl MacDriver for TelinkMac {
         self.csma_ca_transmit(&data_req, true).await?;
 
         // Wait for response — parent may reply with data or empty ACK
-        let result = select::select(Timer::after_millis(500), self.driver.receive()).await;
+        let result = select::select(Timer::after_millis(POLL_RESPONSE_WAIT_MS), self.driver.receive()).await;
 
         match result {
             select::Either::Second(Ok(received)) => {
@@ -837,9 +930,8 @@ impl MacDriver for TelinkMac {
     }
 
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
-        const RX_TIMEOUT_MS: u64 = 5000;
         let deadline =
-            embassy_time::Instant::now() + embassy_time::Duration::from_millis(RX_TIMEOUT_MS);
+            embassy_time::Instant::now() + embassy_time::Duration::from_millis(RX_INDICATION_TIMEOUT_MS);
 
         loop {
             let now = embassy_time::Instant::now();
@@ -877,10 +969,14 @@ impl MacDriver for TelinkMac {
                         continue;
                     }
 
-                    let src = parse_source_address(data, fc)
-                        .unwrap_or(MacAddress::Short(PanId(0), ShortAddress(0)));
-                    let dst = parse_dest_address(data, fc)
-                        .unwrap_or(MacAddress::Short(PanId(0), ShortAddress(0)));
+                    let src = match parse_source_address(data, fc) {
+                        Some(addr) => addr,
+                        None => continue, // discard malformed frame
+                    };
+                    let dst = match parse_dest_address(data, fc) {
+                        Some(addr) => addr,
+                        None => continue, // discard malformed frame
+                    };
 
                     // Software address filtering
                     if !self.promiscuous {
@@ -927,8 +1023,8 @@ impl MacDriver for TelinkMac {
 
     fn capabilities(&self) -> MacCapabilities {
         MacCapabilities {
-            coordinator: true,
-            router: true,
+            coordinator: false,
+            router: false,
             hardware_security: true, // Telink chips have AES-128 hardware
             max_payload: 102,        // 127 - 25 (max MAC overhead)
             tx_power_min: TxPower(-20),
