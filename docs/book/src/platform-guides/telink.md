@@ -56,20 +56,22 @@ RAM   : ORIGIN = 0x00840000, LENGTH = 64K
 
 ## Current Status
 
-> ⚡ **Stubs mode** — Both Telink backends compile with stub FFI symbols in CI.
-> Full radio operation requires linking the Telink SDK driver libraries.
+> ⚡ Both Telink backends compile and produce valid machine code. The B91
+> example targets native RISC-V. The TLSR8258 example produces **tc32-compatible
+> Thumb-1 code** that can be linked with tc32-elf-ld for real hardware.
 
 The backends are architecturally complete:
-- Full `MacDriver` trait implementation
+- Full `MacDriver` trait implementation with CSMA-CA, ED scan, indirect TX queue
 - FFI bindings to Telink RF driver library
-- Frame construction and PIB management
-- Example firmware with GPIO, LED, and button handling
+- Frame construction, PIB management, frame-pending bit for SED support
+- Real time drivers reading hardware system timers (0x740 / 0x140200)
+- GPIO register-mapped I/O, RF ISR routing, WFI-based sleep
+- Example firmware with GPIO, LED, button handling, and sensor reporting
 
 What's needed for real RF operation:
 - Telink Zigbee SDK (`tl_zigbee_sdk`)
 - Driver libraries (`libdrivers_b91.a` or `libdrivers_8258.a`)
-- Proper Embassy time driver using the Telink system timer
-- For TLSR8258: the tc32 GCC toolchain for real builds
+- For TLSR8258: the tc32-elf-ld linker (see [tc32 Build Guide](#building-for-real-tlsr8258-hardware))
 
 ## Prerequisites
 
@@ -318,9 +320,11 @@ The `telink-tlsr8258-sensor` example targets TLSR8258-based products (Sonoff
 SNZB-02 etc.). The code structure is identical to the B91 example — only
 the hardware constants (GPIO addresses, pin assignments) differ.
 
-**Time driver note:** Both examples include a minimal Embassy time driver
-stub. A production firmware would implement a proper driver using the
-Telink system timer.
+**Time driver note:** Both examples include a working Embassy time driver
+that reads the hardware system timer (TLSR8258: register 0x740, B91: register
+0x140200). The 32-bit timer is extended to 64-bit with wraparound detection.
+The `schedule_wake()` alarm is not yet wired to a hardware compare interrupt,
+so Embassy uses polling mode.
 
 ## Troubleshooting
 
@@ -337,8 +341,69 @@ Telink system timer.
 
 To bring the Telink backends to full RF operation:
 
-1. **Embassy time driver** — implement using Telink system timer
+1. ~~**Embassy time driver** — implement using Telink system timer~~ ✅
 2. **Link real SDK** — test with `tl_zigbee_sdk` driver libraries
-3. **Interrupt wiring** — connect RF IRQ handler to Embassy signals
+3. ~~**Interrupt wiring** — connect RF IRQ handler to Embassy signals~~ ✅
 4. **B91 HAL crate** — community `embassy-telink-b91` effort
-5. **TLSR8258 Rust target** — explore custom target JSON for tc32 ISA
+5. ~~**TLSR8258 Rust target** — explore custom target JSON for tc32 ISA~~ ✅
+
+## Building for Real TLSR8258 Hardware
+
+### tc32 ISA Compatibility Discovery
+
+Through binary analysis, we discovered that **tc32 is Thumb-1 with Telink
+extensions**:
+
+- ~92% of tc32 instructions have **identical binary encoding** to ARM Thumb-1
+- The ~8% tc32-only opcodes (`tmcsr`, `tmrss`, `treti`) are used only in
+  startup assembly, IRQ entry/exit, and power management — not in application code
+- Rust/LLVM `thumbv6m` codegen produces **100% valid tc32 machine code**
+  (verified: 1720 instructions, 0 unknown opcodes)
+
+This means Rust can produce native TLSR8258 firmware.
+
+### Custom Target Spec
+
+A custom target JSON is provided at `targets/tc32-none-eabi.json`. It uses
+the `thumbv6m` LLVM backend but overrides the linker to `tc32-elf-ld`:
+
+```bash
+# Build with the custom tc32 target (requires tc32-elf-ld in PATH)
+cd examples/telink-tlsr8258-sensor
+cargo +nightly build --release --features stubs \
+    --target ../../targets/tc32-none-eabi.json \
+    -Z build-std=core,alloc -Z json-target-spec
+```
+
+### Build Script
+
+A helper script `build-tc32.sh` automates the full build:
+1. Compiles Rust code with the tc32 target
+2. Assembles tc32 startup code (`cstartup_8258.S`)
+3. Links everything with `tc32-elf-ld`
+4. Creates a flashable `.bin` with `tc32-elf-objcopy`
+
+```bash
+cd examples/telink-tlsr8258-sensor
+TELINK_SDK_DIR=/path/to/tl_zigbee_sdk ./build-tc32.sh
+```
+
+### Prerequisites
+
+- Telink tc32-elf-gcc toolchain (from Telink IDE or SDK)
+- `TELINK_SDK_DIR` environment variable pointing to `tl_zigbee_sdk`
+- Rust nightly with `rust-src` component
+
+### Alternative: Static Library Approach
+
+If you prefer to integrate Rust into an existing Telink C project:
+
+```bash
+# Build Rust as a static library
+cargo +nightly build --release --target thumbv6m-none-eabi \
+    -Z build-std=core,alloc --crate-type staticlib
+```
+
+Then link the resulting `.a` into your tc32-gcc C project. The C side
+handles hardware initialization and calls `zigbee_init()` / `zigbee_tick()`
+from the Rust library.

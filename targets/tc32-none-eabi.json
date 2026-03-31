@@ -1,0 +1,30 @@
+{
+  "llvm-target": "thumbv6m-none-eabi",
+  "metadata": {
+    "description": "Telink tc32 (Thumb-1 compatible) — TLSR825x family",
+    "host_tools": false,
+    "std": false,
+    "tier": 3
+  },
+  "arch": "arm",
+  "data-layout": "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64",
+  "abi": "eabi",
+  "os": "none",
+  "env": "",
+  "vendor": "telink",
+  "linker-flavor": "gnu",
+  "linker": "tc32-elf-ld",
+  "features": "+strict-align",
+  "atomic-cas": false,
+  "c-enum-min-bits": 8,
+  "panic-strategy": "abort",
+  "relocation-model": "static",
+  "frame-pointer": "always",
+  "emit-debug-gdb-scripts": false,
+  "crt-objects-fallback": "false",
+  "llvm-floatabi": "soft",
+  "target-pointer-width": 32,
+  "pre-link-args": {
+    "gnu": ["-nostdlib"]
+  }
+}
