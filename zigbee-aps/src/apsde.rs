@@ -188,6 +188,13 @@ impl<M: MacDriver> ApsLayer<M> {
 
         // APS-level encryption
         if req.tx_options.security_enabled {
+            // If the payload needs fragmentation, use fragment-then-encrypt path
+            if req.payload.len() > APS_MAX_PAYLOAD && req.tx_options.fragmentation_permitted {
+                return self
+                    .send_fragmented_secured(req, nwk_dst, delivery_mode, radius)
+                    .await;
+            }
+
             let dst_ieee = self.nwk.find_ieee_by_short(nwk_dst);
             let link_key = if let Some(ref ieee) = dst_ieee {
                 if let Some(entry) = self.security.find_any_key(ieee) {
@@ -479,7 +486,159 @@ impl<M: MacDriver> ApsLayer<M> {
         })
     }
 
-    /// Process an incoming APS frame from a NWK data indication.
+    /// Send a large payload as fragments, encrypting each fragment individually.
+    ///
+    /// This implements the correct fragment-then-encrypt approach for APS security:
+    /// 1. Split plaintext into APS_MAX_PAYLOAD-sized chunks
+    /// 2. For each chunk, build APS header with security flag
+    /// 3. Encrypt the chunk with the APS key
+    /// 4. Send via NWK
+    async fn send_fragmented_secured(
+        &mut self,
+        req: &ApsdeDataRequest<'_>,
+        nwk_dst: ShortAddress,
+        delivery_mode: ApsDeliveryMode,
+        radius: u8,
+    ) -> Result<ApsdeDataConfirm, ApsStatus> {
+        log::debug!(
+            "[APS] Sending secured fragmented: {} bytes → {} fragments",
+            req.payload.len(),
+            req.payload.len().div_ceil(APS_MAX_PAYLOAD),
+        );
+
+        // Resolve encryption key
+        let dst_ieee = self.nwk.find_ieee_by_short(nwk_dst);
+        let link_key = if let Some(ref ieee) = dst_ieee {
+            if let Some(entry) = self.security.find_any_key(ieee) {
+                entry.key
+            } else {
+                *self.security.default_tc_link_key()
+            }
+        } else {
+            *self.security.default_tc_link_key()
+        };
+        let src_ieee = self.nwk.nib().ieee_address;
+
+        let aps_counter = self.next_aps_counter();
+        let total_blocks = req.payload.len().div_ceil(APS_MAX_PAYLOAD) as u8;
+
+        for block_num in 0..total_blocks {
+            let start = block_num as usize * APS_MAX_PAYLOAD;
+            let end = (start + APS_MAX_PAYLOAD).min(req.payload.len());
+            let chunk = &req.payload[start..end];
+
+            let (fragmentation, ack_bitfield) = if block_num == 0 {
+                (FRAG_FIRST, Some(0u8))
+            } else {
+                (FRAG_SUBSEQUENT, None)
+            };
+
+            let frag_header = ApsHeader {
+                frame_control: ApsFrameControl {
+                    frame_type: ApsFrameType::Data as u8,
+                    delivery_mode: delivery_mode as u8,
+                    ack_format: false,
+                    security: true,
+                    ack_request: req.tx_options.ack_request && block_num == total_blocks - 1,
+                    extended_header: true,
+                },
+                dst_endpoint: match delivery_mode {
+                    ApsDeliveryMode::Unicast | ApsDeliveryMode::Broadcast => {
+                        Some(req.dst_endpoint)
+                    }
+                    _ => None,
+                },
+                group_address: match delivery_mode {
+                    ApsDeliveryMode::Group => {
+                        if let ApsAddress::Group(g) = req.dst_address {
+                            Some(g)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                },
+                cluster_id: Some(req.cluster_id),
+                profile_id: Some(req.profile_id),
+                src_endpoint: Some(req.src_endpoint),
+                aps_counter,
+                extended_header: Some(ApsExtendedHeader {
+                    fragmentation,
+                    block_number: if block_num == 0 {
+                        total_blocks
+                    } else {
+                        block_num
+                    },
+                    ack_bitfield,
+                }),
+            };
+
+            // Encrypt this fragment
+            let frame_counter = if let Some(ref ieee) = dst_ieee {
+                self.security
+                    .next_frame_counter(ieee, crate::security::ApsKeyType::TrustCenterLinkKey)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let sec_hdr = crate::security::ApsSecurityHeader {
+                security_control: crate::security::ApsSecurityHeader::APS_DEFAULT_EXT_NONCE,
+                frame_counter,
+                source_address: Some(src_ieee),
+                key_seq_number: None,
+            };
+
+            let mut aad_buf = [0u8; 32];
+            let hdr_len = frag_header.serialize(&mut aad_buf);
+            let sec_hdr_len = sec_hdr.serialize(&mut aad_buf[hdr_len..]);
+            let aad = &aad_buf[..hdr_len + sec_hdr_len];
+
+            if let Some(enc) = self.security.encrypt(aad, chunk, &link_key, &sec_hdr) {
+                let mut frag_buf = [0u8; 128];
+                let mut offset = frag_header.serialize(&mut frag_buf);
+                let sec_len = sec_hdr.serialize(&mut frag_buf[offset..]);
+                offset += sec_len;
+                if offset + enc.len() > frag_buf.len() {
+                    return Err(ApsStatus::AsduTooLong);
+                }
+                frag_buf[offset..offset + enc.len()].copy_from_slice(&enc);
+                let total = offset + enc.len();
+
+                let nwk_result = self
+                    .nwk
+                    .nlde_data_request(
+                        nwk_dst,
+                        radius,
+                        &frag_buf[..total],
+                        req.tx_options.use_nwk_key,
+                        true,
+                    )
+                    .await;
+
+                if let Err(nwk_err) = nwk_result {
+                    log::warn!(
+                        "[APS] Secured fragment {}/{} send failed: {:?}",
+                        block_num,
+                        total_blocks,
+                        nwk_err
+                    );
+                    return Err(nwk_status_to_aps(nwk_err));
+                }
+            } else {
+                log::warn!("[APS] Fragment {}/{} encryption failed", block_num, total_blocks);
+                return Err(ApsStatus::SecurityFail);
+            }
+        }
+
+        Ok(ApsdeDataConfirm {
+            status: ApsStatus::Success,
+            dst_addr_mode: req.dst_addr_mode,
+            dst_address: req.dst_address,
+            dst_endpoint: req.dst_endpoint,
+            src_endpoint: req.src_endpoint,
+            aps_counter,
+        })
+    }
     ///
     /// Parses the APS header from the NWK payload and returns an
     /// `ApsdeDataIndication` for the upper layer.

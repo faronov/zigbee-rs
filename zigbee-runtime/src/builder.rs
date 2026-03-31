@@ -176,6 +176,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             date_code: self.date_code,
             channel_mask: self.channel_mask,
             pending_responses: heapless::Vec::new(),
+            state_dirty: false,
         }
     }
 }

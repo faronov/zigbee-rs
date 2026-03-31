@@ -388,10 +388,11 @@ impl TelinkDriver {
 
         unsafe {
             rf_startEDScan();
-            // The SDK accumulates RSSI samples via a poll callback.
-            // In our bare-metal context we do a brief busy-wait to let
-            // the hardware gather a few samples.
-            for _ in 0..1000 {
+            // IEEE 802.15.4 ED measurement duration = 8 symbol periods = 128µs.
+            // Use a calibrated busy-wait (~128µs at typical Telink clock rates).
+            // Each iteration takes ~4 cycles; at 32 MHz → ~4000 iterations ≈ 500µs
+            // (overshoot is fine — gives better RSSI averaging).
+            for _ in 0..4000 {
                 core::hint::spin_loop();
             }
             let ed = rf_stopEDScan();

@@ -97,11 +97,14 @@ impl<M: MacDriver> BdbLayer<M> {
         self.zdo.aps_mut().aib_mut().aps_trust_center_address = ieee;
         self.zdo.aps_mut().aib_mut().aps_designated_coordinator = true;
 
-        // Step 4: Install NWK key
-        // The NWK layer already generated a key during NLME-NETWORK-FORMATION.
-        // In a real implementation, we would generate a proper random key
-        // and distribute it via APSME-TRANSPORT-KEY.
-        log::debug!("[BDB:Formation] NWK key installed by NWK layer");
+        // Step 4: Generate and install NWK key
+        // The coordinator must install a network key so that all secured
+        // NWK frames can be encrypted. Without this, NWK security is broken.
+        let nwk_key = generate_nwk_key();
+        let key_seq: u8 = 0;
+        self.zdo.nwk_mut().security_mut().set_network_key(nwk_key, key_seq);
+        self.zdo.nwk_mut().nib_mut().active_key_seq_number = key_seq;
+        log::info!("[BDB:Formation] NWK key installed (seq={})", key_seq);
 
         // Step 5: Open permit joining so other devices can join
         let duration = core::cmp::min(BDB_MIN_COMMISSIONING_TIME, 254) as u8;
@@ -125,4 +128,23 @@ impl<M: MacDriver> BdbLayer<M> {
         );
         Ok(())
     }
+}
+
+/// Generate a 128-bit NWK key using a simple PRNG.
+///
+/// **Production note**: this should use a hardware RNG (TRNG) for
+/// cryptographic strength. The xorshift here is a placeholder suitable
+/// for bring-up and testing only.
+fn generate_nwk_key() -> [u8; 16] {
+    static mut SEED: u32 = 0xCAFE_BABE;
+    let mut key = [0u8; 16];
+    for chunk in key.chunks_exact_mut(4) {
+        unsafe {
+            SEED ^= SEED << 13;
+            SEED ^= SEED >> 17;
+            SEED ^= SEED << 5;
+            chunk.copy_from_slice(&SEED.to_le_bytes());
+        }
+    }
+    key
 }

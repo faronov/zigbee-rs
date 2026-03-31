@@ -232,10 +232,29 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                 .await;
         }
 
-        // Phase 6: Power management
-        // (Currently returns StayAwake for AlwaysOn devices)
+        // Phase 7: Power management — SED auto-poll and sleep decision
+        // Record that we had activity if reports were sent
+        if !self.pending_responses.is_empty() {
+            self.power.set_pending_tx(true);
+        } else {
+            self.power.set_pending_tx(false);
+        }
 
-        TickResult::Idle
+        // Auto-poll for sleepy end devices
+        let now_ms = (elapsed_secs as u32) * 1000; // approximate
+        if self.is_sleepy() && self.power.should_poll(now_ms) {
+            if let Ok(Some(_frame)) = self.bdb.zdo_mut().nwk_mut().mac_mut().mlme_poll().await {
+                self.power.record_activity(now_ms);
+            }
+            self.power.record_poll(now_ms);
+        }
+
+        // Decide sleep vs stay awake
+        match self.power.decide(now_ms) {
+            crate::power::SleepDecision::StayAwake => TickResult::Idle,
+            crate::power::SleepDecision::LightSleep(ms) => TickResult::RunAgain(ms),
+            crate::power::SleepDecision::DeepSleep(ms) => TickResult::RunAgain(ms),
+        }
     }
 
     /// Handle a user-initiated action.

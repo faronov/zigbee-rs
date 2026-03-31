@@ -123,6 +123,8 @@ pub struct ZigbeeDevice<M: MacDriver> {
     channel_mask: ChannelMask,
     /// Queued ZCL responses to send in next tick().
     pending_responses: heapless::Vec<PendingZclResponse, 4>,
+    /// Flag: network state has changed and should be persisted.
+    state_dirty: bool,
 }
 
 impl<M: MacDriver> ZigbeeDevice<M> {
@@ -167,6 +169,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.bdb.zdo_mut().set_local_nwk_addr(ShortAddress(addr));
         self.bdb.zdo_mut().set_local_ieee_addr(ieee);
 
+        self.state_dirty = true;
         Ok(addr)
     }
 
@@ -180,6 +183,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             .await
             .map_err(|_| event_loop::StartError::InitFailed)?;
         self.bdb.attributes_mut().node_is_on_a_network = false;
+        self.state_dirty = true;
         log::info!("[Runtime] Left network");
         Ok(())
     }
@@ -302,6 +306,19 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// Whether this device is configured as a sleepy end device.
     pub fn is_sleepy(&self) -> bool {
         !matches!(self.power.mode(), power::PowerMode::AlwaysOn)
+    }
+
+    /// Whether the network state has changed since last save.
+    ///
+    /// Check this after `tick()` returns — if true, call `save_state(nv)`
+    /// and then `clear_state_dirty()` to persist the new state.
+    pub fn state_dirty(&self) -> bool {
+        self.state_dirty
+    }
+
+    /// Clear the dirty flag after saving state.
+    pub fn clear_state_dirty(&mut self) {
+        self.state_dirty = false;
     }
 
     // ── NV Persistence ─────────────────────────────────────

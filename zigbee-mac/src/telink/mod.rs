@@ -57,6 +57,25 @@ const RX_INDICATION_TIMEOUT_MS: u64 = 5000;
 /// Poll response wait timeout in milliseconds.
 const POLL_RESPONSE_WAIT_MS: u64 = 500;
 
+/// Maximum number of frames in the indirect TX queue (for coordinator role).
+const INDIRECT_QUEUE_SIZE: usize = 8;
+
+/// Persistence timeout for indirect frames (in ticks / calls to age_indirect_queue).
+/// IEEE 802.15.4: macTransactionPersistenceTime × aBaseSuperframeDuration.
+const INDIRECT_PERSISTENCE_TICKS: u8 = 30;
+
+/// Maximum MAC overhead for a 2.4 GHz frame:
+/// FC(2) + Seq(1) + DstPAN(2) + DstAddr(2|8) + SrcPAN(0|2) + SrcAddr(2|8) + FCS(2)
+/// Worst case with extended addressing: 2+1+2+8+2+8+2 = 25
+const MAX_MAC_OVERHEAD: usize = 25;
+
+/// Entry in the indirect TX queue (buffered frame for sleepy child).
+struct IndirectEntry {
+    dst: MacAddress,
+    frame: heapless::Vec<u8, 128>,
+    remaining_ticks: u8,
+}
+
 /// Telink 802.15.4 MAC driver.
 ///
 /// Built on Telink radio HAL — uses the Telink SoC's hardware radio with
@@ -80,10 +99,14 @@ pub struct TelinkMac {
     channel: u8,
     extended_address: IeeeAddress,
     coord_short_address: ShortAddress,
+    coord_extended_address: IeeeAddress,
     rx_on_when_idle: bool,
     association_permit: bool,
     auto_request: bool,
     pan_coordinator: bool,
+    beacon_order: u8,
+    superframe_order: u8,
+    response_wait_time: u8,
     dsn: u8,
     bsn: u8,
     beacon_payload: PibPayload,
@@ -93,6 +116,8 @@ pub struct TelinkMac {
     max_frame_retries: u8,
     promiscuous: bool,
     tx_power: i8,
+    // Indirect TX queue (coordinator buffers frames for sleepy children)
+    indirect_queue: heapless::Vec<IndirectEntry, INDIRECT_QUEUE_SIZE>,
 }
 
 impl TelinkMac {
@@ -109,10 +134,14 @@ impl TelinkMac {
             channel: 11,
             extended_address: [0u8; 8],
             coord_short_address: ShortAddress(0x0000),
+            coord_extended_address: [0u8; 8],
             rx_on_when_idle: false,
             association_permit: false,
             auto_request: true,
             pan_coordinator: false,
+            beacon_order: 15, // 15 = non-beacon mode
+            superframe_order: 15,
+            response_wait_time: 32, // 32 × aBaseSuperframeDuration ≈ 491ms
             dsn: 0,
             bsn: 0,
             beacon_payload: PibPayload::new(),
@@ -122,6 +151,7 @@ impl TelinkMac {
             max_frame_retries: 3,
             promiscuous: false,
             tx_power: 0,
+            indirect_queue: heapless::Vec::new(),
         }
     }
 
@@ -825,6 +855,10 @@ impl MacDriver for TelinkMac {
             PhyCurrentPage => Ok(PibValue::U8(0)), // Page 0 = 2.4 GHz
             MacBeaconPayload => Ok(PibValue::Payload(self.beacon_payload.clone())),
             MacCoordShortAddress => Ok(PibValue::ShortAddress(self.coord_short_address)),
+            MacCoordExtendedAddress => Ok(PibValue::ExtendedAddress(self.coord_extended_address)),
+            MacBeaconOrder => Ok(PibValue::U8(self.beacon_order)),
+            MacSuperframeOrder => Ok(PibValue::U8(self.superframe_order)),
+            MacResponseWaitTime => Ok(PibValue::U8(self.response_wait_time)),
             _ => Err(MacError::Unsupported),
         }
     }
@@ -877,6 +911,12 @@ impl MacDriver for TelinkMac {
             (MacCoordShortAddress, PibValue::ShortAddress(v)) => {
                 self.coord_short_address = v;
             }
+            (MacCoordExtendedAddress, PibValue::ExtendedAddress(v)) => {
+                self.coord_extended_address = v;
+            }
+            (MacBeaconOrder, PibValue::U8(v)) => self.beacon_order = v,
+            (MacSuperframeOrder, PibValue::U8(v)) => self.superframe_order = v,
+            (MacResponseWaitTime, PibValue::U8(v)) => self.response_wait_time = v,
             _ => return Err(MacError::Unsupported),
         }
 
@@ -934,9 +974,31 @@ impl MacDriver for TelinkMac {
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
         if req.tx_options.indirect {
-            // Indirect transmission: coordinator should buffer for sleepy device.
-            // Currently direct-transmit only; indirect queue not yet implemented.
-            log::warn!("telink: indirect TX requested but not supported, sending directly");
+            // Indirect transmission: buffer frame for sleepy child to poll.
+            if self.pan_coordinator {
+                let mut frame_buf = heapless::Vec::new();
+                let ack_requested = req.tx_options.ack_tx;
+                let built = self.build_data_frame(&req.dst_address, req.payload, ack_requested);
+                if frame_buf.extend_from_slice(&built).is_err() {
+                    log::warn!("telink: indirect frame too large");
+                    return Err(MacError::FrameTooLong);
+                }
+                if self.indirect_queue.is_full() {
+                    // Evict oldest entry
+                    self.indirect_queue.remove(0);
+                }
+                let _ = self.indirect_queue.push(IndirectEntry {
+                    dst: req.dst_address.clone(),
+                    frame: frame_buf,
+                    remaining_ticks: INDIRECT_PERSISTENCE_TICKS,
+                });
+                log::debug!("telink: buffered indirect frame (queue={})", self.indirect_queue.len());
+                return Ok(McpsDataConfirm {
+                    msdu_handle: req.msdu_handle,
+                    timestamp: None,
+                });
+            }
+            log::warn!("telink: indirect TX requested but not coordinator, sending directly");
         }
 
         let ack_requested = req.tx_options.ack_tx;
@@ -986,8 +1048,8 @@ impl MacDriver for TelinkMac {
                     let fc = u16::from_le_bytes([data[0], data[1]]);
                     let frame_type = fc & 0x07;
 
-                    // Only deliver data frames (type 1)
-                    if frame_type != 1 {
+                    // Accept data frames (1) and MAC command frames (3) for processing
+                    if frame_type != 1 && frame_type != 3 {
                         continue;
                     }
 
@@ -1030,7 +1092,26 @@ impl MacDriver for TelinkMac {
 
                     // Send ACK if the received frame requests one
                     if (fc & 0x0020) != 0 && data.len() >= 3 {
-                        self.send_ack(data[2], false).await;
+                        // Check if we have indirect frames for this source
+                        let has_pending = self.has_indirect_frame_for(&src);
+                        self.send_ack(data[2], has_pending).await;
+                    }
+
+                    // If coordinator and this is a MAC command frame (type 3),
+                    // check for Data Request (poll) and drain indirect queue.
+                    if frame_type == 3 && self.pan_coordinator {
+                        // MAC command ID is the first byte after the header
+                        if let Some(&cmd_id) = data.get(header_len) {
+                            if cmd_id == 0x04 {
+                                // Data Request — send buffered indirect frame
+                                self.send_indirect_to(&src).await;
+                            }
+                        }
+                    }
+
+                    // Only deliver data frames (type 1) to upper layers
+                    if frame_type != 1 {
+                        continue;
                     }
 
                     let payload_data = &data[header_len..];
@@ -1053,10 +1134,52 @@ impl MacDriver for TelinkMac {
             coordinator: false,
             router: false,
             hardware_security: true, // Telink chips have AES-128 hardware
-            max_payload: 102,        // 127 - 25 (max MAC overhead)
+            // 127 (max PSDU) - 2 (FCS) - MAX_MAC_OVERHEAD = usable payload
+            max_payload: (127 - 2 - MAX_MAC_OVERHEAD) as u16,
             tx_power_min: TxPower(-20),
             tx_power_max: TxPower(10),
         }
+    }
+}
+
+// ── Indirect TX queue helpers ──────────────────────────────────
+
+impl TelinkMac {
+    /// Check whether we have a buffered indirect frame for the given address.
+    fn has_indirect_frame_for(&self, addr: &MacAddress) -> bool {
+        self.indirect_queue.iter().any(|e| addresses_match(&e.dst, addr))
+    }
+
+    /// Transmit the first matching indirect frame to the polling device.
+    async fn send_indirect_to(&mut self, addr: &MacAddress) {
+        if let Some(idx) = self.indirect_queue.iter().position(|e| addresses_match(&e.dst, addr)) {
+            let entry = self.indirect_queue.remove(idx);
+            log::debug!("telink: sending indirect frame to poller (queue={})", self.indirect_queue.len());
+            let _ = self.csma_ca_transmit(&entry.frame, true).await;
+        }
+    }
+
+    /// Age indirect queue entries. Call periodically (e.g., from tick).
+    /// Removes entries that have expired.
+    pub fn age_indirect_queue(&mut self) {
+        self.indirect_queue.retain_mut(|entry| {
+            entry.remaining_ticks = entry.remaining_ticks.saturating_sub(1);
+            if entry.remaining_ticks == 0 {
+                log::debug!("telink: indirect frame expired");
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+/// Check if two MAC addresses refer to the same device (ignoring PAN ID).
+fn addresses_match(a: &MacAddress, b: &MacAddress) -> bool {
+    match (a, b) {
+        (MacAddress::Short(_, a_addr), MacAddress::Short(_, b_addr)) => a_addr.0 == b_addr.0,
+        (MacAddress::Extended(_, a_addr), MacAddress::Extended(_, b_addr)) => a_addr == b_addr,
+        _ => false,
     }
 }
 
