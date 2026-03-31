@@ -8,10 +8,10 @@
 //! through direct register writes in Rust.
 //!
 //! # Hardware
-//! - PHY6222 (ARM Cortex-M0, 512KB Flash, 64KB SRAM)
+//! - PHY6222 (512KB flash, 64KB SRAM) or PHY6252 (256KB flash, 64KB SRAM), ARM Cortex-M0
 //! - 2.4 GHz radio with IEEE 802.15.4 + BLE support
 //! - I2C sensor: CHT8215/CHT8310/SHT30/AHT20 (configurable)
-//! - Common boards: PB-03F ($1.50), THB2, TH05F, BTH01
+//! - Common boards: PB-03F (PHY6252), THB2/TH05F/BTH01 (PHY6222)
 //!
 //! # Build
 //! ```bash

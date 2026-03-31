@@ -9,9 +9,9 @@ is through direct register writes in Rust.
 
 ## Hardware
 
-- **MCU:** PHY6222 — ARM Cortex-M0, 512KB Flash, 64KB SRAM
+- **MCU:** PHY6222 (512KB flash) or PHY6252 (256KB flash) — ARM Cortex-M0, 64KB SRAM
 - **Radio:** Built-in 2.4 GHz IEEE 802.15.4 + BLE (pure Rust driver)
-- **Boards:** Ai-Thinker PB-03F (~$1.50), Tuya THB2, TH05F, BTH01
+- **Boards:** Ai-Thinker PB-03F (PHY6252, ~$1.50), Tuya THB2, TH05F, BTH01 (PHY6222)
 - **Button:** GPIO15 (PROG button on PB-03F) — join/leave network
 - **LEDs:** GPIO11 (red), GPIO12 (green), GPIO14 (blue) — active low on PB-03F
 
@@ -50,8 +50,8 @@ project builds without any external libraries.
 
 The release build produces a compact firmware:
 
-- **Flash:** ~5KB
-- **RAM:** ~4KB
+- **Flash:** ~51 KB (.text + .rodata)
+- **RAM:** ~4.3 KB (.data + .bss)
 
 ## Flashing
 
