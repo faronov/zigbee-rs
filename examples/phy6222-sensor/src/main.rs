@@ -25,8 +25,14 @@
 #[cfg(feature = "stubs")]
 mod stubs;
 
+mod time_driver;
+mod vectors;
+
 use cortex_m as _;
 use panic_halt as _;
+// Ensure the interrupt vector table is linked in
+#[allow(unused_imports)]
+use vectors::__INTERRUPTS;
 
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
@@ -91,35 +97,18 @@ fn led_off() {
     gpio_write(pins::LED_G, true);
 }
 
-// ── Time driver stub ────────────────────────────────────────────
-// PHY6222 has a 32-bit timer — a production firmware would use it
-// as the Embassy time driver. This stub is sufficient for build.
-
-struct Phy6222TimeDriver;
-
-impl Phy6222TimeDriver {
-    const fn new() -> Self {
-        Self
-    }
-}
-
-impl embassy_time_driver::Driver for Phy6222TimeDriver {
-    fn now(&self) -> u64 {
-        // Read from hardware timer in real implementation
-        0
-    }
-
-    fn schedule_wake(&self, _at: u64, _waker: &core::task::Waker) {
-        // Set alarm in hardware timer in real implementation
-    }
-}
-
-embassy_time_driver::time_driver_impl!(static TIME_DRIVER: Phy6222TimeDriver = Phy6222TimeDriver::new());
-
 // ── Main entry point ────────────────────────────────────────────
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
+    // Start the real SysTick-based time driver (MUST be first)
+    time_driver::init();
+
+    // Enable LL_IRQ (IRQ 17) in NVIC so radio interrupts fire
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::LlIrq);
+    }
+
     log::info!("[PHY6222] Zigbee Sensor starting (pure Rust radio driver!)");
 
     // Initialize GPIO for LEDs

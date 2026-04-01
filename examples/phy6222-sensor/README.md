@@ -50,7 +50,7 @@ project builds without any external libraries.
 
 The release build produces a compact firmware:
 
-- **Flash:** ~51 KB (.text + .rodata)
+- **Flash:** ~57 KB (.text + .rodata)
 - **RAM:** ~4.3 KB (.data + .bss)
 
 ## Flashing
@@ -73,7 +73,8 @@ pyocd flash -t phy6222 target/thumbv6m-none-eabi/release/phy6222-sensor
 
 - **First pure-Rust IEEE 802.15.4 radio driver** in the zigbee-rs project
 - Zigbee 3.0 end device on the ultra-low-cost PHY6222 (~$1.50 boards)
-- Embassy async runtime on Cortex-M0
+- Embassy async runtime on Cortex-M0 with **real SysTick time driver**
+- Proper interrupt vector table (32 entries for all PHY6222 peripherals)
 - No vendor dependencies — fully auditable, reproducible builds
 - Button-driven network join/leave with edge detection
 - RGB LED status indication
@@ -85,9 +86,12 @@ pyocd flash -t phy6222 target/thumbv6m-none-eabi/release/phy6222-sensor
 phy6222-sensor/
 ├── .cargo/config.toml   # Target: thumbv6m-none-eabi, build-std
 ├── Cargo.toml            # Dependencies (no vendor libs!)
-├── build.rs              # Minimal — just linker script, no vendor linking
+├── build.rs              # Linker script + device.x for interrupt vectors
+├── device.x              # PHY6222 interrupt vector names (32 IRQs)
 ├── memory.x              # Flash @ 0x11001000, RAM @ 0x1FFF0000
 └── src/
     ├── main.rs           # Entry point, device setup, sensor loop
+    ├── time_driver.rs    # Embassy time driver (SysTick, 1ms tick, µs resolution)
+    ├── vectors.rs        # Interrupt vector table + NVIC Interrupt enum
     └── stubs.rs          # CI stubs (not needed for real builds)
 ```

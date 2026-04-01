@@ -608,22 +608,16 @@ impl Phy6222Driver {
 
 // ── IRQ handler ─────────────────────────────────────────────────
 
-/// LL HW interrupt handler — called from the LL_IRQHandler vector.
+/// LL HW interrupt handler — called from the LL_IRQ vector.
 ///
 /// This must be registered as the interrupt handler for the LL_IRQn
-/// interrupt (typically IRQ #17 on PHY6222). The handler reads the
+/// interrupt (IRQ #17 on PHY6222). The handler reads the
 /// IRQ status, processes TX/RX completion, and signals the async driver.
 ///
-/// # Registration
-/// ```rust,ignore
-/// // In startup code, after Phy6222Driver::new():
-/// unsafe {
-///     let nvic = &*cortex_m::peripheral::NVIC::PTR;
-///     nvic.enable_irq(17); // LL_IRQn
-/// }
-/// ```
+/// The function name `LL_IRQ` matches the `device.x` linker symbol,
+/// overriding the weak `DefaultHandler` alias.
 #[unsafe(no_mangle)]
-pub extern "C" fn LL_IRQHandler() {
+pub extern "C" fn LL_IRQ() {
     let irq_status = reg_read(LL_HW_BASE + 0x10); // IRQ status register
 
     // Clear all pending IRQs

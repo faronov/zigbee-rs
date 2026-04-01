@@ -19,7 +19,7 @@ embassy-futures = "0.1"
 
 # ARM Cortex-M0 support
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
-cortex-m-rt = "0.7"
+cortex-m-rt = { version = "0.7", features = ["device"] }
 
 # Logging
 log = "0.4"
