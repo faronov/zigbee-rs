@@ -598,7 +598,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
             log::info!(
                 "[RX] NWK type={} src=0x{:04X} dst=0x{:04X} sec={} for_us={} len={}",
-                nwk_fc.frame_type as u8,
+                nwk_fc.frame_type,
                 src.0,
                 dst.0,
                 nwk_fc.security,
