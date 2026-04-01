@@ -15,8 +15,8 @@
 //! 1. Open local permit joining for `bdbcMinCommissioningTime`
 //! 2. Broadcast `Mgmt_Permit_Joining_req` to the network
 
-use zigbee_mac::pib::{PibAttribute, PibValue};
 use zigbee_mac::MacDriver;
+use zigbee_mac::pib::{PibAttribute, PibValue};
 use zigbee_nwk::DeviceType;
 use zigbee_types::ShortAddress;
 
@@ -98,8 +98,13 @@ impl<M: MacDriver> BdbLayer<M> {
             for (i, network) in networks.iter().enumerate() {
                 log::info!(
                     "[BDB:Steering] net[{}] PAN=0x{:04X} ch={} d={} permit={} LQI={} via 0x{:04X}",
-                    i, network.pan_id.0, network.logical_channel, network.depth,
-                    network.permit_joining, network.lqi, network.router_address.0,
+                    i,
+                    network.pan_id.0,
+                    network.logical_channel,
+                    network.depth,
+                    network.permit_joining,
+                    network.lqi,
+                    network.router_address.0,
                 );
             }
 
@@ -110,258 +115,274 @@ impl<M: MacDriver> BdbLayer<M> {
             // First pass: coordinator beacons only (depth == 0)
             // Second pass: all other routers
             for prefer_coordinator in [true, false] {
-            for network in &networks {
-                // Apply extended PAN ID filter
-                if has_epid_filter && network.extended_pan_id != use_epid {
-                    log::debug!(
-                        "[BDB:Steering] Skipping PAN 0x{:04X} — EPID mismatch",
-                        network.pan_id.0,
-                    );
-                    continue;
-                }
-
-                // Must have permit joining enabled
-                if !network.permit_joining {
-                    continue;
-                }
-
-                // Two-pass: coordinators first, then routers
-                let is_coordinator = network.depth == 0;
-                if prefer_coordinator && !is_coordinator {
-                    continue;
-                }
-                if !prefer_coordinator && is_coordinator {
-                    continue; // already tried
-                }
-
-                // One attempt per parent — avoid polluting TC state with repeated join/leave
-                let max_tries = 1u8;
-                let mut joined_addr = None;
-                for try_num in 0..max_tries {
-                    if try_num > 0 {
-                        log::info!(
-                            "[BDB:Steering] Retrying coordinator join (attempt {}/{})",
-                            try_num + 1,
-                            max_tries,
+                for network in &networks {
+                    // Apply extended PAN ID filter
+                    if has_epid_filter && network.extended_pan_id != use_epid {
+                        log::debug!(
+                            "[BDB:Steering] Skipping PAN 0x{:04X} — EPID mismatch",
+                            network.pan_id.0,
                         );
-                    }
-
-                log::info!(
-                    "[BDB:Steering] Joining PAN 0x{:04X} ch {} LQI {} depth {} via 0x{:04X}",
-                    network.pan_id.0,
-                    network.logical_channel,
-                    network.lqi,
-                    network.depth,
-                    network.router_address.0,
-                );
-
-                // Step 3: Attempt join
-                match self.zdo.nlme_join(network).await {
-                    Ok(addr) => {
-                        joined_addr = Some(addr);
-                        break;
-                    }
-                    Err(e) => {
-                        log::warn!("[BDB:Steering] Join failed: {:?}", e);
                         continue;
                     }
-                }
-                }
-                let nwk_addr = match joined_addr {
-                    Some(a) => a,
-                    None => continue,
-                };
 
-                // Step 4: Announce our presence
-                let ieee = self.zdo.nwk().nib().ieee_address;
-                if let Err(e) = self.zdo.device_annce(nwk_addr, ieee).await {
-                    log::warn!("[BDB:Steering] Device_annce failed: {:?}", e);
-                    // Non-fatal — continue commissioning
-                }
+                    // Must have permit joining enabled
+                    if !network.permit_joining {
+                        continue;
+                    }
 
-                // Step 5: Start router if we are a router
-                if self.zdo.nwk().device_type() == DeviceType::Router {
-                    let _ = self.zdo.nlme_start_router().await;
-                }
+                    // Two-pass: coordinators first, then routers
+                    let is_coordinator = network.depth == 0;
+                    if prefer_coordinator && !is_coordinator {
+                        continue;
+                    }
+                    if !prefer_coordinator && is_coordinator {
+                        continue; // already tried
+                    }
 
-                // Step 5b: TC link key exchange
-                // After joining, the coordinator sends Transport-Key (with NWK key)
-                // encrypted with the well-known TC link key (ZigBeeAlliance09).
-                // We must receive and process it before declaring success.
-                // Then send APSME-REQUEST-KEY(0x04) so Z2M establishes a unique TC link key.
-                log::info!("[BDB:Steering] Waiting for Transport-Key from TC...");
-
-                let mut key_received = false;
-                // With rx_on_when_idle=true in CapabilityInfo, the coordinator sends
-                // Transport-Key as a DIRECT unicast (not indirect). We must be in RX
-                // mode to catch it. Do a passive listen first, then fall back to polling.
-
-                // Phase 0: Passive RX listen — catch direct unicast Transport-Key
-                log::info!("[BDB:Steering] Phase 0: passive RX for direct Transport-Key...");
-                for rx_attempt in 0..10u8 {
-                    match self.zdo.aps_mut().nwk_mut().mac_mut().mcps_data_indication().await {
-                        Ok(mac_frame) => {
-                            let mac_payload = mac_frame.payload.as_slice();
+                    // One attempt per parent — avoid polluting TC state with repeated join/leave
+                    let max_tries = 1u8;
+                    let mut joined_addr = None;
+                    for try_num in 0..max_tries {
+                        if try_num > 0 {
                             log::info!(
-                                "[BDB:Steering] RX {}: {} bytes",
-                                rx_attempt,
-                                mac_payload.len(),
+                                "[BDB:Steering] Retrying coordinator join (attempt {}/{})",
+                                try_num + 1,
+                                max_tries,
                             );
-                            if let Some(true) = self.try_process_frame(mac_payload) {
-                                key_received = true;
+                        }
+
+                        log::info!(
+                            "[BDB:Steering] Joining PAN 0x{:04X} ch {} LQI {} depth {} via 0x{:04X}",
+                            network.pan_id.0,
+                            network.logical_channel,
+                            network.lqi,
+                            network.depth,
+                            network.router_address.0,
+                        );
+
+                        // Step 3: Attempt join
+                        match self.zdo.nlme_join(network).await {
+                            Ok(addr) => {
+                                joined_addr = Some(addr);
                                 break;
                             }
-                        }
-                        Err(_) => {
-                            // Timeout — no frame received
+                            Err(e) => {
+                                log::warn!("[BDB:Steering] Join failed: {:?}", e);
+                                continue;
+                            }
                         }
                     }
-                }
+                    let nwk_addr = match joined_addr {
+                        Some(a) => a,
+                        None => continue,
+                    };
 
-                if key_received {
-                    log::info!("[BDB:Steering] Transport-Key received during passive RX!");
-                    // fall through to success path below
-                }
+                    // Step 4: Announce our presence
+                    let ieee = self.zdo.nwk().nib().ieee_address;
+                    if let Err(e) = self.zdo.device_annce(nwk_addr, ieee).await {
+                        log::warn!("[BDB:Steering] Device_annce failed: {:?}", e);
+                        // Non-fatal — continue commissioning
+                    }
 
-                // Phase 1+2: Poll parent and coordinator if passive RX didn't work
-                let parent_addr = self.zdo.nwk().nib().parent_address;
+                    // Step 5: Start router if we are a router
+                    if self.zdo.nwk().device_type() == DeviceType::Router {
+                        let _ = self.zdo.nlme_start_router().await;
+                    }
 
-                const MAX_TOTAL_ROUNDS: usize = 40;
-                const MAX_EMPTY_ROUNDS: u8 = 10;
-                let mut empty_count: u8 = 0;
-                let mut total_rounds: usize = 0;
-                let mut data_frames: usize = 0;
+                    // Step 5b: TC link key exchange
+                    // After joining, the coordinator sends Transport-Key (with NWK key)
+                    // encrypted with the well-known TC link key (ZigBeeAlliance09).
+                    // We must receive and process it before declaring success.
+                    // Then send APSME-REQUEST-KEY(0x04) so Z2M establishes a unique TC link key.
+                    log::info!("[BDB:Steering] Waiting for Transport-Key from TC...");
 
-                while !key_received && total_rounds < MAX_TOTAL_ROUNDS && empty_count < MAX_EMPTY_ROUNDS {
-                    total_rounds += 1;
-                    let mut got_data_this_round = false;
+                    let mut key_received = false;
+                    // With rx_on_when_idle=true in CapabilityInfo, the coordinator sends
+                    // Transport-Key as a DIRECT unicast (not indirect). We must be in RX
+                    // mode to catch it. Do a passive listen first, then fall back to polling.
 
-                    // Poll parent for indirect frames
-                    match self.zdo.aps_mut().nwk_mut().mac_mut().mlme_poll().await {
-                        Ok(Some(mac_frame)) => {
-                            got_data_this_round = true;
-                            data_frames += 1;
-                            let mac_payload = mac_frame.as_slice();
-                            log::info!(
-                                "[BDB:Steering] P-Poll {}: {} bytes (total={})",
-                                total_rounds,
-                                mac_payload.len(),
-                                data_frames,
-                            );
-                            if let Some(true) = self.try_process_frame(mac_payload) {
-                                key_received = true;
-                                break;
+                    // Phase 0: Passive RX listen — catch direct unicast Transport-Key
+                    log::info!("[BDB:Steering] Phase 0: passive RX for direct Transport-Key...");
+                    for rx_attempt in 0..10u8 {
+                        match self
+                            .zdo
+                            .aps_mut()
+                            .nwk_mut()
+                            .mac_mut()
+                            .mcps_data_indication()
+                            .await
+                        {
+                            Ok(mac_frame) => {
+                                let mac_payload = mac_frame.payload.as_slice();
+                                log::info!(
+                                    "[BDB:Steering] RX {}: {} bytes",
+                                    rx_attempt,
+                                    mac_payload.len(),
+                                );
+                                if let Some(true) = self.try_process_frame(mac_payload) {
+                                    key_received = true;
+                                    break;
+                                }
                             }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            log::warn!("[BDB:Steering] P-Poll {}: err {:?}", total_rounds, e);
+                            Err(_) => {
+                                // Timeout — no frame received
+                            }
                         }
                     }
 
                     if key_received {
-                        break;
+                        log::info!("[BDB:Steering] Transport-Key received during passive RX!");
+                        // fall through to success path below
                     }
 
-                    // Phase 2: Poll coordinator (0x0000) for indirect frames.
-                    // The EZSP NCP may queue Transport-Key in the coordinator's own
-                    // indirect buffer (not routed through parent), especially when
-                    // parentOfNewNodeId in trustCenterJoinHandler points to the coordinator.
+                    // Phase 1+2: Poll parent and coordinator if passive RX didn't work
+                    let parent_addr = self.zdo.nwk().nib().parent_address;
+
+                    const MAX_TOTAL_ROUNDS: usize = 40;
+                    const MAX_EMPTY_ROUNDS: u8 = 10;
+                    let mut empty_count: u8 = 0;
+                    let mut total_rounds: usize = 0;
+                    let mut data_frames: usize = 0;
+
+                    while !key_received
+                        && total_rounds < MAX_TOTAL_ROUNDS
+                        && empty_count < MAX_EMPTY_ROUNDS
                     {
-                        let mac = self.zdo.aps_mut().nwk_mut().mac_mut();
-                        let _ = mac
-                            .mlme_set(
-                                PibAttribute::MacCoordShortAddress,
-                                PibValue::ShortAddress(ShortAddress(0x0000)),
-                            )
-                            .await;
-                        match mac.mlme_poll().await {
+                        total_rounds += 1;
+                        let mut got_data_this_round = false;
+
+                        // Poll parent for indirect frames
+                        match self.zdo.aps_mut().nwk_mut().mac_mut().mlme_poll().await {
                             Ok(Some(mac_frame)) => {
                                 got_data_this_round = true;
                                 data_frames += 1;
                                 let mac_payload = mac_frame.as_slice();
                                 log::info!(
-                                    "[BDB:Steering] C-Poll {}: {} bytes (total={})",
+                                    "[BDB:Steering] P-Poll {}: {} bytes (total={})",
                                     total_rounds,
                                     mac_payload.len(),
                                     data_frames,
                                 );
                                 if let Some(true) = self.try_process_frame(mac_payload) {
                                     key_received = true;
+                                    break;
                                 }
                             }
                             Ok(None) => {}
                             Err(e) => {
-                                log::debug!("[BDB:Steering] C-Poll {}: err {:?}", total_rounds, e);
+                                log::warn!("[BDB:Steering] P-Poll {}: err {:?}", total_rounds, e);
                             }
                         }
-                        // Restore parent address
-                        let mac = self.zdo.aps_mut().nwk_mut().mac_mut();
-                        let _ = mac
-                            .mlme_set(
-                                PibAttribute::MacCoordShortAddress,
-                                PibValue::ShortAddress(parent_addr),
-                            )
-                            .await;
+
+                        if key_received {
+                            break;
+                        }
+
+                        // Phase 2: Poll coordinator (0x0000) for indirect frames.
+                        // The EZSP NCP may queue Transport-Key in the coordinator's own
+                        // indirect buffer (not routed through parent), especially when
+                        // parentOfNewNodeId in trustCenterJoinHandler points to the coordinator.
+                        {
+                            let mac = self.zdo.aps_mut().nwk_mut().mac_mut();
+                            let _ = mac
+                                .mlme_set(
+                                    PibAttribute::MacCoordShortAddress,
+                                    PibValue::ShortAddress(ShortAddress(0x0000)),
+                                )
+                                .await;
+                            match mac.mlme_poll().await {
+                                Ok(Some(mac_frame)) => {
+                                    got_data_this_round = true;
+                                    data_frames += 1;
+                                    let mac_payload = mac_frame.as_slice();
+                                    log::info!(
+                                        "[BDB:Steering] C-Poll {}: {} bytes (total={})",
+                                        total_rounds,
+                                        mac_payload.len(),
+                                        data_frames,
+                                    );
+                                    if let Some(true) = self.try_process_frame(mac_payload) {
+                                        key_received = true;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    log::debug!(
+                                        "[BDB:Steering] C-Poll {}: err {:?}",
+                                        total_rounds,
+                                        e
+                                    );
+                                }
+                            }
+                            // Restore parent address
+                            let mac = self.zdo.aps_mut().nwk_mut().mac_mut();
+                            let _ = mac
+                                .mlme_set(
+                                    PibAttribute::MacCoordShortAddress,
+                                    PibValue::ShortAddress(parent_addr),
+                                )
+                                .await;
+                        }
+
+                        if key_received {
+                            break;
+                        }
+
+                        if got_data_this_round {
+                            empty_count = 0;
+                        } else {
+                            empty_count += 1;
+                            log::debug!(
+                                "[BDB:Steering] Round {}: no data ({}/{})",
+                                total_rounds,
+                                empty_count,
+                                MAX_EMPTY_ROUNDS,
+                            );
+                        }
                     }
 
-                    if key_received {
-                        break;
-                    }
-
-                    if got_data_this_round {
-                        empty_count = 0;
-                    } else {
-                        empty_count += 1;
-                        log::debug!(
-                            "[BDB:Steering] Round {}: no data ({}/{})",
+                    if !key_received {
+                        log::warn!(
+                            "[BDB:Steering] Transport-Key NOT received after {} rounds ({} data frames, {} consecutive empty)",
                             total_rounds,
+                            data_frames,
                             empty_count,
-                            MAX_EMPTY_ROUNDS,
                         );
                     }
+
+                    if !key_received {
+                        log::warn!(
+                            "[BDB:Steering] Transport-Key not received — leaving PAN 0x{:04X}",
+                            network.pan_id.0,
+                        );
+                        // Leave cleanly so the TC can clean up its state.
+                        // Then continue to try the next PAN in the scan list.
+                        let _ = self.zdo.nwk_mut().nlme_leave(false).await;
+                        continue;
+                    }
+
+                    // Step 5c: Re-send Device_annce now that we have the NWK key
+                    // (first attempt was pre-key and likely failed with NoAck)
+                    if let Err(e) = self.zdo.device_annce(nwk_addr, ieee).await {
+                        log::warn!("[BDB:Steering] Device_annce (post-key) failed: {:?}", e);
+                    }
+
+                    // Step 5d: Send APSME-REQUEST-KEY to TC for unique link key
+                    // Z2M requires this within ~10s of joining
+                    let tc_addr = zigbee_types::ShortAddress::COORDINATOR;
+                    if let Err(e) = self.zdo.aps_mut().send_request_key(tc_addr).await {
+                        log::warn!("[BDB:Steering] Request-Key failed: {:?}", e);
+                        // Non-fatal — some coordinators don't require this
+                    }
+
+                    // Success!
+                    self.attributes.node_is_on_a_network = true;
+                    self.attributes.commissioning_status =
+                        crate::attributes::BdbCommissioningStatus::Success;
+
+                    log::info!("[BDB:Steering] Joined successfully as 0x{:04X}", nwk_addr.0,);
+                    return Ok(());
                 }
-
-                if !key_received {
-                    log::warn!(
-                        "[BDB:Steering] Transport-Key NOT received after {} rounds ({} data frames, {} consecutive empty)",
-                        total_rounds, data_frames, empty_count,
-                    );
-                }
-
-                if !key_received {
-                    log::warn!(
-                        "[BDB:Steering] Transport-Key not received — leaving PAN 0x{:04X}",
-                        network.pan_id.0,
-                    );
-                    // Leave cleanly so the TC can clean up its state.
-                    // Then continue to try the next PAN in the scan list.
-                    let _ = self.zdo.nwk_mut().nlme_leave(false).await;
-                    continue;
-                }
-
-                // Step 5c: Re-send Device_annce now that we have the NWK key
-                // (first attempt was pre-key and likely failed with NoAck)
-                if let Err(e) = self.zdo.device_annce(nwk_addr, ieee).await {
-                    log::warn!("[BDB:Steering] Device_annce (post-key) failed: {:?}", e);
-                }
-
-                // Step 5d: Send APSME-REQUEST-KEY to TC for unique link key
-                // Z2M requires this within ~10s of joining
-                let tc_addr = zigbee_types::ShortAddress::COORDINATOR;
-                if let Err(e) = self.zdo.aps_mut().send_request_key(tc_addr).await {
-                    log::warn!("[BDB:Steering] Request-Key failed: {:?}", e);
-                    // Non-fatal — some coordinators don't require this
-                }
-
-                // Success!
-                self.attributes.node_is_on_a_network = true;
-                self.attributes.commissioning_status =
-                    crate::attributes::BdbCommissioningStatus::Success;
-
-                log::info!("[BDB:Steering] Joined successfully as 0x{:04X}", nwk_addr.0,);
-                return Ok(());
-            }
             } // end prefer_coordinator pass
         }
 
@@ -418,9 +439,7 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Parse a MAC payload, log diagnostics, and attempt Transport-Key extraction.
     /// Returns `Some(true)` if the NWK key was installed.
     fn try_process_frame(&mut self, mac_payload: &[u8]) -> Option<bool> {
-        if let Some((nwk_hdr, nwk_consumed)) =
-            zigbee_nwk::frames::NwkHeader::parse(mac_payload)
-        {
+        if let Some((nwk_hdr, nwk_consumed)) = zigbee_nwk::frames::NwkHeader::parse(mac_payload) {
             log::info!(
                 "[BDB:Steering] NWK: type={} src=0x{:04X} dst=0x{:04X} sec={}",
                 nwk_hdr.frame_control.frame_type,
@@ -431,30 +450,30 @@ impl<M: MacDriver> BdbLayer<M> {
             // Hex dump coordinator frames for debugging
             if nwk_hdr.src_addr.0 == 0x0000 {
                 let dump_len = mac_payload.len().min(32);
-                let hex: heapless::String<96> = mac_payload[..dump_len]
-                    .iter()
-                    .fold(heapless::String::new(), |mut s, b| {
-                        let _ = core::fmt::Write::write_fmt(
-                            &mut s,
-                            format_args!("{:02X}", b),
-                        );
-                        s
-                    });
+                let hex: heapless::String<96> =
+                    mac_payload[..dump_len]
+                        .iter()
+                        .fold(heapless::String::new(), |mut s, b| {
+                            let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{:02X}", b));
+                            s
+                        });
                 log::info!("[BDB:Steering] COORD hex: {}", hex);
             }
             self.process_key_wait_frame(mac_payload, &nwk_hdr, nwk_consumed, 0)
         } else if mac_payload.len() > 2 {
             let dump_len = mac_payload.len().min(20);
-            let hex: heapless::String<60> = mac_payload[..dump_len]
-                .iter()
-                .fold(heapless::String::new(), |mut s, b| {
-                    let _ = core::fmt::Write::write_fmt(
-                        &mut s,
-                        format_args!("{:02X}", b),
-                    );
-                    s
-                });
-            log::warn!("[BDB:Steering] NWK parse FAIL: len={} {}", mac_payload.len(), hex);
+            let hex: heapless::String<60> =
+                mac_payload[..dump_len]
+                    .iter()
+                    .fold(heapless::String::new(), |mut s, b| {
+                        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{:02X}", b));
+                        s
+                    });
+            log::warn!(
+                "[BDB:Steering] NWK parse FAIL: len={} {}",
+                mac_payload.len(),
+                hex
+            );
             None
         } else {
             None
@@ -542,22 +561,22 @@ impl<M: MacDriver> BdbLayer<M> {
                     }
 
                     // Try 2: TC link key with original AAD (no level patching)
-                    if !decrypted {
-                        if let Some(pt) = self.zdo.aps().nwk().security().decrypt(
+                    if !decrypted
+                        && let Some(pt) = self.zdo.aps().nwk().security().decrypt(
                             &aad_buf[..aad_copy_len],
                             ciphertext,
                             &tc_link_key,
                             &sec_hdr,
-                        ) {
-                            log::info!(
-                                "[BDB:Steering] TC link key decrypt SUCCESS (raw)! {} bytes",
-                                pt.len()
-                            );
-                            let len = pt.len().min(128);
-                            buf[..len].copy_from_slice(&pt[..len]);
-                            payload_data = Some((buf, len));
-                            decrypted = true;
-                        }
+                        )
+                    {
+                        log::info!(
+                            "[BDB:Steering] TC link key decrypt SUCCESS (raw)! {} bytes",
+                            pt.len()
+                        );
+                        let len = pt.len().min(128);
+                        buf[..len].copy_from_slice(&pt[..len]);
+                        payload_data = Some((buf, len));
+                        decrypted = true;
                     }
 
                     // Try 3: Key-Transport key derived from TC link key
@@ -591,7 +610,10 @@ impl<M: MacDriver> BdbLayer<M> {
                                 log::info!(
                                     "[BDB:Steering] Undecryptable unicast: sec_ctrl={:02X} fc={:02X}{:02X}{:02X}{:02X} ks={} len={}",
                                     after_nwk[0],
-                                    after_nwk[1], after_nwk[2], after_nwk[3], after_nwk[4],
+                                    after_nwk[1],
+                                    after_nwk[2],
+                                    after_nwk[3],
+                                    after_nwk[4],
                                     sec_hdr.key_seq_number,
                                     ciphertext.len(),
                                 );

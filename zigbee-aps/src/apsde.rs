@@ -543,9 +543,7 @@ impl<M: MacDriver> ApsLayer<M> {
                     extended_header: true,
                 },
                 dst_endpoint: match delivery_mode {
-                    ApsDeliveryMode::Unicast | ApsDeliveryMode::Broadcast => {
-                        Some(req.dst_endpoint)
-                    }
+                    ApsDeliveryMode::Unicast | ApsDeliveryMode::Broadcast => Some(req.dst_endpoint),
                     _ => None,
                 },
                 group_address: match delivery_mode {
@@ -625,7 +623,11 @@ impl<M: MacDriver> ApsLayer<M> {
                     return Err(nwk_status_to_aps(nwk_err));
                 }
             } else {
-                log::warn!("[APS] Fragment {}/{} encryption failed", block_num, total_blocks);
+                log::warn!(
+                    "[APS] Fragment {}/{} encryption failed",
+                    block_num,
+                    total_blocks
+                );
                 return Err(ApsStatus::SecurityFail);
             }
         }
@@ -775,8 +777,7 @@ impl<M: MacDriver> ApsLayer<M> {
             // Fallback: try with un-patched AAD (original OTA security level)
             if !decrypt_ok {
                 let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
-                if let Some(plaintext) =
-                    self.security.decrypt(aad_raw, ciphertext, &key, &sec_hdr)
+                if let Some(plaintext) = self.security.decrypt(aad_raw, ciphertext, &key, &sec_hdr)
                 {
                     log::info!(
                         "[APS RX] APS decrypt SUCCESS (raw AAD), plaintext {} bytes",
@@ -794,9 +795,7 @@ impl<M: MacDriver> ApsLayer<M> {
             if !decrypt_ok && key_id == crate::security::KEY_ID_KEY_TRANSPORT {
                 let tc_key = *self.security.default_tc_link_key();
                 // Try with patched AAD
-                if let Some(plaintext) =
-                    self.security.decrypt(aad, ciphertext, &tc_key, &sec_hdr)
-                {
+                if let Some(plaintext) = self.security.decrypt(aad, ciphertext, &tc_key, &sec_hdr) {
                     log::info!("[APS RX] APS decrypt SUCCESS (raw TC key + patched AAD)");
                     let pt_len = plaintext.len().min(decrypted_buf.data.len());
                     decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
@@ -807,8 +806,9 @@ impl<M: MacDriver> ApsLayer<M> {
                 // Try with un-patched AAD
                 if !decrypt_ok {
                     let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
-                    if let Some(plaintext) =
-                        self.security.decrypt(aad_raw, ciphertext, &tc_key, &sec_hdr)
+                    if let Some(plaintext) = self
+                        .security
+                        .decrypt(aad_raw, ciphertext, &tc_key, &sec_hdr)
                     {
                         log::info!("[APS RX] APS decrypt SUCCESS (raw TC key + raw AAD)");
                         let pt_len = plaintext.len().min(decrypted_buf.data.len());
@@ -1275,7 +1275,10 @@ impl<M: MacDriver> ApsLayer<M> {
                     incoming_frame_counter: 0,
                 };
                 let _ = self.security_mut().add_key(entry);
-                log::info!("[APS] Application link key installed for partner {:02X?}", partner_ieee);
+                log::info!(
+                    "[APS] Application link key installed for partner {:02X?}",
+                    partner_ieee
+                );
             }
             _ => {
                 log::debug!("[APS] Transport-Key: unknown key_type=0x{:02X}", key_type,);

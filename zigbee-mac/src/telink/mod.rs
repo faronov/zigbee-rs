@@ -438,7 +438,8 @@ impl TelinkMac {
                 let seed = self.dsn.wrapping_add(nb).wrapping_add(attempt);
                 let random = Self::prng(seed);
                 let backoff = (random % (max_val + 1)) as u64;
-                let delay_us = backoff * UNIT_BACKOFF_SYMBOLS * SYMBOL_PERIOD_US;                if delay_us > 0 {
+                let delay_us = backoff * UNIT_BACKOFF_SYMBOLS * SYMBOL_PERIOD_US;
+                if delay_us > 0 {
                     Timer::after_micros(delay_us).await;
                 }
 
@@ -478,7 +479,8 @@ impl TelinkMac {
             // Spec: aTurnaroundTime (192µs) + ACK frame duration (~352µs).
             // Allow 1.5ms total for software overhead.
             let seq = frame[2];
-            let ack_result = select::select(self.driver.receive(), Timer::after_micros(ACK_WAIT_US)).await;
+            let ack_result =
+                select::select(self.driver.receive(), Timer::after_micros(ACK_WAIT_US)).await;
 
             if let select::Either::First(Ok(rx)) = ack_result {
                 if rx.len >= 3 {
@@ -935,7 +937,11 @@ impl MacDriver for TelinkMac {
         self.csma_ca_transmit(&data_req, true).await?;
 
         // Wait for response — parent may reply with data or empty ACK
-        let result = select::select(Timer::after_millis(POLL_RESPONSE_WAIT_MS), self.driver.receive()).await;
+        let result = select::select(
+            Timer::after_millis(POLL_RESPONSE_WAIT_MS),
+            self.driver.receive(),
+        )
+        .await;
 
         // Disable RX after poll for sleepy devices
         if !self.rx_on_when_idle {
@@ -992,7 +998,10 @@ impl MacDriver for TelinkMac {
                     frame: frame_buf,
                     remaining_ticks: INDIRECT_PERSISTENCE_TICKS,
                 });
-                log::debug!("telink: buffered indirect frame (queue={})", self.indirect_queue.len());
+                log::debug!(
+                    "telink: buffered indirect frame (queue={})",
+                    self.indirect_queue.len()
+                );
                 return Ok(McpsDataConfirm {
                     msdu_handle: req.msdu_handle,
                     timestamp: None,
@@ -1019,8 +1028,8 @@ impl MacDriver for TelinkMac {
     }
 
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
-        let deadline =
-            embassy_time::Instant::now() + embassy_time::Duration::from_millis(RX_INDICATION_TIMEOUT_MS);
+        let deadline = embassy_time::Instant::now()
+            + embassy_time::Duration::from_millis(RX_INDICATION_TIMEOUT_MS);
 
         loop {
             let now = embassy_time::Instant::now();
@@ -1147,14 +1156,23 @@ impl MacDriver for TelinkMac {
 impl TelinkMac {
     /// Check whether we have a buffered indirect frame for the given address.
     fn has_indirect_frame_for(&self, addr: &MacAddress) -> bool {
-        self.indirect_queue.iter().any(|e| addresses_match(&e.dst, addr))
+        self.indirect_queue
+            .iter()
+            .any(|e| addresses_match(&e.dst, addr))
     }
 
     /// Transmit the first matching indirect frame to the polling device.
     async fn send_indirect_to(&mut self, addr: &MacAddress) {
-        if let Some(idx) = self.indirect_queue.iter().position(|e| addresses_match(&e.dst, addr)) {
+        if let Some(idx) = self
+            .indirect_queue
+            .iter()
+            .position(|e| addresses_match(&e.dst, addr))
+        {
             let entry = self.indirect_queue.remove(idx);
-            log::debug!("telink: sending indirect frame to poller (queue={})", self.indirect_queue.len());
+            log::debug!(
+                "telink: sending indirect frame to poller (queue={})",
+                self.indirect_queue.len()
+            );
             let _ = self.csma_ca_transmit(&entry.frame, true).await;
         }
     }

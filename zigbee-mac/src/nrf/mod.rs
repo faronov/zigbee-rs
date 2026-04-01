@@ -78,7 +78,14 @@ impl<'a, T: Instance> NrfMac<'a, T> {
         let ieee = Self::read_ficr_ieee();
         log::info!(
             "[MAC] IEEE: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            ieee[0], ieee[1], ieee[2], ieee[3], ieee[4], ieee[5], ieee[6], ieee[7],
+            ieee[0],
+            ieee[1],
+            ieee[2],
+            ieee[3],
+            ieee[4],
+            ieee[5],
+            ieee[6],
+            ieee[7],
         );
 
         Self {
@@ -589,12 +596,7 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                     pass,
                     self.short_address.0
                 );
-                build_data_request_short(
-                    self.next_dsn(),
-                    &parent,
-                    self.pan_id,
-                    self.short_address,
-                )
+                build_data_request_short(self.next_dsn(), &parent, self.pan_id, self.short_address)
             } else {
                 log::debug!("[MAC:Poll] pass {}: IEEE", pass);
                 build_data_request(self.next_dsn(), &parent, &self.extended_address)
@@ -614,8 +616,7 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             // Use a longer window (1500ms) and more attempts (40) to handle
             // busy channels where coordinator transmissions compete with
             // parent indirect frame delivery.
-            let deadline =
-                embassy_time::Instant::now() + embassy_time::Duration::from_millis(1500);
+            let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(1500);
 
             let mut got_none = false;
             for _rx_attempt in 0..40u8 {
@@ -626,11 +627,8 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                 let remaining = deadline - now;
 
                 let mut rx_pkt = Packet::new();
-                let result = select::select(
-                    Timer::after(remaining),
-                    self.radio.receive(&mut rx_pkt),
-                )
-                .await;
+                let result =
+                    select::select(Timer::after(remaining), self.radio.receive(&mut rx_pkt)).await;
 
                 match result {
                     select::Either::Second(Ok(())) => {
@@ -648,9 +646,7 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                                 got_none = true;
                                 break;
                             }
-                            log::info!(
-                                "[MAC:Poll] ACK frame_pending=1, waiting for data"
-                            );
+                            log::info!("[MAC:Poll] ACK frame_pending=1, waiting for data");
                             continue;
                         }
 
@@ -680,9 +676,7 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                                     || d.0 == 0xFFFD
                                     || d.0 == 0xFFFC
                             }
-                            Some(MacAddress::Extended(_, e)) => {
-                                *e == self.extended_address
-                            }
+                            Some(MacAddress::Extended(_, e)) => *e == self.extended_address,
                             None => true, // Can't parse → accept
                         };
                         if !for_us {
@@ -824,10 +818,7 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             match ack_result {
                 select::Either::Second(Ok(())) => {
                     let ack_data: &[u8] = &*ack_pkt;
-                    if ack_data.len() >= 3
-                        && (ack_data[0] & 0x07) == 0x02
-                        && ack_data[2] == dsn
-                    {
+                    if ack_data.len() >= 3 && (ack_data[0] & 0x07) == 0x02 && ack_data[2] == dsn {
                         log::info!("[MAC TX] ACK ok dsn={} attempt={}", dsn, attempt);
                         ack_ok = true;
                         break;

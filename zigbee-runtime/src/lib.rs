@@ -578,8 +578,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             let (header, consumed) = match zigbee_nwk::frames::NwkHeader::parse(mac_payload) {
                 Some(v) => v,
                 None => {
-                    log::warn!("[RX] NWK header parse failed, {} bytes: {:02X?}",
-                        mac_payload.len(), &mac_payload[..mac_payload.len().min(8)]);
+                    log::warn!(
+                        "[RX] NWK header parse failed, {} bytes: {:02X?}",
+                        mac_payload.len(),
+                        &mac_payload[..mac_payload.len().min(8)]
+                    );
                     return None;
                 }
             };
@@ -593,9 +596,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 || dst == ShortAddress(0xFFFF)
                 || dst == ShortAddress(0xFFFD);
 
-            log::info!("[RX] NWK type={} src=0x{:04X} dst=0x{:04X} sec={} for_us={} len={}",
-                nwk_fc.frame_type as u8, src.0, dst.0, nwk_fc.security, is_for_us,
-                mac_payload.len() - consumed);
+            log::info!(
+                "[RX] NWK type={} src=0x{:04X} dst=0x{:04X} sec={} for_us={} len={}",
+                nwk_fc.frame_type as u8,
+                src.0,
+                dst.0,
+                nwk_fc.security,
+                is_for_us,
+                mac_payload.len() - consumed
+            );
 
             if !is_for_us {
                 return None;

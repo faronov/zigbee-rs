@@ -102,7 +102,10 @@ impl<M: MacDriver> BdbLayer<M> {
         // NWK frames can be encrypted. Without this, NWK security is broken.
         let nwk_key = generate_nwk_key();
         let key_seq: u8 = 0;
-        self.zdo.nwk_mut().security_mut().set_network_key(nwk_key, key_seq);
+        self.zdo
+            .nwk_mut()
+            .security_mut()
+            .set_network_key(nwk_key, key_seq);
         self.zdo.nwk_mut().nib_mut().active_key_seq_number = key_seq;
         log::info!("[BDB:Formation] NWK key installed (seq={})", key_seq);
 

@@ -285,7 +285,11 @@ impl<M: MacDriver> NwkLayer<M> {
             "[NWK] Association cap: rx_on_idle={} ffd={} -> parent 0x{:04X}",
             cap.rx_on_when_idle,
             cap.device_type_ffd,
-            if network.router_address.0 != 0xFFFF { network.router_address.0 } else { 0x0000 },
+            if network.router_address.0 != 0xFFFF {
+                network.router_address.0
+            } else {
+                0x0000
+            },
         );
 
         // Perform MAC association — use discovered router address, not hardcoded coordinator
@@ -774,19 +778,13 @@ impl<M: MacDriver> NwkLayer<M> {
         // rejoin the first network whose extended PAN ID matches.
         // Phase 1 — current channel only
         let current_mask = ChannelMask(1u32 << saved_channel);
-        if let Ok(addr) =
-            self.try_rejoin_on_mask(current_mask, &saved_ext_pan).await
-        {
+        if let Ok(addr) = self.try_rejoin_on_mask(current_mask, &saved_ext_pan).await {
             return Ok(addr);
         }
 
         // Phase 2 — primary Touchlink channels (11, 15, 20, 25)
-        let primary_mask = ChannelMask(
-            (1u32 << 11) | (1u32 << 15) | (1u32 << 20) | (1u32 << 25),
-        );
-        if let Ok(addr) =
-            self.try_rejoin_on_mask(primary_mask, &saved_ext_pan).await
-        {
+        let primary_mask = ChannelMask((1u32 << 11) | (1u32 << 15) | (1u32 << 20) | (1u32 << 25));
+        if let Ok(addr) = self.try_rejoin_on_mask(primary_mask, &saved_ext_pan).await {
             return Ok(addr);
         }
 
@@ -814,10 +812,7 @@ impl<M: MacDriver> NwkLayer<M> {
             if net.extended_pan_id == *ext_pan {
                 match self.nlme_join(net, JoinMethod::Rejoin).await {
                     Ok(addr) => {
-                        log::info!(
-                            "[NWK] Orphan recovery succeeded — addr=0x{:04X}",
-                            addr.0
-                        );
+                        log::info!("[NWK] Orphan recovery succeeded — addr=0x{:04X}", addr.0);
                         return Ok(addr);
                     }
                     Err(e) => {

@@ -232,11 +232,7 @@ impl<M: MacDriver> NwkLayer<M> {
             let len = rrep.serialize(&mut payload);
 
             if let Err(e) = self
-                .send_nwk_command(
-                    pending.next_hop,
-                    NwkCommandId::RouteReply,
-                    &payload[..len],
-                )
+                .send_nwk_command(pending.next_hop, NwkCommandId::RouteReply, &payload[..len])
                 .await
             {
                 log::warn!(

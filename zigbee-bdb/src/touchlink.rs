@@ -40,8 +40,7 @@ pub const TOUCHLINK_PRIMARY_CHANNELS: [u8; 4] = [11, 15, 20, 25];
 
 /// ZLL / Touchlink pre-configured link key (used for key transport).
 pub const TOUCHLINK_PRECONFIGURED_LINK_KEY: [u8; 16] = [
-    0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE,
-    0xDF,
+    0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF,
 ];
 
 /// Scan duration per channel in milliseconds.
@@ -233,10 +232,7 @@ impl<M: MacDriver> BdbLayer<M> {
                     .mac_mut()
                     .mcps_data(zigbee_mac::McpsDataRequest {
                         src_addr_mode: zigbee_mac::AddressMode::Extended,
-                        dst_address: MacAddress::Short(
-                            PanId(0xFFFF),
-                            ShortAddress(0xFFFF),
-                        ),
+                        dst_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
                         payload: &scan_payload[..scan_len],
                         msdu_handle: 0,
                         tx_options: zigbee_mac::TxOptions::default(),
@@ -309,10 +305,7 @@ impl<M: MacDriver> BdbLayer<M> {
             .mac_mut()
             .mcps_data(zigbee_mac::McpsDataRequest {
                 src_addr_mode: zigbee_mac::AddressMode::Extended,
-                dst_address: MacAddress::Short(
-                    PanId(0xFFFF),
-                    ShortAddress(0xFFFF),
-                ),
+                dst_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
                 payload: &join_payload[..join_len],
                 msdu_handle: 1,
                 tx_options: zigbee_mac::TxOptions::default(),
@@ -327,8 +320,7 @@ impl<M: MacDriver> BdbLayer<M> {
         }
 
         self.attributes.node_is_on_a_network = true;
-        self.attributes.commissioning_status =
-            crate::attributes::BdbCommissioningStatus::Success;
+        self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::Success;
         log::info!("[BDB:Touchlink] Commissioning complete");
         Ok(())
     }
@@ -385,10 +377,7 @@ impl<M: MacDriver> BdbLayer<M> {
             .mac_mut()
             .mcps_data(zigbee_mac::McpsDataRequest {
                 src_addr_mode: zigbee_mac::AddressMode::Extended,
-                dst_address: MacAddress::Short(
-                    PanId(0xFFFF),
-                    ShortAddress(0xFFFF),
-                ),
+                dst_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
                 payload: &payload[..len],
                 msdu_handle: 2,
                 tx_options: zigbee_mac::TxOptions::default(),

@@ -295,12 +295,9 @@ impl RoutingTable {
             if elapsed > max_age {
                 disc.active = false;
                 // Update the corresponding route entry to DiscoveryFailed
-                if let Some(route) = self
-                    .routes
-                    .iter_mut()
-                    .find(|r| r.destination == disc.destination
-                        && r.status == RouteStatus::DiscoveryUnderway)
-                {
+                if let Some(route) = self.routes.iter_mut().find(|r| {
+                    r.destination == disc.destination && r.status == RouteStatus::DiscoveryUnderway
+                }) {
                     route.status = RouteStatus::DiscoveryFailed;
                 }
                 log::debug!(
