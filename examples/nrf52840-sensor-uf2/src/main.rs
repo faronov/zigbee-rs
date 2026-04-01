@@ -33,6 +33,7 @@
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
+use embassy_nrf::saadc::{self, ChannelConfig, Saadc, VddInput};
 use embassy_nrf::temp::Temp;
 use embassy_nrf::{self as _, bind_interrupts, gpio, peripherals, radio};
 use embassy_time::{Duration, Instant, Timer};
@@ -60,19 +61,23 @@ static LOGGER: DefmtLogger = DefmtLogger;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
+use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
+use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
 const REPORT_INTERVAL_SECS: u64 = 15;
 const FAST_POLL_MS: u64 = 250; // Fast poll during interview (250ms)
 const SLOW_POLL_SECS: u64 = 10; // Normal poll interval (10s)
-const FAST_POLL_DURATION_SECS: u64 = 60; // Stay in fast-poll for 60s after join
+const FAST_POLL_DURATION_SECS: u64 = 120; // Max fast-poll window (safety timeout)
+const EXPECTED_REPORT_CLUSTERS: usize = 3; // PowerConfig + Temp + Humidity
 
 bind_interrupts!(struct Irqs {
     RADIO => radio::InterruptHandler<peripherals::RADIO>;
     TEMP => embassy_nrf::temp::InterruptHandler;
+    SAADC => saadc::InterruptHandler;
 });
 
 /// Disable SoftDevice S140 via SVC call (ProMicro / nice!nano only).
@@ -186,6 +191,12 @@ async fn main(_spawner: Spawner) {
     let mut button = create_button(&mut p);
     let mut temp_sensor = Temp::new(p.TEMP, Irqs);
 
+    // SAADC for battery voltage (VDD via internal divider)
+    let saadc_config = saadc::Config::default();
+    let channel_config = ChannelConfig::single_ended(VddInput);
+    let mut saadc_inst = Saadc::new(p.SAADC, Irqs, saadc_config, [channel_config]);
+    saadc_inst.calibrate().await;
+
     // Boot signal: LED solid ON 3 seconds
     led_on(&mut led);
     Timer::after(Duration::from_secs(3)).await;
@@ -193,7 +204,8 @@ async fn main(_spawner: Spawner) {
     Timer::after(Duration::from_millis(500)).await;
 
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
-    let mac = zigbee_mac::nrf::NrfMac::new(radio);
+    let mut mac = zigbee_mac::nrf::NrfMac::new(radio);
+    mac.set_tx_power(8); // Max TX power (+8 dBm) for better coordinator reach
 
     info!("Radio ready");
 
@@ -206,16 +218,25 @@ async fn main(_spawner: Spawner) {
     basic_cluster.set_power_source(0x03); // Battery
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
+    let mut power_cluster = PowerConfigCluster::new();
+    power_cluster.set_battery_size(4);     // AAA
+    power_cluster.set_battery_quantity(2); // 2× AAA
+    power_cluster.set_battery_rated_voltage(15); // 1.5V per cell
     let mut hum_tick: u32 = 0;
 
     let mut device = ZigbeeDevice::builder(mac)
         .device_type(DeviceType::EndDevice)
+        .power_mode(PowerMode::Sleepy {
+            poll_interval_ms: 10_000,
+            wake_duration_ms: 500,
+        })
         .manufacturer("Zigbee-RS")
         .model("nRF52840-UF2-Sensor")
         .sw_build("0.1.0")
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
         .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
             ep.cluster_server(0x0000) // Basic
+                .cluster_server(0x0001) // Power Configuration
                 .cluster_server(0x0402) // Temperature Measurement
                 .cluster_server(0x0405) // Relative Humidity
         })
@@ -233,6 +254,7 @@ async fn main(_spawner: Spawner) {
         ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
         ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+        ClusterRef { endpoint: 1, cluster: &mut power_cluster },
     ];
     if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
         if log_event(e, &mut led) {
@@ -247,12 +269,26 @@ async fn main(_spawner: Spawner) {
         let hum_hundredths = 5000u16; // initial humidity placeholder
         temp_cluster.set_temperature(temp_hundredths);
         hum_cluster.set_humidity(hum_hundredths);
+
+        // Battery voltage via SAADC (VDD, 12-bit, internal ref 0.6V, gain 1/6 → 3.6V range)
+        let mut buf = [0i16; 1];
+        saadc_inst.sample(&mut buf).await;
+        let raw = buf[0].max(0) as u32;
+        let voltage_mv = raw * 3600 / 4096;
+        let pct = if voltage_mv >= 3000 { 100u8 }
+                  else if voltage_mv <= 1800 { 0 }
+                  else { ((voltage_mv - 1800) * 100 / 1200) as u8 };
+        power_cluster.set_battery_voltage((voltage_mv / 100) as u8);
+        power_cluster.set_battery_percentage(pct * 2); // ZCL: 0.5% units
+
         info!(
-            "Initial: T={}.{:02}°C  H={}.{:02}%",
+            "Initial: T={}.{:02}°C  H={}.{:02}%  Bat={}mV ({}%)",
             temp_hundredths / 100,
             (temp_hundredths % 100).unsigned_abs(),
             hum_hundredths / 100,
             hum_hundredths % 100,
+            voltage_mv,
+            pct,
         );
     }
 
@@ -272,11 +308,31 @@ async fn main(_spawner: Spawner) {
     };
     let mut last_rejoin_attempt = Instant::now();
     let mut rejoin_count: u8 = 0;
+    // Device_annce retry: re-send a few times after join so coordinator discovers us
+    let mut annce_retries_left: u8 = if device.is_joined() { 5 } else { 0 };
+    let mut last_annce = Instant::now();
+
+    let mut was_fast_polling = device.is_joined();
+    let mut interview_done = false;
 
     loop {
         let now = Instant::now();
         let in_fast_poll = now < fast_poll_until;
         let poll_ms = if in_fast_poll { FAST_POLL_MS } else { SLOW_POLL_SECS * 1000 };
+
+        // Log transition from fast→slow poll
+        if was_fast_polling && !in_fast_poll {
+            let cfg = device.configured_cluster_count(1);
+            info!("Fast poll OFF — {}/{} clusters configured", cfg, EXPECTED_REPORT_CLUSTERS);
+            was_fast_polling = false;
+            // Always turn LED off when fast-poll expires (power save fallback)
+            if !interview_done {
+                info!("LED OFF (fast-poll expired, interview incomplete)");
+                led_off(&mut led);
+            }
+        } else if in_fast_poll {
+            was_fast_polling = true;
+        }
 
         // ── Step 1: Sleep until next poll ──
         // Single Timer per iteration — avoids rapid create/drop that panics embassy.
@@ -316,6 +372,7 @@ async fn main(_spawner: Spawner) {
                             ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
                         ]).await;
                     }
                 }
@@ -335,6 +392,7 @@ async fn main(_spawner: Spawner) {
                             ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
                         ];
                         if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
                             if log_event(&ev, &mut led) {
@@ -342,11 +400,26 @@ async fn main(_spawner: Spawner) {
                                 info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
                             }
                         }
+                        // Check if ZHA completed Configure Reporting for all clusters
+                        // (last step of the interview per-cluster)
+                        if !interview_done {
+                            let cfg_count = device.configured_cluster_count(1);
+                            if cfg_count >= EXPECTED_REPORT_CLUSTERS {
+                                info!("Interview done! {}/{} clusters configured — ending fast poll",
+                                      cfg_count, EXPECTED_REPORT_CLUSTERS);
+                                // Give 5s grace for any remaining ZHA requests
+                                fast_poll_until = Instant::now() + Duration::from_secs(5);
+                                interview_done = true;
+                                // Turn off LED to save power (device is fully configured)
+                                led_off(&mut led);
+                            }
+                        }
                         // Immediately tick to send any queued ZCL responses
                         let _ = device.tick(0, &mut [
                             ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
                         ]).await;
                     }
                     Ok(None) => break,
@@ -370,12 +443,25 @@ async fn main(_spawner: Spawner) {
                 temp_cluster.set_temperature(temp_hundredths);
                 hum_cluster.set_humidity(hum_hundredths);
 
+                // Battery voltage via SAADC
+                let mut buf = [0i16; 1];
+                saadc_inst.sample(&mut buf).await;
+                let raw = buf[0].max(0) as u32;
+                let voltage_mv = raw * 3600 / 4096;
+                let pct = if voltage_mv >= 3000 { 100u8 }
+                          else if voltage_mv <= 1800 { 0 }
+                          else { ((voltage_mv - 1800) * 100 / 1200) as u8 };
+                power_cluster.set_battery_voltage((voltage_mv / 100) as u8);
+                power_cluster.set_battery_percentage(pct * 2);
+
                 info!(
-                    "T={}.{:02}°C  H={}.{:02}%",
+                    "T={}.{:02}°C  H={}.{:02}%  Bat={}mV ({}%)",
                     temp_hundredths / 100,
                     (temp_hundredths % 100).unsigned_abs(),
                     hum_hundredths / 100,
                     hum_hundredths % 100,
+                    voltage_mv,
+                    pct,
                 );
             }
 
@@ -385,10 +471,22 @@ async fn main(_spawner: Spawner) {
                 ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut power_cluster },
             ]).await {
                 if log_event(e, &mut led) {
                     fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                     info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
+                }
+            }
+
+            // ── Step 4: Device_annce retry (coordinator may have missed first one) ──
+            if annce_retries_left > 0 && now2.duration_since(last_annce).as_secs() >= 8 {
+                annce_retries_left -= 1;
+                last_annce = now2;
+                info!("Re-sending Device_annce ({} left)", annce_retries_left);
+                match device.send_device_annce().await {
+                    Ok(()) => {},
+                    Err(_) => info!("Device_annce retry failed"),
                 }
             }
         } else {
@@ -413,12 +511,16 @@ async fn main(_spawner: Spawner) {
                     ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
                 ]).await;
                 // If join succeeded during tick, activate fast-poll for interview
                 if device.is_joined() {
                     info!("Joined! addr=0x{:04X}", device.short_address());
                     fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                     info!("Fast poll ON ({}s) — post-rejoin", FAST_POLL_DURATION_SECS);
+                    annce_retries_left = 5;
+                    last_annce = Instant::now();
+                    interview_done = false;
                     led_on(&mut led);
                 }
             }

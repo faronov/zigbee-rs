@@ -68,12 +68,18 @@ pub struct NrfMac<'a, T: Instance> {
     tx_power: i8,
     /// macCoordShortAddress — short address of the coordinator/parent
     coord_short_address: ShortAddress,
+    /// Buffer for data frame received during association (e.g. Transport-Key)
+    pending_assoc_frame: Option<([u8; 128], usize)>,
 }
 
 impl<'a, T: Instance> NrfMac<'a, T> {
     pub fn new(radio: Radio<'a, T>) -> Self {
         // Read factory-programmed IEEE address from FICR registers
         let ieee = Self::read_ficr_ieee();
+        log::info!(
+            "[MAC] IEEE: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            ieee[0], ieee[1], ieee[2], ieee[3], ieee[4], ieee[5], ieee[6], ieee[7],
+        );
 
         Self {
             radio,
@@ -91,6 +97,7 @@ impl<'a, T: Instance> NrfMac<'a, T> {
             promiscuous: false,
             tx_power: 0,
             coord_short_address: ShortAddress(0x0000),
+            pending_assoc_frame: None,
         }
     }
 
@@ -406,33 +413,41 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             .await
             .map_err(|_| MacError::RadioError)?;
 
-        // Fix 11: Per IEEE 802.15.4 §5.3.2.1: wait, then poll with Data Request
-        Timer::after_millis(100).await; // Brief wait for coordinator to process
+        // Per IEEE 802.15.4 §5.3.2.1: wait, then poll with Data Request.
+        // Poll multiple times — the coordinator may need time to process.
+        for poll_attempt in 0..5u8 {
+            // First poll after 200ms, subsequent after 500ms
+            let delay = if poll_attempt == 0 { 200 } else { 500 };
+            Timer::after_millis(delay).await;
 
-        // Send Data Request to poll for indirect Association Response
-        let data_req =
-            build_data_request(self.next_dsn(), &req.coord_address, &self.extended_address);
-        let mut dreq_pkt = Packet::new();
-        dreq_pkt.copy_from_slice(&data_req);
-        let _ = self.radio.try_send(&mut dreq_pkt).await;
+            // Send Data Request to poll for indirect Association Response
+            let data_req =
+                build_data_request(self.next_dsn(), &req.coord_address, &self.extended_address);
+            let mut dreq_pkt = Packet::new();
+            dreq_pkt.copy_from_slice(&data_req);
+            let _ = self.radio.try_send(&mut dreq_pkt).await;
 
-        // Fix 10: Wait for Association Response with generous timeout
-        // macResponseWaitTime = 32 * aBaseSuperframeDuration = ~491ms at 250kbps
-        // Use 3 seconds to account for indirect frame delays and slow coordinators
-        let timeout_us: u64 = 3_000_000;
+            // Wait up to 1.5s per poll for Association Response
+            let timeout_us: u64 = 1_500_000;
 
-        let mut rx_pkt = Packet::new();
-        let result = select::select(
-            Timer::after_micros(timeout_us),
-            self.wait_assoc_response(&mut rx_pkt),
-        )
-        .await;
+            let mut rx_pkt = Packet::new();
+            let result = select::select(
+                Timer::after_micros(timeout_us),
+                self.wait_assoc_response(&mut rx_pkt),
+            )
+            .await;
 
-        match result {
-            select::Either::Second(Ok(confirm)) => Ok(confirm),
-            select::Either::Second(Err(e)) => Err(e),
-            select::Either::First(_) => Err(MacError::NoAck),
+            match result {
+                select::Either::Second(Ok(confirm)) => return Ok(confirm),
+                select::Either::Second(Err(e)) => return Err(e),
+                select::Either::First(_) => {
+                    // Timeout — try polling again
+                    continue;
+                }
+            }
         }
+
+        Err(MacError::NoAck)
     }
 
     async fn mlme_associate_response(
@@ -549,58 +564,180 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
     }
 
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
-        // Build and send MAC Data Request to parent (coordinator)
-        let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
-        let data_req = build_data_request(self.next_dsn(), &parent, &self.extended_address);
-        let mut pkt = Packet::new();
-        pkt.copy_from_slice(&data_req);
-
-        // Transmit Data Request with CSMA-CA
-        self.radio
-            .try_send(&mut pkt)
-            .await
-            .map_err(|_| MacError::RadioError)?;
-
-        // Wait for response — parent may reply with data or empty ACK
-        // Use a short timeout since this is a poll
-        let mut rx_pkt = Packet::new();
-        let result =
-            select::select(Timer::after_millis(500), self.radio.receive(&mut rx_pkt)).await;
-
-        match result {
-            select::Either::Second(Ok(())) => {
-                let data = rx_pkt.as_ref();
-                if data.len() < 5 {
-                    return Ok(None);
-                }
-                let fc = u16::from_le_bytes([data[0], data[1]]);
-                let frame_type = fc & 0x07;
-
-                // Generate ACK if requested
-                let ack_requested = (fc >> 5) & 1 != 0;
-                if ack_requested {
-                    let seq = data[2];
-                    let mut ack_pkt = Packet::new();
-                    ack_pkt.copy_from_slice(&[0x02, 0x00, seq]);
-                    let _ = self.radio.try_send(&mut ack_pkt).await;
-                }
-
-                // Only deliver data frames (type 1)
-                if frame_type != 1 {
-                    return Ok(None);
-                }
-
-                let header_len = 3 + addressing_size(fc);
-                if data.len() <= header_len {
-                    return Ok(None);
-                }
-
-                let payload_data = &data[header_len..];
-                Ok(MacFrame::from_slice(payload_data))
-            }
-            // Timeout or receive error — no pending data
-            select::Either::First(_) | select::Either::Second(Err(_)) => Ok(None),
+        // Return any frame saved during association first (e.g. Transport-Key)
+        if let Some((buf, len)) = self.pending_assoc_frame.take() {
+            log::info!(
+                "[MAC:Poll] Returning saved association frame ({} bytes)",
+                len
+            );
+            return Ok(MacFrame::from_slice(&buf[..len]));
         }
+
+        let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
+        let has_short = self.short_address.0 != 0xFFFF && self.short_address.0 != 0xFFFE;
+
+        // Try up to 2 poll passes:
+        //   Pass 0: use SHORT address (if available) — matches most indirect frames
+        //   Pass 1: use IEEE address — catches Transport-Key which EZSP may queue by IEEE
+        // If we don't have a short address, only do one pass with IEEE.
+        let passes: u8 = if has_short { 2 } else { 1 };
+
+        for pass in 0..passes {
+            let data_req = if pass == 0 && has_short {
+                log::debug!(
+                    "[MAC:Poll] pass {}: SHORT 0x{:04X}",
+                    pass,
+                    self.short_address.0
+                );
+                build_data_request_short(
+                    self.next_dsn(),
+                    &parent,
+                    self.pan_id,
+                    self.short_address,
+                )
+            } else {
+                log::debug!("[MAC:Poll] pass {}: IEEE", pass);
+                build_data_request(self.next_dsn(), &parent, &self.extended_address)
+            };
+
+            let mut pkt = Packet::new();
+            pkt.copy_from_slice(&data_req);
+
+            self.radio
+                .try_send(&mut pkt)
+                .await
+                .map_err(|_| MacError::RadioError)?;
+
+            // IEEE 802.15.4 poll sequence:
+            // 1. Parent ACKs our Data Request (with frame_pending bit)
+            // 2. If frame_pending=1, parent sends the buffered data frame
+            // Use a longer window (1500ms) and more attempts (40) to handle
+            // busy channels where coordinator transmissions compete with
+            // parent indirect frame delivery.
+            let deadline =
+                embassy_time::Instant::now() + embassy_time::Duration::from_millis(1500);
+
+            let mut got_none = false;
+            for _rx_attempt in 0..40u8 {
+                let now = embassy_time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline - now;
+
+                let mut rx_pkt = Packet::new();
+                let result = select::select(
+                    Timer::after(remaining),
+                    self.radio.receive(&mut rx_pkt),
+                )
+                .await;
+
+                match result {
+                    select::Either::Second(Ok(())) => {
+                        let data = rx_pkt.as_ref();
+                        if data.len() < 3 {
+                            continue;
+                        }
+                        let fc = u16::from_le_bytes([data[0], data[1]]);
+                        let frame_type = fc & 0x07;
+
+                        if frame_type == 0x02 {
+                            let frame_pending = (data[0] >> 4) & 1 != 0;
+                            if !frame_pending {
+                                log::debug!("[MAC:Poll] ACK frame_pending=0 (nothing pending)");
+                                got_none = true;
+                                break;
+                            }
+                            log::info!(
+                                "[MAC:Poll] ACK frame_pending=1, waiting for data"
+                            );
+                            continue;
+                        }
+
+                        if frame_type != 0x01 {
+                            log::info!(
+                                "[MAC:Poll] Non-data frame type={} fc={:#06x} len={}",
+                                frame_type,
+                                fc,
+                                data.len()
+                            );
+                            continue;
+                        }
+
+                        // Data frame — in a mesh network, frames can arrive
+                        // from ANY router as the next hop (not just our parent).
+                        // Only filter by MAC destination (must be for us or broadcast).
+                        // The NWK layer handles source validation.
+                        let mac_src = parse_source_address(data, fc);
+
+                        // Verify MAC destination matches US (or broadcast).
+                        // Without this, we accept coordinator frames for OTHER devices.
+                        let mac_dst = parse_dest_address(data, fc);
+                        let for_us = match &mac_dst {
+                            Some(MacAddress::Short(_, d)) => {
+                                d.0 == self.short_address.0
+                                    || d.0 == 0xFFFF
+                                    || d.0 == 0xFFFD
+                                    || d.0 == 0xFFFC
+                            }
+                            Some(MacAddress::Extended(_, e)) => {
+                                *e == self.extended_address
+                            }
+                            None => true, // Can't parse → accept
+                        };
+                        if !for_us {
+                            log::debug!(
+                                "[MAC:Poll] SKIP frame for {:?} (we=0x{:04X})",
+                                mac_dst,
+                                self.short_address.0
+                            );
+                            continue;
+                        }
+
+                        // ACK if requested
+                        let ack_requested = (fc >> 5) & 1 != 0;
+                        if ack_requested {
+                            let seq = data[2];
+                            let mut ack_pkt = Packet::new();
+                            ack_pkt.copy_from_slice(&[0x02, 0x00, seq]);
+                            let _ = self.radio.try_send(&mut ack_pkt).await;
+                        }
+
+                        let header_len = 3 + addressing_size(fc);
+                        if data.len() <= header_len {
+                            return Ok(None);
+                        }
+
+                        // Log source info + payload size for diagnosis
+                        let src_short = match &mac_src {
+                            Some(MacAddress::Short(_, s)) => s.0,
+                            _ => 0xFFFF,
+                        };
+                        log::info!(
+                            "[MAC:Poll] frame {} bytes pass={} src=0x{:04X}",
+                            data.len() - header_len,
+                            pass,
+                            src_short,
+                        );
+                        let payload_data = &data[header_len..];
+                        return Ok(MacFrame::from_slice(payload_data));
+                    }
+                    select::Either::First(_) | select::Either::Second(Err(_)) => {
+                        got_none = true;
+                        break;
+                    }
+                }
+            }
+
+            // If pass 0 (short addr) got data → already returned above.
+            // If pass 0 got nothing (got_none=true), continue to pass 1 (IEEE).
+            if !got_none {
+                // Exhausted rx_attempts without definitive result
+                continue;
+            }
+        }
+
+        Ok(None)
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
@@ -653,24 +790,67 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             }
         }
 
-        // NOTE: Software ACK reception is unreliable on embassy-nrf because
-        // try_send() ends with radio DISABLED (via PHYEND→DISABLE shortcut).
-        // The time to restart RX (~200-500μs software overhead) exceeds the
-        // ACK turnaround window (~192μs). ACKs are consistently missed.
-        //
-        // For now: fire-and-forget TX. Re-send the frame a few times for
-        // reliability without waiting for ACK. Higher layers (APS ACK,
-        // application retry) handle end-to-end reliability.
-        // TODO: implement DISABLED→RXEN hardware shortcut for proper ACK.
-        if ack_requested {
-            // Best-effort retransmit 4 more times with CSMA-CA for each
-            for retransmit in 0..4u8 {
-                // Inter-frame spacing: 3ms + 2ms per retry (increasing gap)
-                Timer::after_millis(3 + retransmit as u64 * 2).await;
+        // MAC ACK-based retransmission (IEEE 802.15.4 §5.1.6.4)
+        // After try_send(), radio is DISABLED via PHYEND→DISABLE shortcut.
+        // Immediately start RX to catch ACK within the 192μs turnaround window.
+        // Timing: PHYEND → DISABLED (~1μs) → try_send returns (~20μs) →
+        //         receive start (~30μs) → RXREADY (~40μs) = ~90μs total.
+        //         ACK preamble starts at 192μs → we have ~100μs margin.
+        let dsn = frame_buf[2]; // DSN is byte 2 of MAC frame
+        let max_retries: u8 = if ack_requested { 3 } else { 0 };
+        let mut ack_ok = !ack_requested; // true if no ACK needed
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                // CSMA-CA backoff before retransmit
+                let delay = 2000 + attempt as u64 * 1000; // 2ms, 3ms, 4ms
+                Timer::after_micros(delay).await;
                 pkt.copy_from_slice(&frame_buf[..len]);
-                // Simple CCA: back off if channel is busy
                 let _ = self.radio.try_send(&mut pkt).await;
             }
+
+            if !ack_requested {
+                break; // No ACK needed — single send
+            }
+
+            // Listen for ACK: start RX immediately after TX
+            let mut ack_pkt = Packet::new();
+            let ack_result = select::select(
+                Timer::after_micros(1200), // 1200μs timeout (192μs turnaround + margin)
+                self.radio.receive(&mut ack_pkt),
+            )
+            .await;
+
+            match ack_result {
+                select::Either::Second(Ok(())) => {
+                    let ack_data: &[u8] = &*ack_pkt;
+                    if ack_data.len() >= 3
+                        && (ack_data[0] & 0x07) == 0x02
+                        && ack_data[2] == dsn
+                    {
+                        log::info!("[MAC TX] ACK ok dsn={} attempt={}", dsn, attempt);
+                        ack_ok = true;
+                        break;
+                    }
+                    // Wrong frame
+                    log::debug!(
+                        "[MAC TX] Wrong frame dsn={} got {} bytes fc=0x{:02X}",
+                        dsn,
+                        ack_data.len(),
+                        if !ack_data.is_empty() { ack_data[0] } else { 0 }
+                    );
+                }
+                select::Either::Second(Err(_)) => {
+                    log::debug!("[MAC TX] RX error attempt={}", attempt);
+                }
+                select::Either::First(_) => {
+                    log::debug!("[MAC TX] ACK timeout attempt={}", attempt);
+                }
+            }
+        }
+
+        if !ack_ok {
+            log::warn!("[MAC TX] No ACK after {} retries dsn={}", max_retries, dsn);
         }
 
         Ok(McpsDataConfirm {
@@ -682,7 +862,7 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
         let mut rx_pkt = Packet::new();
         // Absolute deadline — filtered frames don't reset the clock
-        const RX_TIMEOUT_MS: u64 = 5000;
+        const RX_TIMEOUT_MS: u64 = 1000;
         let deadline =
             embassy_time::Instant::now() + embassy_time::Duration::from_millis(RX_TIMEOUT_MS);
 
@@ -824,7 +1004,37 @@ impl<T: Instance> NrfMac<'_, T> {
                 continue;
             }
             let fc = u16::from_le_bytes([data[0], data[1]]);
-            if fc & 0x07 != 3 {
+            let frame_type = fc & 0x07;
+
+            // ACK all frames with ACK-request bit — critical for Transport-Key!
+            // Without ACK, the coordinator retries and eventually sends Leave.
+            let ack_requested = (fc >> 5) & 1 != 0;
+            if ack_requested {
+                let seq = data[2];
+                let mut ack_pkt = Packet::new();
+                ack_pkt.copy_from_slice(&[0x02, 0x00, seq]);
+                let _ = self.radio.try_send(&mut ack_pkt).await;
+            }
+
+            // Data frame received during association — could be Transport-Key!
+            // Save it for later retrieval via mlme_poll.
+            if frame_type == 0x01 {
+                let header_len = 3 + addressing_size(fc);
+                if data.len() > header_len {
+                    let payload = &data[header_len..];
+                    let len = payload.len().min(128);
+                    let mut buf = [0u8; 128];
+                    buf[..len].copy_from_slice(&payload[..len]);
+                    self.pending_assoc_frame = Some((buf, len));
+                    log::info!(
+                        "[MAC] Saved+ACKed data frame {} bytes during association",
+                        len
+                    );
+                }
+                continue;
+            }
+
+            if frame_type != 3 {
                 continue; // Not a MAC command
             }
             // Find command ID — after addressing fields
@@ -842,6 +1052,50 @@ impl<T: Instance> NrfMac<'_, T> {
                 };
                 if status == AssociationStatus::Success {
                     self.short_address = ShortAddress(short_addr);
+                }
+                // After Association Response, stay in RX to catch Transport-Key.
+                // ACK every frame — without ACK, coordinator retries and gives up.
+                if status == AssociationStatus::Success {
+                    let mut extra_pkt = Packet::new();
+                    for _ in 0..20u8 {
+                        let rx = select::select(
+                            Timer::after_millis(200),
+                            self.radio.receive(&mut extra_pkt),
+                        )
+                        .await;
+                        match rx {
+                            select::Either::Second(Ok(())) => {
+                                let d = extra_pkt.as_ref();
+                                if d.len() >= 5 {
+                                    let efc = u16::from_le_bytes([d[0], d[1]]);
+                                    // ACK if requested
+                                    let ack_req = (efc >> 5) & 1 != 0;
+                                    if ack_req {
+                                        let seq = d[2];
+                                        let mut ack_pkt = Packet::new();
+                                        ack_pkt.copy_from_slice(&[0x02, 0x00, seq]);
+                                        let _ = self.radio.try_send(&mut ack_pkt).await;
+                                    }
+                                    if efc & 0x07 == 0x01 {
+                                        // Data frame — save it (last one wins)
+                                        let hl = 3 + addressing_size(efc);
+                                        if d.len() > hl {
+                                            let pl = &d[hl..];
+                                            let plen = pl.len().min(128);
+                                            let mut buf = [0u8; 128];
+                                            buf[..plen].copy_from_slice(&pl[..plen]);
+                                            self.pending_assoc_frame = Some((buf, plen));
+                                            log::info!(
+                                                "[MAC] Caught+ACKed post-assoc frame {} bytes!",
+                                                plen
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            _ => break, // Timeout — no more frames
+                        }
+                    }
                 }
                 return Ok(MlmeAssociateConfirm {
                     short_address: ShortAddress(short_addr),
@@ -1017,6 +1271,39 @@ fn build_data_request(
         }
     }
     let _ = frame.extend_from_slice(own_extended);
+    let _ = frame.push(0x04); // Data Request command ID
+    frame
+}
+
+/// Build a MAC Data Request using SHORT source address.
+/// Used after association when we have a short address assigned.
+/// IEEE 802.15.4 §5.1.6.3: indirect frame matching uses the source address
+/// mode of the Data Request — if parent queued frames for our short addr,
+/// we must poll with short addr to match.
+fn build_data_request_short(
+    seq: u8,
+    coord: &MacAddress,
+    own_pan: PanId,
+    own_short: ShortAddress,
+) -> heapless::Vec<u8, 24> {
+    let mut frame = heapless::Vec::new();
+    // FC: MAC command (0b011), ack req, PAN compress, dst=short(0b10), src=short(0b10)
+    // Bits: type=011, sec=0, pend=0, ack=1, pan_compress=1, rsvd=0, dst=10, ver=00, src=10
+    // = 0b 10_00_10_0_0_1_1_0_011 = 0x8863
+    let _ = frame.extend_from_slice(&[0x63, 0x88, seq]);
+    let dst_pan = coord.pan_id();
+    let _ = frame.extend_from_slice(&dst_pan.0.to_le_bytes());
+    match coord {
+        MacAddress::Short(_, addr) => {
+            let _ = frame.extend_from_slice(&addr.0.to_le_bytes());
+        }
+        MacAddress::Extended(_, addr) => {
+            let _ = frame.extend_from_slice(addr);
+        }
+    }
+    // PAN compress=1: source PAN is elided (same as dst PAN)
+    // Source short address
+    let _ = frame.extend_from_slice(&own_short.0.to_le_bytes());
     let _ = frame.push(0x04); // Data Request command ID
     frame
 }

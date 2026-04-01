@@ -273,10 +273,20 @@ impl<M: MacDriver> NwkLayer<M> {
         let cap = CapabilityInfo {
             device_type_ffd: self.device_type != DeviceType::EndDevice,
             mains_powered: self.device_type != DeviceType::EndDevice,
-            rx_on_when_idle: self.rx_on_when_idle,
+            // rx_on_when_idle=false → coordinator buffers Transport-Key as indirect
+            // frame, delivered when we poll. This is more reliable than direct unicast
+            // (rx_on_idle=true) because indirect frames are retried on each poll.
+            rx_on_when_idle: self.device_type != DeviceType::EndDevice,
             security_capable: false,
             allocate_address: true,
         };
+
+        log::info!(
+            "[NWK] Association cap: rx_on_idle={} ffd={} -> parent 0x{:04X}",
+            cap.rx_on_when_idle,
+            cap.device_type_ffd,
+            if network.router_address.0 != 0xFFFF { network.router_address.0 } else { 0x0000 },
+        );
 
         // Perform MAC association — use discovered router address, not hardcoded coordinator
         let join_target = if network.router_address.0 != 0xFFFF {

@@ -18,6 +18,7 @@
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{select3, Either3};
+use embassy_nrf::saadc::{self, ChannelConfig, Saadc, VddInput};
 use embassy_nrf::temp::Temp;
 use embassy_nrf::{self as _, bind_interrupts, gpio, peripherals, radio};
 use embassy_time::{Duration, Timer};
@@ -28,8 +29,11 @@ use {defmt_rtt as _, panic_probe as _};
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
+use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
+use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
+use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
 const REPORT_INTERVAL_SECS: u64 = 30;
@@ -37,16 +41,27 @@ const REPORT_INTERVAL_SECS: u64 = 30;
 bind_interrupts!(struct Irqs {
     RADIO => radio::InterruptHandler<peripherals::RADIO>;
     TEMP => embassy_nrf::temp::InterruptHandler;
+    SAADC => saadc::InterruptHandler;
 });
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let p = embassy_nrf::init(Default::default());
+    // HFCLK from external crystal — REQUIRED for 802.15.4 radio
+    let mut config = embassy_nrf::config::Config::default();
+    config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
+    let p = embassy_nrf::init(config);
 
     info!("Zigbee-RS nRF52833 sensor starting…");
 
     // On-chip temperature sensor (real hardware reading)
     let mut temp_sensor = Temp::new(p.TEMP, Irqs);
+
+    // SAADC: measure VDD — default 12-bit, ref=0.6V, gain=1/6 → range 3.6V
+    let mut saadc_sensor = Saadc::new(
+        p.SAADC, Irqs, saadc::Config::default(),
+        [ChannelConfig::single_ended(VddInput)],
+    );
+    saadc_sensor.calibrate().await;
 
     // Button 1 on nRF52833-DK (P0.11, active low with on-board pull-up)
     let mut button = gpio::Input::new(p.P0_11, gpio::Pull::Up);
@@ -58,8 +73,19 @@ async fn main(_spawner: Spawner) {
     info!("Radio ready");
 
     // ZCL cluster instances
+    let mut basic_cluster = BasicCluster::new(
+        b"Zigbee-RS",
+        b"nRF52833-Sensor",
+        b"20260331",
+        b"0.1.0",
+    );
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
+
+    let mut power_cluster = PowerConfigCluster::new();
+    power_cluster.set_battery_size(4);     // AAA
+    power_cluster.set_battery_quantity(2); // 2× AAA
+    power_cluster.set_battery_rated_voltage(15); // 1.5V per cell
 
     // Simulated humidity baseline (no on-chip humidity sensor)
     let mut hum_tick: u32 = 0;
@@ -67,12 +93,17 @@ async fn main(_spawner: Spawner) {
     // Build the Zigbee device
     let mut device = ZigbeeDevice::builder(mac)
         .device_type(DeviceType::EndDevice)
+        .power_mode(PowerMode::Sleepy {
+            poll_interval_ms: 10_000,
+            wake_duration_ms: 500,
+        })
         .manufacturer("Zigbee-RS")
         .model("nRF52833-Sensor")
         .sw_build("0.1.0")
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
         .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
             ep.cluster_server(0x0000) // Basic
+                .cluster_server(0x0001) // Power Configuration
                 .cluster_server(0x0402) // Temperature Measurement
                 .cluster_server(0x0405) // Relative Humidity
         })
@@ -91,8 +122,10 @@ async fn main(_spawner: Spawner) {
             // ── Incoming MAC frame ──────────────────────────────
             Either3::First(Ok(indication)) => {
                 let mut clusters = [
+                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
                 ];
                 if let Some(event) = device.process_incoming(&indication, &mut clusters).await {
                     log_event(&event);
@@ -111,8 +144,10 @@ async fn main(_spawner: Spawner) {
                 }
                 device.user_action(UserAction::Toggle);
                 let mut clusters = [
+                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
                 ];
                 if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
                     log_event(e);
@@ -136,18 +171,33 @@ async fn main(_spawner: Spawner) {
                     temp_cluster.set_temperature(temp_hundredths);
                     hum_cluster.set_humidity(hum_hundredths);
 
+                    // Battery: read VDD via SAADC
+                    let mut buf = [0i16; 1];
+                    saadc_sensor.sample(&mut buf).await;
+                    let raw = buf[0].max(0) as u32;
+                    let voltage_mv = raw * 3600 / 4096;
+                    let pct = if voltage_mv >= 3000 { 100u8 }
+                              else if voltage_mv <= 1800 { 0 }
+                              else { ((voltage_mv - 1800) * 100 / 1200) as u8 };
+                    power_cluster.set_battery_voltage((voltage_mv / 100) as u8);
+                    power_cluster.set_battery_percentage(pct * 2); // ZCL: 0.5% units
+
                     info!(
-                        "T={}.{:02}°C  H={}.{:02}%",
+                        "T={}.{:02}°C  H={}.{:02}%  Bat={}mV ({}%)",
                         temp_hundredths / 100,
                         (temp_hundredths % 100).unsigned_abs(),
                         hum_hundredths / 100,
                         hum_hundredths % 100,
+                        voltage_mv,
+                        pct,
                     );
                 }
                 if let TickResult::Event(ref e) =
                     device.tick(REPORT_INTERVAL_SECS as u16, &mut [
+                        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                        ClusterRef { endpoint: 1, cluster: &mut power_cluster },
                     ]).await
                 {
                     log_event(e);

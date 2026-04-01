@@ -156,6 +156,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
         };
         let node_desc = zigbee_zdo::descriptors::NodeDescriptor {
             logical_type,
+            mac_capabilities: if rx_on { 0x88 } else { 0x80 }, // bit7=AllocAddr, bit3=RxOnWhenIdle
             ..Default::default()
         };
         zdo.set_node_descriptor(node_desc);

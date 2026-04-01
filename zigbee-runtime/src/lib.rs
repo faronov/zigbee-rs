@@ -321,6 +321,21 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.state_dirty = false;
     }
 
+    // ── Reporting / Interview Detection ────────────────────
+
+    /// Check if reporting has been configured for a specific cluster.
+    ///
+    /// Returns `true` after ZHA sends Configure Reporting for this cluster,
+    /// which is the last step of the interview process per-cluster.
+    pub fn is_cluster_reporting_configured(&self, endpoint: u8, cluster_id: u16) -> bool {
+        self.reporting.has_cluster_configured(endpoint, cluster_id)
+    }
+
+    /// Count how many distinct clusters have reporting configured on an endpoint.
+    pub fn configured_cluster_count(&self, endpoint: u8) -> usize {
+        self.reporting.configured_cluster_count(endpoint)
+    }
+
     // ── NV Persistence ─────────────────────────────────────
 
     /// Save critical network state to non-volatile storage.
@@ -560,15 +575,27 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         // NWK layer: parse NWK header, check if frame is for us, decrypt if secured
         let nwk_indication = {
             let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
-            let (header, consumed) = zigbee_nwk::frames::NwkHeader::parse(mac_payload)?;
+            let (header, consumed) = match zigbee_nwk::frames::NwkHeader::parse(mac_payload) {
+                Some(v) => v,
+                None => {
+                    log::warn!("[RX] NWK header parse failed, {} bytes: {:02X?}",
+                        mac_payload.len(), &mac_payload[..mac_payload.len().min(8)]);
+                    return None;
+                }
+            };
 
             let dst = header.dst_addr;
             let src = header.src_addr;
+            let nwk_fc = header.frame_control;
             let nwk_addr = nwk.nib().network_address;
             let is_for_us = dst == nwk_addr
                 || dst == ShortAddress::BROADCAST
                 || dst == ShortAddress(0xFFFF)
                 || dst == ShortAddress(0xFFFD);
+
+            log::info!("[RX] NWK type={} src=0x{:04X} dst=0x{:04X} sec={} for_us={} len={}",
+                nwk_fc.frame_type as u8, src.0, dst.0, nwk_fc.security, is_for_us,
+                mac_payload.len() - consumed);
 
             if !is_for_us {
                 return None;
@@ -821,6 +848,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     cluster_id,
                     req.configs.len()
                 );
+                for cfg in &req.configs {
+                    if cfg.direction == zigbee_zcl::foundation::reporting::ReportDirection::Send {
+                        log::info!(
+                            "  attr=0x{:04X} min={}s max={}s change={:?}",
+                            cfg.attribute_id.0,
+                            cfg.min_interval,
+                            cfg.max_interval,
+                            cfg.reportable_change
+                        );
+                    }
+                }
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
@@ -1703,5 +1741,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// Mutable access to the BDB layer.
     pub fn bdb_mut(&mut self) -> &mut BdbLayer<M> {
         &mut self.bdb
+    }
+
+    /// Re-send Device_annce broadcast. Useful after join to retry if
+    /// the coordinator missed the initial announcement.
+    pub async fn send_device_annce(&mut self) -> Result<(), zigbee_zdo::ZdpStatus> {
+        let nwk_addr = self.bdb.zdo().local_nwk_addr();
+        let ieee_addr = self.bdb.zdo().local_ieee_addr();
+        self.bdb.zdo_mut().device_annce(nwk_addr, ieee_addr).await
     }
 }

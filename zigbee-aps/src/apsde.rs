@@ -755,37 +755,87 @@ impl<M: MacDriver> ApsLayer<M> {
                 return None;
             }
 
-            match self.security.decrypt(aad, ciphertext, &key, &sec_hdr) {
-                Some(plaintext) => {
+            // Try decrypt with patched AAD (standard: OTA level→5).
+            // If that fails AND this is a key-transport frame, try fallback approaches:
+            //   1. AAD with original OTA security level (some coordinators don't strip)
+            //   2. Raw TC link key instead of derived key-transport key
+            let mut decrypt_ok = false;
+            if let Some(plaintext) = self.security.decrypt(aad, ciphertext, &key, &sec_hdr) {
+                log::info!(
+                    "[APS RX] APS decrypt SUCCESS, plaintext {} bytes",
+                    plaintext.len()
+                );
+                let pt_len = plaintext.len().min(decrypted_buf.data.len());
+                decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
+                decrypted_buf.len = pt_len;
+                used_decrypted_buf = true;
+                decrypt_ok = true;
+            }
+
+            // Fallback: try with un-patched AAD (original OTA security level)
+            if !decrypt_ok {
+                let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
+                if let Some(plaintext) =
+                    self.security.decrypt(aad_raw, ciphertext, &key, &sec_hdr)
+                {
                     log::info!(
-                        "[APS RX] APS decrypt SUCCESS, plaintext {} bytes",
+                        "[APS RX] APS decrypt SUCCESS (raw AAD), plaintext {} bytes",
                         plaintext.len()
                     );
-                    if let Some(addr) = &sec_hdr.source_address {
-                        self.security.commit_frame_counter(
-                            addr,
-                            replay_key_type,
-                            sec_hdr.frame_counter,
-                        );
-                    }
                     let pt_len = plaintext.len().min(decrypted_buf.data.len());
                     decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
                     decrypted_buf.len = pt_len;
                     used_decrypted_buf = true;
-                    log::debug!(
-                        "[APS] Decrypted APS frame ({} bytes) from 0x{:04X}",
-                        pt_len,
-                        nwk_src.0
+                    decrypt_ok = true;
+                }
+            }
+
+            // Fallback for key-transport: try raw TC link key (some impls don't derive)
+            if !decrypt_ok && key_id == crate::security::KEY_ID_KEY_TRANSPORT {
+                let tc_key = *self.security.default_tc_link_key();
+                // Try with patched AAD
+                if let Some(plaintext) =
+                    self.security.decrypt(aad, ciphertext, &tc_key, &sec_hdr)
+                {
+                    log::info!("[APS RX] APS decrypt SUCCESS (raw TC key + patched AAD)");
+                    let pt_len = plaintext.len().min(decrypted_buf.data.len());
+                    decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
+                    decrypted_buf.len = pt_len;
+                    used_decrypted_buf = true;
+                    decrypt_ok = true;
+                }
+                // Try with un-patched AAD
+                if !decrypt_ok {
+                    let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
+                    if let Some(plaintext) =
+                        self.security.decrypt(aad_raw, ciphertext, &tc_key, &sec_hdr)
+                    {
+                        log::info!("[APS RX] APS decrypt SUCCESS (raw TC key + raw AAD)");
+                        let pt_len = plaintext.len().min(decrypted_buf.data.len());
+                        decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
+                        decrypted_buf.len = pt_len;
+                        used_decrypted_buf = true;
+                        decrypt_ok = true;
+                    }
+                }
+            }
+
+            if decrypt_ok {
+                if let Some(addr) = &sec_hdr.source_address {
+                    self.security.commit_frame_counter(
+                        addr,
+                        replay_key_type,
+                        sec_hdr.frame_counter,
                     );
                 }
-                None => {
-                    log::warn!(
-                        "[APS] APS decryption failed from 0x{:04X} (key_id={})",
-                        nwk_src.0,
-                        key_id
-                    );
-                    return None;
-                }
+            } else {
+                log::warn!(
+                    "[APS] APS decryption failed from 0x{:04X} (key_id={}, ct_len={})",
+                    nwk_src.0,
+                    key_id,
+                    ciphertext.len(),
+                );
+                return None;
             }
         }
 

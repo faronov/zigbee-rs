@@ -32,7 +32,7 @@ embassy-nrf52833 = { package = "embassy-nrf", version = "0.3", features = ["nrf5
 
 # ── Shared Embassy async primitives (used by multiple backends)
 embassy-sync = { version = "0.7", optional = true }
-embassy-time = { version = "0.5", optional = true }
+embassy-time = { version = "0.4", optional = true }
 embassy-futures = { version = "0.1", optional = true }
 
 # ── Logging ─────────────────────────────────────────────────

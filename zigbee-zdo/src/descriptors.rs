@@ -75,7 +75,7 @@ impl Default for NodeDescriptor {
             user_desc_available: false,
             aps_flags: 0,
             frequency_band: 0x08,   // 2.4 GHz
-            mac_capabilities: 0x88, // AllocateAddress(bit7) | RxOnWhenIdle(bit3)
+            mac_capabilities: 0x80, // AllocateAddress(bit7) only; RxOnWhenIdle set by builder
             manufacturer_code: 0,
             max_buffer_size: 127,
             max_incoming_transfer: 127,
@@ -95,11 +95,12 @@ impl NodeDescriptor {
         if buf.len() < Self::WIRE_SIZE {
             return Err(ZdoError::BufferTooSmall);
         }
+        // Byte 0: logical_type(0-2) | complex_desc(3) | user_desc(4) | reserved(5-7)
         buf[0] = (self.logical_type as u8 & 0x07)
             | if self.complex_desc_available { 0x08 } else { 0 }
-            | if self.user_desc_available { 0x10 } else { 0 }
-            | ((self.aps_flags & 0x07) << 5);
-        buf[1] = self.frequency_band & 0x1F;
+            | if self.user_desc_available { 0x10 } else { 0 };
+        // Byte 1: aps_flags(0-2) | frequency_band(3-7)  [Zigbee spec Table 2.29]
+        buf[1] = (self.aps_flags & 0x07) | ((self.frequency_band & 0x1F) << 3);
         buf[2] = self.mac_capabilities;
         buf[3..5].copy_from_slice(&self.manufacturer_code.to_le_bytes());
         buf[5] = self.max_buffer_size;
@@ -120,8 +121,8 @@ impl NodeDescriptor {
             logical_type,
             complex_desc_available: data[0] & 0x08 != 0,
             user_desc_available: data[0] & 0x10 != 0,
-            aps_flags: (data[0] >> 5) & 0x07,
-            frequency_band: data[1] & 0x1F,
+            aps_flags: data[1] & 0x07,
+            frequency_band: (data[1] >> 3) & 0x1F,
             mac_capabilities: data[2],
             manufacturer_code: u16::from_le_bytes([data[3], data[4]]),
             max_buffer_size: data[5],

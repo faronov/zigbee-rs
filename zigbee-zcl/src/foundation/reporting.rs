@@ -363,6 +363,30 @@ impl ReportingEngine {
         }
     }
 
+    /// Check if any reporting has been configured for a specific cluster.
+    ///
+    /// Returns `true` if at least one attribute on this cluster/endpoint has
+    /// a reporting configuration. Useful for detecting when ZHA has completed
+    /// its Configure Reporting step for a given cluster (interview detection).
+    pub fn has_cluster_configured(&self, endpoint: u8, cluster_id: u16) -> bool {
+        self.states
+            .iter()
+            .any(|s| s.endpoint == endpoint && s.cluster_id == cluster_id)
+    }
+
+    /// Count how many distinct clusters have reporting configured on an endpoint.
+    pub fn configured_cluster_count(&self, endpoint: u8) -> usize {
+        let mut count = 0u16;
+        let mut seen: heapless::Vec<u16, MAX_REPORT_CONFIGS> = heapless::Vec::new();
+        for s in self.states.iter() {
+            if s.endpoint == endpoint && !seen.contains(&s.cluster_id) {
+                let _ = seen.push(s.cluster_id);
+                count += 1;
+            }
+        }
+        count as usize
+    }
+
     /// Look up the reporting configuration for a specific attribute.
     pub fn get_config(
         &self,
