@@ -96,6 +96,29 @@ bind_interrupts!(struct Irqs {
     TWISPI0 => twim::InterruptHandler<peripherals::TWISPI0>;
 });
 
+/// Ensure all RAM banks are powered on. POWER registers survive soft reset,
+/// so a previous firmware run may have powered down banks the stack needs.
+/// Runs as __pre_init — before .bss zero, .data copy, and main().
+/// Pure assembly: zero stack usage (bank 8 section 5 may be powered off).
+core::arch::global_asm!(
+    ".section .text.__pre_init",
+    ".global __pre_init",
+    ".thumb_func",
+    "__pre_init:",
+    "ldr r0, =0x40000904",  // POWER.RAM[0].POWERSET
+    "mvn r1, #0",           // r1 = 0xFFFFFFFF
+    "str r1, [r0, #0x00]",  // RAM[0].POWERSET
+    "str r1, [r0, #0x10]",  // RAM[1].POWERSET
+    "str r1, [r0, #0x20]",  // RAM[2].POWERSET
+    "str r1, [r0, #0x30]",  // RAM[3].POWERSET
+    "str r1, [r0, #0x40]",  // RAM[4].POWERSET
+    "str r1, [r0, #0x50]",  // RAM[5].POWERSET
+    "str r1, [r0, #0x60]",  // RAM[6].POWERSET
+    "str r1, [r0, #0x70]",  // RAM[7].POWERSET
+    "str r1, [r0, #0x80]",  // RAM[8].POWERSET
+    "bx lr",
+);
+
 /// Power down unused RAM banks to reduce sleep current.
 /// nRF52840 has 256 KB RAM in 9 banks; we keep only what's needed.
 fn power_down_unused_ram() {
@@ -106,30 +129,29 @@ fn power_down_unused_ram() {
     let stack_reserve: usize = 8 * 1024;
     let used_end = heap_start;
     let keep_end = ram_end - stack_reserve;
-    let power_base: usize = 0x4000_0900;
+    const POWER_BASE: usize = 0x4000_0900;
 
     // Banks 0-7: 8 KB each (2 sections of 4 KB)
     for bank in 0u32..8 {
         let bank_start = ram_start + (bank as usize) * 8192;
         let bank_end = bank_start + 8192;
         if bank_start >= used_end && bank_end <= keep_end {
-            let reg = (power_base + (bank as usize) * 0x10 + 0x08) as *mut u32;
-            // Clear power + retention for both sections
-            unsafe { core::ptr::write_volatile(reg, 0x0003_0003); }
+            let powerclr = (POWER_BASE + (bank as usize) * 0x10 + 0x08) as *mut u32;
+            unsafe { core::ptr::write_volatile(powerclr, 0x0003_0003); }
         }
     }
     // Bank 8: 192 KB (6 sections of 32 KB)
+    let powerclr8 = (POWER_BASE + 8 * 0x10 + 0x08) as *mut u32;
+    let mut mask8 = 0u32;
     for section in 0u32..6 {
         let section_start = ram_start + 64 * 1024 + (section as usize) * 32768;
         let section_end = section_start + 32768;
         if section_start >= used_end && section_end <= keep_end {
-            let reg = (power_base + 8 * 0x10 + 0x08) as *mut u32;
-            let mask = (1u32 << section) | (1u32 << (section + 16));
-            unsafe {
-                let current = core::ptr::read_volatile(reg);
-                core::ptr::write_volatile(reg, current | mask);
-            }
+            mask8 |= (1u32 << section) | (1u32 << (section + 16));
         }
+    }
+    if mask8 != 0 {
+        unsafe { core::ptr::write_volatile(powerclr8, mask8); }
     }
     let saved_kb = (keep_end.saturating_sub(used_end)) / 1024;
     info!("RAM: used ~{}KB, powered down ~{}KB", (used_end - ram_start) / 1024, saved_kb);
