@@ -172,6 +172,11 @@ impl<M: MacDriver> NwkLayer<M> {
         self.joined
     }
 
+    /// Set the joined flag (used during silent resume after NV restore).
+    pub fn set_joined(&mut self, joined: bool) {
+        self.joined = joined;
+    }
+
     /// Get the device type.
     pub fn device_type(&self) -> DeviceType {
         self.device_type

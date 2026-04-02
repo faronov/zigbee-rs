@@ -277,6 +277,23 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                     }
                 }
             }
+            UserAction::Rejoin => {
+                log::info!("[Runtime] User action: Rejoin");
+                match self.rejoin().await {
+                    Ok(addr) => {
+                        let ch = self.channel();
+                        let pan = self.pan_id();
+                        TickResult::Event(StackEvent::Joined {
+                            short_address: addr,
+                            channel: ch,
+                            pan_id: pan,
+                        })
+                    }
+                    Err(_) => {
+                        TickResult::Event(StackEvent::CommissioningComplete { success: false })
+                    }
+                }
+            }
             UserAction::Leave => {
                 log::info!("[Runtime] User action: Leave");
                 let _ = self.leave().await;

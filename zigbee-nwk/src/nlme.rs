@@ -432,6 +432,15 @@ impl<M: MacDriver> NwkLayer<M> {
             .mac
             .mlme_set(PibAttribute::MacPanId, PibValue::PanId(network.pan_id))
             .await;
+        // Set MAC short address so the MAC address filter accepts the
+        // unicast Rejoin Response addressed to our restored NWK address.
+        let _ = self
+            .mac
+            .mlme_set(
+                PibAttribute::MacShortAddress,
+                PibValue::ShortAddress(self.nib.network_address),
+            )
+            .await;
 
         // Build NWK Rejoin Request frame
         let cap_byte = CapabilityInfo {
@@ -519,11 +528,12 @@ impl<M: MacDriver> NwkLayer<M> {
             .await;
 
         // Wait for Rejoin Response (NWK command 0x07).
-        // Try receiving up to MAX_RX_ATTEMPTS frames; give up if none is
-        // the expected rejoin response. This avoids embassy_time dependency.
-        const MAX_RX_ATTEMPTS: usize = 16;
+        // On busy networks (40+ devices), broadcast traffic can easily fill
+        // a small receive window before the rejoin response arrives from the
+        // coordinator/router. Use a generous attempt count.
+        const MAX_RX_ATTEMPTS: usize = 64;
 
-        for _ in 0..MAX_RX_ATTEMPTS {
+        for attempt in 0..MAX_RX_ATTEMPTS {
             let indication = match self.mac.mcps_data_indication().await {
                 Ok(ind) => ind,
                 Err(_) => continue,
@@ -532,11 +542,20 @@ impl<M: MacDriver> NwkLayer<M> {
             let data = indication.payload.as_slice();
             let (hdr, consumed) = match NwkHeader::parse(data) {
                 Some(v) => v,
-                None => continue,
+                None => {
+                    log::info!("[NWK] Rejoin RX #{}: not NWK ({} bytes)", attempt, data.len());
+                    continue;
+                }
             };
 
+            let ft = hdr.frame_control.frame_type;
+            log::info!(
+                "[NWK] Rejoin RX #{}: ft={} src=0x{:04X} dst=0x{:04X} sec={}",
+                attempt, ft, hdr.src_addr.0, hdr.dst_addr.0, hdr.frame_control.security
+            );
+
             // Must be a NWK Command frame
-            if hdr.frame_control.frame_type != NwkFrameType::Command as u8 {
+            if ft != NwkFrameType::Command as u8 {
                 continue;
             }
 
@@ -546,21 +565,36 @@ impl<M: MacDriver> NwkLayer<M> {
                 let (sec_hdr, sec_consumed) =
                     match crate::security::NwkSecurityHeader::parse(after_hdr) {
                         Some(v) => v,
-                        None => continue,
+                        None => {
+                            log::warn!("[NWK] Rejoin RX #{}: bad security header", attempt);
+                            continue;
+                        }
                     };
                 let key = match self.security.key_by_seq(sec_hdr.key_seq_number) {
                     Some(k) => k.key,
-                    None => continue,
+                    None => {
+                        log::warn!("[NWK] Rejoin RX #{}: unknown key seq {}", attempt, sec_hdr.key_seq_number);
+                        continue;
+                    }
                 };
                 let aad_len = consumed + sec_consumed;
+                // AAD must use ACTUAL security level (5), not OTA value (0).
+                // Patch the security control byte (first byte after NWK header).
+                let mut aad_buf = [0u8; 64];
+                let copy_len = aad_len.min(aad_buf.len());
+                aad_buf[..copy_len].copy_from_slice(&data[..copy_len]);
+                aad_buf[consumed] = (aad_buf[consumed] & !0x07) | 0x05;
                 match self.security.decrypt(
-                    &data[..aad_len],
+                    &aad_buf[..copy_len],
                     &after_hdr[sec_consumed..],
                     &key,
                     &sec_hdr,
                 ) {
                     Some(v) => v,
-                    None => continue,
+                    None => {
+                        log::warn!("[NWK] Rejoin RX #{}: decrypt failed (fc={})", attempt, sec_hdr.frame_counter);
+                        continue;
+                    }
                 }
             } else {
                 let payload = &data[consumed..];
@@ -570,6 +604,10 @@ impl<M: MacDriver> NwkLayer<M> {
             };
 
             // Rejoin Response: cmd_id(0x07) + new_short_addr(2) + rejoin_status(1)
+            log::info!(
+                "[NWK] Rejoin RX #{}: decrypted cmd_id=0x{:02X} len={}",
+                attempt, cmd_data.get(0).copied().unwrap_or(0xFF), cmd_data.len()
+            );
             if cmd_data.len() >= 4 && cmd_data[0] == 0x07 {
                 let new_addr = u16::from_le_bytes([cmd_data[1], cmd_data[2]]);
                 let rejoin_status = cmd_data[3];

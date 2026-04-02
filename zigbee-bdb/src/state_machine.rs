@@ -363,6 +363,9 @@ impl<M: MacDriver> BdbLayer<M> {
         }
 
         log::warn!("[BDB] All rejoin attempts failed — falling back to steering");
+        // Mark as off-network so steering does a fresh scan+join
+        // instead of the "on network" path (which just opens permit joining)
+        self.attributes.node_is_on_a_network = false;
         self.state = BdbState::Idle;
         self.network_steering().await
     }

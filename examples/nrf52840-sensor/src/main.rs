@@ -264,7 +264,7 @@ async fn main(_spawner: Spawner) {
     let restored = device.restore_state(&nv);
     if restored {
         info!("Restored network state from flash — will rejoin existing network");
-        device.user_action(UserAction::Join);
+        device.user_action(UserAction::Rejoin);
     } else {
         info!("No saved state — auto-joining network…");
         device.user_action(UserAction::Join);

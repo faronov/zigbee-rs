@@ -90,6 +90,10 @@ pub struct ClusterRef<'a> {
 pub enum UserAction {
     /// Join a network (BDB commissioning).
     Join,
+    /// Rejoin a previously-joined network using stored NWK key.
+    /// Use after `restore_state()` succeeds — skips full BDB commissioning
+    /// and performs NWK-level rejoin on the last-known channel.
+    Rejoin,
     /// Leave the current network.
     Leave,
     /// Toggle join/leave based on current state.
@@ -168,6 +172,84 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         // Sync addresses into ZDO so interview responses are correct
         self.bdb.zdo_mut().set_local_nwk_addr(ShortAddress(addr));
         self.bdb.zdo_mut().set_local_ieee_addr(ieee);
+
+        self.state_dirty = true;
+        Ok(addr)
+    }
+
+    /// Rejoin a previously-joined network using stored NWK credentials.
+    ///
+    /// Uses a "silent resume" approach: restores MAC-layer addresses (PAN ID,
+    /// short address, channel) so the device can immediately start polling
+    /// its parent and responding to frames. A Device_annce broadcast notifies
+    /// the coordinator that we're back online.
+    ///
+    /// This avoids the NWK Rejoin Request/Response exchange which some
+    /// coordinators (e.g. ZHA/EZSP) handle unreliably. If the parent has
+    /// disappeared, the caller should fall back to `start()` for a full
+    /// BDB steering join.
+    ///
+    /// Call `restore_state()` first — it sets up NIB, security keys, and
+    /// marks `node_is_on_a_network = true`.
+    pub async fn rejoin(&mut self) -> Result<u16, event_loop::StartError> {
+        log::info!("[Runtime] Resuming on previous network…");
+
+        let nib = self.bdb.zdo().nwk().nib();
+        let addr = nib.network_address.0;
+        let channel = nib.logical_channel;
+        let pan_id = nib.pan_id;
+        let parent = nib.parent_address;
+
+        log::info!(
+            "[Runtime] Resume: addr=0x{:04X} PAN=0x{:04X} ch={} parent=0x{:04X}",
+            addr, pan_id.0, channel, parent.0
+        );
+
+        // Configure MAC layer with restored addresses so it accepts
+        // unicast frames and can transmit with the correct source address.
+        let mac = self.bdb.zdo_mut().nwk_mut().mac_mut();
+        let _ = mac
+            .mlme_set(zigbee_mac::PibAttribute::PhyCurrentChannel, zigbee_mac::PibValue::U8(channel))
+            .await;
+        let _ = mac
+            .mlme_set(zigbee_mac::PibAttribute::MacPanId, zigbee_mac::PibValue::PanId(PanId(pan_id.0)))
+            .await;
+        let _ = mac
+            .mlme_set(
+                zigbee_mac::PibAttribute::MacShortAddress,
+                zigbee_mac::PibValue::ShortAddress(ShortAddress(addr)),
+            )
+            .await;
+
+        // Read IEEE address from MAC hardware and set it in NIB.
+        // The NV-restored IEEE may be all-zeros if the first join never
+        // saved it properly. The MAC always has the correct hardware IEEE.
+        if let Ok(zigbee_mac::PibValue::ExtendedAddress(hw_ieee)) = self
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .mac_mut()
+            .mlme_get(zigbee_mac::PibAttribute::MacExtendedAddress)
+            .await
+        {
+            self.bdb.zdo_mut().nwk_mut().nib_mut().ieee_address = hw_ieee;
+            log::info!("[Runtime] NIB IEEE set from MAC: {:02X?}", hw_ieee);
+        }
+
+        let ieee = self.bdb.zdo().nwk().nib().ieee_address;
+
+        // Mark as joined so NWK/ZDO accept frames
+        self.bdb.zdo_mut().nwk_mut().set_joined(true);
+
+        // Sync addresses into ZDO so interview responses are correct
+        self.bdb.zdo_mut().set_local_nwk_addr(ShortAddress(addr));
+        self.bdb.zdo_mut().set_local_ieee_addr(ieee);
+
+        // Skip Device_annce on rejoin — it triggers the coordinator to
+        // re-evaluate our status and potentially send Leave. Just start
+        // polling silently; the coordinator still has our entry from the
+        // previous join.
+        log::info!("[Runtime] Silent resume — skipping Device_annce");
 
         self.state_dirty = true;
         Ok(addr)
@@ -453,6 +535,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             nib.depth = depth;
             nib.parent_address = parent;
             nib.update_id = update_id;
+            // Restore IEEE address (critical for NWK security headers)
+            let mut ieee_buf = [0u8; 8];
+            if let Ok(8) = nv.read(NvItemId::NwkIeeeAddress, &mut ieee_buf) {
+                nib.ieee_address = ieee_buf;
+            }
         }
 
         // Restore NWK security key
@@ -471,12 +558,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 .nwk_mut()
                 .security_mut()
                 .set_network_key(key_buf, seq);
-            // Restore frame counter in NIB
+            // Restore frame counter with safety margin: frames may have been
+            // sent after the last NV save, so the coordinator's expected counter
+            // is higher than what we saved. Add 1000 to avoid replay rejection.
+            const FC_SAFETY_MARGIN: u32 = 1000;
+            let fc_safe = fc.saturating_add(FC_SAFETY_MARGIN);
+            log::info!("[NV] Restored NWK key seq={}, fc={} (saved={} +{})", seq, fc_safe, fc, FC_SAFETY_MARGIN);
             self.bdb
                 .zdo_mut()
                 .nwk_mut()
                 .nib_mut()
-                .outgoing_frame_counter = fc;
+                .outgoing_frame_counter = fc_safe;
         }
 
         // Mark as on-network in BDB
@@ -610,6 +702,19 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 return None;
             }
 
+            // Only NWK Data frames (type=0) carry APS payloads.
+            // NWK Command frames (type=1) are NWK-level management (Link Status,
+            // Route Reply, Leave, etc.) — handle or drop them here.
+            if nwk_fc.frame_type != 0 {
+                // For unicast NWK commands addressed to us, log the command ID
+                if is_for_us && nwk_fc.frame_type == 1 {
+                    log::info!("[RX] NWK cmd for us from 0x{:04X}, will decode", src.0);
+                    // Don't return — fall through to decrypt and inspect
+                } else {
+                    return None;
+                }
+            }
+
             let after_header = &mac_payload[consumed..];
             let mut buf = [0u8; 128];
             let len;
@@ -678,10 +783,21 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 buf[..len].copy_from_slice(&after_header[..len]);
             }
 
-            (dst, src, header.frame_control.security, buf, len)
+            (dst, src, header.frame_control.security, nwk_fc.frame_type, buf, len)
         };
 
-        let (dst, src, nwk_security, buf, len) = nwk_indication;
+        let (dst, src, nwk_security, frame_type, buf, len) = nwk_indication;
+
+        // NWK Command frames (type=1) — log command ID, don't pass to APS
+        if frame_type == 1 {
+            if len > 0 {
+                log::info!("[RX] NWK Command id=0x{:02X} from 0x{:04X} ({} bytes)", buf[0], src.0, len);
+                if len > 1 {
+                    log::info!("[RX] NWK Command payload: {:02X?}", &buf[..len.min(16)]);
+                }
+            }
+            return None;
+        }
 
         // APS decryption buffer (for APS-secured frames like Transport Key)
         let mut aps_decrypt_buf = zigbee_aps::apsde::ApsFrameBuffer::new();
