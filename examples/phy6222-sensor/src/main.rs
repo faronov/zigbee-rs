@@ -104,7 +104,7 @@ async fn main(_spawner: Spawner) {
     // Start the real SysTick-based time driver (MUST be first)
     time_driver::init();
 
-    // Enable LL_IRQ (IRQ 17) in NVIC so radio interrupts fire
+    // Enable BB_IRQ (IRQ 4) in NVIC so radio/LL interrupts fire
     unsafe {
         cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::LlIrq);
     }

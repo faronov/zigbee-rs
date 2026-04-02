@@ -608,14 +608,14 @@ impl Phy6222Driver {
 
 // ── IRQ handler ─────────────────────────────────────────────────
 
-/// LL HW interrupt handler — called from the LL_IRQ vector.
+/// LL HW interrupt handler — called from the BB (Baseband) IRQ vector.
 ///
-/// This must be registered as the interrupt handler for the LL_IRQn
-/// interrupt (IRQ #17 on PHY6222). The handler reads the
+/// This must be registered as the interrupt handler for BB_IRQn
+/// (IRQ #4 on PHY6222, verified from SDK bus_dev.h). The handler reads the
 /// IRQ status, processes TX/RX completion, and signals the async driver.
 ///
-/// The function name `LL_IRQ` matches the `device.x` linker symbol,
-/// overriding the weak `DefaultHandler` alias.
+/// The function name `LL_IRQ` matches the `device.x` linker symbol at
+/// vector position 4, overriding the weak `DefaultHandler` alias.
 #[unsafe(no_mangle)]
 pub extern "C" fn LL_IRQ() {
     let irq_status = reg_read(LL_HW_BASE + 0x10); // IRQ status register
