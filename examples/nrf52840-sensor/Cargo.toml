@@ -28,6 +28,8 @@ defmt = "1.0"
 defmt-rtt = "1.0"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 embedded-hal = "1.0"
+embedded-storage = "0.3"
+heapless = "0.8"
 log = "0.4"
 
 [profile.release]

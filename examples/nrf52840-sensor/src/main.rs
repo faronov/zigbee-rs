@@ -39,6 +39,7 @@ use {defmt_rtt as _, panic_probe as _};
 
 #[cfg(feature = "sensor-bme280")]
 mod bme280;
+mod flash_nv;
 #[cfg(feature = "sensor-sht31")]
 mod sht31;
 
@@ -183,6 +184,11 @@ async fn main(_spawner: Spawner) {
     mac.set_tx_power(8);
     info!("Radio ready");
 
+    // ── Flash NV storage (last 2 pages of 1 MB flash) ──
+    let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
+    let mut nv = flash_nv::FlashNvStorage::new(nvmc);
+    info!("Flash NV storage ready");
+
     // ── ZCL clusters ──
     let mut basic_cluster = BasicCluster::new(b"Zigbee-RS", b"nRF52840-Sensor", b"20260401", b"0.1.0");
     basic_cluster.set_power_source(0x03);
@@ -216,7 +222,18 @@ async fn main(_spawner: Spawner) {
         })
         .build();
 
-    info!("Device ready — press Button 1 to join/leave");
+    // ── Restore previous network state from flash ──
+    let restored = device.restore_state(&nv);
+    if restored {
+        info!("Restored network state from flash — will rejoin existing network");
+        // Set MAC address filter so the radio accepts frames for our stored address
+        device.user_action(UserAction::Join);
+    } else {
+        info!("No saved state — press Button 1 to join a network");
+    }
+
+    // Track whether we need to save state after next tick
+    let mut needs_save = false;
 
     loop {
         match select3(
@@ -243,6 +260,9 @@ async fn main(_spawner: Spawner) {
                 ];
                 if let Some(event) = device.process_incoming(&indication, &mut clusters).await {
                     log_event(&event);
+                    if matches!(event, StackEvent::Joined { .. }) {
+                        needs_save = true;
+                    }
                 }
             }
             Either3::First(Err(_)) => { warn!("MAC receive error"); }
@@ -269,6 +289,17 @@ async fn main(_spawner: Spawner) {
                 ];
                 if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
                     log_event(e);
+                    match e {
+                        StackEvent::Joined { .. } => {
+                            device.save_state(&mut nv);
+                            info!("Network state saved to flash");
+                        }
+                        StackEvent::Left => {
+                            device.factory_reset(Some(&mut nv)).await;
+                            info!("NV storage cleared");
+                        }
+                        _ => {}
+                    }
                 }
                 Timer::after(Duration::from_millis(300)).await;
             }
@@ -357,6 +388,13 @@ async fn main(_spawner: Spawner) {
                 ];
                 if let TickResult::Event(ref e) = device.tick(REPORT_INTERVAL_SECS as u16, &mut clusters).await {
                     log_event(e);
+                }
+
+                // Save state after successful join (deferred from receive path)
+                if needs_save && device.is_joined() {
+                    device.save_state(&mut nv);
+                    needs_save = false;
+                    info!("Network state saved to flash");
                 }
             }
         }

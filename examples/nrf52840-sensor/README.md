@@ -83,15 +83,17 @@ and yield during transfers, so the Zigbee radio continues processing uninterrupt
 - Processing incoming MAC frames and generating ZCL attribute reports
 - Button-driven network join/leave via `UserAction::Toggle`
 - RAM power-down of unused banks (~190 KB saved on nRF52840)
+- **Flash NV storage** — network state persists across power cycles (last 8 KB of flash)
 - Battery voltage monitoring via SAADC (VDD internal divider)
 - `log` → `defmt` bridge for stack-internal logging via RTT
 
 ## Operation
 
-1. Power on → device starts idle (not joined)
-2. Press Button 1 → initiates BDB commissioning (network steering)
-3. Once joined → reads sensors every 30 s, reports to coordinator
-4. Press Button 1 again → leaves the network
+1. Power on → restores saved network state from flash (if any) and auto-rejoins
+2. If no saved state → press Button 1 to initiate BDB commissioning
+3. Once joined → reads sensors every 30 s, reports to coordinator; state saved to flash
+4. Press Button 1 → leaves the network and clears flash NV storage
+5. **Power cycle** → device reconnects automatically (no re-pairing needed!)
 
 ## Project Structure
 
@@ -100,9 +102,10 @@ nrf52840-sensor/
 ├── .cargo/config.toml   # Target, runner (probe-rs), DEFMT_LOG level
 ├── Cargo.toml            # Features (sensor-bme280, sensor-sht31), deps
 ├── build.rs              # Linker script flags (-Tlink.x -Tdefmt.x)
-├── memory.x              # Memory layout: 1 MB Flash, 256 KB RAM
+├── memory.x              # Memory layout: 1016 KB Flash + 8 KB NV, 256 KB RAM
 └── src/
     ├── bme280.rs         # Async BME280 I2C driver (feature: sensor-bme280)
+    ├── flash_nv.rs       # Flash-backed NV storage (NVMC, last 2 pages)
     ├── sht31.rs          # Async SHT31 I2C driver (feature: sensor-sht31)
     └── main.rs           # Async entry point (#[embassy_executor::main])
 ```
