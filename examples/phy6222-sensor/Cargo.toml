@@ -21,6 +21,9 @@ embassy-futures = "0.1"
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = { version = "0.7", features = ["device"] }
 
+# PHY6222 HAL — pure Rust GPIO, I2C, ADC, flash drivers
+phy6222-hal = { path = "../../phy6222-hal" }
+
 # Data structures for no_std
 heapless = "0.8"
 

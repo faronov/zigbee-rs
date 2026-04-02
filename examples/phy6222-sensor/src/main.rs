@@ -30,9 +30,6 @@ mod stubs;
 mod time_driver;
 mod vectors;
 mod flash_nv;
-#[allow(dead_code)]
-mod i2c;
-mod adc;
 
 use cortex_m as _;
 use panic_halt as _;
@@ -61,48 +58,13 @@ const EXPECTED_REPORT_CLUSTERS: usize = 3; // PowerConfig + Temp + Humidity
 
 // ── PHY6222 GPIO ────────────────────────────────────────────────
 
-const GPIO_BASE: u32 = 0x4000_8000;
-
 mod pins {
     pub const LED_G: u8 = 12; // Green LED (PB-03F), active LOW
     pub const BTN: u8 = 15;   // PROG button, active LOW
 }
 
-fn gpio_set_output(pin: u8) {
-    unsafe {
-        let oe = (GPIO_BASE + 0x04) as *mut u32;
-        core::ptr::write_volatile(oe, core::ptr::read_volatile(oe) | (1 << pin));
-    }
-}
-
-fn gpio_set_input(pin: u8) {
-    unsafe {
-        let oe = (GPIO_BASE + 0x04) as *mut u32;
-        core::ptr::write_volatile(oe, core::ptr::read_volatile(oe) & !(1 << pin));
-    }
-}
-
-fn gpio_write(pin: u8, high: bool) {
-    unsafe {
-        let dr = (GPIO_BASE + 0x00) as *mut u32;
-        let val = core::ptr::read_volatile(dr);
-        if high {
-            core::ptr::write_volatile(dr, val | (1 << pin));
-        } else {
-            core::ptr::write_volatile(dr, val & !(1 << pin));
-        }
-    }
-}
-
-fn gpio_read_input(pin: u8) -> bool {
-    unsafe {
-        let ext = (GPIO_BASE + 0x50) as *const u32; // ext_porta (input read)
-        (core::ptr::read_volatile(ext) >> pin) & 1 == 1
-    }
-}
-
-fn led_on() { gpio_write(pins::LED_G, false); }  // active LOW
-fn led_off() { gpio_write(pins::LED_G, true); }
+fn led_on() { phy6222_hal::gpio::write(pins::LED_G, false); }  // active LOW
+fn led_off() { phy6222_hal::gpio::write(pins::LED_G, true); }
 
 // ── Main ────────────────────────────────────────────────────────
 
@@ -117,8 +79,8 @@ async fn main(_spawner: Spawner) {
     log::info!("[PHY6222] Zigbee Sensor starting (pure Rust!)");
 
     // GPIO init
-    gpio_set_output(pins::LED_G);
-    gpio_set_input(pins::BTN);
+    phy6222_hal::gpio::set_output(pins::LED_G);
+    phy6222_hal::gpio::set_input(pins::BTN);
     led_off();
 
     // Boot signal: triple blink
@@ -204,8 +166,8 @@ async fn main(_spawner: Spawner) {
         hum_cluster.set_humidity(5000u16);
 
         // Real battery voltage via ADC
-        let batt_mv = adc::read_battery_mv(adc::AdcChannel::P11);
-        let batt_pct = adc::mv_to_percent(batt_mv);
+        let batt_mv = phy6222_hal::adc::read_battery_mv(phy6222_hal::adc::Channel::P11);
+        let batt_pct = phy6222_hal::adc::mv_to_percent(batt_mv);
         power_cluster.set_battery_voltage((batt_mv / 100) as u8);
         power_cluster.set_battery_percentage(batt_pct * 2); // ZCL 0.5% units
         log::info!("[PHY6222] Initial: T=22.50°C H=50.00% Batt={}mV ({}%)", batt_mv, batt_pct);
@@ -246,12 +208,12 @@ async fn main(_spawner: Spawner) {
         }
 
         // ── Button check ──
-        let pressed = !gpio_read_input(pins::BTN); // active LOW
+        let pressed = !phy6222_hal::gpio::read(pins::BTN); // active LOW
         if pressed && !button_was_pressed {
             // Check for long press (3s = factory reset)
             let mut held_long = false;
             let press_start = Instant::now();
-            while !gpio_read_input(pins::BTN) { // still pressed
+            while !phy6222_hal::gpio::read(pins::BTN) { // still pressed
                 if press_start.elapsed().as_secs() >= 3 {
                     held_long = true;
                     break;
@@ -369,8 +331,8 @@ async fn main(_spawner: Spawner) {
                 );
 
                 // Real battery voltage via ADC
-                let batt_mv = adc::read_battery_mv(adc::AdcChannel::P11);
-                let batt_pct = adc::mv_to_percent(batt_mv);
+                let batt_mv = phy6222_hal::adc::read_battery_mv(phy6222_hal::adc::Channel::P11);
+                let batt_pct = phy6222_hal::adc::mv_to_percent(batt_mv);
                 power_cluster.set_battery_voltage((batt_mv / 100) as u8);
                 power_cluster.set_battery_percentage(batt_pct * 2);
                 log::info!("[PHY6222] Battery: {}mV ({}%)", batt_mv, batt_pct);

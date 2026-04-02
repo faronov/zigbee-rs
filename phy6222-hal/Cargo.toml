@@ -1,0 +1,9 @@
+[package]
+name = "phy6222-hal"
+version = "0.1.0"
+edition = "2024"
+description = "Pure-Rust HAL for PHY6222/PHY6226/PHY6252 SoC — no vendor SDK"
+
+[dependencies]
+cortex-m = "0.7"
+log = "0.4"

@@ -1,4 +1,4 @@
-//! Flash-backed NV storage for PHY6222/6252 — pure Rust, no vendor SDK.
+//! Flash-backed NV storage for PHY6222/6252.
 //!
 //! Uses the last 2 flash sectors (8 KB) for persistent Zigbee state.
 //! Log-structured: items are appended sequentially, latest wins.
@@ -6,16 +6,9 @@
 //!
 //! # Flash layout (PHY6222: 512 KB, sector = 4 KB)
 //! ```text
-//! Sector at 0x7E000: Active NV page (flash addr 0x1107E000)
-//! Sector at 0x7F000: Scratch page   (flash addr 0x1107F000)
+//! Sector at 0x7E000: Active NV page
+//! Sector at 0x7F000: Scratch page
 //! ```
-//!
-//! # PHY6222 Flash Hardware
-//! - Memory-mapped XIP at 0x11000000
-//! - SPIF controller at 0x4000C800
-//! - 4 KB sectors, erase = 0x20 command
-//! - Page program = 0x02 command (up to 256 bytes)
-//! - Must bypass cache for writes/erases
 //!
 //! # Item format (4-byte aligned)
 //! ```text
@@ -23,9 +16,6 @@
 //! ```
 
 use zigbee_runtime::nv_storage::{NvError, NvItemId, NvStorage};
-
-/// Flash base for XIP (memory-mapped reads).
-const FLASH_BASE: u32 = 0x1100_0000;
 
 /// NV page A: second-to-last 4 KB sector of 512 KB flash.
 const NV_PAGE_A: u32 = 0x0007_E000;
@@ -40,20 +30,6 @@ const ITEM_MAGIC: u16 = 0xA55A;
 
 /// Header size: magic(2) + id(2) + len(2) + pad(2) = 8 bytes.
 const HEADER_SIZE: usize = 8;
-
-// ── SPIF register addresses ────────────────────────────────────
-
-const AP_SPIF_BASE: u32 = 0x4000_C800;
-const SPIF_CONFIG: u32 = AP_SPIF_BASE + 0x00;
-const SPIF_FCMD: u32 = AP_SPIF_BASE + 0x90;
-const SPIF_FCMD_ADDR: u32 = AP_SPIF_BASE + 0x94;
-const SPIF_FCMD_WRDATA: u32 = AP_SPIF_BASE + 0xA8;
-
-// Cache control
-const AP_CACHE_BASE: u32 = 0x4000_C000;
-const CACHE_CTRL0: u32 = AP_CACHE_BASE + 0x00;
-/// Cache bypass register (from PHY6222 SDK AP_PCR->CACHE_BYPASS).
-const CACHE_BYPASS_REG: u32 = 0x4000_0044;
 
 /// Flash-backed NV storage for PHY6222.
 pub struct FlashNvStorage {
@@ -187,146 +163,25 @@ impl FlashNvStorage {
         if self.active_page == NV_PAGE_A { NV_PAGE_B } else { NV_PAGE_A }
     }
 
-    // ── Flash hardware access (pure Rust, direct registers) ──
+    // ── Flash access via phy6222-hal ──
 
-    /// Read bytes from flash via XIP memory mapping.
+    /// Read bytes from flash via XIP.
     fn flash_read_bytes(&self, offset: u32, len: usize) -> [u8; 128] {
         let mut buf = [0xFFu8; 128];
-        let addr = (FLASH_BASE | (offset & 0x7_FFFF)) as *const u8;
-        for i in 0..len.min(128) {
-            buf[i] = unsafe { core::ptr::read_volatile(addr.add(i)) };
-        }
+        phy6222_hal::flash::read(offset, &mut buf[..len.min(128)]);
         buf
     }
 
     /// Erase a 4 KB flash sector.
     fn erase_sector(&self, offset: u32) -> Result<(), NvError> {
-        self.enter_cache_bypass();
-
-        // Write Enable
-        self.spif_wait_idle();
-        reg_write(SPIF_FCMD, 0x0600_0001); // WREN
-        self.spif_wait_idle();
-        self.spif_wait_not_busy();
-
-        // Sector Erase (0x20)
-        reg_write(SPIF_FCMD_ADDR, offset);
-        // fcmd encoding: op=0x20, addrlen=3, no read/write data
-        reg_write(SPIF_FCMD, (0x20u32 << 24) | 0x8_0001 | (2 << 16)); // op + addr_en + addr_len=3
-        self.spif_wait_idle();
-        self.spif_wait_not_busy();
-
-        self.exit_cache_bypass();
-        self.cache_flush();
+        phy6222_hal::flash::erase_sector(offset);
         Ok(())
     }
 
-    /// Write data to flash (page program, up to 256 bytes at a time).
+    /// Write data to flash.
     fn flash_write(&self, offset: u32, data: &[u8]) -> Result<(), NvError> {
-        self.enter_cache_bypass();
-
-        let mut pos = 0;
-        while pos < data.len() {
-            // Page program: max 256 bytes, must not cross page boundary
-            let page_boundary = ((offset as usize + pos) | 0xFF) + 1;
-            let remaining_in_page = page_boundary - (offset as usize + pos);
-            let chunk_len = (data.len() - pos).min(remaining_in_page).min(256);
-
-            // Write Enable
-            self.spif_wait_idle();
-            reg_write(SPIF_FCMD, 0x0600_0001); // WREN
-            self.spif_wait_idle();
-            self.spif_wait_not_busy();
-
-            // Set address
-            reg_write(SPIF_FCMD_ADDR, offset + pos as u32);
-
-            // Write data to FIFO (4 bytes at a time via wrdata registers)
-            let mut i = 0;
-            while i < chunk_len {
-                let mut word = 0xFFFF_FFFFu32;
-                for b in 0..4 {
-                    if i + b < chunk_len {
-                        // Clear the byte position and set data
-                        word &= !(0xFF << (b * 8));
-                        word |= (data[pos + i + b] as u32) << (b * 8);
-                    }
-                }
-                reg_write(SPIF_FCMD_WRDATA + (i as u32 / 4) * 4, word);
-                i += 4;
-            }
-
-            // Page Program command (0x02)
-            let wr_words = ((chunk_len + 3) / 4) as u32;
-            // fcmd: op=0x02, addr_en, addr_len=3, wr_en, wr_len
-            let fcmd = (0x02u32 << 24)
-                | 0x8_0001         // addr_en + trigger
-                | (2 << 16)        // addr_len = 3 bytes (0-indexed = 2)
-                | 0x8000           // wr_en
-                | ((wr_words.saturating_sub(1)) << 12); // wr_len (0-indexed)
-            reg_write(SPIF_FCMD, fcmd);
-            self.spif_wait_idle();
-            self.spif_wait_not_busy();
-
-            pos += chunk_len;
-        }
-
-        self.exit_cache_bypass();
-        self.cache_flush();
+        phy6222_hal::flash::write(offset, data);
         Ok(())
-    }
-
-    /// Wait for SPIF controller to be idle.
-    fn spif_wait_idle(&self) {
-        for _ in 0..100_000u32 {
-            let fcmd = reg_read(SPIF_FCMD);
-            if fcmd & 0x02 == 0 {
-                // Also wait for config ready bit
-                let cfg = reg_read(SPIF_CONFIG);
-                if cfg & 0x8000_0000 != 0 {
-                    return;
-                }
-            }
-            cortex_m::asm::nop();
-        }
-    }
-
-    /// Wait for flash chip to finish write/erase (poll status register).
-    fn spif_wait_not_busy(&self) {
-        for _ in 0..1_000_000u32 {
-            // Read Status Register (RDSR = 0x05)
-            reg_write(SPIF_FCMD, (0x05u32 << 24) | 0x80_0001 | (1 << 20)); // op + rd_en + rd_len=2 + trigger
-            self.spif_wait_idle();
-            let status = reg_read(AP_SPIF_BASE + 0xA0) & 0xFF; // fcmd_rddata[0]
-            if status & 0x01 == 0 {
-                return; // WIP bit clear
-            }
-            cortex_m::asm::nop();
-        }
-    }
-
-    fn enter_cache_bypass(&self) {
-        cortex_m::interrupt::free(|_| {
-            reg_write(CACHE_CTRL0, 0x02);
-            reg_write(CACHE_BYPASS_REG, 1);
-        });
-    }
-
-    fn exit_cache_bypass(&self) {
-        cortex_m::interrupt::free(|_| {
-            reg_write(CACHE_CTRL0, 0x00);
-            reg_write(CACHE_BYPASS_REG, 0);
-        });
-    }
-
-    fn cache_flush(&self) {
-        cortex_m::interrupt::free(|_| {
-            reg_write(CACHE_CTRL0, 0x02);
-            for _ in 0..8 { cortex_m::asm::nop(); }
-            reg_write(CACHE_CTRL0, 0x03);
-            for _ in 0..8 { cortex_m::asm::nop(); }
-            reg_write(CACHE_CTRL0, 0x00);
-        });
     }
 }
 
@@ -408,14 +263,6 @@ impl NvStorage for FlashNvStorage {
 
 const fn align4(n: usize) -> usize {
     (n + 3) & !3
-}
-
-fn reg_write(addr: u32, val: u32) {
-    unsafe { core::ptr::write_volatile(addr as *mut u32, val) };
-}
-
-fn reg_read(addr: u32) -> u32 {
-    unsafe { core::ptr::read_volatile(addr as *const u32) }
 }
 
 fn raw_to_nv_item_id(raw: u16) -> Option<NvItemId> {
