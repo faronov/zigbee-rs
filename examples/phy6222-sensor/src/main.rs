@@ -1,21 +1,23 @@
-//! PHY6222 Zigbee Temperature/Humidity Sensor Example
+//! # Zigbee-RS PHY6222 Sensor (SED)
 //!
-//! A complete Zigbee End Device firmware for PHY6222/6252-based boards
-//! (Ai-Thinker PB-03F, Tuya THB2/TH05F/BTH01 sensor devices).
-//!
-//! This is the first zigbee-rs example with a **100% pure-Rust radio driver** —
-//! no vendor SDK, no binary blobs, no C FFI. All radio hardware access is
-//! through direct register writes in Rust.
+//! Full-featured Zigbee 3.0 sleepy end device for PHY6222/6252-based boards.
+//! Pure-Rust radio driver — no vendor SDK, no binary blobs, no C FFI.
 //!
 //! # Hardware
-//! - PHY6222 (512KB flash, 64KB SRAM) or PHY6252 (256KB flash, 64KB SRAM), ARM Cortex-M0
+//! - PHY6222 (512KB flash, 64KB SRAM) or PHY6252 (256KB), ARM Cortex-M0
 //! - 2.4 GHz radio with IEEE 802.15.4 + BLE support
-//! - I2C sensor: CHT8215/CHT8310/SHT30/AHT20 (configurable)
 //! - Common boards: PB-03F (PHY6252), THB2/TH05F/BTH01 (PHY6222)
+//!
+//! # Features
+//! - Auto-join on boot (no button required)
+//! - Sleepy End Device: poll parent for indirect frames
+//! - Fast poll (250ms) during ZHA interview, slow poll (10s) normal
+//! - LED status: triple-blink boot, double-blink joining, solid joined
+//! - Button: short press = toggle join/leave, long press = factory reset
+//! - Device_annce retries for reliable coordinator discovery
 //!
 //! # Build
 //! ```bash
-//! # Full build — no vendor SDK required!
 //! cargo build --release
 //! ```
 
@@ -30,211 +32,394 @@ mod vectors;
 
 use cortex_m as _;
 use panic_halt as _;
-// Ensure the interrupt vector table is linked in
 #[allow(unused_imports)]
 use vectors::__INTERRUPTS;
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::phy6222::Phy6222Mac;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
+use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
+use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
-// ── PHY6222 hardware constants ──────────────────────────────────
+const REPORT_INTERVAL_SECS: u64 = 30;
+const FAST_POLL_MS: u64 = 250;
+const SLOW_POLL_SECS: u64 = 10;
+const FAST_POLL_DURATION_SECS: u64 = 120;
+const EXPECTED_REPORT_CLUSTERS: usize = 3; // PowerConfig + Temp + Humidity
 
-/// PHY6222 GPIO register base
+// ── PHY6222 GPIO ────────────────────────────────────────────────
+
 const GPIO_BASE: u32 = 0x4000_8000;
 
-/// GPIO pin assignments (varies by board — PB-03F defaults)
 mod pins {
-    pub const LED_R: u8 = 11; // Red LED (PB-03F)
-    pub const LED_G: u8 = 12; // Green LED (PB-03F)
-    pub const LED_B: u8 = 14; // Blue LED (PB-03F)
-    pub const BTN: u8 = 15; // PROG button (PB-03F)
+    pub const LED_G: u8 = 12; // Green LED (PB-03F), active LOW
+    pub const BTN: u8 = 15;   // PROG button, active LOW
 }
-
-// ── Minimal GPIO helpers ────────────────────────────────────────
 
 fn gpio_set_output(pin: u8) {
     unsafe {
-        let oe_reg = (GPIO_BASE + 0x04) as *mut u32;
-        let val = core::ptr::read_volatile(oe_reg);
-        core::ptr::write_volatile(oe_reg, val | (1 << pin));
+        let oe = (GPIO_BASE + 0x04) as *mut u32;
+        core::ptr::write_volatile(oe, core::ptr::read_volatile(oe) | (1 << pin));
+    }
+}
+
+fn gpio_set_input(pin: u8) {
+    unsafe {
+        let oe = (GPIO_BASE + 0x04) as *mut u32;
+        core::ptr::write_volatile(oe, core::ptr::read_volatile(oe) & !(1 << pin));
     }
 }
 
 fn gpio_write(pin: u8, high: bool) {
     unsafe {
-        let dout_reg = (GPIO_BASE + 0x00) as *mut u32;
-        let val = core::ptr::read_volatile(dout_reg);
+        let dr = (GPIO_BASE + 0x00) as *mut u32;
+        let val = core::ptr::read_volatile(dr);
         if high {
-            core::ptr::write_volatile(dout_reg, val | (1 << pin));
+            core::ptr::write_volatile(dr, val | (1 << pin));
         } else {
-            core::ptr::write_volatile(dout_reg, val & !(1 << pin));
+            core::ptr::write_volatile(dr, val & !(1 << pin));
         }
     }
 }
 
-fn gpio_read(pin: u8) -> bool {
+fn gpio_read_input(pin: u8) -> bool {
     unsafe {
-        let din_reg = (GPIO_BASE + 0x08) as *const u32;
-        let val = core::ptr::read_volatile(din_reg);
-        (val >> pin) & 1 == 1
+        let ext = (GPIO_BASE + 0x50) as *const u32; // ext_porta (input read)
+        (core::ptr::read_volatile(ext) >> pin) & 1 == 1
     }
 }
 
-fn led_on() {
-    gpio_write(pins::LED_G, false); // Active low on PB-03F
-}
+fn led_on() { gpio_write(pins::LED_G, false); }  // active LOW
+fn led_off() { gpio_write(pins::LED_G, true); }
 
-fn led_off() {
-    gpio_write(pins::LED_G, true);
-}
-
-// ── Main entry point ────────────────────────────────────────────
+// ── Main ────────────────────────────────────────────────────────
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    // Start the real SysTick-based time driver (MUST be first)
     time_driver::init();
 
-    // Enable BB_IRQ (IRQ 4) in NVIC so radio/LL interrupts fire
     unsafe {
         cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::LlIrq);
     }
 
-    log::info!("[PHY6222] Zigbee Sensor starting (pure Rust radio driver!)");
+    log::info!("[PHY6222] Zigbee Sensor starting (pure Rust!)");
 
-    // Initialize GPIO for LEDs
-    gpio_set_output(pins::LED_R);
+    // GPIO init
     gpio_set_output(pins::LED_G);
-    gpio_set_output(pins::LED_B);
+    gpio_set_input(pins::BTN);
     led_off();
 
-    // Startup blink
-    for _ in 0..3 {
+    // Boot signal: triple blink
+    for _ in 0..3u8 {
         led_on();
         Timer::after(Duration::from_millis(100)).await;
         led_off();
         Timer::after(Duration::from_millis(100)).await;
     }
+    Timer::after(Duration::from_millis(500)).await;
 
-    // Create MAC driver — pure Rust, no vendor SDK!
+    // Radio + MAC
     let mac = Phy6222Mac::new();
+    log::info!("[PHY6222] Radio ready");
 
-    // ZCL cluster instances
+    // ZCL clusters
     let mut basic_cluster = BasicCluster::new(
-        b"Zigbee-RS",       // manufacturer
-        b"PHY6222-Sensor",  // model
-        b"20250101",        // date code
-        b"0.1.0",           // sw build
+        b"Zigbee-RS",
+        b"PHY6222-Sensor",
+        b"20260402",
+        b"0.1.0",
     );
+    basic_cluster.set_power_source(0x03); // Battery
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
+    let mut power_cluster = PowerConfigCluster::new();
+    power_cluster.set_battery_size(4);     // AAA
+    power_cluster.set_battery_quantity(2); // 2× AAA
+    power_cluster.set_battery_rated_voltage(15); // 1.5V
 
-    // Build Zigbee device
+    // Simulated sensor state
+    let mut hum_tick: u32 = 0;
+
+    // Build device (SED)
     let mut device = ZigbeeDevice::builder(mac)
         .device_type(DeviceType::EndDevice)
+        .power_mode(PowerMode::Sleepy {
+            poll_interval_ms: 10_000,
+            wake_duration_ms: 500,
+        })
         .manufacturer("Zigbee-RS")
         .model("PHY6222-Sensor")
         .sw_build("0.1.0")
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
         .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
             ep.cluster_server(0x0000) // Basic
+                .cluster_server(0x0001) // Power Configuration
                 .cluster_server(0x0402) // Temperature Measurement
                 .cluster_server(0x0405) // Relative Humidity
         })
         .build();
 
-    log::info!("[PHY6222] Device ready — press PROG button to join/leave");
-
-    // Initial tick to start commissioning state machine
+    // Auto-join on boot
+    log::info!("[PHY6222] Auto-joining network…");
+    device.user_action(UserAction::Join);
     let mut clusters = [
         ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
         ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+        ClusterRef { endpoint: 1, cluster: &mut power_cluster },
     ];
-    let _ = device.tick(0, &mut clusters).await;
+    if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
+        log_event(e);
+    }
 
+    // Set initial sensor values for ZHA interview
+    {
+        let temp: i16 = 2250;
+        temp_cluster.set_temperature(temp);
+        hum_cluster.set_humidity(5000u16);
+        power_cluster.set_battery_voltage(30); // 3.0V
+        power_cluster.set_battery_percentage(200); // 100% (ZCL 0.5% units)
+        log::info!("[PHY6222] Initial: T=22.50°C H=50.00% Batt=100%");
+    }
+
+    // ── Main loop state ──
+    let mut last_report = Instant::now();
+    let mut fast_poll_until = if device.is_joined() {
+        log::info!("[PHY6222] Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
+        led_on();
+        Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS)
+    } else {
+        Instant::now() // expires immediately
+    };
+    let mut last_rejoin_attempt = Instant::now();
+    let mut rejoin_count: u8 = 0;
+    let mut annce_retries_left: u8 = if device.is_joined() { 5 } else { 0 };
+    let mut last_annce = Instant::now();
+    let mut was_fast_polling = device.is_joined();
+    let mut interview_done = false;
     let mut button_was_pressed = false;
-    let mut tick: u32 = 0;
-    const REPORT_INTERVAL_SECS: u16 = 30;
 
     loop {
-        // ── Button handling (edge detection) ─────────────────
-        let pressed = !gpio_read(pins::BTN); // Active low
-        if pressed && !button_was_pressed {
-            if device.is_joined() {
-                log::info!("[PHY6222] Button → leaving network");
-            } else {
-                log::info!("[PHY6222] Button → joining network");
+        let now = Instant::now();
+        let in_fast_poll = now < fast_poll_until;
+        let poll_ms = if in_fast_poll { FAST_POLL_MS } else { SLOW_POLL_SECS * 1000 };
+
+        // Log transition from fast→slow poll
+        if was_fast_polling && !in_fast_poll {
+            let cfg = device.configured_cluster_count(1);
+            log::info!("[PHY6222] Fast poll OFF — {}/{} clusters configured", cfg, EXPECTED_REPORT_CLUSTERS);
+            was_fast_polling = false;
+            if !interview_done {
+                led_off();
             }
-            device.user_action(UserAction::Toggle);
-            // Immediate tick to process the user action
+        } else if in_fast_poll {
+            was_fast_polling = true;
+        }
+
+        // ── Button check ──
+        let pressed = !gpio_read_input(pins::BTN); // active LOW
+        if pressed && !button_was_pressed {
+            // Check for long press (3s = factory reset)
+            let mut held_long = false;
+            let press_start = Instant::now();
+            while !gpio_read_input(pins::BTN) { // still pressed
+                if press_start.elapsed().as_secs() >= 3 {
+                    held_long = true;
+                    break;
+                }
+                Timer::after(Duration::from_millis(50)).await;
+            }
+
+            if held_long {
+                log::info!("[PHY6222] FACTORY RESET");
+                for _ in 0..5u8 {
+                    led_on();
+                    Timer::after(Duration::from_millis(100)).await;
+                    led_off();
+                    Timer::after(Duration::from_millis(100)).await;
+                }
+                cortex_m::peripheral::SCB::sys_reset();
+            } else {
+                log::info!("[PHY6222] Button → {}", if device.is_joined() { "leave" } else { "join" });
+                device.user_action(UserAction::Toggle);
+                let mut cls = [
+                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                ];
+                if let TickResult::Event(ref e) = device.tick(0, &mut cls).await {
+                    if log_event(e) {
+                        fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                        annce_retries_left = 5;
+                        last_annce = Instant::now();
+                        interview_done = false;
+                    }
+                }
+                Timer::after(Duration::from_millis(300)).await;
+            }
+        }
+        button_was_pressed = pressed;
+
+        // ── Sleep until next poll ──
+        Timer::after(Duration::from_millis(poll_ms)).await;
+
+        // ── Poll parent for indirect frames (SED core) ──
+        if device.is_joined() {
+            for _poll_round in 0..4u8 {
+                match device.poll().await {
+                    Ok(Some(ind)) => {
+                        let mut cls = [
+                            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                        ];
+                        if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
+                            if log_event(&ev) {
+                                fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                log::info!("[PHY6222] Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
+                            }
+                        }
+                        // Check if ZHA completed interview
+                        if !interview_done {
+                            let cfg_count = device.configured_cluster_count(1);
+                            if cfg_count >= EXPECTED_REPORT_CLUSTERS {
+                                log::info!("[PHY6222] Interview done! {}/{} clusters", cfg_count, EXPECTED_REPORT_CLUSTERS);
+                                fast_poll_until = Instant::now() + Duration::from_secs(5);
+                                interview_done = true;
+                                led_off();
+                            }
+                        }
+                        // Tick to send queued ZCL responses
+                        let mut cls2 = [
+                            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                        ];
+                        let _ = device.tick(0, &mut cls2).await;
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+
+            // ── Periodic sensor readings ──
+            let now2 = Instant::now();
+            let elapsed_s = now2.duration_since(last_report).as_secs();
+
+            if elapsed_s >= REPORT_INTERVAL_SECS {
+                last_report = now2;
+
+                // Simulated sensors (replace with I2C/ADC when drivers are ready)
+                let temp_hundredths: i16 = 2250 + ((hum_tick % 50) as i16 - 25);
+                hum_tick = hum_tick.wrapping_add(1);
+                let hum_hundredths: u16 = 5000 + ((hum_tick % 100) as u16) * 10;
+                temp_cluster.set_temperature(temp_hundredths);
+                hum_cluster.set_humidity(hum_hundredths);
+                log::info!(
+                    "[PHY6222] T={}.{:02}°C H={}.{:02}%",
+                    temp_hundredths / 100,
+                    (temp_hundredths % 100).unsigned_abs(),
+                    hum_hundredths / 100,
+                    hum_hundredths % 100,
+                );
+
+                // Simulated battery (3.0V, 100%)
+                power_cluster.set_battery_voltage(30);
+                power_cluster.set_battery_percentage(200);
+            }
+
+            // Tick the runtime
+            let tick_elapsed = elapsed_s.min(60) as u16;
             let mut clusters = [
                 ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut power_cluster },
             ];
-            if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-                log_event(e);
+            if let TickResult::Event(ref e) = device.tick(tick_elapsed, &mut clusters).await {
+                if log_event(e) {
+                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                }
             }
-            Timer::after(Duration::from_millis(300)).await;
-        }
-        button_was_pressed = pressed;
 
-        // ── Simulated sensor readings ────────────────────────
-        if device.is_joined() {
-            let temp_hundredths: i16 = 2250 + ((tick % 50) as i16 - 25);
-            let hum_hundredths: u16 = 5000 + ((tick % 100) as u16) * 10;
-
-            temp_cluster.set_temperature(temp_hundredths);
-            hum_cluster.set_humidity(hum_hundredths);
-
-            led_on();
-            log::info!(
-                "[PHY6222] T={}.{:02}°C  H={}.{:02}%",
-                temp_hundredths / 100,
-                (temp_hundredths % 100).unsigned_abs(),
-                hum_hundredths / 100,
-                hum_hundredths % 100,
-            );
+            // Device_annce retry
+            if annce_retries_left > 0 && now2.duration_since(last_annce).as_secs() >= 8 {
+                annce_retries_left -= 1;
+                last_annce = now2;
+                log::info!("[PHY6222] Device_annce retry ({} left)", annce_retries_left);
+                let _ = device.send_device_annce().await;
+            }
         } else {
-            led_off();
-        }
+            // ── Not joined — blink and auto-retry ──
+            let now2 = Instant::now();
+            if now2.duration_since(last_rejoin_attempt).as_secs() >= 1 {
+                // Double blink
+                led_on();
+                Timer::after(Duration::from_millis(80)).await;
+                led_off();
+                Timer::after(Duration::from_millis(120)).await;
+                led_on();
+                Timer::after(Duration::from_millis(80)).await;
+                led_off();
+            }
 
-        // ── Drive the Zigbee stack ───────────────────────────
-        let mut clusters = [
-            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-        ];
-        if let TickResult::Event(ref e) = device.tick(REPORT_INTERVAL_SECS, &mut clusters).await {
-            log_event(e);
+            if now2.duration_since(last_rejoin_attempt).as_secs() >= 15 {
+                rejoin_count = rejoin_count.wrapping_add(1);
+                last_rejoin_attempt = Instant::now();
+                log::info!("[PHY6222] Not joined — retrying (attempt {})…", rejoin_count);
+                device.user_action(UserAction::Join);
+                let mut cls = [
+                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                ];
+                let _ = device.tick(0, &mut cls).await;
+                if device.is_joined() {
+                    log::info!("[PHY6222] Joined! addr=0x{:04X}", device.short_address());
+                    led_on();
+                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                    annce_retries_left = 5;
+                    last_annce = Instant::now();
+                    interview_done = false;
+                }
+            }
         }
-
-        tick = tick.wrapping_add(1);
-        Timer::after(Duration::from_secs(REPORT_INTERVAL_SECS as u64)).await;
     }
 }
 
-/// Log stack events to serial
-fn log_event(event: &StackEvent) {
+/// Log stack events. Returns true on join event.
+fn log_event(event: &StackEvent) -> bool {
     match event {
-        StackEvent::Joined { short_address, channel, .. } => {
-            log::info!("[PHY6222] ✓ Joined network — addr=0x{:04X} ch={}", short_address, channel);
+        StackEvent::Joined { short_address, channel, pan_id } => {
+            led_on();
+            log::info!(
+                "[PHY6222] Joined! addr=0x{:04X} ch={} pan=0x{:04X}",
+                short_address, channel, pan_id
+            );
+            true
         }
         StackEvent::Left => {
+            led_off();
             log::info!("[PHY6222] Left network");
+            false
         }
-        _ => {
-            log::info!("[PHY6222] Event: {:?}", event);
+        StackEvent::ReportSent => { log::info!("[PHY6222] Report sent"); false }
+        StackEvent::CommissioningComplete { success } => {
+            log::info!("[PHY6222] Commissioning: {}", if *success { "ok" } else { "failed" });
+            false
         }
+        _ => { log::info!("[PHY6222] Stack event"); false }
     }
 }
