@@ -11,13 +11,22 @@ zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 
-# ESP32-C6 HAL and runtime — versions aligned with zigbee-mac
+# ESP32-C6 HAL and runtime
 esp-hal = { version = "1.0.0", features = ["esp32c6", "unstable"] }
 esp-radio = { version = "0.17.0", features = ["esp32c6", "ieee802154", "unstable"] }
 esp-backtrace = { version = "0.14", features = ["esp32c6", "panic-handler", "println"] }
 esp-println = { version = "0.12", features = ["esp32c6"] }
 static_cell = "2"
 embedded-hal = "1.0"
+
+# Embassy async runtime
+embassy-executor = { version = "0.7", features = ["arch-riscv32", "executor-thread"] }
+embassy-time = { version = "0.4" }
+embassy-time-driver = "0.2"
+embassy-futures = "0.1"
+
+# Portable atomics for single-core RISC-V
+portable-atomic = { version = "1", features = ["unsafe-assume-single-core"] }
 
 [profile.release]
 opt-level = "s"
