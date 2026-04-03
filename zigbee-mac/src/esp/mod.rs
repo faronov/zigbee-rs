@@ -508,7 +508,7 @@ impl MacDriver for EspMac<'_> {
                 build_data_request(self.next_dsn(), &parent, &self.extended_address)
             };
 
-            if self.transmit_frame(&data_req).is_err() {
+            if self.transmit_frame(&data_req).await.is_err() {
                 continue;
             }
 

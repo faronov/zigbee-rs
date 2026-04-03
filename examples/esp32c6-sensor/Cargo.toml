@@ -19,8 +19,7 @@ esp-println = { version = "0.12", features = ["esp32c6"] }
 static_cell = "2"
 embedded-hal = "1.0"
 
-# Embassy async runtime
-embassy-executor = { version = "0.7", features = ["arch-riscv32", "executor-thread"] }
+# Embassy async runtime (time only — executor driven manually)
 embassy-time = { version = "0.4" }
 embassy-time-driver = "0.2"
 embassy-futures = "0.1"
