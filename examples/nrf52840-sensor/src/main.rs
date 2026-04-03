@@ -306,6 +306,9 @@ async fn main(_spawner: Spawner) {
         &mut saadc_sensor,
     ).await;
 
+    // ── Default reporting so device reports even without ZHA ConfigureReporting ──
+    setup_default_reporting(&mut device);
+
     // ── Main loop state ──
     let mut last_report = Instant::now();
     let mut fast_poll_until = if device.is_joined() {
@@ -400,6 +403,16 @@ async fn main(_spawner: Spawner) {
                                 device.factory_reset(Some(&mut nv)).await;
                                 info!("NV storage cleared");
                             }
+                            StackEvent::LeaveRequested => {
+                                info!("Leave via tick — erasing NV and rejoining");
+                                device.factory_reset(Some(&mut nv)).await;
+                                device.user_action(UserAction::Join);
+                                fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                interview_done = false;
+                                annce_retries_left = 5;
+                                last_annce = Instant::now();
+                                led.set_low();
+                            }
                             _ => { log_event(e, &mut led); }
                         }
                     }
@@ -430,6 +443,20 @@ async fn main(_spawner: Spawner) {
                             ClusterRef { endpoint: 1, cluster: &mut power_cluster },
                         ];
                         if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
+                            match &ev {
+                                StackEvent::LeaveRequested => {
+                                    info!("Coordinator sent Leave — erasing NV and rejoining");
+                                    device.factory_reset(Some(&mut nv)).await;
+                                    device.user_action(UserAction::Join);
+                                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                    interview_done = false;
+                                    annce_retries_left = 5;
+                                    last_annce = Instant::now();
+                                    led.set_low(); // LED ON — joining
+                                    break; // break poll loop, tick will handle Start
+                                }
+                                _ => {}
+                            }
                             if log_event(&ev, &mut led) {
                                 fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                 needs_save = true;
@@ -664,10 +691,46 @@ fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>) -> bool {
             false
         }
         StackEvent::ReportSent => { info!("Report sent"); false }
+        StackEvent::LeaveRequested => {
+            led.set_low(); // ON — rejoining
+            info!("Leave requested by coordinator");
+            false
+        }
         StackEvent::CommissioningComplete { success } => {
             info!("Commissioning: {}", if *success { "ok" } else { "failed" });
             false
         }
         _ => { info!("Stack event"); false }
     }
+}
+
+/// Configure default reporting intervals so device reports even before ZHA interview.
+fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M>) {
+    use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
+    use zigbee_zcl::data_types::ZclDataType;
+
+    let configs = [
+        // Temperature: MeasuredValue (0x0000), report every 60-300s
+        (0x0402u16, 0x0000u16, ZclDataType::I16),
+        // Humidity: MeasuredValue (0x0000), report every 60-300s
+        (0x0405, 0x0000, ZclDataType::U16),
+        // Power Config: BatteryPercentage (0x0021), report every 300-3600s
+        (0x0001, 0x0021, ZclDataType::U8),
+    ];
+
+    for (cluster_id, attr_id, data_type) in configs {
+        let (min, max) = if cluster_id == 0x0001 { (300, 3600) } else { (60, 300) };
+        let _ = device.reporting_mut().configure_for_cluster(
+            1, cluster_id,
+            ReportingConfig {
+                direction: ReportDirection::Send,
+                attribute_id: zigbee_zcl::AttributeId(attr_id),
+                data_type,
+                min_interval: min,
+                max_interval: max,
+                reportable_change: None,
+            },
+        );
+    }
+    info!("Default reporting configured (temp/hum/battery)");
 }

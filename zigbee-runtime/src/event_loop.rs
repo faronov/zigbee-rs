@@ -96,6 +96,8 @@ pub enum StackEvent {
     OtaDelayedActivation { delay_secs: u32 },
     /// Basic cluster: factory reset requested by coordinator.
     FactoryResetRequested,
+    /// NWK Leave command received from coordinator — device should rejoin.
+    LeaveRequested,
 }
 
 /// Stack tick result — tells the application what to do next.

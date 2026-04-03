@@ -789,12 +789,23 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
         let (dst, src, nwk_security, frame_type, buf, len) = nwk_indication;
 
-        // NWK Command frames (type=1) — log command ID, don't pass to APS
+        // NWK Command frames (type=1) — parse and handle at runtime level
         if frame_type == 1 {
             if len > 0 {
-                log::info!("[RX] NWK Command id=0x{:02X} from 0x{:04X} ({} bytes)", buf[0], src.0, len);
-                if len > 1 {
-                    log::info!("[RX] NWK Command payload: {:02X?}", &buf[..len.min(16)]);
+                let cmd_id = buf[0];
+                log::info!("[RX] NWK Command id=0x{:02X} from 0x{:04X} ({} bytes)", cmd_id, src.0, len);
+                // NWK Leave command (0x04) — signal application to rejoin
+                if cmd_id == 0x04 && len >= 2 {
+                    let options = buf[1];
+                    let remove_children = (options & 0x40) != 0;
+                    let rejoin = (options & 0x20) != 0;
+                    log::warn!(
+                        "[RX] NWK Leave from 0x{:04X} (remove_children={}, rejoin={})",
+                        src.0, remove_children, rejoin
+                    );
+                    // Mark as not joined so the stack stops sending
+                    self.bdb.zdo_mut().nwk_mut().set_joined(false);
+                    return Some(event_loop::StackEvent::LeaveRequested);
                 }
             }
             return None;
