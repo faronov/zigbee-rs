@@ -22,6 +22,7 @@
 extern crate alloc;
 
 mod time_driver;
+mod flash_nv;
 
 use esp_backtrace as _;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
@@ -153,11 +154,21 @@ fn main() -> ! {
             temp_centi / 100, (temp_centi % 100).unsigned_abs());
     }
 
+    // Flash NV storage for network persistence
+    let mut nv = flash_nv::create_nv();
+    esp_println::println!("[ESP32-C6] Flash NV storage ready");
+
     // Run the async SED loop synchronously via block_on
     block_on(async {
-        // Auto-join
-        esp_println::println!("[ESP32-C6] Auto-joining network…");
-        device.user_action(UserAction::Join);
+        // Restore previous network state or auto-join
+        let restored = device.restore_state(&nv);
+        if restored {
+            esp_println::println!("[ESP32-C6] Restored state — will rejoin");
+            device.user_action(UserAction::Rejoin);
+        } else {
+            esp_println::println!("[ESP32-C6] No saved state — auto-joining…");
+            device.user_action(UserAction::Join);
+        }
         let mut clusters = [
             ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
             ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
@@ -165,7 +176,10 @@ fn main() -> ! {
             ClusterRef { endpoint: 1, cluster: &mut power_cluster },
         ];
         if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-            log_event(e);
+            if log_event(e) {
+                device.save_state(&mut nv);
+                esp_println::println!("[ESP32-C6] State saved to flash");
+            }
         }
 
         let mut last_report = Instant::now();
@@ -202,6 +216,8 @@ fn main() -> ! {
 
                 if held_long {
                     esp_println::println!("[ESP32-C6] FACTORY RESET");
+                    device.factory_reset(Some(&mut nv)).await;
+                    esp_println::println!("[ESP32-C6] NV cleared — rebooting");
                     for _ in 0..5u8 {
                         led.set_low();
                         Timer::after(Duration::from_millis(100)).await;
@@ -221,6 +237,7 @@ fn main() -> ! {
                     ];
                     if let TickResult::Event(ref e) = device.tick(0, &mut cls).await {
                         if log_event(e) {
+                            device.save_state(&mut nv);
                             fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                             annce_retries_left = 5;
                             last_annce = Instant::now();
@@ -334,6 +351,8 @@ fn main() -> ! {
                         annce_retries_left = 5;
                         last_annce = Instant::now();
                         interview_done = false;
+                        device.save_state(&mut nv);
+                        esp_println::println!("[ESP32-C6] State saved to flash");
                     }
                 }
             }
