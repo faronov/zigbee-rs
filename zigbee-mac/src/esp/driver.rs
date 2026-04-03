@@ -1,10 +1,18 @@
 //! Low-level ESP32 802.15.4 radio driver wrapper.
 //!
-//! Provides synchronous TX and polling-based RX on top of
-//! `esp-radio::ieee802154`. Uses direct radio API calls without
-//! depending on interrupt signal wiring.
+//! Provides TX with completion signaling and polling-based RX on top of
+//! `esp-radio::ieee802154`.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use esp_radio::ieee802154::{Config, Error, Ieee802154};
+
+/// TX completion flag — set by ISR callback, cleared before TX.
+static TX_COMPLETE: AtomicBool = AtomicBool::new(false);
+
+/// TX-done callback — called from radio ISR when TX finishes.
+fn on_tx_done() {
+    TX_COMPLETE.store(true, Ordering::Release);
+}
 
 /// Received frame data (copied out of radio buffer).
 pub struct RxFrame {
@@ -22,6 +30,8 @@ pub struct Ieee802154Driver<'a> {
 impl<'a> Ieee802154Driver<'a> {
     pub fn new(mut ieee802154: Ieee802154<'a>, config: Config) -> Self {
         ieee802154.set_config(config);
+        // Register TX-done callback for completion signaling
+        ieee802154.set_tx_done_callback_fn(on_tx_done);
         Self {
             driver: ieee802154,
             config,
@@ -35,27 +45,63 @@ impl<'a> Ieee802154Driver<'a> {
     }
 
     /// Transmit a raw 802.15.4 frame and wait for TX completion.
-    /// The ESP32 802.15.4 hardware interprets buffer[0] as total OTA length
-    /// INCLUDING FCS. Since hardware auto-generates FCS, we add +2 to the
-    /// length so the full frame data is transmitted.
+    ///
+    /// The ESP32 802.15.4 hardware interprets PHR as total OTA length
+    /// INCLUDING FCS. We add +2 padding so the full frame is transmitted.
+    /// Uses TX-done callback for precise completion detection (~500µs typical).
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
-        // Append 2 dummy bytes — transmit_raw sets PHR = frame.len(),
-        // but hardware expects PHR including FCS. The extra bytes are
-        // overwritten by hardware-generated CRC on air.
         let mut padded = [0u8; 129];
         padded[..frame.len()].copy_from_slice(frame);
+
+        // Clear TX-done flag before starting TX
+        TX_COMPLETE.store(false, Ordering::Release);
+
         self.driver.transmit_raw(&padded[..frame.len() + 2])?;
-        // Wait for TX to complete
+
+        // Wait for TX completion via ISR callback (max 10ms safety timeout)
         let start = esp_hal::time::Instant::now();
-        while start.elapsed() < esp_hal::time::Duration::from_millis(5) {
+        while !TX_COMPLETE.load(Ordering::Acquire) {
+            if start.elapsed() > esp_hal::time::Duration::from_millis(10) {
+                break; // Safety timeout — TX should never take this long
+            }
             core::hint::spin_loop();
         }
-        // Log TX frame header for debugging
-        if frame.len() >= 5 {
-            let fc = u16::from_le_bytes([frame[0], frame[1]]);
-            log::info!("[MAC TX] {} bytes fc=0x{:04X} seq={}", frame.len(), fc, frame[2]);
-        }
+
         Ok(())
+    }
+
+    /// Transmit and wait for ACK from recipient.
+    /// Returns true if ACK received, false if timeout.
+    pub fn transmit_with_ack(&mut self, frame: &[u8], seq: u8) -> bool {
+        if self.transmit(frame).is_err() {
+            return false;
+        }
+
+        // Immediately switch to RX to catch the ACK
+        self.driver.start_receive();
+
+        // ACK window: aTurnaroundTime (192µs) + ACK duration (~352µs) + margin
+        let deadline = esp_hal::time::Instant::now()
+            + esp_hal::time::Duration::from_millis(2);
+
+        while esp_hal::time::Instant::now() < deadline {
+            if let Some(raw) = self.driver.raw_received() {
+                let phr = raw.data[0] as usize;
+                if phr >= 5 {
+                    let fc = u16::from_le_bytes([raw.data[1], raw.data[2]]);
+                    let frame_type = fc & 0x07;
+                    let ack_seq = raw.data[3];
+                    // ACK frame: type=2, matching sequence number
+                    if frame_type == 0x02 && ack_seq == seq {
+                        return true;
+                    }
+                }
+                // Not our ACK — restart RX
+                self.driver.start_receive();
+            }
+        }
+
+        false
     }
 
     /// Put radio into receive mode.
@@ -65,7 +111,6 @@ impl<'a> Ieee802154Driver<'a> {
 
     /// Poll for a received frame. Returns None if nothing available yet.
     pub fn poll_receive(&mut self) -> Option<Result<RxFrame, Error>> {
-        // Try raw_received first for full frame access
         if let Some(raw) = self.driver.raw_received() {
             let mut rx = RxFrame {
                 data: [0u8; 127],

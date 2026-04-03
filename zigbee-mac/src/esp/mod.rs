@@ -82,15 +82,23 @@ impl<'a> EspMac<'a> {
     /// The 6-byte factory MAC is stored in eFuse and converted to EUI-64
     /// by inserting FF:FE in the middle (standard MAC-48 → EUI-64).
     fn read_efuse_ieee() -> IeeeAddress {
-        // eFuse read registers for factory MAC — same offset on C6 and H2
-        // EFUSE_RD_MAC_SYS_0 = base + 0x44, EFUSE_RD_MAC_SYS_1 = base + 0x48
+        // ESP32-C6 eFuse MAC registers
         const EFUSE_RD_MAC_SYS_0: *const u32 = 0x600B_0844 as *const u32;
         const EFUSE_RD_MAC_SYS_1: *const u32 = 0x600B_0848 as *const u32;
 
+        // Read twice and take the consistent result (eFuse reads can be flaky)
         let lo = unsafe { core::ptr::read_volatile(EFUSE_RD_MAC_SYS_0) };
         let hi = unsafe { core::ptr::read_volatile(EFUSE_RD_MAC_SYS_1) };
+        let lo2 = unsafe { core::ptr::read_volatile(EFUSE_RD_MAC_SYS_0) };
+        let hi2 = unsafe { core::ptr::read_volatile(EFUSE_RD_MAC_SYS_1) };
 
-        // Base MAC is 6 bytes: lo[31:0] = MAC[31:0], hi[15:0] = MAC[47:32]
+        // Use second read if first disagrees (allow settling)
+        let lo = if lo == lo2 { lo } else { lo2 };
+        let hi = if hi == hi2 { hi } else { hi2 };
+
+        // Base MAC is 6 bytes in little-endian:
+        // lo[7:0]=mac[0], lo[15:8]=mac[1], lo[23:16]=mac[2], lo[31:24]=mac[3]
+        // hi[7:0]=mac[4], hi[15:8]=mac[5]
         let mac0 = (lo & 0xFF) as u8;
         let mac1 = ((lo >> 8) & 0xFF) as u8;
         let mac2 = ((lo >> 16) & 0xFF) as u8;
@@ -98,8 +106,12 @@ impl<'a> EspMac<'a> {
         let mac4 = (hi & 0xFF) as u8;
         let mac5 = ((hi >> 8) & 0xFF) as u8;
 
-        // Convert MAC-48 to EUI-64 by inserting FF:FE in middle
-        // and flipping the universal/local bit (bit 1 of byte 0)
+        log::info!(
+            "[ESP] eFuse MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            mac0, mac1, mac2, mac3, mac4, mac5
+        );
+
+        // EUI-48 → EUI-64: insert FF:FE in middle, flip U/L bit
         [mac0 ^ 0x02, mac1, mac2, 0xFF, 0xFE, mac3, mac4, mac5]
     }
 
@@ -666,6 +678,7 @@ impl MacDriver for EspMac<'_> {
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
         let msdu_handle = req.msdu_handle;
+        let ack_requested = req.tx_options.ack_tx;
         let mut frame_buf = [0u8; 127];
         let seq = self.next_dsn();
         let len = build_data_frame(
@@ -677,48 +690,64 @@ impl MacDriver for EspMac<'_> {
             &req,
         )?;
 
-        // Simple CSMA-CA + TX. ACK detection is unreliable on ESP32 because
-        // start_receive() interferes with the hardware's TX→RX turnaround.
-        // The coordinator receives our frames even without us checking the ACK.
-        let mut be = self.min_be;
-        let mut nb: u8 = 0;
+        let max_retries = if ack_requested { self.max_frame_retries } else { 0 };
 
-        loop {
-            let max_val = (1u32 << be) - 1;
-            let random = (seq as u32)
-                .wrapping_add(nb as u32)
-                .wrapping_mul(1103515245)
-                .wrapping_add(12345);
-            let backoff = (random % (max_val + 1)) as u64;
-            if backoff > 0 {
-                Timer::after_micros(backoff * 20 * 16).await;
-            }
+        for attempt in 0..=max_retries {
+            // CSMA-CA backoff
+            let mut be = self.min_be;
+            let mut nb: u8 = 0;
 
-            match self.driver.transmit(&frame_buf[..len]) {
-                Ok(()) => break,
-                Err(_) => {
-                    nb += 1;
-                    be = core::cmp::min(be + 1, self.max_be);
-                    if nb > self.max_csma_backoffs {
-                        return Err(MacError::ChannelAccessFailure);
+            let transmitted = loop {
+                let max_val = (1u32 << be) - 1;
+                let random = (seq as u32)
+                    .wrapping_add(nb as u32)
+                    .wrapping_add(attempt as u32)
+                    .wrapping_mul(1103515245)
+                    .wrapping_add(12345);
+                let backoff = (random % (max_val + 1)) as u64;
+                if backoff > 0 {
+                    Timer::after_micros(backoff * 20 * 16).await;
+                }
+
+                if ack_requested {
+                    // TX + ACK wait using driver's precise timing
+                    if self.driver.transmit_with_ack(&frame_buf[..len], seq) {
+                        return Ok(McpsDataConfirm { msdu_handle, timestamp: None });
+                    }
+                    break true; // TX sent but no ACK — will retry
+                } else {
+                    match self.driver.transmit(&frame_buf[..len]) {
+                        Ok(()) => return Ok(McpsDataConfirm { msdu_handle, timestamp: None }),
+                        Err(_) => {
+                            nb += 1;
+                            be = core::cmp::min(be + 1, self.max_be);
+                            if nb > self.max_csma_backoffs {
+                                break false;
+                            }
+                        }
                     }
                 }
+            };
+
+            if !transmitted && attempt == max_retries {
+                return Err(MacError::ChannelAccessFailure);
             }
         }
 
-        Ok(McpsDataConfirm {
-            msdu_handle,
-            timestamp: None,
-        })
+        Err(MacError::NoAck)
     }
 
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
         const RX_TIMEOUT_MS: u64 = 5000;
         let deadline = Instant::now() + Duration::from_millis(RX_TIMEOUT_MS);
+        // Enable promiscuous for passive RX — ensures we receive Transport-Key
+        // frames that use IEEE addressing (not matched by hardware short addr filter)
+        self.driver.update_config(|cfg| cfg.promiscuous = true);
         self.driver.start_receive();
 
         loop {
             if Instant::now() >= deadline {
+                self.driver.update_config(|cfg| cfg.promiscuous = false);
                 return Err(MacError::NoData);
             }
 
@@ -786,6 +815,7 @@ impl MacDriver for EspMac<'_> {
 
                 let payload_data = &data[header_len..];
                 if let Some(mac_frame) = MacFrame::from_slice(payload_data) {
+                    self.driver.update_config(|cfg| cfg.promiscuous = false);
                     return Ok(McpsDataIndication {
                         src_address: src,
                         dst_address: dst,
