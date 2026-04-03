@@ -32,13 +32,28 @@ impl<'a> Ieee802154Driver<'a> {
     pub fn update_config(&mut self, update_fn: impl FnOnce(&mut Config)) {
         update_fn(&mut self.config);
         self.driver.set_config(self.config);
-        log::info!("[DRV] config: ch={}", self.config.channel);
     }
 
-    /// Transmit a raw 802.15.4 frame (synchronous).
+    /// Transmit a raw 802.15.4 frame and wait for TX completion.
+    /// The ESP32 802.15.4 hardware interprets buffer[0] as total OTA length
+    /// INCLUDING FCS. Since hardware auto-generates FCS, we add +2 to the
+    /// length so the full frame data is transmitted.
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
-        log::info!("[DRV] TX {} bytes on ch{}", frame.len(), self.config.channel);
-        self.driver.transmit_raw(frame)
+        // Build TX buffer: [length_including_fcs, ...frame_data...]
+        // We can't modify transmit_raw's behavior, so we build the buffer manually
+        // and use the raw ieee802154_transmit function indirectly.
+        // transmit_raw sets buffer[0] = frame.len(), but we need buffer[0] = frame.len() + 2
+        // Workaround: append 2 dummy bytes to the frame so transmit_raw sends the right length
+        let mut padded = [0u8; 129];
+        padded[..frame.len()].copy_from_slice(frame);
+        // The extra 2 bytes (zeroes) will be overwritten by hardware CRC anyway
+        self.driver.transmit_raw(&padded[..frame.len() + 2])?;
+        // Wait for TX to complete
+        let start = esp_hal::time::Instant::now();
+        while start.elapsed() < esp_hal::time::Duration::from_millis(5) {
+            core::hint::spin_loop();
+        }
+        Ok(())
     }
 
     /// Put radio into receive mode.
@@ -47,31 +62,23 @@ impl<'a> Ieee802154Driver<'a> {
     }
 
     /// Poll for a received frame. Returns None if nothing available yet.
-    /// Returns the RAW frame (including MAC header) for proper parsing.
     pub fn poll_receive(&mut self) -> Option<Result<RxFrame, Error>> {
-        // Use raw_received to get the full MAC frame including header
-        match self.driver.raw_received() {
-            Some(raw) => {
-                let mut rx = RxFrame {
-                    data: [0u8; 127],
-                    len: 0,
-                    lqi: 0,
-                };
-                // raw.data[0] = PHR (length including FCS)
-                // raw.data[1..] = PSDU (MAC frame WITHOUT FCS — CRC not in buffer)
-                let phr = raw.data[0] as usize;
-                let mac_len = if phr >= 2 { phr - 2 } else { 0 }; // subtract FCS
-                let len = mac_len.min(125);
-                if len > 0 {
-                    rx.data[..len].copy_from_slice(&raw.data[1..][..len]);
-                }
-                rx.len = len;
-                // RSSI is at raw.data[phr-1] (last byte before where FCS would be)
-                // Actually unclear — use 0 for now
-                rx.lqi = 128; // default mid-range LQI
-                Some(Ok(rx))
+        // Try raw_received first for full frame access
+        if let Some(raw) = self.driver.raw_received() {
+            let mut rx = RxFrame {
+                data: [0u8; 127],
+                len: 0,
+                lqi: 128,
+            };
+            let phr = raw.data[0] as usize;
+            let mac_len = if phr >= 2 { phr - 2 } else { phr };
+            let len = mac_len.min(125);
+            if len > 0 {
+                rx.data[..len].copy_from_slice(&raw.data[1..][..len]);
             }
-            None => None,
+            rx.len = len;
+            return Some(Ok(rx));
         }
+        None
     }
 }

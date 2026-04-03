@@ -109,12 +109,11 @@ impl<'a> EspMac<'a> {
         seq
     }
 
-    /// Transmit a frame with a small post-TX settle delay.
+    /// Transmit a frame. The driver waits for TX completion internally.
     async fn transmit_frame(&mut self, frame: &[u8]) -> Result<(), MacError> {
         self.driver
             .transmit(frame)
             .map_err(|_| MacError::RadioError)?;
-        Timer::after_micros(200).await;
         Ok(())
     }
 
@@ -128,6 +127,9 @@ impl<'a> EspMac<'a> {
         let deadline = Instant::now() + Duration::from_micros(duration_us);
         self.driver.start_receive();
         let mut rx_count = 0u32;
+        let mut saw_data_on_channel = false;
+        let mut data_pan: u16 = 0;
+        let mut data_src: u16 = 0;
 
         loop {
             if Instant::now() >= deadline {
@@ -140,16 +142,23 @@ impl<'a> EspMac<'a> {
                 let ftype = fc & 0x07;
                 // Log first few frames on each channel for debugging
                 if rx_count <= 3 {
-                    log::info!("[SCAN] ch{}: #{} fc=0x{:04X} type={} len={} hex={:02X?}",
-                        channel, rx_count, fc, ftype, rx.len,
-                        &data[..data.len().min(20)]);
+                    log::info!("[SCAN] ch{}: #{} fc=0x{:04X} type={} len={}",
+                        channel, rx_count, fc, ftype, rx.len);
                 }
                 if let Some(pd) = parse_beacon(channel, data, rx.lqi) {
-                    log::info!("[SCAN] ch{}: BEACON PAN=0x{:04X} permit={}",
-                        channel, pd.coord_address.pan_id().0,
-                        pd.superframe_spec.association_permit);
+                    log::info!("[SCAN] ch{}: BEACON PAN=0x{:04X}",
+                        channel, pd.coord_address.pan_id().0);
                     if descriptors.push(pd).is_err() {
                         break;
+                    }
+                } else if ftype == 1 && data.len() >= 7 && !saw_data_on_channel {
+                    // Data frame — extract PAN and source address for synthetic beacon
+                    let pan = u16::from_le_bytes([data[3], data[4]]);
+                    let src = u16::from_le_bytes([data[5], data[6]]);
+                    if pan != 0xFFFF {
+                        saw_data_on_channel = true;
+                        data_pan = pan;
+                        data_src = src;
                     }
                 }
                 self.driver.start_receive();
@@ -157,11 +166,33 @@ impl<'a> EspMac<'a> {
                 Timer::after_micros(200).await;
             }
         }
-        if rx_count == 0 {
+
+        // Fallback: if we received data frames but no beacons, synthesize a
+        // PanDescriptor. EZSP coordinators may not send standard beacons but
+        // the presence of data traffic proves the network exists.
+        if descriptors.is_empty() && saw_data_on_channel {
+            log::info!("[SCAN] ch{}: no beacons but {} data frames, synth PAN=0x{:04X} src=0x{:04X}",
+                channel, rx_count, data_pan, data_src);
+            let _ = descriptors.push(PanDescriptor {
+                coord_address: MacAddress::Short(PanId(data_pan), ShortAddress(data_src)),
+                channel,
+                superframe_spec: SuperframeSpec::from_raw(0x8FFF), // permit joining
+                lqi: 128,
+                security_use: false,
+                zigbee_beacon: ZigbeeBeaconPayload {
+                    protocol_id: 0,
+                    stack_profile: 2,
+                    protocol_version: 2,
+                    router_capacity: true,
+                    device_depth: 0,
+                    end_device_capacity: true,
+                    extended_pan_id: [0u8; 8],
+                    tx_offset: [0xFF, 0xFF, 0xFF],
+                    update_id: 0,
+                },
+            });
+        } else if rx_count == 0 {
             log::info!("[SCAN] ch{}: no frames in {}us", channel, duration_us);
-        } else {
-            log::info!("[SCAN] ch{}: {} frames, {} beacons", channel, rx_count, 
-                descriptors.len());
         }
     }
 
@@ -172,18 +203,23 @@ impl<'a> EspMac<'a> {
     ) -> Result<MlmeAssociateConfirm, MacError> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         self.driver.start_receive();
+        let mut rx_count = 0u32;
 
         loop {
             if Instant::now() >= deadline {
+                log::info!("[ESP ASSOC-WAIT] timeout, {} frames seen", rx_count);
                 return Err(MacError::NoAck);
             }
             if let Some(Ok(rx)) = self.driver.poll_receive() {
+                rx_count += 1;
                 let data = &rx.data[..rx.len];
                 if data.len() < 5 {
                     self.driver.start_receive();
                     continue;
                 }
                 let fc = u16::from_le_bytes([data[0], data[1]]);
+                let ftype = fc & 0x07;
+                log::info!("[ESP ASSOC-WAIT] #{} fc=0x{:04X} type={} len={}", rx_count, fc, ftype, rx.len);
                 // Must be a MAC command frame (type 3)
                 if fc & 0x07 != 3 {
                     self.driver.start_receive();
@@ -309,6 +345,7 @@ impl MacDriver for EspMac<'_> {
         self.driver.update_config(|cfg| {
             cfg.channel = req.channel;
             cfg.pan_id = Some(req.coord_address.pan_id().0);
+            cfg.promiscuous = true; // Accept all frames during association
         });
 
         log::info!(
@@ -324,7 +361,14 @@ impl MacDriver for EspMac<'_> {
             &self.extended_address,
             &req.capability_info,
         );
-        self.transmit_frame(&frame).await?;
+        log::info!("[ESP MLME-ASSOC] Sending assoc req ({} bytes)", frame.len());
+        match self.transmit_frame(&frame).await {
+            Ok(()) => log::info!("[ESP MLME-ASSOC] TX OK"),
+            Err(e) => {
+                log::warn!("[ESP MLME-ASSOC] TX failed: {:?}", e);
+                return Err(e);
+            }
+        }
 
         // Poll for Association Response with retries
         Timer::after_millis(200).await;
@@ -393,6 +437,9 @@ impl MacDriver for EspMac<'_> {
             }
         }
 
+        // Restore normal mode
+        self.driver.update_config(|cfg| cfg.promiscuous = false);
+        
         confirm.ok_or(MacError::NoBeacon)
     }
 
