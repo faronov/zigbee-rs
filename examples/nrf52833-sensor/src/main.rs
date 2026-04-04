@@ -108,7 +108,7 @@ fn power_down_unused_ram() {
 async fn main(_spawner: Spawner) {
     // HFCLK from external crystal — REQUIRED for 802.15.4 radio
     let mut config = embassy_nrf::config::Config::default();
-    config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
+    config.hfclk_source = embassy_nrf::config::HfclkSource::Internal;
     let p = embassy_nrf::init(config);
 
     info!("Zigbee-RS nRF52833 sensor starting…");

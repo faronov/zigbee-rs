@@ -69,9 +69,9 @@ use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
-const REPORT_INTERVAL_SECS: u64 = 15;
+const REPORT_INTERVAL_SECS: u64 = 60;
 const FAST_POLL_MS: u64 = 250; // Fast poll during interview (250ms)
-const SLOW_POLL_SECS: u64 = 10; // Normal poll interval (10s)
+const SLOW_POLL_SECS: u64 = 30; // Normal poll interval (10s)
 const FAST_POLL_DURATION_SECS: u64 = 120; // Max fast-poll window (safety timeout)
 const EXPECTED_REPORT_CLUSTERS: usize = 3; // PowerConfig + Temp + Humidity
 
@@ -179,7 +179,12 @@ async fn main(_spawner: Spawner) {
 
     // Start HFCLK from external crystal via embassy config — REQUIRED for 802.15.4 radio.
     let mut config = embassy_nrf::config::Config::default();
-    config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
+    config.hfclk_source = embassy_nrf::config::HfclkSource::Internal;
+    config.dcdc = embassy_nrf::config::DcdcConfig {
+        reg0: true,
+        reg0_voltage: None,
+        reg1: true,
+    };
     let mut p = embassy_nrf::init(config);
 
     // Initialize log→defmt bridge so stack crate log::info!/debug! appear in RTT
@@ -208,7 +213,7 @@ async fn main(_spawner: Spawner) {
 
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
     let mut mac = zigbee_mac::nrf::NrfMac::new(radio);
-    mac.set_tx_power(8);
+    mac.set_tx_power(0);
 
     info!("Radio ready");
 

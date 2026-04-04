@@ -73,9 +73,9 @@ use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::pressure::PressureCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
-const REPORT_INTERVAL_SECS: u64 = 30;
+const REPORT_INTERVAL_SECS: u64 = 60;
 const FAST_POLL_MS: u64 = 250;
-const SLOW_POLL_SECS: u64 = 10;
+const SLOW_POLL_SECS: u64 = 30;
 const FAST_POLL_DURATION_SECS: u64 = 120;
 #[cfg(feature = "sensor-bme280")]
 const EXPECTED_REPORT_CLUSTERS: usize = 4; // PowerConfig + Temp + Humidity + Pressure
@@ -171,7 +171,15 @@ async fn main(_spawner: Spawner) {
     log::set_max_level(log::LevelFilter::Debug);
 
     let mut config = embassy_nrf::config::Config::default();
-    config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
+    // Use internal RC for HFCLK — radio requests XTAL automatically when needed.
+    // Saves ~250µA vs keeping external XTAL always on.
+    config.hfclk_source = embassy_nrf::config::HfclkSource::Internal;
+    // Enable DC-DC converter for ~40% lower current draw
+    config.dcdc = embassy_nrf::config::DcdcConfig {
+        reg0: true,
+        reg0_voltage: None, // keep UICR default
+        reg1: true,
+    };
     let p = embassy_nrf::init(config);
 
     power_down_unused_ram();
@@ -220,8 +228,8 @@ async fn main(_spawner: Spawner) {
     // Radio + MAC
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
     let mut mac = zigbee_mac::nrf::NrfMac::new(radio);
-    mac.set_tx_power(8);
-    info!("Radio ready");
+    mac.set_tx_power(0); // 0 dBm — good range, saves ~50% TX current vs +8 dBm
+    info!("Radio ready (TX power 0 dBm)");
 
     // ── Flash NV storage (last 2 pages of 1 MB flash) ──
     let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
@@ -725,33 +733,49 @@ fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>) -> bool {
     }
 }
 
-/// Configure default reporting intervals so device reports even before ZHA interview.
+/// Configure default reporting with change thresholds to suppress unnecessary TX.
 fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M>) {
     use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
-    use zigbee_zcl::data_types::ZclDataType;
+    use zigbee_zcl::data_types::{ZclDataType, ZclValue};
 
-    let configs = [
-        // Temperature: MeasuredValue (0x0000), report every 60-300s
-        (0x0402u16, 0x0000u16, ZclDataType::I16),
-        // Humidity: MeasuredValue (0x0000), report every 60-300s
-        (0x0405, 0x0000, ZclDataType::U16),
-        // Power Config: BatteryPercentage (0x0021), report every 300-3600s
-        (0x0001, 0x0021, ZclDataType::U8),
-    ];
+    // Temperature: report every 60-300s, min change 0.5°C (50 centidegrees)
+    let _ = device.reporting_mut().configure_for_cluster(
+        1, 0x0402,
+        ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: zigbee_zcl::AttributeId(0x0000),
+            data_type: ZclDataType::I16,
+            min_interval: 60,
+            max_interval: 300,
+            reportable_change: Some(ZclValue::I16(50)),
+        },
+    );
 
-    for (cluster_id, attr_id, data_type) in configs {
-        let (min, max) = if cluster_id == 0x0001 { (300, 3600) } else { (60, 300) };
-        let _ = device.reporting_mut().configure_for_cluster(
-            1, cluster_id,
-            ReportingConfig {
-                direction: ReportDirection::Send,
-                attribute_id: zigbee_zcl::AttributeId(attr_id),
-                data_type,
-                min_interval: min,
-                max_interval: max,
-                reportable_change: None,
-            },
-        );
-    }
-    info!("Default reporting configured (temp/hum/battery)");
+    // Humidity: report every 60-300s, min change 1% (100 centi-%)
+    let _ = device.reporting_mut().configure_for_cluster(
+        1, 0x0405,
+        ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: zigbee_zcl::AttributeId(0x0000),
+            data_type: ZclDataType::U16,
+            min_interval: 60,
+            max_interval: 300,
+            reportable_change: Some(ZclValue::U16(100)),
+        },
+    );
+
+    // Battery: report every 300-3600s, min change 2% (4 in 0.5% units)
+    let _ = device.reporting_mut().configure_for_cluster(
+        1, 0x0001,
+        ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: zigbee_zcl::AttributeId(0x0021),
+            data_type: ZclDataType::U8,
+            min_interval: 300,
+            max_interval: 3600,
+            reportable_change: Some(ZclValue::U8(4)),
+        },
+    );
+
+    info!("Default reporting configured (with change thresholds)");
 }
