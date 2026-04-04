@@ -29,6 +29,7 @@ mod flash_nv;
 use esp_backtrace as _;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 
+
 use embassy_futures::block_on;
 use embassy_time::{Duration, Instant, Timer};
 
@@ -54,9 +55,9 @@ impl log::Log for EspLogger {
 }
 static LOGGER: EspLogger = EspLogger;
 
-const REPORT_INTERVAL_SECS: u64 = 30;
+const REPORT_INTERVAL_SECS: u64 = 60;
 const FAST_POLL_MS: u64 = 250;
-const SLOW_POLL_SECS: u64 = 10;
+const SLOW_POLL_SECS: u64 = 30;
 const FAST_POLL_DURATION_SECS: u64 = 120;
 const EXPECTED_REPORT_CLUSTERS: usize = 3;
 
@@ -400,30 +401,43 @@ fn log_event(event: &StackEvent) -> bool {
     }
 }
 
-/// Configure default reporting intervals so device reports even before ZHA interview.
+/// Configure default reporting with change thresholds to suppress unnecessary TX.
 fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M>) {
     use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
-    use zigbee_zcl::data_types::ZclDataType;
+    use zigbee_zcl::data_types::{ZclDataType, ZclValue};
 
-    let configs = [
-        (0x0402u16, 0x0000u16, ZclDataType::I16),   // Temperature
-        (0x0405, 0x0000, ZclDataType::U16),          // Humidity
-        (0x0001, 0x0021, ZclDataType::U8),           // Battery %
-    ];
-
-    for (cluster_id, attr_id, data_type) in configs {
-        let (min, max) = if cluster_id == 0x0001 { (300, 3600) } else { (60, 300) };
-        let _ = device.reporting_mut().configure_for_cluster(
-            1, cluster_id,
-            ReportingConfig {
-                direction: ReportDirection::Send,
-                attribute_id: zigbee_zcl::AttributeId(attr_id),
-                data_type,
-                min_interval: min,
-                max_interval: max,
-                reportable_change: None,
-            },
-        );
-    }
-    esp_println::println!("[ESP32-H2] Default reporting configured");
+    let _ = device.reporting_mut().configure_for_cluster(
+        1, 0x0402,
+        ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: zigbee_zcl::AttributeId(0x0000),
+            data_type: ZclDataType::I16,
+            min_interval: 60,
+            max_interval: 300,
+            reportable_change: Some(ZclValue::I16(50)),
+        },
+    );
+    let _ = device.reporting_mut().configure_for_cluster(
+        1, 0x0405,
+        ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: zigbee_zcl::AttributeId(0x0000),
+            data_type: ZclDataType::U16,
+            min_interval: 60,
+            max_interval: 300,
+            reportable_change: Some(ZclValue::U16(100)),
+        },
+    );
+    let _ = device.reporting_mut().configure_for_cluster(
+        1, 0x0001,
+        ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: zigbee_zcl::AttributeId(0x0021),
+            data_type: ZclDataType::U8,
+            min_interval: 300,
+            max_interval: 3600,
+            reportable_change: Some(ZclValue::U8(4)),
+        },
+    );
+    esp_println::println!("[ESP32-H2] Default reporting configured (with change thresholds)");
 }
