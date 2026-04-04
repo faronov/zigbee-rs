@@ -113,3 +113,21 @@ pub fn clear_fmux(pin: u8) {
     let mux_en = reg_read(mux_en_addr);
     reg_write(mux_en_addr, mux_en & !(1 << pin));
 }
+
+/// Prepare GPIOs for low-power sleep.
+///
+/// Sets all output pins high (LEDs off for active-low), then configures
+/// all unused pins as inputs with pull-down to prevent leakage.
+/// Only `keep_pins` (bitmask) are left as-is (e.g., button with pull-up).
+pub fn prepare_for_sleep(keep_pins: u32) {
+    let ddr = reg_read(GPIO_SWPORTA_DDR);
+    // Turn off all output LEDs (active-low: high = off)
+    reg_write(GPIO_SWPORTA_DR, reg_read(GPIO_SWPORTA_DR) | ddr);
+    // Set non-kept pins to input with pull-down
+    for pin in 0..23u8 {
+        if (keep_pins >> pin) & 1 == 0 {
+            set_input(pin);
+            set_pull(pin, Pull::PullDown);
+        }
+    }
+}

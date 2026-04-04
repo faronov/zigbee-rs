@@ -129,3 +129,28 @@ fn cache_flush() {
         reg_write(CACHE_CTRL0, 0x00);
     });
 }
+
+/// Send flash into deep power-down mode (~1µA vs ~15µA standby).
+/// Call before system sleep. Must call `release_deep_sleep()` on wake.
+pub fn enter_deep_sleep() {
+    enter_cache_bypass();
+    spif_wait_idle();
+    // JEDEC Deep Power-Down command (0xB9)
+    reg_write(SPIF_FCMD, 0xB900_0001);
+    spif_wait_idle();
+    exit_cache_bypass();
+}
+
+/// Release flash from deep power-down mode.
+/// Call after waking from system sleep, before any flash read/write.
+pub fn release_deep_sleep() {
+    enter_cache_bypass();
+    spif_wait_idle();
+    // JEDEC Release Deep Power-Down command (0xAB)
+    reg_write(SPIF_FCMD, 0xAB00_0001);
+    spif_wait_idle();
+    // Wait tRES1 (~30µs) for flash to be ready
+    for _ in 0..2000u32 { cortex_m::asm::nop(); }
+    exit_cache_bypass();
+    cache_flush();
+}
