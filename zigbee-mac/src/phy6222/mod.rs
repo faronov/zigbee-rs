@@ -136,6 +136,17 @@ impl Phy6222Mac {
         s
     }
 
+    /// Power down the radio to save battery between poll cycles.
+    /// Saves ~5–8 mA. Call `radio_wake()` before next TX/RX.
+    pub fn radio_sleep(&self) {
+        self.driver.radio_sleep();
+    }
+
+    /// Re-enable the radio after `radio_sleep()`.
+    pub fn radio_wake(&mut self) {
+        self.driver.radio_wake();
+    }
+
     fn map_radio_err(e: RadioError) -> MacError {
         match e {
             RadioError::CcaFailure => MacError::ChannelAccessFailure,

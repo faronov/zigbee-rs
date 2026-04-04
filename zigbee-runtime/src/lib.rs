@@ -1778,6 +1778,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         &mut self.reporting
     }
 
+    /// Access the underlying MAC driver (e.g., for platform-specific power management).
+    pub fn mac_mut(&mut self) -> &mut M {
+        self.bdb.zdo_mut().nwk_mut().mac_mut()
+    }
+
     /// Check if any attribute reports are due for a cluster and send them.
     ///
     /// Call this after updating cluster attributes (e.g., after reading sensors).

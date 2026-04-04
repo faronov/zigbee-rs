@@ -604,6 +604,38 @@ impl Phy6222Driver {
         reg_write(LL_HW_BASE + 0x00, 0x0000);
         reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK); // clear pending IRQs
     }
+
+    /// Power down the radio analog blocks to save power between TX/RX.
+    ///
+    /// Shuts off PLL, LNA, PA, ADC clocks. Call `radio_wake()` before
+    /// the next TX or RX operation. Saves ~5–8 mA.
+    pub fn radio_sleep(&self) {
+        // Disable LL HW engine
+        reg_write(LL_HW_BASE + 0x00, 0x0000);
+        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
+
+        // Disable RF PHY clocks: RX ADC clk, RF PHY clk
+        sub_write_reg(CLK_CFG_REG, 19, 18, 0x00);
+        // Disable DBL (clock doubler)
+        sub_write_reg(CLK_CFG_REG, 8, 8, 0);
+    }
+
+    /// Re-enable radio analog blocks after `radio_sleep()`.
+    ///
+    /// Re-enables clocks and reconfigures the analog chain.
+    /// Must be called before any TX/RX operation after sleep.
+    pub fn radio_wake(&mut self) {
+        // Re-enable DBL
+        sub_write_reg(CLK_CFG_REG, 8, 8, 1);
+        // Re-enable RF PHY clocks
+        sub_write_reg(CLK_CFG_REG, 19, 18, 0x03);
+
+        // Small settling delay for PLL
+        for _ in 0..1000u32 { core::hint::spin_loop(); }
+
+        // Re-apply channel (re-locks PLL)
+        self.set_channel(self.config.channel);
+    }
 }
 
 // ── IRQ handler ─────────────────────────────────────────────────

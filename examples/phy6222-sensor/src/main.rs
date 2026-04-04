@@ -274,8 +274,10 @@ async fn main(_spawner: Spawner) {
         }
         button_was_pressed = pressed;
 
-        // ── Sleep until next poll ──
+        // ── Sleep until next poll (radio off to save power) ──
+        device.mac_mut().radio_sleep();
         Timer::after(Duration::from_millis(poll_ms)).await;
+        device.mac_mut().radio_wake();
 
         // ── Poll parent for indirect frames (SED core) ──
         if device.is_joined() {
