@@ -163,6 +163,9 @@ async fn main(_spawner: Spawner) {
         }
     }
 
+    // Default reporting so device reports even before ZHA interview
+    setup_default_reporting(&mut device);
+
     // Set initial sensor values for ZHA interview
     {
         let temp: i16 = 2250;
@@ -286,6 +289,20 @@ async fn main(_spawner: Spawner) {
                 ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                         ];
                         if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
+                            match &ev {
+                                StackEvent::LeaveRequested => {
+                                    log::info!("[PHY6222] Leave requested — erasing NV and rejoining");
+                                    device.factory_reset(Some(&mut nv)).await;
+                                    device.user_action(UserAction::Join);
+                                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                    interview_done = false;
+                                    annce_retries_left = 5;
+                                    last_annce = Instant::now();
+                                    led_on();
+                                    break;
+                                }
+                                _ => {}
+                            }
                             if log_event(&ev) {
                                 fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                 log::info!("[PHY6222] Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
@@ -360,6 +377,13 @@ async fn main(_spawner: Spawner) {
                 }
             }
 
+            // Identify LED blink
+            identify_cluster.tick(tick_elapsed);
+            if identify_cluster.is_identifying() {
+                let on = phy6222_hal::gpio::read(pins::LED_G);
+                phy6222_hal::gpio::write(pins::LED_G, !on);
+            }
+
             // Device_annce retry
             if annce_retries_left > 0 && now2.duration_since(last_annce).as_secs() >= 8 {
                 annce_retries_left -= 1;
@@ -426,10 +450,43 @@ fn log_event(event: &StackEvent) -> bool {
             false
         }
         StackEvent::ReportSent => { log::info!("[PHY6222] Report sent"); false }
+        StackEvent::LeaveRequested => {
+            led_on();
+            log::info!("[PHY6222] Leave requested by coordinator");
+            false
+        }
         StackEvent::CommissioningComplete { success } => {
             log::info!("[PHY6222] Commissioning: {}", if *success { "ok" } else { "failed" });
             false
         }
         _ => { log::info!("[PHY6222] Stack event"); false }
     }
+}
+
+/// Configure default reporting intervals so device reports even before ZHA interview.
+fn setup_default_reporting(device: &mut ZigbeeDevice<Phy6222Mac>) {
+    use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
+    use zigbee_zcl::data_types::ZclDataType;
+
+    let configs = [
+        (0x0402u16, 0x0000u16, ZclDataType::I16),   // Temperature
+        (0x0405, 0x0000, ZclDataType::U16),          // Humidity
+        (0x0001, 0x0021, ZclDataType::U8),           // Battery %
+    ];
+
+    for (cluster_id, attr_id, data_type) in configs {
+        let (min, max) = if cluster_id == 0x0001 { (300, 3600) } else { (60, 300) };
+        let _ = device.reporting_mut().configure_for_cluster(
+            1, cluster_id,
+            ReportingConfig {
+                direction: ReportDirection::Send,
+                attribute_id: zigbee_zcl::AttributeId(attr_id),
+                data_type,
+                min_interval: min,
+                max_interval: max,
+                reportable_change: None,
+            },
+        );
+    }
+    log::info!("[PHY6222] Default reporting configured");
 }

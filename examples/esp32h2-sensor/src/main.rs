@@ -24,6 +24,7 @@
 extern crate alloc;
 
 mod time_driver;
+mod flash_nv;
 
 use esp_backtrace as _;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
@@ -145,9 +146,19 @@ fn main() -> ! {
 
     // Run the async SED loop synchronously via block_on
     block_on(async {
-        // Auto-join
-        esp_println::println!("[ESP32-H2] Auto-joining network…");
-        device.user_action(UserAction::Join);
+        // Flash NV storage
+        let mut nv = flash_nv::create_nv();
+        esp_println::println!("[ESP32-H2] Flash NV storage ready");
+
+        // Restore previous network state or auto-join
+        let restored = device.restore_state(&nv);
+        if restored {
+            esp_println::println!("[ESP32-H2] Restored state — will rejoin");
+            device.user_action(UserAction::Rejoin);
+        } else {
+            esp_println::println!("[ESP32-H2] No saved state — auto-joining…");
+            device.user_action(UserAction::Join);
+        }
         let mut clusters = [
             ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
             ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
@@ -156,7 +167,10 @@ fn main() -> ! {
                 ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
         ];
         if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-            log_event(e);
+            if log_event(e) {
+                device.save_state(&mut nv);
+                esp_println::println!("[ESP32-H2] State saved to flash");
+            }
         }
 
         // Default reporting so device reports even before ZHA interview
@@ -217,6 +231,7 @@ fn main() -> ! {
                     ];
                     if let TickResult::Event(ref e) = device.tick(0, &mut cls).await {
                         if log_event(e) {
+                            device.save_state(&mut nv);
                             fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                             annce_retries_left = 5;
                             last_annce = Instant::now();
@@ -246,7 +261,8 @@ fn main() -> ! {
                             if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
                                 match &ev {
                                     StackEvent::LeaveRequested => {
-                                        esp_println::println!("[ESP32-H2] Leave requested — rejoining");
+                                        esp_println::println!("[ESP32-H2] Leave requested — erasing NV and rejoining");
+                                        device.factory_reset(Some(&mut nv)).await;
                                         device.user_action(UserAction::Join);
                                         fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                         interview_done = false;
@@ -348,6 +364,8 @@ fn main() -> ! {
                         annce_retries_left = 5;
                         last_annce = Instant::now();
                         interview_done = false;
+                        device.save_state(&mut nv);
+                        esp_println::println!("[ESP32-H2] State saved to flash");
                     }
                 }
             }
