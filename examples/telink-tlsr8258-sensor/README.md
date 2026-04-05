@@ -7,125 +7,95 @@ reporting temperature and humidity via ZCL clusters 0x0402 and 0x0405.
 
 - **MCU:** Telink TLSR8258 — tc32 core, 512KB Flash, 64KB SRAM
 - **Radio:** Built-in IEEE 802.15.4 + BLE
-- **Boards:** Sonoff SNZB-02, Tuya Zigbee sensors, IKEA devices, Telink devboard
+- **Boards:** TB-03F, Sonoff SNZB-02, Tuya Zigbee sensors, IKEA devices
 - **Button:** GPIO2 — join/leave network
 - **LED:** GPIO3
 
-## Prerequisites
+## Build Modes
 
-- Rust nightly with `thumbv6m-none-eabi` target (compilation stand-in)
-
-```bash
-rustup target add thumbv6m-none-eabi
-```
-
-## ⚠️ Note on tc32 ISA
-
-The TLSR8258 uses Telink's **proprietary tc32 instruction set**. There is no
-official Rust target for tc32. For `cargo check` / `cargo build`, we use
-`thumbv6m-none-eabi` as a compilation stand-in to verify the Rust code compiles
-and the Zigbee stack logic is correct.
-
-Real production builds require the **Telink tc32 GCC toolchain** and would
-typically link via a C firmware project that calls into a Rust static library.
-
-## Vendor Library Setup
-
-The TLSR8258 driver uses FFI bindings to Telink's precompiled driver library
-from the **Telink Zigbee SDK** (`tl_zigbee_sdk`).
-
-### Download the SDK
-
-```bash
-git clone https://github.com/telink-semi/tl_zigbee_sdk.git
-```
-
-### Set the environment variable
-
-```bash
-export TELINK_SDK_DIR=/path/to/tl_zigbee_sdk
-```
-
-### Libraries linked by `build.rs`
-
-| Library               | SDK Path              | Purpose                         |
-|-----------------------|-----------------------|---------------------------------|
-| `libdrivers_8258.a`  | `platform/lib/`       | TLSR8258 hardware drivers (RF, GPIO, timer, etc.) |
-
-The build script links from `$TELINK_SDK_DIR/platform/lib/`.
-
-## Building
-
-### Stubs build (CI — no Telink SDK required)
+### 1. CI/stub mode (no TC32 toolchain needed)
 
 ```bash
 cd examples/telink-tlsr8258-sensor
 cargo build --release --features stubs
 ```
 
-The `stubs` feature provides no-op implementations of all FFI symbols.
+Uses `thumbv6m-none-eabi` as a stand-in target. The `stubs` feature provides
+no-op FFI symbols. This verifies the Rust code compiles but does NOT produce
+flashable firmware.
 
-### Real build (with Telink SDK)
+### 2. Real TC32 firmware (with modern-tc32 toolchain)
 
 ```bash
+# Install the TC32 Rust toolchain
+# See: https://github.com/modern-tc32/examples_rust
+
+# Set paths
+export TC32_TOOLCHAIN=/path/to/toolchains/tc32-stage1
+export TC32_SDK_DIR=/path/to/tl_zigbee_sdk
+export TC32_LLVM_BIN=$TC32_TOOLCHAIN/llvm/bin
+
+# Build real tc32 firmware
 cd examples/telink-tlsr8258-sensor
-TELINK_SDK_DIR=/path/to/tl_zigbee_sdk cargo build --release
+$TC32_TOOLCHAIN/bin/cargo build --release
 ```
 
-> **Note:** This produces a `thumbv6m` ELF binary for verification purposes.
-> For production tc32 firmware, integrate the Rust code as a static library
-> into a Telink tc32 GCC project.
+This produces a real `tc32-unknown-none-elf` binary flashable to TLSR8258 hardware.
+
+The `build.rs` automatically:
+- Compiles Telink SDK C sources with `clang --target=tc32`
+- Links `libdrivers_8258.a` and `libsoft-fp.a` from the SDK
+- Handles startup code and linker script
+
+## TC32 Toolchain
+
+The TLSR8258 uses Telink's proprietary **tc32 instruction set**. The
+[modern-tc32](https://github.com/modern-tc32) project provides:
+
+- **Custom Rust compiler** with `tc32-unknown-none-elf` target
+- **LLVM backend** with TC32 support (`clang --target=tc32`)
+- **Prebuilt `core`/`alloc`** for the TC32 target
+
+Setup: see [modern-tc32/examples_rust](https://github.com/modern-tc32/examples_rust)
+
+## Vendor Library
+
+| Library | SDK Path | Purpose |
+|---------|----------|---------|
+| `libdrivers_8258.a` | `platform/lib/` | Hardware drivers (RF, GPIO, timer) |
+| `libsoft-fp.a` | `platform/tc32/` | Soft-float math |
+
+```bash
+git clone https://github.com/telink-semi/tl_zigbee_sdk.git
+export TC32_SDK_DIR=/path/to/tl_zigbee_sdk
+```
 
 ## Flashing
 
-Use the **Telink Burning & Debug Tool (BDT)** with a Telink USB programmer:
+Use the **Telink Burning & Debug Tool (BDT)** with a USB programmer:
 
 ```bash
-# With Telink BDT
-TelinkBDT --chip 8258 --firmware <your_tc32_firmware.bin>
+TelinkBDT --chip 8258 --firmware target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin
 ```
 
-For the `thumbv6m` stand-in build, the binary is not directly flashable to
-real TLSR8258 hardware.
+## Features
 
-## What It Demonstrates
-
-- Zigbee 3.0 end device targeting the popular TLSR8258 platform
-- Embassy async runtime with tc32-compatible compilation
-- IEEE 802.15.4 radio via Telink driver library FFI
-- Button-driven network join/leave with edge detection
-- ZCL Temperature Measurement + Relative Humidity clusters
-- Cross-compilation approach for non-standard ISA targets
-
-## What Works vs. What's Stubbed
-
-### ✅ Implemented
-- **Time driver**: Reads the TLSR8258 32-bit system timer at `0x740`, extends
-  to 64-bit with wraparound detection, converts to microseconds at 16 MHz
-- **GPIO**: Real register-mapped I/O for group A (input, output, pull-up)
-- **RF ISR routing**: Dispatch function for RF interrupt → MAC driver callbacks
-- **Sleep**: WFI instruction for light sleep; `light_sleep_ms()` placeholder
-  for Telink PM driver integration
-- **MAC driver**: Full Telink MAC with CSMA-CA, ED scan, indirect TX queue,
-  frame-pending bit, poll support
-
-### 🔧 Requires real hardware / SDK for full functionality
-- **Sensor data**: Synthetic temperature/humidity (no I²C sensor driver yet)
-- **Timer alarm**: `schedule_wake()` not yet wired to hardware compare
-  interrupt — Embassy uses polling mode
-- **Deep sleep**: `light_sleep_ms()` falls back to WFI; real suspend requires
-  Telink PM_LowPwrEnter() integration
-- **Build target**: Uses `thumbv6m-none-eabi` as stand-in for tc32
+- Zigbee 3.0 SED with Identify, Temperature, Humidity, Battery clusters
+- NWK Leave handler with auto-rejoin
+- Default reporting with change thresholds
+- IEEE 802.15.4 radio via Telink SDK FFI
+- Button-driven join/leave with factory reset
+- Two build paths: CI stubs + real TC32 firmware
 
 ## Project Structure
 
 ```
 telink-tlsr8258-sensor/
-├── .cargo/config.toml   # Target: thumbv6m-none-eabi (tc32 stand-in), build-std
+├── .cargo/config.toml   # Target config (thumbv6m for CI, tc32 for real)
 ├── Cargo.toml            # Dependencies, stubs feature flag
-├── build.rs              # Telink SDK library linking via TELINK_SDK_DIR
+├── build.rs              # Dual-mode: stub linking OR TC32 SDK compilation
 ├── memory.x              # Flash @ 0x00000000, RAM @ 0x00840000
 └── src/
-    ├── main.rs           # Entry point, device setup, sensor loop
+    ├── main.rs           # Entry point, SED loop, sensor clusters
     └── stubs.rs          # No-op FFI stubs for CI builds
 ```

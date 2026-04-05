@@ -1,7 +1,12 @@
 [build]
-# TLSR8258 uses Telink's tc32 ISA. For cargo check, we use thumbv6m-none-eabi
-# as a compilation stand-in. Real builds use Telink's tc32 GCC toolchain.
+# With the TC32 toolchain installed: target = "tc32-unknown-none-elf"
+# For CI/development without TC32 toolchain (uses stubs):
 target = "thumbv6m-none-eabi"
+
+# To build real firmware, use:
+#   TC32_TOOLCHAIN=/path/to/tc32-stage1 cargo build --release
+# This requires the modern-tc32 toolchain from:
+#   https://github.com/modern-tc32/examples_rust
 
 [unstable]
 build-std = ["core", "alloc"]

@@ -214,7 +214,7 @@ The build script links: `libdrivers_8258.a` from `$TELINK_SDK_DIR/platform/lib/`
 | **BL702** | ✅ lmac154 FFI | `riscv32imac-unknown-none-elf` | Requires vendor libs (`liblmac154.a` + `libbl702_rf.a`) from Bouffalo SDK |
 | **CC2340** | ⚡ ZBOSS FFI | `thumbv6m-none-eabi` | TI SimpleLink SDK stubs (50+ RTOS deps) |
 | **Telink B91** | ⚡ Telink FFI | `riscv32imac-unknown-none-elf` | Telink SDK stubs |
-| **Telink TLSR8258** | ⚡ Telink FFI | `riscv32-unknown-none-elf` | Telink SDK stubs (tc32 ISA) |
+| **Telink TLSR8258** | ⚡ Telink FFI | `tc32-unknown-none-elf` | [modern-tc32](https://github.com/modern-tc32) toolchain for real builds; `thumbv6m` stubs for CI |
 | **PHY6222** | 🦀 **Pure Rust** | `thumbv6m-none-eabi` | Zero vendor blobs — direct register access! |
 
 > **Legend:** ✅ = fully functional radio driver · ⚡ = compiles with stubs, needs vendor SDK for real RF · 🦀 = pure Rust (no FFI)

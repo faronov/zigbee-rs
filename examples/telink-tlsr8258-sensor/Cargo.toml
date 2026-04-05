@@ -2,6 +2,7 @@
 name = "telink-tlsr8258-sensor"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
@@ -11,13 +12,13 @@ zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 
-# Embassy async runtime — tc32 is ARM-like, use cortex-m arch
-embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
+# Embassy async runtime
 embassy-time = { version = "0.5" }
 embassy-time-driver = "0.2"
 embassy-futures = "0.1"
 
-# Cortex-M support (TLSR825x has an ARM-compatible core)
+# For CI stub builds (thumbv6m stand-in)
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"
 
@@ -27,7 +28,7 @@ portable-atomic = { version = "1", features = ["unsafe-assume-single-core"] }
 # Logging
 log = "0.4"
 
-# Panic handler for embedded target
+# Panic handler
 panic-halt = "1.0"
 
 [features]
