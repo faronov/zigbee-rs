@@ -318,9 +318,15 @@ async fn main(_spawner: Spawner) {
         }
         button_was_pressed = pressed;
 
-        // Sleep with radio off to save power
+        // Sleep with radio off — use CPU suspend for slow poll (~3µA)
         device.mac_mut().radio_sleep();
-        Timer::after(Duration::from_millis(poll_ms)).await;
+        if !in_fast_poll && device.is_joined() && poll_ms >= 5000 {
+            // Deep suspend: CPU halts, SRAM retained, timer wakes (~3 µA)
+            zigbee_mac::telink::TelinkMac::cpu_suspend_ms(poll_ms as u32);
+        } else {
+            // Light sleep: WFI via embassy Timer (~1.5 mA)
+            Timer::after(Duration::from_millis(poll_ms)).await;
+        }
         device.mac_mut().radio_wake();
 
         if device.is_joined() {

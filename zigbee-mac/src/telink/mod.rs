@@ -172,6 +172,14 @@ impl TelinkMac {
         self.driver.radio_wake();
     }
 
+    /// Enter CPU suspend mode for the given duration.
+    ///
+    /// Halts the CPU with SRAM retained (~3 µA). Resumes after timer fires.
+    /// Call `radio_sleep()` before this and `radio_wake()` after.
+    pub fn cpu_suspend_ms(duration_ms: u32) {
+        TelinkDriver::cpu_suspend_ms(duration_ms);
+    }
+
     #[allow(dead_code)]
     fn next_bsn(&mut self) -> u8 {
         let seq = self.bsn;

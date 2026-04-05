@@ -111,8 +111,24 @@ const REG_RF_IRQ_MASK: u32 = REG_BASE + 0xF1C; // RF IRQ mask (u16)
 const REG_RF_IRQ_STATUS: u32 = REG_BASE + 0xF20; // RF IRQ status (u16)
 
 // System timer (32-bit, 16 MHz)
-#[allow(dead_code)]
 const REG_SYSTEM_TIMER: u32 = REG_BASE + 0x740;
+/// System timer wake compare register — CPU wakes from suspend when timer reaches this value.
+const REG_SYSTEM_WAKEUP_TICK: u32 = REG_BASE + 0x748;
+
+// Power Management registers
+/// Wake-up source enable register.
+/// BIT(4)=PAD, BIT(5)=CORE, BIT(6)=TIMER, BIT(7)=COMPARATOR
+const REG_WAKEUP_EN: u32 = REG_BASE + 0x6E;
+/// Power-down control. BIT(7) = enter suspend/deep-sleep.
+const REG_PWDN_CTRL: u32 = REG_BASE + 0x6F;
+
+/// System timer clock: 16 MHz = 16 ticks per microsecond.
+const SYSTEM_TIMER_TICKS_PER_US: u32 = 16;
+
+/// Wake source: timer
+const PM_WAKEUP_TIMER: u8 = 1 << 6;
+/// Sleep trigger bit
+const FLD_PWDN_CTRL_SLEEP: u8 = 1 << 7;
 
 // RF IRQ bit masks (for REG_RF_IRQ_MASK / REG_RF_IRQ_STATUS)
 const FLD_RF_IRQ_TX: u16 = 1 << 1; // TX done
@@ -650,6 +666,38 @@ impl TelinkDriver {
         set_rx_buf(core::ptr::addr_of!(RF_RX_DMA_BUF) as *mut u8);
         // Back to RX mode
         set_trx_state(RF_STATE_RX);
+    }
+
+    /// Enter CPU suspend mode for `duration_ms` milliseconds.
+    ///
+    /// The CPU halts, SRAM is retained, and the system timer continues
+    /// running. The CPU resumes execution after the timer fires.
+    /// Radio must be powered down before calling this.
+    ///
+    /// Current draw in suspend: ~3 µA (vs ~1.5 mA in WFI idle).
+    ///
+    /// Unlike PHY6222's system sleep (which reboots), TLSR8258 suspend
+    /// resumes execution right after the sleep trigger write.
+    pub fn cpu_suspend_ms(duration_ms: u32) {
+        // Read current system timer (32-bit, 16 MHz)
+        let now = reg_read_u32(REG_SYSTEM_TIMER);
+        let wake_tick = now.wrapping_add(duration_ms * SYSTEM_TIMER_TICKS_PER_US * 1000);
+
+        // Set wake-up tick
+        reg_write_u32(REG_SYSTEM_WAKEUP_TICK, wake_tick);
+
+        // Enable timer as wake source
+        reg_write_u8(REG_WAKEUP_EN, PM_WAKEUP_TIMER);
+
+        // Enter suspend — CPU halts, resumes when timer fires
+        let ctrl = reg_read_u8(REG_PWDN_CTRL);
+        reg_write_u8(REG_PWDN_CTRL, ctrl | FLD_PWDN_CTRL_SLEEP);
+
+        // Execution resumes here after wake-up
+        // Small delay for clock stabilization
+        for _ in 0..1000u32 {
+            core::hint::spin_loop();
+        }
     }
 }
 
