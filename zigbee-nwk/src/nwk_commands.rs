@@ -4,8 +4,8 @@
 //! (Route Request, Route Reply, Link Status, Route Record).
 
 use crate::frames::{
-    LinkStatusCommand, LinkStatusEntry, NetworkStatusCommand, NwkCommandId, NwkFrameControl,
-    NwkFrameType, NwkHeader, RouteReply, RouteRequest,
+    EdTimeoutRequest, LinkStatusCommand, LinkStatusEntry, NetworkStatusCommand, NwkCommandId,
+    NwkFrameControl, NwkFrameType, NwkHeader, RouteReply, RouteRequest,
 };
 use crate::{NwkLayer, NwkStatus};
 use zigbee_mac::{AddressMode, MacDriver, McpsDataRequest, TxOptions};
@@ -352,5 +352,29 @@ impl<M: MacDriver> NwkLayer<M> {
                 log::warn!("[NWK] Failed to send concentrator RREQ: {:?}", e);
             }
         }
+    }
+
+    /// Send End Device Timeout Request to parent after joining.
+    ///
+    /// Requests the maximum timeout (index 14 = ~11 days) so the parent
+    /// keeps our entry in its neighbor table even during extended sleep.
+    pub async fn send_ed_timeout_request(&mut self) -> Result<(), NwkStatus> {
+        if self.device_type != crate::DeviceType::EndDevice {
+            return Ok(()); // Only end devices send this
+        }
+        let req = EdTimeoutRequest::max_timeout();
+        let mut payload = [0u8; 2];
+        let len = req.serialize(&mut payload);
+        log::info!(
+            "[NWK] Sending ED Timeout Request (index={}, ~11 days) to parent 0x{:04X}",
+            req.requested_timeout,
+            self.nib.parent_address.0
+        );
+        self.send_nwk_command(
+            self.nib.parent_address,
+            NwkCommandId::EdTimeoutRequest,
+            &payload[..len],
+        )
+        .await
     }
 }

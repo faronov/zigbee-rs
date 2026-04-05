@@ -684,6 +684,16 @@ impl<M: MacDriver> NwkLayer<M> {
             Some(NwkCommandId::RouteRecord) => self.handle_route_record(src, cmd_payload),
             Some(NwkCommandId::LinkStatus) => self.handle_link_status(src, cmd_payload),
             Some(NwkCommandId::NetworkStatus) => self.handle_network_status(src, cmd_payload),
+            Some(NwkCommandId::EdTimeoutResponse) => {
+                if let Some(resp) = crate::frames::EdTimeoutResponse::parse(cmd_payload) {
+                    log::info!(
+                        "[NWK] ED Timeout Response from 0x{:04X}: status={} parent_info=0x{:02X}",
+                        src.0,
+                        resp.status,
+                        resp.parent_info,
+                    );
+                }
+            }
             Some(other) => {
                 log::debug!(
                     "[NWK] Ignoring NWK command {:?} from 0x{:04X}",

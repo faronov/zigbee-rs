@@ -560,3 +560,72 @@ impl LinkStatusCommand {
         offset
     }
 }
+
+// ── End Device Timeout ──────────────────────────────────────────
+
+/// End Device Timeout Request (NWK command 0x0B).
+///
+/// Sent by an end device to its parent after joining/rejoining to
+/// request a specific keepalive timeout. The parent uses this to
+/// decide how long to keep the child in its neighbor table.
+///
+/// Timeout index table:
+/// 0=10s, 1=2m, 2=4m, 3=8m, 4=16m, 5=32m, 6=64m, 7=128m,
+/// 8=256m(default), 9=512m, 10=1024m, 11=2048m, 12=4096m,
+/// 13=8192m, 14=16384m(max ~11 days)
+#[derive(Debug, Clone)]
+pub struct EdTimeoutRequest {
+    /// Timeout index (0-14), see table above.
+    pub requested_timeout: u8,
+    /// End device configuration: bit0 = MAC Data Poll Keepalive supported,
+    /// bit1 = End Device Timeout Request keepalive supported
+    pub ed_config: u8,
+}
+
+impl EdTimeoutRequest {
+    /// Create with the maximum timeout (index 14 = ~11 days).
+    pub fn max_timeout() -> Self {
+        Self {
+            requested_timeout: 14,
+            ed_config: 0x02, // End Device Timeout Request keepalive supported
+        }
+    }
+
+    pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.requested_timeout;
+        buf[1] = self.ed_config;
+        2
+    }
+
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 2 {
+            return None;
+        }
+        Some(Self {
+            requested_timeout: data[0],
+            ed_config: data[1],
+        })
+    }
+}
+
+/// End Device Timeout Response (NWK command 0x0C).
+#[derive(Debug, Clone)]
+pub struct EdTimeoutResponse {
+    /// 0x00 = success
+    pub status: u8,
+    /// Parent information: bit0 = MAC Data Poll Keepalive supported,
+    /// bit1 = End Device Timeout Request keepalive supported
+    pub parent_info: u8,
+}
+
+impl EdTimeoutResponse {
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 2 {
+            return None;
+        }
+        Some(Self {
+            status: data[0],
+            parent_info: data[1],
+        })
+    }
+}

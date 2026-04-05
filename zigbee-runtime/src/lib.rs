@@ -1921,4 +1921,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         let ieee_addr = self.bdb.zdo().local_ieee_addr();
         self.bdb.zdo_mut().device_annce(nwk_addr, ieee_addr).await
     }
+
+    /// Send End Device Timeout Request to parent.
+    ///
+    /// Requests the maximum timeout (~11 days) so the parent keeps our
+    /// entry during extended sleep. Call after join/rejoin.
+    /// Only sends for end devices (no-op for routers).
+    pub async fn send_ed_timeout_request(&mut self) {
+        let _ = self.bdb.zdo_mut().nwk_mut().send_ed_timeout_request().await;
+    }
 }

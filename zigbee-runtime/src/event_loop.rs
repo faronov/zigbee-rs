@@ -274,6 +274,8 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                 log::info!("[Runtime] User action: Join");
                 match self.start().await {
                     Ok(addr) => {
+                        // Send ED Timeout Request to parent (max ~11 days)
+                        self.send_ed_timeout_request().await;
                         let ch = self.channel();
                         let pan = self.pan_id();
                         TickResult::Event(StackEvent::Joined {
@@ -291,6 +293,8 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                 log::info!("[Runtime] User action: Rejoin");
                 match self.rejoin().await {
                     Ok(addr) => {
+                        // Send ED Timeout Request to parent (max ~11 days)
+                        self.send_ed_timeout_request().await;
                         let ch = self.channel();
                         let pan = self.pan_id();
                         TickResult::Event(StackEvent::Joined {
