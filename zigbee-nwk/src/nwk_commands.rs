@@ -4,8 +4,8 @@
 //! (Route Request, Route Reply, Link Status, Route Record).
 
 use crate::frames::{
-    LinkStatusCommand, LinkStatusEntry, NwkCommandId, NwkFrameControl, NwkFrameType, NwkHeader,
-    RouteReply, RouteRequest,
+    LinkStatusCommand, LinkStatusEntry, NetworkStatusCommand, NwkCommandId, NwkFrameControl,
+    NwkFrameType, NwkHeader, RouteReply, RouteRequest,
 };
 use crate::{NwkLayer, NwkStatus};
 use zigbee_mac::{AddressMode, MacDriver, McpsDataRequest, TxOptions};
@@ -212,6 +212,54 @@ impl<M: MacDriver> NwkLayer<M> {
             .await
     }
 
+    /// Send a Network Status command (NWK command 0x03) for route errors.
+    pub async fn send_network_status(
+        &mut self,
+        dest: ShortAddress,
+        status_code: u8,
+        failed_destination: ShortAddress,
+    ) -> Result<(), NwkStatus> {
+        let ns = NetworkStatusCommand {
+            status_code,
+            destination: failed_destination,
+        };
+        let mut payload = [0u8; 4];
+        let len = ns.serialize(&mut payload);
+
+        self.send_nwk_command(dest, NwkCommandId::NetworkStatus, &payload[..len])
+            .await
+    }
+
+    /// Send a Many-to-One Route Request (RREQ) broadcast.
+    ///
+    /// Used by concentrators (coordinators) to establish reverse routes
+    /// from all routers back to the concentrator.
+    pub async fn send_many_to_one_rreq(&mut self) -> Result<(), NwkStatus> {
+        let rreq_id = self.nib.next_route_request_id();
+        let rreq = RouteRequest {
+            command_options: 0x08, // Bit 3 = many-to-one
+            route_request_id: rreq_id,
+            dst_addr: self.nib.network_address, // Concentrator is both source and dest
+            path_cost: 0,
+            dst_ieee: None,
+        };
+        let mut payload = [0u8; 16];
+        let len = rreq.serialize(&mut payload);
+
+        log::info!(
+            "[NWK] Sending many-to-one RREQ (id={}, addr=0x{:04X})",
+            rreq_id,
+            self.nib.network_address.0,
+        );
+
+        self.send_nwk_command(
+            ShortAddress::BROADCAST,
+            NwkCommandId::RouteRequest,
+            &payload[..len],
+        )
+        .await
+    }
+
     /// Drain and send all queued route replies and RREQ rebroadcasts.
     ///
     /// Call this after `process_incoming_nwk_frame` returns so that
@@ -276,6 +324,32 @@ impl<M: MacDriver> NwkLayer<M> {
             self.link_status_due = false;
             if let Err(e) = self.send_link_status().await {
                 log::warn!("[NWK] Failed to send periodic link status: {:?}", e);
+            }
+        }
+
+        // Drain pending Network Status (route error) notifications
+        while let Some(pending) = self.pending_route_errors.pop() {
+            if let Err(e) = self
+                .send_network_status(
+                    pending.destination,
+                    pending.status_code,
+                    pending.failed_destination,
+                )
+                .await
+            {
+                log::warn!(
+                    "[NWK] Failed to send NetworkStatus to 0x{:04X}: {:?}",
+                    pending.destination.0,
+                    e
+                );
+            }
+        }
+
+        // Send concentrator many-to-one RREQ if due
+        if self.concentrator_rreq_due {
+            self.concentrator_rreq_due = false;
+            if let Err(e) = self.send_many_to_one_rreq().await {
+                log::warn!("[NWK] Failed to send concentrator RREQ: {:?}", e);
             }
         }
     }

@@ -458,6 +458,54 @@ impl RouteReply {
     }
 }
 
+/// Network Status command (NWK command ID 0x03)
+///
+/// Sent when a routing error occurs (e.g., relay failure, no route available).
+/// See Zigbee spec Table 3-44.
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkStatusCommand {
+    /// Status code (Table 3-45):
+    /// 0x00 = No route available
+    /// 0x01 = Tree link failure
+    /// 0x02 = Non-tree link failure
+    /// 0x03 = Low battery level
+    /// 0x04 = No routing capacity
+    /// 0x05 = No indirect capacity
+    /// 0x06 = Indirect transaction expiry
+    /// 0x07 = Target device unavailable
+    /// 0x08 = Target address unallocated
+    /// 0x09 = Parent link failure
+    /// 0x0B = Address conflict
+    /// 0x0C = Route discovery failed
+    /// 0x0D = Route validation error
+    pub status_code: u8,
+    /// Destination address that triggered the error
+    pub destination: ShortAddress,
+}
+
+impl NetworkStatusCommand {
+    pub const NO_ROUTE_AVAILABLE: u8 = 0x00;
+    pub const TREE_LINK_FAILURE: u8 = 0x01;
+    pub const NON_TREE_LINK_FAILURE: u8 = 0x02;
+
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 3 {
+            return None;
+        }
+        Some(Self {
+            status_code: data[0],
+            destination: ShortAddress(u16::from_le_bytes([data[1], data[2]])),
+        })
+    }
+
+    pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.status_code;
+        buf[1] = (self.destination.0 & 0xFF) as u8;
+        buf[2] = ((self.destination.0 >> 8) & 0xFF) as u8;
+        3
+    }
+}
+
 /// Link status entry (one neighbor's link quality)
 #[derive(Debug, Clone, Copy)]
 pub struct LinkStatusEntry {

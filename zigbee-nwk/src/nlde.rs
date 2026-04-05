@@ -340,8 +340,23 @@ impl<M: MacDriver> NwkLayer<M> {
             return Ok(()); // TTL expired
         }
 
+        // ── Source routing: use relay list instead of routing table ──
+        if let Some(ref sr) = header.source_route {
+            return self
+                .relay_frame_source_routed(original, header, sr, new_radius)
+                .await;
+        }
+
         // Determine next hop for the final destination
         let next_hop = self.resolve_next_hop(header.dst_addr)?;
+
+        // ── Route Record insertion: if the route requires a route record,
+        // append our address to the relay list in the NWK header ──
+        let needs_route_record = self
+            .routing
+            .get_entry(header.dst_addr)
+            .map(|e| e.route_record_required)
+            .unwrap_or(false);
 
         // Check if next hop is a sleepy child — buffer in indirect queue
         if let Some(neighbor) = self.neighbors.find_by_short(next_hop) {
@@ -350,6 +365,9 @@ impl<M: MacDriver> NwkLayer<M> {
                 let mut relay_buf = [0u8; 128];
                 let mut new_header = header.clone();
                 new_header.radius = new_radius;
+                if needs_route_record {
+                    self.insert_route_record(&mut new_header);
+                }
                 let hdr_len = new_header.serialize(&mut relay_buf);
                 let (_, orig_hdr_len) = match NwkHeader::parse(original) {
                     Some(parsed) => parsed,
@@ -370,10 +388,13 @@ impl<M: MacDriver> NwkLayer<M> {
             }
         }
 
-        // Rebuild frame with decremented radius
+        // Rebuild frame with decremented radius (and optional route record)
         let mut relay_buf = [0u8; 128];
         let mut new_header = header.clone();
         new_header.radius = new_radius;
+        if needs_route_record {
+            self.insert_route_record(&mut new_header);
+        }
         let hdr_len = new_header.serialize(&mut relay_buf);
 
         // Copy original payload (everything after header)
@@ -391,7 +412,8 @@ impl<M: MacDriver> NwkLayer<M> {
         relay_buf[hdr_len..hdr_len + payload.len()].copy_from_slice(payload);
         let total = hdr_len + payload.len();
 
-        self.mac
+        let mac_result = self
+            .mac
             .mcps_data(McpsDataRequest {
                 src_addr_mode: AddressMode::Short,
                 dst_address: MacAddress::Short(self.nib.pan_id, next_hop),
@@ -402,10 +424,132 @@ impl<M: MacDriver> NwkLayer<M> {
                     ..Default::default()
                 },
             })
-            .await
-            .map_err(|_| NwkStatus::RouteError)?;
+            .await;
+
+        // ── Route repair: if MAC TX fails, handle relay failure ──
+        if mac_result.is_err() {
+            self.handle_relay_failure(header.dst_addr, header.src_addr, next_hop);
+            return Err(NwkStatus::RouteError);
+        }
 
         Ok(())
+    }
+
+    /// Relay a frame using source routing (relay list in NWK header).
+    async fn relay_frame_source_routed(
+        &mut self,
+        original: &[u8],
+        header: &NwkHeader,
+        sr: &crate::frames::SourceRoute,
+        new_radius: u8,
+    ) -> Result<(), NwkStatus> {
+        let our_addr = self.nib.network_address;
+
+        // Find next hop from source route relay list.
+        // Relay list is ordered [closest-to-dest, ..., closest-to-source].
+        // relay_index points to current position; decrement to advance toward destination.
+        let (next_hop, new_index) = process_source_route(sr, our_addr, header.dst_addr)?;
+
+        // Build new header with updated source route
+        let mut new_header = header.clone();
+        new_header.radius = new_radius;
+        if let Some(ref mut new_sr) = new_header.source_route {
+            new_sr.relay_index = new_index;
+        }
+
+        let mut relay_buf = [0u8; 128];
+        let hdr_len = new_header.serialize(&mut relay_buf);
+
+        let (_, orig_hdr_len) = match NwkHeader::parse(original) {
+            Some(parsed) => parsed,
+            None => return Err(NwkStatus::InvalidParameter),
+        };
+        let payload = &original[orig_hdr_len..];
+        if hdr_len + payload.len() > relay_buf.len() {
+            return Err(NwkStatus::FrameTooLong);
+        }
+        relay_buf[hdr_len..hdr_len + payload.len()].copy_from_slice(payload);
+        let total = hdr_len + payload.len();
+
+        log::debug!(
+            "[NWK] Source-route relay: next_hop=0x{:04X} index={}→{}",
+            next_hop.0,
+            sr.relay_index,
+            new_index,
+        );
+
+        let mac_result = self
+            .mac
+            .mcps_data(McpsDataRequest {
+                src_addr_mode: AddressMode::Short,
+                dst_address: MacAddress::Short(self.nib.pan_id, next_hop),
+                payload: &relay_buf[..total],
+                msdu_handle: self.nib.next_seq(),
+                tx_options: TxOptions {
+                    ack_tx: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        if mac_result.is_err() {
+            self.handle_relay_failure(header.dst_addr, header.src_addr, next_hop);
+            return Err(NwkStatus::RouteError);
+        }
+
+        Ok(())
+    }
+
+    /// Insert our address into a Route Record relay list in the NWK header.
+    ///
+    /// If the header doesn't have a source route subframe, create one.
+    /// This allows the concentrator to learn the reverse path.
+    fn insert_route_record(&self, header: &mut NwkHeader) {
+        let our_addr = self.nib.network_address;
+
+        if let Some(ref mut sr) = header.source_route {
+            // Append our address to the relay list
+            let _ = sr.relay_list.push(our_addr);
+            sr.relay_count = sr.relay_list.len() as u8;
+            sr.relay_index = sr.relay_count;
+        } else {
+            // Create a new source route subframe with just our address
+            let mut relay_list = heapless::Vec::new();
+            let _ = relay_list.push(our_addr);
+            header.source_route = Some(crate::frames::SourceRoute {
+                relay_count: 1,
+                relay_index: 1,
+                relay_list,
+            });
+            header.frame_control.source_route = true;
+        }
+    }
+
+    /// Handle relay failure: remove broken route and queue Network Status error.
+    fn handle_relay_failure(
+        &mut self,
+        failed_dest: ShortAddress,
+        frame_source: ShortAddress,
+        _failed_next_hop: ShortAddress,
+    ) {
+        log::warn!(
+            "[NWK] Relay failure for dst=0x{:04X}, removing route",
+            failed_dest.0,
+        );
+
+        // Remove the broken route
+        self.routing.remove(failed_dest);
+
+        // Queue a Network Status (route error) to send toward the frame source
+        if frame_source != self.nib.network_address {
+            let _ = self
+                .pending_route_errors
+                .push(crate::PendingNetworkStatus {
+                    destination: frame_source,
+                    status_code: crate::frames::NetworkStatusCommand::NO_ROUTE_AVAILABLE,
+                    failed_destination: failed_dest,
+                });
+        }
     }
 
     /// Relay a broadcast NWK frame via MAC broadcast with decremented radius.
@@ -525,6 +669,7 @@ impl<M: MacDriver> NwkLayer<M> {
             Some(NwkCommandId::RouteReply) => self.handle_route_reply(src, cmd_payload),
             Some(NwkCommandId::RouteRecord) => self.handle_route_record(src, cmd_payload),
             Some(NwkCommandId::LinkStatus) => self.handle_link_status(src, cmd_payload),
+            Some(NwkCommandId::NetworkStatus) => self.handle_network_status(src, cmd_payload),
             Some(other) => {
                 log::debug!(
                     "[NWK] Ignoring NWK command {:?} from 0x{:04X}",
@@ -578,16 +723,55 @@ impl<M: MacDriver> NwkLayer<M> {
             return;
         };
 
+        let is_many_to_one = rreq.command_options & 0x08 != 0;
+
         log::debug!(
-            "[NWK] RREQ from 0x{:04X}: id={}, dst=0x{:04X}, cost={}",
+            "[NWK] RREQ from 0x{:04X}: id={}, dst=0x{:04X}, cost={}, m2o={}",
             src.0,
             rreq.route_request_id,
             rreq.dst_addr.0,
-            rreq.path_cost
+            rreq.path_cost,
+            is_many_to_one,
         );
 
         let our_addr = self.nib.network_address;
 
+        // ── Many-to-one RREQ: install route to concentrator, rebroadcast, no RREP ──
+        if is_many_to_one {
+            // Install route to the concentrator (RREQ originator = dst_addr in RREQ)
+            // via the sender
+            let _ = self
+                .routing
+                .update_route_many_to_one(rreq.dst_addr, src, rreq.path_cost);
+
+            log::info!(
+                "[NWK] Many-to-one route installed: concentrator=0x{:04X} via 0x{:04X}",
+                rreq.dst_addr.0,
+                src.0,
+            );
+
+            // Rebroadcast if we're a router (no RREP for many-to-one)
+            if self.device_type != DeviceType::EndDevice {
+                let link_cost = self
+                    .neighbors
+                    .find_by_short(src)
+                    .map(|n| n.outgoing_cost)
+                    .unwrap_or(7);
+                let new_cost = rreq.path_cost.saturating_add(link_cost);
+
+                let _ = self
+                    .pending_rreq_rebroadcasts
+                    .push(crate::PendingRreqRebroadcast {
+                        command_options: rreq.command_options,
+                        route_request_id: rreq.route_request_id,
+                        dst_addr: rreq.dst_addr,
+                        path_cost: new_cost,
+                    });
+            }
+            return;
+        }
+
+        // ── Standard RREQ handling ──
         // If destination is us, or we have a route, we can reply
         let have_route =
             rreq.dst_addr == our_addr || self.routing.next_hop(rreq.dst_addr).is_some();
@@ -781,5 +965,76 @@ impl<M: MacDriver> NwkLayer<M> {
                 break;
             }
         }
+    }
+
+    /// Handle incoming Network Status command (route error notification).
+    fn handle_network_status(&mut self, src: ShortAddress, payload: &[u8]) {
+        let Some(ns) = crate::frames::NetworkStatusCommand::parse(payload) else {
+            log::warn!("[NWK] Malformed NetworkStatus from 0x{:04X}", src.0);
+            return;
+        };
+
+        log::info!(
+            "[NWK] NetworkStatus from 0x{:04X}: code={} dst=0x{:04X}",
+            src.0,
+            ns.status_code,
+            ns.destination.0,
+        );
+
+        // If a route to the failed destination exists, remove it
+        self.routing.remove(ns.destination);
+    }
+}
+
+/// Process a source route relay list to determine the next hop.
+///
+/// The relay list is ordered `[closest-to-dest, ..., closest-to-source]`.
+/// `relay_index` starts at `relay_count - 1` (set by the originator) and is
+/// decremented at each hop. The relay at `relay_list[relay_index]` is the
+/// current node; the next hop is `relay_list[relay_index - 1]`, or
+/// `dst_addr` when `relay_index == 0`.
+///
+/// Returns `(next_hop, new_relay_index)`.
+fn process_source_route(
+    sr: &crate::frames::SourceRoute,
+    our_addr: ShortAddress,
+    dst_addr: ShortAddress,
+) -> Result<(ShortAddress, u8), NwkStatus> {
+    let idx = sr.relay_index as usize;
+
+    // Validate that relay_index is within bounds
+    if idx >= sr.relay_list.len() {
+        log::warn!(
+            "[NWK] Source route relay_index {} out of bounds (len={})",
+            idx,
+            sr.relay_list.len(),
+        );
+        return Err(NwkStatus::InvalidParameter);
+    }
+
+    // Verify we are the expected relay at this index
+    if sr.relay_list[idx] != our_addr {
+        // Try to find ourselves elsewhere in the list
+        if let Some(found_idx) = sr.relay_list.iter().position(|&a| a == our_addr) {
+            // Use the found position instead
+            if found_idx == 0 {
+                return Ok((dst_addr, 0));
+            }
+            return Ok((sr.relay_list[found_idx - 1], (found_idx - 1) as u8));
+        }
+
+        log::warn!(
+            "[NWK] Our addr 0x{:04X} not found in source route relay list",
+            our_addr.0,
+        );
+        return Err(NwkStatus::InvalidParameter);
+    }
+
+    if idx == 0 {
+        // We are the last relay — forward directly to destination
+        Ok((dst_addr, 0))
+    } else {
+        // Forward to the next relay (one step closer to destination)
+        Ok((sr.relay_list[idx - 1], (idx - 1) as u8))
     }
 }

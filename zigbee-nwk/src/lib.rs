@@ -115,6 +115,17 @@ pub struct PendingRreqRebroadcast {
     pub path_cost: u8,
 }
 
+/// A deferred Network Status (route error) to be sent asynchronously.
+#[derive(Debug, Clone)]
+pub struct PendingNetworkStatus {
+    /// Address to send the status toward (NWK source of the failed frame)
+    pub destination: ShortAddress,
+    /// Status code (e.g., 0x00 = no route available)
+    pub status_code: u8,
+    /// The unreachable destination that triggered the error
+    pub failed_destination: ShortAddress,
+}
+
 /// // Discover networks
 /// let networks = nwk.nlme_network_discovery(ChannelMask::ALL_2_4GHZ, 3).await?;
 ///
@@ -138,12 +149,24 @@ pub struct NwkLayer<M: MacDriver> {
     pending_route_replies: heapless::Vec<PendingRouteReply, 4>,
     /// Pending RREQ rebroadcasts (queued from sync handler, sent async).
     pending_rreq_rebroadcasts: heapless::Vec<PendingRreqRebroadcast, 4>,
+    /// Pending Network Status (route error) notifications.
+    pending_route_errors: heapless::Vec<PendingNetworkStatus, 4>,
     /// Indirect frame queue for sleeping end device children.
     indirect: indirect::IndirectQueue,
     /// Link status periodic timer counter (seconds).
     link_status_counter: u16,
     /// Flag: link status should be sent in next async context.
     link_status_due: bool,
+    /// Whether this device is operating as a concentrator (many-to-one).
+    concentrator_active: bool,
+    /// Concentrator RREQ interval counter (seconds).
+    concentrator_counter: u16,
+    /// Concentrator RREQ interval (seconds, default 60).
+    concentrator_interval: u16,
+    /// Flag: concentrator RREQ should be sent in next async context.
+    concentrator_rreq_due: bool,
+    /// Counter for stochastic child address assignment.
+    next_child_addr_offset: u16,
 }
 
 impl<M: MacDriver> NwkLayer<M> {
@@ -163,9 +186,15 @@ impl<M: MacDriver> NwkLayer<M> {
             rx_on_when_idle,
             pending_route_replies: heapless::Vec::new(),
             pending_rreq_rebroadcasts: heapless::Vec::new(),
+            pending_route_errors: heapless::Vec::new(),
             indirect: indirect::IndirectQueue::new(),
             link_status_counter: 0,
             link_status_due: false,
+            concentrator_active: false,
+            concentrator_counter: 0,
+            concentrator_interval: 60,
+            concentrator_rreq_due: false,
+            next_child_addr_offset: 1,
         }
     }
 
@@ -271,7 +300,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Periodic router maintenance — call every second from the runtime tick.
     ///
     /// Ages BTR and indirect queues, triggers periodic link status broadcasts,
-    /// and expires stale routing entries.
+    /// expires stale routing entries, and schedules concentrator RREQs.
     pub fn tick_router_maintenance(&mut self, elapsed_secs: u16) {
         // Age BTR entries
         for _ in 0..elapsed_secs {
@@ -290,6 +319,15 @@ impl<M: MacDriver> NwkLayer<M> {
                 self.link_status_due = true;
             }
         }
+
+        // Periodic many-to-one RREQ for concentrators
+        if self.concentrator_active && self.joined {
+            self.concentrator_counter = self.concentrator_counter.saturating_add(elapsed_secs);
+            if self.concentrator_counter >= self.concentrator_interval {
+                self.concentrator_counter = 0;
+                self.concentrator_rreq_due = true;
+            }
+        }
     }
 
     /// Whether a link status broadcast is due (set by tick, cleared after send).
@@ -305,5 +343,116 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Read-only access to the indirect frame queue.
     pub fn indirect_queue(&self) -> &indirect::IndirectQueue {
         &self.indirect
+    }
+
+    /// Enable concentrator mode (periodic many-to-one RREQ broadcasts).
+    ///
+    /// Only valid for coordinators and routers. The interval is in seconds
+    /// (default 60s per Zigbee spec recommendation).
+    pub fn start_concentrator(&mut self, interval_secs: u16) {
+        if self.device_type == DeviceType::EndDevice {
+            log::warn!("[NWK] Cannot start concentrator on end device");
+            return;
+        }
+        self.concentrator_active = true;
+        self.concentrator_interval = interval_secs;
+        self.concentrator_counter = interval_secs; // Trigger immediately on first tick
+        log::info!(
+            "[NWK] Concentrator mode enabled (interval={}s)",
+            interval_secs
+        );
+    }
+
+    /// Disable concentrator mode.
+    pub fn stop_concentrator(&mut self) {
+        self.concentrator_active = false;
+        self.concentrator_rreq_due = false;
+        log::info!("[NWK] Concentrator mode disabled");
+    }
+
+    /// Whether this device is operating as a concentrator.
+    pub fn is_concentrator(&self) -> bool {
+        self.concentrator_active
+    }
+
+    /// Assign a short address to a new child device using stochastic addressing.
+    ///
+    /// Generates a pseudo-random address based on the child's IEEE address
+    /// and a monotonic counter to avoid collisions.
+    pub fn assign_child_address(&mut self, child_ieee: &IeeeAddress) -> ShortAddress {
+        // Stochastic addressing: hash IEEE address + offset counter
+        let mut hash: u16 = 0;
+        for &b in child_ieee.iter() {
+            hash = hash.wrapping_mul(31).wrapping_add(b as u16);
+        }
+        hash = hash.wrapping_add(self.next_child_addr_offset);
+        self.next_child_addr_offset = self.next_child_addr_offset.wrapping_add(1);
+
+        // Ensure address is valid (not broadcast, not unassigned, not coordinator)
+        let addr = match hash {
+            0x0000 | 0xFFFC..=0xFFFF => hash.wrapping_add(0x0100),
+            other => other,
+        };
+        ShortAddress(addr)
+    }
+
+    /// Handle a child association request (called by the runtime when MAC
+    /// delivers an association indication from a joining device).
+    ///
+    /// Returns the assigned short address on success.
+    pub fn handle_child_association(
+        &mut self,
+        child_ieee: IeeeAddress,
+        capability_info: u8,
+    ) -> Result<ShortAddress, NwkStatus> {
+        if !self.joined {
+            return Err(NwkStatus::InvalidRequest);
+        }
+        if self.device_type == DeviceType::EndDevice {
+            return Err(NwkStatus::InvalidRequest);
+        }
+        if !self.nib.permit_joining {
+            return Err(NwkStatus::NotPermitted);
+        }
+
+        // Determine child type from capability info
+        let is_ffd = capability_info & 0x02 != 0;
+        let rx_on = capability_info & 0x08 != 0;
+        let dev_type = if is_ffd {
+            neighbor::NeighborDeviceType::Router
+        } else {
+            neighbor::NeighborDeviceType::EndDevice
+        };
+
+        let assigned_addr = self.assign_child_address(&child_ieee);
+
+        // Add to neighbor table as child
+        let entry = neighbor::NeighborEntry {
+            ieee_address: child_ieee,
+            network_address: assigned_addr,
+            device_type: dev_type,
+            rx_on_when_idle: rx_on,
+            relationship: neighbor::Relationship::Child,
+            lqi: 0xFF,
+            outgoing_cost: 1,
+            depth: self.nib.depth + 1,
+            permit_joining: false,
+            age: 0,
+            extended_pan_id: self.nib.extended_pan_id,
+            active: true,
+        };
+
+        self.neighbors
+            .add_or_update(entry)
+            .map_err(|_| NwkStatus::NeighborTableFull)?;
+
+        log::info!(
+            "[NWK] Child associated: IEEE={:02X?} → addr=0x{:04X} type={:?}",
+            &child_ieee[..4],
+            assigned_addr.0,
+            dev_type,
+        );
+
+        Ok(assigned_addr)
     }
 }

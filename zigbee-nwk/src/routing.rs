@@ -268,6 +268,87 @@ impl RoutingTable {
         self.len() == 0
     }
 
+    /// Look up a route entry for a destination (read-only).
+    pub fn get_entry(&self, destination: ShortAddress) -> Option<&RouteEntry> {
+        self.routes
+            .iter()
+            .find(|r| r.active && r.destination == destination && r.status == RouteStatus::Active)
+    }
+
+    /// Add or update a route to a many-to-one concentrator.
+    #[allow(clippy::result_unit_err)]
+    pub fn update_route_many_to_one(
+        &mut self,
+        destination: ShortAddress,
+        next_hop: ShortAddress,
+        cost: u8,
+    ) -> Result<(), ()> {
+        // Update existing entry
+        if let Some(entry) = self
+            .routes
+            .iter_mut()
+            .find(|r| r.active && r.destination == destination)
+        {
+            entry.next_hop = next_hop;
+            entry.path_cost = cost;
+            entry.status = RouteStatus::Active;
+            entry.many_to_one = true;
+            entry.route_record_required = true;
+            entry.age = 0;
+            return Ok(());
+        }
+
+        // Find empty slot
+        if let Some(slot) = self.routes.iter_mut().find(|r| !r.active) {
+            *slot = RouteEntry {
+                destination,
+                next_hop,
+                status: RouteStatus::Active,
+                many_to_one: true,
+                route_record_required: true,
+                group_id: false,
+                path_cost: cost,
+                age: 0,
+                active: true,
+            };
+            Ok(())
+        } else {
+            // Evict oldest inactive
+            if let Some(victim) = self
+                .routes
+                .iter_mut()
+                .filter(|r| r.active && r.status != RouteStatus::Active)
+                .max_by_key(|r| r.age)
+            {
+                *victim = RouteEntry {
+                    destination,
+                    next_hop,
+                    status: RouteStatus::Active,
+                    many_to_one: true,
+                    route_record_required: true,
+                    group_id: false,
+                    path_cost: cost,
+                    age: 0,
+                    active: true,
+                };
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+
+    /// Clear the route_record_required flag for a destination.
+    pub fn clear_route_record_required(&mut self, destination: ShortAddress) {
+        if let Some(entry) = self
+            .routes
+            .iter_mut()
+            .find(|r| r.active && r.destination == destination)
+        {
+            entry.route_record_required = false;
+        }
+    }
+
     /// Iterate over active route entries.
     pub fn iter(&self) -> impl Iterator<Item = &RouteEntry> {
         self.routes.iter().filter(|r| r.active)
