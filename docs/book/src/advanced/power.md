@@ -160,6 +160,8 @@ actual sleep/wake is performed by the MAC backend:
 | nRF52840 | `TASKS_DISABLE` + `__WFE` (System ON, RAM retained) | System OFF (wake via GPIO/RTC) |
 | TLSR8258 | `radio_sleep()` + WFI (~1.5 mA) | CPU suspend (~3 µA, timer wake, RAM retained) |
 | PHY6222 | `radio_sleep()` + WFE (~1.5 mA) | AON system sleep (~3 µA, RTC wake) |
+| EFR32MG1 | `radio_sleep()` — radio clock gating via CMU | — |
+| EFR32MG21 | `radio_sleep()` — radio clock gating via CMU | — |
 | BL702 | PDS (Power Down Sleep) | HBN (Hibernate) — wake via RTC |
 
 The runtime event loop integrates the power manager like this (simplified):
@@ -380,6 +382,39 @@ The `phy6222-hal::sleep` module provides the full AON domain API:
 | `was_sleep_reset()` | Check if current boot was a wake from system sleep |
 | `clear_sleep_flag()` | Clear the sleep-wake flag after detection |
 | `ms_to_rtc_ticks(ms)` | Convert milliseconds to 32 kHz RC ticks |
+
+---
+
+### EFR32MG1 / EFR32MG21
+
+Both EFR32 platforms use the **CMU (Clock Management Unit)** to gate the radio
+peripheral clock, providing radio sleep between polls.
+
+**Radio clock gating** — The MAC driver's `radio_sleep()` method disables the
+radio peripheral clock via the CMU, stopping all radio activity and saving
+the radio idle current (~5–8 mA). On wake, `radio_wake()` re-enables the
+clock and re-applies the channel setting:
+
+```rust
+device.mac_mut().radio_sleep();   // CMU clock gate — radio off
+Timer::after(Duration::from_millis(poll_ms)).await;
+device.mac_mut().radio_wake();    // CMU clock enable, re-apply channel
+```
+
+**Series 1 vs Series 2 CMU differences:**
+
+| Feature | EFR32MG1P (Series 1) | EFR32MG21 (Series 2) |
+|---------|---------------------|---------------------|
+| CMU base | `0x400E4000` | `0x40008000` |
+| Clock enable register | `HFPERCLKEN0` | `CLKEN0` |
+| Radio blocks gated | RAC, FRC, MODEM, SYNTH, AGC, BUFC | RAC, FRC, MODEM, SYNTH, AGC, BUFC |
+
+Both platforms implement the same `radio_sleep()` / `radio_wake()` interface
+despite the different register layouts — the CMU abstraction is handled inside
+each platform's MAC driver (`efr32/` for Series 1, `efr32s2/` for Series 2).
+
+> **Note:** Full deep sleep (EM2/EM3/EM4 energy modes) is not yet implemented.
+> Currently only radio clock gating is used for power reduction between polls.
 
 ---
 

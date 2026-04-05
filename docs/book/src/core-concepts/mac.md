@@ -146,6 +146,8 @@ backend is behind a Cargo feature flag:
 | **CC2340** | `cc2340` | CC2340R5 | TI SimpleLink, Cortex-M0+ with 802.15.4 |
 | **Telink** | `telink` | B91 (TLSR9518), TLSR8258 | Telink 802.15.4 radios — TLSR8258 is pure Rust (direct register access), B91 uses FFI |
 | **PHY6222** | `phy6222` | PHY6222 | Phyplus BLE+802.15.4 combo SoC |
+| **EFR32MG1** | `efr32` | EFR32MG1P | Silicon Labs Series 1, Cortex-M4F — pure Rust (direct register access) |
+| **EFR32MG21** | `efr32s2` | EFR32MG21 | Silicon Labs Series 2, Cortex-M33 — pure Rust (direct register access) |
 | **Mock** | `mock` | — | In-memory mock for unit tests and CI |
 
 ### Choosing a Backend
@@ -172,6 +174,10 @@ a one-line Cargo feature change plus updating the MAC initialization code.
   products (IKEA TRÅDFRI, etc.). TLSR8258 has a pure-Rust radio driver (no
   vendor SDK needed); B91 requires Telink SDK.
 - **PHY6222** — Budget BLE+802.15.4 combo, pure-Rust radio driver, suitable for simple sensors.
+- **EFR32MG1** — Silicon Labs Series 1 (Cortex-M4F), used in IKEA TRÅDFRI modules.
+  Pure-Rust radio driver — no GSDK/RAIL required. Great for repurposing existing hardware.
+- **EFR32MG21** — Silicon Labs Series 2 (Cortex-M33), used in Sonoff ZBDongle-E.
+  Pure-Rust radio driver with separate `efr32s2` module (different register map from Series 1).
 - **Mock** — Use for testing your application logic without hardware.
 
 ## The Mock Backend

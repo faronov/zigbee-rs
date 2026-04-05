@@ -5,7 +5,7 @@ A complete Zigbee PRO R22 protocol stack written in Rust, targeting embedded
 Embassy and other embedded async runtimes.
 
 ```text
-58,000+ lines of Rust · 183 source files · 9 crates · 45 ZCL clusters · 11 hardware platforms · 270 tests · 3 pure-Rust radios · NV storage on nRF + ESP32-C6
+63,000+ lines of Rust · 199 source files · 30 crates · 45 ZCL clusters · 12 hardware platforms · 270 tests · 4 pure-Rust radios · NV storage on nRF + ESP32-C6
 ```
 
 ## Architecture
@@ -30,7 +30,7 @@ Embassy and other embedded async runtimes.
 │      frames · routing (AODV+tree) · security · NIB   │
 ├──────────────────────────────────────────────────────┤
 │                    zigbee-mac                          │
-│  MacDriver trait · 11 backends (see table below)     │
+│  MacDriver trait · 12 backends (see table below)     │
 ├──────────────────────────────────────────────────────┤
 │                   zigbee-types                         │
 │     IeeeAddress · ShortAddress · PanId · Channel     │
@@ -160,6 +160,26 @@ cd examples/phy6222-sensor
 cargo build --release   # no stubs, no vendor blobs needed!
 ```
 
+### EFR32MG1 firmware (pure Rust — no vendor SDK!)
+
+```bash
+cd examples/efr32mg1-sensor
+cargo build --release   # no stubs, no GSDK, no RAIL library needed!
+```
+
+> Series 1 Cortex-M4F — direct register access for the radio. Works with
+> IKEA TRÅDFRI modules and Thunderboard Sense boards.
+
+### EFR32MG21 firmware (pure Rust — no vendor SDK!)
+
+```bash
+cd examples/efr32mg21-sensor
+cargo build --release   # no stubs, no GSDK, no RAIL library needed!
+```
+
+> Series 2 Cortex-M33 — independent `efr32s2` MAC module. Works with
+> Sonoff ZBDongle-E and BRD4180A/BRD4181A dev kits.
+
 ### Vendor Libraries
 
 Three backends require vendor radio libraries for **real RF** operation. Without them, use `--features stubs` for CI/development builds.
@@ -219,7 +239,7 @@ cd examples/telink-tlsr8258-sensor && cargo build --release
 
 The TLSR8258 radio driver uses pure-Rust register access — no `libdrivers_8258.a` required.
 
-> **PHY6222** and **nRF52840/52833** and **ESP32-C6/H2** do **not** need any vendor libraries.
+> **PHY6222**, **TLSR8258**, **EFR32MG1**, **EFR32MG21**, and **nRF52840/52833** and **ESP32-C6/H2** do **not** need any vendor libraries.
 
 ## MAC Backends
 
@@ -270,7 +290,7 @@ Occupancy, Electrical, Carbon Dioxide, PM2.5, Soil Moisture
 - **`async` MacDriver trait** — 13 methods, no `Send`/`Sync` requirement
 - **Platform-agnostic** — same stack code runs on mock, ESP32, nRF, BL702, CC2340, Telink, PHY6222, EFR32
 - **Power-aware** — two-phase polling (fast/slow), DC-DC, TX power reduction, radio sleep, CPU suspend, system sleep, flash deep power-down, GPIO preparation, reportable change thresholds
-- **Three pure-Rust radios** — PHY6222, TLSR8258, and EFR32 (MG1 + MG21) need zero vendor blobs
+- **Four pure-Rust radios** — PHY6222, TLSR8258, EFR32MG1, and EFR32MG21 need zero vendor blobs
 - **Router support** — full relay, RREQ rebroadcast, Link Status, indirect queue, source routing
 - **Manual frame parsing** — no `serde`, bitfield encode/decode for all frame types
 - **Embassy-compatible** — designed for single-threaded async executors
@@ -358,6 +378,7 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
 - **CC2340 / Telink B91** backends compile with stub FFI — real RF requires linking vendor SDK libraries (blocked by complex RTOS dependencies)
 - **Telink TLSR8258** pure-Rust driver is fully functional; real tc32 firmware requires the [modern-tc32](https://github.com/modern-tc32) toolchain
 - **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence; temp/humidity sensors are simulated (battery ADC is real); comprehensive power management is implemented (two-tier sleep with AON system sleep ~3 µA, radio sleep/wake, flash deep power-down, GPIO leak prevention)
+- **EFR32MG1 / EFR32MG21** pure-Rust drivers use simplified radio register values — the exact init sequences for 802.15.4 mode need verification against the EFR32xG1/xG21 Reference Manuals or extraction from the RAIL library source
 - **Test coverage** is basic — the mock examples exercise more than the test crate
 - **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal
 - **OTA** — full upgrade flow implemented (OTA cluster + OtaManager + FirmwareWriter trait) but not yet tested on real hardware
