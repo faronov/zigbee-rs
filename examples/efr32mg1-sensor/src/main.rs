@@ -36,6 +36,20 @@ use panic_halt as _;
 #[allow(unused_imports)]
 use vectors::__INTERRUPTS;
 
+// Set VTOR to 0x4000 — required when Gecko Bootloader is present.
+// The bootloader at 0x0 jumps to our app at 0x4000, but cortex-m-rt
+// reset handler may run before VTOR is properly set.
+core::arch::global_asm!(
+    ".section .text.__pre_init",
+    ".global __pre_init",
+    ".thumb_func",
+    "__pre_init:",
+    "ldr r0, =0xE000ED08",  // SCB->VTOR
+    "ldr r1, =0x00004000",  // Our vector table at 0x4000
+    "str r1, [r0]",
+    "bx lr",
+);
+
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant, Timer};
 
