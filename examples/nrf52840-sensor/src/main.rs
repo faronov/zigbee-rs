@@ -173,7 +173,7 @@ async fn main(_spawner: Spawner) {
     let mut config = embassy_nrf::config::Config::default();
     // Use internal RC for HFCLK — radio requests XTAL automatically when needed.
     // Saves ~250µA vs keeping external XTAL always on.
-    config.hfclk_source = embassy_nrf::config::HfclkSource::Internal;
+    config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
     // Enable DC-DC converter for ~40% lower current draw
     config.dcdc = embassy_nrf::config::DcdcConfig {
         reg0: true,
@@ -182,8 +182,9 @@ async fn main(_spawner: Spawner) {
     };
     let p = embassy_nrf::init(config);
 
-    power_down_unused_ram();
-    info!("Zigbee-RS nRF52840 sensor starting…");
+    // RAM power-down disabled temporarily for debugging
+    // power_down_unused_ram();
+    info!("RAM power-down skipped (debugging)");
 
     // LED1 on nRF52840-DK (P0.13, active LOW)
     let mut led = gpio::Output::new(p.P0_13, gpio::Level::High, gpio::OutputDrive::Standard);
@@ -228,8 +229,8 @@ async fn main(_spawner: Spawner) {
     // Radio + MAC
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
     let mut mac = zigbee_mac::nrf::NrfMac::new(radio);
-    mac.set_tx_power(0); // 0 dBm — good range, saves ~50% TX current vs +8 dBm
-    info!("Radio ready (TX power 0 dBm)");
+    mac.set_tx_power(8);
+    info!("Radio ready (TX +8 dBm)");
 
     // ── Flash NV storage (last 2 pages of 1 MB flash) ──
     let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);

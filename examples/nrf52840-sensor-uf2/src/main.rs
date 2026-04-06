@@ -179,7 +179,7 @@ async fn main(_spawner: Spawner) {
 
     // Start HFCLK from external crystal via embassy config — REQUIRED for 802.15.4 radio.
     let mut config = embassy_nrf::config::Config::default();
-    config.hfclk_source = embassy_nrf::config::HfclkSource::Internal;
+    config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
     config.dcdc = embassy_nrf::config::DcdcConfig {
         reg0: true,
         reg0_voltage: None,
@@ -340,8 +340,10 @@ async fn main(_spawner: Spawner) {
             was_fast_polling = true;
         }
 
-        // ── Step 1: Sleep with radio off until next poll ──
-        device.mac_mut().radio_sleep();
+        // ── Step 1: Sleep with radio off until next poll (only when joined) ──
+        if device.is_joined() {
+            device.mac_mut().radio_sleep();
+        }
         if let Some(ref mut btn) = button {
             match select(
                 btn.wait_for_falling_edge(),
@@ -388,7 +390,9 @@ async fn main(_spawner: Spawner) {
             // No button — just sleep
             Timer::after(Duration::from_millis(poll_ms)).await;
         }
-        device.mac_mut().radio_wake();
+        if device.is_joined() {
+            device.mac_mut().radio_wake();
+        }
 
         // ── Step 2: Poll parent for indirect frames (SED core) ──
         if device.is_joined() {

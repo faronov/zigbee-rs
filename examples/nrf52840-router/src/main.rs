@@ -65,7 +65,7 @@ async fn main(_spawner: Spawner) {
     log::set_max_level(log::LevelFilter::Info);
 
     let mut config = embassy_nrf::config::Config::default();
-    config.hfclk_source = embassy_nrf::config::HfclkSource::Internal;
+    config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
     // DC-DC enabled for lower power
     config.dcdc.reg0 = true;
     config.dcdc.reg1 = true;
