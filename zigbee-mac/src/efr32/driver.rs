@@ -327,6 +327,7 @@ impl Efr32Driver {
     /// Full radio initialization: clocks → RAC → FRC → MODEM → SYNTH → AGC.
     fn init_hardware(&mut self) {
         self.enable_clocks();
+        self.load_rac_sequences();
         self.configure_rac();
         self.configure_frc();
         self.configure_modem();
@@ -336,6 +337,26 @@ impl Efr32Driver {
 
         self.initialized = true;
         log::info!("efr32: radio initialized in IEEE 802.15.4 mode");
+    }
+
+    /// Load RAC sequencer microcode into RAM.
+    ///
+    /// The RAC radio sequencer runs a custom instruction set from RAM.
+    /// This blob was dumped from a working RAIL firmware and contains
+    /// the TX/RX state machine programs.
+    fn load_rac_sequences(&self) {
+        let seq_data = &super::rac_seq::RAC_SEQ_DATA;
+        let dst_base = 0x2100_0000u32;
+        for (i, &word) in seq_data.iter().enumerate() {
+            let addr = dst_base + (i as u32) * 4;
+            reg_write(addr, word);
+        }
+
+        // Set RAC sequence pointers (same values as RAIL uses)
+        reg_write(RAC_BASE + 0x58, 0x21000F88); // Sequence pointer A
+        reg_write(RAC_BASE + 0x64, 0x2100085E); // Sequence pointer B
+
+        log::info!("efr32: loaded {} words of RAC sequence data", seq_data.len());
     }
 
     /// Enable peripheral clocks for all radio blocks via CMU.

@@ -15,6 +15,7 @@
 //! use on real hardware.
 
 pub mod driver;
+mod rac_seq;
 
 use crate::pib::{PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
