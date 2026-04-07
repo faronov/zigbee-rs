@@ -141,18 +141,24 @@ const RAC_SEQCMD_RESUME: u32 = 1 << 2;
 // ── RAC Commands ────────────────────────────────────────────────
 
 const RAC_CMD_TXEN: u32 = 1 << 0;
-const RAC_CMD_RXEN: u32 = 1 << 1;
-const RAC_CMD_TXDIS: u32 = 1 << 2;
-const RAC_CMD_RXDIS: u32 = 1 << 3;
+const _RAC_CMD_FORCETX: u32 = 1 << 1;
+const _RAC_CMD_TXONCCA: u32 = 1 << 2;
+const _RAC_CMD_CLEARTXEN: u32 = 1 << 3;
+const _RAC_CMD_TXAFTERFRAME: u32 = 1 << 4;
+const RAC_CMD_TXDIS: u32 = 1 << 5;       // was 1<<2!
 const _RAC_CMD_CLEARRXOVERFLOW: u32 = 1 << 6;
+const _RAC_CMD_RXCAL: u32 = 1 << 7;
+const RAC_CMD_RXDIS: u32 = 1 << 8;       // was 1<<3!
+// Note: NO RXEN in RAC_CMD — RX is started via RAC_RXENSRCEN register
 
 // ── RAC Status Bits ─────────────────────────────────────────────
 
-const RAC_STATUS_STATE_MASK: u32 = 0x0F;
+const RAC_STATUS_STATE_SHIFT: u32 = 24;
+const RAC_STATUS_STATE_MASK: u32 = 0x0F << RAC_STATUS_STATE_SHIFT;
 const _RAC_STATE_OFF: u32 = 0x00;
 const _RAC_STATE_IDLE: u32 = 0x01;
-const RAC_STATE_RX: u32 = 0x02;
-const _RAC_STATE_TX: u32 = 0x03;
+const RAC_STATE_RX: u32 = 0x02 << RAC_STATUS_STATE_SHIFT;
+const _RAC_STATE_TX: u32 = 0x03 << RAC_STATUS_STATE_SHIFT;
 
 // ── Sequencer RAM Variables (from VDowbensky/efr32_baremetal) ───
 //
@@ -185,11 +191,11 @@ const SEQ_SYNTHLPFCTRLRX: u32 = 0x2100_0FF8;
 /// SYNTH LPF control TX (SEQ->SYNTHLPFCTRLTX at 0xFFC)
 const SEQ_SYNTHLPFCTRLTX: u32 = 0x2100_0FFC;
 
-// ── RAC IRQ Bits ────────────────────────────────────────────────
-
-const RAC_IF_TXDONE: u32 = 1 << 0;
-const RAC_IF_RXDONE: u32 = 1 << 1;
-const RAC_IF_RXOF: u32 = 1 << 2;
+// ── RAC IRQ Bits (from GSDK RAC_field.py) ────────────────────
+// NOTE: RAC_IF does NOT have TXDONE/RXDONE — those are FRC_IF only.
+const _RAC_IF_STATECHANGE: u32 = 1 << 0;
+const _RAC_IF_STIMCMPEV: u32 = 1 << 1;
+const _RAC_IF_BUSERROR: u32 = 1 << 2;
 
 // ── FRC Register Offsets (from CMSIS TypeDef at 0x40080000) ─────
 
@@ -641,7 +647,7 @@ impl Efr32Driver {
 
         // Wait for radio to reach idle/off state
         for _ in 0..10_000u32 {
-            let state = reg_read(RAC_STATUS) & RAC_STATUS_STATE_MASK;
+            let state = (reg_read(RAC_STATUS) >> RAC_STATUS_STATE_SHIFT) & 0x0F;
             if state <= 1 {
                 break;
             }
@@ -970,15 +976,9 @@ impl Efr32Driver {
         static TX_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         TX_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-        // Ensure radio is idle before TX
-        reg_write(RAC_CMD, RAC_CMD_RXDIS);
-        for _ in 0..1_000u32 {
-            let state = reg_read(RAC_STATUS) & RAC_STATUS_STATE_MASK;
-            if state != RAC_STATE_RX {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        // NOTE: Do NOT send RXDIS before TXEN — the baremetal reference
+        // writes TXEN directly while RX is active. The sequencer handles
+        // the RX→TX transition internally.
 
         // Clear TX buffer (BUF0_CMD bit 0 = CLEAR)
         reg_write(BUFC_BUF0_CMD, 1);
@@ -995,9 +995,8 @@ impl Efr32Driver {
         let total_bytes = 1 + frame.len(); // 1 for PHR + payload
         reg_write(FRC_WCNTCMP0, (total_bytes - 1) as u32);
 
-        // Clear pending FRC and RAC TX-done flags before starting
-        reg_write(FRC_IFC, FRC_IF_TXDONE);
-        reg_write(RAC_IFC, RAC_IF_TXDONE);
+        // Clear pending FRC TX-done flags before starting
+        reg_write(FRC_IFC, 0xFFFF_FFFF);
 
         // Critical sequencer steps (from baremetal reference):
         // 1. Clear "radio disabled" flag in sequencer control
@@ -1010,11 +1009,13 @@ impl Efr32Driver {
         // Start TX via RAC — the sequencer handles SYNTH cal, PA, FRC
         reg_write(RAC_CMD, RAC_CMD_TXEN);
 
-        // Debug: capture RAC STATUS and FRC IF right after TXEN
-        static TX_RAC_STATUS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        static TX_FRC_IF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        TX_RAC_STATUS.store(reg_read(RAC_STATUS), core::sync::atomic::Ordering::Relaxed);
-        TX_FRC_IF.store(reg_read(FRC_IF), core::sync::atomic::Ordering::Relaxed);
+        // Debug: log RAC state + FRC_IF after a short delay
+        for _ in 0..1_000u32 { core::hint::spin_loop(); }
+        let rac_st = reg_read(RAC_STATUS);
+        let frc_if = reg_read(FRC_IF);
+        let seq_st = reg_read(RAC_SEQSTATUS);
+        rtt_target::rprintln!("  RAC={:#010X} FRC_IF={:#X} SEQ={:#X} FREQ={:#X}",
+            rac_st, frc_if, seq_st, reg_read(SYNTH_FREQ));
 
         log::trace!(
             "efr32: tx {} bytes on ch{}",
@@ -1046,7 +1047,7 @@ impl Efr32Driver {
     ///
     /// RX flow (from working baremetal code):
     ///   1. Clear BUFC buffer 1 (RX) and buffer 2 (RX length)
-    ///   2. RAC_CMD = RAC_CMD_RXEN → sequencer starts RX
+    ///   2. RXENSRCEN = 0x02 → software RX enable
     ///   3. FRC captures frame, checks CRC
     ///   4. Data appears in BUF1, length in BUF1_STATUS
     ///   5. FRC_IF_RXDONE (bit 4) signals completion
@@ -1063,7 +1064,7 @@ impl Efr32Driver {
 
         // Clear pending FRC and RAC RX flags
         reg_write(FRC_IFC, FRC_IF_RXDONE | FRC_IF_RXOF | FRC_IF_FRAMEERROR);
-        reg_write(RAC_IFC, RAC_IF_RXDONE | RAC_IF_RXOF);
+        reg_write(RAC_IFC, 0xFFFF_FFFF);
 
         // Clear sequencer disable flag and set band select (same as TX)
         let seq_ctrl = reg_read(SEQ_CONTROL_REG);
@@ -1130,7 +1131,8 @@ impl Efr32Driver {
         }
 
         // Enable RX briefly for RSSI measurement
-        reg_write(RAC_CMD, RAC_CMD_RXEN);
+        // Start RX via RXENSRCEN (RAC_CMD has no RXEN bit)
+        reg_write(_RAC_RXENSRCEN, 0x02);
 
         // Wait 128µs (8 symbol periods at 62.5 ksym/s) for RSSI to settle
         embassy_time::Timer::after_micros(128).await;
@@ -1156,15 +1158,16 @@ impl Efr32Driver {
         reg_write(BUFC_BUF1_CMD, 1);
         reg_write(_BUFC_BUF2_CMD, 1);
         reg_write(FRC_IFC, FRC_IF_RXDONE | FRC_IF_RXOF | FRC_IF_FRAMEERROR);
-        reg_write(RAC_IFC, RAC_IF_RXDONE | RAC_IF_RXOF);
-        reg_write(RAC_CMD, RAC_CMD_RXEN);
+        reg_write(RAC_IFC, 0xFFFF_FFFF);
+        // Start RX via RXENSRCEN (RAC_CMD has no RXEN bit)
+        reg_write(_RAC_RXENSRCEN, 0x02);
     }
 
     /// Disable the receiver.
     pub fn disable_rx(&self) {
         reg_write(RAC_CMD, RAC_CMD_RXDIS);
         reg_write(FRC_IFC, FRC_IF_RXDONE | FRC_IF_RXOF | FRC_IF_FRAMEERROR);
-        reg_write(RAC_IFC, RAC_IF_RXDONE | RAC_IF_RXOF);
+        reg_write(RAC_IFC, 0xFFFF_FFFF);
     }
 
     /// Power down the radio to save power between TX/RX cycles.
@@ -1173,7 +1176,7 @@ impl Efr32Driver {
     /// Call `radio_wake()` before the next TX or RX operation.
     pub fn radio_sleep(&self) {
         reg_write(RAC_CMD, RAC_CMD_TXDIS | RAC_CMD_RXDIS);
-        reg_write(RAC_IFC, RAC_IF_TXDONE | RAC_IF_RXDONE | RAC_IF_RXOF);
+        reg_write(RAC_IFC, 0xFFFF_FFFF);
         // Disable all radio peripheral clocks via RADIOCLKEN0
         reg_write(CMU_RADIOCLKEN0, 0);
     }
@@ -1206,13 +1209,13 @@ pub extern "C" fn FRC_PRI() {
     reg_write(FRC_IFC, frc_flags);
 
     // TX completion (FRC_IF_TXDONE = bit 0)
-    if frc_flags & FRC_IF_TXDONE != 0 || rac_flags & RAC_IF_TXDONE != 0 {
+    if frc_flags & FRC_IF_TXDONE != 0 {
         TX_DONE.signal(true);
     }
 
     // RX completion (FRC_IF_RXDONE = bit 4)
     let frc_rx_done = frc_flags & FRC_IF_RXDONE != 0;
-    let rac_rx_done = rac_flags & RAC_IF_RXDONE != 0;
+    let rac_rx_done = false; // RAC has no RXDONE flag
 
     if frc_rx_done || rac_rx_done {
         // FRC_IF_RXDONE signals good CRC
@@ -1246,7 +1249,7 @@ pub extern "C" fn FRC_PRI() {
     }
 
     // RX overflow (FRC_IF_RXOF = bit 8) or frame error (bit 6)
-    if frc_flags & (FRC_IF_RXOF | FRC_IF_FRAMEERROR) != 0 || rac_flags & RAC_IF_RXOF != 0 {
+    if frc_flags & (FRC_IF_RXOF | FRC_IF_FRAMEERROR) != 0 {
         RX_CRC_OK.store(false, Ordering::Release);
         RX_LEN.store(0, Ordering::Release);
         RX_DONE.signal(());

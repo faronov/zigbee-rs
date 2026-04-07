@@ -280,6 +280,7 @@ impl MacDriver for Efr32Mac {
 
             match req.scan_type {
                 ScanType::Ed => {
+                    rtt_target::rprintln!("scan ED ch{}", ch);
                     let (rssi, _busy) = self.driver.energy_detect().map_err(Self::map_radio_err)?;
                     let ed = ((rssi as i16 + 100).clamp(0, 255)) as u8;
                     let _ = energy_list.push(EdValue {
@@ -288,9 +289,11 @@ impl MacDriver for Efr32Mac {
                     });
                 }
                 ScanType::Active => {
+                    rtt_target::rprintln!("scan TX ch{}", ch);
                     let seq = self.next_bsn();
                     let beacon_req = build_beacon_request(seq);
-                    let _ = self.driver.transmit(&beacon_req).await;
+                    let tx_result = self.driver.transmit(&beacon_req).await;
+                    rtt_target::rprintln!("  tx={}", if tx_result.is_ok() { "ok" } else { "FAIL" });
 
                     let deadline = embassy_time::Instant::now()
                         + embassy_time::Duration::from_millis(scan_duration_ms);

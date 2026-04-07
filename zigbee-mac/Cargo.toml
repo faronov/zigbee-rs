@@ -34,6 +34,7 @@ embassy-nrf52833 = { package = "embassy-nrf", version = "0.3", features = ["nrf5
 embassy-sync = { version = "0.7", optional = true }
 embassy-time = { version = "0.4", optional = true }
 embassy-futures = { version = "0.1", optional = true }
+rtt-target = { version = "0.6", optional = true }
 
 # ── Logging ─────────────────────────────────────────────────
 log = "0.4"
@@ -48,44 +49,44 @@ esp32c6 = [
     "alloc",
     "dep:esp-radio", "dep:esp-hal", "dep:esp-alloc", "dep:esp-sync",
     "esp-radio/esp32c6", "esp-hal/esp32c6", "esp-alloc/esp32c6", "esp-sync/esp32c6",
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 esp32h2 = [
     "alloc",
     "dep:esp-radio", "dep:esp-hal", "dep:esp-alloc", "dep:esp-sync",
     "esp-radio/esp32h2", "esp-hal/esp32h2", "esp-alloc/esp32h2", "esp-sync/esp32h2",
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 nrf52840 = [
     "dep:embassy-nrf52840",
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 nrf52833 = [
     "dep:embassy-nrf52833",
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 
 bl702 = [
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 
 cc2340 = [
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 
 telink = [
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 
 phy6222 = [
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 
 efr32 = [
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 
 efr32mg21 = [
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 
