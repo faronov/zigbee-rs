@@ -261,8 +261,8 @@ const BUFC_BUF1_CMD: u32 = BUFC_BASE + 0x058;
 const _BUFC_BUF2_CMD: u32 = BUFC_BASE + 0x088;
 
 // BUFC interrupt registers
-const _BUFC_IF: u32 = BUFC_BASE + 0x0E0;
-const _BUFC_IFC: u32 = BUFC_BASE + 0x0E8;
+const BUFC_IF: u32 = BUFC_BASE + 0x0E0;
+const BUFC_IFC: u32 = BUFC_BASE + 0x0E8;
 
 /// BUFC buffer size code: 2 = 256 bytes.
 const BUFC_BUFSIZE_256: u32 = 2;
@@ -1028,6 +1028,35 @@ pub extern "C" fn FRC_PRI() {
         RX_LEN.store(0, Ordering::Release);
         RX_DONE.signal(());
     }
+}
+
+// ── Additional IRQ Handlers ─────────────────────────────────────
+
+/// Regular FRC interrupt handler (IRQ 3) — same logic as FRC_PRI.
+#[unsafe(no_mangle)]
+pub extern "C" fn FRC() {
+    FRC_PRI();
+}
+
+/// RAC sequencer interrupt handler (IRQ 5).
+#[unsafe(no_mangle)]
+pub extern "C" fn RAC_SEQ() {
+    let flags = reg_read(RAC_IF);
+    reg_write(RAC_IFC, flags);
+}
+
+/// RAC state machine interrupt handler (IRQ 6).
+#[unsafe(no_mangle)]
+pub extern "C" fn RAC_RSM() {
+    let flags = reg_read(RAC_IF);
+    reg_write(RAC_IFC, flags);
+}
+
+/// BUFC interrupt handler (IRQ 7).
+#[unsafe(no_mangle)]
+pub extern "C" fn BUFC() {
+    let flags = reg_read(BUFC_IF);
+    reg_write(BUFC_IFC, flags);
 }
 
 // ── Utility ─────────────────────────────────────────────────────

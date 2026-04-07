@@ -36,6 +36,32 @@ use panic_halt as _;
 #[allow(unused_imports)]
 use vectors::__INTERRUPTS;
 
+// Custom HardFault handler that saves faulting PC to known RAM location
+// so we can read it via J-Link after the crash.
+#[cortex_m_rt::exception]
+unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
+    // Save exception frame and stack info for post-mortem analysis
+    // 0x20000000 = magic marker  
+    // 0x20000004 = faulting PC
+    // 0x20000008 = LR at fault
+    // 0x2000000C = xPSR
+    // 0x20000010 = MSP (current stack pointer)
+    // 0x20000014 = R0 from exception frame
+    // 0x20000018 = R12 from exception frame
+    unsafe {
+        let msp: u32;
+        core::arch::asm!("mrs {}, msp", out(reg) msp);
+        core::ptr::write_volatile(0x20000000 as *mut u32, 0xDEAD_BEEF);
+        core::ptr::write_volatile(0x20000004 as *mut u32, ef.pc() as u32);
+        core::ptr::write_volatile(0x20000008 as *mut u32, ef.lr() as u32);
+        core::ptr::write_volatile(0x2000000C as *mut u32, ef.xpsr() as u32);
+        core::ptr::write_volatile(0x20000010 as *mut u32, msp);
+        core::ptr::write_volatile(0x20000014 as *mut u32, ef.r0() as u32);
+        core::ptr::write_volatile(0x20000018 as *mut u32, ef.r12() as u32);
+    }
+    loop { cortex_m::asm::nop(); }
+}
+
 // Set VTOR to 0x4000 — required when Gecko Bootloader is present.
 // The bootloader at 0x0 jumps to our app at 0x4000, but cortex-m-rt
 // reset handler may run before VTOR is properly set.
@@ -115,7 +141,16 @@ async fn main(_spawner: Spawner) {
 
     // Unmask radio IRQ (FRC_PRI = IRQ 1)
     unsafe {
+        // Enable radio NVIC interrupts:
+        // - FrcPri (IRQ 1): high-priority FRC events (TX/RX done)
+        // - Frc (IRQ 3): regular FRC events 
+        // - Bufc (IRQ 7): buffer controller events
+        // NOTE: RAC_SEQ (IRQ 5) and RAC_RSM (IRQ 6) are NOT enabled —
+        // they fire continuously and starve the main executor loop.
+        // TX/RX completion is signaled via FRC interrupts instead.
         cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::FrcPri);
+        cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::Frc);
+        cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::Bufc);
     }
 
     log::info!("[EFR32] Zigbee Sensor starting (pure Rust!)");
