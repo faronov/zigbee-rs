@@ -8,7 +8,7 @@
 #[cfg(feature = "router")]
 const MAX_ENTRIES: usize = 4;
 #[cfg(not(feature = "router"))]
-const MAX_ENTRIES: usize = 1;
+const MAX_ENTRIES: usize = 0;
 
 /// A single fragment reassembly slot.
 struct ReassemblyEntry {
@@ -78,7 +78,7 @@ impl FragmentReassembly {
     #[cfg(not(feature = "router"))]
     pub const fn new() -> Self {
         Self {
-            entries: [ReassemblyEntry::empty()],
+            entries: [],
         }
     }
 
@@ -97,6 +97,10 @@ impl FragmentReassembly {
         total_blocks: u8,
         payload: &[u8],
     ) -> Option<&[u8]> {
+        if self.entries.is_empty() {
+            return None;
+        }
+
         if block_num == 0 && total_blocks > 0 {
             // First fragment — allocate or reuse a slot
             let idx = self.find_or_alloc(src_addr, aps_counter);
@@ -157,6 +161,9 @@ impl FragmentReassembly {
     }
 
     /// Find an existing entry or allocate an inactive slot. Returns index.
+    ///
+    /// # Panics
+    /// Panics if `self.entries` is empty (caller must check).
     fn find_or_alloc(&mut self, src_addr: u16, aps_counter: u8) -> usize {
         // Reuse existing entry for the same source
         if let Some(idx) = self
@@ -170,9 +177,10 @@ impl FragmentReassembly {
         if let Some(idx) = self.entries.iter().position(|e| !e.active) {
             return idx;
         }
-        // Evict slot 0 as last resort
-        self.entries[0].active = false;
-        0
+        // Evict oldest slot as last resort
+        let last = self.entries.len().saturating_sub(1);
+        self.entries[last].active = false;
+        last
     }
 
     /// Age reassembly entries — expire stale incomplete reassemblies.

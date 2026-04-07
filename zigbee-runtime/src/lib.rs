@@ -58,13 +58,22 @@ struct PendingZclResponse {
     dst_endpoint: u8,
     src_endpoint: u8,
     cluster_id: u16,
+    #[cfg(feature = "router")]
     zcl_data: heapless::Vec<u8, 128>,
+    #[cfg(not(feature = "router"))]
+    zcl_data: heapless::Vec<u8, 64>,
 }
 
 /// Maximum number of endpoints on a device (endpoint 0 is ZDO, 1-240 are application)
+#[cfg(feature = "router")]
 pub const MAX_ENDPOINTS: usize = 8;
+#[cfg(not(feature = "router"))]
+pub const MAX_ENDPOINTS: usize = 4;
 /// Maximum clusters per endpoint
+#[cfg(feature = "router")]
 pub const MAX_CLUSTERS_PER_ENDPOINT: usize = 16;
+#[cfg(not(feature = "router"))]
+pub const MAX_CLUSTERS_PER_ENDPOINT: usize = 8;
 
 /// Endpoint configuration.
 #[derive(Debug, Clone)]
@@ -127,7 +136,10 @@ pub struct ZigbeeDevice<M: MacDriver> {
     /// Channel mask for network scanning.
     channel_mask: ChannelMask,
     /// Queued ZCL responses to send in next tick().
+    #[cfg(feature = "router")]
     pending_responses: heapless::Vec<PendingZclResponse, 4>,
+    #[cfg(not(feature = "router"))]
+    pending_responses: heapless::Vec<PendingZclResponse, 2>,
     /// Flag: network state has changed and should be persisted.
     state_dirty: bool,
 }

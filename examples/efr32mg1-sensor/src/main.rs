@@ -225,22 +225,31 @@ async fn main(_spawner: Spawner) {
     let mac = Efr32Mac::new();
     log::info!("[EFR32] Radio ready");
 
-    // Flash NV storage
-    let mut nv = flash_nv::create_nv();
+    // Flash NV storage — static to reduce async future size
+    static NV_CELL: StaticCell<flash_nv::Nv> = StaticCell::new();
+    let nv = NV_CELL.init(flash_nv::create_nv());
     log::info!("[EFR32] Flash NV storage ready");
 
-    // ZCL clusters
-    let mut basic_cluster = BasicCluster::new(
-        b"Zigbee-RS",
-        b"EFR32MG1-Sensor",
-        b"20260402",
-        b"0.1.0",
-    );
-    basic_cluster.set_power_source(0x03); // Battery
-    let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
-    let mut hum_cluster = HumidityCluster::new(0, 10000);
-    let mut power_cluster = PowerConfigCluster::new();
-    let mut identify_cluster = IdentifyCluster::new();
+    // ZCL clusters — static to reduce async future size
+    static BASIC_CELL: StaticCell<BasicCluster> = StaticCell::new();
+    let basic_cluster = BASIC_CELL.init({
+        let mut c = BasicCluster::new(
+            b"Zigbee-RS",
+            b"EFR32MG1-Sensor",
+            b"20260402",
+            b"0.1.0",
+        );
+        c.set_power_source(0x03); // Battery
+        c
+    });
+    static TEMP_CELL: StaticCell<TemperatureCluster> = StaticCell::new();
+    let temp_cluster = TEMP_CELL.init(TemperatureCluster::new(-4000, 12500));
+    static HUM_CELL: StaticCell<HumidityCluster> = StaticCell::new();
+    let hum_cluster = HUM_CELL.init(HumidityCluster::new(0, 10000));
+    static POWER_CELL: StaticCell<PowerConfigCluster> = StaticCell::new();
+    let power_cluster = POWER_CELL.init(PowerConfigCluster::new());
+    static IDENTIFY_CELL: StaticCell<IdentifyCluster> = StaticCell::new();
+    let identify_cluster = IDENTIFY_CELL.init(IdentifyCluster::new());
     power_cluster.set_battery_size(4);     // AAA
     power_cluster.set_battery_quantity(2); // 2× AAA
     power_cluster.set_battery_rated_voltage(15); // 1.5V
@@ -273,7 +282,7 @@ async fn main(_spawner: Spawner) {
         .build());
 
     // Restore previous network state from flash
-    let restored = device.restore_state(&nv);
+    let restored = device.restore_state(&*nv);
     if restored {
         log::info!("[EFR32] Restored state from flash — will rejoin");
         device.user_action(UserAction::Rejoin);
@@ -282,15 +291,15 @@ async fn main(_spawner: Spawner) {
         device.user_action(UserAction::Join);
     }
     let mut clusters = [
-        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+        ClusterRef { endpoint: 1, cluster: &mut *basic_cluster },
+        ClusterRef { endpoint: 1, cluster: &mut *temp_cluster },
+        ClusterRef { endpoint: 1, cluster: &mut *hum_cluster },
+        ClusterRef { endpoint: 1, cluster: &mut *power_cluster },
+        ClusterRef { endpoint: 1, cluster: &mut *identify_cluster },
     ];
     if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
         if log_event(e) {
-            device.save_state(&mut nv);
+            device.save_state(&mut *nv);
             log::info!("[EFR32] Network state saved to flash");
         }
     }
@@ -360,7 +369,7 @@ async fn main(_spawner: Spawner) {
 
             if held_long {
                 log::info!("[EFR32] FACTORY RESET");
-                device.factory_reset(Some(&mut nv)).await;
+                device.factory_reset(Some(&mut *nv)).await;
                 log::info!("[EFR32] NV cleared — rebooting");
                 for _ in 0..5u8 {
                     led_on();
@@ -373,17 +382,17 @@ async fn main(_spawner: Spawner) {
                 log::info!("[EFR32] Button → {}", if device.is_joined() { "leave" } else { "join" });
                 device.user_action(UserAction::Toggle);
                 let mut cls = [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut *basic_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut *temp_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut *hum_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut *power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut *identify_cluster },
                 ];
                 if let TickResult::Event(ref e) = device.tick(0, &mut cls).await {
                     match e {
                         StackEvent::Joined { .. } => {
                             log_event(e);
-                            device.save_state(&mut nv);
+                            device.save_state(&mut *nv);
                             log::info!("[EFR32] State saved to flash");
                             fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                             annce_retries_left = 5;
@@ -392,7 +401,7 @@ async fn main(_spawner: Spawner) {
                         }
                         StackEvent::Left => {
                             log_event(e);
-                            device.factory_reset(Some(&mut nv)).await;
+                            device.factory_reset(Some(&mut *nv)).await;
                             log::info!("[EFR32] NV cleared");
                         }
                         _ => { log_event(e); }
@@ -415,17 +424,17 @@ async fn main(_spawner: Spawner) {
                 match device.poll().await {
                     Ok(Some(ind)) => {
                         let mut cls = [
-                            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut *basic_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut *temp_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut *hum_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut *power_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut *identify_cluster },
                         ];
                         if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
                             match &ev {
                                 StackEvent::LeaveRequested => {
                                     log::info!("[EFR32] Leave requested — erasing NV and rejoining");
-                                    device.factory_reset(Some(&mut nv)).await;
+                                    device.factory_reset(Some(&mut *nv)).await;
                                     device.user_action(UserAction::Join);
                                     fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                     interview_done = false;
@@ -452,11 +461,11 @@ async fn main(_spawner: Spawner) {
                             }
                         }
                         let mut cls2 = [
-                            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut *basic_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut *temp_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut *hum_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut *power_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut *identify_cluster },
                         ];
                         let _ = device.tick(0, &mut cls2).await;
                     }
@@ -489,11 +498,11 @@ async fn main(_spawner: Spawner) {
 
             let tick_elapsed = elapsed_s.min(60) as u16;
             let mut clusters = [
-                ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut *basic_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut *temp_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut *hum_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut *power_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut *identify_cluster },
             ];
             if let TickResult::Event(ref e) = device.tick(tick_elapsed, &mut clusters).await {
                 if log_event(e) {
@@ -518,7 +527,7 @@ async fn main(_spawner: Spawner) {
 
             if needs_save {
                 needs_save = false;
-                device.save_state(&mut nv);
+                device.save_state(&mut *nv);
                 log::info!("[EFR32] State saved to flash (deferred)");
             }
         } else {
@@ -540,11 +549,11 @@ async fn main(_spawner: Spawner) {
                 log::info!("[EFR32] Not joined — retrying (attempt {})…", rejoin_count);
                 device.user_action(UserAction::Join);
                 let mut cls = [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut *basic_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut *temp_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut *hum_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut *power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut *identify_cluster },
                 ];
                 let _ = device.tick(0, &mut cls).await;
                 if device.is_joined() {
@@ -554,7 +563,7 @@ async fn main(_spawner: Spawner) {
                     annce_retries_left = 5;
                     last_annce = Instant::now();
                     interview_done = false;
-                    device.save_state(&mut nv);
+                    device.save_state(&mut *nv);
                     log::info!("[EFR32] State saved to flash");
                 }
             }
