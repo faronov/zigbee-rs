@@ -507,6 +507,23 @@ impl Efr32Driver {
         self.apply_config();
 
         self.initialized = true;
+
+        // Debug: dump critical register values after init
+        rtt_target::rprintln!("=== POST-INIT DUMP ===");
+        rtt_target::rprintln!("FRC: CTRL={:#X} RXCTRL={:#X} FECCTRL={:#X}",
+            reg_read(FRC_CTRL), reg_read(FRC_RXCTRL), reg_read(FRC_FECCTRL));
+        rtt_target::rprintln!("FRC: FCD0={:#X} FCD1={:#X} FCD2={:#X} FCD3={:#X}",
+            reg_read(FRC_FCD0), reg_read(FRC_BASE+0xA4), reg_read(FRC_FCD2), reg_read(FRC_BASE+0xAC));
+        rtt_target::rprintln!("RAC: CTRL={:#X} STATUS={:#X} SEQST={:#X}",
+            reg_read(RAC_CTRL), reg_read(RAC_STATUS), reg_read(RAC_SEQSTATUS));
+        rtt_target::rprintln!("RAC: R4={:#X} R5={:#X} R6={:#X} R7={:#X}",
+            reg_read(RAC_BASE+0x58), reg_read(RAC_BASE+0x5C), 
+            reg_read(RAC_BASE+0x60), reg_read(RAC_BASE+0x64));
+        rtt_target::rprintln!("SYNTH: FREQ={:#X} DIVCTRL={:#X} IFFREQ={:#X}",
+            reg_read(SYNTH_FREQ), reg_read(SYNTH_DIVCTRL), reg_read(SYNTH_IFFREQ));
+        rtt_target::rprintln!("SEQ: CTRL_REG={:#X} TRANSITIONS={:#X}",
+            reg_read(SEQ_CONTROL_REG), reg_read(_SEQ_TRANSITIONS));
+        rtt_target::rprintln!("=== END DUMP ===");
     }
 
     /// Initialize PROTIMER (Protocol Timer) — required by RAC sequencer.
@@ -580,8 +597,14 @@ impl Efr32Driver {
             reg_write(dst_base + (i as u32) * 4, word);
         }
 
-        // 5. Set R6 pointer
-        reg_write(_RAC_R6, 0x2100_0FCC);
+        // 5. Set sequencer register pointers R4-R7
+        //    These point into SEQ RAM and are CRITICAL — without them
+        //    the sequencer can't find its configuration and exits immediately.
+        //    Values from reference firmware dump.
+        reg_write(RAC_BASE + 0x058, 0x2100_0F88); // R4 → SEQ+0x088
+        reg_write(RAC_BASE + 0x05C, 0x2100_0F94); // R5 → SEQ+0x094
+        reg_write(_RAC_R6, 0x2100_0FCC);           // R6 → SEQ+0x0CC (state ptr)
+        reg_write(RAC_BASE + 0x064, 0x2100_085E); // R7 → sequencer code entry
 
         // 6. Clear SEQ variable areas (baremetal does TWO clears):
         //    a) 0x21000F6C-0x21000FFF (SEQ config area)
@@ -753,6 +776,18 @@ impl Efr32Driver {
 
         // RFBIASCAL (0x130): from reference dump
         reg_write(RAC_BASE + 0x130, 0x0025_1504); // RFBIASCAL
+
+        // RAC interrupt enable — the sequencer needs specific RAC interrupts
+        reg_write(RAC_BASE + 0x020, 0x002C_0004); // IEN from reference
+
+        // HFXO retiming control
+        reg_write(RAC_BASE + 0x030, 0x0000_0760); // HFXORETIMECTRL
+
+        // Additional RAC registers from reference dump
+        reg_write(RAC_BASE + 0x048, 0x0000_008C); // R0
+        reg_write(RAC_BASE + 0x054, 0x0000_0004); // R3
+        reg_write(RAC_BASE + 0x06C, 0x0000_0001); // WAITMASK
+        reg_write(RAC_BASE + 0x070, 0x0000_0001); // WAITSNSH
 
         // Clear force-disable if set
         let ctrl = reg_read(RAC_CTRL);
