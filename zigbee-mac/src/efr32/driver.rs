@@ -488,15 +488,20 @@ impl Efr32Driver {
 
     // ── Hardware initialization ─────────────────────────────────
 
-    /// Full radio initialization: clocks → PROTIMER → RAC → BUFC → FRC → MODEM → SYNTH → AGC.
+    /// Full radio initialization — order matches baremetal RADIO_Config():
+    /// 1. Enable clocks
+    /// 2. SetAndForgetWrite (RAC analog config) ← BEFORE sequencer!
+    /// 3. Load sequencer + PROTIMER
+    /// 4. FRC, MODEM, SYNTH, AGC, BUFC
+    /// 5. Apply config (channel, power)
     fn init_hardware(&mut self) {
         self.enable_clocks();
+        self.configure_rac();        // MUST be before sequencer load!
         self.configure_protimer();
-        self.load_rac_sequences();
-        self.configure_rac();
-        self.configure_bufc();
+        self.load_rac_sequences();   // Now RAC regs are set when seq runs
         self.configure_frc();
         self.configure_modem();
+        self.configure_bufc();
         self.configure_synth();
         self.configure_agc();
         self.apply_config();
@@ -793,24 +798,32 @@ impl Efr32Driver {
     /// - FCD0: TX descriptor — CALCCRC | INCLUDECRC, buffer 0, WORDS=0xFF
     /// - FCD2: RX descriptor — CALCCRC | INCLUDECRC, buffer 1, WORDS=0xFF
     fn configure_frc(&self) {
-        // CTRL at 0x040: bits[10:8]=BITSPERWORD=7 → 0x700
-        reg_write(FRC_CTRL, 0x0000_0700);
-        // RXCTRL at 0x044
-        reg_write(FRC_RXCTRL, 0x0014_8001);
-        // TRAILRXDATA at 0x04C
+        // ALL values from the running RAIL reference firmware dump.
+        //
+        // CTRL at 0x040: reference = 0x7A0 (not 0x700!)
+        //   bit 5 (0x20) = RXFCDMODE or TXFCDMODE flag
+        //   bits [10:8] = BITSPERWORD = 7
+        reg_write(FRC_CTRL, 0x0000_07A0);
+        // RXCTRL at 0x044: reference = 0x68 (not 0x148001!)
+        reg_write(FRC_RXCTRL, 0x0000_0068);
+        // TRAILRXDATA at 0x04C: reference = 0x1B
         reg_write(FRC_TRAILRXDATA, 0x0000_001B);
-        // FECCTRL at 0x034: BLOCKWHITEMODE = 1
-        reg_write(FRC_FECCTRL, 0x0000_0001);
-        // BLOCKRAMADDR at 0x038
-        reg_write(FRC_BLOCKRAMADDR, 0x0000_001B);
-        // CONVRAMADDR at 0x03C
-        reg_write(FRC_CONVRAMADDR, 0x0000_A002);
+        // FECCTRL at 0x034: reference = 0x0 (not 0x1!)
+        reg_write(FRC_FECCTRL, 0x0000_0000);
+        // BLOCKRAMADDR at 0x038: clear
+        reg_write(FRC_BLOCKRAMADDR, 0x0000_0000);
+        // CONVRAMADDR at 0x03C: clear
+        reg_write(FRC_CONVRAMADDR, 0x0000_0000);
 
-        // Frame Control Descriptors:
-        // FCD0 (TX): CALCCRC=1 | INCLUDECRC=1 | buffer=0 | WORDS=0xFF → 0x0CFF
-        reg_write(FRC_FCD0, 0x0000_0CFF);
-        // FCD2 (RX): CALCCRC=1 | INCLUDECRC=1 | buffer=1 | WORDS=0xFF → 0x0DFF
-        reg_write(FRC_FCD2, 0x0000_0DFF);
+        // Frame Control Descriptors from reference dump:
+        // FCD0 (TX): 0x4000 = buffer=0, words=0, bit14=CALCCRC
+        reg_write(FRC_FCD0, 0x0000_4000);
+        // FCD1: 0x4CFF = buffer=0, words=0xFF, CALCCRC + INCLUDECRC
+        reg_write(FRC_BASE + 0x0A4, 0x0000_4CFF);
+        // FCD2 (RX): 0x4100 = buffer=1, words=0, bit14=CALCCRC
+        reg_write(FRC_FCD2, 0x0000_4100);
+        // FCD3: 0x4DFF = buffer=1, words=0xFF, CALCCRC + INCLUDECRC
+        reg_write(FRC_BASE + 0x0AC, 0x0000_4DFF);
 
         // Clear all pending FRC interrupt flags
         reg_write(FRC_IFC, 0xFFFF_FFFF);
