@@ -5,7 +5,10 @@
 //! (src_addr, aps_counter) pair are received, the complete payload is returned.
 
 /// Maximum concurrent reassembly sessions.
+#[cfg(feature = "router")]
 const MAX_ENTRIES: usize = 4;
+#[cfg(not(feature = "router"))]
+const MAX_ENTRIES: usize = 1;
 
 /// A single fragment reassembly slot.
 struct ReassemblyEntry {
@@ -61,6 +64,7 @@ impl Default for FragmentReassembly {
 }
 
 impl FragmentReassembly {
+    #[cfg(feature = "router")]
     pub const fn new() -> Self {
         Self {
             entries: [
@@ -69,6 +73,12 @@ impl FragmentReassembly {
                 ReassemblyEntry::empty(),
                 ReassemblyEntry::empty(),
             ],
+        }
+    }
+    #[cfg(not(feature = "router"))]
+    pub const fn new() -> Self {
+        Self {
+            entries: [ReassemblyEntry::empty()],
         }
     }
 

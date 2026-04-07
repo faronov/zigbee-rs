@@ -18,4 +18,5 @@ log = "0.4"
 
 [features]
 default = []
+router = ["zigbee-aps/router"]
 ota = []

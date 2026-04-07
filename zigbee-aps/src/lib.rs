@@ -186,10 +186,16 @@ pub struct PendingApsAck {
 }
 
 /// Maximum entries in APS duplicate rejection table
+#[cfg(feature = "router")]
 const APS_DUP_TABLE_SIZE: usize = 16;
+#[cfg(not(feature = "router"))]
+const APS_DUP_TABLE_SIZE: usize = 4;
 
 /// Maximum entries in outbound APS ACK tracking table
+#[cfg(feature = "router")]
 const APS_ACK_TABLE_SIZE: usize = 8;
+#[cfg(not(feature = "router"))]
+const APS_ACK_TABLE_SIZE: usize = 4;
 
 /// APS duplicate rejection entry
 #[derive(Debug, Clone, Copy)]

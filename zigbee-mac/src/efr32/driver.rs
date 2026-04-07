@@ -889,6 +889,10 @@ impl Efr32Driver {
 
         TX_DONE.reset();
 
+        // Debug: increment atomic TX call counter
+        static TX_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        TX_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
         // Ensure radio is idle before TX
         reg_write(RAC_CMD, RAC_CMD_RXDIS);
         for _ in 0..1_000u32 {
@@ -928,6 +932,12 @@ impl Efr32Driver {
 
         // Start TX via RAC — the sequencer handles SYNTH cal, PA, FRC
         reg_write(RAC_CMD, RAC_CMD_TXEN);
+
+        // Debug: capture RAC STATUS and FRC IF right after TXEN
+        static TX_RAC_STATUS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        static TX_FRC_IF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        TX_RAC_STATUS.store(reg_read(RAC_STATUS), core::sync::atomic::Ordering::Relaxed);
+        TX_FRC_IF.store(reg_read(FRC_IF), core::sync::atomic::Ordering::Relaxed);
 
         log::trace!(
             "efr32: tx {} bytes on ch{}",

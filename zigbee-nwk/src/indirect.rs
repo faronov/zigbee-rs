@@ -2,7 +2,11 @@
 
 use zigbee_types::ShortAddress;
 
+#[cfg(feature = "router")]
 pub const MAX_INDIRECT: usize = 8;
+#[cfg(not(feature = "router"))]
+pub const MAX_INDIRECT: usize = 0;
+
 const MAX_FRAME_SIZE: usize = 128;
 
 /// A buffered frame waiting for a sleeping child to poll.

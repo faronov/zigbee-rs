@@ -9,7 +9,7 @@ zigbee-mac = { path = "../../zigbee-mac", features = ["nrf52840"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee-runtime = { path = "../../zigbee-runtime", features = ["router"] }
 
 # nRF52840 HAL + Embassy
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }

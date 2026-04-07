@@ -3,9 +3,16 @@
 use zigbee_types::ShortAddress;
 
 /// Maximum routing table entries
+#[cfg(feature = "router")]
 pub const MAX_ROUTES: usize = 32;
+#[cfg(not(feature = "router"))]
+pub const MAX_ROUTES: usize = 0;
+
 /// Maximum pending route discoveries
+#[cfg(feature = "router")]
 pub const MAX_ROUTE_DISCOVERIES: usize = 8;
+#[cfg(not(feature = "router"))]
+pub const MAX_ROUTE_DISCOVERIES: usize = 0;
 
 /// Route table entry status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,7 +428,10 @@ impl Default for RoutingTable {
 // ── Broadcast Transaction Record ──────────────────────────────
 
 /// Maximum BTR entries for broadcast deduplication
+#[cfg(feature = "router")]
 pub const MAX_BTR: usize = 16;
+#[cfg(not(feature = "router"))]
+pub const MAX_BTR: usize = 0;
 
 /// Broadcast Transaction Record — tracks seen broadcasts to prevent storms.
 /// Spec: Table 3-68.

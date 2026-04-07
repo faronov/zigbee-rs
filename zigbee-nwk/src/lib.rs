@@ -146,11 +146,20 @@ pub struct NwkLayer<M: MacDriver> {
     /// false = sleepy end device (polls parent for data)
     rx_on_when_idle: bool,
     /// Pending route replies to be sent asynchronously.
+    #[cfg(feature = "router")]
     pending_route_replies: heapless::Vec<PendingRouteReply, 4>,
+    #[cfg(not(feature = "router"))]
+    pending_route_replies: heapless::Vec<PendingRouteReply, 0>,
     /// Pending RREQ rebroadcasts (queued from sync handler, sent async).
+    #[cfg(feature = "router")]
     pending_rreq_rebroadcasts: heapless::Vec<PendingRreqRebroadcast, 4>,
+    #[cfg(not(feature = "router"))]
+    pending_rreq_rebroadcasts: heapless::Vec<PendingRreqRebroadcast, 0>,
     /// Pending Network Status (route error) notifications.
+    #[cfg(feature = "router")]
     pending_route_errors: heapless::Vec<PendingNetworkStatus, 4>,
+    #[cfg(not(feature = "router"))]
+    pending_route_errors: heapless::Vec<PendingNetworkStatus, 0>,
     /// Indirect frame queue for sleeping end device children.
     indirect: indirect::IndirectQueue,
     /// Link status periodic timer counter (seconds).
@@ -184,8 +193,17 @@ impl<M: MacDriver> NwkLayer<M> {
             device_type,
             joined: false,
             rx_on_when_idle,
+            #[cfg(feature = "router")]
             pending_route_replies: heapless::Vec::new(),
+            #[cfg(not(feature = "router"))]
+            pending_route_replies: heapless::Vec::new(),
+            #[cfg(feature = "router")]
             pending_rreq_rebroadcasts: heapless::Vec::new(),
+            #[cfg(not(feature = "router"))]
+            pending_rreq_rebroadcasts: heapless::Vec::new(),
+            #[cfg(feature = "router")]
+            pending_route_errors: heapless::Vec::new(),
+            #[cfg(not(feature = "router"))]
             pending_route_errors: heapless::Vec::new(),
             indirect: indirect::IndirectQueue::new(),
             link_status_counter: 0,

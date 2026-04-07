@@ -5,7 +5,10 @@
 //! that is a member of that group.
 
 /// Maximum number of groups in the table.
+#[cfg(feature = "router")]
 pub const MAX_GROUPS: usize = 16;
+#[cfg(not(feature = "router"))]
+pub const MAX_GROUPS: usize = 4;
 
 /// Maximum number of endpoints per group.
 pub const MAX_ENDPOINTS_PER_GROUP: usize = 8;

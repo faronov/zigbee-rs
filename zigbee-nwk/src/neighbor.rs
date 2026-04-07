@@ -6,7 +6,10 @@
 use zigbee_types::*;
 
 /// Maximum number of neighbors we track
+#[cfg(feature = "router")]
 pub const MAX_NEIGHBORS: usize = 32;
+#[cfg(not(feature = "router"))]
+pub const MAX_NEIGHBORS: usize = 8;
 
 /// Relationship with a neighbor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
