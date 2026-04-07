@@ -897,11 +897,11 @@ impl Efr32Driver {
             0x744A_C39B, // [0x4C] DSSS0
             0x0000_03F0, // [0x50] MODINDEX
             0x0000_0000, // [0x54] AFC
-            0x0101_1030, // [0x58] AFCADJLIM (from ref dump, was 0)
-            0x5070_7F7F, // [0x5C] SHAPING0 (from ref dump)
-            0x0000_0000, // [0x60] SHAPING1 (from ref dump)
-            0x0000_0500, // [0x64] SHAPING2 (from ref dump)
-            0x0000_0000, // [0x68] RAMPCTRL (from ref dump)
+            0x0000_0000, // [0x58] AFCADJLIM (ref=0x0)
+            0x3010_0101, // [0x5C] SHAPING0 (ref=0x30100101)
+            0x7F7F_7050, // [0x60] SHAPING1 (ref=0x7F7F7050)
+            0x0000_0000, // [0x64] SHAPING2 (ref=0x0)
+            0x0000_0500, // [0x68] RAMPCTRL (ref=0x500)
             0x00F0_0000, // [0x6C] RAMPLEV
             0x0000_0000, // [0x70] ROUTEPEN
             0x0000_0000, // [0x74] ROUTELOC0
