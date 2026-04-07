@@ -27,6 +27,7 @@ static_cell = "2"
 
 # Logging
 log = "0.4"
+rtt-target = "0.6"
 
 # Panic handler for embedded target
 panic-halt = "1.0"

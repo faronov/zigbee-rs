@@ -190,6 +190,7 @@ fn led_off() { gpio_write(pins::LED, false); }
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
+    rtt_target::rtt_init_print!();
     time_driver::init();
 
     // Unmask radio IRQ (FRC_PRI = IRQ 1)
@@ -206,7 +207,7 @@ async fn main(_spawner: Spawner) {
         cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::Bufc);
     }
 
-    log::info!("[EFR32] Zigbee Sensor starting (pure Rust!)");
+    rtt_target::rprintln!("[EFR32] Starting...");
 
     // GPIO init
     gpio_set_output(pins::LED);
@@ -223,12 +224,12 @@ async fn main(_spawner: Spawner) {
 
     // Radio + MAC
     let mac = Efr32Mac::new();
-    log::info!("[EFR32] Radio ready");
+    rtt_target::rprintln!("[EFR32] Radio ready");
 
     // Flash NV storage — static to reduce async future size
     static NV_CELL: StaticCell<flash_nv::Nv> = StaticCell::new();
     let nv = NV_CELL.init(flash_nv::create_nv());
-    log::info!("[EFR32] Flash NV storage ready");
+    rtt_target::rprintln!("[EFR32] NV ready");
 
     // ZCL clusters — static to reduce async future size
     static BASIC_CELL: StaticCell<BasicCluster> = StaticCell::new();
@@ -284,10 +285,10 @@ async fn main(_spawner: Spawner) {
     // Restore previous network state from flash
     let restored = device.restore_state(&*nv);
     if restored {
-        log::info!("[EFR32] Restored state from flash — will rejoin");
+        rtt_target::rprintln!("[EFR32] Restored — rejoin");
         device.user_action(UserAction::Rejoin);
     } else {
-        log::info!("[EFR32] No saved state — auto-joining…");
+        rtt_target::rprintln!("[EFR32] No state — joining");
         device.user_action(UserAction::Join);
     }
     let mut clusters = [
@@ -297,12 +298,14 @@ async fn main(_spawner: Spawner) {
         ClusterRef { endpoint: 1, cluster: &mut *power_cluster },
         ClusterRef { endpoint: 1, cluster: &mut *identify_cluster },
     ];
+    rtt_target::rprintln!("[EFR32] First tick...");
     if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
+        rtt_target::rprintln!("[EFR32] First tick event: {:?}", core::mem::discriminant(e));
         if log_event(e) {
             device.save_state(&mut *nv);
-            log::info!("[EFR32] Network state saved to flash");
         }
     }
+    rtt_target::rprintln!("[EFR32] First tick done, joined={}", device.is_joined());
 
     // Default reporting so device reports even before ZHA interview
     setup_default_reporting(device);
@@ -342,6 +345,14 @@ async fn main(_spawner: Spawner) {
         let now = Instant::now();
         let in_fast_poll = now < fast_poll_until;
         let poll_ms = if in_fast_poll { FAST_POLL_MS } else { SLOW_POLL_SECS * 1000 };
+
+        // ── Rejoin if not joined ──
+        if !device.is_joined() && now.duration_since(last_rejoin_attempt).as_secs() > 15 {
+            rtt_target::rprintln!("[EFR32] Retry join...");
+            last_rejoin_attempt = now;
+            rejoin_count += 1;
+            device.user_action(UserAction::Join);
+        }
 
         if was_fast_polling && !in_fast_poll {
             let cfg = device.configured_cluster_count(1);
