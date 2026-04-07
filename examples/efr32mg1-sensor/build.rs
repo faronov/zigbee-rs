@@ -10,10 +10,10 @@ fn main() {
         .expect("failed to copy device.x");
     println!("cargo:rustc-link-search={}", out_dir);
 
-    // Memory layout
+    // Memory layout + cortex-m-rt link script
     println!("cargo:rustc-link-arg=-Tlink.x");
 
-    // Rebuild if device.x changes
+    // Rebuild if any linker script changes
     println!("cargo:rerun-if-changed=device.x");
     println!("cargo:rerun-if-changed=memory.x");
 }

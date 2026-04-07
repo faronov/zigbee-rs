@@ -99,18 +99,44 @@ const CMU_HFPERCLKEN0: u32 = CMU_BASE + 0x0C0;
 /// Individual radio peripheral enables: FRC, AGC, MODEM, etc.
 const CMU_RADIOCLKEN0: u32 = CMU_BASE + 0x0C8;
 
-// ── RAC Register Offsets ────────────────────────────────────────
+// ── RAC Register Offsets (from CMSIS efr32fg1v_rac.h TypeDef) ──
+//
+// CRITICAL: verified against official CMSIS header.
+// RAC has a complex layout with sequencer regs, RF front-end, etc.
 
-/// RAC command register — triggers state transitions.
+const _RAC_RXENSRCEN: u32 = RAC_BASE + 0x000;
 const RAC_STATUS: u32 = RAC_BASE + 0x004;
 const RAC_CMD: u32 = RAC_BASE + 0x008;
-/// RAC status register — current radio state.
-/// RAC interrupt flag register.
+const RAC_CTRL: u32 = RAC_BASE + 0x00C;
+const _RAC_FORCESTATE: u32 = RAC_BASE + 0x010;
 const RAC_IF: u32 = RAC_BASE + 0x014;
-/// RAC interrupt flag clear register.
-const RAC_IFC: u32 = RAC_BASE + 0x018;
-/// RAC interrupt enable register.
-const RAC_IEN: u32 = RAC_BASE + 0x01C;
+const _RAC_IFS: u32 = RAC_BASE + 0x018;
+const RAC_IFC: u32 = RAC_BASE + 0x01C;  // was 0x018!
+const _RAC_IEN: u32 = RAC_BASE + 0x020; // was 0x01C!
+// Sequencer registers
+const RAC_SEQSTATUS: u32 = RAC_BASE + 0x03C;
+const RAC_SEQCMD: u32 = RAC_BASE + 0x040;
+const _RAC_R0: u32 = RAC_BASE + 0x048;
+const _RAC_R6: u32 = RAC_BASE + 0x060;
+const RAC_VECTADDR: u32 = RAC_BASE + 0x07C;  // was 0x058 (=R4)!
+const RAC_SEQCTRL: u32 = RAC_BASE + 0x080;   // was 0x014!
+const _RAC_SR0: u32 = RAC_BASE + 0x088;
+const _RAC_SR1: u32 = RAC_BASE + 0x08C;
+const _RAC_SR2: u32 = RAC_BASE + 0x090;
+const _RAC_SR3: u32 = RAC_BASE + 0x094;
+const RAC_SYNTHREGCTRL: u32 = RAC_BASE + 0x09C;
+const RAC_VCOCTRL: u32 = RAC_BASE + 0x0A0;
+// RF front-end registers
+const _RAC_LNAMIXCTRL: u32 = RAC_BASE + 0x0FC;
+const _RAC_LNAMIXCTRL1: u32 = RAC_BASE + 0x134;
+const RAC_IFPGACTRL: u32 = RAC_BASE + 0x138;
+const RAC_IFFILTCTRL: u32 = RAC_BASE + 0x140;
+const RAC_IFADCCTRL: u32 = RAC_BASE + 0x144;
+
+// Sequencer commands (RAC_SEQCMD at 0x040)
+const RAC_SEQCMD_HALT: u32 = 1 << 0;
+const _RAC_SEQCMD_STEP: u32 = 1 << 1;
+const RAC_SEQCMD_RESUME: u32 = 1 << 2;
 
 // ── RAC Commands ────────────────────────────────────────────────
 
@@ -118,6 +144,7 @@ const RAC_CMD_TXEN: u32 = 1 << 0;
 const RAC_CMD_RXEN: u32 = 1 << 1;
 const RAC_CMD_TXDIS: u32 = 1 << 2;
 const RAC_CMD_RXDIS: u32 = 1 << 3;
+const _RAC_CMD_CLEARRXOVERFLOW: u32 = 1 << 6;
 
 // ── RAC Status Bits ─────────────────────────────────────────────
 
@@ -126,6 +153,37 @@ const _RAC_STATE_OFF: u32 = 0x00;
 const _RAC_STATE_IDLE: u32 = 0x01;
 const RAC_STATE_RX: u32 = 0x02;
 const _RAC_STATE_TX: u32 = 0x03;
+
+// ── Sequencer RAM Variables (from VDowbensky/efr32_baremetal) ───
+//
+// The RAC sequencer uses RAM at 0x21000000 for microcode and
+// variables at 0x21000EFC-0x21000FFF for configuration.
+// SEQ TypeDef base = 0x21000F00.
+
+/// Sequencer control register (NOT in RAC peripheral — it's in RAM!)
+const SEQ_CONTROL_REG: u32 = 0x2100_0EFC;
+/// Radio state transitions (SEQ->REG000)
+const _SEQ_TRANSITIONS: u32 = 0x2100_0F00;
+/// RX warm-up time (SEQ->REG09C)
+const SEQ_RX_WARMTIME: u32 = 0x2100_0F9C;
+/// RX search time (SEQ->REG0A0)
+const SEQ_RX_SEARCHTIME: u32 = 0x2100_0FA0;
+/// RX→TX turnaround (SEQ->REG0A4)
+const SEQ_RX_TX_TIME: u32 = 0x2100_0FA4;
+/// RX frame→TX time (SEQ->REG0A8)
+const SEQ_RXFRAME_TX_TIME: u32 = 0x2100_0FA8;
+/// TX warm-up time (SEQ->REG0AC)
+const SEQ_TX_WARMTIME: u32 = 0x2100_0FAC;
+/// TX→RX turnaround (SEQ->REG0B0)
+const SEQ_TX_RX_TIME: u32 = 0x2100_0FB0;
+/// TX→RX search time (SEQ->REG0B4)
+const SEQ_TX_RX_SEARCHTIME: u32 = 0x2100_0FB4;
+/// TX→TX time (SEQ->REG0B8)
+const SEQ_TX_TX_TIME: u32 = 0x2100_0FB8;
+/// SYNTH LPF control RX (SEQ->SYNTHLPFCTRLRX at 0xFF8)
+const SEQ_SYNTHLPFCTRLRX: u32 = 0x2100_0FF8;
+/// SYNTH LPF control TX (SEQ->SYNTHLPFCTRLTX at 0xFFC)
+const SEQ_SYNTHLPFCTRLTX: u32 = 0x2100_0FFC;
 
 // ── RAC IRQ Bits ────────────────────────────────────────────────
 
@@ -432,18 +490,76 @@ impl Efr32Driver {
     /// RAC_CMD_TXEN/RXEN trigger the sequencer to coordinate SYNTH
     /// calibration, PA enable, FRC TX/RX, and return to idle.
     fn load_rac_sequences(&self) {
-        let seq_data = &super::rac_seq::RAC_SEQ_DATA;
+        // 1. Halt the sequencer before loading
+        reg_write(RAC_SEQCMD, RAC_SEQCMD_HALT);
+
+        // 2. Clear sequencer RAM (4KB at 0x21000000)
         let dst_base = 0x2100_0000u32;
+        for i in 0..1024u32 {
+            reg_write(dst_base + i * 4, 0);
+        }
+
+        // 3. Set vector address BEFORE loading code
+        reg_write(RAC_VECTADDR, dst_base);
+
+        // 4. Enable compact mode
+        reg_write(RAC_SEQCTRL, 1); // COMPACT = bit 0
+
+        // 5. Load microcode
+        let seq_data = &super::rac_seq::RAC_SEQ_DATA;
         for (i, &word) in seq_data.iter().enumerate() {
             let addr = dst_base + (i as u32) * 4;
             reg_write(addr, word);
         }
 
-        // Set RAC sequence pointers (same values as RAIL uses)
-        reg_write(RAC_BASE + 0x58, 0x21000F88); // Sequence pointer A
-        reg_write(RAC_BASE + 0x64, 0x2100085E); // Sequence pointer B
+        // 6. Initialize sequencer variables in RAM
+        // From VDowbensky/efr32_baremetal generic_seq.h:
+        //   SEQ_CONTROL_REG    = 0x21000EFC
+        //   RADIO_TRANSITIONS  = 0x21000F00 (SEQ->REG000)
+        //   RX_WARMTIME        = 0x21000F9C (SEQ->REG09C)
+        //   TX_WARMTIME        = 0x21000FAC (SEQ->REG0AC)
+        //   TX_RX_TIME etc.    = various
+        //   PHYINFO            = 0x21000FF0
+        //   SYNTHLPFCTRLRX     = 0x21000FF8
+        //   SYNTHLPFCTRLTX     = 0x21000FFC
 
-        log::info!("efr32: loaded {} words of RAC sequence data", seq_data.len());
+        // SEQ_CONTROL_REG: bit 3 = enable, bit 5 = disable flag
+        reg_write(SEQ_CONTROL_REG, 0x08); // Enable sequencer
+
+        // Warm-up times (in µs, from baremetal: all set to 100)
+        reg_write(SEQ_RX_WARMTIME, 100);
+        reg_write(SEQ_TX_WARMTIME, 100);
+        reg_write(SEQ_RX_TX_TIME, 100);
+        reg_write(SEQ_TX_RX_TIME, 100);
+        reg_write(SEQ_TX_TX_TIME, 100);
+        reg_write(SEQ_RXFRAME_TX_TIME, 100);
+        reg_write(SEQ_RX_SEARCHTIME, 0);
+        reg_write(SEQ_TX_RX_SEARCHTIME, 0);
+
+        // SYNTH LPF control for RX and TX
+        reg_write(SEQ_SYNTHLPFCTRLRX, 0x0003_C002);
+        reg_write(SEQ_SYNTHLPFCTRLTX, 0x0003_C002);
+
+        // R6 pointer (used by sequencer for state management)
+        reg_write(_RAC_R6, 0x21000FCC);
+
+        // Clear sequencer scratch registers
+        reg_write(_RAC_SR0, 0);
+        reg_write(_RAC_SR1, 0);
+        reg_write(_RAC_SR2, 0);
+        reg_write(_RAC_SR3, 0);
+
+        // 7. Resume sequencer
+        reg_write(RAC_SEQCMD, RAC_SEQCMD_RESUME);
+
+        // Enable RXENSRCEN software RX enable
+        reg_write(_RAC_RXENSRCEN, 0x02);
+
+        log::info!(
+            "efr32: RAC seq loaded {} words, SEQSTATUS={:#X}",
+            seq_data.len(),
+            reg_read(RAC_SEQSTATUS)
+        );
     }
 
     /// Enable peripheral clocks for all radio blocks via CMU.
@@ -501,14 +617,13 @@ impl Efr32Driver {
 
     /// Configure RAC (Radio Controller) for 802.15.4 operation.
     ///
-    /// Register values from a working RAIL-based firmware on EFR32MG1P.
-    /// RAM pointer registers (0x58-0x64, 0x7C) are skipped — those are
-    /// RAIL internal buffer addresses that don't apply to bare-metal mode.
+    /// Register values from CMSIS efr32fg1v_rac.h and baremetal reference.
+    /// Uses named register constants at verified CMSIS offsets.
     fn configure_rac(&self) {
         // Reset RAC to known state
         reg_write(RAC_CMD, RAC_CMD_TXDIS | RAC_CMD_RXDIS);
 
-        // Wait for radio to reach idle state
+        // Wait for radio to reach idle/off state
         for _ in 0..10_000u32 {
             let state = reg_read(RAC_STATUS) & RAC_STATUS_STATE_MASK;
             if state <= 1 {
@@ -517,34 +632,34 @@ impl Efr32Driver {
             core::hint::spin_loop();
         }
 
-        // Write RAC configuration registers (dumped from working firmware).
-        // Skip: 0x00 (RXENSRCEN — read-only status),
-        //       0x04 (CMD — command trigger),
-        //       0x08 (STATUS — read-only),
-        //       0x10/0x18/0x1C (IF/IFC/IEN — set separately below).
-        reg_write(RAC_BASE + 0x0C, 0x0000_0380); // CTRL
-        reg_write(RAC_BASE + 0x14, 0x0000_0003); // FORCESTATE
-        reg_write(RAC_BASE + 0x20, 0x002C_0004); // IF_CFG0
-        reg_write(RAC_BASE + 0x24, 0x0000_000C); // IF_CFG1
-        reg_write(RAC_BASE + 0x28, 0x0000_00BC); // IF_CFG2
-        reg_write(RAC_BASE + 0x30, 0x0000_0760); // PAEN/LNAEN timing
-        reg_write(RAC_BASE + 0x3C, 0x0000_0150); // SYNTH timing
-        reg_write(RAC_BASE + 0x48, 0x0000_008C); // PA config
-        reg_write(RAC_BASE + 0x54, 0x0000_0004); // antenna/misc
-        // 0x58-0x64 = RAIL RAM pointers (skip)
-        reg_write(RAC_BASE + 0x6C, 0x0000_0001); // misc
-        reg_write(RAC_BASE + 0x70, 0x0000_0001); // misc
-        reg_write(RAC_BASE + 0x74, 0x0000_0010); // misc
-        reg_write(RAC_BASE + 0x78, 0x0000_01C3); // misc
-        // 0x7C = RAIL RAM pointer (skip)
+        // CTRL (0x00C): Enable active/PA/LNA polarities
+        // From baremetal: ACTIVEPOL | PAENPOL | LNAENPOL = 0x381
+        reg_write(RAC_CTRL, 0x0000_0381);
 
-        // Enable RAC sequencer (bit 0 of CTRL at 0x0C)
-        let ctrl = reg_read(RAC_BASE + 0x0C);
-        reg_write(RAC_BASE + 0x0C, ctrl | 1);
+        // SYNTHREGCTRL (0x09C): voltage regulator trims for synth
+        // From baremetal: CHPLDOVREFTRIM=3, CHPLDOAMPCURR=3, etc.
+        reg_write(RAC_SYNTHREGCTRL, 0x0000_0FFF);
 
-        // Clear and enable relevant IRQs
-        reg_write(RAC_IFC, RAC_IF_TXDONE | RAC_IF_RXDONE | RAC_IF_RXOF);
-        reg_write(RAC_IEN, RAC_IF_TXDONE | RAC_IF_RXDONE);
+        // VCOCTRL (0x0A0): VCO control
+        reg_write(RAC_VCOCTRL, 0x0F00_277A);
+
+        // IFPGACTRL (0x138): IF PGA control — band select + gain
+        reg_write(RAC_IFPGACTRL, 0x0000_87F6);
+
+        // IFFILTCTRL (0x140): IF filter control
+        reg_write(RAC_IFFILTCTRL, 0x0088_00E0);
+
+        // IFADCCTRL (0x144): IF ADC control
+        reg_write(RAC_IFADCCTRL, 0x1153_E6C0);
+
+        // Clear force-disable if set
+        let ctrl = reg_read(RAC_CTRL);
+        if ctrl & (1 << 14) != 0 { // FORCEDISABLE bit
+            reg_write(RAC_CTRL, ctrl & !(1 << 14));
+        }
+
+        // Clear pending IRQs
+        reg_write(RAC_IFC, 0xFFFF_FFFF);
     }
 
     /// Configure BUFC (Buffer Controller) with RAM buffer addresses.
@@ -803,6 +918,14 @@ impl Efr32Driver {
         reg_write(FRC_IFC, FRC_IF_TXDONE);
         reg_write(RAC_IFC, RAC_IF_TXDONE);
 
+        // Critical sequencer steps (from baremetal reference):
+        // 1. Clear "radio disabled" flag in sequencer control
+        let seq_ctrl = reg_read(SEQ_CONTROL_REG);
+        reg_write(SEQ_CONTROL_REG, seq_ctrl & !0x20);
+        // 2. Set IFPGA band select for 2.4 GHz
+        let ifpga = reg_read(RAC_IFPGACTRL);
+        reg_write(RAC_IFPGACTRL, ifpga | (1 << 16)); // BANDSEL
+
         // Start TX via RAC — the sequencer handles SYNTH cal, PA, FRC
         reg_write(RAC_CMD, RAC_CMD_TXEN);
 
@@ -812,12 +935,21 @@ impl Efr32Driver {
             self.config.channel
         );
 
-        // Wait for TX completion IRQ (FRC_IF_TXDONE)
-        let ok = TX_DONE.wait().await;
-        if ok {
-            Ok(())
-        } else {
-            Err(RadioError::HardwareError)
+        // Wait for TX completion with timeout (poll-based, ~100ms max)
+        let mut timeout_loops = 0u32;
+        loop {
+            // Check if TX_DONE was signaled
+            if let Some(ok) = TX_DONE.try_take() {
+                return if ok { Ok(()) } else { Err(RadioError::HardwareError) };
+            }
+            timeout_loops += 1;
+            if timeout_loops > 1_000_000 {
+                // TX timed out — abort and return error
+                reg_write(RAC_CMD, RAC_CMD_TXDIS);
+                log::warn!("efr32: TX timeout, RAC={:#X}", reg_read(RAC_STATUS));
+                return Err(RadioError::HardwareError);
+            }
+            core::hint::spin_loop();
         }
     }
 
@@ -847,8 +979,13 @@ impl Efr32Driver {
         reg_write(FRC_IFC, FRC_IF_RXDONE | FRC_IF_RXOF | FRC_IF_FRAMEERROR);
         reg_write(RAC_IFC, RAC_IF_RXDONE | RAC_IF_RXOF);
 
-        // Start RX via RAC — sequencer handles LNA, SYNTH, FRC
-        reg_write(RAC_CMD, RAC_CMD_RXEN);
+        // Clear sequencer disable flag and set band select (same as TX)
+        let seq_ctrl = reg_read(SEQ_CONTROL_REG);
+        reg_write(SEQ_CONTROL_REG, seq_ctrl & !0x20);
+        reg_write(RAC_IFPGACTRL, 0x0000_87F6);
+
+        // Start RX via RXENSRCEN (software RX enable, as the baremetal does)
+        reg_write(_RAC_RXENSRCEN, 0x02);
 
         // Wait for RX completion
         RX_DONE.wait().await;

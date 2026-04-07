@@ -36,18 +36,70 @@ use panic_halt as _;
 #[allow(unused_imports)]
 use vectors::__INTERRUPTS;
 
+// ── Gecko Bootloader Application Properties ─────────────────────
+//
+// The Gecko Bootloader requires an ApplicationProperties_t struct
+// in flash so it can identify, validate, and boot the application.
+// The bootloader finds it via word 13 (offset 0x34) of the vector table.
+//
+// Struct layout from Silicon Labs application_properties.h:
+//   magic[16]         — 16-byte magic identifier
+//   structVersion     — version of this struct (0x0100)
+//   signatureType     — 0 = none, 1 = ECDSA-P256, 2 = CRC32
+//   signatureLocation — address of signature (0xFFFFFFFF = none)
+//   app.type          — APPLICATION_TYPE_ZIGBEE = 1
+//   app.version       — application version number
+//   app.capabilities  — 0
+//   app.productId[16] — UUID (all zeros)
+
+#[repr(C)]
+struct ApplicationProperties {
+    magic: [u8; 16],
+    struct_version: u32,
+    signature_type: u32,
+    signature_location: u32,
+    // ApplicationData_t inline:
+    app_type: u32,
+    app_version: u32,
+    app_capabilities: u32,
+    app_product_id: [u8; 16],
+}
+
+#[unsafe(no_mangle)]
+#[used]
+static APP_PROPERTIES: ApplicationProperties = ApplicationProperties {
+    magic: [
+        0x13, 0xb7, 0x79, 0xfa,
+        0xc9, 0x25, 0xdd, 0xb7,
+        0xad, 0xf3, 0xcf, 0xe0,
+        0xf1, 0xb6, 0x14, 0xb8,
+    ],
+    struct_version: 0x0000_0100,     // Version 1.0
+    signature_type: 0,                // APPLICATION_SIGNATURE_NONE
+    signature_location: 0xFFFF_FFFF,  // No signature
+    app_type: 1,                      // APPLICATION_TYPE_ZIGBEE
+    app_version: 1,                   // Version 1
+    app_capabilities: 0,
+    app_product_id: [0u8; 16],
+};
+
+// ── VTOR setup ──────────────────────────────────────────────────
+//
+// When booting via Gecko Bootloader at 0x4000, uncomment this to
+// redirect the vector table. For bare-metal boot at 0x0, VTOR
+// defaults to 0x0 which is correct.
+
+// #[cortex_m_rt::pre_init]
+// unsafe fn pre_init() {
+//     unsafe {
+//         core::ptr::write_volatile(0xE000_ED08 as *mut u32, 0x0000_4000);
+//     }
+// }
+
 // Custom HardFault handler that saves faulting PC to known RAM location
 // so we can read it via J-Link after the crash.
 #[cortex_m_rt::exception]
 unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
-    // Save exception frame and stack info for post-mortem analysis
-    // 0x20000000 = magic marker  
-    // 0x20000004 = faulting PC
-    // 0x20000008 = LR at fault
-    // 0x2000000C = xPSR
-    // 0x20000010 = MSP (current stack pointer)
-    // 0x20000014 = R0 from exception frame
-    // 0x20000018 = R12 from exception frame
     unsafe {
         let msp: u32;
         core::arch::asm!("mrs {}, msp", out(reg) msp);
