@@ -226,7 +226,7 @@ const _FRC_WCNTCMP1: u32 = FRC_BASE + 0x01C;
 /// FRC word count compare 2.
 const _FRC_WCNTCMP2: u32 = FRC_BASE + 0x020;
 /// FRC command register — BIT(0)=RXABORT, BIT(1)=FRAMEDETRESUME.
-const _FRC_CMD: u32 = FRC_BASE + 0x024;
+const FRC_CMD: u32 = FRC_BASE + 0x024;
 /// FRC whitening control.
 const _FRC_WHITECTRL: u32 = FRC_BASE + 0x028;
 /// FRC whitening polynomial.
@@ -271,7 +271,7 @@ const _FRC_FCD3: u32 = FRC_BASE + 0x0AC;
 // ── FRC Command Bits (FRC_CMD at 0x024) ─────────────────────────
 
 /// Abort current RX operation.
-const _FRC_CMD_RXABORT: u32 = 1 << 0;
+const FRC_CMD_RXABORT: u32 = 1 << 0;
 /// Resume frame detection after abort.
 const _FRC_CMD_FRAMEDETRESUME: u32 = 1 << 1;
 
@@ -357,10 +357,16 @@ const BUFC_BUFSIZE_256: u32 = 2;
 
 // ── Static RAM buffers for BUFC DMA ─────────────────────────────
 
+/// Word-aligned buffer wrapper for BUFC DMA.
+/// BUFC requires buffer addresses to be word-aligned (4 bytes).
+/// Rust `[u8; N]` has alignment 1, which is insufficient.
+#[repr(C, align(4))]
+struct AlignedBuf<const N: usize>([u8; N]);
+
 /// TX RAM buffer pointed to by BUFC BUF0_ADDR.
-static BUFC_TX_RAM: SyncUnsafeCell<[u8; 256]> = SyncUnsafeCell::new([0u8; 256]);
+static BUFC_TX_RAM: SyncUnsafeCell<AlignedBuf<256>> = SyncUnsafeCell::new(AlignedBuf([0u8; 256]));
 /// RX RAM buffer pointed to by BUFC BUF1_ADDR.
-static BUFC_RX_RAM: SyncUnsafeCell<[u8; 256]> = SyncUnsafeCell::new([0u8; 256]);
+static BUFC_RX_RAM: SyncUnsafeCell<AlignedBuf<256>> = SyncUnsafeCell::new(AlignedBuf([0u8; 256]));
 
 // ── Register access helpers ─────────────────────────────────────
 
@@ -517,6 +523,17 @@ impl Efr32Driver {
 
         self.initialized = true;
 
+        // Start RX NOW — all peripherals (CRC, FRC, MODEM, BUFC, SYNTH, AGC)
+        // are fully configured. This is where the baremetal reference calls
+        // radio_startrx().
+        let ctrl = reg_read(SEQ_CONTROL_REG);
+        reg_write(SEQ_CONTROL_REG, ctrl & !0x20); // Clear "radio disabled" flag
+        reg_write(RAC_IFPGACTRL, 0x0000_87F6);    // IFPGA for 2.4 GHz RX
+        reg_write(_RAC_RXENSRCEN, 0x02);           // Software RX enable
+
+        // Wait for RX to come up
+        for _ in 0..50_000u32 { core::hint::spin_loop(); }
+
         // Debug: dump critical register values after init
         rtt_target::rprintln!("=== POST-INIT DUMP ===");
         rtt_target::rprintln!("FRC: CTRL={:#X} RXCTRL={:#X} FECCTRL={:#X}",
@@ -532,6 +549,15 @@ impl Efr32Driver {
             reg_read(SYNTH_FREQ), reg_read(SYNTH_DIVCTRL), reg_read(SYNTH_IFFREQ));
         rtt_target::rprintln!("SEQ: CTRL_REG={:#X} TRANSITIONS={:#X}",
             reg_read(SEQ_CONTROL_REG), reg_read(_SEQ_TRANSITIONS));
+        // Dump CRC peripheral to verify register offsets are correct.
+        // We expect: +0x000=0x704 (CTRL), +0x008=0x0 (INIT), +0x00C=0x8408 (POLY).
+        // If POLY shows 0x0 at +0x00C, the offsets need adjustment.
+        rtt_target::rprintln!("CRC @0x40082000: +0={:#X} +4={:#X} +8={:#X} +C={:#X} +10={:#X} +14={:#X} +18={:#X}",
+            reg_read(0x4008_2000), reg_read(0x4008_2004),
+            reg_read(0x4008_2008), reg_read(0x4008_200C),
+            reg_read(0x4008_2010), reg_read(0x4008_2014),
+            reg_read(0x4008_2018));
+        rtt_target::rprintln!("RAC state={}", (reg_read(RAC_STATUS) >> 24) & 0x0F);
         rtt_target::rprintln!("=== END DUMP ===");
     }
 
@@ -666,14 +692,16 @@ impl Efr32Driver {
         reg_write(SEQ_SYNTHLPFCTRLRX, 0x0003_C002);
         reg_write(SEQ_SYNTHLPFCTRLTX, 0x0003_C002);
 
-        // 9. Start RX (baremetal calls radio_startrx after all config)
-        let ctrl = reg_read(SEQ_CONTROL_REG);
-        reg_write(SEQ_CONTROL_REG, ctrl & !0x20);
-        reg_write(RAC_IFPGACTRL, 0x0000_87F6);
-        reg_write(_RAC_RXENSRCEN, 0x02);
+        // 9. NOTE: Do NOT start RX here! The baremetal reference calls
+        //    radio_startrx() AFTER all config (FRC, MODEM, BUFC, SYNTH, AGC).
+        //    Starting RX now would enter RXSEARCH with unconfigured peripherals:
+        //    - BUFC BUF1_ADDR = 0 → DMA writes to flash address 0!
+        //    - FRC has no frame format → can't delimit frames
+        //    - CRC polynomial not set → CRC engine uninitialized
+        //    RX is started at the end of init_hardware() instead.
 
         for _ in 0..50_000u32 { core::hint::spin_loop(); }
-        rtt_target::rprintln!("efr32: after RX start: SEQST={:#X} RAC={:#X}",
+        rtt_target::rprintln!("efr32: after seq load: SEQST={:#X} RAC={:#X}",
             reg_read(RAC_SEQSTATUS), reg_read(RAC_STATUS));
     }
 
@@ -851,18 +879,28 @@ impl Efr32Driver {
     /// Without configuring CRC, all received frames fail CRC validation
     /// and are silently dropped by the FRC — no RXDONE interrupt fires.
     fn configure_crc(&self) {
+        // Radio CRC peripheral at 0x40082000 — same IP block as GPCRC.
+        // Register layout matches CMSIS GPCRC TypeDef (NOT the ad-hoc
+        // offsets we had before — +0x010/+0x018 were WRONG and wrote
+        // POLY/INIT to DATA/reserved instead of the real registers).
         const CRC_BASE: u32 = 0x4008_2000;
         const CRC_CTRL: u32 = CRC_BASE + 0x000;
-        const CRC_INIT: u32 = CRC_BASE + 0x010;
-        const CRC_POLY: u32 = CRC_BASE + 0x018;
+        const CRC_CMD: u32  = CRC_BASE + 0x004;
+        const CRC_INIT: u32 = CRC_BASE + 0x010; // confirmed from reference dump
+        const CRC_POLY: u32 = CRC_BASE + 0x018; // confirmed: reference shows 0x8408 at +0x18
 
-        // Values from reference firmware register dump:
-        //   CTRL = 0x704: BITSPERWORD=7 (bits[10:8]), CRCWIDTH=0 (bits[4:3])
-        //   POLY = 0x8408: reversed CRC-CCITT polynomial
-        //   INIT = 0x0000: initial seed
+        // IEEE 802.15.4 CRC-16/CCITT:
+        //   Polynomial: 0x1021 → bit-reflected for LSB-first = 0x8408
+        //   Seed: 0x0000
+        //   CTRL = 0x0704 (from reference firmware register dump):
+        //     bits[10:8] = 7 → BITSPERWORD = 8 bits/word
+        //     bit[2]     = 1 → CRCWIDTH encoding for 16-bit CRC
         reg_write(CRC_CTRL, 0x0000_0704);
-        reg_write(CRC_POLY, 0x0000_8408);
         reg_write(CRC_INIT, 0x0000_0000);
+        reg_write(CRC_POLY, 0x0000_8408);
+
+        // CMD bit 0 = INIT → load seed value into CRC accumulator
+        reg_write(CRC_CMD, 0x0000_0001);
     }
 
     /// Configure FRC (Frame Controller) for IEEE 802.15.4 frame format.
@@ -910,8 +948,10 @@ impl Efr32Driver {
         // Clear all pending FRC interrupt flags
         reg_write(FRC_IFC, 0xFFFF_FFFF);
 
-        // Enable FRC interrupts: TXDONE(0) | RXDONE(4) | FRAMEERROR(6) = 0x51
-        reg_write(FRC_IEN, FRC_IF_TXDONE | FRC_IF_RXDONE | FRC_IF_FRAMEERROR);
+        // Enable FRC interrupts: TXDONE(0) | RXDONE(4) | FRAMEERROR(6) | RXOF(8)
+        // RXOF must be enabled — the IRQ handler checks for it to signal
+        // RX errors, but it won't fire unless enabled in IEN.
+        reg_write(FRC_IEN, FRC_IF_TXDONE | FRC_IF_RXDONE | FRC_IF_FRAMEERROR | FRC_IF_RXOF);
     }
 
     /// Configure MODEM for IEEE 802.15.4 O-QPSK modulation at 250 kbps.
@@ -1213,6 +1253,12 @@ impl Efr32Driver {
         }
 
         RX_DONE.reset();
+
+        // Abort any in-progress RX before clearing buffers.
+        // After TX, the sequencer auto-transitions to RX (SEQ_TRANSITIONS=0x0202).
+        // If we clear BUF1 while FRC is writing to it, we corrupt state.
+        // FRC_CMD bit 0 = RXABORT.
+        reg_write(FRC_CMD, FRC_CMD_RXABORT);
 
         // Clear RX buffer (BUF1) and length buffer (BUF2)
         reg_write(BUFC_BUF1_CMD, 1);
