@@ -833,6 +833,10 @@ impl Efr32Driver {
         // HFXO retiming control
         reg_write(RAC_BASE + 0x030, 0x0000_0760); // HFXORETIMECTRL
 
+        // Sequencer prescaler — controls timing resolution.
+        // Reference value = 0x07. Without this, sequencer timing is off.
+        reg_write(RAC_BASE + 0x084, 0x0000_0007); // PRESC
+
         // Additional RAC registers from reference dump
         reg_write(RAC_BASE + 0x048, 0x0000_008C); // R0
         reg_write(RAC_BASE + 0x054, 0x0000_0004); // R3
@@ -1001,6 +1005,24 @@ impl Efr32Driver {
 
         for (i, &val) in MODEM_REGS.iter().enumerate() {
             reg_write(MODEM_BASE + 0x14 + (i as u32) * 4, val);
+        }
+
+        // DCCOMP (0x098): DC offset compensation — CRITICAL for RX!
+        // Without this, I/Q baseband has DC offset that prevents
+        // preamble/SFD detection. Reference value = 0x33.
+        reg_write(MODEM_BASE + 0x098, 0x0000_0033);
+
+        // MODEM RAM (0x400-0x43C): DSSS correlation lookup table.
+        // CRITICAL FOR RX: the O-QPSK demodulator uses this table to
+        // despread the received chip sequence into 4-bit symbols.
+        // Without it, the MODEM cannot decode ANY 802.15.4 frames!
+        // Values from reference firmware (halted CPU read).
+        static MODEM_RAM: [u32; 16] = [
+            0x60, 0x14, 0x77, 0x54, 0x58, 0x07, 0x37, 0x43,
+            0x7C, 0x56, 0x15, 0xAB, 0x68, 0x2C, 0x34, 0x30,
+        ];
+        for (i, &val) in MODEM_RAM.iter().enumerate() {
+            reg_write(MODEM_BASE + 0x400 + (i as u32) * 4, val);
         }
     }
 
