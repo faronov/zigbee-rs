@@ -155,10 +155,18 @@ const RAC_CMD_RXDIS: u32 = 1 << 8;       // was 1<<3!
 
 const RAC_STATUS_STATE_SHIFT: u32 = 24;
 const RAC_STATUS_STATE_MASK: u32 = 0x0F << RAC_STATUS_STATE_SHIFT;
-const _RAC_STATE_OFF: u32 = 0x00;
-const _RAC_STATE_IDLE: u32 = 0x01;
-const RAC_STATE_RX: u32 = 0x02 << RAC_STATUS_STATE_SHIFT;
-const _RAC_STATE_TX: u32 = 0x03 << RAC_STATUS_STATE_SHIFT;
+// RAC hardware state machine values (bits [27:24] of RAC_STATUS).
+// These are the 10 hardware states — NOT the same as sequencer states!
+const _RAC_STATE_OFF: u32 = 0x00;       // Radio off
+const _RAC_STATE_RXWARM: u32 = 0x01;    // RX warming up
+const RAC_STATE_RXSEARCH: u32 = 0x02;   // RX active, searching for preamble
+const _RAC_STATE_RXFRAME: u32 = 0x03;   // Receiving a frame
+const _RAC_STATE_RX2TX: u32 = 0x04;     // RX→TX turnaround
+const _RAC_STATE_TXWARM: u32 = 0x05;    // TX warming up
+const _RAC_STATE_TX: u32 = 0x06;        // Actively transmitting
+const _RAC_STATE_TXPD: u32 = 0x07;      // TX power-down
+const _RAC_STATE_TX2RX: u32 = 0x08;     // TX→RX turnaround
+const _RAC_STATE_SHUTDOWN: u32 = 0x09;  // Radio shutdown / error state
 
 // ── Sequencer RAM Variables (from VDowbensky/efr32_baremetal) ───
 //
@@ -202,7 +210,7 @@ const _RAC_IF_BUSERROR: u32 = 1 << 2;
 /// FRC status register (read-only).
 const _FRC_STATUS: u32 = FRC_BASE + 0x000;
 /// FRC data filter control.
-const _FRC_DFLCTRL: u32 = FRC_BASE + 0x004;
+const FRC_DFLCTRL: u32 = FRC_BASE + 0x004;
 /// FRC max frame length.
 const _FRC_MAXLENGTH: u32 = FRC_BASE + 0x008;
 /// FRC address filter control.
@@ -646,7 +654,12 @@ impl Efr32Driver {
         reg_write(SEQ_TX_RX_SEARCHTIME, 0);
 
         // State transitions: all → RX
-        reg_write(_SEQ_TRANSITIONS, 0x0404_0404);
+        // The sequencer uses its OWN state encoding, NOT the RAIL API encoding:
+        //   Sequencer: IDLE=0, RX=1, TX=2
+        //   RAIL API:  INACTIVE=0, IDLE=1, RX=2, TX=3
+        // One-hot bit for sequencer RX (state 1) = 1 << 1 = 0x02
+        // Previous value 0x04040404 was bit 2 = TX, causing TX→TX→SHUTDOWN!
+        reg_write(_SEQ_TRANSITIONS, 0x0202_0202);
 
         // SYNTH LPF
         reg_write(SEQ_SYNTHLPFCTRLRX, 0x0003_C002);
@@ -838,16 +851,24 @@ impl Efr32Driver {
     /// - FCD2: RX descriptor — CALCCRC | INCLUDECRC, buffer 1, WORDS=0xFF
     fn configure_frc(&self) {
         // ALL values from the running RAIL reference firmware dump.
-        //
-        // CTRL at 0x040: reference = 0x7A0 (not 0x700!)
-        //   bit 5 (0x20) = RXFCDMODE or TXFCDMODE flag
-        //   bits [10:8] = BITSPERWORD = 7
+
+        // DFLCTRL at 0x004: Dynamic Frame Length control for RX
+        // CRITICAL for RX: tells FRC how to extract frame length from PHR.
+        // Reference value = 0x00148001 (SINGLEBYTE mode, 7-bit length field)
+        // Without this, FRC can't delimit received frames!
+        reg_write(FRC_DFLCTRL, 0x0014_8001);
+
+        // MAXLENGTH at 0x008: max frame length for RX = 127 bytes (802.15.4)
+        // Without this, FRC may reject or truncate received frames.
+        reg_write(FRC_BASE + 0x008, 0x0000_007F);
+
+        // CTRL at 0x040: reference = 0x7A0
         reg_write(FRC_CTRL, 0x0000_07A0);
-        // RXCTRL at 0x044: reference = 0x68 (not 0x148001!)
+        // RXCTRL at 0x044: reference = 0x68
         reg_write(FRC_RXCTRL, 0x0000_0068);
         // TRAILRXDATA at 0x04C: reference = 0x1B
         reg_write(FRC_TRAILRXDATA, 0x0000_001B);
-        // FECCTRL at 0x034: reference = 0x0 (not 0x1!)
+        // FECCTRL at 0x034: reference = 0x0
         reg_write(FRC_FECCTRL, 0x0000_0000);
         // BLOCKRAMADDR at 0x038: clear
         reg_write(FRC_BLOCKRAMADDR, 0x0000_0000);
