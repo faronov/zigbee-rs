@@ -299,6 +299,17 @@ impl MacDriver for Efr32Mac {
                     let tx_result = self.driver.transmit(&beacon_req).await;
                     rtt_target::rprintln!("  tx={}", if tx_result.is_ok() { "ok" } else { "FAIL" });
 
+                    // Debug: check FRC_STATUS and RSSI during RX listen
+                    if ch == 15 {
+                        // Read radio state while listening
+                        let frc_status = unsafe { core::ptr::read_volatile(0x40080000 as *const u32) };
+                        let rac_status = unsafe { core::ptr::read_volatile(0x40084004 as *const u32) };
+                        let agc_rssi = unsafe { core::ptr::read_volatile(0x40087008 as *const u32) };
+                        let frc_if = unsafe { core::ptr::read_volatile(0x40080060 as *const u32) };
+                        rtt_target::rprintln!("  ch15 RX: FRC_ST={:#X} RAC={:#X} RSSI={:#X} FRC_IF={:#X}",
+                            frc_status, (rac_status >> 24) & 0xF, agc_rssi, frc_if);
+                    }
+
                     let deadline = embassy_time::Instant::now()
                         + embassy_time::Duration::from_millis(scan_duration_ms);
                     while !pan_descriptors.is_full() {
