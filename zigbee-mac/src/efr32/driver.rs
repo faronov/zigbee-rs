@@ -1085,17 +1085,28 @@ impl Efr32Driver {
         // Clear TX buffer (BUF0_CMD bit 0 = CLEAR)
         reg_write(BUFC_BUF0_CMD, 1);
 
-        // Write frame bytes to TX buffer one by one via BUF0_WRITEDATA.
-        // The PHR (length byte) is written first, then the PSDU payload.
-        let phr = (frame.len() + 2) as u8; // +2 for FCS appended by hardware
+        // IEEE 802.15.4 PPDU format:
+        //   Preamble (4 bytes) + SFD (1 byte) — handled by MODEM
+        //   PHR (1 byte) = PSDU length (frame + 2-byte FCS)
+        //   PSDU = frame bytes
+        //   FCS (2 bytes) — appended by FRC hardware (INCLUDECRC in FCD1)
+        //
+        // We write: PHR + frame bytes to BUFC.
+        // FRC appends the 2-byte CRC automatically.
+        // PHR value = frame.len() + 2 (includes the FCS that FRC will add)
+        let phr = (frame.len() + 2) as u8;
         reg_write(BUFC_BUF0_WRITEDATA, phr as u32);
         for &b in frame {
             reg_write(BUFC_BUF0_WRITEDATA, b as u32);
         }
 
-        // Tell FRC how many payload bytes to transmit (PHR + frame bytes)
-        let total_bytes = 1 + frame.len(); // 1 for PHR + payload
-        reg_write(FRC_WCNTCMP0, (total_bytes - 1) as u32);
+        // FRC_WCNTCMP0 = number of PAYLOAD bytes - 1 (NOT including PHR)
+        // The baremetal code: FRC->WCNTCMP0 = BUFC_TxBufferBytesAvailable() - 1
+        // which counts all bytes in the buffer (PHR + frame) minus 1.
+        // With two-subframe FCD: FCD0 handles first subframe (PHR, WORDS=0),
+        // FCD1 handles second subframe (payload, WORDS=0xFF).
+        // WCNTCMP0 counts TOTAL written bytes - 1.
+        reg_write(FRC_WCNTCMP0, (frame.len()) as u32); // PHR(1) + frame - 1
 
         // Clear pending FRC TX-done flags before starting
         reg_write(FRC_IFC, 0xFFFF_FFFF);
@@ -1111,13 +1122,13 @@ impl Efr32Driver {
         // Start TX via RAC — the sequencer handles SYNTH cal, PA, FRC
         reg_write(RAC_CMD, RAC_CMD_TXEN);
 
-        // Debug: log RAC state + FRC_IF after a short delay
-        for _ in 0..1_000u32 { core::hint::spin_loop(); }
+        // Debug: wait a bit longer and check if TXDONE fires
+        for _ in 0..10_000u32 { core::hint::spin_loop(); }
         let rac_st = reg_read(RAC_STATUS);
         let frc_if = reg_read(FRC_IF);
-        let seq_st = reg_read(RAC_SEQSTATUS);
-        rtt_target::rprintln!("  RAC={:#010X} FRC_IF={:#X} SEQ={:#X} FREQ={:#X}",
-            rac_st, frc_if, seq_st, reg_read(SYNTH_FREQ));
+        let rac_state = (rac_st >> 24) & 0x0F;
+        rtt_target::rprintln!("  RAC_st={} FRC_IF={:#X} FREQ={:#X}",
+            rac_state, frc_if, reg_read(SYNTH_FREQ));
 
         log::trace!(
             "efr32: tx {} bytes on ch{}",
@@ -1175,6 +1186,13 @@ impl Efr32Driver {
 
         // Start RX via RXENSRCEN (software RX enable, as the baremetal does)
         reg_write(_RAC_RXENSRCEN, 0x02);
+
+        // Debug: verify radio enters RX state
+        for _ in 0..5_000u32 { core::hint::spin_loop(); }
+        let rac_state = (reg_read(RAC_STATUS) >> 24) & 0x0F;
+        if rac_state != 2 {
+            rtt_target::rprintln!("  RX: state={} (expected 2)", rac_state);
+        }
 
         // Wait for RX completion
         RX_DONE.wait().await;
