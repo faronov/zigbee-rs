@@ -19,12 +19,25 @@ impl<M: MacDriver> NwkLayer<M> {
         cmd_id: NwkCommandId,
         cmd_payload: &[u8],
     ) -> Result<(), NwkStatus> {
+        let is_broadcast = dst_addr.0 >= 0xFFF8;
+        let radius = if is_broadcast { 30 } else { 10 };
+        self.send_nwk_command_with_radius(dst_addr, cmd_id, cmd_payload, radius)
+            .await
+    }
+
+    /// Build and send a NWK command frame with explicit radius.
+    async fn send_nwk_command_with_radius(
+        &mut self,
+        dst_addr: ShortAddress,
+        cmd_id: NwkCommandId,
+        cmd_payload: &[u8],
+        radius: u8,
+    ) -> Result<(), NwkStatus> {
         if !self.joined {
             return Err(NwkStatus::InvalidRequest);
         }
 
         let seq = self.nib.next_seq();
-        let is_broadcast = dst_addr.0 >= 0xFFF8;
 
         let header = NwkHeader {
             frame_control: NwkFrameControl {
@@ -40,7 +53,7 @@ impl<M: MacDriver> NwkLayer<M> {
             },
             dst_addr,
             src_addr: self.nib.network_address,
-            radius: if is_broadcast { 30 } else { 10 },
+            radius,
             seq_number: seq,
             dst_ieee: None,
             src_ieee: Some(self.nib.ieee_address),
@@ -237,7 +250,7 @@ impl<M: MacDriver> NwkLayer<M> {
     pub async fn send_many_to_one_rreq(&mut self) -> Result<(), NwkStatus> {
         let rreq_id = self.nib.next_route_request_id();
         let rreq = RouteRequest {
-            command_options: 0x08, // Bit 3 = many-to-one
+            command_options: self.concentrator_type.rreq_options(),
             route_request_id: rreq_id,
             dst_addr: self.nib.network_address, // Concentrator is both source and dest
             path_cost: 0,
@@ -247,15 +260,19 @@ impl<M: MacDriver> NwkLayer<M> {
         let len = rreq.serialize(&mut payload);
 
         log::info!(
-            "[NWK] Sending many-to-one RREQ (id={}, addr=0x{:04X})",
+            "[NWK] Sending many-to-one RREQ (id={}, addr=0x{:04X}, {:?})",
             rreq_id,
             self.nib.network_address.0,
+            self.concentrator_type,
         );
 
-        self.send_nwk_command(
+        // Use concentrator_radius instead of default broadcast radius
+        let radius = self.concentrator_radius;
+        self.send_nwk_command_with_radius(
             ShortAddress::BROADCAST,
             NwkCommandId::RouteRequest,
             &payload[..len],
+            radius,
         )
         .await
     }

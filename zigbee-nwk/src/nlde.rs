@@ -73,6 +73,25 @@ impl<M: MacDriver> NwkLayer<M> {
         // Note: multicast flag is ONLY for group-addressed frames (via APS group delivery).
         // Broadcast addresses (0xFFF8-0xFFFF) must NOT set the multicast flag.
         // End devices suppress route discovery (parent handles routing).
+
+        // If we're a concentrator with a cached source route, attach it to the header
+        let source_route_subframe = if self.concentrator_active {
+            self.source_route_table.lookup(dst_addr).map(|relays| {
+                let mut relay_list = heapless::Vec::new();
+                for addr in relays {
+                    let _ = relay_list.push(*addr);
+                }
+                crate::frames::SourceRoute {
+                    relay_count: relay_list.len() as u8,
+                    relay_index: relay_list.len() as u8,
+                    relay_list,
+                }
+            })
+        } else {
+            None
+        };
+        let has_source_route = source_route_subframe.is_some();
+
         let header = NwkHeader {
             frame_control: NwkFrameControl {
                 frame_type: NwkFrameType::Data as u8,
@@ -84,7 +103,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 },
                 multicast: false,
                 security: security_enable && self.nib.security_enabled,
-                source_route: false,
+                source_route: has_source_route,
                 dst_ieee_present: false,
                 src_ieee_present: false,
                 end_device_initiator: false, // Maximise compatibility with older stacks
@@ -96,7 +115,7 @@ impl<M: MacDriver> NwkLayer<M> {
             dst_ieee: None,
             src_ieee: None,
             multicast_control: None,
-            source_route: None,
+            source_route: source_route_subframe,
         };
 
         // Serialize NWK frame
@@ -164,6 +183,27 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // Determine MAC-level next hop
         let next_hop = self.resolve_next_hop(dst_addr)?;
+
+        // Auto Route Record: if the destination route requires a Route Record
+        // (many-to-one concentrator), send it BEFORE the data frame.
+        // This is how devices inform the concentrator of the reverse path.
+        if dst_addr.0 < 0xFFF8 {
+            let needs_rr = self
+                .routing
+                .get_entry(dst_addr)
+                .map(|e| e.route_record_required)
+                .unwrap_or(false);
+            if needs_rr {
+                // Send Route Record with empty relay list (we're the originator)
+                // Intermediate routers will append their addresses as it's forwarded
+                log::debug!(
+                    "[NWK] Sending Route Record to concentrator 0x{:04X}",
+                    dst_addr.0
+                );
+                let _ = self.send_route_record(dst_addr, &[]).await;
+                self.routing.clear_route_record_required(dst_addr);
+            }
+        }
 
         log::info!(
             "[NWK TX] dst=0x{:04X} next_hop=0x{:04X} sec={} len={} hdr={:02X?}",
@@ -357,14 +397,6 @@ impl<M: MacDriver> NwkLayer<M> {
         // Determine next hop for the final destination
         let next_hop = self.resolve_next_hop(header.dst_addr)?;
 
-        // ── Route Record insertion: if the route requires a route record,
-        // append our address to the relay list in the NWK header ──
-        let needs_route_record = self
-            .routing
-            .get_entry(header.dst_addr)
-            .map(|e| e.route_record_required)
-            .unwrap_or(false);
-
         // Check if next hop is a sleepy child — buffer in indirect queue
         if let Some(neighbor) = self.neighbors.find_by_short(next_hop)
             && !neighbor.rx_on_when_idle
@@ -373,9 +405,6 @@ impl<M: MacDriver> NwkLayer<M> {
             let mut relay_buf = [0u8; 128];
             let mut new_header = header.clone();
             new_header.radius = new_radius;
-            if needs_route_record {
-                self.insert_route_record(&mut new_header);
-            }
             let hdr_len = new_header.serialize(&mut relay_buf);
             let (_, orig_hdr_len) = match NwkHeader::parse(original) {
                 Some(parsed) => parsed,
@@ -398,13 +427,10 @@ impl<M: MacDriver> NwkLayer<M> {
             return Err(NwkStatus::FrameNotBuffered);
         }
 
-        // Rebuild frame with decremented radius (and optional route record)
+        // Rebuild frame with decremented radius
         let mut relay_buf = [0u8; 128];
         let mut new_header = header.clone();
         new_header.radius = new_radius;
-        if needs_route_record {
-            self.insert_route_record(&mut new_header);
-        }
         let hdr_len = new_header.serialize(&mut relay_buf);
 
         // Copy original payload (everything after header)
@@ -514,27 +540,6 @@ impl<M: MacDriver> NwkLayer<M> {
     ///
     /// If the header doesn't have a source route subframe, create one.
     /// This allows the concentrator to learn the reverse path.
-    fn insert_route_record(&self, header: &mut NwkHeader) {
-        let our_addr = self.nib.network_address;
-
-        if let Some(ref mut sr) = header.source_route {
-            // Append our address to the relay list
-            let _ = sr.relay_list.push(our_addr);
-            sr.relay_count = sr.relay_list.len() as u8;
-            sr.relay_index = sr.relay_count;
-        } else {
-            // Create a new source route subframe with just our address
-            let mut relay_list = heapless::Vec::new();
-            let _ = relay_list.push(our_addr);
-            header.source_route = Some(crate::frames::SourceRoute {
-                relay_count: 1,
-                relay_index: 1,
-                relay_list,
-            });
-            header.frame_control.source_route = true;
-        }
-    }
-
     /// Handle relay failure: remove broken route and queue Network Status error.
     fn handle_relay_failure(
         &mut self,
@@ -762,11 +767,20 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // ── Many-to-one RREQ: install route to concentrator, rebroadcast, no RREP ──
         if is_many_to_one {
+            // Determine concentrator type from RREQ command_options bits 3-4:
+            // bit 3 set, bit 4 clear = LowRam (0x08)
+            // bit 3 set, bit 4 set = HighRam (0x18)
+            let conc_type = if rreq.command_options & 0x10 != 0 {
+                crate::routing::ConcentratorType::HighRam
+            } else {
+                crate::routing::ConcentratorType::LowRam
+            };
+
             // Install route to the concentrator (RREQ originator = dst_addr in RREQ)
             // via the sender
             let _ = self
                 .routing
-                .update_route_many_to_one(rreq.dst_addr, src, rreq.path_cost);
+                .update_route_many_to_one(rreq.dst_addr, src, rreq.path_cost, conc_type);
 
             log::info!(
                 "[NWK] Many-to-one route installed: concentrator=0x{:04X} via 0x{:04X}",
@@ -943,19 +957,29 @@ impl<M: MacDriver> NwkLayer<M> {
             return;
         }
 
+        // Parse the full relay list from the payload
+        let mut relay_list: heapless::Vec<ShortAddress, { crate::routing::MAX_SOURCE_ROUTE_RELAYS }> =
+            heapless::Vec::new();
+        for i in 0..relay_count.min(crate::routing::MAX_SOURCE_ROUTE_RELAYS) {
+            let offset = 1 + i * 2;
+            let addr = u16::from_le_bytes([payload[offset], payload[offset + 1]]);
+            let _ = relay_list.push(ShortAddress(addr));
+        }
+
         log::debug!(
-            "[NWK] RouteRecord from 0x{:04X}: {} relays",
+            "[NWK] RouteRecord from 0x{:04X}: {} relays {:?}",
             src.0,
-            relay_count
+            relay_count,
+            relay_list.as_slice(),
         );
 
-        // Store the source route in the routing table
-        // For many-to-one routing, update route to the source through the first relay
+        // Store the full relay path in the source route table (for concentrator TX)
+        self.source_route_table.insert(src, relay_list.as_slice());
+
+        // Also update the regular routing table with first-hop next hop
         if relay_count > 0 {
-            let first_relay = u16::from_le_bytes([payload[1], payload[2]]);
-            let _ = self
-                .routing
-                .update_route(src, ShortAddress(first_relay), relay_count as u8);
+            let first_relay = relay_list[0];
+            let _ = self.routing.update_route(src, first_relay, relay_count as u8);
         } else {
             // Direct neighbor, no relays
             let _ = self.routing.update_route(src, src, 0);

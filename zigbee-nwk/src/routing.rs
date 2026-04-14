@@ -2,6 +2,167 @@
 
 use zigbee_types::ShortAddress;
 
+// ── Concentrator type ─────────────────────────────────────────
+
+/// Many-to-one concentrator type (Zigbee R22 §3.4.1.3.1.1, bits 3-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcentratorType {
+    /// Low RAM concentrator (bit pattern 01) — devices MUST send Route Records
+    /// before every data frame because the concentrator may evict cached routes.
+    LowRam,
+    /// High RAM concentrator (bit pattern 11) — devices send Route Records once
+    /// and the concentrator caches them persistently.
+    HighRam,
+}
+
+impl ConcentratorType {
+    /// Route Request command_options byte for MTOR RREQ.
+    /// Bit 3 = many-to-one flag, Bit 4 = no route record (high RAM).
+    pub fn rreq_options(self) -> u8 {
+        match self {
+            ConcentratorType::LowRam => 0x08,  // bit 3 set
+            ConcentratorType::HighRam => 0x18, // bits 3+4 set
+        }
+    }
+}
+
+// ── Source Route Table ────────────────────────────────────────
+
+/// Maximum relay hops in a source route (Zigbee spec limit).
+pub const MAX_SOURCE_ROUTE_RELAYS: usize = 8;
+
+/// Maximum number of source route table entries.
+#[cfg(feature = "router")]
+pub const MAX_SOURCE_ROUTES: usize = 32;
+#[cfg(not(feature = "router"))]
+pub const MAX_SOURCE_ROUTES: usize = 0;
+
+/// A source route table entry — stores the full relay path to a destination.
+/// Populated from incoming Route Record commands at the concentrator.
+#[derive(Debug, Clone)]
+pub struct SourceRouteEntry {
+    pub destination: ShortAddress,
+    pub relay_list: heapless::Vec<ShortAddress, MAX_SOURCE_ROUTE_RELAYS>,
+    pub age: u16,
+    pub active: bool,
+}
+
+impl SourceRouteEntry {
+    fn empty() -> Self {
+        Self {
+            destination: ShortAddress(0xFFFF),
+            relay_list: heapless::Vec::new(),
+            age: 0,
+            active: false,
+        }
+    }
+}
+
+/// Source Route Table — used by concentrators to store relay paths learned
+/// from Route Record commands. When sending data to a device, the concentrator
+/// looks up the path here and attaches it as a source route subframe.
+pub struct SourceRouteTable {
+    entries: [SourceRouteEntry; MAX_SOURCE_ROUTES],
+}
+
+impl SourceRouteTable {
+    pub fn new() -> Self {
+        Self {
+            entries: core::array::from_fn(|_| SourceRouteEntry::empty()),
+        }
+    }
+
+    /// Insert or update a source route for a destination.
+    pub fn insert(&mut self, destination: ShortAddress, relay_list: &[ShortAddress]) {
+        // Update existing entry
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.active && e.destination == destination)
+        {
+            entry.relay_list.clear();
+            for addr in relay_list.iter().take(MAX_SOURCE_ROUTE_RELAYS) {
+                let _ = entry.relay_list.push(*addr);
+            }
+            entry.age = 0;
+            return;
+        }
+
+        // Find empty slot
+        let slot = if let Some(slot) = self.entries.iter_mut().find(|e| !e.active) {
+            slot
+        } else {
+            // Evict oldest entry
+            match self
+                .entries
+                .iter_mut()
+                .filter(|e| e.active)
+                .max_by_key(|e| e.age)
+            {
+                Some(victim) => victim,
+                None => return,
+            }
+        };
+
+        slot.destination = destination;
+        slot.relay_list.clear();
+        for addr in relay_list.iter().take(MAX_SOURCE_ROUTE_RELAYS) {
+            let _ = slot.relay_list.push(*addr);
+        }
+        slot.age = 0;
+        slot.active = true;
+    }
+
+    /// Look up the source route (relay list) for a destination.
+    pub fn lookup(&self, destination: ShortAddress) -> Option<&[ShortAddress]> {
+        self.entries
+            .iter()
+            .find(|e| e.active && e.destination == destination)
+            .map(|e| e.relay_list.as_slice())
+    }
+
+    /// Remove a source route entry.
+    pub fn remove(&mut self, destination: ShortAddress) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.active && e.destination == destination)
+        {
+            entry.active = false;
+        }
+    }
+
+    /// Age all entries and expire those exceeding max_age.
+    pub fn age_and_expire(&mut self, max_age: u16) {
+        for entry in self.entries.iter_mut().filter(|e| e.active) {
+            entry.age = entry.age.saturating_add(1);
+            if entry.age > max_age {
+                entry.active = false;
+                log::debug!(
+                    "[NWK] Source route to 0x{:04X} expired (age={})",
+                    entry.destination.0,
+                    entry.age,
+                );
+            }
+        }
+    }
+
+    /// Number of active entries.
+    pub fn len(&self) -> usize {
+        self.entries.iter().filter(|e| e.active).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for SourceRouteTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Maximum routing table entries
 #[cfg(feature = "router")]
 pub const MAX_ROUTES: usize = 32;
@@ -283,13 +444,21 @@ impl RoutingTable {
     }
 
     /// Add or update a route to a many-to-one concentrator.
+    ///
+    /// `concentrator_type`: controls whether `route_record_required` is set.
+    /// - `LowRam`: always set (concentrator may evict cached routes)
+    /// - `HighRam`: only set on first install (concentrator caches persistently)
     #[allow(clippy::result_unit_err)]
     pub fn update_route_many_to_one(
         &mut self,
         destination: ShortAddress,
         next_hop: ShortAddress,
         cost: u8,
+        concentrator_type: ConcentratorType,
     ) -> Result<(), ()> {
+        // For LowRam, always require route record; for HighRam, only on new routes
+        let rr_required = concentrator_type == ConcentratorType::LowRam;
+
         // Update existing entry
         if let Some(entry) = self
             .routes
@@ -300,24 +469,28 @@ impl RoutingTable {
             entry.path_cost = cost;
             entry.status = RouteStatus::Active;
             entry.many_to_one = true;
-            entry.route_record_required = true;
+            if rr_required {
+                entry.route_record_required = true;
+            }
             entry.age = 0;
             return Ok(());
         }
 
         // Find empty slot
+        let new_entry = RouteEntry {
+            destination,
+            next_hop,
+            status: RouteStatus::Active,
+            many_to_one: true,
+            route_record_required: true, // Always required on first install
+            group_id: false,
+            path_cost: cost,
+            age: 0,
+            active: true,
+        };
+
         if let Some(slot) = self.routes.iter_mut().find(|r| !r.active) {
-            *slot = RouteEntry {
-                destination,
-                next_hop,
-                status: RouteStatus::Active,
-                many_to_one: true,
-                route_record_required: true,
-                group_id: false,
-                path_cost: cost,
-                age: 0,
-                active: true,
-            };
+            *slot = new_entry;
             Ok(())
         } else {
             // Evict oldest inactive
@@ -327,17 +500,7 @@ impl RoutingTable {
                 .filter(|r| r.active && r.status != RouteStatus::Active)
                 .max_by_key(|r| r.age)
             {
-                *victim = RouteEntry {
-                    destination,
-                    next_hop,
-                    status: RouteStatus::Active,
-                    many_to_one: true,
-                    route_record_required: true,
-                    group_id: false,
-                    path_cost: cost,
-                    age: 0,
-                    active: true,
-                };
+                *victim = new_entry;
                 Ok(())
             } else {
                 Err(())

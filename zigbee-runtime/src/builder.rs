@@ -21,6 +21,7 @@ pub struct DeviceBuilder<M: MacDriver> {
     date_code: &'static str,
     channel_mask: ChannelMask,
     power_mode: PowerMode,
+    concentrator: Option<(zigbee_nwk::routing::ConcentratorType, u16, u8)>,
 }
 
 impl<M: MacDriver> DeviceBuilder<M> {
@@ -35,6 +36,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             date_code: "",
             channel_mask: ChannelMask::ALL_2_4GHZ,
             power_mode: PowerMode::AlwaysOn,
+            concentrator: None,
         }
     }
 
@@ -80,6 +82,22 @@ impl<M: MacDriver> DeviceBuilder<M> {
         self
     }
 
+    /// Enable concentrator (many-to-one) mode for this device.
+    ///
+    /// Only valid for Router or Coordinator device types.
+    /// - `ctype`: LowRam (devices re-send Route Records each time) or HighRam (cached)
+    /// - `interval_secs`: how often to broadcast MTOR RREQ (default 60s)
+    /// - `radius`: hop limit for MTOR RREQ (default 5)
+    pub fn concentrator(
+        mut self,
+        ctype: zigbee_nwk::routing::ConcentratorType,
+        interval_secs: u16,
+        radius: u8,
+    ) -> Self {
+        self.concentrator = Some((ctype, interval_secs, radius));
+        self
+    }
+
     /// Add an endpoint with the given profile, device ID, and cluster configuration.
     pub fn endpoint(
         mut self,
@@ -120,6 +138,12 @@ impl<M: MacDriver> DeviceBuilder<M> {
             PowerMode::Sleepy { .. } | PowerMode::DeepSleep { .. } => false,
         };
         nwk.set_rx_on_when_idle(rx_on);
+
+        // Enable concentrator mode if requested
+        if let Some((ctype, interval, radius)) = self.concentrator {
+            nwk.start_concentrator(ctype, interval, radius);
+        }
+
         let aps = ApsLayer::new(nwk);
         let mut zdo = ZdoLayer::new(aps);
 

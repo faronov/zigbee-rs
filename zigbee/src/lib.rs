@@ -65,5 +65,6 @@ pub use zigbee_zcl as zcl;
 pub use zigbee_zdo as zdo;
 
 // Re-export commonly used types at top level
+pub use zigbee_nwk::routing::ConcentratorType;
 pub use zigbee_runtime::ZigbeeDevice;
 pub use zigbee_types::{Channel, ChannelMask, IeeeAddress, MacAddress, PanId, ShortAddress};

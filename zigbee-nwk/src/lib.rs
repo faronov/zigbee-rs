@@ -168,12 +168,18 @@ pub struct NwkLayer<M: MacDriver> {
     link_status_due: bool,
     /// Whether this device is operating as a concentrator (many-to-one).
     concentrator_active: bool,
+    /// Concentrator type (LowRam or HighRam).
+    concentrator_type: routing::ConcentratorType,
     /// Concentrator RREQ interval counter (seconds).
     concentrator_counter: u16,
     /// Concentrator RREQ interval (seconds, default 60).
     concentrator_interval: u16,
     /// Flag: concentrator RREQ should be sent in next async context.
     concentrator_rreq_due: bool,
+    /// nwkConcentratorRadius — hop limit for MTOR RREQ (default 5).
+    concentrator_radius: u8,
+    /// Source route table — stores full relay paths from Route Records.
+    source_route_table: routing::SourceRouteTable,
     /// Counter for stochastic child address assignment.
     next_child_addr_offset: u16,
 }
@@ -209,9 +215,12 @@ impl<M: MacDriver> NwkLayer<M> {
             link_status_counter: 0,
             link_status_due: false,
             concentrator_active: false,
+            concentrator_type: routing::ConcentratorType::LowRam,
             concentrator_counter: 0,
             concentrator_interval: 60,
             concentrator_rreq_due: false,
+            concentrator_radius: 5,
+            source_route_table: routing::SourceRouteTable::new(),
             next_child_addr_offset: 1,
         }
     }
@@ -367,17 +376,26 @@ impl<M: MacDriver> NwkLayer<M> {
     ///
     /// Only valid for coordinators and routers. The interval is in seconds
     /// (default 60s per Zigbee spec recommendation).
-    pub fn start_concentrator(&mut self, interval_secs: u16) {
+    pub fn start_concentrator(
+        &mut self,
+        concentrator_type: routing::ConcentratorType,
+        interval_secs: u16,
+        radius: u8,
+    ) {
         if self.device_type == DeviceType::EndDevice {
             log::warn!("[NWK] Cannot start concentrator on end device");
             return;
         }
         self.concentrator_active = true;
+        self.concentrator_type = concentrator_type;
         self.concentrator_interval = interval_secs;
         self.concentrator_counter = interval_secs; // Trigger immediately on first tick
+        self.concentrator_radius = radius;
         log::info!(
-            "[NWK] Concentrator mode enabled (interval={}s)",
-            interval_secs
+            "[NWK] Concentrator mode enabled ({:?}, interval={}s, radius={})",
+            concentrator_type,
+            interval_secs,
+            radius,
         );
     }
 
