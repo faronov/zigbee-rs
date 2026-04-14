@@ -24,6 +24,7 @@ struct ReassemblyEntry {
 }
 
 impl ReassemblyEntry {
+    #[allow(dead_code)]
     const fn empty() -> Self {
         Self {
             active: false,
@@ -77,9 +78,7 @@ impl FragmentReassembly {
     }
     #[cfg(not(feature = "router"))]
     pub const fn new() -> Self {
-        Self {
-            entries: [],
-        }
+        Self { entries: [] }
     }
 
     /// Insert a fragment (first or subsequent).

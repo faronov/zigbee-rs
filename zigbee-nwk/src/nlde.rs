@@ -778,9 +778,12 @@ impl<M: MacDriver> NwkLayer<M> {
 
             // Install route to the concentrator (RREQ originator = dst_addr in RREQ)
             // via the sender
-            let _ = self
-                .routing
-                .update_route_many_to_one(rreq.dst_addr, src, rreq.path_cost, conc_type);
+            let _ = self.routing.update_route_many_to_one(
+                rreq.dst_addr,
+                src,
+                rreq.path_cost,
+                conc_type,
+            );
 
             log::info!(
                 "[NWK] Many-to-one route installed: concentrator=0x{:04X} via 0x{:04X}",
@@ -958,8 +961,10 @@ impl<M: MacDriver> NwkLayer<M> {
         }
 
         // Parse the full relay list from the payload
-        let mut relay_list: heapless::Vec<ShortAddress, { crate::routing::MAX_SOURCE_ROUTE_RELAYS }> =
-            heapless::Vec::new();
+        let mut relay_list: heapless::Vec<
+            ShortAddress,
+            { crate::routing::MAX_SOURCE_ROUTE_RELAYS },
+        > = heapless::Vec::new();
         for i in 0..relay_count.min(crate::routing::MAX_SOURCE_ROUTE_RELAYS) {
             let offset = 1 + i * 2;
             let addr = u16::from_le_bytes([payload[offset], payload[offset + 1]]);
@@ -979,7 +984,9 @@ impl<M: MacDriver> NwkLayer<M> {
         // Also update the regular routing table with first-hop next hop
         if relay_count > 0 {
             let first_relay = relay_list[0];
-            let _ = self.routing.update_route(src, first_relay, relay_count as u8);
+            let _ = self
+                .routing
+                .update_route(src, first_relay, relay_count as u8);
         } else {
             // Direct neighbor, no relays
             let _ = self.routing.update_route(src, src, 0);

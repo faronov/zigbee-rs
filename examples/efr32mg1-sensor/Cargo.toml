@@ -39,3 +39,6 @@ stubs = []
 [profile.release]
 opt-level = "s"
 lto = true
+
+[build-dependencies]
+cc = "1.0"

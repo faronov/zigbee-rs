@@ -9,3 +9,4 @@
 *.diag
 *.sensor
 /docs/book/book/
+*.bin

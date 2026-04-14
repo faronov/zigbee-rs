@@ -30,6 +30,9 @@ embassy-nrf52833 = { package = "embassy-nrf", version = "0.3", features = ["nrf5
 # which conflicts with the modern ecosystem. Clock/GPIO init is done
 # via the C SDK or a future compatible HAL.
 
+# ── Telink TLSR82xx HAL backend ───────────────────────────────
+tlsr82xx-hal = { path = "../../tlsr82xx/tlsr82xx-hal", optional = true, default-features = false, features = ["chip-8258"] }
+
 # ── Shared Embassy async primitives (used by multiple backends)
 embassy-sync = { version = "0.7", optional = true }
 embassy-time = { version = "0.4", optional = true }
@@ -76,6 +79,12 @@ cc2340 = [
 
 telink = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
+]
+
+# Telink with HAL crate (uses tlsr82xx-hal instead of direct register access)
+telink-hal = [
+    "telink",
+    "dep:tlsr82xx-hal",
 ]
 
 phy6222 = [

@@ -193,19 +193,8 @@ async fn main(_spawner: Spawner) {
     rtt_target::rtt_init_print!();
     time_driver::init();
 
-    // Unmask radio IRQ (FRC_PRI = IRQ 1)
-    unsafe {
-        // Enable radio NVIC interrupts:
-        // - FrcPri (IRQ 1): high-priority FRC events (TX/RX done)
-        // - Frc (IRQ 3): regular FRC events 
-        // - Bufc (IRQ 7): buffer controller events
-        // NOTE: RAC_SEQ (IRQ 5) and RAC_RSM (IRQ 6) are NOT enabled —
-        // they fire continuously and starve the main executor loop.
-        // TX/RX completion is signaled via FRC interrupts instead.
-        cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::FrcPri);
-        cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::Frc);
-        cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::Bufc);
-    }
+    // NOTE: Radio NVIC IRQs are enabled AFTER RAIL init (inside init_hardware)
+    // to prevent premature IRQ firing during radio configuration.
 
     rtt_target::rprintln!("[EFR32] Starting...");
 

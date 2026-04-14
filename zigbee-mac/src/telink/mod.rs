@@ -27,6 +27,9 @@
 
 pub mod driver;
 
+#[cfg(feature = "telink-hal")]
+pub mod driver_hal;
+
 use crate::pib::{PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use crate::{MacCapabilities, MacDriver, MacError};
@@ -142,7 +145,12 @@ impl TelinkMac {
             beacon_order: 15, // 15 = non-beacon mode
             superframe_order: 15,
             response_wait_time: 32, // 32 × aBaseSuperframeDuration ≈ 491ms
-            dsn: 0,
+            dsn: {
+                // Seed DSN from system timer for randomization
+                // This prevents collisions with other devices starting at 0
+                let timer_val = unsafe { core::ptr::read_volatile(0x800740 as *const u32) };
+                (timer_val & 0xFF) as u8
+            },
             bsn: 0,
             beacon_payload: PibPayload::new(),
             max_csma_backoffs: 4,
@@ -204,10 +212,21 @@ impl TelinkMac {
         let mut frame = heapless::Vec::new();
         let seq = self.next_dsn();
 
-        // Frame Control: MAC command (type=3), no security, no pending,
-        // ack requested (bit 5), PAN ID compression (bit 6), dst=short, src=extended
-        // 0x63 = 0b_0110_0011 (low byte), 0xC8 = 0b_1100_1000 (high byte)
-        let _ = frame.extend_from_slice(&[0x63, 0xC8, seq]);
+        // Build Frame Control dynamically based on coordinator address type:
+        //   Type = MAC command (0b011)
+        //   Security = 0, Frame Pending = 0
+        //   Ack Request = 1 (bit 5)
+        //   PAN ID Compression = 1 (bit 6)
+        //   Dst addressing mode: 10 (short) or 11 (extended)
+        //   Frame version: 01 (802.15.4-2006)
+        //   Src addressing mode: 11 (extended — our IEEE address)
+        let dst_mode: u8 = match coord_address {
+            MacAddress::Short(_, _) => 0b10,    // Short address
+            MacAddress::Extended(_, _) => 0b11, // Extended address
+        };
+        let fc_lo: u8 = 0b0110_0011; // type=3, ack=1, panid_compress=1
+        let fc_hi: u8 = (0b11 << 6) | (0b01 << 4) | (dst_mode << 2);
+        let _ = frame.extend_from_slice(&[fc_lo, fc_hi, seq]);
 
         // Destination PAN + address
         let dst_pan = coord_address.pan_id();

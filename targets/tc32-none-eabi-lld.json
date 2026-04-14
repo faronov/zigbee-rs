@@ -1,7 +1,7 @@
 {
   "llvm-target": "thumbv6m-none-eabi",
   "metadata": {
-    "description": "Telink tc32 (Thumb-1 compatible) — TLSR825x family, pure Rust",
+    "description": "Telink tc32 (Thumb-1 compatible) — pure Rust with rust-lld",
     "host_tools": false,
     "std": false,
     "tier": 3
@@ -25,6 +25,6 @@
   "llvm-floatabi": "soft",
   "target-pointer-width": 32,
   "pre-link-args": {
-    "gnu-lld": ["-nostdlib", "--no-dynamic-linker"]
+    "gnu-lld": ["-nostdlib", "--gc-sections"]
   }
 }
