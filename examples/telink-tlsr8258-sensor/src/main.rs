@@ -382,6 +382,7 @@ pub extern "C" fn irq_handler() {
 // ── Radio DMA buffers (must be 4-byte aligned, in RAM) ─────────
 
 #[repr(align(4))]
+#[allow(dead_code)]
 struct DmaBuf([u8; 144]);
 
 static mut RF_RX_BUF: DmaBuf = DmaBuf([0u8; 144]);
@@ -675,7 +676,9 @@ mod radio {
     const REG_DMA2_MODE: *mut u8 = 0x800C0B as *mut u8;      // RX DMA mode (1=single, 3=pingpong)
 
     // SRX registers (from rf_start_srx disassembly)
+    #[allow(dead_code)]
     const REG_RF_SRX_TICK: *mut u32 = 0x800F18 as *mut u32;  // SRX start tick
+    #[allow(dead_code)]
     const REG_RF_SRX_TIMEOUT: *mut u32 = 0x800F28 as *mut u32; // SRX timeout
 
     /// Set RX DMA buffer address
@@ -710,6 +713,7 @@ mod radio {
 
     /// Disable DMA RX channel (bit 2)
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn disable_dma_rx() {
         unsafe {
             let v = core::ptr::read_volatile(REG_DMA_CHN_EN as *const u8);
@@ -912,6 +916,7 @@ fn analog_write(addr: u8, value: u8) {
 
 /// Direct analog register read with timeout
 #[inline(always)]
+#[allow(dead_code)]
 fn analog_read(addr: u8) -> u8 {
     let base = (REG_BASE + 0x0B8) as *mut u8;
     unsafe {
@@ -968,9 +973,11 @@ mod gpio {
     }
 
     // Port base addresses
+    #[allow(dead_code)]
     pub const PA: u32 = REG_BASE + 0x580;
     pub const PB: u32 = REG_BASE + 0x588;
     pub const PC: u32 = REG_BASE + 0x590;
+    #[allow(dead_code)]
     pub const PD: u32 = REG_BASE + 0x598;
 
     impl Pin {
@@ -999,6 +1006,7 @@ mod gpio {
         }
 
         /// Configure pin as GPIO input with input-enable
+        #[allow(dead_code)]
         pub fn set_input(self) {
             let mask = self.mask();
             unsafe {
@@ -1023,6 +1031,7 @@ mod gpio {
         }
 
         /// Read input level
+        #[allow(dead_code)]
         pub fn read(self) -> bool {
             unsafe {
                 let r = (self.port_base + 0) as *const u8;
@@ -1041,7 +1050,9 @@ mod board {
     pub const LED_RED:   Pin = Pin::new(gpio::PC, 1);  // RGB Red
     pub const LED_GREEN: Pin = Pin::new(gpio::PB, 5);  // RGB Green
     pub const LED_BLUE:  Pin = Pin::new(gpio::PC, 4);  // RGB Blue
+    #[allow(dead_code)]
     pub const LED_WHITE: Pin = Pin::new(gpio::PD, 4);  // Cool White
+    #[allow(dead_code)]
     pub const LED_WARM:  Pin = Pin::new(gpio::PA, 0);  // Warm Yellow
 }
 
@@ -1071,6 +1082,7 @@ const RX_INDICATION_LOOPS: u32 = 12_000_000;
 struct RxPacket {
     data: [u8; MAX_MAC_FRAME_LEN],
     len: usize,
+    #[allow(dead_code)]
     rssi: i8,
     lqi: u8,
 }
@@ -1105,7 +1117,7 @@ pub struct Tlsr8258Mac {
 
 impl Tlsr8258Mac {
     pub fn new() -> Self {
-        let rx_buf = unsafe { core::ptr::addr_of_mut!(RF_RX_BUF) as *mut u8 };
+        let rx_buf = core::ptr::addr_of_mut!(RF_RX_BUF) as *mut u8;
         radio::set_rx_dma_config(144);
         radio::set_rx_buffer(rx_buf);
         radio::set_channel(15);
@@ -1700,7 +1712,7 @@ impl MacDriver for Tlsr8258Mac {
 }
 
 fn write_tx_dma_frame(frame: &[u8]) {
-    let tx_buf = unsafe { core::ptr::addr_of_mut!(RF_TX_BUF) as *mut u8 };
+    let tx_buf = core::ptr::addr_of_mut!(RF_TX_BUF) as *mut u8;
     let mac_len = frame.len();
     unsafe {
         core::ptr::write_volatile(tx_buf.add(0), (mac_len + 1) as u8);
@@ -1776,6 +1788,7 @@ fn build_beacon_request(seq: u8) -> [u8; 8] {
     [0x03, 0x08, seq, 0xFF, 0xFF, 0xFF, 0xFF, 0x07]
 }
 
+#[cfg(all(not(feature = "sensor"), feature = "diag-assoc"))]
 fn build_long_tx_probe(seq: u8) -> [u8; 17] {
     [
         0x41, 0x88, seq, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12,
@@ -2073,8 +2086,9 @@ mod executor {
 /// Returns true if TX completed, false on timeout.
 /// Beacon request: FC=0x0803, DstPAN=0xFFFF, DstAddr=0xFFFF, Cmd=0x07
 #[inline(never)]
+#[cfg(all(not(feature = "sensor"), not(feature = "diag-assoc")))]
 fn send_beacon_request(seq: u8) -> bool {
-    let tx_buf = unsafe { core::ptr::addr_of_mut!(RF_TX_BUF) as *mut u8 };
+    let tx_buf = core::ptr::addr_of_mut!(RF_TX_BUF) as *mut u8;
     let mac_len: u8 = 8; // FC(2) + Seq(1) + DstPAN(2) + DstAddr(2) + CmdID(1)
 
     unsafe {
@@ -2125,6 +2139,7 @@ fn send_beacon_request(seq: u8) -> bool {
 /// Returns (pkt_received, is_beacon, frame_word).
 /// Uses busy-wait polling to catch first packet before DMA overwrite.
 #[inline(never)]
+#[cfg(all(not(feature = "sensor"), not(feature = "diag-assoc")))]
 fn scan_one(rx_buf: *mut u8, seq: u8) -> (bool, bool, u32) {
     radio::set_channel(15);
     radio::set_trx_off();
@@ -2186,7 +2201,7 @@ const OUR_EXT_ADDR: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
 /// `data` points to the TX DMA buffer already filled, starting at byte 0 (DMA header).
 #[inline(never)]
 fn tx_and_wait() -> bool {
-    let tx_buf = unsafe { core::ptr::addr_of_mut!(RF_TX_BUF) as *mut u8 };
+    let tx_buf = core::ptr::addr_of_mut!(RF_TX_BUF) as *mut u8;
     radio::set_trx_off();
     radio::set_tx_dma_config(144);
     radio::tx_done_clear();
@@ -2217,8 +2232,10 @@ fn tx_and_wait() -> bool {
 ///   FC(2) + Seq(1) + DstPAN(2) + DstShort(2) + SrcExt(8) + CmdID(1) + CapInfo(1) = 17 bytes
 ///   FC = 0xC823: cmd frame, ack_req, intra-PAN, dst=short, src=extended
 #[inline(never)]
+#[cfg(not(feature = "sensor"))]
+#[allow(dead_code)]
 fn send_assoc_request(pan_id: u16, coord_addr: u16, seq: u8) -> bool {
-    let tx_buf = unsafe { core::ptr::addr_of_mut!(RF_TX_BUF) as *mut u8 };
+    let tx_buf = core::ptr::addr_of_mut!(RF_TX_BUF) as *mut u8;
     let mac_len: u8 = 17; // FC(2)+Seq(1)+DstPAN(2)+DstShort(2)+SrcExt(8)+CmdID(1)+Cap(1)
 
     unsafe {
@@ -2264,8 +2281,10 @@ fn send_assoc_request(pan_id: u16, coord_addr: u16, seq: u8) -> bool {
 ///   FC(2) + Seq(1) + DstPAN(2) + DstShort(2) + SrcExt(8) + CmdID(1) = 16 bytes
 ///   FC = 0xC823: cmd, ack_req, intra-PAN, dst=short, src=extended
 #[inline(never)]
+#[cfg(not(feature = "sensor"))]
+#[allow(dead_code)]
 fn send_data_request(pan_id: u16, coord_addr: u16, seq: u8) -> bool {
-    let tx_buf = unsafe { core::ptr::addr_of_mut!(RF_TX_BUF) as *mut u8 };
+    let tx_buf = core::ptr::addr_of_mut!(RF_TX_BUF) as *mut u8;
     let mac_len: u8 = 16;
 
     unsafe {
@@ -2294,6 +2313,8 @@ fn send_data_request(pan_id: u16, coord_addr: u16, seq: u8) -> bool {
 /// Receive one packet with timeout.
 /// Returns (got_pkt, total_len). Caller reads rx_buf directly.
 #[inline(never)]
+#[cfg(not(feature = "sensor"))]
+#[allow(dead_code)]
 fn rx_with_timeout(rx_buf: *mut u8, timeout_loops: u32) -> (bool, u8) {
     radio::set_trx_off();
     radio::rx_done_clear();
@@ -2330,6 +2351,8 @@ fn rx_with_timeout(rx_buf: *mut u8, timeout_loops: u32) -> (bool, u8) {
 /// 3. Wait macResponseWaitTime then poll with Data Request
 /// 4. Receive Association Response (command 0x02)
 #[inline(never)]
+#[cfg(not(feature = "sensor"))]
+#[allow(dead_code)]
 fn try_associate(rx_buf: *mut u8, pan_id: u16, coord_addr: u16, seq: &mut u8) -> Option<u16> {
     // Step 1: Send Association Request
     radio::set_channel(15);
@@ -2426,6 +2449,7 @@ fn try_associate(rx_buf: *mut u8, pan_id: u16, coord_addr: u16, seq: &mut u8) ->
 // ── Mode entry points ──────────────────────────────────────────
 
 #[inline(never)]
+#[cfg(all(not(feature = "sensor"), not(feature = "diag-assoc")))]
 async fn diag_beacon_main(rx_buf: *mut u8) {
     let mut seq: u8 = 0;
     mark32(DBG_MODE_BASE + 0x00, 0xD1A600B0);
@@ -2451,6 +2475,7 @@ async fn diag_beacon_main(rx_buf: *mut u8) {
 }
 
 #[inline(never)]
+#[cfg(all(not(feature = "sensor"), feature = "diag-assoc"))]
 async fn diag_assoc_main() {
     mark32(DBG_MODE_BASE + 0x00, 0xD1A600A0);
     let mut mac = Tlsr8258Mac::new();
@@ -2612,7 +2637,8 @@ fn main_loop() -> ! {
     mark32(DBG_BOOT_BASE + 0x00, 0xCAFE0001_u32);
     mark32(DBG_BOOT_BASE + 0x08, async_timer::now_ticks());
 
-    let rx_buf = unsafe { core::ptr::addr_of_mut!(RF_RX_BUF) as *mut u8 };
+    #[cfg(all(not(feature = "sensor"), not(feature = "diag-assoc")))]
+    let rx_buf = core::ptr::addr_of_mut!(RF_RX_BUF) as *mut u8;
     radio::set_rx_dma_config(144);
 
     board::LED_RED.write(true);
