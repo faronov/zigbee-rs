@@ -62,15 +62,15 @@ Setup: see [modern-tc32/examples_rust](https://github.com/modern-tc32/examples_r
 The example has three firmware modes:
 
 - `diag-beacon`: raw beacon request plus RX parsing, no Zigbee runtime
-- `diag-assoc`: default mode, uses the new polling `MacDriver` to scan, associate, and poll
-- `sensor`: builds `ZigbeeDevice` on top of the same TLSR8258 MAC path
+- `diag-assoc`: bring-up mode, uses the new polling `MacDriver` to scan, associate, and poll
+- `sensor`: default mode, builds `ZigbeeDevice` on top of the same TLSR8258 MAC path
 
 Examples:
 
 ```bash
+$TC32_TOOLCHAIN/bin/cargo build --release
+$TC32_TOOLCHAIN/bin/cargo build --release --no-default-features --features diag-assoc
 $TC32_TOOLCHAIN/bin/cargo build --release --no-default-features --features diag-beacon
-$TC32_TOOLCHAIN/bin/cargo build --release --features diag-assoc
-$TC32_TOOLCHAIN/bin/cargo build --release --no-default-features --features sensor
 ```
 
 ## Flashing
@@ -86,6 +86,7 @@ TelinkBDT --chip 8258 --firmware target/tc32-unknown-none-elf/release/telink-tls
 - Pure-Rust startup, linker, IRQ entry, analog/clock bring-up
 - Pure-Rust TLSR8258 RF/DMA setup and channel programming
 - Polling MAC path for active scan, association, poll, TX, RX indication
+- `sensor` mode uses the validated pure-Rust association path as its default runtime
 - SRAM/SWire markers for bring-up checkpoints
 - No vendor SDK dependency in the TLSR8258 path yet
 

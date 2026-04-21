@@ -22,7 +22,7 @@ heapless = "0.9"
 panic-halt = "1.0"
 
 [features]
-default = ["diag-assoc"]
+default = ["sensor"]
 diag-beacon = []
 diag-assoc = []
 sensor = []
