@@ -16,12 +16,16 @@ zigbee-runtime = { path = "../../zigbee-runtime" }
 
 # Logging (stub — no output backend yet)
 log = "0.4"
+heapless = "0.9"
 
 # Panic handler
 panic-halt = "1.0"
 
 [features]
-default = []
+default = ["diag-assoc"]
+diag-beacon = []
+diag-assoc = []
+sensor = []
 
 [profile.release]
 opt-level = "s"

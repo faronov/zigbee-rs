@@ -11,41 +11,40 @@ reporting temperature and humidity via ZCL clusters 0x0402 and 0x0405.
 - **Button:** GPIO2 — join/leave network
 - **LED:** GPIO3
 
-## Build Modes
+## Build
 
-### 1. CI mode (no TC32 toolchain needed)
+### Real TC32 firmware
 
-```bash
-cd examples/telink-tlsr8258-sensor
-cargo build --release
-```
+Use the modern-tc32 prerelease toolchain from:
 
-Uses `thumbv6m-none-eabi` as a stand-in target. The radio driver uses pure-Rust
-register access, so no FFI stubs or vendor libraries are needed. This verifies
-the Rust code compiles but does NOT produce flashable firmware.
+`https://github.com/modern-tc32/rust/releases/tag/tc32-stage2-tc32-31`
 
-### 2. Real TC32 firmware (with modern-tc32 toolchain)
+For macOS x86_64:
 
 ```bash
-# Install the TC32 Rust toolchain
-# See: https://github.com/modern-tc32/examples_rust
+cd /tmp
+curl -L -O https://github.com/modern-tc32/rust/releases/download/tc32-stage2-tc32-31/tc32-rust-toolchain-macos-amd64.tar.gz
+tar -xf tc32-rust-toolchain-macos-amd64.tar.gz
 
-# Set paths
-export TC32_TOOLCHAIN=/path/to/toolchains/tc32-stage1
-export TC32_SDK_DIR=/path/to/tl_zigbee_sdk
-export TC32_LLVM_BIN=$TC32_TOOLCHAIN/llvm/bin
-
-# Build real tc32 firmware
-cd examples/telink-tlsr8258-sensor
+export TC32_TOOLCHAIN=/tmp/tc32-rust-toolchain-macos-amd64
+cd /path/to/zigbee-rs-fork/examples/telink-tlsr8258-sensor
 $TC32_TOOLCHAIN/bin/cargo build --release
 ```
 
-This produces a real `tc32-unknown-none-elf` binary flashable to TLSR8258 hardware.
+For macOS arm64, use the matching `tc32-rust-toolchain-macos-arm64.tar.gz`.
 
-The `build.rs` automatically:
-- Compiles Telink SDK C sources with `clang --target=tc32`
-- Links `libsoft-fp.a` from the SDK
-- Handles startup code and linker script
+This produces a real `tc32-unknown-none-elf` firmware image for TLSR8258. The
+example is pure Rust: no Telink SDK, no vendor libraries, no C compilation.
+
+### Local type-check without tc32 toolchain
+
+If you only want a fast structural check, use the repo target spec with nightly:
+
+```bash
+cd examples/telink-tlsr8258-sensor
+cargo -Zbuild-std=core -Zunstable-options -Zjson-target-spec check \
+  --target ../../targets/tc32-none-eabi.json
+```
 
 ## TC32 Toolchain
 
@@ -58,15 +57,20 @@ The TLSR8258 uses Telink's proprietary **tc32 instruction set**. The
 
 Setup: see [modern-tc32/examples_rust](https://github.com/modern-tc32/examples_rust)
 
-## Vendor Library
+## Modes
 
-| Library | SDK Path | Purpose |
-|---------|----------|---------|
-| `libsoft-fp.a` | `platform/tc32/` | Soft-float math |
+The example has three firmware modes:
+
+- `diag-beacon`: raw beacon request plus RX parsing, no Zigbee runtime
+- `diag-assoc`: default mode, uses the new polling `MacDriver` to scan, associate, and poll
+- `sensor`: builds `ZigbeeDevice` on top of the same TLSR8258 MAC path
+
+Examples:
 
 ```bash
-git clone https://github.com/telink-semi/tl_zigbee_sdk.git
-export TC32_SDK_DIR=/path/to/tl_zigbee_sdk
+$TC32_TOOLCHAIN/bin/cargo build --release --no-default-features --features diag-beacon
+$TC32_TOOLCHAIN/bin/cargo build --release --features diag-assoc
+$TC32_TOOLCHAIN/bin/cargo build --release --no-default-features --features sensor
 ```
 
 ## Flashing
@@ -77,27 +81,25 @@ Use the **Telink Burning & Debug Tool (BDT)** with a USB programmer:
 TelinkBDT --chip 8258 --firmware target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin
 ```
 
-## Features
+## Current status
 
-- Zigbee 3.0 SED with Identify, Temperature, Humidity, Battery clusters
-- NWK Leave handler with auto-rejoin
-- Default reporting with change thresholds
-- IEEE 802.15.4 radio via pure-Rust register access (no vendor C library)
-- Button-driven join/leave with factory reset
-- Two-tier power management:
-  - Radio sleep: disable RF+DMA+IRQ between polls (~5-8 mA saved)
-  - CPU suspend: ~3 µA with timer wake during slow poll intervals
-- Auto ED Timeout Request after join (index 14 ≈ 11 days)
+- Pure-Rust startup, linker, IRQ entry, analog/clock bring-up
+- Pure-Rust TLSR8258 RF/DMA setup and channel programming
+- Polling MAC path for active scan, association, poll, TX, RX indication
+- SRAM/SWire markers for bring-up checkpoints
+- No vendor SDK dependency in the TLSR8258 path yet
+
+Deep sleep and a polished sleepy end-device loop are still follow-up work after
+hardware validation of scan/associate/poll on the new toolchain.
 
 ## Project Structure
 
 ```
 telink-tlsr8258-sensor/
-├── .cargo/config.toml   # Target config (thumbv6m for CI, tc32 for real)
+├── .cargo/config.toml   # tc32 target config
 ├── Cargo.toml            # Dependencies
-├── build.rs              # Dual-mode: CI linking OR TC32 SDK compilation
-├── memory.x              # Flash @ 0x00000000, RAM @ 0x00840000
+├── build.rs              # Linker script setup
+├── memory.x              # Flash @ 0x00000000, RAM @ 0x00840900
 └── src/
-    ├── main.rs           # Entry point, SED loop, sensor clusters
-    └── stubs.rs          # Critical-section stubs for CI builds
+    └── main.rs           # Startup, RF bring-up, polling MAC, mode entry points
 ```
