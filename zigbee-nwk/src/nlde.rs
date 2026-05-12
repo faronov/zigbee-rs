@@ -10,6 +10,15 @@ use crate::{DeviceType, NwkLayer, NwkStatus};
 use zigbee_mac::{AddressMode, MacDriver, McpsDataRequest, TxOptions};
 use zigbee_types::*;
 
+#[cfg(feature = "efr32-trace")]
+macro_rules! nwk_trace {
+    ($($arg:tt)*) => { rtt_target::rprintln!($($arg)*); };
+}
+#[cfg(not(feature = "efr32-trace"))]
+macro_rules! nwk_trace {
+    ($($arg:tt)*) => {};
+}
+
 /// NWK data indication — received NWK-level data.
 #[derive(Debug)]
 pub struct NldeDataIndication<'a> {
@@ -213,6 +222,15 @@ impl<M: MacDriver> NwkLayer<M> {
             total_len,
             &nwk_buf[..core::cmp::min(8, total_len)],
         );
+        nwk_trace!(
+            "[NWK][EFR32] tx dst=0x{:04X} nh=0x{:04X} src=0x{:04X} sec={} len={} seq={}",
+            dst_addr.0,
+            next_hop.0,
+            self.nib.network_address.0,
+            (security_enable && self.nib.security_enabled) as u8,
+            total_len,
+            seq
+        );
 
         // Send via MAC
         let mac_result = self
@@ -231,10 +249,23 @@ impl<M: MacDriver> NwkLayer<M> {
             .await;
 
         if let Err(ref e) = mac_result {
+            nwk_trace!(
+                "[NWK][EFR32] tx_err dst=0x{:04X} nh=0x{:04X} seq={} err={:?}",
+                dst_addr.0,
+                next_hop.0,
+                seq,
+                e
+            );
             log::warn!("[NWK TX] MAC send failed: {:?}", e);
         }
 
         mac_result.map_err(|_| NwkStatus::RouteError)?;
+        nwk_trace!(
+            "[NWK][EFR32] tx_ok dst=0x{:04X} nh=0x{:04X} seq={}",
+            dst_addr.0,
+            next_hop.0,
+            seq
+        );
 
         Ok(NldeDataConfirm {
             status: NwkStatus::Success,

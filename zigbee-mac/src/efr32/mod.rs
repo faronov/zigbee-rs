@@ -17,7 +17,7 @@
 pub mod driver;
 mod rac_seq;
 
-use crate::pib::{PibAttribute, PibPayload, PibValue};
+use crate::pib::{self, PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use crate::{MacCapabilities, MacDriver, MacError};
 use driver::{Efr32Driver, RadioConfig, RadioError};
@@ -25,6 +25,18 @@ use zigbee_types::*;
 
 use embassy_futures::select;
 use embassy_time::Timer;
+
+#[cfg(feature = "efr32-trace")]
+macro_rules! efr32_trace {
+    ($($arg:tt)*) => {
+        rtt_target::rprintln!($($arg)*);
+    };
+}
+
+#[cfg(not(feature = "efr32-trace"))]
+macro_rules! efr32_trace {
+    ($($arg:tt)*) => {};
+}
 
 /// Maximum MAC payload size (127 - MAC overhead).
 const MAX_MAC_PAYLOAD: usize = 102;
@@ -92,18 +104,36 @@ impl Efr32Mac {
         }
     }
 
+    /// Print a compact radio snapshot for bring-up diagnostics.
+    pub fn debug_radio_snapshot(&self, tag: &str) {
+        self.driver.debug_snapshot(tag);
+    }
+
+    /// Return the factory-programmed IEEE address currently used by the MAC.
+    pub fn extended_address(&self) -> IeeeAddress {
+        self.extended_address
+    }
+
+    /// Transmit a raw 802.15.4 frame for bring-up diagnostics.
+    pub async fn debug_transmit_raw(&mut self, frame: &[u8]) -> Result<(), MacError> {
+        self.driver
+            .transmit(frame)
+            .await
+            .map_err(Self::map_radio_err)
+    }
+
     /// Read the factory-programmed IEEE 802.15.4 EUI-64 address.
     ///
-    /// EFR32MG1P stores a unique 64-bit EUI in the Device Information (DI) page
-    /// at address 0x0FE0_81A0. This is programmed at the factory and cannot be
-    /// changed.
+    /// EFR32MG1P exposes the chip unique identifier in the Device Information
+    /// page DEVINFO.UNIQUEL / DEVINFO.UNIQUEH registers. On this part they sit
+    /// at 0x0FE0_81F0 and 0x0FE0_81F4 respectively.
     fn read_factory_ieee() -> [u8; 8] {
-        // EFR32MG1P Device Information page — EUI64
-        const DI_EUI64_ADDR: u32 = 0x0FE0_81A0; // TODO: verify against EFR32xG1 RM
+        const DI_UNIQUEL_ADDR: u32 = 0x0FE0_81F0;
+        const DI_UNIQUEH_ADDR: u32 = 0x0FE0_81F4;
 
         let mut eui64 = [0u8; 8];
-        let lo = unsafe { core::ptr::read_volatile(DI_EUI64_ADDR as *const u32) };
-        let hi = unsafe { core::ptr::read_volatile((DI_EUI64_ADDR + 4) as *const u32) };
+        let lo = unsafe { core::ptr::read_volatile(DI_UNIQUEL_ADDR as *const u32) };
+        let hi = unsafe { core::ptr::read_volatile(DI_UNIQUEH_ADDR as *const u32) };
 
         eui64[0] = (lo >> 0) as u8;
         eui64[1] = (lo >> 8) as u8;
@@ -229,11 +259,16 @@ impl Efr32Mac {
             }
 
             // ── ACK wait ──
+            // Use receive_ack() which doesn't reset RX_DONE or clear buffers.
+            // The radio auto-transitioned TX→RX via TRANSITIONS; the ISR may
+            // have already captured the ACK before we get here.
             let seq = frame[2];
-            let ack_result = select::select(self.driver.receive(), Timer::after_micros(1500)).await;
+            let ack_result =
+                select::select(self.driver.receive_ack(), Timer::after_micros(1500)).await;
 
             if let select::Either::First(Ok(rx)) = ack_result {
                 if rx.len >= 3 {
+                    // PHR already stripped by driver
                     let fc = u16::from_le_bytes([rx.data[0], rx.data[1]]);
                     let frame_type = fc & 0x07;
                     let ack_seq = rx.data[2];
@@ -269,7 +304,7 @@ impl MacDriver for Efr32Mac {
         let mut pan_descriptors: PanDescriptorList = heapless::Vec::new();
         let mut energy_list: EdList = heapless::Vec::new();
 
-        let scan_duration_ms = ((1u64 << req.scan_duration as u64) * 15360 / 1000) + 1;
+        let scan_duration_us = pib::scan_duration_us(req.scan_duration);
 
         for ch in 11u8..=26 {
             if req.channel_mask.0 & (1u32 << ch) == 0 {
@@ -280,7 +315,7 @@ impl MacDriver for Efr32Mac {
 
             match req.scan_type {
                 ScanType::Ed => {
-                    rtt_target::rprintln!("scan ED ch{}", ch);
+                    efr32_trace!("scan ED ch{}", ch);
                     let (rssi, _busy) = self.driver.energy_detect().map_err(Self::map_radio_err)?;
                     let ed = ((rssi as i16 + 100).clamp(0, 255)) as u8;
                     let _ = energy_list.push(EdValue {
@@ -289,41 +324,23 @@ impl MacDriver for Efr32Mac {
                     });
                 }
                 ScanType::Active => {
+                    let mut rx_frames = 0u16;
+                    let mut rx_errors = 0u16;
+                    let mut beacons = 0u16;
+                    efr32_trace!(
+                        "[MAC][EFR32] scan active ch={} dur_us={}",
+                        ch,
+                        scan_duration_us
+                    );
                     let seq = self.next_bsn();
                     let beacon_req = build_beacon_request(seq);
-                    // Dump first beacon request frame bytes
-                    if ch == 11 {
-                        rtt_target::rprintln!(
-                            "beacon_req[{}]: {:02X?}",
-                            beacon_req.len(),
-                            &beacon_req
-                        );
-                    }
-                    rtt_target::rprintln!("scan TX ch{}", ch);
                     let tx_result = self.driver.transmit(&beacon_req).await;
-                    rtt_target::rprintln!("  tx={}", if tx_result.is_ok() { "ok" } else { "FAIL" });
-
-                    // Debug: check FRC_STATUS and RSSI during RX listen
-                    if ch == 15 {
-                        // Read radio state while listening
-                        let frc_status =
-                            unsafe { core::ptr::read_volatile(0x40080000 as *const u32) };
-                        let rac_status =
-                            unsafe { core::ptr::read_volatile(0x40084004 as *const u32) };
-                        let agc_rssi =
-                            unsafe { core::ptr::read_volatile(0x40087008 as *const u32) };
-                        let frc_if = unsafe { core::ptr::read_volatile(0x40080060 as *const u32) };
-                        rtt_target::rprintln!(
-                            "  ch15 RX: FRC_ST={:#X} RAC={:#X} RSSI={:#X} FRC_IF={:#X}",
-                            frc_status,
-                            (rac_status >> 24) & 0xF,
-                            agc_rssi,
-                            frc_if
-                        );
+                    if tx_result.is_err() {
+                        efr32_trace!("[MAC][EFR32] scan beacon_req_err ch={}", ch);
                     }
 
                     let deadline = embassy_time::Instant::now()
-                        + embassy_time::Duration::from_millis(scan_duration_ms);
+                        + embassy_time::Duration::from_micros(scan_duration_us);
                     while !pan_descriptors.is_full() {
                         let now = embassy_time::Instant::now();
                         if now >= deadline {
@@ -333,18 +350,51 @@ impl MacDriver for Efr32Mac {
                         let result =
                             select::select(self.driver.receive(), Timer::after(remaining)).await;
 
-                        if let select::Either::First(Ok(frame)) = result {
-                            if let Some(pd) = parse_beacon_frame(&frame.data[..frame.len], ch) {
-                                let _ = pan_descriptors.push(pd);
+                        match result {
+                            select::Either::Second(_) => break,
+                            select::Either::First(Err(_)) => {
+                                rx_errors = rx_errors.saturating_add(1);
+                                continue;
                             }
-                        } else {
-                            break;
+                            select::Either::First(Ok(frame)) => {
+                                rx_frames = rx_frames.saturating_add(1);
+                                if let Some(pd) = parse_beacon_frame(&frame.data[..frame.len], ch) {
+                                    beacons = beacons.saturating_add(1);
+                                    efr32_trace!(
+                                        "[MAC][EFR32] scan beacon ch={} pan=0x{:04X} coord=0x{:04X} permit={} lqi={}",
+                                        ch,
+                                        pd.coord_address.pan_id().0,
+                                        match pd.coord_address {
+                                            MacAddress::Short(_, addr) => addr.0,
+                                            MacAddress::Extended(_, _) => 0xFFFF,
+                                        },
+                                        pd.superframe_spec.association_permit,
+                                        pd.lqi
+                                    );
+                                    let _ = pan_descriptors.push(pd);
+                                }
+                            }
                         }
                     }
+                    efr32_trace!(
+                        "[MAC][EFR32] scan done ch={} frames={} beacons={} rx_errs={}",
+                        ch,
+                        rx_frames,
+                        beacons,
+                        rx_errors
+                    );
                 }
                 ScanType::Passive => {
+                    let mut rx_frames = 0u16;
+                    let mut rx_errors = 0u16;
+                    let mut beacons = 0u16;
+                    efr32_trace!(
+                        "[MAC][EFR32] scan passive ch={} dur_us={}",
+                        ch,
+                        scan_duration_us
+                    );
                     let deadline = embassy_time::Instant::now()
-                        + embassy_time::Duration::from_millis(scan_duration_ms);
+                        + embassy_time::Duration::from_micros(scan_duration_us);
                     while !pan_descriptors.is_full() {
                         let now = embassy_time::Instant::now();
                         if now >= deadline {
@@ -354,14 +404,39 @@ impl MacDriver for Efr32Mac {
                         let result =
                             select::select(self.driver.receive(), Timer::after(remaining)).await;
 
-                        if let select::Either::First(Ok(frame)) = result {
-                            if let Some(pd) = parse_beacon_frame(&frame.data[..frame.len], ch) {
-                                let _ = pan_descriptors.push(pd);
+                        match result {
+                            select::Either::Second(_) => break,
+                            select::Either::First(Err(_)) => {
+                                rx_errors = rx_errors.saturating_add(1);
+                                continue;
                             }
-                        } else {
-                            break;
+                            select::Either::First(Ok(frame)) => {
+                                rx_frames = rx_frames.saturating_add(1);
+                                if let Some(pd) = parse_beacon_frame(&frame.data[..frame.len], ch) {
+                                    beacons = beacons.saturating_add(1);
+                                    efr32_trace!(
+                                        "[MAC][EFR32] scan beacon ch={} pan=0x{:04X} coord=0x{:04X} permit={} lqi={}",
+                                        ch,
+                                        pd.coord_address.pan_id().0,
+                                        match pd.coord_address {
+                                            MacAddress::Short(_, addr) => addr.0,
+                                            MacAddress::Extended(_, _) => 0xFFFF,
+                                        },
+                                        pd.superframe_spec.association_permit,
+                                        pd.lqi
+                                    );
+                                    let _ = pan_descriptors.push(pd);
+                                }
+                            }
                         }
                     }
+                    efr32_trace!(
+                        "[MAC][EFR32] scan done ch={} frames={} beacons={} rx_errs={}",
+                        ch,
+                        rx_frames,
+                        beacons,
+                        rx_errors
+                    );
                 }
                 ScanType::Orphan => {}
             }
@@ -394,9 +469,26 @@ impl MacDriver for Efr32Mac {
             &req.capability_info,
         );
 
+        #[cfg(feature = "efr32-trace")]
+        {
+            let dump_len = core::cmp::min(frame.len(), 24);
+            let mut hex = [0u8; 72];
+            for i in 0..dump_len {
+                let hi = frame[i] >> 4;
+                let lo = frame[i] & 0x0F;
+                hex[i * 3] = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+                hex[i * 3 + 1] = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+                hex[i * 3 + 2] = b' ';
+            }
+            if let Ok(s) = core::str::from_utf8(&hex[..dump_len * 3]) {
+                efr32_trace!("[MAC] assoc_req[{}]: {}", frame.len(), s);
+            }
+        }
+
         self.csma_ca_transmit(&frame, true).await?;
 
-        Timer::after(embassy_time::Duration::from_millis(200)).await;
+        // macResponseWaitTime: 32 * aBaseSuperframeDuration = ~500ms
+        Timer::after(embassy_time::Duration::from_millis(500)).await;
 
         let mut confirm: Option<MlmeAssociateConfirm> = None;
 
@@ -410,11 +502,25 @@ impl MacDriver for Efr32Mac {
                 &req.coord_address,
                 &self.extended_address,
             );
-            let _ = self.csma_ca_transmit(&data_req, true).await;
+
+            #[cfg(feature = "efr32-trace")]
+            efr32_trace!(
+                "[MAC] poll[{}] fc={:04x} len={}",
+                poll_attempt,
+                u16::from_le_bytes([data_req[0], data_req[1]]),
+                data_req.len()
+            );
+
+            let poll_result = self.csma_ca_transmit(&data_req, true).await;
+            #[cfg(feature = "efr32-trace")]
+            if let Err(ref e) = poll_result {
+                efr32_trace!("[MAC] poll[{}] tx err: {:?}", poll_attempt, e);
+            }
+            let _ = poll_result;
 
             let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(1500);
 
-            for _ in 0..20u8 {
+            for _rx_iter in 0..20u8 {
                 let now = embassy_time::Instant::now();
                 if now >= deadline {
                     break;
@@ -424,15 +530,37 @@ impl MacDriver for Efr32Mac {
                 let result = select::select(self.driver.receive(), Timer::after(remaining)).await;
 
                 match result {
-                    select::Either::Second(_) => break,
-                    select::Either::First(Err(_)) => continue,
+                    select::Either::Second(_) => {
+                        #[cfg(feature = "efr32-trace")]
+                        efr32_trace!(
+                            "[MAC] poll[{}] rx timeout after {} iters",
+                            poll_attempt,
+                            _rx_iter
+                        );
+                        break;
+                    }
+                    select::Either::First(Err(_e)) => {
+                        #[cfg(feature = "efr32-trace")]
+                        efr32_trace!("[MAC] poll[{}] rx err: {:?}", poll_attempt, _e);
+                        continue;
+                    }
                     select::Either::First(Ok(rx)) => {
                         let data = &rx.data[..rx.len];
                         if data.len() < 3 {
                             continue;
                         }
+                        // PHR already stripped by driver
                         let fc = u16::from_le_bytes([data[0], data[1]]);
                         let frame_type = fc & 0x07;
+
+                        #[cfg(feature = "efr32-trace")]
+                        efr32_trace!(
+                            "[MAC] poll[{}] rx fc={:04x} ft={} len={}",
+                            poll_attempt,
+                            fc,
+                            frame_type,
+                            data.len()
+                        );
 
                         if frame_type == 0x02 {
                             continue;
@@ -443,6 +571,22 @@ impl MacDriver for Efr32Mac {
                         }
 
                         if frame_type == 0x03 {
+                            #[cfg(feature = "efr32-trace")]
+                            if data.len() != 16 {
+                                let dump_len = core::cmp::min(data.len(), 24);
+                                let mut hex = [0u8; 72];
+                                for i in 0..dump_len {
+                                    let hi = data[i] >> 4;
+                                    let lo = data[i] & 0x0F;
+                                    hex[i * 3] = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+                                    hex[i * 3 + 1] =
+                                        if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+                                    hex[i * 3 + 2] = b' ';
+                                }
+                                if let Ok(s) = core::str::from_utf8(&hex[..dump_len * 3]) {
+                                    efr32_trace!("[MAC] cmd[{}]: {}", data.len(), s);
+                                }
+                            }
                             if let Some((addr, status_byte)) = parse_association_response(data) {
                                 let status = match status_byte {
                                     0x00 => AssociationStatus::Success,
@@ -465,8 +609,9 @@ impl MacDriver for Efr32Mac {
                             let (_, _, payload_offset, _) = parse_mac_addresses(data);
                             if data.len() > payload_offset {
                                 let payload = &data[payload_offset..];
-                                let mut buf = [0u8; 128];
                                 let copy_len = payload.len().min(128);
+                                // Reuse stack allocation from pending_assoc_frame tuple
+                                let mut buf = [0u8; 128];
                                 buf[..copy_len].copy_from_slice(&payload[..copy_len]);
                                 self.pending_assoc_frame = Some((buf, copy_len));
                                 log::info!("efr32: saved post-assoc frame ({} bytes)", copy_len);
@@ -483,7 +628,10 @@ impl MacDriver for Efr32Mac {
 
         // Listen briefly for Transport-Key after association
         if confirm.is_some() && self.pending_assoc_frame.is_none() {
+            #[cfg(feature = "efr32-trace")]
+            efr32_trace!("[MAC] post-assoc listen (2s)...");
             let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(2000);
+            let mut _rx_count = 0u8;
             for _ in 0..20u8 {
                 let now = embassy_time::Instant::now();
                 if now >= deadline {
@@ -493,21 +641,46 @@ impl MacDriver for Efr32Mac {
                 let result = select::select(self.driver.receive(), Timer::after(remaining)).await;
                 if let select::Either::First(Ok(rx)) = result {
                     let data = &rx.data[..rx.len];
+                    _rx_count += 1;
                     if data.len() >= 3 {
                         let fc = u16::from_le_bytes([data[0], data[1]]);
+                        let frame_type = fc & 0x07;
+                        #[cfg(feature = "efr32-trace")]
+                        if _rx_count <= 5 {
+                            let (_, dst, _, _) = parse_mac_addresses(data);
+                            let dst_str = match &dst {
+                                MacAddress::Short(_, a) => a.0,
+                                MacAddress::Extended(_, _) => 0xEEEE,
+                            };
+                            efr32_trace!(
+                                "[MAC] post-rx[{}] ft={} len={} dst={:04X}",
+                                _rx_count,
+                                frame_type,
+                                data.len(),
+                                dst_str
+                            );
+                        }
                         if (fc >> 5) & 1 != 0 {
                             self.send_ack(data[2]).await;
                         }
-                        let frame_type = fc & 0x07;
                         if frame_type == 0x01 {
-                            let (_, _, payload_offset, _) = parse_mac_addresses(data);
-                            if data.len() > payload_offset {
+                            let (_, dst, payload_offset, _) = parse_mac_addresses(data);
+                            // Save unicast data frames for us
+                            let for_us = match &dst {
+                                MacAddress::Short(_, a) => {
+                                    a.0 == self.short_address.0 || a.0 == 0xFFFF
+                                }
+                                MacAddress::Extended(_, e) => *e == self.extended_address,
+                            };
+                            if for_us && data.len() > payload_offset {
                                 let payload = &data[payload_offset..];
-                                let mut buf = [0u8; 128];
                                 let copy_len = payload.len().min(128);
+                                // Reuse stack allocation
+                                let mut buf = [0u8; 128];
                                 buf[..copy_len].copy_from_slice(&payload[..copy_len]);
                                 self.pending_assoc_frame = Some((buf, copy_len));
-                                log::info!("efr32: saved post-assoc frame ({} bytes)", copy_len);
+                                #[cfg(feature = "efr32-trace")]
+                                efr32_trace!("[MAC] saved pending frame: {} bytes", copy_len);
                                 break;
                             }
                         }
@@ -516,6 +689,12 @@ impl MacDriver for Efr32Mac {
                     break;
                 }
             }
+            #[cfg(feature = "efr32-trace")]
+            efr32_trace!(
+                "[MAC] post-assoc: {} frames, pending={}",
+                _rx_count,
+                self.pending_assoc_frame.is_some()
+            );
         }
 
         confirm.ok_or(MacError::NoBeacon)
@@ -840,10 +1019,13 @@ impl MacDriver for Efr32Mac {
                                     || addr.0 == 0xFFFD
                                     || addr.0 == 0xFFFC;
                                 if !pan_ok || !addr_ok {
-                                    log::trace!(
-                                        "efr32: filtered short dst pan=0x{:04X} addr=0x{:04X}",
+                                    #[cfg(feature = "efr32-trace")]
+                                    efr32_trace!(
+                                        "[MAC] rx FILTERED short: pan={:04X} addr={:04X} (me={:04X} pan={:04X})",
                                         pan.0,
-                                        addr.0
+                                        addr.0,
+                                        self.short_address.0,
+                                        self.pan_id.0
                                     );
                                     continue;
                                 }
@@ -852,7 +1034,8 @@ impl MacDriver for Efr32Mac {
                                 let pan_ok = pan.0 == self.pan_id.0 || pan.0 == 0xFFFF;
                                 let addr_ok = *addr == self.extended_address;
                                 if !pan_ok || !addr_ok {
-                                    log::trace!("efr32: filtered ext dst pan=0x{:04X}", pan.0,);
+                                    #[cfg(feature = "efr32-trace")]
+                                    efr32_trace!("[MAC] rx FILTERED ext: pan={:04X}", pan.0);
                                     continue;
                                 }
                             }
@@ -908,7 +1091,8 @@ fn build_association_request(
 ) -> heapless::Vec<u8, 32> {
     let mut frame = heapless::Vec::new();
 
-    let fc: u16 = 0xC823;
+    // FC: Command frame, ACK req, PAN ID compression, DstMode=Short, SrcMode=Extended
+    let fc: u16 = 0xC863;
     let _ = frame.push(fc as u8);
     let _ = frame.push((fc >> 8) as u8);
     let _ = frame.push(seq);
@@ -959,7 +1143,13 @@ fn build_data_request_ieee(
     own_ieee: &IeeeAddress,
 ) -> heapless::Vec<u8, 24> {
     let mut frame: heapless::Vec<u8, 24> = heapless::Vec::new();
-    let fc: u16 = 0xCC63;
+    // FC: Command(3), AckReq, PAN compress, src=Extended(11)
+    // dst mode depends on coordinator address type
+    let dst_mode: u16 = match coord {
+        MacAddress::Short(_, _) => 0x02,    // Short
+        MacAddress::Extended(_, _) => 0x03, // Extended
+    };
+    let fc: u16 = 0x0063 | (dst_mode << 10) | (0x03 << 14);
     let _ = frame.push(fc as u8);
     let _ = frame.push((fc >> 8) as u8);
     let _ = frame.push(seq);
@@ -1028,40 +1218,67 @@ fn build_data_frame(
 }
 
 fn parse_beacon_frame(data: &[u8], channel: u8) -> Option<PanDescriptor> {
-    if data.len() < 9 {
+    // PHR is now stripped by the driver — data IS the PSDU
+    let psdu = data;
+
+    if psdu.len() < 3 {
         return None;
     }
-    let fc = u16::from_le_bytes([data[0], data[1]]);
+
+    let fc = u16::from_le_bytes([psdu[0], psdu[1]]);
     if fc & 0x07 != 0x00 {
         return None;
     }
 
-    let src_pan = u16::from_le_bytes([data[3], data[4]]);
-    let coord_addr = u16::from_le_bytes([data[5], data[6]]);
+    let (src_address, _dst_address, addr_end, _security_use) = parse_mac_addresses(psdu);
+    if addr_end + 2 > psdu.len() {
+        return None;
+    }
 
-    let superframe_raw = if data.len() > 8 {
-        u16::from_le_bytes([data[7], data[8]])
+    let superframe_raw = u16::from_le_bytes([psdu[addr_end], psdu[addr_end + 1]]);
+
+    // After superframe spec: GTS spec (1 byte min) + Pending Addr spec (1 byte min)
+    // then Zigbee beacon payload starts
+    let beacon_payload_offset = if psdu.len() > addr_end + 2 {
+        let mut off = addr_end + 2; // after MAC addressing fields + superframe spec
+        // GTS specification field
+        let gts_spec = psdu[off];
+        let gts_count = gts_spec & 0x07;
+        off += 1; // GTS spec byte
+        if gts_count > 0 {
+            off += 1; // GTS directions
+            off += gts_count as usize * 3; // each GTS descriptor = 3 bytes
+        }
+        // Pending address specification field
+        if off < psdu.len() {
+            let pending_spec = psdu[off];
+            let num_short = (pending_spec & 0x07) as usize;
+            let num_ext = ((pending_spec >> 4) & 0x07) as usize;
+            off += 1; // pending addr spec byte
+            off += num_short * 2 + num_ext * 8;
+        }
+        off
     } else {
-        0
+        9
     };
 
-    let zigbee_beacon = if data.len() >= 22 {
-        let offset = 9;
+    let zigbee_beacon = if psdu.len() >= beacon_payload_offset + 15 {
+        let offset = beacon_payload_offset;
         ZigbeeBeaconPayload {
-            protocol_id: data[offset],
-            stack_profile: data[offset + 1] & 0x0F,
-            protocol_version: (data[offset + 1] >> 4) & 0x0F,
-            router_capacity: data[offset + 2] & 0x04 != 0,
-            device_depth: (data[offset + 2] >> 3) & 0x0F,
-            end_device_capacity: data[offset + 2] & 0x80 != 0,
+            protocol_id: psdu[offset],
+            stack_profile: psdu[offset + 1] & 0x0F,
+            protocol_version: (psdu[offset + 1] >> 4) & 0x0F,
+            router_capacity: psdu[offset + 2] & 0x04 != 0,
+            device_depth: (psdu[offset + 2] >> 3) & 0x0F,
+            end_device_capacity: psdu[offset + 2] & 0x80 != 0,
             extended_pan_id: {
                 let mut epid = [0u8; 8];
-                epid.copy_from_slice(&data[offset + 3..offset + 11]);
+                epid.copy_from_slice(&psdu[offset + 3..offset + 11]);
                 epid
             },
-            tx_offset: [data[offset + 11], data[offset + 12], data[offset + 13]],
-            update_id: if data.len() > offset + 14 {
-                data[offset + 14]
+            tx_offset: [psdu[offset + 11], psdu[offset + 12], psdu[offset + 13]],
+            update_id: if psdu.len() > offset + 14 {
+                psdu[offset + 14]
             } else {
                 0
             },
@@ -1081,7 +1298,7 @@ fn parse_beacon_frame(data: &[u8], channel: u8) -> Option<PanDescriptor> {
     };
 
     Some(PanDescriptor {
-        coord_address: MacAddress::Short(PanId(src_pan), ShortAddress(coord_addr)),
+        coord_address: src_address,
         channel,
         superframe_spec: SuperframeSpec::from_raw(superframe_raw),
         lqi: 0xFF,

@@ -262,6 +262,7 @@ pub struct ApsLayer<M: MacDriver> {
 
 impl<M: MacDriver> ApsLayer<M> {
     /// Create a new APS layer wrapping the given NWK layer.
+    #[inline(never)]
     pub fn new(nwk: NwkLayer<M>) -> Self {
         Self {
             nwk,
@@ -274,6 +275,27 @@ impl<M: MacDriver> ApsLayer<M> {
             dup_table: [ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE],
             ack_table: heapless::Vec::new(),
             fragment_rx: fragment::FragmentReassembly::new(),
+        }
+    }
+
+    /// Construct an APS layer directly into caller-provided storage.
+    ///
+    /// # Safety
+    /// `slot` must point to valid, properly aligned, uninitialized storage for `Self`.
+    #[inline(never)]
+    pub unsafe fn write_into(slot: *mut Self, mac: M, device_type: zigbee_nwk::DeviceType) {
+        unsafe {
+            NwkLayer::write_into(core::ptr::addr_of_mut!((*slot).nwk), mac, device_type);
+            core::ptr::addr_of_mut!((*slot).aib).write(aib::Aib::new());
+            core::ptr::addr_of_mut!((*slot).binding_table).write(binding::BindingTable::new());
+            core::ptr::addr_of_mut!((*slot).group_table).write(group::GroupTable::new());
+            core::ptr::addr_of_mut!((*slot).security).write(security::ApsSecurity::new());
+            core::ptr::addr_of_mut!((*slot).aps_counter).write(0);
+            core::ptr::addr_of_mut!((*slot).pending_aps_ack).write(None);
+            core::ptr::addr_of_mut!((*slot).dup_table)
+                .write([ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE]);
+            core::ptr::addr_of_mut!((*slot).ack_table).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*slot).fragment_rx).write(fragment::FragmentReassembly::new());
         }
     }
 

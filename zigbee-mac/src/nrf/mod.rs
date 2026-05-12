@@ -1317,7 +1317,7 @@ fn build_data_request(
 fn build_data_request_short(
     seq: u8,
     coord: &MacAddress,
-    own_pan: PanId,
+    _own_pan: PanId,
     own_short: ShortAddress,
 ) -> heapless::Vec<u8, 24> {
     let mut frame = heapless::Vec::new();

@@ -1,7 +1,7 @@
 //! Build script for TLSR8258 Zigbee sensor — pure Rust, no vendor SDK.
 //!
 //! Uses rust-lld for linking with a custom linker script (memory.x).
-//! No Telink SDK, no C compiler, no external toolchain required.
+//! No Telink SDK and no C compilation; tc32 builds still require the modern-tc32 toolchain.
 
 fn main() {
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());

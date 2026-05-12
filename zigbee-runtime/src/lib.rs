@@ -27,6 +27,15 @@
 #![no_std]
 #![allow(async_fn_in_trait)]
 
+#[cfg(feature = "efr32-trace")]
+macro_rules! rt_trace {
+    ($($arg:tt)*) => { rtt_target::rprintln!($($arg)*); };
+}
+#[cfg(not(feature = "efr32-trace"))]
+macro_rules! rt_trace {
+    ($($arg:tt)*) => {};
+}
+
 pub mod builder;
 pub mod event_loop;
 pub mod firmware_writer;
@@ -49,6 +58,28 @@ use zigbee_zcl::{ClusterDirection, CommandId, ZclStatus};
 use crate::nv_storage::{NvItemId, NvStorage};
 use crate::power::PowerManager;
 
+struct SyncUnsafeCell<T>(core::cell::UnsafeCell<T>);
+unsafe impl<T> Sync for SyncUnsafeCell<T> {}
+
+impl<T> SyncUnsafeCell<T> {
+    const fn new(value: T) -> Self {
+        Self(core::cell::UnsafeCell::new(value))
+    }
+
+    fn get(&self) -> *mut T {
+        self.0.get()
+    }
+}
+
+static PROCESS_INCOMING_NWK_BUF: SyncUnsafeCell<[u8; 128]> = SyncUnsafeCell::new([0u8; 128]);
+static PROCESS_INCOMING_AAD_BUF: SyncUnsafeCell<[u8; 64]> = SyncUnsafeCell::new([0u8; 64]);
+static PROCESS_INCOMING_APS_BUF: SyncUnsafeCell<zigbee_aps::apsde::ApsFrameBuffer> =
+    SyncUnsafeCell::new(zigbee_aps::apsde::ApsFrameBuffer {
+        data: [0u8; 128],
+        len: 0,
+    });
+static PROCESS_INCOMING_ZCL_BUF: SyncUnsafeCell<[u8; 253]> = SyncUnsafeCell::new([0u8; 253]);
+
 /// A queued ZCL response to be sent in the next tick().
 ///
 /// Because `process_incoming()` is sync but sending requires async MAC access,
@@ -61,7 +92,7 @@ struct PendingZclResponse {
     #[cfg(feature = "router")]
     zcl_data: heapless::Vec<u8, 128>,
     #[cfg(not(feature = "router"))]
-    zcl_data: heapless::Vec<u8, 64>,
+    zcl_data: heapless::Vec<u8, 128>,
 }
 
 /// Maximum number of endpoints on a device (endpoint 0 is ZDO, 1-240 are application)
@@ -163,26 +194,33 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     ///
     /// Performs BDB initialize → commission (network steering).
     /// Returns the assigned short address on success.
+    #[inline(never)]
     pub async fn start(&mut self) -> Result<u16, event_loop::StartError> {
-        log::info!("[Runtime] Starting Zigbee device…");
+        rt_trace!("[RT] start: init");
+        // Inline initialize + commission to avoid async state machine losing `self`
+        // reference across await points (observed: self becomes NULL in separate
+        // #[inline(never)] async methods after first await in release mode).
+        let r = self.bdb.initialize().await;
+        rt_trace!("[RT] bdb_init={}", if r.is_ok() { "ok" } else { "ERR" });
+        if r.is_err() {
+            return Err(event_loop::StartError::InitFailed);
+        }
+        rt_trace!("[RT] start: commission");
+        let r = self.bdb.commission().await;
+        rt_trace!("[RT] bdb_comm={}", if r.is_ok() { "ok" } else { "ERR" });
+        if r.is_err() {
+            return Err(event_loop::StartError::CommissioningFailed);
+        }
+        rt_trace!("[RT] start: finish");
+        self.finish_join()
+    }
 
-        // BDB initialize
-        self.bdb
-            .initialize()
-            .await
-            .map_err(|_| event_loop::StartError::InitFailed)?;
-
-        // BDB commission (steering for end devices, formation for coordinators)
-        self.bdb
-            .commission()
-            .await
-            .map_err(|_| event_loop::StartError::CommissioningFailed)?;
-
+    #[inline(never)]
+    fn finish_join(&mut self) -> Result<u16, event_loop::StartError> {
         let addr = self.bdb.zdo().nwk().nib().network_address.0;
         let ieee = self.bdb.zdo().nwk().nib().ieee_address;
         log::info!("[Runtime] Joined network as 0x{:04X}", addr);
 
-        // Sync addresses into ZDO so interview responses are correct
         self.bdb.zdo_mut().set_local_nwk_addr(ShortAddress(addr));
         self.bdb.zdo_mut().set_local_ieee_addr(ieee);
 
@@ -204,6 +242,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     ///
     /// Call `restore_state()` first — it sets up NIB, security keys, and
     /// marks `node_is_on_a_network = true`.
+    #[inline(never)]
     pub async fn rejoin(&mut self) -> Result<u16, event_loop::StartError> {
         log::info!("[Runtime] Resuming on previous network…");
 
@@ -267,11 +306,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.bdb.zdo_mut().set_local_nwk_addr(ShortAddress(addr));
         self.bdb.zdo_mut().set_local_ieee_addr(ieee);
 
-        // Skip Device_annce on rejoin — it triggers the coordinator to
-        // re-evaluate our status and potentially send Leave. Just start
-        // polling silently; the coordinator still has our entry from the
-        // previous join.
-        log::info!("[Runtime] Silent resume — skipping Device_annce");
+        // Announce immediately so coordinators and home automation stacks
+        // that dropped our registry entry can rediscover the device.
+        // Repeating the announce is cheap and avoids relying on stale state.
+        match self.send_device_annce().await {
+            Ok(()) => log::info!("[Runtime] Device_annce sent after resume"),
+            Err(err) => log::warn!("[Runtime] Device_annce after resume failed: {:?}", err),
+        }
 
         self.state_dirty = true;
         Ok(addr)
@@ -685,6 +726,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// - Handle Read/Write/Discover Attributes using cluster attribute stores
     /// - Dispatch cluster-specific commands to `Cluster::handle_command()`
     /// - Sync Groups cluster actions to the APS group table
+    #[inline(never)]
     pub async fn process_incoming(
         &mut self,
         indication: &McpsDataIndication,
@@ -698,6 +740,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             let (header, consumed) = match zigbee_nwk::frames::NwkHeader::parse(mac_payload) {
                 Some(v) => v,
                 None => {
+                    rt_trace!("[RT][EFR32] nwk_parse=fail len={}", mac_payload.len());
                     log::warn!(
                         "[RX] NWK header parse failed, {} bytes: {:02X?}",
                         mac_payload.len(),
@@ -716,6 +759,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 || dst == ShortAddress(0xFFFF)
                 || dst == ShortAddress(0xFFFD);
 
+            rt_trace!(
+                "[RT][EFR32] nwk type={} src=0x{:04X} dst=0x{:04X} sec={} for_us={} len={}",
+                nwk_fc.frame_type,
+                src.0,
+                dst.0,
+                nwk_fc.security as u8,
+                is_for_us as u8,
+                mac_payload.len().saturating_sub(consumed)
+            );
             log::info!(
                 "[RX] NWK type={} src=0x{:04X} dst=0x{:04X} sec={} for_us={} len={}",
                 nwk_fc.frame_type,
@@ -727,6 +779,12 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             );
 
             if !is_for_us {
+                rt_trace!("[RT][EFR32] drop not_for_us");
+                return None;
+            }
+
+            if src == nwk_addr {
+                rt_trace!("[RT][EFR32] drop self_originated src=0x{:04X}", src.0);
                 return None;
             }
 
@@ -744,7 +802,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
 
             let after_header = &mac_payload[consumed..];
-            let mut buf = [0u8; 128];
+            let buf = unsafe { &mut *PROCESS_INCOMING_NWK_BUF.get() };
             let len;
 
             if header.frame_control.security {
@@ -753,6 +811,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     match zigbee_nwk::security::NwkSecurityHeader::parse(after_header) {
                         Some(v) => v,
                         None => {
+                            rt_trace!("[RT][EFR32] nwk_sec=parse_fail");
                             log::warn!("[NWK] Failed to parse security header");
                             return None;
                         }
@@ -762,6 +821,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 let key = match nwk.security().key_by_seq(sec_hdr.key_seq_number) {
                     Some(k) => k.key,
                     None => {
+                        rt_trace!("[RT][EFR32] nwk_key=missing seq={}", sec_hdr.key_seq_number);
                         log::warn!("[NWK] No key for seq {}", sec_hdr.key_seq_number);
                         return None;
                     }
@@ -772,6 +832,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     .security()
                     .check_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter)
                 {
+                    rt_trace!(
+                        "[RT][EFR32] nwk_replay src={:02X?} fc={}",
+                        sec_hdr.source_address,
+                        sec_hdr.frame_counter
+                    );
                     log::warn!("[NWK] Frame counter replay detected");
                     return None;
                 }
@@ -779,7 +844,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 // Build authenticated data (a = NWK header || security aux header)
                 // AAD must use ACTUAL security level (5), not OTA value (0).
                 let aad_len = consumed + sec_consumed;
-                let mut aad_buf = [0u8; 64];
+                let aad_buf = unsafe { &mut *PROCESS_INCOMING_AAD_BUF.get() };
                 let aad_copy_len = aad_len.min(aad_buf.len());
                 aad_buf[..aad_copy_len].copy_from_slice(&mac_payload[..aad_copy_len]);
                 // Patch security control byte at offset `consumed` with actual level 5
@@ -794,6 +859,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     &sec_hdr,
                 ) {
                     Some(plaintext) => {
+                        rt_trace!("[RT][EFR32] nwk_decrypt=ok len={}", plaintext.len());
                         // MIC verified — NOW commit frame counter
                         nwk.security_mut()
                             .commit_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter);
@@ -801,12 +867,14 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         buf[..len].copy_from_slice(&plaintext[..len]);
                     }
                     None => {
+                        rt_trace!("[RT][EFR32] nwk_decrypt=fail");
                         log::warn!("[NWK] Decryption failed (MIC mismatch)");
                         return None;
                     }
                 }
             } else {
                 // No security — pass through
+                rt_trace!("[RT][EFR32] nwk_unsecured len={}", after_header.len());
                 len = after_header.len().min(128);
                 buf[..len].copy_from_slice(&after_header[..len]);
             }
@@ -816,17 +884,24 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 src,
                 header.frame_control.security,
                 nwk_fc.frame_type,
-                buf,
                 len,
             )
         };
 
-        let (dst, src, nwk_security, frame_type, buf, len) = nwk_indication;
+        let (dst, src, nwk_security, frame_type, len) = nwk_indication;
+        let buf = unsafe { &*PROCESS_INCOMING_NWK_BUF.get() };
 
         // NWK Command frames (type=1) — parse and handle at runtime level
         if frame_type == 1 {
             if len > 0 {
                 let cmd_id = buf[0];
+                rt_trace!(
+                    "[RT][EFR32] nwk_cmd id=0x{:02X} src=0x{:04X} dst=0x{:04X} len={}",
+                    cmd_id,
+                    src.0,
+                    dst.0,
+                    len
+                );
                 log::info!(
                     "[RX] NWK Command id=0x{:02X} from 0x{:04X} ({} bytes)",
                     cmd_id,
@@ -835,9 +910,23 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 );
                 // NWK Leave command (0x04) — signal application to rejoin
                 if cmd_id == 0x04 && len >= 2 {
+                    let nwk_addr = self.bdb.zdo().nwk().nib().network_address;
+                    if dst != nwk_addr {
+                        rt_trace!(
+                            "[RT][EFR32] ignore broadcast/foreign leave src=0x{:04X} dst=0x{:04X}",
+                            src.0,
+                            dst.0
+                        );
+                        return None;
+                    }
                     let options = buf[1];
                     let remove_children = (options & 0x40) != 0;
                     let rejoin = (options & 0x20) != 0;
+                    rt_trace!(
+                        "[RT][EFR32] leave_req src=0x{:04X} opt=0x{:02X}",
+                        src.0,
+                        options
+                    );
                     log::warn!(
                         "[RX] NWK Leave from 0x{:04X} (remove_children={}, rejoin={})",
                         src.0,
@@ -853,7 +942,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         }
 
         // APS decryption buffer (for APS-secured frames like Transport Key)
-        let mut aps_decrypt_buf = zigbee_aps::apsde::ApsFrameBuffer::new();
+        let aps_decrypt_buf = unsafe { &mut *PROCESS_INCOMING_APS_BUF.get() };
 
         // APS layer: parse APS header
         let aps_indication = self.bdb.zdo_mut().aps_mut().process_incoming_aps_frame(
@@ -862,21 +951,51 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             dst,
             indication.lqi,
             nwk_security,
-            &mut aps_decrypt_buf,
-        )?;
+            aps_decrypt_buf,
+        );
+        let aps_indication = match aps_indication {
+            Some(v) => v,
+            None => {
+                rt_trace!("[RT][EFR32] aps_process=none");
+                return None;
+            }
+        };
 
         // Route by destination endpoint
         let dst_ep = aps_indication.dst_endpoint;
         let cluster_id = aps_indication.cluster_id;
-        let _profile_id = aps_indication.profile_id;
+        let profile_id = aps_indication.profile_id;
         let src_addr = match aps_indication.src_address {
             ApsAddress::Short(a) => a.0,
             _ => 0,
         };
 
+        rt_trace!(
+            "[RT][EFR32] aps dst_ep={} prof=0x{:04X} cluster=0x{:04X} src=0x{:04X} payload={}",
+            dst_ep,
+            profile_id,
+            cluster_id,
+            src_addr,
+            aps_indication.payload.len()
+        );
+        log::info!(
+            "[RX] APS dst_ep={} prof=0x{:04X} cluster=0x{:04X} src=0x{:04X} len={}",
+            dst_ep,
+            profile_id,
+            cluster_id,
+            src_addr,
+            aps_indication.payload.len()
+        );
+
         if dst_ep == 0x00 {
             // ZDO endpoint — dispatch to ZDP handler which sends responses
             // directly through the APS layer.
+            rt_trace!(
+                "[RT][EFR32] zdo_req cluster=0x{:04X} from=0x{:04X} len={}",
+                cluster_id,
+                src_addr,
+                aps_indication.payload.len()
+            );
             log::info!(
                 "[Runtime] ZDO request: cluster=0x{:04X} from 0x{:04X} len={}",
                 cluster_id,
@@ -884,8 +1003,18 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 aps_indication.payload.len(),
             );
             match self.bdb.zdo_mut().handle_indication(&aps_indication).await {
-                Ok(()) => log::info!("[Runtime] ZDO OK cluster=0x{:04X}", cluster_id),
-                Err(e) => log::warn!("[Runtime] ZDO FAIL cluster=0x{:04X}: {:?}", cluster_id, e,),
+                Ok(()) => {
+                    rt_trace!("[RT][EFR32] zdo_ok cluster=0x{:04X}", cluster_id);
+                    log::info!("[Runtime] ZDO OK cluster=0x{:04X}", cluster_id);
+                }
+                Err(e) => {
+                    rt_trace!(
+                        "[RT][EFR32] zdo_fail cluster=0x{:04X} err={:?}",
+                        cluster_id,
+                        e
+                    );
+                    log::warn!("[Runtime] ZDO FAIL cluster=0x{:04X}: {:?}", cluster_id, e,)
+                }
             }
 
             // After ZDO processes Mgmt_Leave_req, execute the actual leave
@@ -908,6 +1037,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         }
 
         // Application endpoint — parse ZCL frame
+        rt_trace!(
+            "[RT][EFR32] zcl ep={} cluster=0x{:04X} from=0x{:04X} len={}",
+            dst_ep,
+            cluster_id,
+            src_addr,
+            aps_indication.payload.len()
+        );
         log::info!(
             "[Runtime] ZCL frame: ep={} cluster=0x{:04X} from 0x{:04X} len={}",
             dst_ep,
@@ -924,6 +1060,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         };
 
         let cmd_id = zcl_frame.header.command_id.0;
+        rt_trace!(
+            "[RT][EFR32] zcl_cmd ep={} cluster=0x{:04X} cmd=0x{:02X} seq={} dir={:?} payload={}",
+            dst_ep,
+            cluster_id,
+            cmd_id,
+            zcl_frame.header.seq_number,
+            zcl_frame.header.direction(),
+            zcl_frame.payload.len(),
+        );
 
         // Check if this is a Report Attributes (0x0A) — incoming report from remote
         if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
@@ -970,47 +1115,131 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             && cmd_id == 0x06
         {
             use zigbee_zcl::foundation::reporting::{
-                ConfigureReportingRequest, ConfigureReportingResponse,
-                ConfigureReportingStatusRecord,
+                ConfigureReportingResponse, ConfigureReportingStatusRecord, ReportDirection,
+                ReportingConfig,
             };
-            if let Some(req) = ConfigureReportingRequest::parse(zcl_frame.payload.as_slice()) {
-                let mut response = ConfigureReportingResponse {
-                    records: heapless::Vec::new(),
+            let payload = zcl_frame.payload.as_slice();
+            let mut response = ConfigureReportingResponse {
+                records: heapless::Vec::new(),
+            };
+            let cluster_ref = clusters
+                .iter()
+                .find(|c| c.endpoint == dst_ep && c.cluster.cluster_id() == zigbee_zcl::ClusterId(cluster_id));
+            let mut i = 0usize;
+            let mut records = 0usize;
+            let mut parse_ok = true;
+            rt_trace!(
+                "[RT][EFR32] zcl_cfg_reporting ep={} cluster=0x{:04X} len={}",
+                dst_ep,
+                cluster_id,
+                payload.len(),
+            );
+
+            while i < payload.len() {
+                let direction = match payload[i] {
+                    0x00 => ReportDirection::Send,
+                    0x01 => ReportDirection::Receive,
+                    _other => {
+                        rt_trace!("[RT][EFR32] zcl_cfg bad_dir=0x{:02X}", _other);
+                        parse_ok = false;
+                        break;
+                    }
                 };
-                // Find matching cluster to validate attribute existence
-                let cluster_ref = clusters.iter().find(|c| {
-                    c.endpoint == dst_ep
-                        && c.cluster.cluster_id() == zigbee_zcl::ClusterId(cluster_id)
-                });
-                for cfg in &req.configs {
-                    // Validate attribute exists in the cluster before configuring
-                    let attr_def = cluster_ref
-                        .as_ref()
-                        .and_then(|c| c.cluster.attributes().find(cfg.attribute_id));
-                    let status = if let Some(def) = attr_def {
-                        if cfg.direction == zigbee_zcl::foundation::reporting::ReportDirection::Send
-                            && !def.access.is_reportable()
-                        {
-                            ZclStatus::UnreportableAttribute
-                        } else {
-                            match self.reporting.configure_for_cluster(
-                                dst_ep,
-                                cluster_id,
-                                cfg.clone(),
-                            ) {
-                                Ok(()) => ZclStatus::Success,
-                                Err(s) => s,
-                            }
-                        }
-                    } else {
-                        ZclStatus::UnsupportedAttribute
-                    };
-                    let _ = response.records.push(ConfigureReportingStatusRecord {
-                        status,
-                        direction: cfg.direction,
-                        attribute_id: cfg.attribute_id,
-                    });
+                i += 1;
+                if i + 2 > payload.len() {
+                    parse_ok = false;
+                    break;
                 }
+                let attribute_id =
+                    zigbee_zcl::AttributeId(u16::from_le_bytes([payload[i], payload[i + 1]]));
+                i += 2;
+
+                let cfg = if direction == ReportDirection::Send {
+                    if i + 5 > payload.len() {
+                        parse_ok = false;
+                        break;
+                    }
+                    let Some(data_type) = zigbee_zcl::data_types::ZclDataType::from_u8(payload[i])
+                    else {
+                        rt_trace!("[RT][EFR32] zcl_cfg bad_type=0x{:02X}", payload[i]);
+                        parse_ok = false;
+                        break;
+                    };
+                    i += 1;
+                    let min_interval = u16::from_le_bytes([payload[i], payload[i + 1]]);
+                    i += 2;
+                    let max_interval = u16::from_le_bytes([payload[i], payload[i + 1]]);
+                    i += 2;
+                    let reportable_change = if zigbee_zcl::data_types::is_analog_type(data_type) {
+                        let Some((val, consumed)) =
+                            zigbee_zcl::data_types::ZclValue::deserialize(data_type, &payload[i..])
+                        else {
+                            parse_ok = false;
+                            break;
+                        };
+                        i += consumed;
+                        Some(val)
+                    } else {
+                        None
+                    };
+                    ReportingConfig {
+                        direction,
+                        attribute_id,
+                        data_type,
+                        min_interval,
+                        max_interval,
+                        reportable_change,
+                    }
+                } else {
+                    if i + 2 > payload.len() {
+                        parse_ok = false;
+                        break;
+                    }
+                    let timeout = u16::from_le_bytes([payload[i], payload[i + 1]]);
+                    i += 2;
+                    ReportingConfig {
+                        direction,
+                        attribute_id,
+                        data_type: zigbee_zcl::data_types::ZclDataType::NoData,
+                        min_interval: 0,
+                        max_interval: timeout,
+                        reportable_change: None,
+                    }
+                };
+
+                let attr_def = cluster_ref
+                    .as_ref()
+                    .and_then(|c| c.cluster.attributes().find(cfg.attribute_id));
+                let status = if let Some(def) = attr_def {
+                    if cfg.direction == ReportDirection::Send && !def.access.is_reportable() {
+                        ZclStatus::UnreportableAttribute
+                    } else {
+                        match self
+                            .reporting
+                            .configure_for_cluster(dst_ep, cluster_id, cfg.clone())
+                        {
+                            Ok(()) => ZclStatus::Success,
+                            Err(s) => s,
+                        }
+                    }
+                } else {
+                    ZclStatus::UnsupportedAttribute
+                };
+                let _ = response.records.push(ConfigureReportingStatusRecord {
+                    status,
+                    direction: cfg.direction,
+                    attribute_id: cfg.attribute_id,
+                });
+                records += 1;
+                rt_trace!(
+                    "[RT][EFR32] zcl_cfg attr=0x{:04X} dir={} status=0x{:02X}",
+                    cfg.attribute_id.0,
+                    cfg.direction as u8,
+                    status as u8,
+                );
+            }
+
+            if parse_ok && records > 0 {
                 // Queue Configure Reporting Response (0x07)
                 self.queue_reporting_response(
                     ShortAddress(src_addr),
@@ -1024,19 +1253,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     "[Runtime] Configure Reporting: ep={} cluster=0x{:04X} ({} attrs)",
                     dst_ep,
                     cluster_id,
-                    req.configs.len()
+                    records
                 );
-                for cfg in &req.configs {
-                    if cfg.direction == zigbee_zcl::foundation::reporting::ReportDirection::Send {
-                        log::info!(
-                            "  attr=0x{:04X} min={}s max={}s change={:?}",
-                            cfg.attribute_id.0,
-                            cfg.min_interval,
-                            cfg.max_interval,
-                            cfg.reportable_change
-                        );
-                    }
-                }
+            } else {
+                rt_trace!(
+                    "[RT][EFR32] zcl_cfg_reporting parse_fail ep={} cluster=0x{:04X} len={}",
+                    dst_ep,
+                    cluster_id,
+                    zcl_frame.payload.len(),
+                );
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
@@ -1124,6 +1349,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             if let Some(req) = zigbee_zcl::foundation::read_attributes::ReadAttributesRequest::parse(
                 zcl_frame.payload.as_slice(),
             ) {
+                rt_trace!(
+                    "[RT][EFR32] zcl_read ep={} cluster=0x{:04X} attrs={} from=0x{:04X}",
+                    dst_ep,
+                    cluster_id,
+                    req.attributes.len(),
+                    src_addr,
+                );
                 log::info!(
                     "[ZCL] ReadAttr ep={} cluster=0x{:04X} attrs={} from 0x{:04X}",
                     dst_ep,
@@ -1140,8 +1372,14 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         cr.cluster.attributes(),
                         &req,
                     );
-                    let mut payload_buf = [0u8; 253]; // Max ZCL payload size
-                    let payload_len = response.serialize(&mut payload_buf).min(payload_buf.len());
+                    let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                    let payload_len = response.serialize(payload_buf).min(payload_buf.len());
+                    rt_trace!(
+                        "[RT][EFR32] zcl_read_rsp cluster=0x{:04X} len={} records={}",
+                        cluster_id,
+                        payload_len,
+                        response.records.len(),
+                    );
                     log::info!(
                         "[ZCL] ReadAttr response: {} bytes, {} records queued",
                         payload_len,
@@ -1157,6 +1395,12 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         &payload_buf[..payload_len],
                     );
                 } else {
+                    rt_trace!(
+                        "[RT][EFR32] zcl_read no_cluster ep={} cluster=0x{:04X} have={}",
+                        dst_ep,
+                        cluster_id,
+                        clusters.len(),
+                    );
                     log::warn!(
                         "[ZCL] ReadAttr: no cluster found for ep={} cluster=0x{:04X} (have {} clusters)",
                         dst_ep,
@@ -1164,6 +1408,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         clusters.len(),
                     );
                 }
+            } else {
+                rt_trace!(
+                    "[RT][EFR32] zcl_read parse_fail ep={} cluster=0x{:04X} len={}",
+                    dst_ep,
+                    cluster_id,
+                    zcl_frame.payload.len(),
+                );
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
@@ -1192,8 +1443,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     cr.cluster.attributes_mut(),
                     &req,
                 );
-                let mut payload_buf = [0u8; 128];
-                let payload_len = response.serialize(&mut payload_buf);
+                let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                let payload_len = response.serialize(payload_buf);
                 self.queue_global_response(
                     src_addr,
                     aps_indication.src_endpoint,
@@ -1233,8 +1484,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         cr.cluster.attributes_mut(),
                         &req,
                     );
-                let mut payload_buf = [0u8; 128];
-                let payload_len = response.serialize(&mut payload_buf);
+                let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                let payload_len = response.serialize(payload_buf);
                 self.queue_global_response(
                     src_addr,
                     aps_indication.src_endpoint,
@@ -1299,8 +1550,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     cr.cluster.attributes(),
                     &req,
                 );
-                let mut payload_buf = [0u8; 128];
-                let payload_len = response.serialize(&mut payload_buf);
+                let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                let payload_len = response.serialize(payload_buf);
                 self.queue_global_response(
                     src_addr,
                     aps_indication.src_endpoint,
@@ -1338,8 +1589,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     req.start_command_id,
                     req.max_results,
                 );
-                let mut payload_buf = [0u8; 64];
-                let payload_len = response.serialize(&mut payload_buf);
+                let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                let payload_len = response.serialize(payload_buf);
                 self.queue_global_response(
                     src_addr,
                     aps_indication.src_endpoint,
@@ -1377,8 +1628,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     req.start_command_id,
                     req.max_results,
                 );
-                let mut payload_buf = [0u8; 64];
-                let payload_len = response.serialize(&mut payload_buf);
+                let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                let payload_len = response.serialize(payload_buf);
                 self.queue_global_response(
                     src_addr,
                     aps_indication.src_endpoint,
@@ -1414,8 +1665,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     cr.cluster.attributes(),
                     &req,
                 );
-                let mut payload_buf = [0u8; 128];
-                let payload_len = response.serialize(&mut payload_buf);
+                let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                let payload_len = response.serialize(payload_buf);
                 self.queue_global_response(
                     src_addr,
                     aps_indication.src_endpoint,
@@ -1571,8 +1822,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 for &b in resp.as_slice() {
                     let _ = frame.payload.push(b);
                 }
-                let mut zcl_buf = [0u8; 128];
-                if let Ok(len) = frame.serialize(&mut zcl_buf) {
+                let zcl_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                if let Ok(len) = frame.serialize(zcl_buf) {
                     let mut data = heapless::Vec::new();
                     for &b in &zcl_buf[..len] {
                         let _ = data.push(b);
@@ -1889,15 +2140,38 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             true,
         );
         for &b in payload {
-            let _ = frame.payload.push(b);
+            if frame.payload.push(b).is_err() {
+                rt_trace!(
+                    "[RT][EFR32] zcl_queue payload_truncated cluster=0x{:04X} cap={}",
+                    cluster_id,
+                    frame.payload.capacity(),
+                );
+                break;
+            }
         }
 
         let mut zcl_buf = [0u8; 256];
         if let Ok(len) = frame.serialize(&mut zcl_buf) {
             let mut data = heapless::Vec::new();
             for &b in &zcl_buf[..len] {
-                let _ = data.push(b);
+                if data.push(b).is_err() {
+                    rt_trace!(
+                        "[RT][EFR32] zcl_queue frame_truncated cluster=0x{:04X} len={} cap={}",
+                        cluster_id,
+                        len,
+                        data.capacity(),
+                    );
+                    return;
+                }
             }
+            rt_trace!(
+                "[RT][EFR32] zcl_queue dst=0x{:04X} src_ep={} dst_ep={} cluster=0x{:04X} len={}",
+                dst_addr,
+                src_endpoint,
+                dst_endpoint,
+                cluster_id,
+                data.len(),
+            );
             if self
                 .pending_responses
                 .push(PendingZclResponse {
@@ -1909,8 +2183,14 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 })
                 .is_err()
             {
+                rt_trace!("[RT][EFR32] zcl_queue full");
                 log::warn!("[ZCL] Response queue full");
             }
+        } else {
+            rt_trace!(
+                "[RT][EFR32] zcl_queue serialize_fail cluster=0x{:04X}",
+                cluster_id,
+            );
         }
     }
 

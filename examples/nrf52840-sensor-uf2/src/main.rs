@@ -396,7 +396,7 @@ async fn main(_spawner: Spawner) {
 
         // ── Step 2: Poll parent for indirect frames (SED core) ──
         if device.is_joined() {
-            for poll_round in 0..4u8 {
+            for _poll_round in 0..4u8 {
                 match device.poll().await {
                     Ok(Some(ind)) => {
                         let mut cls = [

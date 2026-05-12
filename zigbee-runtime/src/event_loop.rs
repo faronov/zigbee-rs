@@ -145,6 +145,7 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
     ///
     /// Call this periodically. `elapsed_secs` is the time since the last tick.
     /// Pass registered cluster instances for automatic attribute reporting.
+    #[inline(never)]
     pub async fn tick(
         &mut self,
         elapsed_secs: u16,
@@ -155,8 +156,27 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
             return self.handle_action(action).await;
         }
 
-        // Phase 2: Send any queued ZCL responses
+        self.flush_pending_responses().await;
+
+        // Phase 3: Only do reporting/maintenance if joined
+        if !self.is_joined() {
+            return TickResult::Idle;
+        }
+
+        self.tick_joined(elapsed_secs, clusters).await
+    }
+
+    #[inline(never)]
+    async fn flush_pending_responses(&mut self) {
         while let Some(resp) = self.pending_responses.pop() {
+            rt_trace!(
+                "[RT][EFR32] zcl_tx dst=0x{:04X} src_ep={} dst_ep={} cluster=0x{:04X} len={}",
+                resp.dst_addr.0,
+                resp.src_endpoint,
+                resp.dst_endpoint,
+                resp.cluster_id,
+                resp.zcl_data.len(),
+            );
             log::info!(
                 "[Runtime] Sending ZCL response: dst=0x{:04X} ep={} cluster=0x{:04X} len={}",
                 resp.dst_addr.0,
@@ -174,51 +194,75 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                 )
                 .await
             {
+                rt_trace!(
+                    "[RT][EFR32] zcl_tx_err dst=0x{:04X} cluster=0x{:04X}",
+                    resp.dst_addr.0,
+                    resp.cluster_id,
+                );
                 log::warn!(
                     "[Runtime] ZCL response send failed: dst=0x{:04X} ep={} cluster=0x{:04X}",
                     resp.dst_addr.0,
                     resp.dst_endpoint,
                     resp.cluster_id,
                 );
+            } else {
+                rt_trace!(
+                    "[RT][EFR32] zcl_tx_ok dst=0x{:04X} cluster=0x{:04X}",
+                    resp.dst_addr.0,
+                    resp.cluster_id,
+                );
             }
         }
+    }
 
-        // Phase 3: Only do reporting/maintenance if joined
-        if !self.is_joined() {
-            return TickResult::Idle;
-        }
+    #[inline(never)]
+    async fn tick_joined(
+        &mut self,
+        elapsed_secs: u16,
+        clusters: &mut [crate::ClusterRef<'_>],
+    ) -> TickResult {
+        self.run_aps_maintenance().await;
+        self.run_nwk_maintenance(elapsed_secs).await;
 
-        // Phase 4: APS layer maintenance — ACK retransmission and fragment aging
-        {
-            let aps = self.bdb.zdo_mut().aps_mut();
-            let retransmit_frames = aps.age_ack_table();
-            for frame in retransmit_frames.iter() {
-                let _ = aps
-                    .nwk_mut()
-                    .nlde_data_request(zigbee_types::ShortAddress(0xFFFF), 0, frame, true, false)
-                    .await;
-            }
-            aps.age_dup_table();
-            aps.fragment_rx_mut().age_entries();
-        }
-
-        // Phase 4b: NWK router maintenance — BTR aging, link status, routing expiry
-        {
-            let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
-            nwk.tick_router_maintenance(elapsed_secs);
-            // Send link status if due (async operation)
-            nwk.process_pending_routing().await;
-        }
-
-        // Phase 5: Tick the reporting engine timers
         self.reporting.tick(elapsed_secs);
+        self.apply_fb_target_request(clusters);
+        self.run_finding_binding_tick(elapsed_secs).await;
+        self.send_due_reports(clusters).await;
+        self.update_pending_tx_flag();
 
-        // Phase 5b: Handle F&B target request — set IdentifyTime on Identify cluster
+        let now_ms = (elapsed_secs as u32) * 1000;
+        self.run_sleepy_poll(now_ms).await;
+        self.tick_power_state(now_ms)
+    }
+
+    #[inline(never)]
+    async fn run_aps_maintenance(&mut self) {
+        let aps = self.bdb.zdo_mut().aps_mut();
+        let retransmit_frames = aps.age_ack_table();
+        for frame in retransmit_frames.iter() {
+            let _ = aps
+                .nwk_mut()
+                .nlde_data_request(zigbee_types::ShortAddress(0xFFFF), 0, frame, true, false)
+                .await;
+        }
+        aps.age_dup_table();
+        aps.fragment_rx_mut().age_entries();
+    }
+
+    #[inline(never)]
+    async fn run_nwk_maintenance(&mut self, elapsed_secs: u16) {
+        let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
+        nwk.tick_router_maintenance(elapsed_secs);
+        nwk.process_pending_routing().await;
+    }
+
+    #[inline(never)]
+    fn apply_fb_target_request(&mut self, clusters: &mut [crate::ClusterRef<'_>]) {
         if let Some((ep, time_secs)) = self.bdb.fb_target_request.take() {
             for cr in clusters.iter_mut() {
                 if cr.endpoint == ep && cr.cluster.cluster_id().0 == 0x0003 {
                     let _ = cr.cluster.attributes_mut().set(
-                        zigbee_zcl::AttributeId(0x0000), // IdentifyTime
+                        zigbee_zcl::AttributeId(0x0000),
                         zigbee_zcl::data_types::ZclValue::U16(time_secs),
                     );
                     log::info!(
@@ -230,36 +274,41 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                 }
             }
         }
+    }
 
-        // Phase 5c: Tick F&B initiator response window
+    #[inline(never)]
+    async fn run_finding_binding_tick(&mut self, elapsed_secs: u16) {
         let _ = self.bdb.tick_finding_binding(elapsed_secs).await;
+    }
 
-        // Phase 6: Check and send due attribute reports for each cluster
+    #[inline(never)]
+    async fn send_due_reports(&mut self, clusters: &[crate::ClusterRef<'_>]) {
         for cr in clusters.iter() {
             let ep = cr.endpoint;
             let cid = cr.cluster.cluster_id().0;
             self.check_and_send_cluster_reports(ep, cid, cr.cluster.attributes())
                 .await;
         }
+    }
 
-        // Phase 7: Power management — SED auto-poll and sleep decision
-        // Record that we had activity if reports were sent
-        if !self.pending_responses.is_empty() {
-            self.power.set_pending_tx(true);
-        } else {
-            self.power.set_pending_tx(false);
-        }
+    #[inline(never)]
+    fn update_pending_tx_flag(&mut self) {
+        self.power
+            .set_pending_tx(!self.pending_responses.is_empty());
+    }
 
-        // Auto-poll for sleepy end devices
-        let now_ms = (elapsed_secs as u32) * 1000; // approximate
+    #[inline(never)]
+    async fn run_sleepy_poll(&mut self, now_ms: u32) {
         if self.is_sleepy() && self.power.should_poll(now_ms) {
             if let Ok(Some(_frame)) = self.bdb.zdo_mut().nwk_mut().mac_mut().mlme_poll().await {
                 self.power.record_activity(now_ms);
             }
             self.power.record_poll(now_ms);
         }
+    }
 
-        // Decide sleep vs stay awake
+    #[inline(never)]
+    fn tick_power_state(&mut self, now_ms: u32) -> TickResult {
         match self.power.decide(now_ms) {
             crate::power::SleepDecision::StayAwake => TickResult::Idle,
             crate::power::SleepDecision::LightSleep(ms) => TickResult::RunAgain(ms),
@@ -268,6 +317,7 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
     }
 
     /// Handle a user-initiated action.
+    #[inline(never)]
     async fn handle_action(&mut self, action: UserAction) -> TickResult {
         match action {
             UserAction::Join => {

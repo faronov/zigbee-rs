@@ -20,19 +20,22 @@
 
 use panic_halt as _;
 
-use zigbee_aps::PROFILE_HOME_AUTOMATION;
+use zigbee_aps::frames::{
+    ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader,
+};
+use zigbee_aps::{PROFILE_ZDP, ZDO_ENDPOINT};
 use zigbee_mac::{MacDriver, MacError};
-use zigbee_nwk::DeviceType;
-use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
-use zigbee_zcl::clusters::basic::BasicCluster;
-use zigbee_zcl::clusters::humidity::HumidityCluster;
-use zigbee_zcl::clusters::identify::IdentifyCluster;
-use zigbee_zcl::clusters::power_config::PowerConfigCluster;
-use zigbee_zcl::clusters::temperature::TemperatureCluster;
+use zigbee_nwk::frames::{NwkFrameControl, NwkFrameType, NwkHeader};
+use zigbee_types::{MacAddress, ShortAddress};
+use zigbee_zdo::device_announce::DeviceAnnounce;
+use zigbee_zdo::DEVICE_ANNCE;
 
-const DBG_BOOT_BASE: u32 = 0x00848C00;
-const DBG_MODE_BASE: u32 = 0x00848D00;
+// Keep debug SRAM well below the stack top (0x00850000). The heavier
+// sensor-lite interview path uses enough stack that the old 0x00848C00/0x00848D00
+// markers were getting clobbered.
+const DBG_BOOT_BASE: u32 = 0x00848400;
+const DBG_MODE_BASE: u32 = 0x00848500;
+
 
 // ── Boot vector table (tc32 ISA — native mnemonics) ──────────
 //
@@ -219,9 +222,13 @@ pub unsafe extern "C" fn _start() -> ! {
             let bss = &raw mut _sbss as *mut u8;
             core::ptr::write_bytes(bss, 0, bss_len);
         }
+
+        mark32(DBG_BOOT_BASE + 0x04, 0xAAAA0002_u32);
     }
 
+    mark32(DBG_BOOT_BASE + 0x08, 0xAAAA0003_u32);
     chip_init();
+    mark32(DBG_BOOT_BASE + 0x0C, 0xAAAA0004_u32);
     main_loop();
 }
 
@@ -242,6 +249,7 @@ fn chip_init() {
         core::ptr::write_volatile(pc_oen, core::ptr::read_volatile(pc_oen as *const u8) & !0x12);
         core::ptr::write_volatile(pb_oen, core::ptr::read_volatile(pb_oen as *const u8) & !0x20);
     }
+    mark32(DBG_BOOT_BASE + 0x10, 0xC1A00001);
 
     // ── Step 1: RED = disable IRQ + reset peripherals ──
     set_led(pc_out, pb_out, true, false, false);
@@ -301,6 +309,7 @@ fn chip_init() {
         core::ptr::write_volatile((REG_BASE + 0x064) as *mut u8, 0xFF); // CLK_EN1
         core::ptr::write_volatile((REG_BASE + 0x065) as *mut u8, 0xFF); // CLK_EN2 (ZB modem!)
     }
+    mark32(DBG_BOOT_BASE + 0x14, 0xC1A00002);
 
     // ── System tick: try starting it ──
     unsafe {
@@ -328,9 +337,11 @@ fn chip_init() {
         let v = core::ptr::read_volatile(irq_mask as *const u32);
         core::ptr::write_volatile(irq_mask, v | (1 << 0)); // FLD_IRQ_TMR0_EN
     }
+    mark32(DBG_BOOT_BASE + 0x18, 0xC1A00003);
 
     // ── Radio init: 802.15.4 Zigbee mode (custom, no HAL) ──
     radio::init();
+    mark32(DBG_BOOT_BASE + 0x1C, 0xC1A00004);
 
     // Enable global IRQ
     unsafe {
@@ -2464,10 +2475,8 @@ async fn diag_beacon_main(rx_buf: *mut u8) {
             board::LED_GREEN.write(true);
             board::LED_RED.write(false);
 
-            unsafe {
-                mark32(DBG_MODE_BASE + 0x10, pan_word);
-                mark32(DBG_MODE_BASE + 0x14, 0xBEAC0001);
-            }
+            mark32(DBG_MODE_BASE + 0x10, pan_word);
+            mark32(DBG_MODE_BASE + 0x14, 0xBEAC0001);
         }
 
         async_timer::delay_ms(10).await;
@@ -2490,7 +2499,7 @@ async fn diag_assoc_main() {
         mark32(DBG_MODE_BASE + 0x08, 0xD1A600A2);
         let scan = MlmeScanRequest {
             scan_type: ScanType::Active,
-            channel_mask: zigbee_types::ChannelMask(1 << 15),
+            channel_mask: zigbee_types::ChannelMask::ALL_2_4GHZ,
             scan_duration: 3,
         };
 
@@ -2555,73 +2564,242 @@ async fn diag_assoc_main() {
     }
 }
 
+#[cfg(feature = "sensor")]
+const SENSOR_POLL_INTERVAL_MS: u32 = 1000;
+#[cfg(feature = "sensor")]
+const SENSOR_ANNOUNCE_PERIOD_POLLS: u8 = 50;
+
+#[cfg(feature = "sensor")]
 #[inline(never)]
-async fn sensor_main() {
-    let mac = Tlsr8258Mac::new();
+async fn send_device_annce(
+    mac: &mut Tlsr8258Mac,
+    nwk_seq: &mut u8,
+    aps_seq: &mut u8,
+    zdo_seq: &mut u8,
+) -> Result<(), MacError> {
+    let annce = DeviceAnnounce {
+        nwk_addr: mac.short_address,
+        ieee_addr: mac.extended_address,
+        capability: 0x80,
+    };
 
-    let mut basic_cluster = BasicCluster::new(
-        b"Zigbee-RS",
-        b"TLSR8258-Sensor",
-        b"20260420",
-        b"0.1.0",
+    let mut zdp_payload = [0u8; 1 + DeviceAnnounce::WIRE_SIZE];
+    zdp_payload[0] = *zdo_seq;
+    *zdo_seq = zdo_seq.wrapping_add(1);
+    let _ = annce.serialize(&mut zdp_payload[1..]);
+
+    let nwk_header = NwkHeader {
+        frame_control: NwkFrameControl {
+            frame_type: NwkFrameType::Data as u8,
+            protocol_version: 0x02,
+            discover_route: 0,
+            multicast: false,
+            security: false,
+            source_route: false,
+            dst_ieee_present: false,
+            src_ieee_present: false,
+            end_device_initiator: false,
+        },
+        dst_addr: ShortAddress(0xFFFD),
+        src_addr: mac.short_address,
+        radius: 30,
+        seq_number: *nwk_seq,
+        dst_ieee: None,
+        src_ieee: None,
+        multicast_control: None,
+        source_route: None,
+    };
+    *nwk_seq = nwk_seq.wrapping_add(1);
+
+    let aps_header = ApsHeader {
+        frame_control: ApsFrameControl {
+            frame_type: ApsFrameType::Data as u8,
+            delivery_mode: ApsDeliveryMode::Broadcast as u8,
+            ack_format: false,
+            security: false,
+            ack_request: false,
+            extended_header: false,
+        },
+        dst_endpoint: Some(ZDO_ENDPOINT),
+        group_address: None,
+        cluster_id: Some(DEVICE_ANNCE),
+        profile_id: Some(PROFILE_ZDP),
+        src_endpoint: Some(ZDO_ENDPOINT),
+        aps_counter: *aps_seq,
+        extended_header: None,
+    };
+    *aps_seq = aps_seq.wrapping_add(1);
+
+    let mut payload = [0u8; 64];
+    let nwk_len = nwk_header.serialize(&mut payload);
+    let aps_len = aps_header.serialize(&mut payload[nwk_len..]);
+    let total = nwk_len + aps_len + zdp_payload.len();
+    if total > payload.len() {
+        return Err(MacError::FrameTooLong);
+    }
+    payload[nwk_len + aps_len..total].copy_from_slice(&zdp_payload);
+
+    mac.mcps_data(zigbee_mac::primitives::McpsDataRequest {
+        src_addr_mode: zigbee_mac::primitives::AddressMode::Short,
+        dst_address: MacAddress::Short(mac.pan_id, mac.coord_short_address),
+        payload: &payload[..total],
+        msdu_handle: *aps_seq,
+        tx_options: zigbee_mac::primitives::TxOptions {
+            ack_tx: false,
+            indirect: false,
+            security_enabled: false,
+        },
+    })
+    .await?;
+
+    Ok(())
+}
+
+#[cfg(feature = "sensor")]
+#[inline(never)]
+async fn handle_sensor_frame(
+    frame: &zigbee_mac::primitives::MacFrame,
+) -> bool {
+    let data = frame.as_slice();
+    let Some((nwk_header, nwk_len)) = NwkHeader::parse(data) else {
+        mark32(DBG_MODE_BASE + 0x6C, 0x53E5AA01);
+        return false;
+    };
+    let Some((aps_header, aps_len)) = ApsHeader::parse(&data[nwk_len..]) else {
+        mark32(DBG_MODE_BASE + 0x6C, 0x53E5AA02);
+        return false;
+    };
+    let payload = &data[nwk_len + aps_len..];
+
+    mark32(
+        DBG_MODE_BASE + 0x70,
+        nwk_header.src_addr.0 as u32 | ((nwk_header.dst_addr.0 as u32) << 16),
     );
-    basic_cluster.set_power_source(0x03);
-    let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
-    let mut hum_cluster = HumidityCluster::new(0, 10000);
-    let mut power_cluster = PowerConfigCluster::new();
-    let mut identify_cluster = IdentifyCluster::new();
-    temp_cluster.set_temperature(2250);
-    hum_cluster.set_humidity(5000u16);
-    power_cluster.set_battery_voltage(30);
-    power_cluster.set_battery_percentage(200);
+    mark32(
+        DBG_MODE_BASE + 0x74,
+        (aps_header.profile_id.unwrap_or(0) as u32)
+            | ((aps_header.cluster_id.unwrap_or(0) as u32) << 16),
+    );
+    if !payload.is_empty() {
+        mark32(
+            DBG_MODE_BASE + 0x78,
+            payload[0] as u32
+                | ((aps_header.frame_control.frame_type as u32) << 8)
+                | ((aps_header.frame_control.security as u32) << 16),
+        );
+    }
+    true
+}
 
-    let mut device = ZigbeeDevice::builder(mac)
-        .device_type(DeviceType::EndDevice)
-        .power_mode(PowerMode::Sleepy {
-            poll_interval_ms: 10_000,
-            wake_duration_ms: 500,
-        })
-        .manufacturer("Zigbee-RS")
-        .model("TLSR8258-Sensor")
-        .sw_build("0.1.0")
-        .channels(zigbee_types::ChannelMask(1 << 15))
-        .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
-            ep.cluster_server(0x0000)
-                .cluster_server(0x0003)
-                .cluster_server(0x0001)
-                .cluster_server(0x0402)
-                .cluster_server(0x0405)
-        })
-        .build();
+#[inline(never)]
+#[cfg(feature = "sensor")]
+async fn sensor_main() {
+    // Temporary sensor-lite path for tc32-stage2-tc32-31.
+    // The pure-Rust runtime join path (`ZigbeeDevice::start/tick`) currently
+    // trips a tc32 backend codegen bug, so default `sensor` mode uses the
+    // already-validated MAC scan/associate/poll flow directly.
+    let mut mac = Tlsr8258Mac::new();
+    mark32(DBG_MODE_BASE + 0x00, 0x53E50000);
 
-    device.user_action(UserAction::Join);
-
-    let mut elapsed: u16 = 0;
     loop {
-        let mut clusters = [
-            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-            ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-        ];
-        let _ = device.tick(elapsed, &mut clusters).await;
-        elapsed = 1;
+        board::LED_RED.write(true);
+        board::LED_GREEN.write(false);
+        board::LED_BLUE.write(false);
+        mark32(DBG_MODE_BASE + 0x04, 0x53E50001);
 
-        if device.is_joined() {
-            board::LED_GREEN.write(true);
-            if let Ok(Some(ind)) = device.poll().await {
-                let mut clusters = [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-                ];
-                let _ = device.process_incoming(&ind, &mut clusters).await;
+        let scan = MlmeScanRequest {
+            scan_type: ScanType::Active,
+            channel_mask: zigbee_types::ChannelMask(1 << 15),
+            scan_duration: 3,
+        };
+
+        match mac.mlme_scan(scan).await {
+            Ok(confirm) if !confirm.pan_descriptors.is_empty() => {
+                let desc = &confirm.pan_descriptors[0];
+                board::LED_RED.write(false);
+                board::LED_GREEN.write(true);
+                mark32(DBG_MODE_BASE + 0x10, 0x53E50010);
+                mark32(DBG_MODE_BASE + 0x14, desc.channel as u32);
+
+                let assoc = MlmeAssociateRequest {
+                    channel: desc.channel,
+                    coord_address: desc.coord_address,
+                    capability_info: CapabilityInfo {
+                        device_type_ffd: false,
+                        mains_powered: false,
+                        rx_on_when_idle: false,
+                        security_capable: false,
+                        allocate_address: true,
+                    },
+                };
+
+                match mac.mlme_associate(assoc).await {
+                    Ok(confirm) if confirm.status == AssociationStatus::Success => {
+                        let mut nwk_seq = 0u8;
+                        let mut aps_seq = 0u8;
+                        let mut zdo_seq = 0u8;
+                        let mut announce_polls = 0u8;
+                        board::LED_BLUE.write(true);
+                        mark32(DBG_MODE_BASE + 0x18, 0x53E5C000);
+                        mark32(DBG_MODE_BASE + 0x1C, confirm.short_address.0 as u32);
+                        let _ = send_device_annce(
+                            &mut mac,
+                            &mut nwk_seq,
+                            &mut aps_seq,
+                            &mut zdo_seq,
+                        )
+                        .await;
+
+                        loop {
+                            announce_polls = announce_polls.wrapping_add(1);
+                            match mac.mlme_poll().await {
+                                Ok(Some(frame)) => {
+                                    mark32(DBG_MODE_BASE + 0x20, 0x53E50021);
+                                    mark32(DBG_MODE_BASE + 0x24, frame.len() as u32);
+                                    let handled = handle_sensor_frame(&frame).await;
+                                    mark32(
+                                        DBG_MODE_BASE + 0x78,
+                                        if handled { 0x53E5BEEF } else { 0x53E50000 },
+                                    );
+                                }
+                                Ok(None) => {
+                                    mark32(DBG_MODE_BASE + 0x20, 0x53E50020);
+                                }
+                                Err(_) => {
+                                    mark32(DBG_MODE_BASE + 0x20, 0x53E5FFFF);
+                                }
+                            }
+                            if announce_polls >= SENSOR_ANNOUNCE_PERIOD_POLLS {
+                                announce_polls = 0;
+                                let _ = send_device_annce(
+                                    &mut mac,
+                                    &mut nwk_seq,
+                                    &mut aps_seq,
+                                    &mut zdo_seq,
+                                )
+                                .await;
+                            }
+                            async_timer::delay_ms(SENSOR_POLL_INTERVAL_MS).await;
+                        }
+                    }
+                    Ok(confirm) => {
+                        board::LED_BLUE.write(false);
+                        mark32(
+                            DBG_MODE_BASE + 0x18,
+                            0x53E50030 | (confirm.status as u32 & 0xFF),
+                        );
+                    }
+                    Err(_) => {
+                        board::LED_BLUE.write(false);
+                        mark32(DBG_MODE_BASE + 0x18, 0x53E5FF30);
+                    }
+                }
             }
-        } else {
-            board::LED_RED.write(true);
+            _ => {
+                board::LED_GREEN.write(false);
+                board::LED_RED.write(true);
+                mark32(DBG_MODE_BASE + 0x10, 0x53E5FF10);
+            }
         }
 
         async_timer::delay_ms(1000).await;

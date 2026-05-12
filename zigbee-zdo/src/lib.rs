@@ -229,6 +229,7 @@ impl Default for PendingZdpResponse {
 
 impl<M: MacDriver> ZdoLayer<M> {
     /// Create a new ZDO layer wrapping the given APS layer.
+    #[inline(never)]
     pub fn new(aps: ApsLayer<M>) -> Self {
         Self {
             aps,
@@ -239,6 +240,25 @@ impl<M: MacDriver> ZdoLayer<M> {
             local_nwk_addr: ShortAddress::UNASSIGNED,
             local_ieee_addr: [0u8; 8],
             pending_responses: core::array::from_fn(|_| PendingZdpResponse::default()),
+        }
+    }
+
+    /// Construct a ZDO layer directly into caller-provided storage.
+    ///
+    /// # Safety
+    /// `slot` must point to valid, properly aligned, uninitialized storage for `Self`.
+    #[inline(never)]
+    pub unsafe fn write_into(slot: *mut Self, mac: M, device_type: zigbee_nwk::DeviceType) {
+        unsafe {
+            ApsLayer::write_into(core::ptr::addr_of_mut!((*slot).aps), mac, device_type);
+            core::ptr::addr_of_mut!((*slot).seq).write(0);
+            core::ptr::addr_of_mut!((*slot).endpoints).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*slot).node_descriptor).write(NodeDescriptor::default());
+            core::ptr::addr_of_mut!((*slot).power_descriptor).write(PowerDescriptor::default());
+            core::ptr::addr_of_mut!((*slot).local_nwk_addr).write(ShortAddress::UNASSIGNED);
+            core::ptr::addr_of_mut!((*slot).local_ieee_addr).write([0u8; 8]);
+            core::ptr::addr_of_mut!((*slot).pending_responses)
+                .write(core::array::from_fn(|_| PendingZdpResponse::default()));
         }
     }
 

@@ -14,6 +14,28 @@ use crate::discovery::*;
 use crate::network_mgmt::*;
 use crate::{ZDO_ENDPOINT, ZdoError, ZdoLayer, ZdpStatus};
 
+#[inline(always)]
+fn zdp_cluster_name(cluster: u16) -> &'static str {
+    match cluster {
+        crate::NWK_ADDR_REQ => "NWK_ADDR_REQ",
+        crate::IEEE_ADDR_REQ => "IEEE_ADDR_REQ",
+        crate::NODE_DESC_REQ => "NODE_DESC_REQ",
+        crate::POWER_DESC_REQ => "POWER_DESC_REQ",
+        crate::SIMPLE_DESC_REQ => "SIMPLE_DESC_REQ",
+        crate::ACTIVE_EP_REQ => "ACTIVE_EP_REQ",
+        crate::MATCH_DESC_REQ => "MATCH_DESC_REQ",
+        crate::BIND_REQ => "BIND_REQ",
+        crate::UNBIND_REQ => "UNBIND_REQ",
+        crate::MGMT_LQI_REQ => "MGMT_LQI_REQ",
+        crate::MGMT_RTG_REQ => "MGMT_RTG_REQ",
+        crate::MGMT_BIND_REQ => "MGMT_BIND_REQ",
+        crate::MGMT_LEAVE_REQ => "MGMT_LEAVE_REQ",
+        crate::MGMT_PERMIT_JOINING_REQ => "MGMT_PERMIT_JOINING_REQ",
+        crate::MGMT_NWK_UPDATE_REQ => "MGMT_NWK_UPDATE_REQ",
+        _ => "UNKNOWN_ZDP",
+    }
+}
+
 // ── Main dispatcher ─────────────────────────────────────────────
 
 impl<M: MacDriver> ZdoLayer<M> {
@@ -41,6 +63,15 @@ impl<M: MacDriver> ZdoLayer<M> {
             ApsAddress::Short(a) => a,
             _ => ShortAddress(0x0000),
         };
+
+        log::info!(
+            "[ZDO RX] {} cluster=0x{:04X} tsn={} from=0x{:04X} ep={}",
+            zdp_cluster_name(cluster),
+            cluster,
+            tsn,
+            src_short.0,
+            ind.src_endpoint
+        );
 
         // --- Device_annce is fire-and-forget (no response) ---
         if cluster == crate::DEVICE_ANNCE {

@@ -118,11 +118,11 @@ pub struct MlmeScanConfirm {
 }
 
 /// Fixed-capacity list of PAN descriptors (no heap allocation)
-pub const MAX_PAN_DESCRIPTORS: usize = 27;
+pub const MAX_PAN_DESCRIPTORS: usize = 16;
 pub type PanDescriptorList = heapless::Vec<PanDescriptor, MAX_PAN_DESCRIPTORS>;
 
 /// Fixed-capacity list of ED values
-pub const MAX_ED_VALUES: usize = 16;
+pub const MAX_ED_VALUES: usize = 4;
 pub type EdList = heapless::Vec<EdValue, MAX_ED_VALUES>;
 
 // ── Association ─────────────────────────────────────────────────

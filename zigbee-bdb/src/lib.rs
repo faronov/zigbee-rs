@@ -108,6 +108,7 @@ pub struct BdbLayer<M: MacDriver> {
 
 impl<M: MacDriver> BdbLayer<M> {
     /// Create a new BDB layer wrapping the given ZDO layer.
+    #[inline(never)]
     pub fn new(zdo: ZdoLayer<M>) -> Self {
         Self {
             zdo,
@@ -117,6 +118,23 @@ impl<M: MacDriver> BdbLayer<M> {
             fb_identify_responses: heapless::Vec::new(),
             fb_window_remaining: 0,
             fb_initiator_endpoint: 0,
+        }
+    }
+
+    /// Construct a BDB layer directly into caller-provided storage.
+    ///
+    /// # Safety
+    /// `slot` must point to valid, properly aligned, uninitialized storage for `Self`.
+    #[inline(never)]
+    pub unsafe fn write_into(slot: *mut Self, mac: M, device_type: zigbee_nwk::DeviceType) {
+        unsafe {
+            ZdoLayer::write_into(core::ptr::addr_of_mut!((*slot).zdo), mac, device_type);
+            core::ptr::addr_of_mut!((*slot).attributes).write(BdbAttributes::default());
+            core::ptr::addr_of_mut!((*slot).state).write(BdbState::Idle);
+            core::ptr::addr_of_mut!((*slot).fb_target_request).write(None);
+            core::ptr::addr_of_mut!((*slot).fb_identify_responses).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*slot).fb_window_remaining).write(0);
+            core::ptr::addr_of_mut!((*slot).fb_initiator_endpoint).write(0);
         }
     }
 

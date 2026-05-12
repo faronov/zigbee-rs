@@ -147,7 +147,12 @@ impl<M: MacDriver> ApsLayer<M> {
                     ApsAddress::Short(a) => a,
                     _ => return Err(ApsStatus::InvalidParameter),
                 };
-                (addr, ApsDeliveryMode::Unicast)
+                let mode = if addr.0 >= 0xFFF8 {
+                    ApsDeliveryMode::Broadcast
+                } else {
+                    ApsDeliveryMode::Unicast
+                };
+                (addr, mode)
             }
             ApsAddressMode::Group => {
                 let _group = match req.dst_address {
@@ -653,26 +658,20 @@ impl<M: MacDriver> ApsLayer<M> {
         nwk_security: bool,
         decrypted_buf: &'a mut ApsFrameBuffer,
     ) -> Option<ApsdeDataIndication<'a>> {
-        log::info!(
-            "[APS RX] process_incoming_aps_frame: {} bytes from 0x{:04X}",
+        #[cfg(feature = "efr32-trace")]
+        rtt_target::rprintln!(
+            "[APS] RX {} bytes fc={:02X}",
             nwk_payload.len(),
-            nwk_src.0,
+            nwk_payload[0]
         );
-        if nwk_payload.len() >= 2 {
-            log::info!(
-                "[APS RX] FC=0x{:02X} (type={}, sec={})",
-                nwk_payload[0],
-                nwk_payload[0] & 0x03,
-                (nwk_payload[0] >> 5) & 1,
-            );
-        }
 
         let (header, consumed) = ApsHeader::parse(nwk_payload)?;
-        log::info!(
-            "[APS RX] Parsed: type={:?}, sec={}, consumed={}",
+        #[cfg(feature = "efr32-trace")]
+        rtt_target::rprintln!(
+            "[APS] type={} sec={} consumed={}",
             header.frame_control.frame_type,
             header.frame_control.security,
-            consumed,
+            consumed
         );
 
         let aps_secured = header.frame_control.security;
@@ -681,29 +680,22 @@ impl<M: MacDriver> ApsLayer<M> {
 
         // Phase 1: APS security decryption
         if aps_secured {
-            log::info!("[APS RX] APS security enabled, parsing security header...");
-            let parsed = crate::security::ApsSecurityHeader::parse(after_header);
-            if parsed.is_none() {
-                log::warn!(
-                    "[APS RX] APS security header parse FAILED, after_header len={}",
-                    after_header.len()
-                );
-                if after_header.len() >= 2 {
-                    log::warn!(
-                        "[APS RX] sec_ctrl=0x{:02X} next=0x{:02X}",
-                        after_header[0],
-                        after_header[1]
-                    );
-                }
+            #[cfg(feature = "efr32-trace")]
+            rtt_target::rprintln!("[APS] sec enabled, after_hdr={} bytes", after_header.len());
+            let Some((sec_hdr, sec_consumed)) =
+                crate::security::ApsSecurityHeader::parse(after_header)
+            else {
+                #[cfg(feature = "efr32-trace")]
+                rtt_target::rprintln!("[APS] sec hdr parse FAIL len={}", after_header.len());
                 return None;
-            }
-            let (sec_hdr, sec_consumed) = parsed.unwrap();
-            log::info!(
-                "[APS RX] APS sec header: ctrl=0x{:02X}, fc={}, sec_consumed={}, ct_len={}",
+            };
+            #[cfg(feature = "efr32-trace")]
+            rtt_target::rprintln!(
+                "[APS] sec: ctrl={:02X} fc={} sc={} ct={}",
                 sec_hdr.security_control,
                 sec_hdr.frame_counter,
                 sec_consumed,
-                after_header.len() - sec_consumed,
+                after_header.len() - sec_consumed
             );
             let ciphertext = &after_header[sec_consumed..];
             let aad_end = consumed + sec_consumed;
@@ -720,7 +712,14 @@ impl<M: MacDriver> ApsLayer<M> {
 
             let key_id =
                 crate::security::ApsSecurityHeader::key_identifier(sec_hdr.security_control);
-            log::info!("[APS RX] key_id={}", key_id);
+            #[cfg(feature = "efr32-trace")]
+            rtt_target::rprintln!(
+                "[APS] key_id={} aad_len={} ct_len={} src_ieee={}",
+                key_id,
+                aad_len,
+                ciphertext.len(),
+                sec_hdr.source_address.is_some() as u8,
+            );
             let key = if key_id == crate::security::KEY_ID_DATA_KEY {
                 if let Some(addr) = &sec_hdr.source_address {
                     if let Some(entry) = self.security.find_any_key(addr) {
@@ -763,10 +762,8 @@ impl<M: MacDriver> ApsLayer<M> {
             //   2. Raw TC link key instead of derived key-transport key
             let mut decrypt_ok = false;
             if let Some(plaintext) = self.security.decrypt(aad, ciphertext, &key, &sec_hdr) {
-                log::info!(
-                    "[APS RX] APS decrypt SUCCESS, plaintext {} bytes",
-                    plaintext.len()
-                );
+                #[cfg(feature = "efr32-trace")]
+                rtt_target::rprintln!("[APS] decrypt OK! {} bytes", plaintext.len());
                 let pt_len = plaintext.len().min(decrypted_buf.data.len());
                 decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
                 decrypted_buf.len = pt_len;
@@ -779,10 +776,8 @@ impl<M: MacDriver> ApsLayer<M> {
                 let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
                 if let Some(plaintext) = self.security.decrypt(aad_raw, ciphertext, &key, &sec_hdr)
                 {
-                    log::info!(
-                        "[APS RX] APS decrypt SUCCESS (raw AAD), plaintext {} bytes",
-                        plaintext.len()
-                    );
+                    #[cfg(feature = "efr32-trace")]
+                    rtt_target::rprintln!("[APS] decrypt OK (raw AAD)! {} bytes", plaintext.len());
                     let pt_len = plaintext.len().min(decrypted_buf.data.len());
                     decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
                     decrypted_buf.len = pt_len;
@@ -794,9 +789,9 @@ impl<M: MacDriver> ApsLayer<M> {
             // Fallback for key-transport: try raw TC link key (some impls don't derive)
             if !decrypt_ok && key_id == crate::security::KEY_ID_KEY_TRANSPORT {
                 let tc_key = *self.security.default_tc_link_key();
-                // Try with patched AAD
                 if let Some(plaintext) = self.security.decrypt(aad, ciphertext, &tc_key, &sec_hdr) {
-                    log::info!("[APS RX] APS decrypt SUCCESS (raw TC key + patched AAD)");
+                    #[cfg(feature = "efr32-trace")]
+                    rtt_target::rprintln!("[APS] decrypt OK (raw TC + patched)!");
                     let pt_len = plaintext.len().min(decrypted_buf.data.len());
                     decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
                     decrypted_buf.len = pt_len;
@@ -810,7 +805,8 @@ impl<M: MacDriver> ApsLayer<M> {
                         .security
                         .decrypt(aad_raw, ciphertext, &tc_key, &sec_hdr)
                     {
-                        log::info!("[APS RX] APS decrypt SUCCESS (raw TC key + raw AAD)");
+                        #[cfg(feature = "efr32-trace")]
+                        rtt_target::rprintln!("[APS] decrypt OK (raw TC + raw AAD)!");
                         let pt_len = plaintext.len().min(decrypted_buf.data.len());
                         decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
                         decrypted_buf.len = pt_len;
@@ -829,11 +825,11 @@ impl<M: MacDriver> ApsLayer<M> {
                     );
                 }
             } else {
-                log::warn!(
-                    "[APS] APS decryption failed from 0x{:04X} (key_id={}, ct_len={})",
-                    nwk_src.0,
+                #[cfg(feature = "efr32-trace")]
+                rtt_target::rprintln!(
+                    "[APS] decrypt ALL FAILED key_id={} ct_len={}",
                     key_id,
-                    ciphertext.len(),
+                    ciphertext.len()
                 );
                 return None;
             }
@@ -930,11 +926,8 @@ impl<M: MacDriver> ApsLayer<M> {
                 }
                 let cmd_id = cmd_payload[0];
                 let cmd_data = &cmd_payload[1..];
-                log::info!(
-                    "[APS RX] Command ID=0x{:02X}, data_len={}",
-                    cmd_id,
-                    cmd_data.len()
-                );
+                #[cfg(feature = "efr32-trace")]
+                rtt_target::rprintln!("[APS] cmd ID={:02X} data={}", cmd_id, cmd_data.len());
                 match crate::frames::ApsCommandId::from_u8(cmd_id) {
                     Some(crate::frames::ApsCommandId::TransportKey) => {
                         self.handle_transport_key(cmd_data, nwk_src);
@@ -1198,31 +1191,41 @@ impl<M: MacDriver> ApsLayer<M> {
     /// Parses the key data and installs it into the appropriate security
     /// context (NWK key → NwkSecurity, link key → APS security table).
     fn handle_transport_key(&mut self, data: &[u8], src: ShortAddress) {
-        // Transport-Key payload: key_type(1) + key(16) + ...
-        // For Network Key: key_type(1) + key(16) + key_seq(1) + dst_addr(8) + src_addr(8)
-        // Minimum: 1 + 16 = 17 bytes
+        #[cfg(feature = "efr32-trace")]
+        rtt_target::rprintln!(
+            "[APS] Transport-Key! {} bytes from 0x{:04X}",
+            data.len(),
+            src.0
+        );
         if data.len() < 17 {
-            log::warn!("[APS] Transport-Key too short ({} bytes)", data.len());
+            #[cfg(feature = "efr32-trace")]
+            rtt_target::rprintln!("[APS] TK too short!");
             return;
         }
 
         let key_type = data[0];
         let mut key = [0u8; 16];
         key.copy_from_slice(&data[1..17]);
+        #[cfg(feature = "efr32-trace")]
+        rtt_target::rprintln!(
+            "[APS] TK type={} key[0..4]={:02X}{:02X}{:02X}{:02X}",
+            key_type,
+            key[0],
+            key[1],
+            key[2],
+            key[3]
+        );
 
         match key_type {
             0x01 => {
                 // Standard Network Key
                 let key_seq = if data.len() > 17 { data[17] } else { 0 };
-                log::info!(
-                    "[APS] Transport-Key: Network Key (seq={}) from 0x{:04X}",
-                    key_seq,
-                    src.0,
-                );
-                // Install into NWK security
+                #[cfg(feature = "efr32-trace")]
+                rtt_target::rprintln!("[APS] Installing NWK key seq={}", key_seq);
                 self.nwk_mut().security_mut().set_network_key(key, key_seq);
                 self.nwk_mut().nib_mut().active_key_seq_number = key_seq;
-                log::info!("[APS] Network key installed");
+                #[cfg(feature = "efr32-trace")]
+                rtt_target::rprintln!("[APS] NWK key installed!");
             }
             0x03 => {
                 // Trust Center Link Key (spec §4.4.9.2.3)

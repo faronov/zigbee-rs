@@ -35,13 +35,16 @@ const MSC_WRITECMD: u32 = MSC_BASE + 0x00C;
 pub struct Efr32FlashDriver;
 
 impl Efr32FlashDriver {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     fn wait_ready(&self) {
         // Wait for MSC to be ready (busy bit clear)
         for _ in 0..100_000u32 {
             let status = unsafe { core::ptr::read_volatile(MSC_STATUS as *const u32) };
-            if status & 0x01 != 0 { // BUSY bit
+            if status & 0x01 != 0 {
+                // BUSY bit
                 core::hint::spin_loop();
             } else {
                 break;

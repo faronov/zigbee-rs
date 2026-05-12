@@ -15,3 +15,7 @@ zigbee-aps  = { version = "0.1.0", path = "../zigbee-aps" }
 zigbee-zcl  = { version = "0.1.0", path = "../zigbee-zcl" }
 zigbee-zdo  = { version = "0.1.0", path = "../zigbee-zdo" }
 log = "0.4"
+rtt-target = { version = "0.6", optional = true }
+
+[features]
+efr32-trace = ["dep:rtt-target"]

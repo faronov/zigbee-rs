@@ -47,6 +47,18 @@ use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 
+#[cfg(feature = "efr32-trace")]
+macro_rules! efr32_trace {
+    ($($arg:tt)*) => {
+        rtt_target::rprintln!($($arg)*);
+    };
+}
+
+#[cfg(not(feature = "efr32-trace"))]
+macro_rules! efr32_trace {
+    ($($arg:tt)*) => {};
+}
+
 // ── EFR32MG1 Peripheral Base Addresses ──────────────────────────
 
 /// Clock Management Unit — controls peripheral clock gating.
@@ -154,12 +166,12 @@ const RAC_CMD_RXDIS: u32 = 1 << 8; // was 1<<3!
 // ── RAC Status Bits ─────────────────────────────────────────────
 
 const RAC_STATUS_STATE_SHIFT: u32 = 24;
-const RAC_STATUS_STATE_MASK: u32 = 0x0F << RAC_STATUS_STATE_SHIFT;
+const _RAC_STATUS_STATE_MASK: u32 = 0x0F << RAC_STATUS_STATE_SHIFT;
 // RAC hardware state machine values (bits [27:24] of RAC_STATUS).
 // These are the 10 hardware states — NOT the same as sequencer states!
 const _RAC_STATE_OFF: u32 = 0x00; // Radio off
 const _RAC_STATE_RXWARM: u32 = 0x01; // RX warming up
-const RAC_STATE_RXSEARCH: u32 = 0x02; // RX active, searching for preamble
+const _RAC_STATE_RXSEARCH: u32 = 0x02; // RX active, searching for preamble
 const _RAC_STATE_RXFRAME: u32 = 0x03; // Receiving a frame
 const _RAC_STATE_RX2TX: u32 = 0x04; // RX→TX turnaround
 const _RAC_STATE_TXWARM: u32 = 0x05; // TX warming up
@@ -172,7 +184,9 @@ const _RAC_STATE_SHUTDOWN: u32 = 0x09; // Radio shutdown / error state
 //
 // The RAC sequencer uses RAM at 0x21000000 for microcode and
 // variables at 0x21000EFC-0x21000FFF for configuration.
-// SEQ TypeDef base = 0x21000F00.
+// The xg1 register map overlays a small SEQ register block at the top of
+// that window (0x21000FEC-0x21000FFC), so only a subset of this region is
+// plain scratch RAM.
 
 /// Sequencer control register (NOT in RAC peripheral — it's in RAM!)
 const SEQ_CONTROL_REG: u32 = 0x2100_0EFC;
@@ -194,9 +208,21 @@ const SEQ_TX_RX_TIME: u32 = 0x2100_0FB0;
 const SEQ_TX_RX_SEARCHTIME: u32 = 0x2100_0FB4;
 /// TX→TX time (SEQ->REG0B8)
 const SEQ_TX_TX_TIME: u32 = 0x2100_0FB8;
-/// SYNTH LPF control RX (SEQ->SYNTHLPFCTRLRX at 0xFF8)
+/// xg1 sequencer PA slice control.
+const SEQ_PA_SLICES: u32 = 0x2100_0FC0;
+/// xg1 sequencer RX PA CTUNE.
+const SEQ_RX_PA_CTUNE: u32 = 0x2100_0FC4;
+/// xg1 sequencer TX PA CTUNE.
+const SEQ_TX_PA_CTUNE: u32 = 0x2100_0FC8;
+/// xg1 SEQ dynamic-channel-power table pointer.
+const SEQ_DYNAMIC_CHPWR_TABLE: u32 = 0x2100_0FEC;
+/// xg1 SEQ PHYINFO pointer.
+const SEQ_PHYINFO: u32 = 0x2100_0FF0;
+/// xg1 SEQ miscellaneous control.
+const SEQ_MISC: u32 = 0x2100_0FF4;
+/// SYNTH LPF control RX (xg1 SEQ register at 0xFF8)
 const SEQ_SYNTHLPFCTRLRX: u32 = 0x2100_0FF8;
-/// SYNTH LPF control TX (SEQ->SYNTHLPFCTRLTX at 0xFFC)
+/// SYNTH LPF control TX (xg1 SEQ register at 0xFFC)
 const SEQ_SYNTHLPFCTRLTX: u32 = 0x2100_0FFC;
 
 // ── RAC IRQ Bits (from GSDK RAC_field.py) ────────────────────
@@ -258,7 +284,7 @@ const FRC_IFC: u32 = FRC_BASE + 0x068;
 /// FRC interrupt enable register.
 const FRC_IEN: u32 = FRC_BASE + 0x06C;
 /// FRC buffer mode register.
-const _FRC_BUFFERMODE: u32 = FRC_BASE + 0x070;
+const _FRC_BUFFERMODE: u32 = FRC_BASE + 0x07C;
 /// Frame Control Descriptor 0 (TX descriptor).
 const FRC_FCD0: u32 = FRC_BASE + 0x0A0;
 /// Frame Control Descriptor 1.
@@ -336,6 +362,7 @@ const _BUFC_BUF0_READOFFSET: u32 = BUFC_BASE + 0x00C;
 const _BUFC_BUF0_READDATA: u32 = BUFC_BASE + 0x014;
 const BUFC_BUF0_WRITEDATA: u32 = BUFC_BASE + 0x018;
 const _BUFC_BUF0_STATUS: u32 = BUFC_BASE + 0x020;
+const BUFC_BUF0_THRESHOLDCTRL: u32 = BUFC_BASE + 0x024;
 const BUFC_BUF0_CMD: u32 = BUFC_BASE + 0x028;
 
 // Buffer 1 — used for RX
@@ -343,17 +370,61 @@ const BUFC_BUF1_CTRL: u32 = BUFC_BASE + 0x030;
 const BUFC_BUF1_ADDR: u32 = BUFC_BASE + 0x034;
 const BUFC_BUF1_READDATA: u32 = BUFC_BASE + 0x044;
 const BUFC_BUF1_STATUS: u32 = BUFC_BASE + 0x050;
+const BUFC_BUF1_THRESHOLDCTRL: u32 = BUFC_BASE + 0x054;
 const BUFC_BUF1_CMD: u32 = BUFC_BASE + 0x058;
 
-// Buffer 2 — used for RX length
+// Buffer 2 — used by the hardware RX packet queue / metadata path.
+const BUFC_BUF2_CTRL: u32 = BUFC_BASE + 0x060;
+const BUFC_BUF2_ADDR: u32 = BUFC_BASE + 0x064;
+const BUFC_BUF2_THRESHOLDCTRL: u32 = BUFC_BASE + 0x084;
 const _BUFC_BUF2_CMD: u32 = BUFC_BASE + 0x088;
 
 // BUFC interrupt registers
 const BUFC_IF: u32 = BUFC_BASE + 0x0E0;
 const BUFC_IFC: u32 = BUFC_BASE + 0x0E8;
 
-/// BUFC buffer size code: 2 = 256 bytes.
-const BUFC_BUFSIZE_256: u32 = 2;
+/// BUFC control values captured from the working GSDK stack.
+///
+/// Series-1 RAIL uses three hardware buffers:
+/// - BUF0: TX FIFO
+/// - BUF1: RX FIFO
+/// - BUF2: RX packet queue / metadata
+///
+/// Our earlier pure-Rust bring-up only configured BUF0/BUF1 and left BUF2
+/// disabled, which matches the observed "TX works, RX never lands in BUFC"
+/// failure mode. These control values are taken from a runtime capture of the
+/// working EFR32MG1 GSDK firmware during active scan.
+const BUFC_BUF0_CTRL_GSDK: u32 = 0x0000_0001;
+const BUFC_BUF1_CTRL_GSDK: u32 = 0x0000_0003;
+const BUFC_BUF2_CTRL_GSDK: u32 = 0x0000_0000;
+const BUFC_BUF0_THRESHOLD_GSDK: u32 = 0x0000_0FFF;
+const BUFC_BUF1_THRESHOLD_GSDK: u32 = 0x0000_0FFF;
+const BUFC_BUF2_THRESHOLD_GSDK: u32 = 0x0000_0003;
+
+// ── NVIC registers / IRQ numbers ───────────────────────────────
+
+const NVIC_ISER0: u32 = 0xE000_E100;
+const NVIC_ICPR0: u32 = 0xE000_E280;
+const NVIC_IPR_BASE: u32 = 0xE000_E400;
+
+// IRQ numbers match examples/efr32mg1-sensor/src/vectors.rs.
+const IRQ_FRC_PRI: u32 = 1;
+const IRQ_FRC: u32 = 3;
+const _IRQ_MODEM: u32 = 4;
+const IRQ_RAC_SEQ: u32 = 5;
+const IRQ_RAC_RSM: u32 = 6;
+const IRQ_BUFC: u32 = 7;
+const _IRQ_AGC: u32 = 27;
+const _IRQ_PROTIMER: u32 = 28;
+const _IRQ_SYNTH: u32 = 30;
+const PROTIMER_BASE: u32 = 0x4008_5000;
+const PROTIMER_CTRL: u32 = PROTIMER_BASE + 0x000;
+const PROTIMER_CMD: u32 = PROTIMER_BASE + 0x004;
+const PROTIMER_PRECNTTOP: u32 = PROTIMER_BASE + 0x028;
+const PROTIMER_WRAPCNTTOP: u32 = PROTIMER_BASE + 0x030;
+const PROTIMER_WRAPCNT: u32 = PROTIMER_BASE + 0x038;
+const PROTIMER_IFC: u32 = PROTIMER_BASE + 0x064;
+const PROTIMER_IEN: u32 = PROTIMER_BASE + 0x068;
 
 // ── Static RAM buffers for BUFC DMA ─────────────────────────────
 
@@ -366,7 +437,20 @@ struct AlignedBuf<const N: usize>([u8; N]);
 /// TX RAM buffer pointed to by BUFC BUF0_ADDR.
 static BUFC_TX_RAM: SyncUnsafeCell<AlignedBuf<256>> = SyncUnsafeCell::new(AlignedBuf([0u8; 256]));
 /// RX RAM buffer pointed to by BUFC BUF1_ADDR.
-static BUFC_RX_RAM: SyncUnsafeCell<AlignedBuf<256>> = SyncUnsafeCell::new(AlignedBuf([0u8; 256]));
+static BUFC_RX_RAM: SyncUnsafeCell<AlignedBuf<512>> = SyncUnsafeCell::new(AlignedBuf([0u8; 512]));
+/// RX packet-queue / metadata buffer pointed to by BUFC BUF2_ADDR.
+static BUFC_RX_META_RAM: SyncUnsafeCell<AlignedBuf<64>> =
+    SyncUnsafeCell::new(AlignedBuf([0u8; 64]));
+
+/// Fixed MAC/PHY helper table captured from the working xg1 IEEE 802.15.4 GSDK image.
+static SEQ_PHYINFO_MISC_TABLE: [u32; 3] = [0x0000_19E1, 0x0000_19E1, 0x0000_0000];
+/// Fixed frame-coding table captured from the working xg1 IEEE 802.15.4 GSDK image.
+static SEQ_PHYINFO_FRAME_CODING: [u8; 26] = [
+    0x19, 0x3F, 0x01, 0x06, 0x04, 0x10, 0x01, 0x00, 0x00, 0x01, 0x01, 0x06, 0x00, 0x10, 0x27, 0x00,
+    0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+/// Runtime-built xg1 PHYINFO structure for the sequencer.
+static SEQ_PHYINFO_WORDS: SyncUnsafeCell<[u32; 19]> = SyncUnsafeCell::new([0u32; 19]);
 
 // ── Register access helpers ─────────────────────────────────────
 
@@ -382,16 +466,68 @@ fn reg_read(addr: u32) -> u32 {
 
 /// Read-modify-write: set bits in a register.
 #[inline(always)]
-fn reg_set_bits(addr: u32, bits: u32) {
+fn _reg_set_bits(addr: u32, bits: u32) {
     let old = reg_read(addr);
     reg_write(addr, old | bits);
 }
 
 /// Read-modify-write: clear bits in a register.
 #[inline(always)]
-fn reg_clear_bits(addr: u32, bits: u32) {
+fn _reg_clear_bits(addr: u32, bits: u32) {
     let old = reg_read(addr);
     reg_write(addr, old & !bits);
+}
+
+#[inline(always)]
+fn nvic_set_priority(irq: u32, priority: u8) {
+    unsafe { core::ptr::write_volatile((NVIC_IPR_BASE + irq) as *mut u8, priority << 5) };
+}
+
+#[inline(always)]
+fn nvic_clear_pending(irq: u32) {
+    reg_write(NVIC_ICPR0, 1u32 << irq);
+}
+
+#[inline(always)]
+fn nvic_enable(irq: u32) {
+    reg_write(NVIC_ISER0, 1u32 << irq);
+}
+
+fn encode_pa_dbm(dbm: i8) -> u8 {
+    const PA_DBM_TABLE: [u8; 41] = [
+        1, 2, 3, 3, 3, 4, 4, 5, 6, 6, 7, 7, 8, 9, 11, 12, 13, 15, 17, 20, 22, 25, 28, 31, 35, 39,
+        44, 50, 56, 63, 71, 81, 93, 110, 134, 144, 150, 150, 150, 150, 150,
+    ];
+    PA_DBM_TABLE[(dbm.clamp(-20, 20) + 20) as usize]
+}
+
+fn encode_pa_slices(level: u8) -> u32 {
+    let level = level.clamp(1, 248) as u32;
+    let bootstrap = u32::from(level > 201);
+    let (cascode, slice, stripe) = if level <= 31 {
+        (1, 1, level)
+    } else if level < 63 {
+        (3, 3, level - 31)
+    } else if level < 94 {
+        (7, 7, level - 62)
+    } else if level < 125 {
+        (15, 15, level - 93)
+    } else if level < 156 {
+        (31, 31, level - 124)
+    } else if level < 187 {
+        (63, 63, level - 155)
+    } else if level < 218 {
+        (if level < 202 { 127 } else { 255 }, 127, level - 186)
+    } else {
+        (255, 255, level - 217)
+    };
+
+    (bootstrap << 3) | (cascode << 6) | (slice << 14) | (stripe << 24)
+}
+
+fn encode_pa_ctune(value: u8) -> u32 {
+    let value = value.min(31) as u32;
+    (value & 0x7) | (value << 4)
 }
 
 // ── Async completion signals ────────────────────────────────────
@@ -422,6 +558,7 @@ static RX_BUF: SyncUnsafeCell<[u8; MAX_FRAME_LEN]> = SyncUnsafeCell::new([0u8; M
 static RX_LEN: AtomicU8 = AtomicU8::new(0);
 static RX_CRC_OK: AtomicBool = AtomicBool::new(false);
 static RX_RSSI: AtomicI8 = AtomicI8::new(-127);
+static LAST_TX_FRC_FLAGS: AtomicU8 = AtomicU8::new(0);
 
 // ── Public types ────────────────────────────────────────────────
 
@@ -500,6 +637,43 @@ impl Efr32Driver {
         drv
     }
 
+    /// Emit a compact radio state snapshot for parity checks against a
+    /// known-good firmware.
+    pub fn debug_snapshot(&self, _tag: &str) {
+        let _rac_status = reg_read(RAC_STATUS);
+
+        efr32_trace!(
+            "[EFR32][snap:{}] CMU_RADIOCLKEN0={:#010X} PROTIMER_CTRL={:#010X} PROTIMER_CMD={:#010X}",
+            _tag,
+            reg_read(CMU_RADIOCLKEN0),
+            reg_read(0x4008_5000),
+            reg_read(0x4008_5004),
+        );
+        efr32_trace!(
+            "[EFR32][snap:{}] RAC_STATUS={:#010X} RAC_STATE={} RAC_SEQSTATUS={:#010X} RAC_RXENSRCEN={:#010X}",
+            _tag,
+            _rac_status,
+            (_rac_status >> RAC_STATUS_STATE_SHIFT) & 0x0F,
+            reg_read(RAC_SEQSTATUS),
+            reg_read(_RAC_RXENSRCEN),
+        );
+        efr32_trace!(
+            "[EFR32][snap:{}] FRC_STATUS={:#010X} FRC_IF={:#010X} BUFC_BUF1_STATUS={:#010X}",
+            _tag,
+            reg_read(FRC_BASE + 0x000),
+            reg_read(FRC_IF),
+            reg_read(BUFC_BUF1_STATUS),
+        );
+        efr32_trace!(
+            "[EFR32][snap:{}] SYNTH_STATUS={:#010X} SYNTH_CHCTRL={:#010X} SYNTH_FREQ={:#010X} AGC_RSSI={:#010X}",
+            _tag,
+            reg_read(SYNTH_BASE + 0x000),
+            reg_read(SYNTH_CHCTRL),
+            reg_read(SYNTH_FREQ),
+            reg_read(AGC_RSSI),
+        );
+    }
+
     // ── Hardware initialization ─────────────────────────────────
 
     /// Full radio initialization — order matches baremetal RADIO_Config():
@@ -521,14 +695,19 @@ impl Efr32Driver {
         self.configure_agc();
         self.apply_config();
 
+        efr32_trace!("[INIT] before enable_radio_irqs");
+        self.enable_radio_irqs();
+
         self.initialized = true;
+        efr32_trace!("[INIT] starting RX");
 
         // Start RX NOW — all peripherals (CRC, FRC, MODEM, BUFC, SYNTH, AGC)
         // are fully configured. This is where the baremetal reference calls
         // radio_startrx().
         let ctrl = reg_read(SEQ_CONTROL_REG);
         reg_write(SEQ_CONTROL_REG, ctrl & !0x20); // Clear "radio disabled" flag
-        reg_write(RAC_IFPGACTRL, 0x0000_87F6); // IFPGA for 2.4 GHz RX
+        reg_write(RAC_IFPGACTRL, 0x0000_87E6); // Matches the working GSDK capture
+        reg_write(FRC_CMD, _FRC_CMD_FRAMEDETRESUME);
         reg_write(_RAC_RXENSRCEN, 0x02); // Software RX enable
 
         // Wait for RX to come up
@@ -537,48 +716,49 @@ impl Efr32Driver {
         }
 
         // Debug: dump critical register values after init
-        rtt_target::rprintln!("=== POST-INIT DUMP ===");
-        rtt_target::rprintln!(
+        efr32_trace!("=== POST-INIT DUMP ===");
+        efr32_trace!(
             "FRC: CTRL={:#X} RXCTRL={:#X} FECCTRL={:#X}",
             reg_read(FRC_CTRL),
             reg_read(FRC_RXCTRL),
             reg_read(FRC_FECCTRL)
         );
-        rtt_target::rprintln!(
+        efr32_trace!(
             "FRC: FCD0={:#X} FCD1={:#X} FCD2={:#X} FCD3={:#X}",
             reg_read(FRC_FCD0),
             reg_read(FRC_BASE + 0xA4),
             reg_read(FRC_FCD2),
             reg_read(FRC_BASE + 0xAC)
         );
-        rtt_target::rprintln!(
+        efr32_trace!(
             "RAC: CTRL={:#X} STATUS={:#X} SEQST={:#X}",
             reg_read(RAC_CTRL),
             reg_read(RAC_STATUS),
             reg_read(RAC_SEQSTATUS)
         );
-        rtt_target::rprintln!(
+        efr32_trace!(
             "RAC: R4={:#X} R5={:#X} R6={:#X} R7={:#X}",
             reg_read(RAC_BASE + 0x58),
             reg_read(RAC_BASE + 0x5C),
             reg_read(RAC_BASE + 0x60),
             reg_read(RAC_BASE + 0x64)
         );
-        rtt_target::rprintln!(
+        efr32_trace!(
             "SYNTH: FREQ={:#X} DIVCTRL={:#X} IFFREQ={:#X}",
             reg_read(SYNTH_FREQ),
             reg_read(SYNTH_DIVCTRL),
             reg_read(SYNTH_IFFREQ)
         );
-        rtt_target::rprintln!(
-            "SEQ: CTRL_REG={:#X} TRANSITIONS={:#X}",
+        efr32_trace!(
+            "SEQ: CTRL_REG={:#X} TRANSITIONS={:#X} PHYINFO={:#X}",
             reg_read(SEQ_CONTROL_REG),
-            reg_read(_SEQ_TRANSITIONS)
+            reg_read(_SEQ_TRANSITIONS),
+            reg_read(SEQ_PHYINFO)
         );
         // Dump CRC peripheral to verify register offsets are correct.
         // We expect: +0x000=0x704 (CTRL), +0x008=0x0 (INIT), +0x00C=0x8408 (POLY).
         // If POLY shows 0x0 at +0x00C, the offsets need adjustment.
-        rtt_target::rprintln!(
+        efr32_trace!(
             "CRC @0x40082000: +0={:#X} +4={:#X} +8={:#X} +C={:#X} +10={:#X} +14={:#X} +18={:#X}",
             reg_read(0x4008_2000),
             reg_read(0x4008_2004),
@@ -588,8 +768,29 @@ impl Efr32Driver {
             reg_read(0x4008_2014),
             reg_read(0x4008_2018)
         );
-        rtt_target::rprintln!("RAC state={}", (reg_read(RAC_STATUS) >> 24) & 0x0F);
-        rtt_target::rprintln!("=== END DUMP ===");
+        efr32_trace!("RAC state={}", (reg_read(RAC_STATUS) >> 24) & 0x0F);
+        efr32_trace!("=== END DUMP ===");
+    }
+
+    /// Enable the NVIC lines used by the pure-Rust radio path.
+    ///
+    /// Without this the peripheral status bits are set, but the async TX/RX
+    /// signals never fire because FRC/RAC/BUFC interrupts never reach the CPU.
+    fn enable_radio_irqs(&self) {
+        // Only enable lines that already have real handlers in this driver.
+        // Enabling MODEM/AGC/PROTIMER/SYNTH here drops the core into
+        // DefaultHandler during early radio bring-up.
+        for irq in [IRQ_FRC_PRI, IRQ_FRC, IRQ_RAC_SEQ, IRQ_RAC_RSM, IRQ_BUFC] {
+            nvic_clear_pending(irq);
+            nvic_set_priority(irq, 2);
+            nvic_enable(irq);
+        }
+
+        efr32_trace!(
+            "efr32: NVIC ISER0={:#010X} ICPR0={:#010X}",
+            reg_read(NVIC_ISER0),
+            reg_read(NVIC_ICPR0),
+        );
     }
 
     /// Initialize PROTIMER (Protocol Timer) — required by RAC sequencer.
@@ -600,28 +801,12 @@ impl Efr32Driver {
     ///
     /// PROTIMER base = 0x40085000, clock from RADIOCLKEN0 bit 0.
     fn configure_protimer(&self) {
-        const PROTIMER_BASE: u32 = 0x4008_5000;
-        const PROTIMER_CTRL: u32 = PROTIMER_BASE + 0x000;
-        const PROTIMER_CMD: u32 = PROTIMER_BASE + 0x004;
-        const PROTIMER_PRECNTTOP: u32 = PROTIMER_BASE + 0x028;
-        const PROTIMER_WRAPCNTTOP: u32 = PROTIMER_BASE + 0x030;
-        const PROTIMER_IFC: u32 = PROTIMER_BASE + 0x064;
-        const PROTIMER_IEN: u32 = PROTIMER_BASE + 0x068;
-
-        // CTRL = 0x11100 (from baremetal)
-        reg_write(PROTIMER_CTRL, 0x0001_1100);
-
-        // PRECNTTOP: derived from system clock
-        // precnttop = (HFCLK_Hz / 1000) * 0x200 + 500) / 1000
-        // For 38.4 MHz: (38400000/1000) * 512 + 500) / 1000 = (38400*512+500)/1000 = 19661
-        // = 0x4CBD → encoded as (0x4CBD & 0xFF) | ((0x4CBD & 0xFFFFFF00) - 0x100)
-        let hfclk = 38_400_000u32;
-        let precnttop_raw = (hfclk / 1000 * 0x200 + 500) / 1000;
-        let precnttop = (precnttop_raw & 0xFF) | (precnttop_raw & 0xFFFFFF00).wrapping_sub(0x100);
-        reg_write(PROTIMER_PRECNTTOP, precnttop);
-
-        // WRAPCNTTOP = 0 (from baremetal)
-        reg_write(PROTIMER_WRAPCNTTOP, 0);
+        // The original bare-metal values leave FRC_STATUS stuck at 0x1, with
+        // ACTIVERXFCD never asserting. A capture from the working GSDK
+        // firmware shows this protocol-timer state during active scan.
+        reg_write(PROTIMER_CTRL, 0x0051_1102);
+        reg_write(PROTIMER_PRECNTTOP, 0x0000_4BCD);
+        reg_write(PROTIMER_WRAPCNTTOP, 0x7FFF_AAAA);
 
         // Enable WRAPCNTOF interrupt
         reg_write(PROTIMER_IEN, 1 << 2); // WRAPCNTOF = bit 2
@@ -633,6 +818,39 @@ impl Efr32Driver {
         reg_write(PROTIMER_CMD, 1);
     }
 
+    /// Program the xg1 SEQ register block with the PHYINFO layout expected by
+    /// the working IEEE 802.15.4 configurator output.
+    fn configure_seq_phyinfo(&self) {
+        let phyinfo = unsafe { &mut *SEQ_PHYINFO_WORDS.get() };
+        phyinfo.copy_from_slice(&[
+            0x0000_000D,
+            0x006A_AAAA,
+            0x0000_0000,
+            SEQ_PHYINFO_FRAME_CODING.as_ptr() as u32,
+            SEQ_PHYINFO_MISC_TABLE.as_ptr() as u32,
+            0x0000_0000,
+            0x00B7_1B00,
+            0x0249_F000,
+            0x001E_8480,
+            0x0000_2004,
+            0x0200_4924,
+            0x0000_0000,
+            0x0000_0000,
+            0x0000_0000,
+            0x0000_0000,
+            0x0000_0000,
+            0x001E_8480,
+            0x0000_0000,
+            0x0000_0000,
+        ]);
+
+        reg_write(SEQ_DYNAMIC_CHPWR_TABLE, 0);
+        reg_write(SEQ_PHYINFO, phyinfo.as_ptr() as u32);
+        reg_write(SEQ_MISC, 0);
+        reg_write(SEQ_SYNTHLPFCTRLRX, 0x0003_C000);
+        reg_write(SEQ_SYNTHLPFCTRLTX, 0x0003_C00E);
+    }
+
     /// Load RAC sequencer microcode into RAM.
     ///
     /// The RAC radio sequencer runs a custom instruction set from RAM.
@@ -641,16 +859,6 @@ impl Efr32Driver {
     /// RAC_CMD_TXEN/RXEN trigger the sequencer to coordinate SYNTH
     /// calibration, PA enable, FRC TX/RX, and return to idle.
     fn load_rac_sequences(&self) {
-        // Matches VDowbensky/efr32_baremetal RADIO_SeqInit() EXACTLY.
-        //
-        // VDowbensky genericSeqProg = 3820 bytes (955 words).
-        // Code: 0x21000000-0x21000EEB
-        // Variables: 0x21000EFC-0x21000FFF (cleared before resume)
-        //
-        // CRITICAL: Do NOT write variables before RESUME!
-        // The sequencer starts with all vars=0 and enters WAITING state.
-        // Variables are set AFTER resume by RADIO_Config().
-
         // 1. Halt sequencer
         reg_write(RAC_SEQCMD, RAC_SEQCMD_HALT);
 
@@ -659,7 +867,6 @@ impl Efr32Driver {
             reg_write(0x2100_0000 + i * 4, 0);
         }
 
-        // Dummy read (baremetal does this)
         let _ = reg_read(RAC_STATUS);
 
         // 3. Set vector address + compact mode
@@ -672,47 +879,40 @@ impl Efr32Driver {
             reg_write(0x2100_0000 + (i as u32) * 4, word);
         }
 
-        // 5. Set R6 pointer (baremetal does this BEFORE clearing vars)
+        // 5. Set R6 pointer
         reg_write(_RAC_R6, 0x2100_0FCC);
 
-        // 6. Clear variable areas (baremetal does TWO clears AFTER code load):
-        //    a) 0x21000F6C-0x21000FFF (SEQ config area — 148 bytes)
+        // 6. Clear variable areas
         for addr in (0x2100_0F6Cu32..=0x2100_0FFCu32).step_by(4) {
             reg_write(addr, 0);
         }
-        //    b) 0x21000EFC-0x21000F6B (SEQ variables — 112 bytes)
         for addr in (0x2100_0EFCu32..0x2100_0F6Cu32).step_by(4) {
             reg_write(addr, 0);
         }
 
-        // 7. RESUME — sequencer runs init with all vars = 0
-        //    It should enter WAITING state if everything is correct.
+        // 7. RESUME
+        efr32_trace!("[SEQ] pre-resume");
         reg_write(RAC_SEQCMD, RAC_SEQCMD_RESUME);
+        efr32_trace!("[SEQ] resumed, writing SRs");
         reg_write(_RAC_SR0, 0);
         reg_write(_RAC_SR1, 0);
         reg_write(_RAC_SR2, 0);
+        efr32_trace!("[SEQ] SRs written, spinning");
 
-        // Short delay for sequencer init
         for _ in 0..50_000u32 {
             core::hint::spin_loop();
         }
+        efr32_trace!("[SEQ] spin done");
 
-        let seqst = reg_read(RAC_SEQSTATUS);
-        rtt_target::rprintln!("efr32: SEQ {} words, SEQST={:#X}", seq_data.len(), seqst);
+        let _seqst = reg_read(RAC_SEQSTATUS);
+        efr32_trace!("efr32: SEQ {} words, SEQST={:#X}", seq_data.len(), _seqst);
 
-        // 8. NOW set variables (AFTER sequencer is running, same as RADIO_Config)
+        // 8. Set variables
         reg_write(SEQ_CONTROL_REG, reg_read(SEQ_CONTROL_REG) | 0x08);
 
-        // Warm-up times (µs)
-        // Warm-up times in STIMER TICKS (NOT microseconds!).
-        // STIMER runs at HFXO/8 = 38.4MHz/8 = 4.8 MHz.
-        // 100µs × 4.8 ticks/µs = 480 ticks.
-        // VDowbensky subtracts 4µs for overhead: (100-4) × 4.8 = 461.
-        // With raw µs (100), warm-up was only 20.8µs — too short for
-        // DCCAL (~50-80µs), causing RX to never detect frames!
-        const RX_WARM_TICKS: u32 = 461; // (100-4) × 4.8
-        const TX_WARM_TICKS: u32 = 432; // (100-10) × 4.8
-        const TX_PRE_TICKS: u32 = 336; // (100-10-20) × 4.8
+        const RX_WARM_TICKS: u32 = 461;
+        const TX_WARM_TICKS: u32 = 432;
+        const TX_PRE_TICKS: u32 = 336;
         reg_write(SEQ_RX_WARMTIME, RX_WARM_TICKS);
         reg_write(SEQ_TX_WARMTIME, TX_WARM_TICKS | (TX_PRE_TICKS << 16));
         reg_write(SEQ_RX_TX_TIME, TX_WARM_TICKS | (TX_PRE_TICKS << 16));
@@ -722,30 +922,14 @@ impl Efr32Driver {
         reg_write(SEQ_RX_SEARCHTIME, 0);
         reg_write(SEQ_TX_RX_SEARCHTIME, 0);
 
-        // State transitions: all → RX
-        // The sequencer uses its OWN state encoding, NOT the RAIL API encoding:
-        //   Sequencer: IDLE=0, RX=1, TX=2
-        //   RAIL API:  INACTIVE=0, IDLE=1, RX=2, TX=3
-        // One-hot bit for sequencer RX (state 1) = 1 << 1 = 0x02
-        // Previous value 0x04040404 was bit 2 = TX, causing TX→TX→SHUTDOWN!
         reg_write(_SEQ_TRANSITIONS, 0x0202_0202);
 
-        // SYNTH LPF
-        reg_write(SEQ_SYNTHLPFCTRLRX, 0x0003_C002);
-        reg_write(SEQ_SYNTHLPFCTRLTX, 0x0003_C002);
-
-        // 9. NOTE: Do NOT start RX here! The baremetal reference calls
-        //    radio_startrx() AFTER all config (FRC, MODEM, BUFC, SYNTH, AGC).
-        //    Starting RX now would enter RXSEARCH with unconfigured peripherals:
-        //    - BUFC BUF1_ADDR = 0 → DMA writes to flash address 0!
-        //    - FRC has no frame format → can't delimit frames
-        //    - CRC polynomial not set → CRC engine uninitialized
-        //    RX is started at the end of init_hardware() instead.
+        self.configure_seq_phyinfo();
 
         for _ in 0..50_000u32 {
             core::hint::spin_loop();
         }
-        rtt_target::rprintln!(
+        efr32_trace!(
             "efr32: after seq load: SEQST={:#X} RAC={:#X}",
             reg_read(RAC_SEQSTATUS),
             reg_read(RAC_STATUS)
@@ -836,25 +1020,24 @@ impl Efr32Driver {
         // LNAMIXCTRL (0x0FC): from reference dump = 0x00000000
         reg_write(RAC_BASE + 0x0FC, 0x0000_0000);
 
-        // LNAMIXCTRL1 (0x134): from reference dump = 0x00301F19
+        // LNAMIXCTRL1 (0x134): active-scan GSDK runtime value.
         reg_write(RAC_BASE + 0x134, 0x0030_1F19);
 
         // IFPGACTRL (0x138): from reference dump = 0x000087E6
         reg_write(RAC_IFPGACTRL, 0x0000_87E6);
 
-        // IFPGACAL (0x13C): from reference dump = 0x000008E0
+        // IFPGACAL (0x13C): runtime value from the working GSDK active-scan
+        // capture. The earlier bare-metal-derived value left the RX path
+        // alive enough for RSSI but still not framing packets.
         reg_write(RAC_BASE + 0x13C, 0x0000_08E0);
 
         // IFFILTCTRL (0x140): from reference dump = 0x0088006D
         reg_write(RAC_IFFILTCTRL, 0x0088_006D);
 
-        // IFADCCTRL (0x144): IF ADC configuration — CRITICAL!
-        // Reference dump = 0x0115_E6C0. Previous code had 0x1153_E6C0 (WRONG!
-        // 6 bits differ in upper half — VCM, OTA2CURRENT, REGENCLKDELAY fields).
-        // With wrong value, IF ADC outputs garbage → MODEM can't decode anything.
+        // IFADCCTRL (0x144): IF ADC configuration.
         reg_write(RAC_IFADCCTRL, 0x0115_E6C0);
 
-        // IFADCCAL (0x148): Enable IF ADC RC calibration
+        // IFADCCAL (0x148): enable IF ADC RC calibration.
         reg_write(RAC_BASE + 0x148, 0x0000_0010);
 
         // PA registers — values from ACTIVE reference dump (not sleeping!)
@@ -882,14 +1065,14 @@ impl Efr32Driver {
         // RAC interrupt enable — the sequencer needs specific RAC interrupts
         reg_write(RAC_BASE + 0x020, 0x002C_0004); // IEN from reference
 
-        // HFXO retiming control
+        // HFXO retiming control.
         reg_write(RAC_BASE + 0x030, 0x0000_0760); // HFXORETIMECTRL
 
         // Sequencer prescaler — controls timing resolution.
         // Reference value = 0x07. Without this, sequencer timing is off.
         reg_write(RAC_BASE + 0x084, 0x0000_0007); // PRESC
 
-        // Additional RAC registers from reference dump
+        // Additional RAC registers from the working active-scan capture.
         reg_write(RAC_BASE + 0x048, 0x0000_008C); // R0
         reg_write(RAC_BASE + 0x054, 0x0000_0004); // R3
         reg_write(RAC_BASE + 0x06C, 0x0000_0001); // WAITMASK
@@ -907,28 +1090,37 @@ impl Efr32Driver {
 
     /// Configure BUFC (Buffer Controller) with RAM buffer addresses.
     ///
-    /// BUFC requires static RAM buffers for TX (BUF0) and RX (BUF1).
-    /// The buffer addresses and sizes must be set before any TX/RX.
+    /// BUFC requires static RAM buffers for TX (BUF0), RX (BUF1), and the RX
+    /// packet queue / metadata path (BUF2). Leaving BUF2 disabled matches the
+    /// observed "RX path active but no frames ever reach BUFC" failure mode.
     fn configure_bufc(&self) {
-        // Buffer 0 = TX: 256 bytes
+        // Buffer 0 = TX FIFO
         let tx_addr = BUFC_TX_RAM.get() as u32;
-        reg_write(BUFC_BUF0_CTRL, BUFC_BUFSIZE_256);
+        reg_write(BUFC_BUF0_CTRL, BUFC_BUF0_CTRL_GSDK);
         reg_write(BUFC_BUF0_ADDR, tx_addr);
+        reg_write(BUFC_BUF0_THRESHOLDCTRL, BUFC_BUF0_THRESHOLD_GSDK);
         reg_write(BUFC_BUF0_CMD, 1); // clear
 
-        // Buffer 1 = RX: 256 bytes
+        // Buffer 1 = RX FIFO
         let rx_addr = BUFC_RX_RAM.get() as u32;
-        reg_write(BUFC_BUF1_CTRL, BUFC_BUFSIZE_256);
+        reg_write(BUFC_BUF1_CTRL, BUFC_BUF1_CTRL_GSDK);
         reg_write(BUFC_BUF1_ADDR, rx_addr);
+        reg_write(BUFC_BUF1_THRESHOLDCTRL, BUFC_BUF1_THRESHOLD_GSDK);
         reg_write(BUFC_BUF1_CMD, 1); // clear
 
-        // Buffer 2 = RX length: clear
+        // Buffer 2 = RX packet queue / appended metadata
+        let rx_meta_addr = BUFC_RX_META_RAM.get() as u32;
+        reg_write(BUFC_BUF2_CTRL, BUFC_BUF2_CTRL_GSDK);
+        reg_write(BUFC_BUF2_ADDR, rx_meta_addr);
+        reg_write(BUFC_BUF2_THRESHOLDCTRL, BUFC_BUF2_THRESHOLD_GSDK);
         reg_write(_BUFC_BUF2_CMD, 1);
+        reg_write(BUFC_IFC, 0xFFFF_FFFF);
 
         log::info!(
-            "efr32: BUFC configured, TX@{:#010X} RX@{:#010X}",
+            "efr32: BUFC configured, TX@{:#010X} RX@{:#010X} META@{:#010X}",
             tx_addr,
-            rx_addr
+            rx_addr,
+            rx_meta_addr
         );
     }
 
@@ -986,6 +1178,8 @@ impl Efr32Driver {
         reg_write(FRC_CTRL, 0x0000_07A0);
         // RXCTRL at 0x044: reference = 0x68
         reg_write(FRC_RXCTRL, 0x0000_0068);
+        // BUFFERMODE at 0x070 must match the working packet-buffer topology.
+        reg_write(_FRC_BUFFERMODE, 0x0000_17F8);
         // TRAILRXDATA at 0x04C: reference = 0x1B
         reg_write(FRC_TRAILRXDATA, 0x0000_001B);
         // FECCTRL at 0x034: reference = 0x0
@@ -1013,7 +1207,12 @@ impl Efr32Driver {
         // RX errors, but it won't fire unless enabled in IEN.
         reg_write(
             FRC_IEN,
-            FRC_IF_TXDONE | FRC_IF_RXDONE | FRC_IF_FRAMEERROR | FRC_IF_RXOF,
+            FRC_IF_TXDONE
+                | _FRC_IF_TXABORTED
+                | _FRC_IF_TXUF
+                | FRC_IF_RXDONE
+                | FRC_IF_FRAMEERROR
+                | FRC_IF_RXOF,
         );
     }
 
@@ -1128,6 +1327,11 @@ impl Efr32Driver {
         // SYNTH_CHSP: channel spacing (15 from reference — RAIL uses direct FREQ)
         reg_write(SYNTH_CHSP, 0x0000_000F);
 
+        // Match the reference synth retime path on xG1.
+        // Bit 0 enables MODEM DC calibration, bit 2 enables DCDC retime.
+        let sr3 = reg_read(_RAC_SR3);
+        reg_write(_RAC_SR3, sr3 | 0x0000_0004);
+
         // SYNTH_VCOGAIN (0x050)
         reg_write(SYNTH_BASE + 0x050, 0x0000_0029);
     }
@@ -1137,7 +1341,7 @@ impl Efr32Driver {
     /// All values from the working RAIL firmware dump.
     /// CMSIS: STATUS0-FRAMERSSI (0x00-0x0C) are RO, CTRL0 starts at 0x14.
     fn configure_agc(&self) {
-        // Values directly from reference firmware register dump
+        // Values directly from the working active-scan firmware dump.
         reg_write(AGC_BASE + 0x14, 0x0000_E0FA); // CTRL0
         reg_write(AGC_BASE + 0x18, 0x0000_18E7); // CTRL1
         reg_write(AGC_BASE + 0x1C, 0x8284_0000); // CTRL2
@@ -1167,6 +1371,16 @@ impl Efr32Driver {
         // PA registers from ACTIVE reference dump
         reg_write(RAC_BASE + 0x100, 0x0000_000C); // PACTRL0
         reg_write(RAC_BASE + 0x108, 0x0000_0485); // PABIASCTRL0
+
+        // The xG1 sequencer drives the effective PA level through its shadow
+        // variables in the 0x21000FC0 window, not only through the RAC PACTRL
+        // registers. Leaving these at zero lets the TX state machine run while
+        // the PA stays effectively unconfigured.
+        let pa_level = encode_pa_dbm(self.config.tx_power);
+        let pa_slices = (reg_read(SEQ_PA_SLICES) & 0xE0C0_3FFF) | encode_pa_slices(pa_level);
+        reg_write(SEQ_PA_SLICES, pa_slices);
+        reg_write(SEQ_TX_PA_CTUNE, encode_pa_ctune(7));
+        reg_write(SEQ_RX_PA_CTUNE, encode_pa_ctune(13));
     }
 
     /// Set RF channel for IEEE 802.15.4.
@@ -1236,7 +1450,42 @@ impl Efr32Driver {
             return Err(RadioError::InvalidFrame);
         }
 
+        // Recover from a stuck sequencer state before starting a fresh TX.
+        // Use aggressive abort: RXDIS+TXDIS, FRC RXABORT, clear all flags/buffers,
+        // and poll until RAC returns to OFF (state 0).
+        let rac_state_before = (reg_read(RAC_STATUS) >> 24) & 0x0F;
+        if rac_state_before != 0 {
+            // Force radio to idle
+            reg_write(RAC_CMD, RAC_CMD_TXDIS | RAC_CMD_RXDIS);
+            reg_write(FRC_CMD, FRC_CMD_RXABORT); // abort any in-progress FRC frame
+            reg_write(FRC_IFC, 0xFFFF_FFFF);
+            reg_write(RAC_IFC, 0xFFFF_FFFF);
+            reg_write(BUFC_BUF0_CMD, 1); // clear TX buffer
+            reg_write(BUFC_BUF1_CMD, 1); // clear RX buffer
+            reg_write(_BUFC_BUF2_CMD, 1); // clear length buffer
+            // Poll until RAC goes to OFF (state 0) — up to ~2.5ms
+            for i in 0..100u32 {
+                let st = (reg_read(RAC_STATUS) >> 24) & 0x0F;
+                if st == 0 {
+                    break;
+                }
+                if i == 50 {
+                    // Extra kick after 50 iterations
+                    reg_write(RAC_CMD, RAC_CMD_TXDIS | RAC_CMD_RXDIS);
+                }
+                for _ in 0..1000u32 {
+                    core::hint::spin_loop();
+                }
+            }
+            // Clear any signals that fired during abort
+            TX_DONE.reset();
+            RX_DONE.reset();
+            // After RXABORT, FRC RX FCD needs reactivation
+            reg_write(FRC_CMD, _FRC_CMD_FRAMEDETRESUME);
+        }
+
         TX_DONE.reset();
+        LAST_TX_FRC_FLAGS.store(0, Ordering::Release);
 
         // Debug: increment atomic TX call counter
         static TX_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -1249,31 +1498,42 @@ impl Efr32Driver {
         // Clear TX buffer (BUF0_CMD bit 0 = CLEAR)
         reg_write(BUFC_BUF0_CMD, 1);
 
+        // Reinitialize the radio CRC engine before every TX frame so the FRC
+        // starts from the IEEE 802.15.4 seed instead of carrying over the
+        // accumulator state from a previous packet.
+        reg_write(0x4008_2004, 0x0000_0001);
+
+        // Reset protocol-timer scheduling before arming a fresh TX path.
+        reg_write(PROTIMER_WRAPCNT, 0);
+
         // IEEE 802.15.4 PPDU format:
         //   Preamble (4 bytes) + SFD (1 byte) — handled by MODEM
-        //   PHR (1 byte) = PSDU length (frame + 2-byte FCS)
+        //   PHR (1 byte) = PSDU length including the 2-byte FCS
         //   PSDU = frame bytes
-        //   FCS (2 bytes) — appended by FRC hardware (INCLUDECRC in FCD1)
+        //   FCS (2 bytes) — appended on-air by FRC hardware (INCLUDECRC in FCD1)
         //
-        // We write: PHR + frame bytes to BUFC.
-        // FRC appends the 2-byte CRC automatically.
-        // PHR value = frame.len() + 2 (includes the FCS that FRC will add)
+        // The xG1 bare-metal flow writes PHR followed by the frame bytes.
+        // IEEE 802.15.4 encodes the PSDU length including the FCS even when
+        // the hardware appends that CRC on-air.
         let phr = (frame.len() + 2) as u8;
         reg_write(BUFC_BUF0_WRITEDATA, phr as u32);
         for &b in frame {
             reg_write(BUFC_BUF0_WRITEDATA, b as u32);
         }
 
-        // FRC_WCNTCMP0 = number of PAYLOAD bytes - 1 (NOT including PHR)
-        // The baremetal code: FRC->WCNTCMP0 = BUFC_TxBufferBytesAvailable() - 1
-        // which counts all bytes in the buffer (PHR + frame) minus 1.
-        // With two-subframe FCD: FCD0 handles first subframe (PHR, WORDS=0),
-        // FCD1 handles second subframe (payload, WORDS=0xFF).
-        // WCNTCMP0 counts TOTAL written bytes - 1.
-        reg_write(FRC_WCNTCMP0, (frame.len()) as u32); // PHR(1) + frame - 1
+        // In xG1 variable-length mode FCD0 handles the single-byte PHR and
+        // FCD1 handles the remaining PSDU bytes. WCNTCMP0 therefore marks the
+        // end of the 1-byte header, not the end of the whole packet.
+        let dfl_mode = reg_read(FRC_DFLCTRL) & 0x7;
+        let wcntcmp0 = if dfl_mode == 0 { frame.len() as u32 } else { 0 };
+        reg_write(FRC_WCNTCMP0, wcntcmp0);
 
         // Clear pending FRC TX-done flags before starting
         reg_write(FRC_IFC, 0xFFFF_FFFF);
+
+        // Reset RX_DONE before TX so that only the post-TX ACK (received during
+        // the auto TX→RX transition) can trigger receive_ack().
+        RX_DONE.reset();
 
         // Critical sequencer steps (from baremetal reference):
         // 1. Clear "radio disabled" flag in sequencer control
@@ -1286,27 +1546,9 @@ impl Efr32Driver {
         // Start TX via RAC — the sequencer handles SYNTH cal, PA, FRC
         reg_write(RAC_CMD, RAC_CMD_TXEN);
 
-        // Debug: wait a bit longer and check if TXDONE fires
-        for _ in 0..10_000u32 {
-            core::hint::spin_loop();
-        }
-        let rac_st = reg_read(RAC_STATUS);
-        let frc_if = reg_read(FRC_IF);
-        let rac_state = (rac_st >> 24) & 0x0F;
-        rtt_target::rprintln!(
-            "  RAC_st={} FRC_IF={:#X} FREQ={:#X}",
-            rac_state,
-            frc_if,
-            reg_read(SYNTH_FREQ)
-        );
-
-        log::trace!(
-            "efr32: tx {} bytes on ch{}",
-            frame.len(),
-            self.config.channel
-        );
-
-        // Wait for TX completion with async timeout (10ms should be plenty)
+        // Wait for TX completion (async) — NO spin loop!
+        // The ACK arrives 192μs after TX end; every μs of delay here
+        // pushes us closer to missing the preamble.
         let result = embassy_futures::select::select(
             TX_DONE.wait(),
             embassy_time::Timer::after(embassy_time::Duration::from_millis(10)),
@@ -1316,16 +1558,84 @@ impl Efr32Driver {
         match result {
             embassy_futures::select::Either::First(ok) => {
                 if ok {
+                    // IMMEDIATELY enable RX for ACK reception.
+                    // ACK arrives ~192μs after TX end. RX warm-up ~50-100μs.
+                    // We must get here within ~90μs of TX_DONE.
+                    reg_write(BUFC_BUF1_CMD, 1); // clear RX buffer
+                    reg_write(_RAC_RXENSRCEN, 0x02); // enable RX NOW
+
                     Ok(())
                 } else {
+                    let _tx_flags = LAST_TX_FRC_FLAGS.load(Ordering::Acquire);
+                    efr32_trace!(
+                        "  TX fail: FRC_IF={:#X} RAC_st={}",
+                        _tx_flags,
+                        (reg_read(RAC_STATUS) >> 24) & 0x0F
+                    );
+                    reg_write(RAC_CMD, RAC_CMD_TXDIS | RAC_CMD_RXDIS);
                     Err(RadioError::HardwareError)
                 }
             }
             embassy_futures::select::Either::Second(_) => {
-                reg_write(RAC_CMD, RAC_CMD_TXDIS);
+                efr32_trace!(
+                    "  TX timeout: FRC_IF={:#X} RAC_st={}",
+                    LAST_TX_FRC_FLAGS.load(Ordering::Acquire),
+                    (reg_read(RAC_STATUS) >> 24) & 0x0F
+                );
+                reg_write(RAC_CMD, RAC_CMD_TXDIS | RAC_CMD_RXDIS);
                 Err(RadioError::HardwareError)
             }
         }
+    }
+
+    /// ACK wait after TX.
+    ///
+    /// transmit() already enabled RX immediately after TX_DONE.
+    /// This just waits for the ISR to signal RX_DONE and reads the data.
+    pub async fn receive_ack(&mut self) -> Result<RxFrame, RadioError> {
+        if !self.initialized {
+            return Err(RadioError::NotInitialized);
+        }
+
+        // RX was already enabled in transmit() right after TX_DONE.
+        // RX_DONE was reset in transmit() before TXEN.
+        // Just wait for the ISR to receive the ACK frame.
+        RX_DONE.wait().await;
+
+        if !RX_CRC_OK.load(Ordering::Acquire) {
+            return Err(RadioError::CrcError);
+        }
+
+        let len = RX_LEN.load(Ordering::Acquire) as usize;
+        if len == 0 {
+            return Err(RadioError::RxTimeout);
+        }
+
+        let rssi = RX_RSSI.load(Ordering::Acquire);
+
+        let mut frame = RxFrame {
+            data: [0u8; MAX_FRAME_LEN],
+            len: 0,
+            rssi,
+            lqi: rssi_to_lqi(rssi),
+        };
+
+        unsafe {
+            let buf = &*RX_BUF.get();
+            if len > 1 {
+                let phr = (buf[0] & 0x7F) as usize;
+                let data_len = if phr > 2 { phr - 2 } else { 0 };
+                let data_len = data_len.min(len - 1).min(MAX_FRAME_LEN);
+                frame.data[..data_len].copy_from_slice(&buf[1..1 + data_len]);
+                frame.len = data_len;
+            }
+        }
+
+        // After reading the ACK, disable RX so the radio returns to IDLE.
+        // This prevents receiving stray frames between retries.
+        reg_write(RAC_CMD, RAC_CMD_RXDIS);
+
+        Ok(frame)
     }
 
     /// Receive the next IEEE 802.15.4 frame (async).
@@ -1346,9 +1656,32 @@ impl Efr32Driver {
 
         RX_DONE.reset();
 
+        // Abort radio only from truly stuck states (not normal RX transitions
+        // like RXWARM=1, RXSEARCH=2, RXFRAME=3 which occur during TX→RX).
+        let rac_state_before = (reg_read(RAC_STATUS) >> 24) & 0x0F;
+        if matches!(rac_state_before, 4..=12) {
+            reg_write(RAC_CMD, RAC_CMD_TXDIS | RAC_CMD_RXDIS);
+            reg_write(FRC_CMD, FRC_CMD_RXABORT);
+            reg_write(FRC_IFC, 0xFFFF_FFFF);
+            reg_write(RAC_IFC, 0xFFFF_FFFF);
+            for i in 0..100u32 {
+                let st = (reg_read(RAC_STATUS) >> 24) & 0x0F;
+                if st == 0 {
+                    break;
+                }
+                if i == 50 {
+                    reg_write(RAC_CMD, RAC_CMD_TXDIS | RAC_CMD_RXDIS);
+                }
+                for _ in 0..1000u32 {
+                    core::hint::spin_loop();
+                }
+            }
+            reg_write(FRC_CMD, _FRC_CMD_FRAMEDETRESUME);
+            RX_DONE.reset();
+        }
+
         // After TX, the sequencer returned to IDLE (RADIO_TRANSITIONS).
-        // We need to restart RX. But DON'T use RXABORT — that kills the
-        // FRC RX FCD which never reactivates.
+        // We need to restart RX.
         // Just clear flags, clear buffers, and re-enable RXENSRCEN.
         reg_write(BUFC_BUF1_CMD, 1); // clear RX buffer
         reg_write(_BUFC_BUF2_CMD, 1); // clear length buffer
@@ -1357,62 +1690,9 @@ impl Efr32Driver {
         // Restart RX via sequencer
         let ctrl = reg_read(SEQ_CONTROL_REG);
         reg_write(SEQ_CONTROL_REG, ctrl & !0x20);
-        reg_write(RAC_IFPGACTRL, 0x0000_87F6);
+        reg_write(RAC_IFPGACTRL, 0x0000_87E6);
+        reg_write(FRC_CMD, _FRC_CMD_FRAMEDETRESUME);
         reg_write(_RAC_RXENSRCEN, 0x02);
-
-        // Debug: check RX warm-up progression
-        for delay in [5_000u32, 50_000, 200_000] {
-            for _ in 0..delay {
-                core::hint::spin_loop();
-            }
-            let rac_state = (reg_read(RAC_STATUS) >> 24) & 0x0F;
-            let frc_st = reg_read(FRC_BASE + 0x000);
-            if frc_st & 0x02 != 0 {
-                // ACTIVERXFCD is set — warm-up complete!
-                break;
-            }
-            if delay == 200_000 {
-                rtt_target::rprintln!("  RX warmup: RAC={} FRC_ST={:#X}", rac_state, frc_st);
-            }
-        }
-
-        // Wait for RX with periodic status polling (debug)
-        static RX_DBG_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-        let dbg = RX_DBG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if dbg < 3 {
-            // Poll FRC_IF every 5ms for up to 50ms to see if anything arrives
-            for i in 0..10u8 {
-                for _ in 0..200_000u32 {
-                    core::hint::spin_loop();
-                } // ~5ms at 40MHz
-                let frc_if = reg_read(FRC_IF);
-                let rac_st = (reg_read(RAC_STATUS) >> 24) & 0x0F;
-                let buf1_st = reg_read(BUFC_BUF1_STATUS) & 0x1FFF;
-                if frc_if != 0 || buf1_st != 0 {
-                    rtt_target::rprintln!(
-                        "  RX poll[{}]: FRC_IF={:#X} RAC={} BUF1={}",
-                        i,
-                        frc_if,
-                        rac_st,
-                        buf1_st
-                    );
-                }
-            }
-            let frc_if = reg_read(FRC_IF);
-            let rac_st = (reg_read(RAC_STATUS) >> 24) & 0x0F;
-            // Key diagnostics from multi-model analysis
-            let synth_st = reg_read(SYNTH_BASE + 0x000);
-            let dcesti = reg_read(MODEM_BASE + 0x100);
-            let frc_st = reg_read(FRC_BASE + 0x000);
-            rtt_target::rprintln!(
-                "  RX 50ms: FRC_IF={:#X} RAC={} SYNTH_LOCK={} DCESTI={:#X} FRC_ST={:#X}",
-                frc_if,
-                rac_st,
-                synth_st & 1,
-                dcesti,
-                frc_st
-            );
-        }
 
         RX_DONE.wait().await;
 
@@ -1429,17 +1709,26 @@ impl Efr32Driver {
 
         let mut frame = RxFrame {
             data: [0u8; MAX_FRAME_LEN],
-            len,
+            len: 0,
             rssi,
             lqi: rssi_to_lqi(rssi),
         };
 
         unsafe {
             let buf = &*RX_BUF.get();
-            frame.data[..len].copy_from_slice(&buf[..len]);
+            if len > 1 {
+                // PHR byte (first byte) contains PSDU length (7 bits).
+                // BUFC buffer has: PHR(1) + PSDU(phr) + trailer(CRC+RSSI/LQI).
+                // We want only MAC header + MAC payload, stripping PHR, FCS(2), and trailer.
+                let phr = (buf[0] & 0x7F) as usize;
+                let data_len = if phr > 2 { phr - 2 } else { 0 }; // strip 2-byte FCS
+                let data_len = data_len.min(len - 1).min(MAX_FRAME_LEN);
+                frame.data[..data_len].copy_from_slice(&buf[1..1 + data_len]);
+                frame.len = data_len;
+            }
         }
 
-        log::trace!("efr32: rx {} bytes rssi={}dBm", len, rssi);
+        log::trace!("efr32: rx {} bytes rssi={}dBm", frame.len, rssi);
         Ok(frame)
     }
 
@@ -1499,6 +1788,7 @@ impl Efr32Driver {
         reg_write(FRC_IFC, FRC_IF_RXDONE | FRC_IF_RXOF | FRC_IF_FRAMEERROR);
         reg_write(RAC_IFC, 0xFFFF_FFFF);
         // Start RX via RXENSRCEN (RAC_CMD has no RXEN bit)
+        reg_write(FRC_CMD, _FRC_CMD_FRAMEDETRESUME);
         reg_write(_RAC_RXENSRCEN, 0x02);
     }
 
@@ -1544,10 +1834,15 @@ impl Efr32Driver {
 pub extern "C" fn FRC_PRI() {
     let rac_flags = reg_read(RAC_IF);
     let frc_flags = reg_read(FRC_IF);
+    LAST_TX_FRC_FLAGS.store((frc_flags & 0xFF) as u8, Ordering::Release);
 
     // Clear all pending IRQs
     reg_write(RAC_IFC, rac_flags);
     reg_write(FRC_IFC, frc_flags);
+
+    if frc_flags & (_FRC_IF_TXABORTED | _FRC_IF_TXUF) != 0 {
+        TX_DONE.signal(false);
+    }
 
     // TX completion (FRC_IF_TXDONE = bit 0)
     if frc_flags & FRC_IF_TXDONE != 0 {

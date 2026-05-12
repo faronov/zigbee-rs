@@ -419,6 +419,11 @@ impl ApsSecurity {
         nonce[12] = actual_sc;
         nonce
     }
+
+    /// Same as build_nonce but public, for debug tracing.
+    pub fn build_nonce_debug(&self, hdr: &ApsSecurityHeader) -> [u8; 13] {
+        self.build_nonce(hdr)
+    }
 }
 
 impl Default for ApsSecurity {

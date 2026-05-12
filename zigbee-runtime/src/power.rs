@@ -61,6 +61,11 @@ impl PowerManager {
         self.mode
     }
 
+    /// Set a new power mode.
+    pub fn set_mode(&mut self, mode: PowerMode) {
+        self.mode = mode;
+    }
+
     /// Record that activity occurred (rx/tx, user input, sensor read).
     pub fn record_activity(&mut self, now_ms: u32) {
         self.last_activity_ms = now_ms;

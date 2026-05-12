@@ -45,9 +45,9 @@ bind_interrupts!(struct Irqs {
     SAADC => saadc::InterruptHandler;
 });
 
-/// Ensure all RAM banks are powered on. POWER registers survive soft reset,
-/// so a previous firmware run may have powered down banks the stack needs.
-/// Pure assembly: zero stack usage (stack RAM may be powered off).
+// Ensure all RAM banks are powered on. POWER registers survive soft reset,
+// so a previous firmware run may have powered down banks the stack needs.
+// Pure assembly: zero stack usage (stack RAM may be powered off).
 core::arch::global_asm!(
     ".section .text.__pre_init",
     ".global __pre_init",
@@ -67,8 +67,9 @@ core::arch::global_asm!(
     "bx lr",
 );
 
+#[allow(dead_code)]
 /// Power down unused RAM sections to reduce sleep current.
-/// nRF52833 has 128 KB RAM: banks 0–7 (8×8KB, 2 sections each) + bank 8 (64KB, 2×32KB sections).
+/// nRF52833 has 128 KB RAM: banks 0-7 (8x8KB, 2 sections each) + bank 8 (64KB, 2x32KB sections).
 fn power_down_unused_ram() {
     extern "C" {
         static __sheap: u8;

@@ -186,6 +186,7 @@ pub struct NwkLayer<M: MacDriver> {
 
 impl<M: MacDriver> NwkLayer<M> {
     /// Create a new NWK layer with the given MAC driver.
+    #[inline(never)]
     pub fn new(mac: M, device_type: DeviceType) -> Self {
         // Default: FFD/Router always rx_on, EndDevice defaults to true (non-sleepy)
         let rx_on_when_idle = true;
@@ -222,6 +223,50 @@ impl<M: MacDriver> NwkLayer<M> {
             concentrator_radius: 5,
             source_route_table: routing::SourceRouteTable::new(),
             next_child_addr_offset: 1,
+        }
+    }
+
+    /// Construct a NWK layer directly into caller-provided storage.
+    ///
+    /// # Safety
+    /// `slot` must point to valid, properly aligned, uninitialized storage for `Self`.
+    #[inline(never)]
+    pub unsafe fn write_into(slot: *mut Self, mac: M, device_type: DeviceType) {
+        unsafe {
+            core::ptr::addr_of_mut!((*slot).mac).write(mac);
+            core::ptr::addr_of_mut!((*slot).nib).write(nib::Nib::new());
+            core::ptr::addr_of_mut!((*slot).neighbors).write(neighbor::NeighborTable::new());
+            core::ptr::addr_of_mut!((*slot).routing).write(routing::RoutingTable::new());
+            core::ptr::addr_of_mut!((*slot).btr).write(routing::BtrTable::new());
+            core::ptr::addr_of_mut!((*slot).security).write(security::NwkSecurity::new());
+            core::ptr::addr_of_mut!((*slot).device_type).write(device_type);
+            core::ptr::addr_of_mut!((*slot).joined).write(false);
+            core::ptr::addr_of_mut!((*slot).rx_on_when_idle).write(true);
+            #[cfg(feature = "router")]
+            core::ptr::addr_of_mut!((*slot).pending_route_replies).write(heapless::Vec::new());
+            #[cfg(not(feature = "router"))]
+            core::ptr::addr_of_mut!((*slot).pending_route_replies).write(heapless::Vec::new());
+            #[cfg(feature = "router")]
+            core::ptr::addr_of_mut!((*slot).pending_rreq_rebroadcasts).write(heapless::Vec::new());
+            #[cfg(not(feature = "router"))]
+            core::ptr::addr_of_mut!((*slot).pending_rreq_rebroadcasts).write(heapless::Vec::new());
+            #[cfg(feature = "router")]
+            core::ptr::addr_of_mut!((*slot).pending_route_errors).write(heapless::Vec::new());
+            #[cfg(not(feature = "router"))]
+            core::ptr::addr_of_mut!((*slot).pending_route_errors).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*slot).indirect).write(indirect::IndirectQueue::new());
+            core::ptr::addr_of_mut!((*slot).link_status_counter).write(0);
+            core::ptr::addr_of_mut!((*slot).link_status_due).write(false);
+            core::ptr::addr_of_mut!((*slot).concentrator_active).write(false);
+            core::ptr::addr_of_mut!((*slot).concentrator_type)
+                .write(routing::ConcentratorType::LowRam);
+            core::ptr::addr_of_mut!((*slot).concentrator_counter).write(0);
+            core::ptr::addr_of_mut!((*slot).concentrator_interval).write(60);
+            core::ptr::addr_of_mut!((*slot).concentrator_rreq_due).write(false);
+            core::ptr::addr_of_mut!((*slot).concentrator_radius).write(5);
+            core::ptr::addr_of_mut!((*slot).source_route_table)
+                .write(routing::SourceRouteTable::new());
+            core::ptr::addr_of_mut!((*slot).next_child_addr_offset).write(1);
         }
     }
 

@@ -1,5 +1,7 @@
 //! Device builder — fluent API for configuring a Zigbee device.
 
+use core::mem::MaybeUninit;
+
 use crate::power::{PowerManager, PowerMode};
 use crate::{EndpointConfig, MAX_CLUSTERS_PER_ENDPOINT, MAX_ENDPOINTS, ZigbeeDevice};
 use zigbee_aps::ApsLayer;
@@ -127,6 +129,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
     }
 
     /// Build the ZigbeeDevice with the full BDB→ZDO→APS→NWK→MAC stack.
+    #[inline(never)]
     pub fn build(self) -> ZigbeeDevice<M> {
         // Construct the layer stack: MAC → NWK → APS → ZDO → BDB
         let mut nwk = NwkLayer::new(self.mac, self.device_type);
@@ -180,7 +183,8 @@ impl<M: MacDriver> DeviceBuilder<M> {
         };
         let node_desc = zigbee_zdo::descriptors::NodeDescriptor {
             logical_type,
-            mac_capabilities: if rx_on { 0x88 } else { 0x80 }, // bit7=AllocAddr, bit3=RxOnWhenIdle
+            // bit7=AllocAddr, bit6=SecurityCapable, bit3=RxOnWhenIdle.
+            mac_capabilities: if rx_on { 0xC8 } else { 0xC0 },
             ..Default::default()
         };
         zdo.set_node_descriptor(node_desc);
@@ -202,6 +206,100 @@ impl<M: MacDriver> DeviceBuilder<M> {
             channel_mask: self.channel_mask,
             pending_responses: heapless::Vec::new(),
             state_dirty: false,
+        }
+    }
+
+    /// Build the ZigbeeDevice into caller-provided storage.
+    ///
+    /// This avoids the extra closure frame introduced by
+    /// `StaticCell::init_with(|| builder.build())` on small MCUs.
+    #[inline(never)]
+    pub fn build_into<'a>(
+        self,
+        dst: &'a mut MaybeUninit<ZigbeeDevice<M>>,
+    ) -> &'a mut ZigbeeDevice<M> {
+        let Self {
+            mac,
+            device_type,
+            endpoints,
+            manufacturer_name,
+            model_identifier,
+            sw_build_id,
+            date_code,
+            channel_mask,
+            power_mode,
+            concentrator,
+        } = self;
+
+        let rx_on = match &power_mode {
+            PowerMode::AlwaysOn => true,
+            PowerMode::Sleepy { .. } | PowerMode::DeepSleep { .. } => false,
+        };
+
+        let dst = dst.as_mut_ptr();
+        unsafe {
+            BdbLayer::write_into(core::ptr::addr_of_mut!((*dst).bdb), mac, device_type);
+
+            {
+                let zdo = (*dst).bdb.zdo_mut();
+                let nwk = zdo.aps_mut().nwk_mut();
+                nwk.set_rx_on_when_idle(rx_on);
+
+                if let Some((ctype, interval, radius)) = concentrator {
+                    nwk.start_concentrator(ctype, interval, radius);
+                }
+            }
+
+            {
+                let zdo = (*dst).bdb.zdo_mut();
+                for ep in &endpoints {
+                    let mut input_clusters = heapless::Vec::new();
+                    for &c in &ep.server_clusters {
+                        let _ = input_clusters.push(c);
+                    }
+                    let mut output_clusters = heapless::Vec::new();
+                    for &c in &ep.client_clusters {
+                        let _ = output_clusters.push(c);
+                    }
+                    let desc = zigbee_zdo::descriptors::SimpleDescriptor {
+                        endpoint: ep.endpoint,
+                        profile_id: ep.profile_id,
+                        device_id: ep.device_id,
+                        device_version: ep.device_version,
+                        input_clusters,
+                        output_clusters,
+                    };
+                    let _ = zdo.register_endpoint(desc);
+                }
+
+                let logical_type = match device_type {
+                    DeviceType::Coordinator => zigbee_zdo::descriptors::LogicalType::Coordinator,
+                    DeviceType::Router => zigbee_zdo::descriptors::LogicalType::Router,
+                    DeviceType::EndDevice => zigbee_zdo::descriptors::LogicalType::EndDevice,
+                };
+                let node_desc = zigbee_zdo::descriptors::NodeDescriptor {
+                    logical_type,
+                    mac_capabilities: if rx_on { 0xC8 } else { 0xC0 },
+                    ..Default::default()
+                };
+                zdo.set_node_descriptor(node_desc);
+                zdo.set_power_descriptor(zigbee_zdo::descriptors::PowerDescriptor::default());
+            }
+
+            core::ptr::addr_of_mut!((*dst).endpoints).write(endpoints);
+            core::ptr::addr_of_mut!((*dst).reporting).write(ReportingEngine::new());
+            core::ptr::addr_of_mut!((*dst).power).write(PowerManager::new(power_mode));
+            core::ptr::addr_of_mut!((*dst).pending_action).write(None);
+            core::ptr::addr_of_mut!((*dst).zcl_seq).write(0);
+            core::ptr::addr_of_mut!((*dst).manufacturer_name).write(manufacturer_name);
+            core::ptr::addr_of_mut!((*dst).model_identifier).write(model_identifier);
+            core::ptr::addr_of_mut!((*dst).sw_build_id).write(sw_build_id);
+            core::ptr::addr_of_mut!((*dst).date_code).write(date_code);
+            core::ptr::addr_of_mut!((*dst).channel_mask).write(channel_mask);
+            core::ptr::addr_of_mut!((*dst).pending_responses).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*dst).state_dirty).write(false);
+
+            &mut *dst
         }
     }
 }

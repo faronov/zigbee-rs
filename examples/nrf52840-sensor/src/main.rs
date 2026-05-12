@@ -104,10 +104,10 @@ bind_interrupts!(struct Irqs {
     TWISPI0 => twim::InterruptHandler<peripherals::TWISPI0>;
 });
 
-/// Ensure all RAM banks are powered on. POWER registers survive soft reset,
-/// so a previous firmware run may have powered down banks the stack needs.
-/// Runs as __pre_init — before .bss zero, .data copy, and main().
-/// Pure assembly: zero stack usage (bank 8 section 5 may be powered off).
+// Ensure all RAM banks are powered on. POWER registers survive soft reset,
+// so a previous firmware run may have powered down banks the stack needs.
+// Runs as __pre_init before .bss zero, .data copy, and main().
+// Pure assembly: zero stack usage (bank 8 section 5 may be powered off).
 core::arch::global_asm!(
     ".section .text.__pre_init",
     ".global __pre_init",
@@ -127,8 +127,9 @@ core::arch::global_asm!(
     "bx lr",
 );
 
+#[allow(dead_code)]
 /// Power down unused high RAM banks to reduce sleep current.
-/// 
+///
 /// nRF52840 RAM layout: Banks 0-7 (8KB each, 64KB total) + Bank 8 (6×32KB, 192KB).
 /// Embassy allocates task stacks from the top of RAM downward, so we can only
 /// safely power down Bank 8 sections that are clearly above any possible stack use.

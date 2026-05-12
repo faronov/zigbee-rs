@@ -95,8 +95,8 @@ phy6222 = [
 efr32 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
+efr32-trace = []
 
 efr32mg21 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
-

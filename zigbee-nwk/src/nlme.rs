@@ -90,11 +90,17 @@ impl<M: MacDriver> NwkLayer<M> {
         channel_mask: ChannelMask,
         scan_duration: u8,
     ) -> Result<heapless::Vec<NetworkDescriptor, 16>, NwkStatus> {
+        #[cfg(feature = "efr32-trace")]
+        rtt_target::rprintln!("[NWK] disc: mask=0x{:08X}", channel_mask.0);
+
         // Set macAutoRequest = false during scan
         let _ = self
             .mac
             .mlme_set(PibAttribute::MacAutoRequest, PibValue::Bool(false))
             .await;
+
+        #[cfg(feature = "efr32-trace")]
+        rtt_target::rprintln!("[NWK] disc: scanning...");
 
         let scan_result = self
             .mac
@@ -106,14 +112,32 @@ impl<M: MacDriver> NwkLayer<M> {
             .await
             .map_err(|_| NwkStatus::NoNetworks)?;
 
+        #[cfg(feature = "efr32-trace")]
+        rtt_target::rprintln!("[NWK] disc: scan done");
+
         // Restore macAutoRequest
         let _ = self
             .mac
             .mlme_set(PibAttribute::MacAutoRequest, PibValue::Bool(true))
             .await;
 
+        #[cfg(feature = "efr32-trace")]
+        rtt_target::rprintln!(
+            "[NWK] nlme_disc: scan={} PDs",
+            scan_result.pan_descriptors.len()
+        );
+
         let mut networks = heapless::Vec::new();
         for pd in &scan_result.pan_descriptors {
+            #[cfg(feature = "efr32-trace")]
+            rtt_target::rprintln!(
+                "[NWK] PD ch={} proto={} stack={} depth={} permit={}",
+                pd.channel,
+                pd.zigbee_beacon.protocol_id,
+                pd.zigbee_beacon.stack_profile,
+                pd.zigbee_beacon.device_depth,
+                pd.superframe_spec.association_permit,
+            );
             // Filter: only Zigbee PRO beacons (protocol_id = 0, stack_profile = 2)
             if pd.zigbee_beacon.protocol_id != 0 {
                 continue;
@@ -133,7 +157,6 @@ impl<M: MacDriver> NwkLayer<M> {
             return Err(NwkStatus::NoNetworks);
         }
 
-        // Sort by LQI (best signal first)
         networks.sort_unstable_by_key(|n| core::cmp::Reverse(n.lqi));
 
         Ok(networks)
@@ -254,45 +277,58 @@ impl<M: MacDriver> NwkLayer<M> {
         &mut self,
         network: &NetworkDescriptor,
     ) -> Result<ShortAddress, NwkStatus> {
+        #[cfg(feature = "efr32-trace")]
+        rtt_target::rprintln!(
+            "[NWK] join_assoc: pan=0x{:04X} ch={} via=0x{:04X} permit={} ed_cap={} rtr_cap={}",
+            network.pan_id.0,
+            network.logical_channel,
+            network.router_address.0,
+            network.permit_joining,
+            network.end_device_capacity,
+            network.router_capacity,
+        );
+
         // Check capacity
         match self.device_type {
             DeviceType::Router if !network.router_capacity => {
+                #[cfg(feature = "efr32-trace")]
+                rtt_target::rprintln!("[NWK] join: no router capacity");
                 return Err(NwkStatus::NotPermitted);
             }
             DeviceType::EndDevice if !network.end_device_capacity => {
+                #[cfg(feature = "efr32-trace")]
+                rtt_target::rprintln!("[NWK] join: no ED capacity");
                 return Err(NwkStatus::NotPermitted);
             }
             _ => {}
         }
 
         if !network.permit_joining {
+            #[cfg(feature = "efr32-trace")]
+            rtt_target::rprintln!("[NWK] join: permit=false");
             return Err(NwkStatus::NotPermitted);
         }
 
-        // Build capability info
+        // Build capability info. The requested receiver mode must not depend
+        // on diagnostic features; sleepy devices can still obtain indirect
+        // Transport-Key frames through MAC polling.
         let cap = CapabilityInfo {
             device_type_ffd: self.device_type != DeviceType::EndDevice,
             mains_powered: self.device_type != DeviceType::EndDevice,
-            // rx_on_when_idle=false → coordinator buffers Transport-Key as indirect
-            // frame, delivered when we poll. This is more reliable than direct unicast
-            // (rx_on_idle=true) because indirect frames are retried on each poll.
             rx_on_when_idle: self.device_type != DeviceType::EndDevice,
-            security_capable: false,
+            security_capable: true,
             allocate_address: true,
         };
 
-        log::info!(
-            "[NWK] Association cap: rx_on_idle={} ffd={} -> parent 0x{:04X}",
-            cap.rx_on_when_idle,
+        #[cfg(feature = "efr32-trace")]
+        rtt_target::rprintln!(
+            "[NWK] assoc: ffd={} rx_on={} dev_type={:?}",
             cap.device_type_ffd,
-            if network.router_address.0 != 0xFFFF {
-                network.router_address.0
-            } else {
-                0x0000
-            },
+            cap.rx_on_when_idle,
+            self.device_type,
         );
 
-        // Perform MAC association — use discovered router address, not hardcoded coordinator
+        // Perform MAC association
         let join_target = if network.router_address.0 != 0xFFFF {
             network.router_address
         } else {
@@ -307,10 +343,21 @@ impl<M: MacDriver> NwkLayer<M> {
                 capability_info: cap,
             })
             .await
-            .map_err(|e| match e {
-                MacError::NoAck => NwkStatus::NoNetworks,
-                _ => NwkStatus::StartupFailure,
+            .map_err(|e| {
+                #[cfg(feature = "efr32-trace")]
+                rtt_target::rprintln!("[NWK] assoc MAC err: {:?}", e);
+                match e {
+                    MacError::NoAck => NwkStatus::NoNetworks,
+                    _ => NwkStatus::StartupFailure,
+                }
             })?;
+
+        #[cfg(feature = "efr32-trace")]
+        rtt_target::rprintln!(
+            "[NWK] assoc result: status={:?} addr=0x{:04X}",
+            result.status,
+            result.short_address.0,
+        );
 
         if result.status != AssociationStatus::Success {
             return Err(NwkStatus::NotPermitted);
@@ -447,7 +494,7 @@ impl<M: MacDriver> NwkLayer<M> {
             device_type_ffd: self.device_type != DeviceType::EndDevice,
             mains_powered: self.device_type != DeviceType::EndDevice,
             rx_on_when_idle: self.device_type != DeviceType::EndDevice,
-            security_capable: false,
+            security_capable: true,
             allocate_address: true,
         };
 

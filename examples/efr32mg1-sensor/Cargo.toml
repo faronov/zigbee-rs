@@ -6,13 +6,13 @@ edition = "2024"
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["efr32"] }
-zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-nwk = { path = "../../zigbee-nwk", features = ["efr32-trace"] }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee-runtime = { path = "../../zigbee-runtime", features = ["efr32-trace"] }
 
 # Embassy async runtime
-embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "task-arena-size-4096"] }
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "task-arena-size-5120"] }
 embassy-time = { version = "0.5" }
 embassy-time-driver = "0.2"
 embassy-futures = "0.1"
@@ -33,8 +33,17 @@ rtt-target = "0.6"
 panic-halt = "1.0"
 
 [features]
-default = []
+default = ["sensor"]
+sensor = []
+diag-join = []
+diag-beacon = []
 stubs = []
+trace = [
+    "zigbee-mac/efr32-trace",
+    "zigbee-nwk/efr32-trace",
+    "zigbee-aps/efr32-trace",
+    "zigbee-runtime/efr32-trace",
+]
 
 [profile.release]
 opt-level = "s"
