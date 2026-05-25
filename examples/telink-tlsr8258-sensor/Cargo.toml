@@ -25,7 +25,9 @@ panic-halt = "1.0"
 default = ["sensor"]
 diag-beacon = []
 diag-assoc = []
+diag-smoke = []
 sensor = []
+runtime-sensor = []
 
 [profile.release]
 opt-level = "s"

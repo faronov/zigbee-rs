@@ -25,9 +25,26 @@ SECTIONS
         KEEP(*(.vectors.*));
     } > FLASH
 
-    /* Code — right after vectors so tj _start can reach.
-     * VMA = LMA because code runs in-place from flash. */
-    .text :
+    /* Telink boot ROM preloads the beginning of the image into the code SRAM
+     * alias at 0x00880000. Keep RAM-resident routines in that preload area, as
+     * the vendor B85 linker does.
+     */
+    .ram_code :
+    {
+        _ramcode_start_ = .;
+        *(.ram_code .ram_code.*);
+        _ramcode_end_ = .;
+    } > FLASH
+    . = ALIGN(4);
+    _rstored_ = .;
+    _ramcode_size_ = .;
+    _ramcode_size_div_16_ = (. + 15) / 16;
+    _ramcode_size_div_256_ = (. + 255) / 256;
+    _ramcode_size_div_16_align_256_ = ((. + 255) / 256) * 16;
+    _ramcode_size_align_256_ = _ramcode_size_div_16_align_256_ * 16;
+
+    /* Cached flash code starts at the same offset used by the Telink SDK. */
+    .text 0x8000 :
     {
         *(.text._start);
         *(.text._start.*);
@@ -35,25 +52,12 @@ SECTIONS
         *(.rodata .rodata.*);
         *(.ARM.exidx .ARM.exidx.*);
     } > FLASH
-    _etext = .;
-
-    /* RAM-resident code (HAL functions that must survive flash ops).
-     * LMA in flash after .text, VMA in RAM. Copied by _start on boot. */
-    .ram_code : AT(_etext)
-    {
-        . = ALIGN(256);
-        _ramcode_start_ = .;
-        *(.ram_code .ram_code.*);
-        . = ALIGN(256);
-        _ramcode_end_ = .;
-    } > RAM
-    _ramcode_stored_ = LOADADDR(.ram_code);
-    _ramcode_size_ = _ramcode_end_ - _ramcode_start_;
-    _ramcode_size_align_256_ = (_ramcode_size_ + 255) & 0xFFFFFF00;
-    _code_size_ = _etext + SIZEOF(.ram_code);
+    . = ALIGN(4);
+    _dstored_ = .;
+    _code_size_ = .;
 
     /* Initialized data (loaded from flash after ram_code, copied to RAM on startup) */
-    .data : AT(_code_size_)
+    .data 0x00848300 : AT(_dstored_)
     {
         _sdata = .;
         *(.data .data.*);
@@ -73,29 +77,65 @@ SECTIONS
         _ebss = .;
     } > RAM
 
-    /* Stack at end of RAM (grows down) */
-    _stack_top = ORIGIN(RAM) + LENGTH(RAM);
+    /* SWire-readable diagnostics near the top of SRAM. Keep this away from the
+     * lower SRAM area used by Telink's instruction cache while executing XIP.
+     */
+    .debug_sram 0x0084F000 (NOLOAD) :
+    {
+        . = ALIGN(4);
+        _debug_sram_start = .;
+        KEEP(*(.debug_sram));
+        . = ALIGN(4);
+        _debug_sram_end = .;
+    } > RAM
+
+    /* Stack layout (tc32 uses banked, descending stacks). The SVC stack must
+     * start well above `_ebss`; the runtime-sensor build's .bss approaches
+     * 0x0084B000 with all cluster MaybeUninit slots, so the prior hard-coded
+     * 0x0084B000 SVC top left <1 KiB of usable stack before corrupting .bss.
+     *
+     *   SVC stack:  _svc_stack_bottom (0x0084C000) .. _svc_stack_top (0x0084E000)   [8 KiB]
+     *   IRQ stack:  _irq_stack_bottom (0x0084E000) .. _irq_stack_top (0x0084F000)   [4 KiB]
+     * Debug SRAM sits at 0x0084F000+, so the IRQ stack abuts it from below.
+     *
+     * The reset/IRQ asm initialises SP from these symbols so the linker
+     * remains the single source of truth for stack placement.
+     */
+    _svc_stack_bottom = 0x0084C000;
+    _svc_stack_top    = 0x0084E000;
+    _irq_stack_bottom = 0x0084E000;
+    _irq_stack_top    = 0x0084F000;
+
+    /* Backwards-compatible alias for older code paths. */
+    _stack_top = _svc_stack_top;
 
     /* Boot header size fields (used by boot ROM) */
     _bin_size_ = _code_size_ + SIZEOF(.data);
     _bin_size_div_16 = (_bin_size_ + 15) / 16;
+    _etext = _dstored_;
 
     /* Linker symbol aliases (for startup code compatibility) */
-    _dstored_ = LOADADDR(.data);
+    _ramcode_stored_ = LOADADDR(.ram_code);
     _start_data_ = _sdata;
     _end_data_ = _edata;
     _start_bss_ = _sbss;
     _end_bss_ = _ebss;
     _stack_end_ = _stack_top;
-    /* I-cache tags: 256 bytes at start of RAM */
-    _ictag_start_ = 0x840000;
-    _ictag_end_ = 0x840100;
+    /* I-cache tags sit immediately after the boot/RAM-code preload area. */
+    _ictag_start_ = 0x840000 + _ramcode_size_div_256_ * 0x100;
+    _ictag_end_ = _ictag_start_ + 0x100;
     /* Custom data sections (unused — set to zero-length) */
     _custom_stored_ = _etext;
     _start_custom_data_ = _edata;
     _end_custom_data_ = _edata;
     _start_custom_bss_ = _ebss;
     _end_custom_bss_ = _ebss;
+
+    /* Safety asserts (assigned to dummy symbols so ld.lld evaluates them). */
+    _assert_ramcode_fits = ASSERT(_ramcode_end_ <= 0x8000,
+        "ERROR: .ram_code overflows the absolute .text base at FLASH+0x8000");
+    _assert_bss_under_stack = ASSERT(_ebss <= _svc_stack_bottom,
+        "ERROR: .bss/.data extends into the SVC stack region; shrink statics or lower _svc_stack_bottom in memory.x");
 
     /DISCARD/ :
     {
