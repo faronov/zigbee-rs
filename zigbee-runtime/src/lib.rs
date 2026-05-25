@@ -987,6 +987,20 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             aps_indication.payload.len()
         );
 
+        // Send APS ACK now if the incoming frame requested one. This must
+        // happen for *every* endpoint (ZDO and application clusters alike),
+        // not just for ZDO — otherwise the coordinator/TC retransmits ZCL
+        // Read Attributes (e.g. Basic Manufacturer/Model) until the ZHA
+        // interview times out, leaving the device as `unk_manufacturer /
+        // unk_model` with empty endpoints. Spec: APS sub-layer ACKs precede
+        // any application-level response (ZB R22 §2.2.5.1).
+        let _ = self
+            .bdb
+            .zdo_mut()
+            .aps_mut()
+            .send_pending_aps_ack()
+            .await;
+
         if dst_ep == 0x00 {
             // ZDO endpoint — dispatch to ZDP handler which sends responses
             // directly through the APS layer.
@@ -1029,9 +1043,6 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     .await;
                 return Some(event_loop::StackEvent::Left);
             }
-
-            // Send pending APS ACK if any (ZDO frames may have ack_request set)
-            let _ = self.bdb.zdo_mut().aps_mut().send_pending_aps_ack().await;
 
             return None;
         }
