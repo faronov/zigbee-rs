@@ -1860,11 +1860,16 @@ impl Tlsr8258Mac {
 
 impl MacDriver for Tlsr8258Mac {
     async fn mlme_scan(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
+        mark32(DBG_MODE_BASE + 0x60, 0x5CA10E40);
+        mark32(DBG_MODE_BASE + 0x64, req.channel_mask.0);
         let timeout_loops = Self::scan_duration_loops(req.scan_duration);
         let mut pan_descriptors: PanDescriptorList = heapless::Vec::new();
         let mut energy_list: EdList = heapless::Vec::new();
+        let mut iter_count: u32 = 0;
 
         for channel in req.channel_mask.iter() {
+            iter_count = iter_count.wrapping_add(1);
+            mark32(DBG_MODE_BASE + 0x68, 0x5CA10100 | channel.number() as u32);
             let ch = channel.number();
             match req.scan_type {
                 ScanType::Active => {
@@ -1892,9 +1897,13 @@ impl MacDriver for Tlsr8258Mac {
         }
 
         self.sync_radio_config();
+        mark32(DBG_MODE_BASE + 0x6C, 0x5CA10E00 | (iter_count & 0xFF));
+        mark32(DBG_MODE_BASE + 0x70, pan_descriptors.len() as u32);
         if matches!(req.scan_type, ScanType::Active | ScanType::Passive) && pan_descriptors.is_empty() {
+            mark32(DBG_MODE_BASE + 0x74, 0x5CA1F00D);
             Err(MacError::NoBeacon)
         } else {
+            mark32(DBG_MODE_BASE + 0x74, 0x5CA10C0F);
             Ok(MlmeScanConfirm {
                 scan_type: req.scan_type,
                 pan_descriptors,
@@ -5168,9 +5177,28 @@ fn runtime_sensor_main() -> ! {
         });
     mark32(DBG_MODE_BASE + 0x30, 0x52540027);
     let device = builder.build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
+    mark32(DBG_MODE_BASE + 0x178, device as *const _ as u32);
+    {
+        // Dump device.bdb.attributes addresses + raw bytes immediately after build_into
+        let bdb_ptr = device.bdb() as *const _ as u32;
+        mark32(DBG_MODE_BASE + 0x17C, bdb_ptr);
+    }
     mark32(DBG_MODE_BASE + 0x30, 0x52540014);
 
-    device.user_action(UserAction::Join);
+    // Call start() directly (instead of via UserAction::Join through tick())
+    // to keep the await-future state small. Routing start() through tick()
+    // produces a future that overflows the 8 KiB SVC stack on TC32 and
+    // corrupts bdb.attributes (observed: commissioning_mode flips from 0x02
+    // → 0xC0, cap from 0x0B → 0xD1).
+    mark32(DBG_MODE_BASE + 0x40, 0x53AA_0100);
+    match executor::block_on(device.start()) {
+        Ok(addr) => {
+            mark32(DBG_MODE_BASE + 0x44, 0x53AA_0200 | (addr as u32));
+        }
+        Err(_) => {
+            mark32(DBG_MODE_BASE + 0x44, 0x53AA_FA11);
+        }
+    }
     mark32(DBG_MODE_BASE + 0x30, 0x52540015);
     let mut clusters = [
         ClusterRef {
@@ -5196,6 +5224,8 @@ fn runtime_sensor_main() -> ! {
     ];
     mark32(DBG_MODE_BASE + 0x30, 0x52540016);
 
+    let mut tick_counter: u32 = 0;
+    let mut first_tick: bool = true;
     loop {
         mark32(DBG_MODE_BASE + 0x30, 0x52540001);
         match executor::block_on(device.tick(1, &mut clusters)) {
@@ -5210,6 +5240,7 @@ fn runtime_sensor_main() -> ! {
                 mark32(DBG_MODE_BASE + 0x30, 0x5254C000);
                 mark32(DBG_MODE_BASE + 0x34, short_address as u32 | ((pan_id as u32) << 16));
                 mark32(DBG_MODE_BASE + 0x38, channel as u32);
+                if first_tick { mark32(DBG_MODE_BASE + 0x9C, 0xF1559000); }
             }
             TickResult::Event(StackEvent::CommissioningComplete { success }) => {
                 board::LED_GREEN.write(false);
@@ -5219,20 +5250,57 @@ fn runtime_sensor_main() -> ! {
                     DBG_MODE_BASE + 0x30,
                     if success { 0x5254C001 } else { 0x5254FFFF },
                 );
+                if first_tick {
+                    mark32(DBG_MODE_BASE + 0x9C, if success { 0xF155CC01 } else { 0xF155FFFF });
+                }
             }
             TickResult::Event(_) => {
                 mark32(DBG_MODE_BASE + 0x30, 0x52540002);
+                if first_tick { mark32(DBG_MODE_BASE + 0x9C, 0xF1550002); }
             }
             TickResult::RunAgain(ms) => {
                 mark32(DBG_MODE_BASE + 0x30, 0x52540003);
                 mark32(DBG_MODE_BASE + 0x3C, ms);
+                if first_tick { mark32(DBG_MODE_BASE + 0x9C, 0xF1550003); }
             }
             TickResult::Idle => {
                 board::LED_GREEN.write(device.is_joined());
                 mark32(DBG_MODE_BASE + 0x30, 0x52540004);
+                if first_tick { mark32(DBG_MODE_BASE + 0x9C, 0xF1550004); }
             }
         }
-        executor::block_on(async_timer::delay_ms(1000));
+        first_tick = false;
+
+        // Poll parent for indirect frames + dispatch any received APS frames
+        // through the runtime (ZDO + ZCL ReadAttr / ConfigureReporting / etc.).
+        if device.is_joined() {
+            for _ in 0..4u8 {
+                match executor::block_on(device.poll()) {
+                    Ok(Some(ind)) => {
+                        mark32(DBG_MODE_BASE + 0x40, 0x52540030);
+                        mark32(DBG_MODE_BASE + 0x44, ind.payload.len() as u32);
+                        let _ = executor::block_on(
+                            device.process_incoming(&ind, &mut clusters),
+                        );
+                        mark32(DBG_MODE_BASE + 0x40, 0x52540031);
+                    }
+                    Ok(None) => {
+                        mark32(DBG_MODE_BASE + 0x40, 0x52540032);
+                        break;
+                    }
+                    Err(_) => {
+                        mark32(DBG_MODE_BASE + 0x40, 0x5254FFFE);
+                        break;
+                    }
+                }
+            }
+        }
+
+        tick_counter = tick_counter.wrapping_add(1);
+        mark32(DBG_MODE_BASE + 0x48, tick_counter);
+        // Fast poll while joining/interview, slower once steady-state.
+        let delay = if device.is_joined() { 250 } else { 100 };
+        executor::block_on(async_timer::delay_ms(delay));
     }
 }
 
