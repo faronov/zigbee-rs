@@ -5323,7 +5323,12 @@ fn main_loop() -> ! {
     radio::set_rx_dma_config(144);
 
     board::LED_RED.write(true);
-    clear_words(DBG_MODE_BASE, 64);
+    // Clear the full 0x200-byte diagnostic SRAM window. TLSR8258 does NOT zero
+    // SRAM on soft reset, so without this every dump is a superposition of
+    // markers from this boot and from all previous boots since power-on,
+    // making any diagnosis unreliable. 128 words = 512 bytes covers all
+    // markers we currently place at +0x000..+0x1FC.
+    clear_words(DBG_MODE_BASE, 128);
     mark32(DBG_MODE_BASE + 0x00, 0xD1A60000);
 
     #[cfg(feature = "sensor")]

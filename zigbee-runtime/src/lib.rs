@@ -994,12 +994,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         // interview times out, leaving the device as `unk_manufacturer /
         // unk_model` with empty endpoints. Spec: APS sub-layer ACKs precede
         // any application-level response (ZB R22 §2.2.5.1).
-        let _ = self
-            .bdb
-            .zdo_mut()
-            .aps_mut()
-            .send_pending_aps_ack()
-            .await;
+        let _ = self.bdb.zdo_mut().aps_mut().send_pending_aps_ack().await;
 
         if dst_ep == 0x00 {
             // ZDO endpoint — dispatch to ZDP handler which sends responses
@@ -1133,9 +1128,9 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             let mut response = ConfigureReportingResponse {
                 records: heapless::Vec::new(),
             };
-            let cluster_ref = clusters
-                .iter()
-                .find(|c| c.endpoint == dst_ep && c.cluster.cluster_id() == zigbee_zcl::ClusterId(cluster_id));
+            let cluster_ref = clusters.iter().find(|c| {
+                c.endpoint == dst_ep && c.cluster.cluster_id() == zigbee_zcl::ClusterId(cluster_id)
+            });
             let mut i = 0usize;
             let mut records = 0usize;
             let mut parse_ok = true;

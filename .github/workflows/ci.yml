@@ -348,35 +348,9 @@ jobs:
             examples/telink-b91-sensor/target/riscv32imc-unknown-none-elf/release/telink-b91-sensor.bin
             examples/telink-b91-sensor/target/riscv32imc-unknown-none-elf/release/telink-b91-sensor.hex
 
-  build-telink-tlsr8258:
-    name: Build Telink TLSR8258 sensor
-    runs-on: ubuntu-latest
-    continue-on-error: true  # needs custom tc32 toolchain (not available in CI yet)
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: thumbv6m-none-eabi
-          components: rust-src, llvm-tools
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: examples/telink-tlsr8258-sensor
-      - name: Build Telink TLSR8258 sensor (release)
-        working-directory: examples/telink-tlsr8258-sensor
-        run: cargo build --release
-      - name: Create firmware artifacts
-        run: |
-          ELF=examples/telink-tlsr8258-sensor/target/thumbv6m-none-eabi/release/telink-tlsr8258-sensor
-          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          $OBJCOPY -O binary $ELF ${ELF}.bin
-          $OBJCOPY -O ihex   $ELF ${ELF}.hex
-      - name: Upload Telink TLSR8258 firmware
-        uses: actions/upload-artifact@v4
-        with:
-          name: telink-tlsr8258-sensor-firmware
-          path: |
-            examples/telink-tlsr8258-sensor/target/thumbv6m-none-eabi/release/telink-tlsr8258-sensor.bin
-            examples/telink-tlsr8258-sensor/target/thumbv6m-none-eabi/release/telink-tlsr8258-sensor.hex
+  # ── Telink TLSR8258 (tc32) ───────────────────────────────────
+  # Built by .github/workflows/build-tc32.yml using the public
+  # modern-tc32/rust toolchain. Stock nightly cannot compile this target.
 
   build-phy6222:
     name: Build PHY6222 sensor
@@ -416,7 +390,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          targets: thumbv7em-none-eabihf
+          targets: thumbv7em-none-eabi
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@v2
         with:
@@ -430,7 +404,7 @@ jobs:
         run: cargo build --release
       - name: Create firmware artifacts
         run: |
-          ELF=examples/efr32mg1-sensor/target/thumbv7em-none-eabihf/release/efr32mg1-sensor
+          ELF=examples/efr32mg1-sensor/target/thumbv7em-none-eabi/release/efr32mg1-sensor
           OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
@@ -439,8 +413,8 @@ jobs:
         with:
           name: efr32mg1-sensor-firmware
           path: |
-            examples/efr32mg1-sensor/target/thumbv7em-none-eabihf/release/efr32mg1-sensor.bin
-            examples/efr32mg1-sensor/target/thumbv7em-none-eabihf/release/efr32mg1-sensor.hex
+            examples/efr32mg1-sensor/target/thumbv7em-none-eabi/release/efr32mg1-sensor.bin
+            examples/efr32mg1-sensor/target/thumbv7em-none-eabi/release/efr32mg1-sensor.hex
 
   build-efr32mg21:
     name: Build EFR32MG21 sensor

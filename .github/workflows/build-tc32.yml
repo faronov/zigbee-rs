@@ -1,20 +1,32 @@
 name: Build TLSR8258 (TC32 real firmware)
 
 # This workflow builds real tc32-unknown-none-elf firmware for the TLSR8258
-# using the modern-tc32 Rust toolchain. It runs separately from the main CI
-# because it requires the custom TC32 toolchain.
+# using the modern-tc32 Rust toolchain (published as public release on
+# modern-tc32/rust). No secrets required.
 #
 # Triggers:
+# - Push to master that touches Telink files
+# - PR that touches Telink files
 # - Manual dispatch (workflow_dispatch)
-# - When the TC32 toolchain is available as a release/artifact
 
 on:
+  push:
+    branches: [master]
+    paths:
+      - 'examples/telink-tlsr8258-sensor/**'
+      - 'zigbee-*/**'
+      - '.github/workflows/build-tc32.yml'
+  pull_request:
+    paths:
+      - 'examples/telink-tlsr8258-sensor/**'
+      - 'zigbee-*/**'
+      - '.github/workflows/build-tc32.yml'
   workflow_dispatch:
     inputs:
-      tc32_toolchain_run_id:
-        description: 'Run ID from modern-tc32/rust build (default: latest)'
+      tc32_release_tag:
+        description: 'modern-tc32/rust release tag'
         required: false
-        default: '24006473891'
+        default: 'tc32-stage2-tc32-43'
         type: string
 
 permissions:
@@ -22,7 +34,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  TC32_RELEASE_TAG_DEFAULT: tc32-stage2-tc32-43
 
 jobs:
   build-tlsr8258-tc32:
@@ -31,28 +43,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download TC32 toolchain artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: tc32-rust-toolchain-linux-amd64
-          repository: modern-tc32/rust
-          run-id: ${{ inputs.tc32_toolchain_run_id }}
-          github-token: ${{ secrets.TC32_REPO_TOKEN }}
-          path: tc32-artifact
+      - name: Download TC32 toolchain from public release
+        run: |
+          TAG="${{ inputs.tc32_release_tag || env.TC32_RELEASE_TAG_DEFAULT }}"
+          URL="https://github.com/modern-tc32/rust/releases/download/${TAG}/tc32-rust-toolchain-linux-amd64.tar.gz"
+          echo "Downloading ${URL}"
+          curl -fSL --retry 5 --retry-delay 5 -o /tmp/tc32.tar.gz "$URL"
 
       - name: Unpack TC32 toolchain
         run: |
-          mkdir -p $HOME/tc32-stage1
-          tar -xzf tc32-artifact/tc32-rust-toolchain-linux-amd64.tar.gz -C $HOME/
-          # The tarball extracts to tc32-stage1-x86_64-unknown-linux-gnu/
-          ln -sf $HOME/tc32-stage1-x86_64-unknown-linux-gnu $HOME/tc32-stage1
-          echo "TC32_TOOLCHAIN=$HOME/tc32-stage1" >> $GITHUB_ENV
-          echo "TC32_LLVM_BIN=$HOME/tc32-stage1/llvm/bin" >> $GITHUB_ENV
-
-      - name: Clone Telink Zigbee SDK
-        run: |
-          git clone --depth 1 https://github.com/telink-semi/tl_zigbee_sdk.git $HOME/tl_zigbee_sdk
-          echo "TC32_SDK_DIR=$HOME/tl_zigbee_sdk" >> $GITHUB_ENV
+          tar -xzf /tmp/tc32.tar.gz -C $HOME/
+          # Tarball extracts to tc32-stage2-x86_64-unknown-linux-gnu/
+          TC32_DIR="$HOME/tc32-stage2-x86_64-unknown-linux-gnu"
+          test -x "$TC32_DIR/bin/rustc"
+          test -x "$TC32_DIR/bin/cargo"
+          test -x "$TC32_DIR/llvm/bin/llvm-objcopy"
+          echo "TC32_TOOLCHAIN=$TC32_DIR" >> $GITHUB_ENV
+          echo "TC32_LLVM_BIN=$TC32_DIR/llvm/bin" >> $GITHUB_ENV
 
       - name: Verify TC32 toolchain
         run: |

@@ -214,10 +214,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
     /// This avoids the extra closure frame introduced by
     /// `StaticCell::init_with(|| builder.build())` on small MCUs.
     #[inline(never)]
-    pub fn build_into<'a>(
-        self,
-        dst: &'a mut MaybeUninit<ZigbeeDevice<M>>,
-    ) -> &'a mut ZigbeeDevice<M> {
+    pub fn build_into(self, dst: &mut MaybeUninit<ZigbeeDevice<M>>) -> &mut ZigbeeDevice<M> {
         let Self {
             mac,
             device_type,
