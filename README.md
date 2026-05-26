@@ -332,7 +332,6 @@ zigbee-rs/
 │   ├── nrf52840-sensor-uf2/   # nice!nano / ProMicro (UF2 drag-drop, simple demo)
 │   ├── nrf52833-sensor/       # nRF52833-DK (probe-rs)
 │   ├── nrf52840-router/       # nRF52840 Zigbee router (relay, permit join, Link Status)
-│   ├── nrf52840-bridge/       # nRF52840 coordinator bridge (stub)
 │   ├── bl702-sensor/          # BL702 (requires vendor libs from Bouffalo SDK)
 │   ├── cc2340-sensor/         # TI CC2340R5 (stubs)
 │   ├── telink-b91-sensor/     # Telink B91 (requires vendor libs or stubs)

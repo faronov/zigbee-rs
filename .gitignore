@@ -10,3 +10,7 @@
 *.sensor
 /docs/book/book/
 *.bin
+
+# Local toolchain extractions (e.g. tc32 from modern-tc32/rust release)
+/.toolchains/
+/tc32-stage*/

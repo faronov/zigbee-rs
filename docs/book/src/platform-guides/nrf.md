@@ -113,10 +113,10 @@ cd examples/nrf52840-router
 cargo build --release
 ```
 
-### nRF52840 Bridge (coordinator)
+### nRF52840 Router
 
 ```bash
-cd examples/nrf52840-bridge
+cd examples/nrf52840-router
 cargo build --release
 ```
 
@@ -424,10 +424,6 @@ The UF2 variant supports multiple boards via cargo features:
 
 This variant auto-joins on boot (no button press needed) and includes a
 `log` → `defmt` bridge so internal stack log messages appear in RTT output.
-
-### nrf52840-bridge
-
-A coordinator/bridge example that exposes the Zigbee network over USB serial.
 
 ### nrf52840-router
 
