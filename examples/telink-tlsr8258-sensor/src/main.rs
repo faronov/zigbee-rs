@@ -68,11 +68,11 @@ use zigbee_zdo::device_announce::DeviceAnnounce;
 #[cfg(feature = "sensor")]
 use zigbee_zdo::DEVICE_ANNCE;
 #[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
-use zigbee_runtime::event_loop::{StackEvent, TickResult};
+use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 #[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
 use zigbee_runtime::power::PowerMode;
 #[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
-use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
+use zigbee_runtime::{ClusterRef, ZigbeeDevice};
 #[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
 use zigbee_zcl::clusters::basic::BasicCluster;
 #[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
@@ -88,6 +88,27 @@ use zigbee_zcl::clusters::temperature::TemperatureCluster;
 // so diagnostics must not be pinned into the middle of .bss.
 const DBG_BOOT_BASE: u32 = 0x0084F000;
 const DBG_MODE_BASE: u32 = 0x0084F100;
+// Fresh single-writer window for join-path diagnostics.
+// Layout (each offset has exactly one writer in the entire crate):
+//   +0x250  assoc enter sentinel: 0xA55C_0000 | (channel<<16) | pan_id<<24
+//   +0x254  assoc-req: len<<24 | dsn<<16 | cap<<8 | coord_addr_mode
+//   +0x258  assoc-req bytes [0..4] (FCF lo|FCF hi|DSN|PAN lo)
+//   +0x25C  assoc-req bytes [4..8] (PAN hi|dst_addr lo|dst_addr hi|src ext[0])
+//   +0x260  csma_transmit final return: 0=Ok, 0xFFFF=NoAck, 0xFFFE=RadioError
+//   +0x264  csma: (tx_ok_count<<16) | (tx_fail_count<<8) | attempts_executed
+//   +0x268  csma: ACK rx info: matched<<24 | len<<16 | dsn<<8 | fcf_lo
+//   +0x26C  direct-window iterations executed (0..6)
+//   +0x270  direct-window frames seen (cumulative)
+//   +0x274  direct-window first-frame: len<<24 | dsn<<16 | fcf_le16
+//   +0x278  direct-window parse_assoc_response Some(short_addr) | 0xCAFE_0000
+//   +0x27C  post-direct sentinel (after 200ms delay): 0xA55C_200D
+//   +0x280  data-req loop: attempts_started (0..6)
+//   +0x284  data-req TX result bitmap (bit n = attempt n got Ok)
+//   +0x288  data-req inner-loop frames seen (cumulative across all attempts)
+//   +0x28C  data-req first frame: len<<24 | dsn<<16 | fcf_le16
+//   +0x290  data-req parse_assoc_response Some(short_addr) | 0xCAFE_0000
+//   +0x294  mlme_associate final outcome: 0xC0DE_xxxx (success) | 0xDEAD_xxxx (fail)
+const DBG_JOIN_BASE: u32 = 0x0084F100 + 0x250;
 #[cfg(feature = "sensor")]
 const SENSOR_NV_FLASH_ADDR: u32 = 0x0007_F000;
 #[cfg(feature = "sensor")]
@@ -1600,6 +1621,8 @@ impl Tlsr8258Mac {
     fn sync_radio_config(&self) {
         radio::set_channel(self.channel);
         radio::set_rx_buffer(self.rx_buf);
+        // TLSR8258 needs a short PLL settle window after channel changes.
+        spin_delay(2400);
     }
 
     fn scan_duration_loops(scan_duration: u8) -> u32 {
@@ -1699,7 +1722,9 @@ impl Tlsr8258Mac {
             zigbee_types::MacAddress::Extended(_, _) => 0b11,
         };
         let fc_lo = 0b0110_0011u8;
-        let fc_hi = (0b11 << 6) | (0b01 << 4) | (dst_mode << 2);
+        // FCF high byte: src_addr_mode=ext(11) | frame_version=0 (2003 — REQUIRED for
+        // assoc-req per IEEE 802.15.4; some coordinators drop FV=1) | dst_addr_mode.
+        let fc_hi = (0b11 << 6) | (dst_mode << 2);
         let _ = frame.extend_from_slice(&[fc_lo, fc_hi, seq]);
         let _ = frame.extend_from_slice(&coord.pan_id().0.to_le_bytes());
         match coord {
@@ -1729,7 +1754,8 @@ impl Tlsr8258Mac {
             0b11
         };
         let fc_lo = 0b0110_0011u8;
-        let fc_hi = (src_mode << 6) | (0b01 << 4) | (dst_mode << 2);
+        // frame_version=0 (2003); match the assoc-req convention used by the parent.
+        let fc_hi = (src_mode << 6) | (dst_mode << 2);
         let _ = frame.extend_from_slice(&[fc_lo, fc_hi, seq]);
         let _ = frame.extend_from_slice(&coord.pan_id().0.to_le_bytes());
         match coord {
@@ -1840,20 +1866,113 @@ impl Tlsr8258Mac {
 
     fn csma_transmit(&mut self, frame: &[u8], ack_requested: bool) -> Result<(), MacError> {
         let max_retries = if ack_requested { self.max_frame_retries } else { 0 };
+        let expected_dsn = frame.get(2).copied().unwrap_or(0);
+        mark32(
+            DBG_MODE_BASE + 0x80,
+            0xC50A0000
+                | ((expected_dsn as u32) << 8)
+                | (max_retries as u32 & 0xFF)
+                | ((frame.len() as u32 & 0xFF) << 16),
+        );
+        mark32(
+            DBG_MODE_BASE + 0x84,
+            (self.channel as u32) | ((self.pan_id.0 as u32) << 8),
+        );
+        let mut rx_total: u32 = 0;
+        // Per-call counters for join-path window (+0x264 / +0x268).
+        let mut tx_ok_count: u32 = 0;
+        let mut tx_fail_count: u32 = 0;
+        let mut attempts_executed: u32 = 0;
+        let mut ack_recorded: bool = false;
+        let write_csma_counters = |ok: u32, fail: u32, attempts: u32| {
+            mark32(
+                DBG_JOIN_BASE + 0x14, // +0x264 = DBG_MODE_BASE+0x250+0x14
+                ((ok & 0xFFFF) << 16) | ((fail & 0xFF) << 8) | (attempts & 0xFF),
+            );
+        };
         for attempt in 0..=max_retries {
-            self.transmit_raw(frame)?;
+            attempts_executed = attempt as u32 + 1;
+            let tx_ok = self.transmit_raw(frame).is_ok();
+            if tx_ok {
+                tx_ok_count += 1;
+            } else {
+                tx_fail_count += 1;
+            }
+            write_csma_counters(tx_ok_count, tx_fail_count, attempts_executed);
+            mark32(
+                DBG_MODE_BASE + 0x88,
+                0xC50A2000 | ((attempt as u32) << 8) | (tx_ok as u32),
+            );
+            if !tx_ok {
+                if attempt == max_retries {
+                    mark32(DBG_MODE_BASE + 0x9C, 0xC50AFE00 | attempt as u32);
+                    mark32(DBG_JOIN_BASE + 0x10, 0xFFFE);
+                    return Err(MacError::RadioError);
+                }
+                continue;
+            }
             if !ack_requested {
+                mark32(DBG_MODE_BASE + 0x9C, 0xC50A0001);
+                mark32(DBG_JOIN_BASE + 0x10, 0x0000_0001);
                 return Ok(());
             }
-            if let Ok(pkt) = self.receive_raw(ACK_WAIT_LOOPS) {
-                if is_ack_for(&pkt.data[..pkt.len], frame[2]) {
-                    return Ok(());
+            match self.receive_raw(ACK_WAIT_LOOPS) {
+                Ok(pkt) => {
+                    rx_total = rx_total.wrapping_add(1);
+                    let data = &pkt.data[..pkt.len];
+                    let b0 = data.first().copied().unwrap_or(0) as u32;
+                    let b1 = data.get(1).copied().unwrap_or(0) as u32;
+                    let b2 = data.get(2).copied().unwrap_or(0) as u32;
+                    let b3 = data.get(3).copied().unwrap_or(0) as u32;
+                    mark32(
+                        DBG_MODE_BASE + 0x8C,
+                        (pkt.len as u32 & 0xFF)
+                            | ((attempt as u32 & 0xFF) << 8)
+                            | ((rx_total & 0xFFFF) << 16),
+                    );
+                    mark32(
+                        DBG_MODE_BASE + 0x90,
+                        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24),
+                    );
+                    let matched = is_ack_for(data, expected_dsn);
+                    if !ack_recorded {
+                        ack_recorded = true;
+                        mark32(
+                            DBG_JOIN_BASE + 0x18, // +0x268
+                            ((matched as u32) << 24)
+                                | ((pkt.len as u32 & 0xFF) << 16)
+                                | ((b2 & 0xFF) << 8)
+                                | (b0 & 0xFF),
+                        );
+                    }
+                    mark32(
+                        DBG_MODE_BASE + 0x94,
+                        0xC50A4000
+                            | (matched as u32)
+                            | ((b2 as u32) << 8)
+                            | ((expected_dsn as u32) << 16),
+                    );
+                    if matched {
+                        mark32(DBG_MODE_BASE + 0x9C, 0xC50A0002 | ((attempt as u32) << 8));
+                        mark32(DBG_JOIN_BASE + 0x10, 0x0000_0001);
+                        return Ok(());
+                    }
+                }
+                Err(_) => {
+                    mark32(
+                        DBG_MODE_BASE + 0x94,
+                        0xC50A5000 | (attempt as u32),
+                    );
                 }
             }
             if attempt == max_retries {
+                mark32(DBG_MODE_BASE + 0x9C, 0xC50AFFFF);
+                mark32(DBG_JOIN_BASE + 0x10, 0xFFFF);
                 return Err(MacError::NoAck);
             }
         }
+        mark32(DBG_MODE_BASE + 0x9C, 0xC50AFFFE);
+        mark32(DBG_JOIN_BASE + 0x10, 0xFFFD);
         Err(MacError::NoAck)
     }
 }
@@ -1866,6 +1985,8 @@ impl MacDriver for Tlsr8258Mac {
         let mut pan_descriptors: PanDescriptorList = heapless::Vec::new();
         let mut energy_list: EdList = heapless::Vec::new();
         let mut iter_count: u32 = 0;
+        let mut permit_joining_count: u32 = 0;
+        let mut coordinator_beacon_count: u32 = 0;
 
         for channel in req.channel_mask.iter() {
             iter_count = iter_count.wrapping_add(1);
@@ -1875,12 +1996,24 @@ impl MacDriver for Tlsr8258Mac {
                 ScanType::Active => {
                     let found = self.active_scan_channel(ch, timeout_loops);
                     for desc in found {
+                        if desc.superframe_spec.association_permit {
+                            permit_joining_count = permit_joining_count.wrapping_add(1);
+                        }
+                        if desc.superframe_spec.pan_coordinator {
+                            coordinator_beacon_count = coordinator_beacon_count.wrapping_add(1);
+                        }
                         let _ = pan_descriptors.push(desc);
                     }
                 }
                 ScanType::Passive => {
                     let found = self.passive_scan_channel(ch, timeout_loops);
                     for desc in found {
+                        if desc.superframe_spec.association_permit {
+                            permit_joining_count = permit_joining_count.wrapping_add(1);
+                        }
+                        if desc.superframe_spec.pan_coordinator {
+                            coordinator_beacon_count = coordinator_beacon_count.wrapping_add(1);
+                        }
                         let _ = pan_descriptors.push(desc);
                     }
                 }
@@ -1899,6 +2032,8 @@ impl MacDriver for Tlsr8258Mac {
         self.sync_radio_config();
         mark32(DBG_MODE_BASE + 0x6C, 0x5CA10E00 | (iter_count & 0xFF));
         mark32(DBG_MODE_BASE + 0x70, pan_descriptors.len() as u32);
+        mark32(DBG_MODE_BASE + 0x78, permit_joining_count);
+        mark32(DBG_MODE_BASE + 0x7C, coordinator_beacon_count);
         if matches!(req.scan_type, ScanType::Active | ScanType::Passive) && pan_descriptors.is_empty() {
             mark32(DBG_MODE_BASE + 0x74, 0x5CA1F00D);
             Err(MacError::NoBeacon)
@@ -1928,18 +2063,81 @@ impl MacDriver for Tlsr8258Mac {
         self.sync_radio_config();
 
         let assoc = self.build_assoc_request(&req.coord_address, &req.capability_info);
+
+        // === JOIN-PATH DIAG (single writer per offset) ===
+        let coord_mode: u32 = match req.coord_address {
+            zigbee_types::MacAddress::Short(_, _) => 0x2,
+            zigbee_types::MacAddress::Extended(_, _) => 0x3,
+        };
+        let cap_byte: u32 = req.capability_info.to_byte() as u32;
+        let dsn = assoc.get(2).copied().unwrap_or(0) as u32;
+        // Sentinel cleanly separated: high 16 bits = 0xA55C, low byte = channel.
+        mark32(
+            DBG_JOIN_BASE + 0x00,
+            0xA55C_0000 | ((self.channel as u32) & 0xFF),
+        );
+        // Raw pan_id at +0x48 (u16 LE).
+        mark32(DBG_JOIN_BASE + 0x48, self.pan_id.0 as u32);
+        mark32(
+            DBG_JOIN_BASE + 0x04,
+            ((assoc.len() as u32 & 0xFF) << 24) | (dsn << 16) | (cap_byte << 8) | coord_mode,
+        );
+        let w0 = u32::from_le_bytes([
+            assoc.first().copied().unwrap_or(0),
+            assoc.get(1).copied().unwrap_or(0),
+            assoc.get(2).copied().unwrap_or(0),
+            assoc.get(3).copied().unwrap_or(0),
+        ]);
+        let w1 = u32::from_le_bytes([
+            assoc.get(4).copied().unwrap_or(0),
+            assoc.get(5).copied().unwrap_or(0),
+            assoc.get(6).copied().unwrap_or(0),
+            assoc.get(7).copied().unwrap_or(0),
+        ]);
+        mark32(DBG_JOIN_BASE + 0x08, w0);
+        mark32(DBG_JOIN_BASE + 0x0C, w1);
+
         match self.csma_transmit(&assoc, true) {
             Ok(()) => mark32(DBG_MODE_BASE + 0x54, 0xA55C0001),
             Err(e) => {
                 mark32(DBG_MODE_BASE + 0x54, 0xA55CFFFF);
+                mark32(DBG_JOIN_BASE + 0x44, 0xDEAD_0001); // csma fail
                 return Err(e);
             }
         }
 
+        let mut dw_iters: u32 = 0;
+        let mut dw_frames: u32 = 0;
+        let mut dw_first_logged = false;
         for direct_attempt in 0..6u8 {
+            dw_iters = direct_attempt as u32 + 1;
+            mark32(DBG_JOIN_BASE + 0x1C, dw_iters); // +0x26C
             if let Ok(pkt) = self.receive_raw(POLL_RESPONSE_LOOPS / 3) {
+                dw_frames = dw_frames.wrapping_add(1);
+                mark32(DBG_JOIN_BASE + 0x20, dw_frames); // +0x270
+                if !dw_first_logged {
+                    dw_first_logged = true;
+                    let data = &pkt.data[..pkt.len];
+                    let fcf = u16::from_le_bytes([
+                        data.first().copied().unwrap_or(0),
+                        data.get(1).copied().unwrap_or(0),
+                    ]) as u32;
+                    let dsn0 = data.get(2).copied().unwrap_or(0) as u32;
+                    mark32(
+                        DBG_JOIN_BASE + 0x24, // +0x274
+                        ((pkt.len as u32 & 0xFF) << 24) | (dsn0 << 16) | fcf,
+                    );
+                }
                 mark32(DBG_MODE_BASE + 0x58, 0xA55C0100 | direct_attempt as u32);
                 if let Some(confirm) = self.parse_assoc_response_packet(&pkt.data[..pkt.len]) {
+                    mark32(
+                        DBG_JOIN_BASE + 0x28, // +0x278
+                        0xCAFE0000 | confirm.short_address.0 as u32,
+                    );
+                    mark32(
+                        DBG_JOIN_BASE + 0x44,
+                        0xC0DE_0000 | confirm.short_address.0 as u32,
+                    );
                     return Ok(confirm);
                 }
             }
@@ -1947,15 +2145,27 @@ impl MacDriver for Tlsr8258Mac {
 
         delay_ms(200);
         mark32(DBG_MODE_BASE + 0x58, 0xA55C0002);
+        mark32(DBG_JOIN_BASE + 0x2C, 0xA55C200D); // +0x27C
 
+        let mut dr_attempts: u32 = 0;
+        let mut dr_tx_bitmap: u32 = 0;
+        let mut dr_frames: u32 = 0;
+        let mut dr_first_logged = false;
         for poll_attempt in 0..6u8 {
+            dr_attempts = poll_attempt as u32 + 1;
+            mark32(DBG_JOIN_BASE + 0x30, dr_attempts); // +0x280
             let data_req = self.build_data_request(&req.coord_address);
             // The parent may answer a poll with the Association Response before
             // a standalone MAC ACK is observed. Do not use csma_transmit() here:
             // it waits only for ACK frames and would discard the response.
             match self.transmit_raw(&data_req) {
-                Ok(()) => mark32(DBG_MODE_BASE + 0x5C, 0xA55C0003 | ((poll_attempt as u32) << 8)),
+                Ok(()) => {
+                    dr_tx_bitmap |= 1u32 << poll_attempt;
+                    mark32(DBG_JOIN_BASE + 0x34, dr_tx_bitmap); // +0x284
+                    mark32(DBG_MODE_BASE + 0x5C, 0xA55C0003 | ((poll_attempt as u32) << 8));
+                }
                 Err(_) => {
+                    mark32(DBG_JOIN_BASE + 0x34, dr_tx_bitmap);
                     mark32(DBG_MODE_BASE + 0x5C, 0xA55CFF00 | poll_attempt as u32);
                     delay_ms(250);
                     continue;
@@ -1964,16 +2174,40 @@ impl MacDriver for Tlsr8258Mac {
 
             for _ in 0..4 {
                 if let Ok(pkt) = self.receive_raw(POLL_RESPONSE_LOOPS) {
-                let data = &pkt.data[..pkt.len];
-                if let Some(confirm) = self.parse_assoc_response_packet(data) {
-                    return Ok(confirm);
-                }
+                    dr_frames = dr_frames.wrapping_add(1);
+                    mark32(DBG_JOIN_BASE + 0x38, dr_frames); // +0x288
+                    if !dr_first_logged {
+                        dr_first_logged = true;
+                        let data = &pkt.data[..pkt.len];
+                        let fcf = u16::from_le_bytes([
+                            data.first().copied().unwrap_or(0),
+                            data.get(1).copied().unwrap_or(0),
+                        ]) as u32;
+                        let dsn0 = data.get(2).copied().unwrap_or(0) as u32;
+                        mark32(
+                            DBG_JOIN_BASE + 0x3C, // +0x28C
+                            ((pkt.len as u32 & 0xFF) << 24) | (dsn0 << 16) | fcf,
+                        );
+                    }
+                    let data = &pkt.data[..pkt.len];
+                    if let Some(confirm) = self.parse_assoc_response_packet(data) {
+                        mark32(
+                            DBG_JOIN_BASE + 0x40, // +0x290
+                            0xCAFE0000 | confirm.short_address.0 as u32,
+                        );
+                        mark32(
+                            DBG_JOIN_BASE + 0x44,
+                            0xC0DE_0000 | confirm.short_address.0 as u32,
+                        );
+                        return Ok(confirm);
+                    }
                 }
             }
             delay_ms(250);
         }
 
         mark32(DBG_MODE_BASE + 0x60, 0xA55CFFFF);
+        mark32(DBG_JOIN_BASE + 0x44, 0xDEAD_0002); // exhausted both windows
         Err(MacError::NoAck)
     }
 
@@ -2100,6 +2334,11 @@ impl MacDriver for Tlsr8258Mac {
     }
 
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
+        // Diag: count BDB-side calls into mlme_poll
+        unsafe {
+            let p = (DBG_MODE_BASE + 0xC0) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+        }
         let parent = zigbee_types::MacAddress::Short(self.pan_id, self.coord_short_address);
         let data_req = self.build_data_request(&parent);
         self.csma_transmit(&data_req, true)?;
@@ -2149,6 +2388,11 @@ impl MacDriver for Tlsr8258Mac {
     }
 
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
+        // Diag: count BDB-side calls into mcps_data_indication
+        unsafe {
+            let p = (DBG_MODE_BASE + 0xC4) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+        }
         loop {
             let pkt = self.receive_raw(RX_INDICATION_LOOPS)?;
             let data = &pkt.data[..pkt.len];
@@ -2342,6 +2586,39 @@ fn handle_rf_rx_irq() {
         0x1A000000 | (total_len as u32) | ((payload_len as u32) << 8),
     );
 
+    // Diag: total frames entering IRQ handler (any rx_done event with any data)
+    let irq_total = unsafe {
+        let p = (DBG_MODE_BASE + 0xA0) as *mut u32;
+        let v = core::ptr::read_volatile(p).wrapping_add(1);
+        core::ptr::write_volatile(p, v);
+        v
+    };
+    let _ = irq_total;
+
+    // Diag: capture last status byte and FCF+DSN for *every* IRQ frame
+    if total_len > 0 && total_len <= 130 {
+        let status_byte =
+            unsafe { core::ptr::read_volatile(rx_buf.add(total_len as usize + 3)) };
+        let fcf_dsn = unsafe { core::ptr::read_volatile(rx_buf.add(5) as *const u32) };
+        mark32(DBG_MODE_BASE + 0xC8, 0xCB000000 | status_byte as u32);
+        mark32(DBG_MODE_BASE + 0xCC, fcf_dsn);
+    }
+
+    let len_ok = total_len > 0 && radio::packet_length_ok(rx_buf);
+    let crc_ok = len_ok && radio::packet_crc_ok(rx_buf);
+    if len_ok && !crc_ok {
+        unsafe {
+            let p = (DBG_MODE_BASE + 0xA8) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+        }
+    }
+    if crc_ok {
+        unsafe {
+            let p = (DBG_MODE_BASE + 0xA4) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+        }
+    }
+
     if total_len > 0 && radio::packet_length_ok(rx_buf) && radio::packet_crc_ok(rx_buf) {
         let phy_len = radio::payload_len(rx_buf) as usize;
         if (2..=MAX_MAC_FRAME_LEN + 2).contains(&phy_len) {
@@ -2438,6 +2715,7 @@ fn receive_packet(
     radio::set_rx_buffer(rx_buf);
     radio::enable_dma_rx();
     radio::set_rx_mode();
+    spin_delay(2400);
 
     for _ in 0..timeout_loops {
         if let Some(packet) = take_irq_rx_packet() {
@@ -4676,29 +4954,33 @@ fn wait_for_transport_key(
     aps_seq: &mut u8,
     nwk_frame_counter: &mut u32,
 ) -> bool {
-    const PASSIVE_RX_ATTEMPTS: u8 = 10;
-    const MAX_POLL_ROUNDS: u8 = 40;
-    const MAX_EMPTY_POLL_ROUNDS: u8 = 10;
+    const PASSIVE_RX_ATTEMPTS: u8 = 100;
+    const PASSIVE_RX_LOOPS: u32 = 240_000;
+    const MAX_POLL_ROUNDS: u8 = 8;
+    const MAX_EMPTY_POLL_ROUNDS: u8 = 4;
 
     mark32(DBG_MODE_BASE + 0x28, 0x4B455900);
 
     for attempt in 0..PASSIVE_RX_ATTEMPTS {
-        match executor::block_on(mac.mcps_data_indication()) {
-            Ok(indication) => {
+        match mac.receive_raw(PASSIVE_RX_LOOPS) {
+            Ok(pkt) => {
                 mark32(DBG_MODE_BASE + 0x20, 0x4B455910 | attempt as u32);
-                mark32(DBG_MODE_BASE + 0x24, indication.payload.len() as u32);
-                let _ = handle_sensor_frame(
-                    mac,
-                    nwk_security,
-                    aps_security,
-                    &indication.payload,
-                    nwk_seq,
-                    aps_seq,
-                    nwk_frame_counter,
-                );
-                if nwk_security.active_key().is_some() {
-                    mark32(DBG_MODE_BASE + 0x28, 0x4B455901);
-                    return true;
+                mark32(DBG_MODE_BASE + 0x24, pkt.len as u32);
+                if let Some(frame) = zigbee_mac::primitives::MacFrame::from_slice(&pkt.data[..pkt.len])
+                {
+                    let _ = handle_sensor_frame(
+                        mac,
+                        nwk_security,
+                        aps_security,
+                        &frame,
+                        nwk_seq,
+                        aps_seq,
+                        nwk_frame_counter,
+                    );
+                    if nwk_security.active_key().is_some() {
+                        mark32(DBG_MODE_BASE + 0x28, 0x4B455901);
+                        return true;
+                    }
                 }
             }
             Err(_) => {
@@ -4940,8 +5222,10 @@ fn sensor_main() -> ! {
                             mac.short_address.0 as u32 | ((mac.pan_id.0 as u32) << 16),
                         );
                         mark32(DBG_MODE_BASE + 0xAC, mac.coord_short_address.0 as u32);
+                        mark32(DBG_MODE_BASE + 0x2C, 0x53E5A000);
 
                         if persisted_frame_counter.is_none() {
+                            mark32(DBG_MODE_BASE + 0x2C, 0x53E5A001);
                             // The trust center starts key transport only after it learns
                             // about the newly associated device. Do not answer interview
                             // requests until the Transport-Key installs the NWK key.
@@ -4953,12 +5237,14 @@ fn sensor_main() -> ! {
                                 &mut aps_seq,
                                 &mut zdo_seq,
                             ));
+                            mark32(DBG_MODE_BASE + 0x2C, 0x53E5A002);
                             mark32(DBG_MODE_BASE + 0x28, 0x53E50029);
                             let _ = executor::block_on(send_network_key_request(
                                 &mut mac,
                                 &mut nwk_seq,
                                 &mut aps_seq,
                             ));
+                            mark32(DBG_MODE_BASE + 0x2C, 0x53E5A003);
 
                             if !wait_for_transport_key(
                                 &mut mac,
@@ -4968,11 +5254,14 @@ fn sensor_main() -> ! {
                                 &mut aps_seq,
                                 &mut nwk_frame_counter,
                             ) {
+                                mark32(DBG_MODE_BASE + 0x2C, 0x53E5A004);
                                 board::LED_BLUE.write(false);
                                 mark32(DBG_MODE_BASE + 0x18, 0x53E5FF40);
                                 continue;
                             }
+                            mark32(DBG_MODE_BASE + 0x2C, 0x53E5A005);
                         } else {
+                            mark32(DBG_MODE_BASE + 0x2C, 0x53E5A006);
                             mark32(DBG_MODE_BASE + 0x28, 0x53E50228);
                         }
 
@@ -5193,10 +5482,14 @@ fn runtime_sensor_main() -> ! {
     mark32(DBG_MODE_BASE + 0x40, 0x53AA_0100);
     match executor::block_on(device.start()) {
         Ok(addr) => {
-            mark32(DBG_MODE_BASE + 0x44, 0x53AA_0200 | (addr as u32));
+            mark32(DBG_MODE_BASE + 0x1A0, 0x53AA_0200);
+            mark32(DBG_MODE_BASE + 0x1A4, addr as u32);
         }
-        Err(_) => {
-            mark32(DBG_MODE_BASE + 0x44, 0x53AA_FA11);
+        Err(StartError::InitFailed) => {
+            mark32(DBG_MODE_BASE + 0x1A0, 0x53AA_FA10);
+        }
+        Err(StartError::CommissioningFailed(status)) => {
+            mark32(DBG_MODE_BASE + 0x1A0, 0x53AA_FA00 | status as u32);
         }
     }
     mark32(DBG_MODE_BASE + 0x30, 0x52540015);
@@ -5323,12 +5616,12 @@ fn main_loop() -> ! {
     radio::set_rx_dma_config(144);
 
     board::LED_RED.write(true);
-    // Clear the full 0x200-byte diagnostic SRAM window. TLSR8258 does NOT zero
-    // SRAM on soft reset, so without this every dump is a superposition of
-    // markers from this boot and from all previous boots since power-on,
-    // making any diagnosis unreliable. 128 words = 512 bytes covers all
-    // markers we currently place at +0x000..+0x1FC.
-    clear_words(DBG_MODE_BASE, 128);
+    // Clear the full diagnostic SRAM window. TLSR8258 does NOT zero SRAM on
+    // soft reset, so without this every dump is a superposition of markers
+    // from this boot and from all previous boots since power-on, making any
+    // diagnosis unreliable. 192 words = 768 bytes covers all current marker
+    // writers (including DBG_JOIN_BASE at +0x250..+0x294).
+    clear_words(DBG_MODE_BASE, 192);
     mark32(DBG_MODE_BASE + 0x00, 0xD1A60000);
 
     #[cfg(feature = "sensor")]
