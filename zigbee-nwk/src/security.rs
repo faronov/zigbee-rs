@@ -217,72 +217,247 @@ impl Default for NwkSecurity {
 }
 
 // ── AES-128-CCM* implementation ─────────────────────────────────
-// Uses RustCrypto `aes` + `ccm` crates — pure Rust, #![no_std], no alloc.
-// Zigbee uses Security Level 5: ENC-MIC-32 (M=4 byte MIC, L=2).
+// Hand-rolled per Zigbee spec §B.1.2 / IEEE 802.15.4 Annex B / RFC 3610.
+// Parameters: M=4 (4-byte MIC, ENC-MIC-32), L=2, nonce=13.
+//
+// IDENTICAL ALGORITHM to `zigbee-aps/src/security.rs`. Duplicated here to
+// avoid a cyclic dep (APS depends on NWK). TODO: lift to a shared
+// `zigbee-crypto` crate.
+//
+// Rationale: the `ccm` crate consumes ~6 KiB of stack on tc32, blowing the
+// 10 KiB SVC stack. This impl uses only fixed-size 16-byte stack buffers
+// plus one `Aes128` (~176 B round keys), keeping the call frame under ~400 B.
 
 use aes::Aes128;
-use ccm::aead::AeadInPlace;
-use ccm::aead::generic_array::GenericArray;
-use ccm::consts::{U4, U13};
-use ccm::{Ccm, KeyInit};
+use aes::cipher::generic_array::GenericArray;
+use aes::cipher::{BlockEncrypt, KeyInit};
 
-type ZigbeeCcm = Ccm<Aes128, U4, U13>;
+const CCM_B0_FLAGS_ADATA: u8 = 0x49; // Adata=1, M=4, L=2
+const CCM_B0_FLAGS_NO_ADATA: u8 = 0x09; // Adata=0, M=4, L=2
+const CCM_AI_FLAGS: u8 = 0x01; // L=2 counter blocks
 
-/// AES-128-CCM* encrypt with M=4 (4-byte MIC).
-/// Returns ciphertext + 4-byte MIC appended.
+#[inline(always)]
+fn aes_enc(cipher: &Aes128, block: &mut [u8; 16]) {
+    let mut ga = GenericArray::clone_from_slice(block);
+    cipher.encrypt_block(&mut ga);
+    block.copy_from_slice(ga.as_slice());
+}
+
+#[inline(always)]
+fn build_ai(nonce: &[u8; 13], counter: u16) -> [u8; 16] {
+    let mut a = [0u8; 16];
+    a[0] = CCM_AI_FLAGS;
+    a[1..14].copy_from_slice(nonce);
+    a[14] = (counter >> 8) as u8;
+    a[15] = counter as u8;
+    a
+}
+
+#[inline(always)]
+fn mac_fold(cipher: &Aes128, t: &mut [u8; 16], block: &[u8; 16]) {
+    for i in 0..16 {
+        t[i] ^= block[i];
+    }
+    aes_enc(cipher, t);
+}
+
+fn ccm_mac(cipher: &Aes128, nonce: &[u8; 13], aad: &[u8], payload: &[u8]) -> [u8; 16] {
+    let mut t = [0u8; 16];
+    t[0] = if aad.is_empty() {
+        CCM_B0_FLAGS_NO_ADATA
+    } else {
+        CCM_B0_FLAGS_ADATA
+    };
+    t[1..14].copy_from_slice(nonce);
+    let mlen = payload.len() as u16;
+    t[14] = (mlen >> 8) as u8;
+    t[15] = mlen as u8;
+    aes_enc(cipher, &mut t);
+
+    if !aad.is_empty() {
+        let mut blk = [0u8; 16];
+        let alen = aad.len() as u16;
+        blk[0] = (alen >> 8) as u8;
+        blk[1] = alen as u8;
+        let first = core::cmp::min(aad.len(), 14);
+        blk[2..2 + first].copy_from_slice(&aad[..first]);
+        mac_fold(cipher, &mut t, &blk);
+
+        let mut off = first;
+        while off < aad.len() {
+            blk = [0u8; 16];
+            let n = core::cmp::min(16, aad.len() - off);
+            blk[..n].copy_from_slice(&aad[off..off + n]);
+            mac_fold(cipher, &mut t, &blk);
+            off += n;
+        }
+    }
+
+    let mut off = 0;
+    while off < payload.len() {
+        let mut blk = [0u8; 16];
+        let n = core::cmp::min(16, payload.len() - off);
+        blk[..n].copy_from_slice(&payload[off..off + n]);
+        mac_fold(cipher, &mut t, &blk);
+        off += n;
+    }
+    t
+}
+
+fn ccm_ctr_xor(cipher: &Aes128, nonce: &[u8; 13], data: &mut [u8]) {
+    let mut counter: u16 = 1;
+    let mut off = 0;
+    while off < data.len() {
+        let mut ks = build_ai(nonce, counter);
+        aes_enc(cipher, &mut ks);
+        let n = core::cmp::min(16, data.len() - off);
+        for i in 0..n {
+            data[off + i] ^= ks[i];
+        }
+        off += n;
+        counter = counter.wrapping_add(1);
+    }
+}
+
+#[inline(always)]
+fn ct_eq4(a: &[u8], b: &[u8]) -> bool {
+    let mut acc = 0u8;
+    for i in 0..4 {
+        acc |= a[i] ^ b[i];
+    }
+    acc == 0
+}
+
+/// AES-128-CCM* encrypt for NWK frames (M=4, 4-byte MIC).
 fn aes_ccm_encrypt(
     key: &AesKey,
     nonce: &[u8; 13],
     aad: &[u8],
     plaintext: &[u8],
 ) -> Option<heapless::Vec<u8, 128>> {
-    let cipher = ZigbeeCcm::new(GenericArray::from_slice(key));
-    let nonce = GenericArray::from_slice(nonce);
-
-    let mut buf = [0u8; 120];
-    if plaintext.len() > buf.len() {
+    #[cfg(feature = "telink-debug")]
+    unsafe {
+        use core::ptr::{read_volatile, write_volatile};
+        // BDB+0x244 NWK CCM encrypt entries
+        let p = 0x0084_F694usize as *mut u32;
+        write_volatile(p, read_volatile(p).wrapping_add(1));
+        // BDB+0x248 SP at NWK CCM encrypt entry (verify in-stack)
+        let sp: u32;
+        core::arch::asm!("mov {0}, sp", out(reg) sp);
+        write_volatile(0x0084_F698usize as *mut u32, sp);
+    }
+    if plaintext.len() > 124 {
         return None;
     }
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+
+    let t = ccm_mac(&cipher, nonce, aad, plaintext);
+
+    let mut s0 = build_ai(nonce, 0);
+    aes_enc(&cipher, &mut s0);
+    let mut mic = [0u8; 4];
+    for i in 0..4 {
+        mic[i] = t[i] ^ s0[i];
+    }
+
+    let mut buf = [0u8; 124];
     buf[..plaintext.len()].copy_from_slice(plaintext);
+    ccm_ctr_xor(&cipher, nonce, &mut buf[..plaintext.len()]);
 
-    let tag = cipher
-        .encrypt_in_place_detached(nonce, aad, &mut buf[..plaintext.len()])
-        .ok()?;
-
-    let mut out = heapless::Vec::<u8, 128>::new();
+    let mut out = heapless::Vec::new();
     out.extend_from_slice(&buf[..plaintext.len()]).ok()?;
-    out.extend_from_slice(tag.as_slice()).ok()?;
+    out.extend_from_slice(&mic).ok()?;
+    #[cfg(feature = "telink-debug")]
+    unsafe {
+        use core::ptr::{read_volatile, write_volatile};
+        // BDB+0x24C NWK CCM encrypt successful exits
+        let p = 0x0084_F69Cusize as *mut u32;
+        write_volatile(p, read_volatile(p).wrapping_add(1));
+    }
     Some(out)
 }
 
-/// AES-128-CCM* decrypt with M=4.
-/// Input is ciphertext + 4-byte MIC. Returns plaintext.
+/// AES-128-CCM* decrypt for NWK frames (M=4).
 fn aes_ccm_decrypt(
     key: &AesKey,
     nonce: &[u8; 13],
     aad: &[u8],
-    ciphertext_with_mic: &[u8],
+    ciphertext_and_mic: &[u8],
 ) -> Option<heapless::Vec<u8, 128>> {
-    if ciphertext_with_mic.len() < 4 {
+    if ciphertext_and_mic.len() < 4 {
         return None;
     }
-    let cipher = ZigbeeCcm::new(GenericArray::from_slice(key));
-    let nonce = GenericArray::from_slice(nonce);
-
-    let ct_len = ciphertext_with_mic.len() - 4;
-    let mut buf = [0u8; 120];
-    if ct_len > buf.len() {
+    let mic_start = ciphertext_and_mic.len() - 4;
+    if mic_start > 124 {
         return None;
     }
-    buf[..ct_len].copy_from_slice(&ciphertext_with_mic[..ct_len]);
+    let cipher = Aes128::new(GenericArray::from_slice(key));
 
-    let tag = GenericArray::from_slice(&ciphertext_with_mic[ct_len..]);
+    let mut buf = [0u8; 124];
+    buf[..mic_start].copy_from_slice(&ciphertext_and_mic[..mic_start]);
+    ccm_ctr_xor(&cipher, nonce, &mut buf[..mic_start]);
 
-    cipher
-        .decrypt_in_place_detached(nonce, aad, &mut buf[..ct_len], tag)
-        .ok()?;
+    let t = ccm_mac(&cipher, nonce, aad, &buf[..mic_start]);
 
-    let mut out = heapless::Vec::<u8, 128>::new();
-    out.extend_from_slice(&buf[..ct_len]).ok()?;
+    let mut s0 = build_ai(nonce, 0);
+    aes_enc(&cipher, &mut s0);
+    let mut expected = [0u8; 4];
+    for i in 0..4 {
+        expected[i] = t[i] ^ s0[i];
+    }
+
+    if !ct_eq4(&expected, &ciphertext_and_mic[mic_start..mic_start + 4]) {
+        return None;
+    }
+
+    let mut out = heapless::Vec::new();
+    out.extend_from_slice(&buf[..mic_start]).ok()?;
     Some(out)
+}
+
+#[cfg(test)]
+mod ccm_tests {
+    use super::*;
+
+    /// Round-trip the hand-rolled NWK CCM* (M=4, L=2, 13-byte nonce).
+    #[test]
+    fn roundtrip_zigbee_default_level() {
+        let key: AesKey = [
+            0x01, 0x03, 0x05, 0x07, 0x09, 0x0B, 0x0D, 0x0F, 0x00, 0x02, 0x04, 0x06, 0x08, 0x0A,
+            0x0C, 0x0D,
+        ];
+        // src_ieee(8) || frame_counter(4 LE = 1) || sec_control (0x2D)
+        let nonce: [u8; 13] = [
+            0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x08, 0x01, 0x00, 0x00, 0x00, 0x2D,
+        ];
+        let aad = b"NWK-HDR+AUX";
+        let payload = b"hello-nwk-frame";
+
+        let ct = aes_ccm_encrypt(&key, &nonce, aad, payload).expect("encrypt");
+        assert_eq!(ct.len(), payload.len() + 4);
+        let pt = aes_ccm_decrypt(&key, &nonce, aad, &ct).expect("decrypt");
+        assert_eq!(&pt[..], payload);
+    }
+
+    #[test]
+    fn tamper_rejected() {
+        let key: AesKey = [0x42; 16];
+        let nonce: [u8; 13] = [0x55; 13];
+        let aad = b"aad";
+        let payload = b"abcd1234";
+
+        let mut ct = aes_ccm_encrypt(&key, &nonce, aad, payload).unwrap();
+        ct[0] ^= 0x01; // flip a bit in ciphertext
+        assert!(aes_ccm_decrypt(&key, &nonce, aad, &ct).is_none());
+    }
+
+    #[test]
+    fn no_aad_roundtrip() {
+        let key: AesKey = [0x10; 16];
+        let nonce: [u8; 13] = [0x20; 13];
+        let payload = b"no-aad-here";
+        let ct = aes_ccm_encrypt(&key, &nonce, &[], payload).unwrap();
+        let pt = aes_ccm_decrypt(&key, &nonce, &[], &ct).unwrap();
+        assert_eq!(&pt[..], payload);
+    }
 }

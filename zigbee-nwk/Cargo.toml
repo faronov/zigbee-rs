@@ -11,10 +11,15 @@ zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
 zigbee-mac = { version = "0.1.0", path = "../zigbee-mac" }
 log = "0.4"
 aes = { version = "0.8", default-features = false }
-ccm = { version = "0.5", default-features = false }
+# NOTE: dropped `ccm = "0.5"` — its `Ccm::encrypt_in_place_detached` consumes
+# ~6 KiB of stack on tc32 (TLSR8258), overflowing the 10 KiB SVC stack and
+# silently corrupting `.bss`. Replaced with a hand-rolled AES-CCM* (M=4,L=2)
+# in `src/security.rs`. Mirrors the fix already applied in `zigbee-aps`.
 rtt-target = { version = "0.6", optional = true }
 
 [features]
 default = []
 router = []
 efr32-trace = ["dep:rtt-target"]
+# Enable Telink TLSR8258 absolute-address debug markers for the NWK TX path.
+telink-debug = []
