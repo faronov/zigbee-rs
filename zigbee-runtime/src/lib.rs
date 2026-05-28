@@ -208,8 +208,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         rt_trace!("[RT] start: commission");
         let r = self.bdb.commission().await;
         rt_trace!("[RT] bdb_comm={}", if r.is_ok() { "ok" } else { "ERR" });
-        if r.is_err() {
-            return Err(event_loop::StartError::CommissioningFailed);
+        if let Err(status) = r {
+            return Err(event_loop::StartError::CommissioningFailed(status));
         }
         rt_trace!("[RT] start: finish");
         self.finish_join()

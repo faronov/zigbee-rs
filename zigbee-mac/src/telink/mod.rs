@@ -55,10 +55,10 @@ const ACK_WAIT_US: u64 = 1500;
 const ASSOC_RESPONSE_WAIT_MS: u64 = 3000;
 
 /// RX indication timeout in milliseconds.
-const RX_INDICATION_TIMEOUT_MS: u64 = 5000;
+const RX_INDICATION_TIMEOUT_MS: u64 = 1000;
 
 /// Poll response wait timeout in milliseconds.
-const POLL_RESPONSE_WAIT_MS: u64 = 500;
+const POLL_RESPONSE_WAIT_MS: u64 = 200;
 
 /// Maximum number of frames in the indirect TX queue (for coordinator role).
 const INDIRECT_QUEUE_SIZE: usize = 8;

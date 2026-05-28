@@ -116,8 +116,8 @@ pub enum TickResult {
 pub enum StartError {
     /// BDB initialization failed.
     InitFailed,
-    /// BDB commissioning (steering/formation) failed.
-    CommissioningFailed,
+    /// BDB commissioning (steering/formation) failed, with BDB status code.
+    CommissioningFailed(zigbee_bdb::BdbStatus),
 }
 
 /// Run one iteration of the Zigbee stack event loop.
