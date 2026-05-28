@@ -14,6 +14,89 @@ use crate::discovery::*;
 use crate::network_mgmt::*;
 use crate::{ZDO_ENDPOINT, ZdoError, ZdoLayer, ZdpStatus};
 
+// ── Telink-only debug instrumentation ───────────────────────────
+//
+// When `telink-debug` is enabled, the ZDO dispatcher records every
+// incoming ZDP cluster into the BDB SRAM region at 0x0084F450 so we
+// can observe the post-join interview from a memory dump.
+//
+//   BDB+0x1A0..+0x1BF  Ring of 4 ZDO RX events, 8 bytes each:
+//                        word0 = (cluster_id<<16) | tsn
+//                        word1 = (src_endpoint<<16) | src_short
+//                      Ring head index is implicit (count mod 4).
+//   BDB+0x1C0  NODE_DESC_REQ  (0x0002) count
+//   BDB+0x1C4  ACTIVE_EP_REQ  (0x0005) count
+//   BDB+0x1C8  SIMPLE_DESC_REQ(0x0004) count
+//   BDB+0x1CC  handle_indication entries (total ZDO RX seen)
+//   BDB+0x1D0  send_zdp_unicast invocations (ZDO TX responses)
+// ----------------------------------------------------------------
+#[cfg(feature = "telink-debug")]
+mod tlnk_dbg {
+    pub const BASE: u32 = 0x0084_F450;
+
+    #[inline(always)]
+    pub fn bump(off: u32) {
+        unsafe {
+            let p = (BASE + off) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+        }
+    }
+    #[inline(always)]
+    pub fn set(off: u32, val: u32) {
+        unsafe {
+            core::ptr::write_volatile((BASE + off) as *mut u32, val);
+        }
+    }
+    /// Push a (cluster, tsn, src_endpoint, src_short) event into the 4-slot
+    /// ring at BDB+0x1A0..+0x1BF. Ring index is derived from the running
+    /// counter at BDB+0x1CC.
+    #[inline(always)]
+    pub fn ring_push(cluster: u16, tsn: u8, src_ep: u8, src_short: u16) {
+        unsafe {
+            let cnt_p = (BASE + 0x1CC) as *mut u32;
+            let cnt = core::ptr::read_volatile(cnt_p);
+            let slot = (cnt as usize & 0x3) * 8; // 0,8,16,24
+            let base = BASE + 0x1A0 + slot as u32;
+            let w0 = ((cluster as u32) << 16) | (tsn as u32);
+            let w1 = ((src_ep as u32) << 16) | (src_short as u32);
+            core::ptr::write_volatile(base as *mut u32, w0);
+            core::ptr::write_volatile((base + 4) as *mut u32, w1);
+            core::ptr::write_volatile(cnt_p, cnt.wrapping_add(1));
+        }
+    }
+}
+
+#[cfg(feature = "telink-debug")]
+macro_rules! tdbg_bump {
+    ($off:expr) => { tlnk_dbg::bump($off) };
+}
+#[cfg(not(feature = "telink-debug"))]
+macro_rules! tdbg_bump {
+    ($off:expr) => {
+        ()
+    };
+}
+#[cfg(feature = "telink-debug")]
+macro_rules! tdbg_set {
+    ($off:expr, $val:expr) => { tlnk_dbg::set($off, $val) };
+}
+#[cfg(not(feature = "telink-debug"))]
+macro_rules! tdbg_set {
+    ($off:expr, $val:expr) => { () };
+}
+#[cfg(feature = "telink-debug")]
+macro_rules! tdbg_ring {
+    ($cl:expr, $tsn:expr, $ep:expr, $src:expr) => {
+        tlnk_dbg::ring_push($cl, $tsn, $ep, $src)
+    };
+}
+#[cfg(not(feature = "telink-debug"))]
+macro_rules! tdbg_ring {
+    ($cl:expr, $tsn:expr, $ep:expr, $src:expr) => {
+        ()
+    };
+}
+
 #[inline(always)]
 fn zdp_cluster_name(cluster: u16) -> &'static str {
     match cluster {
@@ -63,6 +146,15 @@ impl<M: MacDriver> ZdoLayer<M> {
             ApsAddress::Short(a) => a,
             _ => ShortAddress(0x0000),
         };
+
+        // ── Telink debug: record ZDP RX in ring + bump per-cluster counters
+        tdbg_ring!(cluster, tsn, ind.src_endpoint, src_short.0);
+        match cluster {
+            crate::NODE_DESC_REQ => tdbg_bump!(0x1C0),
+            crate::ACTIVE_EP_REQ => tdbg_bump!(0x1C4),
+            crate::SIMPLE_DESC_REQ => tdbg_bump!(0x1C8),
+            _ => {}
+        }
 
         log::info!(
             "[ZDO RX] {} cluster=0x{:04X} tsn={} from=0x{:04X} ep={}",
@@ -173,8 +265,13 @@ impl<M: MacDriver> ZdoLayer<M> {
             src_short.0,
             rsp_len
         );
-        self.send_zdp_unicast(src_short, rsp_cluster, &rsp_buf[..rsp_len])
-            .await
+        tdbg_bump!(0x1D0); // BDB+0x1D0: ZDO TX response count
+        let tx_result = self.send_zdp_unicast(src_short, rsp_cluster, &rsp_buf[..rsp_len])
+            .await;
+        if tx_result.is_err() {
+            tdbg_bump!(0x1F0); // BDB+0x1F0: ZDO TX failures
+        }
+        tx_result
     }
 }
 
