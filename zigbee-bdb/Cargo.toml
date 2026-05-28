@@ -19,3 +19,7 @@ rtt-target = { version = "0.6", optional = true }
 
 [features]
 efr32-trace = ["dep:rtt-target"]
+# Telink TLSR8258 debug — writes counters to a known SRAM region
+# (0x0084F450..0x0084F500) so a host-side flash dump can decode them.
+# Safe to leave off on other targets — gates ALL writes.
+telink-debug = []
