@@ -94,14 +94,27 @@ SECTIONS
      * 0x0084B000 with all cluster MaybeUninit slots, so the prior hard-coded
      * 0x0084B000 SVC top left <1 KiB of usable stack before corrupting .bss.
      *
-     *   SVC stack:  _svc_stack_bottom (0x0084C000) .. _svc_stack_top (0x0084E000)   [8 KiB]
+     *   SVC stack:  _svc_stack_bottom (0x0084B400) .. _svc_stack_top (0x0084E000)   [11 KiB]
      *   IRQ stack:  _irq_stack_bottom (0x0084E000) .. _irq_stack_top (0x0084F000)   [4 KiB]
      * Debug SRAM sits at 0x0084F000+, so the IRQ stack abuts it from below.
+     *
+     * NOTE: stack was 8 KiB (bottom=0x0084C000) and the SVC high-water mark
+     * (painted-pattern scan recorded at MODE+0x1AC) showed full 8 KiB
+     * occupancy — i.e., a SINGLE-WORD safety margin away from clobbering
+     * .bss. That correlates with the observed `aes_ccm_decrypt` hang during
+     * BDB Transport-Key wait: when BDB ran multiple TC-link-key tries the
+     * descending stack briefly punched into NwkSecurity state in .bss,
+     * leaving the RustCrypto `ccm` crate spinning on corrupt context. The
+     * stack was grown to 11 KiB so even the deepest async/BDB call paths
+     * stay within budget.
+     *
+     * _ebss after the runtime-sensor build sits at 0x0084B224; the assert
+     * below catches any future growth that would re-collide.
      *
      * The reset/IRQ asm initialises SP from these symbols so the linker
      * remains the single source of truth for stack placement.
      */
-    _svc_stack_bottom = 0x0084C000;
+    _svc_stack_bottom = 0x0084B400;
     _svc_stack_top    = 0x0084E000;
     _irq_stack_bottom = 0x0084E000;
     _irq_stack_top    = 0x0084F000;

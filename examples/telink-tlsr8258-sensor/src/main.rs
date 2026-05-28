@@ -37,7 +37,25 @@ compile_error!(
      build with `--no-default-features --features diag-smoke`"
 );
 
-use panic_halt as _;
+// Custom panic handler that records a panic-sentinel in SRAM so we can detect
+// silent panics via the dump tool. Writes:
+//   DBG_MODE_BASE + 0xF8 = 0xDEAD_BEEF (panic-was-here)
+//   DBG_MODE_BASE + 0xFC = LR (caller's return address ≈ panic site)
+// Then spins forever. SRAM is preserved on the no-reset SWire dump.
+#[panic_handler]
+fn panic_handler(_info: &core::panic::PanicInfo) -> ! {
+    let lr: u32;
+    unsafe {
+        core::arch::asm!("mov {0}, lr", out(reg) lr);
+        core::ptr::write_volatile(0x0084F1F8 as *mut u32, 0xDEAD_BEEF);
+        core::ptr::write_volatile(0x0084F1FC as *mut u32, lr);
+    }
+    loop {
+        unsafe {
+            core::arch::asm!("nop");
+        }
+    }
+}
 
 #[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
 use core::mem::MaybeUninit;
@@ -109,6 +127,35 @@ const DBG_MODE_BASE: u32 = 0x0084F100;
 //   +0x290  data-req parse_assoc_response Some(short_addr) | 0xCAFE_0000
 //   +0x294  mlme_associate final outcome: 0xC0DE_xxxx (success) | 0xDEAD_xxxx (fail)
 const DBG_JOIN_BASE: u32 = 0x0084F100 + 0x250;
+/// BDB-side debug region (must match `zigbee_bdb::steering::tlnk_dbg::BASE`).
+/// We write MAC-layer observations into this region from the MAC backend so
+/// the BDB and MAC views can be cross-correlated in a single dump.
+const DBG_BDB_BASE: u32 = 0x0084_F450;
+
+// ── MAC-layer instrumentation statics (used by csma_transmit / mlme_poll /
+// mlme_associate / mcps_data_indication for the "no Transport-Key arrives"
+// investigation). All accessed only from the single-threaded executor, so a
+// plain `static mut` with explicit volatile is sufficient — but we use
+// `AtomicU32`/`AtomicBool` to satisfy strict-aliasing/UB lints uniformly.
+use core::sync::atomic::{AtomicU32, Ordering};
+/// Timer0 ticks captured at the moment `mlme_associate` returns Ok. 0 = unset.
+static ASSOC_OK_TICKS: AtomicU32 = AtomicU32::new(0);
+/// 0 = first-poll delay not yet logged to BDB+0xFC; 1 = logged.
+static FIRST_POLL_LOGGED: AtomicU32 = AtomicU32::new(0);
+/// Frame_pending bit (0/1) extracted from the last matched MAC ACK.
+/// 0xFFFF_FFFF = no ACK matched since last reset.
+static LAST_ACK_FP: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
+/// Ring index for BDB+0xE0..+0xEF frame capture (0..3 wraparound).
+static FRAME_RING_IDX: AtomicU32 = AtomicU32::new(0);
+/// Raw-RX classification ring index (BDB+0x100..+0x11F).
+/// Counts every frame returned by `receive_raw` BEFORE any filter is applied.
+static RX_RAW_RING_IDX: AtomicU32 = AtomicU32::new(0);
+/// Sticky cumulative count of PAN-descriptors with `association_permit=true`
+/// observed across ALL scans during device lifetime. Published at MODE+0x1C8.
+static STICKY_PERMIT_PANS: AtomicU32 = AtomicU32::new(0);
+/// Sticky cumulative count of all PAN-descriptors seen across ALL scans.
+/// Published at MODE+0x1CC.
+static STICKY_TOTAL_PANS: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "sensor")]
 const SENSOR_NV_FLASH_ADDR: u32 = 0x0007_F000;
 #[cfg(feature = "sensor")]
@@ -473,6 +520,46 @@ fn blocking_wait_for_alarm() {
 fn mark32(addr: u32, val: u32) {
     unsafe {
         core::ptr::write_volatile(addr as *mut u32, val);
+    }
+}
+
+/// Capture a frame that was received during the assoc-wait window but was
+/// NOT an Associate Response (so we silently dropped it). Used to verify the
+/// theory that EZSP's queued Transport-Key gets consumed and dropped here.
+/// Layout (JOIN_BASE-relative):
+///   +0x160: u32 dropped-frame counter (incremented on every drop)
+///   +0x164: first-drop u32 packed = (plen<<24) | (seq<<16) | fcf
+///   +0x168..+0x178: first 16 bytes of first dropped frame (4 u32 words, LE)
+/// First-write-wins for +0x164.. so we always preserve the *first* drop.
+#[inline(never)]
+fn capture_dropped_assoc_frame(data: &[u8]) {
+    unsafe {
+        // bump counter
+        let cnt_p = (DBG_JOIN_BASE + 0x160) as *mut u32;
+        core::ptr::write_volatile(cnt_p, core::ptr::read_volatile(cnt_p).wrapping_add(1));
+        // first-write-wins for the FCF+seq+plen word
+        let hdr_p = (DBG_JOIN_BASE + 0x164) as *mut u32;
+        if core::ptr::read_volatile(hdr_p) == 0 {
+            let fcf = u16::from_le_bytes([
+                data.first().copied().unwrap_or(0),
+                data.get(1).copied().unwrap_or(0),
+            ]) as u32;
+            let seq = data.get(2).copied().unwrap_or(0) as u32;
+            let plen = data.len() as u32 & 0xFF;
+            core::ptr::write_volatile(hdr_p, (plen << 24) | (seq << 16) | fcf);
+            // also dump first 16 bytes (4 words) for full visibility
+            for i in 0u32..4 {
+                let off = (i as usize) * 4;
+                let w = u32::from_le_bytes([
+                    data.get(off).copied().unwrap_or(0),
+                    data.get(off + 1).copied().unwrap_or(0),
+                    data.get(off + 2).copied().unwrap_or(0),
+                    data.get(off + 3).copied().unwrap_or(0),
+                ]);
+                let p = (DBG_JOIN_BASE + 0x168 + i * 4) as *mut u32;
+                core::ptr::write_volatile(p, w);
+            }
+        }
     }
 }
 
@@ -1526,7 +1613,15 @@ const MAX_MAC_FRAME_LEN: usize = 127;
 const MAX_MAC_OVERHEAD: usize = 25;
 const ACK_WAIT_LOOPS: u32 = 36_000;
 const POLL_RESPONSE_LOOPS: u32 = 1_200_000;
-const RX_INDICATION_LOOPS: u32 = 12_000_000;
+// Per-call budget for `mcps_data_indication` (the BDB Phase-0 passive RX hook).
+// Each loop iteration ≈ 1 µs on TLSR8258 @24 MHz, so 1.2M ≈ ~100 ms wall-clock
+// per call. BDB Phase 0 invokes this 4× → ~400 ms total before transitioning
+// to Phase 1 (parent_poll). Previously 12_000_000 (~1 s/call → 4 s total),
+// which exceeded the TC indirect-transmission lifetime (~3 s) and caused the
+// Transport-Key to expire from the router's indirect queue before our first
+// Data Request reached the parent. Do NOT increase without re-checking the
+// assoc→first-poll latency marker at BDB+0xFC.
+const RX_INDICATION_LOOPS: u32 = 1_200_000;
 
 static mut IRQ_RX_DATA: [u8; MAX_MAC_FRAME_LEN] = [0; MAX_MAC_FRAME_LEN];
 static mut IRQ_RX_LEN: usize = 0;
@@ -1546,6 +1641,16 @@ struct RxPacket {
     len: usize,
     #[allow(dead_code)]
     rssi: i8,
+    lqi: u8,
+}
+
+/// A raw MAC frame queued during `mlme_associate` for later delivery via
+/// `mcps_data_indication`. Frames received in the assoc response windows that
+/// aren't the Associate Response itself (e.g. Transport-Key) are otherwise
+/// silently dropped after the hardware auto-ACKs them. See Step-2 plan.
+#[derive(Clone)]
+struct PendingPacket {
+    data: heapless::Vec<u8, MAX_MAC_FRAME_LEN>,
     lqi: u8,
 }
 
@@ -1575,6 +1680,9 @@ pub struct Tlsr8258Mac {
     tx_power: i8,
     response_wait_time: u8,
     beacon_payload: zigbee_mac::pib::PibPayload,
+    /// Queue of MAC frames received during `mlme_associate` that weren't the
+    /// Associate Response. Drained from the head by `mcps_data_indication`.
+    pending_rx: heapless::Deque<PendingPacket, 4>,
 }
 
 impl Tlsr8258Mac {
@@ -1609,6 +1717,55 @@ impl Tlsr8258Mac {
             tx_power: 0,
             response_wait_time: 32,
             beacon_payload: zigbee_mac::pib::PibPayload::new(),
+            pending_rx: heapless::Deque::new(),
+        }
+    }
+
+    /// Try to enqueue a MAC frame received during `mlme_associate` for later
+    /// delivery via `mcps_data_indication`. Frames are filtered by destination
+    /// address using the same rule as `mlme_poll`. Diagnostics:
+    ///  +0x180  enqueue success count
+    ///  +0x184  drain count (incremented in `mcps_data_indication`)
+    ///  +0x188  queue-overflow drop count
+    ///  +0x18C  filter-rejected drop count
+    fn maybe_enqueue_pending(&mut self, data: &[u8], lqi: u8) {
+        if data.len() < 5 {
+            return;
+        }
+        let fc = u16::from_le_bytes([data[0], data[1]]);
+        let frame_type = fc & 0x07;
+        // Only data frames carry NWK payloads (Transport-Key, link status, ...).
+        if frame_type != 1 {
+            return;
+        }
+        let Some(dst) = parse_dest_address(data, fc) else {
+            return;
+        };
+        if !address_matches(
+            &dst,
+            self.pan_id,
+            self.short_address,
+            self.extended_address,
+        ) {
+            unsafe {
+                let p = (DBG_JOIN_BASE + 0x18C) as *mut u32;
+                core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+            }
+            return;
+        }
+        let mut buf: heapless::Vec<u8, MAX_MAC_FRAME_LEN> = heapless::Vec::new();
+        if buf.extend_from_slice(data).is_err() {
+            return;
+        }
+        match self.pending_rx.push_back(PendingPacket { data: buf, lqi }) {
+            Ok(()) => unsafe {
+                let p = (DBG_JOIN_BASE + 0x180) as *mut u32;
+                core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+            },
+            Err(_) => unsafe {
+                let p = (DBG_JOIN_BASE + 0x188) as *mut u32;
+                core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+            },
         }
     }
 
@@ -1644,15 +1801,61 @@ impl Tlsr8258Mac {
         }
     }
 
-    fn receive_raw(&self, timeout_loops: u32) -> Result<RxPacket, MacError> {
-        receive_packet(
+    fn receive_raw(&mut self, timeout_loops: u32) -> Result<RxPacket, MacError> {
+        let pkt = receive_packet(
             self.rx_buf,
             timeout_loops,
             self.pan_id,
             self.short_address,
             self.extended_address,
         )
-        .ok_or(MacError::NoData)
+        .ok_or(MacError::NoData)?;
+        // Pre-filter classification. Captures EVERY frame the radio returns
+        // (post hardware-address filter, but BEFORE any software filtering
+        // in mlme_poll / mcps_data_indication). Output region:
+        //   BDB+0x100..+0x11F : 4-entry ring × 8 bytes (word A | word B)
+        //     word A = fcf_lo | (fcf_hi<<8) | (seq<<16) | (dst_pan_hi<<24)
+        //     word B = src_short | (dst_short<<16)
+        //   BDB+0x120 : count of frames with dst_short == our short
+        //   BDB+0x124 : count of broadcasts (dst_short >= 0xFFFC)
+        //   BDB+0x128 : count of other-dest frames
+        //   BDB+0x12C : count of APS frames with apsFC == 0x21 (TK candidates)
+        //   BDB+0x130 : count of sec=0 NWK frames addressed to us (the grail)
+        //   BDB+0x134 : raw receive_raw return count (pre-filter total)
+        let was_tk_candidate = classify_rx_frame(&pkt.data[..pkt.len], self.short_address.0);
+        // Pipeline counters for the TK-delivery path. Recorded at MODE+0x200..+0x20F.
+        //   MODE+0x200 : receive_raw() returned a TK candidate (sec=0 + dst==us + apsFC==0x21)
+        //   MODE+0x204 : force-enqueue success count (pushed into pending_rx here)
+        //   MODE+0x208 : force-enqueue failure (queue full / extend error)
+        //   MODE+0x20C : reserved for mcps_data_indication TK drain
+        if was_tk_candidate {
+            unsafe {
+                let p = (DBG_MODE_BASE + 0x200) as *mut u32;
+                core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+            }
+            // Force-enqueue. This bypasses the (already-passing) address filter in
+            // maybe_enqueue_pending, but uses the same queue so mcps_data_indication
+            // will drain it. If the queue is full we still count the miss.
+            let mut buf: heapless::Vec<u8, MAX_MAC_FRAME_LEN> = heapless::Vec::new();
+            if buf.extend_from_slice(&pkt.data[..pkt.len]).is_ok() {
+                match self.pending_rx.push_back(PendingPacket { data: buf, lqi: pkt.lqi }) {
+                    Ok(()) => unsafe {
+                        let p = (DBG_MODE_BASE + 0x204) as *mut u32;
+                        core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+                    },
+                    Err(_) => unsafe {
+                        let p = (DBG_MODE_BASE + 0x208) as *mut u32;
+                        core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+                    },
+                }
+            } else {
+                unsafe {
+                    let p = (DBG_MODE_BASE + 0x208) as *mut u32;
+                    core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+                }
+            }
+        }
+        Ok(pkt)
     }
 
     fn active_scan_channel(
@@ -1737,7 +1940,46 @@ impl Tlsr8258Mac {
         }
         let _ = frame.extend_from_slice(&self.extended_address);
         let _ = frame.push(0x01);
-        let _ = frame.push(capability_info.to_byte());
+        // ── Test 2 (cap-byte override) + Test 1/3 (TX capture) ──
+        // Override the cap byte to claim NON-SLEEPY (rx_on_when_idle=1,
+        // mains-powered=1, alloc_addr=1, security_capable=1). Bit map:
+        //   bit 0: alt_pan_coord  = 0
+        //   bit 1: device_type FFD= 0  (still RFD; FFD would advertise as router)
+        //   bit 2: mains_powered  = 1
+        //   bit 3: rx_on_when_idle= 1
+        //   bit 6: security_capab = 1
+        //   bit 7: allocate_addr  = 1
+        // Total: 0b1100_1100 = 0xCC.
+        // If TC unicasts TK directly when it thinks the joiner is awake
+        // ⇒ this bypasses indirect-poll entirely and we should join.
+        let cap_override: u8 = 0xCC;
+        let _ = frame.push(cap_override);
+        // Diagnostic capture: what we ACTUALLY put on the wire.
+        //   MODE+0x1E0 : the cap byte (low 8 bits)
+        //   MODE+0x1E4 : marker so we can tell the slot is set (0xCAFE_BABE)
+        //   MODE+0x1E8 : src_ext LE bytes [0..3] as TX'd
+        //   MODE+0x1EC : src_ext LE bytes [4..7] as TX'd
+        unsafe {
+            core::ptr::write_volatile(
+                (DBG_MODE_BASE + 0x1E0) as *mut u32,
+                (cap_override as u32) | ((capability_info.to_byte() as u32) << 8) | 0xCAFE_0000,
+            );
+            core::ptr::write_volatile(
+                (DBG_MODE_BASE + 0x1E4) as *mut u32,
+                0xCAFE_BABE,
+            );
+            let e = &self.extended_address;
+            let lo = (e[0] as u32)
+                | ((e[1] as u32) << 8)
+                | ((e[2] as u32) << 16)
+                | ((e[3] as u32) << 24);
+            let hi = (e[4] as u32)
+                | ((e[5] as u32) << 8)
+                | ((e[6] as u32) << 16)
+                | ((e[7] as u32) << 24);
+            core::ptr::write_volatile((DBG_MODE_BASE + 0x1E8) as *mut u32, lo);
+            core::ptr::write_volatile((DBG_MODE_BASE + 0x1EC) as *mut u32, hi);
+        }
         frame
     }
 
@@ -1935,6 +2177,13 @@ impl Tlsr8258Mac {
                         b0 | (b1 << 8) | (b2 << 16) | (b3 << 24),
                     );
                     let matched = is_ack_for(data, expected_dsn);
+                    // Capture ACK frame_pending bit (FCF byte 0, bit 4) for
+                    // the most recently matched ACK. This lets `mlme_poll`
+                    // increment BDB+0x1B8 (fp=1) vs +0x1BC (fp=0) counters.
+                    if matched {
+                        let fp = ((b0 >> 4) & 0x1) as u32;
+                        LAST_ACK_FP.store(fp, Ordering::Relaxed);
+                    }
                     if !ack_recorded {
                         ack_recorded = true;
                         mark32(
@@ -1979,6 +2228,11 @@ impl Tlsr8258Mac {
 
 impl MacDriver for Tlsr8258Mac {
     async fn mlme_scan(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
+        // Diag: count mlme_scan entries
+        unsafe {
+            let p = (DBG_JOIN_BASE + 0xCC) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+        }
         mark32(DBG_MODE_BASE + 0x60, 0x5CA10E40);
         mark32(DBG_MODE_BASE + 0x64, req.channel_mask.0);
         let timeout_loops = Self::scan_duration_loops(req.scan_duration);
@@ -2034,6 +2288,13 @@ impl MacDriver for Tlsr8258Mac {
         mark32(DBG_MODE_BASE + 0x70, pan_descriptors.len() as u32);
         mark32(DBG_MODE_BASE + 0x78, permit_joining_count);
         mark32(DBG_MODE_BASE + 0x7C, coordinator_beacon_count);
+        // Sticky cumulative counters across all scans during device lifetime.
+        let prev_total = STICKY_TOTAL_PANS.load(Ordering::Relaxed);
+        STICKY_TOTAL_PANS.store(prev_total.wrapping_add(pan_descriptors.len() as u32), Ordering::Relaxed);
+        let prev_permit = STICKY_PERMIT_PANS.load(Ordering::Relaxed);
+        STICKY_PERMIT_PANS.store(prev_permit.wrapping_add(permit_joining_count), Ordering::Relaxed);
+        mark32(DBG_MODE_BASE + 0x1C8, STICKY_PERMIT_PANS.load(Ordering::Relaxed));
+        mark32(DBG_MODE_BASE + 0x1CC, STICKY_TOTAL_PANS.load(Ordering::Relaxed));
         if matches!(req.scan_type, ScanType::Active | ScanType::Passive) && pan_descriptors.is_empty() {
             mark32(DBG_MODE_BASE + 0x74, 0x5CA1F00D);
             Err(MacError::NoBeacon)
@@ -2047,10 +2308,23 @@ impl MacDriver for Tlsr8258Mac {
         }
     }
 
+    /// Capture a frame that was received during the assoc-wait window but was
+    /// NOT an Associate Response (so we silently dropped it). Used to verify
+    /// the theory that EZSP's queued Transport-Key gets consumed and dropped
+    /// here. Layout (JOIN_BASE-relative):
+    ///   +0x160: u32 dropped-frame counter (incremented on every drop)
+    ///   +0x164: first-drop u32 packed = (plen<<24) | (seq<<16) | fcf
+    ///   +0x168..+0x178: first 16 bytes of first dropped frame (4 u32 words, LE)
+    /// First-write-wins for +0x164.. so we always preserve the *first* drop.
     async fn mlme_associate(
         &mut self,
         req: MlmeAssociateRequest,
     ) -> Result<MlmeAssociateConfirm, MacError> {
+        // Diag: count mlme_associate entries
+        unsafe {
+            let p = (DBG_JOIN_BASE + 0xC8) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+        }
         mark32(DBG_MODE_BASE + 0x50, 0xA55C0000);
         self.channel = req.channel;
         self.pan_id = req.coord_address.pan_id();
@@ -2138,7 +2412,22 @@ impl MacDriver for Tlsr8258Mac {
                         DBG_JOIN_BASE + 0x44,
                         0xC0DE_0000 | confirm.short_address.0 as u32,
                     );
+                    // Stamp assoc-OK timestamp for first-poll-delay measurement.
+                    let t = unsafe { core::ptr::read_volatile(0x0080_0630 as *const u32) };
+                    ASSOC_OK_TICKS.store(t.max(1), Ordering::Relaxed);
+                    FIRST_POLL_LOGGED.store(0, Ordering::Relaxed);
                     return Ok(confirm);
+                } else {
+                    // Not an Associate Response — capture and drop. EZSP may
+                    // have queued the Transport-Key as an indirect transaction
+                    // back-to-back with the Associate Response; if we drop it
+                    // here, the HW already auto-ACKed and the coord will not
+                    // retransmit. See Step-1 diagnosis in plan.md.
+                    capture_dropped_assoc_frame(&pkt.data[..pkt.len]);
+                    // Step 2: enqueue addressed-to-us frames so the BDB layer
+                    // can pick them up via `mcps_data_indication` once
+                    // associate returns.
+                    self.maybe_enqueue_pending(&pkt.data[..pkt.len], pkt.lqi);
                 }
             }
         }
@@ -2199,7 +2488,16 @@ impl MacDriver for Tlsr8258Mac {
                             DBG_JOIN_BASE + 0x44,
                             0xC0DE_0000 | confirm.short_address.0 as u32,
                         );
+                        // Stamp assoc-OK timestamp (data-req window).
+                        let t = unsafe { core::ptr::read_volatile(0x0080_0630 as *const u32) };
+                        ASSOC_OK_TICKS.store(t.max(1), Ordering::Relaxed);
+                        FIRST_POLL_LOGGED.store(0, Ordering::Relaxed);
                         return Ok(confirm);
+                    } else {
+                        // See note in direct-window loop above.
+                        capture_dropped_assoc_frame(data);
+                        // Step 2: enqueue addressed-to-us frames.
+                        self.maybe_enqueue_pending(data, pkt.lqi);
                     }
                 }
             }
@@ -2245,6 +2543,11 @@ impl MacDriver for Tlsr8258Mac {
     }
 
     async fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
+        // Diag: count mlme_reset (BDB calls this between candidate attempts)
+        unsafe {
+            let p = (DBG_JOIN_BASE + 0xC0) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+        }
         if set_default_pib {
             self.short_address = zigbee_types::ShortAddress::BROADCAST;
             self.pan_id = zigbee_types::PanId::BROADCAST;
@@ -2298,6 +2601,11 @@ impl MacDriver for Tlsr8258Mac {
     }
 
     async fn mlme_set(&mut self, attr: zigbee_mac::PibAttribute, val: zigbee_mac::PibValue) -> Result<(), MacError> {
+        // Diag: count mlme_set calls (BDB calls this many times during steering)
+        unsafe {
+            let p = (DBG_JOIN_BASE + 0xC4) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+        }
         use zigbee_mac::PibAttribute::*;
         use zigbee_mac::PibValue;
 
@@ -2341,20 +2649,87 @@ impl MacDriver for Tlsr8258Mac {
         }
         let parent = zigbee_types::MacAddress::Short(self.pan_id, self.coord_short_address);
         let data_req = self.build_data_request(&parent);
-        self.csma_transmit(&data_req, true)?;
 
+        // ── Parent identity capture (LAST-write-wins) ──
+        // MODE+0x1D0: parent NWK short (the address we send Data Requests to).
+        //             Expect this to match the parent_address learned by NWK
+        //             during nlme_join (BDB+0xAC, frame-ring src). If it shows
+        //             0x0000 then mlme_associate was passed the coord, not the
+        //             router that actually accepted us — and the TC's TK relay
+        //             will never reach us.
+        // MODE+0x1D4: parent IEEE low  word (coord_extended_address[0..4] LE)
+        // MODE+0x1D8: parent IEEE high word (coord_extended_address[4..8] LE)
+        unsafe {
+            core::ptr::write_volatile(
+                (DBG_MODE_BASE + 0x1D0) as *mut u32,
+                self.coord_short_address.0 as u32,
+            );
+            let e = &self.coord_extended_address;
+            let lo = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+            let hi = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
+            core::ptr::write_volatile((DBG_MODE_BASE + 0x1D4) as *mut u32, lo);
+            core::ptr::write_volatile((DBG_MODE_BASE + 0x1D8) as *mut u32, hi);
+        }
+
+        // ── Polling / ACK frame_pending instrumentation ──
+        // MODE+0x1B4: Data Request TX attempts (counted before csma_transmit)
+        // MODE+0x1B8: ACK observed with frame_pending=1 (parent has data for us)
+        // MODE+0x1BC: ACK observed with frame_pending=0 (parent has nothing)
+        // BDB+0xFC : (assoc-OK → first poll TX) delay, in milliseconds
+        unsafe {
+            let p = (DBG_MODE_BASE + 0x1B4) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+        }
+        if FIRST_POLL_LOGGED.load(Ordering::Relaxed) == 0 {
+            let assoc_t = ASSOC_OK_TICKS.load(Ordering::Relaxed);
+            if assoc_t != 0 {
+                let now = unsafe { core::ptr::read_volatile(0x0080_0630 as *const u32) };
+                let delta_ticks = now.wrapping_sub(assoc_t);
+                // 24 MHz tick → ms; cap to u32 max.
+                let delta_ms = delta_ticks / 24_000;
+                unsafe {
+                    core::ptr::write_volatile((DBG_BDB_BASE + 0xFC) as *mut u32, delta_ms);
+                }
+                FIRST_POLL_LOGGED.store(1, Ordering::Relaxed);
+            }
+        }
+
+        // Reset the ACK-fp sentinel so we only credit fp counters for an ACK
+        // observed during *this* csma call (not a stale one from before).
+        LAST_ACK_FP.store(0xFFFF_FFFF, Ordering::Relaxed);
+        let tx_res = self.csma_transmit(&data_req, true);
+        let fp = LAST_ACK_FP.load(Ordering::Relaxed);
+        if fp == 1 {
+            unsafe {
+                let p = (DBG_MODE_BASE + 0x1B8) as *mut u32;
+                core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+            }
+        } else if fp == 0 {
+            unsafe {
+                let p = (DBG_MODE_BASE + 0x1BC) as *mut u32;
+                core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+            }
+        }
+        tx_res?;
+
+        let mut frames_in_loop: u32 = 0;
+        let mut filtered_out: u32 = 0;
         for _ in 0..8 {
             match self.receive_raw(POLL_RESPONSE_LOOPS / 8) {
                 Ok(pkt) => {
                 let data = &pkt.data[..pkt.len];
+                frames_in_loop = frames_in_loop.wrapping_add(1);
                 if data.len() < 5 {
+                    filtered_out = filtered_out.wrapping_add(1);
                     continue;
                 }
                 let fc = u16::from_le_bytes([data[0], data[1]]);
                 if fc & 0x07 != 1 {
+                    filtered_out = filtered_out.wrapping_add(1);
                     continue;
                 }
                 let Some(dst) = parse_dest_address(data, fc) else {
+                    filtered_out = filtered_out.wrapping_add(1);
                     continue;
                 };
                 if !address_matches(
@@ -2363,24 +2738,173 @@ impl MacDriver for Tlsr8258Mac {
                     self.short_address,
                     self.extended_address,
                 ) {
+                    filtered_out = filtered_out.wrapping_add(1);
                     continue;
                 }
                 let header_len = 3 + addressing_size(fc);
                 if data.len() <= header_len {
+                    filtered_out = filtered_out.wrapping_add(1);
                     continue;
                 }
+                    // Diag: capture this frame BEFORE returning. This is the
+                    // payload BDB will see (after the MAC header is stripped).
+                    let payload = &data[header_len..];
+                    let plen = payload.len() as u32;
+                    let p0 = payload.first().copied().unwrap_or(0) as u32;
+                    let p1 = payload.get(1).copied().unwrap_or(0) as u32;
+                    let p2 = payload.get(2).copied().unwrap_or(0) as u32;
+                    let p3 = payload.get(3).copied().unwrap_or(0) as u32;
+                    let p4 = payload.get(4).copied().unwrap_or(0) as u32;
+                    let p5 = payload.get(5).copied().unwrap_or(0) as u32;
+                    let p6 = payload.get(6).copied().unwrap_or(0) as u32;
+                    let p7 = payload.get(7).copied().unwrap_or(0) as u32;
+                    unsafe {
+                        let cnt_p = (DBG_JOIN_BASE + 0x60) as *mut u32;
+                        let cnt = core::ptr::read_volatile(cnt_p).wrapping_add(1);
+                        core::ptr::write_volatile(cnt_p, cnt);
+                        // First-frame slot only if not yet set.
+                        let first_p = (DBG_JOIN_BASE + 0x68) as *mut u32;
+                        if core::ptr::read_volatile(first_p) == 0 {
+                            core::ptr::write_volatile(first_p, (plen << 24) | (fc as u32));
+                            core::ptr::write_volatile(
+                                (DBG_JOIN_BASE + 0x6C) as *mut u32,
+                                p0 | (p1 << 8) | (p2 << 16) | (p3 << 24),
+                            );
+                            core::ptr::write_volatile(
+                                (DBG_JOIN_BASE + 0x70) as *mut u32,
+                                p4 | (p5 << 8) | (p6 << 16) | (p7 << 24),
+                            );
+                        }
+                    }
+                    // Always update "last frame" slot.
+                    mark32(DBG_JOIN_BASE + 0x74, (plen << 24) | (fc as u32));
+                    mark32(
+                        DBG_JOIN_BASE + 0x78,
+                        p0 | (p1 << 8) | (p2 << 16) | (p3 << 24),
+                    );
+                    mark32(
+                        DBG_JOIN_BASE + 0x7C,
+                        p4 | (p5 << 8) | (p6 << 16) | (p7 << 24),
+                    );
+
+                    // === NWK-dst-filter capture ===
+                    // The previous dump showed only one frame whose NWK
+                    // dst_short matched our short. To decode that we need
+                    // more bytes than (p0..p7). Capture the FIRST such
+                    // frame's first 32 bytes of NWK payload at +0xD0..+0xF8,
+                    // and bump counters for "to-us" and "broadcast" (0xFFFC..)
+                    // NWK dst routing buckets.
+                    if payload.len() >= 4 {
+                        let nwk_dst =
+                            u16::from_le_bytes([payload[2], payload[3]]);
+                        let our_short = self.short_address.0;
+                        unsafe {
+                            if nwk_dst == our_short && our_short != 0xFFFF {
+                                let to_us_p =
+                                    (DBG_JOIN_BASE + 0xD0) as *mut u32;
+                                core::ptr::write_volatile(
+                                    to_us_p,
+                                    core::ptr::read_volatile(to_us_p)
+                                        .wrapping_add(1),
+                                );
+                                let first_to_us =
+                                    (DBG_JOIN_BASE + 0xD8) as *mut u32;
+                                if core::ptr::read_volatile(first_to_us) == 0 {
+                                    core::ptr::write_volatile(
+                                        first_to_us,
+                                        (plen << 24) | (fc as u32),
+                                    );
+                                    // Dump first 32 bytes of payload
+                                    for i in 0..8usize {
+                                        let off = i * 4;
+                                        let b0 = payload
+                                            .get(off)
+                                            .copied()
+                                            .unwrap_or(0)
+                                            as u32;
+                                        let b1 = payload
+                                            .get(off + 1)
+                                            .copied()
+                                            .unwrap_or(0)
+                                            as u32;
+                                        let b2 = payload
+                                            .get(off + 2)
+                                            .copied()
+                                            .unwrap_or(0)
+                                            as u32;
+                                        let b3 = payload
+                                            .get(off + 3)
+                                            .copied()
+                                            .unwrap_or(0)
+                                            as u32;
+                                        let word = b0
+                                            | (b1 << 8)
+                                            | (b2 << 16)
+                                            | (b3 << 24);
+                                        let p_word = (DBG_JOIN_BASE
+                                            + 0xDC
+                                            + (i as u32 * 4))
+                                            as *mut u32;
+                                        core::ptr::write_volatile(p_word, word);
+                                    }
+                                }
+                            } else if nwk_dst >= 0xFFFC {
+                                let bcast_p =
+                                    (DBG_JOIN_BASE + 0xD4) as *mut u32;
+                                core::ptr::write_volatile(
+                                    bcast_p,
+                                    core::ptr::read_volatile(bcast_p)
+                                        .wrapping_add(1),
+                                );
+                            }
+                        }
+                    }
                     return Ok(MacFrame::from_slice(&data[header_len..]));
                 }
                 Err(MacError::NoData) => {}
                 Err(e) => return Err(e),
             }
         }
+        // No frame returned this call; bump None counter and record loop stats.
+        unsafe {
+            let none_p = (DBG_JOIN_BASE + 0x64) as *mut u32;
+            core::ptr::write_volatile(
+                none_p,
+                core::ptr::read_volatile(none_p).wrapping_add(1),
+            );
+            // Last-poll-stats: filtered_out count
+            mark32(DBG_JOIN_BASE + 0xA8, (frames_in_loop << 16) | (filtered_out & 0xFFFF));
+        }
         Ok(None)
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
+        // Diag: count BDB-side calls into mcps_data (TX path used by NWK announce, etc.)
+        unsafe {
+            let p = (DBG_JOIN_BASE + 0xB0) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+            // Capture destination short/ext low bytes
+            let dst_lo: u32 = match &req.dst_address {
+                zigbee_types::MacAddress::Short(_, s) => s.0 as u32,
+                zigbee_types::MacAddress::Extended(_, e) => {
+                    (e[0] as u32) | ((e[1] as u32) << 8) | ((e[2] as u32) << 16) | ((e[3] as u32) << 24)
+                }
+            };
+            mark32(DBG_JOIN_BASE + 0xB4, dst_lo);
+            // Capture payload first 4 bytes
+            let p0 = req.payload.first().copied().unwrap_or(0) as u32;
+            let p1 = req.payload.get(1).copied().unwrap_or(0) as u32;
+            let p2 = req.payload.get(2).copied().unwrap_or(0) as u32;
+            let p3 = req.payload.get(3).copied().unwrap_or(0) as u32;
+            mark32(DBG_JOIN_BASE + 0xB8, p0 | (p1 << 8) | (p2 << 16) | (p3 << 24));
+        }
         let frame = self.build_data_frame(&req.dst_address, req.payload, req.tx_options.ack_tx)?;
         self.csma_transmit(&frame, req.tx_options.ack_tx)?;
+        // Success counter
+        unsafe {
+            let p = (DBG_JOIN_BASE + 0xBC) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+        }
         Ok(McpsDataConfirm {
             msdu_handle: req.msdu_handle,
             timestamp: None,
@@ -2393,9 +2917,65 @@ impl MacDriver for Tlsr8258Mac {
             let p = (DBG_MODE_BASE + 0xC4) as *mut u32;
             core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
         }
+        // Stack high-water scan: starting at _svc_stack_bottom, walk up to
+        // find the first word that is no longer the paint sentinel. That's
+        // the deepest the stack has been since boot (or since last paint).
+        // We record (svc_top - first_non_paint) = bytes of stack used.
+        // Result lives at MODE+0x1AC. Only update if we see a NEW high water.
+        unsafe {
+            const SVC_STACK_BOTTOM: u32 = 0x0084_B400;
+            const SVC_STACK_TOP: u32 = 0x0084_E000;
+            const STACK_PAINT_PATTERN: u32 = 0xDEAD_BEEF;
+            let mut a = SVC_STACK_BOTTOM;
+            while a < SVC_STACK_TOP {
+                if core::ptr::read_volatile(a as *const u32) != STACK_PAINT_PATTERN {
+                    break;
+                }
+                a = a.wrapping_add(4);
+            }
+            let used = SVC_STACK_TOP.saturating_sub(a);
+            let p = (DBG_MODE_BASE + 0x1AC) as *mut u32;
+            let prev = core::ptr::read_volatile(p);
+            if used > prev {
+                core::ptr::write_volatile(p, used);
+            }
+        }
+        // Cap total inner iterations so that a busy channel (frames keep arriving
+        // but none match our filter) cannot livelock the call. Each receive_raw
+        // uses a small slice of the original RX_INDICATION_LOOPS budget; on
+        // exhaustion we return MacError::NoData so callers (e.g. BDB Phase 0)
+        // can iterate or move on to other steering phases.
+        const MCPS_RX_MAX_ITERS: u32 = 16;
+        const MCPS_RX_PER_ITER_LOOPS: u32 = RX_INDICATION_LOOPS / MCPS_RX_MAX_ITERS;
+        let mut rx_iters: u32 = 0;
         loop {
-            let pkt = self.receive_raw(RX_INDICATION_LOOPS)?;
-            let data = &pkt.data[..pkt.len];
+            // Step 2: drain any frame queued during `mlme_associate` first.
+            // Diagnostics: +0x184 = drain count.
+            let mut buf: heapless::Vec<u8, MAX_MAC_FRAME_LEN> = heapless::Vec::new();
+            let lqi: u8;
+            if let Some(pending) = self.pending_rx.pop_front() {
+                unsafe {
+                    let p = (DBG_JOIN_BASE + 0x184) as *mut u32;
+                    core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+                }
+                let _ = buf.extend_from_slice(&pending.data);
+                lqi = pending.lqi;
+            } else {
+                if rx_iters >= MCPS_RX_MAX_ITERS {
+                    // Budget exhausted — bump diag and return NoData so caller
+                    // can proceed instead of looping forever on filter mismatches.
+                    unsafe {
+                        let p = (DBG_JOIN_BASE + 0xA4) as *mut u32;
+                        core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+                    }
+                    return Err(MacError::NoData);
+                }
+                rx_iters = rx_iters.wrapping_add(1);
+                let pkt = self.receive_raw(MCPS_RX_PER_ITER_LOOPS)?;
+                let _ = buf.extend_from_slice(&pkt.data[..pkt.len]);
+                lqi = pkt.lqi;
+            }
+            let data = &buf[..];
             if data.len() < 5 {
                 continue;
             }
@@ -2412,6 +2992,39 @@ impl MacDriver for Tlsr8258Mac {
                 Some(addr) => addr,
                 None => continue,
             };
+            // ── MAC-layer frame capture (BDB+0xD8..+0xEF) ──
+            // Record every frame with valid src+dst into a 4-entry ring so we
+            // can see what actually arrives during the join window, regardless
+            // of whether it later passes the address filter or NWK decrypt.
+            // Slot layout: u32 = fc_u16 | (src_short_u16 << 16).
+            // Counters:
+            //   BDB+0xD8: NWK-unsecured frame count (frame_type=1 AND NWK sec=0)
+            //   BDB+0xDC: unicasts addressed to our short address
+            {
+                let src_short = match src {
+                    zigbee_types::MacAddress::Short(_, s) => s.0,
+                    zigbee_types::MacAddress::Extended(_, _) => 0xFFFEu16,
+                };
+                let slot = FRAME_RING_IDX.load(Ordering::Relaxed) & 0x3;
+                FRAME_RING_IDX.store(slot.wrapping_add(1), Ordering::Relaxed);
+                let val = (fc as u32) | ((src_short as u32) << 16);
+                unsafe {
+                    let p = (DBG_BDB_BASE + 0xE0 + slot * 4) as *mut u32;
+                    core::ptr::write_volatile(p, val);
+                }
+                // Unicast-to-us check (BDB+0xDC).
+                let our_short = self.short_address.0;
+                let is_unicast_to_us = matches!(
+                    dst,
+                    zigbee_types::MacAddress::Short(_, s) if s.0 == our_short && our_short != 0xFFFF && our_short != 0xFFFE
+                );
+                if is_unicast_to_us {
+                    unsafe {
+                        let p = (DBG_BDB_BASE + 0xDC) as *mut u32;
+                        core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+                    }
+                }
+            }
             if !self.promiscuous && !address_matches(&dst, self.pan_id, self.short_address, self.extended_address) {
                 continue;
             }
@@ -2422,11 +3035,69 @@ impl MacDriver for Tlsr8258Mac {
             if data.len() <= header_len {
                 continue;
             }
+            // BDB+0xD8: NWK-unsecured count. NWK FCF byte 1 bit 1 = security.
+            // (Zigbee NWK FCF: u16 LE; security flag at bit 9 → byte 1 bit 1.)
+            {
+                let mp = &data[header_len..];
+                if mp.len() >= 2 {
+                    let nwk_sec = (mp[1] >> 1) & 0x1;
+                    if nwk_sec == 0 {
+                        unsafe {
+                            let p = (DBG_BDB_BASE + 0xD8) as *mut u32;
+                            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+                        }
+                    }
+                }
+            }
             if let Some(payload) = MacFrame::from_slice(&data[header_len..]) {
+                // Diag: capture this frame's payload before returning.
+                let plen = payload.len() as u32;
+                let pp = payload.as_slice();
+                let p0 = pp.first().copied().unwrap_or(0) as u32;
+                let p1 = pp.get(1).copied().unwrap_or(0) as u32;
+                let p2 = pp.get(2).copied().unwrap_or(0) as u32;
+                let p3 = pp.get(3).copied().unwrap_or(0) as u32;
+                let p4 = pp.get(4).copied().unwrap_or(0) as u32;
+                let p5 = pp.get(5).copied().unwrap_or(0) as u32;
+                let p6 = pp.get(6).copied().unwrap_or(0) as u32;
+                let p7 = pp.get(7).copied().unwrap_or(0) as u32;
+                unsafe {
+                    let cnt_p = (DBG_JOIN_BASE + 0x80) as *mut u32;
+                    core::ptr::write_volatile(
+                        cnt_p,
+                        core::ptr::read_volatile(cnt_p).wrapping_add(1),
+                    );
+                    let first_p = (DBG_JOIN_BASE + 0x84) as *mut u32;
+                    if core::ptr::read_volatile(first_p) == 0 {
+                        core::ptr::write_volatile(first_p, (plen << 24) | (fc as u32));
+                        core::ptr::write_volatile(
+                            (DBG_JOIN_BASE + 0x88) as *mut u32,
+                            p0 | (p1 << 8) | (p2 << 16) | (p3 << 24),
+                        );
+                        core::ptr::write_volatile(
+                            (DBG_JOIN_BASE + 0x8C) as *mut u32,
+                            p4 | (p5 << 8) | (p6 << 16) | (p7 << 24),
+                        );
+                    }
+                }
+                mark32(DBG_JOIN_BASE + 0x90, (plen << 24) | (fc as u32));
+                mark32(
+                    DBG_JOIN_BASE + 0x94,
+                    p0 | (p1 << 8) | (p2 << 16) | (p3 << 24),
+                );
+                mark32(
+                    DBG_JOIN_BASE + 0x98,
+                    p4 | (p5 << 8) | (p6 << 16) | (p7 << 24),
+                );
+                // MODE+0x20C: frames returned to BDB from mcps_data_indication.
+                unsafe {
+                    let p = (DBG_MODE_BASE + 0x20C) as *mut u32;
+                    core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+                }
                 return Ok(McpsDataIndication {
                     src_address: src,
                     dst_address: dst,
-                    lqi: pkt.lqi,
+                    lqi,
                     payload,
                     security_use: (fc >> 3) & 1 != 0,
                 });
@@ -2878,6 +3549,160 @@ fn addressing_size(fc: u16) -> usize {
     size
 }
 
+/// Classify every frame returned by `receive_raw` BEFORE any filter is
+/// applied. Records into the BDB+0x100..+0x134 region:
+///   +0x100..+0x11F : 4-entry ring × 8 bytes
+///   +0x120 : dst_short == our_short  (unicast to us)
+///   +0x124 : dst_short >= 0xFFFC     (NWK/MAC broadcast)
+///   +0x128 : anything else
+///   +0x12C : APS frame with apsFC == 0x21 (TK candidate)
+///   +0x130 : NWK sec=0 AND dst_short == us (the holy grail)
+///   +0x134 : raw receive_raw return count (pre-filter)
+fn classify_rx_frame(data: &[u8], our_short: u16) -> bool {
+    let mut is_tk_candidate = false;
+    unsafe {
+        let p = (DBG_BDB_BASE + 0x134) as *mut u32;
+        core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+    }
+    if data.len() < 7 {
+        return is_tk_candidate;
+    }
+    let fc = u16::from_le_bytes([data[0], data[1]]);
+    let frame_type = fc & 0x07;
+    let dst_mode = (fc >> 10) & 0x03;
+    // Only data/cmd frames with short destination — that's everything BDB
+    // cares about. ACK/beacon just bump the raw counter and exit.
+    if (frame_type != 1 && frame_type != 3) || dst_mode != 0x02 {
+        return is_tk_candidate;
+    }
+    let seq = data[2];
+    let dst_pan_hi = data[4];
+    let dst_short = u16::from_le_bytes([data[5], data[6]]);
+    let src_mode = (fc >> 14) & 0x03;
+    let pan_compress = (fc >> 6) & 1 != 0;
+    let src_short = if src_mode == 0x02 {
+        let off = if pan_compress { 7 } else { 9 };
+        if data.len() >= off + 2 {
+            u16::from_le_bytes([data[off], data[off + 1]])
+        } else {
+            0xFFFE
+        }
+    } else {
+        0xFFFE
+    };
+
+    let slot = RX_RAW_RING_IDX.load(Ordering::Relaxed) & 0x3;
+    RX_RAW_RING_IDX.store(slot.wrapping_add(1), Ordering::Relaxed);
+    let word_a = (data[0] as u32)
+        | ((data[1] as u32) << 8)
+        | ((seq as u32) << 16)
+        | ((dst_pan_hi as u32) << 24);
+    let word_b = (src_short as u32) | ((dst_short as u32) << 16);
+    unsafe {
+        let base = DBG_BDB_BASE + 0x100 + slot * 8;
+        core::ptr::write_volatile(base as *mut u32, word_a);
+        core::ptr::write_volatile((base + 4) as *mut u32, word_b);
+    }
+
+    let our_known = our_short != 0xFFFF && our_short != 0xFFFE;
+    let is_us = our_known && dst_short == our_short;
+    let is_bcast = dst_short >= 0xFFFC;
+    unsafe {
+        let off = if is_us {
+            0x120
+        } else if is_bcast {
+            0x124
+        } else {
+            0x128
+        };
+        let p = (DBG_BDB_BASE + off) as *mut u32;
+        core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+    }
+
+    if frame_type != 1 {
+        return is_tk_candidate;
+    }
+    let header_len = 3 + addressing_size(fc);
+    if data.len() <= header_len + 1 {
+        return is_tk_candidate;
+    }
+    let nwk = &data[header_len..];
+    if nwk.len() < 2 {
+        return is_tk_candidate;
+    }
+    let nwk_fcf = u16::from_le_bytes([nwk[0], nwk[1]]);
+    let nwk_sec = (nwk_fcf >> 9) & 0x1;
+    if nwk_sec == 0 && is_us {
+        unsafe {
+            let p = (DBG_BDB_BASE + 0x130) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+            // Twin write to MODE region in the SAME unsafe block. If this
+            // ever differs from BDB+0x130, we have memory-map confusion.
+            let q = (DBG_MODE_BASE + 0x230) as *mut u32;
+            core::ptr::write_volatile(q, core::ptr::read_volatile(q).wrapping_add(1));
+        }
+        // Treat ALL sec=0 unicast data frames to us as TK candidates and
+        // force-enqueue. The actual APS classification is unreliable at this
+        // layer because Sonoff EZSP wraps the TK in Tunnel commands with
+        // varying NWK header layouts (src_ieee included → larger nhl).
+        is_tk_candidate = true;
+        // Capture first 24 bytes of the NWK payload for off-board analysis.
+        // MODE+0x210 : len (low byte) | nwk_fcf (next 16 bits)
+        // MODE+0x214..+0x22F : raw nwk bytes 0..27 (7 words)
+        unsafe {
+            let n = core::cmp::min(nwk.len(), 28);
+            let hdr = (n as u32) | ((nwk_fcf as u32) << 8);
+            let p = (DBG_MODE_BASE + 0x210) as *mut u32;
+            core::ptr::write_volatile(p, hdr);
+            for i in 0..7usize {
+                let off = i * 4;
+                let mut w: u32 = 0;
+                for b in 0..4 {
+                    if off + b < n {
+                        w |= (nwk[off + b] as u32) << (b * 8);
+                    }
+                }
+                let q = (DBG_MODE_BASE + 0x214 + (i as u32) * 4) as *mut u32;
+                core::ptr::write_volatile(q, w);
+            }
+        }
+    }
+
+    // Best-effort NWK header walk → start of APS frame.
+    // Base: FCF(2) dst(2) src(2) radius(1) seq(1) = 8B.
+    let mut nhl: usize = 8;
+    let mcast = (nwk_fcf >> 8) & 0x1;
+    let src_route = (nwk_fcf >> 10) & 0x1;
+    let dst_ieee = (nwk_fcf >> 11) & 0x1;
+    let src_ieee = (nwk_fcf >> 12) & 0x1;
+    if dst_ieee == 1 {
+        nhl += 8;
+    }
+    if src_ieee == 1 {
+        nhl += 8;
+    }
+    if mcast == 1 {
+        nhl += 1;
+    }
+    if src_route == 1 && nwk.len() > nhl {
+        let n = nwk[nhl] as usize;
+        nhl += 2 + n * 2;
+    }
+    if nwk_sec == 1 {
+        // NWK auxiliary security header: 14B for std nonce.
+        nhl += 14;
+    }
+    if nwk.len() > nhl {
+        let aps_fc = nwk[nhl];
+        if aps_fc == 0x21 {
+            unsafe {
+                let p = (DBG_BDB_BASE + 0x12C) as *mut u32;
+                core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+            }
+        }
+    }
+    is_tk_candidate
+}
 fn parse_source_address(data: &[u8], fc: u16) -> Option<zigbee_types::MacAddress> {
     let dst_mode = (fc >> 10) & 0x03;
     let src_mode = (fc >> 14) & 0x03;
@@ -3187,6 +4012,12 @@ fn scan_one(rx_buf: *mut u8, seq: u8) -> (bool, bool, u32) {
 /// `0x76000` is missing or all-FF/all-00. Stored over-the-air little-endian.
 /// Two devices ever flashed without a unique factory address will collide on
 /// this constant — flag for the smoke test.
+// IEEE = 00:12:4B:00:0C:C3:5D:9F (original Telink fallback).
+// Test B (bump to …A0) was run in session 5 and confirmed NCP stale per-IEEE
+// state is NOT the cause: the same decrypt-fail pattern reproduced exactly
+// on a fresh IEEE. Reverted to original to avoid littering ZHA's device DB
+// with abandoned …A0 entries. See plan.md "Marker map" + "Test B result"
+// for the data behind this decision.
 const OUR_EXT_ADDR_FALLBACK: [u8; 8] = [0x9F, 0x5D, 0xC3, 0x0C, 0x00, 0x4B, 0x12, 0x00];
 
 /// Telink factory information sector (per TLSR8258 stack): the 8-byte IEEE
@@ -3658,6 +4489,231 @@ const ZDP_STATUS_NO_MATCH: u8 = 0x86;
 #[cfg(feature = "sensor")]
 const SENSOR_MAC_CAPABILITY: u8 = 0x80 | 0x40 | 0x08; // Allocate address, security-capable, RX-on during join.
 
+// ── Cycle 23: Verify-Key handshake + unicast Device_annce + light MAC TX-Err counters ──
+//
+// HMAC-MMO hangs on tc32 (see derive_key_transport_key bypass), so the Verify-Key
+// hash per ZB R22 §B.1.4 (HMAC-MMO_K(M) with K=ZBA09 TC link key, M=our IEEE) is
+// precomputed offline. LE = src_ieee in LE byte order (memory layout); BE = reversed.
+//
+// Both Wireshark (epan/dissectors/packet-zbee-security.c::zbee_sec_hash) and ZBOSS
+// (zb_aes_mmo_hmac_message) feed the IEEE in LE memory order, so LE is the primary
+// candidate; BE is a hedge.
+#[cfg(feature = "sensor")]
+const VK_HASH_LE: [u8; 16] = [
+    0xB8, 0x36, 0xD6, 0xD9, 0xCC, 0xA0, 0x4C, 0xA7,
+    0xFE, 0xEC, 0xD8, 0xAD, 0x74, 0x65, 0x43, 0x80,
+];
+#[cfg(feature = "sensor")]
+const VK_HASH_BE: [u8; 16] = [
+    0xFD, 0xB3, 0xFC, 0x4D, 0x1C, 0x51, 0x2B, 0xB9,
+    0xAF, 0x2A, 0x26, 0xE2, 0x3B, 0x28, 0x8C, 0xE3,
+];
+
+#[cfg(feature = "sensor")]
+fn mac_err_code(e: MacError) -> u32 {
+    match e {
+        MacError::NoBeacon => 1,
+        MacError::InvalidParameter => 2,
+        MacError::RadioError => 3,
+        MacError::ChannelAccessFailure => 4,
+        MacError::NoAck => 5,
+        MacError::FrameTooLong => 6,
+        MacError::Unsupported => 7,
+        MacError::SecurityError => 8,
+        _ => 0xFE,
+    }
+}
+
+#[cfg(feature = "sensor")]
+fn mac_result_code(r: &Result<(), MacError>) -> u32 {
+    match r {
+        Ok(()) => 0,
+        Err(e) => 0x8000_0000 | mac_err_code(*e),
+    }
+}
+
+#[cfg(feature = "sensor")]
+fn bump_marker(addr: u32) {
+    unsafe {
+        let p = addr as *mut u32;
+        core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+    }
+}
+
+/// Bare-metal APS-Verify-Key sender.
+///
+/// Builds: NWK-secured(APS-secured(VerifyKey || src_ieee || 0x04 || hash[16]))
+/// destined for the TC (0x0000).
+///
+/// Marker layout (MODE-relative, audited free zone +0x148..+0x167):
+///   +0x148  u32 entry counter
+///   +0x14C  u32 APS-encrypt OK counter
+///   +0x150  u32 NWK-encrypt OK counter
+///   +0x154  u32 last MAC TX result (0=Ok, 0x8000_00xx=Err code)
+///   +0x158/+0x15C/+0x160  u32 per-attempt result (LE/BE/LE)
+///   +0x164  u32 ConfirmKey RX counter (bumped by handle_sensor_frame)
+///
+/// MAC-layer counters (shared with other senders, MODE+0x108..+0x117):
+///   +0x108  u32 csma_transmit entries
+///   +0x10C  u32 csma_transmit OK
+///   +0x110  u32 csma_transmit Err
+///   +0x114  u32 last csma_transmit Err code
+#[cfg(feature = "sensor")]
+#[inline(never)]
+fn send_verify_key_aps(
+    mac: &mut Tlsr8258Mac,
+    nwk_security: &mut NwkSecurity,
+    aps_security: &mut ApsSecurity,
+    nwk_frame_counter: &mut u32,
+    nwk_seq: &mut u8,
+    aps_seq: &mut u8,
+    aps_fc_out: &mut u32,
+    hash: &[u8; 16],
+) -> Result<(), MacError> {
+    bump_marker(DBG_MODE_BASE + 0x148);
+
+    // ── APS plaintext: cmd_id(1) + src_ieee(8) + key_type(1) + hash(16) = 26 B
+    let mut plain = [0u8; 26];
+    plain[0] = ApsCommandId::VerifyKey as u8;
+    plain[1..9].copy_from_slice(&mac.extended_address);
+    plain[9] = 0x04; // KEY_TYPE_TC_LINK
+    plain[10..26].copy_from_slice(hash);
+
+    // ── APS header (Command, secured, ack-requested) ──
+    let aps_counter = *aps_seq;
+    let aps_header = ApsHeader {
+        frame_control: ApsFrameControl {
+            frame_type: ApsFrameType::Command as u8,
+            delivery_mode: ApsDeliveryMode::Unicast as u8,
+            ack_format: false,
+            security: true,
+            ack_request: true,
+            extended_header: false,
+        },
+        dst_endpoint: None,
+        group_address: None,
+        cluster_id: None,
+        profile_id: None,
+        src_endpoint: None,
+        aps_counter,
+        extended_header: None,
+    };
+    *aps_seq = aps_seq.wrapping_add(1);
+
+    // ── APS aux header: ENC-MIC-32, key_id=Data(0=TC link), ext_nonce=1 ──
+    let aps_sec_hdr = ApsSecurityHeader {
+        security_control: SEC_LEVEL_ENC_MIC_32 | (KEY_ID_DATA_KEY << 3) | 0x20,
+        frame_counter: *aps_fc_out,
+        source_address: Some(mac.extended_address),
+        key_seq_number: None,
+    };
+    *aps_fc_out = aps_fc_out.wrapping_add(1);
+
+    let mut aps_buf = [0u8; 64];
+    let aps_hdr_len = aps_header.serialize(&mut aps_buf);
+    let aps_aux_len = aps_sec_hdr.serialize(&mut aps_buf[aps_hdr_len..]);
+    let aps_aad_end = aps_hdr_len + aps_aux_len;
+
+    let tc_key = *aps_security.default_tc_link_key();
+    let ct_mic = match aps_security.encrypt(&aps_buf[..aps_aad_end], &plain, &tc_key, &aps_sec_hdr) {
+        Some(ct) => ct,
+        None => {
+            mark32(DBG_MODE_BASE + 0x154, 0x5A50FF01);
+            return Err(MacError::SecurityError);
+        }
+    };
+    bump_marker(DBG_MODE_BASE + 0x14C);
+    if aps_aad_end + ct_mic.len() > aps_buf.len() {
+        return Err(MacError::FrameTooLong);
+    }
+    aps_buf[aps_aad_end..aps_aad_end + ct_mic.len()].copy_from_slice(&ct_mic);
+    let aps_total = aps_aad_end + ct_mic.len();
+
+    // ── NWK header (secured, unicast to TC) ──
+    let nwk_dst = ShortAddress(0x0000);
+    let nwk_header = NwkHeader {
+        frame_control: NwkFrameControl {
+            frame_type: NwkFrameType::Data as u8,
+            protocol_version: 0x02,
+            discover_route: 0,
+            multicast: false,
+            security: true,
+            source_route: false,
+            dst_ieee_present: false,
+            src_ieee_present: false,
+            end_device_initiator: true,
+        },
+        dst_addr: nwk_dst,
+        src_addr: mac.short_address,
+        radius: 30,
+        seq_number: *nwk_seq,
+        dst_ieee: None,
+        src_ieee: None,
+        multicast_control: None,
+        source_route: None,
+    };
+    *nwk_seq = nwk_seq.wrapping_add(1);
+
+    let key_entry = match nwk_security.active_key().cloned() {
+        Some(k) => k,
+        None => {
+            mark32(DBG_MODE_BASE + 0x154, 0x5A50FF02);
+            return Err(MacError::SecurityError);
+        }
+    };
+    let nwk_sec_hdr = NwkSecurityHeader {
+        security_control: NwkSecurityHeader::ZIGBEE_DEFAULT,
+        frame_counter: *nwk_frame_counter,
+        source_address: mac.extended_address,
+        key_seq_number: key_entry.seq_number,
+    };
+    bump_nwk_counter(&*mac, &*nwk_security, nwk_frame_counter);
+
+    let mut frame_buf = [0u8; 128];
+    let nwk_len = nwk_header.serialize(&mut frame_buf);
+    let nwk_aux_len = nwk_sec_hdr.serialize(&mut frame_buf[nwk_len..]);
+    let nwk_aad_end = nwk_len + nwk_aux_len;
+    let nwk_ct = match nwk_security.encrypt(
+        &frame_buf[..nwk_aad_end],
+        &aps_buf[..aps_total],
+        &key_entry.key,
+        &nwk_sec_hdr,
+    ) {
+        Some(ct) => ct,
+        None => {
+            mark32(DBG_MODE_BASE + 0x154, 0x5A50FF03);
+            return Err(MacError::SecurityError);
+        }
+    };
+    bump_marker(DBG_MODE_BASE + 0x150);
+    if nwk_aad_end + nwk_ct.len() > frame_buf.len() {
+        return Err(MacError::FrameTooLong);
+    }
+    frame_buf[nwk_aad_end..nwk_aad_end + nwk_ct.len()].copy_from_slice(&nwk_ct);
+    // Clear NWK FCF security-level bits on the wire (per spec they are transmitted as 0).
+    frame_buf[nwk_len] &= !0x07;
+    let total = nwk_aad_end + nwk_ct.len();
+
+    let next_hop = mac_next_hop_for_nwk_dst(mac, nwk_dst);
+    let frame = mac.build_data_frame(
+        &MacAddress::Short(mac.pan_id, next_hop),
+        &frame_buf[..total],
+        true,
+    )?;
+
+    bump_marker(DBG_MODE_BASE + 0x108);
+    let tx = mac.csma_transmit(&frame, true);
+    let code = mac_result_code(&tx);
+    mark32(DBG_MODE_BASE + 0x154, code);
+    if tx.is_ok() {
+        bump_marker(DBG_MODE_BASE + 0x10C);
+    } else {
+        bump_marker(DBG_MODE_BASE + 0x110);
+        mark32(DBG_MODE_BASE + 0x114, code);
+    }
+    tx
+}
+
 #[cfg(feature = "sensor")]
 #[inline(never)]
 async fn send_device_annce(
@@ -3667,6 +4723,7 @@ async fn send_device_annce(
     nwk_seq: &mut u8,
     aps_seq: &mut u8,
     zdo_seq: &mut u8,
+    dst: ShortAddress,
 ) -> Result<(), MacError> {
     let annce = DeviceAnnounce {
         nwk_addr: mac.short_address,
@@ -3679,7 +4736,8 @@ async fn send_device_annce(
     *zdo_seq = zdo_seq.wrapping_add(1);
     let _ = annce.serialize(&mut zdp_payload[1..]);
 
-    let nwk_dst = ShortAddress(0xFFFD);
+    let nwk_dst = dst;
+    let is_broadcast = nwk_dst.0 >= 0xFFFC;
     let nwk_header = NwkHeader {
         frame_control: NwkFrameControl {
             frame_type: NwkFrameType::Data as u8,
@@ -3706,7 +4764,11 @@ async fn send_device_annce(
     let aps_header = ApsHeader {
         frame_control: ApsFrameControl {
             frame_type: ApsFrameType::Data as u8,
-            delivery_mode: ApsDeliveryMode::Broadcast as u8,
+            delivery_mode: if is_broadcast {
+                ApsDeliveryMode::Broadcast as u8
+            } else {
+                ApsDeliveryMode::Unicast as u8
+            },
             ack_format: false,
             security: false,
             ack_request: false,
@@ -4863,6 +5925,22 @@ fn handle_sensor_frame(
                 mark32(DBG_MODE_BASE + 0xBC, 0xA75C0500);
                 install_transport_key(&payload[1..], &*mac, nwk_security, nwk_frame_counter);
             }
+            Some(ApsCommandId::ConfirmKey) => {
+                // Cycle 23: TC accepted our Verify-Key. ZHA should now register the device.
+                mark32(DBG_MODE_BASE + 0xBC, 0xA75C0010);
+                bump_marker(DBG_MODE_BASE + 0x164);
+                // Capture first byte of ConfirmKey payload (status) into low half of marker.
+                if payload.len() > 1 {
+                    let p = (DBG_MODE_BASE + 0x164) as *mut u32;
+                    unsafe {
+                        let prev = core::ptr::read_volatile(p);
+                        core::ptr::write_volatile(
+                            p,
+                            (prev & 0xFFFF_0000) | (payload[1] as u32) | ((payload.len() as u32) << 8),
+                        );
+                    }
+                }
+            }
             Some(cmd) => {
                 mark32(DBG_MODE_BASE + 0xBC, 0xA75C0000 | cmd as u32);
             }
@@ -5208,6 +6286,7 @@ fn sensor_main() -> ! {
                         let persisted_frame_counter =
                             load_persisted_network_state(&mut nwk_security);
                         let mut aps_security = ApsSecurity::new();
+                        let mut aps_fc_out: u32 = 1; // Cycle 23: outgoing APS frame counter for TC link key
                         let mut nwk_frame_counter = persisted_frame_counter
                             .as_ref()
                             .map(|s| s.frame_counter)
@@ -5236,6 +6315,7 @@ fn sensor_main() -> ! {
                                 &mut nwk_seq,
                                 &mut aps_seq,
                                 &mut zdo_seq,
+                                ShortAddress(0xFFFD),
                             ));
                             mark32(DBG_MODE_BASE + 0x2C, 0x53E5A002);
                             mark32(DBG_MODE_BASE + 0x28, 0x53E50029);
@@ -5265,19 +6345,101 @@ fn sensor_main() -> ! {
                             mark32(DBG_MODE_BASE + 0x28, 0x53E50228);
                         }
 
-                        announced = executor::block_on(send_device_annce(
+                        // ── Cycle 23: post-TK announce + Verify-Key handshake ──
+                        // Step 1: broadcast Device_annce (0xFFFD)
+                        bump_marker(DBG_MODE_BASE + 0x128);
+                        let da_bcast = executor::block_on(send_device_annce(
                             &mut mac,
                             &mut nwk_security,
                             &mut nwk_frame_counter,
                             &mut nwk_seq,
                             &mut aps_seq,
                             &mut zdo_seq,
+                            ShortAddress(0xFFFD),
                         ))
                         .is_ok();
+                        if da_bcast { bump_marker(DBG_MODE_BASE + 0x12C); }
+                        announced = da_bcast;
                         mark32(
                             DBG_MODE_BASE + 0x28,
                             if announced { 0x53E50028 } else { 0x53E5FF28 },
                         );
+
+                        // Step 2: unicast Device_annce to TC (0x0000)
+                        bump_marker(DBG_MODE_BASE + 0x130);
+                        if executor::block_on(send_device_annce(
+                            &mut mac,
+                            &mut nwk_security,
+                            &mut nwk_frame_counter,
+                            &mut nwk_seq,
+                            &mut aps_seq,
+                            &mut zdo_seq,
+                            ShortAddress(0x0000),
+                        )).is_ok() {
+                            bump_marker(DBG_MODE_BASE + 0x134);
+                        }
+
+                        // Step 3: unicast Device_annce to parent (if not TC)
+                        let parent = mac.coord_short_address;
+                        if parent.0 != 0x0000 && parent.0 != 0xFFFF {
+                            bump_marker(DBG_MODE_BASE + 0x138);
+                            if executor::block_on(send_device_annce(
+                                &mut mac,
+                                &mut nwk_security,
+                                &mut nwk_frame_counter,
+                                &mut nwk_seq,
+                                &mut aps_seq,
+                                &mut zdo_seq,
+                                parent,
+                            )).is_ok() {
+                                bump_marker(DBG_MODE_BASE + 0x13C);
+                            }
+                        }
+
+                        // Step 4: APS Verify-Key x3 (LE / BE / LE) with 2 s spacing.
+                        // Per ZB-3.0 R22 §4.4.10, ZHA will not register the device
+                        // in its endpoint registry until the VK → ConfirmKey handshake
+                        // completes. Hashes precomputed offline; primary is LE-IEEE.
+                        for (idx, hash) in [&VK_HASH_LE, &VK_HASH_BE, &VK_HASH_LE]
+                            .iter()
+                            .enumerate()
+                        {
+                            let res = send_verify_key_aps(
+                                &mut mac,
+                                &mut nwk_security,
+                                &mut aps_security,
+                                &mut nwk_frame_counter,
+                                &mut nwk_seq,
+                                &mut aps_seq,
+                                &mut aps_fc_out,
+                                hash,
+                            );
+                            let slot = match idx {
+                                0 => DBG_MODE_BASE + 0x158,
+                                1 => DBG_MODE_BASE + 0x15C,
+                                _ => DBG_MODE_BASE + 0x160,
+                            };
+                            mark32(slot, mac_result_code(&res));
+                            // Drain any inbound frames (ConfirmKey may arrive immediately).
+                            for _ in 0..16 {
+                                if let Ok(indication) =
+                                    executor::block_on(mac.mcps_data_indication())
+                                {
+                                    let _ = handle_sensor_frame(
+                                        &mut mac,
+                                        &mut nwk_security,
+                                        &mut aps_security,
+                                        &indication.payload,
+                                        &mut nwk_seq,
+                                        &mut aps_seq,
+                                        &mut nwk_frame_counter,
+                                    );
+                                } else {
+                                    break;
+                                }
+                            }
+                            executor::block_on(async_timer::delay_ms(2000));
+                        }
 
                         loop {
                             announce_polls = announce_polls.wrapping_add(1);
@@ -5333,6 +6495,7 @@ fn sensor_main() -> ! {
                                     &mut nwk_seq,
                                     &mut aps_seq,
                                     &mut zdo_seq,
+                                    ShortAddress(0xFFFD),
                                 ))
                                 .is_ok();
                                 mark32(
@@ -5350,6 +6513,7 @@ fn sensor_main() -> ! {
                                         &mut nwk_seq,
                                         &mut aps_seq,
                                         &mut zdo_seq,
+                                        ShortAddress(0xFFFD),
                                     ));
                                 }
                             }
@@ -5480,19 +6644,85 @@ fn runtime_sensor_main() -> ! {
     // corrupts bdb.attributes (observed: commissioning_mode flips from 0x02
     // → 0xC0, cap from 0x0B → 0xD1).
     mark32(DBG_MODE_BASE + 0x40, 0x53AA_0100);
-    match executor::block_on(device.start()) {
-        Ok(addr) => {
-            mark32(DBG_MODE_BASE + 0x1A0, 0x53AA_0200);
-            mark32(DBG_MODE_BASE + 0x1A4, addr as u32);
-        }
-        Err(StartError::InitFailed) => {
-            mark32(DBG_MODE_BASE + 0x1A0, 0x53AA_FA10);
-        }
-        Err(StartError::CommissioningFailed(status)) => {
-            mark32(DBG_MODE_BASE + 0x1A0, 0x53AA_FA00 | status as u32);
+    // Pre-sentinel: confirm start() either returns (overwriting this) or is stuck.
+    mark32(DBG_MODE_BASE + 0x1A0, 0xBA50_0000);
+    // Bounded retry loop around device.start() — early scans can race a
+    // late-arriving permit-join broadcast on the coordinator and return
+    // SteeringFailure. Retry up to 10 times with 5s sleep between attempts.
+    // On Ok: stamp success at MODE+0x1A0 and break.
+    // On Err: capture last raw status at MODE+0x1C0, bump attempt count at
+    // MODE+0x1C4. InitFailed is not retried (hardware/init bug).
+    let mut start_addr: Option<u16> = None;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts = attempts.wrapping_add(1);
+        mark32(DBG_MODE_BASE + 0x1C4, attempts);
+        match executor::block_on(device.start()) {
+            Ok(addr) => {
+                mark32(DBG_MODE_BASE + 0x1A0, 0x53AA_0200);
+                mark32(DBG_MODE_BASE + 0x1A4, addr as u32);
+                start_addr = Some(addr);
+                break;
+            }
+            Err(StartError::InitFailed) => {
+                mark32(DBG_MODE_BASE + 0x1C0, 0xFA10_0000);
+                mark32(DBG_MODE_BASE + 0x1A0, 0x53AA_FA10);
+                break;
+            }
+            Err(StartError::CommissioningFailed(status)) => {
+                let raw = status as u32;
+                mark32(DBG_MODE_BASE + 0x1C0, 0xFA00_0000 | raw);
+                if attempts >= 10 {
+                    mark32(DBG_MODE_BASE + 0x1A0, 0x53AA_FA00 | raw);
+                    break;
+                }
+                // Wait 5s before next attempt so a late permit-join broadcast
+                // has time to propagate to the coordinator-side beacon flag.
+                delay_ms(5000);
+            }
         }
     }
+    let _ = start_addr;
     mark32(DBG_MODE_BASE + 0x30, 0x52540015);
+
+    // ---- Manual Device_annce fallback ----------------------------------
+    // start() reported success (MODE+0x1A0 = 0x53AA_0200) but our previous
+    // dump showed BDB+0x1D4 = 0, i.e. the steering FSM's Device_annce TX
+    // (steering.rs ≈ line 643) was never executed. Without Device_annce the
+    // coordinator never adds us to its routing tables and ZHA never sees us.
+    //
+    // Retry up to 5× with 2 s spacing; failures here are non-fatal — the
+    // tick() loop has its own periodic retry that may succeed later.
+    //
+    // Markers:
+    //   MODE+0x50 = attempt count
+    //   MODE+0x54 = 0x53E5_AC00 when broadcast accepted by NWK
+    //   MODE+0x58 = 0xDEAD_0000 | ZdpStatus on error (last error wins)
+    //   MODE+0x5C = 0x5EE0_AC00 if any attempt succeeded
+    {
+        let mut dann_attempts: u32 = 0;
+        let mut dann_ok = false;
+        while dann_attempts < 5 {
+            dann_attempts = dann_attempts.wrapping_add(1);
+            mark32(DBG_MODE_BASE + 0x50, dann_attempts);
+            match executor::block_on(device.send_device_annce()) {
+                Ok(()) => {
+                    mark32(DBG_MODE_BASE + 0x54, 0x53E5_AC00);
+                    dann_ok = true;
+                    break;
+                }
+                Err(e) => {
+                    mark32(DBG_MODE_BASE + 0x58, 0xDEAD_0000 | ((e as u8) as u32));
+                }
+            }
+            delay_ms(2000);
+        }
+        if dann_ok {
+            mark32(DBG_MODE_BASE + 0x5C, 0x5EE0_AC00);
+        }
+    }
+    // --------------------------------------------------------------------
+
     let mut clusters = [
         ClusterRef {
             endpoint: 1,
@@ -5619,10 +6849,60 @@ fn main_loop() -> ! {
     // Clear the full diagnostic SRAM window. TLSR8258 does NOT zero SRAM on
     // soft reset, so without this every dump is a superposition of markers
     // from this boot and from all previous boots since power-on, making any
-    // diagnosis unreliable. 192 words = 768 bytes covers all current marker
-    // writers (including DBG_JOIN_BASE at +0x250..+0x294).
-    clear_words(DBG_MODE_BASE, 192);
+    // diagnosis unreliable. 384 words = 1536 bytes covers DBG_MODE_BASE
+    // through DBG_MODE_BASE+0x5FF, including BDB tlnk_dbg at 0x0084_F450
+    // +0x00..+0xFF (= MODE_BASE+0x350..+0x44F). Previously 256 words (1024B)
+    // stopped at 0x84F500, leaving BDB +0xB0..+0xFF uncleared and producing
+    // garbage in last-frame-wins markers like +0xC0/+0xC4.
+    // Cycle 22: bumped 384 -> 416 words (1536 -> 1664 B) to extend the cleared
+    // window to 0x0084_F100..0x0084_F740, covering the CCM* intermediate trace
+    // region at BDB+0x270..+0x2DF (0x0084_F6C0..0x0084_F72F) and its one-shot
+    // guard at BDB+0x2D8.
+    clear_words(DBG_MODE_BASE, 416);
+    // Cycle 22: clear raw_dec_full capture region (0x0084_FB80..+0xD0 = 52 u32)
+    // so its slot counter starts at 0 and magic word starts unset. Two 96-byte
+    // slots hold full ciphertext+MIC (≤50 B) for offline AES-CCM* MIC verify.
+    clear_words(0x0084_FB80, 52);
+    // Cycle 22: also clear raw_frame_dbg region (0x0084_FA80..+0x80 = 32 u32)
+    // so its first-frame-wins magic word starts unset on a cold boot.
+    clear_words(0x0084_FA80, 32);
+    // Also clear NWK TX wire-capture region (0x0084_FB00..+0x70 = 28 u32) so
+    // the first-call guard at +0x60 starts at 0 (== "not yet captured").
+    clear_words(0x0084_FB00, 28);
     mark32(DBG_MODE_BASE + 0x00, 0xD1A60000);
+
+    // ── Stack high-water instrumentation ──────────────────────────────────
+    // Paint the unused portion of the SVC stack with a sentinel so we can
+    // later scan upward from `_svc_stack_bottom` to find the deepest point
+    // the stack has ever reached (= first non-sentinel word). The scan and
+    // result write happen in `mcps_data_indication` on every entry; that
+    // covers all radio-driven call depths (including AES-CCM under BDB).
+    //
+    // SVC region per memory.x: [0x0084_C000 .. 0x0084_E000) = 8 KiB.
+    // We use a local variable's address as an SP proxy — anything below it
+    // (lower address) is currently unused and safe to paint.
+    unsafe {
+        const SVC_STACK_BOTTOM: u32 = 0x0084_B400;
+        const STACK_PAINT_PATTERN: u32 = 0xDEAD_BEEF;
+        let sp_proxy: u32 = 0;
+        let sp_approx = (&sp_proxy as *const u32 as u32) & !3;
+        // Leave a 64-byte guard between the paint region and current SP so
+        // we never clobber the active call frame.
+        let paint_end = sp_approx.saturating_sub(64);
+        if paint_end > SVC_STACK_BOTTOM {
+            let mut a = SVC_STACK_BOTTOM;
+            while a < paint_end {
+                core::ptr::write_volatile(a as *mut u32, STACK_PAINT_PATTERN);
+                a = a.wrapping_add(4);
+            }
+        }
+        // Record paint extent: MODE+0x1A8 holds paint_end (full 32-bit),
+        // MODE+0x1B0 holds sp_approx (full 32-bit). MODE+0x1AC is the
+        // running high-water mark in bytes (updated by mcps_data_indication).
+        mark32(DBG_MODE_BASE + 0x1A8, paint_end);
+        mark32(DBG_MODE_BASE + 0x1AC, 0);
+        mark32(DBG_MODE_BASE + 0x1B0, sp_approx);
+    }
 
     #[cfg(feature = "sensor")]
     sensor_main();

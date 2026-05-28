@@ -7,11 +7,11 @@ build = "build.rs"
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac" }
-zigbee-nwk = { path = "../../zigbee-nwk" }
-zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-nwk = { path = "../../zigbee-nwk", features = ["telink-debug"] }
+zigbee-aps = { path = "../../zigbee-aps", features = ["telink-debug"] }
 zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-zdo = { path = "../../zigbee-zdo" }
-zigbee-bdb = { path = "../../zigbee-bdb" }
+zigbee-zdo = { path = "../../zigbee-zdo", features = ["telink-debug"] }
+zigbee-bdb = { path = "../../zigbee-bdb", features = ["telink-debug"] }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 
 # Logging (stub — no output backend yet)
