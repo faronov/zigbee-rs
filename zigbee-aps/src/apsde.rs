@@ -20,6 +20,329 @@ use zigbee_types::{IeeeAddress, ShortAddress};
 /// Accounts for APS header + APS security overhead in the NWK frame.
 pub const APS_MAX_PAYLOAD: usize = 80;
 
+// ── Telink BDB-region debug markers (gated) ─────────────────────
+// Absolute SRAM base 0x0084F450 (BDB region). Slots used here:
+//   +0x140 entry counter
+//   +0x144 APS FCF byte (set_once)
+//   +0x148 aux parsed counter
+//   +0x14C aux security_control byte (set_once)
+//   +0x150 src IEEE [0..3] (LE u32, set_once)
+//   +0x154 src IEEE [4..7] (LE u32, set_once)
+//   +0x158 pre-decrypt counter
+//   +0x15C decrypt-ok counter
+//   +0x160 decrypt-fail (return None) counter
+//   +0x164 decrypted plaintext [0..3] (set_once)
+//   +0x168 frame_type after decrypt (set_once: ft|0x80)
+//   +0x16C handle_transport_key entry counter
+//   +0x170 transport-key cmd_id+key_type (set_once)
+//   +0x180..+0x18F derived KT key (4× u32, set_once)
+//   +0x190..+0x19C nonce (13 bytes in 4× u32, set_once)
+#[cfg(feature = "telink-debug")]
+#[inline(always)]
+fn tdbg_bump(off: usize) {
+    unsafe {
+        let p = (0x0084F450usize + off) as *mut u32;
+        let v = core::ptr::read_volatile(p);
+        core::ptr::write_volatile(p, v.wrapping_add(1));
+    }
+}
+#[cfg(feature = "telink-debug")]
+#[inline(always)]
+fn tdbg_set_once(off: usize, val: u32) {
+    unsafe {
+        let p = (0x0084F450usize + off) as *mut u32;
+        if core::ptr::read_volatile(p) == 0 {
+            core::ptr::write_volatile(p, val);
+        }
+    }
+}
+#[cfg(not(feature = "telink-debug"))]
+#[inline(always)]
+fn tdbg_bump(_off: usize) {}
+#[cfg(not(feature = "telink-debug"))]
+#[inline(always)]
+fn tdbg_set_once(_off: usize, _val: u32) {}
+
+// ── Telink raw-decrypt-input capture (gated) ────────────────────
+// Captures per-attempt {key, nonce, aad, ct‖mic} for offline Python AES-CCM*
+// verification. Lives in `.debug_sram` at 0x0084_F800 (NOLOAD, NOINIT),
+// safely past BDB region (ends 0x0084_F644) and clear of all stacks.
+//
+// Layout:
+//   BASE+0x000 : u32 slot counter (rolling; wrapped via &7 for slot index)
+//   BASE+0x004 : u32 region magic 0xDECDECDE (set_once)
+//   BASE+0x010 + i*64 : 8 slots × 64 B
+//
+// Per-slot (64 B):
+//   [0..16]  key                       (16 B)
+//   [16..29] nonce                     (13 B)
+//   [29]     aad_len (clamped to 16)
+//   [30..46] aad[0..16]                (16 B)
+//   [46]     ct_len  (clamped to 16)
+//   [47..63] ct‖mic[0..16]             (16 B)
+//   [63]     result byte (0xFF=pending, 0x00=decrypt OK, 0x01=MIC fail/err,
+//                         0x02=variant skipped)
+//
+// Variant tag is encoded into the high nibble of byte [29] (aad_len):
+//   0x00 = patched AAD + derived KT key   (site @ apsde.rs:837)
+//   0x10 = raw AAD     + derived KT key   (site @ apsde.rs:850)
+//   0x20 = patched AAD + raw TC link key  (site @ apsde.rs:865)
+//   0x30 = raw AAD     + raw TC link key  (site @ apsde.rs:879)
+#[cfg(feature = "telink-debug")]
+mod raw_dec_dbg {
+    pub const BASE: usize = 0x0084_F800;
+    const SLOTS: usize = 8;
+    const SLOT_SZ: usize = 64;
+
+    #[inline(always)]
+    pub fn capture(variant: u8, key: &[u8; 16], nonce: &[u8; 13], aad: &[u8], ct: &[u8]) -> usize {
+        unsafe {
+            // Init magic on first call.
+            let magic_p = (BASE + 4) as *mut u32;
+            if core::ptr::read_volatile(magic_p) != 0xDECD_ECDE {
+                core::ptr::write_volatile(magic_p, 0xDECD_ECDE);
+            }
+            let ctr_p = BASE as *mut u32;
+            let n = core::ptr::read_volatile(ctr_p);
+            let slot = (n as usize) & (SLOTS - 1);
+            let slot_p = (BASE + 0x10 + slot * SLOT_SZ) as *mut u8;
+            // Zero slot.
+            for i in 0..SLOT_SZ {
+                core::ptr::write_volatile(slot_p.add(i), 0);
+            }
+            // Key.
+            for i in 0..16 {
+                core::ptr::write_volatile(slot_p.add(i), key[i]);
+            }
+            // Nonce.
+            for i in 0..13 {
+                core::ptr::write_volatile(slot_p.add(16 + i), nonce[i]);
+            }
+            // aad_len (low nibble) | variant (high nibble).
+            let aad_len = aad.len().min(16) as u8;
+            core::ptr::write_volatile(slot_p.add(29), (aad_len & 0x0F) | (variant & 0xF0));
+            for i in 0..aad.len().min(16) {
+                core::ptr::write_volatile(slot_p.add(30 + i), aad[i]);
+            }
+            // ct_len.
+            let ct_len = ct.len().min(16) as u8;
+            core::ptr::write_volatile(slot_p.add(46), ct_len);
+            for i in 0..ct.len().min(16) {
+                core::ptr::write_volatile(slot_p.add(47 + i), ct[i]);
+            }
+            // Pending result.
+            core::ptr::write_volatile(slot_p.add(63), 0xFF);
+            core::ptr::write_volatile(ctr_p, n.wrapping_add(1));
+            slot
+        }
+    }
+
+    #[inline(always)]
+    pub fn set_result(slot: usize, result: u8) {
+        unsafe {
+            let slot_p = (BASE + 0x10 + (slot & (SLOTS - 1)) * SLOT_SZ) as *mut u8;
+            core::ptr::write_volatile(slot_p.add(63), result);
+        }
+    }
+}
+#[cfg(not(feature = "telink-debug"))]
+mod raw_dec_dbg {
+    #[inline(always)]
+    pub fn capture(_v: u8, _k: &[u8; 16], _n: &[u8; 13], _a: &[u8], _c: &[u8]) -> usize { 0 }
+    #[inline(always)]
+    pub fn set_result(_s: usize, _r: u8) {}
+}
+
+// ── raw_dec_full ─────────────────────────────────────────────────
+// Cycle 22 addition. Mirror of `raw_dec_dbg` but captures the FULL
+// ciphertext+MIC (up to 80 B) instead of just the first 16. Two
+// slots only — we only need a couple of frames to cross-check the
+// MIC against Python AESCCM offline.
+//
+// Layout at 0x0084_FB80..0x0084_FC50 (208 B):
+//   BASE+0x00 : u32 slot counter (rolling; &1 for slot index)
+//   BASE+0x04 : u32 region magic 0xFEEDFACE (set_once)
+//   BASE+0x10 + i*96 : 2 slots × 96 B
+//
+// Per-slot (96 B):
+//   [0..16]   key
+//   [16..29]  nonce (13)
+//   [29]      aad_len (low nibble) | variant (high nibble)
+//   [30..45]  aad (up to 15 B — byte [45] reused for ct_total_len)
+//   [45]      ct_total_len (incl. MIC, ≤80)   [overwrites aad[15]]
+//   [46..]    ct‖mic (≤ 50 B for safety, but slot holds 50)
+//
+// Actually with slot = 96 and ct_off=46, capacity = 50 B for ct+MIC.
+// A 35-byte payload + 4-byte MIC = 39 B fits comfortably.
+#[cfg(feature = "telink-debug")]
+mod raw_dec_full {
+    pub const BASE: usize = 0x0084_FB80;
+    const SLOTS: usize = 2;
+    const SLOT_SZ: usize = 96;
+    const CT_OFF: usize = 46;
+    const CT_MAX: usize = SLOT_SZ - CT_OFF; // 50
+
+    const _CHECK_FITS: () = assert!(CT_MAX >= 40); // 39 B TK frame + headroom
+
+    #[inline(always)]
+    pub fn capture(variant: u8, key: &[u8; 16], nonce: &[u8; 13], aad: &[u8], ct: &[u8]) {
+        unsafe {
+            let magic_p = (BASE + 4) as *mut u32;
+            if core::ptr::read_volatile(magic_p) != 0xFEED_FACE {
+                core::ptr::write_volatile(magic_p, 0xFEED_FACE);
+            }
+            let ctr_p = BASE as *mut u32;
+            let n = core::ptr::read_volatile(ctr_p);
+            let slot = (n as usize) & (SLOTS - 1);
+            let slot_p = (BASE + 0x10 + slot * SLOT_SZ) as *mut u8;
+            for i in 0..SLOT_SZ {
+                core::ptr::write_volatile(slot_p.add(i), 0);
+            }
+            for i in 0..16 {
+                core::ptr::write_volatile(slot_p.add(i), key[i]);
+            }
+            for i in 0..13 {
+                core::ptr::write_volatile(slot_p.add(16 + i), nonce[i]);
+            }
+            let aad_len = aad.len().min(16) as u8;
+            core::ptr::write_volatile(slot_p.add(29), (aad_len & 0x0F) | (variant & 0xF0));
+            for i in 0..aad.len().min(15) {
+                core::ptr::write_volatile(slot_p.add(30 + i), aad[i]);
+            }
+            let ct_total = ct.len().min(CT_MAX) as u8;
+            core::ptr::write_volatile(slot_p.add(45), ct_total);
+            for i in 0..ct_total as usize {
+                core::ptr::write_volatile(slot_p.add(CT_OFF + i), ct[i]);
+            }
+            core::ptr::write_volatile(ctr_p, n.wrapping_add(1));
+        }
+    }
+}
+#[cfg(not(feature = "telink-debug"))]
+mod raw_dec_full {
+    #[inline(always)]
+    pub fn capture(_v: u8, _k: &[u8; 16], _n: &[u8; 13], _a: &[u8], _c: &[u8]) {}
+}
+
+// ── raw_frame_dbg ────────────────────────────────────────────────
+// First-frame-wins capture of the raw NWK payload entering APS so
+// the captured src IEEE (BDB+0x150/+0x154) can be cross-checked
+// against the actual on-wire bytes plus NWK src/dst short and the
+// AAD/CT offsets used by the decrypt path.
+//
+// Layout at 0x0084_FA00..0x0084_FA80 (free in `.debug_sram`, well
+// past raw_dec_dbg which ends at 0x0084_FA10... wait — adjusted: we
+// place fields starting at 0x0084_FA80 to fully clear raw_dec_dbg
+// slot 7 (ends 0x0084_FA10). See module constants below.
+#[cfg(feature = "telink-debug")]
+mod raw_frame_dbg {
+    pub const BASE: usize = 0x0084_FA80;
+    // Layout (all u32 little-endian unless noted):
+    //   +0x00  magic 0x52415746 ("RAWF") — set last; guards first-frame-wins
+    //   +0x04  nwk_payload.len()
+    //   +0x08  nwk_src (u16 in low half) | 0x8000_0000
+    //   +0x0C  nwk_dst (u16 in low half) | 0x8000_0000
+    //   +0x10  nwk_security flag (1 if true) | 0x8000_0000
+    //   +0x14  aps_fcf byte (low 8 bits) | 0x8000_0000
+    //   +0x18  consumed (APS header bytes)
+    //   +0x1C  sec_consumed (APS aux header bytes)
+    //   +0x20  aad_end = consumed + sec_consumed
+    //   +0x24  ct_len (ciphertext.len())
+    //   +0x28..+0x3C reserved
+    //   +0x40..+0x80 raw nwk_payload bytes [0..64]
+    const MAGIC: u32 = 0x5241_5746; // "RAWF"
+
+    #[inline(always)]
+    fn already_captured() -> bool {
+        unsafe { core::ptr::read_volatile(BASE as *const u32) == MAGIC }
+    }
+
+    /// Capture entry-point fields. Called at the very start of
+    /// `process_incoming_aps_frame`. First call wins; subsequent
+    /// frames are ignored so the captured src IEEE / KT decrypt
+    /// stays correlated with the bytes recorded here.
+    #[inline(always)]
+    pub fn capture_entry(
+        nwk_payload: &[u8],
+        nwk_src: u16,
+        nwk_dst: u16,
+        nwk_security: bool,
+    ) {
+        if already_captured() {
+            return;
+        }
+        unsafe {
+            // Length and addresses first (so they're valid even if
+            // we never reach the after-parse fill-in below).
+            core::ptr::write_volatile((BASE + 0x04) as *mut u32, nwk_payload.len() as u32);
+            core::ptr::write_volatile(
+                (BASE + 0x08) as *mut u32,
+                0x8000_0000u32 | nwk_src as u32,
+            );
+            core::ptr::write_volatile(
+                (BASE + 0x0C) as *mut u32,
+                0x8000_0000u32 | nwk_dst as u32,
+            );
+            core::ptr::write_volatile(
+                (BASE + 0x10) as *mut u32,
+                0x8000_0000u32 | nwk_security as u32,
+            );
+            let fcf = if !nwk_payload.is_empty() { nwk_payload[0] } else { 0 };
+            core::ptr::write_volatile(
+                (BASE + 0x14) as *mut u32,
+                0x8000_0000u32 | fcf as u32,
+            );
+            // Zero the parse-related fields so stale data from a
+            // prior boot doesn't confuse the byte-walk.
+            for off in [0x18u32, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C] {
+                core::ptr::write_volatile((BASE + off as usize) as *mut u32, 0);
+            }
+            // Raw bytes 0..64.
+            let n = nwk_payload.len().min(64);
+            for i in 0..n {
+                core::ptr::write_volatile(
+                    (BASE + 0x40 + i) as *mut u8,
+                    nwk_payload[i],
+                );
+            }
+            // Magic LAST so the guard above only fires after a
+            // complete record is in place.
+            core::ptr::write_volatile(BASE as *mut u32, MAGIC);
+        }
+    }
+
+    /// Update the parse-derived fields after the APS header and
+    /// security header have been parsed. Only writes if a record
+    /// is present for the current frame (magic set) AND offsets
+    /// have not been written yet (aad_end == 0).
+    #[inline(always)]
+    pub fn capture_offsets(consumed: usize, sec_consumed: usize, ct_len: usize) {
+        unsafe {
+            if core::ptr::read_volatile(BASE as *const u32) != MAGIC {
+                return;
+            }
+            // Only fill once — first secured frame's offsets win.
+            if core::ptr::read_volatile((BASE + 0x20) as *const u32) != 0 {
+                return;
+            }
+            core::ptr::write_volatile((BASE + 0x18) as *mut u32, consumed as u32);
+            core::ptr::write_volatile((BASE + 0x1C) as *mut u32, sec_consumed as u32);
+            core::ptr::write_volatile(
+                (BASE + 0x20) as *mut u32,
+                (consumed + sec_consumed) as u32,
+            );
+            core::ptr::write_volatile((BASE + 0x24) as *mut u32, ct_len as u32);
+        }
+    }
+}
+#[cfg(not(feature = "telink-debug"))]
+mod raw_frame_dbg {
+    #[inline(always)]
+    pub fn capture_entry(_p: &[u8], _s: u16, _d: u16, _sec: bool) {}
+    #[inline(always)]
+    pub fn capture_offsets(_c: usize, _sc: usize, _ct: usize) {}
+}
+
 // ── APSDE-DATA.request ──────────────────────────────────────────
 
 /// Parameters for APSDE-DATA.request (Zigbee spec Table 2-2).
@@ -658,6 +981,20 @@ impl<M: MacDriver> ApsLayer<M> {
         nwk_security: bool,
         decrypted_buf: &'a mut ApsFrameBuffer,
     ) -> Option<ApsdeDataIndication<'a>> {
+        tdbg_bump(0x140);
+        // First-frame-wins raw capture: nwk_payload bytes + NWK src/dst
+        // short + nwk_security flag, into 0x0084_FA80..0x0084_FAFF. Lets
+        // us cross-check whether the frame we're decrypting was actually
+        // addressed to us, and read APS aux source_address by hand.
+        raw_frame_dbg::capture_entry(
+            nwk_payload,
+            nwk_src.0,
+            nwk_dst.0,
+            nwk_security,
+        );
+        if !nwk_payload.is_empty() {
+            tdbg_set_once(0x144, 0x80000000u32 | nwk_payload[0] as u32);
+        }
         #[cfg(feature = "efr32-trace")]
         rtt_target::rprintln!(
             "[APS] RX {} bytes fc={:02X}",
@@ -689,6 +1026,24 @@ impl<M: MacDriver> ApsLayer<M> {
                 rtt_target::rprintln!("[APS] sec hdr parse FAIL len={}", after_header.len());
                 return None;
             };
+            tdbg_bump(0x148);
+            tdbg_set_once(0x14C, 0x80000000u32 | sec_hdr.security_control as u32);
+            // Fine-grain bisection markers (BDB+0x1A4..0x1BC, all free).
+            tdbg_set_once(0x1A4, 0x80000000u32 | nwk_payload.len() as u32);
+            tdbg_set_once(0x1A8, 0x80000000u32 | consumed as u32);
+            tdbg_set_once(0x1AC, 0x80000000u32 | sec_consumed as u32);
+            tdbg_set_once(0x1B0, 0x80000000u32 | after_header.len() as u32);
+            tdbg_bump(0x1B4);
+            if let Some(ref addr) = sec_hdr.source_address {
+                tdbg_set_once(
+                    0x150,
+                    u32::from_le_bytes([addr[0], addr[1], addr[2], addr[3]]),
+                );
+                tdbg_set_once(
+                    0x154,
+                    u32::from_le_bytes([addr[4], addr[5], addr[6], addr[7]]),
+                );
+            }
             #[cfg(feature = "efr32-trace")]
             rtt_target::rprintln!(
                 "[APS] sec: ctrl={:02X} fc={} sc={} ct={}",
@@ -698,6 +1053,11 @@ impl<M: MacDriver> ApsLayer<M> {
                 after_header.len() - sec_consumed
             );
             let ciphertext = &after_header[sec_consumed..];
+            tdbg_bump(0x1B8);
+            tdbg_set_once(0x1BC, 0x80000000u32 | ciphertext.len() as u32);
+            // Record APS parse offsets for offline byte-walk against the
+            // raw payload captured at raw_frame_dbg::BASE+0x40.
+            raw_frame_dbg::capture_offsets(consumed, sec_consumed, ciphertext.len());
             let aad_end = consumed + sec_consumed;
             // AAD must use the ACTUAL security level (5 = ENC-MIC-32), not the OTA value (0).
             // The sender computes CCM* with actual level, then zeroes it for transmission.
@@ -709,9 +1069,13 @@ impl<M: MacDriver> ApsLayer<M> {
             aad_buf_patched[consumed] =
                 (aad_buf_patched[consumed] & !0x07) | crate::security::SEC_LEVEL_ENC_MIC_32;
             let aad = &aad_buf_patched[..aad_len];
+            tdbg_bump(0x1C0);
+            tdbg_set_once(0x1C4, 0x80000000u32 | aad_len as u32);
 
             let key_id =
                 crate::security::ApsSecurityHeader::key_identifier(sec_hdr.security_control);
+            tdbg_bump(0x1C8);
+            tdbg_set_once(0x1CC, 0x80000000u32 | key_id as u32);
             #[cfg(feature = "efr32-trace")]
             rtt_target::rprintln!(
                 "[APS] key_id={} aad_len={} ct_len={} src_ieee={}",
@@ -720,6 +1084,33 @@ impl<M: MacDriver> ApsLayer<M> {
                 ciphertext.len(),
                 sec_hdr.source_address.is_some() as u8,
             );
+            // DIAGNOSTIC: Always derive KT key OUTSIDE the match, regardless of key_id,
+            // and force-write result. Isolates whether derive itself hangs vs match path issue.
+            {
+                tdbg_bump(0x1DC);
+                let tck_diag = *self.security.default_tc_link_key();
+                #[cfg(feature = "telink-debug")]
+                unsafe {
+                    core::ptr::write_volatile(
+                        (0x0084_F450usize + 0x1E0) as *mut u32,
+                        u32::from_le_bytes([tck_diag[0], tck_diag[1], tck_diag[2], tck_diag[3]])
+                            | 0x8000_0000,
+                    );
+                }
+                let kt_diag = crate::security::derive_key_transport_key(&tck_diag);
+                tdbg_bump(0x1E4);
+                #[cfg(feature = "telink-debug")]
+                unsafe {
+                    for (i, b) in kt_diag.iter().enumerate().take(16) {
+                        core::ptr::write_volatile(
+                            (0x0084_F450usize + 0x1E8 + i) as *mut u8,
+                            *b,
+                        );
+                    }
+                }
+                core::hint::black_box(kt_diag);
+            }
+
             let key = if key_id == crate::security::KEY_ID_DATA_KEY {
                 if let Some(addr) = &sec_hdr.source_address {
                     if let Some(entry) = self.security.find_any_key(addr) {
@@ -731,7 +1122,13 @@ impl<M: MacDriver> ApsLayer<M> {
                     *self.security.default_tc_link_key()
                 }
             } else if key_id == crate::security::KEY_ID_KEY_TRANSPORT {
-                crate::security::derive_key_transport_key(self.security.default_tc_link_key())
+                let tck = *self.security.default_tc_link_key();
+                let kt = crate::security::derive_key_transport_key(&tck);
+                tdbg_set_once(0x180, u32::from_le_bytes([kt[0], kt[1], kt[2], kt[3]]));
+                tdbg_set_once(0x184, u32::from_le_bytes([kt[4], kt[5], kt[6], kt[7]]));
+                tdbg_set_once(0x188, u32::from_le_bytes([kt[8], kt[9], kt[10], kt[11]]));
+                tdbg_set_once(0x18C, u32::from_le_bytes([kt[12], kt[13], kt[14], kt[15]]));
+                kt
             } else if key_id == crate::security::KEY_ID_KEY_LOAD {
                 crate::security::derive_key_load_key(self.security.default_tc_link_key())
             } else {
@@ -744,11 +1141,13 @@ impl<M: MacDriver> ApsLayer<M> {
             } else {
                 crate::security::ApsKeyType::NetworkKey
             };
+            tdbg_bump(0x1D0);
             if let Some(addr) = &sec_hdr.source_address
                 && !self
                     .security
                     .check_frame_counter(addr, replay_key_type, sec_hdr.frame_counter)
             {
+                tdbg_bump(0x1D4);
                 log::warn!(
                     "[APS] Replay detected: frame counter {} from src",
                     sec_hdr.frame_counter
@@ -761,7 +1160,27 @@ impl<M: MacDriver> ApsLayer<M> {
             //   1. AAD with original OTA security level (some coordinators don't strip)
             //   2. Raw TC link key instead of derived key-transport key
             let mut decrypt_ok = false;
-            if let Some(plaintext) = self.security.decrypt(aad, ciphertext, &key, &sec_hdr) {
+            tdbg_bump(0x1D8);
+            tdbg_bump(0x158);
+            // Capture nonce as actually built (for offline verification).
+            {
+                let nonce = self.security.build_nonce_debug(&sec_hdr);
+                tdbg_set_once(0x190, u32::from_le_bytes([nonce[0], nonce[1], nonce[2], nonce[3]]));
+                tdbg_set_once(0x194, u32::from_le_bytes([nonce[4], nonce[5], nonce[6], nonce[7]]));
+                tdbg_set_once(0x198, u32::from_le_bytes([nonce[8], nonce[9], nonce[10], nonce[11]]));
+                tdbg_set_once(0x19C, nonce[12] as u32);
+            }
+            if let Some(plaintext) = {
+                let _nonce = self.security.build_nonce_debug(&sec_hdr);
+                let _slot = raw_dec_dbg::capture(0x00, &key, &_nonce, aad, ciphertext);
+                // Cycle 22: also capture full ct+MIC for offline AES-CCM* MIC
+                // verification (raw_dec_dbg truncates to 16 B which is not
+                // enough to verify the 4-byte MIC at the tail).
+                raw_dec_full::capture(0x00, &key, &_nonce, aad, ciphertext);
+                let r = self.security.decrypt(aad, ciphertext, &key, &sec_hdr);
+                raw_dec_dbg::set_result(_slot, if r.is_some() { 0 } else { 1 });
+                r
+            } {
                 #[cfg(feature = "efr32-trace")]
                 rtt_target::rprintln!("[APS] decrypt OK! {} bytes", plaintext.len());
                 let pt_len = plaintext.len().min(decrypted_buf.data.len());
@@ -774,7 +1193,13 @@ impl<M: MacDriver> ApsLayer<M> {
             // Fallback: try with un-patched AAD (original OTA security level)
             if !decrypt_ok {
                 let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
-                if let Some(plaintext) = self.security.decrypt(aad_raw, ciphertext, &key, &sec_hdr)
+                if let Some(plaintext) = {
+                    let _nonce = self.security.build_nonce_debug(&sec_hdr);
+                    let _slot = raw_dec_dbg::capture(0x10, &key, &_nonce, aad_raw, ciphertext);
+                    let r = self.security.decrypt(aad_raw, ciphertext, &key, &sec_hdr);
+                    raw_dec_dbg::set_result(_slot, if r.is_some() { 0 } else { 1 });
+                    r
+                }
                 {
                     #[cfg(feature = "efr32-trace")]
                     rtt_target::rprintln!("[APS] decrypt OK (raw AAD)! {} bytes", plaintext.len());
@@ -789,7 +1214,13 @@ impl<M: MacDriver> ApsLayer<M> {
             // Fallback for key-transport: try raw TC link key (some impls don't derive)
             if !decrypt_ok && key_id == crate::security::KEY_ID_KEY_TRANSPORT {
                 let tc_key = *self.security.default_tc_link_key();
-                if let Some(plaintext) = self.security.decrypt(aad, ciphertext, &tc_key, &sec_hdr) {
+                if let Some(plaintext) = {
+                    let _nonce = self.security.build_nonce_debug(&sec_hdr);
+                    let _slot = raw_dec_dbg::capture(0x20, &tc_key, &_nonce, aad, ciphertext);
+                    let r = self.security.decrypt(aad, ciphertext, &tc_key, &sec_hdr);
+                    raw_dec_dbg::set_result(_slot, if r.is_some() { 0 } else { 1 });
+                    r
+                } {
                     #[cfg(feature = "efr32-trace")]
                     rtt_target::rprintln!("[APS] decrypt OK (raw TC + patched)!");
                     let pt_len = plaintext.len().min(decrypted_buf.data.len());
@@ -801,9 +1232,13 @@ impl<M: MacDriver> ApsLayer<M> {
                 // Try with un-patched AAD
                 if !decrypt_ok {
                     let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
-                    if let Some(plaintext) = self
-                        .security
-                        .decrypt(aad_raw, ciphertext, &tc_key, &sec_hdr)
+                    if let Some(plaintext) = {
+                        let _nonce = self.security.build_nonce_debug(&sec_hdr);
+                        let _slot = raw_dec_dbg::capture(0x30, &tc_key, &_nonce, aad_raw, ciphertext);
+                        let r = self.security.decrypt(aad_raw, ciphertext, &tc_key, &sec_hdr);
+                        raw_dec_dbg::set_result(_slot, if r.is_some() { 0 } else { 1 });
+                        r
+                    }
                     {
                         #[cfg(feature = "efr32-trace")]
                         rtt_target::rprintln!("[APS] decrypt OK (raw TC + raw AAD)!");
@@ -817,6 +1252,18 @@ impl<M: MacDriver> ApsLayer<M> {
             }
 
             if decrypt_ok {
+                tdbg_bump(0x15C);
+                if decrypted_buf.len >= 4 {
+                    tdbg_set_once(
+                        0x164,
+                        u32::from_le_bytes([
+                            decrypted_buf.data[0],
+                            decrypted_buf.data[1],
+                            decrypted_buf.data[2],
+                            decrypted_buf.data[3],
+                        ]),
+                    );
+                }
                 if let Some(addr) = &sec_hdr.source_address {
                     self.security.commit_frame_counter(
                         addr,
@@ -825,6 +1272,7 @@ impl<M: MacDriver> ApsLayer<M> {
                     );
                 }
             } else {
+                tdbg_bump(0x160);
                 #[cfg(feature = "efr32-trace")]
                 rtt_target::rprintln!(
                     "[APS] decrypt ALL FAILED key_id={} ct_len={}",
@@ -837,6 +1285,7 @@ impl<M: MacDriver> ApsLayer<M> {
 
         // Phase 2: Frame type dispatch
         let ft = crate::frames::ApsFrameType::from_u8(header.frame_control.frame_type)?;
+        tdbg_set_once(0x168, 0x80000000u32 | header.frame_control.frame_type as u32);
         match ft {
             ApsFrameType::Data => {
                 if self.is_aps_duplicate(nwk_src.0, header.aps_counter) {
@@ -1191,6 +1640,10 @@ impl<M: MacDriver> ApsLayer<M> {
     /// Parses the key data and installs it into the appropriate security
     /// context (NWK key → NwkSecurity, link key → APS security table).
     fn handle_transport_key(&mut self, data: &[u8], src: ShortAddress) {
+        tdbg_bump(0x16C);
+        if !data.is_empty() {
+            tdbg_set_once(0x170, 0x80000000u32 | data[0] as u32);
+        }
         #[cfg(feature = "efr32-trace")]
         rtt_target::rprintln!(
             "[APS] Transport-Key! {} bytes from 0x{:04X}",

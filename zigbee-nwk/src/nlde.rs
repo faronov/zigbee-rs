@@ -16,7 +16,108 @@ macro_rules! nwk_trace {
 }
 #[cfg(not(feature = "efr32-trace"))]
 macro_rules! nwk_trace {
-    ($($arg:tt)*) => {};
+    ($($arg:tt)*) => { () };
+}
+
+// ── Telink TLSR8258 debug markers (NWK TX path) ────────────────────────────
+// Absolute SRAM map (matches the convention in zigbee-bdb/steering.rs):
+//   BDB_BASE = 0x0084_F450
+//   BDB+0x230 nlde_data_request entry counter (every call)
+//   BDB+0x234 entry-state latch (first call only, MSB=1):
+//             bit24 = joined, bit16 = security_enabled,
+//             bit8  = has_active_key, bit0  = discover_route
+//   BDB+0x238 dst_addr (low u16) | src_addr (high u16) — last call
+//   BDB+0x23C frame_counter used (last secure call)
+//   BDB+0x240 hdr_len (low u16) | total_len (high u16) — last call
+//   BDB+0x244 NWK CCM encrypt entries (from security::aes_ccm_encrypt)
+//   BDB+0x248 SP at CCM encrypt entry (must stay > 0x0084_B400)
+//   BDB+0x24C NWK CCM encrypt successful exits
+//   BDB+0x250 self.security.encrypt() returned Some count
+//   BDB+0x254 self.security.encrypt() returned None count
+//   BDB+0x258 MAC mcps_data Ok count
+//   BDB+0x25C MAC mcps_data Err count
+//
+// Wire-bytes capture region (only FIRST nlde_data_request call):
+//   0x0084_FB00..+0x10  pre-encrypt: NWK header bytes (16)
+//   0x0084_FB10..+0x10  pre-encrypt: NWK security aux header (14, padded)
+//   0x0084_FB20..+0x40  post-encrypt: assembled NWK frame (up to 64 B)
+//   0x0084_FB60         one-shot guard (0xDEADBEEF after first capture)
+//   0x0084_FB64         hdr_len | (sec_hdr_len << 16)
+//   0x0084_FB68         total_len | (payload_len << 16)
+//   0x0084_FB6C         dst_addr | (next_hop << 16) — populated post-resolve
+#[cfg(feature = "telink-debug")]
+mod tlnk_dbg {
+    pub const BASE: u32 = 0x0084_F450;
+    pub const WIRE_BASE: u32 = 0x0084_FB00;
+    pub const WIRE_GUARD: u32 = 0x0084_FB60;
+
+    #[inline(always)]
+    pub fn bump(off: u32) {
+        unsafe {
+            let p = (BASE + off) as *mut u32;
+            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+        }
+    }
+    #[inline(always)]
+    pub fn set(off: u32, val: u32) {
+        unsafe {
+            core::ptr::write_volatile((BASE + off) as *mut u32, val);
+        }
+    }
+    #[inline(always)]
+    pub fn set_once(off: u32, val: u32) {
+        unsafe {
+            let p = (BASE + off) as *mut u32;
+            if core::ptr::read_volatile(p) == 0 {
+                core::ptr::write_volatile(p, val | 0x8000_0000);
+            }
+        }
+    }
+    /// Capture the first nlde_data_request frame to 0x0084_FB00..+0x70.
+    /// Returns true if the capture slot was taken (caller should fill it).
+    #[inline(always)]
+    pub fn wire_claim() -> bool {
+        unsafe {
+            let g = WIRE_GUARD as *mut u32;
+            if core::ptr::read_volatile(g) == 0xDEAD_BEEF {
+                return false;
+            }
+            core::ptr::write_volatile(g, 0xDEAD_BEEF);
+            true
+        }
+    }
+    #[inline(always)]
+    pub fn wire_copy(off: u32, src: &[u8]) {
+        unsafe {
+            let base = (WIRE_BASE + off) as *mut u8;
+            for (i, b) in src.iter().enumerate() {
+                core::ptr::write_volatile(base.add(i), *b);
+            }
+        }
+    }
+    #[inline(always)]
+    pub fn wire_set(off: u32, val: u32) {
+        unsafe {
+            core::ptr::write_volatile((WIRE_BASE + off) as *mut u32, val);
+        }
+    }
+}
+
+#[cfg(feature = "telink-debug")]
+macro_rules! tdbg_bump {
+    ($off:expr) => { tlnk_dbg::bump($off) };
+}
+#[cfg(not(feature = "telink-debug"))]
+macro_rules! tdbg_bump {
+    ($off:expr) => { () };
+}
+#[cfg(feature = "telink-debug")]
+macro_rules! tdbg_set {
+    ($off:expr, $val:expr) => { tlnk_dbg::set($off, $val) };
+}
+#[cfg(not(feature = "telink-debug"))]
+macro_rules! tdbg_set {
+    ($off:expr, $val:expr) => { () };
 }
 
 /// NWK data indication — received NWK-level data.
@@ -68,6 +169,22 @@ impl<M: MacDriver> NwkLayer<M> {
         security_enable: bool,
         discover_route: bool,
     ) -> Result<NldeDataConfirm, NwkStatus> {
+        // BDB+0x230: nlde_data_request entries (every call)
+        tdbg_bump!(0x230);
+        // BDB+0x234: latch entry flags on FIRST call only (joined / sec_enabled
+        // / has_active_key / discover_route). MSB is set by set_once().
+        #[cfg(feature = "telink-debug")]
+        {
+            let joined = self.joined as u32;
+            let sec_en = self.nib.security_enabled as u32;
+            let has_key = self.security.active_key().is_some() as u32;
+            let dr = discover_route as u32;
+            let flags = (joined << 24) | (sec_en << 16) | (has_key << 8) | dr;
+            // Use plain set (not set_once) so each call updates — easier to
+            // read in the dump. The MSB bit is informational only.
+            tdbg_set!(0x234, 0x4E57_0000 | flags);
+        }
+
         if !self.joined {
             log::warn!(
                 "[NWK] nlde_data_request called but not joined! dst=0x{:04X}",
@@ -162,6 +279,38 @@ impl<M: MacDriver> NwkLayer<M> {
             // Serialize security header right after NWK header
             let sec_hdr_len = sec_hdr.serialize(&mut nwk_buf[hdr_len..]);
 
+            // BDB+0x238: dst_addr | (src_addr << 16) — last call
+            tdbg_set!(
+                0x238,
+                dst_addr.0 as u32 | ((self.nib.network_address.0 as u32) << 16)
+            );
+            // BDB+0x23C: frame counter actually used
+            tdbg_set!(0x23C, sec_hdr.frame_counter);
+
+            // Capture FIRST nlde_data_request pre-encrypt context to
+            // 0x0084_FB00 (header) / 0x0084_FB10 (security aux header).
+            #[cfg(feature = "telink-debug")]
+            {
+                if tlnk_dbg::wire_claim() {
+                    let n = core::cmp::min(hdr_len, 16);
+                    tlnk_dbg::wire_copy(0x00, &nwk_buf[..n]);
+                    let m = core::cmp::min(sec_hdr_len, 16);
+                    tlnk_dbg::wire_copy(0x10, &nwk_buf[hdr_len..hdr_len + m]);
+                    tlnk_dbg::wire_set(
+                        0x64,
+                        (hdr_len as u32) | ((sec_hdr_len as u32) << 16),
+                    );
+                    tlnk_dbg::wire_set(
+                        0x68,
+                        (payload.len() as u32) | ((dst_addr.0 as u32) << 16),
+                    );
+                } else {
+                    // Subsequent calls: re-arm by clearing the guard so the
+                    // dump still shows the most recent FIRST capture.
+                    // (No-op: we keep the first one to preserve evidence.)
+                }
+            }
+
             // Build authenticated data (a = NWK header || security aux header)
             let aad_len = hdr_len + sec_hdr_len;
 
@@ -170,6 +319,8 @@ impl<M: MacDriver> NwkLayer<M> {
                 self.security
                     .encrypt(&nwk_buf[..aad_len], payload, &key_entry.key, &sec_hdr)
             {
+                // BDB+0x250: security.encrypt returned Some
+                tdbg_bump!(0x250);
                 if aad_len + encrypted.len() > nwk_buf.len() {
                     return Err(NwkStatus::FrameTooLong);
                 }
@@ -178,6 +329,8 @@ impl<M: MacDriver> NwkLayer<M> {
                 // Zero security level bits for OTA transmission (spec §4.3.1.2)
                 nwk_buf[hdr_len] &= !0x07;
             } else {
+                // BDB+0x254: security.encrypt returned None
+                tdbg_bump!(0x254);
                 log::warn!("[NWK] Encryption failed");
                 return Err(NwkStatus::InvalidRequest);
             }
@@ -212,6 +365,19 @@ impl<M: MacDriver> NwkLayer<M> {
                 let _ = self.send_route_record(dst_addr, &[]).await;
                 self.routing.clear_route_record_required(dst_addr);
             }
+        }
+
+        // BDB+0x240: hdr_len | (total_len << 16)
+        tdbg_set!(
+            0x240,
+            (hdr_len as u32 & 0xFFFF) | ((total_len as u32 & 0xFFFF) << 16)
+        );
+        // Capture post-encrypt frame bytes (up to 64) to 0x0084_FB20.
+        #[cfg(feature = "telink-debug")]
+        {
+            let n = core::cmp::min(total_len, 64);
+            tlnk_dbg::wire_copy(0x20, &nwk_buf[..n]);
+            tlnk_dbg::wire_set(0x6C, dst_addr.0 as u32 | ((next_hop.0 as u32) << 16));
         }
 
         log::info!(
@@ -249,6 +415,8 @@ impl<M: MacDriver> NwkLayer<M> {
             .await;
 
         if let Err(ref e) = mac_result {
+            // BDB+0x25C: MAC mcps_data Err count
+            tdbg_bump!(0x25C);
             nwk_trace!(
                 "[NWK][EFR32] tx_err dst=0x{:04X} nh=0x{:04X} seq={} err={:?}",
                 dst_addr.0,
@@ -260,6 +428,8 @@ impl<M: MacDriver> NwkLayer<M> {
         }
 
         mac_result.map_err(|_| NwkStatus::RouteError)?;
+        // BDB+0x258: MAC mcps_data Ok count
+        tdbg_bump!(0x258);
         nwk_trace!(
             "[NWK][EFR32] tx_ok dst=0x{:04X} nh=0x{:04X} seq={}",
             dst_addr.0,
