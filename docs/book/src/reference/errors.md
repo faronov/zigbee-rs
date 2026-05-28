@@ -352,7 +352,7 @@ High-level errors from device start / join / leave operations.
 | Variant | Meaning |
 |---------|---------|
 | `InitFailed` | BDB initialization failed |
-| `CommissioningFailed` | BDB commissioning (steering or formation) failed |
+| `CommissioningFailed(BdbStatus)` | BDB commissioning failed with a specific `BdbStatus` cause |
 
 ### `FirmwareError`
 
