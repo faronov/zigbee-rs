@@ -748,22 +748,23 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         Ok(true)
     }
 
-    /// Clear commissioned state while preserving the global counter bound.
+    /// Clear commissioned state while preserving outgoing counter bounds.
     pub fn factory_reset_security_state<S: SecurityStateStore>(
         &mut self,
         store: &mut S,
     ) -> Result<(), SecurityStoreError> {
-        let global_counter_limit = store
+        let (global_counter_limit, tclk_counter_limit) = store
             .load()?
-            .map(|state| state.global_counter_limit)
-            .unwrap_or(0);
+            .map(|state| (state.global_counter_limit, state.tclk_counter_limit))
+            .unwrap_or((0, 0));
         let mut state = PersistentSecurityState::empty();
         state.global_counter_limit = global_counter_limit;
+        state.tclk_counter_limit = tclk_counter_limit;
         store.store(&state)
     }
 
-    /// Factory-reset the stack while retaining the global counter bound that
-    /// prevents key/counter reuse on a later commissioning attempt.
+    /// Factory-reset the stack while retaining outgoing counter bounds that
+    /// prevent key/counter reuse on a later commissioning attempt.
     pub async fn factory_reset_with_security_store<S: SecurityStateStore>(
         &mut self,
         store: &mut S,

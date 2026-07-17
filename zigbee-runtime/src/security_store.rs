@@ -233,7 +233,6 @@ impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersist
         self.state.tclk_present = false;
         self.state.trust_center_address = [0; 8];
         self.state.trust_center_link_key = [0; 16];
-        self.state.tclk_counter_limit = 0;
         self.state.tclk_incoming_counter = 0;
         self.state.tclk_incoming_counter_valid = false;
         self.persist()?;
@@ -247,14 +246,10 @@ impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersist
         if state.key_type != ApsKeyType::TrustCenterLinkKey {
             return Err(SecurityPersistenceError::InvalidState);
         }
-        let same_key = self.state.tclk_present
-            && self.state.trust_center_address == state.partner_address
-            && self.state.trust_center_link_key == state.key;
-        let current = if same_key {
-            max(state.outgoing_frame_counter, self.state.tclk_counter_limit)
-        } else {
-            state.outgoing_frame_counter
-        };
+        // Keep one monotonic reservation space across replacement TCLKs. This
+        // avoids nonce reuse if commissioning is interrupted or a factory-new
+        // join receives the same per-device key again.
+        let current = max(state.outgoing_frame_counter, self.state.tclk_counter_limit);
         let reservation = self.reserve_from(current)?;
 
         self.state.tclk_present = true;
@@ -374,23 +369,24 @@ mod tests {
     #[test]
     fn commissioning_reserves_before_commit() {
         let mut store = RamSecurityStateStore::new();
-        let mut persistence = CommissioningSecurityPersistence::new(&mut store).unwrap();
-        assert_eq!(
-            persistence.reserve_network_security(&network_state(2)),
-            Ok(CounterReservation {
-                current: 2,
-                limit: 0x402
-            })
-        );
-        assert_eq!(
-            persistence.reserve_trust_center_link_key(&tclk_state(0, 0)),
-            Ok(CounterReservation {
-                current: 0,
-                limit: 0x400
-            })
-        );
-        persistence.commit_network(&tclk_state(1, 9)).unwrap();
-        drop(persistence);
+        {
+            let mut persistence = CommissioningSecurityPersistence::new(&mut store).unwrap();
+            assert_eq!(
+                persistence.reserve_network_security(&network_state(2)),
+                Ok(CounterReservation {
+                    current: 2,
+                    limit: 0x402
+                })
+            );
+            assert_eq!(
+                persistence.reserve_trust_center_link_key(&tclk_state(0, 0)),
+                Ok(CounterReservation {
+                    current: 0,
+                    limit: 0x400
+                })
+            );
+            persistence.commit_network(&tclk_state(1, 9)).unwrap();
+        }
         let saved = store.load().unwrap().unwrap();
         assert!(saved.commissioned);
         assert_eq!(saved.global_counter_limit, 0x402);
@@ -407,6 +403,39 @@ mod tests {
         let mut persistence = CommissioningSecurityPersistence::new(&mut store).unwrap();
         assert_eq!(
             persistence.reserve_network_security(&network_state(0)),
+            Ok(CounterReservation {
+                current: 0x800,
+                limit: 0xC00
+            })
+        );
+    }
+
+    #[test]
+    fn preserved_tclk_limit_survives_interrupted_commissioning() {
+        let mut store = RamSecurityStateStore::new();
+        let mut old = PersistentSecurityState::empty();
+        old.tclk_counter_limit = 0x800;
+        store.store(&old).unwrap();
+
+        {
+            let mut persistence = CommissioningSecurityPersistence::new(&mut store).unwrap();
+            persistence
+                .reserve_network_security(&network_state(0))
+                .unwrap();
+        }
+
+        let interrupted = store.load().unwrap().unwrap();
+        assert!(!interrupted.tclk_present);
+        assert_eq!(interrupted.tclk_counter_limit, 0x800);
+
+        let mut persistence = CommissioningSecurityPersistence::new(&mut store).unwrap();
+        persistence
+            .reserve_network_security(&network_state(0))
+            .unwrap();
+        let mut replacement_tclk = tclk_state(0, 0);
+        replacement_tclk.key = [9; 16];
+        assert_eq!(
+            persistence.reserve_trust_center_link_key(&replacement_tclk),
             Ok(CounterReservation {
                 current: 0x800,
                 limit: 0xC00

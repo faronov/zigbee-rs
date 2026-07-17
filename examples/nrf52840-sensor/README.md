@@ -13,7 +13,7 @@ on-chip TEMP as the default fallback. Uses `defmt` + RTT for logging.
 | `sensor-sht31`  | SHT31   | Temp + humidity              |
 
 All variants include: Basic, Power Configuration, **Identify** (LED blink),
-Battery voltage (SAADC), RAM power-down for unused banks, flash NV storage,
+Battery voltage (SAADC), RAM power-down for unused banks, atomic security persistence,
 NWK Leave handling, default reporting, and auto-recovery on sensor failure.
 
 ## Hardware Requirements
@@ -86,9 +86,10 @@ and yield during transfers, so the Zigbee radio continues processing uninterrupt
 - **Identify cluster** (0x0003) — LED blinks during Identify
 - Automatic sensor recovery on read failure (re-init next cycle)
 - Processing incoming MAC frames and generating ZCL attribute reports
-- Button-driven network join/leave via `UserAction::Toggle`
+- Button-driven network join/leave via the security-store lifecycle APIs
 - RAM power-down of unused banks (~190 KB saved on nRF52840)
-- **Flash NV storage** — network state persists across power cycles (last 8 KB of flash)
+- **Atomic security journal** — CRC, generation, and commit-protected security state
+  persists across power cycles in the last 8 KB of flash
 - Battery voltage monitoring via SAADC (VDD internal divider)
 - `log` → `defmt` bridge for stack-internal logging via RTT
 
@@ -119,10 +120,10 @@ stable environment.
 
 ## Operation
 
-1. Power on → restores saved network state from flash (if any) and auto-rejoins
-2. If no saved state → press Button 1 to initiate BDB commissioning
+1. Power on → atomically restores saved security state (if any) and auto-resumes
+2. If no saved state → automatically initiates BDB commissioning
 3. Once joined → reads sensors every 30 s, reports to coordinator; state saved to flash
-4. Press Button 1 → leaves the network and clears flash NV storage
+4. Press Button 1 → leaves the network and records factory-reset security state
 5. **Power cycle** → device reconnects automatically (no re-pairing needed!)
 
 ## Project Structure
@@ -135,7 +136,7 @@ nrf52840-sensor/
 ├── memory.x              # Memory layout: 1016 KB Flash + 8 KB NV, 256 KB RAM
 └── src/
     ├── bme280.rs         # Async BME280 I2C driver (feature: sensor-bme280)
-    ├── flash_nv.rs       # Flash-backed NV storage (NVMC, last 2 pages)
+    ├── flash_nv.rs       # Bounded NVMC adapter for the two-page security journal
     ├── sht31.rs          # Async SHT31 I2C driver (feature: sensor-sht31)
     └── main.rs           # Async entry point (#[embassy_executor::main])
 ```

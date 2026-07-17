@@ -6657,6 +6657,13 @@ fn runtime_sensor_main() -> ! {
                 // has time to propagate to the coordinator-side beacon flag.
                 delay_ms(5000);
             }
+            Err(StartError::PersistenceFailed(_)) => {
+                // This legacy start() path has no store, so persistence
+                // failures are unreachable unless its lifecycle changes.
+                mark32(DBG_MODE_BASE + 0x1C0, 0xFA20_0000);
+                mark32(DBG_MODE_BASE + 0x1A0, 0x53AA_FA20);
+                break;
+            }
         }
     }
     let _ = start_addr;

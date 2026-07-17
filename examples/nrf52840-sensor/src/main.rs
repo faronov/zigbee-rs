@@ -46,12 +46,14 @@ mod sht31;
 // Bridge `log` crate → defmt so stack-internal log::info!/debug! appear in RTT output.
 struct DefmtLogger;
 impl log::Log for DefmtLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool { true }
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
     fn log(&self, record: &log::Record) {
         match record.level() {
             log::Level::Error => defmt::error!("{}", defmt::Display2Format(record.args())),
-            log::Level::Warn  => defmt::warn!("{}", defmt::Display2Format(record.args())),
-            log::Level::Info  => defmt::info!("{}", defmt::Display2Format(record.args())),
+            log::Level::Warn => defmt::warn!("{}", defmt::Display2Format(record.args())),
+            log::Level::Info => defmt::info!("{}", defmt::Display2Format(record.args())),
             log::Level::Debug => defmt::debug!("{}", defmt::Display2Format(record.args())),
             log::Level::Trace => defmt::trace!("{}", defmt::Display2Format(record.args())),
         }
@@ -62,9 +64,11 @@ static LOGGER: DefmtLogger = DefmtLogger;
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_nwk::DeviceType;
-use zigbee_runtime::event_loop::{StackEvent, TickResult};
+use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
+use zigbee_runtime::security_journal::SecurityStateJournal;
+use zigbee_runtime::security_store::{SecurityStateStore, SecurityStoreError};
+use zigbee_runtime::{ClusterRef, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
 use zigbee_zcl::clusters::identify::IdentifyCluster;
@@ -85,9 +89,13 @@ const EXPECTED_REPORT_CLUSTERS: usize = 3; // PowerConfig + Temp + Humidity
 #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
 const I2C_SENSOR_ADDR: u8 = {
     #[cfg(feature = "sensor-bme280")]
-    { 0x76 }
+    {
+        0x76
+    }
     #[cfg(all(feature = "sensor-sht31", not(feature = "sensor-bme280")))]
-    { 0x44 }
+    {
+        0x44
+    }
 };
 
 #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
@@ -113,17 +121,17 @@ core::arch::global_asm!(
     ".global __pre_init",
     ".thumb_func",
     "__pre_init:",
-    "ldr r0, =0x40000904",  // POWER.RAM[0].POWERSET
-    "mvn r1, #0",           // r1 = 0xFFFFFFFF
-    "str r1, [r0, #0x00]",  // RAM[0].POWERSET
-    "str r1, [r0, #0x10]",  // RAM[1].POWERSET
-    "str r1, [r0, #0x20]",  // RAM[2].POWERSET
-    "str r1, [r0, #0x30]",  // RAM[3].POWERSET
-    "str r1, [r0, #0x40]",  // RAM[4].POWERSET
-    "str r1, [r0, #0x50]",  // RAM[5].POWERSET
-    "str r1, [r0, #0x60]",  // RAM[6].POWERSET
-    "str r1, [r0, #0x70]",  // RAM[7].POWERSET
-    "str r1, [r0, #0x80]",  // RAM[8].POWERSET
+    "ldr r0, =0x40000904", // POWER.RAM[0].POWERSET
+    "mvn r1, #0",          // r1 = 0xFFFFFFFF
+    "str r1, [r0, #0x00]", // RAM[0].POWERSET
+    "str r1, [r0, #0x10]", // RAM[1].POWERSET
+    "str r1, [r0, #0x20]", // RAM[2].POWERSET
+    "str r1, [r0, #0x30]", // RAM[3].POWERSET
+    "str r1, [r0, #0x40]", // RAM[4].POWERSET
+    "str r1, [r0, #0x50]", // RAM[5].POWERSET
+    "str r1, [r0, #0x60]", // RAM[6].POWERSET
+    "str r1, [r0, #0x70]", // RAM[7].POWERSET
+    "str r1, [r0, #0x80]", // RAM[8].POWERSET
     "bx lr",
 );
 
@@ -141,7 +149,9 @@ fn power_down_unused_ram() {
     const POWER_BASE: usize = 0x4000_0900;
     let powerclr8 = (POWER_BASE + 8 * 0x10 + 0x08) as *mut u32;
     // All 6 sections off (bits 0-5 for power, bits 16-21 for retention)
-    unsafe { core::ptr::write_volatile(powerclr8, 0x003F_003F); }
+    unsafe {
+        core::ptr::write_volatile(powerclr8, 0x003F_003F);
+    }
     info!("RAM: powered down 192KB (bank 8)");
 }
 
@@ -161,7 +171,6 @@ async fn main(_spawner: Spawner) {
         reg1: true,
     };
     let p = embassy_nrf::init(config);
-
 
     info!("Zigbee-RS nRF52840 sensor starting…");
 
@@ -191,16 +200,26 @@ async fn main(_spawner: Spawner) {
     #[cfg(feature = "sensor-bme280")]
     let mut sensor_ok = bme280::init(&mut i2c, I2C_SENSOR_ADDR).await;
     #[cfg(feature = "sensor-bme280")]
-    if sensor_ok { info!("BME280 ready"); } else { warn!("BME280 not found"); }
+    if sensor_ok {
+        info!("BME280 ready");
+    } else {
+        warn!("BME280 not found");
+    }
 
     #[cfg(feature = "sensor-sht31")]
     let mut sensor_ok = sht31::init(&mut i2c, I2C_SENSOR_ADDR).await;
     #[cfg(feature = "sensor-sht31")]
-    if sensor_ok { info!("SHT31 ready"); } else { warn!("SHT31 not found"); }
+    if sensor_ok {
+        info!("SHT31 ready");
+    } else {
+        warn!("SHT31 not found");
+    }
 
     // SAADC for battery voltage
     let mut saadc_sensor = Saadc::new(
-        p.SAADC, Irqs, saadc::Config::default(),
+        p.SAADC,
+        Irqs,
+        saadc::Config::default(),
         [ChannelConfig::single_ended(VddInput)],
     );
     saadc_sensor.calibrate().await;
@@ -211,13 +230,19 @@ async fn main(_spawner: Spawner) {
     mac.set_tx_power(0);
     info!("Radio ready (TX 0 dBm)");
 
-    // ── Flash NV storage (last 2 pages of 1 MB flash) ──
+    // ── Atomic security journal (last 2 pages of 1 MB flash) ──
     let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
-    let mut nv = flash_nv::FlashNvStorage::new(nvmc);
-    info!("Flash NV storage ready");
+    let security_flash = flash_nv::Nrf52840SecurityFlash::new(nvmc);
+    let mut security_store = SecurityStateJournal::new(
+        security_flash,
+        flash_nv::SECURITY_PAGE_A,
+        flash_nv::SECURITY_PAGE_B,
+    );
+    info!("Security journal ready");
 
     // ── ZCL clusters ──
-    let mut basic_cluster = BasicCluster::new(b"Zigbee-RS", b"nRF52840-Sensor", b"20260401", b"0.1.0");
+    let mut basic_cluster =
+        BasicCluster::new(b"Zigbee-RS", b"nRF52840-Sensor", b"20260401", b"0.1.0");
     basic_cluster.set_power_source(0x03);
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
@@ -234,70 +259,51 @@ async fn main(_spawner: Spawner) {
     // ── Build device ──
     let mut device = ZigbeeDevice::builder(mac)
         .device_type(DeviceType::EndDevice)
-        .power_mode(PowerMode::Sleepy { poll_interval_ms: 10_000, wake_duration_ms: 500 })
+        .power_mode(PowerMode::Sleepy {
+            poll_interval_ms: 10_000,
+            wake_duration_ms: 500,
+        })
         .manufacturer("Zigbee-RS")
         .model("nRF52840-Sensor")
         .sw_build("0.1.0")
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
         .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
-            let ep = ep.cluster_server(0x0000) // Basic
-                .cluster_server(0x0003)        // Identify
-                .cluster_server(0x0001)        // Power Configuration
-                .cluster_server(0x0402)        // Temperature Measurement
-                .cluster_server(0x0405);       // Relative Humidity
+            let ep = ep
+                .cluster_server(0x0000) // Basic
+                .cluster_server(0x0003) // Identify
+                .cluster_server(0x0001) // Power Configuration
+                .cluster_server(0x0402) // Temperature Measurement
+                .cluster_server(0x0405); // Relative Humidity
             #[cfg(feature = "sensor-bme280")]
             let ep = ep.cluster_server(0x0403); // Pressure Measurement
             ep
         })
         .build();
 
-    // ── Restore previous network state from flash ──
-    let restored = device.restore_state(&nv);
-    if restored {
-        info!("Restored network state from flash — will rejoin existing network");
-        device.user_action(UserAction::Rejoin);
-    } else {
-        info!("No saved state — auto-joining network…");
-        device.user_action(UserAction::Join);
-    }
-
-    // Initial tick to start BDB steering
-    #[cfg(feature = "sensor-bme280")]
-    let mut clusters = [
-        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut press_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-    ];
-    #[cfg(not(feature = "sensor-bme280"))]
-    let mut clusters = [
-        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-    ];
-    if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-        if log_event(e, &mut led) {
-            // Initial join — save immediately
-            device.save_state(&mut nv);
-            info!("Network state saved to flash");
-        }
+    // Restore and reserve fresh security-counter ranges before any secured
+    // resume traffic, or commission with durable reservations on first boot.
+    if join_or_resume(&mut device, &mut security_store).await {
+        led.set_low();
     }
 
     // ── Read sensors once so clusters have real values for ZHA interview ──
     read_sensors(
-        &mut temp_cluster, &mut hum_cluster,
-        #[cfg(feature = "sensor-bme280")] &mut press_cluster,
+        &mut temp_cluster,
+        &mut hum_cluster,
+        #[cfg(feature = "sensor-bme280")]
+        &mut press_cluster,
         &mut power_cluster,
-        #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))] &mut temp_sensor,
-        #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))] &mut i2c,
-        #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))] &mut sensor_ok,
-        #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))] &mut hum_tick,
+        #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
+        &mut temp_sensor,
+        #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
+        &mut i2c,
+        #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
+        &mut sensor_ok,
+        #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
+        &mut hum_tick,
         &mut saadc_sensor,
-    ).await;
+    )
+    .await;
 
     // ── Default reporting so device reports even without ZHA ConfigureReporting ──
     setup_default_reporting(&mut device);
@@ -317,17 +323,22 @@ async fn main(_spawner: Spawner) {
     let mut last_annce = Instant::now();
     let mut was_fast_polling = device.is_joined();
     let mut interview_done = false;
-    let mut needs_save = false;
-
     loop {
         let now = Instant::now();
         let in_fast_poll = now < fast_poll_until;
-        let poll_ms = if in_fast_poll { FAST_POLL_MS } else { SLOW_POLL_SECS * 1000 };
+        let poll_ms = if in_fast_poll {
+            FAST_POLL_MS
+        } else {
+            SLOW_POLL_SECS * 1000
+        };
 
         // Log transition from fast→slow poll
         if was_fast_polling && !in_fast_poll {
             let cfg = device.configured_cluster_count(1);
-            info!("Fast poll OFF — {}/{} clusters configured", cfg, EXPECTED_REPORT_CLUSTERS);
+            info!(
+                "Fast poll OFF — {}/{} clusters configured",
+                cfg, EXPECTED_REPORT_CLUSTERS
+            );
             was_fast_polling = false;
             if !interview_done {
                 led.set_high(); // LED OFF
@@ -343,21 +354,25 @@ async fn main(_spawner: Spawner) {
         match select(
             button.wait_for_falling_edge(),
             Timer::after(Duration::from_millis(poll_ms)),
-        ).await {
+        )
+        .await
+        {
             Either::First(_) => {
                 // Check for long press (3s = factory reset)
                 let held_long = matches!(
                     select(
                         button.wait_for_rising_edge(),
                         Timer::after(Duration::from_secs(3)),
-                    ).await,
+                    )
+                    .await,
                     Either::Second(_)
                 );
 
                 if held_long {
                     info!("FACTORY RESET");
-                    device.factory_reset(Some(&mut nv)).await;
-                    info!("NV storage cleared — rebooting");
+                    if factory_reset(&mut device, &mut security_store).await {
+                        info!("Security state reset — rebooting");
+                    }
                     for _ in 0..5u8 {
                         led.set_low();
                         Timer::after(Duration::from_millis(100)).await;
@@ -365,57 +380,24 @@ async fn main(_spawner: Spawner) {
                         Timer::after(Duration::from_millis(100)).await;
                     }
                     cortex_m::peripheral::SCB::sys_reset();
-                } else {
-                    info!("Button → {}", if device.is_joined() { "leave" } else { "join" });
-                    device.user_action(UserAction::Toggle);
-                    #[cfg(feature = "sensor-bme280")]
-                    let mut clusters = [
-                        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut press_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-                    ];
-                    #[cfg(not(feature = "sensor-bme280"))]
-                    let mut clusters = [
-                        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-                    ];
-                    if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-                        match e {
-                            StackEvent::Joined { .. } => {
-                                log_event(e, &mut led);
-                                device.save_state(&mut nv);
-                                info!("Network state saved to flash");
-                                fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                annce_retries_left = 5;
-                                last_annce = Instant::now();
-                                interview_done = false;
-                            }
-                            StackEvent::Left => {
-                                log_event(e, &mut led);
-                                device.factory_reset(Some(&mut nv)).await;
-                                info!("NV storage cleared");
-                            }
-                            StackEvent::LeaveRequested => {
-                                info!("Leave via tick — erasing NV and rejoining");
-                                device.factory_reset(Some(&mut nv)).await;
-                                device.user_action(UserAction::Join);
-                                fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                interview_done = false;
-                                annce_retries_left = 5;
-                                last_annce = Instant::now();
-                                led.set_low();
-                            }
-                            _ => { log_event(e, &mut led); }
-                        }
+                } else if device.is_joined() {
+                    info!("Button → leave");
+                    if factory_reset(&mut device, &mut security_store).await {
+                        led.set_high();
+                        info!("Left network and reset security state");
                     }
-                    Timer::after(Duration::from_millis(300)).await;
+                } else {
+                    info!("Button → join");
+                    if join_or_resume(&mut device, &mut security_store).await {
+                        led.set_low();
+                        fast_poll_until =
+                            Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                        annce_retries_left = 5;
+                        last_annce = Instant::now();
+                        interview_done = false;
+                    }
                 }
+                Timer::after(Duration::from_millis(300)).await;
             }
             Either::Second(_) => {} // Normal timeout — proceed to poll
         }
@@ -426,46 +408,93 @@ async fn main(_spawner: Spawner) {
                     Ok(Some(ind)) => {
                         #[cfg(feature = "sensor-bme280")]
                         let mut cls = [
-                            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut press_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut basic_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut temp_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut hum_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut press_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut power_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut identify_cluster,
+                            },
                         ];
                         #[cfg(not(feature = "sensor-bme280"))]
                         let mut cls = [
-                            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut basic_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut temp_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut hum_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut power_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut identify_cluster,
+                            },
                         ];
-                        if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
-                            match &ev {
-                                StackEvent::LeaveRequested => {
-                                    info!("Coordinator sent Leave — erasing NV and rejoining");
-                                    device.factory_reset(Some(&mut nv)).await;
-                                    device.user_action(UserAction::Join);
-                                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                        let event = match device
+                            .process_incoming_with_security_store(
+                                &ind,
+                                &mut cls,
+                                &mut security_store,
+                            )
+                            .await
+                        {
+                            Ok(event) => event,
+                            Err(error) => persistence_failure(error),
+                        };
+                        if let Some(ev) = event {
+                            if matches!(ev, StackEvent::LeaveRequested) {
+                                info!("Coordinator sent Leave — resetting and rejoining");
+                                if factory_reset(&mut device, &mut security_store).await
+                                    && join_or_resume(&mut device, &mut security_store).await
+                                {
+                                    fast_poll_until = Instant::now()
+                                        + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                     interview_done = false;
                                     annce_retries_left = 5;
                                     last_annce = Instant::now();
-                                    led.set_low(); // LED ON — joining
-                                    break; // break poll loop, tick will handle Start
+                                    led.set_low();
                                 }
-                                _ => {}
+                                break;
                             }
                             if log_event(&ev, &mut led) {
-                                fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                needs_save = true;
+                                fast_poll_until =
+                                    Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                             }
                         }
                         // Check if ZHA completed interview
                         if !interview_done {
                             let cfg_count = device.configured_cluster_count(1);
                             if cfg_count >= EXPECTED_REPORT_CLUSTERS {
-                                info!("Interview done! {}/{} clusters configured", cfg_count, EXPECTED_REPORT_CLUSTERS);
+                                info!(
+                                    "Interview done! {}/{} clusters configured",
+                                    cfg_count, EXPECTED_REPORT_CLUSTERS
+                                );
                                 fast_poll_until = Instant::now() + Duration::from_secs(5);
                                 interview_done = true;
                                 led.set_high(); // LED OFF — power save
@@ -474,22 +503,60 @@ async fn main(_spawner: Spawner) {
                         // Tick to send queued ZCL responses
                         #[cfg(feature = "sensor-bme280")]
                         let mut cls2 = [
-                            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut press_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut basic_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut temp_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut hum_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut press_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut power_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut identify_cluster,
+                            },
                         ];
                         #[cfg(not(feature = "sensor-bme280"))]
                         let mut cls2 = [
-                            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut basic_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut temp_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut hum_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut power_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut identify_cluster,
+                            },
                         ];
-                        let _ = device.tick(0, &mut cls2).await;
+                        if let Err(error) = device
+                            .tick_with_security_store(0, &mut cls2, &mut security_store)
+                            .await
+                        {
+                            persistence_failure(error);
+                        }
                     }
                     Ok(None) => break,
                     Err(_) => break,
@@ -503,37 +570,84 @@ async fn main(_spawner: Spawner) {
             if elapsed_s >= REPORT_INTERVAL_SECS {
                 last_report = now2;
                 read_sensors(
-                    &mut temp_cluster, &mut hum_cluster,
-                    #[cfg(feature = "sensor-bme280")] &mut press_cluster,
+                    &mut temp_cluster,
+                    &mut hum_cluster,
+                    #[cfg(feature = "sensor-bme280")]
+                    &mut press_cluster,
                     &mut power_cluster,
-                    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))] &mut temp_sensor,
-                    #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))] &mut i2c,
-                    #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))] &mut sensor_ok,
-                    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))] &mut hum_tick,
+                    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
+                    &mut temp_sensor,
+                    #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
+                    &mut i2c,
+                    #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
+                    &mut sensor_ok,
+                    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
+                    &mut hum_tick,
                     &mut saadc_sensor,
-                ).await;
+                )
+                .await;
             }
 
             // Tick the runtime
             let tick_elapsed = elapsed_s.min(60) as u16;
             #[cfg(feature = "sensor-bme280")]
             let mut clusters = [
-                ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut press_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut basic_cluster,
+                },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut temp_cluster,
+                },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut hum_cluster,
+                },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut press_cluster,
+                },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut power_cluster,
+                },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut identify_cluster,
+                },
             ];
             #[cfg(not(feature = "sensor-bme280"))]
             let mut clusters = [
-                ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut basic_cluster,
+                },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut temp_cluster,
+                },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut hum_cluster,
+                },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut power_cluster,
+                },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut identify_cluster,
+                },
             ];
-            if let TickResult::Event(ref e) = device.tick(tick_elapsed, &mut clusters).await {
+            let tick_result = match device
+                .tick_with_security_store(tick_elapsed, &mut clusters, &mut security_store)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => persistence_failure(error),
+            };
+            if let TickResult::Event(ref e) = tick_result {
                 if log_event(e, &mut led) {
                     fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                 }
@@ -550,14 +664,9 @@ async fn main(_spawner: Spawner) {
                 annce_retries_left -= 1;
                 last_annce = now2;
                 info!("Re-sending Device_annce ({} left)", annce_retries_left);
+                checkpoint_security(&mut device, &mut security_store);
                 let _ = device.send_device_annce().await;
-            }
-
-            // Save state after successful join (deferred)
-            if needs_save && device.is_joined() {
-                device.save_state(&mut nv);
-                needs_save = false;
-                info!("Network state saved to flash");
+                checkpoint_security(&mut device, &mut security_store);
             }
         } else {
             // ── Not joined — blink and auto-retry ──
@@ -577,38 +686,92 @@ async fn main(_spawner: Spawner) {
                 rejoin_count = rejoin_count.wrapping_add(1);
                 last_rejoin_attempt = Instant::now();
                 info!("Not joined — retrying (attempt {})…", rejoin_count);
-                device.user_action(UserAction::Join);
-                #[cfg(feature = "sensor-bme280")]
-                let mut clusters = [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut press_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-                ];
-                #[cfg(not(feature = "sensor-bme280"))]
-                let mut clusters = [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-                ];
-                let _ = device.tick(0, &mut clusters).await;
-                if device.is_joined() {
-                    info!("Joined! addr=0x{:04X}", device.short_address());
-                    led.set_low(); // LED ON
+                if join_or_resume(&mut device, &mut security_store).await {
+                    led.set_low();
                     fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                     annce_retries_left = 5;
                     last_annce = Instant::now();
                     interview_done = false;
-                    device.save_state(&mut nv);
-                    info!("Network state saved to flash");
                 }
             }
         }
     }
+}
+
+async fn join_or_resume<M, S>(device: &mut ZigbeeDevice<M>, store: &mut S) -> bool
+where
+    M: zigbee_mac::MacDriver,
+    S: SecurityStateStore,
+{
+    match device.start_or_resume_with_security_store(store).await {
+        Ok(short_address) => {
+            info!(
+                "Joined/resumed network: addr=0x{:04X} ch={} pan=0x{:04X}",
+                short_address,
+                device.channel(),
+                device.pan_id()
+            );
+            checkpoint_security(device, store);
+            device.send_ed_timeout_request().await;
+            checkpoint_security(device, store);
+            true
+        }
+        Err(StartError::InitFailed) => {
+            warn!("Zigbee initialization failed");
+            false
+        }
+        Err(StartError::CommissioningFailed(status)) => {
+            warn!("Commissioning failed: status=0x{:02X}", status as u8);
+            false
+        }
+        Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
+    }
+}
+
+async fn factory_reset<M, S>(device: &mut ZigbeeDevice<M>, store: &mut S) -> bool
+where
+    M: zigbee_mac::MacDriver,
+    S: SecurityStateStore,
+{
+    match device.factory_reset_with_security_store(store).await {
+        Ok(()) => true,
+        Err(StartError::InitFailed) => {
+            warn!("Factory reset initialization failed");
+            false
+        }
+        Err(StartError::CommissioningFailed(status)) => {
+            warn!("Factory reset failed: status=0x{:02X}", status as u8);
+            false
+        }
+        Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
+    }
+}
+
+fn checkpoint_security<M, S>(device: &mut ZigbeeDevice<M>, store: &mut S)
+where
+    M: zigbee_mac::MacDriver,
+    S: SecurityStateStore,
+{
+    if let Err(error) = device.refresh_security_state(store) {
+        persistence_failure(error);
+    }
+}
+
+#[inline(never)]
+fn persistence_failure(error: SecurityStoreError) -> ! {
+    match error {
+        SecurityStoreError::NotFound => error!("Security persistence failed: not found"),
+        SecurityStoreError::Corrupt => error!("Security persistence failed: corrupt state"),
+        SecurityStoreError::Full => error!("Security persistence failed: full"),
+        SecurityStoreError::Hardware => error!("Security persistence failed: hardware"),
+        SecurityStoreError::CounterExhausted => {
+            error!("Security persistence failed: counter exhausted")
+        }
+        SecurityStoreError::GenerationExhausted => {
+            error!("Security persistence failed: generation exhausted")
+        }
+    }
+    core::panic!("security persistence failure");
 }
 
 /// Read all sensors and update clusters.
@@ -618,8 +781,13 @@ async fn read_sensors(
     hum_cluster: &mut HumidityCluster,
     #[cfg(feature = "sensor-bme280")] press_cluster: &mut PressureCluster,
     power_cluster: &mut PowerConfigCluster,
-    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))] temp_sensor: &mut Temp<'_>,
-    #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))] i2c: &mut Twim<'_, peripherals::TWISPI0>,
+    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))] temp_sensor: &mut Temp<
+        '_,
+    >,
+    #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))] i2c: &mut Twim<
+        '_,
+        peripherals::TWISPI0,
+    >,
     #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))] sensor_ok: &mut bool,
     #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))] hum_tick: &mut u32,
     saadc: &mut Saadc<'_, 1>,
@@ -628,19 +796,26 @@ async fn read_sensors(
     {
         if !*sensor_ok {
             *sensor_ok = bme280::init(i2c, I2C_SENSOR_ADDR).await;
-            if *sensor_ok { info!("BME280 recovered"); }
+            if *sensor_ok {
+                info!("BME280 recovered");
+            }
         }
         if *sensor_ok {
             if let Some(data) = bme280::read(i2c, I2C_SENSOR_ADDR).await {
                 temp_cluster.set_temperature(data.temperature_centideg);
                 hum_cluster.set_humidity(data.humidity_centipct);
                 press_cluster.set_pressure(data.pressure_hpa as i16);
-                info!("T={}.{:02}°C H={}.{:02}% P={}hPa",
+                info!(
+                    "T={}.{:02}°C H={}.{:02}% P={}hPa",
                     data.temperature_centideg / 100,
                     (data.temperature_centideg % 100).unsigned_abs(),
-                    data.humidity_centipct / 100, data.humidity_centipct % 100,
-                    data.pressure_hpa);
-            } else { warn!("BME280 read failed"); }
+                    data.humidity_centipct / 100,
+                    data.humidity_centipct % 100,
+                    data.pressure_hpa
+                );
+            } else {
+                warn!("BME280 read failed");
+            }
         }
     }
 
@@ -648,17 +823,24 @@ async fn read_sensors(
     {
         if !*sensor_ok {
             *sensor_ok = sht31::init(i2c, I2C_SENSOR_ADDR).await;
-            if *sensor_ok { info!("SHT31 recovered"); }
+            if *sensor_ok {
+                info!("SHT31 recovered");
+            }
         }
         if *sensor_ok {
             if let Some(data) = sht31::read(i2c, I2C_SENSOR_ADDR).await {
                 temp_cluster.set_temperature(data.temperature_centideg);
                 hum_cluster.set_humidity(data.humidity_centipct);
-                info!("T={}.{:02}°C H={}.{:02}%",
+                info!(
+                    "T={}.{:02}°C H={}.{:02}%",
                     data.temperature_centideg / 100,
                     (data.temperature_centideg % 100).unsigned_abs(),
-                    data.humidity_centipct / 100, data.humidity_centipct % 100);
-            } else { warn!("SHT31 read failed"); }
+                    data.humidity_centipct / 100,
+                    data.humidity_centipct % 100
+                );
+            } else {
+                warn!("SHT31 read failed");
+            }
         }
     }
 
@@ -670,9 +852,13 @@ async fn read_sensors(
         let hum_hundredths = 5000u16 + ((*hum_tick % 100) as u16).wrapping_mul(10);
         temp_cluster.set_temperature(temp_hundredths);
         hum_cluster.set_humidity(hum_hundredths);
-        info!("T={}.{:02}°C H={}.{:02}% (on-chip)",
-            temp_hundredths / 100, (temp_hundredths % 100).unsigned_abs(),
-            hum_hundredths / 100, hum_hundredths % 100);
+        info!(
+            "T={}.{:02}°C H={}.{:02}% (on-chip)",
+            temp_hundredths / 100,
+            (temp_hundredths % 100).unsigned_abs(),
+            hum_hundredths / 100,
+            hum_hundredths % 100
+        );
     }
 
     // Battery
@@ -680,9 +866,13 @@ async fn read_sensors(
     saadc.sample(&mut buf).await;
     let raw = buf[0].max(0) as u32;
     let voltage_mv = raw * 3600 / 4096;
-    let pct = if voltage_mv >= 3000 { 100u8 }
-              else if voltage_mv <= 1800 { 0 }
-              else { ((voltage_mv - 1800) * 100 / 1200) as u8 };
+    let pct = if voltage_mv >= 3000 {
+        100u8
+    } else if voltage_mv <= 1800 {
+        0
+    } else {
+        ((voltage_mv - 1800) * 100 / 1200) as u8
+    };
     power_cluster.set_battery_voltage((voltage_mv / 100) as u8);
     power_cluster.set_battery_percentage(pct * 2);
     info!("Battery: {}mV ({}%)", voltage_mv, pct);
@@ -691,9 +881,16 @@ async fn read_sensors(
 /// LED ON = joined, blink = joining, OFF = idle. Returns true on join event.
 fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>) -> bool {
     match event {
-        StackEvent::Joined { short_address, channel, pan_id } => {
+        StackEvent::Joined {
+            short_address,
+            channel,
+            pan_id,
+        } => {
             led.set_low(); // ON
-            info!("Joined! addr=0x{:04X} ch={} pan=0x{:04X}", short_address, channel, pan_id);
+            info!(
+                "Joined! addr=0x{:04X} ch={} pan=0x{:04X}",
+                short_address, channel, pan_id
+            );
             true
         }
         StackEvent::Left => {
@@ -701,7 +898,10 @@ fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>) -> bool {
             info!("Left network");
             false
         }
-        StackEvent::ReportSent => { info!("Report sent"); false }
+        StackEvent::ReportSent => {
+            info!("Report sent");
+            false
+        }
         StackEvent::LeaveRequested => {
             led.set_low(); // ON — rejoining
             info!("Leave requested by coordinator");
@@ -711,18 +911,22 @@ fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>) -> bool {
             info!("Commissioning: {}", if *success { "ok" } else { "failed" });
             false
         }
-        _ => { info!("Stack event"); false }
+        _ => {
+            info!("Stack event");
+            false
+        }
     }
 }
 
 /// Configure default reporting with change thresholds to suppress unnecessary TX.
 fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M>) {
-    use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
     use zigbee_zcl::data_types::{ZclDataType, ZclValue};
+    use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
 
     // Temperature: report every 60-300s, min change 0.5°C (50 centidegrees)
     let _ = device.reporting_mut().configure_for_cluster(
-        1, 0x0402,
+        1,
+        0x0402,
         ReportingConfig {
             direction: ReportDirection::Send,
             attribute_id: zigbee_zcl::AttributeId(0x0000),
@@ -735,7 +939,8 @@ fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M
 
     // Humidity: report every 60-300s, min change 1% (100 centi-%)
     let _ = device.reporting_mut().configure_for_cluster(
-        1, 0x0405,
+        1,
+        0x0405,
         ReportingConfig {
             direction: ReportDirection::Send,
             attribute_id: zigbee_zcl::AttributeId(0x0000),
@@ -748,7 +953,8 @@ fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M
 
     // Battery: report every 300-3600s, min change 2% (4 in 0.5% units)
     let _ = device.reporting_mut().configure_for_cluster(
-        1, 0x0001,
+        1,
+        0x0001,
         ReportingConfig {
             direction: ReportDirection::Send,
             attribute_id: zigbee_zcl::AttributeId(0x0021),
