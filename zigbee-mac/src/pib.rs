@@ -208,6 +208,30 @@ impl MacPib {
         *self = Self::new(self.extended_address, dsn, bsn);
     }
 
+    pub fn short_address(&self) -> ShortAddress {
+        self.short_address
+    }
+
+    pub fn pan_id(&self) -> PanId {
+        self.pan_id
+    }
+
+    pub fn extended_address(&self) -> IeeeAddress {
+        self.extended_address
+    }
+
+    pub fn promiscuous(&self) -> bool {
+        self.promiscuous
+    }
+
+    pub fn current_channel(&self) -> u8 {
+        self.current_channel
+    }
+
+    pub fn transmit_power(&self) -> i8 {
+        self.transmit_power
+    }
+
     pub fn get(&self, attr: PibAttribute) -> PibValue {
         use PibAttribute::*;
         match attr {

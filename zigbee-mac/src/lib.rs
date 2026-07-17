@@ -30,6 +30,7 @@ pub mod phy;
 pub mod pib;
 pub mod platform;
 pub mod primitives;
+pub mod soft_mac;
 
 #[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod esp;
@@ -65,6 +66,7 @@ pub use phy::{
 pub use pib::{MacPib, PibAttribute, PibError, PibValue};
 pub use platform::{PlatformServices, WrappingTickExtender};
 pub use primitives::*;
+pub use soft_mac::SoftMacCore;
 
 use zigbee_types::TxPower;
 
