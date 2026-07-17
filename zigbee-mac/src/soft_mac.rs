@@ -2,11 +2,12 @@
 
 use zigbee_types::MacAddress;
 
-use crate::frames::{build_beacon_request, parse_beacon};
+use crate::frames::{build_beacon_request, build_data_frame, parse_beacon, parse_mac_addresses};
 use crate::pib::scan_duration_us;
 use crate::{
-    EdValue, MacError, MacPib, MlmeScanConfirm, MlmeScanRequest, PanDescriptor, PhyAddressFilter,
-    PhyError, PhyRxFrame, PibAttribute, PibError, PibValue, PlatformServices, RadioPhy, ScanType,
+    EdValue, MacError, MacFrame, MacPib, McpsDataConfirm, McpsDataIndication, McpsDataRequest,
+    MlmeScanConfirm, MlmeScanRequest, PanDescriptor, PhyAddressFilter, PhyError, PhyRxFrame,
+    PibAttribute, PibError, PibValue, PlatformServices, RadioPhy, ScanType,
 };
 
 const UNIT_BACKOFF_PERIOD_US: u32 = 320;
@@ -193,6 +194,71 @@ impl<P: RadioPhy + PlatformServices> PlatformServices for SoftMacCore<P> {
 }
 
 impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
+    pub async fn transmit_data(
+        &mut self,
+        req: McpsDataRequest<'_>,
+    ) -> Result<McpsDataConfirm, MacError> {
+        if req.tx_options.indirect || req.tx_options.security_enabled {
+            return Err(MacError::Unsupported);
+        }
+
+        let ack_requested = req.tx_options.ack_tx
+            && !matches!(
+                req.dst_address,
+                MacAddress::Short(_, address) if address.0 == 0xFFFF
+            );
+        let frame = build_data_frame(
+            self.pib.next_dsn(),
+            req.src_addr_mode,
+            self.pib.short_address(),
+            &self.pib.extended_address(),
+            &req.dst_address,
+            req.payload,
+            ack_requested,
+        )
+        .map_err(|_| MacError::FrameTooLong)?;
+
+        if ack_requested {
+            self.transmit_acknowledged(&frame).await?;
+        } else {
+            self.transmit_csma(&frame).await?;
+        }
+
+        Ok(McpsDataConfirm {
+            msdu_handle: req.msdu_handle,
+            timestamp: None,
+        })
+    }
+
+    pub async fn receive_data(&mut self, timeout_us: u32) -> Result<McpsDataIndication, MacError> {
+        let started_at = self.monotonic_micros();
+
+        for _ in 0..MAX_SCAN_FRAMES_PER_CHANNEL {
+            let frame = if let Some(frame) = self.take_pending_rx() {
+                Some(frame)
+            } else {
+                let elapsed = self.monotonic_micros().wrapping_sub(started_at);
+                let Some(remaining) = timeout_us.checked_sub(elapsed) else {
+                    return Err(MacError::NoData);
+                };
+                match self.phy.receive(remaining).await {
+                    Ok(frame) => frame,
+                    Err(PhyError::CrcFailed) => continue,
+                    Err(error) => return Err(Self::map_phy_error(error)),
+                }
+            };
+
+            let Some(frame) = frame else {
+                return Err(MacError::NoData);
+            };
+            if let Some(indication) = self.process_received_data(frame).await? {
+                return Ok(indication);
+            }
+        }
+
+        Err(MacError::NoData)
+    }
+
     pub async fn scan(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
         if req.scan_duration > 14 {
             return Err(MacError::InvalidParameter);
@@ -311,6 +377,50 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
         let _ = self.pending_rx.push_back(frame);
     }
 
+    async fn process_received_data(
+        &mut self,
+        frame: PhyRxFrame,
+    ) -> Result<Option<McpsDataIndication>, MacError> {
+        let data = frame.as_slice();
+        if data.len() < 3 {
+            return Ok(None);
+        }
+
+        let frame_control = u16::from_le_bytes([data[0], data[1]]);
+        if frame_control & 0x07 != 0x01 {
+            return Ok(None);
+        }
+
+        let (source, destination, payload_offset, security_use) = parse_mac_addresses(data);
+        if payload_offset < 3
+            || payload_offset > data.len()
+            || !self.accepts_destination(&destination)
+        {
+            return Ok(None);
+        }
+
+        let ack_requested = frame_control & (1 << 5) != 0;
+        if ack_requested
+            && self.is_exact_destination(&destination)
+            && !self.phy.capabilities().hardware_auto_ack
+        {
+            self.phy
+                .send_ack(data[2], false)
+                .await
+                .map_err(Self::map_phy_error)?;
+        }
+
+        let payload =
+            MacFrame::from_slice(&data[payload_offset..]).ok_or(MacError::FrameTooLong)?;
+        Ok(Some(McpsDataIndication {
+            src_address: source,
+            dst_address: destination,
+            lqi: frame.lqi,
+            payload,
+            security_use,
+        }))
+    }
+
     async fn scan_unfiltered(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
         let duration_us = u32::try_from(scan_duration_us(req.scan_duration))
             .map_err(|_| MacError::InvalidParameter)?;
@@ -415,7 +525,7 @@ mod tests {
     use std::task::Wake;
 
     use super::*;
-    use crate::PhyCapabilities;
+    use crate::{AddressMode, PhyCapabilities, TxOptions};
     use zigbee_types::{ChannelMask, PanId, ShortAddress};
 
     const IEEE: [u8; 8] = [0x02, 1, 2, 3, 4, 5, 6, 7];
@@ -431,6 +541,8 @@ mod tests {
         delayed_us: u32,
         last_tx: heapless::Vec<u8, { crate::MAX_PHY_FRAME_LEN }>,
         energy: Result<u8, PhyError>,
+        capabilities: PhyCapabilities,
+        sent_acks: heapless::Vec<(u8, bool), 8>,
     }
 
     impl TestPhy {
@@ -446,13 +558,15 @@ mod tests {
                 delayed_us: 0,
                 last_tx: heapless::Vec::new(),
                 energy: Ok(0),
+                capabilities: PhyCapabilities::default(),
+                sent_acks: heapless::Vec::new(),
             }
         }
     }
 
     impl RadioPhy for TestPhy {
         fn capabilities(&self) -> PhyCapabilities {
-            PhyCapabilities::default()
+            self.capabilities
         }
 
         async fn try_transmit(&mut self, frame: &[u8]) -> Result<(), PhyError> {
@@ -464,8 +578,10 @@ mod tests {
             self.tx_results.pop_front().unwrap_or(Ok(()))
         }
 
-        async fn send_ack(&mut self, _sequence: u8, _frame_pending: bool) -> Result<(), PhyError> {
-            Ok(())
+        async fn send_ack(&mut self, sequence: u8, frame_pending: bool) -> Result<(), PhyError> {
+            self.sent_acks
+                .push((sequence, frame_pending))
+                .map_err(|_| PhyError::Hardware)
         }
 
         async fn receive(&mut self, _timeout_us: u32) -> Result<Option<PhyRxFrame>, PhyError> {
@@ -748,5 +864,152 @@ mod tests {
         ));
         assert_eq!(core.phy().filter, filter);
         assert_eq!(core.phy().channel, 11);
+    }
+
+    #[test]
+    fn transmit_data_uses_shared_frame_builder_and_ack_engine() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        core.set_pib(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x5678)),
+        )
+        .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap(),
+            )))
+            .unwrap();
+
+        let confirm = block_on(core.transmit_data(McpsDataRequest {
+            src_addr_mode: AddressMode::Short,
+            dst_address: MacAddress::Short(PanId(0x1234), ShortAddress(0x0000)),
+            payload: &[0xAA, 0xBB],
+            msdu_handle: 7,
+            tx_options: TxOptions {
+                ack_tx: true,
+                ..TxOptions::default()
+            },
+        }))
+        .unwrap();
+
+        assert_eq!(confirm.msdu_handle, 7);
+        assert_eq!(
+            core.phy().last_tx.as_slice(),
+            [
+                0x61, 0x88, 0x01, 0x34, 0x12, 0x00, 0x00, 0x78, 0x56, 0xAA, 0xBB
+            ]
+        );
+    }
+
+    #[test]
+    fn receive_data_sends_software_ack_for_exact_unicast() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        core.set_pib(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x5678)),
+        )
+        .unwrap();
+        let incoming = build_data_frame(
+            0x2A,
+            AddressMode::Short,
+            ShortAddress(0x0000),
+            &[0; 8],
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
+            &[0xCC],
+            true,
+        )
+        .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&incoming, 180).unwrap())))
+            .unwrap();
+
+        let indication = block_on(core.receive_data(5_000)).unwrap();
+
+        assert_eq!(indication.payload.as_slice(), [0xCC]);
+        assert_eq!(indication.lqi, 180);
+        assert_eq!(core.phy().sent_acks.as_slice(), [(0x2A, false)]);
+    }
+
+    #[test]
+    fn transmit_data_clears_ack_request_for_broadcast() {
+        let mut core = core();
+
+        block_on(core.transmit_data(McpsDataRequest {
+            src_addr_mode: AddressMode::Extended,
+            dst_address: MacAddress::Short(PanId(0x1234), ShortAddress(0xFFFF)),
+            payload: &[0xAA],
+            msdu_handle: 8,
+            tx_options: TxOptions {
+                ack_tx: true,
+                ..TxOptions::default()
+            },
+        }))
+        .unwrap();
+
+        assert_eq!(core.phy().tx_attempts, 1);
+        assert_eq!(core.phy().last_tx[0] & (1 << 5), 0);
+    }
+
+    #[test]
+    fn receive_data_never_acks_broadcast() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        let incoming = build_data_frame(
+            0x2B,
+            AddressMode::Short,
+            ShortAddress(0x0000),
+            &[0; 8],
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0xFFFF)),
+            &[0xDD],
+            true,
+        )
+        .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&incoming, 170).unwrap())))
+            .unwrap();
+
+        let indication = block_on(core.receive_data(5_000)).unwrap();
+
+        assert_eq!(indication.payload.as_slice(), [0xDD]);
+        assert!(core.phy().sent_acks.is_empty());
+    }
+
+    #[test]
+    fn hardware_auto_ack_suppresses_software_ack() {
+        let mut core = core();
+        core.phy_mut().capabilities.hardware_auto_ack = true;
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        core.set_pib(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x5678)),
+        )
+        .unwrap();
+        let incoming = build_data_frame(
+            0x2C,
+            AddressMode::Short,
+            ShortAddress(0x0000),
+            &[0; 8],
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
+            &[0xEE],
+            true,
+        )
+        .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&incoming, 160).unwrap())))
+            .unwrap();
+
+        block_on(core.receive_data(5_000)).unwrap();
+
+        assert!(core.phy().sent_acks.is_empty());
     }
 }
