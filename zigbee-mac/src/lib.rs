@@ -62,7 +62,7 @@ pub mod mock;
 pub use phy::{
     MAX_PHY_FRAME_LEN, PhyAddressFilter, PhyCapabilities, PhyError, PhyRxFrame, RadioPhy,
 };
-pub use pib::{PibAttribute, PibValue};
+pub use pib::{MacPib, PibAttribute, PibError, PibValue};
 pub use platform::{PlatformServices, WrappingTickExtender};
 pub use primitives::*;
 
