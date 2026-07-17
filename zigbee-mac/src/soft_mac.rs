@@ -3,26 +3,36 @@
 use zigbee_types::MacAddress;
 
 use crate::frames::{
-    build_beacon_request, build_data_frame, build_data_request, build_data_request_short,
-    parse_beacon, parse_mac_addresses,
+    build_association_request, build_beacon_request, build_data_frame, build_data_request,
+    build_data_request_short, parse_association_response, parse_beacon, parse_mac_addresses,
 };
 use crate::pib::scan_duration_us;
 use crate::{
-    EdValue, MacError, MacFrame, MacPib, McpsDataConfirm, McpsDataIndication, McpsDataRequest,
-    MlmeScanConfirm, MlmeScanRequest, PanDescriptor, PhyAddressFilter, PhyError, PhyRxFrame,
-    PibAttribute, PibError, PibValue, PlatformServices, RadioPhy, ScanType,
+    AssociationStatus, EdValue, MacError, MacFrame, MacPib, McpsDataConfirm, McpsDataIndication,
+    McpsDataRequest, MlmeAssociateConfirm, MlmeAssociateRequest, MlmeScanConfirm, MlmeScanRequest,
+    PanDescriptor, PhyAddressFilter, PhyError, PhyRxFrame, PibAttribute, PibError, PibValue,
+    PlatformServices, RadioPhy, ScanType,
 };
 
 const UNIT_BACKOFF_PERIOD_US: u32 = 320;
 const ACK_WAIT_US: u32 = 1_200;
+const ASSOCIATION_DIRECT_WAIT_US: u32 = 500_000;
 const POLL_RESPONSE_WAIT_US: u32 = 30_000;
+const POST_ASSOCIATION_RX_US: u32 = 250_000;
+const ASSOCIATION_POLL_DELAY_US: u32 = 100_000;
 const MAX_ACK_WINDOW_FRAMES: u8 = 16;
+const MAX_ASSOCIATION_POLLS: u8 = 32;
 const MAX_SCAN_FRAMES_PER_CHANNEL: u16 = 256;
 const PENDING_RX_CAPACITY: usize = 4;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AckResult {
     pub frame_pending: bool,
+}
+
+struct PendingRxFrame {
+    frame: PhyRxFrame,
+    software_ack_sent: bool,
 }
 
 /// Shared software-MAC state for one radio.
@@ -32,7 +42,8 @@ pub struct AckResult {
 pub struct SoftMacCore<P: RadioPhy> {
     phy: P,
     pib: MacPib,
-    pending_rx: heapless::Deque<PhyRxFrame, PENDING_RX_CAPACITY>,
+    pending_rx: heapless::Deque<PendingRxFrame, PENDING_RX_CAPACITY>,
+    pending_error: Option<MacError>,
     random_state: u32,
 }
 
@@ -44,6 +55,7 @@ impl<P: RadioPhy> SoftMacCore<P> {
             phy,
             pib,
             pending_rx: heapless::Deque::new(),
+            pending_error: None,
             random_state,
         })
     }
@@ -82,12 +94,13 @@ impl<P: RadioPhy> SoftMacCore<P> {
         Self::apply_full_config(&mut self.phy, &next)?;
         self.pib = next;
         self.pending_rx.clear();
+        self.pending_error = None;
         self.random_state = Self::random_seed(&self.pib);
         Ok(())
     }
 
     pub fn take_pending_rx(&mut self) -> Option<PhyRxFrame> {
-        self.pending_rx.pop_front()
+        self.pending_rx.pop_front().map(|pending| pending.frame)
     }
 
     pub fn accepts_destination(&self, destination: &MacAddress) -> bool {
@@ -198,6 +211,53 @@ impl<P: RadioPhy + PlatformServices> PlatformServices for SoftMacCore<P> {
 }
 
 impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
+    pub async fn associate(
+        &mut self,
+        req: MlmeAssociateRequest,
+    ) -> Result<MlmeAssociateConfirm, MacError> {
+        self.prepare_association(&req)?;
+
+        let request = build_association_request(
+            self.pib.next_dsn(),
+            &req.coord_address,
+            &self.pib.extended_address(),
+            &req.capability_info,
+        );
+        self.transmit_acknowledged(&request).await?;
+
+        if let Some(response) = self.take_pending_association_response().await? {
+            return self.finish_association(response).await;
+        }
+        if let Some(response) = self
+            .wait_for_association_response(ASSOCIATION_DIRECT_WAIT_US)
+            .await?
+        {
+            return self.finish_association(response).await;
+        }
+
+        for _ in 0..MAX_ASSOCIATION_POLLS {
+            let poll = build_data_request(
+                self.pib.next_dsn(),
+                &req.coord_address,
+                &self.pib.extended_address(),
+            );
+            self.transmit_acknowledged(&poll).await?;
+
+            if let Some(response) = self.take_pending_association_response().await? {
+                return self.finish_association(response).await;
+            }
+            if let Some(response) = self
+                .wait_for_association_response(POLL_RESPONSE_WAIT_US)
+                .await?
+            {
+                return self.finish_association(response).await;
+            }
+            self.delay_micros(ASSOCIATION_POLL_DELAY_US).await;
+        }
+
+        Err(MacError::NoData)
+    }
+
     pub async fn transmit_data(
         &mut self,
         req: McpsDataRequest<'_>,
@@ -241,6 +301,13 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
     }
 
     pub async fn poll(&mut self) -> Result<Option<MacFrame>, MacError> {
+        if let Some(frame) = self.take_pending_data().await? {
+            return Ok(Some(frame));
+        }
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
+
         let own_short = self.pib.short_address();
         let own_extended = self.pib.extended_address();
         let coordinator_short = self.pib.coord_short_address();
@@ -293,24 +360,32 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
         let started_at = self.monotonic_micros();
 
         for _ in 0..MAX_SCAN_FRAMES_PER_CHANNEL {
-            let frame = if let Some(frame) = self.take_pending_rx() {
-                Some(frame)
+            let pending = if let Some(pending) = self.take_pending_entry() {
+                Some(pending)
+            } else if let Some(error) = self.pending_error.take() {
+                return Err(error);
             } else {
                 let elapsed = self.monotonic_micros().wrapping_sub(started_at);
                 let Some(remaining) = timeout_us.checked_sub(elapsed) else {
                     return Err(MacError::NoData);
                 };
                 match self.phy.receive(remaining).await {
-                    Ok(frame) => frame,
+                    Ok(frame) => frame.map(|frame| PendingRxFrame {
+                        frame,
+                        software_ack_sent: false,
+                    }),
                     Err(PhyError::CrcFailed) => continue,
                     Err(error) => return Err(Self::map_phy_error(error)),
                 }
             };
 
-            let Some(frame) = frame else {
+            let Some(pending) = pending else {
                 return Err(MacError::NoData);
             };
-            if let Some(indication) = self.process_received_data(frame).await? {
+            if let Some(indication) = self
+                .process_received_data(pending.frame, pending.software_ack_sent)
+                .await?
+            {
                 return Ok(indication);
             }
         }
@@ -418,7 +493,7 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
                         }
                         continue;
                     }
-                    self.queue_pending_rx(frame);
+                    self.queue_pending_rx(frame, false);
                 }
                 Ok(None) => return Ok(None),
                 Err(PhyError::CrcFailed) => {}
@@ -429,16 +504,24 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
         Ok(None)
     }
 
-    fn queue_pending_rx(&mut self, frame: PhyRxFrame) {
+    fn queue_pending_rx(&mut self, frame: PhyRxFrame, software_ack_sent: bool) {
         if self.pending_rx.is_full() {
             let _ = self.pending_rx.pop_front();
         }
-        let _ = self.pending_rx.push_back(frame);
+        let _ = self.pending_rx.push_back(PendingRxFrame {
+            frame,
+            software_ack_sent,
+        });
+    }
+
+    fn take_pending_entry(&mut self) -> Option<PendingRxFrame> {
+        self.pending_rx.pop_front()
     }
 
     async fn process_received_data(
         &mut self,
         frame: PhyRxFrame,
+        software_ack_sent: bool,
     ) -> Result<Option<McpsDataIndication>, MacError> {
         let data = frame.as_slice();
         if data.len() < 3 {
@@ -460,6 +543,7 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
 
         let ack_requested = frame_control & (1 << 5) != 0;
         if ack_requested
+            && !software_ack_sent
             && self.is_exact_destination(&destination)
             && !self.phy.capabilities().hardware_auto_ack
         {
@@ -481,12 +565,229 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
     }
 
     async fn take_pending_data(&mut self) -> Result<Option<MacFrame>, MacError> {
-        while let Some(frame) = self.take_pending_rx() {
-            if let Some(indication) = self.process_received_data(frame).await? {
+        while let Some(pending) = self.take_pending_entry() {
+            if let Some(indication) = self
+                .process_received_data(pending.frame, pending.software_ack_sent)
+                .await?
+            {
                 return Ok(Some(indication.payload));
             }
         }
         Ok(None)
+    }
+
+    fn prepare_association(&mut self, req: &MlmeAssociateRequest) -> Result<(), MacError> {
+        if self.pib.extended_address() == [0; 8]
+            || self.pib.extended_address() == [0xFF; 8]
+            || req.coord_address.pan_id().0 == 0xFFFF
+            || match req.coord_address {
+                MacAddress::Short(_, address) => address.0 >= 0xFFF8,
+                MacAddress::Extended(_, address) => address == [0; 8] || address == [0xFF; 8],
+            }
+        {
+            return Err(MacError::InvalidParameter);
+        }
+
+        let mut next = self.pib.clone();
+        next.set(PibAttribute::PhyCurrentChannel, PibValue::U8(req.channel))
+            .map_err(Self::map_pib_error)?;
+        next.set(
+            PibAttribute::MacPanId,
+            PibValue::PanId(req.coord_address.pan_id()),
+        )
+        .map_err(Self::map_pib_error)?;
+        next.set(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(zigbee_types::ShortAddress(0xFFFF)),
+        )
+        .map_err(Self::map_pib_error)?;
+        match req.coord_address {
+            MacAddress::Short(_, address) => {
+                next.set(
+                    PibAttribute::MacCoordShortAddress,
+                    PibValue::ShortAddress(address),
+                )
+                .map_err(Self::map_pib_error)?;
+                next.set(
+                    PibAttribute::MacCoordExtendedAddress,
+                    PibValue::ExtendedAddress([0; 8]),
+                )
+                .map_err(Self::map_pib_error)?;
+            }
+            MacAddress::Extended(_, address) => {
+                next.set(
+                    PibAttribute::MacCoordShortAddress,
+                    PibValue::ShortAddress(zigbee_types::ShortAddress(0xFFFF)),
+                )
+                .map_err(Self::map_pib_error)?;
+                next.set(
+                    PibAttribute::MacCoordExtendedAddress,
+                    PibValue::ExtendedAddress(address),
+                )
+                .map_err(Self::map_pib_error)?;
+            }
+        }
+        next.set(PibAttribute::MacAssociatedPanCoord, PibValue::Bool(false))
+            .map_err(Self::map_pib_error)?;
+
+        Self::apply_full_config(&mut self.phy, &next)?;
+        self.pib = next;
+        self.pending_rx.clear();
+        self.pending_error = None;
+        Ok(())
+    }
+
+    async fn take_pending_association_response(
+        &mut self,
+    ) -> Result<Option<(zigbee_types::ShortAddress, u8)>, MacError> {
+        let pending_count = self.pending_rx.len();
+        for _ in 0..pending_count {
+            let Some(pending) = self.take_pending_entry() else {
+                break;
+            };
+            if let Some(response) = self.association_response_for_us(&pending.frame) {
+                if !pending.software_ack_sent {
+                    self.acknowledge_received_frame(&pending.frame).await?;
+                }
+                return Ok(Some(response));
+            }
+            let _ = self.pending_rx.push_back(pending);
+        }
+        Ok(None)
+    }
+
+    async fn wait_for_association_response(
+        &mut self,
+        timeout_us: u32,
+    ) -> Result<Option<(zigbee_types::ShortAddress, u8)>, MacError> {
+        if let Some(response) = self.take_pending_association_response().await? {
+            return Ok(Some(response));
+        }
+
+        let started_at = self.monotonic_micros();
+        for _ in 0..MAX_SCAN_FRAMES_PER_CHANNEL {
+            let elapsed = self.monotonic_micros().wrapping_sub(started_at);
+            let Some(remaining) = timeout_us.checked_sub(elapsed) else {
+                return Ok(None);
+            };
+            let frame = match self.phy.receive(remaining).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Ok(None),
+                Err(PhyError::CrcFailed) => continue,
+                Err(error) => return Err(Self::map_phy_error(error)),
+            };
+
+            if let Some(response) = self.association_response_for_us(&frame) {
+                self.acknowledge_received_frame(&frame).await?;
+                return Ok(Some(response));
+            }
+            self.retain_data_frame(frame).await?;
+        }
+        Ok(None)
+    }
+
+    fn association_response_for_us(
+        &self,
+        frame: &PhyRxFrame,
+    ) -> Option<(zigbee_types::ShortAddress, u8)> {
+        let data = frame.as_slice();
+        let (_, destination, payload_offset, _) = parse_mac_addresses(data);
+        (payload_offset >= 3
+            && payload_offset <= data.len()
+            && self.is_exact_destination(&destination))
+        .then(|| parse_association_response(data))
+        .flatten()
+    }
+
+    async fn finish_association(
+        &mut self,
+        (short_address, status): (zigbee_types::ShortAddress, u8),
+    ) -> Result<MlmeAssociateConfirm, MacError> {
+        let status = match status {
+            0x00 => AssociationStatus::Success,
+            0x01 => AssociationStatus::PanAtCapacity,
+            _ => AssociationStatus::PanAccessDenied,
+        };
+        if status == AssociationStatus::Success {
+            if short_address.0 >= 0xFFF8 {
+                return Err(MacError::AssociationDenied);
+            }
+            let mut next = self.pib.clone();
+            next.set(
+                PibAttribute::MacShortAddress,
+                PibValue::ShortAddress(short_address),
+            )
+            .map_err(Self::map_pib_error)?;
+            next.set(PibAttribute::MacAssociatedPanCoord, PibValue::Bool(true))
+                .map_err(Self::map_pib_error)?;
+            Self::apply_full_config(&mut self.phy, &next)?;
+            self.pib = next;
+            if let Err(error) = self.capture_post_association_data().await {
+                self.pending_error = Some(error);
+            }
+        }
+        Ok(MlmeAssociateConfirm {
+            short_address,
+            status,
+        })
+    }
+
+    async fn capture_post_association_data(&mut self) -> Result<(), MacError> {
+        let started_at = self.monotonic_micros();
+        for _ in 0..MAX_SCAN_FRAMES_PER_CHANNEL {
+            let elapsed = self.monotonic_micros().wrapping_sub(started_at);
+            let Some(remaining) = POST_ASSOCIATION_RX_US.checked_sub(elapsed) else {
+                break;
+            };
+            match self.phy.receive(remaining).await {
+                Ok(Some(frame)) => {
+                    self.retain_data_frame(frame).await?;
+                }
+                Ok(None) => break,
+                Err(PhyError::CrcFailed) => {}
+                Err(error) => return Err(Self::map_phy_error(error)),
+            }
+        }
+        Ok(())
+    }
+
+    async fn retain_data_frame(&mut self, frame: PhyRxFrame) -> Result<(), MacError> {
+        let data = frame.as_slice();
+        if data.len() < 3 || data[0] & 0x07 != 0x01 {
+            return Ok(());
+        }
+        let (_, destination, payload_offset, _) = parse_mac_addresses(data);
+        if payload_offset < 3
+            || payload_offset > data.len()
+            || !self.accepts_destination(&destination)
+        {
+            return Ok(());
+        }
+        let software_ack_sent = self.acknowledge_received_frame(&frame).await?;
+        self.queue_pending_rx(frame, software_ack_sent);
+        Ok(())
+    }
+
+    async fn acknowledge_received_frame(&mut self, frame: &PhyRxFrame) -> Result<bool, MacError> {
+        let data = frame.as_slice();
+        if data.len() < 3 {
+            return Ok(false);
+        }
+        let frame_control = u16::from_le_bytes([data[0], data[1]]);
+        let (_, destination, payload_offset, _) = parse_mac_addresses(data);
+        if frame_control & (1 << 5) == 0
+            || payload_offset < 3
+            || payload_offset > data.len()
+            || !self.is_exact_destination(&destination)
+            || self.phy.capabilities().hardware_auto_ack
+        {
+            return Ok(false);
+        }
+        self.phy
+            .send_ack(data[2], false)
+            .await
+            .map_err(Self::map_phy_error)?;
+        Ok(true)
     }
 
     async fn scan_unfiltered(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
@@ -715,6 +1016,36 @@ mod tests {
 
     fn core() -> SoftMacCore<TestPhy> {
         SoftMacCore::new(TestPhy::new(), MacPib::new(IEEE, 1, 2)).unwrap()
+    }
+
+    fn association_response(
+        sequence: u8,
+        assigned_address: ShortAddress,
+        status: u8,
+    ) -> heapless::Vec<u8, 24> {
+        let mut frame = heapless::Vec::new();
+        frame.extend_from_slice(&0x8C63u16.to_le_bytes()).unwrap();
+        frame.push(sequence).unwrap();
+        frame.extend_from_slice(&0x1234u16.to_le_bytes()).unwrap();
+        frame.extend_from_slice(&IEEE).unwrap();
+        frame.extend_from_slice(&0x0000u16.to_le_bytes()).unwrap();
+        frame.push(0x02).unwrap();
+        frame
+            .extend_from_slice(&assigned_address.0.to_le_bytes())
+            .unwrap();
+        frame.push(status).unwrap();
+        frame
+    }
+
+    fn associate_request() -> MlmeAssociateRequest {
+        MlmeAssociateRequest {
+            channel: 15,
+            coord_address: MacAddress::Short(PanId(0x1234), ShortAddress(0x0000)),
+            capability_info: crate::CapabilityInfo {
+                allocate_address: true,
+                ..Default::default()
+            },
+        }
     }
 
     #[test]
@@ -1079,6 +1410,188 @@ mod tests {
         block_on(core.receive_data(5_000)).unwrap();
 
         assert!(core.phy().sent_acks.is_empty());
+    }
+
+    #[test]
+    fn association_accepts_a_direct_response_and_commits_pib_state() {
+        let mut core = core();
+        let response = association_response(0x44, ShortAddress(0x5678), 0);
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap(),
+            )))
+            .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&response, 210).unwrap())))
+            .unwrap();
+
+        let confirm = block_on(core.associate(associate_request())).unwrap();
+
+        assert_eq!(confirm.status, AssociationStatus::Success);
+        assert_eq!(confirm.short_address, ShortAddress(0x5678));
+        assert_eq!(
+            core.get_pib(PibAttribute::MacShortAddress),
+            PibValue::ShortAddress(ShortAddress(0x5678))
+        );
+        assert_eq!(
+            core.get_pib(PibAttribute::MacCoordShortAddress),
+            PibValue::ShortAddress(ShortAddress(0x0000))
+        );
+        assert_eq!(
+            core.get_pib(PibAttribute::MacAssociatedPanCoord),
+            PibValue::Bool(true)
+        );
+        assert_eq!(core.phy().channel, 15);
+        assert_eq!(core.phy().sent_acks.as_slice(), [(0x44, false)]);
+    }
+
+    #[test]
+    fn association_uses_a_response_retained_during_the_ack_window() {
+        let mut core = core();
+        let response = association_response(0x44, ShortAddress(0x5678), 0);
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&response, 210).unwrap())))
+            .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap(),
+            )))
+            .unwrap();
+
+        let confirm = block_on(core.associate(associate_request())).unwrap();
+
+        assert_eq!(confirm.status, AssociationStatus::Success);
+        assert_eq!(confirm.short_address, ShortAddress(0x5678));
+        assert_eq!(core.phy().tx_attempts, 1);
+        assert_eq!(core.phy().sent_acks.as_slice(), [(0x44, false)]);
+    }
+
+    #[test]
+    fn association_polls_for_an_indirect_response() {
+        let mut core = core();
+        let response = association_response(0x44, ShortAddress(0x5678), 0);
+        for frame in [
+            Some(PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap()),
+            None,
+            Some(PhyRxFrame::from_slice(&[0x02, 0x00, 0x02], 255).unwrap()),
+            Some(PhyRxFrame::from_slice(&response, 210).unwrap()),
+        ] {
+            core.phy_mut().rx_frames.push_back(Ok(frame)).unwrap();
+        }
+
+        let confirm = block_on(core.associate(associate_request())).unwrap();
+
+        assert_eq!(confirm.status, AssociationStatus::Success);
+        assert_eq!(confirm.short_address, ShortAddress(0x5678));
+        assert_eq!(core.phy().tx_attempts, 2);
+    }
+
+    #[test]
+    fn association_captures_and_acks_post_response_data() {
+        let mut core = core();
+        let response = association_response(0x44, ShortAddress(0x5678), 0);
+        let transport_key = build_data_frame(
+            0x55,
+            AddressMode::Short,
+            ShortAddress(0x0000),
+            &[0; 8],
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
+            &[0xA5, 0x5A],
+            true,
+        )
+        .unwrap();
+        for frame in [
+            Some(PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap()),
+            Some(PhyRxFrame::from_slice(&response, 210).unwrap()),
+            Some(PhyRxFrame::from_slice(&transport_key, 200).unwrap()),
+            None,
+        ] {
+            core.phy_mut().rx_frames.push_back(Ok(frame)).unwrap();
+        }
+
+        block_on(core.associate(associate_request())).unwrap();
+        let tx_attempts = core.phy().tx_attempts;
+        let captured = block_on(core.poll()).unwrap().unwrap();
+
+        assert_eq!(captured.as_slice(), [0xA5, 0x5A]);
+        assert_eq!(core.phy().tx_attempts, tx_attempts);
+        assert_eq!(
+            core.phy().sent_acks.as_slice(),
+            [(0x44, false), (0x55, false)]
+        );
+    }
+
+    #[test]
+    fn post_association_capture_error_is_reported_by_the_next_poll() {
+        let mut core = core();
+        let response = association_response(0x44, ShortAddress(0x5678), 0);
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap(),
+            )))
+            .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&response, 210).unwrap())))
+            .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Err(PhyError::Hardware))
+            .unwrap();
+
+        let confirm = block_on(core.associate(associate_request())).unwrap();
+        let tx_attempts = core.phy().tx_attempts;
+
+        assert_eq!(confirm.status, AssociationStatus::Success);
+        assert!(matches!(block_on(core.poll()), Err(MacError::RadioError)));
+        assert_eq!(core.phy().tx_attempts, tx_attempts);
+    }
+
+    #[test]
+    fn association_denial_does_not_assign_a_short_address() {
+        let mut core = core();
+        let response = association_response(0x44, ShortAddress(0xFFFE), 1);
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap(),
+            )))
+            .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&response, 210).unwrap())))
+            .unwrap();
+
+        let confirm = block_on(core.associate(associate_request())).unwrap();
+
+        assert_eq!(confirm.status, AssociationStatus::PanAtCapacity);
+        assert_eq!(
+            core.get_pib(PibAttribute::MacShortAddress),
+            PibValue::ShortAddress(ShortAddress(0xFFFF))
+        );
+        assert_eq!(
+            core.get_pib(PibAttribute::MacAssociatedPanCoord),
+            PibValue::Bool(false)
+        );
+    }
+
+    #[test]
+    fn association_rejects_a_broadcast_coordinator() {
+        let mut core = core();
+        let mut request = associate_request();
+        request.coord_address = MacAddress::Short(PanId(0x1234), ShortAddress::BROADCAST);
+
+        assert!(matches!(
+            block_on(core.associate(request)),
+            Err(MacError::InvalidParameter)
+        ));
+        assert_eq!(core.phy().tx_attempts, 0);
+        assert_eq!(core.phy().channel, 11);
     }
 
     #[test]
