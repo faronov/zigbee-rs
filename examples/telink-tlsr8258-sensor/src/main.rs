@@ -65,8 +65,9 @@ use zigbee_aps::frames::{
 };
 #[cfg(feature = "sensor")]
 use zigbee_aps::security::{
-    derive_key_load_key, derive_key_transport_key, ApsKeyType, ApsSecurity, ApsSecurityHeader,
-    KEY_ID_DATA_KEY, KEY_ID_KEY_LOAD, KEY_ID_KEY_TRANSPORT, SEC_LEVEL_ENC_MIC_32,
+    derive_key_load_key, derive_key_transport_key, derive_verify_key_hash, ApsKeyType,
+    ApsSecurity, ApsSecurityHeader, KEY_ID_DATA_KEY, KEY_ID_KEY_LOAD, KEY_ID_KEY_TRANSPORT,
+    SEC_LEVEL_ENC_MIC_32,
 };
 #[cfg(feature = "sensor")]
 use zigbee_aps::{PROFILE_ZDP, ZDO_ENDPOINT};
@@ -390,6 +391,15 @@ core::arch::global_asm!(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _rust_entry() -> ! {
     chip_init();
+    // Force HMAC-MMO to execute once at boot so SP-min captures at
+    // BDB+0x780..+0x798 (0x0084_F780..0x0084_F798) are populated
+    // regardless of whether the join handshake ever completes. The
+    // result must be black-boxed to prevent the optimizer from
+    // eliding the call entirely. zigbee-aps is built with the
+    // telink-debug feature unconditionally in this crate, so the
+    // probe symbol always exists.
+    let triplet = zigbee_aps::security::telink_debug_probe_mmo();
+    core::hint::black_box(triplet);
     main_loop();
 }
 
@@ -1940,20 +1950,9 @@ impl Tlsr8258Mac {
         }
         let _ = frame.extend_from_slice(&self.extended_address);
         let _ = frame.push(0x01);
-        // ── Test 2 (cap-byte override) + Test 1/3 (TX capture) ──
-        // Override the cap byte to claim NON-SLEEPY (rx_on_when_idle=1,
-        // mains-powered=1, alloc_addr=1, security_capable=1). Bit map:
-        //   bit 0: alt_pan_coord  = 0
-        //   bit 1: device_type FFD= 0  (still RFD; FFD would advertise as router)
-        //   bit 2: mains_powered  = 1
-        //   bit 3: rx_on_when_idle= 1
-        //   bit 6: security_capab = 1
-        //   bit 7: allocate_addr  = 1
-        // Total: 0b1100_1100 = 0xCC.
-        // If TC unicasts TK directly when it thinks the joiner is awake
-        // ⇒ this bypasses indirect-poll entirely and we should join.
-        let cap_override: u8 = 0xCC;
-        let _ = frame.push(cap_override);
+        // Use the requested capability information as-is (no override hacks).
+        let cap_byte = capability_info.to_byte();
+        let _ = frame.push(cap_byte);
         // Diagnostic capture: what we ACTUALLY put on the wire.
         //   MODE+0x1E0 : the cap byte (low 8 bits)
         //   MODE+0x1E4 : marker so we can tell the slot is set (0xCAFE_BABE)
@@ -1962,7 +1961,7 @@ impl Tlsr8258Mac {
         unsafe {
             core::ptr::write_volatile(
                 (DBG_MODE_BASE + 0x1E0) as *mut u32,
-                (cap_override as u32) | ((capability_info.to_byte() as u32) << 8) | 0xCAFE_0000,
+                (cap_byte as u32) | ((capability_info.to_byte() as u32) << 8) | 0xCAFE_0000,
             );
             core::ptr::write_volatile(
                 (DBG_MODE_BASE + 0x1E4) as *mut u32,
@@ -4491,24 +4490,7 @@ const SENSOR_MAC_CAPABILITY: u8 = 0x80 | 0x40 | 0x08; // Allocate address, secur
 
 // ── Cycle 23: Verify-Key handshake + unicast Device_annce + light MAC TX-Err counters ──
 //
-// HMAC-MMO hangs on tc32 (see derive_key_transport_key bypass), so the Verify-Key
-// hash per ZB R22 §B.1.4 (HMAC-MMO_K(M) with K=ZBA09 TC link key, M=our IEEE) is
-// precomputed offline. LE = src_ieee in LE byte order (memory layout); BE = reversed.
-//
-// Both Wireshark (epan/dissectors/packet-zbee-security.c::zbee_sec_hash) and ZBOSS
-// (zb_aes_mmo_hmac_message) feed the IEEE in LE memory order, so LE is the primary
-// candidate; BE is a hedge.
-#[cfg(feature = "sensor")]
-const VK_HASH_LE: [u8; 16] = [
-    0xB8, 0x36, 0xD6, 0xD9, 0xCC, 0xA0, 0x4C, 0xA7,
-    0xFE, 0xEC, 0xD8, 0xAD, 0x74, 0x65, 0x43, 0x80,
-];
-#[cfg(feature = "sensor")]
-const VK_HASH_BE: [u8; 16] = [
-    0xFD, 0xB3, 0xFC, 0x4D, 0x1C, 0x51, 0x2B, 0xB9,
-    0xAF, 0x2A, 0x26, 0xE2, 0x3B, 0x28, 0x8C, 0xE3,
-];
-
+// VK hash per ZB-3.0 R22 §B.1.4: HMAC-MMO(TC link key, 0x03).
 #[cfg(feature = "sensor")]
 fn mac_err_code(e: MacError) -> u32 {
     match e {
@@ -4542,7 +4524,7 @@ fn bump_marker(addr: u32) {
 
 /// Bare-metal APS-Verify-Key sender.
 ///
-/// Builds: NWK-secured(APS-secured(VerifyKey || src_ieee || 0x04 || hash[16]))
+/// Builds: NWK-secured(APS-secured(VerifyKey || 0x04 || src_ieee || hash[16]))
 /// destined for the TC (0x0000).
 ///
 /// Marker layout (MODE-relative, audited free zone +0x148..+0x167):
@@ -4550,7 +4532,7 @@ fn bump_marker(addr: u32) {
 ///   +0x14C  u32 APS-encrypt OK counter
 ///   +0x150  u32 NWK-encrypt OK counter
 ///   +0x154  u32 last MAC TX result (0=Ok, 0x8000_00xx=Err code)
-///   +0x158/+0x15C/+0x160  u32 per-attempt result (LE/BE/LE)
+///   +0x158  u32 attempt MAC result (0=Ok, 0x8000_00xx=Err code)
 ///   +0x164  u32 ConfirmKey RX counter (bumped by handle_sensor_frame)
 ///
 /// MAC-layer counters (shared with other senders, MODE+0x108..+0x117):
@@ -4572,11 +4554,11 @@ fn send_verify_key_aps(
 ) -> Result<(), MacError> {
     bump_marker(DBG_MODE_BASE + 0x148);
 
-    // ── APS plaintext: cmd_id(1) + src_ieee(8) + key_type(1) + hash(16) = 26 B
+    // ── APS plaintext: cmd_id(1) + key_type(1) + src_ieee(8) + hash(16) = 26 B
     let mut plain = [0u8; 26];
     plain[0] = ApsCommandId::VerifyKey as u8;
-    plain[1..9].copy_from_slice(&mac.extended_address);
-    plain[9] = 0x04; // KEY_TYPE_TC_LINK
+    plain[1] = 0x04; // KEY_TYPE_TC_LINK
+    plain[2..10].copy_from_slice(&mac.extended_address);
     plain[10..26].copy_from_slice(hash);
 
     // ── APS header (Command, secured, ack-requested) ──
@@ -6396,14 +6378,14 @@ fn sensor_main() -> ! {
                             }
                         }
 
-                        // Step 4: APS Verify-Key x3 (LE / BE / LE) with 2 s spacing.
-                        // Per ZB-3.0 R22 §4.4.10, ZHA will not register the device
-                        // in its endpoint registry until the VK → ConfirmKey handshake
-                        // completes. Hashes precomputed offline; primary is LE-IEEE.
-                        for (idx, hash) in [&VK_HASH_LE, &VK_HASH_BE, &VK_HASH_LE]
-                            .iter()
-                            .enumerate()
+                        // Step 4: APS Verify-Key (single attempt) with the
+                        // spec-correct HMAC-MMO_{TC link key}(our_ieee_le) hash
+                        // per ZB-3.0 R22 §4.4.11.2 / §B.1.4. Per §4.4.10 ZHA
+                        // will not register the device until the VK ->
+                        // ConfirmKey handshake completes.
                         {
+                            let tc_link_key = *aps_security.default_tc_link_key();
+                            let vk_hash = derive_verify_key_hash(&tc_link_key);
                             let res = send_verify_key_aps(
                                 &mut mac,
                                 &mut nwk_security,
@@ -6412,14 +6394,9 @@ fn sensor_main() -> ! {
                                 &mut nwk_seq,
                                 &mut aps_seq,
                                 &mut aps_fc_out,
-                                hash,
+                                &vk_hash,
                             );
-                            let slot = match idx {
-                                0 => DBG_MODE_BASE + 0x158,
-                                1 => DBG_MODE_BASE + 0x15C,
-                                _ => DBG_MODE_BASE + 0x160,
-                            };
-                            mark32(slot, mac_result_code(&res));
+                            mark32(DBG_MODE_BASE + 0x158, mac_result_code(&res));
                             // Drain any inbound frames (ConfirmKey may arrive immediately).
                             for _ in 0..16 {
                                 if let Ok(indication) =

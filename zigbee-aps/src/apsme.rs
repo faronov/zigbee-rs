@@ -267,7 +267,9 @@ impl<M: MacDriver> ApsLayer<M> {
                     key: req.key,
                     key_type: req.key_type,
                     outgoing_frame_counter: 0,
+                    outgoing_frame_counter_limit: u32::MAX,
                     incoming_frame_counter: 0,
+                    incoming_frame_counter_valid: false,
                 };
                 if self.security.add_key(entry).is_err() {
                     return ApsStatus::TableFull;
@@ -291,7 +293,12 @@ impl<M: MacDriver> ApsLayer<M> {
             }
         };
         let local_ieee = self.nwk.nib().ieee_address;
-        let key_type_byte = req.key_type as u8;
+        let key_type_byte = match req.key_type {
+            ApsKeyType::NetworkKey => 0x01,
+            ApsKeyType::ApplicationLinkKey => 0x03,
+            ApsKeyType::TrustCenterLinkKey => 0x04,
+            _ => return ApsStatus::IllegalRequest,
+        };
         match self
             .send_transport_key(dst_short, key_type_byte, &req.key, 0, &local_ieee)
             .await
@@ -358,18 +365,21 @@ impl<M: MacDriver> ApsLayer<M> {
                 return ApsStatus::IllegalRequest;
             }
         };
-        // Compute APSME-VERIFY-KEY hash per spec §4.4.11.2:
-        // hash = AES-MMO(initiator_ieee || link_key)
-        let key = match self.security.find_key(&req.dst_address, req.key_type) {
-            Some(entry) => entry.key,
-            None => {
-                log::warn!("APSME-VERIFY-KEY: no key for {:02X?}", req.dst_address);
+        // APSME-VERIFY-KEY uses the B.1.4 keyed hash with input 0x03.
+        let key = match req.key_type {
+            ApsKeyType::TrustCenterLinkKey => self
+                .security
+                .find_key(&req.dst_address, req.key_type)
+                .map(|entry| entry.key)
+                .unwrap_or(*self.security.default_tc_link_key()),
+            _ => {
+                log::warn!("APSME-VERIFY-KEY: unsupported key type {:?}", req.key_type);
                 return ApsStatus::IllegalRequest;
             }
         };
         let local_ieee = self.nwk.nib().ieee_address;
-        let hash = crate::security::compute_verify_key_hash(&local_ieee, &key);
-        let key_type_byte = req.key_type as u8;
+        let hash = crate::security::derive_verify_key_hash(&key);
+        let key_type_byte = 0x04;
         match self
             .send_verify_key(dst_short, &local_ieee, key_type_byte, &hash)
             .await

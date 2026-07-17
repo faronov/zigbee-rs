@@ -1,0 +1,12 @@
+[package]
+name = "tlsr8258-hal"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust TLSR8258 platform and IEEE 802.15.4 hardware support"
+repository = "https://github.com/faronov/zigbee-rs"
+
+[dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

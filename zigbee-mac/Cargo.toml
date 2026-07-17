@@ -9,6 +9,7 @@ repository = "https://github.com/zigbee-rs/zigbee-rs"
 [dependencies]
 heapless = "0.9"
 zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
+tlsr8258-hal = { path = "../tlsr8258-hal", optional = true }
 
 # ── ESP32-C6 backend ────────────────────────────────────────
 esp-hal = { version = "1.0.0", features = ["rt", "unstable"], default-features = false, optional = true }
@@ -79,7 +80,7 @@ cc2340 = [
 ]
 
 telink = [
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
+    "dep:tlsr8258-hal",
 ]
 
 # Telink with HAL crate — requires local tlsr82xx-hal (not available in CI)
@@ -100,3 +101,6 @@ efr32-trace = []
 efr32mg21 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

@@ -183,14 +183,17 @@ impl<M: MacDriver> DeviceBuilder<M> {
         };
         let node_desc = zigbee_zdo::descriptors::NodeDescriptor {
             logical_type,
-            // bit7=AllocAddr, bit6=SecurityCapable, bit3=RxOnWhenIdle.
-            mac_capabilities: if rx_on { 0xC8 } else { 0xC0 },
+            // bit7=AllocAddr, bit3=RxOnWhenIdle. Zigbee PRO security is
+            // provided by NWK/APS, not the IEEE 802.15.4 MAC security bit.
+            mac_capabilities: if rx_on { 0x88 } else { 0x80 },
             ..Default::default()
         };
         zdo.set_node_descriptor(node_desc);
         zdo.set_power_descriptor(zigbee_zdo::descriptors::PowerDescriptor::default());
 
-        let bdb = BdbLayer::new(zdo);
+        let mut bdb = BdbLayer::new(zdo);
+        bdb.attributes_mut().primary_channel_set = self.channel_mask;
+        bdb.attributes_mut().secondary_channel_set = ChannelMask(0);
 
         ZigbeeDevice {
             bdb,
@@ -236,6 +239,8 @@ impl<M: MacDriver> DeviceBuilder<M> {
         let dst = dst.as_mut_ptr();
         unsafe {
             BdbLayer::write_into(core::ptr::addr_of_mut!((*dst).bdb), mac, device_type);
+            (*dst).bdb.attributes_mut().primary_channel_set = channel_mask;
+            (*dst).bdb.attributes_mut().secondary_channel_set = ChannelMask(0);
 
             {
                 let zdo = (*dst).bdb.zdo_mut();
@@ -276,7 +281,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
                 };
                 let node_desc = zigbee_zdo::descriptors::NodeDescriptor {
                     logical_type,
-                    mac_capabilities: if rx_on { 0xC8 } else { 0xC0 },
+                    mac_capabilities: if rx_on { 0x88 } else { 0x80 },
                     ..Default::default()
                 };
                 zdo.set_node_descriptor(node_desc);

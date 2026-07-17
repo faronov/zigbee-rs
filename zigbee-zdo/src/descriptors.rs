@@ -90,6 +90,11 @@ impl NodeDescriptor {
     /// On-the-wire size in bytes.
     pub const WIRE_SIZE: usize = 13;
 
+    /// Zigbee stack compliance revision encoded in server-mask bits 9..=14.
+    pub const fn stack_revision(&self) -> u8 {
+        ((self.server_mask >> 9) & 0x3F) as u8
+    }
+
     /// Serialize into `buf`, returning the number of bytes written.
     pub fn serialize(&self, buf: &mut [u8]) -> Result<usize, ZdoError> {
         if buf.len() < Self::WIRE_SIZE {

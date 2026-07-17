@@ -118,6 +118,8 @@ pub enum StartError {
     InitFailed,
     /// BDB commissioning (steering/formation) failed, with BDB status code.
     CommissioningFailed(zigbee_bdb::BdbStatus),
+    /// Durable security-state storage failed.
+    PersistenceFailed(crate::security_store::SecurityStoreError),
 }
 
 /// Run one iteration of the Zigbee stack event loop.

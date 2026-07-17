@@ -106,7 +106,9 @@ impl<M: MacDriver> BdbLayer<M> {
             .nwk_mut()
             .security_mut()
             .set_network_key(nwk_key, key_seq);
-        self.zdo.nwk_mut().nib_mut().active_key_seq_number = key_seq;
+        let nib = self.zdo.nwk_mut().nib_mut();
+        nib.active_key_seq_number = key_seq;
+        nib.security_enabled = true;
         log::info!("[BDB:Formation] NWK key installed (seq={})", key_seq);
 
         // Step 5: Open permit joining so other devices can join

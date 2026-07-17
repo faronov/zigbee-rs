@@ -428,7 +428,7 @@ fn build_ota_file(
 
 #[test]
 fn ota_manager_full_download_flow() {
-    use zigbee_runtime::firmware_writer::{FirmwareWriter, MockFirmwareWriter};
+    use zigbee_runtime::firmware_writer::MockFirmwareWriter;
     use zigbee_runtime::ota::{OtaConfig, OtaManager};
 
     let writer = MockFirmwareWriter::new(4096);

@@ -78,6 +78,16 @@ pub enum DeviceType {
     EndDevice,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NwkRxSecurityStats {
+    pub secured_frames: u32,
+    pub security_header_parse_failures: u32,
+    pub missing_keys: u32,
+    pub replay_rejections: u32,
+    pub decrypt_successes: u32,
+    pub decrypt_failures: u32,
+}
+
 /// The NWK layer — owns all NWK state and the MAC driver.
 ///
 /// Generic over:
@@ -139,6 +149,7 @@ pub struct NwkLayer<M: MacDriver> {
     routing: routing::RoutingTable,
     btr: routing::BtrTable,
     security: security::NwkSecurity,
+    rx_security_stats: NwkRxSecurityStats,
     device_type: DeviceType,
     joined: bool,
     /// Whether this device listens when idle.
@@ -197,6 +208,7 @@ impl<M: MacDriver> NwkLayer<M> {
             routing: routing::RoutingTable::new(),
             btr: routing::BtrTable::new(),
             security: security::NwkSecurity::new(),
+            rx_security_stats: NwkRxSecurityStats::default(),
             device_type,
             joined: false,
             rx_on_when_idle,
@@ -239,6 +251,7 @@ impl<M: MacDriver> NwkLayer<M> {
             core::ptr::addr_of_mut!((*slot).routing).write(routing::RoutingTable::new());
             core::ptr::addr_of_mut!((*slot).btr).write(routing::BtrTable::new());
             core::ptr::addr_of_mut!((*slot).security).write(security::NwkSecurity::new());
+            core::ptr::addr_of_mut!((*slot).rx_security_stats).write(NwkRxSecurityStats::default());
             core::ptr::addr_of_mut!((*slot).device_type).write(device_type);
             core::ptr::addr_of_mut!((*slot).joined).write(false);
             core::ptr::addr_of_mut!((*slot).rx_on_when_idle).write(true);
@@ -325,6 +338,16 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Get mutable reference to the NWK security context.
     pub fn security_mut(&mut self) -> &mut security::NwkSecurity {
         &mut self.security
+    }
+
+    pub fn rx_security_stats(&self) -> NwkRxSecurityStats {
+        self.rx_security_stats
+    }
+
+    /// Mutable security telemetry for stack front-ends that perform NWK
+    /// receive processing directly.
+    pub fn rx_security_stats_mut(&mut self) -> &mut NwkRxSecurityStats {
+        &mut self.rx_security_stats
     }
 
     /// Read-only access to the neighbor table.

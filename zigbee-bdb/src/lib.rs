@@ -36,6 +36,7 @@
 pub mod attributes;
 pub mod finding_binding;
 pub mod formation;
+pub mod security_persistence;
 pub mod state_machine;
 pub mod steering;
 pub mod touchlink;
@@ -44,6 +45,10 @@ use zigbee_mac::MacDriver;
 use zigbee_zdo::ZdoLayer;
 
 pub use attributes::BdbAttributes;
+pub use security_persistence::{
+    CounterReservation, FRAME_COUNTER_RESERVATION_SIZE, NetworkSecurityState, SecurityPersistence,
+    SecurityPersistenceError, TrustCenterLinkKeyState,
+};
 pub use state_machine::{BdbState, CommissioningMode};
 
 // ── BDB status codes ────────────────────────────────────────
@@ -76,6 +81,97 @@ pub enum BdbStatus {
     TargetFailure = 0x0A,
     /// Operation timed out
     Timeout = 0x0B,
+    /// Trust Center link-key exchange failed
+    TrustCenterLinkKeyExchangeFailure = 0x0C,
+    /// Security state could not be durably persisted.
+    PersistenceFailure = 0x0D,
+}
+
+/// Last significant stage reached by off-network steering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum SteeringStage {
+    #[default]
+    Idle = 0,
+    Scanning = 1,
+    Joining = 2,
+    WaitingForTransportKey = 3,
+    TransportKeyReceived = 4,
+    Announcing = 5,
+    VerifyingLinkKey = 6,
+    Complete = 7,
+    NoNetworks = 8,
+    NoJoinCandidate = 9,
+    JoinFailed = 10,
+    TransportKeyMissing = 11,
+    RequestingTrustCenterLinkKey = 12,
+    WaitingForTrustCenterLinkKey = 13,
+    WaitingForConfirmKey = 14,
+    TrustCenterLinkKeyExchangeFailed = 15,
+    QueryingTrustCenterNodeDescriptor = 16,
+    PersistenceFailed = 17,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum KeyFrameResult {
+    #[default]
+    None = 0,
+    NwkParseFailed = 1,
+    SecuredNoActiveKey = 2,
+    SecurityHeaderParseFailed = 3,
+    ActiveKeyDecryptFailed = 4,
+    UnsecuredAps = 5,
+    ApsProcessedNoKey = 6,
+    KeyInstalled = 7,
+}
+
+/// Compact steering telemetry that remains valid after a failed join attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SteeringDiagnostics {
+    pub stage: SteeringStage,
+    pub scan_requests: u16,
+    pub networks_discovered: u16,
+    pub permit_closed_rejects: u16,
+    pub join_attempts: u16,
+    pub join_successes: u16,
+    pub last_join_status: u8,
+    pub channel: u8,
+    pub pan_id: u16,
+    pub parent_address: u16,
+    pub parent_lqi: u8,
+    pub parent_depth: u8,
+    pub assigned_address: u16,
+    pub passive_rx_frames: u16,
+    pub poll_attempts: u16,
+    pub poll_data_frames: u16,
+    pub poll_errors: u16,
+    pub last_frame_len: u8,
+    pub last_frame_prefix: [u8; 16],
+    pub nwk_header_len: u8,
+    pub nwk_security: bool,
+    pub key_frame_result: KeyFrameResult,
+    pub transport_key_received: bool,
+    pub verify_key_attempts: u16,
+    pub verify_key_successes: u16,
+    pub verify_key_error: u8,
+    pub request_key_attempts: u16,
+    pub request_key_send_successes: u16,
+    pub request_key_send_failures: u16,
+    pub request_key_error: u8,
+    pub node_desc_requests: u16,
+    pub node_desc_send_failures: u16,
+    pub node_desc_responses: u16,
+    pub node_desc_timeouts: u16,
+    pub node_desc_parse_failures: u16,
+    pub last_node_desc_status: u8,
+    pub trust_center_server_mask: u16,
+    pub trust_center_stack_revision: u8,
+    pub tclk_installations: u16,
+    pub confirm_key_frames: u32,
+    pub confirm_key_successes: u32,
+    pub confirm_key_rejections: u32,
+    pub last_confirm_key_status: u8,
 }
 
 // ── BDB layer ───────────────────────────────────────────────
@@ -95,6 +191,7 @@ pub struct BdbLayer<M: MacDriver> {
     zdo: ZdoLayer<M>,
     attributes: BdbAttributes,
     state: BdbState,
+    steering_diagnostics: SteeringDiagnostics,
     /// Pending Find & Bind target request: (endpoint, identify_time_secs)
     pub fb_target_request: Option<(u8, u16)>,
     /// Collected F&B identify query responses: (nwk_addr, endpoint).
@@ -114,6 +211,7 @@ impl<M: MacDriver> BdbLayer<M> {
             zdo,
             attributes: BdbAttributes::default(),
             state: BdbState::Idle,
+            steering_diagnostics: SteeringDiagnostics::default(),
             fb_target_request: None,
             fb_identify_responses: heapless::Vec::new(),
             fb_window_remaining: 0,
@@ -131,6 +229,8 @@ impl<M: MacDriver> BdbLayer<M> {
             ZdoLayer::write_into(core::ptr::addr_of_mut!((*slot).zdo), mac, device_type);
             core::ptr::addr_of_mut!((*slot).attributes).write(BdbAttributes::default());
             core::ptr::addr_of_mut!((*slot).state).write(BdbState::Idle);
+            core::ptr::addr_of_mut!((*slot).steering_diagnostics)
+                .write(SteeringDiagnostics::default());
             core::ptr::addr_of_mut!((*slot).fb_target_request).write(None);
             core::ptr::addr_of_mut!((*slot).fb_identify_responses).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).fb_window_remaining).write(0);
@@ -158,6 +258,10 @@ impl<M: MacDriver> BdbLayer<M> {
 
     pub fn state(&self) -> &BdbState {
         &self.state
+    }
+
+    pub fn steering_diagnostics(&self) -> SteeringDiagnostics {
+        self.steering_diagnostics
     }
 
     /// Whether the device is currently on a Zigbee network.

@@ -14,6 +14,5 @@ fn main() {
     }
 
     println!("cargo:rustc-link-arg=-Tmemory.x");
-    println!("cargo:rustc-link-arg=--noinhibit-exec");
     println!("cargo:rustc-link-arg=--gc-sections");
 }

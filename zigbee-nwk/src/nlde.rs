@@ -16,7 +16,9 @@ macro_rules! nwk_trace {
 }
 #[cfg(not(feature = "efr32-trace"))]
 macro_rules! nwk_trace {
-    ($($arg:tt)*) => { () };
+    ($($arg:tt)*) => {
+        ()
+    };
 }
 
 // ── Telink TLSR8258 debug markers (NWK TX path) ────────────────────────────
@@ -105,19 +107,117 @@ mod tlnk_dbg {
 
 #[cfg(feature = "telink-debug")]
 macro_rules! tdbg_bump {
-    ($off:expr) => { tlnk_dbg::bump($off) };
+    ($off:expr) => {
+        tlnk_dbg::bump($off)
+    };
 }
 #[cfg(not(feature = "telink-debug"))]
 macro_rules! tdbg_bump {
-    ($off:expr) => { () };
+    ($off:expr) => {
+        ()
+    };
 }
 #[cfg(feature = "telink-debug")]
 macro_rules! tdbg_set {
-    ($off:expr, $val:expr) => { tlnk_dbg::set($off, $val) };
+    ($off:expr, $val:expr) => {
+        tlnk_dbg::set($off, $val)
+    };
 }
 #[cfg(not(feature = "telink-debug"))]
 macro_rules! tdbg_set {
-    ($off:expr, $val:expr) => { () };
+    ($off:expr, $val:expr) => {
+        ()
+    };
+}
+
+#[cfg(feature = "telink-tx-capture")]
+mod tx_capture {
+    use zigbee_types::ShortAddress;
+
+    const BASE: u32 = 0x0084_FF00;
+    const MAGIC: u32 = 0x5854_4B52; // "RKTX"
+    const PAYLOAD_OFFSET: u32 = 0x20;
+    const PAYLOAD_CAPACITY: usize = 64;
+    const FRAME_OFFSET: u32 = 0x60;
+    const FRAME_CAPACITY: usize = 96;
+    const TIMESTAMP_OFFSET: u32 = 0xC0;
+
+    #[inline(always)]
+    unsafe fn read_u32(off: u32) -> u32 {
+        unsafe { core::ptr::read_volatile((BASE + off) as *const u32) }
+    }
+
+    #[inline(always)]
+    unsafe fn write_u32(off: u32, value: u32) {
+        unsafe { core::ptr::write_volatile((BASE + off) as *mut u32, value) }
+    }
+
+    #[inline(always)]
+    unsafe fn clear_bytes(off: u32, len: usize) {
+        let dst = (BASE + off) as *mut u8;
+        for index in 0..len {
+            unsafe { core::ptr::write_volatile(dst.add(index), 0) };
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn copy_bytes(off: u32, src: &[u8], capacity: usize) {
+        let dst = (BASE + off) as *mut u8;
+        for (index, byte) in src.iter().take(capacity).enumerate() {
+            unsafe { core::ptr::write_volatile(dst.add(index), *byte) };
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        dst: ShortAddress,
+        next_hop: ShortAddress,
+        source: ShortAddress,
+        sequence: u8,
+        secured: bool,
+        header_len: usize,
+        security_header_len: usize,
+        frame_counter: u32,
+        timestamp_micros: u32,
+        payload: &[u8],
+        frame: &[u8],
+    ) {
+        unsafe {
+            let count = if read_u32(0) == MAGIC {
+                read_u32(4).wrapping_add(1)
+            } else {
+                1
+            };
+            write_u32(0, MAGIC);
+            write_u32(4, count);
+            write_u32(8, dst.0 as u32 | ((next_hop.0 as u32) << 16));
+            write_u32(
+                12,
+                (header_len as u32 & 0xFFFF) | ((security_header_len as u32 & 0xFFFF) << 16),
+            );
+            write_u32(
+                16,
+                (payload.len() as u32 & 0xFFFF) | ((frame.len() as u32 & 0xFFFF) << 16),
+            );
+            write_u32(20, frame_counter);
+            write_u32(24, u32::MAX);
+            write_u32(
+                28,
+                source.0 as u32 | ((sequence as u32) << 16) | ((secured as u32) << 24),
+            );
+            clear_bytes(PAYLOAD_OFFSET, PAYLOAD_CAPACITY);
+            copy_bytes(PAYLOAD_OFFSET, payload, PAYLOAD_CAPACITY);
+            clear_bytes(FRAME_OFFSET, FRAME_CAPACITY);
+            copy_bytes(FRAME_OFFSET, frame, FRAME_CAPACITY);
+            write_u32(TIMESTAMP_OFFSET, timestamp_micros);
+        }
+    }
+
+    pub fn set_result(success: bool) {
+        unsafe {
+            write_u32(24, if success { 0 } else { 1 });
+        }
+    }
 }
 
 /// NWK data indication — received NWK-level data.
@@ -169,6 +269,14 @@ impl<M: MacDriver> NwkLayer<M> {
         security_enable: bool,
         discover_route: bool,
     ) -> Result<NldeDataConfirm, NwkStatus> {
+        #[cfg(feature = "telink-tx-capture")]
+        let mut capture_security_header_len = 0usize;
+        #[cfg(feature = "telink-tx-capture")]
+        let mut capture_frame_counter = 0u32;
+        #[cfg(feature = "telink-tx-capture")]
+        let capture_this_frame =
+            payload.len() == 21 && payload[0] == 0x21 && payload[2] & 0xE7 == 0x20;
+
         // BDB+0x230: nlde_data_request entries (every call)
         tdbg_bump!(0x230);
         // BDB+0x234: latch entry flags on FIRST call only (joined / sec_enabled
@@ -278,6 +386,11 @@ impl<M: MacDriver> NwkLayer<M> {
 
             // Serialize security header right after NWK header
             let sec_hdr_len = sec_hdr.serialize(&mut nwk_buf[hdr_len..]);
+            #[cfg(feature = "telink-tx-capture")]
+            {
+                capture_security_header_len = sec_hdr_len;
+                capture_frame_counter = sec_hdr.frame_counter;
+            }
 
             // BDB+0x238: dst_addr | (src_addr << 16) — last call
             tdbg_set!(
@@ -296,14 +409,8 @@ impl<M: MacDriver> NwkLayer<M> {
                     tlnk_dbg::wire_copy(0x00, &nwk_buf[..n]);
                     let m = core::cmp::min(sec_hdr_len, 16);
                     tlnk_dbg::wire_copy(0x10, &nwk_buf[hdr_len..hdr_len + m]);
-                    tlnk_dbg::wire_set(
-                        0x64,
-                        (hdr_len as u32) | ((sec_hdr_len as u32) << 16),
-                    );
-                    tlnk_dbg::wire_set(
-                        0x68,
-                        (payload.len() as u32) | ((dst_addr.0 as u32) << 16),
-                    );
+                    tlnk_dbg::wire_set(0x64, (hdr_len as u32) | ((sec_hdr_len as u32) << 16));
+                    tlnk_dbg::wire_set(0x68, (payload.len() as u32) | ((dst_addr.0 as u32) << 16));
                 } else {
                     // Subsequent calls: re-arm by clearing the guard so the
                     // dump still shows the most recent FIRST capture.
@@ -367,6 +474,23 @@ impl<M: MacDriver> NwkLayer<M> {
             }
         }
 
+        #[cfg(feature = "telink-tx-capture")]
+        if capture_this_frame {
+            tx_capture::record(
+                dst_addr,
+                next_hop,
+                self.nib.network_address,
+                seq,
+                security_enable && self.nib.security_enabled,
+                hdr_len,
+                capture_security_header_len,
+                capture_frame_counter,
+                self.mac.monotonic_micros().unwrap_or(u32::MAX),
+                payload,
+                &nwk_buf[..total_len],
+            );
+        }
+
         // BDB+0x240: hdr_len | (total_len << 16)
         tdbg_set!(
             0x240,
@@ -413,6 +537,11 @@ impl<M: MacDriver> NwkLayer<M> {
                 },
             })
             .await;
+
+        #[cfg(feature = "telink-tx-capture")]
+        if capture_this_frame {
+            tx_capture::set_result(mac_result.is_ok());
+        }
 
         if let Err(ref e) = mac_result {
             // BDB+0x25C: MAC mcps_data Err count
@@ -481,13 +610,27 @@ impl<M: MacDriver> NwkLayer<M> {
 
         if is_for_us {
             if header.frame_control.security {
+                self.rx_security_stats.secured_frames =
+                    self.rx_security_stats.secured_frames.wrapping_add(1);
                 // Parse NWK security auxiliary header
                 let after_header = &mac_payload[consumed..];
-                let (sec_hdr, sec_consumed) =
-                    crate::security::NwkSecurityHeader::parse(after_header)?;
+                let Some((sec_hdr, sec_consumed)) =
+                    crate::security::NwkSecurityHeader::parse(after_header)
+                else {
+                    self.rx_security_stats.security_header_parse_failures = self
+                        .rx_security_stats
+                        .security_header_parse_failures
+                        .wrapping_add(1);
+                    return None;
+                };
 
                 // Look up key
-                let key = self.security.key_by_seq(sec_hdr.key_seq_number)?.key;
+                let Some(key_entry) = self.security.key_by_seq(sec_hdr.key_seq_number) else {
+                    self.rx_security_stats.missing_keys =
+                        self.rx_security_stats.missing_keys.wrapping_add(1);
+                    return None;
+                };
+                let key = key_entry.key;
 
                 log::info!(
                     "[NWK SEC] sc=0x{:02X} fc={} key_seq={}",
@@ -501,6 +644,8 @@ impl<M: MacDriver> NwkLayer<M> {
                     .security
                     .check_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter)
                 {
+                    self.rx_security_stats.replay_rejections =
+                        self.rx_security_stats.replay_rejections.wrapping_add(1);
                     log::warn!("[NWK] Frame counter replay from 0x{:04X}", src.0);
                     return None;
                 }
@@ -522,6 +667,8 @@ impl<M: MacDriver> NwkLayer<M> {
 
                 match plaintext {
                     Some(pt) => {
+                        self.rx_security_stats.decrypt_successes =
+                            self.rx_security_stats.decrypt_successes.wrapping_add(1);
                         // Step 3: MIC verified — NOW commit frame counter
                         self.security
                             .commit_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter);
@@ -547,6 +694,8 @@ impl<M: MacDriver> NwkLayer<M> {
                         }));
                     }
                     None => {
+                        self.rx_security_stats.decrypt_failures =
+                            self.rx_security_stats.decrypt_failures.wrapping_add(1);
                         log::warn!("[NWK] Decrypt/MIC failed from 0x{:04X}", src.0);
                         // Do NOT commit frame counter — frame is forged/corrupted
                         return None;

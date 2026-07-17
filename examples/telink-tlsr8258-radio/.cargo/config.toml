@@ -1,0 +1,11 @@
+## tc32 target rustflags only. Deliberately no `[build] target` default and
+## no `[unstable]` table here: those forced every `cargo` invocation in this
+## directory (including plain host-side `cargo test`) onto the tc32 target
+## and onto `-Z build-std`, which only the vendored tc32 toolchain can use.
+##
+## Embedded (tc32) builds pass `--target tc32-unknown-none-elf -Z
+## build-std=core -Z build-std-features=compiler-builtins-mem` explicitly —
+## see scripts/tlsr8258.sh. Host-side unit tests (`cargo test`) then work
+## unmodified with the ambient host toolchain.
+[target.tc32-unknown-none-elf]
+rustflags = ["-C", "llvm-args=-enable-tail-merge=false"]

@@ -207,8 +207,12 @@ pub struct ApsLinkKeyEntry {
     pub key_type: ApsKeyType,
     /// Outgoing frame counter for this key
     pub outgoing_frame_counter: u32,
+    /// Exclusive upper bound of the durably reserved outgoing-counter range.
+    pub outgoing_frame_counter_limit: u32,
     /// Incoming frame counter for replay protection
     pub incoming_frame_counter: u32,
+    /// Whether an authenticated incoming frame counter has been committed.
+    pub incoming_frame_counter_valid: bool,
 }
 
 // ── APS Security context ────────────────────────────────────────
@@ -249,7 +253,9 @@ impl ApsSecurity {
         {
             existing.key = entry.key;
             existing.outgoing_frame_counter = entry.outgoing_frame_counter;
+            existing.outgoing_frame_counter_limit = entry.outgoing_frame_counter_limit;
             existing.incoming_frame_counter = entry.incoming_frame_counter;
+            existing.incoming_frame_counter_valid = entry.incoming_frame_counter_valid;
             return Ok(());
         }
         self.key_table.push(entry)
@@ -277,6 +283,17 @@ impl ApsSecurity {
     ) -> Option<&ApsLinkKeyEntry> {
         self.key_table
             .iter()
+            .find(|e| e.partner_address == *partner && e.key_type == key_type)
+    }
+
+    /// Find a mutable link-key entry for a partner device.
+    pub fn find_key_mut(
+        &mut self,
+        partner: &IeeeAddress,
+        key_type: ApsKeyType,
+    ) -> Option<&mut ApsLinkKeyEntry> {
+        self.key_table
+            .iter_mut()
             .find(|e| e.partner_address == *partner && e.key_type == key_type)
     }
 
@@ -311,7 +328,7 @@ impl ApsSecurity {
             .iter()
             .find(|e| e.partner_address == *partner && e.key_type == key_type)
         {
-            counter > entry.incoming_frame_counter
+            !entry.incoming_frame_counter_valid || counter > entry.incoming_frame_counter
         } else {
             // Unknown partner — allow with default TC link key (first contact)
             true
@@ -330,9 +347,10 @@ impl ApsSecurity {
             .key_table
             .iter_mut()
             .find(|e| e.partner_address == *partner && e.key_type == key_type)
-            .filter(|e| counter > e.incoming_frame_counter)
+            .filter(|e| !e.incoming_frame_counter_valid || counter > e.incoming_frame_counter)
         {
             entry.incoming_frame_counter = counter;
+            entry.incoming_frame_counter_valid = true;
         }
     }
 
@@ -348,8 +366,12 @@ impl ApsSecurity {
             .iter_mut()
             .find(|e| e.partner_address == *partner && e.key_type == key_type)
         {
+            if entry.outgoing_frame_counter >= entry.outgoing_frame_counter_limit {
+                log::error!("[APS] Link-key frame counter reservation exhausted");
+                return None;
+            }
             let fc = entry.outgoing_frame_counter;
-            entry.outgoing_frame_counter = entry.outgoing_frame_counter.wrapping_add(1);
+            entry.outgoing_frame_counter += 1;
             Some(fc)
         } else {
             None
@@ -448,7 +470,11 @@ impl ApsSecurity {
             // +0x214 result classifier: 0xAA = Some, 0xFF = None
             write_volatile(
                 0x0084_F664usize as *mut u32,
-                if ret.is_some() { 0x0000_00AA } else { 0x0000_00FF },
+                if ret.is_some() {
+                    0x0000_00AA
+                } else {
+                    0x0000_00FF
+                },
             );
         }
         ret
@@ -536,12 +562,7 @@ fn mac_fold(cipher: &Aes128, t: &mut [u8; 16], block: &[u8; 16]) {
 
 /// Compute CCM* CBC-MAC tag T over (B0 || AAD-blocks || payload-blocks).
 /// Returns the full 16-byte MAC state (caller extracts first M bytes).
-fn ccm_mac(
-    cipher: &Aes128,
-    nonce: &[u8; 13],
-    aad: &[u8],
-    payload: &[u8],
-) -> [u8; 16] {
+fn ccm_mac(cipher: &Aes128, nonce: &[u8; 13], aad: &[u8], payload: &[u8]) -> [u8; 16] {
     // B0: flags || nonce(13) || msg_len(2 BE)
     let mut t = [0u8; 16];
     t[0] = if aad.is_empty() {
@@ -857,24 +878,22 @@ mod ccm_tests {
     #[test]
     fn ccm_roundtrip_zigbee_tk() {
         let key: AesKey = [
-            0x4B, 0xAB, 0x0F, 0x17, 0x3E, 0x14, 0x34, 0xA2, 0xD5, 0x72, 0xE1,
-            0xC1, 0xEF, 0x47, 0x87, 0x82,
+            0x4B, 0xAB, 0x0F, 0x17, 0x3E, 0x14, 0x34, 0xA2, 0xD5, 0x72, 0xE1, 0xC1, 0xEF, 0x47,
+            0x87, 0x82,
         ];
         let nonce: [u8; 13] = [
-            0xF2, 0xA6, 0xC9, 0xFE, 0xFF, 0x27, 0x71, 0x84, 0x53, 0x50, 0x0B,
-            0x00, 0x35,
+            0xF2, 0xA6, 0xC9, 0xFE, 0xFF, 0x27, 0x71, 0x84, 0x53, 0x50, 0x0B, 0x00, 0x35,
         ];
         let aad: [u8; 15] = [
-            0x21, 0x95, 0x35, 0x53, 0x50, 0x0B, 0x00, 0xF2, 0xA6, 0xC9, 0xFE,
-            0xFF, 0x27, 0x71, 0x84,
+            0x21, 0x95, 0x35, 0x53, 0x50, 0x0B, 0x00, 0xF2, 0xA6, 0xC9, 0xFE, 0xFF, 0x27, 0x71,
+            0x84,
         ];
         // 35-byte plaintext: TransportKey cmd (0x05) + StandardNwkKey (0x01)
         // + 16-byte NWK key + key seqno + dest IEEE + src IEEE
         let pt: [u8; 35] = [
-            0x05, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22,
-            0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0x01, 0x02, 0x03,
-            0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
-            0x0F, 0x10,
+            0x05, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x66, 0x77, 0x88, 0x99, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+            0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
         ];
         let ct = aps_aes_ccm_encrypt(&key, &nonce, &aad, &pt).unwrap();
         assert_eq!(ct.len(), pt.len() + 4);
@@ -888,17 +907,15 @@ mod ccm_tests {
     #[test]
     fn ccm_roundtrip_no_aad() {
         let key: AesKey = [
-            0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA,
-            0xCB, 0xCC, 0xCD, 0xCE, 0xCF,
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD,
+            0xCE, 0xCF,
         ];
         let nonce: [u8; 13] = [
-            0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0xA0, 0xA1, 0xA2, 0xA3,
-            0xA4, 0xA5,
+            0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
         ];
         let pt: [u8; 23] = [
-            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12,
-            0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
-            0x1E,
+            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
         ];
         let ct = aps_aes_ccm_encrypt(&key, &nonce, &[], &pt).unwrap();
         let dec = aps_aes_ccm_decrypt(&key, &nonce, &[], &ct).unwrap();
@@ -951,10 +968,13 @@ fn matyas_meyer_oseas_hash(data: &[u8]) -> [u8; 16] {
         write_volatile(p, read_volatile(p).wrapping_add(1));
         // +0x24 last data.len
         write_volatile(0x0084_F724usize as *mut u32, data.len() as u32);
-        // +0x784 matyas SP at entry (last-wins)
+        // +0x784 matyas SP at entry (min-tracking)
         let sp: u32;
         core::arch::asm!("mov {0}, sp", out(reg) sp);
-        write_volatile(0x0084_F784usize as *mut u32, sp);
+        let p = 0x0084_F784usize as *mut u32;
+        if sp < read_volatile(p) {
+            write_volatile(p, sp);
+        }
     }
 
     let bit_len = (data.len() as u16).wrapping_mul(8);
@@ -976,6 +996,13 @@ fn matyas_meyer_oseas_hash(data: &[u8]) -> [u8; 16] {
         write_volatile(p, read_volatile(p).wrapping_add(1));
         // +0x2C padded_len
         write_volatile(0x0084_F72Cusize as *mut u32, padded_len as u32);
+        // +0x788 matyas SP after [u8;80] padded decl (min)
+        let sp: u32;
+        core::arch::asm!("mov {0}, sp", out(reg) sp);
+        let p = 0x0084_F788usize as *mut u32;
+        if sp < read_volatile(p) {
+            write_volatile(p, sp);
+        }
     }
 
     let mut hash = [0u8; 16];
@@ -997,8 +1024,41 @@ fn matyas_meyer_oseas_hash(data: &[u8]) -> [u8; 16] {
         }
 
         let cipher = <Aes128 as KeyInit>::new(GenericArray::from_slice(&hash));
+        #[cfg(feature = "telink-debug")]
+        unsafe {
+            use core::ptr::{read_volatile, write_volatile};
+            // +0x78C matyas SP after Aes128::new (key expansion done) (min)
+            let sp: u32;
+            core::arch::asm!("mov {0}, sp", out(reg) sp);
+            let p = 0x0084_F78Cusize as *mut u32;
+            if sp < read_volatile(p) {
+                write_volatile(p, sp);
+            }
+        }
         let mut block = GenericArray::clone_from_slice(chunk);
+        #[cfg(feature = "telink-debug")]
+        unsafe {
+            use core::ptr::{read_volatile, write_volatile};
+            // +0x790 matyas SP just before encrypt_block (deepest expected) (min)
+            let sp: u32;
+            core::arch::asm!("mov {0}, sp", out(reg) sp);
+            let p = 0x0084_F790usize as *mut u32;
+            if sp < read_volatile(p) {
+                write_volatile(p, sp);
+            }
+        }
         cipher.encrypt_block(&mut block);
+        #[cfg(feature = "telink-debug")]
+        unsafe {
+            use core::ptr::{read_volatile, write_volatile};
+            // +0x794 matyas SP right after encrypt_block returns (min)
+            let sp: u32;
+            core::arch::asm!("mov {0}, sp", out(reg) sp);
+            let p = 0x0084_F794usize as *mut u32;
+            if sp < read_volatile(p) {
+                write_volatile(p, sp);
+            }
+        }
 
         #[cfg(feature = "telink-debug")]
         unsafe {
@@ -1048,12 +1108,17 @@ fn hmac_mmo(key: &[u8; 16], message: &[u8]) -> [u8; 16] {
     unsafe {
         use core::ptr::{read_volatile, write_volatile};
         // One-shot zero-init guard at +0x7C (magic 0xBEEF_F00D once initialized).
-        // On first call, zero the entire 128-byte region so subsequent bumps are
-        // meaningful (the .debug_sram NOLOAD region is NOT cleared at cold boot).
+        // On first call, zero the 128-byte counter region (+0x00..+0x80) AND
+        // initialize the 8 SP-min slots at +0x780..+0x7A0 to 0xFFFF_FFFF so
+        // subsequent min-tracking writes are meaningful. The .debug_sram
+        // NOLOAD region is NOT cleared at cold boot.
         let guard = 0x0084_F77Cusize as *mut u32;
         if read_volatile(guard) != 0xBEEF_F00D {
             for off in (0..0x80usize).step_by(4) {
                 write_volatile((0x0084_F700usize + off) as *mut u32, 0u32);
+            }
+            for off in (0..0x20usize).step_by(4) {
+                write_volatile((0x0084_F780usize + off) as *mut u32, 0xFFFF_FFFFu32);
             }
             write_volatile(guard, 0xBEEF_F00D);
         }
@@ -1061,10 +1126,19 @@ fn hmac_mmo(key: &[u8; 16], message: &[u8]) -> [u8; 16] {
         let p = 0x0084_F700usize as *mut u32;
         write_volatile(p, read_volatile(p).wrapping_add(1));
         write_volatile(0x0084_F704usize as *mut u32, message.len() as u32);
-        // +0x780 hmac SP at entry (last-wins)
+        // +0x780 hmac SP at entry (min-tracking)
         let sp: u32;
         core::arch::asm!("mov {0}, sp", out(reg) sp);
-        write_volatile(0x0084_F780usize as *mut u32, sp);
+        let p = 0x0084_F780usize as *mut u32;
+        if sp < read_volatile(p) {
+            write_volatile(p, sp);
+        }
+        // +0x798 hmac SP max-seen (high-water = stack baseline pre-call)
+        let p = 0x0084_F798usize as *mut u32;
+        let cur_max = read_volatile(p);
+        if cur_max == 0xFFFF_FFFF || sp > cur_max {
+            write_volatile(p, sp);
+        }
     }
 
     let mut ipad_key = [0x36u8; 16];
@@ -1109,21 +1183,8 @@ fn hmac_mmo(key: &[u8; 16], message: &[u8]) -> [u8; 16] {
 /// Derive Key-Transport Key from TC link key (Zigbee spec §4.5.3.4).
 ///
 /// Key-Transport Key = HMAC-MMO(Link Key, 0x00)
-#[cfg(not(feature = "telink-debug"))]
 pub fn derive_key_transport_key(link_key: &AesKey) -> AesKey {
     hmac_mmo(link_key, &[0x00])
-}
-
-/// Debug-only hardcoded KT for ZBA09 default global link key
-/// (HMAC-MMO("ZigBeeAlliance09", 0x00)). Used to bypass an observed
-/// stack-corruption hang in the MMO epilogue on tc32 builds, so the
-/// rest of the APS Transport-Key install path can be exercised.
-#[cfg(feature = "telink-debug")]
-pub fn derive_key_transport_key(_link_key: &AesKey) -> AesKey {
-    [
-        0x4B, 0xAB, 0x0F, 0x17, 0x3E, 0x14, 0x34, 0xA2,
-        0xD5, 0x72, 0xE1, 0xC1, 0xEF, 0x47, 0x87, 0x82,
-    ]
 }
 
 /// Derive Key-Load Key from TC link key (Zigbee spec §4.5.3.4).
@@ -1133,14 +1194,130 @@ pub fn derive_key_load_key(link_key: &AesKey) -> AesKey {
     hmac_mmo(link_key, &[0x02])
 }
 
-/// Compute Verify-Key hash for APSME-VERIFY-KEY (Zigbee spec §4.4.11.2).
+/// Derive the Verify-Key hash for APSME-VERIFY-KEY (Zigbee spec B.1.4).
 ///
-/// hash = AES-MMO( initiator_ieee[8] || key[16] )
-/// The 24-byte input is the concatenation of the initiator's IEEE address
-/// (little-endian) and the trust center link key being verified.
-pub fn compute_verify_key_hash(initiator_ieee: &[u8; 8], key: &AesKey) -> AesKey {
-    let mut input = [0u8; 24]; // 8 (IEEE) + 16 (key)
-    input[..8].copy_from_slice(initiator_ieee);
-    input[8..24].copy_from_slice(key);
-    matyas_meyer_oseas_hash(&input)
+/// Verify-Key Hash = HMAC-MMO(Link Key, 0x03). The source IEEE address is a
+/// separate command field and is not part of the keyed-hash input.
+pub fn derive_verify_key_hash(link_key: &AesKey) -> AesKey {
+    hmac_mmo(link_key, &[0x03])
+}
+
+/// telink-debug only: force HMAC-MMO to execute once at boot so SP-min
+/// captures at +0x780..+0x798 are populated even if the join handshake
+/// never completes. Bypasses the hardcoded KT shortcut in
+/// `derive_key_transport_key` to exercise the real code path.
+///
+/// Returns the computed [Key-Transport Key, Key-Load Key, Verify-Key hash]
+/// triplet so the call cannot be optimized away. The caller is expected
+/// to use `core::hint::black_box` on the result.
+#[cfg(feature = "telink-debug")]
+pub fn telink_debug_probe_mmo() -> ([u8; 16], [u8; 16], [u8; 16]) {
+    // ZigBeeAlliance09 default global link key
+    let zba09: AesKey = [
+        0x5A, 0x69, 0x67, 0x42, 0x65, 0x65, 0x41, 0x6C, 0x6C, 0x69, 0x61, 0x6E, 0x63, 0x65, 0x30,
+        0x39,
+    ];
+
+    // SRAM dump layout (survives main_loop's clear_words wipe at 0x84F100..F780):
+    //   0x84F7A0..7AF : KT result
+    //   0x84F7B0..7BF : KL result
+    //   0x84F7C0..7CF : Verify-Key result
+    //   0x84F7D0      : status bits (b0=pre-KT, b1=post-KT, b2=post-KL, b3=post-VK)
+    //   0x84F7E0..7EF : KT reference   (4B AB 0F 17 3E 14 34 A2 D5 72 E1 C1 EF 47 87 82)
+    //   0x84F7F0..7FF : VK reference (1A B1 28 DF 16 39 A1 24 6A AB A7 2A 6A 55 91 24)
+
+    const STATUS: *mut u8 = 0x0084_F7D0 as *mut u8;
+    unsafe {
+        // Zero status & output regions so partial writes are visible.
+        for off in 0xA0u32..=0xD0 {
+            core::ptr::write_volatile((0x0084_F700 + off) as *mut u8, 0);
+        }
+        core::ptr::write_volatile(STATUS, 0x01); // entered probe
+    }
+
+    let kt = hmac_mmo(&zba09, &[0x00]);
+    unsafe {
+        core::ptr::write_volatile(0x0084_F7A0 as *mut [u8; 16], kt);
+        core::ptr::write_volatile(STATUS, 0x03); // KT done
+    }
+
+    let kl = hmac_mmo(&zba09, &[0x02]);
+    unsafe {
+        core::ptr::write_volatile(0x0084_F7B0 as *mut [u8; 16], kl);
+        core::ptr::write_volatile(STATUS, 0x07); // KL done
+    }
+
+    let vk = derive_verify_key_hash(&zba09);
+    unsafe {
+        core::ptr::write_volatile(0x0084_F7C0 as *mut [u8; 16], vk);
+        core::ptr::write_volatile(STATUS, 0x0F); // VK done
+    }
+
+    // Write references for in-dump diff (no host-side lookup required).
+    unsafe {
+        let kt_ref: [u8; 16] = [
+            0x4B, 0xAB, 0x0F, 0x17, 0x3E, 0x14, 0x34, 0xA2, 0xD5, 0x72, 0xE1, 0xC1, 0xEF, 0x47,
+            0x87, 0x82,
+        ];
+        let vk_ref: [u8; 16] = [
+            0x1A, 0xB1, 0x28, 0xDF, 0x16, 0x39, 0xA1, 0x24, 0x6A, 0xAB, 0xA7, 0x2A, 0x6A, 0x55,
+            0x91, 0x24,
+        ];
+        core::ptr::write_volatile(0x0084_F7E0 as *mut [u8; 16], kt_ref);
+        core::ptr::write_volatile(0x0084_F7F0 as *mut [u8; 16], vk_ref);
+    }
+
+    (kt, kl, vk)
+}
+
+#[cfg(test)]
+mod mmo_tests {
+    use super::*;
+
+    /// "ZigBeeAlliance09" default global TC link key.
+    const ZBA09: AesKey = [
+        0x5A, 0x69, 0x67, 0x42, 0x65, 0x65, 0x41, 0x6C, 0x6C, 0x69, 0x61, 0x6E, 0x63, 0x65, 0x30,
+        0x39,
+    ];
+
+    /// Zigbee spec §B.6 reference: HMAC-MMO(ZBA09, 0x00) = Key-Transport Key.
+    #[test]
+    fn key_transport_key_zba09() {
+        let kt = derive_key_transport_key(&ZBA09);
+        assert_eq!(
+            kt,
+            [
+                0x4B, 0xAB, 0x0F, 0x17, 0x3E, 0x14, 0x34, 0xA2, 0xD5, 0x72, 0xE1, 0xC1, 0xEF, 0x47,
+                0x87, 0x82,
+            ]
+        );
+    }
+
+    /// HMAC-MMO(ZBA09, 0x02) = Key-Load Key (verified via pycryptodome).
+    #[test]
+    fn key_load_key_zba09() {
+        let kl = derive_key_load_key(&ZBA09);
+        assert_eq!(
+            kl,
+            [
+                0xC5, 0xA4, 0x70, 0x35, 0xC3, 0x32, 0xCC, 0xBF, 0x25, 0x15, 0x71, 0xD8, 0xBA, 0xDE,
+                0xD1, 0x88,
+            ]
+        );
+    }
+
+    /// HMAC-MMO(ZBA09, 0x03) = APSME-VERIFY-KEY hash.
+    /// Independently verified with pycryptodome after checking the same
+    /// implementation against the published 0x00 Key-Transport vector.
+    #[test]
+    fn verify_key_hash_zba09() {
+        let vk = derive_verify_key_hash(&ZBA09);
+        assert_eq!(
+            vk,
+            [
+                0x1A, 0xB1, 0x28, 0xDF, 0x16, 0x39, 0xA1, 0x24, 0x6A, 0xAB, 0xA7, 0x2A, 0x6A, 0x55,
+                0x91, 0x24,
+            ]
+        );
+    }
 }

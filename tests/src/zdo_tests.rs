@@ -3,7 +3,7 @@ use zigbee_zdo::binding_mgmt::{BindReq, BindRsp, BindTarget};
 use zigbee_zdo::descriptors::{LogicalType, NodeDescriptor, PowerDescriptor, SimpleDescriptor};
 use zigbee_zdo::device_announce::DeviceAnnounce;
 use zigbee_zdo::discovery::{
-    IeeeAddrReq, MatchDescReq, NodeDescReq, NwkAddrReq, RequestType, SimpleDescReq,
+    IeeeAddrReq, MatchDescReq, NodeDescReq, NodeDescRsp, NwkAddrReq, RequestType, SimpleDescReq,
 };
 use zigbee_zdo::network_mgmt::{MgmtLeaveReq, MgmtLqiReq, MgmtPermitJoiningReq};
 use zigbee_zdo::ZdpStatus;
@@ -176,6 +176,28 @@ fn node_desc_req_roundtrip() {
 
     let parsed = NodeDescReq::parse(&buf[..len]).unwrap();
     assert_eq!(parsed.nwk_addr_of_interest, ShortAddress(0xABCD));
+}
+
+#[test]
+fn node_desc_rsp_exposes_stack_revision() {
+    let node_descriptor = NodeDescriptor {
+        server_mask: (23 << 9) | 0x0041,
+        ..NodeDescriptor::default()
+    };
+    let rsp = NodeDescRsp {
+        status: ZdpStatus::Success,
+        nwk_addr_of_interest: ShortAddress::COORDINATOR,
+        node_descriptor: Some(node_descriptor),
+    };
+
+    let mut buf = [0u8; 32];
+    let len = rsp.serialize(&mut buf).unwrap();
+    let parsed = NodeDescRsp::parse(&buf[..len]).unwrap();
+    let parsed_descriptor = parsed.node_descriptor.unwrap();
+
+    assert_eq!(parsed.nwk_addr_of_interest, ShortAddress::COORDINATOR);
+    assert_eq!(parsed_descriptor.server_mask, node_descriptor.server_mask);
+    assert_eq!(parsed_descriptor.stack_revision(), 23);
 }
 
 #[test]

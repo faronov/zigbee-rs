@@ -77,6 +77,18 @@ pub enum JoinMethod {
     Direct,
 }
 
+fn zigbee_capability_info(device_type: DeviceType, rx_on_when_idle: bool) -> CapabilityInfo {
+    CapabilityInfo {
+        device_type_ffd: device_type != DeviceType::EndDevice,
+        mains_powered: device_type != DeviceType::EndDevice,
+        rx_on_when_idle,
+        // Zigbee PRO uses NWK/APS security, not IEEE 802.15.4 MAC security.
+        // This matches the official Telink stack and the working nRF backend.
+        security_capable: false,
+        allocate_address: true,
+    }
+}
+
 /// NLME management primitive implementations.
 impl<M: MacDriver> NwkLayer<M> {
     // ── NLME-NETWORK-DISCOVERY ──────────────────────────────
@@ -127,7 +139,7 @@ impl<M: MacDriver> NwkLayer<M> {
             scan_result.pan_descriptors.len()
         );
 
-        let mut networks = heapless::Vec::new();
+        let mut networks: heapless::Vec<NetworkDescriptor, 16> = heapless::Vec::new();
         for pd in &scan_result.pan_descriptors {
             #[cfg(feature = "efr32-trace")]
             rtt_target::rprintln!(
@@ -149,8 +161,17 @@ impl<M: MacDriver> NwkLayer<M> {
                 );
                 continue;
             }
-            let nd = NetworkDescriptor::from(pd);
-            let _ = networks.push(nd);
+            let mut descriptor = NetworkDescriptor::from(pd);
+            if let Some(existing) = networks.iter_mut().find(|existing| {
+                existing.logical_channel == descriptor.logical_channel
+                    && existing.pan_id == descriptor.pan_id
+                    && existing.router_address == descriptor.router_address
+            }) {
+                descriptor.lqi = descriptor.lqi.max(existing.lqi);
+                *existing = descriptor;
+            } else {
+                let _ = networks.push(descriptor);
+            }
         }
 
         if networks.is_empty() {
@@ -312,13 +333,7 @@ impl<M: MacDriver> NwkLayer<M> {
         // Build capability info. The requested receiver mode must not depend
         // on diagnostic features; sleepy devices can still obtain indirect
         // Transport-Key frames through MAC polling.
-        let cap = CapabilityInfo {
-            device_type_ffd: self.device_type != DeviceType::EndDevice,
-            mains_powered: self.device_type != DeviceType::EndDevice,
-            rx_on_when_idle: self.device_type != DeviceType::EndDevice,
-            security_capable: true,
-            allocate_address: true,
-        };
+        let cap = zigbee_capability_info(self.device_type, self.rx_on_when_idle);
 
         #[cfg(feature = "efr32-trace")]
         rtt_target::rprintln!(
@@ -411,7 +426,7 @@ impl<M: MacDriver> NwkLayer<M> {
             .mac
             .mlme_set(
                 PibAttribute::MacRxOnWhenIdle,
-                PibValue::Bool(self.device_type != DeviceType::EndDevice),
+                PibValue::Bool(self.rx_on_when_idle),
             )
             .await;
 
@@ -490,13 +505,7 @@ impl<M: MacDriver> NwkLayer<M> {
             .await;
 
         // Build NWK Rejoin Request frame
-        let cap_byte = CapabilityInfo {
-            device_type_ffd: self.device_type != DeviceType::EndDevice,
-            mains_powered: self.device_type != DeviceType::EndDevice,
-            rx_on_when_idle: self.device_type != DeviceType::EndDevice,
-            security_capable: true,
-            allocate_address: true,
-        };
+        let cap_byte = zigbee_capability_info(self.device_type, self.rx_on_when_idle);
 
         let seq = self.nib.next_seq();
         let mut nwk_frame_buf = [0u8; 64];
@@ -532,7 +541,10 @@ impl<M: MacDriver> NwkLayer<M> {
             // Encrypt rejoin request with network key
             let sec_hdr = crate::security::NwkSecurityHeader {
                 security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
-                frame_counter: self.nib.next_frame_counter().unwrap_or(0),
+                frame_counter: self
+                    .nib
+                    .next_frame_counter()
+                    .ok_or(NwkStatus::InvalidRequest)?,
                 source_address: self.nib.ieee_address,
                 key_seq_number: self.nib.active_key_seq_number,
             };
@@ -775,7 +787,10 @@ impl<M: MacDriver> NwkLayer<M> {
             // Apply NWK security — same path as rejoin and data frames
             let sec_hdr = crate::security::NwkSecurityHeader {
                 security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
-                frame_counter: self.nib.next_frame_counter().unwrap_or(0),
+                frame_counter: self
+                    .nib
+                    .next_frame_counter()
+                    .ok_or(NwkStatus::InvalidRequest)?,
                 source_address: self.nib.ieee_address,
                 key_seq_number: self.nib.active_key_seq_number,
             };
@@ -1055,5 +1070,26 @@ fn generate_pan_id() -> u16 {
         SEED ^= SEED << 5;
         let pan = (SEED & 0x3FFF) as u16; // Avoid reserved range
         if pan == 0xFFFF { 0x1234 } else { pan }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zigbee_capability_bytes_match_reference_stack() {
+        assert_eq!(
+            zigbee_capability_info(DeviceType::EndDevice, false).to_byte(),
+            0x80
+        );
+        assert_eq!(
+            zigbee_capability_info(DeviceType::EndDevice, true).to_byte(),
+            0x88
+        );
+        assert_eq!(
+            zigbee_capability_info(DeviceType::Router, true).to_byte(),
+            0x8E
+        );
     }
 }

@@ -69,6 +69,8 @@ pub struct Nib {
     pub active_key_seq_number: u8,
     /// NWK frame counter (outgoing)
     pub outgoing_frame_counter: u32,
+    /// Exclusive upper bound of the durably reserved outgoing-counter range.
+    pub outgoing_frame_counter_limit: u32,
 
     // ── Sequences ───────────────────────────────────────
     /// NWK sequence number
@@ -118,9 +120,13 @@ impl Nib {
             source_routing: false,
             route_discovery_retries: 3,
             security_level: 5, // ENC-MIC-32 (standard Zigbee)
-            security_enabled: true,
+            // A factory-new device has no active network key. NWK security
+            // becomes active only after network formation, restore, or a
+            // successful APS Transport-Key exchange.
+            security_enabled: false,
             active_key_seq_number: 0,
             outgoing_frame_counter: 0,
+            outgoing_frame_counter_limit: u32::MAX,
             sequence_number: 0,
             route_request_id: 0,
             permit_joining: false,
@@ -143,20 +149,58 @@ impl Nib {
     }
 
     /// Increment outgoing frame counter. Returns the pre-increment value.
-    /// Returns None if counter has reached maximum (must not reuse counters).
+    /// Returns None if the counter has reached the durably reserved limit.
     pub fn next_frame_counter(&mut self) -> Option<u32> {
-        if self.outgoing_frame_counter == u32::MAX {
-            log::error!("[NWK] Frame counter exhausted — cannot send secured frames");
+        if self.outgoing_frame_counter >= self.outgoing_frame_counter_limit {
+            log::error!("[NWK] Frame counter reservation exhausted");
             return None;
         }
         let fc = self.outgoing_frame_counter;
         self.outgoing_frame_counter += 1;
         Some(fc)
     }
+
+    /// Install a durably persisted outgoing-counter reservation.
+    pub fn set_frame_counter_reservation(&mut self, current: u32, limit: u32) -> bool {
+        if current > limit {
+            return false;
+        }
+        self.outgoing_frame_counter = current;
+        self.outgoing_frame_counter_limit = limit;
+        true
+    }
 }
 
 impl Default for Nib {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Nib;
+
+    #[test]
+    fn factory_new_nib_starts_without_nwk_security() {
+        assert!(!Nib::new().security_enabled);
+    }
+
+    #[test]
+    fn outgoing_counter_stops_at_reserved_limit() {
+        let mut nib = Nib::new();
+        assert!(nib.set_frame_counter_reservation(7, 9));
+        assert_eq!(nib.next_frame_counter(), Some(7));
+        assert_eq!(nib.next_frame_counter(), Some(8));
+        assert_eq!(nib.next_frame_counter(), None);
+        assert_eq!(nib.outgoing_frame_counter, 9);
+    }
+
+    #[test]
+    fn outgoing_counter_rejects_invalid_reservation() {
+        let mut nib = Nib::new();
+        assert!(!nib.set_frame_counter_reservation(10, 9));
+        assert_eq!(nib.outgoing_frame_counter, 0);
+        assert_eq!(nib.outgoing_frame_counter_limit, u32::MAX);
     }
 }

@@ -185,6 +185,21 @@ pub trait MacDriver {
     /// responsible for filtering by frame type / addressing.
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError>;
 
+    // ── Protocol timing ─────────────────────────────────────
+
+    /// Monotonic time in microseconds, wrapping at `u32::MAX`.
+    ///
+    /// Backends that provide this let upper layers enforce protocol timeouts
+    /// without depending on a platform-specific async timer.
+    fn monotonic_micros(&self) -> Option<u32> {
+        None
+    }
+
+    /// Delay protocol progress for at least `duration_us` microseconds.
+    ///
+    /// The default is a no-op for backends whose executor owns timing.
+    async fn delay_micros(&mut self, _duration_us: u32) {}
+
     // ── Capability queries ──────────────────────────────────
 
     /// Returns the hardware capabilities of this MAC backend.

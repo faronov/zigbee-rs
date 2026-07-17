@@ -155,6 +155,35 @@ pub enum ApsAddress {
     Group(u16),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApsSecurityHandshakeStats {
+    pub verify_key_sent: u32,
+    pub confirm_key_received: u32,
+    pub confirm_key_successes: u32,
+    pub confirm_key_rejections: u32,
+    pub last_confirm_key_status: u8,
+    pub last_confirm_key_type: u8,
+    pub last_confirm_key_source: u16,
+    pub last_confirm_key_source_ieee: zigbee_types::IeeeAddress,
+    pub last_confirm_key_destination: zigbee_types::IeeeAddress,
+}
+
+impl Default for ApsSecurityHandshakeStats {
+    fn default() -> Self {
+        Self {
+            verify_key_sent: 0,
+            confirm_key_received: 0,
+            confirm_key_successes: 0,
+            confirm_key_rejections: 0,
+            last_confirm_key_status: 0xFF,
+            last_confirm_key_type: 0xFF,
+            last_confirm_key_source: 0xFFFF,
+            last_confirm_key_source_ieee: [0u8; 8],
+            last_confirm_key_destination: [0u8; 8],
+        }
+    }
+}
+
 // ── TX Options ──────────────────────────────────────────────────
 
 /// APSDE-DATA.request TX options bitfield.
@@ -250,6 +279,7 @@ pub struct ApsLayer<M: MacDriver> {
     security: security::ApsSecurity,
     /// APS frame counter (outgoing)
     aps_counter: u8,
+    security_handshake_stats: ApsSecurityHandshakeStats,
     /// Pending APS ACK to send after processing incoming frame
     pending_aps_ack: Option<PendingApsAck>,
     /// APS duplicate rejection table
@@ -271,6 +301,7 @@ impl<M: MacDriver> ApsLayer<M> {
             group_table: group::GroupTable::new(),
             security: security::ApsSecurity::new(),
             aps_counter: 0,
+            security_handshake_stats: ApsSecurityHandshakeStats::default(),
             pending_aps_ack: None,
             dup_table: [ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE],
             ack_table: heapless::Vec::new(),
@@ -291,6 +322,8 @@ impl<M: MacDriver> ApsLayer<M> {
             core::ptr::addr_of_mut!((*slot).group_table).write(group::GroupTable::new());
             core::ptr::addr_of_mut!((*slot).security).write(security::ApsSecurity::new());
             core::ptr::addr_of_mut!((*slot).aps_counter).write(0);
+            core::ptr::addr_of_mut!((*slot).security_handshake_stats)
+                .write(ApsSecurityHandshakeStats::default());
             core::ptr::addr_of_mut!((*slot).pending_aps_ack).write(None);
             core::ptr::addr_of_mut!((*slot).dup_table)
                 .write([ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE]);
@@ -304,6 +337,10 @@ impl<M: MacDriver> ApsLayer<M> {
         let c = self.aps_counter;
         self.aps_counter = self.aps_counter.wrapping_add(1);
         c
+    }
+
+    pub fn security_handshake_stats(&self) -> ApsSecurityHandshakeStats {
+        self.security_handshake_stats
     }
 
     /// Check if an APS frame is a duplicate. Returns true if duplicate.

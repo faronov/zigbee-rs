@@ -68,21 +68,15 @@ mod tlnk_dbg {
 
 #[cfg(feature = "telink-debug")]
 macro_rules! tdbg_bump {
-    ($off:expr) => { tlnk_dbg::bump($off) };
+    ($off:expr) => {
+        tlnk_dbg::bump($off)
+    };
 }
 #[cfg(not(feature = "telink-debug"))]
 macro_rules! tdbg_bump {
     ($off:expr) => {
         ()
     };
-}
-#[cfg(feature = "telink-debug")]
-macro_rules! tdbg_set {
-    ($off:expr, $val:expr) => { tlnk_dbg::set($off, $val) };
-}
-#[cfg(not(feature = "telink-debug"))]
-macro_rules! tdbg_set {
-    ($off:expr, $val:expr) => { () };
 }
 #[cfg(feature = "telink-debug")]
 macro_rules! tdbg_ring {
@@ -146,6 +140,24 @@ impl<M: MacDriver> ZdoLayer<M> {
             ApsAddress::Short(a) => a,
             _ => ShortAddress(0x0000),
         };
+
+        self.diagnostics.indications = self.diagnostics.indications.wrapping_add(1);
+        self.diagnostics.last_cluster = cluster;
+        match cluster {
+            crate::NODE_DESC_REQ => {
+                self.diagnostics.node_desc_requests =
+                    self.diagnostics.node_desc_requests.wrapping_add(1);
+            }
+            crate::ACTIVE_EP_REQ => {
+                self.diagnostics.active_ep_requests =
+                    self.diagnostics.active_ep_requests.wrapping_add(1);
+            }
+            crate::SIMPLE_DESC_REQ => {
+                self.diagnostics.simple_desc_requests =
+                    self.diagnostics.simple_desc_requests.wrapping_add(1);
+            }
+            _ => {}
+        }
 
         // ── Telink debug: record ZDP RX in ring + bump per-cluster counters
         tdbg_ring!(cluster, tsn, ind.src_endpoint, src_short.0);
@@ -265,11 +277,18 @@ impl<M: MacDriver> ZdoLayer<M> {
             src_short.0,
             rsp_len
         );
+        self.diagnostics.response_attempts = self.diagnostics.response_attempts.wrapping_add(1);
+        self.diagnostics.last_response_cluster = rsp_cluster;
         tdbg_bump!(0x1D0); // BDB+0x1D0: ZDO TX response count
-        let tx_result = self.send_zdp_unicast(src_short, rsp_cluster, &rsp_buf[..rsp_len])
+        let tx_result = self
+            .send_zdp_unicast(src_short, rsp_cluster, &rsp_buf[..rsp_len])
             .await;
-        if tx_result.is_err() {
-            tdbg_bump!(0x1F0); // BDB+0x1F0: ZDO TX failures
+        if tx_result.is_ok() {
+            self.diagnostics.response_successes =
+                self.diagnostics.response_successes.wrapping_add(1);
+        } else {
+            self.diagnostics.response_failures = self.diagnostics.response_failures.wrapping_add(1);
+            tdbg_bump!(0x1F0);
         }
         tx_result
     }

@@ -157,6 +157,20 @@ impl From<NwkStatus> for ZdpStatus {
     }
 }
 
+/// Runtime counters for ZDO request handling and response transmission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ZdoDiagnostics {
+    pub indications: u32,
+    pub node_desc_requests: u32,
+    pub active_ep_requests: u32,
+    pub simple_desc_requests: u32,
+    pub response_attempts: u32,
+    pub response_successes: u32,
+    pub response_failures: u32,
+    pub last_cluster: u16,
+    pub last_response_cluster: u16,
+}
+
 // ── ZDO error type ──────────────────────────────────────────────
 
 /// Errors originating from the ZDO layer.
@@ -197,6 +211,7 @@ pub struct ZdoLayer<M: MacDriver> {
     local_ieee_addr: IeeeAddress,
     /// Pending ZDP request-response table for TSN correlation.
     pending_responses: [PendingZdpResponse; MAX_PENDING_ZDP],
+    diagnostics: ZdoDiagnostics,
 }
 
 /// Maximum concurrent pending ZDP requests.
@@ -240,6 +255,7 @@ impl<M: MacDriver> ZdoLayer<M> {
             local_nwk_addr: ShortAddress::UNASSIGNED,
             local_ieee_addr: [0u8; 8],
             pending_responses: core::array::from_fn(|_| PendingZdpResponse::default()),
+            diagnostics: ZdoDiagnostics::default(),
         }
     }
 
@@ -259,6 +275,7 @@ impl<M: MacDriver> ZdoLayer<M> {
             core::ptr::addr_of_mut!((*slot).local_ieee_addr).write([0u8; 8]);
             core::ptr::addr_of_mut!((*slot).pending_responses)
                 .write(core::array::from_fn(|_| PendingZdpResponse::default()));
+            core::ptr::addr_of_mut!((*slot).diagnostics).write(ZdoDiagnostics::default());
         }
     }
 
@@ -325,6 +342,25 @@ impl<M: MacDriver> ZdoLayer<M> {
         }
     }
 
+    /// Route an incoming ZDP response into the pending client-request table.
+    pub fn deliver_client_response(
+        &mut self,
+        indication: &zigbee_aps::apsde::ApsdeDataIndication<'_>,
+    ) -> bool {
+        if indication.dst_endpoint != ZDO_ENDPOINT
+            || indication.profile_id != ZDP_PROFILE_ID
+            || indication.payload.is_empty()
+        {
+            return false;
+        }
+
+        self.deliver_response(
+            indication.cluster_id,
+            indication.payload[0],
+            &indication.payload[1..],
+        )
+    }
+
     // ── Layer access ────────────────────────────────────────
 
     /// Immutable reference to the underlying APS layer.
@@ -345,6 +381,10 @@ impl<M: MacDriver> ZdoLayer<M> {
     /// Shortcut: mutable reference to the NWK layer.
     pub fn nwk_mut(&mut self) -> &mut NwkLayer<M> {
         self.aps.nwk_mut()
+    }
+
+    pub fn diagnostics(&self) -> ZdoDiagnostics {
+        self.diagnostics
     }
 
     // ── Endpoint registry ───────────────────────────────────
@@ -476,6 +516,29 @@ impl<M: MacDriver> ZdoLayer<M> {
         self.send_zdp_broadcast(DEVICE_ANNCE, &buf)
             .await
             .map_err(|_| ZdpStatus::NotActive)
+    }
+
+    /// Start a Node_Desc request and return its pending-response slot.
+    pub async fn start_node_desc_req(&mut self, dst: ShortAddress) -> Result<usize, ZdpStatus> {
+        let tsn = self.next_seq();
+        let mut buf = [0u8; 3];
+        buf[0] = tsn;
+        buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
+
+        let slot = self
+            .register_pending(tsn, NODE_DESC_RSP)
+            .ok_or(ZdpStatus::TableFull)?;
+        log::debug!("[ZDO] Node_Desc_req dst=0x{:04X}", dst.0);
+        if self
+            .send_zdp_unicast(dst, NODE_DESC_REQ, &buf)
+            .await
+            .is_err()
+        {
+            self.cancel_pending(slot);
+            return Err(ZdpStatus::NotActive);
+        }
+
+        Ok(slot)
     }
 
     /// Send Mgmt_Permit_Joining_req (ZDP cluster 0x0036).

@@ -1557,6 +1557,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tlsr8258-hal"
+version = "0.1.0"
+
+[[package]]
 name = "tokio"
 version = "1.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1807,6 +1811,7 @@ dependencies = [
  "heapless 0.9.2",
  "log",
  "rtt-target",
+ "tlsr8258-hal",
  "zigbee-types",
 ]
 

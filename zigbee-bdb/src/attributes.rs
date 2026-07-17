@@ -57,6 +57,7 @@ pub enum BdbCommissioningStatus {
     NoIdentifyQueryResponse = 0x08,
     BindingTableFull = 0x09,
     NoScanResponse = 0x0A,
+    TcLinkKeyExchangeFailure = 0x0B,
 }
 
 // ── BDB attributes ──────────────────────────────────────────

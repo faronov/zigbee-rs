@@ -27,6 +27,8 @@ exclude = [
     "examples/cc2340-sensor",
     "examples/telink-b91-sensor",
     "examples/telink-tlsr8258-sensor",
+    "examples/telink-tlsr8258-radio",
+    "tlsr8258-hal",
     "examples/phy6222-sensor",
     "examples/efr32mg1-sensor",
     "examples/efr32mg21-sensor",

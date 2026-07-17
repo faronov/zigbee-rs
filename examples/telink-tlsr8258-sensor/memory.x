@@ -1,14 +1,20 @@
-/* TLSR8258 memory layout — pure Rust, no vendor SDK
+/* TLSR8258 memory layout — pure Rust, no vendor SDK.
  *
- * Default I-cache is 32KB (reg 0x6C bits[3:2]=00), so the lower SRAM window
- * 0x840000-0x847FFF must be treated as cache territory. Earlier revisions put
- * .data/.bss there, which is acceptable only for fragile bring-up. For stable
- * runtime we place all writable sections in the upper 32KB SRAM window.
+ * This follows Telink SDK V3.7.2.0 platform/boot/8258/boot_8258.link:
+ *
+ *   0x840000 + A         RAM-code backing end / I-cache tag start
+ *   0x840100 + A         I-cache tag end / I-cache data start
+ *   0x840900 + A         I-cache data end / .data start
+ *   0x850000             top of the 64 KiB SRAM window
+ *
+ * where A is the RAM-code preload size rounded up to 256 bytes. The 0x800
+ * bytes after the 0x100-byte tag array are reserved for I-cache data and must
+ * not contain mutable program state or RF DMA buffers.
  */
 MEMORY
 {
     FLASH : ORIGIN = 0x00000000, LENGTH = 512K
-    RAM   : ORIGIN = 0x00848000, LENGTH = 0x8000
+    RAM   : ORIGIN = 0x00840000, LENGTH = 0x10000
 }
 
 ENTRY(_reset_vector);
@@ -56,8 +62,16 @@ SECTIONS
     _dstored_ = .;
     _code_size_ = .;
 
-    /* Initialized data (loaded from flash after ram_code, copied to RAM on startup) */
-    .data 0x00848300 : AT(_dstored_)
+    /* Telink reserves RAM-code backing, 0x100 bytes of I-cache tags, then
+     * 0x800 bytes of I-cache data before writable program data. */
+    _ictag_start_ = 0x840000 + _ramcode_size_align_256_;
+    _ictag_end_ = _ictag_start_ + 0x100;
+    _icache_data_start_ = _ictag_end_;
+    _icache_data_end_ = _icache_data_start_ + 0x800;
+    _sram_data_start_ = 0x840900 + _ramcode_size_align_256_;
+
+    /* Initialized data is copied here from flash by the reset handler. */
+    .data _sram_data_start_ : AT(_dstored_)
     {
         _sdata = .;
         *(.data .data.*);
@@ -77,9 +91,9 @@ SECTIONS
         _ebss = .;
     } > RAM
 
-    /* SWire-readable diagnostics near the top of SRAM. Keep this away from the
-     * lower SRAM area used by Telink's instruction cache while executing XIP.
-     */
+    /* SWire-readable diagnostics near the top of SRAM, above the stacks. The
+     * telink-debug probes also poke raw counters/SP-min slots up to ~0x84F800,
+     * so the stacks are kept below 0x0084F000. */
     .debug_sram 0x0084F000 (NOLOAD) :
     {
         . = ALIGN(4);
@@ -89,27 +103,16 @@ SECTIONS
         _debug_sram_end = .;
     } > RAM
 
-    /* Stack layout (tc32 uses banked, descending stacks). The SVC stack must
-     * start well above `_ebss`; the runtime-sensor build's .bss approaches
-     * 0x0084B000 with all cluster MaybeUninit slots, so the prior hard-coded
-     * 0x0084B000 SVC top left <1 KiB of usable stack before corrupting .bss.
+    /* Stack layout (tc32 uses banked, descending stacks). The debug-heavy
+     * bring-up image keeps diagnostics at 0x84F000, so its stacks remain below
+     * that reservation rather than using the SDK's normal 0x850000 stack top.
      *
      *   SVC stack:  _svc_stack_bottom (0x0084B400) .. _svc_stack_top (0x0084E000)   [11 KiB]
      *   IRQ stack:  _irq_stack_bottom (0x0084E000) .. _irq_stack_top (0x0084F000)   [4 KiB]
      * Debug SRAM sits at 0x0084F000+, so the IRQ stack abuts it from below.
      *
-     * NOTE: stack was 8 KiB (bottom=0x0084C000) and the SVC high-water mark
-     * (painted-pattern scan recorded at MODE+0x1AC) showed full 8 KiB
-     * occupancy — i.e., a SINGLE-WORD safety margin away from clobbering
-     * .bss. That correlates with the observed `aes_ccm_decrypt` hang during
-     * BDB Transport-Key wait: when BDB ran multiple TC-link-key tries the
-     * descending stack briefly punched into NwkSecurity state in .bss,
-     * leaving the RustCrypto `ccm` crate spinning on corrupt context. The
-     * stack was grown to 11 KiB so even the deepest async/BDB call paths
-     * stay within budget.
-     *
-     * _ebss after the runtime-sensor build sits at 0x0084B224; the assert
-     * below catches any future growth that would re-collide.
+     * The `_ebss <= _svc_stack_bottom` assert below still guards against any
+     * future .bss growth large enough to climb back into the stack region.
      *
      * The reset/IRQ asm initialises SP from these symbols so the linker
      * remains the single source of truth for stack placement.
@@ -134,9 +137,6 @@ SECTIONS
     _start_bss_ = _sbss;
     _end_bss_ = _ebss;
     _stack_end_ = _stack_top;
-    /* I-cache tags sit immediately after the boot/RAM-code preload area. */
-    _ictag_start_ = 0x840000 + _ramcode_size_div_256_ * 0x100;
-    _ictag_end_ = _ictag_start_ + 0x100;
     /* Custom data sections (unused — set to zero-length) */
     _custom_stored_ = _etext;
     _start_custom_data_ = _edata;
@@ -147,6 +147,8 @@ SECTIONS
     /* Safety asserts (assigned to dummy symbols so ld.lld evaluates them). */
     _assert_ramcode_fits = ASSERT(_ramcode_end_ <= 0x8000,
         "ERROR: .ram_code overflows the absolute .text base at FLASH+0x8000");
+    _assert_cache_layout = ASSERT(_sdata >= _icache_data_end_,
+        "ERROR: .data overlaps the TLSR8258 I-cache tag/data reservation");
     _assert_bss_under_stack = ASSERT(_ebss <= _svc_stack_bottom,
         "ERROR: .bss/.data extends into the SVC stack region; shrink statics or lower _svc_stack_bottom in memory.x");
 

@@ -23,3 +23,6 @@ router = []
 efr32-trace = ["dep:rtt-target"]
 # Enable Telink TLSR8258 absolute-address debug markers for the NWK TX path.
 telink-debug = []
+# Capture the latest outgoing APS payload and secured NWK frame in the
+# linker-reserved TLSR8258 diagnostic tail at 0x84FF00.
+telink-tx-capture = []

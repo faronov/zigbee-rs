@@ -44,6 +44,8 @@ pub mod nv_storage;
 #[cfg(feature = "ota")]
 pub mod ota;
 pub mod power;
+pub mod security_journal;
+pub mod security_store;
 pub mod templates;
 
 use zigbee_aps::ApsAddress;
@@ -57,6 +59,10 @@ use zigbee_zcl::{ClusterDirection, CommandId, ZclStatus};
 
 use crate::nv_storage::{NvItemId, NvStorage};
 use crate::power::PowerManager;
+use crate::security_store::{
+    CommissioningSecurityPersistence, PersistentSecurityState, SecurityStateStore,
+    SecurityStoreError,
+};
 
 struct SyncUnsafeCell<T>(core::cell::UnsafeCell<T>);
 unsafe impl<T> Sync for SyncUnsafeCell<T> {}
@@ -215,6 +221,65 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.finish_join()
     }
 
+    /// Initialize and join while durably reserving all security counters.
+    #[inline(never)]
+    pub async fn start_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<u16, event_loop::StartError> {
+        let r = self.bdb.initialize().await;
+        if r.is_err() {
+            return Err(event_loop::StartError::InitFailed);
+        }
+
+        let mut persistence = CommissioningSecurityPersistence::new(store)
+            .map_err(event_loop::StartError::PersistenceFailed)?;
+        let result = self
+            .bdb
+            .network_steering_with_persistence(&mut persistence)
+            .await;
+        if let Some(error) = persistence.take_error() {
+            return Err(event_loop::StartError::PersistenceFailed(error));
+        }
+        if let Err(status) = result {
+            return Err(event_loop::StartError::CommissioningFailed(status));
+        }
+        self.finish_join()
+    }
+
+    /// Resume a committed network when available, otherwise commission a new
+    /// one while using the same durable security store.
+    #[inline(never)]
+    pub async fn start_or_resume_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<u16, event_loop::StartError> {
+        if self.bdb.initialize().await.is_err() {
+            return Err(event_loop::StartError::InitFailed);
+        }
+
+        if self
+            .restore_security_state(store)
+            .map_err(event_loop::StartError::PersistenceFailed)?
+        {
+            return self.rejoin().await;
+        }
+
+        let mut persistence = CommissioningSecurityPersistence::new(store)
+            .map_err(event_loop::StartError::PersistenceFailed)?;
+        let result = self
+            .bdb
+            .network_steering_with_persistence(&mut persistence)
+            .await;
+        if let Some(error) = persistence.take_error() {
+            return Err(event_loop::StartError::PersistenceFailed(error));
+        }
+        if let Err(status) = result {
+            return Err(event_loop::StartError::CommissioningFailed(status));
+        }
+        self.finish_join()
+    }
+
     #[inline(never)]
     fn finish_join(&mut self) -> Result<u16, event_loop::StartError> {
         let addr = self.bdb.zdo().nwk().nib().network_address.0;
@@ -240,8 +305,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// disappeared, the caller should fall back to `start()` for a full
     /// BDB steering join.
     ///
-    /// Call `restore_state()` first — it sets up NIB, security keys, and
-    /// marks `node_is_on_a_network = true`.
+    /// Call `restore_security_state()` first — it sets up NIB, security keys,
+    /// and marks `node_is_on_a_network = true`.
     #[inline(never)]
     pub async fn rejoin(&mut self) -> Result<u16, event_loop::StartError> {
         log::info!("[Runtime] Resuming on previous network…");
@@ -263,29 +328,27 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         // Configure MAC layer with restored addresses so it accepts
         // unicast frames and can transmit with the correct source address.
         let mac = self.bdb.zdo_mut().nwk_mut().mac_mut();
-        let _ = mac
-            .mlme_set(
-                zigbee_mac::PibAttribute::PhyCurrentChannel,
-                zigbee_mac::PibValue::U8(channel),
-            )
-            .await;
-        let _ = mac
-            .mlme_set(
-                zigbee_mac::PibAttribute::MacPanId,
-                zigbee_mac::PibValue::PanId(PanId(pan_id.0)),
-            )
-            .await;
-        let _ = mac
-            .mlme_set(
-                zigbee_mac::PibAttribute::MacShortAddress,
-                zigbee_mac::PibValue::ShortAddress(ShortAddress(addr)),
-            )
-            .await;
+        mac.mlme_set(
+            zigbee_mac::PibAttribute::PhyCurrentChannel,
+            zigbee_mac::PibValue::U8(channel),
+        )
+        .await
+        .map_err(|_| event_loop::StartError::InitFailed)?;
+        mac.mlme_set(
+            zigbee_mac::PibAttribute::MacPanId,
+            zigbee_mac::PibValue::PanId(PanId(pan_id.0)),
+        )
+        .await
+        .map_err(|_| event_loop::StartError::InitFailed)?;
+        mac.mlme_set(
+            zigbee_mac::PibAttribute::MacShortAddress,
+            zigbee_mac::PibValue::ShortAddress(ShortAddress(addr)),
+        )
+        .await
+        .map_err(|_| event_loop::StartError::InitFailed)?;
 
         // Read IEEE address from MAC hardware and set it in NIB.
-        // The NV-restored IEEE may be all-zeros if the first join never
-        // saved it properly. The MAC always has the correct hardware IEEE.
-        if let Ok(zigbee_mac::PibValue::ExtendedAddress(hw_ieee)) = self
+        let hw_ieee = match self
             .bdb
             .zdo_mut()
             .nwk_mut()
@@ -293,9 +356,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             .mlme_get(zigbee_mac::PibAttribute::MacExtendedAddress)
             .await
         {
-            self.bdb.zdo_mut().nwk_mut().nib_mut().ieee_address = hw_ieee;
-            log::info!("[Runtime] NIB IEEE set from MAC: {:02X?}", hw_ieee);
+            Ok(zigbee_mac::PibValue::ExtendedAddress(address)) => address,
+            _ => return Err(event_loop::StartError::InitFailed),
+        };
+        let restored_ieee = self.bdb.zdo().nwk().nib().ieee_address;
+        if restored_ieee != [0; 8] && restored_ieee != hw_ieee {
+            return Err(event_loop::StartError::PersistenceFailed(
+                SecurityStoreError::Corrupt,
+            ));
         }
+        self.bdb.zdo_mut().nwk_mut().nib_mut().ieee_address = hw_ieee;
+        log::info!("[Runtime] NIB IEEE set from MAC: {:02X?}", hw_ieee);
 
         let ieee = self.bdb.zdo().nwk().nib().ieee_address;
 
@@ -309,10 +380,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         // Announce immediately so coordinators and home automation stacks
         // that dropped our registry entry can rediscover the device.
         // Repeating the announce is cheap and avoids relying on stale state.
-        match self.send_device_annce().await {
-            Ok(()) => log::info!("[Runtime] Device_annce sent after resume"),
-            Err(err) => log::warn!("[Runtime] Device_annce after resume failed: {:?}", err),
-        }
+        self.send_device_annce()
+            .await
+            .map_err(|_| event_loop::StartError::InitFailed)?;
+        log::info!("[Runtime] Device_annce sent after resume");
 
         self.state_dirty = true;
         Ok(addr)
@@ -428,6 +499,22 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.channel_mask
     }
 
+    pub fn steering_diagnostics(&self) -> zigbee_bdb::SteeringDiagnostics {
+        self.bdb.steering_diagnostics()
+    }
+
+    pub fn nwk_rx_security_stats(&self) -> zigbee_nwk::NwkRxSecurityStats {
+        self.bdb.zdo().aps().nwk().rx_security_stats()
+    }
+
+    pub fn aps_security_handshake_stats(&self) -> zigbee_aps::ApsSecurityHandshakeStats {
+        self.bdb.zdo().aps().security_handshake_stats()
+    }
+
+    pub fn zdo_diagnostics(&self) -> zigbee_zdo::ZdoDiagnostics {
+        self.bdb.zdo().diagnostics()
+    }
+
     /// The software build identifier.
     pub fn sw_build_id(&self) -> &str {
         self.sw_build_id
@@ -483,9 +570,248 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
     // ── NV Persistence ─────────────────────────────────────
 
+    /// Restore a fully commissioned network and reserve fresh counter ranges
+    /// before any secured rejoin traffic can be sent.
+    pub fn restore_security_state<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<bool, SecurityStoreError> {
+        let Some(mut state) = store.load()? else {
+            return Ok(false);
+        };
+        state.validate()?;
+        if !state.commissioned {
+            return Ok(false);
+        }
+        let configured_ieee = self.bdb.zdo().nwk().nib().ieee_address;
+        if configured_ieee != [0; 8] && configured_ieee != state.ieee_address {
+            return Err(SecurityStoreError::Corrupt);
+        }
+
+        let global_current = state.global_counter_limit;
+        let global_limit = global_current
+            .checked_add(zigbee_bdb::FRAME_COUNTER_RESERVATION_SIZE)
+            .ok_or(SecurityStoreError::CounterExhausted)?;
+        let tclk_current = state.tclk_counter_limit;
+        let tclk_limit = tclk_current
+            .checked_add(zigbee_bdb::FRAME_COUNTER_RESERVATION_SIZE)
+            .ok_or(SecurityStoreError::CounterExhausted)?;
+
+        state.global_counter_limit = global_limit;
+        state.tclk_counter_limit = tclk_limit;
+        store.store(&state)?;
+
+        {
+            let nwk = self.bdb.zdo_mut().nwk_mut();
+            nwk.security_mut()
+                .set_network_key(state.network_key, state.key_sequence);
+            let nib = nwk.nib_mut();
+            nib.extended_pan_id = state.extended_pan_id;
+            nib.pan_id = PanId(state.pan_id);
+            nib.network_address = ShortAddress(state.short_address);
+            nib.ieee_address = state.ieee_address;
+            nib.logical_channel = state.channel;
+            nib.depth = state.depth;
+            nib.parent_address = ShortAddress(state.parent_address);
+            nib.update_id = state.update_id;
+            nib.active_key_seq_number = state.key_sequence;
+            nib.security_enabled = true;
+            if !nib.set_frame_counter_reservation(global_current, global_limit) {
+                return Err(SecurityStoreError::Corrupt);
+            }
+        }
+
+        {
+            let aps = self.bdb.zdo_mut().aps_mut();
+            aps.aib_mut().aps_trust_center_address = state.trust_center_address;
+            aps.security_mut()
+                .add_key(zigbee_aps::security::ApsLinkKeyEntry {
+                    partner_address: state.trust_center_address,
+                    key: state.trust_center_link_key,
+                    key_type: zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+                    outgoing_frame_counter: tclk_current,
+                    outgoing_frame_counter_limit: tclk_limit,
+                    incoming_frame_counter: state.tclk_incoming_counter,
+                    incoming_frame_counter_valid: state.tclk_incoming_counter_valid,
+                })
+                .map_err(|_| SecurityStoreError::Full)?;
+        }
+
+        self.bdb.attributes_mut().node_is_on_a_network = true;
+        self.bdb.attributes_mut().primary_channel_set = ChannelMask(1u32 << state.channel);
+        self.bdb.attributes_mut().secondary_channel_set = ChannelMask(0);
+        self.state_dirty = false;
+        Ok(true)
+    }
+
+    /// Persist updated incoming counters and extend low outgoing reservations.
+    ///
+    /// Call before and after runtime operations that may send or accept secured
+    /// frames. Storage is committed before in-memory limits are extended.
+    pub fn refresh_security_state<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<bool, SecurityStoreError> {
+        const LOW_WATER: u32 = 32;
+
+        let Some(mut state) = store.load()? else {
+            return Ok(false);
+        };
+        state.validate()?;
+        if !state.commissioned {
+            return Ok(false);
+        }
+
+        let nib = self.bdb.zdo().nwk().nib();
+        if nib.ieee_address != state.ieee_address
+            || nib.pan_id.0 != state.pan_id
+            || nib.outgoing_frame_counter > nib.outgoing_frame_counter_limit
+            || nib.outgoing_frame_counter_limit != state.global_counter_limit
+        {
+            return Err(SecurityStoreError::Corrupt);
+        }
+
+        let tclk = self
+            .bdb
+            .zdo()
+            .aps()
+            .security()
+            .find_key(
+                &state.trust_center_address,
+                zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+            )
+            .ok_or(SecurityStoreError::Corrupt)?;
+        if tclk.key != state.trust_center_link_key
+            || tclk.outgoing_frame_counter > tclk.outgoing_frame_counter_limit
+            || tclk.outgoing_frame_counter_limit != state.tclk_counter_limit
+        {
+            return Err(SecurityStoreError::Corrupt);
+        }
+
+        let mut changed = false;
+        let mut new_global_limit = nib.outgoing_frame_counter_limit;
+        if nib
+            .outgoing_frame_counter_limit
+            .saturating_sub(nib.outgoing_frame_counter)
+            <= LOW_WATER
+        {
+            new_global_limit = nib
+                .outgoing_frame_counter_limit
+                .checked_add(zigbee_bdb::FRAME_COUNTER_RESERVATION_SIZE)
+                .ok_or(SecurityStoreError::CounterExhausted)?;
+            state.global_counter_limit = new_global_limit;
+            changed = true;
+        }
+
+        let mut new_tclk_limit = tclk.outgoing_frame_counter_limit;
+        if tclk
+            .outgoing_frame_counter_limit
+            .saturating_sub(tclk.outgoing_frame_counter)
+            <= LOW_WATER
+        {
+            new_tclk_limit = tclk
+                .outgoing_frame_counter_limit
+                .checked_add(zigbee_bdb::FRAME_COUNTER_RESERVATION_SIZE)
+                .ok_or(SecurityStoreError::CounterExhausted)?;
+            state.tclk_counter_limit = new_tclk_limit;
+            changed = true;
+        }
+
+        if state.tclk_incoming_counter != tclk.incoming_frame_counter
+            || state.tclk_incoming_counter_valid != tclk.incoming_frame_counter_valid
+        {
+            state.tclk_incoming_counter = tclk.incoming_frame_counter;
+            state.tclk_incoming_counter_valid = tclk.incoming_frame_counter_valid;
+            changed = true;
+        }
+
+        if !changed {
+            return Ok(false);
+        }
+        store.store(&state)?;
+
+        self.bdb
+            .zdo_mut()
+            .nwk_mut()
+            .nib_mut()
+            .outgoing_frame_counter_limit = new_global_limit;
+        self.bdb
+            .zdo_mut()
+            .aps_mut()
+            .security_mut()
+            .find_key_mut(
+                &state.trust_center_address,
+                zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+            )
+            .ok_or(SecurityStoreError::Corrupt)?
+            .outgoing_frame_counter_limit = new_tclk_limit;
+        Ok(true)
+    }
+
+    /// Clear commissioned state while preserving the global counter bound.
+    pub fn factory_reset_security_state<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<(), SecurityStoreError> {
+        let global_counter_limit = store
+            .load()?
+            .map(|state| state.global_counter_limit)
+            .unwrap_or(0);
+        let mut state = PersistentSecurityState::empty();
+        state.global_counter_limit = global_counter_limit;
+        store.store(&state)
+    }
+
+    /// Factory-reset the stack while retaining the global counter bound that
+    /// prevents key/counter reuse on a later commissioning attempt.
+    pub async fn factory_reset_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<(), event_loop::StartError> {
+        self.factory_reset_security_state(store)
+            .map_err(event_loop::StartError::PersistenceFailed)?;
+        self.bdb
+            .factory_reset()
+            .await
+            .map_err(event_loop::StartError::CommissioningFailed)?;
+        self.state_dirty = false;
+        Ok(())
+    }
+
+    /// Process an incoming frame with crash-safe counter maintenance.
+    pub async fn process_incoming_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        indication: &McpsDataIndication,
+        clusters: &mut [ClusterRef<'_>],
+        store: &mut S,
+    ) -> Result<Option<event_loop::StackEvent>, SecurityStoreError> {
+        self.refresh_security_state(store)?;
+        let event = self.process_incoming(indication, clusters).await;
+        self.refresh_security_state(store)?;
+        Ok(event)
+    }
+
+    /// Tick reporting and pending responses with crash-safe counter
+    /// maintenance.
+    pub async fn tick_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        elapsed_secs: u16,
+        clusters: &mut [ClusterRef<'_>],
+        store: &mut S,
+    ) -> Result<event_loop::TickResult, SecurityStoreError> {
+        self.refresh_security_state(store)?;
+        let result = self.tick(elapsed_secs, clusters).await;
+        self.refresh_security_state(store)?;
+        Ok(result)
+    }
+
     /// Save critical network state to non-volatile storage.
     ///
     /// Call after: join, key update, bind/unbind, group changes, or before sleep.
+    ///
+    /// This legacy item-by-item format is not crash-safe for Zigbee security
+    /// counters or unique Trust Center link keys. New secured devices must use
+    /// `SecurityStateStore` and `start_or_resume_with_security_store()`.
     pub fn save_state(&self, nv: &mut dyn NvStorage) {
         let nib = self.bdb.zdo().nwk().nib();
 
@@ -546,6 +872,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// Call on startup before `start()`. If state is found, the device can
     /// attempt rejoin instead of full commissioning.
     /// Returns `true` if valid state was restored.
+    ///
+    /// This legacy format is not suitable for production secured restore; use
+    /// `restore_security_state()` through
+    /// `start_or_resume_with_security_store()` instead.
     pub fn restore_state(&mut self, nv: &dyn NvStorage) -> bool {
         let mut buf = [0u8; 16];
 
@@ -621,6 +951,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 .nwk_mut()
                 .security_mut()
                 .set_network_key(key_buf, seq);
+            {
+                let nib = self.bdb.zdo_mut().nwk_mut().nib_mut();
+                nib.active_key_seq_number = seq;
+                nib.security_enabled = true;
+            }
             // Restore frame counter with safety margin: frames may have been
             // sent after the last NV save, so the coordinator's expected counter
             // is higher than what we saved. Add 1000 to avoid replay rejection.
@@ -806,11 +1141,18 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             let len;
 
             if header.frame_control.security {
+                let count = nwk.rx_security_stats().secured_frames.wrapping_add(1);
+                nwk.rx_security_stats_mut().secured_frames = count;
                 // Parse NWK security auxiliary header
                 let (sec_hdr, sec_consumed) =
                     match zigbee_nwk::security::NwkSecurityHeader::parse(after_header) {
                         Some(v) => v,
                         None => {
+                            let count = nwk
+                                .rx_security_stats()
+                                .security_header_parse_failures
+                                .wrapping_add(1);
+                            nwk.rx_security_stats_mut().security_header_parse_failures = count;
                             rt_trace!("[RT][EFR32] nwk_sec=parse_fail");
                             log::warn!("[NWK] Failed to parse security header");
                             return None;
@@ -821,6 +1163,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 let key = match nwk.security().key_by_seq(sec_hdr.key_seq_number) {
                     Some(k) => k.key,
                     None => {
+                        let count = nwk.rx_security_stats().missing_keys.wrapping_add(1);
+                        nwk.rx_security_stats_mut().missing_keys = count;
                         rt_trace!("[RT][EFR32] nwk_key=missing seq={}", sec_hdr.key_seq_number);
                         log::warn!("[NWK] No key for seq {}", sec_hdr.key_seq_number);
                         return None;
@@ -832,6 +1176,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     .security()
                     .check_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter)
                 {
+                    let count = nwk.rx_security_stats().replay_rejections.wrapping_add(1);
+                    nwk.rx_security_stats_mut().replay_rejections = count;
                     rt_trace!(
                         "[RT][EFR32] nwk_replay src={:02X?} fc={}",
                         sec_hdr.source_address,
@@ -859,6 +1205,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     &sec_hdr,
                 ) {
                     Some(plaintext) => {
+                        let count = nwk.rx_security_stats().decrypt_successes.wrapping_add(1);
+                        nwk.rx_security_stats_mut().decrypt_successes = count;
                         rt_trace!("[RT][EFR32] nwk_decrypt=ok len={}", plaintext.len());
                         // MIC verified — NOW commit frame counter
                         nwk.security_mut()
@@ -867,6 +1215,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         buf[..len].copy_from_slice(&plaintext[..len]);
                     }
                     None => {
+                        let count = nwk.rx_security_stats().decrypt_failures.wrapping_add(1);
+                        nwk.rx_security_stats_mut().decrypt_failures = count;
                         rt_trace!("[RT][EFR32] nwk_decrypt=fail");
                         log::warn!("[NWK] Decryption failed (MIC mismatch)");
                         return None;

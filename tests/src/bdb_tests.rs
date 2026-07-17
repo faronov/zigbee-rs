@@ -131,6 +131,7 @@ fn bdb_status_discriminants() {
     assert_eq!(BdbStatus::FormationFailure as u8, 0x05);
     assert_eq!(BdbStatus::TouchlinkFailure as u8, 0x09);
     assert_eq!(BdbStatus::Timeout as u8, 0x0B);
+    assert_eq!(BdbStatus::TrustCenterLinkKeyExchangeFailure as u8, 0x0C);
 }
 
 // ── 6. Commissioning time constant ─────────────────────────

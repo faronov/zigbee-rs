@@ -516,7 +516,9 @@ fn test_security_add_find_remove_key() {
         key,
         key_type: ApsKeyType::TrustCenterLinkKey,
         outgoing_frame_counter: 0,
+        outgoing_frame_counter_limit: u32::MAX,
         incoming_frame_counter: 0,
+        incoming_frame_counter_valid: false,
     };
     assert!(sec.add_key(entry).is_ok());
     assert_eq!(sec.key_count(), 1);
@@ -540,11 +542,17 @@ fn test_security_frame_counter_replay_protection() {
         key: [0x22; 16],
         key_type: ApsKeyType::ApplicationLinkKey,
         outgoing_frame_counter: 0,
+        outgoing_frame_counter_limit: u32::MAX,
         incoming_frame_counter: 0,
+        incoming_frame_counter_valid: false,
     };
     sec.add_key(entry).unwrap();
 
     // Two-phase pattern: check (read-only) then commit after MIC verify
+    // The first authenticated frame may legitimately use counter zero.
+    assert!(sec.check_frame_counter(&partner, ApsKeyType::ApplicationLinkKey, 0));
+    sec.commit_frame_counter(&partner, ApsKeyType::ApplicationLinkKey, 0);
+    assert!(!sec.check_frame_counter(&partner, ApsKeyType::ApplicationLinkKey, 0));
     // Counter 10 should be accepted (> 0)
     assert!(sec.check_frame_counter(&partner, ApsKeyType::ApplicationLinkKey, 10));
     // Commit after successful MIC verification
@@ -568,7 +576,9 @@ fn test_security_outgoing_frame_counter() {
         key: [0x33; 16],
         key_type: ApsKeyType::TrustCenterLinkKey,
         outgoing_frame_counter: 0,
+        outgoing_frame_counter_limit: 2,
         incoming_frame_counter: 0,
+        incoming_frame_counter_valid: false,
     };
     sec.add_key(entry).unwrap();
 
@@ -582,7 +592,7 @@ fn test_security_outgoing_frame_counter() {
     );
     assert_eq!(
         sec.next_frame_counter(&partner, ApsKeyType::TrustCenterLinkKey),
-        Some(2)
+        None
     );
 }
 

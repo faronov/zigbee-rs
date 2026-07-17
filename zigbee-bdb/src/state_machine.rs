@@ -164,6 +164,7 @@ impl<M: MacDriver> BdbLayer<M> {
         }
 
         let mut any_success = false;
+        let mut last_error = None;
 
         // ── 1. Touchlink ────────────────────────────────────
         if effective.contains(CommissioningMode::TOUCHLINK) {
@@ -175,6 +176,7 @@ impl<M: MacDriver> BdbLayer<M> {
                 }
                 Err(e) => {
                     log::warn!("[BDB] Touchlink failed: {:?}", e);
+                    last_error = Some(e);
                 }
             }
         }
@@ -189,6 +191,7 @@ impl<M: MacDriver> BdbLayer<M> {
                 }
                 Err(e) => {
                     log::warn!("[BDB] Network Steering failed: {:?}", e);
+                    last_error = Some(e);
                 }
             }
         }
@@ -203,6 +206,7 @@ impl<M: MacDriver> BdbLayer<M> {
                 }
                 Err(e) => {
                     log::warn!("[BDB] Network Formation failed: {:?}", e);
+                    last_error = Some(e);
                 }
             }
         }
@@ -217,6 +221,7 @@ impl<M: MacDriver> BdbLayer<M> {
                 }
                 Err(e) => {
                     log::warn!("[BDB] Finding & Binding failed: {:?}", e);
+                    last_error = Some(e);
                 }
             }
         }
@@ -226,7 +231,7 @@ impl<M: MacDriver> BdbLayer<M> {
         if any_success {
             Ok(())
         } else {
-            Err(BdbStatus::SteeringFailure)
+            Err(last_error.unwrap_or(BdbStatus::SteeringFailure))
         }
     }
 

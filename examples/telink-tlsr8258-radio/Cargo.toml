@@ -1,0 +1,56 @@
+[package]
+name = "telink-tlsr8258-radio"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+description = """
+Standalone pure-Rust TLSR8258 802.15.4 raw-radio bring-up firmware. No Zigbee
+stack crates, no vendor SDK. Cycles channels 11/18/26, sends a Beacon Request,
+and records CRC/length-validated Beacon results in a fixed-address SRAM
+diagnostic record.
+"""
+publish = false
+
+[dependencies]
+tlsr8258-hal = { path = "../../tlsr8258-hal" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["telink"], optional = true }
+zigbee-types = { path = "../../zigbee-types", optional = true }
+zigbee-nwk = { path = "../../zigbee-nwk", optional = true }
+zigbee-aps = { path = "../../zigbee-aps", optional = true }
+zigbee-runtime = { path = "../../zigbee-runtime", optional = true }
+zigbee-zcl = { path = "../../zigbee-zcl", optional = true }
+
+[features]
+default = []
+# Standalone test/self-check state machine (see src/mac_test.rs). Always on;
+# feature kept only so the mode can be named explicitly in build scripts,
+# mirroring the sibling telink-tlsr8258-sensor crate's mode-selection style.
+mac-test = []
+# Hardware extraction control: scan the known local ZHA coordinator channel
+# so RX can be validated without changing the default 11/18/26 band gate.
+control-channel-15 = []
+active-scan = []
+association = []
+association-fresh = ["association"]
+association-stress = ["association-fresh"]
+mac-driver = ["dep:zigbee-mac", "dep:zigbee-types"]
+runtime-join = [
+    "mac-driver",
+    "dep:zigbee-nwk",
+    "zigbee-nwk/telink-tx-capture",
+    "dep:zigbee-aps",
+    "dep:zigbee-runtime",
+    "dep:zigbee-zcl",
+]
+
+[profile.release]
+# Matches the proven evidence-build flags used for telink-tlsr8258-sensor:
+# the tc32 backend trips codegen bugs under LTO / higher opt levels on this
+# family of firmware. scripts/tlsr8258.sh always overrides these explicitly
+# via `cargo rustc -- -C lto=no -C opt-level=1`; the profile defaults below
+# only matter for ad hoc `cargo build` invocations.
+opt-level = 1
+lto = false
+
+[profile.dev]
+opt-level = 0
