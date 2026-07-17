@@ -12,9 +12,3 @@ zigbee-mac  = { version = "0.1.0", path = "../zigbee-mac" }
 zigbee-nwk  = { version = "0.1.0", path = "../zigbee-nwk" }
 zigbee-aps  = { version = "0.1.0", path = "../zigbee-aps" }
 log = "0.4"
-
-[features]
-# Telink-only debug instrumentation that writes counters into the SRAM
-# region 0x0084F450 (BDB region). Off by default; enabled only by the
-# Telink example builds for hardware bringup.
-telink-debug = []
