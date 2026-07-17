@@ -26,6 +26,7 @@
 extern crate alloc;
 
 pub mod frames;
+pub mod phy;
 pub mod pib;
 pub mod platform;
 pub mod primitives;
@@ -58,6 +59,9 @@ pub mod efr32s2;
 pub mod mock;
 
 // Re-exports for convenience
+pub use phy::{
+    MAX_PHY_FRAME_LEN, PhyAddressFilter, PhyCapabilities, PhyError, PhyRxFrame, RadioPhy,
+};
 pub use pib::{PibAttribute, PibValue};
 pub use platform::{PlatformServices, WrappingTickExtender};
 pub use primitives::*;
