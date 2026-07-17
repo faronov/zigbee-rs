@@ -340,9 +340,9 @@ async fn main(_spawner: Spawner) {
             was_fast_polling = true;
         }
 
-        // ── Step 1: Sleep with radio off until next poll (only when joined) ──
-        if device.is_joined() {
-            device.mac_mut().radio_sleep();
+        // ── Step 1: Sleep until next poll ──
+        if device.is_joined() && device.mac_mut().enter_low_power_idle().is_err() {
+            warn!("Failed to disable RADIO before poll sleep");
         }
         if let Some(ref mut btn) = button {
             match select(
@@ -390,10 +390,6 @@ async fn main(_spawner: Spawner) {
             // No button — just sleep
             Timer::after(Duration::from_millis(poll_ms)).await;
         }
-        if device.is_joined() {
-            device.mac_mut().radio_wake();
-        }
-
         // ── Step 2: Poll parent for indirect frames (SED core) ──
         if device.is_joined() {
             for _poll_round in 0..4u8 {

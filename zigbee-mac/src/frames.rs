@@ -63,14 +63,19 @@ pub fn build_association_request(
 /// Build a Data Request MAC command with IEEE (extended) source address.
 ///
 /// Used for indirect frame retrieval (polling parent).
-/// FC = 0xC863: command, ACK request, PAN compress, dst=short, src=extended.
+/// Uses PAN compression because the associated child and parent share a PAN.
 pub fn build_data_request(
     seq: u8,
     coord: &MacAddress,
     own_extended: &IeeeAddress,
 ) -> heapless::Vec<u8, 24> {
     let mut frame = heapless::Vec::new();
-    let _ = frame.extend_from_slice(&[0x63, 0xC8, seq]);
+    let frame_control: u16 = match coord {
+        MacAddress::Short(_, _) => 0xC863,
+        MacAddress::Extended(_, _) => 0xCC63,
+    };
+    let _ = frame.extend_from_slice(&frame_control.to_le_bytes());
+    let _ = frame.push(seq);
     let dst_pan = coord.pan_id();
     let _ = frame.extend_from_slice(&dst_pan.0.to_le_bytes());
     match coord {
@@ -89,14 +94,19 @@ pub fn build_data_request(
 /// Build a Data Request MAC command with SHORT source address.
 ///
 /// Used after association when we have a short address assigned.
-/// FC = 0x8863: command, ACK request, PAN compress, dst=short, src=short.
+/// Uses PAN compression because the associated child and parent share a PAN.
 pub fn build_data_request_short(
     seq: u8,
     coord: &MacAddress,
     own_short: ShortAddress,
 ) -> heapless::Vec<u8, 24> {
     let mut frame = heapless::Vec::new();
-    let _ = frame.extend_from_slice(&[0x63, 0x88, seq]);
+    let frame_control: u16 = match coord {
+        MacAddress::Short(_, _) => 0x8863,
+        MacAddress::Extended(_, _) => 0x8C63,
+    };
+    let _ = frame.extend_from_slice(&frame_control.to_le_bytes());
+    let _ = frame.push(seq);
     let dst_pan = coord.pan_id();
     let _ = frame.extend_from_slice(&dst_pan.0.to_le_bytes());
     match coord {
@@ -109,6 +119,52 @@ pub fn build_data_request_short(
     }
     let _ = frame.extend_from_slice(&own_short.0.to_le_bytes());
     let _ = frame.push(0x04); // Data Request command ID
+    frame
+}
+
+/// Build a Disassociation Notification MAC command.
+pub fn build_disassociation_notification(
+    seq: u8,
+    destination: &MacAddress,
+    own_short: ShortAddress,
+    own_extended: &IeeeAddress,
+    reason: DisassociateReason,
+) -> heapless::Vec<u8, 32> {
+    let source_mode = if matches!(own_short.0, 0xFFFE | 0xFFFF) {
+        AddressMode::Extended
+    } else {
+        AddressMode::Short
+    };
+    let mut frame_control = 0x0003u16 | (1 << 5) | (1 << 6);
+    frame_control |= match destination {
+        MacAddress::Short(_, _) => 0b10 << 10,
+        MacAddress::Extended(_, _) => 0b11 << 10,
+    };
+    frame_control |= (source_mode as u16) << 14;
+
+    let mut frame = heapless::Vec::new();
+    let _ = frame.extend_from_slice(&frame_control.to_le_bytes());
+    let _ = frame.push(seq);
+    let _ = frame.extend_from_slice(&destination.pan_id().0.to_le_bytes());
+    match destination {
+        MacAddress::Short(_, address) => {
+            let _ = frame.extend_from_slice(&address.0.to_le_bytes());
+        }
+        MacAddress::Extended(_, address) => {
+            let _ = frame.extend_from_slice(address);
+        }
+    }
+    match source_mode {
+        AddressMode::Short => {
+            let _ = frame.extend_from_slice(&own_short.0.to_le_bytes());
+        }
+        AddressMode::Extended => {
+            let _ = frame.extend_from_slice(own_extended);
+        }
+        AddressMode::None => {}
+    }
+    let _ = frame.push(0x03);
+    let _ = frame.push(reason as u8);
     frame
 }
 
@@ -479,6 +535,40 @@ mod tests {
                 0x23, 0xC8, 0x42, 0xE9, 0xDF, 0x00, 0x00, 0xFF, 0xFF, 0x29, 0x34, 0x36, 0x39, 0x33,
                 0x4E, 0x55, 0x02, 0x01, 0x80,
             ]
+        );
+    }
+
+    #[test]
+    fn data_request_uses_coordinator_address_mode() {
+        let own_ieee = [1, 2, 3, 4, 5, 6, 7, 8];
+        let short = build_data_request(
+            0x22,
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
+            &own_ieee,
+        );
+        assert_eq!(&short[..3], &[0x63, 0xC8, 0x22]);
+
+        let extended = build_data_request(
+            0x23,
+            &MacAddress::Extended(PanId(0x1234), [9; 8]),
+            &own_ieee,
+        );
+        assert_eq!(&extended[..3], &[0x63, 0xCC, 0x23]);
+    }
+
+    #[test]
+    fn disassociation_notification_uses_assigned_short_source() {
+        let frame = build_disassociation_notification(
+            0x24,
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0x0000)),
+            ShortAddress(0x5678),
+            &[1; 8],
+            DisassociateReason::DeviceLeave,
+        );
+        assert_eq!(&frame[..3], &[0x63, 0x88, 0x24]);
+        assert_eq!(
+            &frame[3..],
+            &[0x34, 0x12, 0x00, 0x00, 0x78, 0x56, 0x03, 0x02]
         );
     }
 

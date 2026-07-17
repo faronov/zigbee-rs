@@ -336,8 +336,10 @@ async fn main(_spawner: Spawner) {
             was_fast_polling = true;
         }
 
-        // ── Sleep with radio off (button or timer wake) ──
-        device.mac_mut().radio_sleep();
+        // ── Sleep until button or poll timer wake ──
+        if device.is_joined() && device.mac_mut().enter_low_power_idle().is_err() {
+            warn!("Failed to disable RADIO before poll sleep");
+        }
         match select(
             button.wait_for_falling_edge(),
             Timer::after(Duration::from_millis(poll_ms)),
@@ -417,8 +419,6 @@ async fn main(_spawner: Spawner) {
             }
             Either::Second(_) => {} // Normal timeout — proceed to poll
         }
-        device.mac_mut().radio_wake();
-
         // ── Poll parent for indirect frames (SED core) ──
         if device.is_joined() {
             for _poll_round in 0..4u8 {

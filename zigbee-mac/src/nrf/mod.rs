@@ -2,13 +2,13 @@
 //!
 //! Implements `MacDriver` using Embassy's ieee802154 radio driver for
 //! Nordic nRF52840/nRF52833. Both chips share the same 802.15.4
-//! radio with DMA-driven TX/RX and hardware address filtering.
+//! radio with DMA-driven TX/RX.
 //!
 //! # Hardware features used
 //! - Auto-CRC generation/checking
-//! - Hardware address filtering (PAN ID + short address)
-//! - Auto-ACK for frames with ACK request bit set
-//! - Energy Detection via EDREQ task
+//! - Software address filtering (PAN ID + short/extended address)
+//! - Software ACK generation and matching
+//! - Hardware CCA before transmission
 //! - RSSI measurement
 //!
 //! # Dependencies
@@ -17,8 +17,13 @@
 //!
 //! # Supported boards
 //! - nRF52840-DK, nRF52840-Dongle, Seeed XIAO nRF52840
-//! - nRF52833-DK, Thingy:53
+//! - nRF52833-DK
 
+use crate::frames::{
+    addressing_size, build_association_request, build_beacon_request, build_data_frame,
+    build_data_request, build_data_request_short, build_disassociation_notification, parse_beacon,
+    parse_dest_address, parse_source_address,
+};
 use crate::pib::{self, PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use crate::{MacCapabilities, MacDriver, MacError};
@@ -40,7 +45,8 @@ use embassy_nrf::radio::ieee802154::{Packet, Radio};
 ///
 /// Uses Embassy's hardware abstraction for the nRF radio peripheral.
 /// TX/RX are interrupt-driven with DMA. The radio hardware handles
-/// CRC, ACK generation, and address filtering.
+/// CRC generation/checking and CCA are handled by hardware. MAC destination
+/// filtering and ACK matching are implemented in software.
 ///
 /// # Usage
 /// ```rust,no_run
@@ -68,8 +74,12 @@ pub struct NrfMac<'a, T: Instance> {
     tx_power: i8,
     /// macCoordShortAddress — short address of the coordinator/parent
     coord_short_address: ShortAddress,
-    /// Buffer for data frame received during association (e.g. Transport-Key)
-    pending_assoc_frame: Option<([u8; 128], usize)>,
+    /// macCoordExtendedAddress — extended address of the coordinator/parent
+    coord_extended_address: IeeeAddress,
+    /// Frames received while association is still completing.
+    pending_assoc_frames: heapless::Deque<MacFrame, 2>,
+    /// Per-device evolving state for sequence numbers and CSMA backoff.
+    random_state: u32,
 }
 
 impl<'a, T: Instance> NrfMac<'a, T> {
@@ -88,6 +98,10 @@ impl<'a, T: Instance> NrfMac<'a, T> {
             ieee[7],
         );
 
+        let seed = u32::from_le_bytes([ieee[0], ieee[1], ieee[2], ieee[3]])
+            ^ u32::from_le_bytes([ieee[4], ieee[5], ieee[6], ieee[7]])
+            ^ 0x9E37_79B9;
+
         Self {
             radio,
             short_address: ShortAddress(0xFFFF),
@@ -97,14 +111,16 @@ impl<'a, T: Instance> NrfMac<'a, T> {
             rx_on_when_idle: false,
             association_permit: false,
             auto_request: true,
-            dsn: 0,
-            bsn: 0,
+            dsn: seed as u8,
+            bsn: (seed >> 8) as u8,
             beacon_payload: PibPayload::new(),
             max_frame_retries: 3,
             promiscuous: false,
             tx_power: 0,
             coord_short_address: ShortAddress(0x0000),
-            pending_assoc_frame: None,
+            coord_extended_address: [0; 8],
+            pending_assoc_frames: heapless::Deque::new(),
+            random_state: seed.max(1),
         }
     }
 
@@ -128,6 +144,28 @@ impl<'a, T: Instance> NrfMac<'a, T> {
         seq
     }
 
+    fn next_random_u32(&mut self) -> u32 {
+        let mut value = self.random_state;
+        value ^= value << 13;
+        value ^= value >> 17;
+        value ^= value << 5;
+        self.random_state = value.max(1);
+        value
+    }
+
+    fn queue_pending_assoc_frame(&mut self, payload: &[u8]) {
+        let Some(frame) = MacFrame::from_slice(payload) else {
+            log::warn!(
+                "[MAC] Dropping oversized association-time frame ({} bytes)",
+                payload.len()
+            );
+            return;
+        };
+        if self.pending_assoc_frames.push_back(frame).is_err() {
+            log::warn!("[MAC] Association-time frame queue full");
+        }
+    }
+
     /// Set the radio channel (11-26 for 2.4 GHz Zigbee).
     fn set_channel(&mut self, channel: u8) {
         self.channel = channel;
@@ -140,102 +178,90 @@ impl<'a, T: Instance> NrfMac<'a, T> {
         self.radio.set_transmission_power(dbm);
     }
 
-    /// Disable the radio to save power between poll cycles.
-    ///
-    /// Writes TASKS_DISABLE and waits for DISABLED state.
-    /// Saves ~4-8 mA (radio RX/idle current). Call `radio_wake()` before
-    /// the next TX/RX operation.
-    pub fn radio_sleep(&mut self) {
-        const RADIO_BASE: u32 = 0x4000_1000;
-        const TASKS_DISABLE: u32 = RADIO_BASE + 0x010;
-        const EVENTS_DISABLED: u32 = RADIO_BASE + 0x110;
-        const STATE: u32 = RADIO_BASE + 0x550;
+    async fn try_send_with_csma(&mut self, packet: &mut Packet) -> Result<(), MacError> {
+        const MAX_BACKOFFS: u8 = 4;
+        const MIN_BE: u8 = 3;
+        const MAX_BE: u8 = 5;
+        const UNIT_BACKOFF_US: u64 = 20 * 16;
 
-        unsafe {
-            // Check if already disabled
-            let state = core::ptr::read_volatile(STATE as *const u32);
-            if state == 0 {
-                return;
-            } // 0 = DISABLED
+        let mut backoff_count = 0u8;
+        let mut backoff_exponent = MIN_BE;
+        loop {
+            let slots = self.next_random_u32() & ((1u32 << backoff_exponent) - 1);
+            if slots != 0 {
+                Timer::after_micros(slots as u64 * UNIT_BACKOFF_US).await;
+            }
 
-            // Clear event
-            core::ptr::write_volatile(EVENTS_DISABLED as *mut u32, 0);
-            // Trigger disable
-            core::ptr::write_volatile(TASKS_DISABLE as *mut u32, 1);
-            // Wait for disabled state (should be fast, <10µs)
-            for _ in 0..10_000u32 {
-                if core::ptr::read_volatile(EVENTS_DISABLED as *const u32) != 0 {
-                    break;
+            match self.radio.try_send(packet).await {
+                Ok(()) => return Ok(()),
+                Err(_) if backoff_count < MAX_BACKOFFS => {
+                    backoff_count += 1;
+                    backoff_exponent = core::cmp::min(backoff_exponent + 1, MAX_BE);
                 }
-                core::hint::spin_loop();
+                Err(_) => return Err(MacError::ChannelAccessFailure),
             }
         }
     }
 
-    /// Re-enable the radio after `radio_sleep()`.
-    ///
-    /// The radio peripheral is already powered — just needs the next TX/RX
-    /// operation to transition from DISABLED → TXRU/RXRU. No explicit
-    /// wake needed; the embassy radio driver handles this automatically.
-    pub fn radio_wake(&mut self) {
-        // Nothing to do — embassy Radio handles DISABLED→RX/TX transitions
-        // in try_send() and receive(). Just re-apply channel in case it was lost.
-        self.radio.set_channel(self.channel);
+    async fn send_acknowledged_frame(
+        &mut self,
+        frame: &[u8],
+        max_retries: u8,
+    ) -> Result<(), MacError> {
+        let dsn = *frame.get(2).ok_or(MacError::InvalidParameter)?;
+        for attempt in 0..=max_retries {
+            let mut packet = Packet::new();
+            packet.copy_from_slice(frame);
+            self.try_send_with_csma(&mut packet).await?;
+
+            let mut ack_packet = Packet::new();
+            let ack_result = select::select(
+                Timer::after_micros(1200),
+                self.radio.receive(&mut ack_packet),
+            )
+            .await;
+            if let select::Either::Second(Ok(())) = ack_result {
+                let ack = ack_packet.as_ref();
+                if ack.len() >= 3 && ack[0] & 0x07 == 0x02 && ack[2] == dsn {
+                    log::info!("[MAC TX] ACK ok dsn={} attempt={}", dsn, attempt);
+                    return Ok(());
+                }
+            }
+        }
+
+        log::warn!("[MAC TX] No ACK after {} retries dsn={}", max_retries, dsn);
+        Err(MacError::NoAck)
     }
 
-    /// Configure hardware address filtering on the radio.
+    /// Stop the RADIO peripheral between sleepy-device poll windows.
     ///
-    /// The nRF52840 RADIO peripheral supports automatic MHR (MAC Header) matching
-    /// via DAB/DAP registers for address filtering. This programs:
-    /// - DAP0/DAB0: short address + PAN ID for destination matching
-    /// - DACNF: enable address 0
-    ///
-    /// With this configured, the radio only delivers frames addressed to us
-    /// (or broadcast), reducing CPU wake-ups for sleepy end devices.
-    fn update_address_filter(&mut self) {
-        // nRF52840 RADIO base address
+    /// `&mut self` guarantees no Embassy radio future is active. Interrupts
+    /// are cleared before requesting DISABLED, and the next Embassy operation
+    /// performs the normal DISABLED-to-RX/TX transition.
+    pub fn enter_low_power_idle(&mut self) -> Result<(), MacError> {
         const RADIO_BASE: u32 = 0x4000_1000;
-        // DAB[n] — Device Address Base (lower 32 bits)
-        const DAB0: *mut u32 = (RADIO_BASE + 0x600) as *mut u32;
-        // DAP[n] — Device Address Prefix (upper 16 bits)
-        const DAP0: *mut u32 = (RADIO_BASE + 0x620) as *mut u32;
-        // DACNF — Device Address match Configuration
-        const DACNF: *mut u32 = (RADIO_BASE + 0x640) as *mut u32;
+        const TASKS_DISABLE: *mut u32 = (RADIO_BASE + 0x010) as *mut u32;
+        const STATE: *const u32 = (RADIO_BASE + 0x550) as *const u32;
 
-        // For IEEE 802.15.4 MHR matching:
-        // DAB0 = PAN_ID(16) | SHORT_ADDR(16) packed as little-endian
-        let pan = self.pan_id.0;
-        let short = self.short_address.0;
-
-        // Only enable filtering if we have a valid short address and PAN
-        if short == 0xFFFF || pan == 0xFFFF {
-            // Disable address matching — accept all frames
-            unsafe { core::ptr::write_volatile(DACNF, 0) };
-            return;
+        self.radio.clear_all_interrupts();
+        if unsafe { core::ptr::read_volatile(STATE) } == 0 {
+            return Ok(());
         }
-
-        // Pack: lower 16 = PAN ID, upper 16 = short address
-        let dab_val = (pan as u32) | ((short as u32) << 16);
-        unsafe {
-            core::ptr::write_volatile(DAB0, dab_val);
-            core::ptr::write_volatile(DAP0, 0); // not used for short addr matching
-            // Enable address 0 matching (bit 0 = ENA0)
-            // Note: nRF52840 MHR match is best-effort; we still validate in software
-            core::ptr::write_volatile(DACNF, 0x01);
+        unsafe { core::ptr::write_volatile(TASKS_DISABLE, 1) };
+        for _ in 0..10_000 {
+            if unsafe { core::ptr::read_volatile(STATE) } == 0 {
+                return Ok(());
+            }
+            core::hint::spin_loop();
         }
-        log::debug!(
-            "[nRF MAC] Address filter: PAN=0x{:04X} short=0x{:04X}",
-            pan,
-            short
-        );
+        Err(MacError::RadioError)
     }
 
     /// Construct a beacon request MAC command frame.
     fn beacon_request_frame(&mut self) -> Packet {
         let seq = self.next_dsn();
         let mut pkt = Packet::new();
-        // Fix 2: Beacon request is 8 bytes: FC(2) + Seq(1) + DstPAN(2) + DstAddr(2) + CmdID(1)
-        let frame: [u8; 8] = [0x03, 0x08, seq, 0xFF, 0xFF, 0xFF, 0xFF, 0x07];
+        let frame = build_beacon_request(seq);
         pkt.copy_from_slice(&frame);
         pkt
     }
@@ -293,7 +319,7 @@ impl<'a, T: Instance> NrfMac<'a, T> {
             match self.radio.receive(&mut rx_pkt).await {
                 Ok(()) => {
                     let data = rx_pkt.as_ref();
-                    if let Some(pd) = self.parse_beacon(channel, data, rx_pkt.lqi()) {
+                    if let Some(pd) = parse_beacon(channel, data, rx_pkt.lqi()) {
                         if descriptors.push(pd).is_err() {
                             break;
                         }
@@ -304,54 +330,6 @@ impl<'a, T: Instance> NrfMac<'a, T> {
         }
         Ok(())
     }
-
-    /// Parse a received frame as a beacon. Returns None if not a beacon.
-    fn parse_beacon(&self, channel: u8, data: &[u8], lqi: u8) -> Option<PanDescriptor> {
-        // Minimal frame check: at least FC(2) + SeqN(1) + addressing
-        if data.len() < 5 {
-            return None;
-        }
-
-        // Frame Control
-        let fc = u16::from_le_bytes([data[0], data[1]]);
-        let frame_type = fc & 0x07;
-
-        // Must be a beacon frame (type 0)
-        if frame_type != 0 {
-            return None;
-        }
-
-        // Parse superframe spec from beacon payload.
-        // Position depends on addressing mode — computed via addressing_size().
-        let superframe_offset = 3 + addressing_size(fc);
-        if data.len() < superframe_offset + 2 {
-            return None;
-        }
-
-        let sf_raw = u16::from_le_bytes([data[superframe_offset], data[superframe_offset + 1]]);
-        let superframe_spec = SuperframeSpec::from_raw(sf_raw);
-
-        // Zigbee beacon payload follows superframe + GTS + pending address fields
-        // For non-beacon networks (beacon_order=15), GTS and pending are minimal
-        let beacon_payload_offset = superframe_offset + 4; // +2 sf, +1 gts, +1 pending
-        if data.len() < beacon_payload_offset + 15 {
-            return None;
-        }
-
-        let zigbee_beacon = parse_zigbee_beacon(&data[beacon_payload_offset..]);
-
-        // Extract coordinator address from frame header
-        let coord_address = parse_source_address(data, fc)?;
-
-        Some(PanDescriptor {
-            channel,
-            coord_address,
-            superframe_spec,
-            lqi,
-            security_use: (fc >> 3) & 1 != 0,
-            zigbee_beacon,
-        })
-    }
 }
 
 // ── MacDriver implementation ────────────────────────────────────
@@ -359,7 +337,7 @@ impl<'a, T: Instance> NrfMac<'a, T> {
 impl<T: Instance> MacDriver for NrfMac<'_, T> {
     async fn mlme_scan(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
         let mut pan_descriptors = heapless::Vec::new();
-        let mut energy_list = heapless::Vec::new();
+        let energy_list = heapless::Vec::new();
 
         log::info!(
             "[nRF MLME-SCAN] Starting {:?} scan, duration={}",
@@ -394,27 +372,8 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                     }
                 }
                 ScanType::Ed => {
-                    self.set_channel(ch);
-                    // Measure energy on channel using RSSI sampling.
-                    // nRF52840 doesn't expose a standalone ED task via embassy-nrf,
-                    // so we start a brief RX and sample RSSISAMPLE register.
-                    const RADIO_BASE: u32 = 0x4000_1000;
-                    const RSSISAMPLE: *const u32 = (RADIO_BASE + 0x548) as *const u32;
-
-                    // Brief listen to let AGC settle and capture RSSI
-                    let mut dummy = Packet::new();
-                    let _ = select::select(Timer::after_millis(2), self.radio.receive(&mut dummy))
-                        .await;
-
-                    // Read RSSISAMPLE (value is positive dBm magnitude, negate for actual)
-                    let rssi_raw = unsafe { core::ptr::read_volatile(RSSISAMPLE) } as u8;
-                    // Convert to 802.15.4 ED value (0-255, higher = more energy)
-                    // nRF RSSI is 0..127 (abs dBm), map: ED = 255 - (rssi * 2)
-                    let ed = 255u8.saturating_sub(rssi_raw.saturating_mul(2));
-                    let _ = energy_list.push(EdValue {
-                        channel: ch,
-                        energy: ed,
-                    });
+                    log::warn!("[nRF] ED scan is not implemented by embassy-nrf");
+                    return Err(MacError::Unsupported);
                 }
                 ScanType::Orphan => {
                     log::warn!("[nRF] Orphan scan not yet implemented");
@@ -446,6 +405,16 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         req: MlmeAssociateRequest,
     ) -> Result<MlmeAssociateConfirm, MacError> {
         self.set_channel(req.channel);
+        match req.coord_address {
+            MacAddress::Short(_, address) => {
+                self.coord_short_address = address;
+                self.coord_extended_address = [0; 8];
+            }
+            MacAddress::Extended(_, address) => {
+                self.coord_short_address = ShortAddress::COORDINATOR;
+                self.coord_extended_address = address;
+            }
+        }
 
         // Build Association Request command frame
         let mut pkt = Packet::new();
@@ -508,7 +477,19 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         Err(MacError::Unsupported)
     }
 
-    async fn mlme_disassociate(&mut self, _req: MlmeDisassociateRequest) -> Result<(), MacError> {
+    async fn mlme_disassociate(&mut self, req: MlmeDisassociateRequest) -> Result<(), MacError> {
+        if req.tx_indirect {
+            return Err(MacError::Unsupported);
+        }
+        let frame = build_disassociation_notification(
+            self.next_dsn(),
+            &req.device_address,
+            self.short_address,
+            &self.extended_address,
+            req.reason,
+        );
+        self.send_acknowledged_frame(&frame, self.max_frame_retries)
+            .await?;
         self.short_address = ShortAddress(0xFFFF);
         self.pan_id = PanId(0xFFFF);
         Ok(())
@@ -516,26 +497,27 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
 
     async fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
         if set_default_pib {
+            let random = self.next_random_u32();
             self.short_address = ShortAddress(0xFFFF);
             self.pan_id = PanId(0xFFFF);
             self.channel = 11;
             self.rx_on_when_idle = false;
             self.association_permit = false;
             self.auto_request = true;
-            self.dsn = 0;
-            self.bsn = 0;
+            self.dsn = random as u8;
+            self.bsn = (random >> 8) as u8;
             self.max_frame_retries = 3;
             self.promiscuous = false;
+            self.coord_short_address = ShortAddress::COORDINATOR;
+            self.coord_extended_address = [0; 8];
+            self.pending_assoc_frames.clear();
         }
         self.set_channel(self.channel);
         Ok(())
     }
 
-    async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
-        self.pan_id = req.pan_id;
-        self.set_channel(req.channel);
-        self.update_address_filter();
-        Ok(())
+    async fn mlme_start(&mut self, _req: MlmeStartRequest) -> Result<(), MacError> {
+        Err(MacError::Unsupported)
     }
 
     async fn mlme_get(&self, attr: PibAttribute) -> Result<PibValue, MacError> {
@@ -545,16 +527,28 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             PibAttribute::MacExtendedAddress => {
                 Ok(PibValue::ExtendedAddress(self.extended_address))
             }
+            PibAttribute::MacCoordShortAddress => {
+                Ok(PibValue::ShortAddress(self.coord_short_address))
+            }
+            PibAttribute::MacCoordExtendedAddress => {
+                Ok(PibValue::ExtendedAddress(self.coord_extended_address))
+            }
             PibAttribute::MacRxOnWhenIdle => Ok(PibValue::Bool(self.rx_on_when_idle)),
             PibAttribute::MacAssociationPermit => Ok(PibValue::Bool(self.association_permit)),
             PibAttribute::MacAutoRequest => Ok(PibValue::Bool(self.auto_request)),
             PibAttribute::MacDsn => Ok(PibValue::U8(self.dsn)),
+            PibAttribute::MacBsn => Ok(PibValue::U8(self.bsn)),
+            PibAttribute::MacMaxFrameRetries => Ok(PibValue::U8(self.max_frame_retries)),
             PibAttribute::PhyCurrentChannel => Ok(PibValue::U8(self.channel)),
             PibAttribute::PhyTransmitPower => Ok(PibValue::I8(self.tx_power)),
             PibAttribute::PhyChannelsSupported => Ok(PibValue::U32(ChannelMask::ALL_2_4GHZ.0)),
             PibAttribute::MacPromiscuousMode => Ok(PibValue::Bool(self.promiscuous)),
             PibAttribute::MacBeaconPayload => Ok(PibValue::Payload(self.beacon_payload.clone())),
-            _ => Ok(PibValue::U8(0)),
+            PibAttribute::MacBeaconPayloadLength => {
+                Ok(PibValue::U8(self.beacon_payload.as_slice().len() as u8))
+            }
+            PibAttribute::PhyCurrentPage => Ok(PibValue::U8(0)),
+            _ => Err(MacError::Unsupported),
         }
     }
 
@@ -562,11 +556,9 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         match attr {
             PibAttribute::MacShortAddress => {
                 self.short_address = value.as_short_address().ok_or(MacError::InvalidParameter)?;
-                self.update_address_filter();
             }
             PibAttribute::MacPanId => {
                 self.pan_id = value.as_pan_id().ok_or(MacError::InvalidParameter)?;
-                self.update_address_filter();
             }
             PibAttribute::MacRxOnWhenIdle => {
                 self.rx_on_when_idle = value.as_bool().ok_or(MacError::InvalidParameter)?;
@@ -588,39 +580,54 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                 self.promiscuous = value.as_bool().ok_or(MacError::InvalidParameter)?;
             }
             PibAttribute::MacBeaconPayload => {
-                if let PibValue::Payload(p) = value {
-                    self.beacon_payload = p;
-                }
+                self.beacon_payload = match value {
+                    PibValue::Payload(payload) => payload,
+                    _ => return Err(MacError::InvalidParameter),
+                };
             }
             PibAttribute::PhyTransmitPower => {
-                if let PibValue::I8(p) = value {
-                    self.tx_power = p;
-                    self.radio.set_transmission_power(p);
-                }
+                let PibValue::I8(power) = value else {
+                    return Err(MacError::InvalidParameter);
+                };
+                self.tx_power = power;
+                self.radio.set_transmission_power(power);
             }
             PibAttribute::MacCoordShortAddress => {
-                if let PibValue::ShortAddress(addr) = value {
-                    self.coord_short_address = addr;
-                }
+                self.coord_short_address =
+                    value.as_short_address().ok_or(MacError::InvalidParameter)?;
+            }
+            PibAttribute::MacCoordExtendedAddress => {
+                self.coord_extended_address = value
+                    .as_extended_address()
+                    .ok_or(MacError::InvalidParameter)?;
             }
             PibAttribute::MacExtendedAddress => {
-                if let PibValue::ExtendedAddress(addr) = value {
-                    self.extended_address = addr;
-                }
+                self.extended_address = value
+                    .as_extended_address()
+                    .ok_or(MacError::InvalidParameter)?;
             }
-            _ => {}
+            PibAttribute::MacDsn => {
+                self.dsn = value.as_u8().ok_or(MacError::InvalidParameter)?;
+            }
+            PibAttribute::MacBsn => {
+                self.bsn = value.as_u8().ok_or(MacError::InvalidParameter)?;
+            }
+            PibAttribute::MacMaxFrameRetries => {
+                self.max_frame_retries = value.as_u8().ok_or(MacError::InvalidParameter)?;
+            }
+            _ => return Err(MacError::Unsupported),
         }
         Ok(())
     }
 
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
         // Return any frame saved during association first (e.g. Transport-Key)
-        if let Some((buf, len)) = self.pending_assoc_frame.take() {
+        if let Some(frame) = self.pending_assoc_frames.pop_front() {
             log::info!(
                 "[MAC:Poll] Returning saved association frame ({} bytes)",
-                len
+                frame.len()
             );
-            return Ok(MacFrame::from_slice(&buf[..len]));
+            return Ok(Some(frame));
         }
 
         let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
@@ -633,16 +640,17 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         let passes: u8 = if has_short { 2 } else { 1 };
 
         for pass in 0..passes {
+            let poll_dsn = self.next_dsn();
             let data_req = if pass == 0 && has_short {
                 log::debug!(
                     "[MAC:Poll] pass {}: SHORT 0x{:04X}",
                     pass,
                     self.short_address.0
                 );
-                build_data_request_short(self.next_dsn(), &parent, self.pan_id, self.short_address)
+                build_data_request_short(poll_dsn, &parent, self.short_address)
             } else {
                 log::debug!("[MAC:Poll] pass {}: IEEE", pass);
-                build_data_request(self.next_dsn(), &parent, &self.extended_address)
+                build_data_request(poll_dsn, &parent, &self.extended_address)
             };
 
             let mut pkt = Packet::new();
@@ -683,6 +691,14 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                         let frame_type = fc & 0x07;
 
                         if frame_type == 0x02 {
+                            if data[2] != poll_dsn {
+                                log::debug!(
+                                    "[MAC:Poll] Ignoring stale ACK dsn={} expected={}",
+                                    data[2],
+                                    poll_dsn
+                                );
+                                continue;
+                            }
                             let frame_pending = (data[0] >> 4) & 1 != 0;
                             if !frame_pending {
                                 log::debug!("[MAC:Poll] ACK frame_pending=0 (nothing pending)");
@@ -780,111 +796,25 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
         let msdu_handle = req.msdu_handle;
         let ack_requested = req.tx_options.ack_tx;
-        let mut frame_buf = [0u8; 127];
-        let len = build_data_frame(
-            &mut frame_buf,
-            self.next_dsn(),
+        let dsn = self.next_dsn();
+        let frame = build_data_frame(
+            dsn,
+            req.src_addr_mode,
             self.short_address,
-            self.pan_id,
             &self.extended_address,
-            req,
-        )?;
+            &req.dst_address,
+            req.payload,
+            ack_requested,
+        )
+        .map_err(|_| MacError::FrameTooLong)?;
 
-        let mut pkt = Packet::new();
-        pkt.copy_from_slice(&frame_buf[..len]);
-
-        // Fix 6: Unslotted CSMA-CA (IEEE 802.15.4-2011 §5.1.1.4)
-        let max_backoffs: u8 = 4; // macMaxCsmaBackoffs
-        let min_be: u8 = 3; // macMinBE
-        let max_be: u8 = 5; // macMaxBE
-        let mut be = min_be;
-        let mut nb: u8 = 0;
-        let symbol_period_us: u64 = 16; // 2.4 GHz = 62.5 ksym/s = 16μs/symbol
-        let unit_backoff_symbols: u64 = 20; // aUnitBackoffPeriod
-
-        loop {
-            // Random backoff: 0 to 2^BE - 1 unit backoff periods
-            let max_val = (1u32 << be) - 1;
-            // Simple PRNG: use dsn as seed (not cryptographic, but adequate for CSMA)
-            let random = (self.dsn as u32)
-                .wrapping_mul(1103515245)
-                .wrapping_add(12345);
-            let backoff = (random % (max_val + 1)) as u64;
-            let delay_us = backoff * unit_backoff_symbols * symbol_period_us;
-            if delay_us > 0 {
-                Timer::after_micros(delay_us).await;
-            }
-
-            match self.radio.try_send(&mut pkt).await {
-                Ok(()) => break,
-                Err(_) => {
-                    nb += 1;
-                    be = core::cmp::min(be + 1, max_be);
-                    if nb > max_backoffs {
-                        return Err(MacError::ChannelAccessFailure);
-                    }
-                }
-            }
-        }
-
-        // MAC ACK-based retransmission (IEEE 802.15.4 §5.1.6.4)
-        // After try_send(), radio is DISABLED via PHYEND→DISABLE shortcut.
-        // Immediately start RX to catch ACK within the 192μs turnaround window.
-        // Timing: PHYEND → DISABLED (~1μs) → try_send returns (~20μs) →
-        //         receive start (~30μs) → RXREADY (~40μs) = ~90μs total.
-        //         ACK preamble starts at 192μs → we have ~100μs margin.
-        let dsn = frame_buf[2]; // DSN is byte 2 of MAC frame
-        let max_retries: u8 = if ack_requested { 3 } else { 0 };
-        let mut ack_ok = !ack_requested; // true if no ACK needed
-
-        for attempt in 0..=max_retries {
-            if attempt > 0 {
-                // CSMA-CA backoff before retransmit
-                let delay = 2000 + attempt as u64 * 1000; // 2ms, 3ms, 4ms
-                Timer::after_micros(delay).await;
-                pkt.copy_from_slice(&frame_buf[..len]);
-                let _ = self.radio.try_send(&mut pkt).await;
-            }
-
-            if !ack_requested {
-                break; // No ACK needed — single send
-            }
-
-            // Listen for ACK: start RX immediately after TX
-            let mut ack_pkt = Packet::new();
-            let ack_result = select::select(
-                Timer::after_micros(1200), // 1200μs timeout (192μs turnaround + margin)
-                self.radio.receive(&mut ack_pkt),
-            )
-            .await;
-
-            match ack_result {
-                select::Either::Second(Ok(())) => {
-                    let ack_data: &[u8] = &*ack_pkt;
-                    if ack_data.len() >= 3 && (ack_data[0] & 0x07) == 0x02 && ack_data[2] == dsn {
-                        log::info!("[MAC TX] ACK ok dsn={} attempt={}", dsn, attempt);
-                        ack_ok = true;
-                        break;
-                    }
-                    // Wrong frame
-                    log::debug!(
-                        "[MAC TX] Wrong frame dsn={} got {} bytes fc=0x{:02X}",
-                        dsn,
-                        ack_data.len(),
-                        if !ack_data.is_empty() { ack_data[0] } else { 0 }
-                    );
-                }
-                select::Either::Second(Err(_)) => {
-                    log::debug!("[MAC TX] RX error attempt={}", attempt);
-                }
-                select::Either::First(_) => {
-                    log::debug!("[MAC TX] ACK timeout attempt={}", attempt);
-                }
-            }
-        }
-
-        if !ack_ok {
-            log::warn!("[MAC TX] No ACK after {} retries dsn={}", max_retries, dsn);
+        if ack_requested {
+            self.send_acknowledged_frame(&frame, self.max_frame_retries)
+                .await?;
+        } else {
+            let mut packet = Packet::new();
+            packet.copy_from_slice(&frame);
+            self.try_send_with_csma(&mut packet).await?;
         }
 
         Ok(McpsDataConfirm {
@@ -1013,13 +943,21 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
 
     fn capabilities(&self) -> MacCapabilities {
         MacCapabilities {
-            coordinator: true,
-            router: true,
+            coordinator: false,
+            router: false,
             hardware_security: false,
             max_payload: 102,
             tx_power_min: TxPower(-20),
             tx_power_max: TxPower(8), // nRF52840: -20 to +8 dBm
         }
+    }
+
+    fn monotonic_micros(&self) -> Option<u32> {
+        Some(embassy_time::Instant::now().as_micros() as u32)
+    }
+
+    async fn delay_micros(&mut self, duration_us: u32) {
+        Timer::after_micros(duration_us as u64).await;
     }
 }
 
@@ -1056,13 +994,10 @@ impl<T: Instance> NrfMac<'_, T> {
                 let header_len = 3 + addressing_size(fc);
                 if data.len() > header_len {
                     let payload = &data[header_len..];
-                    let len = payload.len().min(128);
-                    let mut buf = [0u8; 128];
-                    buf[..len].copy_from_slice(&payload[..len]);
-                    self.pending_assoc_frame = Some((buf, len));
+                    self.queue_pending_assoc_frame(payload);
                     log::info!(
                         "[MAC] Saved+ACKed data frame {} bytes during association",
-                        len
+                        payload.len()
                     );
                 }
                 continue;
@@ -1115,13 +1050,10 @@ impl<T: Instance> NrfMac<'_, T> {
                                         let hl = 3 + addressing_size(efc);
                                         if d.len() > hl {
                                             let pl = &d[hl..];
-                                            let plen = pl.len().min(128);
-                                            let mut buf = [0u8; 128];
-                                            buf[..plen].copy_from_slice(&pl[..plen]);
-                                            self.pending_assoc_frame = Some((buf, plen));
+                                            self.queue_pending_assoc_frame(pl);
                                             log::info!(
                                                 "[MAC] Caught+ACKed post-assoc frame {} bytes!",
-                                                plen
+                                                pl.len()
                                             );
                                         }
                                     }
@@ -1139,270 +1071,4 @@ impl<T: Instance> NrfMac<'_, T> {
         }
         Err(MacError::NoAck)
     }
-}
-
-// ── Shared frame-building utilities ─────────────────────────────
-
-/// Calculate addressing field size from Frame Control word.
-fn addressing_size(fc: u16) -> usize {
-    let dst_mode = (fc >> 10) & 0x03;
-    let src_mode = (fc >> 14) & 0x03;
-    let pan_compress = (fc >> 6) & 1 != 0;
-
-    let mut size = 0;
-    // Destination
-    match dst_mode {
-        0x02 => size += 2 + 2, // PAN(2) + Short(2)
-        0x03 => size += 2 + 8, // PAN(2) + Extended(8)
-        _ => {}
-    }
-    // Source
-    match src_mode {
-        0x02 => size += if pan_compress { 2 } else { 4 }, // Short ± PAN
-        0x03 => size += if pan_compress { 8 } else { 10 }, // Extended ± PAN
-        _ => {}
-    }
-    size
-}
-
-/// Parse source address from raw MAC frame.
-fn parse_source_address(data: &[u8], fc: u16) -> Option<MacAddress> {
-    let dst_mode = (fc >> 10) & 0x03;
-    let src_mode = (fc >> 14) & 0x03;
-    let pan_compress = (fc >> 6) & 1 != 0;
-
-    // Skip past FC(2) + Seq(1) + dst addressing
-    let mut offset = 3;
-    let dst_pan = if dst_mode >= 2 && data.len() > offset + 1 {
-        let pan = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        offset += 2;
-        Some(pan)
-    } else {
-        None
-    };
-    match dst_mode {
-        0x02 => offset += 2,
-        0x03 => offset += 8,
-        _ => {}
-    }
-
-    // Source PAN
-    let src_pan = if !pan_compress && src_mode >= 2 && data.len() > offset + 1 {
-        let pan = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        offset += 2;
-        pan
-    } else {
-        dst_pan.unwrap_or(0xFFFF)
-    };
-
-    match src_mode {
-        0x02 if data.len() >= offset + 2 => {
-            let addr = u16::from_le_bytes([data[offset], data[offset + 1]]);
-            Some(MacAddress::Short(PanId(src_pan), ShortAddress(addr)))
-        }
-        0x03 if data.len() >= offset + 8 => {
-            let mut ext = [0u8; 8];
-            ext.copy_from_slice(&data[offset..offset + 8]);
-            Some(MacAddress::Extended(PanId(src_pan), ext))
-        }
-        _ => None,
-    }
-}
-
-/// Parse destination address from raw MAC frame.
-fn parse_dest_address(data: &[u8], fc: u16) -> Option<MacAddress> {
-    let dst_mode = (fc >> 10) & 0x03;
-    let offset = 3; // After FC(2) + Seq(1)
-
-    if data.len() < offset + 2 {
-        return None;
-    }
-    let pan = u16::from_le_bytes([data[offset], data[offset + 1]]);
-    let addr_offset = offset + 2;
-
-    match dst_mode {
-        0x02 if data.len() >= addr_offset + 2 => {
-            let addr = u16::from_le_bytes([data[addr_offset], data[addr_offset + 1]]);
-            Some(MacAddress::Short(PanId(pan), ShortAddress(addr)))
-        }
-        0x03 if data.len() >= addr_offset + 8 => {
-            let mut ext = [0u8; 8];
-            ext.copy_from_slice(&data[addr_offset..addr_offset + 8]);
-            Some(MacAddress::Extended(PanId(pan), ext))
-        }
-        _ => None,
-    }
-}
-
-/// Parse Zigbee beacon payload from raw bytes (at least 15 bytes).
-fn parse_zigbee_beacon(data: &[u8]) -> ZigbeeBeaconPayload {
-    let protocol_id = data[0];
-    let nwk_info = u16::from_le_bytes([data[1], data[2]]);
-
-    let mut extended_pan_id = [0u8; 8];
-    extended_pan_id.copy_from_slice(&data[3..11]);
-    let mut tx_offset = [0u8; 3];
-    tx_offset.copy_from_slice(&data[11..14]);
-
-    ZigbeeBeaconPayload {
-        protocol_id,
-        stack_profile: (nwk_info & 0x0F) as u8,
-        protocol_version: ((nwk_info >> 4) & 0x0F) as u8,
-        router_capacity: (nwk_info >> 10) & 1 != 0,
-        device_depth: ((nwk_info >> 11) & 0x0F) as u8,
-        end_device_capacity: (nwk_info >> 15) & 1 != 0,
-        extended_pan_id,
-        tx_offset,
-        update_id: data[14],
-    }
-}
-
-/// Build an Association Request MAC command frame.
-/// Fix 3: Use PAN ID compression to avoid missing Source PAN ID field
-fn build_association_request(
-    seq: u8,
-    coord: &MacAddress,
-    own_extended: &IeeeAddress,
-    cap: &CapabilityInfo,
-) -> heapless::Vec<u8, 32> {
-    let mut frame = heapless::Vec::new();
-    // FC: MAC command, ack req, PAN ID compress, dst=short, src=extended
-    // 0xC863: type=3(cmd), ack_req=1, pan_compress=1, dst_mode=2(short), src_mode=3(ext)
-    let _ = frame.extend_from_slice(&[0x63, 0xC8, seq]);
-    let dst_pan = coord.pan_id();
-    let _ = frame.extend_from_slice(&dst_pan.0.to_le_bytes());
-    match coord {
-        MacAddress::Short(_, addr) => {
-            let _ = frame.extend_from_slice(&addr.0.to_le_bytes());
-        }
-        MacAddress::Extended(_, addr) => {
-            let _ = frame.extend_from_slice(addr);
-        }
-    }
-    let _ = frame.extend_from_slice(own_extended);
-    let _ = frame.push(0x01); // Association Request command ID
-    let _ = frame.push(cap.to_byte());
-    frame
-}
-
-/// Fix 11: Build a MAC Data Request command frame for indirect frame retrieval.
-fn build_data_request(
-    seq: u8,
-    coord: &MacAddress,
-    own_extended: &IeeeAddress,
-) -> heapless::Vec<u8, 24> {
-    let mut frame = heapless::Vec::new();
-    // FC: MAC command, ack req, PAN compress, dst=short, src=extended
-    let _ = frame.extend_from_slice(&[0x63, 0xC8, seq]);
-    let dst_pan = coord.pan_id();
-    let _ = frame.extend_from_slice(&dst_pan.0.to_le_bytes());
-    match coord {
-        MacAddress::Short(_, addr) => {
-            let _ = frame.extend_from_slice(&addr.0.to_le_bytes());
-        }
-        MacAddress::Extended(_, addr) => {
-            let _ = frame.extend_from_slice(addr);
-        }
-    }
-    let _ = frame.extend_from_slice(own_extended);
-    let _ = frame.push(0x04); // Data Request command ID
-    frame
-}
-
-/// Build a MAC Data Request using SHORT source address.
-/// Used after association when we have a short address assigned.
-/// IEEE 802.15.4 §5.1.6.3: indirect frame matching uses the source address
-/// mode of the Data Request — if parent queued frames for our short addr,
-/// we must poll with short addr to match.
-fn build_data_request_short(
-    seq: u8,
-    coord: &MacAddress,
-    _own_pan: PanId,
-    own_short: ShortAddress,
-) -> heapless::Vec<u8, 24> {
-    let mut frame = heapless::Vec::new();
-    // FC: MAC command (0b011), ack req, PAN compress, dst=short(0b10), src=short(0b10)
-    // Bits: type=011, sec=0, pend=0, ack=1, pan_compress=1, rsvd=0, dst=10, ver=00, src=10
-    // = 0b 10_00_10_0_0_1_1_0_011 = 0x8863
-    let _ = frame.extend_from_slice(&[0x63, 0x88, seq]);
-    let dst_pan = coord.pan_id();
-    let _ = frame.extend_from_slice(&dst_pan.0.to_le_bytes());
-    match coord {
-        MacAddress::Short(_, addr) => {
-            let _ = frame.extend_from_slice(&addr.0.to_le_bytes());
-        }
-        MacAddress::Extended(_, addr) => {
-            let _ = frame.extend_from_slice(addr);
-        }
-    }
-    // PAN compress=1: source PAN is elided (same as dst PAN)
-    // Source short address
-    let _ = frame.extend_from_slice(&own_short.0.to_le_bytes());
-    let _ = frame.push(0x04); // Data Request command ID
-    frame
-}
-
-/// Build an IEEE 802.15.4 data frame.
-fn build_data_frame(
-    buf: &mut [u8; 127],
-    seq: u8,
-    short_addr: ShortAddress,
-    _pan_id: PanId,
-    extended_addr: &IeeeAddress,
-    req: McpsDataRequest<'_>,
-) -> Result<usize, MacError> {
-    let mut fc: u16 = 0x0001; // Data frame
-    if req.tx_options.ack_tx {
-        fc |= 0x0020;
-    }
-    fc |= 0x0040; // PAN ID compression
-
-    match req.dst_address {
-        MacAddress::Short(_, _) => fc |= 0x0800,
-        MacAddress::Extended(_, _) => fc |= 0x0C00,
-    }
-    if short_addr.0 != 0xFFFF {
-        fc |= 0x8000;
-    } else {
-        fc |= 0xC000;
-    }
-
-    let mut pos = 0;
-    buf[pos] = (fc & 0xFF) as u8;
-    pos += 1;
-    buf[pos] = ((fc >> 8) & 0xFF) as u8;
-    pos += 1;
-    buf[pos] = seq;
-    pos += 1;
-
-    let dst_pan = req.dst_address.pan_id();
-    buf[pos..pos + 2].copy_from_slice(&dst_pan.0.to_le_bytes());
-    pos += 2;
-
-    match req.dst_address {
-        MacAddress::Short(_, addr) => {
-            buf[pos..pos + 2].copy_from_slice(&addr.0.to_le_bytes());
-            pos += 2;
-        }
-        MacAddress::Extended(_, addr) => {
-            buf[pos..pos + 8].copy_from_slice(&addr);
-            pos += 8;
-        }
-    }
-
-    if short_addr.0 != 0xFFFF {
-        buf[pos..pos + 2].copy_from_slice(&short_addr.0.to_le_bytes());
-        pos += 2;
-    } else {
-        buf[pos..pos + 8].copy_from_slice(extended_addr);
-        pos += 8;
-    }
-
-    if pos + req.payload.len() > 125 {
-        return Err(MacError::FrameTooLong);
-    }
-    buf[pos..pos + req.payload.len()].copy_from_slice(req.payload);
-    pos += req.payload.len();
-
-    Ok(pos)
 }

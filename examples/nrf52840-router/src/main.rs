@@ -1,16 +1,13 @@
 //! # nRF52840 Zigbee Router
 //!
-//! A Zigbee 3.0 router device for nRF52840-DK.
-//! Routes frames between end devices and the coordinator,
-//! extends network range, and accepts child joins.
+//! Experimental always-on FFD join target for nRF52840-DK.
+//! It can join with the router capability bit and exercise NWK forwarding,
+//! but the nRF MAC cannot yet accept child associations.
 //!
 //! # Features
 //! - Joins existing network as a router (FFD)
 //! - Continuous RX (rx_on_when_idle = true)
-//! - Relays unicast and broadcast frames
-//! - Accepts child end device joins (permit joining)
-//! - Periodic Link Status broadcasts (every 15s)
-//! - Indirect frame buffering for sleeping children
+//! - Exercises unicast and broadcast forwarding paths
 //! - NWK Leave handler with auto-rejoin
 //! - Button: short=toggle join/leave, long=factory reset
 //!

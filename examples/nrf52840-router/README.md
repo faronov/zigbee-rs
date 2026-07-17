@@ -1,8 +1,12 @@
 # nRF52840 Zigbee Router
 
-A `no_std` Zigbee 3.0 router firmware for the **nRF52840-DK**. Joins an
-existing network as a Full Function Device (FFD), relays frames between end
-devices and the coordinator, and extends network range.
+A `no_std` experimental Full Function Device target for the
+**nRF52840-DK**. It joins an existing network with the router capability bit
+and exercises always-on receive and NWK forwarding paths.
+
+This is not yet a complete Zigbee router: the nRF MAC does not implement
+`MLME-ASSOCIATE.response`, so it cannot accept child devices or buffer
+indirect frames for sleeping children.
 
 ## Hardware
 
@@ -17,11 +21,9 @@ devices and the coordinator, and extends network range.
 
 - Joins existing Zigbee network as a router (FFD)
 - Continuous RX (`rx_on_when_idle = true`)
-- Relays unicast and broadcast frames (BTR broadcast relay)
-- Accepts child end device joins (permit joining)
+- Exercises unicast and broadcast forwarding paths
 - RREQ rebroadcast for route discovery
 - Periodic Link Status broadcasts (every 15 seconds)
-- Indirect frame buffering for sleeping children
 - NWK Leave handler with auto-rejoin
 - Button-driven join/leave with factory reset
 
@@ -54,11 +56,12 @@ probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-
 Unlike sensor examples (which are Sleepy End Devices), the router:
 
 1. **Never sleeps** — radio is always on to relay frames
-2. **Accepts child joins** — end devices can associate through this router
-3. **Relays all frames** — unicast, broadcast, and indirect frames for
-   sleeping children
-4. **Sends Link Status** — periodic broadcasts so neighbors know it's alive
-5. **Participates in routing** — AODV route discovery, RREQ rebroadcast
+2. **Exercises forwarding** — unicast and broadcast NWK paths stay active
+3. **Sends Link Status** — periodic broadcasts so neighbors know it's alive
+4. **Participates in routing** — AODV route discovery and RREQ rebroadcast
+
+Child admission remains disabled until the backend implements association
+indications/responses, pending transactions, and indirect transmission.
 
 The router uses `PowerMode::AlwaysOn` and does not implement any sleep
 logic. DC-DC converters are enabled for lower power consumption while
@@ -86,7 +89,6 @@ INFO  [btn] Joining network…
 INFO  [scan] Scanning channels 11-26…
 INFO  [scan] Found network: ch=15, PAN=0x1AAA
 INFO  [join] Association successful, addr=0x5678
-INFO  [router] Permit join enabled
 INFO  [router] Link Status broadcast
 INFO  [relay] Relayed frame 0x1234 → 0x0000
 ```
