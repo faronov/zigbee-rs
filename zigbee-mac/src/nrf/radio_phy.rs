@@ -28,6 +28,8 @@ impl<T: RadioInstance, R: RngInstance> RadioPhy for NrfRadioPhy<'_, T, R> {
         PhyCapabilities {
             hardware_auto_ack: false,
             hardware_address_filter: false,
+            tx_power_min: -20,
+            tx_power_max: 8,
         }
     }
 

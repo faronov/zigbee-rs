@@ -37,6 +37,10 @@ pub struct PhyCapabilities {
     pub hardware_auto_ack: bool,
     /// The PHY can discard frames that do not match the configured addresses.
     pub hardware_address_filter: bool,
+    /// Minimum supported transmit power in dBm.
+    pub tx_power_min: i8,
+    /// Maximum supported transmit power in dBm.
+    pub tx_power_max: i8,
 }
 
 /// FCS-validated MAC bytes received from the PHY.

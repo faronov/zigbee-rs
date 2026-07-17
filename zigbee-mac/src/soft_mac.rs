@@ -4,15 +4,18 @@ use zigbee_types::MacAddress;
 
 use crate::frames::{
     build_association_request, build_beacon_request, build_data_frame, build_data_request,
-    build_data_request_short, parse_association_response, parse_beacon, parse_mac_addresses,
+    build_data_request_short, build_disassociation_notification, parse_association_response,
+    parse_beacon, parse_mac_addresses,
 };
 use crate::pib::scan_duration_us;
 use crate::{
-    AssociationStatus, EdValue, MacError, MacFrame, MacPib, McpsDataConfirm, McpsDataIndication,
-    McpsDataRequest, MlmeAssociateConfirm, MlmeAssociateRequest, MlmeScanConfirm, MlmeScanRequest,
-    PanDescriptor, PhyAddressFilter, PhyError, PhyRxFrame, PibAttribute, PibError, PibValue,
-    PlatformServices, RadioPhy, ScanType,
+    AssociationStatus, EdValue, MacCapabilities, MacDriver, MacError, MacFrame, MacPib,
+    McpsDataConfirm, McpsDataIndication, McpsDataRequest, MlmeAssociateConfirm,
+    MlmeAssociateRequest, MlmeAssociateResponse, MlmeDisassociateRequest, MlmeScanConfirm,
+    MlmeScanRequest, MlmeStartRequest, PanDescriptor, PhyAddressFilter, PhyError, PhyRxFrame,
+    PibAttribute, PibError, PibValue, PlatformServices, RadioPhy, ScanType,
 };
+use zigbee_types::TxPower;
 
 const UNIT_BACKOFF_PERIOD_US: u32 = 320;
 const ACK_WAIT_US: u32 = 1_200;
@@ -20,6 +23,7 @@ const ASSOCIATION_DIRECT_WAIT_US: u32 = 500_000;
 const POLL_RESPONSE_WAIT_US: u32 = 30_000;
 const POST_ASSOCIATION_RX_US: u32 = 250_000;
 const ASSOCIATION_POLL_DELAY_US: u32 = 100_000;
+const DATA_INDICATION_WAIT_US: u32 = 1_000_000;
 const MAX_ACK_WINDOW_FRAMES: u8 = 16;
 const MAX_ASSOCIATION_POLLS: u8 = 32;
 const MAX_SCAN_FRAMES_PER_CHANNEL: u16 = 256;
@@ -256,6 +260,45 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
         }
 
         Err(MacError::NoData)
+    }
+
+    pub async fn disassociate(&mut self, req: MlmeDisassociateRequest) -> Result<(), MacError> {
+        if req.tx_indirect {
+            return Err(MacError::Unsupported);
+        }
+        if self.pib.short_address().0 >= 0xFFF8
+            || req.device_address.pan_id() != self.pib.pan_id()
+            || match req.device_address {
+                MacAddress::Short(_, address) => address.0 >= 0xFFF8,
+                MacAddress::Extended(_, address) => address == [0; 8] || address == [0xFF; 8],
+            }
+        {
+            return Err(MacError::InvalidParameter);
+        }
+
+        let notification = build_disassociation_notification(
+            self.pib.next_dsn(),
+            &req.device_address,
+            self.pib.short_address(),
+            &self.pib.extended_address(),
+            req.reason,
+        );
+        let transmit_result = self.transmit_acknowledged(&notification).await;
+        let clear_result = self.clear_association();
+        clear_result?;
+        transmit_result.map(|_| ())
+    }
+
+    pub fn reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
+        if set_default_pib {
+            let random = self.next_random_u32();
+            return self.reset_pib(random as u8, (random >> 8) as u8);
+        }
+
+        Self::apply_full_config(&mut self.phy, &self.pib)?;
+        self.pending_rx.clear();
+        self.pending_error = None;
+        Ok(())
     }
 
     pub async fn transmit_data(
@@ -637,6 +680,38 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
         Ok(())
     }
 
+    fn clear_association(&mut self) -> Result<(), MacError> {
+        let mut next = self.pib.clone();
+        next.set(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(zigbee_types::ShortAddress(0xFFFF)),
+        )
+        .map_err(Self::map_pib_error)?;
+        next.set(
+            PibAttribute::MacPanId,
+            PibValue::PanId(zigbee_types::PanId(0xFFFF)),
+        )
+        .map_err(Self::map_pib_error)?;
+        next.set(
+            PibAttribute::MacCoordShortAddress,
+            PibValue::ShortAddress(zigbee_types::ShortAddress(0xFFFF)),
+        )
+        .map_err(Self::map_pib_error)?;
+        next.set(
+            PibAttribute::MacCoordExtendedAddress,
+            PibValue::ExtendedAddress([0; 8]),
+        )
+        .map_err(Self::map_pib_error)?;
+        next.set(PibAttribute::MacAssociatedPanCoord, PibValue::Bool(false))
+            .map_err(Self::map_pib_error)?;
+
+        Self::apply_full_config(&mut self.phy, &next)?;
+        self.pib = next;
+        self.pending_rx.clear();
+        self.pending_error = None;
+        Ok(())
+    }
+
     async fn take_pending_association_response(
         &mut self,
     ) -> Result<Option<(zigbee_types::ShortAddress, u8)>, MacError> {
@@ -884,6 +959,70 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
     }
 }
 
+impl<P: RadioPhy + PlatformServices> MacDriver for SoftMacCore<P> {
+    async fn mlme_scan(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
+        self.scan(req).await
+    }
+
+    async fn mlme_associate(
+        &mut self,
+        req: MlmeAssociateRequest,
+    ) -> Result<MlmeAssociateConfirm, MacError> {
+        self.associate(req).await
+    }
+
+    async fn mlme_associate_response(
+        &mut self,
+        _rsp: MlmeAssociateResponse,
+    ) -> Result<(), MacError> {
+        Err(MacError::Unsupported)
+    }
+
+    async fn mlme_disassociate(&mut self, req: MlmeDisassociateRequest) -> Result<(), MacError> {
+        self.disassociate(req).await
+    }
+
+    async fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
+        self.reset(set_default_pib)
+    }
+
+    async fn mlme_start(&mut self, _req: MlmeStartRequest) -> Result<(), MacError> {
+        Err(MacError::Unsupported)
+    }
+
+    async fn mlme_get(&self, attr: PibAttribute) -> Result<PibValue, MacError> {
+        Ok(self.get_pib(attr))
+    }
+
+    async fn mlme_set(&mut self, attr: PibAttribute, value: PibValue) -> Result<(), MacError> {
+        self.set_pib(attr, value)
+    }
+
+    async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
+        self.poll().await
+    }
+
+    async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
+        self.transmit_data(req).await
+    }
+
+    async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
+        self.receive_data(DATA_INDICATION_WAIT_US).await
+    }
+
+    fn capabilities(&self) -> MacCapabilities {
+        let phy = self.phy.capabilities();
+        MacCapabilities {
+            coordinator: false,
+            router: false,
+            hardware_security: false,
+            max_payload: 102,
+            tx_power_min: TxPower(phy.tx_power_min),
+            tx_power_max: TxPower(phy.tx_power_max),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -927,7 +1066,11 @@ mod tests {
                 delayed_us: 0,
                 last_tx: heapless::Vec::new(),
                 energy: Ok(0),
-                capabilities: PhyCapabilities::default(),
+                capabilities: PhyCapabilities {
+                    tx_power_min: -8,
+                    tx_power_max: 4,
+                    ..Default::default()
+                },
                 sent_acks: heapless::Vec::new(),
             }
         }
@@ -1046,6 +1189,25 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    fn associated_core() -> SoftMacCore<TestPhy> {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        core.set_pib(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x5678)),
+        )
+        .unwrap();
+        core.set_pib(
+            PibAttribute::MacCoordShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x0000)),
+        )
+        .unwrap();
+        core.set_pib(PibAttribute::MacAssociatedPanCoord, PibValue::Bool(true))
+            .unwrap();
+        core
     }
 
     #[test]
@@ -1592,6 +1754,153 @@ mod tests {
         ));
         assert_eq!(core.phy().tx_attempts, 0);
         assert_eq!(core.phy().channel, 11);
+    }
+
+    #[test]
+    fn disassociation_notifies_the_parent_before_clearing_state() {
+        let mut core = associated_core();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap(),
+            )))
+            .unwrap();
+
+        block_on(core.disassociate(MlmeDisassociateRequest {
+            device_address: MacAddress::Short(PanId(0x1234), ShortAddress(0x0000)),
+            reason: crate::DisassociateReason::DeviceLeave,
+            tx_indirect: false,
+        }))
+        .unwrap();
+
+        assert_eq!(core.phy().tx_attempts, 1);
+        assert_eq!(core.phy().last_tx.last(), Some(&0x02));
+        assert_eq!(
+            core.get_pib(PibAttribute::MacShortAddress),
+            PibValue::ShortAddress(ShortAddress(0xFFFF))
+        );
+        assert_eq!(
+            core.get_pib(PibAttribute::MacPanId),
+            PibValue::PanId(PanId(0xFFFF))
+        );
+        assert_eq!(
+            core.get_pib(PibAttribute::MacAssociatedPanCoord),
+            PibValue::Bool(false)
+        );
+        assert_eq!(core.phy().channel, 11);
+    }
+
+    #[test]
+    fn indirect_disassociation_is_rejected_without_changing_state() {
+        let mut core = associated_core();
+
+        assert!(matches!(
+            block_on(core.disassociate(MlmeDisassociateRequest {
+                device_address: MacAddress::Short(PanId(0x1234), ShortAddress(0x0000)),
+                reason: crate::DisassociateReason::DeviceLeave,
+                tx_indirect: true,
+            })),
+            Err(MacError::Unsupported)
+        ));
+        assert_eq!(core.phy().tx_attempts, 0);
+        assert_eq!(
+            core.get_pib(PibAttribute::MacShortAddress),
+            PibValue::ShortAddress(ShortAddress(0x5678))
+        );
+    }
+
+    #[test]
+    fn failed_disassociation_notification_still_clears_local_state() {
+        let mut core = associated_core();
+
+        assert!(matches!(
+            block_on(core.disassociate(MlmeDisassociateRequest {
+                device_address: MacAddress::Short(PanId(0x1234), ShortAddress(0x0000)),
+                reason: crate::DisassociateReason::DeviceLeave,
+                tx_indirect: false,
+            })),
+            Err(MacError::NoAck)
+        ));
+        assert_eq!(
+            core.get_pib(PibAttribute::MacShortAddress),
+            PibValue::ShortAddress(ShortAddress(0xFFFF))
+        );
+        assert_eq!(
+            core.get_pib(PibAttribute::MacPanId),
+            PibValue::PanId(PanId(0xFFFF))
+        );
+        assert_eq!(
+            core.get_pib(PibAttribute::MacAssociatedPanCoord),
+            PibValue::Bool(false)
+        );
+    }
+
+    #[test]
+    fn default_reset_preserves_eui_and_restores_portable_pib_defaults() {
+        let mut core = associated_core();
+        core.set_pib(PibAttribute::PhyCurrentChannel, PibValue::U8(20))
+            .unwrap();
+
+        core.reset(true).unwrap();
+
+        assert_eq!(
+            core.get_pib(PibAttribute::MacExtendedAddress),
+            PibValue::ExtendedAddress(IEEE)
+        );
+        assert_eq!(
+            core.get_pib(PibAttribute::MacShortAddress),
+            PibValue::ShortAddress(ShortAddress(0xFFFF))
+        );
+        assert_eq!(
+            core.get_pib(PibAttribute::MacPanId),
+            PibValue::PanId(PanId(0xFFFF))
+        );
+        assert_eq!(
+            core.get_pib(PibAttribute::PhyCurrentChannel),
+            PibValue::U8(11)
+        );
+        assert_eq!(core.phy().channel, 11);
+    }
+
+    #[test]
+    fn non_default_reset_preserves_pib_and_clears_transient_receive_state() {
+        let mut core = associated_core();
+        core.queue_pending_rx(
+            PhyRxFrame::from_slice(&[0x01, 0x00, 0x33], 100).unwrap(),
+            false,
+        );
+        core.pending_error = Some(MacError::RadioError);
+
+        core.reset(false).unwrap();
+
+        assert_eq!(
+            core.get_pib(PibAttribute::MacShortAddress),
+            PibValue::ShortAddress(ShortAddress(0x5678))
+        );
+        assert!(core.pending_rx.is_empty());
+        assert_eq!(core.pending_error, None);
+    }
+
+    #[test]
+    fn soft_mac_core_implements_the_end_device_mac_driver_surface() {
+        fn assert_mac_driver<T: MacDriver>() {}
+        assert_mac_driver::<SoftMacCore<TestPhy>>();
+
+        let mut core = core();
+        core.set_pib(PibAttribute::PhyTransmitPower, PibValue::I8(-4))
+            .unwrap();
+        let capabilities = MacDriver::capabilities(&core);
+
+        assert!(!capabilities.coordinator);
+        assert!(!capabilities.router);
+        assert!(!capabilities.hardware_security);
+        assert_eq!(capabilities.max_payload, 102);
+        assert_eq!(capabilities.tx_power_min, TxPower(-8));
+        assert_eq!(capabilities.tx_power_max, TxPower(4));
+        assert_eq!(
+            block_on(MacDriver::mlme_get(&core, PibAttribute::MacExtendedAddress)).unwrap(),
+            PibValue::ExtendedAddress(IEEE)
+        );
     }
 
     #[test]
