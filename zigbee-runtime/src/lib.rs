@@ -64,27 +64,48 @@ use crate::security_store::{
     SecurityStoreError,
 };
 
-struct SyncUnsafeCell<T>(core::cell::UnsafeCell<T>);
-unsafe impl<T> Sync for SyncUnsafeCell<T> {}
+/// Per-device scratch used while buffer-backed indications are alive.
+///
+/// `process_incoming()` has exclusive `&mut ZigbeeDevice` access, so these
+/// cells cannot be accessed concurrently. Keeping them per instance avoids
+/// the aliasing and false `Sync` guarantee of the previous global buffers.
+struct RuntimeScratch {
+    nwk: core::cell::UnsafeCell<[u8; 128]>,
+    aad: core::cell::UnsafeCell<[u8; 64]>,
+    aps: core::cell::UnsafeCell<zigbee_aps::apsde::ApsFrameBuffer>,
+    zcl: core::cell::UnsafeCell<[u8; 253]>,
+}
 
-impl<T> SyncUnsafeCell<T> {
-    const fn new(value: T) -> Self {
-        Self(core::cell::UnsafeCell::new(value))
-    }
-
-    fn get(&self) -> *mut T {
-        self.0.get()
+impl RuntimeScratch {
+    const fn new() -> Self {
+        Self {
+            nwk: core::cell::UnsafeCell::new([0; 128]),
+            aad: core::cell::UnsafeCell::new([0; 64]),
+            aps: core::cell::UnsafeCell::new(zigbee_aps::apsde::ApsFrameBuffer {
+                data: [0; 128],
+                len: 0,
+            }),
+            zcl: core::cell::UnsafeCell::new([0; 253]),
+        }
     }
 }
 
-static PROCESS_INCOMING_NWK_BUF: SyncUnsafeCell<[u8; 128]> = SyncUnsafeCell::new([0u8; 128]);
-static PROCESS_INCOMING_AAD_BUF: SyncUnsafeCell<[u8; 64]> = SyncUnsafeCell::new([0u8; 64]);
-static PROCESS_INCOMING_APS_BUF: SyncUnsafeCell<zigbee_aps::apsde::ApsFrameBuffer> =
-    SyncUnsafeCell::new(zigbee_aps::apsde::ApsFrameBuffer {
-        data: [0u8; 128],
-        len: 0,
-    });
-static PROCESS_INCOMING_ZCL_BUF: SyncUnsafeCell<[u8; 253]> = SyncUnsafeCell::new([0u8; 253]);
+#[cfg(test)]
+mod runtime_scratch_tests {
+    use super::RuntimeScratch;
+
+    #[test]
+    fn scratch_storage_is_owned_by_each_runtime_instance() {
+        let first = RuntimeScratch::new();
+        let second = RuntimeScratch::new();
+
+        unsafe {
+            (*first.nwk.get())[0] = 0xA5;
+            assert_eq!((*second.nwk.get())[0], 0);
+            assert_ne!(first.nwk.get(), second.nwk.get());
+        }
+    }
+}
 
 /// A queued ZCL response to be sent in the next tick().
 ///
@@ -177,6 +198,8 @@ pub struct ZigbeeDevice<M: MacDriver> {
     pending_responses: heapless::Vec<PendingZclResponse, 4>,
     #[cfg(not(feature = "router"))]
     pending_responses: heapless::Vec<PendingZclResponse, 2>,
+    /// Per-instance receive/decrypt/serialize scratch storage.
+    scratch: RuntimeScratch,
     /// Flag: network state has changed and should be persisted.
     state_dirty: bool,
 }
@@ -1138,7 +1161,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
 
             let after_header = &mac_payload[consumed..];
-            let buf = unsafe { &mut *PROCESS_INCOMING_NWK_BUF.get() };
+            let buf = unsafe { &mut *self.scratch.nwk.get() };
             let len;
 
             if header.frame_control.security {
@@ -1191,7 +1214,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 // Build authenticated data (a = NWK header || security aux header)
                 // AAD must use ACTUAL security level (5), not OTA value (0).
                 let aad_len = consumed + sec_consumed;
-                let aad_buf = unsafe { &mut *PROCESS_INCOMING_AAD_BUF.get() };
+                let aad_buf = unsafe { &mut *self.scratch.aad.get() };
                 let aad_copy_len = aad_len.min(aad_buf.len());
                 aad_buf[..aad_copy_len].copy_from_slice(&mac_payload[..aad_copy_len]);
                 // Patch security control byte at offset `consumed` with actual level 5
@@ -1240,7 +1263,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         };
 
         let (dst, src, nwk_security, frame_type, len) = nwk_indication;
-        let buf = unsafe { &*PROCESS_INCOMING_NWK_BUF.get() };
+        let buf = unsafe { &*self.scratch.nwk.get() };
 
         // NWK Command frames (type=1) — parse and handle at runtime level
         if frame_type == 1 {
@@ -1293,7 +1316,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         }
 
         // APS decryption buffer (for APS-secured frames like Transport Key)
-        let aps_decrypt_buf = unsafe { &mut *PROCESS_INCOMING_APS_BUF.get() };
+        let aps_decrypt_buf = unsafe { &mut *self.scratch.aps.get() };
 
         // APS layer: parse APS header
         let aps_indication = self.bdb.zdo_mut().aps_mut().process_incoming_aps_frame(
@@ -1729,7 +1752,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         cr.cluster.attributes(),
                         &req,
                     );
-                    let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                    let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
                     let payload_len = response.serialize(payload_buf).min(payload_buf.len());
                     rt_trace!(
                         "[RT][EFR32] zcl_read_rsp cluster=0x{:04X} len={} records={}",
@@ -1742,7 +1765,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         payload_len,
                         response.records.len(),
                     );
-                    self.queue_global_response(
+                    Self::queue_global_response_inner(
+                        &mut self.pending_responses,
                         src_addr,
                         aps_indication.src_endpoint,
                         dst_ep,
@@ -1800,9 +1824,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     cr.cluster.attributes_mut(),
                     &req,
                 );
-                let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
                 let payload_len = response.serialize(payload_buf);
-                self.queue_global_response(
+                Self::queue_global_response_inner(
+                    &mut self.pending_responses,
                     src_addr,
                     aps_indication.src_endpoint,
                     dst_ep,
@@ -1841,9 +1866,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         cr.cluster.attributes_mut(),
                         &req,
                     );
-                let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
                 let payload_len = response.serialize(payload_buf);
-                self.queue_global_response(
+                Self::queue_global_response_inner(
+                    &mut self.pending_responses,
                     src_addr,
                     aps_indication.src_endpoint,
                     dst_ep,
@@ -1907,9 +1933,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     cr.cluster.attributes(),
                     &req,
                 );
-                let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
                 let payload_len = response.serialize(payload_buf);
-                self.queue_global_response(
+                Self::queue_global_response_inner(
+                    &mut self.pending_responses,
                     src_addr,
                     aps_indication.src_endpoint,
                     dst_ep,
@@ -1946,9 +1973,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     req.start_command_id,
                     req.max_results,
                 );
-                let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
                 let payload_len = response.serialize(payload_buf);
-                self.queue_global_response(
+                Self::queue_global_response_inner(
+                    &mut self.pending_responses,
                     src_addr,
                     aps_indication.src_endpoint,
                     dst_ep,
@@ -1985,9 +2013,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     req.start_command_id,
                     req.max_results,
                 );
-                let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
                 let payload_len = response.serialize(payload_buf);
-                self.queue_global_response(
+                Self::queue_global_response_inner(
+                    &mut self.pending_responses,
                     src_addr,
                     aps_indication.src_endpoint,
                     dst_ep,
@@ -2022,9 +2051,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     cr.cluster.attributes(),
                     &req,
                 );
-                let payload_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
                 let payload_len = response.serialize(payload_buf);
-                self.queue_global_response(
+                Self::queue_global_response_inner(
+                    &mut self.pending_responses,
                     src_addr,
                     aps_indication.src_endpoint,
                     dst_ep,
@@ -2179,7 +2209,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 for &b in resp.as_slice() {
                     let _ = frame.payload.push(b);
                 }
-                let zcl_buf = unsafe { &mut *PROCESS_INCOMING_ZCL_BUF.get() };
+                let zcl_buf = unsafe { &mut *self.scratch.zcl.get() };
                 if let Ok(len) = frame.serialize(zcl_buf) {
                     let mut data = heapless::Vec::new();
                     for &b in &zcl_buf[..len] {
@@ -2490,6 +2520,29 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         response_cmd: u8,
         payload: &[u8],
     ) {
+        Self::queue_global_response_inner(
+            &mut self.pending_responses,
+            dst_addr,
+            dst_endpoint,
+            src_endpoint,
+            cluster_id,
+            seq,
+            response_cmd,
+            payload,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn queue_global_response_inner<const N: usize>(
+        pending_responses: &mut heapless::Vec<PendingZclResponse, N>,
+        dst_addr: u16,
+        dst_endpoint: u8,
+        src_endpoint: u8,
+        cluster_id: u16,
+        seq: u8,
+        response_cmd: u8,
+        payload: &[u8],
+    ) {
         let mut frame = ZclFrame::new_global(
             seq,
             CommandId(response_cmd),
@@ -2529,8 +2582,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 cluster_id,
                 data.len(),
             );
-            if self
-                .pending_responses
+            if pending_responses
                 .push(PendingZclResponse {
                     dst_addr: ShortAddress(dst_addr),
                     dst_endpoint,
