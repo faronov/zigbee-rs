@@ -391,15 +391,12 @@ core::arch::global_asm!(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _rust_entry() -> ! {
     chip_init();
-    // Force HMAC-MMO to execute once at boot so SP-min captures at
-    // BDB+0x780..+0x798 (0x0084_F780..0x0084_F798) are populated
-    // regardless of whether the join handshake ever completes. The
-    // result must be black-boxed to prevent the optimizer from
-    // eliding the call entirely. zigbee-aps is built with the
-    // telink-debug feature unconditionally in this crate, so the
-    // probe symbol always exists.
-    let triplet = zigbee_aps::security::telink_debug_probe_mmo();
-    core::hint::black_box(triplet);
+    #[cfg(feature = "telink-stack-debug")]
+    {
+        // Populate the lab-only HMAC-MMO stack captures before commissioning.
+        let triplet = zigbee_aps::security::telink_debug_probe_mmo();
+        core::hint::black_box(triplet);
+    }
     main_loop();
 }
 

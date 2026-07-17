@@ -7,11 +7,11 @@ build = "build.rs"
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac" }
-zigbee-nwk = { path = "../../zigbee-nwk", features = ["telink-debug"] }
-zigbee-aps = { path = "../../zigbee-aps", features = ["telink-debug"] }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-zdo = { path = "../../zigbee-zdo", features = ["telink-debug"] }
-zigbee-bdb = { path = "../../zigbee-bdb", features = ["telink-debug"] }
+zigbee-zdo = { path = "../../zigbee-zdo" }
+zigbee-bdb = { path = "../../zigbee-bdb" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 
 # Logging (stub — no output backend yet)
@@ -26,8 +26,14 @@ default = ["runtime-sensor"]
 diag-beacon = []
 diag-assoc = []
 diag-smoke = []
-sensor = []
+sensor = ["telink-stack-debug"]
 runtime-sensor = []
+telink-stack-debug = [
+    "zigbee-nwk/telink-debug",
+    "zigbee-aps/telink-debug",
+    "zigbee-zdo/telink-debug",
+    "zigbee-bdb/telink-debug",
+]
 
 [profile.release]
 opt-level = "s"
