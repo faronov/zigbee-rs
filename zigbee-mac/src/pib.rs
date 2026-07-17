@@ -232,6 +232,30 @@ impl MacPib {
         self.transmit_power
     }
 
+    pub fn max_csma_backoffs(&self) -> u8 {
+        self.max_csma_backoffs
+    }
+
+    pub fn min_be(&self) -> u8 {
+        self.min_be
+    }
+
+    pub fn max_be(&self) -> u8 {
+        self.max_be
+    }
+
+    pub fn max_frame_retries(&self) -> u8 {
+        self.max_frame_retries
+    }
+
+    pub fn dsn(&self) -> u8 {
+        self.dsn
+    }
+
+    pub fn bsn(&self) -> u8 {
+        self.bsn
+    }
+
     pub fn get(&self, attr: PibAttribute) -> PibValue {
         use PibAttribute::*;
         match attr {

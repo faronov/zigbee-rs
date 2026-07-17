@@ -66,7 +66,7 @@ pub use phy::{
 pub use pib::{MacPib, PibAttribute, PibError, PibValue};
 pub use platform::{PlatformServices, WrappingTickExtender};
 pub use primitives::*;
-pub use soft_mac::SoftMacCore;
+pub use soft_mac::{AckResult, SoftMacCore};
 
 use zigbee_types::TxPower;
 

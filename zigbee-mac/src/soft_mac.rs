@@ -3,9 +3,19 @@
 use zigbee_types::MacAddress;
 
 use crate::{
-    MacError, MacPib, PhyAddressFilter, PhyError, PibAttribute, PibError, PibValue,
+    MacError, MacPib, PhyAddressFilter, PhyError, PhyRxFrame, PibAttribute, PibError, PibValue,
     PlatformServices, RadioPhy,
 };
+
+const UNIT_BACKOFF_PERIOD_US: u32 = 320;
+const ACK_WAIT_US: u32 = 1_200;
+const MAX_ACK_WINDOW_FRAMES: u8 = 16;
+const PENDING_RX_CAPACITY: usize = 4;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AckResult {
+    pub frame_pending: bool,
+}
 
 /// Shared software-MAC state for one radio.
 ///
@@ -14,12 +24,20 @@ use crate::{
 pub struct SoftMacCore<P: RadioPhy> {
     phy: P,
     pib: MacPib,
+    pending_rx: heapless::Deque<PhyRxFrame, PENDING_RX_CAPACITY>,
+    random_state: u32,
 }
 
 impl<P: RadioPhy> SoftMacCore<P> {
     pub fn new(mut phy: P, pib: MacPib) -> Result<Self, MacError> {
         Self::apply_full_config(&mut phy, &pib)?;
-        Ok(Self { phy, pib })
+        let random_state = Self::random_seed(&pib);
+        Ok(Self {
+            phy,
+            pib,
+            pending_rx: heapless::Deque::new(),
+            random_state,
+        })
     }
 
     pub fn phy(&self) -> &P {
@@ -55,7 +73,13 @@ impl<P: RadioPhy> SoftMacCore<P> {
         next.reset(dsn, bsn);
         Self::apply_full_config(&mut self.phy, &next)?;
         self.pib = next;
+        self.pending_rx.clear();
+        self.random_state = Self::random_seed(&self.pib);
         Ok(())
+    }
+
+    pub fn take_pending_rx(&mut self) -> Option<PhyRxFrame> {
+        self.pending_rx.pop_front()
     }
 
     pub fn accepts_destination(&self, destination: &MacAddress) -> bool {
@@ -139,6 +163,16 @@ impl<P: RadioPhy> SoftMacCore<P> {
             PhyError::Unsupported => MacError::Unsupported,
         }
     }
+
+    fn random_seed(pib: &MacPib) -> u32 {
+        let address = pib.extended_address();
+        let seed = u32::from_le_bytes([address[0], address[1], address[2], address[3]])
+            ^ u32::from_le_bytes([address[4], address[5], address[6], address[7]])
+            ^ u32::from(pib.dsn())
+            ^ (u32::from(pib.bsn()) << 8)
+            ^ 0x9E37_79B9;
+        seed.max(1)
+    }
 }
 
 impl<P: RadioPhy + PlatformServices> PlatformServices for SoftMacCore<P> {
@@ -155,10 +189,108 @@ impl<P: RadioPhy + PlatformServices> PlatformServices for SoftMacCore<P> {
     }
 }
 
+impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
+    pub async fn transmit_csma(&mut self, frame: &[u8]) -> Result<(), MacError> {
+        let mut backoff_count = 0u8;
+        let mut backoff_exponent = self.pib.min_be();
+
+        loop {
+            let slots = self.random_backoff_slots(backoff_exponent);
+            if slots != 0 {
+                self.delay_micros(u32::from(slots) * UNIT_BACKOFF_PERIOD_US)
+                    .await;
+            }
+
+            match self.phy.try_transmit(frame).await {
+                Ok(()) => return Ok(()),
+                Err(PhyError::ChannelBusy) if backoff_count < self.pib.max_csma_backoffs() => {
+                    backoff_count = backoff_count.saturating_add(1);
+                    backoff_exponent =
+                        core::cmp::min(backoff_exponent.saturating_add(1), self.pib.max_be());
+                }
+                Err(error) => return Err(Self::map_phy_error(error)),
+            }
+        }
+    }
+
+    pub async fn transmit_acknowledged(&mut self, frame: &[u8]) -> Result<AckResult, MacError> {
+        let sequence = *frame.get(2).ok_or(MacError::InvalidParameter)?;
+
+        for _ in 0..=self.pib.max_frame_retries() {
+            self.transmit_csma(frame).await?;
+            if let Some(ack) = self.wait_for_ack(sequence).await? {
+                return Ok(ack);
+            }
+        }
+
+        Err(MacError::NoAck)
+    }
+
+    fn random_backoff_slots(&mut self, backoff_exponent: u8) -> u16 {
+        let random = self.next_random_u32();
+        let mask = (1u16 << backoff_exponent) - 1;
+        random as u16 & mask
+    }
+
+    fn next_random_u32(&mut self) -> u32 {
+        let mut value = self.random_state;
+        value ^= value << 13;
+        value ^= value >> 17;
+        value ^= value << 5;
+        self.random_state = value.max(1);
+        value
+    }
+
+    async fn wait_for_ack(&mut self, sequence: u8) -> Result<Option<AckResult>, MacError> {
+        let started_at = self.monotonic_micros();
+
+        for _ in 0..MAX_ACK_WINDOW_FRAMES {
+            let elapsed = self.monotonic_micros().wrapping_sub(started_at);
+            let Some(remaining) = ACK_WAIT_US.checked_sub(elapsed) else {
+                return Ok(None);
+            };
+
+            match self.phy.receive(remaining).await {
+                Ok(Some(frame)) => {
+                    let data = frame.as_slice();
+                    if data.len() >= 2 && data[0] & 0x07 == 0x02 {
+                        if data.len() >= 3 && data[2] == sequence {
+                            return Ok(Some(AckResult {
+                                frame_pending: data[0] & (1 << 4) != 0,
+                            }));
+                        }
+                        continue;
+                    }
+                    self.queue_pending_rx(frame);
+                }
+                Ok(None) => return Ok(None),
+                Err(PhyError::CrcFailed) => {}
+                Err(error) => return Err(Self::map_phy_error(error)),
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn queue_pending_rx(&mut self, frame: PhyRxFrame) {
+        if self.pending_rx.is_full() {
+            let _ = self.pending_rx.pop_front();
+        }
+        let _ = self.pending_rx.push_back(frame);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+    use std::sync::Arc;
+    use std::task::Wake;
+
     use super::*;
-    use crate::{PhyCapabilities, PhyRxFrame};
+    use crate::PhyCapabilities;
     use zigbee_types::{PanId, ShortAddress};
 
     const IEEE: [u8; 8] = [0x02, 1, 2, 3, 4, 5, 6, 7];
@@ -168,6 +300,10 @@ mod tests {
         tx_power: i8,
         filter: Option<PhyAddressFilter>,
         fail_channel: Option<u8>,
+        tx_attempts: u8,
+        tx_results: heapless::Deque<Result<(), PhyError>, 8>,
+        rx_frames: heapless::Deque<Result<Option<PhyRxFrame>, PhyError>, 8>,
+        delayed_us: u32,
     }
 
     impl TestPhy {
@@ -177,6 +313,10 @@ mod tests {
                 tx_power: i8::MIN,
                 filter: None,
                 fail_channel: None,
+                tx_attempts: 0,
+                tx_results: heapless::Deque::new(),
+                rx_frames: heapless::Deque::new(),
+                delayed_us: 0,
             }
         }
     }
@@ -187,7 +327,8 @@ mod tests {
         }
 
         async fn try_transmit(&mut self, _frame: &[u8]) -> Result<(), PhyError> {
-            Ok(())
+            self.tx_attempts = self.tx_attempts.saturating_add(1);
+            self.tx_results.pop_front().unwrap_or(Ok(()))
         }
 
         async fn send_ack(&mut self, _sequence: u8, _frame_pending: bool) -> Result<(), PhyError> {
@@ -195,7 +336,7 @@ mod tests {
         }
 
         async fn receive(&mut self, _timeout_us: u32) -> Result<Option<PhyRxFrame>, PhyError> {
-            Ok(None)
+            self.rx_frames.pop_front().unwrap_or(Ok(None))
         }
 
         fn set_channel(&mut self, channel: u8) -> Result<(), PhyError> {
@@ -226,11 +367,32 @@ mod tests {
             123
         }
 
-        async fn delay_micros(&mut self, _duration_us: u32) {}
+        async fn delay_micros(&mut self, duration_us: u32) {
+            self.delayed_us = self.delayed_us.saturating_add(duration_us);
+        }
 
         fn fill_random(&mut self, output: &mut [u8]) -> Result<(), MacError> {
-            output.fill(0xA5);
+            output.fill(3);
             Ok(())
+        }
+    }
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+            std::thread::yield_now();
         }
     }
 
@@ -316,6 +478,80 @@ mod tests {
         core.fill_random(&mut random).unwrap();
 
         assert_eq!(core.monotonic_micros(), 123);
-        assert_eq!(random, [0xA5; 4]);
+        assert_eq!(random, [3; 4]);
+    }
+
+    #[test]
+    fn csma_retries_busy_channel_with_pib_backoff_policy() {
+        let mut core = core();
+        core.phy_mut()
+            .tx_results
+            .push_back(Err(PhyError::ChannelBusy))
+            .unwrap();
+        core.phy_mut()
+            .tx_results
+            .push_back(Err(PhyError::ChannelBusy))
+            .unwrap();
+        core.phy_mut().tx_results.push_back(Ok(())).unwrap();
+
+        block_on(core.transmit_csma(&[1, 2, 3])).unwrap();
+
+        assert_eq!(core.phy().tx_attempts, 3);
+        assert!(core.phy().delayed_us >= UNIT_BACKOFF_PERIOD_US);
+    }
+
+    #[test]
+    fn acknowledged_transmit_retries_until_matching_ack() {
+        let mut core = core();
+        core.phy_mut().rx_frames.push_back(Ok(None)).unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x12, 0x00, 0x2A], 255).unwrap(),
+            )))
+            .unwrap();
+
+        let result = block_on(core.transmit_acknowledged(&[0x61, 0x88, 0x2A])).unwrap();
+
+        assert_eq!(
+            result,
+            AckResult {
+                frame_pending: true
+            }
+        );
+        assert_eq!(core.phy().tx_attempts, 2);
+    }
+
+    #[test]
+    fn ack_wait_preserves_non_ack_frames() {
+        let mut core = core();
+        let data = PhyRxFrame::from_slice(&[0x41, 0x88, 0x10, 0xAA], 100).unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(data.clone())))
+            .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, 0x2A], 255).unwrap(),
+            )))
+            .unwrap();
+
+        block_on(core.transmit_acknowledged(&[0x61, 0x88, 0x2A])).unwrap();
+
+        assert_eq!(core.take_pending_rx(), Some(data));
+    }
+
+    #[test]
+    fn acknowledged_transmit_stops_after_configured_retries() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacMaxFrameRetries, PibValue::U8(2))
+            .unwrap();
+
+        assert_eq!(
+            block_on(core.transmit_acknowledged(&[0x61, 0x88, 0x2A])),
+            Err(MacError::NoAck)
+        );
+        assert_eq!(core.phy().tx_attempts, 3);
     }
 }
