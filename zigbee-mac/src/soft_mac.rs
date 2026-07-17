@@ -2,14 +2,17 @@
 
 use zigbee_types::MacAddress;
 
+use crate::frames::{build_beacon_request, parse_beacon};
+use crate::pib::scan_duration_us;
 use crate::{
-    MacError, MacPib, PhyAddressFilter, PhyError, PhyRxFrame, PibAttribute, PibError, PibValue,
-    PlatformServices, RadioPhy,
+    EdValue, MacError, MacPib, MlmeScanConfirm, MlmeScanRequest, PanDescriptor, PhyAddressFilter,
+    PhyError, PhyRxFrame, PibAttribute, PibError, PibValue, PlatformServices, RadioPhy, ScanType,
 };
 
 const UNIT_BACKOFF_PERIOD_US: u32 = 320;
 const ACK_WAIT_US: u32 = 1_200;
 const MAX_ACK_WINDOW_FRAMES: u8 = 16;
+const MAX_SCAN_FRAMES_PER_CHANNEL: u16 = 256;
 const PENDING_RX_CAPACITY: usize = 4;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -190,6 +193,35 @@ impl<P: RadioPhy + PlatformServices> PlatformServices for SoftMacCore<P> {
 }
 
 impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
+    pub async fn scan(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
+        if req.scan_duration > 14 {
+            return Err(MacError::InvalidParameter);
+        }
+        if req.scan_type == ScanType::Orphan {
+            return Err(MacError::Unsupported);
+        }
+
+        let original_channel = self.pib.current_channel();
+        self.phy
+            .set_address_filter(None)
+            .map_err(Self::map_phy_error)?;
+
+        let scan_result = self.scan_unfiltered(req).await;
+        let restore_result = self
+            .set_pib(
+                PibAttribute::PhyCurrentChannel,
+                PibValue::U8(original_channel),
+            )
+            .and_then(|()| {
+                self.phy
+                    .set_address_filter(Self::address_filter(&self.pib))
+                    .map_err(Self::map_phy_error)
+            });
+
+        restore_result?;
+        scan_result
+    }
+
     pub async fn transmit_csma(&mut self, frame: &[u8]) -> Result<(), MacError> {
         let mut backoff_count = 0u8;
         let mut backoff_exponent = self.pib.min_be();
@@ -278,6 +310,99 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
         }
         let _ = self.pending_rx.push_back(frame);
     }
+
+    async fn scan_unfiltered(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
+        let duration_us = u32::try_from(scan_duration_us(req.scan_duration))
+            .map_err(|_| MacError::InvalidParameter)?;
+        let mut pan_descriptors = heapless::Vec::new();
+        let mut energy_list = heapless::Vec::new();
+
+        for channel in req.channel_mask.iter() {
+            let channel = channel.number();
+            self.set_pib(PibAttribute::PhyCurrentChannel, PibValue::U8(channel))?;
+
+            match req.scan_type {
+                ScanType::Ed => {
+                    let energy = self
+                        .phy
+                        .energy_detect(duration_us)
+                        .await
+                        .map_err(Self::map_phy_error)?;
+                    let _ = energy_list.push(EdValue { channel, energy });
+                }
+                ScanType::Active => {
+                    let beacon_request = build_beacon_request(self.pib.next_dsn());
+                    self.transmit_csma(&beacon_request).await?;
+                    self.collect_beacons(channel, duration_us, &mut pan_descriptors)
+                        .await?;
+                }
+                ScanType::Passive => {
+                    self.collect_beacons(channel, duration_us, &mut pan_descriptors)
+                        .await?;
+                }
+                ScanType::Orphan => unreachable!(),
+            }
+        }
+
+        if matches!(req.scan_type, ScanType::Active | ScanType::Passive)
+            && pan_descriptors.is_empty()
+        {
+            return Err(MacError::NoBeacon);
+        }
+
+        Ok(MlmeScanConfirm {
+            scan_type: req.scan_type,
+            pan_descriptors,
+            energy_list,
+        })
+    }
+
+    async fn collect_beacons(
+        &mut self,
+        channel: u8,
+        duration_us: u32,
+        descriptors: &mut heapless::Vec<PanDescriptor, { crate::primitives::MAX_PAN_DESCRIPTORS }>,
+    ) -> Result<(), MacError> {
+        let started_at = self.monotonic_micros();
+
+        for _ in 0..MAX_SCAN_FRAMES_PER_CHANNEL {
+            let elapsed = self.monotonic_micros().wrapping_sub(started_at);
+            let Some(remaining) = duration_us.checked_sub(elapsed) else {
+                break;
+            };
+
+            match self.phy.receive(remaining).await {
+                Ok(Some(frame)) => {
+                    if let Some(descriptor) = parse_beacon(channel, frame.as_slice(), frame.lqi) {
+                        Self::upsert_pan_descriptor(descriptors, descriptor);
+                    }
+                }
+                Ok(None) => break,
+                Err(PhyError::CrcFailed) => {}
+                Err(error) => return Err(Self::map_phy_error(error)),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn upsert_pan_descriptor(
+        descriptors: &mut heapless::Vec<PanDescriptor, { crate::primitives::MAX_PAN_DESCRIPTORS }>,
+        descriptor: PanDescriptor,
+    ) {
+        if let Some(existing) = descriptors.iter_mut().find(|existing| {
+            existing.channel == descriptor.channel
+                && existing.coord_address == descriptor.coord_address
+                && existing.zigbee_beacon.extended_pan_id
+                    == descriptor.zigbee_beacon.extended_pan_id
+        }) {
+            if descriptor.lqi > existing.lqi {
+                *existing = descriptor;
+            }
+        } else {
+            let _ = descriptors.push(descriptor);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -291,7 +416,7 @@ mod tests {
 
     use super::*;
     use crate::PhyCapabilities;
-    use zigbee_types::{PanId, ShortAddress};
+    use zigbee_types::{ChannelMask, PanId, ShortAddress};
 
     const IEEE: [u8; 8] = [0x02, 1, 2, 3, 4, 5, 6, 7];
 
@@ -304,6 +429,8 @@ mod tests {
         tx_results: heapless::Deque<Result<(), PhyError>, 8>,
         rx_frames: heapless::Deque<Result<Option<PhyRxFrame>, PhyError>, 8>,
         delayed_us: u32,
+        last_tx: heapless::Vec<u8, { crate::MAX_PHY_FRAME_LEN }>,
+        energy: Result<u8, PhyError>,
     }
 
     impl TestPhy {
@@ -317,6 +444,8 @@ mod tests {
                 tx_results: heapless::Deque::new(),
                 rx_frames: heapless::Deque::new(),
                 delayed_us: 0,
+                last_tx: heapless::Vec::new(),
+                energy: Ok(0),
             }
         }
     }
@@ -326,8 +455,12 @@ mod tests {
             PhyCapabilities::default()
         }
 
-        async fn try_transmit(&mut self, _frame: &[u8]) -> Result<(), PhyError> {
+        async fn try_transmit(&mut self, frame: &[u8]) -> Result<(), PhyError> {
             self.tx_attempts = self.tx_attempts.saturating_add(1);
+            self.last_tx.clear();
+            self.last_tx
+                .extend_from_slice(frame)
+                .map_err(|_| PhyError::FrameTooLong)?;
             self.tx_results.pop_front().unwrap_or(Ok(()))
         }
 
@@ -353,7 +486,7 @@ mod tests {
         }
 
         async fn energy_detect(&mut self, _duration_us: u32) -> Result<u8, PhyError> {
-            Ok(0)
+            self.energy
         }
 
         fn set_address_filter(&mut self, filter: Option<PhyAddressFilter>) -> Result<(), PhyError> {
@@ -553,5 +686,67 @@ mod tests {
             Err(MacError::NoAck)
         );
         assert_eq!(core.phy().tx_attempts, 3);
+    }
+
+    #[test]
+    fn active_scan_collects_beacon_and_restores_radio_config() {
+        let mut core = core();
+        let beacon = [
+            0x00, 0x80, 0x55, 0xE9, 0xDF, 0x2D, 0x7D, 0xFF, 0xCF, 0x00, 0x00, 0x00, 0x22, 0x84, 1,
+            2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0x09,
+        ];
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&beacon, 200).unwrap())))
+            .unwrap();
+        core.phy_mut().rx_frames.push_back(Ok(None)).unwrap();
+
+        let confirm = block_on(core.scan(MlmeScanRequest {
+            scan_type: ScanType::Active,
+            channel_mask: ChannelMask(1 << 15),
+            scan_duration: 3,
+        }))
+        .unwrap();
+
+        assert_eq!(confirm.pan_descriptors.len(), 1);
+        assert_eq!(confirm.pan_descriptors[0].channel, 15);
+        assert_eq!(core.phy().channel, 11);
+        assert!(core.phy().filter.is_some());
+        assert_eq!(&core.phy().last_tx[..3], &[0x03, 0x08, 1]);
+    }
+
+    #[test]
+    fn ed_scan_uses_phy_measurement_and_restores_channel() {
+        let mut core = core();
+        core.phy_mut().energy = Ok(177);
+
+        let confirm = block_on(core.scan(MlmeScanRequest {
+            scan_type: ScanType::Ed,
+            channel_mask: ChannelMask(1 << 20),
+            scan_duration: 2,
+        }))
+        .unwrap();
+
+        assert_eq!(confirm.energy_list.len(), 1);
+        assert_eq!(confirm.energy_list[0].channel, 20);
+        assert_eq!(confirm.energy_list[0].energy, 177);
+        assert_eq!(core.phy().channel, 11);
+    }
+
+    #[test]
+    fn scan_rejects_invalid_duration_without_changing_filter() {
+        let mut core = core();
+        let filter = core.phy().filter;
+
+        assert!(matches!(
+            block_on(core.scan(MlmeScanRequest {
+                scan_type: ScanType::Active,
+                channel_mask: ChannelMask(1 << 15),
+                scan_duration: 15,
+            })),
+            Err(MacError::InvalidParameter)
+        ));
+        assert_eq!(core.phy().filter, filter);
+        assert_eq!(core.phy().channel, 11);
     }
 }
