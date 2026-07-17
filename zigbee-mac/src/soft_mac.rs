@@ -2,7 +2,10 @@
 
 use zigbee_types::MacAddress;
 
-use crate::frames::{build_beacon_request, build_data_frame, parse_beacon, parse_mac_addresses};
+use crate::frames::{
+    build_beacon_request, build_data_frame, build_data_request, build_data_request_short,
+    parse_beacon, parse_mac_addresses,
+};
 use crate::pib::scan_duration_us;
 use crate::{
     EdValue, MacError, MacFrame, MacPib, McpsDataConfirm, McpsDataIndication, McpsDataRequest,
@@ -12,6 +15,7 @@ use crate::{
 
 const UNIT_BACKOFF_PERIOD_US: u32 = 320;
 const ACK_WAIT_US: u32 = 1_200;
+const POLL_RESPONSE_WAIT_US: u32 = 30_000;
 const MAX_ACK_WINDOW_FRAMES: u8 = 16;
 const MAX_SCAN_FRAMES_PER_CHANNEL: u16 = 256;
 const PENDING_RX_CAPACITY: usize = 4;
@@ -198,8 +202,14 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
         &mut self,
         req: McpsDataRequest<'_>,
     ) -> Result<McpsDataConfirm, MacError> {
-        if req.tx_options.indirect || req.tx_options.security_enabled {
+        if req.tx_options.indirect {
             return Err(MacError::Unsupported);
+        }
+        if req.tx_options.security_enabled {
+            return Err(MacError::SecurityError);
+        }
+        if req.src_addr_mode == crate::AddressMode::Short && self.pib.short_address().0 >= 0xFFF8 {
+            return Err(MacError::InvalidParameter);
         }
 
         let ack_requested = req.tx_options.ack_tx
@@ -228,6 +238,55 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
             msdu_handle: req.msdu_handle,
             timestamp: None,
         })
+    }
+
+    pub async fn poll(&mut self) -> Result<Option<MacFrame>, MacError> {
+        let own_short = self.pib.short_address();
+        let own_extended = self.pib.extended_address();
+        let coordinator_short = self.pib.coord_short_address();
+        let coordinator_extended = self.pib.coord_extended_address();
+        let has_short_source = own_short.0 < 0xFFF8;
+        let has_extended_source = own_extended != [0; 8];
+        let coordinator = if coordinator_short.0 < 0xFFF8 {
+            MacAddress::Short(self.pib.pan_id(), coordinator_short)
+        } else if coordinator_extended != [0; 8] {
+            MacAddress::Extended(self.pib.pan_id(), coordinator_extended)
+        } else {
+            return Err(MacError::InvalidParameter);
+        };
+        if !has_short_source && !has_extended_source {
+            return Err(MacError::InvalidParameter);
+        }
+
+        let passes = if has_short_source && has_extended_source {
+            2
+        } else {
+            1
+        };
+        for pass in 0..passes {
+            let sequence = self.pib.next_dsn();
+            let request = if pass == 0 && has_short_source {
+                build_data_request_short(sequence, &coordinator, own_short)
+            } else {
+                build_data_request(sequence, &coordinator, &own_extended)
+            };
+
+            let ack = self.transmit_acknowledged(&request).await?;
+            if let Some(frame) = self.take_pending_data().await? {
+                return Ok(Some(frame));
+            }
+            if !ack.frame_pending {
+                continue;
+            }
+
+            match self.receive_data(POLL_RESPONSE_WAIT_US).await {
+                Ok(indication) => return Ok(Some(indication.payload)),
+                Err(MacError::NoData) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(None)
     }
 
     pub async fn receive_data(&mut self, timeout_us: u32) -> Result<McpsDataIndication, MacError> {
@@ -419,6 +478,15 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
             payload,
             security_use,
         }))
+    }
+
+    async fn take_pending_data(&mut self) -> Result<Option<MacFrame>, MacError> {
+        while let Some(frame) = self.take_pending_rx() {
+            if let Some(indication) = self.process_received_data(frame).await? {
+                return Ok(Some(indication.payload));
+            }
+        }
+        Ok(None)
     }
 
     async fn scan_unfiltered(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
@@ -1011,5 +1079,183 @@ mod tests {
         block_on(core.receive_data(5_000)).unwrap();
 
         assert!(core.phy().sent_acks.is_empty());
+    }
+
+    #[test]
+    fn poll_returns_none_when_parent_ack_has_no_pending_data() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        core.set_pib(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x5678)),
+        )
+        .unwrap();
+        core.set_pib(
+            PibAttribute::MacCoordShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x0000)),
+        )
+        .unwrap();
+        core.set_pib(
+            PibAttribute::MacExtendedAddress,
+            PibValue::ExtendedAddress([0; 8]),
+        )
+        .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap(),
+            )))
+            .unwrap();
+
+        assert!(block_on(core.poll()).unwrap().is_none());
+        assert_eq!(core.phy().tx_attempts, 1);
+    }
+
+    #[test]
+    fn poll_returns_indirect_data_when_frame_pending_is_set() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        core.set_pib(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x5678)),
+        )
+        .unwrap();
+        core.set_pib(
+            PibAttribute::MacCoordShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x0000)),
+        )
+        .unwrap();
+        let incoming = build_data_frame(
+            0x33,
+            AddressMode::Short,
+            ShortAddress(0x0000),
+            &[0; 8],
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
+            &[0xA1, 0xB2],
+            true,
+        )
+        .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x12, 0x00, 0x01], 255).unwrap(),
+            )))
+            .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&incoming, 190).unwrap())))
+            .unwrap();
+
+        let frame = block_on(core.poll()).unwrap().unwrap();
+
+        assert_eq!(frame.as_slice(), [0xA1, 0xB2]);
+        assert_eq!(core.phy().sent_acks.as_slice(), [(0x33, false)]);
+    }
+
+    #[test]
+    fn poll_consumes_data_queued_during_the_ack_window() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        core.set_pib(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x5678)),
+        )
+        .unwrap();
+        core.set_pib(
+            PibAttribute::MacCoordShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x0000)),
+        )
+        .unwrap();
+        let incoming = build_data_frame(
+            0x33,
+            AddressMode::Short,
+            ShortAddress(0x0000),
+            &[0; 8],
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
+            &[0xC3],
+            false,
+        )
+        .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&incoming, 190).unwrap())))
+            .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap(),
+            )))
+            .unwrap();
+
+        let frame = block_on(core.poll()).unwrap().unwrap();
+
+        assert_eq!(frame.as_slice(), [0xC3]);
+        assert!(core.phy().sent_acks.is_empty());
+    }
+
+    #[test]
+    fn poll_falls_back_from_short_to_extended_source_addressing() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        core.set_pib(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x5678)),
+        )
+        .unwrap();
+        core.set_pib(
+            PibAttribute::MacCoordShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x0000)),
+        )
+        .unwrap();
+        core.set_pib(
+            PibAttribute::MacCoordExtendedAddress,
+            PibValue::ExtendedAddress([0x10; 8]),
+        )
+        .unwrap();
+        for sequence in [0x01, 0x02] {
+            core.phy_mut()
+                .rx_frames
+                .push_back(Ok(Some(
+                    PhyRxFrame::from_slice(&[0x02, 0x00, sequence], 255).unwrap(),
+                )))
+                .unwrap();
+        }
+
+        assert!(block_on(core.poll()).unwrap().is_none());
+        assert_eq!(core.phy().tx_attempts, 2);
+        assert_eq!(core.phy().last_tx[2], 0x02);
+        assert_eq!(&core.phy().last_tx[7..15], &IEEE);
+    }
+
+    #[test]
+    fn poll_rejects_missing_coordinator_addresses() {
+        let mut core = core();
+
+        assert!(matches!(
+            block_on(core.poll()),
+            Err(MacError::InvalidParameter)
+        ));
+        assert_eq!(core.phy().tx_attempts, 0);
+    }
+
+    #[test]
+    fn short_source_data_requires_an_assigned_address() {
+        let mut core = core();
+
+        assert!(matches!(
+            block_on(core.transmit_data(McpsDataRequest {
+                src_addr_mode: AddressMode::Short,
+                dst_address: MacAddress::Short(PanId(0x1234), ShortAddress(0x0000)),
+                payload: &[0xAA],
+                msdu_handle: 9,
+                tx_options: TxOptions::default(),
+            })),
+            Err(MacError::InvalidParameter)
+        ));
+        assert_eq!(core.phy().tx_attempts, 0);
     }
 }

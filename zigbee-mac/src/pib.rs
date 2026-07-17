@@ -220,6 +220,14 @@ impl MacPib {
         self.extended_address
     }
 
+    pub fn coord_short_address(&self) -> ShortAddress {
+        self.coord_short_address
+    }
+
+    pub fn coord_extended_address(&self) -> IeeeAddress {
+        self.coord_extended_address
+    }
+
     pub fn promiscuous(&self) -> bool {
         self.promiscuous
     }
