@@ -406,38 +406,10 @@ impl ApsSecurity {
         key: &AesKey,
         security_header: &ApsSecurityHeader,
     ) -> Option<heapless::Vec<u8, 128>> {
-        // ── telink-debug: AES-CCM* decrypt instrumentation ──
-        // BASE = 0x0084_F450 (DBG_BDB_BASE), offsets 0x200..0x21C.
-        #[cfg(feature = "telink-debug")]
-        unsafe {
-            use core::ptr::{read_volatile, write_volatile};
-            // +0x200 entry counter
-            let p = 0x0084_F650usize as *mut u32;
-            write_volatile(p, read_volatile(p).wrapping_add(1));
-            // +0x21C last ct_len (raw, before any guard)
-            write_volatile(0x0084_F66Cusize as *mut u32, ciphertext.len() as u32);
-        }
-        // Defensive size guard — MIC is 4 bytes (ENC-MIC-32).
-        // Without this, ct_len=0 would underflow inside aps_aes_ccm_decrypt
-        // (it already returns None for <4, but bump a marker first so we see it).
         if ciphertext.len() < 4 {
-            #[cfg(feature = "telink-debug")]
-            unsafe {
-                use core::ptr::{read_volatile, write_volatile};
-                // +0x220 short-ciphertext rejection counter
-                let p = 0x0084_F670usize as *mut u32;
-                write_volatile(p, read_volatile(p).wrapping_add(1));
-            }
             return None;
         }
         let nonce = self.build_nonce(security_header);
-        #[cfg(feature = "telink-debug")]
-        unsafe {
-            use core::ptr::{read_volatile, write_volatile};
-            // +0x204 post build_nonce
-            let p = 0x0084_F654usize as *mut u32;
-            write_volatile(p, read_volatile(p).wrapping_add(1));
-        }
         #[cfg(feature = "defmt")]
         {
             defmt::info!("[APS-SEC] key: {:02x}", key);
@@ -453,31 +425,7 @@ impl ApsSecurity {
                 ciphertext
             );
         }
-        #[cfg(feature = "telink-debug")]
-        unsafe {
-            use core::ptr::{read_volatile, write_volatile};
-            // +0x208 about to call aps_aes_ccm_decrypt
-            let p = 0x0084_F658usize as *mut u32;
-            write_volatile(p, read_volatile(p).wrapping_add(1));
-        }
-        let ret = aps_aes_ccm_decrypt(key, &nonce, aps_header, ciphertext);
-        #[cfg(feature = "telink-debug")]
-        unsafe {
-            use core::ptr::{read_volatile, write_volatile};
-            // +0x218 decrypt returned (regardless of Some/None)
-            let p = 0x0084_F668usize as *mut u32;
-            write_volatile(p, read_volatile(p).wrapping_add(1));
-            // +0x214 result classifier: 0xAA = Some, 0xFF = None
-            write_volatile(
-                0x0084_F664usize as *mut u32,
-                if ret.is_some() {
-                    0x0000_00AA
-                } else {
-                    0x0000_00FF
-                },
-            );
-        }
-        ret
+        aps_aes_ccm_decrypt(key, &nonce, aps_header, ciphertext)
     }
 
     /// Build CCM* nonce from APS security header.
@@ -495,11 +443,6 @@ impl ApsSecurity {
         let actual_sc = (hdr.security_control & !0x07) | SEC_LEVEL_ENC_MIC_32;
         nonce[12] = actual_sc;
         nonce
-    }
-
-    /// Same as build_nonce but public, for debug tracing.
-    pub fn build_nonce_debug(&self, hdr: &ApsSecurityHeader) -> [u8; 13] {
-        self.build_nonce(hdr)
     }
 }
 
@@ -678,31 +621,12 @@ fn aps_aes_ccm_decrypt(
     aad: &[u8],
     ciphertext_and_mic: &[u8],
 ) -> Option<heapless::Vec<u8, 128>> {
-    #[cfg(feature = "telink-debug")]
-    unsafe {
-        use core::ptr::{read_volatile, write_volatile};
-        // +0x20C aps_aes_ccm_decrypt entry
-        let p = 0x0084_F65Cusize as *mut u32;
-        write_volatile(p, read_volatile(p).wrapping_add(1));
-    }
     if ciphertext_and_mic.len() < 4 {
         return None;
     }
     let mic_start = ciphertext_and_mic.len() - 4;
     if mic_start > 124 {
         return None;
-    }
-
-    #[cfg(feature = "telink-debug")]
-    unsafe {
-        use core::ptr::{read_volatile, write_volatile};
-        // +0x210 about to enter hand-rolled CCM*
-        let p = 0x0084_F660usize as *mut u32;
-        write_volatile(p, read_volatile(p).wrapping_add(1));
-        // +0x224 SP at hand-rolled CCM* entry (should now stay > 0x84B400)
-        let sp: u32;
-        core::arch::asm!("mov {0}, sp", out(reg) sp);
-        write_volatile(0x0084_F674usize as *mut u32, sp);
     }
 
     let cipher = Aes128::new(GenericArray::from_slice(key));
@@ -712,143 +636,7 @@ fn aps_aes_ccm_decrypt(
     buf[..mic_start].copy_from_slice(&ciphertext_and_mic[..mic_start]);
     ccm_ctr_xor(&cipher, nonce, &mut buf[..mic_start]);
 
-    // ── Cycle 22: stepwise CBC-MAC with on-device intermediate trace ──
-    // We compute the MAC inline (instead of via ccm_mac) so we can capture
-    // T at AAD/payload boundaries plus B0, B1, S0, computed/received MIC.
-    // First-call-wins so the snapshot stays correlated with a single frame.
-    //
-    // Trace layout (BDB_BASE = 0x0084_F450):
-    //   +0x270..+0x27F = B0 block (16 B)
-    //   +0x280..+0x28F = B1 block (16 B: AAD-len-prefix(2 BE) ‖ first 14 B AAD)
-    //   +0x290..+0x29F = T after AAD pass (16 B)
-    //   +0x2A0..+0x2AF = T after payload pass (16 B)
-    //   +0x2B0..+0x2BF = S0 = AES(K, A_0) (16 B)
-    //   +0x2C0..+0x2C3 = computed MIC (4 B)
-    //   +0x2C4..+0x2C7 = received MIC (4 B)
-    //   +0x2C8         = match flag (0x01 OK, 0x00 fail)
-    //   +0x2D0..+0x2DE = AAD as fed (15 B)
-    //   +0x2DC         = one-shot guard (u32, 0xC22BCED if taken)
-    #[cfg(feature = "telink-debug")]
-    let trace_this = unsafe {
-        use core::ptr::{read_volatile, write_volatile};
-        let guard_p = 0x0084_F72Cusize as *mut u32; // BDB+0x2DC
-        if read_volatile(guard_p) != 0xC22B_CED5 {
-            write_volatile(guard_p, 0xC22B_CED5);
-            true
-        } else {
-            false
-        }
-    };
-    #[cfg(not(feature = "telink-debug"))]
-    let trace_this = false;
-
-    let t = if trace_this {
-        #[cfg(feature = "telink-debug")]
-        unsafe {
-            use core::ptr::write_volatile;
-            const BDB_BASE: usize = 0x0084_F450;
-
-            // Build B0.
-            let mut b0 = [0u8; 16];
-            b0[0] = if aad.is_empty() {
-                CCM_B0_FLAGS_NO_ADATA
-            } else {
-                CCM_B0_FLAGS_ADATA
-            };
-            b0[1..14].copy_from_slice(nonce);
-            let mlen = mic_start as u16;
-            b0[14] = (mlen >> 8) as u8;
-            b0[15] = mlen as u8;
-            for i in 0..16 {
-                write_volatile((BDB_BASE + 0x270 + i) as *mut u8, b0[i]);
-            }
-
-            // Build B1 (only meaningful when AAD present).
-            let mut b1 = [0u8; 16];
-            if !aad.is_empty() {
-                let alen = aad.len() as u16;
-                b1[0] = (alen >> 8) as u8;
-                b1[1] = alen as u8;
-                let first = core::cmp::min(aad.len(), 14);
-                b1[2..2 + first].copy_from_slice(&aad[..first]);
-            }
-            for i in 0..16 {
-                write_volatile((BDB_BASE + 0x280 + i) as *mut u8, b1[i]);
-            }
-
-            // Stepwise CBC-MAC.
-            let mut t = b0;
-            aes_enc(&cipher, &mut t);
-            if !aad.is_empty() {
-                mac_fold(&cipher, &mut t, &b1);
-                let mut off = core::cmp::min(aad.len(), 14);
-                while off < aad.len() {
-                    let mut blk = [0u8; 16];
-                    let n = core::cmp::min(16, aad.len() - off);
-                    blk[..n].copy_from_slice(&aad[off..off + n]);
-                    mac_fold(&cipher, &mut t, &blk);
-                    off += n;
-                }
-            }
-            // Snapshot T after AAD pass.
-            for i in 0..16 {
-                write_volatile((BDB_BASE + 0x290 + i) as *mut u8, t[i]);
-            }
-
-            // Payload blocks.
-            let payload = &buf[..mic_start];
-            let mut off = 0;
-            while off < payload.len() {
-                let mut blk = [0u8; 16];
-                let n = core::cmp::min(16, payload.len() - off);
-                blk[..n].copy_from_slice(&payload[off..off + n]);
-                mac_fold(&cipher, &mut t, &blk);
-                off += n;
-            }
-            // Snapshot T after payload pass.
-            for i in 0..16 {
-                write_volatile((BDB_BASE + 0x2A0 + i) as *mut u8, t[i]);
-            }
-
-            // S0 = AES(K, A_0).
-            let mut s0 = build_ai(nonce, 0);
-            aes_enc(&cipher, &mut s0);
-            for i in 0..16 {
-                write_volatile((BDB_BASE + 0x2B0 + i) as *mut u8, s0[i]);
-            }
-
-            // Computed MIC.
-            let mut computed = [0u8; 4];
-            for i in 0..4 {
-                computed[i] = t[i] ^ s0[i];
-            }
-            for i in 0..4 {
-                write_volatile((BDB_BASE + 0x2C0 + i) as *mut u8, computed[i]);
-            }
-            // Received MIC.
-            for i in 0..4 {
-                write_volatile(
-                    (BDB_BASE + 0x2C4 + i) as *mut u8,
-                    ciphertext_and_mic[mic_start + i],
-                );
-            }
-            // Match flag (write before later early return).
-            let ok = ct_eq4(&computed, &ciphertext_and_mic[mic_start..mic_start + 4]);
-            write_volatile((BDB_BASE + 0x2C8) as *mut u8, if ok { 0x01 } else { 0x00 });
-
-            // AAD as fed.
-            let an = aad.len().min(15);
-            for i in 0..an {
-                write_volatile((BDB_BASE + 0x2D0 + i) as *mut u8, aad[i]);
-            }
-
-            t
-        }
-        #[cfg(not(feature = "telink-debug"))]
-        unreachable!()
-    } else {
-        ccm_mac(&cipher, nonce, aad, &buf[..mic_start])
-    };
+    let t = ccm_mac(&cipher, nonce, aad, &buf[..mic_start]);
 
     // Expected MIC = T[0..4] XOR S0[0..4].
     let mut s0 = build_ai(nonce, 0);
@@ -957,26 +745,6 @@ mod ccm_tests {
 ///
 /// Input is padded per B.6: append 0x80, zeros, then 16-bit big-endian bit-length.
 fn matyas_meyer_oseas_hash(data: &[u8]) -> [u8; 16] {
-    // ── telink-debug: MMO loop instrumentation ──
-    // BASE = 0x0084_F700 (256 B free region between BDB markers and raw_dec_dbg).
-    // All writes are raw volatile to absolute SRAM, no helper-fn stack pressure.
-    #[cfg(feature = "telink-debug")]
-    unsafe {
-        use core::ptr::{read_volatile, write_volatile};
-        // +0x20 matyas enter counter
-        let p = 0x0084_F720usize as *mut u32;
-        write_volatile(p, read_volatile(p).wrapping_add(1));
-        // +0x24 last data.len
-        write_volatile(0x0084_F724usize as *mut u32, data.len() as u32);
-        // +0x784 matyas SP at entry (min-tracking)
-        let sp: u32;
-        core::arch::asm!("mov {0}, sp", out(reg) sp);
-        let p = 0x0084_F784usize as *mut u32;
-        if sp < read_volatile(p) {
-            write_volatile(p, sp);
-        }
-    }
-
     let bit_len = (data.len() as u16).wrapping_mul(8);
 
     // Build padded message: data || 0x80 || zeros || bit_len_be16
@@ -988,113 +756,17 @@ fn matyas_meyer_oseas_hash(data: &[u8]) -> [u8; 16] {
     padded[padded_len - 2] = (bit_len >> 8) as u8;
     padded[padded_len - 1] = bit_len as u8;
 
-    #[cfg(feature = "telink-debug")]
-    unsafe {
-        use core::ptr::{read_volatile, write_volatile};
-        // +0x28 pre-loop bump
-        let p = 0x0084_F728usize as *mut u32;
-        write_volatile(p, read_volatile(p).wrapping_add(1));
-        // +0x2C padded_len
-        write_volatile(0x0084_F72Cusize as *mut u32, padded_len as u32);
-        // +0x788 matyas SP after [u8;80] padded decl (min)
-        let sp: u32;
-        core::arch::asm!("mov {0}, sp", out(reg) sp);
-        let p = 0x0084_F788usize as *mut u32;
-        if sp < read_volatile(p) {
-            write_volatile(p, sp);
-        }
-    }
-
     let mut hash = [0u8; 16];
 
-    let mut _iter_idx: u32 = 0;
     for chunk in padded[..padded_len].chunks(16) {
-        #[cfg(feature = "telink-debug")]
-        unsafe {
-            use core::ptr::{read_volatile, write_volatile};
-            // +0x30 per-iter counter
-            let p = 0x0084_F730usize as *mut u32;
-            write_volatile(p, read_volatile(p).wrapping_add(1));
-            // +0x34 last iter idx (entry)
-            write_volatile(0x0084_F734usize as *mut u32, _iter_idx);
-            // +0x38 pre-AES bump, +0x3C iter idx
-            let p = 0x0084_F738usize as *mut u32;
-            write_volatile(p, read_volatile(p).wrapping_add(1));
-            write_volatile(0x0084_F73Cusize as *mut u32, _iter_idx);
-        }
-
         let cipher = <Aes128 as KeyInit>::new(GenericArray::from_slice(&hash));
-        #[cfg(feature = "telink-debug")]
-        unsafe {
-            use core::ptr::{read_volatile, write_volatile};
-            // +0x78C matyas SP after Aes128::new (key expansion done) (min)
-            let sp: u32;
-            core::arch::asm!("mov {0}, sp", out(reg) sp);
-            let p = 0x0084_F78Cusize as *mut u32;
-            if sp < read_volatile(p) {
-                write_volatile(p, sp);
-            }
-        }
         let mut block = GenericArray::clone_from_slice(chunk);
-        #[cfg(feature = "telink-debug")]
-        unsafe {
-            use core::ptr::{read_volatile, write_volatile};
-            // +0x790 matyas SP just before encrypt_block (deepest expected) (min)
-            let sp: u32;
-            core::arch::asm!("mov {0}, sp", out(reg) sp);
-            let p = 0x0084_F790usize as *mut u32;
-            if sp < read_volatile(p) {
-                write_volatile(p, sp);
-            }
-        }
         cipher.encrypt_block(&mut block);
-        #[cfg(feature = "telink-debug")]
-        unsafe {
-            use core::ptr::{read_volatile, write_volatile};
-            // +0x794 matyas SP right after encrypt_block returns (min)
-            let sp: u32;
-            core::arch::asm!("mov {0}, sp", out(reg) sp);
-            let p = 0x0084_F794usize as *mut u32;
-            if sp < read_volatile(p) {
-                write_volatile(p, sp);
-            }
-        }
-
-        #[cfg(feature = "telink-debug")]
-        unsafe {
-            use core::ptr::{read_volatile, write_volatile};
-            // +0x40 post-AES bump, +0x44 iter idx
-            let p = 0x0084_F740usize as *mut u32;
-            write_volatile(p, read_volatile(p).wrapping_add(1));
-            write_volatile(0x0084_F744usize as *mut u32, _iter_idx);
-        }
 
         // H_i = E(H_{i-1}, M_i) XOR M_i
         for j in 0..16 {
             hash[j] = block[j] ^ chunk[j];
         }
-
-        #[cfg(feature = "telink-debug")]
-        unsafe {
-            use core::ptr::{read_volatile, write_volatile};
-            // +0x48 post-XOR bump, +0x4C iter idx
-            let p = 0x0084_F748usize as *mut u32;
-            write_volatile(p, read_volatile(p).wrapping_add(1));
-            write_volatile(0x0084_F74Cusize as *mut u32, _iter_idx);
-        }
-
-        _iter_idx = _iter_idx.wrapping_add(1);
-    }
-
-    #[cfg(feature = "telink-debug")]
-    unsafe {
-        use core::ptr::{read_volatile, write_volatile};
-        // +0x50 loop-exit bump
-        let p = 0x0084_F750usize as *mut u32;
-        write_volatile(p, read_volatile(p).wrapping_add(1));
-        // +0x58 matyas exit bump
-        let p = 0x0084_F758usize as *mut u32;
-        write_volatile(p, read_volatile(p).wrapping_add(1));
     }
 
     hash
@@ -1104,43 +776,6 @@ fn matyas_meyer_oseas_hash(data: &[u8]) -> [u8; 16] {
 ///
 /// HMAC(Key, M) = Hash( (Key XOR opad) || Hash( (Key XOR ipad) || M ) )
 fn hmac_mmo(key: &[u8; 16], message: &[u8]) -> [u8; 16] {
-    #[cfg(feature = "telink-debug")]
-    unsafe {
-        use core::ptr::{read_volatile, write_volatile};
-        // One-shot zero-init guard at +0x7C (magic 0xBEEF_F00D once initialized).
-        // On first call, zero the 128-byte counter region (+0x00..+0x80) AND
-        // initialize the 8 SP-min slots at +0x780..+0x7A0 to 0xFFFF_FFFF so
-        // subsequent min-tracking writes are meaningful. The .debug_sram
-        // NOLOAD region is NOT cleared at cold boot.
-        let guard = 0x0084_F77Cusize as *mut u32;
-        if read_volatile(guard) != 0xBEEF_F00D {
-            for off in (0..0x80usize).step_by(4) {
-                write_volatile((0x0084_F700usize + off) as *mut u32, 0u32);
-            }
-            for off in (0..0x20usize).step_by(4) {
-                write_volatile((0x0084_F780usize + off) as *mut u32, 0xFFFF_FFFFu32);
-            }
-            write_volatile(guard, 0xBEEF_F00D);
-        }
-        // +0x00 hmac enter counter, +0x04 last message.len
-        let p = 0x0084_F700usize as *mut u32;
-        write_volatile(p, read_volatile(p).wrapping_add(1));
-        write_volatile(0x0084_F704usize as *mut u32, message.len() as u32);
-        // +0x780 hmac SP at entry (min-tracking)
-        let sp: u32;
-        core::arch::asm!("mov {0}, sp", out(reg) sp);
-        let p = 0x0084_F780usize as *mut u32;
-        if sp < read_volatile(p) {
-            write_volatile(p, sp);
-        }
-        // +0x798 hmac SP max-seen (high-water = stack baseline pre-call)
-        let p = 0x0084_F798usize as *mut u32;
-        let cur_max = read_volatile(p);
-        if cur_max == 0xFFFF_FFFF || sp > cur_max {
-            write_volatile(p, sp);
-        }
-    }
-
     let mut ipad_key = [0x36u8; 16];
     let mut opad_key = [0x5Cu8; 16];
     for i in 0..16 {
@@ -1155,29 +790,11 @@ fn hmac_mmo(key: &[u8; 16], message: &[u8]) -> [u8; 16] {
     inner_input[16..inner_len].copy_from_slice(message);
     let inner_hash = matyas_meyer_oseas_hash(&inner_input[..inner_len]);
 
-    #[cfg(feature = "telink-debug")]
-    unsafe {
-        use core::ptr::{read_volatile, write_volatile};
-        // +0x08 hmac after_inner counter
-        let p = 0x0084_F708usize as *mut u32;
-        write_volatile(p, read_volatile(p).wrapping_add(1));
-    }
-
     // Outer hash: Hash(opad_key || inner_hash)
     let mut outer_input = [0u8; 32];
     outer_input[..16].copy_from_slice(&opad_key);
     outer_input[16..32].copy_from_slice(&inner_hash);
-    let result = matyas_meyer_oseas_hash(&outer_input);
-
-    #[cfg(feature = "telink-debug")]
-    unsafe {
-        use core::ptr::{read_volatile, write_volatile};
-        // +0x10 hmac exit counter
-        let p = 0x0084_F710usize as *mut u32;
-        write_volatile(p, read_volatile(p).wrapping_add(1));
-    }
-
-    result
+    matyas_meyer_oseas_hash(&outer_input)
 }
 
 /// Derive Key-Transport Key from TC link key (Zigbee spec §4.5.3.4).
@@ -1200,74 +817,6 @@ pub fn derive_key_load_key(link_key: &AesKey) -> AesKey {
 /// separate command field and is not part of the keyed-hash input.
 pub fn derive_verify_key_hash(link_key: &AesKey) -> AesKey {
     hmac_mmo(link_key, &[0x03])
-}
-
-/// telink-debug only: force HMAC-MMO to execute once at boot so SP-min
-/// captures at +0x780..+0x798 are populated even if the join handshake
-/// never completes. Bypasses the hardcoded KT shortcut in
-/// `derive_key_transport_key` to exercise the real code path.
-///
-/// Returns the computed [Key-Transport Key, Key-Load Key, Verify-Key hash]
-/// triplet so the call cannot be optimized away. The caller is expected
-/// to use `core::hint::black_box` on the result.
-#[cfg(feature = "telink-debug")]
-pub fn telink_debug_probe_mmo() -> ([u8; 16], [u8; 16], [u8; 16]) {
-    // ZigBeeAlliance09 default global link key
-    let zba09: AesKey = [
-        0x5A, 0x69, 0x67, 0x42, 0x65, 0x65, 0x41, 0x6C, 0x6C, 0x69, 0x61, 0x6E, 0x63, 0x65, 0x30,
-        0x39,
-    ];
-
-    // SRAM dump layout (survives main_loop's clear_words wipe at 0x84F100..F780):
-    //   0x84F7A0..7AF : KT result
-    //   0x84F7B0..7BF : KL result
-    //   0x84F7C0..7CF : Verify-Key result
-    //   0x84F7D0      : status bits (b0=pre-KT, b1=post-KT, b2=post-KL, b3=post-VK)
-    //   0x84F7E0..7EF : KT reference   (4B AB 0F 17 3E 14 34 A2 D5 72 E1 C1 EF 47 87 82)
-    //   0x84F7F0..7FF : VK reference (1A B1 28 DF 16 39 A1 24 6A AB A7 2A 6A 55 91 24)
-
-    const STATUS: *mut u8 = 0x0084_F7D0 as *mut u8;
-    unsafe {
-        // Zero status & output regions so partial writes are visible.
-        for off in 0xA0u32..=0xD0 {
-            core::ptr::write_volatile((0x0084_F700 + off) as *mut u8, 0);
-        }
-        core::ptr::write_volatile(STATUS, 0x01); // entered probe
-    }
-
-    let kt = hmac_mmo(&zba09, &[0x00]);
-    unsafe {
-        core::ptr::write_volatile(0x0084_F7A0 as *mut [u8; 16], kt);
-        core::ptr::write_volatile(STATUS, 0x03); // KT done
-    }
-
-    let kl = hmac_mmo(&zba09, &[0x02]);
-    unsafe {
-        core::ptr::write_volatile(0x0084_F7B0 as *mut [u8; 16], kl);
-        core::ptr::write_volatile(STATUS, 0x07); // KL done
-    }
-
-    let vk = derive_verify_key_hash(&zba09);
-    unsafe {
-        core::ptr::write_volatile(0x0084_F7C0 as *mut [u8; 16], vk);
-        core::ptr::write_volatile(STATUS, 0x0F); // VK done
-    }
-
-    // Write references for in-dump diff (no host-side lookup required).
-    unsafe {
-        let kt_ref: [u8; 16] = [
-            0x4B, 0xAB, 0x0F, 0x17, 0x3E, 0x14, 0x34, 0xA2, 0xD5, 0x72, 0xE1, 0xC1, 0xEF, 0x47,
-            0x87, 0x82,
-        ];
-        let vk_ref: [u8; 16] = [
-            0x1A, 0xB1, 0x28, 0xDF, 0x16, 0x39, 0xA1, 0x24, 0x6A, 0xAB, 0xA7, 0x2A, 0x6A, 0x55,
-            0x91, 0x24,
-        ];
-        core::ptr::write_volatile(0x0084_F7E0 as *mut [u8; 16], kt_ref);
-        core::ptr::write_volatile(0x0084_F7F0 as *mut [u8; 16], vk_ref);
-    }
-
-    (kt, kl, vk)
 }
 
 #[cfg(test)]

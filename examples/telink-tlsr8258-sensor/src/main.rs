@@ -391,12 +391,6 @@ core::arch::global_asm!(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _rust_entry() -> ! {
     chip_init();
-    #[cfg(feature = "telink-stack-debug")]
-    {
-        // Populate the lab-only HMAC-MMO stack captures before commissioning.
-        let triplet = zigbee_aps::security::telink_debug_probe_mmo();
-        core::hint::black_box(triplet);
-    }
     main_loop();
 }
 
@@ -6848,29 +6842,9 @@ fn main_loop() -> ! {
     radio::set_rx_dma_config(144);
 
     board::LED_RED.write(true);
-    // Clear the full diagnostic SRAM window. TLSR8258 does NOT zero SRAM on
-    // soft reset, so without this every dump is a superposition of markers
-    // from this boot and from all previous boots since power-on, making any
-    // diagnosis unreliable. 384 words = 1536 bytes covers DBG_MODE_BASE
-    // through DBG_MODE_BASE+0x5FF, including BDB tlnk_dbg at 0x0084_F450
-    // +0x00..+0xFF (= MODE_BASE+0x350..+0x44F). Previously 256 words (1024B)
-    // stopped at 0x84F500, leaving BDB +0xB0..+0xFF uncleared and producing
-    // garbage in last-frame-wins markers like +0xC0/+0xC4.
-    // Cycle 22: bumped 384 -> 416 words (1536 -> 1664 B) to extend the cleared
-    // window to 0x0084_F100..0x0084_F740, covering the CCM* intermediate trace
-    // region at BDB+0x270..+0x2DF (0x0084_F6C0..0x0084_F72F) and its one-shot
-    // guard at BDB+0x2D8.
+    // TLSR8258 does not clear retained SRAM on soft reset, so reset the
+    // example-owned diagnostic window before recording this boot.
     clear_words(DBG_MODE_BASE, 416);
-    // Cycle 22: clear raw_dec_full capture region (0x0084_FB80..+0xD0 = 52 u32)
-    // so its slot counter starts at 0 and magic word starts unset. Two 96-byte
-    // slots hold full ciphertext+MIC (≤50 B) for offline AES-CCM* MIC verify.
-    clear_words(0x0084_FB80, 52);
-    // Cycle 22: also clear raw_frame_dbg region (0x0084_FA80..+0x80 = 32 u32)
-    // so its first-frame-wins magic word starts unset on a cold boot.
-    clear_words(0x0084_FA80, 32);
-    // Also clear NWK TX wire-capture region (0x0084_FB00..+0x70 = 28 u32) so
-    // the first-call guard at +0x60 starts at 0 (== "not yet captured").
-    clear_words(0x0084_FB00, 28);
     mark32(DBG_MODE_BASE + 0x00, 0xD1A60000);
 
     // ── Stack high-water instrumentation ──────────────────────────────────

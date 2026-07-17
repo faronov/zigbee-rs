@@ -26,11 +26,8 @@ default = ["runtime-sensor"]
 diag-beacon = []
 diag-assoc = []
 diag-smoke = []
-sensor = ["telink-stack-debug"]
+sensor = []
 runtime-sensor = []
-telink-stack-debug = [
-    "zigbee-aps/telink-debug",
-]
 
 [profile.release]
 opt-level = "s"
