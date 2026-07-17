@@ -19,6 +19,10 @@
 //! - nRF52840-DK, nRF52840-Dongle, Seeed XIAO nRF52840
 //! - nRF52833-DK
 
+mod radio_phy;
+
+pub use radio_phy::{NrfRadioPhy, NrfSoftMac};
+
 use crate::frames::{
     addressing_size, build_association_request, build_beacon_request, build_data_frame,
     build_data_request, build_data_request_short, build_disassociation_notification, parse_beacon,
