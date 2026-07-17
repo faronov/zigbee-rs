@@ -335,17 +335,6 @@ fn aes_ccm_encrypt(
     aad: &[u8],
     plaintext: &[u8],
 ) -> Option<heapless::Vec<u8, 128>> {
-    #[cfg(feature = "telink-debug")]
-    unsafe {
-        use core::ptr::{read_volatile, write_volatile};
-        // BDB+0x244 NWK CCM encrypt entries
-        let p = 0x0084_F694usize as *mut u32;
-        write_volatile(p, read_volatile(p).wrapping_add(1));
-        // BDB+0x248 SP at NWK CCM encrypt entry (verify in-stack)
-        let sp: u32;
-        core::arch::asm!("mov {0}, sp", out(reg) sp);
-        write_volatile(0x0084_F698usize as *mut u32, sp);
-    }
     if plaintext.len() > 124 {
         return None;
     }
@@ -367,13 +356,6 @@ fn aes_ccm_encrypt(
     let mut out = heapless::Vec::new();
     out.extend_from_slice(&buf[..plaintext.len()]).ok()?;
     out.extend_from_slice(&mic).ok()?;
-    #[cfg(feature = "telink-debug")]
-    unsafe {
-        use core::ptr::{read_volatile, write_volatile};
-        // BDB+0x24C NWK CCM encrypt successful exits
-        let p = 0x0084_F69Cusize as *mut u32;
-        write_volatile(p, read_volatile(p).wrapping_add(1));
-    }
     Some(out)
 }
 

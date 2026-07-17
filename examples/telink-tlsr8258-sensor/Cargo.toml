@@ -29,7 +29,6 @@ diag-smoke = []
 sensor = ["telink-stack-debug"]
 runtime-sensor = []
 telink-stack-debug = [
-    "zigbee-nwk/telink-debug",
     "zigbee-aps/telink-debug",
     "zigbee-zdo/telink-debug",
     "zigbee-bdb/telink-debug",
