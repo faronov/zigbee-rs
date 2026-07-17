@@ -485,7 +485,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 hdr_len,
                 capture_security_header_len,
                 capture_frame_counter,
-                self.mac.monotonic_micros().unwrap_or(u32::MAX),
+                self.mac.monotonic_micros(),
                 payload,
                 &nwk_buf[..total_len],
             );

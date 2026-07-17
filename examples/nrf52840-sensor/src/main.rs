@@ -31,7 +31,7 @@ use embassy_nrf::saadc::{self, ChannelConfig, Saadc, VddInput};
 use embassy_nrf::temp::Temp;
 #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
 use embassy_nrf::twim::{self, Twim};
-use embassy_nrf::{self as _, bind_interrupts, gpio, peripherals, radio};
+use embassy_nrf::{self as _, bind_interrupts, gpio, peripherals, radio, rng};
 use embassy_time::{Duration, Instant, Timer};
 
 use defmt::*;
@@ -101,6 +101,7 @@ const I2C_SENSOR_ADDR: u8 = {
 #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
 bind_interrupts!(struct Irqs {
     RADIO => radio::InterruptHandler<peripherals::RADIO>;
+    RNG => rng::InterruptHandler<peripherals::RNG>;
     TEMP => embassy_nrf::temp::InterruptHandler;
     SAADC => saadc::InterruptHandler;
 });
@@ -108,6 +109,7 @@ bind_interrupts!(struct Irqs {
 #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
 bind_interrupts!(struct Irqs {
     RADIO => radio::InterruptHandler<peripherals::RADIO>;
+    RNG => rng::InterruptHandler<peripherals::RNG>;
     SAADC => saadc::InterruptHandler;
     TWISPI0 => twim::InterruptHandler<peripherals::TWISPI0>;
 });
@@ -226,7 +228,8 @@ async fn main(_spawner: Spawner) {
 
     // Radio + MAC
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
-    let mut mac = zigbee_mac::nrf::NrfMac::new(radio);
+    let rng = rng::Rng::new(p.RNG, Irqs);
+    let mut mac = zigbee_mac::nrf::NrfMac::new(radio, rng);
     mac.set_tx_power(0);
     info!("Radio ready (TX 0 dBm)");
 

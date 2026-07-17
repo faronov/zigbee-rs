@@ -165,17 +165,17 @@ const TCLK_EXCHANGE_ATTEMPTS: u8 = 4;
 const TCLK_EXCHANGE_START_DELAY_US: u32 = 1_200_000;
 const TCLK_EXCHANGE_TIMEOUT_US: u32 = 5_000_000;
 const TCLK_EXCHANGE_POLL_INTERVAL_US: u32 = 50_000;
-const TCLK_EXCHANGE_FALLBACK_ROUNDS: u16 = 100;
 const TCLK_MIN_STACK_REVISION: u8 = 21;
 
 impl<M: MacDriver> BdbLayer<M> {
-    fn security_exchange_timed_out(&self, started: Option<u32>, rounds: u16) -> bool {
-        if let (Some(started), Some(now)) = (started, self.zdo.aps().nwk().mac().monotonic_micros())
-        {
-            now.wrapping_sub(started) >= TCLK_EXCHANGE_TIMEOUT_US
-        } else {
-            rounds >= TCLK_EXCHANGE_FALLBACK_ROUNDS
-        }
+    fn security_exchange_timed_out(&self, started: u32) -> bool {
+        self.zdo
+            .aps()
+            .nwk()
+            .mac()
+            .monotonic_micros()
+            .wrapping_sub(started)
+            >= TCLK_EXCHANGE_TIMEOUT_US
     }
 
     async fn receive_security_exchange_frame(&mut self) -> bool {
@@ -216,7 +216,7 @@ impl<M: MacDriver> BdbLayer<M> {
 
     async fn wait_for_security_condition(
         &mut self,
-        started: Option<u32>,
+        started: u32,
         rounds: &mut u16,
         mut ready: impl FnMut(&Self) -> bool,
     ) -> bool {
@@ -224,7 +224,7 @@ impl<M: MacDriver> BdbLayer<M> {
             if ready(self) {
                 return true;
             }
-            if self.security_exchange_timed_out(started, *rounds) {
+            if self.security_exchange_timed_out(started) {
                 return false;
             }
 
@@ -234,7 +234,7 @@ impl<M: MacDriver> BdbLayer<M> {
             if ready(self) {
                 return true;
             }
-            if self.security_exchange_timed_out(started, *rounds) {
+            if self.security_exchange_timed_out(started) {
                 return false;
             }
 
@@ -250,14 +250,14 @@ impl<M: MacDriver> BdbLayer<M> {
     async fn wait_for_zdp_response(
         &mut self,
         slot: usize,
-        started: Option<u32>,
+        started: u32,
         rounds: &mut u16,
     ) -> Option<heapless::Vec<u8, 128>> {
         loop {
             if let Some(response) = self.zdo.take_response(slot) {
                 return Some(response);
             }
-            if self.security_exchange_timed_out(started, *rounds) {
+            if self.security_exchange_timed_out(started) {
                 self.zdo.cancel_pending(slot);
                 return None;
             }
@@ -268,7 +268,7 @@ impl<M: MacDriver> BdbLayer<M> {
             if let Some(response) = self.zdo.take_response(slot) {
                 return Some(response);
             }
-            if self.security_exchange_timed_out(started, *rounds) {
+            if self.security_exchange_timed_out(started) {
                 self.zdo.cancel_pending(slot);
                 return None;
             }

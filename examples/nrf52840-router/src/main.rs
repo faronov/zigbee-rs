@@ -28,6 +28,7 @@ use panic_probe as _;
 use embassy_executor::Spawner;
 use embassy_nrf::gpio;
 use embassy_nrf::radio;
+use embassy_nrf::rng;
 use embassy_nrf::{bind_interrupts, peripherals};
 use embassy_time::{Duration, Instant, Timer};
 
@@ -54,6 +55,7 @@ const RX_CHECK_MS: u64 = 50;
 
 bind_interrupts!(struct Irqs {
     RADIO => radio::InterruptHandler<peripherals::RADIO>;
+    RNG => rng::InterruptHandler<peripherals::RNG>;
 });
 
 #[embassy_executor::main]
@@ -79,7 +81,8 @@ async fn main(_spawner: Spawner) {
 
     // Radio
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
-    let mut mac = zigbee_mac::nrf::NrfMac::new(radio);
+    let rng = rng::Rng::new(p.RNG, Irqs);
+    let mut mac = zigbee_mac::nrf::NrfMac::new(radio, rng);
     mac.set_tx_power(0);
     info!("Radio ready (TX 0 dBm)");
 

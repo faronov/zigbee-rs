@@ -218,8 +218,12 @@ impl<M: MacDriver> NwkLayer<M> {
             .map(|ed| ed.channel)
             .unwrap_or(15); // Default to ch 15
 
-        // Generate random PAN ID (avoid 0xFFFF)
-        let pan_id = PanId(generate_pan_id());
+        // Generate a PAN ID from the platform entropy source.
+        let mut pan_id_bytes = [0u8; 2];
+        self.mac
+            .fill_random(&mut pan_id_bytes)
+            .map_err(|_| NwkStatus::StartupFailure)?;
+        let pan_id = PanId(u16::from_le_bytes(pan_id_bytes) & 0x3FFF);
 
         // Configure MAC
         self.mac
@@ -1057,19 +1061,6 @@ impl<M: MacDriver> NwkLayer<M> {
             .map_err(|_| NwkStatus::InvalidRequest)?;
 
         Ok(())
-    }
-}
-
-/// Simple PAN ID generation (should use proper RNG in production).
-fn generate_pan_id() -> u16 {
-    // Use a simple PRNG seed — real implementation should use hardware RNG
-    static mut SEED: u32 = 0xDEAD_BEEF;
-    unsafe {
-        SEED ^= SEED << 13;
-        SEED ^= SEED >> 17;
-        SEED ^= SEED << 5;
-        let pan = (SEED & 0x3FFF) as u16; // Avoid reserved range
-        if pan == 0xFFFF { 0x1234 } else { pan }
     }
 }
 

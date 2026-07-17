@@ -32,7 +32,9 @@ impl<M: MacDriver> BdbLayer<M> {
     /// On success, the device becomes the PAN coordinator and Trust Center.
     pub async fn network_formation(&mut self) -> Result<(), BdbStatus> {
         // Step 1: Verify coordinator capability
-        if self.zdo.nwk().device_type() != DeviceType::Coordinator {
+        if self.zdo.nwk().device_type() != DeviceType::Coordinator
+            || !self.zdo.nwk().mac().capabilities().coordinator
+        {
             log::warn!("[BDB:Formation] Not a coordinator — skipping");
             return Err(BdbStatus::NotPermitted);
         }
@@ -41,6 +43,15 @@ impl<M: MacDriver> BdbLayer<M> {
             log::info!("[BDB:Formation] Already on a network");
             return Ok(());
         }
+
+        // Acquire security material before NLME starts a PAN. If entropy is
+        // unavailable, fail without leaving an active unsecured network.
+        let mut nwk_key = [0u8; 16];
+        self.zdo
+            .nwk_mut()
+            .mac_mut()
+            .fill_random(&mut nwk_key)
+            .map_err(|_| BdbStatus::FormationFailure)?;
 
         log::info!("[BDB:Formation] Forming new network…");
 
@@ -69,7 +80,7 @@ impl<M: MacDriver> BdbLayer<M> {
             {
                 Ok(()) => {
                     log::info!("[BDB:Formation] Network formed on {} channels", set_name);
-                    return self.post_formation_setup().await;
+                    return self.post_formation_setup(nwk_key).await;
                 }
                 Err(e) => {
                     log::debug!(
@@ -87,7 +98,7 @@ impl<M: MacDriver> BdbLayer<M> {
     }
 
     /// Post-formation setup: TC policies, NWK key, permit joining.
-    async fn post_formation_setup(&mut self) -> Result<(), BdbStatus> {
+    async fn post_formation_setup(&mut self, nwk_key: [u8; 16]) -> Result<(), BdbStatus> {
         // Step 3: Set Trust Center policies
         // The coordinator IS the Trust Center in centralized mode.
         log::debug!("[BDB:Formation] Configuring Trust Center policies");
@@ -100,7 +111,6 @@ impl<M: MacDriver> BdbLayer<M> {
         // Step 4: Generate and install NWK key
         // The coordinator must install a network key so that all secured
         // NWK frames can be encrypted. Without this, NWK security is broken.
-        let nwk_key = generate_nwk_key();
         let key_seq: u8 = 0;
         self.zdo
             .nwk_mut()
@@ -133,23 +143,4 @@ impl<M: MacDriver> BdbLayer<M> {
         );
         Ok(())
     }
-}
-
-/// Generate a 128-bit NWK key using a simple PRNG.
-///
-/// **Production note**: this should use a hardware RNG (TRNG) for
-/// cryptographic strength. The xorshift here is a placeholder suitable
-/// for bring-up and testing only.
-fn generate_nwk_key() -> [u8; 16] {
-    static mut SEED: u32 = 0xCAFE_BABE;
-    let mut key = [0u8; 16];
-    for chunk in key.chunks_exact_mut(4) {
-        unsafe {
-            SEED ^= SEED << 13;
-            SEED ^= SEED >> 17;
-            SEED ^= SEED << 5;
-            chunk.copy_from_slice(&SEED.to_le_bytes());
-        }
-    }
-    key
 }

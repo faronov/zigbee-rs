@@ -26,7 +26,7 @@ use crate::frames::{
 };
 use crate::pib::{self, PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
-use crate::{MacCapabilities, MacDriver, MacError};
+use crate::{MacCapabilities, MacDriver, MacError, PlatformServices};
 use zigbee_types::*;
 
 use embassy_futures::select;
@@ -38,8 +38,9 @@ use embassy_nrf52833 as embassy_nrf;
 #[cfg(feature = "nrf52840")]
 use embassy_nrf52840 as embassy_nrf;
 
-use embassy_nrf::radio::Instance;
+use embassy_nrf::radio::Instance as RadioInstance;
 use embassy_nrf::radio::ieee802154::{Packet, Radio};
+use embassy_nrf::rng::{Instance as RngInstance, Rng};
 
 /// nRF52840 802.15.4 MAC driver.
 ///
@@ -53,11 +54,13 @@ use embassy_nrf::radio::ieee802154::{Packet, Radio};
 /// use embassy_nrf::radio::ieee802154::Radio;
 ///
 /// let radio = Radio::new(p.RADIO, Irqs);
-/// let mac = NrfMac::new(radio);
+/// let rng = Rng::new(p.RNG, Irqs);
+/// let mac = NrfMac::new(radio, rng);
 /// let nlme = Nlme::new(storage, mac);
 /// ```
-pub struct NrfMac<'a, T: Instance> {
+pub struct NrfMac<'a, T: RadioInstance, R: RngInstance> {
     radio: Radio<'a, T>,
+    rng: Rng<'a, R>,
     // PIB state
     short_address: ShortAddress,
     pan_id: PanId,
@@ -82,8 +85,8 @@ pub struct NrfMac<'a, T: Instance> {
     random_state: u32,
 }
 
-impl<'a, T: Instance> NrfMac<'a, T> {
-    pub fn new(radio: Radio<'a, T>) -> Self {
+impl<'a, T: RadioInstance, R: RngInstance> NrfMac<'a, T, R> {
+    pub fn new(radio: Radio<'a, T>, rng: Rng<'a, R>) -> Self {
         // Read factory-programmed IEEE address from FICR registers
         let ieee = Self::read_ficr_ieee();
         log::info!(
@@ -104,6 +107,7 @@ impl<'a, T: Instance> NrfMac<'a, T> {
 
         Self {
             radio,
+            rng,
             short_address: ShortAddress(0xFFFF),
             pan_id: PanId(0xFFFF),
             channel: 11,
@@ -334,7 +338,7 @@ impl<'a, T: Instance> NrfMac<'a, T> {
 
 // ── MacDriver implementation ────────────────────────────────────
 
-impl<T: Instance> MacDriver for NrfMac<'_, T> {
+impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
     async fn mlme_scan(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
         let mut pan_descriptors = heapless::Vec::new();
         let energy_list = heapless::Vec::new();
@@ -951,17 +955,24 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             tx_power_max: TxPower(8), // nRF52840: -20 to +8 dBm
         }
     }
+}
 
-    fn monotonic_micros(&self) -> Option<u32> {
-        Some(embassy_time::Instant::now().as_micros() as u32)
+impl<T: RadioInstance, R: RngInstance> PlatformServices for NrfMac<'_, T, R> {
+    fn monotonic_micros(&self) -> u32 {
+        embassy_time::Instant::now().as_micros() as u32
     }
 
     async fn delay_micros(&mut self, duration_us: u32) {
         Timer::after_micros(duration_us as u64).await;
     }
+
+    fn fill_random(&mut self, output: &mut [u8]) -> Result<(), MacError> {
+        self.rng.blocking_fill_bytes(output);
+        Ok(())
+    }
 }
 
-impl<T: Instance> NrfMac<'_, T> {
+impl<T: RadioInstance, R: RngInstance> NrfMac<'_, T, R> {
     async fn wait_assoc_response(
         &mut self,
         pkt: &mut Packet,

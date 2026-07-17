@@ -27,6 +27,7 @@ extern crate alloc;
 
 pub mod frames;
 pub mod pib;
+pub mod platform;
 pub mod primitives;
 
 #[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
@@ -58,6 +59,7 @@ pub mod mock;
 
 // Re-exports for convenience
 pub use pib::{PibAttribute, PibValue};
+pub use platform::{PlatformServices, WrappingTickExtender};
 pub use primitives::*;
 
 use zigbee_types::TxPower;
@@ -112,7 +114,7 @@ pub enum MacError {
 /// All methods are async to accommodate interrupt-driven radios with
 /// Embassy/async executors. Implementations MUST be safe to call from
 /// a single-threaded async executor (no `Send`/`Sync` requirement).
-pub trait MacDriver {
+pub trait MacDriver: PlatformServices {
     // ── MLME: Scan ──────────────────────────────────────────
 
     /// MLME-SCAN.request — perform ED, Active, Passive, or Orphan scan.
@@ -184,21 +186,6 @@ pub trait MacDriver {
     /// Blocks until a frame is received from the radio. The caller is
     /// responsible for filtering by frame type / addressing.
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError>;
-
-    // ── Protocol timing ─────────────────────────────────────
-
-    /// Monotonic time in microseconds, wrapping at `u32::MAX`.
-    ///
-    /// Backends that provide this let upper layers enforce protocol timeouts
-    /// without depending on a platform-specific async timer.
-    fn monotonic_micros(&self) -> Option<u32> {
-        None
-    }
-
-    /// Delay protocol progress for at least `duration_us` microseconds.
-    ///
-    /// The default is a no-op for backends whose executor owns timing.
-    async fn delay_micros(&mut self, _duration_us: u32) {}
 
     // ── Capability queries ──────────────────────────────────
 

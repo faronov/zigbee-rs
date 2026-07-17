@@ -73,7 +73,7 @@ use zigbee_aps::security::{
 use zigbee_aps::{PROFILE_ZDP, ZDO_ENDPOINT};
 #[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
-use zigbee_mac::{MacDriver, MacError};
+use zigbee_mac::{MacDriver, MacError, PlatformServices, WrappingTickExtender};
 #[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
 use zigbee_nwk::DeviceType;
 #[cfg(feature = "sensor")]
@@ -1693,11 +1693,13 @@ pub struct Tlsr8258Mac {
     /// Queue of MAC frames received during `mlme_associate` that weren't the
     /// Associate Response. Drained from the head by `mcps_data_indication`.
     pending_rx: heapless::Deque<PendingPacket, 4>,
+    clock: WrappingTickExtender,
 }
 
 impl Tlsr8258Mac {
     pub fn new() -> Self {
         let rx_buf = core::ptr::addr_of_mut!(RF_RX_BUF) as *mut u8;
+        let now_ticks = async_timer::now_ticks();
         radio::set_rx_dma_config(144);
         radio::set_rx_buffer(rx_buf);
         radio::set_channel(15);
@@ -1728,7 +1730,12 @@ impl Tlsr8258Mac {
             response_wait_time: 32,
             beacon_payload: zigbee_mac::pib::PibPayload::new(),
             pending_rx: heapless::Deque::new(),
+            clock: WrappingTickExtender::new(now_ticks),
         }
+    }
+
+    fn extended_timer_ticks(&self) -> u64 {
+        self.clock.extend(async_timer::now_ticks())
     }
 
     /// Try to enqueue a MAC frame received during `mlme_associate` for later
@@ -3113,6 +3120,20 @@ impl MacDriver for Tlsr8258Mac {
             tx_power_min: zigbee_types::TxPower(-20),
             tx_power_max: zigbee_types::TxPower(10),
         }
+    }
+}
+
+impl PlatformServices for Tlsr8258Mac {
+    fn monotonic_micros(&self) -> u32 {
+        (self.extended_timer_ticks() / 24) as u32
+    }
+
+    async fn delay_micros(&mut self, duration_us: u32) {
+        delay_ms(duration_us.saturating_add(999) / 1_000);
+    }
+
+    fn fill_random(&mut self, _output: &mut [u8]) -> Result<(), MacError> {
+        Err(MacError::Unsupported)
     }
 }
 

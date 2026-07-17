@@ -40,7 +40,7 @@ mod imp {
     };
     use crate::pib::{PibAttribute, PibPayload, PibValue};
     use crate::primitives::*;
-    use crate::{MacCapabilities, MacDriver, MacError};
+    use crate::{MacCapabilities, MacDriver, MacError, PlatformServices, WrappingTickExtender};
     use tlsr8258_hal::radio::{MAX_MAC_FRAME_LEN, Radio, RawRxOutcome, ReceivedFrame, TxOutcome};
     use tlsr8258_hal::{flash, timer};
     use zigbee_types::*;
@@ -100,6 +100,7 @@ mod imp {
         tx_power: i8,
         pending_association_response: Option<(ShortAddress, u8)>,
         pending_rx: Option<ReceivedFrame>,
+        clock: WrappingTickExtender,
     }
 
     impl TelinkMac {
@@ -123,7 +124,8 @@ mod imp {
                     address
                 }
             };
-            let dsn = timer::now_ticks() as u8;
+            let now_ticks = timer::now_ticks();
+            let dsn = now_ticks as u8;
             let mut mac = Self {
                 radio,
                 short_address: ShortAddress(0xFFFF),
@@ -152,6 +154,7 @@ mod imp {
                 tx_power: 0,
                 pending_association_response: None,
                 pending_rx: None,
+                clock: WrappingTickExtender::new(now_ticks),
             };
             mac.apply_radio_config();
             mac
@@ -161,6 +164,10 @@ mod imp {
             let sequence = self.dsn;
             self.dsn = self.dsn.wrapping_add(1);
             sequence
+        }
+
+        fn extended_timer_ticks(&self) -> u64 {
+            self.clock.extend(timer::now_ticks())
         }
 
         fn apply_radio_config(&mut self) {
@@ -890,14 +897,6 @@ mod imp {
                 .ok_or(MacError::NoData)
         }
 
-        fn monotonic_micros(&self) -> Option<u32> {
-            Some(timer::now_ticks() / timer::TICKS_PER_US)
-        }
-
-        async fn delay_micros(&mut self, duration_us: u32) {
-            timer::sleep_ticks(timer::us(duration_us));
-        }
-
         fn capabilities(&self) -> MacCapabilities {
             MacCapabilities {
                 coordinator: false,
@@ -907,6 +906,20 @@ mod imp {
                 tx_power_min: TxPower(0),
                 tx_power_max: TxPower(0),
             }
+        }
+    }
+
+    impl PlatformServices for TelinkMac {
+        fn monotonic_micros(&self) -> u32 {
+            (self.extended_timer_ticks() / u64::from(timer::TICKS_PER_US)) as u32
+        }
+
+        async fn delay_micros(&mut self, duration_us: u32) {
+            timer::sleep_ticks(timer::us(duration_us));
+        }
+
+        fn fill_random(&mut self, _output: &mut [u8]) -> Result<(), MacError> {
+            Err(MacError::Unsupported)
         }
     }
 }

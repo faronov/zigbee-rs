@@ -20,7 +20,7 @@ use embassy_executor::Spawner;
 use embassy_futures::select::{select3, Either3};
 use embassy_nrf::saadc::{self, ChannelConfig, Saadc, VddInput};
 use embassy_nrf::temp::Temp;
-use embassy_nrf::{self as _, bind_interrupts, gpio, peripherals, radio};
+use embassy_nrf::{self as _, bind_interrupts, gpio, peripherals, radio, rng};
 use embassy_time::{Duration, Timer};
 
 use defmt::*;
@@ -41,6 +41,7 @@ const REPORT_INTERVAL_SECS: u64 = 30;
 
 bind_interrupts!(struct Irqs {
     RADIO => radio::InterruptHandler<peripherals::RADIO>;
+    RNG => rng::InterruptHandler<peripherals::RNG>;
     TEMP => embassy_nrf::temp::InterruptHandler;
     SAADC => saadc::InterruptHandler;
 });
@@ -129,7 +130,8 @@ async fn main(_spawner: Spawner) {
 
     // IEEE 802.15.4 MAC driver
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
-    let mac = zigbee_mac::nrf::NrfMac::new(radio);
+    let rng = rng::Rng::new(p.RNG, Irqs);
+    let mac = zigbee_mac::nrf::NrfMac::new(radio, rng);
 
     info!("Radio ready");
 

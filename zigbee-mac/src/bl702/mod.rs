@@ -37,12 +37,12 @@ pub mod driver;
 
 use crate::pib::{PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
-use crate::{MacCapabilities, MacDriver, MacError};
+use crate::{MacCapabilities, MacDriver, MacError, PlatformServices};
 use driver::{Bl702Driver, RadioConfig, RadioError};
 use zigbee_types::*;
 
 use embassy_futures::select;
-use embassy_time::Timer;
+use embassy_time::{Instant, Timer};
 
 /// BL702 802.15.4 MAC driver.
 ///
@@ -796,13 +796,27 @@ impl MacDriver for Bl702Mac {
 
     fn capabilities(&self) -> MacCapabilities {
         MacCapabilities {
-            coordinator: true,
+            coordinator: false,
             router: true,
             hardware_security: true, // BL702 has AES-128 hardware
             max_payload: 102,        // 127 - 25 (max MAC overhead)
             tx_power_min: TxPower(-21),
             tx_power_max: TxPower(14),
         }
+    }
+}
+
+impl PlatformServices for Bl702Mac {
+    fn monotonic_micros(&self) -> u32 {
+        Instant::now().as_micros() as u32
+    }
+
+    async fn delay_micros(&mut self, duration_us: u32) {
+        Timer::after_micros(duration_us as u64).await;
+    }
+
+    fn fill_random(&mut self, _output: &mut [u8]) -> Result<(), MacError> {
+        Err(MacError::Unsupported)
     }
 }
 

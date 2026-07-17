@@ -19,12 +19,12 @@ mod rac_seq;
 
 use crate::pib::{self, PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
-use crate::{MacCapabilities, MacDriver, MacError};
+use crate::{MacCapabilities, MacDriver, MacError, PlatformServices};
 use driver::{Efr32Driver, RadioConfig, RadioError};
 use zigbee_types::*;
 
 use embassy_futures::select;
-use embassy_time::Timer;
+use embassy_time::{Instant, Timer};
 
 #[cfg(feature = "efr32-trace")]
 macro_rules! efr32_trace {
@@ -1072,6 +1072,20 @@ impl MacDriver for Efr32Mac {
             tx_power_min: TxPower(-20),
             tx_power_max: TxPower(19),
         }
+    }
+}
+
+impl PlatformServices for Efr32Mac {
+    fn monotonic_micros(&self) -> u32 {
+        Instant::now().as_micros() as u32
+    }
+
+    async fn delay_micros(&mut self, duration_us: u32) {
+        Timer::after_micros(duration_us as u64).await;
+    }
+
+    fn fill_random(&mut self, _output: &mut [u8]) -> Result<(), MacError> {
+        Err(MacError::Unsupported)
     }
 }
 

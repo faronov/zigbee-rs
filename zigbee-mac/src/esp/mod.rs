@@ -18,7 +18,7 @@ mod driver;
 
 use crate::pib::{self, PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
-use crate::{MacCapabilities, MacDriver, MacError};
+use crate::{MacCapabilities, MacDriver, MacError, PlatformServices};
 use driver::Ieee802154Driver;
 use zigbee_types::*;
 
@@ -888,6 +888,20 @@ impl MacDriver for EspMac<'_> {
             tx_power_min: TxPower(-24),
             tx_power_max: TxPower(21),
         }
+    }
+}
+
+impl PlatformServices for EspMac<'_> {
+    fn monotonic_micros(&self) -> u32 {
+        Instant::now().as_micros() as u32
+    }
+
+    async fn delay_micros(&mut self, duration_us: u32) {
+        Timer::after_micros(duration_us as u64).await;
+    }
+
+    fn fill_random(&mut self, _output: &mut [u8]) -> Result<(), MacError> {
+        Err(MacError::Unsupported)
     }
 }
 

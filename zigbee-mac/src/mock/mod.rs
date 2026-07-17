@@ -5,7 +5,7 @@
 
 use crate::pib::{PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
-use crate::{MacCapabilities, MacDriver, MacError};
+use crate::{MacCapabilities, MacDriver, MacError, PlatformServices};
 use zigbee_types::*;
 
 use heapless::Vec;
@@ -51,6 +51,8 @@ pub struct MockMac {
     // Recorded calls for assertions
     tx_history: Vec<TxRecord, 16>,
     rx_queue: Vec<McpsDataIndication, 8>,
+    time_micros: u32,
+    random_state: u32,
 }
 
 /// Record of a transmitted frame (for test assertions)
@@ -65,6 +67,17 @@ pub struct TxRecord {
 impl MockMac {
     /// Create a new mock MAC with the given IEEE address.
     pub fn new(ieee_address: IeeeAddress) -> Self {
+        let random_state = u32::from_le_bytes([
+            ieee_address[0],
+            ieee_address[1],
+            ieee_address[2],
+            ieee_address[3],
+        ]) ^ u32::from_le_bytes([
+            ieee_address[4],
+            ieee_address[5],
+            ieee_address[6],
+            ieee_address[7],
+        ]) ^ 0xA536_6B4D;
         Self {
             ieee_address,
             short_address: ShortAddress(0xFFFF),
@@ -82,6 +95,8 @@ impl MockMac {
             associate_response: None,
             tx_history: Vec::new(),
             rx_queue: Vec::new(),
+            time_micros: 0,
+            random_state: random_state.max(1),
         }
     }
 
@@ -117,6 +132,28 @@ impl MockMac {
     /// Clear TX history.
     pub fn clear_tx_history(&mut self) {
         self.tx_history.clear();
+    }
+}
+
+impl PlatformServices for MockMac {
+    fn monotonic_micros(&self) -> u32 {
+        self.time_micros
+    }
+
+    async fn delay_micros(&mut self, duration_us: u32) {
+        self.time_micros = self.time_micros.wrapping_add(duration_us);
+    }
+
+    fn fill_random(&mut self, output: &mut [u8]) -> Result<(), MacError> {
+        for chunk in output.chunks_mut(4) {
+            let mut value = self.random_state;
+            value ^= value << 13;
+            value ^= value >> 17;
+            value ^= value << 5;
+            self.random_state = value.max(1);
+            chunk.copy_from_slice(&value.to_le_bytes()[..chunk.len()]);
+        }
+        Ok(())
     }
 }
 
