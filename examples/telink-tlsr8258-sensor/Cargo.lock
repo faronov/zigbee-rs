@@ -124,6 +124,7 @@ dependencies = [
  "log",
  "panic-halt",
  "tlsr8258-hal",
+ "tlsr8258-rt",
  "zigbee-aps",
  "zigbee-bdb",
  "zigbee-mac",
@@ -136,6 +137,10 @@ dependencies = [
 
 [[package]]
 name = "tlsr8258-hal"
+version = "0.1.0"
+
+[[package]]
+name = "tlsr8258-rt"
 version = "0.1.0"
 
 [[package]]

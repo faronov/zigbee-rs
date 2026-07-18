@@ -5,8 +5,10 @@ Trust Center exchange, ZHA interview, reporting, persistence, reset resume,
 and secured parent rejoin.
 
 `runtime-sensor` builds the dedicated `telink-tlsr8258-runtime` binary over
-the reusable `tlsr8258-hal` radio and `zigbee_mac::telink::TelinkMac`. The
-large local diagnostic radio and `Tlsr8258Mac` compile only into the separate
+the reusable `tlsr8258-rt` startup, `tlsr8258-hal` radio, and
+`zigbee_mac::telink::TelinkMac`. Its entry point contains only panic/IRQ glue
+and application selection. The large local diagnostic radio, startup
+instrumentation, and `Tlsr8258Mac` compile only into the separate
 `telink-tlsr8258-lab` binary selected by legacy and diagnostic modes.
 
 `runtime-router` builds `telink-tlsr8258-router` — an **EXPERIMENTAL**,

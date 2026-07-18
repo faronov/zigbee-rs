@@ -27,6 +27,7 @@ required-features = ["runtime-router"]
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac" }
 tlsr8258-hal = { path = "../../tlsr8258-hal", optional = true }
+tlsr8258-rt = { path = "../../tlsr8258-rt", optional = true }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
@@ -49,11 +50,11 @@ diag-assoc = ["lab"]
 diag-smoke = ["lab"]
 diag-pm = ["lab", "dep:tlsr8258-hal"]
 sensor = ["lab"]
-runtime-sensor = ["dep:tlsr8258-hal", "zigbee-mac/tlsr8258"]
+runtime-sensor = ["dep:tlsr8258-hal", "dep:tlsr8258-rt", "zigbee-mac/tlsr8258"]
 # EXPERIMENTAL router firmware: join + non-beacon relay only. Does not,
 # and must not, gain child-association/beacon/permit-joining/indirect-queue
 # support merely by enabling this feature — see README.md.
-runtime-router = ["dep:tlsr8258-hal", "zigbee-mac/tlsr8258"]
+runtime-router = ["dep:tlsr8258-hal", "dep:tlsr8258-rt", "zigbee-mac/tlsr8258"]
 
 [profile.release]
 # Optimize the complete stack as one unit. The tc32 backend rejects

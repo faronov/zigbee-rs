@@ -1,0 +1,12 @@
+[package]
+name = "tlsr8258-rt"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "TLSR8258 reset vector, IRQ context, and Rust startup"
+repository = "https://github.com/faronov/zigbee-rs"
+
+[dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }
