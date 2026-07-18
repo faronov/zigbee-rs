@@ -37,7 +37,6 @@ mac-driver = ["dep:zigbee-mac", "dep:zigbee-types"]
 runtime-join = [
     "mac-driver",
     "dep:zigbee-nwk",
-    "zigbee-nwk/telink-tx-capture",
     "dep:zigbee-aps",
     "dep:zigbee-runtime",
     "dep:zigbee-zcl",

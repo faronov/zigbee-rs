@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "zigbee-types",
+    "zigbee-crypto",
     "zigbee-mac",
     "zigbee-nwk",
     "zigbee-aps",

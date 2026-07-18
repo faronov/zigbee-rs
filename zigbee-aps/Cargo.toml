@@ -9,14 +9,11 @@ repository = "https://github.com/zigbee-rs/zigbee-rs"
 [dependencies]
 heapless = "0.9"
 zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
+zigbee-crypto = { version = "0.1.0", path = "../zigbee-crypto" }
 zigbee-nwk = { version = "0.1.0", path = "../zigbee-nwk" }
 zigbee-mac = { version = "0.1.0", path = "../zigbee-mac" }
 log = "0.4"
 aes = { version = "0.8", default-features = false }
-# NOTE: ccm crate was removed (its decrypt_in_place_detached consumes ~6 KiB
-# of stack on tc32, blowing the 10 KiB SVC stack on TLSR8258). Replaced with
-# a hand-rolled AES-CCM* implementation in src/security.rs (M=4, L=2,
-# nonce=13) per Zigbee §B.1.2, stack budget ~400 B.
 
 [features]
 router = ["zigbee-nwk/router"]

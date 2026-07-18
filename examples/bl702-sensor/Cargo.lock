@@ -570,6 +570,7 @@ dependencies = [
  "aes",
  "heapless 0.9.2",
  "log",
+ "zigbee-crypto",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-types",
@@ -590,6 +591,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zigbee-crypto"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "heapless 0.9.2",
+]
+
+[[package]]
 name = "zigbee-mac"
 version = "0.1.0"
 dependencies = [
@@ -606,9 +615,9 @@ dependencies = [
 name = "zigbee-nwk"
 version = "0.1.0"
 dependencies = [
- "aes",
  "heapless 0.9.2",
  "log",
+ "zigbee-crypto",
  "zigbee-mac",
  "zigbee-types",
 ]

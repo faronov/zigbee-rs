@@ -57,6 +57,7 @@ pub mod trust_center;
 // Re-export all sub-crates for convenience
 pub use zigbee_aps as aps;
 pub use zigbee_bdb as bdb;
+pub use zigbee_crypto as crypto;
 pub use zigbee_mac as mac;
 pub use zigbee_nwk as nwk;
 pub use zigbee_runtime as runtime;

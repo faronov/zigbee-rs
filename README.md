@@ -32,8 +32,8 @@ Embassy and other embedded async runtimes.
 │                    zigbee-mac                          │
 │  MacDriver trait · 12 backends (see table below)     │
 ├──────────────────────────────────────────────────────┤
-│                   zigbee-types                         │
-│     IeeeAddress · ShortAddress · PanId · Channel     │
+│           zigbee-crypto · zigbee-types                │
+│ low-stack AES-CCM* · addresses · PANs · channels     │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -302,6 +302,7 @@ Occupancy, Electrical, Carbon Dioxide, PM2.5, Soil Moisture
 ```
 zigbee-rs/
 ├── zigbee-types/              # Core types (addresses, channels)
+├── zigbee-crypto/             # Shared low-stack AES-CCM* primitives
 ├── zigbee-mac/                # MAC layer + platform backends
 │   └── src/
 │       ├── mock/              # Full mock for host testing

@@ -8,6 +8,7 @@ description = "Complete Zigbee PRO R22 stack — coordinator, router, and end de
 [dependencies]
 heapless = "0.9"
 zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
+zigbee-crypto = { version = "0.1.0", path = "../zigbee-crypto" }
 zigbee-mac = { version = "0.1.0", path = "../zigbee-mac" }
 zigbee-nwk = { version = "0.1.0", path = "../zigbee-nwk" }
 zigbee-aps = { version = "0.1.0", path = "../zigbee-aps" }

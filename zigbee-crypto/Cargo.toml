@@ -1,0 +1,11 @@
+[package]
+name = "zigbee-crypto"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Low-stack cryptographic primitives shared by the zigbee-rs protocol layers"
+repository = "https://github.com/zigbee-rs/zigbee-rs"
+
+[dependencies]
+aes = { version = "0.8", default-features = false }
+heapless = "0.9"

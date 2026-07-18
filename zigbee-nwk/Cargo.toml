@@ -8,13 +8,9 @@ description = "Zigbee PRO R22 NWK layer — network formation, join, routing, da
 [dependencies]
 heapless = "0.9"
 zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
+zigbee-crypto = { version = "0.1.0", path = "../zigbee-crypto" }
 zigbee-mac = { version = "0.1.0", path = "../zigbee-mac" }
 log = "0.4"
-aes = { version = "0.8", default-features = false }
-# NOTE: dropped `ccm = "0.5"` — its `Ccm::encrypt_in_place_detached` consumes
-# ~6 KiB of stack on tc32 (TLSR8258), overflowing the 10 KiB SVC stack and
-# silently corrupting `.bss`. Replaced with a hand-rolled AES-CCM* (M=4,L=2)
-# in `src/security.rs`. Mirrors the fix already applied in `zigbee-aps`.
 
 [features]
 default = []
