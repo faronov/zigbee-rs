@@ -14,6 +14,8 @@ use zigbee_zcl::clusters::humidity::HumidityCluster;
 use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
+use zigbee_zcl::data_types::{ZclDataType, ZclValue};
+use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
 
 use crate::{board, executor};
 
@@ -25,6 +27,34 @@ const SECURITY_SECTOR_B: u32 = 0x0007_5000;
 const DEVICE_EUI_OFFSET: u8 = 0x33;
 const SENSOR_UPDATE_INTERVAL_SECS: u16 = 30;
 const TEST_SENSOR: SyntheticSensor = SyntheticSensor::new(2_150, 100, 5_000, 400);
+
+fn setup_test_reporting(device: &mut ZigbeeDevice<TelinkMac>) -> bool {
+    let temperature = device.reporting_mut().configure_for_cluster(
+        1,
+        0x0402,
+        ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: zigbee_zcl::AttributeId(0x0000),
+            data_type: ZclDataType::I16,
+            min_interval: 1,
+            max_interval: 60,
+            reportable_change: Some(ZclValue::I16(1)),
+        },
+    );
+    let humidity = device.reporting_mut().configure_for_cluster(
+        1,
+        0x0405,
+        ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: zigbee_zcl::AttributeId(0x0000),
+            data_type: ZclDataType::U16,
+            min_interval: 1,
+            max_interval: 60,
+            reportable_change: Some(ZclValue::U16(1)),
+        },
+    );
+    temperature.is_ok() && humidity.is_ok()
+}
 
 struct Tlsr8258SecurityFlash;
 
@@ -137,6 +167,9 @@ pub fn run() -> ! {
                 .cluster_server(0x0405)
         })
         .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
+    if !setup_test_reporting(device) {
+        failure();
+    }
 
     let mut clusters = [
         ClusterRef {
