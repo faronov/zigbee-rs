@@ -3,6 +3,7 @@
 
 #![cfg(target_arch = "tc32")]
 
+use super::tx_power_register_fields;
 use crate::mmio::{REG_CLK_EN0, REG_CLK_EN1, REG_CLK_EN2, REG_RST0, REG_RST1, REG_RST2, r8, w8};
 
 // RF control registers
@@ -21,6 +22,9 @@ const REG_RF_RX_MODE: u32 = 0x800428; // RX mode enable
 const REG_RF_CHANNEL: u32 = 0x80040D; // physical channel
 const REG_RF_RSSI: u32 = 0x800441; // RSSI readback
 const REG_PLL_FINE_TUNE: u32 = 0x8004D6; // PLL fine divider (u16)
+const REG_RF_POWER_MODE: u32 = 0x801225;
+const REG_RF_POWER_LSB: u32 = 0x801226;
+const REG_RF_POWER_MSB: u32 = 0x801227;
 
 // Modem channel registers (from SDK rf_set_channel disassembly)
 const REG_MODEM_CHN_L: u32 = 0x801244;
@@ -96,6 +100,26 @@ pub fn set_tx_pipe(pipe: u8) {
 
 pub fn set_tx_settle(us: u16) {
     unsafe { w16(REG_RF_TX_SETTLE, us.saturating_sub(1) & 0x0FFF) };
+}
+
+/// Program an official SDK `RF_PowerTypeDef` value.
+pub fn set_tx_power_level(level: u8) {
+    let (vbat_mode, lsb, msb) = tx_power_register_fields(level);
+    unsafe {
+        let mut mode = r8(REG_RF_POWER_MODE);
+        if vbat_mode {
+            mode |= 1 << 6;
+        } else {
+            mode &= !(1 << 6);
+        }
+        w8(REG_RF_POWER_MODE, mode);
+
+        let low = (r8(REG_RF_POWER_LSB) & 0x7F) | lsb;
+        w8(REG_RF_POWER_LSB, low);
+
+        let high = (r8(REG_RF_POWER_MSB) & !0x1F) | msb;
+        w8(REG_RF_POWER_MSB, high);
+    }
 }
 
 /// Write PHY registers transcribed from

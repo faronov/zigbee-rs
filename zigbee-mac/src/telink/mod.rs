@@ -41,7 +41,10 @@ mod imp {
     use crate::pib::{PibAttribute, PibPayload, PibValue};
     use crate::primitives::*;
     use crate::{MacCapabilities, MacDriver, MacError, PlatformServices, WrappingTickExtender};
-    use tlsr8258_hal::radio::{MAX_MAC_FRAME_LEN, Radio, RawRxOutcome, ReceivedFrame, TxOutcome};
+    use tlsr8258_hal::radio::{
+        MAX_MAC_FRAME_LEN, Radio, RawRxOutcome, ReceivedFrame, TX_POWER_MAX_DBM, TX_POWER_MIN_DBM,
+        TxOutcome,
+    };
     use tlsr8258_hal::{flash, timer};
     use zigbee_types::*;
 
@@ -172,6 +175,7 @@ mod imp {
 
         fn apply_radio_config(&mut self) {
             self.radio.set_channel(self.channel());
+            let _ = self.radio.set_tx_power(self.tx_power);
             self.radio
                 .set_ack_filter(self.pan_id.0, self.short_address.0, self.extended_address);
         }
@@ -834,7 +838,12 @@ mod imp {
                     self.promiscuous = value;
                 }
                 (PhyCurrentChannel, PibValue::U8(value)) => self.set_channel(value)?,
-                (PhyTransmitPower, PibValue::I8(0)) => self.tx_power = 0,
+                (PhyTransmitPower, PibValue::I8(value)) => {
+                    if !self.radio.set_tx_power(value) {
+                        return Err(MacError::InvalidParameter);
+                    }
+                    self.tx_power = value;
+                }
                 (PhyCcaMode, PibValue::U8(1)) | (PhyCurrentPage, PibValue::U8(0)) => {}
                 _ => return Err(MacError::InvalidParameter),
             }
@@ -926,8 +935,8 @@ mod imp {
                 router: false,
                 hardware_security: false,
                 max_payload: (MAX_MAC_FRAME_LEN - 23) as u16,
-                tx_power_min: TxPower(0),
-                tx_power_max: TxPower(0),
+                tx_power_min: TxPower(TX_POWER_MIN_DBM),
+                tx_power_max: TxPower(TX_POWER_MAX_DBM),
             }
         }
     }

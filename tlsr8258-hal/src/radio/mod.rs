@@ -14,6 +14,82 @@ pub const DMA_BUF_LEN: usize = 144;
 /// The IEEE 802.15.4 PSDU limit is 127 bytes including the two-byte FCS,
 /// which TLSR8258 appends/removes in hardware.
 pub const MAX_MAC_FRAME_LEN: usize = 125;
+pub const TX_POWER_MIN_DBM: i8 = -25;
+pub const TX_POWER_MAX_DBM: i8 = 10;
+
+// Official TLSR8258 RF_PowerTypeDef levels, expressed as centi-dBm and the
+// register value consumed by rf_set_power_level().
+#[cfg(any(target_arch = "tc32", test))]
+const TX_POWER_LEVELS: &[(i16, u8)] = &[
+    (1046, 63),
+    (1029, 61),
+    (1001, 58),
+    (981, 56),
+    (948, 53),
+    (924, 51),
+    (897, 49),
+    (873, 47),
+    (844, 45),
+    (813, 43),
+    (779, 41),
+    (741, 39),
+    (702, 37),
+    (660, 35),
+    (614, 33),
+    (565, 31),
+    (513, 29),
+    (457, 27),
+    (394, 25),
+    (323, 23),
+    (301, 0x80 | 63),
+    (281, 0x80 | 61),
+    (261, 0x80 | 59),
+    (239, 0x80 | 57),
+    (199, 0x80 | 54),
+    (173, 0x80 | 52),
+    (145, 0x80 | 50),
+    (117, 0x80 | 48),
+    (90, 0x80 | 46),
+    (58, 0x80 | 44),
+    (4, 0x80 | 41),
+    (-14, 0x80 | 40),
+    (-97, 0x80 | 36),
+    (-142, 0x80 | 34),
+    (-189, 0x80 | 32),
+    (-248, 0x80 | 30),
+    (-303, 0x80 | 28),
+    (-361, 0x80 | 26),
+    (-426, 0x80 | 24),
+    (-503, 0x80 | 22),
+    (-581, 0x80 | 20),
+    (-667, 0x80 | 18),
+    (-765, 0x80 | 16),
+    (-865, 0x80 | 14),
+    (-989, 0x80 | 12),
+    (-1140, 0x80 | 10),
+    (-1329, 0x80 | 8),
+    (-1588, 0x80 | 6),
+    (-1927, 0x80 | 4),
+    (-2518, 0x80 | 2),
+];
+
+#[cfg(any(target_arch = "tc32", test))]
+fn tx_power_register_value(dbm: i8) -> Option<u8> {
+    if !(TX_POWER_MIN_DBM..=TX_POWER_MAX_DBM).contains(&dbm) {
+        return None;
+    }
+
+    let requested = i32::from(dbm) * 100;
+    TX_POWER_LEVELS
+        .iter()
+        .min_by_key(|(centi_dbm, _)| (i32::from(*centi_dbm) - requested).abs())
+        .map(|(_, register)| *register)
+}
+
+#[cfg(any(target_arch = "tc32", test))]
+fn tx_power_register_fields(level: u8) -> (bool, u8, u8) {
+    (level & 0x80 != 0, (level & 0x01) << 7, (level >> 1) & 0x1F)
+}
 
 /// RF DMA buffer wrapper. `repr(align(4))` is required by the TLSR8258 DMA
 /// engine (see `memory.x`'s `.rf_dma` section, which is checked post-link
@@ -95,6 +171,15 @@ impl Radio {
     }
 
     #[cfg(target_arch = "tc32")]
+    pub fn set_tx_power(&mut self, dbm: i8) -> bool {
+        let Some(level) = tx_power_register_value(dbm) else {
+            return false;
+        };
+        phy::set_tx_power_level(level);
+        true
+    }
+
+    #[cfg(target_arch = "tc32")]
     pub fn set_ack_filter(&mut self, pan_id: u16, short_address: u16, extended_address: [u8; 8]) {
         hw::set_ack_filter(pan_id, short_address, extended_address);
     }
@@ -127,6 +212,32 @@ impl Radio {
     #[cfg(target_arch = "tc32")]
     pub fn measure_energy(&mut self) -> u8 {
         hw::measure_energy()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tx_power_mapping_uses_nearest_official_level() {
+        assert_eq!(tx_power_register_value(10), Some(58));
+        assert_eq!(tx_power_register_value(3), Some(0x80 | 63));
+        assert_eq!(tx_power_register_value(0), Some(0x80 | 41));
+        assert_eq!(tx_power_register_value(-10), Some(0x80 | 12));
+        assert_eq!(tx_power_register_value(-25), Some(0x80 | 2));
+    }
+
+    #[test]
+    fn tx_power_mapping_rejects_unsupported_range() {
+        assert_eq!(tx_power_register_value(TX_POWER_MAX_DBM + 1), None);
+        assert_eq!(tx_power_register_value(TX_POWER_MIN_DBM - 1), None);
+    }
+
+    #[test]
+    fn tx_power_fields_match_official_register_layout() {
+        assert_eq!(tx_power_register_fields(0x80 | 41), (true, 0x80, 0x14));
+        assert_eq!(tx_power_register_fields(58), (false, 0x00, 0x1D));
     }
 }
 
