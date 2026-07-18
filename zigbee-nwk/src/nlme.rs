@@ -19,6 +19,17 @@ use zigbee_mac::primitives::*;
 use zigbee_mac::{MacDriver, MacError};
 use zigbee_types::*;
 
+#[cfg(feature = "trace")]
+macro_rules! nwk_diag {
+    ($($arg:tt)*) => {
+        log::trace!($($arg)*);
+    };
+}
+#[cfg(not(feature = "trace"))]
+macro_rules! nwk_diag {
+    ($($arg:tt)*) => {};
+}
+
 /// Network descriptor — result of network discovery.
 #[derive(Debug, Clone)]
 pub struct NetworkDescriptor {
@@ -102,17 +113,13 @@ impl<M: MacDriver> NwkLayer<M> {
         channel_mask: ChannelMask,
         scan_duration: u8,
     ) -> Result<heapless::Vec<NetworkDescriptor, 16>, NwkStatus> {
-        #[cfg(feature = "efr32-trace")]
-        rtt_target::rprintln!("[NWK] disc: mask=0x{:08X}", channel_mask.0);
+        nwk_diag!("[NWK] discovery mask=0x{:08X}", channel_mask.0);
 
         // Set macAutoRequest = false during scan
         let _ = self
             .mac
             .mlme_set(PibAttribute::MacAutoRequest, PibValue::Bool(false))
             .await;
-
-        #[cfg(feature = "efr32-trace")]
-        rtt_target::rprintln!("[NWK] disc: scanning...");
 
         let scan_result = self
             .mac
@@ -124,25 +131,20 @@ impl<M: MacDriver> NwkLayer<M> {
             .await
             .map_err(|_| NwkStatus::NoNetworks)?;
 
-        #[cfg(feature = "efr32-trace")]
-        rtt_target::rprintln!("[NWK] disc: scan done");
-
         // Restore macAutoRequest
         let _ = self
             .mac
             .mlme_set(PibAttribute::MacAutoRequest, PibValue::Bool(true))
             .await;
 
-        #[cfg(feature = "efr32-trace")]
-        rtt_target::rprintln!(
-            "[NWK] nlme_disc: scan={} PDs",
+        nwk_diag!(
+            "[NWK] discovery found {} PAN descriptors",
             scan_result.pan_descriptors.len()
         );
 
         let mut networks: heapless::Vec<NetworkDescriptor, 16> = heapless::Vec::new();
         for pd in &scan_result.pan_descriptors {
-            #[cfg(feature = "efr32-trace")]
-            rtt_target::rprintln!(
+            nwk_diag!(
                 "[NWK] PD ch={} proto={} stack={} depth={} permit={}",
                 pd.channel,
                 pd.zigbee_beacon.protocol_id,
@@ -302,8 +304,7 @@ impl<M: MacDriver> NwkLayer<M> {
         &mut self,
         network: &NetworkDescriptor,
     ) -> Result<ShortAddress, NwkStatus> {
-        #[cfg(feature = "efr32-trace")]
-        rtt_target::rprintln!(
+        nwk_diag!(
             "[NWK] join_assoc: pan=0x{:04X} ch={} via=0x{:04X} permit={} ed_cap={} rtr_cap={}",
             network.pan_id.0,
             network.logical_channel,
@@ -316,21 +317,17 @@ impl<M: MacDriver> NwkLayer<M> {
         // Check capacity
         match self.device_type {
             DeviceType::Router if !network.router_capacity => {
-                #[cfg(feature = "efr32-trace")]
-                rtt_target::rprintln!("[NWK] join: no router capacity");
+                nwk_diag!("[NWK] join rejected: no router capacity");
                 return Err(NwkStatus::NotPermitted);
             }
             DeviceType::EndDevice if !network.end_device_capacity => {
-                #[cfg(feature = "efr32-trace")]
-                rtt_target::rprintln!("[NWK] join: no ED capacity");
+                nwk_diag!("[NWK] join rejected: no end-device capacity");
                 return Err(NwkStatus::NotPermitted);
             }
             _ => {}
         }
-
         if !network.permit_joining {
-            #[cfg(feature = "efr32-trace")]
-            rtt_target::rprintln!("[NWK] join: permit=false");
+            nwk_diag!("[NWK] join rejected: association permit is closed");
             return Err(NwkStatus::NotPermitted);
         }
 
@@ -339,8 +336,7 @@ impl<M: MacDriver> NwkLayer<M> {
         // Transport-Key frames through MAC polling.
         let cap = zigbee_capability_info(self.device_type, self.rx_on_when_idle);
 
-        #[cfg(feature = "efr32-trace")]
-        rtt_target::rprintln!(
+        nwk_diag!(
             "[NWK] assoc: ffd={} rx_on={} dev_type={:?}",
             cap.device_type_ffd,
             cap.rx_on_when_idle,
@@ -363,16 +359,14 @@ impl<M: MacDriver> NwkLayer<M> {
             })
             .await
             .map_err(|e| {
-                #[cfg(feature = "efr32-trace")]
-                rtt_target::rprintln!("[NWK] assoc MAC err: {:?}", e);
+                nwk_diag!("[NWK] association failed: {:?}", e);
                 match e {
                     MacError::NoAck => NwkStatus::NoNetworks,
                     _ => NwkStatus::StartupFailure,
                 }
             })?;
 
-        #[cfg(feature = "efr32-trace")]
-        rtt_target::rprintln!(
+        nwk_diag!(
             "[NWK] assoc result: status={:?} addr=0x{:04X}",
             result.status,
             result.short_address.0,

@@ -410,21 +410,6 @@ impl ApsSecurity {
             return None;
         }
         let nonce = self.build_nonce(security_header);
-        #[cfg(feature = "defmt")]
-        {
-            defmt::info!("[APS-SEC] key: {:02x}", key);
-            defmt::info!("[APS-SEC] nonce: {:02x}", &nonce[..]);
-            defmt::info!(
-                "[APS-SEC] aad({} bytes): {:02x}",
-                aps_header.len(),
-                aps_header
-            );
-            defmt::info!(
-                "[APS-SEC] ciphertext({} bytes): {:02x}",
-                ciphertext.len(),
-                ciphertext
-            );
-        }
         aps_aes_ccm_decrypt(key, &nonce, aps_header, ciphertext)
     }
 

@@ -15,10 +15,9 @@ zigbee-zdo = { version = "0.1.0", path = "../zigbee-zdo" }
 zigbee-bdb = { version = "0.1.0", path = "../zigbee-bdb" }
 zigbee-zcl = { version = "0.1.0", path = "../zigbee-zcl" }
 log = "0.4"
-rtt-target = { version = "0.6", optional = true }
 
 [features]
 default = []
 router = ["zigbee-aps/router"]
 ota = []
-efr32-trace = ["dep:rtt-target", "zigbee-bdb/efr32-trace"]
+trace = ["zigbee-bdb/trace", "zigbee-aps/trace", "zigbee-nwk/trace"]

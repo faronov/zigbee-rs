@@ -15,9 +15,8 @@ aes = { version = "0.8", default-features = false }
 # ~6 KiB of stack on tc32 (TLSR8258), overflowing the 10 KiB SVC stack and
 # silently corrupting `.bss`. Replaced with a hand-rolled AES-CCM* (M=4,L=2)
 # in `src/security.rs`. Mirrors the fix already applied in `zigbee-aps`.
-rtt-target = { version = "0.6", optional = true }
 
 [features]
 default = []
 router = []
-efr32-trace = ["dep:rtt-target"]
+trace = []

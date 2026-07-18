@@ -47,6 +47,25 @@ use cortex_m as _;
 #[allow(unused_imports)]
 use vectors::__INTERRUPTS;
 
+#[cfg(feature = "trace")]
+struct RttLogger;
+
+#[cfg(feature = "trace")]
+static LOGGER: RttLogger = RttLogger;
+
+#[cfg(feature = "trace")]
+impl log::Log for RttLogger {
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        rtt_target::rprintln!("[{}] {}", record.level(), record.args());
+    }
+
+    fn flush(&self) {}
+}
+
 fn init_logging() {
     let channels = rtt_target::rtt_init! {
         up: {
@@ -65,6 +84,11 @@ fn init_logging() {
         }
     };
     rtt_target::set_print_channel(channels.up.0);
+    #[cfg(feature = "trace")]
+    {
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log::LevelFilter::Trace);
+    }
 }
 
 // ── Gecko Bootloader Application Properties ─────────────────────

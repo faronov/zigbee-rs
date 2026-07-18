@@ -28,18 +28,15 @@ use crate::{
     SteeringDiagnostics, SteeringStage, TrustCenterLinkKeyState,
 };
 
-#[cfg(feature = "efr32-trace")]
+#[cfg(feature = "trace")]
 macro_rules! bdb_diag {
     ($($arg:tt)*) => {
-        rtt_target::rprintln!($($arg)*);
+        log::trace!($($arg)*);
     };
 }
-
-#[cfg(not(feature = "efr32-trace"))]
+#[cfg(not(feature = "trace"))]
 macro_rules! bdb_diag {
-    ($($arg:tt)*) => {
-        ()
-    };
+    ($($arg:tt)*) => {};
 }
 
 /// Default scan duration exponent for active scan (2^n + 1 superframes).
@@ -357,7 +354,7 @@ impl<M: MacDriver> BdbLayer<M> {
                         // Step 3: Attempt join
                         match self.zdo.nlme_join(network).await {
                             Ok(addr) => {
-                                bdb_diag!("[BDB][EFR32] nlme_join=ok addr=0x{:04X}", addr.0);
+                                bdb_diag!("[BDB] nlme_join=ok addr=0x{:04X}", addr.0);
                                 self.steering_diagnostics.join_successes =
                                     self.steering_diagnostics.join_successes.saturating_add(1);
                                 self.steering_diagnostics.last_join_status = 0;
@@ -367,7 +364,7 @@ impl<M: MacDriver> BdbLayer<M> {
                             }
                             Err(e) => {
                                 self.steering_diagnostics.last_join_status = e as u8;
-                                bdb_diag!("[BDB][EFR32] nlme_join=err {:?}", e);
+                                bdb_diag!("[BDB] nlme_join=err {:?}", e);
                                 log::warn!("[BDB:Steering] Join failed: {:?}", e);
                                 continue;
                             }
@@ -406,6 +403,7 @@ impl<M: MacDriver> BdbLayer<M> {
                             "[BDB:Steering] Phase 0: passive RX for direct Transport-Key..."
                         );
                         for rx_attempt in 0..4u8 {
+                            #[allow(clippy::single_match)]
                             match self
                                 .zdo
                                 .aps_mut()
@@ -431,7 +429,7 @@ impl<M: MacDriver> BdbLayer<M> {
                                         );
                                     let mac_payload = mac_frame.payload.as_slice();
                                     bdb_diag!(
-                                        "[BDB][EFR32] passive_rx[{}] {} bytes",
+                                        "[BDB] passive_rx[{}] {} bytes",
                                         rx_attempt,
                                         mac_payload.len()
                                     );
@@ -446,7 +444,7 @@ impl<M: MacDriver> BdbLayer<M> {
                                     }
                                 }
                                 Err(_) => {
-                                    bdb_diag!("[BDB][EFR32] passive_rx[{}] none", rx_attempt);
+                                    bdb_diag!("[BDB] passive_rx[{}] none", rx_attempt);
                                 }
                             }
                         }
@@ -492,7 +490,7 @@ impl<M: MacDriver> BdbLayer<M> {
                                 data_frames += 1;
                                 let mac_payload = mac_frame.as_slice();
                                 bdb_diag!(
-                                    "[BDB][EFR32] parent_poll[{}] {} bytes total={}",
+                                    "[BDB] parent_poll[{}] {} bytes total={}",
                                     total_rounds,
                                     mac_payload.len(),
                                     data_frames
@@ -504,18 +502,18 @@ impl<M: MacDriver> BdbLayer<M> {
                                     data_frames,
                                 );
                                 if let Some(true) = self.try_process_frame(mac_payload) {
-                                    bdb_diag!("[BDB][EFR32] transport_key=ok via parent_poll");
+                                    bdb_diag!("[BDB] transport_key=ok via parent_poll");
                                     key_received = true;
                                     break;
                                 }
                             }
                             Ok(None) => {
-                                bdb_diag!("[BDB][EFR32] parent_poll[{}] none", total_rounds);
+                                bdb_diag!("[BDB] parent_poll[{}] none", total_rounds);
                             }
                             Err(e) => {
                                 self.steering_diagnostics.poll_errors =
                                     self.steering_diagnostics.poll_errors.saturating_add(1);
-                                bdb_diag!("[BDB][EFR32] parent_poll[{}] err {:?}", total_rounds, e);
+                                bdb_diag!("[BDB] parent_poll[{}] err {:?}", total_rounds, e);
                                 log::warn!("[BDB:Steering] P-Poll {}: err {:?}", total_rounds, e);
                             }
                         }
@@ -552,7 +550,7 @@ impl<M: MacDriver> BdbLayer<M> {
                     if !key_received {
                         self.steering_diagnostics.stage = SteeringStage::TransportKeyMissing;
                         bdb_diag!(
-                            "[BDB][EFR32] transport_key=missing rounds={} frames={} empty={}",
+                            "[BDB] transport_key=missing rounds={} frames={} empty={}",
                             total_rounds,
                             data_frames,
                             empty_count
@@ -567,7 +565,7 @@ impl<M: MacDriver> BdbLayer<M> {
 
                     if !key_received {
                         bdb_diag!(
-                            "[BDB][EFR32] reset pan=0x{:04X} reason=no_transport_key",
+                            "[BDB] reset pan=0x{:04X} reason=no_transport_key",
                             network.pan_id.0
                         );
                         log::warn!(
@@ -602,7 +600,7 @@ impl<M: MacDriver> BdbLayer<M> {
                     self.zdo.set_local_nwk_addr(nwk_addr);
                     self.zdo.set_local_ieee_addr(ieee);
                     bdb_diag!(
-                        "[BDB][EFR32] zdo_local addr=0x{:04X} ieee={:02X?}",
+                        "[BDB] zdo_local addr=0x{:04X} ieee={:02X?}",
                         nwk_addr.0,
                         ieee
                     );
@@ -918,7 +916,7 @@ impl<M: MacDriver> BdbLayer<M> {
                         crate::attributes::BdbCommissioningStatus::Success;
                     self.steering_diagnostics.stage = SteeringStage::Complete;
 
-                    bdb_diag!("[BDB][EFR32] steering=ok addr=0x{:04X}", nwk_addr.0);
+                    bdb_diag!("[BDB] steering=ok addr=0x{:04X}", nwk_addr.0);
                     log::info!("[BDB:Steering] Joined successfully as 0x{:04X}", nwk_addr.0,);
                     return Ok(());
                 }
@@ -1112,7 +1110,7 @@ impl<M: MacDriver> BdbLayer<M> {
             self.steering_diagnostics.nwk_header_len = nwk_consumed.min(u8::MAX as usize) as u8;
             self.steering_diagnostics.nwk_security = nwk_hdr.frame_control.security;
             bdb_diag!(
-                "[BDB][EFR32] nwk type={} src=0x{:04X} dst=0x{:04X} sec={} used={}",
+                "[BDB] nwk type={} src=0x{:04X} dst=0x{:04X} sec={} used={}",
                 nwk_hdr.frame_control.frame_type,
                 nwk_hdr.src_addr.0,
                 nwk_hdr.dst_addr.0,
@@ -1141,7 +1139,7 @@ impl<M: MacDriver> BdbLayer<M> {
             self.process_key_wait_frame(mac_payload, &nwk_hdr, nwk_consumed, 0)
         } else if mac_payload.len() > 2 {
             self.steering_diagnostics.key_frame_result = KeyFrameResult::NwkParseFailed;
-            bdb_diag!("[BDB][EFR32] nwk_parse=fail len={}", mac_payload.len());
+            bdb_diag!("[BDB] nwk_parse=fail len={}", mac_payload.len());
             let dump_len = mac_payload.len().min(20);
             let hex: heapless::String<60> =
                 mac_payload[..dump_len]
@@ -1182,7 +1180,7 @@ impl<M: MacDriver> BdbLayer<M> {
             let parse_result = zigbee_nwk::security::NwkSecurityHeader::parse(after_nwk);
             if let Some((sec_hdr, sec_consumed)) = parse_result {
                 bdb_diag!(
-                    "[BDB][EFR32] nwk_sec key_seq={} sec_used={} cipher_len={}",
+                    "[BDB] nwk_sec key_seq={} sec_used={} cipher_len={}",
                     sec_hdr.key_seq_number,
                     sec_consumed,
                     after_nwk.len().saturating_sub(sec_consumed)
@@ -1208,14 +1206,14 @@ impl<M: MacDriver> BdbLayer<M> {
                         &sec_hdr,
                     );
                     if let Some(pt) = active_pt {
-                        bdb_diag!("[BDB][EFR32] nwk_decrypt=ok active_key len={}", pt.len());
+                        bdb_diag!("[BDB] nwk_decrypt=ok active_key len={}", pt.len());
                         let len = pt.len().min(128);
                         buf[..len].copy_from_slice(&pt[..len]);
                         payload_data = Some((buf, len));
                     } else {
                         self.steering_diagnostics.key_frame_result =
                             KeyFrameResult::ActiveKeyDecryptFailed;
-                        bdb_diag!("[BDB][EFR32] nwk_decrypt=fail active_key");
+                        bdb_diag!("[BDB] nwk_decrypt=fail active_key");
                         log::warn!("[BDB:Steering] NWK decrypt failed");
                         payload_data = None;
                     }
@@ -1237,19 +1235,19 @@ impl<M: MacDriver> BdbLayer<M> {
                     //
                     // So: when sec=1 and we have no NWK key, simply drop.
                     self.steering_diagnostics.key_frame_result = KeyFrameResult::SecuredNoActiveKey;
-                    bdb_diag!("[BDB][EFR32] sec=1 no_active_key — drop (KT is APS-layer, not NWK)");
+                    bdb_diag!("[BDB] sec=1 no_active_key — drop (KT is APS-layer, not NWK)");
                     payload_data = None;
                 }
             } else {
                 self.steering_diagnostics.key_frame_result =
                     KeyFrameResult::SecurityHeaderParseFailed;
-                bdb_diag!("[BDB][EFR32] nwk_sec=parse_fail len={}", after_nwk.len());
+                bdb_diag!("[BDB] nwk_sec=parse_fail len={}", after_nwk.len());
                 log::warn!("[BDB:Steering] NWK security header parse failed");
                 payload_data = None;
             }
         } else {
             // NWK security OFF — this is what Transport-Key looks like
-            bdb_diag!("[BDB][EFR32] nwk_unsecured after_nwk={}", after_nwk.len());
+            bdb_diag!("[BDB] nwk_unsecured after_nwk={}", after_nwk.len());
             log::info!(
                 "[BDB:Steering] NWK unsecured frame! {} bytes — possible Transport-Key",
                 after_nwk.len()
@@ -1265,7 +1263,7 @@ impl<M: MacDriver> BdbLayer<M> {
             // Log first 20 bytes hex for debugging APS parsing
             if len >= 4 {
                 bdb_diag!(
-                    "[BDB][EFR32] aps first={:02X} {:02X} {:02X} {:02X} len={}",
+                    "[BDB] aps first={:02X} {:02X} {:02X} {:02X} len={}",
                     data[0],
                     data[1],
                     data[2],
@@ -1298,16 +1296,16 @@ impl<M: MacDriver> BdbLayer<M> {
 
             if self.zdo.aps().nwk().security().active_key().is_some() {
                 self.steering_diagnostics.key_frame_result = KeyFrameResult::KeyInstalled;
-                bdb_diag!("[BDB][EFR32] aps_process=key_installed");
+                bdb_diag!("[BDB] aps_process=key_installed");
                 log::info!("[BDB:Steering] NWK key received from TC!");
                 return Some(true);
             }
             self.steering_diagnostics.key_frame_result = KeyFrameResult::ApsProcessedNoKey;
-            bdb_diag!("[BDB][EFR32] aps_process=no_key");
+            bdb_diag!("[BDB] aps_process=no_key");
             log::info!("[BDB:Steering] APS processed but no key installed yet");
             Some(false)
         } else {
-            bdb_diag!("[BDB][EFR32] payload_data=none");
+            bdb_diag!("[BDB] payload_data=none");
             None
         }
     }

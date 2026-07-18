@@ -172,7 +172,7 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
     async fn flush_pending_responses(&mut self) {
         while let Some(resp) = self.pending_responses.pop() {
             rt_trace!(
-                "[RT][EFR32] zcl_tx dst=0x{:04X} src_ep={} dst_ep={} cluster=0x{:04X} len={}",
+                "[RT] zcl_tx dst=0x{:04X} src_ep={} dst_ep={} cluster=0x{:04X} len={}",
                 resp.dst_addr.0,
                 resp.src_endpoint,
                 resp.dst_endpoint,
@@ -197,7 +197,7 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                 .await
             {
                 rt_trace!(
-                    "[RT][EFR32] zcl_tx_err dst=0x{:04X} cluster=0x{:04X}",
+                    "[RT] zcl_tx_err dst=0x{:04X} cluster=0x{:04X}",
                     resp.dst_addr.0,
                     resp.cluster_id,
                 );
@@ -209,7 +209,7 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                 );
             } else {
                 rt_trace!(
-                    "[RT][EFR32] zcl_tx_ok dst=0x{:04X} cluster=0x{:04X}",
+                    "[RT] zcl_tx_ok dst=0x{:04X} cluster=0x{:04X}",
                     resp.dst_addr.0,
                     resp.cluster_id,
                 );

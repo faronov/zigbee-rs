@@ -600,7 +600,6 @@ dependencies = [
  "aes",
  "heapless 0.9.2",
  "log",
- "rtt-target",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-types",
@@ -612,7 +611,6 @@ version = "0.1.0"
 dependencies = [
  "heapless 0.9.2",
  "log",
- "rtt-target",
  "zigbee-aps",
  "zigbee-mac",
  "zigbee-nwk",
@@ -641,7 +639,6 @@ dependencies = [
  "aes",
  "heapless 0.9.2",
  "log",
- "rtt-target",
  "zigbee-mac",
  "zigbee-types",
 ]
@@ -652,7 +649,6 @@ version = "0.1.0"
 dependencies = [
  "heapless 0.9.2",
  "log",
- "rtt-target",
  "zigbee-aps",
  "zigbee-bdb",
  "zigbee-mac",
