@@ -342,15 +342,17 @@ jobs:
         run: |
           ELF=examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor
           OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
+          sh examples/phy6222-sensor/check-layout.sh $ELF
+          cargo run --quiet -p phy62x2-image -- ${ELF}.hex ${ELF}.phy6.bin
       - name: Upload PHY6222 firmware
         uses: actions/upload-artifact@v4
         with:
           name: phy6222-sensor-firmware
           path: |
-            examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor.bin
+            examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor
             examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor.hex
+            examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor.phy6.bin
 
   # ── EFR32MG1P (Silicon Labs, ARM Cortex-M4F) ─────────────────
   build-efr32mg1:

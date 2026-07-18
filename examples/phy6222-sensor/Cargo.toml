@@ -33,13 +33,17 @@ log = "0.4"
 # Panic handler for embedded target
 panic-halt = "1.0"
 
-# Portable atomics for Cortex-M0 (no native atomics)
-portable-atomic = { version = "1", features = ["unsafe-assume-single-core"] }
+# Cortex-M0 has no native 32-bit atomics; emulate them with the platform
+# critical-section implementation instead of making an unsupported assumption.
+portable-atomic = { version = "1", features = ["critical-section"] }
 
 [features]
-default = []
+default = ["phy6222"]
+phy6222 = []
+phy6252 = []
 stubs = []
 
 [profile.release]
 opt-level = "s"
 lto = true
+panic = "abort"

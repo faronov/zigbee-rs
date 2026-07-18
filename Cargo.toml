@@ -16,6 +16,7 @@ members = [
     "examples/mock-light",
     "examples/mock-sleepy-sensor",
     "tests",
+    "tools/phy62x2-image",
 ]
 exclude = [
     "examples/nrf52840-sensor",
@@ -30,6 +31,7 @@ exclude = [
     "examples/telink-tlsr8258-sensor",
     "examples/telink-tlsr8258-radio",
     "tlsr8258-hal",
+    "tlsr8258-rt",
     "examples/phy6222-sensor",
     "examples/efr32mg1-sensor",
     "examples/efr32mg21-sensor",

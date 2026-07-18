@@ -159,7 +159,7 @@ actual sleep/wake is performed by the MAC backend:
 | ESP32-C6/H2 | `esp_light_sleep_start()` | `esp_deep_sleep()` — only RTC memory retained |
 | nRF52840 | `TASKS_DISABLE` + `__WFE` (System ON, RAM retained) | System OFF (wake via GPIO/RTC) |
 | TLSR8258 | `radio_sleep()` + WFI (~1.5 mA) | CPU suspend (~3 µA, timer wake, RAM retained) |
-| PHY6222 | `radio_sleep()` + WFE (~1.5 mA) | AON system sleep (~3 µA, RTC wake) |
+| PHY6222 | `radio_sleep()` + Embassy timer wait | AON system sleep not enabled |
 | EFR32MG1 | `radio_sleep()` — radio clock gating via CMU | — |
 | EFR32MG21 | `radio_sleep()` — radio clock gating via CMU | — |
 | BL702 | PDS (Power Down Sleep) | HBN (Hibernate) — wake via RTC |
@@ -310,12 +310,8 @@ The suspend mode uses direct register access:
 
 ### PHY6222
 
-The PHY6222 sensor implements a **two-tier sleep architecture** that combines
-light sleep during fast polling with deep AON system sleep during slow polling.
-
-**Tier 1 — Light sleep (fast poll, ~1.5 mA):**
-During fast polling (first 120 seconds after join/activity), the radio is
-turned off between polls and the CPU enters WFE via Embassy's `Timer::after()`:
+The PHY62x2 example currently uses only radio sleep plus Embassy timer waits
+between parent polls:
 
 ```rust
 device.mac_mut().radio_sleep();
@@ -323,65 +319,11 @@ Timer::after(Duration::from_millis(poll_ms)).await;
 device.mac_mut().radio_wake();
 ```
 
-**Tier 2 — AON system sleep (slow poll, ~3 µA):**
-During slow polling (30-second intervals), the device enters full system sleep:
-
-```rust
-// Turn off radio
-device.mac_mut().radio_sleep();
-// Save Zigbee state to flash NV
-device.save_state(&mut nv);
-// Prepare peripherals for minimum leakage
-phy6222_hal::gpio::prepare_for_sleep(1 << pins::BTN);
-// Flash to deep power-down (~1µA vs ~15µA standby)
-phy6222_hal::flash::enter_deep_sleep();
-// Configure SRAM retention and RTC wake
-phy6222_hal::sleep::set_ram_retention(phy6222_hal::regs::RET_SRAM0);
-phy6222_hal::sleep::config_rtc_wakeup(
-    phy6222_hal::sleep::ms_to_rtc_ticks(poll_ms as u32),
-);
-phy6222_hal::sleep::enter_system_sleep();
-```
-
-On wake, the firmware detects the system-sleep reset, restores flash from deep
-power-down, and does a fast restore of the Zigbee network state from NV.
-
-**Flash deep power-down** — JEDEC commands `0xB9` (enter) and `0xAB` (release)
-reduce flash standby current from ~15 µA to ~1 µA:
-
-```rust
-phy6222_hal::flash::enter_deep_sleep();   // JEDEC 0xB9
-phy6222_hal::flash::release_deep_sleep(); // JEDEC 0xAB on wake
-```
-
-**GPIO leak prevention** — Before system sleep, all unused GPIO pins are
-configured as inputs with pull-down resistors to prevent floating-pin leakage.
-Only essential pins (e.g., the button) retain their pull-up:
-
-```rust
-phy6222_hal::gpio::prepare_for_sleep(1 << pins::BTN);
-```
-
-**Radio sleep/wake** — The MAC driver provides `radio_sleep()` and
-`radio_wake()` methods that power down the radio transceiver between polls,
-saving ~5–8 mA:
-
-```rust
-device.mac_mut().radio_sleep();
-// ... sleep ...
-device.mac_mut().radio_wake();
-```
-
-The `phy6222-hal::sleep` module provides the full AON domain API:
-
-| Function | Purpose |
-|----------|---------|
-| `config_rtc_wakeup(ticks)` | Set RTC compare channel 0 for timed wake |
-| `set_ram_retention(banks)` | Select SRAM banks to retain during sleep |
-| `enter_system_sleep()` | Enter AON system sleep (~3 µA, does not return) |
-| `was_sleep_reset()` | Check if current boot was a wake from system sleep |
-| `clear_sleep_flag()` | Clear the sleep-wake flag after detection |
-| `ms_to_rtc_ticks(ms)` | Convert milliseconds to 32 kHz RC ticks |
+The low-level HAL contains RTC, SRAM-retention, and RAM-resident sleep-entry
+primitives, but the application does not call them. AON wake restarts through
+ROM; enabling it safely requires hardware proof of the packaged boot image,
+flash release, interrupt dispatch, and retained runtime state. No PHY62x2
+sleep-current or battery-life claim is made.
 
 ---
 
@@ -454,21 +396,10 @@ environments.
 > With reportable change thresholds suppressing most TX events, practical
 > battery life approaches the self-discharge limit of the CR2032.
 
-### PHY6222 (2×AAA, ~1200 mAh)
+### PHY6222
 
-| State | Current | Duty Cycle | Average |
-|-------|---------|------------|---------|
-| AON system sleep (radio off, flash off, GPIO prepared) | ~3 µA | ~99.8% | ~3.0 µA |
-| Flash standby (deep power-down) | ~1 µA | — | included above |
-| Radio RX (poll) | ~8 mA | ~0.03% (10 ms / 30 s) | ~2.7 µA |
-| Radio TX (report) | ~10 mA | ~0.005% (3 ms / 60 s) | ~0.5 µA |
-| Fast poll phase (WFE, ~1.5 mA) | ~1.5 mA | ~1.5% (120 s / 2 hr) | ~22 µA |
-| **Total average (steady state)** | | | **~6–35 µA** |
-| **Estimated battery life (2×AAA)** | | | **~3+ years** |
-
-> The fast-poll phase (first 120 seconds after joining or button press) draws
-> ~1.5 mA but lasts only briefly. In steady state with 30-second slow polls
-> and AON system sleep, the average drops below 10 µA.
+No power budget is published yet. The current example uses light sleep only,
+and neither radio timing nor AON sleep current has been measured on hardware.
 
 ---
 

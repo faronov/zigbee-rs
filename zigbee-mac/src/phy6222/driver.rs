@@ -31,7 +31,18 @@
 //! Derived from the open-source PHY6222 SDK (`rf_phy_driver.c`, `ll_hw_drv.c`)
 //! available at: <https://github.com/pvvx/THB2>
 
-use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, Ordering};
+// `LL_HW_BASE + 0x00` (the trigger register) is written out with an
+// explicit `+ 0x00` offset throughout this file, matching every other
+// `reg_write(BASE + offset, ...)` call site and the register map comments
+// above each block. This is a deliberate readability/consistency choice
+// for a file that is effectively a register map transcription — silence
+// clippy's `identity_op` for it rather than making the trigger register
+// the one visual outlier among dozens of sibling register writes.
+#![allow(clippy::identity_op)]
+
+use core::cell::Cell;
+use core::sync::atomic::{AtomicI8, AtomicU8, Ordering};
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 
@@ -107,6 +118,7 @@ static TX_DONE: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 
 /// RX completion signal (set from IRQ handler).
 static RX_DONE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static DRIVER_TAKEN: Mutex<CriticalSectionRawMutex, Cell<bool>> = Mutex::new(Cell::new(false));
 
 // Static RX buffer — written by IRQ handler, read after signal.
 struct SyncUnsafeCell<T>(core::cell::UnsafeCell<T>);
@@ -121,13 +133,101 @@ impl<T> SyncUnsafeCell<T> {
     }
 }
 
-/// Maximum IEEE 802.15.4 frame size (PHY payload = 127 bytes).
+/// Maximum IEEE 802.15.4 on-air PSDU size (`aMaxPHYPacketSize` = 127 bytes,
+/// including the 2-byte FCS/CRC-16).
 const MAX_FRAME_LEN: usize = 127;
+
+/// Maximum MPDU length (MAC header + payload) that may be handed to
+/// [`Phy6222Driver::transmit`] or read back from [`Phy6222Driver::receive`].
+///
+/// The hardware appends (TX) / includes (RX) a 2-byte FCS on top of this,
+/// so `MAX_MPDU_LEN + 2 == MAX_FRAME_LEN` keeps the on-air PSDU within
+/// `aMaxPHYPacketSize`. See `transmit()` and `zb_rfifo_mpdu_len()`.
+const MAX_MPDU_LEN: usize = MAX_FRAME_LEN - 2;
+
+/// CCA / energy-detect busy threshold, in dBm. Matches the typical
+/// IEEE 802.15.4 CCA Mode 1 (energy above threshold) default.
+const CCA_THRESHOLD_DBM: i8 = -60;
 
 static RX_BUF: SyncUnsafeCell<[u8; MAX_FRAME_LEN]> = SyncUnsafeCell::new([0u8; MAX_FRAME_LEN]);
 static RX_LEN: AtomicU8 = AtomicU8::new(0);
-static RX_CRC_OK: AtomicBool = AtomicBool::new(false);
 static RX_RSSI: AtomicI8 = AtomicI8::new(-127);
+
+/// Outcome of the most recently completed SRX (single-RX) hardware
+/// operation. Replaces a bare "CRC ok?" boolean so that a genuine RX
+/// timeout (`LIRQ_RTO`, no frame received at all) can be told apart from
+/// a frame that *was* received but failed its CRC check — both used to
+/// collapse into the same "not CRC-OK" state and were reported to callers
+/// as [`RadioError::CrcError`], hiding real timeouts. See `receive()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum RxOutcome {
+    /// No SRX has completed since the last reset — `RX_DONE` should not
+    /// yet be signalled while this is the value; treated defensively as a
+    /// hardware error if ever observed after a signal.
+    Pending = 0,
+    /// Mode-done with good CRC — a frame is available in `RX_BUF`/`RX_LEN`.
+    FrameOk = 1,
+    /// Mode-done but the CRC check failed.
+    CrcError = 2,
+    /// The RX window elapsed with no frame received at all.
+    Timeout = 3,
+}
+
+impl RxOutcome {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => RxOutcome::FrameOk,
+            2 => RxOutcome::CrcError,
+            3 => RxOutcome::Timeout,
+            _ => RxOutcome::Pending,
+        }
+    }
+}
+
+static RX_OUTCOME: AtomicU8 = AtomicU8::new(RxOutcome::Pending as u8);
+
+/// Classify a raw LL HW IRQ status word for an SRX (single-RX) mode-done or
+/// timeout event.
+///
+/// Kept as a small, pure, hardware-independent function (no register
+/// access) precisely so the mode-done/CRC/timeout precedence can be
+/// exercised with host tests — see `driver::tests`. `LL_IRQ` calls this
+/// only for the RX-relevant events (mode-done while in SRX mode, or an
+/// `LIRQ_RTO` with no mode-done) it has already identified via the mode
+/// register, matching this function's precedence: mode-done takes priority
+/// over a (mutually exclusive, per the PHY6222 LL HW) timeout bit.
+fn classify_rx_irq(irq_status: u32) -> RxOutcome {
+    if irq_status & LIRQ_MD != 0 {
+        if irq_status & LIRQ_COK != 0 {
+            RxOutcome::FrameOk
+        } else {
+            RxOutcome::CrcError
+        }
+    } else if irq_status & LIRQ_RTO != 0 {
+        RxOutcome::Timeout
+    } else {
+        RxOutcome::Pending
+    }
+}
+
+/// Convert the PHY6222 Zigbee RFIFO length byte into the MPDU length
+/// (MAC header + payload, FCS stripped) used by the rest of this driver.
+///
+/// Per the public pvvx/THB2 PHY6222 SDK (`ll_hw_drv.c`,
+/// `ll_hw_read_rfifo_zb()`): the length byte popped from the head of the
+/// RX FIFO is the over-the-air PSDU length and "blen included the 2 byte
+/// crc" — i.e. it counts the trailing 2-byte FCS/CRC-16, exactly like the
+/// length byte `transmit()` writes to the TX FIFO (`frame.len() + 2`).
+/// Both driver.rs FIFO consumers must agree on this convention: after
+/// popping the length byte, the following `len_byte` bytes in the FIFO are
+/// `[MHR][payload][fcs_lo][fcs_hi]`. This function strips the trailing 2
+/// FCS bytes so `RX_LEN`/`RX_BUF` (and therefore `RxFrame`) hold only the
+/// MPDU, matching what `transmit()` sends and what the MAC layer parses
+/// (FCF, addressing, payload — no FCS).
+fn zb_rfifo_mpdu_len(len_byte: u8) -> usize {
+    (len_byte as usize).saturating_sub(2).min(MAX_MPDU_LEN)
+}
 
 // ── Public types ────────────────────────────────────────────────
 
@@ -196,11 +296,23 @@ pub struct Phy6222Driver {
 }
 
 impl Phy6222Driver {
-    /// Create and initialize a new PHY6222 radio driver.
+    /// Acquire and initialize the process-wide PHY6222 radio driver.
     ///
-    /// Configures the radio for IEEE 802.15.4 (Zigbee) mode with the given
-    /// settings. After this call the radio is ready for TX/RX.
-    pub fn new(config: RadioConfig) -> Self {
+    /// IRQ signals and FIFO state are global hardware resources, so a second
+    /// driver instance would alias them unsafely.
+    pub fn take(config: RadioConfig) -> Option<Self> {
+        let acquired = DRIVER_TAKEN.lock(|taken| {
+            if taken.get() {
+                false
+            } else {
+                taken.set(true);
+                true
+            }
+        });
+        acquired.then(|| Self::new(config))
+    }
+
+    fn new(config: RadioConfig) -> Self {
         let mut drv = Self {
             config,
             initialized: false,
@@ -356,7 +468,7 @@ impl Phy6222Driver {
         reg_write(RF_PHY_BASE + 0x80, old);
 
         // Sanity check: valid cap range is roughly 0x05..0x3F
-        if cap >= 0x05 && cap <= 0x3F {
+        if (0x05..=0x3F).contains(&cap) {
             cap
         } else {
             0x20 // fallback default
@@ -387,8 +499,11 @@ impl Phy6222Driver {
 
     /// Interpolate TP calibration cap value for a given RF channel index.
     fn tp_cal_for_channel(&self, rf_chn: u8) -> u8 {
-        // Linear interpolation between cal points at rf_chn=2 and rf_chn=66
-        let idx = ((rf_chn.saturating_sub(2)) >> 1).min(39) as u16;
+        // Interpolate only inside the measured 2..=66 range. Zigbee
+        // channels 25-26 map above the high point and must use that endpoint
+        // rather than extrapolating an unmeasured capacitor value.
+        let calibrated_channel = rf_chn.clamp(2, 66);
+        let idx = ((calibrated_channel - 2) >> 1) as u16;
         let cal0 = self.tp_cal0 as u16;
         let cal1 = self.tp_cal1 as u16;
         let result = if cal1 >= cal0 {
@@ -424,15 +539,26 @@ impl Phy6222Driver {
 
     /// Transmit an IEEE 802.15.4 frame (async).
     ///
-    /// The frame should contain the full MAC header + payload. The radio
-    /// hardware appends the 2-byte FCS (CRC-16) automatically.
+    /// `frame` must be the MAC header + payload **without** an FCS — the
+    /// radio hardware appends the 2-byte FCS (CRC-16) automatically. Since
+    /// the on-air PSDU is `frame.len() + 2` and must stay within
+    /// `aMaxPHYPacketSize` (127 bytes), `frame` itself is bounded by
+    /// [`MAX_MPDU_LEN`] (125 bytes), not [`MAX_FRAME_LEN`].
     pub async fn transmit(&mut self, frame: &[u8]) -> Result<(), RadioError> {
         if !self.initialized {
             return Err(RadioError::NotInitialized);
         }
-        if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
+        if frame.is_empty() || frame.len() > MAX_MPDU_LEN {
             return Err(RadioError::InvalidFrame);
         }
+
+        // Defensively abort any SRX left running by a `receive()` future
+        // that was cancelled (e.g. by `embassy_futures::select` racing a
+        // timeout) before it reached `RX_DONE.wait().await`'s completion,
+        // and clear any IRQ status latched by it, so this TX starts from a
+        // clean hardware state. See `receive()` for the matching rationale.
+        reg_write(LL_HW_BASE + 0x00, 0x0000);
+        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
 
         TX_DONE.reset();
 
@@ -480,12 +606,33 @@ impl Phy6222Driver {
     /// Receive the next IEEE 802.15.4 frame (async).
     ///
     /// Enables the receiver and waits for a frame. Returns the frame data
-    /// with RSSI and LQI. Frames failing CRC are rejected.
+    /// (FCS stripped, see [`zb_rfifo_mpdu_len`]) with RSSI and LQI.
+    /// Returns [`RadioError::CrcError`] for a frame that failed its CRC
+    /// check, or [`RadioError::RxTimeout`] if the RX window elapsed with
+    /// no frame at all — the two are distinguished via [`RxOutcome`]
+    /// rather than collapsed into one "not ok" state.
+    ///
+    /// # Cancellation
+    /// Callers (the MAC layer) routinely race this future against a timer
+    /// with `embassy_futures::select` and drop it if the timer wins. When
+    /// that happens the SRX operation this call started may still be
+    /// running in hardware. The next call to `receive()` (or `transmit()`)
+    /// defensively aborts that stale SRX and clears any IRQ/status it may
+    /// have latched *before* starting its own operation, so a leftover
+    /// operation from a cancelled `receive()` can't corrupt or pre-empt
+    /// the next one.
     pub async fn receive(&mut self) -> Result<RxFrame, RadioError> {
         if !self.initialized {
             return Err(RadioError::NotInitialized);
         }
 
+        // Abort any previous SRX left running by a cancelled `receive()`
+        // future and clear stale IRQ/status latched from it (see doc
+        // comment above) before touching `RX_DONE`/`RX_OUTCOME`, so a
+        // late spurious IRQ from that stale operation can't race us.
+        reg_write(LL_HW_BASE + 0x00, 0x0000);
+        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
+        RX_OUTCOME.store(RxOutcome::Pending as u8, Ordering::Release);
         RX_DONE.reset();
 
         // Set single-RX mode
@@ -505,12 +652,18 @@ impl Phy6222Driver {
         // Wait for RX completion
         RX_DONE.wait().await;
 
-        if !RX_CRC_OK.load(Ordering::Acquire) {
-            return Err(RadioError::CrcError);
+        match RxOutcome::from_u8(RX_OUTCOME.load(Ordering::Acquire)) {
+            RxOutcome::CrcError => return Err(RadioError::CrcError),
+            RxOutcome::Timeout => return Err(RadioError::RxTimeout),
+            // `RX_DONE` fired without `LL_IRQ` recording an outcome — should
+            // not happen, but fail safe rather than read stale RX_LEN/RX_BUF.
+            RxOutcome::Pending => return Err(RadioError::HardwareError),
+            RxOutcome::FrameOk => {}
         }
 
         let len = RX_LEN.load(Ordering::Acquire) as usize;
         if len == 0 {
+            // Defensive: `FrameOk` should always carry a non-zero MPDU.
             return Err(RadioError::RxTimeout);
         }
 
@@ -532,32 +685,26 @@ impl Phy6222Driver {
         Ok(frame)
     }
 
-    /// Perform Clear Channel Assessment (energy detection).
+    /// Briefly enable the receiver on the current channel and measure RSSI.
     ///
-    /// Returns (RSSI in dBm, channel_busy).
-    pub fn energy_detect(&self) -> Result<(i8, bool), RadioError> {
+    /// Shared by [`Self::energy_detect`] and [`Self::clear_channel_assessment`]
+    /// — both need to actually turn the receiver on for a short window and
+    /// let the RSSI front-end settle before reading the foot-word RSSI
+    /// register; reading that register without first enabling SRX would
+    /// return whatever value happened to be latched from an earlier,
+    /// unrelated RX (or nothing, on a cold radio).
+    async fn measure_channel_rssi(&mut self) -> Result<i8, RadioError> {
         if !self.initialized {
             return Err(RadioError::NotInitialized);
         }
 
-        // Read RSSI from the RX front-end (foot word 0)
-        let foot0 = reg_read(RF_PHY_BASE + 0xE4);
-        let rssi_raw = ((foot0 >> 24) & 0xFF) as i8;
-        let busy = rssi_raw > -60; // CCA threshold: -60 dBm (typical)
+        // Defensively abort any stale SRX (e.g. a cancelled `receive()`)
+        // and clear stale IRQ status first — see `receive()`.
+        reg_write(LL_HW_BASE + 0x00, 0x0000);
+        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
 
-        Ok((rssi_raw, busy))
-    }
-
-    /// Perform Clear Channel Assessment (async, IEEE 802.15.4 CCA mode 1).
-    ///
-    /// Briefly enables the receiver to measure RF energy on the current channel.
-    /// Returns `true` if the channel is busy (energy above threshold).
-    pub async fn clear_channel_assessment(&mut self) -> Result<bool, RadioError> {
-        if !self.initialized {
-            return Err(RadioError::NotInitialized);
-        }
-
-        // Set SRX mode with a short timeout
+        // Set SRX mode with a short timeout, just to energize the receiver
+        // and sample RF energy — we don't care about demodulating a frame.
         reg_write(LL_HW_BASE + 0x04, 0x01_00_01);
         reg_write(LL_HW_BASE + 0x38, 0x07);
         reg_write(LL_HW_BASE + 0x28, 0x0800); // short RX window
@@ -568,20 +715,43 @@ impl Phy6222Driver {
         // Trigger RX
         reg_write(LL_HW_BASE + 0x00, 0x0001);
 
-        // Wait 128µs (8 symbol periods) for RSSI to settle
+        // Wait 128µs (8 symbol periods, the minimum 802.15.4 ED duration)
+        // for RSSI to settle.
         embassy_time::Timer::after_micros(128).await;
 
         // Read RSSI from foot word
         let foot0 = reg_read(RF_PHY_BASE + 0xE4);
         let rssi = ((foot0 >> 24) & 0xFF) as i8;
 
-        // Abort RX
+        // Abort RX and clear IRQ status so the next operation starts clean.
         reg_write(LL_HW_BASE + 0x00, 0x0000);
         reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
 
-        // CCA threshold: -60 dBm (typical for 802.15.4)
-        let busy = rssi > -60;
-        Ok(busy)
+        Ok(rssi)
+    }
+
+    /// Perform an IEEE 802.15.4 Energy Detect scan on the current channel.
+    ///
+    /// Actually enables the receiver for a short window and measures RF
+    /// energy (via [`Self::measure_channel_rssi`]) rather than reading a
+    /// possibly-stale RSSI register — the channel to measure is whatever
+    /// `RadioConfig::channel` is currently applied to hardware (callers
+    /// select the channel via `update_config` before calling this, e.g.
+    /// during `MLME-SCAN.request` with `ScanType::Ed`).
+    ///
+    /// Returns (RSSI in dBm, channel_busy).
+    pub async fn energy_detect(&mut self) -> Result<(i8, bool), RadioError> {
+        let rssi = self.measure_channel_rssi().await?;
+        Ok((rssi, rssi > CCA_THRESHOLD_DBM))
+    }
+
+    /// Perform Clear Channel Assessment (async, IEEE 802.15.4 CCA mode 1).
+    ///
+    /// Briefly enables the receiver to measure RF energy on the current channel.
+    /// Returns `true` if the channel is busy (energy above threshold).
+    pub async fn clear_channel_assessment(&mut self) -> Result<bool, RadioError> {
+        let rssi = self.measure_channel_rssi().await?;
+        Ok(rssi > CCA_THRESHOLD_DBM)
     }
 
     /// Enable continuous receive mode.
@@ -665,15 +835,23 @@ pub extern "C" fn LL_IRQ() {
             // STX mode done → TX complete
             TX_DONE.signal(true);
         } else if mode == 0x01 {
-            // SRX mode done → check for received data
-            let crc_ok = (irq_status & LIRQ_COK) != 0;
-            RX_CRC_OK.store(crc_ok, Ordering::Release);
+            // SRX mode done — `classify_rx_irq` distinguishes CRC-ok from
+            // CRC-error for a mode-done event (RTO is not set here, since
+            // mode-done and RX-timeout are mutually exclusive per the LL
+            // HW; see `classify_rx_irq`'s doc comment).
+            let outcome = classify_rx_irq(irq_status);
+            RX_OUTCOME.store(outcome as u8, Ordering::Release);
 
-            if crc_ok {
-                // Read frame from RX FIFO
+            if outcome == RxOutcome::FrameOk {
+                // Read frame from RX FIFO. `len_byte` is the PSDU length
+                // as encoded by the PHY6222 Zigbee RFIFO framing and
+                // includes the 2-byte FCS; `zb_rfifo_mpdu_len` strips it
+                // so `RX_LEN`/`RX_BUF` hold only the MPDU (MHR + payload),
+                // matching what `transmit()` sends and what the MAC layer
+                // parses. See `zb_rfifo_mpdu_len`'s doc comment.
                 let rfifo = LL_HW_RFIFO as *const u8;
                 let len_byte = unsafe { core::ptr::read_volatile(rfifo) };
-                let len = (len_byte as usize).min(MAX_FRAME_LEN);
+                let len = zb_rfifo_mpdu_len(len_byte);
 
                 RX_LEN.store(len as u8, Ordering::Release);
 
@@ -682,11 +860,12 @@ pub extern "C" fn LL_IRQ() {
                 let rssi = ((foot0 >> 24) & 0xFF) as i8;
                 RX_RSSI.store(rssi, Ordering::Release);
 
-                // Copy frame data
+                // Copy frame data (MPDU only — the 2 FCS bytes still
+                // sitting in the FIFO after it are left unread here).
                 unsafe {
                     let buf = &mut *RX_BUF.get();
-                    for i in 0..len {
-                        buf[i] = core::ptr::read_volatile(rfifo.add(1 + i));
+                    for (i, byte) in buf.iter_mut().enumerate().take(len) {
+                        *byte = core::ptr::read_volatile(rfifo.add(1 + i));
                     }
                 }
             } else {
@@ -696,8 +875,9 @@ pub extern "C" fn LL_IRQ() {
             RX_DONE.signal(());
         }
     } else if irq_status & LIRQ_RTO != 0 {
-        // RX timeout
-        RX_CRC_OK.store(false, Ordering::Release);
+        // RX timeout — no frame received at all, distinct from a received
+        // frame that failed its CRC check (see `RxOutcome`).
+        RX_OUTCOME.store(RxOutcome::Timeout as u8, Ordering::Release);
         RX_LEN.store(0, Ordering::Release);
         RX_DONE.signal(());
     }
@@ -710,4 +890,136 @@ fn rssi_to_lqi(rssi: i8) -> u8 {
     // Simple linear mapping: -100 dBm → 0, -20 dBm → 255
     let clamped = (rssi as i16).clamp(-100, -20);
     (((clamped + 100) as u16) * 255 / 80) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests exercise only pure, hardware-independent helper
+    // functions. `Phy6222Driver`/`Phy6222Mac` cannot be constructed on a
+    // host test target: `Phy6222Driver::new()` performs unconditional,
+    // unsafe MMIO register access (`init_hardware()`), which would fault
+    // on any machine other than a real PHY6222 SoC — an existing, pre-dating
+    // limitation of this backend, not something introduced or worked
+    // around here. See item 6/7/8/9 helpers below.
+
+    #[test]
+    fn max_frame_and_mpdu_len_leave_room_for_two_byte_fcs() {
+        assert_eq!(MAX_FRAME_LEN, 127); // aMaxPHYPacketSize
+        assert_eq!(MAX_MPDU_LEN, 125);
+        assert_eq!(MAX_MPDU_LEN + 2, MAX_FRAME_LEN);
+    }
+
+    // ── classify_rx_irq (RxTimeout vs CrcError precedence, item 9) ──
+
+    #[test]
+    fn classify_rx_irq_mode_done_with_good_crc_is_frame_ok() {
+        assert_eq!(classify_rx_irq(LIRQ_MD | LIRQ_COK), RxOutcome::FrameOk);
+    }
+
+    #[test]
+    fn classify_rx_irq_mode_done_with_bad_crc_is_crc_error() {
+        assert_eq!(classify_rx_irq(LIRQ_MD | LIRQ_CERR), RxOutcome::CrcError);
+        // Mode-done without the COK bit set at all is also a CRC error,
+        // regardless of whether CERR happens to be latched too.
+        assert_eq!(classify_rx_irq(LIRQ_MD), RxOutcome::CrcError);
+    }
+
+    #[test]
+    fn classify_rx_irq_timeout_without_mode_done_is_timeout() {
+        assert_eq!(classify_rx_irq(LIRQ_RTO), RxOutcome::Timeout);
+    }
+
+    #[test]
+    fn classify_rx_irq_neither_bit_is_pending() {
+        assert_eq!(classify_rx_irq(0), RxOutcome::Pending);
+    }
+
+    #[test]
+    fn classify_rx_irq_mode_done_takes_precedence_over_timeout_bit() {
+        // The LL HW should never raise MD and RTO together for the same
+        // SRX operation, but if it did, a completed frame must win over a
+        // stray timeout bit rather than being discarded as a timeout.
+        assert_eq!(
+            classify_rx_irq(LIRQ_MD | LIRQ_COK | LIRQ_RTO),
+            RxOutcome::FrameOk
+        );
+    }
+
+    #[test]
+    fn rx_outcome_round_trips_through_u8() {
+        for outcome in [
+            RxOutcome::Pending,
+            RxOutcome::FrameOk,
+            RxOutcome::CrcError,
+            RxOutcome::Timeout,
+        ] {
+            assert_eq!(RxOutcome::from_u8(outcome as u8), outcome);
+        }
+        // Any other encoded value defensively decodes to `Pending` rather
+        // than panicking or aliasing a real outcome.
+        assert_eq!(RxOutcome::from_u8(0xFF), RxOutcome::Pending);
+    }
+
+    // ── zb_rfifo_mpdu_len (FCS stripping, item 6) ───────────────────
+
+    #[test]
+    fn zb_rfifo_mpdu_len_strips_two_byte_fcs() {
+        // A 10-byte over-the-air PSDU (8-byte MPDU + 2-byte FCS).
+        assert_eq!(zb_rfifo_mpdu_len(10), 8);
+    }
+
+    #[test]
+    fn zb_rfifo_mpdu_len_at_max_psdu_matches_max_mpdu_len() {
+        assert_eq!(zb_rfifo_mpdu_len(MAX_FRAME_LEN as u8), MAX_MPDU_LEN);
+    }
+
+    #[test]
+    fn zb_rfifo_mpdu_len_saturates_instead_of_underflowing() {
+        // A length byte shorter than the FCS itself (corrupt/impossible in
+        // practice) must not panic or wrap around `usize`.
+        assert_eq!(zb_rfifo_mpdu_len(0), 0);
+        assert_eq!(zb_rfifo_mpdu_len(1), 0);
+        assert_eq!(zb_rfifo_mpdu_len(2), 0);
+    }
+
+    #[test]
+    fn zb_rfifo_mpdu_len_caps_at_max_mpdu_len() {
+        // Defensive cap even if the length byte somehow exceeded the PHY's
+        // own 127-byte maximum.
+        assert_eq!(zb_rfifo_mpdu_len(u8::MAX), MAX_MPDU_LEN);
+    }
+
+    // ── rssi_to_lqi sanity ───────────────────────────────────────────
+
+    #[test]
+    fn rssi_to_lqi_is_monotonic_and_bounded() {
+        assert_eq!(rssi_to_lqi(-100), 0);
+        assert_eq!(rssi_to_lqi(-20), 255);
+        assert!(rssi_to_lqi(-60) > rssi_to_lqi(-90));
+        // Out-of-range RSSI values are clamped, not wrapped.
+        assert_eq!(rssi_to_lqi(-128), rssi_to_lqi(-100));
+        assert_eq!(rssi_to_lqi(0), rssi_to_lqi(-20));
+    }
+
+    // ── CCA / ED threshold (item 8 support) ─────────────────────────
+
+    #[test]
+    fn cca_threshold_matches_ieee_802_15_4_cca_mode_1_default() {
+        assert_eq!(CCA_THRESHOLD_DBM, -60);
+    }
+
+    #[test]
+    fn tp_calibration_clamps_above_measured_range() {
+        let driver = Phy6222Driver {
+            config: RadioConfig::default(),
+            initialized: false,
+            tp_cal0: 0x10,
+            tp_cal1: 0x30,
+        };
+        assert_eq!(driver.tp_cal_for_channel(66), 0x30);
+        assert_eq!(driver.tp_cal_for_channel(75), 0x30);
+        assert_eq!(driver.tp_cal_for_channel(80), 0x30);
+    }
 }

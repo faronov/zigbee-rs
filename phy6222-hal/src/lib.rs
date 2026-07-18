@@ -1,4 +1,4 @@
-//! Pure-Rust HAL for PHY6222/PHY6226/PHY6252 SoC.
+//! Pure-Rust HAL for the PHY6222 family.
 //!
 //! No vendor SDK, no binary blobs — all hardware access through direct
 //! register writes derived from the open-source PHY6222 SDK.
@@ -9,16 +9,15 @@
 //! - [`adc`] — ADC single-shot battery voltage measurement
 //! - [`flash`] — SPIF flash controller: read (XIP), write, sector erase
 //!
-//! # Chip variants
-//! - **PHY6222**: BLE 5.4, 512KB flash, 64KB SRAM, QFN32/QFN24
-//! - **PHY6226**: Zigbee 3.0 variant (same silicon, different ROM)
-//! - **PHY6252**: 256KB flash variant
+//! Boot layout, flash size, and ROM services vary by chip. Applications must
+//! select and validate a concrete device layout rather than assuming PHY6222
+//! and PHY6252 images are interchangeable.
 
 #![no_std]
 
-pub mod regs;
-pub mod gpio;
-pub mod i2c;
 pub mod adc;
 pub mod flash;
+pub mod gpio;
+pub mod i2c;
+pub mod regs;
 pub mod sleep;

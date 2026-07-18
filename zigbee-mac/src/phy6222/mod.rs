@@ -10,6 +10,10 @@
 
 pub mod driver;
 
+use crate::frames::{
+    build_association_request, build_beacon_request, build_data_frame, build_data_request,
+    build_data_request_short, parse_association_response, parse_mac_addresses,
+};
 use crate::pib::{PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use crate::{MacCapabilities, MacDriver, MacError, PlatformServices};
@@ -45,9 +49,21 @@ pub struct Phy6222Mac {
     pending_assoc_frame: Option<([u8; 128], usize)>,
 }
 
+impl Default for Phy6222Mac {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Phy6222Mac {
     pub fn new() -> Self {
+        Self::take().expect("the PHY6222 radio driver has already been acquired")
+    }
+
+    /// Acquire the single PHY6222 MAC/radio instance.
+    pub fn take() -> Option<Self> {
         let config = RadioConfig::default();
+        let driver = Phy6222Driver::take(config)?;
         let ieee = Self::read_factory_ieee();
         log::info!(
             "[MAC] IEEE: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
@@ -60,8 +76,8 @@ impl Phy6222Mac {
             ieee[6],
             ieee[7]
         );
-        Self {
-            driver: Phy6222Driver::new(config),
+        Some(Self {
+            driver,
             short_address: ShortAddress(0xFFFF),
             pan_id: PanId(0xFFFF),
             channel: 11,
@@ -79,7 +95,11 @@ impl Phy6222Mac {
             max_frame_retries: 3,
             promiscuous: false,
             pending_assoc_frame: None,
-        }
+        })
+    }
+
+    pub fn extended_address(&self) -> IeeeAddress {
+        self.extended_address
     }
 
     /// Read the factory-programmed 6-byte BLE MAC from flash and convert
@@ -245,14 +265,14 @@ impl Phy6222Mac {
             let seq = frame[2];
             let ack_result = select::select(self.driver.receive(), Timer::after_micros(1500)).await;
 
-            if let select::Either::First(Ok(rx)) = ack_result {
-                if rx.len >= 3 {
-                    let fc = u16::from_le_bytes([rx.data[0], rx.data[1]]);
-                    let frame_type = fc & 0x07;
-                    let ack_seq = rx.data[2];
-                    if frame_type == 0x02 && ack_seq == seq {
-                        return Ok(());
-                    }
+            if let select::Either::First(Ok(rx)) = ack_result
+                && rx.len >= 3
+            {
+                let fc = u16::from_le_bytes([rx.data[0], rx.data[1]]);
+                let frame_type = fc & 0x07;
+                let ack_seq = rx.data[2];
+                if frame_type == 0x02 && ack_seq == seq {
+                    return Ok(());
                 }
             }
 
@@ -295,7 +315,11 @@ impl MacDriver for Phy6222Mac {
 
             match req.scan_type {
                 ScanType::Ed => {
-                    let (rssi, _busy) = self.driver.energy_detect().map_err(Self::map_radio_err)?;
+                    let (rssi, _busy) = self
+                        .driver
+                        .energy_detect()
+                        .await
+                        .map_err(Self::map_radio_err)?;
                     let ed = ((rssi as i16 + 100).clamp(0, 255)) as u8;
                     let _ = energy_list.push(EdValue {
                         channel: ch,
@@ -369,12 +393,13 @@ impl MacDriver for Phy6222Mac {
         self.channel = req.channel;
         self.driver.update_config(|c| c.channel = req.channel);
 
-        let coord_pan = req.coord_address.pan_id();
-
+        // `build_association_request` derives the destination PAN from
+        // `req.coord_address` itself and always uses the broadcast PAN
+        // (0xFFFF) with PAN ID compression clear for our own (unassociated)
+        // source, since we have no PAN yet — see its doc comment.
         let seq = self.next_dsn();
         let frame = build_association_request(
             seq,
-            coord_pan,
             &req.coord_address,
             &self.extended_address,
             &req.capability_info,
@@ -394,12 +419,12 @@ impl MacDriver for Phy6222Mac {
                 Timer::after(embassy_time::Duration::from_millis(500)).await;
             }
 
-            // Send Data Request to poll for association response
-            let data_req = build_data_request_ieee(
-                self.next_dsn(),
-                &req.coord_address,
-                &self.extended_address,
-            );
+            // Send Data Request to poll for association response. We are
+            // still unassociated (no short address yet), so this uses our
+            // IEEE address as source; `build_data_request`'s FCF dst-mode
+            // matches whether `req.coord_address` is short or extended.
+            let data_req =
+                build_data_request(self.next_dsn(), &req.coord_address, &self.extended_address);
             let _ = self.csma_ca_transmit(&data_req, true).await;
 
             let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(1500);
@@ -435,23 +460,23 @@ impl MacDriver for Phy6222Mac {
                         }
 
                         // Check for Association Response (MAC command, type 3)
-                        if frame_type == 0x03 {
-                            if let Some((addr, status_byte)) = parse_association_response(data) {
-                                let status = match status_byte {
-                                    0x00 => AssociationStatus::Success,
-                                    0x01 => AssociationStatus::PanAtCapacity,
-                                    _ => AssociationStatus::PanAccessDenied,
-                                };
-                                if status_byte == 0 {
-                                    self.short_address = addr;
-                                    self.driver.update_config(|c| c.short_address = addr.0);
-                                }
-                                confirm = Some(MlmeAssociateConfirm {
-                                    short_address: addr,
-                                    status,
-                                });
-                                break;
+                        if frame_type == 0x03
+                            && let Some((addr, status_byte)) = parse_association_response(data)
+                        {
+                            let status = match status_byte {
+                                0x00 => AssociationStatus::Success,
+                                0x01 => AssociationStatus::PanAtCapacity,
+                                _ => AssociationStatus::PanAccessDenied,
+                            };
+                            if status_byte == 0 {
+                                self.short_address = addr;
+                                self.driver.update_config(|c| c.short_address = addr.0);
                             }
+                            confirm = Some(MlmeAssociateConfirm {
+                                short_address: addr,
+                                status,
+                            });
+                            break;
                         }
 
                         // Data frame received during association — save it
@@ -667,14 +692,16 @@ impl MacDriver for Phy6222Mac {
         let passes: u8 = if has_short { 2 } else { 1 };
 
         for pass in 0..passes {
-            let data_req = if pass == 0 && has_short {
-                build_data_request(self.next_dsn(), self.pan_id, self.coord_short_address)
-                    .as_slice()
-                    .iter()
-                    .copied()
-                    .collect::<heapless::Vec<u8, 24>>()
+            // Pass 0 (once associated) polls with our real short address —
+            // never the unassigned/broadcast 0xFFFF placeholder — so the
+            // parent's indirect-transmission queue lookup matches us.
+            // Pass 1 (IEEE) catches frames (e.g. Transport-Key) the parent
+            // queued against our extended address before it learned our
+            // short address.
+            let data_req: heapless::Vec<u8, 24> = if pass == 0 && has_short {
+                build_data_request_short(self.next_dsn(), &parent, self.short_address)
             } else {
-                build_data_request_ieee(self.next_dsn(), &parent, &self.extended_address)
+                build_data_request(self.next_dsn(), &parent, &self.extended_address)
             };
 
             if self.csma_ca_transmit(&data_req, true).await.is_err() {
@@ -749,8 +776,8 @@ impl MacDriver for Phy6222Mac {
                             continue;
                         }
 
-                        let mac_frame = MacFrame::from_slice(&data[payload_offset..])
-                            .unwrap_or_else(MacFrame::new);
+                        let mac_frame =
+                            MacFrame::from_slice(&data[payload_offset..]).unwrap_or_default();
 
                         return Ok(Some(mac_frame));
                     }
@@ -766,23 +793,26 @@ impl MacDriver for Phy6222Mac {
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
-        if req.payload.len() > MAX_MAC_PAYLOAD {
-            return Err(MacError::FrameTooLong);
-        }
-
         let msdu_handle = req.msdu_handle;
         let ack_requested = req.tx_options.ack_tx;
 
-        // Build MAC frame with proper header
+        // Build the MAC frame via the shared, header-size-aware builder:
+        // it rejects frames whose *total* PSDU (MHR + MSDU, excluding the
+        // 2-byte hardware FCS) would exceed 125 bytes — the same bound the
+        // radio driver enforces in `Phy6222Driver::transmit` — instead of
+        // checking `req.payload.len()` against a fixed constant that does
+        // not account for addressing-mode overhead or the FCS.
         let seq = self.next_dsn();
         let mac_frame = build_data_frame(
             seq,
-            self.pan_id,
-            &req.dst_address,
+            req.src_addr_mode,
             self.short_address,
+            &self.extended_address,
+            &req.dst_address,
             req.payload,
             ack_requested,
-        );
+        )
+        .map_err(|_| MacError::FrameTooLong)?;
 
         // CSMA-CA + TX + ACK wait + retries
         self.csma_ca_transmit(&mac_frame, ack_requested).await?;
@@ -877,7 +907,7 @@ impl MacDriver for Phy6222Mac {
                     }
 
                     let mac_frame =
-                        MacFrame::from_slice(&data[payload_offset..]).unwrap_or_else(MacFrame::new);
+                        MacFrame::from_slice(&data[payload_offset..]).unwrap_or_default();
 
                     log::trace!("phy6222: rx {} bytes lqi={}", rx.len, rx.lqi);
 
@@ -898,6 +928,13 @@ impl MacDriver for Phy6222Mac {
             coordinator: false,
             router: true,
             hardware_security: false,
+            // Nominal payload for the common short-dst/short-src case
+            // (9-byte MHR, 125-byte PSDU-minus-FCS budget → 116 bytes, of
+            // which 102 is a conservative figure matching other backends).
+            // `mcps_data` does not rely on this constant for correctness:
+            // the actual bound is enforced per-frame by
+            // `frames::build_data_frame`, which accounts for the real
+            // addressing-mode overhead and the 2-byte hardware FCS.
             max_payload: 102,
             tx_power_min: TxPower(0),
             tx_power_max: TxPower(10),
@@ -920,150 +957,14 @@ impl PlatformServices for Phy6222Mac {
 }
 
 // ── Frame builders ──────────────────────────────────────────────
-
-fn build_beacon_request(seq: u8) -> [u8; 8] {
-    let fc: u16 = 0x0803;
-    [fc as u8, (fc >> 8) as u8, seq, 0xFF, 0xFF, 0xFF, 0xFF, 0x07]
-}
-
-fn build_association_request(
-    seq: u8,
-    coord_pan: PanId,
-    coord_addr: &MacAddress,
-    ext_addr: &IeeeAddress,
-    cap: &CapabilityInfo,
-) -> heapless::Vec<u8, 32> {
-    let mut frame = heapless::Vec::new();
-
-    // FC: Command, dst=short, src=extended, AR=1, PAN compress=1
-    let fc: u16 = 0xC823;
-    let _ = frame.push(fc as u8);
-    let _ = frame.push((fc >> 8) as u8);
-    let _ = frame.push(seq);
-
-    let _ = frame.push(coord_pan.0 as u8);
-    let _ = frame.push((coord_pan.0 >> 8) as u8);
-    match coord_addr {
-        MacAddress::Short(_, a) => {
-            let _ = frame.push(a.0 as u8);
-            let _ = frame.push((a.0 >> 8) as u8);
-        }
-        MacAddress::Extended(_, ext) => {
-            for b in ext {
-                let _ = frame.push(*b);
-            }
-        }
-    }
-
-    for b in ext_addr {
-        let _ = frame.push(*b);
-    }
-
-    let _ = frame.push(0x01); // Association Request command ID
-    let _ = frame.push(cap.to_byte());
-
-    frame
-}
-
-fn build_data_request(seq: u8, pan_id: PanId, coord: ShortAddress) -> [u8; 10] {
-    let fc: u16 = 0x8863;
-    [
-        fc as u8,
-        (fc >> 8) as u8,
-        seq,
-        pan_id.0 as u8,
-        (pan_id.0 >> 8) as u8,
-        coord.0 as u8,
-        (coord.0 >> 8) as u8,
-        0xFF,
-        0xFF,
-        0x04,
-    ]
-}
-
-/// Build a Data Request MAC command with IEEE (extended) source address.
-/// Used for poll pass 2 to catch Transport-Key queued by coordinator for our IEEE.
-fn build_data_request_ieee(
-    seq: u8,
-    coord: &MacAddress,
-    own_ieee: &IeeeAddress,
-) -> heapless::Vec<u8, 24> {
-    let mut frame: heapless::Vec<u8, 24> = heapless::Vec::new();
-    // FC: command(0x03), dst=short(0x08), src=extended(0xC0), AR(0x20), PAN compress(0x40)
-    let fc: u16 = 0xCC63;
-    let _ = frame.push(fc as u8);
-    let _ = frame.push((fc >> 8) as u8);
-    let _ = frame.push(seq);
-    // Dst PAN + addr
-    match coord {
-        MacAddress::Short(pan, addr) => {
-            let _ = frame.push(pan.0 as u8);
-            let _ = frame.push((pan.0 >> 8) as u8);
-            let _ = frame.push(addr.0 as u8);
-            let _ = frame.push((addr.0 >> 8) as u8);
-        }
-        MacAddress::Extended(pan, ext) => {
-            let _ = frame.push(pan.0 as u8);
-            let _ = frame.push((pan.0 >> 8) as u8);
-            for b in ext {
-                let _ = frame.push(*b);
-            }
-        }
-    }
-    // Src IEEE (no src PAN — PAN compress)
-    for b in own_ieee {
-        let _ = frame.push(*b);
-    }
-    // Command: Data Request (0x04)
-    let _ = frame.push(0x04);
-    frame
-}
-
-fn build_data_frame(
-    seq: u8,
-    pan_id: PanId,
-    dst: &MacAddress,
-    src_short: ShortAddress,
-    payload: &[u8],
-    ack: bool,
-) -> heapless::Vec<u8, 127> {
-    let mut frame: heapless::Vec<u8, 127> = heapless::Vec::new();
-
-    // FC: Data frame, dst=short, src=short, PAN compress, optional ACK request
-    let mut fc: u16 = 0x8861; // data + dst short + src short + PAN compress
-    if ack {
-        fc |= 0x0020; // AR bit
-    }
-    let _ = frame.push(fc as u8);
-    let _ = frame.push((fc >> 8) as u8);
-    let _ = frame.push(seq);
-
-    // Dst PAN + addr
-    let _ = frame.push(pan_id.0 as u8);
-    let _ = frame.push((pan_id.0 >> 8) as u8);
-    match dst {
-        MacAddress::Short(_, a) => {
-            let _ = frame.push(a.0 as u8);
-            let _ = frame.push((a.0 >> 8) as u8);
-        }
-        MacAddress::Extended(_, ext) => {
-            for b in ext {
-                let _ = frame.push(*b);
-            }
-        }
-    }
-
-    // Src short
-    let _ = frame.push(src_short.0 as u8);
-    let _ = frame.push((src_short.0 >> 8) as u8);
-
-    // Payload
-    for &b in payload {
-        let _ = frame.push(b);
-    }
-
-    frame
-}
+//
+// Beacon Request, Association Request, Data Request and data-frame framing
+// are built by the shared, host-tested helpers in `crate::frames` (see the
+// `use` list at the top of this file) instead of duplicating FCF-encoding
+// logic locally. Only beacon *parsing* remains local, since this backend's
+// scan path fills in `PanDescriptor` fields (LQI, default Zigbee beacon
+// payload synthesis) slightly differently from the shared `frames::parse_beacon`
+// helper used by other backends.
 
 fn parse_beacon_frame(data: &[u8], channel: u8) -> Option<PanDescriptor> {
     if data.len() < 9 {
@@ -1129,118 +1030,6 @@ fn parse_beacon_frame(data: &[u8], channel: u8) -> Option<PanDescriptor> {
     })
 }
 
-fn parse_mac_addresses(data: &[u8]) -> (MacAddress, MacAddress, usize, bool) {
-    let default_addr = MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF));
-    if data.len() < 3 {
-        return (default_addr, default_addr, 0, false);
-    }
-
-    let fc = u16::from_le_bytes([data[0], data[1]]);
-    let security = (fc >> 3) & 1 != 0;
-    let pan_compress = (fc >> 6) & 1 != 0;
-    let dst_mode = (fc >> 10) & 0x03;
-    let src_mode = (fc >> 14) & 0x03;
-
-    let mut offset = 3; // past FC + seq
-
-    // Dst PAN
-    let dst_pan = if dst_mode > 0 && offset + 2 <= data.len() {
-        let p = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        offset += 2;
-        PanId(p)
-    } else {
-        PanId(0xFFFF)
-    };
-
-    // Dst addr
-    let dst_address = match dst_mode {
-        2 if offset + 2 <= data.len() => {
-            let a = u16::from_le_bytes([data[offset], data[offset + 1]]);
-            offset += 2;
-            MacAddress::Short(dst_pan, ShortAddress(a))
-        }
-        3 if offset + 8 <= data.len() => {
-            let mut ext = [0u8; 8];
-            ext.copy_from_slice(&data[offset..offset + 8]);
-            offset += 8;
-            MacAddress::Extended(dst_pan, ext)
-        }
-        _ => default_addr,
-    };
-
-    // Src PAN
-    let src_pan = if src_mode > 0 && !pan_compress && offset + 2 <= data.len() {
-        let p = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        offset += 2;
-        PanId(p)
-    } else {
-        dst_pan
-    };
-
-    // Src addr
-    let src_address = match src_mode {
-        2 if offset + 2 <= data.len() => {
-            let a = u16::from_le_bytes([data[offset], data[offset + 1]]);
-            offset += 2;
-            MacAddress::Short(src_pan, ShortAddress(a))
-        }
-        3 if offset + 8 <= data.len() => {
-            let mut ext = [0u8; 8];
-            ext.copy_from_slice(&data[offset..offset + 8]);
-            offset += 8;
-            MacAddress::Extended(src_pan, ext)
-        }
-        _ => MacAddress::Short(src_pan, ShortAddress(0xFFFF)),
-    };
-
-    (src_address, dst_address, offset, security)
-}
-
-fn parse_association_response(data: &[u8]) -> Option<(ShortAddress, u8)> {
-    if data.len() < 5 {
-        return None;
-    }
-    let fc = u16::from_le_bytes([data[0], data[1]]);
-    if fc & 0x07 != 0x03 {
-        return None;
-    }
-
-    let dst_mode = (fc >> 10) & 0x03;
-    let src_mode = (fc >> 14) & 0x03;
-    let pan_compress = (fc >> 6) & 0x01;
-
-    let mut offset = 3;
-    if dst_mode > 0 {
-        offset += 2;
-    }
-    match dst_mode {
-        2 => offset += 2,
-        3 => offset += 8,
-        _ => {}
-    }
-    if src_mode > 0 && pan_compress == 0 {
-        offset += 2;
-    }
-    match src_mode {
-        2 => offset += 2,
-        3 => offset += 8,
-        _ => {}
-    }
-
-    if offset + 3 > data.len() {
-        return None;
-    }
-
-    if data[offset] != 0x02 {
-        return None;
-    }
-
-    let short = u16::from_le_bytes([data[offset + 1], data[offset + 2]]);
-    let status = data[offset + 3];
-
-    Some((ShortAddress(short), status))
-}
-
 /// Decode a one-bit-hot encoded 32-bit word back to a byte.
 ///
 /// PHY6222 factory flash stores each byte as a 32-bit word where each
@@ -1285,4 +1074,182 @@ fn one_bit_hot_decode(word: u32) -> Option<u8> {
     }
 
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests exercise the shared `crate::frames` builders/parsers
+    // exactly as this backend's `MacDriver` impl calls them (same argument
+    // shapes), pinning golden frame bytes / FCF bit decoding for the
+    // specific bugs the audit found here. `Phy6222Mac`/`Phy6222Driver`
+    // themselves cannot be constructed on a host test target (see
+    // `driver::tests` for why), so these test the frame layer directly.
+
+    const OWN_IEEE: IeeeAddress = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+
+    fn fc_of(frame: &[u8]) -> u16 {
+        u16::from_le_bytes([frame[0], frame[1]])
+    }
+
+    // ── (1) data-frame base FCF must not always set ACK request ─────
+
+    #[test]
+    fn data_frame_without_ack_request_clears_ar_bit() {
+        let dst = MacAddress::Short(PanId(0x1234), ShortAddress(0xBEEF));
+        let frame = build_data_frame(
+            0x10,
+            AddressMode::Short,
+            ShortAddress(0x0042),
+            &OWN_IEEE,
+            &dst,
+            &[0xAA, 0xBB],
+            /* ack_request = */ false,
+        )
+        .expect("frame within PSDU limit");
+
+        let fc = fc_of(&frame);
+        assert_eq!(fc & 0x07, 0x01, "frame type must be Data");
+        assert_eq!(
+            fc & 0x0020,
+            0,
+            "AR bit must be clear when ack not requested"
+        );
+    }
+
+    #[test]
+    fn data_frame_with_ack_request_sets_ar_bit() {
+        let dst = MacAddress::Short(PanId(0x1234), ShortAddress(0xBEEF));
+        let frame = build_data_frame(
+            0x11,
+            AddressMode::Short,
+            ShortAddress(0x0042),
+            &OWN_IEEE,
+            &dst,
+            &[0xAA, 0xBB],
+            /* ack_request = */ true,
+        )
+        .expect("frame within PSDU limit");
+
+        let fc = fc_of(&frame);
+        assert_ne!(fc & 0x0020, 0, "AR bit must be set when ack requested");
+    }
+
+    // ── (2) Association Request FCF PAN ID compression / addressing ──
+
+    #[test]
+    fn association_request_fcf_matches_short_coordinator_and_uncompressed_src_pan() {
+        let coord = MacAddress::Short(PanId(0xDFE9), ShortAddress(0x0000));
+        let cap = CapabilityInfo {
+            rx_on_when_idle: false,
+            allocate_address: true,
+            ..CapabilityInfo::default()
+        };
+        let frame = build_association_request(0x42, &coord, &OWN_IEEE, &cap);
+
+        let fc = fc_of(&frame);
+        assert_eq!(fc & 0x07, 0x03, "frame type must be MAC command");
+        assert_eq!((fc >> 10) & 0x03, 0x02, "dst addr mode must be short");
+        assert_eq!(
+            (fc >> 6) & 1,
+            0,
+            "PAN ID compression must be clear — we have no PAN yet"
+        );
+        assert_eq!((fc >> 14) & 0x03, 0x03, "src addr mode must be extended");
+        // Own (unassociated) source PAN is the broadcast PAN, present
+        // uncompressed right after the destination PAN + address.
+        assert_eq!(&frame[7..9], &[0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn association_request_fcf_matches_extended_coordinator() {
+        let coord = MacAddress::Extended(PanId(0xDFE9), [0x99; 8]);
+        let frame = build_association_request(0x43, &coord, &OWN_IEEE, &CapabilityInfo::default());
+
+        let fc = fc_of(&frame);
+        assert_eq!(
+            (fc >> 10) & 0x03,
+            0x03,
+            "dst addr mode must be extended to match the coordinator's address"
+        );
+    }
+
+    // ── (3) short-address Data Request carries the real child address ──
+
+    #[test]
+    fn data_request_short_uses_actual_assigned_short_address_not_broadcast() {
+        let parent = MacAddress::Short(PanId(0x1234), ShortAddress(0x0001));
+        let our_short = ShortAddress(0x9ABC);
+        let frame = build_data_request_short(0x20, &parent, our_short);
+
+        // Source address is the last 2 bytes before the command ID.
+        let cmd_id_index = frame.len() - 1;
+        assert_eq!(frame[cmd_id_index], 0x04, "Data Request command ID");
+        let src = u16::from_le_bytes([frame[cmd_id_index - 2], frame[cmd_id_index - 1]]);
+        assert_eq!(src, our_short.0);
+        assert_ne!(src, 0xFFFF, "must not fall back to the broadcast address");
+    }
+
+    // ── (4) IEEE-source Data Request FCF dst mode vs short/extended dst ──
+
+    #[test]
+    fn data_request_ieee_source_fcf_dst_mode_follows_short_coordinator() {
+        let coord = MacAddress::Short(PanId(0x1234), ShortAddress(0x5678));
+        let frame = build_data_request(0x30, &coord, &OWN_IEEE);
+        let fc = fc_of(&frame);
+        assert_eq!((fc >> 10) & 0x03, 0x02, "dst addr mode must be short");
+        assert_eq!((fc >> 14) & 0x03, 0x03, "src addr mode must be extended");
+    }
+
+    #[test]
+    fn data_request_ieee_source_fcf_dst_mode_follows_extended_coordinator() {
+        let coord = MacAddress::Extended(PanId(0x1234), [0x77; 8]);
+        let frame = build_data_request(0x31, &coord, &OWN_IEEE);
+        let fc = fc_of(&frame);
+        assert_eq!(
+            (fc >> 10) & 0x03,
+            0x03,
+            "dst addr mode must switch to extended when the coordinator's \
+             address is extended"
+        );
+    }
+
+    // ── (5) MAC frame/PSDU length enforcement (incl. 2-byte FCS) ─────
+
+    #[test]
+    fn data_frame_at_max_psdu_minus_fcs_is_accepted() {
+        // MHR for short/short addressing is 2(FC)+1(seq)+2(dstPan)+2(dstAddr)
+        // +2(srcAddr) = 9 bytes; 125 - 9 = 116 bytes of payload exactly
+        // fills the PSDU-without-FCS budget.
+        let dst = MacAddress::Short(PanId(1), ShortAddress(2));
+        let payload = [0u8; 116];
+        let frame = build_data_frame(
+            0,
+            AddressMode::Short,
+            ShortAddress(3),
+            &OWN_IEEE,
+            &dst,
+            &payload,
+            false,
+        )
+        .expect("exactly at the 125-byte PSDU-minus-FCS bound");
+        assert_eq!(frame.len(), 125);
+    }
+
+    #[test]
+    fn data_frame_over_max_psdu_minus_fcs_is_rejected() {
+        let dst = MacAddress::Short(PanId(1), ShortAddress(2));
+        let payload = [0u8; 117];
+        let result = build_data_frame(
+            0,
+            AddressMode::Short,
+            ShortAddress(3),
+            &OWN_IEEE,
+            &dst,
+            &payload,
+            false,
+        );
+        assert!(result.is_err(), "one byte over budget must be rejected");
+    }
 }

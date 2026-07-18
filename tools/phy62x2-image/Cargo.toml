@@ -1,0 +1,9 @@
+[package]
+name = "phy62x2-image"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Build a PHY6 ROM-loader image from an Intel HEX firmware file"
+
+[dependencies]

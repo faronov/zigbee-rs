@@ -2,11 +2,11 @@
 //!
 //! The PHY6222 has three low-power modes:
 //!
-//! | Mode | CPU | SRAM | 32K RC | Radio | Current | Wake |
-//! |------|-----|------|--------|-------|---------|------|
-//! | WFI  | Halt| On   | On     | Off*  | ~1.5 mA | Any IRQ |
-//! | System Sleep | Off | Retention | On | Off | ~3 µA | RTC, GPIO |
-//! | System Off | Off | Off | On | Off | ~1 µA | GPIO only |
+//! | Mode | CPU | SRAM | 32K RC | Radio | Wake |
+//! |------|-----|------|--------|-------|------|
+//! | WFI  | Halt| On   | On     | Off*  | Any IRQ |
+//! | System Sleep | Off | Retention | On | Off | RTC, GPIO |
+//! | System Off | Off | Off | On | Off | GPIO only |
 //!
 //! System sleep is a warm reboot — the ROM bootloader runs on wake and
 //! jumps to the application entry point. State must be saved to retention
@@ -22,6 +22,13 @@
 //! A compare channel (RTCCC0) can wake the CPU from system sleep.
 
 use crate::regs::*;
+use crate::flash::FlashError;
+use core::convert::Infallible;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepError {
+    Flash(FlashError),
+}
 
 /// Approximate RC32K frequency (varies ±10% per chip/temperature).
 pub const RC32K_HZ: u32 = 32_768;
@@ -81,23 +88,27 @@ pub fn clear_ram_retention() {
 /// - Call `set_ram_retention()` to select which SRAM banks to keep
 /// - Save any critical state to retention SRAM or flash
 ///
-/// # Safety
-/// This function never returns. The chip resets on wake.
-pub fn enter_system_sleep() -> ! {
-    // Disable software control of 32k clock
-    reg_set_bits(AON_PMCTL2_0, 6, 6, 0);
+/// On success this function does not return. Before triggering sleep it sends
+/// the external flash into deep power-down, so the complete transition runs
+/// from SRAM with interrupts disabled. The ROM wake path is responsible for
+/// making XIP flash available before it starts the application again.
+#[unsafe(link_section = ".data.ram_code")]
+#[inline(never)]
+pub fn enter_system_sleep() -> Result<Infallible, SleepError> {
+    cortex_m::interrupt::free(|_| {
+        crate::flash::prepare_deep_power_down().map_err(SleepError::Flash)?;
 
-    // Clear xtal tracking (prevents hang on wake)
-    reg_set_bits(AON_PMCTL0, 29, 27, 0x07);
+        reg_set_bits(AON_PMCTL2_0, 6, 6, 0);
+        reg_set_bits(AON_PMCTL0, 29, 27, 0x07);
+        reg_write(AON_SLEEP_R0, 4);
+        reg_write(AON_PWRSLP, SYSTEM_SLEEP_MAGIC);
 
-    // Set reset cause to WARM (so wakeup skips full DWC reset)
-    reg_write(AON_SLEEP_R0, 4); // RSTC_WARM_NDWC
-
-    // Trigger system sleep — CPU powers off immediately
-    reg_write(AON_PWRSLP, SYSTEM_SLEEP_MAGIC);
-
-    // Never reached — but compiler needs divergent function
-    loop { cortex_m::asm::wfi(); }
+        loop {
+            unsafe {
+                core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+            }
+        }
+    })
 }
 
 /// Check if the current boot was a wake from system sleep.

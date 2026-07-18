@@ -1,13 +1,15 @@
-/* PHY6222/6252 Memory Layout
- * Flash: 512KB at 0x1100_0000
- * SRAM:  64KB  at 0x1FFF_0000
+/* PHY62x2 ROM boot layout.
  *
- * The PHY6222 maps flash at 0x11000000 and SRAM at 0x1FFF0000.
- * First 4KB of flash reserved for bootloader/OTA header.
- * Adjust based on your specific firmware layout.
+ * The ROM dispatches interrupts through an application table at 0x1fff0000
+ * and starts applications from a two-word descriptor loaded at 0x1fff1838.
+ * XIP firmware begins after the 0x100-byte PHY6 image header at 0x10100.
+ *
+ * Keep the XIP slot below 0x30000 so the same firmware image cannot overflow
+ * a 256 KiB PHY6252. Persistent sectors are selected separately per chip.
  */
 MEMORY
 {
-    FLASH : ORIGIN = 0x11001000, LENGTH = 508K
-    RAM   : ORIGIN = 0x1FFF0000, LENGTH = 64K
+    JUMP_TABLE (rw) : ORIGIN = 0x1fff0000, LENGTH = 0x400
+    FLASH (rx)  : ORIGIN = 0x11010100, LENGTH = 0x1ff00
+    RAM   (rwx) : ORIGIN = 0x1fff1838, LENGTH = 0x0e7c8
 }
