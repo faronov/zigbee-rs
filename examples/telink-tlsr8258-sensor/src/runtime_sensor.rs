@@ -88,12 +88,9 @@ fn failure() -> ! {
 pub fn run() -> ! {
     type Device = ZigbeeDevice<TelinkMac>;
 
-    board::LED_RED.set_output();
-    board::LED_GREEN.set_output();
-    board::LED_BLUE.set_output();
-    board::LED_RED.write(true);
-    board::LED_GREEN.write(false);
-    board::LED_BLUE.write(false);
+    if board::configure_status_leds().is_err() {
+        failure();
+    }
 
     let mut ieee_address = [0u8; 8];
     tlsr8258_hal::flash::factory_ieee(&mut ieee_address);
@@ -198,6 +195,9 @@ pub fn run() -> ! {
         SECURITY_SECTOR_A,
         SECURITY_SECTOR_B,
     );
+    if crate::security_identity::prepare(device, &mut security_store, ieee_address).is_err() {
+        failure();
+    }
     let mut sensor_sample = 0u32;
     let mut sensor_update_elapsed = 0u16;
 

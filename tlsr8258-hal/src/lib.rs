@@ -6,9 +6,13 @@
 
 #![no_std]
 
+pub mod adc;
 pub mod clocks;
 #[cfg(target_arch = "tc32")]
 pub mod flash;
+pub mod gpio;
 pub mod mmio;
+pub mod pm;
 pub mod radio;
 pub mod timer;
+pub mod watchdog;

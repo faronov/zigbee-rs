@@ -27,7 +27,14 @@ pub enum FlashError {
     AddressOverflow,
     UnalignedSector,
     BufferNotInRam,
-    VoltageGuardRequired,
+    /// No voltage guard is registered (see [`set_voltage_guard`]), or the
+    /// registered guard reported [`VoltageReading::Unavailable`] — the
+    /// flash-supply voltage could not be checked at all.
+    VoltageGuardUnavailable,
+    /// The voltage guard took a real reading, but it is below/unstable
+    /// relative to the Zbit safety thresholds — a genuinely low or noisy
+    /// supply, distinct from [`FlashError::VoltageGuardUnavailable`].
+    VoltageUnsafe,
 }
 
 #[inline(always)]
@@ -251,14 +258,78 @@ fn ensure_ram_buffer(data: &[u8]) -> Result<(), FlashError> {
     if data.is_empty() {
         return Ok(());
     }
-    let start = data.as_ptr() as usize;
-    let end = start
-        .checked_add(data.len())
-        .ok_or(FlashError::AddressOverflow)?;
-    if start < 0x0084_0000 || end > 0x0085_0000 {
+    if !super::mmio::sram_contains(data.as_ptr() as usize, data.len()) {
         return Err(FlashError::BufferNotInRam);
     }
     Ok(())
+}
+
+/// Zbit flash (`ZB25WD40B`/`ZB25WD80B`, JEDEC MID `0x13325E`/`0x14325E`)
+/// requires an ADC voltage/fluctuation guard before program/erase
+/// operations — see `platform/chip_8258/flash.c`'s
+/// `flash_mspi_write_ram()`, which refuses to send the address phase
+/// unless `adc_get_result_with_fluct()` reads above `FLASH_ZBIT_SAFE_VOL`
+/// (2200 mV) with a fluctuation below `FLASH_ZBIT_SAFE_VOLFLUCT` (500 mV).
+const FLASH_ZBIT_SAFE_VOL_MV: u16 = 2200;
+const FLASH_ZBIT_SAFE_VOLFLUCT_MV: u16 = 500;
+
+/// Outcome of a single voltage-guard reading attempt, returned by a
+/// [`VoltageGuardFn`].
+///
+/// This is deliberately not a plain `Option<(u16, u16)>`: a failed/absent
+/// ADC reading (misconfigured pin, ADC not powered, DMA buffer error) and a
+/// *successful* reading that happens to show a genuinely low or unstable
+/// voltage are different situations for the caller to diagnose, so they get
+/// distinct [`FlashError`] variants below rather than collapsing to one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoltageReading {
+    /// A real ADC reading was obtained: `(voltage_mv, fluctuation_mv)`.
+    Measured(u16, u16),
+    /// No reading could be obtained right now (e.g. `adc::AdcError`
+    /// surfaced from the callback) — distinct from a confirmed low/
+    /// unstable measured voltage.
+    Unavailable,
+}
+
+/// Voltage-guard callback signature. Wire this to a real ADC reading (e.g.
+/// `adc::sample_with_fluctuation_mv`) via [`set_voltage_guard`].
+///
+/// The board-specific piece this crate cannot supply on its own is *which*
+/// GPIO pin the ADC should sample to approximate flash-supply voltage —
+/// see `adc.rs`'s module docs. Until the application calls
+/// [`set_voltage_guard`] with a real reading wired to its own board, Zbit
+/// program/erase calls are refused outright (the previous, more
+/// conservative behavior of this module).
+pub type VoltageGuardFn = fn() -> VoltageReading;
+
+/// Storage for the registered [`VoltageGuardFn`], as the bit pattern of the
+/// function pointer (`0` = none registered).
+///
+/// A `static mut` setter here would be unsound (safe code could call it
+/// from two contexts and race the plain read/write); this crate has no
+/// threads, but `AtomicUsize` gives a genuinely sound safe API for free
+/// (single-instruction load/store, no critical section needed) rather than
+/// pushing an `unsafe` requirement onto every call site of
+/// [`set_voltage_guard`].
+static VOLTAGE_GUARD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register the ADC-backed voltage guard used before Zbit flash
+/// program/erase operations. Safe to call at any time (e.g. re-registered
+/// after re-initializing the ADC); the most recent registration wins.
+pub fn set_voltage_guard(guard: VoltageGuardFn) {
+    VOLTAGE_GUARD.store(guard as usize, core::sync::atomic::Ordering::SeqCst);
+}
+
+fn voltage_guard() -> Option<VoltageGuardFn> {
+    let raw = VOLTAGE_GUARD.load(core::sync::atomic::Ordering::SeqCst);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: the only non-zero values ever stored are `guard as usize`
+    // for a real `VoltageGuardFn` passed into `set_voltage_guard` — `usize`
+    // is defined as this target's pointer-sized integer, so the round trip
+    // through the same integer representation is valid.
+    Some(unsafe { core::mem::transmute::<usize, VoltageGuardFn>(raw) })
 }
 
 fn ensure_safe_flash() -> Result<(), FlashError> {
@@ -266,13 +337,22 @@ fn ensure_safe_flash() -> Result<(), FlashError> {
     if !jedec_id(&mut id) {
         return Err(FlashError::Timeout);
     }
-    // The official SDK requires an ADC voltage/fluctuation guard for Zbit
-    // ZB25WD40/80 parts. Refuse destructive operations until that guard is
-    // available rather than writing them unsafely.
-    if id == [0x5E, 0x32, 0x13] || id == [0x5E, 0x32, 0x14] {
-        return Err(FlashError::VoltageGuardRequired);
+    if id != [0x5E, 0x32, 0x13] && id != [0x5E, 0x32, 0x14] {
+        return Ok(());
     }
-    Ok(())
+    let Some(guard) = voltage_guard() else {
+        return Err(FlashError::VoltageGuardUnavailable);
+    };
+    match guard() {
+        VoltageReading::Unavailable => Err(FlashError::VoltageGuardUnavailable),
+        VoltageReading::Measured(voltage_mv, fluctuation_mv)
+            if voltage_mv > FLASH_ZBIT_SAFE_VOL_MV
+                && fluctuation_mv < FLASH_ZBIT_SAFE_VOLFLUCT_MV =>
+        {
+            Ok(())
+        }
+        VoltageReading::Measured(_, _) => Err(FlashError::VoltageUnsafe),
+    }
 }
 
 /// Program bytes without crossing a hardware page-program boundary.

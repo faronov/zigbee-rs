@@ -27,7 +27,13 @@ fn analog_write(addr: u8, value: u8) {
 #[cfg(target_arch = "tc32")]
 #[unsafe(link_section = ".ram_code")]
 pub fn init() {
-    use super::mmio::*;
+    // Deliberately *not* a glob import: `super::mmio::analog_write` (now
+    // `Result`-returning) would otherwise shadow this module's own
+    // early-boot `analog_write` above within this function's scope (a
+    // local `use` shadows an outer-module item of the same name), silently
+    // swapping in the wrong implementation — including its IRQ-disable/
+    // restore path, which has no business running this early in boot.
+    use super::mmio::{REG_BASE, REG_CLK_EN0, REG_CLK_EN1, REG_CLK_EN2, w8};
     analog_write(0x82, 0x64);
     analog_write(0x34, 0x80);
     analog_write(0x06, 0x00);

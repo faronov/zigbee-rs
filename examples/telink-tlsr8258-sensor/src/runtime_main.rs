@@ -197,65 +197,8 @@ pub unsafe extern "C" fn _rust_entry() -> ! {
     runtime_sensor::run();
 }
 
-mod gpio {
-    const REG_BASE: u32 = 0x800000;
-
-    #[derive(Clone, Copy)]
-    pub struct Pin {
-        port_base: u32,
-        bit: u8,
-    }
-
-    pub const PB: u32 = REG_BASE + 0x588;
-    pub const PC: u32 = REG_BASE + 0x590;
-
-    impl Pin {
-        pub const fn new(port_base: u32, bit: u8) -> Self {
-            Self { port_base, bit }
-        }
-
-        pub fn set_output(self) {
-            let mask = 1u8 << self.bit;
-            unsafe {
-                let function = (self.port_base + 6) as *mut u8;
-                core::ptr::write_volatile(
-                    function,
-                    core::ptr::read_volatile(function) | mask,
-                );
-                let output_enable = (self.port_base + 2) as *mut u8;
-                core::ptr::write_volatile(
-                    output_enable,
-                    core::ptr::read_volatile(output_enable) & !mask,
-                );
-                let input_enable = (self.port_base + 1) as *mut u8;
-                core::ptr::write_volatile(
-                    input_enable,
-                    core::ptr::read_volatile(input_enable) & !mask,
-                );
-            }
-        }
-
-        pub fn write(self, high: bool) {
-            let mask = 1u8 << self.bit;
-            unsafe {
-                let output = (self.port_base + 3) as *mut u8;
-                let value = core::ptr::read_volatile(output);
-                core::ptr::write_volatile(
-                    output,
-                    if high { value | mask } else { value & !mask },
-                );
-            }
-        }
-    }
-}
-
-mod board {
-    use super::gpio::{self, Pin};
-
-    pub const LED_RED: Pin = Pin::new(gpio::PC, 1);
-    pub const LED_GREEN: Pin = Pin::new(gpio::PB, 5);
-    pub const LED_BLUE: Pin = Pin::new(gpio::PC, 4);
-}
+mod board;
+mod security_identity;
 
 mod executor {
     use core::future::Future;
