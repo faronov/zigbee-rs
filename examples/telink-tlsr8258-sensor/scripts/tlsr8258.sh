@@ -256,6 +256,11 @@ verify_layout() {
             exit 1
         fi
         if (( bin_size > 0x40000 )); then
+            if [[ "$MODE_NAME" == "runtime-sensor" ]]; then
+                printf 'layout-check FAIL: runtime .bin size=%d (0x%X) exceeds 256 KiB production/OTA slot\n' \
+                    "$bin_size" "$bin_size" >&2
+                exit 1
+            fi
             printf 'layout-check WARN: .bin size=%d (0x%X) exceeds 256 KiB production/OTA slot\n' \
                 "$bin_size" "$bin_size" >&2
         fi
@@ -271,7 +276,7 @@ cmd_check() {
 
 cmd_build() {
     resolve_mode "${1:-sensor}"
-    run_cargo rustc -- -C lto=no -C opt-level=1
+    run_cargo rustc -- -C lto=fat -C opt-level=s -C codegen-units=1
     emit_bin
     verify_layout
     echo "Mode: ${MODE_NAME}"

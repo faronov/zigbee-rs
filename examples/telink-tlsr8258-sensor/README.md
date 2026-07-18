@@ -81,10 +81,10 @@ Other modes are selected explicitly:
 ./scripts/tlsr8258.sh build diag-beacon
 ```
 
-The release profile and helper use the hardware-proven tc32 codegen settings:
+The release profile and helper optimize the complete firmware for size:
 
 ```text
--C lto=no -C opt-level=1
+-C lto=fat -C opt-level=s -C codegen-units=1
 ```
 
 The large-image failure previously attributed to compiler code generation was
@@ -99,9 +99,8 @@ target/tc32-unknown-none-elf/release/telink-tlsr8258-runtime
 target/tc32-unknown-none-elf/release/telink-tlsr8258-runtime.bin
 ```
 
-The current runtime image is 355,828 bytes (`0x56DF4`), so the checker warns
-that it exceeds the 256 KiB production/OTA slot while still enforcing the
-security-journal boundary at `0x74000`.
+The current runtime image is 213,988 bytes (`0x343E4`), below the 256 KiB
+production/OTA slot and the security-journal boundary at `0x74000`.
 
 ## Flash and inspect
 

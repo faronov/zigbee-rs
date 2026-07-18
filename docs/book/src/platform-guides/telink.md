@@ -141,10 +141,10 @@ target/tc32-unknown-none-elf/release/telink-tlsr8258-runtime.bin
 
 The production binary is separate from the diagnostic
 `telink-tlsr8258-lab` target and uses a linker layout without the SWire SRAM
-reservation. The current runtime image is larger than the 256 KiB
-production/OTA slot, so
-the post-link checker emits a warning while still enforcing the factory-data,
-cache, DMA, BSS, and stack boundaries.
+reservation. Fat LTO with size optimization produces a 213,988-byte
+(`0x343E4`) runtime image. The post-link checker enforces the 256 KiB
+production/OTA slot plus the factory-data, cache, DMA, BSS, and stack
+boundaries.
 
 ## Hardware status
 

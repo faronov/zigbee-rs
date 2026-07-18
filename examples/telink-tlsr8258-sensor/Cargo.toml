@@ -43,8 +43,8 @@ sensor = ["lab"]
 runtime-sensor = ["dep:tlsr8258-hal", "zigbee-mac/tlsr8258"]
 
 [profile.release]
-# Match the hardware-proven reusable TLSR8258 backend build. The helper also
-# passes these settings to the final crate explicitly, but dependencies must
-# use the same profile to avoid tc32 LTO/codegen differences.
-opt-level = 1
-lto = false
+# Optimize the complete stack as one unit. The tc32 backend rejects
+# opt-level="z", while "s" plus fat LTO fits the 256 KiB OTA slot.
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
