@@ -32,7 +32,7 @@
 //! ```
 
 use zigbee_aps::apsde::ApsdeDataRequest;
-use zigbee_aps::{ApsAddress, ApsAddressMode, ApsTxOptions};
+use zigbee_aps::{ApsAddress, ApsAddressMode, ApsStatus, ApsTxOptions};
 use zigbee_mac::MacDriver;
 use zigbee_types::ShortAddress;
 use zigbee_zcl::frame::ZclFrame;
@@ -122,6 +122,19 @@ pub enum StartError {
     CommissioningFailed(zigbee_bdb::BdbStatus),
     /// Durable security-state storage failed.
     PersistenceFailed(crate::security_store::SecurityStoreError),
+}
+
+/// Errors returned while sending application ZCL traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendError {
+    /// The device has not joined a network yet.
+    NotJoined,
+    /// The ZCL frame could not be serialized.
+    Serialization,
+    /// The serialized payload exceeded the fixed ZCL frame capacity.
+    PayloadTooLong,
+    /// APS rejected or failed the data request.
+    Aps(ApsStatus),
 }
 
 /// Run one iteration of the Zigbee stack event loop.
@@ -431,9 +444,9 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         endpoint: u8,
         cluster_id: u16,
         report: &zigbee_zcl::foundation::reporting::ReportAttributes,
-    ) -> Result<(), ()> {
+    ) -> Result<(), SendError> {
         if !self.is_joined() {
-            return Err(());
+            return Err(SendError::NotJoined);
         }
 
         // Build ZCL Report Attributes frame (command 0x0A, server→client)
@@ -449,14 +462,17 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         let mut payload_buf = [0u8; 128];
         let payload_len = report.serialize(&mut payload_buf);
         for &b in &payload_buf[..payload_len] {
-            let _ = zcl_frame.payload.push(b);
+            zcl_frame
+                .payload
+                .push(b)
+                .map_err(|_| SendError::PayloadTooLong)?;
         }
 
         // Serialize ZCL frame
         let mut zcl_buf = [0u8; 128];
         let zcl_len = match zcl_frame.serialize(&mut zcl_buf) {
             Ok(len) => len,
-            Err(_) => return Err(()),
+            Err(_) => return Err(SendError::Serialization),
         };
 
         // Send via APS to the coordinator (0x0000)
@@ -488,7 +504,7 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
             }
             Err(e) => {
                 log::warn!("[Runtime] Report send failed: {:?}", e);
-                Err(())
+                Err(SendError::Aps(e))
             }
         }
     }

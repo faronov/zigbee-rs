@@ -2744,9 +2744,9 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         src_endpoint: u8,
         cluster_id: u16,
         zcl_data: &[u8],
-    ) -> Result<(), ()> {
+    ) -> Result<(), event_loop::SendError> {
         if !self.is_joined() {
-            return Err(());
+            return Err(event_loop::SendError::NotJoined);
         }
 
         let req = zigbee_aps::apsde::ApsdeDataRequest {
@@ -2770,7 +2770,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             Ok(_) => Ok(()),
             Err(e) => {
                 log::warn!("[Runtime] ZCL frame send failed: {:?}", e);
-                Err(())
+                Err(event_loop::SendError::Aps(e))
             }
         }
     }
