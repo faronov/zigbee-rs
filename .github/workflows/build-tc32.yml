@@ -14,11 +14,15 @@ on:
     branches: [master]
     paths:
       - 'examples/telink-tlsr8258-sensor/**'
+      - 'examples/telink-tlsr8258-radio/**'
+      - 'tlsr8258-hal/**'
       - 'zigbee-*/**'
       - '.github/workflows/build-tc32.yml'
   pull_request:
     paths:
       - 'examples/telink-tlsr8258-sensor/**'
+      - 'examples/telink-tlsr8258-radio/**'
+      - 'tlsr8258-hal/**'
       - 'zigbee-*/**'
       - '.github/workflows/build-tc32.yml'
   workflow_dispatch:
@@ -26,7 +30,7 @@ on:
       tc32_release_tag:
         description: 'modern-tc32/rust release tag'
         required: false
-        default: 'tc32-stage2-tc32-43'
+        default: 'tc32-stage2-tc32-45'
         type: string
 
 permissions:
@@ -34,7 +38,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  TC32_RELEASE_TAG_DEFAULT: tc32-stage2-tc32-43
+  TC32_RELEASE_TAG_DEFAULT: tc32-stage2-tc32-45
 
 jobs:
   build-tlsr8258-tc32:
@@ -68,19 +72,13 @@ jobs:
           $TC32_TOOLCHAIN/llvm/bin/clang --version
           echo "TC32 toolchain ready"
 
-      - name: Build TLSR8258 sensor (real tc32 firmware)
+      - name: Build TLSR8258 runtime sensor
         working-directory: examples/telink-tlsr8258-sensor
-        run: |
-          $TC32_TOOLCHAIN/bin/cargo build --release
-          echo "=== Build successful ==="
-          ls -la target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor
+        run: ./scripts/tlsr8258.sh build runtime-sensor
 
-      - name: Create firmware binary
-        run: |
-          ELF=examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor
-          $TC32_LLVM_BIN/llvm-objcopy -O binary $ELF ${ELF}.bin
-          echo "=== Firmware sizes ==="
-          ls -la ${ELF} ${ELF}.bin
+      - name: Build reusable TLSR8258 backend
+        working-directory: examples/telink-tlsr8258-radio
+        run: ./scripts/tlsr8258.sh build runtime-join
 
       - name: Upload TLSR8258 real firmware
         uses: actions/upload-artifact@v4
@@ -88,4 +86,4 @@ jobs:
           name: tlsr8258-tc32-firmware
           path: |
             examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin
-
+            examples/telink-tlsr8258-radio/target/tc32-unknown-none-elf/release/telink-tlsr8258-radio.bin

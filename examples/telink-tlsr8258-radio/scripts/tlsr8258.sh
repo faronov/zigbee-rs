@@ -285,14 +285,15 @@ cmd_build() {
 }
 
 cmd_test() {
-    # Host-side unit/golden-vector tests only (radio::frame, diag). Uses the
-    # ambient host cargo/rustc, not the tc32 toolchain -- there is no host
-    # `std` for the tc32-unknown-none-elf target to run tests against.
+    # Host-side unit/golden-vector tests use the ambient host cargo/rustc;
+    # there is no host `std` for the tc32 target to run tests against.
     (
         cd "$EXAMPLE_DIR"
         local host_target
         host_target=$(rustc -vV | awk '/^host:/ {print $2}')
         cargo test --target "$host_target" "$@"
+        cargo test --manifest-path "$REPO_DIR/tlsr8258-hal/Cargo.toml" \
+            --target "$host_target" "$@"
     )
 }
 

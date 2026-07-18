@@ -1,12 +1,13 @@
 # telink-tlsr8258-radio
 
-Standalone, pure-Rust TLSR8258 802.15.4 radio bring-up firmware. **No
-Zigbee-stack crate dependency** (`zigbee-mac`/`zigbee-nwk`/... are not used):
-this crate exists to prove out PHY/DMA bring-up in isolation, independent of
-the generic `zigbee-mac` Telink backend (which is known invalid for this
-chip) and without touching the 7000-line `examples/telink-tlsr8258-sensor`
-bring-up lab, which remains the read-only source of the proven low-level
-sequences transcribed here.
+Pure-Rust TLSR8258 radio, MAC, and stack-conformance harness.
+
+The default raw-radio variants have no Zigbee-stack dependency and prove the
+PHY/DMA path in isolation. Optional `mac-driver` and `runtime-join` variants
+enable the reusable `zigbee_mac::telink::TelinkMac` backend over
+`tlsr8258-hal`, then exercise it through the shared stack. The larger
+`examples/telink-tlsr8258-sensor` remains the end-to-end runtime/persistence
+gate but still contains its older local MAC/radio implementation.
 
 ## What it does
 
@@ -20,6 +21,8 @@ The build variant selects one explicit hardware gate:
 | `association` | Scan, MAC association, indirect Data Request polling, software ACK, and short-addressed unicast |
 | `association-fresh` | Association with an isolated UID-derived locally administered EUI |
 | `association-stress` | Association followed by 100 poll cycles and ten unicast frames |
+| `mac-association` | The same association/poll/unicast gate through `zigbee_mac::telink::TelinkMac` |
+| `runtime-join` | Shared NWK/APS/BDB/runtime commissioning over the reusable `TelinkMac` backend |
 
 All normal outbound frames use unslotted IEEE 802.15.4 CSMA-CA
 (`macMinBE=3`, `macMaxBE=5`, `macMaxCSMABackoffs=4`), a 128 us averaged RSSI
@@ -43,11 +46,13 @@ beyond a `bx lr` stub — see [Design notes](#design-notes)).
 | Module | Role |
 |---|---|
 | [`platform`](src/platform/mod.rs) | Boot vectors/startup asm, MMIO register helpers, clocks, Timer0-based bounded waits, GPIO/LED, linker-symbol accessors + layout self-checks |
-| [`platform::flash`](src/platform/flash.rs) | Factory EUI / flash UID reads and stable UID-derived locally administered EUI fallback |
-| [`radio`](src/radio/mod.rs) | PHY init, DMA TX/RX, immediate TX-done→RX transition, CCA/CSMA-CA, software ACK, bounded waits, and frame classification |
-| [`radio::frame`](src/radio/frame.rs) | **Pure, host-testable** Beacon, Association Request/Response, Data Request, data, ACK, and DMA framing/parsing |
+| [`tlsr8258_hal::flash`](../../tlsr8258-hal/src/flash.rs) | Factory EUI / flash UID reads and stable UID-derived locally administered EUI fallback |
+| [`tlsr8258_hal::radio`](../../tlsr8258-hal/src/radio/mod.rs) | PHY init, DMA TX/RX, immediate TX-done→RX transition, CCA/CSMA-CA, software ACK, bounded waits, and frame classification |
+| [`tlsr8258_hal::radio::frame`](../../tlsr8258-hal/src/radio/frame.rs) | **Pure, host-testable** Beacon, Association Request/Response, Data Request, data, ACK, and DMA framing/parsing |
 | [`mac_test`](src/mac_test.rs) | The explicit raw test state machine: channel cycle, TX, bounded RX window, outcome recording |
 | [`association`](src/association.rs) | Active scan, parent selection, association, polling, unicast, retries, and stress state machines |
+| [`mac_driver_test`](src/mac_driver_test.rs) | Reusable `TelinkMac` association/poll/unicast hardware gate |
+| [`runtime_join_test`](src/runtime_join_test.rs) | Full shared-stack join gate over the reusable `TelinkMac` backend |
 | [`diag`](src/diag.rs) | Fixed-address SRAM diagnostic record, checksum, cache-boundary canary |
 
 ### Host tests vs. embedded build
@@ -84,6 +89,8 @@ scripts/tlsr8258.sh build control
 scripts/tlsr8258.sh build scan
 scripts/tlsr8258.sh build association
 scripts/tlsr8258.sh build association-stress
+scripts/tlsr8258.sh build mac-association
+scripts/tlsr8258.sh build runtime-join
 
 # Explicit tc32-43 for comparison
 TC32_TOOLCHAIN=/path/to/.toolchains/tc32-stage2-tc32-43 scripts/tlsr8258.sh build
@@ -95,7 +102,7 @@ scripts/tlsr8258.sh check
 Equivalent raw `cargo` invocation (what the script wraps):
 
 ```sh
-TC32=.toolchains/tc32-stage2-tc32-45
+TC32=../../.toolchains/tc32-stage2-tc32-45
 env CARGO_HOME="$HOME/.cargo" "$TC32/bin/cargo" rustc --release \
     --target tc32-unknown-none-elf \
     -Z build-std=core -Z build-std-features=compiler-builtins-mem \
@@ -129,12 +136,15 @@ for the `tc32-unknown-none-elf` target):
 scripts/tlsr8258.sh test
 # equivalent to:
 cargo test --target "$(rustc -vV | awk '/^host:/ {print $2}')"
+cargo test --manifest-path ../../tlsr8258-hal/Cargo.toml \
+  --target "$(rustc -vV | awk '/^host:/ {print $2}')"
 ```
 
-27 tests cover Beacon Request, Association Request/Response, pre- and
-post-association Data Request, short-addressed data and ACK golden vectors;
-DMA/length/CRC/RSSI transcriptions; short/extended Zigbee Beacon parsing;
-RSSI→LQI; diagnostics; and Timer0 conversion.
+The script runs 29 tests: seven harness diagnostic tests plus 22 HAL tests
+covering Beacon Request, Association Request/Response, pre- and
+post-association Data Request, short-addressed data and ACK golden vectors,
+DMA/length/CRC/RSSI transcriptions, short/extended Zigbee Beacon parsing,
+RSSI-to-LQI, and Timer0 conversion.
 
 ## Diagnostic record
 

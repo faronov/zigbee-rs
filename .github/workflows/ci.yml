@@ -319,35 +319,6 @@ jobs:
             examples/cc2340-sensor/target/thumbv6m-none-eabi/release/cc2340-sensor.bin
             examples/cc2340-sensor/target/thumbv6m-none-eabi/release/cc2340-sensor.hex
 
-  build-telink-b91:
-    name: Build Telink B91 sensor
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: riscv32imc-unknown-none-elf
-          components: rust-src, llvm-tools
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: examples/telink-b91-sensor
-      - name: Build Telink B91 sensor (release)
-        working-directory: examples/telink-b91-sensor
-        run: cargo build --release --features stubs
-      - name: Create firmware artifacts
-        run: |
-          ELF=examples/telink-b91-sensor/target/riscv32imc-unknown-none-elf/release/telink-b91-sensor
-          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          $OBJCOPY -O binary $ELF ${ELF}.bin
-          $OBJCOPY -O ihex   $ELF ${ELF}.hex
-      - name: Upload Telink B91 firmware
-        uses: actions/upload-artifact@v4
-        with:
-          name: telink-b91-sensor-firmware
-          path: |
-            examples/telink-b91-sensor/target/riscv32imc-unknown-none-elf/release/telink-b91-sensor.bin
-            examples/telink-b91-sensor/target/riscv32imc-unknown-none-elf/release/telink-b91-sensor.hex
-
   # ── Telink TLSR8258 (tc32) ───────────────────────────────────
   # Built by .github/workflows/build-tc32.yml using the public
   # modern-tc32/rust toolchain. Stock nightly cannot compile this target.

@@ -1,164 +1,146 @@
-# Telink TLSR8258 Zigbee Sensor
+# Telink TLSR8258 Zigbee sensor
 
-A `no_std` Zigbee 3.0 end-device firmware for the **Telink TLSR8258** (tc32 ISA),
-brought up on the pure-Rust Telink MAC path.
+This package is the current end-to-end TLSR8258 hardware gate for join,
+Trust Center exchange, ZHA interview, reporting, persistence, and reset
+resume.
+
+It is pure Rust, but it is not yet the clean production target: `src/main.rs`
+still contains a large local diagnostic radio module and local
+`Tlsr8258Mac`. The reusable backend lives in `tlsr8258-hal` plus
+`zigbee_mac::telink::TelinkMac` and is exercised by
+`examples/telink-tlsr8258-radio`.
 
 ## Hardware
 
-- **MCU:** Telink TLSR8258 — tc32 core, 512KB Flash, 64KB SRAM
-- **Radio:** Built-in IEEE 802.15.4 + BLE
-- **Reference board:** TB-04-Kit
-- **LEDs:** PC1 red, PB5 green, PC4 blue
+- MCU: Telink TLSR8258, TC32 core
+- Flash: 512 KiB
+- SRAM: 64 KiB at `0x840000..0x850000`
+- Reference board: TB-04-Kit
+- LEDs: PC1 red, PB5 green, PC4 blue
+
+Writable data starts after aligned RAM code plus the 0x900-byte I-cache
+reservation. The linker script and build helper verify cache, DMA, BSS,
+stack, NV, and image boundaries after every link.
 
 ## Toolchain
 
-Use the modern-tc32 prerelease toolchain:
+Use the modern-tc32 stage2 release selected by the helper script:
 
-`https://github.com/modern-tc32/rust/releases/tag/tc32-stage2-tc32-31`
-
-For macOS x86_64:
-
-```bash
-cd /tmp
-curl -L -O https://github.com/modern-tc32/rust/releases/download/tc32-stage2-tc32-31/tc32-rust-toolchain-macos-amd64.tar.gz
-tar -xf tc32-rust-toolchain-macos-amd64.tar.gz
-export TC32_TOOLCHAIN=/tmp/tc32-rust-toolchain-macos-amd64
+```text
+tc32-stage2-tc32-45
 ```
 
-For macOS arm64, use the matching `tc32-rust-toolchain-macos-arm64.tar.gz`.
+Install it under the repository default path:
 
-The example also needs the local Telink flashing/debug helpers used for bring-up:
+```bash
+TAG=tc32-stage2-tc32-45
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)  ASSET=tc32-rust-toolchain-macos-arm64.tar.gz ;;
+  Darwin-x86_64) ASSET=tc32-rust-toolchain-macos-amd64.tar.gz ;;
+  Linux-x86_64)  ASSET=tc32-rust-toolchain-linux-amd64.tar.gz ;;
+  *) echo "Unsupported host"; exit 1 ;;
+esac
 
-- `~/TLSRPGM/TlsrPgm.py`
-- `~/zboss_opensource/tlsr_debug.py`
+DEST=".toolchains/${TAG}"
+mkdir -p "${DEST}"
+curl -fL \
+  "https://github.com/modern-tc32/rust/releases/download/${TAG}/${ASSET}" \
+  -o /tmp/tc32-toolchain.tar.gz
+tar -xzf /tmp/tc32-toolchain.tar.gz --strip-components=1 -C "${DEST}"
+"${DEST}/bin/rustc" --version
+```
 
-Both paths are overridable with environment variables.
+Alternatively set `TC32_TOOLCHAIN` to another extracted stage2 toolchain.
 
-## Modes
+## Firmware modes
 
-The example has three firmware modes:
+| Mode | Purpose |
+|------|---------|
+| `runtime-sensor` | Default full NWK/APS/BDB/ZDO/ZCL runtime, security persistence, and reporting |
+| `sensor` | Legacy lighter interview path retained for comparison |
+| `diag-assoc` | Scan, association, polling, and unicast diagnostics |
+| `diag-beacon` | Raw Beacon Request and beacon parsing |
+| `diag-smoke` | Minimal startup/radio smoke gate |
 
-- `sensor`: default mode, uses the validated pure-Rust MAC scan/associate/poll path plus a minimal interview responder
-- `diag-assoc`: bring-up mode for scan, association, and poll
-- `diag-beacon`: raw beacon request plus RX parsing, no Zigbee runtime
+## Build
 
-## Reproducible Bring-Up Flow
+Always use the helper so the custom cargo, binary conversion, and layout
+checks stay consistent:
 
-The helper script keeps build, flash, and SRAM dump commands in one place:
+```bash
+cd examples/telink-tlsr8258-sensor
 
-`scripts/tlsr8258.sh`
+./scripts/tlsr8258.sh check runtime-sensor
+./scripts/tlsr8258.sh build runtime-sensor
+```
 
-Default environment:
+Other modes are selected explicitly:
 
-- `TC32_TOOLCHAIN=/tmp/tc32-rust-toolchain-macos-amd64`
+```bash
+./scripts/tlsr8258.sh build sensor
+./scripts/tlsr8258.sh build diag-assoc
+./scripts/tlsr8258.sh build diag-beacon
+```
+
+The helper invokes the tc32 compiler with the hardware-proven codegen
+settings:
+
+```text
+-C lto=no -C opt-level=1
+```
+
+The large-image failure previously attributed to compiler code generation was
+reduced to delayed TX-done to RX activation. The radio now enters RX
+synchronously at TX completion, matching the official Telink ACK-turnaround
+sequence.
+
+Outputs:
+
+```text
+target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor
+target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin
+```
+
+The current runtime image is 305,760 bytes (`0x4AA60`), so the checker warns
+that it exceeds the 256 KiB production/OTA slot while still enforcing the
+factory-data boundary.
+
+## Flash and inspect
+
+The default helper paths are:
+
 - `TLSRPGM=$HOME/TLSRPGM/TlsrPgm.py`
 - `TLSR_DEBUG=$HOME/zboss_opensource/tlsr_debug.py`
 - `TELINK_PORT=/dev/cu.usbserial-1410`
 
-Override any of them if your setup differs.
-
-### 1. Build or check
+All are overridable:
 
 ```bash
-cd examples/telink-tlsr8258-sensor
-
-scripts/tlsr8258.sh check sensor
-scripts/tlsr8258.sh build sensor
-scripts/tlsr8258.sh build diag-assoc
-scripts/tlsr8258.sh build diag-beacon
+./scripts/tlsr8258.sh flash runtime-sensor
+./scripts/tlsr8258.sh dump-boot
+./scripts/tlsr8258.sh dump-mode
+./scripts/tlsr8258.sh dump 0x00848550 8
 ```
 
-The build step emits:
+## Proven behavior
 
-- `target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor`
-- `target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin`
+The runtime gate has been exercised with Home Assistant ZHA and an Ember
+coordinator:
 
-The validated build path uses:
+- active scan, association, and indirect polling;
+- Network-Key transport and secured Device Announce;
+- Request-Key, unique TCLK transport, Verify-Key, and Confirm-Key;
+- Node Descriptor, Active Endpoints, Simple Descriptor, Match, and Bind;
+- Basic, Power Configuration, Identify, Temperature, and Humidity clusters;
+- crash-safe two-sector security journal;
+- reset resume with monotonic reserved global and TCLK counters.
 
-```bash
-cargo rustc --release -- -C lto=no -C opt-level=1
-```
+## Remaining work
 
-The tc32 backend currently trips codegen bugs on this example with the default
-high-optimization release pipeline.
-
-### 2. Flash
-
-```bash
-cd examples/telink-tlsr8258-sensor
-
-scripts/tlsr8258.sh flash sensor
-scripts/tlsr8258.sh flash diag-assoc
-scripts/tlsr8258.sh flash diag-beacon
-```
-
-Under the hood, this runs the same programmer flow used during bring-up:
-
-```bash
-python3 ~/TLSRPGM/TlsrPgm.py \
-  -p /dev/cu.usbserial-1410 \
-  -t 500 \
-  -a 200 \
-  -m we 0 \
-  target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin
-```
-
-### 3. Inspect debug SRAM markers
-
-Boot-stage markers live at `0x00848400`, runtime markers at `0x00848500`.
-
-```bash
-cd examples/telink-tlsr8258-sensor
-
-scripts/tlsr8258.sh dump-boot
-scripts/tlsr8258.sh dump-mode
-scripts/tlsr8258.sh dump 0x00848550 8
-```
-
-Equivalent raw command:
-
-```bash
-python3 ~/zboss_opensource/tlsr_debug.py \
-  -p /dev/cu.usbserial-1410 \
-  --activate read 0x00848500 20
-```
-
-## Local type-check without tc32 toolchain
-
-If you only want a fast structural check, use the repo target spec with nightly:
-
-```bash
-cd examples/telink-tlsr8258-sensor
-cargo -Zbuild-std=core -Zunstable-options -Zjson-target-spec check \
-  --target ../../targets/tc32-none-eabi.json
-```
-
-This does not produce a flashable tc32 firmware image.
-
-## Current status
-
-- Pure-Rust startup, linker, IRQ entry, analog/clock bring-up
-- Pure-Rust TLSR8258 RF/DMA setup and channel programming
-- Polling MAC path for active scan, association, poll, TX, RX indication
-- `sensor` mode is the default runtime and uses the validated pure-Rust association path
-- minimal interview responses for `NWK/IEEE Addr`, `Node Desc`, `Power Desc`, `Active EP`, `Simple Desc`
-- minimal ZCL `Read Attributes Response` for Basic, Power Configuration, Identify, and Temperature Measurement
-- Flash/debug helpers are scripted for reproducible build, flash, and SRAM inspection
-- No vendor SDK dependency in the TLSR8258 path
-
-The full `ZigbeeDevice::start/tick` runtime path is still blocked by a tc32
-backend codegen bug on `tc32-stage2-tc32-31`, so the current default firmware
-keeps the hardware on the lighter `sensor-lite` path for join and interview.
-
-## Project structure
-
-```text
-telink-tlsr8258-sensor/
-├── Cargo.toml
-├── build.rs
-├── memory.x
-├── scripts/
-│   └── tlsr8258.sh
-└── src/
-    └── main.rs
-```
+- Replace the local radio/MAC copy with the reusable
+  `zigbee_mac::telink::TelinkMac` path.
+- Remove the remaining application-owned SRAM markers and HA probe logic.
+- Add production factory-reset UI and hardware validation.
+- Add retention/deep-sleep radio reconfiguration and the Zbit flash voltage
+  guard.
+- Reduce the image below the 256 KiB OTA slot.

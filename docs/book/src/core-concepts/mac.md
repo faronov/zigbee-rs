@@ -144,7 +144,7 @@ backend is behind a Cargo feature flag:
 | **nRF** | `nrf52840`, `nrf52833` | nRF52840, nRF52833 | Nordic 802.15.4 radio, `embassy-nrf` peripherals |
 | **BL702** | `bl702` | BL702, BL706 | Bouffalo Lab 802.15.4 radio |
 | **CC2340** | `cc2340` | CC2340R5 | TI SimpleLink, Cortex-M0+ with 802.15.4 |
-| **Telink** | `telink` | B91 (TLSR9518), TLSR8258 | Telink 802.15.4 radios — TLSR8258 is pure Rust (direct register access), B91 uses FFI |
+| **Telink TLSR8258** | `tlsr8258` | TLSR8258 | Pure-Rust TLSR8258 radio and MAC; `telink` remains a compatibility alias |
 | **PHY6222** | `phy6222` | PHY6222 | Phyplus BLE+802.15.4 combo SoC |
 | **EFR32MG1** | `efr32` | EFR32MG1P | Silicon Labs Series 1, Cortex-M4F — pure Rust (direct register access) |
 | **EFR32MG21** | `efr32s2` | EFR32MG21 | Silicon Labs Series 2, Cortex-M33 — pure Rust (direct register access) |
@@ -170,9 +170,9 @@ a one-line Cargo feature change plus updating the MAC initialization code.
   combo.  Mature Embassy async support.
 - **BL702** — Low cost, good for high-volume products.
 - **CC2340R5** — TI ecosystem, good for industrial applications.
-- **Telink B91 / TLSR8258** — Very low cost, widely used in commercial Zigbee
-  products (IKEA TRÅDFRI, etc.). TLSR8258 has a pure-Rust radio driver (no
-  vendor SDK needed); B91 requires Telink SDK.
+- **Telink TLSR8258** — Very low cost and widely used in commercial Zigbee
+  products. The current backend is pure Rust and needs no vendor SDK. B91 is
+  not implemented and remains an unsupported scaffold.
 - **PHY6222** — Budget BLE+802.15.4 combo, pure-Rust radio driver, suitable for simple sensors.
 - **EFR32MG1** — Silicon Labs Series 1 (Cortex-M4F), used in IKEA TRÅDFRI modules.
   Pure-Rust radio driver — no GSDK/RAIL required. Great for repurposing existing hardware.

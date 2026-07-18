@@ -44,7 +44,7 @@ pub mod bl702;
 #[cfg(feature = "cc2340")]
 pub mod cc2340;
 
-#[cfg(feature = "telink")]
+#[cfg(feature = "tlsr8258")]
 pub mod telink;
 
 #[cfg(feature = "phy6222")]

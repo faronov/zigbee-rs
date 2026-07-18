@@ -13,7 +13,7 @@ publish = false
 
 [dependencies]
 tlsr8258-hal = { path = "../../tlsr8258-hal" }
-zigbee-mac = { path = "../../zigbee-mac", features = ["telink"], optional = true }
+zigbee-mac = { path = "../../zigbee-mac", features = ["tlsr8258"], optional = true }
 zigbee-types = { path = "../../zigbee-types", optional = true }
 zigbee-nwk = { path = "../../zigbee-nwk", optional = true }
 zigbee-aps = { path = "../../zigbee-aps", optional = true }

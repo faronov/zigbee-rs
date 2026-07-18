@@ -79,13 +79,15 @@ cc2340 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 
-telink = [
+tlsr8258 = [
     "dep:tlsr8258-hal",
 ]
+# Backward-compatible alias for the former ambiguous feature name.
+telink = ["tlsr8258"]
 
 # Telink with HAL crate — requires local tlsr82xx-hal (not available in CI)
 # telink-hal = [
-#     "telink",
+#     "tlsr8258",
 #     "dep:tlsr82xx-hal",
 # ]
 

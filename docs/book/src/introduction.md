@@ -53,7 +53,7 @@ responsible for one protocol layer:
 The ZCL layer implements **33 clusters** spanning General, Measurement &
 Sensing, Lighting, HVAC, Closures, Security, Smart Energy, and Touchlink.
 
-The MAC layer provides **10 hardware backends**:
+The MAC layer provides **11 supported chip targets**:
 
 | Backend | Target | Notes |
 |---------|--------|-------|
@@ -64,9 +64,13 @@ The MAC layer provides **10 hardware backends**:
 | nRF52833 | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
 | BL702 | `riscv32imac-unknown-none-elf` | Vendor `lmac154` FFI |
 | CC2340 | `thumbv6m-none-eabi` | TI SimpleLink SDK stubs |
-| Telink B91 | `riscv32imac-unknown-none-elf` | Telink SDK stubs |
-| TLSR8258 | `riscv32-unknown-none-elf` | Telink SDK stubs (tc32 ISA) |
+| TLSR8258 | `tc32-unknown-none-elf` | **Pure Rust** TLSR8258 radio and MAC |
 | PHY6222 | `thumbv6m-none-eabi` | **Pure Rust** — zero vendor blobs! |
+| EFR32MG1 | `thumbv7em-none-eabi` | **Pure Rust** Series 1 radio |
+| EFR32MG21 | `thumbv8m.main-none-eabihf` | **Pure Rust** Series 2 radio |
+
+Telink B91 is retained only as an unsupported scaffold; no B91 radio or MAC
+backend is currently implemented.
 
 ## Current Status
 

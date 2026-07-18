@@ -31,7 +31,8 @@ coordinator/router role support. Most applications interact with the
 | Crate | Role |
 |-------|------|
 | **`zigbee-types`** | Core types shared by all layers: `IeeeAddress`, `ShortAddress`, `PanId`, `ChannelMask`, `MacAddress`. No dependencies. |
-| **`zigbee-mac`** | IEEE 802.15.4 MAC layer. Defines the async `MacDriver` trait (13 methods) and ships 8+ backends: MockMac, ESP32-C6/H2, nRF52840/52833, BL702, CC2340, Telink B91/TLSR8258, PHY6222. |
+| **`zigbee-crypto`** | Shared low-stack Zigbee AES-CCM* primitives used by NWK and APS. |
+| **`zigbee-mac`** | IEEE 802.15.4 MAC layer. Defines the async `MacDriver` trait and ships backends for Mock, ESP32-C6/H2, nRF52840/52833, BL702, CC2340, TLSR8258, PHY6222, EFR32MG1, and EFR32MG21. |
 | **`zigbee-nwk`** | Network layer. Frame parsing, AODV + tree routing, NWK security (AES-CCM\*), the NIB (Network Information Base), and the `NwkLayer<M: MacDriver>` wrapper. |
 | **`zigbee-aps`** | Application Support Sub-layer. APS frame encode/decode, binding table, group table, APS security, fragmentation, and duplicate detection. |
 | **`zigbee-zdo`** | Zigbee Device Objects (endpoint 0). Handles discovery (`Active_EP_req`, `Simple_Desc_req`, `Match_Desc_req`), binding, and network management requests. |
