@@ -9,6 +9,7 @@ use zigbee_mac::primitives::*;
 use zigbee_mac::MacDriver;
 use zigbee_runtime::nv_storage::{NvItemId, NvStorage, RamNvStorage};
 use zigbee_runtime::power::{PowerManager, PowerMode, SleepDecision};
+use zigbee_runtime::synthetic_sensor::SyntheticSensor;
 use zigbee_types::*;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
 use zigbee_zcl::clusters::poll_control::PollControlCluster;
@@ -38,6 +39,8 @@ const DEVICE_IEEE: IeeeAddress = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08
 // ── Sensor simulation parameters ────────────────────────────────
 const BASE_TEMP_HUNDREDTHS: i16 = 2300; // 23.00°C
 const BASE_HUMIDITY_HUNDREDTHS: u16 = 6500; // 65.00% RH
+const TEST_SENSOR: SyntheticSensor =
+    SyntheticSensor::new(BASE_TEMP_HUNDREDTHS, 100, BASE_HUMIDITY_HUNDREDTHS, 400);
 const TEMP_REPORTABLE_CHANGE: i16 = 10; // 0.10°C threshold
 const HUMIDITY_REPORTABLE_CHANGE: u16 = 50; // 0.50% RH threshold
 const CHECK_IN_CYCLE_INTERVAL: u32 = 5; // send check-in every 5th cycle
@@ -273,27 +276,9 @@ fn phase_read_sensors(
     println!();
     println!("  {YELLOW}[SENSOR]{RESET} Reading sensors...");
 
-    // Simulate drift: temperature drifts ±0.02°C per cycle, humidity ±0.1%
-    let temp_drift = match cycle % 7 {
-        0 => -5,
-        1 => 2,
-        2 => 3,
-        3 => -1,
-        4 => 8,
-        5 => -2,
-        _ => 1,
-    };
-    let humidity_drift: i32 = match cycle % 5 {
-        0 => -20,
-        1 => 10,
-        2 => 15,
-        3 => -5,
-        _ => 8,
-    };
-
-    let temp = BASE_TEMP_HUNDREDTHS + (cycle as i16 * 2) + temp_drift;
-    let humidity = (BASE_HUMIDITY_HUNDREDTHS as i32 + (cycle as i32 * 3) + humidity_drift)
-        .clamp(0, 10000) as u16;
+    let reading = TEST_SENSOR.sample(cycle);
+    let temp = reading.temperature_centidegrees;
+    let humidity = reading.humidity_centipercent;
 
     temp_cluster.set_temperature(temp);
     humidity_cluster.set_humidity(humidity);

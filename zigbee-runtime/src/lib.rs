@@ -51,6 +51,7 @@ pub mod ota;
 pub mod power;
 pub mod security_journal;
 pub mod security_store;
+pub mod synthetic_sensor;
 pub mod templates;
 
 use zigbee_aps::ApsAddress;

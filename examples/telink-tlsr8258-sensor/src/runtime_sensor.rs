@@ -7,6 +7,7 @@ use zigbee_runtime::event_loop::{StackEvent, StartError};
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::security_journal::{SecurityJournalStorage, SecurityStateJournal};
 use zigbee_runtime::security_store::SecurityStoreError;
+use zigbee_runtime::synthetic_sensor::{SyntheticSensor, apply_synthetic_reading};
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
@@ -22,6 +23,8 @@ const SECURITY_SECTOR_B: u32 = 0x0007_5000;
 // Preserve the IEEE address used by the hardware-proven runtime image so the
 // existing journal and ZHA device identity remain valid across this refactor.
 const DEVICE_EUI_OFFSET: u8 = 0x33;
+const SENSOR_UPDATE_INTERVAL_SECS: u16 = 30;
+const TEST_SENSOR: SyntheticSensor = SyntheticSensor::new(2_150, 100, 5_000, 400);
 
 struct Tlsr8258SecurityFlash;
 
@@ -162,6 +165,8 @@ pub fn run() -> ! {
         SECURITY_SECTOR_A,
         SECURITY_SECTOR_B,
     );
+    let mut sensor_sample = 0u32;
+    let mut sensor_update_elapsed = 0u16;
 
     'commission: loop {
         let mut attempts = 0u8;
@@ -181,6 +186,9 @@ pub fn run() -> ! {
         board::LED_RED.write(false);
         board::LED_GREEN.write(true);
         board::LED_BLUE.write(false);
+        if apply_synthetic_reading(&mut clusters, 1, TEST_SENSOR.sample(sensor_sample)).is_err() {
+            failure();
+        }
 
         let one_second = tlsr8258_hal::timer::ms(1_000);
         let mut tick_anchor = tlsr8258_hal::timer::now_ticks();
@@ -237,6 +245,20 @@ pub fn run() -> ! {
             if elapsed >= one_second {
                 let elapsed_secs = (elapsed / one_second).min(u16::MAX as u32) as u16;
                 tick_anchor = tick_anchor.wrapping_add(u32::from(elapsed_secs) * one_second);
+                sensor_update_elapsed = sensor_update_elapsed.saturating_add(elapsed_secs);
+                if sensor_update_elapsed >= SENSOR_UPDATE_INTERVAL_SECS {
+                    sensor_update_elapsed %= SENSOR_UPDATE_INTERVAL_SECS;
+                    sensor_sample = sensor_sample.wrapping_add(1);
+                    if apply_synthetic_reading(
+                        &mut clusters,
+                        1,
+                        TEST_SENSOR.sample(sensor_sample),
+                    )
+                    .is_err()
+                    {
+                        failure();
+                    }
+                }
                 if executor::block_on(device.tick_with_security_store(
                     elapsed_secs,
                     &mut clusters,
