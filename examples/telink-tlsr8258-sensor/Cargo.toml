@@ -3,6 +3,17 @@ name = "telink-tlsr8258-sensor"
 version = "0.1.0"
 edition = "2024"
 build = "build.rs"
+autobins = false
+
+[[bin]]
+name = "telink-tlsr8258-runtime"
+path = "src/runtime_main.rs"
+required-features = ["runtime-sensor"]
+
+[[bin]]
+name = "telink-tlsr8258-lab"
+path = "src/main.rs"
+required-features = ["lab"]
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
@@ -24,10 +35,11 @@ panic-halt = "1.0"
 
 [features]
 default = ["runtime-sensor"]
-diag-beacon = []
-diag-assoc = []
-diag-smoke = []
-sensor = []
+lab = []
+diag-beacon = ["lab"]
+diag-assoc = ["lab"]
+diag-smoke = ["lab"]
+sensor = ["lab"]
 runtime-sensor = ["dep:tlsr8258-hal", "zigbee-mac/tlsr8258"]
 
 [profile.release]

@@ -4,10 +4,10 @@ This package is the current end-to-end TLSR8258 hardware gate for join,
 Trust Center exchange, ZHA interview, reporting, persistence, reset resume,
 and secured parent rejoin.
 
-`runtime-sensor` uses the reusable `tlsr8258-hal` radio plus
-`zigbee_mac::telink::TelinkMac`. The large local diagnostic radio and
-`Tlsr8258Mac` remain only for the explicitly selected legacy `sensor` and
-diagnostic modes.
+`runtime-sensor` builds the dedicated `telink-tlsr8258-runtime` binary over
+the reusable `tlsr8258-hal` radio and `zigbee_mac::telink::TelinkMac`. The
+large local diagnostic radio and `Tlsr8258Mac` compile only into the separate
+`telink-tlsr8258-lab` binary selected by legacy and diagnostic modes.
 
 ## Hardware
 
@@ -95,11 +95,11 @@ sequence.
 Outputs:
 
 ```text
-target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor
-target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin
+target/tc32-unknown-none-elf/release/telink-tlsr8258-runtime
+target/tc32-unknown-none-elf/release/telink-tlsr8258-runtime.bin
 ```
 
-The current runtime image is 356,668 bytes (`0x5713C`), so the checker warns
+The current runtime image is 355,828 bytes (`0x56DF4`), so the checker warns
 that it exceeds the 256 KiB production/OTA slot while still enforcing the
 security-journal boundary at `0x74000`.
 

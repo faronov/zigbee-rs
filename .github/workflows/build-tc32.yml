@@ -85,5 +85,5 @@ jobs:
         with:
           name: tlsr8258-tc32-firmware
           path: |
-            examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin
+            examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-runtime.bin
             examples/telink-tlsr8258-radio/target/tc32-unknown-none-elf/release/telink-tlsr8258-radio.bin

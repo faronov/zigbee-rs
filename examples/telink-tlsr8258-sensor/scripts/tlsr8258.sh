@@ -23,8 +23,9 @@ PROBE_RS_PROTOCOL="${PROBE_RS_PROTOCOL:-swd}"
 PROBE_RS_SCAN_REGION="${PROBE_RS_SCAN_REGION:-ram}"
 
 TARGET_DIR="${EXAMPLE_DIR}/target/tc32-unknown-none-elf/release"
-ELF_PATH="${TARGET_DIR}/telink-tlsr8258-sensor"
-BIN_PATH="${TARGET_DIR}/telink-tlsr8258-sensor.bin"
+BIN_NAME="telink-tlsr8258-lab"
+ELF_PATH="${TARGET_DIR}/${BIN_NAME}"
+BIN_PATH="${TARGET_DIR}/${BIN_NAME}.bin"
 
 DBG_BOOT_BASE="0x0084F000"
 DBG_MODE_BASE="0x0084F100"
@@ -84,22 +85,27 @@ resolve_mode() {
     case "$mode" in
         sensor)
             MODE_NAME="sensor"
+            BIN_NAME="telink-tlsr8258-lab"
             CARGO_FEATURE_ARGS=(--no-default-features --features sensor)
             ;;
         runtime-sensor)
             MODE_NAME="runtime-sensor"
+            BIN_NAME="telink-tlsr8258-runtime"
             CARGO_FEATURE_ARGS=(--no-default-features --features runtime-sensor)
             ;;
         diag-assoc)
             MODE_NAME="diag-assoc"
+            BIN_NAME="telink-tlsr8258-lab"
             CARGO_FEATURE_ARGS=(--no-default-features --features diag-assoc)
             ;;
         diag-beacon)
             MODE_NAME="diag-beacon"
+            BIN_NAME="telink-tlsr8258-lab"
             CARGO_FEATURE_ARGS=(--no-default-features --features diag-beacon)
             ;;
         diag-smoke)
             MODE_NAME="diag-smoke"
+            BIN_NAME="telink-tlsr8258-lab"
             CARGO_FEATURE_ARGS=(--no-default-features --features diag-smoke)
             ;;
         *)
@@ -108,6 +114,8 @@ resolve_mode() {
             exit 1
             ;;
     esac
+    ELF_PATH="${TARGET_DIR}/${BIN_NAME}"
+    BIN_PATH="${TARGET_DIR}/${BIN_NAME}.bin"
 }
 
 run_cargo() {
@@ -119,6 +127,7 @@ run_cargo() {
         if (( ${#CARGO_FEATURE_ARGS[@]} > 0 )); then
             cargo_args+=("${CARGO_FEATURE_ARGS[@]}")
         fi
+        cargo_args+=(--bin "$BIN_NAME")
         cargo_args+=("$@")
         cd "$EXAMPLE_DIR"
         env CARGO_HOME="$CARGO_HOME" "$CARGO_BIN" "${cargo_args[@]}"

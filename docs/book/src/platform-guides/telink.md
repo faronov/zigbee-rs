@@ -132,14 +132,17 @@ cd examples/telink-tlsr8258-sensor
 ./scripts/tlsr8258.sh build runtime-sensor
 ```
 
-The runtime-gate output files are:
+The production runtime output files are:
 
 ```text
-target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor
-target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin
+target/tc32-unknown-none-elf/release/telink-tlsr8258-runtime
+target/tc32-unknown-none-elf/release/telink-tlsr8258-runtime.bin
 ```
 
-The current runtime image is larger than the 256 KiB production/OTA slot, so
+The production binary is separate from the diagnostic
+`telink-tlsr8258-lab` target and uses a linker layout without the SWire SRAM
+reservation. The current runtime image is larger than the 256 KiB
+production/OTA slot, so
 the post-link checker emits a warning while still enforcing the factory-data,
 cache, DMA, BSS, and stack boundaries.
 
