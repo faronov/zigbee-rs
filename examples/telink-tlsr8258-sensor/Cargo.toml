@@ -15,6 +15,14 @@ name = "telink-tlsr8258-lab"
 path = "src/main.rs"
 required-features = ["lab"]
 
+# EXPERIMENTAL — join/relay-only router (no child association). See
+# src/runtime_router.rs and README.md "Router firmware" for scope and
+# limitations.
+[[bin]]
+name = "telink-tlsr8258-router"
+path = "src/main_router.rs"
+required-features = ["runtime-router"]
+
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac" }
@@ -41,6 +49,10 @@ diag-assoc = ["lab"]
 diag-smoke = ["lab"]
 sensor = ["lab"]
 runtime-sensor = ["dep:tlsr8258-hal", "zigbee-mac/tlsr8258"]
+# EXPERIMENTAL router firmware: join + non-beacon relay only. Does not,
+# and must not, gain child-association/beacon/permit-joining/indirect-queue
+# support merely by enabling this feature — see README.md.
+runtime-router = ["dep:tlsr8258-hal", "zigbee-mac/tlsr8258"]
 
 [profile.release]
 # Optimize the complete stack as one unit. The tc32 backend rejects

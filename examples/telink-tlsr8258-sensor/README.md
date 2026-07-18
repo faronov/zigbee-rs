@@ -9,6 +9,11 @@ the reusable `tlsr8258-hal` radio and `zigbee_mac::telink::TelinkMac`. The
 large local diagnostic radio and `Tlsr8258Mac` compile only into the separate
 `telink-tlsr8258-lab` binary selected by legacy and diagnostic modes.
 
+`runtime-router` builds `telink-tlsr8258-router` — an **EXPERIMENTAL**,
+join/relay-only router firmware over the same reusable
+`zigbee_mac::telink::TelinkMac`. See "Router firmware" below before treating
+it as a complete Zigbee router.
+
 ## Hardware
 
 - MCU: Telink TLSR8258, TC32 core
@@ -56,6 +61,7 @@ Alternatively set `TC32_TOOLCHAIN` to another extracted stage2 toolchain.
 | Mode | Purpose |
 |------|---------|
 | `runtime-sensor` | Default full NWK/APS/BDB/ZDO/ZCL runtime, security persistence, and reporting |
+| `runtime-router` | **EXPERIMENTAL** join/relay-only router — see "Router firmware" below |
 | `sensor` | Legacy lighter interview path retained for comparison |
 | `diag-assoc` | Scan, association, polling, and unicast diagnostics |
 | `diag-beacon` | Raw Beacon Request and beacon parsing |
@@ -76,6 +82,7 @@ cd examples/telink-tlsr8258-sensor
 Other modes are selected explicitly:
 
 ```bash
+./scripts/tlsr8258.sh build runtime-router
 ./scripts/tlsr8258.sh build sensor
 ./scripts/tlsr8258.sh build diag-assoc
 ./scripts/tlsr8258.sh build diag-beacon
@@ -145,3 +152,85 @@ coordinator:
 - Add retention/deep-sleep radio reconfiguration and the Zbit flash voltage
   guard.
 - Reduce the image below the 256 KiB OTA slot.
+
+## Router firmware (`runtime-router`) — EXPERIMENTAL, non-parenting
+
+`telink-tlsr8258-router` is the TLSR8258 analogue of
+`examples/nrf52840-router`: an always-on FFD that joins an existing network
+with the router capability bit and exercises NWK relay paths. It reuses the
+same proven boot vector, IRQ glue, production linker layout
+(`memory-runtime.x`), and security journal as `runtime-sensor` — only the
+application module (`src/runtime_router.rs`) and device role differ.
+
+**What it does:**
+
+- Joins with the router capability bit (`DeviceType::Router`,
+  `PowerMode::AlwaysOn`, `rx_on_when_idle` always on — never sleeps).
+- After joining, `zigbee-nwk`'s `Nlme::nlme_start_router()` drives
+  `zigbee_mac::telink::TelinkMac::mlme_start` into non-beacon (`BO=SO=15`),
+  non-PAN-coordinator, continuous-RX mode.
+- Relays unicast NWK frames addressed elsewhere and rebroadcasts
+  broadcast/route-request traffic (existing generic `zigbee-nwk` forwarding,
+  unchanged by this firmware).
+- Sends periodic NWK Link Status broadcasts (existing generic
+  `zigbee-runtime`/`zigbee-nwk` tick behavior).
+- Persists join/security state across resets and secure-rejoins on request,
+  exactly like `runtime-sensor`.
+
+**What it explicitly does NOT do — and must not silently grow:**
+
+- **No child association.** `TelinkMac` never implements
+  `MLME-ASSOCIATE.response`. Nothing fakes it here.
+- **No beacon transmission.** `macBeaconOrder`/`macSuperframeOrder` are
+  fixed at 15 by `TelinkMac::mlme_start`'s parameter validation
+  (`zigbee_mac::telink::validate_router_start`); beaconed superframes are
+  rejected with `MacError::Unsupported`.
+- **No permit-joining.** `macAssociationPermit` is never set `true`.
+- **No indirect transmission / pending-frame queue** for sleepy children —
+  `TelinkMac::mcps_data` rejects `tx_options.indirect`.
+- **No PAN-coordinator / network-forming support.** `mlme_start` rejects
+  `pan_coordinator: true` requests.
+
+`zigbee_mac::telink::TelinkMac::capabilities().router` intentionally
+reports `false`: that flag describes the ability to admit and serve child
+devices, which this backend genuinely lacks, not "can relay frames on an
+existing route" (which `mlme_start` now enables).
+
+The router uses a distinct IEEE address from `runtime-sensor`. When switching
+the same board between those firmware roles, the runtime clears the stale
+commissioned identity while preserving both outgoing security-counter bounds,
+then performs a fresh join. This avoids both restoring a journal for the wrong
+IEEE address and reusing secured nonce/counter space.
+
+Build and flash exactly like the sensor runtime:
+
+```bash
+cd examples/telink-tlsr8258-sensor
+./scripts/tlsr8258.sh check runtime-router
+./scripts/tlsr8258.sh build runtime-router
+./scripts/tlsr8258.sh flash runtime-router
+```
+
+Output:
+
+```text
+target/tc32-unknown-none-elf/release/telink-tlsr8258-router
+target/tc32-unknown-none-elf/release/telink-tlsr8258-router.bin
+```
+
+The router image is 212,256 bytes (`0x33D20`), below the 256 KiB
+production/OTA slot and the security-journal boundary at `0x74000`.
+
+### Router remaining gaps
+
+- Home Assistant ZHA hardware testing confirms FFD join, Basic/Identify
+  interview, Identify commands, and commissioned-state restoration after a
+  hardware reset.
+- A routed third-node traffic test and long-duration relay stability run are
+  still outstanding.
+- Child association, beaconing, permit-joining, and indirect transmission
+  are not implemented at the MAC layer; adding them requires independent
+  hardware bring-up of `MLME-ASSOCIATE.response`, beacon TX, and a pending
+  (indirect) frame queue in `tlsr8258-hal`/`zigbee-mac`, which is out of
+  scope here.
+- Coordinator (PAN-forming) support is out of scope for this backend.

@@ -36,9 +36,9 @@ declare -a CARGO_FEATURE_ARGS=()
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/tlsr8258.sh check [sensor|runtime-sensor|diag-assoc|diag-beacon]
-  scripts/tlsr8258.sh build [sensor|runtime-sensor|diag-assoc|diag-beacon]
-  scripts/tlsr8258.sh flash [sensor|runtime-sensor|diag-assoc|diag-beacon]
+  scripts/tlsr8258.sh check [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
+  scripts/tlsr8258.sh build [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
+  scripts/tlsr8258.sh flash [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
   scripts/tlsr8258.sh dump-boot [word-count]
   scripts/tlsr8258.sh dump-mode [word-count]
   scripts/tlsr8258.sh dump <address> [word-count]
@@ -50,10 +50,10 @@ Usage:
   scripts/tlsr8258.sh pgm-go
   scripts/tlsr8258.sh probe-list
   scripts/tlsr8258.sh probe-info
-  scripts/tlsr8258.sh probe-attach [sensor|runtime-sensor|diag-assoc|diag-beacon]
-  scripts/tlsr8258.sh probe-list-rtt [sensor|runtime-sensor|diag-assoc|diag-beacon]
-  scripts/tlsr8258.sh probe-debug [sensor|runtime-sensor|diag-assoc|diag-beacon]
-  scripts/tlsr8258.sh probe-gdb [sensor|runtime-sensor|diag-assoc|diag-beacon]
+  scripts/tlsr8258.sh probe-attach [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
+  scripts/tlsr8258.sh probe-list-rtt [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
+  scripts/tlsr8258.sh probe-debug [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
+  scripts/tlsr8258.sh probe-gdb [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
 
 Environment overrides:
   TC32_TOOLCHAIN  Path to tc32-stage2 toolchain root
@@ -92,6 +92,11 @@ resolve_mode() {
             MODE_NAME="runtime-sensor"
             BIN_NAME="telink-tlsr8258-runtime"
             CARGO_FEATURE_ARGS=(--no-default-features --features runtime-sensor)
+            ;;
+        runtime-router)
+            MODE_NAME="runtime-router"
+            BIN_NAME="telink-tlsr8258-router"
+            CARGO_FEATURE_ARGS=(--no-default-features --features runtime-router)
             ;;
         diag-assoc)
             MODE_NAME="diag-assoc"
@@ -226,12 +231,12 @@ verify_layout() {
             "$ramcode_len" >&2
         exit 1
     fi
-    if [[ "$MODE_NAME" == "runtime-sensor" ]]; then
+    if [[ "$MODE_NAME" == "runtime-sensor" || "$MODE_NAME" == "runtime-router" ]]; then
         if ! "$nm" -C "$ELF_PATH" | awk '
             /zigbee_mac::telink::imp::TelinkMac/ { found = 1 }
             END { exit(found ? 0 : 1) }
         '; then
-            echo 'layout-check FAIL: runtime-sensor does not link zigbee_mac::telink::TelinkMac' >&2
+            echo "layout-check FAIL: ${MODE_NAME} does not link zigbee_mac::telink::TelinkMac" >&2
             exit 1
         fi
         if "$nm" -C "$ELF_PATH" | awk '
@@ -239,7 +244,7 @@ verify_layout() {
             /telink_tlsr8258_sensor::radio::/ { found = 1 }
             END { exit(found ? 0 : 1) }
         '; then
-            echo 'layout-check FAIL: runtime-sensor still links the legacy local MAC/radio' >&2
+            echo "layout-check FAIL: ${MODE_NAME} still links the legacy local MAC/radio" >&2
             exit 1
         fi
     fi
@@ -256,9 +261,9 @@ verify_layout() {
             exit 1
         fi
         if (( bin_size > 0x40000 )); then
-            if [[ "$MODE_NAME" == "runtime-sensor" ]]; then
-                printf 'layout-check FAIL: runtime .bin size=%d (0x%X) exceeds 256 KiB production/OTA slot\n' \
-                    "$bin_size" "$bin_size" >&2
+            if [[ "$MODE_NAME" == "runtime-sensor" || "$MODE_NAME" == "runtime-router" ]]; then
+                printf 'layout-check FAIL: %s .bin size=%d (0x%X) exceeds 256 KiB production/OTA slot\n' \
+                    "$MODE_NAME" "$bin_size" "$bin_size" >&2
                 exit 1
             fi
             printf 'layout-check WARN: .bin size=%d (0x%X) exceeds 256 KiB production/OTA slot\n' \

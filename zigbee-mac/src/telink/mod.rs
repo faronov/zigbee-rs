@@ -1,9 +1,32 @@
 //! Pure-Rust TLSR8258 MAC backend.
 //!
-//! This backend intentionally supports Zigbee end devices only. It wraps the
-//! hardware-proven `tlsr8258-hal` radio path; coordinator and router
-//! primitives remain disabled until they have independent hardware evidence.
+//! This backend wraps the hardware-proven `tlsr8258-hal` radio path and
+//! supports two roles:
+//!
+//! - **End device** (fully supported): scan, associate, sleepy poll, secure
+//!   rejoin.
+//! - **Router — join/relay only, EXPERIMENTAL** (see `imp::TelinkMac::mlme_start`
+//!   below): after `mlme_associate` completes with the router capability
+//!   bit, the NWK layer's `nlme_start_router()` calls `MacDriver::mlme_start`
+//!   to put the radio into non-beacon, continuous-RX mode so this device
+//!   can relay unicast/broadcast NWK traffic and participate in AODV route
+//!   discovery for other routers/end devices, exactly like the
+//!   `nrf52840-router` example.
+//!
+//! **This backend cannot parent child devices.** It never implements
+//! `MLME-ASSOCIATE.response`, never transmits 802.15.4 beacons, never opens
+//! `macAssociationPermit`, and has no indirect-transmission (pending frame)
+//! queue for sleepy children. `MacCapabilities::router` is reported as
+//! `false` for this reason — it describes "can this backend admit and serve
+//! children" capacity, which is honestly absent, not "can this backend relay
+//! frames on an existing route", which router-role `mlme_start` now enables.
+//! True coordinator (PAN-forming) support also remains disabled pending
+//! independent hardware evidence.
 
+#[cfg(any(target_arch = "tc32", test))]
+use crate::MacError;
+#[cfg(any(target_arch = "tc32", test))]
+use crate::primitives::MlmeStartRequest;
 #[cfg(any(target_arch = "tc32", test))]
 use crate::primitives::{PanDescriptor, PanDescriptorList};
 
@@ -29,6 +52,41 @@ fn upsert_pan_descriptor(descriptors: &mut PanDescriptorList, mut descriptor: Pa
     {
         descriptors[weakest_index] = descriptor;
     }
+}
+
+/// Validates an `MLME-START.request` for the TLSR8258 backend's
+/// join/relay-only router role.
+///
+/// This is a pure, host-testable function (see the `tests` module below)
+/// kept separate from `imp::TelinkMac::mlme_start` so the parameter rules
+/// can be exercised without hardware. It intentionally accepts only the
+/// exact non-beacon, non-coordinator shape that
+/// `zigbee_nwk`'s `Nlme::nlme_start_router()` sends after a router has
+/// joined:
+///
+/// - `pan_coordinator` must be `false`. This backend never starts a PAN as
+///   coordinator via `MLME-START` — that role has no independent hardware
+///   evidence yet and is out of scope for this router path.
+/// - `beacon_order` and `superframe_order` must both be `15` (non-beacon
+///   mode). Beaconed superframes require transmitting periodic beacons and
+///   are not implemented.
+/// - `channel` must be a valid 2.4 GHz Zigbee channel (11..=26).
+/// - `pan_id` must not be the broadcast PAN ID `0xFFFF`.
+#[cfg(any(target_arch = "tc32", test))]
+pub(crate) fn validate_router_start(req: &MlmeStartRequest) -> Result<(), MacError> {
+    if req.pan_coordinator {
+        return Err(MacError::Unsupported);
+    }
+    if req.beacon_order != 15 || req.superframe_order != 15 {
+        return Err(MacError::Unsupported);
+    }
+    if !(11..=26).contains(&req.channel) {
+        return Err(MacError::InvalidParameter);
+    }
+    if req.pan_id.0 == 0xFFFF {
+        return Err(MacError::InvalidParameter);
+    }
+    Ok(())
 }
 
 #[cfg(target_arch = "tc32")]
@@ -733,8 +791,30 @@ mod imp {
             Ok(())
         }
 
-        async fn mlme_start(&mut self, _req: MlmeStartRequest) -> Result<(), MacError> {
-            Err(MacError::Unsupported)
+        /// EXPERIMENTAL, join/relay-only router start.
+        ///
+        /// Called by `zigbee_nwk::Nlme::nlme_start_router()` after this
+        /// device has already joined a network with the router capability
+        /// bit set. Validates the non-beacon, non-coordinator parameter
+        /// shape via [`super::validate_router_start`], then:
+        ///
+        /// 1. Applies `req.channel` and `req.pan_id` to the radio.
+        /// 2. Sets `macRxOnWhenIdle = true` so the radio stays in continuous
+        ///    RX and can relay unicast/broadcast NWK traffic and rebroadcast
+        ///    route-request frames.
+        ///
+        /// It does **not** transmit beacons, does **not** open
+        /// `macAssociationPermit`, and does **not** allocate any indirect
+        /// (pending-frame) queue — this backend cannot accept child
+        /// associations. Any caller requesting beaconed superframes or
+        /// PAN-coordinator start receives `MacError::Unsupported`.
+        async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
+            super::validate_router_start(&req)?;
+            self.set_channel(req.channel)?;
+            self.pan_id = req.pan_id;
+            self.rx_on_when_idle = true;
+            self.apply_radio_config();
+            Ok(())
         }
 
         async fn mlme_get(&self, attr: PibAttribute) -> Result<PibValue, MacError> {
@@ -932,6 +1012,12 @@ mod imp {
         fn capabilities(&self) -> MacCapabilities {
             MacCapabilities {
                 coordinator: false,
+                // `mlme_start` now supports the non-beacon join/relay router
+                // path (see its doc comment), but this backend still cannot
+                // admit child associations, transmit beacons, or buffer
+                // indirect frames — the capability this flag is meant to
+                // describe. Report `false` until that hardware evidence
+                // exists, matching the honest `nrf52840-router` precedent.
                 router: false,
                 hardware_security: false,
                 max_payload: (MAX_MAC_FRAME_LEN - 23) as u16,
@@ -1038,5 +1124,79 @@ mod tests {
         assert!(!descriptors.iter().any(|entry| {
             entry.coord_address == MacAddress::Short(PanId(0xDFE9), ShortAddress(0))
         }));
+    }
+
+    // ── validate_router_start (host-testable MLME-START parameter rules) ──
+
+    fn router_start_request() -> MlmeStartRequest {
+        MlmeStartRequest {
+            pan_id: PanId(0x1AAA),
+            channel: 15,
+            beacon_order: 15,
+            superframe_order: 15,
+            pan_coordinator: false,
+            battery_life_ext: false,
+        }
+    }
+
+    #[test]
+    fn router_start_accepts_the_exact_non_beacon_shape_nlme_start_router_sends() {
+        assert!(validate_router_start(&router_start_request()).is_ok());
+    }
+
+    #[test]
+    fn router_start_rejects_pan_coordinator_requests() {
+        let mut req = router_start_request();
+        req.pan_coordinator = true;
+        assert_eq!(validate_router_start(&req), Err(MacError::Unsupported));
+    }
+
+    #[test]
+    fn router_start_rejects_beaconed_superframes() {
+        let mut req = router_start_request();
+        req.beacon_order = 8;
+        req.superframe_order = 8;
+        assert_eq!(validate_router_start(&req), Err(MacError::Unsupported));
+    }
+
+    #[test]
+    fn router_start_rejects_partial_non_beacon_orders() {
+        // BO=15 with SO!=15 (or vice versa) is not a valid non-beacon
+        // configuration either — both fields must be 15 together.
+        let mut req = router_start_request();
+        req.superframe_order = 0;
+        assert_eq!(validate_router_start(&req), Err(MacError::Unsupported));
+    }
+
+    #[test]
+    fn router_start_rejects_out_of_range_channels() {
+        for channel in [0u8, 10, 27, 255] {
+            let mut req = router_start_request();
+            req.channel = channel;
+            assert_eq!(
+                validate_router_start(&req),
+                Err(MacError::InvalidParameter),
+                "channel {channel} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn router_start_accepts_full_channel_range() {
+        for channel in 11u8..=26 {
+            let mut req = router_start_request();
+            req.channel = channel;
+            assert!(
+                validate_router_start(&req).is_ok(),
+                "channel {channel} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn router_start_rejects_broadcast_pan_id() {
+        let mut req = router_start_request();
+        req.pan_id = PanId(0xFFFF);
+        assert_eq!(validate_router_start(&req), Err(MacError::InvalidParameter));
     }
 }

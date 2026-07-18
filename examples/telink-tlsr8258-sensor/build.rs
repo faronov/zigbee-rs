@@ -5,7 +5,8 @@
 
 fn main() {
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let production_runtime = std::env::var_os("CARGO_FEATURE_RUNTIME_SENSOR").is_some()
+    let production_runtime = (std::env::var_os("CARGO_FEATURE_RUNTIME_SENSOR").is_some()
+        || std::env::var_os("CARGO_FEATURE_RUNTIME_ROUTER").is_some())
         && std::env::var_os("CARGO_FEATURE_LAB").is_none();
     let linker_script = if production_runtime {
         "memory-runtime.x"

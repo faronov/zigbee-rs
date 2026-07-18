@@ -93,8 +93,24 @@ cargo build --release
 probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-router
 ```
 
-> **Router mode** — relays frames, accepts child joins, sends periodic Link Status
-> broadcasts. LED2 blinks on frame relay.
+> **Router mode** — joins as an always-on FFD, relays frames, and sends
+> periodic Link Status broadcasts. Child association is not implemented yet.
+
+### Telink TLSR8258 router — EXPERIMENTAL, join/relay only
+
+```bash
+cd examples/telink-tlsr8258-sensor
+./scripts/tlsr8258.sh build runtime-router
+./scripts/tlsr8258.sh flash runtime-router
+```
+
+> **Router mode (Telink)** — joins with the router capability bit and relays
+> unicast/broadcast NWK traffic + periodic Link Status. Hardware testing
+> confirms ZHA join, interview, Identify, and reset/resume. This backend does
+> **not** accept child joins: no `MLME-ASSOCIATE.response`, no beacons, no
+> permit-joining, no indirect frame queue. See
+> `examples/telink-tlsr8258-sensor/README.md` ("Router firmware") for the full
+> capability boundary.
 
 > **Flash NV storage** — network state is saved to internal flash (last 8 KB) and automatically
 > restored on power-up. No re-pairing after power cycles!
@@ -322,7 +338,7 @@ zigbee-rs/
 │   ├── bl702-sensor/          # BL702 (requires vendor libs from Bouffalo SDK)
 │   ├── cc2340-sensor/         # TI CC2340R5 (stubs)
 │   ├── telink-b91-sensor/     # Unsupported B91 scaffold (no MAC backend)
-│   ├── telink-tlsr8258-sensor/# Telink TLSR8258 — pure Rust, no vendor SDK!
+│   ├── telink-tlsr8258-sensor/# Telink TLSR8258 — pure Rust, no vendor SDK! (+ experimental router mode)
 │   ├── phy6222-sensor/        # PHY6222 — pure Rust, no vendor SDK!
 │   ├── efr32mg1-sensor/       # EFR32MG1P — pure Rust, Series 1 Cortex-M4F!
 │   └── efr32mg21-sensor/      # EFR32MG21 — pure Rust, Series 2 Cortex-M33!

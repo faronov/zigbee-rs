@@ -69,8 +69,22 @@ The reusable TLSR8258 backend currently supports the Zigbee end-device path:
 - local association-state clear and MAC reset;
 - mandatory platform timing and delay services.
 
-Coordinator and router roles are not advertised. Secure entropy is not yet
-provided by the backend, so operations that require it fail explicitly.
+It also supports an **experimental, join/relay-only router path**: after a
+device joins with the router capability bit, `zigbee-nwk`'s
+`Nlme::nlme_start_router()` calls `MacDriver::mlme_start`, which this backend
+now implements for the non-beacon (`BO=SO=15`), non-PAN-coordinator case —
+putting the radio into continuous RX so it can relay unicast/broadcast NWK
+traffic and rebroadcast route requests. See
+`examples/telink-tlsr8258-sensor` (`runtime-router` firmware mode) and its
+README "Router firmware" section. This does **not** include child
+association, beacon transmission, permit-joining, or an indirect
+(pending-frame) queue for sleepy children — the backend has no hardware
+evidence for any of those yet, so `MacCapabilities::router` still reports
+`false`. It mirrors `examples/nrf52840-router` exactly.
+
+Full coordinator (PAN-forming) support is not advertised. Secure entropy is
+not yet provided by the backend, so operations that require it fail
+explicitly.
 
 The preferred feature is:
 
@@ -141,10 +155,23 @@ target/tc32-unknown-none-elf/release/telink-tlsr8258-runtime.bin
 
 The production binary is separate from the diagnostic
 `telink-tlsr8258-lab` target and uses a linker layout without the SWire SRAM
-reservation. Fat LTO with size optimization produces a 213,988-byte
-(`0x343E4`) runtime image. The post-link checker enforces the 256 KiB
+reservation. Fat LTO with size optimization produces a 216,548-byte
+(`0x34DE4`) runtime image. The post-link checker enforces the 256 KiB
 production/OTA slot plus the factory-data, cache, DMA, BSS, and stack
 boundaries.
+
+Build the **experimental, join/relay-only router** firmware the same way,
+selecting `runtime-router` instead:
+
+```bash
+cd examples/telink-tlsr8258-sensor
+./scripts/tlsr8258.sh build runtime-router
+```
+
+producing `telink-tlsr8258-router[.bin]` (212,256 bytes / `0x33D20`) from the
+same production linker layout. See that package's README ("Router
+firmware") for the exact capability boundary — join and relay only, no child
+association.
 
 ## Hardware status
 
@@ -165,6 +192,15 @@ Ember coordinator:
 Remaining production work includes a clean small application entry point,
 factory-reset UI validation, deep-sleep/retention reconfiguration, the Zbit
 flash voltage guard, and reducing the image to the OTA slot.
+
+The router path (`runtime-router`) remains experimental. Real TLSR8258
+hardware has joined Home Assistant ZHA as `TLSR8258-Router`, completed its
+Basic/Identify interview, answered Identify, and restored the commissioned
+state after a hardware reset. `MLME-START`'s parameter rules are also
+unit-tested on host (`cargo test -p zigbee-mac --features tlsr8258`), and the
+firmware stays below the 256 KiB OTA limit. A routed third-node traffic test
+is still outstanding. Child association, beacon transmission,
+permit-joining, and indirect transmission remain unimplemented.
 
 ## Telink B91
 
