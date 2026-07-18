@@ -30,6 +30,8 @@ macro_rules! nwk_diag {
     ($($arg:tt)*) => {};
 }
 
+const REJOIN_RESPONSE_WAIT_US: u32 = 491_520;
+
 /// Network descriptor — result of network discovery.
 #[derive(Debug, Clone)]
 pub struct NetworkDescriptor {
@@ -501,6 +503,17 @@ impl<M: MacDriver> NwkLayer<M> {
                 PibValue::ShortAddress(self.nib.network_address),
             )
             .await;
+        let _ = self
+            .mac
+            .mlme_set(
+                PibAttribute::MacCoordShortAddress,
+                PibValue::ShortAddress(network.router_address),
+            )
+            .await;
+        let _ = self
+            .mac
+            .mlme_set(PibAttribute::MacAssociatedPanCoord, PibValue::Bool(true))
+            .await;
 
         // Build NWK Rejoin Request frame
         let cap_byte = zigbee_capability_info(self.device_type, self.rx_on_when_idle);
@@ -517,9 +530,11 @@ impl<M: MacDriver> NwkLayer<M> {
                 source_route: false,
                 dst_ieee_present: false,
                 src_ieee_present: true,
-                end_device_initiator: self.device_type == DeviceType::EndDevice,
+                // EDI indicates forwarding on behalf of a child. A device
+                // selecting a new prospective parent clears it during rejoin.
+                end_device_initiator: false,
             },
-            dst_addr: ShortAddress::BROADCAST,
+            dst_addr: network.router_address,
             src_addr: self.nib.network_address,
             radius: 1,
             seq_number: seq,
@@ -561,6 +576,9 @@ impl<M: MacDriver> NwkLayer<M> {
                     }
                     nwk_frame_buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
                     total_len = aad_len + encrypted.len();
+                    // Zigbee transmits security level 0 in the auxiliary
+                    // header while authenticating with the actual level 5.
+                    nwk_frame_buf[hdr_len] &= !0x07;
                 } else {
                     return Err(NwkStatus::InvalidRequest);
                 }
@@ -573,30 +591,73 @@ impl<M: MacDriver> NwkLayer<M> {
         }
 
         // Send via MAC
-        let _ = self
-            .mac
+        self.mac
             .mcps_data(zigbee_mac::McpsDataRequest {
                 src_addr_mode: zigbee_mac::AddressMode::Short,
-                dst_address: MacAddress::Short(network.pan_id, ShortAddress::BROADCAST),
+                dst_address: MacAddress::Short(network.pan_id, network.router_address),
                 payload: &nwk_frame_buf[..total_len],
                 msdu_handle: seq,
-                tx_options: zigbee_mac::TxOptions::default(),
+                tx_options: zigbee_mac::TxOptions {
+                    ack_tx: true,
+                    ..Default::default()
+                },
             })
-            .await;
+            .await
+            .map_err(|error| match error {
+                MacError::NoAck | MacError::ChannelAccessFailure => NwkStatus::NoNetworks,
+                _ => NwkStatus::StartupFailure,
+            })?;
 
-        // Wait for Rejoin Response (NWK command 0x07).
-        // On busy networks (40+ devices), broadcast traffic can easily fill
-        // a small receive window before the rejoin response arrives from the
-        // coordinator/router. Use a generous attempt count.
+        // A sleepy end device receives the Rejoin Response indirectly and
+        // must poll the prospective parent during aResponseWaitTime
+        // (approximately 492 ms at 2.4 GHz).
+        const SLEEPY_POLL_INTERVAL_US: u32 = 50_000;
         const MAX_RX_ATTEMPTS: usize = 64;
+        let sleepy = self.device_type == DeviceType::EndDevice && !self.rx_on_when_idle;
+        let response_wait_started = self.mac.monotonic_micros();
+        let mut attempt = 0usize;
 
-        for attempt in 0..MAX_RX_ATTEMPTS {
-            let indication = match self.mac.mcps_data_indication().await {
-                Ok(ind) => ind,
-                Err(_) => continue,
+        loop {
+            if attempt >= MAX_RX_ATTEMPTS {
+                break;
+            }
+            let elapsed = self
+                .mac
+                .monotonic_micros()
+                .wrapping_sub(response_wait_started);
+            if elapsed >= REJOIN_RESPONSE_WAIT_US {
+                break;
+            }
+            let response_time_remaining = REJOIN_RESPONSE_WAIT_US.saturating_sub(elapsed);
+            attempt += 1;
+
+            let frame = if sleepy {
+                match self.mac.mlme_poll_timeout(response_time_remaining).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) | Err(_) => {
+                        let elapsed = self
+                            .mac
+                            .monotonic_micros()
+                            .wrapping_sub(response_wait_started);
+                        let remaining = REJOIN_RESPONSE_WAIT_US.saturating_sub(elapsed);
+                        self.mac
+                            .delay_micros(SLEEPY_POLL_INTERVAL_US.min(remaining))
+                            .await;
+                        continue;
+                    }
+                }
+            } else {
+                match self
+                    .mac
+                    .mcps_data_indication_timeout(response_time_remaining)
+                    .await
+                {
+                    Ok(indication) => indication.payload,
+                    Err(_) => break,
+                }
             };
 
-            let data = indication.payload.as_slice();
+            let data = frame.as_slice();
             let (hdr, consumed) = match NwkHeader::parse(data) {
                 Some(v) => v,
                 None => {
@@ -623,6 +684,17 @@ impl<M: MacDriver> NwkLayer<M> {
             if ft != NwkFrameType::Command as u8 {
                 continue;
             }
+            let Some(parent_ieee) = hdr.src_ieee else {
+                continue;
+            };
+            if hdr.src_addr != network.router_address
+                || hdr.dst_addr != self.nib.network_address
+                || hdr.dst_ieee != Some(self.nib.ieee_address)
+                || (self.nib.security_enabled && !hdr.frame_control.security)
+            {
+                log::warn!("[NWK] Rejoin RX #{}: unrelated response", attempt);
+                continue;
+            }
 
             // Get command payload — may need NWK decryption
             let cmd_data = if hdr.frame_control.security {
@@ -635,6 +707,18 @@ impl<M: MacDriver> NwkLayer<M> {
                             continue;
                         }
                     };
+                if sec_hdr.source_address != parent_ieee
+                    || !self
+                        .security
+                        .check_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter)
+                {
+                    log::warn!(
+                        "[NWK] Rejoin RX #{}: replay or source mismatch (fc={})",
+                        attempt,
+                        sec_hdr.frame_counter
+                    );
+                    continue;
+                }
                 let key = match self.security.key_by_seq(sec_hdr.key_seq_number) {
                     Some(k) => k.key,
                     None => {
@@ -659,7 +743,11 @@ impl<M: MacDriver> NwkLayer<M> {
                     &key,
                     &sec_hdr,
                 ) {
-                    Some(v) => v,
+                    Some(v) => {
+                        self.security
+                            .commit_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter);
+                        v
+                    }
                     None => {
                         log::warn!(
                             "[NWK] Rejoin RX #{}: decrypt failed (fc={})",
@@ -670,6 +758,9 @@ impl<M: MacDriver> NwkLayer<M> {
                     }
                 }
             } else {
+                if self.nib.security_enabled {
+                    continue;
+                }
                 let payload = &data[consumed..];
                 let mut v = heapless::Vec::<u8, 128>::new();
                 let _ = v.extend_from_slice(payload);
@@ -687,11 +778,15 @@ impl<M: MacDriver> NwkLayer<M> {
                 let new_addr = u16::from_le_bytes([cmd_data[1], cmd_data[2]]);
                 let rejoin_status = cmd_data[3];
 
-                if rejoin_status == 0x00 {
+                if rejoin_status == 0x00 && (0x0001..=0xFFF7).contains(&new_addr) {
                     log::info!("[NWK] Rejoin accepted, new addr=0x{:04X}", new_addr);
                     self.nib.network_address = ShortAddress(new_addr);
                     // Refresh parent address to the sender of the rejoin response
                     self.nib.parent_address = hdr.src_addr;
+                    self.nib.extended_pan_id = network.extended_pan_id;
+                    self.nib.pan_id = network.pan_id;
+                    self.nib.logical_channel = network.logical_channel;
+                    self.nib.update_id = network.update_id;
                     // Update depth from beacon (parent depth + 1)
                     self.nib.depth = network.depth.saturating_add(1);
                     let _ = self
@@ -700,6 +795,17 @@ impl<M: MacDriver> NwkLayer<M> {
                             PibAttribute::MacShortAddress,
                             PibValue::ShortAddress(ShortAddress(new_addr)),
                         )
+                        .await;
+                    let _ = self
+                        .mac
+                        .mlme_set(
+                            PibAttribute::MacCoordShortAddress,
+                            PibValue::ShortAddress(hdr.src_addr),
+                        )
+                        .await;
+                    let _ = self
+                        .mac
+                        .mlme_set(PibAttribute::MacAssociatedPanCoord, PibValue::Bool(true))
                         .await;
                     // Update parent neighbor entry
                     let parent_device_type = if hdr.src_addr == ShortAddress::COORDINATOR {
@@ -734,7 +840,7 @@ impl<M: MacDriver> NwkLayer<M> {
 
         log::warn!(
             "[NWK] Rejoin response not received after {} attempts",
-            MAX_RX_ATTEMPTS
+            attempt
         );
         Err(NwkStatus::NoNetworks)
     }
@@ -805,6 +911,7 @@ impl<M: MacDriver> NwkLayer<M> {
                     }
                     buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
                     total_len = aad_len + encrypted.len();
+                    buf[hdr_len] &= !0x07;
                 } else {
                     return Err(NwkStatus::BadCcmOutput);
                 }
@@ -1061,6 +1168,7 @@ impl<M: MacDriver> NwkLayer<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zigbee_mac::mock::MockMac;
 
     #[test]
     fn zigbee_capability_bytes_match_reference_stack() {
@@ -1075,6 +1183,224 @@ mod tests {
         assert_eq!(
             zigbee_capability_info(DeviceType::Router, true).to_byte(),
             0x8E
+        );
+    }
+
+    #[test]
+    fn sleepy_secure_rejoin_unicasts_and_polls_selected_parent() {
+        const DEVICE_IEEE: IeeeAddress = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
+        const PARENT_IEEE: IeeeAddress = [0x00, 0x12, 0x4B, 0x00, 0x01, 0xAA, 0xBB, 0xCC];
+        const KEY: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ];
+        const PAN_ID: PanId = PanId(0xDFE9);
+        const OLD_ADDRESS: ShortAddress = ShortAddress(0x07D6);
+        const NEW_ADDRESS: ShortAddress = ShortAddress(0x1234);
+        const DIRECT_ADDRESS: ShortAddress = ShortAddress(0x2345);
+        const LATE_ADDRESS: ShortAddress = ShortAddress(0x3456);
+        const PARENT_ADDRESS: ShortAddress = ShortAddress(0xBA0F);
+
+        fn block_on<F: core::future::Future>(future: F) -> F::Output {
+            use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+            use std::boxed::Box;
+
+            fn no_op(_: *const ()) {}
+            fn clone(_: *const ()) -> RawWaker {
+                RawWaker::new(core::ptr::null(), &VTABLE)
+            }
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+
+            let waker = unsafe { Waker::from_raw(clone(core::ptr::null())) };
+            let mut context = Context::from_waker(&waker);
+            let mut future = Box::pin(future);
+            loop {
+                if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                    return output;
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        let network = NetworkDescriptor {
+            extended_pan_id: [0xAA; 8],
+            pan_id: PAN_ID,
+            logical_channel: 15,
+            stack_profile: 2,
+            zigbee_version: 2,
+            beacon_order: 15,
+            superframe_order: 15,
+            permit_joining: false,
+            router_capacity: true,
+            end_device_capacity: true,
+            update_id: 0,
+            lqi: 200,
+            router_address: PARENT_ADDRESS,
+            depth: 1,
+        };
+
+        let build_response =
+            |frame_counter: u32, destination: ShortAddress, address: ShortAddress, status: u8| {
+                let response_header = NwkHeader {
+                    frame_control: NwkFrameControl {
+                        frame_type: NwkFrameType::Command as u8,
+                        protocol_version: 2,
+                        discover_route: 0,
+                        multicast: false,
+                        security: true,
+                        source_route: false,
+                        dst_ieee_present: true,
+                        src_ieee_present: true,
+                        end_device_initiator: false,
+                    },
+                    dst_addr: destination,
+                    src_addr: PARENT_ADDRESS,
+                    radius: 1,
+                    seq_number: 0x42,
+                    dst_ieee: Some(DEVICE_IEEE),
+                    src_ieee: Some(PARENT_IEEE),
+                    multicast_control: None,
+                    source_route: None,
+                };
+                let response_security = crate::security::NwkSecurityHeader {
+                    security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
+                    frame_counter,
+                    source_address: PARENT_IEEE,
+                    key_seq_number: 0,
+                };
+                let mut response_buf = [0u8; 128];
+                let response_header_len = response_header.serialize(&mut response_buf);
+                let response_security_len =
+                    response_security.serialize(&mut response_buf[response_header_len..]);
+                let response_aad_len = response_header_len + response_security_len;
+                let response_plaintext = [0x07, address.0 as u8, (address.0 >> 8) as u8, status];
+                let crypto = crate::security::NwkSecurity::new();
+                let encrypted = crypto
+                    .encrypt(
+                        &response_buf[..response_aad_len],
+                        &response_plaintext,
+                        &KEY,
+                        &response_security,
+                    )
+                    .unwrap();
+                response_buf[response_aad_len..response_aad_len + encrypted.len()]
+                    .copy_from_slice(&encrypted);
+                response_buf[response_header_len] &= !0x07;
+                MacFrame::from_slice(&response_buf[..response_aad_len + encrypted.len()]).unwrap()
+            };
+
+        let mut mac = MockMac::new(DEVICE_IEEE);
+        mac.enqueue_poll_response(build_response(4, OLD_ADDRESS, ShortAddress(0x2222), 0x00));
+        mac.enqueue_poll_response(build_response(6, OLD_ADDRESS, NEW_ADDRESS, 0x01));
+        let mut nwk = crate::NwkLayer::new(mac, DeviceType::EndDevice);
+        nwk.set_rx_on_when_idle(false);
+        {
+            let nib = nwk.nib_mut();
+            nib.extended_pan_id = network.extended_pan_id;
+            nib.pan_id = PanId(0x1234);
+            nib.network_address = OLD_ADDRESS;
+            nib.logical_channel = network.logical_channel;
+            nib.ieee_address = DEVICE_IEEE;
+            nib.security_enabled = true;
+            nib.active_key_seq_number = 0;
+            nib.outgoing_frame_counter = 0x100;
+            nib.outgoing_frame_counter_limit = 0x200;
+        }
+        nwk.security_mut().set_network_key(KEY, 0);
+        nwk.security_mut().commit_frame_counter(&PARENT_IEEE, 5);
+
+        assert_eq!(
+            block_on(nwk.nlme_join(&network, JoinMethod::Rejoin)),
+            Err(NwkStatus::NotPermitted)
+        );
+        assert_eq!(nwk.mac().poll_count(), 2);
+        assert!(!nwk.security().check_frame_counter(&PARENT_IEEE, 6));
+        assert!(nwk.security().check_frame_counter(&PARENT_IEEE, 7));
+
+        nwk.mac_mut()
+            .enqueue_poll_response(build_response(7, OLD_ADDRESS, NEW_ADDRESS, 0x00));
+        assert_eq!(
+            block_on(nwk.nlme_join(&network, JoinMethod::Rejoin)).unwrap(),
+            NEW_ADDRESS
+        );
+        assert_eq!(nwk.mac().poll_count(), 3);
+        assert_eq!(nwk.nib().pan_id, PAN_ID);
+        assert!(!nwk.security().check_frame_counter(&PARENT_IEEE, 7));
+        assert!(nwk.security().check_frame_counter(&PARENT_IEEE, 8));
+
+        let tx = &nwk.mac().tx_history()[0];
+        assert_eq!(
+            tx.dst,
+            MacAddress::Short(PAN_ID, PARENT_ADDRESS),
+            "rejoin must target the selected prospective parent"
+        );
+        assert!(tx.ack_requested);
+
+        let (request_header, consumed) = NwkHeader::parse(tx.payload.as_slice()).unwrap();
+        assert_eq!(request_header.dst_addr, PARENT_ADDRESS);
+        assert_eq!(request_header.src_addr, OLD_ADDRESS);
+        assert!(!request_header.frame_control.end_device_initiator);
+        assert!(request_header.frame_control.security);
+        assert_eq!(request_header.src_ieee, Some(DEVICE_IEEE));
+        assert_eq!(tx.payload.as_slice()[consumed] & 0x07, 0);
+
+        nwk.set_rx_on_when_idle(true);
+        nwk.mac_mut().enqueue_rx(McpsDataIndication {
+            src_address: MacAddress::Short(PAN_ID, PARENT_ADDRESS),
+            dst_address: MacAddress::Short(PAN_ID, NEW_ADDRESS),
+            lqi: 100,
+            payload: MacFrame::from_slice(&[0x00]).unwrap(),
+            security_use: false,
+        });
+        nwk.mac_mut().enqueue_rx(McpsDataIndication {
+            src_address: MacAddress::Short(PAN_ID, PARENT_ADDRESS),
+            dst_address: MacAddress::Short(PAN_ID, NEW_ADDRESS),
+            lqi: 200,
+            payload: build_response(8, NEW_ADDRESS, DIRECT_ADDRESS, 0x00),
+            security_use: true,
+        });
+        assert_eq!(
+            block_on(nwk.nlme_join(&network, JoinMethod::Rejoin)).unwrap(),
+            DIRECT_ADDRESS
+        );
+        assert_eq!(
+            nwk.mac().poll_count(),
+            3,
+            "RX-on devices must wait directly without polling"
+        );
+        assert!(!nwk.security().check_frame_counter(&PARENT_IEEE, 8));
+        assert!(nwk.security().check_frame_counter(&PARENT_IEEE, 9));
+
+        nwk.mac_mut().enqueue_rx(McpsDataIndication {
+            src_address: MacAddress::Short(PAN_ID, PARENT_ADDRESS),
+            dst_address: MacAddress::Short(PAN_ID, DIRECT_ADDRESS),
+            lqi: 200,
+            payload: build_response(9, DIRECT_ADDRESS, LATE_ADDRESS, 0x00),
+            security_use: true,
+        });
+        nwk.mac_mut().set_rx_delay_us(REJOIN_RESPONSE_WAIT_US);
+        assert_eq!(
+            block_on(nwk.nlme_join(&network, JoinMethod::Rejoin)),
+            Err(NwkStatus::NoNetworks)
+        );
+        assert_eq!(nwk.nib().network_address, DIRECT_ADDRESS);
+        assert!(
+            nwk.security().check_frame_counter(&PARENT_IEEE, 9),
+            "a response at or after the deadline must not be authenticated"
+        );
+
+        nwk.set_rx_on_when_idle(false);
+        nwk.mac_mut()
+            .enqueue_poll_response(build_response(9, DIRECT_ADDRESS, LATE_ADDRESS, 0x00));
+        nwk.mac_mut().set_poll_delay_us(REJOIN_RESPONSE_WAIT_US);
+        assert_eq!(
+            block_on(nwk.nlme_join(&network, JoinMethod::Rejoin)),
+            Err(NwkStatus::NoNetworks)
+        );
+        assert_eq!(nwk.nib().network_address, DIRECT_ADDRESS);
+        assert!(
+            nwk.security().check_frame_counter(&PARENT_IEEE, 9),
+            "a late indirect response must not be authenticated"
         );
     }
 }

@@ -32,6 +32,9 @@
 #![no_std]
 #![allow(async_fn_in_trait)]
 
+#[cfg(test)]
+extern crate std;
+
 pub mod frames;
 pub mod indirect;
 pub mod neighbor;

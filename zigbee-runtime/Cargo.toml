@@ -21,3 +21,6 @@ default = []
 router = ["zigbee-aps/router"]
 ota = []
 trace = ["zigbee-bdb/trace", "zigbee-aps/trace", "zigbee-nwk/trace"]
+
+[dev-dependencies]
+zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }

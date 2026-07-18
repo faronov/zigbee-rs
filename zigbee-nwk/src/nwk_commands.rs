@@ -99,6 +99,9 @@ impl<M: MacDriver> NwkLayer<M> {
                     }
                     buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
                     total_len = aad_len + encrypted.len();
+                    // The actual ENC-MIC-32 level is used for CCM*, but Zigbee
+                    // carries zero in the over-the-air security-level bits.
+                    buf[hdr_len] &= !0x07;
                 } else {
                     return Err(NwkStatus::InvalidRequest);
                 }

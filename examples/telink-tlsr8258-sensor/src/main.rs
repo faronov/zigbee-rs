@@ -75,6 +75,8 @@ use zigbee_aps::{PROFILE_ZDP, ZDO_ENDPOINT};
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::{MacDriver, MacError, PlatformServices, WrappingTickExtender};
 #[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+use zigbee_mac::telink::TelinkMac;
+#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
 use zigbee_nwk::DeviceType;
 #[cfg(feature = "sensor")]
 use zigbee_nwk::frames::{NwkFrameControl, NwkFrameType, NwkHeader};
@@ -87,9 +89,13 @@ use zigbee_zdo::device_announce::DeviceAnnounce;
 #[cfg(feature = "sensor")]
 use zigbee_zdo::DEVICE_ANNCE;
 #[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
-use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
+use zigbee_runtime::event_loop::StartError;
 #[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
 use zigbee_runtime::power::PowerMode;
+#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+use zigbee_runtime::security_journal::{SecurityJournalStorage, SecurityStateJournal};
+#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+use zigbee_runtime::security_store::SecurityStoreError;
 #[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
 #[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
@@ -398,6 +404,13 @@ pub unsafe extern "C" fn _rust_entry() -> ! {
 //
 // Direct MMIO based on Telink C SDK. No HAL dependency for boot.
 
+#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+#[inline(never)]
+fn chip_init() {
+    tlsr8258_hal::clocks::init();
+}
+
+#[cfg(not(all(feature = "runtime-sensor", not(feature = "sensor"))))]
 #[inline(never)]
 fn chip_init() {
     let pc_out = (REG_BASE + 0x593) as *mut u8;
@@ -808,6 +821,7 @@ fn spin_delay_ms(ms: u32) {
 /// IRQ handler — called from assembly __irq via `bl irq_handler`
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".ram_code")]
+#[cfg(not(all(feature = "runtime-sensor", not(feature = "sensor"))))]
 pub extern "C" fn irq_handler() {
     unsafe {
         static mut IRQ_COUNT: u32 = 0;
@@ -856,6 +870,14 @@ pub extern "C" fn irq_handler() {
         core::ptr::write_volatile(0x800643 as *mut u8, 1);
     }
 }
+
+// The reusable TLSR8258 backend is fully polled and leaves CPU interrupts
+// disabled. Keep the application-owned vector valid without retaining the
+// legacy local RF/DMA interrupt path in runtime-sensor.
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".ram_code")]
+#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+pub extern "C" fn irq_handler() {}
 
 // ── Radio DMA buffers (must be 4-byte aligned, in RAM) ─────────
 
@@ -2909,6 +2931,13 @@ impl MacDriver for Tlsr8258Mac {
     }
 
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
+        self.mcps_data_indication_timeout(5_000_000).await
+    }
+
+    async fn mcps_data_indication_timeout(
+        &mut self,
+        timeout_us: u32,
+    ) -> Result<McpsDataIndication, MacError> {
         // Diag: count BDB-side calls into mcps_data_indication
         unsafe {
             let p = (DBG_MODE_BASE + 0xC4) as *mut u32;
@@ -2937,14 +2966,7 @@ impl MacDriver for Tlsr8258Mac {
                 core::ptr::write_volatile(p, used);
             }
         }
-        // Cap total inner iterations so that a busy channel (frames keep arriving
-        // but none match our filter) cannot livelock the call. Each receive_raw
-        // uses a small slice of the original RX_INDICATION_LOOPS budget; on
-        // exhaustion we return MacError::NoData so callers (e.g. BDB Phase 0)
-        // can iterate or move on to other steering phases.
-        const MCPS_RX_MAX_ITERS: u32 = 16;
-        const MCPS_RX_PER_ITER_LOOPS: u32 = RX_INDICATION_LOOPS / MCPS_RX_MAX_ITERS;
-        let mut rx_iters: u32 = 0;
+        let started = self.monotonic_micros();
         loop {
             // Step 2: drain any frame queued during `mlme_associate` first.
             // Diagnostics: +0x184 = drain count.
@@ -2958,17 +2980,18 @@ impl MacDriver for Tlsr8258Mac {
                 let _ = buf.extend_from_slice(&pending.data);
                 lqi = pending.lqi;
             } else {
-                if rx_iters >= MCPS_RX_MAX_ITERS {
-                    // Budget exhausted — bump diag and return NoData so caller
-                    // can proceed instead of looping forever on filter mismatches.
+                if self.monotonic_micros().wrapping_sub(started) >= timeout_us {
                     unsafe {
                         let p = (DBG_JOIN_BASE + 0xA4) as *mut u32;
                         core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
                     }
                     return Err(MacError::NoData);
                 }
-                rx_iters = rx_iters.wrapping_add(1);
-                let pkt = self.receive_raw(MCPS_RX_PER_ITER_LOOPS)?;
+                let pkt = match self.receive_raw(1) {
+                    Ok(pkt) => pkt,
+                    Err(MacError::NoData) => continue,
+                    Err(error) => return Err(error),
+                };
                 let _ = buf.extend_from_slice(&pkt.data[..pkt.len]);
                 lqi = pkt.lqi;
             }
@@ -6539,7 +6562,9 @@ fn sensor_main() -> ! {
     }
 }
 
-#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+// Kept as source-level history for the legacy local MAC investigation. The
+// runtime-sensor entry point below uses the reusable TLSR8258 backend.
+#[cfg(any())]
 #[inline(never)]
 fn runtime_sensor_main() -> ! {
     mark32(DBG_MODE_BASE + 0x30, 0x52540010);
@@ -6823,6 +6848,262 @@ fn runtime_sensor_main() -> ! {
     }
 }
 
+#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+const SECURITY_SECTOR_A: u32 = 0x0007_4000;
+#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+const SECURITY_SECTOR_B: u32 = 0x0007_5000;
+#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+const RUNTIME_TEST_EUI_OFFSET: u8 = 0x33;
+
+#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+struct Tlsr8258SecurityFlash;
+
+#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+impl SecurityJournalStorage for Tlsr8258SecurityFlash {
+    fn read(&self, address: u32, output: &mut [u8]) -> Result<(), SecurityStoreError> {
+        if tlsr8258_hal::flash::read_bytes(address, output) {
+            Ok(())
+        } else {
+            Err(SecurityStoreError::Hardware)
+        }
+    }
+
+    fn program(&mut self, address: u32, data: &[u8]) -> Result<(), SecurityStoreError> {
+        tlsr8258_hal::flash::program(address, data).map_err(|_| SecurityStoreError::Hardware)
+    }
+
+    fn erase_sector(&mut self, address: u32) -> Result<(), SecurityStoreError> {
+        tlsr8258_hal::flash::erase_sector(address).map_err(|_| SecurityStoreError::Hardware)
+    }
+}
+
+#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+fn runtime_failure(code: u32) -> ! {
+    mark32(DBG_MODE_BASE + 0x30, code);
+    board::LED_GREEN.write(false);
+    board::LED_BLUE.write(false);
+    board::LED_RED.write(true);
+    loop {
+        tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(1_000));
+    }
+}
+
+#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+#[inline(never)]
+fn runtime_sensor_main() -> ! {
+    type Device = ZigbeeDevice<TelinkMac>;
+
+    mark32(DBG_MODE_BASE + 0x30, 0x5254_0010);
+    let mut ieee_address = [0u8; 8];
+    tlsr8258_hal::flash::factory_ieee(&mut ieee_address);
+    ieee_address[0] = ieee_address[0].wrapping_add(RUNTIME_TEST_EUI_OFFSET);
+    let mac = TelinkMac::with_extended_address(ieee_address);
+    mark32(DBG_MODE_BASE + 0x30, 0x5254_0011);
+
+    static mut DEVICE_STORAGE: MaybeUninit<Device> = MaybeUninit::uninit();
+    static mut BASIC_STORAGE: MaybeUninit<BasicCluster> = MaybeUninit::uninit();
+    static mut TEMP_STORAGE: MaybeUninit<TemperatureCluster> = MaybeUninit::uninit();
+    static mut HUM_STORAGE: MaybeUninit<HumidityCluster> = MaybeUninit::uninit();
+    static mut POWER_STORAGE: MaybeUninit<PowerConfigCluster> = MaybeUninit::uninit();
+    static mut IDENTIFY_STORAGE: MaybeUninit<IdentifyCluster> = MaybeUninit::uninit();
+
+    let basic_cluster = unsafe {
+        let ptr = core::ptr::addr_of_mut!(BASIC_STORAGE).cast::<BasicCluster>();
+        ptr.write(BasicCluster::new(
+            b"Zigbee-RS",
+            b"TLSR8258-Runtime",
+            b"20260717",
+            b"0.1.0",
+        ));
+        &mut *ptr
+    };
+    basic_cluster.set_power_source(0x03);
+
+    let power_cluster = unsafe {
+        let ptr = core::ptr::addr_of_mut!(POWER_STORAGE).cast::<PowerConfigCluster>();
+        ptr.write(PowerConfigCluster::new());
+        &mut *ptr
+    };
+    power_cluster.set_battery_voltage(30);
+    power_cluster.set_battery_percentage(200);
+    power_cluster.set_battery_size(0x04);
+    power_cluster.set_battery_quantity(2);
+    power_cluster.set_battery_rated_voltage(15);
+
+    let identify_cluster = unsafe {
+        let ptr = core::ptr::addr_of_mut!(IDENTIFY_STORAGE).cast::<IdentifyCluster>();
+        ptr.write(IdentifyCluster::new());
+        &mut *ptr
+    };
+    let temp_cluster = unsafe {
+        let ptr = core::ptr::addr_of_mut!(TEMP_STORAGE).cast::<TemperatureCluster>();
+        ptr.write(TemperatureCluster::new(-4_000, 12_500));
+        &mut *ptr
+    };
+    temp_cluster.set_temperature(2_150);
+    let hum_cluster = unsafe {
+        let ptr = core::ptr::addr_of_mut!(HUM_STORAGE).cast::<HumidityCluster>();
+        ptr.write(HumidityCluster::new(0, 10_000));
+        &mut *ptr
+    };
+    hum_cluster.set_humidity(5_000);
+
+    let device = ZigbeeDevice::builder(mac)
+        .device_type(DeviceType::EndDevice)
+        .power_mode(PowerMode::Sleepy {
+            poll_interval_ms: 10_000,
+            wake_duration_ms: 500,
+        })
+        .manufacturer("Zigbee-RS")
+        .model("TLSR8258-Runtime")
+        .sw_build("0.1.0")
+        .channels(zigbee_types::ChannelMask(1 << 15))
+        .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |endpoint| {
+            endpoint
+                .cluster_server(0x0000)
+                .cluster_server(0x0001)
+                .cluster_server(0x0003)
+                .cluster_server(0x0402)
+                .cluster_server(0x0405)
+        })
+        .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
+
+    let mut clusters = [
+        ClusterRef {
+            endpoint: 1,
+            cluster: basic_cluster,
+        },
+        ClusterRef {
+            endpoint: 1,
+            cluster: power_cluster,
+        },
+        ClusterRef {
+            endpoint: 1,
+            cluster: identify_cluster,
+        },
+        ClusterRef {
+            endpoint: 1,
+            cluster: temp_cluster,
+        },
+        ClusterRef {
+            endpoint: 1,
+            cluster: hum_cluster,
+        },
+    ];
+    let mut security_store = SecurityStateJournal::new(
+        Tlsr8258SecurityFlash,
+        SECURITY_SECTOR_A,
+        SECURITY_SECTOR_B,
+    );
+
+    let mut attempts = 0u8;
+    loop {
+        attempts = attempts.saturating_add(1);
+        match executor::block_on(device.start_or_resume_with_security_store(&mut security_store)) {
+            Ok(short_address) => {
+                mark32(DBG_MODE_BASE + 0x30, 0x5254_0000 | u32::from(short_address));
+                break;
+            }
+            Err(StartError::CommissioningFailed(_)) if attempts < 10 => {
+                tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(5_000));
+            }
+            Err(StartError::InitFailed) => runtime_failure(0x5254_F001),
+            Err(StartError::PersistenceFailed(_)) => runtime_failure(0x5254_F002),
+            Err(StartError::CommissioningFailed(status)) => {
+                runtime_failure(0x5254_F100 | status as u32)
+            }
+        }
+    }
+
+    board::LED_RED.write(false);
+    board::LED_GREEN.write(true);
+    board::LED_BLUE.write(false);
+    let nib = device.bdb().zdo().nwk().nib();
+    mark32(
+        DBG_MODE_BASE + 0x34,
+        u32::from(nib.parent_address.0) | (u32::from(nib.pan_id.0) << 16),
+    );
+
+    let one_second = tlsr8258_hal::timer::ms(1_000);
+    let mut tick_anchor = tlsr8258_hal::timer::now_ticks();
+    loop {
+        for _ in 0..4u8 {
+            match executor::block_on(device.poll()) {
+                Ok(Some(indication)) => {
+                    mark32(
+                        DBG_MODE_BASE + 0x38,
+                        0x5254_1000 | indication.payload.len() as u32,
+                    );
+                    let event = executor::block_on(device.process_incoming_with_security_store(
+                        &indication,
+                        &mut clusters,
+                        &mut security_store,
+                    ));
+                    match event {
+                        Ok(Some(zigbee_runtime::event_loop::StackEvent::RejoinRequested)) => {
+                            if executor::block_on(
+                                device.secure_rejoin_with_security_store(&mut security_store),
+                            )
+                            .is_err()
+                            {
+                                mark32(DBG_MODE_BASE + 0x38, 0x5254_F203);
+                            }
+                        }
+                        Ok(Some(zigbee_runtime::event_loop::StackEvent::LeaveRequested)) => {
+                            if executor::block_on(
+                                device.factory_reset_with_security_store(&mut security_store),
+                            )
+                            .is_err()
+                            {
+                                runtime_failure(0x5254_F205);
+                            }
+                            runtime_failure(0x5254_F204);
+                        }
+                        Ok(_) => {}
+                        Err(_) => runtime_failure(0x5254_F201),
+                    }
+
+                    if executor::block_on(device.tick_with_security_store(
+                        0,
+                        &mut clusters,
+                        &mut security_store,
+                    ))
+                    .is_err()
+                    {
+                        runtime_failure(0x5254_F202);
+                    }
+                }
+                Ok(None) => {
+                    mark32(DBG_MODE_BASE + 0x38, 0x5254_2000);
+                    break;
+                }
+                Err(error) => {
+                    mark32(DBG_MODE_BASE + 0x38, 0x5254_E000 | error as u32);
+                    break;
+                }
+            }
+        }
+
+        let now = tlsr8258_hal::timer::now_ticks();
+        let elapsed = now.wrapping_sub(tick_anchor);
+        if elapsed >= one_second {
+            let elapsed_secs = (elapsed / one_second).min(u16::MAX as u32) as u16;
+            tick_anchor = tick_anchor.wrapping_add(u32::from(elapsed_secs) * one_second);
+            if executor::block_on(device.tick_with_security_store(
+                elapsed_secs,
+                &mut clusters,
+                &mut security_store,
+            ))
+            .is_err()
+            {
+                runtime_failure(0x5254_F203);
+            }
+        }
+
+        tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(250));
+    }
+}
+
 fn main_loop() -> ! {
     // Setup RGB LED pins
     board::LED_RED.set_output();
@@ -6830,6 +7111,7 @@ fn main_loop() -> ! {
     board::LED_BLUE.set_output();
 
     mark32(DBG_BOOT_BASE + 0x00, 0xCAFE0001_u32);
+    #[cfg(not(all(feature = "runtime-sensor", not(feature = "sensor"))))]
     mark32(DBG_BOOT_BASE + 0x08, async_timer::now_ticks());
 
     #[cfg(all(
@@ -6839,6 +7121,7 @@ fn main_loop() -> ! {
         not(feature = "diag-smoke"),
     ))]
     let rx_buf = core::ptr::addr_of_mut!(RF_RX_BUF) as *mut u8;
+    #[cfg(not(all(feature = "runtime-sensor", not(feature = "sensor"))))]
     radio::set_rx_dma_config(144);
 
     board::LED_RED.write(true);

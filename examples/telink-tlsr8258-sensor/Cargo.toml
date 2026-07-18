@@ -7,6 +7,7 @@ build = "build.rs"
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac" }
+tlsr8258-hal = { path = "../../tlsr8258-hal", optional = true }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
@@ -27,8 +28,11 @@ diag-beacon = []
 diag-assoc = []
 diag-smoke = []
 sensor = []
-runtime-sensor = []
+runtime-sensor = ["dep:tlsr8258-hal", "zigbee-mac/tlsr8258"]
 
 [profile.release]
-opt-level = "s"
-lto = true
+# Match the hardware-proven reusable TLSR8258 backend build. The helper also
+# passes these settings to the final crate explicitly, but dependencies must
+# use the same profile to avoid tc32 LTO/codegen differences.
+opt-level = 1
+lto = false

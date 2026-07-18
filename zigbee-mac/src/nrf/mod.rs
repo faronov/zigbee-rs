@@ -832,11 +832,17 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
     }
 
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
+        self.mcps_data_indication_timeout(1_000_000).await
+    }
+
+    async fn mcps_data_indication_timeout(
+        &mut self,
+        timeout_us: u32,
+    ) -> Result<McpsDataIndication, MacError> {
         let mut rx_pkt = Packet::new();
         // Absolute deadline — filtered frames don't reset the clock
-        const RX_TIMEOUT_MS: u64 = 1000;
         let deadline =
-            embassy_time::Instant::now() + embassy_time::Duration::from_millis(RX_TIMEOUT_MS);
+            embassy_time::Instant::now() + embassy_time::Duration::from_micros(timeout_us as u64);
 
         loop {
             let now = embassy_time::Instant::now();
@@ -852,7 +858,7 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
             match rx_result {
                 select::Either::Second(_) => {
                     // Timeout — no frame received
-                    log::debug!("[nRF RX] Timeout ({}ms) — no frame", RX_TIMEOUT_MS);
+                    log::debug!("[nRF RX] Timeout ({}us) — no frame", timeout_us);
                     return Err(MacError::NoData);
                 }
                 select::Either::First(Err(_)) => {

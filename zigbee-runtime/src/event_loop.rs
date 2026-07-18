@@ -98,6 +98,8 @@ pub enum StackEvent {
     FactoryResetRequested,
     /// NWK Leave command received from coordinator — device should rejoin.
     LeaveRequested,
+    /// NWK Leave command explicitly requested a secured network rejoin.
+    RejoinRequested,
 }
 
 /// Stack tick result — tells the application what to do next.
@@ -153,6 +155,23 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         elapsed_secs: u16,
         clusters: &mut [crate::ClusterRef<'_>],
     ) -> TickResult {
+        if self.pending_action.is_some() {
+            return self
+                .tick_without_secure_rejoin(elapsed_secs, clusters)
+                .await;
+        }
+        if self.secure_rejoin_retry_due() {
+            return self.retry_secure_rejoin().await;
+        }
+        self.tick_without_secure_rejoin(elapsed_secs, clusters)
+            .await
+    }
+
+    pub(crate) async fn tick_without_secure_rejoin(
+        &mut self,
+        elapsed_secs: u16,
+        clusters: &mut [crate::ClusterRef<'_>],
+    ) -> TickResult {
         // Phase 1: Handle pending user actions
         if let Some(action) = self.pending_action.take() {
             return self.handle_action(action).await;
@@ -166,6 +185,18 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         }
 
         self.tick_joined(elapsed_secs, clusters).await
+    }
+
+    async fn retry_secure_rejoin(&mut self) -> TickResult {
+        log::info!("[Runtime] Retrying secure rejoin");
+        match self.secure_rejoin().await {
+            Ok(addr) => TickResult::Event(StackEvent::Joined {
+                short_address: addr,
+                channel: self.channel(),
+                pan_id: self.pan_id(),
+            }),
+            Err(_) => TickResult::Event(StackEvent::CommissioningComplete { success: false }),
+        }
     }
 
     #[inline(never)]
@@ -323,6 +354,9 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
     async fn handle_action(&mut self, action: UserAction) -> TickResult {
         match action {
             UserAction::Join => {
+                if self.secure_rejoin_pending() {
+                    return self.retry_secure_rejoin().await;
+                }
                 log::info!("[Runtime] User action: Join");
                 match self.start().await {
                     Ok(addr) => {
@@ -343,22 +377,7 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
             }
             UserAction::Rejoin => {
                 log::info!("[Runtime] User action: Rejoin");
-                match self.rejoin().await {
-                    Ok(addr) => {
-                        // Send ED Timeout Request to parent (max ~11 days)
-                        self.send_ed_timeout_request().await;
-                        let ch = self.channel();
-                        let pan = self.pan_id();
-                        TickResult::Event(StackEvent::Joined {
-                            short_address: addr,
-                            channel: ch,
-                            pan_id: pan,
-                        })
-                    }
-                    Err(_) => {
-                        TickResult::Event(StackEvent::CommissioningComplete { success: false })
-                    }
-                }
+                self.retry_secure_rejoin().await
             }
             UserAction::Leave => {
                 log::info!("[Runtime] User action: Leave");
@@ -371,6 +390,9 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                     let _ = self.leave().await;
                     TickResult::Event(StackEvent::Left)
                 } else {
+                    if self.secure_rejoin_pending() {
+                        return self.retry_secure_rejoin().await;
+                    }
                     log::info!("[Runtime] User action: Toggle → Join");
                     match self.start().await {
                         Ok(addr) => {

@@ -210,6 +210,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             pending_responses: heapless::Vec::new(),
             scratch: super::RuntimeScratch::new(),
             state_dirty: false,
+            secure_rejoin_retry_at: None,
         }
     }
 
@@ -301,6 +302,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             core::ptr::addr_of_mut!((*dst).channel_mask).write(channel_mask);
             core::ptr::addr_of_mut!((*dst).pending_responses).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*dst).state_dirty).write(false);
+            core::ptr::addr_of_mut!((*dst).secure_rejoin_retry_at).write(None);
 
             &mut *dst
         }

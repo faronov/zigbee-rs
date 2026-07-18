@@ -176,6 +176,12 @@ async fn main(_spawner: Spawner) {
                     ];
                     if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
                         match &ev {
+                            StackEvent::RejoinRequested => {
+                                info!("Secure rejoin requested");
+                                if device.secure_rejoin().await.is_err() {
+                                    warn!("Secure rejoin failed");
+                                }
+                            }
                             StackEvent::LeaveRequested => {
                                 info!("Leave requested — rejoining");
                                 device.user_action(UserAction::Join);
@@ -252,7 +258,7 @@ fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>) {
             led.set_high(); // OFF
             info!("Left network");
         }
-        StackEvent::LeaveRequested => {
+        StackEvent::LeaveRequested | StackEvent::RejoinRequested => {
             info!("Leave requested by coordinator");
         }
         _ => {}

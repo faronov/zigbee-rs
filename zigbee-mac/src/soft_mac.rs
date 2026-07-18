@@ -1010,6 +1010,13 @@ impl<P: RadioPhy + PlatformServices> MacDriver for SoftMacCore<P> {
         self.receive_data(DATA_INDICATION_WAIT_US).await
     }
 
+    async fn mcps_data_indication_timeout(
+        &mut self,
+        timeout_us: u32,
+    ) -> Result<McpsDataIndication, MacError> {
+        self.receive_data(timeout_us).await
+    }
+
     fn capabilities(&self) -> MacCapabilities {
         let phy = self.phy.capabilities();
         MacCapabilities {

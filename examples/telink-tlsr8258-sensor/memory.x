@@ -13,7 +13,11 @@
  */
 MEMORY
 {
-    FLASH : ORIGIN = 0x00000000, LENGTH = 512K
+    /* Keep the security journal and factory/configuration area out of the
+     * linked image:
+     *   0x74000..0x76000 security-state journal
+     *   0x76000..0x80000 factory/configuration data */
+    FLASH : ORIGIN = 0x00000000, LENGTH = 0x74000
     RAM   : ORIGIN = 0x00840000, LENGTH = 0x10000
 }
 
@@ -91,6 +95,16 @@ SECTIONS
         _ebss = .;
     } > RAM
 
+    /* Reusable tlsr8258-hal radio DMA storage. */
+    .rf_dma (NOLOAD) :
+    {
+        . = ALIGN(4);
+        _rf_dma_start_ = .;
+        KEEP(*(.rf_dma));
+        . = ALIGN(4);
+        _rf_dma_end_ = .;
+    } > RAM
+
     /* SWire-readable diagnostics near the top of SRAM, above the stacks. The
      * telink-debug probes also poke raw counters/SP-min slots up to ~0x84F800,
      * so the stacks are kept below 0x0084F000. */
@@ -129,6 +143,8 @@ SECTIONS
     _bin_size_ = _code_size_ + SIZEOF(.data);
     _bin_size_div_16 = (_bin_size_ + 15) / 16;
     _etext = _dstored_;
+    _security_nv_start_ = 0x74000;
+    _security_nv_end_ = 0x76000;
 
     /* Linker symbol aliases (for startup code compatibility) */
     _ramcode_stored_ = LOADADDR(.ram_code);
@@ -151,6 +167,12 @@ SECTIONS
         "ERROR: .data overlaps the TLSR8258 I-cache tag/data reservation");
     _assert_bss_under_stack = ASSERT(_ebss <= _svc_stack_bottom,
         "ERROR: .bss/.data extends into the SVC stack region; shrink statics or lower _svc_stack_bottom in memory.x");
+    _assert_dma_outside_cache = ASSERT(_rf_dma_start_ >= _icache_data_end_,
+        "ERROR: .rf_dma overlaps the TLSR8258 I-cache tag/data reservation");
+    _assert_dma_under_stack = ASSERT(_rf_dma_end_ <= _svc_stack_bottom,
+        "ERROR: .rf_dma extends into the SVC stack region");
+    _assert_image_below_security_nv = ASSERT(_bin_size_ <= _security_nv_start_,
+        "ERROR: firmware image overlaps security journal at 0x74000");
 
     /DISCARD/ :
     {

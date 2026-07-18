@@ -16,3 +16,6 @@ log = "0.4"
 default = []
 router = []
 trace = []
+
+[dev-dependencies]
+zigbee-mac = { version = "0.1.0", path = "../zigbee-mac", features = ["mock"] }

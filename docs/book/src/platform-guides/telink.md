@@ -26,9 +26,8 @@ The application linker script and post-link checker enforce this layout.
 
 ## Current implementation paths
 
-The repository currently has two TLSR8258 paths:
-
-1. The reusable backend used by the standalone radio/conformance harness:
+The runtime sensor and standalone conformance harness share one TLSR8258
+backend:
 
 ```text
 zigbee-runtime / BDB / ZDO / APS / NWK
@@ -42,12 +41,8 @@ zigbee-runtime / BDB / ZDO / APS / NWK
      Timer0 / flash / RF DMA / RF IRQ / MMIO
 ```
 
-2. The full join/interview/persistence runtime gate in
-   `examples/telink-tlsr8258-sensor`. It predates the HAL extraction and still
-   defines a local diagnostic-heavy `Tlsr8258Mac` and local radio module.
-
 `tlsr8258-hal` and the reusable `zigbee_mac::telink::TelinkMac` own the proven
-platform and radio primitives for the first path:
+platform and radio primitives:
 
 - clock and Timer0 access;
 - factory IEEE address or stable flash-UID fallback;
@@ -58,12 +53,10 @@ platform and radio primitives for the first path:
 - CCA, unslotted CSMA-CA, frame retries, and TX-done to RX turnaround;
 - RAM-resident flash erase/program operations.
 
-The harness application owns startup vectors, linker layout, stacks, and the
-reserved diagnostic regions.
-
-The local runtime-sensor path is the current end-to-end hardware proof gate,
-not the final production architecture. Replacing its local MAC/radio copy with
-the reusable backend remains required.
+Each application owns startup vectors, linker layout, stacks, and any reserved
+diagnostic regions. The sensor source still retains its legacy local
+`Tlsr8258Mac` and radio implementation for explicitly selected diagnostic
+modes, but `runtime-sensor` no longer links them.
 
 ## Capability boundary
 
@@ -161,7 +154,10 @@ Ember coordinator:
 - Request-Key, unique TCLK transport, Verify-Key, and Confirm-Key;
 - normal ZDO/ZCL interview;
 - battery, temperature, humidity, and Identify entities;
-- reset resume with crash-safe journaled security-counter reservations.
+- reset resume with crash-safe journaled security-counter reservations;
+- secured unicast parent rejoin with indirect-response polling for the sleepy
+  end device;
+- successful ZHA Identify after reset and parent re-registration.
 
 Remaining production work includes a clean small application entry point,
 factory-reset UI validation, deep-sleep/retention reconfiguration, the Zbit

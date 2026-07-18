@@ -1,14 +1,13 @@
 # Telink TLSR8258 Zigbee sensor
 
 This package is the current end-to-end TLSR8258 hardware gate for join,
-Trust Center exchange, ZHA interview, reporting, persistence, and reset
-resume.
+Trust Center exchange, ZHA interview, reporting, persistence, reset resume,
+and secured parent rejoin.
 
-It is pure Rust, but it is not yet the clean production target: `src/main.rs`
-still contains a large local diagnostic radio module and local
-`Tlsr8258Mac`. The reusable backend lives in `tlsr8258-hal` plus
-`zigbee_mac::telink::TelinkMac` and is exercised by
-`examples/telink-tlsr8258-radio`.
+`runtime-sensor` uses the reusable `tlsr8258-hal` radio plus
+`zigbee_mac::telink::TelinkMac`. The large local diagnostic radio and
+`Tlsr8258Mac` remain only for the explicitly selected legacy `sensor` and
+diagnostic modes.
 
 ## Hardware
 
@@ -82,8 +81,7 @@ Other modes are selected explicitly:
 ./scripts/tlsr8258.sh build diag-beacon
 ```
 
-The helper invokes the tc32 compiler with the hardware-proven codegen
-settings:
+The release profile and helper use the hardware-proven tc32 codegen settings:
 
 ```text
 -C lto=no -C opt-level=1
@@ -101,9 +99,9 @@ target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor
 target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin
 ```
 
-The current runtime image is 305,760 bytes (`0x4AA60`), so the checker warns
+The current runtime image is 356,668 bytes (`0x5713C`), so the checker warns
 that it exceeds the 256 KiB production/OTA slot while still enforcing the
-factory-data boundary.
+security-journal boundary at `0x74000`.
 
 ## Flash and inspect
 
@@ -120,6 +118,7 @@ All are overridable:
 ./scripts/tlsr8258.sh dump-boot
 ./scripts/tlsr8258.sh dump-mode
 ./scripts/tlsr8258.sh dump 0x00848550 8
+./scripts/tlsr8258.sh pgm-dump 0x74000 512
 ```
 
 ## Proven behavior
@@ -133,12 +132,15 @@ coordinator:
 - Node Descriptor, Active Endpoints, Simple Descriptor, Match, and Bind;
 - Basic, Power Configuration, Identify, Temperature, and Humidity clusters;
 - crash-safe two-sector security journal;
-- reset resume with monotonic reserved global and TCLK counters.
+- reset resume with monotonic reserved global and TCLK counters;
+- secured unicast rejoin and indirect Rejoin Response polling after a parent
+  requests rejoin;
+- successful ZHA Identify after reset and parent re-registration.
 
 ## Remaining work
 
-- Replace the local radio/MAC copy with the reusable
-  `zigbee_mac::telink::TelinkMac` path.
+- Remove the legacy local radio/MAC source after its remaining diagnostic
+  modes have moved to the reusable harness.
 - Remove the remaining application-owned SRAM markers and HA probe logic.
 - Add production factory-reset UI and hardware validation.
 - Add retention/deep-sleep radio reconfiguration and the Zbit flash voltage

@@ -683,6 +683,19 @@ impl SensorApp {
     }
 
     #[inline(always)]
+    async fn secure_rejoin(&mut self) -> bool {
+        if self.device.secure_rejoin().await.is_err() {
+            log::warn!("[EFR32] Secure rejoin failed");
+            return false;
+        }
+        self.reset_post_join_state();
+        self.needs_bootstrap_join = false;
+        self.needs_save = true;
+        log::info!("[EFR32] Secure rejoin succeeded");
+        true
+    }
+
+    #[inline(always)]
     async fn bootstrap_join(&mut self, reason: &'static str) -> bool {
         self.last_rejoin_attempt = Instant::now();
         self.rejoin_count = self.rejoin_count.wrapping_add(1);
@@ -789,6 +802,11 @@ impl SensorApp {
 
     #[inline(always)]
     async fn request_join_retry(&mut self, reason: &'static str) {
+        if self.device.secure_rejoin_pending() {
+            self.last_rejoin_attempt = Instant::now();
+            let _ = sensor_tick_handles(self.handles(), 0).await;
+            return;
+        }
         let _ = self.bootstrap_join(reason).await;
     }
 
@@ -857,7 +875,12 @@ impl SensorApp {
     #[inline(always)]
     async fn service_polled_frame(&mut self, ind: zigbee_mac::McpsDataIndication) -> bool {
         if let Some(ev) = sensor_process_incoming_handles(self.handles(), &ind).await {
-            if let StackEvent::LeaveRequested = &ev {
+            if matches!(&ev, StackEvent::RejoinRequested) {
+                log::info!("[EFR32] Secure rejoin requested");
+                let _ = self.secure_rejoin().await;
+                return true;
+            }
+            if matches!(&ev, StackEvent::LeaveRequested) {
                 log::info!("[EFR32] Leave requested - erasing NV and rejoining");
                 self.factory_reset().await;
                 self.needs_bootstrap_join = true;
@@ -920,7 +943,12 @@ impl SensorApp {
                 select::Either::First(Ok(ind)) => {
                     rtt_target::rprintln!("[EFR32] Direct RX {} bytes", ind.payload.len());
                     if let Some(ev) = sensor_process_incoming_handles(self.handles(), &ind).await {
-                        if let StackEvent::LeaveRequested = &ev {
+                        if matches!(&ev, StackEvent::RejoinRequested) {
+                            rtt_target::rprintln!("[EFR32] Secure rejoin requested during direct RX");
+                            let _ = self.secure_rejoin().await;
+                            return;
+                        }
+                        if matches!(&ev, StackEvent::LeaveRequested) {
                             rtt_target::rprintln!("[EFR32] Leave requested during direct RX");
                             self.factory_reset().await;
                             self.needs_bootstrap_join = true;
@@ -1184,7 +1212,7 @@ impl DiagJoinApp {
                 led_off();
                 rtt_target::rprintln!("[EFR32][diag-join] Left network");
             }
-            StackEvent::LeaveRequested => {
+            StackEvent::LeaveRequested | StackEvent::RejoinRequested => {
                 self.joined_at = None;
                 self.annce_retries = 0;
                 led_off();
@@ -1777,7 +1805,7 @@ fn log_event(event: &StackEvent) -> bool {
             log::info!("[EFR32] Report sent");
             false
         }
-        StackEvent::LeaveRequested => {
+        StackEvent::LeaveRequested | StackEvent::RejoinRequested => {
             led_on();
             log::info!("[EFR32] Leave requested by coordinator");
             false

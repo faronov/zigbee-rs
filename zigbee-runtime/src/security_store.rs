@@ -14,6 +14,7 @@ pub const ENCODED_SECURITY_STATE_LEN: usize = 80;
 const FLAG_COMMISSIONED: u8 = 1 << 0;
 const FLAG_TCLK_PRESENT: u8 = 1 << 1;
 const FLAG_TCLK_INCOMING_VALID: u8 = 1 << 2;
+const FLAG_REJOIN_PENDING: u8 = 1 << 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityStoreError {
@@ -48,6 +49,7 @@ pub struct PersistentSecurityState {
     pub tclk_counter_limit: u32,
     pub tclk_incoming_counter: u32,
     pub tclk_incoming_counter_valid: bool,
+    pub rejoin_pending: bool,
 }
 
 impl PersistentSecurityState {
@@ -71,6 +73,7 @@ impl PersistentSecurityState {
             tclk_counter_limit: 0,
             tclk_incoming_counter: 0,
             tclk_incoming_counter_valid: false,
+            rejoin_pending: false,
         }
     }
 
@@ -86,6 +89,10 @@ impl PersistentSecurityState {
             0
         }) | (if self.tclk_incoming_counter_valid {
             FLAG_TCLK_INCOMING_VALID
+        } else {
+            0
+        }) | (if self.rejoin_pending {
+            FLAG_REJOIN_PENDING
         } else {
             0
         });
@@ -108,13 +115,20 @@ impl PersistentSecurityState {
 
     pub fn decode(input: &[u8; ENCODED_SECURITY_STATE_LEN]) -> Result<Self, SecurityStoreError> {
         let flags = input[0];
-        if flags & !(FLAG_COMMISSIONED | FLAG_TCLK_PRESENT | FLAG_TCLK_INCOMING_VALID) != 0 {
+        if flags
+            & !(FLAG_COMMISSIONED
+                | FLAG_TCLK_PRESENT
+                | FLAG_TCLK_INCOMING_VALID
+                | FLAG_REJOIN_PENDING)
+            != 0
+        {
             return Err(SecurityStoreError::Corrupt);
         }
         let mut state = Self::empty();
         state.commissioned = flags & FLAG_COMMISSIONED != 0;
         state.tclk_present = flags & FLAG_TCLK_PRESENT != 0;
         state.tclk_incoming_counter_valid = flags & FLAG_TCLK_INCOMING_VALID != 0;
+        state.rejoin_pending = flags & FLAG_REJOIN_PENDING != 0;
         state.channel = input[1];
         state.depth = input[2];
         state.update_id = input[3];
@@ -151,6 +165,9 @@ impl PersistentSecurityState {
         if self.tclk_present
             && (self.trust_center_address == [0; 8] || self.tclk_counter_limit == 0)
         {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        if self.rejoin_pending && !self.commissioned {
             return Err(SecurityStoreError::Corrupt);
         }
         Ok(())
@@ -219,6 +236,7 @@ impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersist
         let reservation = self.reserve_from(current)?;
 
         self.state.commissioned = false;
+        self.state.rejoin_pending = false;
         self.state.extended_pan_id = state.extended_pan_id;
         self.state.pan_id = state.pan_id;
         self.state.short_address = state.short_address;
@@ -276,6 +294,7 @@ impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersist
         self.state.tclk_incoming_counter = trust_center_link_key.incoming_frame_counter;
         self.state.tclk_incoming_counter_valid = trust_center_link_key.incoming_frame_counter_valid;
         self.state.commissioned = true;
+        self.state.rejoin_pending = false;
         self.persist()
     }
 }
@@ -361,6 +380,7 @@ mod tests {
         state.tclk_counter_limit = 0x800;
         state.tclk_incoming_counter = 17;
         state.tclk_incoming_counter_valid = true;
+        state.rejoin_pending = true;
         let mut encoded = [0u8; ENCODED_SECURITY_STATE_LEN];
         state.encode(&mut encoded);
         assert_eq!(PersistentSecurityState::decode(&encoded), Ok(state));

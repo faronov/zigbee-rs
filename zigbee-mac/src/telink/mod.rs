@@ -842,9 +842,20 @@ mod imp {
         }
 
         async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
+            self.mlme_poll_timeout(
+                (POLL_RESPONSE_WAIT_TICKS / u32::from(timer::TICKS_PER_US)).max(1),
+            )
+            .await
+        }
+
+        async fn mlme_poll_timeout(
+            &mut self,
+            timeout_us: u32,
+        ) -> Result<Option<MacFrame>, MacError> {
             if self.coord_short_address.0 == 0xFFFF {
                 return Err(MacError::InvalidParameter);
             }
+            let started = self.monotonic_micros();
             let coordinator = MacAddress::Short(self.pan_id, self.coord_short_address);
             let sequence = self.next_dsn();
             let request = build_data_request_short(sequence, &coordinator, self.short_address);
@@ -856,8 +867,12 @@ mod imp {
             if !ack.frame_pending {
                 return Ok(None);
             }
+            let elapsed = self.monotonic_micros().wrapping_sub(started);
+            let Some(remaining_us) = timeout_us.checked_sub(elapsed) else {
+                return Ok(None);
+            };
             Ok(self
-                .receive_poll_response(POLL_RESPONSE_WAIT_TICKS)
+                .receive_poll_response(timer::us(remaining_us))
                 .map(|indication| indication.payload))
         }
 
@@ -894,6 +909,14 @@ mod imp {
 
         async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
             self.receive_data_indication(RX_INDICATION_WAIT_TICKS)
+                .ok_or(MacError::NoData)
+        }
+
+        async fn mcps_data_indication_timeout(
+            &mut self,
+            timeout_us: u32,
+        ) -> Result<McpsDataIndication, MacError> {
+            self.receive_data_indication(timer::us(timeout_us))
                 .ok_or(MacError::NoData)
         }
 

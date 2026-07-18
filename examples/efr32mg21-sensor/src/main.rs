@@ -327,6 +327,21 @@ async fn main(_spawner: Spawner) {
                         ];
                         if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
                             match &ev {
+                                StackEvent::RejoinRequested => {
+                                    log::info!("[EFR32] Secure rejoin requested");
+                                    if device.secure_rejoin().await.is_ok() {
+                                        fast_poll_until = Instant::now()
+                                            + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                        interview_done = false;
+                                        annce_retries_left = 5;
+                                        last_annce = Instant::now();
+                                        led_on();
+                                        needs_save = true;
+                                    } else {
+                                        log::warn!("[EFR32] Secure rejoin failed");
+                                    }
+                                    break;
+                                }
                                 StackEvent::LeaveRequested => {
                                     log::info!("[EFR32] Leave requested — erasing NV and rejoining");
                                     device.factory_reset(Some(&mut nv)).await;
@@ -483,7 +498,7 @@ fn log_event(event: &StackEvent) -> bool {
             false
         }
         StackEvent::ReportSent => { log::info!("[EFR32] Report sent"); false }
-        StackEvent::LeaveRequested => {
+        StackEvent::LeaveRequested | StackEvent::RejoinRequested => {
             led_on();
             log::info!("[EFR32] Leave requested by coordinator");
             false

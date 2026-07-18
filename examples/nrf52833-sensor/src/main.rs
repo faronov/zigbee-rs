@@ -194,7 +194,14 @@ async fn main(_spawner: Spawner) {
                 ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                 ];
                 if let Some(event) = device.process_incoming(&indication, &mut clusters).await {
-                    log_event(&event);
+                    if matches!(&event, StackEvent::RejoinRequested) {
+                        info!("Secure rejoin requested");
+                        if device.secure_rejoin().await.is_err() {
+                            warn!("Secure rejoin failed");
+                        }
+                    } else {
+                        log_event(&event);
+                    }
                 }
             }
             Either3::First(Err(_)) => {

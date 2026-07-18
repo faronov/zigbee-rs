@@ -141,6 +141,7 @@ verify_layout() {
     local ramcode_end=0 ramcode_start=0 ramcode_aligned=0
     local ictag_start=0 ictag_end=0 icache_data_end=0 sdata=0
     local ebss=0 svc_bot=0 svc_top=0 irq_top=0
+    local rf_dma_start=0 rf_dma_end=0
     local rf_rx_buf=0 rf_tx_buf=0
     local line value name
     while read -r line; do
@@ -159,6 +160,8 @@ verify_layout() {
             _svc_stack_bottom)  svc_bot=$((16#$value)) ;;
             _svc_stack_top)     svc_top=$((16#$value)) ;;
             _irq_stack_top)     irq_top=$((16#$value)) ;;
+            _rf_dma_start_)     rf_dma_start=$((16#$value)) ;;
+            _rf_dma_end_)       rf_dma_end=$((16#$value)) ;;
             *RF_RX_BUF)         rf_rx_buf=$((16#$value)) ;;
             *RF_TX_BUF)         rf_tx_buf=$((16#$value)) ;;
         esac
@@ -195,25 +198,51 @@ verify_layout() {
             "$rf_tx_buf" "$icache_data_end" >&2
         exit 1
     fi
-    # LTO + opt-level=s can in principle empty `.ram_code` if every function
-    # is inlined away. The flash erase/program path *must* be present in RAM
-    # because executing flash erase from XIP flash hangs the bus. Require at
-    # least 256 bytes of ram_code body.
+    if (( rf_dma_start != 0 && rf_dma_start < icache_data_end )); then
+        printf 'layout-check FAIL: .rf_dma starts at 0x%X before cache reservation end 0x%X\n' \
+            "$rf_dma_start" "$icache_data_end" >&2
+        exit 1
+    fi
+    if (( rf_dma_end > svc_bot )); then
+        printf 'layout-check FAIL: .rf_dma ends at 0x%X past _svc_stack_bottom=0x%X\n' \
+            "$rf_dma_end" "$svc_bot" >&2
+        exit 1
+    fi
+    # The flash erase/program path must remain in RAM because executing flash
+    # erase from XIP flash hangs the bus. Require at least 256 bytes of
+    # ram_code body.
     local ramcode_len=$(( ramcode_end - ramcode_start ))
     if (( ramcode_len < 0x100 )); then
         printf 'layout-check FAIL: .ram_code body too small (%d bytes); flash routines likely inlined into XIP flash\n' \
             "$ramcode_len" >&2
         exit 1
     fi
-    # The 512 KiB SDK layout keeps factory data near 0x76000. Production/OTA
-    # images should stay below 0x40000, but the unoptimized runtime bring-up
-    # build is allowed to exceed that boundary while remaining below factory
-    # data. Keep this visible as a warning rather than blocking diagnostics.
+    if [[ "$MODE_NAME" == "runtime-sensor" ]]; then
+        if ! "$nm" -C "$ELF_PATH" | awk '
+            /zigbee_mac::telink::imp::TelinkMac/ { found = 1 }
+            END { exit(found ? 0 : 1) }
+        '; then
+            echo 'layout-check FAIL: runtime-sensor does not link zigbee_mac::telink::TelinkMac' >&2
+            exit 1
+        fi
+        if "$nm" -C "$ELF_PATH" | awk '
+            /telink_tlsr8258_sensor::Tlsr8258Mac/ ||
+            /telink_tlsr8258_sensor::radio::/ { found = 1 }
+            END { exit(found ? 0 : 1) }
+        '; then
+            echo 'layout-check FAIL: runtime-sensor still links the legacy local MAC/radio' >&2
+            exit 1
+        fi
+    fi
+    # The security journal starts at 0x74000 and factory data at 0x76000.
+    # Production/OTA images should stay below 0x40000, but the unoptimized
+    # runtime build may exceed that boundary while remaining below the
+    # journal. Keep this visible as a warning rather than blocking it.
     if [[ -f "$BIN_PATH" ]]; then
         local bin_size
         bin_size=$(wc -c < "$BIN_PATH" | tr -d ' ')
-        if (( bin_size > 0x76000 )); then
-            printf 'layout-check FAIL: .bin size=%d (0x%X) reaches factory-data region at 0x76000\n' \
+        if (( bin_size > 0x74000 )); then
+            printf 'layout-check FAIL: .bin size=%d (0x%X) reaches security journal at 0x74000\n' \
                 "$bin_size" "$bin_size" >&2
             exit 1
         fi
@@ -279,7 +308,7 @@ cmd_pgm_dump() {
     local address="${1:?pgm-dump requires an address}"
     local bytes="${2:-128}"
     require_file "$TLSRPGM" "TlsrPgm.py"
-    python3 "$TLSRPGM" -p "$TELINK_PORT" -t 500 -a 200 -s ds "$address" "$bytes"
+    python3 "$TLSRPGM" -p "$TELINK_PORT" -t 500 -a 200 -s df "$address" "$bytes"
 }
 
 cmd_pgm_break() {

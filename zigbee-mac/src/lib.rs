@@ -179,6 +179,18 @@ pub trait MacDriver: PlatformServices {
     /// any pending indirect frame.
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError>;
 
+    /// Poll the coordinator, discarding any response completed after the
+    /// supplied timeout.
+    async fn mlme_poll_timeout(&mut self, timeout_us: u32) -> Result<Option<MacFrame>, MacError> {
+        let started = self.monotonic_micros();
+        let result = self.mlme_poll().await?;
+        if self.monotonic_micros().wrapping_sub(started) >= timeout_us {
+            Ok(None)
+        } else {
+            Ok(result)
+        }
+    }
+
     // ── MCPS: Data service ──────────────────────────────────
 
     /// MCPS-DATA.request — transmit a MAC frame.
@@ -192,6 +204,16 @@ pub trait MacDriver: PlatformServices {
     /// Blocks until a frame is received from the radio. The caller is
     /// responsible for filtering by frame type / addressing.
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError>;
+
+    /// Receive the next incoming MAC frame before `timeout_us` expires.
+    ///
+    /// Unlike [`Self::mcps_data_indication`], this primitive must not block
+    /// beyond the supplied timeout and returns [`MacError::NoData`] when the
+    /// deadline expires.
+    async fn mcps_data_indication_timeout(
+        &mut self,
+        timeout_us: u32,
+    ) -> Result<McpsDataIndication, MacError>;
 
     // ── Capability queries ──────────────────────────────────
 

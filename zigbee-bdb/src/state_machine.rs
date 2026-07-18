@@ -315,6 +315,20 @@ impl<M: MacDriver> BdbLayer<M> {
     ///
     /// Falls back to full steering if rejoin fails.
     pub async fn rejoin(&mut self) -> Result<(), BdbStatus> {
+        if self.rejoin_previous_network().await.is_ok() {
+            return Ok(());
+        }
+
+        log::warn!("[BDB] Secured rejoin failed — falling back to steering");
+        self.attributes.node_is_on_a_network = false;
+        self.state = BdbState::Idle;
+        self.network_steering().await
+    }
+
+    /// Rejoin only the previously commissioned network using the stored NWK
+    /// key. Failure leaves the commissioned state intact and never falls back
+    /// to factory-new steering.
+    pub async fn rejoin_previous_network(&mut self) -> Result<(), BdbStatus> {
         if !self.attributes.node_is_on_a_network {
             return Err(BdbStatus::NotOnNetwork);
         }
@@ -322,23 +336,24 @@ impl<M: MacDriver> BdbLayer<M> {
         self.state = BdbState::NetworkSteering;
         log::info!("[BDB] Attempting rejoin on previous network…");
 
-        // Get last-known channel from NWK NIB
-        let channel = self.zdo.nwk().nib().logical_channel;
+        let nib = self.zdo.nwk().nib();
+        let channel = nib.logical_channel;
+        let extended_pan_id = nib.extended_pan_id;
         let channel_mask = zigbee_types::ChannelMask(1u32 << channel);
 
-        // Scan for networks on the last-known channel
         let networks = match self.zdo.nlme_network_discovery(channel_mask, 3).await {
             Ok(n) => n,
             Err(_) => {
                 log::warn!("[BDB] Rejoin: no networks found on channel {}", channel);
                 self.state = BdbState::Idle;
-                // Fall back to full steering
-                return self.network_steering().await;
+                return Err(BdbStatus::NoScanResponse);
             }
         };
 
-        // Try rejoin on each discovered network
-        for network in &networks {
+        for network in networks
+            .iter()
+            .filter(|network| network.extended_pan_id == extended_pan_id)
+        {
             log::info!(
                 "[BDB] Rejoin: trying PAN 0x{:04X} ch {}",
                 network.pan_id.0,
@@ -367,11 +382,8 @@ impl<M: MacDriver> BdbLayer<M> {
             }
         }
 
-        log::warn!("[BDB] All rejoin attempts failed — falling back to steering");
-        // Mark as off-network so steering does a fresh scan+join
-        // instead of the "on network" path (which just opens permit joining)
-        self.attributes.node_is_on_a_network = false;
+        log::warn!("[BDB] Previous network did not accept secured rejoin");
         self.state = BdbState::Idle;
-        self.network_steering().await
+        Err(BdbStatus::SteeringFailure)
     }
 }

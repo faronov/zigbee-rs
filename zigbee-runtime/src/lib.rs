@@ -27,6 +27,9 @@
 #![no_std]
 #![allow(async_fn_in_trait)]
 
+#[cfg(test)]
+extern crate std;
+
 #[cfg(feature = "trace")]
 macro_rules! rt_trace {
     ($($arg:tt)*) => {
@@ -106,6 +109,138 @@ mod runtime_scratch_tests {
             assert_eq!((*second.nwk.get())[0], 0);
             assert_ne!(first.nwk.get(), second.nwk.get());
         }
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+    use std::sync::Arc;
+    use std::task::Wake;
+
+    use super::ZigbeeDevice;
+    use crate::security_store::{
+        PersistentSecurityState, RamSecurityStateStore, SecurityStateStore,
+    };
+    use zigbee_mac::mock::MockMac;
+    use zigbee_mac::{MacDriver, PibAttribute, PibValue};
+    use zigbee_nwk::DeviceType;
+    use zigbee_types::ShortAddress;
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn resume_restores_parent_address_into_mac_pib() {
+        const IEEE_ADDRESS: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
+        const PARENT_ADDRESS: ShortAddress = ShortAddress(0x3344);
+
+        let mac = MockMac::new(IEEE_ADDRESS);
+        let mut device = ZigbeeDevice::builder(mac)
+            .device_type(DeviceType::EndDevice)
+            .build();
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.extended_pan_id = [1; 8];
+        state.pan_id = 0x1234;
+        state.short_address = 0x5678;
+        state.ieee_address = IEEE_ADDRESS;
+        state.channel = 15;
+        state.depth = 1;
+        state.parent_address = PARENT_ADDRESS.0;
+        state.network_key = [2; 16];
+        state.global_counter_limit = 0x400;
+        state.tclk_present = true;
+        state.trust_center_address = [3; 8];
+        state.trust_center_link_key = [4; 16];
+        state.tclk_counter_limit = 0x400;
+
+        let mut store = RamSecurityStateStore::new();
+        store.store(&state).unwrap();
+
+        assert_eq!(
+            block_on(device.start_or_resume_with_security_store(&mut store)).unwrap(),
+            state.short_address
+        );
+        assert_eq!(
+            block_on(
+                device
+                    .mac_mut()
+                    .mlme_get(PibAttribute::MacCoordShortAddress)
+            )
+            .unwrap(),
+            PibValue::ShortAddress(PARENT_ADDRESS)
+        );
+        assert_eq!(
+            block_on(
+                device
+                    .mac_mut()
+                    .mlme_get(PibAttribute::MacAssociatedPanCoord)
+            )
+            .unwrap(),
+            PibValue::Bool(true)
+        );
+        assert!(device.is_joined());
+        assert!(device.bdb.is_on_network());
+        device.bdb.zdo_mut().nwk_mut().set_joined(false);
+        assert!(
+            !device.is_joined(),
+            "runtime join state must reflect operational NWK connectivity"
+        );
+        assert!(
+            device.bdb.is_on_network(),
+            "losing the parent must not erase commissioned credentials"
+        );
+
+        let mut pending_state = state;
+        pending_state.rejoin_pending = true;
+        let mut pending_store = RamSecurityStateStore::new();
+        pending_store.store(&pending_state).unwrap();
+        let mut pending_device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        assert!(
+            pending_device
+                .restore_security_state(&mut pending_store)
+                .unwrap()
+        );
+        assert!(pending_device.secure_rejoin_pending());
+        assert!(!pending_device.is_joined());
+        block_on(pending_device.leave()).unwrap();
+        assert!(!pending_device.secure_rejoin_pending());
+        assert!(!pending_device.bdb.is_on_network());
+
+        let mut reboot_store = RamSecurityStateStore::new();
+        reboot_store.store(&pending_state).unwrap();
+        let mut rebooted = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        assert!(matches!(
+            block_on(rebooted.start_or_resume_with_security_store(&mut reboot_store)),
+            Err(crate::event_loop::StartError::CommissioningFailed(_))
+        ));
+        assert!(
+            !rebooted.is_joined(),
+            "persisted rejoin-pending state must not silently resume"
+        );
+        assert!(reboot_store.load().unwrap().unwrap().rejoin_pending);
     }
 }
 
@@ -204,9 +339,13 @@ pub struct ZigbeeDevice<M: MacDriver> {
     scratch: RuntimeScratch,
     /// Flag: network state has changed and should be persisted.
     state_dirty: bool,
+    /// Earliest monotonic time for the next automatic secure-rejoin attempt.
+    secure_rejoin_retry_at: Option<u32>,
 }
 
 impl<M: MacDriver> ZigbeeDevice<M> {
+    const SECURE_REJOIN_RETRY_DELAY_US: u32 = 5_000_000;
+
     /// Create a new device builder.
     pub fn builder(mac: M) -> builder::DeviceBuilder<M> {
         builder::DeviceBuilder::new(mac)
@@ -287,6 +426,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             .restore_security_state(store)
             .map_err(event_loop::StartError::PersistenceFailed)?
         {
+            if self.secure_rejoin_pending() {
+                self.configure_restored_network().await?;
+                return self.secure_rejoin_with_security_store(store).await;
+            }
             return self.rejoin().await;
         }
 
@@ -315,6 +458,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.bdb.zdo_mut().set_local_ieee_addr(ieee);
 
         self.state_dirty = true;
+        self.secure_rejoin_retry_at = None;
         Ok(addr)
     }
 
@@ -335,7 +479,25 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     #[inline(never)]
     pub async fn rejoin(&mut self) -> Result<u16, event_loop::StartError> {
         log::info!("[Runtime] Resuming on previous network…");
+        let addr = self.configure_restored_network().await?;
 
+        // Mark as joined so NWK/ZDO accept frames
+        self.bdb.zdo_mut().nwk_mut().set_joined(true);
+
+        // Announce immediately so coordinators and home automation stacks
+        // that dropped our registry entry can rediscover the device.
+        // Repeating the announce is cheap and avoids relying on stale state.
+        self.send_device_annce()
+            .await
+            .map_err(|_| event_loop::StartError::InitFailed)?;
+        log::info!("[Runtime] Device_annce sent after resume");
+
+        self.state_dirty = true;
+        self.secure_rejoin_retry_at = None;
+        Ok(addr)
+    }
+
+    async fn configure_restored_network(&mut self) -> Result<u16, event_loop::StartError> {
         let nib = self.bdb.zdo().nwk().nib();
         let addr = nib.network_address.0;
         let channel = nib.logical_channel;
@@ -350,8 +512,6 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             parent.0
         );
 
-        // Configure MAC layer with restored addresses so it accepts
-        // unicast frames and can transmit with the correct source address.
         let mac = self.bdb.zdo_mut().nwk_mut().mac_mut();
         mac.mlme_set(
             zigbee_mac::PibAttribute::PhyCurrentChannel,
@@ -371,8 +531,19 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         )
         .await
         .map_err(|_| event_loop::StartError::InitFailed)?;
+        mac.mlme_set(
+            zigbee_mac::PibAttribute::MacCoordShortAddress,
+            zigbee_mac::PibValue::ShortAddress(parent),
+        )
+        .await
+        .map_err(|_| event_loop::StartError::InitFailed)?;
+        mac.mlme_set(
+            zigbee_mac::PibAttribute::MacAssociatedPanCoord,
+            zigbee_mac::PibValue::Bool(true),
+        )
+        .await
+        .map_err(|_| event_loop::StartError::InitFailed)?;
 
-        // Read IEEE address from MAC hardware and set it in NIB.
         let hw_ieee = match self
             .bdb
             .zdo_mut()
@@ -391,39 +562,97 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             ));
         }
         self.bdb.zdo_mut().nwk_mut().nib_mut().ieee_address = hw_ieee;
-        log::info!("[Runtime] NIB IEEE set from MAC: {:02X?}", hw_ieee);
-
-        let ieee = self.bdb.zdo().nwk().nib().ieee_address;
-
-        // Mark as joined so NWK/ZDO accept frames
-        self.bdb.zdo_mut().nwk_mut().set_joined(true);
-
-        // Sync addresses into ZDO so interview responses are correct
         self.bdb.zdo_mut().set_local_nwk_addr(ShortAddress(addr));
-        self.bdb.zdo_mut().set_local_ieee_addr(ieee);
+        self.bdb.zdo_mut().set_local_ieee_addr(hw_ieee);
+        log::info!("[Runtime] NIB IEEE set from MAC: {:02X?}", hw_ieee);
+        Ok(addr)
+    }
 
-        // Announce immediately so coordinators and home automation stacks
-        // that dropped our registry entry can rediscover the device.
-        // Repeating the announce is cheap and avoids relying on stale state.
-        self.send_device_annce()
-            .await
-            .map_err(|_| event_loop::StartError::InitFailed)?;
-        log::info!("[Runtime] Device_annce sent after resume");
+    /// Re-establish the parent relationship with a secured NWK rejoin.
+    ///
+    /// Unlike [`Self::rejoin`], this performs the over-the-air Rejoin
+    /// Request/Response exchange. Use it when a parent sends a Leave command
+    /// with the rejoin bit set or when silent resume can no longer poll.
+    #[inline(never)]
+    pub async fn secure_rejoin(&mut self) -> Result<u16, event_loop::StartError> {
+        self.bdb.zdo_mut().nwk_mut().set_joined(false);
+        let result = match self.bdb.rejoin_previous_network().await {
+            Ok(()) => self.finish_join(),
+            Err(status) => Err(event_loop::StartError::CommissioningFailed(status)),
+        };
+        if result.is_ok() {
+            self.send_ed_timeout_request().await;
+            self.secure_rejoin_retry_at = None;
+        } else {
+            self.schedule_secure_rejoin_retry();
+        }
+        result
+    }
 
-        self.state_dirty = true;
+    /// Perform a secured NWK rejoin while preserving crash-safe counters and
+    /// persisting any new short address or parent selected by the network.
+    #[inline(never)]
+    pub async fn secure_rejoin_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<u16, event_loop::StartError> {
+        self.refresh_security_state(store)
+            .map_err(event_loop::StartError::PersistenceFailed)?;
+        self.persist_rejoin_pending(store, true)
+            .map_err(event_loop::StartError::PersistenceFailed)?;
+
+        let addr = match self.secure_rejoin().await {
+            Ok(addr) => addr,
+            Err(error) => {
+                self.refresh_security_state(store)
+                    .map_err(event_loop::StartError::PersistenceFailed)?;
+                return Err(error);
+            }
+        };
+        let mut state = store
+            .load()
+            .map_err(event_loop::StartError::PersistenceFailed)?
+            .ok_or(event_loop::StartError::PersistenceFailed(
+                SecurityStoreError::NotFound,
+            ))?;
+        state
+            .validate()
+            .map_err(event_loop::StartError::PersistenceFailed)?;
+
+        let nib = self.bdb.zdo().nwk().nib();
+        state.extended_pan_id = nib.extended_pan_id;
+        state.pan_id = nib.pan_id.0;
+        state.short_address = nib.network_address.0;
+        state.channel = nib.logical_channel;
+        state.depth = nib.depth;
+        state.parent_address = nib.parent_address.0;
+        state.update_id = nib.update_id;
+        state.rejoin_pending = false;
+        store
+            .store(&state)
+            .map_err(event_loop::StartError::PersistenceFailed)?;
+        self.refresh_security_state(store)
+            .map_err(event_loop::StartError::PersistenceFailed)?;
+
         Ok(addr)
     }
 
     /// Leave the current Zigbee network.
     pub async fn leave(&mut self) -> Result<(), event_loop::StartError> {
         log::info!("[Runtime] Leaving network…");
-        self.bdb
+        if self
+            .bdb
             .zdo_mut()
             .nwk_mut()
             .nlme_leave(false)
             .await
-            .map_err(|_| event_loop::StartError::InitFailed)?;
+            .is_err()
+        {
+            log::warn!("[Runtime] Leave notification failed; clearing local state");
+        }
         self.bdb.attributes_mut().node_is_on_a_network = false;
+        self.bdb.zdo_mut().nwk_mut().set_joined(false);
+        self.secure_rejoin_retry_at = None;
         self.state_dirty = true;
         log::info!("[Runtime] Left network");
         Ok(())
@@ -466,6 +695,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
         }
 
+        self.secure_rejoin_retry_at = None;
         log::info!("[Runtime] Factory reset complete");
     }
 
@@ -481,7 +711,25 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
     /// Whether the device is currently joined to a network.
     pub fn is_joined(&self) -> bool {
-        self.bdb.is_on_network()
+        self.bdb.is_on_network() && self.bdb.zdo().nwk().is_joined()
+    }
+
+    /// Whether a coordinator-requested secure rejoin still needs retrying.
+    pub fn secure_rejoin_pending(&self) -> bool {
+        self.secure_rejoin_retry_at.is_some()
+    }
+
+    pub(crate) fn secure_rejoin_retry_due(&self) -> bool {
+        let Some(deadline) = self.secure_rejoin_retry_at else {
+            return false;
+        };
+        let now = self.bdb.zdo().nwk().mac().monotonic_micros();
+        now.wrapping_sub(deadline) < 0x8000_0000
+    }
+
+    fn schedule_secure_rejoin_retry(&mut self) {
+        let now = self.bdb.zdo().nwk().mac().monotonic_micros();
+        self.secure_rejoin_retry_at = Some(now.wrapping_add(Self::SECURE_REJOIN_RETRY_DELAY_US));
     }
 
     /// The device's NWK short address (0xFFFF if not joined).
@@ -666,6 +914,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.bdb.attributes_mut().primary_channel_set = ChannelMask(1u32 << state.channel);
         self.bdb.attributes_mut().secondary_channel_set = ChannelMask(0);
         self.state_dirty = false;
+        let now = self.bdb.zdo().nwk().mac().monotonic_micros();
+        self.secure_rejoin_retry_at = state.rejoin_pending.then_some(now);
         Ok(true)
     }
 
@@ -801,6 +1051,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             .await
             .map_err(event_loop::StartError::CommissioningFailed)?;
         self.state_dirty = false;
+        self.secure_rejoin_retry_at = None;
         Ok(())
     }
 
@@ -813,8 +1064,30 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     ) -> Result<Option<event_loop::StackEvent>, SecurityStoreError> {
         self.refresh_security_state(store)?;
         let event = self.process_incoming(indication, clusters).await;
+        if matches!(&event, Some(event_loop::StackEvent::RejoinRequested)) {
+            self.persist_rejoin_pending(store, true)?;
+        }
         self.refresh_security_state(store)?;
         Ok(event)
+    }
+
+    fn persist_rejoin_pending<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+        pending: bool,
+    ) -> Result<(), SecurityStoreError> {
+        let Some(mut state) = store.load()? else {
+            return Err(SecurityStoreError::NotFound);
+        };
+        state.validate()?;
+        if !state.commissioned {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        if state.rejoin_pending != pending {
+            state.rejoin_pending = pending;
+            store.store(&state)?;
+        }
+        Ok(())
     }
 
     /// Tick reporting and pending responses with crash-safe counter
@@ -826,9 +1099,59 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         store: &mut S,
     ) -> Result<event_loop::TickResult, SecurityStoreError> {
         self.refresh_security_state(store)?;
-        let result = self.tick(elapsed_secs, clusters).await;
+        let security_reset_action = matches!(
+            self.pending_action,
+            Some(UserAction::Leave | UserAction::FactoryReset)
+        ) || (matches!(self.pending_action, Some(UserAction::Toggle))
+            && self.is_joined());
+        let recovery_action = self.secure_rejoin_pending()
+            && matches!(
+                self.pending_action,
+                Some(UserAction::Join | UserAction::Rejoin | UserAction::Toggle)
+            );
+        let result = if security_reset_action {
+            self.pending_action = None;
+            self.factory_reset_with_security_store(store)
+                .await
+                .map_err(|error| match error {
+                    event_loop::StartError::PersistenceFailed(error) => error,
+                    _ => SecurityStoreError::Hardware,
+                })?;
+            event_loop::TickResult::Event(event_loop::StackEvent::Left)
+        } else if recovery_action {
+            self.pending_action = None;
+            self.retry_secure_rejoin_with_security_store(store).await?
+        } else if self.pending_action.is_some() {
+            self.tick_without_secure_rejoin(elapsed_secs, clusters)
+                .await
+        } else if self.secure_rejoin_retry_due() {
+            self.retry_secure_rejoin_with_security_store(store).await?
+        } else {
+            self.tick_without_secure_rejoin(elapsed_secs, clusters)
+                .await
+        };
         self.refresh_security_state(store)?;
         Ok(result)
+    }
+
+    async fn retry_secure_rejoin_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<event_loop::TickResult, SecurityStoreError> {
+        log::info!("[Runtime] Retrying secure rejoin with security store");
+        match self.secure_rejoin_with_security_store(store).await {
+            Ok(addr) => Ok(event_loop::TickResult::Event(
+                event_loop::StackEvent::Joined {
+                    short_address: addr,
+                    channel: self.channel(),
+                    pan_id: self.pan_id(),
+                },
+            )),
+            Err(event_loop::StartError::PersistenceFailed(error)) => Err(error),
+            Err(_) => Ok(event_loop::TickResult::Event(
+                event_loop::StackEvent::CommissioningComplete { success: false },
+            )),
+        }
     }
 
     /// Save critical network state to non-volatile storage.
@@ -1305,9 +1628,21 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         remove_children,
                         rejoin
                     );
-                    // Mark as not joined so the stack stops sending
+                    // Mark as not joined so the stack stops sending until the
+                    // application either honors the requested rejoin or
+                    // clears its persisted network state.
                     self.bdb.zdo_mut().nwk_mut().set_joined(false);
-                    return Some(event_loop::StackEvent::LeaveRequested);
+                    if rejoin {
+                        let now = self.bdb.zdo().nwk().mac().monotonic_micros();
+                        self.secure_rejoin_retry_at = Some(now);
+                    } else {
+                        self.secure_rejoin_retry_at = None;
+                    }
+                    return Some(if rejoin {
+                        event_loop::StackEvent::RejoinRequested
+                    } else {
+                        event_loop::StackEvent::LeaveRequested
+                    });
                 }
             }
             return None;

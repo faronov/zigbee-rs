@@ -268,6 +268,18 @@ fn main() -> ! {
                             ];
                             if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
                                 match &ev {
+                                    StackEvent::RejoinRequested => {
+                                        esp_println::println!("[ESP32-C6] Secure rejoin requested");
+                                        if device.secure_rejoin().await.is_ok() {
+                                            device.save_state(&mut nv);
+                                            fast_poll_until = Instant::now()
+                                                + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                            interview_done = false;
+                                        } else {
+                                            esp_println::println!("[ESP32-C6] Secure rejoin failed");
+                                        }
+                                        break;
+                                    }
                                     StackEvent::LeaveRequested => {
                                         esp_println::println!("[ESP32-C6] Leave requested — erasing NV and rejoining");
                                         device.factory_reset(Some(&mut nv)).await;
@@ -386,7 +398,7 @@ fn log_event(event: &StackEvent) -> bool {
             esp_println::println!("[ESP32-C6] Report sent");
             false
         }
-        StackEvent::LeaveRequested => {
+        StackEvent::LeaveRequested | StackEvent::RejoinRequested => {
             esp_println::println!("[ESP32-C6] Leave requested by coordinator");
             false
         }

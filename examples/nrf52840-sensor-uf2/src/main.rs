@@ -405,6 +405,17 @@ async fn main(_spawner: Spawner) {
                 ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                         ];
                         if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
+                            if matches!(&ev, StackEvent::RejoinRequested) {
+                                info!("Secure rejoin requested");
+                                if device.secure_rejoin().await.is_ok() {
+                                    fast_poll_until = Instant::now()
+                                        + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                    interview_done = false;
+                                } else {
+                                    warn!("Secure rejoin failed");
+                                }
+                                break;
+                            }
                             if log_event(&ev, &mut led) {
                                 fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                 info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);

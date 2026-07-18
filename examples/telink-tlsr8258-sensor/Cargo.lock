@@ -123,6 +123,7 @@ dependencies = [
  "heapless",
  "log",
  "panic-halt",
+ "tlsr8258-hal",
  "zigbee-aps",
  "zigbee-bdb",
  "zigbee-mac",
@@ -132,6 +133,10 @@ dependencies = [
  "zigbee-zcl",
  "zigbee-zdo",
 ]
+
+[[package]]
+name = "tlsr8258-hal"
+version = "0.1.0"
 
 [[package]]
 name = "typenum"
@@ -186,6 +191,7 @@ version = "0.1.0"
 dependencies = [
  "heapless",
  "log",
+ "tlsr8258-hal",
  "zigbee-types",
 ]
 

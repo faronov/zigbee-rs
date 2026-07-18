@@ -786,8 +786,14 @@ impl MacDriver for EspMac<'_> {
     }
 
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
-        const RX_TIMEOUT_MS: u64 = 5000;
-        let deadline = Instant::now() + Duration::from_millis(RX_TIMEOUT_MS);
+        self.mcps_data_indication_timeout(5_000_000).await
+    }
+
+    async fn mcps_data_indication_timeout(
+        &mut self,
+        timeout_us: u32,
+    ) -> Result<McpsDataIndication, MacError> {
+        let deadline = Instant::now() + Duration::from_micros(timeout_us as u64);
         // Enable promiscuous for passive RX — ensures we receive Transport-Key
         // frames that use IEEE addressing (not matched by hardware short addr filter)
         self.driver.update_config(|cfg| cfg.promiscuous = true);

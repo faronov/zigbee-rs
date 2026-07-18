@@ -471,19 +471,34 @@ async fn main(_spawner: Spawner) {
                             Err(error) => persistence_failure(error),
                         };
                         if let Some(ev) = event {
-                            if matches!(ev, StackEvent::LeaveRequested) {
-                                info!("Coordinator sent Leave — resetting and rejoining");
-                                if factory_reset(&mut device, &mut security_store).await
-                                    && join_or_resume(&mut device, &mut security_store).await
-                                {
-                                    fast_poll_until = Instant::now()
-                                        + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                    interview_done = false;
-                                    annce_retries_left = 5;
-                                    last_annce = Instant::now();
-                                    led.set_low();
+                            match &ev {
+                                StackEvent::RejoinRequested => {
+                                    info!("Coordinator requested secure rejoin");
+                                    if secure_rejoin(&mut device, &mut security_store).await {
+                                        fast_poll_until = Instant::now()
+                                            + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                        interview_done = false;
+                                        annce_retries_left = 5;
+                                        last_annce = Instant::now();
+                                        led.set_low();
+                                    }
+                                    break;
                                 }
-                                break;
+                                StackEvent::LeaveRequested => {
+                                    info!("Coordinator sent Leave — resetting and rejoining");
+                                    if factory_reset(&mut device, &mut security_store).await
+                                        && join_or_resume(&mut device, &mut security_store).await
+                                    {
+                                        fast_poll_until = Instant::now()
+                                            + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                        interview_done = false;
+                                        annce_retries_left = 5;
+                                        last_annce = Instant::now();
+                                        led.set_low();
+                                    }
+                                    break;
+                                }
+                                _ => {}
                             }
                             if log_event(&ev, &mut led) {
                                 fast_poll_until =
@@ -689,7 +704,38 @@ async fn main(_spawner: Spawner) {
                 rejoin_count = rejoin_count.wrapping_add(1);
                 last_rejoin_attempt = Instant::now();
                 info!("Not joined — retrying (attempt {})…", rejoin_count);
-                if join_or_resume(&mut device, &mut security_store).await {
+                let mut clusters = [
+                    ClusterRef {
+                        endpoint: 1,
+                        cluster: &mut basic_cluster,
+                    },
+                    ClusterRef {
+                        endpoint: 1,
+                        cluster: &mut temp_cluster,
+                    },
+                    ClusterRef {
+                        endpoint: 1,
+                        cluster: &mut hum_cluster,
+                    },
+                    ClusterRef {
+                        endpoint: 1,
+                        cluster: &mut power_cluster,
+                    },
+                    ClusterRef {
+                        endpoint: 1,
+                        cluster: &mut identify_cluster,
+                    },
+                ];
+                if let Err(error) = device
+                    .tick_with_security_store(0, &mut clusters, &mut security_store)
+                    .await
+                {
+                    persistence_failure(error);
+                }
+                if device.is_joined()
+                    || (!device.secure_rejoin_pending()
+                        && join_or_resume(&mut device, &mut security_store).await)
+                {
                     led.set_low();
                     fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                     annce_retries_left = 5;
@@ -725,6 +771,29 @@ where
         }
         Err(StartError::CommissioningFailed(status)) => {
             warn!("Commissioning failed: status=0x{:02X}", status as u8);
+            false
+        }
+        Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
+    }
+}
+
+async fn secure_rejoin<M, S>(device: &mut ZigbeeDevice<M>, store: &mut S) -> bool
+where
+    M: zigbee_mac::MacDriver,
+    S: SecurityStateStore,
+{
+    match device.secure_rejoin_with_security_store(store).await {
+        Ok(short_address) => {
+            info!("Secure rejoin succeeded: addr=0x{:04X}", short_address);
+            checkpoint_security(device, store);
+            true
+        }
+        Err(StartError::InitFailed) => {
+            warn!("Secure rejoin initialization failed");
+            false
+        }
+        Err(StartError::CommissioningFailed(status)) => {
+            warn!("Secure rejoin failed: status=0x{:02X}", status as u8);
             false
         }
         Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
@@ -905,7 +974,7 @@ fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>) -> bool {
             info!("Report sent");
             false
         }
-        StackEvent::LeaveRequested => {
+        StackEvent::LeaveRequested | StackEvent::RejoinRequested => {
             led.set_low(); // ON — rejoining
             info!("Leave requested by coordinator");
             false

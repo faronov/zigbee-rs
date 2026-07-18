@@ -34,6 +34,8 @@ pub struct MockMac {
     ieee_address: IeeeAddress,
     short_address: ShortAddress,
     pan_id: PanId,
+    coord_short_address: ShortAddress,
+    associated_pan_coord: bool,
     channel: u8,
     rx_on_when_idle: bool,
     association_permit: bool,
@@ -47,11 +49,15 @@ pub struct MockMac {
     scan_beacons: Vec<PanDescriptor, MAX_PAN_DESCRIPTORS>,
     scan_energy: Vec<EdValue, MAX_ED_VALUES>,
     associate_response: Option<MlmeAssociateConfirm>,
+    poll_queue: Vec<MacFrame, 8>,
 
     // Recorded calls for assertions
     tx_history: Vec<TxRecord, 16>,
     rx_queue: Vec<McpsDataIndication, 8>,
+    poll_count: u32,
+    poll_delay_us: u32,
     time_micros: u32,
+    rx_delay_us: u32,
     random_state: u32,
 }
 
@@ -60,6 +66,7 @@ pub struct MockMac {
 pub struct TxRecord {
     pub dst: MacAddress,
     pub payload_len: usize,
+    pub payload: MacFrame,
     pub handle: u8,
     pub ack_requested: bool,
 }
@@ -82,6 +89,8 @@ impl MockMac {
             ieee_address,
             short_address: ShortAddress(0xFFFF),
             pan_id: PanId(0xFFFF),
+            coord_short_address: ShortAddress(0xFFFF),
+            associated_pan_coord: false,
             channel: 11,
             rx_on_when_idle: false,
             association_permit: false,
@@ -93,9 +102,13 @@ impl MockMac {
             scan_beacons: Vec::new(),
             scan_energy: Vec::new(),
             associate_response: None,
+            poll_queue: Vec::new(),
             tx_history: Vec::new(),
             rx_queue: Vec::new(),
+            poll_count: 0,
+            poll_delay_us: 0,
             time_micros: 0,
+            rx_delay_us: 0,
             random_state: random_state.max(1),
         }
     }
@@ -122,6 +135,21 @@ impl MockMac {
         let _ = self.rx_queue.push(ind);
     }
 
+    /// Set the simulated delay before the next direct data indication.
+    pub fn set_rx_delay_us(&mut self, delay_us: u32) {
+        self.rx_delay_us = delay_us;
+    }
+
+    /// Enqueue a frame that will be returned by the next MLME-POLL.
+    pub fn enqueue_poll_response(&mut self, frame: MacFrame) {
+        let _ = self.poll_queue.push(frame);
+    }
+
+    /// Set the simulated delay before the next poll result.
+    pub fn set_poll_delay_us(&mut self, delay_us: u32) {
+        self.poll_delay_us = delay_us;
+    }
+
     // ── Test assertion methods ──────────────────────────────
 
     /// Get all transmitted frames for verification.
@@ -132,6 +160,11 @@ impl MockMac {
     /// Clear TX history.
     pub fn clear_tx_history(&mut self) {
         self.tx_history.clear();
+    }
+
+    /// Number of MLME-POLL requests issued.
+    pub fn poll_count(&self) -> u32 {
+        self.poll_count
     }
 }
 
@@ -208,12 +241,16 @@ impl MacDriver for MockMac {
     ) -> Result<MlmeAssociateConfirm, MacError> {
         self.channel = req.channel;
         self.pan_id = req.coord_address.pan_id();
+        if let MacAddress::Short(_, coordinator) = req.coord_address {
+            self.coord_short_address = coordinator;
+        }
 
         match &self.associate_response {
             Some(rsp) => {
                 let confirm = rsp.clone();
                 if confirm.status == AssociationStatus::Success {
                     self.short_address = confirm.short_address;
+                    self.associated_pan_coord = true;
                 }
                 Ok(confirm)
             }
@@ -232,6 +269,8 @@ impl MacDriver for MockMac {
     async fn mlme_disassociate(&mut self, _req: MlmeDisassociateRequest) -> Result<(), MacError> {
         self.short_address = ShortAddress(0xFFFF);
         self.pan_id = PanId(0xFFFF);
+        self.coord_short_address = ShortAddress(0xFFFF);
+        self.associated_pan_coord = false;
         Ok(())
     }
 
@@ -239,6 +278,8 @@ impl MacDriver for MockMac {
         if set_default_pib {
             self.short_address = ShortAddress(0xFFFF);
             self.pan_id = PanId(0xFFFF);
+            self.coord_short_address = ShortAddress(0xFFFF);
+            self.associated_pan_coord = false;
             self.channel = 11;
             self.rx_on_when_idle = false;
             self.association_permit = false;
@@ -260,6 +301,10 @@ impl MacDriver for MockMac {
             PibAttribute::MacShortAddress => Ok(PibValue::ShortAddress(self.short_address)),
             PibAttribute::MacPanId => Ok(PibValue::PanId(self.pan_id)),
             PibAttribute::MacExtendedAddress => Ok(PibValue::ExtendedAddress(self.ieee_address)),
+            PibAttribute::MacCoordShortAddress => {
+                Ok(PibValue::ShortAddress(self.coord_short_address))
+            }
+            PibAttribute::MacAssociatedPanCoord => Ok(PibValue::Bool(self.associated_pan_coord)),
             PibAttribute::MacRxOnWhenIdle => Ok(PibValue::Bool(self.rx_on_when_idle)),
             PibAttribute::MacAssociationPermit => Ok(PibValue::Bool(self.association_permit)),
             PibAttribute::MacAutoRequest => Ok(PibValue::Bool(self.auto_request)),
@@ -280,6 +325,13 @@ impl MacDriver for MockMac {
             }
             PibAttribute::MacPanId => {
                 self.pan_id = value.as_pan_id().ok_or(MacError::InvalidParameter)?;
+            }
+            PibAttribute::MacCoordShortAddress => {
+                self.coord_short_address =
+                    value.as_short_address().ok_or(MacError::InvalidParameter)?;
+            }
+            PibAttribute::MacAssociatedPanCoord => {
+                self.associated_pan_coord = value.as_bool().ok_or(MacError::InvalidParameter)?;
             }
             PibAttribute::MacRxOnWhenIdle => {
                 self.rx_on_when_idle = value.as_bool().ok_or(MacError::InvalidParameter)?;
@@ -312,14 +364,31 @@ impl MacDriver for MockMac {
     }
 
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
-        // Mock: return nothing (no pending indirect frames)
-        Ok(None)
+        self.poll_count = self.poll_count.wrapping_add(1);
+        if self.poll_queue.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(self.poll_queue.remove(0)))
+        }
+    }
+
+    async fn mlme_poll_timeout(&mut self, timeout_us: u32) -> Result<Option<MacFrame>, MacError> {
+        if self.poll_delay_us >= timeout_us {
+            self.poll_count = self.poll_count.wrapping_add(1);
+            self.time_micros = self.time_micros.wrapping_add(timeout_us);
+            return Ok(None);
+        }
+        self.time_micros = self.time_micros.wrapping_add(self.poll_delay_us);
+        self.poll_delay_us = 0;
+        self.mlme_poll().await
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
+        let payload = MacFrame::from_slice(req.payload).ok_or(MacError::FrameTooLong)?;
         let record = TxRecord {
             dst: req.dst_address,
             payload_len: req.payload.len(),
+            payload,
             handle: req.msdu_handle,
             ack_requested: req.tx_options.ack_tx,
         };
@@ -340,6 +409,19 @@ impl MacDriver for MockMac {
         }
         // Pop from front (swap_remove from index 0)
         Ok(self.rx_queue.swap_remove(0))
+    }
+
+    async fn mcps_data_indication_timeout(
+        &mut self,
+        timeout_us: u32,
+    ) -> Result<McpsDataIndication, MacError> {
+        if self.rx_delay_us >= timeout_us {
+            self.time_micros = self.time_micros.wrapping_add(timeout_us);
+            return Err(MacError::NoData);
+        }
+        self.time_micros = self.time_micros.wrapping_add(self.rx_delay_us);
+        self.rx_delay_us = 0;
+        self.mcps_data_indication().await
     }
 
     fn capabilities(&self) -> MacCapabilities {
