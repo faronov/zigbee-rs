@@ -238,6 +238,27 @@ mod imp {
                 .set_ack_filter(self.pan_id.0, self.short_address.0, self.extended_address);
         }
 
+        /// Quiesce the RF/DMA block before entering TLSR8258 retention sleep.
+        ///
+        /// Call only after the synchronous MAC operation in progress has
+        /// completed. Any frame retained from an ACK window is discarded
+        /// because its DMA contents are not valid after wake.
+        pub fn prepare_for_sleep(&mut self) {
+            self.pending_rx = None;
+            self.radio.prepare_for_sleep();
+        }
+
+        /// Restore the RF/DMA block after TLSR8258 retention wake.
+        ///
+        /// The PHY initialization resets the channel and hardware filters, so
+        /// reapply all PIB-backed radio state before the next MAC operation.
+        pub fn resume_after_sleep(&mut self) {
+            self.radio.init();
+            self.pending_association_response = None;
+            self.pending_rx = None;
+            self.apply_radio_config();
+        }
+
         fn channel(&self) -> u8 {
             self.phy_channel
         }

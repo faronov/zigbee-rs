@@ -47,6 +47,7 @@ lab = []
 diag-beacon = ["lab"]
 diag-assoc = ["lab"]
 diag-smoke = ["lab"]
+diag-pm = ["lab", "dep:tlsr8258-hal"]
 sensor = ["lab"]
 runtime-sensor = ["dep:tlsr8258-hal", "zigbee-mac/tlsr8258"]
 # EXPERIMENTAL router firmware: join + non-beacon relay only. Does not,

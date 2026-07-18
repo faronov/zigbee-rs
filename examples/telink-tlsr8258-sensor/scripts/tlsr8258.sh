@@ -36,9 +36,9 @@ declare -a CARGO_FEATURE_ARGS=()
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/tlsr8258.sh check [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
-  scripts/tlsr8258.sh build [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
-  scripts/tlsr8258.sh flash [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
+  scripts/tlsr8258.sh check [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon|diag-smoke|diag-pm]
+  scripts/tlsr8258.sh build [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon|diag-smoke|diag-pm]
+  scripts/tlsr8258.sh flash [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon|diag-smoke|diag-pm]
   scripts/tlsr8258.sh dump-boot [word-count]
   scripts/tlsr8258.sh dump-mode [word-count]
   scripts/tlsr8258.sh dump <address> [word-count]
@@ -50,10 +50,10 @@ Usage:
   scripts/tlsr8258.sh pgm-go
   scripts/tlsr8258.sh probe-list
   scripts/tlsr8258.sh probe-info
-  scripts/tlsr8258.sh probe-attach [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
-  scripts/tlsr8258.sh probe-list-rtt [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
-  scripts/tlsr8258.sh probe-debug [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
-  scripts/tlsr8258.sh probe-gdb [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon]
+  scripts/tlsr8258.sh probe-attach [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon|diag-smoke|diag-pm]
+  scripts/tlsr8258.sh probe-list-rtt [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon|diag-smoke|diag-pm]
+  scripts/tlsr8258.sh probe-debug [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon|diag-smoke|diag-pm]
+  scripts/tlsr8258.sh probe-gdb [sensor|runtime-sensor|runtime-router|diag-assoc|diag-beacon|diag-smoke|diag-pm]
 
 Environment overrides:
   TC32_TOOLCHAIN  Path to tc32-stage2 toolchain root
@@ -112,6 +112,11 @@ resolve_mode() {
             MODE_NAME="diag-smoke"
             BIN_NAME="telink-tlsr8258-lab"
             CARGO_FEATURE_ARGS=(--no-default-features --features diag-smoke)
+            ;;
+        diag-pm)
+            MODE_NAME="diag-pm"
+            BIN_NAME="telink-tlsr8258-lab"
+            CARGO_FEATURE_ARGS=(--no-default-features --features diag-pm)
             ;;
         *)
             echo "Unsupported mode: ${mode}" >&2
@@ -220,6 +225,12 @@ verify_layout() {
     if (( rf_dma_end > svc_bot )); then
         printf 'layout-check FAIL: .rf_dma ends at 0x%X past _svc_stack_bottom=0x%X\n' \
             "$rf_dma_end" "$svc_bot" >&2
+        exit 1
+    fi
+    if [[ "$MODE_NAME" == "diag-pm" ]] \
+        && (( svc_top > 0x848000 || irq_top > 0x848000 )); then
+        printf 'layout-check FAIL: LOW32K stacks exceed retention: SVC top=0x%X IRQ top=0x%X\n' \
+            "$svc_top" "$irq_top" >&2
         exit 1
     fi
     # The flash erase/program path must remain in RAM because executing flash

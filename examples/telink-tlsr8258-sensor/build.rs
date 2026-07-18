@@ -8,7 +8,10 @@ fn main() {
     let production_runtime = (std::env::var_os("CARGO_FEATURE_RUNTIME_SENSOR").is_some()
         || std::env::var_os("CARGO_FEATURE_RUNTIME_ROUTER").is_some())
         && std::env::var_os("CARGO_FEATURE_LAB").is_none();
-    let linker_script = if production_runtime {
+    let retention_diagnostic = std::env::var_os("CARGO_FEATURE_DIAG_PM").is_some();
+    let linker_script = if retention_diagnostic {
+        "memory-pm.x"
+    } else if production_runtime {
         "memory-runtime.x"
     } else {
         "memory.x"
@@ -19,6 +22,7 @@ fn main() {
         println!("cargo:rustc-link-search={}", out_dir.display());
     }
     println!("cargo:rerun-if-changed=memory.x");
+    println!("cargo:rerun-if-changed=memory-pm.x");
     println!("cargo:rerun-if-changed=memory-runtime.x");
 
     println!(

@@ -17,6 +17,7 @@
 
 #![no_std]
 #![no_main]
+#![cfg_attr(feature = "diag-pm", allow(dead_code, unused_assignments))]
 
 // The `sensor` and `runtime-sensor` builds are alternative top-level entry
 // points and share many `static mut` slots, so enabling both at once would
@@ -35,6 +36,15 @@ compile_error!(
 compile_error!(
     "feature `diag-smoke` is mutually exclusive with `sensor`/`runtime-sensor`; \
      build with `--no-default-features --features diag-smoke`"
+);
+
+#[cfg(all(
+    feature = "diag-pm",
+    any(feature = "sensor", feature = "runtime-sensor")
+))]
+compile_error!(
+    "feature `diag-pm` is mutually exclusive with `sensor`/`runtime-sensor`; \
+     build with `--no-default-features --features diag-pm`"
 );
 
 // Custom panic handler that records a panic-sentinel in SRAM so we can detect
@@ -61,13 +71,13 @@ fn panic_handler(_info: &core::panic::PanicInfo) -> ! {
 mod runtime_sensor;
 #[cfg(feature = "sensor")]
 use zigbee_aps::frames::{
-    ApsCommandId, ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader,
+    ApsCommandId, ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader
 };
 #[cfg(feature = "sensor")]
-use zigbee_aps::security::{
-    derive_key_load_key, derive_key_transport_key, derive_verify_key_hash, ApsKeyType,
+use zigbee_aps::security::{ ApsKeyType,
     ApsSecurity, ApsSecurityHeader, KEY_ID_DATA_KEY, KEY_ID_KEY_LOAD, KEY_ID_KEY_TRANSPORT,
-    SEC_LEVEL_ENC_MIC_32,
+    SEC_LEVEL_ENC_MIC_32, derive_key_load_key, derive_key_transport_key,
+    derive_verify_key_hash,
 };
 #[cfg(feature = "sensor")]
 use zigbee_aps::{PROFILE_ZDP, ZDO_ENDPOINT};
@@ -79,9 +89,9 @@ use zigbee_nwk::security::{NwkSecurity, NwkSecurityHeader};
 #[cfg(feature = "sensor")]
 use zigbee_types::{MacAddress, ShortAddress};
 #[cfg(feature = "sensor")]
-use zigbee_zdo::device_announce::DeviceAnnounce;
-#[cfg(feature = "sensor")]
 use zigbee_zdo::DEVICE_ANNCE;
+#[cfg(feature = "sensor")]
+use zigbee_zdo::device_announce::DeviceAnnounce;
 
 // Keep SWire markers above the stack. Runtime sensor statics occupy low SRAM,
 // so diagnostics must not be pinned into the middle of .bss.
@@ -330,6 +340,12 @@ core::arch::global_asm!(
     "ldr r0, =0x84F00C",
     "ldr r1, =0x57A70011",
     "str r1, [r0, #0]",
+    // Official 8258 startup checks analog 0x7e before C/Rust data
+    // initialization. A non-zero retention mode skips .data copy and .bss
+    // clear so the LOW32K state survives the wake reboot.
+    "tjl _is_retention_boot",
+    "cmp r0, #0",
+    "bne 4f",
 
     "ldr r0, =_sdata",
     "ldr r1, =_edata",
@@ -367,6 +383,20 @@ core::arch::global_asm!(
     "tjl _rust_entry",
 );
 
+#[unsafe(no_mangle)]
+extern "C" fn _is_retention_boot() -> u32 {
+    #[cfg(feature = "diag-pm")]
+    {
+        return u32::from(
+            tlsr8258_hal::mmio::analog_read(0x7e)
+                .map(|mode| mode != 0)
+                .unwrap_or(false),
+        );
+    }
+    #[cfg(not(feature = "diag-pm"))]
+    0
+}
+
 /// Rust entry point — called from the assembly startup after RAM init.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _rust_entry() -> ! {
@@ -378,13 +408,15 @@ pub unsafe extern "C" fn _rust_entry() -> ! {
 //
 // Direct MMIO based on Telink C SDK. No HAL dependency for boot.
 
-#[cfg(all(feature = "runtime-sensor", not(feature = "sensor")))]
+#[cfg(any(all(feature = "runtime-sensor", not(feature = "sensor")),
+    feature = "diag-pm"))]
 #[inline(never)]
 fn chip_init() {
     tlsr8258_hal::clocks::init();
 }
 
-#[cfg(not(all(feature = "runtime-sensor", not(feature = "sensor"))))]
+#[cfg(not(any(all(feature = "runtime-sensor", not(feature = "sensor")),
+    feature = "diag-pm")))]
 #[inline(never)]
 fn chip_init() {
     let pc_out = (REG_BASE + 0x593) as *mut u8;
@@ -569,7 +601,7 @@ fn mark_bytes_as_words(base: u32, data: &[u8]) {
         let b3 = data.get(idx + 3).copied().unwrap_or(0);
         mark32(
             base + idx as u32,
-            u32::from_le_bytes([b0, b1, b2, b3]),
+            u32::from_le_bytes([b0, b1, b2, b3])
         );
         idx += 4;
     }
@@ -884,7 +916,7 @@ fn rf_phy_init_zigbee() {
         core::ptr::write_volatile(0x800064 as *mut u8, 0xFF); // CLK_EN1
         // Store clock diag
         mark32(DBG_BOOT_BASE + 0x2C,
-            (clk2_before as u32) | ((clk2_after as u32) << 8));
+            (clk2_before as u32) | ((clk2_after as u32) << 8),);
 
         // tbl_rf_init — common RF PHY init (6 entries)
         reg8w(0x8012D2, 0x9B);
@@ -938,7 +970,7 @@ fn rf_phy_init_zigbee() {
         let r12d2 = core::ptr::read_volatile(0x8012D2 as *const u8);
         let r0460 = core::ptr::read_volatile(0x800460 as *const u8);
         mark32(DBG_BOOT_BASE + 0x30,
-            (r0400 as u32) | ((r1220 as u32) << 8) | ((r12d2 as u32) << 16) | ((r0460 as u32) << 24));
+            (r0400 as u32) | ((r1220 as u32) << 8) | ((r12d2 as u32) << 16) | ((r0460 as u32) << 24),);
         // Also test: write 0xAB to 0x800400, read back
         core::ptr::write_volatile(0x800400 as *mut u8, 0xAB);
         let test_rb = core::ptr::read_volatile(0x800400 as *const u8);
@@ -946,7 +978,7 @@ fn rf_phy_init_zigbee() {
         core::ptr::write_volatile((DBG_BOOT_BASE + 0x3C) as *mut u8, 0x55);
         let ram_rb = core::ptr::read_volatile((DBG_BOOT_BASE + 0x3C) as *const u8);
         mark32(DBG_BOOT_BASE + 0x34,
-            (test_rb as u32) | ((ram_rb as u32) << 8));
+            (test_rb as u32) | ((ram_rb as u32) << 8),);
         // Restore 0x800400 to correct value
         core::ptr::write_volatile(0x800400 as *mut u8, 0x13);
         // Mark PHY init complete
@@ -1144,7 +1176,7 @@ mod radio {
             core::ptr::write_volatile(REG_MODEM_CHN_L, modem_val as u8);
             let existing_h = core::ptr::read_volatile(REG_MODEM_CHN_H as *const u8);
             core::ptr::write_volatile(REG_MODEM_CHN_H,
-                (existing_h & 0xC0) | ((modem_val >> 8) as u8 & 0x3F));
+                (existing_h & 0xC0) | ((modem_val >> 8) as u8 & 0x3F),);
 
             // 4. Power band register (from disassembly, bits [5:2])
             let existing_band = core::ptr::read_volatile(REG_MODEM_BAND as *const u8);
@@ -1749,7 +1781,7 @@ impl Tlsr8258Mac {
             &dst,
             self.pan_id,
             self.short_address,
-            self.extended_address,
+            self.extended_address
         ) {
             unsafe {
                 let p = (DBG_JOIN_BASE + 0x18C) as *mut u32;
@@ -1842,7 +1874,7 @@ impl Tlsr8258Mac {
             // will drain it. If the queue is full we still count the miss.
             let mut buf: heapless::Vec<u8, MAX_MAC_FRAME_LEN> = heapless::Vec::new();
             if buf.extend_from_slice(&pkt.data[..pkt.len]).is_ok() {
-                match self.pending_rx.push_back(PendingPacket { data: buf, lqi: pkt.lqi }) {
+                match self.pending_rx.push_back(PendingPacket { data: buf, lqi: pkt.lqi, }) {
                     Ok(()) => unsafe {
                         let p = (DBG_MODE_BASE + 0x204) as *mut u32;
                         core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
@@ -1959,7 +1991,7 @@ impl Tlsr8258Mac {
             );
             core::ptr::write_volatile(
                 (DBG_MODE_BASE + 0x1E4) as *mut u32,
-                0xCAFE_BABE,
+                0xCAFE_BABE
             );
             let e = &self.extended_address;
             let lo = (e[0] as u32)
@@ -2203,7 +2235,7 @@ impl Tlsr8258Mac {
                 Err(_) => {
                     mark32(
                         DBG_MODE_BASE + 0x94,
-                        0xC50A5000 | (attempt as u32),
+                        0xC50A5000 | (attempt as u32)
                     );
                 }
             }
@@ -2283,11 +2315,11 @@ impl MacDriver for Tlsr8258Mac {
         mark32(DBG_MODE_BASE + 0x7C, coordinator_beacon_count);
         // Sticky cumulative counters across all scans during device lifetime.
         let prev_total = STICKY_TOTAL_PANS.load(Ordering::Relaxed);
-        STICKY_TOTAL_PANS.store(prev_total.wrapping_add(pan_descriptors.len() as u32), Ordering::Relaxed);
+        STICKY_TOTAL_PANS.store(prev_total.wrapping_add(pan_descriptors.len() as u32), Ordering::Relaxed,);
         let prev_permit = STICKY_PERMIT_PANS.load(Ordering::Relaxed);
-        STICKY_PERMIT_PANS.store(prev_permit.wrapping_add(permit_joining_count), Ordering::Relaxed);
-        mark32(DBG_MODE_BASE + 0x1C8, STICKY_PERMIT_PANS.load(Ordering::Relaxed));
-        mark32(DBG_MODE_BASE + 0x1CC, STICKY_TOTAL_PANS.load(Ordering::Relaxed));
+        STICKY_PERMIT_PANS.store(prev_permit.wrapping_add(permit_joining_count), Ordering::Relaxed,);
+        mark32(DBG_MODE_BASE + 0x1C8, STICKY_PERMIT_PANS.load(Ordering::Relaxed),);
+        mark32(DBG_MODE_BASE + 0x1CC, STICKY_TOTAL_PANS.load(Ordering::Relaxed),);
         if matches!(req.scan_type, ScanType::Active | ScanType::Passive) && pan_descriptors.is_empty() {
             mark32(DBG_MODE_BASE + 0x74, 0x5CA1F00D);
             Err(MacError::NoBeacon)
@@ -2444,7 +2476,7 @@ impl MacDriver for Tlsr8258Mac {
                 Ok(()) => {
                     dr_tx_bitmap |= 1u32 << poll_attempt;
                     mark32(DBG_JOIN_BASE + 0x34, dr_tx_bitmap); // +0x284
-                    mark32(DBG_MODE_BASE + 0x5C, 0xA55C0003 | ((poll_attempt as u32) << 8));
+                    mark32(DBG_MODE_BASE + 0x5C, 0xA55C0003 | ((poll_attempt as u32) << 8),);
                 }
                 Err(_) => {
                     mark32(DBG_JOIN_BASE + 0x34, dr_tx_bitmap);
@@ -2502,7 +2534,7 @@ impl MacDriver for Tlsr8258Mac {
         Err(MacError::NoAck)
     }
 
-    async fn mlme_associate_response(&mut self, _rsp: MlmeAssociateResponse) -> Result<(), MacError> {
+    async fn mlme_associate_response(&mut self, _rsp: MlmeAssociateResponse,) -> Result<(), MacError> {
         Err(MacError::Unsupported)
     }
 
@@ -2563,7 +2595,7 @@ impl MacDriver for Tlsr8258Mac {
         Ok(())
     }
 
-    async fn mlme_get(&self, attr: zigbee_mac::PibAttribute) -> Result<zigbee_mac::PibValue, MacError> {
+    async fn mlme_get(&self, attr: zigbee_mac::PibAttribute,) -> Result<zigbee_mac::PibValue, MacError> {
         use zigbee_mac::PibAttribute::*;
         use zigbee_mac::PibValue;
 
@@ -2593,7 +2625,7 @@ impl MacDriver for Tlsr8258Mac {
         }
     }
 
-    async fn mlme_set(&mut self, attr: zigbee_mac::PibAttribute, val: zigbee_mac::PibValue) -> Result<(), MacError> {
+    async fn mlme_set(&mut self, attr: zigbee_mac::PibAttribute, val: zigbee_mac::PibValue,) -> Result<(), MacError> {
         // Diag: count mlme_set calls (BDB calls this many times during steering)
         unsafe {
             let p = (DBG_JOIN_BASE + 0xC4) as *mut u32;
@@ -2613,7 +2645,8 @@ impl MacDriver for Tlsr8258Mac {
             }
             (MacExtendedAddress, PibValue::ExtendedAddress(v)) => self.extended_address = v,
             (MacCoordShortAddress, PibValue::ShortAddress(v)) => self.coord_short_address = v,
-            (MacCoordExtendedAddress, PibValue::ExtendedAddress(v)) => self.coord_extended_address = v,
+            (MacCoordExtendedAddress, PibValue::ExtendedAddress(v)) => { self.coord_extended_address = v
+            }
             (MacRxOnWhenIdle, PibValue::Bool(v)) => self.rx_on_when_idle = v,
             (MacAssociationPermit, PibValue::Bool(v)) => self.association_permit = v,
             (MacAutoRequest, PibValue::Bool(v)) => self.auto_request = v,
@@ -2863,10 +2896,10 @@ impl MacDriver for Tlsr8258Mac {
             let none_p = (DBG_JOIN_BASE + 0x64) as *mut u32;
             core::ptr::write_volatile(
                 none_p,
-                core::ptr::read_volatile(none_p).wrapping_add(1),
+                core::ptr::read_volatile(none_p).wrapping_add(1)
             );
             // Last-poll-stats: filtered_out count
-            mark32(DBG_JOIN_BASE + 0xA8, (frames_in_loop << 16) | (filtered_out & 0xFFFF));
+            mark32(DBG_JOIN_BASE + 0xA8, (frames_in_loop << 16) | (filtered_out & 0xFFFF),);
         }
         Ok(None)
     }
@@ -2880,7 +2913,10 @@ impl MacDriver for Tlsr8258Mac {
             let dst_lo: u32 = match &req.dst_address {
                 zigbee_types::MacAddress::Short(_, s) => s.0 as u32,
                 zigbee_types::MacAddress::Extended(_, e) => {
-                    (e[0] as u32) | ((e[1] as u32) << 8) | ((e[2] as u32) << 16) | ((e[3] as u32) << 24)
+                    (e[0] as u32)
+                        | ((e[1] as u32) << 8)
+                        | ((e[2] as u32) << 16)
+                        | ((e[3] as u32) << 24)
                 }
             };
             mark32(DBG_JOIN_BASE + 0xB4, dst_lo);
@@ -2889,7 +2925,10 @@ impl MacDriver for Tlsr8258Mac {
             let p1 = req.payload.get(1).copied().unwrap_or(0) as u32;
             let p2 = req.payload.get(2).copied().unwrap_or(0) as u32;
             let p3 = req.payload.get(3).copied().unwrap_or(0) as u32;
-            mark32(DBG_JOIN_BASE + 0xB8, p0 | (p1 << 8) | (p2 << 16) | (p3 << 24));
+            mark32(
+                DBG_JOIN_BASE + 0xB8,
+                p0 | (p1 << 8) | (p2 << 16) | (p3 << 24),
+            );
         }
         let frame = self.build_data_frame(&req.dst_address, req.payload, req.tx_options.ack_tx)?;
         self.csma_transmit(&frame, req.tx_options.ack_tx)?;
@@ -3038,7 +3077,7 @@ impl MacDriver for Tlsr8258Mac {
                     if nwk_sec == 0 {
                         unsafe {
                             let p = (DBG_BDB_BASE + 0xD8) as *mut u32;
-                            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+                            core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1),);
                         }
                     }
                 }
@@ -3311,7 +3350,7 @@ fn handle_rf_rx_irq() {
                 frame_len,
                 pan_id,
                 short_address,
-                ext_addr,
+                ext_addr
             ) {
                 transmit_mac_ack(seq, false, rx_buf);
             }
@@ -3777,7 +3816,7 @@ fn parse_dest_address(data: &[u8], fc: u16) -> Option<zigbee_types::MacAddress> 
         0x03 if data.len() >= addr_offset + 8 => {
             let mut ext = [0u8; 8];
             ext.copy_from_slice(&data[addr_offset..addr_offset + 8]);
-            Some(zigbee_types::MacAddress::Extended(zigbee_types::PanId(pan), ext))
+            Some(zigbee_types::MacAddress::Extended(zigbee_types::PanId(pan), ext,))
         }
         _ => None,
     }
@@ -3881,7 +3920,7 @@ mod executor {
             |p| RawWaker::new(p, &VTABLE),
             |_| {},
             |_| {},
-            |_| {},
+            |_| {}
         );
         unsafe { Waker::new(core::ptr::null(), &VTABLE) }
     }
@@ -4800,7 +4839,7 @@ async fn send_device_annce(
         let sec_len = sec_hdr.serialize(&mut payload[nwk_len..]);
         let aad_len = nwk_len + sec_len;
         let Some(encrypted) =
-            nwk_security.encrypt(&payload[..aad_len], &aps_plain[..aps_total], &key_entry.key, &sec_hdr)
+            nwk_security.encrypt(&payload[..aad_len], &aps_plain[..aps_total], &key_entry.key, &sec_hdr,)
         else {
             return Err(MacError::SecurityError);
         };
@@ -5003,7 +5042,7 @@ fn send_zdo_response_raw(
         let sec_len = sec_hdr.serialize(&mut payload[nwk_len..]);
         let aad_len = nwk_len + sec_len;
         let Some(encrypted) =
-            nwk_security.encrypt(&payload[..aad_len], &aps_plain[..aps_total], &key_entry.key, &sec_hdr)
+            nwk_security.encrypt(&payload[..aad_len], &aps_plain[..aps_total], &key_entry.key, &sec_hdr,)
         else {
             mark32(DBG_MODE_BASE + 0x94, 0x5A50FF02);
             return Err(MacError::SecurityError);
@@ -5113,7 +5152,7 @@ fn send_aps_ack_raw(
         let sec_len = sec_hdr.serialize(&mut payload[nwk_len..]);
         let aad_len = nwk_len + sec_len;
         let Some(encrypted) =
-            nwk_security.encrypt(&payload[..aad_len], &aps_plain[..aps_total], &key_entry.key, &sec_hdr)
+            nwk_security.encrypt(&payload[..aad_len], &aps_plain[..aps_total], &key_entry.key, &sec_hdr,)
         else {
             return Err(MacError::SecurityError);
         };
@@ -5290,7 +5329,7 @@ fn build_zdo_response(
             push_le16(
                 out,
                 &mut off,
-                SENSOR_STACK_COMPLIANCE_REVISION << 9,
+                SENSOR_STACK_COMPLIANCE_REVISION << 9
             )?; // Server mask: stack compliance revision.
             push_le16(out, &mut off, 127)?; // Max outgoing transfer.
             push_u8(out, &mut off, 0x00)?; // Descriptor capabilities.
@@ -5567,7 +5606,7 @@ fn bump_nwk_counter(mac: &Tlsr8258Mac, nwk_security: &NwkSecurity, nwk_frame_cou
     if nwk_frame_counter.wrapping_sub(last) < SENSOR_NWK_COUNTER_PERSIST_INTERVAL {
         return;
     }
-    let Some(key_entry) = nwk_security.active_key() else { return };
+    let Some(key_entry) = nwk_security.active_key() else { return; };
     persist_network_state(
         &key_entry.key,
         key_entry.seq_number,
@@ -5585,7 +5624,7 @@ fn persist_network_state(
     key: &[u8; 16],
     key_seq: u8,
     next_frame_counter: u32,
-    pan: PanIdentity,
+    pan: PanIdentity
 ) {
     let mut record = [0xFFu8; SENSOR_NV_RECORD_LEN];
     record[0..4].copy_from_slice(&SENSOR_NV_MAGIC.to_le_bytes());
@@ -5647,7 +5686,7 @@ fn load_persisted_network_state(nwk_security: &mut NwkSecurity) -> Option<Loaded
             PanIdentity::NONE,
         );
         mark32(DBG_MODE_BASE + 0xB8, 0xA75C1200 | key_seq as u32);
-        return Some(LoadedNvState { frame_counter: next_frame_counter, pan: None });
+        return Some(LoadedNvState { frame_counter: next_frame_counter, pan: None, });
     }
 
     // v2: 26 B payload + checksum at [26]. Counter, no PAN identity.
@@ -5670,7 +5709,7 @@ fn load_persisted_network_state(nwk_security: &mut NwkSecurity) -> Option<Loaded
             PanIdentity::NONE,
         );
         mark32(DBG_MODE_BASE + 0xB8, 0xA75C0200 | key_seq as u32);
-        return Some(LoadedNvState { frame_counter: next_frame_counter, pan: None });
+        return Some(LoadedNvState { frame_counter: next_frame_counter, pan: None, });
     }
 
     // v3: 62 B payload + checksum at [62].
@@ -5695,7 +5734,7 @@ fn load_persisted_network_state(nwk_security: &mut NwkSecurity) -> Option<Loaded
     let mut ext_pan_id = [0u8; 8];
     ext_pan_id.copy_from_slice(&record[32..40]);
     let channel = record[40];
-    let pan = PanIdentity { pan_id, short_address, parent_short_address, ext_pan_id, channel };
+    let pan = PanIdentity { pan_id, short_address, parent_short_address, ext_pan_id, channel, };
     nwk_security.set_network_key(key, key_seq);
 
     persist_network_state(
@@ -5705,7 +5744,7 @@ fn load_persisted_network_state(nwk_security: &mut NwkSecurity) -> Option<Loaded
         pan,
     );
     mark32(DBG_MODE_BASE + 0xB8, 0xA75C0300 | key_seq as u32);
-    Some(LoadedNvState { frame_counter: next_frame_counter, pan: Some(pan) })
+    Some(LoadedNvState { frame_counter: next_frame_counter, pan: Some(pan), })
 }
 
 #[cfg(feature = "sensor")]
@@ -5714,7 +5753,7 @@ fn persist_network_key(
     key: &[u8; 16],
     key_seq: u8,
     next_frame_counter: u32,
-    pan: PanIdentity,
+    pan: PanIdentity
 ) {
     persist_network_state(
         key,
@@ -5733,7 +5772,7 @@ fn install_transport_key(
     nwk_frame_counter: &mut u32,
 ) -> bool {
     if cmd_payload.len() < 17 {
-        mark32(DBG_MODE_BASE + 0xB8, 0xA75CFF10 | ((cmd_payload.len() as u32) << 16));
+        mark32(DBG_MODE_BASE + 0xB8, 0xA75CFF10 | ((cmd_payload.len() as u32) << 16),);
         return false;
     }
 
@@ -5750,7 +5789,7 @@ fn install_transport_key(
     if *nwk_frame_counter < SENSOR_NWK_COUNTER_RESERVE {
         *nwk_frame_counter = SENSOR_NWK_COUNTER_RESERVE;
     }
-    persist_network_key(&key, key_seq, *nwk_frame_counter, PanIdentity::from_mac(mac));
+    persist_network_key(&key, key_seq, *nwk_frame_counter, PanIdentity::from_mac(mac),);
     mark32(DBG_MODE_BASE + 0xB8, 0xA75C0100 | key_seq as u32);
     true
 }
@@ -5858,7 +5897,7 @@ fn handle_sensor_frame(
             mark32(DBG_MODE_BASE + 0x6C, 0x53E5C001);
         } else {
             let Some(plain) =
-                decrypt_initial_nwk_payload(nwk_security, aps_security, data, nwk_len, sec_len, &sec_hdr)
+                decrypt_initial_nwk_payload(nwk_security, aps_security, data, nwk_len, sec_len, &sec_hdr,)
             else {
                 mark32(DBG_MODE_BASE + 0x6C, 0x53E5AA05);
                 return false;
@@ -5958,8 +5997,8 @@ fn handle_sensor_frame(
             &aps_header,
             nwk_seq,
         ) {
-            Ok(()) => mark32(DBG_MODE_BASE + 0x98, 0xA9000000 | aps_header.aps_counter as u32),
-            Err(_) => mark32(DBG_MODE_BASE + 0x98, 0xA9FF0000 | aps_header.aps_counter as u32),
+            Ok(()) => mark32(DBG_MODE_BASE + 0x98, 0xA9000000 | aps_header.aps_counter as u32,),
+            Err(_) => mark32(DBG_MODE_BASE + 0x98, 0xA9FF0000 | aps_header.aps_counter as u32,),
         }
     }
 
@@ -6756,7 +6795,7 @@ fn runtime_sensor_main() -> ! {
                 board::LED_GREEN.write(true);
                 board::LED_BLUE.write(true);
                 mark32(DBG_MODE_BASE + 0x30, 0x5254C000);
-                mark32(DBG_MODE_BASE + 0x34, short_address as u32 | ((pan_id as u32) << 16));
+                mark32(DBG_MODE_BASE + 0x34, short_address as u32 | ((pan_id as u32) << 16),);
                 mark32(DBG_MODE_BASE + 0x38, channel as u32);
                 if first_tick { mark32(DBG_MODE_BASE + 0x9C, 0xF1559000); }
             }
@@ -6769,7 +6808,7 @@ fn runtime_sensor_main() -> ! {
                     if success { 0x5254C001 } else { 0x5254FFFF },
                 );
                 if first_tick {
-                    mark32(DBG_MODE_BASE + 0x9C, if success { 0xF155CC01 } else { 0xF155FFFF });
+                    mark32(DBG_MODE_BASE + 0x9C, if success { 0xF155CC01 } else { 0xF155FFFF },);
                 }
             }
             TickResult::Event(_) => {
@@ -6798,7 +6837,7 @@ fn runtime_sensor_main() -> ! {
                         mark32(DBG_MODE_BASE + 0x40, 0x52540030);
                         mark32(DBG_MODE_BASE + 0x44, ind.payload.len() as u32);
                         let _ = executor::block_on(
-                            device.process_incoming(&ind, &mut clusters),
+                            device.process_incoming(&ind, &mut clusters)
                         );
                         mark32(DBG_MODE_BASE + 0x40, 0x52540031);
                     }
@@ -6843,9 +6882,11 @@ fn main_loop() -> ! {
         not(feature = "runtime-sensor"),
         not(feature = "diag-assoc"),
         not(feature = "diag-smoke"),
+        not(feature = "diag-pm"),
     ))]
     let rx_buf = core::ptr::addr_of_mut!(RF_RX_BUF) as *mut u8;
-    #[cfg(not(all(feature = "runtime-sensor", not(feature = "sensor"))))]
+    #[cfg(all(not(all(feature = "runtime-sensor", not(feature = "sensor"))),
+        not(feature = "diag-pm"),))]
     radio::set_rx_dma_config(144);
 
     board::LED_RED.write(true);
@@ -6893,6 +6934,14 @@ fn main_loop() -> ! {
     #[cfg(all(
         not(feature = "sensor"),
         not(feature = "runtime-sensor"),
+        feature = "diag-pm",
+    ))]
+    diag_pm_main();
+
+    #[cfg(all(
+        not(feature = "sensor"),
+        not(feature = "runtime-sensor"),
+        not(feature = "diag-pm"),
         feature = "diag-smoke",
     ))]
     diag_smoke_main();
@@ -6900,6 +6949,7 @@ fn main_loop() -> ! {
     #[cfg(all(
         not(feature = "sensor"),
         not(feature = "runtime-sensor"),
+        not(feature = "diag-pm"),
         not(feature = "diag-smoke"),
         feature = "diag-assoc",
     ))]
@@ -6908,13 +6958,250 @@ fn main_loop() -> ! {
     #[cfg(all(
         not(feature = "sensor"),
         not(feature = "runtime-sensor"),
+        not(feature = "diag-pm"),
         not(feature = "diag-smoke"),
         not(feature = "diag-assoc"),
     ))]
     executor::block_on(diag_beacon_main(rx_buf));
 
-    #[cfg(all(not(feature = "sensor"), not(feature = "runtime-sensor")))]
+    #[cfg(all(not(feature = "sensor"), not(feature = "runtime-sensor"),
+        not(feature = "diag-pm"),))]
     loop {}
+}
+
+// ─── Timer-suspend hardware harness ────────────────────────────────────────
+
+#[cfg(feature = "diag-pm")]
+static mut PM_CANARY: u32 = 0;
+
+#[cfg(feature = "diag-pm")]
+static mut PM_CYCLE: u32 = 0;
+
+#[cfg(feature = "diag-pm")]
+const PM_LOG_SECTOR: u32 = 0x0007_3000;
+
+#[cfg(feature = "diag-pm")]
+fn diag_pm_voltage_guard() -> tlsr8258_hal::flash::VoltageReading {
+    // Dedicated USB-powered lab board. Production firmware uses a real ADC
+    // guard; this diagnostic records PM progress only on stable bench power.
+    tlsr8258_hal::flash::VoltageReading::Measured(3_300, 0)
+}
+
+#[cfg(feature = "diag-pm")]
+fn diag_pm_log(offset: u32, tag: u32, value0: u32, value1: u32) -> bool {
+    let mut record = [0xFFu8; 16];
+    record[0..4].copy_from_slice(&tag.to_le_bytes());
+    record[4..8].copy_from_slice(&value0.to_le_bytes());
+    record[8..12].copy_from_slice(&value1.to_le_bytes());
+    record[12..16].copy_from_slice(&0xA55A_C33Cu32.to_le_bytes());
+    tlsr8258_hal::flash::program(PM_LOG_SECTOR + offset, &record).is_ok()
+}
+
+#[cfg(feature = "diag-pm")]
+fn diag_pm_fail(code: u32) -> ! {
+    const PM_BASE: u32 = DBG_MODE_BASE + 0x80;
+    let _ = diag_pm_log(0x0F0, 0x504D_DEAD, code, 0);
+    let _ = tlsr8258_hal::mmio::analog_write(
+        tlsr8258_hal::pm::DEEP_ANA_REG0,
+        0xE0 | (code as u8 & 0x1F),
+    );
+    let _ = tlsr8258_hal::mmio::analog_write(
+        tlsr8258_hal::pm::DEEP_ANA_REG1,
+        (code >> 8) as u8,
+    );
+    mark32(PM_BASE + 0x00, 0x504D_DEAD);
+    mark32(PM_BASE + 0x04, code);
+    board::LED_GREEN.write(false);
+    board::LED_BLUE.write(false);
+    board::LED_RED.write(true);
+    loop {
+        unsafe { core::arch::asm!("nop") };
+    }
+}
+
+#[cfg(feature = "diag-pm")]
+fn diag_pm_error_code(error: tlsr8258_hal::pm::PmError) -> u32 {
+    use tlsr8258_hal::pm::PmError;
+
+    match error {
+        PmError::ZeroDuration => 0x01,
+        PmError::TooShort => 0x02,
+        PmError::TooLong => 0x03,
+        PmError::CalibrationNotReady => 0x04,
+        PmError::AnalogTimeout => 0x05,
+        PmError::TickHandshakeTimeout => 0x06,
+        PmError::SystemClockNotStable => 0x07,
+        PmError::WakeTickTimeout => 0x08,
+        PmError::SystemTimerNotRunning => 0x09,
+        PmError::RetentionReturned => 0x0A,
+    }
+}
+
+#[cfg(feature = "diag-pm")]
+fn diag_pm_record_wake(cycle: u32, status: u8, entered: bool) {
+    const PM_BASE: u32 = DBG_MODE_BASE + 0x80;
+
+    let retained = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PM_CANARY)) };
+    let expected = 0xC0DE_0000 ^ cycle;
+    let post_offset = 0x20 + (cycle - 1) * 0x20;
+
+    mark32(PM_BASE + 0x00, 0x504D_2000);
+    mark32(PM_BASE + 0x08, cycle);
+    mark32(PM_BASE + 0x1C, u32::from(status));
+    mark32(PM_BASE + 0x20, retained);
+    if !diag_pm_log(
+        post_offset,
+        0x504D_2000 | cycle,
+        retained,
+        u32::from(status),
+    ) {
+        diag_pm_fail(0x305);
+    }
+    if retained != expected {
+        diag_pm_fail(0x300);
+    }
+    if !entered {
+        diag_pm_fail(0x301);
+    }
+    if status & tlsr8258_hal::pm::WAKEUP_STATUS_TIMER == 0 {
+        diag_pm_fail(0x302 | (u32::from(status) << 8));
+    }
+    if tlsr8258_hal::pm::write_retention(
+        tlsr8258_hal::pm::RetentionRegister::Reg7,
+        status,
+    )
+    .is_err()
+    {
+        diag_pm_fail(0x303);
+    }
+}
+
+#[cfg(feature = "diag-pm")]
+fn diag_pm_main() -> ! {
+    use tlsr8258_hal::mmio::{REG_BASE, r32};
+    use tlsr8258_hal::pm::{self, RetentionRegister};
+
+    const PM_BASE: u32 = DBG_MODE_BASE + 0x80;
+    const REG_SYSTEM_TICK: u32 = REG_BASE + 0x740;
+    const ONE_SECOND_TICKS: u32 = 16_000_000;
+    const TEST_CYCLES: u32 = 4;
+
+    tlsr8258_hal::flash::set_voltage_guard(diag_pm_voltage_guard);
+    let retention_boot = tlsr8258_hal::mmio::analog_read(0x7e)
+        .map(|mode| mode != 0)
+        .unwrap_or(false);
+
+    if retention_boot {
+        let cycle = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PM_CYCLE)) };
+        if cycle == 0 || cycle > TEST_CYCLES {
+            diag_pm_fail(0x071);
+        }
+        let status = tlsr8258_hal::mmio::analog_read(0x44).unwrap_or_else(|_| diag_pm_fail(0x072));
+        diag_pm_record_wake(cycle, status, true);
+        if cycle >= TEST_CYCLES {
+            let _ = diag_pm_log(0x090, 0x504D_600D, cycle, 0);
+            mark32(PM_BASE + 0x00, 0x504D_600D);
+            board::LED_BLUE.write(true);
+            loop {
+                unsafe { core::arch::asm!("nop") };
+            }
+        }
+    } else {
+        mark32(PM_BASE + 0x00, 0x504D_0002);
+        if tlsr8258_hal::flash::erase_sector(PM_LOG_SECTOR).is_err()
+            || !diag_pm_log(0, 0x504D_0002, 0, 0)
+        {
+            diag_pm_fail(0x070);
+        }
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(PM_CYCLE), 0);
+        }
+    }
+
+    if let Err(error) = pm::system_timer_init() {
+        diag_pm_fail(0x080 | diag_pm_error_code(error));
+    }
+    if pm::rc_32k_init_and_cal().is_err() {
+        diag_pm_fail(0x100);
+    }
+    if tlsr8258_hal::mmio::analog_write(pm::DEEP_ANA_REG0, 0x10).is_err()
+        || tlsr8258_hal::mmio::analog_write(pm::DEEP_ANA_REG1, 0).is_err()
+    {
+        diag_pm_fail(0x102);
+    }
+    mark32(PM_BASE + 0x00, 0x504D_0002);
+
+    board::LED_RED.write(false);
+    board::LED_GREEN.write(true);
+    board::LED_BLUE.write(false);
+
+    loop {
+        let cycle = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!(PM_CYCLE)).wrapping_add(1)
+        };
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(PM_CYCLE), cycle);
+        }
+        let canary = 0xC0DE_0000 ^ cycle;
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(PM_CANARY), canary);
+        }
+        if pm::write_retention(RetentionRegister::Reg6, cycle as u8).is_err() {
+            diag_pm_fail(0x101);
+        }
+        if tlsr8258_hal::mmio::analog_write(
+            pm::DEEP_ANA_REG0,
+            0x80 | (cycle as u8 & 0x3F),
+        )
+        .is_err()
+        {
+            diag_pm_fail(0x103);
+        }
+
+        let before = unsafe { r32(REG_SYSTEM_TICK) };
+        let wakeup_tick = before.wrapping_add(ONE_SECOND_TICKS);
+        let pre_offset = 0x10 + (cycle - 1) * 0x20;
+        if !diag_pm_log(pre_offset, 0x504D_1000 | cycle, before, wakeup_tick) {
+            diag_pm_fail(0x104);
+        }
+        if cycle == 1 {
+            let calib = unsafe { r32(REG_BASE + 0x750) };
+            let tick_32k = match (
+                tlsr8258_hal::mmio::analog_read(0x43),
+                tlsr8258_hal::mmio::analog_read(0x42),
+                tlsr8258_hal::mmio::analog_read(0x41),
+                tlsr8258_hal::mmio::analog_read(0x40),
+            ) {
+                (Ok(b3), Ok(b2), Ok(b1), Ok(b0)) => {
+                    (u32::from(b3) << 24)
+                        | (u32::from(b2) << 16)
+                        | (u32::from(b1) << 8)
+                        | u32::from(b0)
+                }
+                _ => diag_pm_fail(0x105),
+            };
+            let target_32k = pm::calc::target_32k_short(
+                pm::calc::adjusted_wake_tick(wakeup_tick),
+                before.wrapping_add(pm::calc::TICK_SETUP_OFFSET),
+                calib as u16,
+                tick_32k,
+            )
+            .unwrap_or_else(|| diag_pm_fail(0x106));
+            if !diag_pm_log(0x0A0, 0x504D_3001, calib, tick_32k)
+                || !diag_pm_log(0x0B0, 0x504D_3002, target_32k, 0)
+            {
+                diag_pm_fail(0x107);
+            }
+        }
+        mark32(PM_BASE + 0x08, cycle);
+        mark32(PM_BASE + 0x0C, before);
+        mark32(PM_BASE + 0x10, wakeup_tick);
+        mark32(PM_BASE + 0x00, 0x504D_1000);
+
+        match pm::cpu_sleep_timer_rc(wakeup_tick) {
+            Ok(never) => match never {},
+            Err(error) => diag_pm_fail(0x200 | diag_pm_error_code(error)),
+        }}
 }
 
 // ─── Hardware smoke harness ─────────────────────────────────────────────────

@@ -165,6 +165,15 @@ impl Radio {
         hw::init();
     }
 
+    /// Quiesce the RF block before the MCU enters a retention sleep mode.
+    ///
+    /// Retention wake does not preserve the RF/DMA register state. Call
+    /// [`Radio::init`] after wake before using the radio again.
+    #[cfg(target_arch = "tc32")]
+    pub fn prepare_for_sleep(&mut self) {
+        hw::prepare_for_sleep();
+    }
+
     #[cfg(target_arch = "tc32")]
     pub fn set_channel(&mut self, channel: u8) {
         hw::set_channel(channel);
@@ -321,6 +330,12 @@ mod hw {
         set_active_rx_index(0);
         let rx_ptr = active_rx_ptr();
         phy::init(rx_ptr);
+    }
+
+    pub fn prepare_for_sleep() {
+        phy::set_trx_off();
+        phy::clear_irq_mask();
+        phy::clear_irq_status();
     }
 
     pub fn set_channel(channel: u8) {
