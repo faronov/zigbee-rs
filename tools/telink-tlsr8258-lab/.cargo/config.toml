@@ -1,0 +1,12 @@
+[build]
+target = "tc32-unknown-none-elf"
+
+[target.tc32-unknown-none-elf]
+rustflags = ["-C", "llvm-args=-enable-tail-merge=false"]
+
+[unstable]
+build-std = ["core"]
+build-std-features = ["compiler-builtins-mem"]
+
+[env]
+DEFMT_LOG = "info"

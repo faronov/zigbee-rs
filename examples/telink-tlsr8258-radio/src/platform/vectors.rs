@@ -1,5 +1,5 @@
 //! Boot vector table, banked-SP/IRQ setup, and `.data`/`.bss` startup init —
-//! transcribed from `examples/telink-tlsr8258-sensor/src/main.rs`'s
+//! transcribed from `tools/telink-tlsr8258-lab/src/main.rs`'s
 //! `global_asm!` blocks (proven on hardware, tc32-45, `diag-beacon`).
 //!
 //! Only compiled for the real `tc32-unknown-none-elf` target (see

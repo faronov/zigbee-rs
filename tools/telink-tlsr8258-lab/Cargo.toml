@@ -1,0 +1,38 @@
+[package]
+name = "telink-tlsr8258-lab"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+autobins = false
+
+[[bin]]
+name = "telink-tlsr8258-lab"
+path = "src/main.rs"
+required-features = ["lab"]
+
+[dependencies]
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-mac = { path = "../../zigbee-mac" }
+tlsr8258-hal = { path = "../../tlsr8258-hal", optional = true }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-zcl = { path = "../../zigbee-zcl" }
+zigbee-zdo = { path = "../../zigbee-zdo" }
+zigbee-bdb = { path = "../../zigbee-bdb" }
+zigbee-runtime = { path = "../../zigbee-runtime" }
+log = "0.4"
+heapless = "0.9"
+
+[features]
+default = ["diag-beacon"]
+lab = []
+diag-beacon = ["lab"]
+diag-assoc = ["lab"]
+diag-smoke = ["lab"]
+diag-pm = ["lab", "dep:tlsr8258-hal"]
+sensor = ["lab"]
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1

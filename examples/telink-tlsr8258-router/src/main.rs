@@ -5,10 +5,9 @@
 #![no_std]
 #![no_main]
 
+mod app;
 mod board;
-mod executor;
-mod runtime_router;
-mod security_identity;
+mod flash_nv;
 
 use tlsr8258_rt as _;
 
@@ -27,5 +26,5 @@ pub extern "C" fn irq_handler() {}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _rust_entry() -> ! {
     tlsr8258_hal::clocks::init();
-    runtime_router::run();
+    app::run();
 }

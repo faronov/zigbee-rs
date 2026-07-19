@@ -111,25 +111,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
-name = "telink-tlsr8258-sensor"
+name = "telink-tlsr8258-lab"
 version = "0.1.0"
 dependencies = [
+ "heapless",
+ "log",
  "tlsr8258-hal",
- "tlsr8258-rt",
  "zigbee-aps",
+ "zigbee-bdb",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zcl",
+ "zigbee-zdo",
 ]
 
 [[package]]
 name = "tlsr8258-hal"
-version = "0.1.0"
-
-[[package]]
-name = "tlsr8258-rt"
 version = "0.1.0"
 
 [[package]]
@@ -185,7 +184,6 @@ version = "0.1.0"
 dependencies = [
  "heapless",
  "log",
- "tlsr8258-hal",
  "zigbee-types",
 ]
 

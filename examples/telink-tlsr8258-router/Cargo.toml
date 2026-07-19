@@ -1,5 +1,5 @@
 [package]
-name = "telink-tlsr8258-sensor"
+name = "telink-tlsr8258-router"
 version = "0.1.0"
 edition = "2024"
 build = "build.rs"
@@ -10,7 +10,7 @@ zigbee-mac = { path = "../../zigbee-mac", features = ["tlsr8258"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee-runtime = { path = "../../zigbee-runtime", features = ["router"] }
 tlsr8258-hal = { path = "../../tlsr8258-hal" }
 tlsr8258-rt = { path = "../../tlsr8258-rt" }
 

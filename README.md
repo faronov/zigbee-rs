@@ -99,9 +99,8 @@ probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-
 ### Telink TLSR8258 router — EXPERIMENTAL, join/relay only
 
 ```bash
-cd examples/telink-tlsr8258-sensor
-./scripts/tlsr8258.sh build runtime-router
-./scripts/tlsr8258.sh flash runtime-router
+./scripts/tlsr8258.sh build router
+./scripts/tlsr8258.sh flash router
 ```
 
 > **Router mode (Telink)** — joins with the router capability bit and relays
@@ -109,7 +108,7 @@ cd examples/telink-tlsr8258-sensor
 > confirms ZHA join, interview, Identify, and reset/resume. This backend does
 > **not** accept child joins: no `MLME-ASSOCIATE.response`, no beacons, no
 > permit-joining, no indirect frame queue. See
-> `examples/telink-tlsr8258-sensor/README.md` ("Router firmware") for the full
+> `examples/telink-tlsr8258-router/README.md` for the full
 > capability boundary.
 
 > **Flash NV storage** — network state is saved to internal flash (last 8 KB) and automatically
@@ -158,12 +157,14 @@ the firmware build matrix.
 ### Telink TLSR8258 firmware (pure Rust — no vendor SDK!)
 
 ```bash
-cd examples/telink-tlsr8258-sensor
-./scripts/tlsr8258.sh build runtime-sensor
+./scripts/tlsr8258.sh build sensor
+./scripts/tlsr8258.sh build router
 ```
 
 > The TLSR8258 radio driver uses pure-Rust register access. For real tc32
 > firmware, use the [modern-tc32](https://github.com/modern-tc32) toolchain.
+> Hardware bring-up diagnostics live separately in
+> `tools/telink-tlsr8258-lab`.
 
 ### PHY6222 firmware (pure Rust — no vendor SDK!)
 
@@ -235,8 +236,7 @@ The build script links: `librcl_cc23x0r5.a` (Radio Control Layer) and RF firmwar
 #### Telink TLSR8258 — Pure Rust (no vendor library needed)
 
 ```bash
-cd examples/telink-tlsr8258-sensor
-./scripts/tlsr8258.sh build runtime-sensor
+./scripts/tlsr8258.sh build sensor
 ```
 
 The TLSR8258 radio driver uses pure-Rust register access — no `libdrivers_8258.a` required.
@@ -338,13 +338,16 @@ zigbee-rs/
 │   ├── bl702-sensor/          # BL702 (requires vendor libs from Bouffalo SDK)
 │   ├── cc2340-sensor/         # TI CC2340R5 (stubs)
 │   ├── telink-b91-sensor/     # Unsupported B91 scaffold (no MAC backend)
-│   ├── telink-tlsr8258-sensor/# Telink TLSR8258 — pure Rust, no vendor SDK! (+ experimental router mode)
+│   ├── telink-tlsr8258-sensor/# Telink TLSR8258 polling end-device sensor
+│   ├── telink-tlsr8258-router/# Telink TLSR8258 join/relay router
 │   ├── phy6222-sensor/        # PHY6222 — pure Rust, no vendor SDK!
 │   ├── efr32mg1-sensor/       # EFR32MG1P — pure Rust, Series 1 Cortex-M4F!
 │   └── efr32mg21-sensor/      # EFR32MG21 — pure Rust, Series 2 Cortex-M33!
 ├── docs/
 │   ├── book/                  # mdBook source → GitHub Pages
 │   └── flasher/               # ESP web flasher (GitHub Pages)
+├── tools/
+│   └── telink-tlsr8258-lab/  # Telink hardware diagnostics and legacy regression firmware
 └── BUILD.md                   # Comprehensive build guide
 ```
 
@@ -380,7 +383,7 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
 
 - **CC2340** compiles with stub FFI; real RF requires the TI SDK integration.
 - **Telink B91** has no current `RadioPhy`/`MacDriver` implementation. Its old example is retained only as an unsupported scaffold and is not built in CI.
-- **Telink TLSR8258** pure-Rust driver is fully functional; real tc32 firmware requires the [modern-tc32](https://github.com/modern-tc32) toolchain
+- **Telink TLSR8258** production examples are split by role. The sensor is a polling end device, not yet a retention SED; the router joins and relays but does not admit children. Real tc32 firmware requires the [modern-tc32](https://github.com/modern-tc32) toolchain.
 - **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence; temp/humidity sensors are simulated (battery ADC is real); comprehensive power management is implemented (two-tier sleep with AON system sleep ~3 µA, radio sleep/wake, flash deep power-down, GPIO leak prevention)
 - **EFR32MG1 / EFR32MG21** pure-Rust drivers use simplified radio register values — the exact init sequences for 802.15.4 mode need verification against the EFR32xG1/xG21 Reference Manuals or extraction from the RAIL library source
 - **Test coverage** is basic — the mock examples exercise more than the test crate

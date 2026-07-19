@@ -11,7 +11,7 @@ than in application logic.
 |---|---|
 | `mock-light` | Canonical host FFD/router application |
 | `nrf52840-router` | Hardware router example |
-| `telink-tlsr8258-sensor` with `runtime-router` | Join/relay-only prototype; no child admission |
+| `telink-tlsr8258-router` | Hardware-proven join/relay router; no child admission |
 
 ## Always-on end device
 
@@ -19,6 +19,7 @@ than in application logic.
 |---|---|
 | `mock-sensor` | Canonical host end-device sensor |
 | `efr32mg1-sensor` | Platform example with always-on and sleepy build paths |
+| `telink-tlsr8258-sensor` | Polling TLSR8258 sensor; CPU retention sleep not yet integrated |
 
 ## Sleepy end device
 
@@ -30,7 +31,6 @@ than in application logic.
 | `esp32c6-sensor`, `esp32h2-sensor` | Espressif platform SEDs |
 | `cc2340-sensor` | TI platform SED |
 | `phy6222-sensor` | Compile-tested PHY62x2 SED; deep sleep disabled |
-| `telink-tlsr8258-sensor` with `runtime-sensor` | Hardware-proven Telink end-device runtime; production SED retention integration remains |
 
 ## Coordinator
 
@@ -43,9 +43,9 @@ than in application logic.
 The Telink project intentionally contains three separate surfaces:
 
 - `tlsr8258-rt`: reset vector, IRQ context, and cold-start RAM initialization;
-- `telink-tlsr8258-runtime` / `telink-tlsr8258-router`: small production role
-  entry points and application modules;
-- `telink-tlsr8258-lab`: hardware bring-up and diagnostic firmware.
+- `examples/telink-tlsr8258-sensor`: small polling end-device application;
+- `examples/telink-tlsr8258-router`: small always-on router application;
+- `tools/telink-tlsr8258-lab`: hardware bring-up and diagnostic firmware.
 
 Diagnostic startup and SRAM instrumentation remain in the lab binary and are
 not part of the production sensor/router applications.

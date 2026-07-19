@@ -1,89 +1,121 @@
-name: Build TLSR8258 (TC32 real firmware)
-
-# This workflow builds real tc32-unknown-none-elf firmware for the TLSR8258
-# using the modern-tc32 Rust toolchain (published as public release on
-# modern-tc32/rust). No secrets required.
-#
-# Triggers:
-# - Push to master that touches Telink files
-# - PR that touches Telink files
-# - Manual dispatch (workflow_dispatch)
+name: Build TLSR8258 (tc32)
 
 on:
   push:
-    branches: [master]
+    branches: [master, main, develop]
     paths:
-      - 'examples/telink-tlsr8258-sensor/**'
-      - 'examples/telink-tlsr8258-radio/**'
-      - 'tlsr8258-hal/**'
-      - 'zigbee-*/**'
-      - '.github/workflows/build-tc32.yml'
+      - "examples/telink-tlsr8258-sensor/**"
+      - "examples/telink-tlsr8258-router/**"
+      - "tools/telink-tlsr8258-lab/**"
+      - "scripts/tlsr8258.sh"
+      - "tools/tlsr8258-firmware.sh"
+      - "examples/telink-tlsr8258-radio/**"
+      - "tlsr8258-hal/**"
+      - "tlsr8258-rt/**"
+      - "zigbee-*/**"
+      - ".github/workflows/build-tc32.yml"
   pull_request:
+    branches: [master, main, develop]
     paths:
-      - 'examples/telink-tlsr8258-sensor/**'
-      - 'examples/telink-tlsr8258-radio/**'
-      - 'tlsr8258-hal/**'
-      - 'zigbee-*/**'
-      - '.github/workflows/build-tc32.yml'
+      - "examples/telink-tlsr8258-sensor/**"
+      - "examples/telink-tlsr8258-router/**"
+      - "tools/telink-tlsr8258-lab/**"
+      - "scripts/tlsr8258.sh"
+      - "tools/tlsr8258-firmware.sh"
+      - "examples/telink-tlsr8258-radio/**"
+      - "tlsr8258-hal/**"
+      - "tlsr8258-rt/**"
+      - "zigbee-*/**"
+      - ".github/workflows/build-tc32.yml"
   workflow_dispatch:
-    inputs:
-      tc32_release_tag:
-        description: 'modern-tc32/rust release tag'
-        required: false
-        default: 'tc32-stage2-tc32-45'
-        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: tc32-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  CARGO_TERM_COLOR: always
-  TC32_RELEASE_TAG_DEFAULT: tc32-stage2-tc32-45
+  TC32_TOOLCHAIN_URL: https://github.com/modern-tc32/rust/releases/download/tc32-stage2-tc32-45/tc32-rust-toolchain-linux-amd64.tar.gz
+  TC32_TOOLCHAIN_DIR: ${{ github.workspace }}/.toolchains/tc32-stage2-tc32-45
 
 jobs:
-  build-tlsr8258-tc32:
-    name: Build TLSR8258 real firmware (tc32)
+  build:
+    name: Production and lab firmware
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download TC32 toolchain from public release
+      - name: Install tc32-45 toolchain
         run: |
-          TAG="${{ inputs.tc32_release_tag || env.TC32_RELEASE_TAG_DEFAULT }}"
-          URL="https://github.com/modern-tc32/rust/releases/download/${TAG}/tc32-rust-toolchain-linux-amd64.tar.gz"
-          echo "Downloading ${URL}"
-          curl -fSL --retry 5 --retry-delay 5 -o /tmp/tc32.tar.gz "$URL"
+          mkdir -p "$TC32_TOOLCHAIN_DIR"
+          curl -fL --retry 3 "$TC32_TOOLCHAIN_URL" -o /tmp/tc32.tar.gz
+          tar -xzf /tmp/tc32.tar.gz --strip-components=1 -C "$TC32_TOOLCHAIN_DIR"
+          "$TC32_TOOLCHAIN_DIR/bin/rustc" --version --verbose
 
-      - name: Unpack TC32 toolchain
+      - name: Cache tc32 build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            examples/telink-tlsr8258-sensor/target
+            examples/telink-tlsr8258-router/target
+            tools/telink-tlsr8258-lab/target
+            examples/telink-tlsr8258-radio/target
+          key: tc32-45-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '**/memory*.x') }}
+
+      - name: Build production sensor and router
         run: |
-          tar -xzf /tmp/tc32.tar.gz -C $HOME/
-          # Tarball extracts to tc32-stage2-x86_64-unknown-linux-gnu/
-          TC32_DIR="$HOME/tc32-stage2-x86_64-unknown-linux-gnu"
-          test -x "$TC32_DIR/bin/rustc"
-          test -x "$TC32_DIR/bin/cargo"
-          test -x "$TC32_DIR/llvm/bin/llvm-objcopy"
-          echo "TC32_TOOLCHAIN=$TC32_DIR" >> $GITHUB_ENV
-          echo "TC32_LLVM_BIN=$TC32_DIR/llvm/bin" >> $GITHUB_ENV
+          mkdir -p target/tlsr8258-artifacts
+          ./scripts/tlsr8258.sh build sensor
+          cp examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin \
+            target/tlsr8258-artifacts/telink-tlsr8258-sensor.bin
+          ./scripts/tlsr8258.sh build router
+          cp examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router.bin \
+            target/tlsr8258-artifacts/telink-tlsr8258-router.bin
 
-      - name: Verify TC32 toolchain
+      - name: Build hardware lab matrix
         run: |
-          $TC32_TOOLCHAIN/bin/rustc --version
-          $TC32_TOOLCHAIN/bin/rustc --print target-list | grep tc32
-          $TC32_TOOLCHAIN/llvm/bin/clang --version
-          echo "TC32 toolchain ready"
+          for mode in diag-beacon diag-assoc diag-smoke diag-pm lab-sensor; do
+            ./scripts/tlsr8258.sh build "$mode"
+            cp tools/telink-tlsr8258-lab/target/tc32-unknown-none-elf/release/telink-tlsr8258-lab.bin \
+              "target/tlsr8258-artifacts/telink-tlsr8258-${mode}.bin"
+          done
 
-      - name: Build TLSR8258 runtime sensor
-        working-directory: examples/telink-tlsr8258-sensor
-        run: ./scripts/tlsr8258.sh build runtime-sensor
-
-      - name: Build reusable TLSR8258 backend
+      - name: Build standalone radio harness
         working-directory: examples/telink-tlsr8258-radio
-        run: ./scripts/tlsr8258.sh build runtime-join
+        run: |
+          ./scripts/tlsr8258.sh build
+          cp target/tc32-unknown-none-elf/release/telink-tlsr8258-radio.bin \
+            ../../target/tlsr8258-artifacts/telink-tlsr8258-radio.bin
 
-      - name: Upload TLSR8258 real firmware
+      - name: Run host radio tests
+        run: |
+          HOST_TARGET="$(rustc +stable -vV | sed -n 's/^host: //p')"
+          cargo +stable test --manifest-path examples/telink-tlsr8258-radio/Cargo.toml \
+            --release --target "$HOST_TARGET"
+
+      - name: Upload TLSR8258 binaries
         uses: actions/upload-artifact@v4
         with:
-          name: tlsr8258-tc32-firmware
-          path: |
-            examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-runtime.bin
-            examples/telink-tlsr8258-radio/target/tc32-unknown-none-elf/release/telink-tlsr8258-radio.bin
+          name: telink-tlsr8258-tc32-45-${{ github.sha }}
+          path: target/tlsr8258-artifacts/*.bin
+          if-no-files-found: error
+          retention-days: 30
+
+  quality:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path examples/telink-tlsr8258-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/telink-tlsr8258-router/Cargo.toml -- --check
+          cargo fmt --manifest-path tools/telink-tlsr8258-lab/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/telink-tlsr8258-radio/Cargo.toml -- --check

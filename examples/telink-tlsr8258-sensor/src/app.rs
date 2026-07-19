@@ -5,8 +5,6 @@ use zigbee_mac::telink::TelinkMac;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, StartError};
 use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::security_journal::{SecurityJournalStorage, SecurityStateJournal};
-use zigbee_runtime::security_store::SecurityStoreError;
 use zigbee_runtime::synthetic_sensor::{SyntheticSensor, apply_synthetic_reading};
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::BasicCluster;
@@ -17,10 +15,7 @@ use zigbee_zcl::clusters::temperature::TemperatureCluster;
 use zigbee_zcl::data_types::{ZclDataType, ZclValue};
 use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
 
-use crate::{board, executor};
-
-const SECURITY_SECTOR_A: u32 = 0x0007_4000;
-const SECURITY_SECTOR_B: u32 = 0x0007_5000;
+use crate::{board, flash_nv};
 
 // Preserve the IEEE address used by the hardware-proven runtime image so the
 // existing journal and ZHA device identity remain valid across this refactor.
@@ -54,26 +49,6 @@ fn setup_test_reporting(device: &mut ZigbeeDevice<TelinkMac>) -> bool {
         },
     );
     temperature.is_ok() && humidity.is_ok()
-}
-
-struct Tlsr8258SecurityFlash;
-
-impl SecurityJournalStorage for Tlsr8258SecurityFlash {
-    fn read(&self, address: u32, output: &mut [u8]) -> Result<(), SecurityStoreError> {
-        if tlsr8258_hal::flash::read_bytes(address, output) {
-            Ok(())
-        } else {
-            Err(SecurityStoreError::Hardware)
-        }
-    }
-
-    fn program(&mut self, address: u32, data: &[u8]) -> Result<(), SecurityStoreError> {
-        tlsr8258_hal::flash::program(address, data).map_err(|_| SecurityStoreError::Hardware)
-    }
-
-    fn erase_sector(&mut self, address: u32) -> Result<(), SecurityStoreError> {
-        tlsr8258_hal::flash::erase_sector(address).map_err(|_| SecurityStoreError::Hardware)
-    }
 }
 
 fn failure() -> ! {
@@ -190,12 +165,11 @@ pub fn run() -> ! {
             cluster: hum_cluster,
         },
     ];
-    let mut security_store = SecurityStateJournal::new(
-        Tlsr8258SecurityFlash,
-        SECURITY_SECTOR_A,
-        SECURITY_SECTOR_B,
-    );
-    if crate::security_identity::prepare(device, &mut security_store, ieee_address).is_err() {
+    let mut security_store = flash_nv::security_store();
+    if device
+        .reset_security_state_if_identity_changed(&mut security_store)
+        .is_err()
+    {
         failure();
     }
     let mut sensor_sample = 0u32;
@@ -205,7 +179,7 @@ pub fn run() -> ! {
         let mut attempts = 0u8;
         loop {
             attempts = attempts.saturating_add(1);
-            match executor::block_on(
+            match tlsr8258_rt::block_on(
                 device.start_or_resume_with_security_store(&mut security_store),
             ) {
                 Ok(_) => break,
@@ -227,23 +201,22 @@ pub fn run() -> ! {
         let mut tick_anchor = tlsr8258_hal::timer::now_ticks();
         loop {
             for _ in 0..4u8 {
-                match executor::block_on(device.poll()) {
+                match tlsr8258_rt::block_on(device.poll()) {
                     Ok(Some(indication)) => {
-                        let event = executor::block_on(
-                            device.process_incoming_with_security_store(
+                        let event =
+                            tlsr8258_rt::block_on(device.process_incoming_with_security_store(
                                 &indication,
                                 &mut clusters,
                                 &mut security_store,
-                            ),
-                        );
+                            ));
                         match event {
                             Ok(Some(StackEvent::RejoinRequested)) => {
-                                let _ = executor::block_on(
+                                let _ = tlsr8258_rt::block_on(
                                     device.secure_rejoin_with_security_store(&mut security_store),
                                 );
                             }
                             Ok(Some(StackEvent::LeaveRequested)) => {
-                                if executor::block_on(
+                                if tlsr8258_rt::block_on(
                                     device.factory_reset_with_security_store(&mut security_store),
                                 )
                                 .is_err()
@@ -258,7 +231,7 @@ pub fn run() -> ! {
                             Err(_) => failure(),
                         }
 
-                        if executor::block_on(device.tick_with_security_store(
+                        if tlsr8258_rt::block_on(device.tick_with_security_store(
                             0,
                             &mut clusters,
                             &mut security_store,
@@ -282,17 +255,13 @@ pub fn run() -> ! {
                 if sensor_update_elapsed >= SENSOR_UPDATE_INTERVAL_SECS {
                     sensor_update_elapsed %= SENSOR_UPDATE_INTERVAL_SECS;
                     sensor_sample = sensor_sample.wrapping_add(1);
-                    if apply_synthetic_reading(
-                        &mut clusters,
-                        1,
-                        TEST_SENSOR.sample(sensor_sample),
-                    )
-                    .is_err()
+                    if apply_synthetic_reading(&mut clusters, 1, TEST_SENSOR.sample(sensor_sample))
+                        .is_err()
                     {
                         failure();
                     }
                 }
-                if executor::block_on(device.tick_with_security_store(
+                if tlsr8258_rt::block_on(device.tick_with_security_store(
                     elapsed_secs,
                     &mut clusters,
                     &mut security_store,

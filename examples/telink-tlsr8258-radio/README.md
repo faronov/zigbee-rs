@@ -216,8 +216,8 @@ not redundant):
 
 ## Design notes / limitations
 
-- **RF PHY table "6+28" vs. the task's "5+28":** the proven source
-  (`examples/telink-tlsr8258-sensor/src/main.rs`, `tbl_rf_init`) documents
+- **RF PHY table "6+28" vs. the task's "5+28":** the proven lab source
+  (`tools/telink-tlsr8258-lab/src/main.rs`, `tbl_rf_init`) documents
   **6** common-init register writes (`0x8012D2`, `0x8012D3`, `0x80127B`,
   `0x801276`, `0x801277`, `0x800430`) followed by the 28-entry Zigbee-250K
   table. This crate transcribes that faithfully as 6+28

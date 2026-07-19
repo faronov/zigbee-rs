@@ -5,6 +5,34 @@
 
 #![no_std]
 
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+/// Run one async application future on the single-threaded TLSR8258 runtime.
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |pointer| RawWaker::new(pointer, &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+
+    let mut future = future;
+    let mut future = unsafe { Pin::new_unchecked(&mut future) };
+    let waker = unsafe { Waker::new(core::ptr::null(), &VTABLE) };
+    let mut context = Context::from_waker(&waker);
+
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            return output;
+        }
+        for _ in 0..100 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 #[cfg(target_arch = "tc32")]
 core::arch::global_asm!(
     ".section .vectors, \"ax\"",

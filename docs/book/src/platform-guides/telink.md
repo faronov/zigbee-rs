@@ -1,104 +1,48 @@
 # Telink TLSR8258
 
-The supported Telink backend is the TLSR8258 pure-Rust end-device path. The
-repository does not currently implement a B91 radio or MAC backend.
+The supported Telink platform is a pure-Rust TLSR8258 implementation. Telink
+B91 remains an unsupported scaffold because it has no radio or MAC backend.
 
-## Hardware
+## Hardware and SRAM layout
 
 | Property | TLSR8258 |
-|----------|----------|
+|---|---|
 | Core | Telink TC32 |
 | Flash | 512 KiB |
-| SRAM | 64 KiB |
-| Radio | IEEE 802.15.4 + BLE |
+| SRAM | 64 KiB at `0x840000..0x850000` |
 | Rust target | `tc32-unknown-none-elf` |
 | Toolchain | [modern-tc32](https://github.com/modern-tc32/rust) |
 
-The 64 KiB SRAM region starts at `0x840000`. RAM-resident code is followed by
-the hardware I-cache reservation: 0x100 bytes of tags and 0x800 bytes of cache
-data. Writable `.data` and `.bss` must begin after:
+RAM-resident code occupies the bottom of SRAM. The hardware instruction cache
+then requires 0x100 bytes of tags and 0x800 bytes of cache data. Writable
+`.data` and `.bss` therefore start at:
 
 ```text
 0x840900 + align256(ram_code_size)
 ```
 
-The application linker script and post-link checker enforce this layout.
+Both production linker scripts and the post-link checker enforce this
+reservation. The SVC stack occupies `0x84BC00..0x84FC00`; the IRQ stack ends
+at `0x850000`.
 
-## Current implementation paths
-
-The runtime sensor and standalone conformance harness share one TLSR8258
-backend:
+## Repository structure
 
 ```text
-zigbee-runtime / BDB / ZDO / APS / NWK
-                    |
-             MacDriver
-                    |
-       zigbee-mac::telink::TelinkMac
-                    |
-              tlsr8258-hal
-                    |
-     Timer0 / flash / RF DMA / RF IRQ / MMIO
+examples/telink-tlsr8258-sensor/  polling end-device sensor
+examples/telink-tlsr8258-router/  always-on join/relay router
+tools/telink-tlsr8258-lab/        bring-up and regression firmware
+tlsr8258-hal/                     clocks, timers, flash, radio, GPIO, ADC, PM
+tlsr8258-rt/                      reset, IRQ context, RAM initialization
+zigbee-mac/src/telink/            reusable TLSR8258 MacDriver
 ```
 
-`tlsr8258-hal` and the reusable `zigbee_mac::telink::TelinkMac` own the proven
-platform and radio primitives:
+The application examples contain only board configuration, flash-journal
+adaptation, and role-specific Zigbee logic. The old direct-MMIO radio, local
+MAC, SRAM markers, and diagnostic modes are retained only in the hardware lab.
 
-- clock and Timer0 access;
-- factory IEEE address or stable flash-UID fallback;
-- official PHY initialization and calibration tables;
-- two rotating RX DMA buffers and one TX DMA buffer;
-- CRC/RSSI validation;
-- immediate software ACK handling;
-- CCA, unslotted CSMA-CA, frame retries, and TX-done to RX turnaround;
-- RAM-resident flash erase/program operations.
+## Toolchain
 
-Each application owns startup vectors, linker layout, stacks, and any reserved
-diagnostic regions. The sensor source still retains its legacy local
-`Tlsr8258Mac` and radio implementation for explicitly selected diagnostic
-modes, but `runtime-sensor` no longer links them.
-
-## Capability boundary
-
-The reusable TLSR8258 backend currently supports the Zigbee end-device path:
-
-- active/passive/energy scan;
-- association;
-- data request polling;
-- unicast data TX/RX;
-- local association-state clear and MAC reset;
-- mandatory platform timing and delay services.
-
-It also supports an **experimental, join/relay-only router path**: after a
-device joins with the router capability bit, `zigbee-nwk`'s
-`Nlme::nlme_start_router()` calls `MacDriver::mlme_start`, which this backend
-now implements for the non-beacon (`BO=SO=15`), non-PAN-coordinator case —
-putting the radio into continuous RX so it can relay unicast/broadcast NWK
-traffic and rebroadcast route requests. See
-`examples/telink-tlsr8258-sensor` (`runtime-router` firmware mode) and its
-README "Router firmware" section. This does **not** include child
-association, beacon transmission, permit-joining, or an indirect
-(pending-frame) queue for sleepy children — the backend has no hardware
-evidence for any of those yet, so `MacCapabilities::router` still reports
-`false`. It mirrors `examples/nrf52840-router` exactly.
-
-Full coordinator (PAN-forming) support is not advertised. Secure entropy is
-not yet provided by the backend, so operations that require it fail
-explicitly.
-
-The preferred feature is:
-
-```toml
-zigbee-mac = { features = ["tlsr8258"] }
-```
-
-The former `telink` feature remains only as a backward-compatible alias for
-`tlsr8258`; it does not imply B91 support.
-
-## Toolchain installation
-
-The toolchain is not committed to the repository. Install the current local
-default release into the ignored `.toolchains` directory:
+Install the current supported release under `.toolchains`:
 
 ```bash
 TAG=tc32-stage2-tc32-45
@@ -110,104 +54,83 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 DEST=".toolchains/${TAG}"
-mkdir -p "${DEST}"
+mkdir -p "$DEST"
 curl -fL \
   "https://github.com/modern-tc32/rust/releases/download/${TAG}/${ASSET}" \
   -o /tmp/tc32-toolchain.tar.gz
-tar -xzf /tmp/tc32-toolchain.tar.gz --strip-components=1 -C "${DEST}"
-"${DEST}/bin/rustc" --version
+tar -xzf /tmp/tc32-toolchain.tar.gz --strip-components=1 -C "$DEST"
+"$DEST/bin/rustc" --version
 ```
 
-The scripts also accept an external extraction:
+An external extraction can be selected with `TC32_TOOLCHAIN=/path/to/toolchain`.
+
+## Production examples
+
+Build from the repository root:
 
 ```bash
-cd examples/telink-tlsr8258-sensor
-TC32_TOOLCHAIN=/path/to/tc32-stage2-toolchain \
-  ./scripts/tlsr8258.sh build runtime-sensor
+./scripts/tlsr8258.sh build sensor
+./scripts/tlsr8258.sh build router
 ```
 
-The dedicated tc32 GitHub workflow downloads a public modern-tc32 release and
-builds the real `tc32-unknown-none-elf` target; it does not use a Cortex-M
-stand-in.
-
-## Building
-
-Build the reusable backend with the full stack in the radio harness:
-
-```bash
-cd examples/telink-tlsr8258-radio
-./scripts/tlsr8258.sh build runtime-join
-```
-
-Build the current end-to-end runtime gate separately:
-
-```bash
-cd examples/telink-tlsr8258-sensor
-./scripts/tlsr8258.sh build runtime-sensor
-```
-
-The production runtime output files are:
+The generated images are:
 
 ```text
-target/tc32-unknown-none-elf/release/telink-tlsr8258-runtime
-target/tc32-unknown-none-elf/release/telink-tlsr8258-runtime.bin
+examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin
+examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router.bin
 ```
 
-The production binary is separate from the diagnostic
-`telink-tlsr8258-lab` target and uses a linker layout without the SWire SRAM
-reservation. Fat LTO with size optimization produces a 216,548-byte
-(`0x34DE4`) runtime image. The post-link checker enforces the 256 KiB
-production/OTA slot plus the factory-data, cache, DMA, BSS, and stack
-boundaries.
+`tools/tlsr8258-firmware.sh` builds with tc32-45, emits the binary, and checks
+the cache reservation, RAM code, BSS/stack separation, production image size,
+and absence of the legacy lab MAC.
 
-Build the **experimental, join/relay-only router** firmware the same way,
-selecting `runtime-router` instead:
+### Sensor
+
+The sensor is a polling Zigbee end device:
+
+- Basic, Power Configuration, Identify, Temperature, and Humidity clusters;
+- deterministic test variation for temperature and humidity;
+- crash-safe two-sector security journal;
+- secured rejoin and parent polling;
+- `rx_on_when_idle = false`.
+
+`PowerMode::Sleepy` currently selects the polling end-device behavior. It does
+not put the TC32 CPU into retention sleep. A separate SED example will be
+added only after the production runtime layout and full Zigbee state survive
+repeated LOW32K retention wakeups.
+
+### Router
+
+The router joins as an FFD, enters continuous receive, relays NWK traffic, and
+sends router maintenance frames. Hardware has proven join, interview,
+Identify, and reset/resume.
+
+It is not yet a parent router. Child association responses, beacon
+transmission, permit joining, and indirect queues are not implemented.
+
+## Hardware lab
+
+The 7,000-line bring-up firmware is deliberately not an example. Run its
+diagnostics through the root wrapper:
 
 ```bash
-cd examples/telink-tlsr8258-sensor
-./scripts/tlsr8258.sh build runtime-router
+./scripts/tlsr8258.sh build diag-beacon
+./scripts/tlsr8258.sh build diag-assoc
+./scripts/tlsr8258.sh build diag-smoke
+./scripts/tlsr8258.sh build diag-pm
+./scripts/tlsr8258.sh build lab-sensor
 ```
 
-producing `telink-tlsr8258-router[.bin]` (212,256 bytes / `0x33D20`) from the
-same production linker layout. See that package's README ("Router
-firmware") for the exact capability boundary — join and relay only, no child
-association.
+The lab preserves the hardware evidence for raw RF, MAC timing, startup,
+flash, and retention PM without obscuring the production applications.
 
-## Hardware status
+## Current capability boundary
 
-The TLSR8258 end-device path has been proven with Home Assistant ZHA and an
-Ember coordinator:
+The TLSR8258 backend provides active/passive/energy scan, association, data
+request polling, unicast TX/RX, CSMA-CA, ACK retries, software ACK generation,
+mandatory timing, and crash-safe security persistence. Home Assistant ZHA has
+verified commissioning, TCLK exchange, interview, reporting, reset resume,
+secured rejoin, and router join/relay setup.
 
-- active scan and coordinator beacon parsing;
-- association and indirect polling;
-- secured network-key delivery;
-- Request-Key, unique TCLK transport, Verify-Key, and Confirm-Key;
-- normal ZDO/ZCL interview;
-- battery, temperature, humidity, and Identify entities;
-- reset resume with crash-safe journaled security-counter reservations;
-- secured unicast parent rejoin with indirect-response polling for the sleepy
-  end device;
-- successful ZHA Identify after reset and parent re-registration.
-
-Remaining production work includes a clean small application entry point,
-factory-reset UI validation, deep-sleep/retention reconfiguration, the Zbit
-flash voltage guard, and reducing the image to the OTA slot.
-
-The router path (`runtime-router`) remains experimental. Real TLSR8258
-hardware has joined Home Assistant ZHA as `TLSR8258-Router`, completed its
-Basic/Identify interview, answered Identify, and restored the commissioned
-state after a hardware reset. `MLME-START`'s parameter rules are also
-unit-tested on host (`cargo test -p zigbee-mac --features tlsr8258`), and the
-firmware stays below the 256 KiB OTA limit. A routed third-node traffic test
-is still outstanding. Child association, beacon transmission,
-permit-joining, and indirect transmission remain unimplemented.
-
-## Telink B91
-
-`examples/telink-b91-sensor` is an unsupported scaffold. The previous
-documentation incorrectly described the TLSR8258 backend as a shared B91
-driver and claimed that a complete `libdrivers_b91.a` FFI path existed.
-
-A B91 implementation must start with a separately proven B91 radio HAL and
-then implement `RadioPhy` plus the mandatory platform services. Until that
-work exists, B91 is not built in CI and no firmware artifact is published.
+Full coordinator support is not advertised. The B91 scaffold is excluded from
+the firmware matrix until a separate B91 radio and MAC implementation exists.

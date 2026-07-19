@@ -243,6 +243,44 @@ mod resume_tests {
         );
         assert!(reboot_store.load().unwrap().unwrap().rejoin_pending);
     }
+
+    #[test]
+    fn identity_change_clears_credentials_and_preserves_counter_bounds() {
+        const CURRENT_IEEE: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x99];
+        const OLD_IEEE: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
+
+        let mut device = ZigbeeDevice::builder(MockMac::new(CURRENT_IEEE))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.ieee_address = OLD_IEEE;
+        state.network_key = [0xA5; 16];
+        state.trust_center_link_key = [0x5A; 16];
+        state.global_counter_limit = 0x2400;
+        state.tclk_counter_limit = 0x1800;
+
+        let mut store = RamSecurityStateStore::new();
+        store.store(&state).unwrap();
+
+        assert!(
+            device
+                .reset_security_state_if_identity_changed(&mut store)
+                .unwrap()
+        );
+        let reset = store.load().unwrap().unwrap();
+        assert!(!reset.commissioned);
+        assert_eq!(reset.ieee_address, [0; 8]);
+        assert_eq!(reset.network_key, [0; 16]);
+        assert_eq!(reset.trust_center_link_key, [0; 16]);
+        assert_eq!(reset.global_counter_limit, 0x2400);
+        assert_eq!(reset.tclk_counter_limit, 0x1800);
+        assert!(
+            !device
+                .reset_security_state_if_identity_changed(&mut store)
+                .unwrap()
+        );
+    }
 }
 
 /// A queued ZCL response to be sent in the next tick().
@@ -1037,6 +1075,25 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         state.global_counter_limit = global_counter_limit;
         state.tclk_counter_limit = tclk_counter_limit;
         store.store(&state)
+    }
+
+    /// Clear persisted network identity when firmware selects a different EUI.
+    ///
+    /// Outgoing counter reservations are preserved, so reflashing one board
+    /// with a different device role cannot reuse a prior key/counter pair.
+    pub fn reset_security_state_if_identity_changed<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<bool, SecurityStoreError> {
+        let Some(state) = store.load()? else {
+            return Ok(false);
+        };
+        let configured_ieee = self.bdb.zdo().nwk().nib().ieee_address;
+        if state.ieee_address == [0; 8] || state.ieee_address == configured_ieee {
+            return Ok(false);
+        }
+        self.factory_reset_security_state(store)?;
+        Ok(true)
     }
 
     /// Factory-reset the stack while retaining outgoing counter bounds that

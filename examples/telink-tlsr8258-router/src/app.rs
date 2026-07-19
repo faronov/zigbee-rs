@@ -1,86 +1,25 @@
-//! Production TLSR8258 Zigbee router application — EXPERIMENTAL,
-//! join/relay-only.
+//! Always-on TLSR8258 join/relay router application.
 //!
-//! This mirrors `runtime_sensor.rs` for the join/commissioning, security
-//! journal, and reset-resume plumbing, which is proven end-device behavior
-//! shared unchanged with this router build. The only new piece is the
-//! device role: `DeviceType::Router` + `PowerMode::AlwaysOn` with a
-//! continuous-receive main loop instead of sleepy polling.
-//!
-//! # Scope (read this before treating this as a real router)
-//!
-//! What this firmware DOES:
-//! - Joins an existing Zigbee network with the router capability bit set.
-//! - Calls `zigbee_nwk`'s `Nlme::nlme_start_router()` after joining, which
-//!   drives `zigbee_mac::telink::TelinkMac::mlme_start` into non-beacon
-//!   (BO=SO=15), non-PAN-coordinator, continuous-RX mode.
-//! - Relays unicast NWK frames not addressed to itself and rebroadcasts
-//!   broadcast/route-request traffic (existing `zigbee-nwk` forwarding —
-//!   unchanged by this example).
-//! - Sends periodic NWK Link Status broadcasts (existing generic
-//!   `zigbee-nwk` behavior, not router-specific code added here).
-//! - Persists join/security state across resets via the same flash journal
-//!   used by the sensor runtime, and secure-rejoins on request.
-//!
-//! What this firmware explicitly DOES NOT do (and must not silently grow):
-//! - **No child association.** `TelinkMac` never implements
-//!   `MLME-ASSOCIATE.response`; nothing here fakes it.
-//! - **No beacons.** `macBeaconOrder`/`macSuperframeOrder` are fixed at 15
-//!   (non-beacon); this device never transmits an 802.15.4 beacon.
-//! - **No permit-joining.** `macAssociationPermit` is never set to `true`.
-//! - **No indirect transmission / pending-frame queue** for sleepy
-//!   children — `TelinkMac::mcps_data` rejects `tx_options.indirect`.
-//!
-//! This is the direct TLSR8258 analogue of `examples/nrf52840-router`: an
-//! always-on FFD join/relay target, not a complete Zigbee router.
+//! Child admission is not implemented; see the package README for the exact
+//! capability boundary.
 
 use core::mem::MaybeUninit;
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
-use zigbee_mac::telink::TelinkMac;
+use zigbee_mac::{MacError, telink::TelinkMac};
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, StartError};
 use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::security_journal::{SecurityJournalStorage, SecurityStateJournal};
-use zigbee_runtime::security_store::SecurityStoreError;
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::identify::IdentifyCluster;
 
-use crate::{board, executor};
-
-const SECURITY_SECTOR_A: u32 = 0x0007_4000;
-const SECURITY_SECTOR_B: u32 = 0x0007_5000;
+use crate::{board, flash_nv};
 
 // Distinct from the sensor runtime's `DEVICE_EUI_OFFSET` (0x33) so a router
 // and a sensor built from the same factory-programmed part never collide on
 // IEEE address if someone reflashes one board with both images over time.
 const DEVICE_EUI_OFFSET: u8 = 0x52; // 'R' for Router
-
-/// Router maintenance tick period (link status, route table aging, etc. —
-/// all handled generically by `zigbee-nwk`/`zigbee-runtime`; this constant
-/// only paces how often we call `tick_with_security_store`).
-const MAINTENANCE_TICK_SECS_MAX: u16 = 60;
-
-struct Tlsr8258SecurityFlash;
-
-impl SecurityJournalStorage for Tlsr8258SecurityFlash {
-    fn read(&self, address: u32, output: &mut [u8]) -> Result<(), SecurityStoreError> {
-        if tlsr8258_hal::flash::read_bytes(address, output) {
-            Ok(())
-        } else {
-            Err(SecurityStoreError::Hardware)
-        }
-    }
-
-    fn program(&mut self, address: u32, data: &[u8]) -> Result<(), SecurityStoreError> {
-        tlsr8258_hal::flash::program(address, data).map_err(|_| SecurityStoreError::Hardware)
-    }
-
-    fn erase_sector(&mut self, address: u32) -> Result<(), SecurityStoreError> {
-        tlsr8258_hal::flash::erase_sector(address).map_err(|_| SecurityStoreError::Hardware)
-    }
-}
 
 fn failure() -> ! {
     board::LED_GREEN.write(false);
@@ -138,12 +77,11 @@ pub fn run() -> ! {
         })
         .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
 
-    let mut security_store = SecurityStateJournal::new(
-        Tlsr8258SecurityFlash,
-        SECURITY_SECTOR_A,
-        SECURITY_SECTOR_B,
-    );
-    if crate::security_identity::prepare(device, &mut security_store, ieee_address).is_err() {
+    let mut security_store = flash_nv::security_store();
+    if device
+        .reset_security_state_if_identity_changed(&mut security_store)
+        .is_err()
+    {
         failure();
     }
 
@@ -151,7 +89,7 @@ pub fn run() -> ! {
         let mut attempts = 0u8;
         loop {
             attempts = attempts.saturating_add(1);
-            match executor::block_on(
+            match tlsr8258_rt::block_on(
                 device.start_or_resume_with_security_store(&mut security_store),
             ) {
                 Ok(_) => break,
@@ -169,7 +107,7 @@ pub fn run() -> ! {
         board::LED_GREEN.write(true);
         board::LED_BLUE.write(false);
 
-        let mut maintenance_elapsed = 0u16;
+        let mut identify_elapsed = 0u32;
         let one_second = tlsr8258_hal::timer::ms(1_000);
         let mut tick_anchor = tlsr8258_hal::timer::now_ticks();
 
@@ -184,7 +122,7 @@ pub fn run() -> ! {
             // use rather than held across the loop, so `identify_cluster`
             // remains individually accessible for its own `tick()` below
             // without a persistent borrow conflict.
-            match executor::block_on(device.receive()) {
+            match tlsr8258_rt::block_on(device.receive()) {
                 Ok(indication) => {
                     let mut clusters = [
                         ClusterRef {
@@ -196,19 +134,19 @@ pub fn run() -> ! {
                             cluster: identify_cluster,
                         },
                     ];
-                    let event = executor::block_on(device.process_incoming_with_security_store(
+                    let event = tlsr8258_rt::block_on(device.process_incoming_with_security_store(
                         &indication,
                         &mut clusters,
                         &mut security_store,
                     ));
                     match event {
                         Ok(Some(StackEvent::RejoinRequested)) => {
-                            let _ = executor::block_on(
+                            let _ = tlsr8258_rt::block_on(
                                 device.secure_rejoin_with_security_store(&mut security_store),
                             );
                         }
                         Ok(Some(StackEvent::LeaveRequested)) => {
-                            if executor::block_on(
+                            if tlsr8258_rt::block_on(
                                 device.factory_reset_with_security_store(&mut security_store),
                             )
                             .is_err()
@@ -233,7 +171,7 @@ pub fn run() -> ! {
                             cluster: identify_cluster,
                         },
                     ];
-                    if executor::block_on(device.tick_with_security_store(
+                    if tlsr8258_rt::block_on(device.tick_with_security_store(
                         0,
                         &mut clusters2,
                         &mut security_store,
@@ -245,11 +183,8 @@ pub fn run() -> ! {
 
                     identify_cluster.tick(0);
                 }
-                Err(_) => {
-                    // MAC-level RX timeout or transient radio error — fall
-                    // through to the maintenance tick below rather than
-                    // treating this as fatal. A router must keep listening.
-                }
+                Err(MacError::NoData) => {}
+                Err(_) => failure(),
             }
 
             let now = tlsr8258_hal::timer::now_ticks();
@@ -257,8 +192,7 @@ pub fn run() -> ! {
             if elapsed >= one_second {
                 let elapsed_secs = (elapsed / one_second).min(u16::MAX as u32) as u16;
                 tick_anchor = tick_anchor.wrapping_add(u32::from(elapsed_secs) * one_second);
-                maintenance_elapsed =
-                    maintenance_elapsed.saturating_add(elapsed_secs).min(MAINTENANCE_TICK_SECS_MAX);
+                identify_elapsed = identify_elapsed.wrapping_add(u32::from(elapsed_secs));
                 let mut clusters = [
                     ClusterRef {
                         endpoint: 1,
@@ -269,7 +203,7 @@ pub fn run() -> ! {
                         cluster: identify_cluster,
                     },
                 ];
-                if executor::block_on(device.tick_with_security_store(
+                if tlsr8258_rt::block_on(device.tick_with_security_store(
                     elapsed_secs,
                     &mut clusters,
                     &mut security_store,
@@ -280,7 +214,7 @@ pub fn run() -> ! {
                 }
                 identify_cluster.tick(elapsed_secs);
                 if identify_cluster.is_identifying() {
-                    board::LED_BLUE.write((maintenance_elapsed & 1) == 0);
+                    board::LED_BLUE.write((identify_elapsed & 1) == 0);
                 } else {
                     board::LED_BLUE.write(false);
                 }
