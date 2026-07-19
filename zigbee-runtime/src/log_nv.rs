@@ -60,15 +60,15 @@ impl<F: NorFlash> LogStructuredNv<F> {
         if F::READ_SIZE == 0
             || F::WRITE_SIZE == 0
             || F::ERASE_SIZE == 0
-            || HEADER_SIZE % F::READ_SIZE != 0
-            || HEADER_SIZE % F::WRITE_SIZE != 0
-            || PAGE_HEADER_SIZE % F::READ_SIZE != 0
-            || PAGE_HEADER_SIZE % F::WRITE_SIZE != 0
-            || 4 % F::READ_SIZE != 0
-            || 4 % F::WRITE_SIZE != 0
+            || !HEADER_SIZE.is_multiple_of(F::READ_SIZE)
+            || !HEADER_SIZE.is_multiple_of(F::WRITE_SIZE)
+            || !PAGE_HEADER_SIZE.is_multiple_of(F::READ_SIZE)
+            || !PAGE_HEADER_SIZE.is_multiple_of(F::WRITE_SIZE)
+            || !4usize.is_multiple_of(F::READ_SIZE)
+            || !4usize.is_multiple_of(F::WRITE_SIZE)
             || page_a == page_b
-            || page_a as usize % F::ERASE_SIZE != 0
-            || page_b as usize % F::ERASE_SIZE != 0
+            || !(page_a as usize).is_multiple_of(F::ERASE_SIZE)
+            || !(page_b as usize).is_multiple_of(F::ERASE_SIZE)
             || [page_a, page_b].iter().any(|page| {
                 (*page as usize)
                     .checked_add(F::ERASE_SIZE)

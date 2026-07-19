@@ -188,15 +188,23 @@ fn build_image(segments: &[Segment]) -> Result<Vec<u8>, String> {
         ));
     }
 
-    let mut xip_end = FLASH_WRITE_ADDRESS + HEADER_SIZE as u32;
+    let first_xip = FLASH_WRITE_ADDRESS + HEADER_SIZE as u32;
+    let mut xip_end = first_xip;
+    let mut has_xip = false;
     let mut total_sram = 0u32;
     for segment in segments {
         match classify_address(segment.address)? {
             AddressClass::Xip => {
                 let flash_address = segment.address & XIP_MASK;
-                if flash_address != xip_end {
+                if !has_xip && flash_address != first_xip {
                     return Err(format!(
-                        "XIP segment 0x{:08x} maps to 0x{flash_address:06x}, expected 0x{xip_end:06x}",
+                        "first XIP segment 0x{:08x} maps to 0x{flash_address:06x}, expected 0x{first_xip:06x}",
+                        segment.address
+                    ));
+                }
+                if flash_address < xip_end {
+                    return Err(format!(
+                        "XIP segment 0x{:08x} maps to 0x{flash_address:06x}, before previous end 0x{xip_end:06x}",
                         segment.address
                     ));
                 }
@@ -205,6 +213,7 @@ fn build_image(segments: &[Segment]) -> Result<Vec<u8>, String> {
                         .checked_add(segment.data.len() as u32)
                         .ok_or_else(|| "XIP segment size overflow".to_string())?,
                 );
+                has_xip = true;
             }
             AddressClass::Sram => {
                 total_sram = total_sram
@@ -214,7 +223,6 @@ fn build_image(segments: &[Segment]) -> Result<Vec<u8>, String> {
         }
     }
 
-    let first_xip = FLASH_WRITE_ADDRESS + HEADER_SIZE as u32;
     let mut next_sram_flash = first_xip;
     if next_sram_flash + total_sram >= first_xip {
         next_sram_flash = xip_end;
@@ -367,6 +375,29 @@ mod tests {
     }
 
     #[test]
+    fn preserves_alignment_gaps_between_xip_segments() {
+        let segments = vec![
+            Segment {
+                address: 0x1101_0100,
+                data: vec![1, 2, 3, 4],
+            },
+            Segment {
+                address: 0x1101_0108,
+                data: vec![5, 6, 7, 8],
+            },
+            Segment {
+                address: RUN_ADDRESS,
+                data: vec![0; 8],
+            },
+        ];
+
+        let image = build_image(&segments).unwrap();
+        assert_eq!(&image[HEADER_SIZE..HEADER_SIZE + 4], &[1, 2, 3, 4]);
+        assert_eq!(&image[HEADER_SIZE + 4..HEADER_SIZE + 8], &[0xFF; 4]);
+        assert_eq!(&image[HEADER_SIZE + 8..HEADER_SIZE + 12], &[5, 6, 7, 8]);
+    }
+
+    #[test]
     fn keeps_discontiguous_sram_regions_separate() {
         let segments = normalize_segments(vec![
             Segment {
@@ -383,6 +414,23 @@ mod tests {
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].address, 0x1fff_0000);
         assert_eq!(segments[1].address, RUN_ADDRESS);
+    }
+
+    #[test]
+    fn rejects_overlapping_segments() {
+        let error = normalize_segments(vec![
+            Segment {
+                address: 0x1101_0100,
+                data: vec![0; 8],
+            },
+            Segment {
+                address: 0x1101_0104,
+                data: vec![0; 8],
+            },
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("overlapping segments"));
     }
 
     #[test]

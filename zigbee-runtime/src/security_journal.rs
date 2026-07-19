@@ -129,14 +129,14 @@ impl<S: NorFlash> SecurityStateJournal<S> {
             || S::READ_SIZE == 0
             || S::WRITE_SIZE == 0
             || S::ERASE_SIZE == 0
-            || SECURITY_JOURNAL_SLOT_SIZE % S::READ_SIZE != 0
-            || SECURITY_JOURNAL_SLOT_SIZE % S::WRITE_SIZE != 0
-            || SECURITY_JOURNAL_SECTOR_SIZE % S::ERASE_SIZE != 0
-            || RECORD_PREFIX_LEN % S::WRITE_SIZE != 0
-            || RECORD_COMMIT_OFFSET % S::WRITE_SIZE != 0
-            || RECORD_COMMIT.len() % S::WRITE_SIZE != 0
-            || self.sectors[0] as usize % S::ERASE_SIZE != 0
-            || self.sectors[1] as usize % S::ERASE_SIZE != 0
+            || !SECURITY_JOURNAL_SLOT_SIZE.is_multiple_of(S::READ_SIZE)
+            || !SECURITY_JOURNAL_SLOT_SIZE.is_multiple_of(S::WRITE_SIZE)
+            || !SECURITY_JOURNAL_SECTOR_SIZE.is_multiple_of(S::ERASE_SIZE)
+            || !RECORD_PREFIX_LEN.is_multiple_of(S::WRITE_SIZE)
+            || !RECORD_COMMIT_OFFSET.is_multiple_of(S::WRITE_SIZE)
+            || !RECORD_COMMIT.len().is_multiple_of(S::WRITE_SIZE)
+            || !(self.sectors[0] as usize).is_multiple_of(S::ERASE_SIZE)
+            || !(self.sectors[1] as usize).is_multiple_of(S::ERASE_SIZE)
             || self.sectors.iter().any(|sector| {
                 (*sector as usize)
                     .checked_add(SECURITY_JOURNAL_SECTOR_SIZE)
