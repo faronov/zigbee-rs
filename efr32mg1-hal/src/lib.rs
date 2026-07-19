@@ -2,4 +2,7 @@
 
 #![no_std]
 
+pub mod clock;
 pub mod flash;
+pub mod gpio;
+pub mod i2c;

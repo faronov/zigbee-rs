@@ -1,7 +1,8 @@
 MEMORY
 {
-    /* Bare-metal boot at 0x0 (no bootloader) for JLink flashing. */
-    /* 4 KiB at 0x3E000 is reserved for application NV; 0x3F000 remains unused. */
-    FLASH : ORIGIN = 0x00000000, LENGTH = 248K
-    RAM   : ORIGIN = 0x20000000, LENGTH = 32K
+    /* Preserve the resident Gecko bootloader at 0x0000..0x3FFF. */
+    /* Preserve the native firmware's 24 KiB NVM3 at 0x3A000..0x3FFFF. */
+    FLASH : ORIGIN = 0x00004000, LENGTH = 0x00036000
+    /* EFR32MG1P132F256 exposes 31 KiB of SRAM, not 32 KiB. */
+    RAM   : ORIGIN = 0x20000000, LENGTH = 0x00007C00
 }

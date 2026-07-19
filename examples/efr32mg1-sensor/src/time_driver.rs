@@ -5,8 +5,7 @@
 //! EFR32-specific timer peripherals are needed.
 //!
 //! # Clock assumption
-//! HCLK = 40 MHz (EFR32MG1P default with HFXO).
-//! If your board uses a different system clock, adjust `HCLK_HZ`.
+//! HCLK = 38.4 MHz after `efr32mg1_tradfri::init_clocks()`.
 
 use core::cell::RefCell;
 use cortex_m::interrupt::Mutex;
@@ -16,29 +15,27 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 // ── Configuration ───────────────────────────────────────────────
 
-/// EFR32MG1P system clock (HCLK) frequency in Hz.
-/// Default: 40 MHz from HFXO.
-const HCLK_HZ: u32 = 40_000_000;
+/// EFR32MG1P board HFXO and HCLK frequency.
+const HCLK_HZ: u32 = efr32mg1_tradfri::HCLK_HZ;
 
 /// SysTick fires every 1 ms.
-const SYSTICK_RELOAD: u32 = HCLK_HZ / 1000 - 1; // 39_999
+const SYSTICK_RELOAD: u32 = HCLK_HZ / 1000 - 1; // 38_399
 
 /// Embassy ticks per SysTick overflow.
 /// Embassy TICK_HZ = 1_000_000, SysTick overflow = 1 ms = 1000 ticks.
 const TICKS_PER_MS: u64 = 1_000;
-
-/// HCLK cycles per Embassy tick (for sub-ms interpolation).
-const HCLK_PER_TICK: u64 = (HCLK_HZ / 1_000_000) as u64; // 40
 
 // ── SysTick register addresses (ARM standard) ──────────────────
 
 const SYST_CSR: *mut u32 = 0xE000_E010 as *mut u32;
 const SYST_RVR: *mut u32 = 0xE000_E014 as *mut u32;
 const SYST_CVR: *mut u32 = 0xE000_E018 as *mut u32;
+const SCB_ICSR: *const u32 = 0xE000_ED04 as *const u32;
 
 const CSR_ENABLE: u32 = 1 << 0;
 const CSR_TICKINT: u32 = 1 << 1;
 const CSR_CLKSOURCE: u32 = 1 << 2;
+const ICSR_PENDSTSET: u32 = 1 << 26;
 
 // ── State ───────────────────────────────────────────────────────
 
@@ -78,11 +75,27 @@ impl embassy_time_driver::Driver for Efr32TimeDriver {
         cortex_m::interrupt::free(|_| {
             let epoch = MS_EPOCH.load(Ordering::Relaxed) as u64;
             let ms = MS_COUNT.load(Ordering::Relaxed) as u64;
-            let full_ms = (epoch << 32) | ms;
+            let mut full_ms = (epoch << 32) | ms;
 
-            let remaining = unsafe { core::ptr::read_volatile(SYST_CVR as *const u32) } as u64;
+            let remaining_before =
+                unsafe { core::ptr::read_volatile(SYST_CVR as *const u32) };
+            let systick_pending =
+                unsafe { core::ptr::read_volatile(SCB_ICSR) } & ICSR_PENDSTSET != 0;
+            let remaining_after =
+                unsafe { core::ptr::read_volatile(SYST_CVR as *const u32) };
+            if systick_pending || remaining_after > remaining_before {
+                // SysTick keeps running while interrupts are masked. Account
+                // for a reload whose handler is pending instead of combining
+                // the old millisecond counter with the new counter period.
+                full_ms += 1;
+            }
+
+            let remaining = remaining_after as u64;
             let elapsed_in_period = (SYSTICK_RELOAD as u64) - remaining;
-            let sub_ms_ticks = elapsed_in_period / HCLK_PER_TICK;
+            // 38.4 cycles/us is fractional, so scale over the complete
+            // one-millisecond period instead of truncating cycles per tick.
+            let sub_ms_ticks =
+                elapsed_in_period * TICKS_PER_MS / (SYSTICK_RELOAD as u64 + 1);
 
             full_ms * TICKS_PER_MS + sub_ms_ticks
         })

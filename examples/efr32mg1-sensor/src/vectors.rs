@@ -5,6 +5,36 @@
 //!
 //! IRQ numbers from EFR32MG1P Reference Manual (EFR32xG1).
 
+/// Silicon Labs application properties consumed by the resident bootloader.
+#[repr(C)]
+pub struct ApplicationProperties {
+    magic: [u8; 16],
+    struct_version: u32,
+    signature_type: u32,
+    signature_location: u32,
+    app_type: u32,
+    app_version: u32,
+    app_capabilities: u32,
+    app_product_id: [u8; 16],
+}
+
+#[used]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".app_properties")]
+pub static APP_PROPERTIES: ApplicationProperties = ApplicationProperties {
+    magic: [
+        0x13, 0xB7, 0x79, 0xFA, 0xC9, 0x25, 0xDD, 0xB7, 0xAD, 0xF3, 0xCF, 0xE0, 0xF1, 0xB6,
+        0x14, 0xB8,
+    ],
+    struct_version: 0x0000_0100,
+    signature_type: 0,
+    signature_location: 0xFFFF_FFFF,
+    app_type: 1,
+    app_version: 1,
+    app_capabilities: 0,
+    app_product_id: [0; 16],
+};
+
 /// Interrupt vector union (matches cortex-m-rt Vector layout).
 #[repr(C)]
 pub union Vector {

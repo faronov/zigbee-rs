@@ -11,6 +11,7 @@ members = [
     "zigbee-zcl",
     "zigbee-runtime",
     "zigbee",
+    "drivers/sht3x",
     "examples/mock-sensor",
     "examples/mock-coordinator",
     "examples/mock-light",

@@ -1,209 +1,152 @@
-# EFR32MG1P Zigbee Sensor - Pure Rust Radio
+# EFR32MG1P TRÅDFRI Zigbee/SHT3x Sensor
 
-A `no_std` Zigbee 3.0 end device firmware for the **EFR32MG1P** (ARM Cortex-M4F),
-reporting temperature and humidity via ZCL clusters 0x0402 and 0x0405.
+Pure-Rust firmware for the connected `EFR32MG1P132F256IM32`. The default
+profile remains the existing Zigbee sleepy-end-device example; `diag-sht` is
+the minimal phase-1/2 hardware path and does not initialize radio or NV.
 
-**This example uses a pure-Rust IEEE 802.15.4 radio driver** — no RAIL library,
-no GSDK, no binary blobs. All radio hardware access is through direct register
-writes in Rust.
+## Fixed board assumptions
 
-Current bring-up is done in direct-boot mode with the application linked at
-`0x00000000`. Bootloader integration is a later step and is intentionally kept
-separate from Zigbee stack stabilization.
+| Function | Configuration |
+|---|---|
+| HFXO/HCLK | 38.4 MHz, CTUNE 360 |
+| LED | PA0, active high |
+| Button | PB13, active low, pull-up/filter |
+| I2C0 SDA/SCL | PC10/PC11, LOC15, open drain |
+| I2C speed | 10 kHz with weak internal pull-ups for bring-up margin |
+| SHT3x | Probe `0x44`, then `0x45` only |
 
-## Hardware
+The controller supports external pull-ups, but this board definition
+intentionally uses the known native-project internal-pull-up configuration.
 
-- **MCU:** EFR32MG1P (256KB flash, 32KB SRAM) — ARM Cortex-M4F @ 40 MHz
-- **Radio:** Built-in 2.4 GHz IEEE 802.15.4 + BLE (pure Rust driver)
-- **Boards:** IKEA TRÅDFRI modules, Thunderboard Sense (BRD4151A), BRD4100A
-- **Button:** Adjust GPIO pin in `pins` module for your board
-- **LED:** Adjust GPIO pin in `pins` module for your board
+## Bootloader-safe memory map
 
-## Prerequisites
-
-- Rust nightly with `thumbv7em-none-eabi` target
-- Any ARM SWD debugger (J-Link, ST-Link, DAPLink, etc.)
-
-```bash
-rustup target add thumbv7em-none-eabi
+```text
+0x00000000..0x00003FFF  resident Gecko bootloader (not emitted)
+0x00004000..0x00039FFF  Rust application
+0x0003A000..0x0003FFFF  existing native NVM3 (preserved)
+0x20000000..0x20007BFF  usable SRAM (0x7C00 bytes)
 ```
 
-## Vendor Library Setup
+The custom board linker script places the vector table at `0x4000` and writes
+the `APP_PROPERTIES` address at vector word 13 (`0x4034`). `cortex-m-rt`'s
+`set-vtor` startup writes `SCB->VTOR = 0x4000` before Rust initialization.
 
-**None required!** 🎉
+## Profiles
 
-The EFR32MG1P radio driver is implemented entirely in Rust using direct register
-access. No GSDK, no RAIL library, no precompiled `.a` files, no environment
-variables to configure.
+- `sensor` (default): existing full Zigbee SED; its application measurements
+  remain simulated for now.
+- `diag-sht`: HFXO, SysTick/RTT, PA0 LED, I2C0, and real SHT3x only; no NV/radio.
+- `diag-beacon`: radio TX/active-scan diagnostic.
+- `diag-join`: Zigbee join/poll diagnostic.
 
-## Modes
+Exactly one profile must be enabled.
 
-- `sensor` - default full Zigbee sleepy end-device example
-- `diag-join` - minimal Zigbee join/poll runtime without sensor reporting
-- `diag-beacon` - pure radio bring-up mode for active scan / beacon RX only
+## Build and verify
 
-## Building
+Run Cargo from this directory so `.cargo/config.toml` supplies the Cortex-M
+target, build-std, and bootloader linker script:
 
 ```bash
 cd examples/efr32mg1-sensor
+
 cargo build --release
-cargo build --release --no-default-features --features diag-join
+cargo build --release --no-default-features --features diag-sht
 cargo build --release --no-default-features --features diag-beacon
+cargo build --release --no-default-features --features diag-join
+
+tools/verify-layout.py \
+  target/thumbv7em-none-eabi/release/efr32mg1-sensor
 ```
 
-No GSDK or RAIL headers are required for the pure-Rust path.
+The ELF artifact is:
 
-## Flashing
-
-Use any ARM SWD debugger — the EFR32MG1P is a standard Cortex-M4F:
-
-```bash
-# With probe-rs
-probe-rs run --chip EFR32MG1P target/thumbv7em-none-eabi/release/efr32mg1-sensor
-
-# With openocd
-openocd -f interface/cmsis-dap.cfg -f target/efm32.cfg \
-  -c "program target/thumbv7em-none-eabi/release/efr32mg1-sensor verify reset exit"
-
-# With Simplicity Commander (Silicon Labs tool)
-commander flash target/thumbv7em-none-eabi/release/efr32mg1-sensor.hex
+```text
+target/thumbv7em-none-eabi/release/efr32mg1-sensor
 ```
 
-For the local Commander installation on this machine:
+Create a range-limited Intel HEX only after layout verification:
 
 ```bash
-/Applications/Commander-cli.app/Contents/MacOS/commander-cli flash \
+rust-objcopy -O ihex \
   target/thumbv7em-none-eabi/release/efr32mg1-sensor \
-  --device EFR32MG1P132F256
+  target/thumbv7em-none-eabi/release/efr32mg1-sensor.hex
 ```
 
-Recommended direct-boot cycle during bring-up:
+The verifier rejects a first file-backed load below `0x4000`, a load entering
+`0x3A000`, an invalid SP, a missing application-properties pointer, or a Reset
+handler without the early VTOR write.
+
+## `diag-sht` RTT markers
+
+The diagnostic performs:
+
+1. bounded 38.4 MHz HFXO startup;
+2. I2C0 initialization and bus recovery if SDA/SCL are not idle;
+3. soft reset (`30 A2`) and 2 ms wait;
+4. status read (`F3 2D`) with CRC validation;
+5. high-repeatability single shot (`24 00`), 20 ms wait, six-byte read;
+6. independent temperature and humidity CRC checks.
+
+Expected markers include:
+
+```text
+[EFR32][diag-sht] CLOCK_READY ...
+[EFR32][diag-sht] I2C_READY ...
+[EFR32][diag-sht] SHT_FOUND address=0x44 status=... crc=ok
+[EFR32][diag-sht] MEAS_OK ... temp_centi_c=... humidity_centi_percent=... crc=ok
+```
+
+Probe, status, CRC, transfer, and clock failures have distinct RTT markers.
+
+## Hardware-proven `diag-sht`
+
+The isolated diagnostic is proven on the connected
+`EFR32MG1P132F256IM32`:
+
+- resident bootloader and `0x3A000..0x3FFFF` native NVM3 remained unchanged;
+- HFXO/HCLK started at 38.4 MHz with CTUNE 360;
+- SHT3x was detected at `0x44`, status CRC passed;
+- a 140-sample 10 kHz stress run completed with zero I2C or CRC errors after
+  enabling the Series-1 GPIO input filter;
+- observed values were approximately 25.2 °C and 66.6 %RH.
+
+Only `diag-sht` is currently authorized for hardware use. The default Zigbee
+profile still initializes Rust NV inside the legacy NVM3 range and must not be
+flashed until the persistence migration is explicit.
+
+Safe identification/read-only checks remain:
 
 ```bash
-/Applications/Commander-cli.app/Contents/MacOS/commander-cli device masserase \
-  --device EFR32MG1P132F256
-
-/Applications/Commander-cli.app/Contents/MacOS/commander-cli flash \
-  target/thumbv7em-none-eabi/release/efr32mg1-sensor \
-  --device EFR32MG1P132F256
+commander adapter probe
+commander device info --device EFR32MG1P132F256IM32
+commander readmem --device EFR32MG1P132F256IM32 --range 0x00000000:+0x40
+commander readmem --device EFR32MG1P132F256IM32 --range 0x00004000:+0x40
 ```
 
-## Beacon Diagnostics
-
-The recommended first bring-up step on real hardware is beacon RX on a single
-channel before trying association or the full Zigbee runtime.
-
-Build and flash the radio-only diagnostic image:
+Build and verify `diag-sht`, then perform a page-limited flash with no
+mass-erase/recover option:
 
 ```bash
 cd examples/efr32mg1-sensor
-cargo build --release --no-default-features --features diag-beacon
-
-/Applications/Commander-cli.app/Contents/MacOS/commander-cli flash \
+cargo build --release --no-default-features --features diag-sht
+tools/verify-layout.py target/thumbv7em-none-eabi/release/efr32mg1-sensor
+rust-objcopy -O ihex \
   target/thumbv7em-none-eabi/release/efr32mg1-sensor \
-  --device EFR32MG1P132F256
+  target/thumbv7em-none-eabi/release/efr32mg1-sensor.hex
+commander flash \
+  target/thumbv7em-none-eabi/release/efr32mg1-sensor.hex \
+  --device EFR32MG1P132F256IM32
 ```
 
-Read logs over RTT or SWO:
+Never use `device masserase` for this layout. Re-read vectors at `0x0` and
+`0x4000`, then attach RTT without requesting an erase.
 
-```bash
-/Applications/Commander-cli.app/Contents/MacOS/commander-cli rtt connect \
-  --device EFR32MG1P132F256
+## Architecture
 
-/Applications/Commander-cli.app/Contents/MacOS/commander-cli swo read \
-  --device EFR32MG1P132F256
-```
+- `efr32mg1-hal`: raw CMU/MSC wait-state, GPIO, and I2C0 controller code.
+- `boards/efr32mg1-tradfri`: HFXO/pin/LOC/I2C speed and application flash map.
+- `drivers/sht3x`: generic blocking embedded-hal 1.0 SHT3x protocol.
+- this example: profile sequencing, Embassy timers, RTT, and LED patterns.
 
-The diagnostic firmware:
-
-- initializes the pure-Rust radio path
-- performs repeated active scans on channel 15
-- prints beacon count and parsed PAN descriptors
-- blinks the LED twice when at least one beacon is received
-
-## Join Diagnostics
-
-Use `diag-join` after beacon RX is confirmed. This image keeps the full
-MAC/NWK/APS/BDB join path but removes the sensor reporting workload.
-
-For the full local ZHA + sniffer + nRF baseline workflow, see
-[`docs/efr32-join-debug.md`](../../docs/efr32-join-debug.md).
-
-```bash
-cd examples/efr32mg1-sensor
-cargo build --release --no-default-features --features diag-join
-
-/Applications/Commander-cli.app/Contents/MacOS/commander-cli flash \
-  target/thumbv7em-none-eabi/release/efr32mg1-sensor \
-  --device EFR32MG1P132F256
-```
-
-`diag-join`:
-
-- requests join on boot
-- retries join every 15 seconds when not attached
-- polls the parent aggressively right after join
-- logs join and incoming poll traffic over RTT
-
-Useful register snapshots during parity work:
-
-```bash
-/Applications/Commander-cli.app/Contents/MacOS/commander-cli readmem \
-  --device EFR32MG1P132F256 \
-  --range 0x40080000:+0x200
-
-/Applications/Commander-cli.app/Contents/MacOS/commander-cli readmem \
-  --device EFR32MG1P132F256 \
-  --range 0x40083000:+0x100
-
-/Applications/Commander-cli.app/Contents/MacOS/commander-cli readmem \
-  --device EFR32MG1P132F256 \
-  --range 0x40084000:+0x180
-```
-
-## What It Demonstrates
-
-- **Pure-Rust IEEE 802.15.4 radio driver** for EFR32MG1P (no RAIL/GSDK)
-- Zigbee 3.0 end device on the popular EFR32MG1P platform
-- Embassy async runtime on Cortex-M4F with SysTick time driver
-- Proper interrupt vector table (34 entries for all EFR32MG1P peripherals)
-- No vendor dependencies — fully auditable, reproducible builds
-- Button-driven network join/leave with edge detection
-- LED status indication + identify blink
-- ZCL Temperature Measurement + Relative Humidity + Identify clusters
-- Flash NV storage — network state persists across reboots
-- Default reporting with reportable change thresholds
-- Radio sleep/wake for power management
-
-## Radio Architecture
-
-The EFR32MG1P radio consists of several interconnected blocks:
-
-| Block | Base Address | Function |
-|-------|-------------|----------|
-| RAC   | 0x40084000  | Radio Controller — state machine, PA |
-| FRC   | 0x40080000  | Frame Controller — CRC, format |
-| MODEM | 0x40086000  | O-QPSK modulation/demodulation |
-| SYNTH | 0x40083000  | PLL frequency synthesizer |
-| AGC   | 0x40087000  | Automatic gain control, RSSI |
-| BUFC  | 0x40082000  | TX/RX buffer controller |
-
-All blocks are configured via memory-mapped registers — no co-processor
-or mailbox protocol needed.
-
-## Project Structure
-
-```
-efr32mg1-sensor/
-├── .cargo/config.toml   # Target: thumbv7em-none-eabi, build-std
-├── Cargo.toml            # Dependencies (no vendor libs!)
-├── device.x              # EFR32MG1P interrupt vector names (34 IRQs)
-└── src/
-    ├── main.rs           # Entry point, device setup, sensor loop
-    ├── time_driver.rs    # Embassy time driver (SysTick, 1ms tick)
-    ├── vectors.rs        # Interrupt vector table + NVIC Interrupt enum
-    └── stubs.rs          # CI stubs (not needed for real builds)
-```
-
-`efr32mg1-hal` owns the MSC flash controller. `boards/efr32mg1-tradfri` owns
-the bounded application-NV partition and direct-boot linker layout.
+DCDC and EM2 are deliberately deferred. Phase 1/2 runs in normal active mode;
+power management begins only after sensor and radio behavior are proven.

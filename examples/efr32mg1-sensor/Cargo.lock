@@ -156,6 +156,7 @@ dependencies = [
 name = "efr32mg1-hal"
 version = "0.1.0"
 dependencies = [
+ "embedded-hal 1.0.0",
  "embedded-storage",
 ]
 
@@ -179,6 +180,7 @@ dependencies = [
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-runtime",
+ "zigbee-sht3x",
  "zigbee-types",
  "zigbee-zcl",
 ]
@@ -666,6 +668,13 @@ dependencies = [
  "zigbee-types",
  "zigbee-zcl",
  "zigbee-zdo",
+]
+
+[[package]]
+name = "zigbee-sht3x"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
 ]
 
 [[package]]

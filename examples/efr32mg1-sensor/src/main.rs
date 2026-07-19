@@ -4,7 +4,7 @@
 //! Pure-Rust radio driver — no RAIL library, no GSDK, no binary blobs.
 //!
 //! # Hardware
-//! - EFR32MG1P (256KB flash, 32KB SRAM), ARM Cortex-M4F @ 40 MHz
+//! - EFR32MG1P (256KB flash, 31KB SRAM), ARM Cortex-M4F @ 38.4 MHz
 //! - 2.4 GHz radio with IEEE 802.15.4 + BLE support
 //! - Common boards: IKEA TRÅDFRI, Thunderboard Sense, BRD4151A
 //!
@@ -24,20 +24,35 @@
 #![no_std]
 #![no_main]
 
-#[cfg(not(any(feature = "sensor", feature = "diag-beacon", feature = "diag-join")))]
-compile_error!("enable exactly one of `sensor`, `diag-join`, or `diag-beacon`");
+#[cfg(not(any(
+    feature = "sensor",
+    feature = "diag-beacon",
+    feature = "diag-join",
+    feature = "diag-sht"
+)))]
+compile_error!("enable exactly one of `sensor`, `diag-join`, `diag-beacon`, or `diag-sht`");
 
 #[cfg(any(
     all(feature = "sensor", feature = "diag-beacon"),
     all(feature = "sensor", feature = "diag-join"),
+    all(feature = "sensor", feature = "diag-sht"),
     all(feature = "diag-beacon", feature = "diag-join"),
+    all(feature = "diag-beacon", feature = "diag-sht"),
+    all(feature = "diag-join", feature = "diag-sht"),
 ))]
-compile_error!("features `sensor`, `diag-join`, and `diag-beacon` are mutually exclusive");
+compile_error!(
+    "features `sensor`, `diag-join`, `diag-beacon`, and `diag-sht` are mutually exclusive"
+);
 
 #[cfg(feature = "stubs")]
 mod stubs;
 
-#[cfg(feature = "sensor")]
+#[cfg(any(
+    feature = "sensor",
+    feature = "diag-beacon",
+    feature = "diag-join",
+    feature = "diag-sht"
+))]
 mod time_driver;
 mod vectors;
 
@@ -90,51 +105,6 @@ fn init_logging() {
     }
 }
 
-// ── Gecko Bootloader Application Properties ─────────────────────
-//
-// The Gecko Bootloader requires an ApplicationProperties_t struct
-// in flash so it can identify, validate, and boot the application.
-// The bootloader finds it via word 13 (offset 0x34) of the vector table.
-//
-// Struct layout from Silicon Labs application_properties.h:
-//   magic[16]         — 16-byte magic identifier
-//   structVersion     — version of this struct (0x0100)
-//   signatureType     — 0 = none, 1 = ECDSA-P256, 2 = CRC32
-//   signatureLocation — address of signature (0xFFFFFFFF = none)
-//   app.type          — APPLICATION_TYPE_ZIGBEE = 1
-//   app.version       — application version number
-//   app.capabilities  — 0
-//   app.productId[16] — UUID (all zeros)
-
-#[repr(C)]
-struct ApplicationProperties {
-    magic: [u8; 16],
-    struct_version: u32,
-    signature_type: u32,
-    signature_location: u32,
-    // ApplicationData_t inline:
-    app_type: u32,
-    app_version: u32,
-    app_capabilities: u32,
-    app_product_id: [u8; 16],
-}
-
-#[unsafe(no_mangle)]
-#[used]
-static APP_PROPERTIES: ApplicationProperties = ApplicationProperties {
-    magic: [
-        0x13, 0xb7, 0x79, 0xfa, 0xc9, 0x25, 0xdd, 0xb7, 0xad, 0xf3, 0xcf, 0xe0, 0xf1, 0xb6, 0x14,
-        0xb8,
-    ],
-    struct_version: 0x0000_0100,     // Version 1.0
-    signature_type: 0,               // APPLICATION_SIGNATURE_NONE
-    signature_location: 0xFFFF_FFFF, // No signature
-    app_type: 1,                     // APPLICATION_TYPE_ZIGBEE
-    app_version: 1,                  // Version 1
-    app_capabilities: 0,
-    app_product_id: [0u8; 16],
-};
-
 #[repr(C)]
 struct FaultLog {
     hardfault_magic: u32,
@@ -159,20 +129,6 @@ unsafe fn fault_log_mut() -> *mut FaultLog {
     core::ptr::addr_of_mut!(FAULT_LOG).cast::<FaultLog>()
 }
 
-// ── VTOR setup ──────────────────────────────────────────────────
-//
-// When booting via Gecko Bootloader at 0x4000, uncomment this to
-// redirect the vector table. For bare-metal boot at 0x0, VTOR
-// defaults to 0x0 which is correct.
-
-// When using Gecko Bootloader (app at 0x4000), uncomment to redirect VTOR:
-// #[cortex_m_rt::pre_init]
-// unsafe fn pre_init() {
-//     unsafe {
-//         core::ptr::write_volatile(0xE000_ED08 as *mut u32, 0x0000_4000);
-//     }
-// }
-
 // Custom HardFault handler that saves faulting PC to known RAM location
 // so we can read it via J-Link after the crash.
 #[cortex_m_rt::exception]
@@ -182,12 +138,12 @@ unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
         core::arch::asm!("mrs {}, msp", out(reg) msp);
         let log = fault_log_mut();
         core::ptr::addr_of_mut!((*log).hardfault_magic).write_volatile(0xDEAD_BEEF);
-        core::ptr::addr_of_mut!((*log).hardfault_pc).write_volatile(ef.pc() as u32);
-        core::ptr::addr_of_mut!((*log).hardfault_lr).write_volatile(ef.lr() as u32);
-        core::ptr::addr_of_mut!((*log).hardfault_xpsr).write_volatile(ef.xpsr() as u32);
+        core::ptr::addr_of_mut!((*log).hardfault_pc).write_volatile(ef.pc());
+        core::ptr::addr_of_mut!((*log).hardfault_lr).write_volatile(ef.lr());
+        core::ptr::addr_of_mut!((*log).hardfault_xpsr).write_volatile(ef.xpsr());
         core::ptr::addr_of_mut!((*log).hardfault_msp).write_volatile(msp);
-        core::ptr::addr_of_mut!((*log).hardfault_r0).write_volatile(ef.r0() as u32);
-        core::ptr::addr_of_mut!((*log).hardfault_r12).write_volatile(ef.r12() as u32);
+        core::ptr::addr_of_mut!((*log).hardfault_r0).write_volatile(ef.r0());
+        core::ptr::addr_of_mut!((*log).hardfault_r12).write_volatile(ef.r12());
     }
     loop {
         cortex_m::asm::nop();
@@ -218,11 +174,11 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     }
 }
 
-// Set VTOR to 0x4000 — required when Gecko Bootloader is present.
-// The bootloader at 0x0 jumps to our app at 0x4000, but cortex-m-rt
-// reset handler may run before VTOR is properly set.
-
+#[cfg(feature = "sensor")]
 use efr32mg1_tradfri::storage::{self, ApplicationNv};
+#[cfg(feature = "sensor")]
+use efr32mg1_tradfri::Button;
+use efr32mg1_tradfri::Led;
 #[cfg(feature = "sensor")]
 use embassy_executor::Spawner;
 #[cfg(any(feature = "sensor", feature = "diag-join"))]
@@ -237,6 +193,7 @@ use static_cell::StaticCell;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 #[cfg(any(feature = "diag-beacon", feature = "diag-join"))]
 use zigbee_mac::MacDriver;
+#[cfg(any(feature = "sensor", feature = "diag-beacon", feature = "diag-join"))]
 use zigbee_mac::efr32::Efr32Mac;
 #[cfg(feature = "diag-beacon")]
 use zigbee_mac::frames::build_beacon_request;
@@ -305,67 +262,62 @@ const DIAG_JOIN_MASK_2GHZ: ChannelMask = ChannelMask::ALL_2_4GHZ;
 const DIAG_TX_TEST_SEQ: u8 = 0xA5;
 #[cfg(feature = "diag-beacon")]
 const DIAG_TX_PRESCAN_BURSTS: u8 = 8;
+#[cfg(feature = "diag-sht")]
+const DIAG_SHT_SAMPLE_INTERVAL_MS: u64 = 2_000;
 
-// ── EFR32MG1P GPIO ─────────────────────────────────────────────
+// ── TRÅDFRI board startup and GPIO ──────────────────────────────
 
-mod pins {
-    // GPIO pin numbers — adjust for your board
-    pub const LED: u8 = 6; // LED on PF6 (Thunderboard Sense)
-    #[cfg(feature = "sensor")]
-    #[allow(dead_code)]
-    pub const BTN: u8 = 7; // Button on PF7 (Thunderboard Sense)
-}
-
-// Simple GPIO access via memory-mapped registers
-// EFR32MG1P GPIO base = 0x4000_A000
-fn gpio_set_output(pin: u8) {
-    let port = (pin / 16) as u32;
-    let pin_in_port = (pin % 16) as u32;
-    let mode_reg = 0x4000_A004 + port * 0x30 + if pin_in_port >= 8 { 4 } else { 0 };
-    let shift = (pin_in_port % 8) * 4;
-    unsafe {
-        let old = core::ptr::read_volatile(mode_reg as *const u32);
-        // Mode 4 = push-pull output
-        core::ptr::write_volatile(mode_reg as *mut u32, (old & !(0xF << shift)) | (4 << shift));
-    }
-}
-
-fn gpio_write(pin: u8, high: bool) {
-    let port = (pin / 16) as u32;
-    let pin_in_port = (pin % 16) as u32;
-    let reg = if high {
-        0x4000_A018 + port * 0x30 // DOUTSET
-    } else {
-        0x4000_A01C + port * 0x30 // DOUTCLR
-    };
-    unsafe {
-        core::ptr::write_volatile(reg as *mut u32, 1 << pin_in_port);
-    }
-}
-
+static BOARD_LED: Led = Led::new();
 #[cfg(feature = "sensor")]
-fn gpio_read(pin: u8) -> bool {
-    let port = (pin / 16) as u32;
-    let pin_in_port = (pin % 16) as u32;
-    let din_reg = 0x4000_A010 + port * 0x30; // DIN
-    let val = unsafe { core::ptr::read_volatile(din_reg as *const u32) };
-    (val >> pin_in_port) & 1 != 0
-}
+static BOARD_BUTTON: Button = Button::new();
 
 fn led_on() {
-    gpio_write(pins::LED, true);
+    BOARD_LED.on();
 }
 fn led_off() {
-    gpio_write(pins::LED, false);
+    BOARD_LED.off();
+}
+
+fn platform_init(profile: &str) {
+    init_logging();
+    // GPIO is usable from reset HFRCO, so clock failures can still be marked.
+    BOARD_LED.init();
+    led_off();
+    #[cfg(feature = "sensor")]
+    BOARD_BUTTON.init();
+
+    match efr32mg1_tradfri::init_clocks() {
+        Ok(()) => {
+            rtt_target::rprintln!(
+                "[EFR32][{}] CLOCK_READY hclk={} ctune={}",
+                profile,
+                efr32mg1_tradfri::HCLK_HZ,
+                efr32mg1_tradfri::HFXO_CTUNE
+            );
+        }
+        Err(error) => {
+            rtt_target::rprintln!("[EFR32][{}] CLOCK_FATAL {:?}", profile, error);
+            loop {
+                led_on();
+                busy_delay();
+                led_off();
+                busy_delay();
+            }
+        }
+    }
+    time_driver::init();
+}
+
+#[inline(never)]
+fn busy_delay() {
+    for _ in 0..750_000 {
+        cortex_m::asm::nop();
+    }
 }
 
 #[cfg(feature = "sensor")]
 async fn boot_signal() {
-    init_logging();
-    time_driver::init();
-
-    gpio_set_output(pins::LED);
-    led_off();
+    platform_init("sensor");
 
     for _ in 0..3u8 {
         led_on();
@@ -815,7 +767,7 @@ impl SensorApp {
     async fn handle_button_press(&mut self) {
         let mut held_long = false;
         let press_start = Instant::now();
-        while !gpio_read(pins::BTN) {
+        while BOARD_BUTTON.is_pressed() {
             if press_start.elapsed().as_secs() >= 3 {
                 held_long = true;
                 break;
@@ -994,16 +946,20 @@ impl SensorApp {
         self.service_joined_polls().await;
 
         let tick_elapsed = self.update_measurements(now);
-        if let TickResult::Event(ref e) = sensor_tick_handles(self.handles(), tick_elapsed).await {
-            if log_event(e) {
-                self.reset_post_join_state();
-            }
+        if let TickResult::Event(ref e) =
+            sensor_tick_handles(self.handles(), tick_elapsed).await
+            && log_event(e)
+        {
+            self.reset_post_join_state();
         }
 
         self.identify_cluster.tick(tick_elapsed);
         if self.identify_cluster.is_identifying() {
-            let on = gpio_read(pins::LED);
-            gpio_write(pins::LED, !on);
+            if BOARD_LED.is_on() {
+                led_off();
+            } else {
+                led_on();
+            }
         }
 
         if self.annce_retries_left > 0 && now.duration_since(self.last_annce).as_secs() >= 8 {
@@ -1070,7 +1026,6 @@ async fn main(_spawner: Spawner) {
 
     rtt_target::rprintln!("[EFR32] Starting...");
 
-    gpio_set_output(pins::LED);
     led_off();
     for _ in 0..3u8 {
         led_on();
@@ -1145,6 +1100,147 @@ async fn main(_spawner: Spawner) {
     ));
     app.needs_bootstrap_join = needs_bootstrap_join;
     app.run().await
+}
+
+// ── Phase 2 SHT3x-only diagnostic ───────────────────────────────
+
+#[cfg(feature = "diag-sht")]
+async fn diag_sht_probe(
+    mut i2c: efr32mg1_tradfri::SensorI2c,
+) -> zigbee_sht3x::Sht3x<efr32mg1_tradfri::SensorI2c> {
+    loop {
+        for address in [
+            zigbee_sht3x::PRIMARY_ADDRESS,
+            zigbee_sht3x::SECONDARY_ADDRESS,
+        ] {
+            rtt_target::rprintln!("[EFR32][diag-sht] PROBE address=0x{:02X}", address);
+            let mut sensor = zigbee_sht3x::Sht3x::new(i2c, address);
+
+            match sensor.soft_reset() {
+                Ok(()) => {
+                    Timer::after(Duration::from_millis(2)).await;
+                    match sensor.read_status() {
+                        Ok(status) => {
+                            rtt_target::rprintln!(
+                                "[EFR32][diag-sht] SHT_FOUND address=0x{:02X} status=0x{:04X} crc=ok",
+                                address,
+                                status.raw
+                            );
+                            return sensor;
+                        }
+                        Err(error) => {
+                            rtt_target::rprintln!(
+                                "[EFR32][diag-sht] STATUS_ERROR address=0x{:02X} error={:?}",
+                                address,
+                                error
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    rtt_target::rprintln!(
+                        "[EFR32][diag-sht] PROBE_MISS address=0x{:02X} error={:?}",
+                        address,
+                        error
+                    );
+                }
+            }
+            i2c = sensor.release();
+        }
+
+        rtt_target::rprintln!("[EFR32][diag-sht] SHT_NOT_FOUND retry_ms=3000");
+        for _ in 0..2 {
+            led_on();
+            Timer::after(Duration::from_millis(100)).await;
+            led_off();
+            Timer::after(Duration::from_millis(100)).await;
+        }
+        Timer::after(Duration::from_millis(2_600)).await;
+    }
+}
+
+#[cfg(feature = "diag-sht")]
+#[embassy_executor::task]
+async fn diag_sht_task(i2c: efr32mg1_tradfri::SensorI2c) -> ! {
+    rtt_target::rprintln!(
+        "[EFR32][diag-sht] I2C_READY controller=I2C0 sda=PC10 scl=PC11 loc=15 hz={}",
+        efr32mg1_tradfri::SENSOR_I2C_HZ
+    );
+    let mut sensor = diag_sht_probe(i2c).await;
+    let mut successful_samples = 0u32;
+    let mut failed_samples = 0u32;
+
+    loop {
+        match sensor.start_measurement() {
+            Ok(()) => {
+                Timer::after(Duration::from_millis(20)).await;
+                match sensor.read_measurement() {
+                    Ok(measurement) => {
+                        successful_samples = successful_samples.wrapping_add(1);
+                        rtt_target::rprintln!(
+                            "[EFR32][diag-sht] MEAS_OK seq={} errors={} address=0x{:02X} temp_centi_c={} humidity_centi_percent={} crc=ok",
+                            successful_samples,
+                            failed_samples,
+                            sensor.address(),
+                            measurement.temperature_centi_celsius,
+                            measurement.humidity_centi_percent
+                        );
+                        led_on();
+                        Timer::after(Duration::from_millis(80)).await;
+                        led_off();
+                    }
+                    Err(error) => {
+                        failed_samples = failed_samples.wrapping_add(1);
+                        rtt_target::rprintln!(
+                            "[EFR32][diag-sht] MEAS_READ_ERROR seq={} errors={} error={:?}",
+                            successful_samples,
+                            failed_samples,
+                            error
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                failed_samples = failed_samples.wrapping_add(1);
+                rtt_target::rprintln!(
+                    "[EFR32][diag-sht] MEAS_START_ERROR seq={} errors={} error={:?}",
+                    successful_samples,
+                    failed_samples,
+                    error
+                );
+            }
+        }
+        Timer::after(Duration::from_millis(DIAG_SHT_SAMPLE_INTERVAL_MS)).await;
+    }
+}
+
+#[cfg(feature = "diag-sht")]
+#[cortex_m_rt::entry]
+fn diag_sht_entry() -> ! {
+    platform_init("diag-sht");
+    rtt_target::rprintln!("[EFR32][diag-sht] BOOT phase=2 nv=off radio=off");
+
+    let i2c = match efr32mg1_tradfri::sensor_i2c() {
+        Ok(i2c) => i2c,
+        Err(error) => {
+            rtt_target::rprintln!("[EFR32][diag-sht] I2C_FATAL error={:?}", error);
+            loop {
+                for _ in 0..3 {
+                    led_on();
+                    busy_delay();
+                    led_off();
+                    busy_delay();
+                }
+                busy_delay();
+                busy_delay();
+            }
+        }
+    };
+
+    static EXECUTOR: static_cell::StaticCell<embassy_executor::Executor> =
+        static_cell::StaticCell::new();
+    let executor = EXECUTOR.init(embassy_executor::Executor::new());
+    executor.run(|spawner| spawner.must_spawn(diag_sht_task(i2c)))
 }
 
 #[cfg(feature = "diag-join")]
@@ -1346,8 +1442,12 @@ impl DiagJoinApp {
             nib.pan_id.0
         );
         match self.device.send_device_annce().await {
-            Ok(()) => rtt_target::rprintln!("[EFR32][diag-join] device_annce retry=ok"),
-            Err(e) => rtt_target::rprintln!("[EFR32][diag-join] device_annce retry=err {:?}", e),
+            Ok(()) => {
+                rtt_target::rprintln!("[EFR32][diag-join] device_annce retry=ok");
+            }
+            Err(e) => {
+                rtt_target::rprintln!("[EFR32][diag-join] device_annce retry=err {:?}", e);
+            }
         }
     }
 
@@ -1369,15 +1469,19 @@ impl DiagJoinApp {
         self.last_annce_retry = now;
         self.annce_retries = self.annce_retries.wrapping_add(1);
         match self.device.send_device_annce().await {
-            Ok(()) => rtt_target::rprintln!(
-                "[EFR32][diag-join] periodic device_annce {}=ok",
-                self.annce_retries
-            ),
-            Err(e) => rtt_target::rprintln!(
-                "[EFR32][diag-join] periodic device_annce {}=err {:?}",
-                self.annce_retries,
-                e
-            ),
+            Ok(()) => {
+                rtt_target::rprintln!(
+                    "[EFR32][diag-join] periodic device_annce {}=ok",
+                    self.annce_retries
+                );
+            }
+            Err(e) => {
+                rtt_target::rprintln!(
+                    "[EFR32][diag-join] periodic device_annce {}=err {:?}",
+                    self.annce_retries,
+                    e
+                );
+            }
         }
     }
 
@@ -1572,10 +1676,7 @@ async fn diag_join_task(app: &'static mut DiagJoinApp) -> ! {
 #[cortex_m_rt::entry]
 fn diag_join_entry() -> ! {
     // Sync boot init (what boot_signal() does minus the async waits).
-    init_logging();
-    time_driver::init();
-    gpio_set_output(pins::LED);
-    led_off();
+    platform_init("diag-join");
     rtt_target::rprintln!("[EFR32][diag-join] Booted");
 
     // Heavy build runs in #[entry] stack frame BEFORE executor starts,
@@ -1663,8 +1764,12 @@ async fn diag_data_probe_tx(mac: &mut Efr32Mac, seq: u8, marker: u8) {
     );
 
     match mac.debug_transmit_raw(&frame).await {
-        Ok(_) => rtt_target::rprintln!("[EFR32][diag-beacon] tx-data=ok"),
-        Err(err) => rtt_target::rprintln!("[EFR32][diag-beacon] tx-data=err {:?}", err),
+        Ok(_) => {
+            rtt_target::rprintln!("[EFR32][diag-beacon] tx-data=ok");
+        }
+        Err(err) => {
+            rtt_target::rprintln!("[EFR32][diag-beacon] tx-data=err {:?}", err);
+        }
     }
 }
 
@@ -1770,10 +1875,7 @@ async fn diag_beacon_task(mut mac: Efr32Mac) -> ! {
 #[cfg(feature = "diag-beacon")]
 #[cortex_m_rt::entry]
 fn diag_beacon_entry() -> ! {
-    init_logging();
-    time_driver::init();
-    gpio_set_output(pins::LED);
-    led_off();
+    platform_init("diag-beacon");
     rtt_target::rprintln!("[EFR32][diag-beacon] Booted");
 
     let mac = Efr32Mac::new();

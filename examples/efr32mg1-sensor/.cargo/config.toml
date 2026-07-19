@@ -4,7 +4,8 @@ target = "thumbv7em-none-eabi"
 [target.thumbv7em-none-eabi]
 rustflags = [
     "-L", "../../boards/efr32mg1-tradfri/link",
-    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=-Tbootloader-app.x",
+    "-C", "link-arg=--nmagic",
 ]
 
 [unstable]

@@ -178,10 +178,13 @@ cargo build --release   # no stubs, no vendor blobs needed!
 ```bash
 cd examples/efr32mg1-sensor
 cargo build --release   # no stubs, no GSDK, no RAIL library needed!
+cargo build --release --no-default-features --features diag-sht
+tools/verify-layout.py target/thumbv7em-none-eabi/release/efr32mg1-sensor
 ```
 
-> Series 1 Cortex-M4F — direct register access for the radio. Works with
-> IKEA TRÅDFRI modules and Thunderboard Sense boards.
+> The TRÅDFRI image is linked at `0x4000` for the resident Gecko bootloader.
+> `diag-sht` brings up PA0 and SHT3x on I2C0 PC10/PC11 without NV or radio.
+> Verify the ELF before creating a flash image.
 
 ### EFR32MG21 firmware (pure Rust — no vendor SDK!)
 
