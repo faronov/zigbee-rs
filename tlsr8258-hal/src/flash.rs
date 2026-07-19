@@ -3,6 +3,10 @@
 
 #![cfg(target_arch = "tc32")]
 
+use embedded_storage::nor_flash::{
+    ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
+};
+
 const REG_MSPI_DATA: u32 = 0x80000C;
 const REG_MSPI_CTRL: u32 = 0x80000D;
 const REG_IRQ_EN: u32 = 0x800643;
@@ -35,6 +39,89 @@ pub enum FlashError {
     /// relative to the Zbit safety thresholds — a genuinely low or noisy
     /// supply, distinct from [`FlashError::VoltageGuardUnavailable`].
     VoltageUnsafe,
+}
+
+impl NorFlashError for FlashError {
+    fn kind(&self) -> NorFlashErrorKind {
+        match self {
+            Self::AddressOverflow => NorFlashErrorKind::OutOfBounds,
+            Self::UnalignedSector => NorFlashErrorKind::NotAligned,
+            Self::Timeout
+            | Self::BufferNotInRam
+            | Self::VoltageGuardUnavailable
+            | Self::VoltageUnsafe => NorFlashErrorKind::Other,
+        }
+    }
+}
+
+/// Full-chip TLSR8258 NOR flash controller.
+///
+/// Board crates provide the guaranteed flash capacity and expose bounded
+/// partitions to applications.
+pub struct Tlsr8258Flash {
+    capacity: usize,
+}
+
+impl Tlsr8258Flash {
+    pub const fn new(capacity: usize) -> Self {
+        Self { capacity }
+    }
+
+    fn validate_range(&self, address: u32, length: usize) -> Result<(), FlashError> {
+        let start = usize::try_from(address).map_err(|_| FlashError::AddressOverflow)?;
+        start
+            .checked_add(length)
+            .filter(|end| *end <= self.capacity)
+            .map(|_| ())
+            .ok_or(FlashError::AddressOverflow)
+    }
+}
+
+impl ErrorType for Tlsr8258Flash {
+    type Error = FlashError;
+}
+
+impl ReadNorFlash for Tlsr8258Flash {
+    const READ_SIZE: usize = 1;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.validate_range(offset, bytes.len())?;
+        if read_bytes(offset, bytes) {
+            Ok(())
+        } else {
+            Err(FlashError::Timeout)
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+impl NorFlash for Tlsr8258Flash {
+    const WRITE_SIZE: usize = 1;
+    const ERASE_SIZE: usize = SECTOR_SIZE as usize;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        if from >= to {
+            return Err(FlashError::AddressOverflow);
+        }
+        if from & (SECTOR_SIZE - 1) != 0 || to & (SECTOR_SIZE - 1) != 0 {
+            return Err(FlashError::UnalignedSector);
+        }
+        self.validate_range(from, (to - from) as usize)?;
+        let mut address = from;
+        while address < to {
+            erase_sector(address)?;
+            address += SECTOR_SIZE;
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.validate_range(offset, bytes.len())?;
+        program(offset, bytes)
+    }
 }
 
 #[inline(always)]

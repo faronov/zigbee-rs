@@ -89,7 +89,7 @@ async fn run() {
         if is_cold_boot {
             phase_cold_boot(&mut mac, &mut nv).await;
         } else {
-            phase_warm_boot(&nv);
+            phase_warm_boot(&mut nv);
         }
 
         // ── Phase 2: Poll Parent ────────────────────────────
@@ -108,7 +108,7 @@ async fn run() {
             humidity,
             &mut last_reported_temp,
             &mut last_reported_humidity,
-            &nv,
+            &mut nv,
         )
         .await;
         if reported {
@@ -120,7 +120,7 @@ async fn run() {
             phase_checkin(
                 &mut mac,
                 &mut poll_control,
-                &nv,
+                &mut nv,
                 sim_time_ms,
                 &mut power_mgr,
             )
@@ -224,7 +224,7 @@ async fn phase_cold_boot(mac: &mut MockMac, nv: &mut RamNvStorage) {
 }
 
 /// Phase 1b: Warm boot — restore network state from NV.
-fn phase_warm_boot(nv: &RamNvStorage) {
+fn phase_warm_boot(nv: &mut RamNvStorage) {
     println!("  {GREEN}[NV]{RESET} Restoring network state from NV storage");
     if let Some((pan_id, short_addr, channel)) = nv_read_network_state(nv) {
         println!(
@@ -299,7 +299,7 @@ async fn phase_report_attributes(
     humidity: u16,
     last_temp: &mut i16,
     last_humidity: &mut u16,
-    nv: &RamNvStorage,
+    nv: &mut RamNvStorage,
 ) -> bool {
     println!();
 
@@ -369,7 +369,7 @@ async fn phase_report_attributes(
 async fn phase_checkin(
     mac: &mut MockMac,
     poll_control: &mut PollControlCluster,
-    nv: &RamNvStorage,
+    nv: &mut RamNvStorage,
     sim_time_ms: u32,
     power_mgr: &mut PowerManager,
 ) {
@@ -483,7 +483,7 @@ fn nv_write_network_state(nv: &mut RamNvStorage, pan_id: u16, short_addr: u16, c
     let _ = nv.write(NvItemId::BdbNodeIsOnNetwork, &[1u8]);
 }
 
-fn nv_read_network_state(nv: &RamNvStorage) -> Option<(u16, u16, u8)> {
+fn nv_read_network_state(nv: &mut RamNvStorage) -> Option<(u16, u16, u8)> {
     let mut flag = [0u8; 1];
     if nv.read(NvItemId::BdbNodeIsOnNetwork, &mut flag).is_err() || flag[0] == 0 {
         return None;

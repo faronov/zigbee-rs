@@ -15,6 +15,7 @@ zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
+nrf52840-dk = { path = "../../boards/nrf52840-dk" }
 
 # nRF52840 Embassy HAL
 embassy-nrf = { version = "0.3", features = ["nrf52840", "time-driver-rtc1", "gpiote"] }
@@ -27,7 +28,6 @@ defmt = "1.0"
 defmt-rtt = "1.0"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 embedded-hal = "1.0"
-embedded-storage = "0.3"
 log = "0.4"
 
 [profile.release]

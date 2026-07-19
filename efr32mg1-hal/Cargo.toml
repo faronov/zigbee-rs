@@ -1,0 +1,11 @@
+[package]
+name = "efr32mg1-hal"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust EFR32MG1 peripheral support"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+embedded-storage = "0.3"

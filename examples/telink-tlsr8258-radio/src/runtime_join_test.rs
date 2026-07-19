@@ -11,12 +11,12 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use crate::diag::{self, state};
 use crate::platform::timer;
 use tlsr8258_hal::flash;
+use tlsr8258_tb04::storage;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::telink::TelinkMac;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::StartError;
 use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::security_journal::{SecurityJournalStorage, SecurityStateJournal};
 use zigbee_runtime::security_store::SecurityStoreError;
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
 use zigbee_types::ChannelMask;
@@ -27,29 +27,6 @@ use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
 type Device = ZigbeeDevice<TelinkMac>;
-
-const SECURITY_SECTOR_A: u32 = 0x0007_4000;
-const SECURITY_SECTOR_B: u32 = 0x0007_5000;
-
-struct Tlsr8258SecurityFlash;
-
-impl SecurityJournalStorage for Tlsr8258SecurityFlash {
-    fn read(&self, address: u32, output: &mut [u8]) -> Result<(), SecurityStoreError> {
-        if flash::read_bytes(address, output) {
-            Ok(())
-        } else {
-            Err(SecurityStoreError::Hardware)
-        }
-    }
-
-    fn program(&mut self, address: u32, data: &[u8]) -> Result<(), SecurityStoreError> {
-        flash::program(address, data).map_err(|_| SecurityStoreError::Hardware)
-    }
-
-    fn erase_sector(&mut self, address: u32) -> Result<(), SecurityStoreError> {
-        flash::erase_sector(address).map_err(|_| SecurityStoreError::Hardware)
-    }
-}
 
 struct DeviceSlot(UnsafeCell<MaybeUninit<Device>>);
 unsafe impl Sync for DeviceSlot {}
@@ -116,8 +93,7 @@ pub fn run() -> ! {
             cluster: &mut humidity_cluster,
         },
     ];
-    let mut security_store =
-        SecurityStateJournal::new(Tlsr8258SecurityFlash, SECURITY_SECTOR_A, SECURITY_SECTOR_B);
+    let mut security_store = storage::security_store();
 
     diag::update(|record| {
         record.factory_ieee.copy_from_slice(&ieee);

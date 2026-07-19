@@ -1,6 +1,12 @@
 [build]
 target = "thumbv8m.main-none-eabihf"
 
+[target.thumbv8m.main-none-eabihf]
+rustflags = [
+    "-L", "../../boards/efr32mg21-devkit/link",
+    "-C", "link-arg=-Tlink.x",
+]
+
 [unstable]
 build-std = ["core", "alloc"]
 

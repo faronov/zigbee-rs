@@ -2,7 +2,11 @@
 target = "tc32-unknown-none-elf"
 
 [target.tc32-unknown-none-elf]
-rustflags = ["-C", "llvm-args=-enable-tail-merge=false"]
+rustflags = [
+    "-C", "llvm-args=-enable-tail-merge=false",
+    "-C", "link-arg=-T../../boards/tlsr8258-tb04/memory.x",
+    "-C", "link-arg=--gc-sections",
+]
 
 [unstable]
 build-std = ["core"]

@@ -10,6 +10,7 @@ zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
+phy62x2-evk = { path = "../../boards/phy62x2-evk", default-features = false }
 
 # Embassy async runtime
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
@@ -39,8 +40,8 @@ portable-atomic = { version = "1", features = ["critical-section"] }
 
 [features]
 default = ["phy6222"]
-phy6222 = []
-phy6252 = []
+phy6222 = ["phy62x2-evk/phy6222"]
+phy6252 = ["phy62x2-evk/phy6252"]
 stubs = []
 
 [profile.release]

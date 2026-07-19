@@ -39,7 +39,6 @@ use {defmt_rtt as _, panic_probe as _};
 
 #[cfg(feature = "sensor-bme280")]
 mod bme280;
-mod flash_nv;
 #[cfg(feature = "sensor-sht31")]
 mod sht31;
 
@@ -62,11 +61,11 @@ impl log::Log for DefmtLogger {
 }
 static LOGGER: DefmtLogger = DefmtLogger;
 
+use nrf52840_dk::storage;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::security_journal::SecurityStateJournal;
 use zigbee_runtime::security_store::{SecurityStateStore, SecurityStoreError};
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::BasicCluster;
@@ -235,12 +234,7 @@ async fn main(_spawner: Spawner) {
 
     // ── Atomic security journal (last 2 pages of 1 MB flash) ──
     let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
-    let security_flash = flash_nv::Nrf52840SecurityFlash::new(nvmc);
-    let mut security_store = SecurityStateJournal::new(
-        security_flash,
-        flash_nv::SECURITY_PAGE_A,
-        flash_nv::SECURITY_PAGE_B,
-    );
+    let mut security_store = storage::security_store(nvmc);
     info!("Security journal ready");
 
     // ── ZCL clusters ──

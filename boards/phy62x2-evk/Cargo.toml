@@ -1,0 +1,22 @@
+[package]
+name = "phy62x2-evk"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board and platform support for PHY6222/PHY6252 development boards"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = { version = "0.7", features = ["device"] }
+embedded-storage = "0.3"
+embassy-time-driver = "0.2"
+phy6222-hal = { path = "../../phy6222-hal" }
+portable-atomic = { version = "1", features = ["critical-section"] }
+zigbee-runtime = { path = "../../zigbee-runtime" }
+
+[features]
+default = []
+phy6222 = []
+phy6252 = []

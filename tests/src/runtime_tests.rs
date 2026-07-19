@@ -104,7 +104,7 @@ fn test_ram_nv_write_read() {
 
 #[test]
 fn test_ram_nv_not_found() {
-    let nv = RamNvStorage::new();
+    let mut nv = RamNvStorage::new();
     let mut buf = [0u8; 8];
     assert_eq!(
         nv.read(NvItemId::NwkChannel, &mut buf),
@@ -127,10 +127,10 @@ fn test_ram_nv_overwrite() {
 fn test_ram_nv_delete() {
     let mut nv = RamNvStorage::new();
     nv.write(NvItemId::NwkKey, &[0xAA; 16]).unwrap();
-    assert!(nv.exists(NvItemId::NwkKey));
+    assert_eq!(nv.exists(NvItemId::NwkKey), Ok(true));
 
     nv.delete(NvItemId::NwkKey).unwrap();
-    assert!(!nv.exists(NvItemId::NwkKey));
+    assert_eq!(nv.exists(NvItemId::NwkKey), Ok(false));
 }
 
 #[test]

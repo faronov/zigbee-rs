@@ -74,7 +74,7 @@ pub trait NvStorage {
     /// Read an item from NV storage.
     ///
     /// Returns the number of bytes read into `buf`.
-    fn read(&self, id: NvItemId, buf: &mut [u8]) -> Result<usize, NvError>;
+    fn read(&mut self, id: NvItemId, buf: &mut [u8]) -> Result<usize, NvError>;
 
     /// Write an item to NV storage.
     fn write(&mut self, id: NvItemId, data: &[u8]) -> Result<(), NvError>;
@@ -83,10 +83,10 @@ pub trait NvStorage {
     fn delete(&mut self, id: NvItemId) -> Result<(), NvError>;
 
     /// Check if an item exists.
-    fn exists(&self, id: NvItemId) -> bool;
+    fn exists(&mut self, id: NvItemId) -> Result<bool, NvError>;
 
     /// Get the length of a stored item.
-    fn item_length(&self, id: NvItemId) -> Result<usize, NvError>;
+    fn item_length(&mut self, id: NvItemId) -> Result<usize, NvError>;
 
     /// Compact/defragment the storage (if applicable).
     fn compact(&mut self) -> Result<(), NvError>;
@@ -117,7 +117,7 @@ impl Default for RamNvStorage {
 }
 
 impl NvStorage for RamNvStorage {
-    fn read(&self, id: NvItemId, buf: &mut [u8]) -> Result<usize, NvError> {
+    fn read(&mut self, id: NvItemId, buf: &mut [u8]) -> Result<usize, NvError> {
         let item = self
             .items
             .iter()
@@ -157,11 +157,11 @@ impl NvStorage for RamNvStorage {
         }
     }
 
-    fn exists(&self, id: NvItemId) -> bool {
-        self.items.iter().any(|i| i.id == id)
+    fn exists(&mut self, id: NvItemId) -> Result<bool, NvError> {
+        Ok(self.items.iter().any(|i| i.id == id))
     }
 
-    fn item_length(&self, id: NvItemId) -> Result<usize, NvError> {
+    fn item_length(&mut self, id: NvItemId) -> Result<usize, NvError> {
         self.items
             .iter()
             .find(|i| i.id == id)

@@ -10,6 +10,7 @@ zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
+efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
 
 # Embassy async runtime
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "task-arena-size-5120"] }
@@ -46,6 +47,3 @@ trace = [
 [profile.release]
 opt-level = "s"
 lto = true
-
-[build-dependencies]
-cc = "1.0"

@@ -1,6 +1,12 @@
 [build]
 target = "thumbv7em-none-eabi"
 
+[target.thumbv7em-none-eabi]
+rustflags = [
+    "-L", "../../boards/efr32mg1-tradfri/link",
+    "-C", "link-arg=-Tlink.x",
+]
+
 [unstable]
 build-std = ["core", "alloc"]
 

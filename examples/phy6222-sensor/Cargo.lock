@@ -278,6 +278,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-storage"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a21dea9854beb860f3062d10228ce9b976da520a73474aed3171ec276bc0c032"
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -410,6 +416,7 @@ name = "phy6222-hal"
 version = "0.1.0"
 dependencies = [
  "cortex-m",
+ "embedded-storage",
  "log",
 ]
 
@@ -427,6 +434,7 @@ dependencies = [
  "log",
  "panic-halt",
  "phy6222-hal",
+ "phy62x2-evk",
  "portable-atomic",
  "zigbee-aps",
  "zigbee-mac",
@@ -434,6 +442,19 @@ dependencies = [
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zcl",
+]
+
+[[package]]
+name = "phy62x2-evk"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "embassy-time-driver",
+ "embedded-storage",
+ "phy6222-hal",
+ "portable-atomic",
+ "zigbee-runtime",
 ]
 
 [[package]]
@@ -635,6 +656,7 @@ dependencies = [
 name = "zigbee-runtime"
 version = "0.1.0"
 dependencies = [
+ "embedded-storage",
  "heapless 0.9.2",
  "log",
  "zigbee-aps",

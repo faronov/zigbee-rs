@@ -15,7 +15,7 @@ use zigbee_zcl::clusters::temperature::TemperatureCluster;
 use zigbee_zcl::data_types::{ZclDataType, ZclValue};
 use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
 
-use crate::{board, flash_nv};
+use tlsr8258_tb04::{leds as board, storage};
 
 // Preserve the IEEE address used by the hardware-proven runtime image so the
 // existing journal and ZHA device identity remain valid across this refactor.
@@ -165,7 +165,7 @@ pub fn run() -> ! {
             cluster: hum_cluster,
         },
     ];
-    let mut security_store = flash_nv::security_store();
+    let mut security_store = storage::security_store();
     if device
         .reset_security_state_if_identity_changed(&mut security_store)
         .is_err()

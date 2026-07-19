@@ -1563,6 +1563,9 @@ dependencies = [
 [[package]]
 name = "tlsr8258-hal"
 version = "0.1.0"
+dependencies = [
+ "embedded-storage",
+]
 
 [[package]]
 name = "tokio"
@@ -1842,6 +1845,7 @@ dependencies = [
 name = "zigbee-runtime"
 version = "0.1.0"
 dependencies = [
+ "embedded-storage",
  "heapless 0.9.2",
  "log",
  "zigbee-aps",

@@ -24,11 +24,10 @@
 extern crate alloc;
 
 mod time_driver;
-mod flash_nv;
 
+use esp32_zigbee_devkit::storage;
 use esp_backtrace as _;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
-
 
 use embassy_futures::block_on;
 use embassy_time::{Duration, Instant, Timer};
@@ -47,7 +46,9 @@ use zigbee_zcl::clusters::temperature::TemperatureCluster;
 // Bridge `log` crate → esp_println
 struct EspLogger;
 impl log::Log for EspLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool { true }
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
     fn log(&self, record: &log::Record) {
         esp_println::println!("[{}] {}", record.level(), record.args());
     }
@@ -60,7 +61,6 @@ const FAST_POLL_MS: u64 = 250;
 const SLOW_POLL_SECS: u64 = 30;
 const FAST_POLL_DURATION_SECS: u64 = 120;
 const EXPECTED_REPORT_CLUSTERS: usize = 3;
-
 
 #[esp_hal::main]
 fn main() -> ! {
@@ -91,9 +91,13 @@ fn main() -> ! {
     for _ in 0..3u8 {
         led.set_low();
         // Busy-wait outside async context
-        for _ in 0..100_000u32 { core::hint::spin_loop(); }
+        for _ in 0..100_000u32 {
+            core::hint::spin_loop();
+        }
         led.set_high();
-        for _ in 0..100_000u32 { core::hint::spin_loop(); }
+        for _ in 0..100_000u32 {
+            core::hint::spin_loop();
+        }
     }
 
     // IEEE 802.15.4 radio
@@ -103,12 +107,8 @@ fn main() -> ! {
     esp_println::println!("[ESP32-H2] Radio ready");
 
     // ZCL clusters
-    let mut basic_cluster = BasicCluster::new(
-        b"Zigbee-RS",
-        b"ESP32-H2-Sensor",
-        b"20260403",
-        b"0.1.0",
-    );
+    let mut basic_cluster =
+        BasicCluster::new(b"Zigbee-RS", b"ESP32-H2-Sensor", b"20260403", b"0.1.0");
     basic_cluster.set_power_source(0x03); // Battery
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
@@ -149,11 +149,11 @@ fn main() -> ! {
     // Run the async SED loop synchronously via block_on
     block_on(async {
         // Flash NV storage
-        let mut nv = flash_nv::create_nv();
+        let mut nv = storage::application_nv().expect("failed to initialize application NV");
         esp_println::println!("[ESP32-H2] Flash NV storage ready");
 
         // Restore previous network state or auto-join
-        let restored = device.restore_state(&nv);
+        let restored = device.restore_state(&mut nv);
         if restored {
             esp_println::println!("[ESP32-H2] Restored state — will rejoin");
             device.user_action(UserAction::Rejoin);
@@ -162,11 +162,26 @@ fn main() -> ! {
             device.user_action(UserAction::Join);
         }
         let mut clusters = [
-            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+            ClusterRef {
+                endpoint: 1,
+                cluster: &mut basic_cluster,
+            },
+            ClusterRef {
+                endpoint: 1,
+                cluster: &mut temp_cluster,
+            },
+            ClusterRef {
+                endpoint: 1,
+                cluster: &mut hum_cluster,
+            },
+            ClusterRef {
+                endpoint: 1,
+                cluster: &mut power_cluster,
+            },
+            ClusterRef {
+                endpoint: 1,
+                cluster: &mut identify_cluster,
+            },
         ];
         if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
             if log_event(e) {
@@ -196,7 +211,11 @@ fn main() -> ! {
         loop {
             let now = Instant::now();
             let in_fast_poll = now < fast_poll_until;
-            let poll_ms = if in_fast_poll { FAST_POLL_MS } else { SLOW_POLL_SECS * 1000 };
+            let poll_ms = if in_fast_poll {
+                FAST_POLL_MS
+            } else {
+                SLOW_POLL_SECS * 1000
+            };
 
             // Button check
             let pressed = button.is_low();
@@ -221,20 +240,38 @@ fn main() -> ! {
                     }
                     esp_hal::system::software_reset();
                 } else {
-                    esp_println::println!("[ESP32-H2] Button → {}",
-                        if device.is_joined() { "leave" } else { "join" });
+                    esp_println::println!(
+                        "[ESP32-H2] Button → {}",
+                        if device.is_joined() { "leave" } else { "join" }
+                    );
                     device.user_action(UserAction::Toggle);
                     let mut cls = [
-                        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                        ClusterRef {
+                            endpoint: 1,
+                            cluster: &mut basic_cluster,
+                        },
+                        ClusterRef {
+                            endpoint: 1,
+                            cluster: &mut temp_cluster,
+                        },
+                        ClusterRef {
+                            endpoint: 1,
+                            cluster: &mut hum_cluster,
+                        },
+                        ClusterRef {
+                            endpoint: 1,
+                            cluster: &mut power_cluster,
+                        },
+                        ClusterRef {
+                            endpoint: 1,
+                            cluster: &mut identify_cluster,
+                        },
                     ];
                     if let TickResult::Event(ref e) = device.tick(0, &mut cls).await {
                         if log_event(e) {
                             device.save_state(&mut nv);
-                            fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                            fast_poll_until =
+                                Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                             annce_retries_left = 5;
                             last_annce = Instant::now();
                             interview_done = false;
@@ -254,11 +291,26 @@ fn main() -> ! {
                     match device.poll().await {
                         Ok(Some(ind)) => {
                             let mut cls = [
-                                ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                                ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                                ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                                ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                                ClusterRef {
+                                    endpoint: 1,
+                                    cluster: &mut basic_cluster,
+                                },
+                                ClusterRef {
+                                    endpoint: 1,
+                                    cluster: &mut temp_cluster,
+                                },
+                                ClusterRef {
+                                    endpoint: 1,
+                                    cluster: &mut hum_cluster,
+                                },
+                                ClusterRef {
+                                    endpoint: 1,
+                                    cluster: &mut power_cluster,
+                                },
+                                ClusterRef {
+                                    endpoint: 1,
+                                    cluster: &mut identify_cluster,
+                                },
                             ];
                             if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
                                 match &ev {
@@ -270,36 +322,59 @@ fn main() -> ! {
                                                 + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                             interview_done = false;
                                         } else {
-                                            esp_println::println!("[ESP32-H2] Secure rejoin failed");
+                                            esp_println::println!(
+                                                "[ESP32-H2] Secure rejoin failed"
+                                            );
                                         }
                                         break;
                                     }
                                     StackEvent::LeaveRequested => {
-                                        esp_println::println!("[ESP32-H2] Leave requested — erasing NV and rejoining");
+                                        esp_println::println!(
+                                            "[ESP32-H2] Leave requested — erasing NV and rejoining"
+                                        );
                                         device.factory_reset(Some(&mut nv)).await;
                                         device.user_action(UserAction::Join);
-                                        fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                        fast_poll_until = Instant::now()
+                                            + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                         interview_done = false;
                                         break;
                                     }
                                     _ => {}
                                 }
                                 if log_event(&ev) {
-                                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                    fast_poll_until = Instant::now()
+                                        + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                 }
                             }
-                            if !interview_done && device.configured_cluster_count(1) >= EXPECTED_REPORT_CLUSTERS {
+                            if !interview_done
+                                && device.configured_cluster_count(1) >= EXPECTED_REPORT_CLUSTERS
+                            {
                                 interview_done = true;
                                 fast_poll_until = Instant::now() + Duration::from_secs(5);
                                 led.set_high(); // OFF
                                 esp_println::println!("[ESP32-H2] Interview done!");
                             }
                             let mut cls2 = [
-                                ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                                ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                                ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                                ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                                ClusterRef {
+                                    endpoint: 1,
+                                    cluster: &mut basic_cluster,
+                                },
+                                ClusterRef {
+                                    endpoint: 1,
+                                    cluster: &mut temp_cluster,
+                                },
+                                ClusterRef {
+                                    endpoint: 1,
+                                    cluster: &mut hum_cluster,
+                                },
+                                ClusterRef {
+                                    endpoint: 1,
+                                    cluster: &mut power_cluster,
+                                },
+                                ClusterRef {
+                                    endpoint: 1,
+                                    cluster: &mut identify_cluster,
+                                },
                             ];
                             let _ = device.tick(0, &mut cls2).await;
                         }
@@ -318,18 +393,38 @@ fn main() -> ! {
                     let hum: u16 = 5000 + ((hum_tick % 100) as u16) * 10;
                     temp_cluster.set_temperature(temp);
                     hum_cluster.set_humidity(hum);
-                    esp_println::println!("[ESP32-H2] T={}.{:02}°C H={}.{:02}%",
-                        temp / 100, (temp % 100).unsigned_abs(), hum / 100, hum % 100);
+                    esp_println::println!(
+                        "[ESP32-H2] T={}.{:02}°C H={}.{:02}%",
+                        temp / 100,
+                        (temp % 100).unsigned_abs(),
+                        hum / 100,
+                        hum % 100
+                    );
                 }
 
                 // Tick runtime
                 let tick_elapsed = elapsed_s.min(60) as u16;
                 let mut clusters = [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                    ClusterRef {
+                        endpoint: 1,
+                        cluster: &mut basic_cluster,
+                    },
+                    ClusterRef {
+                        endpoint: 1,
+                        cluster: &mut temp_cluster,
+                    },
+                    ClusterRef {
+                        endpoint: 1,
+                        cluster: &mut hum_cluster,
+                    },
+                    ClusterRef {
+                        endpoint: 1,
+                        cluster: &mut power_cluster,
+                    },
+                    ClusterRef {
+                        endpoint: 1,
+                        cluster: &mut identify_cluster,
+                    },
                 ];
                 let _ = device.tick(tick_elapsed, &mut clusters).await;
 
@@ -364,17 +459,36 @@ fn main() -> ! {
                     esp_println::println!("[ESP32-H2] Retrying join (attempt {})…", rejoin_count);
                     device.user_action(UserAction::Join);
                     let mut cls = [
-                        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
+                        ClusterRef {
+                            endpoint: 1,
+                            cluster: &mut basic_cluster,
+                        },
+                        ClusterRef {
+                            endpoint: 1,
+                            cluster: &mut temp_cluster,
+                        },
+                        ClusterRef {
+                            endpoint: 1,
+                            cluster: &mut hum_cluster,
+                        },
+                        ClusterRef {
+                            endpoint: 1,
+                            cluster: &mut power_cluster,
+                        },
+                        ClusterRef {
+                            endpoint: 1,
+                            cluster: &mut identify_cluster,
+                        },
                     ];
                     let _ = device.tick(0, &mut cls).await;
                     if device.is_joined() {
-                        esp_println::println!("[ESP32-H2] Joined! addr=0x{:04X}", device.short_address());
+                        esp_println::println!(
+                            "[ESP32-H2] Joined! addr=0x{:04X}",
+                            device.short_address()
+                        );
                         led.set_low();
-                        fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                        fast_poll_until =
+                            Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                         annce_retries_left = 5;
                         last_annce = Instant::now();
                         interview_done = false;
@@ -389,9 +503,17 @@ fn main() -> ! {
 
 fn log_event(event: &StackEvent) -> bool {
     match event {
-        StackEvent::Joined { short_address, channel, pan_id } => {
-            esp_println::println!("[ESP32-H2] Joined! addr=0x{:04X} ch={} pan=0x{:04X}",
-                short_address, channel, pan_id);
+        StackEvent::Joined {
+            short_address,
+            channel,
+            pan_id,
+        } => {
+            esp_println::println!(
+                "[ESP32-H2] Joined! addr=0x{:04X} ch={} pan=0x{:04X}",
+                short_address,
+                channel,
+                pan_id
+            );
             true
         }
         StackEvent::Left => {
@@ -407,7 +529,10 @@ fn log_event(event: &StackEvent) -> bool {
             false
         }
         StackEvent::CommissioningComplete { success } => {
-            esp_println::println!("[ESP32-H2] Commissioning: {}", if *success { "ok" } else { "failed" });
+            esp_println::println!(
+                "[ESP32-H2] Commissioning: {}",
+                if *success { "ok" } else { "failed" }
+            );
             false
         }
         _ => false,
@@ -416,11 +541,12 @@ fn log_event(event: &StackEvent) -> bool {
 
 /// Configure default reporting with change thresholds to suppress unnecessary TX.
 fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M>) {
-    use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
     use zigbee_zcl::data_types::{ZclDataType, ZclValue};
+    use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
 
     let _ = device.reporting_mut().configure_for_cluster(
-        1, 0x0402,
+        1,
+        0x0402,
         ReportingConfig {
             direction: ReportDirection::Send,
             attribute_id: zigbee_zcl::AttributeId(0x0000),
@@ -431,7 +557,8 @@ fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M
         },
     );
     let _ = device.reporting_mut().configure_for_cluster(
-        1, 0x0405,
+        1,
+        0x0405,
         ReportingConfig {
             direction: ReportDirection::Send,
             attribute_id: zigbee_zcl::AttributeId(0x0000),
@@ -442,7 +569,8 @@ fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M
         },
     );
     let _ = device.reporting_mut().configure_for_cluster(
-        1, 0x0001,
+        1,
+        0x0001,
         ReportingConfig {
             direction: ReportDirection::Send,
             attribute_id: zigbee_zcl::AttributeId(0x0021),

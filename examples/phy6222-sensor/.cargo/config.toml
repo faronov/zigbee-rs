@@ -1,6 +1,12 @@
 [build]
 target = "thumbv6m-none-eabi"
 
+[target.thumbv6m-none-eabi]
+rustflags = [
+    "-L", "../../boards/phy62x2-evk/link",
+    "-C", "link-arg=-Tphy6222.x",
+]
+
 [unstable]
 build-std = ["core", "alloc"]
 

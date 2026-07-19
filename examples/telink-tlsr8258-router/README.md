@@ -8,9 +8,8 @@ separate crate from the end-device sensor, matching the Nordic example layout.
 ```text
 src/main.rs      reset glue and application selection
 src/app.rs       router role, commissioning, receive and maintenance loop
-src/board.rs     TB-04 status LEDs
-src/flash_nv.rs  crash-safe security journal adapter
-memory.x         production flash/SRAM layout
+../../boards/tlsr8258-tb04
+                 TB-04 LEDs, security partition, and linker layout
 ```
 
 The firmware joins as an FFD, keeps the radio in continuous receive, relays

@@ -112,13 +112,13 @@ or mailbox protocol needed.
 efr32mg21-sensor/
 ├── .cargo/config.toml   # Target: thumbv8m.main-none-eabihf, build-std
 ├── Cargo.toml            # Dependencies (no vendor libs!)
-├── build.rs              # Linker script + device.x for interrupt vectors
 ├── device.x              # EFR32MG21 interrupt vector names (51 IRQs)
-├── memory.x              # Flash @ 0x00004000 (496K), RAM @ 0x20000000 (64K)
 └── src/
     ├── main.rs           # Entry point, device setup, sensor loop
     ├── time_driver.rs    # Embassy time driver (SysTick @ 80 MHz, 1ms tick)
     ├── vectors.rs        # Interrupt vector table + NVIC Interrupt enum
-    ├── flash_nv.rs       # Flash NV via MSC register access (8 KB pages)
     └── stubs.rs          # CI stubs (not needed for real builds)
 ```
+
+`efr32mg21-hal` owns the MSC flash controller. `boards/efr32mg21-devkit` owns
+the bounded 16 KB application-NV partition and linker layout.

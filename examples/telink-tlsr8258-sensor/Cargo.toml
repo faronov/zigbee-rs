@@ -2,7 +2,6 @@
 name = "telink-tlsr8258-sensor"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
@@ -13,6 +12,7 @@ zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 tlsr8258-hal = { path = "../../tlsr8258-hal" }
 tlsr8258-rt = { path = "../../tlsr8258-rt" }
+tlsr8258-tb04 = { path = "../../boards/tlsr8258-tb04" }
 
 [profile.release]
 opt-level = "s"

@@ -6,8 +6,6 @@
 #![no_main]
 
 mod app;
-mod board;
-mod flash_nv;
 
 use tlsr8258_rt as _;
 

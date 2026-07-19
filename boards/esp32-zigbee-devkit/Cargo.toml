@@ -1,0 +1,18 @@
+[package]
+name = "esp32-zigbee-devkit"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Shared board storage wiring for ESP32-C6 and ESP32-H2 Zigbee examples"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+embedded-storage = "0.3"
+esp-storage = { version = "0.7", default-features = false, features = ["bytewise-read"] }
+zigbee-runtime = { path = "../../zigbee-runtime" }
+
+[features]
+default = []
+esp32c6 = ["esp-storage/esp32c6"]
+esp32h2 = ["esp-storage/esp32h2"]

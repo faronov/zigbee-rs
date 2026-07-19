@@ -10,14 +10,11 @@
 #[cfg(feature = "stubs")]
 mod stubs;
 
-mod flash_nv;
-mod time_driver;
-mod vectors;
-
 use cortex_m as _;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant, Timer};
 use panic_halt as _;
+use phy62x2_evk::{pins, storage, time, vectors};
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::phy6222::Phy6222Mac;
@@ -39,17 +36,12 @@ const FAST_POLL_DURATION_SECS: u64 = 120;
 const SENSOR_UPDATE_INTERVAL_SECS: u64 = 30;
 const TEST_SENSOR: SyntheticSensor = SyntheticSensor::new(2_250, 75, 5_000, 300);
 
-mod pins {
-    pub const LED_G: u8 = 12;
-    pub const BTN: u8 = 15;
-}
-
 fn led_on() {
-    phy6222_hal::gpio::write(pins::LED_G, false);
+    phy6222_hal::gpio::write(pins::LED_GREEN, false);
 }
 
 fn led_off() {
-    phy6222_hal::gpio::write(pins::LED_G, true);
+    phy6222_hal::gpio::write(pins::LED_GREEN, true);
 }
 
 fn failure() -> ! {
@@ -61,13 +53,13 @@ fn failure() -> ! {
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    time_driver::init();
+    time::init();
     unsafe {
         cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::LlIrq);
     }
 
-    phy6222_hal::gpio::set_output(pins::LED_G);
-    phy6222_hal::gpio::set_input(pins::BTN);
+    phy6222_hal::gpio::set_output(pins::LED_GREEN);
+    phy6222_hal::gpio::set_input(pins::BUTTON);
     led_off();
 
     for _ in 0..3 {
@@ -113,7 +105,7 @@ async fn main(_spawner: Spawner) {
     let mut hum_cluster = HumidityCluster::new(0, 10_000);
 
     setup_default_reporting(&mut device);
-    let mut security_store = flash_nv::create_security_store();
+    let mut security_store = storage::security_store();
     match security_store.load() {
         Ok(Some(state))
             if state.ieee_address != [0; 8] && state.ieee_address != configured_ieee =>
@@ -172,10 +164,10 @@ async fn main(_spawner: Spawner) {
             Timer::after(Duration::from_millis(poll_ms)).await;
             device.mac_mut().radio_wake();
 
-            let pressed = !phy6222_hal::gpio::read(pins::BTN);
+            let pressed = !phy6222_hal::gpio::read(pins::BUTTON);
             if pressed && !button_was_pressed {
                 let press_start = Instant::now();
-                while !phy6222_hal::gpio::read(pins::BTN) {
+                while !phy6222_hal::gpio::read(pins::BUTTON) {
                     if press_start.elapsed().as_secs() >= 3 {
                         if device
                             .factory_reset_with_security_store(&mut security_store)
@@ -313,7 +305,10 @@ async fn main(_spawner: Spawner) {
             }
 
             if identify_cluster.is_identifying() {
-                phy6222_hal::gpio::write(pins::LED_G, !phy6222_hal::gpio::read(pins::LED_G));
+                phy6222_hal::gpio::write(
+                    pins::LED_GREEN,
+                    !phy6222_hal::gpio::read(pins::LED_GREEN),
+                );
             } else {
                 led_on();
             }

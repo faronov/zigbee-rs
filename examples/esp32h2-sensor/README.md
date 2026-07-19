@@ -12,7 +12,7 @@ entry point with `block_on()` for the async runtime.
 
 ## Prerequisites
 
-- Rust toolchain with the `esp` channel: `rustup toolchain install esp`
+- Rust nightly toolchain with `rust-src`
 - `espflash` for flashing: `cargo install espflash`
 - Target: `riscv32imac-unknown-none-elf` (added automatically via `.cargo/config.toml`)
 
@@ -22,7 +22,7 @@ No vendor libraries or binary blobs are needed — the project uses the
 ## Build
 
 ```sh
-cargo +esp build -Z build-std=core,alloc --target riscv32imac-unknown-none-elf --release
+cargo build --release
 ```
 
 ## Flash & Monitor
@@ -34,7 +34,7 @@ espflash flash --monitor target/riscv32imac-unknown-none-elf/release/esp32h2-sen
 Or use the configured runner:
 
 ```sh
-cargo +esp run -Z build-std=core,alloc --target riscv32imac-unknown-none-elf --release
+cargo run --release
 ```
 
 ## What It Demonstrates
@@ -51,9 +51,7 @@ cargo +esp run -Z build-std=core,alloc --target riscv32imac-unknown-none-elf --r
 - **Identify cluster** (0x0003) — LED blinks during Identify
 - Button-driven network join/leave via `UserAction::Toggle`
 - Periodic simulated sensor updates
-
-> **Note:** NV flash storage is not yet implemented for ESP32-H2. Network state
-> is lost on reboot and the device must re-pair.
+- Flash NV storage through the shared ESP32-C6/H2 board support crate
 
 ## Operation
 
@@ -71,3 +69,6 @@ esp32h2-sensor/
 └── src/
     └── main.rs           # Application entry point (#[esp_hal::main])
 ```
+
+`boards/esp32-zigbee-devkit` owns the bounded 8 KB flash partition and
+constructs the shared log-structured NV store.

@@ -38,7 +38,6 @@ compile_error!("features `sensor`, `diag-join`, and `diag-beacon` are mutually e
 mod stubs;
 
 #[cfg(feature = "sensor")]
-mod flash_nv;
 mod time_driver;
 mod vectors;
 
@@ -223,6 +222,7 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 // The bootloader at 0x0 jumps to our app at 0x4000, but cortex-m-rt
 // reset handler may run before VTOR is properly set.
 
+use efr32mg1_tradfri::storage::{self, ApplicationNv};
 #[cfg(feature = "sensor")]
 use embassy_executor::Spawner;
 #[cfg(any(feature = "sensor", feature = "diag-join"))]
@@ -237,25 +237,25 @@ use static_cell::StaticCell;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 #[cfg(any(feature = "diag-beacon", feature = "diag-join"))]
 use zigbee_mac::MacDriver;
+use zigbee_mac::efr32::Efr32Mac;
+#[cfg(feature = "diag-beacon")]
+use zigbee_mac::frames::build_beacon_request;
 #[cfg(feature = "diag-beacon")]
 use zigbee_mac::pib::{PibAttribute, PibValue};
 #[cfg(any(feature = "diag-beacon", feature = "diag-join"))]
 use zigbee_mac::primitives::{MlmeScanRequest, ScanType};
-#[cfg(feature = "diag-beacon")]
-use zigbee_mac::frames::build_beacon_request;
-#[cfg(any(feature = "sensor", feature = "diag-beacon", feature = "diag-join"))]
-use zigbee_types::ChannelMask;
-use zigbee_mac::efr32::Efr32Mac;
 #[cfg(any(feature = "sensor", feature = "diag-join"))]
 use zigbee_nwk::DeviceType;
+#[cfg(feature = "sensor")]
+use zigbee_runtime::UserAction;
 #[cfg(any(feature = "sensor", feature = "diag-join"))]
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
 #[cfg(any(feature = "sensor", feature = "diag-join"))]
 use zigbee_runtime::power::PowerMode;
 #[cfg(any(feature = "sensor", feature = "diag-join"))]
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
-#[cfg(feature = "sensor")]
-use zigbee_runtime::UserAction;
+#[cfg(any(feature = "sensor", feature = "diag-beacon", feature = "diag-join"))]
+use zigbee_types::ChannelMask;
 #[cfg(any(feature = "sensor", feature = "diag-join"))]
 use zigbee_zcl::clusters::basic::BasicCluster;
 #[cfg(feature = "sensor")]
@@ -583,7 +583,7 @@ async fn diag_join_process_incoming_handles(
 #[cfg(feature = "sensor")]
 struct SensorApp {
     device: &'static mut ZigbeeDevice<Efr32Mac>,
-    nv: &'static mut flash_nv::Nv,
+    nv: &'static mut ApplicationNv,
     basic_cluster: &'static mut BasicCluster,
     temp_cluster: &'static mut TemperatureCluster,
     hum_cluster: &'static mut HumidityCluster,
@@ -608,7 +608,7 @@ struct SensorApp {
 impl SensorApp {
     fn new(
         device: &'static mut ZigbeeDevice<Efr32Mac>,
-        nv: &'static mut flash_nv::Nv,
+        nv: &'static mut ApplicationNv,
         basic_cluster: &'static mut BasicCluster,
         temp_cluster: &'static mut TemperatureCluster,
         hum_cluster: &'static mut HumidityCluster,
@@ -676,7 +676,7 @@ impl SensorApp {
     #[inline(always)]
     async fn factory_reset(&mut self) {
         let device = self.device as *mut ZigbeeDevice<Efr32Mac>;
-        let nv = self.nv as *mut flash_nv::Nv;
+        let nv = self.nv as *mut ApplicationNv;
         unsafe {
             (&mut *device).factory_reset(Some(&mut *nv)).await;
         }
@@ -944,7 +944,9 @@ impl SensorApp {
                     rtt_target::rprintln!("[EFR32] Direct RX {} bytes", ind.payload.len());
                     if let Some(ev) = sensor_process_incoming_handles(self.handles(), &ind).await {
                         if matches!(&ev, StackEvent::RejoinRequested) {
-                            rtt_target::rprintln!("[EFR32] Secure rejoin requested during direct RX");
+                            rtt_target::rprintln!(
+                                "[EFR32] Secure rejoin requested during direct RX"
+                            );
                             let _ = self.secure_rejoin().await;
                             return;
                         }
@@ -1081,8 +1083,8 @@ async fn main(_spawner: Spawner) {
     let mac = Efr32Mac::new();
     rtt_target::rprintln!("[EFR32] Radio ready");
 
-    static NV_CELL: StaticCell<flash_nv::Nv> = StaticCell::new();
-    let nv = NV_CELL.init(flash_nv::create_nv());
+    static NV_CELL: StaticCell<ApplicationNv> = StaticCell::new();
+    let nv = NV_CELL.init(storage::application_nv().expect("failed to initialize application NV"));
     rtt_target::rprintln!("[EFR32] NV ready");
 
     static BASIC_CELL: StaticCell<BasicCluster> = StaticCell::new();
@@ -1123,7 +1125,7 @@ async fn main(_spawner: Spawner) {
     let needs_bootstrap_join = if FORCE_FRESH_JOIN_ON_BOOT {
         rtt_target::rprintln!("[EFR32] Fresh join mode — skipping restore_state");
         true
-    } else if device.restore_state(&*nv) {
+    } else if device.restore_state(&mut *nv) {
         rtt_target::rprintln!("[EFR32] Restored — rejoin");
         false
     } else {
@@ -1592,7 +1594,10 @@ fn diag_join_entry() -> ! {
 #[cfg(feature = "diag-beacon")]
 async fn diag_beacon_known_tx(mac: &mut Efr32Mac, seq: u8) {
     let _ = mac
-        .mlme_set(PibAttribute::PhyCurrentChannel, PibValue::U8(DIAG_SCAN_CHANNEL))
+        .mlme_set(
+            PibAttribute::PhyCurrentChannel,
+            PibValue::U8(DIAG_SCAN_CHANNEL),
+        )
         .await;
     let beacon_req = build_beacon_request(seq);
 
@@ -1632,7 +1637,10 @@ fn build_diag_broadcast_data(seq: u8, src_ext: &[u8; 8], marker: u8) -> heapless
 #[cfg(feature = "diag-beacon")]
 async fn diag_data_probe_tx(mac: &mut Efr32Mac, seq: u8, marker: u8) {
     let _ = mac
-        .mlme_set(PibAttribute::PhyCurrentChannel, PibValue::U8(DIAG_SCAN_CHANNEL))
+        .mlme_set(
+            PibAttribute::PhyCurrentChannel,
+            PibValue::U8(DIAG_SCAN_CHANNEL),
+        )
         .await;
     let src_ext = mac.extended_address();
     let frame = build_diag_broadcast_data(seq, &src_ext, marker);

@@ -628,6 +628,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrf52840-dk"
+version = "0.1.0"
+dependencies = [
+ "embassy-nrf",
+ "embedded-storage",
+ "zigbee-runtime",
+]
+
+[[package]]
 name = "nrf52840-sensor"
 version = "0.1.0"
 dependencies = [
@@ -640,8 +649,8 @@ dependencies = [
  "embassy-nrf",
  "embassy-time",
  "embedded-hal 1.0.0",
- "embedded-storage",
  "log",
+ "nrf52840-dk",
  "panic-probe",
  "zigbee-aps",
  "zigbee-mac",
@@ -935,6 +944,7 @@ dependencies = [
 name = "zigbee-runtime"
 version = "0.1.0"
 dependencies = [
+ "embedded-storage",
  "heapless 0.9.2",
  "log",
  "zigbee-aps",

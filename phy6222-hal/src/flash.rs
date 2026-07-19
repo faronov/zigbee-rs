@@ -5,6 +5,9 @@
 //! Cache must be bypassed during write/erase operations.
 
 use crate::regs::*;
+use embedded_storage::nor_flash::{
+    ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
+};
 
 macro_rules! ram_nop {
     () => {
@@ -39,8 +42,8 @@ macro_rules! restore_interrupts {
     };
 }
 
-const FLASH_CAPACITY: u32 = 512 * 1024;
-const SECTOR_SIZE: u32 = 4096;
+const MAX_FLASH_CAPACITY: u32 = 512 * 1024;
+pub const SECTOR_SIZE: u32 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashError {
@@ -48,6 +51,81 @@ pub enum FlashError {
     UnalignedSector,
     ControllerTimeout,
     DeviceBusyTimeout,
+}
+
+impl NorFlashError for FlashError {
+    fn kind(&self) -> NorFlashErrorKind {
+        match self {
+            Self::OutOfRange => NorFlashErrorKind::OutOfBounds,
+            Self::UnalignedSector => NorFlashErrorKind::NotAligned,
+            Self::ControllerTimeout | Self::DeviceBusyTimeout => NorFlashErrorKind::Other,
+        }
+    }
+}
+
+pub struct Phy62x2Flash {
+    capacity: usize,
+}
+
+impl Phy62x2Flash {
+    pub const fn new(capacity: usize) -> Self {
+        Self { capacity }
+    }
+
+    fn validate_range(&self, offset: u32, length: usize) -> Result<(), FlashError> {
+        let start = usize::try_from(offset).map_err(|_| FlashError::OutOfRange)?;
+        start
+            .checked_add(length)
+            .filter(|end| *end <= self.capacity)
+            .map(|_| ())
+            .ok_or(FlashError::OutOfRange)
+    }
+}
+
+impl ErrorType for Phy62x2Flash {
+    type Error = FlashError;
+}
+
+impl ReadNorFlash for Phy62x2Flash {
+    const READ_SIZE: usize = 1;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.validate_range(offset, bytes.len())?;
+        read(offset, bytes)
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+impl NorFlash for Phy62x2Flash {
+    const WRITE_SIZE: usize = 4;
+    const ERASE_SIZE: usize = SECTOR_SIZE as usize;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        if from >= to {
+            return Err(FlashError::OutOfRange);
+        }
+        if from & (SECTOR_SIZE - 1) != 0 || to & (SECTOR_SIZE - 1) != 0 {
+            return Err(FlashError::UnalignedSector);
+        }
+        self.validate_range(from, (to - from) as usize)?;
+        let mut offset = from;
+        while offset < to {
+            erase_sector(offset)?;
+            offset += SECTOR_SIZE;
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        if offset as usize % Self::WRITE_SIZE != 0 || bytes.len() % Self::WRITE_SIZE != 0 {
+            return Err(FlashError::UnalignedSector);
+        }
+        self.validate_range(offset, bytes.len())?;
+        write(offset, bytes)
+    }
 }
 
 /// Read bytes from flash via XIP (memory-mapped, no SPIF commands needed).
@@ -160,7 +238,7 @@ fn write_inner(offset: u32, data: &[u8]) -> Result<(), FlashError> {
 fn validate_range(offset: u32, len: usize) -> Result<(), FlashError> {
     let len = u32::try_from(len).map_err(|_| FlashError::OutOfRange)?;
     let end = offset.checked_add(len).ok_or(FlashError::OutOfRange)?;
-    if end > FLASH_CAPACITY {
+    if end > MAX_FLASH_CAPACITY {
         return Err(FlashError::OutOfRange);
     }
     Ok(())

@@ -13,6 +13,7 @@ publish = false
 
 [dependencies]
 tlsr8258-hal = { path = "../../tlsr8258-hal" }
+tlsr8258-tb04 = { path = "../../boards/tlsr8258-tb04", optional = true }
 zigbee-mac = { path = "../../zigbee-mac", features = ["tlsr8258"], optional = true }
 zigbee-types = { path = "../../zigbee-types", optional = true }
 zigbee-nwk = { path = "../../zigbee-nwk", optional = true }
@@ -36,6 +37,7 @@ association-stress = ["association-fresh"]
 mac-driver = ["dep:zigbee-mac", "dep:zigbee-types"]
 runtime-join = [
     "mac-driver",
+    "dep:tlsr8258-tb04",
     "dep:zigbee-nwk",
     "dep:zigbee-aps",
     "dep:zigbee-runtime",

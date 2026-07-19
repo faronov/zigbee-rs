@@ -89,3 +89,7 @@ interrupts disabled. The example pauses SysTick and accounts for the interval
 with the continuously running AON RTC, so journal updates do not make Embassy
 time run slow. Network keys and outgoing counter reservations are saved only
 when security state changes, not on every poll cycle.
+
+`boards/phy62x2-evk` owns these partitions, the ROM-aware linker layout, and
+the AON-RTC time compensation. `phy6222-hal` only implements the raw flash
+controller.

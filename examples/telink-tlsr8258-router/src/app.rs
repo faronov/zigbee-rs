@@ -14,7 +14,7 @@ use zigbee_runtime::{ClusterRef, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::identify::IdentifyCluster;
 
-use crate::{board, flash_nv};
+use tlsr8258_tb04::{leds as board, storage};
 
 // Distinct from the sensor runtime's `DEVICE_EUI_OFFSET` (0x33) so a router
 // and a sensor built from the same factory-programmed part never collide on
@@ -77,7 +77,7 @@ pub fn run() -> ! {
         })
         .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
 
-    let mut security_store = flash_nv::security_store();
+    let mut security_store = storage::security_store();
     if device
         .reset_security_state_if_identity_changed(&mut security_store)
         .is_err()

@@ -1,0 +1,13 @@
+[package]
+name = "efr32mg1-tradfri"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board support for the EFR32MG1P TRADFRI module"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+efr32mg1-hal = { path = "../../efr32mg1-hal" }
+embedded-storage = "0.3"
+zigbee-runtime = { path = "../../zigbee-runtime" }

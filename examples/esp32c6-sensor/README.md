@@ -16,7 +16,7 @@ re-pairing.
 
 ## Prerequisites
 
-- Rust toolchain with the `esp` channel: `rustup toolchain install esp`
+- Rust nightly toolchain with `rust-src`
 - `espflash` for flashing: `cargo install espflash`
 - Target: `riscv32imac-unknown-none-elf` (added automatically via `.cargo/config.toml`)
 
@@ -26,7 +26,7 @@ No vendor libraries or binary blobs are needed — the project uses the
 ## Build
 
 ```sh
-cargo +esp build -Z build-std=core,alloc --target riscv32imac-unknown-none-elf --release
+cargo build --release
 ```
 
 ## Flash & Monitor
@@ -38,7 +38,7 @@ espflash flash --monitor target/riscv32imac-unknown-none-elf/release/esp32c6-sen
 Or use the configured runner:
 
 ```sh
-cargo +esp run -Z build-std=core,alloc --target riscv32imac-unknown-none-elf --release
+cargo run --release
 ```
 
 ## What It Demonstrates
@@ -50,7 +50,7 @@ cargo +esp run -Z build-std=core,alloc --target riscv32imac-unknown-none-elf --r
   and **Relative Humidity** clusters
 - **On-chip temperature sensor** via `esp_hal::tsens::TemperatureSensor`
 - **Flash NV storage** — network state saved to last 2 sectors of flash (`0x3FE000`, 8 KB)
-  using `esp-storage` LL API + log-structured NV format
+  using `esp_storage::FlashStorage` + log-structured NV format
 - **NWK Leave handler** — auto-erases NV and rejoins when coordinator sends Leave
 - **Default reporting configuration** — temp/humidity: 60–300 s, battery: 300–3600 s
   (devices report data even before ZHA sends ConfigureReporting)
@@ -72,7 +72,8 @@ cargo +esp run -Z build-std=core,alloc --target riscv32imac-unknown-none-elf --r
 esp32c6-sensor/
 ├── .cargo/config.toml   # Target, runner, rustflags, build-std
 ├── Cargo.toml            # Dependencies (esp-hal 1.0, esp-radio 0.17, esp-storage, zigbee-rs crates)
-└── src/
-    ├── flash_nv.rs       # Flash-backed NV storage (EspFlashDriver, LogStructuredNv, 0x3FE000)
-    └── main.rs           # Application entry point (#[esp_hal::main])
+└── src/main.rs           # Application entry point (#[esp_hal::main])
 ```
+
+`boards/esp32-zigbee-devkit` owns the bounded 8 KB partition and constructs
+the shared `LogStructuredNv` store for both ESP32-C6 and ESP32-H2.

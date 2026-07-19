@@ -279,25 +279,21 @@ let i2c = I2c::new(peripherals.I2C0, /* config */)
 // Use any embedded-hal 1.0 compatible sensor driver
 ```
 
-## Flash NV Storage (ESP32-C6)
+## Flash NV Storage
 
-The `esp32c6-sensor` example persists Zigbee network state to the last two
-4 KB sectors of the on-chip flash (addresses `0x3FE000`–`0x3FFFFF`, 8 KB total).
-This uses the `esp-storage` crate's low-level SPI flash API directly:
+Both sensor examples persist Zigbee network state to the last two 4 KB sectors
+of the external flash (addresses `0x3FE000`-`0x3FFFFF`, 8 KB total).
+`boards/esp32-zigbee-devkit` owns this partition and wraps the official
+`esp_storage::FlashStorage` implementation of the standard
+`embedded-storage` NOR traits.
 
-- **Read:** `esp_storage::ll::spiflash_read`
-- **Write:** `esp_storage::ll::spiflash_write`
-- **Erase:** `esp_storage::ll::spiflash_erase_sector`
-
-The storage is wrapped in `LogStructuredNv<EspFlashDriver>` — a log-structured
-format that appends writes and only erases on compaction, minimizing flash wear.
+The bounded board flash is wrapped in `LogStructuredNv<ApplicationFlash>`, a
+log-structured format that appends writes and only erases during compaction.
+The example never sees physical flash addresses or raw controller calls.
 
 On boot, the device checks for saved network state and automatically rejoins
 the previous network. If the coordinator sends a NWK Leave command, the device
 erases NV storage and starts fresh commissioning.
-
-> **Note:** The ESP32-H2 example does **not** yet have NV flash storage.
-> Network state is lost on reboot and the device must re-pair.
 
 ## ESP32-C6-DevKitC-1 LED Note
 

@@ -1,5 +1,7 @@
 //! Atomic two-sector journal for persistent Zigbee security state.
 
+use embedded_storage::nor_flash::NorFlash;
+
 use crate::security_store::{
     ENCODED_SECURITY_STATE_LEN, PersistentSecurityState, SecurityStateStore, SecurityStoreError,
 };
@@ -16,12 +18,6 @@ const RECORD_PREFIX_LEN: usize = 96;
 const RECORD_COMMIT_OFFSET: usize = 124;
 const RECORD_COMMIT: [u8; 4] = *b"CMIT";
 
-pub trait SecurityJournalStorage {
-    fn read(&self, address: u32, output: &mut [u8]) -> Result<(), SecurityStoreError>;
-    fn program(&mut self, address: u32, data: &[u8]) -> Result<(), SecurityStoreError>;
-    fn erase_sector(&mut self, address: u32) -> Result<(), SecurityStoreError>;
-}
-
 pub struct SecurityStateJournal<S> {
     storage: S,
     sectors: [u32; 2],
@@ -36,7 +32,7 @@ struct LocatedState {
     state: PersistentSecurityState,
 }
 
-impl<S: SecurityJournalStorage> SecurityStateJournal<S> {
+impl<S: NorFlash> SecurityStateJournal<S> {
     pub const fn new(storage: S, first_sector: u32, second_sector: u32) -> Self {
         Self {
             storage,
@@ -61,15 +57,17 @@ impl<S: SecurityJournalStorage> SecurityStateJournal<S> {
     }
 
     fn read_slot(
-        &self,
+        &mut self,
         sector: usize,
         slot: usize,
         output: &mut [u8; SECURITY_JOURNAL_SLOT_SIZE],
     ) -> Result<(), SecurityStoreError> {
-        self.storage.read(
-            self.sectors[sector] + (slot * SECURITY_JOURNAL_SLOT_SIZE) as u32,
-            output,
-        )
+        self.storage
+            .read(
+                self.sectors[sector] + (slot * SECURITY_JOURNAL_SLOT_SIZE) as u32,
+                output,
+            )
+            .map_err(|_| SecurityStoreError::Hardware)
     }
 
     fn decode_record(
@@ -100,7 +98,7 @@ impl<S: SecurityJournalStorage> SecurityStateJournal<S> {
         Some((generation, state))
     }
 
-    fn newest(&self) -> Result<Option<LocatedState>, SecurityStoreError> {
+    fn newest(&mut self) -> Result<Option<LocatedState>, SecurityStoreError> {
         let mut newest: Option<LocatedState> = None;
         let mut record = [0u8; SECURITY_JOURNAL_SLOT_SIZE];
         for sector in 0..2 {
@@ -127,8 +125,23 @@ impl<S: SecurityJournalStorage> SecurityStateJournal<S> {
 
     fn current(&mut self) -> Result<Option<LocatedState>, SecurityStoreError> {
         if self.sectors[0] == self.sectors[1]
-            || self.sectors[0] as usize & (SECURITY_JOURNAL_SECTOR_SIZE - 1) != 0
-            || self.sectors[1] as usize & (SECURITY_JOURNAL_SECTOR_SIZE - 1) != 0
+            || self.sectors[0].abs_diff(self.sectors[1]) < SECURITY_JOURNAL_SECTOR_SIZE as u32
+            || S::READ_SIZE == 0
+            || S::WRITE_SIZE == 0
+            || S::ERASE_SIZE == 0
+            || SECURITY_JOURNAL_SLOT_SIZE % S::READ_SIZE != 0
+            || SECURITY_JOURNAL_SLOT_SIZE % S::WRITE_SIZE != 0
+            || SECURITY_JOURNAL_SECTOR_SIZE % S::ERASE_SIZE != 0
+            || RECORD_PREFIX_LEN % S::WRITE_SIZE != 0
+            || RECORD_COMMIT_OFFSET % S::WRITE_SIZE != 0
+            || RECORD_COMMIT.len() % S::WRITE_SIZE != 0
+            || self.sectors[0] as usize % S::ERASE_SIZE != 0
+            || self.sectors[1] as usize % S::ERASE_SIZE != 0
+            || self.sectors.iter().any(|sector| {
+                (*sector as usize)
+                    .checked_add(SECURITY_JOURNAL_SECTOR_SIZE)
+                    .is_none_or(|end| end > self.storage.capacity())
+            })
         {
             return Err(SecurityStoreError::Hardware);
         }
@@ -139,7 +152,7 @@ impl<S: SecurityJournalStorage> SecurityStateJournal<S> {
         Ok(self.cached)
     }
 
-    fn first_erased_slot(&self, sector: usize) -> Result<Option<usize>, SecurityStoreError> {
+    fn first_erased_slot(&mut self, sector: usize) -> Result<Option<usize>, SecurityStoreError> {
         let mut record = [0u8; SECURITY_JOURNAL_SLOT_SIZE];
         for slot in 0..SECURITY_JOURNAL_SLOTS_PER_SECTOR {
             self.read_slot(sector, slot, &mut record)?;
@@ -172,10 +185,12 @@ impl<S: SecurityJournalStorage> SecurityStateJournal<S> {
 
         let address = self.sectors[sector] + (slot * SECURITY_JOURNAL_SLOT_SIZE) as u32;
         self.storage
-            .program(address, &record[..RECORD_PREFIX_LEN])?;
+            .write(address, &record[..RECORD_PREFIX_LEN])
+            .map_err(|_| SecurityStoreError::Hardware)?;
         let commit = RECORD_COMMIT;
         self.storage
-            .program(address + RECORD_COMMIT_OFFSET as u32, &commit)?;
+            .write(address + RECORD_COMMIT_OFFSET as u32, &commit)
+            .map_err(|_| SecurityStoreError::Hardware)?;
 
         let mut verify = [0u8; SECURITY_JOURNAL_SLOT_SIZE];
         self.read_slot(sector, slot, &mut verify)?;
@@ -190,7 +205,7 @@ impl<S: SecurityJournalStorage> SecurityStateJournal<S> {
     }
 }
 
-impl<S: SecurityJournalStorage> SecurityStateStore for SecurityStateJournal<S> {
+impl<S: NorFlash> SecurityStateStore for SecurityStateJournal<S> {
     fn load(&mut self) -> Result<Option<PersistentSecurityState>, SecurityStoreError> {
         Ok(self.current()?.map(|located| located.state))
     }
@@ -222,9 +237,11 @@ impl<S: SecurityJournalStorage> SecurityStateStore for SecurityStateJournal<S> {
             }
 
             let target = 1 - located.sector;
+            let sector = self.sectors[target];
             let result = self
                 .storage
-                .erase_sector(self.sectors[target])
+                .erase(sector, sector + SECURITY_JOURNAL_SECTOR_SIZE as u32)
+                .map_err(|_| SecurityStoreError::Hardware)
                 .and_then(|()| self.write_record(target, 0, generation, state));
             if result.is_ok() {
                 self.cached = Some(LocatedState {
@@ -239,9 +256,11 @@ impl<S: SecurityJournalStorage> SecurityStateStore for SecurityStateJournal<S> {
             return result;
         }
 
+        let sector = self.sectors[0];
         let result = self
             .storage
-            .erase_sector(self.sectors[0])
+            .erase(sector, sector + SECURITY_JOURNAL_SECTOR_SIZE as u32)
+            .map_err(|_| SecurityStoreError::Hardware)
             .and_then(|()| self.write_record(0, 0, generation, state));
         if result.is_ok() {
             self.cached = Some(LocatedState {
@@ -272,6 +291,7 @@ fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use embedded_storage::nor_flash::{ErrorType, NorFlashErrorKind, ReadNorFlash};
 
     struct MockFlash {
         data: [u8; SECURITY_JOURNAL_SECTOR_SIZE * 2],
@@ -286,31 +306,46 @@ mod tests {
             }
         }
 
-        fn offset(address: u32) -> Result<usize, SecurityStoreError> {
+        fn offset(address: u32) -> Result<usize, NorFlashErrorKind> {
             let offset = address as usize;
             if offset < SECURITY_JOURNAL_SECTOR_SIZE * 2 {
                 Ok(offset)
             } else {
-                Err(SecurityStoreError::Hardware)
+                Err(NorFlashErrorKind::OutOfBounds)
             }
         }
     }
 
-    impl SecurityJournalStorage for MockFlash {
-        fn read(&self, address: u32, output: &mut [u8]) -> Result<(), SecurityStoreError> {
+    impl ErrorType for MockFlash {
+        type Error = NorFlashErrorKind;
+    }
+
+    impl ReadNorFlash for MockFlash {
+        const READ_SIZE: usize = 1;
+
+        fn read(&mut self, address: u32, output: &mut [u8]) -> Result<(), Self::Error> {
             let start = Self::offset(address)?;
             let end = start
                 .checked_add(output.len())
                 .filter(|end| *end <= self.data.len())
-                .ok_or(SecurityStoreError::Hardware)?;
+                .ok_or(NorFlashErrorKind::OutOfBounds)?;
             output.copy_from_slice(&self.data[start..end]);
             Ok(())
         }
 
-        fn program(&mut self, address: u32, data: &[u8]) -> Result<(), SecurityStoreError> {
+        fn capacity(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    impl NorFlash for MockFlash {
+        const WRITE_SIZE: usize = 1;
+        const ERASE_SIZE: usize = SECURITY_JOURNAL_SECTOR_SIZE;
+
+        fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
             if let Some(remaining) = self.programs_before_failure.as_mut() {
                 if *remaining == 0 {
-                    return Err(SecurityStoreError::Hardware);
+                    return Err(NorFlashErrorKind::Other);
                 }
                 *remaining -= 1;
             }
@@ -319,24 +354,27 @@ mod tests {
             let end = start
                 .checked_add(data.len())
                 .filter(|end| *end <= self.data.len())
-                .ok_or(SecurityStoreError::Hardware)?;
+                .ok_or(NorFlashErrorKind::OutOfBounds)?;
             for (old, new) in self.data[start..end].iter_mut().zip(data) {
                 if (*old & *new) != *new {
-                    return Err(SecurityStoreError::Hardware);
+                    return Err(NorFlashErrorKind::Other);
                 }
                 *old &= *new;
             }
             Ok(())
         }
 
-        fn erase_sector(&mut self, address: u32) -> Result<(), SecurityStoreError> {
-            let start = Self::offset(address)?;
+        fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+            let start = Self::offset(from)?;
+            let end = usize::try_from(to).map_err(|_| NorFlashErrorKind::OutOfBounds)?;
             if start % SECURITY_JOURNAL_SECTOR_SIZE != 0
-                || start + SECURITY_JOURNAL_SECTOR_SIZE > self.data.len()
+                || end % SECURITY_JOURNAL_SECTOR_SIZE != 0
+                || start >= end
+                || end > self.data.len()
             {
-                return Err(SecurityStoreError::Hardware);
+                return Err(NorFlashErrorKind::NotAligned);
             }
-            self.data[start..start + SECURITY_JOURNAL_SECTOR_SIZE].fill(0xFF);
+            self.data[start..end].fill(0xFF);
             Ok(())
         }
     }

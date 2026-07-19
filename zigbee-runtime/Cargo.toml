@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 description = "Zigbee device runtime — event loop, device builder, NV storage"
 
 [dependencies]
+embedded-storage = { workspace = true }
 heapless = "0.9"
 zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
 zigbee-mac = { version = "0.1.0", path = "../zigbee-mac" }

@@ -132,11 +132,11 @@ stable environment.
 nrf52840-sensor/
 ├── .cargo/config.toml   # Target, runner (probe-rs), DEFMT_LOG level
 ├── Cargo.toml            # Features (sensor-bme280, sensor-sht31), deps
-├── build.rs              # Linker script flags (-Tlink.x -Tdefmt.x)
-├── memory.x              # Memory layout: 1016 KB Flash + 8 KB NV, 256 KB RAM
 └── src/
     ├── bme280.rs         # Async BME280 I2C driver (feature: sensor-bme280)
-    ├── flash_nv.rs       # Bounded NVMC adapter for the two-page security journal
     ├── sht31.rs          # Async SHT31 I2C driver (feature: sensor-sht31)
     └── main.rs           # Async entry point (#[embassy_executor::main])
 ```
+
+`boards/nrf52840-dk` owns the NVMC partition and linker layout that reserve the
+last 8 KB for the shared security journal.

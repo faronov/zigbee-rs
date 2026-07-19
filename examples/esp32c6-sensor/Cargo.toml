@@ -10,6 +10,7 @@ zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
+esp32-zigbee-devkit = { path = "../../boards/esp32-zigbee-devkit", features = ["esp32c6"] }
 
 # ESP32-C6 HAL and runtime
 esp-hal = { version = "1.0.0", features = ["esp32c6", "unstable"] }
@@ -21,9 +22,6 @@ critical-section = "1.2"
 static_cell = "2"
 embedded-hal = "1.0"
 log = "0.4"
-
-# Flash NV storage
-esp-storage = { version = "0.7", features = ["esp32c6"] }
 
 # Embassy async runtime (time only — executor driven manually)
 embassy-time = { version = "0.4" }

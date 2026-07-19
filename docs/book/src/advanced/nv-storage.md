@@ -1,300 +1,86 @@
 # NV Storage
 
-Zigbee devices must survive power cycles and reboots without losing their
-network membership, keys, or application state. The `zigbee-runtime` crate
-defines a `NvStorage` trait that platform backends implement using their
-specific flash, EEPROM, or NVS hardware.
+The storage stack separates portable persistence algorithms from flash
+controllers and board-specific partition layouts:
 
----
+```text
+zigbee-runtime      persistence algorithms and Zigbee security semantics
+embedded-storage    common raw NOR flash traits
+<chip>-hal          flash controller implementation
+boards/<board>      bounded partitions and linker layout
+examples/<role>     application behavior
+```
 
-## The NvStorage Trait
+Physical flash addresses must not be placed in examples or generic chip HALs.
+They depend on the board, bootloader, OTA layout, and linked firmware region,
+so the BSP owns them.
 
-The `NvStorage` trait lives in `zigbee_runtime::nv_storage` and provides six
-methods:
+## Generic application NV
+
+`NvStorage` is an item-oriented interface for ordinary application and stack
+state:
 
 ```rust
 pub trait NvStorage {
-    /// Read an item from NV storage.
-    /// Returns the number of bytes read into `buf`.
-    fn read(&self, id: NvItemId, buf: &mut [u8]) -> Result<usize, NvError>;
-
-    /// Write an item to NV storage.
+    fn read(
+        &mut self,
+        id: NvItemId,
+        buf: &mut [u8],
+    ) -> Result<usize, NvError>;
     fn write(&mut self, id: NvItemId, data: &[u8]) -> Result<(), NvError>;
-
-    /// Delete an item from NV storage.
     fn delete(&mut self, id: NvItemId) -> Result<(), NvError>;
-
-    /// Check if an item exists.
-    fn exists(&self, id: NvItemId) -> bool;
-
-    /// Get the length of a stored item.
-    fn item_length(&self, id: NvItemId) -> Result<usize, NvError>;
-
-    /// Compact/defragment the storage (if applicable).
+    fn exists(&mut self, id: NvItemId) -> Result<bool, NvError>;
+    fn item_length(&mut self, id: NvItemId) -> Result<usize, NvError>;
     fn compact(&mut self) -> Result<(), NvError>;
 }
 ```
 
-All methods are synchronous — flash writes on embedded targets are typically
-blocking and complete in microseconds to low milliseconds. The trait does not
-require `alloc`; buffers are caller-provided.
-
-### NvError
-
-```rust
-pub enum NvError {
-    NotFound,        // Item does not exist
-    Full,            // Storage is full — call compact() or free items
-    BufferTooSmall,  // Caller buffer too small for the stored item
-    HardwareError,   // Flash/EEPROM write or erase failed
-    Corrupt,         // CRC or consistency check failed
-}
-```
-
----
-
-## NvItemId — What Gets Persisted
-
-Every stored item is identified by an `NvItemId`, a `#[repr(u16)]` enum.
-Items are organized into logical groups:
+`RamNvStorage` implements this interface for host tests.
+`LogStructuredNv<F>` provides flash-backed storage when `F` implements
+`embedded_storage::nor_flash::NorFlash`. It uses two erase sectors, appends
+new item versions, and copies live values during compaction.
 
 ```rust
-#[repr(u16)]
-pub enum NvItemId {
-    // ── Network parameters (0x0001 – 0x000B) ──
-    NwkPanId            = 0x0001,
-    NwkChannel          = 0x0002,
-    NwkShortAddress     = 0x0003,
-    NwkExtendedPanId    = 0x0004,
-    NwkIeeeAddress      = 0x0005,
-    NwkKey              = 0x0006,
-    NwkKeySeqNum        = 0x0007,
-    NwkFrameCounter     = 0x0008,
-    NwkDepth            = 0x0009,
-    NwkParentAddress    = 0x000A,
-    NwkUpdateId         = 0x000B,
+use zigbee_runtime::log_nv::LogStructuredNv;
 
-    // ── APS parameters (0x0020 – 0x0023) ──
-    ApsTrustCenterAddress = 0x0020,
-    ApsLinkKey            = 0x0021,
-    ApsBindingTable       = 0x0022,
-    ApsGroupTable         = 0x0023,
-
-    // ── BDB commissioning (0x0040 – 0x0044) ──
-    BdbNodeIsOnNetwork       = 0x0040,
-    BdbCommissioningMode     = 0x0041,
-    BdbPrimaryChannelSet     = 0x0042,
-    BdbSecondaryChannelSet   = 0x0043,
-    BdbCommissioningGroupId  = 0x0044,
-
-    // ── Application data (0x0100+) ──
-    AppEndpoint1    = 0x0100,
-    AppEndpoint2    = 0x0101,
-    AppEndpoint3    = 0x0102,
-    AppCustomBase   = 0x0200,   // user-defined items start here
-}
+let nv = LogStructuredNv::new(flash_partition, 0, erase_size)?;
 ```
 
-### What Each Group Contains
+The flash value passed here is already bounded to the BSP-owned partition.
+Offsets are relative to that partition, not absolute chip addresses.
 
-| Group | Items | Why It Matters |
-|-------|-------|---------------|
-| **Network** | PAN ID, channel, addresses, network key, frame counter | Without these the device would have to rejoin the network from scratch. |
-| **APS** | TC address, link keys, binding table, group table | Link keys enable encrypted communication; bindings control where reports go. |
-| **BDB** | On-network flag, channel sets, commissioning state | Lets the stack know whether to commission or resume on next boot. |
-| **Application** | Endpoint-specific attribute data | Preserves user-visible state (e.g., thermostat setpoint, light on/off). |
+## Security state
 
-> **Frame counter persistence is critical.** If `NwkFrameCounter` is lost on
-> reboot, the device will transmit frames with a counter of zero. Other devices
-> will treat these as replay attacks and silently drop them.
+Zigbee network keys and outgoing frame counters require stronger guarantees
+than generic item storage. `SecurityStateJournal<F>` is a separate two-sector
+atomic journal with CRC, generations, read-back verification, and a final
+commit marker. It also supports crash-safe outgoing-counter reservations.
 
----
+Do not replace the security journal with `LogStructuredNv`. Both use the same
+raw NOR traits, but they intentionally provide different semantics.
 
-## RamNvStorage — In-Memory Storage for Testing
+## Platform ownership
 
-For host-based tests and simulations, `RamNvStorage` implements `NvStorage`
-using `heapless` collections — no flash hardware needed:
+| Platform | Flash controller | Partition owner | Store |
+|---|---|---|---|
+| TLSR8258 | `tlsr8258-hal` | `boards/tlsr8258-tb04` | Security journal |
+| nRF52840 | Embassy NVMC | `boards/nrf52840-dk` | Security journal |
+| PHY6222/PHY6252 | `phy6222-hal` | `boards/phy62x2-evk` | Security journal |
+| ESP32-C6/H2 | `esp_storage::FlashStorage` | `boards/esp32-zigbee-devkit` | Generic NV |
+| EFR32MG1P | `efr32mg1-hal` MSC | `boards/efr32mg1-tradfri` | Generic NV |
+| EFR32MG21 | `efr32mg21-hal` MSC | `boards/efr32mg21-devkit` | Generic NV |
 
-```rust
-pub struct RamNvStorage {
-    items: heapless::Vec<NvItem, 64>,  // up to 64 items
-}
+The BSP wrappers validate bounds and translate relative offsets to physical
+addresses. Linker scripts reserve the same regions so application code cannot
+overlap persistent storage.
 
-struct NvItem {
-    id: NvItemId,
-    data: heapless::Vec<u8, 128>,      // up to 128 bytes per item
-}
-```
+## Adding a platform
 
-Usage:
+1. Implement `ReadNorFlash` and `NorFlash` in the chip HAL.
+2. Define a bounded partition wrapper in the board crate.
+3. Reserve that partition in the board linker layout.
+4. Construct `SecurityStateJournal` or `LogStructuredNv` in the BSP.
+5. Pass the resulting store to the application without exposing addresses.
 
-```rust
-use zigbee_runtime::nv_storage::{RamNvStorage, NvStorage, NvItemId};
-
-let mut nv = RamNvStorage::new();
-
-// Write the network channel
-nv.write(NvItemId::NwkChannel, &[15]).unwrap();
-
-// Read it back
-let mut buf = [0u8; 4];
-let len = nv.read(NvItemId::NwkChannel, &mut buf).unwrap();
-assert_eq!(&buf[..len], &[15]);
-
-// Check existence
-assert!(nv.exists(NvItemId::NwkChannel));
-assert!(!nv.exists(NvItemId::NwkKey));
-```
-
-`RamNvStorage` is volatile — all data is lost when the process exits. Its
-`compact()` method is a no-op since RAM doesn't suffer from flash wear.
-
----
-
-## Implementing Flash-Backed NV Storage
-
-To run on real hardware you need a `NvStorage` implementation that writes to
-non-volatile memory. Here is the pattern for a typical flash-backed store:
-
-```rust
-use zigbee_runtime::nv_storage::{NvStorage, NvItemId, NvError};
-
-pub struct FlashNvStorage {
-    // Platform-specific flash handle
-    flash: MyFlashDriver,
-    // Base address of the NV partition
-    base_addr: u32,
-    // Simple item index kept in RAM for fast lookup
-    index: heapless::Vec<FlashItem, 64>,
-}
-
-struct FlashItem {
-    id: NvItemId,
-    offset: u32,   // byte offset from base_addr
-    length: u16,
-}
-
-impl NvStorage for FlashNvStorage {
-    fn read(&self, id: NvItemId, buf: &mut [u8]) -> Result<usize, NvError> {
-        let item = self.index.iter()
-            .find(|i| i.id == id)
-            .ok_or(NvError::NotFound)?;
-        if buf.len() < item.length as usize {
-            return Err(NvError::BufferTooSmall);
-        }
-        self.flash.read(self.base_addr + item.offset, &mut buf[..item.length as usize])
-            .map_err(|_| NvError::HardwareError)?;
-        Ok(item.length as usize)
-    }
-
-    fn write(&mut self, id: NvItemId, data: &[u8]) -> Result<(), NvError> {
-        // Append-only: write to next free sector, update index
-        // On compact(), defragment and reclaim deleted entries
-        todo!("platform-specific flash write")
-    }
-
-    fn delete(&mut self, id: NvItemId) -> Result<(), NvError> {
-        // Mark the item as deleted in flash; reclaim space on compact()
-        todo!("platform-specific flash delete")
-    }
-
-    fn exists(&self, id: NvItemId) -> bool {
-        self.index.iter().any(|i| i.id == id)
-    }
-
-    fn item_length(&self, id: NvItemId) -> Result<usize, NvError> {
-        self.index.iter()
-            .find(|i| i.id == id)
-            .map(|i| i.length as usize)
-            .ok_or(NvError::NotFound)
-    }
-
-    fn compact(&mut self) -> Result<(), NvError> {
-        // Erase + rewrite: copy live items to a scratch sector,
-        // erase the primary sector, copy back.
-        todo!("wear-leveled compaction")
-    }
-}
-```
-
-### Platform Hints
-
-The source code documents these target backends:
-
-| Platform | Recommended Backend |
-|----------|-------------------|
-| nRF52840 | Flash-backed `FlashNvStorage` using NVMC (last 2 pages = 8 KB) — **implemented** in `nrf52840-sensor` |
-| ESP32-C6 | `EspFlashDriver` via `esp-storage` LL API (last 2 sectors at `0x3FE000`) — **implemented** in `esp32c6-sensor` |
-| ESP32-H2 | Not yet implemented — network state is lost on reboot |
-| STM32WB | Internal flash with wear leveling |
-| Generic | Bridge via the `embedded-storage` traits |
-
-Both the nRF52840 and ESP32-C6 implementations use `LogStructuredNv<T>` — a
-log-structured NV format from `zigbee-runtime` that wraps a platform-specific
-flash driver. It appends writes sequentially and only erases sectors during
-compaction, minimizing flash wear.
-
-#### ESP32-C6 NV Details
-
-The ESP32-C6 example (`esp32c6-sensor/src/flash_nv.rs`) stores network state
-in the last two 4 KB sectors of the 4 MB external SPI flash:
-
-| Sector | Address | Purpose |
-|--------|---------|---------|
-| Page A | `0x3FE000` – `0x3FEFFF` | Primary NV page |
-| Page B | `0x3FF000` – `0x3FFFFF` | Secondary NV page (for compaction) |
-
-The implementation uses `esp_storage::ll` functions for raw SPI flash access
-(`spiflash_read`, `spiflash_write`, `spiflash_erase_sector`, `spiflash_unlock`).
-
-```rust
-// From esp32c6-sensor/src/flash_nv.rs
-pub fn create_nv() -> LogStructuredNv<EspFlashDriver> {
-    LogStructuredNv::new(EspFlashDriver::new(), NV_PAGE_A, NV_PAGE_B)
-}
-```
-
-#### nRF52840 NV Details
-
-The nRF52840 example (`nrf52840-sensor/src/flash_nv.rs`) uses the NVMC
-(Non-Volatile Memory Controller) to write to the last 2 pages (8 KB) of the
-1 MB internal flash. The `FlashNvStorage` struct implements `NvStorage` and
-is wrapped in `LogStructuredNv` for the same log-structured format.
-
----
-
-## What State Is Saved and Restored on Reboot
-
-When the stack starts, it checks `BdbNodeIsOnNetwork`. If the flag is set, it
-restores the following items from NV instead of starting fresh commissioning:
-
-1. **Network identity** — `NwkPanId`, `NwkChannel`, `NwkShortAddress`,
-   `NwkExtendedPanId`
-2. **Security material** — `NwkKey`, `NwkKeySeqNum`, `NwkFrameCounter`,
-   `ApsLinkKey`, `ApsTrustCenterAddress`
-3. **Topology** — `NwkParentAddress`, `NwkDepth`, `NwkUpdateId`
-4. **Bindings and groups** — `ApsBindingTable`, `ApsGroupTable`
-5. **Application attributes** — `AppEndpoint1`–`AppEndpoint3` and any
-   `AppCustomBase + N` items the application registered
-
-If any critical item is missing or corrupt (`NvError::Corrupt`), the stack
-falls back to a fresh commissioning cycle — the device will rejoin the network
-as if it were new.
-
-### Saving Before Deep Sleep
-
-Before entering deep sleep (which typically resets the CPU), the runtime
-persists all dirty state:
-
-```rust
-// Pseudocode from the event loop
-if let SleepDecision::DeepSleep(_) = decision {
-    nv.write(NvItemId::NwkFrameCounter, &fc.to_le_bytes())?;
-    nv.write(NvItemId::NwkShortAddress, &addr.0.to_le_bytes())?;
-    // ... save any changed application attributes ...
-}
-```
-
-> **Tip:** Only write items that have actually changed since the last save.
-> Flash has limited write endurance (typically 10,000–100,000 cycles per
-> sector), so unnecessary writes shorten the device's lifetime.
+Flash errors must be returned to the storage algorithm. Reads, writes, and
+erases must never be treated as successful after a controller failure.

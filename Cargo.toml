@@ -34,6 +34,14 @@ exclude = [
     "examples/telink-tlsr8258-radio",
     "tlsr8258-hal",
     "tlsr8258-rt",
+    "boards/tlsr8258-tb04",
+    "boards/nrf52840-dk",
+    "boards/phy62x2-evk",
+    "boards/esp32-zigbee-devkit",
+    "boards/efr32mg1-tradfri",
+    "boards/efr32mg21-devkit",
+    "efr32mg1-hal",
+    "efr32mg21-hal",
     "examples/phy6222-sensor",
     "examples/efr32mg1-sensor",
     "examples/efr32mg21-sensor",
@@ -46,5 +54,6 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/faronov/zigbee-rs"
 
 [workspace.dependencies]
+embedded-storage = "0.3"
 heapless = "0.9"
 log = "0.4"

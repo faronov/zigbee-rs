@@ -1283,7 +1283,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// This legacy format is not suitable for production secured restore; use
     /// `restore_security_state()` through
     /// `start_or_resume_with_security_store()` instead.
-    pub fn restore_state(&mut self, nv: &dyn NvStorage) -> bool {
+    pub fn restore_state(&mut self, nv: &mut dyn NvStorage) -> bool {
         let mut buf = [0u8; 16];
 
         // Check if we have stored network state

@@ -1,0 +1,16 @@
+[package]
+name = "tlsr8258-tb04"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board support for the TLSR8258 TB-04 module"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+embedded-storage = "0.3"
+tlsr8258-hal = { path = "../../tlsr8258-hal" }
+zigbee-runtime = { path = "../../zigbee-runtime" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }
