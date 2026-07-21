@@ -1804,6 +1804,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "zigbee-bh1750"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "heapless 0.9.2",
+]
+
+[[package]]
+name = "zigbee-bme280"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "heapless 0.9.2",
+]
+
+[[package]]
+name = "zigbee-bme680"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "heapless 0.9.2",
+]
+
+[[package]]
 name = "zigbee-crypto"
 version = "0.1.0"
 dependencies = [
@@ -1858,10 +1885,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "zigbee-scd4x"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "heapless 0.9.2",
+]
+
+[[package]]
 name = "zigbee-sht3x"
 version = "0.1.0"
 dependencies = [
  "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "heapless 0.9.2",
+]
+
+[[package]]
+name = "zigbee-sht4x"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "heapless 0.9.2",
 ]
 
 [[package]]

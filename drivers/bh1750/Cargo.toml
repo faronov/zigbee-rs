@@ -1,9 +1,9 @@
 [package]
-name = "zigbee-sht3x"
+name = "zigbee-bh1750"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Blocking and async embedded-hal SHT3x temperature and humidity driver"
+description = "Blocking and async embedded-hal BH1750 ambient light sensor driver"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 

@@ -319,6 +319,13 @@ zigbee-rs/
 ├── zigbee-zcl/                # Zigbee Cluster Library (45 clusters)
 ├── zigbee-runtime/            # Device builder, power, NV storage
 ├── zigbee/                    # Top-level: coordinator, router
+├── drivers/                   # Transport-independent sensor drivers (blocking + async)
+│   ├── sht3x/                 # Sensirion SHT3x temperature + humidity
+│   ├── sht4x/                 # Sensirion SHT4x temperature + humidity
+│   ├── scd4x/                 # Sensirion SCD4x CO2 + temperature + humidity
+│   ├── bme280/                # Bosch BME280/BMP280 temperature + humidity + pressure
+│   ├── bme680/                # Bosch BME680 temperature + humidity + pressure
+│   └── bh1750/                # ROHM BH1750 ambient light
 ├── tests/                     # Integration tests
 ├── examples/
 │   ├── mock-sensor/           # Host: temp+humidity sensor
