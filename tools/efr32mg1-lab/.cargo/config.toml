@@ -1,0 +1,15 @@
+[build]
+target = "thumbv7em-none-eabi"
+
+[target.thumbv7em-none-eabi]
+rustflags = [
+    "-L", "../../boards/efr32mg1-tradfri/link",
+    "-C", "link-arg=-Tbootloader-app.x",
+    "-C", "link-arg=--nmagic",
+]
+
+[unstable]
+build-std = ["core", "alloc"]
+
+[env]
+DEFMT_LOG = "info"

@@ -8,6 +8,22 @@ const MODEL_OFFSET: u32 = 0x04;
 const MODEH_OFFSET: u32 = 0x08;
 const DOUT_OFFSET: u32 = 0x0C;
 const DIN_OFFSET: u32 = 0x1C;
+const EXTIPSELL_OFFSET: u32 = 0x400;
+const EXTIPSELH_OFFSET: u32 = 0x404;
+const EXTIPINSELL_OFFSET: u32 = 0x408;
+const EXTIPINSELH_OFFSET: u32 = 0x40C;
+const EXTIRISE_OFFSET: u32 = 0x410;
+const EXTIFALL_OFFSET: u32 = 0x414;
+const IF_OFFSET: u32 = 0x41C;
+const IFC_OFFSET: u32 = 0x424;
+const IEN_OFFSET: u32 = 0x428;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptEdge {
+    Rising,
+    Falling,
+    Both,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -97,8 +113,76 @@ impl Pin {
         unsafe { read(self.port_base() + DOUT_OFFSET) & (1 << self.number) != 0 }
     }
 
+    /// Route this pin to its same-numbered external interrupt line.
+    ///
+    /// EFR32xG1 groups lines by pin number: line 13 can select any port's
+    /// pin 13, but not an arbitrary pin from another four-pin group.
+    pub fn configure_interrupt(self, edge: InterruptEdge) {
+        clock::enable_gpio_clock();
+        let mask = self.interrupt_mask();
+        let (port_select, port_shift) = interrupt_port_select(self.number);
+        let (pin_select, pin_shift) = interrupt_pin_select(self.number);
+
+        unsafe {
+            modify(GPIO_BASE + IEN_OFFSET, mask, 0);
+            modify(
+                GPIO_BASE + port_select,
+                0xF << port_shift,
+                (self.port as u32) << port_shift,
+            );
+            modify(
+                GPIO_BASE + pin_select,
+                0x3 << pin_shift,
+                ((self.number & 0x3) as u32) << pin_shift,
+            );
+            modify(
+                GPIO_BASE + EXTIRISE_OFFSET,
+                mask,
+                if matches!(edge, InterruptEdge::Rising | InterruptEdge::Both) {
+                    mask
+                } else {
+                    0
+                },
+            );
+            modify(
+                GPIO_BASE + EXTIFALL_OFFSET,
+                mask,
+                if matches!(edge, InterruptEdge::Falling | InterruptEdge::Both) {
+                    mask
+                } else {
+                    0
+                },
+            );
+            write(GPIO_BASE + IFC_OFFSET, mask);
+            modify(GPIO_BASE + IEN_OFFSET, mask, mask);
+        }
+    }
+
+    #[inline]
+    pub fn interrupt_pending(self) -> bool {
+        unsafe { read(GPIO_BASE + IF_OFFSET) & self.interrupt_mask() != 0 }
+    }
+
+    #[inline]
+    pub fn clear_interrupt(self) {
+        unsafe { write(GPIO_BASE + IFC_OFFSET, self.interrupt_mask()) }
+    }
+
+    #[inline]
+    pub fn disable_interrupt(self) {
+        let mask = self.interrupt_mask();
+        unsafe {
+            modify(GPIO_BASE + IEN_OFFSET, mask, 0);
+            write(GPIO_BASE + IFC_OFFSET, mask);
+        }
+    }
+
     const fn port_base(self) -> u32 {
         GPIO_BASE + (self.port as u32) * PORT_STRIDE
+    }
+
+    const fn interrupt_mask(self) -> u32 {
+        1 << self.number
     }
 
     const fn mode_register(self) -> (u32, u32) {
@@ -113,6 +197,22 @@ impl Pin {
     }
 }
 
+const fn interrupt_port_select(line: u8) -> (u32, u32) {
+    if line < 8 {
+        (EXTIPSELL_OFFSET, (line as u32) * 4)
+    } else {
+        (EXTIPSELH_OFFSET, ((line - 8) as u32) * 4)
+    }
+}
+
+const fn interrupt_pin_select(line: u8) -> (u32, u32) {
+    if line < 8 {
+        (EXTIPINSELL_OFFSET, (line as u32) * 4)
+    } else {
+        (EXTIPINSELH_OFFSET, ((line - 8) as u32) * 4)
+    }
+}
+
 #[inline]
 unsafe fn read(address: u32) -> u32 {
     unsafe { core::ptr::read_volatile(address as *const u32) }
@@ -121,4 +221,29 @@ unsafe fn read(address: u32) -> u32 {
 #[inline]
 unsafe fn write(address: u32, value: u32) {
     unsafe { core::ptr::write_volatile(address as *mut u32, value) }
+}
+
+#[inline]
+unsafe fn modify(address: u32, mask: u32, value: u32) {
+    unsafe { write(address, (read(address) & !mask) | (value & mask)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EXTIPSELH_OFFSET, EXTIPSELL_OFFSET, EXTIPINSELH_OFFSET, EXTIPINSELL_OFFSET,
+        interrupt_pin_select, interrupt_port_select,
+    };
+
+    #[test]
+    fn interrupt_line_13_uses_high_route_fields() {
+        assert_eq!(interrupt_port_select(13), (EXTIPSELH_OFFSET, 20));
+        assert_eq!(interrupt_pin_select(13), (EXTIPINSELH_OFFSET, 20));
+    }
+
+    #[test]
+    fn interrupt_line_3_uses_low_route_fields() {
+        assert_eq!(interrupt_port_select(3), (EXTIPSELL_OFFSET, 12));
+        assert_eq!(interrupt_pin_select(3), (EXTIPINSELL_OFFSET, 12));
+    }
 }

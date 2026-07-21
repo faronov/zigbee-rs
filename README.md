@@ -180,13 +180,13 @@ cargo build --release   # no stubs, no vendor blobs needed!
 ```bash
 cd examples/efr32mg1-sensor
 cargo build --release   # no stubs, no GSDK, no RAIL library needed!
-cargo build --release --no-default-features --features diag-sht
 tools/verify-layout.py target/thumbv7em-none-eabi/release/efr32mg1-sensor
 ```
 
 > The TRÅDFRI image is linked at `0x4000` for the resident Gecko bootloader.
-> `diag-sht` brings up PA0 and SHT3x on I2C0 PC10/PC11 without NV or radio.
-> Verify the ELF before creating a flash image.
+> It is an unconditional 30-second RTCC/EM2 sleepy end device. Hardware
+> diagnostics are separate binaries under `tools/efr32mg1-lab`. Verify every
+> ELF before creating a flash image.
 
 ### EFR32MG21 firmware (pure Rust — no vendor SDK!)
 

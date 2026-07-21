@@ -32,6 +32,7 @@ exclude = [
     "examples/telink-tlsr8258-sensor",
     "examples/telink-tlsr8258-router",
     "tools/telink-tlsr8258-lab",
+    "tools/efr32mg1-lab",
     "examples/telink-tlsr8258-radio",
     "tlsr8258-hal",
     "tlsr8258-rt",

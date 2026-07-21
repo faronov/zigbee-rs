@@ -355,8 +355,10 @@ Both platforms implement the same `radio_sleep()` / `radio_wake()` interface
 despite the different register layouts — the CMU abstraction is handled inside
 each platform's MAC driver (`efr32/` for Series 1, `efr32s2/` for Series 2).
 
-> **Note:** Full deep sleep (EM2/EM3/EM4 energy modes) is not yet implemented.
-> Currently only radio clock gating is used for power reduction between polls.
+> **Series 1:** The production EFR32MG1P sensor additionally uses RTCC/LFRCO
+> wakeups and EM2 between 30-second parent polls, including the Series-1 DCDC
+> safety gate and PB13 interrupt wake. EFR32MG21 currently uses radio clock
+> gating only.
 
 ---
 

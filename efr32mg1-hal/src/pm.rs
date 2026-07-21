@@ -79,6 +79,13 @@ pub enum WakeCause {
     Spurious,
 }
 
+/// Result from an EM2 sleep that may be stopped by an application interrupt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptibleSleep {
+    Deadline { deadline: u32 },
+    Interrupted { deadline: u32 },
+}
+
 /// Runs `poll` up to `max_attempts` times, returning as soon as
 /// it reports success. This isolates bounded-retry bookkeeping from the
 /// actual hardware access so the exact same retry logic used by every wait
@@ -317,7 +324,7 @@ pub const fn ticks_from_now_clamped(now: u64, deadline: u64) -> Option<u32> {
 
 #[cfg(target_arch = "arm")]
 mod hw {
-    use super::{poll_bounded, PmError, WakeCause};
+    use super::{InterruptibleSleep, PmError, WakeCause, poll_bounded};
     use core::sync::atomic::{AtomicU32, Ordering};
 
     // CMU (shared base with efr32mg1_hal::clock; offsets cross-checked
@@ -676,7 +683,10 @@ mod hw {
         let before = wake_events();
         let mut attempts = 0u32;
         loop {
-            enter_em2_once()?;
+            if let Err(error) = enter_em2_once() {
+                disarm_wake();
+                return Err(error);
+            }
             let after = wake_events();
             if after != before {
                 return Ok(super::classify_wake(before, after));
@@ -718,13 +728,40 @@ mod hw {
     /// can safely reuse the exact same bounded `enter_em2_once` loop as
     /// `diag-em2` while the time driver's ISR is installed.
     pub fn sleep_for_ticks_polled(ticks_from_now: u32) -> Result<u32, PmError> {
+        match sleep_for_ticks_polled_until(ticks_from_now, || false)? {
+            InterruptibleSleep::Deadline { deadline } => Ok(deadline),
+            InterruptibleSleep::Interrupted { .. } => unreachable!(),
+        }
+    }
+
+    /// Sleeps until the RTCC deadline or until `interrupted` observes an
+    /// application wake event. Other IRQs are treated as bounded spurious
+    /// wakes; the RTCC compare is disarmed on every normal return path.
+    pub fn sleep_for_ticks_polled_until<F>(
+        ticks_from_now: u32,
+        mut interrupted: F,
+    ) -> Result<InterruptibleSleep, PmError>
+    where
+        F: FnMut() -> bool,
+    {
         let deadline = arm_wake(ticks_from_now);
         let mut attempts = 0u32;
         loop {
-            enter_em2_once()?;
+            if interrupted() {
+                disarm_wake();
+                return Ok(InterruptibleSleep::Interrupted { deadline });
+            }
+            if let Err(error) = enter_em2_once() {
+                disarm_wake();
+                return Err(error);
+            }
             if super::ticks_reached(now(), deadline) {
                 disarm_wake();
-                return Ok(deadline);
+                return Ok(InterruptibleSleep::Deadline { deadline });
+            }
+            if interrupted() {
+                disarm_wake();
+                return Ok(InterruptibleSleep::Interrupted { deadline });
             }
             attempts += 1;
             if attempts > DEFAULT_MAX_SPURIOUS_WAKES {

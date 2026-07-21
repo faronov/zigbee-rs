@@ -7,7 +7,7 @@ pub mod storage;
 use efr32mg1_hal::{
     adc::{Adc0, AdcError, Config as AdcConfig, avdd_raw_to_millivolts},
     clock::{self, ClockError, HfxoConfig},
-    gpio::{Mode, Pin, Port},
+    gpio::{InterruptEdge, Mode, Pin, Port},
     i2c::{Config as I2cConfig, I2c0, I2cError, PullUp},
 };
 
@@ -199,10 +199,19 @@ impl Button {
 
     pub fn init(&self) {
         BUTTON_PIN.configure(Mode::InputPullFilter, true);
+        BUTTON_PIN.configure_interrupt(InterruptEdge::Falling);
     }
 
     pub fn is_pressed(&self) -> bool {
         !BUTTON_PIN.is_high()
+    }
+
+    pub fn take_interrupt(&self) -> bool {
+        if !BUTTON_PIN.interrupt_pending() {
+            return false;
+        }
+        BUTTON_PIN.clear_interrupt();
+        true
     }
 }
 

@@ -91,6 +91,14 @@ cd examples/efr32mg1-sensor
 cargo build --release
 ```
 
+The MG1 production package always builds the sleepy end device. Explicitly
+named hardware diagnostics are built separately, for example:
+
+```bash
+cd tools/efr32mg1-lab
+cargo build --release --bin efr32mg1-diag-sht
+```
+
 ### EFR32MG21 (Series 2)
 
 ```bash
@@ -211,9 +219,10 @@ Both `efr32mg1-sensor` and `efr32mg21-sensor` implement a Zigbee 3.0
 temperature & humidity end device with:
 
 - **Pure-Rust IEEE 802.15.4 radio driver** (no RAIL/GSDK)
-- Embassy async runtime (SysTick time driver)
+- Embassy async runtime (RTCC/LFRCO on MG1P; SysTick on MG21)
 - Proper interrupt vector table (34 IRQs for MG1P, 51 for MG21)
-- Button-driven network join/leave with edge detection
+- MG1P PB13 interrupt wake from EM2; short press samples sensors and a
+  three-second hold performs factory reset
 - LED status indication + Identify blink
 - ZCL Temperature Measurement + Relative Humidity + Identify clusters
 - MG1P ADC0 AVDD battery measurement and Power Configuration reporting
@@ -235,10 +244,11 @@ temperature & humidity end device with:
 
 - **Series 1 status** — the EFR32MG1P path is hardware-proven through
   commissioning, ZHA interview, real SHT3x reporting, reset resume, and secure
-  rejoin. Hardware reset cycles also proved the two-sector security-journal
-  rollover with monotonic counter reservations and no invalid records. The
-  TRÅDFRI linker preserves the resident bootloader and native NVM3 while
-  reserving separate Rust security-journal and application-NV regions.
+  rejoin, plus RTCC/EM2 polling and PB13 interrupt wake. Hardware reset cycles
+  also proved the two-sector security-journal rollover with monotonic counter
+  reservations and no invalid records. The TRÅDFRI linker preserves the
+  resident bootloader and native NVM3 while reserving separate Rust
+  security-journal and application-NV regions.
 - **Series 2 status** — the EFR32MG21 pure-Rust radio initialization remains
   hardware-unverified.
 - **Board-specific sensing** — the proven TRÅDFRI MG1 target reads a real SHT3x

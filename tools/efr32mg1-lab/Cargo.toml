@@ -1,45 +1,59 @@
 [package]
-name = "efr32mg1-sensor"
+name = "efr32mg1-lab"
 version = "0.1.0"
 edition = "2024"
+publish = false
 autobins = false
 
 [[bin]]
-name = "efr32mg1-sensor"
-path = "src/main.rs"
+name = "efr32mg1-diag-nv"
+path = "src/bin/diag_nv.rs"
+
+[[bin]]
+name = "efr32mg1-diag-em2"
+path = "src/bin/diag_em2.rs"
+
+[[bin]]
+name = "efr32mg1-diag-rtcc-time"
+path = "src/bin/diag_rtcc_time.rs"
+
+[[bin]]
+name = "efr32mg1-diag-radio-em2"
+path = "src/bin/diag_radio_em2.rs"
+
+[[bin]]
+name = "efr32mg1-diag-sht"
+path = "src/bin/diag_sht.rs"
+
+[[bin]]
+name = "efr32mg1-diag-join"
+path = "src/bin/diag_join.rs"
+
+[[bin]]
+name = "efr32mg1-diag-beacon"
+path = "src/bin/diag_beacon.rs"
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
-zigbee-mac = { path = "../../zigbee-mac", features = ["efr32"] }
+zigbee-mac = { path = "../../zigbee-mac", features = ["efr32", "efr32-trace"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee-runtime = { path = "../../zigbee-runtime", features = ["trace"] }
 efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
 efr32mg1-hal = { path = "../../efr32mg1-hal" }
 zigbee-sht3x = { path = "../../drivers/sht3x" }
 
-# Embassy async runtime
-#
-# `embassy-time-driver` carries `TICK_HZ`; `tick-hz-32_768` pins it to
-# exactly the RTCC/LFRCO tick rate (`efr32mg1_hal::pm::LFRCO_HZ`) so the
-# RTCC-backed time driver (`src/time_driver.rs`) needs no fractional tick
-# conversion. `embassy-time-driver` is `links = "embassy-time"`, so Cargo
-# unifies a single instance of it across this whole dependency graph —
-# including `zigbee-mac`'s `efr32` feature, which pulls in `embassy-time`
-# 0.4 (this crate uses 0.5) but shares that same single driver instance.
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
 embassy-time = { version = "0.5" }
 embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
 embassy-time-queue-utils = "0.1"
 embassy-futures = "0.1"
 
-# ARM Cortex-M4F support
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = { version = "0.7", features = ["device", "set-vtor"] }
-
 static_cell = "2"
-
+log = "0.4"
 rtt-target = "0.6"
 
 [profile.release]
