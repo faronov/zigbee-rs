@@ -324,7 +324,7 @@ pub const fn ticks_from_now_clamped(now: u64, deadline: u64) -> Option<u32> {
 
 #[cfg(target_arch = "arm")]
 mod hw {
-    use super::{InterruptibleSleep, PmError, WakeCause, poll_bounded};
+    use super::{poll_bounded, InterruptibleSleep, PmError, WakeCause};
     use core::sync::atomic::{AtomicU32, Ordering};
 
     // CMU (shared base with efr32mg1_hal::clock; offsets cross-checked
