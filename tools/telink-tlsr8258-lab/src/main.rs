@@ -2177,7 +2177,6 @@ impl Tlsr8258Mac {
         // Per-call counters for join-path window (+0x264 / +0x268).
         let mut tx_ok_count: u32 = 0;
         let mut tx_fail_count: u32 = 0;
-        let mut attempts_executed: u32 = 0;
         let mut ack_recorded: bool = false;
         let write_csma_counters = |ok: u32, fail: u32, attempts: u32| {
             mark32(
@@ -2186,7 +2185,7 @@ impl Tlsr8258Mac {
             );
         };
         for attempt in 0..=max_retries {
-            attempts_executed = attempt as u32 + 1;
+            let attempts_executed = attempt as u32 + 1;
             let tx_ok = self.transmit_raw(frame).is_ok();
             if tx_ok {
                 tx_ok_count += 1;
@@ -2444,11 +2443,10 @@ impl MacDriver for Tlsr8258Mac {
             }
         }
 
-        let mut dw_iters: u32 = 0;
         let mut dw_frames: u32 = 0;
         let mut dw_first_logged = false;
         for direct_attempt in 0..6u8 {
-            dw_iters = direct_attempt as u32 + 1;
+            let dw_iters = direct_attempt as u32 + 1;
             mark32(DBG_JOIN_BASE + 0x1C, dw_iters); // +0x26C
             if let Ok(pkt) = self.receive_raw(POLL_RESPONSE_LOOPS / 3) {
                 dw_frames = dw_frames.wrapping_add(1);
@@ -2500,12 +2498,11 @@ impl MacDriver for Tlsr8258Mac {
         mark32(DBG_MODE_BASE + 0x58, 0xA55C0002);
         mark32(DBG_JOIN_BASE + 0x2C, 0xA55C200D); // +0x27C
 
-        let mut dr_attempts: u32 = 0;
         let mut dr_tx_bitmap: u32 = 0;
         let mut dr_frames: u32 = 0;
         let mut dr_first_logged = false;
         for poll_attempt in 0..6u8 {
-            dr_attempts = poll_attempt as u32 + 1;
+            let dr_attempts = poll_attempt as u32 + 1;
             mark32(DBG_JOIN_BASE + 0x30, dr_attempts); // +0x280
             let data_req = self.build_data_request(&req.coord_address);
             // The parent may answer a poll with the Association Response before
@@ -2612,7 +2609,7 @@ impl MacDriver for Tlsr8258Mac {
         Ok(())
     }
 
-    async fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
+    fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
         // Diag: count mlme_reset (BDB calls this between candidate attempts)
         unsafe {
             let p = (DBG_JOIN_BASE + 0xC0) as *mut u32;
