@@ -1903,9 +1903,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 // NWK Leave command (0x04) — signal application to rejoin
                 if cmd_id == 0x04 && len >= 2 {
                     let nwk_addr = self.bdb.zdo().nwk().nib().network_address;
-                    let Some(leave) = zigbee_nwk::frames::LeaveCommand::parse(&buf[1..]) else {
-                        return None;
-                    };
+                    let leave = zigbee_nwk::frames::LeaveCommand::parse(&buf[1..])?;
                     let nib = self.bdb.zdo().nwk().nib();
                     if nib.security_enabled && !nwk_security {
                         log::warn!("[Runtime] Ignoring unsecured NWK Leave command");
@@ -2061,11 +2059,9 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
             // After ZDO processes Mgmt_Leave_req, execute the actual leave
             if cluster_id == zigbee_zdo::MGMT_LEAVE_REQ && zdo_handled {
-                let Some(request) = aps_indication.payload.get(1..).and_then(|payload| {
+                let request = aps_indication.payload.get(1..).and_then(|payload| {
                     zigbee_zdo::network_mgmt::MgmtLeaveReq::parse(payload).ok()
-                }) else {
-                    return None;
-                };
+                })?;
                 let local_ieee = self.bdb.zdo().nwk().nib().ieee_address;
                 if request.device_address != [0; 8] && request.device_address != local_ieee {
                     log::warn!(

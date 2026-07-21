@@ -321,8 +321,8 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
 
     #[inline(never)]
     fn apply_fb_target_request(&mut self, clusters: &mut [crate::ClusterRef<'_>]) {
-        if let Some((ep, time_secs)) = self.bdb.fb_target_request.take() {
-            if self
+        if let Some((ep, time_secs)) = self.bdb.fb_target_request.take()
+            && self
                 .with_cluster_mut(ep, zigbee_zcl::ClusterId::IDENTIFY, clusters, |cluster| {
                     cluster.attributes_mut().set(
                         zigbee_zcl::AttributeId(0x0000),
@@ -330,13 +330,12 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                     )
                 })
                 .is_some()
-            {
-                log::info!(
-                    "[Runtime] F&B target: set IdentifyTime={}s on ep {}",
-                    time_secs,
-                    ep,
-                );
-            }
+        {
+            log::info!(
+                "[Runtime] F&B target: set IdentifyTime={}s on ep {}",
+                time_secs,
+                ep,
+            );
         }
     }
 
