@@ -15,6 +15,7 @@ flash-controller bring-up isolated from the radio stack.
 | I2C0 SDA/SCL | PC10/PC11, LOC15, open drain |
 | I2C speed | 10 kHz with weak internal pull-ups for bring-up margin |
 | SHT3x | Probe `0x44`, then `0x45` only |
+| Battery | ADC0 measures AVDD against the calibrated internal 5 V reference |
 
 The controller supports external pull-ups, but this board definition
 intentionally uses the known native-project internal-pull-up configuration.
@@ -36,8 +37,9 @@ the `APP_PROPERTIES` address at vector word 13 (`0x4034`). `cortex-m-rt`'s
 
 ## Profiles
 
-- `sensor` (default): factory-EUI Zigbee end device with real SHT3x
-  temperature/humidity, ZHA reporting, and crash-safe security restore.
+- `sensor` (default): factory-EUI sleepy Zigbee end device with real SHT3x
+  temperature/humidity, ADC battery monitoring, ZHA reporting, crash-safe
+  security restore, and 30-second RTCC/EM2 parent polling.
 - `diag-sht`: HFXO, RTCC-backed Embassy timers/RTT, PA0 LED, I2C0, and real
   SHT3x only; no NV/radio.
 - `diag-nv`: MSC plus the bounded Rust application journal only; no radio.
@@ -312,6 +314,9 @@ The default sensor profile is hardware-proven with factory EUI
 - ZHA completed interview as `Zigbee-RS / EFR32MG1-Sensor`;
 - the normal profile reads the SHT3x at `0x44`; ZHA observed real values and a
   later periodic update (`23.87 -> 23.88 °C`, `61.13 -> 61.10 %RH`);
+- ADC0 measures AVDD with the calibrated internal 5 V reference. The first
+  post-EM2 hardware sample reported raw `2617`, `3195 mV`, and updated the ZHA
+  Power Configuration battery attributes;
 - the resident bootloader, separate application NV, and native
   `0x3A000..0x3FFFF` NVM3 remained byte-identical throughout NV writes,
   commissioning, reset, secure rejoin, and journal rollover.
@@ -363,9 +368,10 @@ Never use `device masserase` for this layout. Re-read vectors at `0x0` and
 
 ## Architecture
 
-- `efr32mg1-hal`: raw CMU/MSC wait-state, GPIO, I2C0 controller, and RTCC
-  wake-timer/EM2-entry (`pm`) code.
-- `boards/efr32mg1-tradfri`: HFXO/pin/LOC/I2C speed and application flash map.
+- `efr32mg1-hal`: raw CMU/MSC wait-state, GPIO, ADC0, I2C0 controller, and
+  RTCC wake-timer/EM2-entry (`pm`) code.
+- `boards/efr32mg1-tradfri`: HFXO/pin/LOC/I2C configuration, battery curve,
+  and application flash map.
 - `drivers/sht3x`: generic blocking embedded-hal 1.0 SHT3x protocol.
 - this example: profile sequencing, Embassy timers, RTT, and LED patterns.
   `src/time_driver.rs` is the Embassy time driver, backed by
@@ -374,8 +380,6 @@ Never use `device masserase` for this layout. Re-read vectors at `0x0` and
   interrupt for every profile that links it; `diag-em2` does not compile
   this module and keeps its own separate, unmodified `RTCC` handler.
 
-Full DCDC/EM2 integration into the production SED path is still deferred;
-`diag-em2` and `diag-rtcc-time` are isolated, unflashed gates towards it and
-do not change `sensor` behavior. Power management for the production
-profile begins only after these gates — and the SED conversion itself —
-are proven on hardware.
+The production SED uses the RTCC/LFRCO time driver and EM2 between 30-second
+parent polls. The isolated `diag-em2` and `diag-rtcc-time` profiles remain as
+regression gates for low-power timer, SRAM retention, and wake behavior.

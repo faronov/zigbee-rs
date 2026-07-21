@@ -2,6 +2,11 @@
 
 #![no_std]
 
+#[cfg(test)]
+#[macro_use]
+extern crate std;
+
+pub mod adc;
 pub mod clock;
 pub mod flash;
 pub mod gpio;

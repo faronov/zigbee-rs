@@ -448,7 +448,7 @@ use efr32mg1_hal::pm;
 #[cfg(feature = "sensor")]
 use efr32mg1_tradfri::storage::SecurityStore;
 #[cfg(feature = "sensor")]
-use efr32mg1_tradfri::Button;
+use efr32mg1_tradfri::{BatteryMonitor, Button};
 use efr32mg1_tradfri::Led;
 #[cfg(feature = "sensor")]
 use embassy_executor::Spawner;
@@ -712,6 +712,7 @@ struct SensorApp {
     device: &'static mut ZigbeeDevice<Efr32Mac>,
     security_store: &'static mut SecurityStore,
     sht: zigbee_sht3x::Sht3x<efr32mg1_tradfri::SensorI2c>,
+    battery: Option<BatteryMonitor>,
     temp_cluster: &'static mut TemperatureCluster,
     hum_cluster: &'static mut HumidityCluster,
     power_cluster: &'static mut PowerConfigCluster,
@@ -742,6 +743,7 @@ impl SensorApp {
         device: &'static mut ZigbeeDevice<Efr32Mac>,
         security_store: &'static mut SecurityStore,
         sht: zigbee_sht3x::Sht3x<efr32mg1_tradfri::SensorI2c>,
+        battery: Option<BatteryMonitor>,
         temp_cluster: &'static mut TemperatureCluster,
         hum_cluster: &'static mut HumidityCluster,
         power_cluster: &'static mut PowerConfigCluster,
@@ -752,6 +754,7 @@ impl SensorApp {
             device,
             security_store,
             sht,
+            battery,
             temp_cluster,
             hum_cluster,
             power_cluster,
@@ -1072,8 +1075,7 @@ impl SensorApp {
         if !self.awaiting_initial_configuration {
             setup_default_reporting(&mut *self.device);
         }
-        self.power_cluster.set_battery_voltage(30);
-        self.power_cluster.set_battery_percentage(100 * 2);
+        self.sample_battery();
         self.sample_sht().await;
         self.last_report = Instant::now();
 
@@ -1383,10 +1385,44 @@ impl SensorApp {
     }
 
     #[inline(always)]
+    fn sample_battery(&mut self) {
+        let Some(monitor) = self.battery.as_mut() else {
+            self.power_cluster.set_battery_voltage(0xFF);
+            self.power_cluster.set_battery_percentage(0xFF);
+            rtt_target::rprintln!("[EFR32][sensor] BATTERY_UNAVAILABLE");
+            return;
+        };
+
+        match monitor.read() {
+            Ok(reading) => {
+                self.power_cluster
+                    .set_battery_voltage(reading.voltage_100mv);
+                self.power_cluster
+                    .set_battery_percentage(reading.percentage_remaining);
+                rtt_target::rprintln!(
+                    "[EFR32][sensor] BATTERY_MEAS_OK raw={} millivolts={} voltage_100mv={} percentage_half={}",
+                    reading.raw_adc,
+                    reading.millivolts,
+                    reading.voltage_100mv,
+                    reading.percentage_remaining
+                );
+            }
+            Err(error) => {
+                // ZCL reserves 0xFF for unknown. Do not retain a stale,
+                // success-shaped battery value after a failed conversion.
+                self.power_cluster.set_battery_voltage(0xFF);
+                self.power_cluster.set_battery_percentage(0xFF);
+                rtt_target::rprintln!("[EFR32][sensor] BATTERY_READ_ERROR {:?}", error);
+            }
+        }
+    }
+
+    #[inline(always)]
     async fn update_measurements(&mut self, now: Instant) {
         let elapsed_s = now.duration_since(self.last_report).as_secs();
         if elapsed_s >= REPORT_INTERVAL_SECS {
             self.last_report = now;
+            self.sample_battery();
             self.sample_sht().await;
         }
     }
@@ -1583,6 +1619,19 @@ async fn main(_spawner: Spawner) {
         }
     };
     let sht = sht_probe(i2c, "sensor").await;
+    let battery = match efr32mg1_tradfri::battery_monitor() {
+        Ok(monitor) => {
+            rtt_target::rprintln!(
+                "[EFR32][sensor] BATTERY_READY curve={:?}",
+                monitor.curve()
+            );
+            Some(monitor)
+        }
+        Err(error) => {
+            rtt_target::rprintln!("[EFR32][sensor] BATTERY_INIT_ERROR {:?}", error);
+            None
+        }
+    };
 
     static SECURITY_STORE_CELL: StaticCell<SecurityStore> = StaticCell::new();
     let security_store = SECURITY_STORE_CELL.init(storage::security_store());
@@ -1594,6 +1643,8 @@ async fn main(_spawner: Spawner) {
     let hum_cluster = HUM_CELL.init(HumidityCluster::new(0, 10000));
     static POWER_CELL: StaticCell<PowerConfigCluster> = StaticCell::new();
     let power_cluster = POWER_CELL.init(PowerConfigCluster::new());
+    power_cluster.set_battery_voltage(0xFF);
+    power_cluster.set_battery_percentage(0xFF);
     power_cluster.set_battery_size(4);
     power_cluster.set_battery_quantity(2);
     power_cluster.set_battery_rated_voltage(15);
@@ -1622,6 +1673,7 @@ async fn main(_spawner: Spawner) {
         device,
         security_store,
         sht,
+        battery,
         temp_cluster,
         hum_cluster,
         power_cluster,

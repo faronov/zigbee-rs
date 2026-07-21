@@ -124,7 +124,7 @@ impl NorFlash for Efr32mg1Flash {
 }
 
 #[inline(never)]
-#[unsafe(link_section = ".data.ram_code")]
+#[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.ram_code"))]
 fn erase_page_ram(offset: u32) -> Result<(), FlashError> {
     unsafe {
         let was_locked = core::ptr::read_volatile(MSC_LOCK as *const u32) != 0;
@@ -157,7 +157,7 @@ fn erase_page_ram(offset: u32) -> Result<(), FlashError> {
 }
 
 #[inline(never)]
-#[unsafe(link_section = ".data.ram_code")]
+#[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.ram_code"))]
 fn program_word_ram(offset: u32, word: u32) -> Result<(), FlashError> {
     unsafe {
         let was_locked = core::ptr::read_volatile(MSC_LOCK as *const u32) != 0;
@@ -200,7 +200,7 @@ fn program_word_ram(offset: u32, word: u32) -> Result<(), FlashError> {
 }
 
 #[inline(never)]
-#[unsafe(link_section = ".data.ram_code")]
+#[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.ram_code"))]
 fn wait_series1_ready_ram() -> Result<(), FlashError> {
     for _ in 0..PROGRAM_TIMEOUT {
         let status = unsafe { core::ptr::read_volatile(MSC_STATUS as *const u32) };

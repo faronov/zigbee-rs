@@ -187,21 +187,20 @@ zigbee-mac = { features = ["efr32s2"] }
 ## Power Management
 
 Both EFR32 platforms implement radio sleep/wake via the **CMU (Clock
-Management Unit)**, which gates the radio peripheral clocks to save power
-between polls:
+Management Unit)**. The hardware-proven MG1P SED additionally uses an
+RTCC/LFRCO time driver and enters EM2 between parent polls:
 
 ```rust
-device.mac_mut().radio_sleep();   // CMU clock gate — radio off
-Timer::after(Duration::from_millis(poll_ms)).await;
-device.mac_mut().radio_wake();    // CMU clock enable, re-apply channel
+device.mac_mut().radio_sleep();
+pm::sleep_for_ticks(pm::ms_to_ticks(poll_ms, pm::LFRCO_HZ))?;
+device.mac_mut().radio_wake();
 ```
 
 The CMU register addresses differ between Series 1 and Series 2 (see
 register table above), but the sleep/wake interface is identical.
 
-> **Note:** Full deep sleep (EM2/EM3/EM4 energy modes) is not yet
-> implemented. Currently only radio clock gating is used for power
-> reduction between polls.
+Series 2 still uses radio clock gating only; its deep-sleep path remains
+hardware-unverified.
 
 See the [Power Management](../advanced/power.md) chapter for the full
 cross-platform power framework.
@@ -217,9 +216,10 @@ temperature & humidity end device with:
 - Button-driven network join/leave with edge detection
 - LED status indication + Identify blink
 - ZCL Temperature Measurement + Relative Humidity + Identify clusters
+- MG1P ADC0 AVDD battery measurement and Power Configuration reporting
 - Flash NV storage — network state persists across reboots
 - Default reporting with reportable change thresholds
-- Radio sleep/wake for power management
+- MG1P RTCC/EM2 sleepy polling; radio sleep/wake on both series
 
 ## Troubleshooting
 
@@ -241,10 +241,11 @@ temperature & humidity end device with:
   reserving separate Rust security-journal and application-NV regions.
 - **Series 2 status** — the EFR32MG21 pure-Rust radio initialization remains
   hardware-unverified.
-- **No deep sleep** — only radio clock gating is implemented; full EM2/EM3/EM4
-  energy modes are not yet supported.
 - **Board-specific sensing** — the proven TRÅDFRI MG1 target reads a real SHT3x
-  on I2C0 PC10/PC11. Other EFR examples may still use placeholder values.
+  on I2C0 PC10/PC11 and measures AVDD through ADC0. Other EFR examples may
+  still use placeholder values.
+- **Series 2 deep sleep** — the MG21 path has not yet received the hardware-
+  proven RTCC/EM2 integration used by MG1P.
 
 ---
 

@@ -146,6 +146,14 @@ pub fn enable_i2c0_clock() {
     }
 }
 
+#[inline]
+pub fn enable_adc0_clock() {
+    unsafe {
+        modify(CMU_CTRL, CMU_CTRL_HFPERCLKEN, CMU_CTRL_HFPERCLKEN);
+        modify(CMU_HFPERCLKEN0, 1 << 8, 1 << 8);
+    }
+}
+
 unsafe fn set_flash_wait_state_38m4() {
     // EFR32xG1 permits up to 25 MHz at WS0 and 40 MHz at WS1 at 1.2 V.
     let was_locked = unsafe { read(MSC_LOCK) != 0 };
