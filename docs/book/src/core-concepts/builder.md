@@ -33,6 +33,7 @@ defaults:
 | `model`            | `"Generic"`                   |
 | `sw_build`         | `"0.1.0"`                     |
 | `date_code`        | `""`                          |
+| `power_source`     | `PowerSource::Unknown`        |
 
 You only override what you need.
 
@@ -110,6 +111,7 @@ builder
     .model("TempSensor-v2")          // ModelIdentifier  (attr 0x0005)
     .sw_build("1.3.0")               // SWBuildID        (attr 0x4000)
     .date_code("20260101")           // DateCode         (attr 0x0006)
+    .power_source(PowerSource::Battery)
 ```
 
 ## Adding Endpoints
@@ -124,12 +126,12 @@ clusters:
 builder.endpoint(
     1,        // endpoint number (1-240)
     0x0104,   // profile ID: Home Automation
-    0x0302,   // device ID: Temperature Sensor
+    DeviceId::TEMPERATURE_SENSOR,
     |ep| {
-        ep.cluster_server(0x0000)   // Basic
-          .cluster_server(0x0001)   // Power Configuration
-          .cluster_server(0x0003)   // Identify
-          .cluster_server(0x0402)   // Temperature Measurement
+        ep.cluster_server(ClusterId::BASIC)
+          .cluster_server(ClusterId::POWER_CONFIG)
+          .cluster_server(ClusterId::IDENTIFY)
+          .cluster_server(ClusterId::TEMPERATURE)
     },
 )
 ```
@@ -140,14 +142,15 @@ The closure receives an `EndpointBuilder` with these methods:
 
 | Method              | Description                                      |
 |---------------------|--------------------------------------------------|
-| `cluster_server(id)` | Add a server-side cluster (you implement it)    |
+| `cluster_server(id)` | Add a server-side cluster to the endpoint       |
 | `cluster_client(id)` | Add a client-side cluster (you send commands)   |
 | `device_version(v)`  | Set the device version (default: 1)             |
 
 **Server clusters** are clusters your device *implements* — other devices can
 read attributes and send commands to them.  **Client clusters** are clusters
 your device *sends commands to* — for example, a light switch has On/Off as a
-client cluster.
+client cluster. `ZigbeeDevice` owns Basic and Identify; mutable sensor and
+actuator clusters are supplied by the application as `ClusterRef`s.
 
 You can add up to **16 clusters per endpoint** and **8 endpoints per device**.
 
@@ -157,15 +160,15 @@ Some devices expose multiple functions.  For example, a multi-sensor:
 
 ```rust,ignore
 builder
-    .endpoint(1, 0x0104, 0x0302, |ep| {
-        ep.cluster_server(0x0000)   // Basic
-          .cluster_server(0x0402)   // Temperature
+    .endpoint(1, 0x0104, DeviceId::TEMPERATURE_SENSOR, |ep| {
+        ep.cluster_server(ClusterId::BASIC)
+          .cluster_server(ClusterId::TEMPERATURE)
     })
-    .endpoint(2, 0x0104, 0x0302, |ep| {
-        ep.cluster_server(0x0405)   // Relative Humidity
+    .endpoint(2, 0x0104, DeviceId::TEMPERATURE_SENSOR, |ep| {
+        ep.cluster_server(ClusterId::HUMIDITY)
     })
-    .endpoint(3, 0x0104, 0x0402, |ep| {
-        ep.cluster_server(0x0500)   // IAS Zone (contact)
+    .endpoint(3, 0x0104, DeviceId::IAS_ZONE, |ep| {
+        ep.cluster_server(ClusterId::IAS_ZONE)
     })
 ```
 
@@ -216,18 +219,20 @@ let mut device = ZigbeeDevice::builder(mac)
     .device_type(DeviceType::EndDevice)
     .manufacturer("Acme Corp")
     .model("TempSensor-v2")
+    .date_code("20260325")
     .sw_build("1.3.0")
+    .power_source(PowerSource::Battery)
     .channels(ChannelMask::from_channels(&[15, 20, 25]))
     .power_mode(PowerMode::Sleepy {
         poll_interval_ms: 5_000,
         wake_duration_ms: 500,
     })
-    .endpoint(1, 0x0104, 0x0302, |ep| {
-        ep.cluster_server(0x0000)   // Basic
-          .cluster_server(0x0001)   // Power Configuration
-          .cluster_server(0x0003)   // Identify
-          .cluster_server(0x0402)   // Temperature Measurement
-          .cluster_server(0x0405)   // Relative Humidity
+    .endpoint(1, 0x0104, DeviceId::TEMPERATURE_SENSOR, |ep| {
+        ep.cluster_server(ClusterId::BASIC)
+          .cluster_server(ClusterId::POWER_CONFIG)
+          .cluster_server(ClusterId::IDENTIFY)
+          .cluster_server(ClusterId::TEMPERATURE)
+          .cluster_server(ClusterId::HUMIDITY)
     })
     .build();
 ```
@@ -257,6 +262,8 @@ use zigbee_runtime::power::PowerMode;
 use zigbee_mac::nrf::NrfMac;
 use zigbee_nwk::DeviceType;
 use zigbee_types::ChannelMask;
+use zigbee_zcl::clusters::basic::PowerSource;
+use zigbee_zcl::{ClusterId, DeviceId};
 
 #[embassy_executor::main]
 async fn main(spawner: embassy_executor::Spawner) {
@@ -268,17 +275,18 @@ async fn main(spawner: embassy_executor::Spawner) {
         .model("TH-Sensor-01")
         .sw_build("1.3.0")
         .date_code("20260325")
+        .power_source(PowerSource::Battery)
         .channels(ChannelMask::ALL_2_4GHZ)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: 7_500,
             wake_duration_ms: 500,
         })
-        .endpoint(1, 0x0104, 0x0302, |ep| {
-            ep.cluster_server(0x0000)   // Basic
-              .cluster_server(0x0001)   // Power Configuration
-              .cluster_server(0x0003)   // Identify
-              .cluster_server(0x0402)   // Temperature Measurement
-              .cluster_server(0x0405)   // Relative Humidity
+        .endpoint(1, 0x0104, DeviceId::TEMPERATURE_SENSOR, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+              .cluster_server(ClusterId::POWER_CONFIG)
+              .cluster_server(ClusterId::IDENTIFY)
+              .cluster_server(ClusterId::TEMPERATURE)
+              .cluster_server(ClusterId::HUMIDITY)
         })
         .build();
 

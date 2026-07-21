@@ -166,11 +166,13 @@ version = "0.1.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
+ "efr32mg1-hal",
  "efr32mg1-tradfri",
  "embassy-executor",
  "embassy-futures",
  "embassy-time 0.5.1",
  "embassy-time-driver",
+ "embassy-time-queue-utils",
  "heapless 0.8.0",
  "log",
  "panic-halt",
@@ -277,6 +279,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ee71af1b3a0deaa53eaf2d39252f83504c853646e472400b763060389b9fcc9"
 dependencies = [
  "document-features",
+]
+
+[[package]]
+name = "embassy-time-queue-utils"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc55c748d16908a65b166d09ce976575fb8852cf60ccd06174092b41064d8f83"
+dependencies = [
+ "embassy-executor",
+ "heapless 0.8.0",
 ]
 
 [[package]]

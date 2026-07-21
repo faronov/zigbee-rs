@@ -64,7 +64,7 @@ Every call to `tick()` runs through these phases in order:
 | **3. Join check** | If not joined to a network, returns `Idle` early |
 | **4. APS maintenance** | Ages the APS ACK table, retransmits unacknowledged frames, ages duplicate-detection and fragment tables |
 | **5. Reporting timers** | Ticks the ZCL reporting engine by `elapsed_secs` seconds |
-| **5b. Find & Bind** | Handles Finding & Binding target requests (sets IdentifyTime) |
+| **5b. Identify / Find & Bind** | Ticks the runtime-owned Identify cluster and handles Finding & Binding target requests |
 | **5c. F&B initiator** | Ticks the F&B initiator response window |
 | **6. Attribute reports** | For each registered cluster, checks if any attribute reports are due and sends them |
 
@@ -73,19 +73,17 @@ has passed since the last tick.  Use the actual interval of your timer.
 
 ### ClusterRef — Connecting Clusters to the Runtime
 
-The runtime needs access to your cluster instances to read attribute values for
-reports and handle incoming commands.  You pass them as a `&mut [ClusterRef]`:
+The runtime needs access to application-owned cluster instances to read
+attribute values for reports and handle incoming commands. Basic and Identify
+are owned by `ZigbeeDevice`; pass only sensor and actuator clusters as a
+`&mut [ClusterRef]`:
 
 ```rust,ignore
 use zigbee_runtime::ClusterRef;
+use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
-let mut temp_cluster = TemperatureMeasurement::new();
-let mut basic_cluster = BasicCluster::new();
-
-let mut clusters = [
-    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-];
+let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
+let mut clusters = [ClusterRef { endpoint: 1, cluster: &mut temp_cluster }];
 
 let result = device.tick(10, &mut clusters).await;
 ```
@@ -317,14 +315,10 @@ use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Timer};
 use zigbee_runtime::{ClusterRef, UserAction};
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
+use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
 // After device.build()...
-let mut temp = TemperatureMeasurement::new();
-let mut basic = BasicCluster::new();
-let mut clusters = [
-    ClusterRef { endpoint: 1, cluster: &mut basic },
-    ClusterRef { endpoint: 1, cluster: &mut temp },
-];
+let mut temp = TemperatureCluster::new(-4000, 12500);
 
 // Start by requesting join
 device.user_action(UserAction::Join);
@@ -335,6 +329,7 @@ loop {
         Timer::after(Duration::from_secs(60)),
     ).await {
         Either::First(Ok(frame)) => {
+            let mut clusters = [ClusterRef { endpoint: 1, cluster: &mut temp }];
             if let Some(event) = device.process_incoming(&frame, &mut clusters).await {
                 match event {
                     StackEvent::Joined { short_address, channel, pan_id } => {
@@ -365,8 +360,9 @@ loop {
         Either::Second(_) => {
             // Timer fired — read sensor and tick the stack
             let temperature = read_temperature_sensor();
-            temp.set_measured_value(temperature);
+            temp.set_temperature(temperature);
 
+            let mut clusters = [ClusterRef { endpoint: 1, cluster: &mut temp }];
             let result = device.tick(60, &mut clusters).await;
             if let TickResult::Event(event) = result {
                 // Handle events from tick (reports sent, etc.)
@@ -387,7 +383,8 @@ loop {
 - **One user action at a time** — actions are queued, not stacked.
 - **`process_incoming()` is async** — it may send ZDO responses back through
   the MAC.
-- **Pass the same `clusters` slice** to both `tick()` and `process_incoming()`
-  so the runtime can read attributes for reports and dispatch commands.
+- **Pass references to the same cluster instances** to both `tick()` and
+  `process_incoming()`. Create short-lived `ClusterRef` arrays when the
+  application also needs to update a cluster directly.
 - **Save state after joining** — call `device.save_state(&mut nv)` so the
   device can rejoin quickly after power loss.

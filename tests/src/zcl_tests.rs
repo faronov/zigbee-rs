@@ -373,7 +373,13 @@ fn analog_vs_discrete_types() {
 
 #[test]
 fn basic_cluster_id_and_defaults() {
-    let cluster = BasicCluster::new(b"TestMfr", b"Model1", b"20240101", b"1.0.0");
+    let cluster = BasicCluster::new(
+        "TestMfr",
+        "Model1",
+        "20240101",
+        "1.0.0",
+        basic::PowerSource::MainsSinglePhase,
+    );
     assert_eq!(cluster.cluster_id(), ClusterId::BASIC);
 
     let attrs = cluster.attributes();

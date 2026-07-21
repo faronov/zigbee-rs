@@ -18,7 +18,7 @@ pub const CMD_IDENTIFY_QUERY_RESPONSE: CommandId = CommandId(0x00);
 
 /// Identify cluster implementation.
 pub struct IdentifyCluster {
-    store: AttributeStore<4>,
+    store: AttributeStore<1>,
     /// Pending trigger effect: (effect_id, effect_variant).
     /// Set by TriggerEffect command, cleared by application via `take_pending_effect()`.
     pending_effect: Option<(u8, u8)>,

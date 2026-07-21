@@ -281,8 +281,9 @@ impl NwkHeader {
 /// Leave command (NWK command ID 0x04)
 #[derive(Debug, Clone, Copy)]
 pub struct LeaveCommand {
-    /// Request = device wants to leave; Indication = device told to leave
     pub remove_children: bool,
+    /// `true` asks the receiver to leave; `false` indicates the sender left.
+    pub request: bool,
     pub rejoin: bool,
 }
 
@@ -292,7 +293,8 @@ impl LeaveCommand {
             return None;
         }
         Some(Self {
-            remove_children: data[0] & (1 << 6) != 0,
+            remove_children: data[0] & (1 << 7) != 0,
+            request: data[0] & (1 << 6) != 0,
             rejoin: data[0] & (1 << 5) != 0,
         })
     }
@@ -300,6 +302,9 @@ impl LeaveCommand {
     pub fn serialize(&self) -> u8 {
         let mut cmd_opts: u8 = 0;
         if self.remove_children {
+            cmd_opts |= 1 << 7;
+        }
+        if self.request {
             cmd_opts |= 1 << 6;
         }
         if self.rejoin {

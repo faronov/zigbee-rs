@@ -8,7 +8,7 @@ machine using `MockMac`. No hardware required.
 - **MockMac** — pre-configured beacons and association responses for offline testing
 - **DeviceBuilder** — `templates::temperature_humidity_sensor()` for a HA-profile end device
 - **MAC primitives** — MLME-RESET, MLME-SCAN (active), MLME-ASSOCIATE, MLME-START
-- **ZCL clusters** — `TemperatureCluster`, `HumidityCluster`, `BasicCluster`
+- **ZCL clusters** — runtime-owned Basic identity plus application-owned `TemperatureCluster` and `HumidityCluster`
 - **Attribute read/write** — simulated sensor readings with `set_temperature()` / `set_humidity()`, read-back via `Cluster::attributes()`
 
 ## Build & Run

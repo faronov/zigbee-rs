@@ -41,6 +41,15 @@ macro_rules! efr32_trace {
 /// Maximum MAC payload size (127 - MAC overhead).
 const MAX_MAC_PAYLOAD: usize = 102;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScanDiagnostics {
+    pub tx_attempts: u8,
+    pub tx_failures: u8,
+    pub rx_frames: u16,
+    pub rx_errors: u16,
+    pub beacons: u16,
+}
+
 /// EFR32MG1P IEEE 802.15.4 MAC driver.
 ///
 /// Pure-Rust implementation using direct register access — no RAIL FFI.
@@ -51,6 +60,7 @@ pub struct Efr32Mac {
     channel: u8,
     extended_address: IeeeAddress,
     coord_short_address: ShortAddress,
+    associated_pan_coord: bool,
     rx_on_when_idle: bool,
     association_permit: bool,
     auto_request: bool,
@@ -65,6 +75,7 @@ pub struct Efr32Mac {
     /// Buffer for frames received during association (e.g. Transport-Key).
     /// Returned by the next mlme_poll() call.
     pending_assoc_frame: Option<([u8; 128], usize)>,
+    scan_diagnostics: ScanDiagnostics,
 }
 
 impl Efr32Mac {
@@ -89,6 +100,7 @@ impl Efr32Mac {
             channel: 11,
             extended_address: ieee,
             coord_short_address: ShortAddress(0xFFFF),
+            associated_pan_coord: false,
             rx_on_when_idle: false,
             association_permit: false,
             auto_request: true,
@@ -101,6 +113,7 @@ impl Efr32Mac {
             max_frame_retries: 3,
             promiscuous: false,
             pending_assoc_frame: None,
+            scan_diagnostics: ScanDiagnostics::default(),
         }
     }
 
@@ -112,6 +125,23 @@ impl Efr32Mac {
     /// Return the factory-programmed IEEE address currently used by the MAC.
     pub fn extended_address(&self) -> IeeeAddress {
         self.extended_address
+    }
+
+    pub fn scan_diagnostics(&self) -> ScanDiagnostics {
+        self.scan_diagnostics
+    }
+
+    pub fn cca_snapshot(&self) -> (i8, u32, bool, u8, u16) {
+        let (rssi, status, clear, state) = self.driver.cca_snapshot();
+        (rssi, status, clear, state, self.driver.cca_samples())
+    }
+
+    /// Override the factory EUI-64 before radio initialization.
+    pub fn with_extended_address(mut self, ieee: IeeeAddress) -> Self {
+        self.extended_address = ieee;
+        self.driver
+            .update_config(|config| config.extended_address = ieee);
+        self
     }
 
     /// Transmit a raw 802.15.4 frame for bring-up diagnostics.
@@ -273,6 +303,12 @@ impl Efr32Mac {
                     let frame_type = fc & 0x07;
                     let ack_seq = rx.data[2];
                     if frame_type == 0x02 && ack_seq == seq {
+                        #[cfg(feature = "efr32-trace")]
+                        efr32_trace!(
+                            "[MAC] ACK seq={} frame_pending={}",
+                            ack_seq,
+                            (fc & (1 << 4)) != 0
+                        );
                         return Ok(());
                     }
                 }
@@ -301,6 +337,7 @@ impl Efr32Mac {
 
 impl MacDriver for Efr32Mac {
     async fn mlme_scan(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
+        self.scan_diagnostics = ScanDiagnostics::default();
         let mut pan_descriptors: PanDescriptorList = heapless::Vec::new();
         let mut energy_list: EdList = heapless::Vec::new();
 
@@ -334,8 +371,12 @@ impl MacDriver for Efr32Mac {
                     );
                     let seq = self.next_bsn();
                     let beacon_req = build_beacon_request(seq);
+                    self.scan_diagnostics.tx_attempts =
+                        self.scan_diagnostics.tx_attempts.saturating_add(1);
                     let tx_result = self.driver.transmit(&beacon_req).await;
                     if tx_result.is_err() {
+                        self.scan_diagnostics.tx_failures =
+                            self.scan_diagnostics.tx_failures.saturating_add(1);
                         efr32_trace!("[MAC][EFR32] scan beacon_req_err ch={}", ch);
                     }
 
@@ -354,12 +395,18 @@ impl MacDriver for Efr32Mac {
                             select::Either::Second(_) => break,
                             select::Either::First(Err(_)) => {
                                 rx_errors = rx_errors.saturating_add(1);
+                                self.scan_diagnostics.rx_errors =
+                                    self.scan_diagnostics.rx_errors.saturating_add(1);
                                 continue;
                             }
                             select::Either::First(Ok(frame)) => {
                                 rx_frames = rx_frames.saturating_add(1);
+                                self.scan_diagnostics.rx_frames =
+                                    self.scan_diagnostics.rx_frames.saturating_add(1);
                                 if let Some(pd) = parse_beacon_frame(&frame.data[..frame.len], ch) {
                                     beacons = beacons.saturating_add(1);
+                                    self.scan_diagnostics.beacons =
+                                        self.scan_diagnostics.beacons.saturating_add(1);
                                     efr32_trace!(
                                         "[MAC][EFR32] scan beacon ch={} pan=0x{:04X} coord=0x{:04X} permit={} lqi={}",
                                         ch,
@@ -459,6 +506,9 @@ impl MacDriver for Efr32Mac {
         self.driver.update_config(|c| c.channel = req.channel);
 
         let coord_pan = req.coord_address.pan_id();
+        if let MacAddress::Short(_, address) = req.coord_address {
+            self.coord_short_address = address;
+        }
 
         let seq = self.next_dsn();
         let frame = build_association_request(
@@ -595,6 +645,7 @@ impl MacDriver for Efr32Mac {
                                 };
                                 if status_byte == 0 {
                                     self.short_address = addr;
+                                    self.associated_pan_coord = true;
                                     self.driver.update_config(|c| c.short_address = addr.0);
                                 }
                                 confirm = Some(MlmeAssociateConfirm {
@@ -710,6 +761,7 @@ impl MacDriver for Efr32Mac {
     async fn mlme_disassociate(&mut self, _req: MlmeDisassociateRequest) -> Result<(), MacError> {
         self.short_address = ShortAddress(0xFFFF);
         self.pan_id = PanId(0xFFFF);
+        self.associated_pan_coord = false;
         self.driver.update_config(|c| {
             c.short_address = 0xFFFF;
             c.pan_id = 0xFFFF;
@@ -717,12 +769,13 @@ impl MacDriver for Efr32Mac {
         Ok(())
     }
 
-    async fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
+    fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
         if set_default_pib {
             self.short_address = ShortAddress(0xFFFF);
             self.pan_id = PanId(0xFFFF);
             self.channel = 11;
             self.rx_on_when_idle = false;
+            self.associated_pan_coord = false;
             self.dsn = 0;
             self.bsn = 0;
         }
@@ -752,6 +805,7 @@ impl MacDriver for Efr32Mac {
             PhyCurrentChannel => PibValue::U8(self.channel),
             MacExtendedAddress => PibValue::ExtendedAddress(self.extended_address),
             MacCoordShortAddress => PibValue::ShortAddress(self.coord_short_address),
+            MacAssociatedPanCoord => PibValue::Bool(self.associated_pan_coord),
             MacRxOnWhenIdle => PibValue::Bool(self.rx_on_when_idle),
             MacAssociationPermit => PibValue::Bool(self.association_permit),
             MacAutoRequest => PibValue::Bool(self.auto_request),
@@ -791,6 +845,9 @@ impl MacDriver for Efr32Mac {
             }
             (MacCoordShortAddress, PibValue::ShortAddress(v)) => {
                 self.coord_short_address = v;
+            }
+            (MacAssociatedPanCoord, PibValue::Bool(v)) => {
+                self.associated_pan_coord = v;
             }
             (MacRxOnWhenIdle, PibValue::Bool(v)) => {
                 self.rx_on_when_idle = v;
@@ -850,14 +907,30 @@ impl MacDriver for Efr32Mac {
 
         for pass in 0..passes {
             let data_req = if pass == 0 && has_short {
-                build_data_request(self.next_dsn(), self.pan_id, self.coord_short_address)
-                    .as_slice()
-                    .iter()
-                    .copied()
-                    .collect::<heapless::Vec<u8, 24>>()
+                build_data_request(
+                    self.next_dsn(),
+                    self.pan_id,
+                    self.coord_short_address,
+                    self.short_address,
+                )
+                .as_slice()
+                .iter()
+                .copied()
+                .collect::<heapless::Vec<u8, 24>>()
             } else {
                 build_data_request_ieee(self.next_dsn(), &parent, &self.extended_address)
             };
+
+            #[cfg(feature = "efr32-trace")]
+            if pass == 0 && has_short {
+                efr32_trace!(
+                    "[MAC] data_poll short src=0x{:04X} dst=0x{:04X}",
+                    self.short_address.0,
+                    self.coord_short_address.0
+                );
+            } else {
+                efr32_trace!("[MAC] data_poll extended");
+            }
 
             if self.csma_ca_transmit(&data_req, true).await.is_err() {
                 continue;
@@ -873,8 +946,12 @@ impl MacDriver for Efr32Mac {
                 }
                 let remaining = deadline - now;
 
+                // Keep the post-TX receiver and BUFC contents intact. The
+                // parent's indirect frame may start immediately after the
+                // ACK; receive() would reset RX_DONE, clear BUFC, and restart
+                // RX in that critical turnaround window.
                 let rx_result =
-                    select::select(self.driver.receive(), Timer::after(remaining)).await;
+                    select::select(self.driver.receive_ack(), Timer::after(remaining)).await;
 
                 match rx_result {
                     select::Either::Second(_) => break,
@@ -940,6 +1017,24 @@ impl MacDriver for Efr32Mac {
         }
 
         Ok(None)
+    }
+
+    async fn mlme_poll_timeout(&mut self, timeout_us: u32) -> Result<Option<MacFrame>, MacError> {
+        match select::select(
+            self.mlme_poll(),
+            Timer::after(embassy_time::Duration::from_micros(timeout_us as u64)),
+        )
+        .await
+        {
+            select::Either::First(result) => result,
+            select::Either::Second(_) => {
+                if self.driver.cancel_pending_operation() {
+                    Ok(None)
+                } else {
+                    Err(MacError::RadioError)
+                }
+            }
+        }
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
@@ -1141,7 +1236,12 @@ fn build_association_request(
     frame
 }
 
-fn build_data_request(seq: u8, pan_id: PanId, coord: ShortAddress) -> [u8; 10] {
+fn build_data_request(
+    seq: u8,
+    pan_id: PanId,
+    coord: ShortAddress,
+    source: ShortAddress,
+) -> [u8; 10] {
     let fc: u16 = 0x8863;
     [
         fc as u8,
@@ -1151,8 +1251,8 @@ fn build_data_request(seq: u8, pan_id: PanId, coord: ShortAddress) -> [u8; 10] {
         (pan_id.0 >> 8) as u8,
         coord.0 as u8,
         (coord.0 >> 8) as u8,
-        0xFF,
-        0xFF,
+        source.0 as u8,
+        (source.0 >> 8) as u8,
         0x04,
     ]
 }

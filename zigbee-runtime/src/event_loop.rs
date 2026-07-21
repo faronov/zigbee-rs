@@ -168,16 +168,33 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         elapsed_secs: u16,
         clusters: &mut [crate::ClusterRef<'_>],
     ) -> TickResult {
-        if self.pending_action.is_some() {
-            return self
-                .tick_without_secure_rejoin(elapsed_secs, clusters)
-                .await;
+        self.tick_identify_clusters(elapsed_secs);
+        if let Some(action) = self.pending_action.take() {
+            return self.handle_action(action).await;
         }
         if self.secure_rejoin_retry_due() {
             return self.retry_secure_rejoin().await;
         }
-        self.tick_without_secure_rejoin(elapsed_secs, clusters)
-            .await
+
+        self.flush_pending_responses().await;
+        if !self.is_joined() {
+            return TickResult::Idle;
+        }
+
+        // Keep this path direct: another async wrapper adds several KiB of
+        // transient stack on small Series-1 devices.
+        self.run_aps_maintenance().await;
+        self.run_nwk_maintenance(elapsed_secs).await;
+
+        self.reporting.tick(elapsed_secs);
+        self.apply_fb_target_request(clusters);
+        self.run_finding_binding_tick(elapsed_secs).await;
+        self.send_due_reports(clusters).await;
+        self.update_pending_tx_flag();
+
+        let now_ms = (elapsed_secs as u32) * 1000;
+        self.run_sleepy_poll(now_ms).await;
+        self.tick_power_state(now_ms)
     }
 
     pub(crate) async fn tick_without_secure_rejoin(
@@ -305,19 +322,20 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
     #[inline(never)]
     fn apply_fb_target_request(&mut self, clusters: &mut [crate::ClusterRef<'_>]) {
         if let Some((ep, time_secs)) = self.bdb.fb_target_request.take() {
-            for cr in clusters.iter_mut() {
-                if cr.endpoint == ep && cr.cluster.cluster_id().0 == 0x0003 {
-                    let _ = cr.cluster.attributes_mut().set(
+            if self
+                .with_cluster_mut(ep, zigbee_zcl::ClusterId::IDENTIFY, clusters, |cluster| {
+                    cluster.attributes_mut().set(
                         zigbee_zcl::AttributeId(0x0000),
                         zigbee_zcl::data_types::ZclValue::U16(time_secs),
-                    );
-                    log::info!(
-                        "[Runtime] F&B target: set IdentifyTime={}s on ep {}",
-                        time_secs,
-                        ep,
-                    );
-                    break;
-                }
+                    )
+                })
+                .is_some()
+            {
+                log::info!(
+                    "[Runtime] F&B target: set IdentifyTime={}s on ep {}",
+                    time_secs,
+                    ep,
+                );
             }
         }
     }

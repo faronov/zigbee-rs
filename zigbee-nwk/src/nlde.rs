@@ -743,23 +743,30 @@ impl<M: MacDriver> NwkLayer<M> {
         };
 
         log::info!(
-            "[NWK] Leave from 0x{:04X} (remove_children={}, rejoin={})",
+            "[NWK] Leave from 0x{:04X} (remove_children={}, request={}, rejoin={})",
             src.0,
             leave.remove_children,
+            leave.request,
             leave.rejoin
         );
 
-        if leave.remove_children {
-            // We are being asked to leave the network
+        if leave.request {
+            if src != self.nib.parent_address {
+                log::warn!(
+                    "[NWK] Ignoring leave request from non-parent 0x{:04X}",
+                    src.0
+                );
+                return;
+            }
             log::warn!(
-                "[NWK] Received leave-with-remove-children from 0x{:04X}",
-                src.0
+                "[NWK] Received leave request from 0x{:04X} (remove_children={})",
+                src.0,
+                leave.remove_children,
             );
             self.joined = false;
+        } else {
+            self.neighbors.remove(src);
         }
-
-        // Remove the leaving device from our neighbor table
-        self.neighbors.remove(src);
     }
 
     /// Handle incoming Route Request (RREQ).

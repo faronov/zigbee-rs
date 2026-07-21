@@ -91,6 +91,20 @@ pub struct NwkRxSecurityStats {
     pub decrypt_failures: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RejoinDiagnostics {
+    pub stage: u8,
+    pub candidate_attempts: u8,
+    pub tx_attempts: u8,
+    pub poll_attempts: u8,
+    pub rx_frames: u8,
+    pub last_status: u8,
+    pub last_parent: u16,
+    pub no_ack_failures: u8,
+    pub channel_access_failures: u8,
+    pub other_tx_failures: u8,
+}
+
 /// The NWK layer — owns all NWK state and the MAC driver.
 ///
 /// Generic over:
@@ -153,6 +167,7 @@ pub struct NwkLayer<M: MacDriver> {
     btr: routing::BtrTable,
     security: security::NwkSecurity,
     rx_security_stats: NwkRxSecurityStats,
+    rejoin_diagnostics: RejoinDiagnostics,
     device_type: DeviceType,
     joined: bool,
     /// Whether this device listens when idle.
@@ -212,6 +227,7 @@ impl<M: MacDriver> NwkLayer<M> {
             btr: routing::BtrTable::new(),
             security: security::NwkSecurity::new(),
             rx_security_stats: NwkRxSecurityStats::default(),
+            rejoin_diagnostics: RejoinDiagnostics::default(),
             device_type,
             joined: false,
             rx_on_when_idle,
@@ -255,6 +271,7 @@ impl<M: MacDriver> NwkLayer<M> {
             core::ptr::addr_of_mut!((*slot).btr).write(routing::BtrTable::new());
             core::ptr::addr_of_mut!((*slot).security).write(security::NwkSecurity::new());
             core::ptr::addr_of_mut!((*slot).rx_security_stats).write(NwkRxSecurityStats::default());
+            core::ptr::addr_of_mut!((*slot).rejoin_diagnostics).write(RejoinDiagnostics::default());
             core::ptr::addr_of_mut!((*slot).device_type).write(device_type);
             core::ptr::addr_of_mut!((*slot).joined).write(false);
             core::ptr::addr_of_mut!((*slot).rx_on_when_idle).write(true);
@@ -296,6 +313,14 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Get rx_on_when_idle setting.
     pub fn rx_on_when_idle(&self) -> bool {
         self.rx_on_when_idle
+    }
+
+    pub fn rejoin_diagnostics(&self) -> RejoinDiagnostics {
+        self.rejoin_diagnostics
+    }
+
+    pub fn reset_rejoin_diagnostics(&mut self) {
+        self.rejoin_diagnostics = RejoinDiagnostics::default();
     }
 
     /// Get reference to the NIB.
@@ -356,6 +381,11 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Read-only access to the neighbor table.
     pub fn neighbor_table(&self) -> &neighbor::NeighborTable {
         &self.neighbors
+    }
+
+    /// Remove a device that sent a NWK Leave indication.
+    pub fn remove_neighbor(&mut self, address: ShortAddress) {
+        self.neighbors.remove(address);
     }
 
     /// Read-only access to the routing table.

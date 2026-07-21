@@ -100,12 +100,12 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Must be called once after power-on/reset before any commissioning.
     /// Sets up the device-type–dependent commissioning capabilities and
     /// optionally restores network state from NV storage.
-    pub async fn initialize(&mut self) -> Result<(), BdbStatus> {
+    pub fn initialize(&mut self) -> Result<(), BdbStatus> {
         self.state = BdbState::Initializing;
         log::info!("[BDB] Initializing…");
 
         // Reset lower layers
-        if self.zdo.nlme_reset(false).await.is_err() {
+        if self.zdo.nlme_reset(false).is_err() {
             self.state = BdbState::Idle;
             return Err(BdbStatus::NotPermitted);
         }
@@ -255,7 +255,7 @@ impl<M: MacDriver> BdbLayer<M> {
 
         // Step 2: Reset lower layers (NWK + MAC) — clears neighbor table,
         // security material, routing table, frame counters
-        let _ = self.zdo.nlme_reset(true).await;
+        let _ = self.zdo.nlme_reset(true);
 
         // Step 3: Clear APS state — binding table, group table, key table
         self.zdo.aps_mut().binding_table_mut().clear();
@@ -339,9 +339,11 @@ impl<M: MacDriver> BdbLayer<M> {
         let nib = self.zdo.nwk().nib();
         let channel = nib.logical_channel;
         let extended_pan_id = nib.extended_pan_id;
+        let previous_parent = nib.parent_address;
         let channel_mask = zigbee_types::ChannelMask(1u32 << channel);
 
-        let networks = match self.zdo.nlme_network_discovery(channel_mask, 3).await {
+        self.zdo.nwk_mut().reset_rejoin_diagnostics();
+        let mut networks = match self.zdo.nlme_network_discovery(channel_mask, 3).await {
             Ok(n) => n,
             Err(_) => {
                 log::warn!("[BDB] Rejoin: no networks found on channel {}", channel);
@@ -349,6 +351,12 @@ impl<M: MacDriver> BdbLayer<M> {
                 return Err(BdbStatus::NoScanResponse);
             }
         };
+        networks.sort_unstable_by_key(|network| {
+            (
+                network.router_address != previous_parent,
+                core::cmp::Reverse(network.lqi),
+            )
+        });
 
         for network in networks
             .iter()

@@ -17,7 +17,7 @@ pub const ATTR_BATTERY_ALARM_STATE: AttributeId = AttributeId(0x003E);
 
 /// Power Configuration cluster (battery subset).
 pub struct PowerConfigCluster {
-    store: AttributeStore<12>,
+    store: AttributeStore<8>,
 }
 
 impl Default for PowerConfigCluster {

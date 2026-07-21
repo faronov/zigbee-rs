@@ -8,6 +8,8 @@
 use crate::builder::DeviceBuilder;
 use zigbee_mac::MacDriver;
 use zigbee_nwk::DeviceType;
+use zigbee_zcl::clusters::basic::PowerSource;
+use zigbee_zcl::{ClusterId, DeviceId};
 
 /// HA profile ID
 const HA_PROFILE: u16 = 0x0104;
@@ -22,11 +24,12 @@ const HA_PROFILE: u16 = 0x0104;
 pub fn temperature_sensor<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
         .device_type(DeviceType::EndDevice)
-        .endpoint(1, HA_PROFILE, 0x0302, |ep| {
-            ep.cluster_server(0x0000) // Basic
-                .cluster_server(0x0001) // Power Configuration
-                .cluster_server(0x0003) // Identify
-                .cluster_server(0x0402) // Temperature Measurement
+        .power_source(PowerSource::Battery)
+        .endpoint(1, HA_PROFILE, DeviceId::TEMPERATURE_SENSOR, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::POWER_CONFIG)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::TEMPERATURE)
         })
 }
 
@@ -39,12 +42,13 @@ pub fn temperature_sensor<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
 pub fn temperature_humidity_sensor<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
         .device_type(DeviceType::EndDevice)
-        .endpoint(1, HA_PROFILE, 0x0302, |ep| {
-            ep.cluster_server(0x0000)
-                .cluster_server(0x0001)
-                .cluster_server(0x0003)
-                .cluster_server(0x0402)
-                .cluster_server(0x0405)
+        .power_source(PowerSource::Battery)
+        .endpoint(1, HA_PROFILE, DeviceId::TEMPERATURE_SENSOR, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::POWER_CONFIG)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::TEMPERATURE)
+                .cluster_server(ClusterId::HUMIDITY)
         })
 }
 
@@ -56,12 +60,13 @@ pub fn temperature_humidity_sensor<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
 pub fn on_off_light<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
         .device_type(DeviceType::Router) // Lights are typically routers
-        .endpoint(1, HA_PROFILE, 0x0100, |ep| {
-            ep.cluster_server(0x0000) // Basic
-                .cluster_server(0x0003) // Identify
-                .cluster_server(0x0004) // Groups
-                .cluster_server(0x0005) // Scenes
-                .cluster_server(0x0006) // On/Off
+        .power_source(PowerSource::MainsSinglePhase)
+        .endpoint(1, HA_PROFILE, DeviceId::ON_OFF_LIGHT, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::GROUPS)
+                .cluster_server(ClusterId::SCENES)
+                .cluster_server(ClusterId::ON_OFF)
         })
 }
 
@@ -74,13 +79,14 @@ pub fn on_off_light<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
 pub fn dimmable_light<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
         .device_type(DeviceType::Router)
-        .endpoint(1, HA_PROFILE, 0x0101, |ep| {
-            ep.cluster_server(0x0000)
-                .cluster_server(0x0003)
-                .cluster_server(0x0004)
-                .cluster_server(0x0005)
-                .cluster_server(0x0006)
-                .cluster_server(0x0008) // Level Control
+        .power_source(PowerSource::MainsSinglePhase)
+        .endpoint(1, HA_PROFILE, DeviceId::DIMMABLE_LIGHT, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::GROUPS)
+                .cluster_server(ClusterId::SCENES)
+                .cluster_server(ClusterId::ON_OFF)
+                .cluster_server(ClusterId::LEVEL_CONTROL)
         })
 }
 
@@ -93,14 +99,15 @@ pub fn dimmable_light<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
 pub fn color_temperature_light<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
         .device_type(DeviceType::Router)
-        .endpoint(1, HA_PROFILE, 0x010C, |ep| {
-            ep.cluster_server(0x0000)
-                .cluster_server(0x0003)
-                .cluster_server(0x0004)
-                .cluster_server(0x0005)
-                .cluster_server(0x0006)
-                .cluster_server(0x0008)
-                .cluster_server(0x0300) // Color Control
+        .power_source(PowerSource::MainsSinglePhase)
+        .endpoint(1, HA_PROFILE, DeviceId::COLOR_TEMPERATURE_LIGHT, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::GROUPS)
+                .cluster_server(ClusterId::SCENES)
+                .cluster_server(ClusterId::ON_OFF)
+                .cluster_server(ClusterId::LEVEL_CONTROL)
+                .cluster_server(ClusterId::COLOR_CONTROL)
         })
 }
 
@@ -112,11 +119,12 @@ pub fn color_temperature_light<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
 pub fn contact_sensor<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
         .device_type(DeviceType::EndDevice)
-        .endpoint(1, HA_PROFILE, 0x0402, |ep| {
-            ep.cluster_server(0x0000)
-                .cluster_server(0x0001)
-                .cluster_server(0x0003)
-                .cluster_server(0x0500) // IAS Zone
+        .power_source(PowerSource::Battery)
+        .endpoint(1, HA_PROFILE, DeviceId::IAS_ZONE, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::POWER_CONFIG)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::IAS_ZONE)
         })
 }
 
@@ -128,11 +136,12 @@ pub fn contact_sensor<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
 pub fn occupancy_sensor<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
         .device_type(DeviceType::EndDevice)
-        .endpoint(1, HA_PROFILE, 0x0107, |ep| {
-            ep.cluster_server(0x0000)
-                .cluster_server(0x0001)
-                .cluster_server(0x0003)
-                .cluster_server(0x0406) // Occupancy Sensing
+        .power_source(PowerSource::Battery)
+        .endpoint(1, HA_PROFILE, DeviceId::OCCUPANCY_SENSOR, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::POWER_CONFIG)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::OCCUPANCY)
         })
 }
 
@@ -145,13 +154,14 @@ pub fn occupancy_sensor<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
 pub fn smart_plug<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
         .device_type(DeviceType::Router)
-        .endpoint(1, HA_PROFILE, 0x0009, |ep| {
-            ep.cluster_server(0x0000)
-                .cluster_server(0x0003)
-                .cluster_server(0x0004)
-                .cluster_server(0x0005)
-                .cluster_server(0x0006)
-                .cluster_server(0x0B04) // Electrical Measurement
+        .power_source(PowerSource::MainsSinglePhase)
+        .endpoint(1, HA_PROFILE, DeviceId::MAINS_POWER_OUTLET, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::GROUPS)
+                .cluster_server(ClusterId::SCENES)
+                .cluster_server(ClusterId::ON_OFF)
+                .cluster_server(ClusterId::ELECTRICAL_MEASUREMENT)
         })
 }
 
@@ -164,11 +174,12 @@ pub fn smart_plug<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
 pub fn thermostat<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
         .device_type(DeviceType::Router)
-        .endpoint(1, HA_PROFILE, 0x0301, |ep| {
-            ep.cluster_server(0x0000)
-                .cluster_server(0x0003)
-                .cluster_server(0x0004)
-                .cluster_server(0x0201) // Thermostat
-                .cluster_server(0x0402) // Temperature Measurement
+        .power_source(PowerSource::MainsSinglePhase)
+        .endpoint(1, HA_PROFILE, DeviceId::THERMOSTAT, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::GROUPS)
+                .cluster_server(ClusterId::THERMOSTAT)
+                .cluster_server(ClusterId::TEMPERATURE)
         })
 }

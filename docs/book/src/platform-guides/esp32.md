@@ -244,18 +244,22 @@ fn main() -> ! {
 ### Device Setup
 
 ```rust
+    use zigbee_zcl::clusters::basic::PowerSource;
+    use zigbee_zcl::{ClusterId, DeviceId};
+
     let mut device = ZigbeeDevice::builder(mac)
         .device_type(DeviceType::EndDevice)
         .manufacturer("Zigbee-RS")
         .model("ESP32-C6-Sensor")
         .sw_build("0.1.0")
+        .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
-            ep.cluster_server(0x0000) // Basic
-                .cluster_server(0x0001) // Power Configuration
-                .cluster_server(0x0003) // Identify
-                .cluster_server(0x0402) // Temperature Measurement
-                .cluster_server(0x0405) // Relative Humidity
+        .endpoint(1, PROFILE_HOME_AUTOMATION, DeviceId::TEMPERATURE_SENSOR, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::POWER_CONFIG)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::TEMPERATURE)
+                .cluster_server(ClusterId::HUMIDITY)
         })
         .build();
 ```

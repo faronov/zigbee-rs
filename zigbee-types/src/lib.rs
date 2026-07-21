@@ -15,6 +15,7 @@ pub struct ShortAddress(pub u16);
 
 impl ShortAddress {
     pub const BROADCAST: Self = Self(0xFFFF);
+    pub const BROADCAST_RX_ON_WHEN_IDLE: Self = Self(0xFFFD);
     pub const UNASSIGNED: Self = Self(0xFFFE);
     pub const COORDINATOR: Self = Self(0x0000);
 }

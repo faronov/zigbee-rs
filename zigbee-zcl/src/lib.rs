@@ -73,6 +73,26 @@ impl ClusterId {
     pub const TOUCHLINK: Self = Self(0x1000);
 }
 
+/// A 16-bit application device identifier from the endpoint's profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeviceId(pub u16);
+
+impl DeviceId {
+    // Home Automation profile device IDs.
+    pub const COMBINED_INTERFACE: Self = Self(0x0007);
+    pub const RANGE_EXTENDER: Self = Self(0x0008);
+    pub const MAINS_POWER_OUTLET: Self = Self(0x0009);
+    pub const SIMPLE_SENSOR: Self = Self(0x000C);
+    pub const HOME_GATEWAY: Self = Self(0x0050);
+    pub const ON_OFF_LIGHT: Self = Self(0x0100);
+    pub const DIMMABLE_LIGHT: Self = Self(0x0101);
+    pub const OCCUPANCY_SENSOR: Self = Self(0x0107);
+    pub const COLOR_TEMPERATURE_LIGHT: Self = Self(0x010C);
+    pub const THERMOSTAT: Self = Self(0x0301);
+    pub const TEMPERATURE_SENSOR: Self = Self(0x0302);
+    pub const IAS_ZONE: Self = Self(0x0402);
+}
+
 /// A 16-bit ZCL attribute identifier, scoped to a cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AttributeId(pub u16);

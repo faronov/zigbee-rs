@@ -24,11 +24,11 @@ use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::security_store::SecurityStateStore;
 use zigbee_runtime::synthetic_sensor::{SyntheticSensor, apply_synthetic_reading};
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
-use zigbee_zcl::clusters::basic::BasicCluster;
+use zigbee_zcl::clusters::basic::PowerSource;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
-use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
+use zigbee_zcl::{ClusterId, DeviceId};
 
 const FAST_POLL_MS: u64 = 250;
 const SLOW_POLL_MS: u64 = 10_000;
@@ -81,26 +81,29 @@ async fn main(_spawner: Spawner) {
         })
         .manufacturer("Zigbee-RS")
         .model("PHY62x2-Sensor")
+        .date_code("20260718")
         .sw_build("0.2.0")
+        .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |endpoint| {
+        .endpoint(
+            1,
+            PROFILE_HOME_AUTOMATION,
+            DeviceId::TEMPERATURE_SENSOR,
+            |endpoint| {
             endpoint
-                .cluster_server(0x0000)
-                .cluster_server(0x0001)
-                .cluster_server(0x0003)
-                .cluster_server(0x0402)
-                .cluster_server(0x0405)
-        })
+                    .cluster_server(ClusterId::BASIC)
+                    .cluster_server(ClusterId::POWER_CONFIG)
+                    .cluster_server(ClusterId::IDENTIFY)
+                    .cluster_server(ClusterId::TEMPERATURE)
+                    .cluster_server(ClusterId::HUMIDITY)
+            },
+        )
         .build();
 
-    let mut basic_cluster =
-        BasicCluster::new(b"Zigbee-RS", b"PHY62x2-Sensor", b"20260718", b"0.2.0");
-    basic_cluster.set_power_source(0x03);
     let mut power_cluster = PowerConfigCluster::new();
     power_cluster.set_battery_size(4);
     power_cluster.set_battery_quantity(2);
     power_cluster.set_battery_rated_voltage(15);
-    let mut identify_cluster = IdentifyCluster::new();
     let mut temp_cluster = TemperatureCluster::new(-4_000, 12_500);
     let mut hum_cluster = HumidityCluster::new(0, 10_000);
 
@@ -140,9 +143,7 @@ async fn main(_spawner: Spawner) {
         led_on();
         update_sensor_values(
             sensor_sample,
-            &mut basic_cluster,
             &mut power_cluster,
-            &mut identify_cluster,
             &mut temp_cluster,
             &mut hum_cluster,
         );
@@ -153,7 +154,7 @@ async fn main(_spawner: Spawner) {
         let mut button_was_pressed = false;
 
         loop {
-            let identifying = identify_cluster.is_identifying();
+            let identifying = device.is_identifying(1);
             let poll_ms = if identifying || Instant::now() < fast_poll_until {
                 FAST_POLL_MS
             } else {
@@ -206,9 +207,7 @@ async fn main(_spawner: Spawner) {
                 };
                 let event = {
                     let mut clusters = cluster_refs(
-                        &mut basic_cluster,
                         &mut power_cluster,
-                        &mut identify_cluster,
                         &mut temp_cluster,
                         &mut hum_cluster,
                     );
@@ -259,9 +258,7 @@ async fn main(_spawner: Spawner) {
                 sensor_sample = sensor_sample.wrapping_add(1);
                 update_sensor_values(
                     sensor_sample,
-                    &mut basic_cluster,
                     &mut power_cluster,
-                    &mut identify_cluster,
                     &mut temp_cluster,
                     &mut hum_cluster,
                 );
@@ -276,9 +273,7 @@ async fn main(_spawner: Spawner) {
                 tick_anchor += Duration::from_secs(elapsed_secs);
                 let tick_result = {
                     let mut clusters = cluster_refs(
-                        &mut basic_cluster,
                         &mut power_cluster,
-                        &mut identify_cluster,
                         &mut temp_cluster,
                         &mut hum_cluster,
                     );
@@ -304,7 +299,7 @@ async fn main(_spawner: Spawner) {
                 }
             }
 
-            if identify_cluster.is_identifying() {
+            if device.is_identifying(1) {
                 phy6222_hal::gpio::write(
                     pins::LED_GREEN,
                     !phy6222_hal::gpio::read(pins::LED_GREEN),
@@ -317,24 +312,14 @@ async fn main(_spawner: Spawner) {
 }
 
 fn cluster_refs<'a>(
-    basic: &'a mut BasicCluster,
     power: &'a mut PowerConfigCluster,
-    identify: &'a mut IdentifyCluster,
     temperature: &'a mut TemperatureCluster,
     humidity: &'a mut HumidityCluster,
-) -> [ClusterRef<'a>; 5] {
+) -> [ClusterRef<'a>; 3] {
     [
         ClusterRef {
             endpoint: 1,
-            cluster: basic,
-        },
-        ClusterRef {
-            endpoint: 1,
             cluster: power,
-        },
-        ClusterRef {
-            endpoint: 1,
-            cluster: identify,
         },
         ClusterRef {
             endpoint: 1,
@@ -349,13 +334,11 @@ fn cluster_refs<'a>(
 
 fn update_sensor_values(
     sample: u32,
-    basic: &mut BasicCluster,
     power: &mut PowerConfigCluster,
-    identify: &mut IdentifyCluster,
     temperature: &mut TemperatureCluster,
     humidity: &mut HumidityCluster,
 ) {
-    let mut clusters = cluster_refs(basic, power, identify, temperature, humidity);
+    let mut clusters = cluster_refs(power, temperature, humidity);
     if apply_synthetic_reading(&mut clusters, 1, TEST_SENSOR.sample(sample)).is_err() {
         failure();
     }
@@ -372,24 +355,24 @@ fn setup_default_reporting(device: &mut ZigbeeDevice<Phy6222Mac>) {
 
     let configs = [
         (
-            0x0402,
-            0x0000,
+            ClusterId::TEMPERATURE,
+            zigbee_zcl::clusters::temperature::ATTR_MEASURED_VALUE,
             ZclDataType::I16,
             Some(ZclValue::I16(50)),
             60,
             300,
         ),
         (
-            0x0405,
-            0x0000,
+            ClusterId::HUMIDITY,
+            zigbee_zcl::clusters::humidity::ATTR_MEASURED_VALUE,
             ZclDataType::U16,
             Some(ZclValue::U16(100)),
             60,
             300,
         ),
         (
-            0x0001,
-            0x0021,
+            ClusterId::POWER_CONFIG,
+            zigbee_zcl::clusters::power_config::ATTR_BATTERY_PERCENTAGE_REMAINING,
             ZclDataType::U8,
             Some(ZclValue::U8(4)),
             300,
@@ -402,10 +385,10 @@ fn setup_default_reporting(device: &mut ZigbeeDevice<Phy6222Mac>) {
             .reporting_mut()
             .configure_for_cluster(
                 1,
-                cluster_id,
+                cluster_id.0,
                 ReportingConfig {
                     direction: ReportDirection::Send,
-                    attribute_id: zigbee_zcl::AttributeId(attribute_id),
+                    attribute_id,
                     data_type,
                     min_interval: min,
                     max_interval: max,

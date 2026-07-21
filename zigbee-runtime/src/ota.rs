@@ -567,7 +567,7 @@ impl<F: FirmwareWriter> OtaManager<F> {
             self.pending_frame = Some(PendingOtaFrame {
                 zcl_data: data,
                 endpoint: self.config.endpoint,
-                cluster_id: 0x0019,
+                cluster_id: zigbee_zcl::ClusterId::OTA_UPGRADE.0,
             });
         }
     }

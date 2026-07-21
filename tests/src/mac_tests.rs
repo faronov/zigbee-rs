@@ -132,7 +132,7 @@ async fn test_mock_data_tx() {
 #[tokio::test]
 async fn test_mock_reset() {
     let mut mac = make_mock();
-    let result = mac.mlme_reset(true).await;
+    let result = mac.mlme_reset(true);
     assert!(result.is_ok());
 }
 

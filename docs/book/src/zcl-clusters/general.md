@@ -24,16 +24,19 @@ General clusters provide core functionality required by most Zigbee devices. Thi
 **Commands:** `ResetToFactoryDefaults` (0x00)
 
 ```rust
-use zigbee_zcl::clusters::basic::BasicCluster;
+use zigbee_zcl::clusters::basic::{BasicCluster, PowerSource};
 
 let basic = BasicCluster::new(
-    b"zigbee-rs",     // manufacturer
-    b"MyDevice",      // model
-    b"20250101",      // date code
-    b"1.0.0",         // sw build
+    "zigbee-rs",     // manufacturer
+    "MyDevice",      // model
+    "20250101",      // date code
+    "1.0.0",         // sw build
+    PowerSource::Battery,
 );
-// basic.set_power_source(0x03); // Battery
 ```
+
+Device applications normally configure this runtime-owned cluster through
+`DeviceBuilder` rather than constructing a second instance.
 
 ---
 
@@ -77,19 +80,19 @@ Allows a coordinator to make a device identify itself (e.g. blink an LED).
 **Commands:** `Identify` (0x00), `IdentifyQuery` (0x01), `TriggerEffect` (0x40)
 
 ```rust
-use zigbee_zcl::clusters::identify::IdentifyCluster;
-
-let mut identify = IdentifyCluster::new();
-// In your timer callback:
-identify.tick(1); // decrement by 1 second
-if identify.is_identifying() {
+let endpoint = 1;
+if device.is_identifying(endpoint) {
     toggle_led();
 }
 // Check for trigger effects:
-if let Some((effect_id, variant)) = identify.take_pending_effect() {
+if let Some((effect_id, variant)) = device.take_identify_effect(endpoint) {
     play_effect(effect_id, variant);
 }
 ```
+
+`ZigbeeDevice` owns and ticks the standard Identify cluster. Applications can
+query it with `device.is_identifying(endpoint)` and consume trigger effects
+with `device.take_identify_effect(endpoint)`.
 
 ---
 

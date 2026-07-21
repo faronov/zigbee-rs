@@ -1,128 +1,49 @@
-# BL702 Zigbee Temperature Sensor
+# BL702 Zigbee Scaffold
 
-A `no_std` Zigbee 3.0 end device firmware for the **Bouffalo Lab BL702** (RISC-V),
-reporting temperature and humidity via ZCL clusters 0x0402 and 0x0405.
+This crate is a compile-only experiment around Bouffalo's binary BL702 radio
+libraries. It is not a pure-Rust radio backend and is not hardware-proven.
 
-## Hardware
+## SDK Audit Result
 
-- **MCU:** BL702 — RISC-V 32-bit, 128KB SRAM, 512KB Flash
-- **Radio:** Built-in IEEE 802.15.4 + BLE 5.0
-- **Boards:** XT-ZB1, DT-BL10, Pine64 Pinenut, BL706 devboard
-- **Button:** GPIO8 (boot button on most modules) — join/leave network
-- **Debug:** UART0 serial logging
+- `liblmac154.a` contains the IEEE 802.15.4 MAC/PHY implementation.
+- `libbl702_rf.a` contains RF initialization and calibration.
+- The vendor Zigbee stack is also binary-only, although zigbee-rs does not
+  need it.
+- The archives retain symbols and DWARF. Static analysis recovered the M154
+  register paths plus the RF reset, live-calibration, channel, RX, CCA, and
+  TX-power algorithms needed for an independent implementation.
+- Startup, CLIC dispatch, boot headers, and image packaging are not yet proven
+  by this crate.
 
-## Prerequisites
+A pure-Rust port is technically feasible, but it is not implemented or
+hardware-proven yet. Cold boot must run live ACAL, KCAL, ROSCAL, and RCCAL;
+a generic precomputed calibration snapshot is not a safe replacement.
 
-- Rust nightly with `riscv32imac-unknown-none-elf` target
-- `cargo install cargo-binutils` (for `cargo objcopy`)
+The vendor Zigbee linker exposes 112 KiB at `0x42014000..0x42030000`, but
+reserves `0x42028000..0x420283ff`. This scaffold places data/heap in the lower
+80 KiB and the stack in the upper 31 KiB instead of treating the window as one
+flat allocation.
 
-```bash
-rustup target add riscv32imac-unknown-none-elf
-```
-
-## Vendor Library Setup
-
-The BL702 802.15.4 radio driver uses FFI bindings to two precompiled C libraries
-from the **Bouffalo IoT SDK** (`bl_iot_sdk`):
-
-| Library          | Purpose                      |
-|------------------|------------------------------|
-| `liblmac154.a`   | IEEE 802.15.4 MAC layer      |
-| `libbl702_rf.a`  | RF PHY / calibration         |
-
-There are **three ways** to provide these libraries (checked in priority order by `build.rs`):
-
-### Option 1: Full SDK path (`BL_IOT_SDK_DIR`)
-
-Clone the Bouffalo IoT SDK and point to it:
-
-```bash
-git clone https://github.com/bouffalolab/bl_iot_sdk.git
-export BL_IOT_SDK_DIR=/path/to/bl_iot_sdk
-```
-
-The build script auto-derives library paths:
-- `$BL_IOT_SDK_DIR/components/network/lmac154/lib/`
-- `$BL_IOT_SDK_DIR/components/platform/soc/bl702/bl702_rf/lib/`
-
-### Option 2: Explicit library paths
-
-Point directly to each library directory:
-
-```bash
-export LMAC154_LIB_DIR=/path/to/dir/containing/liblmac154.a
-export BL702_RF_LIB_DIR=/path/to/dir/containing/libbl702_rf.a
-```
-
-### Option 3: Local `vendor_libs/` directory
-
-Copy ABI-patched `.a` files into the project:
-
-```bash
-mkdir vendor_libs/
-cp /path/to/liblmac154.a vendor_libs/
-cp /path/to/libbl702_rf.a vendor_libs/
-```
-
-### ⚠️ Float ABI Mismatch
-
-The vendor `.a` files are compiled with **rv32imfc/ilp32f** (hard-float ABI).
-Rust targets **riscv32imac/ilp32** (soft-float). You must strip the ELF float-ABI
-flag before linking:
-
-```bash
-python3 scripts/strip_float_abi.py liblmac154.a vendor_libs/liblmac154.a
-python3 scripts/strip_float_abi.py libbl702_rf.a vendor_libs/libbl702_rf.a
-```
-
-## Building
-
-### Stubs build (CI — no vendor libs required)
+## Compile-Only Check
 
 ```bash
 cd examples/bl702-sensor
 cargo build --release --features stubs
 ```
 
-The `stubs` feature provides no-op implementations of all FFI symbols, allowing
-the project to compile without any vendor libraries.
+The `stubs` feature supplies no-op radio symbols. The resulting ELF checks Rust
+integration only and must not be flashed.
 
-### Real build (with vendor libraries)
+## Vendor ABI Experiment
 
-```bash
-cd examples/bl702-sensor
-LMAC154_LIB_DIR=/path/to/lib cargo build --release
-```
-
-## Flashing
-
-Use the Bouffalo `bflb-iot-tool` or BLDevCube:
+The vendor archives use `rv32imfc/ilp32f`. Any future hybrid build must use:
 
 ```bash
-bflb-iot-tool --chipname bl702 --firmware target/riscv32imac-unknown-none-elf/release/bl702-sensor
+BL_IOT_SDK_DIR=/path/to/bl_iot_sdk \
+  cargo build --release --target riscv32imafc-unknown-none-elf
 ```
 
-## What It Demonstrates
-
-- Zigbee 3.0 end device on BL702 with Embassy async runtime
-- Custom Embassy time driver using BL702 TIMER_CH0 (1 MHz tick)
-- IEEE 802.15.4 radio via `lmac154` FFI bindings
-- UART-based logging
-- Button-driven network join/leave with edge detection
-- ZCL Temperature Measurement + Relative Humidity clusters
-
-## Project Structure
-
-```
-bl702-sensor/
-├── .cargo/config.toml   # Target: riscv32imac-unknown-none-elf, build-std
-├── .gitignore            # Excludes lib/ and vendor_libs/
-├── Cargo.toml            # Dependencies, stubs feature flag
-├── build.rs              # Vendor lib linking (3 fallback methods)
-├── memory.x              # Flash @ 0x23000000, RAM @ 0x42014000
-├── vendor_libs/          # (gitignored) ABI-patched .a files
-└── src/
-    ├── main.rs           # Entry point, device setup, sensor loop
-    ├── hal.rs            # HAL impls (delay, IRQ, GPIO, memcpy)
-    └── stubs.rs          # No-op FFI stubs for CI builds
-```
+Stripping the ELF float-ABI flag is invalid because it changes metadata, not
+the calling convention. The current runtime/startup, interrupt dispatch,
+missing vendor dependencies, and boot image format still need dedicated
+bring-up before this path can produce firmware.

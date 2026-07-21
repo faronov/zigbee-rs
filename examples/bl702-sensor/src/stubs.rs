@@ -2,8 +2,8 @@
 //!
 //! When the `stubs` feature is enabled these `#[unsafe(no_mangle)]` symbols satisfy
 //! the linker without requiring the real `liblmac154.a` static library,
-//! allowing `cargo build --release --features stubs` to produce a valid ELF
-//! for CI checks and static analysis.
+//! allowing `cargo build --release --features stubs` to check the Rust code.
+//! The resulting ELF has no radio implementation and must never be flashed.
 
 #![allow(non_snake_case)]
 

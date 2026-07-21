@@ -31,11 +31,11 @@ use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
-use zigbee_zcl::clusters::basic::BasicCluster;
+use zigbee_zcl::clusters::basic::PowerSource;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
-use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
+use zigbee_zcl::{ClusterId, DeviceId};
 
 const REPORT_INTERVAL_SECS: u64 = 30;
 
@@ -135,18 +135,10 @@ async fn main(_spawner: Spawner) {
 
     info!("Radio ready");
 
-    // ZCL cluster instances
-    let mut basic_cluster = BasicCluster::new(
-        b"Zigbee-RS",
-        b"nRF52833-Sensor",
-        b"20260331",
-        b"0.1.0",
-    );
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
 
     let mut power_cluster = PowerConfigCluster::new();
-    let mut identify_cluster = IdentifyCluster::new();
     power_cluster.set_battery_size(4);     // AAA
     power_cluster.set_battery_quantity(2); // 2× AAA
     power_cluster.set_battery_rated_voltage(15); // 1.5V per cell
@@ -163,14 +155,16 @@ async fn main(_spawner: Spawner) {
         })
         .manufacturer("Zigbee-RS")
         .model("nRF52833-Sensor")
+        .date_code("20260331")
         .sw_build("0.1.0")
+        .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
-            ep.cluster_server(0x0000) // Basic
-                .cluster_server(0x0003) // Identify
-                .cluster_server(0x0001) // Power Configuration
-                .cluster_server(0x0402) // Temperature Measurement
-                .cluster_server(0x0405) // Relative Humidity
+        .endpoint(1, PROFILE_HOME_AUTOMATION, DeviceId::TEMPERATURE_SENSOR, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::POWER_CONFIG)
+                .cluster_server(ClusterId::TEMPERATURE)
+                .cluster_server(ClusterId::HUMIDITY)
         })
         .build();
 
@@ -187,11 +181,9 @@ async fn main(_spawner: Spawner) {
             // ── Incoming MAC frame ──────────────────────────────
             Either3::First(Ok(indication)) => {
                 let mut clusters = [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                 ];
                 if let Some(event) = device.process_incoming(&indication, &mut clusters).await {
                     if matches!(&event, StackEvent::RejoinRequested) {
@@ -217,11 +209,9 @@ async fn main(_spawner: Spawner) {
                 }
                 device.user_action(UserAction::Toggle);
                 let mut clusters = [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                 ];
                 if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
                     log_event(e);
@@ -268,11 +258,9 @@ async fn main(_spawner: Spawner) {
                 }
                 if let TickResult::Event(ref e) =
                     device.tick(REPORT_INTERVAL_SECS as u16, &mut [
-                        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                     ]).await
                 {
                     log_event(e);

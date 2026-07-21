@@ -17,7 +17,6 @@ use zigbee_mac::primitives::*;
 use zigbee_runtime::templates;
 use zigbee_types::*;
 use zigbee_zcl::clusters::Cluster;
-use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 use zigbee_zcl::data_types::ZclValue;
@@ -99,6 +98,7 @@ fn main() {
     let device = templates::temperature_humidity_sensor(mac)
         .manufacturer("zigbee-rs")
         .model("MockTempHumid-01")
+        .date_code("20250101")
         .sw_build("0.1.0")
         .channels(ChannelMask::PREFERRED)
         .build();
@@ -155,7 +155,7 @@ fn main() {
 
     pollster::block_on(async {
         // 3a) Reset MAC
-        mac2.mlme_reset(true).await.expect("MAC reset failed");
+        mac2.mlme_reset(true).expect("MAC reset failed");
         println!("  [3a] MLME-RESET.request(setDefaultPIB=true) → OK");
 
         // 3b) Active scan on preferred channels
@@ -218,9 +218,6 @@ fn main() {
     // ── Step 4: Create and configure ZCL clusters ───────────────────
     println!("── Step 4: ZCL Cluster Configuration ──");
 
-    // Basic cluster
-    let mut basic = BasicCluster::new(b"zigbee-rs", b"MockTempHumid-01", b"20250101", b"0.1.0");
-    basic.set_power_source(0x03); // Battery
     println!("  Basic cluster: manufacturer='zigbee-rs', model='MockTempHumid-01'");
     println!("  Power source: Battery (0x03)");
 

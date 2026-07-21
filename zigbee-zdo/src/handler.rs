@@ -162,7 +162,7 @@ impl<M: MacDriver> ZdoLayer<M> {
                 (crate::MGMT_BIND_RSP, 1 + n)
             }
             crate::MGMT_LEAVE_REQ => {
-                let n = self.handle_mgmt_leave_req(payload, &mut rsp_buf[1..])?;
+                let n = self.handle_mgmt_leave_req(src_short, payload, &mut rsp_buf[1..])?;
                 (crate::MGMT_LEAVE_RSP, 1 + n)
             }
             crate::MGMT_PERMIT_JOINING_REQ => {
@@ -550,8 +550,13 @@ impl<M: MacDriver> ZdoLayer<M> {
         rsp_data.serialize(rsp)
     }
 
-    fn handle_mgmt_leave_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
-        let _req = MgmtLeaveReq::parse(payload)?;
+    fn handle_mgmt_leave_req(
+        &self,
+        src: ShortAddress,
+        payload: &[u8],
+        rsp: &mut [u8],
+    ) -> Result<usize, ZdoError> {
+        let req = MgmtLeaveReq::parse(payload)?;
         // Note: actual leave is triggered by setting a flag that the runtime polls.
         // We can't call async nlme_leave from a sync context, and the leave needs
         // to happen AFTER we've sent the response. Set a flag and return success.
@@ -559,7 +564,23 @@ impl<M: MacDriver> ZdoLayer<M> {
         if rsp.is_empty() {
             return Err(ZdoError::BufferTooSmall);
         }
-        rsp[0] = ZdpStatus::Success as u8;
+        if self.nwk().device_type() == zigbee_nwk::DeviceType::EndDevice
+            && src != self.nwk().nib().parent_address
+            && src != ShortAddress::COORDINATOR
+        {
+            log::warn!(
+                "[ZDO] Ignoring Mgmt_Leave_req from unauthorized source 0x{:04X}",
+                src.0
+            );
+            return Err(ZdoError::InvalidData);
+        }
+        let local_ieee = self.nwk().nib().ieee_address;
+        let targets_local_device = req.device_address == [0; 8] || req.device_address == local_ieee;
+        rsp[0] = if targets_local_device && !req.remove_children {
+            ZdpStatus::Success
+        } else {
+            ZdpStatus::NotSupported
+        } as u8;
         Ok(1)
     }
 

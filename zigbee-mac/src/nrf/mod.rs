@@ -503,7 +503,7 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
         Ok(())
     }
 
-    async fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
+    fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
         if set_default_pib {
             let random = self.next_random_u32();
             self.short_address = ShortAddress(0xFFFF);

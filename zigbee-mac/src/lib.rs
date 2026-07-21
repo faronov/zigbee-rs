@@ -157,7 +157,7 @@ pub trait MacDriver: PlatformServices {
     /// MLME-RESET.request — reset MAC to default state.
     ///
     /// If `set_default_pib` is true, all PIB attributes are reset to defaults.
-    async fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError>;
+    fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError>;
 
     /// MLME-START.request — start a PAN (coordinator) or begin transmitting
     /// beacons (router). End devices do not use this.

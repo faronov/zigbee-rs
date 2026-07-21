@@ -3,12 +3,9 @@
 //! Provides async TX/RX on top of the BL702's IEEE 802.15.4 radio peripheral
 //! using Embassy signals for interrupt-driven completion notification.
 //!
-//! The BL702 (Bouffalo Lab, RISC-V) has a built-in multi-protocol radio
-//! supporting BLE 5.0 and IEEE 802.15.4. The 802.15.4 radio registers are
-//! not publicly documented — Bouffalo provides radio access through the
-//! `lmac154` C library (`liblmac154.a`). This driver creates Rust FFI
-//! bindings to that library and implements the callback functions to bridge
-//! into Embassy async signals.
+//! The complete 802.15.4 PHY/MAC initialization and RF calibration sequences
+//! are not available as source in the SDK. Bouffalo provides them through
+//! `liblmac154.a` and `libbl702_rf.a`. This driver only wraps that binary ABI.
 //!
 //! # Radio peripheral overview
 //! - 2.4 GHz IEEE 802.15.4 compliant
@@ -32,11 +29,14 @@
 //! ```
 //!
 //! # Build requirements
-//! The downstream firmware crate must link `liblmac154.a` from Bouffalo's SDK.
+//! The downstream firmware crate must link both vendor archives with the
+//! `riscv32imafc-unknown-none-elf` (`ilp32f`) target. Removing the archives'
+//! float-ABI ELF flag is not an ABI conversion.
 //! Add to your `build.rs`:
 //! ```rust,ignore
 //! println!("cargo:rustc-link-search=path/to/bl_iot_sdk/components/network/lmac154/lib");
 //! println!("cargo:rustc-link-lib=static=lmac154");
+//! println!("cargo:rustc-link-lib=static=bl702_rf");
 //! ```
 //!
 //! The M154 interrupt must be registered in the firmware startup:

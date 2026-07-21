@@ -1,160 +1,214 @@
-//! Embassy time driver for EFR32MG1P using ARM SysTick.
+//! Embassy time driver for EFR32MG1P backed by the RTCC/LFRCO EM2-capable
+//! wake timer in `efr32mg1_hal::pm` (see that module's own doc header for
+//! why RTCC-from-LFRCO is the Silicon-Labs-sanctioned Series-1 EM2 wake
+//! source, and why LFRCO rather than LFXO).
 //!
-//! Provides a real monotonic timer and alarm for Embassy async runtime.
-//! Uses the SysTick exception (always available on Cortex-M4F) so no
-//! EFR32-specific timer peripherals are needed.
+//! # Replaces the SysTick driver
 //!
-//! # Clock assumption
-//! HCLK = 38.4 MHz after `efr32mg1_tradfri::init_clocks()`.
+//! Every profile that previously ran on the ARM SysTick exception (assumed
+//! HCLK-derived 1 MHz Embassy ticks, no deep sleep) now runs on this RTCC
+//! driver instead. SysTick cannot survive EM2 (the Cortex-M4 core clock and
+//! its SysTick timer both stop in EM2), so an EM2-aware Embassy runtime
+//! needs a wake source that keeps ticking there — RTCC clocked from LFRCO
+//! over the CMU "LFE" branch does.
+//!
+//! # Tick rate: exactly 32768 Hz, matching RTCC 1:1
+//!
+//! `Cargo.toml` enables `embassy-time-driver`'s `tick-hz-32_768` feature, so
+//! `embassy_time_driver::TICK_HZ == 32_768 == pm::LFRCO_HZ`. Because RTCC's
+//! `CNTPRESC` is left at its reset default (`DIV1`) by `pm::init()`, the
+//! RTCC counter itself increments at exactly the LFRCO rate, i.e. one RTCC
+//! tick == one Embassy tick. This is a deliberate simplification: no
+//! fractional tick-rate conversion (the previous SysTick driver needed one,
+//! since HCLK and 1 MHz Embassy ticks did not divide evenly) is needed
+//! anywhere in this module.
+//!
+//! `embassy-time-driver` is `links = "embassy-time"`, so Cargo unifies a
+//! single copy of it for the whole dependency graph; `zigbee-mac`'s
+//! `efr32` feature depends on `embassy-time` 0.4 (this crate depends on
+//! 0.5), but both resolve to the *same* `embassy-time-driver` 0.2.x
+//! instance, so `zigbee_mac::efr32`'s own `embassy_time::Timer`/`Instant`
+//! calls run on this exact same 32768 Hz driver too — not a second,
+//! inconsistent one. Its `Timer::after_micros(128)` call
+//! (`zigbee-mac/src/efr32/driver.rs`) now quantizes to whole ~30.5 µs RTCC
+//! ticks instead of whole microseconds; this is an inherent, expected
+//! consequence of a single shared 32768 Hz timebase (required by this
+//! gate) and is not a change to radio *policy* — no timeout duration,
+//! retry count, or decision changed, only the underlying tick granularity
+//! used to wait it out.
+//!
+//! # 64-bit monotonic across the 32-bit RTCC wraparound
+//!
+//! RTCC's hardware counter is 32 bits and wraps every
+//! `2^32 / 32768 ≈ 131_072` s (~36.4 hours). `now()` extends this to a
+//! genuinely monotonic 64-bit Embassy tick count using
+//! `efr32mg1_hal::pm::now64()` — see that function's doc comment for the
+//! race-safety argument. This module is only responsible for feeding it
+//! the overflow interrupt (`enable_overflow_interrupt` in `init`) and
+//! calling `bump_wrap_count()` from `RTCC` when the overflow flag was
+//! observed pending.
+//!
+//! # One compare, many software timers
+//!
+//! RTCC only has to arm a *single* hardware compare (`CC0`, via
+//! `pm::arm_wake`/`pm::disarm_wake`) at a time. Multiple concurrent
+//! `embassy_time::Timer`s are supported by holding them in
+//! `embassy_time_queue_utils::Queue` (the "integrated" variant: timer
+//! state lives in each task's own header, no heap/global `Vec` needed) and
+//! always arming hardware for only the *soonest* pending deadline. This
+//! follows the exact pattern documented in `embassy_time_driver`'s own
+//! `Driver` trait docs.
+//!
+//! # Long deadlines
+//!
+//! A single RTCC compare can only unambiguously represent a deadline up to
+//! `pm::MAX_ARM_TICKS` (half the 32-bit range) away from `now` — see
+//! `pm::ticks_from_now_clamped`. A `Timer::after` requesting something
+//! further out (this module supports the full 64-bit Embassy range, not
+//! just one RTCC wrap) is armed as a capped intermediate "hop": when that
+//! hop's compare fires, `RTCC` re-evaluates the queue and re-arms again,
+//! repeating until the real deadline is within range. This requires no
+//! extra bookkeeping beyond what `rearm` already does after *every* fire.
+//!
+//! # This module owns the `RTCC` interrupt
+//!
+//! For every profile that compiles this module (`sensor`, `diag-join`,
+//! `diag-beacon`, `diag-sht`, `diag-nv`, `diag-rtcc-time`), the `RTCC`
+//! handler below is the *only* one linked in, and it is responsible for
+//! both the CC0 wake and the overflow epoch. `diag-em2` does not compile
+//! this module at all (see `main.rs`'s `mod time_driver` gate) and keeps
+//! its own minimal `RTCC` handler there, calling only
+//! `efr32mg1_hal::pm::handle_interrupt()` — unchanged, so its
+//! hardware-proven behavior (10 × 1 s EM2 cycles, exactly 32768 ticks
+//! elapsed, all canaries intact) cannot regress.
+//!
+//! # SLEEPDEEP boundary
+//!
+//! This driver's own `Timer`-driven path (`schedule_wake`/`rearm`) never
+//! touches `SCB.SCR.SLEEPDEEP` — arming/disarming CC0 and waking a task is
+//! all it does, so the Embassy executor's normal idle behavior (EM1, via
+//! `cortex_m::asm::wfe`) is unaffected; that is future SED work, not this
+//! gate. The *only* thing in this dependency graph that ever sets
+//! `SLEEPDEEP` is `efr32mg1_hal::pm::enter_em2_once()` (used internally by
+//! `pm::sleep_for_ticks`/`pm::sleep_for_ticks_polled`), which applies the
+//! DCDC LN-handshake safety gate immediately before every `WFI` and clears
+//! `SLEEPDEEP` again immediately after, unconditionally, regardless of
+//! what woke the core — so it can never be left armed by accident. See
+//! `diag-rtcc-time`'s explicit EM2 phase for a diagnostic that calls this
+//! directly and then asserts `pm::sleepdeep_is_set() == false` on return.
 
 use core::cell::RefCell;
+use core::task::Waker;
+
 use cortex_m::interrupt::Mutex;
-use cortex_m_rt::exception;
+use efr32mg1_hal::pm;
+use embassy_time_queue_utils::Queue;
 
-use core::sync::atomic::{AtomicU32, Ordering};
-
-// ── Configuration ───────────────────────────────────────────────
-
-/// EFR32MG1P board HFXO and HCLK frequency.
-const HCLK_HZ: u32 = efr32mg1_tradfri::HCLK_HZ;
-
-/// SysTick fires every 1 ms.
-const SYSTICK_RELOAD: u32 = HCLK_HZ / 1000 - 1; // 38_399
-
-/// Embassy ticks per SysTick overflow.
-/// Embassy TICK_HZ = 1_000_000, SysTick overflow = 1 ms = 1000 ticks.
-const TICKS_PER_MS: u64 = 1_000;
-
-// ── SysTick register addresses (ARM standard) ──────────────────
-
-const SYST_CSR: *mut u32 = 0xE000_E010 as *mut u32;
-const SYST_RVR: *mut u32 = 0xE000_E014 as *mut u32;
-const SYST_CVR: *mut u32 = 0xE000_E018 as *mut u32;
-const SCB_ICSR: *const u32 = 0xE000_ED04 as *const u32;
-
-const CSR_ENABLE: u32 = 1 << 0;
-const CSR_TICKINT: u32 = 1 << 1;
-const CSR_CLKSOURCE: u32 = 1 << 2;
-const ICSR_PENDSTSET: u32 = 1 << 26;
-
-// ── State ───────────────────────────────────────────────────────
-
-static MS_COUNT: AtomicU32 = AtomicU32::new(0);
-static MS_EPOCH: AtomicU32 = AtomicU32::new(0);
-
-struct AlarmState {
-    target: u64,
-    waker: Option<core::task::Waker>,
+struct Efr32RtccTimeDriver {
+    queue: Mutex<RefCell<Queue>>,
 }
 
-static ALARM: Mutex<RefCell<AlarmState>> = Mutex::new(RefCell::new(AlarmState {
-    target: u64::MAX,
-    waker: None,
-}));
-
-// ── Driver ──────────────────────────────────────────────────────
-
-pub struct Efr32TimeDriver;
-
-impl Efr32TimeDriver {
-    pub const fn new() -> Self {
-        Self
-    }
-
-    pub fn init(&self) {
-        unsafe {
-            core::ptr::write_volatile(SYST_RVR, SYSTICK_RELOAD);
-            core::ptr::write_volatile(SYST_CVR, 0);
-            core::ptr::write_volatile(SYST_CSR, CSR_CLKSOURCE | CSR_TICKINT | CSR_ENABLE);
+impl Efr32RtccTimeDriver {
+    const fn new() -> Self {
+        Self {
+            queue: Mutex::new(RefCell::new(Queue::new())),
         }
     }
-}
 
-impl embassy_time_driver::Driver for Efr32TimeDriver {
-    fn now(&self) -> u64 {
-        cortex_m::interrupt::free(|_| {
-            let epoch = MS_EPOCH.load(Ordering::Relaxed) as u64;
-            let ms = MS_COUNT.load(Ordering::Relaxed) as u64;
-            let mut full_ms = (epoch << 32) | ms;
-
-            let remaining_before =
-                unsafe { core::ptr::read_volatile(SYST_CVR as *const u32) };
-            let systick_pending =
-                unsafe { core::ptr::read_volatile(SCB_ICSR) } & ICSR_PENDSTSET != 0;
-            let remaining_after =
-                unsafe { core::ptr::read_volatile(SYST_CVR as *const u32) };
-            if systick_pending || remaining_after > remaining_before {
-                // SysTick keeps running while interrupts are masked. Account
-                // for a reload whose handler is pending instead of combining
-                // the old millisecond counter with the new counter period.
-                full_ms += 1;
+    /// Brings up LFRCO/RTCC (`pm::init`) and additionally enables the
+    /// overflow interrupt this driver needs for its 64-bit monotonic
+    /// extension — a strict superset of what `pm::init()` alone provides,
+    /// so `diag-em2` (which only calls `pm::init()`) is unaffected.
+    fn init(&self) {
+        if pm::init().is_err() {
+            rtt_target::rprintln!("[EFR32][time_driver] RTCC_INIT_FAIL");
+            loop {
+                cortex_m::asm::nop();
             }
-
-            let remaining = remaining_after as u64;
-            let elapsed_in_period = (SYSTICK_RELOAD as u64) - remaining;
-            // 38.4 cycles/us is fractional, so scale over the complete
-            // one-millisecond period instead of truncating cycles per tick.
-            let sub_ms_ticks =
-                elapsed_in_period * TICKS_PER_MS / (SYSTICK_RELOAD as u64 + 1);
-
-            full_ms * TICKS_PER_MS + sub_ms_ticks
-        })
+        }
+        pm::enable_overflow_interrupt();
+        // Our `RTCC` handler below is a real, bounded ISR (never falls
+        // through to the infinite `DefaultHandler` loop), so it is safe to
+        // unmask now.
+        cortex_m::peripheral::NVIC::unpend(crate::vectors::Interrupt::Rtcc);
+        unsafe { cortex_m::peripheral::NVIC::unmask(crate::vectors::Interrupt::Rtcc) };
     }
 
-    fn schedule_wake(&self, at: u64, waker: &core::task::Waker) {
+    /// Arms (or disarms) hardware for `deadline` — an Embassy 64-bit tick
+    /// value, or `u64::MAX` for "nothing pending". Returns `false` if
+    /// `deadline` has already passed (or is `u64::MAX` and there is
+    /// nothing to do beyond disarming); the caller must then re-query
+    /// `Queue::next_expiration` (which will have woken the expired timer)
+    /// and retry with the new next deadline, exactly as documented by
+    /// `embassy_time_driver::time_driver_impl`'s own recommended pattern.
+    fn set_alarm(&self, deadline: u64) -> bool {
+        if deadline == u64::MAX {
+            pm::disarm_wake();
+            return true;
+        }
+        let now = pm::now64();
+        match pm::ticks_from_now_clamped(now, deadline) {
+            None => false,
+            Some(ticks_from_now) => {
+                pm::arm_wake(ticks_from_now);
+                true
+            }
+        }
+    }
+
+    /// Re-evaluates the timer queue against the current time and
+    /// (re-)arms hardware for whatever is now soonest. Called both from
+    /// `schedule_wake` (a new timer may now be the soonest) and from the
+    /// `RTCC` handler (the previously-armed deadline — real or an
+    /// intermediate long-deadline "hop" — was reached).
+    #[inline(never)]
+    fn rearm(&self) {
         cortex_m::interrupt::free(|cs| {
-            let mut alarm = ALARM.borrow(cs).borrow_mut();
-            alarm.target = at;
-            alarm.waker = Some(waker.clone());
-        });
-
-        if self.now() >= at {
-            cortex_m::interrupt::free(|cs| {
-                let mut alarm = ALARM.borrow(cs).borrow_mut();
-                if alarm.target == at {
-                    alarm.target = u64::MAX;
-                    if let Some(waker) = alarm.waker.take() {
-                        waker.wake();
-                    }
-                }
-            });
-        }
-    }
-}
-
-// ── SysTick exception handler ───────────────────────────────────
-
-#[exception]
-fn SysTick() {
-    let prev = MS_COUNT.load(Ordering::Relaxed);
-    let next = prev.wrapping_add(1);
-    MS_COUNT.store(next, Ordering::Relaxed);
-    if next == 0 {
-        let ep = MS_EPOCH.load(Ordering::Relaxed);
-        MS_EPOCH.store(ep.wrapping_add(1), Ordering::Relaxed);
-    }
-
-    let epoch = MS_EPOCH.load(Ordering::Relaxed) as u64;
-    let ms = next as u64;
-    let now_ticks = ((epoch << 32) | ms) * TICKS_PER_MS;
-
-    cortex_m::interrupt::free(|cs| {
-        let mut alarm = ALARM.borrow(cs).borrow_mut();
-        if now_ticks >= alarm.target {
-            alarm.target = u64::MAX;
-            if let Some(waker) = alarm.waker.take() {
-                waker.wake();
+            let mut queue = self.queue.borrow(cs).borrow_mut();
+            let mut next = queue.next_expiration(pm::now64());
+            while !self.set_alarm(next) {
+                next = queue.next_expiration(pm::now64());
             }
-        }
-    });
+        });
+    }
 }
 
-// ── Registration ────────────────────────────────────────────────
+impl embassy_time_driver::Driver for Efr32RtccTimeDriver {
+    fn now(&self) -> u64 {
+        pm::now64()
+    }
+
+    fn schedule_wake(&self, at: u64, waker: &Waker) {
+        let changed = cortex_m::interrupt::free(|cs| {
+            let mut queue = self.queue.borrow(cs).borrow_mut();
+            queue.schedule_wake(at, waker)
+        });
+        if changed {
+            self.rearm();
+        }
+    }
+}
 
 embassy_time_driver::time_driver_impl!(
-    static TIME_DRIVER: Efr32TimeDriver = Efr32TimeDriver::new()
+    static TIME_DRIVER: Efr32RtccTimeDriver = Efr32RtccTimeDriver::new()
 );
 
 pub fn init() {
     TIME_DRIVER.init();
+}
+
+// ── RTCC interrupt handler ──────────────────────────────────────
+//
+// Owns the vector for every profile that compiles this module (see module
+// doc header). Reads and clears both flags it cares about in one shot
+// (`take_pending_flags`), advances the 64-bit epoch if the counter
+// wrapped, then re-arms hardware for whatever is now the soonest pending
+// software timer (if any).
+#[unsafe(no_mangle)]
+pub extern "C" fn RTCC() {
+    let flags = pm::take_pending_flags();
+    if flags.overflow {
+        pm::bump_wrap_count();
+    }
+    TIME_DRIVER.rearm();
 }

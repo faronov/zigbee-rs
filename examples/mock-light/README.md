@@ -42,7 +42,7 @@ mock-light/
 | Crate | Purpose |
 |---|---|
 | `zigbee-mac` (mock) | MockMac, scan + associate |
-| `zigbee-zcl` | OnOffCluster, LevelControlCluster, BasicCluster |
+| `zigbee-zcl` | OnOffCluster, LevelControlCluster, typed cluster/device IDs |
 | `zigbee-runtime` | DeviceBuilder, templates |
 | `zigbee-types` | IeeeAddress, PanId, ChannelMask |
 | `pollster` | Block on async MAC calls |

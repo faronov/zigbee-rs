@@ -22,17 +22,26 @@ fn main() {
         return;
     }
 
+    let target = env::var("TARGET").unwrap();
+    if target != "riscv32imafc-unknown-none-elf" {
+        panic!(
+            "Bouffalo's BL702 radio archives use the ilp32f hard-float ABI; \
+             build with --target riscv32imafc-unknown-none-elf. Do not strip \
+             the ELF float-ABI flag."
+        );
+    }
+
     // Priority order:
     // 1. BL_IOT_SDK_DIR env var (full SDK path, auto-derives lib paths)
     // 2. LMAC154_LIB_DIR + BL702_RF_LIB_DIR env vars (explicit paths)
-    // 3. vendor_libs/ directory (ABI-patched copies, for local builds)
+    // 3. vendor_libs/ directory (local copies)
     //
-    // The vendor .a files are compiled with rv32imfc/ilp32f (float ABI).
-    // Since Rust targets riscv32imac/ilp32 (soft-float), the .a files
-    // must have their ELF float-ABI flag stripped before linking.
-    // Use: python3 scripts/strip_float_abi.py <input.a> <output.a>
+    // The vendor .a files are compiled with rv32imfc/ilp32f. The Rust target
+    // must use the same ABI; changing archive metadata does not make a
+    // soft-float caller ABI-compatible with hard-float code.
 
-    let mut linked = false;
+    let mut linked_lmac = false;
+    let mut linked_rf = false;
 
     if let Ok(sdk_dir) = env::var("BL_IOT_SDK_DIR") {
         let lmac_dir = format!("{}/components/network/lmac154/lib", sdk_dir);
@@ -40,34 +49,51 @@ fn main() {
         if std::path::Path::new(&lmac_dir).exists() {
             println!("cargo:rustc-link-search=native={}", lmac_dir);
             println!("cargo:rustc-link-lib=static=lmac154");
-            linked = true;
+            linked_lmac = true;
         }
         if std::path::Path::new(&rf_dir).exists() {
             println!("cargo:rustc-link-search=native={}", rf_dir);
             println!("cargo:rustc-link-lib=static=bl702_rf");
+            linked_rf = true;
         }
     }
 
-    if !linked {
+    if !linked_lmac {
         if let Ok(lib_dir) = env::var("LMAC154_LIB_DIR") {
             println!("cargo:rustc-link-search=native={}", lib_dir);
             println!("cargo:rustc-link-lib=static=lmac154");
-            linked = true;
+            linked_lmac = true;
         }
+    }
+    if !linked_rf {
         if let Ok(rf_dir) = env::var("BL702_RF_LIB_DIR") {
             println!("cargo:rustc-link-search=native={}", rf_dir);
             println!("cargo:rustc-link-lib=static=bl702_rf");
+            linked_rf = true;
         }
     }
 
-    // Fallback: check for ABI-patched vendor libs in vendor_libs/ directory
-    if !linked {
+    // Fallback: check for vendor libs in vendor_libs/ directory.
+    if !linked_lmac || !linked_rf {
         let vendor_dir = manifest_dir.join("vendor_libs");
-        if vendor_dir.join("liblmac154.a").exists() {
+        if !linked_lmac && vendor_dir.join("liblmac154.a").exists() {
             println!("cargo:rustc-link-search=native={}", vendor_dir.display());
             println!("cargo:rustc-link-lib=static=lmac154");
-            println!("cargo:rustc-link-lib=static=bl702_rf");
+            linked_lmac = true;
         }
+        if !linked_rf && vendor_dir.join("libbl702_rf.a").exists() {
+            println!("cargo:rustc-link-search=native={}", vendor_dir.display());
+            println!("cargo:rustc-link-lib=static=bl702_rf");
+            linked_rf = true;
+        }
+    }
+
+    if !linked_lmac || !linked_rf {
+        panic!(
+            "BL702 vendor build requires both liblmac154.a and libbl702_rf.a; \
+             set BL_IOT_SDK_DIR, set both explicit library directories, or \
+             use --features stubs for the compile-only check"
+        );
     }
 
     println!("cargo:rerun-if-env-changed=LMAC154_LIB_DIR");

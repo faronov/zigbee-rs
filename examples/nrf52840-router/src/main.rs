@@ -36,9 +36,9 @@ use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
 use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
-use zigbee_zcl::clusters::basic::BasicCluster;
-use zigbee_zcl::clusters::identify::IdentifyCluster;
+use zigbee_runtime::{UserAction, ZigbeeDevice};
+use zigbee_zcl::clusters::basic::PowerSource;
+use zigbee_zcl::{ClusterId, DeviceId};
 
 // Bridge `log` crate → defmt
 struct DefmtLogger;
@@ -86,38 +86,31 @@ async fn main(_spawner: Spawner) {
     mac.set_tx_power(0);
     info!("Radio ready (TX 0 dBm)");
 
-    // ZCL clusters — router only needs Basic + Identify
-    let mut basic_cluster = BasicCluster::new(
-        b"Zigbee-RS",
-        b"nRF52840-Router",
-        b"20260405",
-        b"0.1.0",
-    );
-    basic_cluster.set_power_source(0x01); // Mains powered
-    let mut identify_cluster = IdentifyCluster::new();
-
     // Build device as ROUTER — rx_on_when_idle, no sleep
     let mut device = ZigbeeDevice::builder(mac)
         .device_type(DeviceType::Router)
         .power_mode(PowerMode::AlwaysOn)
         .manufacturer("Zigbee-RS")
         .model("nRF52840-Router")
+        .date_code("20260405")
         .sw_build("0.1.0")
+        .power_source(PowerSource::MainsSinglePhase)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0007, |ep| { // 0x0007 = Home Gateway
-            ep.cluster_server(0x0000) // Basic
-                .cluster_server(0x0003) // Identify
-        })
+        .endpoint(
+            1,
+            PROFILE_HOME_AUTOMATION,
+            DeviceId::RANGE_EXTENDER,
+            |ep| {
+                ep.cluster_server(ClusterId::BASIC)
+                    .cluster_server(ClusterId::IDENTIFY)
+            },
+        )
         .build();
 
     // Auto-join network
     info!("Joining network as router…");
     device.user_action(UserAction::Join);
-    let mut clusters = [
-        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-    ];
-    if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
+    if let TickResult::Event(ref e) = device.tick(0, &mut []).await {
         log_event(e, &mut led);
     }
 
@@ -152,11 +145,7 @@ async fn main(_spawner: Spawner) {
             } else {
                 info!("Button → {}", if device.is_joined() { "leave" } else { "join" });
                 device.user_action(UserAction::Toggle);
-                let mut cls = [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-                ];
-                if let TickResult::Event(ref e) = device.tick(0, &mut cls).await {
+                if let TickResult::Event(ref e) = device.tick(0, &mut []).await {
                     log_event(e, &mut led);
                 }
             }
@@ -170,11 +159,7 @@ async fn main(_spawner: Spawner) {
             // Continuous RX — check for incoming frames
             match device.receive().await {
                 Ok(ind) => {
-                    let mut cls = [
-                        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-                    ];
-                    if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
+                    if let Some(ev) = device.process_incoming(&ind, &mut []).await {
                         match &ev {
                             StackEvent::RejoinRequested => {
                                 info!("Secure rejoin requested");
@@ -195,11 +180,7 @@ async fn main(_spawner: Spawner) {
                     led_relay.set_high();
 
                     // Tick to send queued responses
-                    let mut cls2 = [
-                        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-                    ];
-                    let _ = device.tick(0, &mut cls2).await;
+                    let _ = device.tick(0, &mut []).await;
                 }
                 Err(_) => {} // RX error or timeout
             }
@@ -209,15 +190,10 @@ async fn main(_spawner: Spawner) {
             if now.duration_since(last_tick).as_secs() >= 1 {
                 let elapsed = now.duration_since(last_tick).as_secs().min(60) as u16;
                 last_tick = now;
-                let mut cls = [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-                ];
-                let _ = device.tick(elapsed, &mut cls).await;
+                let _ = device.tick(elapsed, &mut []).await;
 
                 // Identify LED
-                identify_cluster.tick(elapsed);
-                if identify_cluster.is_identifying() {
+                if device.is_identifying(1) {
                     led.toggle();
                 }
             }
@@ -234,11 +210,7 @@ async fn main(_spawner: Spawner) {
                 last_rejoin = Instant::now();
                 info!("Retrying join (attempt {})…", rejoin_count);
                 device.user_action(UserAction::Join);
-                let mut cls = [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
-                ];
-                let _ = device.tick(0, &mut cls).await;
+                let _ = device.tick(0, &mut []).await;
                 if device.is_joined() {
                     info!("Joined as router! addr=0x{:04X}", device.short_address());
                     led.set_low(); // LED ON

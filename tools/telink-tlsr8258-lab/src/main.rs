@@ -6688,23 +6688,10 @@ fn runtime_sensor_main() -> ! {
     mark32(DBG_MODE_BASE + 0x30, 0x52540011);
 
     static mut DEVICE_STORAGE: MaybeUninit<ZigbeeDevice<Tlsr8258Mac>> = MaybeUninit::uninit();
-    static mut BASIC_STORAGE: MaybeUninit<BasicCluster> = MaybeUninit::uninit();
     static mut TEMP_STORAGE: MaybeUninit<TemperatureCluster> = MaybeUninit::uninit();
     static mut HUM_STORAGE: MaybeUninit<HumidityCluster> = MaybeUninit::uninit();
     static mut POWER_STORAGE: MaybeUninit<PowerConfigCluster> = MaybeUninit::uninit();
-    static mut IDENTIFY_STORAGE: MaybeUninit<IdentifyCluster> = MaybeUninit::uninit();
 
-    let basic_cluster = unsafe {
-        let ptr = core::ptr::addr_of_mut!(BASIC_STORAGE).cast::<BasicCluster>();
-        ptr.write(BasicCluster::new(
-            b"Zigbee-RS",
-            b"TLSR8258-Sensor",
-            b"20260513",
-            b"0.1.0",
-        ));
-        &mut *ptr
-    };
-    basic_cluster.set_power_source(0x03);
     mark32(DBG_MODE_BASE + 0x30, 0x52540012);
 
     let temp_cluster = unsafe {
@@ -6722,12 +6709,6 @@ fn runtime_sensor_main() -> ! {
         ptr.write(PowerConfigCluster::new());
         &mut *ptr
     };
-    let identify_cluster = unsafe {
-        let ptr = core::ptr::addr_of_mut!(IDENTIFY_STORAGE).cast::<IdentifyCluster>();
-        ptr.write(IdentifyCluster::new());
-        &mut *ptr
-    };
-
     temp_cluster.set_temperature(2250);
     hum_cluster.set_humidity(5000);
     power_cluster.set_battery_voltage(30);
@@ -6747,17 +6728,24 @@ fn runtime_sensor_main() -> ! {
     mark32(DBG_MODE_BASE + 0x30, 0x52540023);
     let builder = builder.model("TLSR8258-Sensor");
     mark32(DBG_MODE_BASE + 0x30, 0x52540024);
+    let builder = builder.date_code("20260513");
     let builder = builder.sw_build("0.1.0");
     mark32(DBG_MODE_BASE + 0x30, 0x52540025);
+    let builder = builder.power_source(PowerSource::Battery);
     let builder = builder.channels(zigbee_types::ChannelMask(1 << 15));
     mark32(DBG_MODE_BASE + 0x30, 0x52540026);
-    let builder = builder.endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
-        ep.cluster_server(0x0000)
-            .cluster_server(0x0003)
-            .cluster_server(0x0001)
-            .cluster_server(0x0402)
-            .cluster_server(0x0405)
-    });
+    let builder = builder.endpoint(
+        1,
+        PROFILE_HOME_AUTOMATION,
+        DeviceId::TEMPERATURE_SENSOR,
+        |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::POWER_CONFIG)
+                .cluster_server(ClusterId::TEMPERATURE)
+                .cluster_server(ClusterId::HUMIDITY)
+        },
+    );
     mark32(DBG_MODE_BASE + 0x30, 0x52540027);
     let device = builder.build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
     mark32(DBG_MODE_BASE + 0x178, device as *const _ as u32);
@@ -6863,10 +6851,6 @@ fn runtime_sensor_main() -> ! {
     let mut clusters = [
         ClusterRef {
             endpoint: 1,
-            cluster: basic_cluster,
-        },
-        ClusterRef {
-            endpoint: 1,
             cluster: temp_cluster,
         },
         ClusterRef {
@@ -6876,10 +6860,6 @@ fn runtime_sensor_main() -> ! {
         ClusterRef {
             endpoint: 1,
             cluster: power_cluster,
-        },
-        ClusterRef {
-            endpoint: 1,
-            cluster: identify_cluster,
         },
     ];
     mark32(DBG_MODE_BASE + 0x30, 0x52540016);

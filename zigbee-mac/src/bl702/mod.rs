@@ -1,10 +1,10 @@
 //! BL702 MAC backend.
 //!
-//! Implements `MacDriver` for the Bouffalo Lab BL702 RISC-V SoC. The BL702
-//! has a built-in multi-protocol radio supporting BLE 5.0 and IEEE 802.15.4.
+//! Experimental `MacDriver` scaffold for the Bouffalo Lab BL702 RISC-V SoC.
 //!
-//! This backend uses FFI bindings to Bouffalo's `lmac154` C library for
-//! radio access, with async TX/RX through Embassy signals.
+//! This backend uses binary-only Bouffalo `lmac154` and RF libraries through
+//! FFI. It is compile-tested with no-op stubs but is not hardware-proven and
+//! is not a pure-Rust radio implementation.
 //!
 //! # Architecture
 //! ```text
@@ -22,7 +22,8 @@
 //!
 //! # Dependencies
 //! - `liblmac154.a` — Bouffalo's pre-compiled 802.15.4 MAC/PHY library (linked via FFI)
-//! - `bl702-hal` — clock and GPIO configuration
+//! - platform startup, clocks, CLIC dispatch, and image packaging supplied by
+//!   the firmware crate
 //! - Embassy async primitives (`embassy-sync`, `embassy-time`, `embassy-futures`)
 //!
 //! # Hardware
@@ -46,8 +47,8 @@ use embassy_time::{Instant, Timer};
 
 /// BL702 802.15.4 MAC driver.
 ///
-/// Built on direct `bl702-pac` register access — uses the BL702's hardware
-/// radio with interrupt-driven TX/RX via Embassy signals.
+/// Wraps Bouffalo's binary radio libraries with interrupt-driven TX/RX
+/// signals. This path is experimental and not hardware-proven.
 ///
 /// # Usage
 /// ```rust,no_run
@@ -86,8 +87,8 @@ impl Bl702Mac {
     ///
     /// The caller must have already:
     /// 1. Enabled BL702 radio peripheral clocks
-    /// 2. Configured the radio interrupt to call `driver::rx_callback`
-    ///    and `driver::tx_callback`
+    /// 2. Installed the handler returned by `lmac154_getInterruptHandler()`
+    ///    in a working CLIC trap dispatcher
     pub fn new() -> Self {
         Self {
             driver: Bl702Driver::new(RadioConfig::default()),
@@ -515,7 +516,7 @@ impl MacDriver for Bl702Mac {
         Ok(())
     }
 
-    async fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
+    fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
         if set_default_pib {
             self.short_address = ShortAddress(0xFFFF);
             self.pan_id = PanId(0xFFFF);

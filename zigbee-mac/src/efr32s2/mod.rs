@@ -507,7 +507,7 @@ impl MacDriver for Efr32s2Mac {
         Ok(())
     }
 
-    async fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
+    fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
         if set_default_pib {
             self.short_address = ShortAddress(0xFFFF);
             self.pan_id = PanId(0xFFFF);

@@ -184,7 +184,7 @@ pub struct SteeringDiagnostics {
 /// # Usage
 /// ```rust,ignore
 /// let bdb = BdbLayer::new(zdo_layer);
-/// bdb.initialize().await?;
+/// bdb.initialize()?;
 /// bdb.commission().await?;
 /// ```
 pub struct BdbLayer<M: MacDriver> {

@@ -120,47 +120,41 @@ chain `.endpoint()` calls with a closure that configures clusters:
 ```rust,ignore
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_nwk::DeviceType;
+use zigbee_zcl::clusters::basic::PowerSource;
+use zigbee_zcl::{ClusterId, DeviceId};
 
 let device = ZigbeeDevice::builder(mac)
     .device_type(DeviceType::EndDevice)
     .manufacturer("zigbee-rs-tutorial")
     .model("MyTempSensor-01")
+    .date_code("20250101")
     .sw_build("0.1.0")
+    .power_source(PowerSource::Battery)
     .channels(ChannelMask::PREFERRED)
-    .endpoint(1, 0x0104, 0x0302, |ep| {
-        ep.cluster_server(0x0000)   // Basic
-          .cluster_server(0x0402)   // Temperature Measurement
+    .endpoint(1, 0x0104, DeviceId::TEMPERATURE_SENSOR, |ep| {
+        ep.cluster_server(ClusterId::BASIC)
+          .cluster_server(ClusterId::TEMPERATURE)
     })
     .build();
 ```
 
-- **`cluster_server(0x0000)`** — the Basic cluster is mandatory on every
+- **`cluster_server(ClusterId::BASIC)`** — the Basic cluster is mandatory on every
   endpoint. It holds the manufacturer name, model, and software version.
-- **`cluster_server(0x0402)`** — the Temperature Measurement cluster. It
+- **`cluster_server(ClusterId::TEMPERATURE)`** — the Temperature Measurement cluster. It
   exposes `MeasuredValue`, `MinMeasuredValue`, and `MaxMeasuredValue` attributes.
 
 The builder registers these with the ZDO layer so that discovery requests
 (`Active_EP_req`, `Simple_Desc_req`) return the correct data to coordinators
 and gateways.
 
-## Step 4 — Create Cluster Instances
+## Step 4 — Create Application Cluster Instances
 
-The `DeviceBuilder` registers which cluster *IDs* exist on each endpoint, but
-the actual **attribute storage** lives in cluster structs that you create
-separately:
+`ZigbeeDevice` owns the standard Basic and Identify cluster instances. The
+builder metadata above directly populates Basic attributes, so identity is
+defined only once. You create only mutable application clusters separately:
 
 ```rust,ignore
-use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
-
-// Basic cluster — holds device identity
-let mut basic = BasicCluster::new(
-    b"zigbee-rs-tutorial",  // manufacturer name
-    b"MyTempSensor-01",     // model identifier
-    b"20250101",            // date code
-    b"0.1.0",               // SW build ID
-);
-basic.set_power_source(0x03); // Battery
 
 // Temperature cluster — range -40.00°C to +125.00°C
 // Values are in hundredths of a degree: -4000 = -40.00°C
@@ -206,10 +200,7 @@ call `device.tick()`:
 
 ```rust,ignore
 pollster::block_on(async {
-    let mut clusters = [
-        ClusterRef { endpoint: 1, cluster: &mut basic },
-        ClusterRef { endpoint: 1, cluster: &mut temp },
-    ];
+    let mut clusters = [ClusterRef { endpoint: 1, cluster: &mut temp }];
     let result = device.tick(10, &mut clusters).await;
     println!("Tick result: {:?}", result);
 });
@@ -246,10 +237,11 @@ use zigbee_mac::primitives::*;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
 use zigbee_types::*;
-use zigbee_zcl::clusters::basic::BasicCluster;
+use zigbee_zcl::clusters::basic::PowerSource;
 use zigbee_zcl::clusters::temperature::{TemperatureCluster, ATTR_MEASURED_VALUE};
 use zigbee_zcl::clusters::Cluster;
 use zigbee_zcl::data_types::ZclValue;
+use zigbee_zcl::{ClusterId, DeviceId};
 
 fn main() {
     // ── 1. Set up MockMac ──────────────────────────────────────────
@@ -297,23 +289,17 @@ fn main() {
         .device_type(DeviceType::EndDevice)
         .manufacturer("zigbee-rs-tutorial")
         .model("MyTempSensor-01")
+        .date_code("20250101")
         .sw_build("0.1.0")
+        .power_source(PowerSource::Battery)
         .channels(ChannelMask::PREFERRED)
-        .endpoint(1, 0x0104, 0x0302, |ep| {
-            ep.cluster_server(0x0000) // Basic
-              .cluster_server(0x0402) // Temperature Measurement
+        .endpoint(1, 0x0104, DeviceId::TEMPERATURE_SENSOR, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+              .cluster_server(ClusterId::TEMPERATURE)
         })
         .build();
 
     // ── 3. Create cluster instances ────────────────────────────────
-    let mut basic = BasicCluster::new(
-        b"zigbee-rs-tutorial",
-        b"MyTempSensor-01",
-        b"20250101",
-        b"0.1.0",
-    );
-    basic.set_power_source(0x03); // Battery
-
     let mut temp = TemperatureCluster::new(-4000, 12500);
 
     // ── 4. Join the network ────────────────────────────────────────
@@ -346,10 +332,7 @@ fn main() {
             }
 
             // ── 6. Tick the stack ──────────────────────────────────
-            let mut clusters = [
-                ClusterRef { endpoint: 1, cluster: &mut basic },
-                ClusterRef { endpoint: 1, cluster: &mut temp },
-            ];
+            let mut clusters = [ClusterRef { endpoint: 1, cluster: &mut temp }];
             let _result = device.tick(10, &mut clusters).await;
         }
     });
@@ -364,7 +347,7 @@ fn main() {
 |---------|---------|
 | **MockMac setup** | Creates a simulated radio with a fake coordinator beacon so the device can scan and associate without real hardware. |
 | **`ZigbeeDevice::builder(mac)`** | Constructs the full BDB→ZDO→APS→NWK→MAC layer stack. The `.endpoint()` call registers clusters with the ZDO so discovery works. |
-| **`BasicCluster::new(...)`** | Creates the attribute store for the Basic cluster. Every Zigbee endpoint must have one — it tells the coordinator your manufacturer and model. |
+| **Builder identity methods** | Configure the runtime-owned Basic cluster once through `.manufacturer()`, `.model()`, `.date_code()`, `.sw_build()`, and `.power_source()`. |
 | **`TemperatureCluster::new(-4000, 12500)`** | Creates the Temperature Measurement attribute store with a valid range of −40.00 °C to +125.00 °C. Values are in hundredths of a degree. |
 | **`device.start().await`** | Runs BDB commissioning: MAC reset → active scan → association → NWK join. Returns the assigned short address. |
 | **`temp.set_temperature(2350)`** | Updates the `MeasuredValue` attribute to 23.50 °C. On the next reporting interval, the runtime will send this to the coordinator. |
@@ -391,7 +374,7 @@ Done!
 
 ## Next Steps
 
-- **Add humidity** — add `cluster_server(0x0405)` to the endpoint and create a
+- **Add humidity** — add `cluster_server(ClusterId::HUMIDITY)` to the endpoint and create a
   `HumidityCluster`. See the `mock-sensor` example for a complete temp+humidity
   device.
 - **Use a template** — `zigbee_runtime::templates::temperature_sensor(mac)`

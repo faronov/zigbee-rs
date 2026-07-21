@@ -3,14 +3,34 @@
 use core::mem::MaybeUninit;
 
 use crate::power::{PowerManager, PowerMode};
-use crate::{EndpointConfig, MAX_CLUSTERS_PER_ENDPOINT, MAX_ENDPOINTS, ZigbeeDevice};
+use crate::{
+    EndpointConfig, EndpointIdentifyCluster, MAX_CLUSTERS_PER_ENDPOINT, MAX_ENDPOINTS, ZigbeeDevice,
+};
 use zigbee_aps::ApsLayer;
 use zigbee_bdb::BdbLayer;
 use zigbee_mac::MacDriver;
 use zigbee_nwk::{DeviceType, NwkLayer};
 use zigbee_types::*;
+use zigbee_zcl::clusters::basic::{BasicCluster, PowerSource};
+use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::foundation::reporting::ReportingEngine;
+use zigbee_zcl::{ClusterId, DeviceId};
 use zigbee_zdo::ZdoLayer;
+
+fn build_identify_clusters(
+    endpoints: &[EndpointConfig],
+) -> heapless::Vec<EndpointIdentifyCluster, MAX_ENDPOINTS> {
+    let mut clusters = heapless::Vec::new();
+    for endpoint in endpoints {
+        if endpoint.server_clusters.contains(&ClusterId::IDENTIFY) {
+            let _ = clusters.push(EndpointIdentifyCluster {
+                endpoint: endpoint.endpoint,
+                cluster: IdentifyCluster::new(),
+            });
+        }
+    }
+    clusters
+}
 
 /// Fluent builder for creating a ZigbeeDevice.
 pub struct DeviceBuilder<M: MacDriver> {
@@ -21,6 +41,7 @@ pub struct DeviceBuilder<M: MacDriver> {
     model_identifier: &'static str,
     sw_build_id: &'static str,
     date_code: &'static str,
+    power_source: PowerSource,
     channel_mask: ChannelMask,
     power_mode: PowerMode,
     concentrator: Option<(zigbee_nwk::routing::ConcentratorType, u16, u8)>,
@@ -36,6 +57,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             model_identifier: "Generic",
             sw_build_id: "0.1.0",
             date_code: "",
+            power_source: PowerSource::Unknown,
             channel_mask: ChannelMask::ALL_2_4GHZ,
             power_mode: PowerMode::AlwaysOn,
             concentrator: None,
@@ -72,6 +94,12 @@ impl<M: MacDriver> DeviceBuilder<M> {
         self
     }
 
+    /// Set the Basic-cluster power source.
+    pub fn power_source(mut self, source: PowerSource) -> Self {
+        self.power_source = source;
+        self
+    }
+
     /// Set the channel mask for scanning.
     pub fn channels(mut self, mask: ChannelMask) -> Self {
         self.channel_mask = mask;
@@ -105,7 +133,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
         mut self,
         endpoint: u8,
         profile_id: u16,
-        device_id: u16,
+        device_id: DeviceId,
         configure: impl FnOnce(EndpointBuilder) -> EndpointBuilder,
     ) -> Self {
         let ep_builder = EndpointBuilder {
@@ -155,16 +183,16 @@ impl<M: MacDriver> DeviceBuilder<M> {
         for ep in &self.endpoints {
             let mut input_clusters = heapless::Vec::new();
             for &c in &ep.server_clusters {
-                let _ = input_clusters.push(c);
+                let _ = input_clusters.push(c.0);
             }
             let mut output_clusters = heapless::Vec::new();
             for &c in &ep.client_clusters {
-                let _ = output_clusters.push(c);
+                let _ = output_clusters.push(c.0);
             }
             let desc = zigbee_zdo::descriptors::SimpleDescriptor {
                 endpoint: ep.endpoint,
                 profile_id: ep.profile_id,
-                device_id: ep.device_id,
+                device_id: ep.device_id.0,
                 device_version: ep.device_version,
                 input_clusters,
                 output_clusters,
@@ -194,6 +222,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
         let mut bdb = BdbLayer::new(zdo);
         bdb.attributes_mut().primary_channel_set = self.channel_mask;
         bdb.attributes_mut().secondary_channel_set = ChannelMask(0);
+        let identify_clusters = build_identify_clusters(&self.endpoints);
 
         ZigbeeDevice {
             bdb,
@@ -202,10 +231,14 @@ impl<M: MacDriver> DeviceBuilder<M> {
             power: PowerManager::new(self.power_mode),
             pending_action: None,
             zcl_seq: 0,
-            manufacturer_name: self.manufacturer_name,
-            model_identifier: self.model_identifier,
-            sw_build_id: self.sw_build_id,
-            date_code: self.date_code,
+            basic_cluster: BasicCluster::new(
+                self.manufacturer_name,
+                self.model_identifier,
+                self.date_code,
+                self.sw_build_id,
+                self.power_source,
+            ),
+            identify_clusters,
             channel_mask: self.channel_mask,
             pending_responses: heapless::Vec::new(),
             scratch: super::RuntimeScratch::new(),
@@ -228,6 +261,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             model_identifier,
             sw_build_id,
             date_code,
+            power_source,
             channel_mask,
             power_mode,
             concentrator,
@@ -237,6 +271,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             PowerMode::AlwaysOn => true,
             PowerMode::Sleepy { .. } | PowerMode::DeepSleep { .. } => false,
         };
+        let identify_clusters = build_identify_clusters(&endpoints);
 
         let dst = dst.as_mut_ptr();
         unsafe {
@@ -259,16 +294,16 @@ impl<M: MacDriver> DeviceBuilder<M> {
                 for ep in &endpoints {
                     let mut input_clusters = heapless::Vec::new();
                     for &c in &ep.server_clusters {
-                        let _ = input_clusters.push(c);
+                        let _ = input_clusters.push(c.0);
                     }
                     let mut output_clusters = heapless::Vec::new();
                     for &c in &ep.client_clusters {
-                        let _ = output_clusters.push(c);
+                        let _ = output_clusters.push(c.0);
                     }
                     let desc = zigbee_zdo::descriptors::SimpleDescriptor {
                         endpoint: ep.endpoint,
                         profile_id: ep.profile_id,
-                        device_id: ep.device_id,
+                        device_id: ep.device_id.0,
                         device_version: ep.device_version,
                         input_clusters,
                         output_clusters,
@@ -295,12 +330,17 @@ impl<M: MacDriver> DeviceBuilder<M> {
             core::ptr::addr_of_mut!((*dst).power).write(PowerManager::new(power_mode));
             core::ptr::addr_of_mut!((*dst).pending_action).write(None);
             core::ptr::addr_of_mut!((*dst).zcl_seq).write(0);
-            core::ptr::addr_of_mut!((*dst).manufacturer_name).write(manufacturer_name);
-            core::ptr::addr_of_mut!((*dst).model_identifier).write(model_identifier);
-            core::ptr::addr_of_mut!((*dst).sw_build_id).write(sw_build_id);
-            core::ptr::addr_of_mut!((*dst).date_code).write(date_code);
+            core::ptr::addr_of_mut!((*dst).basic_cluster).write(BasicCluster::new(
+                manufacturer_name,
+                model_identifier,
+                date_code,
+                sw_build_id,
+                power_source,
+            ));
+            core::ptr::addr_of_mut!((*dst).identify_clusters).write(identify_clusters);
             core::ptr::addr_of_mut!((*dst).channel_mask).write(channel_mask);
             core::ptr::addr_of_mut!((*dst).pending_responses).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*dst).scratch).write(super::RuntimeScratch::new());
             core::ptr::addr_of_mut!((*dst).state_dirty).write(false);
             core::ptr::addr_of_mut!((*dst).secure_rejoin_retry_at).write(None);
 
@@ -313,30 +353,33 @@ impl<M: MacDriver> DeviceBuilder<M> {
 pub struct EndpointBuilder {
     pub endpoint: u8,
     pub profile_id: u16,
-    pub device_id: u16,
+    pub device_id: DeviceId,
     pub device_version: u8,
-    pub server_clusters: heapless::Vec<u16, MAX_CLUSTERS_PER_ENDPOINT>,
-    pub client_clusters: heapless::Vec<u16, MAX_CLUSTERS_PER_ENDPOINT>,
+    pub server_clusters: heapless::Vec<ClusterId, MAX_CLUSTERS_PER_ENDPOINT>,
+    pub client_clusters: heapless::Vec<ClusterId, MAX_CLUSTERS_PER_ENDPOINT>,
 }
 
 impl EndpointBuilder {
-    /// Add a server-side cluster.
-    pub fn cluster_server(mut self, cluster_id: u16) -> Self {
+    /// Add a server-side cluster to the endpoint descriptor.
+    ///
+    /// Basic and Identify use the runtime-owned instances configured by
+    /// `DeviceBuilder`; other clusters must also be supplied as `ClusterRef`s.
+    pub fn cluster_server(mut self, cluster_id: ClusterId) -> Self {
         if self.server_clusters.push(cluster_id).is_err() {
             log::warn!(
                 "EndpointBuilder: server cluster table full, dropping cluster 0x{:04X}",
-                cluster_id,
+                cluster_id.0,
             );
         }
         self
     }
 
     /// Add a client-side cluster.
-    pub fn cluster_client(mut self, cluster_id: u16) -> Self {
+    pub fn cluster_client(mut self, cluster_id: ClusterId) -> Self {
         if self.client_clusters.push(cluster_id).is_err() {
             log::warn!(
                 "EndpointBuilder: client cluster table full, dropping cluster 0x{:04X}",
-                cluster_id,
+                cluster_id.0,
             );
         }
         self

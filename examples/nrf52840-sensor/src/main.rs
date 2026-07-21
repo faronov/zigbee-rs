@@ -68,13 +68,13 @@ use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::security_store::{SecurityStateStore, SecurityStoreError};
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
-use zigbee_zcl::clusters::basic::BasicCluster;
+use zigbee_zcl::clusters::basic::PowerSource;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
-use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 #[cfg(feature = "sensor-bme280")]
 use zigbee_zcl::clusters::pressure::PressureCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
+use zigbee_zcl::{ClusterId, DeviceId};
 
 const REPORT_INTERVAL_SECS: u64 = 60;
 const FAST_POLL_MS: u64 = 250;
@@ -238,15 +238,11 @@ async fn main(_spawner: Spawner) {
     info!("Security journal ready");
 
     // ── ZCL clusters ──
-    let mut basic_cluster =
-        BasicCluster::new(b"Zigbee-RS", b"nRF52840-Sensor", b"20260401", b"0.1.0");
-    basic_cluster.set_power_source(0x03);
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
     #[cfg(feature = "sensor-bme280")]
     let mut press_cluster = PressureCluster::new(3000, 11000);
     let mut power_cluster = PowerConfigCluster::new();
-    let mut identify_cluster = IdentifyCluster::new();
     power_cluster.set_battery_size(4);
     power_cluster.set_battery_quantity(2);
     power_cluster.set_battery_rated_voltage(15);
@@ -262,17 +258,19 @@ async fn main(_spawner: Spawner) {
         })
         .manufacturer("Zigbee-RS")
         .model("nRF52840-Sensor")
+        .date_code("20260401")
         .sw_build("0.1.0")
+        .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
+        .endpoint(1, PROFILE_HOME_AUTOMATION, DeviceId::TEMPERATURE_SENSOR, |ep| {
             let ep = ep
-                .cluster_server(0x0000) // Basic
-                .cluster_server(0x0003) // Identify
-                .cluster_server(0x0001) // Power Configuration
-                .cluster_server(0x0402) // Temperature Measurement
-                .cluster_server(0x0405); // Relative Humidity
+                .cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::POWER_CONFIG)
+                .cluster_server(ClusterId::TEMPERATURE)
+                .cluster_server(ClusterId::HUMIDITY);
             #[cfg(feature = "sensor-bme280")]
-            let ep = ep.cluster_server(0x0403); // Pressure Measurement
+            let ep = ep.cluster_server(ClusterId::PRESSURE);
             ep
         })
         .build();
@@ -407,10 +405,6 @@ async fn main(_spawner: Spawner) {
                         let mut cls = [
                             ClusterRef {
                                 endpoint: 1,
-                                cluster: &mut basic_cluster,
-                            },
-                            ClusterRef {
-                                endpoint: 1,
                                 cluster: &mut temp_cluster,
                             },
                             ClusterRef {
@@ -425,17 +419,9 @@ async fn main(_spawner: Spawner) {
                                 endpoint: 1,
                                 cluster: &mut power_cluster,
                             },
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut identify_cluster,
-                            },
                         ];
                         #[cfg(not(feature = "sensor-bme280"))]
                         let mut cls = [
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut basic_cluster,
-                            },
                             ClusterRef {
                                 endpoint: 1,
                                 cluster: &mut temp_cluster,
@@ -447,10 +433,6 @@ async fn main(_spawner: Spawner) {
                             ClusterRef {
                                 endpoint: 1,
                                 cluster: &mut power_cluster,
-                            },
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut identify_cluster,
                             },
                         ];
                         let event = match device
@@ -517,10 +499,6 @@ async fn main(_spawner: Spawner) {
                         let mut cls2 = [
                             ClusterRef {
                                 endpoint: 1,
-                                cluster: &mut basic_cluster,
-                            },
-                            ClusterRef {
-                                endpoint: 1,
                                 cluster: &mut temp_cluster,
                             },
                             ClusterRef {
@@ -535,17 +513,9 @@ async fn main(_spawner: Spawner) {
                                 endpoint: 1,
                                 cluster: &mut power_cluster,
                             },
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut identify_cluster,
-                            },
                         ];
                         #[cfg(not(feature = "sensor-bme280"))]
                         let mut cls2 = [
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut basic_cluster,
-                            },
                             ClusterRef {
                                 endpoint: 1,
                                 cluster: &mut temp_cluster,
@@ -557,10 +527,6 @@ async fn main(_spawner: Spawner) {
                             ClusterRef {
                                 endpoint: 1,
                                 cluster: &mut power_cluster,
-                            },
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut identify_cluster,
                             },
                         ];
                         if let Err(error) = device
@@ -606,10 +572,6 @@ async fn main(_spawner: Spawner) {
             let mut clusters = [
                 ClusterRef {
                     endpoint: 1,
-                    cluster: &mut basic_cluster,
-                },
-                ClusterRef {
-                    endpoint: 1,
                     cluster: &mut temp_cluster,
                 },
                 ClusterRef {
@@ -624,17 +586,9 @@ async fn main(_spawner: Spawner) {
                     endpoint: 1,
                     cluster: &mut power_cluster,
                 },
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut identify_cluster,
-                },
             ];
             #[cfg(not(feature = "sensor-bme280"))]
             let mut clusters = [
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut basic_cluster,
-                },
                 ClusterRef {
                     endpoint: 1,
                     cluster: &mut temp_cluster,
@@ -646,10 +600,6 @@ async fn main(_spawner: Spawner) {
                 ClusterRef {
                     endpoint: 1,
                     cluster: &mut power_cluster,
-                },
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut identify_cluster,
                 },
             ];
             let tick_result = match device
@@ -666,8 +616,7 @@ async fn main(_spawner: Spawner) {
             }
 
             // Identify LED blink
-            identify_cluster.tick(tick_elapsed);
-            if identify_cluster.is_identifying() {
+            if device.is_identifying(1) {
                 led.toggle();
             }
 
@@ -701,10 +650,6 @@ async fn main(_spawner: Spawner) {
                 let mut clusters = [
                     ClusterRef {
                         endpoint: 1,
-                        cluster: &mut basic_cluster,
-                    },
-                    ClusterRef {
-                        endpoint: 1,
                         cluster: &mut temp_cluster,
                     },
                     ClusterRef {
@@ -714,10 +659,6 @@ async fn main(_spawner: Spawner) {
                     ClusterRef {
                         endpoint: 1,
                         cluster: &mut power_cluster,
-                    },
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut identify_cluster,
                     },
                 ];
                 if let Err(error) = device
@@ -992,10 +933,10 @@ fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M
     // Temperature: report every 60-300s, min change 0.5°C (50 centidegrees)
     let _ = device.reporting_mut().configure_for_cluster(
         1,
-        0x0402,
+        ClusterId::TEMPERATURE.0,
         ReportingConfig {
             direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::AttributeId(0x0000),
+            attribute_id: zigbee_zcl::clusters::temperature::ATTR_MEASURED_VALUE,
             data_type: ZclDataType::I16,
             min_interval: 60,
             max_interval: 300,
@@ -1006,10 +947,10 @@ fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M
     // Humidity: report every 60-300s, min change 1% (100 centi-%)
     let _ = device.reporting_mut().configure_for_cluster(
         1,
-        0x0405,
+        ClusterId::HUMIDITY.0,
         ReportingConfig {
             direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::AttributeId(0x0000),
+            attribute_id: zigbee_zcl::clusters::humidity::ATTR_MEASURED_VALUE,
             data_type: ZclDataType::U16,
             min_interval: 60,
             max_interval: 300,
@@ -1020,10 +961,11 @@ fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M
     // Battery: report every 300-3600s, min change 2% (4 in 0.5% units)
     let _ = device.reporting_mut().configure_for_cluster(
         1,
-        0x0001,
+        ClusterId::POWER_CONFIG.0,
         ReportingConfig {
             direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::AttributeId(0x0021),
+            attribute_id:
+                zigbee_zcl::clusters::power_config::ATTR_BATTERY_PERCENTAGE_REMAINING,
             data_type: ZclDataType::U8,
             min_interval: 300,
             max_interval: 3600,

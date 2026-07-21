@@ -12,10 +12,10 @@ library, no binary blobs.
 |------|---------------------|---------------------|
 | **Core** | ARM Cortex-M4F @ 40 MHz | ARM Cortex-M33 @ 80 MHz |
 | **Flash** | 256 KB | 512 KB |
-| **SRAM** | 32 KB | 64 KB |
+| **SRAM** | 32 KB nominal; `0x7c00` bytes usable on the proven part | 64 KB |
 | **Radio** | 2.4 GHz IEEE 802.15.4 + BLE | 2.4 GHz IEEE 802.15.4 + BLE |
 | **Security** | CRYPTO engine | Secure Element (SE) + TrustZone |
-| **Target** | `thumbv7em-none-eabihf` | `thumbv8m.main-none-eabihf` |
+| **Target** | `thumbv7em-none-eabi` | `thumbv8m.main-none-eabihf` |
 | **Flash page size** | 2 KB | 8 KB |
 
 ### Why EFR32?
@@ -57,7 +57,7 @@ rustup default nightly
 rustup update nightly
 
 # Series 1 (MG1P — Cortex-M4F)
-rustup target add thumbv7em-none-eabihf
+rustup target add thumbv7em-none-eabi
 
 # Series 2 (MG21 — Cortex-M33)
 rustup target add thumbv8m.main-none-eabihf
@@ -118,14 +118,14 @@ $OBJCOPY -O ihex   $ELF ${ELF}.hex
 
 ```bash
 # With probe-rs
-probe-rs run --chip EFR32MG1P target/thumbv7em-none-eabihf/release/efr32mg1-sensor
+probe-rs run --chip EFR32MG1P target/thumbv7em-none-eabi/release/efr32mg1-sensor
 
 # With openocd
 openocd -f interface/cmsis-dap.cfg -f target/efm32.cfg \
-  -c "program target/thumbv7em-none-eabihf/release/efr32mg1-sensor verify reset exit"
+  -c "program target/thumbv7em-none-eabi/release/efr32mg1-sensor verify reset exit"
 
 # With Simplicity Commander (Silicon Labs tool)
-commander flash target/thumbv7em-none-eabihf/release/efr32mg1-sensor.hex
+commander flash target/thumbv7em-none-eabi/release/efr32mg1-sensor.hex
 ```
 
 ### EFR32MG21 (Series 2)
@@ -227,20 +227,24 @@ temperature & humidity end device with:
 |---------|-------|-----|
 | `probe-rs` can't connect | Wrong chip name | Use `EFR32MG1P` (S1) or `EFR32MG21A020F512IM32` (S2) |
 | Flash write fails (MG21) | Wrong page size | Series 2 uses 8 KB pages (vs 2 KB for Series 1) |
-| Radio not working | Register init approximations | See known limitations — init registers need verification |
-| Build fails with linker errors | Wrong target | Use `thumbv7em-none-eabihf` (S1) or `thumbv8m.main-none-eabihf` (S2) |
+| Radio not working | Platform or clock setup | MG1 requires the board-specific HFXO/radio sequence; MG21 remains hardware-unverified |
+| Build fails with linker errors | Wrong target | Use `thumbv7em-none-eabi` (S1) or `thumbv8m.main-none-eabihf` (S2) |
 | No serial output | No logger configured | Add a defmt or RTT logger for debug output |
 
 ### Known Limitations
 
-- **Scaffold radio init** — the pure-Rust radio register values are simplified
-  approximations. The exact register sequences for 802.15.4 mode need
-  verification against the EFR32xG1/xG21 Reference Manuals or extraction from
-  the RAIL library source.
+- **Series 1 status** — the EFR32MG1P path is hardware-proven through
+  commissioning, ZHA interview, real SHT3x reporting, reset resume, and secure
+  rejoin. Hardware reset cycles also proved the two-sector security-journal
+  rollover with monotonic counter reservations and no invalid records. The
+  TRÅDFRI linker preserves the resident bootloader and native NVM3 while
+  reserving separate Rust security-journal and application-NV regions.
+- **Series 2 status** — the EFR32MG21 pure-Rust radio initialization remains
+  hardware-unverified.
 - **No deep sleep** — only radio clock gating is implemented; full EM2/EM3/EM4
   energy modes are not yet supported.
-- **Simulated sensors** — temperature and humidity values are placeholders.
-  Replace with I²C sensor drivers for real readings.
+- **Board-specific sensing** — the proven TRÅDFRI MG1 target reads a real SHT3x
+  on I2C0 PC10/PC11. Other EFR examples may still use placeholder values.
 
 ---
 

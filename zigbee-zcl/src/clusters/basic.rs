@@ -2,7 +2,7 @@
 
 use crate::attribute::{AttributeAccess, AttributeDefinition, AttributeStore};
 use crate::clusters::{AttributeStoreAccess, AttributeStoreMutAccess, Cluster};
-use crate::data_types::{ZclDataType, ZclValue};
+use crate::data_types::{MAX_STRING_LEN, ZclDataType, ZclValue};
 use crate::{AttributeId, ClusterId, CommandId, ZclStatus};
 
 // Attribute IDs
@@ -24,13 +24,43 @@ pub const ATTR_SW_BUILD_ID: AttributeId = AttributeId(0x4000);
 // Command IDs
 pub const CMD_RESET_TO_FACTORY_DEFAULTS: CommandId = CommandId(0x00);
 
+/// Basic-cluster PowerSource values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PowerSource {
+    Unknown = 0x00,
+    MainsSinglePhase = 0x01,
+    MainsThreePhase = 0x02,
+    Battery = 0x03,
+    DcSource = 0x04,
+    EmergencyMainsConstantlyPowered = 0x05,
+    EmergencyMainsTransferSwitch = 0x06,
+    UnknownWithBatteryBackup = 0x80,
+    MainsSinglePhaseWithBatteryBackup = 0x81,
+    MainsThreePhaseWithBatteryBackup = 0x82,
+    BatteryWithBatteryBackup = 0x83,
+    DcSourceWithBatteryBackup = 0x84,
+    EmergencyMainsConstantlyPoweredWithBatteryBackup = 0x85,
+    EmergencyMainsTransferSwitchWithBatteryBackup = 0x86,
+}
+
 /// Basic cluster implementation.
 pub struct BasicCluster {
-    store: AttributeStore<16>,
+    store: AttributeStore<10>,
 }
 
 impl BasicCluster {
-    pub fn new(manufacturer: &[u8], model: &[u8], date_code: &[u8], sw_build: &[u8]) -> Self {
+    /// Create a Basic cluster.
+    ///
+    /// ZCL strings are limited to [`MAX_STRING_LEN`] bytes. Longer values are
+    /// truncated at a UTF-8 character boundary.
+    pub fn new(
+        manufacturer: &str,
+        model: &str,
+        date_code: &str,
+        sw_build: &str,
+        power_source: PowerSource,
+    ) -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
             AttributeDefinition {
@@ -75,7 +105,7 @@ impl BasicCluster {
                 access: AttributeAccess::ReadOnly,
                 name: "ManufacturerName",
             },
-            ZclValue::CharString(heapless::Vec::from_slice(manufacturer).unwrap_or_default()),
+            ZclValue::CharString(zcl_string(manufacturer)),
         );
         let _ = store.register(
             AttributeDefinition {
@@ -84,7 +114,7 @@ impl BasicCluster {
                 access: AttributeAccess::ReadOnly,
                 name: "ModelIdentifier",
             },
-            ZclValue::CharString(heapless::Vec::from_slice(model).unwrap_or_default()),
+            ZclValue::CharString(zcl_string(model)),
         );
         let _ = store.register(
             AttributeDefinition {
@@ -93,7 +123,7 @@ impl BasicCluster {
                 access: AttributeAccess::ReadOnly,
                 name: "DateCode",
             },
-            ZclValue::CharString(heapless::Vec::from_slice(date_code).unwrap_or_default()),
+            ZclValue::CharString(zcl_string(date_code)),
         );
         let _ = store.register(
             AttributeDefinition {
@@ -102,7 +132,7 @@ impl BasicCluster {
                 access: AttributeAccess::ReadOnly,
                 name: "PowerSource",
             },
-            ZclValue::Enum8(0x01), // Mains (single phase)
+            ZclValue::Enum8(power_source as u8),
         );
         let _ = store.register(
             AttributeDefinition {
@@ -120,17 +150,58 @@ impl BasicCluster {
                 access: AttributeAccess::ReadOnly,
                 name: "SWBuildID",
             },
-            ZclValue::CharString(heapless::Vec::from_slice(sw_build).unwrap_or_default()),
+            ZclValue::CharString(zcl_string(sw_build)),
         );
         Self { store }
     }
 
     /// Set the power source enum value.
-    pub fn set_power_source(&mut self, source: u8) {
+    pub fn set_power_source(&mut self, source: PowerSource) {
         let _ = self
             .store
-            .set_raw(ATTR_POWER_SOURCE, ZclValue::Enum8(source));
+            .set_raw(ATTR_POWER_SOURCE, ZclValue::Enum8(source as u8));
     }
+
+    /// Reset writable Basic attributes while preserving configured identity.
+    pub fn reset_to_factory_defaults(&mut self) {
+        let _ = self.store.set_raw(
+            ATTR_LOCATION_DESCRIPTION,
+            ZclValue::CharString(heapless::Vec::new()),
+        );
+    }
+
+    pub fn manufacturer_name(&self) -> &str {
+        self.string_attribute(ATTR_MANUFACTURER_NAME)
+    }
+
+    pub fn model_identifier(&self) -> &str {
+        self.string_attribute(ATTR_MODEL_IDENTIFIER)
+    }
+
+    pub fn date_code(&self) -> &str {
+        self.string_attribute(ATTR_DATE_CODE)
+    }
+
+    pub fn sw_build_id(&self) -> &str {
+        self.string_attribute(ATTR_SW_BUILD_ID)
+    }
+
+    fn string_attribute(&self, id: AttributeId) -> &str {
+        let Some(ZclValue::CharString(value)) = self.store.get(id) else {
+            unreachable!("Basic cluster string attribute is always registered");
+        };
+        core::str::from_utf8(value.as_slice())
+            .expect("Basic cluster strings originate from valid UTF-8")
+    }
+}
+
+fn zcl_string(value: &str) -> heapless::Vec<u8, MAX_STRING_LEN> {
+    let mut end = value.len().min(MAX_STRING_LEN);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    heapless::Vec::from_slice(&value.as_bytes()[..end])
+        .expect("slice is bounded by the ZCL string capacity")
 }
 
 impl Cluster for BasicCluster {
@@ -145,7 +216,7 @@ impl Cluster for BasicCluster {
     ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
         match cmd_id {
             CMD_RESET_TO_FACTORY_DEFAULTS => {
-                // Application should handle actual reset; we just acknowledge.
+                self.reset_to_factory_defaults();
                 Ok(heapless::Vec::new())
             }
             _ => Err(ZclStatus::UnsupClusterCommand),

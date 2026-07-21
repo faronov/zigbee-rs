@@ -67,7 +67,7 @@ raw NOR traits, but they intentionally provide different semantics.
 | nRF52840 | Embassy NVMC | `boards/nrf52840-dk` | Security journal |
 | PHY6222/PHY6252 | `phy6222-hal` | `boards/phy62x2-evk` | Security journal |
 | ESP32-C6/H2 | `esp_storage::FlashStorage` | `boards/esp32-zigbee-devkit` | Generic NV |
-| EFR32MG1P | `efr32mg1-hal` MSC | `boards/efr32mg1-tradfri` | Generic NV |
+| EFR32MG1P | `efr32mg1-hal` MSC | `boards/efr32mg1-tradfri` | Security journal + separate generic NV |
 | EFR32MG21 | `efr32mg21-hal` MSC | `boards/efr32mg21-devkit` | Generic NV |
 
 The BSP wrappers validate bounds and translate relative offsets to physical

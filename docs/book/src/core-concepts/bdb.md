@@ -167,7 +167,7 @@ Before any commissioning, you must call `initialize()` once after power-on:
 
 ```rust
 // Initialize BDB — sets capabilities, syncs on-network state
-bdb.initialize().await?;
+bdb.initialize()?;
 ```
 
 This performs:
@@ -551,7 +551,7 @@ bdb.zdo_mut().register_endpoint(SimpleDescriptor {
 });
 
 // 3. Initialize BDB
-bdb.initialize().await?;
+bdb.initialize()?;
 
 // 4. Configure commissioning
 bdb.attributes_mut().commissioning_mode =
@@ -588,7 +588,7 @@ let zdo = ZdoLayer::new(aps);
 let mut bdb = BdbLayer::new(zdo);
 
 // 2. Initialize
-bdb.initialize().await?;
+bdb.initialize()?;
 
 // 3. Form the network
 bdb.attributes_mut().commissioning_mode = CommissioningMode::FORMATION;

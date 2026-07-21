@@ -723,7 +723,13 @@ mod basic {
 
     #[test]
     fn attributes_set_from_constructor() {
-        let c = BasicCluster::new(b"TestMfr", b"Model-X", b"20260101", b"1.0.0");
+        let c = BasicCluster::new(
+            "TestMfr",
+            "Model-X",
+            "20260101",
+            "1.0.0",
+            PowerSource::MainsSinglePhase,
+        );
         if let Some(ZclValue::CharString(s)) = c.attributes().get(ATTR_MANUFACTURER_NAME.into()) {
             assert_eq!(s.as_slice(), b"TestMfr");
         } else {
@@ -739,25 +745,55 @@ mod basic {
 
     #[test]
     fn set_power_source() {
-        let mut c = BasicCluster::new(b"", b"", b"", b"");
-        c.set_power_source(0x03); // Battery
+        let mut c = BasicCluster::new("", "", "", "", PowerSource::Unknown);
+        c.set_power_source(PowerSource::MainsSinglePhaseWithBatteryBackup);
         if let Some(ZclValue::Enum8(v)) = c.attributes().get(ATTR_POWER_SOURCE.into()) {
-            assert_eq!(*v, 0x03);
+            assert_eq!(*v, 0x81);
         }
     }
 
     #[test]
+    fn oversized_strings_are_truncated_at_utf8_boundaries() {
+        let c = BasicCluster::new(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            "1234567890123456789012345678901é",
+            "",
+            "",
+            PowerSource::Unknown,
+        );
+
+        let manufacturer = c.manufacturer_name().as_bytes();
+        assert_eq!(manufacturer.len(), 32);
+        assert_eq!(manufacturer, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345");
+
+        let model = c.model_identifier();
+        assert!(model.is_char_boundary(model.len()));
+        assert_eq!(model.as_bytes().len(), 31);
+        assert_eq!(model, "1234567890123456789012345678901");
+    }
+
+    #[test]
     fn reset_to_factory_defaults_accepted() {
-        let mut c = BasicCluster::new(b"", b"", b"", b"");
+        let mut c = BasicCluster::new("", "", "", "", PowerSource::Unknown);
+        c.attributes_mut()
+            .set(
+                ATTR_LOCATION_DESCRIPTION,
+                ZclValue::CharString(heapless::Vec::from_slice(b"Office").unwrap()),
+            )
+            .unwrap();
         let resp = c
             .handle_command(CMD_RESET_TO_FACTORY_DEFAULTS, &[])
             .unwrap();
         assert!(resp.is_empty());
+        assert_eq!(
+            c.attributes().get(ATTR_LOCATION_DESCRIPTION),
+            Some(&ZclValue::CharString(heapless::Vec::new()))
+        );
     }
 
     #[test]
     fn unsupported_command() {
-        let mut c = BasicCluster::new(b"", b"", b"", b"");
+        let mut c = BasicCluster::new("", "", "", "", PowerSource::Unknown);
         assert_eq!(
             c.handle_command(CommandId(0x01), &[]),
             Err(ZclStatus::UnsupClusterCommand)

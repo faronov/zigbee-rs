@@ -7,7 +7,8 @@ import sys
 from pathlib import Path
 
 FLASH_START = 0x00004000
-FLASH_END = 0x0003A000
+FLASH_END = 0x00037000
+APP_NV_END = 0x0003A000
 RAM_START = 0x20000000
 RAM_END = 0x20007C00
 APP_PROPERTIES_MAGIC = bytes.fromhex(
@@ -140,7 +141,7 @@ def main() -> None:
     if first_load != FLASH_START:
         fail(f"first file-backed PT_LOAD is 0x{first_load:08X}, expected 0x00004000")
     if highest_load > FLASH_END:
-        fail(f"highest file-backed load 0x{highest_load:08X} enters legacy NVM3")
+        fail(f"highest file-backed load 0x{highest_load:08X} enters security storage")
     for start, end in loads:
         if start < FLASH_START or end > FLASH_END:
             fail(f"file-backed PT_LOAD 0x{start:08X}..0x{end:08X} is unsafe")
@@ -154,7 +155,10 @@ def main() -> None:
         f"  vector[13]=APP_PROPERTIES=0x{properties_pointer:08X}; "
         "Reset sets VTOR=0x00004000"
     )
-    print("  no file-backed bootloader/legacy-NVM3 records")
+    print(
+        f"  no file-backed bootloader/security/application-NV records; "
+        f"native NVM3 starts at 0x{APP_NV_END:08X}"
+    )
 
 
 if __name__ == "__main__":

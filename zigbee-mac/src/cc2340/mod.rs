@@ -580,7 +580,7 @@ impl MacDriver for Cc2340Mac {
         Ok(())
     }
 
-    async fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
+    fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
         self.driver.init();
         if set_default_pib {
             self.short_address = ShortAddress(0xFFFF);

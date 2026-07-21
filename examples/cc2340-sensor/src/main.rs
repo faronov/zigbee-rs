@@ -36,11 +36,11 @@ use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::StackEvent;
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
-use zigbee_zcl::clusters::basic::BasicCluster;
+use zigbee_zcl::clusters::basic::PowerSource;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
-use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
+use zigbee_zcl::{ClusterId, DeviceId};
 
 const REPORT_INTERVAL_SECS: u64 = 30;
 const FAST_POLL_MS: u64 = 250;
@@ -155,13 +155,9 @@ async fn main(_spawner: Spawner) {
     // Create MAC driver
     let mac = Cc2340Mac::new();
 
-    // ZCL cluster instances
-    let mut basic_cluster = BasicCluster::new(b"Zigbee-RS", b"CC2340-Sensor", b"20260402", b"0.1.0");
-    basic_cluster.set_power_source(0x03); // Battery
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
     let mut power_cluster = PowerConfigCluster::new();
-    let mut identify_cluster = IdentifyCluster::new();
 
     // Build Zigbee device (SED architecture)
     let mut device = ZigbeeDevice::builder(mac)
@@ -172,14 +168,16 @@ async fn main(_spawner: Spawner) {
         })
         .manufacturer("Zigbee-RS")
         .model("CC2340-Sensor")
+        .date_code("20260402")
         .sw_build("0.1.0")
+        .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
-            ep.cluster_server(0x0000) // Basic
-                .cluster_server(0x0003) // Identify
-                .cluster_server(0x0001) // Power Configuration
-                .cluster_server(0x0402) // Temperature Measurement
-                .cluster_server(0x0405) // Relative Humidity
+        .endpoint(1, PROFILE_HOME_AUTOMATION, DeviceId::TEMPERATURE_SENSOR, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::POWER_CONFIG)
+                .cluster_server(ClusterId::TEMPERATURE)
+                .cluster_server(ClusterId::HUMIDITY)
         })
         .build();
 
@@ -187,11 +185,9 @@ async fn main(_spawner: Spawner) {
     log::info!("[CC2340] Auto-joining network…");
     device.user_action(UserAction::Join);
     let mut clusters = [
-        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
         ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
         ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
     ];
     let _ = device.tick(0, &mut clusters).await;
 
@@ -240,11 +236,9 @@ async fn main(_spawner: Spawner) {
                 match device.poll().await {
                     Ok(Some(ind)) => {
                         let mut cls = [
-                            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                         ];
                         if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
                             if matches!(&ev, StackEvent::RejoinRequested) {
@@ -268,11 +262,9 @@ async fn main(_spawner: Spawner) {
                             log::info!("[CC2340] Interview done — ending fast poll");
                         }
                         let mut cls2 = [
-                            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                         ];
                         let _ = device.tick(0, &mut cls2).await;
                     }
@@ -303,11 +295,9 @@ async fn main(_spawner: Spawner) {
             // Tick runtime
             let tick_elapsed = elapsed_s.min(60) as u16;
             let mut clusters = [
-                ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
             ];
             let _ = device.tick(tick_elapsed, &mut clusters).await;
 
@@ -329,11 +319,9 @@ async fn main(_spawner: Spawner) {
                 last_rejoin_attempt = Instant::now();
                 device.user_action(UserAction::Join);
                 let mut cls = [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                 ];
                 let _ = device.tick(0, &mut cls).await;
                 if device.is_joined() {

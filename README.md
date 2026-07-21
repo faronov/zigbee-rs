@@ -129,12 +129,14 @@ cargo build --release
 ```bash
 cd examples/bl702-sensor
 
-# CI mode (stubs — no vendor libs needed):
+# Compile-only scaffold check:
 cargo build --release --features stubs
-
-# Real radio (requires vendor libs — see "Vendor Libraries" below):
-cargo build --release
 ```
+
+The resulting ELF contains no radio implementation and is not flashable
+firmware. The SDK provides the 802.15.4 MAC/PHY and RF calibration only as
+binary archives, so the current backend is neither pure Rust nor
+hardware-proven.
 
 ### CC2340 firmware
 
@@ -198,33 +200,24 @@ cargo build --release   # no stubs, no GSDK, no RAIL library needed!
 
 ### Vendor Libraries
 
-Two backends require vendor radio libraries for **real RF** operation. Without them, use `--features stubs` for CI/development builds.
+Some experimental backends depend on vendor radio libraries. A successful
+stub build proves only that the Rust side compiles.
 
 #### BL702 — Bouffalo `lmac154` + `bl702_rf`
 
-The BL702 needs two pre-compiled libraries from the [Bouffalo IoT SDK](https://github.com/bouffalolab/bl_iot_sdk):
+The BL702 SDK contains two pre-compiled radio libraries:
 
-```bash
-# Option 1: Point to full SDK
-git clone https://github.com/bouffalolab/bl_iot_sdk.git
-export BL_IOT_SDK_DIR=/path/to/bl_iot_sdk
-cd examples/bl702-sensor && cargo build --release
-
-# Option 2: Copy libs manually into vendor_libs/
-mkdir -p examples/bl702-sensor/vendor_libs
-cp bl_iot_sdk/components/network/lmac154/lib/liblmac154.a examples/bl702-sensor/vendor_libs/
-cp bl_iot_sdk/components/platform/soc/bl702/bl702_rf/lib/libbl702_rf.a examples/bl702-sensor/vendor_libs/
-cargo build --release
-
-# Option 3: Explicit env vars
-export LMAC154_LIB_DIR=/path/to/lmac154/lib
-export BL702_RF_LIB_DIR=/path/to/bl702_rf/lib
-cargo build --release
+```text
+liblmac154.a
+libbl702_rf.a
 ```
 
-> **Note:** The SDK libs are compiled with `rv32imfc/ilp32f` (hard-float ABI). Since Rust targets
-> `riscv32imac/ilp32` (soft-float), you may need to strip the float-ABI flag:
-> `python3 scripts/strip_float_abi.py input.a output.a`
+They use the `ilp32f` hard-float ABI, so an ABI-correct experiment must use
+`riscv32imafc-unknown-none-elf`. Do not strip the ELF float-ABI flag: that
+changes metadata, not calling conventions. Symbols and DWARF were sufficient
+to recover the M154 and live RF-calibration paths, so a pure-Rust port is
+feasible. The implementation, startup, CLIC dispatch, boot-header packaging,
+and hardware behavior remain unproven.
 
 #### CC2340 — TI SimpleLink Low Power F3 SDK
 
@@ -255,12 +248,12 @@ The TLSR8258 radio driver uses pure-Rust register access — no `libdrivers_8258
 | **ESP32-H2** | ✅ esp-ieee802154 | `riscv32imac-unknown-none-elf` | Native 802.15.4 radio |
 | **nRF52840** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
 | **nRF52833** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
-| **BL702** | ✅ lmac154 FFI | `riscv32imac-unknown-none-elf` | Requires vendor libs (`liblmac154.a` + `libbl702_rf.a`) from Bouffalo SDK |
+| **BL702** | ⚠️ Compile-only FFI scaffold | `riscv32imac` stubs / `riscv32imafc` vendor ABI | Binary-only radio/RF libraries; no hardware proof or flashable CI artifact |
 | **CC2340** | ⚡ ZBOSS FFI | `thumbv6m-none-eabi` | TI SimpleLink SDK stubs (50+ RTOS deps) |
 | **Telink B91** | ❌ Not implemented | `riscv32imc-unknown-none-elf` | Unsupported scaffold; no `RadioPhy`/`MacDriver` backend |
 | **Telink TLSR8258** | 🦀 **Pure Rust** | `tc32-unknown-none-elf` | Real tc32 builds in the dedicated [modern-tc32](https://github.com/modern-tc32) CI workflow |
 | **PHY6222** | 🦀 **Pure Rust** | `thumbv6m-none-eabi` | Zero vendor blobs — direct register access! |
-| **EFR32MG1** | 🦀 **Pure Rust** | `thumbv7em-none-eabihf` | Series 1, Cortex-M4F — direct register access! |
+| **EFR32MG1** | 🦀 **Pure Rust** | `thumbv7em-none-eabi` | Series 1, Cortex-M4F — hardware-proven direct register access |
 | **EFR32MG21** | 🦀 **Pure Rust** | `thumbv8m.main-none-eabihf` | Series 2, Cortex-M33 — independent `efr32s2` module |
 
 > **Legend:** ✅ = functional radio driver · ⚡ = compiles with stubs, needs vendor SDK for real RF · 🦀 = pure Rust (no FFI, no vendor blobs)
@@ -379,6 +372,7 @@ The following hardware has been tested end-to-end with **Home Assistant + ZHA**:
 | **nRF52840-DK** (PCA10056) | ZHA (via zigpy) | ✅ Fully verified | Flash NV, Identify LED blink, BME280/SHT31 optional |
 | **ESP32-C6-DevKitC-1** | ZHA (via zigpy) | ✅ Fully verified | Shows as "Zigbee-RS ESP32-C6-Sensor" with Temperature, Humidity, Battery entities. Flash NV at 0x3FE000. |
 | **TLSR8258** | Home Assistant ZHA / Ember | ✅ End-device path verified | Join, TCLK exchange, interview, reporting, reset resume, and crash-safe counter persistence |
+| **EFR32MG1P TRÅDFRI** | Home Assistant ZHA / Ember | ✅ End-device path verified | Pure-Rust radio, SHT3x reporting, crash-safe journal rollover, reset resume, and secure rejoin |
 
 All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling** (auto-erase NV + rejoin), and **default reporting configuration** (so devices report data even before the coordinator sends ConfigureReporting).
 
@@ -388,7 +382,8 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
 - **Telink B91** has no current `RadioPhy`/`MacDriver` implementation. Its old example is retained only as an unsupported scaffold and is not built in CI.
 - **Telink TLSR8258** production examples are split by role. The sensor is a polling end device, not yet a retention SED; the router joins and relays but does not admit children. Real tc32 firmware requires the [modern-tc32](https://github.com/modern-tc32) toolchain.
 - **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence; temp/humidity sensors are simulated (battery ADC is real); comprehensive power management is implemented (two-tier sleep with AON system sleep ~3 µA, radio sleep/wake, flash deep power-down, GPIO leak prevention)
-- **EFR32MG1 / EFR32MG21** pure-Rust drivers use simplified radio register values — the exact init sequences for 802.15.4 mode need verification against the EFR32xG1/xG21 Reference Manuals or extraction from the RAIL library source
+- **EFR32MG1** is hardware-proven for an always-on end device, but EM2 sleep, wake-time radio restoration, battery ADC, and long-duration stability remain.
+- **EFR32MG21** still uses an unverified pure-Rust radio initialization path and needs independent hardware validation.
 - **Test coverage** is basic — the mock examples exercise more than the test crate
 - **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal
 - **OTA** — full upgrade flow implemented (OTA cluster + OtaManager + FirmwareWriter trait) but not yet tested on real hardware

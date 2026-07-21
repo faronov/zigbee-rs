@@ -1,5 +1,6 @@
 //! Tests for the runtime: builder API, NV storage, power management, templates.
 
+use core::mem::MaybeUninit;
 use zigbee_mac::mock::MockMac;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::nv_storage::*;
@@ -7,6 +8,7 @@ use zigbee_runtime::power::*;
 use zigbee_runtime::templates;
 use zigbee_runtime::*;
 use zigbee_types::*;
+use zigbee_zcl::{ClusterId, DeviceId};
 
 fn make_mock() -> MockMac {
     MockMac::new([1, 2, 3, 4, 5, 6, 7, 8])
@@ -28,14 +30,31 @@ fn test_device_builder_basic() {
 }
 
 #[test]
+fn test_device_builder_build_into_preserves_basic_identity() {
+    let mut storage = MaybeUninit::uninit();
+    let device = ZigbeeDevice::builder(make_mock())
+        .manufacturer("TestCo")
+        .model("TestSensor")
+        .date_code("20260719")
+        .sw_build("2.0.0")
+        .build_into(&mut storage);
+
+    assert_eq!(device.manufacturer_name(), "TestCo");
+    assert_eq!(device.model_identifier(), "TestSensor");
+    assert_eq!(device.date_code(), "20260719");
+    assert_eq!(device.sw_build_id(), "2.0.0");
+}
+
+#[test]
 fn test_device_builder_with_endpoints() {
     let device = ZigbeeDevice::builder(make_mock())
-        .endpoint(1, 0x0104, 0x0302, |ep| {
-            ep.cluster_server(0x0000) // Basic
-                .cluster_server(0x0402) // Temperature
+        .endpoint(1, 0x0104, DeviceId::TEMPERATURE_SENSOR, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::TEMPERATURE)
         })
-        .endpoint(2, 0x0104, 0x0301, |ep| {
-            ep.cluster_server(0x0000).cluster_server(0x0405) // Humidity
+        .endpoint(2, 0x0104, DeviceId::THERMOSTAT, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::HUMIDITY)
         })
         .build();
 
@@ -62,29 +81,44 @@ fn test_temperature_sensor_template() {
     assert_eq!(device.endpoints().len(), 1);
     assert_eq!(device.endpoints()[0].endpoint, 1);
     assert_eq!(device.endpoints()[0].profile_id, 0x0104);
-    assert_eq!(device.endpoints()[0].device_id, 0x0302);
-    assert!(device.endpoints()[0].server_clusters.contains(&0x0402));
+    assert_eq!(
+        device.endpoints()[0].device_id,
+        DeviceId::TEMPERATURE_SENSOR
+    );
+    assert!(device.endpoints()[0]
+        .server_clusters
+        .contains(&ClusterId::TEMPERATURE));
 }
 
 #[test]
 fn test_on_off_light_template() {
     let device = templates::on_off_light(make_mock()).build();
     assert_eq!(device.device_type(), DeviceType::Router);
-    assert!(device.endpoints()[0].server_clusters.contains(&0x0006));
+    assert!(device.endpoints()[0]
+        .server_clusters
+        .contains(&ClusterId::ON_OFF));
 }
 
 #[test]
 fn test_color_temperature_light_template() {
     let device = templates::color_temperature_light(make_mock()).build();
-    assert!(device.endpoints()[0].server_clusters.contains(&0x0300));
-    assert!(device.endpoints()[0].server_clusters.contains(&0x0008));
-    assert!(device.endpoints()[0].server_clusters.contains(&0x0006));
+    assert!(device.endpoints()[0]
+        .server_clusters
+        .contains(&ClusterId::COLOR_CONTROL));
+    assert!(device.endpoints()[0]
+        .server_clusters
+        .contains(&ClusterId::LEVEL_CONTROL));
+    assert!(device.endpoints()[0]
+        .server_clusters
+        .contains(&ClusterId::ON_OFF));
 }
 
 #[test]
 fn test_smart_plug_template() {
     let device = templates::smart_plug(make_mock()).build();
-    assert!(device.endpoints()[0].server_clusters.contains(&0x0B04));
+    assert!(device.endpoints()[0]
+        .server_clusters
+        .contains(&ClusterId::ELECTRICAL_MEASUREMENT));
 }
 
 // ── NV Storage Tests ─────────────────────────────────

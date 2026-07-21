@@ -17,7 +17,6 @@ use zigbee_mac::primitives::*;
 use zigbee_runtime::templates;
 use zigbee_types::*;
 use zigbee_zcl::clusters::Cluster;
-use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::level_control::{self, CMD_MOVE_TO_LEVEL, CMD_STEP, LevelControlCluster};
 use zigbee_zcl::clusters::on_off::{self, CMD_OFF, CMD_ON, CMD_TOGGLE, OnOffCluster};
 
@@ -84,7 +83,7 @@ fn main() {
     });
 
     pollster::block_on(async {
-        mac.mlme_reset(true).await.expect("Reset failed");
+        mac.mlme_reset(true).expect("Reset failed");
         println!("  MLME-RESET → OK");
 
         // Scan
@@ -131,6 +130,7 @@ fn main() {
     let device = templates::dimmable_light(mac_for_device)
         .manufacturer("zigbee-rs")
         .model("MockDimLight-01")
+        .date_code("20250101")
         .sw_build("0.1.0")
         .build();
 
@@ -147,9 +147,6 @@ fn main() {
 
     // ── Step 3: Create cluster instances ─────────────────────────────
     println!("── Step 3: Initialize Clusters ──");
-
-    let mut basic = BasicCluster::new(b"zigbee-rs", b"MockDimLight-01", b"20250101", b"0.1.0");
-    basic.set_power_source(0x01); // Mains single phase
 
     let mut on_off = OnOffCluster::new();
     let mut level = LevelControlCluster::new();

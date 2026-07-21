@@ -461,21 +461,39 @@ impl<M: MacDriver> BdbLayer<M> {
                     // multi-hop relays may require many rounds.
                     const MAX_TOTAL_ROUNDS: usize = 128;
                     const MAX_EMPTY_ROUNDS: u16 = 128;
+                    const POLL_TIMEOUT_US: u32 = 500_000;
                     let mut empty_count: u16 = 0;
                     let mut total_rounds: usize = 0;
                     let mut data_frames: usize = 0;
+                    let transport_key_wait_started = self.zdo.aps().nwk().mac().monotonic_micros();
 
                     while !key_received
                         && total_rounds < MAX_TOTAL_ROUNDS
                         && empty_count < MAX_EMPTY_ROUNDS
+                        && !self.security_exchange_timed_out(transport_key_wait_started)
                     {
                         total_rounds += 1;
                         let mut got_data_this_round = false;
+                        let elapsed = self
+                            .zdo
+                            .aps()
+                            .nwk()
+                            .mac()
+                            .monotonic_micros()
+                            .wrapping_sub(transport_key_wait_started);
+                        let remaining = TCLK_EXCHANGE_TIMEOUT_US.saturating_sub(elapsed);
 
                         // Poll parent for indirect frames
                         self.steering_diagnostics.poll_attempts =
                             self.steering_diagnostics.poll_attempts.saturating_add(1);
-                        match self.zdo.aps_mut().nwk_mut().mac_mut().mlme_poll().await {
+                        match self
+                            .zdo
+                            .aps_mut()
+                            .nwk_mut()
+                            .mac_mut()
+                            .mlme_poll_timeout(POLL_TIMEOUT_US.min(remaining))
+                            .await
+                        {
                             Ok(Some(mac_frame)) => {
                                 self.steering_diagnostics.poll_data_frames =
                                     self.steering_diagnostics.poll_data_frames.saturating_add(1);
@@ -576,7 +594,7 @@ impl<M: MacDriver> BdbLayer<M> {
                         // network key. Clear local NWK/MAC state and try the
                         // next beacon candidate; declaring success here leaves
                         // us unable to decrypt ZHA interview traffic.
-                        let _ = self.zdo.nlme_reset(false).await;
+                        let _ = self.zdo.nlme_reset(false);
                         continue;
                     }
 
@@ -591,7 +609,7 @@ impl<M: MacDriver> BdbLayer<M> {
                             "[BDB:Steering] Failed to persist network security: {:?}",
                             error
                         );
-                        let _ = self.zdo.nlme_reset(false).await;
+                        let _ = self.zdo.nlme_reset(false);
                         return Err(BdbStatus::PersistenceFailure);
                     }
 
@@ -606,7 +624,7 @@ impl<M: MacDriver> BdbLayer<M> {
                     );
                     if let Err(e) = self.zdo.device_annce(nwk_addr, ieee).await {
                         log::warn!("[BDB:Steering] Device_annce failed: {:?}", e);
-                        let _ = self.zdo.nlme_reset(false).await;
+                        let _ = self.zdo.nlme_reset(false);
                         continue;
                     }
 
@@ -621,7 +639,7 @@ impl<M: MacDriver> BdbLayer<M> {
                             SteeringStage::TrustCenterLinkKeyExchangeFailed;
                         self.attributes.commissioning_status =
                             crate::attributes::BdbCommissioningStatus::TcLinkKeyExchangeFailure;
-                        let _ = self.zdo.nlme_reset(false).await;
+                        let _ = self.zdo.nlme_reset(false);
                         return Err(BdbStatus::TrustCenterLinkKeyExchangeFailure);
                     }
 
@@ -828,7 +846,7 @@ impl<M: MacDriver> BdbLayer<M> {
                                 .aps_mut()
                                 .security_mut()
                                 .remove_key(&tc_ieee, ApsKeyType::TrustCenterLinkKey);
-                            let _ = self.zdo.nlme_reset(false).await;
+                            let _ = self.zdo.nlme_reset(false);
                             return Err(BdbStatus::PersistenceFailure);
                         }
 
@@ -895,7 +913,7 @@ impl<M: MacDriver> BdbLayer<M> {
                             .aps_mut()
                             .security_mut()
                             .remove_key(&tc_ieee, ApsKeyType::TrustCenterLinkKey);
-                        let _ = self.zdo.nlme_reset(false).await;
+                        let _ = self.zdo.nlme_reset(false);
                         return Err(BdbStatus::TrustCenterLinkKeyExchangeFailure);
                     }
 

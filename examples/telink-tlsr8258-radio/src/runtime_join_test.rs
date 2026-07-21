@@ -20,11 +20,11 @@ use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::security_store::SecurityStoreError;
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
 use zigbee_types::ChannelMask;
-use zigbee_zcl::clusters::basic::BasicCluster;
+use zigbee_zcl::clusters::basic::PowerSource;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
-use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
+use zigbee_zcl::{ClusterId, DeviceId};
 
 type Device = ZigbeeDevice<TelinkMac>;
 
@@ -45,28 +45,31 @@ pub fn run() -> ! {
         .power_mode(PowerMode::AlwaysOn)
         .manufacturer("Zigbee-RS")
         .model("TLSR8258-Runtime")
+        .date_code("20260717")
         .sw_build("0.1.0")
+        .power_source(PowerSource::Battery)
         .channels(ChannelMask(1 << 15))
-        .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |endpoint| {
-            endpoint
-                .cluster_server(0x0000)
-                .cluster_server(0x0001)
-                .cluster_server(0x0003)
-                .cluster_server(0x0402)
-                .cluster_server(0x0405)
-        })
+        .endpoint(
+            1,
+            PROFILE_HOME_AUTOMATION,
+            DeviceId::TEMPERATURE_SENSOR,
+            |endpoint| {
+                endpoint
+                    .cluster_server(ClusterId::BASIC)
+                    .cluster_server(ClusterId::POWER_CONFIG)
+                    .cluster_server(ClusterId::IDENTIFY)
+                    .cluster_server(ClusterId::TEMPERATURE)
+                    .cluster_server(ClusterId::HUMIDITY)
+            },
+        )
         .build_into(slot);
 
-    let mut basic_cluster =
-        BasicCluster::new(b"Zigbee-RS", b"TLSR8258-Runtime", b"20260717", b"0.1.0");
-    basic_cluster.set_power_source(0x03);
     let mut power_cluster = PowerConfigCluster::new();
     power_cluster.set_battery_voltage(30);
     power_cluster.set_battery_percentage(200);
     power_cluster.set_battery_size(0x04);
     power_cluster.set_battery_quantity(2);
     power_cluster.set_battery_rated_voltage(15);
-    let mut identify_cluster = IdentifyCluster::new();
     let mut temperature_cluster = TemperatureCluster::new(-4_000, 12_500);
     temperature_cluster.set_temperature(2_150);
     let mut humidity_cluster = HumidityCluster::new(0, 10_000);
@@ -74,15 +77,7 @@ pub fn run() -> ! {
     let mut clusters = [
         ClusterRef {
             endpoint: 1,
-            cluster: &mut basic_cluster,
-        },
-        ClusterRef {
-            endpoint: 1,
             cluster: &mut power_cluster,
-        },
-        ClusterRef {
-            endpoint: 1,
-            cluster: &mut identify_cluster,
         },
         ClusterRef {
             endpoint: 1,

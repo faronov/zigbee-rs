@@ -982,7 +982,7 @@ impl<P: RadioPhy + PlatformServices> MacDriver for SoftMacCore<P> {
         self.disassociate(req).await
     }
 
-    async fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
+    fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
         self.reset(set_default_pib)
     }
 

@@ -73,7 +73,7 @@ fn main() {
     println!("── Step 2: Energy Detection Scan ──");
 
     let selected_channel = pollster::block_on(async {
-        mac.mlme_reset(true).await.expect("Reset failed");
+        mac.mlme_reset(true).expect("Reset failed");
         println!("  MLME-RESET.request(setDefaultPIB=true) → OK");
 
         let scan_req = MlmeScanRequest {
@@ -231,11 +231,12 @@ fn main() {
         .device_type(DeviceType::Coordinator)
         .manufacturer("zigbee-rs")
         .model("MockCoordinator-01")
+        .date_code("20250101")
         .sw_build("0.1.0")
         .channels(ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, 0x0104, 0x0000, |ep| {
-            ep.cluster_server(0x0000) // Basic
-                .cluster_server(0x0003) // Identify
+        .endpoint(1, 0x0104, zigbee_zcl::DeviceId::COMBINED_INTERFACE, |ep| {
+            ep.cluster_server(zigbee_zcl::ClusterId::BASIC)
+                .cluster_server(zigbee_zcl::ClusterId::IDENTIFY)
         })
         .build();
 

@@ -7,13 +7,13 @@ use zigbee_runtime::event_loop::{StackEvent, StartError};
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::synthetic_sensor::{SyntheticSensor, apply_synthetic_reading};
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
-use zigbee_zcl::clusters::basic::BasicCluster;
+use zigbee_zcl::clusters::basic::PowerSource;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
-use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 use zigbee_zcl::data_types::{ZclDataType, ZclValue};
 use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
+use zigbee_zcl::{ClusterId, DeviceId};
 
 use tlsr8258_tb04::{leds as board, storage};
 
@@ -26,10 +26,10 @@ const TEST_SENSOR: SyntheticSensor = SyntheticSensor::new(2_150, 100, 5_000, 400
 fn setup_test_reporting(device: &mut ZigbeeDevice<TelinkMac>) -> bool {
     let temperature = device.reporting_mut().configure_for_cluster(
         1,
-        0x0402,
+        ClusterId::TEMPERATURE.0,
         ReportingConfig {
             direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::AttributeId(0x0000),
+            attribute_id: zigbee_zcl::clusters::temperature::ATTR_MEASURED_VALUE,
             data_type: ZclDataType::I16,
             min_interval: 1,
             max_interval: 60,
@@ -38,10 +38,10 @@ fn setup_test_reporting(device: &mut ZigbeeDevice<TelinkMac>) -> bool {
     );
     let humidity = device.reporting_mut().configure_for_cluster(
         1,
-        0x0405,
+        ClusterId::HUMIDITY.0,
         ReportingConfig {
             direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::AttributeId(0x0000),
+            attribute_id: zigbee_zcl::clusters::humidity::ATTR_MEASURED_VALUE,
             data_type: ZclDataType::U16,
             min_interval: 1,
             max_interval: 60,
@@ -73,23 +73,9 @@ pub fn run() -> ! {
     let mac = TelinkMac::with_extended_address(ieee_address);
 
     static mut DEVICE_STORAGE: MaybeUninit<Device> = MaybeUninit::uninit();
-    static mut BASIC_STORAGE: MaybeUninit<BasicCluster> = MaybeUninit::uninit();
     static mut TEMP_STORAGE: MaybeUninit<TemperatureCluster> = MaybeUninit::uninit();
     static mut HUM_STORAGE: MaybeUninit<HumidityCluster> = MaybeUninit::uninit();
     static mut POWER_STORAGE: MaybeUninit<PowerConfigCluster> = MaybeUninit::uninit();
-    static mut IDENTIFY_STORAGE: MaybeUninit<IdentifyCluster> = MaybeUninit::uninit();
-
-    let basic_cluster = unsafe {
-        let ptr = core::ptr::addr_of_mut!(BASIC_STORAGE).cast::<BasicCluster>();
-        ptr.write(BasicCluster::new(
-            b"Zigbee-RS",
-            b"TLSR8258-Runtime",
-            b"20260718",
-            b"0.1.0",
-        ));
-        &mut *ptr
-    };
-    basic_cluster.set_power_source(0x03);
 
     let power_cluster = unsafe {
         let ptr = core::ptr::addr_of_mut!(POWER_STORAGE).cast::<PowerConfigCluster>();
@@ -102,11 +88,6 @@ pub fn run() -> ! {
     power_cluster.set_battery_quantity(2);
     power_cluster.set_battery_rated_voltage(15);
 
-    let identify_cluster = unsafe {
-        let ptr = core::ptr::addr_of_mut!(IDENTIFY_STORAGE).cast::<IdentifyCluster>();
-        ptr.write(IdentifyCluster::new());
-        &mut *ptr
-    };
     let temp_cluster = unsafe {
         let ptr = core::ptr::addr_of_mut!(TEMP_STORAGE).cast::<TemperatureCluster>();
         ptr.write(TemperatureCluster::new(-4_000, 12_500));
@@ -128,16 +109,23 @@ pub fn run() -> ! {
         })
         .manufacturer("Zigbee-RS")
         .model("TLSR8258-Runtime")
+        .date_code("20260718")
         .sw_build("0.1.0")
+        .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask(1 << 15))
-        .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |endpoint| {
-            endpoint
-                .cluster_server(0x0000)
-                .cluster_server(0x0001)
-                .cluster_server(0x0003)
-                .cluster_server(0x0402)
-                .cluster_server(0x0405)
-        })
+        .endpoint(
+            1,
+            PROFILE_HOME_AUTOMATION,
+            DeviceId::TEMPERATURE_SENSOR,
+            |endpoint| {
+                endpoint
+                    .cluster_server(ClusterId::BASIC)
+                    .cluster_server(ClusterId::POWER_CONFIG)
+                    .cluster_server(ClusterId::IDENTIFY)
+                    .cluster_server(ClusterId::TEMPERATURE)
+                    .cluster_server(ClusterId::HUMIDITY)
+            },
+        )
         .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
     if !setup_test_reporting(device) {
         failure();
@@ -146,15 +134,7 @@ pub fn run() -> ! {
     let mut clusters = [
         ClusterRef {
             endpoint: 1,
-            cluster: basic_cluster,
-        },
-        ClusterRef {
-            endpoint: 1,
             cluster: power_cluster,
-        },
-        ClusterRef {
-            endpoint: 1,
-            cluster: identify_cluster,
         },
         ClusterRef {
             endpoint: 1,

@@ -786,7 +786,7 @@ mod imp {
             Ok(())
         }
 
-        async fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
+        fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
             if set_default_pib {
                 self.clear_association();
                 self.phy_channel = 11;

@@ -261,7 +261,7 @@ jobs:
             examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.bin
 
   build-bl702:
-    name: Build BL702 sensor
+    name: Check BL702 scaffold
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -275,19 +275,6 @@ jobs:
       - name: Build BL702 sensor (release)
         working-directory: examples/bl702-sensor
         run: cargo build --release --features stubs -Z build-std=core,alloc
-      - name: Create firmware artifacts
-        run: |
-          ELF=examples/bl702-sensor/target/riscv32imac-unknown-none-elf/release/bl702-sensor
-          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          $OBJCOPY -O binary $ELF ${ELF}.bin
-          $OBJCOPY -O ihex   $ELF ${ELF}.hex
-      - name: Upload BL702 firmware
-        uses: actions/upload-artifact@v4
-        with:
-          name: bl702-sensor-firmware
-          path: |
-            examples/bl702-sensor/target/riscv32imac-unknown-none-elf/release/bl702-sensor.bin
-            examples/bl702-sensor/target/riscv32imac-unknown-none-elf/release/bl702-sensor.hex
 
   # ── CC2340 (TI, ARM Cortex-M0+) ────────────────────────────
   build-cc2340:

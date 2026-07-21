@@ -7,6 +7,8 @@ mod bdb_tests;
 #[cfg(test)]
 mod cluster_tests;
 #[cfg(test)]
+mod efr32mg1_pm_tests;
+#[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
 mod mac_tests;

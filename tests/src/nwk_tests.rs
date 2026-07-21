@@ -323,10 +323,17 @@ fn test_nwk_layer_creation() {
 #[test]
 fn test_leave_command_serialize() {
     let cmd = LeaveCommand {
-        remove_children: false,
+        remove_children: true,
+        request: false,
         rejoin: true,
     };
     let byte = cmd.serialize();
     assert_eq!(byte & 0x20, 0x20); // Rejoin bit set
-    assert_eq!(byte & 0x40, 0x00); // Remove children bit clear
+    assert_eq!(byte & 0x40, 0x00); // Request bit clear
+    assert_eq!(byte & 0x80, 0x80); // Remove children bit set
+
+    let parsed = LeaveCommand::parse(&[0xE0]).unwrap();
+    assert!(parsed.remove_children);
+    assert!(parsed.request);
+    assert!(parsed.rejoin);
 }

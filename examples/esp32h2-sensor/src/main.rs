@@ -37,11 +37,11 @@ use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
-use zigbee_zcl::clusters::basic::BasicCluster;
+use zigbee_zcl::clusters::basic::PowerSource;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
-use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
+use zigbee_zcl::{ClusterId, DeviceId};
 
 // Bridge `log` crate → esp_println
 struct EspLogger;
@@ -106,17 +106,12 @@ fn main() -> ! {
     let mac = zigbee_mac::esp::EspMac::new(ieee802154, config);
     esp_println::println!("[ESP32-H2] Radio ready");
 
-    // ZCL clusters
-    let mut basic_cluster =
-        BasicCluster::new(b"Zigbee-RS", b"ESP32-H2-Sensor", b"20260403", b"0.1.0");
-    basic_cluster.set_power_source(0x03); // Battery
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
     let mut power_cluster = PowerConfigCluster::new();
     power_cluster.set_battery_size(4);
     power_cluster.set_battery_quantity(2);
     power_cluster.set_battery_rated_voltage(15);
-    let mut identify_cluster = IdentifyCluster::new();
 
     let mut hum_tick: u32 = 0;
 
@@ -129,14 +124,16 @@ fn main() -> ! {
         })
         .manufacturer("Zigbee-RS")
         .model("ESP32-H2-Sensor")
+        .date_code("20260403")
         .sw_build("0.1.0")
+        .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
-            ep.cluster_server(0x0000) // Basic
-                .cluster_server(0x0003) // Identify
-                .cluster_server(0x0001) // Power Configuration
-                .cluster_server(0x0402) // Temperature Measurement
-                .cluster_server(0x0405) // Relative Humidity
+        .endpoint(1, PROFILE_HOME_AUTOMATION, DeviceId::TEMPERATURE_SENSOR, |ep| {
+            ep.cluster_server(ClusterId::BASIC)
+                .cluster_server(ClusterId::IDENTIFY)
+                .cluster_server(ClusterId::POWER_CONFIG)
+                .cluster_server(ClusterId::TEMPERATURE)
+                .cluster_server(ClusterId::HUMIDITY)
         })
         .build();
 
@@ -164,10 +161,6 @@ fn main() -> ! {
         let mut clusters = [
             ClusterRef {
                 endpoint: 1,
-                cluster: &mut basic_cluster,
-            },
-            ClusterRef {
-                endpoint: 1,
                 cluster: &mut temp_cluster,
             },
             ClusterRef {
@@ -177,10 +170,6 @@ fn main() -> ! {
             ClusterRef {
                 endpoint: 1,
                 cluster: &mut power_cluster,
-            },
-            ClusterRef {
-                endpoint: 1,
-                cluster: &mut identify_cluster,
             },
         ];
         if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
@@ -248,10 +237,6 @@ fn main() -> ! {
                     let mut cls = [
                         ClusterRef {
                             endpoint: 1,
-                            cluster: &mut basic_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
                             cluster: &mut temp_cluster,
                         },
                         ClusterRef {
@@ -261,10 +246,6 @@ fn main() -> ! {
                         ClusterRef {
                             endpoint: 1,
                             cluster: &mut power_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut identify_cluster,
                         },
                     ];
                     if let TickResult::Event(ref e) = device.tick(0, &mut cls).await {
@@ -293,10 +274,6 @@ fn main() -> ! {
                             let mut cls = [
                                 ClusterRef {
                                     endpoint: 1,
-                                    cluster: &mut basic_cluster,
-                                },
-                                ClusterRef {
-                                    endpoint: 1,
                                     cluster: &mut temp_cluster,
                                 },
                                 ClusterRef {
@@ -306,10 +283,6 @@ fn main() -> ! {
                                 ClusterRef {
                                     endpoint: 1,
                                     cluster: &mut power_cluster,
-                                },
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut identify_cluster,
                                 },
                             ];
                             if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
@@ -357,10 +330,6 @@ fn main() -> ! {
                             let mut cls2 = [
                                 ClusterRef {
                                     endpoint: 1,
-                                    cluster: &mut basic_cluster,
-                                },
-                                ClusterRef {
-                                    endpoint: 1,
                                     cluster: &mut temp_cluster,
                                 },
                                 ClusterRef {
@@ -370,10 +339,6 @@ fn main() -> ! {
                                 ClusterRef {
                                     endpoint: 1,
                                     cluster: &mut power_cluster,
-                                },
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut identify_cluster,
                                 },
                             ];
                             let _ = device.tick(0, &mut cls2).await;
@@ -407,10 +372,6 @@ fn main() -> ! {
                 let mut clusters = [
                     ClusterRef {
                         endpoint: 1,
-                        cluster: &mut basic_cluster,
-                    },
-                    ClusterRef {
-                        endpoint: 1,
                         cluster: &mut temp_cluster,
                     },
                     ClusterRef {
@@ -421,16 +382,11 @@ fn main() -> ! {
                         endpoint: 1,
                         cluster: &mut power_cluster,
                     },
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut identify_cluster,
-                    },
                 ];
                 let _ = device.tick(tick_elapsed, &mut clusters).await;
 
                 // Identify LED blink
-                identify_cluster.tick(tick_elapsed);
-                if identify_cluster.is_identifying() {
+                if device.is_identifying(1) {
                     led.toggle();
                 }
 
@@ -461,10 +417,6 @@ fn main() -> ! {
                     let mut cls = [
                         ClusterRef {
                             endpoint: 1,
-                            cluster: &mut basic_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
                             cluster: &mut temp_cluster,
                         },
                         ClusterRef {
@@ -474,10 +426,6 @@ fn main() -> ! {
                         ClusterRef {
                             endpoint: 1,
                             cluster: &mut power_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut identify_cluster,
                         },
                     ];
                     let _ = device.tick(0, &mut cls).await;
@@ -546,10 +494,10 @@ fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M
 
     let _ = device.reporting_mut().configure_for_cluster(
         1,
-        0x0402,
+        ClusterId::TEMPERATURE.0,
         ReportingConfig {
             direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::AttributeId(0x0000),
+            attribute_id: zigbee_zcl::clusters::temperature::ATTR_MEASURED_VALUE,
             data_type: ZclDataType::I16,
             min_interval: 60,
             max_interval: 300,
@@ -558,10 +506,10 @@ fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M
     );
     let _ = device.reporting_mut().configure_for_cluster(
         1,
-        0x0405,
+        ClusterId::HUMIDITY.0,
         ReportingConfig {
             direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::AttributeId(0x0000),
+            attribute_id: zigbee_zcl::clusters::humidity::ATTR_MEASURED_VALUE,
             data_type: ZclDataType::U16,
             min_interval: 60,
             max_interval: 300,
@@ -570,10 +518,11 @@ fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M
     );
     let _ = device.reporting_mut().configure_for_cluster(
         1,
-        0x0001,
+        ClusterId::POWER_CONFIG.0,
         ReportingConfig {
             direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::AttributeId(0x0021),
+            attribute_id:
+                zigbee_zcl::clusters::power_config::ATTR_BATTERY_PERCENTAGE_REMAINING,
             data_type: ZclDataType::U8,
             min_interval: 300,
             max_interval: 3600,

@@ -11,12 +11,22 @@ zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
+efr32mg1-hal = { path = "../../efr32mg1-hal" }
 zigbee-sht3x = { path = "../../drivers/sht3x", optional = true }
 
 # Embassy async runtime
-embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "task-arena-size-5120"] }
+#
+# `embassy-time-driver` carries `TICK_HZ`; `tick-hz-32_768` pins it to
+# exactly the RTCC/LFRCO tick rate (`efr32mg1_hal::pm::LFRCO_HZ`) so the
+# RTCC-backed time driver (`src/time_driver.rs`) needs no fractional tick
+# conversion. `embassy-time-driver` is `links = "embassy-time"`, so Cargo
+# unifies a single instance of it across this whole dependency graph —
+# including `zigbee-mac`'s `efr32` feature, which pulls in `embassy-time`
+# 0.4 (this crate uses 0.5) but shares that same single driver instance.
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
 embassy-time = { version = "0.5" }
-embassy-time-driver = "0.2"
+embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
+embassy-time-queue-utils = "0.1"
 embassy-futures = "0.1"
 
 # ARM Cortex-M4F support
@@ -36,10 +46,17 @@ panic-halt = "1.0"
 
 [features]
 default = ["sensor"]
-sensor = []
+sensor = ["dep:zigbee-sht3x"]
 diag-join = []
 diag-beacon = []
 diag-sht = ["dep:zigbee-sht3x"]
+diag-nv = []
+diag-em2 = []
+diag-rtcc-time = []
+diag-radio-em2 = []
+sed = []
+sed-diag = []
+sed-migrate = ["sed"]
 stubs = []
 trace = [
     "zigbee-mac/efr32-trace",
@@ -47,5 +64,5 @@ trace = [
 ]
 
 [profile.release]
-opt-level = "s"
+opt-level = 3
 lto = true

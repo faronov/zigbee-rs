@@ -750,10 +750,9 @@ impl<M: MacDriver> ZdoLayer<M> {
     }
 
     /// Reset the stack (wraps NLME-RESET).
-    pub async fn nlme_reset(&mut self, warm_start: bool) -> Result<(), ZdpStatus> {
+    pub fn nlme_reset(&mut self, warm_start: bool) -> Result<(), ZdpStatus> {
         self.nwk_mut()
             .nlme_reset(warm_start)
-            .await
             .map_err(ZdpStatus::from)
     }
 }

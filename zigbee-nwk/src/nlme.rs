@@ -479,6 +479,11 @@ impl<M: MacDriver> NwkLayer<M> {
         &mut self,
         network: &NetworkDescriptor,
     ) -> Result<ShortAddress, NwkStatus> {
+        self.rejoin_diagnostics.stage = 1;
+        self.rejoin_diagnostics.candidate_attempts =
+            self.rejoin_diagnostics.candidate_attempts.saturating_add(1);
+        self.rejoin_diagnostics.last_parent = network.router_address.0;
+
         // Rejoin uses NWK-level Rejoin Request command (encrypted with network key)
         // This is used when a device has been disconnected but still knows the network key
 
@@ -591,7 +596,9 @@ impl<M: MacDriver> NwkLayer<M> {
         }
 
         // Send via MAC
-        self.mac
+        self.rejoin_diagnostics.tx_attempts = self.rejoin_diagnostics.tx_attempts.saturating_add(1);
+        let tx_result = self
+            .mac
             .mcps_data(zigbee_mac::McpsDataRequest {
                 src_addr_mode: zigbee_mac::AddressMode::Short,
                 dst_address: MacAddress::Short(network.pan_id, network.router_address),
@@ -602,11 +609,32 @@ impl<M: MacDriver> NwkLayer<M> {
                     ..Default::default()
                 },
             })
-            .await
-            .map_err(|error| match error {
-                MacError::NoAck | MacError::ChannelAccessFailure => NwkStatus::NoNetworks,
-                _ => NwkStatus::StartupFailure,
-            })?;
+            .await;
+        if let Err(error) = tx_result {
+            let status = match error {
+                MacError::NoAck => {
+                    self.rejoin_diagnostics.no_ack_failures =
+                        self.rejoin_diagnostics.no_ack_failures.saturating_add(1);
+                    NwkStatus::NoNetworks
+                }
+                MacError::ChannelAccessFailure => {
+                    self.rejoin_diagnostics.channel_access_failures = self
+                        .rejoin_diagnostics
+                        .channel_access_failures
+                        .saturating_add(1);
+                    NwkStatus::NoNetworks
+                }
+                _ => {
+                    self.rejoin_diagnostics.other_tx_failures =
+                        self.rejoin_diagnostics.other_tx_failures.saturating_add(1);
+                    NwkStatus::StartupFailure
+                }
+            };
+            self.rejoin_diagnostics.stage = 2;
+            self.rejoin_diagnostics.last_status = status as u8;
+            return Err(status);
+        }
+        self.rejoin_diagnostics.stage = 3;
 
         // A sleepy end device receives the Rejoin Response indirectly and
         // must poll the prospective parent during aResponseWaitTime
@@ -630,6 +658,8 @@ impl<M: MacDriver> NwkLayer<M> {
             }
             let response_time_remaining = REJOIN_RESPONSE_WAIT_US.saturating_sub(elapsed);
             attempt += 1;
+            self.rejoin_diagnostics.poll_attempts =
+                self.rejoin_diagnostics.poll_attempts.saturating_add(1);
 
             let frame = if sleepy {
                 match self.mac.mlme_poll_timeout(response_time_remaining).await {
@@ -656,6 +686,7 @@ impl<M: MacDriver> NwkLayer<M> {
                     Err(_) => break,
                 }
             };
+            self.rejoin_diagnostics.rx_frames = self.rejoin_diagnostics.rx_frames.saturating_add(1);
 
             let data = frame.as_slice();
             let (hdr, consumed) = match NwkHeader::parse(data) {
@@ -779,6 +810,8 @@ impl<M: MacDriver> NwkLayer<M> {
                 let rejoin_status = cmd_data[3];
 
                 if rejoin_status == 0x00 && (0x0001..=0xFFF7).contains(&new_addr) {
+                    self.rejoin_diagnostics.stage = 5;
+                    self.rejoin_diagnostics.last_status = 0;
                     log::info!("[NWK] Rejoin accepted, new addr=0x{:04X}", new_addr);
                     self.nib.network_address = ShortAddress(new_addr);
                     // Refresh parent address to the sender of the rejoin response
@@ -832,6 +865,8 @@ impl<M: MacDriver> NwkLayer<M> {
                     self.joined = true;
                     return Ok(ShortAddress(new_addr));
                 } else {
+                    self.rejoin_diagnostics.stage = 6;
+                    self.rejoin_diagnostics.last_status = rejoin_status;
                     log::warn!("[NWK] Rejoin rejected (status=0x{:02X})", rejoin_status);
                     return Err(NwkStatus::NotPermitted);
                 }
@@ -842,6 +877,8 @@ impl<M: MacDriver> NwkLayer<M> {
             "[NWK] Rejoin response not received after {} attempts",
             attempt
         );
+        self.rejoin_diagnostics.stage = 4;
+        self.rejoin_diagnostics.last_status = NwkStatus::NoNetworks as u8;
         Err(NwkStatus::NoNetworks)
     }
 
@@ -868,7 +905,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 src_ieee_present: true,
                 end_device_initiator: false,
             },
-            dst_addr: self.nib.parent_address,
+            dst_addr: ShortAddress::BROADCAST_RX_ON_WHEN_IDLE,
             src_addr: self.nib.network_address,
             radius: 1,
             seq_number: seq,
@@ -882,6 +919,7 @@ impl<M: MacDriver> NwkLayer<M> {
         // Leave command payload: command ID + options byte
         let leave_cmd = crate::frames::LeaveCommand {
             remove_children: false,
+            request: false,
             rejoin,
         };
         let payload = [0x04u8, leave_cmd.serialize()]; // cmd_id=Leave, options
@@ -928,11 +966,11 @@ impl<M: MacDriver> NwkLayer<M> {
             .mac
             .mcps_data(zigbee_mac::McpsDataRequest {
                 src_addr_mode: zigbee_mac::AddressMode::Short,
-                dst_address: MacAddress::Short(self.nib.pan_id, self.nib.parent_address),
+                dst_address: MacAddress::Short(self.nib.pan_id, ShortAddress::BROADCAST),
                 payload: &buf[..total_len],
                 msdu_handle: seq,
                 tx_options: zigbee_mac::TxOptions {
-                    ack_tx: true,
+                    ack_tx: false,
                     ..Default::default()
                 },
             })
@@ -949,24 +987,26 @@ impl<M: MacDriver> NwkLayer<M> {
             })
             .await;
 
-        // Reset state — clear all network-scoped state
-        self.joined = false;
-        self.nib.network_address = ShortAddress(0xFFFF);
-        self.nib.pan_id = PanId(0xFFFF);
-        self.nib.parent_address = ShortAddress(0xFFFF);
-        self.nib.logical_channel = 0;
-        self.nib.depth = 0;
-        self.nib.extended_pan_id = [0u8; 8];
-        self.neighbors = crate::neighbor::NeighborTable::new();
-        self.routing = crate::routing::RoutingTable::new();
-        if !rejoin {
-            // Full leave — also clear security state
-            self.security = crate::security::NwkSecurity::new();
-        }
+        self.finish_leave(rejoin);
 
         log::info!("[NWK] Left network, rejoin={rejoin}");
 
         Ok(())
+    }
+
+    fn finish_leave(&mut self, rejoin: bool) {
+        self.joined = false;
+        self.neighbors = crate::neighbor::NeighborTable::new();
+        self.routing = crate::routing::RoutingTable::new();
+        if !rejoin {
+            self.nib.network_address = ShortAddress(0xFFFF);
+            self.nib.pan_id = PanId(0xFFFF);
+            self.nib.parent_address = ShortAddress(0xFFFF);
+            self.nib.logical_channel = 0;
+            self.nib.depth = 0;
+            self.nib.extended_pan_id = [0u8; 8];
+            self.security = crate::security::NwkSecurity::new();
+        }
     }
 
     // ── NLME-ORPHAN-RECOVERY ────────────────────────────────
@@ -1147,7 +1187,7 @@ impl<M: MacDriver> NwkLayer<M> {
     // ── NLME-RESET ──────────────────────────────────────────
 
     /// Reset the NWK layer to initial state.
-    pub async fn nlme_reset(&mut self, warm_start: bool) -> Result<(), NwkStatus> {
+    pub fn nlme_reset(&mut self, warm_start: bool) -> Result<(), NwkStatus> {
         if !warm_start {
             self.nib = Nib::new();
             self.neighbors = crate::neighbor::NeighborTable::new();
@@ -1158,7 +1198,6 @@ impl<M: MacDriver> NwkLayer<M> {
 
         self.mac
             .mlme_reset(!warm_start)
-            .await
             .map_err(|_| NwkStatus::InvalidRequest)?;
 
         Ok(())
@@ -1184,6 +1223,52 @@ mod tests {
             zigbee_capability_info(DeviceType::Router, true).to_byte(),
             0x8E
         );
+    }
+
+    #[test]
+    fn rejoin_leave_preserves_previous_network_identity() {
+        let mut nwk = NwkLayer::new(
+            MockMac::new([1, 2, 3, 4, 5, 6, 7, 8]),
+            DeviceType::EndDevice,
+        );
+        nwk.joined = true;
+        nwk.nib.network_address = ShortAddress(0x1234);
+        nwk.nib.pan_id = PanId(0xABCD);
+        nwk.nib.parent_address = ShortAddress(0x0000);
+        nwk.nib.logical_channel = 15;
+        nwk.nib.extended_pan_id = [8, 7, 6, 5, 4, 3, 2, 1];
+
+        nwk.finish_leave(true);
+
+        assert!(!nwk.joined);
+        assert_eq!(nwk.nib.network_address, ShortAddress(0x1234));
+        assert_eq!(nwk.nib.pan_id, PanId(0xABCD));
+        assert_eq!(nwk.nib.parent_address, ShortAddress(0x0000));
+        assert_eq!(nwk.nib.logical_channel, 15);
+        assert_eq!(nwk.nib.extended_pan_id, [8, 7, 6, 5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn final_leave_clears_previous_network_identity() {
+        let mut nwk = NwkLayer::new(
+            MockMac::new([1, 2, 3, 4, 5, 6, 7, 8]),
+            DeviceType::EndDevice,
+        );
+        nwk.joined = true;
+        nwk.nib.network_address = ShortAddress(0x1234);
+        nwk.nib.pan_id = PanId(0xABCD);
+        nwk.nib.parent_address = ShortAddress(0x0000);
+        nwk.nib.logical_channel = 15;
+        nwk.nib.extended_pan_id = [8, 7, 6, 5, 4, 3, 2, 1];
+
+        nwk.finish_leave(false);
+
+        assert!(!nwk.joined);
+        assert_eq!(nwk.nib.network_address, ShortAddress(0xFFFF));
+        assert_eq!(nwk.nib.pan_id, PanId(0xFFFF));
+        assert_eq!(nwk.nib.parent_address, ShortAddress(0xFFFF));
+        assert_eq!(nwk.nib.logical_channel, 0);
+        assert_eq!(nwk.nib.extended_pan_id, [0; 8]);
     }
 
     #[test]
