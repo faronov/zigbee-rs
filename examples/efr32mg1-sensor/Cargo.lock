@@ -189,6 +189,7 @@ name = "efr32mg1-tradfri"
 version = "0.1.0"
 dependencies = [
  "efr32mg1-hal",
+ "embedded-hal 1.0.0",
  "embedded-storage",
  "zigbee-runtime",
 ]

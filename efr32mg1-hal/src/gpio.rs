@@ -1,5 +1,7 @@
 //! EFR32MG1 Series 1 GPIO primitives.
 
+use core::convert::Infallible;
+
 use crate::clock;
 
 const GPIO_BASE: u32 = 0x4000_A000;
@@ -194,6 +196,42 @@ impl Pin {
                 ((self.number - 8) as u32) * 4,
             )
         }
+    }
+}
+
+impl embedded_hal::digital::ErrorType for Pin {
+    type Error = Infallible;
+}
+
+impl embedded_hal::digital::OutputPin for Pin {
+    fn set_low(&mut self) -> Result<(), Self::Error> {
+        Pin::set_low(*self);
+        Ok(())
+    }
+
+    fn set_high(&mut self) -> Result<(), Self::Error> {
+        Pin::set_high(*self);
+        Ok(())
+    }
+}
+
+impl embedded_hal::digital::StatefulOutputPin for Pin {
+    fn is_set_high(&mut self) -> Result<bool, Self::Error> {
+        Ok(self.output_is_high())
+    }
+
+    fn is_set_low(&mut self) -> Result<bool, Self::Error> {
+        Ok(!self.output_is_high())
+    }
+}
+
+impl embedded_hal::digital::InputPin for Pin {
+    fn is_high(&mut self) -> Result<bool, Self::Error> {
+        Ok(Pin::is_high(*self))
+    }
+
+    fn is_low(&mut self) -> Result<bool, Self::Error> {
+        Ok(!Pin::is_high(*self))
     }
 }
 

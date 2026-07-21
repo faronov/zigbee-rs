@@ -9,5 +9,6 @@ publish = false
 
 [dependencies]
 efr32mg1-hal = { path = "../../efr32mg1-hal" }
+embedded-hal = "1.0"
 embedded-storage = "0.3"
 zigbee-runtime = { path = "../../zigbee-runtime" }

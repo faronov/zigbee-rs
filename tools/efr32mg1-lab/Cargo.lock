@@ -173,6 +173,7 @@ dependencies = [
  "embassy-time 0.5.1",
  "embassy-time-driver",
  "embassy-time-queue-utils",
+ "embedded-hal 1.0.0",
  "log",
  "rtt-target",
  "static_cell",
@@ -190,6 +191,7 @@ name = "efr32mg1-tradfri"
 version = "0.1.0"
 dependencies = [
  "efr32mg1-hal",
+ "embedded-hal 1.0.0",
  "embedded-storage",
  "zigbee-runtime",
 ]

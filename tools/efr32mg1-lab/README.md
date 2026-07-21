@@ -15,6 +15,8 @@ package has no feature-selected entry points.
 | `efr32mg1-diag-sht` | I2C/SHT3x probe and repeated CRC-checked samples |
 | `efr32mg1-diag-join` | No-NV join, poll, announce, and descriptor path |
 | `efr32mg1-diag-beacon` | Bounded raw TX gate followed by active scans |
+| `efr32mg1-diag-spi` | Read-only USART0/SPI JEDEC-ID probe on the external flash |
+| `efr32mg1-diag-pwm` | TIMER0 CC0 PWM fade on the PA0 LED |
 
 Build from this directory so `.cargo/config.toml` supplies the target and
 bootloader-safe linker script:
@@ -27,6 +29,8 @@ cargo build --release --bin efr32mg1-diag-radio-em2
 cargo build --release --bin efr32mg1-diag-sht
 cargo build --release --bin efr32mg1-diag-join
 cargo build --release --bin efr32mg1-diag-beacon
+cargo build --release --bin efr32mg1-diag-spi
+cargo build --release --bin efr32mg1-diag-pwm
 ```
 
 Verify each ELF before producing a HEX:
@@ -47,8 +51,9 @@ tools/verify-layout.py \
 ```
 
 Only `efr32mg1-diag-nv` intentionally writes flash, and only in
-`0x39000..0x39FFF`. No command in this package flashes hardware. Never use a
-mass erase with this layout.
+`0x39000..0x39FFF`. `diag-spi` sends only the read-JEDEC-ID command and does
+not alter the external flash. No command in this package flashes hardware.
+Never use a mass erase with this layout.
 
 The binaries compile shared vector, application-properties, panic/fault-log,
 and RTCC time-driver source directly into each final ELF. `diag-em2` excludes

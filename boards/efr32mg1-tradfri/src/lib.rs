@@ -9,12 +9,21 @@ use efr32mg1_hal::{
     clock::{self, ClockError, HfxoConfig},
     gpio::{InterruptEdge, Mode, Pin, Port},
     i2c::{Config as I2cConfig, I2c0, I2cError, PullUp},
+    pwm::{
+        Channel as PwmChannel, Config as PwmConfig, Polarity as PwmPolarity, PwmError, Timer0Pwm,
+    },
+    spi::{BitOrder, Config as SpiConfig, SpiError, Usart0Spi},
 };
+use embedded_hal::spi::MODE_0;
 
 pub const HCLK_HZ: u32 = 38_400_000;
 pub const HFXO_CTUNE: u16 = 360;
 pub const SENSOR_I2C_HZ: u32 = 10_000;
+pub const FLASH_SPI_HZ: u32 = 4_000_000;
+pub const LED_PWM_HZ: u32 = 1_000;
 pub type SensorI2c = I2c0;
+pub type FlashSpi = Usart0Spi;
+pub type LedPwm = Timer0Pwm;
 
 const BATTERY_ADC_HZ: u32 = 1_000_000;
 const BATTERY_ADC_TIMEOUT_ITERATIONS: u32 = 200_000;
@@ -26,6 +35,10 @@ const LED_PIN: Pin = Pin::new(Port::A, 0);
 const BUTTON_PIN: Pin = Pin::new(Port::B, 13);
 const SENSOR_SDA_PIN: Pin = Pin::new(Port::C, 10);
 const SENSOR_SCL_PIN: Pin = Pin::new(Port::C, 11);
+const FLASH_MOSI_PIN: Pin = Pin::new(Port::D, 15);
+const FLASH_MISO_PIN: Pin = Pin::new(Port::D, 14);
+const FLASH_CLOCK_PIN: Pin = Pin::new(Port::D, 13);
+const FLASH_CS_PIN: Pin = Pin::new(Port::B, 11);
 
 /// Voltage-to-capacity curves supported by the TRÅDFRI 2xAAA carrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,9 +251,54 @@ pub fn sensor_i2c() -> Result<SensorI2c, I2cError> {
     })
 }
 
+pub struct FlashSpiResources {
+    pub bus: FlashSpi,
+    pub chip_select: Pin,
+}
+
+/// Construct the board's external-flash SPI bus and active-low PB11 CS.
+///
+/// The bus uses USART0 in mode 0 at up to 4 MHz. `Pin` implements the
+/// embedded-hal digital traits, so callers can wrap these resources in an
+/// `embedded-hal-bus` exclusive SPI device without board-specific adapters.
+pub fn flash_spi() -> Result<FlashSpiResources, SpiError> {
+    let bus = Usart0Spi::new(SpiConfig {
+        reference_hz: HCLK_HZ,
+        bus_hz: FLASH_SPI_HZ,
+        mode: MODE_0,
+        bit_order: BitOrder::MostSignificantFirst,
+        mosi: FLASH_MOSI_PIN,
+        miso: FLASH_MISO_PIN,
+        clock: FLASH_CLOCK_PIN,
+        mosi_location: 23,
+        miso_location: 21,
+        clock_location: 19,
+        timeout_iterations: 200_000,
+    })?;
+    FLASH_CS_PIN.configure(Mode::PushPull, true);
+    Ok(FlashSpiResources {
+        bus,
+        chip_select: FLASH_CS_PIN,
+    })
+}
+
+/// Route TIMER0 CC0 LOC0 to the active-high PA0 board LED.
+///
+/// This is mutually exclusive with `Led`: both own the same physical pin.
+pub fn led_pwm() -> Result<LedPwm, PwmError> {
+    Timer0Pwm::new(PwmConfig {
+        reference_hz: HCLK_HZ,
+        frequency_hz: LED_PWM_HZ,
+        pin: LED_PIN,
+        channel: PwmChannel::Cc0,
+        location: 0,
+        polarity: PwmPolarity::ActiveHigh,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BatteryCurve, battery_percentage, zcl_battery_voltage};
+    use super::{BatteryCurve, FLASH_SPI_HZ, LED_PWM_HZ, battery_percentage, zcl_battery_voltage};
 
     #[test]
     fn zcl_voltage_uses_100mv_units_and_reserves_unknown() {
@@ -270,5 +328,11 @@ mod tests {
         assert_eq!(battery_percentage(curve, 2_500), 160);
         assert_eq!(battery_percentage(curve, 2_600), 180);
         assert_eq!(battery_percentage(curve, 2_700), 200);
+    }
+
+    #[test]
+    fn board_peripheral_defaults_are_conservative() {
+        assert_eq!(FLASH_SPI_HZ, 4_000_000);
+        assert_eq!(LED_PWM_HZ, 1_000);
     }
 }

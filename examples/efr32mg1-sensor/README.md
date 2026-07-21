@@ -50,6 +50,8 @@ layout.
 | I2C speed | 10 kHz with internal pull-ups |
 | SHT3x | Probe `0x44`, then `0x45` |
 | Battery | ADC0 AVDD against calibrated internal 5 V reference |
+| External flash SPI | USART0 mode 0, PD15/PD14/PD13 LOC23/21/19, PB11 CS |
+| LED PWM | TIMER0 CC0 LOC0 on PA0, 1 kHz |
 
 ## Bootloader-safe layout
 
@@ -67,4 +69,5 @@ The custom linker script places vectors at `0x4000`, places
 `cortex-m-rt`'s `set-vtor` feature.
 
 Hardware diagnostics live in
-[`../../tools/efr32mg1-lab`](../../tools/efr32mg1-lab).
+[`../../tools/efr32mg1-lab`](../../tools/efr32mg1-lab), including read-only
+external-flash JEDEC probing and LED PWM waveform tests.

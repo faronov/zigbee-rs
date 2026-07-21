@@ -12,3 +12,6 @@ pub mod flash;
 pub mod gpio;
 pub mod i2c;
 pub mod pm;
+pub mod pwm;
+mod routing;
+pub mod spi;
