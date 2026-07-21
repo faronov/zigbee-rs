@@ -209,6 +209,101 @@ fn upgrade_end_response_parse() {
     assert_eq!(resp.upgrade_time, 0); // Immediate upgrade
 }
 
+#[test]
+fn ota_delayed_upgrade_activates_after_countdown() {
+    let mut cluster = OtaCluster::new(0x1234, 0x0001, 1);
+    cluster.start_query();
+    let mut query_response = [0u8; 13];
+    query_response[0] = 0x00;
+    query_response[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    query_response[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    query_response[5..9].copy_from_slice(&2u32.to_le_bytes());
+    query_response[9..13].copy_from_slice(&128u32.to_le_bytes());
+    let _ = cluster.process_server_command(CMD_QUERY_NEXT_IMAGE_RESPONSE.0, &query_response);
+    let _ = cluster.mark_verified();
+
+    let mut response = [0u8; 16];
+    response[0..2].copy_from_slice(&0x1234u16.to_le_bytes());
+    response[2..4].copy_from_slice(&0x0001u16.to_le_bytes());
+    response[4..8].copy_from_slice(&2u32.to_le_bytes());
+    response[8..12].copy_from_slice(&100u32.to_le_bytes());
+    response[12..16].copy_from_slice(&105u32.to_le_bytes());
+
+    assert!(matches!(
+        cluster.process_server_command(CMD_UPGRADE_END_RESPONSE.0, &response),
+        OtaAction::Wait(5)
+    ));
+    assert_eq!(
+        cluster.state(),
+        OtaState::WaitingUpgrade {
+            delay_secs: 5,
+            elapsed: 0
+        }
+    );
+    assert!(matches!(cluster.tick(4), OtaAction::None));
+    assert!(matches!(cluster.tick(1), OtaAction::ActivateImage));
+    assert_eq!(cluster.state(), OtaState::Done);
+}
+
+#[test]
+fn ota_upgrade_end_wait_sentinel_is_not_treated_as_a_delay() {
+    let mut cluster = OtaCluster::new(0x1234, 0x0001, 1);
+    cluster.start_query();
+    let mut query_response = [0u8; 13];
+    query_response[0] = 0x00;
+    query_response[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    query_response[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    query_response[5..9].copy_from_slice(&2u32.to_le_bytes());
+    query_response[9..13].copy_from_slice(&128u32.to_le_bytes());
+    let _ = cluster.process_server_command(CMD_QUERY_NEXT_IMAGE_RESPONSE.0, &query_response);
+    let _ = cluster.mark_verified();
+
+    let mut response = [0u8; 16];
+    response[0..2].copy_from_slice(&0x1234u16.to_le_bytes());
+    response[2..4].copy_from_slice(&0x0001u16.to_le_bytes());
+    response[4..8].copy_from_slice(&2u32.to_le_bytes());
+    response[8..12].copy_from_slice(&100u32.to_le_bytes());
+    response[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+
+    assert!(matches!(
+        cluster.process_server_command(CMD_UPGRADE_END_RESPONSE.0, &response),
+        OtaAction::None
+    ));
+    assert_eq!(cluster.state(), OtaState::WaitingUpgradeCommand);
+}
+
+#[test]
+fn ota_upgrade_end_rejects_wrong_state_and_image() {
+    let mut cluster = OtaCluster::new(0x1234, 0x0001, 1);
+    let mut response = [0u8; 16];
+    response[0..2].copy_from_slice(&0x1234u16.to_le_bytes());
+    response[2..4].copy_from_slice(&0x0001u16.to_le_bytes());
+    response[4..8].copy_from_slice(&2u32.to_le_bytes());
+
+    assert!(matches!(
+        cluster.process_server_command(CMD_UPGRADE_END_RESPONSE.0, &response),
+        OtaAction::None
+    ));
+    assert_eq!(cluster.state(), OtaState::Idle);
+
+    cluster.start_query();
+    let mut query_response = [0u8; 13];
+    query_response[0] = 0x00;
+    query_response[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    query_response[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    query_response[5..9].copy_from_slice(&2u32.to_le_bytes());
+    query_response[9..13].copy_from_slice(&128u32.to_le_bytes());
+    let _ = cluster.process_server_command(CMD_QUERY_NEXT_IMAGE_RESPONSE.0, &query_response);
+    let _ = cluster.mark_verified();
+    response[4..8].copy_from_slice(&3u32.to_le_bytes());
+
+    assert!(matches!(
+        cluster.process_server_command(CMD_UPGRADE_END_RESPONSE.0, &response),
+        OtaAction::None
+    ));
+    assert_eq!(cluster.state(), OtaState::WaitingActivate);
+}
+
 // ── OTA State Machine tests ─────────────────────────────────────
 
 #[test]
@@ -428,6 +523,7 @@ fn build_ota_file(
 
 #[test]
 fn ota_manager_full_download_flow() {
+    use zigbee_runtime::event_loop::StackEvent;
     use zigbee_runtime::firmware_writer::MockFirmwareWriter;
     use zigbee_runtime::ota::{OtaConfig, OtaManager};
 
@@ -498,10 +594,18 @@ fn ota_manager_full_download_flow() {
     end_resp[2..4].copy_from_slice(&0x0001u16.to_le_bytes());
     end_resp[4..8].copy_from_slice(&0x00000002u32.to_le_bytes());
     end_resp[8..12].copy_from_slice(&1000u32.to_le_bytes()); // current_time
-    end_resp[12..16].copy_from_slice(&0u32.to_le_bytes()); // upgrade NOW
+    end_resp[12..16].copy_from_slice(&u32::MAX.to_le_bytes()); // wait for later command
 
     let event = mgr.handle_incoming(0x07, &end_resp, None);
-    assert!(event.is_some()); // OtaComplete
+    assert!(event.is_none());
+    assert_eq!(mgr.state(), OtaState::WaitingUpgradeCommand);
+    assert!(mgr.tick(120).is_none());
+    assert_eq!(mgr.state(), OtaState::WaitingUpgradeCommand);
+
+    end_resp[12..16].copy_from_slice(&0u32.to_le_bytes()); // upgrade NOW
+    let event = mgr.handle_incoming(0x07, &end_resp, None);
+    assert!(matches!(event, Some(StackEvent::OtaComplete)));
+    mgr.activate().unwrap();
 }
 
 #[test]
@@ -530,10 +634,10 @@ fn ota_manager_rejects_wrong_manufacturer() {
     mgr.start_query();
     mgr.take_pending_frame();
 
-    // Query response
+    // Query response for this device, followed by an OTA header for another device.
     let mut resp = [0u8; 13];
     resp[0] = 0x00;
-    resp[1..3].copy_from_slice(&0x9999u16.to_le_bytes()); // wrong mfg in response too
+    resp[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
     resp[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
     resp[5..9].copy_from_slice(&0x00000002u32.to_le_bytes());
     resp[9..13].copy_from_slice(&ota_total.to_le_bytes());
@@ -545,7 +649,7 @@ fn ota_manager_rejects_wrong_manufacturer() {
     let chunk = &ota_file[..chunk_len];
     let mut block = [0u8; 80];
     block[0] = 0x00;
-    block[1..3].copy_from_slice(&0x9999u16.to_le_bytes());
+    block[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
     block[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
     block[5..9].copy_from_slice(&0x00000002u32.to_le_bytes());
     block[9..13].copy_from_slice(&0u32.to_le_bytes());
@@ -555,6 +659,38 @@ fn ota_manager_rejects_wrong_manufacturer() {
     let event = mgr.handle_incoming(0x05, &block[..14 + chunk_len], None);
     // Should get OtaFailed because manufacturer mismatch
     assert!(matches!(event, Some(StackEvent::OtaFailed)));
+    let failure_frame = mgr
+        .take_pending_frame()
+        .expect("failure Upgrade End Request must remain queued");
+    assert_eq!(failure_frame.zcl_data[2], CMD_UPGRADE_END_REQUEST.0);
+    assert_eq!(failure_frame.zcl_data[3], 0x96);
+}
+
+#[test]
+fn ota_manager_times_out_a_stalled_server_response() {
+    use zigbee_runtime::event_loop::StackEvent;
+    use zigbee_runtime::firmware_writer::MockFirmwareWriter;
+    use zigbee_runtime::ota::{OtaConfig, OtaManager};
+
+    let mut mgr = OtaManager::new(
+        MockFirmwareWriter::new(4096),
+        OtaConfig {
+            manufacturer_code: 0x1234,
+            image_type: 0x0001,
+            current_version: 1,
+            endpoint: 1,
+            block_size: 48,
+            auto_accept: true,
+            hardware_version: None,
+        },
+    );
+    mgr.start_query();
+    let _ = mgr.take_pending_frame();
+
+    assert!(mgr.tick(119).is_none());
+    assert_eq!(mgr.state(), OtaState::QuerySent);
+    assert!(matches!(mgr.tick(1), Some(StackEvent::OtaFailed)));
+    assert_eq!(mgr.state(), OtaState::Idle);
 }
 
 #[test]
@@ -599,9 +735,9 @@ fn ota_wait_for_data_resumes_download() {
     wait[0] = 0x97; // WAIT_FOR_DATA status
     wait[1..5].copy_from_slice(&1000u32.to_le_bytes());
     wait[5..9].copy_from_slice(&1010u32.to_le_bytes());
-    wait[9..11].copy_from_slice(&5u16.to_le_bytes()); // wait 5 seconds
+    wait[9..11].copy_from_slice(&500u16.to_le_bytes()); // 500 ms minimum block period
     let action = cluster.process_server_command(0x05, &wait);
-    assert!(matches!(action, OtaAction::Wait(5)));
+    assert!(matches!(action, OtaAction::Wait(10)));
     assert!(matches!(
         cluster.state(),
         OtaState::WaitForData {
@@ -615,8 +751,8 @@ fn ota_wait_for_data_resumes_download() {
     let action = cluster.tick(3);
     assert!(matches!(action, OtaAction::None));
 
-    // Tick 3 more seconds — should resume with block request at offset=48
-    let action = cluster.tick(3);
+    // Tick 7 more seconds — should resume with block request at offset=48
+    let action = cluster.tick(7);
     match action {
         OtaAction::SendBlockRequest(req) => {
             assert_eq!(req.file_offset, 48);
@@ -628,4 +764,31 @@ fn ota_wait_for_data_resumes_download() {
         cluster.state(),
         OtaState::Downloading { offset: 48, .. }
     ));
+}
+
+#[test]
+fn ota_upgrade_time_in_the_past_activates_immediately() {
+    let mut cluster = OtaCluster::new(0x1234, 0x0001, 1);
+    cluster.start_query();
+    let mut query_response = [0u8; 13];
+    query_response[0] = 0x00;
+    query_response[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    query_response[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    query_response[5..9].copy_from_slice(&2u32.to_le_bytes());
+    query_response[9..13].copy_from_slice(&128u32.to_le_bytes());
+    let _ = cluster.process_server_command(CMD_QUERY_NEXT_IMAGE_RESPONSE.0, &query_response);
+    let _ = cluster.mark_verified();
+
+    let mut response = [0u8; 16];
+    response[0..2].copy_from_slice(&0x1234u16.to_le_bytes());
+    response[2..4].copy_from_slice(&0x0001u16.to_le_bytes());
+    response[4..8].copy_from_slice(&2u32.to_le_bytes());
+    response[8..12].copy_from_slice(&100u32.to_le_bytes());
+    response[12..16].copy_from_slice(&99u32.to_le_bytes());
+
+    assert!(matches!(
+        cluster.process_server_command(CMD_UPGRADE_END_RESPONSE.0, &response),
+        OtaAction::ActivateImage
+    ));
+    assert_eq!(cluster.state(), OtaState::Done);
 }

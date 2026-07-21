@@ -75,6 +75,8 @@ pub enum OtaState {
     Verifying,
     /// Image verified, waiting for activation.
     WaitingActivate,
+    /// Server deferred activation until a later Upgrade End Response.
+    WaitingUpgradeCommand,
     /// Waiting for server-specified delay before retrying.
     WaitForData {
         /// Seconds to wait.
@@ -86,6 +88,8 @@ pub enum OtaState {
         /// Saved download total size.
         download_total: u32,
     },
+    /// Image is verified and waiting for the server-selected upgrade time.
+    WaitingUpgrade { delay_secs: u32, elapsed: u32 },
     /// OTA completed successfully.
     Done,
     /// OTA failed.
@@ -565,6 +569,22 @@ impl OtaCluster {
                     OtaAction::None
                 }
             }
+            OtaState::WaitingUpgrade {
+                delay_secs,
+                elapsed,
+            } => {
+                let new_elapsed = elapsed.saturating_add(elapsed_secs as u32);
+                if new_elapsed >= delay_secs {
+                    self.state = OtaState::Done;
+                    OtaAction::ActivateImage
+                } else {
+                    self.state = OtaState::WaitingUpgrade {
+                        delay_secs,
+                        elapsed: new_elapsed,
+                    };
+                    OtaAction::None
+                }
+            }
             _ => OtaAction::None,
         }
     }
@@ -575,7 +595,11 @@ impl OtaCluster {
             OtaState::Downloading { offset, total_size } if total_size > 0 => {
                 ((offset as u64 * 100) / total_size as u64) as u8
             }
-            OtaState::Verifying | OtaState::WaitingActivate | OtaState::Done => 100,
+            OtaState::Verifying
+            | OtaState::WaitingActivate
+            | OtaState::WaitingUpgradeCommand
+            | OtaState::WaitingUpgrade { .. }
+            | OtaState::Done => 100,
             _ => 0,
         }
     }
@@ -698,6 +722,15 @@ impl OtaCluster {
 
         let version = resp.file_version.unwrap_or(0);
         let size = resp.image_size.unwrap_or(0);
+        if resp.manufacturer_code != Some(self.manufacturer_code)
+            || resp.image_type != Some(self.image_type)
+            || version <= self.current_version
+            || size == 0
+        {
+            log::warn!("[OTA] Ignoring invalid Query Response image metadata");
+            self.state = OtaState::Idle;
+            return OtaAction::None;
+        }
 
         log::info!(
             "[OTA] New image available: version=0x{:08X} size={}",
@@ -744,7 +777,27 @@ impl OtaCluster {
 
         match parsed {
             ParsedBlockResponse::Success(block) => {
+                let expected_offset = match self.state {
+                    OtaState::Downloading { offset, .. }
+                    | OtaState::WaitForData {
+                        download_offset: offset,
+                        ..
+                    } => offset,
+                    _ => unreachable!(),
+                };
+                if block.manufacturer_code != self.manufacturer_code
+                    || block.image_type != self.image_type
+                    || block.file_version != self.target_version
+                    || block.file_offset != expected_offset
+                {
+                    log::warn!("[OTA] Ignoring block for a different image or offset");
+                    return OtaAction::None;
+                }
                 let new_offset = block.file_offset + block.data_size as u32;
+                if block.data_size == 0 || new_offset > self.target_size {
+                    log::warn!("[OTA] Rejecting empty or oversized image block");
+                    return self.mark_failed();
+                }
 
                 // Update state
                 let total = self.target_size;
@@ -768,20 +821,37 @@ impl OtaCluster {
                 }
             }
             ParsedBlockResponse::WaitForData(wait) => {
-                let delay = wait.minimum_block_period.max(1) as u32;
+                let delay = wait.request_time.saturating_sub(wait.current_time);
+                let _ = self.store.set(
+                    ATTR_MIN_BLOCK_PERIOD,
+                    ZclValue::U16(wait.minimum_block_period),
+                );
                 log::debug!("[OTA] Server says wait {} seconds", delay);
                 // Save current download position so we can resume
                 let (offset, total) = match self.state {
                     OtaState::Downloading { offset, total_size } => (offset, total_size),
-                    _ => (0, 0),
+                    OtaState::WaitForData {
+                        download_offset,
+                        download_total,
+                        ..
+                    } => (download_offset, download_total),
+                    _ => unreachable!(),
                 };
-                self.state = OtaState::WaitForData {
-                    delay_secs: delay,
-                    elapsed: 0,
-                    download_offset: offset,
-                    download_total: total,
-                };
-                OtaAction::Wait(delay)
+                if delay == 0 {
+                    self.state = OtaState::Downloading {
+                        offset,
+                        total_size: total,
+                    };
+                    self.build_block_request(offset, total)
+                } else {
+                    self.state = OtaState::WaitForData {
+                        delay_secs: delay,
+                        elapsed: 0,
+                        download_offset: offset,
+                        download_total: total,
+                    };
+                    OtaAction::Wait(delay)
+                }
             }
             ParsedBlockResponse::Error(status) => {
                 log::warn!("[OTA] Block response error: 0x{:02X}", status);
@@ -792,6 +862,13 @@ impl OtaCluster {
     }
 
     fn handle_end_response(&mut self, payload: &[u8]) -> OtaAction {
+        if !matches!(
+            self.state,
+            OtaState::WaitingActivate | OtaState::WaitingUpgradeCommand
+        ) {
+            log::warn!("[OTA] Ignoring End Response outside WaitingActivate");
+            return OtaAction::None;
+        }
         let resp = match UpgradeEndResponse::parse(payload) {
             Some(r) => r,
             None => {
@@ -799,19 +876,35 @@ impl OtaCluster {
                 return OtaAction::None;
             }
         };
+        if resp.manufacturer_code != self.manufacturer_code
+            || resp.image_type != self.image_type
+            || resp.file_version != self.target_version
+        {
+            log::warn!("[OTA] Ignoring End Response for a different image");
+            return OtaAction::None;
+        }
 
         // upgrade_time == 0 means upgrade immediately
         // upgrade_time == 0xFFFFFFFF means wait for another command
-        if resp.upgrade_time == 0 || resp.upgrade_time == resp.current_time {
+        if resp.upgrade_time == 0xFFFFFFFF {
+            log::info!("[OTA] Server says wait for signal");
+            self.state = OtaState::WaitingUpgradeCommand;
+            OtaAction::None
+        } else if resp.upgrade_time == 0 || resp.upgrade_time <= resp.current_time {
             log::info!("[OTA] Server says upgrade NOW");
             self.state = OtaState::Done;
             OtaAction::ActivateImage
-        } else if resp.upgrade_time == 0xFFFFFFFF {
-            log::info!("[OTA] Server says wait for signal");
-            OtaAction::None
         } else {
             let delay = resp.upgrade_time.saturating_sub(resp.current_time);
             log::info!("[OTA] Server says upgrade in {} seconds", delay);
+            self.state = OtaState::WaitingUpgrade {
+                delay_secs: delay,
+                elapsed: 0,
+            };
+            let _ = self.store.set(
+                ATTR_IMAGE_UPGRADE_STATUS,
+                ZclValue::Enum8(STATUS_COUNT_DOWN),
+            );
             OtaAction::Wait(delay)
         }
     }
@@ -865,10 +958,8 @@ impl Cluster for OtaCluster {
         // process_server_command() — here we just validate the command is known.
         match cmd_id.0 {
             0x00 | 0x02 | 0x05 | 0x07 => {
-                // Known server→client commands: ImageNotify, QueryResponse,
-                // BlockResponse, EndResponse — processed via process_server_command()
-                let _ = self.process_server_command(cmd_id.0, payload);
-                // Return empty response — OTA doesn't send ZCL default responses
+                // The runtime processes the command after preserving its APS source.
+                let _ = payload;
                 Ok(heapless::Vec::new())
             }
             _ => Err(ZclStatus::UnsupClusterCommand),

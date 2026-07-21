@@ -7,10 +7,16 @@ use embassy_futures::select;
 use embassy_time::{Duration, Instant, Timer};
 use zigbee_mac::efr32::Efr32Mac;
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
+#[cfg(feature = "ota")]
+use zigbee_runtime::ota::OtaManager;
 use zigbee_runtime::security_store::{SecurityStateStore, SecurityStoreError};
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
+#[cfg(feature = "ota")]
+use zigbee_types::ShortAddress;
 use zigbee_zcl::ClusterId;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
+#[cfg(feature = "ota")]
+use zigbee_zcl::clusters::ota::{CMD_IMAGE_NOTIFY, OtaState};
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 use zigbee_zcl::data_types::{ZclDataType, ZclValue};
@@ -28,6 +34,29 @@ const SLOW_POLL_SECS: u64 = 30;
 const FAST_POLL_DURATION_SECS: u64 = 120;
 const RESTORED_FAST_POLL_SECS: u64 = 60;
 const EXPECTED_REPORT_CLUSTERS: usize = 3;
+macro_rules! application_clusters {
+    ($app:expr) => {
+        [
+            ClusterRef {
+                endpoint: 1,
+                cluster: &mut *$app.temp_cluster,
+            },
+            ClusterRef {
+                endpoint: 1,
+                cluster: &mut *$app.hum_cluster,
+            },
+            ClusterRef {
+                endpoint: 1,
+                cluster: &mut *$app.power_cluster,
+            },
+            #[cfg(feature = "ota")]
+            ClusterRef {
+                endpoint: 1,
+                cluster: $app.ota.cluster_mut(),
+            },
+        ]
+    };
+}
 
 pub struct SensorApp {
     device: &'static mut ZigbeeDevice<Efr32Mac>,
@@ -50,6 +79,12 @@ pub struct SensorApp {
     needs_bootstrap_join: bool,
     awaiting_initial_configuration: bool,
     restoring_commissioned_state: bool,
+    #[cfg(feature = "ota")]
+    ota: OtaManager<efr32mg1_tradfri::ota::Efr32FirmwareWriter>,
+    #[cfg(feature = "ota")]
+    ota_server: Option<(u16, u8)>,
+    #[cfg(feature = "ota")]
+    ota_cleanup_pending: bool,
 }
 
 impl SensorApp {
@@ -61,6 +96,7 @@ impl SensorApp {
         temp_cluster: &'static mut TemperatureCluster,
         hum_cluster: &'static mut HumidityCluster,
         power_cluster: &'static mut PowerConfigCluster,
+        #[cfg(feature = "ota")] ota: OtaManager<efr32mg1_tradfri::ota::Efr32FirmwareWriter>,
     ) -> Self {
         let now = Instant::now();
         let joined = device.is_joined();
@@ -89,6 +125,12 @@ impl SensorApp {
             needs_bootstrap_join: !joined,
             awaiting_initial_configuration: false,
             restoring_commissioned_state: false,
+            #[cfg(feature = "ota")]
+            ota,
+            #[cfg(feature = "ota")]
+            ota_server: None,
+            #[cfg(feature = "ota")]
+            ota_cleanup_pending: false,
         }
     }
 
@@ -112,6 +154,7 @@ impl SensorApp {
 
                 if !self.awaiting_initial_configuration
                     && !self.device.is_identifying(1)
+                    && !self.ota_active()
                     && Instant::now() >= self.fast_poll_until
                     && self.sleep_joined_until_next_poll()
                 {
@@ -228,20 +271,7 @@ impl SensorApp {
         let tick_result = {
             let device = &mut *self.device;
             let security_store = &mut *self.security_store;
-            let mut clusters = [
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut *self.temp_cluster,
-                },
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut *self.hum_cluster,
-                },
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut *self.power_cluster,
-                },
-            ];
+            let mut clusters = application_clusters!(self);
             device
                 .tick_with_security_store(0, &mut clusters, security_store)
                 .await
@@ -269,6 +299,7 @@ impl SensorApp {
     fn update_fast_poll_window(&mut self, now: Instant) -> u64 {
         let in_fast_poll = self.awaiting_initial_configuration
             || self.device.is_identifying(1)
+            || self.ota_active()
             || now < self.fast_poll_until;
         if self.was_fast_polling && !in_fast_poll {
             self.was_fast_polling = false;
@@ -292,20 +323,7 @@ impl SensorApp {
             let result = {
                 let device = &mut *self.device;
                 let security_store = &mut *self.security_store;
-                let mut clusters = [
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut *self.temp_cluster,
-                    },
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut *self.hum_cluster,
-                    },
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut *self.power_cluster,
-                    },
-                ];
+                let mut clusters = application_clusters!(self);
                 device
                     .tick_with_security_store(0, &mut clusters, security_store)
                     .await
@@ -354,20 +372,7 @@ impl SensorApp {
         let event = {
             let device = &mut *self.device;
             let security_store = &mut *self.security_store;
-            let mut clusters = [
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut *self.temp_cluster,
-                },
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut *self.hum_cluster,
-                },
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut *self.power_cluster,
-                },
-            ];
+            let mut clusters = application_clusters!(self);
             device
                 .process_incoming_with_security_store(indication, &mut clusters, security_store)
                 .await
@@ -378,6 +383,10 @@ impl SensorApp {
         };
 
         if let Some(event) = event {
+            #[cfg(feature = "ota")]
+            if self.process_ota_event(&event).await {
+                return false;
+            }
             match event {
                 StackEvent::RejoinRequested => {
                     let _ = self.secure_rejoin().await;
@@ -402,20 +411,7 @@ impl SensorApp {
         let result = {
             let device = &mut *self.device;
             let security_store = &mut *self.security_store;
-            let mut clusters = [
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut *self.temp_cluster,
-                },
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut *self.hum_cluster,
-                },
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut *self.power_cluster,
-                },
-            ];
+            let mut clusters = application_clusters!(self);
             device
                 .tick_with_security_store(0, &mut clusters, security_store)
                 .await
@@ -510,20 +506,7 @@ impl SensorApp {
         let result = {
             let device = &mut *self.device;
             let security_store = &mut *self.security_store;
-            let mut clusters = [
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut *self.temp_cluster,
-                },
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut *self.hum_cluster,
-                },
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut *self.power_cluster,
-                },
-            ];
+            let mut clusters = application_clusters!(self);
             device
                 .tick_with_security_store(elapsed, &mut clusters, security_store)
                 .await
@@ -535,6 +518,9 @@ impl SensorApp {
             Ok(_) => {}
             Err(error) => persistence_failure(error),
         }
+
+        #[cfg(feature = "ota")]
+        self.service_ota(elapsed).await;
 
         if self.annce_retries_left > 0 && now.duration_since(self.last_annce).as_secs() >= 8 {
             self.annce_retries_left -= 1;
@@ -558,6 +544,122 @@ impl SensorApp {
         if self.needs_checkpoint {
             self.needs_checkpoint = false;
             self.checkpoint_security();
+        }
+    }
+
+    #[cfg(feature = "ota")]
+    fn ota_active(&self) -> bool {
+        matches!(
+            self.ota.state(),
+            OtaState::QuerySent
+                | OtaState::Downloading { .. }
+                | OtaState::Verifying
+                | OtaState::WaitingActivate
+        )
+    }
+
+    #[cfg(not(feature = "ota"))]
+    const fn ota_active(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "ota")]
+    async fn process_ota_event(&mut self, event: &StackEvent) -> bool {
+        let StackEvent::CommandReceived {
+            src_addr,
+            source_endpoint,
+            endpoint,
+            cluster_id,
+            command_id,
+            payload,
+            ..
+        } = event
+        else {
+            return false;
+        };
+        if *cluster_id != ClusterId::OTA_UPGRADE.0 {
+            return false;
+        }
+        if *endpoint != 1 {
+            return true;
+        }
+
+        let sender = (*src_addr, *source_endpoint);
+        match self.ota_server {
+            Some(server) if server != sender => return true,
+            None if *command_id != CMD_IMAGE_NOTIFY.0 => return true,
+            None => self.ota_server = Some(sender),
+            Some(_) => {}
+        }
+        self.fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+        let ota_event = self
+            .ota
+            .handle_incoming(*command_id, payload.as_slice(), None);
+        self.handle_ota_status(ota_event);
+        self.send_pending_ota().await;
+        if self.ota.state() == OtaState::Idle {
+            self.ota_server = None;
+        }
+        true
+    }
+
+    #[cfg(feature = "ota")]
+    async fn service_ota(&mut self, elapsed_secs: u16) {
+        let event = self.ota.tick(elapsed_secs);
+        self.handle_ota_status(event);
+        self.send_pending_ota().await;
+    }
+
+    #[cfg(feature = "ota")]
+    fn handle_ota_status(&mut self, event: Option<StackEvent>) {
+        match event {
+            Some(StackEvent::OtaImageAvailable { .. })
+            | Some(StackEvent::OtaProgress { .. })
+            | Some(StackEvent::OtaDelayedActivation { .. }) => {
+                self.fast_poll_until =
+                    Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+            }
+            Some(StackEvent::OtaFailed) => self.ota_cleanup_pending = true,
+            Some(StackEvent::OtaComplete) => {
+                self.checkpoint_security();
+                if self.ota.activate().is_err() {
+                    self.ota_cleanup_pending = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(feature = "ota")]
+    async fn send_pending_ota(&mut self) {
+        if let Some(frame) = self.ota.take_pending_frame() {
+            let Some((server, endpoint)) = self.ota_server else {
+                self.ota.abort();
+                self.ota_cleanup_pending = false;
+                return;
+            };
+            if self
+                .device
+                .send_zcl_frame(
+                    ShortAddress(server),
+                    endpoint,
+                    frame.endpoint,
+                    frame.cluster_id,
+                    frame.zcl_data.as_slice(),
+                )
+                .await
+                .is_err()
+            {
+                self.ota.abort();
+                self.ota_server = None;
+                self.ota_cleanup_pending = false;
+                return;
+            }
+        }
+        if self.ota_cleanup_pending {
+            self.ota.abort();
+            self.ota_server = None;
+            self.ota_cleanup_pending = false;
         }
     }
 

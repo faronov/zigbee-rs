@@ -41,6 +41,18 @@ path = "src/bin/diag_spi.rs"
 name = "efr32mg1-diag-pwm"
 path = "src/bin/diag_pwm.rs"
 
+[[bin]]
+name = "efr32mg1-diag-ota-storage"
+path = "src/bin/diag_ota_storage.rs"
+
+[[bin]]
+name = "efr32mg1-diag-ota-write"
+path = "src/bin/diag_ota_write.rs"
+
+[[bin]]
+name = "efr32mg1-diag-ota-install"
+path = "src/bin/diag_ota_install.rs"
+
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["efr32", "efr32-trace"] }

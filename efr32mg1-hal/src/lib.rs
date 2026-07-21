@@ -7,6 +7,7 @@
 extern crate std;
 
 pub mod adc;
+pub mod bootloader;
 pub mod clock;
 pub mod flash;
 pub mod gpio;

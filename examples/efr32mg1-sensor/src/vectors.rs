@@ -30,7 +30,7 @@ pub static APP_PROPERTIES: ApplicationProperties = ApplicationProperties {
     signature_type: 0,
     signature_location: 0xFFFF_FFFF,
     app_type: 1,
-    app_version: 1,
+    app_version: crate::FIRMWARE_VERSION,
     app_capabilities: 0,
     app_product_id: [0; 16],
 };

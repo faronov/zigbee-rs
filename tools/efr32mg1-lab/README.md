@@ -17,6 +17,9 @@ package has no feature-selected entry points.
 | `efr32mg1-diag-beacon` | Bounded raw TX gate followed by active scans |
 | `efr32mg1-diag-spi` | Read-only USART0/SPI JEDEC-ID probe on the external flash |
 | `efr32mg1-diag-pwm` | TIMER0 CC0 PWM fade on the PA0 LED |
+| `efr32mg1-diag-ota-storage` | Read-only resident Gecko bootloader/storage/slot probe |
+| `efr32mg1-diag-ota-write` | Destructive external OTA-slot erase/write/readback gate |
+| `efr32mg1-diag-ota-install` | One-shot GBL staging, verification, and bootloader install gate |
 
 Build from this directory so `.cargo/config.toml` supplies the target and
 bootloader-safe linker script:
@@ -31,6 +34,10 @@ cargo build --release --bin efr32mg1-diag-join
 cargo build --release --bin efr32mg1-diag-beacon
 cargo build --release --bin efr32mg1-diag-spi
 cargo build --release --bin efr32mg1-diag-pwm
+cargo build --release --bin efr32mg1-diag-ota-storage
+cargo build --release --bin efr32mg1-diag-ota-write
+EFR32_GBL_PATH=/absolute/path/update.gbl \
+  cargo build --release --bin efr32mg1-diag-ota-install
 ```
 
 Verify each ELF before producing a HEX:
@@ -38,6 +45,8 @@ Verify each ELF before producing a HEX:
 ```bash
 tools/verify-layout.py \
   target/thumbv7em-none-eabi/release/efr32mg1-diag-em2
+tools/verify-layout.py \
+  target/thumbv7em-none-eabi/release/efr32mg1-diag-ota-storage
 ```
 
 ## Memory and flash safety
@@ -50,10 +59,19 @@ tools/verify-layout.py \
 0x0003A000..0x0003FFFF  existing native NVM3
 ```
 
-Only `efr32mg1-diag-nv` intentionally writes flash, and only in
-`0x39000..0x39FFF`. `diag-spi` sends only the read-JEDEC-ID command and does
-not alter the external flash. No command in this package flashes hardware.
-Never use a mass erase with this layout.
+`efr32mg1-diag-nv` writes only `0x39000..0x39FFF`.
+`diag-ota-write` intentionally erases and programs external Gecko OTA slot 0,
+checks a write crossing offset 256, and erases the slot again before halting.
+It never requests activation. `diag-ota-install` is a one-shot destructive
+gate: it embeds the GBL named by `EFR32_GBL_PATH`, replaces external slot 0,
+verifies it with the resident parser, and immediately resets into the
+bootloader to install it. Use it only with a separately verified application-
+only GBL that remains below the internal journal boundary. `diag-spi` sends
+only the read-JEDEC-ID command.
+`diag-ota-storage` calls only Gecko bootloader discovery, init, information,
+slot-read, and deinit APIs; it does not erase/program storage, alter the
+bootload list, or request installation. No command in this package flashes
+hardware. Never use a mass erase with this layout.
 
 The binaries compile shared vector, application-properties, panic/fault-log,
 and RTCC time-driver source directly into each final ELF. `diag-em2` excludes

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 autobins = false
 
+[features]
+default = []
+ota = ["zigbee-runtime/ota"]
+
 [[bin]]
 name = "efr32mg1-sensor"
 path = "src/main.rs"

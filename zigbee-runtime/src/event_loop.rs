@@ -61,6 +61,9 @@ pub enum StackEvent {
     /// Command received from another device.
     CommandReceived {
         src_addr: u16,
+        /// Remote APS endpoint that sent the command.
+        source_endpoint: u8,
+        /// Local endpoint that received the command.
         endpoint: u8,
         cluster_id: u16,
         command_id: u8,
@@ -88,7 +91,7 @@ pub enum StackEvent {
     OtaImageAvailable { version: u32, size: u32 },
     /// OTA: Download progress update.
     OtaProgress { percent: u8 },
-    /// OTA: Upgrade completed successfully — reboot to apply.
+    /// OTA: Image is verified and ready for application-controlled activation.
     OtaComplete,
     /// OTA: Upgrade failed.
     OtaFailed,

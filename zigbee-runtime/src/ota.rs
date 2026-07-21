@@ -22,6 +22,8 @@ use zigbee_zcl::clusters::ota_image::{OtaImageHeader, OtaSubElement, OtaTagId};
 use zigbee_zcl::frame::ZclFrame;
 use zigbee_zcl::{ClusterDirection, CommandId};
 
+const OTA_RESPONSE_TIMEOUT_SECS: u32 = 120;
+
 /// OTA configuration.
 #[derive(Debug, Clone)]
 pub struct OtaConfig {
@@ -88,6 +90,10 @@ pub struct OtaManager<F: FirmwareWriter> {
     download_ctx: OtaDownloadCtx,
     /// Whether an image query was accepted (for auto_accept=false mode).
     query_pending_accept: bool,
+    /// Time spent waiting for the next OTA server response.
+    response_wait_secs: u32,
+    /// Whether the verified image is waiting for application-controlled activation.
+    activation_pending: bool,
 }
 
 /// Tracks OTA file header parsing and firmware write offset during download.
@@ -150,6 +156,8 @@ impl<F: FirmwareWriter> OtaManager<F> {
             zcl_seq: 0,
             download_ctx: OtaDownloadCtx::new(),
             query_pending_accept: false,
+            response_wait_secs: 0,
+            activation_pending: false,
         }
     }
 
@@ -174,8 +182,15 @@ impl<F: FirmwareWriter> OtaManager<F> {
         &self.cluster
     }
 
+    /// Get mutable access to the OTA cluster for runtime attribute dispatch.
+    pub fn cluster_mut(&mut self) -> &mut OtaCluster {
+        &mut self.cluster
+    }
+
     /// Initiate an OTA image query.
     pub fn start_query(&mut self) -> Option<StackEvent> {
+        self.response_wait_secs = 0;
+        self.activation_pending = false;
         let action = self.cluster.start_query();
         self.process_action(action)
     }
@@ -189,6 +204,7 @@ impl<F: FirmwareWriter> OtaManager<F> {
         payload: &[u8],
         server_ieee: Option<u64>,
     ) -> Option<StackEvent> {
+        self.response_wait_secs = 0;
         // Update UpgradeServerID from the server that sent us a command
         if let Some(ieee) = server_ieee {
             self.cluster.set_upgrade_server_id(ieee);
@@ -199,6 +215,22 @@ impl<F: FirmwareWriter> OtaManager<F> {
 
     /// Tick the OTA engine (called from runtime tick).
     pub fn tick(&mut self, elapsed_secs: u16) -> Option<StackEvent> {
+        if matches!(
+            self.cluster.state(),
+            OtaState::QuerySent
+                | OtaState::Downloading { .. }
+                | OtaState::Verifying
+                | OtaState::WaitingActivate
+        ) {
+            self.response_wait_secs = self.response_wait_secs.saturating_add(elapsed_secs as u32);
+            if self.response_wait_secs >= OTA_RESPONSE_TIMEOUT_SECS {
+                self.abort();
+                return Some(StackEvent::OtaFailed);
+            }
+        } else {
+            self.response_wait_secs = 0;
+        }
+
         // Handle pending next-block request after a write
         if self.need_next_block {
             self.need_next_block = false;
@@ -221,7 +253,6 @@ impl<F: FirmwareWriter> OtaManager<F> {
                     }
                     Err(e) => {
                         log::warn!("[OTA] Verify failed: {:?}", e);
-                        let _ = self.writer.abort();
                         let action = self.cluster.mark_failed();
                         return self.process_action(action);
                     }
@@ -243,6 +274,16 @@ impl<F: FirmwareWriter> OtaManager<F> {
         self.pending_frame.take()
     }
 
+    /// Activate a verified image after the application has persisted any state
+    /// that must survive the bootloader reset.
+    pub fn activate(&mut self) -> Result<(), crate::firmware_writer::FirmwareError> {
+        if !self.activation_pending {
+            return Err(crate::firmware_writer::FirmwareError::ActivateFailed);
+        }
+        self.activation_pending = false;
+        self.writer.activate()
+    }
+
     /// Abort the current OTA.
     pub fn abort(&mut self) {
         self.cluster.abort();
@@ -251,6 +292,8 @@ impl<F: FirmwareWriter> OtaManager<F> {
         self.need_next_block = false;
         self.download_ctx.reset();
         self.query_pending_accept = false;
+        self.response_wait_secs = 0;
+        self.activation_pending = false;
     }
 
     /// Accept a pending OTA image (for auto_accept=false mode).
@@ -336,23 +379,20 @@ impl<F: FirmwareWriter> OtaManager<F> {
                 }
                 Err(e) => {
                     log::warn!("[OTA] Write failed at offset {}: {:?}", offset, e);
-                    let _ = self.writer.abort();
                     let fail_action = self.cluster.mark_failed();
                     self.process_action(fail_action);
                     Some(StackEvent::OtaFailed)
                 }
             },
             OtaAction::SendEndRequest(req) => {
+                let failed = req.status != 0;
                 self.build_and_queue_end_request(&req);
-                None
+                failed.then_some(StackEvent::OtaFailed)
             }
-            OtaAction::ActivateImage => match self.writer.activate() {
-                Ok(()) => Some(StackEvent::OtaComplete),
-                Err(e) => {
-                    log::warn!("[OTA] Activate failed: {:?}", e);
-                    Some(StackEvent::OtaFailed)
-                }
-            },
+            OtaAction::ActivateImage => {
+                self.activation_pending = true;
+                Some(StackEvent::OtaComplete)
+            }
             OtaAction::Wait(secs) => Some(StackEvent::OtaDelayedActivation { delay_secs: secs }),
             OtaAction::None => None,
         }

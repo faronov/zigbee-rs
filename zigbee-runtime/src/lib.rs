@@ -2327,6 +2327,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
+                source_endpoint: aps_indication.src_endpoint,
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
@@ -2396,6 +2397,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
+                source_endpoint: aps_indication.src_endpoint,
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
@@ -2483,6 +2485,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
+                source_endpoint: aps_indication.src_endpoint,
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
@@ -2524,6 +2527,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
+                source_endpoint: aps_indication.src_endpoint,
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
@@ -2566,6 +2570,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
+                source_endpoint: aps_indication.src_endpoint,
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
@@ -2597,6 +2602,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
+                source_endpoint: aps_indication.src_endpoint,
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
@@ -2636,6 +2642,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
+                source_endpoint: aps_indication.src_endpoint,
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
@@ -2677,6 +2684,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
+                source_endpoint: aps_indication.src_endpoint,
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
@@ -2718,6 +2726,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
+                source_endpoint: aps_indication.src_endpoint,
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
@@ -2757,6 +2766,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
+                source_endpoint: aps_indication.src_endpoint,
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
@@ -2788,6 +2798,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             if zcl_frame.header.direction() == ClusterDirection::ServerToClient {
                 return Some(event_loop::StackEvent::CommandReceived {
                     src_addr,
+                    source_endpoint: aps_indication.src_endpoint,
                     endpoint: dst_ep,
                     cluster_id,
                     command_id: cmd_id,
@@ -2983,6 +2994,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
+                source_endpoint: aps_indication.src_endpoint,
                 endpoint: dst_ep,
                 cluster_id,
                 command_id: cmd_id,
@@ -3008,6 +3020,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         }
         Some(event_loop::StackEvent::CommandReceived {
             src_addr,
+            source_endpoint: aps_indication.src_endpoint,
             endpoint: dst_ep,
             cluster_id,
             command_id: cmd_id,

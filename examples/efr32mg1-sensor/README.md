@@ -2,7 +2,8 @@
 
 Pure-Rust production firmware for the connected
 `EFR32MG1P132F256IM32`. This package has one unconditional binary and no
-profile-selection features.
+profile-selection modes. The optional `ota` feature adds the OTA Upgrade
+client without changing the default production image.
 
 The firmware is a Zigbee temperature/humidity sleepy end device with:
 
@@ -38,6 +39,23 @@ rust-objcopy -O ihex \
 
 No command here flashes hardware. Never use `device masserase` for this
 layout.
+
+## OTA image
+
+The OTA client stages a Gecko Bootloader GBL in the 256 KiB external flash,
+keeps the SED in fast-poll mode during transfer, verifies the GBL with the
+resident bootloader, checkpoints Zigbee security state, and then resets into
+the bootloader for installation.
+
+Build a versioned GBL and Zigbee OTA container with Simplicity Commander:
+
+```bash
+tools/create-ota.sh 2
+```
+
+This produces `target/ota/efr32mg1-sensor-v2.{s37,gbl,ota}`. The numeric
+version is compiled into both `APP_PROPERTIES` and the OTA client attributes;
+it must be higher than the version currently installed on the device.
 
 ## Fixed board configuration
 

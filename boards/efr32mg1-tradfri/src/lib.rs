@@ -2,6 +2,7 @@
 
 #![no_std]
 
+pub mod ota;
 pub mod storage;
 
 use efr32mg1_hal::{
