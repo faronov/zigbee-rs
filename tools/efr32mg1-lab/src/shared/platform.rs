@@ -9,7 +9,7 @@ macro_rules! init_small {
         let channels = rtt_target::rtt_init! {
             up: {
                 0: {
-                    size: 256,
+                    size: 64,
                     mode: rtt_target::ChannelMode::NoBlockSkip,
                     name: "Terminal"
                 }

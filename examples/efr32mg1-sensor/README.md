@@ -2,8 +2,8 @@
 
 Pure-Rust production firmware for the connected
 `EFR32MG1P132F256IM32`. This package has one unconditional binary and no
-profile-selection modes. The optional `ota` feature adds the OTA Upgrade
-client without changing the default production image.
+profile-selection modes. The production image always includes the OTA Upgrade
+client and external-flash staging support.
 
 The firmware is a Zigbee temperature/humidity sleepy end device with:
 

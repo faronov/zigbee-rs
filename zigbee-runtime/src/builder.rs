@@ -44,6 +44,7 @@ pub struct DeviceBuilder<M: MacDriver> {
     power_source: PowerSource,
     channel_mask: ChannelMask,
     power_mode: PowerMode,
+    automatic_polling: bool,
     concentrator: Option<(zigbee_nwk::routing::ConcentratorType, u16, u8)>,
 }
 
@@ -60,6 +61,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             power_source: PowerSource::Unknown,
             channel_mask: ChannelMask::ALL_2_4GHZ,
             power_mode: PowerMode::AlwaysOn,
+            automatic_polling: true,
             concentrator: None,
         }
     }
@@ -109,6 +111,15 @@ impl<M: MacDriver> DeviceBuilder<M> {
     /// Set the power mode (AlwaysOn, Sleepy, DeepSleep).
     pub fn power_mode(mut self, mode: PowerMode) -> Self {
         self.power_mode = mode;
+        self
+    }
+
+    /// Enable or disable parent polling from `tick()`.
+    ///
+    /// Disable this when the application owns the SED poll loop and calls
+    /// [`ZigbeeDevice::poll`] directly.
+    pub fn automatic_polling(mut self, enabled: bool) -> Self {
+        self.automatic_polling = enabled;
         self
     }
 
@@ -229,6 +240,8 @@ impl<M: MacDriver> DeviceBuilder<M> {
             endpoints: self.endpoints,
             reporting: ReportingEngine::new(),
             power: PowerManager::new(self.power_mode),
+            power_now_ms: 0,
+            automatic_polling: self.automatic_polling,
             pending_action: None,
             zcl_seq: 0,
             basic_cluster: BasicCluster::new(
@@ -264,6 +277,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             power_source,
             channel_mask,
             power_mode,
+            automatic_polling,
             concentrator,
         } = self;
 
@@ -328,6 +342,8 @@ impl<M: MacDriver> DeviceBuilder<M> {
             core::ptr::addr_of_mut!((*dst).endpoints).write(endpoints);
             core::ptr::addr_of_mut!((*dst).reporting).write(ReportingEngine::new());
             core::ptr::addr_of_mut!((*dst).power).write(PowerManager::new(power_mode));
+            core::ptr::addr_of_mut!((*dst).power_now_ms).write(0);
+            core::ptr::addr_of_mut!((*dst).automatic_polling).write(automatic_polling);
             core::ptr::addr_of_mut!((*dst).pending_action).write(None);
             core::ptr::addr_of_mut!((*dst).zcl_seq).write(0);
             core::ptr::addr_of_mut!((*dst).basic_cluster).write(BasicCluster::new(

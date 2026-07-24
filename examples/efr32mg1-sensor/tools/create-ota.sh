@@ -31,7 +31,7 @@ PY
 )
 
 mkdir -p "$OUTPUT_DIR"
-EFR32_OTA_VERSION=$VERSION_DEC cargo build --release --features ota
+EFR32_OTA_VERSION=$VERSION_DEC cargo build --release
 ELF=target/thumbv7em-none-eabi/release/efr32mg1-sensor
 tools/verify-layout.py "$ELF"
 

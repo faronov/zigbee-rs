@@ -40,6 +40,19 @@ use zigbee_zcl::{ClusterDirection, CommandId};
 
 use crate::UserAction;
 
+fn advance_millis(now_ms: u32, elapsed_secs: u16) -> u32 {
+    now_ms.wrapping_add((elapsed_secs as u32) * 1000)
+}
+
+fn automatic_poll_due(
+    automatic_polling: bool,
+    sleepy: bool,
+    commissioning_active: bool,
+    interval_due: bool,
+) -> bool {
+    automatic_polling && sleepy && (commissioning_active || interval_due)
+}
+
 /// Events that the stack can generate for the application.
 #[derive(Debug)]
 pub enum StackEvent {
@@ -195,9 +208,42 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         self.send_due_reports(clusters).await;
         self.update_pending_tx_flag();
 
-        let now_ms = (elapsed_secs as u32) * 1000;
-        self.run_sleepy_poll(now_ms).await;
-        self.tick_power_state(now_ms)
+        let now_ms = self.advance_power_clock(elapsed_secs);
+        let result = if let Some(event) = self.run_sleepy_poll(now_ms, clusters).await {
+            TickResult::Event(event)
+        } else {
+            self.tick_power_state(now_ms)
+        };
+        self.advance_commissioning(result).await
+    }
+
+    /// Advance post-network commissioning without a durable security store.
+    ///
+    /// This is the platform-independent equivalent of GSDK's scheduled
+    /// update-tc-link-key event: normal ZDO/ZCL and polling work runs first,
+    /// then one bounded security step is performed.
+    async fn advance_commissioning(&mut self, result: TickResult) -> TickResult {
+        if matches!(result, TickResult::Event(_)) || !self.bdb.tclk_exchange_active() {
+            return result;
+        }
+
+        match self.bdb.advance_tclk_exchange(None).await {
+            zigbee_bdb::TclkProgress::InProgress => {
+                if matches!(result, TickResult::Idle) {
+                    TickResult::RunAgain(Self::COMMISSIONING_POLL_MS)
+                } else {
+                    result
+                }
+            }
+            zigbee_bdb::TclkProgress::Complete => {
+                self.state_dirty = true;
+                TickResult::Event(StackEvent::CommissioningComplete { success: true })
+            }
+            zigbee_bdb::TclkProgress::Failed(_) => {
+                self.mark_left();
+                TickResult::Event(StackEvent::CommissioningComplete { success: false })
+            }
+        }
     }
 
     pub(crate) async fn tick_without_secure_rejoin(
@@ -296,8 +342,10 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         self.send_due_reports(clusters).await;
         self.update_pending_tx_flag();
 
-        let now_ms = (elapsed_secs as u32) * 1000;
-        self.run_sleepy_poll(now_ms).await;
+        let now_ms = self.advance_power_clock(elapsed_secs);
+        if let Some(event) = self.run_sleepy_poll(now_ms, clusters).await {
+            return TickResult::Event(event);
+        }
         self.tick_power_state(now_ms)
     }
 
@@ -364,13 +412,29 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
     }
 
     #[inline(never)]
-    async fn run_sleepy_poll(&mut self, now_ms: u32) {
-        if self.is_sleepy() && self.power.should_poll(now_ms) {
-            if let Ok(Some(_frame)) = self.bdb.zdo_mut().nwk_mut().mac_mut().mlme_poll().await {
-                self.power.record_activity(now_ms);
+    fn advance_power_clock(&mut self, elapsed_secs: u16) -> u32 {
+        self.power_now_ms = advance_millis(self.power_now_ms, elapsed_secs);
+        self.power_now_ms
+    }
+
+    #[inline(never)]
+    async fn run_sleepy_poll(
+        &mut self,
+        now_ms: u32,
+        clusters: &mut [crate::ClusterRef<'_>],
+    ) -> Option<StackEvent> {
+        if automatic_poll_due(
+            self.automatic_polling,
+            self.is_sleepy(),
+            self.bdb.tclk_exchange_active(),
+            self.power.should_poll(now_ms),
+        ) {
+            let indication = self.poll().await;
+            if let Ok(Some(frame)) = indication {
+                return self.process_incoming(&frame, clusters).await;
             }
-            self.power.record_poll(now_ms);
         }
+        None
     }
 
     #[inline(never)]
@@ -408,6 +472,7 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                     }
                 }
             }
+
             UserAction::Rejoin => {
                 log::info!("[Runtime] User action: Rejoin");
                 self.retry_secure_rejoin().await
@@ -527,5 +592,28 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                 Err(SendError::Aps(e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{advance_millis, automatic_poll_due};
+
+    #[test]
+    fn power_clock_accumulates_elapsed_deltas() {
+        let mut now_ms = 0;
+        for elapsed_secs in [1, 0, 0, 1] {
+            now_ms = advance_millis(now_ms, elapsed_secs);
+        }
+        assert_eq!(now_ms, 2_000);
+    }
+
+    #[test]
+    fn commissioning_forces_automatic_sleepy_polling() {
+        assert!(automatic_poll_due(true, true, true, false));
+        assert!(!automatic_poll_due(false, true, true, false));
+        assert!(!automatic_poll_due(true, false, true, false));
+        assert!(automatic_poll_due(true, true, false, true));
+        assert!(!automatic_poll_due(true, true, false, false));
     }
 }

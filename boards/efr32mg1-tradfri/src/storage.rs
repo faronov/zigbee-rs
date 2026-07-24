@@ -16,14 +16,10 @@ const NV_PAGE_A: u32 = 0;
 const NV_PAGE_B: u32 = 2048;
 
 const _: () = assert!(
-    SECURITY_PARTITION_START as usize + SECURITY_PARTITION_SIZE
-        == APP_NV_PARTITION_START as usize
+    SECURITY_PARTITION_START as usize + SECURITY_PARTITION_SIZE == APP_NV_PARTITION_START as usize
 );
-const _: () =
-    assert!(APP_NV_PARTITION_START as usize + APP_NV_PARTITION_SIZE == 0x0003_A000);
-const _: () = assert!(
-    SECURITY_JOURNAL_SECTOR_SIZE % <Efr32mg1Flash as NorFlash>::ERASE_SIZE == 0
-);
+const _: () = assert!(APP_NV_PARTITION_START as usize + APP_NV_PARTITION_SIZE == 0x0003_A000);
+const _: () = assert!(SECURITY_JOURNAL_SECTOR_SIZE % <Efr32mg1Flash as NorFlash>::ERASE_SIZE == 0);
 
 pub struct PartitionFlash<const START: u32, const SIZE: usize> {
     flash: Efr32mg1Flash,
@@ -84,19 +80,13 @@ impl<const START: u32, const SIZE: usize> NorFlash for PartitionFlash<START, SIZ
     }
 }
 
-pub type SecurityFlash =
-    PartitionFlash<SECURITY_PARTITION_START, SECURITY_PARTITION_SIZE>;
+pub type SecurityFlash = PartitionFlash<SECURITY_PARTITION_START, SECURITY_PARTITION_SIZE>;
 pub type SecurityStore = SecurityStateJournal<SecurityFlash>;
-pub type ApplicationFlash =
-    PartitionFlash<APP_NV_PARTITION_START, APP_NV_PARTITION_SIZE>;
+pub type ApplicationFlash = PartitionFlash<APP_NV_PARTITION_START, APP_NV_PARTITION_SIZE>;
 pub type ApplicationNv = LogStructuredNv<ApplicationFlash>;
 
 pub fn security_store() -> SecurityStore {
-    SecurityStateJournal::new(
-        SecurityFlash::new(),
-        SECURITY_SECTOR_A,
-        SECURITY_SECTOR_B,
-    )
+    SecurityStateJournal::new(SecurityFlash::new(), SECURITY_SECTOR_A, SECURITY_SECTOR_B)
 }
 
 pub fn application_nv() -> Result<ApplicationNv, NvError> {

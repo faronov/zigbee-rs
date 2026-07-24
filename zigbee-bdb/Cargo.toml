@@ -18,3 +18,6 @@ log = "0.4"
 
 [features]
 trace = ["zigbee-aps/trace", "zigbee-nwk/trace"]
+
+[dev-dependencies]
+zigbee-mac = { version = "0.1.0", path = "../zigbee-mac", features = ["mock"] }

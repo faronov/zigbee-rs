@@ -12,3 +12,4 @@ log = "0.4"
 [features]
 default = []
 ota = []
+constrained-memory = []

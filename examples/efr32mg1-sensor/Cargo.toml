@@ -4,21 +4,18 @@ version = "0.1.0"
 edition = "2024"
 autobins = false
 
-[features]
-default = []
-ota = ["zigbee-runtime/ota"]
-
 [[bin]]
 name = "efr32mg1-sensor"
 path = "src/main.rs"
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
+zigbee-bdb = { path = "../../zigbee-bdb" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["efr32"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee-runtime = { path = "../../zigbee-runtime", features = ["constrained-memory", "ota"] }
 efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
 efr32mg1-hal = { path = "../../efr32mg1-hal" }
 zigbee-sht3x = { path = "../../drivers/sht3x" }

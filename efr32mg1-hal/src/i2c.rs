@@ -80,9 +80,7 @@ impl embedded_hal::i2c::Error for I2cError {
         match self {
             Self::Bus | Self::BusStuck => ErrorKind::Bus,
             Self::ArbitrationLoss => ErrorKind::ArbitrationLoss,
-            Self::NoAcknowledgeAddress => {
-                ErrorKind::NoAcknowledge(NoAcknowledgeSource::Address)
-            }
+            Self::NoAcknowledgeAddress => ErrorKind::NoAcknowledge(NoAcknowledgeSource::Address),
             Self::NoAcknowledgeData => ErrorKind::NoAcknowledge(NoAcknowledgeSource::Data),
             Self::InvalidConfig | Self::Timeout => ErrorKind::Other,
         }
@@ -333,10 +331,7 @@ impl I2c<SevenBitAddress> for I2c0 {
             let reading = matches!(operations[index], Operation::Read(_));
             let run_end = next_direction_change(operations, index, reading);
             let read_count = if reading {
-                operations[index..run_end]
-                    .iter()
-                    .map(operation_len)
-                    .sum()
+                operations[index..run_end].iter().map(operation_len).sum()
             } else {
                 0
             };

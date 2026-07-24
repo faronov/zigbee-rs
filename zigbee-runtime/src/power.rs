@@ -141,3 +141,36 @@ impl Default for PowerManager {
         Self::new(PowerMode::AlwaysOn)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{PowerManager, PowerMode};
+
+    #[test]
+    fn sleepy_poll_uses_monotonic_time() {
+        let mut power = PowerManager::new(PowerMode::Sleepy {
+            poll_interval_ms: 1_000,
+            wake_duration_ms: 300,
+        });
+
+        assert!(!power.should_poll(0));
+        assert!(!power.should_poll(999));
+        assert!(power.should_poll(1_000));
+
+        power.record_poll(1_000);
+        assert!(!power.should_poll(1_999));
+        assert!(power.should_poll(2_000));
+    }
+
+    #[test]
+    fn sleepy_poll_interval_survives_clock_wrap() {
+        let mut power = PowerManager::new(PowerMode::Sleepy {
+            poll_interval_ms: 1_000,
+            wake_duration_ms: 300,
+        });
+
+        power.record_poll(u32::MAX - 499);
+        assert!(!power.should_poll(400));
+        assert!(power.should_poll(500));
+    }
+}

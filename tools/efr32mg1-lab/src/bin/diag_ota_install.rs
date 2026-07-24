@@ -20,9 +20,7 @@ fn main() -> ! {
     platform::init_small!("diag-ota-install");
 
     let mut writer = Efr32FirmwareWriter::new().unwrap_or_else(|_| fail("DISCOVERY_FAIL"));
-    writer
-        .erase_slot()
-        .unwrap_or_else(|_| fail("ERASE_FAIL"));
+    writer.erase_slot().unwrap_or_else(|_| fail("ERASE_FAIL"));
     if GBL.len() as u32 > writer.slot_size() {
         fail("GBL_TOO_LARGE");
     }
@@ -41,9 +39,7 @@ fn main() -> ! {
         GBL.len()
     );
     platform::led_on();
-    writer
-        .activate()
-        .unwrap_or_else(|_| fail("ACTIVATE_FAIL"));
+    writer.activate().unwrap_or_else(|_| fail("ACTIVATE_FAIL"));
     platform::halt()
 }
 

@@ -55,11 +55,12 @@ path = "src/bin/diag_ota_install.rs"
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
+zigbee-bdb = { path = "../../zigbee-bdb" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["efr32", "efr32-trace"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime", features = ["trace"] }
+zigbee-runtime = { path = "../../zigbee-runtime", features = ["constrained-memory", "trace"] }
 efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
 efr32mg1-hal = { path = "../../efr32mg1-hal" }
 zigbee-sht3x = { path = "../../drivers/sht3x" }

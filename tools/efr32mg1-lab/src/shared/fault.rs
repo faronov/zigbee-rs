@@ -24,6 +24,25 @@ unsafe fn fault_log_mut() -> *mut FaultLog {
     core::ptr::addr_of_mut!(FAULT_LOG).cast::<FaultLog>()
 }
 
+pub fn clear() {
+    unsafe {
+        fault_log_mut().write_volatile(FaultLog {
+            hardfault_magic: 0,
+            hardfault_pc: 0,
+            hardfault_lr: 0,
+            hardfault_xpsr: 0,
+            hardfault_msp: 0,
+            hardfault_r0: 0,
+            hardfault_r12: 0,
+            panic_magic: 0,
+            panic_line: 0,
+            panic_column: 0,
+            panic_file_ptr: 0,
+            panic_file_len: 0,
+        });
+    }
+}
+
 #[cortex_m_rt::exception]
 unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
     unsafe {

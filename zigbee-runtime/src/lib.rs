@@ -492,6 +492,10 @@ pub struct ZigbeeDevice<M: MacDriver> {
     reporting: ReportingEngine,
     /// Power management.
     power: PowerManager,
+    /// Monotonic millisecond clock accumulated from `tick()` deltas.
+    power_now_ms: u32,
+    /// Whether `tick()` owns sleepy-end-device parent polling.
+    automatic_polling: bool,
     /// Pending user action (set by button press, consumed by tick).
     pending_action: Option<UserAction>,
     /// ZCL transaction sequence counter.
@@ -516,6 +520,9 @@ pub struct ZigbeeDevice<M: MacDriver> {
 
 impl<M: MacDriver> ZigbeeDevice<M> {
     const SECURE_REJOIN_RETRY_DELAY_US: u32 = 5_000_000;
+    /// Poll cadence hint while the event-driven commissioning security
+    /// handshake is still running after network-up.
+    const COMMISSIONING_POLL_MS: u32 = 250;
 
     /// Create a new device builder.
     pub fn builder(mac: M) -> builder::DeviceBuilder<M> {
@@ -533,21 +540,21 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
     /// Initialize and join a Zigbee network via BDB commissioning.
     ///
-    /// Performs BDB initialize → commission (network steering).
-    /// Returns the assigned short address on success.
+    /// Performs BDB initialize and the pre-network part of Network Steering.
+    /// Returns the assigned short address once the network is up. The
+    /// post-network unique Trust Center link-key exchange is advanced by
+    /// [`Self::tick`], which emits `CommissioningComplete` on its terminal
+    /// transition.
     #[inline(never)]
     pub async fn start(&mut self) -> Result<u16, event_loop::StartError> {
         rt_trace!("[RT] start: init");
-        // Inline initialize + commission to avoid async state machine losing `self`
-        // reference across await points (observed: self becomes NULL in separate
-        // #[inline(never)] async methods after first await in release mode).
         let r = self.bdb.initialize();
         rt_trace!("[RT] bdb_init={}", if r.is_ok() { "ok" } else { "ERR" });
         if r.is_err() {
             return Err(event_loop::StartError::InitFailed);
         }
         rt_trace!("[RT] start: commission");
-        let r = self.bdb.commission().await;
+        let r = self.bdb.network_steering().await;
         rt_trace!("[RT] bdb_comm={}", if r.is_ok() { "ok" } else { "ERR" });
         if let Err(status) = r {
             return Err(event_loop::StartError::CommissioningFailed(status));
@@ -557,6 +564,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     }
 
     /// Initialize and join while durably reserving all security counters.
+    ///
+    /// The pre-network work (scan → join → initial Transport-Key → reserve
+    /// network security → `Device_annce`) is awaited here. The post-network
+    /// unique Trust Center link-key handshake is **not** awaited: on success
+    /// the device is on the network and the caller must drive commissioning
+    /// security to completion by calling [`Self::tick_with_security_store`]
+    /// each tick/poll (GSDK network-steering / update-tc-link-key split).
+    /// `CommissioningComplete { success: true }` is emitted from the tick loop
+    /// only after Verify/Confirm (or a pre-R21 determination).
     #[inline(never)]
     pub async fn start_with_security_store<S: SecurityStateStore>(
         &mut self,
@@ -584,6 +600,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
     /// Resume a committed network when available, otherwise commission a new
     /// one while using the same durable security store.
+    ///
+    /// Like [`Self::start_with_security_store`], commissioning of a new network
+    /// leaves the unique-TCLK handshake pending; drive it via
+    /// [`Self::tick_with_security_store`].
     #[inline(never)]
     pub async fn start_or_resume_with_security_store<S: SecurityStateStore>(
         &mut self,
@@ -628,7 +648,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.bdb.zdo_mut().set_local_nwk_addr(ShortAddress(addr));
         self.bdb.zdo_mut().set_local_ieee_addr(ieee);
 
-        self.state_dirty = true;
+        self.state_dirty = !self.bdb.tclk_exchange_active();
         self.secure_rejoin_retry_at = None;
         Ok(addr)
     }
@@ -1423,8 +1443,72 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             self.tick_without_secure_rejoin(elapsed_secs, clusters)
                 .await
         };
+        // GSDK-style event-driven commissioning: after network-up the normal
+        // tick above services ZDO/ZCL and sleepy polling, feeding the unique
+        // Trust Center link-key handshake. Advance that handshake one bounded
+        // step here, unless the tick already produced an application event to
+        // return (which would otherwise be dropped).
+        let result = if !matches!(result, event_loop::TickResult::Event(_))
+            && self.bdb.tclk_exchange_active()
+        {
+            match self
+                .advance_commissioning_with_security_store(store)
+                .await?
+            {
+                Some(event) => event_loop::TickResult::Event(event),
+                None if matches!(result, event_loop::TickResult::Idle) => {
+                    event_loop::TickResult::RunAgain(Self::COMMISSIONING_POLL_MS)
+                }
+                None => result,
+            }
+        } else {
+            result
+        };
         self.refresh_security_state(store)?;
         Ok(result)
+    }
+
+    /// Advance the event-driven unique Trust Center link-key exchange by one
+    /// bounded step using the durable security store for persistence.
+    ///
+    /// Network security was reserved before `Device_annce`; here the unique
+    /// TCLK/counter is reserved before Verify-Key and the commissioned network
+    /// is committed only after a successful Confirm-Key. Returns a
+    /// `CommissioningComplete` event on a terminal transition.
+    async fn advance_commissioning_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<Option<event_loop::StackEvent>, SecurityStoreError> {
+        if !self.bdb.tclk_exchange_active() {
+            return Ok(None);
+        }
+        let progress = {
+            let mut persistence = CommissioningSecurityPersistence::new(store)?;
+            let progress = self.bdb.advance_tclk_exchange(Some(&mut persistence)).await;
+            if let Some(error) = persistence.take_error() {
+                return Err(error);
+            }
+            progress
+        };
+        match progress {
+            zigbee_bdb::TclkProgress::InProgress => Ok(None),
+            zigbee_bdb::TclkProgress::Complete => {
+                self.state_dirty = true;
+                log::info!("[Runtime] Commissioning security complete — network committed");
+                Ok(Some(event_loop::StackEvent::CommissioningComplete {
+                    success: true,
+                }))
+            }
+            zigbee_bdb::TclkProgress::Failed(status) => {
+                log::warn!("[Runtime] Commissioning security failed: {:?}", status);
+                // BDB already reset NWK/MAC and cleared the on-network flag;
+                // mirror that in the runtime so we stop servicing consistently.
+                self.mark_left();
+                Ok(Some(event_loop::StackEvent::CommissioningComplete {
+                    success: false,
+                }))
+            }
+        }
     }
 
     async fn retry_secure_rejoin_with_security_store<S: SecurityStateStore>(
@@ -1672,9 +1756,18 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// any queued frame. Returns `None` if no data is pending.
     /// After calling this, feed the result into `process_incoming()`.
     pub async fn poll(&mut self) -> Result<Option<McpsDataIndication>, MacError> {
-        let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
-        match mac.mlme_poll().await? {
+        let frame = self
+            .bdb
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut()
+            .mlme_poll()
+            .await?;
+        self.power.record_poll(self.power_now_ms);
+        match frame {
             Some(frame) => {
+                self.power.record_activity(self.power_now_ms);
                 // Wrap the raw poll response in a McpsDataIndication.
                 // The parent address comes from NIB; LQI is unknown from poll.
                 let parent = self.bdb.zdo().nwk().nib().parent_address;
@@ -3238,9 +3331,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     ) -> bool {
         // We need to work through the reporting engine, which requires AttributeStore<N>.
         // Since we have a trait object, we build reports manually by checking each config.
-        use zigbee_zcl::foundation::reporting::{AttributeReport, ReportAttributes};
+        use zigbee_zcl::foundation::reporting::{
+            AttributeReport, MAX_REPORT_CONFIGS, ReportAttributes,
+        };
 
-        let mut reports: heapless::Vec<AttributeReport, 16> = heapless::Vec::new();
+        let mut reports: heapless::Vec<AttributeReport, MAX_REPORT_CONFIGS> = heapless::Vec::new();
         self.reporting
             .check_and_collect_dyn(endpoint, cluster_id, store, &mut reports);
 

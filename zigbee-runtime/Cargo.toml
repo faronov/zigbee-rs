@@ -22,6 +22,10 @@ default = []
 router = ["zigbee-aps/router"]
 ota = []
 trace = ["zigbee-bdb/trace", "zigbee-aps/trace", "zigbee-nwk/trace"]
+constrained-memory = [
+    "zigbee-zcl/constrained-memory",
+    "zigbee-zdo/constrained-memory",
+]
 
 [dev-dependencies]
 zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }

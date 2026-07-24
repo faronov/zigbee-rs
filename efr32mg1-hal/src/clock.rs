@@ -78,8 +78,7 @@ pub fn init_hfxo(config: HfxoConfig) -> Result<(), ClockError> {
     unsafe {
         // Always move to HFRCO before changing HFXO analog configuration.
         write(CMU_OSCENCMD, CMU_OSCENCMD_HFRCOEN);
-        wait_set(CMU_STATUS, CMU_STATUS_HFRCORDY)
-            .ok_or(ClockError::HfrcoStartTimeout)?;
+        wait_set(CMU_STATUS, CMU_STATUS_HFRCORDY).ok_or(ClockError::HfrcoStartTimeout)?;
         write(CMU_HFCLKSEL, CMU_HFCLK_HFRCO);
         wait_value(
             CMU_HFCLKSTATUS,
@@ -90,8 +89,7 @@ pub fn init_hfxo(config: HfxoConfig) -> Result<(), ClockError> {
 
         if read(CMU_STATUS) & CMU_STATUS_HFXOENS != 0 {
             write(CMU_OSCENCMD, CMU_OSCENCMD_HFXODIS);
-            wait_clear(CMU_STATUS, CMU_STATUS_HFXOENS)
-                .ok_or(ClockError::HfxoStopTimeout)?;
+            wait_clear(CMU_STATUS, CMU_STATUS_HFXOENS).ok_or(ClockError::HfxoStopTimeout)?;
         }
 
         // GSDK 4.5 CMU_HFXOInit defaults for internal SDID 80 (EFR32xG1):
@@ -118,8 +116,7 @@ pub fn init_hfxo(config: HfxoConfig) -> Result<(), ClockError> {
         set_flash_wait_state_38m4();
 
         write(CMU_OSCENCMD, CMU_OSCENCMD_HFXOEN);
-        wait_set(CMU_STATUS, CMU_STATUS_HFXORDY)
-            .ok_or(ClockError::HfxoStartTimeout)?;
+        wait_set(CMU_STATUS, CMU_STATUS_HFXORDY).ok_or(ClockError::HfxoStartTimeout)?;
         write(CMU_HFCLKSEL, CMU_HFCLK_HFXO);
         wait_value(
             CMU_HFCLKSTATUS,
@@ -175,11 +172,7 @@ unsafe fn set_flash_wait_state_38m4() {
     let was_locked = unsafe { read(MSC_LOCK) != 0 };
     unsafe {
         write(MSC_LOCK, MSC_LOCK_UNLOCK);
-        modify(
-            MSC_READCTRL,
-            MSC_READCTRL_MODE_MASK,
-            MSC_READCTRL_MODE_WS1,
-        );
+        modify(MSC_READCTRL, MSC_READCTRL_MODE_MASK, MSC_READCTRL_MODE_WS1);
         if was_locked {
             write(MSC_LOCK, MSC_LOCK_LOCK);
         }

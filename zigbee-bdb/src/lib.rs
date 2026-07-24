@@ -39,6 +39,7 @@ pub mod formation;
 pub mod security_persistence;
 pub mod state_machine;
 pub mod steering;
+pub mod tclk_exchange;
 pub mod touchlink;
 
 use zigbee_mac::MacDriver;
@@ -50,6 +51,7 @@ pub use security_persistence::{
     SecurityPersistenceError, TrustCenterLinkKeyState,
 };
 pub use state_machine::{BdbState, CommissioningMode};
+pub use tclk_exchange::{TclkExchange, TclkProgress, TclkStage};
 
 // ── BDB status codes ────────────────────────────────────────
 
@@ -186,6 +188,10 @@ pub struct SteeringDiagnostics {
 /// let bdb = BdbLayer::new(zdo_layer);
 /// bdb.initialize()?;
 /// bdb.commission().await?;
+/// while bdb.tclk_exchange_active() {
+///     // Process normal incoming stack traffic, then:
+///     bdb.advance_tclk_exchange(None).await;
+/// }
 /// ```
 pub struct BdbLayer<M: MacDriver> {
     zdo: ZdoLayer<M>,
@@ -201,6 +207,12 @@ pub struct BdbLayer<M: MacDriver> {
     pub fb_window_remaining: u16,
     /// Endpoint being used for F&B initiator procedure.
     fb_initiator_endpoint: u8,
+    /// In-flight event-driven unique Trust Center link-key exchange.
+    ///
+    /// Armed after network-up + `Device_annce`; advanced one bounded step per
+    /// tick/poll via [`BdbLayer::advance_tclk_exchange`]. `None` when no
+    /// post-network commissioning security handshake is pending.
+    tclk_exchange: Option<TclkExchange>,
 }
 
 impl<M: MacDriver> BdbLayer<M> {
@@ -216,6 +228,7 @@ impl<M: MacDriver> BdbLayer<M> {
             fb_identify_responses: heapless::Vec::new(),
             fb_window_remaining: 0,
             fb_initiator_endpoint: 0,
+            tclk_exchange: None,
         }
     }
 
@@ -235,6 +248,7 @@ impl<M: MacDriver> BdbLayer<M> {
             core::ptr::addr_of_mut!((*slot).fb_identify_responses).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).fb_window_remaining).write(0);
             core::ptr::addr_of_mut!((*slot).fb_initiator_endpoint).write(0);
+            core::ptr::addr_of_mut!((*slot).tclk_exchange).write(None);
         }
     }
 
@@ -279,6 +293,31 @@ impl<M: MacDriver> BdbLayer<M> {
         self.fb_identify_responses.clear();
         self.fb_window_remaining = 0;
         self.fb_initiator_endpoint = 0;
+        self.tclk_exchange = None;
         self.state = BdbState::Idle;
+    }
+
+    /// Whether an event-driven unique Trust Center link-key exchange is still
+    /// running. The runtime uses this to decide when to advance commissioning
+    /// security from its tick/poll loop.
+    pub fn tclk_exchange_active(&self) -> bool {
+        self.tclk_exchange.is_some()
+    }
+
+    /// The current stage of the in-flight unique-TCLK exchange, if any.
+    pub fn tclk_exchange_stage(&self) -> Option<TclkStage> {
+        self.tclk_exchange.as_ref().map(|exchange| exchange.stage)
+    }
+
+    /// Arm a unique-TCLK exchange directly, bypassing scan/join, for tests.
+    #[cfg(test)]
+    pub(crate) fn arm_tclk_exchange_for_test(
+        &mut self,
+        tc_addr: zigbee_types::ShortAddress,
+        tc_ieee: zigbee_types::IeeeAddress,
+    ) {
+        let now = self.zdo.aps().nwk().mac().monotonic_micros();
+        self.attributes.node_is_on_a_network = true;
+        self.tclk_exchange = Some(TclkExchange::new(tc_addr, tc_ieee, now));
     }
 }

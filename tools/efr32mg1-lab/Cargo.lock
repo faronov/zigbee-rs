@@ -178,6 +178,7 @@ dependencies = [
  "rtt-target",
  "static_cell",
  "zigbee-aps",
+ "zigbee-bdb",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-runtime",

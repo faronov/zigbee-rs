@@ -7,15 +7,12 @@ use embassy_futures::select;
 use embassy_time::{Duration, Instant, Timer};
 use zigbee_mac::efr32::Efr32Mac;
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
-#[cfg(feature = "ota")]
 use zigbee_runtime::ota::OtaManager;
 use zigbee_runtime::security_store::{SecurityStateStore, SecurityStoreError};
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
-#[cfg(feature = "ota")]
 use zigbee_types::ShortAddress;
 use zigbee_zcl::ClusterId;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
-#[cfg(feature = "ota")]
 use zigbee_zcl::clusters::ota::{CMD_IMAGE_NOTIFY, OtaState};
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
@@ -49,7 +46,6 @@ macro_rules! application_clusters {
                 endpoint: 1,
                 cluster: &mut *$app.power_cluster,
             },
-            #[cfg(feature = "ota")]
             ClusterRef {
                 endpoint: 1,
                 cluster: $app.ota.cluster_mut(),
@@ -79,11 +75,8 @@ pub struct SensorApp {
     needs_bootstrap_join: bool,
     awaiting_initial_configuration: bool,
     restoring_commissioned_state: bool,
-    #[cfg(feature = "ota")]
     ota: OtaManager<efr32mg1_tradfri::ota::Efr32FirmwareWriter>,
-    #[cfg(feature = "ota")]
     ota_server: Option<(u16, u8)>,
-    #[cfg(feature = "ota")]
     ota_cleanup_pending: bool,
 }
 
@@ -96,7 +89,7 @@ impl SensorApp {
         temp_cluster: &'static mut TemperatureCluster,
         hum_cluster: &'static mut HumidityCluster,
         power_cluster: &'static mut PowerConfigCluster,
-        #[cfg(feature = "ota")] ota: OtaManager<efr32mg1_tradfri::ota::Efr32FirmwareWriter>,
+        ota: OtaManager<efr32mg1_tradfri::ota::Efr32FirmwareWriter>,
     ) -> Self {
         let now = Instant::now();
         let joined = device.is_joined();
@@ -125,11 +118,8 @@ impl SensorApp {
             needs_bootstrap_join: !joined,
             awaiting_initial_configuration: false,
             restoring_commissioned_state: false,
-            #[cfg(feature = "ota")]
             ota,
-            #[cfg(feature = "ota")]
             ota_server: None,
-            #[cfg(feature = "ota")]
             ota_cleanup_pending: false,
         }
     }
@@ -383,7 +373,6 @@ impl SensorApp {
         };
 
         if let Some(event) = event {
-            #[cfg(feature = "ota")]
             if self.process_ota_event(&event).await {
                 return false;
             }
@@ -519,7 +508,6 @@ impl SensorApp {
             Err(error) => persistence_failure(error),
         }
 
-        #[cfg(feature = "ota")]
         self.service_ota(elapsed).await;
 
         if self.annce_retries_left > 0 && now.duration_since(self.last_annce).as_secs() >= 8 {
@@ -547,7 +535,6 @@ impl SensorApp {
         }
     }
 
-    #[cfg(feature = "ota")]
     fn ota_active(&self) -> bool {
         matches!(
             self.ota.state(),
@@ -558,12 +545,6 @@ impl SensorApp {
         )
     }
 
-    #[cfg(not(feature = "ota"))]
-    const fn ota_active(&self) -> bool {
-        false
-    }
-
-    #[cfg(feature = "ota")]
     async fn process_ota_event(&mut self, event: &StackEvent) -> bool {
         let StackEvent::CommandReceived {
             src_addr,
@@ -603,14 +584,12 @@ impl SensorApp {
         true
     }
 
-    #[cfg(feature = "ota")]
     async fn service_ota(&mut self, elapsed_secs: u16) {
         let event = self.ota.tick(elapsed_secs);
         self.handle_ota_status(event);
         self.send_pending_ota().await;
     }
 
-    #[cfg(feature = "ota")]
     fn handle_ota_status(&mut self, event: Option<StackEvent>) {
         match event {
             Some(StackEvent::OtaImageAvailable { .. })
@@ -630,7 +609,6 @@ impl SensorApp {
         }
     }
 
-    #[cfg(feature = "ota")]
     async fn send_pending_ota(&mut self) {
         if let Some(frame) = self.ota.take_pending_frame() {
             let Some((server, endpoint)) = self.ota_server else {

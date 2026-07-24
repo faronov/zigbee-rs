@@ -136,6 +136,10 @@ impl Efr32Mac {
         (rssi, status, clear, state, self.driver.cca_samples())
     }
 
+    pub fn software_ack_snapshot(&self) -> (u32, u32, u32, u8, u8) {
+        self.driver.software_ack_snapshot()
+    }
+
     /// Override the factory EUI-64 before radio initialization.
     pub fn with_extended_address(mut self, ieee: IeeeAddress) -> Self {
         self.extended_address = ieee;
@@ -328,11 +332,8 @@ impl Efr32Mac {
         Err(MacError::NoAck)
     }
 
-    /// Send a 3-byte IEEE 802.15.4 ACK frame for the given sequence number.
-    async fn send_ack(&mut self, seq: u8) {
-        let ack = [0x02u8, 0x00, seq];
-        let _ = self.driver.transmit(&ack).await;
-    }
+    /// ACK transmission is started synchronously by the pure-Rust FRC IRQ.
+    async fn send_ack(&mut self, _seq: u8) {}
 }
 
 impl MacDriver for Efr32Mac {
@@ -503,9 +504,12 @@ impl MacDriver for Efr32Mac {
         req: MlmeAssociateRequest,
     ) -> Result<MlmeAssociateConfirm, MacError> {
         self.channel = req.channel;
-        self.driver.update_config(|c| c.channel = req.channel);
-
         let coord_pan = req.coord_address.pan_id();
+        self.driver.update_config(|c| {
+            c.channel = req.channel;
+            c.pan_id = coord_pan.0;
+        });
+
         if let MacAddress::Short(_, address) = req.coord_address {
             self.coord_short_address = address;
         }
@@ -644,9 +648,13 @@ impl MacDriver for Efr32Mac {
                                     _ => AssociationStatus::PanAccessDenied,
                                 };
                                 if status_byte == 0 {
+                                    self.pan_id = coord_pan;
                                     self.short_address = addr;
                                     self.associated_pan_coord = true;
-                                    self.driver.update_config(|c| c.short_address = addr.0);
+                                    self.driver.update_config(|c| {
+                                        c.pan_id = coord_pan.0;
+                                        c.short_address = addr.0;
+                                    });
                                 }
                                 confirm = Some(MlmeAssociateConfirm {
                                     short_address: addr,

@@ -6,7 +6,11 @@ use crate::data_types::{self, ZclDataType, ZclValue};
 use crate::{AttributeId, ZclStatus};
 
 /// Maximum number of reporting configurations tracked simultaneously.
+#[cfg(not(feature = "constrained-memory"))]
 pub const MAX_REPORT_CONFIGS: usize = 16;
+/// Reduced reporting capacity for devices with tightly constrained SRAM.
+#[cfg(feature = "constrained-memory")]
+pub const MAX_REPORT_CONFIGS: usize = 8;
 
 /// Direction field in a reporting configuration record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -210,7 +210,7 @@ const RAC_STATE_POR: u32 = 0x0E;
 /// Sequencer control register (NOT in RAC peripheral — it's in RAM!)
 const SEQ_CONTROL_REG: u32 = 0x2100_0EFC;
 /// Radio state transitions (SEQ->REG000)
-const _SEQ_TRANSITIONS: u32 = 0x2100_0F00;
+const SEQ_TRANSITIONS: u32 = 0x2100_0F00;
 /// RX warm-up time (SEQ->REG09C)
 const SEQ_RX_WARMTIME: u32 = 0x2100_0F9C;
 /// RX search time (SEQ->REG0A0)
@@ -227,6 +227,9 @@ const SEQ_TX_RX_TIME: u32 = 0x2100_0FB0;
 const SEQ_TX_RX_SEARCHTIME: u32 = 0x2100_0FB4;
 /// TX→TX time (SEQ->REG0B8)
 const SEQ_TX_TX_TIME: u32 = 0x2100_0FB8;
+const RX_WARM_TICKS: u32 = 461;
+const TX_WARM_TICKS: u32 = 432;
+const TX_PRE_TICKS: u32 = 336;
 /// xg1 sequencer PA slice control.
 const SEQ_PA_SLICES: u32 = 0x2100_0FC0;
 /// xg1 sequencer RX PA CTUNE.
@@ -325,7 +328,7 @@ const FRC_CMD_FRAMEDETRESUME: u32 = 1 << 1;
 // ── FRC Interrupt Flag Bits (FRC_IF at 0x060) ───────────────────
 
 const FRC_IF_TXDONE: u32 = 1 << 0;
-const _FRC_IF_TXAFTERFRAMEDONE: u32 = 1 << 1;
+const FRC_IF_TXAFTERFRAMEDONE: u32 = 1 << 1;
 const _FRC_IF_TXABORTED: u32 = 1 << 2;
 const _FRC_IF_TXUF: u32 = 1 << 3;
 const FRC_IF_RXDONE: u32 = 1 << 4;
@@ -333,6 +336,7 @@ const _FRC_IF_RXABORTED: u32 = 1 << 5;
 const FRC_IF_FRAMEERROR: u32 = 1 << 6;
 const _FRC_IF_BLOCKERROR: u32 = 1 << 7;
 const FRC_IF_RXOF: u32 = 1 << 8;
+const FRC_IF_WCNTCMP2: u32 = 1 << 11;
 
 // ── MODEM Register Offsets (CMSIS: efr32fg1v_modem.h) ──────────
 // 0x000–0x010 are read-only status registers; first writable is MIXCTRL at 0x014.
@@ -466,13 +470,12 @@ const PROTIMER_IEN: u32 = PROTIMER_BASE + 0x068;
 struct AlignedBuf<const N: usize>([u8; N]);
 
 /// TX RAM buffer pointed to by BUFC BUF0_ADDR.
-static BUFC_TX_RAM: SyncUnsafeCell<AlignedBuf<256>> = SyncUnsafeCell::new(AlignedBuf([0u8; 256]));
+static BUFC_TX_RAM: SyncUnsafeCell<AlignedBuf<128>> = SyncUnsafeCell::new(AlignedBuf([0u8; 128]));
 /// RX RAM buffer pointed to by BUFC BUF1_ADDR.
-static BUFC_RX_RAM: SyncUnsafeCell<AlignedBuf<512>> = SyncUnsafeCell::new(AlignedBuf([0u8; 512]));
+static BUFC_RX_RAM: SyncUnsafeCell<AlignedBuf<256>> = SyncUnsafeCell::new(AlignedBuf([0u8; 256]));
 /// RX packet-queue / metadata buffer pointed to by BUFC BUF2_ADDR.
 static BUFC_RX_META_RAM: SyncUnsafeCell<AlignedBuf<64>> =
     SyncUnsafeCell::new(AlignedBuf([0u8; 64]));
-
 /// Fixed MAC/PHY helper table captured from the working xg1 IEEE 802.15.4 GSDK image.
 static SEQ_PHYINFO_MISC_TABLE: [u32; 3] = [0x0000_19E1, 0x0000_19E1, 0x0000_0000];
 /// Fixed frame-coding table captured from the working xg1 IEEE 802.15.4 GSDK image.
@@ -617,6 +620,21 @@ static RX_LEN: AtomicU8 = AtomicU8::new(0);
 static RX_CRC_OK: AtomicBool = AtomicBool::new(false);
 static RX_RSSI: AtomicI8 = AtomicI8::new(-127);
 static LAST_TX_FRC_FLAGS: AtomicU32 = AtomicU32::new(0);
+static EXPECTED_ACK_PENDING: AtomicBool = AtomicBool::new(false);
+static EXPECTED_ACK_DSN: AtomicU8 = AtomicU8::new(0);
+static SOFTWARE_ACK_TX_PENDING: AtomicBool = AtomicBool::new(false);
+static SOFTWARE_ACK_PREARMED: AtomicBool = AtomicBool::new(false);
+static SOFTWARE_ACK_PREARMED_DSN: AtomicU8 = AtomicU8::new(0);
+static SOFTWARE_ACK_ENABLED: AtomicBool = AtomicBool::new(false);
+static SOFTWARE_ACK_PAN_ID: AtomicU32 = AtomicU32::new(0xFFFF);
+static SOFTWARE_ACK_SHORT_ADDRESS: AtomicU32 = AtomicU32::new(0xFFFF);
+static SOFTWARE_ACK_EXTENDED_ADDRESS_LOW: AtomicU32 = AtomicU32::new(0);
+static SOFTWARE_ACK_EXTENDED_ADDRESS_HIGH: AtomicU32 = AtomicU32::new(0);
+static SOFTWARE_ACK_STARTED: AtomicU32 = AtomicU32::new(0);
+static SOFTWARE_ACK_COMPLETED: AtomicU32 = AtomicU32::new(0);
+static SOFTWARE_ACK_FAILED: AtomicU32 = AtomicU32::new(0);
+static SOFTWARE_ACK_LAST_DSN: AtomicU8 = AtomicU8::new(0);
+static SOFTWARE_ACK_LAST_RAC_STATE: AtomicU8 = AtomicU8::new(RAC_STATE_OFF as u8);
 
 // ── Public types ────────────────────────────────────────────────
 
@@ -868,9 +886,9 @@ impl Efr32Driver {
             reg_read(SYNTH_IFFREQ)
         );
         efr32_trace!(
-            "SEQ: CTRL_REG={:#X} TRANSITIONS={:#X} PHYINFO={:#X}",
+            "SEQ: CTRL={:#X} TRANSITIONS={:#X} PHYINFO={:#X}",
             reg_read(SEQ_CONTROL_REG),
-            reg_read(_SEQ_TRANSITIONS),
+            reg_read(SEQ_TRANSITIONS),
             reg_read(SEQ_PHYINFO)
         );
         // Dump the radio CRC block, including STATUS(+4), CMD(+8, write-only),
@@ -1031,9 +1049,6 @@ impl Efr32Driver {
         // 8. Set variables
         reg_write(SEQ_CONTROL_REG, reg_read(SEQ_CONTROL_REG) | 0x08);
 
-        const RX_WARM_TICKS: u32 = 461;
-        const TX_WARM_TICKS: u32 = 432;
-        const TX_PRE_TICKS: u32 = 336;
         reg_write(SEQ_RX_WARMTIME, RX_WARM_TICKS);
         reg_write(SEQ_TX_WARMTIME, TX_WARM_TICKS | (TX_PRE_TICKS << 16));
         reg_write(SEQ_RX_TX_TIME, TX_WARM_TICKS | (TX_PRE_TICKS << 16));
@@ -1043,7 +1058,8 @@ impl Efr32Driver {
         reg_write(SEQ_RX_SEARCHTIME, 0);
         reg_write(SEQ_TX_RX_SEARCHTIME, 0);
 
-        reg_write(_SEQ_TRANSITIONS, 0x0202_0202);
+        // Keep RX active after RX/TX success or failure.
+        reg_write(SEQ_TRANSITIONS, 0x0202_0202);
 
         self.configure_seq_phyinfo();
 
@@ -1235,6 +1251,7 @@ impl Efr32Driver {
         reg_write(BUFC_BUF2_ADDR, rx_meta_addr);
         reg_write(BUFC_BUF2_THRESHOLDCTRL, BUFC_BUF2_THRESHOLD_GSDK);
         reg_write(BUFC_BUF2_CMD, 1);
+
         reg_write(BUFC_IFC, 0xFFFF_FFFF);
 
         log::info!(
@@ -1316,8 +1333,11 @@ impl Efr32Driver {
 
         // Clear all pending FRC interrupt flags
         reg_write(FRC_IFC, 0xFFFF_FFFF);
+        // Interrupt after the complete extended destination is available.
+        // The early IRQ pre-arms TX while RX is still in progress.
+        reg_write(_FRC_WCNTCMP1, 0);
+        reg_write(_FRC_WCNTCMP2, 14);
 
-        // Enable FRC interrupts: TXDONE(0) | RXDONE(4) | FRAMEERROR(6) | RXOF(8)
         // RXOF must be enabled — the IRQ handler checks for it to signal
         // RX errors, but it won't fire unless enabled in IEN.
         reg_write(
@@ -1327,7 +1347,8 @@ impl Efr32Driver {
                 | _FRC_IF_TXUF
                 | FRC_IF_RXDONE
                 | FRC_IF_FRAMEERROR
-                | FRC_IF_RXOF,
+                | FRC_IF_RXOF
+                | FRC_IF_WCNTCMP2,
         );
     }
 
@@ -1526,9 +1547,31 @@ impl Efr32Driver {
     fn apply_config(&self) {
         self.set_channel(self.config.channel);
         self.set_tx_power(self.config.tx_power);
-        // Address filtering is handled in software (same approach as PHY6222).
-        // The FRC/RAC hardware can do address filtering, but software filtering
-        // is more flexible and works reliably across register configurations.
+
+        SOFTWARE_ACK_ENABLED.store(!self.config.promiscuous, Ordering::Release);
+        SOFTWARE_ACK_PAN_ID.store(self.config.pan_id as u32, Ordering::Release);
+        SOFTWARE_ACK_SHORT_ADDRESS.store(self.config.short_address as u32, Ordering::Release);
+        SOFTWARE_ACK_EXTENDED_ADDRESS_LOW.store(
+            u32::from_le_bytes([
+                self.config.extended_address[0],
+                self.config.extended_address[1],
+                self.config.extended_address[2],
+                self.config.extended_address[3],
+            ]),
+            Ordering::Release,
+        );
+        SOFTWARE_ACK_EXTENDED_ADDRESS_HIGH.store(
+            u32::from_le_bytes([
+                self.config.extended_address[4],
+                self.config.extended_address[5],
+                self.config.extended_address[6],
+                self.config.extended_address[7],
+            ]),
+            Ordering::Release,
+        );
+
+        // Address filtering and immediate ACK generation are owned by the
+        // FRC IRQ for this public sequencer revision.
     }
 
     /// Get current radio configuration.
@@ -1567,6 +1610,9 @@ impl Efr32Driver {
     }
 
     fn clear_radio_buffers(&self) {
+        EXPECTED_ACK_PENDING.store(false, Ordering::Release);
+        SOFTWARE_ACK_TX_PENDING.store(false, Ordering::Release);
+        SOFTWARE_ACK_PREARMED.store(false, Ordering::Release);
         reg_write(BUFC_BUF0_CMD, 1);
         reg_write(BUFC_BUF1_CMD, 1);
         reg_write(BUFC_BUF2_CMD, 1);
@@ -1577,6 +1623,13 @@ impl Efr32Driver {
     /// known idle state. xG1 RXOVERFLOW (state 6) requires an explicit
     /// CLEARRXOVERFLOW command; TXDIS alone cannot recover it.
     fn force_radio_idle(&self) -> bool {
+        for _ in 0..100_000 {
+            if !SOFTWARE_ACK_TX_PENDING.load(Ordering::Acquire) {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
         reg_write(SEQ_CONTROL_REG, reg_read(SEQ_CONTROL_REG) | 0x20);
         reg_write(_RAC_RXENSRCEN, reg_read(_RAC_RXENSRCEN) & !0x02);
         reg_write(FRC_CMD, FRC_CMD_RXABORT);
@@ -1615,6 +1668,11 @@ impl Efr32Driver {
     }
 
     fn start_rx(&self) {
+        // The IRQ-started ACK uses BUF0 while the completed frame remains in
+        // BUF1. Its configured TX transition returns the radio to RX.
+        if SOFTWARE_ACK_TX_PENDING.load(Ordering::Acquire) {
+            return;
+        }
         reg_write(BUFC_BUF1_CMD, 1);
         reg_write(BUFC_BUF2_CMD, 1);
         reg_write(FRC_IFC, 0xFFFF_FFFF);
@@ -1675,6 +1733,17 @@ impl Efr32Driver {
 
         TX_DONE.reset();
         LAST_TX_FRC_FLAGS.store(0, Ordering::Release);
+        let frame_control = if frame.len() >= 2 {
+            u16::from_le_bytes([frame[0], frame[1]])
+        } else {
+            0
+        };
+        let expects_ack =
+            frame.len() >= 3 && frame_control & (1 << 5) != 0 && frame_control & 0x07 != 0x02;
+        EXPECTED_ACK_PENDING.store(expects_ack, Ordering::Release);
+        if expects_ack {
+            EXPECTED_ACK_DSN.store(frame[2], Ordering::Release);
+        }
 
         // Debug: increment atomic TX call counter
         static TX_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -1760,6 +1829,7 @@ impl Efr32Driver {
 
                     Ok(())
                 } else {
+                    EXPECTED_ACK_PENDING.store(false, Ordering::Release);
                     let _tx_flags = LAST_TX_FRC_FLAGS.load(Ordering::Acquire);
                     efr32_trace!(
                         "[EFR32][tx] error: FRC_IF={:#X} RAC={}({})",
@@ -1778,6 +1848,7 @@ impl Efr32Driver {
                 }
             }
             embassy_futures::select::Either::Second(_) => {
+                EXPECTED_ACK_PENDING.store(false, Ordering::Release);
                 efr32_trace!(
                     "[EFR32][tx] timeout: FRC_IF={:#X} RAC={}({})",
                     LAST_TX_FRC_FLAGS.load(Ordering::Acquire),
@@ -1839,6 +1910,10 @@ impl Efr32Driver {
             }
         }
 
+        // Re-arm RX before task-level ACK processing/logging. Indirect data
+        // may follow the ACK within a few milliseconds.
+        self.start_rx();
+
         #[cfg(feature = "efr32-trace")]
         if frame.len >= 3 && (u16::from_le_bytes([frame.data[0], frame.data[1]]) & 0x07) == 0x02 {
             efr32_trace!(
@@ -1871,31 +1946,34 @@ impl Efr32Driver {
             return Err(RadioError::NotInitialized);
         }
 
-        RX_DONE.reset();
+        // receive_ack() may already have re-armed RX and the ISR may have
+        // captured the indirect frame before this future is created.
+        let frame_ready = RX_DONE.try_take().is_some();
 
-        // RXWARM through RX2RX are valid receive states. RXOVERFLOW and all
-        // TX/turnaround/error states are normalized before restarting RX.
-        let rac_state_before = self.rac_state();
-        if rac_state_before >= RAC_STATE_RXOVERFLOW {
-            if !self.force_radio_idle() {
-                self.debug_snapshot("rx-recovery-failed");
-                return Err(RadioError::HardwareError);
+        if !frame_ready {
+            // RXWARM through RX2RX are valid receive states. RXOVERFLOW and all
+            // TX/turnaround/error states are normalized before restarting RX.
+            let rac_state_before = self.rac_state();
+            if rac_state_before >= RAC_STATE_RXOVERFLOW {
+                if !self.force_radio_idle() {
+                    self.debug_snapshot("rx-recovery-failed");
+                    return Err(RadioError::HardwareError);
+                }
             }
-            RX_DONE.reset();
+
+            // After TX, the sequencer returned to IDLE (RADIO_TRANSITIONS).
+            // We need to restart RX.
+            // Just clear flags, clear buffers, and re-enable RXENSRCEN.
+            reg_write(BUFC_BUF1_CMD, 1); // clear RX buffer
+            reg_write(BUFC_BUF2_CMD, 1); // clear length buffer
+            reg_write(FRC_IFC, 0xFFFF_FFFF); // clear FRC flags
+
+            // Restart RX via sequencer
+            reg_write(RAC_IFPGACTRL, 0x0000_87E6);
+            self.start_rx();
+
+            RX_DONE.wait().await;
         }
-
-        // After TX, the sequencer returned to IDLE (RADIO_TRANSITIONS).
-        // We need to restart RX.
-        // Just clear flags, clear buffers, and re-enable RXENSRCEN.
-        reg_write(BUFC_BUF1_CMD, 1); // clear RX buffer
-        reg_write(BUFC_BUF2_CMD, 1); // clear length buffer
-        reg_write(FRC_IFC, 0xFFFF_FFFF); // clear FRC flags
-
-        // Restart RX via sequencer
-        reg_write(RAC_IFPGACTRL, 0x0000_87E6);
-        self.start_rx();
-
-        RX_DONE.wait().await;
 
         if !RX_CRC_OK.load(Ordering::Acquire) {
             return Err(RadioError::CrcError);
@@ -1962,6 +2040,16 @@ impl Efr32Driver {
 
     pub fn cca_samples(&self) -> u16 {
         self.cca_samples
+    }
+
+    pub fn software_ack_snapshot(&self) -> (u32, u32, u32, u8, u8) {
+        (
+            SOFTWARE_ACK_STARTED.load(Ordering::Acquire),
+            SOFTWARE_ACK_COMPLETED.load(Ordering::Acquire),
+            SOFTWARE_ACK_FAILED.load(Ordering::Acquire),
+            SOFTWARE_ACK_LAST_DSN.load(Ordering::Acquire),
+            SOFTWARE_ACK_LAST_RAC_STATE.load(Ordering::Acquire),
+        )
     }
 
     pub fn cancel_pending_operation(&self) -> bool {
@@ -2059,6 +2147,130 @@ impl Efr32Driver {
 
 // ── IRQ handler ─────────────────────────────────────────────────
 
+#[inline(always)]
+fn software_ack_destination_matches(raw: &[u8]) -> Option<u8> {
+    if !SOFTWARE_ACK_ENABLED.load(Ordering::Acquire) || raw.len() < 6 {
+        return None;
+    }
+
+    let frame_control = u16::from_le_bytes([raw[1], raw[2]]);
+    let frame_type = frame_control & 0x07;
+    let destination_mode = (frame_control >> 10) & 0x03;
+
+    if frame_type == 0x02
+        || frame_control & (1 << 5) == 0
+        || frame_control & (1 << 8) != 0
+        || !matches!(destination_mode, 0x02 | 0x03)
+    {
+        return None;
+    }
+
+    let destination_pan = u16::from_le_bytes([raw[4], raw[5]]);
+    let configured_pan = SOFTWARE_ACK_PAN_ID.load(Ordering::Acquire) as u16;
+    if configured_pan == 0xFFFF || (destination_pan != configured_pan && destination_pan != 0xFFFF)
+    {
+        return None;
+    }
+
+    match destination_mode {
+        0x02 => {
+            if raw.len() < 8 {
+                return None;
+            }
+            let destination = u16::from_le_bytes([raw[6], raw[7]]);
+            let configured = SOFTWARE_ACK_SHORT_ADDRESS.load(Ordering::Acquire) as u16;
+            if destination == 0xFFFF || configured == 0xFFFF || destination != configured {
+                return None;
+            }
+        }
+        0x03 => {
+            if raw.len() < 14 {
+                return None;
+            }
+            if u32::from_le_bytes([raw[6], raw[7], raw[8], raw[9]])
+                != SOFTWARE_ACK_EXTENDED_ADDRESS_LOW.load(Ordering::Acquire)
+                || u32::from_le_bytes([raw[10], raw[11], raw[12], raw[13]])
+                    != SOFTWARE_ACK_EXTENDED_ADDRESS_HIGH.load(Ordering::Acquire)
+            {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+
+    Some(raw[3])
+}
+
+#[inline(always)]
+fn early_software_ack_destination_matches(raw: &[u8]) -> Option<u8> {
+    if !SOFTWARE_ACK_ENABLED.load(Ordering::Acquire) || raw.len() < 14 {
+        return None;
+    }
+
+    let frame_control = u16::from_le_bytes([raw[1], raw[2]]);
+    let frame_type = frame_control & 0x07;
+    let destination_mode = (frame_control >> 10) & 0x03;
+
+    if !matches!(frame_type, 0x01 | 0x03)
+        || frame_control & (1 << 5) == 0
+        || frame_control & (1 << 8) != 0
+    {
+        return None;
+    }
+
+    match destination_mode {
+        0x02 => {
+            let destination = u16::from_le_bytes([raw[6], raw[7]]);
+            let configured = SOFTWARE_ACK_SHORT_ADDRESS.load(Ordering::Acquire) as u16;
+            if destination == 0xFFFF || configured == 0xFFFF || destination != configured {
+                return None;
+            }
+        }
+        0x03 => {
+            if u32::from_le_bytes([raw[6], raw[7], raw[8], raw[9]])
+                != SOFTWARE_ACK_EXTENDED_ADDRESS_LOW.load(Ordering::Acquire)
+                || u32::from_le_bytes([raw[10], raw[11], raw[12], raw[13]])
+                    != SOFTWARE_ACK_EXTENDED_ADDRESS_HIGH.load(Ordering::Acquire)
+            {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+
+    Some(raw[3])
+}
+
+#[inline(always)]
+fn prepare_software_ack_from_isr(sequence: u8, issue_txen: bool) {
+    reg_write(BUFC_BUF0_CMD, 1);
+    reg_write(CRC_CMD, 0x0000_0001);
+    reg_write(PROTIMER_WRAPCNT, 0);
+    reg_write(BUFC_BUF0_WRITEDATA, 5);
+    reg_write(BUFC_BUF0_WRITEDATA, 0x02);
+    reg_write(BUFC_BUF0_WRITEDATA, 0x00);
+    reg_write(BUFC_BUF0_WRITEDATA, sequence as u32);
+    reg_write(FRC_WCNTCMP0, 0);
+    reg_write(FRC_IFC, FRC_IF_TXDONE | _FRC_IF_TXABORTED | _FRC_IF_TXUF);
+
+    reg_write(RAC_IFPGACTRL, reg_read(RAC_IFPGACTRL) | (1 << 16));
+    SOFTWARE_ACK_TX_PENDING.store(true, Ordering::Release);
+    SOFTWARE_ACK_LAST_DSN.store(sequence, Ordering::Release);
+    SOFTWARE_ACK_LAST_RAC_STATE.store(
+        ((reg_read(RAC_STATUS) & RAC_STATUS_STATE_MASK) >> RAC_STATUS_STATE_SHIFT) as u8,
+        Ordering::Release,
+    );
+    SOFTWARE_ACK_STARTED.fetch_add(1, Ordering::Relaxed);
+
+    if issue_txen {
+        reg_write(RAC_SR0_SET, 1 << 7);
+        reg_write(RAC_SR0_CLEAR, 1 << 3);
+        reg_write(SEQ_CONTROL_REG, reg_read(SEQ_CONTROL_REG) & !0x20);
+        reg_write(SEQ_RXFRAME_TX_TIME, TX_WARM_TICKS | (TX_PRE_TICKS << 16));
+        reg_write(RAC_CMD, RAC_CMD_TXEN);
+    }
+}
+
 /// RAC/FRC interrupt handler for EFR32MG1P radio.
 ///
 /// Reads IRQ status from both RAC and FRC, processes TX/RX completion,
@@ -2072,16 +2284,49 @@ pub extern "C" fn FRC_PRI() {
     let frc_flags = reg_read(FRC_IF);
     LAST_TX_FRC_FLAGS.store(frc_flags, Ordering::Release);
 
-    // Clear all pending IRQs
+    // RAC flags are independent of the FRC header state used by auto-ACK.
     reg_write(RAC_IFC, rac_flags);
     reg_write(FRC_IFC, frc_flags);
 
-    if frc_flags & (_FRC_IF_TXABORTED | _FRC_IF_TXUF) != 0 {
-        TX_DONE.signal(false);
+    if frc_flags & FRC_IF_WCNTCMP2 != 0
+        && !SOFTWARE_ACK_TX_PENDING.load(Ordering::Acquire)
+        && !SOFTWARE_ACK_PREARMED.load(Ordering::Acquire)
+        && ((reg_read(RAC_STATUS) & RAC_STATUS_STATE_MASK) >> RAC_STATUS_STATE_SHIFT)
+            == RAC_STATE_RXFRAME
+    {
+        let sequence = unsafe {
+            let raw = &(&(*BUFC_RX_RAM.get()).0)[..14];
+            early_software_ack_destination_matches(raw)
+        };
+        if let Some(sequence) = sequence {
+            SOFTWARE_ACK_PREARMED_DSN.store(sequence, Ordering::Release);
+            SOFTWARE_ACK_PREARMED.store(true, Ordering::Release);
+            reg_write(RAC_SR0_SET, 1 << 7);
+            reg_write(RAC_SR0_CLEAR, 1 << 3);
+            reg_write(SEQ_CONTROL_REG, reg_read(SEQ_CONTROL_REG) & !0x20);
+            reg_write(SEQ_RXFRAME_TX_TIME, TX_WARM_TICKS | (TX_PRE_TICKS << 16));
+            reg_write(RAC_CMD, RAC_CMD_TXEN);
+        }
     }
 
-    // TX completion (FRC_IF_TXDONE = bit 0)
-    if frc_flags & FRC_IF_TXDONE != 0 {
+    if frc_flags & (_FRC_IF_TXABORTED | _FRC_IF_TXUF) != 0 {
+        SOFTWARE_ACK_PREARMED.store(false, Ordering::Release);
+        if SOFTWARE_ACK_TX_PENDING.swap(false, Ordering::AcqRel) {
+            SOFTWARE_ACK_FAILED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            TX_DONE.signal(false);
+        }
+    }
+
+    let auto_ack_done = frc_flags & FRC_IF_TXAFTERFRAMEDONE != 0;
+    let auto_ack_tx_done =
+        frc_flags & FRC_IF_TXDONE != 0 && SOFTWARE_ACK_TX_PENDING.load(Ordering::Acquire);
+    if auto_ack_done || auto_ack_tx_done {
+        SOFTWARE_ACK_TX_PENDING.store(false, Ordering::Release);
+        SOFTWARE_ACK_COMPLETED.fetch_add(1, Ordering::Relaxed);
+        reg_write(BUFC_BUF1_CMD, 1);
+        reg_write(BUFC_BUF2_CMD, 1);
+    } else if frc_flags & FRC_IF_TXDONE != 0 {
         TX_DONE.signal(true);
     }
 
@@ -2095,32 +2340,71 @@ pub extern "C" fn FRC_PRI() {
         RX_CRC_OK.store(crc_ok, Ordering::Release);
 
         if crc_ok {
-            // Read byte count from BUFC BUF1 (RX) status, bits [12:0]
+            let prearmed_sequence = if SOFTWARE_ACK_PREARMED.swap(false, Ordering::AcqRel) {
+                Some(SOFTWARE_ACK_PREARMED_DSN.load(Ordering::Acquire))
+            } else {
+                None
+            };
+
+            if let Some(sequence) = prearmed_sequence {
+                prepare_software_ack_from_isr(sequence, false);
+            }
+
             let status = reg_read(BUFC_BUF1_STATUS);
             let len = ((status & 0x1FFF) as usize).min(MAX_FRAME_LEN);
-
             RX_LEN.store(len as u8, Ordering::Release);
 
             RX_RSSI.store(read_agc_rssi_dbm(), Ordering::Release);
 
-            // Read frame data byte-by-byte from BUFC BUF1 (RX buffer)
             unsafe {
                 let buf = &mut *RX_BUF.get();
-                for i in 0..len {
-                    buf[i] = (reg_read(BUFC_BUF1_READDATA) & 0xFF) as u8;
+                let header_len = len.min(14);
+                for byte in buf.iter_mut().take(header_len) {
+                    *byte = (reg_read(BUFC_BUF1_READDATA) & 0xFF) as u8;
+                }
+
+                let frame_control = if header_len >= 3 {
+                    u16::from_le_bytes([buf[1], buf[2]])
+                } else {
+                    0
+                };
+                let is_ack = frame_control & 0x07 == 0x02;
+                let expected_ack = is_ack
+                    && header_len >= 4
+                    && EXPECTED_ACK_PENDING.load(Ordering::Acquire)
+                    && buf[3] == EXPECTED_ACK_DSN.load(Ordering::Acquire);
+
+                if is_ack && !expected_ack {
+                    for _ in header_len..len {
+                        let _ = reg_read(BUFC_BUF1_READDATA);
+                    }
+                    reg_write(BUFC_BUF1_CMD, 1);
+                    reg_write(BUFC_BUF2_CMD, 1);
+                    reg_write(SEQ_CONTROL_REG, reg_read(SEQ_CONTROL_REG) & !0x20);
+                    reg_write(FRC_CMD, FRC_CMD_FRAMEDETRESUME);
+                    reg_write(_RAC_RXENSRCEN, reg_read(_RAC_RXENSRCEN) | 0x02);
+                    return;
+                }
+
+                if expected_ack {
+                    EXPECTED_ACK_PENDING.store(false, Ordering::Release);
+                }
+
+                if prearmed_sequence.is_none()
+                    && let Some(sequence) = software_ack_destination_matches(&buf[..header_len])
+                {
+                    prepare_software_ack_from_isr(sequence, true);
+                }
+
+                for byte in buf.iter_mut().take(len).skip(header_len) {
+                    *byte = (reg_read(BUFC_BUF1_READDATA) & 0xFF) as u8;
                 }
             }
 
-            // Re-arm in interrupt context immediately after copying the
-            // completed frame. A parent's indirect frame can start shortly
-            // after its frame-pending ACK; waiting for the async task to wake
-            // and restart RX misses that turnaround. RX_BUF is independent of
-            // BUFC, so the hardware buffers can be recycled now.
-            reg_write(BUFC_BUF1_CMD, 1);
-            reg_write(BUFC_BUF2_CMD, 1);
-            reg_write(SEQ_CONTROL_REG, reg_read(SEQ_CONTROL_REG) & !0x20);
-            reg_write(FRC_CMD, FRC_CMD_FRAMEDETRESUME);
-            reg_write(_RAC_RXENSRCEN, reg_read(_RAC_RXENSRCEN) | 0x02);
+            if !SOFTWARE_ACK_TX_PENDING.load(Ordering::Acquire) {
+                reg_write(BUFC_BUF1_CMD, 1);
+                reg_write(BUFC_BUF2_CMD, 1);
+            }
         } else {
             RX_LEN.store(0, Ordering::Release);
         }
@@ -2130,6 +2414,10 @@ pub extern "C" fn FRC_PRI() {
 
     // RX overflow (FRC_IF_RXOF = bit 8) or frame error (bit 6)
     if frc_flags & (FRC_IF_RXOF | FRC_IF_FRAMEERROR) != 0 {
+        SOFTWARE_ACK_PREARMED.store(false, Ordering::Release);
+        if SOFTWARE_ACK_TX_PENDING.swap(false, Ordering::AcqRel) {
+            SOFTWARE_ACK_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
         RX_CRC_OK.store(false, Ordering::Release);
         RX_LEN.store(0, Ordering::Release);
         RX_DONE.signal(());

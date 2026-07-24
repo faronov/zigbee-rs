@@ -269,7 +269,7 @@ unsafe fn modify(address: u32, mask: u32, value: u32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        EXTIPSELH_OFFSET, EXTIPSELL_OFFSET, EXTIPINSELH_OFFSET, EXTIPINSELL_OFFSET,
+        EXTIPINSELH_OFFSET, EXTIPINSELL_OFFSET, EXTIPSELH_OFFSET, EXTIPSELL_OFFSET,
         interrupt_pin_select, interrupt_port_select,
     };
 

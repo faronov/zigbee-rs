@@ -19,6 +19,18 @@ pub const BDB_PRIMARY_CHANNEL_SET: ChannelMask =
 pub const BDB_SECONDARY_CHANNEL_SET: ChannelMask =
     ChannelMask(ChannelMask::ALL_2_4GHZ.0 & !BDB_PRIMARY_CHANNEL_SET.0); // 0x05EF_7000
 
+/// Common low-interference Zigbee channels, including channel 15.
+///
+/// Steering gives channel 15 its own first scan, then scans the remaining
+/// channels in this set before falling back to the rest of the 2.4 GHz band.
+pub const BDB_POPULAR_CHANNEL_SET: ChannelMask = ChannelMask(
+    (1 << 11) | (1 << 14) | (1 << 15) | (1 << 19) | (1 << 20) | (1 << 24) | (1 << 25) | (1 << 26),
+);
+
+/// All 2.4 GHz channels not included in [`BDB_POPULAR_CHANNEL_SET`].
+pub const BDB_POPULAR_CHANNEL_FALLBACK_SET: ChannelMask =
+    ChannelMask(ChannelMask::ALL_2_4GHZ.0 & !BDB_POPULAR_CHANNEL_SET.0);
+
 /// BDB minimum commissioning time for Finding & Binding (seconds).
 pub const BDB_MIN_COMMISSIONING_TIME: u16 = 180;
 

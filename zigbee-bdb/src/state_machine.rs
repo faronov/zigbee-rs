@@ -145,7 +145,10 @@ impl<M: MacDriver> BdbLayer<M> {
     /// 3. Network Formation (if enabled and coordinator-capable)
     /// 4. Finding & Binding (if enabled and on a network)
     ///
-    /// Returns `Ok` if at least one method succeeded.
+    /// Returns `Ok` once at least one method has started successfully. Network
+    /// Steering returns at network-up; when it arms the unique-TCLK exchange,
+    /// the caller must drive [`crate::BdbLayer::advance_tclk_exchange`] before
+    /// starting later commissioning methods.
     pub async fn commission(&mut self) -> Result<(), BdbStatus> {
         let mode = self.attributes.commissioning_mode;
         let cap = self.attributes.node_commissioning_capability;
@@ -186,8 +189,12 @@ impl<M: MacDriver> BdbLayer<M> {
             self.state = BdbState::NetworkSteering;
             match self.network_steering().await {
                 Ok(()) => {
-                    log::info!("[BDB] Network Steering succeeded");
+                    log::info!("[BDB] Network Steering reached network-up");
                     any_success = true;
+                    if self.tclk_exchange_active() {
+                        self.state = BdbState::Idle;
+                        return Ok(());
+                    }
                 }
                 Err(e) => {
                     log::warn!("[BDB] Network Steering failed: {:?}", e);

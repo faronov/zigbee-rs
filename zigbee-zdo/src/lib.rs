@@ -190,6 +190,11 @@ pub enum ZdoError {
 
 // ── The ZDO layer ───────────────────────────────────────────────
 
+#[cfg(not(feature = "constrained-memory"))]
+const MAX_LOCAL_ENDPOINTS: usize = 32;
+#[cfg(feature = "constrained-memory")]
+const MAX_LOCAL_ENDPOINTS: usize = 4;
+
 /// Zigbee Device Object layer, generic over the MAC driver.
 ///
 /// Owns the APS layer and all ZDO-local state (descriptors, endpoint
@@ -200,7 +205,7 @@ pub struct ZdoLayer<M: MacDriver> {
     /// ZDP transaction-sequence-number counter.
     seq: u8,
     /// Registered application endpoints with their simple descriptors.
-    endpoints: heapless::Vec<SimpleDescriptor, 32>,
+    endpoints: heapless::Vec<SimpleDescriptor, MAX_LOCAL_ENDPOINTS>,
     /// This node's node descriptor.
     node_descriptor: NodeDescriptor,
     /// This node's power descriptor.

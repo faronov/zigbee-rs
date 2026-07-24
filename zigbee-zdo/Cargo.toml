@@ -12,3 +12,7 @@ zigbee-mac  = { version = "0.1.0", path = "../zigbee-mac" }
 zigbee-nwk  = { version = "0.1.0", path = "../zigbee-nwk" }
 zigbee-aps  = { version = "0.1.0", path = "../zigbee-aps" }
 log = "0.4"
+
+[features]
+default = []
+constrained-memory = []

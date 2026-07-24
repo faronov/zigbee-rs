@@ -15,14 +15,15 @@
 //! 1. Open local permit joining for `bdbcMinCommissioningTime`
 //! 2. Broadcast `Mgmt_Permit_Joining_req` to the network
 
-use zigbee_aps::security::ApsKeyType;
+use zigbee_aps::security::{ApsKeyType, ApsLinkKeyEntry};
 use zigbee_mac::MacDriver;
 use zigbee_nwk::DeviceType;
-use zigbee_types::ShortAddress;
+use zigbee_types::{ChannelMask, ShortAddress};
 use zigbee_zdo::ZdpStatus;
 use zigbee_zdo::discovery::NodeDescRsp;
 
 use crate::attributes::BDB_MIN_COMMISSIONING_TIME;
+use crate::tclk_exchange::{TCLK_EXCHANGE_TIMEOUT_US, TclkExchange, TclkProgress, TclkStage};
 use crate::{
     BdbLayer, BdbStatus, KeyFrameResult, NetworkSecurityState, SecurityPersistence,
     SteeringDiagnostics, SteeringStage, TrustCenterLinkKeyState,
@@ -42,12 +43,212 @@ macro_rules! bdb_diag {
 /// Default scan duration exponent for active scan (2^n + 1 superframes).
 /// Exponent 3 ≈ 138 ms per channel — good balance of speed vs. reliability.
 const SCAN_DURATION: u8 = 3;
-// Official Telink BDB sends one initial Node_Desc request plus three retries.
-const TCLK_EXCHANGE_ATTEMPTS: u8 = 4;
-const TCLK_EXCHANGE_START_DELAY_US: u32 = 1_200_000;
-const TCLK_EXCHANGE_TIMEOUT_US: u32 = 5_000_000;
-const TCLK_EXCHANGE_POLL_INTERVAL_US: u32 = 50_000;
+// The unique Trust Center link-key handshake timing/budget lives in the
+// event-driven state machine (`crate::tclk_exchange`).
 const TCLK_MIN_STACK_REVISION: u8 = 21;
+const FIRST_SCAN_CHANNEL: u8 = 15;
+
+fn ordered_steering_channel_sets(primary: ChannelMask, secondary: ChannelMask) -> [ChannelMask; 3] {
+    let first_channel_bit = 1u32 << FIRST_SCAN_CHANNEL;
+    let first = ChannelMask(primary.0 & first_channel_bit);
+    let preferred = ChannelMask(primary.0 & !first_channel_bit);
+    let fallback = ChannelMask(secondary.0 & !primary.0);
+    [first, preferred, fallback]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steering_scans_channel_15_then_primary_then_secondary() {
+        let primary = ChannelMask((1 << 11) | (1 << 15) | (1 << 20));
+        let secondary = ChannelMask((1 << 12) | (1 << 20) | (1 << 25));
+
+        assert_eq!(
+            ordered_steering_channel_sets(primary, secondary),
+            [
+                ChannelMask(1 << 15),
+                ChannelMask((1 << 11) | (1 << 20)),
+                ChannelMask((1 << 12) | (1 << 25)),
+            ]
+        );
+    }
+
+    #[test]
+    fn steering_preserves_primary_order_when_channel_15_is_not_primary() {
+        let primary = ChannelMask((1 << 20) | (1 << 25));
+        let secondary = ChannelMask((1 << 15) | (1 << 26));
+
+        assert_eq!(
+            ordered_steering_channel_sets(primary, secondary),
+            [ChannelMask(0), primary, secondary]
+        );
+    }
+
+    // ── Event-driven unique-TCLK exchange integration ───────
+
+    use core::future::Future;
+    use zigbee_aps::ApsLayer;
+    use zigbee_mac::PlatformServices;
+    use zigbee_mac::mock::MockMac;
+    use zigbee_nwk::{DeviceType, NwkLayer};
+    use zigbee_zdo::ZdoLayer;
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut context = Context::from_waker(&waker);
+        let mut future = core::pin::pin!(future);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+        }
+    }
+
+    fn test_bdb() -> BdbLayer<MockMac> {
+        let mac = MockMac::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        let nwk = NwkLayer::new(mac, DeviceType::EndDevice);
+        let aps = ApsLayer::new(nwk);
+        let zdo = ZdoLayer::new(aps);
+        BdbLayer::new(zdo)
+    }
+
+    fn advance_time(bdb: &mut BdbLayer<MockMac>, micros: u32) {
+        block_on(
+            bdb.zdo_mut()
+                .aps_mut()
+                .nwk_mut()
+                .mac_mut()
+                .delay_micros(micros),
+        );
+    }
+
+    #[test]
+    fn tclk_exchange_fails_and_resets_after_attempt_budget() {
+        let tc_ieee = [0xAA; 8];
+        let mut bdb = test_bdb();
+        bdb.arm_tclk_exchange_for_test(ShortAddress::COORDINATOR, tc_ieee);
+        assert!(bdb.tclk_exchange_active());
+        assert!(bdb.is_on_network());
+
+        // No Node_Desc_rsp is ever injected, so each attempt must time out.
+        // Advancing mock time between bounded steps drives the machine to its
+        // terminal failure without monopolising a single long future.
+        let mut result = None;
+        for _ in 0..512 {
+            match block_on(bdb.advance_tclk_exchange(None)) {
+                TclkProgress::InProgress => advance_time(&mut bdb, 2_000_000),
+                terminal => {
+                    result = Some(terminal);
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            result,
+            Some(TclkProgress::Failed(
+                BdbStatus::TrustCenterLinkKeyExchangeFailure
+            )),
+            "exhausting the attempt budget must fail the exchange"
+        );
+        assert!(
+            !bdb.tclk_exchange_active(),
+            "a terminal exchange must be cleared"
+        );
+        assert!(
+            !bdb.is_on_network(),
+            "failure must reset the on-network flag consistently"
+        );
+        assert!(bdb.steering_diagnostics().node_desc_requests >= 1);
+    }
+
+    #[test]
+    fn advance_without_armed_exchange_reports_complete() {
+        let mut bdb = test_bdb();
+        assert!(!bdb.tclk_exchange_active());
+        assert_eq!(
+            block_on(bdb.advance_tclk_exchange(None)),
+            TclkProgress::Complete
+        );
+    }
+
+    #[derive(Default)]
+    struct TestPersistence {
+        reserved: Option<TrustCenterLinkKeyState>,
+        committed: Option<TrustCenterLinkKeyState>,
+    }
+
+    impl SecurityPersistence for TestPersistence {
+        fn reserve_network_security(
+            &mut self,
+            _state: &NetworkSecurityState,
+        ) -> Result<crate::CounterReservation, crate::SecurityPersistenceError> {
+            unreachable!()
+        }
+
+        fn reserve_trust_center_link_key(
+            &mut self,
+            state: &TrustCenterLinkKeyState,
+        ) -> Result<crate::CounterReservation, crate::SecurityPersistenceError> {
+            self.reserved = Some(*state);
+            Ok(crate::CounterReservation {
+                current: 0x400,
+                limit: 0x800,
+            })
+        }
+
+        fn commit_network(
+            &mut self,
+            state: &TrustCenterLinkKeyState,
+        ) -> Result<(), crate::SecurityPersistenceError> {
+            self.committed = Some(*state);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pre_r21_commits_configured_default_trust_center_key() {
+        let tc_ieee = [0xAA; 8];
+        let mut bdb = test_bdb();
+        let expected_key = *bdb.zdo().aps().security().default_tc_link_key();
+        let mut exchange = TclkExchange::new(ShortAddress::COORDINATOR, tc_ieee, 0);
+        let mut persistence = TestPersistence::default();
+
+        assert_eq!(
+            bdb.finalize_pre_r21(&mut exchange, Some(&mut persistence)),
+            TclkProgress::Complete
+        );
+        assert_eq!(
+            persistence.reserved,
+            Some(TrustCenterLinkKeyState {
+                partner_address: tc_ieee,
+                key: expected_key,
+                key_type: ApsKeyType::TrustCenterLinkKey,
+                outgoing_frame_counter: 0,
+                incoming_frame_counter: 0,
+                incoming_frame_counter_valid: false,
+            })
+        );
+        assert_eq!(persistence.committed.unwrap().outgoing_frame_counter, 0x400);
+        let stored = bdb
+            .zdo()
+            .aps()
+            .security()
+            .find_key(&tc_ieee, ApsKeyType::TrustCenterLinkKey)
+            .unwrap();
+        assert_eq!(stored.key, expected_key);
+        assert_eq!(stored.outgoing_frame_counter, 0x400);
+        assert_eq!(stored.outgoing_frame_counter_limit, 0x800);
+    }
+}
 
 impl<M: MacDriver> BdbLayer<M> {
     fn security_exchange_timed_out(&self, started: u32) -> bool {
@@ -60,120 +261,25 @@ impl<M: MacDriver> BdbLayer<M> {
             >= TCLK_EXCHANGE_TIMEOUT_US
     }
 
-    async fn receive_security_exchange_frame(&mut self) -> bool {
-        if self.zdo.nwk().rx_on_when_idle() {
-            match self
-                .zdo
-                .aps_mut()
-                .nwk_mut()
-                .mac_mut()
-                .mcps_data_indication()
-                .await
-            {
-                Ok(frame) => {
-                    self.try_process_frame(frame.payload.as_slice());
-                    true
-                }
-                Err(_) => false,
-            }
-        } else {
-            self.steering_diagnostics.poll_attempts =
-                self.steering_diagnostics.poll_attempts.saturating_add(1);
-            match self.zdo.aps_mut().nwk_mut().mac_mut().mlme_poll().await {
-                Ok(Some(frame)) => {
-                    self.steering_diagnostics.poll_data_frames =
-                        self.steering_diagnostics.poll_data_frames.saturating_add(1);
-                    self.try_process_frame(frame.as_slice());
-                    true
-                }
-                Ok(None) => false,
-                Err(_) => {
-                    self.steering_diagnostics.poll_errors =
-                        self.steering_diagnostics.poll_errors.saturating_add(1);
-                    false
-                }
-            }
-        }
-    }
-
-    async fn wait_for_security_condition(
-        &mut self,
-        started: u32,
-        rounds: &mut u16,
-        mut ready: impl FnMut(&Self) -> bool,
-    ) -> bool {
-        loop {
-            if ready(self) {
-                return true;
-            }
-            if self.security_exchange_timed_out(started) {
-                return false;
-            }
-
-            self.receive_security_exchange_frame().await;
-            *rounds = rounds.saturating_add(1);
-
-            if ready(self) {
-                return true;
-            }
-            if self.security_exchange_timed_out(started) {
-                return false;
-            }
-
-            self.zdo
-                .aps_mut()
-                .nwk_mut()
-                .mac_mut()
-                .delay_micros(TCLK_EXCHANGE_POLL_INTERVAL_US)
-                .await;
-        }
-    }
-
-    async fn wait_for_zdp_response(
-        &mut self,
-        slot: usize,
-        started: u32,
-        rounds: &mut u16,
-    ) -> Option<heapless::Vec<u8, 128>> {
-        loop {
-            if let Some(response) = self.zdo.take_response(slot) {
-                return Some(response);
-            }
-            if self.security_exchange_timed_out(started) {
-                self.zdo.cancel_pending(slot);
-                return None;
-            }
-
-            self.receive_security_exchange_frame().await;
-            *rounds = rounds.saturating_add(1);
-
-            if let Some(response) = self.zdo.take_response(slot) {
-                return Some(response);
-            }
-            if self.security_exchange_timed_out(started) {
-                self.zdo.cancel_pending(slot);
-                return None;
-            }
-
-            self.zdo
-                .aps_mut()
-                .nwk_mut()
-                .mac_mut()
-                .delay_micros(TCLK_EXCHANGE_POLL_INTERVAL_US)
-                .await;
-        }
-    }
-
     /// Execute the Network Steering procedure (BDB spec §8.3).
     ///
     /// Behaviour depends on `bdbNodeIsOnANetwork`:
     /// - **Not on network**: scan → join → announce → TC key exchange
     /// - **On network**: open permit joining → broadcast Mgmt_Permit_Joining_req
+    ///
+    /// Runs the pre-network work (scan → join → Transport-Key →
+    /// `Device_annce`) and arms the post-network unique-TCLK exchange. It
+    /// returns once the network is up; the caller must continue normal stack
+    /// processing and call [`Self::advance_tclk_exchange`] until completion.
     pub async fn network_steering(&mut self) -> Result<(), BdbStatus> {
         self.network_steering_inner(None).await
     }
 
-    /// Execute Network Steering with synchronous security persistence.
+    /// Event-driven Network Steering with synchronous security persistence.
+    ///
+    /// Network security is reserved before `Device_annce`; the unique TCLK and
+    /// its counter are reserved before Verify-Key and the network is committed
+    /// only after Confirm-Key while advancing the exchange.
     pub async fn network_steering_with_persistence(
         &mut self,
         persistence: &mut dyn SecurityPersistence,
@@ -183,9 +289,10 @@ impl<M: MacDriver> BdbLayer<M> {
 
     async fn network_steering_inner(
         &mut self,
-        persistence: Option<&mut dyn SecurityPersistence>,
+        persistence: Option<&mut (dyn SecurityPersistence + '_)>,
     ) -> Result<(), BdbStatus> {
         self.steering_diagnostics = SteeringDiagnostics::default();
+        self.tclk_exchange = None;
         if self.attributes.node_is_on_a_network {
             self.steer_on_network().await
         } else {
@@ -193,10 +300,38 @@ impl<M: MacDriver> BdbLayer<M> {
         }
     }
 
+    /// Advance the armed unique Trust Center link-key exchange by one bounded
+    /// step (GSDK update-tc-link-key, event-driven).
+    ///
+    /// Performs at most one non-blocking action per call — a single transmit,
+    /// or a check of already-received ZDO/APS security state plus the
+    /// per-attempt timeout — so the application/runtime keeps servicing normal
+    /// traffic between calls. Returns [`TclkProgress::Complete`] only after a
+    /// pre-R21 determination or a successful unique-key Verify/Confirm, and
+    /// [`TclkProgress::Failed`] after resetting/leaving the network
+    /// consistently once the attempt budget is exhausted (or on a persistence
+    /// error). When no exchange is armed it returns [`TclkProgress::Complete`].
+    ///
+    /// `persistence`, when supplied, reserves the unique TCLK/counter before
+    /// Verify-Key and commits the commissioned network only after Confirm-Key.
+    pub async fn advance_tclk_exchange(
+        &mut self,
+        persistence: Option<&mut (dyn SecurityPersistence + '_)>,
+    ) -> TclkProgress {
+        let Some(mut exchange) = self.tclk_exchange.take() else {
+            return TclkProgress::Complete;
+        };
+        let progress = self.step_tclk_exchange(&mut exchange, persistence).await;
+        if matches!(progress, TclkProgress::InProgress) {
+            self.tclk_exchange = Some(exchange);
+        }
+        progress
+    }
+
     /// Steering when the device is NOT on a network — join an existing PAN.
     async fn steer_off_network(
         &mut self,
-        mut persistence: Option<&mut dyn SecurityPersistence>,
+        mut persistence: Option<&mut (dyn SecurityPersistence + '_)>,
     ) -> Result<(), BdbStatus> {
         self.steering_diagnostics.stage = SteeringStage::Scanning;
         let mut discovered_any = false;
@@ -217,18 +352,23 @@ impl<M: MacDriver> BdbLayer<M> {
             self.attributes.steering_attempts_remaining,
         );
 
-        // Try primary channels first, then secondary
-        let channel_sets = [
+        // Give channel 15 a short dedicated first chance, then scan the rest
+        // of the primary set and finally the non-overlapping secondary set.
+        let channel_sets = ordered_steering_channel_sets(
             self.attributes.primary_channel_set,
             self.attributes.secondary_channel_set,
-        ];
+        );
 
         for (idx, &channel_mask) in channel_sets.iter().enumerate() {
             if channel_mask.0 == 0 {
                 continue;
             }
 
-            let set_name = if idx == 0 { "primary" } else { "secondary" };
+            let set_name = match idx {
+                0 => "channel 15",
+                1 => "preferred",
+                _ => "fallback",
+            };
             log::debug!(
                 "[BDB:Steering] Scanning {} channels: 0x{:08X}",
                 set_name,
@@ -281,13 +421,11 @@ impl<M: MacDriver> BdbLayer<M> {
                 );
             }
 
-            // Step 3: Try joining networks — prefer coordinator (depth=0) for
-            // reliable Transport-Key delivery. Some routers don't properly relay
-            // the "Update Device" APS command to the TC, so direct coordinator
-            // association is more reliable.
-            // First pass: coordinator beacons only (depth == 0)
-            // Second pass: all other routers
-            for prefer_coordinator in [true, false] {
+            // Step 3: Try routers before the coordinator. Coordinators often
+            // have a small or saturated child table, while nearby routers are
+            // the normal parents for sleepy devices. Keep the coordinator as
+            // a fallback for sparse networks without an eligible router.
+            for prefer_coordinator in [false, true] {
                 for network in &networks {
                     // Apply extended PAN ID filter
                     if has_epid_filter && network.extended_pan_id != use_epid {
@@ -309,7 +447,7 @@ impl<M: MacDriver> BdbLayer<M> {
                         continue;
                     }
 
-                    // Two-pass: coordinators first, then routers
+                    // Two-pass: routers first, then coordinator fallback.
                     let is_coordinator = network.depth == 0;
                     if prefer_coordinator && !is_coordinator {
                         pass_skips = pass_skips.saturating_add(1);
@@ -443,6 +581,7 @@ impl<M: MacDriver> BdbLayer<M> {
                                         break;
                                     }
                                 }
+
                                 Err(_) => {
                                     bdb_diag!("[BDB] passive_rx[{}] none", rx_attempt);
                                 }
@@ -628,10 +767,12 @@ impl<M: MacDriver> BdbLayer<M> {
                         continue;
                     }
 
-                    // Step 5d: Retrieve a unique Trust Center link key, then
-                    // prove possession and wait for a successful Confirm-Key.
-                    // The official Telink BDB gives the complete exchange
-                    // five seconds and retries it up to three times.
+                    // Step 5d: retrieve a unique Trust Center link key, prove
+                    // possession, and wait for a successful Confirm-Key. In the
+                    // GSDK model this runs *after* the network is up: we arm an
+                    // explicit bounded state machine here and let the runtime
+                    // advance it one step per tick/poll while normal ZDO/ZCL
+                    // processing and sleepy polling continue.
                     let tc_addr = ShortAddress::COORDINATOR;
                     let tc_ieee = self.zdo.aps().aib().aps_trust_center_address;
                     if tc_ieee == [0u8; 8] {
@@ -643,299 +784,18 @@ impl<M: MacDriver> BdbLayer<M> {
                         return Err(BdbStatus::TrustCenterLinkKeyExchangeFailure);
                     }
 
-                    self.zdo
-                        .aps_mut()
-                        .nwk_mut()
-                        .mac_mut()
-                        .delay_micros(TCLK_EXCHANGE_START_DELAY_US)
-                        .await;
-
-                    let mut tclk_exchange_complete = false;
-                    for _ in 0..TCLK_EXCHANGE_ATTEMPTS {
-                        self.zdo
-                            .aps_mut()
-                            .security_mut()
-                            .remove_key(&tc_ieee, ApsKeyType::TrustCenterLinkKey);
-
-                        let exchange_started = self.zdo.aps().nwk().mac().monotonic_micros();
-                        let mut exchange_rounds = 0u16;
-                        self.steering_diagnostics.stage =
-                            SteeringStage::QueryingTrustCenterNodeDescriptor;
-                        self.steering_diagnostics.node_desc_requests = self
-                            .steering_diagnostics
-                            .node_desc_requests
-                            .saturating_add(1);
-                        let node_desc_slot = match self.zdo.start_node_desc_req(tc_addr).await {
-                            Ok(slot) => slot,
-                            Err(e) => {
-                                self.steering_diagnostics.node_desc_send_failures = self
-                                    .steering_diagnostics
-                                    .node_desc_send_failures
-                                    .saturating_add(1);
-                                self.steering_diagnostics.last_node_desc_status = e as u8;
-                                log::warn!("[BDB:Steering] Node_Desc_req failed: {:?}", e);
-                                let _ = self
-                                    .wait_for_security_condition(
-                                        exchange_started,
-                                        &mut exchange_rounds,
-                                        |_| false,
-                                    )
-                                    .await;
-                                continue;
-                            }
-                        };
-
-                        let node_desc_payload = match self
-                            .wait_for_zdp_response(
-                                node_desc_slot,
-                                exchange_started,
-                                &mut exchange_rounds,
-                            )
-                            .await
-                        {
-                            Some(payload) => payload,
-                            None => {
-                                self.steering_diagnostics.node_desc_timeouts = self
-                                    .steering_diagnostics
-                                    .node_desc_timeouts
-                                    .saturating_add(1);
-                                log::warn!("[BDB:Steering] Node_Desc_rsp timed out");
-                                continue;
-                            }
-                        };
-                        self.steering_diagnostics.node_desc_responses = self
-                            .steering_diagnostics
-                            .node_desc_responses
-                            .saturating_add(1);
-
-                        let node_desc = match NodeDescRsp::parse(node_desc_payload.as_slice()) {
-                            Ok(response) => response,
-                            Err(e) => {
-                                self.steering_diagnostics.node_desc_parse_failures = self
-                                    .steering_diagnostics
-                                    .node_desc_parse_failures
-                                    .saturating_add(1);
-                                log::warn!("[BDB:Steering] Invalid Node_Desc_rsp: {:?}", e);
-                                let _ = self
-                                    .wait_for_security_condition(
-                                        exchange_started,
-                                        &mut exchange_rounds,
-                                        |_| false,
-                                    )
-                                    .await;
-                                continue;
-                            }
-                        };
-                        self.steering_diagnostics.last_node_desc_status = node_desc.status as u8;
-                        if node_desc.status != ZdpStatus::Success
-                            || node_desc.nwk_addr_of_interest != tc_addr
-                        {
-                            log::warn!(
-                                "[BDB:Steering] Node_Desc_rsp rejected: status={:?} addr=0x{:04X}",
-                                node_desc.status,
-                                node_desc.nwk_addr_of_interest.0,
-                            );
-                            let _ = self
-                                .wait_for_security_condition(
-                                    exchange_started,
-                                    &mut exchange_rounds,
-                                    |_| false,
-                                )
-                                .await;
-                            continue;
-                        }
-
-                        let Some(node_descriptor) = node_desc.node_descriptor else {
-                            self.steering_diagnostics.node_desc_parse_failures = self
-                                .steering_diagnostics
-                                .node_desc_parse_failures
-                                .saturating_add(1);
-                            let _ = self
-                                .wait_for_security_condition(
-                                    exchange_started,
-                                    &mut exchange_rounds,
-                                    |_| false,
-                                )
-                                .await;
-                            continue;
-                        };
-                        let stack_revision = node_descriptor.stack_revision();
-                        self.steering_diagnostics.trust_center_server_mask =
-                            node_descriptor.server_mask;
-                        self.steering_diagnostics.trust_center_stack_revision = stack_revision;
-                        log::info!(
-                            "[BDB:Steering] Trust Center stack revision {} (server mask 0x{:04X})",
-                            stack_revision,
-                            node_descriptor.server_mask,
-                        );
-
-                        if stack_revision < TCLK_MIN_STACK_REVISION {
-                            log::info!(
-                                "[BDB:Steering] Pre-R21 Trust Center; unique link-key exchange not required"
-                            );
-                            tclk_exchange_complete = true;
-                            break;
-                        }
-
-                        self.steering_diagnostics.stage =
-                            SteeringStage::RequestingTrustCenterLinkKey;
-                        self.steering_diagnostics.request_key_attempts = self
-                            .steering_diagnostics
-                            .request_key_attempts
-                            .saturating_add(1);
-                        match self.zdo.aps_mut().send_request_key(tc_addr).await {
-                            Ok(()) => {
-                                self.steering_diagnostics.request_key_send_successes = self
-                                    .steering_diagnostics
-                                    .request_key_send_successes
-                                    .saturating_add(1);
-                                self.steering_diagnostics.request_key_error = 0;
-                            }
-                            Err(e) => {
-                                self.steering_diagnostics.request_key_send_failures = self
-                                    .steering_diagnostics
-                                    .request_key_send_failures
-                                    .saturating_add(1);
-                                self.steering_diagnostics.request_key_error = e as u8;
-                                log::warn!("[BDB:Steering] Request-Key failed: {:?}", e);
-                                let _ = self
-                                    .wait_for_security_condition(
-                                        exchange_started,
-                                        &mut exchange_rounds,
-                                        |_| false,
-                                    )
-                                    .await;
-                                continue;
-                            }
-                        }
-
-                        self.steering_diagnostics.stage =
-                            SteeringStage::WaitingForTrustCenterLinkKey;
-                        let tclk_installed = self
-                            .wait_for_security_condition(
-                                exchange_started,
-                                &mut exchange_rounds,
-                                |bdb| {
-                                    bdb.zdo
-                                        .aps()
-                                        .security()
-                                        .find_key(&tc_ieee, ApsKeyType::TrustCenterLinkKey)
-                                        .is_some()
-                                },
-                            )
-                            .await;
-                        if !tclk_installed {
-                            log::warn!("[BDB:Steering] Unique TC link key was not received");
-                            continue;
-                        }
-                        self.steering_diagnostics.tclk_installations = self
-                            .steering_diagnostics
-                            .tclk_installations
-                            .saturating_add(1);
-
-                        if let Some(persistence) = persistence.as_deref_mut()
-                            && let Err(error) =
-                                self.reserve_trust_center_link_key(persistence, &tc_ieee)
-                        {
-                            self.steering_diagnostics.stage = SteeringStage::PersistenceFailed;
-                            log::error!(
-                                "[BDB:Steering] Failed to persist Trust Center link key: {:?}",
-                                error
-                            );
-                            self.zdo
-                                .aps_mut()
-                                .security_mut()
-                                .remove_key(&tc_ieee, ApsKeyType::TrustCenterLinkKey);
-                            let _ = self.zdo.nlme_reset(false);
-                            return Err(BdbStatus::PersistenceFailure);
-                        }
-
-                        let handshake_before = self.zdo.aps().security_handshake_stats();
-                        self.steering_diagnostics.stage = SteeringStage::VerifyingLinkKey;
-                        self.steering_diagnostics.verify_key_attempts = self
-                            .steering_diagnostics
-                            .verify_key_attempts
-                            .saturating_add(1);
-                        match self.zdo.aps_mut().send_tc_verify_key(tc_addr).await {
-                            Ok(()) => {
-                                self.steering_diagnostics.verify_key_successes = self
-                                    .steering_diagnostics
-                                    .verify_key_successes
-                                    .saturating_add(1);
-                                self.steering_diagnostics.verify_key_error = 0;
-                            }
-                            Err(e) => {
-                                self.steering_diagnostics.verify_key_error = e as u8;
-                                log::warn!("[BDB:Steering] Verify-Key failed: {:?}", e);
-                                continue;
-                            }
-                        }
-
-                        self.steering_diagnostics.stage = SteeringStage::WaitingForConfirmKey;
-                        let confirm_seen = self
-                            .wait_for_security_condition(
-                                exchange_started,
-                                &mut exchange_rounds,
-                                |bdb| {
-                                    let stats = bdb.zdo.aps().security_handshake_stats();
-                                    stats.confirm_key_successes
-                                        > handshake_before.confirm_key_successes
-                                        || stats.confirm_key_rejections
-                                            > handshake_before.confirm_key_rejections
-                                },
-                            )
-                            .await;
-                        let handshake_after = self.zdo.aps().security_handshake_stats();
-                        self.steering_diagnostics.confirm_key_frames =
-                            handshake_after.confirm_key_received;
-                        self.steering_diagnostics.confirm_key_successes =
-                            handshake_after.confirm_key_successes;
-                        self.steering_diagnostics.confirm_key_rejections =
-                            handshake_after.confirm_key_rejections;
-                        self.steering_diagnostics.last_confirm_key_status =
-                            handshake_after.last_confirm_key_status;
-
-                        if confirm_seen
-                            && handshake_after.confirm_key_successes
-                                > handshake_before.confirm_key_successes
-                        {
-                            tclk_exchange_complete = true;
-                            break;
-                        }
-                    }
-
-                    if !tclk_exchange_complete {
-                        self.steering_diagnostics.stage =
-                            SteeringStage::TrustCenterLinkKeyExchangeFailed;
-                        self.attributes.commissioning_status =
-                            crate::attributes::BdbCommissioningStatus::TcLinkKeyExchangeFailure;
-                        self.zdo
-                            .aps_mut()
-                            .security_mut()
-                            .remove_key(&tc_ieee, ApsKeyType::TrustCenterLinkKey);
-                        let _ = self.zdo.nlme_reset(false);
-                        return Err(BdbStatus::TrustCenterLinkKeyExchangeFailure);
-                    }
-
-                    if let Some(persistence) = persistence.as_deref_mut()
-                        && let Err(error) = self.commit_persisted_network(persistence, &tc_ieee)
-                    {
-                        self.steering_diagnostics.stage = SteeringStage::PersistenceFailed;
-                        log::error!(
-                            "[BDB:Steering] Failed to commit commissioned network: {:?}",
-                            error
-                        );
-                        return Err(BdbStatus::PersistenceFailure);
-                    }
-
-                    // Success!
+                    // The network is up. Mark the node on-network so the runtime
+                    // resumes normal servicing immediately (GSDK EMBER_NETWORK_UP);
+                    // the durable "commissioned" flag is only committed after
+                    // Confirm-Key via the persistence hook.
                     self.attributes.node_is_on_a_network = true;
-                    self.attributes.commissioning_status =
-                        crate::attributes::BdbCommissioningStatus::Success;
-                    self.steering_diagnostics.stage = SteeringStage::Complete;
-
-                    bdb_diag!("[BDB] steering=ok addr=0x{:04X}", nwk_addr.0);
-                    log::info!("[BDB:Steering] Joined successfully as 0x{:04X}", nwk_addr.0,);
+                    let now = self.zdo.aps().nwk().mac().monotonic_micros();
+                    self.tclk_exchange = Some(TclkExchange::new(tc_addr, tc_ieee, now));
+                    bdb_diag!("[BDB] steering=network_up addr=0x{:04X}", nwk_addr.0);
+                    log::info!(
+                        "[BDB:Steering] Network up as 0x{:04X} — unique TCLK exchange armed",
+                        nwk_addr.0,
+                    );
                     return Ok(());
                 }
             } // end prefer_coordinator pass
@@ -1075,6 +935,400 @@ impl<M: MacDriver> BdbLayer<M> {
             })
             .ok_or(crate::SecurityPersistenceError::InvalidState)?;
         persistence.commit_network(&state)
+    }
+
+    // ── Event-driven unique TCLK exchange ───────────────────
+
+    /// Advance the exchange by one bounded step. See
+    /// [`Self::advance_tclk_exchange`] for the public contract.
+    async fn step_tclk_exchange(
+        &mut self,
+        ex: &mut TclkExchange,
+        mut persistence: Option<&mut (dyn SecurityPersistence + '_)>,
+    ) -> TclkProgress {
+        let now = self.zdo.aps().nwk().mac().monotonic_micros();
+        match ex.stage {
+            TclkStage::StartDelay => {
+                if ex.start_delay_elapsed(now) {
+                    ex.begin_attempt(now);
+                }
+                TclkProgress::InProgress
+            }
+
+            TclkStage::SendNodeDesc => {
+                // Fresh attempt — drop any stale unique key so a retry cannot
+                // reuse partial security material.
+                self.zdo
+                    .aps_mut()
+                    .security_mut()
+                    .remove_key(&ex.tc_ieee, ApsKeyType::TrustCenterLinkKey);
+                self.steering_diagnostics.stage = SteeringStage::QueryingTrustCenterNodeDescriptor;
+                self.steering_diagnostics.node_desc_requests = self
+                    .steering_diagnostics
+                    .node_desc_requests
+                    .saturating_add(1);
+                match self.zdo.start_node_desc_req(ex.tc_addr).await {
+                    Ok(slot) => {
+                        ex.node_desc_slot = Some(slot);
+                        ex.stage = TclkStage::AwaitNodeDesc;
+                    }
+                    Err(e) => {
+                        self.steering_diagnostics.node_desc_send_failures = self
+                            .steering_diagnostics
+                            .node_desc_send_failures
+                            .saturating_add(1);
+                        self.steering_diagnostics.last_node_desc_status = e as u8;
+                        log::warn!("[BDB:Steering] Node_Desc_req failed: {:?}", e);
+                        ex.stage = TclkStage::AttemptCooldown;
+                    }
+                }
+                TclkProgress::InProgress
+            }
+
+            TclkStage::AwaitNodeDesc => {
+                let slot = match ex.node_desc_slot {
+                    Some(slot) => slot,
+                    None => {
+                        ex.stage = TclkStage::AttemptCooldown;
+                        return TclkProgress::InProgress;
+                    }
+                };
+                if let Some(payload) = self.zdo.take_response(slot) {
+                    ex.node_desc_slot = None;
+                    ex.restart_stage_timeout(now);
+                    self.steering_diagnostics.node_desc_responses = self
+                        .steering_diagnostics
+                        .node_desc_responses
+                        .saturating_add(1);
+                    self.handle_node_desc_payload(ex, &payload, persistence.as_deref_mut())
+                } else if ex.attempt_timed_out(now) {
+                    self.zdo.cancel_pending(slot);
+                    ex.node_desc_slot = None;
+                    self.steering_diagnostics.node_desc_timeouts = self
+                        .steering_diagnostics
+                        .node_desc_timeouts
+                        .saturating_add(1);
+                    log::warn!("[BDB:Steering] Node_Desc_rsp timed out");
+                    self.retry_or_fail(ex, now)
+                } else {
+                    TclkProgress::InProgress
+                }
+            }
+
+            TclkStage::SendRequestKey => {
+                self.steering_diagnostics.stage = SteeringStage::RequestingTrustCenterLinkKey;
+                self.steering_diagnostics.request_key_attempts = self
+                    .steering_diagnostics
+                    .request_key_attempts
+                    .saturating_add(1);
+                match self.zdo.aps_mut().send_request_key(ex.tc_addr).await {
+                    Ok(()) => {
+                        ex.restart_stage_timeout(self.zdo.aps().nwk().mac().monotonic_micros());
+                        self.steering_diagnostics.request_key_send_successes = self
+                            .steering_diagnostics
+                            .request_key_send_successes
+                            .saturating_add(1);
+                        self.steering_diagnostics.request_key_error = 0;
+                        ex.stage = TclkStage::AwaitTclk;
+                    }
+                    Err(e) => {
+                        self.steering_diagnostics.request_key_send_failures = self
+                            .steering_diagnostics
+                            .request_key_send_failures
+                            .saturating_add(1);
+                        self.steering_diagnostics.request_key_error = e as u8;
+                        log::warn!("[BDB:Steering] Request-Key failed: {:?}", e);
+                        ex.stage = TclkStage::AttemptCooldown;
+                    }
+                }
+                TclkProgress::InProgress
+            }
+
+            TclkStage::AwaitTclk => {
+                self.steering_diagnostics.stage = SteeringStage::WaitingForTrustCenterLinkKey;
+                let installed = self
+                    .zdo
+                    .aps()
+                    .security()
+                    .find_key(&ex.tc_ieee, ApsKeyType::TrustCenterLinkKey)
+                    .is_some();
+                if installed {
+                    self.steering_diagnostics.tclk_installations = self
+                        .steering_diagnostics
+                        .tclk_installations
+                        .saturating_add(1);
+                    // Reserve the unique TCLK/counter *before* Verify-Key.
+                    if let Some(persistence) = persistence.as_deref_mut()
+                        && let Err(error) =
+                            self.reserve_trust_center_link_key(persistence, &ex.tc_ieee)
+                    {
+                        log::error!(
+                            "[BDB:Steering] Failed to persist Trust Center link key: {:?}",
+                            error
+                        );
+                        return self.finalize_persistence_failure(ex);
+                    }
+                    let stats = self.zdo.aps().security_handshake_stats();
+                    ex.confirm_success_baseline = stats.confirm_key_successes;
+                    ex.confirm_reject_baseline = stats.confirm_key_rejections;
+                    ex.restart_stage_timeout(now);
+                    ex.stage = TclkStage::SendVerifyKey;
+                    TclkProgress::InProgress
+                } else if ex.attempt_timed_out(now) {
+                    log::warn!("[BDB:Steering] Unique TC link key was not received");
+                    self.retry_or_fail(ex, now)
+                } else {
+                    TclkProgress::InProgress
+                }
+            }
+
+            TclkStage::SendVerifyKey => {
+                self.steering_diagnostics.stage = SteeringStage::VerifyingLinkKey;
+                self.steering_diagnostics.verify_key_attempts = self
+                    .steering_diagnostics
+                    .verify_key_attempts
+                    .saturating_add(1);
+                match self.zdo.aps_mut().send_tc_verify_key(ex.tc_addr).await {
+                    Ok(()) => {
+                        ex.restart_stage_timeout(self.zdo.aps().nwk().mac().monotonic_micros());
+                        self.steering_diagnostics.verify_key_successes = self
+                            .steering_diagnostics
+                            .verify_key_successes
+                            .saturating_add(1);
+                        self.steering_diagnostics.verify_key_error = 0;
+                        ex.stage = TclkStage::AwaitConfirmKey;
+                    }
+                    Err(e) => {
+                        self.steering_diagnostics.verify_key_error = e as u8;
+                        log::warn!("[BDB:Steering] Verify-Key failed: {:?}", e);
+                        ex.stage = TclkStage::AttemptCooldown;
+                    }
+                }
+                TclkProgress::InProgress
+            }
+
+            TclkStage::AwaitConfirmKey => {
+                self.steering_diagnostics.stage = SteeringStage::WaitingForConfirmKey;
+                let stats = self.zdo.aps().security_handshake_stats();
+                self.steering_diagnostics.confirm_key_frames = stats.confirm_key_received;
+                self.steering_diagnostics.confirm_key_successes = stats.confirm_key_successes;
+                self.steering_diagnostics.confirm_key_rejections = stats.confirm_key_rejections;
+                self.steering_diagnostics.last_confirm_key_status = stats.last_confirm_key_status;
+
+                if stats.confirm_key_successes > ex.confirm_success_baseline {
+                    self.finalize_tclk_success(ex, persistence.as_deref_mut())
+                } else if stats.confirm_key_rejections > ex.confirm_reject_baseline {
+                    log::warn!("[BDB:Steering] Confirm-Key rejected by Trust Center");
+                    self.retry_or_fail(ex, now)
+                } else if ex.attempt_timed_out(now) {
+                    log::warn!("[BDB:Steering] Confirm-Key not received");
+                    self.retry_or_fail(ex, now)
+                } else {
+                    TclkProgress::InProgress
+                }
+            }
+
+            TclkStage::AttemptCooldown => {
+                // Drain the remainder of the failed attempt's window before
+                // retrying, matching the pacing of the original blocking loop.
+                if ex.attempt_timed_out(now) {
+                    self.retry_or_fail(ex, now)
+                } else {
+                    TclkProgress::InProgress
+                }
+            }
+
+            TclkStage::Complete => TclkProgress::Complete,
+            TclkStage::Failed => TclkProgress::Failed(BdbStatus::TrustCenterLinkKeyExchangeFailure),
+        }
+    }
+
+    /// Parse a Node_Desc_rsp and decide the next stage: pre-R21 completes the
+    /// exchange, R21+ proceeds to the unique-key request; a rejected or
+    /// malformed response cools down and retries.
+    fn handle_node_desc_payload(
+        &mut self,
+        ex: &mut TclkExchange,
+        payload: &[u8],
+        persistence: Option<&mut (dyn SecurityPersistence + '_)>,
+    ) -> TclkProgress {
+        let node_desc = match NodeDescRsp::parse(payload) {
+            Ok(response) => response,
+            Err(e) => {
+                self.steering_diagnostics.node_desc_parse_failures = self
+                    .steering_diagnostics
+                    .node_desc_parse_failures
+                    .saturating_add(1);
+                log::warn!("[BDB:Steering] Invalid Node_Desc_rsp: {:?}", e);
+                ex.stage = TclkStage::AttemptCooldown;
+                return TclkProgress::InProgress;
+            }
+        };
+        self.steering_diagnostics.last_node_desc_status = node_desc.status as u8;
+        if node_desc.status != ZdpStatus::Success || node_desc.nwk_addr_of_interest != ex.tc_addr {
+            log::warn!(
+                "[BDB:Steering] Node_Desc_rsp rejected: status={:?} addr=0x{:04X}",
+                node_desc.status,
+                node_desc.nwk_addr_of_interest.0,
+            );
+            ex.stage = TclkStage::AttemptCooldown;
+            return TclkProgress::InProgress;
+        }
+        let Some(node_descriptor) = node_desc.node_descriptor else {
+            self.steering_diagnostics.node_desc_parse_failures = self
+                .steering_diagnostics
+                .node_desc_parse_failures
+                .saturating_add(1);
+            ex.stage = TclkStage::AttemptCooldown;
+            return TclkProgress::InProgress;
+        };
+        let stack_revision = node_descriptor.stack_revision();
+        self.steering_diagnostics.trust_center_server_mask = node_descriptor.server_mask;
+        self.steering_diagnostics.trust_center_stack_revision = stack_revision;
+        log::info!(
+            "[BDB:Steering] Trust Center stack revision {} (server mask 0x{:04X})",
+            stack_revision,
+            node_descriptor.server_mask,
+        );
+
+        if stack_revision < TCLK_MIN_STACK_REVISION {
+            log::info!(
+                "[BDB:Steering] Pre-R21 Trust Center; unique link-key exchange not required"
+            );
+            return self.finalize_pre_r21(ex, persistence);
+        }
+
+        ex.stage = TclkStage::SendRequestKey;
+        TclkProgress::InProgress
+    }
+
+    /// Common success finalisation shared by the pre-R21 and confirmed paths.
+    fn mark_commissioned_success(&mut self, ex: &mut TclkExchange) -> TclkProgress {
+        self.attributes.node_is_on_a_network = true;
+        self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::Success;
+        self.steering_diagnostics.stage = SteeringStage::Complete;
+        ex.stage = TclkStage::Complete;
+        bdb_diag!("[BDB] tclk_exchange=complete");
+        log::info!("[BDB:Steering] Commissioning security complete");
+        TclkProgress::Complete
+    }
+
+    fn finalize_pre_r21(
+        &mut self,
+        ex: &mut TclkExchange,
+        persistence: Option<&mut (dyn SecurityPersistence + '_)>,
+    ) -> TclkProgress {
+        if let Some(persistence) = persistence {
+            let key = *self.zdo.aps().security().default_tc_link_key();
+            let mut state = TrustCenterLinkKeyState {
+                partner_address: ex.tc_ieee,
+                key,
+                key_type: ApsKeyType::TrustCenterLinkKey,
+                outgoing_frame_counter: 0,
+                incoming_frame_counter: 0,
+                incoming_frame_counter_valid: false,
+            };
+            let reservation = match persistence.reserve_trust_center_link_key(&state) {
+                Ok(reservation) if reservation.is_valid() => reservation,
+                Ok(_) => {
+                    log::error!("[BDB:Steering] Invalid pre-R21 TCLK counter reservation");
+                    return self.finalize_persistence_failure(ex);
+                }
+                Err(error) => {
+                    log::error!(
+                        "[BDB:Steering] Failed to reserve pre-R21 Trust Center key: {:?}",
+                        error
+                    );
+                    return self.finalize_persistence_failure(ex);
+                }
+            };
+            state.outgoing_frame_counter = reservation.current;
+            if let Err(_entry) = self.zdo.aps_mut().security_mut().add_key(ApsLinkKeyEntry {
+                partner_address: ex.tc_ieee,
+                key,
+                key_type: ApsKeyType::TrustCenterLinkKey,
+                outgoing_frame_counter: reservation.current,
+                outgoing_frame_counter_limit: reservation.limit,
+                incoming_frame_counter: 0,
+                incoming_frame_counter_valid: false,
+            }) {
+                log::error!("[BDB:Steering] Failed to install pre-R21 Trust Center key");
+                return self.finalize_persistence_failure(ex);
+            }
+            if let Err(error) = persistence.commit_network(&state) {
+                log::error!(
+                    "[BDB:Steering] Failed to commit pre-R21 commissioned network: {:?}",
+                    error
+                );
+                return self.finalize_persistence_failure(ex);
+            }
+        }
+        self.mark_commissioned_success(ex)
+    }
+
+    /// Commit the commissioned network after a successful Confirm-Key.
+    fn finalize_tclk_success(
+        &mut self,
+        ex: &mut TclkExchange,
+        persistence: Option<&mut (dyn SecurityPersistence + '_)>,
+    ) -> TclkProgress {
+        if let Some(persistence) = persistence
+            && let Err(error) = self.commit_persisted_network(persistence, &ex.tc_ieee)
+        {
+            log::error!(
+                "[BDB:Steering] Failed to commit commissioned network: {:?}",
+                error
+            );
+            return self.finalize_persistence_failure(ex);
+        }
+        self.mark_commissioned_success(ex)
+    }
+
+    /// Decrement the attempt budget and either start a fresh attempt or fail
+    /// the exchange, resetting/leaving the network consistently.
+    fn retry_or_fail(&mut self, ex: &mut TclkExchange, now: u32) -> TclkProgress {
+        self.zdo
+            .aps_mut()
+            .security_mut()
+            .remove_key(&ex.tc_ieee, ApsKeyType::TrustCenterLinkKey);
+        if let Some(slot) = ex.node_desc_slot.take() {
+            self.zdo.cancel_pending(slot);
+        }
+        if ex.record_attempt_failure() {
+            self.finalize_exchange_failure(ex)
+        } else {
+            ex.begin_attempt(now);
+            TclkProgress::InProgress
+        }
+    }
+
+    /// Terminal failure after exhausting the attempt budget.
+    fn finalize_exchange_failure(&mut self, ex: &mut TclkExchange) -> TclkProgress {
+        ex.stage = TclkStage::Failed;
+        self.steering_diagnostics.stage = SteeringStage::TrustCenterLinkKeyExchangeFailed;
+        self.attributes.commissioning_status =
+            crate::attributes::BdbCommissioningStatus::TcLinkKeyExchangeFailure;
+        self.reset_after_tclk_failure(&ex.tc_ieee);
+        TclkProgress::Failed(BdbStatus::TrustCenterLinkKeyExchangeFailure)
+    }
+
+    /// Terminal failure caused by a durable-persistence error.
+    fn finalize_persistence_failure(&mut self, ex: &mut TclkExchange) -> TclkProgress {
+        ex.stage = TclkStage::Failed;
+        self.steering_diagnostics.stage = SteeringStage::PersistenceFailed;
+        self.reset_after_tclk_failure(&ex.tc_ieee);
+        TclkProgress::Failed(BdbStatus::PersistenceFailure)
+    }
+
+    /// Reset security/network state consistently after a failed exchange so
+    /// the device does not linger half-commissioned.
+    fn reset_after_tclk_failure(&mut self, tc_ieee: &zigbee_types::IeeeAddress) {
+        self.zdo
+            .aps_mut()
+            .security_mut()
+            .remove_key(tc_ieee, ApsKeyType::TrustCenterLinkKey);
+        let _ = self.zdo.nlme_reset(false);
+        self.attributes.node_is_on_a_network = false;
     }
 
     /// Steering when the device IS already on a network.
