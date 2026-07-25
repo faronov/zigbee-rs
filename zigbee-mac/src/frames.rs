@@ -512,6 +512,67 @@ pub fn parse_association_response(data: &[u8]) -> Option<(ShortAddress, u8)> {
     Some((ShortAddress(short), status))
 }
 
+/// Return the sequence number if `data` is an IEEE 802.15.4 ACK frame.
+pub fn ack_sequence(data: &[u8]) -> Option<u8> {
+    if data.len() < 3 {
+        return None;
+    }
+    let frame_type = data[0] & 0x07;
+    (frame_type == 0x02).then_some(data[2])
+}
+
+/// Return `(sequence, frame_pending)` if `data` is an IEEE 802.15.4 ACK frame.
+///
+/// An ACK carries no addresses, so the sequence number is the only way to tell
+/// our acknowledgement apart from one that another pair of nodes exchanged on
+/// the same channel. The frame-pending bit is what a sleepy end device reads
+/// after a Data Request to learn whether the parent has traffic buffered for
+/// it.
+pub fn ack_info(data: &[u8]) -> Option<(u8, bool)> {
+    let sequence = ack_sequence(data)?;
+    Some((sequence, data[0] & 0x10 != 0))
+}
+
+/// Decide whether a received frame is addressed to this node.
+///
+/// This mirrors IEEE 802.15.4-2015 §6.7.2 third-level filtering and must agree
+/// with whatever the radio's hardware address filter is programmed with —
+/// otherwise the hardware acknowledges frames software then throws away (or,
+/// worse, software accepts frames the hardware never acknowledged).
+///
+/// `our_short` is `0xFFFF` while unassociated; broadcast short addresses
+/// (`0xFFFF`, `0xFFFD`, `0xFFFC`) are always accepted, and an unassociated node
+/// (`our_pan == 0xFFFF`) accepts any PAN so that the association response and
+/// the Transport-Key can be received.
+pub fn frame_is_for_us(
+    dst: &MacAddress,
+    our_pan: PanId,
+    our_short: ShortAddress,
+    our_extended: &IeeeAddress,
+) -> bool {
+    let pan_ok = |pan: PanId| pan.0 == our_pan.0 || pan.0 == 0xFFFF || our_pan.0 == 0xFFFF;
+    match dst {
+        MacAddress::Short(pan, addr) => {
+            pan_ok(*pan)
+                && (matches!(addr.0, 0xFFFF | 0xFFFD | 0xFFFC)
+                    || (our_short.0 != 0xFFFF && addr.0 == our_short.0))
+        }
+        MacAddress::Extended(pan, addr) => pan_ok(*pan) && addr == our_extended,
+    }
+}
+
+/// Convert an EUI-64 into the big-endian word expected by radio drivers that
+/// take the extended address as a `u64`.
+///
+/// [`IeeeAddress`] holds the bytes in the order the MAC writes them into the
+/// addressing fields (IEEE 802.15.4 transmits extended addresses
+/// least-significant octet first). `esp-radio`'s `Config::ext_addr` is fed to
+/// the hardware through `u64::to_be_bytes()`, so the round-trip only preserves
+/// the on-air ordering if the word is built with `from_be_bytes`.
+pub fn ieee_address_as_be_word(address: &IeeeAddress) -> u64 {
+    u64::from_be_bytes(*address)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,5 +706,101 @@ mod tests {
             [1, 2, 3, 4, 5, 6, 7, 8]
         );
         assert_eq!(descriptor.zigbee_beacon.update_id, 9);
+    }
+
+    #[test]
+    fn ack_frames_are_detected_by_sequence() {
+        // FCF 0x0200 = ACK, sequence 0x42
+        assert_eq!(ack_sequence(&[0x02, 0x00, 0x42]), Some(0x42));
+        // Data frame must never be mistaken for an ACK
+        assert_eq!(ack_sequence(&[0x61, 0x88, 0x42, 0x34, 0x12]), None);
+        assert_eq!(ack_sequence(&[0x02, 0x00]), None);
+    }
+
+    #[test]
+    fn ack_frame_pending_bit_is_read_with_the_sequence_number() {
+        // FCF 0x0200: ACK, no frame pending.
+        assert_eq!(ack_info(&[0x02, 0x00, 0x42]), Some((0x42, false)));
+        // FCF 0x0212: ACK with the frame-pending bit set — the parent has data
+        // buffered for us and we must keep listening.
+        assert_eq!(ack_info(&[0x12, 0x00, 0x42]), Some((0x42, true)));
+        // A data frame with the same bit set is not an ACK.
+        assert_eq!(ack_info(&[0x61, 0x88, 0x42, 0x34, 0x12]), None);
+    }
+
+    #[test]
+    fn address_filter_accepts_our_unicast_and_broadcasts() {
+        let our_pan = PanId(0xDFE9);
+        let our_short = ShortAddress(0x167E);
+        let our_ieee: IeeeAddress = [0x62, 0x55, 0xF9, 0xFF, 0xFE, 0xF6, 0x96, 0x88];
+
+        for accepted in [
+            MacAddress::Short(our_pan, our_short),
+            MacAddress::Short(our_pan, ShortAddress(0xFFFF)),
+            MacAddress::Short(our_pan, ShortAddress(0xFFFD)),
+            MacAddress::Short(our_pan, ShortAddress(0xFFFC)),
+            MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+            // Transport-Key and Association Response are IEEE addressed —
+            // these are the frames that used to require promiscuous mode.
+            MacAddress::Extended(our_pan, our_ieee),
+        ] {
+            assert!(
+                frame_is_for_us(&accepted, our_pan, our_short, &our_ieee),
+                "{accepted:?} must be accepted"
+            );
+        }
+
+        for rejected in [
+            MacAddress::Short(our_pan, ShortAddress(0x1F0F)),
+            MacAddress::Short(PanId(0x1234), our_short),
+            MacAddress::Extended(our_pan, [0; 8]),
+        ] {
+            assert!(
+                !frame_is_for_us(&rejected, our_pan, our_short, &our_ieee),
+                "{rejected:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn unassociated_node_does_not_claim_short_broadcast_as_unicast() {
+        let our_ieee: IeeeAddress = [0x62, 0x55, 0xF9, 0xFF, 0xFE, 0xF6, 0x96, 0x88];
+        // While unassociated macShortAddress is 0xFFFF; that must not turn
+        // every 0xFFFF-addressed frame into a "unicast for us" match, and the
+        // IEEE-addressed association response must still be accepted.
+        assert!(frame_is_for_us(
+            &MacAddress::Extended(PanId(0xDFE9), our_ieee),
+            PanId(0xFFFF),
+            ShortAddress(0xFFFF),
+            &our_ieee,
+        ));
+        assert!(!frame_is_for_us(
+            &MacAddress::Short(PanId(0xDFE9), ShortAddress(0x0001)),
+            PanId(0xFFFF),
+            ShortAddress(0xFFFF),
+            &our_ieee,
+        ));
+    }
+
+    #[test]
+    fn hardware_filter_word_round_trips_to_on_air_order() {
+        // The MAC writes IeeeAddress verbatim into the addressing fields, and
+        // esp-radio hands Config::ext_addr to the radio via to_be_bytes(), so
+        // the two must be identical byte sequences.
+        let ieee: IeeeAddress = [0x62, 0x55, 0xF9, 0xFF, 0xFE, 0xF6, 0x96, 0x88];
+        assert_eq!(ieee_address_as_be_word(&ieee).to_be_bytes(), ieee);
+
+        let request = build_association_request(
+            0x01,
+            &MacAddress::Short(PanId(0xDFE9), ShortAddress(0x0000)),
+            &ieee,
+            &CapabilityInfo::default(),
+        );
+        let on_air_source = &request[9..17];
+        assert_eq!(
+            on_air_source,
+            ieee_address_as_be_word(&ieee).to_be_bytes(),
+            "hardware filter must be programmed with the bytes we transmit"
+        );
     }
 }

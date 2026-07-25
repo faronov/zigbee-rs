@@ -19,11 +19,16 @@ mod driver;
 use crate::pib::{self, PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use crate::{MacCapabilities, MacDriver, MacError, PlatformServices};
-use driver::Ieee802154Driver;
+use driver::{Ieee802154Driver, TxAckResult};
 use zigbee_types::*;
 
 use embassy_time::{Duration, Instant, Timer};
 use esp_radio::ieee802154::{Config, Ieee802154};
+
+/// How long to wait for the parent to deliver an indirect frame after a Data
+/// Request. The parent transmits the buffered frame immediately after the MAC
+/// acknowledgement, so this only has to cover CSMA plus one frame.
+const POLL_RESPONSE_MS: u64 = 250;
 
 /// ESP32 802.15.4 MAC driver.
 pub struct EspMac<'a> {
@@ -36,6 +41,7 @@ pub struct EspMac<'a> {
     coord_short_address: ShortAddress,
     rx_on_when_idle: bool,
     association_permit: bool,
+    associated_pan_coord: bool,
     auto_request: bool,
     dsn: u8,
     bsn: u8,
@@ -51,18 +57,29 @@ pub struct EspMac<'a> {
 }
 
 impl<'a> EspMac<'a> {
-    pub fn new(ieee802154: Ieee802154<'a>, config: Config) -> Self {
+    pub fn new(ieee802154: Ieee802154<'a>, mut config: Config) -> Self {
         let ieee = Self::read_efuse_ieee();
+
+        // Program the hardware address filter from the start. Without the
+        // extended address the radio drops (and never acknowledges) the
+        // IEEE-addressed Association Response and Transport-Key frames, which
+        // is what forced the old code into promiscuous mode — and promiscuous
+        // mode is exactly what disables the hardware ACK generator.
+        config.pan_id = Some(0xFFFF);
+        config.short_addr = Some(0xFFFF);
+        config.ext_addr = Some(crate::frames::ieee_address_as_be_word(&ieee));
+        config.promiscuous = false;
 
         Self {
             driver: Ieee802154Driver::new(ieee802154, config),
             short_address: ShortAddress(0xFFFF),
             pan_id: PanId(0xFFFF),
-            channel: 11,
+            channel: config.channel,
             extended_address: ieee,
             coord_short_address: ShortAddress(0x0000),
             rx_on_when_idle: false,
             association_permit: false,
+            associated_pan_coord: false,
             auto_request: true,
             dsn: 0,
             bsn: 0,
@@ -131,6 +148,14 @@ impl<'a> EspMac<'a> {
         let seq = self.dsn;
         self.dsn = self.dsn.wrapping_add(1);
         seq
+    }
+
+    /// Push PAN ID / short address / EUI-64 into the radio's hardware address
+    /// filter. Must be called after every address change: the filter decides
+    /// which frames the radio receives *and* which ones it acknowledges.
+    fn sync_radio_filter(&mut self) {
+        let (pan, short, ext) = (self.pan_id.0, self.short_address.0, self.extended_address);
+        self.driver.set_addresses(pan, short, &ext);
     }
 
     /// Transmit a frame. The driver waits for TX completion internally.
@@ -316,10 +341,11 @@ impl MacDriver for EspMac<'_> {
             req.scan_duration
         );
 
-        // Enable promiscuous mode for scanning (accept beacon responses)
-        self.driver.update_config(|cfg| {
-            cfg.promiscuous = true;
-        });
+        // Scanning is the one phase that legitimately needs promiscuous mode:
+        // beacons carry no destination address. `set_promiscuous` also turns
+        // the hardware ACK generator off, matching ESP-IDF semantics — a
+        // sniffing radio must not acknowledge other people's frames.
+        self.driver.set_promiscuous(true);
 
         for ch in req.channel_mask.iter() {
             let ch_num = ch.number();
@@ -360,10 +386,9 @@ impl MacDriver for EspMac<'_> {
             }
         }
 
-        // Restore normal mode after scan
-        self.driver.update_config(|cfg| {
-            cfg.promiscuous = false;
-        });
+        // Restore filtered mode (and with it hardware auto-ACK) after the scan
+        self.driver.set_promiscuous(false);
+        self.sync_radio_filter();
 
         if matches!(req.scan_type, ScanType::Active | ScanType::Passive)
             && pan_descriptors.is_empty()
@@ -390,11 +415,16 @@ impl MacDriver for EspMac<'_> {
     ) -> Result<MlmeAssociateConfirm, MacError> {
         self.channel = req.channel;
         self.pan_id = req.coord_address.pan_id();
+        // Filtered mode with the EUI-64 programmed: the Association Response
+        // and the Transport-Key are addressed to our extended address, so the
+        // hardware both accepts and acknowledges them. Promiscuous mode would
+        // accept them too, but the coordinator would never see an ACK and would
+        // keep retransmitting.
         self.driver.update_config(|cfg| {
             cfg.channel = req.channel;
-            cfg.pan_id = Some(req.coord_address.pan_id().0);
-            cfg.promiscuous = true; // Accept all frames during association
+            cfg.promiscuous = false;
         });
+        self.sync_radio_filter();
 
         log::info!(
             "[ESP MLME-ASSOC] Associating on ch {} with {:?}",
@@ -445,6 +475,10 @@ impl MacDriver for EspMac<'_> {
 
         // After getting assoc response, listen for post-assoc frames (Transport-Key)
         if confirm.is_some() && self.pending_assoc_frame.is_none() {
+            // The Association Response assigned a short address; program it
+            // before listening so the hardware filter (and the ACK generator)
+            // accept frames sent to the new address as well.
+            self.sync_radio_filter();
             let deadline = Instant::now() + Duration::from_millis(2000);
             self.driver.start_receive();
 
@@ -455,11 +489,9 @@ impl MacDriver for EspMac<'_> {
                         let fc = u16::from_le_bytes([data[0], data[1]]);
                         let frame_type = fc & 0x07;
 
-                        // Send ACK if requested
-                        if (fc >> 5) & 1 != 0 {
-                            let ack = [0x02u8, 0x00, data[2]];
-                            let _ = self.driver.transmit(&ack);
-                        }
+                        // No software ACK here: the acknowledgement has to be
+                        // on air 192µs after the frame ends, which only the
+                        // hardware auto-ACK can do. See driver.rs.
 
                         // Save data frames (likely Transport-Key)
                         if frame_type == 0x01 {
@@ -482,9 +514,6 @@ impl MacDriver for EspMac<'_> {
             }
         }
 
-        // Restore normal mode
-        self.driver.update_config(|cfg| cfg.promiscuous = false);
-
         confirm.ok_or(MacError::NoBeacon)
     }
 
@@ -499,6 +528,8 @@ impl MacDriver for EspMac<'_> {
     async fn mlme_disassociate(&mut self, _req: MlmeDisassociateRequest) -> Result<(), MacError> {
         self.short_address = ShortAddress(0xFFFF);
         self.pan_id = PanId(0xFFFF);
+        self.associated_pan_coord = false;
+        self.sync_radio_filter();
         Ok(())
     }
 
@@ -509,6 +540,7 @@ impl MacDriver for EspMac<'_> {
             self.channel = 11;
             self.rx_on_when_idle = false;
             self.association_permit = false;
+            self.associated_pan_coord = false;
             self.auto_request = true;
             self.dsn = 0;
             self.bsn = 0;
@@ -520,21 +552,20 @@ impl MacDriver for EspMac<'_> {
             self.promiscuous = false;
             self.tx_power = 0;
         }
+        let channel = self.channel;
         self.driver.update_config(|cfg| {
-            cfg.channel = self.channel;
-            cfg.pan_id = Some(self.pan_id.0);
-            cfg.short_addr = Some(self.short_address.0);
+            cfg.channel = channel;
+            cfg.promiscuous = false;
         });
+        self.sync_radio_filter();
         Ok(())
     }
 
     async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
         self.pan_id = req.pan_id;
         self.channel = req.channel;
-        self.driver.update_config(|cfg| {
-            cfg.channel = req.channel;
-            cfg.pan_id = Some(req.pan_id.0);
-        });
+        self.driver.update_config(|cfg| cfg.channel = req.channel);
+        self.sync_radio_filter();
         Ok(())
     }
 
@@ -548,6 +579,7 @@ impl MacDriver for EspMac<'_> {
             }
             PibAttribute::MacRxOnWhenIdle => Ok(PibValue::Bool(self.rx_on_when_idle)),
             PibAttribute::MacAssociationPermit => Ok(PibValue::Bool(self.association_permit)),
+            PibAttribute::MacAssociatedPanCoord => Ok(PibValue::Bool(self.associated_pan_coord)),
             PibAttribute::MacAutoRequest => Ok(PibValue::Bool(self.auto_request)),
             PibAttribute::MacDsn => Ok(PibValue::U8(self.dsn)),
             PibAttribute::MacBsn => Ok(PibValue::U8(self.bsn)),
@@ -567,11 +599,11 @@ impl MacDriver for EspMac<'_> {
         match (attribute, &value) {
             (PibAttribute::MacShortAddress, PibValue::ShortAddress(v)) => {
                 self.short_address = *v;
-                self.driver.update_config(|cfg| cfg.short_addr = Some(v.0));
+                self.sync_radio_filter();
             }
             (PibAttribute::MacPanId, PibValue::PanId(v)) => {
                 self.pan_id = *v;
-                self.driver.update_config(|cfg| cfg.pan_id = Some(v.0));
+                self.sync_radio_filter();
             }
             (PibAttribute::PhyCurrentChannel, PibValue::U8(v)) => {
                 if !(11..=26).contains(v) {
@@ -582,10 +614,14 @@ impl MacDriver for EspMac<'_> {
             }
             (PibAttribute::MacExtendedAddress, PibValue::ExtendedAddress(v)) => {
                 self.extended_address = *v;
+                self.sync_radio_filter();
             }
             (PibAttribute::MacRxOnWhenIdle, PibValue::Bool(v)) => self.rx_on_when_idle = *v,
             (PibAttribute::MacAssociationPermit, PibValue::Bool(v)) => {
                 self.association_permit = *v;
+            }
+            (PibAttribute::MacAssociatedPanCoord, PibValue::Bool(v)) => {
+                self.associated_pan_coord = *v;
             }
             (PibAttribute::MacAutoRequest, PibValue::Bool(v)) => self.auto_request = *v,
             (PibAttribute::MacBeaconPayload, PibValue::Payload(v)) => {
@@ -595,7 +631,10 @@ impl MacDriver for EspMac<'_> {
             (PibAttribute::MacMinBe, PibValue::U8(v)) => self.min_be = *v,
             (PibAttribute::MacMaxBe, PibValue::U8(v)) => self.max_be = *v,
             (PibAttribute::MacMaxFrameRetries, PibValue::U8(v)) => self.max_frame_retries = *v,
-            (PibAttribute::MacPromiscuousMode, PibValue::Bool(v)) => self.promiscuous = *v,
+            (PibAttribute::MacPromiscuousMode, PibValue::Bool(v)) => {
+                self.promiscuous = *v;
+                self.driver.set_promiscuous(*v);
+            }
             (PibAttribute::PhyTransmitPower, PibValue::I8(v)) => {
                 self.tx_power = *v;
                 // TX power is applied through driver config if the radio supports it
@@ -623,10 +662,11 @@ impl MacDriver for EspMac<'_> {
         let passes: u8 = if has_short { 2 } else { 1 };
 
         for pass in 0..passes {
+            let dsn = self.next_dsn();
             let data_req = if pass == 0 && has_short {
-                build_data_request_short(self.next_dsn(), &parent, self.short_address)
+                build_data_request_short(dsn, &parent, self.short_address)
             } else {
-                build_data_request(self.next_dsn(), &parent, &self.extended_address)
+                build_data_request(dsn, &parent, &self.extended_address)
             };
 
             if self.transmit_frame(&data_req).await.is_err() {
@@ -634,10 +674,14 @@ impl MacDriver for EspMac<'_> {
             }
 
             self.driver.start_receive();
-            let deadline = Instant::now() + Duration::from_millis(1500);
+            // Bounded wait: the parent sends the buffered frame right after
+            // acknowledging the Data Request. The old 1.5s-per-pass budget was
+            // only survivable when the ACK arrived early enough to cut it
+            // short, which is not something a poll may depend on.
+            let deadline = Instant::now() + Duration::from_millis(POLL_RESPONSE_MS);
 
             let mut got_none = false;
-            for _rx_attempt in 0..40u8 {
+            loop {
                 if Instant::now() >= deadline {
                     break;
                 }
@@ -658,14 +702,15 @@ impl MacDriver for EspMac<'_> {
                     let fc = u16::from_le_bytes([data[0], data[1]]);
                     let frame_type = fc & 0x07;
 
-                    // ACK — check frame_pending bit
-                    if frame_type == 0x02 {
-                        let frame_pending = (data[0] >> 4) & 1 != 0;
-                        if !frame_pending {
+                    // ACK — check frame_pending bit. IEEE 802.15.4 ACK frames
+                    // carry no addresses, so the only way to know it is ours is
+                    // the sequence number: acting on another node's ACK would
+                    // end the poll before the parent had a chance to answer.
+                    if let Some((ack_seq, frame_pending)) = crate::frames::ack_info(data) {
+                        if ack_seq == dsn && !frame_pending {
                             got_none = true;
                             break;
                         }
-                        self.driver.start_receive();
                         continue;
                     }
 
@@ -676,20 +721,16 @@ impl MacDriver for EspMac<'_> {
                     }
 
                     // Verify destination matches us or broadcast
-                    if let Some(dst) = parse_dest_address(data, fc) {
-                        let for_us = match &dst {
-                            MacAddress::Short(_, d) => {
-                                d.0 == self.short_address.0
-                                    || d.0 == 0xFFFF
-                                    || d.0 == 0xFFFD
-                                    || d.0 == 0xFFFC
-                            }
-                            MacAddress::Extended(_, e) => *e == self.extended_address,
-                        };
-                        if !for_us {
-                            self.driver.start_receive();
-                            continue;
-                        }
+                    if let Some(dst) = parse_dest_address(data, fc)
+                        && !crate::frames::frame_is_for_us(
+                            &dst,
+                            self.pan_id,
+                            self.short_address,
+                            &self.extended_address,
+                        )
+                    {
+                        self.driver.start_receive();
+                        continue;
                     }
 
                     let header_len = 3 + addressing_size(fc);
@@ -732,6 +773,11 @@ impl MacDriver for EspMac<'_> {
             0
         };
 
+        let confirm = McpsDataConfirm {
+            msdu_handle,
+            timestamp: None,
+        };
+
         for attempt in 0..=max_retries {
             // CSMA-CA backoff
             let mut be = self.min_be;
@@ -751,21 +797,37 @@ impl MacDriver for EspMac<'_> {
 
                 if ack_requested {
                     // TX + ACK wait using driver's precise timing
-                    if self.driver.transmit_with_ack(&frame_buf[..len], seq) {
-                        return Ok(McpsDataConfirm {
-                            msdu_handle,
-                            timestamp: None,
-                        });
+                    match self.driver.transmit_with_ack(&frame_buf[..len], seq) {
+                        TxAckResult::Acked => return Ok(confirm),
+                        // The radio was holding frames the stack has not seen
+                        // yet, so the ACK could not be looked for without
+                        // dropping them. Retransmitting would duplicate a frame
+                        // the peer probably already has; APS/NWK own end-to-end
+                        // reliability here.
+                        TxAckResult::NotChecked => return Ok(confirm),
+                        TxAckResult::NotObserved => {
+                            // esp-radio only surfaces ACK frames while the
+                            // hardware filter passes them. If this radio has
+                            // never delivered a single ACK, "no ACK" carries no
+                            // information and retransmitting would just double
+                            // the traffic — report success and let APS/NWK
+                            // handle end-to-end reliability.
+                            if !self.driver.ack_observed() {
+                                return Ok(confirm);
+                            }
+                            break true; // TX sent but no ACK — will retry
+                        }
+                        TxAckResult::TxFailed => {
+                            nb += 1;
+                            be = core::cmp::min(be + 1, self.max_be);
+                            if nb > self.max_csma_backoffs {
+                                break false;
+                            }
+                        }
                     }
-                    break true; // TX sent but no ACK — will retry
                 } else {
                     match self.driver.transmit(&frame_buf[..len]) {
-                        Ok(()) => {
-                            return Ok(McpsDataConfirm {
-                                msdu_handle,
-                                timestamp: None,
-                            });
-                        }
+                        Ok(()) => return Ok(confirm),
                         Err(_) => {
                             nb += 1;
                             be = core::cmp::min(be + 1, self.max_be);
@@ -782,6 +844,11 @@ impl MacDriver for EspMac<'_> {
             }
         }
 
+        log::warn!(
+            "[ESP TX] no ACK for seq {} after {} tries",
+            seq,
+            max_retries
+        );
         Err(MacError::NoAck)
     }
 
@@ -794,14 +861,15 @@ impl MacDriver for EspMac<'_> {
         timeout_us: u32,
     ) -> Result<McpsDataIndication, MacError> {
         let deadline = Instant::now() + Duration::from_micros(timeout_us as u64);
-        // Enable promiscuous for passive RX — ensures we receive Transport-Key
-        // frames that use IEEE addressing (not matched by hardware short addr filter)
-        self.driver.update_config(|cfg| cfg.promiscuous = true);
+        // Stay in filtered mode. The hardware filter now holds our EUI-64, so
+        // IEEE-addressed frames (Transport-Key, Association Response) are
+        // received *and* acknowledged. Switching to promiscuous mode here is
+        // what silently disabled the hardware ACK generator and made the parent
+        // retransmit every buffered frame until it gave up.
         self.driver.start_receive();
 
         loop {
             if Instant::now() >= deadline {
-                self.driver.update_config(|cfg| cfg.promiscuous = false);
                 return Err(MacError::NoData);
             }
 
@@ -834,42 +902,33 @@ impl MacDriver for EspMac<'_> {
                 let dst = parse_dest_address(data, fc)
                     .unwrap_or(MacAddress::Short(PanId(0), ShortAddress(0)));
 
-                // Software address filtering — only accept frames for us
-                if !self.promiscuous {
-                    let accepted = match &dst {
-                        MacAddress::Short(pan, addr) => {
-                            (pan.0 == self.pan_id.0 || pan.0 == 0xFFFF)
-                                && (addr.0 == self.short_address.0
-                                    || addr.0 == 0xFFFF
-                                    || addr.0 == 0xFFFD
-                                    || addr.0 == 0xFFFC)
-                        }
-                        MacAddress::Extended(pan, addr) => {
-                            (pan.0 == self.pan_id.0 || pan.0 == 0xFFFF)
-                                && *addr == self.extended_address
-                        }
-                    };
-                    if !accepted {
-                        self.driver.start_receive();
-                        continue;
-                    }
+                // Software address filtering — mirrors the hardware filter so
+                // we never hand up a frame the radio did not acknowledge.
+                if !self.promiscuous
+                    && !crate::frames::frame_is_for_us(
+                        &dst,
+                        self.pan_id,
+                        self.short_address,
+                        &self.extended_address,
+                    )
+                {
+                    self.driver.start_receive();
+                    continue;
                 }
 
                 log::info!(
-                    "[ESP RX] Accepted frame {} bytes, LQI {}",
+                    "[ESP RX] Accepted frame {} bytes, LQI {} RSSI {}",
                     data.len(),
-                    received.lqi
+                    received.lqi,
+                    received.rssi
                 );
 
-                // Send software ACK if requested (FC bit 5)
-                if (fc >> 5) & 1 != 0 {
-                    let ack_frame = [0x02u8, 0x00, data[2]]; // ACK type, seq
-                    let _ = self.driver.transmit(&ack_frame);
-                }
+                // The acknowledgement is generated by the radio (auto-ACK TX);
+                // a software ACK from here would be milliseconds late and would
+                // only add collisions.
 
                 let payload_data = &data[header_len..];
                 if let Some(mac_frame) = MacFrame::from_slice(payload_data) {
-                    self.driver.update_config(|cfg| cfg.promiscuous = false);
                     return Ok(McpsDataIndication {
                         src_address: src,
                         dst_address: dst,
