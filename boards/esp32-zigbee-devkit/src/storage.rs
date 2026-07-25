@@ -1,14 +1,18 @@
 //! ESP32 flash partition wiring for generic application NV.
+//!
+//! The two NV pages live in the last 8 KiB of the `zbnv` partition. Those are
+//! the same addresses the firmware used before the partition table existed, so
+//! introducing the table does not move the joined-network state.
 
 use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
 use esp_storage::{FlashStorage, FlashStorageError};
 use zigbee_runtime::log_nv::LogStructuredNv;
 use zigbee_runtime::nv_storage::NvError;
 
-const NV_PARTITION_START: u32 = 0x003F_E000;
-const NV_PARTITION_SIZE: usize = 8192;
-const NV_PAGE_A: u32 = 0;
-const NV_PAGE_B: u32 = 4096;
+use crate::layout::{NV_OFFSET, NV_PAGE_A, NV_PAGE_B, NV_SIZE};
+
+const NV_PARTITION_START: u32 = NV_OFFSET;
+const NV_PARTITION_SIZE: usize = NV_SIZE as usize;
 
 pub struct ApplicationFlash {
     flash: FlashStorage,

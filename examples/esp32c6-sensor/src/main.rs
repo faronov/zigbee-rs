@@ -13,7 +13,11 @@
 //! # Build & flash
 //! ```bash
 //! cargo build --release
-//! espflash flash --monitor target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
+//! espflash flash \
+//!   --partition-table ../../boards/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv \
+//!   --target-app-partition ota_0 \
+//!   --erase-parts otadata \
+//!   --monitor target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
 //! ```
 
 #![no_std]
@@ -21,9 +25,14 @@
 
 extern crate alloc;
 
+esp_bootloader_esp_idf::esp_app_desc!();
+
+mod ota_client;
 mod time_driver;
 
-use esp32_zigbee_devkit::storage;
+include!(concat!(env!("OUT_DIR"), "/firmware_version.rs"));
+
+use esp32_zigbee_devkit::{firmware, storage};
 use esp_backtrace as _;
 use esp_hal::gpio::{Input, InputConfig, Pull};
 use esp_hal::tsens::{Config as TsensConfig, TemperatureSensor};
@@ -31,9 +40,11 @@ use esp_hal::tsens::{Config as TsensConfig, TemperatureSensor};
 use embassy_futures::block_on;
 use embassy_time::{Duration, Instant, Timer};
 
+use ota_client::OtaClient;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
+use zigbee_runtime::ota::OtaConfig;
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::PowerSource;
@@ -60,6 +71,41 @@ const FAST_POLL_MS: u64 = 250;
 const SLOW_POLL_SECS: u64 = 30;
 const FAST_POLL_DURATION_SECS: u64 = 120;
 const EXPECTED_REPORT_CLUSTERS: usize = 3;
+/// Manufacturer code advertised in `QueryNextImageRequest` and stamped into the
+/// OTA container by `tools/create-ota.py`. ZHA matches images on this pair, so
+/// the two must stay in sync.
+const OTA_MANUFACTURER_CODE: u16 = 0x1234;
+/// Image type: 0x0001 = ESP32-C6 sensor.
+const OTA_IMAGE_TYPE: u16 = 0x0001;
+/// Hardware version reported to the OTA server.
+const OTA_HARDWARE_VERSION: u16 = 1;
+
+/// Application clusters handed to the runtime on every dispatch.
+///
+/// The OTA cluster is in here so the server can read `CurrentFileVersion` and
+/// friends off endpoint 1 like any other attribute.
+macro_rules! app_clusters {
+    ($temp:expr, $hum:expr, $power:expr, $ota:expr) => {
+        [
+            ClusterRef {
+                endpoint: 1,
+                cluster: $temp,
+            },
+            ClusterRef {
+                endpoint: 1,
+                cluster: $hum,
+            },
+            ClusterRef {
+                endpoint: 1,
+                cluster: $power,
+            },
+            ClusterRef {
+                endpoint: 1,
+                cluster: $ota,
+            },
+        ]
+    };
+}
 
 #[esp_hal::main]
 fn main() -> ! {
@@ -106,6 +152,18 @@ fn main() -> ! {
 
     let mut hum_tick: u32 = 0;
 
+    // OTA client — stages upgrades into the inactive application slot.
+    let mut ota = OtaClient::new(OtaConfig {
+        manufacturer_code: OTA_MANUFACTURER_CODE,
+        image_type: OTA_IMAGE_TYPE,
+        current_version: FIRMWARE_VERSION,
+        endpoint: 1,
+        block_size: 48,
+        auto_accept: true,
+        hardware_version: Some(OTA_HARDWARE_VERSION),
+    });
+    let ota_enabled = ota.is_enabled();
+
     // Build device (SED)
     let mut device = ZigbeeDevice::builder(mac)
         .device_type(DeviceType::EndDevice)
@@ -115,17 +173,29 @@ fn main() -> ! {
         })
         .manufacturer("Zigbee-RS")
         .model("ESP32-C6-Sensor")
+        .application_version(firmware::application_version(FIRMWARE_VERSION))
         .date_code("20260403")
-        .sw_build("0.1.0")
+        .sw_build(FIRMWARE_VERSION_STR)
         .power_source(PowerSource::DcSource)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, DeviceId::TEMPERATURE_SENSOR, |ep| {
-            ep.cluster_server(ClusterId::BASIC)
-                .cluster_server(ClusterId::IDENTIFY)
-                .cluster_server(ClusterId::POWER_CONFIG)
-                .cluster_server(ClusterId::TEMPERATURE)
-                .cluster_server(ClusterId::HUMIDITY)
-        })
+        .endpoint(
+            1,
+            PROFILE_HOME_AUTOMATION,
+            DeviceId::TEMPERATURE_SENSOR,
+            |ep| {
+                let ep = ep
+                    .cluster_server(ClusterId::BASIC)
+                    .cluster_server(ClusterId::IDENTIFY)
+                    .cluster_server(ClusterId::POWER_CONFIG)
+                    .cluster_server(ClusterId::TEMPERATURE)
+                    .cluster_server(ClusterId::HUMIDITY);
+                if ota_enabled {
+                    ep.cluster_client(ClusterId::OTA_UPGRADE)
+                } else {
+                    ep
+                }
+            },
+        )
         .build();
 
     // Initial sensor values
@@ -164,20 +234,12 @@ fn main() -> ! {
             esp_println::println!("[ESP32-C6] No saved state — auto-joining…");
             device.user_action(UserAction::Join);
         }
-        let mut clusters = [
-            ClusterRef {
-                endpoint: 1,
-                cluster: &mut temp_cluster,
-            },
-            ClusterRef {
-                endpoint: 1,
-                cluster: &mut hum_cluster,
-            },
-            ClusterRef {
-                endpoint: 1,
-                cluster: &mut power_cluster,
-            },
-        ];
+        let mut clusters = app_clusters!(
+            &mut temp_cluster,
+            &mut hum_cluster,
+            &mut power_cluster,
+            ota.cluster_mut()
+        );
         if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
             if log_event(e) {
                 device.save_state(&mut nv);
@@ -195,6 +257,10 @@ fn main() -> ! {
             Instant::now()
         };
         let mut last_rejoin_attempt = Instant::now();
+        // Whole seconds already handed to the OTA engine; the loop runs far
+        // faster than 1 Hz, so the remainder has to be carried over instead of
+        // being rounded away (otherwise OTA timers would never advance).
+        let mut last_ota_service = Instant::now();
         let mut rejoin_count: u8 = 0;
         let mut annce_retries_left: u8 = if device.is_joined() { 5 } else { 0 };
         let mut last_annce = Instant::now();
@@ -203,7 +269,8 @@ fn main() -> ! {
 
         loop {
             let now = Instant::now();
-            let in_fast_poll = now < fast_poll_until;
+            // An in-flight OTA always polls fast, regardless of the window.
+            let in_fast_poll = now < fast_poll_until || ota.is_active();
             let poll_ms = if in_fast_poll {
                 FAST_POLL_MS
             } else {
@@ -238,20 +305,12 @@ fn main() -> ! {
                         if device.is_joined() { "leave" } else { "join" }
                     );
                     device.user_action(UserAction::Toggle);
-                    let mut cls = [
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut temp_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut hum_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut power_cluster,
-                        },
-                    ];
+                    let mut cls = app_clusters!(
+                        &mut temp_cluster,
+                        &mut hum_cluster,
+                        &mut power_cluster,
+                        ota.cluster_mut()
+                    );
                     if let TickResult::Event(ref e) = device.tick(0, &mut cls).await {
                         if log_event(e) {
                             device.save_state(&mut nv);
@@ -275,21 +334,29 @@ fn main() -> ! {
                 for _poll_round in 0..4u8 {
                     match device.poll().await {
                         Ok(Some(ind)) => {
-                            let mut cls = [
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut temp_cluster,
-                                },
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut hum_cluster,
-                                },
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut power_cluster,
-                                },
-                            ];
+                            let mut cls = app_clusters!(
+                                &mut temp_cluster,
+                                &mut hum_cluster,
+                                &mut power_cluster,
+                                ota.cluster_mut()
+                            );
                             if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
+                                if ota.handle_event(&mut device, &ev).await {
+                                    // Keep the radio hot for the rest of the
+                                    // transfer: OTA blocks arrive as indirect
+                                    // traffic and only a fast poll fetches them
+                                    // at a useful rate.
+                                    fast_poll_until = Instant::now()
+                                        + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                    let mut cls2 = app_clusters!(
+                                        &mut temp_cluster,
+                                        &mut hum_cluster,
+                                        &mut power_cluster,
+                                        ota.cluster_mut()
+                                    );
+                                    let _ = device.tick(0, &mut cls2).await;
+                                    continue;
+                                }
                                 match &ev {
                                     StackEvent::RejoinRequested => {
                                         esp_println::println!("[ESP32-C6] Secure rejoin requested");
@@ -330,20 +397,12 @@ fn main() -> ! {
                                 fast_poll_until = Instant::now() + Duration::from_secs(5);
                                 esp_println::println!("[ESP32-C6] Interview done!");
                             }
-                            let mut cls2 = [
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut temp_cluster,
-                                },
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut hum_cluster,
-                                },
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut power_cluster,
-                                },
-                            ];
+                            let mut cls2 = app_clusters!(
+                                &mut temp_cluster,
+                                &mut hum_cluster,
+                                &mut power_cluster,
+                                ota.cluster_mut()
+                            );
                             let _ = device.tick(0, &mut cls2).await;
                         }
                         Ok(None) => break,
@@ -375,21 +434,30 @@ fn main() -> ! {
                 }
 
                 let tick_elapsed = elapsed_s.min(60) as u16;
-                let mut clusters = [
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut temp_cluster,
-                    },
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut hum_cluster,
-                    },
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut power_cluster,
-                    },
-                ];
+                let mut clusters = app_clusters!(
+                    &mut temp_cluster,
+                    &mut hum_cluster,
+                    &mut power_cluster,
+                    ota.cluster_mut()
+                );
                 let _ = device.tick(tick_elapsed, &mut clusters).await;
+
+                // Drive the OTA state machine and flush any queued request.
+                let ota_elapsed = Instant::now()
+                    .duration_since(last_ota_service)
+                    .as_secs()
+                    .min(60);
+                last_ota_service += Duration::from_secs(ota_elapsed);
+                ota.service(&mut device, ota_elapsed as u16).await;
+                if ota.activation_pending() {
+                    // Checkpoint first: activate() reboots into the staged
+                    // image and anything not in NV by then is lost.
+                    device.save_state(&mut nv);
+                    esp_println::println!("[ESP32-C6] State saved — activating new image");
+                    if ota.activate().is_err() {
+                        esp_println::println!("[ESP32-C6] OTA activation failed");
+                    }
+                }
 
                 // Device_annce retry
                 if annce_retries_left > 0 && now2.duration_since(last_annce).as_secs() >= 8 {
@@ -411,20 +479,12 @@ fn main() -> ! {
                     last_rejoin_attempt = Instant::now();
                     esp_println::println!("[ESP32-C6] Retrying join ({})…", rejoin_count);
                     device.user_action(UserAction::Join);
-                    let mut cls = [
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut temp_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut hum_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut power_cluster,
-                        },
-                    ];
+                    let mut cls = app_clusters!(
+                        &mut temp_cluster,
+                        &mut hum_cluster,
+                        &mut power_cluster,
+                        ota.cluster_mut()
+                    );
                     let _ = device.tick(0, &mut cls).await;
                     if device.is_joined() {
                         esp_println::println!(
@@ -522,8 +582,7 @@ fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M
         ClusterId::POWER_CONFIG.0,
         ReportingConfig {
             direction: ReportDirection::Send,
-            attribute_id:
-                zigbee_zcl::clusters::power_config::ATTR_BATTERY_PERCENTAGE_REMAINING,
+            attribute_id: zigbee_zcl::clusters::power_config::ATTR_BATTERY_PERCENTAGE_REMAINING,
             data_type: ZclDataType::U8,
             min_interval: 300,
             max_interval: 3600,

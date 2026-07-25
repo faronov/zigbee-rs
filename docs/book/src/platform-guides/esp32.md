@@ -84,7 +84,7 @@ cargo build --release -Z build-std=core,alloc
 target = "riscv32imac-unknown-none-elf"
 
 [target.riscv32imac-unknown-none-elf]
-runner = "espflash flash --monitor"
+runner = "espflash flash --partition-table ../../boards/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv --target-app-partition ota_0 --erase-parts otadata --monitor"
 rustflags = ["-C", "link-arg=-Tlinkall.x"]
 
 [unstable]
@@ -93,6 +93,12 @@ build-std = ["core", "alloc"]
 [env]
 ESP_LOG = "info"
 ```
+
+This is the ESP32-C6 OTA-capable runner. It always reinstalls the checked-in
+partition table, writes the wired image to `ota_0`, and erases `otadata` so a
+previously selected `ota_1` cannot hide the newly flashed firmware. The H2
+example, which does not yet instantiate an OTA client, keeps the plain
+`espflash flash --monitor` runner.
 
 The `linkall.x` linker script is provided by `esp-hal` and sets up the ESP32
 memory layout, interrupt vectors, and boot sequence.
@@ -130,7 +136,11 @@ lto = true         # Link-Time Optimization
 cd examples/esp32c6-sensor
 
 # Flash and open serial monitor
-espflash flash --monitor target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
+espflash flash \
+  --partition-table ../../boards/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv \
+  --target-app-partition ota_0 \
+  --erase-parts otadata \
+  --monitor target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
 
 # Or use cargo run (runner configured in .cargo/config.toml)
 cargo run --release
@@ -298,6 +308,141 @@ The example never sees physical flash addresses or raw controller calls.
 On boot, the device checks for saved network state and automatically rejoins
 the previous network. If the coordinator sends a NWK Leave command, the device
 erases NV storage and starts fresh commissioning.
+
+## Partition Table
+
+OTA needs two application slots, so the devkits are flashed with an explicit
+ESP-IDF partition table, checked in at
+`boards/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv`:
+
+| Partition | Type / SubType | Offset | Size |
+|-----------|----------------|--------|------|
+| `otadata` | `data` / `ota` | `0x9000` | `0x2000` |
+| `ota_0` | `app` / `ota_0` | `0x10000` | `0x1F0000` |
+| `ota_1` | `app` / `ota_1` | `0x200000` | `0x1F0000` |
+| `zbnv` | `data` / `undefined` | `0x3F0000` | `0x10000` |
+
+Notes:
+
+* `ota_0` starts at `0x10000`, which is where a plain `espflash flash` already
+  puts the application — a device flashed before this table existed is already
+  running from `ota_0`.
+* The Zigbee NV pages stay at `0x3FE000`-`0x3FFFFF`, now the tail of `zbnv`.
+  Adding the table does not move a single byte of joined-network state.
+* `0xB000`-`0x10000` is intentionally unmapped (ESP-IDF would put `nvs` and
+  `phy_init` there; this firmware uses neither).
+* `esp32-zigbee-devkit::layout` mirrors these addresses, asserts the invariants
+  at compile time and parses the CSV in a unit test, so the constants and the
+  table cannot drift apart.
+* The OTA writer validates the four on-device partition entries before it
+  exposes the OTA client. A plain single-app table disables OTA while leaving
+  the sensor operational, rather than accepting a download that the bootloader
+  can never activate or halting the device during boot.
+* Do not use a plain `espflash flash` command after migration: without
+  `--partition-table`, espflash reinstalls its default single-app table.
+
+Build the 3072-byte binary that goes at `0x8000` with:
+
+```bash
+boards/esp32-zigbee-devkit/partitions/build-partition-table.sh
+```
+
+The script uses `espflash partition-table --to-binary`, checks the size and
+converts the result back to CSV to confirm the round trip.
+
+## OTA Updates
+
+> **Status:** implemented in software and covered by host tests; **not yet
+> exercised on hardware**. Migrating a device to the two-slot layout rewrites
+> its partition table, which is a deliberate, separate step.
+
+### How it works
+
+`esp32-zigbee-devkit::ota::EspFirmwareWriter` implements the runtime's
+`FirmwareWriter` trait:
+
+1. **Slot selection** — `otadata` is read to find the running slot; the *other*
+   slot is the staging target. Erased `otadata` means the bootloader fell back
+   to `ota_0`, so staging goes to `ota_1`.
+2. **Lazy erase** — `erase_slot()` only resets bookkeeping. Erasing 1.9 MiB in
+   one go would hold `esp-storage`'s critical section for many seconds and the
+   radio would miss every parent poll, so each 4 KiB sector is erased just
+   before the first byte lands in it.
+3. **Word alignment** — Zigbee blocks are 48 bytes and the last one is ragged,
+   but ESP flash programs 4-byte words. Sub-word tails are buffered in RAM and
+   the final partial word is padded with `0xFF`, past the end of the image, so
+   no image byte is ever altered.
+4. **Verification** — the staged slot is re-read: image magic `0xE9`, the chip
+   ID (`0x000D` for C6, `0x0010` for H2), the `hash_appended` flag and the
+   trailing SHA-256 all have to match.
+5. **Activation** — one 32-byte `otadata` entry is written into the sector that
+   does *not* hold the active entry, then the chip resets. Any power failure
+   before that write leaves the old entry, and therefore the old firmware, in
+   charge. `abort()` never touches `otadata`.
+
+The application defers activation until after it has checkpointed its Zigbee
+state to NV, so the reset into the new image cannot lose the network keys.
+
+### Building an OTA image
+
+The payload of the Zigbee container must be an **ESP application image**
+(`espflash save-image` output) — not an ELF and not a merged flash image:
+
+```bash
+cd examples/esp32c6-sensor
+tools/create-ota.py 2            # writes target/ota/
+```
+
+The tool builds the firmware with `ESP32_OTA_VERSION=2`, runs
+`espflash save-image`, wraps the result in an OTA container
+(manufacturer `0x1234`, image type `0x0001`, hardware version 1), parses the
+container back and compares it byte for byte with the image, and regenerates a
+`zigpy_local` index with the sha3-256 checksums ZHA verifies:
+
+```json
+{
+  "firmwares": [
+    {
+      "path": "esp32c6-sensor-v2.ota",
+      "file_version": 2,
+      "file_size": 279554,
+      "image_type": 1,
+      "manufacturer_id": 4660,
+      "checksum": "sha3-256:…"
+    }
+  ]
+}
+```
+
+Point ZHA at it with a `zigpy_local` OTA provider:
+
+```yaml
+zigpy_config:
+  ota:
+    providers:
+      - type: zigpy_local
+        index_file: /config/zigbee-rs-ota/index.json
+```
+
+### Migrating a device that is already joined
+
+These steps **write flash** and are not performed by `cargo build`:
+
+1. Back up the NV pages: `espflash read-flash 0x3FE000 0x2000 nv-backup.bin`.
+2. Flash the OTA-capable firmware together with the required table:
+
+   ```bash
+   cd examples/esp32c6-sensor
+   espflash flash \
+     --partition-table ../../boards/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv \
+     --target-app-partition ota_0 \
+     --erase-parts otadata \
+     --monitor target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
+   ```
+
+   The configured `cargo run --release` runner executes the same command.
+3. Confirm the device rejoins with its existing keys before publishing an
+   image; only then run an upgrade from ZHA.
 
 ## ESP32-C6-DevKitC-1 LED Note
 

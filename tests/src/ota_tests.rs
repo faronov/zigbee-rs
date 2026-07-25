@@ -694,6 +694,43 @@ fn ota_manager_times_out_a_stalled_server_response() {
 }
 
 #[test]
+fn ota_manager_requeues_request_after_transport_failure() {
+    use zigbee_runtime::firmware_writer::MockFirmwareWriter;
+    use zigbee_runtime::ota::{OtaConfig, OtaManager};
+    use zigbee_zcl::clusters::ota::CMD_IMAGE_BLOCK_REQUEST;
+
+    let mut mgr = OtaManager::new(
+        MockFirmwareWriter::new(4096),
+        OtaConfig {
+            manufacturer_code: 0x1234,
+            image_type: 0x0001,
+            current_version: 1,
+            endpoint: 1,
+            block_size: 48,
+            auto_accept: true,
+            hardware_version: None,
+        },
+    );
+    mgr.start_query();
+
+    let frame = mgr.take_pending_frame().expect("query request queued");
+    assert!(mgr.requeue_pending_frame(frame));
+
+    let mut response = [0u8; 13];
+    response[0] = 0x00;
+    response[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    response[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    response[5..9].copy_from_slice(&2u32.to_le_bytes());
+    response[9..13].copy_from_slice(&1024u32.to_le_bytes());
+    mgr.handle_incoming(0x02, &response, None);
+
+    let next = mgr
+        .take_pending_frame()
+        .expect("block request replaces answered query retry");
+    assert_eq!(next.zcl_data[2], CMD_IMAGE_BLOCK_REQUEST.0);
+}
+
+#[test]
 fn ota_wait_for_data_resumes_download() {
     let mut cluster = OtaCluster::new(0x1234, 0x0001, 0x00000001);
     cluster.start_query();
@@ -791,4 +828,150 @@ fn ota_upgrade_time_in_the_past_activates_immediately() {
         OtaAction::ActivateImage
     ));
     assert_eq!(cluster.state(), OtaState::Done);
+}
+
+// ── ESP32 OTA container ─────────────────────────────────────────
+//
+// These cover the exact container layout produced by
+// `examples/esp32c6-sensor/tools/create-ota.py`: a 60-byte header (the
+// hardware-version field control bit is set) followed by a single
+// `UpgradeImage` sub-element whose payload is the ESP application image from
+// `espflash save-image`. The device has to reproduce that payload byte for
+// byte, because the second stage bootloader hashes it.
+
+const ESP_HEADER_LEN: u16 = 60;
+const ESP_FIELD_CONTROL_HARDWARE_VERSIONS: u16 = 0x0004;
+const ESP_CHIP_ID_ESP32C6: u16 = 0x000D;
+
+/// Synthesise an ESP application image: magic, chip ID, `hash_appended` and a
+/// trailing digest placeholder. Only the framing matters here — the on-device
+/// SHA-256 check is covered by the board crate's own tests.
+fn esp_application_image(payload_len: usize) -> Vec<u8> {
+    let mut image = vec![0u8; 24 + payload_len];
+    image[0] = 0xE9;
+    image[1] = 4; // segment count
+    image[12..14].copy_from_slice(&ESP_CHIP_ID_ESP32C6.to_le_bytes());
+    image[23] = 1; // hash appended
+    for (index, byte) in image[24..].iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    image.extend((0..32u8).map(|b| b ^ 0xA5)); // digest placeholder
+    image
+}
+
+/// Build the OTA container exactly like `tools/create-ota.py`.
+fn build_esp_ota_container(mfg: u16, image_type: u16, version: u32, image: &[u8]) -> Vec<u8> {
+    let total_size = ESP_HEADER_LEN as u32 + 6 + image.len() as u32;
+    let mut file = Vec::with_capacity(total_size as usize);
+
+    file.extend(0x0BEE_F11Eu32.to_le_bytes());
+    file.extend(0x0100u16.to_le_bytes());
+    file.extend(ESP_HEADER_LEN.to_le_bytes());
+    file.extend(ESP_FIELD_CONTROL_HARDWARE_VERSIONS.to_le_bytes());
+    file.extend(mfg.to_le_bytes());
+    file.extend(image_type.to_le_bytes());
+    file.extend(version.to_le_bytes());
+    file.extend(0x0002u16.to_le_bytes()); // Zigbee PRO stack
+    let mut header_string = [0u8; 32];
+    let text = b"zigbee-rs ESP32-C6 sensor";
+    header_string[..text.len()].copy_from_slice(text);
+    file.extend(header_string);
+    file.extend(total_size.to_le_bytes());
+    file.extend(1u16.to_le_bytes()); // min hardware version
+    file.extend(1u16.to_le_bytes()); // max hardware version
+    assert_eq!(file.len(), ESP_HEADER_LEN as usize);
+
+    file.extend(0x0000u16.to_le_bytes()); // UpgradeImage
+    file.extend((image.len() as u32).to_le_bytes());
+    file.extend_from_slice(image);
+    assert_eq!(file.len() as u32, total_size);
+    file
+}
+
+#[test]
+fn esp_ota_container_header_declares_the_hardware_version_range() {
+    let image = esp_application_image(200);
+    let container = build_esp_ota_container(0x1234, 0x0001, 2, &image);
+
+    let (header, consumed) = OtaImageHeader::parse(&container).unwrap();
+    assert_eq!(consumed, ESP_HEADER_LEN as usize);
+    assert_eq!(header.header_length, ESP_HEADER_LEN);
+    assert_eq!(header.manufacturer_code, 0x1234);
+    assert_eq!(header.image_type, 0x0001);
+    assert_eq!(header.file_version, 2);
+    assert_eq!(header.min_hardware_version, Some(1));
+    assert_eq!(header.max_hardware_version, Some(1));
+    assert_eq!(header.security_credential_version, None);
+    assert_eq!(header.total_image_size as usize, container.len());
+    assert_eq!(header.header_string_str(), "zigbee-rs ESP32-C6 sensor");
+
+    let (sub_element, sub_len) = OtaSubElement::parse(&container[consumed..]).unwrap();
+    assert_eq!(sub_element.tag, OtaTagId::UpgradeImage);
+    assert_eq!(sub_element.length as usize, image.len());
+    assert_eq!(&container[consumed + sub_len..], image.as_slice());
+}
+
+#[test]
+fn esp_ota_container_round_trip_preserves_the_application_image() {
+    use zigbee_runtime::firmware_writer::MockFirmwareWriter;
+    use zigbee_runtime::ota::{OtaConfig, OtaManager};
+
+    let image = esp_application_image(600);
+    let container = build_esp_ota_container(0x1234, 0x0001, 2, &image);
+    let total = container.len() as u32;
+
+    let mut mgr = OtaManager::new(
+        MockFirmwareWriter::new(0x001F_0000),
+        OtaConfig {
+            manufacturer_code: 0x1234,
+            image_type: 0x0001,
+            current_version: 1,
+            endpoint: 1,
+            block_size: 48,
+            auto_accept: true,
+            hardware_version: Some(1),
+        },
+    );
+
+    mgr.start_query();
+    assert!(mgr.take_pending_frame().is_some());
+
+    let mut response = [0u8; 13];
+    response[0] = 0x00;
+    response[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    response[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    response[5..9].copy_from_slice(&2u32.to_le_bytes());
+    response[9..13].copy_from_slice(&total.to_le_bytes());
+    mgr.handle_incoming(CMD_QUERY_NEXT_IMAGE_RESPONSE.0, &response, None);
+    assert!(mgr.take_pending_frame().is_some());
+
+    // Ragged 48-byte blocks, exactly like a real download.
+    let mut offset = 0usize;
+    while offset < container.len() {
+        let end = (offset + 48).min(container.len());
+        let chunk = &container[offset..end];
+
+        let mut block = [0u8; 64];
+        block[0] = 0x00;
+        block[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+        block[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+        block[5..9].copy_from_slice(&2u32.to_le_bytes());
+        block[9..13].copy_from_slice(&(offset as u32).to_le_bytes());
+        block[13] = chunk.len() as u8;
+        block[14..14 + chunk.len()].copy_from_slice(chunk);
+
+        mgr.handle_incoming(CMD_IMAGE_BLOCK_RESPONSE.0, &block[..14 + chunk.len()], None);
+        mgr.tick(0);
+        offset = end;
+    }
+
+    // The header and sub-element framing must have been stripped, leaving the
+    // ESP application image untouched.
+    assert_eq!(
+        mgr.writer().bytes_written() as usize,
+        image.len(),
+        "staged size must be the application image size, not the container size"
+    );
+    assert_eq!(mgr.writer().data(), image.as_slice());
+    assert_eq!(mgr.state(), OtaState::WaitingActivate);
 }

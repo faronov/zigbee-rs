@@ -263,12 +263,28 @@ pub enum FirmwareError {
 
 ### Platform Implementations
 
-| Platform | Slot Location | Notes |
-|----------|--------------|-------|
-| nRF52840 | Secondary flash bank via NVMC | Dual-bank swap with nRF bootloader |
-| ESP32 | OTA partition via `esp-storage` | ESP-IDF OTA partition table |
-| BL702 | XIP flash via `bl702-pac` | Single-bank with staging area |
-| Mock | RAM buffer (`heapless::Vec<u8, 262144>`) | For host testing — 256 KB max |
+| Platform | Writer | Slot Location | Status |
+|----------|--------|---------------|--------|
+| EFR32MG1 | `efr32mg1_tradfri::ota::Efr32FirmwareWriter` | Gecko Bootloader storage slot 0 (external SPI flash) | Implemented |
+| ESP32-C6 / H2 | `esp32_zigbee_devkit::ota::EspFirmwareWriter` | Inactive `ota_0`/`ota_1` partition, selected through `otadata` | Implemented in software, not yet run on hardware |
+| Mock | `zigbee_runtime::firmware_writer::MockFirmwareWriter` | RAM buffer (`heapless::Vec<u8, 262144>`) | For host testing — 256 KB max |
+| nRF52840 | — | Secondary flash bank via NVMC | Not implemented |
+| BL702 | — | XIP flash via `bl702-pac` | Not implemented |
+
+> Only the platforms marked *Implemented* have a `FirmwareWriter`; the others
+> are design sketches for future backends.
+
+#### ESP32 specifics
+
+The ESP writer stages into whichever of `ota_0`/`ota_1` is *not* running,
+erases 4 KiB sectors lazily as data reaches them (a whole-slot erase would mask
+interrupts for seconds), pads the ragged final Zigbee block up to the 4-byte
+flash write granularity with `0xFF`, and verifies the staged slot by re-reading
+it: image magic, chip ID and the SHA-256 appended by `espflash save-image` must
+all match. Activation writes a single 32-byte `otadata` entry into the
+redundant sector and resets. See the
+[ESP32 platform guide](../platform-guides/esp32.md) for the partition table and
+the packaging tool.
 
 ### MockFirmwareWriter (for Testing)
 
@@ -314,9 +330,10 @@ then the **bootloader** handles the swap and boot.
 
 | Platform | Bootloader | Swap Method |
 |----------|-----------|-------------|
-| nRF52840 | MCUboot / nRF Bootloader | Dual-bank swap |
-| ESP32 | ESP-IDF bootloader | OTA partition switch |
-| BL702 | BL702 ROM bootloader | XIP remap |
+| EFR32MG1 | Silicon Labs Gecko Bootloader | GBL install from storage slot |
+| ESP32 | ESP-IDF second stage bootloader | `otadata` sequence number selects `ota_0`/`ota_1` |
+| nRF52840 | MCUboot / nRF Bootloader | Dual-bank swap (planned) |
+| BL702 | BL702 ROM bootloader | XIP remap (planned) |
 
 > **Rollback:** If the new firmware fails to start (e.g., crashes in a loop),
 > most bootloaders support automatic rollback — they detect that the new image

@@ -9,10 +9,11 @@ zigbee-mac = { path = "../../zigbee-mac", features = ["esp32c6"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee-runtime = { path = "../../zigbee-runtime", features = ["ota"] }
 esp32-zigbee-devkit = { path = "../../boards/esp32-zigbee-devkit", features = ["esp32c6"] }
 
 # ESP32-C6 HAL and runtime
+esp-bootloader-esp-idf = { version = "0.4.0", default-features = false, features = ["esp32c6"] }
 esp-hal = { version = "1.0.0", features = ["esp32c6", "unstable"] }
 esp-radio = { version = "0.17.0", features = ["esp32c6", "ieee802154", "unstable"] }
 esp-backtrace = { version = "0.14", features = ["esp32c6", "panic-handler", "println"] }

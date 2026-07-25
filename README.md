@@ -393,7 +393,7 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
 - **EFR32MG21** still uses an unverified pure-Rust radio initialization path and needs independent hardware validation.
 - **Test coverage** is basic — the mock examples exercise more than the test crate
 - **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal
-- **OTA** — full upgrade flow implemented (OTA cluster + OtaManager + FirmwareWriter trait) but not yet tested on real hardware
+- **OTA** — full upgrade flow implemented (OTA cluster + OtaManager + FirmwareWriter trait) with EFR32MG1 (Gecko Bootloader) and ESP32-C6/H2 (`ota_0`/`ota_1` + `otadata`) writers; neither has been exercised on real hardware yet. nRF52840 and BL702 have no writer.
 
 ## Documentation
 

@@ -1,0 +1,19 @@
+# ESP-IDF partition table for the 4 MiB ESP32-C6 / ESP32-H2 zigbee-rs devkits.
+#
+# The table itself lives at 0x8000 and is 3072 (0xC00) bytes long; the second
+# stage bootloader occupies 0x0..0x8000. 0xB000..0x10000 is intentionally left
+# unmapped (that is where ESP-IDF would put `nvs`/`phy_init`, which this
+# firmware does not use).
+#
+# `zbnv` covers the last 64 KiB. The log-structured Zigbee NV storage keeps its
+# two 4 KiB pages in the last 8 KiB of that partition (0x3FE000..0x400000) —
+# the same addresses used before the table existed, so migrating to this table
+# does not move a single byte of joined-network state.
+#
+# Regenerate the 3072-byte binary with partitions/build-partition-table.sh.
+#
+# Name,   Type, SubType,   Offset,   Size,     Flags
+otadata,  data, ota,       0x9000,   0x2000,
+ota_0,    app,  ota_0,     0x10000,  0x1F0000,
+ota_1,    app,  ota_1,     0x200000, 0x1F0000,
+zbnv,     data, undefined, 0x3F0000, 0x10000,

@@ -23,8 +23,12 @@
 
 extern crate alloc;
 
+esp_bootloader_esp_idf::esp_app_desc!();
+
+mod chip_temperature;
 mod time_driver;
 
+use chip_temperature::H2TemperatureSensor;
 use esp32_zigbee_devkit::storage;
 use esp_backtrace as _;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
@@ -100,6 +104,8 @@ fn main() -> ! {
         }
     }
 
+    let temp_sensor = H2TemperatureSensor::new().expect("temp sensor init failed");
+
     // IEEE 802.15.4 radio
     let ieee802154 = esp_radio::ieee802154::Ieee802154::new(peripherals.IEEE802154);
     let config = esp_radio::ieee802154::Config::default();
@@ -138,10 +144,16 @@ fn main() -> ! {
         .build();
 
     // Initial sensor values
-    temp_cluster.set_temperature(2250);
+    let temp_centi = temp_sensor.read_centi_celsius();
+    temp_cluster.set_temperature(temp_centi);
     hum_cluster.set_humidity(5000u16);
     power_cluster.set_battery_voltage(33);
     power_cluster.set_battery_percentage(200);
+    esp_println::println!(
+        "[ESP32-H2] Temp: {}.{:02}°C (on-chip)",
+        temp_centi / 100,
+        (temp_centi % 100).unsigned_abs()
+    );
 
     // Run the async SED loop synchronously via block_on
     block_on(async {
@@ -353,15 +365,15 @@ fn main() -> ! {
                 let elapsed_s = now2.duration_since(last_report).as_secs();
                 if elapsed_s >= REPORT_INTERVAL_SECS {
                     last_report = now2;
+                    let temp_centi = temp_sensor.read_centi_celsius();
                     hum_tick = hum_tick.wrapping_add(1);
-                    let temp: i16 = 2250 + ((hum_tick % 50) as i16 - 25);
                     let hum: u16 = 5000 + ((hum_tick % 100) as u16) * 10;
-                    temp_cluster.set_temperature(temp);
+                    temp_cluster.set_temperature(temp_centi);
                     hum_cluster.set_humidity(hum);
                     esp_println::println!(
                         "[ESP32-H2] T={}.{:02}°C H={}.{:02}%",
-                        temp / 100,
-                        (temp % 100).unsigned_abs(),
+                        temp_centi / 100,
+                        (temp_centi % 100).unsigned_abs(),
                         hum / 100,
                         hum % 100
                     );

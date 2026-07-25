@@ -3,14 +3,30 @@ name = "esp32-zigbee-devkit"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Shared board storage wiring for ESP32-C6 and ESP32-H2 Zigbee examples"
+description = "Shared board storage and OTA wiring for ESP32-C6 and ESP32-H2 Zigbee examples"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
 [dependencies]
 embedded-storage = "0.3"
-esp-storage = { version = "0.7", default-features = false, features = ["bytewise-read"] }
+log = "0.4"
 zigbee-runtime = { path = "../../zigbee-runtime" }
+
+# `esp-storage` only builds for the Espressif targets (it links the ROM SPI
+# flash routines), so it is target gated: the partition layout, the `otadata`
+# codec, the SHA-256 and the firmware writer state machine are all plain Rust
+# and are unit tested on the host.
+#
+# `critical-section` is required: esp-storage runs the ROM SPI flash erase/write
+# routines from RAM (`.rwtext`) but does not disable the instruction cache. Any
+# interrupt handler that is still executing from XIP flash while the flash chip
+# is busy (radio ISR, systimer ISR, ...) reads garbage and faults. The critical
+# section keeps interrupts masked for the duration of the flash operation.
+[target.'cfg(target_os = "none")'.dependencies]
+esp-storage = { version = "0.7", default-features = false, features = [
+    "bytewise-read",
+    "critical-section",
+] }
 
 [features]
 default = []

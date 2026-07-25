@@ -2,7 +2,7 @@
 target = "riscv32imac-unknown-none-elf"
 
 [target.riscv32imac-unknown-none-elf]
-runner = "espflash flash --monitor"
+runner = "espflash flash --partition-table ../../boards/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv --target-app-partition ota_0 --erase-parts otadata --monitor"
 rustflags = [
     "-C", "link-arg=-Tlinkall.x",
 ]

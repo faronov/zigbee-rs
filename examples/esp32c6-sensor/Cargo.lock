@@ -68,6 +68,12 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
+
+[[package]]
+name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
@@ -233,6 +239,37 @@ dependencies = [
  "darling_core 0.23.0",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "defmt"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2953bfe4f93bbd20cc71198842756f77d161884c99ebbabc41d80231ded88d1"
+dependencies = [
+ "bitflags 1.3.2",
+ "defmt-macros",
+]
+
+[[package]]
+name = "defmt-macros"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bad9c72e7ca2137e0dc3813245a0d282fd6daad32fd800af018306a9169b5fe8"
+dependencies = [
+ "defmt-parser",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "defmt-parser"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]
@@ -482,6 +519,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-bootloader-esp-idf"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02a56964ab5479ac20c9cf76fa3b0d3f2233b20b5d8554e81ef5d65f63c20567"
+dependencies = [
+ "cfg-if",
+ "document-features",
+ "embedded-storage",
+ "esp-config",
+ "esp-hal-procmacros",
+ "esp-metadata-generated 0.3.0",
+ "esp-rom-sys",
+ "jiff",
+ "strum",
+]
+
+[[package]]
 name = "esp-build"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -499,7 +553,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "102871054f8dd98202177b9890cb4b71d0c6fe1f1413b7a379a8e0841fc2473c"
 dependencies = [
  "document-features",
- "esp-metadata-generated",
+ "esp-metadata-generated 0.3.0",
  "serde",
  "serde_yaml",
  "somni-expr",
@@ -512,7 +566,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54786287c0a61ca0f78cb0c338a39427551d1be229103b4444591796c579e093"
 dependencies = [
  "bitfield",
- "bitflags",
+ "bitflags 2.11.0",
  "bytemuck",
  "cfg-if",
  "critical-section",
@@ -532,14 +586,14 @@ dependencies = [
  "enumset",
  "esp-config",
  "esp-hal-procmacros",
- "esp-metadata-generated",
+ "esp-metadata-generated 0.3.0",
  "esp-riscv-rt",
  "esp-rom-sys",
  "esp-sync",
  "esp32",
  "esp32c2",
  "esp32c3",
- "esp32c6",
+ "esp32c6 0.22.0",
  "esp32h2",
  "esp32s2",
  "esp32s3",
@@ -579,6 +633,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a93e39c8ad8d390d248dc7b9f4b59a873f313bf535218b8e2351356972399e3"
 
 [[package]]
+name = "esp-metadata-generated"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42c2ee95b945a4780796e4359e72c033aed3b45073880e8029458f538532db8a"
+
+[[package]]
 name = "esp-phy"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -588,7 +648,7 @@ dependencies = [
  "document-features",
  "esp-config",
  "esp-hal",
- "esp-metadata-generated",
+ "esp-metadata-generated 0.3.0",
  "esp-sync",
  "esp-wifi-sys",
 ]
@@ -623,7 +683,7 @@ dependencies = [
  "esp-config",
  "esp-hal",
  "esp-hal-procmacros",
- "esp-metadata-generated",
+ "esp-metadata-generated 0.3.0",
  "esp-phy",
  "esp-radio-rtos-driver",
  "esp-sync",
@@ -656,13 +716,14 @@ dependencies = [
 
 [[package]]
 name = "esp-rom-sys"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd66cccc6dd2d13e9f33668a57717ab14a6d217180ec112e6be533de93e7ecbf"
+checksum = "eae852ccb08971155023d1371c96d5490cbc26860f06aee2d629ef73f1a890c3"
 dependencies = [
  "cfg-if",
  "document-features",
- "esp-metadata-generated",
+ "esp-metadata-generated 0.4.0",
+ "esp32c6 0.23.2",
 ]
 
 [[package]]
@@ -671,6 +732,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f276ad8a3bdc6b47cd92a3e91013f2e42dce9b3fc5023392063387a1ce2ed69a"
 dependencies = [
+ "critical-section",
  "document-features",
  "embedded-storage",
  "esp-rom-sys",
@@ -686,7 +748,7 @@ dependencies = [
  "document-features",
  "embassy-sync 0.6.2",
  "embassy-sync 0.7.2",
- "esp-metadata-generated",
+ "esp-metadata-generated 0.3.0",
  "riscv",
  "xtensa-lx",
 ]
@@ -716,6 +778,7 @@ version = "0.1.0"
 dependencies = [
  "embedded-storage",
  "esp-storage",
+ "log",
  "zigbee-runtime",
 ]
 
@@ -750,6 +813,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp32c6"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c58f34ff2633968c12125efc7f4f8f101078d5d34c7cb60eab82268db20986f9"
+dependencies = [
+ "vcell",
+]
+
+[[package]]
 name = "esp32c6-sensor"
 version = "0.1.0"
 dependencies = [
@@ -760,6 +832,7 @@ dependencies = [
  "embedded-hal 1.0.0",
  "esp-alloc",
  "esp-backtrace",
+ "esp-bootloader-esp-idf",
  "esp-hal",
  "esp-println",
  "esp-radio",
@@ -993,6 +1066,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jiff"
+version = "0.2.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e184d09547b80eb7e20d141ba2fb1fbac843ca53f4cf1b31210adc4c1adc6e16"
+dependencies = [
+ "defmt",
+ "jiff-core",
+ "jiff-static",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7feca88439efe53da3754500c1851dedf3cb36c524dd5cf8225cc0794de95d09"
+dependencies = [
+ "defmt",
+]
+
+[[package]]
+name = "jiff-static"
+version = "0.2.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "323da076b7a6faf914dc677cb05a4b907742ff7375c8322c9e7f5061e5e0e9de"
+dependencies = [
+ "jiff-core",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.183"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1083,6 +1192,15 @@ name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
+
+[[package]]
+name = "portable-atomic-util"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618"
+dependencies = [
+ "portable-atomic",
+]
 
 [[package]]
 name = "portable_atomic_enum"
@@ -1381,12 +1499,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "termcolor"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]

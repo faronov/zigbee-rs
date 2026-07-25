@@ -13,6 +13,7 @@ zigbee-runtime = { path = "../../zigbee-runtime" }
 esp32-zigbee-devkit = { path = "../../boards/esp32-zigbee-devkit", features = ["esp32h2"] }
 
 # ESP32-H2 HAL and runtime
+esp-bootloader-esp-idf = { version = "0.4.0", default-features = false, features = ["esp32h2"] }
 esp-hal = { version = "1.0.0", features = ["esp32h2", "unstable"] }
 esp-radio = { version = "0.17.0", features = ["esp32h2", "ieee802154", "unstable"] }
 esp-backtrace = { version = "0.14", features = ["esp32h2", "panic-handler", "println"] }
