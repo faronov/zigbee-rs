@@ -31,6 +31,7 @@ const SLOW_POLL_SECS: u64 = 30;
 const FAST_POLL_DURATION_SECS: u64 = 120;
 const RESTORED_FAST_POLL_SECS: u64 = 60;
 const EXPECTED_REPORT_CLUSTERS: usize = 3;
+
 macro_rules! application_clusters {
     ($app:expr) => {
         [
@@ -57,7 +58,7 @@ macro_rules! application_clusters {
 pub struct SensorApp {
     device: &'static mut ZigbeeDevice<Efr32Mac>,
     security_store: &'static mut SecurityStore,
-    sht: sensor::Sht3x,
+    sht: sensor::Sensor,
     battery: Option<BatteryMonitor>,
     temp_cluster: &'static mut TemperatureCluster,
     hum_cluster: &'static mut HumidityCluster,
@@ -84,7 +85,7 @@ impl SensorApp {
     pub fn new(
         device: &'static mut ZigbeeDevice<Efr32Mac>,
         security_store: &'static mut SecurityStore,
-        sht: sensor::Sht3x,
+        sht: sensor::Sensor,
         battery: Option<BatteryMonitor>,
         temp_cluster: &'static mut TemperatureCluster,
         hum_cluster: &'static mut HumidityCluster,
@@ -443,11 +444,7 @@ impl SensorApp {
     }
 
     async fn sample_sht(&mut self) {
-        if self.sht.start_measurement().is_err() {
-            return;
-        }
-        Timer::after(Duration::from_millis(20)).await;
-        if let Ok(measurement) = self.sht.read_measurement() {
+        if let Some(measurement) = self.sht.sample().await {
             self.temp_cluster
                 .set_temperature(measurement.temperature_centi_celsius);
             self.hum_cluster
@@ -628,9 +625,11 @@ impl SensorApp {
                 .await
                 .is_err()
             {
-                self.ota.abort();
-                self.ota_server = None;
-                self.ota_cleanup_pending = false;
+                if !self.ota.requeue_pending_frame(frame) {
+                    self.ota.abort();
+                    self.ota_server = None;
+                    self.ota_cleanup_pending = false;
+                }
                 return;
             }
         }

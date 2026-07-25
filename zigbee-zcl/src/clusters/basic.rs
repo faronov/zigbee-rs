@@ -61,6 +61,25 @@ impl BasicCluster {
         sw_build: &str,
         power_source: PowerSource,
     ) -> Self {
+        Self::new_with_application_version(
+            manufacturer,
+            model,
+            date_code,
+            sw_build,
+            1,
+            power_source,
+        )
+    }
+
+    /// Create a Basic cluster with an explicit ApplicationVersion value.
+    pub fn new_with_application_version(
+        manufacturer: &str,
+        model: &str,
+        date_code: &str,
+        sw_build: &str,
+        application_version: u8,
+        power_source: PowerSource,
+    ) -> Self {
         let mut store = AttributeStore::new();
         let _ = store.register(
             AttributeDefinition {
@@ -78,7 +97,7 @@ impl BasicCluster {
                 access: AttributeAccess::ReadOnly,
                 name: "ApplicationVersion",
             },
-            ZclValue::U8(1),
+            ZclValue::U8(application_version),
         );
         let _ = store.register(
             AttributeDefinition {

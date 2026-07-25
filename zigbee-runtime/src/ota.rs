@@ -187,6 +187,11 @@ impl<F: FirmwareWriter> OtaManager<F> {
         &mut self.cluster
     }
 
+    /// Borrow the platform firmware writer (staging slot state, diagnostics).
+    pub fn writer(&self) -> &F {
+        &self.writer
+    }
+
     /// Initiate an OTA image query.
     pub fn start_query(&mut self) -> Option<StackEvent> {
         self.response_wait_secs = 0;
@@ -205,6 +210,9 @@ impl<F: FirmwareWriter> OtaManager<F> {
         server_ieee: Option<u64>,
     ) -> Option<StackEvent> {
         self.response_wait_secs = 0;
+        // A response proves that an ambiguously failed request reached the
+        // server, so discard any retry copy before queuing the next request.
+        self.pending_frame = None;
         // Update UpgradeServerID from the server that sent us a command
         if let Some(ieee) = server_ieee {
             self.cluster.set_upgrade_server_id(ieee);
@@ -272,6 +280,18 @@ impl<F: FirmwareWriter> OtaManager<F> {
     /// Take the pending outgoing frame (consumed by runtime to send via APS).
     pub fn take_pending_frame(&mut self) -> Option<PendingOtaFrame> {
         self.pending_frame.take()
+    }
+
+    /// Requeue a frame after a transient transport failure.
+    ///
+    /// OTA requests are idempotent because they carry the requested file
+    /// offset. The response timeout remains the upper bound for retries.
+    pub fn requeue_pending_frame(&mut self, frame: PendingOtaFrame) -> bool {
+        if self.pending_frame.is_some() {
+            return false;
+        }
+        self.pending_frame = Some(frame);
+        true
     }
 
     /// Activate a verified image after the application has persisted any state

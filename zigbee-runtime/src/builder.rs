@@ -39,6 +39,7 @@ pub struct DeviceBuilder<M: MacDriver> {
     endpoints: heapless::Vec<EndpointConfig, MAX_ENDPOINTS>,
     manufacturer_name: &'static str,
     model_identifier: &'static str,
+    application_version: u8,
     sw_build_id: &'static str,
     date_code: &'static str,
     power_source: PowerSource,
@@ -56,6 +57,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             endpoints: heapless::Vec::new(),
             manufacturer_name: "zigbee-rs",
             model_identifier: "Generic",
+            application_version: 1,
             sw_build_id: "0.1.0",
             date_code: "",
             power_source: PowerSource::Unknown,
@@ -81,6 +83,12 @@ impl<M: MacDriver> DeviceBuilder<M> {
     /// Set the model identifier (Basic cluster attribute).
     pub fn model(mut self, model: &'static str) -> Self {
         self.model_identifier = model;
+        self
+    }
+
+    /// Set the Basic-cluster application version.
+    pub fn application_version(mut self, version: u8) -> Self {
+        self.application_version = version;
         self
     }
 
@@ -244,11 +252,12 @@ impl<M: MacDriver> DeviceBuilder<M> {
             automatic_polling: self.automatic_polling,
             pending_action: None,
             zcl_seq: 0,
-            basic_cluster: BasicCluster::new(
+            basic_cluster: BasicCluster::new_with_application_version(
                 self.manufacturer_name,
                 self.model_identifier,
                 self.date_code,
                 self.sw_build_id,
+                self.application_version,
                 self.power_source,
             ),
             identify_clusters,
@@ -272,6 +281,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             endpoints,
             manufacturer_name,
             model_identifier,
+            application_version,
             sw_build_id,
             date_code,
             power_source,
@@ -346,13 +356,16 @@ impl<M: MacDriver> DeviceBuilder<M> {
             core::ptr::addr_of_mut!((*dst).automatic_polling).write(automatic_polling);
             core::ptr::addr_of_mut!((*dst).pending_action).write(None);
             core::ptr::addr_of_mut!((*dst).zcl_seq).write(0);
-            core::ptr::addr_of_mut!((*dst).basic_cluster).write(BasicCluster::new(
-                manufacturer_name,
-                model_identifier,
-                date_code,
-                sw_build_id,
-                power_source,
-            ));
+            core::ptr::addr_of_mut!((*dst).basic_cluster).write(
+                BasicCluster::new_with_application_version(
+                    manufacturer_name,
+                    model_identifier,
+                    date_code,
+                    sw_build_id,
+                    application_version,
+                    power_source,
+                ),
+            );
             core::ptr::addr_of_mut!((*dst).identify_clusters).write(identify_clusters);
             core::ptr::addr_of_mut!((*dst).channel_mask).write(channel_mask);
             core::ptr::addr_of_mut!((*dst).pending_responses).write(heapless::Vec::new());

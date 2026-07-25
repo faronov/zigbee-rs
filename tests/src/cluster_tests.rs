@@ -744,6 +744,22 @@ mod basic {
     }
 
     #[test]
+    fn explicit_application_version_is_reported() {
+        let c = BasicCluster::new_with_application_version(
+            "TestMfr",
+            "Model-X",
+            "20260101",
+            "3",
+            3,
+            PowerSource::Battery,
+        );
+        assert_eq!(
+            c.attributes().get(ATTR_APPLICATION_VERSION),
+            Some(&ZclValue::U8(3))
+        );
+    }
+
+    #[test]
     fn set_power_source() {
         let mut c = BasicCluster::new("", "", "", "", PowerSource::Unknown);
         c.set_power_source(PowerSource::MainsSinglePhaseWithBatteryBackup);

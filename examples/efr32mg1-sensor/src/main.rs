@@ -51,7 +51,7 @@ async fn main(_spawner: Spawner) {
     platform::signal_boot().await;
 
     let i2c = efr32mg1_tradfri::sensor_i2c().unwrap_or_else(|_| platform::halt_with_led());
-    let sht = sensor::probe(i2c).await;
+    let sht = sensor::Sensor::new(i2c);
     let battery = efr32mg1_tradfri::battery_monitor().ok();
     let ota = OtaManager::new(
         efr32mg1_tradfri::ota::Efr32FirmwareWriter::new()
@@ -90,6 +90,7 @@ async fn main(_spawner: Spawner) {
         .automatic_polling(false)
         .manufacturer("Zigbee-RS")
         .model("EFR32MG1-Sensor")
+        .application_version(FIRMWARE_APPLICATION_VERSION)
         .date_code("20260402")
         .sw_build(FIRMWARE_VERSION_STR)
         .power_source(PowerSource::Battery)
