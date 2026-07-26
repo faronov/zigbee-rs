@@ -1,8 +1,19 @@
 //! Flash layout of the 4 MiB ESP32-C6/H2 Zigbee devkit partition table.
 //!
+//! This is C6-only product policy: the ESP32-H2 build keeps the default
+//! single-app partition table and has no OTA writer (see the crate docs).
+//!
 //! The single source of truth for the addresses is
 //! `partitions/esp32-4mb-ota.csv`; the constants below mirror it and the unit
 //! tests at the bottom of this file parse the CSV to prove they still agree.
+
+// `esp32_zigbee_devkit::flash` (the board crate) defines the same physical
+// chip constants, but it is `target_os = "none"`-gated so its ROM flash
+// driver dependency does not leak onto the host; this module's unit tests
+// (including the CSV round trip below) must run on the host, so the values
+// are mirrored here instead of re-exported. They are physical facts of the
+// flash chip fitted on every supported devkit and do not change per board
+// revision.
 
 /// Total flash size of the supported devkits.
 pub const FLASH_SIZE: u32 = 0x0040_0000;

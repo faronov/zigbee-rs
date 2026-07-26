@@ -520,7 +520,9 @@ mod tests {
             if self.fail_reads {
                 return Err(NorFlashErrorKind::Other);
             }
-            if offset as usize % Self::READ_SIZE != 0 || bytes.len() % Self::READ_SIZE != 0 {
+            if !(offset as usize).is_multiple_of(Self::READ_SIZE)
+                || !bytes.len().is_multiple_of(Self::READ_SIZE)
+            {
                 return Err(NorFlashErrorKind::NotAligned);
             }
             let range = self.range(offset, bytes.len())?;

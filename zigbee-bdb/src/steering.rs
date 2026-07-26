@@ -941,6 +941,7 @@ impl<M: MacDriver> BdbLayer<M> {
 
     /// Advance the exchange by one bounded step. See
     /// [`Self::advance_tclk_exchange`] for the public contract.
+    #[allow(clippy::needless_option_as_deref)]
     async fn step_tclk_exchange(
         &mut self,
         ex: &mut TclkExchange,

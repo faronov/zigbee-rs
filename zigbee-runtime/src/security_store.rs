@@ -15,6 +15,7 @@ const FLAG_COMMISSIONED: u8 = 1 << 0;
 const FLAG_TCLK_PRESENT: u8 = 1 << 1;
 const FLAG_TCLK_INCOMING_VALID: u8 = 1 << 2;
 const FLAG_REJOIN_PENDING: u8 = 1 << 3;
+const FLAG_LEGACY_DEFAULT_TCLK: u8 = 1 << 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityStoreError {
@@ -43,6 +44,19 @@ pub struct PersistentSecurityState {
     /// Persisted exclusive upper bound, never the live counter.
     pub global_counter_limit: u32,
     pub tclk_present: bool,
+    /// Commissioned network recovered from a persistence format that never
+    /// stored a unique Trust Center link key.
+    ///
+    /// The node keeps its NWK identity, network key and counter reservation,
+    /// but has no unique TCLK, so APS link-key traffic uses the well-known
+    /// default global Trust Center link key. That key's outgoing counter space
+    /// *is* the NWK frame counter (see
+    /// `zigbee_aps::Apsde::next_default_tc_link_key_frame_counter`), which the
+    /// durable `global_counter_limit` reservation already covers — no Trust
+    /// Center address or key is ever invented. Mutually exclusive with
+    /// [`Self::tclk_present`]; cleared as soon as a real unique TCLK is
+    /// reserved.
+    pub legacy_default_tclk: bool,
     pub trust_center_address: IeeeAddress,
     pub trust_center_link_key: [u8; 16],
     /// Persisted exclusive upper bound, never the live counter.
@@ -68,6 +82,7 @@ impl PersistentSecurityState {
             key_sequence: 0,
             global_counter_limit: 0,
             tclk_present: false,
+            legacy_default_tclk: false,
             trust_center_address: [0; 8],
             trust_center_link_key: [0; 16],
             tclk_counter_limit: 0,
@@ -95,6 +110,10 @@ impl PersistentSecurityState {
             FLAG_REJOIN_PENDING
         } else {
             0
+        }) | (if self.legacy_default_tclk {
+            FLAG_LEGACY_DEFAULT_TCLK
+        } else {
+            0
         });
         output[1] = self.channel;
         output[2] = self.depth;
@@ -119,7 +138,8 @@ impl PersistentSecurityState {
             & !(FLAG_COMMISSIONED
                 | FLAG_TCLK_PRESENT
                 | FLAG_TCLK_INCOMING_VALID
-                | FLAG_REJOIN_PENDING)
+                | FLAG_REJOIN_PENDING
+                | FLAG_LEGACY_DEFAULT_TCLK)
             != 0
         {
             return Err(SecurityStoreError::Corrupt);
@@ -129,6 +149,7 @@ impl PersistentSecurityState {
         state.tclk_present = flags & FLAG_TCLK_PRESENT != 0;
         state.tclk_incoming_counter_valid = flags & FLAG_TCLK_INCOMING_VALID != 0;
         state.rejoin_pending = flags & FLAG_REJOIN_PENDING != 0;
+        state.legacy_default_tclk = flags & FLAG_LEGACY_DEFAULT_TCLK != 0;
         state.channel = input[1];
         state.depth = input[2];
         state.update_id = input[3];
@@ -158,7 +179,20 @@ impl PersistentSecurityState {
                 || self.short_address == 0xFFFF
                 || self.ieee_address == [0; 8]
                 || self.global_counter_limit == 0
-                || !self.tclk_present)
+                || !(self.tclk_present || self.legacy_default_tclk))
+        {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        // A legacy default-TCLK network is a commissioned network *without* a
+        // unique key; the two representations must never be combined.
+        if self.legacy_default_tclk
+            && (!self.commissioned
+                || self.tclk_present
+                || self.trust_center_address != [0; 8]
+                || self.trust_center_link_key != [0; 16]
+                || self.tclk_counter_limit == 0
+                || self.tclk_incoming_counter != 0
+                || self.tclk_incoming_counter_valid)
         {
             return Err(SecurityStoreError::Corrupt);
         }
@@ -249,6 +283,7 @@ impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersist
         self.state.key_sequence = state.key_sequence;
         self.state.global_counter_limit = reservation.limit;
         self.state.tclk_present = false;
+        self.state.legacy_default_tclk = false;
         self.state.trust_center_address = [0; 8];
         self.state.trust_center_link_key = [0; 16];
         self.state.tclk_incoming_counter = 0;
@@ -271,6 +306,7 @@ impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersist
         let reservation = self.reserve_from(current)?;
 
         self.state.tclk_present = true;
+        self.state.legacy_default_tclk = false;
         self.state.trust_center_address = state.partner_address;
         self.state.trust_center_link_key = state.key;
         self.state.tclk_counter_limit = reservation.limit;
@@ -384,6 +420,93 @@ mod tests {
         let mut encoded = [0u8; ENCODED_SECURITY_STATE_LEN];
         state.encode(&mut encoded);
         assert_eq!(PersistentSecurityState::decode(&encoded), Ok(state));
+    }
+
+    #[test]
+    fn legacy_default_tclk_state_round_trips_and_is_validated() {
+        // A network recovered from a persistence format that never stored a
+        // unique TCLK: commissioned, but explicitly without one.
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.legacy_default_tclk = true;
+        state.extended_pan_id = [1; 8];
+        state.pan_id = 0x1234;
+        state.short_address = 0x5678;
+        state.ieee_address = [2; 8];
+        state.channel = 15;
+        state.network_key = [3; 16];
+        state.key_sequence = 4;
+        state.global_counter_limit = 0x400;
+        state.tclk_counter_limit = 0x400;
+        assert_eq!(state.validate(), Ok(()));
+
+        let mut encoded = [0u8; ENCODED_SECURITY_STATE_LEN];
+        state.encode(&mut encoded);
+        let decoded = PersistentSecurityState::decode(&encoded).unwrap();
+        assert_eq!(decoded, state);
+        assert!(decoded.legacy_default_tclk);
+        assert!(!decoded.tclk_present);
+        assert_eq!(decoded.trust_center_address, [0; 8]);
+
+        // The flag is only meaningful for a commissioned network without a
+        // unique key; every other combination is corruption.
+        let mut both = state;
+        both.tclk_present = true;
+        both.trust_center_address = [5; 8];
+        assert_eq!(both.validate(), Err(SecurityStoreError::Corrupt));
+        let mut uncommissioned = state;
+        uncommissioned.commissioned = false;
+        assert_eq!(uncommissioned.validate(), Err(SecurityStoreError::Corrupt));
+        let mut neither = state;
+        neither.legacy_default_tclk = false;
+        assert_eq!(neither.validate(), Err(SecurityStoreError::Corrupt));
+        let mut invented_trust_center = state;
+        invented_trust_center.trust_center_address = [5; 8];
+        assert_eq!(
+            invented_trust_center.validate(),
+            Err(SecurityStoreError::Corrupt)
+        );
+        let mut no_tclk_floor = state;
+        no_tclk_floor.tclk_counter_limit = 0;
+        assert_eq!(no_tclk_floor.validate(), Err(SecurityStoreError::Corrupt));
+    }
+
+    #[test]
+    fn a_real_tclk_replaces_the_legacy_default_key_marker() {
+        let mut store = RamSecurityStateStore::new();
+        let mut legacy = PersistentSecurityState::empty();
+        legacy.commissioned = true;
+        legacy.legacy_default_tclk = true;
+        legacy.extended_pan_id = [1; 8];
+        legacy.pan_id = 0x1234;
+        legacy.short_address = 0x5678;
+        legacy.ieee_address = [2; 8];
+        legacy.channel = 15;
+        legacy.network_key = [3; 16];
+        legacy.global_counter_limit = 0x800;
+        legacy.tclk_counter_limit = 0x800;
+        store.store(&legacy).unwrap();
+
+        {
+            let mut persistence = CommissioningSecurityPersistence::new(&mut store).unwrap();
+            // A unique key delivered later continues above the migrated floor …
+            assert_eq!(
+                persistence.reserve_trust_center_link_key(&tclk_state(0, 0)),
+                Ok(CounterReservation {
+                    current: 0x800,
+                    limit: 0xC00
+                })
+            );
+            persistence.commit_network(&tclk_state(1, 9)).unwrap();
+        }
+
+        // … and the transitional marker is gone once it exists.
+        let saved = store.load().unwrap().unwrap();
+        assert!(saved.commissioned);
+        assert!(saved.tclk_present);
+        assert!(!saved.legacy_default_tclk);
+        assert_eq!(saved.tclk_counter_limit, 0xC00);
+        assert_eq!(saved.validate(), Ok(()));
     }
 
     #[test]

@@ -8,9 +8,9 @@ across **9 crates** that mirror the standard Zigbee layer model. Every crate is
 
 ```text
 ┌─────────────────────────────────────┐
-│  Application (your code)            │
+│  Product + application profile      │
 ├─────────────────────────────────────┤
-│  zigbee-runtime (ZigbeeDevice)      │
+│  zigbee-runtime (ZigbeeNode)        │
 ├──────┬──────┬───────┬──────┬───────┤
 │  BDB │  ZCL │  ZDO  │  APS │       │
 ├──────┴──────┴───────┴──────┤       │
@@ -24,7 +24,57 @@ across **9 crates** that mirror the standard Zigbee layer model. Every crate is
 
 The top-level **`zigbee`** crate re-exports everything and adds
 coordinator/router role support. Most applications interact with the
-`zigbee-runtime` layer through `ZigbeeDevice`.
+`zigbee-runtime` layer through `ZigbeeNode`, which composes a
+`ZigbeeDevice`, durable security store, and typed application profile.
+
+Hardware composition follows a separate dependency direction:
+
+```text
+application/profile  device behavior and measurement mapping
+product              identity, flash layout, bootloader/OTA selection
+board                physical pins, buses, buttons, LEDs, fitted devices
+platform/chip HAL    radio, clocks, sleep, reset, raw flash controller
+```
+
+A board crate must not depend on `zigbee-runtime`. Product code depends on the
+board and selects the storage/OTA policy used by the application.
+
+## Board Resource Ownership
+
+Where fitted peripherals have alternative owners, board crates expose typed
+resources that enforce mutual exclusion at the type level. The EFR32MG1
+TRÅDFRI board is the reference example:
+
+```rust,ignore
+let board = BoardResources::take().unwrap();
+
+// PA0: choose EITHER direct GPIO LED OR TIMER0 PWM (not both)
+let led = board.pa0.into_led();        // excludes PWM
+// let pwm = board.pa0.into_led_pwm(); // would fail: token consumed
+
+// Product policy chooses EITHER direct SPI OR bootloader-managed flash.
+let ota_flash = board.external_flash.into_bootloader_managed();
+let profile = product::profile::sensor_profile(firmware_version, ota_flash)?;
+
+// Remaining tokens are consumed individually
+let i2c = board.sensor_i2c.into_sensor_i2c()?;
+let supply = board.supply_adc.into_supply_monitor()?;
+```
+
+Each token is consumed exactly once. Unused tokens are dropped and the linker
+eliminates the dead driver code. The bootloader ownership marker is retained by
+the product OTA writer for its full lifetime, so the direct USART0 SPI path
+cannot be selected through the typed API at the same time. Peripheral
+diagnostics should exercise the same typed constructors as production.
+Chip-internal radio, RTCC timing, and internal flash remain HAL/platform or
+product resources rather than board tokens; their existing diagnostics stay
+independently buildable.
+
+ESP32-C6/H2 and nRF52840 use their vendor-independent HAL types directly for
+chip-internal flash/radio mechanisms. Their board crates still remain
+physical-only: the ESP board exposes raw whole-chip flash, while the nRF DK
+board maps LED, button, and sensor-I2C pins. Product crates add partitions,
+persistence, identity, and the concrete profile.
 
 ## Crate Roles
 
@@ -38,8 +88,45 @@ coordinator/router role support. Most applications interact with the
 | **`zigbee-zdo`** | Zigbee Device Objects (endpoint 0). Handles discovery (`Active_EP_req`, `Simple_Desc_req`, `Match_Desc_req`), binding, and network management requests. |
 | **`zigbee-bdb`** | Base Device Behavior. Implements BDB commissioning: network steering (end devices join), network formation (coordinators create), Finding & Binding, and Touchlink. |
 | **`zigbee-zcl`** | Zigbee Cluster Library. 33 clusters, foundation commands (Read/Write/Report/Discover Attributes), attribute storage engine, and reporting engine. |
-| **`zigbee-runtime`** | The integration layer your application uses. Provides `DeviceBuilder`, `ZigbeeDevice`, the event loop (`tick()` / `process_incoming()`), NV storage abstraction, power management, and pre-built device templates. |
+| **`zigbee-runtime`** | The integration layer your application uses. Provides `DeviceBuilder`, `ZigbeeDevice`, typed application profiles, `ZigbeeNode`, persistence algorithms, reporting, and power management. |
 | **`zigbee`** | Top-level umbrella crate. Re-exports all sub-crates and adds coordinator/router role implementations. |
+
+## Reusable Typed Profiles
+
+`zigbee_runtime::profile` owns cluster instances, endpoint composition,
+default reporting, and application-value mapping. Product crates select and
+configure these reusable archetypes:
+
+| Archetype | Implemented composition |
+|-----------|-------------------------|
+| `TemperatureHumidityBattery` | Temperature + humidity + power configuration |
+| `TemperatureHumidityPressureBattery` | `TemperatureHumidityBattery` plus a mandatory Pressure Measurement cluster, via `TemperatureHumidityBattery::with_pressure` |
+| `AirQuality` | CO₂ + temperature + humidity; optional battery |
+| `Thermostat` | Thermostat local temperature/setpoint/schedule controls; optional humidity and battery |
+| `OccupancyLight` | Occupancy sensing + illuminance; optional battery |
+| `PlantSensor` | Soil moisture + temperature + illuminance; optional battery |
+| `SmartPlug` | On/Off + basic electrical measurement; optional delivered-energy/demand metering |
+
+Profiles do not advertise decorative clusters. For example, the air-quality
+profile does not add PM2.5 until a product supplies that measurement, the
+occupancy profile does not pretend to be an IAS security zone, and the smart
+plug does not claim unimplemented Simple Metering commands. Illuminance input
+is the ZCL-encoded measured value; the `no_std` runtime does not invent a
+floating-point `log10` conversion.
+
+Most "optional cluster" archetypes above (`AirQuality`, `Thermostat`,
+`OccupancyLight`, `PlantSensor`) hold their optional cluster as an
+`Option<Cluster>` field, which is appropriate when most products using that
+archetype are expected to fit the optional hardware. Pressure is different:
+it is the one uncommon variant of `TemperatureHumidityBattery`, fitted only
+by the nRF52840 BME280 product, while EFR32 and ESP32 products never call
+`with_pressure`. Because `ClusterRef` holds `&mut dyn Cluster`, an
+`Option<PressureCluster>` field on `TemperatureHumidityBattery` would still
+link `PressureCluster`'s `Cluster` vtable and attribute storage into *every*
+firmware built from that archetype — EFR32 and ESP32 included — regardless
+of whether it is ever `Some`. `with_pressure` therefore returns the distinct
+`TemperatureHumidityPressureBattery` type instead, so only the one product
+that actually composes it pays for it.
 
 ## Data Flow
 
@@ -78,7 +165,7 @@ attribute report:
 ### RX Path (Radio → Application)
 
 Incoming frames flow **up**. The application drives this by calling
-`device.receive()` and then `device.process_incoming()`:
+`node.device_mut().receive()` and then `node.process_incoming()`:
 
 ```text
 Radio       802.15.4 frame received
@@ -108,7 +195,9 @@ primarily [Embassy](https://embassy.dev/):
 - **`no_std` throughout** — no heap allocation, no `std::thread`, no OS.
 - **`async` without `Send`/`Sync`** — the `MacDriver` trait uses `async fn`
   methods with no `Send` bounds, matching Embassy's single-core executor model.
-- **`stack_tick()` polling** — your main loop calls `device.tick(elapsed_secs, clusters)` periodically.
+- **Periodic ticks** — your main loop calls `node.tick(elapsed_secs)` periodically.
+  The profile owns the application clusters, so callers do not rebuild
+  `ClusterRef` arrays before every operation.
   Between ticks the executor can run other tasks (sensor reads, display updates,
   button debouncing). The runtime never blocks indefinitely.
 - **`select!` pattern** — the idiomatic event loop uses `embassy_futures::select`
@@ -118,12 +207,12 @@ primarily [Embassy](https://embassy.dev/):
 loop {
     match select(device.receive(), Timer::after(Duration::from_secs(10))).await {
         Either::First(Ok(frame)) => {
-            device.process_incoming(&frame, &mut clusters).await;
+            node.process_incoming(&frame).await;
         }
         Either::First(Err(_)) => {}  // MAC error, retry
         Either::Second(_) => {
             // Timer fired — run periodic maintenance
-            device.tick(10, &mut clusters).await;
+            node.tick(10).await;
         }
     }
 }

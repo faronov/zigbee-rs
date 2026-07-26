@@ -1,4 +1,4 @@
-/* EFR32MG1P TRADFRI Interrupt Vector Names
+/* EFR32MG1P Interrupt Vector Names
  *
  * Weak aliases to DefaultHandler — override by defining a function
  * with the same name in Rust code.

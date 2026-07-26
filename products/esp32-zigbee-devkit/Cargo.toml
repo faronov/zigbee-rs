@@ -1,0 +1,34 @@
+[package]
+name = "esp32-zigbee-devkit-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product configuration (persistence, OTA, profile) for the ESP32-C6/H2 Zigbee sensor firmware"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+embedded-storage = "0.3"
+log = "0.4"
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-bdb = { path = "../../zigbee-bdb" }
+zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee-zcl = { path = "../../zigbee-zcl" }
+esp32-zigbee-devkit = { path = "../../boards/esp32-zigbee-devkit" }
+
+# Only for naming the concrete flash error type that `esp32-zigbee-devkit`'s
+# `RawFlash` returns (`embedded_storage::nor_flash::ErrorType::Error`); all
+# flash access itself goes through the board crate.
+[target.'cfg(target_os = "none")'.dependencies]
+esp-storage = { version = "0.7", default-features = false, features = [
+    "bytewise-read",
+    "critical-section",
+] }
+
+[features]
+default = []
+# Only the ESP32-C6 build has an OTA-capable two-slot partition table today;
+# the ESP32-H2 build keeps the default single-app table (see
+# `docs/book/src/platform-guides/esp32.md`) and has no OTA writer.
+esp32c6 = ["esp32-zigbee-devkit/esp32c6", "zigbee-runtime/ota"]
+esp32h2 = ["esp32-zigbee-devkit/esp32h2"]

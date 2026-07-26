@@ -62,6 +62,7 @@ zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime", features = ["constrained-memory", "trace"] }
 efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
+efr32mg1-tradfri-product = { path = "../../products/efr32mg1-tradfri" }
 efr32mg1-hal = { path = "../../efr32mg1-hal" }
 zigbee-sht3x = { path = "../../drivers/sht3x" }
 

@@ -14,7 +14,11 @@ use embedded_hal::spi::SpiBus;
 #[cortex_m_rt::entry]
 fn main() -> ! {
     platform::init_small!("diag-spi");
-    let resources = match efr32mg1_tradfri::flash_spi() {
+    let board = efr32mg1_tradfri::resources::BoardResources::take().unwrap_or_else(|| {
+        rtt_target::rprintln!("[EFR32][diag-spi] RESOURCE_TAKEN");
+        platform::halt()
+    });
+    let resources = match board.external_flash.into_direct_spi() {
         Ok(resources) => resources,
         Err(error) => {
             rtt_target::rprintln!("[EFR32][diag-spi] INIT_FAIL error={:?}", error);

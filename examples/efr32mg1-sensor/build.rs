@@ -15,8 +15,7 @@ fn main() {
     let generated = format!(
         "pub const FIRMWARE_VERSION: u32 = {version};\n\
          pub const FIRMWARE_APPLICATION_VERSION: u8 = {};\n\
-         pub const FIRMWARE_VERSION_STR: &str = \"{version}\";\n"
-        ,
+         pub const FIRMWARE_VERSION_STR: &str = \"{version}\";\n",
         version as u8
     );
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));

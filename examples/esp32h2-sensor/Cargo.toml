@@ -10,7 +10,7 @@ zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
-esp32-zigbee-devkit = { path = "../../boards/esp32-zigbee-devkit", features = ["esp32h2"] }
+esp32-zigbee-devkit-product = { path = "../../products/esp32-zigbee-devkit", features = ["esp32h2"] }
 
 # ESP32-H2 HAL and runtime
 esp-bootloader-esp-idf = { version = "0.4.0", default-features = false, features = ["esp32h2"] }

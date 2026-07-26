@@ -1,0 +1,29 @@
+[package]
+name = "nrf52840-sensor-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product configuration for the nRF52840-DK Zigbee sensor firmware"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[features]
+# Adds a Pressure Measurement cluster to the profile for the BME280 variant.
+# Keep in sync with the `sensor-bme280` feature in examples/nrf52840-sensor.
+sensor-bme280 = []
+
+[dependencies]
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee-zcl = { path = "../../zigbee-zcl" }
+
+# `embassy-nrf` (and this product's `nrf52840-dk` board dependency, which
+# also requires it) only build for the actual Cortex-M target: `nrf-pac`'s
+# `rt` feature embeds a hardware vector table section that is not valid for
+# a host Mach-O/ELF object. Gate both so `battery` and `profile` — the
+# pure, hardware-independent logic — stay host-testable via `cargo test`,
+# the same way `boards/esp32-zigbee-devkit` gates `esp-storage`.
+[target.'cfg(target_os = "none")'.dependencies]
+nrf52840-dk = { path = "../../boards/nrf52840-dk" }
+embassy-nrf = { version = "0.3", features = ["nrf52840"] }
+embedded-storage = "0.3"

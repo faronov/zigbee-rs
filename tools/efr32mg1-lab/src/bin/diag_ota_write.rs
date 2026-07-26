@@ -9,7 +9,7 @@ mod platform;
 mod vectors;
 
 use cortex_m as _;
-use efr32mg1_tradfri::ota::Efr32FirmwareWriter;
+use efr32mg1_tradfri_product::ota::Efr32FirmwareWriter;
 use zigbee_runtime::firmware_writer::{FirmwareError, FirmwareWriter};
 
 const FIRST_LEN: usize = 250;
@@ -20,7 +20,12 @@ const TOTAL_LEN: usize = FIRST_LEN + SECOND_LEN;
 fn main() -> ! {
     platform::init_small!("diag-ota-write");
 
-    let mut writer = Efr32FirmwareWriter::new().unwrap_or_else(|_| fail("DISCOVERY_FAIL"));
+    let flash_access = efr32mg1_tradfri::resources::BoardResources::take()
+        .unwrap_or_else(|| fail("RESOURCE_TAKEN"))
+        .external_flash
+        .into_bootloader_managed();
+    let mut writer =
+        Efr32FirmwareWriter::new(flash_access).unwrap_or_else(|_| fail("DISCOVERY_FAIL"));
     writer.erase_slot().unwrap_or_else(|_| fail("ERASE1_FAIL"));
 
     let mut first = [0u8; FIRST_LEN];

@@ -216,6 +216,24 @@ number of seconds, then resumes from the saved offset.
 
 ---
 
+## Shared Runtime Session Transport
+
+`zigbee_runtime::ota::OtaManager` owns the Zigbee OTA protocol state machine
+and image-header checks. `zigbee_runtime::ota_transport::OtaSession` owns the
+common network bookkeeping used by EFR32MG1 and ESP32-C6: locking a transfer
+to one server, forwarding OTA commands, retrying queued APS requests, cleaning
+up failed sessions, and deferring activation until the application has
+checkpointed security state.
+
+Storage access, image-format validation beyond the Zigbee header, version
+policy, boot-slot selection, activation, and reset remain in each product's
+`FirmwareWriter`. `OptionalOta` lets ESP32-C6 omit the OTA client cluster when
+the checked on-device partition table is incompatible; normal commissioning
+and reporting continue. ESP32-H2 has no OTA backend or OTA client in the
+current product.
+
+---
+
 ## FirmwareWriter Trait
 
 The `FirmwareWriter` trait (`zigbee_runtime::firmware_writer`) abstracts the
@@ -265,14 +283,21 @@ pub enum FirmwareError {
 
 | Platform | Writer | Slot Location | Status |
 |----------|--------|---------------|--------|
-| EFR32MG1 | `efr32mg1_tradfri::ota::Efr32FirmwareWriter` | Gecko Bootloader storage slot 0 (external SPI flash) | Implemented |
-| ESP32-C6 / H2 | `esp32_zigbee_devkit::ota::EspFirmwareWriter` | Inactive `ota_0`/`ota_1` partition, selected through `otadata` | Implemented in software, not yet run on hardware |
+| EFR32MG1 | `efr32mg1_tradfri_product::ota::Efr32FirmwareWriter` | Gecko Bootloader storage slot 0 (external SPI flash) | Implemented |
+| ESP32-C6 | `esp32_zigbee_devkit_product::ota::EspFirmwareWriter` | Inactive `ota_0`/`ota_1` partition, selected through `otadata` | Implemented and host-tested; real upgrade still pending |
+| ESP32-H2 | — | — | Not implemented; product intentionally omits OTA |
 | Mock | `zigbee_runtime::firmware_writer::MockFirmwareWriter` | RAM buffer (`heapless::Vec<u8, 262144>`) | For host testing — 256 KB max |
 | nRF52840 | — | Secondary flash bank via NVMC | Not implemented |
 | BL702 | — | XIP flash via `bl702-pac` | Not implemented |
 
 > Only the platforms marked *Implemented* have a `FirmwareWriter`; the others
 > are design sketches for future backends.
+
+The EFR32MG1 writer can only be constructed with the
+`BootloaderFlashAccess` marker obtained by consuming the board's external-flash
+token. The product profile retains that marker for the writer's lifetime, so
+the direct USART0 SPI path and Gecko Bootloader storage API cannot both be
+selected through the typed board API.
 
 #### ESP32 specifics
 

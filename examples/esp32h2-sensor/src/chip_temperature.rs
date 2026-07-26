@@ -47,8 +47,7 @@ impl H2TemperatureSensor {
             .modify(|_, w| w.tsens_clk_sel().set_bit());
 
         let current = Self::regi2c_read(Self::TSENS_DAC_REGISTER)?;
-        let configured = (current & !Self::TSENS_DAC_MASK)
-            | Self::TSENS_DAC_RANGE_MINUS_10_TO_80;
+        let configured = (current & !Self::TSENS_DAC_MASK) | Self::TSENS_DAC_RANGE_MINUS_10_TO_80;
         Self::regi2c_write(Self::TSENS_DAC_REGISTER, configured)?;
 
         Ok(Self)
@@ -81,7 +80,11 @@ impl H2TemperatureSensor {
             w.sar_i2c_rd().clear_bit()
         });
 
-        if sar_uses_master_zero { 0 } else { 1 }
+        if sar_uses_master_zero {
+            0
+        } else {
+            1
+        }
     }
 
     fn wait_regi2c(master: usize) -> Result<(), Error> {
@@ -103,33 +106,25 @@ impl H2TemperatureSensor {
         let master = Self::regi2c_master();
         Self::wait_regi2c(master)?;
 
-        I2C_ANA_MST::regs()
-            .i2c_ctrl(master)
-            .write(|w| unsafe {
-                w.slave_addr().bits(Self::SAR_I2C_BLOCK);
-                w.slave_reg_addr().bits(register)
-            });
+        I2C_ANA_MST::regs().i2c_ctrl(master).write(|w| unsafe {
+            w.slave_addr().bits(Self::SAR_I2C_BLOCK);
+            w.slave_reg_addr().bits(register)
+        });
         Self::wait_regi2c(master)?;
 
-        Ok(I2C_ANA_MST::regs()
-            .i2c_ctrl(master)
-            .read()
-            .data()
-            .bits())
+        Ok(I2C_ANA_MST::regs().i2c_ctrl(master).read().data().bits())
     }
 
     fn regi2c_write(register: u8, value: u8) -> Result<(), Error> {
         let master = Self::regi2c_master();
         Self::wait_regi2c(master)?;
 
-        I2C_ANA_MST::regs()
-            .i2c_ctrl(master)
-            .write(|w| unsafe {
-                w.slave_addr().bits(Self::SAR_I2C_BLOCK);
-                w.slave_reg_addr().bits(register);
-                w.read_write().set_bit();
-                w.data().bits(value)
-            });
+        I2C_ANA_MST::regs().i2c_ctrl(master).write(|w| unsafe {
+            w.slave_addr().bits(Self::SAR_I2C_BLOCK);
+            w.slave_reg_addr().bits(register);
+            w.read_write().set_bit();
+            w.data().bits(value)
+        });
 
         Self::wait_regi2c(master)
     }

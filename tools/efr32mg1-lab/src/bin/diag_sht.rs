@@ -108,7 +108,11 @@ async fn run(i2c: efr32mg1_tradfri::SensorI2c) -> ! {
 fn main() -> ! {
     platform::init_small!("diag-sht");
     time_driver::init();
-    let i2c = match efr32mg1_tradfri::sensor_i2c() {
+    let board = efr32mg1_tradfri::resources::BoardResources::take().unwrap_or_else(|| {
+        rtt_target::rprintln!("[EFR32][diag-sht] RESOURCE_TAKEN");
+        platform::halt()
+    });
+    let i2c = match board.sensor_i2c.into_sensor_i2c() {
         Ok(i2c) => i2c,
         Err(error) => {
             rtt_target::rprintln!("[EFR32][diag-sht] I2C_FATAL error={:?}", error);

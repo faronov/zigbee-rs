@@ -19,12 +19,12 @@ fn main() -> ! {
     platform::init_small!("diag-nv");
     rtt_target::rprintln!(
         "[EFR32][diag-nv] BOOT nv=0x{:08X}..0x{:08X} radio=off rtcc=off",
-        efr32mg1_tradfri::storage::APP_NV_PARTITION_START,
-        efr32mg1_tradfri::storage::APP_NV_PARTITION_START
-            + efr32mg1_tradfri::storage::APP_NV_PARTITION_SIZE as u32
+        efr32mg1_tradfri_product::storage::APP_NV_PARTITION_START,
+        efr32mg1_tradfri_product::storage::APP_NV_PARTITION_START
+            + efr32mg1_tradfri_product::storage::APP_NV_PARTITION_SIZE as u32
     );
 
-    let mut nv = match efr32mg1_tradfri::storage::application_nv() {
+    let mut nv = match efr32mg1_tradfri_product::storage::application_nv() {
         Ok(nv) => nv,
         Err(error) => {
             rtt_target::rprintln!("[EFR32][diag-nv] OPEN_FAIL error={:?}", error);

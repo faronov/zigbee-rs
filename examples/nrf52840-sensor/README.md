@@ -13,8 +13,8 @@ on-chip TEMP as the default fallback. Uses `defmt` + RTT for logging.
 | `sensor-sht31`  | SHT31   | Temp + humidity              |
 
 All variants include: Basic, Power Configuration, **Identify** (LED blink),
-Battery voltage (SAADC), RAM power-down for unused banks, atomic security persistence,
-NWK Leave handling, default reporting, and auto-recovery on sensor failure.
+Battery voltage (SAADC), atomic security persistence, NWK Leave handling,
+default reporting, and auto-recovery on sensor failure.
 
 ## Hardware Requirements
 
@@ -69,8 +69,12 @@ cargo run --release
 
 BME280 I2C address: 0x76 (SDO→GND) or 0x77 (SDO→VCC).
 
-Both drivers are **fully async** — they use embassy's TWIM (DMA-based I2C master)
-and yield during transfers, so the Zigbee radio continues processing uninterrupted.
+Both drivers are the shared, workspace-level `zigbee-bme280` / `zigbee-sht3x`
+crates (`drivers/bme280`, `drivers/sht3x`) — the same register map, reset, and
+oversampling as before, now reused instead of hand-duplicated. They are
+**fully async** — they use embassy's TWIM (DMA-based I2C master) and yield
+during transfers, so the Zigbee radio continues processing uninterrupted.
+See `src/sensor.rs` for the recoverable probe/read wiring.
 
 ## What It Demonstrates
 
@@ -87,11 +91,17 @@ and yield during transfers, so the Zigbee radio continues processing uninterrupt
 - Automatic sensor recovery on read failure (re-init next cycle)
 - Processing incoming MAC frames and generating ZCL attribute reports
 - Button-driven network join/leave via the security-store lifecycle APIs
-- RAM power-down of unused banks (~190 KB saved on nRF52840)
 - **Atomic security journal** — CRC, generation, and commit-protected security state
-  persists across power cycles in the last 8 KB of flash
+  persists across power cycles in the last 8 KiB of flash (owned by the
+  `nrf52840-sensor-product` product crate; see Architecture below)
 - Battery voltage monitoring via SAADC (VDD internal divider)
 - `log` → `defmt` bridge for stack-internal logging via RTT
+- Endpoint/cluster composition, reporting defaults, and measurement mapping
+  come from the shared `zigbee_runtime::profile::TemperatureHumidityBattery`
+  archetype, selected by `nrf52840-sensor-product`. With `sensor-bme280`,
+  the product instead selects `TemperatureHumidityPressureBattery` (built
+  via `TemperatureHumidityBattery::with_pressure`), a distinct type so
+  builds without BME280 never link the Pressure Measurement cluster
 
 ## Power Optimizations
 
@@ -103,7 +113,13 @@ battery drain:
 | DC-DC converter | `reg0` + `reg1` enabled | ~40% lower current |
 | TX power | 0 dBm (down from +8 dBm) | ~50% TX current |
 | HFCLK source | Internal RC (radio auto-requests XTAL) | ~250 µA idle |
-| RAM power-down | Unused banks off at boot | ~190 KB unpowered |
+
+`main.rs` also defines `power_down_unused_ram()`, which would power off the
+unused ~192 KiB RAM bank 8 (`#[allow(dead_code)]`). It is **not currently
+called** from `main()` — wiring it in requires re-verifying stack/BSS
+headroom against the executor's task arena on hardware first. Treat "RAM
+power-down" as an available-but-unwired primitive, not an active
+optimization, until that hardware gate is closed.
 
 **Polling scheme:**
 - Fast poll: 250 ms for 120 seconds after join/activity
@@ -133,10 +149,31 @@ nrf52840-sensor/
 ├── .cargo/config.toml   # Target, runner (probe-rs), DEFMT_LOG level
 ├── Cargo.toml            # Features (sensor-bme280, sensor-sht31), deps
 └── src/
-    ├── bme280.rs         # Async BME280 I2C driver (feature: sensor-bme280)
-    ├── sht31.rs          # Async SHT31 I2C driver (feature: sensor-sht31)
-    └── main.rs           # Async entry point (#[embassy_executor::main])
+    ├── sensor.rs         # Recoverable BME280/SHT31 wiring over the shared
+    │                     # zigbee-bme280 / zigbee-sht3x drivers (feature-gated)
+    └── main.rs           # Composition root: platform startup, resource
+                           # construction, Embassy event loop
 ```
 
-`boards/nrf52840-dk` owns the NVMC partition and linker layout that reserve the
-last 8 KB for the shared security journal.
+## Architecture
+
+This example is a composition root only. Physical wiring, memory layout,
+persistence, and Zigbee protocol behavior are owned by separate crates:
+
+```
+nrf52840-sensor (example)   startup, resource construction, event loop
+        |
+nrf52840-sensor-product     identity, link/memory.x, security journal
+        |                   partition, concrete profile (products/nrf52840-sensor)
+        |
+nrf52840-dk (board)         LED1/Button 1/sensor-I2C pin wiring only
+                            (boards/nrf52840-dk; no zigbee-runtime dependency)
+```
+
+`products/nrf52840-sensor` owns the NVMC partition (`src/storage.rs`) and
+linker layout (`link/memory.x`) that reserve the last 8 KiB of flash for the
+shared, crash-safe security journal, plus the battery voltage/percentage
+curve (`src/battery.rs`) and the concrete Zigbee profile (`src/profile.rs`,
+built from the shared `zigbee_runtime::profile::TemperatureHumidityBattery`
+archetype). `boards/nrf52840-dk` only wires LED1, Button 1, and the sensor
+I2C bus pins, and has no dependency on `zigbee-runtime`.

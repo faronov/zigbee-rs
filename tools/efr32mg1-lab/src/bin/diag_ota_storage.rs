@@ -15,6 +15,13 @@ use efr32mg1_hal::bootloader::Bootloader;
 fn main() -> ! {
     platform::init_small!("diag-ota-storage");
 
+    let _flash_access = efr32mg1_tradfri::resources::BoardResources::take()
+        .unwrap_or_else(|| {
+            rtt_target::rprintln!("[EFR32][diag-ota-storage] RESOURCE_TAKEN");
+            platform::halt()
+        })
+        .external_flash
+        .into_bootloader_managed();
     let mut bootloader = match Bootloader::discover() {
         Ok(bootloader) => bootloader,
         Err(error) => {

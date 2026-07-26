@@ -1,12 +1,25 @@
-//! nRF52840 DK flash partitions and Zigbee security storage wiring.
+//! Product-owned nRF52840 flash partitions and Zigbee security persistence
+//! wiring.
+//!
+//! Moved here from `boards/nrf52840-dk` unchanged: partition addresses,
+//! sizes, and the `SecurityStateJournal` sector assignment are exactly as
+//! previously proven on hardware. Only the ownership boundary changed — the
+//! board crate no longer selects persistence policy, the product does.
+//!
+//! Target-gated: `embassy_nrf::nvmc` only builds for the real Cortex-M
+//! target (see the crate-level dependency comment in `Cargo.toml`).
+
+#![cfg(target_os = "none")]
 
 use embassy_nrf::nvmc::{Error, Nvmc, PAGE_SIZE};
 use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
 use zigbee_runtime::security_journal::{SECURITY_JOURNAL_SECTOR_SIZE, SecurityStateJournal};
 
 const FLASH_CAPACITY: usize = 1024 * 1024;
-const SECURITY_PARTITION_START: u32 = 0x000F_E000;
-const SECURITY_PARTITION_SIZE: usize = SECURITY_JOURNAL_SECTOR_SIZE * 2;
+/// Start of the crash-safe security journal partition: the last 8 KiB of
+/// the 1 MiB flash (pages 254-255), reserved in `link/memory.x`.
+pub const SECURITY_PARTITION_START: u32 = 0x000F_E000;
+pub const SECURITY_PARTITION_SIZE: usize = SECURITY_JOURNAL_SECTOR_SIZE * 2;
 const SECURITY_SECTOR_A: u32 = 0;
 const SECURITY_SECTOR_B: u32 = SECURITY_JOURNAL_SECTOR_SIZE as u32;
 

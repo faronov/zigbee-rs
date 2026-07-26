@@ -778,8 +778,20 @@ version = "0.1.0"
 dependencies = [
  "embedded-storage",
  "esp-storage",
+]
+
+[[package]]
+name = "esp32-zigbee-devkit-product"
+version = "0.1.0"
+dependencies = [
+ "embedded-storage",
+ "esp-storage",
+ "esp32-zigbee-devkit",
  "log",
+ "zigbee-aps",
+ "zigbee-bdb",
  "zigbee-runtime",
+ "zigbee-zcl",
 ]
 
 [[package]]
@@ -836,7 +848,7 @@ dependencies = [
  "esp-hal",
  "esp-println",
  "esp-radio",
- "esp32-zigbee-devkit",
+ "esp32-zigbee-devkit-product",
  "log",
  "portable-atomic",
  "static_cell",

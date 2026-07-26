@@ -4,13 +4,24 @@
 //! Uses the built-in IEEE 802.15.4 radio via `esp-radio`.
 //!
 //! # Features
-//! - Auto-join on boot
+//! - Auto-join on boot, secure rejoin on restart with saved state
 //! - Sleepy End Device: poll parent for indirect frames
-//! - Fast poll (250ms) during ZHA interview, slow poll (10s) normal
+//! - Fast poll (250ms) during ZHA interview, slow poll (30s) normal
 //! - Device_annce retries for reliable coordinator discovery
 //! - NWK Leave handler: auto-rejoin when coordinator sends Leave
 //! - Default reporting: temp/hum/battery reported without ZHA interview
 //! - Button: BOOT (GPIO9) — short=toggle, long=factory reset
+//!
+//! # Architecture
+//! `esp32-zigbee-devkit-product` (see `products/esp32-zigbee-devkit`) owns
+//! the typed [`SensorProfile`](esp32_zigbee_devkit_product::profile::SensorProfile)
+//! (endpoint/cluster declaration) and the durable
+//! [`SecurityStore`](esp32_zigbee_devkit_product::storage::SecurityStore).
+//! This build has no OTA backend — see the crate docs and
+//! `docs/book/src/platform-guides/esp32.md`. This file is only the
+//! composition root: platform startup, resource construction, and handing
+//! both to [`zigbee_runtime::node::ZigbeeNode`] before running
+//! [`app::SensorApp`]'s event loop.
 //!
 //! # Build
 //! ```bash
@@ -25,27 +36,25 @@ extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+mod app;
 mod chip_temperature;
 mod time_driver;
 
+use app::SensorApp;
 use chip_temperature::H2TemperatureSensor;
-use esp32_zigbee_devkit::storage;
 use esp_backtrace as _;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 
 use embassy_futures::block_on;
-use embassy_time::{Duration, Instant, Timer};
+use static_cell::StaticCell;
 
-use zigbee_aps::PROFILE_HOME_AUTOMATION;
+use esp32_zigbee_devkit_product as product;
 use zigbee_nwk::DeviceType;
-use zigbee_runtime::event_loop::{StackEvent, TickResult};
+use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
+use zigbee_runtime::profile::ApplicationProfile;
+use zigbee_runtime::ZigbeeDevice;
 use zigbee_zcl::clusters::basic::PowerSource;
-use zigbee_zcl::clusters::humidity::HumidityCluster;
-use zigbee_zcl::clusters::power_config::PowerConfigCluster;
-use zigbee_zcl::clusters::temperature::TemperatureCluster;
-use zigbee_zcl::{ClusterId, DeviceId};
 
 // Bridge `log` crate → esp_println
 struct EspLogger;
@@ -59,12 +68,6 @@ impl log::Log for EspLogger {
     fn flush(&self) {}
 }
 static LOGGER: EspLogger = EspLogger;
-
-const REPORT_INTERVAL_SECS: u64 = 60;
-const FAST_POLL_MS: u64 = 250;
-const SLOW_POLL_SECS: u64 = 30;
-const FAST_POLL_DURATION_SECS: u64 = 120;
-const EXPECTED_REPORT_CLUSTERS: usize = 3;
 
 #[esp_hal::main]
 fn main() -> ! {
@@ -112,434 +115,65 @@ fn main() -> ! {
     let mac = zigbee_mac::esp::EspMac::new(ieee802154, config);
     esp_println::println!("[ESP32-H2] Radio ready");
 
-    let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
-    let mut hum_cluster = HumidityCluster::new(0, 10000);
-    let mut power_cluster = PowerConfigCluster::new();
-    power_cluster.set_battery_size(4);
-    power_cluster.set_battery_quantity(2);
-    power_cluster.set_battery_rated_voltage(15);
+    // Product-owned durable security store and endpoint profile (no OTA on
+    // this build — see `esp32_zigbee_devkit_product::profile`).
+    //
+    // `open_security_store` also runs the one-time legacy persistence
+    // migration (see `esp32_zigbee_devkit_product::migration`): a device
+    // already joined under the old `LogStructuredNv` format keeps its network
+    // and is upgraded to the crash-safe journal without reusing a frame
+    // counter. A migration error means the reserved NV region may still be
+    // intact, so halt rather than silently commissioning as factory-new.
+    let (security, migration) = product::storage::open_security_store().unwrap_or_else(|error| {
+        esp_println::println!(
+            "[ESP32-H2] FATAL: persistence migration failed: {:?}",
+            error
+        );
+        loop {
+            core::hint::spin_loop();
+        }
+    });
+    esp_println::println!("[ESP32-H2] Persistence migration: {:?}", migration);
+    let profile = product::profile::sensor_profile();
 
-    let mut hum_tick: u32 = 0;
-
-    // Build device (SED)
-    let mut device = ZigbeeDevice::builder(mac)
+    let device = ZigbeeDevice::builder(mac)
         .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: 10_000,
             wake_duration_ms: 500,
         })
-        .manufacturer("Zigbee-RS")
-        .model("ESP32-H2-Sensor")
-        .date_code("20260403")
+        .manufacturer(product::MANUFACTURER)
+        .model(product::MODEL)
+        .date_code(product::DATE_CODE)
         .sw_build("0.1.0")
         .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, DeviceId::TEMPERATURE_SENSOR, |ep| {
-            ep.cluster_server(ClusterId::BASIC)
-                .cluster_server(ClusterId::IDENTIFY)
-                .cluster_server(ClusterId::POWER_CONFIG)
-                .cluster_server(ClusterId::TEMPERATURE)
-                .cluster_server(ClusterId::HUMIDITY)
-        })
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |ep| profile.configure_endpoint(ep),
+        )
         .build();
 
-    // Initial sensor values
-    let temp_centi = temp_sensor.read_centi_celsius();
-    temp_cluster.set_temperature(temp_centi);
-    hum_cluster.set_humidity(5000u16);
-    power_cluster.set_battery_voltage(33);
-    power_cluster.set_battery_percentage(200);
-    esp_println::println!(
-        "[ESP32-H2] Temp: {}.{:02}°C (on-chip)",
-        temp_centi / 100,
-        (temp_centi % 100).unsigned_abs()
-    );
+    // `ZigbeeNode` borrows the device, security store and profile for its
+    // whole lifetime; giving them `'static` storage (like the EFR32MG1
+    // product) keeps that borrow trivially valid across the diverging
+    // `block_on` call below, regardless of how the `#[esp_hal::main]` macro
+    // structures the generated entry point.
+    static SECURITY: StaticCell<product::storage::SecurityStore> = StaticCell::new();
+    static PROFILE: StaticCell<product::profile::SensorProfile> = StaticCell::new();
+    static DEVICE: StaticCell<ZigbeeDevice<zigbee_mac::esp::EspMac<'static>>> = StaticCell::new();
+    static APP: StaticCell<SensorApp<'static>> = StaticCell::new();
 
-    // Run the async SED loop synchronously via block_on
-    block_on(async {
-        // Flash NV storage
-        let mut nv = storage::application_nv().expect("failed to initialize application NV");
-        esp_println::println!("[ESP32-H2] Flash NV storage ready");
+    let security = SECURITY.init(security);
+    let profile = PROFILE.init(profile);
+    let device = DEVICE.init(device);
 
-        // Restore previous network state or auto-join
-        let restored = device.restore_state(&mut nv);
-        if restored {
-            esp_println::println!("[ESP32-H2] Restored state — will rejoin");
-            device.user_action(UserAction::Rejoin);
-        } else {
-            esp_println::println!("[ESP32-H2] No saved state — auto-joining…");
-            device.user_action(UserAction::Join);
-        }
-        let mut clusters = [
-            ClusterRef {
-                endpoint: 1,
-                cluster: &mut temp_cluster,
-            },
-            ClusterRef {
-                endpoint: 1,
-                cluster: &mut hum_cluster,
-            },
-            ClusterRef {
-                endpoint: 1,
-                cluster: &mut power_cluster,
-            },
-        ];
-        if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-            if log_event(e) {
-                device.save_state(&mut nv);
-                esp_println::println!("[ESP32-H2] State saved to flash");
-            }
-        }
+    let node = ZigbeeNode::new(device, security, profile);
+    let app = APP.init(SensorApp::new(node, button, led, temp_sensor));
 
-        // Default reporting so device reports even before ZHA interview
-        setup_default_reporting(&mut device);
+    esp_println::println!("[ESP32-H2] Flash NV storage ready (security-state journal)");
 
-        // Main loop state
-        let mut last_report = Instant::now();
-        let mut fast_poll_until = if device.is_joined() {
-            led.set_low(); // ON
-            Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS)
-        } else {
-            Instant::now()
-        };
-        let mut last_rejoin_attempt = Instant::now();
-        let mut rejoin_count: u8 = 0;
-        let mut annce_retries_left: u8 = if device.is_joined() { 5 } else { 0 };
-        let mut last_annce = Instant::now();
-        let mut interview_done = false;
-        let mut button_was_pressed = false;
-
-        loop {
-            let now = Instant::now();
-            let in_fast_poll = now < fast_poll_until;
-            let poll_ms = if in_fast_poll {
-                FAST_POLL_MS
-            } else {
-                SLOW_POLL_SECS * 1000
-            };
-
-            // Button check
-            let pressed = button.is_low();
-            if pressed && !button_was_pressed {
-                let press_start = Instant::now();
-                let mut held_long = false;
-                while button.is_low() {
-                    if press_start.elapsed().as_secs() >= 3 {
-                        held_long = true;
-                        break;
-                    }
-                    Timer::after(Duration::from_millis(50)).await;
-                }
-
-                if held_long {
-                    esp_println::println!("[ESP32-H2] FACTORY RESET");
-                    for _ in 0..5u8 {
-                        led.set_low();
-                        Timer::after(Duration::from_millis(100)).await;
-                        led.set_high();
-                        Timer::after(Duration::from_millis(100)).await;
-                    }
-                    esp_hal::system::software_reset();
-                } else {
-                    esp_println::println!(
-                        "[ESP32-H2] Button → {}",
-                        if device.is_joined() { "leave" } else { "join" }
-                    );
-                    device.user_action(UserAction::Toggle);
-                    let mut cls = [
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut temp_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut hum_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut power_cluster,
-                        },
-                    ];
-                    if let TickResult::Event(ref e) = device.tick(0, &mut cls).await {
-                        if log_event(e) {
-                            device.save_state(&mut nv);
-                            fast_poll_until =
-                                Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                            annce_retries_left = 5;
-                            last_annce = Instant::now();
-                            interview_done = false;
-                        }
-                    }
-                    Timer::after(Duration::from_millis(300)).await;
-                }
-            }
-            button_was_pressed = pressed;
-
-            // Sleep until next poll
-            Timer::after(Duration::from_millis(poll_ms)).await;
-
-            // Poll parent (SED core)
-            if device.is_joined() {
-                for _poll_round in 0..4u8 {
-                    match device.poll().await {
-                        Ok(Some(ind)) => {
-                            let mut cls = [
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut temp_cluster,
-                                },
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut hum_cluster,
-                                },
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut power_cluster,
-                                },
-                            ];
-                            if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
-                                match &ev {
-                                    StackEvent::RejoinRequested => {
-                                        esp_println::println!("[ESP32-H2] Secure rejoin requested");
-                                        if device.secure_rejoin().await.is_ok() {
-                                            device.save_state(&mut nv);
-                                            fast_poll_until = Instant::now()
-                                                + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                            interview_done = false;
-                                        } else {
-                                            esp_println::println!(
-                                                "[ESP32-H2] Secure rejoin failed"
-                                            );
-                                        }
-                                        break;
-                                    }
-                                    StackEvent::LeaveRequested => {
-                                        esp_println::println!(
-                                            "[ESP32-H2] Leave requested — erasing NV and rejoining"
-                                        );
-                                        device.factory_reset(Some(&mut nv)).await;
-                                        device.user_action(UserAction::Join);
-                                        fast_poll_until = Instant::now()
-                                            + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                        interview_done = false;
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                                if log_event(&ev) {
-                                    fast_poll_until = Instant::now()
-                                        + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                }
-                            }
-                            if !interview_done
-                                && device.configured_cluster_count(1) >= EXPECTED_REPORT_CLUSTERS
-                            {
-                                interview_done = true;
-                                fast_poll_until = Instant::now() + Duration::from_secs(5);
-                                led.set_high(); // OFF
-                                esp_println::println!("[ESP32-H2] Interview done!");
-                            }
-                            let mut cls2 = [
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut temp_cluster,
-                                },
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut hum_cluster,
-                                },
-                                ClusterRef {
-                                    endpoint: 1,
-                                    cluster: &mut power_cluster,
-                                },
-                            ];
-                            let _ = device.tick(0, &mut cls2).await;
-                        }
-                        Ok(None) => break,
-                        Err(_) => break,
-                    }
-                }
-
-                // Periodic sensor update
-                let now2 = Instant::now();
-                let elapsed_s = now2.duration_since(last_report).as_secs();
-                if elapsed_s >= REPORT_INTERVAL_SECS {
-                    last_report = now2;
-                    let temp_centi = temp_sensor.read_centi_celsius();
-                    hum_tick = hum_tick.wrapping_add(1);
-                    let hum: u16 = 5000 + ((hum_tick % 100) as u16) * 10;
-                    temp_cluster.set_temperature(temp_centi);
-                    hum_cluster.set_humidity(hum);
-                    esp_println::println!(
-                        "[ESP32-H2] T={}.{:02}°C H={}.{:02}%",
-                        temp_centi / 100,
-                        (temp_centi % 100).unsigned_abs(),
-                        hum / 100,
-                        hum % 100
-                    );
-                }
-
-                // Tick runtime
-                let tick_elapsed = elapsed_s.min(60) as u16;
-                let mut clusters = [
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut temp_cluster,
-                    },
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut hum_cluster,
-                    },
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut power_cluster,
-                    },
-                ];
-                let _ = device.tick(tick_elapsed, &mut clusters).await;
-
-                // Identify LED blink
-                if device.is_identifying(1) {
-                    led.toggle();
-                }
-
-                // Device_annce retry
-                if annce_retries_left > 0 && now2.duration_since(last_annce).as_secs() >= 8 {
-                    annce_retries_left -= 1;
-                    last_annce = now2;
-                    let _ = device.send_device_annce().await;
-                }
-            } else {
-                // Not joined — blink and auto-retry
-                let now2 = Instant::now();
-                if now2.duration_since(last_rejoin_attempt).as_secs() >= 1 {
-                    led.set_low();
-                    Timer::after(Duration::from_millis(80)).await;
-                    led.set_high();
-                    Timer::after(Duration::from_millis(120)).await;
-                    led.set_low();
-                    Timer::after(Duration::from_millis(80)).await;
-                    led.set_high();
-                }
-
-                if now2.duration_since(last_rejoin_attempt).as_secs() >= 15 {
-                    rejoin_count = rejoin_count.wrapping_add(1);
-                    last_rejoin_attempt = Instant::now();
-                    esp_println::println!("[ESP32-H2] Retrying join (attempt {})…", rejoin_count);
-                    device.user_action(UserAction::Join);
-                    let mut cls = [
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut temp_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut hum_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut power_cluster,
-                        },
-                    ];
-                    let _ = device.tick(0, &mut cls).await;
-                    if device.is_joined() {
-                        esp_println::println!(
-                            "[ESP32-H2] Joined! addr=0x{:04X}",
-                            device.short_address()
-                        );
-                        led.set_low();
-                        fast_poll_until =
-                            Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                        annce_retries_left = 5;
-                        last_annce = Instant::now();
-                        interview_done = false;
-                        device.save_state(&mut nv);
-                        esp_println::println!("[ESP32-H2] State saved to flash");
-                    }
-                }
-            }
-        }
-    })
-}
-
-fn log_event(event: &StackEvent) -> bool {
-    match event {
-        StackEvent::Joined {
-            short_address,
-            channel,
-            pan_id,
-        } => {
-            esp_println::println!(
-                "[ESP32-H2] Joined! addr=0x{:04X} ch={} pan=0x{:04X}",
-                short_address,
-                channel,
-                pan_id
-            );
-            true
-        }
-        StackEvent::Left => {
-            esp_println::println!("[ESP32-H2] Left network");
-            false
-        }
-        StackEvent::ReportSent => {
-            esp_println::println!("[ESP32-H2] Report sent");
-            false
-        }
-        StackEvent::LeaveRequested | StackEvent::RejoinRequested => {
-            esp_println::println!("[ESP32-H2] Leave requested by coordinator");
-            false
-        }
-        StackEvent::CommissioningComplete { success } => {
-            esp_println::println!(
-                "[ESP32-H2] Commissioning: {}",
-                if *success { "ok" } else { "failed" }
-            );
-            false
-        }
-        _ => false,
-    }
-}
-
-/// Configure default reporting with change thresholds to suppress unnecessary TX.
-fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M>) {
-    use zigbee_zcl::data_types::{ZclDataType, ZclValue};
-    use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
-
-    let _ = device.reporting_mut().configure_for_cluster(
-        1,
-        ClusterId::TEMPERATURE.0,
-        ReportingConfig {
-            direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::clusters::temperature::ATTR_MEASURED_VALUE,
-            data_type: ZclDataType::I16,
-            min_interval: 60,
-            max_interval: 300,
-            reportable_change: Some(ZclValue::I16(50)),
-        },
-    );
-    let _ = device.reporting_mut().configure_for_cluster(
-        1,
-        ClusterId::HUMIDITY.0,
-        ReportingConfig {
-            direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::clusters::humidity::ATTR_MEASURED_VALUE,
-            data_type: ZclDataType::U16,
-            min_interval: 60,
-            max_interval: 300,
-            reportable_change: Some(ZclValue::U16(100)),
-        },
-    );
-    let _ = device.reporting_mut().configure_for_cluster(
-        1,
-        ClusterId::POWER_CONFIG.0,
-        ReportingConfig {
-            direction: ReportDirection::Send,
-            attribute_id:
-                zigbee_zcl::clusters::power_config::ATTR_BATTERY_PERCENTAGE_REMAINING,
-            data_type: ZclDataType::U8,
-            min_interval: 300,
-            max_interval: 3600,
-            reportable_change: Some(ZclValue::U8(4)),
-        },
-    );
-    esp_println::println!("[ESP32-H2] Default reporting configured (with change thresholds)");
+    block_on(app.run())
 }

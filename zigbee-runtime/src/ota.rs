@@ -187,6 +187,10 @@ impl<F: FirmwareWriter> OtaManager<F> {
         &mut self.cluster
     }
 
+    pub const fn endpoint(&self) -> u8 {
+        self.config.endpoint
+    }
+
     /// Borrow the platform firmware writer (staging slot state, diagnostics).
     pub fn writer(&self) -> &F {
         &self.writer

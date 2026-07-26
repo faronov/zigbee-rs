@@ -1,0 +1,16 @@
+[package]
+name = "efr32mg1-tradfri-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product configuration for the EFR32MG1P TRADFRI sensor firmware"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+efr32mg1-hal = { path = "../../efr32mg1-hal" }
+efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
+embedded-storage = "0.3"
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-runtime = { path = "../../zigbee-runtime", features = ["ota"] }
+zigbee-zcl = { path = "../../zigbee-zcl" }

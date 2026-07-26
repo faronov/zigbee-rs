@@ -340,9 +340,9 @@ bus initialization differs.
 
 | Sensor | Crate | Measures | I2C Addr | ZCL Clusters |
 |--------|-------|----------|----------|--------------|
-| SHT31 | **built-in** (`sht31.rs`) | Temp + Humidity | 0x44 / 0x45 | 0x0402 + 0x0405 |
+| SHT31 | `zigbee-sht3x` (`drivers/sht3x`) | Temp + Humidity | 0x44 / 0x45 | 0x0402 + 0x0405 |
 | SHT40 | `sht4x` | Temp + Humidity | 0x44 | 0x0402 + 0x0405 |
-| BME280 | **built-in** (`bme280.rs`) | Temp + Humidity + Pressure | 0x76 / 0x77 | 0x0402 + 0x0405 + 0x0403 |
+| BME280 | `zigbee-bme280` (`drivers/bme280`) | Temp + Humidity + Pressure | 0x76 / 0x77 | 0x0402 + 0x0405 + 0x0403 |
 | BMP280 | `bmp280-rs` | Temp + Pressure | 0x76 / 0x77 | 0x0402 + 0x0403 |
 | HDC1080 | `hdc1080` | Temp + Humidity | 0x40 | 0x0402 + 0x0405 |
 | SHTC3 | `shtcx` | Temp + Humidity | 0x70 | 0x0402 + 0x0405 |
@@ -352,32 +352,42 @@ bus initialization differs.
 | MAX44009 | `max44009` | Illuminance | 0x4A / 0x4B | 0x0400 |
 | SCD40 | `scd4x` | CO₂ + Temp + Humidity | 0x62 | Custom + 0x0402 + 0x0405 |
 
-> The nRF52840-sensor example includes **built-in async drivers** for BME280 and SHT31 —
-> enable via `--features sensor-bme280` or `--features sensor-sht31`.
-> See `examples/nrf52840-sensor/README.md` for wiring and build instructions.
-> Both drivers are fully async (embassy TWIM DMA) and don't block the radio.
+> The nRF52840-sensor example wires the shared, workspace-level
+> `zigbee-bme280` / `zigbee-sht3x` async drivers (`drivers/bme280`,
+> `drivers/sht3x`) over the board's TWISPI0 bus — enable via
+> `--features sensor-bme280` or `--features sensor-sht31`. See
+> `examples/nrf52840-sensor/src/sensor.rs` for the recoverable probe/read
+> wiring and `examples/nrf52840-sensor/README.md` for pin wiring and build
+> instructions. Both drivers are fully async (embassy TWIM DMA) and don't
+> block the radio.
 
 ### Pattern: Reading Sensor → Updating ZCL Cluster
 
 ```rust
-// Built-in async BME280 driver (examples/nrf52840-sensor/src/bme280.rs)
-if let Some(data) = bme280::read(&mut i2c, 0x76).await {
+// Shared async BME280 driver (drivers/bme280, `zigbee_bme280::asynch::Bme280`)
+if let Ok(measurement) = bme280.measure_forced(&mut delay).await {
     // Temperature: ZCL uses units of 0.01 °C (i16) — driver returns centidegrees
-    temp_cluster.set_temperature(data.temperature_centideg);
-    // Humidity: ZCL uses units of 0.01 % (u16) — driver returns centipercent
-    hum_cluster.set_humidity(data.humidity_centipct);
-    // Pressure: BME280 returns hPa as u16
-    press_cluster.set_pressure(data.pressure_hpa as i16);
+    environment.update_environment(TemperatureHumidityMeasurement {
+        temperature_centi_celsius: measurement.temperature_centi_celsius as i16,
+        humidity_centi_percent: measurement.humidity_centi_percent.unwrap_or(0),
+    });
+    // Pressure: driver returns Pascal; the ZCL Pressure Measurement cluster
+    // uses 0.1 hPa units (`PressureCluster::set_pressure`'s doc comment).
+    environment.update_pressure((measurement.pressure_pa / 10) as i16);
 }
 
-// Built-in async SHT31 driver (examples/nrf52840-sensor/src/sht31.rs)
-if let Some(data) = sht31::read(&mut i2c, 0x44).await {
-    temp_cluster.set_temperature(data.temperature_centideg);
-    hum_cluster.set_humidity(data.humidity_centipct);
+// Shared async SHT3x driver (drivers/sht3x, `zigbee_sht3x::asynch::Sht3x`)
+if let Ok(measurement) = sht3x.measure(&mut delay).await {
+    environment.update_environment(TemperatureHumidityMeasurement {
+        temperature_centi_celsius: measurement.temperature_centi_celsius,
+        humidity_centi_percent: measurement.humidity_centi_percent,
+    });
 }
 
-// The stack handles reporting changes to the coordinator automatically
-// based on the configured min/max reporting interval and reportable change.
+// `environment` is the shared `zigbee_runtime::profile::TemperatureHumidityBattery`
+// archetype selected by the product crate; the stack handles reporting
+// changes to the coordinator automatically based on the configured min/max
+// reporting interval and reportable change.
 ```
 
 ### SPI Displays

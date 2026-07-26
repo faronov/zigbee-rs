@@ -1,4 +1,4 @@
-//! TRADFRI internal-flash partition wiring for application NV.
+//! Product-owned internal-flash partitions and Zigbee persistence wiring.
 
 use efr32mg1_hal::flash::{Efr32mg1Flash, FlashError};
 use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
@@ -19,7 +19,8 @@ const _: () = assert!(
     SECURITY_PARTITION_START as usize + SECURITY_PARTITION_SIZE == APP_NV_PARTITION_START as usize
 );
 const _: () = assert!(APP_NV_PARTITION_START as usize + APP_NV_PARTITION_SIZE == 0x0003_A000);
-const _: () = assert!(SECURITY_JOURNAL_SECTOR_SIZE % <Efr32mg1Flash as NorFlash>::ERASE_SIZE == 0);
+const _: () =
+    assert!(SECURITY_JOURNAL_SECTOR_SIZE.is_multiple_of(<Efr32mg1Flash as NorFlash>::ERASE_SIZE));
 
 pub struct PartitionFlash<const START: u32, const SIZE: usize> {
     flash: Efr32mg1Flash,

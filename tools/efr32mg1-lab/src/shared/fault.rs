@@ -24,6 +24,11 @@ unsafe fn fault_log_mut() -> *mut FaultLog {
     core::ptr::addr_of_mut!(FAULT_LOG).cast::<FaultLog>()
 }
 
+/// Clear retained fault state for diagnostics that need a fresh-run marker.
+///
+/// This shared module is compiled independently into every diagnostic binary;
+/// only the join diagnostic currently calls this helper.
+#[allow(dead_code)]
 pub fn clear() {
     unsafe {
         fault_log_mut().write_volatile(FaultLog {

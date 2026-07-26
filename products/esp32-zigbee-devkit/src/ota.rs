@@ -419,10 +419,10 @@ impl<F: OtaFlash> FirmwareWriter for EspFirmwareWriter<F> {
 
 // ── Hardware backing ────────────────────────────────────────────────────────
 
-/// [`OtaFlash`] backed by the ROM SPI flash routines.
+/// [`OtaFlash`] backed by the board's raw whole-chip flash access.
 #[cfg(target_os = "none")]
 pub struct EspOtaFlash {
-    flash: esp_storage::FlashStorage,
+    flash: esp32_zigbee_devkit::flash::RawFlash,
 }
 
 #[cfg(target_os = "none")]
@@ -430,7 +430,7 @@ impl EspOtaFlash {
     /// Open the on-board SPI flash.
     pub fn new() -> Self {
         Self {
-            flash: esp_storage::FlashStorage::new(),
+            flash: esp32_zigbee_devkit::flash::RawFlash::new(),
         }
     }
 }
@@ -507,8 +507,7 @@ mod tests {
         fn new() -> Self {
             let mut flash = Self::erased();
             for (index, partition) in EXPECTED_PARTITIONS.iter().copied().enumerate() {
-                let start =
-                    PARTITION_TABLE_OFFSET as usize + index * PARTITION_ENTRY_SIZE;
+                let start = PARTITION_TABLE_OFFSET as usize + index * PARTITION_ENTRY_SIZE;
                 flash.data[start..start + PARTITION_ENTRY_SIZE]
                     .copy_from_slice(&partition.encode());
             }

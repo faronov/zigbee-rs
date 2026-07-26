@@ -50,13 +50,41 @@ macro_rules! init_large {
     }};
 }
 
+macro_rules! init_small_without_led {
+    ($profile:expr) => {{
+        let channels = rtt_target::rtt_init! {
+            up: {
+                0: {
+                    size: 64,
+                    mode: rtt_target::ChannelMode::NoBlockSkip,
+                    name: "Terminal"
+                }
+            }
+            down: {
+                0: {
+                    size: 16,
+                    mode: rtt_target::ChannelMode::NoBlockSkip,
+                    name: "Terminal"
+                }
+            }
+        };
+        rtt_target::set_print_channel(channels.up.0);
+        $crate::platform::finish_init_without_led($profile);
+    }};
+}
+
 pub(crate) use init_large;
 pub(crate) use init_small;
+pub(crate) use init_small_without_led;
 
 pub(crate) fn finish_init(profile: &str) {
-    let _ = &crate::vectors::__INTERRUPTS;
     LED.init();
     LED.off();
+    finish_init_without_led(profile);
+}
+
+pub(crate) fn finish_init_without_led(profile: &str) {
+    let _ = &crate::vectors::__INTERRUPTS;
     match efr32mg1_tradfri::init_clocks() {
         Ok(()) => rtt_target::rprintln!(
             "[EFR32][{}] CLOCK_READY hclk={} ctune={}",

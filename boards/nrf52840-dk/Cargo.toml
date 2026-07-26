@@ -8,6 +8,4 @@ repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
 [dependencies]
-embedded-storage = "0.3"
 embassy-nrf = { version = "0.3", features = ["nrf52840"] }
-zigbee-runtime = { path = "../../zigbee-runtime" }

@@ -1,7 +1,9 @@
-//! Pre-built device type templates.
+//! Builder presets for common Zigbee device descriptors.
 //!
-//! These provide convenient constructors for common Zigbee device types
-//! with the correct endpoints, clusters, and device IDs pre-configured.
+//! These functions configure endpoint metadata only; they do not own the
+//! corresponding cluster instances. New applications should prefer
+//! [`crate::profile`] plus [`crate::node::ZigbeeNode`] when they need one
+//! source of truth for endpoint declaration and runtime cluster dispatch.
 //!
 //! All templates use the Home Automation profile (0x0104).
 

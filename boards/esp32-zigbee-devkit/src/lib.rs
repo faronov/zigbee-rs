@@ -1,14 +1,14 @@
 //! Shared board support for ESP32-C6 and ESP32-H2 Zigbee development boards.
 //!
-//! * [`layout`] — the 4 MiB partition table these boards are flashed with.
-//! * [`storage`] — log-structured Zigbee NV in the last 8 KiB of `zbnv`.
-//! * [`otadata`] — ESP-IDF boot-slot selection records.
-//! * [`ota`] — [`zigbee_runtime::firmware_writer::FirmwareWriter`] that stages
-//!   an OTA payload into the inactive application slot.
+//! This crate exposes only physical chip resources: the on-die 4 MiB NOR
+//! flash ([`flash`]) accessed through `esp_storage::FlashStorage`. It has no
+//! dependency on `zigbee-runtime` and owns no partition layout, NV placement,
+//! OTA policy, or firmware identity — those are product concerns. See
+//! `products/esp32-zigbee-devkit` for the product crate that builds on this
+//! board and selects them.
 //!
-//! Everything except the flash back end is chip independent, so both examples
-//! share it; the only per-chip value is the expected image chip ID, selected by
-//! the `esp32c6`/`esp32h2` features.
+//! The only per-chip difference at this layer is which `esp-storage` chip
+//! feature is enabled, selected by the `esp32c6`/`esp32h2` features.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -17,11 +17,5 @@ compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 #[cfg(not(any(feature = "esp32c6", feature = "esp32h2")))]
 compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 
-pub mod esp_image;
-pub mod firmware;
-pub mod layout;
-pub mod ota;
-pub mod otadata;
-pub mod sha256;
 #[cfg(target_os = "none")]
-pub mod storage;
+pub mod flash;

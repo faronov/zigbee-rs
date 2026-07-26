@@ -46,10 +46,14 @@ pub mod builder;
 pub mod event_loop;
 pub mod firmware_writer;
 pub mod log_nv;
+pub mod node;
 pub mod nv_storage;
 #[cfg(feature = "ota")]
 pub mod ota;
+#[cfg(feature = "ota")]
+pub mod ota_transport;
 pub mod power;
+pub mod profile;
 pub mod security_journal;
 pub mod security_store;
 pub mod synthetic_sensor;
@@ -369,6 +373,203 @@ mod resume_tests {
             "persisted rejoin-pending state must not silently resume"
         );
         assert!(reboot_store.load().unwrap().unwrap().rejoin_pending);
+    }
+
+    /// An ESP32-C6/H2 upgraded from the legacy `LogStructuredNv` persistence
+    /// keeps its network: the migrated record is commissioned but has no
+    /// persisted unique Trust Center link key. The recoverable post-reboot
+    /// path therefore uses the default global key, drawn from the NWK counter
+    /// space, without fabricating a Trust Center identity.
+    #[test]
+    fn legacy_default_tclk_state_resumes_on_the_previous_network() {
+        const IEEE_ADDRESS: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
+        const FLOOR: u32 = 0x2400;
+        const RESERVATION: u32 = zigbee_bdb::FRAME_COUNTER_RESERVATION_SIZE;
+
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.legacy_default_tclk = true;
+        state.extended_pan_id = [0xAA; 8];
+        state.pan_id = 0x1234;
+        state.short_address = 0x5678;
+        state.ieee_address = IEEE_ADDRESS;
+        state.channel = 15;
+        state.depth = 2;
+        state.parent_address = 0x0001;
+        state.update_id = 7;
+        state.network_key = [0xCC; 16];
+        state.key_sequence = 3;
+        state.global_counter_limit = FLOOR;
+        state.tclk_counter_limit = FLOOR;
+
+        let mut store = RamSecurityStateStore::new();
+        store.store(&state).unwrap();
+
+        assert_eq!(
+            block_on(device.start_or_resume_with_security_store(&mut store)).unwrap(),
+            state.short_address,
+            "a migrated installation must resume, not re-commission"
+        );
+        assert!(device.is_joined());
+        assert_eq!(device.pan_id(), 0x1234);
+        assert_eq!(device.channel(), 15);
+        assert_eq!(
+            device
+                .bdb
+                .zdo()
+                .nwk()
+                .security()
+                .active_key()
+                .map(|key| (key.key, key.seq_number)),
+            Some(([0xCC; 16], 3)),
+            "the previous network key must survive the format switch"
+        );
+
+        // Fresh ranges are reserved from both persisted floors, and committed,
+        // before any secured frame can be sent.
+        let reserved = store.load().unwrap().unwrap();
+        assert!(reserved.commissioned);
+        assert!(reserved.legacy_default_tclk);
+        assert!(!reserved.tclk_present);
+        assert_eq!(reserved.global_counter_limit, FLOOR + RESERVATION);
+        assert_eq!(reserved.tclk_counter_limit, FLOOR + RESERVATION);
+        let nib = device.bdb.zdo().nwk().nib();
+        assert!(
+            (FLOOR..nib.outgoing_frame_counter_limit).contains(&nib.outgoing_frame_counter),
+            "the live counter resumes inside the fresh reservation (the resume \
+             Device_annce consumes from it) and never below the persisted floor"
+        );
+        assert_eq!(nib.outgoing_frame_counter_limit, FLOOR + RESERVATION);
+
+        // No Trust Center identity or key is fabricated: APS link-key traffic
+        // falls back to the default global key over the NWK counter space.
+        assert_eq!(device.bdb.zdo().aps().security().key_count(), 0);
+        assert_eq!(
+            device.bdb.zdo().aps().aib().aps_trust_center_address,
+            [0; 8]
+        );
+
+        // A missing unique TCLK is a supported state, not corruption, and the
+        // NWK reservation still extends at the low-water mark.
+        assert!(!device.refresh_security_state(&mut store).unwrap());
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .nib_mut()
+            .outgoing_frame_counter = FLOOR + RESERVATION - 1;
+        assert!(device.refresh_security_state(&mut store).unwrap());
+        let extended = store.load().unwrap().unwrap();
+        assert_eq!(extended.global_counter_limit, FLOOR + 2 * RESERVATION);
+        assert_eq!(
+            extended.tclk_counter_limit,
+            FLOOR + RESERVATION,
+            "there is no unique-TCLK counter in flight to extend"
+        );
+        assert_eq!(
+            device.bdb.zdo().nwk().nib().outgoing_frame_counter_limit,
+            FLOOR + 2 * RESERVATION
+        );
+
+        // Rebooting on the committed record stays on the same network.
+        let mut rebooted = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        assert_eq!(
+            block_on(rebooted.start_or_resume_with_security_store(&mut store)).unwrap(),
+            state.short_address
+        );
+        assert_eq!(rebooted.pan_id(), 0x1234);
+    }
+
+    /// If the Trust Center later transports a unique link key to a migrated
+    /// node, the APS layer installs it with an outgoing counter of zero and no
+    /// reservation. That must become durable before it is used, and the
+    /// transitional marker must go away with it.
+    #[test]
+    fn a_runtime_trust_center_key_is_adopted_into_the_durable_store() {
+        const IEEE_ADDRESS: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
+        const TC_ADDRESS: [u8; 8] = [0x11; 8];
+        const FLOOR: u32 = 0x2400;
+        const RESERVATION: u32 = zigbee_bdb::FRAME_COUNTER_RESERVATION_SIZE;
+
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.legacy_default_tclk = true;
+        state.extended_pan_id = [0xAA; 8];
+        state.pan_id = 0x1234;
+        state.short_address = 0x5678;
+        state.ieee_address = IEEE_ADDRESS;
+        state.channel = 15;
+        state.network_key = [0xCC; 16];
+        state.global_counter_limit = FLOOR;
+        state.tclk_counter_limit = FLOOR;
+
+        let mut store = RamSecurityStateStore::new();
+        store.store(&state).unwrap();
+        assert!(device.restore_security_state(&mut store).unwrap());
+
+        // What `Apsde::handle_transport_key` installs for a TC link key.
+        device
+            .bdb
+            .zdo_mut()
+            .aps_mut()
+            .security_mut()
+            .add_key(zigbee_aps::security::ApsLinkKeyEntry {
+                partner_address: TC_ADDRESS,
+                key: [0xDD; 16],
+                key_type: zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+                outgoing_frame_counter: 0,
+                outgoing_frame_counter_limit: u32::MAX,
+                incoming_frame_counter: 7,
+                incoming_frame_counter_valid: true,
+            })
+            .unwrap();
+
+        assert!(device.refresh_security_state(&mut store).unwrap());
+        let adopted = store.load().unwrap().unwrap();
+        assert!(adopted.commissioned);
+        assert!(adopted.tclk_present);
+        assert!(
+            !adopted.legacy_default_tclk,
+            "the transitional marker retires once a real key exists"
+        );
+        assert_eq!(adopted.trust_center_address, TC_ADDRESS);
+        assert_eq!(adopted.trust_center_link_key, [0xDD; 16]);
+        assert_eq!(adopted.tclk_incoming_counter, 7);
+        assert!(adopted.tclk_incoming_counter_valid);
+        // Continues above the migrated floor, never from the live zero.
+        assert_eq!(
+            adopted.tclk_counter_limit,
+            FLOOR + RESERVATION + RESERVATION
+        );
+
+        let entry = device
+            .bdb
+            .zdo()
+            .aps()
+            .security()
+            .find_key(
+                &TC_ADDRESS,
+                zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+            )
+            .expect("adopted key stays installed");
+        assert_eq!(entry.outgoing_frame_counter, FLOOR + RESERVATION);
+        assert_eq!(
+            entry.outgoing_frame_counter_limit,
+            adopted.tclk_counter_limit
+        );
+
+        // Steady state afterwards: nothing left to persist, and the record now
+        // validates as an ordinary commissioned network.
+        assert!(!device.refresh_security_state(&mut store).unwrap());
+        assert_eq!(adopted.validate(), Ok(()));
     }
 
     #[test]
@@ -1179,7 +1380,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
         }
 
-        {
+        if state.tclk_present {
             let aps = self.bdb.zdo_mut().aps_mut();
             aps.aib_mut().aps_trust_center_address = state.trust_center_address;
             aps.security_mut()
@@ -1194,6 +1395,12 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 })
                 .map_err(|_| SecurityStoreError::Full)?;
         }
+        // Otherwise this is a `legacy_default_tclk` network (see
+        // `PersistentSecurityState`): no unique Trust Center link key was ever
+        // persisted, so none is invented here. APS link-key traffic falls back
+        // to the default global key, which draws its outgoing counter from the
+        // NWK reservation installed above, and the Trust Center address stays
+        // unset until the network transports a real key.
 
         self.bdb.attributes_mut().node_is_on_a_network = true;
         self.bdb.attributes_mut().primary_channel_set = ChannelMask(1u32 << state.channel);
@@ -1214,6 +1421,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     ) -> Result<bool, SecurityStoreError> {
         const LOW_WATER: u32 = 32;
 
+        /// The counter fields of the installed unique Trust Center link key.
+        /// Copied out so the APS key table is not borrowed while the state is
+        /// updated and committed.
+        #[derive(Clone, Copy)]
+        struct TclkCounters {
+            outgoing: u32,
+            limit: u32,
+            incoming: u32,
+            incoming_valid: bool,
+        }
+
         let Some(mut state) = store.load()? else {
             return Ok(false);
         };
@@ -1231,24 +1449,89 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             return Err(SecurityStoreError::Corrupt);
         }
 
-        let tclk = self
-            .bdb
-            .zdo()
-            .aps()
-            .security()
-            .find_key(
-                &state.trust_center_address,
-                zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
-            )
-            .ok_or(SecurityStoreError::Corrupt)?;
-        if tclk.key != state.trust_center_link_key
-            || tclk.outgoing_frame_counter > tclk.outgoing_frame_counter_limit
-            || tclk.outgoing_frame_counter_limit != state.tclk_counter_limit
-        {
-            return Err(SecurityStoreError::Corrupt);
-        }
+        // Set when a unique Trust Center link key transported at runtime is
+        // adopted into the durable store below; the live APS entry then has to
+        // start from the reserved floor rather than its counter of zero.
+        let mut adopted_current: Option<u32> = None;
 
-        let mut changed = false;
+        let tclk = if state.tclk_present {
+            let tclk = self
+                .bdb
+                .zdo()
+                .aps()
+                .security()
+                .find_key(
+                    &state.trust_center_address,
+                    zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+                )
+                .ok_or(SecurityStoreError::Corrupt)?;
+            if tclk.key != state.trust_center_link_key
+                || tclk.outgoing_frame_counter > tclk.outgoing_frame_counter_limit
+                || tclk.outgoing_frame_counter_limit != state.tclk_counter_limit
+            {
+                return Err(SecurityStoreError::Corrupt);
+            }
+            Some(TclkCounters {
+                outgoing: tclk.outgoing_frame_counter,
+                limit: tclk.outgoing_frame_counter_limit,
+                incoming: tclk.incoming_frame_counter,
+                incoming_valid: tclk.incoming_frame_counter_valid,
+            })
+        } else {
+            // A `legacy_default_tclk` network has no unique key to maintain:
+            // the default global Trust Center link key draws from the NWK
+            // counter space handled above, so there is no separate APS
+            // reservation to extend. If the Trust Center transports a unique
+            // key to such a node, though, the APS layer installs it with no
+            // reservation and an outgoing counter of zero — a reboot would
+            // replay it. Adopt it durably here instead, which also retires the
+            // transitional representation.
+            let adopted = self
+                .bdb
+                .zdo()
+                .aps()
+                .security()
+                .key_table()
+                .iter()
+                .find(|entry| {
+                    entry.key_type == zigbee_aps::security::ApsKeyType::TrustCenterLinkKey
+                })
+                .map(|entry| {
+                    (
+                        entry.partner_address,
+                        entry.key,
+                        entry.outgoing_frame_counter,
+                        entry.incoming_frame_counter,
+                        entry.incoming_frame_counter_valid,
+                    )
+                });
+            match adopted {
+                Some((partner, key, outgoing, incoming, incoming_valid)) => {
+                    let current = outgoing.max(state.tclk_counter_limit);
+                    let limit = current
+                        .checked_add(zigbee_bdb::FRAME_COUNTER_RESERVATION_SIZE)
+                        .ok_or(SecurityStoreError::CounterExhausted)?;
+                    state.tclk_present = true;
+                    state.legacy_default_tclk = false;
+                    state.trust_center_address = partner;
+                    state.trust_center_link_key = key;
+                    state.tclk_counter_limit = limit;
+                    state.tclk_incoming_counter = incoming;
+                    state.tclk_incoming_counter_valid = incoming_valid;
+                    state.validate()?;
+                    adopted_current = Some(current);
+                    Some(TclkCounters {
+                        outgoing: current,
+                        limit,
+                        incoming,
+                        incoming_valid,
+                    })
+                }
+                None => None,
+            }
+        };
+
+        let mut changed = adopted_current.is_some();
         let mut new_global_limit = nib.outgoing_frame_counter_limit;
         if nib
             .outgoing_frame_counter_limit
@@ -1263,26 +1546,24 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             changed = true;
         }
 
-        let mut new_tclk_limit = tclk.outgoing_frame_counter_limit;
-        if tclk
-            .outgoing_frame_counter_limit
-            .saturating_sub(tclk.outgoing_frame_counter)
-            <= LOW_WATER
-        {
-            new_tclk_limit = tclk
-                .outgoing_frame_counter_limit
-                .checked_add(zigbee_bdb::FRAME_COUNTER_RESERVATION_SIZE)
-                .ok_or(SecurityStoreError::CounterExhausted)?;
-            state.tclk_counter_limit = new_tclk_limit;
-            changed = true;
-        }
+        let mut new_tclk_limit = state.tclk_counter_limit;
+        if let Some(tclk) = tclk {
+            if tclk.limit.saturating_sub(tclk.outgoing) <= LOW_WATER {
+                new_tclk_limit = tclk
+                    .limit
+                    .checked_add(zigbee_bdb::FRAME_COUNTER_RESERVATION_SIZE)
+                    .ok_or(SecurityStoreError::CounterExhausted)?;
+                state.tclk_counter_limit = new_tclk_limit;
+                changed = true;
+            }
 
-        if state.tclk_incoming_counter != tclk.incoming_frame_counter
-            || state.tclk_incoming_counter_valid != tclk.incoming_frame_counter_valid
-        {
-            state.tclk_incoming_counter = tclk.incoming_frame_counter;
-            state.tclk_incoming_counter_valid = tclk.incoming_frame_counter_valid;
-            changed = true;
+            if state.tclk_incoming_counter != tclk.incoming
+                || state.tclk_incoming_counter_valid != tclk.incoming_valid
+            {
+                state.tclk_incoming_counter = tclk.incoming;
+                state.tclk_incoming_counter_valid = tclk.incoming_valid;
+                changed = true;
+            }
         }
 
         if !changed {
@@ -1295,16 +1576,22 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             .nwk_mut()
             .nib_mut()
             .outgoing_frame_counter_limit = new_global_limit;
-        self.bdb
-            .zdo_mut()
-            .aps_mut()
-            .security_mut()
-            .find_key_mut(
-                &state.trust_center_address,
-                zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
-            )
-            .ok_or(SecurityStoreError::Corrupt)?
-            .outgoing_frame_counter_limit = new_tclk_limit;
+        if tclk.is_some() {
+            let entry = self
+                .bdb
+                .zdo_mut()
+                .aps_mut()
+                .security_mut()
+                .find_key_mut(
+                    &state.trust_center_address,
+                    zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+                )
+                .ok_or(SecurityStoreError::Corrupt)?;
+            entry.outgoing_frame_counter_limit = new_tclk_limit;
+            if let Some(current) = adopted_current {
+                entry.outgoing_frame_counter = current;
+            }
+        }
         Ok(true)
     }
 

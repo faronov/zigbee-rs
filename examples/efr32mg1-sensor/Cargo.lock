@@ -168,6 +168,7 @@ dependencies = [
  "cortex-m-rt",
  "efr32mg1-hal",
  "efr32mg1-tradfri",
+ "efr32mg1-tradfri-product",
  "embassy-executor",
  "embassy-futures",
  "embassy-time 0.5.1",
@@ -191,8 +192,18 @@ version = "0.1.0"
 dependencies = [
  "efr32mg1-hal",
  "embedded-hal 1.0.0",
+]
+
+[[package]]
+name = "efr32mg1-tradfri-product"
+version = "0.1.0"
+dependencies = [
+ "efr32mg1-hal",
+ "efr32mg1-tradfri",
  "embedded-storage",
+ "zigbee-aps",
  "zigbee-runtime",
+ "zigbee-zcl",
 ]
 
 [[package]]

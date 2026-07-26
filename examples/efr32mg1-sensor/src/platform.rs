@@ -1,13 +1,23 @@
 //! TRÅDFRI board startup, status LED, and PB13 wake handling.
+//!
+//! Consumes typed [`BoardResources`](efr32mg1_tradfri::resources::BoardResources)
+//! tokens passed from the composition root (`main.rs`). PA0 is claimed as a
+//! direct GPIO LED (not PWM). Product code separately selects the external
+//! flash owner for OTA.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use efr32mg1_tradfri::resources::{ButtonToken, Pa0Output};
 use efr32mg1_tradfri::{Button, Led};
 use embassy_time::{Duration, Timer};
 
 use crate::{time_driver, vectors};
 
+/// LED handle — a ZST proxy to the PA0 hardware register.
+/// Hardware initialization is performed by `Pa0Output::into_led()` during `init()`.
 static LED: Led = Led::new();
+/// Button handle — a ZST proxy to the PB13 hardware register.
+/// Hardware initialization is performed by `ButtonToken::into_button()` during `init()`.
 static BUTTON: Button = Button::new();
 static BUTTON_EDGE_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -18,7 +28,12 @@ pub extern "C" fn GPIO_ODD() {
     }
 }
 
-pub fn init() {
+/// Initialize platform services (RTT, clocks, time driver) and claim
+/// exclusive board resources: PA0 as GPIO LED and PB13 button with interrupt.
+///
+/// The consumed PA0 token enforces at the type level that TIMER0 PWM cannot
+/// also be configured through the typed board-resource path.
+pub fn init(pa0: Pa0Output, button: ButtonToken) {
     let channels = rtt_target::rtt_init! {
         up: {
             0: {
@@ -37,12 +52,18 @@ pub fn init() {
     };
     rtt_target::set_print_channel(channels.up.0);
 
-    LED.init();
+    // PA0 → direct GPIO LED (excludes TIMER0 PWM on this pin).
+    // Token consumption initializes hardware; the static LED handle is a
+    // ZST that proxies the same memory-mapped GPIO register.
+    let _led = pa0.into_led();
     LED.off();
-    BUTTON.init();
+
+    // PB13 → button with interrupt.
+    let _btn = button.into_button();
     cortex_m::peripheral::NVIC::unpend(vectors::Interrupt::GpioOdd);
     unsafe { cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::GpioOdd) };
 
+    // System clocks and time driver
     if efr32mg1_tradfri::init_clocks().is_err() {
         halt_with_led();
     }
@@ -90,8 +111,20 @@ pub fn led_is_on() -> bool {
 }
 
 pub fn halt_with_led() -> ! {
+    LED.on();
     loop {
-        LED.on();
+        cortex_m::asm::nop();
+    }
+}
+
+/// Emergency halt before board resources are fully initialized.
+/// Configures PA0 directly via HAL as a last-resort indicator.
+pub fn halt_with_led_raw() -> ! {
+    use efr32mg1_hal::gpio::{Mode, Pin, Port};
+    let pin = Pin::new(Port::A, 0);
+    pin.configure(Mode::PushPull, false);
+    pin.set_high();
+    loop {
         cortex_m::asm::nop();
     }
 }

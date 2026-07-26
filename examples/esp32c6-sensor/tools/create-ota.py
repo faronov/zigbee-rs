@@ -42,7 +42,7 @@ TAG_UPGRADE_IMAGE = 0x0000
 SUB_ELEMENT_HEADER_LEN = 6
 ZIGBEE_PRO_STACK_VERSION = 0x0002
 
-# Must match examples/esp32c6-sensor/src/main.rs.
+# Must match products/esp32-zigbee-devkit/src/lib.rs (OTA_MANUFACTURER_CODE/OTA_IMAGE_TYPE/OTA_HARDWARE_VERSION) and the product profile in src/profile.rs.
 MANUFACTURER_CODE = 0x1234
 IMAGE_TYPE = 0x0001
 HARDWARE_VERSION = 1
@@ -50,7 +50,7 @@ MANUFACTURER_NAME = "Zigbee-RS"
 MODEL_NAME = "ESP32-C6-Sensor"
 HEADER_STRING = "zigbee-rs ESP32-C6 sensor"
 
-# Must match boards/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv.
+# Must match products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv.
 OTA_SLOT_SIZE = 0x001F_0000
 
 # ESP application image ------------------------------------------------------

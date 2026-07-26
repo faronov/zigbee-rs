@@ -1,23 +1,21 @@
 //! Production Zigbee SED state machine.
 
 use efr32mg1_hal::pm;
-use efr32mg1_tradfri::BatteryMonitor;
-use efr32mg1_tradfri::storage::SecurityStore;
+use efr32mg1_tradfri_product::battery::BatteryMonitor;
+use efr32mg1_tradfri_product::ota::Efr32FirmwareWriter;
+use efr32mg1_tradfri_product::profile::SensorProfile;
+use efr32mg1_tradfri_product::storage::SecurityStore;
 use embassy_futures::select;
 use embassy_time::{Duration, Instant, Timer};
 use zigbee_mac::efr32::Efr32Mac;
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
+use zigbee_runtime::node::{NodeError, ZigbeeNode};
 use zigbee_runtime::ota::OtaManager;
-use zigbee_runtime::security_store::{SecurityStateStore, SecurityStoreError};
-use zigbee_runtime::{ClusterRef, ZigbeeDevice};
-use zigbee_types::ShortAddress;
-use zigbee_zcl::ClusterId;
-use zigbee_zcl::clusters::humidity::HumidityCluster;
-use zigbee_zcl::clusters::ota::{CMD_IMAGE_NOTIFY, OtaState};
-use zigbee_zcl::clusters::power_config::PowerConfigCluster;
-use zigbee_zcl::clusters::temperature::TemperatureCluster;
-use zigbee_zcl::data_types::{ZclDataType, ZclValue};
-use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
+use zigbee_runtime::ota_transport::{OtaEventOutcome, OtaSession};
+use zigbee_runtime::profile::{
+    BatteryMeasurement, TemperatureHumidityBattery, TemperatureHumidityMeasurement,
+};
+use zigbee_runtime::security_store::SecurityStoreError;
 
 use crate::{platform, sensor, vectors};
 
@@ -30,39 +28,13 @@ const FAST_POLL_MS: u64 = 250;
 const SLOW_POLL_SECS: u64 = 30;
 const FAST_POLL_DURATION_SECS: u64 = 120;
 const RESTORED_FAST_POLL_SECS: u64 = 60;
-const EXPECTED_REPORT_CLUSTERS: usize = 3;
 
-macro_rules! application_clusters {
-    ($app:expr) => {
-        [
-            ClusterRef {
-                endpoint: 1,
-                cluster: &mut *$app.temp_cluster,
-            },
-            ClusterRef {
-                endpoint: 1,
-                cluster: &mut *$app.hum_cluster,
-            },
-            ClusterRef {
-                endpoint: 1,
-                cluster: &mut *$app.power_cluster,
-            },
-            ClusterRef {
-                endpoint: 1,
-                cluster: $app.ota.cluster_mut(),
-            },
-        ]
-    };
-}
+type SensorNode = ZigbeeNode<'static, Efr32Mac, SecurityStore, SensorProfile>;
 
 pub struct SensorApp {
-    device: &'static mut ZigbeeDevice<Efr32Mac>,
-    security_store: &'static mut SecurityStore,
+    node: SensorNode,
     sht: sensor::Sensor,
     battery: Option<BatteryMonitor>,
-    temp_cluster: &'static mut TemperatureCluster,
-    hum_cluster: &'static mut HumidityCluster,
-    power_cluster: &'static mut PowerConfigCluster,
     last_report: Instant,
     last_tick: Instant,
     fast_poll_until: Instant,
@@ -76,32 +48,17 @@ pub struct SensorApp {
     needs_bootstrap_join: bool,
     awaiting_initial_configuration: bool,
     restoring_commissioned_state: bool,
-    ota: OtaManager<efr32mg1_tradfri::ota::Efr32FirmwareWriter>,
-    ota_server: Option<(u16, u8)>,
-    ota_cleanup_pending: bool,
+    ota_session: OtaSession,
 }
 
 impl SensorApp {
-    pub fn new(
-        device: &'static mut ZigbeeDevice<Efr32Mac>,
-        security_store: &'static mut SecurityStore,
-        sht: sensor::Sensor,
-        battery: Option<BatteryMonitor>,
-        temp_cluster: &'static mut TemperatureCluster,
-        hum_cluster: &'static mut HumidityCluster,
-        power_cluster: &'static mut PowerConfigCluster,
-        ota: OtaManager<efr32mg1_tradfri::ota::Efr32FirmwareWriter>,
-    ) -> Self {
+    pub fn new(node: SensorNode, sht: sensor::Sensor, battery: Option<BatteryMonitor>) -> Self {
         let now = Instant::now();
-        let joined = device.is_joined();
+        let joined = node.device().is_joined();
         Self {
-            device,
-            security_store,
+            node,
             sht,
             battery,
-            temp_cluster,
-            hum_cluster,
-            power_cluster,
             last_report: now,
             last_tick: now,
             fast_poll_until: if joined {
@@ -119,10 +76,16 @@ impl SensorApp {
             needs_bootstrap_join: !joined,
             awaiting_initial_configuration: false,
             restoring_commissioned_state: false,
-            ota,
-            ota_server: None,
-            ota_cleanup_pending: false,
+            ota_session: OtaSession::new(),
         }
+    }
+
+    fn environment_mut(&mut self) -> &mut TemperatureHumidityBattery {
+        self.node.profile_mut().inner_mut().component_mut()
+    }
+
+    fn ota(&self) -> &OtaManager<Efr32FirmwareWriter> {
+        self.node.profile().ota()
     }
 
     pub async fn run(&mut self) -> ! {
@@ -135,8 +98,8 @@ impl SensorApp {
 
             let now = Instant::now();
             let poll_ms = self.update_fast_poll_window(now);
-            if self.device.is_joined() {
-                self.device.mac_mut().radio_wake();
+            if self.node.device().is_joined() {
+                self.node.device_mut().mac_mut().radio_wake();
                 self.service_joined_tick(now).await;
                 let direct_rx_ms = if poll_ms == FAST_POLL_MS { poll_ms } else { 0 };
                 self.service_direct_rx_window(direct_rx_ms).await;
@@ -144,7 +107,10 @@ impl SensorApp {
                 self.service_joined_post_rx();
 
                 if !self.awaiting_initial_configuration
-                    && !self.device.is_identifying(1)
+                    && !self
+                        .node
+                        .device()
+                        .is_identifying(efr32mg1_tradfri_product::ENDPOINT)
                     && !self.ota_active()
                     && Instant::now() >= self.fast_poll_until
                     && self.sleep_joined_until_next_poll()
@@ -152,9 +118,9 @@ impl SensorApp {
                     self.handle_button_edge().await;
                 }
             } else {
-                self.device.mac_mut().radio_sleep();
+                self.node.device_mut().mac_mut().radio_sleep();
                 Timer::after(Duration::from_millis(poll_ms)).await;
-                self.device.mac_mut().radio_wake();
+                self.node.device_mut().mac_mut().radio_wake();
                 self.service_unjoined_cycle(Instant::now()).await;
             }
         }
@@ -174,8 +140,7 @@ impl SensorApp {
     }
 
     fn update_interview_state(&mut self) {
-        if self.interview_done || self.device.configured_cluster_count(1) < EXPECTED_REPORT_CLUSTERS
-        {
+        if self.interview_done || !self.node.reporting_is_configured() {
             return;
         }
 
@@ -186,30 +151,19 @@ impl SensorApp {
     }
 
     fn checkpoint_security(&mut self) {
-        if let Err(error) = self
-            .device
-            .refresh_security_state(&mut *self.security_store)
-        {
+        if let Err(error) = self.node.checkpoint_security() {
             persistence_failure(error);
         }
     }
 
     async fn factory_reset(&mut self) {
-        if let Err(StartError::PersistenceFailed(error)) = self
-            .device
-            .factory_reset_with_security_store(&mut *self.security_store)
-            .await
-        {
+        if let Err(StartError::PersistenceFailed(error)) = self.node.factory_reset().await {
             persistence_failure(error);
         }
     }
 
     async fn secure_rejoin(&mut self) -> bool {
-        match self
-            .device
-            .secure_rejoin_with_security_store(&mut *self.security_store)
-            .await
-        {
+        match self.node.secure_rejoin().await {
             Ok(_) => {}
             Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
             Err(_) => return false,
@@ -223,7 +177,7 @@ impl SensorApp {
     async fn bootstrap_join(&mut self) -> bool {
         self.last_rejoin_attempt = Instant::now();
 
-        let restored_state = match self.security_store.load() {
+        let restored_state = match self.node.load_security_state() {
             Ok(state) => state,
             Err(error) => persistence_failure(error),
         };
@@ -231,18 +185,14 @@ impl SensorApp {
         self.awaiting_initial_configuration = !had_commissioned_state;
         self.restoring_commissioned_state = had_commissioned_state;
 
-        match self
-            .device
-            .start_or_resume_with_security_store(&mut *self.security_store)
-            .await
-        {
+        match self.node.start_or_resume().await {
             Ok(_) => {}
             Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
             Err(_) => return false,
         }
 
         self.checkpoint_security();
-        let _ = self.device.send_device_annce().await;
+        let _ = self.node.device_mut().send_device_annce().await;
         self.checkpoint_security();
         self.reset_post_join_state();
         if self.restoring_commissioned_state {
@@ -255,41 +205,39 @@ impl SensorApp {
     }
 
     async fn run_first_tick(&mut self) {
-        if self.needs_bootstrap_join && !self.device.is_joined() {
+        if self.needs_bootstrap_join && !self.node.device().is_joined() {
             let _ = self.bootstrap_join().await;
         }
 
-        let tick_result = {
-            let device = &mut *self.device;
-            let security_store = &mut *self.security_store;
-            let mut clusters = application_clusters!(self);
-            device
-                .tick_with_security_store(0, &mut clusters, security_store)
-                .await
-        };
+        let tick_result = self.node.tick(0).await;
         match tick_result {
             Ok(TickResult::Event(ref event)) if update_status_led(event) => {
                 self.checkpoint_security();
             }
             Ok(_) => {}
-            Err(error) => persistence_failure(error),
+            Err(error) => node_failure(error),
         }
 
-        if !self.awaiting_initial_configuration {
-            setup_default_reporting(&mut *self.device);
+        if !self.awaiting_initial_configuration
+            && let Err(error) = self.node.configure_default_reporting()
+        {
+            node_failure(NodeError::Profile(error));
         }
         self.sample_battery();
         self.sample_sht().await;
         self.last_report = Instant::now();
 
-        if self.device.is_joined() {
+        if self.node.device().is_joined() {
             self.reset_post_join_state();
         }
     }
 
     fn update_fast_poll_window(&mut self, now: Instant) -> u64 {
         let in_fast_poll = self.awaiting_initial_configuration
-            || self.device.is_identifying(1)
+            || self
+                .node
+                .device()
+                .is_identifying(efr32mg1_tradfri_product::ENDPOINT)
             || self.ota_active()
             || now < self.fast_poll_until;
         if self.was_fast_polling && !in_fast_poll {
@@ -309,18 +257,11 @@ impl SensorApp {
     }
 
     async fn request_join_retry(&mut self) {
-        if self.device.secure_rejoin_pending() {
+        if self.node.device().secure_rejoin_pending() {
             self.last_rejoin_attempt = Instant::now();
-            let result = {
-                let device = &mut *self.device;
-                let security_store = &mut *self.security_store;
-                let mut clusters = application_clusters!(self);
-                device
-                    .tick_with_security_store(0, &mut clusters, security_store)
-                    .await
-            };
+            let result = self.node.tick(0).await;
             if let Err(error) = result {
-                persistence_failure(error);
+                node_failure(error);
             }
             return;
         }
@@ -360,17 +301,10 @@ impl SensorApp {
     }
 
     async fn process_indication(&mut self, indication: &zigbee_mac::McpsDataIndication) -> bool {
-        let event = {
-            let device = &mut *self.device;
-            let security_store = &mut *self.security_store;
-            let mut clusters = application_clusters!(self);
-            device
-                .process_incoming_with_security_store(indication, &mut clusters, security_store)
-                .await
-        };
+        let event = self.node.process_incoming(indication).await;
         let event = match event {
             Ok(event) => event,
-            Err(error) => persistence_failure(error),
+            Err(error) => node_failure(error),
         };
 
         if let Some(event) = event {
@@ -398,23 +332,16 @@ impl SensorApp {
         }
 
         self.update_interview_state();
-        let result = {
-            let device = &mut *self.device;
-            let security_store = &mut *self.security_store;
-            let mut clusters = application_clusters!(self);
-            device
-                .tick_with_security_store(0, &mut clusters, security_store)
-                .await
-        };
+        let result = self.node.tick(0).await;
         if let Err(error) = result {
-            persistence_failure(error);
+            node_failure(error);
         }
         false
     }
 
     async fn service_joined_polls(&mut self) {
         for _ in 0..4 {
-            match self.device.poll().await {
+            match self.node.device_mut().poll().await {
                 Ok(Some(indication)) => {
                     if self.process_indication(&indication).await {
                         break;
@@ -432,7 +359,12 @@ impl SensorApp {
             if now >= deadline {
                 break;
             }
-            match select::select(self.device.receive(), Timer::after(deadline - now)).await {
+            match select::select(
+                self.node.device_mut().receive(),
+                Timer::after(deadline - now),
+            )
+            .await
+            {
                 select::Either::First(Ok(indication)) => {
                     if self.process_indication(&indication).await {
                         return;
@@ -445,28 +377,27 @@ impl SensorApp {
 
     async fn sample_sht(&mut self) {
         if let Some(measurement) = self.sht.sample().await {
-            self.temp_cluster
-                .set_temperature(measurement.temperature_centi_celsius);
-            self.hum_cluster
-                .set_humidity(measurement.humidity_centi_percent);
+            self.environment_mut()
+                .update_environment(TemperatureHumidityMeasurement {
+                    temperature_centi_celsius: measurement.temperature_centi_celsius,
+                    humidity_centi_percent: measurement.humidity_centi_percent,
+                });
         }
     }
 
     fn sample_battery(&mut self) {
         let Some(monitor) = self.battery.as_mut() else {
-            self.power_cluster.set_battery_voltage(0xFF);
-            self.power_cluster.set_battery_percentage(0xFF);
+            self.environment_mut().set_battery_unknown();
             return;
         };
 
         if let Ok(reading) = monitor.read() {
-            self.power_cluster
-                .set_battery_voltage(reading.voltage_100mv);
-            self.power_cluster
-                .set_battery_percentage(reading.percentage_remaining);
+            self.environment_mut().update_battery(BatteryMeasurement {
+                voltage_100mv: reading.voltage_100mv,
+                percentage_remaining: reading.percentage_remaining,
+            });
         } else {
-            self.power_cluster.set_battery_voltage(0xFF);
-            self.power_cluster.set_battery_percentage(0xFF);
+            self.environment_mut().set_battery_unknown();
         }
     }
 
@@ -489,20 +420,13 @@ impl SensorApp {
     async fn service_joined_tick(&mut self, now: Instant) {
         self.update_measurements(now).await;
         let elapsed = self.tick_elapsed_seconds(now);
-        let result = {
-            let device = &mut *self.device;
-            let security_store = &mut *self.security_store;
-            let mut clusters = application_clusters!(self);
-            device
-                .tick_with_security_store(elapsed, &mut clusters, security_store)
-                .await
-        };
+        let result = self.node.tick(elapsed).await;
         match result {
             Ok(TickResult::Event(ref event)) if update_status_led(event) => {
                 self.reset_post_join_state();
             }
             Ok(_) => {}
-            Err(error) => persistence_failure(error),
+            Err(error) => node_failure(error),
         }
 
         self.service_ota(elapsed).await;
@@ -511,13 +435,16 @@ impl SensorApp {
             self.annce_retries_left -= 1;
             self.last_annce = now;
             self.checkpoint_security();
-            let _ = self.device.send_device_annce().await;
+            let _ = self.node.device_mut().send_device_annce().await;
             self.checkpoint_security();
         }
     }
 
     fn service_joined_post_rx(&mut self) {
-        let identifying = self.device.is_identifying(1);
+        let identifying = self
+            .node
+            .device()
+            .is_identifying(efr32mg1_tradfri_product::ENDPOINT);
         self.was_identifying = identifying;
         if identifying {
             if platform::led_is_on() {
@@ -533,110 +460,71 @@ impl SensorApp {
     }
 
     fn ota_active(&self) -> bool {
-        matches!(
-            self.ota.state(),
-            OtaState::QuerySent
-                | OtaState::Downloading { .. }
-                | OtaState::Verifying
-                | OtaState::WaitingActivate
-        )
+        OtaSession::is_active(Some(self.ota()))
     }
 
+    /// Route OTA Upgrade cluster traffic through the shared transport.
+    ///
+    /// Session bookkeeping (which server owns the transfer, sending and
+    /// retrying the manager's queued request, resetting once idle) lives in
+    /// [`zigbee_runtime::ota_transport::OtaSession`] — identical to the
+    /// ESP32-C6 example. What stays here is app policy: extending the
+    /// fast-poll window, and checkpointing security state before activating
+    /// a verified image so the reset into the new firmware cannot lose the
+    /// network keys.
     async fn process_ota_event(&mut self, event: &StackEvent) -> bool {
-        let StackEvent::CommandReceived {
-            src_addr,
-            source_endpoint,
-            endpoint,
-            cluster_id,
-            command_id,
-            payload,
-            ..
-        } = event
-        else {
-            return false;
-        };
-        if *cluster_id != ClusterId::OTA_UPGRADE.0 {
-            return false;
+        let (device, profile) = self.node.device_and_profile_mut();
+        let outcome = self
+            .ota_session
+            .handle_event(
+                device,
+                Some(profile.ota_mut()),
+                efr32mg1_tradfri_product::ENDPOINT,
+                event,
+            )
+            .await;
+        match outcome {
+            OtaEventOutcome::NotOta => false,
+            // Traffic addressed to the OTA cluster but declined by the
+            // session (wrong server, wrong endpoint) — still handled, but
+            // not worth waking up the radio for.
+            OtaEventOutcome::Ignored => true,
+            OtaEventOutcome::Consumed(status) => {
+                self.fast_poll_until =
+                    Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                self.react_to_ota_status(&status);
+                true
+            }
         }
-        if *endpoint != 1 {
-            return true;
-        }
-
-        let sender = (*src_addr, *source_endpoint);
-        match self.ota_server {
-            Some(server) if server != sender => return true,
-            None if *command_id != CMD_IMAGE_NOTIFY.0 => return true,
-            None => self.ota_server = Some(sender),
-            Some(_) => {}
-        }
-        self.fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-        let ota_event = self
-            .ota
-            .handle_incoming(*command_id, payload.as_slice(), None);
-        self.handle_ota_status(ota_event);
-        self.send_pending_ota().await;
-        if self.ota.state() == OtaState::Idle {
-            self.ota_server = None;
-        }
-        true
     }
 
     async fn service_ota(&mut self, elapsed_secs: u16) {
-        let event = self.ota.tick(elapsed_secs);
-        self.handle_ota_status(event);
-        self.send_pending_ota().await;
+        let (device, profile) = self.node.device_and_profile_mut();
+        let status = self
+            .ota_session
+            .service(device, Some(profile.ota_mut()), elapsed_secs)
+            .await;
+        self.react_to_ota_status(&status);
     }
 
-    fn handle_ota_status(&mut self, event: Option<StackEvent>) {
-        match event {
+    /// App-level reaction to an OTA status: extend the fast-poll window
+    /// while a transfer is progressing, and checkpoint security state
+    /// before activating a verified image (a failed activation is left for
+    /// [`zigbee_runtime::ota_transport::OtaSession`] to clean up).
+    fn react_to_ota_status(&mut self, status: &Option<StackEvent>) {
+        if matches!(
+            status,
             Some(StackEvent::OtaImageAvailable { .. })
-            | Some(StackEvent::OtaProgress { .. })
-            | Some(StackEvent::OtaDelayedActivation { .. }) => {
-                self.fast_poll_until =
-                    Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-            }
-            Some(StackEvent::OtaFailed) => self.ota_cleanup_pending = true,
-            Some(StackEvent::OtaComplete) => {
-                self.checkpoint_security();
-                if self.ota.activate().is_err() {
-                    self.ota_cleanup_pending = true;
-                }
-            }
-            _ => {}
+                | Some(StackEvent::OtaProgress { .. })
+                | Some(StackEvent::OtaDelayedActivation { .. })
+        ) {
+            self.fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
         }
-    }
-
-    async fn send_pending_ota(&mut self) {
-        if let Some(frame) = self.ota.take_pending_frame() {
-            let Some((server, endpoint)) = self.ota_server else {
-                self.ota.abort();
-                self.ota_cleanup_pending = false;
-                return;
-            };
-            if self
-                .device
-                .send_zcl_frame(
-                    ShortAddress(server),
-                    endpoint,
-                    frame.endpoint,
-                    frame.cluster_id,
-                    frame.zcl_data.as_slice(),
-                )
-                .await
-                .is_err()
-            {
-                if !self.ota.requeue_pending_frame(frame) {
-                    self.ota.abort();
-                    self.ota_server = None;
-                    self.ota_cleanup_pending = false;
-                }
-                return;
-            }
-        }
-        if self.ota_cleanup_pending {
-            self.ota.abort();
-            self.ota_server = None;
-            self.ota_cleanup_pending = false;
+        if matches!(status, Some(StackEvent::OtaComplete)) {
+            self.checkpoint_security();
+            let _ = self
+                .ota_session
+                .activate(Some(self.node.profile_mut().ota_mut()));
         }
     }
 
@@ -657,7 +545,7 @@ impl SensorApp {
 
     #[inline(never)]
     fn sleep_joined_until_next_poll(&mut self) -> bool {
-        self.device.mac_mut().radio_sleep();
+        self.node.device_mut().mac_mut().radio_sleep();
         cortex_m::peripheral::NVIC::unpend(vectors::Interrupt::FrcPri);
 
         let ticks = pm::ms_to_ticks((SLOW_POLL_SECS * 1_000) as u32, pm::LFRCO_HZ);
@@ -679,6 +567,10 @@ fn persistence_failure(_error: SecurityStoreError) -> ! {
     platform::halt_with_led()
 }
 
+fn node_failure(_error: NodeError) -> ! {
+    platform::halt_with_led()
+}
+
 fn update_status_led(event: &StackEvent) -> bool {
     match event {
         StackEvent::Joined { .. } => {
@@ -695,43 +587,4 @@ fn update_status_led(event: &StackEvent) -> bool {
         }
         _ => false,
     }
-}
-
-fn setup_default_reporting(device: &mut ZigbeeDevice<Efr32Mac>) {
-    let _ = device.reporting_mut().configure_for_cluster(
-        1,
-        ClusterId::TEMPERATURE.0,
-        ReportingConfig {
-            direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::clusters::temperature::ATTR_MEASURED_VALUE,
-            data_type: ZclDataType::I16,
-            min_interval: 60,
-            max_interval: 300,
-            reportable_change: Some(ZclValue::I16(50)),
-        },
-    );
-    let _ = device.reporting_mut().configure_for_cluster(
-        1,
-        ClusterId::HUMIDITY.0,
-        ReportingConfig {
-            direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::clusters::humidity::ATTR_MEASURED_VALUE,
-            data_type: ZclDataType::U16,
-            min_interval: 60,
-            max_interval: 300,
-            reportable_change: Some(ZclValue::U16(100)),
-        },
-    );
-    let _ = device.reporting_mut().configure_for_cluster(
-        1,
-        ClusterId::POWER_CONFIG.0,
-        ReportingConfig {
-            direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::clusters::power_config::ATTR_BATTERY_PERCENTAGE_REMAINING,
-            data_type: ZclDataType::U8,
-            min_interval: 300,
-            max_interval: 3_600,
-            reportable_change: Some(ZclValue::U8(4)),
-        },
-    );
 }

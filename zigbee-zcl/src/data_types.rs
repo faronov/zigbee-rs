@@ -470,10 +470,50 @@ impl ZclValue {
             (ZclValue::I32(a), ZclValue::I32(b), ZclValue::I32(t)) => {
                 ((*a as i64) - (*b as i64)).unsigned_abs() >= *t as u64
             }
+            (ZclValue::Float32(a), ZclValue::Float32(b), ZclValue::Float32(t)) => {
+                float32_exceeds_threshold(*a, *b, *t)
+            }
+            (ZclValue::Float64(a), ZclValue::Float64(b), ZclValue::Float64(t)) => {
+                float64_exceeds_threshold(*a, *b, *t)
+            }
             // For non-numeric or mismatched types, any difference triggers
             _ => self != other,
         }
     }
+}
+
+fn float32_exceeds_threshold(current: f32, previous: f32, threshold: f32) -> bool {
+    if !current.is_finite() || !previous.is_finite() {
+        return if current.is_nan() && previous.is_nan() {
+            false
+        } else {
+            current != previous
+        };
+    }
+    if !threshold.is_finite() || threshold < 0.0 {
+        return false;
+    }
+
+    let difference = (current - previous).abs();
+    let rounding_tolerance = f32::EPSILON * current.abs().max(previous.abs()).max(threshold) * 2.0;
+    difference >= threshold || threshold - difference <= rounding_tolerance
+}
+
+fn float64_exceeds_threshold(current: f64, previous: f64, threshold: f64) -> bool {
+    if !current.is_finite() || !previous.is_finite() {
+        return if current.is_nan() && previous.is_nan() {
+            false
+        } else {
+            current != previous
+        };
+    }
+    if !threshold.is_finite() || threshold < 0.0 {
+        return false;
+    }
+
+    let difference = (current - previous).abs();
+    let rounding_tolerance = f64::EPSILON * current.abs().max(previous.abs()).max(threshold) * 2.0;
+    difference >= threshold || threshold - difference <= rounding_tolerance
 }
 
 /// Convenience free function: serialize a value into `buf`.
@@ -514,4 +554,77 @@ pub fn is_analog_type(dt: ZclDataType) -> bool {
 /// Whether a data type is "discrete" (does not support reportable change).
 pub fn is_discrete_type(dt: ZclDataType) -> bool {
     !is_analog_type(dt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ZclValue;
+
+    #[test]
+    fn float32_thresholds_compare_finite_absolute_difference() {
+        let previous = ZclValue::Float32(1_000.0);
+        assert!(!ZclValue::Float32(1_049.9).exceeds_threshold(&previous, &ZclValue::Float32(50.0)));
+        assert!(ZclValue::Float32(1_050.0).exceeds_threshold(&previous, &ZclValue::Float32(50.0)));
+
+        let fractional_previous = ZclValue::Float32(1_000.0e-6);
+        assert!(
+            !ZclValue::Float32(1_049.9e-6)
+                .exceeds_threshold(&fractional_previous, &ZclValue::Float32(50.0e-6))
+        );
+        assert!(
+            ZclValue::Float32(1_050.0e-6)
+                .exceeds_threshold(&fractional_previous, &ZclValue::Float32(50.0e-6))
+        );
+
+        assert!(
+            !ZclValue::Float32(2_000.0).exceeds_threshold(&previous, &ZclValue::Float32(f32::NAN))
+        );
+        assert!(
+            !ZclValue::Float32(2_000.0)
+                .exceeds_threshold(&previous, &ZclValue::Float32(f32::INFINITY))
+        );
+    }
+
+    #[test]
+    fn float64_thresholds_compare_finite_absolute_difference() {
+        let previous = ZclValue::Float64(-2.0);
+        assert!(!ZclValue::Float64(2.99).exceeds_threshold(&previous, &ZclValue::Float64(5.0)));
+        assert!(ZclValue::Float64(3.0).exceeds_threshold(&previous, &ZclValue::Float64(5.0)));
+    }
+
+    #[test]
+    fn non_finite_float_values_do_not_repeat_without_a_transition() {
+        assert!(
+            !ZclValue::Float32(f32::NAN)
+                .exceeds_threshold(&ZclValue::Float32(f32::NAN), &ZclValue::Float32(1.0),)
+        );
+        assert!(
+            ZclValue::Float32(f32::NAN)
+                .exceeds_threshold(&ZclValue::Float32(1.0), &ZclValue::Float32(1.0),)
+        );
+        assert!(
+            !ZclValue::Float64(f64::INFINITY)
+                .exceeds_threshold(&ZclValue::Float64(f64::INFINITY), &ZclValue::Float64(1.0),)
+        );
+        assert!(
+            ZclValue::Float64(f64::NEG_INFINITY)
+                .exceeds_threshold(&ZclValue::Float64(f64::INFINITY), &ZclValue::Float64(1.0),)
+        );
+    }
+
+    #[test]
+    fn mismatched_float_types_keep_change_detection_semantics() {
+        assert!(
+            ZclValue::Float32(1.0)
+                .exceeds_threshold(&ZclValue::Float64(1.0), &ZclValue::Float32(1.0),)
+        );
+        assert!(
+            !ZclValue::Float32(1.0)
+                .exceeds_threshold(&ZclValue::Float32(1.0), &ZclValue::Float64(1.0),)
+        );
+        assert!(
+            ZclValue::Float32(2.0)
+                .exceeds_threshold(&ZclValue::Float32(1.0), &ZclValue::Float64(1.0),)
+        );
+    }
 }

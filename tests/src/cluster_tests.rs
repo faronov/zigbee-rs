@@ -1103,7 +1103,7 @@ mod environmental {
 
         c.set_co2_ppm(412.5);
         if let Some(ZclValue::Float32(v)) = c.attributes().get(ATTR_MEASURED_VALUE.into()) {
-            assert!((*v - 412.5).abs() < f32::EPSILON);
+            assert!((*v - 412.5e-6).abs() < f32::EPSILON);
         }
 
         assert_eq!(

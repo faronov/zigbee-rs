@@ -632,8 +632,6 @@ name = "nrf52840-dk"
 version = "0.1.0"
 dependencies = [
  "embassy-nrf",
- "embedded-storage",
- "zigbee-runtime",
 ]
 
 [[package]]
@@ -651,12 +649,26 @@ dependencies = [
  "embedded-hal 1.0.0",
  "log",
  "nrf52840-dk",
+ "nrf52840-sensor-product",
  "panic-probe",
- "zigbee-aps",
+ "zigbee-bme280",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-runtime",
+ "zigbee-sht3x",
  "zigbee-types",
+ "zigbee-zcl",
+]
+
+[[package]]
+name = "nrf52840-sensor-product"
+version = "0.1.0"
+dependencies = [
+ "embassy-nrf",
+ "embedded-storage",
+ "nrf52840-dk",
+ "zigbee-aps",
+ "zigbee-runtime",
  "zigbee-zcl",
 ]
 
@@ -908,6 +920,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zigbee-bme280"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+]
+
+[[package]]
 name = "zigbee-crypto"
 version = "0.1.0"
 dependencies = [
@@ -954,6 +974,14 @@ dependencies = [
  "zigbee-types",
  "zigbee-zcl",
  "zigbee-zdo",
+]
+
+[[package]]
+name = "zigbee-sht3x"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
 ]
 
 [[package]]

@@ -37,9 +37,13 @@ async fn run(mut pwm: efr32mg1_tradfri::LedPwm) -> ! {
 
 #[cortex_m_rt::entry]
 fn main() -> ! {
-    platform::init_small!("diag-pwm");
+    platform::init_small_without_led!("diag-pwm");
     time_driver::init();
-    let pwm = match efr32mg1_tradfri::led_pwm() {
+    let board = efr32mg1_tradfri::resources::BoardResources::take().unwrap_or_else(|| {
+        rtt_target::rprintln!("[EFR32][diag-pwm] RESOURCE_TAKEN");
+        platform::halt()
+    });
+    let pwm = match board.pa0.into_led_pwm() {
         Ok(pwm) => pwm,
         Err(error) => {
             rtt_target::rprintln!("[EFR32][diag-pwm] INIT_FAIL error={:?}", error);

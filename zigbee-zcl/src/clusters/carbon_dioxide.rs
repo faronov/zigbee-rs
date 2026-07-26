@@ -1,6 +1,8 @@
 //! Carbon Dioxide (CO₂) Measurement cluster (0x040D).
 //!
-//! Reports CO₂ concentration in ppm. Widely used by air quality sensors.
+//! Reports CO₂ concentration as a fraction of one, as required by ZCL.
+//! [`CarbonDioxideCluster::set_co2_ppm`] accepts the application-friendly
+//! parts-per-million representation and performs the wire-unit conversion.
 
 use crate::attribute::{AttributeAccess, AttributeDefinition, AttributeStore};
 use crate::clusters::{AttributeStoreAccess, AttributeStoreMutAccess, Cluster};
@@ -11,6 +13,8 @@ pub const ATTR_MEASURED_VALUE: AttributeId = AttributeId(0x0000);
 pub const ATTR_MIN_MEASURED_VALUE: AttributeId = AttributeId(0x0001);
 pub const ATTR_MAX_MEASURED_VALUE: AttributeId = AttributeId(0x0002);
 pub const ATTR_TOLERANCE: AttributeId = AttributeId(0x0003);
+
+const PPM_TO_FRACTION: f32 = 1.0e-6;
 
 /// Carbon Dioxide Measurement cluster.
 pub struct CarbonDioxideCluster {
@@ -51,7 +55,7 @@ impl CarbonDioxideCluster {
                 access: AttributeAccess::ReadOnly,
                 name: "MaxMeasuredValue",
             },
-            ZclValue::Float32(10000.0),
+            ZclValue::Float32(10_000.0 * PPM_TO_FRACTION),
         );
         let _ = store.register(
             AttributeDefinition {
@@ -67,9 +71,10 @@ impl CarbonDioxideCluster {
 
     /// Set the CO₂ concentration in ppm.
     pub fn set_co2_ppm(&mut self, ppm: f32) {
-        let _ = self
-            .store
-            .set_raw(ATTR_MEASURED_VALUE, ZclValue::Float32(ppm));
+        let _ = self.store.set_raw(
+            ATTR_MEASURED_VALUE,
+            ZclValue::Float32(ppm * PPM_TO_FRACTION),
+        );
     }
 }
 

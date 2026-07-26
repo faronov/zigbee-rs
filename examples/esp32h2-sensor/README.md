@@ -41,7 +41,9 @@ cargo run --release
 ## What It Demonstrates
 
 - Initialising the ESP32-H2 IEEE 802.15.4 radio with `esp-radio`
-- Building a Zigbee device with the `ZigbeeDevice` builder API
+- A typed product profile (`esp32_zigbee_devkit_product::profile::SensorProfile`)
+  and `zigbee_runtime::node::ZigbeeNode`, instead of building the device and its
+  cluster list by hand
 - **esp-hal 1.0 pattern** — `#[esp_hal::main]` entry point with `block_on()` async runtime
   (replaces the removed `embassy_executor` / `riscv_rt` approach)
 - Registering ZCL endpoint 1 (Home Automation profile, device type 0x0302)
@@ -49,20 +51,32 @@ cargo run --release
   and **Relative Humidity** clusters
 - **NWK Leave handler** — auto-rejoins when coordinator sends Leave
 - **Default reporting configuration** — temp/humidity: 60–300 s, battery: 300–3600 s
+  (from the shared `TemperatureHumidityBattery` profile archetype)
 - **Identify cluster** (0x0003) — LED blinks during Identify
-- Button-driven network join/leave via `UserAction::Toggle`
+- Button toggles join/leave directly through `ZigbeeNode`
+  (`start_or_resume`/`secure_rejoin`/`factory_reset`)
 - Periodic on-chip temperature and simulated humidity updates
-- Flash NV storage through the shared ESP32-C6/H2 board support crate
+- **Crash-safe security-state journal** through the product crate (see below)
 
 ## Hardware Validation
 
-Validated on an ESP32-H2 SuperMini revision 1.2 with 4 MiB flash:
+The current product/profile/`ZigbeeNode` build was validated on an ESP32-H2
+SuperMini revision 1.2 with 4 MiB flash on 2026-07-26:
 
 - native USB Serial/JTAG boot and flashing
-- IEEE 802.15.4 active scan and association
-- Zigbee Transport Key exchange and ZHA interview
-- temperature, humidity, battery, and Identify entities in Home Assistant
-- flash persistence and secure rejoin after reset without reopening pairing
+- one-time migration of the existing flat `LogStructuredNv` records into the
+  crash-safe `SecurityStateJournal`, while retaining the original PAN, short
+  address, parent, key, and IEEE address
+- the legacy sector remained intact while committed `ZBSS`/`CMIT` records were
+  written to the other sector
+- reset and secure resume without reopening pairing
+- monotonically increasing secured NWK counters after migration
+- Device Announce, ZHA interview completion, reporting, and Identify responses
+- live Home Assistant values: on-chip temperature, simulated humidity, and
+  battery percentage
+
+Fresh factory-reset commissioning and long-duration sleepy operation remain
+separate hardware gates. This H2 product intentionally has no OTA backend.
 
 The ESP-IDF 5.5 bootloader on this board requires an application descriptor.
 The example provides it through `esp-bootloader-esp-idf` 0.4, whose linker
@@ -84,21 +98,30 @@ for each measurement.
 ```
 esp32h2-sensor/
 ├── .cargo/config.toml   # Target, runner, rustflags, build-std
-├── Cargo.toml            # Dependencies (esp-hal 1.0, esp-radio 0.17, zigbee-rs crates)
+├── Cargo.toml            # Dependencies (esp-hal 1.0, esp-radio 0.17, product crate, zigbee-rs crates)
 └── src/
-    └── main.rs           # Application entry point (#[esp_hal::main])
+    ├── main.rs           # Composition root: platform startup + resource construction (#[esp_hal::main])
+    ├── app.rs            # SensorApp: ZigbeeNode-driven event loop, button, poll windows, LED
+    └── chip_temperature.rs  # H2 on-chip TSENS register driver
 ```
 
-`boards/esp32-zigbee-devkit` owns the bounded 8 KB flash partition and
-constructs the shared log-structured NV store.
+Architecture: `boards/esp32-zigbee-devkit` exposes only the physical chip
+flash (`esp32_zigbee_devkit::flash::RawFlash`, wrapping `esp_storage`), with
+no dependency on `zigbee-runtime`. `products/esp32-zigbee-devkit` (the
+`esp32-zigbee-devkit-product` crate) owns the bounded 8 KB NV window and
+constructs the crash-safe `SecurityStore`
+(`zigbee_runtime::security_journal::SecurityStateJournal`) plus the typed
+`SensorProfile`, shared with ESP32-C6.
 
 ## OTA
 
-The board crate's OTA firmware writer
-(`esp32_zigbee_devkit::ota::EspFirmwareWriter`) is chip independent apart from
-the expected image chip ID, which the `esp32h2` feature sets to `0x0010`, so it
-is compiled and unit tested for the H2 as well. It is **not wired into this
-example**: the OTA client, the packaging tool, and the two-slot partition table
-have only been brought up for the ESP32-C6 (see
-[`examples/esp32c6-sensor`](../esp32c6-sensor/README.md)), and nothing here has
-yet been verified through a real H2 OTA transfer.
+The product crate's OTA firmware writer
+(`esp32_zigbee_devkit_product::ota::EspFirmwareWriter`) is only compiled for
+the `esp32c6` feature — it is not part of this build at all. It is **not
+wired into this example**: the OTA client, the packaging tool, and the
+two-slot partition table have only been brought up for the ESP32-C6 (see
+[`examples/esp32c6-sensor`](../esp32c6-sensor/README.md)), and nothing here
+has yet been verified through a real H2 OTA transfer. Adding OTA to this
+build would mean giving the H2 build its own two-slot partition table and
+firmware writer, gated on an `esp32h2` feature in the product crate the same
+way the C6 backend is gated today.

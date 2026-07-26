@@ -4,18 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-# External I2C sensor (pick one; SDA=P0.26, SCL=P0.27):
-sensor-bme280 = []  # Bosch BME280 temperature + humidity + pressure
-sensor-sht31  = []  # Sensirion SHT31 temperature + humidity
+# External I2C sensor (pick one; SDA=P0.26, SCL=P0.27). Forwards to the
+# product crate too, since BME280 adds a Pressure Measurement cluster to
+# the profile.
+sensor-bme280 = ["nrf52840-sensor-product/sensor-bme280", "dep:zigbee-bme280"]  # Bosch BME280 temperature + humidity + pressure
+sensor-sht31  = ["dep:zigbee-sht3x"]                                            # Sensirion SHT31 temperature + humidity
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["nrf52840"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
-zigbee-aps = { path = "../../zigbee-aps" }
-zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee-zcl = { path = "../../zigbee-zcl" }
 nrf52840-dk = { path = "../../boards/nrf52840-dk" }
+nrf52840-sensor-product = { path = "../../products/nrf52840-sensor" }
+zigbee-bme280 = { package = "zigbee-bme280", path = "../../drivers/bme280", optional = true }
+zigbee-sht3x = { package = "zigbee-sht3x", path = "../../drivers/sht3x", optional = true }
 
 # nRF52840 Embassy HAL
 embassy-nrf = { version = "0.3", features = ["nrf52840", "time-driver-rtc1", "gpiote"] }

@@ -4,10 +4,11 @@ Nordic's nRF52840 and nRF52833 are ARM Cortex-M4F SoCs with a built-in
 IEEE 802.15.4 radio. The zigbee-rs nRF backend uses Embassy's radio driver
 for interrupt-driven, DMA-based TX/RX — **no SoftDevice required**.
 
-> **✅ Hardware Verified:** The nRF52840-DK has been tested end-to-end with
-> **Home Assistant + ZHA**. Features include flash NV storage (survives reboots),
-> NWK Leave handling (auto-erase + rejoin), default reporting configuration,
-> Identify cluster with LED blink, and optional BME280/SHT31 I2C sensors.
+> **Prior hardware baseline verified:** The nRF52840-DK path was tested
+> end-to-end with **Home Assistant + ZHA**, including flash NV, NWK Leave,
+> reporting, Identify, and optional BME280/SHT31 sensors. The current
+> product/profile/`ZigbeeNode` refactor preserves those mechanisms and passes
+> host/cross-build validation, but has not yet been re-run on hardware.
 
 ## Hardware Overview
 
@@ -167,11 +168,17 @@ python uf2conv.py -c -f 0xADA52840 ${ELF}.hex -o ${ELF}.uf2
 
 The `memory.x` linker script defines the memory regions:
 
-**nRF52840** (full chip, no bootloader):
+**nRF52840 sensor product** (no bootloader; last 8 KiB protected for Zigbee
+security persistence):
 ```
-FLASH : ORIGIN = 0x00000000, LENGTH = 1024K
+FLASH : ORIGIN = 0x00000000, LENGTH = 1016K
 RAM   : ORIGIN = 0x20000000, LENGTH = 256K
 ```
+
+`products/nrf52840-sensor/link/memory.x` owns this layout. The protected
+`0x000FE000..0x000FFFFF` region contains the two-sector crash-safe
+`SecurityStateJournal`; the board crate owns no flash addresses or persistence
+policy.
 
 **nRF52833**:
 ```
@@ -354,8 +361,10 @@ battery). This suppresses unnecessary transmissions in stable environments.
 
 ### RAM Power-Down
 
-Unused RAM banks are powered down at startup, saving ~190 KB of unpowered SRAM.
-This was already implemented in earlier versions.
+The example contains a `power_down_unused_ram()` primitive, but it is not
+currently called. Enabling it requires hardware validation of the linked BSS,
+Embassy task arena, and stack headroom first; do not count RAM-bank power-down
+as an active optimization in the current firmware.
 
 ### Radio Sleep
 
@@ -379,27 +388,41 @@ enabled is ~5-7 mA (radio RX idle).
 The flagship example: an Embassy-based Zigbee 3.0 end device that reads the
 on-chip temperature sensor and reports simulated humidity. Includes:
 
-- **Flash NV storage** — network state persists across power cycles (last 8 KB of flash)
+- **Crash-safe security journal** — product-owned last 8 KiB partition with
+  CRC/commit protection and outgoing-frame-counter reservation
 - **NWK Leave handler** — auto-erases NV and rejoins when coordinator sends Leave
 - **Default reporting** — configures report intervals at boot (temp/hum: 60–300 s, battery: 300–3600 s)
 - **Identify cluster** (0x0003) — LED blinks during Identify
 - **Battery monitoring** via SAADC (VDD internal divider)
-- **Optional external sensors** — BME280 (temp + humidity + pressure) or SHT31 (temp + humidity)
+- **Optional external sensors** — shared `zigbee-bme280` (temp + humidity +
+  pressure) or `zigbee-sht3x` (temp + humidity) drivers
+- **Typed product profile + `ZigbeeNode`** — endpoint composition,
+  reporting, persistence lifecycle, tick, and receive dispatch are shared
+  rather than rebuilt in the example
 
 **Initialization:**
 
 ```rust
 let p = embassy_nrf::init(Default::default());
 
-// On-chip temperature sensor (real hardware reading)
-let mut temp_sensor = Temp::new(p.TEMP, Irqs);
-
-// Button 1 on nRF52840-DK (P0.11, active low)
-let mut button = gpio::Input::new(p.P0_11, gpio::Pull::Up);
+// Board-owned physical wiring.
+let mut led = nrf52840_dk::led(p.P0_13);
+let mut button = nrf52840_dk::button(p.P0_11);
 
 // IEEE 802.15.4 MAC driver (interrupt-driven, DMA-based)
 let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
-let mac = zigbee_mac::nrf::NrfMac::new(radio);
+let rng = rng::Rng::new(p.RNG, Irqs);
+let mac = zigbee_mac::nrf::NrfMac::new(radio, rng);
+
+// Product-owned persistence, identity, and concrete profile.
+let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
+let mut security = nrf52840_sensor_product::storage::security_store(nvmc);
+let mut profile = nrf52840_sensor_product::profile::sensor_profile();
+
+let mut device = ZigbeeDevice::builder(mac)
+    // identity and endpoint come from nrf52840-sensor-product
+    .build();
+let mut node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
 ```
 
 **Real temperature reading:**

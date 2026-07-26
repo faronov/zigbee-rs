@@ -1,19 +1,20 @@
 # NV Storage
 
 The storage stack separates portable persistence algorithms from flash
-controllers and board-specific partition layouts:
+controllers, physical board wiring, and product-specific partition layouts:
 
 ```text
 zigbee-runtime      persistence algorithms and Zigbee security semantics
 embedded-storage    common raw NOR flash traits
 <chip>-hal          flash controller implementation
-boards/<board>      bounded partitions and linker layout
-examples/<role>     application behavior
+boards/<board>      physical flash chip/bus wiring only
+products/<product>  bounded partitions, linker layout, bootloader/OTA policy
+examples/<role>     application behavior and scheduling
 ```
 
 Physical flash addresses must not be placed in examples or generic chip HALs.
 They depend on the board, bootloader, OTA layout, and linked firmware region,
-so the BSP owns them.
+so the product owns them.
 
 ## Generic application NV
 
@@ -46,7 +47,7 @@ use zigbee_runtime::log_nv::LogStructuredNv;
 let nv = LogStructuredNv::new(flash_partition, 0, erase_size)?;
 ```
 
-The flash value passed here is already bounded to the BSP-owned partition.
+The flash value passed here is already bounded to the product-owned partition.
 Offsets are relative to that partition, not absolute chip addresses.
 
 ## Security state
@@ -61,26 +62,34 @@ raw NOR traits, but they intentionally provide different semantics.
 
 ## Platform ownership
 
-| Platform | Flash controller | Partition owner | Store |
+| Platform | Flash controller | Current partition owner | Store |
 |---|---|---|---|
 | TLSR8258 | `tlsr8258-hal` | `boards/tlsr8258-tb04` | Security journal |
-| nRF52840 | Embassy NVMC | `boards/nrf52840-dk` | Security journal |
+| nRF52840 | Embassy NVMC | `products/nrf52840-sensor` | Security journal |
 | PHY6222/PHY6252 | `phy6222-hal` | `boards/phy62x2-evk` | Security journal |
-| ESP32-C6/H2 | `esp_storage::FlashStorage` | `boards/esp32-zigbee-devkit` | Generic NV |
-| EFR32MG1P | `efr32mg1-hal` MSC | `boards/efr32mg1-tradfri` | Security journal + separate generic NV |
+| ESP32-C6/H2 | `esp_storage::FlashStorage` | `products/esp32-zigbee-devkit` | Security journal |
+| EFR32MG1P | `efr32mg1-hal` MSC | `products/efr32mg1-tradfri` | Security journal + separate generic NV |
 | EFR32MG21 | `efr32mg21-hal` MSC | `boards/efr32mg21-devkit` | Generic NV |
 
-The BSP wrappers validate bounds and translate relative offsets to physical
-addresses. Linker scripts reserve the same regions so application code cannot
-overlap persistent storage.
+EFR32MG1P, ESP32-C6/H2, and nRF52840 are product-split platforms:
+`boards/<board>` exposes only the physical chip flash resource (raw
+whole-chip read/write/erase, no partition or NV knowledge, no
+`zigbee-runtime` dependency), and `products/<product>` bounds it to a window
+and constructs the store. The remaining board-owned rows are legacy
+boundaries that will migrate after the API is proven across more platforms.
+Partition wrappers validate bounds and translate relative offsets to
+physical addresses. Product linker scripts (or, on ESP32, the product-owned
+partition table) reserve the same regions so application code cannot overlap
+persistent storage.
 
 ## Adding a platform
 
 1. Implement `ReadNorFlash` and `NorFlash` in the chip HAL.
-2. Define a bounded partition wrapper in the board crate.
-3. Reserve that partition in the board linker layout.
-4. Construct `SecurityStateJournal` or `LogStructuredNv` in the BSP.
-5. Pass the resulting store to the application without exposing addresses.
+2. Expose only physical flash wiring from the board crate.
+3. Define a bounded partition wrapper in the product crate.
+4. Reserve that partition in the product linker layout.
+5. Construct `SecurityStateJournal` or `LogStructuredNv` in the product.
+6. Pass the resulting store to the application without exposing addresses.
 
 Flash errors must be returned to the storage algorithm. Reads, writes, and
 erases must never be treated as successful after a controller failure.

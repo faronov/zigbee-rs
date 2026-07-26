@@ -1,6 +1,7 @@
-//! OTA staging through the resident Gecko Bootloader and external SPI flash.
+//! Product OTA staging through the resident Gecko Bootloader slot.
 
 use efr32mg1_hal::bootloader::Bootloader;
+use efr32mg1_tradfri::resources::BootloaderFlashAccess;
 use zigbee_runtime::firmware_writer::{FirmwareError, FirmwareWriter};
 
 const OTA_SLOT: u32 = 0;
@@ -18,6 +19,7 @@ enum State {
 /// is active. `activate()` does not return: it requests a bootloader reset and
 /// installs the verified GBL from slot 0.
 pub struct Efr32FirmwareWriter {
+    _flash_access: BootloaderFlashAccess,
     bootloader: Option<Bootloader>,
     slot_size: u32,
     written: u32,
@@ -25,8 +27,11 @@ pub struct Efr32FirmwareWriter {
 }
 
 impl Efr32FirmwareWriter {
-    pub fn new() -> Result<Self, FirmwareError> {
+    /// Discover the resident bootloader while retaining exclusive ownership of
+    /// the external-flash path for the lifetime of this writer.
+    pub fn new(flash_access: BootloaderFlashAccess) -> Result<Self, FirmwareError> {
         Ok(Self {
+            _flash_access: flash_access,
             bootloader: Some(Bootloader::discover().map_err(|_| FirmwareError::HardwareError)?),
             slot_size: 0,
             written: 0,

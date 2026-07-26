@@ -4,17 +4,28 @@
 //! Uses the built-in IEEE 802.15.4 radio via `esp-radio`.
 //!
 //! # Features
-//! - Auto-join on boot
+//! - Auto-join on boot, secure rejoin on restart with saved state
 //! - Sleepy End Device: poll parent for indirect frames
-//! - Fast poll (250ms) during ZHA interview, slow poll (10s) normal
+//! - Fast poll (250ms) during ZHA interview/OTA, slow poll (30s) normal
 //! - Device_annce retries for reliable coordinator discovery
+//! - OTA Upgrade client, cleanly omitted if the partition table is missing
+//!   or incompatible
 //! - Button: BOOT (GPIO9) — short=toggle, long=factory reset
+//!
+//! # Architecture
+//! `esp32-zigbee-devkit-product` (see `products/esp32-zigbee-devkit`) owns
+//! the typed [`SensorProfile`](esp32_zigbee_devkit_product::profile::SensorProfile)
+//! (endpoint/cluster declaration + OTA composition) and the durable
+//! [`SecurityStore`](esp32_zigbee_devkit_product::storage::SecurityStore).
+//! This file is only the composition root: platform startup, resource
+//! construction, and handing both to [`zigbee_runtime::node::ZigbeeNode`]
+//! before running [`app::SensorApp`]'s event loop.
 //!
 //! # Build & flash
 //! ```bash
 //! cargo build --release
 //! espflash flash \
-//!   --partition-table ../../boards/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv \
+//!   --partition-table ../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv \
 //!   --target-app-partition ota_0 \
 //!   --erase-parts otadata \
 //!   --monitor target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
@@ -27,31 +38,27 @@ extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+mod app;
 mod ota_client;
 mod time_driver;
 
 include!(concat!(env!("OUT_DIR"), "/firmware_version.rs"));
 
-use esp32_zigbee_devkit::{firmware, storage};
+use app::SensorApp;
 use esp_backtrace as _;
 use esp_hal::gpio::{Input, InputConfig, Pull};
 use esp_hal::tsens::{Config as TsensConfig, TemperatureSensor};
 
 use embassy_futures::block_on;
-use embassy_time::{Duration, Instant, Timer};
+use static_cell::StaticCell;
 
-use ota_client::OtaClient;
-use zigbee_aps::PROFILE_HOME_AUTOMATION;
+use esp32_zigbee_devkit_product as product;
 use zigbee_nwk::DeviceType;
-use zigbee_runtime::event_loop::{StackEvent, TickResult};
-use zigbee_runtime::ota::OtaConfig;
+use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
+use zigbee_runtime::profile::ApplicationProfile;
+use zigbee_runtime::ZigbeeDevice;
 use zigbee_zcl::clusters::basic::PowerSource;
-use zigbee_zcl::clusters::humidity::HumidityCluster;
-use zigbee_zcl::clusters::power_config::PowerConfigCluster;
-use zigbee_zcl::clusters::temperature::TemperatureCluster;
-use zigbee_zcl::{ClusterId, DeviceId};
 
 // Bridge `log` crate → esp_println so stack-internal log::info! appears on serial
 struct EspLogger;
@@ -65,47 +72,6 @@ impl log::Log for EspLogger {
     fn flush(&self) {}
 }
 static LOGGER: EspLogger = EspLogger;
-
-const REPORT_INTERVAL_SECS: u64 = 60;
-const FAST_POLL_MS: u64 = 250;
-const SLOW_POLL_SECS: u64 = 30;
-const FAST_POLL_DURATION_SECS: u64 = 120;
-const EXPECTED_REPORT_CLUSTERS: usize = 3;
-/// Manufacturer code advertised in `QueryNextImageRequest` and stamped into the
-/// OTA container by `tools/create-ota.py`. ZHA matches images on this pair, so
-/// the two must stay in sync.
-const OTA_MANUFACTURER_CODE: u16 = 0x1234;
-/// Image type: 0x0001 = ESP32-C6 sensor.
-const OTA_IMAGE_TYPE: u16 = 0x0001;
-/// Hardware version reported to the OTA server.
-const OTA_HARDWARE_VERSION: u16 = 1;
-
-/// Application clusters handed to the runtime on every dispatch.
-///
-/// The OTA cluster is in here so the server can read `CurrentFileVersion` and
-/// friends off endpoint 1 like any other attribute.
-macro_rules! app_clusters {
-    ($temp:expr, $hum:expr, $power:expr, $ota:expr) => {
-        [
-            ClusterRef {
-                endpoint: 1,
-                cluster: $temp,
-            },
-            ClusterRef {
-                endpoint: 1,
-                cluster: $hum,
-            },
-            ClusterRef {
-                endpoint: 1,
-                cluster: $power,
-            },
-            ClusterRef {
-                endpoint: 1,
-                cluster: $ota,
-            },
-        ]
-    };
-}
 
 #[esp_hal::main]
 fn main() -> ! {
@@ -131,9 +97,8 @@ fn main() -> ! {
         InputConfig::default().with_pull(Pull::Up),
     );
 
-    // ESP32-C6-DevKitC-1 has a WS2812 RGB LED on GPIO8 — not a simple GPIO LED.
-    // For now, we just log status instead of blinking.
-    // To use an external LED, connect one to any free GPIO.
+    // ESP32-C6-DevKitC-1 has a WS2812 addressable RGB LED on GPIO8, not a
+    // simple GPIO LED. For now we just log status instead of blinking.
     esp_println::println!("[ESP32-C6] Boot signal (no simple LED on devkit)");
 
     // IEEE 802.15.4 radio
@@ -146,449 +111,74 @@ fn main() -> ! {
     let temp_sensor = TemperatureSensor::new(peripherals.TSENS, TsensConfig::default())
         .expect("temp sensor init failed");
 
-    let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
-    let mut hum_cluster = HumidityCluster::new(0, 10000);
-    let mut power_cluster = PowerConfigCluster::new();
-
-    let mut hum_tick: u32 = 0;
-
-    // OTA client — stages upgrades into the inactive application slot.
-    let mut ota = OtaClient::new(OtaConfig {
-        manufacturer_code: OTA_MANUFACTURER_CODE,
-        image_type: OTA_IMAGE_TYPE,
-        current_version: FIRMWARE_VERSION,
-        endpoint: 1,
-        block_size: 48,
-        auto_accept: true,
-        hardware_version: Some(OTA_HARDWARE_VERSION),
+    // Product-owned durable security store and endpoint/OTA profile.
+    //
+    // `open_security_store` also runs the one-time legacy persistence
+    // migration (see `esp32_zigbee_devkit_product::migration`): a device
+    // already joined under the old `LogStructuredNv` format keeps its network
+    // and is upgraded to the crash-safe journal without reusing a frame
+    // counter. A migration error means the reserved NV region may still be
+    // intact, so halt rather than silently commissioning as factory-new.
+    let (security, migration) = product::storage::open_security_store().unwrap_or_else(|error| {
+        esp_println::println!(
+            "[ESP32-C6] FATAL: persistence migration failed: {:?}",
+            error
+        );
+        loop {
+            core::hint::spin_loop();
+        }
     });
-    let ota_enabled = ota.is_enabled();
+    esp_println::println!("[ESP32-C6] Persistence migration: {:?}", migration);
+    let profile =
+        product::profile::sensor_profile(FIRMWARE_VERSION, esp_hal::system::software_reset);
+    esp_println::println!(
+        "[ESP32-C6] OTA {}",
+        if profile.is_enabled() {
+            "enabled"
+        } else {
+            "disabled (incompatible partition layout)"
+        }
+    );
 
-    // Build device (SED)
-    let mut device = ZigbeeDevice::builder(mac)
+    let device = ZigbeeDevice::builder(mac)
         .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: 10_000,
             wake_duration_ms: 500,
         })
-        .manufacturer("Zigbee-RS")
-        .model("ESP32-C6-Sensor")
-        .application_version(firmware::application_version(FIRMWARE_VERSION))
-        .date_code("20260403")
+        .manufacturer(product::MANUFACTURER)
+        .model(product::MODEL)
+        .application_version(product::firmware::application_version(FIRMWARE_VERSION))
+        .date_code(product::DATE_CODE)
         .sw_build(FIRMWARE_VERSION_STR)
         .power_source(PowerSource::DcSource)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
         .endpoint(
-            1,
-            PROFILE_HOME_AUTOMATION,
-            DeviceId::TEMPERATURE_SENSOR,
-            |ep| {
-                let ep = ep
-                    .cluster_server(ClusterId::BASIC)
-                    .cluster_server(ClusterId::IDENTIFY)
-                    .cluster_server(ClusterId::POWER_CONFIG)
-                    .cluster_server(ClusterId::TEMPERATURE)
-                    .cluster_server(ClusterId::HUMIDITY);
-                if ota_enabled {
-                    ep.cluster_client(ClusterId::OTA_UPGRADE)
-                } else {
-                    ep
-                }
-            },
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |ep| profile.configure_endpoint(ep),
         )
         .build();
 
-    // Initial sensor values
-    {
-        let raw_temp = temp_sensor.get_temperature();
-        // Convert to centidegrees: (raw * 0.4386 - offset*27.88 - 20.52) * 100
-        // Integer: (raw * 4386 - offset * 278800 - 205200) / 100
-        let temp_centi =
-            ((raw_temp.raw_value as i32) * 4386 - (raw_temp.offset as i32) * 278800 - 205200) / 100;
-        temp_cluster.set_temperature(temp_centi as i16);
-        hum_cluster.set_humidity(5000u16); // No humidity sensor — fixed 50%
-        power_cluster.set_battery_voltage(33); // USB powered = 3.3V
-        power_cluster.set_battery_percentage(200); // 100%
-        esp_println::println!(
-            "[ESP32-C6] Temp: {}.{:02}°C (on-chip)",
-            temp_centi / 100,
-            (temp_centi % 100).unsigned_abs()
-        );
-    }
+    // `ZigbeeNode` borrows the device, security store and profile for its
+    // whole lifetime; giving them `'static` storage (like the EFR32MG1
+    // product) keeps that borrow trivially valid across the diverging
+    // `block_on` call below, regardless of how the `#[esp_hal::main]` macro
+    // structures the generated entry point.
+    static SECURITY: StaticCell<product::storage::SecurityStore> = StaticCell::new();
+    static PROFILE: StaticCell<product::profile::SensorProfile> = StaticCell::new();
+    static DEVICE: StaticCell<ZigbeeDevice<zigbee_mac::esp::EspMac<'static>>> = StaticCell::new();
+    static APP: StaticCell<SensorApp<'static>> = StaticCell::new();
 
-    // Flash NV storage for network persistence
-    let mut nv = storage::application_nv().expect("failed to initialize application NV");
-    esp_println::println!("[ESP32-C6] Flash NV storage ready");
+    let security = SECURITY.init(security);
+    let profile = PROFILE.init(profile);
+    let device = DEVICE.init(device);
 
-    // Run the async SED loop synchronously via block_on
-    // NOTE: block_on busy-spins the CPU (~48°C on-chip). For real battery
-    // operation, ESP32-C6 needs an interrupt-driven time driver + light sleep.
-    // This is fine for USB-powered dev kits.
-    block_on(async {
-        // Restore previous network state or auto-join
-        let restored = device.restore_state(&mut nv);
-        if restored {
-            esp_println::println!("[ESP32-C6] Restored state — will rejoin");
-            device.user_action(UserAction::Rejoin);
-        } else {
-            esp_println::println!("[ESP32-C6] No saved state — auto-joining…");
-            device.user_action(UserAction::Join);
-        }
-        let mut clusters = app_clusters!(
-            &mut temp_cluster,
-            &mut hum_cluster,
-            &mut power_cluster,
-            ota.cluster_mut()
-        );
-        if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-            if log_event(e) {
-                device.save_state(&mut nv);
-                esp_println::println!("[ESP32-C6] State saved to flash");
-            }
-        }
+    let node = ZigbeeNode::new(device, security, profile);
+    let app = APP.init(SensorApp::new(node, button, temp_sensor));
 
-        // Default reporting so device reports even before ZHA interview
-        setup_default_reporting(&mut device);
+    esp_println::println!("[ESP32-C6] Flash NV storage ready (security-state journal)");
 
-        let mut last_report = Instant::now();
-        let mut fast_poll_until = if device.is_joined() {
-            Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS)
-        } else {
-            Instant::now()
-        };
-        let mut last_rejoin_attempt = Instant::now();
-        // Whole seconds already handed to the OTA engine; the loop runs far
-        // faster than 1 Hz, so the remainder has to be carried over instead of
-        // being rounded away (otherwise OTA timers would never advance).
-        let mut last_ota_service = Instant::now();
-        let mut rejoin_count: u8 = 0;
-        let mut annce_retries_left: u8 = if device.is_joined() { 5 } else { 0 };
-        let mut last_annce = Instant::now();
-        let mut interview_done = false;
-        let mut button_was_pressed = false;
-
-        loop {
-            let now = Instant::now();
-            // An in-flight OTA always polls fast, regardless of the window.
-            let in_fast_poll = now < fast_poll_until || ota.is_active();
-            let poll_ms = if in_fast_poll {
-                FAST_POLL_MS
-            } else {
-                SLOW_POLL_SECS * 1000
-            };
-
-            // Button check
-            let pressed = button.is_low();
-            if pressed && !button_was_pressed {
-                let press_start = Instant::now();
-                let mut held_long = false;
-                while button.is_low() {
-                    if press_start.elapsed().as_secs() >= 3 {
-                        held_long = true;
-                        break;
-                    }
-                    Timer::after(Duration::from_millis(50)).await;
-                }
-
-                if held_long {
-                    esp_println::println!("[ESP32-C6] FACTORY RESET");
-                    device.factory_reset(Some(&mut nv)).await;
-                    esp_println::println!("[ESP32-C6] NV cleared — rebooting");
-                    for _ in 0..5u8 {
-                        Timer::after(Duration::from_millis(100)).await;
-                        Timer::after(Duration::from_millis(100)).await;
-                    }
-                    esp_hal::system::software_reset();
-                } else {
-                    esp_println::println!(
-                        "[ESP32-C6] Button → {}",
-                        if device.is_joined() { "leave" } else { "join" }
-                    );
-                    device.user_action(UserAction::Toggle);
-                    let mut cls = app_clusters!(
-                        &mut temp_cluster,
-                        &mut hum_cluster,
-                        &mut power_cluster,
-                        ota.cluster_mut()
-                    );
-                    if let TickResult::Event(ref e) = device.tick(0, &mut cls).await {
-                        if log_event(e) {
-                            device.save_state(&mut nv);
-                            fast_poll_until =
-                                Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                            annce_retries_left = 5;
-                            last_annce = Instant::now();
-                            interview_done = false;
-                        }
-                    }
-                    Timer::after(Duration::from_millis(300)).await;
-                }
-            }
-            button_was_pressed = pressed;
-
-            // Sleep
-            Timer::after(Duration::from_millis(poll_ms)).await;
-
-            // Poll parent (SED core)
-            if device.is_joined() {
-                for _poll_round in 0..4u8 {
-                    match device.poll().await {
-                        Ok(Some(ind)) => {
-                            let mut cls = app_clusters!(
-                                &mut temp_cluster,
-                                &mut hum_cluster,
-                                &mut power_cluster,
-                                ota.cluster_mut()
-                            );
-                            if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
-                                if ota.handle_event(&mut device, &ev).await {
-                                    // Keep the radio hot for the rest of the
-                                    // transfer: OTA blocks arrive as indirect
-                                    // traffic and only a fast poll fetches them
-                                    // at a useful rate.
-                                    fast_poll_until = Instant::now()
-                                        + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                    let mut cls2 = app_clusters!(
-                                        &mut temp_cluster,
-                                        &mut hum_cluster,
-                                        &mut power_cluster,
-                                        ota.cluster_mut()
-                                    );
-                                    let _ = device.tick(0, &mut cls2).await;
-                                    continue;
-                                }
-                                match &ev {
-                                    StackEvent::RejoinRequested => {
-                                        esp_println::println!("[ESP32-C6] Secure rejoin requested");
-                                        if device.secure_rejoin().await.is_ok() {
-                                            device.save_state(&mut nv);
-                                            fast_poll_until = Instant::now()
-                                                + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                            interview_done = false;
-                                        } else {
-                                            esp_println::println!(
-                                                "[ESP32-C6] Secure rejoin failed"
-                                            );
-                                        }
-                                        break;
-                                    }
-                                    StackEvent::LeaveRequested => {
-                                        esp_println::println!(
-                                            "[ESP32-C6] Leave requested — erasing NV and rejoining"
-                                        );
-                                        device.factory_reset(Some(&mut nv)).await;
-                                        device.user_action(UserAction::Join);
-                                        fast_poll_until = Instant::now()
-                                            + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                        interview_done = false;
-                                        break; // break poll loop
-                                    }
-                                    _ => {}
-                                }
-                                if log_event(&ev) {
-                                    fast_poll_until = Instant::now()
-                                        + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                }
-                            }
-                            if !interview_done
-                                && device.configured_cluster_count(1) >= EXPECTED_REPORT_CLUSTERS
-                            {
-                                interview_done = true;
-                                fast_poll_until = Instant::now() + Duration::from_secs(5);
-                                esp_println::println!("[ESP32-C6] Interview done!");
-                            }
-                            let mut cls2 = app_clusters!(
-                                &mut temp_cluster,
-                                &mut hum_cluster,
-                                &mut power_cluster,
-                                ota.cluster_mut()
-                            );
-                            let _ = device.tick(0, &mut cls2).await;
-                        }
-                        Ok(None) => break,
-                        Err(_) => break,
-                    }
-                }
-
-                // Periodic sensor update
-                let now2 = Instant::now();
-                let elapsed_s = now2.duration_since(last_report).as_secs();
-                if elapsed_s >= REPORT_INTERVAL_SECS {
-                    last_report = now2;
-                    let raw_temp = temp_sensor.get_temperature();
-                    let temp_centi = ((raw_temp.raw_value as i32) * 4386
-                        - (raw_temp.offset as i32) * 278800
-                        - 205200)
-                        / 100;
-                    hum_tick = hum_tick.wrapping_add(1);
-                    let hum: u16 = 5000 + ((hum_tick % 100) as u16) * 10;
-                    temp_cluster.set_temperature(temp_centi as i16);
-                    hum_cluster.set_humidity(hum);
-                    esp_println::println!(
-                        "[ESP32-C6] T={}.{:02}°C H={}.{:02}%",
-                        temp_centi / 100,
-                        (temp_centi % 100).unsigned_abs(),
-                        hum / 100,
-                        hum % 100
-                    );
-                }
-
-                let tick_elapsed = elapsed_s.min(60) as u16;
-                let mut clusters = app_clusters!(
-                    &mut temp_cluster,
-                    &mut hum_cluster,
-                    &mut power_cluster,
-                    ota.cluster_mut()
-                );
-                let _ = device.tick(tick_elapsed, &mut clusters).await;
-
-                // Drive the OTA state machine and flush any queued request.
-                let ota_elapsed = Instant::now()
-                    .duration_since(last_ota_service)
-                    .as_secs()
-                    .min(60);
-                last_ota_service += Duration::from_secs(ota_elapsed);
-                ota.service(&mut device, ota_elapsed as u16).await;
-                if ota.activation_pending() {
-                    // Checkpoint first: activate() reboots into the staged
-                    // image and anything not in NV by then is lost.
-                    device.save_state(&mut nv);
-                    esp_println::println!("[ESP32-C6] State saved — activating new image");
-                    if ota.activate().is_err() {
-                        esp_println::println!("[ESP32-C6] OTA activation failed");
-                    }
-                }
-
-                // Device_annce retry
-                if annce_retries_left > 0 && now2.duration_since(last_annce).as_secs() >= 8 {
-                    annce_retries_left -= 1;
-                    last_annce = now2;
-                    let _ = device.send_device_annce().await;
-                }
-            } else {
-                // Not joined — blink and retry
-                let now2 = Instant::now();
-                if now2.duration_since(last_rejoin_attempt).as_secs() >= 1 {
-                    Timer::after(Duration::from_millis(80)).await;
-                    Timer::after(Duration::from_millis(120)).await;
-                    Timer::after(Duration::from_millis(80)).await;
-                }
-
-                if now2.duration_since(last_rejoin_attempt).as_secs() >= 15 {
-                    rejoin_count = rejoin_count.wrapping_add(1);
-                    last_rejoin_attempt = Instant::now();
-                    esp_println::println!("[ESP32-C6] Retrying join ({})…", rejoin_count);
-                    device.user_action(UserAction::Join);
-                    let mut cls = app_clusters!(
-                        &mut temp_cluster,
-                        &mut hum_cluster,
-                        &mut power_cluster,
-                        ota.cluster_mut()
-                    );
-                    let _ = device.tick(0, &mut cls).await;
-                    if device.is_joined() {
-                        esp_println::println!(
-                            "[ESP32-C6] Joined! addr=0x{:04X}",
-                            device.short_address()
-                        );
-                        fast_poll_until =
-                            Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                        annce_retries_left = 5;
-                        last_annce = Instant::now();
-                        interview_done = false;
-                        device.save_state(&mut nv);
-                        esp_println::println!("[ESP32-C6] State saved to flash");
-                    }
-                }
-            }
-        }
-    })
-}
-
-fn log_event(event: &StackEvent) -> bool {
-    match event {
-        StackEvent::Joined {
-            short_address,
-            channel,
-            pan_id,
-        } => {
-            esp_println::println!(
-                "[ESP32-C6] Joined! addr=0x{:04X} ch={} pan=0x{:04X}",
-                short_address,
-                channel,
-                pan_id
-            );
-            true
-        }
-        StackEvent::Left => {
-            esp_println::println!("[ESP32-C6] Left network");
-            false
-        }
-        StackEvent::ReportSent => {
-            esp_println::println!("[ESP32-C6] Report sent");
-            false
-        }
-        StackEvent::LeaveRequested | StackEvent::RejoinRequested => {
-            esp_println::println!("[ESP32-C6] Leave requested by coordinator");
-            false
-        }
-        StackEvent::CommissioningComplete { success } => {
-            esp_println::println!(
-                "[ESP32-C6] Commissioning: {}",
-                if *success { "ok" } else { "failed" }
-            );
-            false
-        }
-        _ => false,
-    }
-}
-
-/// Configure default reporting with change thresholds to suppress unnecessary TX.
-fn setup_default_reporting<M: zigbee_mac::MacDriver>(device: &mut ZigbeeDevice<M>) {
-    use zigbee_zcl::data_types::{ZclDataType, ZclValue};
-    use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
-
-    // Temperature: report every 60-300s, min change 0.5°C (50 centidegrees)
-    let _ = device.reporting_mut().configure_for_cluster(
-        1,
-        ClusterId::TEMPERATURE.0,
-        ReportingConfig {
-            direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::clusters::temperature::ATTR_MEASURED_VALUE,
-            data_type: ZclDataType::I16,
-            min_interval: 60,
-            max_interval: 300,
-            reportable_change: Some(ZclValue::I16(50)),
-        },
-    );
-
-    // Humidity: report every 60-300s, min change 1% (100 centi-%)
-    let _ = device.reporting_mut().configure_for_cluster(
-        1,
-        ClusterId::HUMIDITY.0,
-        ReportingConfig {
-            direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::clusters::humidity::ATTR_MEASURED_VALUE,
-            data_type: ZclDataType::U16,
-            min_interval: 60,
-            max_interval: 300,
-            reportable_change: Some(ZclValue::U16(100)),
-        },
-    );
-
-    // Battery: report every 300-3600s, min change 2% (4 in 0.5% units)
-    let _ = device.reporting_mut().configure_for_cluster(
-        1,
-        ClusterId::POWER_CONFIG.0,
-        ReportingConfig {
-            direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::clusters::power_config::ATTR_BATTERY_PERCENTAGE_REMAINING,
-            data_type: ZclDataType::U8,
-            min_interval: 300,
-            max_interval: 3600,
-            reportable_change: Some(ZclValue::U8(4)),
-        },
-    );
-
-    esp_println::println!("[ESP32-C6] Default reporting configured (with change thresholds)");
+    block_on(app.run())
 }

@@ -84,7 +84,7 @@ cargo build --release -Z build-std=core,alloc
 target = "riscv32imac-unknown-none-elf"
 
 [target.riscv32imac-unknown-none-elf]
-runner = "espflash flash --partition-table ../../boards/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv --target-app-partition ota_0 --erase-parts otadata --monitor"
+runner = "espflash flash --partition-table ../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv --target-app-partition ota_0 --erase-parts otadata --monitor"
 rustflags = ["-C", "link-arg=-Tlinkall.x"]
 
 [unstable]
@@ -137,7 +137,7 @@ cd examples/esp32c6-sensor
 
 # Flash and open serial monitor
 espflash flash \
-  --partition-table ../../boards/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv \
+  --partition-table ../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv \
   --target-app-partition ota_0 \
   --erase-parts otadata \
   --monitor target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
@@ -221,16 +221,25 @@ The MAC driver code is shared — only the HAL feature gate changes.
 
 ## Example Walkthrough
 
-The `esp32c6-sensor` example implements a Zigbee 3.0 temperature & humidity
-end device with:
+The `esp32c6-sensor` and `esp32h2-sensor` examples implement a Zigbee 3.0
+temperature & humidity end device around a typed product profile
+(`esp32_zigbee_devkit_product::profile::SensorProfile`, from
+`products/esp32-zigbee-devkit`) and `zigbee_runtime::node::ZigbeeNode`, with:
 
-- **On-chip temperature sensor** (via `esp_hal::tsens::TemperatureSensor`)
-- **Flash NV storage** — network state persists across power cycles (no re-pairing)
-- **NWK Leave handler** — auto-erases NV and rejoins when coordinator sends Leave
-- **Default reporting** — configures report intervals at boot so data flows before ZHA interview
+- **On-chip temperature sensor** (via `esp_hal::tsens::TemperatureSensor` on
+  C6; a small register-level TSENS driver on H2)
+- **Crash-safe security-state journal** — network/security state persists
+  across power cycles with a bounded frame-counter reservation (no re-pairing,
+  no counter reuse after a crash)
+- **NWK Leave handler** — auto-erases state and rejoins when the coordinator
+  sends Leave
+- **Default reporting** — configured from the shared profile at boot so data
+  flows before ZHA interview
 - **Identify cluster** (0x0003) — supports Identify, IdentifyQuery, TriggerEffect
 - **Battery percentage** reporting via Power Configuration cluster
 - Join/leave button (BOOT / GPIO9)
+- **OTA Upgrade client**, ESP32-C6 only, composed into the profile only when
+  the checked partition table matches
 
 ### Initialization
 
@@ -253,31 +262,54 @@ fn main() -> ! {
 
 ### Device Setup
 
-```rust
-    use zigbee_zcl::clusters::basic::PowerSource;
-    use zigbee_zcl::{ClusterId, DeviceId};
+The composition root builds the product's profile, then hands the endpoint
+declaration straight through to the builder instead of listing clusters by
+hand:
 
-    let mut device = ZigbeeDevice::builder(mac)
+```rust
+    use esp32_zigbee_devkit_product as product;
+    use zigbee_runtime::profile::ApplicationProfile;
+    use zigbee_zcl::clusters::basic::PowerSource;
+
+    let security = product::storage::security_store();
+    let profile = product::profile::sensor_profile(FIRMWARE_VERSION, esp_hal::system::software_reset);
+
+    let device = ZigbeeDevice::builder(mac)
         .device_type(DeviceType::EndDevice)
-        .manufacturer("Zigbee-RS")
-        .model("ESP32-C6-Sensor")
-        .sw_build("0.1.0")
+        .manufacturer(product::MANUFACTURER)
+        .model(product::MODEL)
+        .sw_build(FIRMWARE_VERSION_STR)
         .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, DeviceId::TEMPERATURE_SENSOR, |ep| {
-            ep.cluster_server(ClusterId::BASIC)
-                .cluster_server(ClusterId::POWER_CONFIG)
-                .cluster_server(ClusterId::IDENTIFY)
-                .cluster_server(ClusterId::TEMPERATURE)
-                .cluster_server(ClusterId::HUMIDITY)
-        })
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |ep| profile.configure_endpoint(ep),
+        )
         .build();
+
+    let node = zigbee_runtime::node::ZigbeeNode::new(device, security, profile);
 ```
+
+(`device`/`security`/`profile` are given `'static` storage through
+`static_cell::StaticCell` so `ZigbeeNode`'s borrow of all three stays valid
+across the diverging `block_on` call, the same pattern the EFR32MG1 product
+uses.)
 
 ### Main Loop
 
-The main loop handles button presses (join/leave), updates simulated sensor
-values every 30 seconds, and ticks the Zigbee stack.
+`SensorApp` (`src/app.rs` in each example) owns the event loop: button
+presses (join/leave/factory-reset), the fast/slow poll window, periodic
+sensor sampling, Device_annce retries, and — on the C6 build — driving the
+OTA transport (`src/ota_client.rs`) over whatever backend the profile
+composed in. Initial and retried commissioning goes through
+`ZigbeeNode::start_or_resume`/`secure_rejoin`/`factory_reset`, which
+`tick`/`process_incoming` alone do not perform.
+
+The example's `OtaTransport` is only platform logging/poll-window policy. The
+server lock, APS retry, cleanup, and activation-pending state are shared in
+`zigbee_runtime::ota_transport::OtaSession`.
 
 ### Adding a Real Sensor
 
@@ -295,25 +327,92 @@ let i2c = I2c::new(peripherals.I2C0, /* config */)
 
 ## Flash NV Storage
 
-Both sensor examples persist Zigbee network state to the last two 4 KB sectors
-of the external flash (addresses `0x3FE000`-`0x3FFFFF`, 8 KB total).
-`boards/esp32-zigbee-devkit` owns this partition and wraps the official
-`esp_storage::FlashStorage` implementation of the standard
-`embedded-storage` NOR traits.
+Both sensor examples persist Zigbee network state to the last two 4 KB
+sectors of the physical flash chip (addresses `0x3FE000`-`0x3FFFFF`, 8 KB
+total) — the same addresses used before any partition table existed, so
+introducing one on the C6 build does not move already-joined network state.
 
-The bounded board flash is wrapped in `LogStructuredNv<ApplicationFlash>`, a
-log-structured format that appends writes and only erases during compaction.
-The example never sees physical flash addresses or raw controller calls.
+`boards/esp32-zigbee-devkit` (the board crate) exposes only
+`esp32_zigbee_devkit::flash::RawFlash`, whole-chip access wrapping the
+official `esp_storage::FlashStorage` implementation of the standard
+`embedded-storage` NOR traits — no partition, NV, or OTA policy, and no
+dependency on `zigbee-runtime`.
 
-On boot, the device checks for saved network state and automatically rejoins
-the previous network. If the coordinator sends a NWK Leave command, the device
-erases NV storage and starts fresh commissioning.
+`products/esp32-zigbee-devkit` (the `esp32-zigbee-devkit-product` crate)
+bounds that raw flash to the reserved 8 KiB window and constructs
+`zigbee_runtime::security_journal::SecurityStateJournal`, a crash-safe
+two-sector journal: every commissioning/rejoin commit reserves a bounded block
+of NWK frame-counter values up front, so a power loss between reservation and
+use can never replay a previously used counter. This replaces the flat
+`LogStructuredNv`-based item store the product used before the product/board
+split (`ZigbeeDevice::save_state`/`restore_state`, documented as "not
+suitable for production secured restore").
+
+### One-time legacy migration
+
+Because the journal reuses the *same* two sectors the legacy `LogStructuredNv`
+item store occupied, a device already joined under the old firmware boots
+facing legacy records where the journal expects its own. `open_security_store`
+(in `products/esp32-zigbee-devkit`, called from each example's composition
+root) runs a one-time, crash-safe migration before the store is handed to the
+node:
+
+* It prefers any already-committed journal, so reboots after the first
+  migration — and after an interrupted one — are idempotent.
+* Otherwise it reads the legacy NWK identity, network key and *live* frame
+  counter, and commits a **commissioned** journal record: the device keeps its
+  PAN, short address, network key and key sequence and resumes on its existing
+  network instead of being treated as factory-new. Both counter floors (the
+  NWK/global range and the range a unique TCLK would later use) sit strictly
+  above the legacy counter — plus the legacy safety margin and a fresh
+  reservation block — so no counter can be reused across the format switch.
+* The migrated record is committed into the *scratch* (erased) sector first, so
+  the authoritative legacy page is never erased before the new record is
+  durable — a power loss leaves either the intact legacy record (retried next
+  boot) or a valid journal (preferred), never a silent factory-new wipe.
+* A flash read fault or an unparseable-but-present legacy region is surfaced as
+  an error (the boot halts) rather than being mistaken for a factory-new
+  device.
+
+The legacy format never persisted a unique Trust Center Link Key. The legacy
+runtime could negotiate one, but after reboot its restore path only recovered
+the well-known *default global* TC link key, whose outgoing counter space is
+the NWK frame counter (`Apsde::next_default_tc_link_key_frame_counter`). Every
+unique-TCLK APS frame was also carried by a NWK-secured frame, so the migrated
+NWK counter floor conservatively bounds either counter space. The migrated
+record represents the recoverable post-reboot state explicitly with
+`PersistentSecurityState::legacy_default_tclk`: commissioned, `tclk_present`
+false, no APS key installed and no Trust Center address or key invented. The
+runtime accepts that state on restore and keeps using the default global key
+from the durable NWK counter space; as soon as the Trust Center delivers a
+unique key, the reservation continues above the migrated floor and the marker
+is cleared.
+
+If a legacy record cannot describe a commissioned network — no persisted IEEE
+address (NWK security nonces need it), or values the new format rejects — the
+migration reports `MigratedCounters` instead: the counter floors are still
+carried over and the device re-pairs once. It never fabricates the missing
+identity, and never silently reuses counters.
+
+The migration was exercised on an ESP32-H2 revision 1.2 on 2026-07-26. The
+pre-flash `0x3FE000..0x3FFFFF` dump contained the legacy `0xA55A` item records.
+After flashing without erasing NV, the product wrote committed `ZBSS`/`CMIT`
+journal records into the other sector, restored PAN `0xDFE9`, short address
+`0x44CB`, channel 15 and parent `0x1F0F`, and resumed with secured NWK counters
+above the legacy value. A subsequent reset reported `JournalPresent`, sent
+Device Announce, completed the ZHA interview, updated sensor entities, and
+answered Identify commands. The original legacy sector was still intact.
+
+On boot, `ZigbeeNode::start_or_resume` checks for saved network state and, if
+present, performs a secure silent rejoin instead of full commissioning. If the
+coordinator sends a NWK Leave command, the device erases the security-state
+journal and starts fresh commissioning.
 
 ## Partition Table
 
 OTA needs two application slots, so the devkits are flashed with an explicit
 ESP-IDF partition table, checked in at
-`boards/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv`:
+`products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv`:
 
 | Partition | Type / SubType | Offset | Size |
 |-----------|----------------|--------|------|
@@ -331,7 +430,7 @@ Notes:
   Adding the table does not move a single byte of joined-network state.
 * `0xB000`-`0x10000` is intentionally unmapped (ESP-IDF would put `nvs` and
   `phy_init` there; this firmware uses neither).
-* `esp32-zigbee-devkit::layout` mirrors these addresses, asserts the invariants
+* `esp32_zigbee_devkit_product::layout` mirrors these addresses, asserts the invariants
   at compile time and parses the CSV in a unit test, so the constants and the
   table cannot drift apart.
 * The OTA writer validates the four on-device partition entries before it
@@ -344,7 +443,7 @@ Notes:
 Build the 3072-byte binary that goes at `0x8000` with:
 
 ```bash
-boards/esp32-zigbee-devkit/partitions/build-partition-table.sh
+products/esp32-zigbee-devkit/partitions/build-partition-table.sh
 ```
 
 The script uses `espflash partition-table --to-binary`, checks the size and
@@ -358,7 +457,7 @@ converts the result back to CSV to confirm the round trip.
 
 ### How it works
 
-`esp32-zigbee-devkit::ota::EspFirmwareWriter` implements the runtime's
+`esp32_zigbee_devkit_product::ota::EspFirmwareWriter` implements the runtime's
 `FirmwareWriter` trait:
 
 1. **Slot selection** — `otadata` is read to find the running slot; the *other*
@@ -434,7 +533,7 @@ These steps **write flash** and are not performed by `cargo build`:
    ```bash
    cd examples/esp32c6-sensor
    espflash flash \
-     --partition-table ../../boards/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv \
+     --partition-table ../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv \
      --target-app-partition ota_0 \
      --erase-parts otadata \
      --monitor target/riscv32imac-unknown-none-elf/release/esp32c6-sensor

@@ -376,8 +376,9 @@ The following hardware has been tested end-to-end with **Home Assistant + ZHA**:
 
 | Board | Coordinator | Status | Notes |
 |-------|-------------|--------|-------|
-| **nRF52840-DK** (PCA10056) | ZHA (via zigpy) | ✅ Fully verified | Flash NV, Identify LED blink, BME280/SHT31 optional |
-| **ESP32-C6-DevKitC-1** | ZHA (via zigpy) | ✅ Fully verified | Shows as "Zigbee-RS ESP32-C6-Sensor" with Temperature, Humidity, Battery entities. Flash NV at 0x3FE000. |
+| **nRF52840-DK** (PCA10056) | ZHA (via zigpy) | ✅ Prior baseline verified | Flash NV, Identify LED blink, BME280/SHT31 optional; current product/profile refactor awaits hardware revalidation |
+| **ESP32-C6-DevKitC-1** | ZHA (via zigpy) | ✅ Prior baseline verified | Temperature, Humidity, Battery and flash NV proven; current product/profile refactor and real OTA upgrade await hardware validation |
+| **ESP32-H2-DevKitM-1** | ZHA (via zigpy) | ✅ Current refactor verified | Legacy NV migrated atomically to the security journal; reset/resume, reporting, TSENS, interview, and Identify verified on hardware. OTA absent. |
 | **TLSR8258** | Home Assistant ZHA / Ember | ✅ End-device path verified | Join, TCLK exchange, interview, reporting, reset resume, and crash-safe counter persistence |
 | **EFR32MG1P TRÅDFRI** | Home Assistant ZHA / Ember | ✅ End-device path verified | Pure-Rust radio, SHT3x reporting, crash-safe journal rollover, reset resume, and secure rejoin |
 
@@ -393,7 +394,7 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
 - **EFR32MG21** still uses an unverified pure-Rust radio initialization path and needs independent hardware validation.
 - **Test coverage** is basic — the mock examples exercise more than the test crate
 - **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal
-- **OTA** — full upgrade flow implemented (OTA cluster + OtaManager + FirmwareWriter trait) with EFR32MG1 (Gecko Bootloader) and ESP32-C6/H2 (`ota_0`/`ota_1` + `otadata`) writers; neither has been exercised on real hardware yet. nRF52840 and BL702 have no writer.
+- **OTA** — the transport/session flow is shared in `zigbee-runtime`; EFR32MG1 has a Gecko Bootloader writer and ESP32-C6 has a checked dual-slot (`ota_0`/`ota_1` + `otadata`) writer. Real version-upgrade/reboot validation remains pending. ESP32-H2, nRF52840, and BL702 have no writer.
 
 ## Documentation
 
