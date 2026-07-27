@@ -21,8 +21,8 @@ embassy-time = { version = "0.5" }
 embassy-time-driver = "0.2"
 
 # RISC-V support
-riscv = { version = "0.12", features = ["critical-section-single-hart"] }
-riscv-rt = "0.13"
+riscv = { version = "0.15", features = ["critical-section-single-hart"] }
+riscv-rt = "0.16"
 
 # Logging
 log = "0.4"
