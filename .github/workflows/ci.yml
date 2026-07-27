@@ -261,20 +261,33 @@ jobs:
             examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.bin
 
   build-bl702:
-    name: Check BL702 scaffold
+    name: Build BL702 sensor
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          targets: riscv32imac-unknown-none-elf
+          targets: riscv32imc-unknown-none-elf
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: examples/bl702-sensor
       - name: Build BL702 sensor (release)
         working-directory: examples/bl702-sensor
-        run: cargo build --release --features stubs -Z build-std=core,alloc
+        run: cargo build --release
+      - name: Install Bouffalo image tool
+        run: python3 -m pip install --disable-pip-version-check bflb-mcu-tool==1.10.0
+      - name: Create firmware artifacts
+        working-directory: examples/bl702-sensor
+        run: ./build-image.sh
+      - name: Upload BL702 sensor
+        uses: actions/upload-artifact@v4
+        with:
+          name: bl702-sensor-firmware
+          path: |
+            examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor
+            examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.bin
+            examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.flash.bin
 
   # ── CC2340 (TI, ARM Cortex-M0+) ────────────────────────────
   build-cc2340:
@@ -421,7 +434,7 @@ jobs:
   # ESP web flasher and latest firmware binaries.
   deploy-site:
     name: Deploy Site
-    needs: [check, test, clippy, fmt, build-esp32c6, build-esp32h2]
+    needs: [check, test, clippy, fmt, build-esp32c6, build-esp32h2, build-bl702]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     environment:

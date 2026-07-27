@@ -1,49 +1,98 @@
-# BL702 Zigbee Scaffold
+# BL702 Pure-Rust Zigbee Sensor
 
-This crate is a compile-only experiment around Bouffalo's binary BL702 radio
-libraries. It is not a pure-Rust radio backend and is not hardware-proven.
+This firmware runs a Zigbee temperature, humidity, and battery end device on
+an XT-ZB1 without linking `liblmac154.a`, `libbl702_rf.a`, or another Bouffalo
+radio archive.
 
-## SDK Audit Result
+The direct-register Rust path has been validated on real hardware:
 
-- `liblmac154.a` contains the IEEE 802.15.4 MAC/PHY implementation.
-- `libbl702_rf.a` contains RF initialization and calibration.
-- The vendor Zigbee stack is also binary-only, although zigbee-rs does not
-  need it.
-- The archives retain symbols and DWARF. Static analysis recovered the M154
-  register paths plus the RF reset, live-calibration, channel, RX, CCA, and
-  TX-power algorithms needed for an independent implementation.
-- Startup, CLIC dispatch, boot headers, and image packaging are not yet proven
-  by this crate.
+- cold-start ACAL, KCAL, ROSCAL, and RCCAL;
+- channel selection, CCA/energy detect, RX, and TX;
+- network steering and association on channel 15;
+- sleepy-device indirect polling and Transport-Key reception;
+- ZHA Node/Simple descriptor interview;
+- Configure Reporting for Power Configuration, Temperature, and Humidity;
+- unique Trust Center link-key exchange;
+- live entities and attribute reports in Home Assistant.
 
-A pure-Rust port is technically feasible, but it is not implemented or
-hardware-proven yet. Cold boot must run live ACAL, KCAL, ROSCAL, and RCCAL;
-a generic precomputed calibration snapshot is not a safe replacement.
+The application currently publishes synthetic values (22.50 C, 50% RH, and
+3.0 V). BL702 I2C and ADC drivers are not implemented yet.
 
-The vendor Zigbee linker exposes 112 KiB at `0x42014000..0x42030000`, but
-reserves `0x42028000..0x420283ff`. This scaffold places data/heap in the lower
-80 KiB and the stack in the upper 31 KiB instead of treating the window as one
-flat allocation.
-
-## Compile-Only Check
+## Build
 
 ```bash
 cd examples/bl702-sensor
-cargo build --release --features stubs
+rustup component add rust-src llvm-tools-preview
+python3 -m pip install bflb-mcu-tool==1.10.0 pyserial
+./build-image.sh
 ```
 
-The `stubs` feature supplies no-op radio symbols. The resulting ELF checks Rust
-integration only and must not be flashed.
+The local Cargo configuration builds for `riscv32imc-unknown-none-elf`. BL702
+must not use `riscv32imac`: RV32A atomic instructions trap on the tested
+XT-ZB1.
 
-## Vendor ABI Experiment
+The script creates:
 
-The vendor archives use `rv32imfc/ilp32f`. Any future hybrid build must use:
+- `target/riscv32imc-unknown-none-elf/release/bl702-sensor`
+- `target/riscv32imc-unknown-none-elf/release/bl702-sensor.bin`
+- `target/riscv32imc-unknown-none-elf/release/bl702-sensor.flash.bin`
+
+The raw payload is about 194 KiB. The generated flash image contains the
+official 176-byte BL702 boot header, payload hash and CRC, a 32 MHz XTAL clock
+configuration, and the application at flash offset `0x2000`.
+
+## Flash and monitor
+
+Connect the CH340 USB-serial port, hold BOOT/GPIO28, and run:
 
 ```bash
-BL_IOT_SDK_DIR=/path/to/bl_iot_sdk \
-  cargo build --release --target riscv32imafc-unknown-none-elf
+./flash.sh
 ```
 
-Stripping the ELF float-ABI flag is invalid because it changes metadata, not
-the calling convention. The current runtime/startup, interrupt dispatch,
-missing vendor dependencies, and boot image format still need dedicated
-bring-up before this path can produce firmware.
+The script auto-detects VID:PID `1A86:7523`, resets the board through RTS,
+programs and verifies the raw image, and requires the tool to print
+`[All Successful]`.
+
+Release BOOT, open permit-join on the coordinator, then run:
+
+```bash
+./monitor.sh
+```
+
+`monitor.sh` resets through RTS and opens UART0 on GPIO14/GPIO15 at 2 Mbaud.
+The firmware scans channel 15 and retries joining every 15 seconds.
+
+Expected commissioning milestones include:
+
+```text
+[BDB:Steering] Joining PAN ... ch 15
+[NWK] Joined PAN ... as ...
+[BDB:Steering] NWK key received from TC!
+stack joined: short=..., PAN=..., channel=15
+[BDB:Steering] Commissioning security complete
+commissioning complete: success=true
+```
+
+## Current peripheral support
+
+There is no general BL702 HAL crate yet. The example currently owns only:
+
+- UART0 TX and GPIO14/GPIO15 pinmux;
+- a free-running 1 MHz timer used by Embassy and radio deadlines;
+- factory chip-ID reads from the boot-ROM-loaded eFuse shadow.
+
+I2C, SPI, ADC, general GPIO ownership, flash/NV storage, hardware RNG, and
+retention sleep are not exposed through a Rust HAL. A real BME280/SHT3x and
+battery build therefore needs a `bl702-hal` crate with `embedded-hal` I2C and
+digital traits, an ADC API, and `embedded-storage` flash support.
+
+## Known limitations
+
+- Network and security state are not persisted yet; a reset requires a fresh
+  permit-join commissioning.
+- The sensor values are synthetic until I2C and ADC support is added.
+- M154 operation and the Embassy executor are polling-only; the firmware does
+  not enter low-power retention sleep.
+- Hardware address filtering and hardware auto-ACK are disabled.
+- RF output power and spectral behavior still need lab measurement before a
+  production or regulatory-compliance build.

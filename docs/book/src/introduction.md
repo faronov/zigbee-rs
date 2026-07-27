@@ -62,7 +62,7 @@ The MAC layer provides **11 supported chip targets**:
 | ESP32-H2 | `riscv32imac-unknown-none-elf` | Native 802.15.4 via `esp-ieee802154` |
 | nRF52840 | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
 | nRF52833 | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
-| BL702 | `riscv32imac-unknown-none-elf` | Vendor `lmac154` FFI |
+| BL702 | `riscv32imc-unknown-none-elf` | Pure-Rust direct-register radio; XT-ZB1 join, ZHA interview, and reporting hardware-tested |
 | CC2340 | `thumbv6m-none-eabi` | Rust LRFD host driver + official TI radio microcode; hardware validation pending |
 | TLSR8258 | `tc32-unknown-none-elf` | **Pure Rust** TLSR8258 radio and MAC |
 | PHY6222 | `thumbv6m-none-eabi` | **Pure Rust** — zero vendor blobs! |
@@ -82,7 +82,8 @@ successfully in CI.
 - ZCL cluster creation and typed attribute read/write
 - Device builder with templates for common sensor profiles
 - MockMac for host-side development and testing
-- ESP32-C6/H2, nRF52840/52833, and BL702 firmware that compiles and flashes
+- ESP32-C6/H2 and nRF52840/52833 firmware that compiles and flashes
+- A pure-Rust BL702 XT-ZB1 sensor with hardware-tested RF, joining, ZHA interview, Trust Center security, and reporting
 - AES-CCM* encryption (via RustCrypto, `no_std`)
 
 **In development:**

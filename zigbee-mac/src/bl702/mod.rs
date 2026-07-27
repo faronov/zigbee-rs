@@ -1,45 +1,50 @@
 //! BL702 MAC backend.
 //!
-//! Experimental `MacDriver` scaffold for the Bouffalo Lab BL702 RISC-V SoC.
+//! Experimental backends for the Bouffalo Lab BL702 RISC-V SoC.
 //!
-//! This backend uses binary-only Bouffalo `lmac154` and RF libraries through
-//! FFI. It is compile-tested with no-op stubs but is not hardware-proven and
-//! is not a pure-Rust radio implementation.
+//! [`radio_phy::Bl702RadioPhy`] is a direct-register Rust implementation of
+//! digital PHY reset, per-die RF calibration, CCA, TX, RX, and energy detect.
+//! It is intended to run through the shared `SoftMacCore`.
+//!
+//! [`Bl702Mac`] and [`driver::Bl702Driver`] retain the earlier binary-library
+//! FFI path for comparison.
 //!
 //! # Architecture
 //! ```text
 //! MacDriver trait methods
 //!        │
 //!        ▼
-//! Bl702Mac (this module)
-//!   ├── PIB state (addresses, channel, config)
-//!   ├── Frame construction (beacon req, assoc req, data)
-//!   └── Bl702Driver (driver.rs)
-//!          ├── FFI → liblmac154.a (Bouffalo C library)
-//!          ├── TX via Signal (interrupt-driven)
-//!          └── RX via Signal (interrupt-driven)
+//! Bl702RadioPhy (radio_phy.rs)
+//!   ├── pure-Rust RF reset + calibration
+//!   ├── direct M154 polling TX/RX/CCA
+//!   └── SoftMacCore<Bl702RadioPhy>
+//!
+//! Legacy: Bl702Mac → Bl702Driver → liblmac154.a
 //! ```
 //!
 //! # Dependencies
-//! - `liblmac154.a` — Bouffalo's pre-compiled 802.15.4 MAC/PHY library (linked via FFI)
-//! - platform startup, clocks, CLIC dispatch, and image packaging supplied by
-//!   the firmware crate
+//! - the Rust radio path needs no vendor archive
+//! - platform startup, clocks, and image packaging are supplied by the
+//!   firmware crate
 //! - Embassy async primitives (`embassy-sync`, `embassy-time`, `embassy-futures`)
 //!
 //! # Hardware
 //! - BL702 module boards (XT-ZB1, DT-BL10, Pine64 Pinenut)
 //! - BL706 IoT Development Board (Sipeed)
 //!
-//! # Build requirements
-//! The firmware crate must link `liblmac154.a` from Bouffalo's IoT SDK.
-//! See `driver.rs` module documentation for details.
+//! The Rust path is hardware-tested on an XT-ZB1 using
+//! `riscv32imc-unknown-none-elf`. Cold-start calibration, energy detect, RX,
+//! and TX have been observed on channel 15.
 
 pub mod driver;
+pub mod radio_phy;
+mod registers;
+mod rf;
 
 use crate::pib::{PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use crate::{MacCapabilities, MacDriver, MacError, PlatformServices};
-use driver::{Bl702Driver, RadioConfig, RadioError};
+use driver::{Bl702Driver, RadioConfig};
 use zigbee_types::*;
 
 use embassy_futures::select;
@@ -51,7 +56,7 @@ use embassy_time::{Instant, Timer};
 /// signals. This path is experimental and not hardware-proven.
 ///
 /// # Usage
-/// ```rust,no_run
+/// ```ignore
 /// use zigbee_mac::bl702::Bl702Mac;
 ///
 /// // After initializing BL702 clocks and enabling radio peripheral:

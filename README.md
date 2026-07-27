@@ -5,7 +5,7 @@ A complete Zigbee PRO R22 protocol stack written in Rust, targeting embedded
 Embassy and other embedded async runtimes.
 
 ```text
-63,000+ lines of Rust · 199 source files · 30 crates · 45 ZCL clusters · 12 hardware platforms · 270 tests · 4 pure-Rust radios · NV storage on nRF + ESP32-C6
+63,000+ lines of Rust · 199 source files · 30 crates · 45 ZCL clusters · 12 hardware platforms · 270 tests · 5 pure-Rust radios · NV storage on nRF + ESP32-C6
 ```
 
 ## Architecture
@@ -128,15 +128,16 @@ cargo build --release
 
 ```bash
 cd examples/bl702-sensor
-
-# Compile-only scaffold check:
-cargo build --release --features stubs
+python3 -m pip install bflb-mcu-tool==1.10.0 pyserial
+./build-image.sh
 ```
 
-The resulting ELF contains no radio implementation and is not flashable
-firmware. The SDK provides the 802.15.4 MAC/PHY and RF calibration only as
-binary archives, so the current backend is neither pure Rust nor
-hardware-proven.
+This builds a pure-Rust XT-ZB1 sleepy Zigbee sensor with live
+ACAL/KCAL/ROSCAL/RCCAL, polling RX/TX, CCA, and energy detection. No Bouffalo
+archive is linked. Direct RF operation, joining, ZHA interview, Trust Center
+link-key exchange, and attribute reporting are hardware-tested. Temperature,
+humidity, and battery values remain synthetic until BL702 I2C and ADC drivers
+are added.
 
 ### CC2340 firmware
 
@@ -201,21 +202,17 @@ cargo build --release   # no stubs, no GSDK, no RAIL library needed!
 Some experimental backends depend on vendor radio libraries. A successful
 stub build proves only that the Rust side compiles.
 
-#### BL702 — Bouffalo `lmac154` + `bl702_rf`
+#### BL702 — direct Rust radio + retained legacy FFI
 
-The BL702 SDK contains two pre-compiled radio libraries:
+The direct backend reconstructs the BL702 digital PHY, analog calibration,
+channel synthesizer, M154 FIFO, CCA, RX, and TX register paths in Rust. The
+XT-ZB1 sensor builds for `riscv32imc-unknown-none-elf` and links no vendor
+code. The RV32A instructions emitted by `riscv32imac` trap on the tested
+BL702.
 
-```text
-liblmac154.a
-libbl702_rf.a
-```
-
-They use the `ilp32f` hard-float ABI, so an ABI-correct experiment must use
-`riscv32imafc-unknown-none-elf`. Do not strip the ELF float-ABI flag: that
-changes metadata, not calling conventions. Symbols and DWARF were sufficient
-to recover the M154 and live RF-calibration paths, so a pure-Rust port is
-feasible. The implementation, startup, CLIC dispatch, boot-header packaging,
-and hardware behavior remain unproven.
+The old `Bl702Mac` FFI backend remains side-by-side for comparison with
+Bouffalo's `liblmac154.a` and `libbl702_rf.a`. Those archives use the
+`ilp32f` ABI and are not used by the Rust sensor.
 
 #### CC2340 — TI SimpleLink Low Power F3 SDK
 
@@ -249,14 +246,14 @@ The TLSR8258 radio driver uses pure-Rust register access — no `libdrivers_8258
 | **ESP32-H2** | ✅ esp-ieee802154 | `riscv32imac-unknown-none-elf` | Native 802.15.4 radio |
 | **nRF52840** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
 | **nRF52833** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
-| **BL702** | ⚠️ Compile-only FFI scaffold | `riscv32imac` stubs / `riscv32imafc` vendor ABI | Binary-only radio/RF libraries; no hardware proof or flashable CI artifact |
+| **BL702** | 🦀 Pure-Rust direct registers | `riscv32imc-unknown-none-elf` | XT-ZB1 RF, join, ZHA interview, security, and reporting hardware-tested |
 | **CC2340** | 🦀 Rust host + TI microcode | `thumbv6m-none-eabi` | Raw polling TX/RX implemented; hardware validation, CCA, IRQs, filtering, and auto-ACK pending |
 | **Telink TLSR8258** | 🦀 **Pure Rust** | `tc32-unknown-none-elf` | Real tc32 builds in the dedicated [modern-tc32](https://github.com/modern-tc32) CI workflow |
 | **PHY6222** | 🦀 **Pure Rust** | `thumbv6m-none-eabi` | Zero vendor blobs — direct register access! |
 | **EFR32MG1** | 🦀 **Pure Rust** | `thumbv7em-none-eabi` | Series 1, Cortex-M4F — hardware-proven direct register access |
 | **EFR32MG21** | 🦀 **Pure Rust** | `thumbv8m.main-none-eabihf` | Series 2, Cortex-M33 — independent `efr32s2` module |
 
-> **Legend:** ✅ = functional radio driver · ⚡ = compile-only scaffold · 🦀 = Rust host driver. CC2340 still embeds official TI radio microcode as data.
+> **Legend:** ✅ = functional radio driver · ⚡ = compile-only scaffold · 🦀 = Rust host driver. BL702 is hardware-tested on XT-ZB1; CC2340 still embeds official TI radio microcode as data.
 
 All 12 supported firmware targets build in CI and produce downloadable artifacts.
 
@@ -288,7 +285,7 @@ Occupancy, Electrical, Carbon Dioxide, PM2.5, Soil Moisture
 - **`async` MacDriver trait** — 13 methods, no `Send`/`Sync` requirement
 - **Platform-agnostic** — same stack code runs on mock, ESP32, nRF, BL702, CC2340, Telink, PHY6222, EFR32
 - **Power-aware** — two-phase polling (fast/slow), DC-DC, TX power reduction, radio sleep, CPU suspend, system sleep, flash deep power-down, GPIO preparation, reportable change thresholds
-- **Four pure-Rust radios** — PHY6222, TLSR8258, EFR32MG1, and EFR32MG21 need zero vendor blobs
+- **Five pure-Rust radios** — BL702, PHY6222, TLSR8258, EFR32MG1, and EFR32MG21 need zero vendor blobs
 - **Router support** — full relay, RREQ rebroadcast, Link Status, indirect queue, source routing
 - **Manual frame parsing** — no `serde`, bitfield encode/decode for all frame types
 - **Embassy-compatible** — designed for single-threaded async executors
@@ -306,7 +303,7 @@ zigbee-rs/
 │       ├── mock/              # Full mock for host testing
 │       ├── esp/               # ESP32-C6/H2 (esp-ieee802154)
 │       ├── nrf/               # nRF52840/52833 (radio peripheral)
-│       ├── bl702/             # BL702 (lmac154 FFI)
+│       ├── bl702/             # BL702 direct Rust radio + legacy FFI
 │       ├── cc2340/            # CC2340 Rust host driver + TI radio microcode
 │       ├── telink/            # TLSR8258 pure-Rust backend
 │       ├── phy6222/           # PHY6222 (pure Rust radio driver!)
@@ -338,7 +335,7 @@ zigbee-rs/
 │   ├── nrf52840-sensor-uf2/   # nice!nano / ProMicro (UF2 drag-drop, simple demo)
 │   ├── nrf52833-sensor/       # nRF52833-DK (probe-rs)
 │   ├── nrf52840-router/       # nRF52840 Zigbee router (relay, permit join, Link Status)
-│   ├── bl702-sensor/          # BL702 (requires vendor libs from Bouffalo SDK)
+│   ├── bl702-sensor/          # XT-ZB1 pure-Rust Zigbee sensor
 │   ├── cc2340-sensor/         # TI CC2340R5 (SDK-backed compile, hardware pending)
 │   ├── telink-tlsr8258-sensor/# Telink TLSR8258 polling end-device sensor
 │   ├── telink-tlsr8258-router/# Telink TLSR8258 join/relay router

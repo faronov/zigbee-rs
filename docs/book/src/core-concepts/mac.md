@@ -142,7 +142,7 @@ backend is behind a Cargo feature flag:
 |---------|-------------|---------|-------|
 | **ESP32** | `esp32c6`, `esp32h2` | ESP32-C6, ESP32-H2 | Espressif IEEE 802.15.4 radio, `esp-ieee802154` HAL |
 | **nRF** | `nrf52840`, `nrf52833` | nRF52840, nRF52833 | Nordic 802.15.4 radio, `embassy-nrf` peripherals |
-| **BL702** | `bl702` | BL702, BL706 | Bouffalo Lab 802.15.4 radio |
+| **BL702** | `bl702` | BL702, BL706 | Direct Rust `RadioPhy`; XT-ZB1 join and ZHA reporting hardware-tested |
 | **CC2340** | `cc2340` | CC2340R5 | TI SimpleLink, Cortex-M0+ with 802.15.4 |
 | **Telink TLSR8258** | `tlsr8258` | TLSR8258 | Pure-Rust TLSR8258 radio and MAC; `telink` remains a compatibility alias |
 | **PHY6222** | `phy6222` | PHY6222 | Phyplus BLE+802.15.4 combo SoC |

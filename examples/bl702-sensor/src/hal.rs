@@ -1,146 +1,132 @@
-//! BL702 HAL function implementations needed by `liblmac154.a` and `libbl702_rf.a`.
-//!
-//! These provide the minimal hardware abstraction that the vendor radio
-//! libraries depend on. They are always linked (not gated behind `stubs`),
-//! because even with real vendor radio code we still replace the BL702
-//! HOSAL/StdDriver C libraries with lightweight Rust implementations.
+//! Minimal XT-ZB1 peripherals used by the Zigbee sensor.
 
-#![allow(non_snake_case)]
+use core::hint::spin_loop;
 
-use core::ptr;
+const SYSTEM_CLOCK_HZ: u32 = 32_000_000;
 
-// ── BL702 register constants ────────────────────────────────────
+const GLB_BASE: u32 = 0x4000_0000;
+const HBN_BASE: u32 = 0x4000_f000;
+const EF_DATA_BASE: u32 = 0x4000_7000;
+const UART0_BASE: u32 = 0x4000_a000;
+const TIMER_BASE: u32 = 0x4000_a500;
 
-/// Machine cycle counter CSR (RISC-V standard)
-#[allow(dead_code)]
-const MCYCLE: u32 = 0xB00;
+const GLB_CLK_CFG2: u32 = GLB_BASE + 0x008;
+const GLB_UART_SIG_SEL: u32 = GLB_BASE + 0x0c0;
+const GLB_GPIO_14_15_CFG: u32 = GLB_BASE + 0x11c;
+const GLB_GPIO_OUTPUT_ENABLE: u32 = GLB_BASE + 0x190;
+const HBN_GLOBAL: u32 = HBN_BASE + 0x030;
+const EF_WIFI_MAC_LOW: u32 = EF_DATA_BASE + 0x014;
+const EF_WIFI_MAC_HIGH: u32 = EF_DATA_BASE + 0x018;
 
-/// BL702 system clock (default 32 MHz from RC32M)
-const SYS_CLOCK_HZ: u32 = 32_000_000;
+const UART_TX_CONFIG: u32 = UART0_BASE;
+const UART_RX_CONFIG: u32 = UART0_BASE + 0x004;
+const UART_BIT_PERIOD: u32 = UART0_BASE + 0x008;
+const UART_FIFO_CONFIG_0: u32 = UART0_BASE + 0x080;
+const UART_FIFO_CONFIG_1: u32 = UART0_BASE + 0x084;
+const UART_FIFO_WRITE: u32 = UART0_BASE + 0x088;
 
-// CLIC / interrupt controller base
-const CLIC_BASE: usize = 0x0200_0000;
-const CLIC_INT_EN_OFFSET: usize = 0x400; // per-interrupt enable, 1 byte each
+const TIMER_CLOCK_CONFIG: u32 = TIMER_BASE;
+const TIMER_COMPARE_0: u32 = TIMER_BASE + 0x010;
+const TIMER_COMPARE_1: u32 = TIMER_BASE + 0x014;
+const TIMER_COMPARE_2: u32 = TIMER_BASE + 0x018;
+const TIMER_COUNTER: u32 = TIMER_BASE + 0x02c;
+const TIMER_INTERRUPT_ENABLE: u32 = TIMER_BASE + 0x044;
+const TIMER_PRELOAD_CONTROL: u32 = TIMER_BASE + 0x05c;
+const TIMER_INTERRUPT_CLEAR: u32 = TIMER_BASE + 0x078;
+const TIMER_ENABLE: u32 = TIMER_BASE + 0x084;
+const TIMER_COUNT_MODE: u32 = TIMER_BASE + 0x088;
+const TIMER_CLOCK_DIVIDER: u32 = TIMER_BASE + 0x0bc;
 
-// ── Delay functions ─────────────────────────────────────────────
+pub fn init() {
+    init_uart();
+    init_timer();
+}
 
-/// Read the RISC-V mcycle CSR (cycle counter).
+pub fn delay_us(duration_us: u32) {
+    let target_cycles = duration_us.saturating_mul(SYSTEM_CLOCK_HZ / 1_000_000);
+    let started = cycle_count();
+    while cycle_count().wrapping_sub(started) < target_cycles {
+        spin_loop();
+    }
+}
+
+pub fn timer_ticks() -> u32 {
+    read32(TIMER_COUNTER)
+}
+
+/// Read the eight-byte factory chip identifier loaded from eFuse by the boot ROM.
+pub fn chip_id() -> [u8; 8] {
+    let low = read32(EF_WIFI_MAC_LOW).to_le_bytes();
+    let high = read32(EF_WIFI_MAC_HIGH).to_le_bytes();
+    [
+        low[0], low[1], low[2], low[3], high[0], high[1], high[2], high[3],
+    ]
+}
+
+pub fn uart_write(byte: u8) {
+    while read32(UART_FIFO_CONFIG_1) & 0xff == 0 {
+        spin_loop();
+    }
+    write32(UART_FIFO_WRITE, u32::from(byte));
+}
+
+fn init_uart() {
+    // UART0 clock: 32 MHz FCLK, divider 1.
+    rmw(GLB_CLK_CFG2, 1 << 4, 0);
+    rmw(GLB_CLK_CFG2, 0x7, 0);
+    rmw(HBN_GLOBAL, 1 << 2, 0);
+    rmw(GLB_CLK_CFG2, 1 << 4, 1 << 4);
+
+    // XT-ZB1 UART0: TX GPIO14, RX GPIO15.
+    rmw(GLB_GPIO_OUTPUT_ENABLE, (1 << 14) | (1 << 15), 0);
+    write32(GLB_GPIO_14_15_CFG, 0x0717_0717);
+    rmw(GLB_UART_SIG_SEL, 0xff00_0000, 0x3200_0000);
+
+    write32(UART_TX_CONFIG, 0);
+    write32(UART_RX_CONFIG, 0);
+    write32(UART_BIT_PERIOD, 0x000f_000f);
+    write32(UART_FIFO_CONFIG_0, 0x0c);
+    write32(UART_FIFO_CONFIG_0, 0);
+    write32(UART_FIFO_CONFIG_1, 0x0f0f_0000);
+    write32(UART_TX_CONFIG, 0x0000_0f05);
+    write32(UART_RX_CONFIG, 0x0000_0701);
+}
+
+fn init_timer() {
+    // TIMER_CH0: 32 MHz FCLK / 32 = 1 MHz, free-running.
+    rmw(TIMER_ENABLE, 1 << 1, 0);
+    rmw(TIMER_CLOCK_CONFIG, 0x3 << 2, 0);
+    rmw(TIMER_CLOCK_DIVIDER, 0xff << 8, 31 << 8);
+    rmw(TIMER_COUNT_MODE, 1 << 1, 1 << 1);
+    write32(TIMER_PRELOAD_CONTROL, 0);
+    write32(TIMER_COMPARE_0, u32::MAX - 2);
+    write32(TIMER_COMPARE_1, u32::MAX - 2);
+    write32(TIMER_COMPARE_2, u32::MAX - 2);
+    write32(TIMER_INTERRUPT_ENABLE, 0);
+    write32(TIMER_INTERRUPT_CLEAR, 0x7);
+    rmw(TIMER_ENABLE, 1 << 1, 1 << 1);
+}
+
 #[inline(always)]
-fn read_mcycle() -> u32 {
-    let val: u32;
+fn cycle_count() -> u32 {
+    let value: u32;
     unsafe {
-        core::arch::asm!("csrr {}, 0xB00", out(reg) val);
+        core::arch::asm!("csrr {}, mcycle", out(reg) value);
     }
-    val
+    value
 }
 
-/// Busy-wait delay in microseconds.
-#[unsafe(no_mangle)]
-pub extern "C" fn BL702_Delay_US(cnt: u32) {
-    let cycles_per_us = SYS_CLOCK_HZ / 1_000_000;
-    let target_cycles = cnt.saturating_mul(cycles_per_us);
-    let start = read_mcycle();
-    while read_mcycle().wrapping_sub(start) < target_cycles {
-        core::hint::spin_loop();
-    }
+#[inline(always)]
+fn read32(address: u32) -> u32 {
+    unsafe { core::ptr::read_volatile(address as *const u32) }
 }
 
-/// Busy-wait delay in milliseconds.
-#[unsafe(no_mangle)]
-pub extern "C" fn BL702_Delay_MS(cnt: u32) {
-    for _ in 0..cnt {
-        BL702_Delay_US(1000);
-    }
+#[inline(always)]
+fn write32(address: u32, value: u32) {
+    unsafe { core::ptr::write_volatile(address as *mut u32, value) }
 }
 
-// ── IRQ management ──────────────────────────────────────────────
-// Minimal interrupt handler table. The BL702 uses a CLIC-style
-// interrupt controller.  We store handler pointers that the radio
-// library registers and enable the corresponding CLIC interrupt.
-
-const MAX_IRQS: usize = 80; // BL702 has ~64 IRQs, pad a bit
-static mut IRQ_HANDLERS: [Option<unsafe extern "C" fn()>; MAX_IRQS] =
-    [None; MAX_IRQS];
-
-/// Register an interrupt handler.
-#[unsafe(no_mangle)]
-pub extern "C" fn bl_irq_register(irqnum: i32, handler: Option<unsafe extern "C" fn()>) {
-    let idx = irqnum as usize;
-    if idx < MAX_IRQS {
-        unsafe {
-            IRQ_HANDLERS[idx] = handler;
-        }
-        // Enable interrupt in CLIC
-        let en_addr = (CLIC_BASE + CLIC_INT_EN_OFFSET + idx) as *mut u8;
-        unsafe { ptr::write_volatile(en_addr, 1) };
-    }
-}
-
-/// Unregister an interrupt handler.
-#[unsafe(no_mangle)]
-pub extern "C" fn bl_irq_unregister(irqnum: i32, _handler: Option<unsafe extern "C" fn()>) {
-    let idx = irqnum as usize;
-    if idx < MAX_IRQS {
-        // Disable interrupt in CLIC
-        let en_addr = (CLIC_BASE + CLIC_INT_EN_OFFSET + idx) as *mut u8;
-        unsafe { ptr::write_volatile(en_addr, 0) };
-        unsafe {
-            IRQ_HANDLERS[idx] = None;
-        }
-    }
-}
-
-/// Get the currently registered handler for an IRQ.
-#[unsafe(no_mangle)]
-pub extern "C" fn bl_irq_handler_get(
-    irqnum: i32,
-    handler: *mut Option<unsafe extern "C" fn()>,
-) {
-    let idx = irqnum as usize;
-    if idx < MAX_IRQS && !handler.is_null() {
-        unsafe {
-            ptr::write(handler, IRQ_HANDLERS[idx]);
-        }
-    }
-}
-
-// ── GPIO ────────────────────────────────────────────────────────
-
-/// GLB_GPIO_Func_Init — configures GPIO pin function muxing.
-/// The radio libraries call this during init. We provide a minimal
-/// implementation that sets the GPIO function for each pin in the list.
-#[unsafe(no_mangle)]
-pub extern "C" fn GLB_GPIO_Func_Init(
-    _gpio_fun: u32,
-    _pin_list: *const u8,
-    _cnt: u8,
-) -> u32 {
-    // The radio uses default GPIO mappings for the internal antenna
-    // path, which are set by hardware reset. Return SUCCESS (0).
-    0
-}
-
-// ── Memory utilities ────────────────────────────────────────────
-
-/// Word-aligned 32-bit memcpy (copies `n` bytes, but both src/dst
-/// are assumed word-aligned and `n` is a multiple of 4).
-#[unsafe(no_mangle)]
-pub extern "C" fn arch_memcpy4(
-    dst: *mut u32,
-    src: *const u32,
-    n: u32,
-) -> *mut u32 {
-    let words = n as usize / 4;
-    for i in 0..words {
-        unsafe {
-            ptr::write_volatile(dst.add(i), ptr::read_volatile(src.add(i)));
-        }
-    }
-    dst
-}
-
-/// Standard abs — may be needed by vendor math.
-#[unsafe(no_mangle)]
-pub extern "C" fn abs(x: i32) -> i32 {
-    if x < 0 { -x } else { x }
+#[inline(always)]
+fn rmw(address: u32, mask: u32, value: u32) {
+    write32(address, (read32(address) & !mask) | (value & mask));
 }

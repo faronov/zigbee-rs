@@ -1,8 +1,8 @@
 [build]
-target = "riscv32imac-unknown-none-elf"
+target = "riscv32imc-unknown-none-elf"
 
 [unstable]
-build-std = ["core", "alloc"]
+build-std = ["core"]
 
 [env]
 DEFMT_LOG = "info"

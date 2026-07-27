@@ -1,11 +1,11 @@
-/* BL702 memory layout for the compile-only Rust scaffold. */
+/* BL702 memory layout for the XT-ZB1 pure-Rust radio probe. */
 MEMORY
 {
   FLASH : ORIGIN = 0x23000000, LENGTH = 512K
-  /* Match the vendor Zigbee linker: 80 KiB below the RF/shared reservation,
-     a reserved 1 KiB at 0x42028000, then 31 KiB above it. */
+  /* Keep the initial stack below the BL702 reset-time embedded-memory window.
+     The probe conservatively leaves the top 16 KiB unused. */
   RAM1  : ORIGIN = 0x42014000, LENGTH = 80K
-  RAM2  : ORIGIN = 0x42028400, LENGTH = 31K
+  RAM2  : ORIGIN = 0x42028400, LENGTH = 15K
 }
 
 REGION_ALIAS("REGION_TEXT", FLASH);

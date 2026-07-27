@@ -1,391 +1,386 @@
-//! # BL702 Zigbee Temperature Sensor
-//!
-//! Experimental `no_std` BL702 application scaffold.
-//!
-//! ## Hardware
-//! - BL702 module (XT-ZB1, DT-BL10, Pine64 Pinenut, or BL706 devboard)
-//! - Built-in IEEE 802.15.4 + BLE 5.0 radio
-//! - Boot button (GPIO8 on most modules): join/leave network
-//!
-//! ## Radio driver
-//! The radio backend is not pure Rust. It depends on Bouffalo's binary-only
-//! `liblmac154.a` and `libbl702_rf.a`, and hardware operation has not been
-//! proven. The `stubs` feature is compile-only and produces no usable radio.
-//!
-//! ## Building
-//! ```bash
-//! cd examples/bl702-sensor
-//! cargo build --release --features stubs
-//! ```
-//!
-//! ## Embassy Time Driver
-//! Since there is no `embassy-bl702` HAL yet, this example provides a
-//! minimal Embassy time driver using the BL702 TIMER_CH0 (32-bit
-//! match-compare timer) running at 1 MHz (FCLK/32 prescaler from 32 MHz).
+//! Pure-Rust BL702 Zigbee temperature, humidity, and battery sensor.
 
 #![no_std]
 #![no_main]
 
-#[cfg(feature = "stubs")]
-mod stubs;
-
-// Always include HAL implementations for vendor library dependencies
-// (delay, IRQ, GPIO, memcpy). These are needed even with real vendor libs.
 mod hal;
 
-use panic_halt as _;
+use core::fmt::{Display, Formatter, Write};
 
+use embassy_executor::{Executor, Spawner};
+use embassy_time::{Duration, Instant, Timer};
+use embassy_time_driver::Driver;
+use panic_halt as _;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
-use zigbee_mac::bl702::Bl702Mac;
+use zigbee_mac::{MacPib, SoftMacCore, bl702::radio_phy::Bl702RadioPhy};
 use zigbee_nwk::DeviceType;
-use zigbee_runtime::event_loop::StackEvent;
+use zigbee_runtime::event_loop::{StackEvent, TickResult};
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
+use zigbee_types::{ChannelMask, IeeeAddress};
 use zigbee_zcl::clusters::basic::PowerSource;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 use zigbee_zcl::{ClusterId, DeviceId};
 
-use embassy_executor::Spawner;
-use embassy_time::{Duration, Instant, Timer};
+const CHANNEL: u8 = 15;
+const CHANNEL_MASK: ChannelMask = ChannelMask(1 << CHANNEL);
+const TX_POWER_DBM: i8 = 0;
+const LOOP_INTERVAL_MS: u64 = 250;
+const JOIN_RETRY_INTERVAL_SECS: u32 = 15;
+const REPORT_INTERVAL_SECS: u32 = 30;
+const DEVICE_ENDPOINT: u8 = 1;
 
-const REPORT_INTERVAL_SECS: u64 = 30;
-const FAST_POLL_MS: u64 = 250;
-const SLOW_POLL_SECS: u64 = 10;
-const FAST_POLL_DURATION_SECS: u64 = 120;
-const EXPECTED_REPORT_CLUSTERS: usize = 3;
-
-// ── Minimal Embassy time driver using BL702 TIMER_CH0 ──────────
 mod time_driver {
-    use embassy_time_driver::Driver;
-    use portable_atomic::{AtomicU64, Ordering};
+    use super::*;
 
-    struct Bl702TimeDriver {
-        alarm_at: AtomicU64,
-    }
-
-    // BL702 TIMER registers (TIMER_CH0)
-    const TIMER_BASE: usize = 0x4000_A500;
-    const TCCR: *mut u32 = (TIMER_BASE + 0x00) as *mut u32; // Timer Clock Config
-    const TMSR_0: *mut u32 = (TIMER_BASE + 0x28) as *mut u32; // Match Status
-    const TCR_0: *mut u32 = (TIMER_BASE + 0x2C) as *mut u32; // Counter
-    const TMR_0: *mut u32 = (TIMER_BASE + 0x10) as *mut u32; // Match Register
-    const TIER_0: *mut u32 = (TIMER_BASE + 0x44) as *mut u32; // Interrupt Enable
-    const TICR_0: *mut u32 = (TIMER_BASE + 0x48) as *mut u32; // Interrupt Clear
-    const TCER: *mut u32 = (TIMER_BASE + 0x30) as *mut u32; // Counter Enable
-
-    /// Initialize TIMER_CH0 as a free-running 1 MHz counter.
-    pub fn init() {
-        unsafe {
-            // Prescaler: FCLK(32 MHz) / 32 = 1 MHz tick
-            core::ptr::write_volatile(TCCR, 0x1F); // div=32, FCLK source
-            // Match at max value (free-running)
-            core::ptr::write_volatile(TMR_0, 0xFFFF_FFFF);
-            // Clear any pending interrupt
-            core::ptr::write_volatile(TICR_0, 0x07);
-            // Enable match0 interrupt
-            core::ptr::write_volatile(TIER_0, 0x01);
-            // Enable counter
-            core::ptr::write_volatile(TCER, 0x01);
-        }
-    }
-
-    fn now_ticks() -> u64 {
-        unsafe { core::ptr::read_volatile(TCR_0) as u64 }
-    }
+    struct Bl702TimeDriver;
 
     impl Driver for Bl702TimeDriver {
         fn now(&self) -> u64 {
-            now_ticks()
+            u64::from(hal::timer_ticks())
         }
 
-        fn schedule_wake(&self, at: u64, _waker: &core::task::Waker) {
-            self.alarm_at.store(at, Ordering::Release);
-            unsafe {
-                core::ptr::write_volatile(TMR_0, at as u32);
-                // Clear + re-enable
-                core::ptr::write_volatile(TICR_0, 0x01);
-                core::ptr::write_volatile(TIER_0, 0x01);
-            }
+        fn schedule_wake(&self, _at: u64, waker: &core::task::Waker) {
+            // The initial BL702 port uses a polling executor. The independent
+            // 1 MHz timer still provides accurate radio and stack deadlines.
+            waker.wake_by_ref();
         }
     }
 
-    embassy_time_driver::time_driver_impl!(static DRIVER: Bl702TimeDriver = Bl702TimeDriver {
-        alarm_at: AtomicU64::new(u64::MAX),
-    });
+    embassy_time_driver::time_driver_impl!(
+        static DRIVER: Bl702TimeDriver = Bl702TimeDriver
+    );
 }
 
-// ── BL702 GPIO helper for button ───────────────────────────────
-mod gpio {
-    const GLB_BASE: usize = 0x4000_0000;
+struct UartWriter;
 
-    /// Read GPIO input value (0 or 1).
-    pub fn read_input(pin: u8) -> bool {
-        let reg = (GLB_BASE + 0x180) as *const u32;
-        let val = unsafe { core::ptr::read_volatile(reg) };
-        (val >> pin) & 1 != 0
-    }
-
-    /// Configure a GPIO pin as input with pull-up.
-    pub fn configure_input_pullup(pin: u8) {
-        // GPIO config registers are at GLB_BASE + 0x100 + (pin * 4)
-        let reg = (GLB_BASE + 0x100 + (pin as usize) * 4) as *mut u32;
-        unsafe {
-            // Bits: [0] input_en=1, [1] output_en=0, [4] pullup=1
-            core::ptr::write_volatile(reg, 0x11);
+impl Write for UartWriter {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        for byte in text.bytes() {
+            hal::uart_write(byte);
         }
+        Ok(())
     }
 }
 
-// ── UART logger for debug output ───────────────────────────────
-mod uart_log {
-    use core::fmt::Write;
+struct Logger;
 
-    const UART_BASE: usize = 0x4000_A000;
-    const UART_FIFO_WDATA: *mut u32 = (UART_BASE + 0x88) as *mut u32;
-    const UART_FIFO_STATUS: *const u32 = (UART_BASE + 0x84) as *const u32;
-
-    struct UartWriter;
-
-    impl Write for UartWriter {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            for b in s.bytes() {
-                write_byte(b);
-            }
-            Ok(())
-        }
+impl log::Log for Logger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
     }
 
-    pub struct Bl702Logger;
-
-    impl log::Log for Bl702Logger {
-        fn enabled(&self, _metadata: &log::Metadata) -> bool {
-            true
-        }
-
-        fn log(&self, record: &log::Record) {
-            if self.enabled(record.metadata()) {
-                let mut w = UartWriter;
-                let _ = write!(w, "[{}] {}\r\n", record.level(), record.args());
-            }
-        }
-
-        fn flush(&self) {}
+    fn log(&self, record: &log::Record) {
+        let mut uart = UartWriter;
+        let _ = writeln!(uart, "[{}] {}\r", record.level(), record.args());
     }
 
-    fn write_byte(b: u8) {
-        unsafe {
-            // Wait for TX FIFO not full
-            for _ in 0..10000u32 {
-                let status = core::ptr::read_volatile(UART_FIFO_STATUS);
-                if (status >> 8) & 0x3F < 32 {
-                    break;
-                }
-            }
-            core::ptr::write_volatile(UART_FIFO_WDATA, b as u32);
+    fn flush(&self) {}
+}
+
+static LOGGER: Logger = Logger;
+
+struct Hex<'a>(&'a [u8]);
+
+impl Display for Hex<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> core::fmt::Result {
+        for byte in self.0.iter().rev() {
+            write!(formatter, "{byte:02x}")?;
         }
-    }
-
-    static LOGGER: Bl702Logger = Bl702Logger;
-
-    pub fn init() {
-        let _ = log::set_logger(&LOGGER);
-        log::set_max_level(log::LevelFilter::Info);
+        Ok(())
     }
 }
 
-// ── Entry point ────────────────────────────────────────────────
-#[embassy_executor::main]
-async fn main(_spawner: Spawner) {
-    // Initialize BL702 peripherals
-    time_driver::init();
-    uart_log::init();
+#[riscv_rt::entry]
+fn main() -> ! {
+    hal::init();
+    for byte in b"BL702 boot\r\n" {
+        hal::uart_write(*byte);
+    }
 
-    log::info!("BL702 Zigbee sensor starting");
+    // BL702 is single-hart and has no RV32A extension. Interrupts are still
+    // disabled here, so the non-atomic logger setup is the correct startup path.
+    unsafe {
+        log::set_logger_racy(&LOGGER).unwrap();
+        log::set_max_level_racy(log::LevelFilter::Info);
+    }
+    marker(b"logger ready\r\n");
 
-    // Configure button (GPIO8 on most BL702 modules, active low)
-    const BUTTON_PIN: u8 = 8;
-    gpio::configure_input_pullup(BUTTON_PIN);
-    let mut button_was_pressed = false;
+    let mut executor = Executor::new();
+    let executor: &'static mut Executor = unsafe { core::mem::transmute(&mut executor) };
+    marker(b"executor ready\r\n");
+    executor.run(|spawner| spawner.must_spawn(sensor(spawner)))
+}
 
-    // Create 802.15.4 MAC driver
-    let mac = Bl702Mac::new();
+#[embassy_executor::task]
+async fn sensor(_spawner: Spawner) {
+    marker(b"sensor task\r\n");
+    log::info!("zigbee-rs BL702 pure-Rust sensor");
 
-    log::info!("Radio ready");
+    let ieee = device_ieee_address();
+    log::info!("IEEE address: {}", Hex(&ieee));
+    log::info!("initializing RF and running per-die calibration");
 
-    let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
-    let mut hum_cluster = HumidityCluster::new(0, 10000);
-    let mut power_cluster = PowerConfigCluster::new();
+    let mut radio = match unsafe { Bl702RadioPhy::initialize(hal::delay_us) } {
+        Ok(radio) => radio,
+        Err(error) => fatal("RF initialization", error),
+    };
+    if let Err(error) = zigbee_mac::RadioPhy::set_tx_power(&mut radio, TX_POWER_DBM) {
+        fatal("TX power setup", error);
+    }
 
-    // Build Zigbee device (SED architecture)
+    let pib = MacPib::new(ieee, ieee[0], ieee[1]);
+    let mac = match SoftMacCore::new(radio, pib) {
+        Ok(mac) => mac,
+        Err(error) => {
+            log::error!("MAC initialization failed: {error:?}");
+            halt()
+        }
+    };
+    log::info!("radio ready: channel scan={CHANNEL}, tx_power={TX_POWER_DBM} dBm");
+
+    let mut temperature = TemperatureCluster::new(-4000, 12500);
+    let mut humidity = HumidityCluster::new(0, 10000);
+    let mut power = PowerConfigCluster::new();
+    update_synthetic_readings(0, &mut temperature, &mut humidity, &mut power);
+
     let mut device = ZigbeeDevice::builder(mac)
         .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: 10_000,
             wake_duration_ms: 500,
         })
-        .manufacturer("Zigbee-RS")
-        .model("BL702-Sensor")
+        .automatic_polling(false)
+        .manufacturer("zigbee-rs")
+        .model("XT-ZB1 Sensor")
         .date_code("20260402")
         .sw_build("0.1.0")
         .power_source(PowerSource::Battery)
-        .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, DeviceId::TEMPERATURE_SENSOR, |ep| {
-            ep.cluster_server(ClusterId::BASIC)
-                .cluster_server(ClusterId::IDENTIFY)
-                .cluster_server(ClusterId::POWER_CONFIG)
-                .cluster_server(ClusterId::TEMPERATURE)
-                .cluster_server(ClusterId::HUMIDITY)
-        })
+        .channels(CHANNEL_MASK)
+        .endpoint(
+            DEVICE_ENDPOINT,
+            PROFILE_HOME_AUTOMATION,
+            DeviceId::TEMPERATURE_SENSOR,
+            |endpoint| {
+                endpoint
+                    .cluster_server(ClusterId::BASIC)
+                    .cluster_server(ClusterId::IDENTIFY)
+                    .cluster_server(ClusterId::POWER_CONFIG)
+                    .cluster_server(ClusterId::TEMPERATURE)
+                    .cluster_server(ClusterId::HUMIDITY)
+            },
+        )
         .build();
 
-    // Auto-join on boot
-    log::info!("Auto-joining network…");
-    device.user_action(UserAction::Join);
-    let mut clusters = [
-        ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-    ];
-    let _ = device.tick(0, &mut clusters).await;
+    log::info!("sensor endpoint ready; requesting network join");
+    request_join(&mut device, &mut temperature, &mut humidity, &mut power).await;
 
-    // Set initial sensor values
-    temp_cluster.set_temperature(2250);
-    hum_cluster.set_humidity(5000u16);
-    power_cluster.set_battery_voltage(30);
-    power_cluster.set_battery_percentage(200);
-
-    let mut last_report = Instant::now();
-    let mut fast_poll_until = if device.is_joined() {
-        Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS)
-    } else {
-        Instant::now()
-    };
-    let mut annce_retries_left: u8 = if device.is_joined() { 5 } else { 0 };
-    let mut last_annce = Instant::now();
-    let mut interview_done = false;
-    let mut hum_tick: u32 = 0;
-    let mut last_rejoin_attempt = Instant::now();
+    let mut quarter_seconds = 0u32;
+    let mut joined_quarter_seconds = 0u32;
+    let mut report_sequence = 0u32;
+    let mut announce_retries = 0u8;
+    let mut last_announce = Instant::now();
 
     loop {
-        let now = Instant::now();
-        let in_fast_poll = now < fast_poll_until;
-        let poll_ms = if in_fast_poll { FAST_POLL_MS } else { SLOW_POLL_SECS * 1000 };
+        Timer::after(Duration::from_millis(LOOP_INTERVAL_MS)).await;
+        quarter_seconds = quarter_seconds.wrapping_add(1);
 
-        // ── Button handling (edge detection) ─────────────────
-        let pressed = !gpio::read_input(BUTTON_PIN); // Active low
-        if pressed && !button_was_pressed {
-            if device.is_joined() {
-                log::info!("Button → leaving network");
-            } else {
-                log::info!("Button → joining network");
-            }
-            device.user_action(UserAction::Toggle);
-            Timer::after(Duration::from_millis(300)).await; // debounce
-        }
-        button_was_pressed = pressed;
-
-        Timer::after(Duration::from_millis(poll_ms)).await;
-
-        if device.is_joined() {
-            // Poll parent for indirect frames
-            for _poll_round in 0..4u8 {
-                match device.poll().await {
-                    Ok(Some(ind)) => {
-                        let mut cls = [
-                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                        ];
-                        if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
-                            if matches!(&ev, StackEvent::RejoinRequested) {
-                                log::info!("Secure rejoin requested");
-                                if device.secure_rejoin().await.is_ok() {
-                                    fast_poll_until = Instant::now()
-                                        + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                    interview_done = false;
-                                } else {
-                                    log::warn!("Secure rejoin failed");
-                                }
-                                break;
-                            }
-                            if matches!(ev, StackEvent::Joined { .. }) {
-                                fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                            }
-                        }
-                        if !interview_done && device.configured_cluster_count(1) >= EXPECTED_REPORT_CLUSTERS {
-                            interview_done = true;
-                            fast_poll_until = Instant::now() + Duration::from_secs(5);
-                            log::info!("Interview done — ending fast poll");
-                        }
-                        let mut cls2 = [
-                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                        ];
-                        let _ = device.tick(0, &mut cls2).await;
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
-            }
-
-            // Periodic sensor update
-            let now2 = Instant::now();
-            let elapsed_s = now2.duration_since(last_report).as_secs();
-            if elapsed_s >= REPORT_INTERVAL_SECS {
-                last_report = now2;
-                hum_tick = hum_tick.wrapping_add(1);
-                let temp: i16 = 2250 + ((hum_tick % 50) as i16 - 25);
-                let hum: u16 = 5000 + ((hum_tick % 100) as u16) * 10;
-                temp_cluster.set_temperature(temp);
-                hum_cluster.set_humidity(hum);
-                log::info!(
-                    "T={}.{:02}°C H={}.{:02}%",
-                    temp / 100,
-                    (temp % 100).unsigned_abs(),
-                    hum / 100,
-                    hum % 100,
-                );
-            }
-
-            // Tick runtime
-            let tick_elapsed = elapsed_s.min(60) as u16;
-            let mut clusters = [
-                ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-            ];
-            let _ = device.tick(tick_elapsed, &mut clusters).await;
-
-            // Device_annce retry (5×, 8s apart)
-            if annce_retries_left > 0 && now2.duration_since(last_annce).as_secs() >= 8 {
-                annce_retries_left -= 1;
-                last_annce = now2;
-                let _ = device.send_device_annce().await;
-                log::info!("Device_annce retry ({} left)", annce_retries_left);
-            }
-        } else {
-            // Not joined — auto-retry every 15s
-            let now2 = Instant::now();
-            if now2.duration_since(last_rejoin_attempt).as_secs() >= 15 {
-                last_rejoin_attempt = Instant::now();
-                device.user_action(UserAction::Join);
-                let mut cls = [
-                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ];
-                let _ = device.tick(0, &mut cls).await;
+        if !device.is_joined() {
+            if quarter_seconds >= JOIN_RETRY_INTERVAL_SECS * 4 {
+                quarter_seconds = 0;
+                request_join(&mut device, &mut temperature, &mut humidity, &mut power).await;
                 if device.is_joined() {
-                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                    annce_retries_left = 5;
-                    last_annce = Instant::now();
-                    interview_done = false;
-                    log::info!("Joined!");
+                    joined_quarter_seconds = 0;
+                    announce_retries = 5;
+                    last_announce = Instant::now();
                 }
             }
+            continue;
         }
+
+        joined_quarter_seconds = joined_quarter_seconds.wrapping_add(1);
+        poll_parent(&mut device, &mut temperature, &mut humidity, &mut power).await;
+
+        let elapsed_secs = if quarter_seconds.is_multiple_of(4) {
+            1
+        } else {
+            0
+        };
+        let result = {
+            let mut clusters = cluster_refs(&mut temperature, &mut humidity, &mut power);
+            device.tick(elapsed_secs, &mut clusters).await
+        };
+        log_tick_result(&result);
+
+        if announce_retries > 0 && last_announce.elapsed() >= Duration::from_secs(8) {
+            announce_retries -= 1;
+            last_announce = Instant::now();
+            if let Err(error) = device.send_device_annce().await {
+                log::warn!("Device_annce retry failed: {error:?}");
+            } else {
+                log::info!("Device_annce retry sent ({announce_retries} left)");
+            }
+        }
+
+        if joined_quarter_seconds >= REPORT_INTERVAL_SECS * 4 {
+            joined_quarter_seconds = 0;
+            report_sequence = report_sequence.wrapping_add(1);
+            update_synthetic_readings(report_sequence, &mut temperature, &mut humidity, &mut power);
+        }
+    }
+}
+
+async fn request_join<M: zigbee_mac::MacDriver>(
+    device: &mut ZigbeeDevice<M>,
+    temperature: &mut TemperatureCluster,
+    humidity: &mut HumidityCluster,
+    power: &mut PowerConfigCluster,
+) {
+    device.user_action(UserAction::Join);
+    let result = {
+        let mut clusters = cluster_refs(temperature, humidity, power);
+        device.tick(0, &mut clusters).await
+    };
+    log_tick_result(&result);
+
+    if device.is_joined() {
+        log::info!(
+            "joined: short=0x{:04x}, PAN=0x{:04x}, channel={}",
+            device.short_address(),
+            device.pan_id(),
+            device.channel()
+        );
+    } else {
+        log::warn!(
+            "join failed; retry in {JOIN_RETRY_INTERVAL_SECS}s: {:?}",
+            device.steering_diagnostics()
+        );
+    }
+}
+
+async fn poll_parent<M: zigbee_mac::MacDriver>(
+    device: &mut ZigbeeDevice<M>,
+    temperature: &mut TemperatureCluster,
+    humidity: &mut HumidityCluster,
+    power: &mut PowerConfigCluster,
+) {
+    for _ in 0..4 {
+        match device.poll().await {
+            Ok(Some(indication)) => {
+                let event = {
+                    let mut clusters = cluster_refs(temperature, humidity, power);
+                    device.process_incoming(&indication, &mut clusters).await
+                };
+                if let Some(event) = event {
+                    log_stack_event(&event);
+                }
+
+                let result = {
+                    let mut clusters = cluster_refs(temperature, humidity, power);
+                    device.tick(0, &mut clusters).await
+                };
+                log_tick_result(&result);
+            }
+            Ok(None) => break,
+            Err(error) => {
+                log::warn!("parent poll failed: {error:?}");
+                break;
+            }
+        }
+    }
+}
+
+fn cluster_refs<'a>(
+    temperature: &'a mut TemperatureCluster,
+    humidity: &'a mut HumidityCluster,
+    power: &'a mut PowerConfigCluster,
+) -> [ClusterRef<'a>; 3] {
+    [
+        ClusterRef {
+            endpoint: DEVICE_ENDPOINT,
+            cluster: temperature,
+        },
+        ClusterRef {
+            endpoint: DEVICE_ENDPOINT,
+            cluster: humidity,
+        },
+        ClusterRef {
+            endpoint: DEVICE_ENDPOINT,
+            cluster: power,
+        },
+    ]
+}
+
+fn update_synthetic_readings(
+    sequence: u32,
+    temperature: &mut TemperatureCluster,
+    humidity: &mut HumidityCluster,
+    power: &mut PowerConfigCluster,
+) {
+    let temp = 2250 + (sequence % 20) as i16;
+    let hum = 5000 + ((sequence * 7) % 100) as u16;
+    temperature.set_temperature(temp);
+    humidity.set_humidity(hum);
+    power.set_battery_voltage(30);
+    power.set_battery_percentage(200);
+    log::info!(
+        "sensor values (synthetic): {}.{:02} C, {}.{:02}% RH, 3.0 V",
+        temp / 100,
+        temp.unsigned_abs() % 100,
+        hum / 100,
+        hum % 100
+    );
+}
+
+fn log_tick_result(result: &TickResult) {
+    if let TickResult::Event(event) = result {
+        log_stack_event(event);
+    }
+}
+
+fn log_stack_event(event: &StackEvent) {
+    match event {
+        StackEvent::Joined {
+            short_address,
+            channel,
+            pan_id,
+        } => log::info!(
+            "stack joined: short=0x{short_address:04x}, PAN=0x{pan_id:04x}, channel={channel}"
+        ),
+        StackEvent::CommissioningComplete { success } => {
+            log::info!("commissioning complete: success={success}")
+        }
+        StackEvent::ReportSent => log::info!("attribute report sent"),
+        StackEvent::Left => log::warn!("device left the network"),
+        other => log::info!("stack event: {other:?}"),
+    }
+}
+
+fn device_ieee_address() -> IeeeAddress {
+    let id = hal::chip_id();
+    if id == [0; 8] || id == [0xff; 8] {
+        // Stable locally administered address for boards without programmed ID.
+        [0x02, 0x70, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01]
+    } else {
+        id
+    }
+}
+
+fn fatal(context: &str, error: zigbee_mac::PhyError) -> ! {
+    log::error!("{context} failed: {error:?}");
+    halt()
+}
+
+fn halt() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn marker(text: &[u8]) {
+    for byte in text {
+        hal::uart_write(*byte);
     }
 }

@@ -162,7 +162,7 @@ actual sleep/wake is performed by the MAC backend:
 | PHY6222 | `radio_sleep()` + Embassy timer wait | AON system sleep not enabled |
 | EFR32MG1 | `radio_sleep()` — radio clock gating via CMU | — |
 | EFR32MG21 | `radio_sleep()` — radio clock gating via CMU | — |
-| BL702 | PDS (Power Down Sleep) | HBN (Hibernate) — wake via RTC |
+| BL702 | Polling only; PDS not implemented | HBN not implemented |
 
 The runtime event loop integrates the power manager like this (simplified):
 

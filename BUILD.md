@@ -27,7 +27,7 @@ rustup update nightly
 | **ESP32-C6** | `riscv32imac-unknown-none-elf` | `espflash` |
 | **ESP32-H2** | `riscv32imac-unknown-none-elf` | `espflash` |
 | **ESP32-C5** | `riscv32imac-unknown-none-elf` | `espflash` |
-| **BL702** | `riscv32imac-unknown-none-elf` | `blflash` (community) |
+| **BL702** | `riscv32imc-unknown-none-elf` | `bflb-mcu-tool` |
 
 #### nRF52840
 
@@ -50,25 +50,23 @@ No additional setup — uses the regular host target for development and testing
 #### BL702 (Bouffalo Lab)
 
 ```bash
-rustup target add riscv32imac-unknown-none-elf
-cargo install blflash                 # community flash tool for BL702
+rustup target add riscv32imc-unknown-none-elf
+rustup component add llvm-tools-preview
+python3 -m pip install bflb-mcu-tool==1.10.0 pyserial
 ```
 
-The BL702 backend uses FFI bindings to Bouffalo's `lmac154` C library for
-802.15.4 radio access. Your firmware crate must link `liblmac154.a` from
-the [BL IoT SDK](https://github.com/bouffalolab/bl_iot_sdk). Add to your
-`build.rs`:
+The XT-ZB1 sensor uses the direct-register Rust radio and links no Bouffalo
+archive. RF calibration, joining, ZHA interview, Trust Center link-key
+exchange, and attribute reporting are hardware-tested:
 
-```rust
-println!("cargo:rustc-link-search=path/to/bl_iot_sdk/components/network/lmac154/lib");
-println!("cargo:rustc-link-lib=static=lmac154");
+```bash
+cd examples/bl702-sensor
+./build-image.sh
 ```
 
-At startup, register the M154 interrupt handler after creating the MAC:
-```rust
-// bl_irq_register(M154_IRQn, lmac154_getInterruptHandler());
-// bl_irq_enable(M154_IRQn);
-```
+The script asks the official tool to retain the 32 MHz XTAL clock, then emits
+`bl702-sensor.bin` and the bootable `bl702-sensor.flash.bin`. The application
+currently reports synthetic sensor values and does not persist network state.
 
 ---
 
@@ -611,7 +609,7 @@ at the workspace root:
 [toolchain]
 channel = "nightly"
 components = ["rust-src", "clippy", "rustfmt"]
-targets = ["thumbv7em-none-eabihf", "riscv32imac-unknown-none-elf"]
+targets = ["thumbv7em-none-eabihf", "riscv32imac-unknown-none-elf", "riscv32imc-unknown-none-elf"]
 ```
 
 Typical CI steps:

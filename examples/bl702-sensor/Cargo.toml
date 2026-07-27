@@ -4,21 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["bl702"] }
-zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-types = { path = "../../zigbee-types" }
 zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
-
-# BL702 PAC (register-level access for clock/GPIO/timer init)
-bl702-pac = "0.0.3"
+zigbee-runtime = { path = "../../zigbee-runtime", features = ["constrained-memory"] }
 
 # Embassy async runtime (executor + time driver)
-embassy-executor = { version = "0.7", features = ["arch-riscv32", "executor-thread"] }
+embassy-executor = { version = "0.7", features = [
+    "arch-riscv32",
+    "executor-thread",
+    "task-arena-size-32768",
+] }
 embassy-time = { version = "0.5" }
 embassy-time-driver = "0.2"
-embassy-futures = "0.1"
 
 # RISC-V support
 riscv = { version = "0.12", features = ["critical-section-single-hart"] }
@@ -30,13 +30,7 @@ log = "0.4"
 # Panic handler for embedded target
 panic-halt = "1.0"
 
-# Portable-atomic for single-core RISC-V
-portable-atomic = { version = "1", features = ["unsafe-assume-single-core"] }
-
-[features]
-default = []
-stubs = []
-
 [profile.release]
 opt-level = "s"
 lto = true
+panic = "abort"

@@ -26,11 +26,9 @@ embassy-nrf52840 = { package = "embassy-nrf", version = "0.3", features = ["nrf5
 embassy-nrf52833 = { package = "embassy-nrf", version = "0.3", features = ["nrf52833"], optional = true }
 
 # ── BL702 backend ─────────────────────────────────────────────
-# Uses FFI to Bouffalo's lmac154 C library (liblmac154.a).
-# Firmware must link liblmac154.a from BL IoT SDK.
-# No Rust HAL dependency — bl702-hal pins embedded-hal 1.0.0-alpha.5
-# which conflicts with the modern ecosystem. Clock/GPIO init is done
-# via the C SDK or a future compatible HAL.
+# Provides an experimental direct-register Rust RadioPhy plus the legacy
+# Bouffalo lmac154 FFI backend for comparison during hardware bring-up.
+# No Rust HAL dependency is required by the radio implementation.
 
 # ── Telink TLSR82xx HAL backend ───────────────────────────────
 # Local-only: override via .cargo/config.toml [patch] or --manifest-path
