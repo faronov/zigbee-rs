@@ -33,7 +33,6 @@ exclude = [
     "examples/esp32h2-sensor",
     "examples/bl702-sensor",
     "examples/cc2340-sensor",
-    "examples/telink-b91-sensor",
     "examples/telink-tlsr8258-sensor",
     "examples/telink-tlsr8258-router",
     "tools/telink-tlsr8258-lab",

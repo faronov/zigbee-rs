@@ -1,100 +1,59 @@
 # CC2340R5 Zigbee Temperature Sensor
 
-A `no_std` Zigbee 3.0 end device firmware for the **TI CC2340R5** (ARM Cortex-M0+),
-reporting temperature and humidity via ZCL clusters 0x0402 and 0x0405.
+A `no_std` Zigbee end-device bring-up project for the TI CC2340R5 and
+LP-EM-CC2340R5.
+
+## Current status
+
+The radio host driver is Rust and does not link TI RCL, ZBOSS, FreeRTOS, or a
+C platform shim. The build imports TI's official IEEE PBE/MCE/RFE microcode,
+PHY settings, and board PA table as data.
+
+Raw polling TX/RX is implemented and the Cortex-M0+ firmware builds, but no
+CC2340 board has yet been tested on air. The full example is not hardware-ready
+because its Embassy time driver remains a compile stub and complete IOC/button
+configuration is pending.
 
 ## Hardware
 
-- **MCU:** CC2340R5 — ARM Cortex-M0+, 512KB Flash, 36KB SRAM
-- **Radio:** Built-in IEEE 802.15.4 + BLE 5.0
-- **Board:** TI LP-EM-CC2340R5 LaunchPad
-- **Buttons:** BTN1 (DIO13) = join/leave, BTN2 (DIO14) = identify
-- **LEDs:** LED1 (DIO7) = network status, LED2 (DIO6) = activity
+- MCU: CC2340R52, Cortex-M0+, 512 KB flash, 36 KB SRAM
+- Radio: 2.4 GHz IEEE 802.15.4 and Bluetooth LE
+- Board: LP-EM-CC2340R5
+- Target: `thumbv6m-none-eabi`
 
-## Prerequisites
-
-- Rust nightly with `thumbv6m-none-eabi` target
-- TI UniFlash or `openocd` for flashing
+## Build
 
 ```bash
 rustup target add thumbv6m-none-eabi
-```
 
-## Vendor Library Setup
-
-The CC2340R5 radio driver requires precompiled libraries from the
-**TI SimpleLink Low Power F3 SDK**.
-
-### Download the SDK
-
-Download from [TI's website](https://www.ti.com/tool/SIMPLELINK-LOWPOWER-F3-SDK)
-or install via TI's Resource Explorer.
-
-### Set the environment variable
-
-```bash
-export CC2340_SDK_DIR=/path/to/simplelink_lowpower_f3_sdk_8_xx_xx_xx
-```
-
-### Libraries linked by `build.rs`
-
-| Library                    | SDK Path                                              | Purpose                    |
-|----------------------------|-------------------------------------------------------|----------------------------|
-| `librcl_cc23x0r5.a`       | `source/ti/drivers/rcl/lib/ticlang/m0p/`              | Radio Control Layer        |
-| `libpbe_ieee_cc23x0r5.a`  | `source/ti/devices/cc23x0r5/rf_patches/lib/ticlang/m0p/` | PBE firmware patch     |
-| `libmce_ieee_cc23x0r5.a`  | same as above                                         | MCE firmware patch         |
-| `librfe_ieee_cc23x0r5.a`  | same as above                                         | RFE firmware patch         |
-
-The build script also checks for optional ZBOSS platform libraries at:
-`source/third_party/zigbee/libraries/cc2340r5/ticlang/`
-
-## Building
-
-### Stubs build (CI — no TI SDK required)
-
-```bash
+export CC2340_SDK_DIR=/path/to/simplelink-lowpower-f3-sdk
 cd examples/cc2340-sensor
-cargo build --release --features stubs
+cargo build --release
 ```
 
-The `stubs` feature provides no-op implementations of all FFI symbols.
+Without `CC2340_SDK_DIR`, the source still compiles, but radio initialization
+returns `FirmwareUnavailable`.
 
-### Real build (with TI SDK)
+## Imported SDK data
 
-```bash
-cd examples/cc2340-sensor
-CC2340_SDK_DIR=/path/to/simplelink_lowpower_f3_sdk cargo build --release
-```
+`zigbee-mac/build.rs` reads:
 
-## Flashing
+- `source/ti/devices/cc23x0r5/rf_patches/`
+- `source/ti/devices/cc23x0r5/inc/`
+- `source/ti/devices/radioconfig/.meta/config/rcl/`
+- `source/ti/devices/radioconfig/.meta/config/rcl_common/`
 
-Use TI UniFlash, `openocd`, or a J-Link debugger:
+No TI archive is linked.
 
-```bash
-# With openocd
-openocd -f board/ti_cc2340r5.cfg -c "program target/thumbv6m-none-eabi/release/cc2340-sensor verify reset exit"
+## Project structure
 
-# With probe-rs
-probe-rs run --chip CC2340R5 target/thumbv6m-none-eabi/release/cc2340-sensor
-```
-
-## What It Demonstrates
-
-- Zigbee 3.0 end device on CC2340R5 with Embassy async runtime
-- IEEE 802.15.4 radio via TI Radio Control Layer (RCL)
-- Button-driven network join/leave with edge detection
-- LED status indication (joined/not joined)
-- ZCL Temperature Measurement + Relative Humidity clusters
-
-## Project Structure
-
-```
+```text
 cc2340-sensor/
-├── .cargo/config.toml   # Target: thumbv6m-none-eabi, build-std
-├── Cargo.toml            # Dependencies, stubs feature flag
-├── build.rs              # TI SDK library linking via CC2340_SDK_DIR
-├── memory.x              # Flash @ 0x00000000, RAM @ 0x20000000
-└── src/
-    ├── main.rs           # Entry point, device setup, sensor loop
-    └── stubs.rs          # No-op FFI stubs for CI builds
+├── .cargo/config.toml   # thumbv6m-none-eabi
+├── Cargo.toml
+├── build.rs             # linker script only
+├── memory.x             # CC2340R52 36 KB SRAM layout
+└── src/main.rs          # device setup and simulated measurements
 ```
+
+Use TI UniFlash and the board's XDS110 probe for eventual hardware bring-up.

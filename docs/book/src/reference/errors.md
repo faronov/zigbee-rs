@@ -55,10 +55,20 @@ but not identical across platforms.
 
 | Variant | Meaning |
 |---------|---------|
-| `TxFailed` | Transmission failed (generic) |
+| `InvalidChannel` | Channel is outside IEEE 802.15.4 channels 11–26 |
+| `InvalidFrame` | Frame is empty or exceeds the 125-byte FCS-free limit |
+| `FirmwareUnavailable` | `CC2340_SDK_DIR` was not available at build time |
+| `RadioConfigUnavailable` | TI IEEE PHY configuration was not imported |
+| `FactoryTrimUnavailable` | Required per-die FCFG trim data is unavailable |
+| `SynthTimeout` | Synthesizer divider did not complete |
+| `RadioReadyTimeout` | PBE/MCE/RFE TOPsm startup did not complete |
 | `ChannelBusy` | CCA indicated a busy channel |
 | `NoAck` | No acknowledgement from the receiver |
-| `Timeout` | Operation timed out |
+| `RxTimeout` | Receive operation ended without a frame |
+| `FifoOverflow` | PBE reported an RX/TX FIFO error or insufficient space |
+| `MalformedFrame` | RX FIFO entry or metadata layout was invalid |
+| `OperationTimeout` | A PBE operation or hard stop did not complete in time |
+| `PbeError(code)` | PBE returned an unclassified `ENDCAUSE` value |
 | `HardwareError` | Radio hardware fault |
 
 #### BL702 backend
@@ -82,22 +92,6 @@ but not identical across platforms.
 | `InvalidFrame` | Frame too long or too short |
 | `CrcError` | Received frame failed CRC check |
 | `NotInitialized` | Radio not initialized |
-
-### `RclCommandStatus` (CC2340 only)
-
-**Crate:** `zigbee-mac` · **File:** `cc2340/driver.rs`
-
-Low-level Radio Control Layer status on the CC2340.
-
-| Variant | Code | Meaning |
-|---------|------|---------|
-| `Idle` | `0x0000` | Command is idle |
-| `Active` | `0x0001` | Command is currently executing |
-| `Finished` | `0x0101` | Command completed successfully |
-| `ChannelBusy` | `0x0801` | CCA failed — channel busy |
-| `NoAck` | `0x0802` | No acknowledgement received |
-| `RxErr` | `0x0803` | Receive error |
-| `Error` | `0x0F00` | Generic hardware error |
 
 ### `Lmac154TxStatus` (BL702 only)
 

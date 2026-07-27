@@ -289,9 +289,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: examples/cc2340-sensor
+      - name: Checkout pinned TI radio sources
+        run: |
+          SDK_DIR="$RUNNER_TEMP/simplelink-lowpower-f3-sdk"
+          git init "$SDK_DIR"
+          git -C "$SDK_DIR" remote add origin https://github.com/TexasInstruments/simplelink-lowpower-f3-sdk.git
+          git -C "$SDK_DIR" sparse-checkout init --cone
+          git -C "$SDK_DIR" sparse-checkout set source/ti/devices/cc23x0r5 source/ti/devices/radioconfig
+          git -C "$SDK_DIR" fetch --depth=1 --filter=blob:none origin 68ca021502383f367d0bf2a5517fdd0dcb0ef909
+          git -C "$SDK_DIR" checkout --detach FETCH_HEAD
       - name: Build CC2340 sensor (release)
         working-directory: examples/cc2340-sensor
-        run: cargo build --release --features stubs
+        env:
+          CC2340_SDK_DIR: ${{ runner.temp }}/simplelink-lowpower-f3-sdk
+        run: cargo build --release
       - name: Create firmware artifacts
         run: |
           ELF=examples/cc2340-sensor/target/thumbv6m-none-eabi/release/cc2340-sensor

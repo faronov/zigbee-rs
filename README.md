@@ -143,18 +143,16 @@ hardware-proven.
 ```bash
 cd examples/cc2340-sensor
 
-# CI mode (stubs):
-cargo build --release --features stubs
+# Compile-only fallback without radio assets:
+cargo build --release
 
-# Real radio (requires TI SDK — see "Vendor Libraries" below):
+# Embed TI radio microcode/configuration:
 CC2340_SDK_DIR=/path/to/simplelink_lowpower_f3_sdk cargo build --release
 ```
 
-### Telink B91
-
-The retained B91 example is an unsupported scaffold. There is currently no
-B91 `RadioPhy` or `MacDriver` backend, so it is intentionally excluded from
-the firmware build matrix.
+The CC2340 host driver is Rust and does not link RCL or ZBOSS. A build without
+`CC2340_SDK_DIR` compiles, but radio initialization returns
+`FirmwareUnavailable`.
 
 ### Telink TLSR8258 firmware (pure Rust — no vendor SDK!)
 
@@ -227,7 +225,10 @@ export CC2340_SDK_DIR=/path/to/simplelink_lowpower_f3_sdk
 cd examples/cc2340-sensor && cargo build --release
 ```
 
-The build script links: `librcl_cc23x0r5.a` (Radio Control Layer) and RF firmware patches.
+The build script does not link TI host libraries. It imports TI's official
+IEEE PBE/MCE/RFE microcode, PHY register configuration, and LP-EM-CC2340R5 PA
+table as build-time data. Rust code owns LRFD setup, FIFO access, and the
+radio operation state machine.
 
 #### Telink TLSR8258 — Pure Rust (no vendor library needed)
 
@@ -249,14 +250,13 @@ The TLSR8258 radio driver uses pure-Rust register access — no `libdrivers_8258
 | **nRF52840** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
 | **nRF52833** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
 | **BL702** | ⚠️ Compile-only FFI scaffold | `riscv32imac` stubs / `riscv32imafc` vendor ABI | Binary-only radio/RF libraries; no hardware proof or flashable CI artifact |
-| **CC2340** | ⚡ ZBOSS FFI | `thumbv6m-none-eabi` | TI SimpleLink SDK stubs (50+ RTOS deps) |
-| **Telink B91** | ❌ Not implemented | `riscv32imc-unknown-none-elf` | Unsupported scaffold; no `RadioPhy`/`MacDriver` backend |
+| **CC2340** | 🦀 Rust host + TI microcode | `thumbv6m-none-eabi` | Raw polling TX/RX implemented; hardware validation, CCA, IRQs, filtering, and auto-ACK pending |
 | **Telink TLSR8258** | 🦀 **Pure Rust** | `tc32-unknown-none-elf` | Real tc32 builds in the dedicated [modern-tc32](https://github.com/modern-tc32) CI workflow |
 | **PHY6222** | 🦀 **Pure Rust** | `thumbv6m-none-eabi` | Zero vendor blobs — direct register access! |
 | **EFR32MG1** | 🦀 **Pure Rust** | `thumbv7em-none-eabi` | Series 1, Cortex-M4F — hardware-proven direct register access |
 | **EFR32MG21** | 🦀 **Pure Rust** | `thumbv8m.main-none-eabihf` | Series 2, Cortex-M33 — independent `efr32s2` module |
 
-> **Legend:** ✅ = functional radio driver · ⚡ = compiles with stubs, needs vendor SDK for real RF · 🦀 = pure Rust (no FFI, no vendor blobs)
+> **Legend:** ✅ = functional radio driver · ⚡ = compile-only scaffold · 🦀 = Rust host driver. CC2340 still embeds official TI radio microcode as data.
 
 All 12 supported firmware targets build in CI and produce downloadable artifacts.
 
@@ -307,7 +307,7 @@ zigbee-rs/
 │       ├── esp/               # ESP32-C6/H2 (esp-ieee802154)
 │       ├── nrf/               # nRF52840/52833 (radio peripheral)
 │       ├── bl702/             # BL702 (lmac154 FFI)
-│       ├── cc2340/            # CC2340 (ZBOSS FFI stubs)
+│       ├── cc2340/            # CC2340 Rust host driver + TI radio microcode
 │       ├── telink/            # TLSR8258 pure-Rust backend
 │       ├── phy6222/           # PHY6222 (pure Rust radio driver!)
 │       ├── efr32/             # EFR32MG1 (pure Rust radio driver!)
@@ -339,8 +339,7 @@ zigbee-rs/
 │   ├── nrf52833-sensor/       # nRF52833-DK (probe-rs)
 │   ├── nrf52840-router/       # nRF52840 Zigbee router (relay, permit join, Link Status)
 │   ├── bl702-sensor/          # BL702 (requires vendor libs from Bouffalo SDK)
-│   ├── cc2340-sensor/         # TI CC2340R5 (stubs)
-│   ├── telink-b91-sensor/     # Unsupported B91 scaffold (no MAC backend)
+│   ├── cc2340-sensor/         # TI CC2340R5 (SDK-backed compile, hardware pending)
 │   ├── telink-tlsr8258-sensor/# Telink TLSR8258 polling end-device sensor
 │   ├── telink-tlsr8258-router/# Telink TLSR8258 join/relay router
 │   ├── phy6222-sensor/        # PHY6222 — pure Rust, no vendor SDK!
@@ -386,8 +385,9 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
 
 ## Known Limitations
 
-- **CC2340** compiles with stub FFI; real RF requires the TI SDK integration.
-- **Telink B91** has no current `RadioPhy`/`MacDriver` implementation. Its old example is retained only as an unsupported scaffold and is not built in CI.
+- **CC2340** has Rust LRFD bring-up and polling raw TX/RX, but no target has
+  been connected yet. CCA, IRQ-driven completion, hardware address filtering,
+  auto-ACK, temperature compensation, and a real Embassy time driver remain.
 - **Telink TLSR8258** production examples are split by role. The sensor is a polling end device, not yet a retention SED; the router joins and relays but does not admit children. Real tc32 firmware requires the [modern-tc32](https://github.com/modern-tc32) toolchain.
 - **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence; temp/humidity sensors are simulated (battery ADC is real); comprehensive power management is implemented (two-tier sleep with AON system sleep ~3 µA, radio sleep/wake, flash deep power-down, GPIO leak prevention)
 - **EFR32MG1** is hardware-proven for an always-on end device, but EM2 sleep, wake-time radio restoration, battery ADC, and long-duration stability remain.

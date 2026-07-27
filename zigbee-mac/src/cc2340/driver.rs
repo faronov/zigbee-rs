@@ -1,193 +1,21 @@
-//! Low-level CC2340 802.15.4 radio driver via FFI to TI's RCL library.
+//! CC2340R5 IEEE 802.15.4 radio driver.
 //!
-//! Provides async TX/RX on top of the CC2340R5's IEEE 802.15.4 radio using
-//! Embassy signals for interrupt-driven completion notification.
+//! This module is the Rust host-side replacement for the former speculative
+//! `mac_ti23xx_*` and RCL FFI bindings. The current bring-up stage performs the
+//! parts that can be implemented and validated independently:
 //!
-//! The CC2340R5 (Texas Instruments, ARM Cortex-M0+) has a dedicated 2.4 GHz
-//! radio controlled through TI's Radio Control Layer (RCL). The RCL submits
-//! IEEE 802.15.4 commands to the LRF (Low-level Radio Frontend) which manages
-//! the actual RF hardware via precompiled radio firmware patches.
-//!
-//! # Architecture
-//! ```text
-//! Cc2340Driver (Rust, async)
-//!   ├── FFI calls → rcl_cc23x0r5.a (TI precompiled library)
-//!   │     ├── RCL_init / RCL_open / RCL_close
-//!   │     ├── RCL_Command_submit / RCL_Command_pend / RCL_Command_stop
-//!   │     └── RCL_readRssi
-//!   ├── IEEE 802.15.4 commands via RCL_CmdIeeeRxTx
-//!   │     ├── rxAction — receive config (PAN filter, auto-ACK)
-//!   │     └── txAction — transmit config (frame buffer, CCA)
-//!   ├── TX completion: RCL callback → TX_SIGNAL
-//!   └── RX completion: RCL callback → RX_SIGNAL
-//! ```
-//!
-//! # Build requirements
-//! The downstream firmware crate must link TI's precompiled libraries:
-//! ```rust,ignore
-//! // build.rs
-//! let sdk = env::var("CC2340_SDK_DIR").unwrap();
-//! println!("cargo:rustc-link-search={sdk}/source/ti/drivers/rcl/lib/ticlang/m0p");
-//! println!("cargo:rustc-link-lib=static=rcl_cc23x0r5");
-//! // RF firmware patches
-//! println!("cargo:rustc-link-lib=static=pbe_ieee_cc23x0r5");
-//! println!("cargo:rustc-link-lib=static=mce_ieee_cc23x0r5");
-//! println!("cargo:rustc-link-lib=static=rfe_ieee_cc23x0r5");
-//! ```
+//! - applies TI's early CC2340 device trim workaround;
+//! - enables the LRFD module and radio-memory clocks;
+//! - imports and loads the official IEEE PBE/MCE/RFE firmware as data;
+//! - replays TI's IEEE PHY settings and per-die FCFG radio trims;
+//! - programs the channel synthesizer and LaunchPad PA setting;
+//! - initializes all three radio TOPsm cores;
+//! - transfers frames through the LRFD FIFOs and polls PBE radio events.
 
-use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, Ordering};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
+use super::{config, fifo, firmware, hardware};
 
-// ── RCL FFI types ───────────────────────────────────────────────
-// These mirror the C types from TI's RCL headers. We use opaque
-// pointers where possible to avoid reproducing full struct layouts.
-
-/// Opaque RCL client handle (pointer to RCL_Client in C)
-pub type RclHandle = *mut u8;
-
-/// RCL command status (subset of values we care about)
-#[repr(u16)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RclCommandStatus {
-    Idle = 0x0000,
-    Active = 0x0001,
-    Finished = 0x0101,
-    ChannelBusy = 0x0801,
-    NoAck = 0x0802,
-    RxErr = 0x0803,
-    Error = 0x0F00,
-}
-
-/// RCL stop type
-#[repr(u32)]
-#[derive(Debug, Clone, Copy)]
-pub enum RclStopType {
-    Graceful = 0,
-    Hard = 1,
-}
-
-/// TX power in dBm with fractional part
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct RclTxPower {
-    pub dbm: i8,
-    pub fraction: u8,
-}
-
-// ── FFI bindings to TI RCL library ──────────────────────────────
-// These map to functions in rcl_cc23x0r5.a. The library is provided
-// as a pre-compiled static archive by Texas Instruments.
-
-unsafe extern "C" {
-    // RCL core API
-    pub fn RCL_init() -> ();
-    pub fn RCL_open(client: *mut u8, config: *const u8) -> RclHandle;
-    pub fn RCL_close(handle: RclHandle) -> ();
-    pub fn RCL_Command_submit(handle: RclHandle, cmd: *mut u8) -> u16;
-    pub fn RCL_Command_pend(cmd: *mut u8) -> u16;
-    pub fn RCL_Command_stop(cmd: *mut u8, stop_type: u32) -> u16;
-    pub fn RCL_readRssi(handle: RclHandle) -> i8;
-
-    // MAC platform functions from TI's Zigbee platform shim
-    // These implement the radio operations at a higher level than raw RCL.
-    pub fn mac_ti23xx_radio_init(enable: u8) -> ();
-    pub fn mac_ti23xx_set_channel(page: u8, channel_num: u8) -> i32;
-    pub fn mac_ti23xx_24_set_tx_power(tx_power_dbm: u8) -> ();
-    pub fn mac_ti23xx_trans_set_rx_on_off(enable: u32) -> ();
-    pub fn mac_ti23xx_set_ieee_addr(addr: *const u8) -> ();
-    pub fn mac_ti23xx_send_packet(mhr_len: u8, buf: u8, wait_type: u8) -> ();
-    pub fn mac_ti23xx_perform_cca(rssi: *mut i8) -> i32;
-    pub fn mac_ti23xx_set_promiscuous_mode(mode: u8) -> ();
-    pub fn mac_ti23xx_src_match_add_short_addr(index: u8, short_addr: u16) -> u8;
-    pub fn mac_ti23xx_src_match_delete_short_addr(index: u8) -> u8;
-    pub fn mac_ti23xx_src_match_tbl_drop() -> ();
-    pub fn mac_ti23xx_trans_rec_pkt(buf: *mut u8) -> ();
-    pub fn mac_ti23xx_get_radio_data_status(status_type: u8) -> u8;
-    pub fn mac_ti23xx_clear_radio_data_status(status_type: u8) -> ();
-    pub fn mac_ti23xx_abort_tx() -> ();
-    pub fn mac_ti23xx_enable_rx() -> ();
-    pub fn mac_ti23xx_get_sync_rssi() -> i8;
-    pub fn mac_ti23xx_set_cca_rssi_threshold(rssi: i8) -> ();
-}
-
-// ── Async signals for interrupt-driven TX/RX ────────────────────
-
-/// Signal raised by TX completion callback
-static TX_SIGNAL: Signal<CriticalSectionRawMutex, TxResult> = Signal::new();
-
-/// Signal raised by RX completion callback
-static RX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-
-/// Whether a received frame is waiting in the RX buffer
-static RX_PENDING: AtomicBool = AtomicBool::new(false);
-
-/// Last TX status
-static LAST_TX_STATUS: AtomicU8 = AtomicU8::new(0);
-
-/// Last RSSI value from received packet
-static LAST_RX_RSSI: AtomicI8 = AtomicI8::new(-128);
-
-/// Last LQI value from received packet
-static LAST_RX_LQI: AtomicU8 = AtomicU8::new(0);
-
-// ── RX buffer ───────────────────────────────────────────────────
-
-/// Maximum IEEE 802.15.4 frame size
-const MAX_FRAME_LEN: usize = 127;
-
-/// Static RX frame buffer — filled by interrupt, consumed by async reader
-static mut RX_BUF: [u8; MAX_FRAME_LEN + 2] = [0u8; MAX_FRAME_LEN + 2];
-static RX_BUF_LEN: AtomicU8 = AtomicU8::new(0);
-
-// ── TX result ───────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy)]
-pub enum TxResult {
-    Success,
-    ChannelBusy,
-    NoAck,
-    Error,
-}
-
-// ── Callback functions (called from C interrupt context) ────────
-
-/// TX done callback — called from RCL/MAC interrupt context.
-/// Wakes the async TX signal.
-#[unsafe(no_mangle)]
-pub extern "C" fn cc2340_tx_done_callback(status: u8) {
-    let result = match status {
-        0 => TxResult::Success,
-        1 => TxResult::ChannelBusy,
-        2 => TxResult::NoAck,
-        _ => TxResult::Error,
-    };
-    LAST_TX_STATUS.store(status, Ordering::Release);
-    TX_SIGNAL.signal(result);
-}
-
-/// RX done callback — called from RCL/MAC interrupt context.
-/// Copies the received frame into the static buffer and wakes async reader.
-#[unsafe(no_mangle)]
-pub extern "C" fn cc2340_rx_done_callback(data: *const u8, len: u8, rssi: i8, lqi: u8) {
-    if len == 0 || len > MAX_FRAME_LEN as u8 || data.is_null() {
-        return;
-    }
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            data,
-            core::ptr::addr_of_mut!(RX_BUF) as *mut u8,
-            len as usize,
-        );
-    }
-    RX_BUF_LEN.store(len, Ordering::Release);
-    LAST_RX_RSSI.store(rssi, Ordering::Release);
-    LAST_RX_LQI.store(lqi, Ordering::Release);
-    RX_PENDING.store(true, Ordering::Release);
-    RX_SIGNAL.signal(());
-}
-
-// ── Driver configuration ────────────────────────────────────────
+const TX_TIMEOUT_TICKS: u32 = 400_000;
+const ABORT_POLL_LIMIT: usize = 100_000;
 
 /// Radio configuration for the CC2340 driver.
 #[derive(Debug, Clone)]
@@ -217,263 +45,380 @@ impl Default for RadioConfig {
     }
 }
 
-/// Radio error type
-#[derive(Debug, Clone, Copy)]
+/// Radio error type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RadioError {
-    TxFailed,
+    InvalidChannel,
+    InvalidFrame,
+    InvalidTxPower,
+    FirmwareUnavailable,
+    ClockTimeout,
+    FirmwareImageTooLarge,
+    RadioConfigUnavailable,
+    FactoryTrimUnavailable,
+    SynthConfigInvalid,
+    SynthTimeout,
+    RadioReadyTimeout,
     ChannelBusy,
     NoAck,
-    Timeout,
+    RxTimeout,
+    CrcError,
+    FifoOverflow,
+    MalformedFrame,
+    OperationTimeout,
+    PbeError(u8),
     HardwareError,
 }
 
-// ── Received frame ──────────────────────────────────────────────
+impl From<hardware::HardwareError> for RadioError {
+    fn from(error: hardware::HardwareError) -> Self {
+        match error {
+            hardware::HardwareError::ClockTimeout => Self::ClockTimeout,
+            hardware::HardwareError::ImageTooLarge => Self::FirmwareImageTooLarge,
+            hardware::HardwareError::FactoryTrimUnavailable => Self::FactoryTrimUnavailable,
+            hardware::HardwareError::SynthConfigInvalid => Self::SynthConfigInvalid,
+            hardware::HardwareError::SynthDividerTimeout => Self::SynthTimeout,
+            hardware::HardwareError::TopsmTimeout => Self::RadioReadyTimeout,
+        }
+    }
+}
 
 /// A received IEEE 802.15.4 frame with metadata.
 pub struct RxFrame {
-    pub data: [u8; MAX_FRAME_LEN],
+    pub data: [u8; fifo::MAX_PHY_FRAME_LEN],
     pub len: usize,
     pub rssi: i8,
     pub lqi: u8,
 }
 
-// ── CC2340 Driver ───────────────────────────────────────────────
-
-/// Low-level CC2340 802.15.4 radio driver.
-///
-/// Wraps TI's RCL library via FFI, providing async TX/RX through
-/// Embassy signals. The RCL manages the radio hardware including
-/// channel programming, auto-ACK, frame filtering, and CCA.
+/// Low-level CC2340 IEEE 802.15.4 radio driver.
 pub struct Cc2340Driver {
     config: RadioConfig,
-    initialized: bool,
+    images_loaded: bool,
+    configured: bool,
+    config_dirty: bool,
+    operation_active: bool,
 }
 
 impl Cc2340Driver {
-    /// Create a new CC2340 driver with the given configuration.
     pub fn new(config: RadioConfig) -> Self {
         Self {
             config,
-            initialized: false,
+            images_loaded: false,
+            configured: false,
+            config_dirty: true,
+            operation_active: false,
         }
     }
 
-    /// Initialize the radio hardware via RCL.
-    pub fn init(&mut self) {
-        if self.initialized {
-            return;
+    /// Initialize the Rust LRFD hardware, PHY, trims, synthesizer, PA, and
+    /// radio microcode cores.
+    pub fn init(&mut self) -> Result<(), RadioError> {
+        if self.configured {
+            return Ok(());
         }
-        unsafe {
-            mac_ti23xx_radio_init(1);
+        let frequency =
+            hardware::channel_frequency(self.config.channel).ok_or(RadioError::InvalidChannel)?;
+        let tx_power =
+            config::tx_power(self.config.tx_power_dbm).ok_or(RadioError::InvalidTxPower)?;
+
+        if !self.images_loaded {
+            let images = firmware::images().ok_or(RadioError::FirmwareUnavailable)?;
+            let phy_writes =
+                config::ieee_802154_phy_writes().ok_or(RadioError::RadioConfigUnavailable)?;
+
+            hardware::setup_device_trim();
+            hardware::enable_radio_clocks()?;
+            if let Err(error) = hardware::load_firmware(images.pbe, images.mce, images.rfe) {
+                hardware::disable_radio_clocks();
+                return Err(error.into());
+            }
+            hardware::apply_phy_configuration(phy_writes);
+            hardware::route_scheduler_interrupt();
+
+            let bringup = || -> Result<(), hardware::HardwareError> {
+                hardware::finish_radio_setup()?;
+                hardware::enable_synth_refsys()?;
+                hardware::program_frequency(frequency)?;
+                hardware::program_tx_power(tx_power.raw);
+                hardware::enable_radio_cores();
+                hardware::wait_for_topsm_ready()?;
+                fifo::clear_events(u32::MAX);
+                fifo::reset_both();
+                Ok(())
+            };
+            if let Err(error) = bringup() {
+                hardware::hard_stop();
+                hardware::disable_radio_cores();
+                hardware::disable_synth_refsys();
+                hardware::disable_radio_clocks();
+                return Err(error.into());
+            }
+
+            log::info!(
+                "[CC2340 DRV] Initialized channel {} at {} dBm using firmware from {} and PHY settings from {}",
+                self.config.channel,
+                tx_power.dbm,
+                firmware::source(),
+                config::source()
+            );
+            self.images_loaded = true;
+            self.configured = true;
+            self.config_dirty = false;
+            self.operation_active = false;
         }
-        self.apply_config();
-        self.initialized = true;
-        log::info!(
-            "[CC2340 DRV] Radio initialized on channel {}",
-            self.config.channel
-        );
+
+        Ok(())
     }
 
-    /// Deinitialize the radio hardware.
     pub fn deinit(&mut self) {
-        if !self.initialized {
-            return;
+        if self.images_loaded {
+            hardware::hard_stop();
+            hardware::disable_radio_cores();
+            hardware::disable_synth_refsys();
+            hardware::disable_radio_clocks();
         }
-        unsafe {
-            mac_ti23xx_radio_init(0);
-        }
-        self.initialized = false;
+        self.images_loaded = false;
+        self.configured = false;
+        self.config_dirty = true;
+        self.operation_active = false;
     }
 
-    /// Apply current configuration to the radio hardware.
-    fn apply_config(&self) {
-        unsafe {
-            mac_ti23xx_set_channel(0, self.config.channel);
-            mac_ti23xx_24_set_tx_power(self.config.tx_power_dbm as u8);
-            mac_ti23xx_set_ieee_addr(self.config.ieee_addr.as_ptr());
-            mac_ti23xx_trans_set_rx_on_off(if self.config.rx_on_when_idle { 1 } else { 0 });
-            mac_ti23xx_set_promiscuous_mode(if self.config.promiscuous { 1 } else { 0 });
-        }
+    pub fn update_config<F: FnOnce(&mut RadioConfig)>(&mut self, update: F) {
+        update(&mut self.config);
+        self.config_dirty = true;
     }
 
-    /// Update radio configuration with a closure.
-    pub fn update_config<F: FnOnce(&mut RadioConfig)>(&mut self, f: F) {
-        f(&mut self.config);
-        if self.initialized {
-            self.apply_config();
-        }
-    }
-
-    /// Set the 802.15.4 channel (11–26).
     pub fn set_channel(&mut self, channel: u8) {
         self.config.channel = channel;
-        if self.initialized {
-            unsafe {
-                mac_ti23xx_set_channel(0, channel);
-            }
-        }
+        self.config_dirty = true;
     }
 
-    /// Set PAN ID. Updated via the full config apply since TI's API
-    /// uses update_rx_panconfig which is a higher-level function.
     pub fn set_pan_id(&mut self, pan_id: u16) {
         self.config.pan_id = pan_id;
     }
 
-    /// Set short address.
-    pub fn set_short_addr(&mut self, addr: u16) {
-        self.config.short_addr = addr;
+    pub fn set_short_addr(&mut self, address: u16) {
+        self.config.short_addr = address;
     }
 
-    /// Set IEEE (extended) address.
-    pub fn set_ieee_addr(&mut self, addr: &[u8; 8]) {
-        self.config.ieee_addr = *addr;
-        if self.initialized {
-            unsafe {
-                mac_ti23xx_set_ieee_addr(addr.as_ptr());
-            }
-        }
+    pub fn set_ieee_addr(&mut self, address: &[u8; 8]) {
+        self.config.ieee_addr = *address;
     }
 
-    /// Set TX power in dBm.
     pub fn set_tx_power(&mut self, dbm: i8) {
         self.config.tx_power_dbm = dbm;
-        if self.initialized {
-            unsafe {
-                mac_ti23xx_24_set_tx_power(dbm as u8);
-            }
-        }
+        self.config_dirty = true;
     }
 
-    /// Enable or disable RX when idle.
-    pub fn set_rx_on_when_idle(&mut self, on: bool) {
-        self.config.rx_on_when_idle = on;
-        if self.initialized {
-            unsafe {
-                mac_ti23xx_trans_set_rx_on_off(if on { 1 } else { 0 });
-            }
-        }
+    pub fn set_rx_on_when_idle(&mut self, enabled: bool) {
+        self.config.rx_on_when_idle = enabled;
     }
 
-    /// Perform a Clear Channel Assessment.
-    /// Returns the RSSI value if the channel is clear, or an error if busy.
     pub fn perform_cca(&self) -> Result<i8, RadioError> {
-        let mut rssi: i8 = 0;
-        let ret = unsafe { mac_ti23xx_perform_cca(&mut rssi) };
-        if ret == 0 {
-            Ok(rssi)
-        } else {
-            Err(RadioError::ChannelBusy)
+        if !self.configured {
+            return Err(RadioError::RadioConfigUnavailable);
         }
+        Err(RadioError::HardwareError)
     }
 
-    /// Read current RSSI from the radio.
     pub fn read_rssi(&self) -> i8 {
-        unsafe { mac_ti23xx_get_sync_rssi() }
-    }
-
-    /// Transmit a raw IEEE 802.15.4 frame.
-    ///
-    /// The frame should be a complete MAC frame (FC + Seq + Addressing + Payload).
-    /// CRC is appended by hardware.
-    ///
-    /// This is async — waits for the TX complete interrupt via Embassy signal.
-    pub async fn transmit(&self, frame: &[u8]) -> Result<(), RadioError> {
-        if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
-            return Err(RadioError::TxFailed);
-        }
-
-        // Reset TX signal before starting
-        TX_SIGNAL.reset();
-
-        // Copy frame to a static TX buffer for the C library
-        static mut TX_BUF: [u8; MAX_FRAME_LEN + 1] = [0u8; MAX_FRAME_LEN + 1];
-        unsafe {
-            TX_BUF[0] = frame.len() as u8;
-            TX_BUF[1..=frame.len()].copy_from_slice(frame);
-        }
-
-        // Submit TX via the MAC platform shim
-        // The mac_ti23xx_send_packet handles CSMA-CA and auto-ACK internally
-        // mhr_len is used by TI's stack for header/payload split
-        let mhr_len = Self::compute_mhr_len(frame);
-        unsafe {
-            mac_ti23xx_send_packet(mhr_len, 0, 0);
-        }
-
-        // Wait for TX completion signal from interrupt
-        let result = TX_SIGNAL.wait().await;
-
-        match result {
-            TxResult::Success => Ok(()),
-            TxResult::ChannelBusy => Err(RadioError::ChannelBusy),
-            TxResult::NoAck => Err(RadioError::NoAck),
-            TxResult::Error => Err(RadioError::TxFailed),
+        if self.configured {
+            let rssi = hardware::read_rssi();
+            if rssi == 127 { i8::MIN } else { rssi }
+        } else {
+            i8::MIN
         }
     }
 
-    /// Receive the next incoming IEEE 802.15.4 frame.
-    ///
-    /// Blocks until a frame arrives via the RX interrupt signal.
-    pub async fn receive(&self) -> Result<RxFrame, RadioError> {
-        // If a frame is already pending, consume it immediately
-        let was_pending = RX_PENDING.load(Ordering::Acquire);
-        RX_PENDING.store(false, Ordering::Release);
-        if was_pending {
-            return self.consume_rx_frame();
+    pub async fn transmit(&mut self, frame: &[u8]) -> Result<(), RadioError> {
+        if frame.is_empty() || frame.len() > fifo::MAX_MPDU_LEN {
+            return Err(RadioError::InvalidFrame);
+        }
+        if !self.configured {
+            return Err(RadioError::RadioConfigUnavailable);
         }
 
-        // Enable RX if not already on
-        unsafe {
-            mac_ti23xx_enable_rx();
+        self.prepare_operation()?;
+        fifo::prepare_tx();
+        fifo::reset_tx();
+        fifo::write_tx_frame(frame).map_err(map_fifo_error)?;
+        fifo::clear_events(u32::MAX);
+        self.operation_active = true;
+        fifo::start_tx();
+
+        let started = hardware::timer_ticks();
+        loop {
+            let events = fifo::events();
+            if events & fifo::EVENT_TERMINAL != 0 {
+                return self.finish_operation(events);
+            }
+            if hardware::timer_ticks().wrapping_sub(started) >= TX_TIMEOUT_TICKS {
+                break;
+            }
+            yield_now().await;
         }
 
-        // Wait for RX signal
-        RX_SIGNAL.reset();
-        RX_SIGNAL.wait().await;
-        RX_PENDING.store(false, Ordering::Release);
-
-        self.consume_rx_frame()
+        self.abort_active_operation()?;
+        Err(RadioError::OperationTimeout)
     }
 
-    /// Consume the current RX buffer into an RxFrame.
-    fn consume_rx_frame(&self) -> Result<RxFrame, RadioError> {
-        let len = RX_BUF_LEN.load(Ordering::Acquire) as usize;
-        if len == 0 {
-            return Err(RadioError::Timeout);
+    pub async fn receive(&mut self) -> Result<RxFrame, RadioError> {
+        if !self.configured {
+            return Err(RadioError::RadioConfigUnavailable);
         }
 
-        let mut frame = RxFrame {
-            data: [0u8; MAX_FRAME_LEN],
-            len,
-            rssi: LAST_RX_RSSI.load(Ordering::Acquire),
-            lqi: LAST_RX_LQI.load(Ordering::Acquire),
-        };
+        self.prepare_operation()?;
+        fifo::prepare_promiscuous_rx();
+        fifo::reset_rx();
+        fifo::clear_events(u32::MAX);
+        self.operation_active = true;
+        fifo::start_rx();
 
-        unsafe {
-            let src = core::ptr::addr_of!(RX_BUF) as *const u8;
-            core::ptr::copy_nonoverlapping(src, frame.data.as_mut_ptr(), len);
+        loop {
+            let events = fifo::events();
+
+            if events & fifo::EVENT_RX_OK != 0 {
+                match fifo::try_read_rx_frame() {
+                    Ok(Some(frame)) => {
+                        fifo::clear_events(fifo::EVENT_RX_OK);
+                        self.abort_active_operation()?;
+                        return Ok(RxFrame {
+                            data: frame.data,
+                            len: frame.len,
+                            rssi: frame.rssi,
+                            lqi: frame.lqi,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let error = map_fifo_error(error);
+                        self.abort_active_operation()?;
+                        return Err(error);
+                    }
+                }
+            }
+
+            if events & fifo::EVENT_RX_BUF_FULL != 0 {
+                self.abort_active_operation()?;
+                return Err(RadioError::FifoOverflow);
+            }
+
+            if events & (fifo::EVENT_RX_NOK | fifo::EVENT_RX_IGNORED) != 0 {
+                fifo::clear_events(fifo::EVENT_RX_NOK | fifo::EVENT_RX_IGNORED);
+            }
+
+            if events & fifo::EVENT_TERMINAL != 0 {
+                return match self.finish_operation(events) {
+                    Ok(()) => Err(RadioError::RxTimeout),
+                    Err(error) => Err(error),
+                };
+            }
+
+            yield_now().await;
         }
-
-        RX_BUF_LEN.store(0, Ordering::Release);
-        Ok(frame)
     }
 
-    /// Compute MAC header length from frame control field.
-    fn compute_mhr_len(frame: &[u8]) -> u8 {
-        if frame.len() < 2 {
-            return 0;
+    pub fn abort_tx(&mut self) {
+        if let Err(error) = self.abort_active_operation() {
+            log::error!("[CC2340 DRV] Failed to abort radio operation: {error:?}");
         }
-        let fc = u16::from_le_bytes([frame[0], frame[1]]);
-        // MHR = FC(2) + Seq(1) + addressing fields
-        let addr_len = super::addressing_size(fc);
-        (3 + addr_len) as u8
     }
 
-    /// Cancel any in-progress TX operation.
-    pub fn abort_tx(&self) {
-        unsafe {
-            mac_ti23xx_abort_tx();
+    fn prepare_operation(&mut self) -> Result<(), RadioError> {
+        self.abort_active_operation()?;
+        self.apply_runtime_config()?;
+        hardware::wait_for_topsm_ready()?;
+        Ok(())
+    }
+
+    fn apply_runtime_config(&mut self) -> Result<(), RadioError> {
+        if !self.config_dirty {
+            return Ok(());
+        }
+
+        let frequency =
+            hardware::channel_frequency(self.config.channel).ok_or(RadioError::InvalidChannel)?;
+        let tx_power =
+            config::tx_power(self.config.tx_power_dbm).ok_or(RadioError::InvalidTxPower)?;
+        hardware::program_frequency(frequency)?;
+        hardware::program_tx_power(tx_power.raw);
+        self.config_dirty = false;
+        Ok(())
+    }
+
+    fn finish_operation(&mut self, events: u32) -> Result<(), RadioError> {
+        let end_cause = fifo::end_cause();
+        fifo::clear_events(u32::MAX);
+        self.operation_active = false;
+
+        if events & fifo::EVENT_OP_ERROR != 0 && end_cause == 0 {
+            Err(RadioError::HardwareError)
+        } else if end_cause == 0 {
+            Ok(())
+        } else {
+            Err(map_pbe_error(end_cause))
         }
     }
+
+    fn abort_active_operation(&mut self) -> Result<(), RadioError> {
+        if !self.operation_active {
+            return Ok(());
+        }
+
+        if fifo::events() & fifo::EVENT_TERMINAL == 0 {
+            fifo::clear_events(fifo::EVENT_TERMINAL);
+            fifo::hard_stop();
+            let mut stopped = false;
+            for _ in 0..ABORT_POLL_LIMIT {
+                if fifo::events() & fifo::EVENT_TERMINAL != 0 {
+                    stopped = true;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            if !stopped {
+                self.operation_active = false;
+                fifo::reset_both();
+                return Err(RadioError::OperationTimeout);
+            }
+        }
+
+        fifo::clear_events(u32::MAX);
+        fifo::reset_both();
+        self.operation_active = false;
+        Ok(())
+    }
+}
+
+fn map_fifo_error(error: fifo::FifoError) -> RadioError {
+    match error {
+        fifo::FifoError::FrameTooLong => RadioError::InvalidFrame,
+        fifo::FifoError::NoSpace => RadioError::FifoOverflow,
+        fifo::FifoError::MalformedEntry | fifo::FifoError::MetadataMismatch => {
+            RadioError::MalformedFrame
+        }
+    }
+}
+
+fn map_pbe_error(end_cause: u8) -> RadioError {
+    match end_cause {
+        0x01 => RadioError::RxTimeout,
+        0xF9 | 0xFA => RadioError::FifoOverflow,
+        other => RadioError::PbeError(other),
+    }
+}
+
+async fn yield_now() {
+    let mut yielded = false;
+    core::future::poll_fn(|context| {
+        if yielded {
+            core::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            context.waker().wake_by_ref();
+            core::task::Poll::Pending
+        }
+    })
+    .await
 }

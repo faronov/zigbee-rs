@@ -5,7 +5,7 @@
 //! to a Zigbee coordinator every 30 seconds.
 //!
 //! # Hardware
-//! - CC2340R5 LaunchPad (ARM Cortex-M0+, 512KB Flash, 36KB RAM)
+//! - CC2340R5 LaunchPad (ARM Cortex-M0+, 512KB Flash, 64KB RAM)
 //! - Built-in buttons: BTN1 (DIO13) = join/leave, BTN2 (DIO14) = identify
 //! - Built-in LEDs: LED1 (DIO7) = network status
 //!
@@ -20,9 +20,6 @@
 
 #![no_std]
 #![no_main]
-
-#[cfg(feature = "stubs")]
-mod stubs;
 
 use cortex_m as _;
 use panic_halt as _;
@@ -59,33 +56,26 @@ mod pins {
 }
 
 /// CC2340R5 GPIO register base
-const GPIO_BASE: u32 = 0x4000_6000;
+const GPIO_BASE: u32 = 0x4002_3000;
 
 // ── Minimal GPIO helpers ────────────────────────────────────────
 
 fn gpio_set_output(pin: u8) {
     unsafe {
-        let doe_reg = (GPIO_BASE + 0x0C) as *mut u32; // DOUT_EN
-        let val = core::ptr::read_volatile(doe_reg);
-        core::ptr::write_volatile(doe_reg, val | (1 << pin));
+        core::ptr::write_volatile((GPIO_BASE + 0x510) as *mut u32, 1 << pin);
     }
 }
 
 fn gpio_write(pin: u8, high: bool) {
     unsafe {
-        let dout_reg = (GPIO_BASE + 0x08) as *mut u32; // DOUT
-        let val = core::ptr::read_volatile(dout_reg);
-        if high {
-            core::ptr::write_volatile(dout_reg, val | (1 << pin));
-        } else {
-            core::ptr::write_volatile(dout_reg, val & !(1 << pin));
-        }
+        let offset = if high { 0x210 } else { 0x220 };
+        core::ptr::write_volatile((GPIO_BASE + offset) as *mut u32, 1 << pin);
     }
 }
 
 fn gpio_read(pin: u8) -> bool {
     unsafe {
-        let din_reg = (GPIO_BASE + 0x04) as *const u32; // DIN
+        let din_reg = (GPIO_BASE + 0x700) as *const u32;
         let val = core::ptr::read_volatile(din_reg);
         (val >> pin) & 1 == 1
     }
@@ -172,22 +162,36 @@ async fn main(_spawner: Spawner) {
         .sw_build("0.1.0")
         .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, DeviceId::TEMPERATURE_SENSOR, |ep| {
-            ep.cluster_server(ClusterId::BASIC)
-                .cluster_server(ClusterId::IDENTIFY)
-                .cluster_server(ClusterId::POWER_CONFIG)
-                .cluster_server(ClusterId::TEMPERATURE)
-                .cluster_server(ClusterId::HUMIDITY)
-        })
+        .endpoint(
+            1,
+            PROFILE_HOME_AUTOMATION,
+            DeviceId::TEMPERATURE_SENSOR,
+            |ep| {
+                ep.cluster_server(ClusterId::BASIC)
+                    .cluster_server(ClusterId::IDENTIFY)
+                    .cluster_server(ClusterId::POWER_CONFIG)
+                    .cluster_server(ClusterId::TEMPERATURE)
+                    .cluster_server(ClusterId::HUMIDITY)
+            },
+        )
         .build();
 
     // Auto-join on boot
     log::info!("[CC2340] Auto-joining network…");
     device.user_action(UserAction::Join);
     let mut clusters = [
-        ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+        ClusterRef {
+            endpoint: 1,
+            cluster: &mut temp_cluster,
+        },
+        ClusterRef {
+            endpoint: 1,
+            cluster: &mut hum_cluster,
+        },
+        ClusterRef {
+            endpoint: 1,
+            cluster: &mut power_cluster,
+        },
     ];
     let _ = device.tick(0, &mut clusters).await;
 
@@ -213,7 +217,11 @@ async fn main(_spawner: Spawner) {
     loop {
         let now = Instant::now();
         let in_fast_poll = now < fast_poll_until;
-        let poll_ms = if in_fast_poll { FAST_POLL_MS } else { SLOW_POLL_SECS * 1000 };
+        let poll_ms = if in_fast_poll {
+            FAST_POLL_MS
+        } else {
+            SLOW_POLL_SECS * 1000
+        };
 
         // ── Button handling (edge detection) ─────────────────
         let pressed = !gpio_read(pins::BTN1); // Active low
@@ -236,9 +244,18 @@ async fn main(_spawner: Spawner) {
                 match device.poll().await {
                     Ok(Some(ind)) => {
                         let mut cls = [
-                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut temp_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut hum_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut power_cluster,
+                            },
                         ];
                         if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
                             if matches!(&ev, StackEvent::RejoinRequested) {
@@ -253,18 +270,30 @@ async fn main(_spawner: Spawner) {
                                 break;
                             }
                             if matches!(ev, StackEvent::Joined { .. }) {
-                                fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                fast_poll_until =
+                                    Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                             }
                         }
-                        if !interview_done && device.configured_cluster_count(1) >= EXPECTED_REPORT_CLUSTERS {
+                        if !interview_done
+                            && device.configured_cluster_count(1) >= EXPECTED_REPORT_CLUSTERS
+                        {
                             interview_done = true;
                             fast_poll_until = Instant::now() + Duration::from_secs(5);
                             log::info!("[CC2340] Interview done — ending fast poll");
                         }
                         let mut cls2 = [
-                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut temp_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut hum_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut power_cluster,
+                            },
                         ];
                         let _ = device.tick(0, &mut cls2).await;
                     }
@@ -295,9 +324,18 @@ async fn main(_spawner: Spawner) {
             // Tick runtime
             let tick_elapsed = elapsed_s.min(60) as u16;
             let mut clusters = [
-                ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut temp_cluster,
+                },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut hum_cluster,
+                },
+                ClusterRef {
+                    endpoint: 1,
+                    cluster: &mut power_cluster,
+                },
             ];
             let _ = device.tick(tick_elapsed, &mut clusters).await;
 
@@ -319,9 +357,18 @@ async fn main(_spawner: Spawner) {
                 last_rejoin_attempt = Instant::now();
                 device.user_action(UserAction::Join);
                 let mut cls = [
-                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                    ClusterRef {
+                        endpoint: 1,
+                        cluster: &mut temp_cluster,
+                    },
+                    ClusterRef {
+                        endpoint: 1,
+                        cluster: &mut hum_cluster,
+                    },
+                    ClusterRef {
+                        endpoint: 1,
+                        cluster: &mut power_cluster,
+                    },
                 ];
                 let _ = device.tick(0, &mut cls).await;
                 if device.is_joined() {

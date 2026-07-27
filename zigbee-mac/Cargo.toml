@@ -2,6 +2,7 @@
 name = "zigbee-mac"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 license = "MIT OR Apache-2.0"
 description = "IEEE 802.15.4 MAC abstraction for zigbee-rs — trait + multi-platform backends"
 repository = "https://github.com/zigbee-rs/zigbee-rs"

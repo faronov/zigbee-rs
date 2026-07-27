@@ -171,8 +171,7 @@ a one-line Cargo feature change plus updating the MAC initialization code.
 - **BL702** — Low cost, good for high-volume products.
 - **CC2340R5** — TI ecosystem, good for industrial applications.
 - **Telink TLSR8258** — Very low cost and widely used in commercial Zigbee
-  products. The current backend is pure Rust and needs no vendor SDK. B91 is
-  not implemented and remains an unsupported scaffold.
+  products. The current backend is pure Rust and needs no vendor SDK.
 - **PHY6222** — Budget BLE+802.15.4 combo, pure-Rust radio driver, suitable for simple sensors.
 - **EFR32MG1** — Silicon Labs Series 1 (Cortex-M4F), used in IKEA TRÅDFRI modules.
   Pure-Rust radio driver — no GSDK/RAIL required. Great for repurposing existing hardware.

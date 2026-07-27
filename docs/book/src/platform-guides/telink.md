@@ -1,7 +1,6 @@
 # Telink TLSR8258
 
-The supported Telink platform is a pure-Rust TLSR8258 implementation. Telink
-B91 remains an unsupported scaffold because it has no radio or MAC backend.
+The supported Telink platform is a pure-Rust TLSR8258 implementation.
 
 ## Hardware and SRAM layout
 
@@ -132,5 +131,4 @@ mandatory timing, and crash-safe security persistence. Home Assistant ZHA has
 verified commissioning, TCLK exchange, interview, reporting, reset resume,
 secured rejoin, and router join/relay setup.
 
-Full coordinator support is not advertised. The B91 scaffold is excluded from
-the firmware matrix until a separate B91 radio and MAC implementation exists.
+Full coordinator support is not advertised.

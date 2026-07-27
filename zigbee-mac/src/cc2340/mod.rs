@@ -1,11 +1,9 @@
 //! CC2340 MAC backend.
 //!
 //! Implements `MacDriver` for the Texas Instruments CC2340R5 ARM Cortex-M0+ SoC.
-//! The CC2340R5 has a dedicated 2.4 GHz radio supporting IEEE 802.15.4, controlled
-//! through TI's Radio Control Layer (RCL) library.
-//!
-//! This backend uses FFI bindings to TI's precompiled RCL and MAC platform
-//! libraries for radio access, with async TX/RX through Embassy signals.
+//! The host-side radio driver is Rust and accesses the LRFD registers directly.
+//! TI's BSD-licensed PBE/MCE/RFE firmware images remain embedded as radio
+//! microcode data; no RCL, ZBOSS, or MAC shim library is linked.
 //!
 //! # Architecture
 //! ```text
@@ -16,13 +14,21 @@
 //!   ├── PIB state (addresses, channel, config)
 //!   ├── Frame construction (beacon req, assoc req, data)
 //!   └── Cc2340Driver (driver.rs)
-//!          ├── FFI → rcl_cc23x0r5.a + RF patches (TI precompiled)
-//!          ├── FFI → mac_ti23xx_* platform shim functions
-//!          ├── TX via Signal (interrupt-driven)
-//!          └── RX via Signal (interrupt-driven)
+//!          ├── generated TI PHY settings and PA table
+//!          ├── direct LRFD trim, synthesizer, and TOPsm setup
+//!          ├── official PBE/MCE/RFE firmware loaded as data
+//!          └── polling FIFO TX/RX with cooperative async yielding
 //! ```
+//!
+//! Raw TX/RX is implemented but still requires validation on CC2340R5
+//! hardware. CCA, hardware filtering/auto-ACK, IRQ completion, dynamic
+//! temperature compensation, and production power management remain pending.
 
+mod config;
 pub mod driver;
+mod fifo;
+mod firmware;
+mod hardware;
 
 use crate::pib::{PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
@@ -431,7 +437,7 @@ fn parse_zigbee_beacon(data: &[u8]) -> ZigbeeBeaconPayload {
 
 impl MacDriver for Cc2340Mac {
     async fn mlme_scan(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
-        self.driver.init();
+        self.driver.init().map_err(|_| MacError::RadioError)?;
         let scan_duration_ms = ((1u32 << req.scan_duration) + 1) * 15;
 
         match req.scan_type {
@@ -581,7 +587,7 @@ impl MacDriver for Cc2340Mac {
     }
 
     fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
-        self.driver.init();
+        self.driver.init().map_err(|_| MacError::RadioError)?;
         if set_default_pib {
             self.short_address = ShortAddress(0xFFFF);
             self.pan_id = PanId(0xFFFF);

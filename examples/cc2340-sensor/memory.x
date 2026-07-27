@@ -1,10 +1,6 @@
-/* CC2340R5 Memory Layout
+/* CC2340R52 Memory Layout (LP-EM-CC2340R5)
  * Flash: 512KB at 0x0000_0000
  * SRAM:  36KB  at 0x2000_0000
- *
- * Note: actual usable RAM may be less due to radio buffer reservations.
- * The CC2340R5 has 36KB SRAM (not 64KB — that's CC2340R53).
- * Adjust based on your specific variant.
  */
 MEMORY
 {

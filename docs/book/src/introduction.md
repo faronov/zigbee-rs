@@ -63,14 +63,11 @@ The MAC layer provides **11 supported chip targets**:
 | nRF52840 | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
 | nRF52833 | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
 | BL702 | `riscv32imac-unknown-none-elf` | Vendor `lmac154` FFI |
-| CC2340 | `thumbv6m-none-eabi` | TI SimpleLink SDK stubs |
+| CC2340 | `thumbv6m-none-eabi` | Rust LRFD host driver + official TI radio microcode; hardware validation pending |
 | TLSR8258 | `tc32-unknown-none-elf` | **Pure Rust** TLSR8258 radio and MAC |
 | PHY6222 | `thumbv6m-none-eabi` | **Pure Rust** — zero vendor blobs! |
 | EFR32MG1 | `thumbv7em-none-eabi` | **Pure Rust** Series 1 radio |
 | EFR32MG21 | `thumbv8m.main-none-eabihf` | **Pure Rust** Series 2 radio |
-
-Telink B91 is retained only as an unsupported scaffold; no B91 radio or MAC
-backend is currently implemented.
 
 ## Current Status
 
