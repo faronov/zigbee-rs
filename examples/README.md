@@ -11,7 +11,7 @@ than in application logic.
 |---|---|
 | `mock-light` | Canonical host FFD/router application |
 | `nrf52840-router` | Hardware router example |
-| `telink-tlsr8258-router` | Hardware-proven join/relay router; no child admission |
+| `telink-tlsr8258-router` | Software-complete parent router; ZHA/sniffer parent validation pending |
 
 ## Always-on end device
 

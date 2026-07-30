@@ -813,6 +813,7 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
             &req.dst_address,
             req.payload,
             ack_requested,
+            req.tx_options.frame_pending,
         )
         .map_err(|_| MacError::FrameTooLong)?;
 

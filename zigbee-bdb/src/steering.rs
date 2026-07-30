@@ -18,7 +18,8 @@
 use zigbee_aps::security::{ApsKeyType, ApsLinkKeyEntry};
 use zigbee_mac::MacDriver;
 use zigbee_nwk::DeviceType;
-use zigbee_types::{ChannelMask, ShortAddress};
+use zigbee_types::{ChannelMask, IeeeAddress, ShortAddress};
+use zigbee_zdo::ZdoLayer;
 use zigbee_zdo::ZdpStatus;
 use zigbee_zdo::discovery::NodeDescRsp;
 
@@ -48,6 +49,62 @@ const SCAN_DURATION: u8 = 3;
 const TCLK_MIN_STACK_REVISION: u8 = 21;
 const FIRST_SCAN_CHANNEL: u8 = 15;
 
+// ── Device_annce retry policy ───────────────────────────────
+//
+// `Device_annce` is transmitted *after* MAC association, Transport-Key
+// installation and the durable network-security counter reservation. A failed
+// broadcast at that point says nothing about the join itself — the parent link,
+// the network key and the reserved frame counters are all still valid — so the
+// announce is retried in place instead of tearing the join down and forcing a
+// fresh scan/association (which would burn reserved counter space and pollute
+// the Trust Center's child/authentication state).
+
+/// Total `Device_annce` transmissions before commissioning fails explicitly.
+const DEVICE_ANNCE_ATTEMPTS: u8 = 5;
+/// Spacing between two `Device_annce` attempts.
+const DEVICE_ANNCE_RETRY_INTERVAL_US: u32 = 8_000_000;
+/// Radio-service slice used while waiting out the inter-attempt spacing.
+///
+/// Each slice services the parent (or receives when `rx_on_when_idle`) and then
+/// uses the platform's asynchronous delay for any remainder, so an end device
+/// keeps its parent link alive without a blocking sleep.
+const DEVICE_ANNCE_RETRY_SLICE_US: u32 = 500_000;
+/// Bounded slice budget per gap.
+///
+/// The fixed budget guarantees termination even if a backend's bounded receive
+/// primitive returns immediately. The monotonic clock plus the asynchronous
+/// delay still enforce the full retry interval in that case.
+const DEVICE_ANNCE_RETRY_SLICES: u16 =
+    (DEVICE_ANNCE_RETRY_INTERVAL_US / DEVICE_ANNCE_RETRY_SLICE_US) as u16;
+
+/// A single `Device_annce` transmission attempt.
+///
+/// Production steering uses [`ZdoDeviceAnnce`]. The unit tests substitute a
+/// deterministic failure sequence so the retry policy can be proven without a
+/// radio and without adding a fault-injection hook to the shared MAC mock.
+trait DeviceAnnceTransmitter<M: MacDriver> {
+    async fn transmit(
+        &mut self,
+        zdo: &mut ZdoLayer<M>,
+        nwk_addr: ShortAddress,
+        ieee: IeeeAddress,
+    ) -> Result<(), ZdpStatus>;
+}
+
+/// Production transmitter: the real ZDO `Device_annce` broadcast.
+struct ZdoDeviceAnnce;
+
+impl<M: MacDriver> DeviceAnnceTransmitter<M> for ZdoDeviceAnnce {
+    async fn transmit(
+        &mut self,
+        zdo: &mut ZdoLayer<M>,
+        nwk_addr: ShortAddress,
+        ieee: IeeeAddress,
+    ) -> Result<(), ZdpStatus> {
+        zdo.device_annce(nwk_addr, ieee).await
+    }
+}
+
 fn ordered_steering_channel_sets(primary: ChannelMask, secondary: ChannelMask) -> [ChannelMask; 3] {
     let first_channel_bit = 1u32 << FIRST_SCAN_CHANNEL;
     let first = ChannelMask(primary.0 & first_channel_bit);
@@ -57,6 +114,7 @@ fn ordered_steering_channel_sets(primary: ChannelMask, secondary: ChannelMask) -
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -180,8 +238,444 @@ mod tests {
         );
     }
 
+    #[test]
+    fn completed_tclk_exchange_reannounces_authenticated_device() {
+        let mut bdb = steerable_bdb();
+        let mut announce = ScriptedAnnce::failing(0);
+        let mut persistence = TestPersistence::default();
+
+        assert_eq!(
+            block_on(bdb.network_steering_with_announce_for_test(&mut persistence, &mut announce)),
+            Ok(())
+        );
+        bdb.zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut()
+            .clear_tx_history();
+        let counter_before = bdb.zdo().nwk().nib().outgoing_frame_counter;
+        bdb.tclk_exchange.as_mut().unwrap().stage = TclkStage::Complete;
+
+        assert_eq!(
+            block_on(bdb.advance_tclk_exchange(Some(&mut persistence))),
+            TclkProgress::Complete
+        );
+        assert!(!bdb.tclk_exchange_active());
+        assert!(
+            bdb.zdo().nwk().nib().outgoing_frame_counter > counter_before,
+            "the post-authentication announcement must consume a fresh NWK counter"
+        );
+        let history = bdb.zdo().nwk().mac().tx_history();
+        assert_eq!(
+            history.len(),
+            1,
+            "commissioning completion must emit one authenticated Device_annce"
+        );
+        assert_eq!(
+            history[0].dst,
+            MacAddress::Short(PanId(TEST_PAN_ID), ShortAddress::COORDINATOR)
+        );
+        assert!(history[0].ack_requested);
+        let (header, _) = NwkHeader::parse(history[0].payload.as_slice()).unwrap();
+        assert_eq!(header.src_addr, ShortAddress(TEST_SHORT_ADDR));
+        assert_eq!(header.dst_addr, ShortAddress::BROADCAST_RX_ON_WHEN_IDLE);
+    }
+
+    // ── Device_annce retry regression coverage ──────────────
+
+    use zigbee_mac::pib::{PibAttribute, PibValue};
+    use zigbee_mac::primitives::{
+        AssociationStatus, MacFrame, MlmeAssociateConfirm, PanDescriptor, SuperframeSpec,
+        ZigbeeBeaconPayload,
+    };
+    use zigbee_nwk::frames::{NwkFrameControl, NwkFrameType, NwkHeader};
+    use zigbee_types::{IeeeAddress, MacAddress, PanId};
+
+    const TEST_PAN_ID: u16 = 0x1234;
+    const TEST_CHANNEL: u8 = FIRST_SCAN_CHANNEL;
+    const TEST_SHORT_ADDR: u16 = 0x1A2B;
+    const TEST_TC_IEEE: IeeeAddress = [0xAA; 8];
+    const TEST_NETWORK_KEY: [u8; 16] = [0x5A; 16];
+
+    /// State observed by the injected transmitter at one announce attempt.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct AnnounceObservation {
+        short_address: u16,
+        outgoing_frame_counter: u32,
+        network_key_installed: bool,
+        announced_address: u16,
+        announced_ieee: IeeeAddress,
+        monotonic_micros: u32,
+    }
+
+    /// Deterministic `Device_annce` transmitter used to inject TX failures.
+    struct ScriptedAnnce {
+        failures: u8,
+        attempts: u8,
+        observations: heapless::Vec<AnnounceObservation, 8>,
+    }
+
+    impl ScriptedAnnce {
+        fn failing(failures: u8) -> Self {
+            Self {
+                failures,
+                attempts: 0,
+                observations: heapless::Vec::new(),
+            }
+        }
+
+        fn always_failing() -> Self {
+            Self::failing(u8::MAX)
+        }
+    }
+
+    impl DeviceAnnceTransmitter<MockMac> for ScriptedAnnce {
+        async fn transmit(
+            &mut self,
+            zdo: &mut zigbee_zdo::ZdoLayer<MockMac>,
+            nwk_addr: ShortAddress,
+            ieee: IeeeAddress,
+        ) -> Result<(), ZdpStatus> {
+            // Exercise the real secured ZDO/NWK/MAC send path so each injected
+            // failure consumes, but never reuses, its outgoing frame counter.
+            let transmit_result = zdo.device_annce(nwk_addr, ieee).await;
+            self.attempts = self.attempts.saturating_add(1);
+            let _ = self.observations.push(AnnounceObservation {
+                short_address: zdo.nwk().nib().network_address.0,
+                outgoing_frame_counter: zdo.nwk().nib().outgoing_frame_counter,
+                network_key_installed: zdo.nwk().security().active_key().is_some(),
+                announced_address: nwk_addr.0,
+                announced_ieee: ieee,
+                monotonic_micros: zdo.nwk().mac().monotonic_micros(),
+            });
+            transmit_result?;
+            if self.attempts <= self.failures {
+                Err(ZdpStatus::NotActive)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A plain NWK data frame as relayed by the parent.
+    ///
+    /// The steering key-wait loop treats any frame that leaves an active NWK
+    /// key installed as the Transport-Key hit, so this frame plus the
+    /// pre-installed key models "Transport-Key received" without a
+    /// coordinator-side CCM* encryptor in the unit test.
+    fn parent_relayed_frame() -> heapless::Vec<u8, 32> {
+        let header = NwkHeader {
+            frame_control: NwkFrameControl {
+                frame_type: NwkFrameType::Data as u8,
+                protocol_version: 0x02,
+                discover_route: 0,
+                multicast: false,
+                security: false,
+                source_route: false,
+                dst_ieee_present: false,
+                src_ieee_present: false,
+                end_device_initiator: false,
+            },
+            dst_addr: ShortAddress(TEST_SHORT_ADDR),
+            src_addr: ShortAddress::COORDINATOR,
+            radius: 30,
+            seq_number: 1,
+            dst_ieee: None,
+            src_ieee: None,
+            multicast_control: None,
+            source_route: None,
+        };
+        let mut buf = [0u8; 32];
+        let header_len = header.serialize(&mut buf);
+        // APS data frame addressed to an endpoint this node does not host.
+        let aps = [0x00u8, 0x01, 0x00, 0x00, 0x04, 0x01, 0x01, 0x2A];
+        buf[header_len..header_len + aps.len()].copy_from_slice(&aps);
+        let mut frame = heapless::Vec::new();
+        let _ = frame.extend_from_slice(&buf[..header_len + aps.len()]);
+        frame
+    }
+
+    /// Sleepy end device parked one poll away from a joinable coordinator.
+    fn steerable_bdb() -> BdbLayer<MockMac> {
+        let mut bdb = test_bdb();
+        bdb.zdo_mut().aps_mut().nwk_mut().set_rx_on_when_idle(false);
+        {
+            let mac = bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
+            mac.add_beacon(PanDescriptor {
+                channel: TEST_CHANNEL,
+                coord_address: MacAddress::Short(PanId(TEST_PAN_ID), ShortAddress::COORDINATOR),
+                superframe_spec: SuperframeSpec {
+                    association_permit: true,
+                    pan_coordinator: true,
+                    ..Default::default()
+                },
+                lqi: 200,
+                security_use: false,
+                zigbee_beacon: ZigbeeBeaconPayload {
+                    protocol_id: 0,
+                    stack_profile: 2,
+                    protocol_version: 2,
+                    router_capacity: true,
+                    device_depth: 0,
+                    end_device_capacity: true,
+                    extended_pan_id: [0xBB; 8],
+                    tx_offset: [0xFF; 3],
+                    update_id: 0,
+                },
+            });
+            mac.set_associate_response(MlmeAssociateConfirm {
+                short_address: ShortAddress(TEST_SHORT_ADDR),
+                status: AssociationStatus::Success,
+            });
+            let frame = parent_relayed_frame();
+            mac.enqueue_poll_response(MacFrame::from_slice(&frame).unwrap());
+        }
+        // Model the Trust Center having transported the network key and having
+        // been recorded as the Trust Center by that exchange.
+        bdb.zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .security_mut()
+            .set_network_key(TEST_NETWORK_KEY, 0);
+        bdb.zdo_mut().aps_mut().nwk_mut().nib_mut().security_enabled = true;
+        bdb.zdo_mut().aps_mut().aib_mut().aps_trust_center_address = TEST_TC_IEEE;
+        bdb
+    }
+
+    fn mac_short_address(bdb: &BdbLayer<MockMac>) -> u16 {
+        match block_on(
+            bdb.zdo()
+                .aps()
+                .nwk()
+                .mac()
+                .mlme_get(PibAttribute::MacShortAddress),
+        ) {
+            Ok(PibValue::ShortAddress(addr)) => addr.0,
+            other => panic!("unexpected MacShortAddress: {:?}", other),
+        }
+    }
+
+    fn assert_counters_never_rewound(announce: &ScriptedAnnce) {
+        let mut previous: Option<u32> = None;
+        for observation in &announce.observations {
+            assert!(
+                observation.network_key_installed,
+                "the transported network key must survive an announce retry"
+            );
+            assert_eq!(
+                observation.short_address, TEST_SHORT_ADDR,
+                "the joined identity must survive an announce retry"
+            );
+            assert_eq!(observation.announced_address, TEST_SHORT_ADDR);
+            assert_eq!(
+                observation.announced_ieee,
+                [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+            );
+            if let Some(previous) = previous {
+                assert!(
+                    observation.outgoing_frame_counter > previous,
+                    "each announce attempt must consume a fresh outgoing NWK \
+                     frame counter ({} <= {})",
+                    observation.outgoing_frame_counter,
+                    previous,
+                );
+            }
+            previous = Some(observation.outgoing_frame_counter);
+        }
+    }
+
+    fn assert_retry_spacing(announce: &ScriptedAnnce) {
+        for attempts in announce.observations.windows(2) {
+            assert_eq!(
+                attempts[1]
+                    .monotonic_micros
+                    .wrapping_sub(attempts[0].monotonic_micros),
+                DEVICE_ANNCE_RETRY_INTERVAL_US,
+                "announce retries must be eight seconds apart"
+            );
+        }
+    }
+
+    #[test]
+    fn device_annce_retry_policy_is_five_attempts_eight_seconds_apart() {
+        assert_eq!(DEVICE_ANNCE_ATTEMPTS, 5);
+        assert_eq!(DEVICE_ANNCE_RETRY_INTERVAL_US, 8_000_000);
+        assert_eq!(
+            u32::from(DEVICE_ANNCE_RETRY_SLICES) * DEVICE_ANNCE_RETRY_SLICE_US,
+            DEVICE_ANNCE_RETRY_INTERVAL_US,
+            "the bounded slice budget must cover exactly one retry interval"
+        );
+    }
+
+    #[test]
+    fn device_annce_failures_retry_without_rescanning_or_reassociating() {
+        let mut bdb = steerable_bdb();
+        let mut announce = ScriptedAnnce::failing(3);
+        let mut persistence = TestPersistence::default();
+
+        let result =
+            block_on(bdb.network_steering_with_announce_for_test(&mut persistence, &mut announce));
+
+        assert_eq!(result, Ok(()), "a later announce success must commission");
+        assert_eq!(
+            announce.attempts, 4,
+            "the announce must be retried until it succeeds"
+        );
+        assert_counters_never_rewound(&announce);
+        assert_retry_spacing(&announce);
+        assert!(
+            persistence.network_reserved.is_some(),
+            "network security must be durably reserved before announcing"
+        );
+
+        let diagnostics = bdb.steering_diagnostics();
+        assert_eq!(
+            diagnostics.scan_requests, 1,
+            "a failed announce must not trigger another scan"
+        );
+        assert_eq!(
+            diagnostics.join_attempts, 1,
+            "a failed announce must not trigger another MAC association"
+        );
+        assert_eq!(diagnostics.join_successes, 1);
+        assert!(diagnostics.transport_key_received);
+        assert_eq!(diagnostics.assigned_address, TEST_SHORT_ADDR);
+        assert_eq!(
+            diagnostics.poll_attempts,
+            1 + 3 * DEVICE_ANNCE_RETRY_SLICES,
+            "each retry gap must be spent servicing the parent link"
+        );
+
+        assert_eq!(
+            mac_short_address(&bdb),
+            TEST_SHORT_ADDR,
+            "the MAC association must be left untouched by announce retries"
+        );
+        assert_eq!(
+            bdb.zdo().nwk().nib().network_address.0,
+            TEST_SHORT_ADDR,
+            "the assigned identity must be retained"
+        );
+        assert!(bdb.zdo().nwk().security().active_key().is_some());
+
+        assert!(
+            bdb.is_on_network(),
+            "a successful announce brings the network up"
+        );
+        assert!(
+            bdb.tclk_exchange_active(),
+            "a successful announce must arm the unique-TCLK exchange"
+        );
+        assert_eq!(bdb.tclk_exchange_stage(), Some(TclkStage::StartDelay));
+    }
+
+    #[test]
+    fn device_annce_arms_network_up_and_tclk_exchange_exactly_once() {
+        let mut bdb = steerable_bdb();
+        let mut announce = ScriptedAnnce::failing(2);
+        let mut persistence = TestPersistence::default();
+
+        assert_eq!(
+            block_on(bdb.network_steering_with_announce_for_test(&mut persistence, &mut announce)),
+            Ok(())
+        );
+
+        assert_eq!(announce.attempts, 3);
+        assert_retry_spacing(&announce);
+        assert_eq!(
+            announce.observations.len(),
+            3,
+            "no announce attempt may be issued after the successful one"
+        );
+        assert_eq!(bdb.tclk_exchange_stage(), Some(TclkStage::StartDelay));
+        // Exactly one exchange is armed: taking it leaves nothing behind.
+        assert_eq!(
+            block_on(bdb.advance_tclk_exchange(None)),
+            TclkProgress::InProgress
+        );
+        assert_eq!(bdb.steering_diagnostics().join_attempts, 1);
+    }
+
+    #[test]
+    fn device_annce_budget_exhaustion_fails_commissioning_explicitly() {
+        let mut bdb = steerable_bdb();
+        let mut announce = ScriptedAnnce::always_failing();
+        let mut persistence = TestPersistence::default();
+        let mut expected_key = bdb
+            .zdo()
+            .nwk()
+            .security()
+            .active_key()
+            .map(|entry| entry.key);
+
+        let result =
+            block_on(bdb.network_steering_with_announce_for_test(&mut persistence, &mut announce));
+
+        assert_eq!(
+            result,
+            Err(BdbStatus::SteeringFailure),
+            "an exhausted announce budget must fail commissioning explicitly"
+        );
+        assert_eq!(
+            announce.attempts, DEVICE_ANNCE_ATTEMPTS,
+            "the announce budget must be spent exactly once"
+        );
+        assert_counters_never_rewound(&announce);
+        assert_retry_spacing(&announce);
+        assert!(
+            persistence.network_reserved.is_some(),
+            "retry exhaustion must not bypass the durable counter reservation"
+        );
+        assert_eq!(
+            bdb.attributes().commissioning_status,
+            crate::attributes::BdbCommissioningStatus::SteeringFormationFailure,
+        );
+
+        let diagnostics = bdb.steering_diagnostics();
+        assert_eq!(
+            diagnostics.scan_requests, 1,
+            "an exhausted announce budget must not rescan"
+        );
+        assert_eq!(
+            diagnostics.join_attempts, 1,
+            "an exhausted announce budget must not re-associate"
+        );
+        assert_eq!(
+            diagnostics.poll_attempts,
+            1 + 4 * DEVICE_ANNCE_RETRY_SLICES,
+            "four retry gaps must be spent servicing the parent link"
+        );
+
+        assert!(
+            !bdb.is_on_network(),
+            "commissioning failed, so the node must not claim to be on a network"
+        );
+        assert!(
+            !bdb.tclk_exchange_active(),
+            "no unique-TCLK exchange may be armed after an announce failure"
+        );
+        assert_eq!(
+            mac_short_address(&bdb),
+            TEST_SHORT_ADDR,
+            "association must be preserved for the caller to decide the next step"
+        );
+        assert_eq!(bdb.zdo().nwk().nib().network_address.0, TEST_SHORT_ADDR);
+        let retained_key = bdb
+            .zdo()
+            .nwk()
+            .security()
+            .active_key()
+            .map(|entry| entry.key);
+        assert_eq!(
+            retained_key,
+            expected_key.take(),
+            "the transported network key must not be discarded on announce failure"
+        );
+    }
+
     #[derive(Default)]
     struct TestPersistence {
+        network_reserved: Option<NetworkSecurityState>,
         reserved: Option<TrustCenterLinkKeyState>,
         committed: Option<TrustCenterLinkKeyState>,
     }
@@ -189,9 +683,13 @@ mod tests {
     impl SecurityPersistence for TestPersistence {
         fn reserve_network_security(
             &mut self,
-            _state: &NetworkSecurityState,
+            state: &NetworkSecurityState,
         ) -> Result<crate::CounterReservation, crate::SecurityPersistenceError> {
-            unreachable!()
+            self.network_reserved = Some(*state);
+            Ok(crate::CounterReservation {
+                current: 0x100,
+                limit: 0x200,
+            })
         }
 
         fn reserve_trust_center_link_key(
@@ -272,7 +770,7 @@ impl<M: MacDriver> BdbLayer<M> {
     /// returns once the network is up; the caller must continue normal stack
     /// processing and call [`Self::advance_tclk_exchange`] until completion.
     pub async fn network_steering(&mut self) -> Result<(), BdbStatus> {
-        self.network_steering_inner(None).await
+        self.network_steering_inner(None, &mut ZdoDeviceAnnce).await
     }
 
     /// Event-driven Network Steering with synchronous security persistence.
@@ -284,20 +782,37 @@ impl<M: MacDriver> BdbLayer<M> {
         &mut self,
         persistence: &mut dyn SecurityPersistence,
     ) -> Result<(), BdbStatus> {
-        self.network_steering_inner(Some(persistence)).await
+        self.network_steering_inner(Some(persistence), &mut ZdoDeviceAnnce)
+            .await
     }
 
-    async fn network_steering_inner(
+    async fn network_steering_inner<T: DeviceAnnceTransmitter<M>>(
         &mut self,
         persistence: Option<&mut (dyn SecurityPersistence + '_)>,
+        announce: &mut T,
     ) -> Result<(), BdbStatus> {
         self.steering_diagnostics = SteeringDiagnostics::default();
         self.tclk_exchange = None;
         if self.attributes.node_is_on_a_network {
             self.steer_on_network().await
         } else {
-            self.steer_off_network(persistence).await
+            self.steer_off_network(persistence, announce).await
         }
+    }
+
+    /// Run off-network steering with an injected `Device_annce` transmitter.
+    ///
+    /// Test-only entry point: it exercises exactly the production path of
+    /// [`Self::network_steering`] while letting a test choose which announce
+    /// attempts fail.
+    #[cfg(test)]
+    async fn network_steering_with_announce_for_test<T: DeviceAnnceTransmitter<M>>(
+        &mut self,
+        persistence: &mut dyn SecurityPersistence,
+        announce: &mut T,
+    ) -> Result<(), BdbStatus> {
+        self.network_steering_inner(Some(persistence), announce)
+            .await
     }
 
     /// Advance the armed unique Trust Center link-key exchange by one bounded
@@ -322,17 +837,38 @@ impl<M: MacDriver> BdbLayer<M> {
             return TclkProgress::Complete;
         };
         let progress = self.step_tclk_exchange(&mut exchange, persistence).await;
-        if matches!(progress, TclkProgress::InProgress) {
-            self.tclk_exchange = Some(exchange);
+        match progress {
+            TclkProgress::InProgress => {
+                self.tclk_exchange = Some(exchange);
+            }
+            TclkProgress::Complete => {
+                let nwk_addr = self.zdo.local_nwk_addr();
+                let ieee = self.zdo.local_ieee_addr();
+                match self.zdo.device_annce(nwk_addr, ieee).await {
+                    Ok(()) => {
+                        log::info!("[BDB:Steering] Post-authentication Device_annce sent");
+                    }
+                    Err(status) => {
+                        log::warn!(
+                            "[BDB:Steering] Post-authentication Device_annce failed: {:?}",
+                            status
+                        );
+                    }
+                }
+            }
+            TclkProgress::Failed(_) => {}
         }
         progress
     }
 
     /// Steering when the device is NOT on a network — join an existing PAN.
-    async fn steer_off_network(
+    async fn steer_off_network<T: DeviceAnnceTransmitter<M>>(
         &mut self,
         mut persistence: Option<&mut (dyn SecurityPersistence + '_)>,
+        announce: &mut T,
     ) -> Result<(), BdbStatus> {
+        self.steering_diagnostics.attempt_started_us =
+            self.zdo.aps().nwk().mac().monotonic_micros();
         self.steering_diagnostics.stage = SteeringStage::Scanning;
         let mut discovered_any = false;
         let mut discovered_networks_total: u16 = 0;
@@ -493,6 +1029,8 @@ impl<M: MacDriver> BdbLayer<M> {
                         match self.zdo.nlme_join(network).await {
                             Ok(addr) => {
                                 bdb_diag!("[BDB] nlme_join=ok addr=0x{:04X}", addr.0);
+                                self.steering_diagnostics.association_complete_us =
+                                    self.zdo.aps().nwk().mac().monotonic_micros();
                                 self.steering_diagnostics.join_successes =
                                     self.steering_diagnostics.join_successes.saturating_add(1);
                                 self.steering_diagnostics.last_join_status = 0;
@@ -679,10 +1217,6 @@ impl<M: MacDriver> BdbLayer<M> {
                             break;
                         }
 
-                        if key_received {
-                            break;
-                        }
-
                         if got_data_this_round {
                             empty_count = 0;
                         } else {
@@ -739,17 +1273,21 @@ impl<M: MacDriver> BdbLayer<M> {
 
                     self.steering_diagnostics.stage = SteeringStage::TransportKeyReceived;
                     self.steering_diagnostics.transport_key_received = true;
+                    self.steering_diagnostics.transport_key_received_us =
+                        self.zdo.aps().nwk().mac().monotonic_micros();
 
-                    if let Some(persistence) = persistence.as_deref_mut()
-                        && let Err(error) = self.reserve_network_security(persistence)
-                    {
-                        self.steering_diagnostics.stage = SteeringStage::PersistenceFailed;
-                        log::error!(
-                            "[BDB:Steering] Failed to persist network security: {:?}",
-                            error
-                        );
-                        let _ = self.zdo.nlme_reset(false);
-                        return Err(BdbStatus::PersistenceFailure);
+                    if let Some(persistence) = persistence.as_deref_mut() {
+                        if let Err(error) = self.reserve_network_security(persistence) {
+                            self.steering_diagnostics.stage = SteeringStage::PersistenceFailed;
+                            log::error!(
+                                "[BDB:Steering] Failed to persist network security: {:?}",
+                                error
+                            );
+                            let _ = self.zdo.nlme_reset(false);
+                            return Err(BdbStatus::PersistenceFailure);
+                        }
+                        self.steering_diagnostics.security_reserved_us =
+                            self.zdo.aps().nwk().mac().monotonic_micros();
                     }
 
                     // Step 5c: Send Device_annce now that we have the NWK key
@@ -761,11 +1299,26 @@ impl<M: MacDriver> BdbLayer<M> {
                         nwk_addr.0,
                         ieee
                     );
-                    if let Err(e) = self.zdo.device_annce(nwk_addr, ieee).await {
-                        log::warn!("[BDB:Steering] Device_annce failed: {:?}", e);
-                        let _ = self.zdo.nlme_reset(false);
-                        continue;
+                    // The join, the installed network key and the reserved
+                    // security counters survive a failed announce: retry the
+                    // broadcast in place and fail commissioning explicitly only
+                    // once the budget is exhausted. Never reset/rejoin here —
+                    // that would re-associate, re-authenticate and discard
+                    // already reserved outgoing frame-counter space.
+                    if let Err(status) = self.announce_with_retry(announce, nwk_addr, ieee).await {
+                        self.attributes.commissioning_status =
+                            crate::attributes::BdbCommissioningStatus::SteeringFormationFailure;
+                        bdb_diag!("[BDB] device_annce=failed status={:?}", status);
+                        log::error!(
+                            "[BDB:Steering] Device_annce failed after {} attempts ({:?}) — \
+                             keeping association/key/counters, commissioning failed",
+                            DEVICE_ANNCE_ATTEMPTS,
+                            status,
+                        );
+                        return Err(BdbStatus::SteeringFailure);
                     }
+                    self.steering_diagnostics.device_annce_sent_us =
+                        self.zdo.aps().nwk().mac().monotonic_micros();
 
                     // Step 5d: retrieve a unique Trust Center link key, prove
                     // possession, and wait for a successful Confirm-Key. In the
@@ -790,6 +1343,7 @@ impl<M: MacDriver> BdbLayer<M> {
                     // Confirm-Key via the persistence hook.
                     self.attributes.node_is_on_a_network = true;
                     let now = self.zdo.aps().nwk().mac().monotonic_micros();
+                    self.steering_diagnostics.network_up_us = now;
                     self.tclk_exchange = Some(TclkExchange::new(tc_addr, tc_ieee, now));
                     bdb_diag!("[BDB] steering=network_up addr=0x{:04X}", nwk_addr.0);
                     log::info!(
@@ -839,6 +1393,143 @@ impl<M: MacDriver> BdbLayer<M> {
         self.attributes.commissioning_status =
             crate::attributes::BdbCommissioningStatus::NoScanResponse;
         Err(BdbStatus::NoScanResponse)
+    }
+
+    /// Broadcast `Device_annce` with a bounded retry budget.
+    ///
+    /// Called once the device is associated, holds the network key and has a
+    /// durable outgoing frame-counter reservation. Each attempt reuses that
+    /// state: nothing here resets the MAC/NWK join, removes keys, or rewinds a
+    /// frame counter, so security-counter monotonicity is preserved across
+    /// retries. Returns the last transmit error once every attempt has failed.
+    async fn announce_with_retry<T: DeviceAnnceTransmitter<M>>(
+        &mut self,
+        announce: &mut T,
+        nwk_addr: ShortAddress,
+        ieee: IeeeAddress,
+    ) -> Result<(), ZdpStatus> {
+        let mut last_error = ZdpStatus::NotActive;
+        for attempt in 1..=DEVICE_ANNCE_ATTEMPTS {
+            self.steering_diagnostics.device_annce_attempts = attempt;
+            match announce.transmit(&mut self.zdo, nwk_addr, ieee).await {
+                Ok(()) => {
+                    bdb_diag!("[BDB] device_annce=ok attempt={}", attempt);
+                    if attempt > 1 {
+                        log::info!(
+                            "[BDB:Steering] Device_annce succeeded on attempt {}/{}",
+                            attempt,
+                            DEVICE_ANNCE_ATTEMPTS,
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(status) => {
+                    last_error = status;
+                    self.steering_diagnostics.device_annce_failures = self
+                        .steering_diagnostics
+                        .device_annce_failures
+                        .saturating_add(1);
+                    bdb_diag!(
+                        "[BDB] device_annce=retry attempt={} status={:?}",
+                        attempt,
+                        status
+                    );
+                    log::warn!(
+                        "[BDB:Steering] Device_annce attempt {}/{} failed: {:?}",
+                        attempt,
+                        DEVICE_ANNCE_ATTEMPTS,
+                        status,
+                    );
+                }
+            }
+            if attempt < DEVICE_ANNCE_ATTEMPTS {
+                self.wait_before_announce_retry().await;
+            }
+        }
+        Err(last_error)
+    }
+
+    /// Wait out the spacing between two `Device_annce` attempts.
+    ///
+    /// Each bounded slice polls for a sleepy device or receives otherwise, then
+    /// asynchronously delays for any unconsumed part of that slice. This keeps
+    /// the parent link serviced while enforcing the full monotonic interval
+    /// even when the MAC reports "no data" immediately. There is no blocking
+    /// sleep and no unbounded loop.
+    async fn wait_before_announce_retry(&mut self) {
+        let started = self.zdo.aps().nwk().mac().monotonic_micros();
+        let rx_on = self.zdo.nwk().rx_on_when_idle();
+        for slice_index in 1..=DEVICE_ANNCE_RETRY_SLICES {
+            let elapsed = self
+                .zdo
+                .aps()
+                .nwk()
+                .mac()
+                .monotonic_micros()
+                .wrapping_sub(started);
+            let Some(remaining) = DEVICE_ANNCE_RETRY_INTERVAL_US.checked_sub(elapsed) else {
+                break;
+            };
+            if remaining == 0 {
+                break;
+            }
+            let slice = DEVICE_ANNCE_RETRY_SLICE_US.min(remaining);
+            if rx_on {
+                if let Ok(indication) = self
+                    .zdo
+                    .aps_mut()
+                    .nwk_mut()
+                    .mac_mut()
+                    .mcps_data_indication_timeout(slice)
+                    .await
+                {
+                    self.steering_diagnostics.passive_rx_frames = self
+                        .steering_diagnostics
+                        .passive_rx_frames
+                        .saturating_add(1);
+                    let _ = self.try_process_frame(indication.payload.as_slice());
+                }
+            } else {
+                self.steering_diagnostics.poll_attempts =
+                    self.steering_diagnostics.poll_attempts.saturating_add(1);
+                match self
+                    .zdo
+                    .aps_mut()
+                    .nwk_mut()
+                    .mac_mut()
+                    .mlme_poll_timeout(slice)
+                    .await
+                {
+                    Ok(Some(frame)) => {
+                        self.steering_diagnostics.poll_data_frames =
+                            self.steering_diagnostics.poll_data_frames.saturating_add(1);
+                        let _ = self.try_process_frame(frame.as_slice());
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        self.steering_diagnostics.poll_errors =
+                            self.steering_diagnostics.poll_errors.saturating_add(1);
+                    }
+                }
+            }
+
+            let target_elapsed = u32::from(slice_index).saturating_mul(DEVICE_ANNCE_RETRY_SLICE_US);
+            let elapsed = self
+                .zdo
+                .aps()
+                .nwk()
+                .mac()
+                .monotonic_micros()
+                .wrapping_sub(started);
+            if elapsed < target_elapsed {
+                self.zdo
+                    .aps_mut()
+                    .nwk_mut()
+                    .mac_mut()
+                    .delay_micros(target_elapsed - elapsed)
+                    .await;
+            }
+        }
     }
 
     fn reserve_network_security(
@@ -1208,6 +1899,7 @@ impl<M: MacDriver> BdbLayer<M> {
         self.attributes.node_is_on_a_network = true;
         self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::Success;
         self.steering_diagnostics.stage = SteeringStage::Complete;
+        self.steering_diagnostics.tclk_complete_us = self.zdo.aps().nwk().mac().monotonic_micros();
         ex.stage = TclkStage::Complete;
         bdb_diag!("[BDB] tclk_exchange=complete");
         log::info!("[BDB:Steering] Commissioning security complete");
@@ -1559,7 +2251,10 @@ impl<M: MacDriver> BdbLayer<M> {
                     nwk_hdr.src_addr,
                     nwk_hdr.dst_addr,
                     lqi,
-                    nwk_hdr.frame_control.security,
+                    zigbee_aps::apsde::IncomingNwkSecurity::new(
+                        nwk_hdr.frame_control.security,
+                        None,
+                    ),
                     &mut aps_buf,
                 )
             };

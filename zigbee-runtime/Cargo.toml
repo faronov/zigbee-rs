@@ -29,3 +29,7 @@ constrained-memory = [
 
 [dev-dependencies]
 zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }
+# Exercise the shared NWK relay/routing path in host tests. Routing, BTR,
+# source-route and indirect tables are compiled to zero capacity without this
+# feature, so the router-side receive behaviour cannot be observed otherwise.
+zigbee-nwk = { path = "../zigbee-nwk", features = ["router"] }

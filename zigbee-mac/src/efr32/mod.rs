@@ -1061,6 +1061,7 @@ impl MacDriver for Efr32Mac {
             self.short_address,
             req.payload,
             ack_requested,
+            req.tx_options.frame_pending,
         );
 
         self.csma_ca_transmit(&mac_frame, ack_requested).await?;
@@ -1310,10 +1311,14 @@ fn build_data_frame(
     src_short: ShortAddress,
     payload: &[u8],
     ack: bool,
+    frame_pending: bool,
 ) -> heapless::Vec<u8, 127> {
     let mut frame: heapless::Vec<u8, 127> = heapless::Vec::new();
 
     let mut fc: u16 = 0x8861; // data + dst short + src short + PAN compress
+    if frame_pending {
+        fc |= 0x0010;
+    }
     if ack {
         fc |= 0x0020;
     }

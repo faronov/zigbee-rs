@@ -500,6 +500,7 @@ aps.apsme_transport_key(&ApsmeTransportKeyRequest {
     dst_address: remote_ieee,
     key_type: ApsKeyType::ApplicationLinkKey,
     key: my_app_key,
+    key_seq_number: 0, // used only for NetworkKey
 }).await;
 
 // Request a key from the Trust Center

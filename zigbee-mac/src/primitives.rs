@@ -6,6 +6,7 @@
 //!   - Confirm:    result MAC sends UP after completing the request
 //!   - Indication: unsolicited event MAC sends UP (e.g. received frame)
 
+use crate::{MacError, pib::PibPayload};
 use zigbee_types::{ChannelMask, IeeeAddress, MacAddress, PanId, ShortAddress};
 
 // ── Scan ────────────────────────────────────────────────────────
@@ -128,7 +129,7 @@ pub type EdList = heapless::Vec<EdValue, MAX_ED_VALUES>;
 // ── Association ─────────────────────────────────────────────────
 
 /// Device capability info (sent in Association Request)
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CapabilityInfo {
     /// Device is an FFD (Full Function Device)
     pub device_type_ffd: bool,
@@ -203,11 +204,59 @@ pub struct MlmeAssociateConfirm {
 }
 
 /// MLME-ASSOCIATE.indication — coordinator received association request
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlmeAssociateIndication {
     /// Extended address of the requesting device
     pub device_address: IeeeAddress,
+    /// Address of the coordinator/router targeted by the request.
+    pub coordinator_address: MacAddress,
     pub capability_info: CapabilityInfo,
+    pub lqi: u8,
+    /// Whether MAC security was enabled on the received command.
+    pub security_use: bool,
+}
+
+/// A coordinator/router received a Beacon Request command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlmeBeaconRequestIndication {
+    /// Broadcast destination carried by the request.
+    pub destination_address: MacAddress,
+    pub lqi: u8,
+    /// Whether MAC security was enabled on the received command.
+    pub security_use: bool,
+}
+
+/// A coordinator/router received a Data Request command.
+///
+/// `source_address` is deliberately a full [`MacAddress`]: associated
+/// children normally poll with a short address, while a device waiting for
+/// its Association Response polls with its extended address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlmeDataRequestIndication {
+    pub source_address: MacAddress,
+    pub destination_address: MacAddress,
+    pub lqi: u8,
+    /// Whether MAC security was enabled on the received command.
+    pub security_use: bool,
+}
+
+/// Completion of a deferred MLME-ASSOCIATE.response transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlmeAssociateResponseDelivery {
+    pub device_address: IeeeAddress,
+    pub short_address: ShortAddress,
+    pub status: AssociationStatus,
+    /// `Ok(())` means the Association Response was acknowledged over the air.
+    pub result: Result<(), MacError>,
+}
+
+/// MAC management/command event delivered independently of MCPS data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MacCommandEvent {
+    BeaconRequest(MlmeBeaconRequestIndication),
+    AssociationRequest(MlmeAssociateIndication),
+    AssociationResponseDelivery(MlmeAssociateResponseDelivery),
+    DataRequest(MlmeDataRequestIndication),
 }
 
 /// MLME-ASSOCIATE.response — coordinator's reply to association request
@@ -218,6 +267,39 @@ pub struct MlmeAssociateResponse {
     /// Short address to assign (or 0xFFFE to deny)
     pub short_address: ShortAddress,
     pub status: AssociationStatus,
+}
+
+// ── Beacon response / indirect delivery ────────────────────────
+
+/// Maximum number of pending short or extended addresses encodable in one
+/// IEEE 802.15.4 beacon Pending Address Specification field.
+pub const MAX_BEACON_PENDING_ADDRESSES: usize = 7;
+pub type BeaconPendingShortList = heapless::Vec<ShortAddress, MAX_BEACON_PENDING_ADDRESSES>;
+pub type BeaconPendingExtendedList = heapless::Vec<IeeeAddress, MAX_BEACON_PENDING_ADDRESSES>;
+
+/// Parameters for an on-demand beacon response in Zigbee non-beacon mode.
+///
+/// Beacon/superframe orders are fixed to 15, the GTS specification is empty,
+/// and the bounded pending-address lists are encoded in the MAC beacon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlmeBeaconResponse {
+    pub pan_coordinator: bool,
+    pub association_permit: bool,
+    pub pending_short_addresses: BeaconPendingShortList,
+    pub pending_extended_addresses: BeaconPendingExtendedList,
+    pub beacon_payload: PibPayload,
+}
+
+impl MlmeBeaconResponse {
+    pub fn new(beacon_payload: PibPayload) -> Self {
+        Self {
+            pan_coordinator: false,
+            association_permit: false,
+            pending_short_addresses: BeaconPendingShortList::new(),
+            pending_extended_addresses: BeaconPendingExtendedList::new(),
+            beacon_payload,
+        }
+    }
 }
 
 // ── Disassociation ──────────────────────────────────────────────
@@ -263,6 +345,8 @@ pub struct MlmeStartRequest {
 pub struct TxOptions {
     /// Request MAC-level acknowledgement
     pub ack_tx: bool,
+    /// Advertise that another indirect transaction remains queued.
+    pub frame_pending: bool,
     /// Use indirect transmission (coordinator → sleepy device)
     pub indirect: bool,
     /// Apply MAC-level security

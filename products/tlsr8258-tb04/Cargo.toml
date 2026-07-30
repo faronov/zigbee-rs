@@ -1,0 +1,17 @@
+[package]
+name = "tlsr8258-tb04-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product flash layout and persistence policy for TLSR8258 TB-04 firmware"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+embedded-storage = "0.3"
+tlsr8258-hal = { path = "../../tlsr8258-hal" }
+tlsr8258-tb04 = { path = "../../boards/tlsr8258-tb04" }
+zigbee-runtime = { path = "../../zigbee-runtime" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

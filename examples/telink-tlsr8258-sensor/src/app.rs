@@ -15,7 +15,7 @@ use zigbee_zcl::data_types::{ZclDataType, ZclValue};
 use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
 use zigbee_zcl::{ClusterId, DeviceId};
 
-use tlsr8258_tb04::{leds as board, storage};
+use tlsr8258_tb04::{leds::StatusLeds, resources::BoardResources};
 
 // Preserve the IEEE address used by the hardware-proven runtime image so the
 // existing journal and ZHA device identity remain valid across this refactor.
@@ -51,10 +51,10 @@ fn setup_test_reporting(device: &mut ZigbeeDevice<TelinkMac>) -> bool {
     temperature.is_ok() && humidity.is_ok()
 }
 
-fn failure() -> ! {
-    board::LED_GREEN.write(false);
-    board::LED_BLUE.write(false);
-    board::LED_RED.write(true);
+fn failure(leds: &StatusLeds) -> ! {
+    leds.green.write(false);
+    leds.blue.write(false);
+    leds.red.write(true);
     loop {
         tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(1_000));
     }
@@ -63,8 +63,15 @@ fn failure() -> ! {
 pub fn run() -> ! {
     type Device = ZigbeeDevice<TelinkMac>;
 
-    if board::configure_status_leds().is_err() {
-        failure();
+    let resources = match BoardResources::take() {
+        Some(resources) => resources,
+        None => loop {
+            core::hint::spin_loop();
+        },
+    };
+    let leds = resources.lighting.into_status_leds();
+    if leds.init().is_err() {
+        failure(&leds);
     }
 
     let mut ieee_address = [0u8; 8];
@@ -128,7 +135,7 @@ pub fn run() -> ! {
         )
         .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
     if !setup_test_reporting(device) {
-        failure();
+        failure(&leds);
     }
 
     let mut clusters = [
@@ -145,12 +152,12 @@ pub fn run() -> ! {
             cluster: hum_cluster,
         },
     ];
-    let mut security_store = storage::security_store();
+    let mut security_store = tlsr8258_tb04_product::storage::security_store(resources.flash);
     if device
-        .reset_security_state_if_identity_changed(&mut security_store)
+        .reset_security_state_if_identity_changed(&mut security_store, ieee_address)
         .is_err()
     {
-        failure();
+        failure(&leds);
     }
     let mut sensor_sample = 0u32;
     let mut sensor_update_elapsed = 0u16;
@@ -166,15 +173,15 @@ pub fn run() -> ! {
                 Err(StartError::CommissioningFailed(_)) if attempts < 10 => {
                     tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(5_000));
                 }
-                Err(_) => failure(),
+                Err(_) => failure(&leds),
             }
         }
 
-        board::LED_RED.write(false);
-        board::LED_GREEN.write(true);
-        board::LED_BLUE.write(false);
+        leds.red.write(false);
+        leds.green.write(true);
+        leds.blue.write(false);
         if apply_synthetic_reading(&mut clusters, 1, TEST_SENSOR.sample(sensor_sample)).is_err() {
-            failure();
+            failure(&leds);
         }
 
         let one_second = tlsr8258_hal::timer::ms(1_000);
@@ -201,14 +208,14 @@ pub fn run() -> ! {
                                 )
                                 .is_err()
                                 {
-                                    failure();
+                                    failure(&leds);
                                 }
-                                board::LED_GREEN.write(false);
-                                board::LED_RED.write(true);
+                                leds.green.write(false);
+                                leds.red.write(true);
                                 continue 'commission;
                             }
                             Ok(_) => {}
-                            Err(_) => failure(),
+                            Err(_) => failure(&leds),
                         }
 
                         if tlsr8258_rt::block_on(device.tick_with_security_store(
@@ -218,7 +225,7 @@ pub fn run() -> ! {
                         ))
                         .is_err()
                         {
-                            failure();
+                            failure(&leds);
                         }
                     }
                     Ok(None) => break,
@@ -238,7 +245,7 @@ pub fn run() -> ! {
                     if apply_synthetic_reading(&mut clusters, 1, TEST_SENSOR.sample(sensor_sample))
                         .is_err()
                     {
-                        failure();
+                        failure(&leds);
                     }
                 }
                 if tlsr8258_rt::block_on(device.tick_with_security_store(
@@ -248,7 +255,7 @@ pub fn run() -> ! {
                 ))
                 .is_err()
                 {
-                    failure();
+                    failure(&leds);
                 }
             }
 

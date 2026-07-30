@@ -128,7 +128,7 @@ fn main() {
 
     let mac_for_device = MockMac::new(light_ieee);
     let device = templates::dimmable_light(mac_for_device)
-        .manufacturer("zigbee-rs")
+        .manufacturer("Zigbee-RS")
         .model("MockDimLight-01")
         .date_code("20250101")
         .sw_build("0.1.0")

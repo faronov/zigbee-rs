@@ -46,6 +46,8 @@ pub struct NeighborEntry {
     pub device_type: NeighborDeviceType,
     /// Rx on when idle (false = sleepy end device)
     pub rx_on_when_idle: bool,
+    /// Security-capable bit supplied by the device during admission.
+    pub security_capable: bool,
     /// Relationship to us
     pub relationship: Relationship,
     /// Link Quality Indicator (rolling average)
@@ -71,6 +73,7 @@ impl NeighborEntry {
             network_address: ShortAddress(0xFFFF),
             device_type: NeighborDeviceType::Unknown,
             rx_on_when_idle: false,
+            security_capable: false,
             relationship: Relationship::Sibling,
             lqi: 0,
             outgoing_cost: 7,
@@ -131,6 +134,13 @@ impl NeighborTable {
             .find(|e| e.active && e.ieee_address == *addr)
     }
 
+    /// Find neighbor by IEEE address (mutable).
+    pub fn find_by_ieee_mut(&mut self, addr: &IeeeAddress) -> Option<&mut NeighborEntry> {
+        self.entries[..self.count]
+            .iter_mut()
+            .find(|e| e.active && e.ieee_address == *addr)
+    }
+
     /// Find neighbor by short address (mutable).
     pub fn find_by_short_mut(&mut self, addr: ShortAddress) -> Option<&mut NeighborEntry> {
         self.entries[..self.count]
@@ -147,21 +157,50 @@ impl NeighborTable {
 
     /// Get all children.
     pub fn children(&self) -> impl Iterator<Item = &NeighborEntry> {
-        self.entries[..self.count]
-            .iter()
-            .filter(|e| e.active && e.relationship == Relationship::Child)
+        self.entries[..self.count].iter().filter(|e| {
+            e.active
+                && matches!(
+                    e.relationship,
+                    Relationship::Child | Relationship::UnauthenticatedChild
+                )
+        })
+    }
+
+    /// Whether a child can be inserted without evicting a parent or child.
+    pub fn has_child_slot(&self) -> bool {
+        self.entries.iter().any(|entry| !entry.active)
+            || self.entries.iter().any(|entry| {
+                entry.active
+                    && !matches!(
+                        entry.relationship,
+                        Relationship::Parent
+                            | Relationship::Child
+                            | Relationship::UnauthenticatedChild
+                    )
+            })
     }
 
     /// Add or update a neighbor entry. Returns Ok if added, Err if table full.
     #[allow(clippy::result_unit_err)]
     pub fn add_or_update(&mut self, entry: NeighborEntry) -> Result<(), ()> {
-        // Check if already present
-        if let Some(existing) = self.entries[..self.count]
-            .iter_mut()
-            .find(|e| e.active && e.network_address == entry.network_address)
-        {
-            *existing = entry;
-            existing.active = true;
+        // Both addresses are unique identifiers. Merge any stale entries that
+        // match either one so IEEE and short-address lookups cannot disagree.
+        let mut existing_index = None;
+        for index in 0..self.count {
+            if self.entries[index].active
+                && (self.entries[index].network_address == entry.network_address
+                    || self.entries[index].ieee_address == entry.ieee_address)
+            {
+                if existing_index.is_none() {
+                    existing_index = Some(index);
+                } else {
+                    self.entries[index].active = false;
+                }
+            }
+        }
+        if let Some(index) = existing_index {
+            self.entries[index] = entry;
+            self.entries[index].active = true;
             return Ok(());
         }
 
@@ -174,13 +213,19 @@ impl NeighborTable {
             }
             Ok(())
         } else {
-            // Table full — try to evict oldest non-parent, non-child
+            // Table full — evict only entries outside an active
+            // parent/child authorization relationship.
             if let Some(victim) = self
                 .entries
                 .iter_mut()
                 .filter(|e| {
                     e.active
-                        && !matches!(e.relationship, Relationship::Parent | Relationship::Child)
+                        && !matches!(
+                            e.relationship,
+                            Relationship::Parent
+                                | Relationship::Child
+                                | Relationship::UnauthenticatedChild
+                        )
                 })
                 .max_by_key(|e| e.age)
             {
@@ -211,6 +256,23 @@ impl NeighborTable {
         }
     }
 
+    /// Remove provisional children that did not prove network-key possession.
+    pub fn expire_unauthenticated(
+        &mut self,
+        max_age: u16,
+    ) -> heapless::Vec<ShortAddress, MAX_NEIGHBORS> {
+        let mut expired = heapless::Vec::new();
+        for entry in self.entries.iter_mut().filter(|entry| {
+            entry.active
+                && entry.relationship == Relationship::UnauthenticatedChild
+                && entry.age >= max_age
+        }) {
+            let _ = expired.push(entry.network_address);
+            entry.active = false;
+        }
+        expired
+    }
+
     /// Number of active entries.
     pub fn len(&self) -> usize {
         self.entries.iter().filter(|e| e.active).count()
@@ -234,5 +296,59 @@ impl NeighborTable {
 impl Default for NeighborTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, feature = "router"))]
+mod tests {
+    use super::*;
+
+    fn entry(index: usize, relationship: Relationship) -> NeighborEntry {
+        let mut entry =
+            NeighborEntry::new_from_annce(ShortAddress((index + 1) as u16), [(index + 1) as u8; 8]);
+        entry.relationship = relationship;
+        entry.age = index as u16;
+        entry
+    }
+
+    #[test]
+    fn provisional_child_is_not_evicted_from_a_full_table() {
+        let mut table = NeighborTable::new();
+        table
+            .add_or_update(entry(0, Relationship::UnauthenticatedChild))
+            .unwrap();
+        for index in 1..MAX_NEIGHBORS {
+            table
+                .add_or_update(entry(index, Relationship::Child))
+                .unwrap();
+        }
+
+        assert!(
+            table
+                .add_or_update(entry(MAX_NEIGHBORS, Relationship::Sibling))
+                .is_err()
+        );
+        assert_eq!(
+            table.find_by_short(ShortAddress(1)).unwrap().relationship,
+            Relationship::UnauthenticatedChild
+        );
+    }
+
+    #[test]
+    fn ieee_address_update_reuses_the_existing_neighbor_slot() {
+        let mut table = NeighborTable::new();
+        let announced = entry(0, Relationship::Sibling);
+        let ieee = announced.ieee_address;
+        table.add_or_update(announced).unwrap();
+
+        let mut child = entry(1, Relationship::UnauthenticatedChild);
+        child.ieee_address = ieee;
+        table.add_or_update(child).unwrap();
+
+        assert_eq!(table.len(), 1);
+        assert!(table.find_by_short(ShortAddress(1)).is_none());
+        let found = table.find_by_ieee(&ieee).unwrap();
+        assert_eq!(found.network_address, ShortAddress(2));
+        assert_eq!(found.relationship, Relationship::UnauthenticatedChild);
     }
 }

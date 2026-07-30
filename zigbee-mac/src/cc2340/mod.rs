@@ -139,11 +139,15 @@ impl Cc2340Mac {
         dst_address: &MacAddress,
         payload: &[u8],
         ack_request: bool,
+        frame_pending: bool,
     ) -> heapless::Vec<u8, 127> {
         let mut frame = heapless::Vec::new();
         let seq = self.next_dsn();
 
         let mut fc: u16 = 0x0001; // Data frame
+        if frame_pending {
+            fc |= 0x0010;
+        }
         if ack_request {
             fc |= 0x0020;
         }
@@ -733,7 +737,12 @@ impl MacDriver for Cc2340Mac {
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
         let ack_requested = req.tx_options.ack_tx;
-        let frame = self.build_data_frame(&req.dst_address, req.payload, ack_requested);
+        let frame = self.build_data_frame(
+            &req.dst_address,
+            req.payload,
+            ack_requested,
+            req.tx_options.frame_pending,
+        );
 
         // Unslotted CSMA-CA
         let mut be = self.min_be;

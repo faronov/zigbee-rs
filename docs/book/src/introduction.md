@@ -71,10 +71,11 @@ The MAC layer provides **11 supported chip targets**:
 
 ## Current Status
 
-zigbee-rs is **functional for end devices** (sensors, lights, sleepy devices).
-The mock examples exercise the full lifecycle — network scan, association,
-cluster creation, and attribute reporting — and every hardware target builds
-successfully in CI.
+zigbee-rs is functional for end devices and has a shared Zigbee PRO router
+engine. The mock examples exercise the end-device lifecycle, while router
+tests cover forwarding, route discovery, source routing, parent admission,
+indirect delivery, and Trust Center security flows. Every hardware target
+builds successfully in CI.
 
 **What works today:**
 
@@ -84,14 +85,20 @@ successfully in CI.
 - MockMac for host-side development and testing
 - ESP32-C6/H2 and nRF52840/52833 firmware that compiles and flashes
 - A pure-Rust BL702 XT-ZB1 sensor with hardware-tested RF, joining, ZHA interview, Trust Center security, and reporting
+- Zigbee PRO relay, broadcast transaction records, AODV route discovery,
+  source routes, Route Record, and Link Status
+- Telink TLSR8258 parent-router software with child authorization, indirect
+  queues, Transport-Key Tunnel forwarding, and rejoin handling
 - AES-CCM* encryption (via RustCrypto, `no_std`)
 
 **In development:**
 
-- Full coordinator and router operation
+- Full coordinator operation
+- TLSR8258 parent-router hardware timing validation with an over-the-air
+  sniffer
 - OTA firmware upgrade flow
 - Expanded test coverage
-- Key management beyond the default Trust Center link key
+- Install-code and additional production Trust Center policy
 
 ## What You Can Build
 

@@ -16,6 +16,227 @@ pub const DMA_BUF_LEN: usize = 144;
 pub const MAX_MAC_FRAME_LEN: usize = 125;
 pub const TX_POWER_MIN_DBM: i8 = -25;
 pub const TX_POWER_MAX_DBM: i8 = 10;
+pub const MAX_ACK_PENDING_ADDRESSES: usize = 16;
+
+#[cfg(any(target_arch = "tc32", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleRxState {
+    Off,
+    Armed,
+}
+
+/// State to restore after a bounded RX/TX/CCA operation finishes.
+///
+/// A sleepy end device keeps the historical bounded-window behavior. A
+/// router with `macRxOnWhenIdle` set must return to an armed receiver after
+/// every exit, including NoData, TX timeout, and channel-access failure.
+#[cfg(any(target_arch = "tc32", test))]
+const fn idle_rx_state(rx_on_when_idle: bool) -> IdleRxState {
+    if rx_on_when_idle {
+        IdleRxState::Armed
+    } else {
+        IdleRxState::Off
+    }
+}
+
+/// Child identity used by the turnaround-critical software ACK path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AckPendingAddress {
+    Short { pan_id: u16, address: u16 },
+    Extended { pan_id: u16, address: [u8; 8] },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AckPendingError {
+    InvalidAddress,
+    TableFull,
+}
+
+#[cfg(any(target_arch = "tc32", test))]
+#[derive(Clone, Copy)]
+struct AckPendingEntry {
+    address: AckPendingAddress,
+}
+
+#[cfg(any(target_arch = "tc32", test))]
+const EMPTY_ACK_PENDING_ENTRY: AckPendingEntry = AckPendingEntry {
+    address: AckPendingAddress::Short {
+        pan_id: 0,
+        address: 0,
+    },
+};
+
+#[cfg(any(target_arch = "tc32", test))]
+#[derive(Clone, Copy)]
+struct AckPendingTable {
+    entries: [AckPendingEntry; MAX_ACK_PENDING_ADDRESSES],
+    len: u8,
+}
+
+#[cfg(any(target_arch = "tc32", test))]
+impl AckPendingTable {
+    const fn new() -> Self {
+        Self {
+            entries: [EMPTY_ACK_PENDING_ENTRY; MAX_ACK_PENDING_ADDRESSES],
+            len: 0,
+        }
+    }
+
+    fn set(&mut self, address: AckPendingAddress, pending: bool) -> Result<(), AckPendingError> {
+        if !valid_ack_pending_address(address) {
+            return Err(AckPendingError::InvalidAddress);
+        }
+        let (index, found) = self.find(address);
+        if found {
+            if !pending {
+                let len = self.len as usize;
+                self.entries.copy_within(index + 1..len, index);
+                self.entries[len - 1] = EMPTY_ACK_PENDING_ENTRY;
+                self.len -= 1;
+            }
+            return Ok(());
+        }
+        if !pending {
+            return Ok(());
+        }
+        let len = self.len as usize;
+        if len == MAX_ACK_PENDING_ADDRESSES {
+            return Err(AckPendingError::TableFull);
+        }
+        self.entries.copy_within(index..len, index + 1);
+        self.entries[index] = AckPendingEntry { address };
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Binary search over the sorted, contiguous prefix. The ACK path uses
+    /// the same layout through volatile reads, so a full 16-entry scan is
+    /// never needed.
+    fn find(&self, address: AckPendingAddress) -> (usize, bool) {
+        let mut low = 0usize;
+        let mut high = self.len as usize;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if self.entries[mid].address < address {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        (
+            low,
+            low < self.len as usize && self.entries[low].address == address,
+        )
+    }
+
+    #[cfg(test)]
+    fn frame_pending(&self, psdu: &[u8]) -> bool {
+        let Some(source) = data_request_source(psdu) else {
+            return false;
+        };
+        self.frame_pending_for(source)
+    }
+
+    #[cfg(test)]
+    fn frame_pending_for(&self, source: AckPendingAddress) -> bool {
+        self.find(source).1
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries = [EMPTY_ACK_PENDING_ENTRY; MAX_ACK_PENDING_ADDRESSES];
+        self.len = 0;
+    }
+}
+
+#[cfg(any(target_arch = "tc32", test))]
+fn valid_ack_pending_address(address: AckPendingAddress) -> bool {
+    match address {
+        AckPendingAddress::Short { pan_id, address } => pan_id != 0xFFFF && address < 0xFFF8,
+        AckPendingAddress::Extended { pan_id, address } => pan_id != 0xFFFF && address != [0xFF; 8],
+    }
+}
+
+#[cfg(any(target_arch = "tc32", test))]
+const fn remaining_settle_ticks(rx_complete_ticks: u32, now_ticks: u32, settle_ticks: u32) -> u32 {
+    settle_ticks.saturating_sub(now_ticks.wrapping_sub(rx_complete_ticks))
+}
+
+#[cfg(any(target_arch = "tc32", test))]
+const fn ack_frame_control(frame_pending: bool) -> u8 {
+    if frame_pending { 0x12 } else { 0x02 }
+}
+
+/// Return the exact child identity from a valid, unsecured Data Request.
+#[cfg(any(target_arch = "tc32", test))]
+fn data_request_source(psdu: &[u8]) -> Option<AckPendingAddress> {
+    if psdu.len() < 8 {
+        return None;
+    }
+    let frame_control = u16::from_le_bytes([psdu[0], psdu[1]]);
+    if frame_control & 0x07 != 0x03
+        || frame_control & (1 << 3) != 0
+        || frame_control & (1 << 5) == 0
+    {
+        return None;
+    }
+    let destination_mode = (frame_control >> 10) & 0x03;
+    let source_mode = (frame_control >> 14) & 0x03;
+    if !matches!(destination_mode, 2 | 3) || !matches!(source_mode, 2 | 3) {
+        return None;
+    }
+
+    let mut offset = 3;
+    let destination_pan =
+        u16::from_le_bytes([*psdu.get(offset)?, *psdu.get(offset.checked_add(1)?)?]);
+    offset += 2;
+    offset += match destination_mode {
+        2 => 2,
+        3 => 8,
+        _ => return None,
+    };
+
+    let source_pan = if frame_control & (1 << 6) != 0 {
+        destination_pan
+    } else {
+        let pan = u16::from_le_bytes([*psdu.get(offset)?, *psdu.get(offset.checked_add(1)?)?]);
+        offset += 2;
+        pan
+    };
+    if source_pan != destination_pan || source_pan == 0xFFFF {
+        return None;
+    }
+
+    let source = match source_mode {
+        2 => {
+            let address =
+                u16::from_le_bytes([*psdu.get(offset)?, *psdu.get(offset.checked_add(1)?)?]);
+            offset += 2;
+            AckPendingAddress::Short {
+                pan_id: source_pan,
+                address,
+            }
+        }
+        3 => {
+            let end = offset.checked_add(8)?;
+            let mut address = [0u8; 8];
+            address.copy_from_slice(psdu.get(offset..end)?);
+            offset = end;
+            AckPendingAddress::Extended {
+                pan_id: source_pan,
+                address,
+            }
+        }
+        _ => return None,
+    };
+    if !valid_ack_pending_address(source)
+        || psdu.len() != offset.checked_add(1)?
+        || psdu[offset] != frame::CMD_ID_DATA_REQUEST
+    {
+        return None;
+    }
+    Some(source)
+}
 
 // Official TLSR8258 RF_PowerTypeDef levels, expressed as centi-dBm and the
 // register value consumed by rf_set_power_level().
@@ -96,6 +317,26 @@ fn tx_power_register_fields(level: u8) -> (bool, u8, u8) {
 /// for 4-byte alignment by `scripts/tlsr8258.sh verify_layout`).
 #[repr(align(4))]
 pub struct DmaBuf(pub [u8; DMA_BUF_LEN]);
+
+#[cfg(any(target_arch = "tc32", test))]
+fn dma_buffer_layout_valid(addresses: [u32; 4]) -> bool {
+    for (index, address) in addresses.iter().enumerate() {
+        if address % 4 != 0 {
+            return false;
+        }
+        for other in addresses.iter().skip(index + 1) {
+            let (low, high) = if address < other {
+                (*address, *other)
+            } else {
+                (*other, *address)
+            };
+            if high - low < DMA_BUF_LEN as u32 {
+                return false;
+            }
+        }
+    }
+    true
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ReceivedFrame {
@@ -193,6 +434,31 @@ impl Radio {
         hw::set_ack_filter(pan_id, short_address, extended_address);
     }
 
+    /// Keep the PHY armed between bounded MAC operations.
+    ///
+    /// In this mode RX completion is serviced by the RF/DMA interrupt while
+    /// upper layers are running. Received frames are retained in a bounded
+    /// HAL queue and delivered by the next receive slice.
+    #[cfg(target_arch = "tc32")]
+    pub fn set_rx_on_when_idle(&mut self, enabled: bool) {
+        hw::set_rx_on_when_idle(enabled);
+    }
+
+    /// Set or clear Frame Pending for ACKs to one child's Data Requests.
+    #[cfg(target_arch = "tc32")]
+    pub fn set_ack_frame_pending(
+        &mut self,
+        child: AckPendingAddress,
+        pending: bool,
+    ) -> Result<(), AckPendingError> {
+        hw::set_ack_frame_pending(child, pending)
+    }
+
+    #[cfg(target_arch = "tc32")]
+    pub fn clear_ack_frame_pending(&mut self) {
+        hw::clear_ack_frame_pending();
+    }
+
     #[cfg(target_arch = "tc32")]
     pub fn transmit(&mut self, frame: &[u8]) -> TxOutcome {
         hw::send_mac_frame(frame)
@@ -248,6 +514,189 @@ mod tests {
         assert_eq!(tx_power_register_fields(0x80 | 41), (true, 0x80, 0x14));
         assert_eq!(tx_power_register_fields(58), (false, 0x00, 0x1D));
     }
+
+    #[test]
+    fn normal_tx_and_software_ack_require_distinct_dma_storage() {
+        let stride = DMA_BUF_LEN as u32;
+        assert!(dma_buffer_layout_valid([
+            0x1000,
+            0x1000 + stride,
+            0x1000 + 2 * stride,
+            0x1000 + 3 * stride,
+        ]));
+        assert!(!dma_buffer_layout_valid([0x1000, 0x1090, 0x1120, 0x1120,]));
+        assert!(!dma_buffer_layout_valid([0x1000, 0x1090, 0x1120, 0x1124,]));
+    }
+
+    #[test]
+    fn ack_pending_table_matches_only_exact_data_request_source() {
+        let mut table = AckPendingTable::new();
+        let child = AckPendingAddress::Short {
+            pan_id: 0x1234,
+            address: 0x3344,
+        };
+        table.set(child, true).unwrap();
+
+        let request = frame::data_request_associated_short(1, 0x1234, 0x0001, 0x3344);
+        assert!(table.frame_pending(&request));
+
+        let other = frame::data_request_associated_short(2, 0x1234, 0x0001, 0x3345);
+        assert!(!table.frame_pending(&other));
+        assert!(!table.frame_pending(&frame::data_frame_short(3, 0x1234, 0x0001, 0x3344)));
+
+        table.set(child, false).unwrap();
+        assert!(!table.frame_pending(&request));
+
+        let extended_child = AckPendingAddress::Extended {
+            pan_id: 0x1234,
+            address: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        table.set(extended_child, true).unwrap();
+        let extended_request =
+            frame::data_request_short(4, 0x1234, 0x0001, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(table.frame_pending(&extended_request));
+    }
+
+    #[test]
+    fn association_request_never_performs_a_frame_pending_match() {
+        // Frame 3084 from the clean BL702 -> TLSR8258 parent capture. Unlike
+        // an extended Data Request, an Association Request has source PAN
+        // 0xffff and command ID 0x01.
+        let association_request = [
+            0x23, 0xC8, 0x9F, 0xE9, 0xDF, 0xDF, 0xF8, 0xFF, 0xFF, 0x7C, 0xB9, 0x4C, 0x61, 0x92,
+            0x3A, 0x00, 0x00, 0x01, 0x80,
+        ];
+        assert_eq!(data_request_source(&association_request), None);
+
+        let mut table = AckPendingTable::new();
+        table
+            .set(
+                AckPendingAddress::Extended {
+                    pan_id: 0xDFE9,
+                    address: [0x7C, 0xB9, 0x4C, 0x61, 0x92, 0x3A, 0x00, 0x00],
+                },
+                true,
+            )
+            .unwrap();
+        assert!(!table.frame_pending(&association_request));
+    }
+
+    #[test]
+    fn ack_pending_table_is_bounded_and_validates_addresses() {
+        let mut table = AckPendingTable::new();
+        for address in 0..MAX_ACK_PENDING_ADDRESSES as u16 {
+            table
+                .set(
+                    AckPendingAddress::Short {
+                        pan_id: 0x1234,
+                        address,
+                    },
+                    true,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            table.set(
+                AckPendingAddress::Short {
+                    pan_id: 0x1234,
+                    address: 0x0100,
+                },
+                true,
+            ),
+            Err(AckPendingError::TableFull)
+        );
+        assert_eq!(
+            table.set(
+                AckPendingAddress::Short {
+                    pan_id: 0x1234,
+                    address: 0xFFFF,
+                },
+                true,
+            ),
+            Err(AckPendingError::InvalidAddress)
+        );
+    }
+
+    #[test]
+    fn clearing_ack_pending_table_removes_all_child_state() {
+        let mut table = AckPendingTable::new();
+        let child = AckPendingAddress::Extended {
+            pan_id: 0x1234,
+            address: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let request = frame::data_request_short(1, 0x1234, 0x0001, [1, 2, 3, 4, 5, 6, 7, 8]);
+        table.set(child, true).unwrap();
+        assert!(table.frame_pending(&request));
+
+        table.clear();
+
+        assert!(!table.frame_pending(&request));
+    }
+
+    #[test]
+    fn ack_pending_lookup_is_sorted_and_exact_at_capacity() {
+        let mut table = AckPendingTable::new();
+        for address in (0..MAX_ACK_PENDING_ADDRESSES as u16).rev() {
+            table
+                .set(
+                    AckPendingAddress::Short {
+                        pan_id: 0x1234,
+                        address,
+                    },
+                    true,
+                )
+                .unwrap();
+        }
+        for address in 0..MAX_ACK_PENDING_ADDRESSES as u16 {
+            assert!(table.frame_pending_for(AckPendingAddress::Short {
+                pan_id: 0x1234,
+                address,
+            }));
+            assert_eq!(
+                table.entries[address as usize].address,
+                AckPendingAddress::Short {
+                    pan_id: 0x1234,
+                    address,
+                }
+            );
+        }
+        assert!(!table.frame_pending_for(AckPendingAddress::Short {
+            pan_id: 0x1234,
+            address: 0x1234,
+        }));
+    }
+
+    #[test]
+    fn ack_settle_is_anchored_to_rx_completion_and_wrap_safe() {
+        assert_eq!(remaining_settle_ticks(1_000, 1_030, 120), 90);
+        assert_eq!(remaining_settle_ticks(1_000, 1_120, 120), 0);
+        assert_eq!(remaining_settle_ticks(1_000, 1_200, 120), 0);
+        assert_eq!(remaining_settle_ticks(u32::MAX - 9, 20, 120), 90);
+    }
+
+    #[test]
+    fn ack_frame_pending_changes_only_the_pending_bit() {
+        assert_eq!(ack_frame_control(false), 0x02);
+        assert_eq!(ack_frame_control(true), 0x12);
+    }
+
+    #[test]
+    fn router_restores_rx_after_every_bounded_operation_exit() {
+        for _exit in [
+            "receive timeout",
+            "receive callback",
+            "tx complete",
+            "tx timeout",
+            "cca failure",
+        ] {
+            assert_eq!(idle_rx_state(true), IdleRxState::Armed);
+        }
+    }
+
+    #[test]
+    fn sleepy_device_preserves_bounded_rx_windows() {
+        assert_eq!(idle_rx_state(false), IdleRxState::Off);
+    }
 }
 
 #[cfg(target_arch = "tc32")]
@@ -255,13 +704,21 @@ mod hw {
     use core::sync::atomic::{Ordering, compiler_fence};
 
     use super::frame::{self, BeaconInfo};
-    use super::{DMA_BUF_LEN, DmaBuf, MAX_MAC_FRAME_LEN, RawRxOutcome, ReceivedFrame, phy};
+    use super::{
+        AckPendingAddress, AckPendingError, AckPendingTable, DMA_BUF_LEN, DmaBuf,
+        MAX_MAC_FRAME_LEN, RawRxOutcome, ReceivedFrame, phy,
+    };
     use crate::timer;
 
     #[unsafe(link_section = ".rf_dma")]
     static mut RF_RX_BUF: [DmaBuf; 2] = [DmaBuf([0u8; DMA_BUF_LEN]), DmaBuf([0u8; DMA_BUF_LEN])];
     #[unsafe(link_section = ".rf_dma")]
     static mut RF_TX_BUF: DmaBuf = DmaBuf([0u8; DMA_BUF_LEN]);
+    /// Turnaround-critical software ACK storage. This must not alias
+    /// `RF_TX_BUF`: synchronous TX can service a completed RX before it
+    /// triggers DMA for the caller's already-encoded frame.
+    #[unsafe(link_section = ".rf_dma")]
+    static mut RF_ACK_TX_BUF: DmaBuf = DmaBuf([0u8; DMA_BUF_LEN]);
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -278,14 +735,31 @@ mod hw {
         extended_address: [0; 8],
         enabled: 0,
     };
+    // Updates are published by flipping ACK_PENDING_ACTIVE only after the
+    // inactive snapshot is complete. This keeps an eventual RX IRQ (and the
+    // current polled turnaround path) from observing a half-shifted sorted
+    // table while NWK changes one child's indirect state.
+    static mut ACK_PENDING_TABLES: [AckPendingTable; 2] =
+        [AckPendingTable::new(), AckPendingTable::new()];
+    static mut ACK_PENDING_ACTIVE: u8 = 0;
     static mut SOFTWARE_ACK_COUNT: u32 = 0;
     static mut SOFTWARE_ACK_TIMEOUT_COUNT: u32 = 0;
     static mut ACTIVE_RX_INDEX: u8 = 0;
     static mut RX_ARMED_AFTER_TX: u8 = 0;
+    static mut RX_ON_WHEN_IDLE: u8 = 0;
+    static mut RX_ARMED: u8 = 0;
     static mut CSMA_RNG_STATE: u32 = 0;
     static mut CCA_ATTEMPT_COUNT: u32 = 0;
     static mut CCA_BUSY_COUNT: u32 = 0;
     static mut CHANNEL_ACCESS_FAILURE_COUNT: u32 = 0;
+    const IRQ_RX_QUEUE_CAPACITY: usize = 8;
+    static mut IRQ_RX_QUEUE: [RawRxOutcome; IRQ_RX_QUEUE_CAPACITY] =
+        [RawRxOutcome::InvalidLength; IRQ_RX_QUEUE_CAPACITY];
+    static mut IRQ_RX_QUEUE_HEAD: u8 = 0;
+    static mut IRQ_RX_QUEUE_LEN: u8 = 0;
+    static mut IRQ_RX_QUEUE_OVERFLOW_COUNT: u32 = 0;
+
+    const CPU_RX_IRQ_MASK: u32 = (1 << 4) | (1 << 13);
 
     const CCA_THRESHOLD_DBM: i8 = -70;
     const CCA_RX_SETTLE_TICKS: u32 = timer::TICKS_PER_MS * 128 / 1_000;
@@ -312,14 +786,15 @@ mod hw {
 
     /// Compile-time-ish alignment/placement facts the post-link script
     /// re-verifies from the linked ELF (see `verify_layout` in
-    /// `scripts/tlsr8258.sh`): all DMA buffers must be 4-byte aligned and
-    /// must live inside the `.rf_dma` section, i.e. outside the I-cache
-    /// tag/data reservation.
+    /// `scripts/tlsr8258.sh`): all DMA buffers must be 4-byte aligned,
+    /// non-overlapping, and must live inside the `.rf_dma` section, i.e.
+    /// outside the I-cache tag/data reservation.
     pub fn dma_buffers_aligned() -> bool {
         let rx0 = rx_buffer_ptr(0) as u32;
         let rx1 = rx_buffer_ptr(1) as u32;
         let tx = core::ptr::addr_of!(RF_TX_BUF) as u32;
-        rx0 % 4 == 0 && rx1 % 4 == 0 && tx % 4 == 0
+        let ack_tx = core::ptr::addr_of!(RF_ACK_TX_BUF) as u32;
+        super::dma_buffer_layout_valid([rx0, rx1, tx, ack_tx])
     }
 
     /// Bring up Timer0 + the RF PHY/DMA, and program channel 11 as the
@@ -328,21 +803,32 @@ mod hw {
         crate::mmio::disable_all_irqs();
         timer::init();
         set_active_rx_index(0);
+        set_rx_armed(false);
+        set_rx_armed_after_tx(false);
+        set_rx_on_when_idle_flag(false);
+        clear_irq_rx_queue();
         let rx_ptr = active_rx_ptr();
         phy::init(rx_ptr);
     }
 
     pub fn prepare_for_sleep() {
+        mask_cpu_rx_irq();
+        set_rx_on_when_idle_flag(false);
         phy::set_trx_off();
+        set_rx_armed(false);
         phy::clear_irq_mask();
         phy::clear_irq_status();
     }
 
     pub fn set_channel(channel: u8) {
+        let restore_rx = begin_radio_operation();
         phy::set_channel(channel);
+        set_rx_armed(false);
+        end_radio_operation(restore_rx);
     }
 
     pub fn set_ack_filter(pan_id: u16, short_address: u16, extended_address: [u8; 8]) {
+        let restore_irq = mask_cpu_rx_irq();
         unsafe {
             core::ptr::write_volatile(
                 core::ptr::addr_of_mut!(ACK_FILTER),
@@ -353,6 +839,55 @@ mod hw {
                     enabled: 1,
                 },
             );
+        }
+        restore_cpu_rx_irq(restore_irq);
+    }
+
+    pub fn set_rx_on_when_idle(enabled: bool) {
+        mask_cpu_rx_irq();
+        set_rx_on_when_idle_flag(enabled);
+        if enabled {
+            if phy::rx_done() {
+                queue_completed_rx();
+            }
+            if !rx_is_armed() {
+                rearm_rx(active_rx_ptr());
+            }
+            enable_cpu_rx_irq();
+        } else {
+            phy::set_trx_off();
+            set_rx_armed(false);
+            phy::rx_done_clear();
+        }
+    }
+
+    pub fn set_ack_frame_pending(
+        child: AckPendingAddress,
+        pending: bool,
+    ) -> Result<(), AckPendingError> {
+        unsafe {
+            let active =
+                core::ptr::read_volatile(core::ptr::addr_of!(ACK_PENDING_ACTIVE)) as usize & 1;
+            let next = active ^ 1;
+            let tables = core::ptr::addr_of_mut!(ACK_PENDING_TABLES).cast::<AckPendingTable>();
+            let mut table = core::ptr::read_volatile(tables.add(active));
+            table.set(child, pending)?;
+            core::ptr::write_volatile(tables.add(next), table);
+            compiler_fence(Ordering::Release);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(ACK_PENDING_ACTIVE), next as u8);
+        }
+        Ok(())
+    }
+
+    pub fn clear_ack_frame_pending() {
+        unsafe {
+            let active =
+                core::ptr::read_volatile(core::ptr::addr_of!(ACK_PENDING_ACTIVE)) as usize & 1;
+            let next = active ^ 1;
+            let tables = core::ptr::addr_of_mut!(ACK_PENDING_TABLES).cast::<AckPendingTable>();
+            core::ptr::write_volatile(tables.add(next), AckPendingTable::new());
+            compiler_fence(Ordering::Release);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(ACK_PENDING_ACTIVE), next as u8);
         }
     }
 
@@ -378,11 +913,14 @@ mod hw {
     }
 
     pub fn measure_energy() -> u8 {
+        let restore_rx = begin_radio_operation();
         let rx_ptr = active_rx_ptr();
         phy::set_trx_off();
+        set_rx_armed(false);
         phy::rx_done_clear();
         prepare_rx_dma(rx_ptr);
         phy::set_rx_mode();
+        set_rx_armed(true);
         timer::sleep_ticks(CCA_RX_SETTLE_TICKS);
 
         let start = timer::now_ticks();
@@ -397,9 +935,12 @@ mod hw {
             unsafe { core::arch::asm!("nop") };
         }
         phy::set_trx_off();
+        set_rx_armed(false);
 
         let rssi = (sum / samples).clamp(-99, -15);
-        (255 * (rssi + 99) / 84) as u8
+        let energy = (255 * (rssi + 99) / 84) as u8;
+        end_radio_operation(restore_rx);
+        energy
     }
 
     /// Fixed bound for one Beacon Request TX: settle + on-air time at 250
@@ -420,18 +961,21 @@ mod hw {
         }
         compiler_fence(Ordering::Release);
 
-        let rx_ptr = active_rx_ptr();
+        let restore_rx = begin_radio_operation();
         set_rx_armed_after_tx(false);
-        if !perform_csma_ca(rx_ptr) {
+        if !perform_csma_ca() {
+            end_radio_operation(restore_rx);
             return TxOutcome::ChannelAccessFailure;
         }
 
+        let rx_ptr = active_rx_ptr();
         phy::rx_done_clear();
         prepare_rx_dma(rx_ptr);
 
         phy::set_tx_dma_config(DMA_BUF_LEN as u16);
         phy::tx_done_clear();
         phy::set_tx_mode();
+        set_rx_armed(false);
         // Settle delay before triggering DMA, matching the proven sensor-lab
         // sequence (PLL/analog settle after the mode-register write).
         timer::sleep_ticks(timer::ms(1) / 4); // ~0.25 ms fixed pause
@@ -444,15 +988,19 @@ mod hw {
             // frame. Enter RX here, before returning to layout-sensitive
             // caller code, and leave the already-armed DMA buffer intact.
             phy::set_rx_mode();
+            set_rx_armed(true);
             set_rx_armed_after_tx(true);
         } else {
             phy::set_trx_off();
+            set_rx_armed(false);
         }
-        if ok {
+        let outcome = if ok {
             TxOutcome::Sent
         } else {
             TxOutcome::Timeout
-        }
+        };
+        end_radio_operation(restore_rx);
+        outcome
     }
 
     /// Encode and transmit a Beacon Request with the given sequence number.
@@ -530,10 +1078,12 @@ mod hw {
         max_frames: u16,
         mut on_frame: impl FnMut(RawRxOutcome) -> bool,
     ) -> u32 {
-        let mut rx_ptr = active_rx_ptr();
+        let restore_rx = begin_radio_operation();
+        let rx_ptr = active_rx_ptr();
 
-        if !take_rx_armed_after_tx() {
+        if !take_rx_armed_after_tx() && !rx_is_armed() {
             phy::set_trx_off();
+            set_rx_armed(false);
             phy::rx_done_clear();
             rearm_rx(rx_ptr);
         }
@@ -541,33 +1091,64 @@ mod hw {
         let start = timer::now_ticks();
         let mut frames_seen: u16 = 0;
         loop {
-            if timer::now_ticks().wrapping_sub(start) >= timeout_ticks {
-                break;
-            }
             if frames_seen >= max_frames {
                 break;
             }
-            if phy::rx_done() {
-                phy::rx_done_clear();
-                compiler_fence(Ordering::Acquire);
-                maybe_send_software_ack(rx_ptr);
-                let completed_rx_ptr = rx_ptr;
-                rx_ptr = rotate_rx_buffer();
-                rearm_rx(rx_ptr);
-                let mut snapshot = [0u8; DMA_BUF_LEN];
-                for (i, byte) in snapshot.iter_mut().enumerate() {
-                    *byte = unsafe { core::ptr::read_volatile(completed_rx_ptr.add(i)) };
-                }
+            if let Some(outcome) = pop_irq_rx() {
                 frames_seen += 1;
-                if on_frame(decode_received_frame(&snapshot)) {
+                if on_frame(outcome) {
+                    break;
+                }
+                continue;
+            }
+            if timer::now_ticks().wrapping_sub(start) >= timeout_ticks {
+                break;
+            }
+            if phy::rx_done() {
+                let outcome = take_completed_rx();
+                frames_seen += 1;
+                if on_frame(outcome) {
                     break;
                 }
             }
             unsafe { core::arch::asm!("nop") };
         }
         let elapsed = timer::now_ticks().wrapping_sub(start);
-        phy::set_trx_off();
+        if super::idle_rx_state(restore_rx) == super::IdleRxState::Off {
+            phy::set_trx_off();
+            set_rx_armed(false);
+        }
+        end_radio_operation(restore_rx);
         elapsed
+    }
+
+    /// RF/DMA interrupt entry used by the always-on router application.
+    ///
+    /// The handler owns RX completion only while no synchronous radio
+    /// operation has masked the CPU RF sources. It ACKs immediately, rotates
+    /// DMA ownership, queues the frame, and restores continuous RX.
+    #[inline(never)]
+    #[unsafe(link_section = ".ram_code")]
+    pub fn handle_irq() {
+        if rx_on_when_idle() {
+            // A second frame can finish while the first ACK and queue copy
+            // are in progress. Drain a small fixed burst; if more remains,
+            // preserve the pending source and let the CPU vector again.
+            for _ in 0..2 {
+                if !phy::rx_done() {
+                    break;
+                }
+                queue_completed_rx();
+            }
+        }
+        if !phy::rx_done() {
+            clear_cpu_rx_irq_sources();
+        }
+        // TLSR8258 clears the global enable on IRQ entry. The proven lab
+        // vector requires the handler to re-enable it before IRQ return.
+        unsafe {
+            crate::mmio::w8(crate::mmio::REG_IRQ_EN, 1);
+        }
     }
 
     fn set_rx_armed_after_tx(armed: bool) {
@@ -576,6 +1157,97 @@ mod hw {
                 core::ptr::addr_of_mut!(RX_ARMED_AFTER_TX),
                 if armed { 1 } else { 0 },
             );
+        }
+    }
+
+    fn set_rx_on_when_idle_flag(enabled: bool) {
+        unsafe {
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!(RX_ON_WHEN_IDLE),
+                if enabled { 1 } else { 0 },
+            );
+        }
+    }
+
+    fn rx_on_when_idle() -> bool {
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(RX_ON_WHEN_IDLE)) != 0 }
+    }
+
+    fn set_rx_armed(armed: bool) {
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(RX_ARMED), if armed { 1 } else { 0 });
+        }
+    }
+
+    fn rx_is_armed() -> bool {
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(RX_ARMED)) != 0 }
+    }
+
+    fn begin_radio_operation() -> bool {
+        let restore_rx = rx_on_when_idle();
+        mask_cpu_rx_irq();
+        // A frame may have completed immediately before the CPU mask was
+        // changed. Own it before any operation clears RX status or DMA.
+        if restore_rx && phy::rx_done() {
+            queue_completed_rx();
+        }
+        restore_rx
+    }
+
+    fn end_radio_operation(restore_rx: bool) {
+        match super::idle_rx_state(restore_rx) {
+            super::IdleRxState::Armed => {
+                if phy::rx_done() {
+                    queue_completed_rx();
+                }
+                if !rx_is_armed() {
+                    rearm_rx(active_rx_ptr());
+                }
+                enable_cpu_rx_irq();
+            }
+            super::IdleRxState::Off => {}
+        }
+    }
+
+    fn mask_cpu_rx_irq() -> bool {
+        unsafe {
+            let global = crate::mmio::r8(crate::mmio::REG_IRQ_EN);
+            crate::mmio::w8(crate::mmio::REG_IRQ_EN, 0);
+            let mask = crate::mmio::r32(crate::mmio::REG_IRQ_MASK);
+            let was_enabled = mask & CPU_RX_IRQ_MASK != 0;
+            crate::mmio::w32(crate::mmio::REG_IRQ_MASK, mask & !CPU_RX_IRQ_MASK);
+            compiler_fence(Ordering::SeqCst);
+            crate::mmio::w8(crate::mmio::REG_IRQ_EN, global);
+            was_enabled
+        }
+    }
+
+    fn restore_cpu_rx_irq(was_enabled: bool) {
+        if was_enabled && rx_on_when_idle() {
+            enable_cpu_rx_irq();
+        }
+    }
+
+    fn enable_cpu_rx_irq() {
+        unsafe {
+            let global = crate::mmio::r8(crate::mmio::REG_IRQ_EN);
+            crate::mmio::w8(crate::mmio::REG_IRQ_EN, 0);
+            // Clear only stale CPU latches. If RX completed in the narrow
+            // handoff between the caller's last status check and this mask
+            // update, preserve its source so enabling the mask vectors it.
+            if !phy::rx_done() {
+                clear_cpu_rx_irq_sources();
+            }
+            let mask = crate::mmio::r32(crate::mmio::REG_IRQ_MASK);
+            crate::mmio::w32(crate::mmio::REG_IRQ_MASK, mask | CPU_RX_IRQ_MASK);
+            compiler_fence(Ordering::SeqCst);
+            crate::mmio::w8(crate::mmio::REG_IRQ_EN, global | 1);
+        }
+    }
+
+    fn clear_cpu_rx_irq_sources() {
+        unsafe {
+            crate::mmio::w32(crate::mmio::REG_IRQ_SRC, CPU_RX_IRQ_MASK);
         }
     }
 
@@ -630,27 +1302,117 @@ mod hw {
     fn rearm_rx(rx_ptr: *mut u8) {
         prepare_rx_dma(rx_ptr);
         phy::set_rx_mode();
+        set_rx_armed(true);
     }
 
-    fn perform_csma_ca(rx_ptr: *mut u8) -> bool {
+    #[inline(never)]
+    #[unsafe(link_section = ".ram_code")]
+    fn take_completed_rx() -> RawRxOutcome {
+        // Anchor RX->TX settling before clearing status or parsing. The
+        // pending lookup and ACK encoding run inside the hardware settle.
+        let rx_complete_ticks = timer::now_ticks();
+        phy::rx_done_clear();
+        compiler_fence(Ordering::Acquire);
+        let completed_rx_ptr = active_rx_ptr();
+        let next_rx_ptr = rotate_rx_buffer();
+        phy::disable_dma_rx();
+        phy::disable_rx_mode();
+        phy::set_tx_dma_config(DMA_BUF_LEN as u16);
+        phy::tx_done_clear();
+        phy::set_tx_mode();
+        set_rx_armed(false);
+        prepare_rx_dma(next_rx_ptr);
+        if !maybe_send_software_ack(completed_rx_ptr, rx_complete_ticks) {
+            rearm_rx(next_rx_ptr);
+        }
+
+        let completed =
+            unsafe { core::slice::from_raw_parts(completed_rx_ptr.cast_const(), DMA_BUF_LEN) };
+        decode_received_frame(completed)
+    }
+
+    #[inline(always)]
+    fn queue_completed_rx() {
+        let outcome = take_completed_rx();
+        push_irq_rx(outcome);
+    }
+
+    fn clear_irq_rx_queue() {
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(IRQ_RX_QUEUE_HEAD), 0);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(IRQ_RX_QUEUE_LEN), 0);
+        }
+    }
+
+    fn push_irq_rx(outcome: RawRxOutcome) {
+        unsafe {
+            let len = core::ptr::read_volatile(core::ptr::addr_of!(IRQ_RX_QUEUE_LEN)) as usize;
+            if len == IRQ_RX_QUEUE_CAPACITY {
+                increment_counter(core::ptr::addr_of_mut!(IRQ_RX_QUEUE_OVERFLOW_COUNT));
+                return;
+            }
+            let head = core::ptr::read_volatile(core::ptr::addr_of!(IRQ_RX_QUEUE_HEAD)) as usize;
+            let index = (head + len) % IRQ_RX_QUEUE_CAPACITY;
+            let queue = core::ptr::addr_of_mut!(IRQ_RX_QUEUE).cast::<RawRxOutcome>();
+            core::ptr::write_volatile(queue.add(index), outcome);
+            compiler_fence(Ordering::Release);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(IRQ_RX_QUEUE_LEN), (len + 1) as u8);
+        }
+    }
+
+    fn pop_irq_rx() -> Option<RawRxOutcome> {
+        unsafe {
+            let len = core::ptr::read_volatile(core::ptr::addr_of!(IRQ_RX_QUEUE_LEN));
+            if len == 0 {
+                return None;
+            }
+            compiler_fence(Ordering::Acquire);
+            let head = core::ptr::read_volatile(core::ptr::addr_of!(IRQ_RX_QUEUE_HEAD)) as usize;
+            let queue = core::ptr::addr_of!(IRQ_RX_QUEUE).cast::<RawRxOutcome>();
+            let outcome = core::ptr::read_volatile(queue.add(head));
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!(IRQ_RX_QUEUE_HEAD),
+                ((head + 1) % IRQ_RX_QUEUE_CAPACITY) as u8,
+            );
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(IRQ_RX_QUEUE_LEN), len - 1);
+            Some(outcome)
+        }
+    }
+
+    fn perform_csma_ca() -> bool {
         let mut backoffs = 0u8;
         let mut backoff_exponent = MAC_MIN_BE;
 
         loop {
             let slots = next_random() & ((1u32 << backoff_exponent) - 1);
+            let rx_ptr = active_rx_ptr();
 
             phy::set_trx_off();
+            set_rx_armed(false);
             phy::rx_done_clear();
             prepare_rx_dma(rx_ptr);
             phy::set_rx_mode();
-            timer::sleep_ticks(CCA_RX_SETTLE_TICKS);
-            if slots != 0 {
-                timer::sleep_ticks(slots * UNIT_BACKOFF_TICKS);
+            set_rx_armed(true);
+            if wait_while_receiving(CCA_RX_SETTLE_TICKS)
+                || (slots != 0 && wait_while_receiving(slots * UNIT_BACKOFF_TICKS))
+            {
+                increment_counter(core::ptr::addr_of_mut!(CCA_BUSY_COUNT));
+                backoffs = backoffs.saturating_add(1);
+                if backoffs > MAC_MAX_CSMA_BACKOFFS {
+                    increment_counter(core::ptr::addr_of_mut!(CHANNEL_ACCESS_FAILURE_COUNT));
+                    phy::set_trx_off();
+                    set_rx_armed(false);
+                    phy::rx_done_clear();
+                    return false;
+                }
+                backoff_exponent = backoff_exponent.saturating_add(1).min(MAC_MAX_BE);
+                continue;
             }
 
             increment_counter(core::ptr::addr_of_mut!(CCA_ATTEMPT_COUNT));
             if channel_is_clear() {
                 phy::set_trx_off();
+                set_rx_armed(false);
                 phy::rx_done_clear();
                 return true;
             }
@@ -660,6 +1422,7 @@ mod hw {
             if backoffs > MAC_MAX_CSMA_BACKOFFS {
                 increment_counter(core::ptr::addr_of_mut!(CHANNEL_ACCESS_FAILURE_COUNT));
                 phy::set_trx_off();
+                set_rx_armed(false);
                 phy::rx_done_clear();
                 return false;
             }
@@ -667,21 +1430,37 @@ mod hw {
         }
     }
 
+    fn wait_while_receiving(ticks: u32) -> bool {
+        let start = timer::now_ticks();
+        loop {
+            if phy::rx_done() {
+                queue_completed_rx();
+                return true;
+            }
+            if timer::now_ticks().wrapping_sub(start) >= ticks {
+                return false;
+            }
+            unsafe { core::arch::asm!("nop") };
+        }
+    }
+
     fn channel_is_clear() -> bool {
         let start = timer::now_ticks();
         let mut sum = 0i32;
         let mut samples = 0i32;
-        let mut received_frame = false;
         loop {
             sum += phy::rssi_dbm() as i32;
             samples += 1;
-            received_frame |= phy::rx_done();
+            if phy::rx_done() {
+                queue_completed_rx();
+                return false;
+            }
             if timer::now_ticks().wrapping_sub(start) >= CCA_SAMPLE_TICKS {
                 break;
             }
             unsafe { core::arch::asm!("nop") };
         }
-        !received_frame && sum / samples <= CCA_THRESHOLD_DBM as i32
+        sum / samples <= CCA_THRESHOLD_DBM as i32
     }
 
     fn next_random() -> u32 {
@@ -708,20 +1487,22 @@ mod hw {
         }
     }
 
-    fn maybe_send_software_ack(rx_ptr: *mut u8) {
+    #[inline(never)]
+    #[unsafe(link_section = ".ram_code")]
+    fn maybe_send_software_ack(rx_ptr: *mut u8, rx_complete_ticks: u32) -> bool {
         let filter = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ACK_FILTER)) };
         if filter.enabled == 0 {
-            return;
+            return false;
         }
 
         let total_len = unsafe { core::ptr::read_volatile(rx_ptr) } as usize;
         let payload_len = unsafe { core::ptr::read_volatile(rx_ptr.add(4)) } as usize;
         if total_len == 0 || total_len > 136 || total_len != payload_len + 9 || payload_len < 7 {
-            return;
+            return false;
         }
         let status = unsafe { core::ptr::read_volatile(rx_ptr.add(total_len + 3)) };
         if status & 0x51 != 0x10 {
-            return;
+            return false;
         }
 
         let frame_control =
@@ -731,7 +1512,7 @@ mod hw {
                 }],
             );
         if frame_control & (1 << 5) == 0 {
-            return;
+            return false;
         }
 
         let destination_pan =
@@ -741,7 +1522,7 @@ mod hw {
                 }],
             );
         if destination_pan != filter.pan_id && destination_pan != 0xFFFF {
-            return;
+            return false;
         }
 
         let destination_mode = (frame_control >> 10) & 0x03;
@@ -766,11 +1547,25 @@ mod hw {
             _ => false,
         };
         if !addressed_to_us {
-            return;
+            return false;
         }
 
         let sequence = unsafe { core::ptr::read_volatile(rx_ptr.add(7)) };
-        if send_ack_fast(sequence) {
+        let frame_pending = if payload_len >= 2 {
+            let psdu = unsafe {
+                core::slice::from_raw_parts(rx_ptr.add(5), payload_len.saturating_sub(2))
+            };
+            // Association Requests also ask for an ACK, but can never carry
+            // Frame Pending. Determine whether this is a Data Request before
+            // touching the 16-entry pending table. The old code copied the
+            // entire table with read_volatile() for every ACK-requested
+            // frame; on TC32 that consumed most of the 192 us turnaround
+            // budget before the mandatory 120 us RX->TX settle even began.
+            super::data_request_source(psdu).is_some_and(ack_pending_for_source)
+        } else {
+            false
+        };
+        if send_ack_fast(sequence, frame_pending, rx_complete_ticks) {
             unsafe {
                 let count = core::ptr::read_volatile(core::ptr::addr_of!(SOFTWARE_ACK_COUNT));
                 core::ptr::write_volatile(
@@ -788,35 +1583,69 @@ mod hw {
                 );
             }
         }
+        // The next DMA buffer was armed before filtering; send_ack_fast()
+        // restores RX even when TX completion times out.
+        true
     }
 
-    fn send_ack_fast(sequence: u8) -> bool {
-        let tx_ptr = core::ptr::addr_of_mut!(RF_TX_BUF) as *mut u8;
+    #[inline(always)]
+    fn ack_pending_for_source(source: AckPendingAddress) -> bool {
+        // One volatile publication read selects a coherent sorted snapshot.
+        // Binary search needs at most five entry reads for 16 children,
+        // instead of copying or scanning the complete table.
+        let active =
+            unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ACK_PENDING_ACTIVE)) as usize }
+                & 1;
+        let tables = core::ptr::addr_of!(ACK_PENDING_TABLES).cast::<AckPendingTable>();
+        let table = unsafe { tables.add(active) };
+        let len = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*table).len)) } as usize;
+        let entries =
+            unsafe { core::ptr::addr_of!((*table).entries).cast::<super::AckPendingEntry>() };
+        let mut low = 0usize;
+        let mut high = len;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let entry = unsafe { core::ptr::read_volatile(entries.add(mid)) };
+            if entry.address < source {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low < len && unsafe { core::ptr::read_volatile(entries.add(low)) }.address == source
+    }
+
+    #[inline(never)]
+    #[unsafe(link_section = ".ram_code")]
+    fn send_ack_fast(sequence: u8, frame_pending: bool, rx_complete_ticks: u32) -> bool {
+        // RX completion runs either in the RF IRQ or with that IRQ masked by
+        // a synchronous operation. Only this path owns RF_ACK_TX_BUF.
+        let tx_ptr = core::ptr::addr_of_mut!(RF_ACK_TX_BUF) as *mut u8;
         unsafe {
             core::ptr::write_volatile(tx_ptr, 4);
             core::ptr::write_volatile(tx_ptr.add(1), 0);
             core::ptr::write_volatile(tx_ptr.add(2), 0);
             core::ptr::write_volatile(tx_ptr.add(3), 0);
             core::ptr::write_volatile(tx_ptr.add(4), 5);
-            core::ptr::write_volatile(tx_ptr.add(5), 0x02);
+            core::ptr::write_volatile(tx_ptr.add(5), super::ack_frame_control(frame_pending));
             core::ptr::write_volatile(tx_ptr.add(6), 0);
             core::ptr::write_volatile(tx_ptr.add(7), sequence);
         }
         compiler_fence(Ordering::Release);
-        phy::disable_dma_rx();
-        phy::disable_rx_mode();
-        phy::set_tx_dma_config(DMA_BUF_LEN as u16);
-        phy::tx_done_clear();
-        phy::set_tx_mode();
-
-        // The TLSR8258 radio needs the same RX->TX settle used by the
-        // official Zigbee SDK before transmitting a MAC ACK.
-        timer::sleep_ticks(timer::us(120));
+        // The TLSR8258 requires 120 us from the RX->TX transition, not 120 us
+        // after arbitrary address parsing and pending-table lookup.
+        let remaining =
+            super::remaining_settle_ticks(rx_complete_ticks, timer::now_ticks(), timer::us(120));
+        if remaining != 0 {
+            timer::sleep_ticks(remaining);
+        }
         phy::tx_pkt(tx_ptr);
         let sent = timer::wait_until(timer::TICKS_PER_MS, phy::tx_done);
         if sent {
             phy::tx_done_clear();
         }
+        phy::set_rx_mode();
+        set_rx_armed(true);
         sent
     }
 
@@ -879,6 +1708,6 @@ mod hw {
 #[cfg(target_arch = "tc32")]
 pub use hw::{
     CsmaStats, RX_WINDOW_TICKS, RxOutcome, TX_TIMEOUT_TICKS, TxOutcome, csma_stats,
-    dma_buffers_aligned, init, rx_raw_window_for, rx_window, rx_window_for, send_beacon_request,
-    send_mac_frame, set_ack_filter, set_channel, software_ack_stats,
+    dma_buffers_aligned, handle_irq, init, rx_raw_window_for, rx_window, rx_window_for,
+    send_beacon_request, send_mac_frame, set_ack_filter, set_channel, software_ack_stats,
 };

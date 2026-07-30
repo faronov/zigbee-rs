@@ -32,6 +32,37 @@ fn build_identify_clusters(
     clusters
 }
 
+fn is_mains_powered(source: PowerSource) -> bool {
+    matches!(
+        source,
+        PowerSource::MainsSinglePhase
+            | PowerSource::MainsThreePhase
+            | PowerSource::EmergencyMainsConstantlyPowered
+            | PowerSource::EmergencyMainsTransferSwitch
+            | PowerSource::MainsSinglePhaseWithBatteryBackup
+            | PowerSource::MainsThreePhaseWithBatteryBackup
+            | PowerSource::EmergencyMainsConstantlyPoweredWithBatteryBackup
+            | PowerSource::EmergencyMainsTransferSwitchWithBatteryBackup
+    )
+}
+
+fn node_mac_capabilities(device_type: DeviceType, rx_on: bool, power_source: PowerSource) -> u8 {
+    let mut capabilities = 0x80; // AllocateAddress
+    if matches!(device_type, DeviceType::Coordinator) {
+        capabilities |= 0x01; // AlternatePanCoordinator
+    }
+    if !matches!(device_type, DeviceType::EndDevice) {
+        capabilities |= 0x02; // DeviceType: FFD
+    }
+    if is_mains_powered(power_source) {
+        capabilities |= 0x04; // PowerSource: mains
+    }
+    if rx_on {
+        capabilities |= 0x08; // ReceiverOnWhenIdle
+    }
+    capabilities
+}
+
 /// Fluent builder for creating a ZigbeeDevice.
 pub struct DeviceBuilder<M: MacDriver> {
     mac: M,
@@ -230,9 +261,9 @@ impl<M: MacDriver> DeviceBuilder<M> {
         };
         let node_desc = zigbee_zdo::descriptors::NodeDescriptor {
             logical_type,
-            // bit7=AllocAddr, bit3=RxOnWhenIdle. Zigbee PRO security is
-            // provided by NWK/APS, not the IEEE 802.15.4 MAC security bit.
-            mac_capabilities: if rx_on { 0x88 } else { 0x80 },
+            // Zigbee PRO security is provided by NWK/APS, not the IEEE
+            // 802.15.4 MAC security-capability bit.
+            mac_capabilities: node_mac_capabilities(self.device_type, rx_on, self.power_source),
             ..Default::default()
         };
         zdo.set_node_descriptor(node_desc);
@@ -266,6 +297,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             scratch: super::RuntimeScratch::new(),
             state_dirty: false,
             secure_rejoin_retry_at: None,
+            pending_child_updates: heapless::Vec::new(),
         }
     }
 
@@ -342,7 +374,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
                 };
                 let node_desc = zigbee_zdo::descriptors::NodeDescriptor {
                     logical_type,
-                    mac_capabilities: if rx_on { 0x88 } else { 0x80 },
+                    mac_capabilities: node_mac_capabilities(device_type, rx_on, power_source),
                     ..Default::default()
                 };
                 zdo.set_node_descriptor(node_desc);
@@ -372,6 +404,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             core::ptr::addr_of_mut!((*dst).scratch).write(super::RuntimeScratch::new());
             core::ptr::addr_of_mut!((*dst).state_dirty).write(false);
             core::ptr::addr_of_mut!((*dst).secure_rejoin_retry_at).write(None);
+            core::ptr::addr_of_mut!((*dst).pending_child_updates).write(heapless::Vec::new());
 
             &mut *dst
         }

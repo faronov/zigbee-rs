@@ -344,6 +344,7 @@ async fn phase_report_attributes(
                     msdu_handle: 0x01,
                     tx_options: TxOptions {
                         ack_tx: true,
+                        frame_pending: false,
                         indirect: false,
                         security_enabled: false,
                     },
@@ -387,6 +388,7 @@ async fn phase_checkin(
                 msdu_handle: 0x02,
                 tx_options: TxOptions {
                     ack_tx: true,
+                    frame_pending: false,
                     indirect: false,
                     security_enabled: false,
                 },

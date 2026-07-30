@@ -15,8 +15,10 @@ The direct-register Rust path has been validated on real hardware:
 - unique Trust Center link-key exchange;
 - live entities and attribute reports in Home Assistant.
 
-The application currently publishes synthetic values (22.50 C, 50% RH, and
-3.0 V). BL702 I2C and ADC drivers are not implemented yet.
+The application currently publishes synthetic temperature and humidity
+values. Battery reporting uses the internal VBAT/2 GPADC path with factory
+eFuse gain trim and falls back explicitly if initialization or conversion is
+implausible.
 
 ## Build
 
@@ -73,24 +75,26 @@ stack joined: short=..., PAN=..., channel=15
 commissioning complete: success=true
 ```
 
-## Current peripheral support
+## Current peripheral and storage support
 
-There is no general BL702 HAL crate yet. The example currently owns only:
+`bl702-hal` provides typed GPIO, I2C0, SPI0, GPADC/VBAT, PWM, UART, timer,
+eFuse, power-state, and XIP-flash APIs. The board crate owns the physical
+resources, while `products/bl702-xt-zb1` owns the protected final-8-KiB flash
+partition and constructs the two-sector `SecurityStateJournal`.
 
-- UART0 TX and GPIO14/GPIO15 pinmux;
-- a free-running 1 MHz timer used by Embassy and radio deadlines;
-- factory chip-ID reads from the boot-ROM-loaded eFuse shadow.
-
-I2C, SPI, ADC, general GPIO ownership, flash/NV storage, hardware RNG, and
-retention sleep are not exposed through a Rust HAL. A real BME280/SHT3x and
-battery build therefore needs a `bl702-hal` crate with `embedded-hal` I2C and
-digital traits, an ADC API, and `embedded-storage` flash support.
+The sensor uses durable start/resume, tick, incoming-frame, rejoin, leave, and
+factory-reset paths. GPIO, buses, ADC, PWM, and destructive flash operations
+are host-tested and RV32IMC-compiled; only UART, timer, eFuse, and radio paths
+are currently hardware-proven.
 
 ## Known limitations
 
-- Network and security state are not persisted yet; a reset requires a fresh
-  permit-join commissioning.
-- The sensor values are synthetic until I2C and ADC support is added.
+- Flash-backed network and security persistence is integrated, but sector
+  erase/program and reset-resume still need cautious XT-ZB1 hardware
+  validation.
+- Temperature and humidity remain synthetic until a physical sensor is wired
+  through the available I2C API.
+- The GPADC battery path still needs hardware validation.
 - M154 operation and the Embassy executor are polling-only; the firmware does
   not enter low-power retention sleep.
 - Hardware address filtering and hardware auto-ACK are disabled.

@@ -12,7 +12,9 @@ use crate::binding::{BindingDst, BindingDstMode, BindingEntry};
 use crate::security::{ApsKeyType, ApsLinkKeyEntry};
 use crate::{ApsLayer, ApsStatus};
 use zigbee_mac::MacDriver;
-use zigbee_types::IeeeAddress;
+use zigbee_types::{IeeeAddress, ShortAddress};
+
+const BROADCAST_IEEE: IeeeAddress = [0xFF; 8];
 
 // ════════════════════════════════════════════════════════════════
 // Key Management Primitives
@@ -27,6 +29,8 @@ pub struct ApsmeTransportKeyRequest {
     pub key_type: ApsKeyType,
     /// The key material (128-bit)
     pub key: [u8; 16],
+    /// Network-key sequence number; ignored for link-key types.
+    pub key_seq_number: u8,
 }
 
 /// APSME-REQUEST-KEY.request — request a key from the Trust Center.
@@ -56,6 +60,19 @@ pub struct ApsmeVerifyKeyRequest {
     pub dst_address: IeeeAddress,
     /// Key type to verify
     pub key_type: ApsKeyType,
+}
+
+/// Status carried by an APS Update-Device command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ApsUpdateDeviceStatus {
+    StandardDeviceSecuredRejoin = 0x00,
+    StandardDeviceUnsecuredJoin = 0x01,
+    DeviceLeft = 0x02,
+    StandardDeviceUnsecuredRejoin = 0x03,
+    HighSecurityDeviceSecuredRejoin = 0x04,
+    HighSecurityDeviceUnsecuredJoin = 0x05,
+    HighSecurityDeviceUnsecuredRejoin = 0x07,
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -259,10 +276,12 @@ impl<M: MacDriver> ApsLayer<M> {
     ///
     /// Stores the key locally and sends an APS Transport Key command frame.
     pub async fn apsme_transport_key(&mut self, req: &ApsmeTransportKeyRequest) -> ApsStatus {
-        // Store the key locally
-        match req.key_type {
+        // Keep the old link key installed until after the command is secured:
+        // a newly transported TC link key must be encrypted with the previous
+        // key-load key, not with the key contained in its own payload.
+        let pending_entry = match req.key_type {
             ApsKeyType::TrustCenterLinkKey | ApsKeyType::ApplicationLinkKey => {
-                let entry = ApsLinkKeyEntry {
+                Some(ApsLinkKeyEntry {
                     partner_address: req.dst_address,
                     key: req.key,
                     key_type: req.key_type,
@@ -270,27 +289,24 @@ impl<M: MacDriver> ApsLayer<M> {
                     outgoing_frame_counter_limit: u32::MAX,
                     incoming_frame_counter: 0,
                     incoming_frame_counter_valid: false,
-                };
-                if self.security.add_key(entry).is_err() {
-                    return ApsStatus::TableFull;
-                }
+                })
             }
-            ApsKeyType::NetworkKey => {
-                // Network key is managed by NWK security, not APS key table
-            }
-            _ => {}
-        }
+            ApsKeyType::NetworkKey => None,
+            _ => None,
+        };
 
-        // Resolve destination short address from IEEE
-        let dst_short = match self.nwk.find_short_by_ieee(&req.dst_address) {
-            Some(addr) => addr,
-            None => {
-                log::warn!(
-                    "APSME-TRANSPORT-KEY: no short address for {:02X?}",
-                    req.dst_address
-                );
-                return ApsStatus::Success; // Key stored locally, but can't send OTA
-            }
+        let dst_short = match req.dst_address {
+            BROADCAST_IEEE => ShortAddress::BROADCAST,
+            _ => match self.nwk.find_short_by_ieee(&req.dst_address) {
+                Some(addr) => addr,
+                None => {
+                    log::warn!(
+                        "APSME-TRANSPORT-KEY: no short address for {:02X?}",
+                        req.dst_address
+                    );
+                    return ApsStatus::NoShortAddress;
+                }
+            },
         };
         let local_ieee = self.nwk.nib().ieee_address;
         let key_type_byte = match req.key_type {
@@ -299,16 +315,29 @@ impl<M: MacDriver> ApsLayer<M> {
             ApsKeyType::TrustCenterLinkKey => 0x04,
             _ => return ApsStatus::IllegalRequest,
         };
-        match self
-            .send_transport_key(dst_short, key_type_byte, &req.key, 0, &local_ieee)
+        let send_status = match self
+            .send_transport_key(
+                dst_short,
+                &req.dst_address,
+                key_type_byte,
+                &req.key,
+                req.key_seq_number,
+                &local_ieee,
+            )
             .await
         {
             Ok(()) => ApsStatus::Success,
             Err(e) => {
                 log::warn!("APSME-TRANSPORT-KEY: send failed: {e:?}");
-                ApsStatus::Success // Key stored locally even if OTA fails
+                return e;
             }
+        };
+        if let Some(entry) = pending_entry
+            && self.security.add_key(entry).is_err()
+        {
+            return ApsStatus::TableFull;
         }
+        send_status
     }
 
     /// APSME-REQUEST-KEY.request — request a key from the Trust Center.
@@ -334,17 +363,23 @@ impl<M: MacDriver> ApsLayer<M> {
 
     /// APSME-SWITCH-KEY.request — switch to a new active network key.
     pub async fn apsme_switch_key(&mut self, req: &ApsmeSwitchKeyRequest) -> ApsStatus {
-        let dst_short = match self.nwk.find_short_by_ieee(&req.dst_address) {
-            Some(addr) => addr,
-            None => {
-                log::warn!(
-                    "APSME-SWITCH-KEY: no short address for {:02X?}",
-                    req.dst_address
-                );
-                return ApsStatus::IllegalRequest;
-            }
+        let dst_short = match req.dst_address {
+            BROADCAST_IEEE => ShortAddress::BROADCAST,
+            _ => match self.nwk.find_short_by_ieee(&req.dst_address) {
+                Some(addr) => addr,
+                None => {
+                    log::warn!(
+                        "APSME-SWITCH-KEY: no short address for {:02X?}",
+                        req.dst_address
+                    );
+                    return ApsStatus::IllegalRequest;
+                }
+            },
         };
-        match self.send_switch_key(dst_short, req.key_seq_number).await {
+        match self
+            .send_switch_key(dst_short, &req.dst_address, req.key_seq_number)
+            .await
+        {
             Ok(()) => ApsStatus::Success,
             Err(e) => {
                 log::warn!("APSME-SWITCH-KEY: send failed: {e:?}");

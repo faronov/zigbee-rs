@@ -96,7 +96,7 @@ fn main() {
     println!("── Step 2: Build Sensor Device ──");
 
     let device = templates::temperature_humidity_sensor(mac)
-        .manufacturer("zigbee-rs")
+        .manufacturer("Zigbee-RS")
         .model("MockTempHumid-01")
         .date_code("20250101")
         .sw_build("0.1.0")

@@ -28,16 +28,21 @@ at `0x850000`.
 
 ```text
 examples/telink-tlsr8258-sensor/  polling end-device sensor
-examples/telink-tlsr8258-router/  always-on join/relay router
+examples/telink-tlsr8258-router/  always-on parent router
 tools/telink-tlsr8258-lab/        bring-up and regression firmware
-tlsr8258-hal/                     clocks, timers, flash, radio, GPIO, ADC, PM
+tlsr8258-hal/                     clocks, timers, flash, radio, GPIO, ADC,
+                                  I2C, SPI, PWM, PM, ownership tokens
 tlsr8258-rt/                      reset, IRQ context, RAM initialization
+boards/tlsr8258-tb04/             fitted LEDs, flash token, typed resources
+products/tlsr8258-tb04/           protected flash partition and linker policy
 zigbee-mac/src/telink/            reusable TLSR8258 MacDriver
 ```
 
-The application examples contain only board configuration, flash-journal
-adaptation, and role-specific Zigbee logic. The old direct-MMIO radio, local
-MAC, SRAM markers, and diagnostic modes are retained only in the hardware lab.
+The board crate exposes only physical resources. The product crate owns the
+bounded security partition, journal construction, and linker layout. The
+application examples contain role-specific Zigbee logic. The old direct-MMIO
+radio, local MAC, SRAM markers, and diagnostic modes are retained only in the
+hardware lab.
 
 ## Toolchain
 
@@ -102,10 +107,26 @@ repeated LOW32K retention wakeups.
 
 The router joins as an FFD, enters continuous receive, relays NWK traffic, and
 sends router maintenance frames. Hardware has proven join, interview,
-Identify, and reset/resume.
+TCLK exchange, Identify, routed-frame relay, and silent reset/resume. The
+accepted reset capture resumed on the previous short address without a Beacon
+Request, Association Request, or Device_annce.
 
-It is not yet a parent router. Child association responses, beacon
-transmission, permit joining, and indirect queues are not implemented.
+The bounded parent path now handles beacon requests, finite or indefinite
+permit joining, child association, and indirect delivery to polling sleepy
+children. Child-table entries are RAM-only and children must re-associate
+after router reboot; commissioned network and security state remain
+persistent.
+
+The security path waits for the over-the-air Association Response ACK before
+notifying the Trust Center, forwards tunneled Transport-Key commands without
+rewriting the embedded APS frame, and keeps a child provisional until it
+proves possession of the network key. Secured and centralized unsecured
+rejoins are supported; distributed unsecured rejoins are rejected.
+
+Child-parent operation is not yet hardware-validated. A sniffer gate must
+verify ACK turnaround and Frame Pending timing, deferred Association Response
+after an extended-address poll, and indirect data after a short-address child
+poll.
 
 ## Hardware lab
 
@@ -123,6 +144,41 @@ diagnostics through the root wrapper:
 The lab preserves the hardware evidence for raw RF, MAC timing, startup,
 flash, and retention PM without obscuring the production applications.
 
+## Peripheral HAL status
+
+The reusable HAL exposes GPIO, ADC, flash, timers, power management, I2C, SPI,
+and six-channel PWM. `embedded-hal` I2C, SPI bus, digital, and PWM traits are
+implemented where applicable.
+
+`tlsr8258_hal::peripherals::Peripherals::take()` creates one shared
+`SerialController` token, the PWM token, and a non-`Clone` token for every
+GPIO pad. I2C and SPI consume the same serial token because TLSR8258 implements
+them with overlapping control and route registers; safe code therefore cannot
+keep both controllers live. On TC32 the single-take guard masks interrupts
+rather than emitting unsupported atomic read-modify-write instructions.
+
+`boards/tlsr8258-tb04::resources::BoardResources` owns those controller tokens,
+the fitted RGB/status LED pins, the supported non-LED I2C/SPI route pins, and
+the fitted flash token. `products/tlsr8258-tb04` consumes that token and bounds
+the security journal to `0x74000..0x76000`; its linker script prevents firmware
+overlap. Choosing direct GPIO LEDs consumes the same
+lighting token that would otherwise create PWM0/PWM5/PWM2 outputs. The raw
+`Pin::steal` escape hatch is unsafe; normal code obtains unique pins only from
+`Peripherals`.
+
+The I2C implementation validates the four documented pin groups, supports
+bounded bus recovery and repeated-start transactions, and does not invent an
+arbitration-loss flag that TLSR8258 does not expose. SPI supports the two
+documented groups and MSB-first operation. All PWM channels share one
+validated clock/divider.
+
+Host tests and TC32 production builds cover the new APIs. Existing GPIO, ADC,
+flash, radio, and retention-PM paths have hardware evidence; the new
+I2C/SPI/PWM paths have not yet been tested on silicon. TB-04 does not expose a
+fixed I2C or SPI convenience constructor because fitted bus wiring is not
+documented. Its `SerialResources` instead exposes the valid route pins and the
+single controller token for an application-selected bus.
+
 ## Current capability boundary
 
 The TLSR8258 backend provides active/passive/energy scan, association, data
@@ -131,4 +187,8 @@ mandatory timing, and crash-safe security persistence. Home Assistant ZHA has
 verified commissioning, TCLK exchange, interview, reporting, reset resume,
 secured rejoin, and router join/relay setup.
 
+Router restart, maintenance traffic, and NWK relay are hardware-verified.
+Child-parent support is software-complete but remains behind the sniffer gate
+described above. SWire RAM/flash inspection is restart-intrusive on the tested
+programmer and must be performed only after stopping an acceptance capture.
 Full coordinator support is not advertised.

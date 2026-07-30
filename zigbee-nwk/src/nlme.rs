@@ -452,6 +452,7 @@ impl<M: MacDriver> NwkLayer<M> {
             network_address: join_target,
             device_type: parent_device_type,
             rx_on_when_idle: true,
+            security_capable: true,
             relationship: Relationship::Parent,
             lqi: network.lqi,
             outgoing_cost: 1,
@@ -739,9 +740,11 @@ impl<M: MacDriver> NwkLayer<M> {
                         }
                     };
                 if sec_hdr.source_address != parent_ieee
-                    || !self
-                        .security
-                        .check_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter)
+                    || !self.security.check_frame_counter_for_key(
+                        &sec_hdr.source_address,
+                        sec_hdr.key_seq_number,
+                        sec_hdr.frame_counter,
+                    )
                 {
                     log::warn!(
                         "[NWK] Rejoin RX #{}: replay or source mismatch (fc={})",
@@ -775,8 +778,11 @@ impl<M: MacDriver> NwkLayer<M> {
                     &sec_hdr,
                 ) {
                     Some(v) => {
-                        self.security
-                            .commit_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter);
+                        self.security.commit_frame_counter_for_key(
+                            &sec_hdr.source_address,
+                            sec_hdr.key_seq_number,
+                            sec_hdr.frame_counter,
+                        );
                         v
                     }
                     None => {
@@ -852,6 +858,7 @@ impl<M: MacDriver> NwkLayer<M> {
                         network_address: hdr.src_addr,
                         device_type: parent_device_type,
                         rx_on_when_idle: true,
+                        security_capable: true,
                         relationship: Relationship::Parent,
                         lqi: network.lqi,
                         outgoing_cost: 1,
@@ -1097,10 +1104,8 @@ impl<M: MacDriver> NwkLayer<M> {
             return Err(NwkStatus::InvalidRequest);
         }
 
-        self.nib.permit_joining = duration != 0;
-        self.nib.permit_joining_duration = duration;
-
-        // Update MAC
+        // Commit the NIB only after the MAC accepts the matching PIB state so
+        // policy and over-the-air association handling cannot diverge.
         self.mac
             .mlme_set(
                 PibAttribute::MacAssociationPermit,
@@ -1108,9 +1113,32 @@ impl<M: MacDriver> NwkLayer<M> {
             )
             .await
             .map_err(|_| NwkStatus::InvalidRequest)?;
+        self.nib.permit_joining = duration != 0;
+        self.nib.permit_joining_duration = duration;
 
         log::info!("[NWK] Permit joining: duration={duration}");
         Ok(())
+    }
+
+    /// Age a finite permit-joining window and synchronize the MAC PIB when it
+    /// closes. `0xFF` remains open indefinitely and `0` remains closed.
+    ///
+    /// Returns `true` only when this tick transitions the window to closed.
+    pub async fn tick_permit_joining(&mut self, elapsed_secs: u16) -> Result<bool, NwkStatus> {
+        if !self.nib.permit_joining
+            || self.nib.permit_joining_duration == 0
+            || self.nib.permit_joining_duration == 0xFF
+            || elapsed_secs == 0
+        {
+            return Ok(false);
+        }
+        let remaining = u16::from(self.nib.permit_joining_duration);
+        if elapsed_secs < remaining {
+            self.nib.permit_joining_duration = (remaining - elapsed_secs) as u8;
+            return Ok(false);
+        }
+        self.nlme_permit_joining(0).await?;
+        Ok(true)
     }
 
     // ── NLME-START-ROUTER ───────────────────────────────────

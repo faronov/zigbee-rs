@@ -1,4 +1,4 @@
-/* Production TLSR8258 TB-04 runtime layout.
+/* Production TLSR8258 TB-04 product layout.
  *
  * Writable data follows the Telink SDK cache reservation:
  *   0x840000 + A         RAM-code backing end / I-cache tag start
@@ -6,7 +6,8 @@
  *   0x840900 + A         I-cache data end / .data start
  *   0x850000             top of SRAM
  *
- * A is the RAM-code preload size rounded up to 256 bytes.
+ * A is the RAM-code preload size rounded up to 256 bytes. The product-owned
+ * security journal occupies flash 0x74000..0x76000.
  */
 MEMORY
 {

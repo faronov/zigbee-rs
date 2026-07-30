@@ -94,7 +94,7 @@ use zigbee_runtime::templates;
 use zigbee_types::*;
 
 let device = templates::temperature_humidity_sensor(mac)
-    .manufacturer("zigbee-rs")
+    .manufacturer("Zigbee-RS")
     .model("MockTempHumid-01")
     .sw_build("0.1.0")
     .channels(ChannelMask::PREFERRED)

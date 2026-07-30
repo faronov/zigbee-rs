@@ -13,6 +13,15 @@ use zigbee_types::IeeeAddress;
 
 /// Maximum number of network keys we can store (current + previous)
 pub const MAX_NETWORK_KEYS: usize = 2;
+#[cfg(feature = "router")]
+const MAX_FRAME_COUNTER_ENTRIES: usize = 64;
+#[cfg(not(feature = "router"))]
+const MAX_FRAME_COUNTER_ENTRIES: usize = 16;
+
+/// Serialized length of the NWK security auxiliary header.
+///
+/// security control (1) + frame counter (4) + source IEEE (8) + key sequence (1).
+pub const NWK_AUX_HEADER_LEN: usize = 14;
 
 /// NWK security material for one key
 #[derive(Debug, Clone)]
@@ -46,7 +55,7 @@ impl NwkSecurityHeader {
     pub const ZIGBEE_DEFAULT: u8 = 0x05 | (0x01 << 3) | (1 << 5); // 0x2D
 
     pub fn parse(data: &[u8]) -> Option<(Self, usize)> {
-        if data.len() < 14 {
+        if data.len() < NWK_AUX_HEADER_LEN {
             return None;
         }
         let security_control = data[0];
@@ -62,7 +71,7 @@ impl NwkSecurityHeader {
                 source_address,
                 key_seq_number,
             },
-            14,
+            NWK_AUX_HEADER_LEN,
         ))
     }
 
@@ -71,7 +80,7 @@ impl NwkSecurityHeader {
         buf[1..5].copy_from_slice(&self.frame_counter.to_le_bytes());
         buf[5..13].copy_from_slice(&self.source_address);
         buf[13] = self.key_seq_number;
-        14
+        NWK_AUX_HEADER_LEN
     }
 }
 
@@ -79,14 +88,17 @@ impl NwkSecurityHeader {
 pub struct NwkSecurity {
     /// Stored network keys
     keys: [Option<NetworkKeyEntry>; MAX_NETWORK_KEYS],
-    /// Incoming frame counter table (for replay protection)
-    /// Maps source IEEE address → last seen frame counter
-    frame_counter_table: heapless::Vec<FrameCounterEntry, 32>,
+    /// Sequence number installed by Transport-Key but not yet activated.
+    staged_key_sequence: Option<u8>,
+    /// Incoming frame counter table (for replay protection).
+    /// Maps source IEEE address and network-key sequence to the last counter.
+    frame_counter_table: heapless::Vec<FrameCounterEntry, MAX_FRAME_COUNTER_ENTRIES>,
 }
 
 #[derive(Debug, Clone)]
 struct FrameCounterEntry {
     source: IeeeAddress,
+    key_sequence: u8,
     counter: u32,
 }
 
@@ -94,19 +106,123 @@ impl NwkSecurity {
     pub fn new() -> Self {
         Self {
             keys: [None, None],
+            staged_key_sequence: None,
             frame_counter_table: heapless::Vec::new(),
         }
     }
 
     /// Set the active network key.
     pub fn set_network_key(&mut self, key: AesKey, seq_number: u8) {
-        // Move current key to slot 1 (previous), new key to slot 0 (active)
-        self.keys[1] = self.keys[0].take();
+        if let Some(active) = self.keys[0].as_mut()
+            && active.seq_number == seq_number
+        {
+            let key_changed = active.key != key;
+            active.key = key;
+            active.active = true;
+            self.staged_key_sequence = None;
+            if key_changed {
+                self.clear_frame_counters_for_key(seq_number);
+            }
+            return;
+        }
+        if self.keys[1]
+            .as_ref()
+            .is_some_and(|entry| entry.seq_number == seq_number && entry.key == key)
+        {
+            self.keys.swap(0, 1);
+            if let Some(active) = self.keys[0].as_mut() {
+                active.active = true;
+            }
+            if let Some(previous) = self.keys[1].as_mut() {
+                previous.active = false;
+            }
+            self.staged_key_sequence = None;
+            return;
+        }
+
+        self.clear_frame_counters_for_key(seq_number);
+        let previous = self.keys[0].take().map(|mut entry| {
+            entry.active = false;
+            entry
+        });
         self.keys[0] = Some(NetworkKeyEntry {
             key,
             seq_number,
             active: true,
         });
+        self.keys[1] = previous.filter(|entry| entry.seq_number != seq_number);
+        self.staged_key_sequence = None;
+        self.retain_frame_counters_for_installed_keys();
+    }
+
+    /// Install a future network key without activating it.
+    ///
+    /// Returns `false` if the sequence number names the active key but the
+    /// supplied key material differs.
+    pub fn stage_network_key(&mut self, key: AesKey, seq_number: u8) -> bool {
+        let Some(active) = self.keys[0].as_ref() else {
+            self.set_network_key(key, seq_number);
+            return true;
+        };
+        if active.seq_number == seq_number {
+            return active.key == key;
+        }
+        if self.keys[1]
+            .as_ref()
+            .is_some_and(|entry| entry.seq_number == seq_number && entry.key == key)
+        {
+            self.staged_key_sequence = Some(seq_number);
+            return true;
+        }
+
+        self.clear_frame_counters_for_key(seq_number);
+        self.keys[1] = Some(NetworkKeyEntry {
+            key,
+            seq_number,
+            active: false,
+        });
+        self.staged_key_sequence = Some(seq_number);
+        self.retain_frame_counters_for_installed_keys();
+        true
+    }
+
+    /// Return the key waiting for a future Switch-Key command.
+    pub fn staged_key(&self) -> Option<&NetworkKeyEntry> {
+        let sequence = self.staged_key_sequence?;
+        self.key_by_seq(sequence)
+    }
+
+    /// Activate an installed network key by sequence number.
+    pub fn activate_network_key(&mut self, seq_number: u8) -> bool {
+        if self.keys[0]
+            .as_ref()
+            .is_some_and(|entry| entry.seq_number == seq_number)
+        {
+            if let Some(active) = self.keys[0].as_mut() {
+                active.active = true;
+            }
+            if let Some(previous) = self.keys[1].as_mut() {
+                previous.active = false;
+            }
+            return true;
+        }
+        if self.keys[1]
+            .as_ref()
+            .is_some_and(|entry| entry.seq_number == seq_number)
+        {
+            self.keys.swap(0, 1);
+            if let Some(active) = self.keys[0].as_mut() {
+                active.active = true;
+            }
+            if let Some(previous) = self.keys[1].as_mut() {
+                previous.active = false;
+            }
+            if self.staged_key_sequence == Some(seq_number) {
+                self.staged_key_sequence = None;
+            }
+            return true;
+        }
+        false
     }
 
     /// Get the active network key.
@@ -119,14 +235,45 @@ impl NwkSecurity {
         self.keys.iter().flatten().find(|k| k.seq_number == seq)
     }
 
+    fn clear_frame_counters_for_key(&mut self, key_sequence: u8) {
+        self.frame_counter_table
+            .retain(|entry| entry.key_sequence != key_sequence);
+    }
+
+    fn retain_frame_counters_for_installed_keys(&mut self) {
+        let active_sequence = self.keys[0].as_ref().map(|entry| entry.seq_number);
+        let alternate_sequence = self.keys[1].as_ref().map(|entry| entry.seq_number);
+        self.frame_counter_table.retain(|entry| {
+            Some(entry.key_sequence) == active_sequence
+                || Some(entry.key_sequence) == alternate_sequence
+        });
+    }
+
+    /// Clear all incoming replay state for one device identity.
+    pub fn clear_frame_counters_for_source(&mut self, source: &IeeeAddress) {
+        self.frame_counter_table
+            .retain(|entry| entry.source != *source);
+    }
+
     /// Check incoming frame counter (replay protection) WITHOUT committing.
     /// Returns true if the frame counter is valid (newer than last seen).
     /// Call `commit_frame_counter()` AFTER successful MIC verification.
     pub fn check_frame_counter(&self, source: &IeeeAddress, counter: u32) -> bool {
+        let key_sequence = self.active_key().map(|entry| entry.seq_number).unwrap_or(0);
+        self.check_frame_counter_for_key(source, key_sequence, counter)
+    }
+
+    /// Check an incoming counter in the replay domain of one network key.
+    pub fn check_frame_counter_for_key(
+        &self,
+        source: &IeeeAddress,
+        key_sequence: u8,
+        counter: u32,
+    ) -> bool {
         if let Some(entry) = self
             .frame_counter_table
             .iter()
-            .find(|e| e.source == *source)
+            .find(|e| e.source == *source && e.key_sequence == key_sequence)
         {
             counter > entry.counter
         } else {
@@ -142,16 +289,28 @@ impl NwkSecurity {
     /// Commit frame counter after successful MIC verification.
     /// Must only be called after decrypt/verify succeeds.
     pub fn commit_frame_counter(&mut self, source: &IeeeAddress, counter: u32) {
+        let key_sequence = self.active_key().map(|entry| entry.seq_number).unwrap_or(0);
+        self.commit_frame_counter_for_key(source, key_sequence, counter);
+    }
+
+    /// Commit a verified counter in the replay domain of one network key.
+    pub fn commit_frame_counter_for_key(
+        &mut self,
+        source: &IeeeAddress,
+        key_sequence: u8,
+        counter: u32,
+    ) {
         if let Some(entry) = self
             .frame_counter_table
             .iter_mut()
-            .find(|e| e.source == *source)
+            .find(|e| e.source == *source && e.key_sequence == key_sequence)
         {
             entry.counter = counter;
         } else {
             // New source — add to table (already checked not full in check_frame_counter)
             let _ = self.frame_counter_table.push(FrameCounterEntry {
                 source: *source,
+                key_sequence,
                 counter,
             });
         }
@@ -256,5 +415,67 @@ mod tests {
             .encrypt(b"NWK-HDR+AUX", b"hello-nwk-frame", &key, &header)
             .expect("encrypt");
         assert_eq!(encrypted.as_slice(), expected);
+    }
+
+    #[test]
+    fn staged_network_key_does_not_activate_until_switch_key() {
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        assert!(security.stage_network_key([0x22; 16], 2));
+
+        assert_eq!(security.active_key().unwrap().seq_number, 1);
+        assert_eq!(security.key_by_seq(2).unwrap().key, [0x22; 16]);
+        assert!(!security.key_by_seq(2).unwrap().active);
+        assert_eq!(security.staged_key().unwrap().seq_number, 2);
+
+        assert!(security.activate_network_key(2));
+        assert_eq!(security.active_key().unwrap().seq_number, 2);
+        assert!(security.staged_key().is_none());
+        assert_eq!(security.key_by_seq(1).unwrap().key, [0x11; 16]);
+        assert!(!security.key_by_seq(1).unwrap().active);
+        assert!(!security.activate_network_key(3));
+    }
+
+    #[test]
+    fn replay_counters_are_scoped_by_network_key_sequence() {
+        let source = [0x44; 8];
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        security.commit_frame_counter_for_key(&source, 1, 100);
+
+        assert!(!security.check_frame_counter_for_key(&source, 1, 1));
+        assert!(security.check_frame_counter_for_key(&source, 2, 1));
+        security.commit_frame_counter_for_key(&source, 2, 1);
+        assert!(!security.check_frame_counter_for_key(&source, 2, 1));
+        assert!(!security.check_frame_counter_for_key(&source, 1, 100));
+    }
+
+    #[test]
+    fn replacing_key_material_resets_that_sequences_replay_domain() {
+        let source = [0x44; 8];
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        security.commit_frame_counter_for_key(&source, 1, 100);
+
+        security.set_network_key([0x22; 16], 1);
+
+        assert!(security.check_frame_counter_for_key(&source, 1, 0));
+    }
+
+    #[test]
+    fn clearing_one_sources_replay_state_preserves_other_devices() {
+        let source = [0x44; 8];
+        let other = [0x55; 8];
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        security.commit_frame_counter_for_key(&source, 1, 100);
+        security.commit_frame_counter_for_key(&source, 2, 200);
+        security.commit_frame_counter_for_key(&other, 1, 300);
+
+        security.clear_frame_counters_for_source(&source);
+
+        assert!(security.check_frame_counter_for_key(&source, 1, 0));
+        assert!(security.check_frame_counter_for_key(&source, 2, 0));
+        assert!(!security.check_frame_counter_for_key(&other, 1, 1));
     }
 }

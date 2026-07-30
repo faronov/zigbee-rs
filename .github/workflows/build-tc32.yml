@@ -11,6 +11,8 @@ on:
       - "tools/tlsr8258-firmware.sh"
       - "examples/telink-tlsr8258-radio/**"
       - "tlsr8258-hal/**"
+      - "boards/tlsr8258-tb04/**"
+      - "products/tlsr8258-tb04/**"
       - "tlsr8258-rt/**"
       - "zigbee-*/**"
       - ".github/workflows/build-tc32.yml"
@@ -24,6 +26,8 @@ on:
       - "tools/tlsr8258-firmware.sh"
       - "examples/telink-tlsr8258-radio/**"
       - "tlsr8258-hal/**"
+      - "boards/tlsr8258-tb04/**"
+      - "products/tlsr8258-tb04/**"
       - "tlsr8258-rt/**"
       - "zigbee-*/**"
       - ".github/workflows/build-tc32.yml"
@@ -64,6 +68,9 @@ jobs:
             ~/.cargo/git
             examples/telink-tlsr8258-sensor/target
             examples/telink-tlsr8258-router/target
+            tlsr8258-hal/target
+            boards/tlsr8258-tb04/target
+            products/tlsr8258-tb04/target
             tools/telink-tlsr8258-lab/target
             examples/telink-tlsr8258-radio/target
           key: tc32-45-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '**/memory*.x') }}
@@ -93,9 +100,15 @@ jobs:
           cp target/tc32-unknown-none-elf/release/telink-tlsr8258-radio.bin \
             ../../target/tlsr8258-artifacts/telink-tlsr8258-radio.bin
 
-      - name: Run host radio tests
+      - name: Run host HAL and radio tests
         run: |
           HOST_TARGET="$(rustc +stable -vV | sed -n 's/^host: //p')"
+          cargo +stable test --manifest-path tlsr8258-hal/Cargo.toml \
+            --release --target "$HOST_TARGET"
+          cargo +stable test --manifest-path boards/tlsr8258-tb04/Cargo.toml \
+            --release --target "$HOST_TARGET"
+          cargo +stable test --manifest-path products/tlsr8258-tb04/Cargo.toml \
+            --release --target "$HOST_TARGET"
           cargo +stable test --manifest-path examples/telink-tlsr8258-radio/Cargo.toml \
             --release --target "$HOST_TARGET"
 
@@ -115,6 +128,9 @@ jobs:
       - name: Check formatting
         run: |
           cargo fmt --all -- --check
+          cargo fmt --manifest-path tlsr8258-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/tlsr8258-tb04/Cargo.toml -- --check
+          cargo fmt --manifest-path products/tlsr8258-tb04/Cargo.toml -- --check
           cargo fmt --manifest-path examples/telink-tlsr8258-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/telink-tlsr8258-router/Cargo.toml -- --check
           cargo fmt --manifest-path tools/telink-tlsr8258-lab/Cargo.toml -- --check

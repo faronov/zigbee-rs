@@ -64,14 +64,15 @@ raw NOR traits, but they intentionally provide different semantics.
 
 | Platform | Flash controller | Current partition owner | Store |
 |---|---|---|---|
-| TLSR8258 | `tlsr8258-hal` | `boards/tlsr8258-tb04` | Security journal |
+| BL702 | `bl702-hal` mask-ROM XIP flash | `products/bl702-xt-zb1` | Security journal; destructive silicon validation pending |
+| TLSR8258 | `tlsr8258-hal` | `products/tlsr8258-tb04` | Security journal |
 | nRF52840 | Embassy NVMC | `products/nrf52840-sensor` | Security journal |
 | PHY6222/PHY6252 | `phy6222-hal` | `boards/phy62x2-evk` | Security journal |
 | ESP32-C6/H2 | `esp_storage::FlashStorage` | `products/esp32-zigbee-devkit` | Security journal |
 | EFR32MG1P | `efr32mg1-hal` MSC | `products/efr32mg1-tradfri` | Security journal + separate generic NV |
 | EFR32MG21 | `efr32mg21-hal` MSC | `boards/efr32mg21-devkit` | Generic NV |
 
-EFR32MG1P, ESP32-C6/H2, and nRF52840 are product-split platforms:
+BL702, TLSR8258, EFR32MG1P, ESP32-C6/H2, and nRF52840 are product-split platforms:
 `boards/<board>` exposes only the physical chip flash resource (raw
 whole-chip read/write/erase, no partition or NV knowledge, no
 `zigbee-runtime` dependency), and `products/<product>` bounds it to a window

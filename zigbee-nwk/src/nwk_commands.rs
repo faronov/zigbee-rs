@@ -7,6 +7,7 @@ use crate::frames::{
     EdTimeoutRequest, LinkStatusCommand, LinkStatusEntry, NetworkStatusCommand, NwkCommandId,
     NwkFrameControl, NwkFrameType, NwkHeader, RouteReply, RouteRequest,
 };
+use crate::nlde::{is_nwk_broadcast, is_unicast_address};
 use crate::{NwkLayer, NwkStatus};
 use zigbee_mac::{AddressMode, MacDriver, McpsDataRequest, TxOptions};
 use zigbee_types::*;
@@ -19,7 +20,7 @@ impl<M: MacDriver> NwkLayer<M> {
         cmd_id: NwkCommandId,
         cmd_payload: &[u8],
     ) -> Result<(), NwkStatus> {
-        let is_broadcast = dst_addr.0 >= 0xFFF8;
+        let is_broadcast = is_nwk_broadcast(dst_addr);
         let radius = if is_broadcast { 30 } else { 10 };
         self.send_nwk_command_with_radius(dst_addr, cmd_id, cmd_payload, radius)
             .await
@@ -70,51 +71,11 @@ impl<M: MacDriver> NwkLayer<M> {
         }
         full_cmd[1..cmd_len].copy_from_slice(cmd_payload);
 
-        let mut buf = [0u8; 128];
-        let hdr_len = header.serialize(&mut buf);
-
-        let total_len;
-        if self.nib.security_enabled {
-            let sec_hdr = crate::security::NwkSecurityHeader {
-                security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
-                frame_counter: self
-                    .nib
-                    .next_frame_counter()
-                    .ok_or(NwkStatus::InvalidRequest)?,
-                source_address: self.nib.ieee_address,
-                key_seq_number: self.nib.active_key_seq_number,
-            };
-            let sec_hdr_len = sec_hdr.serialize(&mut buf[hdr_len..]);
-            let aad_len = hdr_len + sec_hdr_len;
-
-            if let Some(key_entry) = self.security.active_key() {
-                if let Some(encrypted) = self.security.encrypt(
-                    &buf[..aad_len],
-                    &full_cmd[..cmd_len],
-                    &key_entry.key,
-                    &sec_hdr,
-                ) {
-                    if aad_len + encrypted.len() > buf.len() {
-                        return Err(NwkStatus::FrameTooLong);
-                    }
-                    buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
-                    total_len = aad_len + encrypted.len();
-                    // The actual ENC-MIC-32 level is used for CCM*, but Zigbee
-                    // carries zero in the over-the-air security-level bits.
-                    buf[hdr_len] &= !0x07;
-                } else {
-                    return Err(NwkStatus::InvalidRequest);
-                }
-            } else {
-                return Err(NwkStatus::NoKey);
-            }
-        } else {
-            if hdr_len + cmd_len > buf.len() {
-                return Err(NwkStatus::FrameTooLong);
-            }
-            buf[hdr_len..hdr_len + cmd_len].copy_from_slice(&full_cmd[..cmd_len]);
-            total_len = hdr_len + cmd_len;
-        }
+        // The shared builder owns header serialization, key selection, the
+        // durable frame-counter reservation and CCM*, so commands, data and
+        // relayed frames are all secured the same way.
+        let mut buf = [0u8; crate::nlde::MAX_NWK_FRAME];
+        let total_len = self.build_nwk_frame(&header, &full_cmd[..cmd_len], &mut buf)?;
 
         let next_hop = self.resolve_next_hop(dst_addr)?;
 
@@ -142,6 +103,17 @@ impl<M: MacDriver> NwkLayer<M> {
         path_cost: u8,
     ) -> Result<(), NwkStatus> {
         let rreq_id = self.nib.next_route_request_id();
+        self.send_route_request_with_id(rreq_id, dest, path_cost)
+            .await
+    }
+
+    /// Send a Route Request (RREQ) broadcast with a caller-chosen request ID.
+    async fn send_route_request_with_id(
+        &mut self,
+        rreq_id: u8,
+        dest: ShortAddress,
+        path_cost: u8,
+    ) -> Result<(), NwkStatus> {
         let rreq = RouteRequest {
             command_options: 0x00,
             route_request_id: rreq_id,
@@ -161,6 +133,68 @@ impl<M: MacDriver> NwkLayer<M> {
             &payload[..len],
         )
         .await
+    }
+
+    /// Start an AODV route discovery for `dest`.
+    ///
+    /// Records the pending discovery before transmitting so repeated data
+    /// requests for the same destination do not flood the network with Route
+    /// Requests; the record is failed again by
+    /// [`NwkLayer::tick_router_maintenance`] after
+    /// [`crate::routing::ROUTE_DISCOVERY_TIMEOUT_US`].
+    ///
+    /// If the Route Request never reaches the air — no network key, an
+    /// exhausted frame-counter reservation, a MAC transmit error — that record
+    /// is withdrawn again and the original error is returned, so the caller
+    /// may retry immediately instead of waiting out a discovery that was never
+    /// started.
+    ///
+    /// Returns the allocated route request ID.
+    pub async fn discover_route(&mut self, dest: ShortAddress) -> Result<u8, NwkStatus> {
+        if !self.can_route() {
+            // Non-routing builds and end devices have no routing table to
+            // install the answer into — fail instead of broadcasting a RREQ
+            // whose Route Reply would be discarded.
+            return Err(NwkStatus::InvalidRequest);
+        }
+        if !is_unicast_address(dest) || dest == self.nib.network_address {
+            // Broadcast, reserved and unassigned destinations name no device
+            // that a Route Reply could ever come back from.
+            return Err(NwkStatus::InvalidParameter);
+        }
+
+        let rreq_id = self.nib.next_route_request_id();
+        let now = self.mac.monotonic_micros();
+        if self
+            .routing
+            .add_discovery(crate::routing::RouteDiscovery {
+                request_id: rreq_id,
+                destination: dest,
+                sender: self.nib.network_address,
+                forward_cost: 0,
+                residual_cost: 0xFF,
+                timestamp: now,
+                active: true,
+            })
+            .is_err()
+        {
+            log::warn!("[NWK] Route discovery table full for 0x{:04X}", dest.0);
+            return Err(NwkStatus::RouteDiscoveryFailed);
+        }
+
+        if let Err(e) = self.send_route_request_with_id(rreq_id, dest, 0).await {
+            // Nothing was broadcast, so nothing may be waited for: withdraw
+            // the record this call installed and report why the discovery
+            // could not be started.
+            self.routing.fail_discovery(rreq_id);
+            log::warn!(
+                "[NWK] Route Request for 0x{:04X} not sent ({:?}); discovery withdrawn",
+                dest.0,
+                e,
+            );
+            return Err(e);
+        }
+        Ok(rreq_id)
     }
 
     /// Send a Route Reply (RREP) unicast toward the originator.
@@ -209,16 +243,26 @@ impl<M: MacDriver> NwkLayer<M> {
     }
 
     /// Send a Route Record unicast to the destination.
+    ///
+    /// The originator normally passes an empty relay list: every router the
+    /// record passes through appends itself (see
+    /// [`NwkLayer::process_incoming_nwk_frame`]), and the concentrator stores
+    /// the path it finally receives.
     pub async fn send_route_record(
         &mut self,
         dest: ShortAddress,
         relay_list: &[ShortAddress],
     ) -> Result<(), NwkStatus> {
-        let mut payload = [0u8; 40];
-        let count = relay_list.len().min(16);
-        payload[0] = count as u8;
+        // The path is bounded by what a concentrator can store and
+        // source-route over. A longer one is refused rather than silently
+        // truncated into a record that names the wrong hops.
+        if relay_list.len() > crate::routing::MAX_SOURCE_ROUTE_RELAYS {
+            return Err(NwkStatus::FrameTooLong);
+        }
+        let mut payload = [0u8; 1 + 2 * crate::routing::MAX_SOURCE_ROUTE_RELAYS];
+        payload[0] = relay_list.len() as u8;
         let mut offset = 1;
-        for relay in &relay_list[..count] {
+        for relay in relay_list {
             payload[offset] = (relay.0 & 0xFF) as u8;
             payload[offset + 1] = ((relay.0 >> 8) & 0xFF) as u8;
             offset += 2;
@@ -280,7 +324,94 @@ impl<M: MacDriver> NwkLayer<M> {
         .await
     }
 
-    /// Drain and send all queued route replies and RREQ rebroadcasts.
+    /// Forward an accepted Route Request one hop further.
+    ///
+    /// The frame that goes on air is the *originator's* broadcast, not a new
+    /// one of ours:
+    ///
+    /// - the NWK source address stays the originator's, so every receiver's
+    ///   broadcast transaction record recognises the copies that come back
+    ///   through other neighbours and suppresses them;
+    /// - the NWK sequence number and the end-device-initiator bit are
+    ///   preserved for the same reason, and because they belong to the
+    ///   originator's broadcast rather than to this hop;
+    /// - the radius is the received one minus one, so the flood stays inside
+    ///   the bound the originator set;
+    /// - only the RREQ path cost changes, carrying the cost of the path this
+    ///   request travelled to reach the next hop.
+    ///
+    /// NWK security is hop by hop, so the frame is re-secured through the
+    /// shared builder with *this* device's IEEE address and a fresh durable
+    /// frame counter over the header that actually goes on air.
+    async fn forward_route_request(
+        &mut self,
+        pending: &crate::QueuedRreqForward,
+    ) -> Result<(), NwkStatus> {
+        if !self.can_route() {
+            // Membership can end between accepting the request and this
+            // maintenance pass (a Leave, or a failed rejoin).
+            return Err(NwkStatus::InvalidRequest);
+        }
+
+        let header = NwkHeader {
+            frame_control: NwkFrameControl {
+                frame_type: NwkFrameType::Command as u8,
+                protocol_version: pending.frame_control.protocol_version,
+                discover_route: pending.frame_control.discover_route,
+                // A Route Request is a plain broadcast: neither subframe is
+                // carried, so their flags are cleared rather than preserved
+                // over a header that no longer has them.
+                multicast: false,
+                security: pending.frame_control.security,
+                source_route: false,
+                dst_ieee_present: false,
+                src_ieee_present: pending.src_ieee.is_some(),
+                end_device_initiator: pending.frame_control.end_device_initiator,
+            },
+            dst_addr: pending.dst_addr,
+            src_addr: pending.originator,
+            radius: pending.radius,
+            seq_number: pending.seq_number,
+            dst_ieee: None,
+            src_ieee: pending.src_ieee,
+            multicast_control: None,
+            source_route: None,
+        };
+
+        let rreq = RouteRequest {
+            command_options: pending.command_options,
+            route_request_id: pending.route_request_id,
+            dst_addr: pending.rreq_dst,
+            path_cost: pending.path_cost,
+            dst_ieee: pending.rreq_dst_ieee,
+        };
+        let mut cmd = [0u8; 16];
+        cmd[0] = NwkCommandId::RouteRequest as u8;
+        let cmd_len = 1 + rreq.serialize(&mut cmd[1..]);
+
+        let mut buf = [0u8; crate::nlde::MAX_NWK_FRAME];
+        let total_len = self.build_nwk_frame(&header, &cmd[..cmd_len], &mut buf)?;
+
+        self.mac
+            .mcps_data(McpsDataRequest {
+                src_addr_mode: AddressMode::Short,
+                dst_address: MacAddress::Short(self.nib.pan_id, ShortAddress::BROADCAST),
+                payload: &buf[..total_len],
+                // MAC transaction handle only — the NWK sequence number in the
+                // header above stays the originator's.
+                msdu_handle: self.nib.next_seq(),
+                tx_options: TxOptions {
+                    ack_tx: false,
+                    ..Default::default()
+                },
+            })
+            .await
+            .map_err(|_| NwkStatus::RouteError)?;
+
+        Ok(())
+    }
+
+    /// Drain and send all queued route replies and Route Request forwards.
     ///
     /// Call this after `process_incoming_nwk_frame` returns so that
     /// deferred RREPs and RREQs (generated in sync command handlers) get
@@ -311,29 +442,12 @@ impl<M: MacDriver> NwkLayer<M> {
             }
         }
 
-        // Drain RREQ rebroadcasts
-        while let Some(pending) = self.pending_rreq_rebroadcasts.pop() {
-            let rreq = RouteRequest {
-                command_options: pending.command_options,
-                route_request_id: pending.route_request_id,
-                dst_addr: pending.dst_addr,
-                path_cost: pending.path_cost,
-                dst_ieee: None,
-            };
-            let mut payload = [0u8; 16];
-            let len = rreq.serialize(&mut payload);
-
-            if let Err(e) = self
-                .send_nwk_command(
-                    ShortAddress::BROADCAST,
-                    NwkCommandId::RouteRequest,
-                    &payload[..len],
-                )
-                .await
-            {
+        // Drain accepted Route Request forwards
+        while let Some(pending) = self.pending_rreq_forwards.pop() {
+            if let Err(e) = self.forward_route_request(&pending).await {
                 log::warn!(
-                    "[NWK] Failed to rebroadcast RREQ for 0x{:04X}: {:?}",
-                    pending.dst_addr.0,
+                    "[NWK] Failed to forward RREQ for 0x{:04X}: {:?}",
+                    pending.rreq_dst.0,
                     e
                 );
             }

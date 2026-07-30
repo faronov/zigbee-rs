@@ -811,6 +811,7 @@ impl MacDriver for Phy6222Mac {
             &req.dst_address,
             req.payload,
             ack_requested,
+            req.tx_options.frame_pending,
         )
         .map_err(|_| MacError::FrameTooLong)?;
 
@@ -1106,6 +1107,7 @@ mod tests {
             &dst,
             &[0xAA, 0xBB],
             /* ack_request = */ false,
+            /* frame_pending = */ false,
         )
         .expect("frame within PSDU limit");
 
@@ -1129,6 +1131,7 @@ mod tests {
             &dst,
             &[0xAA, 0xBB],
             /* ack_request = */ true,
+            /* frame_pending = */ false,
         )
         .expect("frame within PSDU limit");
 
@@ -1232,6 +1235,7 @@ mod tests {
             &dst,
             &payload,
             false,
+            false,
         )
         .expect("exactly at the 125-byte PSDU-minus-FCS bound");
         assert_eq!(frame.len(), 125);
@@ -1248,6 +1252,7 @@ mod tests {
             &OWN_IEEE,
             &dst,
             &payload,
+            false,
             false,
         );
         assert!(result.is_err(), "one byte over budget must be rejected");

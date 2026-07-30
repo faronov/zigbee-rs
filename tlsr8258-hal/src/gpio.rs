@@ -38,19 +38,11 @@
 //! Treat `set_pull` as "very likely correct, not vendor-header-verified"
 //! until confirmed on hardware.
 //!
-//! GPIO function-mux (routing a pin to UART/I2C/SPI/PWM instead of plain
-//! GPIO) is out of scope for *this* pass, not because it is unrecoverable:
-//! `gpio_set_func()` for anything other than `AS_GPIO` ships only as a
-//! compiled body in this SDK snapshot, but a clean-room, Apache-2.0
-//! reference (`modern-tc32/tlsr82xx`) reportedly documents the TLSR8258
-//! pin-mux tables independently, and the two IE/DS registers above are
-//! themselves evidence that vendor headers plus disassembly (or an
-//! independent clean-room source) can fully recover these tables when the
-//! work is done. Extending this module with the remaining per-pin mux
-//! routes is left to a future pass. The `AS_GPIO` case itself
-//! ([`set_function_gpio`]) was disassembly-confirmed to be a plain
-//! `reg |= pin_mask` on the same `func` register documented below, so it
-//! is implemented at full (header-equivalent) confidence today.
+//! Peripheral function-mux support is intentionally limited to the I2C, SPI,
+//! and non-complementary PWM routes used by this HAL. The selector table and
+//! two-bit packing were checked against Telink's `gpio_set_func()` object and
+//! the independent Apache-2.0 `modern-tc32/tlsr82xx` implementation. Invalid
+//! pin/function pairs are rejected instead of silently selecting slot zero.
 
 #[cfg(target_arch = "tc32")]
 use super::mmio::{r8, w8};
@@ -78,8 +70,8 @@ impl Port {
     }
 }
 
-/// A single GPIO pin, e.g. `Pin::new(Port::B, 5)` for `GPIO_PB5`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Uniquely owned GPIO pin.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Pin {
     port: Port,
     bit: u8,
@@ -103,6 +95,8 @@ pub enum GpioError {
     /// The analog bus timed out while reading/writing the pull-resistor
     /// register — see [`super::mmio::AnalogError`].
     Analog(super::mmio::AnalogError),
+    /// This peripheral function is not routed to the selected pin.
+    UnsupportedFunction,
 }
 
 impl From<super::mmio::AnalogError> for GpioError {
@@ -112,6 +106,7 @@ impl From<super::mmio::AnalogError> for GpioError {
 }
 
 const REG_GPIO_BASE: u32 = super::mmio::REG_BASE + 0x580;
+const REG_MUX_BASE: u32 = super::mmio::REG_BASE + 0x5A8;
 
 // Byte offsets within a port's 8-byte register block, matching
 // `platform/chip_8258/register.h`'s `reg_gpio_in/ie/oen/out/pol/ds/func/
@@ -157,52 +152,64 @@ pub enum FieldLocation {
     Analog(u8),
 }
 
+/// Peripheral functions supported by the pure-Rust pin-mux layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinFunction {
+    Gpio,
+    I2c,
+    Spi,
+    Pwm0,
+    Pwm1,
+    Pwm2,
+    Pwm3,
+    Pwm4,
+    Pwm5,
+}
+
 impl Pin {
-    /// Construct a pin, panicking (in *every* build profile, not just
-    /// debug — see [`Self::try_new`] for a non-panicking alternative) if
-    /// `bit` is out of the `0..8` range a real TLSR8258 GPIO port has.
-    ///
-    /// A previous version of this constructor used `debug_assert!`, which
-    /// is compiled out in release builds: an out-of-range `bit` would
-    /// silently produce a `Pin` whose `mask()` shifts by an out-of-range
-    /// amount. `assert!` always checks, so invalid `Pin`s can no longer be
-    /// constructed through this path in any build profile — for a
-    /// compile-time-constant `bit` this constructor is itself `const`, so
-    /// an invalid literal is rejected at compile time.
-    pub const fn new(port: Port, bit: u8) -> Self {
+    pub(crate) const fn new(port: Port, bit: u8) -> Self {
         assert!(bit < 8, "GPIO bit index must be 0..8");
         Self { port, bit }
     }
 
-    /// Non-panicking, validated alternative to [`Self::new`] for
-    /// runtime-computed bit indices (e.g. iterating over a caller-supplied
-    /// pin list). Returns `None` if `bit >= 8`.
-    pub const fn try_new(port: Port, bit: u8) -> Option<Self> {
-        if bit < 8 {
-            Some(Self { port, bit })
-        } else {
-            None
-        }
+    /// Construct a raw pin without participating in [`crate::Peripherals`]
+    /// ownership.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure no other `Pin` or peripheral driver owns or
+    /// accesses the same physical pad.
+    pub const unsafe fn steal(port: Port, bit: u8) -> Self {
+        assert!(bit < 8, "GPIO bit index must be 0..8");
+        Self { port, bit }
     }
 
-    const fn mask(self) -> u8 {
+    const fn mask(&self) -> u8 {
         1u8 << self.bit
     }
 
     /// Expose the pin's port and bit index (e.g. for peripherals like the
     /// ADC that need to look pins up in their own channel tables).
-    pub const fn port_and_bit(self) -> (Port, u8) {
+    pub const fn port_and_bit(&self) -> (Port, u8) {
         (self.port, self.bit)
     }
 
-    const fn reg(self, offset: u32) -> u32 {
+    const fn reg(&self, offset: u32) -> u32 {
         REG_GPIO_BASE + ((self.port.index() as u32) << 3) + offset
+    }
+
+    const fn mux_reg(&self) -> u32 {
+        REG_MUX_BASE + (self.port.index() as u32 * 2) + (self.bit as u32 / 4)
+    }
+
+    const fn mux_shift(&self) -> u8 {
+        (self.bit % 4) * 2
     }
 
     /// Register location for this pin's input-enable bit. Ports B and C
     /// route this through the analog bus instead of the digital register
     /// the generic formula would otherwise compute — see module docs.
-    pub const fn ie_location(self) -> FieldLocation {
+    pub const fn ie_location(&self) -> FieldLocation {
         match self.port {
             Port::B => FieldLocation::Analog(AREG_PB_IE),
             Port::C => FieldLocation::Analog(AREG_PC_IE),
@@ -212,7 +219,7 @@ impl Pin {
 
     /// Register location for this pin's drive-strength bit. See
     /// [`Self::ie_location`] for why Ports B/C differ.
-    pub const fn ds_location(self) -> FieldLocation {
+    pub const fn ds_location(&self) -> FieldLocation {
         match self.port {
             Port::B => FieldLocation::Analog(AREG_PB_DS),
             Port::C => FieldLocation::Analog(AREG_PC_DS),
@@ -222,7 +229,7 @@ impl Pin {
 
     /// Analog register address and 2-bit shift for this pin's pull
     /// resistor, or `None` for Port E (unsupported, see module docs).
-    const fn pull_location(self) -> Option<(u8, u8)> {
+    const fn pull_location(&self) -> Option<(u8, u8)> {
         let port = self.port.index();
         if port >= 4 {
             return None;
@@ -239,7 +246,7 @@ impl Pin {
 /// active-*low* for "output enabled", so this function inverts `enable`
 /// before writing, matching the vendor source exactly.
 #[cfg(target_arch = "tc32")]
-pub fn set_output_enable(pin: Pin, enable: bool) {
+pub fn set_output_enable(pin: &Pin, enable: bool) {
     let addr = pin.reg(OFFSET_OEN);
     let mask = pin.mask();
     unsafe {
@@ -254,14 +261,14 @@ pub fn set_output_enable(pin: Pin, enable: bool) {
 /// per-port block every other port (and every other field) uses — see
 /// module docs and [`Pin::ie_location`].
 #[cfg(target_arch = "tc32")]
-pub fn set_input_enable(pin: Pin, enable: bool) -> Result<(), GpioError> {
+pub fn set_input_enable(pin: &Pin, enable: bool) -> Result<(), GpioError> {
     set_field_bit(pin.ie_location(), pin.mask(), enable)
 }
 
 /// Drive a pin high (`true`) or low (`false`). Has no effect unless the
 /// pin's output is also enabled via [`set_output_enable`].
 #[cfg(target_arch = "tc32")]
-pub fn write(pin: Pin, high: bool) {
+pub fn write(pin: &Pin, high: bool) {
     let addr = pin.reg(OFFSET_OUT);
     let mask = pin.mask();
     unsafe {
@@ -272,7 +279,7 @@ pub fn write(pin: Pin, high: bool) {
 
 /// Flip a pin's output latch (independent of the input read-back value).
 #[cfg(target_arch = "tc32")]
-pub fn toggle(pin: Pin) {
+pub fn toggle(pin: &Pin) {
     let addr = pin.reg(OFFSET_OUT);
     let mask = pin.mask();
     unsafe {
@@ -282,7 +289,7 @@ pub fn toggle(pin: Pin) {
 
 /// Read a pin's current input level.
 #[cfg(target_arch = "tc32")]
-pub fn read(pin: Pin) -> bool {
+pub fn read(pin: &Pin) -> bool {
     let addr = pin.reg(OFFSET_IN);
     unsafe { r8(addr) & pin.mask() != 0 }
 }
@@ -297,7 +304,7 @@ pub fn read(pin: Pin) -> bool {
 /// now confirm it is simply *every* pin on Ports B and C, not a special
 /// case, and the registers are fully identified (see [`FieldLocation`]).
 #[cfg(target_arch = "tc32")]
-pub fn set_drive_strength(pin: Pin, strong: bool) -> Result<(), GpioError> {
+pub fn set_drive_strength(pin: &Pin, strong: bool) -> Result<(), GpioError> {
     set_field_bit(pin.ds_location(), pin.mask(), strong)
 }
 
@@ -318,14 +325,81 @@ fn set_field_bit(location: FieldLocation, mask: u8, set: bool) -> Result<(), Gpi
     Ok(())
 }
 
-/// Route a pin back to plain GPIO (the only function-mux path this module
-/// implements — see module docs for why peripheral muxing is out of scope).
+/// Route a pin back to plain GPIO.
 #[cfg(target_arch = "tc32")]
-pub fn set_function_gpio(pin: Pin) {
+pub fn set_function_gpio(pin: &Pin) {
     let addr = pin.reg(OFFSET_FUNC);
     let mask = pin.mask();
     unsafe {
         w8(addr, r8(addr) | mask);
+    }
+}
+
+/// Route a pin to a validated I2C, SPI, or PWM function.
+///
+/// I2C and SPI also require their group-level input/output selectors at
+/// `0x5b6/0x5b7`; those are configured by the corresponding driver after
+/// this per-pin selector is installed.
+#[cfg(target_arch = "tc32")]
+pub fn set_function(pin: &Pin, function: PinFunction) -> Result<(), GpioError> {
+    if matches!(function, PinFunction::Gpio) {
+        set_function_gpio(pin);
+        return Ok(());
+    }
+    let selector = function_selector(pin, function).ok_or(GpioError::UnsupportedFunction)?;
+    let shift = pin.mux_shift();
+    let mask = 0x03u8 << shift;
+    unsafe {
+        let mux = r8(pin.mux_reg());
+        w8(pin.mux_reg(), (mux & !mask) | ((selector & 0x03) << shift));
+        let func = r8(pin.reg(OFFSET_FUNC));
+        w8(pin.reg(OFFSET_FUNC), func & !pin.mask());
+    }
+    Ok(())
+}
+
+/// Return whether a pin has a proven route for a peripheral function.
+pub const fn supports_function(pin: &Pin, function: PinFunction) -> bool {
+    matches!(function, PinFunction::Gpio) || function_selector(pin, function).is_some()
+}
+
+const fn function_selector(pin: &Pin, function: PinFunction) -> Option<u8> {
+    let (port, bit) = pin.port_and_bit();
+    match (port, bit, function) {
+        // I2C groups: PA3/PA4, PB6/PD7, PC0/PC1, PC2/PC3.
+        (Port::A, 3, PinFunction::I2c)
+        | (Port::A, 4, PinFunction::I2c)
+        | (Port::C, 0, PinFunction::I2c)
+        | (Port::C, 1, PinFunction::I2c)
+        | (Port::D, 7, PinFunction::I2c) => Some(0),
+        (Port::B, 6, PinFunction::I2c) => Some(1),
+        (Port::C, 2, PinFunction::I2c) | (Port::C, 3, PinFunction::I2c) => Some(2),
+
+        // SPI groups: PA2/PA3/PA4 and PB6/PB7/PD2/PD7. PD6 is the
+        // vendor group's software-controlled CS pin and is accepted as SPI
+        // by gpio_set_func, though SpiBus itself deliberately owns no CS.
+        (Port::A, 2, PinFunction::Spi)
+        | (Port::A, 3, PinFunction::Spi)
+        | (Port::A, 4, PinFunction::Spi)
+        | (Port::D, 2, PinFunction::Spi)
+        | (Port::D, 6, PinFunction::Spi)
+        | (Port::D, 7, PinFunction::Spi) => Some(0),
+        (Port::B, 6, PinFunction::Spi) | (Port::B, 7, PinFunction::Spi) => Some(1),
+
+        // Positive PWM outputs from the TLSR8258 gpio_set_func table.
+        (Port::A, 2, PinFunction::Pwm0) | (Port::C, 1, PinFunction::Pwm0) => Some(2),
+        (Port::C, 2, PinFunction::Pwm0) | (Port::D, 5, PinFunction::Pwm0) => Some(0),
+        (Port::A, 3, PinFunction::Pwm1) => Some(2),
+        (Port::C, 3, PinFunction::Pwm1) => Some(0),
+        (Port::A, 4, PinFunction::Pwm2) => Some(2),
+        (Port::C, 4, PinFunction::Pwm2) => Some(0),
+        (Port::B, 0, PinFunction::Pwm3) => Some(0),
+        (Port::D, 2, PinFunction::Pwm3) => Some(2),
+        (Port::B, 1, PinFunction::Pwm4) => Some(0),
+        (Port::B, 4, PinFunction::Pwm4) => Some(1),
+        (Port::B, 2, PinFunction::Pwm5) => Some(0),
+        (Port::B, 5, PinFunction::Pwm5) => Some(1),
+        _ => None,
     }
 }
 
@@ -363,7 +437,7 @@ pub fn set_wakeup_interrupt_enable(pin: Pin, enable: bool) {
 /// path (addresses are vendor-header-verified; the 2-bit packing was
 /// confirmed by disassembly rather than open source).
 #[cfg(target_arch = "tc32")]
-pub fn set_pull(pin: Pin, pull: Pull) -> Result<(), GpioError> {
+pub fn set_pull(pin: &Pin, pull: Pull) -> Result<(), GpioError> {
     let (addr, shift) = pin
         .pull_location()
         .ok_or(GpioError::PullNotSupportedOnPort)?;
@@ -467,18 +541,6 @@ mod tests {
     }
 
     #[test]
-    fn try_new_accepts_valid_bit_indices() {
-        assert!(Pin::try_new(Port::A, 0).is_some());
-        assert!(Pin::try_new(Port::A, 7).is_some());
-    }
-
-    #[test]
-    fn try_new_rejects_out_of_range_bit_indices() {
-        assert_eq!(Pin::try_new(Port::A, 8), None);
-        assert_eq!(Pin::try_new(Port::A, 255), None);
-    }
-
-    #[test]
     #[should_panic(expected = "GPIO bit index must be 0..8")]
     fn new_panics_on_out_of_range_bit_index() {
         let _ = Pin::new(Port::A, 8);
@@ -514,6 +576,34 @@ mod tests {
     fn pull_location_none_on_port_e() {
         // Port E has no `areg_..._pull` entry in register.h.
         assert_eq!(Pin::new(Port::E, 0).pull_location(), None);
+    }
+
+    #[test]
+    fn peripheral_routes_reject_wrong_pins() {
+        assert!(supports_function(&Pin::new(Port::C, 0), PinFunction::I2c));
+        assert!(supports_function(&Pin::new(Port::B, 7), PinFunction::Spi));
+        assert!(!supports_function(&Pin::new(Port::B, 5), PinFunction::I2c));
+        assert!(!supports_function(&Pin::new(Port::C, 5), PinFunction::Spi));
+    }
+
+    #[test]
+    fn tb04_rgb_pwm_routes_have_expected_selectors() {
+        assert_eq!(
+            function_selector(&Pin::new(Port::C, 1), PinFunction::Pwm0),
+            Some(2)
+        );
+        assert_eq!(
+            function_selector(&Pin::new(Port::B, 5), PinFunction::Pwm5),
+            Some(1)
+        );
+        assert_eq!(
+            function_selector(&Pin::new(Port::C, 4), PinFunction::Pwm2),
+            Some(0)
+        );
+        assert_eq!(
+            function_selector(&Pin::new(Port::C, 4), PinFunction::Pwm3),
+            None
+        );
     }
 
     /// Raw evidence for the module-level confidence caveat: this is the

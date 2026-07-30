@@ -365,9 +365,13 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
 
     #[inline(never)]
     async fn run_nwk_maintenance(&mut self, elapsed_secs: u16) {
-        let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
-        nwk.tick_router_maintenance(elapsed_secs);
-        nwk.process_pending_routing().await;
+        {
+            let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
+            let _ = nwk.tick_permit_joining(elapsed_secs).await;
+            nwk.tick_router_maintenance(elapsed_secs);
+            nwk.process_pending_routing().await;
+        }
+        let _ = self.service_parent_commands().await;
     }
 
     #[inline(never)]

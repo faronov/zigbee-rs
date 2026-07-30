@@ -7,6 +7,8 @@ mod hal;
 
 use core::fmt::{Display, Formatter, Write};
 
+use bl702_hal::{adc::Gpadc, clock::Clocks};
+use bl702_xt_zb1_product as product;
 use embassy_executor::{Executor, Spawner};
 use embassy_time::{Duration, Instant, Timer};
 use embassy_time_driver::Driver;
@@ -14,9 +16,10 @@ use panic_halt as _;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::{MacPib, SoftMacCore, bl702::radio_phy::Bl702RadioPhy};
 use zigbee_nwk::DeviceType;
-use zigbee_runtime::event_loop::{StackEvent, TickResult};
+use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
+use zigbee_runtime::security_store::SecurityStateStore;
+use zigbee_runtime::{ClusterRef, ZigbeeDevice};
 use zigbee_types::{ChannelMask, IeeeAddress};
 use zigbee_zcl::clusters::basic::PowerSource;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
@@ -30,7 +33,15 @@ const TX_POWER_DBM: i8 = 0;
 const LOOP_INTERVAL_MS: u64 = 250;
 const JOIN_RETRY_INTERVAL_SECS: u32 = 15;
 const REPORT_INTERVAL_SECS: u32 = 30;
-const DEVICE_ENDPOINT: u8 = 1;
+const PARENT_POLL_FAILURE_LIMIT: u8 = 16;
+const SECURE_REJOIN_FAILURE_LIMIT: u8 = 4;
+
+#[derive(Clone, Copy)]
+enum ParentPollOutcome {
+    Reachable,
+    Failed,
+    RejoinFailed,
+}
 
 mod time_driver {
     use super::*;
@@ -39,7 +50,7 @@ mod time_driver {
 
     impl Driver for Bl702TimeDriver {
         fn now(&self) -> u64 {
-            u64::from(hal::timer_ticks())
+            hal::timer_ticks()
         }
 
         fn schedule_wake(&self, _at: u64, waker: &core::task::Waker) {
@@ -59,7 +70,7 @@ struct UartWriter;
 impl Write for UartWriter {
     fn write_str(&mut self, text: &str) -> core::fmt::Result {
         for byte in text.bytes() {
-            hal::uart_write(byte);
+            hal::uart_write(byte).map_err(|_| core::fmt::Error)?;
         }
         Ok(())
     }
@@ -95,9 +106,12 @@ impl Display for Hex<'_> {
 
 #[riscv_rt::entry]
 fn main() -> ! {
-    hal::init();
+    let application_resources = match hal::init() {
+        Ok(resources) => resources,
+        Err(_) => halt(),
+    };
     for byte in b"BL702 boot\r\n" {
-        hal::uart_write(*byte);
+        let _ = hal::uart_write(*byte);
     }
 
     // BL702 is single-hart and has no RV32A extension. Interrupts are still
@@ -111,13 +125,46 @@ fn main() -> ! {
     let mut executor = Executor::new();
     let executor: &'static mut Executor = unsafe { core::mem::transmute(&mut executor) };
     marker(b"executor ready\r\n");
-    executor.run(|spawner| spawner.must_spawn(sensor(spawner)))
+    executor.run(move |spawner| spawner.must_spawn(sensor(spawner, application_resources)))
 }
 
 #[embassy_executor::task]
-async fn sensor(_spawner: Spawner) {
+async fn sensor(_spawner: Spawner, application: hal::ApplicationResources) {
     marker(b"sensor task\r\n");
-    log::info!("zigbee-rs BL702 pure-Rust sensor");
+    log::info!("Zigbee-RS BL702 pure-Rust sensor");
+
+    let hal::ApplicationResources {
+        i2c0,
+        spi_or_usb,
+        adc,
+        flash,
+        power: power_control,
+        pwm,
+        uart1,
+        other_pins,
+    } = application;
+    let mut supply_adc = match Gpadc::new(adc, Clocks::rom_boot_32mhz()) {
+        Ok(adc) => {
+            if !adc.gain_trim_valid() {
+                log::warn!("GPADC eFuse gain trim is invalid; using nominal conversion");
+            }
+            Some(adc)
+        }
+        Err(error) => {
+            log::warn!("GPADC initialization failed; battery remains synthetic: {error:?}");
+            None
+        }
+    };
+    let mut security_store = match product::storage::security_store(flash) {
+        Ok(store) => store,
+        Err(error) => {
+            log::error!("security storage initialization failed: {error:?}");
+            halt()
+        }
+    };
+    // Retain ownership of unused application peripherals for the task's
+    // lifetime. No physical environmental sensor is assumed on this board.
+    let _reserved_peripherals = (i2c0, spi_or_usb, power_control, pwm, uart1, other_pins);
 
     let ieee = device_ieee_address();
     log::info!("IEEE address: {}", Hex(&ieee));
@@ -144,7 +191,13 @@ async fn sensor(_spawner: Spawner) {
     let mut temperature = TemperatureCluster::new(-4000, 12500);
     let mut humidity = HumidityCluster::new(0, 10000);
     let mut power = PowerConfigCluster::new();
-    update_synthetic_readings(0, &mut temperature, &mut humidity, &mut power);
+    update_readings(
+        0,
+        read_supply_mv(&mut supply_adc),
+        &mut temperature,
+        &mut humidity,
+        &mut power,
+    );
 
     let mut device = ZigbeeDevice::builder(mac)
         .device_type(DeviceType::EndDevice)
@@ -153,14 +206,14 @@ async fn sensor(_spawner: Spawner) {
             wake_duration_ms: 500,
         })
         .automatic_polling(false)
-        .manufacturer("zigbee-rs")
-        .model("XT-ZB1 Sensor")
-        .date_code("20260402")
-        .sw_build("0.1.0")
+        .manufacturer(product::MANUFACTURER)
+        .model(product::MODEL)
+        .date_code(product::DATE_CODE)
+        .sw_build(product::SW_BUILD)
         .power_source(PowerSource::Battery)
         .channels(CHANNEL_MASK)
         .endpoint(
-            DEVICE_ENDPOINT,
+            product::ENDPOINT,
             PROFILE_HOME_AUTOMATION,
             DeviceId::TEMPERATURE_SENSOR,
             |endpoint| {
@@ -174,14 +227,25 @@ async fn sensor(_spawner: Spawner) {
         )
         .build();
 
-    log::info!("sensor endpoint ready; requesting network join");
-    request_join(&mut device, &mut temperature, &mut humidity, &mut power).await;
+    match device.reset_security_state_if_identity_changed(&mut security_store, ieee) {
+        Ok(true) => log::warn!("cleared persisted network state after IEEE address change"),
+        Ok(false) => {}
+        Err(error) => {
+            log::error!("security state validation failed: {error:?}");
+            halt()
+        }
+    }
+
+    log::info!("sensor endpoint ready; starting or resuming network");
+    request_join(&mut device, &mut security_store).await;
 
     let mut quarter_seconds = 0u32;
     let mut joined_quarter_seconds = 0u32;
     let mut report_sequence = 0u32;
     let mut announce_retries = 0u8;
     let mut last_announce = Instant::now();
+    let mut consecutive_poll_failures = 0u8;
+    let mut consecutive_rejoin_failures = 0u8;
 
     loop {
         Timer::after(Duration::from_millis(LOOP_INTERVAL_MS)).await;
@@ -190,18 +254,72 @@ async fn sensor(_spawner: Spawner) {
         if !device.is_joined() {
             if quarter_seconds >= JOIN_RETRY_INTERVAL_SECS * 4 {
                 quarter_seconds = 0;
-                request_join(&mut device, &mut temperature, &mut humidity, &mut power).await;
+                request_join(&mut device, &mut security_store).await;
                 if device.is_joined() {
+                    consecutive_rejoin_failures = 0;
                     joined_quarter_seconds = 0;
                     announce_retries = 5;
                     last_announce = Instant::now();
+                } else if device.secure_rejoin_pending() {
+                    record_failed_rejoin(
+                        &mut device,
+                        &mut security_store,
+                        &mut consecutive_rejoin_failures,
+                    )
+                    .await;
                 }
             }
             continue;
         }
 
         joined_quarter_seconds = joined_quarter_seconds.wrapping_add(1);
-        poll_parent(&mut device, &mut temperature, &mut humidity, &mut power).await;
+        let poll_outcome = poll_parent(
+            &mut device,
+            &mut temperature,
+            &mut humidity,
+            &mut power,
+            &mut security_store,
+        )
+        .await;
+        match poll_outcome {
+            ParentPollOutcome::Reachable => consecutive_poll_failures = 0,
+            ParentPollOutcome::RejoinFailed => {
+                consecutive_poll_failures = 0;
+                record_failed_rejoin(
+                    &mut device,
+                    &mut security_store,
+                    &mut consecutive_rejoin_failures,
+                )
+                .await;
+            }
+            ParentPollOutcome::Failed => {
+                consecutive_poll_failures = consecutive_poll_failures.saturating_add(1);
+                if consecutive_poll_failures >= PARENT_POLL_FAILURE_LIMIT {
+                    consecutive_poll_failures = 0;
+                    log::warn!("parent is unreachable; attempting a secured rejoin");
+                    match device
+                        .secure_rejoin_with_security_store(&mut security_store)
+                        .await
+                    {
+                        Ok(_) => consecutive_rejoin_failures = 0,
+                        Err(StartError::CommissioningFailed(error)) => {
+                            log::warn!("secured rejoin failed: {error:?}");
+                            record_failed_rejoin(
+                                &mut device,
+                                &mut security_store,
+                                &mut consecutive_rejoin_failures,
+                            )
+                            .await;
+                        }
+                        Err(error) => start_fatal("secured rejoin", error),
+                    }
+                }
+            }
+        }
+        if !device.is_joined() {
+            quarter_seconds = 0;
+            continue;
+        }
 
         let elapsed_secs = if quarter_seconds.is_multiple_of(4) {
             1
@@ -210,9 +328,14 @@ async fn sensor(_spawner: Spawner) {
         };
         let result = {
             let mut clusters = cluster_refs(&mut temperature, &mut humidity, &mut power);
-            device.tick(elapsed_secs, &mut clusters).await
+            device
+                .tick_with_security_store(elapsed_secs, &mut clusters, &mut security_store)
+                .await
         };
-        log_tick_result(&result);
+        match result {
+            Ok(result) => log_tick_result(&result),
+            Err(error) => security_fatal("stack tick", error),
+        }
 
         if announce_retries > 0 && last_announce.elapsed() >= Duration::from_secs(8) {
             announce_retries -= 1;
@@ -227,69 +350,128 @@ async fn sensor(_spawner: Spawner) {
         if joined_quarter_seconds >= REPORT_INTERVAL_SECS * 4 {
             joined_quarter_seconds = 0;
             report_sequence = report_sequence.wrapping_add(1);
-            update_synthetic_readings(report_sequence, &mut temperature, &mut humidity, &mut power);
+            update_readings(
+                report_sequence,
+                read_supply_mv(&mut supply_adc),
+                &mut temperature,
+                &mut humidity,
+                &mut power,
+            );
         }
     }
 }
 
-async fn request_join<M: zigbee_mac::MacDriver>(
+async fn request_join<M: zigbee_mac::MacDriver, S: SecurityStateStore>(
     device: &mut ZigbeeDevice<M>,
-    temperature: &mut TemperatureCluster,
-    humidity: &mut HumidityCluster,
-    power: &mut PowerConfigCluster,
+    store: &mut S,
 ) {
-    device.user_action(UserAction::Join);
-    let result = {
-        let mut clusters = cluster_refs(temperature, humidity, power);
-        device.tick(0, &mut clusters).await
-    };
-    log_tick_result(&result);
-
-    if device.is_joined() {
-        log::info!(
-            "joined: short=0x{:04x}, PAN=0x{:04x}, channel={}",
-            device.short_address(),
-            device.pan_id(),
-            device.channel()
-        );
-    } else {
-        log::warn!(
-            "join failed; retry in {JOIN_RETRY_INTERVAL_SECS}s: {:?}",
-            device.steering_diagnostics()
-        );
+    match device.start_or_resume_with_security_store(store).await {
+        Ok(_) => {
+            log::info!(
+                "network ready: short=0x{:04x}, PAN=0x{:04x}, channel={}",
+                device.short_address(),
+                device.pan_id(),
+                device.channel()
+            );
+        }
+        Err(error) => {
+            if matches!(error, StartError::CommissioningFailed(_)) {
+                log::warn!(
+                    "network start/resume failed; retry in {JOIN_RETRY_INTERVAL_SECS}s: \
+                     {error:?}; diagnostics={:?}",
+                    device.steering_diagnostics()
+                );
+            } else {
+                log::error!("network start/resume failed irrecoverably: {error:?}");
+                halt()
+            }
+        }
     }
 }
 
-async fn poll_parent<M: zigbee_mac::MacDriver>(
+async fn poll_parent<M: zigbee_mac::MacDriver, S: SecurityStateStore>(
     device: &mut ZigbeeDevice<M>,
     temperature: &mut TemperatureCluster,
     humidity: &mut HumidityCluster,
     power: &mut PowerConfigCluster,
-) {
+    store: &mut S,
+) -> ParentPollOutcome {
     for _ in 0..4 {
         match device.poll().await {
             Ok(Some(indication)) => {
                 let event = {
                     let mut clusters = cluster_refs(temperature, humidity, power);
-                    device.process_incoming(&indication, &mut clusters).await
+                    device
+                        .process_incoming_with_security_store(&indication, &mut clusters, store)
+                        .await
                 };
-                if let Some(event) = event {
-                    log_stack_event(&event);
+                match event {
+                    Ok(Some(StackEvent::RejoinRequested)) => {
+                        log::warn!("parent requested a secured rejoin");
+                        match device.secure_rejoin_with_security_store(store).await {
+                            Ok(_) => {}
+                            Err(StartError::CommissioningFailed(error)) => {
+                                log::warn!("secured rejoin failed: {error:?}");
+                                return ParentPollOutcome::RejoinFailed;
+                            }
+                            Err(error) => start_fatal("secured rejoin", error),
+                        }
+                    }
+                    Ok(Some(StackEvent::LeaveRequested | StackEvent::Left)) => {
+                        log::warn!("network leave requested; clearing persisted network state");
+                        if let Err(error) = device.factory_reset_with_security_store(store).await {
+                            log::error!("durable factory reset failed: {error:?}");
+                            halt()
+                        }
+                        return ParentPollOutcome::Reachable;
+                    }
+                    Ok(Some(event)) => log_stack_event(&event),
+                    Ok(None) => {}
+                    Err(error) => security_fatal("incoming frame processing", error),
                 }
 
+                if !device.is_joined() {
+                    return ParentPollOutcome::Reachable;
+                }
                 let result = {
                     let mut clusters = cluster_refs(temperature, humidity, power);
-                    device.tick(0, &mut clusters).await
+                    device
+                        .tick_with_security_store(0, &mut clusters, store)
+                        .await
                 };
-                log_tick_result(&result);
+                match result {
+                    Ok(result) => log_tick_result(&result),
+                    Err(error) => security_fatal("stack tick", error),
+                }
             }
-            Ok(None) => break,
+            Ok(None) => return ParentPollOutcome::Reachable,
             Err(error) => {
                 log::warn!("parent poll failed: {error:?}");
-                break;
+                return ParentPollOutcome::Failed;
             }
         }
     }
+    ParentPollOutcome::Reachable
+}
+
+async fn record_failed_rejoin<M: zigbee_mac::MacDriver, S: SecurityStateStore>(
+    device: &mut ZigbeeDevice<M>,
+    store: &mut S,
+    failures: &mut u8,
+) {
+    *failures = failures.saturating_add(1);
+    if *failures < SECURE_REJOIN_FAILURE_LIMIT {
+        return;
+    }
+
+    log::warn!(
+        "persisted parent remained unreachable after {SECURE_REJOIN_FAILURE_LIMIT} secured \
+         rejoin attempts; clearing stale network state"
+    );
+    if let Err(error) = device.factory_reset_with_security_store(store).await {
+        start_fatal("stale-network reset", error);
+    }
+    *failures = 0;
 }
 
 fn cluster_refs<'a>(
@@ -299,22 +481,40 @@ fn cluster_refs<'a>(
 ) -> [ClusterRef<'a>; 3] {
     [
         ClusterRef {
-            endpoint: DEVICE_ENDPOINT,
+            endpoint: product::ENDPOINT,
             cluster: temperature,
         },
         ClusterRef {
-            endpoint: DEVICE_ENDPOINT,
+            endpoint: product::ENDPOINT,
             cluster: humidity,
         },
         ClusterRef {
-            endpoint: DEVICE_ENDPOINT,
+            endpoint: product::ENDPOINT,
             cluster: power,
         },
     ]
 }
 
-fn update_synthetic_readings(
+fn read_supply_mv(adc: &mut Option<Gpadc>) -> Option<u16> {
+    let adc = adc.as_mut()?;
+    match adc.read_supply_mv() {
+        Ok(millivolts) if (1_800..=3_800).contains(&millivolts) => Some(millivolts),
+        Ok(millivolts) => {
+            log::warn!(
+                "GPADC supply reading is implausible ({millivolts} mV); battery remains synthetic"
+            );
+            None
+        }
+        Err(error) => {
+            log::warn!("GPADC supply read failed; battery remains synthetic: {error:?}");
+            None
+        }
+    }
+}
+
+fn update_readings(
     sequence: u32,
+    supply_mv: Option<u16>,
     temperature: &mut TemperatureCluster,
     humidity: &mut HumidityCluster,
     power: &mut PowerConfigCluster,
@@ -323,15 +523,37 @@ fn update_synthetic_readings(
     let hum = 5000 + ((sequence * 7) % 100) as u16;
     temperature.set_temperature(temp);
     humidity.set_humidity(hum);
-    power.set_battery_voltage(30);
-    power.set_battery_percentage(200);
-    log::info!(
-        "sensor values (synthetic): {}.{:02} C, {}.{:02}% RH, 3.0 V",
-        temp / 100,
-        temp.unsigned_abs() % 100,
-        hum / 100,
-        hum % 100
-    );
+    if let Some(millivolts) = supply_mv {
+        let voltage = ((u32::from(millivolts) + 50) / 100).min(u32::from(u8::MAX)) as u8;
+        let percentage = if millivolts <= 2_000 {
+            0
+        } else if millivolts >= 3_000 {
+            200
+        } else {
+            ((u32::from(millivolts - 2_000) * 200) / 1_000) as u8
+        };
+        power.set_battery_voltage(voltage);
+        power.set_battery_percentage(percentage);
+        log::info!(
+            "sensor values: {}.{:02} C synthetic, {}.{:02}% RH synthetic, {}.{:03} V nominal",
+            temp / 100,
+            temp.unsigned_abs() % 100,
+            hum / 100,
+            hum % 100,
+            millivolts / 1_000,
+            millivolts % 1_000
+        );
+    } else {
+        power.set_battery_voltage(30);
+        power.set_battery_percentage(200);
+        log::info!(
+            "sensor values (synthetic): {}.{:02} C, {}.{:02}% RH, 3.0 V",
+            temp / 100,
+            temp.unsigned_abs() % 100,
+            hum / 100,
+            hum % 100
+        );
+    }
 }
 
 fn log_tick_result(result: &TickResult) {
@@ -373,6 +595,16 @@ fn fatal(context: &str, error: zigbee_mac::PhyError) -> ! {
     halt()
 }
 
+fn security_fatal(context: &str, error: zigbee_runtime::security_store::SecurityStoreError) -> ! {
+    log::error!("{context} failed because durable security state is unavailable: {error:?}");
+    halt()
+}
+
+fn start_fatal(context: &str, error: StartError) -> ! {
+    log::error!("{context} failed irrecoverably: {error:?}");
+    halt()
+}
+
 fn halt() -> ! {
     loop {
         core::hint::spin_loop();
@@ -381,6 +613,6 @@ fn halt() -> ! {
 
 fn marker(text: &[u8]) {
     for byte in text {
-        hal::uart_write(*byte);
+        let _ = hal::uart_write(*byte);
     }
 }

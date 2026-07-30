@@ -229,7 +229,7 @@ fn main() {
     let mac_for_device = MockMac::new(coord_ieee);
     let device = DeviceBuilder::new(mac_for_device)
         .device_type(DeviceType::Coordinator)
-        .manufacturer("zigbee-rs")
+        .manufacturer("Zigbee-RS")
         .model("MockCoordinator-01")
         .date_code("20250101")
         .sw_build("0.1.0")

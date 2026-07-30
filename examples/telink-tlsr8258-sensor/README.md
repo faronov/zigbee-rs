@@ -9,7 +9,9 @@ This directory contains one firmware role and no hardware bring-up code.
 src/main.rs      reset glue and application selection
 src/app.rs       Zigbee device, clusters, commissioning, polling, reporting
 ../../boards/tlsr8258-tb04
-                 TB-04 LEDs, security partition, and linker layout
+                 TB-04 LEDs, flash token, and typed resources
+../../products/tlsr8258-tb04
+                 security partition, journal, and linker layout
 ```
 
 The application exposes Basic, Power Configuration, Identify, Temperature,

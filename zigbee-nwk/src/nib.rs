@@ -81,7 +81,7 @@ pub struct Nib {
     // ── Permit joining ──────────────────────────────────
     /// Whether new devices can join through this device
     pub permit_joining: bool,
-    /// Time remaining for permit joining (0 = permanent, 0xFF = permanent)
+    /// Time remaining for permit joining (0 = closed, 0xFF = indefinite)
     pub permit_joining_duration: u8,
 }
 

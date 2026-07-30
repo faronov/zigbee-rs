@@ -3,5 +3,6 @@
 #![no_std]
 
 pub mod leds;
-#[cfg(target_arch = "tc32")]
-pub mod storage;
+pub mod resources;
+
+pub const ONBOARD_FLASH_CAPACITY: usize = 512 * 1024;

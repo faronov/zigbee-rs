@@ -122,6 +122,140 @@ pub fn build_data_request_short(
     frame
 }
 
+/// Build an on-demand IEEE 802.15.4 beacon for a Zigbee non-beacon network.
+///
+/// The superframe uses BO=15, SO=15 and final CAP slot=15. Zigbee does not
+/// allocate GTS slots, so the GTS Specification is zero. Pending short and
+/// extended addresses are encoded in the bounded Pending Address fields.
+pub fn build_nonbeacon_beacon(
+    sequence: u8,
+    source: &MacAddress,
+    pan_coordinator: bool,
+    association_permit: bool,
+    pending_short_addresses: &[ShortAddress],
+    pending_extended_addresses: &[IeeeAddress],
+    beacon_payload: &[u8],
+) -> Result<heapless::Vec<u8, 125>, FrameBuildError> {
+    if pending_short_addresses.len() > MAX_BEACON_PENDING_ADDRESSES
+        || pending_extended_addresses.len() > MAX_BEACON_PENDING_ADDRESSES
+        || source.pan_id() == PanId::BROADCAST
+    {
+        return Err(FrameBuildError::InvalidParameter);
+    }
+
+    let mut frame_control = 0u16; // Beacon, no ACK/security/PAN compression.
+    frame_control |= match source {
+        MacAddress::Short(_, address) if address.0 < 0xFFF8 => (AddressMode::Short as u16) << 14,
+        MacAddress::Extended(_, address) if *address != [0xFF; 8] => {
+            (AddressMode::Extended as u16) << 14
+        }
+        _ => return Err(FrameBuildError::InvalidParameter),
+    };
+
+    let mut frame = heapless::Vec::new();
+    frame
+        .extend_from_slice(&frame_control.to_le_bytes())
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    frame
+        .push(sequence)
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    frame
+        .extend_from_slice(&source.pan_id().0.to_le_bytes())
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    match source {
+        MacAddress::Short(_, address) => frame
+            .extend_from_slice(&address.0.to_le_bytes())
+            .map_err(|_| FrameBuildError::FrameTooLong)?,
+        MacAddress::Extended(_, address) => frame
+            .extend_from_slice(address)
+            .map_err(|_| FrameBuildError::FrameTooLong)?,
+    }
+
+    let mut superframe_spec = 0x0FFFu16;
+    if pan_coordinator {
+        superframe_spec |= 1 << 14;
+    }
+    if association_permit {
+        superframe_spec |= 1 << 15;
+    }
+    frame
+        .extend_from_slice(&superframe_spec.to_le_bytes())
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    frame.push(0).map_err(|_| FrameBuildError::FrameTooLong)?; // GTS Specification
+    frame
+        .push(pending_short_addresses.len() as u8 | ((pending_extended_addresses.len() as u8) << 4))
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    for address in pending_short_addresses {
+        if address.0 >= 0xFFF8 {
+            return Err(FrameBuildError::InvalidParameter);
+        }
+        frame
+            .extend_from_slice(&address.0.to_le_bytes())
+            .map_err(|_| FrameBuildError::FrameTooLong)?;
+    }
+    for address in pending_extended_addresses {
+        if *address == [0xFF; 8] {
+            return Err(FrameBuildError::InvalidParameter);
+        }
+        frame
+            .extend_from_slice(address)
+            .map_err(|_| FrameBuildError::FrameTooLong)?;
+    }
+    frame
+        .extend_from_slice(beacon_payload)
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    Ok(frame)
+}
+
+/// Build an Association Response MAC command.
+///
+/// IEEE 802.15.4 association responses use extended source and destination
+/// addresses with PAN ID compression. The child therefore remains
+/// identifiable before it begins using its newly allocated short address.
+pub fn build_association_response(
+    sequence: u8,
+    pan_id: PanId,
+    coordinator_extended: &IeeeAddress,
+    response: &MlmeAssociateResponse,
+) -> Result<heapless::Vec<u8, 32>, FrameBuildError> {
+    if pan_id == PanId::BROADCAST
+        || *coordinator_extended == [0xFF; 8]
+        || response.device_address == [0xFF; 8]
+        || (response.status == AssociationStatus::Success && response.short_address.0 >= 0xFFF8)
+    {
+        return Err(FrameBuildError::InvalidParameter);
+    }
+
+    // Command, ACK request, PAN compression, extended dst + extended src.
+    let frame_control = 0xCC63u16;
+    let mut frame = heapless::Vec::new();
+    frame
+        .extend_from_slice(&frame_control.to_le_bytes())
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    frame
+        .push(sequence)
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    frame
+        .extend_from_slice(&pan_id.0.to_le_bytes())
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    frame
+        .extend_from_slice(&response.device_address)
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    frame
+        .extend_from_slice(coordinator_extended)
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    frame
+        .push(0x02)
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    frame
+        .extend_from_slice(&response.short_address.0.to_le_bytes())
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    frame
+        .push(response.status as u8)
+        .map_err(|_| FrameBuildError::FrameTooLong)?;
+    Ok(frame)
+}
+
 /// Build a Disassociation Notification MAC command.
 pub fn build_disassociation_notification(
     seq: u8,
@@ -171,6 +305,7 @@ pub fn build_disassociation_notification(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameBuildError {
     FrameTooLong,
+    InvalidParameter,
 }
 
 /// Build a data frame without an FCS. The radio backend appends the FCS.
@@ -182,6 +317,7 @@ pub fn build_data_frame(
     dst_address: &MacAddress,
     payload: &[u8],
     ack_request: bool,
+    frame_pending: bool,
 ) -> Result<heapless::Vec<u8, 125>, FrameBuildError> {
     let dst_len = match dst_address {
         MacAddress::Short(_, _) => 2,
@@ -198,6 +334,9 @@ pub fn build_data_frame(
     }
 
     let mut fc = 0x0001u16;
+    if frame_pending {
+        fc |= 1 << 4;
+    }
     if ack_request {
         fc |= 1 << 5;
     }
@@ -540,10 +679,11 @@ pub fn ack_info(data: &[u8]) -> Option<(u8, bool)> {
 /// otherwise the hardware acknowledges frames software then throws away (or,
 /// worse, software accepts frames the hardware never acknowledged).
 ///
-/// `our_short` is `0xFFFF` while unassociated; broadcast short addresses
-/// (`0xFFFF`, `0xFFFD`, `0xFFFC`) are always accepted, and an unassociated node
-/// (`our_pan == 0xFFFF`) accepts any PAN so that the association response and
-/// the Transport-Key can be received.
+/// `our_short` is `0xFFFF` while unassociated. The only IEEE 802.15.4 MAC
+/// short broadcast destination is `0xFFFF`; Zigbee values `0xFFFC` and
+/// `0xFFFD` belong in the decoded NWK header, not the MAC destination field.
+/// An unassociated node (`our_pan == 0xFFFF`) accepts any PAN so that the
+/// extended-address Association Response and Transport-Key can be received.
 pub fn frame_is_for_us(
     dst: &MacAddress,
     our_pan: PanId,
@@ -553,9 +693,7 @@ pub fn frame_is_for_us(
     let pan_ok = |pan: PanId| pan.0 == our_pan.0 || pan.0 == 0xFFFF || our_pan.0 == 0xFFFF;
     match dst {
         MacAddress::Short(pan, addr) => {
-            pan_ok(*pan)
-                && (matches!(addr.0, 0xFFFF | 0xFFFD | 0xFFFC)
-                    || (our_short.0 != 0xFFFF && addr.0 == our_short.0))
+            pan_ok(*pan) && (addr.0 == 0xFFFF || (our_short.0 != 0xFFFF && addr.0 == our_short.0))
         }
         MacAddress::Extended(pan, addr) => pan_ok(*pan) && addr == our_extended,
     }
@@ -596,6 +734,70 @@ mod tests {
                 0x23, 0xC8, 0x42, 0xE9, 0xDF, 0x00, 0x00, 0xFF, 0xFF, 0x29, 0x34, 0x36, 0x39, 0x33,
                 0x4E, 0x55, 0x02, 0x01, 0x80,
             ]
+        );
+    }
+
+    #[test]
+    fn nonbeacon_beacon_encodes_superframe_gts_and_pending_addresses() {
+        let frame = build_nonbeacon_beacon(
+            0x21,
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0x0001)),
+            false,
+            true,
+            &[ShortAddress(0x3344)],
+            &[[1, 2, 3, 4, 5, 6, 7, 8]],
+            &[0xAA, 0xBB],
+        )
+        .unwrap();
+
+        assert_eq!(
+            frame.as_slice(),
+            [
+                0x00, 0x80, 0x21, 0x34, 0x12, 0x01, 0x00, // MHR
+                0xFF, 0x8F, // BO=SO=CAP=15, association permitted
+                0x00, // no GTS
+                0x11, // one short + one extended pending address
+                0x44, 0x33, 1, 2, 3, 4, 5, 6, 7, 8, 0xAA, 0xBB,
+            ]
+        );
+    }
+
+    #[test]
+    fn nonbeacon_beacon_rejects_oversize_pending_payload() {
+        let pending = [ShortAddress(1); MAX_BEACON_PENDING_ADDRESSES];
+        let payload = [0u8; 110];
+        assert_eq!(
+            build_nonbeacon_beacon(
+                0,
+                &MacAddress::Short(PanId(1), ShortAddress(1)),
+                false,
+                false,
+                &pending,
+                &[],
+                &payload,
+            ),
+            Err(FrameBuildError::FrameTooLong)
+        );
+    }
+
+    #[test]
+    fn association_response_uses_extended_child_and_parent_addresses() {
+        let response = MlmeAssociateResponse {
+            device_address: [1, 2, 3, 4, 5, 6, 7, 8],
+            short_address: ShortAddress(0x3344),
+            status: AssociationStatus::Success,
+        };
+        let frame =
+            build_association_response(0x22, PanId(0x1234), &[8, 7, 6, 5, 4, 3, 2, 1], &response)
+                .unwrap();
+
+        assert_eq!(&frame[..5], &[0x63, 0xCC, 0x22, 0x34, 0x12]);
+        assert_eq!(&frame[5..13], &response.device_address);
+        assert_eq!(&frame[13..21], &[8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(&frame[21..], &[0x02, 0x44, 0x33, 0x00]);
+        assert_eq!(
+            parse_association_response(&frame),
+            Some((ShortAddress(0x3344), 0))
         );
     }
 
@@ -643,6 +845,7 @@ mod tests {
             &MacAddress::Short(PanId(0xABCD), ShortAddress(0x1122)),
             &[0xAA, 0xBB],
             true,
+            false,
         )
         .unwrap();
 
@@ -652,6 +855,23 @@ mod tests {
                 0x61, 0x88, 0x42, 0xCD, 0xAB, 0x22, 0x11, 0x44, 0x33, 0xAA, 0xBB
             ]
         );
+    }
+
+    #[test]
+    fn data_frame_can_advertise_more_pending_data() {
+        let frame = build_data_frame(
+            0x43,
+            AddressMode::Short,
+            ShortAddress(0x3344),
+            &[0; 8],
+            &MacAddress::Short(PanId(0xABCD), ShortAddress(0x1122)),
+            &[0xAA],
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert_ne!(u16::from_le_bytes([frame[0], frame[1]]) & (1 << 4), 0);
     }
 
     #[test]
@@ -665,6 +885,7 @@ mod tests {
                 &[0; 8],
                 &MacAddress::Short(PanId(1), ShortAddress(2)),
                 &payload,
+                false,
                 false,
             ),
             Err(FrameBuildError::FrameTooLong)
@@ -737,8 +958,6 @@ mod tests {
         for accepted in [
             MacAddress::Short(our_pan, our_short),
             MacAddress::Short(our_pan, ShortAddress(0xFFFF)),
-            MacAddress::Short(our_pan, ShortAddress(0xFFFD)),
-            MacAddress::Short(our_pan, ShortAddress(0xFFFC)),
             MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
             // Transport-Key and Association Response are IEEE addressed —
             // these are the frames that used to require promiscuous mode.
@@ -752,6 +971,9 @@ mod tests {
 
         for rejected in [
             MacAddress::Short(our_pan, ShortAddress(0x1F0F)),
+            // These are Zigbee NWK broadcasts, not MAC broadcasts.
+            MacAddress::Short(our_pan, ShortAddress(0xFFFD)),
+            MacAddress::Short(our_pan, ShortAddress(0xFFFC)),
             MacAddress::Short(PanId(0x1234), our_short),
             MacAddress::Extended(our_pan, [0; 8]),
         ] {

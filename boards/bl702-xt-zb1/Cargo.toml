@@ -1,0 +1,11 @@
+[package]
+name = "bl702-xt-zb1"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "DOIT XT-ZB1 board support for BL702"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+bl702-hal = { path = "../../bl702-hal" }

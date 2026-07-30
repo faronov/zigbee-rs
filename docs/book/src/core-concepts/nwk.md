@@ -269,6 +269,7 @@ pub struct NeighborEntry {
     pub outgoing_cost: u8,              // 1-7, derived from LQI
     pub depth: u8,                      // Network depth
     pub permit_joining: bool,           // For routers/coordinators
+    pub security_capable: bool,          // Child can authenticate with NWK security
     pub age: u16,                       // Ticks since last heard from
     pub extended_pan_id: IeeeAddress,
     pub active: bool,

@@ -328,6 +328,7 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
             &req.dst_address,
             req.payload,
             ack_requested,
+            req.tx_options.frame_pending,
         )
         .map_err(|_| MacError::FrameTooLong)?;
 
@@ -368,35 +369,26 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
             return Err(MacError::InvalidParameter);
         }
 
-        let passes = if has_short_source && has_extended_source {
-            2
+        let sequence = self.pib.next_dsn();
+        let request = if has_short_source {
+            build_data_request_short(sequence, &coordinator, own_short)
         } else {
-            1
+            build_data_request(sequence, &coordinator, &own_extended)
         };
-        for pass in 0..passes {
-            let sequence = self.pib.next_dsn();
-            let request = if pass == 0 && has_short_source {
-                build_data_request_short(sequence, &coordinator, own_short)
-            } else {
-                build_data_request(sequence, &coordinator, &own_extended)
-            };
 
-            let ack = self.transmit_acknowledged(&request).await?;
-            if let Some(frame) = self.take_pending_data().await? {
-                return Ok(Some(frame));
-            }
-            if !ack.frame_pending {
-                continue;
-            }
-
-            match self.receive_data(POLL_RESPONSE_WAIT_US).await {
-                Ok(indication) => return Ok(Some(indication.payload)),
-                Err(MacError::NoData) => {}
-                Err(error) => return Err(error),
-            }
+        let ack = self.transmit_acknowledged(&request).await?;
+        if let Some(frame) = self.take_pending_data().await? {
+            return Ok(Some(frame));
+        }
+        if !ack.frame_pending {
+            return Ok(None);
         }
 
-        Ok(None)
+        match self.receive_data(POLL_RESPONSE_WAIT_US).await {
+            Ok(indication) => Ok(Some(indication.payload)),
+            Err(MacError::NoData) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn receive_data(&mut self, timeout_us: u32) -> Result<McpsDataIndication, MacError> {
@@ -536,7 +528,8 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
                         }
                         continue;
                     }
-                    self.queue_pending_rx(frame, false);
+                    let software_ack_sent = self.acknowledge_received_frame(&frame).await?;
+                    self.queue_pending_rx(frame, software_ack_sent);
                 }
                 Ok(None) => return Ok(None),
                 Err(PhyError::CrcFailed) => {}
@@ -1490,6 +1483,7 @@ mod tests {
             &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
             &[0xCC],
             true,
+            false,
         )
         .unwrap();
         core.phy_mut()
@@ -1537,6 +1531,7 @@ mod tests {
             &MacAddress::Short(PanId(0x1234), ShortAddress(0xFFFF)),
             &[0xDD],
             true,
+            false,
         )
         .unwrap();
         core.phy_mut()
@@ -1569,6 +1564,7 @@ mod tests {
             &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
             &[0xEE],
             true,
+            false,
         )
         .unwrap();
         core.phy_mut()
@@ -1671,6 +1667,7 @@ mod tests {
             &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
             &[0xA5, 0x5A],
             true,
+            false,
         )
         .unwrap();
         for frame in [
@@ -1964,6 +1961,7 @@ mod tests {
             &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
             &[0xA1, 0xB2],
             true,
+            false,
         )
         .unwrap();
         core.phy_mut()
@@ -2006,6 +2004,7 @@ mod tests {
             &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
             &[0xC3],
             false,
+            false,
         )
         .unwrap();
         core.phy_mut()
@@ -2026,7 +2025,53 @@ mod tests {
     }
 
     #[test]
-    fn poll_falls_back_from_short_to_extended_source_addressing() {
+    fn ack_window_immediately_acknowledges_queued_unicast_data() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        core.set_pib(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x5678)),
+        )
+        .unwrap();
+        let incoming = build_data_frame(
+            0x34,
+            AddressMode::Short,
+            ShortAddress(0x0000),
+            &[0; 8],
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
+            &[0xD4],
+            true,
+            false,
+        )
+        .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&incoming, 190).unwrap())))
+            .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, 0x44], 255).unwrap(),
+            )))
+            .unwrap();
+
+        let ack = block_on(core.wait_for_ack(0x44)).unwrap().unwrap();
+
+        assert!(!ack.frame_pending);
+        assert_eq!(core.phy().sent_acks.as_slice(), [(0x34, false)]);
+        assert_eq!(
+            block_on(core.take_pending_data())
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            [0xD4]
+        );
+        assert_eq!(core.phy().sent_acks.as_slice(), [(0x34, false)]);
+    }
+
+    #[test]
+    fn poll_uses_short_source_once_when_assigned() {
         let mut core = core();
         core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
             .unwrap();
@@ -2040,24 +2085,46 @@ mod tests {
             PibValue::ShortAddress(ShortAddress(0x0000)),
         )
         .unwrap();
-        core.set_pib(
-            PibAttribute::MacCoordExtendedAddress,
-            PibValue::ExtendedAddress([0x10; 8]),
-        )
-        .unwrap();
-        for sequence in [0x01, 0x02] {
-            core.phy_mut()
-                .rx_frames
-                .push_back(Ok(Some(
-                    PhyRxFrame::from_slice(&[0x02, 0x00, sequence], 255).unwrap(),
-                )))
-                .unwrap();
-        }
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap(),
+            )))
+            .unwrap();
 
         assert!(block_on(core.poll()).unwrap().is_none());
-        assert_eq!(core.phy().tx_attempts, 2);
-        assert_eq!(core.phy().last_tx[2], 0x02);
+        assert_eq!(core.phy().tx_attempts, 1);
+        assert_eq!(
+            core.phy().last_tx.as_slice(),
+            [0x63, 0x88, 0x01, 0x34, 0x12, 0x00, 0x00, 0x78, 0x56, 0x04]
+        );
+    }
+
+    #[test]
+    fn poll_uses_extended_source_before_short_assignment() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        core.set_pib(
+            PibAttribute::MacCoordShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x0000)),
+        )
+        .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap(),
+            )))
+            .unwrap();
+
+        assert!(block_on(core.poll()).unwrap().is_none());
+        assert_eq!(core.phy().tx_attempts, 1);
+        assert_eq!(
+            &core.phy().last_tx[..7],
+            &[0x63, 0xC8, 0x01, 0x34, 0x12, 0x00, 0x00]
+        );
         assert_eq!(&core.phy().last_tx[7..15], &IEEE);
+        assert_eq!(core.phy().last_tx[15], 0x04);
     }
 
     #[test]

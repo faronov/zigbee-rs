@@ -1,0 +1,14 @@
+[package]
+name = "bl702-xt-zb1-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product configuration for the BL702 XT-ZB1 Zigbee sensor"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+bl702-hal = { path = "../../bl702-hal" }
+bl702-xt-zb1 = { path = "../../boards/bl702-xt-zb1" }
+embedded-storage = "0.3"
+zigbee-runtime = { path = "../../zigbee-runtime" }

@@ -231,6 +231,40 @@ pub const WAKEUP_STATUS_TIMER: u8 = 1 << 1;
 pub const WAKEUP_STATUS_CORE: u8 = 1 << 2;
 pub const WAKEUP_STATUS_PAD: u8 = 1 << 3;
 
+/// Explicit set of wake causes decoded from analog register `0x44`.
+///
+/// More than one bit may be latched, so this is deliberately a bit set rather
+/// than an enum that would discard simultaneous causes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WakeSources(u8);
+
+impl WakeSources {
+    const MASK: u8 =
+        WAKEUP_STATUS_COMPARATOR | WAKEUP_STATUS_TIMER | WAKEUP_STATUS_CORE | WAKEUP_STATUS_PAD;
+
+    pub const fn from_status(raw: u8) -> Self {
+        Self(raw & Self::MASK)
+    }
+
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn contains(self, source: WakeupSource) -> bool {
+        let status_bit = match source {
+            WakeupSource::Pad => WAKEUP_STATUS_PAD,
+            WakeupSource::Core => WAKEUP_STATUS_CORE,
+            WakeupSource::Timer => WAKEUP_STATUS_TIMER,
+            WakeupSource::Comparator => WAKEUP_STATUS_COMPARATOR,
+        };
+        self.0 & status_bit != 0
+    }
+}
+
 /// `reg_system_tick_ctrl` (`0x74f`) field bits, T1 from
 /// `platform/chip_8258/register.h`:
 /// `FLD_SYSTEM_TICK_START = BIT(0)`, `FLD_SYSTEM_TICK_RUNNING = BIT(1)`.
@@ -295,17 +329,21 @@ impl WakeStatus {
     pub fn entered_low_power(&self) -> bool {
         self.entered_low_power
     }
+    /// All latched wake causes. Multiple bits can be present.
+    pub fn sources(&self) -> WakeSources {
+        WakeSources::from_status(self.raw)
+    }
     pub fn woke_by_timer(&self) -> bool {
-        self.raw & WAKEUP_STATUS_TIMER != 0
+        self.sources().contains(WakeupSource::Timer)
     }
     pub fn woke_by_pad(&self) -> bool {
-        self.raw & WAKEUP_STATUS_PAD != 0
+        self.sources().contains(WakeupSource::Pad)
     }
     pub fn woke_by_core(&self) -> bool {
-        self.raw & WAKEUP_STATUS_CORE != 0
+        self.sources().contains(WakeupSource::Core)
     }
     pub fn woke_by_comparator(&self) -> bool {
-        self.raw & WAKEUP_STATUS_COMPARATOR != 0
+        self.sources().contains(WakeupSource::Comparator)
     }
 }
 
@@ -1737,6 +1775,15 @@ mod tests {
         };
         assert!(!s.entered_low_power());
         assert!(s.woke_by_pad());
+    }
+
+    #[test]
+    fn combined_wake_sources_preserve_every_latched_cause() {
+        let sources = WakeSources::from_status(WAKEUP_STATUS_TIMER | WAKEUP_STATUS_PAD | 0x80);
+        assert!(sources.contains(WakeupSource::Timer));
+        assert!(sources.contains(WakeupSource::Pad));
+        assert!(!sources.contains(WakeupSource::Core));
+        assert_eq!(sources.raw(), WAKEUP_STATUS_TIMER | WAKEUP_STATUS_PAD);
     }
 
     #[test]

@@ -3,7 +3,8 @@
 use embedded_storage::nor_flash::NorFlash;
 
 use crate::security_store::{
-    ENCODED_SECURITY_STATE_LEN, PersistentSecurityState, SecurityStateStore, SecurityStoreError,
+    ENCODED_SECURITY_STATE_LEN, LEGACY_ENCODED_SECURITY_STATE_LEN, PersistentSecurityState,
+    SecurityStateStore, SecurityStoreError,
 };
 
 pub const SECURITY_JOURNAL_SECTOR_SIZE: usize = 4096;
@@ -12,9 +13,11 @@ pub const SECURITY_JOURNAL_SLOTS_PER_SECTOR: usize =
     SECURITY_JOURNAL_SECTOR_SIZE / SECURITY_JOURNAL_SLOT_SIZE;
 
 const RECORD_MAGIC: [u8; 4] = *b"ZBSS";
-const RECORD_VERSION: u8 = 1;
-const RECORD_CRC_OFFSET: usize = 92;
-const RECORD_PREFIX_LEN: usize = 96;
+const LEGACY_RECORD_VERSION: u8 = 1;
+const RECORD_VERSION: u8 = 2;
+const LEGACY_RECORD_CRC_OFFSET: usize = 92;
+const RECORD_CRC_OFFSET: usize = 112;
+const RECORD_PREFIX_LEN: usize = 116;
 const RECORD_COMMIT_OFFSET: usize = 124;
 const RECORD_COMMIT: [u8; 4] = *b"CMIT";
 
@@ -75,26 +78,39 @@ impl<S: NorFlash> SecurityStateJournal<S> {
     ) -> Option<(u32, PersistentSecurityState)> {
         if record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4] != RECORD_COMMIT
             || record[0..4] != RECORD_MAGIC
-            || record[4] != RECORD_VERSION
-            || record[5] as usize != ENCODED_SECURITY_STATE_LEN
         {
             return None;
         }
 
+        let (crc_offset, encoded_len) = match (record[4], record[5] as usize) {
+            (RECORD_VERSION, ENCODED_SECURITY_STATE_LEN) => {
+                (RECORD_CRC_OFFSET, ENCODED_SECURITY_STATE_LEN)
+            }
+            (LEGACY_RECORD_VERSION, LEGACY_ENCODED_SECURITY_STATE_LEN) => {
+                (LEGACY_RECORD_CRC_OFFSET, LEGACY_ENCODED_SECURITY_STATE_LEN)
+            }
+            _ => return None,
+        };
         let expected_crc = u32::from_le_bytes([
-            record[RECORD_CRC_OFFSET],
-            record[RECORD_CRC_OFFSET + 1],
-            record[RECORD_CRC_OFFSET + 2],
-            record[RECORD_CRC_OFFSET + 3],
+            record[crc_offset],
+            record[crc_offset + 1],
+            record[crc_offset + 2],
+            record[crc_offset + 3],
         ]);
-        if crc32(&record[..RECORD_CRC_OFFSET]) != expected_crc {
+        if crc32(&record[..crc_offset]) != expected_crc {
             return None;
         }
 
         let generation = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-        let mut encoded_state = [0u8; ENCODED_SECURITY_STATE_LEN];
-        encoded_state.copy_from_slice(&record[12..12 + ENCODED_SECURITY_STATE_LEN]);
-        let state = PersistentSecurityState::decode(&encoded_state).ok()?;
+        let state = if encoded_len == ENCODED_SECURITY_STATE_LEN {
+            let mut encoded_state = [0u8; ENCODED_SECURITY_STATE_LEN];
+            encoded_state.copy_from_slice(&record[12..12 + ENCODED_SECURITY_STATE_LEN]);
+            PersistentSecurityState::decode(&encoded_state).ok()?
+        } else {
+            let mut encoded_state = [0u8; LEGACY_ENCODED_SECURITY_STATE_LEN];
+            encoded_state.copy_from_slice(&record[12..12 + LEGACY_ENCODED_SECURITY_STATE_LEN]);
+            PersistentSecurityState::decode_legacy(&encoded_state).ok()?
+        };
         Some((generation, state))
     }
 
@@ -392,6 +408,29 @@ mod tests {
         assert_eq!(journal.load(), Ok(None));
         journal.store(&state(0x400)).unwrap();
         assert_eq!(journal.load().unwrap().unwrap().global_counter_limit, 0x400);
+    }
+
+    #[test]
+    fn legacy_version_one_record_is_still_loaded() {
+        let expected = state(0x400);
+        let mut current = [0u8; ENCODED_SECURITY_STATE_LEN];
+        expected.encode(&mut current);
+        let mut record = [0xFFu8; SECURITY_JOURNAL_SLOT_SIZE];
+        record[0..4].copy_from_slice(&RECORD_MAGIC);
+        record[4] = LEGACY_RECORD_VERSION;
+        record[5] = LEGACY_ENCODED_SECURITY_STATE_LEN as u8;
+        record[8..12].copy_from_slice(&1u32.to_le_bytes());
+        record[12..12 + LEGACY_ENCODED_SECURITY_STATE_LEN]
+            .copy_from_slice(&current[..LEGACY_ENCODED_SECURITY_STATE_LEN]);
+        let crc = crc32(&record[..LEGACY_RECORD_CRC_OFFSET]);
+        record[LEGACY_RECORD_CRC_OFFSET..LEGACY_RECORD_CRC_OFFSET + 4]
+            .copy_from_slice(&crc.to_le_bytes());
+        record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4].copy_from_slice(&RECORD_COMMIT);
+
+        let mut flash = MockFlash::new();
+        flash.data[..SECURITY_JOURNAL_SLOT_SIZE].copy_from_slice(&record);
+        let mut journal = SecurityStateJournal::new(flash, 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        assert_eq!(journal.load(), Ok(Some(expected)));
     }
 
     #[test]

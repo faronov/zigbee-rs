@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bl702-hal = { path = "../../bl702-hal" }
+bl702-xt-zb1 = { path = "../../boards/bl702-xt-zb1" }
+bl702-xt-zb1-product = { path = "../../products/bl702-xt-zb1" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["bl702"] }
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-aps = { path = "../../zigbee-aps" }

@@ -1,24 +1,23 @@
-//! TB-04 flash partitions and Zigbee security storage wiring.
+//! Product-owned TLSR8258 flash partition and Zigbee security journal.
 
 use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
 use tlsr8258_hal::flash::{FlashError, Tlsr8258Flash};
+use tlsr8258_tb04::resources::OnboardFlash;
 use zigbee_runtime::security_journal::{SECURITY_JOURNAL_SECTOR_SIZE, SecurityStateJournal};
 
-const FLASH_CAPACITY: usize = 512 * 1024;
-const SECURITY_PARTITION_START: u32 = 0x0007_4000;
-const SECURITY_PARTITION_SIZE: usize = SECURITY_JOURNAL_SECTOR_SIZE * 2;
+use crate::{FLASH_CAPACITY, SECURITY_PARTITION_SIZE, SECURITY_PARTITION_START};
+
 const SECURITY_SECTOR_A: u32 = 0;
 const SECURITY_SECTOR_B: u32 = SECURITY_JOURNAL_SECTOR_SIZE as u32;
 
-const _: () =
-    assert!(SECURITY_PARTITION_START as usize + SECURITY_PARTITION_SIZE <= FLASH_CAPACITY);
+const _: () = assert!(SECURITY_PARTITION_SIZE == SECURITY_JOURNAL_SECTOR_SIZE * 2);
 
 pub struct SecurityFlash {
     flash: Tlsr8258Flash,
 }
 
 impl SecurityFlash {
-    const fn new() -> Self {
+    const fn new(_token: OnboardFlash) -> Self {
         Self {
             flash: Tlsr8258Flash::new(FLASH_CAPACITY),
         }
@@ -76,6 +75,10 @@ impl NorFlash for SecurityFlash {
 
 pub type SecurityStore = SecurityStateJournal<SecurityFlash>;
 
-pub const fn security_store() -> SecurityStore {
-    SecurityStateJournal::new(SecurityFlash::new(), SECURITY_SECTOR_A, SECURITY_SECTOR_B)
+pub const fn security_store(token: OnboardFlash) -> SecurityStore {
+    SecurityStateJournal::new(
+        SecurityFlash::new(token),
+        SECURITY_SECTOR_A,
+        SECURITY_SECTOR_B,
+    )
 }

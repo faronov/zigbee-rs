@@ -32,6 +32,9 @@
 #![no_std]
 #![allow(async_fn_in_trait)]
 
+#[cfg(test)]
+extern crate std;
+
 pub mod aib;
 pub mod apsde;
 pub mod apsme;
@@ -158,11 +161,16 @@ pub enum ApsAddress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApsSecurityHandshakeStats {
     pub verify_key_sent: u32,
+    pub last_verify_key_frame_counter: u32,
+    pub last_verify_key_trust_center: zigbee_types::IeeeAddress,
     pub confirm_key_received: u32,
     pub confirm_key_successes: u32,
     pub confirm_key_rejections: u32,
     pub last_confirm_key_status: u8,
     pub last_confirm_key_type: u8,
+    pub last_confirm_key_key_identifier: u8,
+    pub last_confirm_key_aps_secured: bool,
+    pub last_confirm_key_nwk_secured: bool,
     pub last_confirm_key_source: u16,
     pub last_confirm_key_source_ieee: zigbee_types::IeeeAddress,
     pub last_confirm_key_destination: zigbee_types::IeeeAddress,
@@ -172,11 +180,16 @@ impl Default for ApsSecurityHandshakeStats {
     fn default() -> Self {
         Self {
             verify_key_sent: 0,
+            last_verify_key_frame_counter: 0,
+            last_verify_key_trust_center: [0u8; 8],
             confirm_key_received: 0,
             confirm_key_successes: 0,
             confirm_key_rejections: 0,
             last_confirm_key_status: 0xFF,
             last_confirm_key_type: 0xFF,
+            last_confirm_key_key_identifier: 0xFF,
+            last_confirm_key_aps_secured: false,
+            last_confirm_key_nwk_secured: false,
             last_confirm_key_source: 0xFFFF,
             last_confirm_key_source_ieee: [0u8; 8],
             last_confirm_key_destination: [0u8; 8],
@@ -212,6 +225,19 @@ pub struct PendingApsAck {
     pub cluster_id: u16,
     pub profile_id: u16,
     pub aps_counter: u8,
+}
+
+/// APS Tunnel command awaiting hop-by-hop delivery to a joining child.
+#[derive(Debug, Clone)]
+pub struct PendingApsTunnel {
+    pub destination: zigbee_types::IeeeAddress,
+    frame: heapless::Vec<u8, 128>,
+}
+
+impl PendingApsTunnel {
+    pub fn frame(&self) -> &[u8] {
+        self.frame.as_slice()
+    }
 }
 
 /// Maximum entries in APS duplicate rejection table
@@ -282,6 +308,8 @@ pub struct ApsLayer<M: MacDriver> {
     security_handshake_stats: ApsSecurityHandshakeStats,
     /// Pending APS ACK to send after processing incoming frame
     pending_aps_ack: Option<PendingApsAck>,
+    /// Pending APS Tunnel payload to forward without NWK security.
+    pending_tunnel: Option<PendingApsTunnel>,
     /// APS duplicate rejection table
     dup_table: [ApsDuplicateEntry; APS_DUP_TABLE_SIZE],
     /// Outbound APS ACK tracking (frames awaiting ACK confirmation)
@@ -303,6 +331,7 @@ impl<M: MacDriver> ApsLayer<M> {
             aps_counter: 0,
             security_handshake_stats: ApsSecurityHandshakeStats::default(),
             pending_aps_ack: None,
+            pending_tunnel: None,
             dup_table: [ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE],
             ack_table: heapless::Vec::new(),
             fragment_rx: fragment::FragmentReassembly::new(),
@@ -325,6 +354,7 @@ impl<M: MacDriver> ApsLayer<M> {
             core::ptr::addr_of_mut!((*slot).security_handshake_stats)
                 .write(ApsSecurityHandshakeStats::default());
             core::ptr::addr_of_mut!((*slot).pending_aps_ack).write(None);
+            core::ptr::addr_of_mut!((*slot).pending_tunnel).write(None);
             core::ptr::addr_of_mut!((*slot).dup_table)
                 .write([ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE]);
             core::ptr::addr_of_mut!((*slot).ack_table).write(heapless::Vec::new());

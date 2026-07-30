@@ -99,7 +99,7 @@ emit_bin() {
 #   1. I-cache tag/data reservation vs. `.ram_code` size
 #   2. `.data` (and its first word, the cache canary) starting at/after
 #      `_icache_data_end_`
-#   3. `.rf_dma` (RF_RX_BUF/RF_TX_BUF) placement outside the cache
+#   3. `.rf_dma` (RF_RX_BUF/RF_TX_BUF/RF_ACK_TX_BUF) placement outside the cache
 #      reservation, below the IRQ stack, and 4-byte aligned
 #   4. `.bss` staying below the IRQ stack
 #   5. the diagnostic record's fixed address and reserved size
@@ -113,7 +113,7 @@ verify_layout() {
     local ramcode_start=0 ramcode_end=0 ramcode_aligned=0
     local ictag_start=0 ictag_end=0 icache_data_end=0
     local sdata=0 edata=0 sbss=0 ebss=0
-    local rf_dma_start=0 rf_dma_end=0 rf_rx_buf=0 rf_tx_buf=0
+    local rf_dma_start=0 rf_dma_end=0 rf_rx_buf=0 rf_tx_buf=0 rf_ack_tx_buf=0
     local svc_top=0 svc_bot=0 irq_top=0 irq_bot=0
     local diag_start=0 diag_end=0
     local line value name
@@ -135,6 +135,7 @@ verify_layout() {
             _rf_dma_end_)      rf_dma_end=$((16#$value)) ;;
             *RF_RX_BUF)        rf_rx_buf=$((16#$value)) ;;
             *RF_TX_BUF)        rf_tx_buf=$((16#$value)) ;;
+            *RF_ACK_TX_BUF)    rf_ack_tx_buf=$((16#$value)) ;;
             _svc_stack_top)    svc_top=$((16#$value)) ;;
             _svc_stack_bottom) svc_bot=$((16#$value)) ;;
             _irq_stack_top)    irq_top=$((16#$value)) ;;
@@ -169,8 +170,8 @@ verify_layout() {
     fi
 
     # 3: .rf_dma placement + alignment.
-    if (( rf_rx_buf == 0 || rf_tx_buf == 0 )); then
-        fail_check "RF_RX_BUF/RF_TX_BUF symbols were not found in the linked ELF"
+    if (( rf_rx_buf == 0 || rf_tx_buf == 0 || rf_ack_tx_buf == 0 )); then
+        fail_check "RF_RX_BUF/RF_TX_BUF/RF_ACK_TX_BUF symbols were not found in the linked ELF"
     fi
     if (( rf_dma_start < icache_data_end )); then
         fail_check ".rf_dma (0x$(printf %X "$rf_dma_start")) overlaps the I-cache reservation ending at 0x$(printf %X "$icache_data_end")"
@@ -184,11 +185,26 @@ verify_layout() {
     if (( rf_tx_buf % 4 != 0 )); then
         fail_check "RF_TX_BUF (0x$(printf %X "$rf_tx_buf")) is not 4-byte aligned"
     fi
+    if (( rf_ack_tx_buf % 4 != 0 )); then
+        fail_check "RF_ACK_TX_BUF (0x$(printf %X "$rf_ack_tx_buf")) is not 4-byte aligned"
+    fi
     if (( rf_rx_buf != 0 && rf_rx_buf < icache_data_end )); then
         fail_check "RF_RX_BUF (0x$(printf %X "$rf_rx_buf")) overlaps the I-cache reservation"
     fi
     if (( rf_tx_buf != 0 && rf_tx_buf < icache_data_end )); then
         fail_check "RF_TX_BUF (0x$(printf %X "$rf_tx_buf")) overlaps the I-cache reservation"
+    fi
+    if (( rf_ack_tx_buf != 0 && rf_ack_tx_buf < icache_data_end )); then
+        fail_check "RF_ACK_TX_BUF (0x$(printf %X "$rf_ack_tx_buf")) overlaps the I-cache reservation"
+    fi
+    if (( rf_rx_buf < rf_tx_buf + 144 && rf_tx_buf < rf_rx_buf + 288 )); then
+        fail_check "RF_RX_BUF overlaps RF_TX_BUF"
+    fi
+    if (( rf_rx_buf < rf_ack_tx_buf + 144 && rf_ack_tx_buf < rf_rx_buf + 288 )); then
+        fail_check "RF_RX_BUF overlaps RF_ACK_TX_BUF"
+    fi
+    if (( rf_tx_buf < rf_ack_tx_buf + 144 && rf_ack_tx_buf < rf_tx_buf + 144 )); then
+        fail_check "RF_TX_BUF overlaps RF_ACK_TX_BUF"
     fi
 
     # 4: .bss vs stacks/diag.
@@ -243,9 +259,9 @@ verify_layout() {
         fi
     fi
 
-    printf 'layout-check OK: ram_code=%dB cache=[0x%X..0x%X) data=[0x%X..0x%X) rf_dma=[0x%X..0x%X) (rx=0x%X tx=0x%X) bss=[0x%X..0x%X) irq=[0x%X..0x%X) svc=[0x%X..0x%X) diag=[0x%X..0x%X)\n' \
+    printf 'layout-check OK: ram_code=%dB cache=[0x%X..0x%X) data=[0x%X..0x%X) rf_dma=[0x%X..0x%X) (rx=0x%X tx=0x%X ack=0x%X) bss=[0x%X..0x%X) irq=[0x%X..0x%X) svc=[0x%X..0x%X) diag=[0x%X..0x%X)\n' \
         "$ramcode_len" "$ictag_start" "$icache_data_end" "$sdata" "$edata" \
-        "$rf_dma_start" "$rf_dma_end" "$rf_rx_buf" "$rf_tx_buf" \
+        "$rf_dma_start" "$rf_dma_end" "$rf_rx_buf" "$rf_tx_buf" "$rf_ack_tx_buf" \
         "$sbss" "$ebss" "$irq_bot" "$irq_top" "$svc_bot" "$svc_top" "$diag_start" "$diag_end"
 }
 

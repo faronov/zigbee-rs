@@ -45,8 +45,10 @@ pub mod nwk_commands;
 pub mod routing;
 pub mod security;
 
-use zigbee_mac::MacDriver;
-use zigbee_types::{IeeeAddress, ShortAddress};
+use zigbee_mac::{AddressMode, CapabilityInfo, MacDriver, MacError, McpsDataRequest, TxOptions};
+use zigbee_types::{IeeeAddress, MacAddress, ShortAddress};
+
+const UNAUTHENTICATED_CHILD_TIMEOUT_SECS: u16 = 10;
 
 /// NWK layer status codes (Zigbee spec Table 3-70)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +81,34 @@ pub enum DeviceType {
     Coordinator,
     Router,
     EndDevice,
+}
+
+/// Available child slots advertised in Zigbee beacon capacity bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildCapacity {
+    pub router: bool,
+    pub end_device: bool,
+}
+
+/// Result of servicing one MAC Data Request from a possible child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildPollOutcome {
+    /// Extended-address polls are reserved for the MAC-owned Association
+    /// Response transaction and are intentionally not drained here.
+    AssociationResponsePoll,
+    UnknownChild,
+    NoData,
+    Delivered {
+        child: ShortAddress,
+        more_pending: bool,
+    },
+}
+
+/// How a Rejoin Response was delivered to the requesting child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejoinResponseDelivery {
+    Direct,
+    Indirect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -134,12 +164,53 @@ pub struct PendingRouteReply {
 }
 
 /// A deferred RREQ rebroadcast (queued from sync handler, sent async).
+///
+/// Retained for API compatibility. Route Request propagation no longer
+/// *rebroadcasts* a locally originated copy: it forwards the originator's
+/// frame, which needs the original NWK header as well, so the queue holds a
+/// crate-private `QueuedRreqForward` instead.
 #[derive(Debug, Clone)]
 pub struct PendingRreqRebroadcast {
     pub command_options: u8,
     pub route_request_id: u8,
     pub dst_addr: ShortAddress,
     pub path_cost: u8,
+}
+
+/// A Route Request this device has accepted for propagation, queued from the
+/// synchronous command handler and forwarded on the next maintenance pass.
+///
+/// A forwarded RREQ is the *originator's* broadcast carried one hop further,
+/// not a new one of ours. Everything that identifies the broadcast — the NWK
+/// source address, the NWK sequence number and the end-device-initiator bit —
+/// is preserved, only the radius (decremented) and the RREQ path cost change,
+/// and the frame is re-secured hop by hop with this device's own IEEE address
+/// and durable frame counter. Re-originating it instead would defeat every
+/// receiver's broadcast transaction record and let two routers pass the same
+/// discovery back and forth forever.
+#[derive(Debug, Clone)]
+pub(crate) struct QueuedRreqForward {
+    /// Frame control of the received frame — protocol version, discover-route
+    /// bits, security flag and the end-device-initiator bit are preserved.
+    pub(crate) frame_control: frames::NwkFrameControl,
+    /// Broadcast address the originator used (0xFFFC, 0xFFFD, 0xFFFF...).
+    pub(crate) dst_addr: ShortAddress,
+    /// NWK source address of the originator — never this device.
+    pub(crate) originator: ShortAddress,
+    /// Originator's IEEE address, when the received header carried one.
+    pub(crate) src_ieee: Option<IeeeAddress>,
+    /// The originator's NWK sequence number, preserved for BTR suppression.
+    pub(crate) seq_number: u8,
+    /// Radius to send with — already decremented from the received radius.
+    pub(crate) radius: u8,
+    /// RREQ command options (many-to-one bits, destination IEEE flag).
+    pub(crate) command_options: u8,
+    pub(crate) route_request_id: u8,
+    /// RREQ destination (the concentrator for a many-to-one request).
+    pub(crate) rreq_dst: ShortAddress,
+    pub(crate) rreq_dst_ieee: Option<IeeeAddress>,
+    /// Accumulated path cost including our link from the previous hop.
+    pub(crate) path_cost: u8,
 }
 
 /// A deferred Network Status (route error) to be sent asynchronously.
@@ -179,11 +250,14 @@ pub struct NwkLayer<M: MacDriver> {
     pending_route_replies: heapless::Vec<PendingRouteReply, 4>,
     #[cfg(not(feature = "router"))]
     pending_route_replies: heapless::Vec<PendingRouteReply, 0>,
-    /// Pending RREQ rebroadcasts (queued from sync handler, sent async).
+    /// Route Requests accepted for propagation (queued from the sync handler,
+    /// forwarded async by [`NwkLayer::process_pending_routing`]).
     #[cfg(feature = "router")]
-    pending_rreq_rebroadcasts: heapless::Vec<PendingRreqRebroadcast, 4>,
+    pending_rreq_forwards: heapless::Vec<QueuedRreqForward, 4>,
     #[cfg(not(feature = "router"))]
-    pending_rreq_rebroadcasts: heapless::Vec<PendingRreqRebroadcast, 0>,
+    pending_rreq_forwards: heapless::Vec<QueuedRreqForward, 0>,
+    /// Route requests already acted upon, keyed by originator and request ID.
+    rreq_records: routing::RreqRecordTable,
     /// Pending Network Status (route error) notifications.
     #[cfg(feature = "router")]
     pending_route_errors: heapless::Vec<PendingNetworkStatus, 4>,
@@ -211,6 +285,13 @@ pub struct NwkLayer<M: MacDriver> {
     source_route_table: routing::SourceRouteTable,
     /// Counter for stochastic child address assignment.
     next_child_addr_offset: u16,
+    /// Lifecycle outcome of the NWK command in the frame currently being
+    /// processed, collected by the layer above with
+    /// [`take_command_outcome`](Self::take_command_outcome).
+    ///
+    /// Reset at the start of every `process_incoming_nwk_frame` call so it can
+    /// only ever describe that call's frame.
+    pending_command_outcome: Option<nlde::NwkCommandOutcome>,
 }
 
 impl<M: MacDriver> NwkLayer<M> {
@@ -236,9 +317,10 @@ impl<M: MacDriver> NwkLayer<M> {
             #[cfg(not(feature = "router"))]
             pending_route_replies: heapless::Vec::new(),
             #[cfg(feature = "router")]
-            pending_rreq_rebroadcasts: heapless::Vec::new(),
+            pending_rreq_forwards: heapless::Vec::new(),
             #[cfg(not(feature = "router"))]
-            pending_rreq_rebroadcasts: heapless::Vec::new(),
+            pending_rreq_forwards: heapless::Vec::new(),
+            rreq_records: routing::RreqRecordTable::new(),
             #[cfg(feature = "router")]
             pending_route_errors: heapless::Vec::new(),
             #[cfg(not(feature = "router"))]
@@ -254,6 +336,7 @@ impl<M: MacDriver> NwkLayer<M> {
             concentrator_radius: 5,
             source_route_table: routing::SourceRouteTable::new(),
             next_child_addr_offset: 1,
+            pending_command_outcome: None,
         }
     }
 
@@ -280,9 +363,10 @@ impl<M: MacDriver> NwkLayer<M> {
             #[cfg(not(feature = "router"))]
             core::ptr::addr_of_mut!((*slot).pending_route_replies).write(heapless::Vec::new());
             #[cfg(feature = "router")]
-            core::ptr::addr_of_mut!((*slot).pending_rreq_rebroadcasts).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*slot).pending_rreq_forwards).write(heapless::Vec::new());
             #[cfg(not(feature = "router"))]
-            core::ptr::addr_of_mut!((*slot).pending_rreq_rebroadcasts).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*slot).pending_rreq_forwards).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*slot).rreq_records).write(routing::RreqRecordTable::new());
             #[cfg(feature = "router")]
             core::ptr::addr_of_mut!((*slot).pending_route_errors).write(heapless::Vec::new());
             #[cfg(not(feature = "router"))]
@@ -300,6 +384,7 @@ impl<M: MacDriver> NwkLayer<M> {
             core::ptr::addr_of_mut!((*slot).source_route_table)
                 .write(routing::SourceRouteTable::new());
             core::ptr::addr_of_mut!((*slot).next_child_addr_offset).write(1);
+            core::ptr::addr_of_mut!((*slot).pending_command_outcome).write(None);
         }
     }
 
@@ -343,9 +428,47 @@ impl<M: MacDriver> NwkLayer<M> {
         self.joined = joined;
     }
 
+    /// Take the lifecycle outcome of the NWK command just processed.
+    ///
+    /// Call this immediately after [`process_incoming_nwk_frame`] — that call
+    /// clears the slot on entry and sets it only for the frame it processed,
+    /// so a stale Leave can never be attributed to a later frame.
+    ///
+    /// Routing and neighbour maintenance commands (RREQ, RREP, Route Record,
+    /// Link Status, Network Status) are handled entirely inside the NWK layer
+    /// and never produce an outcome here. Only commands that change this
+    /// device's network lifecycle do, and the NWK layer has already applied
+    /// the network-level effect (including dropping the joined flag) after
+    /// validating security and parent authorization.
+    ///
+    /// [`process_incoming_nwk_frame`]: Self::process_incoming_nwk_frame
+    pub fn take_command_outcome(&mut self) -> Option<nlde::NwkCommandOutcome> {
+        self.pending_command_outcome.take()
+    }
+
     /// Get the device type.
     pub fn device_type(&self) -> DeviceType {
         self.device_type
+    }
+
+    /// Whether this build and device type may forward traffic for other nodes.
+    ///
+    /// Routing needs the `router` feature: without it the routing, broadcast
+    /// transaction (BTR), source-route and indirect tables are compiled to
+    /// zero capacity, so a device could neither suppress broadcast duplicates
+    /// nor remember a next hop. Relaying in that configuration would produce
+    /// unbounded rebroadcast storms, so forwarding is refused outright instead
+    /// of being attempted with tables that cannot hold state.
+    ///
+    /// Routing also requires membership of the network. A device that has not
+    /// joined yet — or that was told to leave — has no PAN ID, no network
+    /// address and no key material it may legitimately act under, so relaying,
+    /// rebroadcasting and route discovery are all refused. Otherwise a
+    /// commissioning or orphaned router would transmit on behalf of a network
+    /// it is not part of and burn durably reserved outgoing frame counters
+    /// doing it.
+    pub fn can_route(&self) -> bool {
+        cfg!(feature = "router") && self.device_type != DeviceType::EndDevice && self.joined
     }
 
     /// Get reference to the MAC driver.
@@ -430,14 +553,45 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Ages BTR and indirect queues, triggers periodic link status broadcasts,
     /// expires stale routing entries, and schedules concentrator RREQs.
     pub fn tick_router_maintenance(&mut self, elapsed_secs: u16) {
-        // Age BTR entries
+        // Age BTR entries, route-request forwarding records and the indirect
+        // queue. A forwarding record must outlive its BTR entry, so both are
+        // aged on the same tick.
         for _ in 0..elapsed_secs {
             self.btr.age();
-            self.indirect.age();
+            self.rreq_records.age();
+            self.neighbors.age_tick();
+            let expired_children = self.indirect.age();
+            for child in expired_children {
+                if !self.indirect.has_pending(child) {
+                    let _ = self.mac.set_indirect_data_pending(
+                        MacAddress::Short(self.nib.pan_id, child),
+                        false,
+                    );
+                }
+            }
+            let unauthorized = self
+                .neighbors
+                .expire_unauthenticated(UNAUTHENTICATED_CHILD_TIMEOUT_SECS);
+            for child in unauthorized {
+                self.indirect.remove_all(child);
+                self.routing.remove(child);
+                let _ = self
+                    .mac
+                    .set_indirect_data_pending(MacAddress::Short(self.nib.pan_id, child), false);
+                log::warn!("[NWK] Unauthenticated child 0x{:04X} expired", child.0);
+            }
         }
 
         // Age routing table entries
         self.routing.age_tick();
+
+        // Fail route discoveries that never produced a Route Reply so a later
+        // data request may retry instead of being suppressed forever.
+        if self.can_route() {
+            let now = self.mac.monotonic_micros();
+            self.routing
+                .expire_discoveries(crate::routing::ROUTE_DISCOVERY_TIMEOUT_US, now);
+        }
 
         // Periodic link status for routers/coordinators
         if self.device_type != DeviceType::EndDevice && self.joined {
@@ -512,6 +666,206 @@ impl<M: MacDriver> NwkLayer<M> {
         self.concentrator_active
     }
 
+    /// Return whether router and end-device child slots remain.
+    pub fn child_capacity(&self) -> ChildCapacity {
+        if !self.can_route() || !self.neighbors.has_child_slot() {
+            return ChildCapacity {
+                router: false,
+                end_device: false,
+            };
+        }
+        let mut routers = 0usize;
+        let mut end_devices = 0usize;
+        for child in self.neighbors.children() {
+            match child.device_type {
+                neighbor::NeighborDeviceType::Router => routers += 1,
+                neighbor::NeighborDeviceType::EndDevice => end_devices += 1,
+                _ => {}
+            }
+        }
+        let total_capacity = routers + end_devices < usize::from(self.nib.max_children);
+        ChildCapacity {
+            router: total_capacity
+                && self.nib.depth < self.nib.max_depth
+                && routers < usize::from(self.nib.max_routers),
+            end_device: total_capacity,
+        }
+    }
+
+    /// Resolve a MAC short source to a child admitted through this parent.
+    pub fn known_child_short(&self, source: &MacAddress) -> Option<ShortAddress> {
+        let MacAddress::Short(pan_id, address) = source else {
+            return None;
+        };
+        if *pan_id != self.nib.pan_id || address.0 >= 0xFFF8 {
+            return None;
+        }
+        self.neighbors.find_by_short(*address).and_then(|entry| {
+            matches!(
+                entry.relationship,
+                neighbor::Relationship::Child | neighbor::Relationship::UnauthenticatedChild
+            )
+            .then_some(*address)
+        })
+    }
+
+    pub fn known_child_by_ieee(&self, ieee: &IeeeAddress) -> Option<ShortAddress> {
+        self.neighbors.find_by_ieee(ieee).and_then(|entry| {
+            matches!(
+                entry.relationship,
+                neighbor::Relationship::Child | neighbor::Relationship::UnauthenticatedChild
+            )
+            .then_some(entry.network_address)
+        })
+    }
+
+    pub fn child_security_capable(&self, ieee: &IeeeAddress) -> Option<bool> {
+        self.neighbors
+            .find_by_ieee(ieee)
+            .map(|entry| entry.security_capable)
+    }
+
+    pub fn child_rx_on_when_idle(&self, ieee: &IeeeAddress) -> Option<bool> {
+        self.neighbors
+            .find_by_ieee(ieee)
+            .map(|entry| entry.rx_on_when_idle)
+    }
+
+    pub fn child_is_authorized(&self, ieee: &IeeeAddress) -> bool {
+        self.neighbors
+            .find_by_ieee(ieee)
+            .is_some_and(|entry| entry.relationship == neighbor::Relationship::Child)
+    }
+
+    pub fn child_is_unauthenticated(&self, address: ShortAddress) -> bool {
+        self.neighbors
+            .find_by_short(address)
+            .is_some_and(|entry| entry.relationship == neighbor::Relationship::UnauthenticatedChild)
+    }
+
+    /// Remove a child only while it is still awaiting network-key proof.
+    pub fn remove_unauthenticated_child(
+        &mut self,
+        ieee: &IeeeAddress,
+        address: ShortAddress,
+    ) -> bool {
+        let removable = self.neighbors.find_by_ieee(ieee).is_some_and(|entry| {
+            entry.network_address == address
+                && entry.relationship == neighbor::Relationship::UnauthenticatedChild
+        });
+        if !removable {
+            return false;
+        }
+        self.indirect.remove_all(address);
+        self.routing.remove(address);
+        let _ = self
+            .mac
+            .set_indirect_data_pending(MacAddress::Short(self.nib.pan_id, address), false);
+        self.neighbors.remove(address);
+        true
+    }
+
+    /// Mark a provisionally admitted child as authorized after it proves
+    /// possession of the active network key.
+    pub fn authorize_child(&mut self, address: ShortAddress) -> bool {
+        let Some(entry) = self.neighbors.find_by_short_mut(address) else {
+            return false;
+        };
+        if entry.relationship != neighbor::Relationship::UnauthenticatedChild {
+            return false;
+        }
+        entry.relationship = neighbor::Relationship::Child;
+        entry.age = 0;
+        true
+    }
+
+    /// Queue one already-built NWK frame for a sleepy child and arm the MAC
+    /// Frame Pending state atomically from the caller's perspective.
+    pub fn enqueue_indirect_for_child(
+        &mut self,
+        child: ShortAddress,
+        frame: &[u8],
+    ) -> Result<(), NwkStatus> {
+        let is_sleepy_child = self.neighbors.find_by_short(child).is_some_and(|entry| {
+            !entry.rx_on_when_idle
+                && matches!(
+                    entry.relationship,
+                    neighbor::Relationship::Child | neighbor::Relationship::UnauthenticatedChild
+                )
+        });
+        if !is_sleepy_child {
+            return Err(NwkStatus::UnknownDevice);
+        }
+        let Some(slot) = self.indirect.enqueue_with_slot(child, frame) else {
+            return Err(NwkStatus::FrameNotBuffered);
+        };
+        if self
+            .mac
+            .set_indirect_data_pending(MacAddress::Short(self.nib.pan_id, child), true)
+            .is_err()
+        {
+            self.indirect.remove_slot(slot);
+            return Err(NwkStatus::FrameNotBuffered);
+        }
+        Ok(())
+    }
+
+    /// Service at most one queued transaction for one physical child poll.
+    ///
+    /// Extended-source Data Requests are left to the MAC's retained
+    /// Association Response transaction. A failed data transmission leaves
+    /// the NWK entry queued and Frame Pending armed for a fresh poll.
+    pub async fn service_child_data_request(
+        &mut self,
+        source: MacAddress,
+    ) -> Result<ChildPollOutcome, MacError> {
+        if matches!(source, MacAddress::Extended(_, _)) {
+            return Ok(ChildPollOutcome::AssociationResponsePoll);
+        }
+        let MacAddress::Short(pan_id, child) = source else {
+            return Ok(ChildPollOutcome::AssociationResponsePoll);
+        };
+        if pan_id != self.nib.pan_id
+            || (self.known_child_short(&source).is_none() && !self.indirect.has_pending(child))
+        {
+            return Ok(ChildPollOutcome::UnknownChild);
+        }
+        let Some(frame) = self.indirect.peek(child) else {
+            self.mac.set_indirect_data_pending(source, false)?;
+            return Ok(ChildPollOutcome::NoData);
+        };
+        let more_pending = self.indirect.pending_count(child) > 1;
+
+        let result = self
+            .mac
+            .mcps_indirect_data(McpsDataRequest {
+                src_addr_mode: AddressMode::Short,
+                dst_address: source,
+                payload: frame.as_slice(),
+                msdu_handle: self.nib.next_seq(),
+                tx_options: TxOptions {
+                    ack_tx: true,
+                    frame_pending: more_pending,
+                    indirect: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+        if let Err(error) = result {
+            let _ = self.mac.set_indirect_data_pending(source, true);
+            return Err(error);
+        }
+
+        let remaining_pending = self.indirect.complete_one(child).unwrap_or(false);
+        debug_assert_eq!(remaining_pending, more_pending);
+        self.mac
+            .set_indirect_data_pending(source, remaining_pending)?;
+        Ok(ChildPollOutcome::Delivered {
+            child,
+            more_pending: remaining_pending,
+        })
+    }
+
     /// Assign a short address to a new child device using stochastic addressing.
     ///
     /// Generates a pseudo-random address based on the child's IEEE address
@@ -525,12 +879,14 @@ impl<M: MacDriver> NwkLayer<M> {
         hash = hash.wrapping_add(self.next_child_addr_offset);
         self.next_child_addr_offset = self.next_child_addr_offset.wrapping_add(1);
 
-        // Ensure address is valid (not broadcast, not unassigned, not coordinator)
-        let addr = match hash {
-            0x0000 | 0xFFFC..=0xFFFF => hash.wrapping_add(0x0100),
-            other => other,
+        // Preserve valid hashes and fold only reserved values into the
+        // allocated unicast range.
+        let address = if (0x0001..=0xFFF7).contains(&hash) {
+            hash
+        } else {
+            (hash % 0xFFF7).saturating_add(1)
         };
-        ShortAddress(addr)
+        ShortAddress(address)
     }
 
     /// Handle a child association request (called by the runtime when MAC
@@ -552,16 +908,79 @@ impl<M: MacDriver> NwkLayer<M> {
             return Err(NwkStatus::NotPermitted);
         }
 
-        // Determine child type from capability info
-        let is_ffd = capability_info & 0x02 != 0;
-        let rx_on = capability_info & 0x08 != 0;
+        let capability_info = CapabilityInfo::from_byte(capability_info);
+        if !capability_info.allocate_address
+            || (capability_info.device_type_ffd && !capability_info.rx_on_when_idle)
+        {
+            return Err(NwkStatus::NotPermitted);
+        }
+
+        let existing_neighbor = self
+            .neighbors
+            .find_by_ieee(&child_ieee)
+            .map(|entry| (entry.network_address, entry.relationship));
+        if existing_neighbor
+            .is_some_and(|(_, relationship)| relationship == neighbor::Relationship::Parent)
+        {
+            return Err(NwkStatus::NotPermitted);
+        }
+
+        let capacity = if existing_neighbor.is_some() {
+            let mut routers = 0usize;
+            let mut end_devices = 0usize;
+            for child in self.neighbors.children() {
+                if Some(child.network_address) == existing_neighbor.map(|entry| entry.0) {
+                    continue;
+                }
+                match child.device_type {
+                    neighbor::NeighborDeviceType::Router => routers += 1,
+                    neighbor::NeighborDeviceType::EndDevice => end_devices += 1,
+                    _ => {}
+                }
+            }
+            let total_capacity = routers + end_devices < usize::from(self.nib.max_children);
+            ChildCapacity {
+                router: total_capacity
+                    && self.nib.depth < self.nib.max_depth
+                    && routers < usize::from(self.nib.max_routers),
+                end_device: total_capacity,
+            }
+        } else {
+            self.child_capacity()
+        };
+        if (capability_info.device_type_ffd && !capacity.router)
+            || (!capability_info.device_type_ffd && !capacity.end_device)
+        {
+            return Err(NwkStatus::NeighborTableFull);
+        }
+
+        // Determine child type from capability info.
+        let is_ffd = capability_info.device_type_ffd;
+        let rx_on = capability_info.rx_on_when_idle;
         let dev_type = if is_ffd {
             neighbor::NeighborDeviceType::Router
         } else {
             neighbor::NeighborDeviceType::EndDevice
         };
 
-        let assigned_addr = self.assign_child_address(&child_ieee);
+        let assigned_addr = if let Some((address, _)) = existing_neighbor
+            && (0x0001..=0xFFF7).contains(&address.0)
+            && address != self.nib.network_address
+        {
+            address
+        } else {
+            let mut assigned_addr = None;
+            for _ in 0..=neighbor::MAX_NEIGHBORS {
+                let candidate = self.assign_child_address(&child_ieee);
+                if candidate != self.nib.network_address
+                    && self.neighbors.find_by_short(candidate).is_none()
+                {
+                    assigned_addr = Some(candidate);
+                    break;
+                }
+            }
+            assigned_addr.ok_or(NwkStatus::NeighborTableFull)?
+        };
 
         // Add to neighbor table as child
         let entry = neighbor::NeighborEntry {
@@ -569,7 +988,8 @@ impl<M: MacDriver> NwkLayer<M> {
             network_address: assigned_addr,
             device_type: dev_type,
             rx_on_when_idle: rx_on,
-            relationship: neighbor::Relationship::Child,
+            security_capable: capability_info.security_capable,
+            relationship: neighbor::Relationship::UnauthenticatedChild,
             lqi: 0xFF,
             outgoing_cost: 1,
             depth: self.nib.depth + 1,
@@ -582,6 +1002,15 @@ impl<M: MacDriver> NwkLayer<M> {
         self.neighbors
             .add_or_update(entry)
             .map_err(|_| NwkStatus::NeighborTableFull)?;
+        self.security.clear_frame_counters_for_source(&child_ieee);
+        if let Some((previous_address, _)) = existing_neighbor {
+            self.indirect.remove_all(previous_address);
+            self.routing.remove(previous_address);
+            let _ = self.mac.set_indirect_data_pending(
+                MacAddress::Short(self.nib.pan_id, previous_address),
+                false,
+            );
+        }
 
         log::info!(
             "[NWK] Child associated: IEEE={:02X?} → addr=0x{:04X} type={:?}",
@@ -591,5 +1020,165 @@ impl<M: MacDriver> NwkLayer<M> {
         );
 
         Ok(assigned_addr)
+    }
+
+    /// Admit a device that sent a NWK Rejoin Request.
+    ///
+    /// A secured rejoin is authorized by successful NWK authentication.
+    /// An unsecured Trust Center rejoin remains provisional until the child
+    /// receives the current network key and sends a secured frame.
+    pub fn handle_child_rejoin(
+        &mut self,
+        requested_address: ShortAddress,
+        child_ieee: IeeeAddress,
+        capability_info: u8,
+        secured: bool,
+    ) -> Result<ShortAddress, NwkStatus> {
+        if !self.can_route() {
+            return Err(NwkStatus::InvalidRequest);
+        }
+
+        let capability_info = CapabilityInfo::from_byte(capability_info);
+        if capability_info.device_type_ffd && !capability_info.rx_on_when_idle {
+            return Err(NwkStatus::NotPermitted);
+        }
+        let requested_type = if capability_info.device_type_ffd {
+            neighbor::NeighborDeviceType::Router
+        } else {
+            neighbor::NeighborDeviceType::EndDevice
+        };
+
+        if let Some(existing) = self.neighbors.find_by_ieee(&child_ieee) {
+            let existing_address = existing.network_address;
+            let existing_type = existing.device_type;
+            let existing_relationship = existing.relationship;
+            if !matches!(
+                existing_relationship,
+                neighbor::Relationship::Child
+                    | neighbor::Relationship::UnauthenticatedChild
+                    | neighbor::Relationship::PreviousChild
+                    | neighbor::Relationship::Sibling
+            ) {
+                return Err(NwkStatus::NotPermitted);
+            }
+            let was_child = matches!(
+                existing_relationship,
+                neighbor::Relationship::Child
+                    | neighbor::Relationship::UnauthenticatedChild
+                    | neighbor::Relationship::PreviousChild
+            );
+            if (!was_child || existing_type != requested_type)
+                && !secured
+                && !self.nib.permit_joining
+            {
+                return Err(NwkStatus::NotPermitted);
+            }
+
+            let mut routers = 0usize;
+            let mut end_devices = 0usize;
+            for child in self.neighbors.children() {
+                if child.network_address == existing_address {
+                    continue;
+                }
+                match child.device_type {
+                    neighbor::NeighborDeviceType::Router => routers += 1,
+                    neighbor::NeighborDeviceType::EndDevice => end_devices += 1,
+                    _ => {}
+                }
+            }
+            if routers + end_devices >= usize::from(self.nib.max_children)
+                || (requested_type == neighbor::NeighborDeviceType::Router
+                    && (self.nib.depth >= self.nib.max_depth
+                        || routers >= usize::from(self.nib.max_routers)))
+            {
+                return Err(NwkStatus::NeighborTableFull);
+            }
+
+            {
+                let entry = self
+                    .neighbors
+                    .find_by_ieee_mut(&child_ieee)
+                    .expect("the child entry still exists");
+                entry.device_type = requested_type;
+                entry.rx_on_when_idle = capability_info.rx_on_when_idle;
+                entry.security_capable = capability_info.security_capable;
+                entry.relationship = if secured {
+                    neighbor::Relationship::Child
+                } else {
+                    neighbor::Relationship::UnauthenticatedChild
+                };
+                entry.age = 0;
+            }
+            if !secured {
+                self.security.clear_frame_counters_for_source(&child_ieee);
+                self.indirect.remove_all(existing_address);
+                self.routing.remove(existing_address);
+                let _ = self.mac.set_indirect_data_pending(
+                    MacAddress::Short(self.nib.pan_id, existing_address),
+                    false,
+                );
+            }
+            return Ok(existing_address);
+        }
+
+        // A known child may perform a Trust Center rejoin while joining is
+        // closed. A new unsecured device is admitted only while permit joining
+        // is active; the Trust Center still makes the authorization decision.
+        if !secured && !self.nib.permit_joining {
+            return Err(NwkStatus::NotPermitted);
+        }
+
+        let capacity = self.child_capacity();
+        if (capability_info.device_type_ffd && !capacity.router)
+            || (!capability_info.device_type_ffd && !capacity.end_device)
+        {
+            return Err(NwkStatus::NeighborTableFull);
+        }
+
+        let requested_is_usable = (0x0001..=0xFFF7).contains(&requested_address.0)
+            && requested_address != self.nib.network_address
+            && self.neighbors.find_by_short(requested_address).is_none();
+        let assigned_address = if requested_is_usable {
+            requested_address
+        } else {
+            let mut assigned = None;
+            for _ in 0..=neighbor::MAX_NEIGHBORS {
+                let candidate = self.assign_child_address(&child_ieee);
+                if candidate != self.nib.network_address
+                    && self.neighbors.find_by_short(candidate).is_none()
+                {
+                    assigned = Some(candidate);
+                    break;
+                }
+            }
+            assigned.ok_or(NwkStatus::NeighborTableFull)?
+        };
+
+        let entry = neighbor::NeighborEntry {
+            ieee_address: child_ieee,
+            network_address: assigned_address,
+            device_type: requested_type,
+            rx_on_when_idle: capability_info.rx_on_when_idle,
+            security_capable: capability_info.security_capable,
+            relationship: if secured {
+                neighbor::Relationship::Child
+            } else {
+                neighbor::Relationship::UnauthenticatedChild
+            },
+            lqi: 0xFF,
+            outgoing_cost: 1,
+            depth: self.nib.depth.saturating_add(1),
+            permit_joining: false,
+            age: 0,
+            extended_pan_id: self.nib.extended_pan_id,
+            active: true,
+        };
+        self.neighbors
+            .add_or_update(entry)
+            .map_err(|_| NwkStatus::NeighborTableFull)?;
+        if !secured {
+            self.security.clear_frame_counters_for_source(&child_ieee);
+        }
+        Ok(assigned_address)
     }
 }

@@ -5,7 +5,7 @@ A complete Zigbee PRO R22 protocol stack written in Rust, targeting embedded
 Embassy and other embedded async runtimes.
 
 ```text
-63,000+ lines of Rust · 199 source files · 30 crates · 45 ZCL clusters · 12 hardware platforms · 270 tests · 5 pure-Rust radios · NV storage on nRF + ESP32-C6
+63,000+ lines of Rust · 199 source files · 30 crates · 45 ZCL clusters · 12 hardware platforms · 300+ tests · 5 pure-Rust radios · crash-safe NV storage across nRF, ESP32, BL702, and TLSR8258
 ```
 
 ## Architecture
@@ -96,20 +96,23 @@ probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-
 > **Router mode** — joins as an always-on FFD, relays frames, and sends
 > periodic Link Status broadcasts. Child association is not implemented yet.
 
-### Telink TLSR8258 router — EXPERIMENTAL, join/relay only
+### Telink TLSR8258 parent router — EXPERIMENTAL
 
 ```bash
 ./scripts/tlsr8258.sh build router
 ./scripts/tlsr8258.sh flash router
 ```
 
-> **Router mode (Telink)** — joins with the router capability bit and relays
-> unicast/broadcast NWK traffic + periodic Link Status. Hardware testing
-> confirms ZHA join, interview, Identify, and reset/resume. This backend does
-> **not** accept child joins: no `MLME-ASSOCIATE.response`, no beacons, no
-> permit-joining, no indirect frame queue. See
-> `examples/telink-tlsr8258-router/README.md` for the full
-> capability boundary.
+> **Router mode (Telink)** — joins as an FFD, relays routed and broadcast NWK
+> traffic, sends router maintenance frames, responds to beacon requests, and
+> admits polling sleepy children while permit joining is open. Association
+> Response delivery, Trust Center Update-Device/Tunnel handling, indirect
+> queues, child authorization, and rejoin are implemented. ZHA join,
+> TCLK exchange, interview, Identify, routed-frame relay, and silent
+> reset/resume are hardware-proven. The reset capture contained no scan,
+> association, or Device_annce traffic. Parent timing and Frame Pending still
+> require the child-device sniffer gate documented in
+> `examples/telink-tlsr8258-router/README.md`.
 
 > **Flash NV storage** — network state is saved to internal flash (last 8 KB) and automatically
 > restored on power-up. No re-pairing after power cycles!
@@ -135,9 +138,12 @@ python3 -m pip install bflb-mcu-tool==1.10.0 pyserial
 This builds a pure-Rust XT-ZB1 sleepy Zigbee sensor with live
 ACAL/KCAL/ROSCAL/RCCAL, polling RX/TX, CCA, and energy detection. No Bouffalo
 archive is linked. Direct RF operation, joining, ZHA interview, Trust Center
-link-key exchange, and attribute reporting are hardware-tested. Temperature,
-humidity, and battery values remain synthetic until BL702 I2C and ADC drivers
-are added.
+link-key exchange, and attribute reporting are hardware-tested. Temperature
+and humidity remain synthetic. Battery reporting now samples the nominal
+internal VBAT/2 GPADC path, with an explicit synthetic fallback if conversion
+fails. The reusable BL702 HAL also provides I2C, SPI, GPIO, PWM, UART, timer,
+eFuse, and XIP flash, but the new sensor/flash paths still need silicon
+validation and application integration.
 
 ### CC2340 firmware
 
@@ -164,6 +170,8 @@ The CC2340 host driver is Rust and does not link RCL or ZBOSS. A build without
 
 > The TLSR8258 radio driver uses pure-Rust register access. For real tc32
 > firmware, use the [modern-tc32](https://github.com/modern-tc32) toolchain.
+> The HAL also exposes typed single-owner I2C, SPI, PWM, GPIO, ADC, flash,
+> timer, and power-management APIs.
 > Hardware bring-up diagnostics live separately in
 > `tools/telink-tlsr8258-lab`.
 
@@ -236,6 +244,20 @@ radio operation state machine.
 The TLSR8258 radio driver uses pure-Rust register access — no `libdrivers_8258.a` required.
 
 > **PHY6222**, **TLSR8258**, **EFR32MG1**, **EFR32MG21**, and **nRF52840/52833** and **ESP32-C6/H2** do **not** need any vendor libraries.
+
+## Peripheral HALs
+
+| Platform | Reusable peripherals | Validation boundary |
+|----------|----------------------|---------------------|
+| **BL702** | GPIO, I2C0, SPI0, GPADC/VBAT, PWM, UART0/1, timer, eFuse, XIP flash | UART, timer, eFuse, and radio paths hardware-proven; new GPIO/I2C/SPI/ADC/PWM/flash paths host-tested and RV32IMC-compiled, not yet silicon-tested |
+| **TLSR8258** | GPIO, I2C, SPI, ADC, PWM, flash, timers, retention PM | Existing GPIO/ADC/flash/PM paths hardware-proven; new I2C/SPI/PWM paths host-tested and TC32-compiled, not yet silicon-tested |
+| **EFR32MG1** | GPIO, I2C, SPI, ADC, PWM, flash, RTCC, bootloader storage | Board peripheral paths hardware-proven except the limitations called out below |
+
+BL702 and TLSR8258 stateful bus/PWM constructors consume unique peripheral
+tokens. TLSR8258 I2C and SPI intentionally consume the same serial-controller
+token and non-`Clone` route pins because those functions overlap in hardware.
+Their board crates preserve exclusive ownership even when an application
+leaves a peripheral unused.
 
 ## MAC Backends
 
@@ -316,6 +338,17 @@ zigbee-rs/
 ├── zigbee-zcl/                # Zigbee Cluster Library (45 clusters)
 ├── zigbee-runtime/            # Device builder, power, NV storage
 ├── zigbee/                    # Top-level: coordinator, router
+├── bl702-hal/                 # BL702 GPIO, buses, ADC, PWM, flash, clocks
+├── tlsr8258-hal/              # TLSR8258 radio and reusable peripheral HAL
+├── boards/
+│   ├── bl702-xt-zb1/          # XT-ZB1 wiring and ownership tokens
+│   └── tlsr8258-tb04/         # TB-04 wiring, LEDs, flash and pin ownership
+├── products/
+│   ├── bl702-xt-zb1/          # XT-ZB1 storage and linker policy
+│   ├── efr32mg1-tradfri/      # TRADFRI sensor profile, storage, linker policy
+│   ├── esp32-zigbee-devkit/   # ESP32 product profiles and partitions
+│   ├── nrf52840-sensor/       # nRF52840 profile, storage, linker policy
+│   └── tlsr8258-tb04/         # TB-04 storage and linker policy
 ├── drivers/                   # Transport-independent sensor drivers (blocking + async)
 │   ├── sht3x/                 # Sensirion SHT3x temperature + humidity
 │   ├── sht4x/                 # Sensirion SHT4x temperature + humidity
@@ -338,7 +371,7 @@ zigbee-rs/
 │   ├── bl702-sensor/          # XT-ZB1 pure-Rust Zigbee sensor
 │   ├── cc2340-sensor/         # TI CC2340R5 (SDK-backed compile, hardware pending)
 │   ├── telink-tlsr8258-sensor/# Telink TLSR8258 polling end-device sensor
-│   ├── telink-tlsr8258-router/# Telink TLSR8258 join/relay router
+│   ├── telink-tlsr8258-router/# Telink TLSR8258 parent router
 │   ├── phy6222-sensor/        # PHY6222 — pure Rust, no vendor SDK!
 │   ├── efr32mg1-sensor/       # EFR32MG1P — pure Rust, Series 1 Cortex-M4F!
 │   └── efr32mg21-sensor/      # EFR32MG21 — pure Rust, Series 2 Cortex-M33!
@@ -375,7 +408,8 @@ The following hardware has been tested end-to-end with **Home Assistant + ZHA**:
 | **nRF52840-DK** (PCA10056) | ZHA (via zigpy) | ✅ Prior baseline verified | Flash NV, Identify LED blink, BME280/SHT31 optional; current product/profile refactor awaits hardware revalidation |
 | **ESP32-C6-DevKitC-1** | ZHA (via zigpy) | ✅ Prior baseline verified | Temperature, Humidity, Battery and flash NV proven; current product/profile refactor and real OTA upgrade await hardware validation |
 | **ESP32-H2-DevKitM-1** | ZHA (via zigpy) | ✅ Current refactor verified | Legacy NV migrated atomically to the security journal; reset/resume, reporting, TSENS, interview, and Identify verified on hardware. OTA absent. |
-| **TLSR8258** | Home Assistant ZHA / Ember | ✅ End-device path verified | Join, TCLK exchange, interview, reporting, reset resume, and crash-safe counter persistence |
+| **BL702 XT-ZB1** | Home Assistant ZHA / Ember | ✅ End-device path verified | Pure-Rust RF calibration, join, TCLK exchange, interview, Identify, and reporting; temperature/humidity currently synthetic |
+| **TLSR8258** | Home Assistant ZHA / Ember | ✅ End-device and router paths verified | Join, TCLK exchange, interview, reporting, routed-frame relay, silent reset resume, and crash-safe counter persistence; child polling remains gated |
 | **EFR32MG1P TRÅDFRI** | Home Assistant ZHA / Ember | ✅ End-device path verified | Pure-Rust radio, SHT3x reporting, crash-safe journal rollover, reset resume, and secure rejoin |
 
 All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling** (auto-erase NV + rejoin), and **default reporting configuration** (so devices report data even before the coordinator sends ConfigureReporting).
@@ -385,7 +419,17 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
 - **CC2340** has Rust LRFD bring-up and polling raw TX/RX, but no target has
   been connected yet. CCA, IRQ-driven completion, hardware address filtering,
   auto-ACK, temperature compensation, and a real Embassy time driver remain.
-- **Telink TLSR8258** production examples are split by role. The sensor is a polling end device, not yet a retention SED; the router joins and relays but does not admit children. Real tc32 firmware requires the [modern-tc32](https://github.com/modern-tc32) toolchain.
+- **BL702** now has product-owned crash-safe network/security persistence in
+  the final 8 KiB of the XT-ZB1's 1 MiB flash. The integration compiles and is
+  covered by host tests, but erase/program and reset-resume still require
+  hardware validation. Retention sleep is not implemented. The new
+  I2C/SPI/ADC/PWM paths also still require hardware validation.
+- **Telink TLSR8258** production examples are split by role. The sensor is a
+  polling end device, not yet a retention SED. The router's parent path is
+  software-complete, but software-ACK turnaround, Frame Pending timing, and
+  indirect delivery still need a real-device sniffer gate. Child and route
+  tables remain RAM-only across reboot. Real tc32 firmware requires the
+  [modern-tc32](https://github.com/modern-tc32) toolchain.
 - **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence; temp/humidity sensors are simulated (battery ADC is real); comprehensive power management is implemented (two-tier sleep with AON system sleep ~3 µA, radio sleep/wake, flash deep power-down, GPIO leak prevention)
 - **EFR32MG1** is hardware-proven for an always-on end device, but EM2 sleep, wake-time radio restoration, battery ADC, and long-duration stability remain.
 - **EFR32MG21** still uses an unverified pure-Rust radio initialization path and needs independent hardware validation.

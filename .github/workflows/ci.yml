@@ -59,7 +59,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path bl702-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/bl702-xt-zb1/Cargo.toml -- --check
+          cargo fmt --manifest-path products/bl702-xt-zb1/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/bl702-sensor/Cargo.toml -- --check
 
   doc:
     name: Doc
@@ -268,10 +273,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: riscv32imc-unknown-none-elf
-          components: rust-src, llvm-tools
+          components: rust-src, llvm-tools, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: examples/bl702-sensor
+          workspaces: |
+            bl702-hal
+            boards/bl702-xt-zb1
+            products/bl702-xt-zb1
+            examples/bl702-sensor
+      - name: Test and lint BL702 platform crates
+        run: |
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo test --manifest-path bl702-hal/Cargo.toml --target "$HOST_TARGET"
+          cargo test --manifest-path boards/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET"
+          cargo test --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET"
+          cargo clippy --manifest-path bl702-hal/Cargo.toml --target "$HOST_TARGET" -- -D warnings
+          cargo clippy --manifest-path boards/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" -- -D warnings
+          cargo clippy --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" -- -D warnings
+          cargo clippy --manifest-path bl702-hal/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
+          cargo clippy --manifest-path boards/bl702-xt-zb1/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
+          cargo clippy --manifest-path products/bl702-xt-zb1/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
       - name: Build BL702 sensor (release)
         working-directory: examples/bl702-sensor
         run: cargo build --release
@@ -280,6 +301,19 @@ jobs:
       - name: Create firmware artifacts
         working-directory: examples/bl702-sensor
         run: ./build-image.sh
+      - name: Check BL702 firmware purity
+        run: |
+          ELF=examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor
+          OBJDUMP=$(find "$(rustc --print sysroot)" -name llvm-objdump -print -quit)
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          if "$OBJDUMP" -d "$ELF" | grep -Eq '[[:space:]](amo[a-z.]*|lr\.[wd]|sc\.[wd])[[:space:]]'; then
+            echo "BL702 image contains unsupported RV32A instructions" >&2
+            exit 1
+          fi
+          if "$NM" "$ELF" | grep -Eq '(lmac154_|AON_Power_On_XTAL|GLB_Set_System_CLK|RF_SetZigbee)'; then
+            echo "BL702 image contains a vendor radio symbol" >&2
+            exit 1
+          fi
       - name: Upload BL702 sensor
         uses: actions/upload-artifact@v4
         with:

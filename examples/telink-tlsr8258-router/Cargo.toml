@@ -13,6 +13,7 @@ zigbee-runtime = { path = "../../zigbee-runtime", features = ["router"] }
 tlsr8258-hal = { path = "../../tlsr8258-hal" }
 tlsr8258-rt = { path = "../../tlsr8258-rt" }
 tlsr8258-tb04 = { path = "../../boards/tlsr8258-tb04" }
+tlsr8258-tb04-product = { path = "../../products/tlsr8258-tb04" }
 
 [profile.release]
 opt-level = "s"

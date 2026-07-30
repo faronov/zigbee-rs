@@ -342,9 +342,9 @@ pub fn set_irq_mask_rx_only() {
 
 /// Full radio init: reset, PHY config, DMA, channel 11. Mirrors
 /// `examples/telink-tlsr8258-sensor::radio::init`, minus the CPU-side
-/// `REG_IRQ_EN`/`REG_IRQ_MASK` enable at the end — this firmware runs fully
-/// polled, so the CPU IRQ line for RF/DMA is never unmasked (see
-/// `platform::vectors` and `mac_test`).
+/// `REG_IRQ_EN`/`REG_IRQ_MASK` enable at the end. The end-device path remains
+/// fully polled; the parent path enables those CPU sources only after
+/// continuous RX is armed.
 #[inline(never)]
 #[unsafe(link_section = ".ram_code")]
 pub fn init(rx_buf: *mut u8) {

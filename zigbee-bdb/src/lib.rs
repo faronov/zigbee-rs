@@ -132,6 +132,13 @@ pub enum KeyFrameResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SteeringDiagnostics {
     pub stage: SteeringStage,
+    pub attempt_started_us: u32,
+    pub association_complete_us: u32,
+    pub transport_key_received_us: u32,
+    pub security_reserved_us: u32,
+    pub device_annce_sent_us: u32,
+    pub network_up_us: u32,
+    pub tclk_complete_us: u32,
     pub scan_requests: u16,
     pub networks_discovered: u16,
     pub permit_closed_rejects: u16,
@@ -154,6 +161,8 @@ pub struct SteeringDiagnostics {
     pub nwk_security: bool,
     pub key_frame_result: KeyFrameResult,
     pub transport_key_received: bool,
+    pub device_annce_attempts: u8,
+    pub device_annce_failures: u8,
     pub verify_key_attempts: u16,
     pub verify_key_successes: u16,
     pub verify_key_error: u8,
@@ -174,6 +183,15 @@ pub struct SteeringDiagnostics {
     pub confirm_key_successes: u32,
     pub confirm_key_rejections: u32,
     pub last_confirm_key_status: u8,
+}
+
+impl SteeringDiagnostics {
+    /// `true` when steering stopped after every `Device_annce` attempt failed.
+    pub const fn device_annce_exhausted(&self) -> bool {
+        matches!(self.stage, SteeringStage::Announcing)
+            && self.device_annce_attempts != 0
+            && self.device_annce_attempts == self.device_annce_failures
+    }
 }
 
 // ── BDB layer ───────────────────────────────────────────────

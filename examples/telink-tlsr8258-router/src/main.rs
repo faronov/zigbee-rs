@@ -1,6 +1,7 @@
-//! Production TLSR8258 join/relay router entry point.
+//! Production TLSR8258 parent-router entry point.
 //!
-//! The current router does not admit children or implement indirect queues.
+//! Parent timing and Frame Pending behavior still require a hardware sniffer
+//! gate before interoperability is claimed.
 
 #![no_std]
 #![no_main]
@@ -19,7 +20,10 @@ fn panic_handler(_info: &core::panic::PanicInfo) -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn irq_handler() {}
+#[unsafe(link_section = ".ram_code")]
+pub extern "C" fn irq_handler() {
+    tlsr8258_hal::radio::handle_irq();
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _rust_entry() -> ! {

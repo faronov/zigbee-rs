@@ -68,7 +68,7 @@ pub use platform::{PlatformServices, WrappingTickExtender};
 pub use primitives::*;
 pub use soft_mac::{AckResult, SoftMacCore};
 
-use zigbee_types::TxPower;
+use zigbee_types::{MacAddress, TxPower};
 
 // ── Error types ─────────────────────────────────────────────────
 
@@ -143,11 +143,19 @@ pub trait MacDriver: PlatformServices {
 
     /// MLME-ASSOCIATE.response — respond to an association indication.
     ///
-    /// Only needed for Coordinator/Router roles. Sends the association
-    /// response (with assigned short address or denial) back to the
-    /// requesting device.
+    /// Only needed for Coordinator/Router roles. Retains the response as a
+    /// bounded indirect transaction, sets ACK Frame Pending for the joining
+    /// EUI-64, and transmits only after that device sends a matching extended
+    /// address Data Request. `Ok(())` confirms queueing, not over-air delivery.
     async fn mlme_associate_response(&mut self, rsp: MlmeAssociateResponse)
     -> Result<(), MacError>;
+
+    /// Transmit an on-demand beacon after a Beacon Request.
+    ///
+    /// Backends that cannot act as a parent retain an unsupported default.
+    async fn mlme_beacon_response(&mut self, _rsp: MlmeBeaconResponse) -> Result<(), MacError> {
+        Err(MacError::Unsupported)
+    }
 
     /// MLME-DISASSOCIATE.request — leave the PAN.
     async fn mlme_disassociate(&mut self, req: MlmeDisassociateRequest) -> Result<(), MacError>;
@@ -214,6 +222,52 @@ pub trait MacDriver: PlatformServices {
         &mut self,
         timeout_us: u32,
     ) -> Result<McpsDataIndication, MacError>;
+
+    /// Configure whether ACKs to Data Requests from `child` carry the Frame
+    /// Pending bit.
+    ///
+    /// The caller owns the indirect transaction queue and must arm this
+    /// before the child polls, then clear it after its last queued transaction
+    /// is dequeued. Implementations must bound the remembered child set.
+    fn set_indirect_data_pending(
+        &mut self,
+        _child: MacAddress,
+        _pending: bool,
+    ) -> Result<(), MacError> {
+        Err(MacError::Unsupported)
+    }
+
+    /// Transmit one indirect transaction already dequeued by the upper layer.
+    ///
+    /// This is called only after a matching Data Request event. It does not
+    /// transfer queue ownership to the backend.
+    async fn mcps_indirect_data(
+        &mut self,
+        _req: McpsDataRequest<'_>,
+    ) -> Result<McpsDataConfirm, MacError> {
+        Err(MacError::Unsupported)
+    }
+
+    // ── MAC management/command events ─────────────────────
+
+    /// Receive the next MAC command event independently of MCPS data.
+    ///
+    /// Backends that do not expose command frames retain their existing
+    /// behavior through this default no-event implementation.
+    async fn mac_command_event(&mut self) -> Result<MacCommandEvent, MacError> {
+        Err(MacError::NoData)
+    }
+
+    /// Receive a MAC command event before `timeout_us` expires.
+    ///
+    /// Implementations must retain any normal data frame observed while
+    /// waiting so it remains available through `mcps_data_indication`.
+    async fn mac_command_event_timeout(
+        &mut self,
+        _timeout_us: u32,
+    ) -> Result<MacCommandEvent, MacError> {
+        self.mac_command_event().await
+    }
 
     // ── Capability queries ──────────────────────────────────
 

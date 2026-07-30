@@ -288,7 +288,7 @@ pub enum FirmwareError {
 | ESP32-H2 | — | — | Not implemented; product intentionally omits OTA |
 | Mock | `zigbee_runtime::firmware_writer::MockFirmwareWriter` | RAM buffer (`heapless::Vec<u8, 262144>`) | For host testing — 256 KB max |
 | nRF52840 | — | Secondary flash bank via NVMC | Not implemented |
-| BL702 | — | XIP flash; no Rust flash driver yet | Not implemented |
+| BL702 | — | `bl702-hal` mask-ROM XIP flash; no OTA partition/writer | Raw driver implemented and target-compiled; destructive silicon validation and OTA integration pending |
 
 > Only the platforms marked *Implemented* have a `FirmwareWriter`; the others
 > are design sketches for future backends.

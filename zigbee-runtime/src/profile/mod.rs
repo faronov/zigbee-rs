@@ -18,6 +18,8 @@
 //!   optional battery.
 //! - [`plant_sensor::PlantSensor`] — soil moisture + temperature + illuminance,
 //!   optional battery.
+//! - [`range_extender::RangeExtender`] — Basic + Identify for a router-only
+//!   Home Automation range extender.
 //! - [`smart_plug::SmartPlug`] — On/Off + electrical measurement, optional
 //!   metering.
 //!
@@ -29,12 +31,14 @@
 pub mod air_quality;
 pub mod occupancy_light;
 pub mod plant_sensor;
+pub mod range_extender;
 pub mod smart_plug;
 pub mod thermostat;
 
 pub use air_quality::{AirQuality, AirQualityMeasurement, AirQualityReporting};
 pub use occupancy_light::{OccupancyLight, OccupancyLightMeasurement, OccupancyLightReporting};
 pub use plant_sensor::{PlantSensor, PlantSensorMeasurement, PlantSensorReporting};
+pub use range_extender::RangeExtender;
 pub use smart_plug::{ElectricalReading, SmartPlug, SmartPlugReporting};
 pub use thermostat::{Thermostat, ThermostatReporting};
 

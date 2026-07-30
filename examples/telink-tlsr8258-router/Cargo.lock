@@ -55,6 +55,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-hal"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
+
+[[package]]
 name = "embedded-storage"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -123,6 +129,7 @@ dependencies = [
  "tlsr8258-hal",
  "tlsr8258-rt",
  "tlsr8258-tb04",
+ "tlsr8258-tb04-product",
  "zigbee-aps",
  "zigbee-mac",
  "zigbee-nwk",
@@ -135,6 +142,7 @@ dependencies = [
 name = "tlsr8258-hal"
 version = "0.1.0"
 dependencies = [
+ "embedded-hal",
  "embedded-storage",
 ]
 
@@ -146,8 +154,16 @@ version = "0.1.0"
 name = "tlsr8258-tb04"
 version = "0.1.0"
 dependencies = [
+ "tlsr8258-hal",
+]
+
+[[package]]
+name = "tlsr8258-tb04-product"
+version = "0.1.0"
+dependencies = [
  "embedded-storage",
  "tlsr8258-hal",
+ "tlsr8258-tb04",
  "zigbee-runtime",
 ]
 

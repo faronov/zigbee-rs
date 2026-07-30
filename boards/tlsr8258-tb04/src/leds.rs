@@ -1,31 +1,46 @@
-use tlsr8258_hal::gpio::{self, GpioError, Pin, Port};
+use tlsr8258_hal::gpio::{self, GpioError, Pin};
 
-#[derive(Clone, Copy)]
 pub struct Led(Pin);
 
 impl Led {
-    const fn new(port: Port, bit: u8) -> Self {
-        Self(Pin::new(port, bit))
+    pub(crate) const fn new(pin: Pin) -> Self {
+        Self(pin)
     }
 
-    fn configure_output(self, high: bool) -> Result<(), GpioError> {
-        gpio::set_function_gpio(self.0);
-        gpio::write(self.0, high);
-        gpio::set_output_enable(self.0, true);
-        gpio::set_input_enable(self.0, false)
+    #[cfg(target_arch = "tc32")]
+    fn configure_output(&self, high: bool) -> Result<(), GpioError> {
+        gpio::set_function_gpio(&self.0);
+        gpio::write(&self.0, high);
+        gpio::set_output_enable(&self.0, true);
+        gpio::set_input_enable(&self.0, false)
     }
 
-    pub fn write(self, high: bool) {
-        gpio::write(self.0, high);
+    #[cfg(target_arch = "tc32")]
+    pub fn write(&self, high: bool) {
+        gpio::write(&self.0, high);
     }
 }
 
-pub const LED_RED: Led = Led::new(Port::C, 1);
-pub const LED_GREEN: Led = Led::new(Port::B, 5);
-pub const LED_BLUE: Led = Led::new(Port::C, 4);
+/// Exclusively-owned view of the three fitted TB-04 status LEDs.
+pub struct StatusLeds {
+    pub red: Led,
+    pub green: Led,
+    pub blue: Led,
+}
 
-pub fn configure_status_leds() -> Result<(), GpioError> {
-    LED_RED.configure_output(true)?;
-    LED_GREEN.configure_output(false)?;
-    LED_BLUE.configure_output(false)
+impl StatusLeds {
+    pub(crate) const fn new(red: Pin, green: Pin, blue: Pin) -> Self {
+        Self {
+            red: Led::new(red),
+            green: Led::new(green),
+            blue: Led::new(blue),
+        }
+    }
+
+    #[cfg(target_arch = "tc32")]
+    pub fn init(&self) -> Result<(), GpioError> {
+        self.red.configure_output(true)?;
+        self.green.configure_output(false)?;
+        self.blue.configure_output(false)
+    }
 }

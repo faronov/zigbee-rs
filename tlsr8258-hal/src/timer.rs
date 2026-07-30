@@ -32,9 +32,9 @@ pub fn now_ticks() -> u32 {
 /// `u32::MAX` — fine for the millisecond-scale windows used here). Returns
 /// `true` if `condition` became true, `false` on timeout.
 ///
-/// This is a *bounded busy-wait*: IRQs are intentionally left disabled (see
-/// `platform::vectors`), so there is nothing to block on except polling,
-/// and every call site must pass a finite, documented `timeout_ticks`.
+/// This is a *bounded busy-wait*. The always-on router may service RF RX from
+/// an interrupt between condition polls; every call site must still pass a
+/// finite, documented `timeout_ticks`.
 #[cfg(target_arch = "tc32")]
 pub fn wait_until(timeout_ticks: u32, mut condition: impl FnMut() -> bool) -> bool {
     let start = now_ticks();

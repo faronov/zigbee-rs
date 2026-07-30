@@ -135,6 +135,7 @@ pub fn run() -> ! {
                     msdu_handle: cycle as u8,
                     tx_options: TxOptions {
                         ack_tx: true,
+                        frame_pending: false,
                         indirect: false,
                         security_enabled: false,
                     },

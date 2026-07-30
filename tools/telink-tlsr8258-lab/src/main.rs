@@ -2116,9 +2116,13 @@ impl Tlsr8258Mac {
         dst_address: &zigbee_types::MacAddress,
         payload: &[u8],
         ack_request: bool,
+        frame_pending: bool,
     ) -> Result<heapless::Vec<u8, 127>, MacError> {
         let mut frame = heapless::Vec::new();
         let mut fc: u16 = 0x0001;
+        if frame_pending {
+            fc |= 0x0010;
+        }
         if ack_request {
             fc |= 0x0020;
         }
@@ -2953,7 +2957,12 @@ impl MacDriver for Tlsr8258Mac {
                 p0 | (p1 << 8) | (p2 << 16) | (p3 << 24),
             );
         }
-        let frame = self.build_data_frame(&req.dst_address, req.payload, req.tx_options.ack_tx)?;
+        let frame = self.build_data_frame(
+            &req.dst_address,
+            req.payload,
+            req.tx_options.ack_tx,
+            req.tx_options.frame_pending,
+        )?;
         self.csma_transmit(&frame, req.tx_options.ack_tx)?;
         // Success counter
         unsafe {
@@ -4783,6 +4792,7 @@ fn send_verify_key_aps(
         &MacAddress::Short(mac.pan_id, next_hop),
         &frame_buf[..total],
         true,
+        false,
     )?;
 
     bump_marker(DBG_MODE_BASE + 0x108);
@@ -4922,6 +4932,7 @@ async fn send_device_annce(
         msdu_handle: *aps_seq,
         tx_options: zigbee_mac::primitives::TxOptions {
             ack_tx: next_hop.0 != 0xFFFF,
+            frame_pending: false,
             indirect: false,
             security_enabled: false,
         },
@@ -5009,6 +5020,7 @@ async fn send_network_key_request(
         msdu_handle: *aps_seq,
         tx_options: zigbee_mac::primitives::TxOptions {
             ack_tx: true,
+            frame_pending: false,
             indirect: false,
             security_enabled: false,
         },
@@ -5126,6 +5138,7 @@ fn send_zdo_response_raw(
         &MacAddress::Short(mac.pan_id, next_hop),
         &payload[..total],
         true,
+        false,
     )?;
     mac.csma_transmit(&frame, true)?;
 
@@ -5238,6 +5251,7 @@ fn send_aps_ack_raw(
         &MacAddress::Short(mac.pan_id, next_hop),
         &payload[..total],
         true,
+        false,
     )?;
     mac.csma_transmit(&frame, false)?;
     Ok(())
@@ -5947,7 +5961,11 @@ fn handle_sensor_frame(
             sec_hdr.key_seq_number as u32 | ((sec_hdr.frame_counter & 0x00FF_FFFF) << 8),
         );
         if let Some(key_entry) = nwk_security.key_by_seq(sec_hdr.key_seq_number).cloned() {
-            if !nwk_security.check_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter) {
+            if !nwk_security.check_frame_counter_for_key(
+                &sec_hdr.source_address,
+                sec_hdr.key_seq_number,
+                sec_hdr.frame_counter,
+            ) {
                 mark32(DBG_MODE_BASE + 0x6C, 0x53E5AA06);
                 return false;
             }
@@ -5971,7 +5989,11 @@ fn handle_sensor_frame(
                 mark32(DBG_MODE_BASE + 0x6C, 0x53E5AA09);
                 return false;
             };
-            nwk_security.commit_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter);
+            nwk_security.commit_frame_counter_for_key(
+                &sec_hdr.source_address,
+                sec_hdr.key_seq_number,
+                sec_hdr.frame_counter,
+            );
             decrypted = plain;
             mark_bytes_as_words(DBG_MODE_BASE + 0x100, decrypted.as_slice());
             mark32(DBG_MODE_BASE + 0x6C, 0x53E5C001);

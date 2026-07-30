@@ -175,6 +175,12 @@ pub const MAX_ROUTE_DISCOVERIES: usize = 8;
 #[cfg(not(feature = "router"))]
 pub const MAX_ROUTE_DISCOVERIES: usize = 0;
 
+/// `nwkRouteDiscoveryTime` (spec default 10 s) expressed in microseconds.
+///
+/// A discovery older than this is failed so the destination becomes eligible
+/// for a fresh Route Request.
+pub const ROUTE_DISCOVERY_TIMEOUT_US: u32 = 10_000_000;
+
 /// Route table entry status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteStatus {
@@ -195,6 +201,8 @@ pub struct RouteEntry {
     pub many_to_one: bool,
     /// Whether a route record is required
     pub route_record_required: bool,
+    /// Low-RAM concentrators require a Route Record before every data frame.
+    pub route_record_every_frame: bool,
     /// Whether the destination is a group address
     pub group_id: bool,
     /// Path cost (sum of link costs along the route)
@@ -212,6 +220,7 @@ impl RouteEntry {
             status: RouteStatus::Inactive,
             many_to_one: false,
             route_record_required: false,
+            route_record_every_frame: false,
             group_id: false,
             path_cost: 0xFF,
             age: 0,
@@ -297,6 +306,7 @@ impl RoutingTable {
                 status: RouteStatus::Active,
                 many_to_one: false,
                 route_record_required: false,
+                route_record_every_frame: false,
                 group_id: false,
                 path_cost: cost,
                 age: 0,
@@ -317,6 +327,7 @@ impl RoutingTable {
                     status: RouteStatus::Active,
                     many_to_one: false,
                     route_record_required: false,
+                    route_record_every_frame: false,
                     group_id: false,
                     path_cost: cost,
                     age: 0,
@@ -369,6 +380,44 @@ impl RoutingTable {
         self.discoveries
             .iter()
             .find(|d| d.active && d.request_id == request_id)
+    }
+
+    /// Whether a route discovery for `destination` is still outstanding.
+    ///
+    /// Used to suppress repeated Route Requests while an earlier discovery
+    /// for the same destination is still within its timeout window.
+    pub fn has_active_discovery(&self, destination: ShortAddress) -> bool {
+        self.discoveries
+            .iter()
+            .any(|d| d.active && d.destination == destination)
+    }
+
+    /// Abandon a route discovery that never reached the air.
+    ///
+    /// Route discovery state is installed *before* the Route Request is
+    /// transmitted, so a burst of data requests for the same destination
+    /// cannot flood the mesh. When the transmission itself fails — no network
+    /// key, an exhausted frame-counter reservation, a MAC error — nothing was
+    /// broadcast, so the record must not keep suppressing the immediate retry
+    /// either. The route entry is left in [`RouteStatus::DiscoveryFailed`],
+    /// the same state [`RoutingTable::expire_discoveries`] leaves behind.
+    pub fn fail_discovery(&mut self, request_id: u8) {
+        let Some(disc) = self
+            .discoveries
+            .iter_mut()
+            .find(|d| d.active && d.request_id == request_id)
+        else {
+            return;
+        };
+        disc.active = false;
+        let destination = disc.destination;
+        if let Some(route) = self
+            .routes
+            .iter_mut()
+            .find(|r| r.destination == destination && r.status == RouteStatus::DiscoveryUnderway)
+        {
+            route.status = RouteStatus::DiscoveryFailed;
+        }
     }
 
     /// Complete a route discovery (remove from pending).
@@ -469,6 +518,7 @@ impl RoutingTable {
             entry.path_cost = cost;
             entry.status = RouteStatus::Active;
             entry.many_to_one = true;
+            entry.route_record_every_frame = rr_required;
             if rr_required {
                 entry.route_record_required = true;
             }
@@ -483,6 +533,7 @@ impl RoutingTable {
             status: RouteStatus::Active,
             many_to_one: true,
             route_record_required: true, // Always required on first install
+            route_record_every_frame: rr_required,
             group_id: false,
             path_cost: cost,
             age: 0,
@@ -508,12 +559,16 @@ impl RoutingTable {
         }
     }
 
-    /// Clear the route_record_required flag for a destination.
+    /// Clear a one-shot Route Record requirement after successful transmission.
+    ///
+    /// Low-RAM concentrators require a fresh Route Record before every data
+    /// frame, so their requirement remains armed.
     pub fn clear_route_record_required(&mut self, destination: ShortAddress) {
         if let Some(entry) = self
             .routes
             .iter_mut()
             .find(|r| r.active && r.destination == destination)
+            && !entry.route_record_every_frame
         {
             entry.route_record_required = false;
         }
@@ -562,24 +617,43 @@ impl RoutingTable {
 }
 
 /// CSkip value calculation for tree addressing.
-/// CSkip(d) = (1 + Cm - Rm - Cm * Rm^(Lm-d-1)) / (1 - Rm) for Rm != 1
+///
+/// Spec form: `CSkip(d) = (1 + Cm - Rm - Cm * Rm^(Lm-d-1)) / (1 - Rm)` for
+/// `Rm != 1`. Both the numerator and the denominator of that expression are
+/// negative, so it is evaluated here in the algebraically identical unsigned
+/// form `(Cm * Rm^(Lm-d-1) + Rm - Cm - 1) / (Rm - 1)`.
+///
+/// `Rm^(Lm-d-1)` overflows 32 bits for ordinary parameters (for example the
+/// NIB defaults `Rm = 5`, `Lm = 15`, `d = 0`), and the result may exceed the
+/// 16-bit address space. Every step is therefore checked, and a value that
+/// cannot be represented yields 0 — "no tree route from here", which makes
+/// [`RoutingTable::tree_route`] fall through to the parent instead of routing
+/// on a wrapped, meaningless CSkip.
 fn cskip_value(depth: u8, max_routers: u8, max_depth: u8) -> u16 {
     if depth >= max_depth {
         return 0;
     }
     let rm = max_routers as u32;
+    if rm == 0 {
+        return 0;
+    }
     if rm == 1 {
         return 1;
     }
     let cm = 20u32; // max_children default
     let remaining = max_depth as u32 - depth as u32 - 1;
-    let rm_pow = rm.pow(remaining);
-    let numerator = 1 + cm - rm - cm * rm_pow;
-    let denominator = 1u32.wrapping_sub(rm);
-    if denominator == 0 {
+    let Some(rm_pow) = rm.checked_pow(remaining) else {
         return 0;
-    }
-    (numerator / denominator) as u16
+    };
+    let Some(numerator) = cm
+        .checked_mul(rm_pow)
+        .and_then(|v| v.checked_add(rm))
+        .and_then(|v| v.checked_sub(cm + 1))
+    else {
+        return 0;
+    };
+    let cskip = numerator / (rm - 1);
+    u16::try_from(cskip).unwrap_or(0)
 }
 
 impl Default for RoutingTable {
@@ -681,6 +755,149 @@ impl BtrTable {
 }
 
 impl Default for BtrTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Route Request forwarding records ──────────────────────────
+
+/// Maximum route-request forwarding records.
+///
+/// One entry per (originator, route request ID) pair currently being
+/// propagated. Sized like the route discovery table: a router only has to
+/// remember the discoveries that are still inside their lifetime.
+#[cfg(feature = "router")]
+pub(crate) const MAX_RREQ_RECORDS: usize = 8;
+#[cfg(not(feature = "router"))]
+pub(crate) const MAX_RREQ_RECORDS: usize = 0;
+
+/// Lifetime of a route-request forwarding record, in seconds.
+///
+/// `nwkRouteDiscoveryTime` is 10 s; the record has to outlive the discovery it
+/// describes so a late duplicate of the *same* request cannot restart the
+/// propagation after the broadcast transaction record has already expired
+/// (BTR entries live 9 s).
+const RREQ_RECORD_LIFETIME_SECS: u8 = 12;
+
+/// A route request this device has already acted upon.
+///
+/// Keyed by the *original* NWK originator and the route request ID carried in
+/// the command payload — the pair that identifies one route discovery across
+/// every hop it is propagated over. The NWK sequence number cannot be used for
+/// this: a retry from the originator carries a fresh sequence number, so the
+/// broadcast transaction record no longer suppresses it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RreqRecord {
+    originator: ShortAddress,
+    route_request_id: u8,
+    /// Best (lowest) accumulated cost this request has arrived with.
+    forward_cost: u8,
+    expiry: u8,
+    active: bool,
+}
+
+impl RreqRecord {
+    const fn empty() -> Self {
+        Self {
+            originator: ShortAddress(0xFFFF),
+            route_request_id: 0,
+            forward_cost: 0xFF,
+            expiry: 0,
+            active: false,
+        }
+    }
+}
+
+/// Route request forwarding records — deduplicates route discoveries per
+/// (originator, route request ID) and keeps only strictly better paths.
+///
+/// Compiled to zero capacity without the `router` feature, where nothing may
+/// be forwarded in the first place.
+pub(crate) struct RreqRecordTable {
+    entries: [RreqRecord; MAX_RREQ_RECORDS],
+}
+
+impl RreqRecordTable {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: [RreqRecord::empty(); MAX_RREQ_RECORDS],
+        }
+    }
+
+    /// Decide whether a route request may be acted upon, recording it.
+    ///
+    /// Returns `true` for a request that has not been seen inside the record
+    /// lifetime, or one that arrived over a *strictly* better path than the
+    /// best previously recorded one. A repeat at equal or worse cost returns
+    /// `false`, so a copy that travelled the long way around can neither
+    /// overwrite an installed route, nor re-arm a reply, nor restart the
+    /// propagation — including after the originator retried with a fresh NWK
+    /// sequence number that the broadcast transaction record cannot catch.
+    pub(crate) fn admit(
+        &mut self,
+        originator: ShortAddress,
+        route_request_id: u8,
+        forward_cost: u8,
+    ) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|e| {
+            e.active && e.originator == originator && e.route_request_id == route_request_id
+        }) {
+            if forward_cost >= entry.forward_cost {
+                return false;
+            }
+            entry.forward_cost = forward_cost;
+            entry.expiry = RREQ_RECORD_LIFETIME_SECS;
+            return true;
+        }
+
+        let slot = match self.entries.iter_mut().find(|e| !e.active) {
+            Some(slot) => slot,
+            // Every record is live: evict the one closest to expiry rather
+            // than refusing to propagate. Yields `None` — and therefore no
+            // propagation at all — only in a zero-capacity build.
+            None => match self.entries.iter_mut().min_by_key(|e| e.expiry) {
+                Some(victim) => victim,
+                None => return false,
+            },
+        };
+        *slot = RreqRecord {
+            originator,
+            route_request_id,
+            forward_cost,
+            expiry: RREQ_RECORD_LIFETIME_SECS,
+            active: true,
+        };
+        true
+    }
+
+    /// Age entries. Call every second.
+    pub(crate) fn age(&mut self) {
+        for entry in self.entries.iter_mut().filter(|e| e.active) {
+            entry.expiry = entry.expiry.saturating_sub(1);
+            if entry.expiry == 0 {
+                entry.active = false;
+            }
+        }
+    }
+
+    /// Best cost recorded for a route request, while the record is still live.
+    #[cfg(all(test, feature = "router"))]
+    pub(crate) fn recorded_cost(
+        &self,
+        originator: ShortAddress,
+        route_request_id: u8,
+    ) -> Option<u8> {
+        self.entries
+            .iter()
+            .find(|e| {
+                e.active && e.originator == originator && e.route_request_id == route_request_id
+            })
+            .map(|e| e.forward_cost)
+    }
+}
+
+impl Default for RreqRecordTable {
     fn default() -> Self {
         Self::new()
     }

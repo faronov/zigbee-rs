@@ -53,7 +53,11 @@ pub struct MockMac {
 
     // Recorded calls for assertions
     tx_history: Vec<TxRecord, 16>,
+    beacon_responses: Vec<MlmeBeaconResponse, 8>,
+    association_responses: Vec<MlmeAssociateResponse, 8>,
+    indirect_pending_history: Vec<(MacAddress, bool), 16>,
     rx_queue: Vec<McpsDataIndication, 8>,
+    command_queue: Vec<MacCommandEvent, 8>,
     poll_count: u32,
     poll_delay_us: u32,
     time_micros: u32,
@@ -69,6 +73,8 @@ pub struct TxRecord {
     pub payload: MacFrame,
     pub handle: u8,
     pub ack_requested: bool,
+    pub frame_pending: bool,
+    pub indirect: bool,
 }
 
 impl MockMac {
@@ -104,7 +110,11 @@ impl MockMac {
             associate_response: None,
             poll_queue: Vec::new(),
             tx_history: Vec::new(),
+            beacon_responses: Vec::new(),
+            association_responses: Vec::new(),
+            indirect_pending_history: Vec::new(),
             rx_queue: Vec::new(),
+            command_queue: Vec::new(),
             poll_count: 0,
             poll_delay_us: 0,
             time_micros: 0,
@@ -133,6 +143,11 @@ impl MockMac {
     /// Enqueue a frame that will be delivered via mcps_data_indication.
     pub fn enqueue_rx(&mut self, ind: McpsDataIndication) {
         let _ = self.rx_queue.push(ind);
+    }
+
+    /// Enqueue a management/command event for `mac_command_event`.
+    pub fn enqueue_command_event(&mut self, event: MacCommandEvent) {
+        let _ = self.command_queue.push(event);
     }
 
     /// Set the simulated delay before the next direct data indication.
@@ -165,6 +180,22 @@ impl MockMac {
     /// Number of MLME-POLL requests issued.
     pub fn poll_count(&self) -> u32 {
         self.poll_count
+    }
+
+    pub fn beacon_responses(&self) -> &[MlmeBeaconResponse] {
+        &self.beacon_responses
+    }
+
+    pub fn association_responses(&self) -> &[MlmeAssociateResponse] {
+        &self.association_responses
+    }
+
+    pub fn indirect_pending_history(&self) -> &[(MacAddress, bool)] {
+        &self.indirect_pending_history
+    }
+
+    pub fn association_permit(&self) -> bool {
+        self.association_permit
     }
 }
 
@@ -260,9 +291,31 @@ impl MacDriver for MockMac {
 
     async fn mlme_associate_response(
         &mut self,
-        _rsp: MlmeAssociateResponse,
+        rsp: MlmeAssociateResponse,
     ) -> Result<(), MacError> {
-        // Mock: just accept
+        if self.association_responses.is_full() || self.command_queue.is_full() {
+            return Err(MacError::TransactionOverflow);
+        }
+        self.association_responses
+            .push(rsp.clone())
+            .map_err(|_| MacError::TransactionOverflow)?;
+        self.command_queue
+            .push(MacCommandEvent::AssociationResponseDelivery(
+                MlmeAssociateResponseDelivery {
+                    device_address: rsp.device_address,
+                    short_address: rsp.short_address,
+                    status: rsp.status,
+                    result: Ok(()),
+                },
+            ))
+            .map_err(|_| MacError::TransactionOverflow)?;
+        Ok(())
+    }
+
+    async fn mlme_beacon_response(&mut self, rsp: MlmeBeaconResponse) -> Result<(), MacError> {
+        self.beacon_responses
+            .push(rsp)
+            .map_err(|_| MacError::TransactionOverflow)?;
         Ok(())
     }
 
@@ -287,6 +340,10 @@ impl MacDriver for MockMac {
             self.dsn = 0;
         }
         self.tx_history.clear();
+        self.beacon_responses.clear();
+        self.association_responses.clear();
+        self.indirect_pending_history.clear();
+        self.command_queue.clear();
         Ok(())
     }
 
@@ -391,6 +448,8 @@ impl MacDriver for MockMac {
             payload,
             handle: req.msdu_handle,
             ack_requested: req.tx_options.ack_tx,
+            frame_pending: req.tx_options.frame_pending,
+            indirect: req.tx_options.indirect,
         };
         let _ = self.tx_history.push(record);
 
@@ -422,6 +481,34 @@ impl MacDriver for MockMac {
         self.time_micros = self.time_micros.wrapping_add(self.rx_delay_us);
         self.rx_delay_us = 0;
         self.mcps_data_indication().await
+    }
+
+    async fn mac_command_event(&mut self) -> Result<MacCommandEvent, MacError> {
+        if self.command_queue.is_empty() {
+            Err(MacError::NoData)
+        } else {
+            Ok(self.command_queue.remove(0))
+        }
+    }
+
+    fn set_indirect_data_pending(
+        &mut self,
+        child: MacAddress,
+        pending: bool,
+    ) -> Result<(), MacError> {
+        self.indirect_pending_history
+            .push((child, pending))
+            .map_err(|_| MacError::TransactionOverflow)
+    }
+
+    async fn mcps_indirect_data(
+        &mut self,
+        req: McpsDataRequest<'_>,
+    ) -> Result<McpsDataConfirm, MacError> {
+        if !req.tx_options.indirect {
+            return Err(MacError::InvalidParameter);
+        }
+        self.mcps_data(req).await
     }
 
     fn capabilities(&self) -> MacCapabilities {

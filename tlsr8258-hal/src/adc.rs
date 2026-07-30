@@ -168,7 +168,8 @@ impl From<super::mmio::AnalogError> for AdcError {
 fn gpio_to_adc_error(error: super::gpio::GpioError) -> AdcError {
     match error {
         super::gpio::GpioError::Analog(analog) => AdcError::Analog(analog),
-        super::gpio::GpioError::PullNotSupportedOnPort => AdcError::UnsupportedPin,
+        super::gpio::GpioError::PullNotSupportedOnPort
+        | super::gpio::GpioError::UnsupportedFunction => AdcError::UnsupportedPin,
     }
 }
 
@@ -370,7 +371,7 @@ pub fn init() -> Result<(), AdcError> {
 /// board is exactly the kind of board-specific wiring this crate cannot
 /// verify, so the choice is left explicit rather than defaulted).
 #[cfg(target_arch = "tc32")]
-pub fn configure_gpio_channel(pin: Pin, drive_high: bool) -> Result<(), AdcError> {
+pub fn configure_gpio_channel(pin: &Pin, drive_high: bool) -> Result<(), AdcError> {
     let (port, bit) = pin.port_and_bit();
     let channel = ain_positive_channel(port, bit).ok_or(AdcError::UnsupportedPin)?;
 

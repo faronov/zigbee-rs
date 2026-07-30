@@ -327,22 +327,27 @@ closes.
 
 ## Current Implementation Status
 
-The coordinator, router, and trust center modules provide the **data structures
-and core logic** for network management. The following is the current state:
+The coordinator, router, and Trust Center modules provide the data structures
+and core logic for network management. The shared router path is integrated
+with `zigbee-runtime`. TLSR8258 join, durable restart, Link Status, and NWK
+relay are hardware-verified; child polling timing still requires validation.
 
 | Feature | Status |
 |---------|--------|
 | Coordinator config and state | ✅ Implemented |
 | Network key generation | ✅ Placeholder (needs hardware RNG) |
-| Address allocation (stochastic) | ✅ Sequential (needs random + conflict check) |
+| Address allocation (stochastic) | ✅ Hash-based, reserved-address filtering and collision checks |
 | Trust Center link key table | ✅ Implemented (32 entries) |
 | Install code derivation (MMO hash) | ⚠️ Structural placeholder |
-| Router child management | ✅ Implemented (32 children) |
-| Child aging and timeout | ✅ Implemented |
-| Route discovery (AODV) | ⚠️ Defined in `zigbee-nwk` routing module |
-| Link status messages | ⚠️ Config present, sending not yet wired |
-| Distributed security (TC-less) | ⚠️ Key defined, mode not fully supported |
+| Router child management | ✅ Provisional admission, authorization and rollback |
+| Child aging and timeout | ✅ Implemented, including indirect cleanup |
+| Route discovery (AODV) | ✅ Integrated with runtime forwarding |
+| Source routing / Route Record | ✅ Integrated with concentrator behavior |
+| Link status messages | ✅ Receive, maintenance and periodic sending |
+| Trust Center Update/Transport/Switch Key | ✅ APS security and Tunnel forwarding implemented |
+| Distributed security (TC-less) | ⚠️ Secured rejoin supported; full coordinator policy remains incomplete |
+| TLSR8258 router MAC | ✅ Join, silent restart, Link Status and NWK relay hardware-verified; child ACK/Frame Pending timing remains |
 
-> **Contributing:** The coordinator and router modules are a good place to
-> start contributing — they have clear APIs, well-defined behavior from the
-> Zigbee spec, and several `TODO` items for production hardening.
+> **Contributing:** Coordinator policy, install codes, long-duration routing
+> tests, and hardware interoperability remain useful production-hardening
+> areas.

@@ -14,9 +14,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bl702-hal"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-storage",
+ "riscv",
+]
+
+[[package]]
 name = "bl702-sensor"
 version = "0.1.0"
 dependencies = [
+ "bl702-hal",
+ "bl702-xt-zb1",
+ "bl702-xt-zb1-product",
  "embassy-executor",
  "embassy-time 0.5.1",
  "embassy-time-driver",
@@ -30,6 +42,23 @@ dependencies = [
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zcl",
+]
+
+[[package]]
+name = "bl702-xt-zb1"
+version = "0.1.0"
+dependencies = [
+ "bl702-hal",
+]
+
+[[package]]
+name = "bl702-xt-zb1-product"
+version = "0.1.0"
+dependencies = [
+ "bl702-hal",
+ "bl702-xt-zb1",
+ "embedded-storage",
+ "zigbee-runtime",
 ]
 
 [[package]]

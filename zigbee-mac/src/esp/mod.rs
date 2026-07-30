@@ -1220,6 +1220,9 @@ fn build_data_frame(
     req: &McpsDataRequest<'_>,
 ) -> Result<usize, MacError> {
     let mut fc: u16 = 0x0001; // Data frame
+    if req.tx_options.frame_pending {
+        fc |= 0x0010;
+    }
     if req.tx_options.ack_tx {
         fc |= 0x0020;
     }

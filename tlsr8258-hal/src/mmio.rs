@@ -20,8 +20,8 @@ pub const REG_TMR_STA: u32 = REG_BASE + 0x623;
 pub const REG_TMR0_CAPT: u32 = REG_BASE + 0x624;
 pub const REG_TMR0_TICK: u32 = REG_BASE + 0x630;
 
-// CPU IRQ (kept masked/disabled for this firmware — see `platform::vectors`
-// and `mac_test`; defined here only for completeness/documentation).
+// CPU IRQ. The sleepy-device path keeps these masked; the always-on router
+// enables only the RF/DMA receive sources while idle.
 pub const REG_IRQ_MASK: u32 = REG_BASE + 0x640;
 pub const REG_IRQ_SRC: u32 = REG_BASE + 0x648;
 pub const REG_IRQ_EN: u32 = REG_BASE + 0x643;

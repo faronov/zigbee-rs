@@ -61,7 +61,11 @@ pub mod templates;
 
 use zigbee_aps::ApsAddress;
 use zigbee_bdb::BdbLayer;
-use zigbee_mac::{MacDriver, MacError, McpsDataIndication};
+use zigbee_mac::pib::PibPayload;
+use zigbee_mac::{
+    AssociationStatus, CapabilityInfo, MacCommandEvent, MacDriver, MacError, McpsDataIndication,
+    MlmeAssociateResponse, MlmeBeaconResponse,
+};
 use zigbee_types::*;
 use zigbee_zcl::clusters::Cluster;
 use zigbee_zcl::clusters::basic::BasicCluster;
@@ -84,7 +88,6 @@ use crate::security_store::{
 /// the aliasing and false `Sync` guarantee of the previous global buffers.
 struct RuntimeScratch {
     nwk: core::cell::UnsafeCell<[u8; 128]>,
-    aad: core::cell::UnsafeCell<[u8; 64]>,
     aps: core::cell::UnsafeCell<zigbee_aps::apsde::ApsFrameBuffer>,
     zcl: core::cell::UnsafeCell<[u8; 253]>,
 }
@@ -93,7 +96,6 @@ impl RuntimeScratch {
     const fn new() -> Self {
         Self {
             nwk: core::cell::UnsafeCell::new([0; 128]),
-            aad: core::cell::UnsafeCell::new([0; 64]),
             aps: core::cell::UnsafeCell::new(zigbee_aps::apsde::ApsFrameBuffer {
                 data: [0; 128],
                 len: 0,
@@ -126,6 +128,7 @@ mod builder_cluster_tests {
 
     use super::{ClusterRef, ZigbeeDevice};
     use zigbee_mac::mock::MockMac;
+    use zigbee_nwk::DeviceType;
     use zigbee_types::ShortAddress;
     use zigbee_zcl::clusters::basic::{ATTR_MANUFACTURER_NAME, ATTR_POWER_SOURCE, PowerSource};
     use zigbee_zcl::clusters::identify::{CMD_IDENTIFY, CMD_TRIGGER_EFFECT};
@@ -219,6 +222,30 @@ mod builder_cluster_tests {
         assert!(matches!(result, Some(Ok(_))));
         assert!(!device.is_identifying(1));
         assert!(device.is_identifying(2));
+    }
+
+    #[test]
+    fn router_node_descriptor_reports_ffd_mains_and_receiver_on() {
+        let device = ZigbeeDevice::builder(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8]))
+            .device_type(DeviceType::Router)
+            .power_source(PowerSource::MainsSinglePhase)
+            .build();
+
+        assert_eq!(device.bdb().zdo().node_descriptor().mac_capabilities, 0x8E);
+    }
+
+    #[test]
+    fn sleepy_battery_end_device_does_not_claim_ffd_mains_or_idle_rx() {
+        let device = ZigbeeDevice::builder(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8]))
+            .device_type(DeviceType::EndDevice)
+            .power_mode(crate::power::PowerMode::Sleepy {
+                poll_interval_ms: 1_000,
+                wake_duration_ms: 100,
+            })
+            .power_source(PowerSource::Battery)
+            .build();
+
+        assert_eq!(device.bdb().zdo().node_descriptor().mac_capabilities, 0x80);
     }
 
     #[test]
@@ -485,6 +512,71 @@ mod resume_tests {
         assert_eq!(rebooted.pan_id(), 0x1234);
     }
 
+    #[test]
+    fn staged_network_key_rotation_survives_reboot_and_switch() {
+        const IEEE_ADDRESS: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
+        const FLOOR: u32 = 0x2400;
+        const NEXT_KEY: [u8; 16] = [0xDD; 16];
+
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.legacy_default_tclk = true;
+        state.extended_pan_id = [0xAA; 8];
+        state.pan_id = 0x1234;
+        state.short_address = 0x5678;
+        state.ieee_address = IEEE_ADDRESS;
+        state.channel = 15;
+        state.network_key = [0xCC; 16];
+        state.key_sequence = 3;
+        state.global_counter_limit = FLOOR;
+        state.tclk_counter_limit = FLOOR;
+
+        let mut store = RamSecurityStateStore::new();
+        store.store(&state).unwrap();
+        assert!(device.restore_security_state(&mut store).unwrap());
+
+        {
+            let nwk = device.bdb.zdo_mut().nwk_mut();
+            assert!(nwk.security_mut().stage_network_key(NEXT_KEY, 4));
+        }
+        assert!(device.refresh_security_state(&mut store).unwrap());
+        let staged = store.load().unwrap().unwrap();
+        assert_eq!(staged.network_key, [0xCC; 16]);
+        assert_eq!(staged.key_sequence, 3);
+        assert!(staged.staged_network_key_present);
+        assert_eq!(staged.staged_network_key, NEXT_KEY);
+        assert_eq!(staged.staged_key_sequence, 4);
+
+        let mut rebooted = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        assert!(rebooted.restore_security_state(&mut store).unwrap());
+        assert_eq!(
+            rebooted
+                .bdb
+                .zdo()
+                .nwk()
+                .security()
+                .staged_key()
+                .unwrap()
+                .key,
+            NEXT_KEY
+        );
+        {
+            let nwk = rebooted.bdb.zdo_mut().nwk_mut();
+            assert!(nwk.security_mut().activate_network_key(4));
+            nwk.nib_mut().active_key_seq_number = 4;
+        }
+        assert!(rebooted.refresh_security_state(&mut store).unwrap());
+        let switched = store.load().unwrap().unwrap();
+        assert_eq!(switched.network_key, NEXT_KEY);
+        assert_eq!(switched.key_sequence, 4);
+        assert!(!switched.staged_network_key_present);
+    }
+
     /// If the Trust Center later transports a unique link key to a migrated
     /// node, the APS layer installs it with an outgoing counter of zero and no
     /// reservation. That must become durable before it is used, and the
@@ -570,6 +662,44 @@ mod resume_tests {
         // validates as an ordinary commissioned network.
         assert!(!device.refresh_security_state(&mut store).unwrap());
         assert_eq!(adopted.validate(), Ok(()));
+
+        device
+            .bdb
+            .zdo_mut()
+            .aps_mut()
+            .security_mut()
+            .add_key(zigbee_aps::security::ApsLinkKeyEntry {
+                partner_address: TC_ADDRESS,
+                key: [0xEE; 16],
+                key_type: zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+                outgoing_frame_counter: 0,
+                outgoing_frame_counter_limit: u32::MAX,
+                incoming_frame_counter: 0,
+                incoming_frame_counter_valid: false,
+            })
+            .unwrap();
+        assert!(device.refresh_security_state(&mut store).unwrap());
+        let replaced = store.load().unwrap().unwrap();
+        assert_eq!(replaced.trust_center_link_key, [0xEE; 16]);
+        assert_eq!(
+            replaced.tclk_counter_limit,
+            adopted.tclk_counter_limit + RESERVATION
+        );
+        let live = device
+            .bdb
+            .zdo()
+            .aps()
+            .security()
+            .find_key(
+                &TC_ADDRESS,
+                zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+            )
+            .unwrap();
+        assert_eq!(live.outgoing_frame_counter, adopted.tclk_counter_limit);
+        assert_eq!(
+            live.outgoing_frame_counter_limit,
+            replaced.tclk_counter_limit
+        );
     }
 
     #[test]
@@ -593,7 +723,7 @@ mod resume_tests {
 
         assert!(
             device
-                .reset_security_state_if_identity_changed(&mut store)
+                .reset_security_state_if_identity_changed(&mut store, CURRENT_IEEE)
                 .unwrap()
         );
         let reset = store.load().unwrap().unwrap();
@@ -605,8 +735,513 @@ mod resume_tests {
         assert_eq!(reset.tclk_counter_limit, 0x1800);
         assert!(
             !device
-                .reset_security_state_if_identity_changed(&mut store)
+                .reset_security_state_if_identity_changed(&mut store, CURRENT_IEEE)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn matching_configured_identity_preserves_commissioned_state_before_start() {
+        const CURRENT_IEEE: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x99];
+
+        let mut device = ZigbeeDevice::builder(MockMac::new(CURRENT_IEEE))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.ieee_address = CURRENT_IEEE;
+        state.network_key = [0xA5; 16];
+        state.global_counter_limit = 0x2400;
+
+        let mut store = RamSecurityStateStore::new();
+        store.store(&state).unwrap();
+
+        assert!(
+            !device
+                .reset_security_state_if_identity_changed(&mut store, CURRENT_IEEE)
+                .unwrap()
+        );
+        assert_eq!(store.load().unwrap(), Some(state));
+    }
+
+    // ── Shared NWK receive path ──────────────────────────────
+
+    const IEEE_ADDRESS: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
+    const COORDINATOR_IEEE: [u8; 8] = [0x11; 8];
+    const NETWORK_KEY: [u8; 16] = [2; 16];
+    const KEY_SEQUENCE: u8 = 0;
+    const OUR_SHORT: u16 = 0x5678;
+    const COORDINATOR: ShortAddress = ShortAddress(0x0000);
+    const NEIGHBOUR: ShortAddress = ShortAddress(0x2222);
+
+    fn commissioned_state() -> PersistentSecurityState {
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.extended_pan_id = [1; 8];
+        state.pan_id = 0x1234;
+        state.short_address = OUR_SHORT;
+        state.ieee_address = IEEE_ADDRESS;
+        state.channel = 15;
+        state.depth = 1;
+        state.parent_address = COORDINATOR.0;
+        state.network_key = NETWORK_KEY;
+        state.key_sequence = KEY_SEQUENCE;
+        state.global_counter_limit = 0x400;
+        state.tclk_present = true;
+        state.trust_center_address = COORDINATOR_IEEE;
+        state.trust_center_link_key = [4; 16];
+        state.tclk_counter_limit = 0x400;
+        state
+    }
+
+    fn resumed_device(device_type: DeviceType) -> ZigbeeDevice<MockMac> {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(device_type)
+            .build();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+        device
+    }
+
+    #[test]
+    fn durable_router_resume_does_not_reannounce_or_rejoin() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::Router)
+            .build();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+
+        assert_eq!(
+            block_on(device.start_or_resume_with_security_store(&mut store)).unwrap(),
+            OUR_SHORT
+        );
+        assert!(device.mac().tx_history().is_empty());
+        assert!(device.is_joined());
+    }
+
+    /// Build the NWK frame a coordinator would put on air, secured with the
+    /// restored network key exactly like `nlde_data_request` does.
+    fn nwk_frame(
+        frame_type: zigbee_nwk::frames::NwkFrameType,
+        dst: ShortAddress,
+        payload: &[u8],
+        frame_counter: u32,
+        secured: bool,
+    ) -> zigbee_mac::MacFrame {
+        use zigbee_nwk::frames::{NwkFrameControl, NwkHeader};
+        use zigbee_nwk::security::{NwkSecurity, NwkSecurityHeader};
+
+        let header = NwkHeader {
+            frame_control: NwkFrameControl {
+                frame_type: frame_type as u8,
+                protocol_version: 0x02,
+                discover_route: 0,
+                multicast: false,
+                security: secured,
+                source_route: false,
+                dst_ieee_present: false,
+                src_ieee_present: false,
+                end_device_initiator: false,
+            },
+            dst_addr: dst,
+            src_addr: COORDINATOR,
+            radius: 5,
+            seq_number: frame_counter as u8,
+            dst_ieee: None,
+            src_ieee: None,
+            multicast_control: None,
+            source_route: None,
+        };
+
+        let mut buf = [0u8; 128];
+        let hdr_len = header.serialize(&mut buf);
+        let total = if secured {
+            let sec_hdr = NwkSecurityHeader {
+                security_control: NwkSecurityHeader::ZIGBEE_DEFAULT,
+                frame_counter,
+                source_address: COORDINATOR_IEEE,
+                key_seq_number: KEY_SEQUENCE,
+            };
+            let sec_len = sec_hdr.serialize(&mut buf[hdr_len..]);
+            let aad_len = hdr_len + sec_len;
+            let ciphertext = NwkSecurity::new()
+                .encrypt(&buf[..aad_len], payload, &NETWORK_KEY, &sec_hdr)
+                .expect("test frame encrypts");
+            buf[aad_len..aad_len + ciphertext.len()].copy_from_slice(&ciphertext);
+            // Zigbee transmits zero in the OTA security-level bits.
+            buf[hdr_len] &= !0x07;
+            aad_len + ciphertext.len()
+        } else {
+            buf[hdr_len..hdr_len + payload.len()].copy_from_slice(payload);
+            hdr_len + payload.len()
+        };
+
+        zigbee_mac::MacFrame::from_slice(&buf[..total]).expect("frame fits")
+    }
+
+    fn indication(payload: zigbee_mac::MacFrame) -> zigbee_mac::McpsDataIndication {
+        zigbee_mac::McpsDataIndication {
+            src_address: zigbee_types::MacAddress::Short(zigbee_types::PanId(0x1234), COORDINATOR),
+            dst_address: zigbee_types::MacAddress::Short(
+                zigbee_types::PanId(0x1234),
+                ShortAddress(OUR_SHORT),
+            ),
+            lqi: 200,
+            payload,
+            security_use: false,
+        }
+    }
+
+    /// The same indication, but transmitted by `previous_hop` rather than
+    /// directly by the NWK source.
+    fn indication_from(
+        payload: zigbee_mac::MacFrame,
+        previous_hop: ShortAddress,
+    ) -> zigbee_mac::McpsDataIndication {
+        let mut indication = indication(payload);
+        indication.src_address =
+            zigbee_types::MacAddress::Short(zigbee_types::PanId(0x1234), previous_hop);
+        indication
+    }
+
+    fn leave_command(rejoin: bool) -> [u8; 2] {
+        [
+            zigbee_nwk::frames::NwkCommandId::Leave as u8,
+            zigbee_nwk::frames::LeaveCommand {
+                remove_children: false,
+                request: true,
+                rejoin,
+            }
+            .serialize(),
+        ]
+    }
+
+    #[test]
+    fn secured_parent_leave_still_drives_rejoin_through_the_shared_nwk_path() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Command,
+            ShortAddress(OUR_SHORT),
+            &leave_command(true),
+            1,
+            true,
+        );
+
+        let event = block_on(device.process_incoming(&indication(frame), &mut []));
+
+        assert!(matches!(
+            event,
+            Some(crate::event_loop::StackEvent::RejoinRequested)
+        ));
+        assert!(!device.is_joined());
+        assert!(device.secure_rejoin_pending());
+        assert_eq!(
+            device.nwk_rx_security_stats().decrypt_successes,
+            1,
+            "the shared NWK path owns decryption and counter commits"
+        );
+    }
+
+    #[test]
+    fn secured_leave_without_rejoin_reports_a_leave_request() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Command,
+            ShortAddress(OUR_SHORT),
+            &leave_command(false),
+            1,
+            true,
+        );
+
+        let event = block_on(device.process_incoming(&indication(frame), &mut []));
+
+        assert!(matches!(
+            event,
+            Some(crate::event_loop::StackEvent::LeaveRequested)
+        ));
+        assert!(!device.is_joined());
+        assert!(!device.secure_rejoin_pending());
+    }
+
+    #[test]
+    fn unsecured_leave_is_ignored_on_a_secured_network() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Command,
+            ShortAddress(OUR_SHORT),
+            &leave_command(true),
+            1,
+            false,
+        );
+
+        assert!(block_on(device.process_incoming(&indication(frame), &mut [])).is_none());
+        assert!(device.is_joined());
+    }
+
+    #[test]
+    fn replayed_secured_frames_are_rejected_once_the_counter_is_committed() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        let payload = [0x00u8, 0x01, 0x02];
+        let first = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &payload,
+            7,
+            true,
+        );
+        let replay = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &payload,
+            7,
+            true,
+        );
+
+        let _ = block_on(device.process_incoming(&indication(first), &mut []));
+        assert_eq!(device.nwk_rx_security_stats().decrypt_successes, 1);
+
+        let _ = block_on(device.process_incoming(&indication(replay), &mut []));
+        assert_eq!(
+            device.nwk_rx_security_stats().replay_rejections,
+            1,
+            "a committed frame counter must reject the replay"
+        );
+        assert_eq!(device.nwk_rx_security_stats().decrypt_successes, 1);
+    }
+
+    #[test]
+    fn router_relays_traffic_for_other_devices_and_delivers_its_own_locally() {
+        let mut device = resumed_device(DeviceType::Router);
+
+        // Addressed to another device: authenticated first, then forwarded
+        // toward the best next hop (here the parent, the last resort of
+        // `resolve_next_hop`) under freshly applied NWK security.
+        let relayed = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            NEIGHBOUR,
+            &[0xAA, 0xBB],
+            11,
+            true,
+        );
+        assert!(block_on(device.process_incoming(&indication(relayed), &mut [])).is_none());
+        {
+            let history = device.mac_mut().tx_history();
+            assert_eq!(history.len(), 1, "a unicast for another device is relayed");
+            let bytes = history[0].payload.as_slice();
+            let (header, consumed) =
+                zigbee_nwk::frames::NwkHeader::parse(bytes).expect("relayed frame parses");
+            assert_eq!(
+                header.dst_addr, NEIGHBOUR,
+                "relay preserves the destination"
+            );
+            assert_eq!(
+                header.src_addr, COORDINATOR,
+                "relay preserves the originator"
+            );
+            assert_eq!(header.radius, 4, "relay decrements the radius");
+            assert!(header.frame_control.security);
+            assert!(matches!(
+                history[0].dst,
+                zigbee_types::MacAddress::Short(_, COORDINATOR)
+            ));
+
+            // The mutated header is CCM* additional authenticated data, so the
+            // relay must re-secure the frame under its own identity instead of
+            // forwarding the originator's ciphertext and MIC.
+            let (aux, _) = zigbee_nwk::security::NwkSecurityHeader::parse(&bytes[consumed..])
+                .expect("the relay writes its own auxiliary header");
+            assert_eq!(aux.source_address, IEEE_ADDRESS);
+            assert_ne!(
+                aux.frame_counter, 11,
+                "the relay allocates its own durable frame counter"
+            );
+        }
+        assert_eq!(
+            device.nwk_rx_security_stats().decrypt_successes,
+            1,
+            "a relayed frame is authenticated before it is forwarded"
+        );
+
+        device.mac_mut().clear_tx_history();
+
+        // Addressed to us: delivered upwards, never relayed.
+        let local = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &[0xAA, 0xBB],
+            12,
+            true,
+        );
+        let _ = block_on(device.process_incoming(&indication(local), &mut []));
+        assert!(
+            device.mac_mut().tx_history().is_empty(),
+            "a frame addressed to us must not be relayed"
+        );
+        assert_eq!(device.nwk_rx_security_stats().decrypt_successes, 2);
+    }
+
+    #[test]
+    fn router_relays_to_an_announced_neighbour_instead_of_queueing_it() {
+        let mut device = resumed_device(DeviceType::Router);
+        // A Device_annce only carries the address pair, so the neighbour entry
+        // keeps the default `rx_on_when_idle == false`. It is not a child of
+        // ours and must not be treated as a sleeping one: nothing drains the
+        // indirect queue, so buffering here would blackhole the traffic.
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .update_neighbor_address(NEIGHBOUR, [9u8; 8]);
+
+        let relayed = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            NEIGHBOUR,
+            &[0xAA, 0xBB],
+            11,
+            true,
+        );
+        assert!(block_on(device.process_incoming(&indication(relayed), &mut [])).is_none());
+
+        assert!(
+            !device
+                .bdb
+                .zdo()
+                .nwk()
+                .indirect_queue()
+                .has_pending(NEIGHBOUR),
+            "an announced neighbour must not be parked in an undrainable queue"
+        );
+        let history = device.mac_mut().tx_history();
+        assert_eq!(history.len(), 1, "the frame is relayed directly");
+        assert!(matches!(
+            history[0].dst,
+            zigbee_types::MacAddress::Short(_, NEIGHBOUR)
+        ));
+    }
+
+    #[test]
+    fn router_resume_restarts_router_operation() {
+        let device = resumed_device(DeviceType::Router);
+
+        assert_eq!(
+            block_on(
+                device
+                    .bdb
+                    .zdo()
+                    .nwk()
+                    .mac()
+                    .mlme_get(PibAttribute::MacRxOnWhenIdle)
+            )
+            .unwrap(),
+            PibValue::Bool(true),
+            "a resumed router must restart MAC router operation"
+        );
+    }
+
+    #[test]
+    fn a_router_that_cannot_start_is_reported_instead_of_half_joined() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::Router)
+            .build();
+
+        // NLME-START-ROUTER refuses a device that is not on a network.
+        assert_eq!(
+            block_on(device.restore_router_operation()),
+            Err(crate::event_loop::StartError::InitFailed),
+            "an unsupported router start must not be silently ignored"
+        );
+        assert!(!device.is_joined());
+    }
+
+    #[test]
+    fn a_relayed_many_to_one_request_routes_through_the_transmitting_neighbour() {
+        use zigbee_nwk::frames::{NwkCommandId, RouteRequest};
+
+        let mut device = resumed_device(DeviceType::Router);
+
+        // The concentrator (our coordinator) originated this many-to-one
+        // request; the NWK header still names it several hops later. The
+        // frame reached us from NEIGHBOUR, and that is the only device the
+        // route to the concentrator may go through.
+        let rreq = RouteRequest {
+            command_options: 0x08,
+            route_request_id: 3,
+            dst_addr: COORDINATOR,
+            path_cost: 1,
+            dst_ieee: None,
+        };
+        let mut command = [0u8; 16];
+        command[0] = NwkCommandId::RouteRequest as u8;
+        let len = 1 + rreq.serialize(&mut command[1..]);
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Command,
+            ShortAddress(0xFFFC),
+            &command[..len],
+            21,
+            true,
+        );
+
+        assert!(
+            block_on(device.process_incoming(&indication_from(frame, NEIGHBOUR), &mut []))
+                .is_none()
+        );
+
+        let entry = device
+            .bdb
+            .zdo()
+            .nwk()
+            .routing_table()
+            .get_entry(COORDINATOR)
+            .expect("the many-to-one route is installed");
+        assert_eq!(
+            entry.next_hop, NEIGHBOUR,
+            "the runtime carries the MAC previous hop into the NWK layer"
+        );
+        assert!(entry.many_to_one);
+
+        // And the forwarded copy is still the concentrator's own broadcast.
+        block_on(device.bdb.zdo_mut().nwk_mut().process_pending_routing());
+        let history = device.mac_mut().tx_history();
+        assert_eq!(history.len(), 1, "the request is carried one hop further");
+        let (header, consumed) =
+            zigbee_nwk::frames::NwkHeader::parse(history[0].payload.as_slice())
+                .expect("the forward parses");
+        assert_eq!(header.src_addr, COORDINATOR);
+        assert_eq!(header.radius, 4, "the received radius is decremented");
+        assert!(header.frame_control.security);
+        let (aux, aux_len) = zigbee_nwk::security::NwkSecurityHeader::parse(
+            &history[0].payload.as_slice()[consumed..],
+        )
+        .expect("the forward carries a fresh auxiliary header");
+        assert_eq!(aux_len, zigbee_nwk::security::NWK_AUX_HEADER_LEN);
+        assert_eq!(
+            aux.source_address, IEEE_ADDRESS,
+            "NWK security is hop by hop: this relay signs the forward itself"
+        );
+        assert_ne!(
+            aux.frame_counter, 21,
+            "and spends its own durable counter, not the concentrator's"
+        );
+    }
+
+    #[test]
+    fn end_device_resume_does_not_start_router_operation() {
+        let device = resumed_device(DeviceType::EndDevice);
+
+        assert_eq!(
+            block_on(
+                device
+                    .bdb
+                    .zdo()
+                    .nwk()
+                    .mac()
+                    .mlme_get(PibAttribute::MacRxOnWhenIdle)
+            )
+            .unwrap(),
+            PibValue::Bool(false),
+            "end-device resume behaviour must be unchanged"
         );
     }
 }
@@ -683,6 +1318,29 @@ pub enum UserAction {
     FactoryReset,
 }
 
+/// Outcome of one bounded, nonblocking parent-command maintenance step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParentCommandStep {
+    pub processed: u8,
+    pub failures: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingChildUpdate {
+    poll_address: ShortAddress,
+    device_address: IeeeAddress,
+    device_short_address: ShortAddress,
+    status: zigbee_aps::apsme::ApsUpdateDeviceStatus,
+    expires_at_us: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustCenterMode {
+    Unknown,
+    Centralized,
+    Distributed,
+}
+
 /// The running Zigbee device — owns the full BDB→ZDO→APS→NWK→MAC stack.
 pub struct ZigbeeDevice<M: MacDriver> {
     /// BDB layer (transitively owns ZDO → APS → NWK → MAC).
@@ -717,10 +1375,16 @@ pub struct ZigbeeDevice<M: MacDriver> {
     state_dirty: bool,
     /// Earliest monotonic time for the next automatic secure-rejoin attempt.
     secure_rejoin_retry_at: Option<u32>,
+    /// Trust Center notifications deferred until an indirect Rejoin Response
+    /// is actually transmitted and acknowledged.
+    pending_child_updates: heapless::Vec<PendingChildUpdate, 8>,
 }
 
 impl<M: MacDriver> ZigbeeDevice<M> {
     const SECURE_REJOIN_RETRY_DELAY_US: u32 = 5_000_000;
+    const PARENT_RX_SLICE_US: u32 = 20_000;
+    const MAX_PARENT_COMMANDS_PER_STEP: u8 = 4;
+    const PENDING_CHILD_UPDATE_TIMEOUT_US: u32 = 10_000_000;
     /// Poll cadence hint while the event-driven commissioning security
     /// handshake is still running after network-up.
     const COMMISSIONING_POLL_MS: u32 = 250;
@@ -856,10 +1520,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
     /// Rejoin a previously-joined network using stored NWK credentials.
     ///
-    /// Uses a "silent resume" approach: restores MAC-layer addresses (PAN ID,
+    /// Uses a silent resume approach: restores MAC-layer addresses (PAN ID,
     /// short address, channel) so the device can immediately start polling
-    /// its parent and responding to frames. A Device_annce broadcast notifies
-    /// the coordinator that we're back online.
+    /// its parent and responding to frames without scanning, associating, or
+    /// broadcasting Device_annce.
     ///
     /// This avoids the NWK Rejoin Request/Response exchange which some
     /// coordinators (e.g. ZHA/EZSP) handle unreliably. If the parent has
@@ -876,14 +1540,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         // Mark as joined so NWK/ZDO accept frames
         self.bdb.zdo_mut().nwk_mut().set_joined(true);
 
-        // Announce immediately so coordinators and home automation stacks
-        // that dropped our registry entry can rediscover the device.
-        // Repeating the announce is cheap and avoids relying on stale state.
-        if self.send_device_annce().await.is_err() {
-            log::warn!("[Runtime] Device_annce failed after resume; continuing");
-        } else {
-            log::info!("[Runtime] Device_annce sent after resume");
-        }
+        // A router must resume MAC router operation before announcing itself:
+        // otherwise it advertises a routing device that never starts its
+        // receiver or accepts children.
+        self.restore_router_operation().await?;
 
         self.state_dirty = true;
         self.secure_rejoin_retry_at = None;
@@ -969,10 +1629,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     #[inline(never)]
     pub async fn secure_rejoin(&mut self) -> Result<u16, event_loop::StartError> {
         self.bdb.zdo_mut().nwk_mut().set_joined(false);
-        let result = match self.bdb.rejoin_previous_network().await {
+        let mut result = match self.bdb.rejoin_previous_network().await {
             Ok(()) => self.finish_join(),
             Err(status) => Err(event_loop::StartError::CommissioningFailed(status)),
         };
+        if result.is_ok()
+            && let Err(error) = self.restore_router_operation().await
+        {
+            result = Err(error);
+        }
         if result.is_ok() {
             self.send_ed_timeout_request().await;
             self.secure_rejoin_retry_at = None;
@@ -980,6 +1645,44 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             self.schedule_secure_rejoin_retry();
         }
         result
+    }
+
+    /// Resume MAC router operation after a resume or secured rejoin.
+    ///
+    /// Fresh BDB steering already issues NLME-START-ROUTER; the persisted
+    /// resume and rejoin paths skip commissioning entirely, so the router has
+    /// to be restarted here. End devices and coordinators are unaffected.
+    ///
+    /// A router that cannot start is reported as a start failure instead of
+    /// being left half-operational: the device would otherwise look like a
+    /// router to the network while never enabling its receiver or accepting
+    /// children. On failure the joined flag is cleared so the stack stops
+    /// transmitting as if it were on the network; the commissioned
+    /// credentials are kept so the caller can retry a resume or fall back to
+    /// steering.
+    ///
+    /// `StartError` deliberately gains no new variant here — downstream
+    /// applications match it exhaustively — so the NWK status is logged and
+    /// mapped onto [`event_loop::StartError::InitFailed`].
+    async fn restore_router_operation(&mut self) -> Result<(), event_loop::StartError> {
+        if self.bdb.zdo().nwk().device_type() != zigbee_nwk::DeviceType::Router {
+            return Ok(());
+        }
+        match self.bdb.zdo_mut().nwk_mut().nlme_start_router().await {
+            Ok(()) => {
+                log::info!("[Runtime] Router operation restored after resume");
+                Ok(())
+            }
+            Err(status) => {
+                rt_trace!("[RT] start_router=err {:?}", status);
+                log::error!(
+                    "[Runtime] NLME-START-ROUTER failed after resume: {:?}",
+                    status
+                );
+                self.bdb.zdo_mut().nwk_mut().set_joined(false);
+                Err(event_loop::StartError::InitFailed)
+            }
+        }
     }
 
     /// Perform a secured NWK rejoin while preserving crash-safe counters and
@@ -1364,6 +2067,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             let nwk = self.bdb.zdo_mut().nwk_mut();
             nwk.security_mut()
                 .set_network_key(state.network_key, state.key_sequence);
+            if state.staged_network_key_present
+                && !nwk
+                    .security_mut()
+                    .stage_network_key(state.staged_network_key, state.staged_key_sequence)
+            {
+                return Err(SecurityStoreError::Corrupt);
+            }
             let nib = nwk.nib_mut();
             nib.extended_pan_id = state.extended_pan_id;
             nib.pan_id = PanId(state.pan_id);
@@ -1440,14 +2150,48 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             return Ok(false);
         }
 
-        let nib = self.bdb.zdo().nwk().nib();
+        let nwk = self.bdb.zdo().nwk();
+        let nib = nwk.nib();
+        let active_network_key = nwk
+            .security()
+            .active_key()
+            .ok_or(SecurityStoreError::Corrupt)?;
+        let staged_network_key = nwk
+            .security()
+            .staged_key()
+            .map(|entry| (entry.key, entry.seq_number));
         if nib.ieee_address != state.ieee_address
             || nib.pan_id.0 != state.pan_id
             || nib.outgoing_frame_counter > nib.outgoing_frame_counter_limit
             || nib.outgoing_frame_counter_limit != state.global_counter_limit
+            || nib.active_key_seq_number != active_network_key.seq_number
         {
             return Err(SecurityStoreError::Corrupt);
         }
+        let network_key_changed = state.network_key != active_network_key.key
+            || state.key_sequence != active_network_key.seq_number;
+        if network_key_changed {
+            state.network_key = active_network_key.key;
+            state.key_sequence = active_network_key.seq_number;
+        }
+        let staged_key_changed = match staged_network_key {
+            Some((key, sequence)) => {
+                let changed = !state.staged_network_key_present
+                    || state.staged_network_key != key
+                    || state.staged_key_sequence != sequence;
+                state.staged_network_key_present = true;
+                state.staged_network_key = key;
+                state.staged_key_sequence = sequence;
+                changed
+            }
+            None => {
+                let changed = state.staged_network_key_present;
+                state.staged_network_key_present = false;
+                state.staged_network_key = [0; 16];
+                state.staged_key_sequence = 0;
+                changed
+            }
+        };
 
         // Set when a unique Trust Center link key transported at runtime is
         // adopted into the durable store below; the live APS entry then has to
@@ -1465,18 +2209,35 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
                 )
                 .ok_or(SecurityStoreError::Corrupt)?;
-            if tclk.key != state.trust_center_link_key
-                || tclk.outgoing_frame_counter > tclk.outgoing_frame_counter_limit
-                || tclk.outgoing_frame_counter_limit != state.tclk_counter_limit
-            {
-                return Err(SecurityStoreError::Corrupt);
+            if tclk.key != state.trust_center_link_key {
+                let current = tclk.outgoing_frame_counter.max(state.tclk_counter_limit);
+                let limit = current
+                    .checked_add(zigbee_bdb::FRAME_COUNTER_RESERVATION_SIZE)
+                    .ok_or(SecurityStoreError::CounterExhausted)?;
+                state.trust_center_link_key = tclk.key;
+                state.tclk_counter_limit = limit;
+                state.tclk_incoming_counter = tclk.incoming_frame_counter;
+                state.tclk_incoming_counter_valid = tclk.incoming_frame_counter_valid;
+                adopted_current = Some(current);
+                Some(TclkCounters {
+                    outgoing: current,
+                    limit,
+                    incoming: tclk.incoming_frame_counter,
+                    incoming_valid: tclk.incoming_frame_counter_valid,
+                })
+            } else {
+                if tclk.outgoing_frame_counter > tclk.outgoing_frame_counter_limit
+                    || tclk.outgoing_frame_counter_limit != state.tclk_counter_limit
+                {
+                    return Err(SecurityStoreError::Corrupt);
+                }
+                Some(TclkCounters {
+                    outgoing: tclk.outgoing_frame_counter,
+                    limit: tclk.outgoing_frame_counter_limit,
+                    incoming: tclk.incoming_frame_counter,
+                    incoming_valid: tclk.incoming_frame_counter_valid,
+                })
             }
-            Some(TclkCounters {
-                outgoing: tclk.outgoing_frame_counter,
-                limit: tclk.outgoing_frame_counter_limit,
-                incoming: tclk.incoming_frame_counter,
-                incoming_valid: tclk.incoming_frame_counter_valid,
-            })
         } else {
             // A `legacy_default_tclk` network has no unique key to maintain:
             // the default global Trust Center link key draws from the NWK
@@ -1531,7 +2292,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
         };
 
-        let mut changed = adopted_current.is_some();
+        let mut changed = adopted_current.is_some() || network_key_changed || staged_key_changed;
         let mut new_global_limit = nib.outgoing_frame_counter_limit;
         if nib
             .outgoing_frame_counter_limit
@@ -1617,11 +2378,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     pub fn reset_security_state_if_identity_changed<S: SecurityStateStore>(
         &mut self,
         store: &mut S,
+        configured_ieee: IeeeAddress,
     ) -> Result<bool, SecurityStoreError> {
         let Some(state) = store.load()? else {
             return Ok(false);
         };
-        let configured_ieee = self.bdb.zdo().nwk().nib().ieee_address;
         if state.ieee_address == [0; 8] || state.ieee_address == configured_ieee {
             return Ok(false);
         }
@@ -2018,6 +2779,307 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
     // ── MAC proxy ───────────────────────────────────────────
 
+    fn parent_mode_active(&self) -> bool {
+        let nwk = self.bdb.zdo().aps().nwk();
+        let capabilities = nwk.mac().capabilities();
+        nwk.can_route()
+            && match nwk.device_type() {
+                zigbee_nwk::DeviceType::Coordinator => capabilities.coordinator,
+                zigbee_nwk::DeviceType::Router => capabilities.router,
+                zigbee_nwk::DeviceType::EndDevice => false,
+            }
+    }
+
+    fn parent_beacon_response(&self) -> MlmeBeaconResponse {
+        let nwk = self.bdb.zdo().aps().nwk();
+        let nib = nwk.nib();
+        let capacity = nwk.child_capacity();
+        let mut nwk_info = u16::from(nib.stack_profile & 0x0F) | (2u16 << 4);
+        if capacity.router {
+            nwk_info |= 1 << 10;
+        }
+        nwk_info |= u16::from(nib.depth.min(15)) << 11;
+        if capacity.end_device {
+            nwk_info |= 1 << 15;
+        }
+        let mut bytes = [0u8; 15];
+        bytes[0] = 0; // Zigbee protocol ID
+        bytes[1..3].copy_from_slice(&nwk_info.to_le_bytes());
+        bytes[3..11].copy_from_slice(&nib.extended_pan_id);
+        bytes[11..14].fill(0xFF); // undefined TX offset in a non-beacon network
+        bytes[14] = nib.update_id;
+
+        let mut response =
+            MlmeBeaconResponse::new(PibPayload::from_slice(&bytes).expect("fixed beacon payload"));
+        response.pan_coordinator = nwk.device_type() == zigbee_nwk::DeviceType::Coordinator;
+        response.association_permit =
+            nib.permit_joining && (capacity.router || capacity.end_device);
+        for child in nwk.indirect_queue().pending_children() {
+            if !response.pending_short_addresses.contains(&child)
+                && response.pending_short_addresses.push(child).is_err()
+            {
+                break;
+            }
+        }
+        response
+    }
+
+    fn trust_center_mode(&self) -> TrustCenterMode {
+        let address = self.bdb.zdo().aps().aib().aps_trust_center_address;
+        if address == [0; 8] {
+            TrustCenterMode::Unknown
+        } else if address == [0xFF; 8] {
+            TrustCenterMode::Distributed
+        } else {
+            TrustCenterMode::Centralized
+        }
+    }
+
+    fn child_update_status(
+        security_capable: bool,
+        secured_rejoin: Option<bool>,
+    ) -> zigbee_aps::apsme::ApsUpdateDeviceStatus {
+        use zigbee_aps::apsme::ApsUpdateDeviceStatus;
+
+        match (security_capable, secured_rejoin) {
+            (false, None) => ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin,
+            (true, None) => ApsUpdateDeviceStatus::HighSecurityDeviceUnsecuredJoin,
+            (false, Some(true)) => ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
+            (true, Some(true)) => ApsUpdateDeviceStatus::HighSecurityDeviceSecuredRejoin,
+            (false, Some(false)) => ApsUpdateDeviceStatus::StandardDeviceUnsecuredRejoin,
+            (true, Some(false)) => ApsUpdateDeviceStatus::HighSecurityDeviceUnsecuredRejoin,
+        }
+    }
+
+    async fn notify_trust_center_of_child(
+        &mut self,
+        device_address: IeeeAddress,
+        device_short_address: ShortAddress,
+        status: zigbee_aps::apsme::ApsUpdateDeviceStatus,
+    ) -> Result<(), zigbee_aps::ApsStatus> {
+        match self.trust_center_mode() {
+            TrustCenterMode::Distributed => Ok(()),
+            TrustCenterMode::Unknown => Err(zigbee_aps::ApsStatus::InvalidParameter),
+            TrustCenterMode::Centralized => {
+                self.bdb
+                    .zdo_mut()
+                    .aps_mut()
+                    .send_update_device(&device_address, device_short_address, status)
+                    .await
+            }
+        }
+    }
+
+    fn prune_pending_child_updates(&mut self) {
+        let now = self.bdb.zdo().nwk().mac().monotonic_micros();
+        self.pending_child_updates
+            .retain(|pending| now.wrapping_sub(pending.expires_at_us) >= 0x8000_0000);
+    }
+
+    fn queue_pending_child_update(
+        &mut self,
+        poll_address: ShortAddress,
+        device_address: IeeeAddress,
+        device_short_address: ShortAddress,
+        status: zigbee_aps::apsme::ApsUpdateDeviceStatus,
+    ) -> Result<(), MacError> {
+        self.prune_pending_child_updates();
+        let expires_at_us = self
+            .bdb
+            .zdo()
+            .nwk()
+            .mac()
+            .monotonic_micros()
+            .wrapping_add(Self::PENDING_CHILD_UPDATE_TIMEOUT_US);
+        let pending = PendingChildUpdate {
+            poll_address,
+            device_address,
+            device_short_address,
+            status,
+            expires_at_us,
+        };
+        if let Some(existing) = self.pending_child_updates.iter_mut().find(|existing| {
+            existing.poll_address == poll_address || existing.device_address == device_address
+        }) {
+            *existing = pending;
+            return Ok(());
+        }
+        self.pending_child_updates
+            .push(pending)
+            .map_err(|_| MacError::TransactionOverflow)
+    }
+
+    async fn complete_pending_child_update(
+        &mut self,
+        poll_address: ShortAddress,
+    ) -> Result<(), MacError> {
+        self.prune_pending_child_updates();
+        let Some(index) = self
+            .pending_child_updates
+            .iter()
+            .position(|pending| pending.poll_address == poll_address)
+        else {
+            return Ok(());
+        };
+        let pending = self.pending_child_updates.swap_remove(index);
+        self.notify_trust_center_of_child(
+            pending.device_address,
+            pending.device_short_address,
+            pending.status,
+        )
+        .await
+        .map_err(|_| MacError::SecurityError)
+    }
+
+    async fn handle_parent_command(&mut self, event: MacCommandEvent) -> Result<(), MacError> {
+        match event {
+            MacCommandEvent::BeaconRequest(_) => {
+                let response = self.parent_beacon_response();
+                self.bdb
+                    .zdo_mut()
+                    .aps_mut()
+                    .nwk_mut()
+                    .mac_mut()
+                    .mlme_beacon_response(response)
+                    .await
+            }
+            MacCommandEvent::AssociationRequest(indication) => {
+                let (was_existing, association) = {
+                    let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
+                    let was_existing = nwk
+                        .known_child_by_ieee(&indication.device_address)
+                        .is_some();
+                    let association = nwk.handle_child_association(
+                        indication.device_address,
+                        indication.capability_info.to_byte(),
+                    );
+                    (was_existing, association)
+                };
+                let (short_address, status) = match association {
+                    Ok(address) => (address, AssociationStatus::Success),
+                    Err(zigbee_nwk::NwkStatus::NeighborTableFull) => {
+                        (ShortAddress(0xFFFF), AssociationStatus::PanAtCapacity)
+                    }
+                    Err(_) => (ShortAddress(0xFFFF), AssociationStatus::PanAccessDenied),
+                };
+                let response = MlmeAssociateResponse {
+                    device_address: indication.device_address,
+                    short_address,
+                    status,
+                };
+                let result = self
+                    .bdb
+                    .zdo_mut()
+                    .aps_mut()
+                    .nwk_mut()
+                    .mac_mut()
+                    .mlme_associate_response(response)
+                    .await;
+                if result.is_err() && status == AssociationStatus::Success && !was_existing {
+                    self.bdb
+                        .zdo_mut()
+                        .aps_mut()
+                        .nwk_mut()
+                        .remove_neighbor(short_address);
+                }
+                result
+            }
+            MacCommandEvent::AssociationResponseDelivery(delivery) => {
+                if delivery.status != AssociationStatus::Success {
+                    return Ok(());
+                }
+                if let Err(error) = delivery.result {
+                    self.bdb
+                        .zdo_mut()
+                        .aps_mut()
+                        .nwk_mut()
+                        .remove_unauthenticated_child(
+                            &delivery.device_address,
+                            delivery.short_address,
+                        );
+                    return Err(error);
+                }
+
+                let security_capable = self
+                    .bdb
+                    .zdo()
+                    .nwk()
+                    .child_security_capable(&delivery.device_address)
+                    .ok_or(MacError::InvalidParameter)?;
+                let status = Self::child_update_status(security_capable, None);
+                self.notify_trust_center_of_child(
+                    delivery.device_address,
+                    delivery.short_address,
+                    status,
+                )
+                .await
+                .map_err(|_| MacError::SecurityError)
+            }
+            MacCommandEvent::DataRequest(indication) => {
+                let outcome = self
+                    .bdb
+                    .zdo_mut()
+                    .aps_mut()
+                    .nwk_mut()
+                    .service_child_data_request(indication.source_address)
+                    .await?;
+                if let zigbee_nwk::ChildPollOutcome::Delivered { child, .. } = outcome {
+                    self.complete_pending_child_update(child).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Drain a bounded number of already-received MAC management events.
+    ///
+    /// The zero-timeout poll never starts a long radio window. Limiting each
+    /// call to four events prevents beacon/association traffic from starving
+    /// normal MCPS data.
+    pub async fn service_parent_commands(&mut self) -> ParentCommandStep {
+        let mut outcome = ParentCommandStep::default();
+        if !self.parent_mode_active() {
+            return outcome;
+        }
+        self.prune_pending_child_updates();
+        for _ in 0..Self::MAX_PARENT_COMMANDS_PER_STEP {
+            let event = self
+                .bdb
+                .zdo_mut()
+                .aps_mut()
+                .nwk_mut()
+                .mac_mut()
+                .mac_command_event_timeout(0)
+                .await;
+            let event = match event {
+                Ok(event) => event,
+                Err(MacError::NoData | MacError::Unsupported) => break,
+                Err(_) => {
+                    outcome.failures = outcome.failures.saturating_add(1);
+                    break;
+                }
+            };
+            outcome.processed = outcome.processed.saturating_add(1);
+            if self.handle_parent_command(event).await.is_err() {
+                outcome.failures = outcome.failures.saturating_add(1);
+            }
+        }
+        outcome
+    }
+
+    /// Open or close child joining through this coordinator/router.
+    ///
+    /// `0` closes immediately, `0xFF` is indefinite, and `1..=254` is a
+    /// duration in seconds aged by [`tick`](Self::tick).
+    pub async fn permit_joining(&mut self, duration: u8) -> Result<(), zigbee_nwk::NwkStatus> {
+        self.bdb
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .nlme_permit_joining(duration)
+            .await
+    }
+
     /// Wait for an incoming MAC frame. Blocks until a frame arrives.
     ///
     /// Use with `select!` and a timer for non-blocking operation:
@@ -2028,13 +3090,44 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// }
     /// ```
     pub async fn receive(&mut self) -> Result<McpsDataIndication, MacError> {
-        self.bdb
+        if self.parent_mode_active() {
+            self.receive_timeout(Self::PARENT_RX_SLICE_US).await
+        } else {
+            self.bdb
+                .zdo_mut()
+                .aps_mut()
+                .nwk_mut()
+                .mac_mut()
+                .mcps_data_indication()
+                .await
+        }
+    }
+
+    /// Wait for an incoming MAC frame for at most `timeout_us`.
+    ///
+    /// Parent-mode command servicing runs before and after the bounded RX
+    /// window, matching [`Self::receive`] while allowing an application to
+    /// shorten the slice when [`event_loop::TickResult::RunAgain`] requests an
+    /// earlier runtime deadline.
+    pub async fn receive_timeout(
+        &mut self,
+        timeout_us: u32,
+    ) -> Result<McpsDataIndication, MacError> {
+        if self.parent_mode_active() {
+            let _ = self.service_parent_commands().await;
+        }
+        let result = self
+            .bdb
             .zdo_mut()
             .aps_mut()
             .nwk_mut()
             .mac_mut()
-            .mcps_data_indication()
-            .await
+            .mcps_data_indication_timeout(timeout_us)
+            .await;
+        if self.parent_mode_active() {
+            let _ = self.service_parent_commands().await;
+        }
+        result
     }
 
     /// Poll the parent for pending data (Sleepy End Device).
@@ -2074,6 +3167,161 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
     // ── Incoming frame processing ───────────────────────────
 
+    async fn handle_child_rejoin_request(
+        &mut self,
+        request_address: ShortAddress,
+        device_address: IeeeAddress,
+        capability_info: u8,
+        secured: bool,
+    ) {
+        let capability = CapabilityInfo::from_byte(capability_info);
+        let trust_center_mode = self.trust_center_mode();
+        let was_existing = self
+            .bdb
+            .zdo()
+            .nwk()
+            .known_child_by_ieee(&device_address)
+            .is_some();
+        let admission = if trust_center_mode == TrustCenterMode::Unknown
+            || (!secured && trust_center_mode == TrustCenterMode::Distributed)
+        {
+            Err(zigbee_nwk::NwkStatus::NotPermitted)
+        } else {
+            self.bdb.zdo_mut().aps_mut().nwk_mut().handle_child_rejoin(
+                request_address,
+                device_address,
+                capability_info,
+                secured,
+            )
+        };
+        let (assigned_address, rejoin_status) = match admission {
+            Ok(address) => (address, 0x00),
+            Err(zigbee_nwk::NwkStatus::NeighborTableFull) => (ShortAddress(0xFFFF), 0x01),
+            Err(_) => (ShortAddress(0xFFFF), 0x02),
+        };
+
+        let delivery = self
+            .bdb
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .send_rejoin_response(
+                request_address,
+                device_address,
+                assigned_address,
+                rejoin_status,
+                secured,
+                capability.rx_on_when_idle,
+            )
+            .await;
+        let delivery = match delivery {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                log::warn!(
+                    "[Runtime] Rejoin Response to 0x{:04X} failed: {:?}",
+                    request_address.0,
+                    error
+                );
+                if rejoin_status == 0x00 && !was_existing {
+                    self.bdb
+                        .zdo_mut()
+                        .aps_mut()
+                        .nwk_mut()
+                        .remove_neighbor(assigned_address);
+                }
+                return;
+            }
+        };
+        if rejoin_status != 0x00 || trust_center_mode != TrustCenterMode::Centralized {
+            return;
+        }
+
+        let update_status = Self::child_update_status(capability.security_capable, Some(secured));
+        match delivery {
+            zigbee_nwk::RejoinResponseDelivery::Direct => {
+                if let Err(error) = self
+                    .notify_trust_center_of_child(device_address, assigned_address, update_status)
+                    .await
+                {
+                    log::warn!("[Runtime] Rejoin Update-Device failed: {:?}", error);
+                }
+            }
+            zigbee_nwk::RejoinResponseDelivery::Indirect => {
+                if let Err(error) = self.queue_pending_child_update(
+                    request_address,
+                    device_address,
+                    assigned_address,
+                    update_status,
+                ) {
+                    log::warn!("[Runtime] Cannot defer Rejoin Update-Device: {:?}", error);
+                    if !was_existing {
+                        self.bdb
+                            .zdo_mut()
+                            .aps_mut()
+                            .nwk_mut()
+                            .remove_neighbor(assigned_address);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply the runtime policy for a NWK command reported by the NWK layer.
+    ///
+    /// The NWK layer owns validation (security, addressing and parent
+    /// authorization) and has already dropped its joined state. The runtime
+    /// owns rejoin scheduling and the application-visible event.
+    async fn handle_nwk_command_outcome(
+        &mut self,
+        command: zigbee_nwk::nlde::NwkCommandOutcome,
+    ) -> Option<event_loop::StackEvent> {
+        match command {
+            zigbee_nwk::nlde::NwkCommandOutcome::ParentLeft { src } => {
+                rt_trace!("[RT] parent_left src=0x{:04X}", src.0);
+                log::warn!("[RX] Parent 0x{:04X} left the network", src.0);
+                let now = self.bdb.zdo().nwk().mac().monotonic_micros();
+                self.secure_rejoin_retry_at = Some(now);
+                Some(event_loop::StackEvent::RejoinRequested)
+            }
+            zigbee_nwk::nlde::NwkCommandOutcome::LeaveRequested {
+                src,
+                rejoin,
+                remove_children,
+            } => {
+                rt_trace!(
+                    "[RT] leave src=0x{:04X} remove_children={} rejoin={}",
+                    src.0,
+                    remove_children,
+                    rejoin
+                );
+                log::warn!(
+                    "[RX] NWK Leave request from 0x{:04X} (remove_children={}, rejoin={})",
+                    src.0,
+                    remove_children,
+                    rejoin
+                );
+                if rejoin {
+                    let now = self.bdb.zdo().nwk().mac().monotonic_micros();
+                    self.secure_rejoin_retry_at = Some(now);
+                    Some(event_loop::StackEvent::RejoinRequested)
+                } else {
+                    self.secure_rejoin_retry_at = None;
+                    Some(event_loop::StackEvent::LeaveRequested)
+                }
+            }
+            zigbee_nwk::nlde::NwkCommandOutcome::ChildRejoinRequest {
+                src,
+                ieee,
+                capability_info,
+                secured,
+            } => {
+                self.handle_child_rejoin_request(src, ieee, capability_info, secured)
+                    .await;
+                None
+            }
+        }
+    }
+
     /// Process an incoming MAC frame through the full stack.
     ///
     /// MAC → NWK → APS → ZDO (endpoint 0) or ZCL (app endpoints).
@@ -2091,274 +3339,111 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     ) -> Option<event_loop::StackEvent> {
         let mac_payload = indication.payload.as_slice();
 
-        // NWK layer: parse NWK header, check if frame is for us, decrypt if secured
-        let nwk_indication = {
-            let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
-            let (header, consumed) = match zigbee_nwk::frames::NwkHeader::parse(mac_payload) {
-                Some(v) => v,
-                None => {
-                    rt_trace!("[RT] nwk_parse=fail len={}", mac_payload.len());
-                    log::warn!(
-                        "[RX] NWK header parse failed, {} bytes: {:02X?}",
-                        mac_payload.len(),
-                        &mac_payload[..mac_payload.len().min(8)]
-                    );
-                    return None;
-                }
-            };
-
-            let dst = header.dst_addr;
-            let src = header.src_addr;
-            let nwk_fc = header.frame_control;
-            let nwk_addr = nwk.nib().network_address;
-            let is_for_us = dst == nwk_addr
-                || dst == ShortAddress::BROADCAST
-                || dst == ShortAddress(0xFFFF)
-                || dst == ShortAddress(0xFFFD);
-
-            rt_trace!(
-                "[RT] nwk type={} src=0x{:04X} dst=0x{:04X} sec={} for_us={} len={}",
-                nwk_fc.frame_type,
-                src.0,
-                dst.0,
-                nwk_fc.security as u8,
-                is_for_us as u8,
-                mac_payload.len().saturating_sub(consumed)
-            );
-            log::info!(
-                "[RX] NWK type={} src=0x{:04X} dst=0x{:04X} sec={} for_us={} len={}",
-                nwk_fc.frame_type,
-                src.0,
-                dst.0,
-                nwk_fc.security,
-                is_for_us,
-                mac_payload.len() - consumed
-            );
-
-            if !is_for_us {
-                rt_trace!("[RT] drop not_for_us");
-                return None;
-            }
-
-            if src == nwk_addr {
-                rt_trace!("[RT] drop self_originated src=0x{:04X}", src.0);
-                return None;
-            }
-
-            // Only NWK Data frames (type=0) carry APS payloads.
-            // NWK Command frames (type=1) are NWK-level management (Link Status,
-            // Route Reply, Leave, etc.) — handle or drop them here.
-            if nwk_fc.frame_type != 0 {
-                // For unicast NWK commands addressed to us, log the command ID
-                if is_for_us && nwk_fc.frame_type == 1 {
-                    log::info!("[RX] NWK cmd for us from 0x{:04X}, will decode", src.0);
-                    // Don't return — fall through to decrypt and inspect
-                } else {
-                    return None;
-                }
-            }
-
-            let after_header = &mac_payload[consumed..];
-            let buf = unsafe { &mut *self.scratch.nwk.get() };
-            let len;
-
-            if header.frame_control.security {
-                let count = nwk.rx_security_stats().secured_frames.wrapping_add(1);
-                nwk.rx_security_stats_mut().secured_frames = count;
-                // Parse NWK security auxiliary header
-                let (sec_hdr, sec_consumed) =
-                    match zigbee_nwk::security::NwkSecurityHeader::parse(after_header) {
-                        Some(v) => v,
-                        None => {
-                            let count = nwk
-                                .rx_security_stats()
-                                .security_header_parse_failures
-                                .wrapping_add(1);
-                            nwk.rx_security_stats_mut().security_header_parse_failures = count;
-                            rt_trace!("[RT] nwk_sec=parse_fail");
-                            log::warn!("[NWK] Failed to parse security header");
-                            return None;
-                        }
-                    };
-
-                // Look up decryption key by sequence number
-                let key = match nwk.security().key_by_seq(sec_hdr.key_seq_number) {
-                    Some(k) => k.key,
-                    None => {
-                        let count = nwk.rx_security_stats().missing_keys.wrapping_add(1);
-                        nwk.rx_security_stats_mut().missing_keys = count;
-                        rt_trace!("[RT] nwk_key=missing seq={}", sec_hdr.key_seq_number);
-                        log::warn!("[NWK] No key for seq {}", sec_hdr.key_seq_number);
-                        return None;
-                    }
-                };
-
-                // Replay protection — check BEFORE decrypt (don't commit yet)
-                if !nwk
-                    .security()
-                    .check_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter)
-                {
-                    let count = nwk.rx_security_stats().replay_rejections.wrapping_add(1);
-                    nwk.rx_security_stats_mut().replay_rejections = count;
-                    rt_trace!(
-                        "[RT] nwk_replay src={:02X?} fc={}",
-                        sec_hdr.source_address,
-                        sec_hdr.frame_counter
-                    );
-                    log::warn!("[NWK] Frame counter replay detected");
-                    return None;
-                }
-
-                // Build authenticated data (a = NWK header || security aux header)
-                // AAD must use ACTUAL security level (5), not OTA value (0).
-                let aad_len = consumed + sec_consumed;
-                let aad_buf = unsafe { &mut *self.scratch.aad.get() };
-                let aad_copy_len = aad_len.min(aad_buf.len());
-                aad_buf[..aad_copy_len].copy_from_slice(&mac_payload[..aad_copy_len]);
-                // Patch security control byte at offset `consumed` with actual level 5
-                aad_buf[consumed] = (aad_buf[consumed] & !0x07) | 0x05;
-                let ciphertext_and_mic = &after_header[sec_consumed..];
-
-                // Decrypt
-                match nwk.security().decrypt(
-                    &aad_buf[..aad_copy_len],
-                    ciphertext_and_mic,
-                    &key,
-                    &sec_hdr,
-                ) {
-                    Some(plaintext) => {
-                        let count = nwk.rx_security_stats().decrypt_successes.wrapping_add(1);
-                        nwk.rx_security_stats_mut().decrypt_successes = count;
-                        rt_trace!("[RT] nwk_decrypt=ok len={}", plaintext.len());
-                        // MIC verified — NOW commit frame counter
-                        nwk.security_mut()
-                            .commit_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter);
-                        len = plaintext.len().min(128);
-                        buf[..len].copy_from_slice(&plaintext[..len]);
-                    }
-                    None => {
-                        let count = nwk.rx_security_stats().decrypt_failures.wrapping_add(1);
-                        nwk.rx_security_stats_mut().decrypt_failures = count;
-                        rt_trace!("[RT] nwk_decrypt=fail");
-                        log::warn!("[NWK] Decryption failed (MIC mismatch)");
-                        return None;
-                    }
-                }
-            } else {
-                // No security — pass through
-                rt_trace!("[RT] nwk_unsecured len={}", after_header.len());
-                len = after_header.len().min(128);
-                buf[..len].copy_from_slice(&after_header[..len]);
-            }
-
-            (
-                dst,
-                src,
-                header.frame_control.security,
-                nwk_fc.frame_type,
-                len,
-            )
+        // NWK layer: header parsing, broadcast eligibility, BTR/relay for
+        // routing devices, replay checks, decryption and NWK command
+        // dispatch all live in the shared NWK implementation. The runtime
+        // only routes the outcome onwards — it must not duplicate the
+        // security-counter check/commit sequence.
+        // The MAC source address is the neighbour that actually transmitted
+        // this frame. NWK routing state is hop by hop — a propagated Route
+        // Request still carries the *originator* in its NWK header — so the
+        // previous hop has to travel with the frame into the NWK layer or the
+        // next hops installed from it would name a device several hops away.
+        let previous_hop = match indication.src_address {
+            zigbee_types::MacAddress::Short(_, addr) if addr.0 < 0xFFF8 => Some(addr),
+            // Extended or broadcast MAC source: unknown short address, so the
+            // NWK layer falls back to the NWK source address.
+            _ => None,
         };
 
-        let (dst, src, nwk_security, frame_type, len) = nwk_indication;
+        let (nwk_indication, command_outcome) = {
+            let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
+            let nwk_indication = nwk
+                .process_incoming_nwk_frame_from(mac_payload, indication.lqi, previous_hop)
+                .await;
+            // Collected in the same borrow as the call that produced it: the
+            // NWK layer clears this slot per frame, so nothing stale can leak
+            // into a later frame.
+            (nwk_indication, nwk.take_command_outcome())
+        };
+
+        // NWK commands never carry an NLDE-DATA payload; a lifecycle outcome
+        // is the whole result of the frame.
+        if let Some(command) = command_outcome {
+            return self.handle_nwk_command_outcome(command).await;
+        }
+
+        let (dst, src, nwk_security, nwk_security_source, len) = match nwk_indication {
+            None => {
+                rt_trace!("[RT] nwk_rx=dropped len={}", mac_payload.len());
+                return None;
+            }
+            Some(zigbee_nwk::nlde::NwkIndication::Borrowed(data)) => {
+                let buf = unsafe { &mut *self.scratch.nwk.get() };
+                let len = data.payload.len().min(buf.len());
+                buf[..len].copy_from_slice(&data.payload[..len]);
+                (
+                    data.dst_addr,
+                    data.src_addr,
+                    data.security_use,
+                    data.security_source,
+                    len,
+                )
+            }
+            Some(zigbee_nwk::nlde::NwkIndication::Owned(data)) => {
+                let buf = unsafe { &mut *self.scratch.nwk.get() };
+                let len = data.payload.len().min(buf.len());
+                buf[..len].copy_from_slice(&data.payload[..len]);
+                (
+                    data.dst_addr,
+                    data.src_addr,
+                    data.security_use,
+                    data.security_source,
+                    len,
+                )
+            }
+        };
+
         let buf = unsafe { &*self.scratch.nwk.get() };
 
-        // NWK Command frames (type=1) — parse and handle at runtime level
-        if frame_type == 1 {
-            if len > 0 {
-                let cmd_id = buf[0];
-                rt_trace!(
-                    "[RT] nwk_cmd id=0x{:02X} src=0x{:04X} dst=0x{:04X} len={}",
-                    cmd_id,
-                    src.0,
-                    dst.0,
-                    len
-                );
-                log::info!(
-                    "[RX] NWK Command id=0x{:02X} from 0x{:04X} ({} bytes)",
-                    cmd_id,
-                    src.0,
-                    len
-                );
-                // NWK Leave command (0x04) — signal application to rejoin
-                if cmd_id == 0x04 && len >= 2 {
-                    let nwk_addr = self.bdb.zdo().nwk().nib().network_address;
-                    let leave = zigbee_nwk::frames::LeaveCommand::parse(&buf[1..])?;
-                    let nib = self.bdb.zdo().nwk().nib();
-                    if nib.security_enabled && !nwk_security {
-                        log::warn!("[Runtime] Ignoring unsecured NWK Leave command");
-                        return None;
-                    }
-                    if leave.request && (dst != nwk_addr || src != nib.parent_address) {
-                        rt_trace!(
-                            "[RT] ignore unauthorized leave request src=0x{:04X} dst=0x{:04X}",
-                            src.0,
-                            dst.0
-                        );
-                        return None;
-                    }
-                    if !leave.request
-                        && dst != ShortAddress::BROADCAST_RX_ON_WHEN_IDLE
-                        && dst != nwk_addr
-                    {
-                        return None;
-                    }
-                    rt_trace!(
-                        "[RT] leave src=0x{:04X} remove_children={} request={} rejoin={}",
-                        src.0,
-                        leave.remove_children,
-                        leave.request,
-                        leave.rejoin
-                    );
-                    log::warn!(
-                        "[RX] NWK Leave from 0x{:04X} (remove_children={}, request={}, rejoin={})",
-                        src.0,
-                        leave.remove_children,
-                        leave.request,
-                        leave.rejoin
-                    );
-                    if !leave.request {
-                        self.bdb.zdo_mut().nwk_mut().remove_neighbor(src);
-                        if src == self.bdb.zdo().nwk().nib().parent_address {
-                            self.bdb.zdo_mut().nwk_mut().set_joined(false);
-                            let now = self.bdb.zdo().nwk().mac().monotonic_micros();
-                            self.secure_rejoin_retry_at = Some(now);
-                            return Some(event_loop::StackEvent::RejoinRequested);
-                        }
-                        return None;
-                    }
-                    // Mark as not joined so the stack stops sending until the
-                    // application either honors the requested rejoin or
-                    // clears its persisted network state.
-                    self.bdb.zdo_mut().nwk_mut().set_joined(false);
-                    if leave.rejoin {
-                        let now = self.bdb.zdo().nwk().mac().monotonic_micros();
-                        self.secure_rejoin_retry_at = Some(now);
-                    } else {
-                        self.secure_rejoin_retry_at = None;
-                    }
-                    return Some(if leave.rejoin {
-                        event_loop::StackEvent::RejoinRequested
-                    } else {
-                        event_loop::StackEvent::LeaveRequested
-                    });
-                }
-            }
-            return None;
-        }
+        rt_trace!(
+            "[RT] nwk src=0x{:04X} dst=0x{:04X} sec={} len={}",
+            src.0,
+            dst.0,
+            nwk_security as u8,
+            len
+        );
+        log::info!(
+            "[RX] NWK data src=0x{:04X} dst=0x{:04X} sec={} len={}",
+            src.0,
+            dst.0,
+            nwk_security,
+            len
+        );
 
         // APS decryption buffer (for APS-secured frames like Transport Key)
         let aps_decrypt_buf = unsafe { &mut *self.scratch.aps.get() };
 
         // APS layer: parse APS header
-        let aps_indication = self.bdb.zdo_mut().aps_mut().process_incoming_aps_frame(
-            &buf[..len],
-            src,
-            dst,
-            indication.lqi,
-            nwk_security,
-            aps_decrypt_buf,
-        );
+        let (aps_indication, pending_tunnel) = {
+            let aps = self.bdb.zdo_mut().aps_mut();
+            let indication = aps.process_incoming_aps_frame(
+                &buf[..len],
+                src,
+                dst,
+                indication.lqi,
+                zigbee_aps::apsde::IncomingNwkSecurity::new(nwk_security, nwk_security_source),
+                aps_decrypt_buf,
+            );
+            let tunnel = aps.take_pending_tunnel();
+            (indication, tunnel)
+        };
+        if let Some(tunnel) = pending_tunnel {
+            if let Err(error) = self.bdb.zdo_mut().aps_mut().forward_tunnel(&tunnel).await {
+                log::warn!("[Runtime] APS Tunnel forwarding failed: {:?}", error);
+            }
+            return None;
+        }
         let aps_indication = match aps_indication {
             Some(v) => v,
             None => {
@@ -3593,6 +4678,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.bdb.zdo_mut().nwk_mut().mac_mut()
     }
 
+    /// Shared access to the underlying MAC driver.
+    pub fn mac(&self) -> &M {
+        self.bdb.zdo().nwk().mac()
+    }
+
     /// Check if any attribute reports are due for a cluster and send them.
     ///
     /// Call this after updating cluster attributes (e.g., after reading sensors).
@@ -3760,5 +4850,681 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// Only sends for end devices (no-op for routers).
     pub async fn send_ed_timeout_request(&mut self) {
         let _ = self.bdb.zdo_mut().nwk_mut().send_ed_timeout_request().await;
+    }
+}
+
+#[cfg(all(test, feature = "router"))]
+mod parent_router_tests {
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+    use std::sync::Arc;
+    use std::task::Wake;
+
+    use super::{ClusterRef, ZigbeeDevice};
+    use zigbee_mac::frames::parse_zigbee_beacon;
+    use zigbee_mac::mock::MockMac;
+    use zigbee_mac::{
+        AssociationStatus, CapabilityInfo, MacCommandEvent, MacError, MacFrame, McpsDataIndication,
+        MlmeAssociateIndication, MlmeAssociateResponseDelivery, MlmeBeaconRequestIndication,
+        MlmeDataRequestIndication,
+    };
+    use zigbee_nwk::DeviceType;
+    use zigbee_types::{IeeeAddress, MacAddress, PanId, ShortAddress};
+
+    const PAN: PanId = PanId(0x1234);
+    const ROUTER: ShortAddress = ShortAddress(0x0001);
+    const CHILD_IEEE: IeeeAddress = [0x22; 8];
+    const ROUTER_IEEE: IeeeAddress = [1, 2, 3, 4, 5, 6, 7, 8];
+    const TC_IEEE: IeeeAddress = [0x44; 8];
+    const NETWORK_KEY: [u8; 16] = [0x55; 16];
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    fn router() -> ZigbeeDevice<MockMac> {
+        let mut device = ZigbeeDevice::builder(MockMac::new(ROUTER_IEEE))
+            .device_type(DeviceType::Router)
+            .build();
+        device.bdb_mut().attributes_mut().node_is_on_a_network = true;
+        {
+            let aps = device.bdb_mut().zdo_mut().aps_mut();
+            aps.aib_mut().aps_trust_center_address = [0xFF; 8];
+            let nwk = aps.nwk_mut();
+            nwk.set_joined(true);
+            let nib = nwk.nib_mut();
+            nib.pan_id = PAN;
+            nib.network_address = ROUTER;
+            nib.extended_pan_id = [0xA5; 8];
+            nib.depth = 3;
+            nib.update_id = 7;
+        }
+        device
+    }
+
+    fn centralized_router() -> ZigbeeDevice<MockMac> {
+        let mut device = router();
+        let aps = device.bdb_mut().zdo_mut().aps_mut();
+        aps.aib_mut().aps_trust_center_address = TC_IEEE;
+        let nwk = aps.nwk_mut();
+        nwk.security_mut().set_network_key(NETWORK_KEY, 0);
+        let nib = nwk.nib_mut();
+        nib.ieee_address = ROUTER_IEEE;
+        nib.parent_address = ShortAddress::COORDINATOR;
+        nib.security_enabled = true;
+        nib.active_key_seq_number = 0;
+        device
+    }
+
+    fn beacon_request() -> MacCommandEvent {
+        MacCommandEvent::BeaconRequest(MlmeBeaconRequestIndication {
+            destination_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+            lqi: 200,
+            security_use: false,
+        })
+    }
+
+    fn association_request(ieee: IeeeAddress, capability_info: CapabilityInfo) -> MacCommandEvent {
+        MacCommandEvent::AssociationRequest(MlmeAssociateIndication {
+            device_address: ieee,
+            coordinator_address: MacAddress::Short(PAN, ROUTER),
+            capability_info,
+            lqi: 180,
+            security_use: false,
+        })
+    }
+
+    fn sleepy_child_capabilities() -> CapabilityInfo {
+        CapabilityInfo {
+            device_type_ffd: false,
+            mains_powered: false,
+            rx_on_when_idle: false,
+            security_capable: true,
+            allocate_address: true,
+        }
+    }
+
+    fn data_request(source_address: MacAddress) -> MacCommandEvent {
+        MacCommandEvent::DataRequest(MlmeDataRequestIndication {
+            source_address,
+            destination_address: MacAddress::Short(PAN, ROUTER),
+            lqi: 170,
+            security_use: false,
+        })
+    }
+
+    fn open_for_joining(device: &mut ZigbeeDevice<MockMac>, duration: u8) {
+        block_on(device.permit_joining(duration)).unwrap();
+    }
+
+    fn associate_sleepy_child(device: &mut ZigbeeDevice<MockMac>) -> ShortAddress {
+        open_for_joining(device, 0xFF);
+        device
+            .mac_mut()
+            .enqueue_command_event(association_request(CHILD_IEEE, sleepy_child_capabilities()));
+        assert_eq!(block_on(device.service_parent_commands()).processed, 2);
+        let response = device.mac().association_responses().last().unwrap();
+        assert_eq!(response.status, AssociationStatus::Success);
+        response.short_address
+    }
+
+    #[test]
+    fn beacon_uses_nib_capacity_and_join_state() {
+        let mut device = router();
+        {
+            let nib = device.bdb_mut().zdo_mut().aps_mut().nwk_mut().nib_mut();
+            nib.max_routers = 0;
+            nib.max_children = 1;
+        }
+        open_for_joining(&mut device, 0xFF);
+        device.mac_mut().enqueue_command_event(beacon_request());
+        assert_eq!(block_on(device.service_parent_commands()).processed, 1);
+
+        let response = &device.mac().beacon_responses()[0];
+        let beacon = parse_zigbee_beacon(response.beacon_payload.as_slice());
+        assert_eq!(beacon.protocol_id, 0);
+        assert_eq!(beacon.stack_profile, 2);
+        assert_eq!(beacon.protocol_version, 2);
+        assert!(!beacon.router_capacity);
+        assert!(beacon.end_device_capacity);
+        assert_eq!(beacon.device_depth, 3);
+        assert_eq!(beacon.extended_pan_id, [0xA5; 8]);
+        assert_eq!(beacon.tx_offset, [0xFF; 3]);
+        assert_eq!(beacon.update_id, 7);
+        assert!(response.association_permit);
+
+        let _ = associate_sleepy_child(&mut device);
+        device.mac_mut().enqueue_command_event(beacon_request());
+        block_on(device.service_parent_commands());
+        let full = device.mac().beacon_responses().last().unwrap();
+        let full_payload = parse_zigbee_beacon(full.beacon_payload.as_slice());
+        assert!(!full_payload.end_device_capacity);
+        assert!(!full.association_permit);
+    }
+
+    #[test]
+    fn association_is_accepted_or_denied_by_policy_and_capacity() {
+        let mut accepted = router();
+        let short = associate_sleepy_child(&mut accepted);
+        assert_ne!(short, ShortAddress(0xFFFF));
+        assert_eq!(
+            accepted
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .known_child_by_ieee(&CHILD_IEEE),
+            Some(short)
+        );
+
+        let mut closed = router();
+        closed
+            .mac_mut()
+            .enqueue_command_event(association_request(CHILD_IEEE, sleepy_child_capabilities()));
+        block_on(closed.service_parent_commands());
+        assert_eq!(
+            closed.mac().association_responses()[0].status,
+            AssociationStatus::PanAccessDenied
+        );
+
+        let mut full = router();
+        full.bdb_mut()
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .nib_mut()
+            .max_children = 0;
+        open_for_joining(&mut full, 0xFF);
+        full.mac_mut()
+            .enqueue_command_event(association_request(CHILD_IEEE, sleepy_child_capabilities()));
+        block_on(full.service_parent_commands());
+        assert_eq!(
+            full.mac().association_responses()[0].status,
+            AssociationStatus::PanAtCapacity
+        );
+
+        let mut invalid = router();
+        open_for_joining(&mut invalid, 0xFF);
+        let mut capabilities = sleepy_child_capabilities();
+        capabilities.allocate_address = false;
+        invalid
+            .mac_mut()
+            .enqueue_command_event(association_request(CHILD_IEEE, capabilities));
+        block_on(invalid.service_parent_commands());
+        assert_eq!(
+            invalid.mac().association_responses()[0].status,
+            AssociationStatus::PanAccessDenied
+        );
+    }
+
+    #[test]
+    fn tick_expires_finite_permit_but_not_indefinite_permit() {
+        let mut finite = router();
+        open_for_joining(&mut finite, 2);
+        let mut clusters: [ClusterRef<'_>; 0] = [];
+        block_on(finite.tick(1, &mut clusters));
+        assert!(finite.mac().association_permit());
+        block_on(finite.tick(1, &mut clusters));
+        assert!(!finite.mac().association_permit());
+        assert!(!finite.bdb().zdo().aps().nwk().nib().permit_joining);
+
+        let mut indefinite = router();
+        open_for_joining(&mut indefinite, 0xFF);
+        block_on(indefinite.tick(u16::MAX, &mut clusters));
+        assert!(indefinite.mac().association_permit());
+        assert_eq!(
+            indefinite
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .nib()
+                .permit_joining_duration,
+            0xFF
+        );
+    }
+
+    #[test]
+    fn child_poll_sends_one_frame_and_tracks_remaining_pending_data() {
+        let mut device = router();
+        let child = associate_sleepy_child(&mut device);
+        {
+            let nwk = device.bdb_mut().zdo_mut().aps_mut().nwk_mut();
+            nwk.enqueue_indirect_for_child(child, &[1, 2]).unwrap();
+            nwk.enqueue_indirect_for_child(child, &[3, 4]).unwrap();
+        }
+        device.mac_mut().clear_tx_history();
+        device
+            .mac_mut()
+            .enqueue_command_event(data_request(MacAddress::Short(PAN, child)));
+        block_on(device.service_parent_commands());
+
+        assert_eq!(device.mac().tx_history().len(), 1);
+        assert!(device.mac().tx_history()[0].indirect);
+        assert_eq!(device.mac().tx_history()[0].payload.as_slice(), &[1, 2]);
+        assert_eq!(
+            device.mac().indirect_pending_history().last(),
+            Some(&(MacAddress::Short(PAN, child), true))
+        );
+
+        device
+            .mac_mut()
+            .enqueue_command_event(data_request(MacAddress::Short(PAN, child)));
+        block_on(device.service_parent_commands());
+        assert_eq!(device.mac().tx_history().len(), 2);
+        assert_eq!(
+            device.mac().indirect_pending_history().last(),
+            Some(&(MacAddress::Short(PAN, child), false))
+        );
+    }
+
+    #[test]
+    fn unknown_and_extended_polls_do_not_dequeue_nwk_indirect_data() {
+        let mut device = router();
+        let child = associate_sleepy_child(&mut device);
+        device
+            .bdb_mut()
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .enqueue_indirect_for_child(child, &[9])
+            .unwrap();
+        device.mac_mut().clear_tx_history();
+        device
+            .mac_mut()
+            .enqueue_command_event(data_request(MacAddress::Short(PAN, ShortAddress(0x7788))));
+        device
+            .mac_mut()
+            .enqueue_command_event(data_request(MacAddress::Extended(PAN, CHILD_IEEE)));
+        block_on(device.service_parent_commands());
+        assert!(device.mac().tx_history().is_empty());
+        assert!(
+            device
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .indirect_queue()
+                .has_pending(child)
+        );
+    }
+
+    #[test]
+    fn expired_indirect_transaction_clears_frame_pending() {
+        let mut device = router();
+        let child = associate_sleepy_child(&mut device);
+        device
+            .bdb_mut()
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .enqueue_indirect_for_child(child, &[9])
+            .unwrap();
+        let mut clusters: [ClusterRef<'_>; 0] = [];
+        block_on(device.tick(8, &mut clusters));
+
+        assert!(
+            !device
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .indirect_queue()
+                .has_pending(child)
+        );
+        assert_eq!(
+            device.mac().indirect_pending_history().last(),
+            Some(&(MacAddress::Short(PAN, child), false))
+        );
+    }
+
+    #[test]
+    fn command_drain_is_bounded_to_four_events() {
+        let mut device = router();
+        for _ in 0..5 {
+            device.mac_mut().enqueue_command_event(beacon_request());
+        }
+        let first = block_on(device.service_parent_commands());
+        assert_eq!(first.processed, 4);
+        assert_eq!(device.mac().beacon_responses().len(), 4);
+        let second = block_on(device.service_parent_commands());
+        assert_eq!(second.processed, 1);
+        assert_eq!(device.mac().beacon_responses().len(), 5);
+    }
+
+    #[test]
+    fn update_device_waits_for_association_response_delivery() {
+        let mut device = centralized_router();
+        open_for_joining(&mut device, 0xFF);
+
+        block_on(
+            device.handle_parent_command(association_request(
+                CHILD_IEEE,
+                sleepy_child_capabilities(),
+            )),
+        )
+        .unwrap();
+        let response = device.mac().association_responses()[0].clone();
+        assert!(
+            device.mac().tx_history().is_empty(),
+            "queueing the Association Response must not notify the Trust Center"
+        );
+        assert!(
+            !device
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .child_is_authorized(&CHILD_IEEE)
+        );
+
+        let step = block_on(device.service_parent_commands());
+        assert_eq!(step.processed, 1);
+        assert_eq!(step.failures, 0);
+        assert_eq!(
+            device.mac().tx_history().len(),
+            2,
+            "the global TC key produces encrypted and NWK-only Update-Device copies"
+        );
+        assert_eq!(
+            device
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .known_child_by_ieee(&CHILD_IEEE),
+            Some(response.short_address)
+        );
+    }
+
+    #[test]
+    fn failed_association_response_delivery_rolls_back_a_provisional_child() {
+        let mut device = centralized_router();
+        open_for_joining(&mut device, 0xFF);
+        block_on(
+            device.handle_parent_command(association_request(
+                CHILD_IEEE,
+                sleepy_child_capabilities(),
+            )),
+        )
+        .unwrap();
+        let response = device.mac().association_responses()[0].clone();
+
+        assert_eq!(
+            block_on(
+                device.handle_parent_command(MacCommandEvent::AssociationResponseDelivery(
+                    MlmeAssociateResponseDelivery {
+                        device_address: CHILD_IEEE,
+                        short_address: response.short_address,
+                        status: AssociationStatus::Success,
+                        result: Err(MacError::NoAck),
+                    },
+                ),)
+            ),
+            Err(MacError::NoAck)
+        );
+        assert_eq!(
+            device
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .known_child_by_ieee(&CHILD_IEEE),
+            None
+        );
+    }
+
+    #[test]
+    fn sleepy_rejoin_notifies_the_trust_center_only_after_the_response_poll() {
+        let mut device = centralized_router();
+        device
+            .bdb_mut()
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .nib_mut()
+            .permit_joining = true;
+        let old_address = ShortAddress(0x3344);
+
+        block_on(device.handle_child_rejoin_request(
+            old_address,
+            CHILD_IEEE,
+            sleepy_child_capabilities().to_byte(),
+            false,
+        ));
+        assert!(device.mac().tx_history().is_empty());
+        assert!(
+            device
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .indirect_queue()
+                .has_pending(old_address)
+        );
+        assert_eq!(device.pending_child_updates.len(), 1);
+
+        device
+            .mac_mut()
+            .enqueue_command_event(data_request(MacAddress::Short(PAN, old_address)));
+        let step = block_on(device.service_parent_commands());
+        assert_eq!(step.processed, 1);
+        assert_eq!(step.failures, 0);
+        assert_eq!(device.pending_child_updates.len(), 0);
+        let history = device.mac().tx_history();
+        assert_eq!(history.len(), 3);
+        assert!(history[0].indirect);
+        let response = history[0].payload.as_slice();
+        let (header, consumed) = zigbee_nwk::frames::NwkHeader::parse(response).unwrap();
+        assert_eq!(header.dst_addr, old_address);
+        assert!(!header.frame_control.security);
+        assert_eq!(
+            &response[consumed..],
+            &[
+                zigbee_nwk::frames::NwkCommandId::RejoinResponse as u8,
+                old_address.0 as u8,
+                (old_address.0 >> 8) as u8,
+                0,
+            ]
+        );
+    }
+
+    #[test]
+    fn distributed_security_rejects_an_unsecured_trust_center_rejoin() {
+        let mut device = router();
+        let old_address = ShortAddress(0x4455);
+        let mut capability = sleepy_child_capabilities();
+        capability.rx_on_when_idle = true;
+
+        block_on(device.handle_child_rejoin_request(
+            old_address,
+            CHILD_IEEE,
+            capability.to_byte(),
+            false,
+        ));
+
+        assert_eq!(
+            device
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .known_child_by_ieee(&CHILD_IEEE),
+            None
+        );
+        let history = device.mac().tx_history();
+        assert_eq!(history.len(), 1);
+        let response = history[0].payload.as_slice();
+        let (_, consumed) = zigbee_nwk::frames::NwkHeader::parse(response).unwrap();
+        assert_eq!(
+            &response[consumed..],
+            &[
+                zigbee_nwk::frames::NwkCommandId::RejoinResponse as u8,
+                0xFF,
+                0xFF,
+                0x02,
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_forwards_a_tunneled_apdu_unchanged_to_a_sleepy_child() {
+        let mut device = centralized_router();
+        {
+            let nwk = device.bdb_mut().zdo_mut().aps_mut().nwk_mut();
+            nwk.nib_mut().permit_joining = true;
+            nwk.handle_child_association(CHILD_IEEE, sleepy_child_capabilities().to_byte())
+                .unwrap();
+        }
+        let child = device
+            .bdb()
+            .zdo()
+            .aps()
+            .nwk()
+            .known_child_by_ieee(&CHILD_IEEE)
+            .unwrap();
+
+        let embedded_header = zigbee_aps::frames::ApsHeader {
+            frame_control: zigbee_aps::frames::ApsFrameControl {
+                frame_type: zigbee_aps::frames::ApsFrameType::Command as u8,
+                delivery_mode: zigbee_aps::frames::ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: true,
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: None,
+            group_address: None,
+            cluster_id: None,
+            profile_id: None,
+            src_endpoint: None,
+            aps_counter: 7,
+            extended_header: None,
+        };
+        let mut embedded = [0u8; 64];
+        let embedded_header_len = embedded_header.serialize(&mut embedded);
+        let embedded_security = zigbee_aps::security::ApsSecurityHeader {
+            security_control: (zigbee_aps::security::KEY_ID_KEY_TRANSPORT << 3) | (1 << 5),
+            frame_counter: 9,
+            source_address: Some(TC_IEEE),
+            key_seq_number: None,
+        };
+        let embedded_security_len =
+            embedded_security.serialize(&mut embedded[embedded_header_len..]);
+        let embedded_len = embedded_header_len + embedded_security_len + 5;
+        embedded[embedded_header_len + embedded_security_len..embedded_len]
+            .copy_from_slice(&[1, 2, 3, 4, 5]);
+
+        let outer_header = zigbee_aps::frames::ApsHeader {
+            frame_control: zigbee_aps::frames::ApsFrameControl {
+                frame_type: zigbee_aps::frames::ApsFrameType::Command as u8,
+                delivery_mode: zigbee_aps::frames::ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: false,
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: None,
+            group_address: None,
+            cluster_id: None,
+            profile_id: None,
+            src_endpoint: None,
+            aps_counter: 8,
+            extended_header: None,
+        };
+        let mut outer = [0u8; 96];
+        let outer_header_len = outer_header.serialize(&mut outer);
+        outer[outer_header_len] = zigbee_aps::frames::ApsCommandId::Tunnel as u8;
+        outer[outer_header_len + 1..outer_header_len + 9].copy_from_slice(&CHILD_IEEE);
+        outer[outer_header_len + 9..outer_header_len + 9 + embedded_len]
+            .copy_from_slice(&embedded[..embedded_len]);
+        let outer_len = outer_header_len + 9 + embedded_len;
+
+        let nwk_header = zigbee_nwk::frames::NwkHeader {
+            frame_control: zigbee_nwk::frames::NwkFrameControl {
+                frame_type: zigbee_nwk::frames::NwkFrameType::Data as u8,
+                protocol_version: 0x02,
+                discover_route: 0,
+                multicast: false,
+                security: true,
+                source_route: false,
+                dst_ieee_present: false,
+                src_ieee_present: false,
+                end_device_initiator: false,
+            },
+            dst_addr: ROUTER,
+            src_addr: ShortAddress::COORDINATOR,
+            radius: 5,
+            seq_number: 9,
+            dst_ieee: None,
+            src_ieee: None,
+            multicast_control: None,
+            source_route: None,
+        };
+        let mut nwk_frame = [0u8; 128];
+        let nwk_header_len = nwk_header.serialize(&mut nwk_frame);
+        let nwk_security = zigbee_nwk::security::NwkSecurityHeader {
+            security_control: zigbee_nwk::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
+            frame_counter: 1,
+            source_address: TC_IEEE,
+            key_seq_number: 0,
+        };
+        let nwk_security_len = nwk_security.serialize(&mut nwk_frame[nwk_header_len..]);
+        let aad_len = nwk_header_len + nwk_security_len;
+        let ciphertext = zigbee_nwk::security::NwkSecurity::new()
+            .encrypt(
+                &nwk_frame[..aad_len],
+                &outer[..outer_len],
+                &NETWORK_KEY,
+                &nwk_security,
+            )
+            .unwrap();
+        nwk_frame[aad_len..aad_len + ciphertext.len()].copy_from_slice(&ciphertext);
+        nwk_frame[nwk_header_len] &= !0x07;
+        let frame_len = aad_len + ciphertext.len();
+        let indication = McpsDataIndication {
+            src_address: MacAddress::Short(PAN, ShortAddress::COORDINATOR),
+            dst_address: MacAddress::Short(PAN, ROUTER),
+            lqi: 200,
+            payload: MacFrame::from_slice(&nwk_frame[..frame_len]).unwrap(),
+            security_use: false,
+        };
+
+        let mut clusters: [ClusterRef<'_>; 0] = [];
+        assert!(block_on(device.process_incoming(&indication, &mut clusters)).is_none());
+        assert!(
+            device
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .indirect_queue()
+                .has_pending(child)
+        );
+
+        device
+            .mac_mut()
+            .enqueue_command_event(data_request(MacAddress::Short(PAN, child)));
+        block_on(device.service_parent_commands());
+        let record = &device.mac().tx_history()[0];
+        assert!(record.indirect);
+        let bytes = record.payload.as_slice();
+        let (forward_header, consumed) = zigbee_nwk::frames::NwkHeader::parse(bytes).unwrap();
+        assert!(!forward_header.frame_control.security);
+        assert_eq!(&bytes[consumed..], &embedded[..embedded_len]);
     }
 }

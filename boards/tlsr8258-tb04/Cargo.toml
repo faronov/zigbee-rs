@@ -8,9 +8,7 @@ repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
 [dependencies]
-embedded-storage = "0.3"
 tlsr8258-hal = { path = "../../tlsr8258-hal" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

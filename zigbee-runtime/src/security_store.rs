@@ -9,13 +9,15 @@ use zigbee_bdb::{
 };
 use zigbee_types::IeeeAddress;
 
-pub const ENCODED_SECURITY_STATE_LEN: usize = 80;
+pub const ENCODED_SECURITY_STATE_LEN: usize = 97;
+pub(crate) const LEGACY_ENCODED_SECURITY_STATE_LEN: usize = 80;
 
 const FLAG_COMMISSIONED: u8 = 1 << 0;
 const FLAG_TCLK_PRESENT: u8 = 1 << 1;
 const FLAG_TCLK_INCOMING_VALID: u8 = 1 << 2;
 const FLAG_REJOIN_PENDING: u8 = 1 << 3;
 const FLAG_LEGACY_DEFAULT_TCLK: u8 = 1 << 4;
+const FLAG_STAGED_NETWORK_KEY: u8 = 1 << 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityStoreError {
@@ -41,6 +43,9 @@ pub struct PersistentSecurityState {
     pub update_id: u8,
     pub network_key: [u8; 16],
     pub key_sequence: u8,
+    pub staged_network_key_present: bool,
+    pub staged_network_key: [u8; 16],
+    pub staged_key_sequence: u8,
     /// Persisted exclusive upper bound, never the live counter.
     pub global_counter_limit: u32,
     pub tclk_present: bool,
@@ -80,6 +85,9 @@ impl PersistentSecurityState {
             update_id: 0,
             network_key: [0; 16],
             key_sequence: 0,
+            staged_network_key_present: false,
+            staged_network_key: [0; 16],
+            staged_key_sequence: 0,
             global_counter_limit: 0,
             tclk_present: false,
             legacy_default_tclk: false,
@@ -114,6 +122,10 @@ impl PersistentSecurityState {
             FLAG_LEGACY_DEFAULT_TCLK
         } else {
             0
+        }) | (if self.staged_network_key_present {
+            FLAG_STAGED_NETWORK_KEY
+        } else {
+            0
         });
         output[1] = self.channel;
         output[2] = self.depth;
@@ -130,16 +142,33 @@ impl PersistentSecurityState {
         output[56..72].copy_from_slice(&self.trust_center_link_key);
         output[72..76].copy_from_slice(&self.tclk_counter_limit.to_le_bytes());
         output[76..80].copy_from_slice(&self.tclk_incoming_counter.to_le_bytes());
+        output[80] = self.staged_key_sequence;
+        output[81..97].copy_from_slice(&self.staged_network_key);
     }
 
     pub fn decode(input: &[u8; ENCODED_SECURITY_STATE_LEN]) -> Result<Self, SecurityStoreError> {
+        Self::decode_bytes(input, true)
+    }
+
+    pub(crate) fn decode_legacy(
+        input: &[u8; LEGACY_ENCODED_SECURITY_STATE_LEN],
+    ) -> Result<Self, SecurityStoreError> {
+        Self::decode_bytes(input, false)
+    }
+
+    fn decode_bytes(input: &[u8], supports_staged_key: bool) -> Result<Self, SecurityStoreError> {
         let flags = input[0];
         if flags
             & !(FLAG_COMMISSIONED
                 | FLAG_TCLK_PRESENT
                 | FLAG_TCLK_INCOMING_VALID
                 | FLAG_REJOIN_PENDING
-                | FLAG_LEGACY_DEFAULT_TCLK)
+                | FLAG_LEGACY_DEFAULT_TCLK
+                | if supports_staged_key {
+                    FLAG_STAGED_NETWORK_KEY
+                } else {
+                    0
+                })
             != 0
         {
             return Err(SecurityStoreError::Corrupt);
@@ -167,6 +196,11 @@ impl PersistentSecurityState {
         state.tclk_counter_limit = u32::from_le_bytes([input[72], input[73], input[74], input[75]]);
         state.tclk_incoming_counter =
             u32::from_le_bytes([input[76], input[77], input[78], input[79]]);
+        if supports_staged_key {
+            state.staged_network_key_present = flags & FLAG_STAGED_NETWORK_KEY != 0;
+            state.staged_key_sequence = input[80];
+            state.staged_network_key.copy_from_slice(&input[81..97]);
+        }
 
         state.validate()?;
         Ok(state)
@@ -194,6 +228,13 @@ impl PersistentSecurityState {
                 || self.tclk_incoming_counter != 0
                 || self.tclk_incoming_counter_valid)
         {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        if self.staged_network_key_present {
+            if !self.commissioned || self.staged_key_sequence == self.key_sequence {
+                return Err(SecurityStoreError::Corrupt);
+            }
+        } else if self.staged_key_sequence != 0 || self.staged_network_key != [0; 16] {
             return Err(SecurityStoreError::Corrupt);
         }
         if self.tclk_present
@@ -281,6 +322,9 @@ impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersist
         self.state.update_id = state.update_id;
         self.state.network_key = state.network_key;
         self.state.key_sequence = state.key_sequence;
+        self.state.staged_network_key_present = false;
+        self.state.staged_network_key = [0; 16];
+        self.state.staged_key_sequence = 0;
         self.state.global_counter_limit = reservation.limit;
         self.state.tclk_present = false;
         self.state.legacy_default_tclk = false;
@@ -409,6 +453,9 @@ mod tests {
         state.update_id = 9;
         state.network_key = [3; 16];
         state.key_sequence = 4;
+        state.staged_network_key_present = true;
+        state.staged_network_key = [8; 16];
+        state.staged_key_sequence = 5;
         state.global_counter_limit = 0x400;
         state.tclk_present = true;
         state.trust_center_address = [5; 8];
@@ -535,6 +582,29 @@ mod tests {
         assert_eq!(saved.global_counter_limit, 0x402);
         assert_eq!(saved.tclk_counter_limit, 0x400);
         assert_eq!(saved.tclk_incoming_counter, 9);
+    }
+
+    #[test]
+    fn fresh_commissioning_discards_a_previously_staged_network_key() {
+        let mut store = RamSecurityStateStore::new();
+        let mut old = PersistentSecurityState::empty();
+        old.commissioned = true;
+        old.staged_network_key_present = true;
+        old.staged_network_key = [0x55; 16];
+        old.staged_key_sequence = 7;
+        store.store(&old).unwrap();
+
+        {
+            let mut persistence = CommissioningSecurityPersistence::new(&mut store).unwrap();
+            persistence
+                .reserve_network_security(&network_state(0))
+                .unwrap();
+        }
+
+        let saved = store.load().unwrap().unwrap();
+        assert!(!saved.staged_network_key_present);
+        assert_eq!(saved.staged_network_key, [0; 16]);
+        assert_eq!(saved.staged_key_sequence, 0);
     }
 
     #[test]

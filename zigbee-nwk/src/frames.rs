@@ -192,24 +192,26 @@ impl NwkHeader {
         };
 
         // Source route subframe
-        let source_route = if frame_control.source_route && data.len() >= offset + 2 {
+        let source_route = if frame_control.source_route {
+            if data.len() < offset + 2 {
+                return None;
+            }
             let relay_count = data[offset];
             let relay_index = data[offset + 1];
             offset += 2;
+            let relay_count_usize = relay_count as usize;
+            if relay_count == 0
+                || relay_index >= relay_count
+                || relay_count_usize > 16
+                || data.len() < offset + relay_count_usize * 2
+            {
+                return None;
+            }
             let mut relay_list = heapless::Vec::new();
-            for i in 0..relay_count {
-                if data.len() >= offset + 2 {
-                    let relay = ShortAddress(u16::from_le_bytes([data[offset], data[offset + 1]]));
-                    if relay_list.push(relay).is_err() {
-                        log::warn!(
-                            "NWK source route: relay list full (capacity={}, have={})",
-                            relay_list.capacity(),
-                            i,
-                        );
-                        break;
-                    }
-                    offset += 2;
-                }
+            for _ in 0..relay_count {
+                let relay = ShortAddress(u16::from_le_bytes([data[offset], data[offset + 1]]));
+                relay_list.push(relay).ok()?;
+                offset += 2;
             }
             Some(SourceRoute {
                 relay_count,
@@ -632,5 +634,30 @@ impl EdTimeoutResponse {
             status: data[0],
             parent_info: data[1],
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NwkHeader;
+
+    #[test]
+    fn rejects_malformed_source_route_subframes() {
+        let malformed: &[&[u8]] = &[
+            // Missing relay count and index.
+            &[0x08, 0x04, 1, 0, 2, 0, 5, 1],
+            // Missing relay index.
+            &[0x08, 0x04, 1, 0, 2, 0, 5, 1, 1],
+            // Empty relay list.
+            &[0x08, 0x04, 1, 0, 2, 0, 5, 1, 0, 0],
+            // Relay index outside the list.
+            &[0x08, 0x04, 1, 0, 2, 0, 5, 1, 1, 1, 3, 0],
+            // Truncated relay list.
+            &[0x08, 0x04, 1, 0, 2, 0, 5, 1, 2, 1, 3, 0],
+        ];
+
+        for frame in malformed {
+            assert!(NwkHeader::parse(frame).is_none(), "{frame:02X?}");
+        }
     }
 }
