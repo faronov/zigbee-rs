@@ -37,6 +37,8 @@ pub const DEVICE_TYPE_ELECTRIC: u8 = 0x00;
 pub const DEVICE_TYPE_GAS: u8 = 0x01;
 pub const DEVICE_TYPE_WATER: u8 = 0x02;
 
+const MAX_U48: u64 = (1u64 << 48) - 1;
+
 /// Simple Metering cluster implementation.
 pub struct MeteringCluster {
     store: AttributeStore<10>,
@@ -144,9 +146,14 @@ impl MeteringCluster {
             Some(ZclValue::U48(v)) => *v,
             _ => 0,
         };
+        self.set_total_delivered(current.saturating_add(wh));
+    }
+
+    /// Restore the cumulative delivered-energy counter from durable storage.
+    pub fn set_total_delivered(&mut self, wh: u64) {
         let _ = self.store.set_raw(
             ATTR_CURRENT_SUMMATION_DELIVERED,
-            ZclValue::U48(current.saturating_add(wh)),
+            ZclValue::U48(wh.min(MAX_U48)),
         );
     }
 
@@ -184,5 +191,22 @@ impl Cluster for MeteringCluster {
     }
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_delivered_can_be_restored_and_saturates_to_u48() {
+        let mut cluster = MeteringCluster::new(UNIT_KWH, 1, 1_000);
+        cluster.set_total_delivered(12_345);
+        assert_eq!(cluster.get_total_delivered(), 12_345);
+
+        cluster.set_total_delivered(u64::MAX);
+        assert_eq!(cluster.get_total_delivered(), MAX_U48);
+        cluster.add_energy_delivered(1);
+        assert_eq!(cluster.get_total_delivered(), MAX_U48);
     }
 }

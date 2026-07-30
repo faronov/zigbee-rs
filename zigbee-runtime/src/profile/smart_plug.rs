@@ -31,8 +31,9 @@ use crate::builder::EndpointBuilder;
 use crate::{ClusterRef, ZigbeeDevice};
 use zigbee_mac::MacDriver;
 use zigbee_zcl::ClusterId;
+use zigbee_zcl::ZclStatus;
 use zigbee_zcl::clusters::electrical::{
-    ATTR_ACTIVE_POWER, ATTR_RMS_CURRENT, ATTR_RMS_VOLTAGE, ElectricalMeasurementCluster,
+    ATTR_ACTIVE_POWER, ATTR_RMS_CURRENT, ATTR_RMS_VOLTAGE, AcScaling, ElectricalMeasurementCluster,
 };
 use zigbee_zcl::clusters::metering::{
     ATTR_CURRENT_SUMMATION_DELIVERED, ATTR_INSTANTANEOUS_DEMAND, MeteringCluster,
@@ -142,12 +143,25 @@ impl SmartPlug {
         );
     }
 
+    /// Configure how clients scale the raw voltage/current/power attributes.
+    pub fn set_electrical_scaling(&mut self, scaling: AcScaling) -> Result<(), ZclStatus> {
+        self.electrical.set_ac_scaling(scaling)
+    }
+
     /// Add delivered energy (Wh) to the cumulative summation counter. No-op
     /// if metering was not configured via
     /// [`with_metering`](Self::with_metering).
     pub fn add_energy_delivered_wh(&mut self, wh: u64) {
         if let Some(metering) = &mut self.metering {
             metering.add_energy_delivered(wh);
+        }
+    }
+
+    /// Restore cumulative delivered energy (Wh) from durable storage. No-op
+    /// if metering was not configured.
+    pub fn restore_energy_delivered_wh(&mut self, wh: u64) {
+        if let Some(metering) = &mut self.metering {
+            metering.set_total_delivered(wh);
         }
     }
 
@@ -410,16 +424,33 @@ mod tests {
         let mut component =
             SmartPlug::new(SmartPlugReporting::default()).with_metering(UNIT_KWH, 1, 1_000);
         component.update_electrical(ElectricalReading {
-            rms_voltage: 230,
+            rms_voltage: 2_300,
             rms_current: 500,
             active_power_watts: 115,
         });
+        component
+            .set_electrical_scaling(AcScaling {
+                voltage_multiplier: 1,
+                voltage_divisor: 10,
+                current_multiplier: 1,
+                current_divisor: 1_000,
+                power_multiplier: 1,
+                power_divisor: 1,
+            })
+            .unwrap();
         component.add_energy_delivered_wh(1_500);
         component.set_instantaneous_demand_watts(115);
 
         assert_eq!(
             component.electrical().attributes().get(ATTR_RMS_VOLTAGE),
-            Some(&ZclValue::U16(230))
+            Some(&ZclValue::U16(2_300))
+        );
+        assert_eq!(
+            component
+                .electrical()
+                .attributes()
+                .get(zigbee_zcl::clusters::electrical::ATTR_AC_CURRENT_DIVISOR),
+            Some(&ZclValue::U16(1_000))
         );
         assert_eq!(
             component.electrical().attributes().get(ATTR_ACTIVE_POWER),
@@ -429,6 +460,8 @@ mod tests {
 
         component.add_energy_delivered_wh(500);
         assert_eq!(component.total_energy_delivered_wh(), Some(2_000));
+        component.restore_energy_delivered_wh(42_000);
+        assert_eq!(component.total_energy_delivered_wh(), Some(42_000));
     }
 
     #[test]
