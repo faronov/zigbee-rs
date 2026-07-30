@@ -309,6 +309,7 @@ pub enum FrameBuildError {
 }
 
 /// Build a data frame without an FCS. The radio backend appends the FCS.
+#[allow(clippy::too_many_arguments)]
 pub fn build_data_frame(
     seq: u8,
     src_addr_mode: AddressMode,

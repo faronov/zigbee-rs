@@ -45,6 +45,7 @@ phy6252 = ["phy62x2-evk/phy6252"]
 stubs = []
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = true
+codegen-units = 1
 panic = "abort"

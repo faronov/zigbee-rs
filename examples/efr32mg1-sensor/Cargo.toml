@@ -45,5 +45,7 @@ static_cell = "2"
 rtt-target = "0.6"
 
 [profile.release]
-opt-level = 3
+opt-level = "s"
 lto = true
+codegen-units = 1
+panic = "abort"
