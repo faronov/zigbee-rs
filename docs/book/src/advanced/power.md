@@ -158,7 +158,7 @@ actual sleep/wake is performed by the MAC backend:
 |----------|-----------|------------|
 | ESP32-C6/H2 | `esp_light_sleep_start()` | `esp_deep_sleep()` — only RTC memory retained |
 | nRF52840 | `TASKS_DISABLE` + `__WFE` (System ON, RAM retained) | System OFF (wake via GPIO/RTC) |
-| TLSR8258 | `radio_sleep()` + WFI (~1.5 mA) | CPU suspend (~3 µA, timer wake, RAM retained) |
+| TLSR8258 | RF/DMA quiesce + restore hooks | HAL suspend/retention entry; timer wake proven, production sensor integration pending |
 | PHY6222 | `radio_sleep()` + Embassy timer wait | AON system sleep not enabled |
 | EFR32MG1 | `radio_sleep()` — radio clock gating via CMU | — |
 | EFR32MG21 | `radio_sleep()` — radio clock gating via CMU | — |
@@ -253,60 +253,42 @@ device.mac_mut().radio_wake();
 
 ### TLSR8258
 
-The TLSR8258 sensor implements a **two-tier sleep architecture** similar to
-the PHY6222, using the pure-Rust radio driver's built-in power management.
-
-**Tier 1 — Light sleep (fast poll, ~1.5 mA):**
-During fast polling (first 120 seconds after join/activity), the radio
-transceiver is disabled between polls and the CPU enters WFI. The radio
-driver disables RF, DMA channels, and RF IRQs to minimize current:
+The production TLSR8258 sensor is still a polling end device; it does **not**
+yet enter suspend or retention sleep. The HAL now contains the low-level
+pieces needed for that integration:
 
 ```rust
-device.mac_mut().radio_sleep();   // disable RF + DMA + IRQ (~5-8 mA saved)
-Timer::after(Duration::from_millis(poll_ms)).await;
-device.mac_mut().radio_wake();    // re-enable, re-apply channel
+device.mac_mut().prepare_for_sleep();
+let wake = tlsr8258_hal::pm::cpu_suspend_wakeup_rc(
+    tlsr8258_hal::pm::WakeConfig::Timer { wakeup_tick },
+)?;
+device.mac_mut().resume_after_sleep();
 ```
 
-**Tier 2 — CPU suspend (slow poll, ~3 µA):**
-During slow polling (30-second intervals), the device enters tc32 CPU suspend
-mode. Unlike PHY6222's system sleep (which reboots), TLSR8258 suspend mode
-retains all RAM and resumes execution in-place when the system timer fires:
+The sleep entry is RAM-resident, uses bounded clock/analog waits, returns a
+typed wake status after suspend, and restores the RF/DMA configuration
+through the MAC hooks. Timer-only suspend behavior has been exercised on
+hardware.
 
-```rust
-// Radio is already sleeping from radio_sleep()
-// Enter CPU suspend with timer wake
-driver.cpu_suspend_ms(poll_ms);
-// CPU resumes here — RAM intact, no reboot
-driver.radio_wake();
-```
+The generalized wake API can arm:
 
-The suspend mode uses direct register access:
-- System timer wake compare register sets the wake time
-- Wake source enable register selects timer wake
-- Power-down control register enters suspend (`BIT(7)`)
+- timer;
+- pad;
+- pad or timer;
+- comparator;
+- comparator or timer.
 
-**Power registers used:**
+Pad wake configuration supports ports A-D. Port E is rejected because the
+naively extrapolated analog enable address collides with a hardware-proven PM
+control register. Comparator wake only arms the PM source; the external
+comparator front end must already be configured by board-specific code.
 
-| Register | Address | Purpose |
-|----------|---------|---------|
-| `REG_TMR_WKUP` | `0x740 + 0x08` | Timer compare for wake |
-| `REG_WAKEUP_EN` | `0x6E` | Wake source enable (timer, PAD, etc.) |
-| `REG_PWDN_CTRL` | `0x6F` | Suspend/deep-sleep entry (BIT 7) |
-
-**Battery life estimate (TLSR8258, CR2032, 230 mAh):**
-
-| State | Current | Duty Cycle | Average |
-|-------|---------|------------|---------|
-| CPU suspend (radio off, RAM retained) | ~3 µA | ~99.8% | ~3.0 µA |
-| Radio RX (poll) | ~8 mA | ~0.03% (10 ms / 30 s) | ~2.7 µA |
-| Radio TX (report) | ~10 mA | ~0.005% (3 ms / 60 s) | ~0.5 µA |
-| Fast poll phase (WFI, ~1.5 mA) | ~1.5 mA | ~1.5% (120 s / 2 hr) | ~22 µA |
-| **Total average (steady state)** | | | **~6 µA** |
-| **Estimated battery life (CR2032)** | | | **~4+ years** |
-
-> CPU suspend preserves all RAM, so no NV save/restore is needed between
-> sleep cycles. This is a significant advantage over the PHY6222, which
-> reboots from system sleep and requires full state restoration.
+Pad, comparator, and mixed wake modes are disassembly-derived and TC32-built,
+but have not been validated on silicon. The production runtime also still
+needs an end-to-end acceptance test proving that RAM state, radio restore,
+poll scheduling, frame counters, and flash-backed security state remain
+correct over repeated sleeps. No sleep-current or battery-life estimate is
+claimed until that work is complete.
 
 ### PHY6222
 

@@ -330,7 +330,9 @@ closes.
 The coordinator, router, and Trust Center modules provide the data structures
 and core logic for network management. The shared router path is integrated
 with `zigbee-runtime`. TLSR8258 join, durable restart, Link Status, and NWK
-relay are hardware-verified; child polling timing still requires validation.
+relay are hardware-verified. Parent/child traffic has been exercised, but a
+clean first-attempt join and complete interview with the corrected child image
+remain the release gate.
 
 | Feature | Status |
 |---------|--------|
@@ -346,7 +348,7 @@ relay are hardware-verified; child polling timing still requires validation.
 | Link status messages | ✅ Receive, maintenance and periodic sending |
 | Trust Center Update/Transport/Switch Key | ✅ APS security and Tunnel forwarding implemented |
 | Distributed security (TC-less) | ⚠️ Secured rejoin supported; full coordinator policy remains incomplete |
-| TLSR8258 router MAC | ✅ Join, silent restart, Link Status and NWK relay hardware-verified; child ACK/Frame Pending timing remains |
+| TLSR8258 router MAC | ✅ Join, silent restart, Link Status and NWK relay hardware-verified; corrected-image first-attempt child acceptance remains gated |
 
 > **Contributing:** Coordinator policy, install codes, long-duration routing
 > tests, and hardware interoperability remain useful production-hardening

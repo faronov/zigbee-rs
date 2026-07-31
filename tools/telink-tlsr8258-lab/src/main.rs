@@ -440,7 +440,30 @@ pub unsafe extern "C" fn _rust_entry() -> ! {
 #[cfg(feature = "diag-pm")]
 #[inline(never)]
 fn chip_init() {
-    tlsr8258_hal::clocks::init();
+    if tlsr8258_hal::clocks::init().is_err() {
+        // Fail closed: the analog/clock bring-up sequence did not
+        // complete, so the clock tree is in an unknown state and nothing
+        // below (`main_loop`, radio/timer/PM diagnostics) may run. Mirror
+        // this file's own panic handler's sentinel format above (same
+        // fixed SRAM words, same LR capture, same terminal spin) but with
+        // a distinct magic so a clock-bring-up failure is distinguishable
+        // from an ordinary panic when read back via `scripts/tlsr8258.sh
+        // dump` — the same 0xC10C_FA17 ("CLOCk FAILed") value used for the
+        // same purpose in the `telink-tlsr8258-radio` example's
+        // `diag::CLOCK_INIT_FAIL_MAGIC`.
+        unsafe {
+            let lr: u32;
+            core::arch::asm!("mov {0}, lr", out(reg) lr);
+            core::ptr::write_volatile(0x0084F1F8 as *mut u32, 0xC10C_FA17);
+            core::ptr::write_volatile(0x0084F1FC as *mut u32, lr);
+        }
+        loop {
+            unsafe {
+                core::arch::asm!("nop");
+            }
+        }
+    }
+    tlsr8258_hal::timer::init();
 }
 
 #[cfg(not(feature = "diag-pm"))]
@@ -7078,13 +7101,6 @@ static mut PM_CYCLE: u32 = 0;
 const PM_LOG_SECTOR: u32 = 0x0007_3000;
 
 #[cfg(feature = "diag-pm")]
-fn diag_pm_voltage_guard() -> tlsr8258_hal::flash::VoltageReading {
-    // Dedicated USB-powered lab board. Production firmware uses a real ADC
-    // guard; this diagnostic records PM progress only on stable bench power.
-    tlsr8258_hal::flash::VoltageReading::Measured(3_300, 0)
-}
-
-#[cfg(feature = "diag-pm")]
 fn diag_pm_log(offset: u32, tag: u32, value0: u32, value1: u32) -> bool {
     let mut record = [0xFFu8; 16];
     record[0..4].copy_from_slice(&tag.to_le_bytes());
@@ -7128,6 +7144,9 @@ fn diag_pm_error_code(error: tlsr8258_hal::pm::PmError) -> u32 {
         PmError::WakeTickTimeout => 0x08,
         PmError::SystemTimerNotRunning => 0x09,
         PmError::RetentionReturned => 0x0A,
+        PmError::EmptyWakeSource => 0x0B,
+        PmError::UnsupportedWakeSource => 0x0C,
+        PmError::PadWakePortUnsupported => 0x0D,
     }
 }
 
@@ -7176,10 +7195,20 @@ fn diag_pm_main() -> ! {
     const ONE_SECOND_TICKS: u32 = 16_000_000;
     const TEST_CYCLES: u32 = 4;
 
-    tlsr8258_hal::flash::set_voltage_guard(diag_pm_voltage_guard);
     let retention_boot = tlsr8258_hal::mmio::analog_read(0x7e)
         .map(|mode| mode != 0)
         .unwrap_or(false);
+    if !retention_boot {
+        let peripherals =
+            tlsr8258_hal::peripherals::Peripherals::take().unwrap_or_else(|| diag_pm_fail(0x060));
+        let adc = tlsr8258_hal::adc::Adc::new(
+            peripherals.adc,
+            tlsr8258_hal::flash::FlashGeometry::KiB512,
+        )
+        .unwrap_or_else(|_| diag_pm_fail(0x061));
+        adc.install_flash_voltage_guard(peripherals.pins.pc5)
+            .unwrap_or_else(|_| diag_pm_fail(0x062));
+    }
 
     if retention_boot {
         let cycle = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PM_CYCLE)) };

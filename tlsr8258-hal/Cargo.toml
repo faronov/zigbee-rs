@@ -9,6 +9,19 @@ repository = "https://github.com/faronov/zigbee-rs"
 [dependencies]
 embedded-hal = "1.0"
 embedded-storage = "0.3"
+# Same version already vetted/used by `zigbee-crypto` for AES-128-CCM*.
+# `rng.rs` uses the raw single-block encryptor as the forward function of a
+# NIST SP 800-90A CTR_DRBG (AES-128, no derivation function) seeded from
+# on-chip ADC noise; see that module's docs for exactly what this does and
+# does not prove about entropy quality. Used unconditionally (host and
+# tc32 both run the real cipher, not a host-only stand-in) so host tests
+# exercise production crypto.
+aes = { version = "0.8", default-features = false }
+# `rng.rs`'s entropy conditioner: folds raw ADC observations into a
+# `SEED_LEN`-byte digest via SHA-256. `default-features = false` keeps
+# this `no_std`-only (no host-only SIMD/asm backend surprises); see that
+# module's docs for why hashing cannot itself increase entropy.
+sha2 = { version = "0.10", default-features = false }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

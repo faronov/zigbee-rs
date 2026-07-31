@@ -80,7 +80,27 @@ fn panic_handler(_info: &core::panic::PanicInfo) -> ! {
 #[cfg(target_arch = "tc32")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _rust_entry() -> ! {
-    platform::clocks::init();
+    if platform::clocks::init().is_err() {
+        // Fail closed, same rationale as the panic handler above: the
+        // clock tree never reached its documented configuration, so no
+        // `.diag`/radio/MAC code below may run. Record a distinguishable
+        // sentinel (not the ordinary panic magic — see
+        // `diag::CLOCK_INIT_FAIL_MAGIC`'s doc) at the same reserved,
+        // checksum-external SRAM words the panic handler uses, then spin
+        // forever, exactly like an ordinary panic would.
+        unsafe {
+            let lr: u32;
+            core::arch::asm!("mov {0}, lr", out(reg) lr);
+            core::ptr::write_volatile(
+                diag::PANIC_MAGIC_ADDR as *mut u32,
+                diag::CLOCK_INIT_FAIL_MAGIC,
+            );
+            core::ptr::write_volatile(diag::PANIC_LR_ADDR as *mut u32, lr);
+        }
+        loop {
+            unsafe { core::arch::asm!("nop") };
+        }
+    }
     #[cfg(feature = "runtime-join")]
     {
         runtime_join_test::run()

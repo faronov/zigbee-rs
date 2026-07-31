@@ -170,8 +170,8 @@ The CC2340 host driver is Rust and does not link RCL or ZBOSS. A build without
 
 > The TLSR8258 radio driver uses pure-Rust register access. For real tc32
 > firmware, use the [modern-tc32](https://github.com/modern-tc32) toolchain.
-> The HAL also exposes typed single-owner I2C, SPI, PWM, GPIO, ADC, flash,
-> timer, and power-management APIs.
+> The HAL also exposes typed single-owner GPIO, I2C, SPI, UART, ADC, PWM,
+> flash, timer/watchdog, IRQ/reset/clock, wake/capture, RNG, and AES APIs.
 > Hardware bring-up diagnostics live separately in
 > `tools/telink-tlsr8258-lab`.
 
@@ -250,7 +250,7 @@ The TLSR8258 radio driver uses pure-Rust register access — no `libdrivers_8258
 | Platform | Reusable peripherals | Validation boundary |
 |----------|----------------------|---------------------|
 | **BL702** | GPIO, I2C0, SPI0, GPADC/VBAT, PWM, UART0/1, timer, eFuse, XIP flash | UART, timer, eFuse, and radio paths hardware-proven; new GPIO/I2C/SPI/ADC/PWM/flash paths host-tested and RV32IMC-compiled, not yet silicon-tested |
-| **TLSR8258** | GPIO, I2C, SPI, ADC, PWM, flash, timers, retention PM | Existing GPIO/ADC/flash/PM paths hardware-proven; new I2C/SPI/PWM paths host-tested and TC32-compiled, not yet silicon-tested |
+| **TLSR8258** | GPIO/edge capture, I2C, SPI, UART, ADC, PWM/IR, flash, timers/watchdog, IRQ/reset/clock, suspend/wake, RNG, AES-128 | Radio, GPIO, flash, timer-wake suspend, and deployed persistence paths have hardware evidence. UART, I2C/SPI, advanced PWM/capture, pad/comparator wake, RNG entropy quality, and AES remain silicon-validation gates |
 | **EFR32MG1** | GPIO, I2C, SPI, ADC, PWM, flash, RTCC, bootloader storage | Board peripheral paths hardware-proven except the limitations called out below |
 
 BL702 and TLSR8258 stateful bus/PWM constructors consume unique peripheral
@@ -258,6 +258,20 @@ tokens. TLSR8258 I2C and SPI intentionally consume the same serial-controller
 token and non-`Clone` route pins because those functions overlap in hardware.
 Their board crates preserve exclusive ownership even when an application
 leaves a peripheral unused.
+
+TLSR8258 factory data is geometry-specific for 512 KiB, 1 MiB, 2 MiB, and
+4 MiB flashes. Non-512-KiB products must verify the JEDEC capacity before
+reading the factory EUI-64 or ADC calibration. Zbit program/erase operations
+fail closed unless the owned ADC/PC5 voltage guard measures a safe, stable
+supply immediately before each physical operation. The RNG uses an
+AES-128 CTR_DRBG seeded from SHA-256-conditioned VBAT/GND ADC observations;
+the DRBG has a NIST known-answer test, but the physical entropy source still
+requires SP 800-90B characterization.
+
+The TLSR8258 AES block has a bounded, token-owned ECB driver and an opt-in
+`zigbee-crypto` backend. NWK/APS still use software CCM* because their current
+APIs do not carry a persistent cipher object, so the Telink MAC continues to
+report `hardware_security = false`.
 
 ## MAC Backends
 
@@ -409,7 +423,7 @@ The following hardware has been tested end-to-end with **Home Assistant + ZHA**:
 | **ESP32-C6-DevKitC-1** | ZHA (via zigpy) | ✅ Prior baseline verified | Temperature, Humidity, Battery and flash NV proven; current product/profile refactor and real OTA upgrade await hardware validation |
 | **ESP32-H2-DevKitM-1** | ZHA (via zigpy) | ✅ Current refactor verified | Legacy NV migrated atomically to the security journal; reset/resume, reporting, TSENS, interview, and Identify verified on hardware. OTA absent. |
 | **BL702 XT-ZB1** | Home Assistant ZHA / Ember | ✅ End-device path verified | Pure-Rust RF calibration, join, TCLK exchange, interview, Identify, and reporting; temperature/humidity currently synthetic |
-| **TLSR8258** | Home Assistant ZHA / Ember | ✅ End-device and router paths verified | Join, TCLK exchange, interview, reporting, routed-frame relay, silent reset resume, and crash-safe counter persistence; child polling remains gated |
+| **TLSR8258** | Home Assistant ZHA / Ember | ✅ End-device and router paths verified | Join, TCLK exchange, interview, reporting, routed-frame relay, silent reset resume, and crash-safe counter persistence. Parent/child traffic has been exercised, but clean first-attempt sleepy-child commissioning with the corrected child image remains the release gate |
 | **EFR32MG1P TRÅDFRI** | Home Assistant ZHA / Ember | ✅ End-device path verified | Pure-Rust radio, SHT3x reporting, crash-safe journal rollover, reset resume, and secure rejoin |
 
 All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling** (auto-erase NV + rejoin), and **default reporting configuration** (so devices report data even before the coordinator sends ConfigureReporting).
@@ -425,9 +439,12 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
   hardware validation. Retention sleep is not implemented. The new
   I2C/SPI/ADC/PWM paths also still require hardware validation.
 - **Telink TLSR8258** production examples are split by role. The sensor is a
-  polling end device, not yet a retention SED. The router's parent path is
-  software-complete, but software-ACK turnaround, Frame Pending timing, and
-  indirect delivery still need a real-device sniffer gate. Child and route
+  polling end device, not yet a retention SED. Timer-only suspend is
+  hardware-proven in the HAL, while pad/comparator wake paths and production
+  runtime integration remain unvalidated. The router's parent path is
+  software-complete and has been exercised on hardware, but release still
+  requires a clean first-attempt sleepy-child join and complete ZHA interview
+  with the corrected child image under an independent sniffer. Child and route
   tables remain RAM-only across reboot. Real tc32 firmware requires the
   [modern-tc32](https://github.com/modern-tc32) toolchain.
 - **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence; temp/humidity sensors are simulated (battery ADC is real); comprehensive power management is implemented (two-tier sleep with AON system sleep ~3 µA, radio sleep/wake, flash deep power-down, GPIO leak prevention)

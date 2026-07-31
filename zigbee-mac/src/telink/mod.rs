@@ -602,6 +602,7 @@ mod imp {
         AckPendingAddress, AckPendingError, MAX_MAC_FRAME_LEN, Radio, RawRxOutcome, ReceivedFrame,
         TX_POWER_MAX_DBM, TX_POWER_MIN_DBM, TxOutcome,
     };
+    use tlsr8258_hal::rng::Rng;
     use tlsr8258_hal::{flash, timer};
     use zigbee_types::*;
 
@@ -667,12 +668,33 @@ mod imp {
             { super::ASSOCIATION_DELIVERY_QUEUE_CAPACITY },
         >,
         clock: WrappingTickExtender,
+        /// Lazily acquired on first [`PlatformServices::fill_random`] call
+        /// so construction never pays the ADC-sampling cost (or fails)
+        /// unless random bytes are actually requested. See
+        /// `tlsr8258_hal::rng`'s module docs for exactly what this
+        /// provides and does not prove about entropy quality.
+        rng: Option<Rng>,
     }
 
     impl TelinkMac {
         pub fn new() -> Self {
             let radio = Radio::take().expect("TLSR8258 radio already taken");
             Self::from_radio(radio, None)
+        }
+
+        /// Verify `geometry` against the fitted JEDEC flash, then construct
+        /// the MAC with the factory EUI-64 from that geometry's Telink
+        /// factory sector (or the stable flash-UID fallback).
+        ///
+        /// Non-512-KiB products should use this constructor instead of
+        /// [`Self::new`], whose legacy identity path intentionally remains
+        /// fixed to the 512-KiB TB-04 layout.
+        pub fn new_for_flash_geometry(
+            geometry: flash::FlashGeometry,
+        ) -> Result<Self, flash::FlashError> {
+            let mut address = [0u8; 8];
+            flash::factory_ieee_for(geometry, &mut address)?;
+            Ok(Self::with_extended_address(address))
         }
 
         pub fn with_extended_address(extended_address: IeeeAddress) -> Self {
@@ -724,6 +746,7 @@ mod imp {
                 pending_outgoing_associations: super::AssociationResponseQueue::new(),
                 pending_association_deliveries: heapless::Deque::new(),
                 clock: WrappingTickExtender::new(now_ticks),
+                rng: None,
             };
             mac.apply_radio_config();
             mac
@@ -1985,8 +2008,42 @@ mod imp {
             timer::sleep_ticks(timer::us(duration_us));
         }
 
-        fn fill_random(&mut self, _output: &mut [u8]) -> Result<(), MacError> {
-            Err(MacError::Unsupported)
+        fn fill_random(&mut self, output: &mut [u8]) -> Result<(), MacError> {
+            // `tlsr8258_hal::rng::Rng` seeds a NIST SP 800-90A CTR_DRBG
+            // (AES-128, no derivation function, verified against an
+            // official NIST CAVP known-answer test) from repeated ADC
+            // noise sampling of the VBAT/GND channel, conditioned through
+            // SHA-256 before use. See that module's docs for exactly what
+            // this does and does not prove: the DRBG algorithm is a
+            // reviewable, KAT-verified standard construction, but the
+            // *entropy quality feeding its seed* has not been
+            // independently measured on real hardware (no SP 800-90B
+            // assessment was performed) — that remains this path's one
+            // honest, hardware-only caveat. This is treated as a hardware
+            // entropy source per `PlatformServices::fill_random`'s
+            // contract, not as predictable vendor MWC (`rand()`) output,
+            // which this backend never exposes through this API.
+            //
+            // Every failure path below — `Rng::take` (initial ADC
+            // harvest), and `fill_bytes` (periodic reseed harvest) —
+            // propagates as `Err` rather than ever silently falling back
+            // to a weaker source or claiming success with unfilled/
+            // partially-filled `output`. `tlsr8258_hal::rng::RngError`'s
+            // richer cases (already-taken singleton, ADC analog-bus
+            // failure, a wholly stuck noise channel, or a failed post-
+            // harvest ADC state restore) are collapsed to
+            // `MacError::Unsupported` here only because `MacError` has no
+            // dedicated entropy-source variant today (`Unsupported` is
+            // this trait's own documented case for "no usable hardware
+            // entropy source" — reused here for "one exists but could not
+            // be used for this call", not conflated with predictable
+            // output). A caller that needs the finer-grained reason should
+            // go through `tlsr8258_hal::rng` directly.
+            if self.rng.is_none() {
+                self.rng = Some(Rng::take().map_err(|_| MacError::Unsupported)?);
+            }
+            let rng = self.rng.as_mut().expect("just initialized above");
+            rng.fill_bytes(output).map_err(|_| MacError::Unsupported)
         }
     }
 }

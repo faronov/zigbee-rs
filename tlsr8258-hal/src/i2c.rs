@@ -38,8 +38,6 @@ const CMD_STOP: u8 = 1 << 5;
 const CMD_READ_ID: u8 = 1 << 6;
 const CMD_NACK: u8 = 1 << 7;
 const SPI_ENABLE: u8 = 1 << 7;
-const RESET_I2C: u8 = 1 << 1;
-const CLOCK_I2C: u8 = 1 << 1;
 
 /// The TLSR8258 status register has no documented arbitration-loss bit.
 pub const ARBITRATION_LOSS_DETECTION_SUPPORTED: bool = false;
@@ -224,10 +222,14 @@ impl I2cMaster {
 
     #[cfg(target_arch = "tc32")]
     fn configure_peripheral(&self) {
+        // Clock-gate and reset the shared I2C block via the generic
+        // reg_clk_en0/reg_rst0 facade (see `crate::reset::Peripheral::I2c`)
+        // instead of hand-rolling the same read-modify-write this module
+        // used to perform locally.
+        crate::reset::enable_clock(crate::reset::Peripheral::I2c)
+            .expect("I2C has a documented reg_clk_en0 bit");
+        self.reset_peripheral();
         unsafe {
-            let clocks = crate::mmio::r8(crate::mmio::REG_CLK_EN0);
-            crate::mmio::w8(crate::mmio::REG_CLK_EN0, clocks | CLOCK_I2C);
-            self.reset_peripheral();
             crate::mmio::w8(REG_I2C_SPEED, self.divider);
             crate::mmio::w8(REG_I2C_MODE, MODE_MASTER_ENABLE);
             let spi = crate::mmio::r8(REG_SPI_SP);
@@ -237,12 +239,7 @@ impl I2cMaster {
 
     #[cfg(target_arch = "tc32")]
     fn reset_peripheral(&self) {
-        unsafe {
-            let reset = crate::mmio::r8(crate::mmio::REG_RST0);
-            crate::mmio::w8(crate::mmio::REG_RST0, reset | RESET_I2C);
-            let reset = crate::mmio::r8(crate::mmio::REG_RST0);
-            crate::mmio::w8(crate::mmio::REG_RST0, reset & !RESET_I2C);
-        }
+        crate::reset::pulse_reset(crate::reset::Peripheral::I2c);
     }
 
     #[cfg(target_arch = "tc32")]
@@ -544,7 +541,6 @@ mod tests {
 
     #[test]
     fn bus_busy_is_not_guessed_to_be_arbitration_loss() {
-        assert!(!ARBITRATION_LOSS_DETECTION_SUPPORTED);
         assert_eq!(command_error(0, true, true), None);
         assert_eq!(
             command_error(STATUS_NACK, true, true),

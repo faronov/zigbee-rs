@@ -381,12 +381,16 @@ static mut RADIO_TAKEN: u8 = 0;
 impl Radio {
     #[cfg(target_arch = "tc32")]
     pub fn take() -> Option<Self> {
-        unsafe {
+        let acquired = crate::mmio::with_irqs_disabled(|| unsafe {
             let ptr = core::ptr::addr_of_mut!(RADIO_TAKEN);
             if core::ptr::read_volatile(ptr) != 0 {
-                return None;
+                return false;
             }
             core::ptr::write_volatile(ptr, 1);
+            true
+        });
+        if !acquired {
+            return None;
         }
         Some(Self { _private: () })
     }
@@ -759,7 +763,17 @@ mod hw {
     static mut IRQ_RX_QUEUE_LEN: u8 = 0;
     static mut IRQ_RX_QUEUE_OVERFLOW_COUNT: u32 = 0;
 
-    const CPU_RX_IRQ_MASK: u32 = (1 << 4) | (1 << 13);
+    /// The two `reg_irq_mask`/`reg_irq_src` bits this module's RX path
+    /// gates as a single unit: [`crate::irq::IrqSource::Dma`] (bit 4, the
+    /// DMA-complete signal the RF RX DMA channel raises) and
+    /// [`crate::irq::IrqSource::ZbRt`] (bit 13, the baseband "done" IRQ).
+    /// Built from `crate::irq`'s canonical bit table instead of repeating
+    /// the `(1 << 4) | (1 << 13)` literal here — see
+    /// `mask_cpu_rx_irq`/`enable_cpu_rx_irq` below for why the
+    /// mask/enable *control flow* itself still doesn't call through
+    /// `crate::irq`'s `set_enabled`/`enable`/`disable`.
+    const CPU_RX_IRQ_MASK: u32 =
+        crate::irq::IrqSource::Dma.mask() | crate::irq::IrqSource::ZbRt.mask();
 
     const CCA_THRESHOLD_DBM: i8 = -70;
     const CCA_RX_SETTLE_TICKS: u32 = timer::TICKS_PER_MS * 128 / 1_000;
@@ -1209,6 +1223,29 @@ mod hw {
         }
     }
 
+    /// Mask (disable) the CPU RX IRQ sources and report whether they were
+    /// enabled beforehand.
+    ///
+    /// # Why this doesn't call `crate::irq::set_enabled`/`disable`
+    ///
+    /// [`crate::irq`] centralizes the *generic* `reg_irq_mask`/
+    /// `reg_irq_src` read-modify-write/write-1-to-clear idiom, and this
+    /// function's overall shape — save `reg_irq_en`, clear it, touch
+    /// `reg_irq_mask`, restore `reg_irq_en` — is exactly that idiom. It
+    /// still isn't expressed as a call through `crate::irq` because this
+    /// function's *return value* (`was_enabled`, read from the mask
+    /// register while `reg_irq_en` is known-clear) is part of its
+    /// contract, and [`crate::irq::set_enabled`] does not report the
+    /// previous state — adding that here would mean either changing
+    /// `crate::irq`'s generic API's return type for every other caller
+    /// (none of which need it) or duplicating the read anyway outside the
+    /// masked window (racy: the mask could change between an unmasked
+    /// read and this function's own masked write). The explicit
+    /// `compiler_fence(Ordering::SeqCst)` between the `reg_irq_mask`
+    /// write and the `reg_irq_en` restore is also specific to this RX
+    /// hot path's proven-on-hardware ordering requirements (see
+    /// `enable_cpu_rx_irq`'s own doc for the matching concern on the
+    /// re-enable side) and has no equivalent in the generic helper.
     fn mask_cpu_rx_irq() -> bool {
         unsafe {
             let global = crate::mmio::r8(crate::mmio::REG_IRQ_EN);
@@ -1228,6 +1265,27 @@ mod hw {
         }
     }
 
+    /// Re-enable the CPU RX IRQ sources.
+    ///
+    /// # Why this doesn't call `crate::irq::enable`
+    ///
+    /// Unlike [`crate::irq::set_enabled`] (a pure `reg_irq_mask` toggle),
+    /// this function performs a fixed *sequence* around that toggle that
+    /// is load-bearing for this RX path specifically: it conditionally
+    /// clears stale CPU latches (only if a frame did *not* just complete
+    /// in the handoff window — see the inline comment), then sets the
+    /// mask bits, then unconditionally forces `reg_irq_en`'s bit 0 on
+    /// (`global | 1`) rather than restoring whatever `reg_irq_en` held
+    /// before this call, because every call site reaches this function
+    /// specifically to (re)establish "RX IRQs are live", not to restore
+    /// an arbitrary prior global-enable state. `crate::irq::enable` only
+    /// does the last of those three steps' register (`reg_irq_mask`)
+    /// half, and does not touch `reg_irq_en` or `reg_irq_src` at all —
+    /// composing it with separate calls for the other two steps would
+    /// reopen exactly the same race across independent masked windows
+    /// this function's single critical section is proven to close. This
+    /// stays hand-rolled by design; see [`mask_cpu_rx_irq`]'s doc for the
+    /// matching concern on the mask side.
     fn enable_cpu_rx_irq() {
         unsafe {
             let global = crate::mmio::r8(crate::mmio::REG_IRQ_EN);
@@ -1245,6 +1303,15 @@ mod hw {
         }
     }
 
+    /// Acknowledge (write-1-to-clear) both [`CPU_RX_IRQ_MASK`] bits in
+    /// `reg_irq_src` in one `w32`. Equivalent in effect to calling
+    /// [`crate::irq::clear_pending`] once each for
+    /// [`crate::irq::IrqSource::Dma`] and [`crate::irq::IrqSource::ZbRt`],
+    /// but kept as a single combined write here (not migrated) since this
+    /// is always called from inside [`enable_cpu_rx_irq`]'s own
+    /// `reg_irq_en`-masked critical section, and splitting it into two
+    /// separate `crate::irq` calls would not change the generated code,
+    /// only add call overhead in an RX-path hot function.
     fn clear_cpu_rx_irq_sources() {
         unsafe {
             crate::mmio::w32(crate::mmio::REG_IRQ_SRC, CPU_RX_IRQ_MASK);

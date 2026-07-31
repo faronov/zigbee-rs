@@ -22,8 +22,6 @@ const CTRL_READ: u8 = 1 << 3;
 const CTRL_SHARE_MODE: u8 = 1 << 5;
 const CTRL_BUSY: u8 = 1 << 6;
 const SPEED_ENABLE: u8 = 1 << 7;
-const RESET_SPI: u8 = 1 << 0;
-const CLOCK_SPI: u8 = 1 << 0;
 const DUMMY_BYTE: u8 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,13 +140,14 @@ impl SpiMaster {
 
     #[cfg(target_arch = "tc32")]
     fn configure_peripheral(&self) {
+        // Clock-gate and reset the shared SPI block via the generic
+        // reg_clk_en0/reg_rst0 facade (see `crate::reset::Peripheral::Spi`)
+        // instead of hand-rolling the same read-modify-write this module
+        // used to perform locally.
+        crate::reset::enable_clock(crate::reset::Peripheral::Spi)
+            .expect("SPI has a documented reg_clk_en0 bit");
+        crate::reset::pulse_reset(crate::reset::Peripheral::Spi);
         unsafe {
-            let clocks = crate::mmio::r8(crate::mmio::REG_CLK_EN0);
-            crate::mmio::w8(crate::mmio::REG_CLK_EN0, clocks | CLOCK_SPI);
-            let reset = crate::mmio::r8(crate::mmio::REG_RST0);
-            crate::mmio::w8(crate::mmio::REG_RST0, reset | RESET_SPI);
-            let reset = crate::mmio::r8(crate::mmio::REG_RST0);
-            crate::mmio::w8(crate::mmio::REG_RST0, reset & !RESET_SPI);
             crate::mmio::w8(REG_SPI_SPEED, SPEED_ENABLE | self.divider);
             let mode = crate::mmio::r8(REG_SPI_MODE);
             crate::mmio::w8(REG_SPI_MODE, (mode & !0x03) | encode_mode(self.config.mode));

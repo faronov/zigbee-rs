@@ -39,10 +39,54 @@
 //! until confirmed on hardware.
 //!
 //! Peripheral function-mux support is intentionally limited to the I2C, SPI,
-//! and non-complementary PWM routes used by this HAL. The selector table and
-//! two-bit packing were checked against Telink's `gpio_set_func()` object and
-//! the independent Apache-2.0 `modern-tc32/tlsr82xx` implementation. Invalid
-//! pin/function pairs are rejected instead of silently selecting slot zero.
+//! UART, and non-complementary PWM routes used by this HAL. The selector
+//! table and two-bit packing were checked against Telink's `gpio_set_func()`
+//! object and the independent Apache-2.0 `modern-tc32/tlsr82xx`
+//! implementation. Invalid pin/function pairs are rejected instead of
+//! silently selecting slot zero.
+//!
+//! All twelve documented UART TX/RX routes are supported: TX on
+//! PA2/PB1/PC2/PD0/PD3/PD7 and RX on PA0/PB0/PB7/PC3/PC5/PD6 (the same set
+//! enumerated by `platform/chip_8258/uart.h`'s `UART_TxPinDef`/
+//! `UART_RxPinDef`). `gpio_set_func()` itself is compiled, not inline, so
+//! rather than trust a single decompilation these selector values were
+//! derived by writing a small tc32 instruction interpreter and
+//! symbolically executing the actual compiled `gpio_set_func()` body from
+//! the official `telink-semi/telink_zigbee_sdk` repository's
+//! `platform/lib/libdrivers_8258.a:gpio.o` for `func == AS_UART (3)` on
+//! every pin value above — i.e. this is the vendor's real shipped object
+//! code, disassembled and executed, not a guess. Every one of the twelve
+//! resulting selectors was then independently cross-checked against
+//! `modern-tc32/tlsr82xx`'s `tlsr82xx-hal/src/gpio.rs` `pinmux_mode_for`
+//! table, and both sources agree on all twelve pins with no discrepancies
+//! (PB1 `0b01`/PB7 `0b10` also match the values this HAL already shipped).
+//! This is held at the same full-confidence tier as the vendor-header
+//! fields above, not the lower "independent-source-only" tier.
+//!
+//! UART flow control (RTS on PA4/PB3/PB6/PC0, CTS on PA3/PB2/PC4/PD1) is
+//! deliberately **not** listed in [`PinFunction`]/`function_selector` at
+//! all: disassembling `uart_set_rts`/`uart_set_cts`/`uart_set_rts_level`
+//! from the same `uart.o` shows they never call `gpio_set_func` — they
+//! only pull up and enable input/output on the plain GPIO pin and then
+//! configure `reg_uart_ctrl1`/`reg_uart_ctrl2` bits (see `uart.rs`). RTS/CTS
+//! pins are therefore configured with this module's ordinary
+//! `set_pull`/`set_output_enable`/`set_input_enable` primitives, consuming
+//! a plain [`Pin`] token — no special mux path exists for them to omit or
+//! get wrong.
+//!
+//! GPIO IRQ support (module-level: [`GpioIrqSource`],
+//! [`set_source_interrupt_enable`], [`set_core_interrupt_enable`],
+//! [`set_global_interrupt_enable`], [`interrupt_pending`],
+//! [`clear_interrupt_pending`]) is transcribed directly from the *inline*
+//! `static inline` bodies of `gpio_set_interrupt`/`gpio_en_interrupt`/
+//! `gpio_set_interrupt_risc0`/`gpio_en_interrupt_risc0`/
+//! `gpio_set_interrupt_risc1`/`gpio_en_interrupt_risc1` in
+//! `platform/chip_8258/gpio.h`, plus `reg_gpio_wakeup_irq`'s
+//! `FLD_GPIO_CORE_INTERRUPT_EN` and the `reg_irq_mask`/`reg_irq_src`
+//! `FLD_IRQ_GPIO_EN`/`FLD_IRQ_GPIO_RISC0_EN`/`FLD_IRQ_GPIO_RISC1_EN` bits in
+//! `platform/chip_8258/register.h`. These are open, shipped-as-source
+//! functions (not compiled objects), so this path is held at full
+//! confidence, same as the rest of this file's per-pin digital registers.
 
 #[cfg(target_arch = "tc32")]
 use super::mmio::{r8, w8};
@@ -158,6 +202,7 @@ pub enum PinFunction {
     Gpio,
     I2c,
     Spi,
+    Uart,
     Pwm0,
     Pwm1,
     Pwm2,
@@ -249,10 +294,10 @@ impl Pin {
 pub fn set_output_enable(pin: &Pin, enable: bool) {
     let addr = pin.reg(OFFSET_OEN);
     let mask = pin.mask();
-    unsafe {
+    super::mmio::with_irqs_disabled(|| unsafe {
         let value = r8(addr);
         w8(addr, if enable { value & !mask } else { value | mask });
-    }
+    });
 }
 
 /// Enable or disable a pin's input buffer/read-back path.
@@ -271,10 +316,10 @@ pub fn set_input_enable(pin: &Pin, enable: bool) -> Result<(), GpioError> {
 pub fn write(pin: &Pin, high: bool) {
     let addr = pin.reg(OFFSET_OUT);
     let mask = pin.mask();
-    unsafe {
+    super::mmio::with_irqs_disabled(|| unsafe {
         let value = r8(addr);
         w8(addr, if high { value | mask } else { value & !mask });
-    }
+    });
 }
 
 /// Flip a pin's output latch (independent of the input read-back value).
@@ -282,9 +327,9 @@ pub fn write(pin: &Pin, high: bool) {
 pub fn toggle(pin: &Pin) {
     let addr = pin.reg(OFFSET_OUT);
     let mask = pin.mask();
-    unsafe {
+    super::mmio::with_irqs_disabled(|| unsafe {
         w8(addr, r8(addr) ^ mask);
-    }
+    });
 }
 
 /// Read a pin's current input level.
@@ -312,17 +357,19 @@ pub fn set_drive_strength(pin: &Pin, strong: bool) -> Result<(), GpioError> {
 /// the digital or analog register space — see [`FieldLocation`].
 #[cfg(target_arch = "tc32")]
 fn set_field_bit(location: FieldLocation, mask: u8, set: bool) -> Result<(), GpioError> {
-    match location {
-        FieldLocation::Digital(addr) => unsafe {
-            let value = r8(addr);
-            w8(addr, if set { value | mask } else { value & !mask });
-        },
-        FieldLocation::Analog(addr) => {
-            let value = super::mmio::analog_read(addr)?;
-            super::mmio::analog_write(addr, if set { value | mask } else { value & !mask })?;
+    super::mmio::with_irqs_disabled(|| {
+        match location {
+            FieldLocation::Digital(addr) => unsafe {
+                let value = r8(addr);
+                w8(addr, if set { value | mask } else { value & !mask });
+            },
+            FieldLocation::Analog(addr) => {
+                let value = super::mmio::analog_read(addr)?;
+                super::mmio::analog_write(addr, if set { value | mask } else { value & !mask })?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Route a pin back to plain GPIO.
@@ -330,9 +377,9 @@ fn set_field_bit(location: FieldLocation, mask: u8, set: bool) -> Result<(), Gpi
 pub fn set_function_gpio(pin: &Pin) {
     let addr = pin.reg(OFFSET_FUNC);
     let mask = pin.mask();
-    unsafe {
+    super::mmio::with_irqs_disabled(|| unsafe {
         w8(addr, r8(addr) | mask);
-    }
+    });
 }
 
 /// Route a pin to a validated I2C, SPI, or PWM function.
@@ -349,12 +396,12 @@ pub fn set_function(pin: &Pin, function: PinFunction) -> Result<(), GpioError> {
     let selector = function_selector(pin, function).ok_or(GpioError::UnsupportedFunction)?;
     let shift = pin.mux_shift();
     let mask = 0x03u8 << shift;
-    unsafe {
+    super::mmio::with_irqs_disabled(|| unsafe {
         let mux = r8(pin.mux_reg());
         w8(pin.mux_reg(), (mux & !mask) | ((selector & 0x03) << shift));
         let func = r8(pin.reg(OFFSET_FUNC));
         w8(pin.reg(OFFSET_FUNC), func & !pin.mask());
-    }
+    });
     Ok(())
 }
 
@@ -386,6 +433,26 @@ const fn function_selector(pin: &Pin, function: PinFunction) -> Option<u8> {
         | (Port::D, 7, PinFunction::Spi) => Some(0),
         (Port::B, 6, PinFunction::Spi) | (Port::B, 7, PinFunction::Spi) => Some(1),
 
+        // UART TX routes: PA2, PB1, PC2, PD0, PD3, PD7.
+        // UART RX routes: PA0, PB0, PB7, PC3, PC5, PD6.
+        // Derived by symbolically executing the compiled `gpio_set_func()`
+        // object for `func == AS_UART` on every pin and cross-checked
+        // against `modern-tc32/tlsr82xx` — see the module docs for the
+        // full evidence trail. RTS/CTS pins are intentionally absent: they
+        // never go through `gpio_set_func` (see module docs).
+        (Port::A, 0, PinFunction::Uart) => Some(0b10), // RX
+        (Port::A, 2, PinFunction::Uart) => Some(0b01), // TX
+        (Port::B, 0, PinFunction::Uart) => Some(0b01), // RX
+        (Port::B, 1, PinFunction::Uart) => Some(0b01), // TX
+        (Port::B, 7, PinFunction::Uart) => Some(0b10), // RX
+        (Port::C, 2, PinFunction::Uart) => Some(0b01), // TX
+        (Port::C, 3, PinFunction::Uart) => Some(0b01), // RX
+        (Port::C, 5, PinFunction::Uart) => Some(0b01), // RX
+        (Port::D, 0, PinFunction::Uart) => Some(0b10), // TX
+        (Port::D, 3, PinFunction::Uart) => Some(0b10), // TX
+        (Port::D, 6, PinFunction::Uart) => Some(0b01), // RX
+        (Port::D, 7, PinFunction::Uart) => Some(0b10), // TX
+
         // Positive PWM outputs from the TLSR8258 gpio_set_func table.
         (Port::A, 2, PinFunction::Pwm0) | (Port::C, 1, PinFunction::Pwm0) => Some(2),
         (Port::C, 2, PinFunction::Pwm0) | (Port::D, 5, PinFunction::Pwm0) => Some(0),
@@ -405,30 +472,173 @@ const fn function_selector(pin: &Pin, function: PinFunction) -> Option<u8> {
 
 /// Set the edge polarity (`true` = falling, `false` = rising) that this
 /// pin's interrupt/wakeup logic reacts to. Does not itself enable the
-/// interrupt — pair with [`set_wakeup_interrupt_enable`] and the caller's
-/// own global IRQ mask policy.
+/// interrupt — pair with [`set_wakeup_interrupt_enable`] (or
+/// [`set_source_interrupt_enable`]) and [`set_global_interrupt_enable`].
+///
+/// Takes `&Pin` (not `Pin`) so callers can keep configuring/reading the same
+/// pin afterwards instead of losing the ownership token to this one call.
 #[cfg(target_arch = "tc32")]
-pub fn set_interrupt_polarity(pin: Pin, falling: bool) {
+pub fn set_interrupt_polarity(pin: &Pin, falling: bool) {
     let addr = pin.reg(OFFSET_POL);
     let mask = pin.mask();
-    unsafe {
+    super::mmio::with_irqs_disabled(|| unsafe {
         let value = r8(addr);
         w8(addr, if falling { value | mask } else { value & !mask });
+    });
+}
+
+/// Enable or disable this pin as a source of the *primary* GPIO IRQ
+/// (`reg_gpio_irq_wakeup_en`, gated by `FLD_IRQ_GPIO_EN` in the global IRQ
+/// mask — left to the caller via [`set_global_interrupt_enable`], matching
+/// this crate's "IRQs stay off unless the application opts in" convention).
+/// This helper only changes the per-pin source enable; callers using the
+/// primary source must also own the shared
+/// [`set_core_interrupt_enable`] policy.
+///
+/// Equivalent to `set_source_interrupt_enable(pin, GpioIrqSource::Primary,
+/// enable)`. Takes `&Pin` (not `Pin`) for the same reason as
+/// [`set_interrupt_polarity`].
+#[cfg(target_arch = "tc32")]
+pub fn set_wakeup_interrupt_enable(pin: &Pin, enable: bool) {
+    set_source_interrupt_enable(pin, GpioIrqSource::Primary, enable);
+}
+
+/// The three independent GPIO-edge interrupt sources the TLSR8258 core can
+/// see, each with its own per-pin enable register, its own bit in
+/// `reg_irq_mask`/`reg_irq_src`, and (for [`GpioIrqSource::Primary`] only)
+/// a shared core-interrupt gate — see [`set_core_interrupt_enable`].
+///
+/// Transcribed from the `static inline gpio_set_interrupt`/
+/// `gpio_set_interrupt_risc0`/`gpio_set_interrupt_risc1` and
+/// `gpio_en_interrupt`/`gpio_en_interrupt_risc0`/`gpio_en_interrupt_risc1`
+/// bodies in `platform/chip_8258/gpio.h`. Because these are three distinct
+/// hardware comparators (not a software fan-out of one), a caller can
+/// assign different pins to different sources and distinguish which pin's
+/// edge fired purely from which `reg_irq_src` bit is set — no software
+/// pin-level polling required. See [`crate::capture`] for a reusable
+/// consumer of exactly this property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpioIrqSource {
+    /// `reg_gpio_irq_wakeup_en` / `FLD_IRQ_GPIO_EN` (`reg_irq_mask`/
+    /// `reg_irq_src` bit 18). The only source gated by
+    /// `FLD_GPIO_CORE_INTERRUPT_EN` — see [`set_core_interrupt_enable`].
+    Primary,
+    /// `reg_gpio_irq_risc0_en` / `FLD_IRQ_GPIO_RISC0_EN` (bit 21).
+    Risc0,
+    /// `reg_gpio_irq_risc1_en` / `FLD_IRQ_GPIO_RISC1_EN` (bit 22).
+    Risc1,
+}
+
+impl GpioIrqSource {
+    /// Base address of this source's per-port, one-byte-per-port,
+    /// one-bit-per-pin enable register (`reg_gpio_irq_wakeup_en(i)` =
+    /// `REG_ADDR8(0x587+((i>>8)<<3))`, `reg_gpio_irq_risc0_en(i)` =
+    /// `REG_ADDR8(0x5b8+(i>>8))`, `reg_gpio_irq_risc1_en(i)` =
+    /// `REG_ADDR8(0x5c0+(i>>8))`). Note `Primary` uses the same 8-byte
+    /// per-port stride as every other per-pin digital field in this module
+    /// (it is `reg(OFFSET_IRQ_WAKEUP_EN)`), while `Risc0`/`Risc1` use a
+    /// contiguous one-byte-per-port array instead.
+    const fn enable_register(self, port: Port) -> u32 {
+        match self {
+            GpioIrqSource::Primary => {
+                REG_GPIO_BASE + ((port.index() as u32) << 3) + OFFSET_IRQ_WAKEUP_EN
+            }
+            GpioIrqSource::Risc0 => REG_GPIO_IRQ_RISC0_BASE + port.index() as u32,
+            GpioIrqSource::Risc1 => REG_GPIO_IRQ_RISC1_BASE + port.index() as u32,
+        }
+    }
+
+    /// This source's bit in `reg_irq_mask`/`reg_irq_src`
+    /// (`FLD_IRQ_GPIO_EN`/`FLD_IRQ_GPIO_RISC0_EN`/`FLD_IRQ_GPIO_RISC1_EN`,
+    /// `platform/chip_8258/register.h`). Delegates to [`crate::irq`]'s
+    /// canonical bit table instead of repeating these three literals here
+    /// — see that module's docs for the full `reg_irq_mask` layout.
+    pub const fn global_mask(self) -> u32 {
+        self.as_irq_source().mask()
+    }
+
+    /// This source's counterpart in [`crate::irq::IrqSource`], the
+    /// generic CPU-IRQ-controller facade every `reg_irq_mask`/
+    /// `reg_irq_src` access in this crate now goes through.
+    const fn as_irq_source(self) -> crate::irq::IrqSource {
+        match self {
+            GpioIrqSource::Primary => crate::irq::IrqSource::GpioPrimary,
+            GpioIrqSource::Risc0 => crate::irq::IrqSource::GpioRisc0,
+            GpioIrqSource::Risc1 => crate::irq::IrqSource::GpioRisc1,
+        }
     }
 }
 
-/// Enable or disable this pin as a wakeup/interrupt source
-/// (`reg_gpio_irq_wakeup_en`, gated by `FLD_IRQ_GPIO_EN` in the global IRQ
-/// mask — left to the caller, matching this crate's "IRQs stay off unless
-/// the application opts in" convention).
+/// `reg_gpio_irq_risc0_en` base (`platform/chip_8258/register.h`): one byte
+/// per port, contiguous (`0x5b8 + port_index`), unlike the 8-byte-stride
+/// digital per-port block every other field in this module uses.
+const REG_GPIO_IRQ_RISC0_BASE: u32 = super::mmio::REG_BASE + 0x5B8;
+/// `reg_gpio_irq_risc1_en` base, same layout as [`REG_GPIO_IRQ_RISC0_BASE`].
+const REG_GPIO_IRQ_RISC1_BASE: u32 = super::mmio::REG_BASE + 0x5C0;
+/// `reg_gpio_wakeup_irq` (`platform/chip_8258/register.h`).
+const REG_GPIO_WAKEUP_IRQ: u32 = super::mmio::REG_BASE + 0x5B5;
+/// `FLD_GPIO_CORE_INTERRUPT_EN` (`reg_gpio_wakeup_irq` bit 3). Must be set
+/// for [`GpioIrqSource::Primary`] to ever reach the core, per
+/// `gpio_set_interrupt()`'s body — `Risc0`/`Risc1` do not touch this bit.
+const FLD_GPIO_CORE_INTERRUPT_EN: u8 = 1 << 3;
+
+/// Enable or disable this pin as a source of the given [`GpioIrqSource`].
+/// See [`GpioIrqSource`] and [`set_wakeup_interrupt_enable`] (the
+/// `Primary`-only convenience wrapper this generalizes).
 #[cfg(target_arch = "tc32")]
-pub fn set_wakeup_interrupt_enable(pin: Pin, enable: bool) {
-    let addr = pin.reg(OFFSET_IRQ_WAKEUP_EN);
+pub fn set_source_interrupt_enable(pin: &Pin, source: GpioIrqSource, enable: bool) {
+    let (port, _bit) = pin.port_and_bit();
+    let addr = source.enable_register(port);
     let mask = pin.mask();
-    unsafe {
+    super::mmio::with_irqs_disabled(|| unsafe {
         let value = r8(addr);
         w8(addr, if enable { value | mask } else { value & !mask });
-    }
+    });
+}
+
+/// Set (`enable = true`) or clear the shared `FLD_GPIO_CORE_INTERRUPT_EN`
+/// gate that [`GpioIrqSource::Primary`] needs in addition to its
+/// `reg_irq_mask` bit — see [`GpioIrqSource::Primary`]'s docs and the
+/// vendor `gpio_set_interrupt()` body this is transcribed from.
+#[cfg(target_arch = "tc32")]
+pub fn set_core_interrupt_enable(enable: bool) {
+    super::mmio::with_irqs_disabled(|| unsafe {
+        let value = r8(REG_GPIO_WAKEUP_IRQ);
+        w8(
+            REG_GPIO_WAKEUP_IRQ,
+            if enable {
+                value | FLD_GPIO_CORE_INTERRUPT_EN
+            } else {
+                value & !FLD_GPIO_CORE_INTERRUPT_EN
+            },
+        );
+    });
+}
+
+/// Enable or disable one or more [`GpioIrqSource`] bits in `reg_irq_mask`
+/// (`0x640`). Delegates to [`crate::irq::set_enabled`], which performs the
+/// masked read-modify-write under `REG_IRQ_EN=0` (this crate's established
+/// convention — see `radio::hw::mask_cpu_rx_irq`/`enable_cpu_rx_irq`) so a
+/// half-updated 32-bit mask is never visible to an interrupted vector.
+#[cfg(target_arch = "tc32")]
+pub fn set_global_interrupt_enable(source: GpioIrqSource, enable: bool) {
+    crate::irq::set_enabled(source.as_irq_source(), enable);
+}
+
+/// `true` if `source`'s bit is currently latched in `reg_irq_src` (`0x648`).
+#[cfg(target_arch = "tc32")]
+pub fn interrupt_pending(source: GpioIrqSource) -> bool {
+    crate::irq::pending(source.as_irq_source())
+}
+
+/// Acknowledge `source`'s pending bit in `reg_irq_src`. `reg_irq_src` is
+/// write-to-clear per bit (writing a 0 bit leaves the corresponding source
+/// untouched — see `radio::hw::clear_cpu_rx_irq_sources`'s identical single
+/// `w32` for the RF/DMA sources), so this cannot disturb unrelated pending
+/// bits. Delegates to [`crate::irq::clear_pending`].
+#[cfg(target_arch = "tc32")]
+pub fn clear_interrupt_pending(source: GpioIrqSource) {
+    crate::irq::clear_pending(source.as_irq_source());
 }
 
 /// Configure a pin's internal pull resistor.
@@ -442,10 +652,12 @@ pub fn set_pull(pin: &Pin, pull: Pull) -> Result<(), GpioError> {
         .pull_location()
         .ok_or(GpioError::PullNotSupportedOnPort)?;
     let mask = 0x03u8 << shift;
-    let value = super::mmio::analog_read(addr)?;
-    let updated = (value & !mask) | ((pull as u8) << shift);
-    super::mmio::analog_write(addr, updated)?;
-    Ok(())
+    super::mmio::with_irqs_disabled(|| {
+        let value = super::mmio::analog_read(addr)?;
+        let updated = (value & !mask) | ((pull as u8) << shift);
+        super::mmio::analog_write(addr, updated)?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -604,6 +816,123 @@ mod tests {
             function_selector(&Pin::new(Port::C, 4), PinFunction::Pwm3),
             None
         );
+    }
+
+    #[test]
+    fn uart_pb1_tx_and_pb7_rx_routes_have_cross_checked_selectors() {
+        // PB1/PB7 are the pre-existing, most heavily validated routes;
+        // kept as their own test so a regression here is unambiguous.
+        assert_eq!(
+            function_selector(&Pin::new(Port::B, 1), PinFunction::Uart),
+            Some(0b01)
+        );
+        assert_eq!(
+            function_selector(&Pin::new(Port::B, 7), PinFunction::Uart),
+            Some(0b10)
+        );
+        assert!(supports_function(&Pin::new(Port::B, 1), PinFunction::Uart));
+        assert!(supports_function(&Pin::new(Port::B, 7), PinFunction::Uart));
+    }
+
+    #[test]
+    fn uart_all_documented_tx_routes_have_disassembly_verified_selectors() {
+        // Every TX pin in uart.h's UART_TxPinDef, selector derived from the
+        // compiled gpio_set_func() object (see module docs).
+        let tx_routes = [
+            (Port::A, 2, 0b01u8),
+            (Port::B, 1, 0b01),
+            (Port::C, 2, 0b01),
+            (Port::D, 0, 0b10),
+            (Port::D, 3, 0b10),
+            (Port::D, 7, 0b10),
+        ];
+        for (port, bit, expected) in tx_routes {
+            assert_eq!(
+                function_selector(&Pin::new(port, bit), PinFunction::Uart),
+                Some(expected),
+                "TX route {port:?}{bit}"
+            );
+            assert!(supports_function(&Pin::new(port, bit), PinFunction::Uart));
+        }
+    }
+
+    #[test]
+    fn uart_all_documented_rx_routes_have_disassembly_verified_selectors() {
+        // Every RX pin in uart.h's UART_RxPinDef, selector derived from the
+        // compiled gpio_set_func() object (see module docs).
+        let rx_routes = [
+            (Port::A, 0, 0b10u8),
+            (Port::B, 0, 0b01),
+            (Port::B, 7, 0b10),
+            (Port::C, 3, 0b01),
+            (Port::C, 5, 0b01),
+            (Port::D, 6, 0b01),
+        ];
+        for (port, bit, expected) in rx_routes {
+            assert_eq!(
+                function_selector(&Pin::new(port, bit), PinFunction::Uart),
+                Some(expected),
+                "RX route {port:?}{bit}"
+            );
+            assert!(supports_function(&Pin::new(port, bit), PinFunction::Uart));
+        }
+    }
+
+    #[test]
+    fn uart_route_rejects_pins_outside_uart_h() {
+        // PC1 sits right next to the PC2 TX route in the mux decision
+        // tree, but tracing gpio_set_func(0x0202 /* PC1 */, AS_UART)
+        // resolves to the "no match" default (selector-writing code path
+        // never taken), matching PC1's absence from uart.h. PA1 is not
+        // documented in uart.h's TX/RX enums either, so this HAL rejects
+        // it too — note that gpio_set_func's silicon-level decision tree
+        // does resolve *some* selector for PA1 under AS_UART; this HAL
+        // deliberately stays within uart.h's documented pin list rather
+        // than routing undocumented pins the vendor SDK itself never
+        // exposes as UART pins, per the "reject anything not proven by an
+        // in-scope, documented route" policy.
+        assert_eq!(
+            function_selector(&Pin::new(Port::C, 1), PinFunction::Uart),
+            None
+        );
+        assert!(!supports_function(&Pin::new(Port::C, 1), PinFunction::Uart));
+        assert_eq!(
+            function_selector(&Pin::new(Port::A, 1), PinFunction::Uart),
+            None
+        );
+        assert!(!supports_function(&Pin::new(Port::A, 1), PinFunction::Uart));
+    }
+
+    #[test]
+    fn gpio_irq_source_global_mask_matches_register_h_bits() {
+        // FLD_IRQ_GPIO_EN/FLD_IRQ_GPIO_RISC0_EN/FLD_IRQ_GPIO_RISC1_EN,
+        // platform/chip_8258/register.h.
+        assert_eq!(GpioIrqSource::Primary.global_mask(), 1 << 18);
+        assert_eq!(GpioIrqSource::Risc0.global_mask(), 1 << 21);
+        assert_eq!(GpioIrqSource::Risc1.global_mask(), 1 << 22);
+    }
+
+    #[test]
+    fn gpio_irq_source_enable_register_matches_register_h_formula() {
+        // reg_gpio_irq_wakeup_en(i) = REG_ADDR8(0x587+((i>>8)<<3)): same
+        // 8-byte-stride per-port block as every other digital field.
+        assert_eq!(GpioIrqSource::Primary.enable_register(Port::A), 0x800587);
+        assert_eq!(GpioIrqSource::Primary.enable_register(Port::B), 0x80058F);
+        // reg_gpio_irq_risc0_en(i) = REG_ADDR8(0x5b8 + (i>>8)): contiguous
+        // one byte per port, not the 8-byte stride.
+        assert_eq!(GpioIrqSource::Risc0.enable_register(Port::A), 0x8005B8);
+        assert_eq!(GpioIrqSource::Risc0.enable_register(Port::B), 0x8005B9);
+        assert_eq!(GpioIrqSource::Risc0.enable_register(Port::E), 0x8005BC);
+        // reg_gpio_irq_risc1_en(i) = REG_ADDR8(0x5c0 + (i>>8)).
+        assert_eq!(GpioIrqSource::Risc1.enable_register(Port::A), 0x8005C0);
+        assert_eq!(GpioIrqSource::Risc1.enable_register(Port::B), 0x8005C1);
+    }
+
+    #[test]
+    fn gpio_core_interrupt_enable_bit_matches_register_h() {
+        // reg_gpio_wakeup_irq (0x5b5), FLD_GPIO_CORE_INTERRUPT_EN = BIT(3).
+        assert_eq!(REG_GPIO_WAKEUP_IRQ, 0x8005B5);
+        assert_eq!(FLD_GPIO_CORE_INTERRUPT_EN, 0x08);
     }
 
     /// Raw evidence for the module-level confidence caveat: this is the

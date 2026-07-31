@@ -12,9 +12,11 @@ products/<product>  bounded partitions, linker layout, bootloader/OTA policy
 examples/<role>     application behavior and scheduling
 ```
 
-Physical flash addresses must not be placed in examples or generic chip HALs.
-They depend on the board, bootloader, OTA layout, and linked firmware region,
-so the product owns them.
+Application/NV partition addresses must not be placed in examples or generic
+chip HALs. They depend on the board, bootloader, OTA layout, and linked
+firmware region, so the product owns them. Vendor-defined factory metadata
+locations are different: a chip HAL may model them when they are derived from
+the verified fitted flash geometry.
 
 ## Generic application NV
 
@@ -65,7 +67,7 @@ raw NOR traits, but they intentionally provide different semantics.
 | Platform | Flash controller | Current partition owner | Store |
 |---|---|---|---|
 | BL702 | `bl702-hal` mask-ROM XIP flash | `products/bl702-xt-zb1` | Security journal; destructive silicon validation pending |
-| TLSR8258 | `tlsr8258-hal` | `products/tlsr8258-tb04` | Security journal |
+| TLSR8258 | `tlsr8258-hal` | `products/tlsr8258-tb04` | Security journal; geometry-aware identity and fail-closed Zbit voltage guard |
 | nRF52840 | Embassy NVMC | `products/nrf52840-sensor` | Security journal |
 | PHY6222/PHY6252 | `phy6222-hal` | `boards/phy62x2-evk` | Security journal |
 | ESP32-C6/H2 | `esp_storage::FlashStorage` | `products/esp32-zigbee-devkit` | Security journal |
@@ -82,6 +84,25 @@ Partition wrappers validate bounds and translate relative offsets to
 physical addresses. Product linker scripts (or, on ESP32, the product-owned
 partition table) reserve the same regions so application code cannot overlap
 persistent storage.
+
+### TLSR8258 geometry and write safety
+
+TLSR8258 factory EUI-64 and ADC-calibration sectors move with flash capacity.
+The HAL supports the Telink 512 KiB, 1 MiB, 2 MiB, and 4 MiB layouts.
+Non-512-KiB products must verify the JEDEC capacity before reading those
+sectors; otherwise ordinary application data at another geometry's address
+could be accepted as a plausible device identity.
+
+The TB-04 product remains a 512 KiB layout. Its security journal occupies
+`0x74000..0x76000`, immediately below the factory EUI sector, and its
+production examples preserve their deployed EUI offsets.
+
+Zbit `ZB25WD40B`/`ZB25WD80B` flash writes have an additional hardware
+requirement. Before each physical page program or sector erase, the HAL calls
+the owned ADC/PC5 guard and requires a measured voltage above 2200 mV with
+less than 500 mV fluctuation. Missing, busy, or failed ADC readings return a
+flash error; there is no constant-voltage fallback. Multi-page writes repeat
+the check for every page rather than trusting one stale measurement.
 
 ## Adding a platform
 

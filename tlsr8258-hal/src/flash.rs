@@ -7,10 +7,10 @@ use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
 };
 
+use super::mmio::REG_IRQ_EN;
+
 const REG_MSPI_DATA: u32 = 0x80000C;
 const REG_MSPI_CTRL: u32 = 0x80000D;
-const REG_IRQ_EN: u32 = 0x800643;
-const FACTORY_IEEE_ADDR: u32 = 0x0007_6000;
 const FALLBACK_IEEE: [u8; 8] = [0x9F, 0x5D, 0xC3, 0x0C, 0x00, 0x4B, 0x12, 0x00];
 
 const FLASH_WRITE_ENABLE: u8 = 0x06;
@@ -25,13 +25,116 @@ pub const IEEE_SOURCE_FALLBACK: u8 = 0;
 pub const IEEE_SOURCE_FACTORY: u8 = 1;
 pub const IEEE_SOURCE_FLASH_UID: u8 = 2;
 
+/// Physical SPI-flash geometry used to locate Telink's factory MAC and
+/// calibration sectors.
+///
+/// These addresses are the `FLASH_ADDR_OF_MAC_ADDR_*` and
+/// `FLASH_ADDR_OF_F_CFG_INFO_*` constants from the official Zigbee SDK's
+/// `proj/drivers/drv_nv.h`. They are not interchangeable: using the legacy
+/// 512 KiB address on a 1 MiB smart plug reads ordinary application data
+/// instead of its factory EUI-64.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashGeometry {
+    KiB512,
+    MiB1,
+    MiB2,
+    MiB4,
+}
+
+impl FlashGeometry {
+    pub const fn capacity(self) -> usize {
+        match self {
+            Self::KiB512 => 512 * 1024,
+            Self::MiB1 => 1024 * 1024,
+            Self::MiB2 => 2 * 1024 * 1024,
+            Self::MiB4 => 4 * 1024 * 1024,
+        }
+    }
+
+    pub const fn from_capacity(capacity: usize) -> Option<Self> {
+        match capacity {
+            0x0008_0000 => Some(Self::KiB512),
+            0x0010_0000 => Some(Self::MiB1),
+            0x0020_0000 => Some(Self::MiB2),
+            0x0040_0000 => Some(Self::MiB4),
+            _ => None,
+        }
+    }
+
+    pub const fn factory_ieee_address(self) -> u32 {
+        match self {
+            Self::KiB512 => 0x0007_6000,
+            Self::MiB1 => 0x000F_F000,
+            Self::MiB2 => 0x001F_F000,
+            Self::MiB4 => 0x003F_F000,
+        }
+    }
+
+    pub const fn factory_config_address(self) -> u32 {
+        match self {
+            Self::KiB512 => 0x0007_7000,
+            Self::MiB1 => 0x000F_E000,
+            Self::MiB2 => 0x001F_E000,
+            Self::MiB4 => 0x003F_E000,
+        }
+    }
+
+    pub const fn adc_calibration_address(self) -> u32 {
+        self.factory_config_address() + 0xC0
+    }
+
+    /// Decode the standard JEDEC capacity byte used by the flash parts
+    /// supported by Telink's factory layout table.
+    pub const fn from_jedec_capacity_code(code: u8) -> Option<Self> {
+        match code {
+            0x13 => Some(Self::KiB512),
+            0x14 => Some(Self::MiB1),
+            0x15 => Some(Self::MiB2),
+            0x16 => Some(Self::MiB4),
+            _ => None,
+        }
+    }
+}
+
+const _: () = {
+    assert!(FlashGeometry::KiB512.factory_ieee_address() == 0x76000);
+    assert!(FlashGeometry::KiB512.factory_config_address() == 0x77000);
+    assert!(FlashGeometry::KiB512.adc_calibration_address() == 0x770C0);
+    assert!(FlashGeometry::MiB1.factory_ieee_address() == 0xFF000);
+    assert!(FlashGeometry::MiB1.factory_config_address() == 0xFE000);
+    assert!(FlashGeometry::MiB1.adc_calibration_address() == 0xFE0C0);
+    assert!(matches!(
+        FlashGeometry::from_capacity(0x0008_0000),
+        Some(FlashGeometry::KiB512)
+    ));
+    assert!(matches!(
+        FlashGeometry::from_capacity(0x0010_0000),
+        Some(FlashGeometry::MiB1)
+    ));
+    assert!(matches!(
+        FlashGeometry::from_jedec_capacity_code(0x13),
+        Some(FlashGeometry::KiB512)
+    ));
+    assert!(matches!(
+        FlashGeometry::from_jedec_capacity_code(0x14),
+        Some(FlashGeometry::MiB1)
+    ));
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashError {
     Timeout,
     AddressOverflow,
     UnalignedSector,
     BufferNotInRam,
-    /// No voltage guard is registered (see [`set_voltage_guard`]), or the
+    /// The JEDEC capacity code is not one of the geometries for which the
+    /// Telink SDK defines factory-data locations.
+    UnsupportedGeometry,
+    /// The detected JEDEC capacity does not match the product-selected
+    /// geometry. Writes must fail rather than target another layout's NV
+    /// or factory sectors.
+    GeometryMismatch,
+    /// No ADC-backed voltage guard is installed, or the
     /// registered guard reported [`VoltageReading::Unavailable`] — the
     /// flash-supply voltage could not be checked at all.
     VoltageGuardUnavailable,
@@ -48,6 +151,8 @@ impl NorFlashError for FlashError {
             Self::UnalignedSector => NorFlashErrorKind::NotAligned,
             Self::Timeout
             | Self::BufferNotInRam
+            | Self::UnsupportedGeometry
+            | Self::GeometryMismatch
             | Self::VoltageGuardUnavailable
             | Self::VoltageUnsafe => NorFlashErrorKind::Other,
         }
@@ -65,6 +170,10 @@ pub struct Tlsr8258Flash {
 impl Tlsr8258Flash {
     pub const fn new(capacity: usize) -> Self {
         Self { capacity }
+    }
+
+    pub const fn for_geometry(geometry: FlashGeometry) -> Self {
+        Self::new(geometry.capacity())
     }
 
     fn validate_range(&self, address: u32, length: usize) -> Result<(), FlashError> {
@@ -126,13 +235,19 @@ impl NorFlash for Tlsr8258Flash {
 
 #[inline(always)]
 fn irq_disable() -> u8 {
+    use core::sync::atomic::{Ordering, compiler_fence};
+
     let previous = unsafe { core::ptr::read_volatile(REG_IRQ_EN as *const u8) };
     unsafe { core::ptr::write_volatile(REG_IRQ_EN as *mut u8, 0) };
+    compiler_fence(Ordering::SeqCst);
     previous
 }
 
 #[inline(always)]
 fn irq_restore(previous: u8) {
+    use core::sync::atomic::{Ordering, compiler_fence};
+
+    compiler_fence(Ordering::SeqCst);
     unsafe { core::ptr::write_volatile(REG_IRQ_EN as *mut u8, previous) };
 }
 
@@ -360,8 +475,7 @@ fn ensure_ram_buffer(data: &[u8]) -> Result<(), FlashError> {
 const FLASH_ZBIT_SAFE_VOL_MV: u16 = 2200;
 const FLASH_ZBIT_SAFE_VOLFLUCT_MV: u16 = 500;
 
-/// Outcome of a single voltage-guard reading attempt, returned by a
-/// [`VoltageGuardFn`].
+/// Outcome of a single voltage-guard reading attempt.
 ///
 /// This is deliberately not a plain `Option<(u16, u16)>`: a failed/absent
 /// ADC reading (misconfigured pin, ADC not powered, DMA buffer error) and a
@@ -378,16 +492,7 @@ pub enum VoltageReading {
     Unavailable,
 }
 
-/// Voltage-guard callback signature. Wire this to a real ADC reading (e.g.
-/// `adc::sample_with_fluctuation_mv`) via [`set_voltage_guard`].
-///
-/// The board-specific piece this crate cannot supply on its own is *which*
-/// GPIO pin the ADC should sample to approximate flash-supply voltage —
-/// see `adc.rs`'s module docs. Until the application calls
-/// [`set_voltage_guard`] with a real reading wired to its own board, Zbit
-/// program/erase calls are refused outright (the previous, more
-/// conservative behavior of this module).
-pub type VoltageGuardFn = fn() -> VoltageReading;
+type VoltageGuardFn = fn() -> VoltageReading;
 
 /// Storage for the registered [`VoltageGuardFn`], as the bit pattern of the
 /// function pointer (`0` = none registered).
@@ -397,13 +502,15 @@ pub type VoltageGuardFn = fn() -> VoltageReading;
 /// threads, but `AtomicUsize` gives a genuinely sound safe API for free
 /// (single-instruction load/store, no critical section needed) rather than
 /// pushing an `unsafe` requirement onto every call site of
-/// [`set_voltage_guard`].
+/// `crate::adc::Adc::install_flash_voltage_guard`.
 static VOLTAGE_GUARD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// Register the ADC-backed voltage guard used before Zbit flash
-/// program/erase operations. Safe to call at any time (e.g. re-registered
-/// after re-initializing the ADC); the most recent registration wins.
-pub fn set_voltage_guard(guard: VoltageGuardFn) {
+/// Register the owned ADC-backed voltage guard.
+///
+/// Kept crate-private so safe external code cannot install a constant or
+/// otherwise unowned callback that bypasses
+/// [`crate::adc::Adc::install_flash_voltage_guard`].
+pub(crate) fn set_voltage_guard(guard: VoltageGuardFn) {
     VOLTAGE_GUARD.store(guard as usize, core::sync::atomic::Ordering::SeqCst);
 }
 
@@ -413,9 +520,9 @@ fn voltage_guard() -> Option<VoltageGuardFn> {
         return None;
     }
     // SAFETY: the only non-zero values ever stored are `guard as usize`
-    // for a real `VoltageGuardFn` passed into `set_voltage_guard` — `usize`
-    // is defined as this target's pointer-sized integer, so the round trip
-    // through the same integer representation is valid.
+    // for the real ADC-backed callback installed by this crate — `usize` is
+    // this target's pointer-sized integer, so the round trip through the same
+    // integer representation is valid.
     Some(unsafe { core::mem::transmute::<usize, VoltageGuardFn>(raw) })
 }
 
@@ -451,7 +558,6 @@ pub fn program(mut address: u32, mut data: &[u8]) -> Result<(), FlashError> {
         return Ok(());
     }
     ensure_ram_buffer(data)?;
-    ensure_safe_flash()?;
     address
         .checked_add(data.len() as u32)
         .filter(|end| *end <= 0x0100_0000)
@@ -460,6 +566,10 @@ pub fn program(mut address: u32, mut data: &[u8]) -> Result<(), FlashError> {
     while !data.is_empty() {
         let page_remaining = PAGE_SIZE - (address as usize & (PAGE_SIZE - 1));
         let count = data.len().min(page_remaining);
+        // Re-check immediately before every physical page-program command.
+        // A multi-page write must not rely on one stale supply reading
+        // taken before the first page.
+        ensure_safe_flash()?;
         if !write_command(FLASH_PAGE_PROGRAM, address, &data[..count]) {
             return Err(FlashError::Timeout);
         }
@@ -489,11 +599,31 @@ pub fn erase_sector(address: u32) -> Result<(), FlashError> {
     }
 }
 
+/// Read the JEDEC ID and map its capacity byte to a supported Telink
+/// factory-data geometry.
+pub fn detect_geometry() -> Result<FlashGeometry, FlashError> {
+    let mut id = [0u8; 3];
+    if !jedec_id(&mut id) {
+        return Err(FlashError::Timeout);
+    }
+    FlashGeometry::from_jedec_capacity_code(id[2]).ok_or(FlashError::UnsupportedGeometry)
+}
+
+/// Fail closed if the fitted flash does not match the product-selected
+/// geometry.
+pub fn verify_geometry(expected: FlashGeometry) -> Result<(), FlashError> {
+    if detect_geometry()? == expected {
+        Ok(())
+    } else {
+        Err(FlashError::GeometryMismatch)
+    }
+}
+
 #[inline(never)]
 #[unsafe(link_section = ".ram_code")]
-pub fn factory_ieee(address: &mut [u8; 8]) -> u8 {
+fn factory_ieee_unchecked(geometry: FlashGeometry, address: &mut [u8; 8]) -> u8 {
     *address = [0xFFu8; 8];
-    let read_ok = read_bytes(FACTORY_IEEE_ADDR, address);
+    let read_ok = read_bytes(geometry.factory_ieee_address(), address);
     let all_ff = address[0] == 0xFF
         && address[1] == 0xFF
         && address[2] == 0xFF
@@ -530,6 +660,27 @@ pub fn factory_ieee(address: &mut [u8; 8]) -> u8 {
 
     *address = FALLBACK_IEEE;
     IEEE_SOURCE_FALLBACK
+}
+
+/// Verify the fitted flash geometry, then read its factory EUI-64.
+///
+/// This is the required entry point for non-512-KiB products. Verification
+/// happens before the factory sector is read, so a product built for one
+/// geometry cannot accidentally accept ordinary application bytes at
+/// another geometry's factory-EUI address as a valid device identity.
+pub fn factory_ieee_for(geometry: FlashGeometry, address: &mut [u8; 8]) -> Result<u8, FlashError> {
+    verify_geometry(geometry)?;
+    Ok(factory_ieee_unchecked(geometry, address))
+}
+
+/// Read the factory EUI-64 using the legacy 512 KiB Telink layout.
+///
+/// Existing TB-04 firmware uses 512 KiB flash, so this compatibility
+/// wrapper preserves its behavior. Products with any other geometry must
+/// call [`factory_ieee_for`] explicitly; silently probing the 512 KiB
+/// address on a 1 MiB part can produce a plausible but incorrect identity.
+pub fn factory_ieee(address: &mut [u8; 8]) -> u8 {
+    factory_ieee_unchecked(FlashGeometry::KiB512, address)
 }
 
 #[inline(always)]

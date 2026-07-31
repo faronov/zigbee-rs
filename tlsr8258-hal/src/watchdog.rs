@@ -11,7 +11,7 @@
 //! supports more than one clock configuration.
 
 #[cfg(target_arch = "tc32")]
-use super::mmio::{r32, w8, w32};
+use super::mmio::{r32, w8, w32, with_irqs_disabled};
 
 const REG_TMR_CTRL: u32 = super::mmio::REG_BASE + 0x620;
 const REG_TMR_STA: u32 = super::mmio::REG_BASE + 0x623;
@@ -49,6 +49,11 @@ pub enum WatchdogError {
     /// the caller intended, so this is rejected rather than silently
     /// programming a capture value of `0`.
     ZeroPeriod,
+    /// The requested non-zero interval is still shorter than one hardware
+    /// capture tick at `system_clk_mhz`, so Telink's integer formula
+    /// truncates it to zero. Programming that value has the same
+    /// immediate-reset hazard as [`WatchdogError::ZeroPeriod`].
+    IntervalTooShort,
     /// `system_clk_mhz == 0` is not a valid clock configuration; dividing
     /// by it is meaningless (and the previous implementation would have
     /// silently produced a capture value of `0`, arming a zero-timeout
@@ -79,6 +84,9 @@ pub const fn capture_value(period_ms: u32, system_clk_mhz: u32) -> Result<u32, W
     }
     let raw = (period_ms as u64 * 1000 * system_clk_mhz as u64) >> 18;
     let max = (1u64 << FLD_TMR_WD_CAPT_BITS) - 1;
+    if raw == 0 {
+        return Err(WatchdogError::IntervalTooShort);
+    }
     if raw > max {
         return Err(WatchdogError::IntervalTooLong);
     }
@@ -91,34 +99,34 @@ pub const fn capture_value(period_ms: u32, system_clk_mhz: u32) -> Result<u32, W
 #[cfg(target_arch = "tc32")]
 pub fn set_interval_ms(period_ms: u32, system_clk_mhz: u32) -> Result<(), WatchdogError> {
     let capture = capture_value(period_ms, system_clk_mhz)?;
-    unsafe {
+    with_irqs_disabled(|| unsafe {
         w32(REG_TMR2_TICK, 0);
         let ctrl = r32(REG_TMR_CTRL);
         w32(
             REG_TMR_CTRL,
             (ctrl & !FLD_TMR_WD_CAPT_MASK) | (capture << FLD_TMR_WD_CAPT_SHIFT),
         );
-    }
+    });
     Ok(())
 }
 
 /// Start the watchdog (Timer2 must be enabled for its tick to advance).
 #[cfg(target_arch = "tc32")]
 pub fn start() {
-    unsafe {
+    with_irqs_disabled(|| unsafe {
         let ctrl = r32(REG_TMR_CTRL);
         w32(REG_TMR_CTRL, ctrl | FLD_TMR2_EN | FLD_TMR_WD_EN);
-    }
+    });
 }
 
 /// Stop the watchdog (leaves Timer2 itself running if other code depends
 /// on it).
 #[cfg(target_arch = "tc32")]
 pub fn stop() {
-    unsafe {
+    with_irqs_disabled(|| unsafe {
         let ctrl = r32(REG_TMR_CTRL);
         w32(REG_TMR_CTRL, ctrl & !FLD_TMR_WD_EN);
-    }
+    });
 }
 
 /// Feed the watchdog — call this periodically from `user_app_idle` (or
@@ -153,6 +161,15 @@ mod tests {
     #[test]
     fn capture_value_rejects_zero_clock() {
         assert_eq!(capture_value(1000, 0), Err(WatchdogError::ZeroClock));
+    }
+
+    #[test]
+    fn capture_value_rejects_nonzero_interval_that_truncates_to_zero() {
+        // At 24 MHz, 10 ms still gives
+        // (10 * 1000 * 24) >> 18 == 0. Treating that as a valid capture
+        // would arm the same effectively-immediate reset as a zero period.
+        assert_eq!(capture_value(10, 24), Err(WatchdogError::IntervalTooShort));
+        assert_eq!(capture_value(11, 24), Ok(1));
     }
 
     #[test]

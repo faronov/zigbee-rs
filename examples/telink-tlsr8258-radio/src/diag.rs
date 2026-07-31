@@ -39,6 +39,22 @@ pub const DIAG_ADDR: u32 = 0x0084FE00;
 pub const PANIC_MAGIC_ADDR: u32 = DIAG_ADDR + 0x1F8;
 pub const PANIC_LR_ADDR: u32 = DIAG_ADDR + 0x1FC;
 
+/// Written to [`PANIC_MAGIC_ADDR`] (in place of the ordinary
+/// `0xDEAD_BEEF` panic magic) when `_rust_entry` halts because
+/// `platform::clocks::init` returned `Err` — i.e. the analog/clock
+/// bring-up sequence itself failed, before any `.diag` record or panic
+/// machinery is even live. Distinguishing this from an ordinary panic
+/// matters post-mortem: a clock-bring-up failure means the clock tree
+/// never reached its documented configuration at all, whereas an ordinary
+/// panic implies clocks came up fine and something later in `mac_test`/
+/// `association`/etc. failed. Safe to reuse [`PANIC_MAGIC_ADDR`]/
+/// [`PANIC_LR_ADDR`] for this: `_rust_entry` calls `clocks::init` before
+/// anything that could reach this module's internal `init` (which is
+/// what clears these two
+/// words), so there is no risk of this sentinel being clobbered before a
+/// post-mortem `scripts/tlsr8258.sh dump` can observe it.
+pub const CLOCK_INIT_FAIL_MAGIC: u32 = 0xC10C_FA17;
+
 /// "TDIA" (Telink DIAgnostics), little-endian bytes 'T','D','I','A'.
 pub const DIAG_MAGIC: u32 = 0x4149_4454;
 

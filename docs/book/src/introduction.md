@@ -94,8 +94,8 @@ builds successfully in CI.
 **In development:**
 
 - Full coordinator operation
-- TLSR8258 parent-router hardware timing validation with an over-the-air
-  sniffer
+- Clean first-attempt TLSR8258 sleepy-child commissioning and interview with
+  the corrected child image under an over-the-air sniffer
 - OTA firmware upgrade flow
 - Expanded test coverage
 - Install-code and additional production Trust Center policy

@@ -59,9 +59,118 @@
 //!   single common code path parameterised by a small `ModeProfile`.
 //!
 //! It is deliberately **not** wired into the sensor application yet, and makes
-//! **no** current-draw claims. Pad wake, comparator wake, external-32k-crystal
-//! timekeeping and plain `DEEPSLEEP_MODE` (reboot-on-wake) remain out of scope
-//! for this landing.
+//! **no** current-draw claims. External-32k-crystal timekeeping and plain
+//! `DEEPSLEEP_MODE` (reboot-on-wake) remain out of scope for this landing.
+//!
+//! # Wake-source arming: Pad, Timer, Comparator ([`WakeConfig`]) — T1, not
+//! # silicon-validated
+//!
+//! `cpu_sleep_wakeup_32k_rc`'s wake-source arm (`analog_write(0x26,
+//! wakeup_src)`, T1: `+0xdc` SUSPEND / `+0x2c8` LOW32K) writes the **caller's
+//! full `wakeup_src` byte**, not a hardcoded `PM_WAKEUP_TIMER` — both mode
+//! branches share one call site with `r8` (the untouched wakeup_src
+//! argument) as the value. Everything downstream of that write (the `0x44`
+//! status clear, the mode-specific analog writes, the 32k target
+//! computation, and the `0x74c`/`0x754`/`0x74f` comparator programming) is
+//! byte-identical regardless of which bits are set. This crate's original
+//! port hardcoded that byte to `WakeupSource::Timer`; [`WakeConfig`]
+//! generalizes it to every source combination the vendor's own
+//! `SleepWakeupSrc_TypeDef` documents as available "for customer" use
+//! (`platform/chip_8258/pm.h`): `Timer`, `Pad`, `PadOrTimer`, `Comparator`,
+//! and `ComparatorOrTimer`. [`cpu_sleep_timer_rc`]/[`cpu_suspend_timer_rc`]
+//! are now thin wrappers over [`cpu_sleep_wakeup_rc`]/
+//! [`cpu_suspend_wakeup_rc`] with `WakeConfig::Timer`, so their existing
+//! signatures and byte-for-byte SUSPEND/LOW32K behavior are unchanged.
+//!
+//! One vendor detail is *not* reproduced. Whether the Timer bit is present
+//! in `wakeup_src` also gates a *duration-validation* branch
+//! (`r9 = wakeup_src & 0x40`, T1 `+0x42..0x46`): if clear, the vendor skips
+//! straight past the zero/too-short/too-long checks to `+0x76`, relying on
+//! whatever `pm_long_suspend` (short/long path selector) a *previous* call
+//! happened to leave behind — a real, undocumented, stateful quirk with no
+//! defined first-call behavior. A clean-room port has no such persistent
+//! global to (mis)inherit, so instead every [`WakeConfig`] variant validates
+//! its `wakeup_tick` deadline identically via [`calc::classify_duration`],
+//! whether or not Timer is armed. This is strictly more conservative than
+//! the vendor (never a state-dependent surprise) and keeps the target-32k
+//! math, which the disassembly shows runs unconditionally regardless of the
+//! Timer bit, always fed a validated value. Practically, this deadline
+//! doubles as a hardware failsafe timeout alongside Pad/Comparator; whether
+//! reaching it *alone* can still produce a wake when Timer is not armed is
+//! not established by the available evidence (analog `0x26` bit6 gates
+//! Timer's reported *contribution*, but the internal effect of a comparator
+//! match with that bit clear is undocumented) — treat an observed
+//! [`WakeStatus::woke_by_timer`] under [`WakeConfig::Pad`] /
+//! [`WakeConfig::Comparator`] with that caveat.
+//!
+//! `PM_WAKEUP_CORE` (analog `0x26` bit5) is **not** exposed as an armable
+//! [`WakeConfig`] variant. Evidence against it being a real caller-selected
+//! sleep source: it is never passed as a `wakeup_src` argument anywhere in
+//! the vendor SDK — not in `cpu_sleep_wakeup_32k_rc`'s own callers, not in
+//! any board/example, and not in `proj/drivers/drv_pm.c` (the SDK's own
+//! higher-level sleep driver, which composes only `PM_WAKEUP_PAD` /
+//! `PM_WAKEUP_TIMER` across **every** Telink chip family it supports —
+//! 826x, 8258/8278, B91/B92/TL721x/TL321x). `WAKEUP_STATUS_CORE` (analog
+//! `0x44` bit2) is decoded and exposed read-only via
+//! [`WakeStatus::woke_by_core`]/[`WakeSources`] — it is a real *status* bit
+//! that can latch (most plausibly reporting that a digital core interrupt,
+//! e.g. this crate's own `gpio.rs` `reg_gpio_wakeup_irq` /
+//! `FLD_GPIO_CORE_INTERRUPT_EN` path, was already pending when suspend was
+//! entered) — but there is no evidence it is something an application arms
+//! as a *sleep source* the way Pad/Timer/Comparator are, so this crate does
+//! not speculate a `0x26` bit5 arm sequence for it.
+//!
+//! **Confidence.** The `0x26` write itself is T1 (bit-exact, shared code
+//! path, already exercised by the hardware-proven Timer-only tests above).
+//! Composing it from [`WakeConfig`] instead of a hardcoded constant does not
+//! change what gets written for the Timer-only case, so that case's
+//! hardware proof is undisturbed. The **Pad and Comparator variants are
+//! new with this change and have not been run on silicon** — no
+//! current-draw or wake-latency claim is made for them, only that the
+//! bytes written match the disassembly.
+//!
+//! # Pad-wake pin configuration — separate from suspend entry (T1)
+//!
+//! Analog `0x26` only selects *which classes* of source can wake the core;
+//! it does not touch any GPIO pin. Which specific pad(s) and edge
+//! polarity/polarities are live is configured by a **separate** vendor
+//! function, `cpu_set_gpio_wakeup(pin, pol, en)` (declared in `pm.h`,
+//! disassembled from `pm.o`), which round-trips through **analog** registers
+//! `0x21..0x25` (per-port-group polarity, one byte per port A..E, bit `i` =
+//! pin `i`'s polarity) and `0x27..0x2a` (per-port-group enable, ports A..D
+//! only — see [`configure_pad_wakeup`] for why port E is rejected rather
+//! than guessed). This is a **different** register family from `gpio.rs`'s
+//! digital `reg_gpio_wakeup_irq`/`reg_irq_mask` core-interrupt path, and
+//! from `0x26`/`0x44` above.
+//!
+//! Because of that separation, [`configure_pad_wakeup`] lives in *this*
+//! module (it is declared in the vendor's `pm.h`, not `gpio.h`, and shares
+//! the `0x21..0x2c` analog neighborhood with the rest of this file) but
+//! takes pins **by shared reference** (`&crate::gpio::Pin`) rather than
+//! consuming or storing them: entering suspend does not need — and this
+//! crate does not take — ownership of the pin. **Invariant:** any pin(s)
+//! intended to wake the core via [`WakeConfig::Pad`] / `PadOrTimer` must
+//! already be configured with [`configure_pad_wakeup`] (polarity + enable)
+//! *before* calling [`cpu_sleep_timer_rc`]/[`cpu_suspend_timer_rc`]/
+//! [`cpu_sleep_wakeup_rc`]/[`cpu_suspend_wakeup_rc`] — arming
+//! `WakeConfig::Pad` alone only opens the analog `0x26` gate for whichever
+//! pins were separately enabled; it configures no pin itself. This mirrors
+//! the vendor SDK's own split between `cpu_set_gpio_wakeup` (pin-level,
+//! called once at setup) and `cpu_sleep_wakeup_32k_rc` (source-class-level,
+//! called per sleep).
+//!
+//! Comparator wake ([`WakeConfig::Comparator`] / `ComparatorOrTimer`) has an
+//! analogous split this crate does **not** implement: the TLSR8258 comparator
+//! front-end (preamp bias trim, reference voltage) is exposed only through
+//! `adc.h`'s analog front-end registers (`areg_ain_scale = 0xfa`, shared with
+//! ADC channel configuration), not through any `pm.h`/`gpio.h` API, and is
+//! owned by this crate's ADC module, not `pm.rs`. Unlike the newer B91 SDK
+//! (which documents comparator settle-time and voltage-difference
+//! preconditions directly in `pm.h`), chip_8258's `pm.h` has no equivalent
+//! note, so this crate only exposes the raw `0x26` bit7 arm/status
+//! plumbing — the analog comparator front-end must be configured
+//! separately (ADC ownership) before relying on
+//! [`WakeConfig::Comparator`]/`ComparatorOrTimer`.
 //!
 //! # Bit-field rmw correction (T1) — `tbclrs` is full-register BIC
 //!
@@ -133,6 +242,19 @@
 //!   independent `modern-tc32/tlsr82xx` `REG_SYSTEM_32K_TICK_CAL` map.
 //!   `register.h` also defines the normal system-timer wake register at
 //!   `0x748`; that is a distinct register and is not used by this PM path.
+//!   **Naming note:** this "comparator" is the internal 32k-tick match
+//!   hardware that implements *Timer* wake — an unrelated use of the word
+//!   from [`WakeupSource::Comparator`]/`PM_WAKEUP_COMPARATOR`, which is an
+//!   external analog voltage comparator (ADC front-end) wake source. Do not
+//!   confuse register `0x754`'s "comparator" with analog `0x26` bit7.
+//! * [`WakeConfig::Pad`], `PadOrTimer`, [`WakeConfig::Comparator`], and
+//!   `ComparatorOrTimer` are **new with this change and have not been run on
+//!   silicon**. The `0x26` arm write they produce is the same T1, shared,
+//!   already-hardware-proven code path as `WakeConfig::Timer` (see "Wake-
+//!   source arming" above) — only the byte value differs — but that does
+//!   not substitute for an actual on-device Pad/Comparator wake-cycle test.
+//!   Treat them as logic/disassembly-proven, not current-draw- or
+//!   wake-latency-proven.
 
 // ---------------------------------------------------------------------------
 // Deep-sleep-retention analog scratch registers (unchanged public surface)
@@ -201,6 +323,92 @@ pub enum WakeupSource {
     Core = 1 << 5,
     Timer = 1 << 6,
     Comparator = 1 << 7,
+}
+
+/// Caller-selectable wake-source combination for
+/// [`cpu_sleep_wakeup_rc`]/[`cpu_suspend_wakeup_rc`] (and, via `Timer`, the
+/// original [`cpu_sleep_timer_rc`]/[`cpu_suspend_timer_rc`] entry points).
+///
+/// Every variant is one of the combinations the vendor's own
+/// `SleepWakeupSrc_TypeDef` documents as available "for customer" use
+/// (`platform/chip_8258/pm.h`) and that its higher-level `drv_pm.c` driver
+/// actually composes (`PM_WAKEUP_PAD` / `PM_WAKEUP_TIMER`, OR'd together);
+/// `PM_WAKEUP_COMPARATOR` is additionally exposed here because this crate's
+/// raw disassembly evidence for the `0x26` arm write applies identically to
+/// it (see the module docs' "Wake-source arming" section for why `Core` is
+/// deliberately excluded and why Pad/Comparator have no on-silicon proof
+/// yet). There is intentionally no way to construct an arbitrary bitmask —
+/// [`WakeupSource::Core`] and any reserved bit can never reach analog
+/// register `0x26` through this type.
+///
+/// Every variant carries an absolute 16 MHz system-tick wake deadline,
+/// validated identically via [`calc::classify_duration`] regardless of
+/// which sources are armed — see the module docs for why this is a
+/// deliberate, safer deviation from the vendor's own conditional validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeConfig {
+    /// `PM_WAKEUP_TIMER` only. Identical to the byte this crate's original
+    /// `cpu_sleep_timer_rc`/`cpu_suspend_timer_rc` hardcoded — hardware
+    /// timer-wake proven, see the module docs.
+    Timer { wakeup_tick: u32 },
+    /// `PM_WAKEUP_PAD` only. Requires the target pin(s) to already be
+    /// configured via [`configure_pad_wakeup`] — see its docs and the
+    /// module-level "Pad-wake pin configuration" section.
+    Pad { wakeup_tick: u32 },
+    /// `PM_WAKEUP_PAD | PM_WAKEUP_TIMER` — matches `drv_pm.c`'s own OR'd
+    /// composition. Same pin-configuration prerequisite as [`Self::Pad`].
+    PadOrTimer { wakeup_tick: u32 },
+    /// `PM_WAKEUP_COMPARATOR` only. Requires the analog comparator
+    /// front-end to already be configured (ADC ownership, out of scope for
+    /// this module) — see the module docs.
+    Comparator { wakeup_tick: u32 },
+    /// `PM_WAKEUP_COMPARATOR | PM_WAKEUP_TIMER`. Same comparator-front-end
+    /// prerequisite as [`Self::Comparator`].
+    ComparatorOrTimer { wakeup_tick: u32 },
+}
+
+impl WakeConfig {
+    /// The absolute 16 MHz system-tick deadline this configuration will
+    /// validate and program, regardless of which sources are armed.
+    pub const fn wakeup_tick(self) -> u32 {
+        match self {
+            WakeConfig::Timer { wakeup_tick }
+            | WakeConfig::Pad { wakeup_tick }
+            | WakeConfig::PadOrTimer { wakeup_tick }
+            | WakeConfig::Comparator { wakeup_tick }
+            | WakeConfig::ComparatorOrTimer { wakeup_tick } => wakeup_tick,
+        }
+    }
+
+    /// The analog `0x26` byte this configuration composes to. Always a
+    /// subset of [`calc::ARMABLE_WAKE_SOURCE_MASK`] by construction.
+    pub const fn source_bits(self) -> u8 {
+        let pad = WakeupSource::Pad as u8;
+        let timer = WakeupSource::Timer as u8;
+        let comparator = WakeupSource::Comparator as u8;
+        match self {
+            WakeConfig::Timer { .. } => timer,
+            WakeConfig::Pad { .. } => pad,
+            WakeConfig::PadOrTimer { .. } => pad | timer,
+            WakeConfig::Comparator { .. } => comparator,
+            WakeConfig::ComparatorOrTimer { .. } => comparator | timer,
+        }
+    }
+
+    /// `true` if this configuration includes `PM_WAKEUP_TIMER`.
+    pub const fn includes_timer(self) -> bool {
+        self.source_bits() & (WakeupSource::Timer as u8) != 0
+    }
+
+    /// `true` if this configuration includes `PM_WAKEUP_PAD`.
+    pub const fn includes_pad(self) -> bool {
+        self.source_bits() & (WakeupSource::Pad as u8) != 0
+    }
+
+    /// `true` if this configuration includes `PM_WAKEUP_COMPARATOR`.
+    pub const fn includes_comparator(self) -> bool {
+        self.source_bits() & (WakeupSource::Comparator as u8) != 0
+    }
 }
 
 /// MCU status after reset, matching `pm_mcu_status` in
@@ -310,6 +518,26 @@ pub enum PmError {
     /// LOW32K entry returned to its caller instead of resetting through the
     /// retention-aware startup path.
     RetentionReturned,
+    /// Internal invariant failure: a [`WakeConfig`] composed an empty
+    /// analog `0x26` byte. Unreachable through the public `WakeConfig`
+    /// variants (every one sets at least one bit) — see
+    /// [`calc::validate_wake_source_bits`].
+    EmptyWakeSource,
+    /// Internal invariant failure: a [`WakeConfig`] composed an analog
+    /// `0x26` byte outside [`calc::ARMABLE_WAKE_SOURCE_MASK`] (e.g. the
+    /// `Core` bit or a reserved bit). Unreachable through the public
+    /// `WakeConfig` variants — see [`calc::validate_wake_source_bits`].
+    UnsupportedWakeSource,
+    /// [`configure_pad_wakeup`] was called with a pin on
+    /// [`crate::gpio::Port::E`]. The vendor's cold-boot `cpu_wakeup_init`
+    /// only clears the four pad-wake-enable registers for ports A–D
+    /// (analog `0x27..=0x2a`); there is no disassembly evidence pinning
+    /// down a port-E enable register, and naively extrapolating the same
+    /// `0x27 + group` formula would land on analog `0x2b` — which is
+    /// already the hardware-proven SUSPEND/LOW32K wake-control byte
+    /// (`ModeProfile::reg_2b`). Rather than risk that collision, port E is
+    /// rejected outright.
+    PadWakePortUnsupported,
 }
 
 /// Result of a suspend attempt.
@@ -472,6 +700,72 @@ pub mod calc {
         } else {
             Ok(SuspendKind::Short)
         }
+    }
+
+    /// Analog `0x26` bits [`WakeConfig`](super::WakeConfig) is allowed to
+    /// compose: `PM_WAKEUP_PAD | PM_WAKEUP_TIMER | PM_WAKEUP_COMPARATOR`.
+    /// `PM_WAKEUP_CORE` (`0x20`) and every bit outside `SleepWakeupSrc_TypeDef`
+    /// are deliberately excluded — see the module docs' "Wake-source arming"
+    /// section for why `Core` is not caller-armable.
+    pub const ARMABLE_WAKE_SOURCE_MASK: u8 = (super::WakeupSource::Pad as u8)
+        | (super::WakeupSource::Timer as u8)
+        | (super::WakeupSource::Comparator as u8);
+
+    /// Validate a raw analog `0x26` candidate byte before it is written.
+    ///
+    /// [`WakeConfig`](super::WakeConfig)'s closed set of variants can never
+    /// actually produce a value this rejects — this is defense-in-depth,
+    /// exercised on every real suspend entry (not just in tests), so a
+    /// future bug in [`WakeConfig::source_bits`](super::WakeConfig::source_bits)
+    /// fails loudly instead of silently arming an unintended/undocumented
+    /// source.
+    pub const fn validate_wake_source_bits(bits: u8) -> Result<u8, PmError> {
+        if bits == 0 {
+            Err(PmError::EmptyWakeSource)
+        } else if bits & !ARMABLE_WAKE_SOURCE_MASK != 0 {
+            Err(PmError::UnsupportedWakeSource)
+        } else {
+            Ok(bits)
+        }
+    }
+
+    /// Analog polarity/enable register addresses for [`configure_pad_wakeup`]
+    /// (super)'s pad-wake path, indexed by GPIO port group (`0`=A .. `4`=E).
+    ///
+    /// T1, from disassembling `cpu_set_gpio_wakeup` in `pm.o`: polarity lives
+    /// at `0x21 + group` for every group (the function's arithmetic is a
+    /// single formula, not per-group branches, so groups A–E all compute a
+    /// polarity address); enable lives at `0x27 + group`, but the vendor's
+    /// own cold-boot `cpu_wakeup_init` only ever clears `0x27..=0x2a` (groups
+    /// A–D) — never a fifth register for group E. Extrapolating the same
+    /// `+0x27` formula to group E would land on `0x2b`, which is already the
+    /// hardware-proven SUSPEND/LOW32K wake-control byte
+    /// (`ModeProfile::reg_2b`, values `0x5e`/`0xde`). Because that would risk
+    /// writing group E's pad-wake-enable bit on top of an unrelated,
+    /// silicon-validated register, this returns `None` for group 4 (port E)
+    /// rather than guess.
+    ///
+    /// Returns `(polarity_addr, enable_addr)`.
+    pub const fn pad_wake_group_regs(group: u8) -> Option<(u8, u8)> {
+        if group > 4 {
+            return None;
+        }
+        let polarity_addr = 0x21 + group;
+        if group > 3 {
+            // Port E: polarity address is computable, but see the doc
+            // comment above for why the enable address is not.
+            return None;
+        }
+        let enable_addr = 0x27 + group;
+        Some((polarity_addr, enable_addr))
+    }
+
+    /// Read-modify-write a single bit of a byte: set it if `set`, clear it
+    /// otherwise. Used for the pad-wake polarity/enable registers (each pin
+    /// is one bit of its port's byte) — the same set/clear shape
+    /// `cpu_set_gpio_wakeup` performs.
+    pub const fn set_or_clear_bit(old: u8, mask: u8, set: bool) -> u8 {
+        if set { old | mask } else { old & !mask }
     }
 
     /// Compose the analog `0x2c` wake-control byte.
@@ -788,6 +1082,90 @@ pub mod calc {
             assert_eq!(adjusted_wake_tick_suspend(100_000), 100_000 - 21_840);
             assert_eq!(adjusted_wake_tick_with(100_000, 7), 99_993);
         }
+
+        #[test]
+        fn armable_wake_source_mask_is_pad_timer_comparator_only() {
+            // 0x10 | 0x40 | 0x80 = 0xd0. Core (0x20) is deliberately absent.
+            assert_eq!(ARMABLE_WAKE_SOURCE_MASK, 0xd0);
+            assert_eq!(ARMABLE_WAKE_SOURCE_MASK & 0x20, 0);
+        }
+
+        #[test]
+        fn validate_wake_source_bits_accepts_every_documented_single_and_or_combo() {
+            // Every WakeConfig-reachable byte must validate.
+            for bits in [0x40u8, 0x10, 0x50, 0x80, 0xc0] {
+                assert_eq!(validate_wake_source_bits(bits), Ok(bits));
+            }
+        }
+
+        #[test]
+        fn validate_wake_source_bits_rejects_empty() {
+            assert_eq!(validate_wake_source_bits(0), Err(PmError::EmptyWakeSource));
+        }
+
+        #[test]
+        fn validate_wake_source_bits_rejects_core_and_reserved_bits() {
+            // Core alone.
+            assert_eq!(
+                validate_wake_source_bits(0x20),
+                Err(PmError::UnsupportedWakeSource)
+            );
+            // Core OR'd with an otherwise-valid Timer bit.
+            assert_eq!(
+                validate_wake_source_bits(0x40 | 0x20),
+                Err(PmError::UnsupportedWakeSource)
+            );
+            // A reserved low bit alongside a valid source.
+            assert_eq!(
+                validate_wake_source_bits(0x40 | 0x01),
+                Err(PmError::UnsupportedWakeSource)
+            );
+        }
+
+        #[test]
+        fn pad_wake_group_regs_covers_ports_a_through_d() {
+            assert_eq!(pad_wake_group_regs(0), Some((0x21, 0x27))); // A
+            assert_eq!(pad_wake_group_regs(1), Some((0x22, 0x28))); // B
+            assert_eq!(pad_wake_group_regs(2), Some((0x23, 0x29))); // C
+            assert_eq!(pad_wake_group_regs(3), Some((0x24, 0x2a))); // D
+        }
+
+        #[test]
+        fn pad_wake_group_regs_rejects_port_e_and_out_of_range() {
+            // Port E: no proven enable register, and 0x2b would collide with
+            // the hardware-proven suspend/low32k wake-control byte.
+            assert_eq!(pad_wake_group_regs(4), None);
+            assert_eq!(pad_wake_group_regs(5), None);
+            assert_eq!(pad_wake_group_regs(255), None);
+        }
+
+        #[test]
+        fn pad_wake_enable_registers_never_collide_with_reg_2b() {
+            for group in 0..4u8 {
+                let (_, en_addr) = pad_wake_group_regs(group).unwrap();
+                assert_ne!(en_addr, REG_2B_SUSPEND);
+                assert_ne!(en_addr, REG_2B_LOW32K);
+            }
+        }
+
+        #[test]
+        fn set_or_clear_bit_only_touches_the_requested_bit() {
+            assert_eq!(set_or_clear_bit(0x00, 0x04, true), 0x04);
+            assert_eq!(set_or_clear_bit(0xff, 0x04, false), 0xfb);
+            // Untouched bits are preserved exactly.
+            assert_eq!(
+                set_or_clear_bit(0b1010_1010, 0b0000_0010, true),
+                0b1010_1010
+            );
+            assert_eq!(
+                set_or_clear_bit(0b1010_1010, 0b0000_0001, true),
+                0b1010_1011
+            );
+            assert_eq!(
+                set_or_clear_bit(0b1010_1010, 0b0000_1000, false),
+                0b1010_0010
+            );
+        }
     }
 }
 
@@ -800,7 +1178,7 @@ mod hw {
     use super::calc;
     use super::{
         FLD_SYSTEM_TICK_RUNNING, FLD_SYSTEM_TICK_START, PmDebugSnapshot, PmError, SuspendKind,
-        WakeStatus, WakeupSource,
+        WakeStatus,
     };
     use crate::mmio::{REG_ANALOG_ADDR, r8, r32, w8, w32};
 
@@ -1147,34 +1525,51 @@ mod hw {
     where
         F: FnOnce() -> Result<T, PmError>,
     {
+        use core::sync::atomic::{Ordering, compiler_fence};
+
         let saved_irq = unsafe { r8(REG_IRQ_EN_643) };
         unsafe { w8(REG_IRQ_EN_643, 0) };
+        compiler_fence(Ordering::SeqCst);
         let result = body();
+        compiler_fence(Ordering::SeqCst);
         // Restore on every returning path, including every typed error.
         unsafe { w8(REG_IRQ_EN_643, saved_irq) };
         result
     }
 
-    /// Enter `DEEPSLEEP_MODE_RET_SRAM_LOW32K` and wake by the 32k RC timer at
-    /// the absolute 16 MHz system tick `wakeup_tick`.
+    /// Enter `DEEPSLEEP_MODE_RET_SRAM_LOW32K` and wake by the sources armed in
+    /// `config`, waking no later than its absolute 16 MHz system tick.
     ///
     /// The caller must have already run [`super::rc_32k_init_and_cal`] (RC-32k
-    /// selected and calibrated) so that register `0x750` is valid.
+    /// selected and calibrated) so that register `0x750` is valid. If `config`
+    /// includes `Pad`, the target pin(s) must already have been armed via
+    /// [`super::configure_pad_wakeup`] — see its docs and the module-level
+    /// "Pad-wake pin configuration" section; this function does not touch
+    /// GPIO configuration itself.
     ///
-    /// A successful entry never returns: timer wake resets the core, preserves
-    /// LOW32K SRAM, and re-enters the application's retention-aware startup.
-    /// Pre-entry failures return a typed [`PmError`]. If the hardware
-    /// unexpectedly resumes in place, the function returns
+    /// A successful entry never returns: a real wake resets the core,
+    /// preserves LOW32K SRAM, and re-enters the application's retention-aware
+    /// startup. Pre-entry failures return a typed [`PmError`]. If the
+    /// hardware unexpectedly resumes in place, the function returns
     /// [`PmError::RetentionReturned`] rather than pretending LOW32K succeeded.
-    pub fn cpu_sleep_timer_rc(wakeup_tick: u32) -> Result<core::convert::Infallible, PmError> {
-        with_irq_saved(|| match suspend_body(wakeup_tick, &PROFILE_LOW32K) {
+    ///
+    /// Byte-for-byte identical to the original timer-only entry when
+    /// `config` is [`super::WakeConfig::Timer`] — see [`cpu_sleep_timer_rc`],
+    /// which is now a thin wrapper around this function. Pad/Comparator
+    /// arming is T1 (disassembly-derived: the `0x26` write always carried the
+    /// caller's full byte, not just the Timer bit) but has **not** been
+    /// exercised on real silicon — see the module docs.
+    pub fn cpu_sleep_wakeup_rc(
+        config: super::WakeConfig,
+    ) -> Result<core::convert::Infallible, PmError> {
+        with_irq_saved(|| match suspend_body(config, &PROFILE_LOW32K) {
             Ok(_) => Err(PmError::RetentionReturned),
             Err(error) => Err(error),
         })
     }
 
-    /// Enter plain `SUSPEND_MODE` (0x00) and wake by the 32k RC timer at the
-    /// absolute 16 MHz system tick `wakeup_tick`.
+    /// Enter plain `SUSPEND_MODE` (0x00) and wake by the sources armed in
+    /// `config`, waking no later than its absolute 16 MHz system tick.
     ///
     /// SUSPEND resumes in place with all SRAM powered, so it does **not**
     /// depend on LOW32K retention. It is
@@ -1184,11 +1579,44 @@ mod hw {
     /// `0x2b = 0x5e`, `0x2c` tail `0x96`, `0x07 |= 0x04`, `0x7f = 1`, system
     /// register `0x602 = 8`, and the mode-0 early-wake offset `0x0555<<4`.
     ///
+    /// If `config` includes `Pad`, the target pin(s) must already have been
+    /// armed via [`super::configure_pad_wakeup`] — this function does not
+    /// touch GPIO configuration itself. Comparator front-end setup is
+    /// likewise the caller's responsibility (out of scope for this module).
+    ///
     /// Returns the decoded [`WakeStatus`] after the in-place wake. All waits
     /// are bounded, failures are typed, and IRQ + `0x66` are restored
     /// unconditionally before returning.
+    ///
+    /// Byte-for-byte identical to the original timer-only entry when
+    /// `config` is [`super::WakeConfig::Timer`] — see [`cpu_suspend_timer_rc`],
+    /// which is now a thin wrapper around this function. Pad/Comparator
+    /// arming is T1 but has **not** been exercised on real silicon — see the
+    /// module docs.
+    pub fn cpu_suspend_wakeup_rc(config: super::WakeConfig) -> Result<WakeStatus, PmError> {
+        with_irq_saved(|| suspend_body(config, &PROFILE_SUSPEND))
+    }
+
+    /// Enter `DEEPSLEEP_MODE_RET_SRAM_LOW32K` and wake by the 32k RC timer at
+    /// the absolute 16 MHz system tick `wakeup_tick`.
+    ///
+    /// Thin wrapper around [`cpu_sleep_wakeup_rc`] with
+    /// [`super::WakeConfig::Timer`] — kept for backward compatibility and
+    /// produces byte-for-byte the same register writes as before this
+    /// module gained general wake-source arming.
+    pub fn cpu_sleep_timer_rc(wakeup_tick: u32) -> Result<core::convert::Infallible, PmError> {
+        cpu_sleep_wakeup_rc(super::WakeConfig::Timer { wakeup_tick })
+    }
+
+    /// Enter plain `SUSPEND_MODE` (0x00) and wake by the 32k RC timer at the
+    /// absolute 16 MHz system tick `wakeup_tick`.
+    ///
+    /// Thin wrapper around [`cpu_suspend_wakeup_rc`] with
+    /// [`super::WakeConfig::Timer`] — kept for backward compatibility and
+    /// produces byte-for-byte the same register writes as before this
+    /// module gained general wake-source arming.
     pub fn cpu_suspend_timer_rc(wakeup_tick: u32) -> Result<WakeStatus, PmError> {
-        with_irq_saved(|| suspend_body(wakeup_tick, &PROFILE_SUSPEND))
+        cpu_suspend_wakeup_rc(super::WakeConfig::Timer { wakeup_tick })
     }
 
     /// Start the free-running 16 MHz system timer (`reg_system_tick`, `0x740`)
@@ -1242,16 +1670,18 @@ mod hw {
     }
 
     /// Read-only diagnostic: compute and return the SUSPEND-path
-    /// [`PmDebugSnapshot`] for `wakeup_tick` **without** writing any register,
+    /// [`PmDebugSnapshot`] for `config` **without** writing any register,
     /// arming any wake source, touching `0x66`, or entering low power.
     ///
     /// It mirrors the exact reads/computations of the SUSPEND entry
-    /// ([`cpu_suspend_timer_rc`]) up to the first register write, so the
+    /// ([`cpu_suspend_wakeup_rc`]) up to the first register write, so the
     /// returned `target32k`, `reg_20/1f/2c`, and raw `reg_07/02/05` values are
     /// what a real suspend would use. Intended for on-hardware verification of
     /// the derived comparator target and calibration before committing to a
     /// suspend. All hardware waits are bounded; every failure is typed.
-    pub fn suspend_debug_snapshot(wakeup_tick: u32) -> Result<PmDebugSnapshot, PmError> {
+    pub fn suspend_debug_snapshot(config: super::WakeConfig) -> Result<PmDebugSnapshot, PmError> {
+        let wakeup_tick = config.wakeup_tick();
+        let src = calc::validate_wake_source_bits(config.source_bits())?;
         system_timer_ready()?;
 
         // Hardware 32k calibration (bounded), identical to suspend_body.
@@ -1291,7 +1721,6 @@ mod hw {
         let reg_02_raw = ana_r(ANA_02).ok_or(PmError::AnalogTimeout)?;
         let reg_05_raw = ana_r(ANA_05).ok_or(PmError::AnalogTimeout)?;
 
-        let src = WakeupSource::Timer as u8;
         Ok(PmDebugSnapshot {
             calib,
             now_sys_tick: now,
@@ -1433,7 +1862,18 @@ mod hw {
     /// * a `sleep_start` or post-wake analog failure completes **all**
     ///   mandatory cleanup (32k-timer disable handshake, system-clock restore,
     ///   `0x66` restore) *first*, then surfaces the error.
-    fn suspend_body(wakeup_tick: u32, profile: &ModeProfile) -> Result<WakeStatus, PmError> {
+    fn suspend_body(
+        config: super::WakeConfig,
+        profile: &ModeProfile,
+    ) -> Result<WakeStatus, PmError> {
+        let wakeup_tick = config.wakeup_tick();
+        // Validate the composed analog `0x26` byte up front (defense-in-depth
+        // — see `calc::validate_wake_source_bits`; unreachable through the
+        // public `WakeConfig` variants, but cheap and worth checking on every
+        // real entry rather than only in tests). No state saved yet, so a
+        // bail-out here is clean.
+        let src = calc::validate_wake_source_bits(config.source_bits())?;
+
         // The entire path relies on the free-running 16 MHz system timer
         // (0x740): `now`, the xtal-ready wait, and the post-wake tick wait all
         // read it. The pure-Rust boot never starts it, so require it running
@@ -1471,7 +1911,6 @@ mod hw {
         let adjusted = calc::adjusted_wake_tick_with(wakeup_tick, profile.early_wakeup_ticks);
 
         // --- arm wake source + clear status (T1: +0x2c8 / +0xdc) ---
-        let src = WakeupSource::Timer as u8; // 0x40
         if !ana_w(ANA_26, src) {
             return Err(PmError::AnalogTimeout);
         }
@@ -1603,8 +2042,8 @@ mod hw {
 
 #[cfg(target_arch = "tc32")]
 pub use hw::{
-    cpu_sleep_timer_rc, cpu_suspend_timer_rc, suspend_debug_snapshot, system_timer_init,
-    system_timer_ready,
+    cpu_sleep_timer_rc, cpu_sleep_wakeup_rc, cpu_suspend_timer_rc, cpu_suspend_wakeup_rc,
+    suspend_debug_snapshot, system_timer_init, system_timer_ready,
 };
 
 // ---------------------------------------------------------------------------
@@ -1671,6 +2110,91 @@ pub fn rc_32k_cal() -> Result<(), super::mmio::AnalogError> {
     analog_write(0xc6, 0xf6)?;
     analog_write(0x30, 0x20)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pad wake-source pin configuration (runs before suspend, flash still powered)
+// ---------------------------------------------------------------------------
+
+/// Wake polarity for a single pin armed via [`configure_pad_wakeup`],
+/// matching `GPIO_LevelTypeDef` (`platform/chip_8258/gpio.h`) both in name
+/// and value: `Level_Low = 0` ("low-level wakeup"), `Level_High = 1`
+/// ("high-level wakeup") — the vendor's own doc comment on
+/// `cpu_set_gpio_wakeup`'s `pol` parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadWakeLevel {
+    /// Wake when the pin reads low.
+    Low,
+    /// Wake when the pin reads high.
+    High,
+}
+
+/// Arm or disarm a single GPIO pin as a `PM_WAKEUP_PAD` source.
+///
+/// T1, ported from disassembling `cpu_set_gpio_wakeup` in `pm.o`: for the
+/// pin's port group `g` (`A`=0 .. `D`=3), this reads/RMWs a single bit
+/// (`1 << bit`) of the analog polarity register at `0x21 + g` to `level`,
+/// then the same bit of the analog enable register at `0x27 + g` to
+/// `enable`. See [`calc::pad_wake_group_regs`] for the address derivation
+/// and why [`crate::gpio::Port::E`] is rejected rather than extrapolated.
+///
+/// # Invariant: configure pins *before* entering sleep
+///
+/// This function only programs the analog pad-wake registers; it does
+/// **not** call [`cpu_sleep_wakeup_rc`]/[`cpu_suspend_wakeup_rc`], and those
+/// functions do not take or validate a `Pin` — arming `WakeConfig::Pad`/
+/// `PadOrTimer` without first calling this (with `enable: true`) for at
+/// least one pin arms an analog wake source with no pin actually watching
+/// it. Conversely, this function does not touch `crate::gpio::Pin`'s own
+/// digital configuration (input-enable, pull, mux) — the pin must
+/// separately be a configured digital input for the pad level to be
+/// meaningful; this function does not and cannot verify that from the
+/// analog side, so no such check is attempted here.
+///
+/// This does **not** consume or store the `Pin` — GPIO ownership stays with
+/// the caller/`gpio` module for the pin's whole lifetime; this function only
+/// borrows it momentarily to read its port/bit.
+///
+/// # Errors
+///
+/// Returns [`PmError::PadWakePortUnsupported`] for `Port::E` (see
+/// [`calc::pad_wake_group_regs`]) and [`PmError::AnalogTimeout`] on a
+/// bounded analog-bus timeout. The polarity write happens before the enable
+/// write, but a timed-out analog transaction has unknown completion state;
+/// callers must treat any `Err` as "reconfigure and verify before relying on
+/// this pin to wake."
+#[cfg(target_arch = "tc32")]
+pub fn configure_pad_wakeup(
+    pin: &crate::gpio::Pin,
+    level: PadWakeLevel,
+    enable: bool,
+) -> Result<(), PmError> {
+    use crate::gpio::Port;
+    use crate::mmio::{analog_read, analog_write};
+
+    let (port, bit) = pin.port_and_bit();
+    let group = match port {
+        Port::A => 0u8,
+        Port::B => 1,
+        Port::C => 2,
+        Port::D => 3,
+        Port::E => return Err(PmError::PadWakePortUnsupported),
+    };
+    let (pol_addr, en_addr) =
+        calc::pad_wake_group_regs(group).ok_or(PmError::PadWakePortUnsupported)?;
+    let mask = 1u8 << bit;
+
+    crate::mmio::with_irqs_disabled(|| {
+        let old_pol = analog_read(pol_addr).map_err(|_| PmError::AnalogTimeout)?;
+        let new_pol = calc::set_or_clear_bit(old_pol, mask, matches!(level, PadWakeLevel::High));
+        analog_write(pol_addr, new_pol).map_err(|_| PmError::AnalogTimeout)?;
+
+        let old_en = analog_read(en_addr).map_err(|_| PmError::AnalogTimeout)?;
+        let new_en = calc::set_or_clear_bit(old_en, mask, enable);
+        analog_write(en_addr, new_en).map_err(|_| PmError::AnalogTimeout)?;
+
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1751,6 +2275,73 @@ mod tests {
     fn timer_source_matches_analog_0x26_encoding() {
         // The value written to analog 0x26 for a timer wake is 0x40.
         assert_eq!(WakeupSource::Timer as u8, 0x40);
+    }
+
+    #[test]
+    fn wake_config_source_bits_match_documented_combinations() {
+        assert_eq!(
+            WakeConfig::Timer { wakeup_tick: 0 }.source_bits(),
+            WakeupSource::Timer as u8
+        );
+        assert_eq!(
+            WakeConfig::Pad { wakeup_tick: 0 }.source_bits(),
+            WakeupSource::Pad as u8
+        );
+        assert_eq!(
+            WakeConfig::PadOrTimer { wakeup_tick: 0 }.source_bits(),
+            (WakeupSource::Pad as u8) | (WakeupSource::Timer as u8)
+        );
+        assert_eq!(
+            WakeConfig::Comparator { wakeup_tick: 0 }.source_bits(),
+            WakeupSource::Comparator as u8
+        );
+        assert_eq!(
+            WakeConfig::ComparatorOrTimer { wakeup_tick: 0 }.source_bits(),
+            (WakeupSource::Comparator as u8) | (WakeupSource::Timer as u8)
+        );
+    }
+
+    #[test]
+    fn wake_config_never_composes_core_or_a_reserved_bit() {
+        // Exhaustive over the closed variant set: every possible
+        // `source_bits()` output must survive `validate_wake_source_bits`.
+        let configs = [
+            WakeConfig::Timer { wakeup_tick: 0 },
+            WakeConfig::Pad { wakeup_tick: 0 },
+            WakeConfig::PadOrTimer { wakeup_tick: 0 },
+            WakeConfig::Comparator { wakeup_tick: 0 },
+            WakeConfig::ComparatorOrTimer { wakeup_tick: 0 },
+        ];
+        for config in configs {
+            let bits = config.source_bits();
+            assert!(bits & (WakeupSource::Core as u8) == 0);
+            assert_eq!(calc::validate_wake_source_bits(bits), Ok(bits));
+        }
+    }
+
+    #[test]
+    fn wake_config_wakeup_tick_is_preserved_for_every_variant() {
+        assert_eq!(WakeConfig::Timer { wakeup_tick: 42 }.wakeup_tick(), 42);
+        assert_eq!(WakeConfig::Pad { wakeup_tick: 42 }.wakeup_tick(), 42);
+        assert_eq!(WakeConfig::PadOrTimer { wakeup_tick: 42 }.wakeup_tick(), 42);
+        assert_eq!(WakeConfig::Comparator { wakeup_tick: 42 }.wakeup_tick(), 42);
+        assert_eq!(
+            WakeConfig::ComparatorOrTimer { wakeup_tick: 42 }.wakeup_tick(),
+            42
+        );
+    }
+
+    #[test]
+    fn wake_config_includes_helpers_agree_with_source_bits() {
+        let pad_or_timer = WakeConfig::PadOrTimer { wakeup_tick: 0 };
+        assert!(pad_or_timer.includes_pad());
+        assert!(pad_or_timer.includes_timer());
+        assert!(!pad_or_timer.includes_comparator());
+
+        let comparator_only = WakeConfig::Comparator { wakeup_tick: 0 };
+        assert!(comparator_only.includes_comparator());
+        assert!(!comparator_only.includes_pad());
+        assert!(!comparator_only.includes_timer());
     }
 
     #[test]

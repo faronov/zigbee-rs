@@ -63,6 +63,7 @@ fn failure(leds: &StatusLeds) -> ! {
 pub fn run() -> ! {
     type Device = ZigbeeDevice<TelinkMac>;
 
+    tlsr8258_hal::timer::init();
     let resources = match BoardResources::take() {
         Some(resources) => resources,
         None => loop {
@@ -71,6 +72,16 @@ pub fn run() -> ! {
     };
     let leds = resources.lighting.into_status_leds();
     if leds.init().is_err() {
+        failure(&leds);
+    }
+    let adc = match tlsr8258_hal::adc::Adc::new(
+        resources.adc,
+        tlsr8258_hal::flash::FlashGeometry::KiB512,
+    ) {
+        Ok(adc) => adc,
+        Err(_) => failure(&leds),
+    };
+    if adc.install_flash_voltage_guard(resources.adc_pc5).is_err() {
         failure(&leds);
     }
 

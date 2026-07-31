@@ -7,7 +7,8 @@ The supported Telink platform is a pure-Rust TLSR8258 implementation.
 | Property | TLSR8258 |
 |---|---|
 | Core | Telink TC32 |
-| Flash | 512 KiB |
+| HAL flash geometries | 512 KiB, 1 MiB, 2 MiB, 4 MiB |
+| TB-04 fitted flash | 512 KiB |
 | SRAM | 64 KiB at `0x840000..0x850000` |
 | Rust target | `tc32-unknown-none-elf` |
 | Toolchain | [modern-tc32](https://github.com/modern-tc32/rust) |
@@ -31,7 +32,8 @@ examples/telink-tlsr8258-sensor/  polling end-device sensor
 examples/telink-tlsr8258-router/  always-on parent router
 tools/telink-tlsr8258-lab/        bring-up and regression firmware
 tlsr8258-hal/                     clocks, timers, flash, radio, GPIO, ADC,
-                                  I2C, SPI, PWM, PM, ownership tokens
+                                  I2C, SPI, UART, PWM, PM, IRQ/reset,
+                                  capture, RNG, AES, ownership tokens
 tlsr8258-rt/                      reset, IRQ context, RAM initialization
 boards/tlsr8258-tb04/             fitted LEDs, flash token, typed resources
 products/tlsr8258-tb04/           protected flash partition and linker policy
@@ -123,10 +125,12 @@ rewriting the embedded APS frame, and keeps a child provisional until it
 proves possession of the network key. Secured and centralized unsecured
 rejoins are supported; distributed unsecured rejoins are rejected.
 
-Child-parent operation is not yet hardware-validated. A sniffer gate must
-verify ACK turnaround and Frame Pending timing, deferred Association Response
-after an extended-address poll, and indirect data after a short-address child
-poll.
+Child-parent operation has been exercised once on hardware, including child
+admission and Trust Center link-key exchange. That run used an older BL702
+child image, and a later corrected capture exposed parent-delivery blockers
+that are now fixed in source. The release gate therefore remains a clean
+first-attempt join with the corrected child image, followed by a complete ZHA
+interview under an independent channel-15 sniffer.
 
 ## Hardware lab
 
@@ -146,38 +150,71 @@ flash, and retention PM without obscuring the production applications.
 
 ## Peripheral HAL status
 
-The reusable HAL exposes GPIO, ADC, flash, timers, power management, I2C, SPI,
-and six-channel PWM. `embedded-hal` I2C, SPI bus, digital, and PWM traits are
-implemented where applicable.
+The chip HAL is direct-register Rust. Vendor objects were used only as
+disassembly evidence where open headers did not contain a function body; no
+Telink library is linked.
 
-`tlsr8258_hal::peripherals::Peripherals::take()` creates one shared
-`SerialController` token, the PWM token, and a non-`Clone` token for every
-GPIO pad. I2C and SPI consume the same serial token because TLSR8258 implements
-them with overlapping control and route registers; safe code therefore cannot
-keep both controllers live. On TC32 the single-take guard masks interrupts
-rather than emitting unsupported atomic read-modify-write instructions.
+| Surface | Implemented support | Validation boundary |
+|---|---|---|
+| System control | Fail-closed clock bring-up, typed clock/reset gates, canonical IRQ masks/W1C acknowledgement, Timer0/Timer1, Timer2 watchdog, immediate software reset | Clock/radio/timer behavior has hardware evidence; the consolidated facades are host-tested and TC32-built |
+| GPIO and capture | Unique PA0-PE7 tokens, GPIO/mux/pulls/drive, three GPIO IRQ comparators, fixed-capacity rising-edge capture queue | Existing GPIO paths have hardware evidence; the generalized IRQ/capture APIs are compile-tested |
+| I2C/SPI | Four I2C groups with repeated starts and bounded recovery; two MSB-first SPI groups | Host-tested and TC32-built, not silicon-tested |
+| UART | All documented TX/RX routes, fixed 8 data bits, parity/stop bits, RTS/CTS, bounded flush, nonblocking byte I/O, trigger/error IRQ status | Disassembly-derived and cross-checked, including the PB1/PB7 4800-8N1 smart-plug profile; not silicon-tested |
+| ADC | Exclusive MISC-channel owner, geometry-aware factory calibration, GPIO voltage sampling, serialized sharing with RNG/flash | Register path is evidenced; physical accuracy depends on fitted calibration and board wiring |
+| Flash | Raw NOR read/program/erase, bounded partitions, geometry verification, factory EUI/UID fallback, Zbit voltage guard | Deployed TB-04 persistence is hardware-proven; new geometry/guard behavior is compile-tested |
+| PWM | Six channels, normal/count/IR modes, CPU-fed IR FIFO, shadow cycle/duty, typed IRQ status | Basic register path is compile-tested; advanced modes are not silicon-tested |
+| Power management | Suspend/deep-sleep/retention entry, timer/pad/comparator wake-source arming, RC32K calibration, typed wake status | Timer-only suspend is hardware-proven. Pad/comparator wake and comparator front-end behavior remain unvalidated |
+| RNG | AES-128 CTR_DRBG with SHA-256-conditioned VBAT/GND ADC samples, stuck-source rejection, full ADC state restore | NIST DRBG vector passes; physical min-entropy is uncharacterized and still requires SP 800-90B work |
+| AES | Token-owned, bounded AES-128 ECB encrypt/decrypt plus optional `zigbee-crypto` forward-cipher backend | Vendor-protocol/KAT tested, never exercised on silicon; default timeout is unmeasured |
 
-`boards/tlsr8258-tb04::resources::BoardResources` owns those controller tokens,
-the fitted RGB/status LED pins, the supported non-LED I2C/SPI route pins, and
-the fitted flash token. `products/tlsr8258-tb04` consumes that token and bounds
-the security journal to `0x74000..0x76000`; its linker script prevents firmware
-overlap. Choosing direct GPIO LEDs consumes the same
-lighting token that would otherwise create PWM0/PWM5/PWM2 outputs. The raw
-`Pin::steal` escape hatch is unsafe; normal code obtains unique pins only from
-`Peripherals`.
+`tlsr8258_hal::peripherals::Peripherals::take()` returns one
+`SerialController`, plus independent PWM, UART, ADC, AES, and non-`Clone` GPIO
+tokens. I2C and SPI consume the same serial token because their control and
+route registers overlap. Radio and RNG use separate IRQ-safe singleton
+handles. Shared register read-modify-writes are serialized by the central
+nested-safe IRQ critical section.
 
-The I2C implementation validates the four documented pin groups, supports
-bounded bus recovery and repeated-start transactions, and does not invent an
-arbitration-loss flag that TLSR8258 does not expose. SPI supports the two
-documented groups and MSB-first operation. All PWM channels share one
-validated clock/divider.
+`boards/tlsr8258-tb04::resources::BoardResources` retains the serial, UART,
+ADC, AES, lighting, PC5, and fitted-flash ownership. The production sensor
+and router install the owned ADC/PC5 flash-voltage guard before constructing
+the security journal. `products/tlsr8258-tb04` bounds that journal to
+`0x74000..0x76000`; the linker script prevents firmware overlap.
 
-Host tests and TC32 production builds cover the new APIs. Existing GPIO, ADC,
-flash, radio, and retention-PM paths have hardware evidence; the new
-I2C/SPI/PWM paths have not yet been tested on silicon. TB-04 does not expose a
-fixed I2C or SPI convenience constructor because fitted bus wiring is not
-documented. Its `SerialResources` instead exposes the valid route pins and the
-single controller token for an application-selected bus.
+### Flash geometry and identity
+
+Telink factory locations move with the fitted flash:
+
+| Geometry | Factory EUI-64 | Factory config | ADC calibration |
+|---|---:|---:|---:|
+| 512 KiB | `0x76000` | `0x77000` | `0x770C0` |
+| 1 MiB | `0xFF000` | `0xFE000` | `0xFE0C0` |
+| 2 MiB | `0x1FF000` | `0x1FE000` | `0x1FE0C0` |
+| 4 MiB | `0x3FF000` | `0x3FE000` | `0x3FE0C0` |
+
+Non-512-KiB products must use geometry-aware constructors. They verify the
+JEDEC capacity before reading a factory sector, preventing ordinary
+application bytes at another geometry's address from becoming a plausible
+device identity. Existing TB-04 sensor/router EUI offsets remain unchanged
+for deployed persistence and ZHA compatibility; new products should use the
+unchanged factory/UID-derived EUI.
+
+Zbit `ZB25WD40B`/`ZB25WD80B` parts require a real ADC check before every
+physical page program or sector erase. The HAL drives PC5 high, samples it,
+and fails closed below 2200 mV, at 500 mV or more fluctuation, or whenever
+the reading is unavailable. A constant-voltage callback cannot be installed
+through the public API.
+
+### Explicitly unsupported
+
+UART DMA, generic DMA-channel ownership, PWM DMA, complementary PWM outputs,
+USB, audio/PGA, QDEC, EMI/test features, and SWire debug control are not
+modeled. The AES accelerator is also not yet the default Zigbee CCM* path:
+NWK/APS currently call software free functions without carrying a persistent
+cipher object, so `MacCapabilities.hardware_security` remains `false`.
+
+Host tests and TC32 builds cover the complete API. TB-04 exposes no fixed
+I2C/SPI convenience constructor because fitted bus wiring is undocumented;
+applications choose from the validated generic route groups.
 
 ## Current capability boundary
 
@@ -188,7 +225,8 @@ verified commissioning, TCLK exchange, interview, reporting, reset resume,
 secured rejoin, and router join/relay setup.
 
 Router restart, maintenance traffic, and NWK relay are hardware-verified.
-Child-parent support is software-complete but remains behind the sniffer gate
-described above. SWire RAM/flash inspection is restart-intrusive on the tested
-programmer and must be performed only after stopping an acceptance capture.
-Full coordinator support is not advertised.
+Child-parent support is software-complete and has partial hardware evidence,
+but remains behind the clean corrected-image sniffer gate described above.
+SWire RAM/flash inspection is restart-intrusive on the tested programmer and
+must be performed only after stopping an acceptance capture. Full coordinator
+support is not advertised.

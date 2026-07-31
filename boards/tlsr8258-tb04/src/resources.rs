@@ -13,8 +13,17 @@ pub const SYSTEM_CLOCK_HZ: u32 = 24_000_000;
 pub struct BoardResources {
     /// Mutually exclusive I2C/SPI controller and the non-LED route pins.
     pub serial: SerialResources,
+    /// Independent UART controller. Pair it with a documented route pin
+    /// exposed by `serial` or `adc_pc5`; LED-overlapping routes stay owned
+    /// by `lighting`.
+    pub uart: tlsr8258_hal::peripherals::Uart,
+    /// Hardware AES-128 accelerator ownership.
+    pub aes: tlsr8258_hal::peripherals::Aes,
     /// PC1/PB5/PC4: choose direct GPIO LEDs or PWM0/PWM5/PWM2.
     pub lighting: LightingToken,
+    /// Exclusive ADC controller and the otherwise-unassigned PC5 ADC pin.
+    pub adc: tlsr8258_hal::peripherals::Adc,
+    pub adc_pc5: tlsr8258_hal::gpio::Pin,
     /// Exclusive ownership of the fitted 512 KiB flash.
     #[cfg(target_arch = "tc32")]
     pub flash: OnboardFlash,
@@ -34,6 +43,7 @@ impl BoardResources {
             pc2,
             pc3,
             pc4,
+            pc5,
             pd7,
             ..
         } = peripherals.pins;
@@ -49,12 +59,16 @@ impl BoardResources {
                 pc3,
                 pd7,
             },
+            uart: peripherals.uart,
+            aes: peripherals.aes,
             lighting: LightingToken {
                 pwm: peripherals.pwm,
                 red: pc1,
                 green: pb5,
                 blue: pc4,
             },
+            adc: peripherals.adc,
+            adc_pc5: pc5,
             #[cfg(target_arch = "tc32")]
             flash: OnboardFlash(()),
         })
@@ -167,6 +181,9 @@ mod tests {
     #[test]
     fn peripheral_token_is_zero_sized_but_pin_owners_are_not() {
         assert_eq!(size_of::<tlsr8258_hal::peripherals::SerialController>(), 0);
+        assert_eq!(size_of::<tlsr8258_hal::peripherals::Uart>(), 0);
+        assert_eq!(size_of::<tlsr8258_hal::peripherals::Adc>(), 0);
+        assert_eq!(size_of::<tlsr8258_hal::peripherals::Aes>(), 0);
         assert!(size_of::<LightingToken>() > 0);
         assert!(size_of::<SerialResources>() > 0);
         #[cfg(target_arch = "tc32")]

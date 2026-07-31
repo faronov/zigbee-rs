@@ -14,6 +14,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-buffer"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -53,6 +62,28 @@ dependencies = [
  "generic-array",
  "typenum",
 ]
+
+[[package]]
+name = "digest"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+dependencies = [
+ "block-buffer",
+ "crypto-common",
+]
+
+[[package]]
+name = "embedded-hal"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
+
+[[package]]
+name = "embedded-storage"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a21dea9854beb860f3062d10228ce9b976da520a73474aed3171ec276bc0c032"
 
 [[package]]
 name = "generic-array"
@@ -105,6 +136,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -115,6 +157,7 @@ name = "telink-tlsr8258-radio"
 version = "0.1.0"
 dependencies = [
  "tlsr8258-hal",
+ "tlsr8258-tb04",
  "zigbee-aps",
  "zigbee-mac",
  "zigbee-nwk",
@@ -126,6 +169,19 @@ dependencies = [
 [[package]]
 name = "tlsr8258-hal"
 version = "0.1.0"
+dependencies = [
+ "aes",
+ "embedded-hal",
+ "embedded-storage",
+ "sha2",
+]
+
+[[package]]
+name = "tlsr8258-tb04"
+version = "0.1.0"
+dependencies = [
+ "tlsr8258-hal",
+]
 
 [[package]]
 name = "typenum"
@@ -199,6 +255,7 @@ dependencies = [
 name = "zigbee-runtime"
 version = "0.1.0"
 dependencies = [
+ "embedded-storage",
  "heapless",
  "log",
  "zigbee-aps",

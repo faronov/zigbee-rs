@@ -9,3 +9,10 @@ repository = "https://github.com/zigbee-rs/zigbee-rs"
 [dependencies]
 aes = { version = "0.8", default-features = false }
 heapless = "0.9"
+tlsr8258-hal = { path = "../tlsr8258-hal", optional = true }
+
+[features]
+tlsr8258 = ["dep:tlsr8258-hal"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

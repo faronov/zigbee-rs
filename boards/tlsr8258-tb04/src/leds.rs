@@ -1,4 +1,6 @@
-use tlsr8258_hal::gpio::{self, GpioError, Pin};
+use tlsr8258_hal::gpio::Pin;
+#[cfg(target_arch = "tc32")]
+use tlsr8258_hal::gpio::{self, GpioError};
 
 pub struct Led(Pin);
 

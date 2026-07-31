@@ -1,7 +1,8 @@
 //! Exclusive ownership tokens for singleton TLSR8258 peripherals.
 
 macro_rules! token {
-    ($name:ident) => {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
         #[derive(Debug)]
         pub struct $name {
             _private: (),
@@ -17,6 +18,17 @@ macro_rules! token {
 
 token!(Pwm);
 token!(SerialController);
+token!(Uart);
+token!(
+    /// Exclusive ownership of the shared MISC-channel ADC.
+    Adc
+);
+token!(
+    /// Exclusive ownership of the AES-128 ECB hardware accelerator
+    /// (`reg_aes_ctrl`/`reg_aes_data`/`reg_aes_key`, `0x540..0x560`) — see
+    /// `crate::aes` for the driver built on top of this token.
+    Aes
+);
 
 macro_rules! pins {
     ($($field:ident: ($port:ident, $bit:literal)),+ $(,)?) => {
@@ -53,6 +65,14 @@ pub struct Peripherals {
     /// TLSR8258's mutually exclusive I2C/SPI controller.
     pub serial: SerialController,
     pub pwm: Pwm,
+    /// The independent, non-DMA-capable UART controller (`0x90..0x9f`) —
+    /// does not share registers with [`SerialController`].
+    pub uart: Uart,
+    /// Application ownership of the ADC. The RNG is an internal serialized
+    /// client and restores this owner's configuration after each harvest.
+    pub adc: Adc,
+    /// The AES-128 ECB hardware accelerator (`crate::aes`).
+    pub aes: Aes,
     pub pins: Pins,
 }
 
@@ -69,14 +89,14 @@ impl Peripherals {
         {
             // TC32 is single-core and lacks atomic read-modify-write
             // instructions, so serialize acquisition by masking interrupts.
-            let previous_irq = unsafe { crate::mmio::r8(crate::mmio::REG_IRQ_EN) };
-            unsafe { crate::mmio::w8(crate::mmio::REG_IRQ_EN, 0) };
-            let taken = core::ptr::addr_of_mut!(TAKEN);
-            let was_taken = unsafe { core::ptr::read_volatile(taken) };
-            if !was_taken {
-                unsafe { core::ptr::write_volatile(taken, true) };
-            }
-            unsafe { crate::mmio::w8(crate::mmio::REG_IRQ_EN, previous_irq) };
+            let was_taken = crate::mmio::with_irqs_disabled(|| unsafe {
+                let taken = core::ptr::addr_of_mut!(TAKEN);
+                let was_taken = core::ptr::read_volatile(taken);
+                if !was_taken {
+                    core::ptr::write_volatile(taken, true);
+                }
+                was_taken
+            });
 
             if was_taken {
                 None
@@ -110,6 +130,9 @@ impl Peripherals {
         Self {
             serial: SerialController::new(),
             pwm: Pwm::new(),
+            uart: Uart::new(),
+            adc: Adc::new(),
+            aes: Aes::new(),
             pins: Pins::new(),
         }
     }
@@ -126,6 +149,9 @@ mod tests {
         assert!(Peripherals::take().is_none());
         assert_eq!(size_of::<SerialController>(), 0);
         assert_eq!(size_of::<Pwm>(), 0);
+        assert_eq!(size_of::<Uart>(), 0);
+        assert_eq!(size_of::<Adc>(), 0);
+        assert_eq!(size_of::<Aes>(), 0);
         assert!(size_of::<Pins>() > 0);
     }
 }
