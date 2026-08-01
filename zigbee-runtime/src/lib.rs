@@ -532,8 +532,6 @@ mod builder_cluster_tests {
 mod resume_tests {
     use core::future::Future;
     use core::task::{Context, Poll, Waker};
-    use std::sync::Arc;
-    use std::task::Wake;
 
     use super::ZigbeeDevice;
     use crate::child_store::ChildTableStore;
@@ -546,15 +544,8 @@ mod resume_tests {
     use zigbee_nwk::DeviceType;
     use zigbee_types::ShortAddress;
 
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     fn block_on<F: Future>(future: F) -> F::Output {
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         let mut future = std::pin::pin!(future);
 
         loop {
@@ -5555,13 +5546,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
 
 #[cfg(all(test, feature = "router"))]
 mod parent_router_tests {
-    use core::future::Future;
-    use core::task::{Context, Poll, Waker};
-    use std::sync::Arc;
-    use std::task::Wake;
-
     use super::role::Router;
     use super::{ClusterRef, ZigbeeDevice};
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
     use zigbee_mac::frames::parse_zigbee_beacon;
     use zigbee_mac::mock::MockMac;
     use zigbee_mac::{
@@ -5579,15 +5567,8 @@ mod parent_router_tests {
     const TC_IEEE: IeeeAddress = [0x44; 8];
     const NETWORK_KEY: [u8; 16] = [0x55; 16];
 
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     fn block_on<F: Future>(future: F) -> F::Output {
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         let mut future = std::pin::pin!(future);
         loop {
             if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
@@ -6877,16 +6858,9 @@ mod role_tests {
     fn router_role_exposes_permit_joining() {
         use core::future::Future;
         use core::task::{Context, Poll, Waker};
-        use std::sync::Arc;
-        use std::task::Wake;
 
-        struct NoopWake;
-        impl Wake for NoopWake {
-            fn wake(self: Arc<Self>) {}
-        }
         fn block_on<F: Future>(future: F) -> F::Output {
-            let waker = Waker::from(Arc::new(NoopWake));
-            let mut context = Context::from_waker(&waker);
+            let mut context = Context::from_waker(Waker::noop());
             let mut future = std::pin::pin!(future);
             loop {
                 if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
