@@ -39,9 +39,21 @@ The script creates:
 - `target/riscv32imc-unknown-none-elf/release/bl702-sensor.bin`
 - `target/riscv32imc-unknown-none-elf/release/bl702-sensor.flash.bin`
 
-The raw payload is about 194 KiB. The generated flash image contains the
+The production raw payload is 165,058 bytes; the packaged flash image is
+173,264 bytes. Production release builds compile `log` records out while
+retaining the direct UART boot markers. The generated flash image contains the
 official 176-byte BL702 boot header, payload hash and CRC, a 32 MHz XTAL clock
 configuration, and the application at flash offset `0x2000`.
+
+For a release-optimized hardware diagnostic image with the full Zigbee UART
+trace, build with:
+
+```bash
+BL702_DIAGNOSTIC_LOG=1 ./build-image.sh
+```
+
+The diagnostic build is intentionally larger because it retains the full
+Zigbee trace.
 
 ## Flash and monitor
 
@@ -62,7 +74,9 @@ Release BOOT, open permit-join on the coordinator, then run:
 ```
 
 `monitor.sh` resets through RTS and opens UART0 on GPIO14/GPIO15 at 2 Mbaud.
-The firmware scans channel 15 and retries joining every 15 seconds.
+The firmware scans channel 15 and retries joining every 15 seconds. Build the
+diagnostic image above before flashing if the full commissioning trace is
+needed; the production image emits only compact boot markers.
 
 Expected commissioning milestones include:
 

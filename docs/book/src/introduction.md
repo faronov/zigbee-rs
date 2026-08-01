@@ -5,8 +5,18 @@ targeting embedded `no_std` environments. It runs on real hardware — ESP32,
 nRF52, BL702, and more — yet the same code compiles and runs on your laptop
 for rapid iteration without touching a single wire.
 
+## Specification Baseline and Roadmap
+
+Zigbee PRO R22 with BDB 3.0.1 is the active production baseline. Current work
+prioritizes R22 conformance, smaller firmware, and hardware validation across
+the supported platforms.
+
+R23 with BDB 3.1 is intentionally deferred as an optional roadmap item. When
+implemented, its revision marker and mandatory TLV/security surface will be
+compile-time isolated so R23 code is absent from R22 firmware images.
+
 ```text
-47,800+ lines of Rust · 161 source files · 9 crates · 33 ZCL clusters · 10 hardware backends
+63,000+ lines of Rust · 199 source files · 30 crates · 45 ZCL clusters · 12 hardware platforms
 ```
 
 ## Why Rust for Zigbee?

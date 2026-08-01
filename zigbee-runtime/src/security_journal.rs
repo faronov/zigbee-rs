@@ -1,10 +1,32 @@
 //! Atomic two-sector journal for persistent Zigbee security state.
+//!
+//! # Record versions
+//!
+//! | version | encoded state | CRC offset | added                        |
+//! |---------|---------------|------------|------------------------------|
+//! | 1       | 80 bytes      | 92         | initial layout               |
+//! | 2       | 97 bytes      | 112        | staged network key           |
+//! | 3       | 98 bytes      | 112        | R22 End Device Timeout state |
+//!
+//! Slot size, record prefix length and commit offset never changed, so a
+//! newer firmware reads every older record in place and the two-sector
+//! crash-safety scheme is unaffected.
+//!
+//! # Downgrade is not supported
+//!
+//! Once this firmware has written a version 3 record, **downgrading to
+//! firmware that predates version 3 is unsupported**. Older firmware does not
+//! recognise version 3 and skips those records while scanning, so it would
+//! select the newest record it *can* decode — an older generation with stale
+//! counters, a stale parent and possibly a stale network key. Reusing those
+//! reservations would replay NWK/APS frame counters. Recommission the device
+//! instead of downgrading.
 
 use embedded_storage::nor_flash::NorFlash;
 
 use crate::security_store::{
     ENCODED_SECURITY_STATE_LEN, LEGACY_ENCODED_SECURITY_STATE_LEN, PersistentSecurityState,
-    SecurityStateStore, SecurityStoreError,
+    SecurityStateStore, SecurityStoreError, V2_ENCODED_SECURITY_STATE_LEN,
 };
 
 pub const SECURITY_JOURNAL_SECTOR_SIZE: usize = 4096;
@@ -14,12 +36,18 @@ pub const SECURITY_JOURNAL_SLOTS_PER_SECTOR: usize =
 
 const RECORD_MAGIC: [u8; 4] = *b"ZBSS";
 const LEGACY_RECORD_VERSION: u8 = 1;
-const RECORD_VERSION: u8 = 2;
+const V2_RECORD_VERSION: u8 = 2;
+const RECORD_VERSION: u8 = 3;
 const LEGACY_RECORD_CRC_OFFSET: usize = 92;
 const RECORD_CRC_OFFSET: usize = 112;
 const RECORD_PREFIX_LEN: usize = 116;
 const RECORD_COMMIT_OFFSET: usize = 124;
 const RECORD_COMMIT: [u8; 4] = *b"CMIT";
+
+// The encoded state starts at byte 12 and must stay clear of the CRC field.
+const _: () = assert!(12 + ENCODED_SECURITY_STATE_LEN <= RECORD_CRC_OFFSET);
+const _: () = assert!(12 + V2_ENCODED_SECURITY_STATE_LEN <= RECORD_CRC_OFFSET);
+const _: () = assert!(12 + LEGACY_ENCODED_SECURITY_STATE_LEN <= LEGACY_RECORD_CRC_OFFSET);
 
 pub struct SecurityStateJournal<S> {
     storage: S,
@@ -86,6 +114,9 @@ impl<S: NorFlash> SecurityStateJournal<S> {
             (RECORD_VERSION, ENCODED_SECURITY_STATE_LEN) => {
                 (RECORD_CRC_OFFSET, ENCODED_SECURITY_STATE_LEN)
             }
+            (V2_RECORD_VERSION, V2_ENCODED_SECURITY_STATE_LEN) => {
+                (RECORD_CRC_OFFSET, V2_ENCODED_SECURITY_STATE_LEN)
+            }
             (LEGACY_RECORD_VERSION, LEGACY_ENCODED_SECURITY_STATE_LEN) => {
                 (LEGACY_RECORD_CRC_OFFSET, LEGACY_ENCODED_SECURITY_STATE_LEN)
             }
@@ -102,14 +133,25 @@ impl<S: NorFlash> SecurityStateJournal<S> {
         }
 
         let generation = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-        let state = if encoded_len == ENCODED_SECURITY_STATE_LEN {
-            let mut encoded_state = [0u8; ENCODED_SECURITY_STATE_LEN];
-            encoded_state.copy_from_slice(&record[12..12 + ENCODED_SECURITY_STATE_LEN]);
-            PersistentSecurityState::decode(&encoded_state).ok()?
-        } else {
-            let mut encoded_state = [0u8; LEGACY_ENCODED_SECURITY_STATE_LEN];
-            encoded_state.copy_from_slice(&record[12..12 + LEGACY_ENCODED_SECURITY_STATE_LEN]);
-            PersistentSecurityState::decode_legacy(&encoded_state).ok()?
+        // Each version decodes through its own fixed-size buffer, so an older
+        // record can never be read with the newer field offsets or accept a
+        // flag bit its layout predates.
+        let state = match encoded_len {
+            ENCODED_SECURITY_STATE_LEN => {
+                let mut encoded_state = [0u8; ENCODED_SECURITY_STATE_LEN];
+                encoded_state.copy_from_slice(&record[12..12 + ENCODED_SECURITY_STATE_LEN]);
+                PersistentSecurityState::decode(&encoded_state).ok()?
+            }
+            V2_ENCODED_SECURITY_STATE_LEN => {
+                let mut encoded_state = [0u8; V2_ENCODED_SECURITY_STATE_LEN];
+                encoded_state.copy_from_slice(&record[12..12 + V2_ENCODED_SECURITY_STATE_LEN]);
+                PersistentSecurityState::decode_v2(&encoded_state).ok()?
+            }
+            _ => {
+                let mut encoded_state = [0u8; LEGACY_ENCODED_SECURITY_STATE_LEN];
+                encoded_state.copy_from_slice(&record[12..12 + LEGACY_ENCODED_SECURITY_STATE_LEN]);
+                PersistentSecurityState::decode_legacy(&encoded_state).ok()?
+            }
         };
         Some((generation, state))
     }
@@ -292,7 +334,7 @@ impl<S: NorFlash> SecurityStateStore for SecurityStateJournal<S> {
     }
 }
 
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for byte in data {
         crc ^= *byte as u32;
@@ -401,6 +443,39 @@ mod tests {
         state
     }
 
+    /// Write a pre-v3 record by hand, exactly as the older firmware did.
+    ///
+    /// The v3-only content (flags bit 6 and encoded byte 11) is stripped, so
+    /// the bytes on flash are byte-for-byte what firmware predating the R22
+    /// End Device Timeout fields would have written. Everything past
+    /// `encoded_len` stays erased (0xFF), which is what makes this a real
+    /// migration test: a decoder that wrongly indexed encoded byte 97 would
+    /// read 0xFF and reject the record.
+    fn write_migrated_record(
+        flash: &mut MockFlash,
+        version: u8,
+        encoded_len: usize,
+        crc_offset: usize,
+        state: &PersistentSecurityState,
+    ) {
+        let mut current = [0u8; ENCODED_SECURITY_STATE_LEN];
+        state.encode(&mut current);
+        if encoded_len < ENCODED_SECURITY_STATE_LEN {
+            current[0] &= !(1 << 6);
+            current[11] = 0;
+        }
+        let mut record = [0xFFu8; SECURITY_JOURNAL_SLOT_SIZE];
+        record[0..4].copy_from_slice(&RECORD_MAGIC);
+        record[4] = version;
+        record[5] = encoded_len as u8;
+        record[8..12].copy_from_slice(&1u32.to_le_bytes());
+        record[12..12 + encoded_len].copy_from_slice(&current[..encoded_len]);
+        let crc = crc32(&record[..crc_offset]);
+        record[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
+        record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4].copy_from_slice(&RECORD_COMMIT);
+        flash.data[..SECURITY_JOURNAL_SLOT_SIZE].copy_from_slice(&record);
+    }
+
     #[test]
     fn committed_records_round_trip() {
         let mut journal =
@@ -411,26 +486,167 @@ mod tests {
     }
 
     #[test]
+    fn version_three_records_round_trip_the_end_device_timeout() {
+        let mut expected = state(0x400);
+        expected.parent_information = 0x02;
+        expected.parent_information_valid = true;
+        expected.end_device_timeout = 14;
+
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        journal.store(&expected).unwrap();
+        // Force a rescan so the value comes back off the flash, not the cache.
+        journal.storage_mut();
+        assert_eq!(journal.load(), Ok(Some(expected)));
+        assert_eq!(journal.storage().data[4], RECORD_VERSION);
+        assert_eq!(
+            journal.storage().data[5] as usize,
+            ENCODED_SECURITY_STATE_LEN
+        );
+    }
+
+    #[test]
     fn legacy_version_one_record_is_still_loaded() {
         let expected = state(0x400);
-        let mut current = [0u8; ENCODED_SECURITY_STATE_LEN];
-        expected.encode(&mut current);
-        let mut record = [0xFFu8; SECURITY_JOURNAL_SLOT_SIZE];
-        record[0..4].copy_from_slice(&RECORD_MAGIC);
-        record[4] = LEGACY_RECORD_VERSION;
-        record[5] = LEGACY_ENCODED_SECURITY_STATE_LEN as u8;
-        record[8..12].copy_from_slice(&1u32.to_le_bytes());
-        record[12..12 + LEGACY_ENCODED_SECURITY_STATE_LEN]
-            .copy_from_slice(&current[..LEGACY_ENCODED_SECURITY_STATE_LEN]);
-        let crc = crc32(&record[..LEGACY_RECORD_CRC_OFFSET]);
-        record[LEGACY_RECORD_CRC_OFFSET..LEGACY_RECORD_CRC_OFFSET + 4]
-            .copy_from_slice(&crc.to_le_bytes());
-        record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4].copy_from_slice(&RECORD_COMMIT);
-
         let mut flash = MockFlash::new();
-        flash.data[..SECURITY_JOURNAL_SLOT_SIZE].copy_from_slice(&record);
+        write_migrated_record(
+            &mut flash,
+            LEGACY_RECORD_VERSION,
+            LEGACY_ENCODED_SECURITY_STATE_LEN,
+            LEGACY_RECORD_CRC_OFFSET,
+            &expected,
+        );
         let mut journal = SecurityStateJournal::new(flash, 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
         assert_eq!(journal.load(), Ok(Some(expected)));
+    }
+
+    #[test]
+    fn version_one_and_two_records_migrate_to_the_default_timeout() {
+        // A v1/v2 record has no End Device Timeout fields; the migrated state
+        // must fall back to "not negotiated, default enumeration 8".
+        let mut stored = state(0x400);
+        stored.parent_information = 0x03;
+        stored.parent_information_valid = true;
+        stored.end_device_timeout = 14;
+
+        for (version, encoded_len, crc_offset) in [
+            (
+                LEGACY_RECORD_VERSION,
+                LEGACY_ENCODED_SECURITY_STATE_LEN,
+                LEGACY_RECORD_CRC_OFFSET,
+            ),
+            (
+                V2_RECORD_VERSION,
+                V2_ENCODED_SECURITY_STATE_LEN,
+                RECORD_CRC_OFFSET,
+            ),
+        ] {
+            let mut flash = MockFlash::new();
+            write_migrated_record(&mut flash, version, encoded_len, crc_offset, &stored);
+            let mut journal =
+                SecurityStateJournal::new(flash, 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+            let migrated = journal.load().unwrap().unwrap();
+            assert_eq!(migrated.global_counter_limit, 0x400, "v{version}");
+            assert_eq!(migrated.parent_information, 0, "v{version}");
+            assert!(!migrated.parent_information_valid, "v{version}");
+            assert_eq!(migrated.end_device_timeout, 8, "v{version}");
+        }
+    }
+
+    #[test]
+    fn version_two_records_keep_the_staged_network_key() {
+        let mut stored = state(0x400);
+        stored.commissioned = true;
+        stored.channel = 15;
+        stored.pan_id = 0x1234;
+        stored.short_address = 0x5678;
+        stored.ieee_address = [2; 8];
+        stored.network_key = [3; 16];
+        stored.key_sequence = 4;
+        stored.staged_network_key_present = true;
+        stored.staged_network_key = [8; 16];
+        stored.staged_key_sequence = 5;
+        stored.tclk_present = true;
+        stored.trust_center_address = [6; 8];
+        stored.tclk_counter_limit = 0x800;
+
+        let mut flash = MockFlash::new();
+        write_migrated_record(
+            &mut flash,
+            V2_RECORD_VERSION,
+            V2_ENCODED_SECURITY_STATE_LEN,
+            RECORD_CRC_OFFSET,
+            &stored,
+        );
+        let mut journal = SecurityStateJournal::new(flash, 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        let migrated = journal.load().unwrap().unwrap();
+        assert!(migrated.staged_network_key_present);
+        assert_eq!(migrated.staged_network_key, [8; 16]);
+        assert_eq!(migrated.staged_key_sequence, 5);
+        assert_eq!(migrated.end_device_timeout, 8);
+    }
+
+    #[test]
+    fn version_two_records_reject_the_version_three_flag_bit() {
+        // Byte 0 bit 6 only exists from v3 onwards; a v2 record carrying it is
+        // corrupt rather than a valid "parent information is valid" record.
+        let mut flash = MockFlash::new();
+        write_migrated_record(
+            &mut flash,
+            V2_RECORD_VERSION,
+            V2_ENCODED_SECURITY_STATE_LEN,
+            RECORD_CRC_OFFSET,
+            &state(0x400),
+        );
+        flash.data[12] |= 1 << 6;
+        let crc = crc32(&flash.data[..RECORD_CRC_OFFSET]);
+        flash.data[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+
+        let mut journal = SecurityStateJournal::new(flash, 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        assert_eq!(journal.load(), Ok(None));
+    }
+
+    #[test]
+    fn corrupt_end_device_timeout_fields_are_rejected() {
+        for (offset, value) in [
+            // byte 97 of the encoded state: undefined timeout enumeration.
+            (12 + 97, 15u8),
+            // byte 11 of the encoded state: reserved parent-information bit.
+            (12 + 11, 0x04),
+        ] {
+            let mut journal =
+                SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+            let mut stored = state(0x400);
+            stored.parent_information = 0x01;
+            stored.parent_information_valid = true;
+            journal.store(&stored).unwrap();
+
+            let flash = journal.storage_mut();
+            flash.data[offset] = value;
+            let crc = crc32(&flash.data[..RECORD_CRC_OFFSET]);
+            flash.data[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4]
+                .copy_from_slice(&crc.to_le_bytes());
+
+            assert_eq!(journal.load(), Ok(None), "offset {offset} value {value}");
+        }
+    }
+
+    #[test]
+    fn parent_information_without_validity_is_rejected() {
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        let mut stored = state(0x400);
+        stored.parent_information = 0x01;
+        stored.parent_information_valid = true;
+        journal.store(&stored).unwrap();
+
+        let flash = journal.storage_mut();
+        // Clear the validity flag while leaving the advertised bits behind.
+        flash.data[12] &= !(1 << 6);
+        let crc = crc32(&flash.data[..RECORD_CRC_OFFSET]);
+        flash.data[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+
+        assert_eq!(journal.load(), Ok(None));
     }
 
     #[test]

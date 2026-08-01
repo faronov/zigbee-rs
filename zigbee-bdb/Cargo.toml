@@ -12,11 +12,14 @@ zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
 zigbee-mac  = { version = "0.1.0", path = "../zigbee-mac" }
 zigbee-nwk  = { version = "0.1.0", path = "../zigbee-nwk" }
 zigbee-aps  = { version = "0.1.0", path = "../zigbee-aps" }
-zigbee-zcl  = { version = "0.1.0", path = "../zigbee-zcl" }
+zigbee-zcl  = { version = "0.1.0", path = "../zigbee-zcl", default-features = false }
 zigbee-zdo  = { version = "0.1.0", path = "../zigbee-zdo" }
 log = "0.4"
 
 [features]
+default = ["float32", "float64"]
+float32 = ["zigbee-zcl/float32"]
+float64 = ["zigbee-zcl/float64"]
 trace = ["zigbee-aps/trace", "zigbee-nwk/trace"]
 
 [dev-dependencies]

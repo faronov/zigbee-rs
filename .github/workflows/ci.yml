@@ -39,6 +39,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+      # The router relay tests are gated on `zigbee-runtime/router`, which is
+      # off in the workspace build so sensors do not link the routing tables.
+      - run: cargo test -p zigbee-runtime --features router
+      - run: cargo test -p zigbee-zdo --features router
+      - run: cargo test -p zigbee-runtime --no-default-features
+      - run: cargo test -p zigbee-zcl --no-default-features
+      - run: cargo test -p zigbee-zcl --no-default-features --features float32
+      - run: cargo test -p zigbee-zcl --no-default-features --features float64
 
   clippy:
     name: Clippy
@@ -50,6 +58,12 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy -p zigbee-runtime --features router --all-targets -- -D warnings
+      - run: cargo clippy -p zigbee-zdo --features router --all-targets -- -D warnings
+      - run: cargo clippy -p zigbee-runtime --no-default-features --all-targets -- -D warnings
+      - run: cargo clippy -p zigbee-zcl --no-default-features --all-targets -- -D warnings
+      - run: cargo clippy -p zigbee-zcl --no-default-features --features float32 --all-targets -- -D warnings
+      - run: cargo clippy -p zigbee-zcl --no-default-features --features float64 --all-targets -- -D warnings
 
   fmt:
     name: Format
@@ -99,8 +113,35 @@ jobs:
         run: |
           ELF=examples/nrf52840-sensor/target/thumbv7em-none-eabihf/release/nrf52840-sensor
           OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
+          ./tools/firmware-size-report.sh nrf52840-sensor ${ELF}.bin 225280 ${ELF}.size.json
+          if "$NM" --demangle "$ELF" | grep -q 'core::slice::sort'; then
+            echo "nRF52840 image contains generic slice sorting" >&2
+            exit 1
+          fi
+          # A non-router sensor must compile out the parent/router maintenance
+          # subgraph (permit-join, routing, MAC parent-command servicing, child
+          # rejoin/Update-Device and Parent Announce). Representative symbols
+          # verified present in the router image and absent from the sensor.
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if "$NM" --demangle "$ELF" | grep -Eq "($PARENT_SYMS)"; then
+            echo "nRF52840 sensor links parent/router maintenance symbols:" >&2
+            "$NM" --demangle "$ELF" | grep -E "($PARENT_SYMS)" >&2
+            exit 1
+          fi
+          # Role-state split: the R22 End Device Timeout *client* lifecycle
+          # belongs to the end-device role, so its `#[inline(never)]` helpers
+          # must be retained in the sensor image (and are compiled out of the
+          # relay/router — verified in the router job below).
+          ED_CLIENT_SYMS='resume_end_device_timeout|service_end_device_timeout|apply_end_device_timeout_change|send_ed_timeout_request_tracked'
+          for sym in resume_end_device_timeout service_end_device_timeout apply_end_device_timeout_change send_ed_timeout_request_tracked; do
+            if ! "$NM" --demangle "$ELF" | grep -q "$sym"; then
+              echo "nRF52840 sensor is missing End Device Timeout CLIENT symbol: $sym" >&2
+              exit 1
+            fi
+          done
       - name: Upload nRF52840 firmware
         uses: actions/upload-artifact@v4
         with:
@@ -108,6 +149,7 @@ jobs:
           path: |
             examples/nrf52840-sensor/target/thumbv7em-none-eabihf/release/nrf52840-sensor.bin
             examples/nrf52840-sensor/target/thumbv7em-none-eabihf/release/nrf52840-sensor.hex
+            examples/nrf52840-sensor/target/thumbv7em-none-eabihf/release/nrf52840-sensor.size.json
 
   build-nrf52840-router:
     name: Build nRF52840 router
@@ -128,8 +170,20 @@ jobs:
         run: |
           ELF=examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router
           OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
+          # Role-state split: the nRF backend builds the forwarding-only
+          # `RelayRouter` role via `build_relay()`. A relay routes but is not an
+          # end device, so it must carry none of the R22 End Device Timeout
+          # *client* lifecycle — those `#[inline(never)]` helpers must be
+          # compiled out entirely (they are retained in the sensor image).
+          ED_CLIENT_SYMS='resume_end_device_timeout|service_end_device_timeout|apply_end_device_timeout_change|send_ed_timeout_request_tracked'
+          if "$NM" --demangle "$ELF" | grep -Eq "($ED_CLIENT_SYMS)"; then
+            echo "nRF52840 relay links End Device Timeout CLIENT lifecycle symbols:" >&2
+            "$NM" --demangle "$ELF" | grep -E "($ED_CLIENT_SYMS)" >&2
+            exit 1
+          fi
       - name: Upload nRF52840 router firmware
         uses: actions/upload-artifact@v4
         with:
@@ -304,14 +358,33 @@ jobs:
       - name: Check BL702 firmware purity
         run: |
           ELF=examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor
+          RAW=${ELF}.bin
           OBJDUMP=$(find "$(rustc --print sysroot)" -name llvm-objdump -print -quit)
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          ./tools/firmware-size-report.sh bl702-sensor "$RAW" 196608 ${ELF}.size.json
           if "$OBJDUMP" -d "$ELF" | grep -Eq '[[:space:]](amo[a-z.]*|lr\.[wd]|sc\.[wd])[[:space:]]'; then
             echo "BL702 image contains unsupported RV32A instructions" >&2
             exit 1
           fi
           if "$NM" "$ELF" | grep -Eq '(lmac154_|AON_Power_On_XTAL|GLB_Set_System_CLK|RF_SetZigbee)'; then
             echo "BL702 image contains a vendor radio symbol" >&2
+            exit 1
+          fi
+          if "$NM" --demangle "$ELF" | grep -q 'core::slice::sort'; then
+            echo "BL702 image contains generic slice sorting" >&2
+            exit 1
+          fi
+          # The sensor must compile out the parent/router maintenance subgraph.
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if "$NM" --demangle "$ELF" | grep -Eq "($PARENT_SYMS)"; then
+            echo "BL702 sensor links parent/router maintenance symbols:" >&2
+            "$NM" --demangle "$ELF" | grep -E "($PARENT_SYMS)" >&2
+            exit 1
+          fi
+          START_RUST=$("$NM" "$ELF" | awk '$3 == "_start_rust" { print $1 }')
+          if [[ -z "$START_RUST" ]] ||
+             (( 16#$START_RUST < 0x23000000 || 16#$START_RUST >= 0x23080000 )); then
+            echo "BL702 _start_rust is outside XIP flash: ${START_RUST:-missing}" >&2
             exit 1
           fi
       - name: Upload BL702 sensor
@@ -322,6 +395,7 @@ jobs:
             examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor
             examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.bin
             examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.flash.bin
+            examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.size.json
 
   # ── CC2340 (TI, ARM Cortex-M0+) ────────────────────────────
   build-cc2340:
@@ -424,8 +498,21 @@ jobs:
         run: |
           ELF=examples/efr32mg1-sensor/target/thumbv7em-none-eabi/release/efr32mg1-sensor
           OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
+          ./tools/firmware-size-report.sh efr32mg1-sensor ${ELF}.bin 163840 ${ELF}.size.json
+          if "$NM" --demangle "$ELF" | grep -q 'core::slice::sort'; then
+            echo "EFR32MG1 image contains generic slice sorting" >&2
+            exit 1
+          fi
+          # The sensor must compile out the parent/router maintenance subgraph.
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if "$NM" --demangle "$ELF" | grep -Eq "($PARENT_SYMS)"; then
+            echo "EFR32MG1 sensor links parent/router maintenance symbols:" >&2
+            "$NM" --demangle "$ELF" | grep -E "($PARENT_SYMS)" >&2
+            exit 1
+          fi
       - name: Upload EFR32MG1 firmware
         uses: actions/upload-artifact@v4
         with:
@@ -433,6 +520,7 @@ jobs:
           path: |
             examples/efr32mg1-sensor/target/thumbv7em-none-eabi/release/efr32mg1-sensor.bin
             examples/efr32mg1-sensor/target/thumbv7em-none-eabi/release/efr32mg1-sensor.hex
+            examples/efr32mg1-sensor/target/thumbv7em-none-eabi/release/efr32mg1-sensor.size.json
 
   build-efr32mg21:
     name: Build EFR32MG21 sensor

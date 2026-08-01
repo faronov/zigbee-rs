@@ -12,5 +12,5 @@ efr32mg1-hal = { path = "../../efr32mg1-hal" }
 efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
 embedded-storage = "0.3"
 zigbee-aps = { path = "../../zigbee-aps" }
-zigbee-runtime = { path = "../../zigbee-runtime", features = ["ota"] }
-zigbee-zcl = { path = "../../zigbee-zcl" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["ota"] }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }

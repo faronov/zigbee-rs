@@ -239,10 +239,10 @@ impl ProfileComponent for SmartPlug {
         2 + usize::from(self.metering.is_some())
     }
 
-    fn configure_default_reporting<M: MacDriver>(
+    fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
         &self,
         endpoint: u8,
-        device: &mut ZigbeeDevice<M>,
+        device: &mut ZigbeeDevice<M, R>,
     ) -> Result<(), ProfileError> {
         let reporting = device.reporting_mut();
         // Bool is a discrete type: no reportable-change threshold, any

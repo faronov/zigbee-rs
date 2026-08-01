@@ -2051,6 +2051,16 @@ mod imp {
 #[cfg(target_arch = "tc32")]
 pub use imp::TelinkMac;
 
+// The Telink soft-MAC genuinely implements the parent-side primitives
+// (`mlme_beacon_response`, `set_indirect_data_pending`, `mcps_indirect_data`,
+// `mac_command_event`), so it may back a router/parent role. Only the real
+// tc32 backend implements `MacDriver`; the host placeholder below does not.
+#[cfg(target_arch = "tc32")]
+impl crate::ParentMacDriver for TelinkMac {}
+
+#[cfg(target_arch = "tc32")]
+impl crate::sealed::SealedParent for TelinkMac {}
+
 #[cfg(not(target_arch = "tc32"))]
 pub struct TelinkMac;
 

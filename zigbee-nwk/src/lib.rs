@@ -90,6 +90,19 @@ pub struct ChildCapacity {
     pub end_device: bool,
 }
 
+/// Result of applying an incoming R22 Parent Announce to the child table.
+///
+/// `kept` names confirmed children this device keeps and reports back in a
+/// Parent Announce Response; `dropped` names unconfirmed children this device
+/// evicted because the announcer's live claim won.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParentAnnceOutcome {
+    /// Authenticated children this device is actively parenting and keeps.
+    pub kept: heapless::Vec<IeeeAddress, { neighbor::MAX_NEIGHBORS }>,
+    /// Short addresses of children this device evicted (they moved away).
+    pub dropped: heapless::Vec<ShortAddress, { neighbor::MAX_NEIGHBORS }>,
+}
+
 /// Result of servicing one MAC Data Request from a possible child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildPollOutcome {
@@ -548,6 +561,21 @@ impl<M: MacDriver> NwkLayer<M> {
         let _ = self.neighbors.add_or_update(entry);
     }
 
+    /// Age the neighbour cache on a non-routing end device.
+    ///
+    /// A router ages the same table inside [`tick_router_maintenance`]; a
+    /// sleepy end device runs no router maintenance, so this preserves the LRU
+    /// eviction ordering of its small neighbour cache without linking the
+    /// routing / BTR / indirect / link-status subgraph. Aging is applied once
+    /// per elapsed second to match the router path exactly.
+    ///
+    /// [`tick_router_maintenance`]: Self::tick_router_maintenance
+    pub fn tick_end_device_maintenance(&mut self, elapsed_secs: u16) {
+        for _ in 0..elapsed_secs {
+            self.neighbors.age_tick();
+        }
+    }
+
     /// Periodic router maintenance — call every second from the runtime tick.
     ///
     /// Ages BTR and indirect queues, triggers periodic link status broadcasts,
@@ -776,7 +804,264 @@ impl<M: MacDriver> NwkLayer<M> {
         }
         entry.relationship = neighbor::Relationship::Child;
         entry.age = 0;
+        // A key-proving frame is live evidence of the child, so it counts as
+        // confirmed for Parent Announce ownership decisions.
+        entry.keepalive_confirmed = true;
+        // An end-device child now counts against the R22 End Device Timeout:
+        // arm its deadline so it is aged out unless it keeps alive.
+        if entry.device_type == neighbor::NeighborDeviceType::EndDevice {
+            entry.refresh_end_device_timeout();
+        }
         true
+    }
+
+    /// Refresh the R22 End Device Timeout deadline of a directly-attached
+    /// authenticated end-device child, keyed by short address.
+    ///
+    /// No-op unless this device can route and `address` is one of its
+    /// authenticated end-device children. Used by the MAC Data Poll keepalive
+    /// and the End Device Timeout Request keepalive.
+    pub(crate) fn refresh_child_keepalive_by_short(&mut self, address: ShortAddress) {
+        if !self.can_route() {
+            return;
+        }
+        if let Some(entry) = self.neighbors.find_by_short_mut(address)
+            && entry.relationship == neighbor::Relationship::Child
+            && entry.device_type == neighbor::NeighborDeviceType::EndDevice
+        {
+            entry.refresh_end_device_timeout();
+            entry.age = 0;
+            entry.keepalive_confirmed = true;
+        }
+    }
+
+    /// R22 secured-traffic keepalive.
+    ///
+    /// A NWK frame that passes CCM* authentication and whose auxiliary-header
+    /// source IEEE matches a directly-attached authenticated end-device child
+    /// (by **both** IEEE and short address) proves that child is alive, so its
+    /// End Device Timeout deadline is refreshed. Keyed on the authenticated
+    /// identity, so an unsecured or wrongly-sourced frame can never refresh a
+    /// child it does not actually originate from. Covers relayed child data
+    /// and secured child NWK commands as well as frames addressed to us.
+    fn refresh_child_keepalive_secured(&mut self, src: ShortAddress, security_source: IeeeAddress) {
+        if !self.can_route() {
+            return;
+        }
+        if let Some(entry) = self.neighbors.find_by_short_mut(src)
+            && entry.relationship == neighbor::Relationship::Child
+            && entry.device_type == neighbor::NeighborDeviceType::EndDevice
+            && entry.ieee_address == security_source
+        {
+            entry.refresh_end_device_timeout();
+            entry.age = 0;
+            entry.keepalive_confirmed = true;
+        }
+    }
+
+    /// Age directly-attached authenticated end-device children by the R22 End
+    /// Device Timeout and evict any whose deadline has elapsed.
+    ///
+    /// Returns the short addresses of evicted children so the caller can drop
+    /// coupled state it owns (for example a deferred Update-Device). Aging uses
+    /// saturating subtraction on a `u32` second counter, so a multi-day
+    /// enumeration can neither overflow nor wrap. Eviction cleans the coupled
+    /// indirect queue, routing entry, replay counters and MAC Frame Pending
+    /// state consistently, mirroring the provisional-child expiry path.
+    pub fn age_end_device_children(
+        &mut self,
+        elapsed_secs: u16,
+    ) -> heapless::Vec<ShortAddress, { neighbor::MAX_NEIGHBORS }> {
+        let mut evicted = heapless::Vec::new();
+        if !self.can_route() || elapsed_secs == 0 {
+            return evicted;
+        }
+        let elapsed = u32::from(elapsed_secs);
+        let mut expired: heapless::Vec<(ShortAddress, IeeeAddress), { neighbor::MAX_NEIGHBORS }> =
+            heapless::Vec::new();
+        for entry in self.neighbors.iter_mut_all() {
+            if entry.relationship != neighbor::Relationship::Child
+                || entry.device_type != neighbor::NeighborDeviceType::EndDevice
+            {
+                continue;
+            }
+            entry.keepalive_remaining_secs = entry.keepalive_remaining_secs.saturating_sub(elapsed);
+            if entry.keepalive_remaining_secs == 0 {
+                let _ = expired.push((entry.network_address, entry.ieee_address));
+            }
+        }
+        for (short, ieee) in expired {
+            self.evict_child(short, &ieee);
+            let _ = evicted.push(short);
+            log::warn!(
+                "[NWK] End-device child 0x{:04X} aged out (R22 End Device Timeout)",
+                short.0
+            );
+        }
+        evicted
+    }
+
+    /// Re-install an authenticated child from durable persistence after a
+    /// router reboot.
+    ///
+    /// Restores the neighbour entry as an authenticated [`Child`] with the
+    /// persisted identity, capability and accepted End Device Timeout
+    /// enumeration, and re-arms an end-device child's deadline to the full
+    /// window of that enumeration (the live countdown is deliberately not
+    /// persisted, so a restored child is granted a fresh full window to prove
+    /// liveness). Returns whether the child was installed.
+    ///
+    /// [`Child`]: neighbor::Relationship::Child
+    pub fn restore_child(
+        &mut self,
+        ieee: IeeeAddress,
+        short: ShortAddress,
+        rx_on_when_idle: bool,
+        security_capable: bool,
+        is_router: bool,
+        end_device_timeout: u8,
+    ) -> bool {
+        if !self.can_route()
+            || end_device_timeout > frames::ED_TIMEOUT_ENUM_MAX
+            || !(0x0001..=0xFFF7).contains(&short.0)
+            || short == self.nib.network_address
+            || ieee == [0u8; 8]
+        {
+            return false;
+        }
+        let device_type = if is_router {
+            neighbor::NeighborDeviceType::Router
+        } else {
+            neighbor::NeighborDeviceType::EndDevice
+        };
+        let mut entry = neighbor::NeighborEntry {
+            ieee_address: ieee,
+            network_address: short,
+            device_type,
+            rx_on_when_idle,
+            security_capable,
+            relationship: neighbor::Relationship::Child,
+            lqi: 0xFF,
+            outgoing_cost: 1,
+            depth: self.nib.depth.saturating_add(1),
+            permit_joining: false,
+            age: 0,
+            end_device_timeout,
+            keepalive_remaining_secs: 0,
+            // Restored from flash — not yet heard from this power cycle.
+            keepalive_confirmed: false,
+            extended_pan_id: self.nib.extended_pan_id,
+            active: true,
+        };
+        if device_type == neighbor::NeighborDeviceType::EndDevice {
+            entry.refresh_end_device_timeout();
+        }
+        self.neighbors.add_or_update(entry).is_ok()
+    }
+
+    /// Remove a child and every piece of coupled per-child state consistently.
+    ///
+    /// Cleans the indirect queue, routing entry, replay counters and MAC Frame
+    /// Pending flag before dropping the neighbour, so no stale transaction,
+    /// route or counter can outlive the child. Shared by End Device Timeout
+    /// aging and Parent Announce pruning.
+    fn evict_child(&mut self, short: ShortAddress, ieee: &IeeeAddress) {
+        self.indirect.remove_all(short);
+        self.routing.remove(short);
+        self.security.clear_frame_counters_for_source(ieee);
+        let _ = self
+            .mac
+            .set_indirect_data_pending(MacAddress::Short(self.nib.pan_id, short), false);
+        self.neighbors.remove(short);
+    }
+
+    /// Collect the IEEE addresses of every authenticated child of this parent.
+    ///
+    /// Used to build a R22 Parent Announce after a router restores or rebuilds
+    /// its child table. Empty on a non-routing device.
+    pub fn authenticated_child_ieees<const N: usize>(&self) -> heapless::Vec<IeeeAddress, N> {
+        let mut out = heapless::Vec::new();
+        if !self.can_route() {
+            return out;
+        }
+        for entry in self.neighbors.iter() {
+            if entry.relationship == neighbor::Relationship::Child
+                && out.push(entry.ieee_address).is_err()
+            {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Apply an incoming R22 Parent Announce to this parent's child table.
+    ///
+    /// For each announced child that this device also holds as its own
+    /// authenticated child:
+    /// - if this device has **confirmed** the child's liveness this power cycle
+    ///   (a poll, End Device Timeout Request or valid secured traffic), it is
+    ///   actively parenting the child, so the child is kept and returned in
+    ///   `kept` — the caller reports it in the Parent Announce Response so the
+    ///   announcer drops its stale copy;
+    /// - otherwise the child has not been heard from since boot (typically a
+    ///   record just restored from flash), so the announcer's live claim wins:
+    ///   the child is evicted (with all coupled state) and returned in
+    ///   `dropped`.
+    ///
+    /// The confirmed-liveness gate is what makes this safe across a
+    /// simultaneous reboot: neither router drops a child it is actually
+    /// keeping alive, and an unconfirmed restored record yields rather than
+    /// being defended against the real parent.
+    pub fn apply_parent_annce(&mut self, announced: &[IeeeAddress]) -> ParentAnnceOutcome {
+        let mut outcome = ParentAnnceOutcome::default();
+        if !self.can_route() {
+            return outcome;
+        }
+        for ieee in announced {
+            let (short, confirmed) = match self.neighbors.find_by_ieee(ieee) {
+                Some(entry) if entry.relationship == neighbor::Relationship::Child => {
+                    (entry.network_address, entry.keepalive_confirmed)
+                }
+                _ => continue,
+            };
+            if confirmed {
+                let _ = outcome.kept.push(*ieee);
+            } else {
+                self.evict_child(short, ieee);
+                let _ = outcome.dropped.push(short);
+                log::info!(
+                    "[NWK] Parent Announce: yielding unconfirmed child 0x{:04X}",
+                    short.0
+                );
+            }
+        }
+        outcome
+    }
+
+    /// Drop children named in a Parent Announce Response.
+    ///
+    /// The responder is actively parenting these children, so this device
+    /// (which announced them) relinquishes its stale records. Returns the
+    /// evicted short addresses so the caller can drop coupled runtime state.
+    pub fn remove_children_by_ieee(
+        &mut self,
+        ieees: &[IeeeAddress],
+    ) -> heapless::Vec<ShortAddress, { neighbor::MAX_NEIGHBORS }> {
+        let mut dropped = heapless::Vec::new();
+        if !self.can_route() {
+            return dropped;
+        }
+        for ieee in ieees {
+            let short = match self.neighbors.find_by_ieee(ieee) {
+                Some(entry) if entry.relationship == neighbor::Relationship::Child => {
+                    entry.network_address
+                }
+                _ => continue,
+            };
+            self.evict_child(short, ieee);
+            let _ = dropped.push(short);
+        }
+        dropped
     }
 
     /// Queue one already-built NWK frame for a sleepy child and arm the MAC
@@ -830,6 +1115,11 @@ impl<M: MacDriver> NwkLayer<M> {
         {
             return Ok(ChildPollOutcome::UnknownChild);
         }
+        // R22 MAC Data Poll keepalive: a poll from a directly-attached
+        // authenticated end-device child refreshes its End Device Timeout
+        // deadline, whether or not any indirect data is waiting. Advertised to
+        // the child through `PARENT_INFO_MAC_DATA_POLL_KEEPALIVE`.
+        self.refresh_child_keepalive_by_short(child);
         let Some(frame) = self.indirect.peek(child) else {
             self.mac.set_indirect_data_pending(source, false)?;
             return Ok(ChildPollOutcome::NoData);
@@ -995,6 +1285,12 @@ impl<M: MacDriver> NwkLayer<M> {
             depth: self.nib.depth + 1,
             permit_joining: false,
             age: 0,
+            // A fresh associating child starts at the R22 default timeout and
+            // is aged by the provisional-child timer until it authenticates;
+            // the End Device Timeout deadline is armed at authorization.
+            end_device_timeout: frames::ED_TIMEOUT_ENUM_DEFAULT,
+            keepalive_remaining_secs: 0,
+            keepalive_confirmed: false,
             extended_pan_id: self.nib.extended_pan_id,
             active: true,
         };
@@ -1108,6 +1404,14 @@ impl<M: MacDriver> NwkLayer<M> {
                     neighbor::Relationship::UnauthenticatedChild
                 };
                 entry.age = 0;
+                // A secured rejoin re-authenticates the child, so its R22 End
+                // Device Timeout deadline is armed afresh here. A provisional
+                // (unsecured) rejoin waits for network-key proof, exactly like
+                // a first association.
+                if secured && requested_type == neighbor::NeighborDeviceType::EndDevice {
+                    entry.refresh_end_device_timeout();
+                }
+                entry.keepalive_confirmed = secured;
             }
             if !secured {
                 self.security.clear_frame_counters_for_source(&child_ieee);
@@ -1154,7 +1458,7 @@ impl<M: MacDriver> NwkLayer<M> {
             assigned.ok_or(NwkStatus::NeighborTableFull)?
         };
 
-        let entry = neighbor::NeighborEntry {
+        let mut entry = neighbor::NeighborEntry {
             ieee_address: child_ieee,
             network_address: assigned_address,
             device_type: requested_type,
@@ -1170,9 +1474,20 @@ impl<M: MacDriver> NwkLayer<M> {
             depth: self.nib.depth.saturating_add(1),
             permit_joining: false,
             age: 0,
+            end_device_timeout: frames::ED_TIMEOUT_ENUM_DEFAULT,
+            keepalive_remaining_secs: 0,
+            // A secured rejoin is a live admission; a provisional (unsecured)
+            // one is not confirmed until it proves the network key.
+            keepalive_confirmed: secured,
             extended_pan_id: self.nib.extended_pan_id,
             active: true,
         };
+        // A secured rejoin authenticates the child immediately, so arm its R22
+        // End Device Timeout deadline now. An unsecured rejoin stays
+        // provisional and is armed only once it proves the network key.
+        if secured && requested_type == neighbor::NeighborDeviceType::EndDevice {
+            entry.refresh_end_device_timeout();
+        }
         self.neighbors
             .add_or_update(entry)
             .map_err(|_| NwkStatus::NeighborTableFull)?;

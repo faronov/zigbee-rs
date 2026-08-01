@@ -8,7 +8,11 @@ ELF="$TARGET_DIR/bl702-sensor"
 RAW_IMAGE="$ELF.bin"
 FLASH_IMAGE="$ELF.flash.bin"
 
-cargo build --release
+if [[ "${BL702_DIAGNOSTIC_LOG:-0}" == "1" ]]; then
+    cargo build --release --no-default-features --features diagnostic-logging
+else
+    cargo build --release
+fi
 
 OBJCOPY="${OBJCOPY:-$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)}"
 if [[ -z "$OBJCOPY" || ! -x "$OBJCOPY" ]]; then

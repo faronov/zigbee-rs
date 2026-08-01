@@ -570,32 +570,96 @@ impl LinkStatusCommand {
 
 // ── End Device Timeout ──────────────────────────────────────────
 
+/// Highest defined Requested Timeout Enumeration value (R22 Table 3-59).
+pub const ED_TIMEOUT_ENUM_MAX: u8 = 14;
+/// Timeout enumeration a device falls back to when no negotiation succeeded.
+///
+/// This is also the value a R22 parent applies to a child that never sent an
+/// End Device Timeout Request, so it is the only safe recurring fallback.
+pub const ED_TIMEOUT_ENUM_DEFAULT: u8 = 8;
+/// Timeout enumeration requested on a fresh join or secured rejoin.
+///
+/// Enumeration 14 (16384 minutes ≈ 11 days) keeps a battery sensor in the
+/// parent's child table across long sleep windows. A parent that refuses it
+/// answers `INCORRECT_VALUE`, which walks the request back down towards
+/// [`ED_TIMEOUT_ENUM_DEFAULT`].
+pub const ED_TIMEOUT_ENUM_REQUESTED: u8 = ED_TIMEOUT_ENUM_MAX;
+
+/// End Device Timeout Response status: the requested timeout was accepted.
+pub const ED_TIMEOUT_STATUS_SUCCESS: u8 = 0x00;
+/// End Device Timeout Response status: the requested timeout was refused.
+pub const ED_TIMEOUT_STATUS_INCORRECT_VALUE: u8 = 0x01;
+
+/// `nwkParentInformation` bit 0 — the parent supports MAC Data Poll keepalive.
+pub const PARENT_INFO_MAC_DATA_POLL_KEEPALIVE: u8 = 0x01;
+/// `nwkParentInformation` bit 1 — the parent supports End Device Timeout
+/// Request keepalive.
+pub const PARENT_INFO_ED_TIMEOUT_REQUEST_KEEPALIVE: u8 = 0x02;
+/// Defined `nwkParentInformation` bits; every other bit is reserved.
+pub const PARENT_INFO_MASK: u8 =
+    PARENT_INFO_MAC_DATA_POLL_KEEPALIVE | PARENT_INFO_ED_TIMEOUT_REQUEST_KEEPALIVE;
+
+/// Convert a Requested Timeout Enumeration into seconds.
+///
+/// R22 Table 3-59 is arithmetic rather than a table lookup: enumeration 0 is
+/// 10 seconds and every other enumeration `n` is `2^(n-1) * 2` minutes, i.e.
+/// `120 << (n - 1)` seconds. Values above [`ED_TIMEOUT_ENUM_MAX`] are not
+/// defined and are rejected instead of being clamped, so a corrupt persisted
+/// or received enumeration can never silently become a valid deadline.
+pub const fn ed_timeout_enum_to_seconds(timeout_enum: u8) -> Option<u32> {
+    match timeout_enum {
+        0 => Some(10),
+        1..=ED_TIMEOUT_ENUM_MAX => Some(120u32 << (timeout_enum - 1)),
+        _ => None,
+    }
+}
+
 /// End Device Timeout Request (NWK command 0x0B).
 ///
-/// Sent by an end device to its parent after joining/rejoining to
-/// request a specific keepalive timeout. The parent uses this to
-/// decide how long to keep the child in its neighbor table.
+/// Sent by an end device to its parent after joining/rejoining to request a
+/// specific keepalive timeout. The parent uses this to decide how long to
+/// keep the child in its neighbour table.
 ///
-/// Timeout index table:
-/// 0=10s, 1=2m, 2=4m, 3=8m, 4=16m, 5=32m, 6=64m, 7=128m,
-/// 8=256m(default), 9=512m, 10=1024m, 11=2048m, 12=4096m,
-/// 13=8192m, 14=16384m(max ~11 days)
-#[derive(Debug, Clone)]
+/// Payload (R22 §3.4.11):
+/// - byte 0: Requested Timeout Enumeration, 0..=14
+///   (0=10s, 1=2m, 2=4m, … 8=256m default, … 14=16384m ≈ 11 days)
+/// - byte 1: End Device Configuration — **reserved in R22 and always 0**.
+///   Earlier drafts carried keepalive-capability bits here; a R22 parent
+///   rejects a non-zero value, so this crate never sets one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdTimeoutRequest {
-    /// Timeout index (0-14), see table above.
+    /// Requested Timeout Enumeration (0..=14), see table above.
     pub requested_timeout: u8,
-    /// End device configuration: bit0 = MAC Data Poll Keepalive supported,
-    /// bit1 = End Device Timeout Request keepalive supported
+    /// End Device Configuration — reserved in R22, always 0.
     pub ed_config: u8,
 }
 
 impl EdTimeoutRequest {
-    /// Create with the maximum timeout (index 14 = ~11 days).
-    pub fn max_timeout() -> Self {
-        Self {
-            requested_timeout: 14,
-            ed_config: 0x02, // End Device Timeout Request keepalive supported
+    /// Create a request for `requested_timeout`, rejecting undefined
+    /// enumerations.
+    pub const fn new(requested_timeout: u8) -> Option<Self> {
+        if requested_timeout > ED_TIMEOUT_ENUM_MAX {
+            return None;
         }
+        Some(Self {
+            requested_timeout,
+            // Reserved in R22 — see the type documentation.
+            ed_config: 0,
+        })
+    }
+
+    /// Create with the maximum timeout (enumeration 14 ≈ 11 days).
+    pub const fn max_timeout() -> Self {
+        Self {
+            requested_timeout: ED_TIMEOUT_ENUM_REQUESTED,
+            ed_config: 0,
+        }
+    }
+
+    /// The requested timeout in seconds, or `None` if the enumeration is
+    /// undefined.
+    pub const fn timeout_seconds(&self) -> Option<u32> {
+        ed_timeout_enum_to_seconds(self.requested_timeout)
     }
 
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
@@ -604,8 +668,11 @@ impl EdTimeoutRequest {
         2
     }
 
+    /// Parse a request payload, rejecting undefined enumerations and any
+    /// non-zero reserved End Device Configuration byte. Trailing bytes from a
+    /// future revision are ignored.
     pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() < 2 {
+        if data.len() < 2 || data[0] > ED_TIMEOUT_ENUM_MAX || data[1] != 0 {
             return None;
         }
         Some(Self {
@@ -616,16 +683,29 @@ impl EdTimeoutRequest {
 }
 
 /// End Device Timeout Response (NWK command 0x0C).
-#[derive(Debug, Clone)]
+///
+/// Payload (R22 §3.4.12):
+/// - byte 0: status (0x00 success, 0x01 incorrect value)
+/// - byte 1: `nwkParentInformation` — bit0 MAC Data Poll keepalive,
+///   bit1 End Device Timeout Request keepalive, other bits reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdTimeoutResponse {
-    /// 0x00 = success
+    /// 0x00 = success, 0x01 = incorrect value.
     pub status: u8,
     /// Parent information: bit0 = MAC Data Poll Keepalive supported,
-    /// bit1 = End Device Timeout Request keepalive supported
+    /// bit1 = End Device Timeout Request keepalive supported.
     pub parent_info: u8,
 }
 
 impl EdTimeoutResponse {
+    pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.status;
+        buf[1] = self.parent_info;
+        2
+    }
+
+    /// Parse a response payload. Exactly two bytes are meaningful; trailing
+    /// bytes added by a future revision are ignored rather than rejected.
     pub fn parse(data: &[u8]) -> Option<Self> {
         if data.len() < 2 {
             return None;
@@ -640,6 +720,9 @@ impl EdTimeoutResponse {
 #[cfg(test)]
 mod tests {
     use super::NwkHeader;
+    use super::{
+        ED_TIMEOUT_ENUM_MAX, EdTimeoutRequest, EdTimeoutResponse, ed_timeout_enum_to_seconds,
+    };
 
     #[test]
     fn rejects_malformed_source_route_subframes() {
@@ -659,5 +742,64 @@ mod tests {
         for frame in malformed {
             assert!(NwkHeader::parse(frame).is_none(), "{frame:02X?}");
         }
+    }
+
+    #[test]
+    fn ed_timeout_request_reserves_the_configuration_byte() {
+        let mut buf = [0xAAu8; 2];
+        assert_eq!(EdTimeoutRequest::max_timeout().serialize(&mut buf), 2);
+        assert_eq!(buf, [ED_TIMEOUT_ENUM_MAX, 0x00]);
+
+        let mut buf = [0xAAu8; 2];
+        assert_eq!(EdTimeoutRequest::new(8).unwrap().serialize(&mut buf), 2);
+        assert_eq!(buf, [8, 0x00]);
+    }
+
+    #[test]
+    fn ed_timeout_request_rejects_undefined_enumerations() {
+        assert_eq!(EdTimeoutRequest::new(ED_TIMEOUT_ENUM_MAX + 1), None);
+        assert_eq!(EdTimeoutRequest::new(0xFF), None);
+        assert!(EdTimeoutRequest::new(0).is_some());
+        assert!(EdTimeoutRequest::new(ED_TIMEOUT_ENUM_MAX).is_some());
+    }
+
+    #[test]
+    fn ed_timeout_request_parse_enforces_the_wire_contract() {
+        assert_eq!(EdTimeoutRequest::parse(&[14]), None);
+        // Reserved End Device Configuration byte must be zero in R22.
+        assert_eq!(EdTimeoutRequest::parse(&[14, 0x02]), None);
+        assert_eq!(EdTimeoutRequest::parse(&[15, 0x00]), None);
+        assert_eq!(
+            EdTimeoutRequest::parse(&[14, 0x00, 0x99]),
+            Some(EdTimeoutRequest::max_timeout()),
+        );
+    }
+
+    #[test]
+    fn ed_timeout_enumeration_seconds_are_arithmetic() {
+        assert_eq!(ed_timeout_enum_to_seconds(0), Some(10));
+        assert_eq!(ed_timeout_enum_to_seconds(1), Some(120));
+        assert_eq!(ed_timeout_enum_to_seconds(2), Some(240));
+        assert_eq!(ed_timeout_enum_to_seconds(8), Some(256 * 60));
+        assert_eq!(ed_timeout_enum_to_seconds(14), Some(16384 * 60));
+        assert_eq!(ed_timeout_enum_to_seconds(15), None);
+        assert_eq!(ed_timeout_enum_to_seconds(0xFF), None);
+    }
+
+    #[test]
+    fn ed_timeout_response_round_trips_and_ignores_trailing_bytes() {
+        let response = EdTimeoutResponse {
+            status: 0x00,
+            parent_info: 0x03,
+        };
+        let mut buf = [0xAAu8; 2];
+        assert_eq!(response.serialize(&mut buf), 2);
+        assert_eq!(buf, [0x00, 0x03]);
+        assert_eq!(EdTimeoutResponse::parse(&buf), Some(response));
+        assert_eq!(
+            EdTimeoutResponse::parse(&[0x00, 0x03, 0x77]),
+            Some(response)
+        );
+        assert_eq!(EdTimeoutResponse::parse(&[0x00]), None);
     }
 }

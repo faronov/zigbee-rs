@@ -7,9 +7,21 @@ use zigbee_bdb::{
     CounterReservation, FRAME_COUNTER_RESERVATION_SIZE, NetworkSecurityState, SecurityPersistence,
     SecurityPersistenceError, TrustCenterLinkKeyState,
 };
+use zigbee_nwk::frames::{ED_TIMEOUT_ENUM_DEFAULT, ED_TIMEOUT_ENUM_MAX, PARENT_INFO_MASK};
 use zigbee_types::IeeeAddress;
 
-pub const ENCODED_SECURITY_STATE_LEN: usize = 97;
+/// Encoded length of the current (version 3) record.
+///
+/// Version 3 appends the R22 End Device Timeout negotiation result to the
+/// version 2 layout: flags bit 6 carries `parent_information_valid`, the
+/// previously unused encoded byte 11 carries `parent_information`, and the new
+/// byte 97 carries `end_device_timeout`. No other field moved, so the journal
+/// slot geometry (slot size, CRC offset, prefix length and commit offset) is
+/// unchanged.
+pub const ENCODED_SECURITY_STATE_LEN: usize = 98;
+/// Encoded length of a version 2 record (staged network key, no ED timeout).
+pub(crate) const V2_ENCODED_SECURITY_STATE_LEN: usize = 97;
+/// Encoded length of a version 1 record (no staged network key).
 pub(crate) const LEGACY_ENCODED_SECURITY_STATE_LEN: usize = 80;
 
 const FLAG_COMMISSIONED: u8 = 1 << 0;
@@ -18,6 +30,45 @@ const FLAG_TCLK_INCOMING_VALID: u8 = 1 << 2;
 const FLAG_REJOIN_PENDING: u8 = 1 << 3;
 const FLAG_LEGACY_DEFAULT_TCLK: u8 = 1 << 4;
 const FLAG_STAGED_NETWORK_KEY: u8 = 1 << 5;
+const FLAG_PARENT_INFORMATION_VALID: u8 = 1 << 6;
+
+/// Encoded record layout revision.
+///
+/// Each variant lists exactly which bytes and flags it may touch, so an older
+/// record can never be read with the newer field offsets and a newer flag bit
+/// can never be silently accepted by an older layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateFormat {
+    /// 80 bytes: no staged network key, no End Device Timeout fields.
+    V1,
+    /// 97 bytes: staged network key, no End Device Timeout fields.
+    V2,
+    /// 98 bytes: staged network key and End Device Timeout fields.
+    V3,
+}
+
+impl StateFormat {
+    const fn allowed_flags(self) -> u8 {
+        let common = FLAG_COMMISSIONED
+            | FLAG_TCLK_PRESENT
+            | FLAG_TCLK_INCOMING_VALID
+            | FLAG_REJOIN_PENDING
+            | FLAG_LEGACY_DEFAULT_TCLK;
+        match self {
+            Self::V1 => common,
+            Self::V2 => common | FLAG_STAGED_NETWORK_KEY,
+            Self::V3 => common | FLAG_STAGED_NETWORK_KEY | FLAG_PARENT_INFORMATION_VALID,
+        }
+    }
+
+    const fn has_staged_key(self) -> bool {
+        !matches!(self, Self::V1)
+    }
+
+    const fn has_end_device_timeout(self) -> bool {
+        matches!(self, Self::V3)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityStoreError {
@@ -69,6 +120,28 @@ pub struct PersistentSecurityState {
     pub tclk_incoming_counter: u32,
     pub tclk_incoming_counter_valid: bool,
     pub rejoin_pending: bool,
+    /// `nwkParentInformation` advertised by the parent in its End Device
+    /// Timeout Response, masked to the two defined bits.
+    ///
+    /// Only meaningful while [`Self::parent_information_valid`] is set. Kept
+    /// durable so a silent persisted resume can pick the right keepalive
+    /// method — a MAC data poll or a fresh End Device Timeout Request —
+    /// without re-running the negotiation on every reboot.
+    ///
+    /// The stored relationship is keyed by [`Self::parent_address`] only; the
+    /// parent's IEEE address is not persisted yet. That is safe because the
+    /// NWK layer clears validity at every real parent (re)assignment and
+    /// parent loss, so a stored advertisement can only ever be replayed by the
+    /// silent resume path, which keeps the same parent by construction.
+    pub parent_information: u8,
+    /// Whether [`Self::parent_information`] describes the stored parent.
+    pub parent_information_valid: bool,
+    /// `nwkEndDeviceTimeout` enumeration currently in effect (0..=14).
+    ///
+    /// Defaults to 8, the value a R22 parent applies to a child that never
+    /// negotiated, so a migrated or freshly commissioned record can never
+    /// claim a longer child lifetime than the parent actually granted.
+    pub end_device_timeout: u8,
 }
 
 impl PersistentSecurityState {
@@ -97,6 +170,9 @@ impl PersistentSecurityState {
             tclk_incoming_counter: 0,
             tclk_incoming_counter_valid: false,
             rejoin_pending: false,
+            parent_information: 0,
+            parent_information_valid: false,
+            end_device_timeout: ED_TIMEOUT_ENUM_DEFAULT,
         }
     }
 
@@ -126,6 +202,10 @@ impl PersistentSecurityState {
             FLAG_STAGED_NETWORK_KEY
         } else {
             0
+        }) | (if self.parent_information_valid {
+            FLAG_PARENT_INFORMATION_VALID
+        } else {
+            0
         });
         output[1] = self.channel;
         output[2] = self.depth;
@@ -134,6 +214,7 @@ impl PersistentSecurityState {
         output[6..8].copy_from_slice(&self.short_address.to_le_bytes());
         output[8..10].copy_from_slice(&self.parent_address.to_le_bytes());
         output[10] = self.key_sequence;
+        output[11] = self.parent_information;
         output[12..16].copy_from_slice(&self.global_counter_limit.to_le_bytes());
         output[16..24].copy_from_slice(&self.extended_pan_id);
         output[24..32].copy_from_slice(&self.ieee_address);
@@ -144,35 +225,33 @@ impl PersistentSecurityState {
         output[76..80].copy_from_slice(&self.tclk_incoming_counter.to_le_bytes());
         output[80] = self.staged_key_sequence;
         output[81..97].copy_from_slice(&self.staged_network_key);
+        output[97] = self.end_device_timeout;
     }
 
     pub fn decode(input: &[u8; ENCODED_SECURITY_STATE_LEN]) -> Result<Self, SecurityStoreError> {
-        Self::decode_bytes(input, true)
+        Self::decode_bytes(input, StateFormat::V3)
+    }
+
+    pub(crate) fn decode_v2(
+        input: &[u8; V2_ENCODED_SECURITY_STATE_LEN],
+    ) -> Result<Self, SecurityStoreError> {
+        Self::decode_bytes(input, StateFormat::V2)
     }
 
     pub(crate) fn decode_legacy(
         input: &[u8; LEGACY_ENCODED_SECURITY_STATE_LEN],
     ) -> Result<Self, SecurityStoreError> {
-        Self::decode_bytes(input, false)
+        Self::decode_bytes(input, StateFormat::V1)
     }
 
-    fn decode_bytes(input: &[u8], supports_staged_key: bool) -> Result<Self, SecurityStoreError> {
+    fn decode_bytes(input: &[u8], format: StateFormat) -> Result<Self, SecurityStoreError> {
         let flags = input[0];
-        if flags
-            & !(FLAG_COMMISSIONED
-                | FLAG_TCLK_PRESENT
-                | FLAG_TCLK_INCOMING_VALID
-                | FLAG_REJOIN_PENDING
-                | FLAG_LEGACY_DEFAULT_TCLK
-                | if supports_staged_key {
-                    FLAG_STAGED_NETWORK_KEY
-                } else {
-                    0
-                })
-            != 0
-        {
+        if flags & !format.allowed_flags() != 0 {
             return Err(SecurityStoreError::Corrupt);
         }
+        // `empty()` supplies the migration defaults for every field a format
+        // predates — notably `end_device_timeout = 8` and invalid parent
+        // information — so a v1/v2 record never reads byte 11 or byte 97.
         let mut state = Self::empty();
         state.commissioned = flags & FLAG_COMMISSIONED != 0;
         state.tclk_present = flags & FLAG_TCLK_PRESENT != 0;
@@ -196,10 +275,15 @@ impl PersistentSecurityState {
         state.tclk_counter_limit = u32::from_le_bytes([input[72], input[73], input[74], input[75]]);
         state.tclk_incoming_counter =
             u32::from_le_bytes([input[76], input[77], input[78], input[79]]);
-        if supports_staged_key {
+        if format.has_staged_key() {
             state.staged_network_key_present = flags & FLAG_STAGED_NETWORK_KEY != 0;
             state.staged_key_sequence = input[80];
             state.staged_network_key.copy_from_slice(&input[81..97]);
+        }
+        if format.has_end_device_timeout() {
+            state.parent_information_valid = flags & FLAG_PARENT_INFORMATION_VALID != 0;
+            state.parent_information = input[11];
+            state.end_device_timeout = input[97];
         }
 
         state.validate()?;
@@ -243,6 +327,18 @@ impl PersistentSecurityState {
             return Err(SecurityStoreError::Corrupt);
         }
         if self.rejoin_pending && !self.commissioned {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        // R22 End Device Timeout negotiation result. An undefined enumeration
+        // would produce an undefined keepalive deadline, a reserved
+        // `nwkParentInformation` bit would claim a keepalive method that does
+        // not exist, and information that is not valid must carry no bits at
+        // all — otherwise a corrupt record could select a keepalive method
+        // that silently ages the device out of its parent's child table.
+        if self.end_device_timeout > ED_TIMEOUT_ENUM_MAX
+            || self.parent_information & !PARENT_INFO_MASK != 0
+            || (!self.parent_information_valid && self.parent_information != 0)
+        {
             return Err(SecurityStoreError::Corrupt);
         }
         Ok(())
@@ -332,6 +428,12 @@ impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersist
         self.state.trust_center_link_key = [0; 16];
         self.state.tclk_incoming_counter = 0;
         self.state.tclk_incoming_counter_valid = false;
+        // A fresh commissioning selects a new parent, so any keepalive method
+        // the previous parent advertised is void and the child lifetime falls
+        // back to the R22 default until the new parent answers.
+        self.state.parent_information = 0;
+        self.state.parent_information_valid = false;
+        self.state.end_device_timeout = ED_TIMEOUT_ENUM_DEFAULT;
         self.persist()?;
         Ok(reservation)
     }
@@ -467,6 +569,81 @@ mod tests {
         let mut encoded = [0u8; ENCODED_SECURITY_STATE_LEN];
         state.encode(&mut encoded);
         assert_eq!(PersistentSecurityState::decode(&encoded), Ok(state));
+    }
+
+    #[test]
+    fn end_device_timeout_fields_round_trip_and_use_the_new_byte() {
+        let mut state = PersistentSecurityState::empty();
+        state.parent_information = 0x02;
+        state.parent_information_valid = true;
+        state.end_device_timeout = 14;
+
+        let mut encoded = [0u8; ENCODED_SECURITY_STATE_LEN];
+        state.encode(&mut encoded);
+        assert_eq!(
+            encoded[0] & (1 << 6),
+            1 << 6,
+            "flags bit 6 carries validity"
+        );
+        assert_eq!(encoded[11], 0x02, "byte 11 carries parent information");
+        assert_eq!(encoded[97], 14, "byte 97 carries the timeout enumeration");
+        assert_eq!(PersistentSecurityState::decode(&encoded), Ok(state));
+    }
+
+    #[test]
+    fn an_empty_state_defaults_to_the_r22_default_timeout() {
+        let state = PersistentSecurityState::empty();
+        assert_eq!(state.end_device_timeout, 8);
+        assert_eq!(state.parent_information, 0);
+        assert!(!state.parent_information_valid);
+        assert_eq!(state.validate(), Ok(()));
+    }
+
+    #[test]
+    fn impossible_end_device_timeout_state_is_rejected() {
+        let mut state = PersistentSecurityState::empty();
+        state.end_device_timeout = 15;
+        assert_eq!(state.validate(), Err(SecurityStoreError::Corrupt));
+
+        let mut state = PersistentSecurityState::empty();
+        state.parent_information_valid = true;
+        state.parent_information = 0x04;
+        assert_eq!(state.validate(), Err(SecurityStoreError::Corrupt));
+
+        let mut state = PersistentSecurityState::empty();
+        state.parent_information = 0x01;
+        assert_eq!(
+            state.validate(),
+            Err(SecurityStoreError::Corrupt),
+            "advertised bits without validity are impossible"
+        );
+    }
+
+    #[test]
+    fn a_v2_record_never_decodes_the_version_three_fields() {
+        let mut state = PersistentSecurityState::empty();
+        state.parent_information = 0x03;
+        state.parent_information_valid = true;
+        state.end_device_timeout = 14;
+        let mut encoded = [0u8; ENCODED_SECURITY_STATE_LEN];
+        state.encode(&mut encoded);
+
+        // A real v2 record carries neither the flag bit nor byte 11.
+        let mut v2 = [0u8; V2_ENCODED_SECURITY_STATE_LEN];
+        v2.copy_from_slice(&encoded[..V2_ENCODED_SECURITY_STATE_LEN]);
+        v2[0] &= !(1 << 6);
+        v2[11] = 0;
+        let migrated = PersistentSecurityState::decode_v2(&v2).unwrap();
+        assert_eq!(migrated.parent_information, 0);
+        assert!(!migrated.parent_information_valid);
+        assert_eq!(migrated.end_device_timeout, 8);
+
+        // The version 3 flag bit does not exist in the v2 layout.
+        v2[0] |= 1 << 6;
+        assert_eq!(
+            PersistentSecurityState::decode_v2(&v2),
+            Err(SecurityStoreError::Corrupt)
+        );
     }
 
     #[test]

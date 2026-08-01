@@ -28,3 +28,4 @@ embedded-hal = "1.0"
 opt-level = "s"
 debug = 2
 lto = true
+codegen-units = 1

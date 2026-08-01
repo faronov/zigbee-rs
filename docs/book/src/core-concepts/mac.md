@@ -498,3 +498,38 @@ pub enum PibValue {
 
 Convenience accessors (`as_bool()`, `as_u8()`, `as_short_address()`, etc.) are
 provided for safe downcasting.
+
+## Parent capability boundary: `ParentMacDriver`
+
+Not every MAC backend can act as a parent. Accepting and serving children
+requires the parent-side 802.15.4 operations — on-demand beacon response,
+association indication → response with ACK Frame Pending, and child Data
+Request events with indirect (frame-pending) delivery. The base `MacDriver`
+trait keeps those primitives (`mlme_beacon_response`,
+`set_indirect_data_pending`, `mcps_indirect_data`, `mac_command_event`,
+`mac_command_event_timeout`) as `Unsupported`/`NoData` defaults so an
+**end-device** backend needs to implement only `MacDriver`.
+
+A backend that genuinely overrides those primitives asserts it by implementing
+the capability marker trait, which is **sealed**:
+
+```rust,ignore
+pub trait ParentMacDriver: MacDriver + sealed::SealedParent {}
+```
+
+`ParentMacDriver` is implemented only by backends that can truthfully parent
+(for example the Telink soft-MAC on hardware, and the host `MockMac`). Because
+its supertrait `sealed::SealedParent` can only be named inside `zigbee-mac`, the
+trait can be implemented **only by in-tree, reviewed MAC backends** — an
+arbitrary downstream crate cannot forge the capability to unlock router
+construction. This is an *audited capability assertion*, not a compiler-checked
+proof: the type system cannot verify that a backend actually answers Beacon
+Requests and delivers indirect data, so sealing is the mechanism that keeps the
+claim honest. Adding a new parent backend requires an in-crate
+`impl sealed::SealedParent` plus `impl ParentMacDriver`, which is the point at
+which the parent behaviour is reviewed.
+
+A backend that only satisfies the `MacDriver` defaults **must not** implement
+it. This lets the runtime bound router construction on a genuine parent MAC
+rather than on the Cargo `router` feature alone — see
+[Coordinator & Router](../advanced/coordinator-router.md#logical-roles-are-types).

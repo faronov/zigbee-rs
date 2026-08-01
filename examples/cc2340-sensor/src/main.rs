@@ -29,7 +29,6 @@ use embassy_time::{Duration, Instant, Timer};
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::cc2340::Cc2340Mac;
-use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::StackEvent;
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
@@ -151,7 +150,6 @@ async fn main(_spawner: Spawner) {
 
     // Build Zigbee device (SED architecture)
     let mut device = ZigbeeDevice::builder(mac)
-        .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: 10_000,
             wake_duration_ms: 500,

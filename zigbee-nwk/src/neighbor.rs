@@ -3,6 +3,7 @@
 //! Tracks all known neighbors (parents, children, siblings) with
 //! their addresses, relationship, LQI, and aging information.
 
+use crate::frames::{ED_TIMEOUT_ENUM_DEFAULT, ed_timeout_enum_to_seconds};
 use zigbee_types::*;
 
 /// Maximum number of neighbors we track
@@ -60,6 +61,34 @@ pub struct NeighborEntry {
     pub permit_joining: bool,
     /// Age counter — incremented on each aging tick, reset on frame receipt
     pub age: u16,
+    /// R22 accepted End Device Timeout enumeration (0..=14) for an end-device
+    /// child. Only meaningful when this entry is an authenticated end-device
+    /// [`Relationship::Child`]; other entries leave it at the default.
+    ///
+    /// A child that never negotiates keeps [`ED_TIMEOUT_ENUM_DEFAULT`] (8), the
+    /// value a R22 parent applies by default, so a missing negotiation can
+    /// never grant a longer child lifetime than the parent actually intended.
+    pub end_device_timeout: u8,
+    /// R22 End Device Timeout deadline countdown, in whole seconds.
+    ///
+    /// Armed to `ed_timeout_enum_to_seconds(end_device_timeout)` when an
+    /// end-device child becomes authenticated and reset on every keepalive the
+    /// parent advertises (MAC Data Poll, End Device Timeout Request) plus valid
+    /// secured traffic. Aged down each tick with saturating subtraction; when
+    /// it reaches `0` the child is evicted. `u32` because enum 14 is
+    /// ≈ 11 days (983040 s), which overflows the `u16` [`Self::age`] counter.
+    /// `0` on a non-child / unauthenticated entry means "not armed" and is
+    /// never aged.
+    pub keepalive_remaining_secs: u32,
+    /// Whether this child has proven liveness in the current power cycle.
+    ///
+    /// `true` for a child admitted or kept alive at runtime (association,
+    /// rejoin, key proof, MAC poll, End Device Timeout Request, valid secured
+    /// traffic); `false` for a child re-installed from durable persistence
+    /// that has not yet been heard from. Used by Parent Announce so a router
+    /// yields an unconfirmed restored child to whichever parent it actually
+    /// keeps alive with, and defends a child it is actively parenting.
+    pub keepalive_confirmed: bool,
     /// Extended PAN ID of neighbor's network
     pub extended_pan_id: IeeeAddress,
     /// Whether this entry is occupied
@@ -80,6 +109,9 @@ impl NeighborEntry {
             depth: 0,
             permit_joining: false,
             age: 0,
+            end_device_timeout: ED_TIMEOUT_ENUM_DEFAULT,
+            keepalive_remaining_secs: 0,
+            keepalive_confirmed: false,
             extended_pan_id: [0; 8],
             active: false,
         }
@@ -103,6 +135,18 @@ impl NeighborEntry {
             151..=200 => 2,
             201..=255 => 1,
         };
+    }
+
+    /// Re-arm the R22 End Device Timeout deadline from the stored enumeration.
+    ///
+    /// Called when an end-device child is authenticated and on every keepalive
+    /// it performs. Falls back to the default enumeration's window if the
+    /// stored enumeration is somehow undefined, so an armed child always has a
+    /// finite, positive deadline rather than an immediate eviction.
+    pub fn refresh_end_device_timeout(&mut self) {
+        self.keepalive_remaining_secs = ed_timeout_enum_to_seconds(self.end_device_timeout)
+            .or_else(|| ed_timeout_enum_to_seconds(ED_TIMEOUT_ENUM_DEFAULT))
+            .unwrap_or(1);
     }
 }
 

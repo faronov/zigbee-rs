@@ -3,6 +3,11 @@ name = "bl702-sensor"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["production"]
+production = ["log/release_max_level_off"]
+diagnostic-logging = []
+
 [dependencies]
 bl702-hal = { path = "../../bl702-hal" }
 bl702-xt-zb1 = { path = "../../boards/bl702-xt-zb1" }
@@ -11,14 +16,14 @@ zigbee-mac = { path = "../../zigbee-mac", features = ["bl702"] }
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-nwk = { path = "../../zigbee-nwk" }
-zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime", features = ["constrained-memory"] }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["constrained-memory"] }
 
 # Embassy async runtime (executor + time driver)
 embassy-executor = { version = "0.7", features = [
     "arch-riscv32",
     "executor-thread",
-    "task-arena-size-32768",
+    "task-arena-size-16384",
 ] }
 embassy-time = { version = "0.5" }
 embassy-time-driver = "0.2"
@@ -36,4 +41,5 @@ panic-halt = "1.0"
 [profile.release]
 opt-level = "s"
 lto = true
+codegen-units = 1
 panic = "abort"

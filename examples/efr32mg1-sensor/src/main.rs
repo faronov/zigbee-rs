@@ -20,7 +20,6 @@ use static_cell::StaticCell;
 use vectors::__INTERRUPTS;
 use zigbee_bdb::attributes::{BDB_POPULAR_CHANNEL_FALLBACK_SET, BDB_POPULAR_CHANNEL_SET};
 use zigbee_mac::efr32::Efr32Mac;
-use zigbee_nwk::DeviceType;
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::power::PowerMode;
@@ -81,7 +80,6 @@ async fn main(_spawner: Spawner) {
     );
 
     let device = ZigbeeDevice::builder(Efr32Mac::new())
-        .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: SLOW_POLL_SECS * 1_000,
             wake_duration_ms: FAST_POLL_MS,

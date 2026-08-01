@@ -4,14 +4,18 @@
 //! command IDs, and a struct that implements the [`Cluster`] trait.
 
 pub mod alarms;
+#[cfg(feature = "float32")]
 pub mod analog_input;
+#[cfg(feature = "float32")]
 pub mod analog_output;
+#[cfg(feature = "float32")]
 pub mod analog_value;
 pub mod ballast_config;
 pub mod basic;
 pub mod binary_input;
 pub mod binary_output;
 pub mod binary_value;
+#[cfg(feature = "float32")]
 pub mod carbon_dioxide;
 pub mod color_control;
 pub mod device_temp_config;
@@ -37,6 +41,7 @@ pub mod on_off;
 pub mod on_off_switch_config;
 pub mod ota;
 pub mod ota_image;
+#[cfg(feature = "float32")]
 pub mod pm25;
 pub mod poll_control;
 pub mod power_config;
@@ -110,6 +115,40 @@ pub trait AttributeStoreMutAccess {
     ) -> Result<(), ZclStatus>;
     /// Look up an attribute definition for validation (needed by Write Undivided).
     fn find(&self, id: crate::AttributeId) -> Option<&crate::attribute::AttributeDefinition>;
+    /// Report whether a [`Self::set`] of `value` into `id` would succeed,
+    /// without mutating the store.
+    ///
+    /// Write Attributes Undivided relies on this to honour its all-or-nothing
+    /// contract: once `validate_set` returns `Ok(())` for every record, the
+    /// apply phase's `set` calls must not fail, so no record can partially
+    /// commit.
+    ///
+    /// The default reproduces the documented store contract enforced by
+    /// [`AttributeStore::set`]: the attribute must exist
+    /// (`UnsupportedAttribute`), be writable (`ReadOnly`), and the supplied
+    /// value's data type must match the attribute's declared type
+    /// (`InvalidDataType`). A store whose `set` can fail for any additional
+    /// reason MUST override this method so it stays exactly consistent with
+    /// `set`; otherwise an undivided write it validates may still commit part
+    /// of a batch.
+    fn validate_set(
+        &self,
+        id: crate::AttributeId,
+        value: &crate::data_types::ZclValue,
+    ) -> Result<(), ZclStatus> {
+        match self.find(id) {
+            Some(def) => {
+                if !def.access.is_writable() {
+                    Err(ZclStatus::ReadOnly)
+                } else if value.data_type() != def.data_type {
+                    Err(ZclStatus::InvalidDataType)
+                } else {
+                    Ok(())
+                }
+            }
+            None => Err(ZclStatus::UnsupportedAttribute),
+        }
+    }
 }
 
 impl<const N: usize> AttributeStoreAccess for AttributeStore<N> {
@@ -151,5 +190,15 @@ impl<const N: usize> AttributeStoreMutAccess for AttributeStore<N> {
     }
     fn find(&self, id: crate::AttributeId) -> Option<&crate::attribute::AttributeDefinition> {
         self.find(id)
+    }
+    fn validate_set(
+        &self,
+        id: crate::AttributeId,
+        value: &crate::data_types::ZclValue,
+    ) -> Result<(), ZclStatus> {
+        // Exact preflight for the in-tree store: delegates to the same
+        // `writable_slot` resolver used by `set`, so validation and the write
+        // it guards can never diverge.
+        self.validate_set(id, value)
     }
 }

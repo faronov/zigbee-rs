@@ -63,10 +63,13 @@ Every call to `tick()` runs through these phases in order:
 | **2. ZCL responses** | Sends any queued ZCL response frames (from sync `process_incoming()` handling) |
 | **3. Join check** | If not joined to a network, returns `Idle` early |
 | **4. APS maintenance** | Ages the APS ACK table, retransmits unacknowledged frames, ages duplicate-detection and fragment tables |
+| **4b. NWK maintenance** | Runs role-independent NWK maintenance (neighbour-cache aging). On `router`-feature builds it additionally runs parent/router maintenance — permit-join expiry, link-status / route-table / concentrator upkeep, pending routing transmissions, End Device Timeout child aging and eviction, MAC parent-command servicing, and Parent Announce. A non-routing sensor build compiles the whole parent/router maintenance subgraph out of the image. |
 | **5. Reporting timers** | Ticks the ZCL reporting engine by `elapsed_secs` seconds |
 | **5b. Identify / Find & Bind** | Ticks the runtime-owned Identify cluster and handles Finding & Binding target requests |
 | **5c. F&B initiator** | Ticks the F&B initiator response window |
 | **6. Attribute reports** | For each registered cluster, checks if any attribute reports are due and sends them |
+| **7. Poll** | Performs a forced End Device Timeout poll, or an automatic sleepy poll when due, and routes any returned frame through `process_incoming()` |
+| **8. End Device Timeout** | Services the R22 keepalive: response timeout, bounded retransmissions and the recurring keepalive |
 
 The `elapsed_secs` parameter tells the reporting engine how much wall-clock time
 has passed since the last tick.  Use the actual interval of your timer.
@@ -304,6 +307,63 @@ if device.power().should_poll(now_ms) {
     device.power_mut().record_poll(now_ms);
 }
 ```
+
+## End Device Timeout keepalive
+
+The runtime owns the client half of the R22 End Device Timeout lifecycle (the
+NWK 0x0B/0x0C wire format and NIB state live in
+[`zigbee-nwk`](./nwk.md#end-device-timeout-nwk-0x0b--0x0c)). Nothing has to be
+called from the application: `tick()` drives it.
+
+**Owned by the end-device role only.** The client lifecycle state (the keepalive
+countdown, response wait, retransmission budget, failure counter and forced-poll
+flag) lives in the `EndDevice` role's inline `EndDeviceState`, and the client
+helpers are bounded on the `EndDeviceRole` trait. The join/rejoin/resume/tick and
+receive paths reach them through static role hooks, so a `RelayRouter` or
+`Router` monomorphization carries **neither the client state nor the client
+code** — a parent instead runs the separate *server-side* End Device Timeout
+path (child aging and the 0x0C response). The public
+`send_ed_timeout_request()` API is likewise present only on an end-device-typed
+device rather than as a no-op on a router.
+
+**One request per real join.** `finish_join()` is the single choke point for
+`start()`, `start_with_security_store()`, the steering branch of
+`start_or_resume_with_security_store()`, `secure_rejoin()` and the
+`UserAction::Join`/`Toggle` handlers, so exactly one initial request with
+enumeration 14 is sent per join. A transmission failure never fails the join —
+the recurring keepalive owns recovery.
+
+**Silent persisted resume** does not renegotiate. It re-uses the stored parent
+relationship and picks the cheapest keepalive:
+
+| Stored `nwkParentInformation` | Resume / keepalive action |
+|-------------------------------|---------------------------|
+| valid, bit0 set (or both bits) | forced MAC poll |
+| valid, `0` (pre-R22 parent) | forced MAC poll |
+| valid, bit1 only | End Device Timeout Request |
+| invalid (never negotiated) | End Device Timeout Request |
+
+A **forced poll** bypasses the `automatic_polling` and sleepy gates and routes
+any returned frame through `process_incoming()`, so choosing the cheap
+keepalive never drops a pending indirect frame. One is scheduled after every
+successful request so a sleepy device can fetch the indirect response inside
+the parent's transaction persistence.
+
+**Bounded recovery.** An unanswered request is retransmitted twice within a
+5-second response window; if that budget is exhausted the parent information
+stays invalid and the recurring keepalive falls back to enumeration 8. The
+recurring keepalive runs at `timeout / 3` seconds, tracked in whole seconds with
+saturating subtraction because a negotiated timeout can be days long. A MAC poll
+refreshes that deadline — **except** for a parent that advertised bit1 only,
+which does not age its children on polls. Consecutive forced keepalive TX/poll
+failures schedule the existing secured-rejoin retry after a small bounded
+threshold.
+
+**Persistence.** `parent_information`, `parent_information_valid` and
+`end_device_timeout` are stored in the durable security state (record version
+3), so a reboot resumes with the negotiated keepalive method instead of
+renegotiating. Note that **downgrading to firmware older than record version 3
+is unsupported** once a version 3 record has been written.
 
 ## Complete Event Loop Example
 

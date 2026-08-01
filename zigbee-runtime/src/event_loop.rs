@@ -53,6 +53,24 @@ fn automatic_poll_due(
     automatic_polling && sleepy && (commissioning_active || interval_due)
 }
 
+/// Map a power-manager [`SleepDecision`](crate::power::SleepDecision) to the
+/// [`TickResult`] returned by the joined tick.
+///
+/// Factored out (and kept non-generic) so the two joined-tick tails share one
+/// behaviour: a routing role reaches it through the out-of-line
+/// [`ZigbeeDevice::tick_power_state`], while a sleepy end device inlines it at
+/// the single tail return of [`ZigbeeDevice::tick_joined`] (compile-time
+/// `CAN_ROUTE` split) so the large `TickResult` is built straight into the
+/// caller instead of copied back through an extra call frame.
+#[inline]
+fn sleep_decision_to_tick(decision: crate::power::SleepDecision) -> TickResult {
+    match decision {
+        crate::power::SleepDecision::StayAwake => TickResult::Idle,
+        crate::power::SleepDecision::LightSleep(ms) => TickResult::RunAgain(ms),
+        crate::power::SleepDecision::DeepSleep(ms) => TickResult::RunAgain(ms),
+    }
+}
+
 /// Events that the stack can generate for the application.
 #[derive(Debug)]
 pub enum StackEvent {
@@ -165,15 +183,15 @@ pub enum SendError {
 ///
 /// Pass registered cluster instances so the runtime can automatically
 /// send attribute reports when they are due.
-pub async fn stack_tick<M: MacDriver>(
-    device: &mut crate::ZigbeeDevice<M>,
+pub async fn stack_tick<M: MacDriver, R: crate::role::DeviceRole>(
+    device: &mut crate::ZigbeeDevice<M, R>,
     elapsed_secs: u16,
     clusters: &mut [crate::ClusterRef<'_>],
 ) -> TickResult {
     device.tick(elapsed_secs, clusters).await
 }
 
-impl<M: MacDriver> crate::ZigbeeDevice<M> {
+impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
     /// Tick the Zigbee stack — process pending actions, send reports.
     ///
     /// Call this periodically. `elapsed_secs` is the time since the last tick.
@@ -201,6 +219,7 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         // transient stack on small Series-1 devices.
         self.run_aps_maintenance().await;
         self.run_nwk_maintenance(elapsed_secs).await;
+        R::ed_advance_timers(self, elapsed_secs);
 
         self.reporting.tick(elapsed_secs);
         self.apply_fb_target_request(clusters);
@@ -209,7 +228,11 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         self.update_pending_tx_flag();
 
         let now_ms = self.advance_power_clock(elapsed_secs);
-        let result = if let Some(event) = self.run_sleepy_poll(now_ms, clusters).await {
+        // The poll runs first so an End Device Timeout Response that arrives
+        // this tick cancels the response wait before it is serviced.
+        let poll_event = self.run_sleepy_poll(now_ms, clusters).await;
+        R::ed_service(self).await;
+        let result = if let Some(event) = poll_event {
             TickResult::Event(event)
         } else {
             self.tick_power_state(now_ms)
@@ -335,6 +358,7 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
     ) -> TickResult {
         self.run_aps_maintenance().await;
         self.run_nwk_maintenance(elapsed_secs).await;
+        R::ed_advance_timers(self, elapsed_secs);
 
         self.reporting.tick(elapsed_secs);
         self.apply_fb_target_request(clusters);
@@ -343,10 +367,22 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         self.update_pending_tx_flag();
 
         let now_ms = self.advance_power_clock(elapsed_secs);
-        if let Some(event) = self.run_sleepy_poll(now_ms, clusters).await {
+        // The poll runs first so an End Device Timeout Response that arrives
+        // this tick cancels the response wait before it is serviced.
+        let poll_event = self.run_sleepy_poll(now_ms, clusters).await;
+        R::ed_service(self).await;
+        if let Some(event) = poll_event {
             return TickResult::Event(event);
         }
-        self.tick_power_state(now_ms)
+        // A routing role keeps the sleep decision behind an out-of-line call to
+        // contain its large joined-tick future; a sleepy end device inlines it
+        // (compile-time `CAN_ROUTE` split) so the large `TickResult` is built
+        // straight into the caller instead of copied back through a call frame.
+        if R::CAN_ROUTE {
+            self.tick_power_state(now_ms)
+        } else {
+            sleep_decision_to_tick(self.power.decide(now_ms))
+        }
     }
 
     #[inline(never)]
@@ -363,15 +399,100 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         aps.fragment_rx_mut().age_entries();
     }
 
+    /// Drive periodic NWK maintenance for this device's role.
+    ///
+    /// All maintenance is now selected by *static dispatch* through
+    /// [`DeviceRole::run_role_nwk_maintenance`](crate::role::DeviceRole::run_role_nwk_maintenance):
+    /// - a leaf [`EndDevice`](crate::role::EndDevice) ages only its small
+    ///   neighbour cache (no router/parent subgraph),
+    /// - a [`RelayRouter`](crate::role::RelayRouter) runs routing-only
+    ///   maintenance (permit-join expiry, router / link-status / route-table /
+    ///   concentrator maintenance, pending routing TX),
+    /// - a [`Router`](crate::role::Router) runs the full parent maintenance
+    ///   sequence plus a due Parent Announce.
+    ///
+    /// Because the split is by role type, a non-parent monomorphization's `tick`
+    /// future never contains the child-serving futures. The routing/parent
+    /// bodies are additionally gated on the `router` capability feature, so a
+    /// sensor build removes them from the image entirely.
     #[inline(never)]
     async fn run_nwk_maintenance(&mut self, elapsed_secs: u16) {
-        {
+        R::run_role_nwk_maintenance(self, elapsed_secs).await;
+    }
+
+    /// End-device neighbour-cache aging — the leaf role's only NWK maintenance.
+    ///
+    /// A routing device ages the same table inside
+    /// [`NwkLayer::tick_router_maintenance`], so this runs *only* for the
+    /// [`EndDevice`](crate::role::EndDevice) role (dispatched from
+    /// [`DeviceRole::run_role_nwk_maintenance`](crate::role::DeviceRole::run_role_nwk_maintenance))
+    /// to preserve the LRU eviction ordering of its small neighbour cache
+    /// without linking the routing / BTR / indirect / link-status subgraph.
+    ///
+    /// [`NwkLayer::tick_router_maintenance`]: zigbee_nwk::NwkLayer::tick_router_maintenance
+    #[inline]
+    pub(crate) fn run_end_device_nwk_maintenance(&mut self, elapsed_secs: u16) {
+        self.bdb
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .tick_end_device_maintenance(elapsed_secs);
+    }
+
+    /// Forwarding-only (relay) NWK maintenance — the routing subset shared by a
+    /// [`RelayRouter`](crate::role::RelayRouter) and a
+    /// [`Router`](crate::role::Router).
+    ///
+    /// Runs permit-join expiry, router / link-status / route-table /
+    /// concentrator maintenance and pending routing transmission, but **no**
+    /// child End Device Timeout aging, MAC parent-command servicing or Parent
+    /// Announce — a relay cannot accept or serve children. Present only in
+    /// `router` builds; dispatched from
+    /// [`DeviceRole::run_role_nwk_maintenance`](crate::role::DeviceRole::run_role_nwk_maintenance)
+    /// for the [`RelayRouter`](crate::role::RelayRouter) role.
+    #[cfg(feature = "router")]
+    pub(crate) async fn run_relay_nwk_maintenance(&mut self, elapsed_secs: u16) {
+        let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
+        let _ = nwk.tick_permit_joining(elapsed_secs).await;
+        nwk.tick_router_maintenance(elapsed_secs);
+        nwk.process_pending_routing().await;
+    }
+
+    /// Parent/router periodic maintenance — present only in `router` builds and
+    /// dispatched only for the [`Router`](crate::role::Router) parent role.
+    ///
+    /// This is verbatim the pre-split maintenance sequence (Parent Announce
+    /// *sending* excepted — that runs immediately after this in the role
+    /// dispatch), so a router/coordinator executes exactly the same work in the
+    /// same order. It extends the routing subset with the parent-only steps:
+    /// End Device Timeout child aging and coupled eviction cleanup, MAC
+    /// parent-command servicing and Parent Announce transaction aging. A relay
+    /// or sensor never runs (or links) any of it.
+    #[cfg(feature = "router")]
+    pub(crate) async fn run_parent_nwk_maintenance(&mut self, elapsed_secs: u16)
+    where
+        R: crate::role::ParentRole,
+    {
+        let evicted = {
             let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
             let _ = nwk.tick_permit_joining(elapsed_secs).await;
             nwk.tick_router_maintenance(elapsed_secs);
+            // R22 End Device Timeout aging: evict end-device children that
+            // stopped keeping alive. Returns the evicted short addresses so
+            // the runtime can drop the coupled deferred Update-Device state it
+            // owns; the NWK layer already cleaned the indirect queue, routing,
+            // replay counters and MAC Frame Pending for each one.
+            let evicted = nwk.age_end_device_children(elapsed_secs);
             nwk.process_pending_routing().await;
+            evicted
+        };
+        for child in evicted {
+            self.forget_evicted_child(child);
         }
-        let _ = self.service_parent_commands().await;
+        let _ = self.service_parent_commands_inner().await;
+        self.bdb
+            .zdo_mut()
+            .tick_parent_annce_transactions(elapsed_secs);
     }
 
     #[inline(never)]
@@ -409,13 +530,11 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         }
     }
 
-    #[inline(never)]
     fn update_pending_tx_flag(&mut self) {
         self.power
             .set_pending_tx(!self.pending_responses.is_empty());
     }
 
-    #[inline(never)]
     fn advance_power_clock(&mut self, elapsed_secs: u16) -> u32 {
         self.power_now_ms = advance_millis(self.power_now_ms, elapsed_secs);
         self.power_now_ms
@@ -427,13 +546,30 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         now_ms: u32,
         clusters: &mut [crate::ClusterRef<'_>],
     ) -> Option<StackEvent> {
-        if automatic_poll_due(
-            self.automatic_polling,
-            self.is_sleepy(),
-            self.bdb.tclk_exchange_active(),
-            self.power.should_poll(now_ms),
-        ) {
+        // A forced poll fetches an indirect End Device Timeout Response (or a
+        // command the parent queued while we slept) and deliberately bypasses
+        // the automatic-polling and sleepy gates: it is a keepalive obligation,
+        // not an application poll.
+        let forced = R::ed_take_forced_poll(self);
+        if forced
+            || automatic_poll_due(
+                self.automatic_polling,
+                self.is_sleepy(),
+                self.bdb.tclk_exchange_active(),
+                self.power.should_poll(now_ms),
+            )
+        {
             let indication = self.poll().await;
+            if forced {
+                // Only a keepalive-driven poll feeds the bounded failure
+                // counter; an application poll that finds nothing is normal.
+                // `forced` is only ever true for an `EndDevice`, so this
+                // dispatch reaches the client counter and no other role.
+                if let Err(error) = &indication {
+                    log::warn!("[Runtime] Forced keepalive poll failed: {:?}", error);
+                }
+                R::ed_note_forced_poll_result(self, indication.is_ok());
+            }
             if let Ok(Some(frame)) = indication {
                 return self.process_incoming(&frame, clusters).await;
             }
@@ -441,13 +577,18 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         None
     }
 
+    /// Map the power manager's sleep decision to a [`TickResult`] for a routing
+    /// role.
+    ///
+    /// A routing device's joined tick is a large standalone future, so keeping
+    /// this an out-of-line call avoids growing it. A sleepy end device instead
+    /// inlines the same decision at the single tail return in
+    /// [`Self::tick_joined`] (selected by the `CAN_ROUTE` role constant), which
+    /// lets the large `TickResult` be constructed directly into the caller
+    /// rather than copied back through an extra call frame.
     #[inline(never)]
     fn tick_power_state(&mut self, now_ms: u32) -> TickResult {
-        match self.power.decide(now_ms) {
-            crate::power::SleepDecision::StayAwake => TickResult::Idle,
-            crate::power::SleepDecision::LightSleep(ms) => TickResult::RunAgain(ms),
-            crate::power::SleepDecision::DeepSleep(ms) => TickResult::RunAgain(ms),
-        }
+        sleep_decision_to_tick(self.power.decide(now_ms))
     }
 
     /// Handle a user-initiated action.
@@ -461,8 +602,8 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
                 log::info!("[Runtime] User action: Join");
                 match self.start().await {
                     Ok(addr) => {
-                        // Send ED Timeout Request to parent (max ~11 days)
-                        self.send_ed_timeout_request().await;
+                        // `start()` owns the single initial End Device Timeout
+                        // Request for this join.
                         let ch = self.channel();
                         let pan = self.pan_id();
                         TickResult::Event(StackEvent::Joined {
@@ -601,7 +742,8 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::{advance_millis, automatic_poll_due};
+    use super::{TickResult, advance_millis, automatic_poll_due, sleep_decision_to_tick};
+    use crate::power::SleepDecision;
 
     #[test]
     fn power_clock_accumulates_elapsed_deltas() {
@@ -619,5 +761,24 @@ mod tests {
         assert!(!automatic_poll_due(true, false, true, false));
         assert!(automatic_poll_due(true, true, false, true));
         assert!(!automatic_poll_due(true, true, false, false));
+    }
+
+    #[test]
+    fn sleep_decision_maps_to_tick_result() {
+        // Both joined-tick tails (the router's out-of-line `tick_power_state`
+        // and the sleepy end device's inlined `CAN_ROUTE` tail) funnel through
+        // this one mapping, so locking it keeps the two role paths identical.
+        assert!(matches!(
+            sleep_decision_to_tick(SleepDecision::StayAwake),
+            TickResult::Idle
+        ));
+        assert!(matches!(
+            sleep_decision_to_tick(SleepDecision::LightSleep(1_500)),
+            TickResult::RunAgain(1_500)
+        ));
+        assert!(matches!(
+            sleep_decision_to_tick(SleepDecision::DeepSleep(60_000)),
+            TickResult::RunAgain(60_000)
+        ));
     }
 }

@@ -292,3 +292,56 @@ pub struct MacCapabilities {
     pub tx_power_min: TxPower,
     pub tx_power_max: TxPower,
 }
+
+// ── Parent-side capability boundary ─────────────────────────────
+
+/// Capability marker for a MAC backend that genuinely implements the
+/// parent-side 802.15.4 operations required to accept and serve children.
+///
+/// The base [`MacDriver`] trait keeps `mlme_beacon_response`,
+/// `set_indirect_data_pending`, `mcps_indirect_data`, `mac_command_event` and
+/// `mac_command_event_timeout` as `Unsupported`/`NoData` defaults so that an
+/// **end-device** backend needs to implement only [`MacDriver`]. Implementing
+/// `ParentMacDriver` is an explicit, *truthful* assertion that a backend
+/// overrides those parent primitives with real behavior:
+///
+/// - on-demand beacon response to a Beacon Request,
+/// - association indication → response with ACK Frame Pending,
+/// - child Data Request events with indirect (frame-pending) delivery.
+///
+/// A backend that only satisfies the [`MacDriver`] defaults (returning
+/// `Unsupported`/`NoData`) **must not** implement this trait, so a router role
+/// cannot be constructed on top of a MAC that cannot parent. This keeps a
+/// platform's capability claim honest and lets the runtime bound router
+/// construction on a genuine parent MAC rather than the Cargo `router` feature
+/// alone.
+///
+/// # Sealed, audited capability assertion — not compiler proof
+///
+/// `ParentMacDriver` is **sealed**: its supertrait [`sealed::SealedParent`] can
+/// only be named inside this crate, so the trait can be implemented **only by
+/// in-tree MAC backends** whose parent primitives have actually been reviewed.
+/// This is deliberately an *audited assertion*, not a mechanical proof — the
+/// type system cannot verify that a backend truly answers Beacon Requests,
+/// associates children and delivers indirect data, so sealing prevents an
+/// arbitrary downstream crate from falsely claiming the capability to unlock
+/// router construction. Adding a new parent backend therefore requires an
+/// in-crate `impl sealed::SealedParent` plus `impl ParentMacDriver`, which is
+/// the point at which the parent behaviour is reviewed.
+///
+/// The trait carries no additional methods in this phase: it is a compile-time
+/// capability boundary layered over the existing [`MacDriver`] surface. Moving
+/// the parent primitive *declarations* out of [`MacDriver`] and into this
+/// trait is deferred to a later slice (it ripples through every backend and the
+/// feature-gated `receive`/`tick` parent interleaving).
+pub trait ParentMacDriver: MacDriver + sealed::SealedParent {}
+
+pub(crate) mod sealed {
+    /// Seals [`ParentMacDriver`](super::ParentMacDriver) to in-tree backends.
+    ///
+    /// Only backends defined in this crate can name and implement this trait,
+    /// so the parent-capability assertion cannot be forged by a downstream
+    /// crate. See the `ParentMacDriver` docs for why this is an audited
+    /// assertion rather than a compiler-checked proof.
+    pub trait SealedParent {}
+}

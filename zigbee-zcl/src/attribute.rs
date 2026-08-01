@@ -46,6 +46,36 @@ pub struct AttributeValue {
     pub value: ZclValue,
 }
 
+/// Resolve the slot index of a writable attribute in `attrs` that will accept
+/// `value`, returning the exact [`ZclStatus`] that [`AttributeStore::set`]
+/// would produce on failure (`UnsupportedAttribute` / `ReadOnly` /
+/// `InvalidDataType`).
+///
+/// Free function over the attribute *slice* (not the capacity-generic store),
+/// so this resolver — shared by both `set` and `validate_set` — is compiled
+/// exactly once instead of once per `AttributeStore<N>`. Keeping preflight and
+/// write funnelled through the same resolver is what lets Write Attributes
+/// Undivided guarantee its all-or-nothing contract.
+#[inline(never)]
+fn resolve_writable_slot(
+    attrs: &[AttributeValue],
+    id: AttributeId,
+    value: &ZclValue,
+) -> Result<usize, ZclStatus> {
+    let idx = attrs
+        .iter()
+        .position(|a| a.definition.id == id)
+        .ok_or(ZclStatus::UnsupportedAttribute)?;
+    let def = &attrs[idx].definition;
+    if !def.access.is_writable() {
+        return Err(ZclStatus::ReadOnly);
+    }
+    if value.data_type() != def.data_type {
+        return Err(ZclStatus::InvalidDataType);
+    }
+    Ok(idx)
+}
+
 /// Fixed-capacity store of attribute values using `heapless::Vec`.
 ///
 /// The const generic `N` determines the maximum number of attributes.
@@ -92,20 +122,21 @@ impl<const N: usize> AttributeStore<N> {
 
     /// Write a value to an attribute, respecting access control and type.
     pub fn set(&mut self, id: AttributeId, value: ZclValue) -> Result<(), ZclStatus> {
-        let entry = self
-            .attrs
-            .iter_mut()
-            .find(|a| a.definition.id == id)
-            .ok_or(ZclStatus::UnsupportedAttribute)?;
-
-        if !entry.definition.access.is_writable() {
-            return Err(ZclStatus::ReadOnly);
-        }
-        if value.data_type() != entry.definition.data_type {
-            return Err(ZclStatus::InvalidDataType);
-        }
-        entry.value = value;
+        // `set` and `validate_set` share the capacity-independent resolver so a
+        // preflight validation can never disagree with the write it guards —
+        // the guarantee Write Attributes Undivided relies on for atomicity.
+        let idx = resolve_writable_slot(&self.attrs, id, &value)?;
+        self.attrs[idx].value = value;
         Ok(())
+    }
+
+    /// Report whether [`Self::set`] would succeed for `value` without mutating
+    /// the store. Returns the identical [`ZclStatus`] error `set` would return
+    /// (`UnsupportedAttribute`, `ReadOnly`, or `InvalidDataType`), covering
+    /// every way `set` can fail. Undivided writes preflight with this so a
+    /// validated batch can be applied without any record failing part-way.
+    pub fn validate_set(&self, id: AttributeId, value: &ZclValue) -> Result<(), ZclStatus> {
+        resolve_writable_slot(&self.attrs, id, value).map(|_| ())
     }
 
     /// Unconditionally set a value (for internal / server-side updates that

@@ -1,6 +1,8 @@
 use zigbee_types::ShortAddress;
 use zigbee_zdo::binding_mgmt::{BindReq, BindRsp, BindTarget};
-use zigbee_zdo::descriptors::{LogicalType, NodeDescriptor, PowerDescriptor, SimpleDescriptor};
+use zigbee_zdo::descriptors::{
+    LogicalType, NodeDescriptor, PowerDescriptor, SimpleDescriptor, STACK_COMPLIANCE_REVISION,
+};
 use zigbee_zdo::device_announce::DeviceAnnounce;
 use zigbee_zdo::discovery::{
     IeeeAddrReq, MatchDescReq, NodeDescReq, NodeDescRsp, NwkAddrReq, RequestType, SimpleDescReq,
@@ -47,6 +49,42 @@ fn node_descriptor_serialize_roundtrip() {
 
     let parsed = NodeDescriptor::parse(&buf[..len]).unwrap();
     assert_eq!(parsed, nd);
+}
+
+#[test]
+fn server_mask_encodes_r22_and_drops_reserved_bits() {
+    // Reserved bits 7-8 and 15 must never reach the wire, and the revision is
+    // limited to the six bits the field has.
+    let mask = NodeDescriptor::server_mask(0xFFFF, STACK_COMPLIANCE_REVISION);
+    assert_eq!(mask, (22 << 9) | NodeDescriptor::SERVER_SERVICE_MASK);
+    assert_eq!(mask & 0x8180, 0);
+
+    let coordinator_mask = NodeDescriptor::server_mask(
+        NodeDescriptor::SERVER_PRIMARY_TRUST_CENTER,
+        STACK_COMPLIANCE_REVISION,
+    );
+    assert_eq!(coordinator_mask, 0x2C01);
+}
+
+#[test]
+fn with_stack_revision_preserves_service_bits() {
+    let descriptor = NodeDescriptor {
+        server_mask: NodeDescriptor::SERVER_PRIMARY_TRUST_CENTER,
+        ..NodeDescriptor::default()
+    }
+    .with_stack_revision(STACK_COMPLIANCE_REVISION);
+
+    assert_eq!(descriptor.stack_revision(), 22);
+    assert_eq!(
+        descriptor.server_mask & NodeDescriptor::SERVER_SERVICE_MASK,
+        NodeDescriptor::SERVER_PRIMARY_TRUST_CENTER
+    );
+
+    // Bytes 8-9 of the wire format carry the server mask little-endian.
+    let mut buf = [0u8; 16];
+    descriptor.serialize(&mut buf).unwrap();
+    assert_eq!([buf[8], buf[9]], [0x01, 0x2C]);
+    assert_eq!(NodeDescriptor::parse(&buf[..13]).unwrap(), descriptor);
 }
 
 #[test]

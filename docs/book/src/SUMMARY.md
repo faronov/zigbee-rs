@@ -55,6 +55,7 @@
 - [NV Storage](./advanced/nv-storage.md)
 - [Security](./advanced/security.md)
 - [OTA Updates](./advanced/ota.md)
+- [Firmware Size](./advanced/firmware-size.md)
 - [Coordinator & Router](./advanced/coordinator-router.md)
 
 ---

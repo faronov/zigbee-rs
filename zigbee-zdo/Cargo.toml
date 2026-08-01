@@ -16,3 +16,9 @@ log = "0.4"
 [features]
 default = []
 constrained-memory = []
+router = ["zigbee-aps/router", "zigbee-nwk/router"]
+
+[dev-dependencies]
+# The ZDP dispatcher tests drive real indications through APS/NWK down to the
+# MAC and decode the transmitted response frame.
+zigbee-mac = { version = "0.1.0", path = "../zigbee-mac", features = ["mock"] }

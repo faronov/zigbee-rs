@@ -9,6 +9,7 @@ on:
       - "tools/telink-tlsr8258-lab/**"
       - "scripts/tlsr8258.sh"
       - "tools/tlsr8258-firmware.sh"
+      - "tools/firmware-size-report.sh"
       - "examples/telink-tlsr8258-radio/**"
       - "tlsr8258-hal/**"
       - "boards/tlsr8258-tb04/**"
@@ -24,6 +25,7 @@ on:
       - "tools/telink-tlsr8258-lab/**"
       - "scripts/tlsr8258.sh"
       - "tools/tlsr8258-firmware.sh"
+      - "tools/firmware-size-report.sh"
       - "examples/telink-tlsr8258-radio/**"
       - "tlsr8258-hal/**"
       - "boards/tlsr8258-tb04/**"
@@ -84,6 +86,55 @@ jobs:
           ./scripts/tlsr8258.sh build router
           cp examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-router.bin
+          ./tools/firmware-size-report.sh telink-tlsr8258-sensor \
+            target/tlsr8258-artifacts/telink-tlsr8258-sensor.bin 286720 \
+            target/tlsr8258-artifacts/telink-tlsr8258-sensor.size.json
+          ./tools/firmware-size-report.sh telink-tlsr8258-router \
+            target/tlsr8258-artifacts/telink-tlsr8258-router.bin 344064 \
+            target/tlsr8258-artifacts/telink-tlsr8258-router.size.json
+          NM="$TC32_TOOLCHAIN_DIR/llvm/bin/llvm-nm"
+          SENSOR_ELF=examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor
+          ROUTER_ELF=examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router
+          for elf in "$SENSOR_ELF" "$ROUTER_ELF"; do
+            if "$NM" --demangle "$elf" | grep -q 'core::slice::sort'; then
+              echo "$elf contains generic slice sorting" >&2
+              exit 1
+            fi
+          done
+          # Role split: the sleepy sensor must compile out the parent/router
+          # maintenance subgraph (permit-join, routing, MAC parent-command
+          # servicing, child rejoin/Update-Device, Parent Announce), while the
+          # router still links it. These names are verified present in the
+          # router image and absent from the sensor image.
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if "$NM" --demangle "$SENSOR_ELF" | grep -Eq "($PARENT_SYMS)"; then
+            echo "TLSR8258 sensor links parent/router maintenance symbols:" >&2
+            "$NM" --demangle "$SENSOR_ELF" | grep -E "($PARENT_SYMS)" >&2
+            exit 1
+          fi
+          if ! "$NM" --demangle "$ROUTER_ELF" | grep -Eq 'handle_parent_command|queue_pending_child_update'; then
+            echo "TLSR8258 router is missing expected parent maintenance symbols" >&2
+            exit 1
+          fi
+          # Role-state split: the R22 End Device Timeout *client* lifecycle
+          # (begin/resume/service/apply/tracked-request) belongs to the
+          # end-device role alone. Its `#[inline(never)]` helpers must be
+          # retained in the sleepy sensor and compiled out of the router (a
+          # parent runs the separate server-side ED Timeout path, never the
+          # client). These are client-only runtime symbols, not the generic
+          # server helpers.
+          ED_CLIENT_SYMS='resume_end_device_timeout|service_end_device_timeout|apply_end_device_timeout_change|send_ed_timeout_request_tracked'
+          if "$NM" --demangle "$ROUTER_ELF" | grep -Eq "($ED_CLIENT_SYMS)"; then
+            echo "TLSR8258 router links End Device Timeout CLIENT lifecycle symbols:" >&2
+            "$NM" --demangle "$ROUTER_ELF" | grep -E "($ED_CLIENT_SYMS)" >&2
+            exit 1
+          fi
+          for sym in resume_end_device_timeout service_end_device_timeout apply_end_device_timeout_change send_ed_timeout_request_tracked; do
+            if ! "$NM" --demangle "$SENSOR_ELF" | grep -q "$sym"; then
+              echo "TLSR8258 sensor is missing End Device Timeout CLIENT symbol: $sym" >&2
+              exit 1
+            fi
+          done
 
       - name: Build hardware lab matrix
         run: |
@@ -116,7 +167,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: telink-tlsr8258-tc32-45-${{ github.sha }}
-          path: target/tlsr8258-artifacts/*.bin
+          path: |
+            target/tlsr8258-artifacts/*.bin
+            target/tlsr8258-artifacts/*.json
           if-no-files-found: error
           retention-days: 30
 

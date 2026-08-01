@@ -14,7 +14,6 @@ use tlsr8258_hal::flash;
 use tlsr8258_tb04::storage;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::telink::TelinkMac;
-use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::StartError;
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::security_store::SecurityStoreError;
@@ -41,7 +40,6 @@ pub fn run() -> ! {
     let mac = TelinkMac::with_extended_address(ieee);
     let slot = unsafe { &mut *DEVICE.0.get() };
     let device = ZigbeeDevice::builder(mac)
-        .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::AlwaysOn)
         .manufacturer("Zigbee-RS")
         .model("TLSR8258-Runtime")

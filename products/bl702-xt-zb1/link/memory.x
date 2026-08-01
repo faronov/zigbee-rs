@@ -20,6 +20,14 @@ REGION_ALIAS("REGION_BSS", RAM1);
 REGION_ALIAS("REGION_HEAP", RAM1);
 REGION_ALIAS("REGION_STACK", RAM2);
 
+/* riscv-rt 0.16 leaves the Rust entry trampoline as an orphan section.
+   Pin it in XIP flash so codegen-unit changes cannot place it in RAM. */
+SECTIONS
+{
+  .init.rust : { KEEP(*(.init.rust)) } > REGION_TEXT
+}
+INSERT AFTER .text;
+
 SECTIONS
 {
   /DISCARD/ : { *(.eh_frame) *(.eh_frame_hdr) }

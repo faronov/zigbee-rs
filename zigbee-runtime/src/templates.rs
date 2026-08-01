@@ -6,6 +6,17 @@
 //! source of truth for endpoint declaration and runtime cluster dispatch.
 //!
 //! All templates use the Home Automation profile (0x0104).
+//!
+//! # Choosing a build method
+//!
+//! A template only *configures* a [`DeviceBuilder`]; the caller finalizes it.
+//! The sensor templates preset [`DeviceType::EndDevice`] and are finished with
+//! `build()`. The mains-powered templates (lights, plug, thermostat) preset
+//! [`DeviceType::Router`], so they must be finished with a routing build
+//! method that matches the MAC's capability — `build_router()` on a genuine
+//! [`ParentMacDriver`](zigbee_mac::ParentMacDriver) backend, or `build_relay()`
+//! for a forwarding-only relay. Finishing a router-typed template with plain
+//! `build()` is a role/device-type mismatch and is rejected.
 
 use crate::builder::DeviceBuilder;
 use zigbee_mac::MacDriver;

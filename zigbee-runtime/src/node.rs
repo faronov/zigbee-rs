@@ -3,6 +3,7 @@
 use crate::ZigbeeDevice;
 use crate::event_loop::{StackEvent, StartError, TickResult};
 use crate::profile::{ApplicationClusters, ApplicationProfile, ProfileError};
+use crate::role::{DeviceRole, EndDevice};
 use crate::security_store::{PersistentSecurityState, SecurityStateStore, SecurityStoreError};
 use zigbee_mac::{MacDriver, McpsDataIndication};
 
@@ -25,25 +26,32 @@ impl From<SecurityStoreError> for NodeError {
 }
 
 /// Owns the three objects every persistent Zigbee application needs.
-pub struct ZigbeeNode<'a, M, S, P>
+///
+/// Generic over the device's logical [`DeviceRole`] `R` (defaulting to
+/// [`EndDevice`] so existing `ZigbeeNode<'_, M, S, P>` source is unchanged), so
+/// a router product can compose a `ZigbeeDevice<M, Router>` without a bespoke
+/// wrapper.
+pub struct ZigbeeNode<'a, M, S, P, R = EndDevice>
 where
     M: MacDriver,
     S: SecurityStateStore,
     P: ApplicationProfile,
+    R: DeviceRole,
 {
-    device: &'a mut ZigbeeDevice<M>,
+    device: &'a mut ZigbeeDevice<M, R>,
     security_store: &'a mut S,
     profile: &'a mut P,
 }
 
-impl<'a, M, S, P> ZigbeeNode<'a, M, S, P>
+impl<'a, M, S, P, R> ZigbeeNode<'a, M, S, P, R>
 where
     M: MacDriver,
     S: SecurityStateStore,
     P: ApplicationProfile,
+    R: DeviceRole,
 {
     pub const fn new(
-        device: &'a mut ZigbeeDevice<M>,
+        device: &'a mut ZigbeeDevice<M, R>,
         security_store: &'a mut S,
         profile: &'a mut P,
     ) -> Self {
@@ -54,11 +62,11 @@ where
         }
     }
 
-    pub const fn device(&self) -> &ZigbeeDevice<M> {
+    pub const fn device(&self) -> &ZigbeeDevice<M, R> {
         self.device
     }
 
-    pub fn device_mut(&mut self) -> &mut ZigbeeDevice<M> {
+    pub fn device_mut(&mut self) -> &mut ZigbeeDevice<M, R> {
         self.device
     }
 
@@ -77,7 +85,7 @@ where
     /// hands an OTA transport helper both the device and the profile's OTA
     /// backend in the same call) cannot call them in the same expression.
     /// This splits the two fields explicitly instead.
-    pub fn device_and_profile_mut(&mut self) -> (&mut ZigbeeDevice<M>, &mut P) {
+    pub fn device_and_profile_mut(&mut self) -> (&mut ZigbeeDevice<M, R>, &mut P) {
         (self.device, self.profile)
     }
 

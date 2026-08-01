@@ -18,7 +18,6 @@ use phy62x2_evk::{pins, storage, time, vectors};
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::phy6222::Phy6222Mac;
-use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::security_store::SecurityStateStore;
@@ -74,7 +73,6 @@ async fn main(_spawner: Spawner) {
     };
     let configured_ieee = mac.extended_address();
     let mut device = ZigbeeDevice::builder(mac)
-        .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: SLOW_POLL_MS as u32,
             wake_duration_ms: 500,

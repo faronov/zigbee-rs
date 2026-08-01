@@ -86,6 +86,22 @@ examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr
 examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router.bin
 ```
 
+### Firmware footprint
+
+With the pinned `tc32-45` toolchain, the current production payloads are:
+
+| Image | Raw payload | Complete-HAL baseline | Reduction | CI budget |
+|---|---:|---:|---:|---:|
+| End-device sensor | 272,148 B | 323,876 B | 51,728 B (16.0%) | 280 KiB |
+| Parent router | 331,852 B | 349,792 B | 17,940 B (5.1%) | 336 KiB |
+
+The router is 59,704 bytes larger because it retains route maintenance, child
+admission and aging, indirect delivery, parent-side MAC commands,
+Update-Device handling, and Parent Announce. The sensor compiles those paths
+out and retains only its leaf behavior, including the R22 End Device Timeout
+client. See [Firmware Size and Role Specialization](../advanced/firmware-size.md)
+for the cross-platform measurements and CI gates.
+
 `tools/tlsr8258-firmware.sh` builds with tc32-45, emits the binary, and checks
 the cache reservation, RAM code, BSS/stack separation, production image size,
 and absence of the legacy lab MAC.

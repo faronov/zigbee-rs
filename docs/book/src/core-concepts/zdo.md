@@ -83,6 +83,56 @@ response ID is always `request_id | 0x8000`:
 | Mgmt_Permit_Joining | `0x0036` | `0x8036` |
 | Mgmt_NWK_Update | `0x0038` | `0x8038` |
 
+## Incoming Request Policy
+
+`ZdoLayer::handle_indication` decides what to send back from the indication's
+own destination address mode and address, compared against this node's short
+address. A frame is treated as unicast only when it was individually
+addressed; group deliveries and the four NWK broadcast addresses (`0xFFFF`,
+`0xFFFD`, `0xFFFC`, `0xFFFB`) are not.
+
+| Incoming frame | Response |
+|---|---|
+| Supported request, unicast | Normal response cluster |
+| Supported discovery broadcast that matches this node | Normal response cluster |
+| Broadcast address discovery miss | Silent |
+| Broadcast `Mgmt_Permit_Joining_req` | Apply the request, no response |
+| Unsupported request cluster, unicast | `cluster \| 0x8000` with `[TSN, NOT_SUPPORTED(0x84)]` |
+| Unsupported request cluster, broadcast or group | Dropped |
+| Malformed known request, unicast | Rejected without emitting a malformed response |
+| Malformed known request, broadcast or group | Dropped |
+| Response cluster (bit 15 set) with no pending request | Dropped — never answered |
+| `Match_Desc_req` broadcast with no match | Silent |
+| `Match_Desc_req` unicast with no match | `NO_MATCH` |
+
+A "not supported" or "no match" reply from every receiver of a broadcast is a
+broadcast storm, so those cases stay silent; a unicast requester always gets a
+status for unsupported request clusters. Malformed known requests are not
+answered with a status-only body because most defined response clusters require
+additional mandatory fields even on failure.
+
+## Stack Compliance Revision
+
+Node Descriptor server-mask bits 9..=14 carry the Stack Compliance Revision.
+This stack advertises **revision 22** (Zigbee Core R22) via
+`zigbee_zdo::descriptors::STACK_COMPLIANCE_REVISION`; a device that leaves the
+field at 0 is treated as pre-R21 by certified coordinators. `zigbee-runtime`
+sets it in both builder paths (`build()` and `build_into()`).
+
+Service bits are only claimed where the stack provides the service: a
+coordinator sets Primary Trust Center (bit 0) because it forms a centralized
+network and transports the network key; routers and end devices claim no
+services. Network Manager and the binding/discovery cache bits stay clear.
+
+```rust
+use zigbee_zdo::descriptors::{NodeDescriptor, STACK_COMPLIANCE_REVISION};
+
+let server_mask = NodeDescriptor::server_mask(
+    NodeDescriptor::SERVER_PRIMARY_TRUST_CENTER,
+    STACK_COMPLIANCE_REVISION,
+); // 0x2C01
+```
+
 ## Device Discovery
 
 Device discovery lets you translate between the two types of addresses in a
@@ -567,6 +617,39 @@ for &ep in &eps.active_ep_list {
 // 5. Create a binding if we find a matching cluster
 //    (BDB Finding & Binding does this automatically)
 ```
+
+## Parent Announce (`Parent_annce` 0x001F / `Parent_annce_rsp` 0x801F)
+
+`Parent_annce` is the R22 ZDP primitive a router/coordinator uses to reconcile
+its child table with the rest of the network after it restores or rebuilds it.
+It is a **ZDP** command carried over APS on endpoint 0 (not a NWK-layer
+command), restricted to routing devices — end devices have no child table, so
+`send_parent_annce()` is a no-op on them and the receive path is gated on
+`can_route()`.
+
+| Cluster | Payload |
+|---------|---------|
+| `Parent_annce` 0x001F | `NumberOfChildren(1)` then that many `IEEE(8)` |
+| `Parent_annce_rsp` 0x801F | `Status(1)`, `NumberOfChildren(1)`, then `IEEE(8)` |
+
+Behaviour (`zigbee_zdo::parent_annce`):
+
+- **Send** — after a router's restored child state is authoritative,
+  `ZigbeeDevice::announce_parent()` (also fired once automatically by the joined
+  tick following `restore_child_table`) broadcasts the IEEE addresses of its
+  authenticated children.
+- **Receive `Parent_annce`** — for each announced child the receiver also
+  holds: if it has **confirmed** the child's liveness this power cycle it keeps
+  the child and reports it in a `Parent_annce_rsp`; otherwise (an unconfirmed
+  record just restored from flash) it yields the child to the announcer and
+  evicts it. This confirmed-liveness gate is what makes simultaneous reboots
+  safe — neither router drops a child it is actually keeping alive.
+- **Receive `Parent_annce_rsp`** — the announcer relinquishes every child the
+  responder is keeping.
+
+The confirmed-liveness bit is set by any keepalive (poll, End Device Timeout
+Request, valid secured traffic) or live admission, and is `false` for a child
+restored from persistence until it is next heard from.
 
 ## Summary
 

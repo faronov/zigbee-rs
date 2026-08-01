@@ -80,6 +80,20 @@ pub enum NwkCommandOutcome {
         capability_info: u8,
         secured: bool,
     },
+    /// A directly-attached authenticated child sent an End Device Timeout
+    /// Request (0x0B). The runtime must apply the timeout policy and transmit
+    /// the End Device Timeout Response (0x0C), which may be delivered
+    /// indirectly to a sleepy child. The NWK layer has already checked that
+    /// `src`/`ieee` name an authenticated child of this parent and that the
+    /// frame was addressed to and authenticated for this device.
+    EndDeviceTimeoutRequest {
+        /// Short address of the requesting child (validated as our child).
+        src: ShortAddress,
+        /// Authenticated IEEE identity of the requesting child.
+        ieee: IeeeAddress,
+        /// Requested Timeout Enumeration (already parsed to 0..=14).
+        requested_timeout: u8,
+    },
 }
 
 /// NWK data confirm — result of NLDE-DATA.request.
@@ -513,6 +527,166 @@ impl<M: MacDriver> NwkLayer<M> {
         Ok(RejoinResponseDelivery::Direct)
     }
 
+    /// Apply the R22 End Device Timeout policy for a validated child request
+    /// and transmit the End Device Timeout Response (0x0C).
+    ///
+    /// Called by the layer above for a
+    /// [`NwkCommandOutcome::EndDeviceTimeoutRequest`]. The identity and
+    /// authentication checks were already made by `handle_ed_timeout_request`;
+    /// this re-validates that `child`/`child_ieee` still name an authenticated
+    /// end-device child (the child table could have changed between receive and
+    /// this async step) and then:
+    /// - accepts every defined enumeration 0..=14 — this parent imposes no
+    ///   tighter bound — recording it as the child's accepted timeout and
+    ///   answering `SUCCESS`;
+    /// - answers `INCORRECT_VALUE` and falls back to
+    ///   [`ED_TIMEOUT_ENUM_DEFAULT`] for any other value (unreachable through
+    ///   the strict wire parser, but kept as an explicit deterministic branch);
+    /// - refreshes the child's deadline, because the request itself is an End
+    ///   Device Timeout Request keepalive;
+    /// - advertises both supported keepalive methods in `nwkParentInformation`.
+    ///
+    /// A sleepy child receives the response indirectly through the parent's
+    /// queue on its next MAC Data Request; an rx-on child receives it directly.
+    pub async fn respond_to_end_device_timeout_request(
+        &mut self,
+        child: ShortAddress,
+        child_ieee: IeeeAddress,
+        requested_timeout: u8,
+    ) -> Result<(), NwkStatus> {
+        use crate::frames::{
+            ED_TIMEOUT_ENUM_DEFAULT, ED_TIMEOUT_STATUS_INCORRECT_VALUE, ED_TIMEOUT_STATUS_SUCCESS,
+            PARENT_INFO_MASK, ed_timeout_enum_to_seconds,
+        };
+
+        if !self.can_route() {
+            return Err(NwkStatus::InvalidRequest);
+        }
+        let rx_on_when_idle = match self.neighbors.find_by_short(child) {
+            Some(entry)
+                if entry.relationship == crate::neighbor::Relationship::Child
+                    && entry.ieee_address == child_ieee =>
+            {
+                entry.rx_on_when_idle
+            }
+            _ => return Err(NwkStatus::UnknownDevice),
+        };
+
+        // Explicit supported-enumeration policy: accept all R22 values.
+        let (status, accepted) = match ed_timeout_enum_to_seconds(requested_timeout) {
+            Some(_) => (ED_TIMEOUT_STATUS_SUCCESS, requested_timeout),
+            None => (ED_TIMEOUT_STATUS_INCORRECT_VALUE, ED_TIMEOUT_ENUM_DEFAULT),
+        };
+
+        if let Some(entry) = self.neighbors.find_by_short_mut(child) {
+            entry.end_device_timeout = accepted;
+            // The request is itself a keepalive, so re-arm the deadline from
+            // the (possibly new) accepted enumeration.
+            entry.refresh_end_device_timeout();
+            entry.age = 0;
+            entry.keepalive_confirmed = true;
+        }
+
+        // This parent implements both keepalive methods.
+        let parent_info = PARENT_INFO_MASK;
+        log::info!(
+            "[NWK] ED Timeout {} for child 0x{:04X}: enum={} parent_info=0x{:02X}",
+            if status == ED_TIMEOUT_STATUS_SUCCESS {
+                "accepted"
+            } else {
+                "refused"
+            },
+            child.0,
+            accepted,
+            parent_info,
+        );
+        self.send_end_device_timeout_response(
+            child,
+            child_ieee,
+            status,
+            parent_info,
+            rx_on_when_idle,
+        )
+        .await
+    }
+
+    /// Send a one-hop End Device Timeout Response (0x0C) to a child.
+    ///
+    /// Mirrors [`Self::send_rejoin_response`] delivery: a sleepy child's
+    /// response is queued indirectly and armed with MAC Frame Pending so it is
+    /// retrieved on the child's next Data Request without bypassing ACK/Frame
+    /// Pending semantics; an rx-on child is sent the response directly.
+    async fn send_end_device_timeout_response(
+        &mut self,
+        child: ShortAddress,
+        child_ieee: IeeeAddress,
+        status: u8,
+        parent_info: u8,
+        rx_on_when_idle: bool,
+    ) -> Result<(), NwkStatus> {
+        if !self.can_route() || !is_unicast_address(child) {
+            return Err(NwkStatus::InvalidRequest);
+        }
+
+        let sequence = self.nib.next_seq();
+        let header = NwkHeader {
+            frame_control: NwkFrameControl {
+                frame_type: NwkFrameType::Command as u8,
+                protocol_version: 0x02,
+                discover_route: 0,
+                multicast: false,
+                security: self.nib.security_enabled,
+                source_route: false,
+                dst_ieee_present: true,
+                src_ieee_present: false,
+                end_device_initiator: false,
+            },
+            dst_addr: child,
+            src_addr: self.nib.network_address,
+            radius: 1,
+            seq_number: sequence,
+            dst_ieee: Some(child_ieee),
+            src_ieee: None,
+            multicast_control: None,
+            source_route: None,
+        };
+        let command = [NwkCommandId::EdTimeoutResponse as u8, status, parent_info];
+        let mut frame = [0u8; MAX_NWK_FRAME];
+        let frame_len = self.build_nwk_frame(&header, &command, &mut frame)?;
+
+        if !rx_on_when_idle {
+            // The response is keyed on the child's own short address so its
+            // next poll retrieves it, exactly like the Rejoin Response path.
+            let Some(slot) = self.indirect.enqueue_with_slot(child, &frame[..frame_len]) else {
+                return Err(NwkStatus::FrameNotBuffered);
+            };
+            if self
+                .mac
+                .set_indirect_data_pending(MacAddress::Short(self.nib.pan_id, child), true)
+                .is_err()
+            {
+                self.indirect.remove_slot(slot);
+                return Err(NwkStatus::FrameNotBuffered);
+            }
+            return Ok(());
+        }
+
+        self.mac
+            .mcps_data(McpsDataRequest {
+                src_addr_mode: AddressMode::Short,
+                dst_address: MacAddress::Short(self.nib.pan_id, child),
+                payload: &frame[..frame_len],
+                msdu_handle: sequence,
+                tx_options: TxOptions {
+                    ack_tx: true,
+                    ..Default::default()
+                },
+            })
+            .await
+            .map_err(|_| NwkStatus::RouteError)?;
+        Ok(())
+    }
+
     /// Decide what to do with a unicast that currently has no next hop.
     ///
     /// Routing devices start an AODV route discovery so a retry (APS
@@ -766,6 +940,14 @@ impl<M: MacDriver> NwkLayer<M> {
                 "[NWK] Child 0x{:04X} proved possession of the network key",
                 src.0
             );
+        }
+        // R22 secured-traffic keepalive: an authenticated frame from an
+        // attached end-device child refreshes its End Device Timeout deadline.
+        // Runs after `authorize_child` so a frame that both authenticates and
+        // keeps alive is credited once, and before the relay branch so a
+        // child's data relayed on to the coordinator still counts.
+        if let Some(security_source) = payload.security_source() {
+            self.refresh_child_keepalive_secured(src, security_source);
         }
 
         // Two commands are not handled by the generic broadcast and relay
@@ -1459,14 +1641,15 @@ impl<M: MacDriver> NwkLayer<M> {
             Some(NwkCommandId::LinkStatus) => self.handle_link_status(src, cmd_payload),
             Some(NwkCommandId::NetworkStatus) => self.handle_network_status(src, cmd_payload),
             Some(NwkCommandId::EdTimeoutResponse) => {
-                if let Some(resp) = crate::frames::EdTimeoutResponse::parse(cmd_payload) {
-                    log::info!(
-                        "[NWK] ED Timeout Response from 0x{:04X}: status={} parent_info=0x{:02X}",
-                        src.0,
-                        resp.status,
-                        resp.parent_info,
-                    );
-                }
+                self.handle_ed_timeout_response(src, dst, cmd_payload)
+            }
+            Some(NwkCommandId::EdTimeoutRequest) => {
+                return self.handle_ed_timeout_request(
+                    header,
+                    secured,
+                    security_source,
+                    cmd_payload,
+                );
             }
             Some(NwkCommandId::RejoinRequest) => {
                 return self.handle_rejoin_request(header, secured, security_source, cmd_payload);
@@ -1530,6 +1713,176 @@ impl<M: MacDriver> NwkLayer<M> {
         })
     }
 
+    /// Handle incoming NWK End Device Timeout Request (0x0B) on a parent.
+    ///
+    /// The R22 server side. Accepted only when every one of these holds, so an
+    /// arbitrary network member can never rewrite a child's timeout state:
+    /// - this device can route (only a parent answers requests);
+    /// - the frame was addressed directly to this parent's own short address
+    ///   (and matching IEEE, if the sender included one);
+    /// - the source is a real unicast address;
+    /// - the reserved End Device Configuration byte is zero and the requested
+    ///   enumeration is defined (0..=14) — enforced by the wire parser;
+    /// - on a secured network the frame was NWK-authenticated (the shared
+    ///   dispatcher guard) and its auxiliary-header source IEEE matches the
+    ///   IEEE the sender advertised;
+    /// - the sender is a directly-attached, **authenticated** child of this
+    ///   parent whose stored IEEE matches that authenticated identity.
+    ///
+    /// The actual policy decision and the 0x0C transmission (which may be
+    /// indirect for a sleepy child) are performed asynchronously by the layer
+    /// above via [`NwkLayer::respond_to_end_device_timeout_request`], so this
+    /// synchronous handler only validates and reports.
+    fn handle_ed_timeout_request(
+        &self,
+        header: &NwkHeader,
+        secured: bool,
+        security_source: Option<IeeeAddress>,
+        payload: &[u8],
+    ) -> Option<NwkCommandOutcome> {
+        if !self.can_route() {
+            return None;
+        }
+        if header.dst_addr != self.nib.network_address {
+            return None;
+        }
+        if header
+            .dst_ieee
+            .is_some_and(|address| address != self.nib.ieee_address)
+        {
+            return None;
+        }
+        if !is_unicast_address(header.src_addr) {
+            return None;
+        }
+        // On a secured network the request must be authenticated; the shared
+        // dispatcher guard already enforced this, so a false `secured` here can
+        // only occur on an unsecured network, where no authenticated child can
+        // exist and the relationship check below fails anyway.
+        if self.nib.security_enabled && !secured {
+            return None;
+        }
+        let request = crate::frames::EdTimeoutRequest::parse(payload)?;
+
+        // Authenticated identity of the sender: the NWK security source on a
+        // secured network, otherwise the IEEE the sender embedded in the
+        // header. Any embedded IEEE must agree with the authenticated one.
+        let ieee = if secured {
+            security_source?
+        } else {
+            header.src_ieee?
+        };
+        if header.src_ieee.is_some_and(|address| address != ieee) {
+            log::warn!(
+                "[NWK] ED Timeout Request IEEE does not match its security source (0x{:04X})",
+                header.src_addr.0
+            );
+            return None;
+        }
+
+        // The sender must be a directly-attached authenticated child, matched
+        // by both its short address and the authenticated IEEE. A provisional
+        // (unauthenticated) child, a router, a sibling or an unknown device is
+        // refused silently — no response is sent.
+        let is_attached_child =
+            self.neighbors
+                .find_by_short(header.src_addr)
+                .is_some_and(|entry| {
+                    entry.relationship == crate::neighbor::Relationship::Child
+                        && entry.ieee_address == ieee
+                });
+        if !is_attached_child {
+            log::warn!(
+                "[NWK] Ignoring ED Timeout Request from non-child 0x{:04X}",
+                header.src_addr.0
+            );
+            return None;
+        }
+
+        Some(NwkCommandOutcome::EndDeviceTimeoutRequest {
+            src: header.src_addr,
+            ieee,
+            requested_timeout: request.requested_timeout,
+        })
+    }
+
+    /// Handle incoming NWK End Device Timeout Response (0x0C).
+    ///
+    /// Accepted only when every one of these holds:
+    /// - this device is an end device (a router never negotiates a timeout
+    ///   for itself);
+    /// - the frame came from the current parent, and that parent address is a
+    ///   real unicast address rather than the unassigned/broadcast range;
+    /// - the frame was addressed to this device's own network address;
+    /// - the shared secured-NWK-command guard in the dispatcher already
+    ///   passed, so on a secured network the frame was NWK-decrypted.
+    ///
+    /// Without the source and destination checks any neighbour could shorten
+    /// this device's keepalive interval or advertise a keepalive method the
+    /// real parent does not implement, which would silently age the device out
+    /// of its parent's child table.
+    ///
+    /// No [`NwkCommandOutcome`] is produced: the effect is entirely NIB state,
+    /// which the layer above detects by comparing the negotiation fields
+    /// around `process_incoming_nwk_frame`.
+    fn handle_ed_timeout_response(&mut self, src: ShortAddress, dst: ShortAddress, payload: &[u8]) {
+        if self.device_type != crate::DeviceType::EndDevice {
+            return;
+        }
+        let parent = self.nib.parent_address;
+        if !is_unicast_address(parent) || src != parent || dst != self.nib.network_address {
+            log::warn!(
+                "[NWK] Ignoring ED Timeout Response src=0x{:04X} dst=0x{:04X} (parent=0x{:04X})",
+                src.0,
+                dst.0,
+                parent.0,
+            );
+            return;
+        }
+        let Some(response) = crate::frames::EdTimeoutResponse::parse(payload) else {
+            log::warn!("[NWK] Malformed ED Timeout Response from 0x{:04X}", src.0);
+            return;
+        };
+
+        match response.status {
+            crate::frames::ED_TIMEOUT_STATUS_SUCCESS => {
+                if !self.nib.take_end_device_timeout_response_pending() {
+                    log::warn!(
+                        "[NWK] Ignoring unsolicited ED Timeout Response from 0x{:04X}",
+                        src.0
+                    );
+                    return;
+                }
+                self.nib.accept_end_device_timeout(response.parent_info);
+                log::info!(
+                    "[NWK] ED Timeout accepted: enum={} parent_info=0x{:02X}",
+                    self.nib.end_device_timeout,
+                    self.nib.parent_information,
+                );
+            }
+            crate::frames::ED_TIMEOUT_STATUS_INCORRECT_VALUE => {
+                if !self.nib.take_end_device_timeout_response_pending() {
+                    log::warn!(
+                        "[NWK] Ignoring unsolicited ED Timeout Response from 0x{:04X}",
+                        src.0
+                    );
+                    return;
+                }
+                // A refusal carries no usable parent information, so any
+                // previously validated advertisement stays untouched.
+                let lowered = self.nib.lower_requested_end_device_timeout();
+                log::warn!(
+                    "[NWK] ED Timeout refused; requested enum now {} (lowered={})",
+                    self.nib.requested_end_device_timeout,
+                    lowered,
+                );
+            }
+            other => {
+                log::warn!("[NWK] Unknown ED Timeout Response status 0x{:02X}", other);
+            }
+        }
+    }
+
     /// Handle incoming NWK Leave command.
     ///
     /// A Leave *request* is only honoured from the current parent and only
@@ -1567,6 +1920,10 @@ impl<M: MacDriver> NwkLayer<M> {
             // Stop using the network until the caller either honours the
             // requested rejoin or clears its persisted network state.
             self.joined = false;
+            // The parent relationship is over either way, so the R22 End
+            // Device Timeout has to be renegotiated with whichever parent
+            // accepts the device next.
+            self.nib.reset_end_device_timeout_negotiation();
             return Some(NwkCommandOutcome::LeaveRequested {
                 src,
                 rejoin: leave.rejoin,
@@ -1581,6 +1938,7 @@ impl<M: MacDriver> NwkLayer<M> {
         self.neighbors.remove(src);
         if src == self.nib.parent_address {
             self.joined = false;
+            self.nib.reset_end_device_timeout_negotiation();
             return Some(NwkCommandOutcome::ParentLeft { src });
         }
         None
@@ -2051,7 +2409,10 @@ fn process_source_route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::{NwkFrameControl, NwkFrameType, NwkHeader};
+    use crate::frames::{
+        ED_TIMEOUT_ENUM_DEFAULT, ED_TIMEOUT_ENUM_REQUESTED, NwkFrameControl, NwkFrameType,
+        NwkHeader,
+    };
     use crate::{DeviceType, NwkLayer};
     use core::future::Future;
     use core::task::{Context, Poll, Waker};
@@ -2341,6 +2702,27 @@ mod tests {
     }
 
     // ── Local delivery versus relay ──────────────────────────
+
+    #[test]
+    fn tick_end_device_maintenance_ages_the_neighbour_cache() {
+        // The role-independent common maintenance path ages the neighbour cache
+        // once per elapsed second — the LRU input a non-routing end device
+        // still needs — without touching any router maintenance state.
+        let mut nwk = node(DeviceType::EndDevice, OUR_ADDR);
+        nwk.update_neighbor_address(PEER, [0xAB; 8]);
+        assert_eq!(
+            nwk.neighbor_table().find_by_ieee(&[0xAB; 8]).unwrap().age,
+            0
+        );
+
+        nwk.tick_end_device_maintenance(7);
+
+        assert_eq!(
+            nwk.neighbor_table().find_by_ieee(&[0xAB; 8]).unwrap().age,
+            7,
+            "each elapsed second ages the neighbour cache exactly once"
+        );
+    }
 
     #[test]
     fn unicast_addressed_to_us_is_delivered_locally_and_not_relayed() {
@@ -2850,6 +3232,219 @@ mod tests {
             nwk.is_joined(),
             "a forged unsecured leave must not take the device off the network"
         );
+    }
+
+    /// Deliver a NWK End Device Timeout Response (0x0C) from `src` to `dst`.
+    fn deliver_ed_timeout_response(
+        nwk: &mut NwkLayer<MockMac>,
+        src: ShortAddress,
+        dst: ShortAddress,
+        body: &[u8],
+    ) {
+        deliver_ed_timeout_response_with_seq(nwk, src, dst, body, 7);
+    }
+
+    fn deliver_ed_timeout_response_with_seq(
+        nwk: &mut NwkLayer<MockMac>,
+        src: ShortAddress,
+        dst: ShortAddress,
+        body: &[u8],
+        sequence: u8,
+    ) {
+        let mut payload = [0u8; 32];
+        let payload_len = command_payload(NwkCommandId::EdTimeoutResponse, body, &mut payload);
+        let mut buf = [0u8; 128];
+        let mut header = frame(NwkFrameType::Command, src, dst);
+        header.seq_number = sequence;
+        let len = encode(&header, &payload[..payload_len], &mut buf);
+        assert!(block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+        assert_eq!(
+            nwk.take_command_outcome(),
+            None,
+            "the timeout negotiation is NIB state, not a lifecycle outcome"
+        );
+    }
+
+    fn negotiating_end_device() -> NwkLayer<MockMac> {
+        let mut nwk = node(DeviceType::EndDevice, OUR_ADDR);
+        nwk.nib.reset_end_device_timeout_negotiation();
+        block_on(nwk.send_ed_timeout_request()).unwrap();
+        nwk
+    }
+
+    #[test]
+    fn ed_timeout_success_stores_masked_parent_information() {
+        let mut nwk = negotiating_end_device();
+        // Trailing byte from a future revision must be ignored, not rejected.
+        deliver_ed_timeout_response(
+            &mut nwk,
+            ShortAddress(0x0000),
+            OUR_ADDR,
+            &[0x00, 0xF3, 0x5A],
+        );
+
+        assert!(nwk.nib.parent_information_valid);
+        assert_eq!(nwk.nib.parent_information, 0x03);
+        assert_eq!(nwk.nib.end_device_timeout, ED_TIMEOUT_ENUM_REQUESTED);
+        assert_eq!(
+            nwk.nib.requested_end_device_timeout,
+            ED_TIMEOUT_ENUM_REQUESTED
+        );
+    }
+
+    #[test]
+    fn ed_timeout_incorrect_value_lowers_only_to_the_default_floor() {
+        let mut nwk = negotiating_end_device();
+        // Establish prior valid parent information, then refuse a request.
+        deliver_ed_timeout_response(&mut nwk, ShortAddress(0x0000), OUR_ADDR, &[0x00, 0x01]);
+        assert!(nwk.nib.parent_information_valid);
+
+        for _ in 0..(ED_TIMEOUT_ENUM_REQUESTED - ED_TIMEOUT_ENUM_DEFAULT + 3) {
+            block_on(nwk.send_ed_timeout_request()).unwrap();
+            deliver_ed_timeout_response(&mut nwk, ShortAddress(0x0000), OUR_ADDR, &[0x01, 0x02]);
+        }
+
+        assert_eq!(
+            nwk.nib.requested_end_device_timeout, ED_TIMEOUT_ENUM_DEFAULT,
+            "refusals must never walk below the default enumeration"
+        );
+        assert!(
+            nwk.nib.parent_information_valid,
+            "a refusal must not invalidate previously accepted parent information"
+        );
+        assert_eq!(
+            nwk.nib.parent_information, 0x01,
+            "a refusal must not overwrite prior valid parent information"
+        );
+    }
+
+    #[test]
+    fn ed_timeout_unknown_status_changes_no_state() {
+        let mut nwk = negotiating_end_device();
+        deliver_ed_timeout_response(&mut nwk, ShortAddress(0x0000), OUR_ADDR, &[0x7F, 0x03]);
+
+        assert!(!nwk.nib.parent_information_valid);
+        assert_eq!(nwk.nib.parent_information, 0);
+        assert_eq!(nwk.nib.end_device_timeout, ED_TIMEOUT_ENUM_DEFAULT);
+        assert_eq!(
+            nwk.nib.requested_end_device_timeout,
+            ED_TIMEOUT_ENUM_REQUESTED
+        );
+    }
+
+    #[test]
+    fn unsolicited_and_duplicate_ed_timeout_responses_are_ignored() {
+        let mut nwk = node(DeviceType::EndDevice, OUR_ADDR);
+        nwk.nib.reset_end_device_timeout_negotiation();
+
+        deliver_ed_timeout_response_with_seq(
+            &mut nwk,
+            ShortAddress(0x0000),
+            OUR_ADDR,
+            &[0x00, 0x03],
+            1,
+        );
+        assert!(!nwk.nib.parent_information_valid);
+        assert_eq!(nwk.nib.end_device_timeout_accepts, 0);
+
+        block_on(nwk.send_ed_timeout_request()).unwrap();
+        deliver_ed_timeout_response_with_seq(
+            &mut nwk,
+            ShortAddress(0x0000),
+            OUR_ADDR,
+            &[0x00, 0x01],
+            2,
+        );
+        assert!(nwk.nib.parent_information_valid);
+        assert_eq!(nwk.nib.parent_information, 0x01);
+        assert_eq!(nwk.nib.end_device_timeout_accepts, 1);
+
+        deliver_ed_timeout_response_with_seq(
+            &mut nwk,
+            ShortAddress(0x0000),
+            OUR_ADDR,
+            &[0x01, 0x02],
+            3,
+        );
+        assert_eq!(nwk.nib.parent_information, 0x01);
+        assert_eq!(nwk.nib.end_device_timeout_accepts, 1);
+        assert_eq!(
+            nwk.nib.requested_end_device_timeout, ED_TIMEOUT_ENUM_REQUESTED,
+            "a delayed duplicate must not ratchet the requested timeout"
+        );
+    }
+
+    #[test]
+    fn ed_timeout_response_is_only_accepted_from_the_parent_to_this_node() {
+        // Wrong source: a neighbour that is not the current parent.
+        let mut nwk = negotiating_end_device();
+        deliver_ed_timeout_response(&mut nwk, PEER, OUR_ADDR, &[0x00, 0x03]);
+        assert!(!nwk.nib.parent_information_valid);
+
+        // Wrong destination: a frame addressed elsewhere.
+        let mut nwk = negotiating_end_device();
+        deliver_ed_timeout_response(&mut nwk, ShortAddress(0x0000), FAR, &[0x00, 0x03]);
+        assert!(!nwk.nib.parent_information_valid);
+
+        // No valid parent yet.
+        let mut nwk = negotiating_end_device();
+        nwk.nib.parent_address = ShortAddress(0xFFFF);
+        deliver_ed_timeout_response(&mut nwk, ShortAddress(0xFFFF), OUR_ADDR, &[0x00, 0x03]);
+        assert!(!nwk.nib.parent_information_valid);
+
+        // Truncated payload.
+        let mut nwk = negotiating_end_device();
+        deliver_ed_timeout_response(&mut nwk, ShortAddress(0x0000), OUR_ADDR, &[0x00]);
+        assert!(!nwk.nib.parent_information_valid);
+    }
+
+    #[test]
+    fn ed_timeout_response_is_ignored_by_non_end_devices() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.nib.reset_end_device_timeout_negotiation();
+        deliver_ed_timeout_response(&mut nwk, ShortAddress(0x0000), OUR_ADDR, &[0x00, 0x03]);
+        assert!(!nwk.nib.parent_information_valid);
+    }
+
+    #[test]
+    fn unsecured_ed_timeout_response_is_dropped_on_a_secured_network() {
+        let mut nwk = negotiating_end_device();
+        nwk.nib.security_enabled = true;
+        deliver_ed_timeout_response(&mut nwk, ShortAddress(0x0000), OUR_ADDR, &[0x00, 0x03]);
+        assert!(
+            !nwk.nib.parent_information_valid,
+            "the shared secured-command guard must run before the timeout state changes"
+        );
+    }
+
+    #[test]
+    fn parent_leave_clears_the_end_device_timeout_negotiation() {
+        let mut nwk = negotiating_end_device();
+        deliver_ed_timeout_response(&mut nwk, ShortAddress(0x0000), OUR_ADDR, &[0x00, 0x03]);
+        assert!(nwk.nib.parent_information_valid);
+
+        let leave = crate::frames::LeaveCommand {
+            remove_children: false,
+            request: false,
+            rejoin: false,
+        };
+        let mut payload = [0u8; 32];
+        let payload_len = command_payload(NwkCommandId::Leave, &[leave.serialize()], &mut payload);
+        let mut buf = [0u8; 128];
+        let len = encode(
+            &frame(
+                NwkFrameType::Command,
+                ShortAddress(0x0000),
+                ShortAddress::BROADCAST_RX_ON_WHEN_IDLE,
+            ),
+            &payload[..payload_len],
+            &mut buf,
+        );
+        assert!(block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+
+        assert!(!nwk.nib.parent_information_valid);
+        assert_eq!(nwk.nib.parent_information, 0);
+        assert_eq!(nwk.nib.end_device_timeout, ED_TIMEOUT_ENUM_DEFAULT);
     }
 
     #[test]
@@ -5419,5 +6014,431 @@ mod tests {
                 address.0
             );
         }
+    }
+
+    // ── R22 End Device Timeout Request server ────────────────
+
+    /// The exact bytes a child puts on air for an End Device Timeout Request
+    /// (0x0B), produced by the real transmit path of a secured node standing
+    /// in for the child rather than a hand-rolled encoder.
+    #[cfg(feature = "router")]
+    fn ed_timeout_request_on_air(
+        dst: ShortAddress,
+        secured: bool,
+        header_ieee: IeeeAddress,
+        security_ieee: IeeeAddress,
+        requested_timeout: u8,
+        ed_config: u8,
+    ) -> heapless::Vec<u8, 128> {
+        let mut child = secured_node(DeviceType::EndDevice, ORIGIN, security_ieee);
+        let header = NwkHeader {
+            frame_control: NwkFrameControl {
+                frame_type: NwkFrameType::Command as u8,
+                protocol_version: 0x02,
+                discover_route: 0,
+                multicast: false,
+                security: secured,
+                source_route: false,
+                dst_ieee_present: false,
+                src_ieee_present: true,
+                end_device_initiator: false,
+            },
+            dst_addr: dst,
+            src_addr: ORIGIN,
+            radius: 1,
+            seq_number: 0x33,
+            dst_ieee: None,
+            src_ieee: Some(header_ieee),
+            multicast_control: None,
+            source_route: None,
+        };
+        let mut frame = [0u8; 128];
+        let len = child
+            .build_nwk_frame(
+                &header,
+                &[
+                    NwkCommandId::EdTimeoutRequest as u8,
+                    requested_timeout,
+                    ed_config,
+                ],
+                &mut frame,
+            )
+            .expect("the request frame builds");
+        heapless::Vec::from_slice(&frame[..len]).unwrap()
+    }
+
+    #[cfg(feature = "router")]
+    fn sleepy_end_device_capability() -> CapabilityInfo {
+        CapabilityInfo {
+            device_type_ffd: false,
+            mains_powered: false,
+            rx_on_when_idle: false,
+            security_capable: true,
+            allocate_address: true,
+        }
+    }
+
+    /// A router parent that already holds `ORIGIN_IEEE` at `ORIGIN` as a
+    /// secured, authenticated sleepy end-device child.
+    #[cfg(feature = "router")]
+    fn parent_with_sleepy_child() -> NwkLayer<MockMac> {
+        let mut parent = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        parent.nib.permit_joining = true;
+        let assigned = parent
+            .handle_child_rejoin(
+                ORIGIN,
+                ORIGIN_IEEE,
+                sleepy_end_device_capability().to_byte(),
+                true,
+            )
+            .expect("the child is admitted");
+        assert_eq!(assigned, ORIGIN, "the requested address is free");
+        parent
+    }
+
+    /// Decrypt a recorded secured NWK command back to its plaintext body.
+    #[cfg(feature = "router")]
+    fn decrypted_command_body(frame: &[u8]) -> heapless::Vec<u8, MAX_NWK_FRAME> {
+        decrypt_recorded(frame).2
+    }
+
+    #[cfg(feature = "router")]
+    fn assert_ed_request_refused(parent: &mut NwkLayer<MockMac>, frame: &[u8]) {
+        assert!(
+            block_on(parent.process_incoming_nwk_frame_from(frame, 42, Some(ORIGIN))).is_none()
+        );
+        assert_eq!(parent.take_command_outcome(), None);
+        assert!(
+            parent.mac.tx_history().is_empty(),
+            "a refused request must never draw a response"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn ed_timeout_request_from_an_authenticated_child_is_accepted_and_answered_indirectly() {
+        let mut parent = parent_with_sleepy_child();
+        let request = ed_timeout_request_on_air(OUR_ADDR, true, ORIGIN_IEEE, ORIGIN_IEEE, 14, 0);
+
+        assert!(
+            block_on(parent.process_incoming_nwk_frame_from(&request, 42, Some(ORIGIN))).is_none()
+        );
+        assert_eq!(
+            parent.take_command_outcome(),
+            Some(NwkCommandOutcome::EndDeviceTimeoutRequest {
+                src: ORIGIN,
+                ieee: ORIGIN_IEEE,
+                requested_timeout: 14,
+            })
+        );
+
+        block_on(parent.respond_to_end_device_timeout_request(ORIGIN, ORIGIN_IEEE, 14))
+            .expect("the response is queued");
+
+        // The accepted timeout is recorded and the deadline re-armed to it.
+        let entry = parent.neighbor_table().find_by_short(ORIGIN).unwrap();
+        assert_eq!(entry.end_device_timeout, 14);
+        assert_eq!(
+            entry.keepalive_remaining_secs,
+            crate::frames::ed_timeout_enum_to_seconds(14).unwrap()
+        );
+
+        // A sleepy child receives the response indirectly on its next poll,
+        // through the parent queue with Frame Pending armed.
+        assert!(parent.indirect_queue().has_pending(ORIGIN));
+        assert_eq!(
+            parent.mac.indirect_pending_history().last(),
+            Some(&(MacAddress::Short(PAN, ORIGIN), true))
+        );
+        parent.mac.clear_tx_history();
+        let outcome = block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN)))
+            .expect("the poll delivers the response");
+        assert!(matches!(outcome, crate::ChildPollOutcome::Delivered { .. }));
+
+        let record = &parent.mac.tx_history()[0];
+        assert!(record.indirect, "a sleepy child response is indirect");
+        assert_eq!(
+            decrypted_command_body(record.payload.as_slice()).as_slice(),
+            &[
+                NwkCommandId::EdTimeoutResponse as u8,
+                crate::frames::ED_TIMEOUT_STATUS_SUCCESS,
+                crate::frames::PARENT_INFO_MASK,
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn ed_timeout_request_rejects_reserved_byte_and_undefined_enum() {
+        // A fresh parent per frame keeps each request at frame counter zero
+        // without tripping the replay filter.
+        let mut reserved = parent_with_sleepy_child();
+        assert_ed_request_refused(
+            &mut reserved,
+            &ed_timeout_request_on_air(OUR_ADDR, true, ORIGIN_IEEE, ORIGIN_IEEE, 8, 0x01),
+        );
+
+        let mut undefined = parent_with_sleepy_child();
+        assert_ed_request_refused(
+            &mut undefined,
+            &ed_timeout_request_on_air(OUR_ADDR, true, ORIGIN_IEEE, ORIGIN_IEEE, 15, 0x00),
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn ed_timeout_request_rejects_a_spoofed_source_identity() {
+        // The auxiliary-header (authenticated) IEEE is the child's, but the
+        // NWK header claims a different one.
+        let mut parent = parent_with_sleepy_child();
+        assert_ed_request_refused(
+            &mut parent,
+            &ed_timeout_request_on_air(OUR_ADDR, true, DEST_IEEE, ORIGIN_IEEE, 8, 0x00),
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn ed_timeout_request_from_an_unknown_device_is_ignored() {
+        let mut parent = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        assert_ed_request_refused(
+            &mut parent,
+            &ed_timeout_request_on_air(OUR_ADDR, true, ORIGIN_IEEE, ORIGIN_IEEE, 8, 0x00),
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn ed_timeout_request_from_a_non_child_network_member_is_ignored() {
+        // ORIGIN is a known, authenticated network member — but a sibling, not
+        // a child of this parent. It must not be able to rewrite child state.
+        let mut parent = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        parent.update_neighbor_address(ORIGIN, ORIGIN_IEEE);
+        assert_ed_request_refused(
+            &mut parent,
+            &ed_timeout_request_on_air(OUR_ADDR, true, ORIGIN_IEEE, ORIGIN_IEEE, 8, 0x00),
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_unsupported_enum_is_refused_and_an_rx_on_child_is_answered_directly() {
+        // rx-on end-device child at ORIGIN.
+        let mut parent = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        parent.nib.permit_joining = true;
+        let capability = CapabilityInfo {
+            device_type_ffd: false,
+            mains_powered: true,
+            rx_on_when_idle: true,
+            security_capable: true,
+            allocate_address: true,
+        };
+        let assigned = parent
+            .handle_child_rejoin(ORIGIN, ORIGIN_IEEE, capability.to_byte(), true)
+            .expect("the child is admitted");
+        assert_eq!(assigned, ORIGIN);
+
+        // A value outside 0..=14 exercises the deterministic INCORRECT_VALUE
+        // fallback to the default enumeration.
+        block_on(parent.respond_to_end_device_timeout_request(ORIGIN, ORIGIN_IEEE, 15))
+            .expect("the refusal is transmitted");
+
+        let entry = parent.neighbor_table().find_by_short(ORIGIN).unwrap();
+        assert_eq!(
+            entry.end_device_timeout,
+            crate::frames::ED_TIMEOUT_ENUM_DEFAULT
+        );
+
+        // rx-on child → a direct response, nothing queued indirectly.
+        assert!(!parent.indirect_queue().has_pending(ORIGIN));
+        let record = &parent.mac.tx_history()[0];
+        assert!(!record.indirect, "an rx-on child response is direct");
+        assert_eq!(
+            decrypted_command_body(record.payload.as_slice()).as_slice(),
+            &[
+                NwkCommandId::EdTimeoutResponse as u8,
+                crate::frames::ED_TIMEOUT_STATUS_INCORRECT_VALUE,
+                crate::frames::PARENT_INFO_MASK,
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn respond_to_ed_timeout_request_rejects_an_evicted_child() {
+        // If the child is gone by the async response step, no frame is sent.
+        let mut parent = parent_with_sleepy_child();
+        parent.remove_neighbor(ORIGIN);
+        assert_eq!(
+            block_on(parent.respond_to_end_device_timeout_request(ORIGIN, ORIGIN_IEEE, 8)),
+            Err(NwkStatus::UnknownDevice)
+        );
+        assert!(parent.mac.tx_history().is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_mac_poll_refreshes_an_end_device_child_deadline() {
+        let mut parent = parent_with_sleepy_child();
+        let window =
+            crate::frames::ed_timeout_enum_to_seconds(crate::frames::ED_TIMEOUT_ENUM_DEFAULT)
+                .unwrap() as u16;
+        // Age almost to the deadline without evicting.
+        assert!(parent.age_end_device_children(window - 2).is_empty());
+        // A MAC Data Poll is an advertised keepalive and re-arms the deadline.
+        let _ = block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN)));
+        assert_eq!(
+            parent
+                .neighbor_table()
+                .find_by_short(ORIGIN)
+                .unwrap()
+                .keepalive_remaining_secs,
+            crate::frames::ed_timeout_enum_to_seconds(crate::frames::ED_TIMEOUT_ENUM_DEFAULT)
+                .unwrap(),
+            "a MAC Data Poll re-arms the deadline"
+        );
+        // Without the poll this much aging would have evicted the child; it
+        // survives because the poll refreshed it.
+        assert!(parent.age_end_device_children(window - 1).is_empty());
+        assert!(parent.neighbor_table().find_by_short(ORIGIN).is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn end_device_children_age_out_and_are_cleaned_up() {
+        let mut parent = parent_with_sleepy_child();
+        // Queue an indirect frame so eviction has coupled state to clean.
+        parent.enqueue_indirect_for_child(ORIGIN, &[0xAB]).unwrap();
+        assert!(parent.indirect_queue().has_pending(ORIGIN));
+
+        // Age just short of the default deadline: still present.
+        let window =
+            crate::frames::ed_timeout_enum_to_seconds(crate::frames::ED_TIMEOUT_ENUM_DEFAULT)
+                .unwrap() as u16;
+        // (The default enumeration's window fits in u16.)
+        let evicted = parent.age_end_device_children(window - 1);
+        assert!(evicted.is_empty());
+        assert!(parent.neighbor_table().find_by_short(ORIGIN).is_some());
+
+        // One more second past the deadline evicts it and cleans coupled state.
+        let evicted = parent.age_end_device_children(1);
+        assert_eq!(evicted.as_slice(), &[ORIGIN]);
+        assert!(parent.neighbor_table().find_by_short(ORIGIN).is_none());
+        assert!(!parent.indirect_queue().has_pending(ORIGIN));
+        assert_eq!(
+            parent.mac.indirect_pending_history().last(),
+            Some(&(MacAddress::Short(PAN, ORIGIN), false)),
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_end_device_resume_never_ages_children() {
+        // Aging is a parent-only concern; an end device returns nothing.
+        let mut end_device = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+        assert!(end_device.age_end_device_children(u16::MAX).is_empty());
+    }
+
+    // ── R22 child restore + Parent Announce ──────────────────
+
+    const RESTORED_CHILD: ShortAddress = FAR;
+    const RESTORED_CHILD_IEEE: IeeeAddress = [0xC7; 8];
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn restore_child_reinstalls_authenticated_children_unconfirmed() {
+        let mut parent = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        // An end-device child and a router child.
+        assert!(parent.restore_child(ORIGIN_IEEE, ORIGIN, false, true, false, 8));
+        assert!(parent.restore_child(RESTORED_CHILD_IEEE, RESTORED_CHILD, true, true, true, 8));
+
+        let end_device = parent.neighbor_table().find_by_short(ORIGIN).unwrap();
+        assert_eq!(
+            end_device.relationship,
+            crate::neighbor::Relationship::Child
+        );
+        assert!(
+            !end_device.keepalive_confirmed,
+            "a restored child has not been heard from yet"
+        );
+        assert_eq!(
+            end_device.keepalive_remaining_secs,
+            crate::frames::ed_timeout_enum_to_seconds(8).unwrap(),
+            "an end-device child's deadline is re-armed to a full window"
+        );
+        let router_child = parent
+            .neighbor_table()
+            .find_by_short(RESTORED_CHILD)
+            .unwrap();
+        assert_eq!(
+            router_child.keepalive_remaining_secs, 0,
+            "a router child does not use the End Device Timeout deadline"
+        );
+
+        let ieees: heapless::Vec<IeeeAddress, 8> = parent.authenticated_child_ieees();
+        assert_eq!(ieees.len(), 2);
+        assert!(ieees.contains(&ORIGIN_IEEE));
+        assert!(ieees.contains(&RESTORED_CHILD_IEEE));
+
+        // An end device never restores children or announces them.
+        let mut end = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+        assert!(!end.restore_child(ORIGIN_IEEE, ORIGIN, false, true, false, 8));
+        assert!(end.authenticated_child_ieees::<8>().is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn parent_annce_keeps_confirmed_children_and_yields_unconfirmed_ones() {
+        let mut parent = parent_with_sleepy_child(); // ORIGIN is confirmed (live rejoin)
+        assert!(parent.restore_child(RESTORED_CHILD_IEEE, RESTORED_CHILD, false, true, false, 14));
+
+        let outcome = parent.apply_parent_annce(&[ORIGIN_IEEE, RESTORED_CHILD_IEEE]);
+        assert_eq!(
+            outcome.kept.as_slice(),
+            &[ORIGIN_IEEE],
+            "a child we actively parent is defended and reported"
+        );
+        assert_eq!(
+            outcome.dropped.as_slice(),
+            &[RESTORED_CHILD],
+            "an unconfirmed restored child yields to the announcer"
+        );
+        assert!(parent.neighbor_table().find_by_short(ORIGIN).is_some());
+        assert!(
+            parent
+                .neighbor_table()
+                .find_by_short(RESTORED_CHILD)
+                .is_none()
+        );
+
+        // An unrelated IEEE that we do not parent is neither kept nor dropped.
+        let outcome = parent.apply_parent_annce(&[[0x99; 8]]);
+        assert!(outcome.kept.is_empty() && outcome.dropped.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn parent_annce_confirms_a_child_after_a_keepalive() {
+        // A restored (unconfirmed) child that then polls becomes confirmed and
+        // is thereafter defended rather than yielded.
+        let mut parent = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        assert!(parent.restore_child(ORIGIN_IEEE, ORIGIN, false, true, false, 8));
+        let _ = block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN)));
+
+        let outcome = parent.apply_parent_annce(&[ORIGIN_IEEE]);
+        assert_eq!(outcome.kept.as_slice(), &[ORIGIN_IEEE]);
+        assert!(outcome.dropped.is_empty());
+        assert!(parent.neighbor_table().find_by_short(ORIGIN).is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn parent_annce_rsp_relinquishes_moved_children() {
+        let mut parent = parent_with_sleepy_child();
+        let dropped = parent.remove_children_by_ieee(&[ORIGIN_IEEE]);
+        assert_eq!(dropped.as_slice(), &[ORIGIN]);
+        assert!(parent.neighbor_table().find_by_short(ORIGIN).is_none());
+        // An IEEE we do not parent is ignored.
+        assert!(parent.remove_children_by_ieee(&[[0x99; 8]]).is_empty());
     }
 }

@@ -152,6 +152,9 @@ fn test_neighbor_table_add_and_find() {
         permit_joining: true,
         security_capable: true,
         age: 0,
+        end_device_timeout: zigbee_nwk::frames::ED_TIMEOUT_ENUM_DEFAULT,
+        keepalive_remaining_secs: 0,
+        keepalive_confirmed: false,
         extended_pan_id: [0; 8],
         active: true,
     };
@@ -178,6 +181,9 @@ fn test_neighbor_table_aging() {
         permit_joining: false,
         security_capable: false,
         age: 0,
+        end_device_timeout: zigbee_nwk::frames::ED_TIMEOUT_ENUM_DEFAULT,
+        keepalive_remaining_secs: 0,
+        keepalive_confirmed: false,
         extended_pan_id: [0; 8],
         active: true,
     };

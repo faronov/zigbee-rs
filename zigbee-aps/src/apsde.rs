@@ -171,6 +171,209 @@ fn centralized_trust_center(address: IeeeAddress) -> Option<IeeeAddress> {
     nonzero_ieee(address).filter(|address| *address != BROADCAST_IEEE)
 }
 
+/// Attempt one APS CCM* decryption, copying the plaintext into `buf` on
+/// success and returning whether the frame authenticated.
+///
+/// The incoming APS security path tries the same decryption up to four times
+/// (patched vs. raw AAD × derived vs. raw Trust-Center link key). Each attempt
+/// shares an identical tail — clamp the plaintext to the frame buffer, copy it
+/// in and record its length. Folding that tail into one **non-generic**
+/// `#[inline(never)]` helper emits the copy (and its `memcpy`) once instead of
+/// four times, and keeps it out of every `ApsLayer<M>` monomorphisation. The
+/// replay check and the single post-success frame-counter commit stay with the
+/// caller, so the R22 "commit only after MIC success, exactly once" ordering is
+/// untouched.
+#[inline(never)]
+fn decrypt_into(
+    security: &crate::security::ApsSecurity,
+    aad: &[u8],
+    ciphertext: &[u8],
+    key: &crate::security::AesKey,
+    security_header: &crate::security::ApsSecurityHeader,
+    buf: &mut ApsFrameBuffer,
+) -> bool {
+    let Some(plaintext) = security.decrypt(aad, ciphertext, key, security_header) else {
+        return false;
+    };
+    let pt_len = plaintext.len().min(buf.data.len());
+    buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
+    buf.len = pt_len;
+    true
+}
+
+/// Result of the incoming APS security-decryption phase.
+struct ApsDecryptOutcome {
+    /// APS security source IEEE (auxiliary header, or the resolved fallback).
+    aps_security_source: Option<IeeeAddress>,
+    /// APS key identifier that selected the decryption key.
+    aps_key_identifier: Option<u8>,
+}
+
+/// Verify and decrypt a secured incoming APS frame into `decrypted_buf`.
+///
+/// This is the synchronous, `MacDriver`-independent APS security phase, lifted
+/// out of [`ApsLayer::process_incoming_aps_frame`] so its auxiliary-header
+/// parse, 64-byte AAD-patch buffer, key derivation and four decrypt attempts
+/// are emitted once as a **non-generic** `#[inline(never)]` function. Keeping
+/// that scratch and control flow out of the generic receive method shrinks the
+/// caller's stack frame (the dominant cost of the `tloadr [pc]`-heavy TC32
+/// codegen) and avoids re-monomorphising the whole block per `ApsLayer<M>`.
+///
+/// The two `NwkLayer<M>`-derived inputs (`nwk_src_ieee`, `nwk_has_active_key`)
+/// are resolved by the caller so this helper never touches the generic NWK
+/// layer. R22 replay ordering is preserved verbatim: the frame counter is
+/// checked before any decryption and committed exactly once, only after a MIC
+/// succeeds. Returns `None` to drop the frame.
+#[inline(never)]
+fn aps_decrypt_incoming(
+    security: &mut crate::security::ApsSecurity,
+    nwk_src_ieee: Option<IeeeAddress>,
+    nwk_has_active_key: bool,
+    tc_address: IeeeAddress,
+    nwk_payload: &[u8],
+    consumed: usize,
+    decrypted_buf: &mut ApsFrameBuffer,
+) -> Option<ApsDecryptOutcome> {
+    let after_header = &nwk_payload[consumed..];
+    aps_diag!("[APS] secured payload has {} bytes", after_header.len());
+    #[allow(clippy::question_mark)]
+    let Some((mut sec_hdr, sec_consumed)) = crate::security::ApsSecurityHeader::parse(after_header)
+    else {
+        aps_diag!(
+            "[APS] security header parse failed for {} bytes",
+            after_header.len()
+        );
+        return None;
+    };
+    if sec_hdr.source_address.is_none() {
+        sec_hdr.source_address = nwk_src_ieee.or_else(|| nonzero_ieee(tc_address));
+    }
+    let aps_security_source = sec_hdr.source_address;
+    aps_diag!(
+        "[APS] sec: ctrl={:02X} fc={} sc={} ct={}",
+        sec_hdr.security_control,
+        sec_hdr.frame_counter,
+        sec_consumed,
+        after_header.len() - sec_consumed
+    );
+    let ciphertext = &after_header[sec_consumed..];
+    let aad_end = consumed + sec_consumed;
+    // AAD must use the ACTUAL security level (5 = ENC-MIC-32), not the OTA value (0).
+    // The sender computes CCM* with actual level, then zeroes it for transmission.
+    // Copy AAD and patch the security control byte with actual level.
+    let mut aad_buf_patched = [0u8; 64];
+    let aad_len = aad_end.min(aad_buf_patched.len());
+    aad_buf_patched[..aad_len].copy_from_slice(&nwk_payload[..aad_len]);
+    // The security control byte is at offset `consumed` (first byte of aux header)
+    aad_buf_patched[consumed] =
+        (aad_buf_patched[consumed] & !0x07) | crate::security::SEC_LEVEL_ENC_MIC_32;
+    let aad = &aad_buf_patched[..aad_len];
+
+    let key_id = crate::security::ApsSecurityHeader::key_identifier(sec_hdr.security_control);
+    let aps_key_identifier = Some(key_id);
+    aps_diag!(
+        "[APS] key_id={} aad_len={} ct_len={} src_ieee={}",
+        key_id,
+        aad_len,
+        ciphertext.len(),
+        sec_hdr.source_address.is_some() as u8,
+    );
+
+    let installed_link_key = sec_hdr
+        .source_address
+        .as_ref()
+        .and_then(|address| security.find_any_key(address))
+        .map(|entry| entry.key);
+    let uses_default_link_key = installed_link_key.is_none();
+    let base_link_key = installed_link_key.unwrap_or(*security.default_tc_link_key());
+    let key = if key_id == crate::security::KEY_ID_DATA_KEY {
+        base_link_key
+    } else if key_id == crate::security::KEY_ID_KEY_TRANSPORT {
+        crate::security::derive_key_transport_key(&base_link_key)
+    } else if key_id == crate::security::KEY_ID_KEY_LOAD {
+        crate::security::derive_key_load_key(&base_link_key)
+    } else {
+        log::warn!("[APS] Unsupported key_id={} in APS security", key_id);
+        return None;
+    };
+
+    let replay_key_type = crate::security::ApsKeyType::TrustCenterLinkKey;
+    if let Some(addr) = &sec_hdr.source_address
+        && !security.check_frame_counter(addr, replay_key_type, sec_hdr.frame_counter)
+    {
+        log::warn!(
+            "[APS] Replay detected: frame counter {} from src",
+            sec_hdr.frame_counter
+        );
+        return None;
+    }
+
+    // Try decrypt with patched AAD (standard: OTA level→5).
+    // If that fails AND this is a key-transport frame, try fallback approaches:
+    //   1. AAD with original OTA security level (some coordinators don't strip)
+    //   2. Raw TC link key instead of derived key-transport key
+    let mut decrypt_ok = false;
+    if decrypt_into(security, aad, ciphertext, &key, &sec_hdr, decrypted_buf) {
+        aps_diag!("[APS] decrypt succeeded with patched AAD");
+        decrypt_ok = true;
+    }
+
+    // Fallback: try with un-patched AAD (original OTA security level)
+    if !decrypt_ok {
+        let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
+        if decrypt_into(security, aad_raw, ciphertext, &key, &sec_hdr, decrypted_buf) {
+            aps_diag!("[APS] decrypt succeeded with raw AAD");
+            decrypt_ok = true;
+        }
+    }
+
+    // Fallback for key-transport: try raw TC link key (some impls don't derive)
+    if !decrypt_ok
+        && key_id == crate::security::KEY_ID_KEY_TRANSPORT
+        && uses_default_link_key
+        && !nwk_has_active_key
+    {
+        let tc_key = *security.default_tc_link_key();
+        if decrypt_into(security, aad, ciphertext, &tc_key, &sec_hdr, decrypted_buf) {
+            aps_diag!("[APS] key-transport decrypt succeeded with raw TC key");
+            decrypt_ok = true;
+        }
+        // Try with un-patched AAD
+        if !decrypt_ok {
+            let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
+            if decrypt_into(
+                security,
+                aad_raw,
+                ciphertext,
+                &tc_key,
+                &sec_hdr,
+                decrypted_buf,
+            ) {
+                aps_diag!("[APS] key-transport decrypt succeeded with raw TC key and raw AAD");
+                decrypt_ok = true;
+            }
+        }
+    }
+
+    if decrypt_ok {
+        if let Some(addr) = &sec_hdr.source_address {
+            security.commit_frame_counter(addr, replay_key_type, sec_hdr.frame_counter);
+        }
+    } else {
+        aps_diag!(
+            "[APS] decrypt ALL FAILED key_id={} ct_len={}",
+            key_id,
+            ciphertext.len()
+        );
+        return None;
+    }
+
+    Some(ApsDecryptOutcome {
+        aps_security_source,
+        aps_key_identifier,
+    })
+}
+
 // ── APSDE-DATA.request ──────────────────────────────────────────
 
 /// Parameters for APSDE-DATA.request (Zigbee spec Table 2-2).
@@ -807,166 +1010,28 @@ impl<M: MacDriver> ApsLayer<M> {
         let mut aps_security_source = None;
         let mut aps_key_identifier = None;
 
-        // Phase 1: APS security decryption
+        // Phase 1: APS security decryption.
+        //
+        // The decrypt, replay check and key derivation are `MacDriver`-
+        // independent, so they run in the non-generic `aps_decrypt_incoming`
+        // helper (see its doc comment). The two `NwkLayer<M>`-derived inputs are
+        // resolved here and handed in by value so the helper never sees `M`.
         if aps_secured {
-            aps_diag!("[APS] secured payload has {} bytes", after_header.len());
-            #[allow(clippy::question_mark)]
-            let Some((mut sec_hdr, sec_consumed)) =
-                crate::security::ApsSecurityHeader::parse(after_header)
-            else {
-                aps_diag!(
-                    "[APS] security header parse failed for {} bytes",
-                    after_header.len()
-                );
-                return None;
-            };
-            if sec_hdr.source_address.is_none() {
-                sec_hdr.source_address = self
-                    .nwk
-                    .find_ieee_by_short(nwk_src)
-                    .or_else(|| nonzero_ieee(self.aib.aps_trust_center_address));
-            }
-            aps_security_source = sec_hdr.source_address;
-            aps_diag!(
-                "[APS] sec: ctrl={:02X} fc={} sc={} ct={}",
-                sec_hdr.security_control,
-                sec_hdr.frame_counter,
-                sec_consumed,
-                after_header.len() - sec_consumed
-            );
-            let ciphertext = &after_header[sec_consumed..];
-            let aad_end = consumed + sec_consumed;
-            // AAD must use the ACTUAL security level (5 = ENC-MIC-32), not the OTA value (0).
-            // The sender computes CCM* with actual level, then zeroes it for transmission.
-            // Copy AAD and patch the security control byte with actual level.
-            let mut aad_buf_patched = [0u8; 64];
-            let aad_len = aad_end.min(aad_buf_patched.len());
-            aad_buf_patched[..aad_len].copy_from_slice(&nwk_payload[..aad_len]);
-            // The security control byte is at offset `consumed` (first byte of aux header)
-            aad_buf_patched[consumed] =
-                (aad_buf_patched[consumed] & !0x07) | crate::security::SEC_LEVEL_ENC_MIC_32;
-            let aad = &aad_buf_patched[..aad_len];
-
-            let key_id =
-                crate::security::ApsSecurityHeader::key_identifier(sec_hdr.security_control);
-            aps_key_identifier = Some(key_id);
-            aps_diag!(
-                "[APS] key_id={} aad_len={} ct_len={} src_ieee={}",
-                key_id,
-                aad_len,
-                ciphertext.len(),
-                sec_hdr.source_address.is_some() as u8,
-            );
-
-            let installed_link_key = sec_hdr
-                .source_address
-                .as_ref()
-                .and_then(|address| self.security.find_any_key(address))
-                .map(|entry| entry.key);
-            let uses_default_link_key = installed_link_key.is_none();
-            let base_link_key = installed_link_key.unwrap_or(*self.security.default_tc_link_key());
-            let key = if key_id == crate::security::KEY_ID_DATA_KEY {
-                base_link_key
-            } else if key_id == crate::security::KEY_ID_KEY_TRANSPORT {
-                crate::security::derive_key_transport_key(&base_link_key)
-            } else if key_id == crate::security::KEY_ID_KEY_LOAD {
-                crate::security::derive_key_load_key(&base_link_key)
-            } else {
-                log::warn!("[APS] Unsupported key_id={} in APS security", key_id);
-                return None;
-            };
-
-            let replay_key_type = crate::security::ApsKeyType::TrustCenterLinkKey;
-            if let Some(addr) = &sec_hdr.source_address
-                && !self
-                    .security
-                    .check_frame_counter(addr, replay_key_type, sec_hdr.frame_counter)
-            {
-                log::warn!(
-                    "[APS] Replay detected: frame counter {} from src",
-                    sec_hdr.frame_counter
-                );
-                return None;
-            }
-
-            // Try decrypt with patched AAD (standard: OTA level→5).
-            // If that fails AND this is a key-transport frame, try fallback approaches:
-            //   1. AAD with original OTA security level (some coordinators don't strip)
-            //   2. Raw TC link key instead of derived key-transport key
-            let mut decrypt_ok = false;
-            if let Some(plaintext) = self.security.decrypt(aad, ciphertext, &key, &sec_hdr) {
-                aps_diag!("[APS] decrypt succeeded with patched AAD");
-                let pt_len = plaintext.len().min(decrypted_buf.data.len());
-                decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
-                decrypted_buf.len = pt_len;
-                used_decrypted_buf = true;
-                decrypt_ok = true;
-            }
-
-            // Fallback: try with un-patched AAD (original OTA security level)
-            if !decrypt_ok {
-                let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
-                if let Some(plaintext) = self.security.decrypt(aad_raw, ciphertext, &key, &sec_hdr)
-                {
-                    aps_diag!("[APS] decrypt succeeded with raw AAD");
-                    let pt_len = plaintext.len().min(decrypted_buf.data.len());
-                    decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
-                    decrypted_buf.len = pt_len;
-                    used_decrypted_buf = true;
-                    decrypt_ok = true;
-                }
-            }
-
-            // Fallback for key-transport: try raw TC link key (some impls don't derive)
-            if !decrypt_ok
-                && key_id == crate::security::KEY_ID_KEY_TRANSPORT
-                && uses_default_link_key
-                && self.nwk.security().active_key().is_none()
-            {
-                let tc_key = *self.security.default_tc_link_key();
-                if let Some(plaintext) = self.security.decrypt(aad, ciphertext, &tc_key, &sec_hdr) {
-                    aps_diag!("[APS] key-transport decrypt succeeded with raw TC key");
-                    let pt_len = plaintext.len().min(decrypted_buf.data.len());
-                    decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
-                    decrypted_buf.len = pt_len;
-                    used_decrypted_buf = true;
-                    decrypt_ok = true;
-                }
-                // Try with un-patched AAD
-                if !decrypt_ok {
-                    let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
-                    if let Some(plaintext) = self
-                        .security
-                        .decrypt(aad_raw, ciphertext, &tc_key, &sec_hdr)
-                    {
-                        aps_diag!(
-                            "[APS] key-transport decrypt succeeded with raw TC key and raw AAD"
-                        );
-                        let pt_len = plaintext.len().min(decrypted_buf.data.len());
-                        decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
-                        decrypted_buf.len = pt_len;
-                        used_decrypted_buf = true;
-                        decrypt_ok = true;
-                    }
-                }
-            }
-
-            if decrypt_ok {
-                if let Some(addr) = &sec_hdr.source_address {
-                    self.security.commit_frame_counter(
-                        addr,
-                        replay_key_type,
-                        sec_hdr.frame_counter,
-                    );
-                }
-            } else {
-                aps_diag!(
-                    "[APS] decrypt ALL FAILED key_id={} ct_len={}",
-                    key_id,
-                    ciphertext.len()
-                );
-                return None;
-            }
+            let nwk_src_ieee = self.nwk.find_ieee_by_short(nwk_src);
+            let nwk_has_active_key = self.nwk.security().active_key().is_some();
+            let tc_address = self.aib.aps_trust_center_address;
+            let outcome = aps_decrypt_incoming(
+                &mut self.security,
+                nwk_src_ieee,
+                nwk_has_active_key,
+                tc_address,
+                nwk_payload,
+                consumed,
+                decrypted_buf,
+            )?;
+            used_decrypted_buf = true;
+            aps_security_source = outcome.aps_security_source;
+            aps_key_identifier = outcome.aps_key_identifier;
         }
 
         // Phase 2: Frame type dispatch
@@ -2970,5 +3035,132 @@ mod tests {
         );
         assert_eq!(aps.nwk().security().active_key().unwrap().seq_number, 1);
         assert_eq!(aps.nwk().nib().active_key_seq_number, 1);
+    }
+
+    /// End-to-end cover for the extracted `aps_decrypt_incoming` /
+    /// `decrypt_into` phase: a real CCM*-secured APS command must decrypt and
+    /// be acted on exactly once, and its frame counter must be committed only
+    /// after the MIC verifies so an identical replay is refused before any
+    /// second decryption. This pins the R22 "replay-check before decrypt,
+    /// commit once after MIC" ordering that the phase extraction must preserve.
+    #[test]
+    #[cfg(feature = "router")]
+    fn secured_aps_command_decrypts_once_then_rejects_the_replay() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        aps.aib_mut().aps_trust_center_address = TC_IEEE;
+        let link_key = [0x7A; 16];
+        aps.security_mut()
+            .add_key(crate::security::ApsLinkKeyEntry {
+                partner_address: TC_IEEE,
+                key: link_key,
+                key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+                outgoing_frame_counter: 0,
+                outgoing_frame_counter_limit: 0x1000,
+                incoming_frame_counter: 0,
+                incoming_frame_counter_valid: false,
+            })
+            .unwrap();
+
+        // The Trust Center encrypts a Confirm-Key command (status SUCCESS,
+        // TC-link key type, addressed to us) with the shared link key.
+        let tc_security = crate::security::ApsSecurity::new();
+        let mut confirm_key = [0u8; 11];
+        confirm_key[0] = crate::frames::ApsCommandId::ConfirmKey as u8;
+        confirm_key[1] = 0x00;
+        confirm_key[2] = WIRE_KEY_TYPE_TC_LINK;
+        confirm_key[3..11].copy_from_slice(&LOCAL_IEEE);
+        let mut frame = [0u8; 64];
+        let len = build_tc_secured_command_frame(
+            &tc_security,
+            &link_key,
+            &TC_IEEE,
+            0x11,
+            0x0000_0100,
+            crate::security::KEY_ID_DATA_KEY,
+            false,
+            &confirm_key,
+            &mut frame,
+        )
+        .unwrap();
+        let nwk_security = IncomingNwkSecurity::new(true, Some(TC_IEEE));
+
+        // First delivery decrypts, dispatches Confirm-Key and commits 0x100.
+        let mut buf = ApsFrameBuffer::new();
+        assert!(
+            aps.process_incoming_aps_frame(
+                &frame[..len],
+                ShortAddress::COORDINATOR,
+                LOCAL_SHORT,
+                180,
+                nwk_security,
+                &mut buf,
+            )
+            .is_none()
+        );
+        assert_eq!(aps.security_handshake_stats().confirm_key_received, 1);
+        assert_eq!(aps.security_handshake_stats().confirm_key_successes, 1);
+        let entry = aps
+            .security()
+            .find_key(&TC_IEEE, crate::security::ApsKeyType::TrustCenterLinkKey)
+            .unwrap();
+        assert!(entry.incoming_frame_counter_valid);
+        assert_eq!(entry.incoming_frame_counter, 0x0000_0100);
+
+        // The identical frame replays counter 0x100: the pre-decrypt replay
+        // check drops it, so Confirm-Key is not processed a second time and the
+        // committed counter is untouched.
+        let mut replay_buf = ApsFrameBuffer::new();
+        assert!(
+            aps.process_incoming_aps_frame(
+                &frame[..len],
+                ShortAddress::COORDINATOR,
+                LOCAL_SHORT,
+                180,
+                nwk_security,
+                &mut replay_buf,
+            )
+            .is_none()
+        );
+        assert_eq!(aps.security_handshake_stats().confirm_key_received, 1);
+        let after = aps
+            .security()
+            .find_key(&TC_IEEE, crate::security::ApsKeyType::TrustCenterLinkKey)
+            .unwrap();
+        assert_eq!(after.incoming_frame_counter, 0x0000_0100);
+
+        // A forged frame at a higher counter but with a corrupted MIC must fail
+        // the MIC and must NOT advance the committed counter.
+        let mut forged = [0u8; 64];
+        let forged_len = build_tc_secured_command_frame(
+            &tc_security,
+            &link_key,
+            &TC_IEEE,
+            0x12,
+            0x0000_0200,
+            crate::security::KEY_ID_DATA_KEY,
+            false,
+            &confirm_key,
+            &mut forged,
+        )
+        .unwrap();
+        forged[forged_len - 1] ^= 0xFF;
+        let mut forged_buf = ApsFrameBuffer::new();
+        assert!(
+            aps.process_incoming_aps_frame(
+                &forged[..forged_len],
+                ShortAddress::COORDINATOR,
+                LOCAL_SHORT,
+                180,
+                nwk_security,
+                &mut forged_buf,
+            )
+            .is_none()
+        );
+        assert_eq!(aps.security_handshake_stats().confirm_key_received, 1);
+        let unchanged = aps
+            .security()
+            .find_key(&TC_IEEE, crate::security::ApsKeyType::TrustCenterLinkKey)
+            .unwrap();
+        assert_eq!(unchanged.incoming_frame_counter, 0x0000_0100);
     }
 }

@@ -3,6 +3,9 @@
 //! This crate provides a `#![no_std]` ZCL layer with frame parsing, foundation
 //! commands, data types, attribute storage, reporting, and standard cluster
 //! implementations. All collections use `heapless` — no heap allocation.
+//! `float32` and `float64` support is enabled by default; integer-only products
+//! may disable either capability, in which case incoming values of that type
+//! are rejected with `InvalidDataType`.
 
 #![no_std]
 

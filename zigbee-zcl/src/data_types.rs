@@ -136,6 +136,31 @@ pub fn data_type_size(dt: ZclDataType) -> Option<usize> {
     }
 }
 
+/// Whether support for this data type is enabled in the current build.
+#[cfg(all(feature = "float32", feature = "float64"))]
+pub const fn is_data_type_enabled(dt: ZclDataType) -> bool {
+    let _ = dt;
+    true
+}
+
+/// Whether support for this data type is enabled in the current build.
+#[cfg(all(feature = "float32", not(feature = "float64")))]
+pub const fn is_data_type_enabled(dt: ZclDataType) -> bool {
+    !matches!(dt, ZclDataType::Float64)
+}
+
+/// Whether support for this data type is enabled in the current build.
+#[cfg(all(not(feature = "float32"), feature = "float64"))]
+pub const fn is_data_type_enabled(dt: ZclDataType) -> bool {
+    !matches!(dt, ZclDataType::Float32)
+}
+
+/// Whether support for this data type is enabled in the current build.
+#[cfg(all(not(feature = "float32"), not(feature = "float64")))]
+pub const fn is_data_type_enabled(dt: ZclDataType) -> bool {
+    !matches!(dt, ZclDataType::Float32 | ZclDataType::Float64)
+}
+
 /// Maximum size (bytes) of an inline string/octet-string value.
 pub const MAX_STRING_LEN: usize = 32;
 
@@ -284,6 +309,10 @@ impl ZclValue {
     /// Deserialize a ZCL value of a known type from a buffer.
     /// Returns `(value, bytes_consumed)`.
     pub fn deserialize(dt: ZclDataType, data: &[u8]) -> Option<(Self, usize)> {
+        if !is_data_type_enabled(dt) {
+            return None;
+        }
+
         match dt {
             ZclDataType::NoData => Some((Self::NoData, 0)),
             ZclDataType::Bool => {
@@ -382,6 +411,7 @@ impl ZclValue {
                 ]);
                 Some((Self::I64(v), 8))
             }
+            #[cfg(feature = "float32")]
             ZclDataType::Float32 => {
                 if data.len() < 4 {
                     return None;
@@ -389,6 +419,9 @@ impl ZclValue {
                 let v = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                 Some((Self::Float32(v), 4))
             }
+            #[cfg(not(feature = "float32"))]
+            ZclDataType::Float32 => None,
+            #[cfg(feature = "float64")]
             ZclDataType::Float64 => {
                 if data.len() < 8 {
                     return None;
@@ -398,6 +431,8 @@ impl ZclValue {
                 ]);
                 Some((Self::Float64(v), 8))
             }
+            #[cfg(not(feature = "float64"))]
+            ZclDataType::Float64 => None,
             ZclDataType::UtcTime => {
                 if data.len() < 4 {
                     return None;
@@ -470,18 +505,29 @@ impl ZclValue {
             (ZclValue::I32(a), ZclValue::I32(b), ZclValue::I32(t)) => {
                 ((*a as i64) - (*b as i64)).unsigned_abs() >= *t as u64
             }
+            #[cfg(feature = "float32")]
             (ZclValue::Float32(a), ZclValue::Float32(b), ZclValue::Float32(t)) => {
                 float32_exceeds_threshold(*a, *b, *t)
             }
+            #[cfg(not(feature = "float32"))]
+            (ZclValue::Float32(a), ZclValue::Float32(b), _) => a.to_bits() != b.to_bits(),
+            #[cfg(not(feature = "float32"))]
+            (ZclValue::Float32(_), _, _) | (_, ZclValue::Float32(_), _) => true,
+            #[cfg(feature = "float64")]
             (ZclValue::Float64(a), ZclValue::Float64(b), ZclValue::Float64(t)) => {
                 float64_exceeds_threshold(*a, *b, *t)
             }
+            #[cfg(not(feature = "float64"))]
+            (ZclValue::Float64(a), ZclValue::Float64(b), _) => a.to_bits() != b.to_bits(),
+            #[cfg(not(feature = "float64"))]
+            (ZclValue::Float64(_), _, _) | (_, ZclValue::Float64(_), _) => true,
             // For non-numeric or mismatched types, any difference triggers
             _ => self != other,
         }
     }
 }
 
+#[cfg(feature = "float32")]
 fn float32_exceeds_threshold(current: f32, previous: f32, threshold: f32) -> bool {
     if !current.is_finite() || !previous.is_finite() {
         return if current.is_nan() && previous.is_nan() {
@@ -499,6 +545,7 @@ fn float32_exceeds_threshold(current: f32, previous: f32, threshold: f32) -> boo
     difference >= threshold || threshold - difference <= rounding_tolerance
 }
 
+#[cfg(feature = "float64")]
 fn float64_exceeds_threshold(current: f64, previous: f64, threshold: f64) -> bool {
     if !current.is_finite() || !previous.is_finite() {
         return if current.is_nan() && previous.is_nan() {
@@ -559,7 +606,10 @@ pub fn is_discrete_type(dt: ZclDataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::ZclValue;
+    #[cfg(any(not(feature = "float32"), not(feature = "float64")))]
+    use super::{ZclDataType, is_data_type_enabled};
 
+    #[cfg(feature = "float32")]
     #[test]
     fn float32_thresholds_compare_finite_absolute_difference() {
         let previous = ZclValue::Float32(1_000.0);
@@ -585,6 +635,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "float64")]
     #[test]
     fn float64_thresholds_compare_finite_absolute_difference() {
         let previous = ZclValue::Float64(-2.0);
@@ -592,6 +643,7 @@ mod tests {
         assert!(ZclValue::Float64(3.0).exceeds_threshold(&previous, &ZclValue::Float64(5.0)));
     }
 
+    #[cfg(all(feature = "float32", feature = "float64"))]
     #[test]
     fn non_finite_float_values_do_not_repeat_without_a_transition() {
         assert!(
@@ -612,6 +664,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "float32", feature = "float64"))]
     #[test]
     fn mismatched_float_types_keep_change_detection_semantics() {
         assert!(
@@ -625,6 +678,28 @@ mod tests {
         assert!(
             ZclValue::Float32(2.0)
                 .exceeds_threshold(&ZclValue::Float32(1.0), &ZclValue::Float64(1.0),)
+        );
+    }
+
+    #[cfg(not(feature = "float32"))]
+    #[test]
+    fn disabled_float32_rejects_wire_values_without_losing_public_variant() {
+        assert!(!is_data_type_enabled(ZclDataType::Float32));
+        assert!(ZclValue::deserialize(ZclDataType::Float32, &[0, 0, 0, 0]).is_none());
+        assert!(
+            ZclValue::Float32(2.0)
+                .exceeds_threshold(&ZclValue::Float32(1.0), &ZclValue::Float32(0.5))
+        );
+    }
+
+    #[cfg(not(feature = "float64"))]
+    #[test]
+    fn disabled_float64_rejects_wire_values_without_losing_public_variant() {
+        assert!(!is_data_type_enabled(ZclDataType::Float64));
+        assert!(ZclValue::deserialize(ZclDataType::Float64, &[0; 8]).is_none());
+        assert!(
+            !ZclValue::Float64(1.0)
+                .exceeds_threshold(&ZclValue::Float64(1.0), &ZclValue::Float64(0.5))
         );
     }
 }

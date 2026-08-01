@@ -79,6 +79,20 @@ impl From<&PanDescriptor> for NetworkDescriptor {
     }
 }
 
+/// Sort the bounded network-discovery list with a compact stable insertion sort.
+pub fn sort_network_descriptors_by(
+    networks: &mut [NetworkDescriptor],
+    mut precedes: impl FnMut(&NetworkDescriptor, &NetworkDescriptor) -> bool,
+) {
+    for index in 1..networks.len() {
+        let mut current = index;
+        while current > 0 && precedes(&networks[current], &networks[current - 1]) {
+            networks.swap(current - 1, current);
+            current -= 1;
+        }
+    }
+}
+
 /// Join method
 #[derive(Debug, Clone, Copy)]
 pub enum JoinMethod {
@@ -182,7 +196,9 @@ impl<M: MacDriver> NwkLayer<M> {
             return Err(NwkStatus::NoNetworks);
         }
 
-        networks.sort_unstable_by_key(|n| core::cmp::Reverse(n.lqi));
+        sort_network_descriptors_by(&mut networks, |candidate, current| {
+            candidate.lqi > current.lqi
+        });
 
         Ok(networks)
     }
@@ -386,6 +402,10 @@ impl<M: MacDriver> NwkLayer<M> {
         self.nib.update_id = network.update_id;
         self.nib.stack_profile = network.stack_profile;
         self.nib.parent_address = join_target;
+        // Authoritative parent assignment: the R22 End Device Timeout has to
+        // be renegotiated with this parent before any of its keepalive
+        // advertisements may be trusted again.
+        self.nib.reset_end_device_timeout_negotiation();
 
         // Set macCoordShortAddress so MAC layer knows the parent for mlme_poll
         let _ = self
@@ -459,6 +479,9 @@ impl<M: MacDriver> NwkLayer<M> {
             depth: network.depth,
             permit_joining: network.permit_joining,
             age: 0,
+            end_device_timeout: crate::frames::ED_TIMEOUT_ENUM_DEFAULT,
+            keepalive_remaining_secs: 0,
+            keepalive_confirmed: false,
             extended_pan_id: network.extended_pan_id,
             active: true,
         };
@@ -822,6 +845,9 @@ impl<M: MacDriver> NwkLayer<M> {
                     self.nib.network_address = ShortAddress(new_addr);
                     // Refresh parent address to the sender of the rejoin response
                     self.nib.parent_address = hdr.src_addr;
+                    // Authoritative parent assignment — renegotiate the R22
+                    // End Device Timeout with the parent that accepted us.
+                    self.nib.reset_end_device_timeout_negotiation();
                     self.nib.extended_pan_id = network.extended_pan_id;
                     self.nib.pan_id = network.pan_id;
                     self.nib.logical_channel = network.logical_channel;
@@ -865,6 +891,9 @@ impl<M: MacDriver> NwkLayer<M> {
                         depth: network.depth,
                         permit_joining: network.permit_joining,
                         age: 0,
+                        end_device_timeout: crate::frames::ED_TIMEOUT_ENUM_DEFAULT,
+                        keepalive_remaining_secs: 0,
+                        keepalive_confirmed: false,
                         extended_pan_id: network.extended_pan_id,
                         active: true,
                     };
@@ -1013,6 +1042,9 @@ impl<M: MacDriver> NwkLayer<M> {
             self.nib.depth = 0;
             self.nib.extended_pan_id = [0u8; 8];
             self.security = crate::security::NwkSecurity::new();
+            // The parent relationship is gone: no advertised keepalive method
+            // survives a full leave.
+            self.nib.reset_end_device_timeout_negotiation();
         }
     }
 
@@ -1236,6 +1268,79 @@ impl<M: MacDriver> NwkLayer<M> {
 mod tests {
     use super::*;
     use zigbee_mac::mock::MockMac;
+
+    fn descriptor(router_address: u16, lqi: u8) -> NetworkDescriptor {
+        NetworkDescriptor {
+            extended_pan_id: [0; 8],
+            pan_id: PanId(0x1234),
+            logical_channel: 15,
+            stack_profile: 2,
+            zigbee_version: 2,
+            beacon_order: 15,
+            superframe_order: 15,
+            permit_joining: true,
+            router_capacity: true,
+            end_device_capacity: true,
+            update_id: 0,
+            lqi,
+            router_address: ShortAddress(router_address),
+            depth: 1,
+        }
+    }
+
+    #[test]
+    fn bounded_descriptor_sort_orders_by_lqi_and_preserves_ties() {
+        let mut networks = [
+            descriptor(0x0001, 100),
+            descriptor(0x0002, 200),
+            descriptor(0x0003, 200),
+            descriptor(0x0004, 50),
+        ];
+
+        sort_network_descriptors_by(&mut networks, |candidate, current| {
+            candidate.lqi > current.lqi
+        });
+
+        assert_eq!(
+            networks.map(|network| network.router_address),
+            [
+                ShortAddress(0x0002),
+                ShortAddress(0x0003),
+                ShortAddress(0x0001),
+                ShortAddress(0x0004),
+            ]
+        );
+    }
+
+    #[test]
+    fn bounded_descriptor_sort_supports_parent_preference() {
+        let previous_parent = ShortAddress(0x0001);
+        let mut networks = [
+            descriptor(0x0002, 220),
+            descriptor(0x0001, 80),
+            descriptor(0x0003, 180),
+        ];
+
+        sort_network_descriptors_by(&mut networks, |candidate, current| {
+            match (
+                candidate.router_address == previous_parent,
+                current.router_address == previous_parent,
+            ) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => candidate.lqi > current.lqi,
+            }
+        });
+
+        assert_eq!(
+            networks.map(|network| network.router_address),
+            [
+                ShortAddress(0x0001),
+                ShortAddress(0x0002),
+                ShortAddress(0x0003),
+            ]
+        );
+    }
 
     #[test]
     fn zigbee_capability_bytes_match_reference_stack() {

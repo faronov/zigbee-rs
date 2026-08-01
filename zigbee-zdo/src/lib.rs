@@ -33,6 +33,7 @@ pub mod device_announce;
 pub mod discovery;
 pub mod handler;
 pub mod network_mgmt;
+pub mod parent_annce;
 
 use zigbee_aps::ApsLayer;
 use zigbee_aps::binding::BindingEntry;
@@ -92,6 +93,11 @@ pub const MGMT_PERMIT_JOINING_REQ: u16 = 0x0036;
 pub const MGMT_PERMIT_JOINING_RSP: u16 = 0x8036;
 pub const MGMT_NWK_UPDATE_REQ: u16 = 0x0038;
 pub const MGMT_NWK_UPDATE_RSP: u16 = 0x8038;
+
+/// R22 Parent Announce (a router announces the children it parents).
+pub const PARENT_ANNCE: u16 = 0x001F;
+/// R22 Parent Announce Response (children the responder is keeping).
+pub const PARENT_ANNCE_RSP: u16 = 0x801F;
 
 /// Legacy module re-exporting cluster IDs for backwards compatibility.
 pub mod cluster_id {
@@ -233,6 +239,10 @@ struct PendingZdpResponse {
     payload: heapless::Vec<u8, 128>,
     /// Whether the response has been received.
     completed: bool,
+    /// Collection window for one-to-many responses such as Parent Announce.
+    ///
+    /// Zero for the ordinary single-response requests managed by their caller.
+    remaining_secs: u16,
 }
 
 impl Default for PendingZdpResponse {
@@ -243,6 +253,7 @@ impl Default for PendingZdpResponse {
             rsp_cluster: 0,
             payload: heapless::Vec::new(),
             completed: false,
+            remaining_secs: 0,
         }
     }
 }
@@ -304,6 +315,7 @@ impl<M: MacDriver> ZdoLayer<M> {
                 slot.rsp_cluster = rsp_cluster;
                 slot.payload.clear();
                 slot.completed = false;
+                slot.remaining_secs = 0;
                 return Some(i);
             }
         }
@@ -331,6 +343,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         if slot < MAX_PENDING_ZDP && self.pending_responses[slot].completed {
             self.pending_responses[slot].active = false;
             self.pending_responses[slot].completed = false;
+            self.pending_responses[slot].remaining_secs = 0;
             let payload = self.pending_responses[slot].payload.clone();
             self.pending_responses[slot].payload.clear();
             Some(payload)
@@ -344,6 +357,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         if slot < MAX_PENDING_ZDP {
             self.pending_responses[slot].active = false;
             self.pending_responses[slot].completed = false;
+            self.pending_responses[slot].remaining_secs = 0;
         }
     }
 

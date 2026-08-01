@@ -10,6 +10,8 @@ zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
 log = "0.4"
 
 [features]
-default = []
+default = ["float32", "float64"]
+float32 = []
+float64 = []
 ota = []
 constrained-memory = []

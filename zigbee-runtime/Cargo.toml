@@ -13,13 +13,15 @@ zigbee-mac = { version = "0.1.0", path = "../zigbee-mac" }
 zigbee-nwk = { version = "0.1.0", path = "../zigbee-nwk" }
 zigbee-aps = { version = "0.1.0", path = "../zigbee-aps" }
 zigbee-zdo = { version = "0.1.0", path = "../zigbee-zdo" }
-zigbee-bdb = { version = "0.1.0", path = "../zigbee-bdb" }
-zigbee-zcl = { version = "0.1.0", path = "../zigbee-zcl" }
+zigbee-bdb = { version = "0.1.0", path = "../zigbee-bdb", default-features = false }
+zigbee-zcl = { version = "0.1.0", path = "../zigbee-zcl", default-features = false }
 log = "0.4"
 
 [features]
-default = []
-router = ["zigbee-aps/router"]
+default = ["float32", "float64"]
+float32 = ["zigbee-bdb/float32", "zigbee-zcl/float32"]
+float64 = ["zigbee-bdb/float64", "zigbee-zcl/float64"]
+router = ["zigbee-aps/router", "zigbee-nwk/router", "zigbee-zdo/router"]
 ota = []
 trace = ["zigbee-bdb/trace", "zigbee-aps/trace", "zigbee-nwk/trace"]
 constrained-memory = [
@@ -29,7 +31,9 @@ constrained-memory = [
 
 [dev-dependencies]
 zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }
-# Exercise the shared NWK relay/routing path in host tests. Routing, BTR,
-# source-route and indirect tables are compiled to zero capacity without this
-# feature, so the router-side receive behaviour cannot be observed otherwise.
-zigbee-nwk = { path = "../zigbee-nwk", features = ["router"] }
+# NOTE: do not enable `zigbee-nwk/router` here. A dev-dependency feature is
+# unified into this package's own build, so it silently gave every
+# `zigbee-runtime` build the router routing/BTR/source-route tables even for
+# sleepy sensors. The router-side host tests are gated on this crate's own
+# `router` feature (`cargo test -p zigbee-runtime --features router`), which
+# forwards to `zigbee-aps/router` and `zigbee-nwk/router`.

@@ -8,8 +8,8 @@ zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["tlsr8258"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
-zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime", features = ["router"] }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["router"] }
 tlsr8258-hal = { path = "../../tlsr8258-hal" }
 tlsr8258-rt = { path = "../../tlsr8258-rt" }
 tlsr8258-tb04 = { path = "../../boards/tlsr8258-tb04" }

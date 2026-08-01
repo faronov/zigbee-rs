@@ -27,7 +27,6 @@ use defmt::*;
 use {defmt_rtt as _, panic_probe as _};
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
-use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
@@ -148,7 +147,6 @@ async fn main(_spawner: Spawner) {
 
     // Build the Zigbee device
     let mut device = ZigbeeDevice::builder(mac)
-        .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: 10_000,
             wake_duration_ms: 500,

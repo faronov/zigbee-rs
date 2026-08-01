@@ -43,6 +43,7 @@ macro_rules! rt_trace {
 }
 
 pub mod builder;
+pub mod child_store;
 pub mod event_loop;
 pub mod firmware_writer;
 pub mod log_nv;
@@ -54,25 +55,30 @@ pub mod ota;
 pub mod ota_transport;
 pub mod power;
 pub mod profile;
+pub mod role;
 pub mod security_journal;
 pub mod security_store;
 pub mod synthetic_sensor;
 pub mod templates;
+pub(crate) mod zcl_dispatch;
 
 use zigbee_aps::ApsAddress;
 use zigbee_bdb::BdbLayer;
 use zigbee_mac::pib::PibPayload;
 use zigbee_mac::{
-    AssociationStatus, CapabilityInfo, MacCommandEvent, MacDriver, MacError, McpsDataIndication,
+    AssociationStatus, MacCommandEvent, MacDriver, MacError, McpsDataIndication,
     MlmeAssociateResponse, MlmeBeaconResponse,
 };
+// `CapabilityInfo` is only decoded on the parent-side Rejoin Request path,
+// which is compiled solely in `router` builds.
+#[cfg(feature = "router")]
+use zigbee_mac::CapabilityInfo;
 use zigbee_types::*;
 use zigbee_zcl::clusters::Cluster;
 use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::foundation::reporting::ReportingEngine;
-use zigbee_zcl::frame::ZclFrame;
-use zigbee_zcl::{ClusterDirection, ClusterId, CommandId, DeviceId, ZclStatus};
+use zigbee_zcl::{ClusterId, DeviceId};
 
 use crate::nv_storage::{NvItemId, NvStorage};
 use crate::power::PowerManager;
@@ -119,6 +125,162 @@ mod runtime_scratch_tests {
             assert_eq!((*second.nwk.get())[0], 0);
             assert_ne!(first.nwk.get(), second.nwk.get());
         }
+    }
+}
+
+/// Copy an NWK data indication's payload into the receive scratch and extract
+/// its routing/security metadata.
+///
+/// Hoisted out of `process_incoming` as a plain **synchronous, non-generic**
+/// helper — it never touches the `MacDriver`, so it is compiled once instead
+/// of being monomorphised into every backend's async receive future, the same
+/// codegen boundary the synchronous ZCL dispatcher relies on. The two
+/// [`NwkIndication`](zigbee_nwk::nlde::NwkIndication) arms differ only in how
+/// the payload is stored (borrowed from the MAC buffer vs owned after
+/// decryption); folding them into a single copy+unpack removes the duplicated
+/// arm from the receive future. Returns `None` when the frame carried no
+/// NLDE-DATA payload (a dropped frame), matching the former inline `None` arm.
+#[inline(never)]
+fn unpack_nwk_indication(
+    scratch_nwk: &mut [u8; 128],
+    nwk_indication: Option<zigbee_nwk::nlde::NwkIndication<'_>>,
+) -> Option<(ShortAddress, ShortAddress, bool, Option<IeeeAddress>, usize)> {
+    let nwk = nwk_indication?;
+    let (payload, dst, src, security_use, security_source): (
+        &[u8],
+        ShortAddress,
+        ShortAddress,
+        bool,
+        Option<IeeeAddress>,
+    ) = match &nwk {
+        zigbee_nwk::nlde::NwkIndication::Borrowed(data) => (
+            data.payload,
+            data.dst_addr,
+            data.src_addr,
+            data.security_use,
+            data.security_source,
+        ),
+        zigbee_nwk::nlde::NwkIndication::Owned(data) => (
+            data.payload.as_slice(),
+            data.dst_addr,
+            data.src_addr,
+            data.security_use,
+            data.security_source,
+        ),
+    };
+    let len = payload.len().min(scratch_nwk.len());
+    scratch_nwk[..len].copy_from_slice(&payload[..len]);
+    Some((dst, src, security_use, security_source, len))
+}
+
+/// Extract the APS routing metadata (destination endpoint, cluster and source
+/// short address) from a parsed indication and emit the RX trace/log line.
+///
+/// Like [`unpack_nwk_indication`], this is a synchronous, non-generic step of
+/// the receive path, so one `#[inline(never)]` copy is shared by every backend
+/// instead of being inlined into each per-`MacDriver` receive future.
+/// `profile_id` is only observed by the diagnostic lines, so it is consumed
+/// here rather than returned.
+#[inline(never)]
+fn aps_route_metadata(
+    aps_indication: &zigbee_aps::apsde::ApsdeDataIndication<'_>,
+) -> (u8, u16, u16) {
+    let dst_ep = aps_indication.dst_endpoint;
+    let cluster_id = aps_indication.cluster_id;
+    let profile_id = aps_indication.profile_id;
+    let src_addr = match aps_indication.src_address {
+        ApsAddress::Short(a) => a.0,
+        _ => 0,
+    };
+
+    rt_trace!(
+        "[RT] aps dst_ep={} prof=0x{:04X} cluster=0x{:04X} src=0x{:04X} payload={}",
+        dst_ep,
+        profile_id,
+        cluster_id,
+        src_addr,
+        aps_indication.payload.len()
+    );
+    log::info!(
+        "[RX] APS dst_ep={} prof=0x{:04X} cluster=0x{:04X} src=0x{:04X} len={}",
+        dst_ep,
+        profile_id,
+        cluster_id,
+        src_addr,
+        aps_indication.payload.len()
+    );
+    (dst_ep, cluster_id, src_addr)
+}
+
+#[cfg(test)]
+mod receive_stage_helper_tests {
+    use super::*;
+    use zigbee_nwk::nlde::{NldeDataIndication, NldeDataIndicationOwned, NwkIndication};
+
+    const DST: ShortAddress = ShortAddress(0x1234);
+    const SRC: ShortAddress = ShortAddress(0xABCD);
+    const SRC_IEEE: IeeeAddress = [1, 2, 3, 4, 5, 6, 7, 8];
+
+    fn borrowed(payload: &[u8]) -> NwkIndication<'_> {
+        NwkIndication::Borrowed(NldeDataIndication {
+            dst_addr: DST,
+            src_addr: SRC,
+            payload,
+            lqi: 200,
+            security_use: true,
+            security_source: Some(SRC_IEEE),
+        })
+    }
+
+    fn owned(payload: &[u8]) -> NwkIndication<'static> {
+        NwkIndication::Owned(NldeDataIndicationOwned {
+            dst_addr: DST,
+            src_addr: SRC,
+            payload: heapless::Vec::from_slice(payload).unwrap(),
+            lqi: 200,
+            security_use: true,
+            security_source: Some(SRC_IEEE),
+        })
+    }
+
+    /// The `Borrowed` (unsecured, MAC-buffer) and `Owned` (decrypted) arms must
+    /// stage identical scratch bytes and identical metadata — the whole point
+    /// of folding the two former inline arms into one helper.
+    #[test]
+    fn borrowed_and_owned_unpack_identically() {
+        let data = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02];
+        let mut buf_b = [0u8; 128];
+        let mut buf_o = [0u8; 128];
+
+        let rb = unpack_nwk_indication(&mut buf_b, Some(borrowed(&data))).unwrap();
+        let ro = unpack_nwk_indication(&mut buf_o, Some(owned(&data))).unwrap();
+
+        assert_eq!(rb, ro);
+        assert_eq!(rb, (DST, SRC, true, Some(SRC_IEEE), data.len()));
+        assert_eq!(&buf_b[..data.len()], &data[..]);
+        assert_eq!(buf_b, buf_o);
+    }
+
+    /// A payload larger than the 128-byte NWK scratch is clamped to the buffer
+    /// capacity, exactly as the former inline `min(len, buf.len())` did.
+    #[test]
+    fn payload_is_truncated_to_scratch_capacity() {
+        let data = [0x5A; 200];
+        let mut buf = [0u8; 128];
+
+        let r = unpack_nwk_indication(&mut buf, Some(borrowed(&data))).unwrap();
+
+        assert_eq!(r.4, 128);
+        assert_eq!(buf, [0x5A; 128]);
+    }
+
+    /// A frame that yielded no NLDE-DATA payload (the former inline `None` arm)
+    /// stays a drop and leaves the scratch untouched.
+    #[test]
+    fn none_indication_yields_none() {
+        let mut buf = [0u8; 128];
+        assert!(unpack_nwk_indication(&mut buf, None).is_none());
+        assert_eq!(buf, [0u8; 128]);
     }
 }
 
@@ -229,7 +391,7 @@ mod builder_cluster_tests {
         let device = ZigbeeDevice::builder(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8]))
             .device_type(DeviceType::Router)
             .power_source(PowerSource::MainsSinglePhase)
-            .build();
+            .build_router();
 
         assert_eq!(device.bdb().zdo().node_descriptor().mac_capabilities, 0x8E);
     }
@@ -249,10 +411,105 @@ mod builder_cluster_tests {
     }
 
     #[test]
+    fn end_device_node_descriptor_advertises_r22_without_service_bits() {
+        let device = ZigbeeDevice::builder(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8]))
+            .device_type(DeviceType::EndDevice)
+            .build();
+
+        let node_descriptor = *device.bdb().zdo().node_descriptor();
+        assert_eq!(node_descriptor.stack_revision(), 22);
+        assert_eq!(node_descriptor.server_mask, 22 << 9);
+    }
+
+    #[test]
+    fn router_node_descriptor_advertises_r22_without_service_bits() {
+        let device = ZigbeeDevice::builder(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8]))
+            .device_type(DeviceType::Router)
+            .build_router();
+
+        let node_descriptor = *device.bdb().zdo().node_descriptor();
+        assert_eq!(node_descriptor.stack_revision(), 22);
+        assert_eq!(node_descriptor.server_mask, 22 << 9);
+    }
+
+    #[test]
+    fn coordinator_node_descriptor_advertises_r22_and_primary_trust_center() {
+        let device = ZigbeeDevice::builder(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8]))
+            .device_type(DeviceType::Coordinator)
+            .build_router();
+
+        let node_descriptor = *device.bdb().zdo().node_descriptor();
+        assert_eq!(node_descriptor.stack_revision(), 22);
+        assert_eq!(node_descriptor.server_mask, (22 << 9) | 0x0001);
+
+        // Bits 7-8 are reserved and the Network Manager / cache services are
+        // not implemented, so they must stay clear.
+        assert_eq!(node_descriptor.server_mask & 0x0180, 0);
+        assert_eq!(node_descriptor.server_mask & 0x007E, 0);
+    }
+
+    #[test]
+    fn both_builder_paths_agree_on_the_node_descriptor() {
+        // The role and its device type are now chosen together by the terminal
+        // build method, so exercise each role's `build`/`build_into` pair.
+        fn assert_agrees<R>(
+            build: impl FnOnce(crate::builder::DeviceBuilder<MockMac>) -> ZigbeeDevice<MockMac, R>,
+            build_into: impl FnOnce(
+                crate::builder::DeviceBuilder<MockMac>,
+                &mut MaybeUninit<ZigbeeDevice<MockMac, R>>,
+            ) -> &mut ZigbeeDevice<MockMac, R>,
+        ) where
+            R: crate::role::DeviceRole,
+        {
+            let built = build(ZigbeeDevice::builder(MockMac::new([
+                1, 2, 3, 4, 5, 6, 7, 8,
+            ])));
+            let mut storage = MaybeUninit::uninit();
+            let built_into = build_into(
+                ZigbeeDevice::builder(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8])),
+                &mut storage,
+            );
+            assert_eq!(
+                built.bdb().zdo().node_descriptor(),
+                built_into.bdb().zdo().node_descriptor(),
+                "descriptors must match across build paths"
+            );
+        }
+
+        assert_agrees(|b| b.build(), |b, d| b.build_into(d));
+        assert_agrees(|b| b.build_relay(), |b, d| b.build_relay_into(d));
+        assert_agrees(|b| b.build_router(), |b, d| b.build_router_into(d));
+        assert_agrees(
+            |b| b.build_coordinator(),
+            |b, d| b.build_coordinator_into(d),
+        );
+    }
+
+    #[test]
+    fn node_descriptor_serializes_the_stack_revision_bytes() {
+        let device = ZigbeeDevice::builder(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8]))
+            .device_type(DeviceType::Coordinator)
+            .build_router();
+
+        let mut buf = [0u8; 13];
+        let len = device
+            .bdb()
+            .zdo()
+            .node_descriptor()
+            .serialize(&mut buf)
+            .unwrap();
+
+        assert_eq!(len, 13);
+        // Bytes 8-9: server mask, little endian — 0x2C01 = R22 + primary TC.
+        assert_eq!([buf[8], buf[9]], [0x01, 0x2C]);
+    }
+
+    #[test]
     fn default_response_reverses_command_direction() {
         let mut device = ZigbeeDevice::builder(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8])).build();
 
-        device.queue_default_response(
+        crate::zcl_dispatch::queue_default_response(
+            &mut device.pending_responses,
             ShortAddress(0x1234),
             1,
             1,
@@ -279,6 +536,8 @@ mod resume_tests {
     use std::task::Wake;
 
     use super::ZigbeeDevice;
+    use crate::child_store::ChildTableStore;
+    use crate::role::Router;
     use crate::security_store::{
         PersistentSecurityState, RamSecurityStateStore, SecurityStateStore,
     };
@@ -307,10 +566,46 @@ mod resume_tests {
     }
 
     #[test]
+    fn a_sensor_role_never_acts_as_a_parent() {
+        // The parent operational surface (announce_parent, save/restore child
+        // table, permit_joining, service_parent_commands) is now bounded on the
+        // typed `ParentRole`, so a leaf `EndDevice` cannot even *name* it — the
+        // calls that previously had to be proven inert at runtime no longer
+        // compile on a sensor. The `compile_fail` doctest on `ZigbeeDevice`
+        // covers that; here we confirm the sensor still builds and its joined
+        // tick emits no parent traffic.
+        let mut sensor = ZigbeeDevice::builder(MockMac::new([9; 8]))
+            .device_type(DeviceType::EndDevice)
+            .build();
+
+        // A populated store is irrelevant to a sensor: it owns no child table
+        // API to load it through, and its tick performs no parent maintenance.
+        let mut store = crate::child_store::RamChildTableStore::new();
+        let mut table = crate::child_store::PersistentChildTable::new();
+        table
+            .push(crate::child_store::PersistentChild {
+                ieee_address: [1; 8],
+                short_address: 0x1234,
+                rx_on_when_idle: false,
+                security_capable: true,
+                is_router: false,
+                end_device_timeout: 8,
+            })
+            .unwrap();
+        store.store(&table).unwrap();
+        assert!(store.load().unwrap().is_some());
+
+        // The sensor owns no Parent Announce state at all — its role state is
+        // the zero-sized `NonParentState`, so there is no `parent_annce_due`
+        // field to inspect — and its tick transmits nothing.
+        block_on(sensor.tick(1, &mut []));
+        assert!(sensor.mac().tx_history().is_empty());
+    }
+
+    #[test]
     fn resume_restores_parent_address_into_mac_pib() {
         const IEEE_ADDRESS: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
         const PARENT_ADDRESS: ShortAddress = ShortAddress(0x3344);
-
         let mac = MockMac::new(IEEE_ADDRESS);
         let mut device = ZigbeeDevice::builder(mac)
             .device_type(DeviceType::EndDevice)
@@ -772,6 +1067,9 @@ mod resume_tests {
     const KEY_SEQUENCE: u8 = 0;
     const OUR_SHORT: u16 = 0x5678;
     const COORDINATOR: ShortAddress = ShortAddress(0x0000);
+    // Only the router relay tests, which need `zigbee-nwk/router`, name a
+    // neighbour that is neither us nor our parent.
+    #[cfg(feature = "router")]
     const NEIGHBOUR: ShortAddress = ShortAddress(0x2222);
 
     fn commissioned_state() -> PersistentSecurityState {
@@ -795,9 +1093,19 @@ mod resume_tests {
     }
 
     fn resumed_device(device_type: DeviceType) -> ZigbeeDevice<MockMac> {
+        assert_eq!(device_type, DeviceType::EndDevice);
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+        device
+    }
+
+    fn resumed_router() -> ZigbeeDevice<MockMac, Router> {
         let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
-            .device_type(device_type)
-            .build();
+            .device_type(DeviceType::Router)
+            .build_router();
         let mut store = RamSecurityStateStore::new();
         store.store(&commissioned_state()).unwrap();
         block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
@@ -809,7 +1117,7 @@ mod resume_tests {
     fn durable_router_resume_does_not_reannounce_or_rejoin() {
         let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
             .device_type(DeviceType::Router)
-            .build();
+            .build_router();
         let mut store = RamSecurityStateStore::new();
         store.store(&commissioned_state()).unwrap();
 
@@ -896,6 +1204,7 @@ mod resume_tests {
 
     /// The same indication, but transmitted by `previous_hop` rather than
     /// directly by the NWK source.
+    #[cfg(feature = "router")]
     fn indication_from(
         payload: zigbee_mac::MacFrame,
         previous_hop: ShortAddress,
@@ -1011,9 +1320,13 @@ mod resume_tests {
         assert_eq!(device.nwk_rx_security_stats().decrypt_successes, 1);
     }
 
+    // Relaying needs the router routing/BTR/source-route tables, which are
+    // compiled to zero capacity without `zigbee-nwk/router`. Run with
+    // `cargo test -p zigbee-runtime --features router`.
+    #[cfg(feature = "router")]
     #[test]
     fn router_relays_traffic_for_other_devices_and_delivers_its_own_locally() {
-        let mut device = resumed_device(DeviceType::Router);
+        let mut device = resumed_router();
 
         // Addressed to another device: authenticated first, then forwarded
         // toward the best next hop (here the parent, the last resort of
@@ -1082,9 +1395,13 @@ mod resume_tests {
         assert_eq!(device.nwk_rx_security_stats().decrypt_successes, 2);
     }
 
+    // Relaying needs the router routing/BTR/source-route tables, which are
+    // compiled to zero capacity without `zigbee-nwk/router`. Run with
+    // `cargo test -p zigbee-runtime --features router`.
+    #[cfg(feature = "router")]
     #[test]
     fn router_relays_to_an_announced_neighbour_instead_of_queueing_it() {
-        let mut device = resumed_device(DeviceType::Router);
+        let mut device = resumed_router();
         // A Device_annce only carries the address pair, so the neighbour entry
         // keeps the default `rx_on_when_idle == false`. It is not a child of
         // ours and must not be treated as a sleeping one: nothing drains the
@@ -1123,7 +1440,7 @@ mod resume_tests {
 
     #[test]
     fn router_resume_restarts_router_operation() {
-        let device = resumed_device(DeviceType::Router);
+        let device = resumed_router();
 
         assert_eq!(
             block_on(
@@ -1144,7 +1461,7 @@ mod resume_tests {
     fn a_router_that_cannot_start_is_reported_instead_of_half_joined() {
         let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
             .device_type(DeviceType::Router)
-            .build();
+            .build_router();
 
         // NLME-START-ROUTER refuses a device that is not on a network.
         assert_eq!(
@@ -1155,11 +1472,15 @@ mod resume_tests {
         assert!(!device.is_joined());
     }
 
+    // Relaying needs the router routing/BTR/source-route tables, which are
+    // compiled to zero capacity without `zigbee-nwk/router`. Run with
+    // `cargo test -p zigbee-runtime --features router`.
+    #[cfg(feature = "router")]
     #[test]
     fn a_relayed_many_to_one_request_routes_through_the_transmitting_neighbour() {
         use zigbee_nwk::frames::{NwkCommandId, RouteRequest};
 
-        let mut device = resumed_device(DeviceType::Router);
+        let mut device = resumed_router();
 
         // The concentrator (our coordinator) originated this many-to-one
         // request; the NWK header still names it several hops later. The
@@ -1244,26 +1565,515 @@ mod resume_tests {
             "end-device resume behaviour must be unchanged"
         );
     }
+
+    // ── R22 End Device Timeout client lifecycle ──────────────
+
+    use zigbee_nwk::frames::{
+        ED_TIMEOUT_ENUM_DEFAULT, ED_TIMEOUT_ENUM_REQUESTED, NwkCommandId,
+        ed_timeout_enum_to_seconds,
+    };
+
+    /// Payloads of every End Device Timeout Request (0x0B) this device sent.
+    ///
+    /// Transmissions on a commissioned network are NWK-secured, so the frame
+    /// is decrypted with the same network key the test installed before the
+    /// command body is inspected.
+    fn ed_timeout_requests<R: crate::role::DeviceRole>(
+        device: &ZigbeeDevice<MockMac, R>,
+    ) -> std::vec::Vec<[u8; 2]> {
+        device
+            .mac()
+            .tx_history()
+            .iter()
+            .filter_map(|record| {
+                let frame = record.payload.as_slice();
+                let (header, header_len) = zigbee_nwk::frames::NwkHeader::parse(frame)?;
+                let body = if header.frame_control.security {
+                    let (sec_hdr, sec_len) =
+                        zigbee_nwk::security::NwkSecurityHeader::parse(&frame[header_len..])?;
+                    let aad_len = header_len + sec_len;
+                    let mut aad = [0u8; 64];
+                    aad[..aad_len].copy_from_slice(&frame[..aad_len]);
+                    // The over-the-air security level bits are zero; the AAD
+                    // uses the real level, exactly like the receive path.
+                    aad[header_len] = (aad[header_len] & !0x07) | 0x05;
+                    zigbee_nwk::security::NwkSecurity::new().decrypt(
+                        &aad[..aad_len],
+                        &frame[aad_len..],
+                        &NETWORK_KEY,
+                        &sec_hdr,
+                    )?
+                } else {
+                    let mut plain = heapless::Vec::<u8, 128>::new();
+                    plain.extend_from_slice(frame.get(header_len..)?).ok()?;
+                    plain
+                };
+                if body.first().copied()? != NwkCommandId::EdTimeoutRequest as u8 {
+                    return None;
+                }
+                Some([*body.get(1)?, *body.get(2)?])
+            })
+            .collect()
+    }
+
+    /// Commissioned record whose stored negotiation matches `(info, valid)`.
+    fn negotiated_state(
+        parent_information: u8,
+        valid: bool,
+        timeout: u8,
+    ) -> PersistentSecurityState {
+        let mut state = commissioned_state();
+        state.parent_information = parent_information;
+        state.parent_information_valid = valid;
+        state.end_device_timeout = timeout;
+        state
+    }
+
+    fn resumed_end_device(
+        state: PersistentSecurityState,
+    ) -> (ZigbeeDevice<MockMac>, RamSecurityStateStore) {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&state).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        (device, store)
+    }
+
+    /// A secured NWK End Device Timeout Response from the coordinator.
+    fn ed_timeout_response(status: u8, parent_info: u8, counter: u32) -> zigbee_mac::MacFrame {
+        nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Command,
+            ShortAddress(OUR_SHORT),
+            &[NwkCommandId::EdTimeoutResponse as u8, status, parent_info],
+            counter,
+            true,
+        )
+    }
+
+    #[test]
+    fn a_fresh_join_negotiation_sends_exactly_one_long_timeout_request() {
+        // `finish_join()` is the single choke point every fresh join and
+        // secured rejoin passes through, so proving it here proves `start()`,
+        // `start_with_security_store()`, the steering branch of
+        // `start_or_resume_with_security_store()`, `secure_rejoin()` and the
+        // `UserAction::Join`/`Toggle` handlers, which have no request of their
+        // own. A full BDB steering join cannot be driven to completion against
+        // `MockMac` — nothing transports the network key — so the assertion is
+        // made at the shared choke point rather than through a fake join.
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x01, true, 14));
+        device.mac_mut().clear_tx_history();
+        device.reset_end_device_timeout_state();
+        // A real join renegotiates from scratch at the NWK parent-assignment
+        // point.
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .nib_mut()
+            .reset_end_device_timeout_negotiation();
+
+        block_on(device.finish_join()).unwrap();
+
+        assert_eq!(
+            ed_timeout_requests(&device),
+            std::vec![[ED_TIMEOUT_ENUM_REQUESTED, 0x00]],
+            "a fresh join sends exactly one request, with the reserved byte clear"
+        );
+        assert!(
+            device.ed_timeout().forced_poll,
+            "the indirect response needs a forced poll on the next tick"
+        );
+    }
+
+    #[test]
+    fn a_join_still_succeeds_when_the_initial_request_cannot_be_transmitted() {
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x01, true, 14));
+        device.mac_mut().clear_tx_history();
+        device.mac_mut().set_tx_failures(64);
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .nib_mut()
+            .reset_end_device_timeout_negotiation();
+
+        let address = block_on(device.finish_join())
+            .expect("a join must not fail because a keepalive frame did not go out");
+
+        assert_eq!(address, OUR_SHORT);
+        assert!(device.is_joined());
+        assert!(
+            !device.secure_rejoin_pending(),
+            "a single keepalive failure must not schedule a rejoin"
+        );
+        assert!(
+            device.ed_timeout().keepalive_remaining_secs.is_some(),
+            "the recurring keepalive owns recovery after a failed request"
+        );
+    }
+
+    /// Current neighbour-cache age for the entry with this IEEE address.
+    fn neighbour_age(device: &ZigbeeDevice<MockMac>, ieee: &[u8; 8]) -> Option<u16> {
+        device
+            .bdb
+            .zdo()
+            .nwk()
+            .neighbor_table()
+            .find_by_ieee(ieee)
+            .map(|entry| entry.age)
+    }
+
+    #[test]
+    fn end_device_tick_runs_common_nwk_maintenance_and_the_ed_timeout_client() {
+        // A non-routing end device links no parent/router maintenance, but the
+        // joined tick must still run the role-independent NWK maintenance
+        // (neighbour-cache aging via `run_common_nwk_maintenance`) and keep the
+        // End Device Timeout *client* alive. This proves the maintenance split
+        // preserved the mandatory common end-device tick work.
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x01, true, 14));
+        device.mac_mut().clear_tx_history();
+
+        // A neighbour learned from a Device_annce (not our parent) starts at
+        // age 0 and is never reset by parent traffic, so its age tracks exactly
+        // how many seconds of common maintenance the tick applied.
+        const NEIGHBOUR: [u8; 8] = [0xC7; 8];
+        device
+            .bdb
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .update_neighbor_address(ShortAddress(0x2345), NEIGHBOUR);
+        assert_eq!(neighbour_age(&device, &NEIGHBOUR), Some(0));
+
+        // The End Device Timeout client is armed after a resume — the common,
+        // non-router keepalive path the split must preserve.
+        assert!(
+            device.ed_timeout().keepalive_remaining_secs.is_some(),
+            "a resumed end device tracks its keepalive countdown"
+        );
+
+        let _ = block_on(device.tick(5, &mut []));
+
+        assert_eq!(
+            neighbour_age(&device, &NEIGHBOUR),
+            Some(5),
+            "run_common_nwk_maintenance ages the end-device neighbour cache once per elapsed second"
+        );
+        assert!(
+            device.ed_timeout().keepalive_remaining_secs.is_some(),
+            "the End Device Timeout client stays armed across the tick"
+        );
+    }
+
+    #[test]
+    fn silent_resume_forces_a_poll_for_a_poll_aging_parent() {
+        for (info, valid) in [(0x01, true), (0x03, true), (0x00, true)] {
+            let (mut device, _store) = resumed_end_device(negotiated_state(info, valid, 14));
+
+            assert!(
+                ed_timeout_requests(&device).is_empty(),
+                "info=0x{info:02X}: a poll-aging parent needs no fresh negotiation"
+            );
+            let polls_before = device.mac().poll_count();
+            // A default-built device is AlwaysOn and would never poll
+            // automatically, so any poll here proves the forced-poll bypass.
+            assert!(!device.is_sleepy());
+            let _ = block_on(device.tick(1, &mut []));
+            assert_eq!(
+                device.mac().poll_count(),
+                polls_before + 1,
+                "info=0x{info:02X}: the resume keepalive must force one poll"
+            );
+        }
+    }
+
+    #[test]
+    fn silent_resume_requests_a_timeout_for_request_only_or_unknown_parents() {
+        for (info, valid) in [(0x02, true), (0x00, false)] {
+            let (device, _store) = resumed_end_device(negotiated_state(info, valid, 8));
+
+            assert_eq!(
+                ed_timeout_requests(&device).len(),
+                1,
+                "info=0x{info:02X} valid={valid}: a poll would not refresh the parent timer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_forced_poll_retrieves_the_indirect_response_and_persists_it() {
+        let (mut device, mut store) = resumed_end_device(negotiated_state(0x00, false, 8));
+        assert_eq!(ed_timeout_requests(&device).len(), 1);
+
+        device
+            .mac_mut()
+            .enqueue_poll_response(ed_timeout_response(0x00, 0x01, 1));
+        let _ = block_on(device.tick(1, &mut []));
+
+        let nib = device.bdb.zdo().nwk().nib();
+        assert!(nib.parent_information_valid);
+        assert_eq!(nib.parent_information, 0x01);
+        assert_eq!(nib.end_device_timeout, ED_TIMEOUT_ENUM_REQUESTED);
+        assert!(device.state_dirty());
+
+        assert!(device.refresh_security_state(&mut store).unwrap());
+        let stored = store.load().unwrap().unwrap();
+        assert!(stored.parent_information_valid);
+        assert_eq!(stored.parent_information, 0x01);
+        assert_eq!(stored.end_device_timeout, ED_TIMEOUT_ENUM_REQUESTED);
+
+        // A reboot restores the negotiated relationship and then only polls.
+        let (rebooted, _store) = resumed_end_device(stored);
+        assert!(ed_timeout_requests(&rebooted).is_empty());
+        let nib = rebooted.bdb.zdo().nwk().nib();
+        assert!(nib.parent_information_valid);
+        assert_eq!(nib.end_device_timeout, ED_TIMEOUT_ENUM_REQUESTED);
+    }
+
+    #[test]
+    fn a_refused_timeout_is_retried_one_step_lower_and_never_below_the_default() {
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x00, false, 8));
+        device.mac_mut().clear_tx_history();
+
+        // Enough refusals to walk the request all the way to the floor and
+        // then several more. Each response needs a fresh NWK frame counter so
+        // the replay window accepts it.
+        for counter in 1..=u32::from(ED_TIMEOUT_ENUM_REQUESTED - ED_TIMEOUT_ENUM_DEFAULT + 3) {
+            device
+                .mac_mut()
+                .enqueue_poll_response(ed_timeout_response(0x01, 0x02, counter));
+            let _ = block_on(device.tick(1, &mut []));
+        }
+
+        let requests = ed_timeout_requests(&device);
+        assert!(!requests.is_empty());
+        let lowest = requests.iter().map(|request| request[0]).min().unwrap();
+        assert_eq!(
+            lowest, ED_TIMEOUT_ENUM_DEFAULT,
+            "refusals must never retry below the default enumeration"
+        );
+        assert!(
+            requests.iter().all(|request| request[1] == 0),
+            "the reserved End Device Configuration byte stays clear"
+        );
+        assert!(
+            !device.bdb.zdo().nwk().nib().parent_information_valid,
+            "a refusal never validates parent information"
+        );
+    }
+
+    #[test]
+    fn an_unanswered_negotiation_retries_twice_and_falls_back_to_the_default() {
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x00, false, 8));
+        device.mac_mut().clear_tx_history();
+
+        // Each tick advances well past the bounded response wait.
+        for _ in 0..6 {
+            let _ = block_on(device.tick(30, &mut []));
+        }
+
+        assert_eq!(
+            ed_timeout_requests(&device).len(),
+            2,
+            "exactly the bounded retransmission budget is spent"
+        );
+        let nib = device.bdb.zdo().nwk().nib();
+        assert!(!nib.parent_information_valid);
+        assert_eq!(
+            nib.end_device_timeout, ED_TIMEOUT_ENUM_DEFAULT,
+            "the recurring fallback is the default enumeration"
+        );
+        assert!(device.is_joined(), "a silent parent must not undo the join");
+
+        device
+            .mac_mut()
+            .enqueue_poll_response(ed_timeout_response(0x00, 0x03, 1));
+        device.force_end_device_poll();
+        let _ = block_on(device.tick(1, &mut []));
+        assert!(
+            !device.bdb.zdo().nwk().nib().parent_information_valid,
+            "a response after the retry round was abandoned must be ignored"
+        );
+    }
+
+    #[test]
+    fn a_repeat_acceptance_cancels_the_response_wait_without_retransmitting() {
+        // A bit1-only parent is kept alive by the request itself, so every
+        // keepalive re-confirms an unchanged timeout. That must still count as
+        // an answer, or each keepalive would burn the whole retransmission
+        // budget.
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x02, true, 14));
+        device.mac_mut().clear_tx_history();
+        assert!(device.ed_timeout().response_remaining_secs.is_some());
+
+        device
+            .mac_mut()
+            .enqueue_poll_response(ed_timeout_response(0x00, 0x02, 1));
+        let _ = block_on(device.tick(1, &mut []));
+
+        assert_eq!(
+            device.ed_timeout().response_remaining_secs,
+            None,
+            "an acceptance must cancel the response wait"
+        );
+        assert!(ed_timeout_requests(&device).is_empty());
+        assert_eq!(
+            device.ed_timeout().keepalive_remaining_secs,
+            Some(device.end_device_keepalive_interval_secs())
+        );
+
+        // Several further ticks must not retransmit anything.
+        for _ in 0..4 {
+            let _ = block_on(device.tick(30, &mut []));
+        }
+        assert!(ed_timeout_requests(&device).is_empty());
+    }
+
+    #[test]
+    fn a_poll_for_a_request_only_parent_never_postpones_the_next_request() {
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x02, true, 14));
+        let interval = device.end_device_keepalive_interval_secs();
+        device.ed_timeout_mut().keepalive_remaining_secs = Some(7);
+
+        block_on(device.poll()).unwrap();
+
+        assert_eq!(
+            device.ed_timeout().keepalive_remaining_secs,
+            Some(7),
+            "a bit1-only parent does not age its children on polls"
+        );
+
+        // Every advertisement that explicitly supports poll aging refreshes
+        // the parent timer.
+        for (info, valid) in [(0x01, true), (0x03, true), (0x00, true)] {
+            let (mut device, _store) = resumed_end_device(negotiated_state(info, valid, 14));
+            device.ed_timeout_mut().keepalive_remaining_secs = Some(7);
+            block_on(device.poll()).unwrap();
+            assert_eq!(
+                device.ed_timeout().keepalive_remaining_secs,
+                Some(device.end_device_keepalive_interval_secs()),
+                "info=0x{info:02X} valid={valid}"
+            );
+        }
+
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x00, false, 8));
+        device.ed_timeout_mut().keepalive_remaining_secs = Some(7);
+        block_on(device.poll()).unwrap();
+        assert_eq!(
+            device.ed_timeout().keepalive_remaining_secs,
+            Some(7),
+            "an unknown parent may be request-only, so a poll cannot postpone 0x0B"
+        );
+        let _ = interval;
+    }
+
+    #[test]
+    fn the_keepalive_interval_stays_below_the_negotiated_timeout() {
+        let (device, _store) = resumed_end_device(negotiated_state(0x01, true, 14));
+        let timeout = ed_timeout_enum_to_seconds(ED_TIMEOUT_ENUM_REQUESTED).unwrap();
+        let interval = device.end_device_keepalive_interval_secs();
+        assert!(interval < timeout);
+        assert_eq!(interval, timeout / 3);
+
+        let (device, _store) = resumed_end_device(negotiated_state(0x00, false, 8));
+        let fallback = ed_timeout_enum_to_seconds(ED_TIMEOUT_ENUM_DEFAULT).unwrap();
+        assert_eq!(device.end_device_keepalive_interval_secs(), fallback / 3);
+    }
+
+    #[test]
+    fn a_due_keepalive_polls_or_requests_by_advertised_method() {
+        // Poll-aging parent: the keepalive is a forced poll, not a request.
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x01, true, 14));
+        device.mac_mut().clear_tx_history();
+        device.ed_timeout_mut().keepalive_remaining_secs = Some(0);
+        let polls_before = device.mac().poll_count();
+        let _ = block_on(device.tick(0, &mut []));
+        let _ = block_on(device.tick(0, &mut []));
+        assert!(ed_timeout_requests(&device).is_empty());
+        assert!(device.mac().poll_count() > polls_before);
+        assert_eq!(
+            device.ed_timeout().keepalive_remaining_secs,
+            Some(device.end_device_keepalive_interval_secs())
+        );
+
+        // Request-only parent: the keepalive is a fresh 0x0B.
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x02, true, 14));
+        device.mac_mut().clear_tx_history();
+        device.ed_timeout_mut().keepalive_remaining_secs = Some(0);
+        let _ = block_on(device.tick(0, &mut []));
+        assert_eq!(ed_timeout_requests(&device).len(), 1);
+    }
+
+    #[test]
+    fn repeated_keepalive_failures_schedule_the_secure_rejoin_retry() {
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x01, true, 14));
+        device.mac_mut().set_poll_failures(64);
+        assert!(!device.secure_rejoin_pending());
+
+        for _ in 0..8 {
+            device.ed_timeout_mut().keepalive_remaining_secs = Some(0);
+            let _ = block_on(device.tick(0, &mut []));
+            let _ = block_on(device.tick(0, &mut []));
+            if device.secure_rejoin_pending() {
+                break;
+            }
+        }
+
+        assert!(
+            device.secure_rejoin_pending(),
+            "a parent that stops answering polls must trigger the rejoin path"
+        );
+    }
+
+    #[test]
+    fn resuming_a_router_never_negotiates_a_timeout() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::Router)
+            .build_router();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+
+        // A `Router` is not an `EndDeviceRole`, so it carries no End Device
+        // Timeout *client* state at all — `ed_timeout()`/`take_forced_poll()`
+        // do not even exist on it (see `role_split_removes_ed_client_from_*`).
+        // The observable guarantee here is behavioural: resuming a router
+        // transmits no client 0x0B request.
+        assert!(
+            ed_timeout_requests(&device).is_empty(),
+            "a router must never transmit an End Device Timeout client request"
+        );
+    }
 }
+
+/// Byte budget of a queued ZCL response payload
+/// ([`PendingZclResponse::zcl_data`]).
+///
+/// Shared with `zcl_dispatch` so its compile-time proof that a cluster-specific
+/// response can never overflow this buffer (and therefore never hits
+/// `queue_frame`'s drop branch) stays tied to the real capacity.
+pub(crate) const PENDING_ZCL_DATA_CAP: usize = 128;
 
 /// A queued ZCL response to be sent in the next tick().
 ///
 /// Because `process_incoming()` is sync but sending requires async MAC access,
 /// we queue responses here and drain them in `tick()`.
-struct PendingZclResponse {
-    dst_addr: ShortAddress,
-    dst_endpoint: u8,
-    src_endpoint: u8,
-    cluster_id: u16,
+pub(crate) struct PendingZclResponse {
+    pub(crate) dst_addr: ShortAddress,
+    pub(crate) dst_endpoint: u8,
+    pub(crate) src_endpoint: u8,
+    pub(crate) cluster_id: u16,
     #[cfg(feature = "router")]
-    zcl_data: heapless::Vec<u8, 128>,
+    pub(crate) zcl_data: heapless::Vec<u8, PENDING_ZCL_DATA_CAP>,
     #[cfg(not(feature = "router"))]
-    zcl_data: heapless::Vec<u8, 128>,
+    pub(crate) zcl_data: heapless::Vec<u8, PENDING_ZCL_DATA_CAP>,
 }
 
-struct EndpointIdentifyCluster {
-    endpoint: u8,
-    cluster: IdentifyCluster,
+pub(crate) struct EndpointIdentifyCluster {
+    pub(crate) endpoint: u8,
+    pub(crate) cluster: IdentifyCluster,
 }
 
 /// Maximum number of endpoints on a device (endpoint 0 is ZDO, 1-240 are application)
@@ -1334,6 +2144,38 @@ struct PendingChildUpdate {
     expires_at_us: u32,
 }
 
+/// A *parent-only* NWK command outcome, extracted from
+/// [`NwkCommandOutcome`](zigbee_nwk::nlde::NwkCommandOutcome) so it can be
+/// dispatched statically through the role type.
+///
+/// Only a [`Router`](crate::role::Router) acts on these; [`EndDevice`] and
+/// [`RelayRouter`] ignore them (see
+/// [`DeviceRole::service_parent_nwk_outcome`](crate::role::DeviceRole::service_parent_nwk_outcome)),
+/// which is what stops a relay — whose `NwkLayer::can_route` is `true` — from
+/// answering a child Rejoin Request or serving End Device Timeout.
+///
+/// Public and `#[doc(hidden)]`: it only needs to be nameable by the role trait
+/// method's signature, not part of the supported surface.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub enum ParentNwkOutcome {
+    /// A child asked to rejoin; answer with a Rejoin Response (and coupled
+    /// Trust Center Update-Device).
+    ChildRejoinRequest {
+        src: ShortAddress,
+        ieee: IeeeAddress,
+        capability_info: u8,
+        secured: bool,
+    },
+    /// A child requested an End Device Timeout; apply policy and transmit the
+    /// 0x0C response.
+    EndDeviceTimeoutRequest {
+        src: ShortAddress,
+        ieee: IeeeAddress,
+        requested_timeout: u8,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrustCenterMode {
     Unknown,
@@ -1341,8 +2183,153 @@ enum TrustCenterMode {
     Distributed,
 }
 
+/// Keepalive method selected from the negotiated `nwkParentInformation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepaliveMethod {
+    /// The parent keeps the child alive on MAC Data Poll. Used when the
+    /// parent advertised bit 0, and when it answered with no bits at all
+    /// (pre-R22 parents only implement poll-based aging).
+    MacDataPoll,
+    /// The parent only advertised End Device Timeout Request keepalive, or
+    /// never answered at all — a poll would not refresh the child timer, so a
+    /// fresh 0x0B has to be sent.
+    TimeoutRequest,
+}
+
+/// R22 End Device Timeout client lifecycle state.
+///
+/// All timers are in whole seconds driven by the `elapsed_secs` a tick
+/// reports, using saturating subtraction. A negotiated timeout can be days
+/// long, which does not fit the microsecond monotonic clock used elsewhere in
+/// the runtime.
+///
+/// This value is the entire runtime payload of the **client** lifecycle, and
+/// it now lives *only* inside an [`EndDevice`](crate::role::EndDevice)'s inline
+/// [`EndDeviceState`](crate::role::EndDeviceState) role state — a
+/// [`RelayRouter`](crate::role::RelayRouter) or [`Router`](crate::role::Router)
+/// carries none of it (see [`crate::role`]). Reached through the
+/// [`EndDeviceRole`](crate::role::EndDeviceRole) accessors so only an
+/// end-device monomorphization can name it.
+///
+/// Exposed as `pub` (opaque — its fields are `pub(crate)`) only so it can name
+/// the return type of the sealed [`EndDeviceRole`](crate::role::EndDeviceRole)
+/// accessors, exactly as [`ParentState`](crate::role::ParentState) is; it is
+/// hidden from the public docs and carries no externally usable surface.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndDeviceTimeoutState {
+    /// Seconds until the next keepalive is due. `None` while no keepalive is
+    /// scheduled (not joined, or not an end device).
+    pub(crate) keepalive_remaining_secs: Option<u32>,
+    /// Seconds still allowed for an outstanding End Device Timeout Response.
+    /// `Some(0)` means the wait expired and has not been serviced yet.
+    pub(crate) response_remaining_secs: Option<u16>,
+    /// Remaining no-response retransmissions of the current request.
+    pub(crate) retries_left: u8,
+    /// Consecutive forced keepalive TX/poll failures.
+    pub(crate) failures: u8,
+    /// A forced MAC poll is scheduled for the next runtime tick.
+    pub(crate) forced_poll: bool,
+}
+
+impl EndDeviceTimeoutState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            keepalive_remaining_secs: None,
+            response_remaining_secs: None,
+            retries_left: 0,
+            failures: 0,
+            forced_poll: false,
+        }
+    }
+
+    /// Age both bounded timers by one tick.
+    ///
+    /// Saturating subtraction keeps `Some(0)` as the "expired but not yet
+    /// serviced" state, which is what distinguishes a lapsed response wait
+    /// from `None` (no request outstanding).
+    fn advance(&mut self, elapsed_secs: u16) {
+        let elapsed = elapsed_secs as u32;
+        if let Some(remaining) = self.keepalive_remaining_secs.as_mut() {
+            *remaining = remaining.saturating_sub(elapsed);
+        }
+        if let Some(remaining) = self.response_remaining_secs.as_mut() {
+            *remaining = remaining.saturating_sub(elapsed_secs);
+        }
+    }
+}
+
+/// NIB fields that describe the End Device Timeout negotiation.
+///
+/// Compared around NWK receive processing to detect an accepted or refused End
+/// Device Timeout Response without adding a public NWK command outcome.
+///
+/// Exposed as `pub` (opaque — its fields are private) only so it can name the
+/// argument of the sealed, `#[doc(hidden)]`
+/// [`DeviceRole::ed_apply_timeout_change`](crate::role::DeviceRole) hook; it is
+/// hidden from the public docs and carries no externally usable surface.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndDeviceTimeoutSnapshot {
+    parent_information: u8,
+    parent_information_valid: bool,
+    end_device_timeout: u8,
+    requested_end_device_timeout: u8,
+    accepts: u8,
+}
+
 /// The running Zigbee device — owns the full BDB→ZDO→APS→NWK→MAC stack.
-pub struct ZigbeeDevice<M: MacDriver> {
+///
+/// The `R` type parameter is the compile-time logical role (see
+/// [`crate::role`]): it
+/// defaults to [`EndDevice`](crate::role::EndDevice) so existing
+/// `ZigbeeDevice<M>` source keeps building an end device unchanged. A
+/// [`Router`](crate::role::Router)-typed device can only be constructed from a
+/// [`ParentMacDriver`](zigbee_mac::ParentMacDriver) backend and gains the
+/// parent-only operational APIs.
+///
+/// The parent operational surface is bounded on
+/// [`ParentRole`](crate::role::ParentRole), so a leaf end device cannot even
+/// name it — the following does not compile:
+///
+/// ```compile_fail
+/// use zigbee_runtime::ZigbeeDevice;
+/// use zigbee_mac::mock::MockMac;
+///
+/// let mut device = ZigbeeDevice::builder(MockMac::new([0x11; 8])).build();
+/// // `permit_joining` lives behind `ParentRole`; an `EndDevice` has no such
+/// // method, so this is a compile error rather than a silent no-op.
+/// let _ = device.permit_joining(0);
+/// ```
+///
+/// The same holds for `announce_parent`, `service_parent_commands` and the
+/// child-table persistence APIs:
+///
+/// ```compile_fail
+/// use zigbee_runtime::ZigbeeDevice;
+/// use zigbee_mac::mock::MockMac;
+///
+/// let mut device = ZigbeeDevice::builder(MockMac::new([0x11; 8])).build();
+/// let _ = device.announce_parent();
+/// ```
+///
+/// Symmetrically, the R22 End Device Timeout **client** API is bounded on
+/// [`EndDeviceRole`](crate::role::EndDeviceRole), so a router-typed device
+/// cannot name it — the following does not compile (rather than being a
+/// success-shaped no-op on a router):
+///
+/// ```compile_fail
+/// use zigbee_runtime::ZigbeeDevice;
+/// use zigbee_runtime::role::Router;
+/// use zigbee_mac::mock::MockMac;
+///
+/// let mut device: ZigbeeDevice<_, Router> =
+///     ZigbeeDevice::builder(MockMac::new([0x11; 8])).build_router();
+/// // `send_ed_timeout_request` is the leaf-only client obligation; a `Router`
+/// // has no such method.
+/// let _ = device.send_ed_timeout_request();
+/// ```
+pub struct ZigbeeDevice<M: MacDriver, R: crate::role::DeviceRole = crate::role::EndDevice> {
     /// BDB layer (transitively owns ZDO → APS → NWK → MAC).
     bdb: BdbLayer<M>,
     /// Application endpoint configurations.
@@ -1375,24 +2362,178 @@ pub struct ZigbeeDevice<M: MacDriver> {
     state_dirty: bool,
     /// Earliest monotonic time for the next automatic secure-rejoin attempt.
     secure_rejoin_retry_at: Option<u32>,
-    /// Trust Center notifications deferred until an indirect Rejoin Response
-    /// is actually transmitted and acknowledged.
-    pending_child_updates: heapless::Vec<PendingChildUpdate, 8>,
+    /// Per-role runtime state (see [`crate::role::RoleState`]).
+    ///
+    /// This is where every role-specific runtime field now lives, keeping each
+    /// role's RAM off the others: a [`RelayRouter`](crate::role::RelayRouter)
+    /// selects the zero-sized [`NonParentState`](crate::role::NonParentState),
+    /// an [`EndDevice`](crate::role::EndDevice) selects
+    /// [`EndDeviceState`](crate::role::EndDeviceState) (the R22 End Device
+    /// Timeout *client* lifecycle), and a [`Router`](crate::role::Router)
+    /// selects [`ParentState`](crate::role::ParentState) (the deferred
+    /// child-update queue and Parent Announce flag). So a relay carries no role
+    /// RAM at all, an end device carries only the client timeout state, and a
+    /// router carries only the parent/server state. Role-only helpers reach the
+    /// concrete state through [`ParentRole`](crate::role::ParentRole) /
+    /// [`EndDeviceRole`](crate::role::EndDeviceRole).
+    role_state: R::State,
+    /// Zero-sized compile-time logical role marker.
+    _role: core::marker::PhantomData<R>,
 }
 
-impl<M: MacDriver> ZigbeeDevice<M> {
-    const SECURE_REJOIN_RETRY_DELAY_US: u32 = 5_000_000;
-    const PARENT_RX_SLICE_US: u32 = 20_000;
-    const MAX_PARENT_COMMANDS_PER_STEP: u8 = 4;
-    const PENDING_CHILD_UPDATE_TIMEOUT_US: u32 = 10_000_000;
-    /// Poll cadence hint while the event-driven commissioning security
-    /// handshake is still running after network-up.
-    const COMMISSIONING_POLL_MS: u32 = 250;
-
+/// Role-agnostic constructor entry point.
+///
+/// Pinned to the default [`EndDevice`](crate::role::EndDevice) role so
+/// `ZigbeeDevice::builder(mac)` resolves without a role annotation; the actual
+/// role is chosen when the returned builder is finalized with
+/// [`build`](crate::builder::DeviceBuilder::build) (end device) or
+/// [`build_router`](crate::builder::DeviceBuilder::build_router) (router).
+impl<M: MacDriver> ZigbeeDevice<M, crate::role::EndDevice> {
     /// Create a new device builder.
     pub fn builder(mac: M) -> builder::DeviceBuilder<M> {
         builder::DeviceBuilder::new(mac)
     }
+}
+
+/// Parent-only operational API, available only on a router/parent-role device.
+///
+/// These operations are meaningless on a leaf end device, so they live behind
+/// the [`ParentRole`](crate::role::ParentRole) bound instead of being exposed
+/// as success-shaped no-ops on every device. A router-role device can only be
+/// constructed from a [`ParentMacDriver`](zigbee_mac::ParentMacDriver) backend
+/// (see [`DeviceBuilder::build_router`](crate::builder::DeviceBuilder::build_router)),
+/// so reaching this API already implies genuine parent capability.
+impl<M: MacDriver, R: crate::role::ParentRole> ZigbeeDevice<M, R> {
+    /// Open or close child joining through this coordinator/router.
+    ///
+    /// `0` closes immediately, `0xFF` is indefinite, and `1..=254` is a
+    /// duration in seconds aged by [`tick`](Self::tick).
+    pub async fn permit_joining(&mut self, duration: u8) -> Result<(), zigbee_nwk::NwkStatus> {
+        self.bdb
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .nlme_permit_joining(duration)
+            .await
+    }
+
+    /// Broadcast a R22 Parent Announce for this router/coordinator's children.
+    ///
+    /// Explicit runtime hook. A router product calls it after
+    /// [`restore_child_table`](Self::restore_child_table) (and after the
+    /// network is up) so any former parent of a child that has since moved
+    /// prunes its stale entry. Also fired automatically by the joined tick once
+    /// after a child table is restored. Only available on a parent role, so a
+    /// leaf device cannot emit it.
+    pub async fn announce_parent(&mut self) -> Result<(), zigbee_zdo::ZdoError> {
+        self.send_parent_annce_inner().await
+    }
+
+    /// Drain a bounded number of already-received MAC parent-management events
+    /// (beacon requests, association requests, child data requests).
+    ///
+    /// Only available on a parent role. A structural no-op until the device is
+    /// a joined, child-capable parent.
+    pub async fn service_parent_commands(&mut self) -> ParentCommandStep {
+        self.service_parent_commands_inner().await
+    }
+
+    /// Snapshot this router/coordinator's authenticated child table into a
+    /// durable [`ChildTableStore`](crate::child_store::ChildTableStore).
+    ///
+    /// Only available on a parent role — a leaf device has no children to
+    /// persist.
+    pub fn save_child_table<S: child_store::ChildTableStore>(
+        &self,
+        store: &mut S,
+    ) -> Result<(), child_store::ChildStoreError> {
+        self.save_child_table_inner(store)
+    }
+
+    /// Restore the authenticated child table from durable persistence.
+    ///
+    /// Only available on a parent role.
+    pub fn restore_child_table<S: child_store::ChildTableStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<usize, child_store::ChildStoreError> {
+        self.restore_child_table_inner(store)
+    }
+}
+
+/// Test-only accessors for the parent runtime state, so parent tests reach the
+/// role-specific [`ParentState`](crate::role::ParentState) through the
+/// [`ParentRole`](crate::role::ParentRole) accessors rather than a common
+/// field (which no longer exists on a leaf/relay device).
+#[cfg(all(test, feature = "router"))]
+impl<M: MacDriver, R: crate::role::ParentRole> ZigbeeDevice<M, R> {
+    /// Whether a R22 Parent Announce is currently marked due.
+    fn parent_annce_due(&self) -> bool {
+        R::parent_state(&self.role_state).parent_annce_due
+    }
+
+    /// Force the Parent Announce due flag (mirrors a post-restore state).
+    fn set_parent_annce_due(&mut self, due: bool) {
+        R::parent_state_mut(&mut self.role_state).parent_annce_due = due;
+    }
+
+    /// Number of queued deferred Trust Center Update-Device notifications.
+    fn pending_child_update_count(&self) -> usize {
+        R::parent_state(&self.role_state)
+            .pending_child_updates
+            .len()
+    }
+}
+
+/// End-device-only access to the R22 End Device Timeout **client** lifecycle
+/// state.
+///
+/// The client state lives in [`EndDeviceState`](crate::role::EndDeviceState),
+/// reached through the [`EndDeviceRole`](crate::role::EndDeviceRole) accessors,
+/// so a leaf `EndDevice` is the only role that can name it — a relay/router
+/// carries neither the state nor these helpers.
+impl<M: MacDriver, R: crate::role::EndDeviceRole> ZigbeeDevice<M, R> {
+    /// Shared access to the client End Device Timeout state.
+    #[inline]
+    pub(crate) fn ed_timeout(&self) -> &EndDeviceTimeoutState {
+        R::ed_timeout(&self.role_state)
+    }
+
+    /// Exclusive access to the client End Device Timeout state.
+    #[inline]
+    pub(crate) fn ed_timeout_mut(&mut self) -> &mut EndDeviceTimeoutState {
+        R::ed_timeout_mut(&mut self.role_state)
+    }
+
+    /// Reset the client lifecycle to its fresh, unjoined state.
+    ///
+    /// Used by Leave / factory reset via the [`DeviceRole::ed_reset`] hook and
+    /// at the start of a fresh negotiation / resume.
+    #[inline]
+    pub(crate) fn reset_end_device_timeout_state(&mut self) {
+        *self.ed_timeout_mut() = EndDeviceTimeoutState::new();
+    }
+}
+
+impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
+    const SECURE_REJOIN_RETRY_DELAY_US: u32 = 5_000_000;
+    #[cfg(feature = "router")]
+    const PARENT_RX_SLICE_US: u32 = 20_000;
+    const MAX_PARENT_COMMANDS_PER_STEP: u8 = 4;
+    #[cfg(feature = "router")]
+    const PENDING_CHILD_UPDATE_TIMEOUT_US: u32 = 10_000_000;
+    /// Poll cadence hint while the event-driven commissioning security
+    /// handshake is still running after network-up.
+    const COMMISSIONING_POLL_MS: u32 = 250;
+    /// How long an End Device Timeout Response may take to arrive. The
+    /// response is delivered indirectly, so this has to cover the parent's
+    /// transaction persistence plus one forced poll.
+    const ED_TIMEOUT_RESPONSE_WAIT_SECS: u16 = 5;
+    /// Retransmissions of an End Device Timeout Request that drew no response.
+    const ED_TIMEOUT_MAX_RETRIES: u8 = 2;
+    /// Consecutive forced keepalive TX/poll failures tolerated before the
+    /// existing secured-rejoin retry path is scheduled.
+    const ED_TIMEOUT_MAX_FAILURES: u8 = 3;
 
     /// Allocate the next ZCL sequence number.
     fn next_zcl_seq(&mut self) -> u8 {
@@ -1425,7 +2566,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             return Err(event_loop::StartError::CommissioningFailed(status));
         }
         rt_trace!("[RT] start: finish");
-        self.finish_join()
+        self.finish_join().await
     }
 
     /// Initialize and join while durably reserving all security counters.
@@ -1460,7 +2601,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         if let Err(status) = result {
             return Err(event_loop::StartError::CommissioningFailed(status));
         }
-        self.finish_join()
+        self.finish_join().await
     }
 
     /// Resume a committed network when available, otherwise commission a new
@@ -1501,11 +2642,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         if let Err(status) = result {
             return Err(event_loop::StartError::CommissioningFailed(status));
         }
-        self.finish_join()
+        self.finish_join().await
     }
 
     #[inline(never)]
-    fn finish_join(&mut self) -> Result<u16, event_loop::StartError> {
+    async fn finish_join(&mut self) -> Result<u16, event_loop::StartError> {
         let addr = self.bdb.zdo().nwk().nib().network_address.0;
         let ieee = self.bdb.zdo().nwk().nib().ieee_address;
         log::info!("[Runtime] Joined network as 0x{:04X}", addr);
@@ -1515,6 +2656,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
         self.state_dirty = !self.bdb.tclk_exchange_active();
         self.secure_rejoin_retry_at = None;
+        // Single choke point for the R22 End Device Timeout negotiation: every
+        // real join and secured rejoin passes through here, so the initial
+        // request cannot be duplicated or forgotten by an individual entry
+        // point. The silent persisted resume does *not* call this and uses
+        // `resume_end_device_timeout` instead. Dispatched statically so only an
+        // `EndDevice` runs (and links) the client negotiation.
+        R::ed_begin_negotiation(self).await;
         Ok(addr)
     }
 
@@ -1544,6 +2692,12 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         // otherwise it advertises a routing device that never starts its
         // receiver or accepts children.
         self.restore_router_operation().await?;
+
+        // Silent resume keeps the stored parent relationship, so the cheapest
+        // keepalive the parent advertised is enough to refresh the child
+        // timer — no fresh negotiation is needed. Dispatched statically so only
+        // an `EndDevice` runs (and links) the client resume.
+        R::ed_resume(self).await;
 
         self.state_dirty = true;
         self.secure_rejoin_retry_at = None;
@@ -1630,7 +2784,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     pub async fn secure_rejoin(&mut self) -> Result<u16, event_loop::StartError> {
         self.bdb.zdo_mut().nwk_mut().set_joined(false);
         let mut result = match self.bdb.rejoin_previous_network().await {
-            Ok(()) => self.finish_join(),
+            Ok(()) => self.finish_join().await,
             Err(status) => Err(event_loop::StartError::CommissioningFailed(status)),
         };
         if result.is_ok()
@@ -1639,7 +2793,6 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             result = Err(error);
         }
         if result.is_ok() {
-            self.send_ed_timeout_request().await;
             self.secure_rejoin_retry_at = None;
         } else {
             self.schedule_secure_rejoin_retry();
@@ -1723,6 +2876,12 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         state.depth = nib.depth;
         state.parent_address = nib.parent_address.0;
         state.update_id = nib.update_id;
+        // A secured rejoin re-selects a parent, so the negotiation the NWK
+        // layer just reset (and whatever the new parent has already answered)
+        // is committed together with the new parent address.
+        state.parent_information = nib.parent_information;
+        state.parent_information_valid = nib.parent_information_valid;
+        state.end_device_timeout = nib.end_device_timeout;
         state.rejoin_pending = false;
         store
             .store(&state)
@@ -1756,6 +2915,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.bdb.zdo_mut().nwk_mut().set_joined(false);
         self.reset_identify_clusters();
         self.secure_rejoin_retry_at = None;
+        R::ed_reset(self);
         self.state_dirty = true;
     }
 
@@ -1799,6 +2959,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.basic_cluster.reset_to_factory_defaults();
         self.reset_identify_clusters();
         self.secure_rejoin_retry_at = None;
+        R::ed_reset(self);
         log::info!("[Runtime] Factory reset complete");
     }
 
@@ -1935,13 +3096,19 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         })
     }
 
-    fn with_cluster<R>(
+    // Immutable cluster lookup. The receive path's read-only ZCL dispatch now
+    // lives in the `MacDriver`-independent `zcl_dispatch::LocalZclCtx`, so this
+    // is only exercised by the cluster-routing unit tests below; the mutable
+    // twin `with_cluster_mut` is still used by the Identify tick in
+    // `event_loop`.
+    #[cfg(test)]
+    fn with_cluster<T>(
         &self,
         endpoint: u8,
         cluster_id: ClusterId,
         clusters: &[ClusterRef<'_>],
-        access: impl FnOnce(&dyn Cluster) -> R,
-    ) -> Option<R> {
+        access: impl FnOnce(&dyn Cluster) -> T,
+    ) -> Option<T> {
         if !self.endpoint_has_server_cluster(endpoint, cluster_id) {
             return None;
         }
@@ -1961,13 +3128,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         }
     }
 
-    fn with_cluster_mut<R>(
+    fn with_cluster_mut<T>(
         &mut self,
         endpoint: u8,
         cluster_id: ClusterId,
         clusters: &mut [ClusterRef<'_>],
-        access: impl FnOnce(&mut dyn Cluster) -> R,
-    ) -> Option<R> {
+        access: impl FnOnce(&mut dyn Cluster) -> T,
+    ) -> Option<T> {
         if !self.endpoint_has_server_cluster(endpoint, cluster_id) {
             return None;
         }
@@ -2032,6 +3199,141 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
     // ── NV Persistence ─────────────────────────────────────
 
+    /// Snapshot this router/coordinator's authenticated child table into a
+    /// durable [`ChildTableStore`](crate::child_store::ChildTableStore).
+    ///
+    /// Persists every authenticated child (identity, short address,
+    /// capability/configuration and accepted End Device Timeout enumeration)
+    /// so a reboot can restore live child state before Parent Announce. An end
+    /// device or non-routing build has no children and stores an empty table.
+    ///
+    /// This store is independent of the security journal: it never reads or
+    /// writes NWK/APS frame counters, so persisting the child table can never
+    /// disturb the crash-safe counter reservation.
+    ///
+    /// This is the private implementation. The public
+    /// [`save_child_table`](Self::save_child_table) lives behind
+    /// [`ParentRole`](crate::role::ParentRole) so a leaf device never exposes
+    /// child-table persistence.
+    fn save_child_table_inner<S: child_store::ChildTableStore>(
+        &self,
+        store: &mut S,
+    ) -> Result<(), child_store::ChildStoreError> {
+        use zigbee_nwk::neighbor::{NeighborDeviceType, Relationship};
+
+        let mut table = child_store::PersistentChildTable::new();
+        for entry in self.bdb.zdo().nwk().neighbor_table().iter() {
+            if entry.relationship != Relationship::Child {
+                continue;
+            }
+            let child = child_store::PersistentChild {
+                ieee_address: entry.ieee_address,
+                short_address: entry.network_address.0,
+                rx_on_when_idle: entry.rx_on_when_idle,
+                security_capable: entry.security_capable,
+                is_router: entry.device_type == NeighborDeviceType::Router,
+                end_device_timeout: entry.end_device_timeout,
+            };
+            if table.push(child).is_err() {
+                // The neighbour table cannot hold more children than the
+                // persisted table, so this is unreachable, but never silently
+                // drop children — report the overflow.
+                return Err(child_store::ChildStoreError::Full);
+            }
+        }
+        store.store(&table)
+    }
+
+    /// Restore the authenticated child table from durable persistence.
+    ///
+    /// Must run **before** Parent Announce so the announced child list is
+    /// authoritative. Re-installs each persisted child as an authenticated
+    /// neighbour and re-arms an end-device child's End Device Timeout deadline
+    /// to a fresh full window. Returns the number of children restored (`0` if
+    /// nothing was persisted or this is not a routing device).
+    ///
+    /// A corrupt or unreadable store is surfaced as an error rather than
+    /// silently treated as "no children", so a caller can distinguish "no
+    /// child table yet" (`Ok(0)`) from a real persistence fault.
+    ///
+    /// This is the private implementation. The public
+    /// [`restore_child_table`](Self::restore_child_table) lives behind
+    /// [`ParentRole`](crate::role::ParentRole).
+    fn restore_child_table_inner<S: child_store::ChildTableStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<usize, child_store::ChildStoreError>
+    where
+        R: crate::role::ParentRole,
+    {
+        let Some(table) = store.load()? else {
+            return Ok(0);
+        };
+        table.validate()?;
+        if !self.bdb.zdo().nwk().can_route() {
+            return Ok(0);
+        }
+        let mut restored = 0;
+        let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
+        for child in table.children() {
+            if nwk.restore_child(
+                child.ieee_address,
+                ShortAddress(child.short_address),
+                child.rx_on_when_idle,
+                child.security_capable,
+                child.is_router,
+                child.end_device_timeout,
+            ) {
+                restored += 1;
+            }
+        }
+        // Restored child state is now authoritative, so a R22 Parent Announce
+        // is due once the network is up. This is tied to the product's
+        // explicit restore call rather than invented automatically.
+        if restored > 0 {
+            R::parent_state_mut(&mut self.role_state).parent_annce_due = true;
+        }
+        log::info!("[Runtime] Restored {restored} children from durable child table");
+        Ok(restored)
+    }
+
+    /// Broadcast a R22 Parent Announce for this router/coordinator's children.
+    ///
+    /// Private implementation of the Parent Announce transmit. Bounded on
+    /// [`ParentRole`](crate::role::ParentRole) since it clears the parent-only
+    /// due flag; the event loop's due-announce servicing reaches it through the
+    /// static role dispatch, so a leaf device never links it.
+    async fn send_parent_annce_inner(&mut self) -> Result<(), zigbee_zdo::ZdoError>
+    where
+        R: crate::role::ParentRole,
+    {
+        R::parent_state_mut(&mut self.role_state).parent_annce_due = false;
+        self.bdb.zdo_mut().send_parent_annce().await
+    }
+
+    /// Send a due Parent Announce once the restored child table is
+    /// authoritative and the network is up. Dispatched from the joined tick
+    /// only for a [`Router`](crate::role::Router) role (see
+    /// [`DeviceRole::run_role_nwk_maintenance`](crate::role::DeviceRole::run_role_nwk_maintenance)),
+    /// so a non-parent role never links the Parent Announce transmit code.
+    #[cfg(feature = "router")]
+    pub(crate) async fn service_due_parent_annce(&mut self)
+    where
+        R: crate::role::ParentRole,
+    {
+        if !R::parent_state(&self.role_state).parent_annce_due {
+            return;
+        }
+        if !self.is_joined() || !self.bdb.zdo().nwk().can_route() {
+            return;
+        }
+        if let Err(error) = self.send_parent_annce_inner().await {
+            // Keep the flag set so a later tick retries once the path is up.
+            R::parent_state_mut(&mut self.role_state).parent_annce_due = true;
+            log::warn!("[Runtime] Parent_annce send failed: {:?}", error);
+        }
+    }
+
     /// Restore a fully commissioned network and reserve fresh counter ranges
     /// before any secured rejoin traffic can be sent.
     pub fn restore_security_state<S: SecurityStateStore>(
@@ -2085,6 +3387,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             nib.update_id = state.update_id;
             nib.active_key_seq_number = state.key_sequence;
             nib.security_enabled = true;
+            // The stored parent relationship is still in force after a silent
+            // resume, so the negotiated keepalive method and timeout are
+            // restored with it. A record that fails validation here has
+            // already been rejected by `state.validate()`.
+            if !nib.restore_end_device_timeout(
+                state.parent_information,
+                state.parent_information_valid,
+                state.end_device_timeout,
+            ) {
+                return Err(SecurityStoreError::Corrupt);
+            }
             if !nib.set_frame_counter_reservation(global_current, global_limit) {
                 return Err(SecurityStoreError::Corrupt);
             }
@@ -2193,6 +3506,19 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
         };
 
+        // R22 End Device Timeout negotiation result. Persisting it is what
+        // lets a silent resume pick the cheap MAC-poll keepalive instead of
+        // renegotiating on every reboot; the NIB is authoritative here because
+        // both the NWK receive path and a parent change write it directly.
+        let end_device_timeout_changed = state.parent_information != nib.parent_information
+            || state.parent_information_valid != nib.parent_information_valid
+            || state.end_device_timeout != nib.end_device_timeout;
+        if end_device_timeout_changed {
+            state.parent_information = nib.parent_information;
+            state.parent_information_valid = nib.parent_information_valid;
+            state.end_device_timeout = nib.end_device_timeout;
+        }
+
         // Set when a unique Trust Center link key transported at runtime is
         // adopted into the durable store below; the live APS entry then has to
         // start from the reserved floor rather than its counter of zero.
@@ -2292,7 +3618,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
         };
 
-        let mut changed = adopted_current.is_some() || network_key_changed || staged_key_changed;
+        let mut changed = adopted_current.is_some()
+            || network_key_changed
+            || staged_key_changed
+            || end_device_timeout_changed;
         let mut new_global_limit = nib.outgoing_frame_counter_limit;
         if nib
             .outgoing_frame_counter_limit
@@ -2406,6 +3735,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.reset_identify_clusters();
         self.state_dirty = false;
         self.secure_rejoin_retry_at = None;
+        R::ed_reset(self);
         Ok(())
     }
 
@@ -2780,6 +4110,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     // ── MAC proxy ───────────────────────────────────────────
 
     fn parent_mode_active(&self) -> bool {
+        // A device whose logical role is not a parent never serves children,
+        // even if it is a routing FFD — this is the typed parent invariant.
+        if !R::IS_PARENT {
+            return false;
+        }
         let nwk = self.bdb.zdo().aps().nwk();
         let capabilities = nwk.mac().capabilities();
         nwk.can_route()
@@ -2870,19 +4205,49 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         }
     }
 
-    fn prune_pending_child_updates(&mut self) {
+    fn prune_pending_child_updates(&mut self)
+    where
+        R: crate::role::ParentRole,
+    {
         let now = self.bdb.zdo().nwk().mac().monotonic_micros();
-        self.pending_child_updates
+        R::parent_state_mut(&mut self.role_state)
+            .pending_child_updates
             .retain(|pending| now.wrapping_sub(pending.expires_at_us) >= 0x8000_0000);
     }
 
+    /// Drop runtime-owned state coupled to a child the NWK layer just evicted.
+    ///
+    /// The NWK layer already cleaned the neighbour entry, indirect queue,
+    /// routing entry, replay counters and MAC Frame Pending for `child`; a
+    /// deferred Trust Center Update-Device is the runtime's own coupled state,
+    /// so it is dropped here to keep the two consistent. A child that later
+    /// re-associates re-runs the notification from scratch.
+    ///
+    /// Only a parent evicts children, so this is compiled only in `router`
+    /// builds; a sensor image never links End Device Timeout child eviction.
+    #[cfg(feature = "router")]
+    fn forget_evicted_child(&mut self, child: ShortAddress)
+    where
+        R: crate::role::ParentRole,
+    {
+        R::parent_state_mut(&mut self.role_state)
+            .pending_child_updates
+            .retain(|pending| {
+                pending.poll_address != child && pending.device_short_address != child
+            });
+    }
+
+    #[cfg(feature = "router")]
     fn queue_pending_child_update(
         &mut self,
         poll_address: ShortAddress,
         device_address: IeeeAddress,
         device_short_address: ShortAddress,
         status: zigbee_aps::apsme::ApsUpdateDeviceStatus,
-    ) -> Result<(), MacError> {
+    ) -> Result<(), MacError>
+    where
+        R: crate::role::ParentRole,
+    {
         self.prune_pending_child_updates();
         let expires_at_us = self
             .bdb
@@ -2898,13 +4263,14 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             status,
             expires_at_us,
         };
-        if let Some(existing) = self.pending_child_updates.iter_mut().find(|existing| {
+        let updates = &mut R::parent_state_mut(&mut self.role_state).pending_child_updates;
+        if let Some(existing) = updates.iter_mut().find(|existing| {
             existing.poll_address == poll_address || existing.device_address == device_address
         }) {
             *existing = pending;
             return Ok(());
         }
-        self.pending_child_updates
+        updates
             .push(pending)
             .map_err(|_| MacError::TransactionOverflow)
     }
@@ -2912,16 +4278,21 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     async fn complete_pending_child_update(
         &mut self,
         poll_address: ShortAddress,
-    ) -> Result<(), MacError> {
+    ) -> Result<(), MacError>
+    where
+        R: crate::role::ParentRole,
+    {
         self.prune_pending_child_updates();
-        let Some(index) = self
+        let Some(index) = R::parent_state(&self.role_state)
             .pending_child_updates
             .iter()
             .position(|pending| pending.poll_address == poll_address)
         else {
             return Ok(());
         };
-        let pending = self.pending_child_updates.swap_remove(index);
+        let pending = R::parent_state_mut(&mut self.role_state)
+            .pending_child_updates
+            .swap_remove(index);
         self.notify_trust_center_of_child(
             pending.device_address,
             pending.device_short_address,
@@ -2931,7 +4302,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         .map_err(|_| MacError::SecurityError)
     }
 
-    async fn handle_parent_command(&mut self, event: MacCommandEvent) -> Result<(), MacError> {
+    async fn handle_parent_command(&mut self, event: MacCommandEvent) -> Result<(), MacError>
+    where
+        R: crate::role::ParentRole,
+    {
         match event {
             MacCommandEvent::BeaconRequest(_) => {
                 let response = self.parent_beacon_response();
@@ -3036,7 +4410,18 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// The zero-timeout poll never starts a long radio window. Limiting each
     /// call to four events prevents beacon/association traffic from starving
     /// normal MCPS data.
-    pub async fn service_parent_commands(&mut self) -> ParentCommandStep {
+    ///
+    /// Private implementation. The public
+    /// [`service_parent_commands`](Self::service_parent_commands) is bounded on
+    /// [`ParentRole`](crate::role::ParentRole); this inert helper is likewise
+    /// parent-only and is dispatched into a router monomorphization by the
+    /// static role hooks, so a non-parent role never links it. It is also a
+    /// structural no-op whenever [`parent_mode_active`](Self::parent_mode_active)
+    /// is false.
+    pub(crate) async fn service_parent_commands_inner(&mut self) -> ParentCommandStep
+    where
+        R: crate::role::ParentRole,
+    {
         let mut outcome = ParentCommandStep::default();
         if !self.parent_mode_active() {
             return outcome;
@@ -3067,19 +4452,6 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         outcome
     }
 
-    /// Open or close child joining through this coordinator/router.
-    ///
-    /// `0` closes immediately, `0xFF` is indefinite, and `1..=254` is a
-    /// duration in seconds aged by [`tick`](Self::tick).
-    pub async fn permit_joining(&mut self, duration: u8) -> Result<(), zigbee_nwk::NwkStatus> {
-        self.bdb
-            .zdo_mut()
-            .aps_mut()
-            .nwk_mut()
-            .nlme_permit_joining(duration)
-            .await
-    }
-
     /// Wait for an incoming MAC frame. Blocks until a frame arrives.
     ///
     /// Use with `select!` and a timer for non-blocking operation:
@@ -3090,17 +4462,20 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// }
     /// ```
     pub async fn receive(&mut self) -> Result<McpsDataIndication, MacError> {
+        // Parent RX slicing (interleaving MAC parent-command servicing with the
+        // receive window) exists only in router builds. A non-routing device
+        // waits on the MAC directly and never links the parent-command path.
+        #[cfg(feature = "router")]
         if self.parent_mode_active() {
-            self.receive_timeout(Self::PARENT_RX_SLICE_US).await
-        } else {
-            self.bdb
-                .zdo_mut()
-                .aps_mut()
-                .nwk_mut()
-                .mac_mut()
-                .mcps_data_indication()
-                .await
+            return self.receive_timeout(Self::PARENT_RX_SLICE_US).await;
         }
+        self.bdb
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut()
+            .mcps_data_indication()
+            .await
     }
 
     /// Wait for an incoming MAC frame for at most `timeout_us`.
@@ -3108,14 +4483,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// Parent-mode command servicing runs before and after the bounded RX
     /// window, matching [`Self::receive`] while allowing an application to
     /// shorten the slice when [`event_loop::TickResult::RunAgain`] requests an
-    /// earlier runtime deadline.
+    /// earlier runtime deadline. The parent servicing is dispatched statically
+    /// through the role, so only a router monomorphization links (and runs) it.
     pub async fn receive_timeout(
         &mut self,
         timeout_us: u32,
     ) -> Result<McpsDataIndication, MacError> {
-        if self.parent_mode_active() {
-            let _ = self.service_parent_commands().await;
-        }
+        // Parent-command servicing is dispatched statically through the role:
+        // only a `Router` monomorphization materializes the servicing future,
+        // and it self-gates on `parent_mode_active`. A relay/end device is a
+        // compile-time no-op here, so no parent future is instantiated.
+        R::run_role_parent_servicing(self).await;
         let result = self
             .bdb
             .zdo_mut()
@@ -3124,9 +4502,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             .mac_mut()
             .mcps_data_indication_timeout(timeout_us)
             .await;
-        if self.parent_mode_active() {
-            let _ = self.service_parent_commands().await;
-        }
+        R::run_role_parent_servicing(self).await;
         result
     }
 
@@ -3135,6 +4511,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// Sends a MAC Data Request to the coordinator/parent and returns
     /// any queued frame. Returns `None` if no data is pending.
     /// After calling this, feed the result into `process_incoming()`.
+    ///
+    /// A completed poll also refreshes the R22 End Device Timeout keepalive
+    /// deadline — unless the parent advertised *only* End Device Timeout
+    /// Request keepalive, in which case a poll does not reset its child timer
+    /// and must not postpone the next request either.
     pub async fn poll(&mut self) -> Result<Option<McpsDataIndication>, MacError> {
         let frame = self
             .bdb
@@ -3145,6 +4526,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             .mlme_poll()
             .await?;
         self.power.record_poll(self.power_now_ms);
+        R::ed_note_poll(self);
         match frame {
             Some(frame) => {
                 self.power.record_activity(self.power_now_ms);
@@ -3167,13 +4549,23 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
     // ── Incoming frame processing ───────────────────────────
 
+    /// Answer a child's Rejoin Request and notify the Trust Center.
+    ///
+    /// Only a parent accepts children, so this is bounded on
+    /// [`ParentRole`](crate::role::ParentRole) and compiled only in `router`
+    /// builds. It is reached through the static role dispatch of
+    /// [`ParentNwkOutcome::ChildRejoinRequest`], so a sensor/relay build
+    /// neither observes it nor links this rejoin / Update-Device path.
+    #[cfg(feature = "router")]
     async fn handle_child_rejoin_request(
         &mut self,
         request_address: ShortAddress,
         device_address: IeeeAddress,
         capability_info: u8,
         secured: bool,
-    ) {
+    ) where
+        R: crate::role::ParentRole,
+    {
         let capability = CapabilityInfo::from_byte(capability_info);
         let trust_center_mode = self.trust_center_mode();
         let was_existing = self
@@ -3315,9 +4707,88 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 capability_info,
                 secured,
             } => {
+                // Only a parent answers a child's Rejoin Request. Dispatched
+                // statically through the role type so a relay (whose
+                // `NwkLayer::can_route` is true) or an end device never answers
+                // it and never materializes the rejoin / Update-Device future.
+                R::service_parent_nwk_outcome(
+                    self,
+                    ParentNwkOutcome::ChildRejoinRequest {
+                        src,
+                        ieee,
+                        capability_info,
+                        secured,
+                    },
+                )
+                .await;
+                None
+            }
+            zigbee_nwk::nlde::NwkCommandOutcome::EndDeviceTimeoutRequest {
+                src,
+                ieee,
+                requested_timeout,
+            } => {
+                // The NWK layer validated the request came from an
+                // authenticated attached child; a parent applies the policy and
+                // transmits the 0x0C response (indirectly for a sleepy child).
+                // Dispatched statically through the role type so a relay/end
+                // device never answers it and never links the End Device
+                // Timeout *server*.
+                R::service_parent_nwk_outcome(
+                    self,
+                    ParentNwkOutcome::EndDeviceTimeoutRequest {
+                        src,
+                        ieee,
+                        requested_timeout,
+                    },
+                )
+                .await;
+                None
+            }
+        }
+    }
+
+    /// Perform a router's response to a parent-only NWK command outcome.
+    ///
+    /// Bounded on [`ParentRole`](crate::role::ParentRole) and reached only from
+    /// [`Router`](crate::role::Router)'s
+    /// [`service_parent_nwk_outcome`](crate::role::DeviceRole::service_parent_nwk_outcome)
+    /// hook, so a relay/end device build neither observes nor links the child
+    /// rejoin / Update-Device / End Device Timeout server subgraph.
+    #[cfg(feature = "router")]
+    pub(crate) async fn dispatch_parent_nwk_outcome(&mut self, outcome: ParentNwkOutcome)
+    where
+        R: crate::role::ParentRole,
+    {
+        match outcome {
+            ParentNwkOutcome::ChildRejoinRequest {
+                src,
+                ieee,
+                capability_info,
+                secured,
+            } => {
                 self.handle_child_rejoin_request(src, ieee, capability_info, secured)
                     .await;
-                None
+            }
+            ParentNwkOutcome::EndDeviceTimeoutRequest {
+                src,
+                ieee,
+                requested_timeout,
+            } => {
+                if let Err(error) = self
+                    .bdb
+                    .zdo_mut()
+                    .aps_mut()
+                    .nwk_mut()
+                    .respond_to_end_device_timeout_request(src, ieee, requested_timeout)
+                    .await
+                {
+                    log::warn!(
+                        "[Runtime] ED Timeout Response to 0x{:04X} failed: {:?}",
+                        src.0,
+                        error
+                    );
+                }
             }
         }
     }
@@ -3356,6 +4827,9 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             _ => None,
         };
 
+        let negotiates_timeout = self.negotiates_end_device_timeout();
+        let timeout_before = negotiates_timeout.then(|| self.end_device_timeout_snapshot());
+
         let (nwk_indication, command_outcome) = {
             let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
             let nwk_indication = nwk
@@ -3367,40 +4841,29 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             (nwk_indication, nwk.take_command_outcome())
         };
 
+        // An End Device Timeout Response (0x0C) changes NIB state only and
+        // deliberately reports no lifecycle outcome, so the client lifecycle
+        // is driven from the before/after difference. This also covers the
+        // negotiation reset a Leave performs. Dispatched statically so only an
+        // `EndDevice` runs (and links) the client-side apply.
+        if let Some(before) = timeout_before {
+            R::ed_apply_timeout_change(self, before).await;
+        }
+
         // NWK commands never carry an NLDE-DATA payload; a lifecycle outcome
         // is the whole result of the frame.
         if let Some(command) = command_outcome {
             return self.handle_nwk_command_outcome(command).await;
         }
 
-        let (dst, src, nwk_security, nwk_security_source, len) = match nwk_indication {
-            None => {
-                rt_trace!("[RT] nwk_rx=dropped len={}", mac_payload.len());
-                return None;
-            }
-            Some(zigbee_nwk::nlde::NwkIndication::Borrowed(data)) => {
-                let buf = unsafe { &mut *self.scratch.nwk.get() };
-                let len = data.payload.len().min(buf.len());
-                buf[..len].copy_from_slice(&data.payload[..len]);
-                (
-                    data.dst_addr,
-                    data.src_addr,
-                    data.security_use,
-                    data.security_source,
-                    len,
-                )
-            }
-            Some(zigbee_nwk::nlde::NwkIndication::Owned(data)) => {
-                let buf = unsafe { &mut *self.scratch.nwk.get() };
-                let len = data.payload.len().min(buf.len());
-                buf[..len].copy_from_slice(&data.payload[..len]);
-                (
-                    data.dst_addr,
-                    data.src_addr,
-                    data.security_use,
-                    data.security_source,
-                    len,
-                )
+        let (dst, src, nwk_security, nwk_security_source, len) = {
+            let scratch_nwk = unsafe { &mut *self.scratch.nwk.get() };
+            match unpack_nwk_indication(scratch_nwk, nwk_indication) {
+                Some(v) => v,
+                None => {
+                    rt_trace!("[RT] nwk_rx=dropped len={}", mac_payload.len());
+                    return None;
+                }
             }
         };
 
@@ -3452,31 +4915,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             }
         };
 
-        // Route by destination endpoint
-        let dst_ep = aps_indication.dst_endpoint;
-        let cluster_id = aps_indication.cluster_id;
-        let profile_id = aps_indication.profile_id;
-        let src_addr = match aps_indication.src_address {
-            ApsAddress::Short(a) => a.0,
-            _ => 0,
-        };
-
-        rt_trace!(
-            "[RT] aps dst_ep={} prof=0x{:04X} cluster=0x{:04X} src=0x{:04X} payload={}",
-            dst_ep,
-            profile_id,
-            cluster_id,
-            src_addr,
-            aps_indication.payload.len()
-        );
-        log::info!(
-            "[RX] APS dst_ep={} prof=0x{:04X} cluster=0x{:04X} src=0x{:04X} len={}",
-            dst_ep,
-            profile_id,
-            cluster_id,
-            src_addr,
-            aps_indication.payload.len()
-        );
+        // Route by destination endpoint. Reading the metadata and emitting the
+        // RX trace/log line is a synchronous, `MacDriver`-independent step, so
+        // it runs in the shared `#[inline(never)]` `aps_route_metadata` helper
+        // kept out of the per-backend receive future.
+        let (dst_ep, cluster_id, src_addr) = aps_route_metadata(&aps_indication);
 
         // Send APS ACK now if the incoming frame requested one. This must
         // happen for *every* endpoint (ZDO and application clusters alike),
@@ -3560,1066 +5003,61 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             return None;
         }
 
-        // Application endpoint — parse ZCL frame
-        rt_trace!(
-            "[RT] zcl ep={} cluster=0x{:04X} from=0x{:04X} len={}",
+        // Application endpoint — local ZCL work runs in a synchronous,
+        // `MacDriver`-independent dispatcher so the full ZCL command/attribute
+        // engine is not monomorphised into every backend's async receive
+        // future. It parses the ZCL frame, runs foundation and cluster-specific
+        // handling against runtime-local state, and enqueues responses into the
+        // shared pending-response queue (drained by `flush_pending_responses`).
+        // The only `M`-generic side effects — APS group-table updates and the
+        // Finding & Binding Identify collection — are returned as actions and
+        // applied here, after the borrow of runtime-local state is released.
+        let zcl_scratch = unsafe { &mut *self.scratch.zcl.get() };
+        let outcome = zcl_dispatch::LocalZclCtx::new(
+            &self.endpoints,
+            &mut self.basic_cluster,
+            &mut self.identify_clusters,
+            &mut self.reporting,
+            &mut self.pending_responses,
+            clusters,
+            zcl_scratch,
+        )
+        .dispatch(
             dst_ep,
+            aps_indication.src_endpoint,
             cluster_id,
             src_addr,
-            aps_indication.payload.len()
-        );
-        log::info!(
-            "[Runtime] ZCL frame: ep={} cluster=0x{:04X} from 0x{:04X} len={}",
-            dst_ep,
-            cluster_id,
-            src_addr,
-            aps_indication.payload.len()
-        );
-        let zcl_frame = match ZclFrame::parse(aps_indication.payload) {
-            Ok(f) => f,
-            Err(_) => {
-                log::warn!("[Runtime] Failed to parse ZCL frame on ep {}", dst_ep);
-                return None;
-            }
-        };
-
-        let cmd_id = zcl_frame.header.command_id.0;
-        rt_trace!(
-            "[RT] zcl_cmd ep={} cluster=0x{:04X} cmd=0x{:02X} seq={} dir={:?} payload={}",
-            dst_ep,
-            cluster_id,
-            cmd_id,
-            zcl_frame.header.seq_number,
-            zcl_frame.header.direction(),
-            zcl_frame.payload.len(),
+            aps_indication.payload,
         );
 
-        // Check if this is a Report Attributes (0x0A) — incoming report from remote
-        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && cmd_id == 0x0A
-        {
-            return Some(event_loop::StackEvent::AttributeReport {
-                src_addr,
-                endpoint: dst_ep,
-                cluster_id,
-                attr_id: if aps_indication.payload.len() >= 5 {
-                    u16::from_le_bytes([aps_indication.payload[3], aps_indication.payload[4]])
-                } else {
-                    0
-                },
-            });
-        }
-
-        // Check if this is a Default Response (0x0B) — received from remote
-        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && cmd_id == 0x0B
-        {
-            let (resp_cmd, resp_status) = if zcl_frame.payload.len() >= 2 {
-                (zcl_frame.payload[0], zcl_frame.payload[1])
-            } else {
-                (0, 0)
-            };
-            log::debug!(
-                "[Runtime] Default Response for cmd 0x{:02X} status=0x{:02X} from 0x{:04X}",
-                resp_cmd,
-                resp_status,
-                src_addr,
-            );
-            return Some(event_loop::StackEvent::DefaultResponse {
-                src_addr,
-                endpoint: dst_ep,
-                cluster_id,
-                command_id: resp_cmd,
-                status: resp_status,
-            });
-        }
-
-        // Check if this is Configure Reporting (0x06) — coordinator configuring our reports
-        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && cmd_id == 0x06
-            && zcl_frame.header.direction() == ClusterDirection::ClientToServer
-        {
-            use zigbee_zcl::foundation::reporting::{
-                ConfigureReportingResponse, ConfigureReportingStatusRecord, ReportDirection,
-                ReportingConfig,
-            };
-            let payload = zcl_frame.payload.as_slice();
-            let mut response = ConfigureReportingResponse {
-                records: heapless::Vec::new(),
-            };
-            let mut i = 0usize;
-            let mut records = 0usize;
-            let mut parse_ok = true;
-            rt_trace!(
-                "[RT] zcl_cfg_reporting ep={} cluster=0x{:04X} len={}",
-                dst_ep,
-                cluster_id,
-                payload.len(),
-            );
-
-            while i < payload.len() {
-                let direction = match payload[i] {
-                    0x00 => ReportDirection::Send,
-                    0x01 => ReportDirection::Receive,
-                    _other => {
-                        rt_trace!("[RT] zcl_cfg bad_dir=0x{:02X}", _other);
-                        parse_ok = false;
-                        break;
-                    }
-                };
-                i += 1;
-                if i + 2 > payload.len() {
-                    parse_ok = false;
-                    break;
+        if let Some(action) = outcome.group_action {
+            let aps = self.bdb.zdo_mut().aps_mut();
+            match action {
+                zcl_dispatch::GroupTableAction::Add { group, endpoint } => {
+                    let _ = aps.apsme_add_group(&zigbee_aps::apsme::ApsmeAddGroupRequest {
+                        group_address: group,
+                        endpoint,
+                    });
                 }
-                let attribute_id =
-                    zigbee_zcl::AttributeId(u16::from_le_bytes([payload[i], payload[i + 1]]));
-                i += 2;
-
-                let cfg = if direction == ReportDirection::Send {
-                    if i + 5 > payload.len() {
-                        parse_ok = false;
-                        break;
-                    }
-                    let Some(data_type) = zigbee_zcl::data_types::ZclDataType::from_u8(payload[i])
-                    else {
-                        rt_trace!("[RT] zcl_cfg bad_type=0x{:02X}", payload[i]);
-                        parse_ok = false;
-                        break;
-                    };
-                    i += 1;
-                    let min_interval = u16::from_le_bytes([payload[i], payload[i + 1]]);
-                    i += 2;
-                    let max_interval = u16::from_le_bytes([payload[i], payload[i + 1]]);
-                    i += 2;
-                    let reportable_change = if zigbee_zcl::data_types::is_analog_type(data_type) {
-                        let Some((val, consumed)) =
-                            zigbee_zcl::data_types::ZclValue::deserialize(data_type, &payload[i..])
-                        else {
-                            parse_ok = false;
-                            break;
-                        };
-                        i += consumed;
-                        Some(val)
-                    } else {
-                        None
-                    };
-                    ReportingConfig {
-                        direction,
-                        attribute_id,
-                        data_type,
-                        min_interval,
-                        max_interval,
-                        reportable_change,
-                    }
-                } else {
-                    if i + 2 > payload.len() {
-                        parse_ok = false;
-                        break;
-                    }
-                    let timeout = u16::from_le_bytes([payload[i], payload[i + 1]]);
-                    i += 2;
-                    ReportingConfig {
-                        direction,
-                        attribute_id,
-                        data_type: zigbee_zcl::data_types::ZclDataType::NoData,
-                        min_interval: 0,
-                        max_interval: timeout,
-                        reportable_change: None,
-                    }
-                };
-
-                let attr_access = self
-                    .with_cluster(dst_ep, ClusterId(cluster_id), clusters, |cluster| {
-                        cluster
-                            .attributes()
-                            .find(cfg.attribute_id)
-                            .map(|definition| definition.access)
-                    })
-                    .flatten();
-                let status = if let Some(access) = attr_access {
-                    if cfg.direction == ReportDirection::Send && !access.is_reportable() {
-                        ZclStatus::UnreportableAttribute
-                    } else {
-                        match self
-                            .reporting
-                            .configure_for_cluster(dst_ep, cluster_id, cfg.clone())
-                        {
-                            Ok(()) => ZclStatus::Success,
-                            Err(s) => s,
-                        }
-                    }
-                } else {
-                    ZclStatus::UnsupportedAttribute
-                };
-                let _ = response.records.push(ConfigureReportingStatusRecord {
-                    status,
-                    direction: cfg.direction,
-                    attribute_id: cfg.attribute_id,
-                });
-                records += 1;
-                rt_trace!(
-                    "[RT] zcl_cfg attr=0x{:04X} dir={} status=0x{:02X}",
-                    cfg.attribute_id.0,
-                    cfg.direction as u8,
-                    status as u8,
-                );
-            }
-
-            if parse_ok && records > 0 {
-                // Queue Configure Reporting Response (0x07)
-                self.queue_reporting_response(
-                    ShortAddress(src_addr),
-                    aps_indication.src_endpoint,
-                    dst_ep,
-                    cluster_id,
-                    zcl_frame.header.seq_number,
-                    &response,
-                );
-                log::info!(
-                    "[Runtime] Configure Reporting: ep={} cluster=0x{:04X} ({} attrs)",
-                    dst_ep,
-                    cluster_id,
-                    records
-                );
-            } else {
-                rt_trace!(
-                    "[RT] zcl_cfg_reporting parse_fail ep={} cluster=0x{:04X} len={}",
-                    dst_ep,
-                    cluster_id,
-                    zcl_frame.payload.len(),
-                );
-            }
-            return Some(event_loop::StackEvent::CommandReceived {
-                src_addr,
-                source_endpoint: aps_indication.src_endpoint,
-                endpoint: dst_ep,
-                cluster_id,
-                command_id: cmd_id,
-                seq_number: zcl_frame.header.seq_number,
-                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
-                    .unwrap_or_default(),
-            });
-        }
-
-        // Check if this is Read Reporting Config (0x08)
-        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && cmd_id == 0x08
-            && zcl_frame.header.direction() == ClusterDirection::ClientToServer
-        {
-            use zigbee_zcl::foundation::reporting::{
-                ReadReportingConfigRequest, ReadReportingConfigResponse,
-                ReadReportingConfigResponseRecord,
-            };
-            if let Some(req) = ReadReportingConfigRequest::parse(zcl_frame.payload.as_slice()) {
-                let mut response = ReadReportingConfigResponse {
-                    records: heapless::Vec::new(),
-                };
-                for rec in &req.records {
-                    if let Some(cfg) = self.reporting.get_config(
-                        dst_ep,
-                        cluster_id,
-                        rec.direction,
-                        rec.attribute_id,
-                    ) {
-                        if rec.direction == zigbee_zcl::foundation::reporting::ReportDirection::Send
-                        {
-                            let _ = response.records.push(ReadReportingConfigResponseRecord {
-                                status: ZclStatus::Success,
-                                direction: rec.direction,
-                                attribute_id: rec.attribute_id,
-                                config: Some(cfg.clone()),
-                                timeout: None,
-                            });
-                        } else {
-                            // Receive direction: return timeout only
-                            let _ = response.records.push(ReadReportingConfigResponseRecord {
-                                status: ZclStatus::Success,
-                                direction: rec.direction,
-                                attribute_id: rec.attribute_id,
-                                config: None,
-                                timeout: Some(cfg.max_interval),
-                            });
-                        }
-                    } else {
-                        let _ = response.records.push(ReadReportingConfigResponseRecord {
-                            status: ZclStatus::UnsupportedAttribute,
-                            direction: rec.direction,
-                            attribute_id: rec.attribute_id,
-                            config: None,
-                            timeout: None,
-                        });
-                    }
+                zcl_dispatch::GroupTableAction::Remove { group, endpoint } => {
+                    let _ = aps.apsme_remove_group(&zigbee_aps::apsme::ApsmeRemoveGroupRequest {
+                        group_address: group,
+                        endpoint,
+                    });
                 }
-                self.queue_read_reporting_response(
-                    ShortAddress(src_addr),
-                    aps_indication.src_endpoint,
-                    dst_ep,
-                    cluster_id,
-                    zcl_frame.header.seq_number,
-                    &response,
-                );
-            }
-            return Some(event_loop::StackEvent::CommandReceived {
-                src_addr,
-                source_endpoint: aps_indication.src_endpoint,
-                endpoint: dst_ep,
-                cluster_id,
-                command_id: cmd_id,
-                seq_number: zcl_frame.header.seq_number,
-                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
-                    .unwrap_or_default(),
-            });
-        }
-
-        // ── Read Attributes (0x00) ──────────────────────────────
-        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && cmd_id == 0x00
-            && zcl_frame.header.direction() == ClusterDirection::ClientToServer
-        {
-            if let Some(req) = zigbee_zcl::foundation::read_attributes::ReadAttributesRequest::parse(
-                zcl_frame.payload.as_slice(),
-            ) {
-                rt_trace!(
-                    "[RT] zcl_read ep={} cluster=0x{:04X} attrs={} from=0x{:04X}",
-                    dst_ep,
-                    cluster_id,
-                    req.attributes.len(),
-                    src_addr,
-                );
-                log::info!(
-                    "[ZCL] ReadAttr ep={} cluster=0x{:04X} attrs={} from 0x{:04X}",
-                    dst_ep,
-                    cluster_id,
-                    req.attributes.len(),
-                    src_addr,
-                );
-                // Find the cluster's attribute store
-                if let Some(response) =
-                    self.with_cluster(dst_ep, ClusterId(cluster_id), clusters, |cluster| {
-                        zigbee_zcl::foundation::read_attributes::process_read_dyn(
-                            cluster.attributes(),
-                            &req,
-                        )
-                    })
-                {
-                    let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
-                    let payload_len = response.serialize(payload_buf).min(payload_buf.len());
-                    rt_trace!(
-                        "[RT] zcl_read_rsp cluster=0x{:04X} len={} records={}",
-                        cluster_id,
-                        payload_len,
-                        response.records.len(),
-                    );
-                    log::info!(
-                        "[ZCL] ReadAttr response: {} bytes, {} records queued",
-                        payload_len,
-                        response.records.len(),
-                    );
-                    Self::queue_global_response_inner(
-                        &mut self.pending_responses,
-                        src_addr,
-                        aps_indication.src_endpoint,
-                        dst_ep,
-                        cluster_id,
-                        zcl_frame.header.seq_number,
-                        0x01, // Read Attributes Response
-                        &payload_buf[..payload_len],
-                    );
-                } else {
-                    rt_trace!(
-                        "[RT] zcl_read no_cluster ep={} cluster=0x{:04X} have={}",
-                        dst_ep,
-                        cluster_id,
-                        clusters.len(),
-                    );
-                    log::warn!(
-                        "[ZCL] ReadAttr: no cluster found for ep={} cluster=0x{:04X} (have {} clusters)",
-                        dst_ep,
-                        cluster_id,
-                        clusters.len(),
+                zcl_dispatch::GroupTableAction::RemoveAll { endpoint } => {
+                    let _ = aps.apsme_remove_all_groups(
+                        &zigbee_aps::apsme::ApsmeRemoveAllGroupsRequest { endpoint },
                     );
                 }
-            } else {
-                rt_trace!(
-                    "[RT] zcl_read parse_fail ep={} cluster=0x{:04X} len={}",
-                    dst_ep,
-                    cluster_id,
-                    zcl_frame.payload.len(),
-                );
-            }
-            return Some(event_loop::StackEvent::CommandReceived {
-                src_addr,
-                source_endpoint: aps_indication.src_endpoint,
-                endpoint: dst_ep,
-                cluster_id,
-                command_id: cmd_id,
-                seq_number: zcl_frame.header.seq_number,
-                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
-                    .unwrap_or_default(),
-            });
-        }
-
-        // ── Write Attributes (0x02) ─────────────────────────────
-        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && cmd_id == 0x02
-            && zcl_frame.header.direction() == ClusterDirection::ClientToServer
-        {
-            if let Some(req) =
-                zigbee_zcl::foundation::write_attributes::WriteAttributesRequest::parse(
-                    zcl_frame.payload.as_slice(),
-                )
-                && let Some(response) =
-                    self.with_cluster_mut(dst_ep, ClusterId(cluster_id), clusters, |cluster| {
-                        zigbee_zcl::foundation::write_attributes::process_write_dyn(
-                            cluster.attributes_mut(),
-                            &req,
-                        )
-                    })
-            {
-                let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
-                let payload_len = response.serialize(payload_buf);
-                Self::queue_global_response_inner(
-                    &mut self.pending_responses,
-                    src_addr,
-                    aps_indication.src_endpoint,
-                    dst_ep,
-                    cluster_id,
-                    zcl_frame.header.seq_number,
-                    0x04, // Write Attributes Response
-                    &payload_buf[..payload_len],
-                );
-            }
-            return Some(event_loop::StackEvent::CommandReceived {
-                src_addr,
-                source_endpoint: aps_indication.src_endpoint,
-                endpoint: dst_ep,
-                cluster_id,
-                command_id: cmd_id,
-                seq_number: zcl_frame.header.seq_number,
-                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
-                    .unwrap_or_default(),
-            });
-        }
-
-        // ── Write Attributes Undivided (0x03) ────────────────────
-        // All-or-nothing: if any attribute fails, none are written.
-        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && cmd_id == 0x03
-            && zcl_frame.header.direction() == ClusterDirection::ClientToServer
-        {
-            if let Some(req) =
-                zigbee_zcl::foundation::write_attributes::WriteAttributesRequest::parse(
-                    zcl_frame.payload.as_slice(),
-                )
-                && let Some(response) =
-                    self.with_cluster_mut(dst_ep, ClusterId(cluster_id), clusters, |cluster| {
-                        zigbee_zcl::foundation::write_attributes::process_write_undivided_dyn(
-                            cluster.attributes_mut(),
-                            &req,
-                        )
-                    })
-            {
-                let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
-                let payload_len = response.serialize(payload_buf);
-                Self::queue_global_response_inner(
-                    &mut self.pending_responses,
-                    src_addr,
-                    aps_indication.src_endpoint,
-                    dst_ep,
-                    cluster_id,
-                    zcl_frame.header.seq_number,
-                    0x04, // Write Attributes Response (same response cmd for undivided)
-                    &payload_buf[..payload_len],
-                );
-            }
-            return Some(event_loop::StackEvent::CommandReceived {
-                src_addr,
-                source_endpoint: aps_indication.src_endpoint,
-                endpoint: dst_ep,
-                cluster_id,
-                command_id: cmd_id,
-                seq_number: zcl_frame.header.seq_number,
-                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
-                    .unwrap_or_default(),
-            });
-        }
-
-        // ── Write Attributes No Response (0x05) ─────────────────
-        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && cmd_id == 0x05
-            && zcl_frame.header.direction() == ClusterDirection::ClientToServer
-        {
-            if let Some(req) =
-                zigbee_zcl::foundation::write_attributes::WriteAttributesRequest::parse(
-                    zcl_frame.payload.as_slice(),
-                )
-                && self
-                    .with_cluster_mut(dst_ep, ClusterId(cluster_id), clusters, |cluster| {
-                        zigbee_zcl::foundation::write_attributes::process_write_dyn(
-                            cluster.attributes_mut(),
-                            &req,
-                        )
-                    })
-                    .is_some()
-            {
-                // No response sent for 0x05
-            }
-            return Some(event_loop::StackEvent::CommandReceived {
-                src_addr,
-                source_endpoint: aps_indication.src_endpoint,
-                endpoint: dst_ep,
-                cluster_id,
-                command_id: cmd_id,
-                seq_number: zcl_frame.header.seq_number,
-                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
-                    .unwrap_or_default(),
-            });
-        }
-
-        // ── Discover Attributes (0x0C) ──────────────────────────
-        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && cmd_id == 0x0C
-            && zcl_frame.header.direction() == ClusterDirection::ClientToServer
-        {
-            if let Some(req) = zigbee_zcl::foundation::discover::DiscoverAttributesRequest::parse(
-                zcl_frame.payload.as_slice(),
-            ) && let Some(response) =
-                self.with_cluster(dst_ep, ClusterId(cluster_id), clusters, |cluster| {
-                    zigbee_zcl::foundation::discover::process_discover_dyn(
-                        cluster.attributes(),
-                        &req,
-                    )
-                })
-            {
-                let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
-                let payload_len = response.serialize(payload_buf);
-                Self::queue_global_response_inner(
-                    &mut self.pending_responses,
-                    src_addr,
-                    aps_indication.src_endpoint,
-                    dst_ep,
-                    cluster_id,
-                    zcl_frame.header.seq_number,
-                    0x0D, // Discover Attributes Response
-                    &payload_buf[..payload_len],
-                );
-            }
-            return Some(event_loop::StackEvent::CommandReceived {
-                src_addr,
-                source_endpoint: aps_indication.src_endpoint,
-                endpoint: dst_ep,
-                cluster_id,
-                command_id: cmd_id,
-                seq_number: zcl_frame.header.seq_number,
-                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
-                    .unwrap_or_default(),
-            });
-        }
-
-        // ── Discover Commands Received (0x11) ───────────────────
-        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && cmd_id == 0x11
-            && zcl_frame.header.direction() == ClusterDirection::ClientToServer
-        {
-            if let Some(req) = zigbee_zcl::foundation::discover::DiscoverCommandsRequest::parse(
-                zcl_frame.payload.as_slice(),
-            ) && let Some(all) =
-                self.with_cluster(dst_ep, ClusterId(cluster_id), clusters, |cluster| {
-                    cluster.received_commands()
-                })
-            {
-                let response = zigbee_zcl::foundation::discover::process_discover_commands(
-                    &all,
-                    req.start_command_id,
-                    req.max_results,
-                );
-                let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
-                let payload_len = response.serialize(payload_buf);
-                Self::queue_global_response_inner(
-                    &mut self.pending_responses,
-                    src_addr,
-                    aps_indication.src_endpoint,
-                    dst_ep,
-                    cluster_id,
-                    zcl_frame.header.seq_number,
-                    0x12, // Discover Commands Received Response
-                    &payload_buf[..payload_len],
-                );
-            }
-            return Some(event_loop::StackEvent::CommandReceived {
-                src_addr,
-                source_endpoint: aps_indication.src_endpoint,
-                endpoint: dst_ep,
-                cluster_id,
-                command_id: cmd_id,
-                seq_number: zcl_frame.header.seq_number,
-                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
-                    .unwrap_or_default(),
-            });
-        }
-
-        // ── Discover Commands Generated (0x13) ──────────────────
-        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && cmd_id == 0x13
-            && zcl_frame.header.direction() == ClusterDirection::ClientToServer
-        {
-            if let Some(req) = zigbee_zcl::foundation::discover::DiscoverCommandsRequest::parse(
-                zcl_frame.payload.as_slice(),
-            ) && let Some(all) =
-                self.with_cluster(dst_ep, ClusterId(cluster_id), clusters, |cluster| {
-                    cluster.generated_commands()
-                })
-            {
-                let response = zigbee_zcl::foundation::discover::process_discover_commands(
-                    &all,
-                    req.start_command_id,
-                    req.max_results,
-                );
-                let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
-                let payload_len = response.serialize(payload_buf);
-                Self::queue_global_response_inner(
-                    &mut self.pending_responses,
-                    src_addr,
-                    aps_indication.src_endpoint,
-                    dst_ep,
-                    cluster_id,
-                    zcl_frame.header.seq_number,
-                    0x14, // Discover Commands Generated Response
-                    &payload_buf[..payload_len],
-                );
-            }
-            return Some(event_loop::StackEvent::CommandReceived {
-                src_addr,
-                source_endpoint: aps_indication.src_endpoint,
-                endpoint: dst_ep,
-                cluster_id,
-                command_id: cmd_id,
-                seq_number: zcl_frame.header.seq_number,
-                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
-                    .unwrap_or_default(),
-            });
-        }
-
-        // ── Discover Attributes Extended (0x15) ─────────────────
-        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && cmd_id == 0x15
-            && zcl_frame.header.direction() == ClusterDirection::ClientToServer
-        {
-            if let Some(req) = zigbee_zcl::foundation::discover::DiscoverAttributesRequest::parse(
-                zcl_frame.payload.as_slice(),
-            ) && let Some(response) =
-                self.with_cluster(dst_ep, ClusterId(cluster_id), clusters, |cluster| {
-                    zigbee_zcl::foundation::discover::process_discover_extended_dyn(
-                        cluster.attributes(),
-                        &req,
-                    )
-                })
-            {
-                let payload_buf = unsafe { &mut *self.scratch.zcl.get() };
-                let payload_len = response.serialize(payload_buf);
-                Self::queue_global_response_inner(
-                    &mut self.pending_responses,
-                    src_addr,
-                    aps_indication.src_endpoint,
-                    dst_ep,
-                    cluster_id,
-                    zcl_frame.header.seq_number,
-                    0x16, // Discover Attributes Extended Response
-                    &payload_buf[..payload_len],
-                );
-            }
-            return Some(event_loop::StackEvent::CommandReceived {
-                src_addr,
-                source_endpoint: aps_indication.src_endpoint,
-                endpoint: dst_ep,
-                cluster_id,
-                command_id: cmd_id,
-                seq_number: zcl_frame.header.seq_number,
-                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
-                    .unwrap_or_default(),
-            });
-        }
-
-        // ── Cluster-specific command dispatch ────────────────────
-        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::ClusterSpecific {
-            // Intercept Identify Query Response (cluster 0x0003, cmd 0x00, server→client)
-            // for F&B initiator target collection
-            if cluster_id == ClusterId::IDENTIFY.0
-                && cmd_id == zigbee_zcl::clusters::identify::CMD_IDENTIFY_QUERY_RESPONSE.0
-                && zcl_frame.header.direction() == ClusterDirection::ServerToClient
-            {
-                let _ = self
-                    .bdb
-                    .fb_identify_responses
-                    .push((src_addr, aps_indication.src_endpoint));
-                log::debug!(
-                    "[Runtime] F&B: Identify Query Response from 0x{:04X} ep {}",
-                    src_addr,
-                    aps_indication.src_endpoint,
-                );
-            }
-
-            if zcl_frame.header.direction() == ClusterDirection::ServerToClient {
-                return Some(event_loop::StackEvent::CommandReceived {
-                    src_addr,
-                    source_endpoint: aps_indication.src_endpoint,
-                    endpoint: dst_ep,
-                    cluster_id,
-                    command_id: cmd_id,
-                    seq_number: zcl_frame.header.seq_number,
-                    payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
-                        .unwrap_or_default(),
-                });
-            }
-
-            let mut cmd_status = ZclStatus::Success;
-            let mut response_payload: Option<heapless::Vec<u8, 64>> = None;
-            let mut cluster_found = false;
-
-            if let Some(result) =
-                self.with_cluster_mut(dst_ep, ClusterId(cluster_id), clusters, |cluster| {
-                    cluster.handle_command(CommandId(cmd_id), zcl_frame.payload.as_slice())
-                })
-            {
-                cluster_found = true;
-                match result {
-                    Ok(resp) => {
-                        response_payload = if resp.is_empty() { None } else { Some(resp) };
-                    }
-                    Err(status) => {
-                        cmd_status = status;
-                    }
-                }
-
-                // Groups cluster → APS group table bridge
-                if cluster_id == ClusterId::GROUPS.0 {
-                    // Parse group action from command ID and sync to APS table.
-                    // Can't use GroupsCluster::take_action() through trait object,
-                    // so we infer the action from the ZCL command directly.
-                    match cmd_id {
-                        command
-                            if command == zigbee_zcl::clusters::groups::CMD_ADD_GROUP.0
-                                && zcl_frame.payload.len() >= 2 =>
-                        {
-                            // Add Group — group_id is first 2 bytes of payload
-                            let gid =
-                                u16::from_le_bytes([zcl_frame.payload[0], zcl_frame.payload[1]]);
-                            let _ = self.bdb.zdo_mut().aps_mut().apsme_add_group(
-                                &zigbee_aps::apsme::ApsmeAddGroupRequest {
-                                    group_address: gid,
-                                    endpoint: dst_ep,
-                                },
-                            );
-                        }
-                        command
-                            if command == zigbee_zcl::clusters::groups::CMD_REMOVE_GROUP.0
-                                && zcl_frame.payload.len() >= 2 =>
-                        {
-                            // Remove Group — group_id is first 2 bytes
-                            let gid =
-                                u16::from_le_bytes([zcl_frame.payload[0], zcl_frame.payload[1]]);
-                            let _ = self.bdb.zdo_mut().aps_mut().apsme_remove_group(
-                                &zigbee_aps::apsme::ApsmeRemoveGroupRequest {
-                                    group_address: gid,
-                                    endpoint: dst_ep,
-                                },
-                            );
-                        }
-                        command
-                            if command == zigbee_zcl::clusters::groups::CMD_REMOVE_ALL_GROUPS.0 =>
-                        {
-                            // Remove All Groups
-                            let _ = self.bdb.zdo_mut().aps_mut().apsme_remove_all_groups(
-                                &zigbee_aps::apsme::ApsmeRemoveAllGroupsRequest {
-                                    endpoint: dst_ep,
-                                },
-                            );
-                        }
-                        command
-                            if command
-                                == zigbee_zcl::clusters::groups::CMD_ADD_GROUP_IF_IDENTIFYING.0
-                                && zcl_frame.payload.len() >= 2 =>
-                        {
-                            // Add Group If Identifying — only add if Identify cluster
-                            // on this endpoint has IdentifyTime > 0
-                            let gid =
-                                u16::from_le_bytes([zcl_frame.payload[0], zcl_frame.payload[1]]);
-                            let is_identifying = self
-                                .with_cluster(dst_ep, ClusterId::IDENTIFY, clusters, |cluster| {
-                                    cluster
-                                        .attributes()
-                                        .get(zigbee_zcl::AttributeId(0x0000))
-                                        .map(|value| {
-                                            matches!(
-                                                value,
-                                                zigbee_zcl::data_types::ZclValue::U16(time)
-                                                    if *time > 0
-                                            )
-                                        })
-                                        .unwrap_or(false)
-                                })
-                                .unwrap_or(false);
-                            if is_identifying {
-                                // Add to APS group table
-                                let _ = self.bdb.zdo_mut().aps_mut().apsme_add_group(
-                                    &zigbee_aps::apsme::ApsmeAddGroupRequest {
-                                        group_address: gid,
-                                        endpoint: dst_ep,
-                                    },
-                                );
-                                // Also add to GroupsCluster internal list via CMD_ADD_GROUP
-                                // (cluster's handle_command for 0x05 is a no-op; use 0x00 to sync)
-                                let add_payload = gid.to_le_bytes();
-                                let _ = self.with_cluster_mut(
-                                    dst_ep,
-                                    ClusterId::GROUPS,
-                                    clusters,
-                                    |cluster| {
-                                        cluster.handle_command(
-                                            zigbee_zcl::clusters::groups::CMD_ADD_GROUP,
-                                            &add_payload,
-                                        )
-                                    },
-                                );
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Send cluster-specific response if the cluster produced one
-            if let Some(resp) = response_payload {
-                // Determine the response command ID.
-                // For most clusters, the response uses the same cmd_id.
-                // Exceptions per ZCL spec:
-                // - Identify Query (0x01) → IdentifyQueryResponse (0x00)
-                let response_cmd_id = if cluster_id == ClusterId::IDENTIFY.0
-                    && cmd_id == zigbee_zcl::clusters::identify::CMD_IDENTIFY_QUERY.0
-                {
-                    zigbee_zcl::clusters::identify::CMD_IDENTIFY_QUERY_RESPONSE.0
-                } else {
-                    cmd_id
-                };
-                let mut frame = ZclFrame::new_cluster_specific(
-                    zcl_frame.header.seq_number,
-                    CommandId(response_cmd_id),
-                    ClusterDirection::ServerToClient,
-                    true,
-                );
-                for &b in resp.as_slice() {
-                    let _ = frame.payload.push(b);
-                }
-                let zcl_buf = unsafe { &mut *self.scratch.zcl.get() };
-                if let Ok(len) = frame.serialize(zcl_buf) {
-                    let mut data = heapless::Vec::new();
-                    for &b in &zcl_buf[..len] {
-                        let _ = data.push(b);
-                    }
-                    if self
-                        .pending_responses
-                        .push(PendingZclResponse {
-                            dst_addr: ShortAddress(src_addr),
-                            dst_endpoint: aps_indication.src_endpoint,
-                            src_endpoint: dst_ep,
-                            cluster_id,
-                            zcl_data: data,
-                        })
-                        .is_err()
-                    {
-                        log::warn!("[ZCL] Response queue full");
-                    }
-                }
-            } else if cluster_found && !zcl_frame.header.disable_default_response() {
-                // Only send Default Response for clusters we handle in ClusterRef.
-                // Unmatched clusters (e.g. OTA 0x0019) are app-handled — don't
-                // send spurious Default Responses that confuse the coordinator.
-                self.queue_default_response(
-                    ShortAddress(src_addr),
-                    aps_indication.src_endpoint,
-                    dst_ep,
-                    cluster_id,
-                    zcl_frame.header.seq_number,
-                    cmd_id,
-                    cmd_status,
-                    zcl_frame.header.direction(),
-                );
-            }
-
-            // Basic cluster factory reset → distinct event
-            if cluster_id == ClusterId::BASIC.0
-                && cmd_id == zigbee_zcl::clusters::basic::CMD_RESET_TO_FACTORY_DEFAULTS.0
-                && cluster_found
-                && cmd_status == ZclStatus::Success
-                && zcl_frame.header.direction() == ClusterDirection::ClientToServer
-            {
-                return Some(event_loop::StackEvent::FactoryResetRequested);
-            }
-
-            return Some(event_loop::StackEvent::CommandReceived {
-                src_addr,
-                source_endpoint: aps_indication.src_endpoint,
-                endpoint: dst_ep,
-                cluster_id,
-                command_id: cmd_id,
-                seq_number: zcl_frame.header.seq_number,
-                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
-                    .unwrap_or_default(),
-            });
-        }
-
-        // Other global commands — send Default Response for unsupported, then pass through
-        if !zcl_frame.header.disable_default_response() {
-            // Send UNSUP_GENERAL_COMMAND for unhandled foundation commands
-            self.queue_default_response(
-                ShortAddress(src_addr),
-                aps_indication.src_endpoint,
-                dst_ep,
-                cluster_id,
-                zcl_frame.header.seq_number,
-                cmd_id,
-                ZclStatus::UnsupGeneralCommand,
-                zcl_frame.header.direction(),
-            );
-        }
-        Some(event_loop::StackEvent::CommandReceived {
-            src_addr,
-            source_endpoint: aps_indication.src_endpoint,
-            endpoint: dst_ep,
-            cluster_id,
-            command_id: cmd_id,
-            seq_number: zcl_frame.header.seq_number,
-            payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice()).unwrap_or_default(),
-        })
-    }
-
-    /// Queue a ZCL Default Response to be sent in next tick().
-    #[allow(clippy::too_many_arguments)]
-    fn queue_default_response(
-        &mut self,
-        dst_addr: ShortAddress,
-        dst_endpoint: u8,
-        src_endpoint: u8,
-        cluster_id: u16,
-        seq: u8,
-        triggering_cmd: u8,
-        status: ZclStatus,
-        triggering_direction: ClusterDirection,
-    ) {
-        let response_direction = match triggering_direction {
-            ClusterDirection::ClientToServer => ClusterDirection::ServerToClient,
-            ClusterDirection::ServerToClient => ClusterDirection::ClientToServer,
-        };
-        let mut frame = ZclFrame::new_global(
-            seq,
-            CommandId(0x0B), // Default Response
-            response_direction,
-            true,
-        );
-        let _ = frame.payload.push(triggering_cmd);
-        let _ = frame.payload.push(status as u8);
-
-        let mut zcl_buf = [0u8; 128];
-        if let Ok(len) = frame.serialize(&mut zcl_buf) {
-            let mut data = heapless::Vec::new();
-            for &b in &zcl_buf[..len] {
-                let _ = data.push(b);
-            }
-            if self
-                .pending_responses
-                .push(PendingZclResponse {
-                    dst_addr,
-                    dst_endpoint,
-                    src_endpoint,
-                    cluster_id,
-                    zcl_data: data,
-                })
-                .is_err()
-            {
-                log::warn!("[ZCL] Response queue full");
             }
         }
-    }
 
-    /// Queue a Configure Reporting Response (0x07).
-    fn queue_reporting_response(
-        &mut self,
-        dst_addr: ShortAddress,
-        dst_endpoint: u8,
-        src_endpoint: u8,
-        cluster_id: u16,
-        seq: u8,
-        response: &zigbee_zcl::foundation::reporting::ConfigureReportingResponse,
-    ) {
-        let mut frame =
-            ZclFrame::new_global(seq, CommandId(0x07), ClusterDirection::ServerToClient, true);
-        let mut payload_buf = [0u8; 64];
-        let payload_len = response.serialize(&mut payload_buf);
-        for &b in &payload_buf[..payload_len] {
-            let _ = frame.payload.push(b);
+        if let Some((addr, ep)) = outcome.fb_identify_target {
+            let _ = self.bdb.fb_identify_responses.push((addr, ep));
         }
 
-        let mut zcl_buf = [0u8; 128];
-        if let Ok(len) = frame.serialize(&mut zcl_buf) {
-            let mut data = heapless::Vec::new();
-            for &b in &zcl_buf[..len] {
-                let _ = data.push(b);
-            }
-            if self
-                .pending_responses
-                .push(PendingZclResponse {
-                    dst_addr,
-                    dst_endpoint,
-                    src_endpoint,
-                    cluster_id,
-                    zcl_data: data,
-                })
-                .is_err()
-            {
-                log::warn!("[ZCL] Response queue full");
-            }
-        }
-    }
-
-    /// Queue a Read Reporting Configuration Response (0x09).
-    fn queue_read_reporting_response(
-        &mut self,
-        dst_addr: ShortAddress,
-        dst_endpoint: u8,
-        src_endpoint: u8,
-        cluster_id: u16,
-        seq: u8,
-        response: &zigbee_zcl::foundation::reporting::ReadReportingConfigResponse,
-    ) {
-        let mut frame =
-            ZclFrame::new_global(seq, CommandId(0x09), ClusterDirection::ServerToClient, true);
-        let mut payload_buf = [0u8; 128];
-        let payload_len = response.serialize(&mut payload_buf);
-        for &b in &payload_buf[..payload_len] {
-            let _ = frame.payload.push(b);
-        }
-
-        let mut zcl_buf = [0u8; 128];
-        if let Ok(len) = frame.serialize(&mut zcl_buf) {
-            let mut data = heapless::Vec::new();
-            for &b in &zcl_buf[..len] {
-                let _ = data.push(b);
-            }
-            if self
-                .pending_responses
-                .push(PendingZclResponse {
-                    dst_addr,
-                    dst_endpoint,
-                    src_endpoint,
-                    cluster_id,
-                    zcl_data: data,
-                })
-                .is_err()
-            {
-                log::warn!("[ZCL] Response queue full");
-            }
-        }
+        outcome.event
     }
 
     /// Send a raw ZCL frame via APS→NWK→MAC.
@@ -4743,7 +5181,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         response_cmd: u8,
         payload: &[u8],
     ) {
-        Self::queue_global_response_inner(
+        zcl_dispatch::queue_global_response_inner(
             &mut self.pending_responses,
             dst_addr,
             dst_endpoint,
@@ -4753,74 +5191,6 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             response_cmd,
             payload,
         );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn queue_global_response_inner<const N: usize>(
-        pending_responses: &mut heapless::Vec<PendingZclResponse, N>,
-        dst_addr: u16,
-        dst_endpoint: u8,
-        src_endpoint: u8,
-        cluster_id: u16,
-        seq: u8,
-        response_cmd: u8,
-        payload: &[u8],
-    ) {
-        let mut frame = ZclFrame::new_global(
-            seq,
-            CommandId(response_cmd),
-            ClusterDirection::ServerToClient,
-            true,
-        );
-        for &b in payload {
-            if frame.payload.push(b).is_err() {
-                rt_trace!(
-                    "[RT] zcl_queue payload_truncated cluster=0x{:04X} cap={}",
-                    cluster_id,
-                    frame.payload.capacity(),
-                );
-                break;
-            }
-        }
-
-        let mut zcl_buf = [0u8; 256];
-        if let Ok(len) = frame.serialize(&mut zcl_buf) {
-            let mut data = heapless::Vec::new();
-            for &b in &zcl_buf[..len] {
-                if data.push(b).is_err() {
-                    rt_trace!(
-                        "[RT] zcl_queue frame_truncated cluster=0x{:04X} len={} cap={}",
-                        cluster_id,
-                        len,
-                        data.capacity(),
-                    );
-                    return;
-                }
-            }
-            rt_trace!(
-                "[RT] zcl_queue dst=0x{:04X} src_ep={} dst_ep={} cluster=0x{:04X} len={}",
-                dst_addr,
-                src_endpoint,
-                dst_endpoint,
-                cluster_id,
-                data.len(),
-            );
-            if pending_responses
-                .push(PendingZclResponse {
-                    dst_addr: ShortAddress(dst_addr),
-                    dst_endpoint,
-                    src_endpoint,
-                    cluster_id,
-                    zcl_data: data,
-                })
-                .is_err()
-            {
-                rt_trace!("[RT] zcl_queue full");
-                log::warn!("[ZCL] Response queue full");
-            }
-        } else {
-            rt_trace!("[RT] zcl_queue serialize_fail cluster=0x{:04X}", cluster_id,);
-        }
     }
 
     // ── Layer access (for advanced use) ─────────────────────
@@ -4843,13 +5213,343 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.bdb.zdo_mut().device_annce(nwk_addr, ieee_addr).await
     }
 
-    /// Send End Device Timeout Request to parent.
+    /// Send an End Device Timeout Request (0x0B) to the parent and arm the
+    /// client-side response handling.
     ///
-    /// Requests the maximum timeout (~11 days) so the parent keeps our
-    /// entry during extended sleep. Call after join/rejoin.
-    /// Only sends for end devices (no-op for routers).
-    pub async fn send_ed_timeout_request(&mut self) {
-        let _ = self.bdb.zdo_mut().nwk_mut().send_ed_timeout_request().await;
+    /// A successful transmission schedules a forced MAC poll for the next
+    /// runtime tick (the response is delivered indirectly, so a sleepy device
+    /// has to fetch it within the parent's transaction persistence), starts a
+    /// bounded response wait, and resets the recurring keepalive interval.
+    ///
+    /// Never fails a join, resume or tick: a transmission failure only feeds
+    /// the bounded keepalive-failure counter.
+    ///
+    /// Bounded on [`EndDeviceRole`](crate::role::EndDeviceRole): the End Device
+    /// Timeout *client* is a leaf-only obligation, so this API exists only on an
+    /// end-device-typed device rather than as a success-shaped no-op on a
+    /// router/relay.
+    pub async fn send_ed_timeout_request(&mut self)
+    where
+        R: crate::role::EndDeviceRole,
+    {
+        self.send_ed_timeout_request_tracked().await;
+    }
+
+    /// Whether the local device negotiates an End Device Timeout at all.
+    fn negotiates_end_device_timeout(&self) -> bool {
+        self.bdb.zdo().nwk().device_type() == zigbee_nwk::DeviceType::EndDevice
+    }
+
+    fn end_device_timeout_snapshot(&self) -> EndDeviceTimeoutSnapshot {
+        let nib = self.bdb.zdo().nwk().nib();
+        EndDeviceTimeoutSnapshot {
+            parent_information: nib.parent_information,
+            parent_information_valid: nib.parent_information_valid,
+            end_device_timeout: nib.end_device_timeout,
+            requested_end_device_timeout: nib.requested_end_device_timeout,
+            accepts: nib.end_device_timeout_accepts,
+        }
+    }
+
+    /// Keepalive method implied by the negotiated `nwkParentInformation`.
+    ///
+    /// A parent that answered with no bits set is a pre-R22 parent: it ages
+    /// children on MAC Data Poll only, so polling is the right keepalive.
+    /// An unanswered negotiation has to assume nothing and re-run the
+    /// request instead.
+    fn end_device_keepalive_method(&self) -> KeepaliveMethod {
+        let nib = self.bdb.zdo().nwk().nib();
+        if !nib.parent_information_valid {
+            return KeepaliveMethod::TimeoutRequest;
+        }
+        if nib.parent_information == 0
+            || nib.parent_information & zigbee_nwk::frames::PARENT_INFO_MAC_DATA_POLL_KEEPALIVE != 0
+        {
+            KeepaliveMethod::MacDataPoll
+        } else {
+            KeepaliveMethod::TimeoutRequest
+        }
+    }
+
+    /// Recurring keepalive interval in seconds.
+    ///
+    /// Strictly below the timeout currently in effect — a third of it — so
+    /// two consecutive missed keepalives still leave a margin before the
+    /// parent ages the child out of its table.
+    fn end_device_keepalive_interval_secs(&self) -> u32 {
+        (self.bdb.zdo().nwk().nib().end_device_timeout_seconds() / 3).max(1)
+    }
+
+    fn reset_end_device_keepalive(&mut self)
+    where
+        R: crate::role::EndDeviceRole,
+    {
+        let interval = self.end_device_keepalive_interval_secs();
+        self.ed_timeout_mut().keepalive_remaining_secs = Some(interval);
+    }
+
+    /// Schedule a MAC poll on the next tick regardless of the sleepy-poll
+    /// gates, so an indirect response or command can be retrieved.
+    fn force_end_device_poll(&mut self)
+    where
+        R: crate::role::EndDeviceRole,
+    {
+        self.ed_timeout_mut().forced_poll = true;
+    }
+
+    /// Consume the forced-poll request, if one is scheduled.
+    pub(crate) fn take_forced_poll(&mut self) -> bool
+    where
+        R: crate::role::EndDeviceRole,
+    {
+        core::mem::take(&mut self.ed_timeout_mut().forced_poll)
+    }
+
+    /// Whether a MAC Data Poll refreshes this device's entry in the parent's
+    /// child table.
+    ///
+    /// True only after the parent explicitly advertised MAC Data Poll
+    /// keepalive, or answered with no bits (the pre-R22 poll-aging behavior).
+    ///
+    /// While parent information is unknown, ordinary application polls must
+    /// not postpone the next 0x0B: the parent may support only End Device
+    /// Timeout Request keepalive, in which case successful polls do not reset
+    /// its child-aging timer.
+    fn mac_poll_refreshes_parent_timer(&self) -> bool {
+        let nib = self.bdb.zdo().nwk().nib();
+        nib.parent_information_valid
+            && (nib.parent_information == 0
+                || nib.parent_information & zigbee_nwk::frames::PARENT_INFO_MAC_DATA_POLL_KEEPALIVE
+                    != 0)
+    }
+
+    /// Note a completed MAC poll for the End Device Timeout lifecycle.
+    pub(crate) fn note_end_device_poll(&mut self)
+    where
+        R: crate::role::EndDeviceRole,
+    {
+        if !self.negotiates_end_device_timeout() || !self.mac_poll_refreshes_parent_timer() {
+            return;
+        }
+        self.reset_end_device_keepalive();
+    }
+
+    /// Count one forced keepalive failure and, once a small bounded threshold
+    /// is reached, hand recovery to the existing secured-rejoin retry path.
+    pub(crate) fn record_end_device_keepalive_failure(&mut self)
+    where
+        R: crate::role::EndDeviceRole,
+    {
+        let failures = self.ed_timeout().failures.saturating_add(1);
+        self.ed_timeout_mut().failures = failures;
+        if failures < Self::ED_TIMEOUT_MAX_FAILURES {
+            return;
+        }
+        self.ed_timeout_mut().failures = 0;
+        log::warn!("[Runtime] Keepalive to parent failing — scheduling secure rejoin");
+        self.schedule_secure_rejoin_retry();
+    }
+
+    pub(crate) fn record_end_device_keepalive_success(&mut self)
+    where
+        R: crate::role::EndDeviceRole,
+    {
+        self.ed_timeout_mut().failures = 0;
+    }
+
+    /// Transmit an End Device Timeout Request and arm the response handling.
+    /// Returns whether the frame was actually transmitted.
+    #[inline(never)]
+    async fn send_ed_timeout_request_tracked(&mut self) -> bool
+    where
+        R: crate::role::EndDeviceRole,
+    {
+        if !self.negotiates_end_device_timeout() {
+            return false;
+        }
+        match self.bdb.zdo_mut().nwk_mut().send_ed_timeout_request().await {
+            Ok(()) => {
+                self.ed_timeout_mut().response_remaining_secs =
+                    Some(Self::ED_TIMEOUT_RESPONSE_WAIT_SECS);
+                // The parent answers with an indirect frame, so a sleepy
+                // device must poll for it before transaction persistence
+                // expires.
+                self.force_end_device_poll();
+                self.reset_end_device_keepalive();
+                self.record_end_device_keepalive_success();
+                true
+            }
+            Err(status) => {
+                log::warn!("[Runtime] ED Timeout Request failed: {:?}", status);
+                // Retry through the normal keepalive cadence rather than
+                // spinning here; a join must not fail because of this frame.
+                self.reset_end_device_keepalive();
+                self.record_end_device_keepalive_failure();
+                false
+            }
+        }
+    }
+
+    /// Begin a fresh End Device Timeout negotiation after a real join or a
+    /// secured rejoin.
+    ///
+    /// The NWK layer already reset the negotiation at the authoritative
+    /// parent-assignment point, so this only clears the client-side timers and
+    /// sends exactly one initial request. Called from every path that
+    /// establishes a new parent relationship; the silent persisted resume uses
+    /// [`Self::resume_end_device_timeout`] instead.
+    #[inline(never)]
+    async fn begin_end_device_timeout_negotiation(&mut self)
+    where
+        R: crate::role::EndDeviceRole,
+    {
+        self.reset_end_device_timeout_state();
+        if !self.negotiates_end_device_timeout() {
+            return;
+        }
+        self.ed_timeout_mut().retries_left = Self::ED_TIMEOUT_MAX_RETRIES;
+        self.reset_end_device_keepalive();
+        // A transmission failure is deliberately ignored here: the join or
+        // rejoin has already succeeded and the recurring keepalive owns
+        // recovery.
+        self.send_ed_timeout_request_tracked().await;
+    }
+
+    /// Choose the first keepalive after a silent persisted resume.
+    ///
+    /// The stored parent relationship is still in force, so a device whose
+    /// parent advertised MAC Data Poll keepalive (or answered with no bits, a
+    /// pre-R22 parent) refreshes it with a forced poll. That poll also
+    /// retrieves any frame the parent already has queued for us, so choosing
+    /// the cheap keepalive never drops a pending indirect frame. Only a
+    /// bit1-only parent, or a relationship that was never negotiated, needs a
+    /// fresh End Device Timeout Request.
+    #[inline(never)]
+    async fn resume_end_device_timeout(&mut self)
+    where
+        R: crate::role::EndDeviceRole,
+    {
+        self.reset_end_device_timeout_state();
+        if !self.negotiates_end_device_timeout() {
+            return;
+        }
+        self.ed_timeout_mut().retries_left = Self::ED_TIMEOUT_MAX_RETRIES;
+        self.reset_end_device_keepalive();
+        match self.end_device_keepalive_method() {
+            KeepaliveMethod::MacDataPoll => self.force_end_device_poll(),
+            KeepaliveMethod::TimeoutRequest => {
+                self.send_ed_timeout_request_tracked().await;
+            }
+        }
+    }
+
+    /// Age the End Device Timeout timers by one tick.
+    ///
+    /// Pure state, run before the tick's polling so a response that arrives in
+    /// the same tick can still cancel an expired wait.
+    fn advance_end_device_timeout(&mut self, elapsed_secs: u16)
+    where
+        R: crate::role::EndDeviceRole,
+    {
+        self.ed_timeout_mut().advance(elapsed_secs);
+    }
+
+    /// Run the due End Device Timeout work for this tick.
+    ///
+    /// Ordered after the tick's polling: a forced poll scheduled by the
+    /// previous tick has already run, so an outstanding response wait that is
+    /// still armed here really did expire.
+    #[inline(never)]
+    async fn service_end_device_timeout(&mut self)
+    where
+        R: crate::role::EndDeviceRole,
+    {
+        if !self.negotiates_end_device_timeout() || !self.is_joined() {
+            return;
+        }
+
+        if self.ed_timeout().response_remaining_secs == Some(0) {
+            self.ed_timeout_mut().response_remaining_secs = None;
+            if self.ed_timeout().retries_left > 0 {
+                self.ed_timeout_mut().retries_left -= 1;
+                log::warn!("[Runtime] ED Timeout Response missing — retransmitting");
+                self.send_ed_timeout_request_tracked().await;
+                return;
+            }
+            // Give up on this negotiation round: the parent information stays
+            // invalid and the recurring keepalive falls back to the default
+            // enumeration a R22 parent applies anyway. The join is untouched.
+            log::warn!("[Runtime] ED Timeout negotiation unanswered — using default timeout");
+            self.bdb
+                .zdo_mut()
+                .nwk_mut()
+                .cancel_ed_timeout_response_wait();
+            self.reset_end_device_keepalive();
+            return;
+        }
+
+        if self.ed_timeout().keepalive_remaining_secs != Some(0) {
+            return;
+        }
+        self.ed_timeout_mut().retries_left = Self::ED_TIMEOUT_MAX_RETRIES;
+        match self.end_device_keepalive_method() {
+            KeepaliveMethod::MacDataPoll => {
+                // Schedule the poll rather than performing it here: the
+                // shared forced-poll path routes any frame the parent had
+                // queued through `process_incoming`, so choosing the cheap
+                // keepalive never drops a pending indirect frame.
+                self.reset_end_device_keepalive();
+                self.force_end_device_poll();
+            }
+            KeepaliveMethod::TimeoutRequest => {
+                self.send_ed_timeout_request_tracked().await;
+            }
+        }
+    }
+
+    /// Apply the client-side effect of an End Device Timeout Response that the
+    /// NWK layer accepted while processing an incoming frame.
+    ///
+    /// The NWK layer deliberately reports no lifecycle outcome for 0x0C, so
+    /// the change is detected by comparing the NIB negotiation fields around
+    /// NWK processing.
+    #[inline(never)]
+    async fn apply_end_device_timeout_change(&mut self, before: EndDeviceTimeoutSnapshot)
+    where
+        R: crate::role::EndDeviceRole,
+    {
+        let after = self.end_device_timeout_snapshot();
+        if after == before {
+            return;
+        }
+
+        // Only the durably persisted fields make the application state dirty;
+        // the accept counter is a local observation, not persisted state.
+        if after.parent_information != before.parent_information
+            || after.parent_information_valid != before.parent_information_valid
+            || after.end_device_timeout != before.end_device_timeout
+        {
+            self.state_dirty = true;
+        }
+
+        if after.requested_end_device_timeout < before.requested_end_device_timeout {
+            // Refused: retry immediately with the lowered enumeration. The NWK
+            // layer floors the walk at the default, so this can never retry
+            // below it. A refusal that could not lower the enumeration any
+            // further leaves the bounded retransmission budget to run out.
+            self.ed_timeout_mut().response_remaining_secs = None;
+            self.send_ed_timeout_request_tracked().await;
+            return;
+        }
+
+        if after.accepts != before.accepts {
+            // Accepted: the negotiation is complete for this parent, including
+            // a recurring keepalive that re-confirmed an unchanged timeout.
+            self.ed_timeout_mut().response_remaining_secs = None;
+            self.ed_timeout_mut().retries_left = Self::ED_TIMEOUT_MAX_RETRIES;
+            self.reset_end_device_keepalive();
+            self.record_end_device_keepalive_success();
+        }
     }
 }
 
@@ -4860,6 +5560,7 @@ mod parent_router_tests {
     use std::sync::Arc;
     use std::task::Wake;
 
+    use super::role::Router;
     use super::{ClusterRef, ZigbeeDevice};
     use zigbee_mac::frames::parse_zigbee_beacon;
     use zigbee_mac::mock::MockMac;
@@ -4896,10 +5597,10 @@ mod parent_router_tests {
         }
     }
 
-    fn router() -> ZigbeeDevice<MockMac> {
+    fn router() -> ZigbeeDevice<MockMac, Router> {
         let mut device = ZigbeeDevice::builder(MockMac::new(ROUTER_IEEE))
             .device_type(DeviceType::Router)
-            .build();
+            .build_router();
         device.bdb_mut().attributes_mut().node_is_on_a_network = true;
         {
             let aps = device.bdb_mut().zdo_mut().aps_mut();
@@ -4916,7 +5617,7 @@ mod parent_router_tests {
         device
     }
 
-    fn centralized_router() -> ZigbeeDevice<MockMac> {
+    fn centralized_router() -> ZigbeeDevice<MockMac, Router> {
         let mut device = router();
         let aps = device.bdb_mut().zdo_mut().aps_mut();
         aps.aib_mut().aps_trust_center_address = TC_IEEE;
@@ -4936,6 +5637,65 @@ mod parent_router_tests {
             lqi: 200,
             security_use: false,
         })
+    }
+
+    /// A joined forwarding-only [`RelayRouter`], mirroring [`router`] but built
+    /// with `build_relay()` so it can route without being a parent.
+    fn relay() -> ZigbeeDevice<MockMac, super::role::RelayRouter> {
+        let mut device = ZigbeeDevice::builder(MockMac::new(ROUTER_IEEE)).build_relay();
+        device.bdb_mut().attributes_mut().node_is_on_a_network = true;
+        {
+            let aps = device.bdb_mut().zdo_mut().aps_mut();
+            aps.aib_mut().aps_trust_center_address = [0xFF; 8];
+            let nwk = aps.nwk_mut();
+            nwk.set_joined(true);
+            let nib = nwk.nib_mut();
+            nib.pan_id = PAN;
+            nib.network_address = ROUTER;
+            nib.extended_pan_id = [0xA5; 8];
+            nib.depth = 3;
+            nib.update_id = 7;
+        }
+        device
+    }
+
+    #[test]
+    fn a_joined_relay_tick_runs_routing_but_not_parent_maintenance() {
+        // A relay routes (permit-join expiry / router maintenance run) but is
+        // not a parent: it never services MAC parent commands, ages children,
+        // or sends a Parent Announce. This is the routing/parent split enforced
+        // by the typed role rather than the `router` feature alone.
+        let mut relay = relay();
+        {
+            let nib = relay.bdb_mut().zdo_mut().aps_mut().nwk_mut().nib_mut();
+            nib.permit_joining = true;
+            nib.permit_joining_duration = 1;
+        }
+        relay.mac_mut().enqueue_command_event(beacon_request());
+        // A relay's role state is the zero-sized `NonParentState`: it has no
+        // `parent_annce_due` field at all, so the type system already forbids a
+        // relay from ever queuing (or servicing) a Parent Announce.
+        relay.mac_mut().clear_tx_history();
+
+        let mut clusters: [ClusterRef<'_>; 0] = [];
+        block_on(relay.tick(1, &mut clusters));
+
+        // Routing maintenance ran: the finite permit window expired.
+        assert!(
+            !relay.bdb().zdo().aps().nwk().nib().permit_joining,
+            "a relay runs permit-join expiry (routing maintenance)"
+        );
+        // Parent-command servicing did NOT run: the queued beacon request is
+        // left untouched (no beacon response emitted).
+        assert!(
+            relay.mac().beacon_responses().is_empty(),
+            "a relay never services MAC parent commands"
+        );
+        // No parent broadcast (Parent Announce) went out on the tick.
+        assert!(
+            relay.mac().tx_history().is_empty(),
+            "a relay emits no parent broadcast on the tick"
+        );
     }
 
     fn association_request(ieee: IeeeAddress, capability_info: CapabilityInfo) -> MacCommandEvent {
@@ -4967,11 +5727,11 @@ mod parent_router_tests {
         })
     }
 
-    fn open_for_joining(device: &mut ZigbeeDevice<MockMac>, duration: u8) {
+    fn open_for_joining(device: &mut ZigbeeDevice<MockMac, Router>, duration: u8) {
         block_on(device.permit_joining(duration)).unwrap();
     }
 
-    fn associate_sleepy_child(device: &mut ZigbeeDevice<MockMac>) -> ShortAddress {
+    fn associate_sleepy_child(device: &mut ZigbeeDevice<MockMac, Router>) -> ShortAddress {
         open_for_joining(device, 0xFF);
         device
             .mac_mut()
@@ -5316,7 +6076,7 @@ mod parent_router_tests {
                 .indirect_queue()
                 .has_pending(old_address)
         );
-        assert_eq!(device.pending_child_updates.len(), 1);
+        assert_eq!(device.pending_child_update_count(), 1);
 
         device
             .mac_mut()
@@ -5324,7 +6084,7 @@ mod parent_router_tests {
         let step = block_on(device.service_parent_commands());
         assert_eq!(step.processed, 1);
         assert_eq!(step.failures, 0);
-        assert_eq!(device.pending_child_updates.len(), 0);
+        assert_eq!(device.pending_child_update_count(), 0);
         let history = device.mac().tx_history();
         assert_eq!(history.len(), 3);
         assert!(history[0].indirect);
@@ -5526,5 +6286,717 @@ mod parent_router_tests {
         let (forward_header, consumed) = zigbee_nwk::frames::NwkHeader::parse(bytes).unwrap();
         assert!(!forward_header.frame_control.security);
         assert_eq!(&bytes[consumed..], &embedded[..embedded_len]);
+    }
+
+    // ── R22 End Device Timeout server + persistence (runtime) ─
+
+    /// Build a secured NWK command frame sent by an authenticated child to the
+    /// router, produced with the shared network key like real over-the-air
+    /// traffic.
+    fn child_secured_command(
+        child: ShortAddress,
+        command: &[u8],
+        frame_counter: u32,
+    ) -> McpsDataIndication {
+        let header = zigbee_nwk::frames::NwkHeader {
+            frame_control: zigbee_nwk::frames::NwkFrameControl {
+                frame_type: zigbee_nwk::frames::NwkFrameType::Command as u8,
+                protocol_version: 0x02,
+                discover_route: 0,
+                multicast: false,
+                security: true,
+                source_route: false,
+                dst_ieee_present: false,
+                src_ieee_present: true,
+                end_device_initiator: false,
+            },
+            dst_addr: ROUTER,
+            src_addr: child,
+            radius: 1,
+            seq_number: frame_counter as u8,
+            dst_ieee: None,
+            src_ieee: Some(CHILD_IEEE),
+            multicast_control: None,
+            source_route: None,
+        };
+        let mut frame = [0u8; 128];
+        let header_len = header.serialize(&mut frame);
+        let security = zigbee_nwk::security::NwkSecurityHeader {
+            security_control: zigbee_nwk::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
+            frame_counter,
+            source_address: CHILD_IEEE,
+            key_seq_number: 0,
+        };
+        let security_len = security.serialize(&mut frame[header_len..]);
+        let aad_len = header_len + security_len;
+        let ciphertext = zigbee_nwk::security::NwkSecurity::new()
+            .encrypt(&frame[..aad_len], command, &NETWORK_KEY, &security)
+            .unwrap();
+        frame[aad_len..aad_len + ciphertext.len()].copy_from_slice(&ciphertext);
+        frame[header_len] &= !0x07;
+        let frame_len = aad_len + ciphertext.len();
+        McpsDataIndication {
+            src_address: MacAddress::Short(PAN, child),
+            dst_address: MacAddress::Short(PAN, ROUTER),
+            lqi: 200,
+            payload: MacFrame::from_slice(&frame[..frame_len]).unwrap(),
+            security_use: false,
+        }
+    }
+
+    /// Admit `CHILD_IEEE` at `child` as a secured, authenticated sleepy child.
+    fn authenticated_sleepy_child(device: &mut ZigbeeDevice<MockMac, Router>, child: ShortAddress) {
+        let nwk = device.bdb_mut().zdo_mut().aps_mut().nwk_mut();
+        let assigned = nwk
+            .handle_child_rejoin(
+                child,
+                CHILD_IEEE,
+                sleepy_child_capabilities().to_byte(),
+                true,
+            )
+            .expect("the child is admitted");
+        assert_eq!(assigned, child);
+    }
+
+    #[test]
+    fn the_runtime_answers_a_child_ed_timeout_request() {
+        let mut device = centralized_router();
+        const CHILD: ShortAddress = ShortAddress(0x89AB);
+        authenticated_sleepy_child(&mut device, CHILD);
+        device.mac_mut().clear_tx_history();
+
+        let request = child_secured_command(
+            CHILD,
+            &[
+                zigbee_nwk::frames::NwkCommandId::EdTimeoutRequest as u8,
+                14,
+                0,
+            ],
+            1,
+        );
+        let mut clusters: [ClusterRef<'_>; 0] = [];
+        assert!(block_on(device.process_incoming(&request, &mut clusters)).is_none());
+
+        let nwk = device.bdb().zdo().aps().nwk();
+        assert_eq!(
+            nwk.neighbor_table()
+                .find_by_short(CHILD)
+                .unwrap()
+                .end_device_timeout,
+            14,
+            "the runtime applied the accepted timeout"
+        );
+        assert!(
+            nwk.indirect_queue().has_pending(CHILD),
+            "the response is queued indirectly for the sleepy child"
+        );
+    }
+
+    #[test]
+    fn the_child_table_survives_a_reboot_through_the_durable_store() {
+        let mut device = centralized_router();
+        const CHILD: ShortAddress = ShortAddress(0x89AB);
+        authenticated_sleepy_child(&mut device, CHILD);
+        // Negotiate a non-default timeout so the persisted enum is meaningful.
+        block_on(
+            device
+                .bdb_mut()
+                .zdo_mut()
+                .aps_mut()
+                .nwk_mut()
+                .respond_to_end_device_timeout_request(CHILD, CHILD_IEEE, 14),
+        )
+        .unwrap();
+
+        let mut store = crate::child_store::RamChildTableStore::new();
+        device.save_child_table(&mut store).unwrap();
+
+        // A fresh router restores the child table before any Parent Announce.
+        let mut rebooted = centralized_router();
+        assert_eq!(rebooted.restore_child_table(&mut store).unwrap(), 1);
+        assert!(
+            rebooted.parent_annce_due(),
+            "a restore schedules a Parent Announce"
+        );
+
+        let nwk = rebooted.bdb().zdo().aps().nwk();
+        assert_eq!(nwk.known_child_by_ieee(&CHILD_IEEE), Some(CHILD));
+        let entry = nwk.neighbor_table().find_by_short(CHILD).unwrap();
+        assert_eq!(
+            entry.end_device_timeout, 14,
+            "the accepted timeout is restored"
+        );
+        assert_eq!(
+            entry.keepalive_remaining_secs,
+            zigbee_nwk::frames::ed_timeout_enum_to_seconds(14).unwrap(),
+            "a restored child gets a fresh full window"
+        );
+        assert!(
+            !entry.keepalive_confirmed,
+            "a restored child is unconfirmed until heard from"
+        );
+    }
+
+    #[test]
+    fn a_joined_router_tick_ages_out_a_silent_child() {
+        let mut device = centralized_router();
+        const CHILD: ShortAddress = ShortAddress(0x89AB);
+        authenticated_sleepy_child(&mut device, CHILD);
+        let window = zigbee_nwk::frames::ed_timeout_enum_to_seconds(
+            zigbee_nwk::frames::ED_TIMEOUT_ENUM_DEFAULT,
+        )
+        .unwrap() as u16;
+        let mut clusters: [ClusterRef<'_>; 0] = [];
+        block_on(device.tick(window, &mut clusters));
+        assert!(
+            device
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .neighbor_table()
+                .find_by_short(CHILD)
+                .is_none(),
+            "a silent child ages out via the joined tick"
+        );
+    }
+
+    #[test]
+    fn a_joined_router_tick_runs_the_full_parent_maintenance() {
+        // One joined-router tick must drive the whole parent maintenance
+        // subgraph a sensor build compiles out: finite permit-join expiry, MAC
+        // parent-command servicing, End Device Timeout child aging, and — the
+        // path this split moves onto the tick via `run_nwk_maintenance` — a due
+        // Parent Announce broadcast.
+        let mut device = centralized_router();
+        const CHILD: ShortAddress = ShortAddress(0x89AB);
+        authenticated_sleepy_child(&mut device, CHILD);
+
+        // A finite permit window, a queued MAC parent command, and a Parent
+        // Announce marked due (as `restore_child_table` does after a reboot).
+        open_for_joining(&mut device, 1);
+        device.mac_mut().enqueue_command_event(beacon_request());
+        device.set_parent_annce_due(true);
+        device.mac_mut().clear_tx_history();
+
+        let mut clusters: [ClusterRef<'_>; 0] = [];
+        block_on(device.tick(1, &mut clusters));
+
+        // Permit-join expiry (run_parent_nwk_maintenance → tick_permit_joining).
+        assert!(
+            !device.mac().association_permit(),
+            "the finite permit window expired on the tick"
+        );
+        assert!(!device.bdb().zdo().aps().nwk().nib().permit_joining);
+
+        // MAC parent-command servicing (run_parent_nwk_maintenance →
+        // service_parent_commands): the queued beacon request was answered.
+        assert!(
+            !device.mac().beacon_responses().is_empty(),
+            "a queued MAC parent command is serviced by the tick"
+        );
+
+        // Parent Announce sending (run_nwk_maintenance → service_parent_annce).
+        assert!(
+            !device.parent_annce_due(),
+            "the due Parent Announce was consumed"
+        );
+        assert!(
+            device
+                .mac()
+                .tx_history()
+                .iter()
+                .any(|record| matches!(record.dst, MacAddress::Short(_, addr) if addr.0 == 0xFFFF)),
+            "a due Parent Announce broadcast goes out on the tick"
+        );
+
+        // The child is still within its End Device Timeout window after 1 s.
+        assert!(
+            device
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .neighbor_table()
+                .find_by_short(CHILD)
+                .is_some(),
+            "a child kept within its window survives the tick"
+        );
+
+        // Child End Device Timeout aging (run_parent_nwk_maintenance →
+        // age_end_device_children): a tick past the window evicts the child.
+        let window = zigbee_nwk::frames::ed_timeout_enum_to_seconds(
+            zigbee_nwk::frames::ED_TIMEOUT_ENUM_DEFAULT,
+        )
+        .unwrap() as u16;
+        block_on(device.tick(window, &mut clusters));
+        assert!(
+            device
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .neighbor_table()
+                .find_by_short(CHILD)
+                .is_none(),
+            "the silent child ages out via the joined tick"
+        );
+    }
+
+    #[test]
+    fn announce_parent_broadcasts_only_when_there_are_children() {
+        // A childless router has nothing to reconcile.
+        let mut empty = centralized_router();
+        block_on(empty.announce_parent()).unwrap();
+        assert!(empty.mac().tx_history().is_empty());
+
+        // With a child, exactly one broadcast Parent Announce goes out.
+        let mut device = centralized_router();
+        const CHILD: ShortAddress = ShortAddress(0x89AB);
+        authenticated_sleepy_child(&mut device, CHILD);
+        device.mac_mut().clear_tx_history();
+        block_on(device.announce_parent()).unwrap();
+
+        let tx = device.mac().tx_history();
+        assert_eq!(tx.len(), 1, "one Parent_annce broadcast frame");
+        assert!(
+            matches!(tx[0].dst, MacAddress::Short(_, addr) if addr.0 == 0xFFFF),
+            "Parent_annce is a NWK broadcast"
+        );
+    }
+
+    #[test]
+    fn a_relay_ignores_a_synthetic_parent_nwk_outcome() {
+        // The correctness hole this slice closes: `NwkLayer::can_route` is true
+        // for a relay, so a parent-only NWK outcome could previously reach the
+        // shared handler and be answered. The static role dispatch now makes a
+        // relay ignore it — no response, no state mutation.
+        let old_address = ShortAddress(0x3344);
+
+        let mut relay = relay();
+        relay.mac_mut().clear_tx_history();
+        let event = block_on(relay.handle_nwk_command_outcome(
+            zigbee_nwk::nlde::NwkCommandOutcome::ChildRejoinRequest {
+                src: old_address,
+                ieee: CHILD_IEEE,
+                capability_info: sleepy_child_capabilities().to_byte(),
+                secured: true,
+            },
+        ));
+        assert!(event.is_none());
+        assert!(
+            relay.mac().tx_history().is_empty(),
+            "a relay never answers a child Rejoin Request"
+        );
+        assert!(
+            !relay
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .indirect_queue()
+                .has_pending(old_address),
+            "a relay queues no Rejoin Response for a sleepy child"
+        );
+
+        // Likewise, a relay must not serve the End Device Timeout request.
+        let event = block_on(relay.handle_nwk_command_outcome(
+            zigbee_nwk::nlde::NwkCommandOutcome::EndDeviceTimeoutRequest {
+                src: old_address,
+                ieee: CHILD_IEEE,
+                requested_timeout: 14,
+            },
+        ));
+        assert!(event.is_none());
+        assert!(
+            relay.mac().tx_history().is_empty(),
+            "a relay never serves an End Device Timeout Request"
+        );
+    }
+
+    #[test]
+    fn a_router_answers_a_synthetic_child_rejoin_outcome() {
+        // The same synthetic outcome that a relay ignores is acted on by a
+        // router: it queues the indirect Rejoin Response for the sleepy child
+        // and records the deferred Trust Center Update-Device.
+        let mut device = centralized_router();
+        device
+            .bdb_mut()
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .nib_mut()
+            .permit_joining = true;
+        let old_address = ShortAddress(0x3344);
+        device.mac_mut().clear_tx_history();
+
+        let event = block_on(device.handle_nwk_command_outcome(
+            zigbee_nwk::nlde::NwkCommandOutcome::ChildRejoinRequest {
+                src: old_address,
+                ieee: CHILD_IEEE,
+                capability_info: sleepy_child_capabilities().to_byte(),
+                secured: false,
+            },
+        ));
+        assert!(event.is_none());
+        assert!(
+            device
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .indirect_queue()
+                .has_pending(old_address),
+            "a router queues the Rejoin Response indirectly for a sleepy child"
+        );
+        assert_eq!(
+            device.pending_child_update_count(),
+            1,
+            "a router defers the coupled Trust Center Update-Device"
+        );
+    }
+}
+
+/// Typed-role and parent-capability boundary tests.
+///
+/// These compile-time and runtime checks prove that:
+/// - an ordinary [`MacDriver`] backend constructs and uses an end-device-role
+///   device (the default role), and
+/// - a router-role device is type-bounded by
+///   [`ParentMacDriver`](zigbee_mac::ParentMacDriver), so it cannot be built on
+///   a MAC backend that cannot parent.
+#[cfg(test)]
+mod role_tests {
+    use super::ZigbeeDevice;
+    use super::role::{DeviceRole, EndDevice, ParentRole, RelayRouter, Router};
+    use crate::builder::{BuildError, DeviceBuilder};
+    use zigbee_mac::mock::MockMac;
+    use zigbee_mac::{MacDriver, ParentMacDriver};
+    use zigbee_nwk::DeviceType;
+
+    const IEEE: [u8; 8] = [0x11; 8];
+
+    /// Compile-time proof that router construction is bounded on a genuine
+    /// parent MAC: this only type-checks because `MockMac: ParentMacDriver`.
+    fn requires_parent_mac<M: ParentMacDriver>(_mac: &M) {}
+
+    /// Compile-time proof that the ordinary end-device path needs only
+    /// `MacDriver`.
+    fn requires_mac_only<M: MacDriver>(_mac: &M) {}
+
+    // Compile-time role invariants (evaluated in const context so clippy does
+    // not flag them as constant runtime assertions).
+    const _: () = assert!(!EndDevice::IS_PARENT);
+    const _: () = assert!(!EndDevice::CAN_ROUTE);
+    const _: () = assert!(RelayRouter::CAN_ROUTE);
+    const _: () = assert!(!RelayRouter::IS_PARENT);
+    const _: () = assert!(Router::IS_PARENT);
+    const _: () = assert!(Router::CAN_ROUTE);
+
+    #[test]
+    fn role_markers_report_names() {
+        assert_eq!(EndDevice::NAME, "end-device");
+        assert_eq!(RelayRouter::NAME, "relay-router");
+        assert_eq!(Router::NAME, "router");
+    }
+
+    #[test]
+    fn ordinary_mac_builds_an_end_device() {
+        let mac = MockMac::new(IEEE);
+        requires_mac_only(&mac);
+        // Default role: `ZigbeeDevice<MockMac>` == `ZigbeeDevice<MockMac, EndDevice>`.
+        let device: ZigbeeDevice<MockMac> = ZigbeeDevice::builder(mac)
+            .device_type(DeviceType::EndDevice)
+            .build();
+        // The end-device monomorphization is the default role.
+        fn assert_end_device<M: MacDriver>(_d: &ZigbeeDevice<M, EndDevice>) {}
+        assert_end_device(&device);
+        assert_eq!(device.device_type(), DeviceType::EndDevice);
+    }
+
+    #[test]
+    fn parent_mac_builds_a_router() {
+        let mac = MockMac::new(IEEE);
+        requires_parent_mac(&mac);
+        let device: ZigbeeDevice<MockMac, Router> = ZigbeeDevice::builder(mac)
+            .device_type(DeviceType::Router)
+            .build_router();
+        // The router role satisfies the parent bound used to gate parent-only
+        // operational APIs (e.g. `permit_joining`).
+        fn assert_parent_role<M: MacDriver, R: ParentRole>(_d: &ZigbeeDevice<M, R>) {}
+        assert_parent_role(&device);
+        assert_eq!(device.device_type(), DeviceType::Router);
+    }
+
+    #[test]
+    fn any_mac_builds_a_relay_router_without_the_parent_bound() {
+        // A relay is forwarding-only, so it needs only `MacDriver` — no parent
+        // capability. It builds as `DeviceType::Router`, can route, but is not a
+        // parent.
+        let device: ZigbeeDevice<MockMac, RelayRouter> =
+            ZigbeeDevice::builder(MockMac::new(IEEE)).build_relay();
+        assert_eq!(device.device_type(), DeviceType::Router);
+        const { assert!(RelayRouter::CAN_ROUTE) };
+        const { assert!(!RelayRouter::IS_PARENT) };
+        // A relay is *not* a `ParentRole`, so parent-only APIs are not present;
+        // that absence is enforced by the type system (see the `compile_fail`
+        // doctests on `ZigbeeDevice`).
+        fn is_routing<M: MacDriver, R: super::role::RoutingRole>(_d: &ZigbeeDevice<M, R>) {}
+        is_routing(&device);
+    }
+
+    #[test]
+    fn coordinator_builds_as_a_parent_router() {
+        let device = ZigbeeDevice::builder(MockMac::new(IEEE)).build_coordinator();
+        fn assert_parent_role<M: MacDriver, R: ParentRole>(_d: &ZigbeeDevice<M, R>) {}
+        assert_parent_role(&device);
+        assert_eq!(device.device_type(), DeviceType::Coordinator);
+    }
+
+    #[test]
+    #[should_panic(expected = "device_type conflicts")]
+    fn coordinator_builder_rejects_an_explicit_router_type() {
+        let _ = ZigbeeDevice::builder(MockMac::new(IEEE))
+            .device_type(DeviceType::Router)
+            .build_coordinator();
+    }
+
+    #[test]
+    fn build_rejects_a_routing_device_type() {
+        // `build()` yields an end device; a routing/coordinator device type is a
+        // misconfiguration surfaced explicitly (not a success-shaped fallback).
+        let error = DeviceBuilder::new(MockMac::new(IEEE))
+            .device_type(DeviceType::Router)
+            .try_build()
+            .err()
+            .expect("router device_type must be rejected by build()");
+        assert_eq!(
+            error,
+            BuildError::RoleRejectsDeviceType {
+                role: "end-device",
+                device_type: DeviceType::Router,
+            }
+        );
+        assert!(matches!(
+            DeviceBuilder::new(MockMac::new(IEEE))
+                .device_type(DeviceType::Coordinator)
+                .try_build(),
+            Err(BuildError::RoleRejectsDeviceType { .. })
+        ));
+        // The matching device type builds cleanly.
+        assert!(
+            DeviceBuilder::new(MockMac::new(IEEE))
+                .device_type(DeviceType::EndDevice)
+                .try_build()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn relay_rejects_a_non_router_device_type() {
+        // A relay is only ever a router; an end-device or coordinator type is a
+        // misconfiguration.
+        assert!(matches!(
+            DeviceBuilder::new(MockMac::new(IEEE))
+                .device_type(DeviceType::EndDevice)
+                .try_build_relay(),
+            Err(BuildError::RoleRejectsDeviceType { .. })
+        ));
+        assert!(matches!(
+            DeviceBuilder::new(MockMac::new(IEEE))
+                .device_type(DeviceType::Coordinator)
+                .try_build_relay(),
+            Err(BuildError::RoleRejectsDeviceType { .. })
+        ));
+        assert!(
+            DeviceBuilder::new(MockMac::new(IEEE))
+                .device_type(DeviceType::Router)
+                .try_build_relay()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn router_rejects_an_end_device_type() {
+        // `build_router` accepts router or coordinator, but not end device.
+        assert!(matches!(
+            DeviceBuilder::new(MockMac::new(IEEE))
+                .device_type(DeviceType::EndDevice)
+                .try_build_router(),
+            Err(BuildError::RoleRejectsDeviceType { .. })
+        ));
+        assert!(
+            DeviceBuilder::new(MockMac::new(IEEE))
+                .device_type(DeviceType::Coordinator)
+                .try_build_router()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "device_type conflicts")]
+    fn ergonomic_build_panics_on_a_mismatch() {
+        // The ergonomic `build()` turns the misconfiguration into an explicit
+        // panic rather than silently producing a role/device-type mismatch.
+        let _ = DeviceBuilder::new(MockMac::new(IEEE))
+            .device_type(DeviceType::Router)
+            .build();
+    }
+
+    #[test]
+    fn typed_node_composes_a_router_device() {
+        use crate::node::ZigbeeNode;
+        use crate::profile::{DeviceProfile, RangeExtender};
+        use crate::security_store::RamSecurityStateStore;
+        use zigbee_aps::PROFILE_HOME_AUTOMATION;
+        use zigbee_zcl::DeviceId;
+
+        let mut device: ZigbeeDevice<MockMac, Router> = ZigbeeDevice::builder(MockMac::new(IEEE))
+            .device_type(DeviceType::Router)
+            .build_router();
+        let mut store = RamSecurityStateStore::new();
+        let mut profile = DeviceProfile::new(
+            1,
+            PROFILE_HOME_AUTOMATION,
+            DeviceId::RANGE_EXTENDER,
+            RangeExtender,
+        );
+        // `ZigbeeNode` infers and carries the `Router` role type parameter, so a
+        // router product needs no bespoke wrapper.
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        fn assert_router_node<'a, S, P>(_n: &ZigbeeNode<'a, MockMac, S, P, Router>)
+        where
+            S: crate::security_store::SecurityStateStore,
+            P: crate::profile::ApplicationProfile,
+        {
+        }
+        assert_router_node(&node);
+    }
+
+    #[test]
+    fn router_role_exposes_permit_joining() {
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+        use std::sync::Arc;
+        use std::task::Wake;
+
+        struct NoopWake;
+        impl Wake for NoopWake {
+            fn wake(self: Arc<Self>) {}
+        }
+        fn block_on<F: Future>(future: F) -> F::Output {
+            let waker = Waker::from(Arc::new(NoopWake));
+            let mut context = Context::from_waker(&waker);
+            let mut future = std::pin::pin!(future);
+            loop {
+                if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                    return output;
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        // Parent-only APIs (`permit_joining`, `announce_parent`,
+        // `save_child_table`) live behind `ParentRole`; that they resolve here
+        // on a router-role device (and not on an end-device- or relay-role
+        // device) is the capability boundary. On a not-yet-joined router they
+        // are structurally successful no-ops.
+        let mut device: ZigbeeDevice<MockMac, Router> = ZigbeeDevice::builder(MockMac::new(IEEE))
+            .device_type(DeviceType::Router)
+            .build_router();
+        assert!(block_on(device.permit_joining(0)).is_ok());
+        assert!(block_on(device.announce_parent()).is_ok());
+        let mut child_store = crate::child_store::RamChildTableStore::new();
+        assert!(device.save_child_table(&mut child_store).is_ok());
+    }
+
+    /// The role-state split gives each role a *distinct* inline runtime state,
+    /// so no role pays for another's RAM:
+    /// - a [`RelayRouter`] holds the zero-sized `NonParentState`,
+    /// - an [`EndDevice`] holds `EndDeviceState` (the R22 End Device Timeout
+    ///   *client* lifecycle only), and
+    /// - a [`Router`] holds `ParentState` (the deferred child-update queue and
+    ///   Parent Announce flag only).
+    ///
+    /// So a relay is the smallest of the three, an end device is larger by its
+    /// client state, and a router is larger by its (bigger) parent state — and,
+    /// crucially, a router no longer carries the End Device Timeout *client*
+    /// state at all (it moved out of the common struct into `EndDeviceState`).
+    #[test]
+    fn each_role_carries_only_its_own_inline_state() {
+        use super::EndDeviceTimeoutState;
+        use super::role::{EndDeviceState, NonParentState, ParentState};
+        use core::mem::size_of;
+
+        // A relay carries no role RAM; an end device carries exactly the client
+        // timeout state; a router carries the (strictly larger) parent state.
+        assert_eq!(size_of::<NonParentState>(), 0);
+        assert_eq!(
+            size_of::<EndDeviceState>(),
+            size_of::<EndDeviceTimeoutState>(),
+            "the end-device role state is exactly the client timeout lifecycle"
+        );
+        assert!(size_of::<EndDeviceState>() > 0);
+        assert!(
+            size_of::<ParentState>() > size_of::<EndDeviceState>(),
+            "the parent state (queue + flag) is larger than the client state"
+        );
+
+        let relay = size_of::<ZigbeeDevice<MockMac, RelayRouter>>();
+        let end_device = size_of::<ZigbeeDevice<MockMac, EndDevice>>();
+        let router = size_of::<ZigbeeDevice<MockMac, Router>>();
+
+        // The relay is the leanest role: strictly smaller than an end device
+        // (which adds the client state) and than a router (which adds the
+        // parent state). Use `>=`/alignment-tolerant bounds so struct-field
+        // ordering / padding cannot make the assertions brittle.
+        let slack = size_of::<usize>() - 1;
+        assert!(
+            end_device > relay,
+            "an end device carries the client timeout state a relay does not"
+        );
+        assert!(
+            end_device - relay >= size_of::<EndDeviceState>() - slack,
+            "the end-device/relay gap ({}) must account for the client state ({})",
+            end_device - relay,
+            size_of::<EndDeviceState>()
+        );
+        assert!(
+            router > relay,
+            "a router carries the parent state a relay does not"
+        );
+        assert!(
+            router - relay >= size_of::<ParentState>() - slack,
+            "the router/relay gap ({}) must account for the parent state ({})",
+            router - relay,
+            size_of::<ParentState>()
+        );
+        // And a router is larger than an end device, because its parent state is
+        // larger than the client state it no longer carries.
+        assert!(
+            router > end_device,
+            "a router (parent state) is larger than an end device (client state)"
+        );
+    }
+
+    /// Compile-time proof that the R22 End Device Timeout **client** lifecycle
+    /// belongs to the end-device role alone: only [`EndDevice`] implements
+    /// [`EndDeviceRole`](super::role::EndDeviceRole), so only an
+    /// end-device-typed device can name the client state or its helpers. A
+    /// [`RelayRouter`] or [`Router`] carries neither the state nor the client
+    /// code.
+    #[test]
+    fn only_the_end_device_role_owns_the_ed_timeout_client() {
+        use super::role::EndDeviceRole;
+
+        fn assert_end_device_role<M: MacDriver, R: EndDeviceRole>(_d: &ZigbeeDevice<M, R>) {}
+
+        let end_device = ZigbeeDevice::builder(MockMac::new(IEEE)).build();
+        assert_end_device_role(&end_device);
+
+        // The negative side is enforced at compile time by the `compile_fail`
+        // doctests on `ZigbeeDevice` and by `EndDeviceRole` being implemented
+        // for `EndDevice` only; a relay/router simply has no `ed_timeout()` or
+        // `send_ed_timeout_request` method to call.
     }
 }

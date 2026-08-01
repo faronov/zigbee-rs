@@ -10,12 +10,12 @@ path = "src/main.rs"
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
-zigbee-bdb = { path = "../../zigbee-bdb" }
+zigbee-bdb = { path = "../../zigbee-bdb", default-features = false }
 zigbee-mac = { path = "../../zigbee-mac", features = ["efr32"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
-zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime", features = ["constrained-memory", "ota"] }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["constrained-memory", "ota"] }
 efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
 efr32mg1-tradfri-product = { path = "../../products/efr32mg1-tradfri" }
 efr32mg1-hal = { path = "../../efr32mg1-hal" }

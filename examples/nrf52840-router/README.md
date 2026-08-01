@@ -4,9 +4,13 @@ A `no_std` experimental Full Function Device target for the
 **nRF52840-DK**. It joins an existing network with the router capability bit
 and exercises always-on receive and NWK forwarding paths.
 
-This is not yet a complete Zigbee router: the nRF MAC does not implement
-`MLME-ASSOCIATE.response`, so it cannot accept child devices or buffer
-indirect frames for sleeping children.
+Because the nRF MAC does not implement `MLME-ASSOCIATE.response` (it cannot
+accept child devices or buffer indirect frames for sleeping children), this
+target uses the honest forwarding-only **`RelayRouter`** logical role
+(`CAN_ROUTE = true`, `IS_PARENT = false`), constructed with `build_relay()`.
+`NrfMac` is not a `ParentMacDriver`, so it cannot construct the parent `Router`
+role; the relay role relays and runs router/link-status maintenance but never
+advertises or behaves as a child-accepting parent.
 
 ## Hardware
 

@@ -41,19 +41,34 @@ You only override what you need.
 
 ### Device Type
 
-Set the Zigbee role — this affects how the stack joins and routes:
+The logical role is selected by the terminal `build*` method, and the device
+type is chosen to match it:
+
+```rust,ignore
+// End device (default role): joins, never routes.
+let sensor = builder.build();                 // ZigbeeDevice<M, EndDevice>
+
+// Relay router: forwarding-only FFD (needs only a `MacDriver`).
+let relay = builder.build_relay();            // ZigbeeDevice<M, RelayRouter>
+
+// Router / coordinator: child-accepting parent (needs a `ParentMacDriver`).
+let router = builder.build_router();          // ZigbeeDevice<M, Router>
+let coord  = builder.build_coordinator();     // ZigbeeDevice<M, Router>, DeviceType::Coordinator
+```
+
+`.device_type(...)` is optional — each `build*` method already picks the role's
+canonical type. If you do set it, it is validated against the chosen build
+method's role and a conflict is rejected (the `build*` methods panic; the
+`try_build*` methods return a typed `BuildError`) rather than silently applied:
 
 ```rust,ignore
 use zigbee_nwk::DeviceType;
 
-// End Device — joins a network, does not route (default)
-builder.device_type(DeviceType::EndDevice)
+// Selects a coordinator instead of the default router type.
+builder.device_type(DeviceType::Coordinator).build_router();
 
-// Router — joins a network and relays frames for others
-builder.device_type(DeviceType::Router)
-
-// Coordinator — forms a new network (PAN coordinator)
-builder.device_type(DeviceType::Coordinator)
+// Rejected: an end-device build cannot be a router.
+builder.device_type(DeviceType::Router).build();   // panics
 ```
 
 ### Channel Mask

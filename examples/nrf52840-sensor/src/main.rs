@@ -67,7 +67,6 @@ static LOGGER: DefmtLogger = DefmtLogger;
 
 use nrf52840_sensor_product::profile::SensorProfile;
 use zigbee_mac::MacDriver;
-use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::node::{NodeError, ZigbeeNode};
 use zigbee_runtime::power::PowerMode;
@@ -208,7 +207,6 @@ async fn main(_spawner: Spawner) {
 
     // ── Build device ──
     let mut device = ZigbeeDevice::builder(mac)
-        .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: 10_000,
             wake_duration_ms: 500,
@@ -513,8 +511,10 @@ where
                 node.device().channel(),
                 node.device().pan_id()
             );
-            checkpoint_security(node);
-            node.device_mut().send_ed_timeout_request().await;
+            // The runtime owns the R22 End Device Timeout lifecycle: a fresh
+            // join or secured rejoin sends exactly one initial request, and a
+            // silent resume reuses the persisted parent relationship. Sending
+            // one here as well would duplicate the negotiation.
             checkpoint_security(node);
             true
         }

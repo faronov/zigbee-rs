@@ -53,7 +53,6 @@ use embassy_futures::block_on;
 use static_cell::StaticCell;
 
 use esp32_zigbee_devkit_product as product;
-use zigbee_nwk::DeviceType;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::profile::ApplicationProfile;
@@ -141,7 +140,6 @@ fn main() -> ! {
     );
 
     let device = ZigbeeDevice::builder(mac)
-        .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: 10_000,
             wake_duration_ms: 500,

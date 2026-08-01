@@ -132,7 +132,7 @@ fn main() {
         .model("MockDimLight-01")
         .date_code("20250101")
         .sw_build("0.1.0")
-        .build();
+        .build_router();
 
     println!("  Device type: Router (mains-powered light)");
     println!("  HA Device ID: 0x0101 (Dimmable Light)");

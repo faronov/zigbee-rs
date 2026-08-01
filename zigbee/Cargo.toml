@@ -13,7 +13,12 @@ zigbee-mac = { version = "0.1.0", path = "../zigbee-mac" }
 zigbee-nwk = { version = "0.1.0", path = "../zigbee-nwk" }
 zigbee-aps = { version = "0.1.0", path = "../zigbee-aps" }
 zigbee-zdo = { version = "0.1.0", path = "../zigbee-zdo" }
-zigbee-bdb = { version = "0.1.0", path = "../zigbee-bdb" }
-zigbee-zcl = { version = "0.1.0", path = "../zigbee-zcl" }
-zigbee-runtime = { version = "0.1.0", path = "../zigbee-runtime" }
+zigbee-bdb = { version = "0.1.0", path = "../zigbee-bdb", default-features = false }
+zigbee-zcl = { version = "0.1.0", path = "../zigbee-zcl", default-features = false }
+zigbee-runtime = { version = "0.1.0", path = "../zigbee-runtime", default-features = false }
 log = "0.4"
+
+[features]
+default = ["float32", "float64"]
+float32 = ["zigbee-bdb/float32", "zigbee-runtime/float32", "zigbee-zcl/float32"]
+float64 = ["zigbee-bdb/float64", "zigbee-runtime/float64", "zigbee-zcl/float64"]

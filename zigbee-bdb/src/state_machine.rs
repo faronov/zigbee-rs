@@ -32,7 +32,7 @@
 //! ```
 
 use zigbee_mac::MacDriver;
-use zigbee_nwk::DeviceType;
+use zigbee_nwk::{DeviceType, nlme::sort_network_descriptors_by};
 
 use crate::{BdbLayer, BdbStatus};
 
@@ -358,11 +358,15 @@ impl<M: MacDriver> BdbLayer<M> {
                 return Err(BdbStatus::NoScanResponse);
             }
         };
-        networks.sort_unstable_by_key(|network| {
-            (
-                network.router_address != previous_parent,
-                core::cmp::Reverse(network.lqi),
-            )
+        sort_network_descriptors_by(&mut networks, |candidate, current| {
+            match (
+                candidate.router_address == previous_parent,
+                current.router_address == previous_parent,
+            ) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => candidate.lqi > current.lqi,
+            }
         });
 
         for network in networks

@@ -1,7 +1,7 @@
 //! Typed application profiles that own their ZCL cluster instances.
 //!
 //! Besides the shared [`ProfileComponent`] / [`ApplicationProfile`] traits,
-//! [`DeviceProfile`], [`WithOta`], [`OptionalOta`], the original
+//! [`DeviceProfile`], the optional `WithOta` / `OptionalOta` decorators, the original
 //! [`TemperatureHumidityBattery`] sensor archetype, and its
 //! [`TemperatureHumidityPressureBattery`] pressure-composed sibling (built
 //! via [`TemperatureHumidityBattery::with_pressure`]) defined in this
@@ -11,7 +11,8 @@
 //! attribute/command/reporting support — see each submodule's doc comment
 //! for what it deliberately leaves out and why:
 //!
-//! - [`air_quality::AirQuality`] — CO₂ + temperature + humidity, optional battery.
+//! - `AirQuality` — CO₂ + temperature + humidity, optional battery; requires
+//!   the `float32` feature.
 //! - [`thermostat::Thermostat`] — local temperature + full thermostat controls,
 //!   optional humidity/battery.
 //! - [`occupancy_light::OccupancyLight`] — occupancy + illuminance sensing,
@@ -23,11 +24,12 @@
 //! - [`smart_plug::SmartPlug`] — On/Off + electrical measurement, optional
 //!   metering.
 //!
-//! [`WithOta`] always adds the OTA Upgrade client cluster; [`OptionalOta`] is
+//! `WithOta` always adds the OTA Upgrade client cluster; `OptionalOta` is
 //! for platforms where the firmware backend may fail to construct (a checked
 //! partition/bootloader layout that does not match this device) and OTA must
 //! be cleanly omitted rather than block commissioning.
 
+#[cfg(feature = "float32")]
 pub mod air_quality;
 pub mod occupancy_light;
 pub mod plant_sensor;
@@ -35,6 +37,7 @@ pub mod range_extender;
 pub mod smart_plug;
 pub mod thermostat;
 
+#[cfg(feature = "float32")]
 pub use air_quality::{AirQuality, AirQualityMeasurement, AirQualityReporting};
 pub use occupancy_light::{OccupancyLight, OccupancyLightMeasurement, OccupancyLightReporting};
 pub use plant_sensor::{PlantSensor, PlantSensorMeasurement, PlantSensorReporting};
@@ -87,10 +90,10 @@ pub trait ProfileComponent {
         0
     }
 
-    fn configure_default_reporting<M: MacDriver>(
+    fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
         &self,
         _endpoint: u8,
-        _device: &mut ZigbeeDevice<M>,
+        _device: &mut ZigbeeDevice<M, R>,
     ) -> Result<(), ProfileError> {
         Ok(())
     }
@@ -110,9 +113,9 @@ pub trait ApplicationProfile {
 
     fn expected_report_clusters(&self) -> usize;
 
-    fn configure_default_reporting<M: MacDriver>(
+    fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
         &self,
-        device: &mut ZigbeeDevice<M>,
+        device: &mut ZigbeeDevice<M, R>,
     ) -> Result<(), ProfileError>;
 }
 
@@ -171,9 +174,9 @@ impl<C: ProfileComponent> ApplicationProfile for DeviceProfile<C> {
         self.component.expected_report_clusters()
     }
 
-    fn configure_default_reporting<M: MacDriver>(
+    fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
         &self,
-        device: &mut ZigbeeDevice<M>,
+        device: &mut ZigbeeDevice<M, R>,
     ) -> Result<(), ProfileError> {
         self.component
             .configure_default_reporting(self.endpoint, device)
@@ -362,10 +365,10 @@ impl ProfileComponent for TemperatureHumidityBattery {
         3
     }
 
-    fn configure_default_reporting<M: MacDriver>(
+    fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
         &self,
         endpoint: u8,
-        device: &mut ZigbeeDevice<M>,
+        device: &mut ZigbeeDevice<M, R>,
     ) -> Result<(), ProfileError> {
         let reporting = device.reporting_mut();
         reporting
@@ -423,7 +426,7 @@ impl ProfileComponent for TemperatureHumidityBattery {
 /// cluster, built via [`TemperatureHumidityBattery::with_pressure`].
 ///
 /// This is a separate, statically-composed type (the same decorator shape
-/// as [`WithOta`]/[`OptionalOta`] below) rather than an `Option` field on
+/// as `WithOta` / `OptionalOta` below) rather than an `Option` field on
 /// `TemperatureHumidityBattery`, so that products which never call
 /// `with_pressure` — every current EFR32 and ESP32 product — never
 /// monomorphize or link [`PressureCluster`]'s `Cluster` vtable and
@@ -485,10 +488,10 @@ impl ProfileComponent for TemperatureHumidityPressureBattery {
         self.inner.expected_report_clusters() + 1
     }
 
-    fn configure_default_reporting<M: MacDriver>(
+    fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
         &self,
         endpoint: u8,
-        device: &mut ZigbeeDevice<M>,
+        device: &mut ZigbeeDevice<M, R>,
     ) -> Result<(), ProfileError> {
         // Pressure reporting is intentionally left to the coordinator's own
         // ConfigureReporting during interview; see `with_pressure`'s doc
@@ -574,9 +577,9 @@ impl<P: ApplicationProfile, F: crate::firmware_writer::FirmwareWriter> Applicati
         self.inner.expected_report_clusters()
     }
 
-    fn configure_default_reporting<M: MacDriver>(
+    fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
         &self,
-        device: &mut ZigbeeDevice<M>,
+        device: &mut ZigbeeDevice<M, R>,
     ) -> Result<(), ProfileError> {
         self.inner.configure_default_reporting(device)
     }
@@ -743,9 +746,9 @@ impl<P: ApplicationProfile, F: crate::firmware_writer::FirmwareWriter> Applicati
         self.inner.expected_report_clusters()
     }
 
-    fn configure_default_reporting<M: MacDriver>(
+    fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
         &self,
-        device: &mut ZigbeeDevice<M>,
+        device: &mut ZigbeeDevice<M, R>,
     ) -> Result<(), ProfileError> {
         self.inner.configure_default_reporting(device)
     }

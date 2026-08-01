@@ -63,6 +63,8 @@ pub struct MockMac {
     time_micros: u32,
     rx_delay_us: u32,
     random_state: u32,
+    tx_failures: u32,
+    poll_failures: u32,
 }
 
 /// Record of a transmitted frame (for test assertions)
@@ -120,6 +122,8 @@ impl MockMac {
             time_micros: 0,
             rx_delay_us: 0,
             random_state: random_state.max(1),
+            tx_failures: 0,
+            poll_failures: 0,
         }
     }
 
@@ -163,6 +167,19 @@ impl MockMac {
     /// Set the simulated delay before the next poll result.
     pub fn set_poll_delay_us(&mut self, delay_us: u32) {
         self.poll_delay_us = delay_us;
+    }
+
+    /// Fail the next `count` MCPS-DATA transmissions with `MacError::NoAck`.
+    ///
+    /// Models a parent that has gone out of range, so callers can exercise
+    /// their bounded transmit-failure recovery without hardware.
+    pub fn set_tx_failures(&mut self, count: u32) {
+        self.tx_failures = count;
+    }
+
+    /// Fail the next `count` MLME-POLL requests with `MacError::NoAck`.
+    pub fn set_poll_failures(&mut self, count: u32) {
+        self.poll_failures = count;
     }
 
     // ── Test assertion methods ──────────────────────────────
@@ -422,6 +439,10 @@ impl MacDriver for MockMac {
 
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
         self.poll_count = self.poll_count.wrapping_add(1);
+        if self.poll_failures > 0 {
+            self.poll_failures -= 1;
+            return Err(MacError::NoAck);
+        }
         if self.poll_queue.is_empty() {
             Ok(None)
         } else {
@@ -442,6 +463,10 @@ impl MacDriver for MockMac {
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
         let payload = MacFrame::from_slice(req.payload).ok_or(MacError::FrameTooLong)?;
+        if self.tx_failures > 0 {
+            self.tx_failures -= 1;
+            return Err(MacError::NoAck);
+        }
         let record = TxRecord {
             dst: req.dst_address,
             payload_len: req.payload.len(),
@@ -522,3 +547,9 @@ impl MacDriver for MockMac {
         }
     }
 }
+
+// The mock MAC overrides all parent-side primitives (beacon response,
+// association response, Frame Pending, indirect delivery and MAC command
+// events), so it can back a router/parent role in host tests.
+impl crate::ParentMacDriver for MockMac {}
+impl crate::sealed::SealedParent for MockMac {}

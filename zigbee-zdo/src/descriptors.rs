@@ -10,6 +10,15 @@ use crate::ZdoError;
 /// Maximum input/output clusters in a [`SimpleDescriptor`].
 pub const MAX_CLUSTERS: usize = 16;
 
+/// Stack Compliance Revision advertised by this stack.
+///
+/// Zigbee Core R22 (revision 22) is the specification this stack implements,
+/// and R22 §2.3.2.3.10 requires the revision to be advertised in Node
+/// Descriptor server-mask bits 9..=14. A device that leaves the field at 0 is
+/// treated as pre-R21 by certified coordinators, which disables R21+ join and
+/// security behaviour.
+pub const STACK_COMPLIANCE_REVISION: u8 = 22;
+
 // ── Logical type (3 bits, Node Descriptor) ──────────────────────
 
 /// Zigbee logical device type (3-bit field in the Node Descriptor).
@@ -90,9 +99,51 @@ impl NodeDescriptor {
     /// On-the-wire size in bytes.
     pub const WIRE_SIZE: usize = 13;
 
+    // ── Server mask bits (R22 Table 2-34) ───────────────────────
+
+    /// Primary Trust Center (bit 0).
+    pub const SERVER_PRIMARY_TRUST_CENTER: u16 = 1 << 0;
+    /// Backup Trust Center (bit 1).
+    pub const SERVER_BACKUP_TRUST_CENTER: u16 = 1 << 1;
+    /// Primary Binding Table Cache (bit 2).
+    pub const SERVER_PRIMARY_BINDING_CACHE: u16 = 1 << 2;
+    /// Backup Binding Table Cache (bit 3).
+    pub const SERVER_BACKUP_BINDING_CACHE: u16 = 1 << 3;
+    /// Primary Discovery Cache (bit 4).
+    pub const SERVER_PRIMARY_DISCOVERY_CACHE: u16 = 1 << 4;
+    /// Backup Discovery Cache (bit 5).
+    pub const SERVER_BACKUP_DISCOVERY_CACHE: u16 = 1 << 5;
+    /// Network Manager (bit 6).
+    pub const SERVER_NETWORK_MANAGER: u16 = 1 << 6;
+    /// Mask of the advertised server services (bits 0..=6). Bits 7-8 are
+    /// reserved and must stay clear.
+    pub const SERVER_SERVICE_MASK: u16 = 0x007F;
+    /// Mask of the Stack Compliance Revision field (bits 9..=14).
+    pub const SERVER_STACK_REVISION_MASK: u16 = 0x7E00;
+
+    /// Build a server mask from service bits and a stack compliance revision.
+    ///
+    /// Reserved bits 7-8 and 15 are forced clear, and the revision is clamped
+    /// to the six bits the field actually has.
+    pub const fn server_mask(services: u16, stack_revision: u8) -> u16 {
+        (services & Self::SERVER_SERVICE_MASK)
+            | (((stack_revision as u16) & 0x3F) << 9) & Self::SERVER_STACK_REVISION_MASK
+    }
+
     /// Zigbee stack compliance revision encoded in server-mask bits 9..=14.
     pub const fn stack_revision(&self) -> u8 {
         ((self.server_mask >> 9) & 0x3F) as u8
+    }
+
+    /// Replace the stack compliance revision, leaving the service bits intact.
+    pub const fn set_stack_revision(&mut self, stack_revision: u8) {
+        self.server_mask = Self::server_mask(self.server_mask, stack_revision);
+    }
+
+    /// Builder-style [`Self::set_stack_revision`].
+    pub const fn with_stack_revision(mut self, stack_revision: u8) -> Self {
+        self.set_stack_revision(stack_revision);
+        self
     }
 
     /// Serialize into `buf`, returning the number of bytes written.

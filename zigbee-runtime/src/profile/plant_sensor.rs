@@ -7,7 +7,8 @@
 //! Automation device ID dedicated to "plant sensor" (real products such as
 //! the Xiaomi/Aqara Mi Flora use a manufacturer-specific profile rather than
 //! HA 0x0104), so this archetype uses the same generic Simple Sensor device
-//! ID (`DeviceId::SIMPLE_SENSOR`, 0x000C) as [`super::AirQuality`].
+//! ID (`DeviceId::SIMPLE_SENSOR`, 0x000C) as the optional `AirQuality`
+//! profile.
 
 use super::{
     ApplicationClusters, BatteryDescriptor, BatteryMeasurement, ProfileComponent, ProfileError,
@@ -218,10 +219,10 @@ impl ProfileComponent for PlantSensor {
         3 + usize::from(self.battery.is_some())
     }
 
-    fn configure_default_reporting<M: MacDriver>(
+    fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
         &self,
         endpoint: u8,
-        device: &mut ZigbeeDevice<M>,
+        device: &mut ZigbeeDevice<M, R>,
     ) -> Result<(), ProfileError> {
         let reporting = device.reporting_mut();
         reporting

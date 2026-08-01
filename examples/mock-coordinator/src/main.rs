@@ -17,7 +17,6 @@ use zigbee::trust_center::{DEFAULT_TC_LINK_KEY, TrustCenter};
 use zigbee_mac::MacDriver;
 use zigbee_mac::mock::MockMac;
 use zigbee_mac::primitives::*;
-use zigbee_nwk::DeviceType;
 use zigbee_runtime::builder::DeviceBuilder;
 use zigbee_types::*;
 
@@ -227,8 +226,11 @@ fn main() {
 
     // Create a second MockMac for the DeviceBuilder (the first is consumed above)
     let mac_for_device = MockMac::new(coord_ieee);
+    // `build_router()` is bounded on `zigbee_mac::ParentMacDriver`: it produces
+    // a typed `ZigbeeDevice<_, Router>`, which the MockMac backend can satisfy
+    // because it genuinely implements the parent-side MAC primitives. A leaf
+    // end-device MAC could not construct this.
     let device = DeviceBuilder::new(mac_for_device)
-        .device_type(DeviceType::Coordinator)
         .manufacturer("Zigbee-RS")
         .model("MockCoordinator-01")
         .date_code("20250101")
@@ -238,7 +240,7 @@ fn main() {
             ep.cluster_server(zigbee_zcl::ClusterId::BASIC)
                 .cluster_server(zigbee_zcl::ClusterId::IDENTIFY)
         })
-        .build();
+        .build_router();
 
     println!("  Built coordinator device with HA profile");
     println!("  Endpoint 1: Basic + Identify clusters");

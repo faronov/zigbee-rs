@@ -3,6 +3,11 @@
 #![no_std]
 #![no_main]
 
+#[cfg(all(feature = "production", feature = "diagnostic-logging"))]
+compile_error!("select either production or diagnostic-logging, not both");
+#[cfg(not(any(feature = "production", feature = "diagnostic-logging")))]
+compile_error!("select production or diagnostic-logging");
+
 mod hal;
 
 use core::fmt::{Display, Formatter, Write};
@@ -15,7 +20,6 @@ use embassy_time_driver::Driver;
 use panic_halt as _;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::{MacPib, SoftMacCore, bl702::radio_phy::Bl702RadioPhy};
-use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::security_store::SecurityStateStore;
@@ -200,7 +204,6 @@ async fn sensor(_spawner: Spawner, application: hal::ApplicationResources) {
     );
 
     let mut device = ZigbeeDevice::builder(mac)
-        .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: 10_000,
             wake_duration_ms: 500,

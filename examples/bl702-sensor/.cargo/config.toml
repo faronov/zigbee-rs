@@ -1,6 +1,9 @@
 [build]
 target = "riscv32imc-unknown-none-elf"
 
+[target.riscv32imc-unknown-none-elf]
+rustflags = ["-Zlocation-detail=none"]
+
 [unstable]
 build-std = ["core"]
 

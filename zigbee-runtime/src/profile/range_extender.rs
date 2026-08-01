@@ -25,10 +25,10 @@ impl ProfileComponent for RangeExtender {
         Ok(())
     }
 
-    fn configure_default_reporting<M: MacDriver>(
+    fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
         &self,
         _endpoint: u8,
-        _device: &mut ZigbeeDevice<M>,
+        _device: &mut ZigbeeDevice<M, R>,
     ) -> Result<(), ProfileError> {
         Ok(())
     }

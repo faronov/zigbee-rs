@@ -208,10 +208,10 @@ impl ProfileComponent for Thermostat {
         1 + usize::from(self.humidity.is_some()) + usize::from(self.battery.is_some())
     }
 
-    fn configure_default_reporting<M: MacDriver>(
+    fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
         &self,
         endpoint: u8,
-        device: &mut ZigbeeDevice<M>,
+        device: &mut ZigbeeDevice<M, R>,
     ) -> Result<(), ProfileError> {
         let reporting = device.reporting_mut();
         reporting

@@ -182,10 +182,10 @@ impl ProfileComponent for OccupancyLight {
         2 + usize::from(self.battery.is_some())
     }
 
-    fn configure_default_reporting<M: MacDriver>(
+    fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
         &self,
         endpoint: u8,
-        device: &mut ZigbeeDevice<M>,
+        device: &mut ZigbeeDevice<M, R>,
     ) -> Result<(), ProfileError> {
         let reporting = device.reporting_mut();
         // Bitmap8 is a discrete type: no reportable-change threshold, any

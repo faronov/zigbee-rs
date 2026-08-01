@@ -8,12 +8,12 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::{MacDriver, MacError, PlatformServices, telink::TelinkMac};
-use zigbee_nwk::DeviceType;
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::profile::{ApplicationProfile, DeviceProfile, RangeExtender};
+use zigbee_runtime::role::Router;
 use zigbee_runtime::security_store::SecurityStateStore;
 use zigbee_zcl::DeviceId;
 use zigbee_zcl::clusters::basic::PowerSource;
@@ -175,7 +175,7 @@ impl JoinMetrics {
         self.zdo_response_failures.store(0, Ordering::Relaxed);
     }
 
-    fn capture_steering(&self, device: &ZigbeeDevice<TelinkMac>) {
+    fn capture_steering(&self, device: &ZigbeeDevice<TelinkMac, Router>) {
         let diagnostics = device.steering_diagnostics();
         let started_us = if diagnostics.attempt_started_us != 0 {
             self.attempt_started_us
@@ -289,7 +289,7 @@ impl JoinMetrics {
         );
     }
 
-    fn capture_interview(&self, device: &ZigbeeDevice<TelinkMac>) {
+    fn capture_interview(&self, device: &ZigbeeDevice<TelinkMac, Router>) {
         let diagnostics = device.zdo_diagnostics();
         let elapsed_ms = self.elapsed_ms(device.mac().monotonic_micros());
         if diagnostics.node_desc_requests != 0 {
@@ -309,7 +309,7 @@ impl JoinMetrics {
             .store(diagnostics.response_failures, Ordering::Relaxed);
     }
 
-    fn mark_commissioning_complete(&self, device: &ZigbeeDevice<TelinkMac>) {
+    fn mark_commissioning_complete(&self, device: &ZigbeeDevice<TelinkMac, Router>) {
         let elapsed_ms = self.elapsed_ms(device.mac().monotonic_micros());
         self.store_first(&self.commissioning_complete_ms, elapsed_ms);
     }
@@ -361,14 +361,15 @@ enum LoopControl {
     Fatal,
 }
 
-async fn apply_stack_event<M, S, P>(
-    node: &mut ZigbeeNode<'_, M, S, P>,
+async fn apply_stack_event<M, S, P, R>(
+    node: &mut ZigbeeNode<'_, M, S, P, R>,
     event: StackEvent,
 ) -> LoopControl
 where
     M: MacDriver,
     S: SecurityStateStore,
     P: ApplicationProfile,
+    R: zigbee_runtime::role::DeviceRole,
 {
     match event {
         StackEvent::RejoinRequested => match node.secure_rejoin().await {
@@ -399,7 +400,7 @@ fn failure(leds: &StatusLeds) -> ! {
 }
 
 pub fn run() -> ! {
-    type Device = ZigbeeDevice<TelinkMac>;
+    type Device = ZigbeeDevice<TelinkMac, Router>;
 
     tlsr8258_hal::timer::init();
     let resources = match BoardResources::take() {
@@ -437,7 +438,6 @@ pub fn run() -> ! {
     );
 
     let device = ZigbeeDevice::builder(mac)
-        .device_type(DeviceType::Router)
         .power_mode(PowerMode::AlwaysOn)
         .manufacturer("Zigbee-RS")
         .model("TLSR8258-Router")
@@ -451,7 +451,7 @@ pub fn run() -> ! {
             profile.device_id(),
             |endpoint| profile.configure_endpoint(endpoint),
         )
-        .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
+        .build_router_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
 
     let mut security_store = tlsr8258_tb04_product::storage::security_store(resources.flash);
     if device
@@ -462,111 +462,121 @@ pub fn run() -> ! {
     }
     let mut node = ZigbeeNode::new(device, &mut security_store, &mut profile);
 
-    'commission: loop {
-        leds.green.write(false);
-        leds.blue.write(false);
-        leds.red.write(true);
+    // Single root future for the whole firmware: start/resume with join-retry
+    // backoff, MAX_RX_SLICE_US-bounded receive windows, `process_incoming`,
+    // parent command servicing, tick/`RunAgain` scheduling, metrics timestamps,
+    // LED states, and factory-reset/rejoin all run inside this one future so
+    // `tlsr8258_rt::block_on` is monomorphized exactly once. Synchronous chip,
+    // ADC, LED, MAC, device, and node initialization above stays outside the
+    // future. This never returns (`Output = !`).
+    let app = async move {
+        'commission: loop {
+            leds.green.write(false);
+            leds.blue.write(false);
+            leds.red.write(true);
 
-        let mut retry_delay_ms = JOIN_RETRY_MIN_MS;
-        loop {
-            TELINK_JOIN_METRICS.begin_attempt(node.device().mac().monotonic_micros());
-            match tlsr8258_rt::block_on(node.start_or_resume()) {
-                Ok(_) => break,
-                Err(StartError::CommissioningFailed(_)) => {
-                    let diagnostics = node.device().steering_diagnostics();
-                    let announce_exhausted = diagnostics.device_annce_exhausted();
-                    TELINK_JOIN_METRICS.capture_steering(node.device());
-                    if announce_exhausted && tlsr8258_rt::block_on(node.factory_reset()).is_err() {
-                        failure(&leds);
+            let mut retry_delay_ms = JOIN_RETRY_MIN_MS;
+            loop {
+                TELINK_JOIN_METRICS.begin_attempt(node.device().mac().monotonic_micros());
+                match node.start_or_resume().await {
+                    Ok(_) => break,
+                    Err(StartError::CommissioningFailed(_)) => {
+                        let diagnostics = node.device().steering_diagnostics();
+                        let announce_exhausted = diagnostics.device_annce_exhausted();
+                        TELINK_JOIN_METRICS.capture_steering(node.device());
+                        if announce_exhausted && node.factory_reset().await.is_err() {
+                            failure(&leds);
+                        }
+                        tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(retry_delay_ms));
+                        retry_delay_ms = retry_delay_ms.saturating_mul(2).min(JOIN_RETRY_MAX_MS);
                     }
-                    tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(retry_delay_ms));
-                    retry_delay_ms = retry_delay_ms.saturating_mul(2).min(JOIN_RETRY_MAX_MS);
+                    Err(_) => failure(&leds),
                 }
-                Err(_) => failure(&leds),
             }
-        }
-        TELINK_JOIN_METRICS.capture_steering(node.device());
+            TELINK_JOIN_METRICS.capture_steering(node.device());
 
-        // Solid green = joined and relaying. Unlike the sensor runtime,
-        // there is no battery/sensor state to report — this LED state is
-        // the entire "am I alive and joined" signal for the router.
-        leds.red.write(false);
-        leds.green.write(true);
-        leds.blue.write(false);
+            // Solid green = joined and relaying. Unlike the sensor runtime,
+            // there is no battery/sensor state to report — this LED state is
+            // the entire "am I alive and joined" signal for the router.
+            leds.red.write(false);
+            leds.green.write(true);
+            leds.blue.write(false);
 
-        let mut identify_elapsed = 0u32;
-        let one_second = tlsr8258_hal::timer::ms(1_000);
-        let mut tick_anchor = tlsr8258_hal::timer::now_ticks();
-        let mut rx_slice_us = MAX_RX_SLICE_US;
+            let mut identify_elapsed = 0u32;
+            let one_second = tlsr8258_hal::timer::ms(1_000);
+            let mut tick_anchor = tlsr8258_hal::timer::now_ticks();
+            let mut rx_slice_us = MAX_RX_SLICE_US;
 
-        loop {
-            let mut event = None;
-            match tlsr8258_rt::block_on(node.device_mut().receive_timeout(rx_slice_us)) {
-                Ok(indication) => {
-                    TELINK_JOIN_METRICS.record_rx();
-                    match tlsr8258_rt::block_on(node.process_incoming(&indication)) {
-                        Ok(stack_event) => event = stack_event,
-                        Err(_) => failure(&leds),
+            loop {
+                let mut event = None;
+                match node.device_mut().receive_timeout(rx_slice_us).await {
+                    Ok(indication) => {
+                        TELINK_JOIN_METRICS.record_rx();
+                        match node.process_incoming(&indication).await {
+                            Ok(stack_event) => event = stack_event,
+                            Err(_) => failure(&leds),
+                        }
                     }
+                    Err(MacError::NoData) => {}
+                    Err(_) => failure(&leds),
                 }
-                Err(MacError::NoData) => {}
-                Err(_) => failure(&leds),
-            }
-            TELINK_JOIN_METRICS.capture_interview(node.device());
+                TELINK_JOIN_METRICS.capture_interview(node.device());
 
-            if let Some(stack_event) = event {
-                if matches!(
-                    stack_event,
-                    StackEvent::CommissioningComplete { success: true }
-                ) {
-                    TELINK_JOIN_METRICS.mark_commissioning_complete(node.device());
-                }
-                match tlsr8258_rt::block_on(apply_stack_event(&mut node, stack_event)) {
-                    LoopControl::Continue => {}
-                    LoopControl::Recommission => continue 'commission,
-                    LoopControl::Fatal => failure(&leds),
-                }
-            }
-
-            let now = tlsr8258_hal::timer::now_ticks();
-            let elapsed = now.wrapping_sub(tick_anchor);
-            let elapsed_secs = if elapsed >= one_second {
-                let elapsed_secs = (elapsed / one_second).min(u16::MAX as u32) as u16;
-                tick_anchor = tick_anchor.wrapping_add(u32::from(elapsed_secs) * one_second);
-                identify_elapsed = identify_elapsed.wrapping_add(u32::from(elapsed_secs));
-                elapsed_secs
-            } else {
-                0
-            };
-
-            match tlsr8258_rt::block_on(node.tick(elapsed_secs)) {
-                Ok(TickResult::Idle) => rx_slice_us = MAX_RX_SLICE_US,
-                Ok(TickResult::RunAgain(delay_ms)) => {
-                    rx_slice_us = delay_ms.max(1).saturating_mul(1_000).min(MAX_RX_SLICE_US);
-                }
-                Ok(TickResult::Event(stack_event)) => {
-                    rx_slice_us = MAX_RX_SLICE_US;
+                if let Some(stack_event) = event {
                     if matches!(
                         stack_event,
                         StackEvent::CommissioningComplete { success: true }
                     ) {
                         TELINK_JOIN_METRICS.mark_commissioning_complete(node.device());
                     }
-                    match tlsr8258_rt::block_on(apply_stack_event(&mut node, stack_event)) {
+                    match apply_stack_event(&mut node, stack_event).await {
                         LoopControl::Continue => {}
                         LoopControl::Recommission => continue 'commission,
                         LoopControl::Fatal => failure(&leds),
                     }
                 }
-                Err(_) => failure(&leds),
-            }
-            TELINK_JOIN_METRICS.capture_steering(node.device());
 
-            if node.device().is_identifying(ENDPOINT) {
-                leds.blue.write((identify_elapsed & 1) == 0);
-            } else {
-                leds.blue.write(false);
+                let now = tlsr8258_hal::timer::now_ticks();
+                let elapsed = now.wrapping_sub(tick_anchor);
+                let elapsed_secs = if elapsed >= one_second {
+                    let elapsed_secs = (elapsed / one_second).min(u16::MAX as u32) as u16;
+                    tick_anchor = tick_anchor.wrapping_add(u32::from(elapsed_secs) * one_second);
+                    identify_elapsed = identify_elapsed.wrapping_add(u32::from(elapsed_secs));
+                    elapsed_secs
+                } else {
+                    0
+                };
+
+                match node.tick(elapsed_secs).await {
+                    Ok(TickResult::Idle) => rx_slice_us = MAX_RX_SLICE_US,
+                    Ok(TickResult::RunAgain(delay_ms)) => {
+                        rx_slice_us = delay_ms.max(1).saturating_mul(1_000).min(MAX_RX_SLICE_US);
+                    }
+                    Ok(TickResult::Event(stack_event)) => {
+                        rx_slice_us = MAX_RX_SLICE_US;
+                        if matches!(
+                            stack_event,
+                            StackEvent::CommissioningComplete { success: true }
+                        ) {
+                            TELINK_JOIN_METRICS.mark_commissioning_complete(node.device());
+                        }
+                        match apply_stack_event(&mut node, stack_event).await {
+                            LoopControl::Continue => {}
+                            LoopControl::Recommission => continue 'commission,
+                            LoopControl::Fatal => failure(&leds),
+                        }
+                    }
+                    Err(_) => failure(&leds),
+                }
+                TELINK_JOIN_METRICS.capture_steering(node.device());
+
+                if node.device().is_identifying(ENDPOINT) {
+                    leds.blue.write((identify_elapsed & 1) == 0);
+                } else {
+                    leds.blue.write(false);
+                }
             }
         }
-    }
+    };
+    tlsr8258_rt::block_on(app)
 }

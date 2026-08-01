@@ -4,6 +4,17 @@ A complete Zigbee PRO R22 protocol stack written in Rust, targeting embedded
 `no_std` environments. Built on `async` traits for seamless integration with
 Embassy and other embedded async runtimes.
 
+> **Specification roadmap:** Zigbee PRO R22 with BDB 3.0.1 remains the active
+> production target. R23/BDB 3.1 is a deferred, optional roadmap item rather
+> than a current release goal. R23 support must remain compile-time isolated
+> so it adds no code or RAM to R22 products.
+
+> **Role-specialized firmware:** sensor builds compile out parent/router
+> maintenance and parent state rather than carrying dormant code. With the
+> pinned `tc32-45` toolchain, the current TLSR8258 release images are 272,148
+> bytes for the end-device sensor and 331,852 bytes for the parent router.
+> See the [firmware-size report](docs/book/src/advanced/firmware-size.md).
+
 ```text
 63,000+ lines of Rust · 199 source files · 30 crates · 45 ZCL clusters · 12 hardware platforms · 300+ tests · 5 pure-Rust radios · crash-safe NV storage across nRF, ESP32, BL702, and TLSR8258
 ```

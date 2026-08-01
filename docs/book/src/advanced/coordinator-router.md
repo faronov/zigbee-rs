@@ -15,6 +15,100 @@ zigbee/src/
 
 ---
 
+## Logical roles are types
+
+The Zigbee logical role a product plays — a leaf **end device**, a
+forwarding-only **relay router**, or a child-accepting **router**/parent — is a
+compile-time Rust *type*, not the Cargo `router` feature alone.
+`ZigbeeDevice<M, R>` carries a role parameter `R` that defaults to `EndDevice`,
+so existing `ZigbeeDevice<M>` source keeps building an end device unchanged:
+
+```rust,ignore
+use zigbee_runtime::role::{EndDevice, RelayRouter, Router};
+
+// End-device role (default): needs only a `MacDriver` backend.
+let sensor = ZigbeeDevice::builder(mac).build();               // ZigbeeDevice<M, EndDevice>
+
+// Relay-router role: forwarding-only FFD, also needs only a `MacDriver`.
+let relay = ZigbeeDevice::builder(mac).build_relay();          // ZigbeeDevice<M, RelayRouter>
+
+// Router role: bounded on a genuine `ParentMacDriver` backend.
+let router = ZigbeeDevice::builder(parent_mac).build_router(); // ZigbeeDevice<M, Router>
+
+// Coordinator: a parent router that forms a centralized network.
+let coord = ZigbeeDevice::builder(parent_mac).build_coordinator();
+```
+
+| role | `CAN_ROUTE` | `IS_PARENT` | builder | MAC bound |
+|------|-------------|-------------|---------|-----------|
+| `EndDevice`   | `false` | `false` | `build`          | `MacDriver` |
+| `RelayRouter` | `true`  | `false` | `build_relay`    | `MacDriver` |
+| `Router`      | `true`  | `true`  | `build_router` / `build_coordinator` | `ParentMacDriver` |
+
+A **`RelayRouter`** relays NWK traffic and runs router/link-status maintenance
+but *cannot accept or serve children* — it honestly models an always-on FFD
+whose MAC has no parent-side association primitives (for example the nRF radio
+backend, see [`nrf52840-router`](https://github.com/faronov/zigbee-rs/tree/master/examples/nrf52840-router)).
+
+`build_router()` / `build_router_into()` are bounded on
+[`ParentMacDriver`](../core-concepts/mac.md#parent-capability-boundary-parentmacdriver):
+a MAC backend that cannot accept children cannot construct a router, so the
+logical role and the physical parent capability cannot disagree.
+
+**Role and device type cannot disagree.** Each terminal `build*` method selects
+the device's `DeviceType` for its role. Setting a conflicting
+`.device_type(...)` is rejected rather than silently applied: the ergonomic
+`build*` methods panic, and the `try_build*` methods return a typed
+`BuildError`. So `build()` (end device) refuses a router/coordinator type,
+`build_relay()` accepts only a router type, and `build_router()` accepts a
+router or coordinator type.
+
+Parent-only operational APIs (`permit_joining`, `announce_parent`,
+`service_parent_commands`, and child-table `save_child_table`/
+`restore_child_table`) live in impl blocks bounded on the `ParentRole` marker,
+so neither an end device nor a relay exposes them — not even as success-shaped
+no-ops. `ZigbeeNode<'a, M, S, P, R>` is generic over the role, so a router
+product composes a `ZigbeeDevice<M, Router>` without a bespoke wrapper.
+
+### Role-split maintenance
+
+The joined `tick` selects its periodic NWK maintenance by *static dispatch* on
+the role (`DeviceRole::run_role_nwk_maintenance`), so a non-parent
+monomorphization's `tick` future never materializes the child-serving futures:
+
+- `EndDevice` ages only its neighbour cache;
+- `RelayRouter` also runs permit-join expiry, router / link-status / route-table
+  / concentrator maintenance and pending routing transmission;
+- `Router` additionally runs child End Device Timeout aging, MAC parent-command
+  servicing, Parent Announce transaction aging and a due Parent Announce, in the
+  pre-split order.
+
+`parent_mode_active()` now also requires `R::IS_PARENT`, so a relay never enters
+parent servicing even though it routes.
+
+### Role-split inline state
+
+Each role also carries a *distinct* inline runtime state
+(`DeviceRole::State`), so no role pays for another's RAM (or code):
+
+- `RelayRouter` holds the zero-sized `NonParentState` — no role RAM at all;
+- `EndDevice` holds `EndDeviceState`, which owns only the R22 End Device Timeout
+  *client* lifecycle (see [event loop](../core-concepts/event-loop.md#end-device-timeout-keepalive));
+- `Router` holds `ParentState`, which owns only the deferred Trust Center
+  Update-Device queue and the pending Parent Announce flag.
+
+Because the client lifecycle helpers are bounded on `EndDeviceRole` and reached
+through static role hooks, a router/relay links none of the client code and a
+leaf links none of the parent/server code. So the client half of the End Device
+Timeout negotiation is a leaf-only concern and the server half (child aging and
+the 0x0C response) is a router-only concern.
+
+The Cargo `router` feature is still meaningful: it gates table capacities and
+the additive routing/parent code so a non-router sensor build removes them from
+the image entirely. The role type is the capability boundary layered on top.
+
+---
+
 ## Coordinator
 
 ### CoordinatorConfig

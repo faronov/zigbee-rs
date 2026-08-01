@@ -62,6 +62,63 @@ commit marker. It also supports crash-safe outgoing-counter reservations.
 Do not replace the security journal with `LogStructuredNv`. Both use the same
 raw NOR traits, but they intentionally provide different semantics.
 
+### Record versions
+
+| Version | Encoded state | CRC offset | Added |
+|---|---|---|---|
+| 1 | 80 bytes | 92 | initial layout |
+| 2 | 97 bytes | 112 | staged network key |
+| 3 | 98 bytes | 112 | R22 End Device Timeout negotiation |
+
+Version 3 reuses flags bit 6 for `parent_information_valid`, the previously
+unused encoded byte 11 for `parent_information` and the new byte 97 for
+`end_device_timeout`. Nothing else moved: the 128-byte slot size, 116-byte
+record prefix and byte-124 commit marker are unchanged, so the crash-safety
+scheme and every existing partition layout are unaffected. Version 1 and 2
+records are still decoded through their own explicit paths and migrate to
+"never negotiated, default enumeration 8".
+
+> **Downgrade is not supported.** Once this firmware has written a version 3
+> record, older firmware will skip it while scanning and select the newest
+> record it *can* decode — an older generation with stale counters, a stale
+> parent and possibly a stale network key. Reusing those reservations would
+> replay NWK/APS frame counters. Recommission the device instead of
+> downgrading.
+
+## Child table (router/coordinator)
+
+A router persists its authenticated child table through a **separate** durable
+store (`zigbee_runtime::child_store`), kept independent of the security journal
+on purpose: the security record is rewritten on every frame-counter reservation
+and must stay small, whereas the child table is a larger, lower-frequency
+snapshot. The child store never reads or writes NWK/APS frame counters, so
+restoring or discarding it can never replay a secured frame.
+
+Each child persists its IEEE identity, short address, capability/configuration
+(rx-on-when-idle, security-capable, router vs end device) and accepted End
+Device Timeout enumeration. The live aging countdown is **not** persisted — on
+restore each end-device child's deadline is re-armed to the full window of its
+enumeration, granting it a fresh window to prove liveness rather than being
+evicted immediately after a reboot, and avoiding a flash write per countdown
+tick.
+
+| Backend | Use |
+|---|---|
+| `RamChildTableStore` | Complete generic store for a router **without** a configured child-table partition — keeps the table for the current power cycle only and never claims durable persistence. |
+| `ChildTableJournal<S: NorFlash>` | Two-sector crash-safe journal (its own sectors, not the security journal's) with generation numbers, a CRC over the record prefix and a trailing commit marker written last. |
+
+The record is versioned (`ZBCT`, version 1). An unrecognised version is skipped
+like a corrupt record, so downgrading simply drops the persisted child table:
+children re-appear through normal association/rejoin and keepalive, and no
+security counter is affected. Wire it through `ZigbeeDevice::save_child_table`
+and `restore_child_table`; a successful restore schedules a Parent Announce.
+
+> **Partition not yet allocated.** No product linker script currently reserves
+> child-table sectors, so a router opts in with `RamChildTableStore` today.
+> Durable child persistence on hardware requires allocating two dedicated
+> sectors (distinct from the security journal's) in the product memory map and
+> constructing a `ChildTableJournal` over them — a remaining hardware gate.
+
 ## Platform ownership
 
 | Platform | Flash controller | Current partition owner | Store |

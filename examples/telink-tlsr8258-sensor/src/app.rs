@@ -2,7 +2,6 @@ use core::mem::MaybeUninit;
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::telink::TelinkMac;
-use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, StartError};
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::synthetic_sensor::{SyntheticSensor, apply_synthetic_reading};
@@ -120,7 +119,6 @@ pub fn run() -> ! {
     hum_cluster.set_humidity(5_000);
 
     let device = ZigbeeDevice::builder(mac)
-        .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: 10_000,
             wake_duration_ms: 500,
@@ -173,104 +171,116 @@ pub fn run() -> ! {
     let mut sensor_sample = 0u32;
     let mut sensor_update_elapsed = 0u16;
 
-    'commission: loop {
-        let mut attempts = 0u8;
-        loop {
-            attempts = attempts.saturating_add(1);
-            match tlsr8258_rt::block_on(
-                device.start_or_resume_with_security_store(&mut security_store),
-            ) {
-                Ok(_) => break,
-                Err(StartError::CommissioningFailed(_)) if attempts < 10 => {
-                    tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(5_000));
+    // Single root future for the whole firmware: all start/resume, receive
+    // windows, `process_incoming`, tick/persistence refresh, commissioning
+    // retries, and factory-reset/rejoin loops run inside this one future so
+    // `tlsr8258_rt::block_on` is monomorphized exactly once. Synchronous chip,
+    // ADC, LED, MAC, device, and security-store initialization above stays
+    // outside the future. This never returns (`Output = !`).
+    let app = async move {
+        'commission: loop {
+            let mut attempts = 0u8;
+            loop {
+                attempts = attempts.saturating_add(1);
+                match device
+                    .start_or_resume_with_security_store(&mut security_store)
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(StartError::CommissioningFailed(_)) if attempts < 10 => {
+                        tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(5_000));
+                    }
+                    Err(_) => failure(&leds),
                 }
-                Err(_) => failure(&leds),
             }
-        }
 
-        leds.red.write(false);
-        leds.green.write(true);
-        leds.blue.write(false);
-        if apply_synthetic_reading(&mut clusters, 1, TEST_SENSOR.sample(sensor_sample)).is_err() {
-            failure(&leds);
-        }
+            leds.red.write(false);
+            leds.green.write(true);
+            leds.blue.write(false);
+            if apply_synthetic_reading(&mut clusters, 1, TEST_SENSOR.sample(sensor_sample)).is_err()
+            {
+                failure(&leds);
+            }
 
-        let one_second = tlsr8258_hal::timer::ms(1_000);
-        let mut tick_anchor = tlsr8258_hal::timer::now_ticks();
-        loop {
-            for _ in 0..4u8 {
-                match tlsr8258_rt::block_on(device.poll()) {
-                    Ok(Some(indication)) => {
-                        let event =
-                            tlsr8258_rt::block_on(device.process_incoming_with_security_store(
-                                &indication,
-                                &mut clusters,
-                                &mut security_store,
-                            ));
-                        match event {
-                            Ok(Some(StackEvent::RejoinRequested)) => {
-                                let _ = tlsr8258_rt::block_on(
-                                    device.secure_rejoin_with_security_store(&mut security_store),
-                                );
-                            }
-                            Ok(Some(StackEvent::LeaveRequested)) => {
-                                if tlsr8258_rt::block_on(
-                                    device.factory_reset_with_security_store(&mut security_store),
+            let one_second = tlsr8258_hal::timer::ms(1_000);
+            let mut tick_anchor = tlsr8258_hal::timer::now_ticks();
+            loop {
+                for _ in 0..4u8 {
+                    match device.poll().await {
+                        Ok(Some(indication)) => {
+                            let event = device
+                                .process_incoming_with_security_store(
+                                    &indication,
+                                    &mut clusters,
+                                    &mut security_store,
                                 )
-                                .is_err()
-                                {
-                                    failure(&leds);
+                                .await;
+                            match event {
+                                Ok(Some(StackEvent::RejoinRequested)) => {
+                                    let _ = device
+                                        .secure_rejoin_with_security_store(&mut security_store)
+                                        .await;
                                 }
-                                leds.green.write(false);
-                                leds.red.write(true);
-                                continue 'commission;
+                                Ok(Some(StackEvent::LeaveRequested)) => {
+                                    if device
+                                        .factory_reset_with_security_store(&mut security_store)
+                                        .await
+                                        .is_err()
+                                    {
+                                        failure(&leds);
+                                    }
+                                    leds.green.write(false);
+                                    leds.red.write(true);
+                                    continue 'commission;
+                                }
+                                Ok(_) => {}
+                                Err(_) => failure(&leds),
                             }
-                            Ok(_) => {}
-                            Err(_) => failure(&leds),
-                        }
 
-                        if tlsr8258_rt::block_on(device.tick_with_security_store(
-                            0,
+                            if device
+                                .tick_with_security_store(0, &mut clusters, &mut security_store)
+                                .await
+                                .is_err()
+                            {
+                                failure(&leds);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+
+                let now = tlsr8258_hal::timer::now_ticks();
+                let elapsed = now.wrapping_sub(tick_anchor);
+                if elapsed >= one_second {
+                    let elapsed_secs = (elapsed / one_second).min(u16::MAX as u32) as u16;
+                    tick_anchor = tick_anchor.wrapping_add(u32::from(elapsed_secs) * one_second);
+                    sensor_update_elapsed = sensor_update_elapsed.saturating_add(elapsed_secs);
+                    if sensor_update_elapsed >= SENSOR_UPDATE_INTERVAL_SECS {
+                        sensor_update_elapsed %= SENSOR_UPDATE_INTERVAL_SECS;
+                        sensor_sample = sensor_sample.wrapping_add(1);
+                        if apply_synthetic_reading(
                             &mut clusters,
-                            &mut security_store,
-                        ))
+                            1,
+                            TEST_SENSOR.sample(sensor_sample),
+                        )
                         .is_err()
                         {
                             failure(&leds);
                         }
                     }
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
-            }
-
-            let now = tlsr8258_hal::timer::now_ticks();
-            let elapsed = now.wrapping_sub(tick_anchor);
-            if elapsed >= one_second {
-                let elapsed_secs = (elapsed / one_second).min(u16::MAX as u32) as u16;
-                tick_anchor = tick_anchor.wrapping_add(u32::from(elapsed_secs) * one_second);
-                sensor_update_elapsed = sensor_update_elapsed.saturating_add(elapsed_secs);
-                if sensor_update_elapsed >= SENSOR_UPDATE_INTERVAL_SECS {
-                    sensor_update_elapsed %= SENSOR_UPDATE_INTERVAL_SECS;
-                    sensor_sample = sensor_sample.wrapping_add(1);
-                    if apply_synthetic_reading(&mut clusters, 1, TEST_SENSOR.sample(sensor_sample))
+                    if device
+                        .tick_with_security_store(elapsed_secs, &mut clusters, &mut security_store)
+                        .await
                         .is_err()
                     {
                         failure(&leds);
                     }
                 }
-                if tlsr8258_rt::block_on(device.tick_with_security_store(
-                    elapsed_secs,
-                    &mut clusters,
-                    &mut security_store,
-                ))
-                .is_err()
-                {
-                    failure(&leds);
-                }
-            }
 
-            tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(250));
+                tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(250));
+            }
         }
-    }
+    };
+    tlsr8258_rt::block_on(app)
 }

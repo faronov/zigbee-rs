@@ -4,6 +4,15 @@
 //! It can join with the router capability bit and exercise NWK forwarding,
 //! but the nRF MAC cannot yet accept child associations.
 //!
+//! Because `NrfMac` is not a [`zigbee_mac::ParentMacDriver`], this target uses
+//! the forwarding-only [`RelayRouter`](zigbee_runtime::role::RelayRouter)
+//! logical role (`CAN_ROUTE = true`, `IS_PARENT = false`) built with
+//! `build_relay()`. It relays NWK traffic and runs router/link-status
+//! maintenance but cannot accept or serve children — it never advertises or
+//! behaves as a parent — which honestly models the backend until the nRF MAC
+//! gains parent-side support. Its FFD/forwarding behavior is still enabled by
+//! the `router` Cargo feature.
+//!
 //! # Features
 //! - Joins existing network as a router (FFD)
 //! - Continuous RX (rx_on_when_idle = true)
@@ -33,7 +42,6 @@ use embassy_nrf::{bind_interrupts, peripherals};
 use embassy_time::{Duration, Instant, Timer};
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
-use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{UserAction, ZigbeeDevice};
@@ -86,9 +94,12 @@ async fn main(_spawner: Spawner) {
     mac.set_tx_power(0);
     info!("Radio ready (TX 0 dBm)");
 
-    // Build device as ROUTER — rx_on_when_idle, no sleep
+    // Build device as a forwarding-only RELAY ROUTER — rx_on_when_idle, no
+    // sleep. `NrfMac` implements only the base `MacDriver` (no parent-side
+    // association primitives), so it honestly builds the typed `RelayRouter`
+    // role via `build_relay()`: it relays and runs router maintenance but never
+    // accepts children. It builds as `DeviceType::Router`.
     let mut device = ZigbeeDevice::builder(mac)
-        .device_type(DeviceType::Router)
         .power_mode(PowerMode::AlwaysOn)
         .manufacturer("Zigbee-RS")
         .model("nRF52840-Router")
@@ -105,7 +116,7 @@ async fn main(_spawner: Spawner) {
                     .cluster_server(ClusterId::IDENTIFY)
             },
         )
-        .build();
+        .build_relay();
 
     // Auto-join network
     info!("Joining network as router…");

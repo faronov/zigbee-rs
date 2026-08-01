@@ -11,4 +11,4 @@ publish = false
 bl702-hal = { path = "../../bl702-hal" }
 bl702-xt-zb1 = { path = "../../boards/bl702-xt-zb1" }
 embedded-storage = "0.3"
-zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }

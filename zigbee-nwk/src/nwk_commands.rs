@@ -488,27 +488,54 @@ impl<M: MacDriver> NwkLayer<M> {
         }
     }
 
-    /// Send End Device Timeout Request to parent after joining.
+    /// Send an End Device Timeout Request (0x0B) to the current parent.
     ///
-    /// Requests the maximum timeout (index 14 = ~11 days) so the parent
-    /// keeps our entry in its neighbor table even during extended sleep.
+    /// The requested enumeration comes from
+    /// [`Nib::requested_end_device_timeout`](crate::nib::Nib::requested_end_device_timeout):
+    /// a fresh join or secured rejoin asks for the long enumeration 14
+    /// (≈ 11 days) and a parent that answers `INCORRECT_VALUE` walks it down
+    /// towards the default enumeration 8.
+    ///
+    /// Only end devices negotiate a timeout for themselves; a router or
+    /// coordinator returns `Ok(())` without transmitting.
     pub async fn send_ed_timeout_request(&mut self) -> Result<(), NwkStatus> {
         if self.device_type != crate::DeviceType::EndDevice {
             return Ok(()); // Only end devices send this
         }
-        let req = EdTimeoutRequest::max_timeout();
+        let requested = self.nib.requested_end_device_timeout;
+        // An out-of-range NIB value would otherwise put an undefined
+        // enumeration on the wire; refuse instead of clamping so the caller's
+        // retry/fallback path runs.
+        let Some(req) = EdTimeoutRequest::new(requested) else {
+            log::error!("[NWK] Refusing undefined ED Timeout enum {}", requested);
+            return Err(NwkStatus::InvalidRequest);
+        };
         let mut payload = [0u8; 2];
         let len = req.serialize(&mut payload);
         log::info!(
-            "[NWK] Sending ED Timeout Request (index={}, ~11 days) to parent 0x{:04X}",
+            "[NWK] Sending ED Timeout Request (enum={}) to parent 0x{:04X}",
             req.requested_timeout,
             self.nib.parent_address.0
         );
-        self.send_nwk_command(
-            self.nib.parent_address,
-            NwkCommandId::EdTimeoutRequest,
-            &payload[..len],
-        )
-        .await
+        let result = self
+            .send_nwk_command(
+                self.nib.parent_address,
+                NwkCommandId::EdTimeoutRequest,
+                &payload[..len],
+            )
+            .await;
+        if result.is_ok() {
+            self.nib.mark_end_device_timeout_response_pending();
+        }
+        result
+    }
+
+    /// Stop accepting a response for the current End Device Timeout Request.
+    ///
+    /// Used when the runtime exhausts its bounded response retries. A late
+    /// response after that point belongs to an abandoned negotiation round and
+    /// must not change the selected timeout or keepalive method.
+    pub fn cancel_ed_timeout_response_wait(&mut self) {
+        self.nib.clear_end_device_timeout_response_pending();
     }
 }

@@ -14,8 +14,8 @@ sensor-bme280 = []
 
 [dependencies]
 zigbee-aps = { path = "../../zigbee-aps" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
-zigbee-zcl = { path = "../../zigbee-zcl" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 
 # `embassy-nrf` (and this product's `nrf52840-dk` board dependency, which
 # also requires it) only build for the actual Cortex-M target: `nrf-pac`'s

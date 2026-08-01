@@ -377,12 +377,25 @@ of the MAC PIB.
 | `permit_joining` | `bool` | Accept new join requests | false |
 | `permit_joining_duration` | `u8` | Time remaining (seconds) | 0 |
 
+#### R22 End Device Timeout (client side)
+
+| Field | Type | Description | Default |
+|-------|------|-------------|---------|
+| `parent_information` | `u8` | `nwkParentInformation`: bit0 MAC Data Poll keepalive, bit1 End Device Timeout Request keepalive | 0 |
+| `parent_information_valid` | `bool` | Whether `parent_information` describes the *current* parent | false |
+| `end_device_timeout` | `u8` | `nwkEndDeviceTimeout` enumeration in effect (0..=14) | 8 |
+| `requested_end_device_timeout` | `u8` | Enumeration carried by the next request | 8 |
+
 ### Helper Methods
 
 ```rust,ignore
 nib.next_seq()            // Get next NWK sequence number (wrapping)
 nib.next_route_request_id() // Get next route request ID
 nib.next_frame_counter()  // Increment frame counter (returns None if exhausted)
+
+nib.reset_end_device_timeout_negotiation() // New parent: renegotiate from 14
+nib.restore_end_device_timeout(info, valid, timeout) // Install a persisted result
+nib.end_device_timeout_seconds()           // Enumeration → seconds
 ```
 
 > **Frame counter exhaustion:** The outgoing frame counter is a 32-bit value.
@@ -390,6 +403,123 @@ nib.next_frame_counter()  // Increment frame counter (returns None if exhausted)
 > and must perform a key update or factory reset.  In practice this takes
 > billions of frames and is unlikely, but `next_frame_counter()` returns `None`
 > to protect against it.
+
+## End Device Timeout (NWK 0x0B / 0x0C)
+
+A R22 parent ages a child out of its child table unless the child keeps the
+relationship alive. An end device negotiates that lifetime with an **End Device
+Timeout Request** and the parent answers with an **End Device Timeout
+Response**.
+
+### Wire format
+
+`EdTimeoutRequest` (command 0x0B), two bytes:
+
+| Byte | Field | Notes |
+|------|-------|-------|
+| 0 | Requested Timeout Enumeration | 0..=14 |
+| 1 | End Device Configuration | **Reserved in R22 — always 0** |
+
+`EdTimeoutResponse` (command 0x0C), two bytes; trailing bytes from a future
+revision are ignored:
+
+| Byte | Field | Notes |
+|------|-------|-------|
+| 0 | Status | 0x00 success, 0x01 incorrect value |
+| 1 | `nwkParentInformation` | bit0 MAC Data Poll keepalive, bit1 End Device Timeout Request keepalive |
+
+The enumeration is arithmetic, not a lookup table:
+
+```text
+0      => 10 s
+n >= 1 => 120 << (n - 1) seconds   (2 minutes doubling per step)
+8      => 256 min  (the R22 default a parent applies without negotiation)
+14     => 16384 min (~11 days, the maximum)
+```
+
+`ed_timeout_enum_to_seconds()` rejects anything above 14 rather than clamping,
+and `EdTimeoutRequest::new()` is a checked constructor, so an undefined
+enumeration can never reach the air or a keepalive deadline.
+
+### Client behaviour
+
+- A fresh join or secured rejoin requests enumeration **14** for battery life
+  and interoperability. Enumeration **8** is used only as the recurring
+  fallback when no negotiation succeeded.
+- The negotiation is reset at the authoritative NWK parent-assignment and
+  parent-loss points — association success, secured rejoin success, a Leave
+  addressed to this device, a parent that announced its own leave, and a full
+  `nlme_leave` — never from a runtime wrapper.
+- A 0x0C response is accepted only when the device is an end device, the frame
+  came from the current valid unicast parent, it was addressed to this device's
+  own network address, and the shared secured-NWK-command guard passed.
+- `SUCCESS` stores `parent_info & 0x03` and marks it valid. `INCORRECT_VALUE`
+  lowers the requested enumeration one step, never below 8, and never touches
+  previously validated parent information. An unknown status changes nothing.
+- No `NwkCommandOutcome` is produced: the effect is NIB state, which the
+  runtime detects by comparing the negotiation fields around
+  `process_incoming_nwk_frame`.
+
+The recurring keepalive, response timeout, retransmissions and persistence live
+in `zigbee-runtime` — see
+[Event Loop → End Device Timeout keepalive](./event-loop.md).
+
+### Parent (router/coordinator) behaviour
+
+> The entire parent/router server side described below — End Device Timeout
+> child aging, MAC parent-command servicing, the rejoin/Update-Device path and
+> Parent Announce — is gated on the `router` capability feature and its
+> periodic work runs from a dedicated `run_parent_nwk_maintenance` step. A
+> non-routing end-device (sensor) build compiles it out of the image entirely;
+> only the role-independent common NWK maintenance (neighbour-cache aging) and
+> the End Device Timeout **client** remain.
+
+A routing device implements the **server** side of the same exchange:
+
+- A 0x0B request is accepted only when it comes from a directly-attached,
+  **authenticated** child (`Relationship::Child`) whose stored IEEE matches the
+  authenticated NWK source, and only when addressed to this parent's own short
+  address (and matching IEEE, if the child included one). The reserved End
+  Device Configuration byte must be zero and the enumeration must be defined.
+  This keeps an arbitrary network member — or a still-provisional child — from
+  rewriting a child's timeout state.
+- The supported-enumeration policy accepts every defined R22 value 0..=14
+  (`respond_to_end_device_timeout_request`); the parent imposes no tighter
+  bound, so the answer is `SUCCESS` with the requested enumeration. An
+  out-of-range value takes the deterministic `INCORRECT_VALUE` branch and falls
+  back to enumeration 8. `nwkParentInformation` advertises both keepalive
+  methods (`PARENT_INFO_MASK`).
+- The 0x0C response is delivered directly to an rx-on child and **indirectly**
+  (queued, MAC Frame Pending armed) to a sleepy child, reusing the same parent
+  queue / Data Request path as the Rejoin Response.
+
+### Child aging and keepalive (parent side)
+
+Each authenticated end-device child carries an accepted timeout enumeration and
+a `keepalive_remaining_secs` deadline (a `u32`, because enumeration 14 exceeds
+the `u16` neighbour age counter). The deadline is:
+
+- **armed** to the full window of the accepted enumeration when the child
+  authenticates (association + key proof, secured rejoin, or restore);
+- **reset** on every advertised keepalive — a MAC Data Poll, an End Device
+  Timeout Request — and on any CCM*-authenticated frame whose auxiliary-header
+  source IEEE matches the child (the *secured-traffic keepalive*, keyed on the
+  authenticated identity so it cannot be spoofed);
+- **aged down** each shared tick with saturating subtraction; at zero the child
+  is evicted, cleaning the coupled indirect queue, routing entry, replay
+  counters, MAC Frame Pending flag and the runtime's deferred Update-Device.
+
+Router children age via Link Status, not this deadline; unauthenticated
+(provisional) children keep the existing short provisional-child timer.
+
+### Durable child table and Parent Announce
+
+A router persists its authenticated children through a **separate** crash-safe
+store (`child_store`), independent of the security journal — see
+[NV storage → Child table](../advanced/nv-storage.md). After the restored child
+state is authoritative, `announce_parent()` broadcasts a R22 **Parent Announce**
+(ZDP `Parent_annce`, 0x001F) so a former parent of a child that has since moved
+prunes its stale record; see [ZDO → Parent Announce](./zdo.md).
 
 ## `NwkStatus` — Error Codes
 
