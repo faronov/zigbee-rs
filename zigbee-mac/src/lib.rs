@@ -64,7 +64,7 @@ pub use phy::{
     MAX_PHY_FRAME_LEN, PhyAddressFilter, PhyCapabilities, PhyError, PhyRxFrame, RadioPhy,
 };
 pub use pib::{MacPib, PibAttribute, PibError, PibValue};
-pub use platform::{PlatformServices, WrappingTickExtender};
+pub use platform::{ForwardAesProvider, PlatformServices, WrappingTickExtender};
 pub use primitives::*;
 pub use soft_mac::{AckResult, SoftMacCore};
 

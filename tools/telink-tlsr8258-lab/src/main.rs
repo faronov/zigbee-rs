@@ -3210,6 +3210,8 @@ impl MacDriver for Tlsr8258Mac {
     }
 }
 
+impl zigbee_mac::ForwardAesProvider for Tlsr8258Mac {}
+
 impl PlatformServices for Tlsr8258Mac {
     fn monotonic_micros(&self) -> u32 {
         (self.extended_timer_ticks() / 24) as u32

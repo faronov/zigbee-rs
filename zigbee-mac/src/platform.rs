@@ -2,7 +2,7 @@
 
 use core::cell::Cell;
 
-use zigbee_crypto::ForwardAesProvider;
+pub use zigbee_crypto::ForwardAesProvider;
 
 use crate::MacError;
 

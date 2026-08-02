@@ -265,6 +265,9 @@ jobs:
             examples/nrf52840-sensor-uf2/target/thumbv7em-none-eabihf/release/nrf52840-sensor-uf2.hex
             examples/nrf52840-sensor-uf2/target/thumbv7em-none-eabihf/release/nrf52840-sensor-uf2.uf2
 
+  # esp-hal 1.0.0's MMIO const references are rejected by the stricter CTFE
+  # provenance checks in nightly-2026-08-02. Pin only the ESP builds to the
+  # last passing nightly until the upstream HAL release catches up.
   build-esp32c6:
     name: Build ESP32-C6 sensor
     runs-on: ubuntu-latest
@@ -272,6 +275,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-08-01
           targets: riscv32imac-unknown-none-elf
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@v2
@@ -299,6 +303,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-08-01
           targets: riscv32imac-unknown-none-elf
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@v2
