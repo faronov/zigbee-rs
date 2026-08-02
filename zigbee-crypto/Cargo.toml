@@ -10,9 +10,11 @@ repository = "https://github.com/zigbee-rs/zigbee-rs"
 aes = { version = "0.8", default-features = false }
 heapless = "0.9"
 tlsr8258-hal = { path = "../tlsr8258-hal", optional = true }
+bl702-hal = { path = "../bl702-hal", optional = true }
 
 [features]
 tlsr8258 = ["dep:tlsr8258-hal"]
+bl702 = ["dep:bl702-hal"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

@@ -7,6 +7,11 @@ edition = "2024"
 default = ["production"]
 production = ["log/release_max_level_off"]
 diagnostic-logging = []
+# Opt-in BL702 SEC_ENG hardware AES-128 backend for Zigbee CCM*/AES-MMO.
+# Off by default (the standard image uses software AES). NOT validated on
+# silicon yet — see the task report's remaining hardware gate before
+# shipping this variant.
+hardware-aes = ["zigbee-mac/hardware-aes-bl702"]
 
 [dependencies]
 bl702-hal = { path = "../../bl702-hal" }

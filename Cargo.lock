@@ -94,6 +94,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
+name = "bl702-hal"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-storage",
+ "riscv",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1858,6 +1867,7 @@ name = "zigbee-crypto"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "bl702-hal",
  "heapless 0.9.2",
  "tlsr8258-hal",
 ]
@@ -1866,6 +1876,7 @@ dependencies = [
 name = "zigbee-mac"
 version = "0.1.0"
 dependencies = [
+ "bl702-hal",
  "embassy-futures",
  "embassy-nrf",
  "embassy-sync 0.7.2",

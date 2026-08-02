@@ -426,6 +426,69 @@ pub mod tlsr8258 {
     pub use hardware::HardwareAes128;
 }
 
+/// Optional BL702 hardware-AES backend for [`Aes128Forward`]. Only compiled
+/// when this crate's `bl702` feature is enabled (which pulls in `bl702-hal`
+/// as an optional dependency) **and** the target architecture is `riscv32`
+/// — enabling the feature on any other target (e.g. running this crate's
+/// host tests with `--features bl702` by mistake) leaves this module empty
+/// rather than failing to build, since `bl702_hal::aes::AesEngine`'s actual
+/// register-driving methods are themselves `#[cfg(target_arch = "riscv32")]`
+/// gated in the HAL crate.
+///
+/// Mirrors the `tlsr8258` module above; the only differences are the HAL
+/// crate and the target-architecture gate. The BL702 accelerator is the
+/// SEC_ENG AES-128 ECB block — see `bl702_hal::aes` for its (open-source
+/// vendor-driver-derived) register contract and its not-yet-silicon-proven
+/// caveat.
+#[cfg(feature = "bl702")]
+pub mod bl702 {
+    #[cfg(target_arch = "riscv32")]
+    mod hardware {
+        use bl702_hal::aes::{AesEngine, AesError};
+
+        use crate::{Aes128Forward, AesKey};
+
+        /// [`Aes128Forward`] implementation backed by the BL702's SEC_ENG
+        /// hardware AES-128 ECB accelerator ([`AesEngine`]).
+        ///
+        /// Holds the raw key bytes (the accelerator takes the 16-byte key
+        /// directly on every block — see `bl702_hal::aes` — there is no
+        /// separate cached key schedule) and a `&mut AesEngine` borrowed
+        /// from the caller, so this type does not duplicate [`AesEngine`]'s
+        /// own exclusive-ownership guarantee (backed by the zero-sized
+        /// `bl702_hal::peripherals::Aes` token). Callers keep whatever
+        /// `AesEngine` they already own and can reuse it (with different
+        /// keys) across multiple `HardwareAes128` values.
+        pub struct HardwareAes128<'engine> {
+            engine: &'engine mut AesEngine,
+            key: AesKey,
+        }
+
+        impl<'engine> HardwareAes128<'engine> {
+            /// Borrow `engine` and remember `key` for subsequent
+            /// [`Aes128Forward::encrypt_block`] calls.
+            pub fn new(engine: &'engine mut AesEngine, key: AesKey) -> Self {
+                Self { engine, key }
+            }
+        }
+
+        impl Aes128Forward for HardwareAes128<'_> {
+            /// See [`bl702_hal::aes::AesError`] — bounded timeout/hardware
+            /// errors only, never an unbounded spin, per that module's
+            /// contract.
+            type Error = AesError;
+
+            #[inline(always)]
+            fn encrypt_block(&mut self, block: &mut [u8; 16]) -> Result<(), Self::Error> {
+                self.engine.encrypt_block(&self.key, block)
+            }
+        }
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    pub use hardware::HardwareAes128;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

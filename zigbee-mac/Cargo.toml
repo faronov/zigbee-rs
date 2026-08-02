@@ -12,6 +12,7 @@ heapless = "0.9"
 zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
 zigbee-crypto = { version = "0.1.0", path = "../zigbee-crypto" }
 tlsr8258-hal = { path = "../tlsr8258-hal", optional = true }
+bl702-hal = { path = "../bl702-hal", optional = true }
 
 # ── ESP32-C6 backend ────────────────────────────────────────
 esp-hal = { version = "1.0.0", features = ["rt", "unstable"], default-features = false, optional = true }
@@ -92,11 +93,28 @@ telink = ["tlsr8258"]
 # `tlsr8258_hal::aes::AesEngine` and overrides
 # `ForwardAesProvider::forward_cipher` to hand CCM*/MMO a hardware-backed
 # cipher, which lets dead-code elimination drop the RustCrypto software AES
-# core from the image. NOT validated on silicon yet — do not enable in a
-# shipping image until the hardware gate in the task report is closed.
+# core from the image. The backend is silicon-proven but remains opt-in while
+# software AES stays available as the conservative recovery/default image.
 hardware-aes = [
     "tlsr8258",
     "zigbee-crypto/tlsr8258",
+]
+
+# Opt-in BL702 SEC_ENG hardware AES-128 accelerator backend.
+#
+# Off by default (the standard BL702 sensor image uses the software AES
+# core). When enabled the BL702 `SoftMacCore` phy (`Bl702RadioPhy`) takes
+# ownership of the `bl702_hal::aes::AesEngine` and overrides
+# `ForwardAesProvider::forward_cipher` to hand CCM*/MMO a hardware-backed
+# cipher, letting dead-code elimination drop the RustCrypto software AES core
+# from the image. NOT validated on silicon yet — do not enable in a shipping
+# image until the hardware gate in the task report is closed. Kept a
+# separate feature from the Telink `hardware-aes` above because the two
+# select different HAL crates and platform backends.
+hardware-aes-bl702 = [
+    "bl702",
+    "dep:bl702-hal",
+    "zigbee-crypto/bl702",
 ]
 
 # Telink with HAL crate — requires local tlsr82xx-hal (not available in CI)

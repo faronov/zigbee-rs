@@ -11,5 +11,10 @@ publish = false
 embedded-hal = "1.0"
 embedded-storage = "0.3"
 
+[dev-dependencies]
+# Host-only oracle for the SEC_ENG AES register-sequence mock tests in
+# `aes.rs`. Not linked into the firmware (the driver drives real MMIO).
+aes = { version = "0.8", default-features = false }
+
 [target.'cfg(target_arch = "riscv32")'.dependencies]
 riscv = { version = "0.15", features = ["critical-section-single-hart"] }

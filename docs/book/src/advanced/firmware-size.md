@@ -16,7 +16,8 @@ flash offsets are platform-specific.
 |---|---:|---:|---:|
 | TLSR8258 end-device sensor (software AES) | 272,600 B | — | 280 KiB |
 | TLSR8258 parent router (software AES) | 332,440 B | — | 336 KiB |
-| BL702 end-device sensor | 165,058 B | 173,264 B | 192 KiB |
+| BL702 end-device sensor (software AES) | 165,602 B | 173,808 B | 192 KiB |
+| BL702 end-device sensor (hardware AES) | 161,570 B | 169,776 B | 192 KiB |
 | nRF52840 end-device sensor | 202,688 B | — | 220 KiB |
 | nRF52840 relay router | 192,704 B | — | — |
 | nRF52833 end-device sensor | 125,544 B | — | — |
@@ -86,6 +87,8 @@ CI also checks properties that a successful link alone cannot prove:
   absence from routers/relays;
 - BL702 absence of RV32A instructions and vendor radio symbols;
 - BL702 `_start_rust` placement in XIP flash;
+- BL702 hardware-AES variant rejects the RustCrypto software AES core and
+  requires the SEC_ENG backend, while re-running the RV32A/vendor/XIP gates;
 - TLSR8258 RAM-code, cache, BSS, DMA, and stack layout.
 
 Oversized ZCL responses are dropped whole rather than truncated into malformed
@@ -104,6 +107,19 @@ saving 2,660 and 4,724 bytes respectively with 8 additional bytes of RAM.
 Software AES remains the release default. The hardware provider is deliberately
 selected per product with `hardware-aes`, fails closed without a software
 fallback, and keeps a separately named recovery image.
+
+The BL702 SEC_ENG hardware-AES provider is the first cross-platform follow-up
+to the TLSR8258 work. It is **compile/build-proven only** — it has **not** been
+run on BL702 silicon. Its register contract is transcribed from the
+open-source Bouffalo `bl_iot_sdk` SEC_ENG driver and cross-checked against a
+FIPS-197 known-answer vector, its two startup known-answer tests fail closed,
+and the release image links the SEC_ENG backend while dropping the RustCrypto
+software AES core (CI rejects any `aes::soft::fixslice` symbol and requires the
+`HardwareAes128`/`bl702_hal::aes` backend). In a local nightly build the opt-in
+image measured 161,570 bytes versus 165,602 bytes for the same-toolchain
+software build, saving 4,032 bytes and no additional RAM. On-silicon
+functional and timing validation (including SEC_ENG DMA/SRAM coherency) remains
+an open hardware gate.
 
 Compact TLSR8258 text placement, linker tail merging, and identical-code
 folding are also deferred until hardware soak testing confirms startup,

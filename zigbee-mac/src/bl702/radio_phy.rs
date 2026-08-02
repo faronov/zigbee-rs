@@ -27,6 +27,15 @@ enum TxResult {
 pub struct Bl702RadioPhy {
     channel: u8,
     tx_power: i8,
+    /// SEC_ENG hardware AES-128 accelerator, present only under the
+    /// `hardware-aes-bl702` feature. Installed once by the composition root
+    /// via [`Bl702RadioPhy::install_aes_engine`] from the board's exclusive
+    /// `Aes` token, so there is exactly one engine and no global mutable
+    /// alias. `None` only in the window between construction and that single
+    /// install call; a missing engine at cipher time traps loudly rather
+    /// than silently falling back to software.
+    #[cfg(feature = "hardware-aes-bl702")]
+    aes_engine: Option<bl702_hal::aes::AesEngine>,
 }
 
 /// Shared software MAC over the BL702 direct-register radio.
@@ -68,7 +77,32 @@ impl Bl702RadioPhy {
         Self {
             channel: 11,
             tx_power: 0,
+            #[cfg(feature = "hardware-aes-bl702")]
+            aes_engine: None,
         }
+    }
+
+    /// Take ownership of the SEC_ENG AES-128 accelerator and use it for all
+    /// subsequent CCM* and AES-MMO operations (via the `ForwardAesProvider`
+    /// override below, forwarded through [`crate::SoftMacCore`]).
+    ///
+    /// The composition root calls this exactly once, right after
+    /// construction, handing over the board's single exclusive `Aes` token.
+    /// Before accepting the engine this runs back-to-back AES-128
+    /// known-answer tests against the real peripheral, including a
+    /// re-key/reuse cycle. Only compiled under `hardware-aes-bl702`.
+    #[cfg(feature = "hardware-aes-bl702")]
+    pub fn install_aes_engine(
+        &mut self,
+        aes: bl702_hal::peripherals::Aes,
+    ) -> Result<(), bl702_hal::aes::AesError> {
+        let mut engine = bl702_hal::aes::AesEngine::new(
+            aes,
+            bl702_hal::aes::AesEngine::DEFAULT_TIMEOUT_ITERATIONS,
+        )?;
+        engine.self_test()?;
+        self.aes_engine = Some(engine);
+        Ok(())
     }
 
     async fn transmit(&mut self, frame: &[u8], run_cca: bool) -> Result<(), PhyError> {
@@ -187,7 +221,33 @@ impl RadioPhy for Bl702RadioPhy {
     }
 }
 
+/// Software AES (the default) when `hardware-aes-bl702` is off — the
+/// standard BL702 image keeps the RustCrypto software core, exactly as
+/// before.
+#[cfg(not(feature = "hardware-aes-bl702"))]
 impl zigbee_crypto::ForwardAesProvider for Bl702RadioPhy {}
+
+/// Hardware AES-128 backend for CCM* and AES-MMO. Hands back a
+/// [`zigbee_crypto::bl702::HardwareAes128`] borrowing this phy's
+/// exclusively-owned SEC_ENG [`bl702_hal::aes::AesEngine`], so the RustCrypto
+/// software core is dead-code-eliminated from the image. A missing engine
+/// (composition root failed to call [`Bl702RadioPhy::install_aes_engine`])
+/// is a firmware wiring bug and traps loudly rather than silently falling
+/// back to software.
+#[cfg(feature = "hardware-aes-bl702")]
+impl zigbee_crypto::ForwardAesProvider for Bl702RadioPhy {
+    fn forward_cipher(
+        &mut self,
+        key: &zigbee_crypto::AesKey,
+    ) -> impl zigbee_crypto::Aes128Forward + '_ {
+        let engine = self
+            .aes_engine
+            .as_mut()
+            .expect("AES engine not installed: call Bl702RadioPhy::install_aes_engine()");
+        zigbee_crypto::bl702::HardwareAes128::new(engine, *key)
+    }
+}
+
 impl PlatformServices for Bl702RadioPhy {
     fn monotonic_micros(&self) -> u32 {
         Instant::now().as_micros() as u32

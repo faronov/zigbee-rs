@@ -43,7 +43,7 @@ One-page cheat sheet for the `zigbee-rs` public API, organized by crate.
 |-------|------|-------------|
 | `coordinator` | `bool` | Can act as PAN coordinator |
 | `router` | `bool` | Can route frames |
-| `hardware_security` | `bool` | Hardware AES-CCM* support |
+| `hardware_security` | `bool` | Autonomous MAC-level security offload (not mere silicon AES; a stack that runs CCM* itself, even via a hardware block cipher, reports `false`) |
 | `max_payload` | `u16` | Max MAC payload bytes |
 | `tx_power_min` / `tx_power_max` | `TxPower` | TX power range |
 

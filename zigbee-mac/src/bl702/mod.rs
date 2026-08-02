@@ -819,8 +819,14 @@ impl MacDriver for Bl702Mac {
         MacCapabilities {
             coordinator: false,
             router: true,
-            hardware_security: true, // BL702 has AES-128 hardware
-            max_payload: 102,        // 127 - 25 (max MAC overhead)
+            // BL702 silicon has a SEC_ENG AES-128 block, but this MAC still
+            // performs all Zigbee security in the Rust stack (optionally via
+            // a hardware block-cipher `ForwardAesProvider`); it does not
+            // offload autonomous 802.15.4 MAC security. Per the repository
+            // convention this field reports active MAC-level hardware
+            // security, not mere silicon capability, so it is `false`.
+            hardware_security: false,
+            max_payload: 102, // 127 - 25 (max MAC overhead)
             tx_power_min: TxPower(-21),
             tx_power_max: TxPower(14),
         }

@@ -3,16 +3,34 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Build mode selection (mutually exclusive):
+#   (default)                 standard software-AES production image
+#   BL702_DIAGNOSTIC_LOG=1    diagnostic-logging build (no production profile)
+#   BL702_HARDWARE_AES=1      opt-in SEC_ENG hardware-AES production image
+#
+# The hardware-AES variant is named with a `.hardware-aes` infix so it never
+# overwrites the standard recovery artifacts; the standard `cargo build
+# --release` output remains the default recovery image.
 TARGET_DIR=target/riscv32imc-unknown-none-elf/release
 ELF="$TARGET_DIR/bl702-sensor"
-RAW_IMAGE="$ELF.bin"
-FLASH_IMAGE="$ELF.flash.bin"
 
+if [[ "${BL702_DIAGNOSTIC_LOG:-0}" == "1" && "${BL702_HARDWARE_AES:-0}" == "1" ]]; then
+    echo "BL702_DIAGNOSTIC_LOG and BL702_HARDWARE_AES are mutually exclusive" >&2
+    exit 1
+fi
+
+ARTIFACT_INFIX=""
 if [[ "${BL702_DIAGNOSTIC_LOG:-0}" == "1" ]]; then
     cargo build --release --no-default-features --features diagnostic-logging
+elif [[ "${BL702_HARDWARE_AES:-0}" == "1" ]]; then
+    cargo build --release --features hardware-aes
+    ARTIFACT_INFIX=".hardware-aes"
 else
     cargo build --release
 fi
+
+RAW_IMAGE="$ELF$ARTIFACT_INFIX.bin"
+FLASH_IMAGE="$ELF$ARTIFACT_INFIX.flash.bin"
 
 OBJCOPY="${OBJCOPY:-$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)}"
 if [[ -z "$OBJCOPY" || ! -x "$OBJCOPY" ]]; then

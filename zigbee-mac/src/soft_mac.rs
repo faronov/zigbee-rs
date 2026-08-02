@@ -200,7 +200,19 @@ impl<P: RadioPhy> SoftMacCore<P> {
     }
 }
 
-impl<P: RadioPhy + PlatformServices> zigbee_crypto::ForwardAesProvider for SoftMacCore<P> {}
+/// A [`SoftMacCore`] is a [`ForwardAesProvider`] by delegating to its phy,
+/// so a platform whose `RadioPhy` overrides `forward_cipher` with a
+/// hardware AES backend (e.g. the BL702 phy under `hardware-aes-bl702`)
+/// serves CCM*/AES-MMO from hardware, while every phy that keeps the
+/// default software provider yields the exact software behaviour as before.
+impl<P: RadioPhy + PlatformServices> zigbee_crypto::ForwardAesProvider for SoftMacCore<P> {
+    fn forward_cipher(
+        &mut self,
+        key: &zigbee_crypto::AesKey,
+    ) -> impl zigbee_crypto::Aes128Forward + '_ {
+        self.phy.forward_cipher(key)
+    }
+}
 impl<P: RadioPhy + PlatformServices> PlatformServices for SoftMacCore<P> {
     fn monotonic_micros(&self) -> u32 {
         self.phy.monotonic_micros()

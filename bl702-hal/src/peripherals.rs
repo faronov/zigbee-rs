@@ -22,6 +22,7 @@ macro_rules! token {
 }
 
 token!(Adc);
+token!(Aes);
 token!(Efuse);
 token!(Flash);
 token!(I2c0);
@@ -35,6 +36,8 @@ token!(Uart1);
 /// All uniquely owned chip resources.
 pub struct Peripherals {
     pub adc: Adc,
+    /// SEC_ENG AES-128 accelerator (see [`crate::aes`]).
+    pub aes: Aes,
     pub efuse: Efuse,
     pub flash: Flash,
     pub i2c0: I2c0,
@@ -95,6 +98,7 @@ impl Peripherals {
     unsafe fn steal() -> Self {
         Self {
             adc: Adc::new(),
+            aes: Aes::new(),
             efuse: Efuse::new(),
             flash: Flash::new(),
             i2c0: I2c0::new(),

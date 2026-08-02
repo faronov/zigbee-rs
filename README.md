@@ -155,7 +155,11 @@ and humidity remain synthetic. Battery reporting now samples the nominal
 internal VBAT/2 GPADC path, with an explicit synthetic fallback if conversion
 fails. The reusable BL702 HAL also provides I2C, SPI, GPIO, PWM, UART, timer,
 eFuse, and XIP flash, but the new sensor/flash paths still need silicon
-validation and application integration.
+validation and application integration. An opt-in `hardware-aes` build
+(`BL702_HARDWARE_AES=1 ./build-image.sh`) routes Zigbee CCM*/AES-MMO through
+the SEC_ENG AES-128 accelerator and drops the software AES core; it is
+compile/build-proven only and not yet silicon-validated, so software AES
+remains the default recovery image.
 
 ### CC2340 firmware
 
@@ -280,10 +284,11 @@ AES-128 CTR_DRBG seeded from SHA-256-conditioned VBAT/GND ADC observations;
 the DRBG has a NIST known-answer test, but the physical entropy source still
 requires SP 800-90B characterization.
 
-The TLSR8258 AES block has a bounded, token-owned ECB driver and an opt-in
-`zigbee-crypto` backend. NWK/APS still use software CCM* because their current
-APIs do not carry a persistent cipher object, so the Telink MAC continues to
-report `hardware_security = false`.
+The TLSR8258 AES block has a bounded, token-owned ECB driver and an opt-in,
+silicon-proven `zigbee-crypto` backend serving NWK/APS CCM* and AES-MMO.
+Software AES remains the recovery default. The Telink MAC still reports
+`hardware_security = false` because the Rust stack performs security itself;
+the accelerator is a block-cipher provider, not autonomous MAC offload.
 
 ## MAC Backends
 

@@ -284,7 +284,13 @@ pub struct MacCapabilities {
     pub coordinator: bool,
     /// Can act as router (relay frames)
     pub router: bool,
-    /// Supports MAC-level security (encryption in hardware)
+    /// Whether the backend performs autonomous MAC-level 802.15.4 security
+    /// in hardware (frame encryption/authentication offloaded to the radio).
+    ///
+    /// This is **not** a "the silicon has an AES block" flag: a backend whose
+    /// portable Rust stack still performs Zigbee CCM* itself — even when it
+    /// sources the block cipher from a hardware accelerator via
+    /// `ForwardAesProvider` — reports `false`.
     pub hardware_security: bool,
     /// Maximum frame payload size (typically 127 - overhead)
     pub max_payload: u16,

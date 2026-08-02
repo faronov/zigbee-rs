@@ -122,7 +122,7 @@ pub struct MacCapabilities {
     pub coordinator: bool,
     /// Can act as router (relay frames)
     pub router: bool,
-    /// Supports MAC-level hardware encryption
+    /// Autonomous MAC-level hardware security offload (not mere silicon AES)
     pub hardware_security: bool,
     /// Maximum frame payload size (typically 102 bytes)
     pub max_payload: u16,

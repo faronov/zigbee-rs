@@ -148,18 +148,16 @@
 //! time this module was written. All of those drivers now consume the
 //! shared facade instead of keeping local reset/clock sequences.
 //!
-//! # Hardware validation caveat
+//! # Hardware validation
 //!
-//! This module has **not** been exercised against real TLSR8258 silicon.
-//! Every claim above about the polled protocol comes from (a) the open
-//! `register.h` bit/address definitions and (b) disassembling the
-//! vendor's own compiled `aes_encrypt`/`aes_decrypt` objects — cross
-//! checked against each other, not from a datasheet timing diagram or an
-//! oscilloscope. In particular [`AesEngine::DEFAULT_TIMEOUT_ITERATIONS`]
-//! is a conservative placeholder, not a measured bound (the vendor object
-//! itself never bounds this wait at all, so there is no vendor timing
-//! figure to anchor to either) — bench validation on real hardware before
-//! relying on this timeout in production is required.
+//! This module is exercised on real TLSR8258 silicon. Two back-to-back startup
+//! known-answer tests, NWK/APS CCM*, AES-MMO key derivation, secured ZHA
+//! commissioning, Request-Key/Verify-Key/Confirm-Key, sustained traffic, and
+//! reset/resume all passed on a TB-04 router under an independent channel-15
+//! capture. [`AesEngine::DEFAULT_TIMEOUT_ITERATIONS`] remains a conservative
+//! bound rather than a cycle-measured timing guarantee, so the hardware
+//! backend stays opt-in and a separately named software-AES recovery image is
+//! retained.
 //!
 //! # No DMA
 //!

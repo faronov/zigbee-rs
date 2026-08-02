@@ -10,6 +10,7 @@
 extern crate std;
 
 pub mod adc;
+pub mod aes;
 pub mod clock;
 pub mod efuse;
 pub mod flash;

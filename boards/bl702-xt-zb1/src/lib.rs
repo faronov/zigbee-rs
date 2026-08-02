@@ -19,7 +19,9 @@
 use bl702_hal::Peripherals;
 use bl702_hal::clock::Clocks;
 use bl702_hal::gpio::Pin;
-use bl702_hal::peripherals::{Adc, Efuse, Flash, I2c0, Power, Pwm, Spi0, Timer0, Uart0, Uart1};
+use bl702_hal::peripherals::{
+    Adc, Aes, Efuse, Flash, I2c0, Power, Pwm, Spi0, Timer0, Uart0, Uart1,
+};
 use bl702_hal::uart::{ConfigError as UartConfigError, Uart0Tx};
 
 /// Flash capacity configured by the local XT-ZB1 reference firmware.
@@ -92,6 +94,12 @@ pub struct Resources {
     pub power: Power,
     pub pwm: Pwm,
     pub uart1: Uart1,
+    /// SEC_ENG AES-128 accelerator token. Surfaced as a plain chip resource;
+    /// products that do not select a hardware-AES backend leave it unused and
+    /// dead-code elimination drops it. The board only identifies the fitted
+    /// silicon; the persistence/security policy that consumes it lives in the
+    /// product/composition root.
+    pub aes: Aes,
     pub other_pins: OtherPins,
 }
 
@@ -117,6 +125,8 @@ pub struct ApplicationResources {
     pub power: Power,
     pub pwm: Pwm,
     pub uart1: Uart1,
+    /// SEC_ENG AES-128 accelerator token (see [`Resources::aes`]).
+    pub aes: Aes,
     pub other_pins: OtherPins,
 }
 
@@ -143,6 +153,7 @@ impl Resources {
                 power: self.power,
                 pwm: self.pwm,
                 uart1: self.uart1,
+                aes: self.aes,
                 other_pins: self.other_pins,
             },
         )
@@ -208,6 +219,7 @@ impl Resources {
             power: peripherals.power,
             pwm: peripherals.pwm,
             uart1: peripherals.uart1,
+            aes: peripherals.aes,
             other_pins: OtherPins {
                 p0,
                 p1,
@@ -252,6 +264,7 @@ mod tests {
             power,
             pwm,
             uart1,
+            aes,
             other_pins,
         } = resources;
 
@@ -266,7 +279,7 @@ mod tests {
             mosi: _,
             miso: _,
         } = spi_or_usb;
-        let _ = (adc, flash, power, pwm, uart1, other_pins);
+        let _ = (adc, flash, power, pwm, uart1, aes, other_pins);
     }
 
     #[test]

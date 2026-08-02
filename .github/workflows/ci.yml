@@ -355,6 +355,9 @@ jobs:
       - name: Build BL702 sensor (release)
         working-directory: examples/bl702-sensor
         run: cargo build --release
+      - name: Clippy BL702 hardware-AES composition
+        working-directory: examples/bl702-sensor
+        run: cargo clippy --release --features hardware-aes --target riscv32imc-unknown-none-elf -- -D warnings
       - name: Install Bouffalo image tool
         run: python3 -m pip install --disable-pip-version-check bflb-mcu-tool==1.10.0
       - name: Create firmware artifacts
@@ -392,6 +395,51 @@ jobs:
             echo "BL702 _start_rust is outside XIP flash: ${START_RUST:-missing}" >&2
             exit 1
           fi
+      - name: Create hardware-AES firmware variant
+        working-directory: examples/bl702-sensor
+        env:
+          BL702_HARDWARE_AES: "1"
+        run: ./build-image.sh
+      - name: Check BL702 hardware-AES firmware purity
+        run: |
+          # The hardware-AES build reuses the same cargo output ELF path, so
+          # after ./build-image.sh above it now holds the hardware-AES image.
+          ELF=examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor
+          RAW=${ELF}.hardware-aes.bin
+          OBJDUMP=$(find "$(rustc --print sysroot)" -name llvm-objdump -print -quit)
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          ./tools/firmware-size-report.sh bl702-sensor-hardware-aes "$RAW" 196608 ${ELF}.hardware-aes.size.json
+          # A hardware-AES image must NOT link the RustCrypto software AES
+          # core, and MUST link the BL702 SEC_ENG hardware backend.
+          if "$NM" --demangle "$ELF" | grep -q 'aes::soft::fixslice'; then
+            echo "BL702 hardware-AES image still links the software AES core" >&2
+            exit 1
+          fi
+          if ! "$NM" --demangle "$ELF" | grep -Eq 'HardwareAes128|bl702_hal::aes'; then
+            echo "BL702 hardware-AES image is missing the SEC_ENG AES backend" >&2
+            exit 1
+          fi
+          # The hardware image must still pass the standard platform gates.
+          if "$OBJDUMP" -d "$ELF" | grep -Eq '[[:space:]](amo[a-z.]*|lr\.[wd]|sc\.[wd])[[:space:]]'; then
+            echo "BL702 hardware-AES image contains unsupported RV32A instructions" >&2
+            exit 1
+          fi
+          if "$NM" "$ELF" | grep -Eq '(lmac154_|AON_Power_On_XTAL|GLB_Set_System_CLK|RF_SetZigbee)'; then
+            echo "BL702 hardware-AES image contains a vendor radio symbol" >&2
+            exit 1
+          fi
+          START_RUST=$("$NM" "$ELF" | awk '$3 == "_start_rust" { print $1 }')
+          if [[ -z "$START_RUST" ]] ||
+             (( 16#$START_RUST < 0x23000000 || 16#$START_RUST >= 0x23080000 )); then
+            echo "BL702 hardware-AES _start_rust is outside XIP flash: ${START_RUST:-missing}" >&2
+            exit 1
+          fi
+      - name: Restore standard BL702 recovery image
+        working-directory: examples/bl702-sensor
+        # Rebuild the default software-AES image so the uploaded raw ELF is
+        # the standard recovery firmware (the `.hardware-aes.*` artifacts are
+        # kept separately).
+        run: cargo build --release
       - name: Upload BL702 sensor
         uses: actions/upload-artifact@v4
         with:
@@ -401,6 +449,10 @@ jobs:
             examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.bin
             examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.flash.bin
             examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.size.json
+            examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.hardware-aes.bin
+            examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.hardware-aes.flash.bin
+            examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.hardware-aes.size.json
+
 
   # ── CC2340 (TI, ARM Cortex-M0+) ────────────────────────────
   build-cc2340:
