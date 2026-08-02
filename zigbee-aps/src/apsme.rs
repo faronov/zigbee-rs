@@ -413,7 +413,13 @@ impl<M: MacDriver> ApsLayer<M> {
             }
         };
         let local_ieee = self.nwk.nib().ieee_address;
-        let hash = crate::security::derive_verify_key_hash(&key);
+        let hash = match crate::security::derive_verify_key_hash_with(self.nwk.mac_mut(), &key) {
+            Some(hash) => hash,
+            None => {
+                log::warn!("APSME-VERIFY-KEY: hardware AES failed deriving verify-key hash");
+                return ApsStatus::SecurityFail;
+            }
+        };
         let key_type_byte = 0x04;
         match self
             .send_verify_key(dst_short, &local_ieee, key_type_byte, &hash)

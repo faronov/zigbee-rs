@@ -827,6 +827,7 @@ impl MacDriver for Bl702Mac {
     }
 }
 
+impl zigbee_crypto::ForwardAesProvider for Bl702Mac {}
 impl PlatformServices for Bl702Mac {
     fn monotonic_micros(&self) -> u32 {
         Instant::now().as_micros() as u32

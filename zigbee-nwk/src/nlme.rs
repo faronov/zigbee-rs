@@ -594,7 +594,8 @@ impl<M: MacDriver> NwkLayer<M> {
             let aad_len = hdr_len + sec_hdr_len;
 
             if let Some(key_entry) = self.security.active_key() {
-                if let Some(encrypted) = self.security.encrypt(
+                if let Some(encrypted) = self.security.encrypt_with(
+                    &mut self.mac,
                     &nwk_frame_buf[..aad_len],
                     &cmd_payload,
                     &key_entry.key,
@@ -794,7 +795,8 @@ impl<M: MacDriver> NwkLayer<M> {
                 let copy_len = aad_len.min(aad_buf.len());
                 aad_buf[..copy_len].copy_from_slice(&data[..copy_len]);
                 aad_buf[consumed] = (aad_buf[consumed] & !0x07) | 0x05;
-                match self.security.decrypt(
+                match self.security.decrypt_with(
+                    &mut self.mac,
                     &aad_buf[..copy_len],
                     &after_hdr[sec_consumed..],
                     &key,
@@ -976,10 +978,13 @@ impl<M: MacDriver> NwkLayer<M> {
             let aad_len = hdr_len + sec_hdr_len;
 
             if let Some(key_entry) = self.security.active_key() {
-                if let Some(encrypted) =
-                    self.security
-                        .encrypt(&buf[..aad_len], &payload, &key_entry.key, &sec_hdr)
-                {
+                if let Some(encrypted) = self.security.encrypt_with(
+                    &mut self.mac,
+                    &buf[..aad_len],
+                    &payload,
+                    &key_entry.key,
+                    &sec_hdr,
+                ) {
                     if aad_len + encrypted.len() > buf.len() {
                         return Err(NwkStatus::FrameTooLong);
                     }

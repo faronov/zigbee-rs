@@ -2150,21 +2150,21 @@ impl<M: MacDriver> BdbLayer<M> {
                     sec_consumed,
                     after_nwk.len().saturating_sub(sec_consumed)
                 );
-                if let Some(key_entry) = self
+                if let Some(key) = self
                     .zdo
                     .aps()
                     .nwk()
                     .security()
                     .key_by_seq(sec_hdr.key_seq_number)
+                    .map(|key_entry| key_entry.key)
                 {
-                    let key = key_entry.key;
                     let aad_len = nwk_consumed + sec_consumed;
                     // AAD must use ACTUAL security level (5), not OTA value (0).
                     let mut aad_buf = [0u8; 64];
                     let aad_copy_len = aad_len.min(aad_buf.len());
                     aad_buf[..aad_copy_len].copy_from_slice(&mac_payload[..aad_copy_len]);
                     aad_buf[nwk_consumed] = (aad_buf[nwk_consumed] & !0x07) | 0x05;
-                    let active_pt = self.zdo.aps().nwk().security().decrypt(
+                    let active_pt = self.zdo.aps_mut().nwk_mut().decrypt_nwk_frame(
                         &aad_buf[..aad_copy_len],
                         &after_nwk[sec_consumed..],
                         &key,

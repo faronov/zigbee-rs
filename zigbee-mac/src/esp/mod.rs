@@ -956,6 +956,7 @@ impl MacDriver for EspMac<'_> {
     }
 }
 
+impl zigbee_crypto::ForwardAesProvider for EspMac<'_> {}
 impl PlatformServices for EspMac<'_> {
     fn monotonic_micros(&self) -> u32 {
         Instant::now().as_micros() as u32

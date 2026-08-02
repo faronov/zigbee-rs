@@ -216,6 +216,11 @@ pub enum AesError {
     /// object spins here unconditionally instead (see module docs) — this
     /// is a hard failure, not a "assume done and read garbage" fallback.
     Timeout,
+    /// The on-silicon AES result did not match an AES-128 known-answer
+    /// vector. Callers must not use the accelerator after this
+    /// error because register ordering, byte ordering, clocking, or the
+    /// peripheral itself is not behaving as required.
+    KnownAnswerMismatch,
 }
 
 /// Abstraction over the raw AES-128 ECB accelerator registers, so the
@@ -384,6 +389,48 @@ impl AesEngine {
             false,
             self.timeout_iterations,
         )
+    }
+
+    /// Run AES-128 known-answer tests on the real accelerator.
+    ///
+    /// This checks the complete key/data/result byte ordering and register
+    /// handshake before Zigbee security starts using the engine. Two
+    /// back-to-back vectors with different keys also verify that the engine
+    /// can be re-keyed and reused, as required by AES-MMO.
+    #[cfg(target_arch = "tc32")]
+    pub fn self_test(&mut self) -> Result<(), AesError> {
+        const KEY: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        const PLAINTEXT: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        const CIPHERTEXT: [u8; 16] = [
+            0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4,
+            0xc5, 0x5a,
+        ];
+
+        let mut block = PLAINTEXT;
+        self.encrypt_block(&KEY, &mut block)?;
+        if block != CIPHERTEXT {
+            return Err(AesError::KnownAnswerMismatch);
+        }
+
+        let zero_key = [0u8; 16];
+        let mut zero_block = [0u8; 16];
+        self.encrypt_block(&zero_key, &mut zero_block)?;
+        if zero_block
+            != [
+                0x66, 0xe9, 0x4b, 0xd4, 0xef, 0x8a, 0x2c, 0x3b, 0x88, 0x4c, 0xfa, 0x59, 0xca, 0x34,
+                0x2b, 0x2e,
+            ]
+        {
+            return Err(AesError::KnownAnswerMismatch);
+        }
+
+        Ok(())
     }
 
     /// Decrypt one 16-byte block in place with `key`.

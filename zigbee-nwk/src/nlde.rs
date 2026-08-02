@@ -231,9 +231,9 @@ impl<M: MacDriver> NwkLayer<M> {
         }
         let aad_len = hdr_len + sec_hdr.serialize(&mut buf[hdr_len..]);
 
-        let Some(encrypted) = self
-            .security
-            .encrypt(&buf[..aad_len], payload, &key, &sec_hdr)
+        let Some(encrypted) =
+            self.security
+                .encrypt_with(&mut self.mac, &buf[..aad_len], payload, &key, &sec_hdr)
         else {
             log::warn!("[NWK] Encryption failed");
             return Err(NwkStatus::BadCcmOutput);
@@ -1156,7 +1156,8 @@ impl<M: MacDriver> NwkLayer<M> {
         aad_buf[..aad_len].copy_from_slice(&mac_payload[..aad_len]);
         aad_buf[header_len] = (aad_buf[header_len] & !0x07) | 0x05;
 
-        match self.security.decrypt(
+        match self.security.decrypt_with(
+            &mut self.mac,
             &aad_buf[..aad_len],
             &after_header[sec_consumed..],
             &key,

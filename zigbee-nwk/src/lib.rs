@@ -504,6 +504,27 @@ impl<M: MacDriver> NwkLayer<M> {
         &mut self.security
     }
 
+    /// Decrypt/verify a NWK frame with this layer's platform AES provider
+    /// (the owned MAC), keyed by the caller-supplied network `key`.
+    ///
+    /// Front-ends that perform NWK receive processing directly (e.g. BDB
+    /// steering re-decrypting a captured frame) use this instead of
+    /// `security().decrypt(...)` so CCM* runs on the platform's AES backend
+    /// — hardware where available — while keeping the exclusive engine
+    /// ownership inside the MAC. Internally this is a disjoint-field borrow
+    /// of `security` and `mac`. Returns `None` on a MIC mismatch or a
+    /// hardware AES failure (no software fall-back).
+    pub fn decrypt_nwk_frame(
+        &mut self,
+        nwk_header: &[u8],
+        ciphertext: &[u8],
+        key: &security::AesKey,
+        security_header: &security::NwkSecurityHeader,
+    ) -> Option<heapless::Vec<u8, 128>> {
+        self.security
+            .decrypt_with(&mut self.mac, nwk_header, ciphertext, key, security_header)
+    }
+
     pub fn rx_security_stats(&self) -> NwkRxSecurityStats {
         self.rx_security_stats
     }

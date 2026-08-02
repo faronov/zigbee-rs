@@ -8,7 +8,9 @@
 //! MAC-level security is NOT used for normal Zigbee 3.0 data frames.
 
 pub use zigbee_crypto::AesKey;
-use zigbee_crypto::{ccm_star_decrypt, ccm_star_encrypt};
+use zigbee_crypto::{
+    ForwardAesProvider, SoftwareAesProvider, ccm_star_decrypt_with, ccm_star_encrypt_with,
+};
 use zigbee_types::IeeeAddress;
 
 /// Maximum number of network keys we can store (current + previous)
@@ -325,8 +327,38 @@ impl NwkSecurity {
     /// * `security_header` - Security auxiliary header
     ///
     /// Returns: encrypted payload + 4-byte MIC appended.
+    ///
+    /// Software-AES wrapper over [`Self::encrypt_with`] — used by host tests
+    /// and any caller without a platform. The embedded data path uses
+    /// [`Self::encrypt_with`] with the MAC so a hardware AES backend can
+    /// serve CCM*.
     pub fn encrypt(
         &self,
+        nwk_header: &[u8],
+        payload: &[u8],
+        key: &AesKey,
+        security_header: &NwkSecurityHeader,
+    ) -> Option<heapless::Vec<u8, 128>> {
+        self.encrypt_with(
+            &mut SoftwareAesProvider::new(),
+            nwk_header,
+            payload,
+            key,
+            security_header,
+        )
+    }
+
+    /// Encrypt a NWK frame payload using CCM* keyed by `provider`.
+    ///
+    /// The forward AES permutation comes from `provider.forward_cipher(key)`,
+    /// which is the software core by default and a hardware accelerator on
+    /// platforms that override [`ForwardAesProvider::forward_cipher`]. A
+    /// hardware AES failure is surfaced as `None` (the caller reports
+    /// `BadCcmOutput`) rather than silently retried in software — see the
+    /// `Err` arm below.
+    pub fn encrypt_with<P: ForwardAesProvider>(
+        &self,
+        provider: &mut P,
         nwk_header: &[u8],
         payload: &[u8],
         key: &AesKey,
@@ -337,10 +369,18 @@ impl NwkSecurity {
         // - M=4 (MIC length)
         // - a = nwk_header || security_header (authenticated but not encrypted)
         // - m = payload (encrypted and authenticated)
-        ccm_star_encrypt(key, &nonce, nwk_header, payload)
+        let mut cipher = provider.forward_cipher(key);
+        match ccm_star_encrypt_with(&mut cipher, &nonce, nwk_header, payload) {
+            Ok(result) => result,
+            Err(_hardware_error) => {
+                log::error!("[NWK] Hardware AES encrypt failed; dropping frame");
+                None
+            }
+        }
     }
 
-    /// Decrypt a NWK frame payload.
+    /// Decrypt a NWK frame payload (software-AES wrapper over
+    /// [`Self::decrypt_with`]).
     pub fn decrypt(
         &self,
         nwk_header: &[u8],
@@ -348,8 +388,38 @@ impl NwkSecurity {
         key: &AesKey,
         security_header: &NwkSecurityHeader,
     ) -> Option<heapless::Vec<u8, 128>> {
+        self.decrypt_with(
+            &mut SoftwareAesProvider::new(),
+            nwk_header,
+            ciphertext,
+            key,
+            security_header,
+        )
+    }
+
+    /// Decrypt and verify a NWK frame payload using CCM* keyed by `provider`.
+    ///
+    /// Returns `None` on a MIC mismatch (forged/tampered frame) **and** on a
+    /// hardware AES failure — both are hard failures with no software
+    /// fall-back. The caller must not commit the replay frame counter unless
+    /// this returns `Some`.
+    pub fn decrypt_with<P: ForwardAesProvider>(
+        &self,
+        provider: &mut P,
+        nwk_header: &[u8],
+        ciphertext: &[u8],
+        key: &AesKey,
+        security_header: &NwkSecurityHeader,
+    ) -> Option<heapless::Vec<u8, 128>> {
         let nonce = self.build_nonce(security_header);
-        ccm_star_decrypt(key, &nonce, nwk_header, ciphertext)
+        let mut cipher = provider.forward_cipher(key);
+        match ccm_star_decrypt_with(&mut cipher, &nonce, nwk_header, ciphertext) {
+            Ok(result) => result,
+            Err(_hardware_error) => {
+                log::error!("[NWK] Hardware AES decrypt failed; dropping frame");
+                None
+            }
+        }
     }
 
     /// Build CCM* nonce from security header.
@@ -415,6 +485,101 @@ mod tests {
             .encrypt(b"NWK-HDR+AUX", b"hello-nwk-frame", &key, &header)
             .expect("encrypt");
         assert_eq!(encrypted.as_slice(), expected);
+    }
+
+    /// A hardware-shaped forward-AES provider (a cipher with a *fallible*,
+    /// non-`Infallible` error, like the real TLSR8258 backend) drives
+    /// [`NwkSecurity::encrypt_with`]/[`decrypt_with`] to byte-identical
+    /// output as the software wrapper, and a *failing* provider surfaces a
+    /// hard `None` (dropped frame) rather than a silent software fall-back.
+    #[test]
+    fn nwk_security_is_backend_agnostic_and_surfaces_hardware_errors() {
+        use zigbee_crypto::{Aes128Forward, ForwardAesProvider, SoftwareAes128};
+
+        struct FlakyCipher {
+            inner: SoftwareAes128,
+            fail: bool,
+        }
+        impl Aes128Forward for FlakyCipher {
+            type Error = ();
+            fn encrypt_block(&mut self, block: &mut [u8; 16]) -> Result<(), ()> {
+                if self.fail {
+                    return Err(());
+                }
+                self.inner.encrypt_block(block).unwrap();
+                Ok(())
+            }
+        }
+        struct FlakyProvider {
+            fail: bool,
+        }
+        impl ForwardAesProvider for FlakyProvider {
+            fn forward_cipher(&mut self, key: &AesKey) -> impl Aes128Forward + '_ {
+                FlakyCipher {
+                    inner: SoftwareAes128::new(key),
+                    fail: self.fail,
+                }
+            }
+        }
+
+        let key = [0x24; 16];
+        let header = NwkSecurityHeader {
+            security_control: NwkSecurityHeader::ZIGBEE_DEFAULT,
+            frame_counter: 7,
+            source_address: [0xAA; 8],
+            key_seq_number: 0,
+        };
+        let security = NwkSecurity::new();
+
+        // Equivalence: hardware-shaped provider == software wrapper.
+        let via_sw = security
+            .encrypt(b"aad", b"secret-payload", &key, &header)
+            .expect("sw encrypt");
+        let via_hw = security
+            .encrypt_with(
+                &mut FlakyProvider { fail: false },
+                b"aad",
+                b"secret-payload",
+                &key,
+                &header,
+            )
+            .expect("hw encrypt");
+        assert_eq!(via_sw, via_hw);
+        let round_trip = security
+            .decrypt_with(
+                &mut FlakyProvider { fail: false },
+                b"aad",
+                &via_hw,
+                &key,
+                &header,
+            )
+            .expect("hw decrypt");
+        assert_eq!(round_trip.as_slice(), b"secret-payload");
+
+        // A failing backend drops the frame (None), never silently
+        // succeeding or falling back to software.
+        assert!(
+            security
+                .encrypt_with(
+                    &mut FlakyProvider { fail: true },
+                    b"aad",
+                    b"secret-payload",
+                    &key,
+                    &header
+                )
+                .is_none()
+        );
+        assert!(
+            security
+                .decrypt_with(
+                    &mut FlakyProvider { fail: true },
+                    b"aad",
+                    &via_hw,
+                    &key,
+                    &header
+                )
+                .is_none()
+        );
     }
 
     #[test]

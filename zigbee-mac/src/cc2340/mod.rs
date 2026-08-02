@@ -876,6 +876,7 @@ impl MacDriver for Cc2340Mac {
     }
 }
 
+impl zigbee_crypto::ForwardAesProvider for Cc2340Mac {}
 impl PlatformServices for Cc2340Mac {
     fn monotonic_micros(&self) -> u32 {
         Instant::now().as_micros() as u32

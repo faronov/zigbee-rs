@@ -14,6 +14,9 @@ use crate::frames::{
 use crate::{
     ApsAddress, ApsAddressMode, ApsLayer, ApsStatus, ApsTxOptions, PendingApsAck, PendingApsTunnel,
 };
+use zigbee_crypto::ForwardAesProvider;
+#[cfg(test)]
+use zigbee_crypto::SoftwareAesProvider;
 use zigbee_mac::MacDriver;
 use zigbee_nwk::NwkStatus;
 use zigbee_types::{IeeeAddress, ShortAddress};
@@ -95,8 +98,38 @@ fn build_verify_key_command(src_ieee: &IeeeAddress, key_type: u8, hash: &[u8; 16
     payload
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_tc_secured_command_frame(
+    security: &crate::security::ApsSecurity,
+    link_key: &crate::security::AesKey,
+    src_ieee: &IeeeAddress,
+    aps_counter: u8,
+    frame_counter: u32,
+    key_identifier: u8,
+    ack_request: bool,
+    command: &[u8],
+    frame: &mut [u8],
+) -> Option<usize> {
+    // Software-AES wrapper (host tests) over the provider-keyed builder; the
+    // embedded send path uses `_with` with the MAC.
+    build_tc_secured_command_frame_with(
+        &mut SoftwareAesProvider::new(),
+        security,
+        link_key,
+        src_ieee,
+        aps_counter,
+        frame_counter,
+        key_identifier,
+        ack_request,
+        command,
+        frame,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_tc_secured_command_frame_with<P: ForwardAesProvider>(
+    provider: &mut P,
     security: &crate::security::ApsSecurity,
     link_key: &crate::security::AesKey,
     src_ieee: &IeeeAddress,
@@ -149,7 +182,8 @@ fn build_tc_secured_command_frame(
     authenticated_header[..aad_len].copy_from_slice(&frame[..aad_len]);
     authenticated_header[header_len] |= crate::security::SEC_LEVEL_ENC_MIC_32;
     let nonce_header = security_header.clone();
-    let encrypted = security.encrypt(
+    let encrypted = security.encrypt_with(
+        provider,
         &authenticated_header[..aad_len],
         command,
         link_key,
@@ -177,14 +211,18 @@ fn centralized_trust_center(address: IeeeAddress) -> Option<IeeeAddress> {
 /// The incoming APS security path tries the same decryption up to four times
 /// (patched vs. raw AAD × derived vs. raw Trust-Center link key). Each attempt
 /// shares an identical tail — clamp the plaintext to the frame buffer, copy it
-/// in and record its length. Folding that tail into one **non-generic**
-/// `#[inline(never)]` helper emits the copy (and its `memcpy`) once instead of
-/// four times, and keeps it out of every `ApsLayer<M>` monomorphisation. The
-/// replay check and the single post-success frame-counter commit stay with the
-/// caller, so the R22 "commit only after MIC success, exactly once" ordering is
-/// untouched.
+/// in and record its length. Folding that tail into one `#[inline(never)]`
+/// helper emits the copy (and its `memcpy`) once per image instead of four
+/// times. It is now generic over the [`ForwardAesProvider`] (so CCM* can use
+/// a hardware AES backend) but is still a single function emitted once — a
+/// firmware links exactly one MAC, hence one `P`. The replay check and the
+/// single post-success frame-counter commit stay with the caller, so the R22
+/// "commit only after MIC success, exactly once" ordering is untouched. A
+/// hardware AES failure surfaces as a decrypt miss (returns `false`), never a
+/// software fall-back.
 #[inline(never)]
-fn decrypt_into(
+fn decrypt_into<P: ForwardAesProvider>(
+    provider: &mut P,
     security: &crate::security::ApsSecurity,
     aad: &[u8],
     ciphertext: &[u8],
@@ -192,7 +230,8 @@ fn decrypt_into(
     security_header: &crate::security::ApsSecurityHeader,
     buf: &mut ApsFrameBuffer,
 ) -> bool {
-    let Some(plaintext) = security.decrypt(aad, ciphertext, key, security_header) else {
+    let Some(plaintext) = security.decrypt_with(provider, aad, ciphertext, key, security_header)
+    else {
         return false;
     };
     let pt_len = plaintext.len().min(buf.data.len());
@@ -211,21 +250,27 @@ struct ApsDecryptOutcome {
 
 /// Verify and decrypt a secured incoming APS frame into `decrypted_buf`.
 ///
-/// This is the synchronous, `MacDriver`-independent APS security phase, lifted
-/// out of [`ApsLayer::process_incoming_aps_frame`] so its auxiliary-header
-/// parse, 64-byte AAD-patch buffer, key derivation and four decrypt attempts
-/// are emitted once as a **non-generic** `#[inline(never)]` function. Keeping
-/// that scratch and control flow out of the generic receive method shrinks the
-/// caller's stack frame (the dominant cost of the `tloadr [pc]`-heavy TC32
-/// codegen) and avoids re-monomorphising the whole block per `ApsLayer<M>`.
+/// This is the synchronous APS security phase, lifted out of
+/// [`ApsLayer::process_incoming_aps_frame`] so its auxiliary-header parse,
+/// 64-byte AAD-patch buffer, key derivation and four decrypt attempts are
+/// emitted once as an `#[inline(never)]` function. Keeping that scratch and
+/// control flow out of the receive method shrinks the caller's stack frame
+/// (the dominant cost of the `tloadr [pc]`-heavy TC32 codegen). It is generic
+/// over the [`ForwardAesProvider`] so CCM* and AES-MMO key derivation can use
+/// a hardware AES backend, but a firmware links exactly one MAC, so it is
+/// still emitted once per image.
 ///
 /// The two `NwkLayer<M>`-derived inputs (`nwk_src_ieee`, `nwk_has_active_key`)
 /// are resolved by the caller so this helper never touches the generic NWK
-/// layer. R22 replay ordering is preserved verbatim: the frame counter is
+/// layer; `provider` is the caller's MAC, handed in as a disjoint field
+/// borrow. R22 replay ordering is preserved verbatim: the frame counter is
 /// checked before any decryption and committed exactly once, only after a MIC
-/// succeeds. Returns `None` to drop the frame.
+/// succeeds. Returns `None` to drop the frame (including on a hardware AES
+/// failure — never a software fall-back).
 #[inline(never)]
-fn aps_decrypt_incoming(
+#[allow(clippy::too_many_arguments)]
+fn aps_decrypt_incoming<P: ForwardAesProvider>(
+    provider: &mut P,
     security: &mut crate::security::ApsSecurity,
     nwk_src_ieee: Option<IeeeAddress>,
     nwk_has_active_key: bool,
@@ -289,9 +334,9 @@ fn aps_decrypt_incoming(
     let key = if key_id == crate::security::KEY_ID_DATA_KEY {
         base_link_key
     } else if key_id == crate::security::KEY_ID_KEY_TRANSPORT {
-        crate::security::derive_key_transport_key(&base_link_key)
+        crate::security::derive_key_transport_key_with(provider, &base_link_key)?
     } else if key_id == crate::security::KEY_ID_KEY_LOAD {
-        crate::security::derive_key_load_key(&base_link_key)
+        crate::security::derive_key_load_key_with(provider, &base_link_key)?
     } else {
         log::warn!("[APS] Unsupported key_id={} in APS security", key_id);
         return None;
@@ -313,7 +358,15 @@ fn aps_decrypt_incoming(
     //   1. AAD with original OTA security level (some coordinators don't strip)
     //   2. Raw TC link key instead of derived key-transport key
     let mut decrypt_ok = false;
-    if decrypt_into(security, aad, ciphertext, &key, &sec_hdr, decrypted_buf) {
+    if decrypt_into(
+        provider,
+        security,
+        aad,
+        ciphertext,
+        &key,
+        &sec_hdr,
+        decrypted_buf,
+    ) {
         aps_diag!("[APS] decrypt succeeded with patched AAD");
         decrypt_ok = true;
     }
@@ -321,7 +374,15 @@ fn aps_decrypt_incoming(
     // Fallback: try with un-patched AAD (original OTA security level)
     if !decrypt_ok {
         let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
-        if decrypt_into(security, aad_raw, ciphertext, &key, &sec_hdr, decrypted_buf) {
+        if decrypt_into(
+            provider,
+            security,
+            aad_raw,
+            ciphertext,
+            &key,
+            &sec_hdr,
+            decrypted_buf,
+        ) {
             aps_diag!("[APS] decrypt succeeded with raw AAD");
             decrypt_ok = true;
         }
@@ -334,7 +395,15 @@ fn aps_decrypt_incoming(
         && !nwk_has_active_key
     {
         let tc_key = *security.default_tc_link_key();
-        if decrypt_into(security, aad, ciphertext, &tc_key, &sec_hdr, decrypted_buf) {
+        if decrypt_into(
+            provider,
+            security,
+            aad,
+            ciphertext,
+            &tc_key,
+            &sec_hdr,
+            decrypted_buf,
+        ) {
             aps_diag!("[APS] key-transport decrypt succeeded with raw TC key");
             decrypt_ok = true;
         }
@@ -342,6 +411,7 @@ fn aps_decrypt_incoming(
         if !decrypt_ok {
             let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
             if decrypt_into(
+                provider,
                 security,
                 aad_raw,
                 ciphertext,
@@ -588,7 +658,10 @@ impl<M: MacDriver> ApsLayer<M> {
             let sec_hdr_len = sec_hdr.serialize(&mut aad_buf[hdr_len..]);
             let aad = &aad_buf[..hdr_len + sec_hdr_len];
 
-            if let Some(enc) = self.security.encrypt(aad, req.payload, &key, &sec_hdr) {
+            if let Some(enc) =
+                self.security
+                    .encrypt_with(self.nwk.mac_mut(), aad, req.payload, &key, &sec_hdr)
+            {
                 let mut encrypted_buf = [0u8; 128];
                 let mut offset = 0;
                 let aps_hdr_len = aps_header.serialize(&mut encrypted_buf);
@@ -932,7 +1005,10 @@ impl<M: MacDriver> ApsLayer<M> {
             let sec_hdr_len = sec_hdr.serialize(&mut aad_buf[hdr_len..]);
             let aad = &aad_buf[..hdr_len + sec_hdr_len];
 
-            if let Some(enc) = self.security.encrypt(aad, chunk, &link_key, &sec_hdr) {
+            if let Some(enc) =
+                self.security
+                    .encrypt_with(self.nwk.mac_mut(), aad, chunk, &link_key, &sec_hdr)
+            {
                 let mut frag_buf = [0u8; 128];
                 let mut offset = frag_header.serialize(&mut frag_buf);
                 let sec_len = sec_hdr.serialize(&mut frag_buf[offset..]);
@@ -1021,6 +1097,7 @@ impl<M: MacDriver> ApsLayer<M> {
             let nwk_has_active_key = self.nwk.security().active_key().is_some();
             let tc_address = self.aib.aps_trust_center_address;
             let outcome = aps_decrypt_incoming(
+                self.nwk.mac_mut(),
                 &mut self.security,
                 nwk_src_ieee,
                 nwk_has_active_key,
@@ -1525,12 +1602,14 @@ impl<M: MacDriver> ApsLayer<M> {
             .ok_or(ApsStatus::SecurityFail)?;
         let (security_key, key_identifier) = if key_type == 0x01 {
             (
-                crate::security::derive_key_transport_key(&base_key),
+                crate::security::derive_key_transport_key_with(self.nwk.mac_mut(), &base_key)
+                    .ok_or(ApsStatus::SecurityFail)?,
                 crate::security::KEY_ID_KEY_TRANSPORT,
             )
         } else {
             (
-                crate::security::derive_key_load_key(&base_key),
+                crate::security::derive_key_load_key_with(self.nwk.mac_mut(), &base_key)
+                    .ok_or(ApsStatus::SecurityFail)?,
                 crate::security::KEY_ID_KEY_LOAD,
             )
         };
@@ -1649,7 +1728,8 @@ impl<M: MacDriver> ApsLayer<M> {
             .security
             .next_frame_counter(&tc_ieee, crate::security::ApsKeyType::TrustCenterLinkKey)
             .ok_or(ApsStatus::SecurityFail)?;
-        let hash = crate::security::derive_verify_key_hash(&tc_key);
+        let hash = crate::security::derive_verify_key_hash_with(self.nwk.mac_mut(), &tc_key)
+            .ok_or(ApsStatus::SecurityFail)?;
         self.security_handshake_stats.last_verify_key_trust_center = tc_ieee;
         self.send_verify_key_with_material(
             tc_addr,
@@ -1742,7 +1822,8 @@ impl<M: MacDriver> ApsLayer<M> {
         let aps_counter = self.next_aps_counter();
 
         let mut frame = [0u8; 80];
-        let total = build_tc_secured_command_frame(
+        let total = build_tc_secured_command_frame_with(
+            self.nwk.mac_mut(),
             &self.security,
             link_key,
             src_ieee,

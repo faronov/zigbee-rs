@@ -11,8 +11,9 @@ Embassy and other embedded async runtimes.
 
 > **Role-specialized firmware:** sensor builds compile out parent/router
 > maintenance and parent state rather than carrying dormant code. With the
-> pinned `tc32-45` toolchain, the current TLSR8258 release images are 272,148
-> bytes for the end-device sensor and 331,852 bytes for the parent router.
+> pinned `tc32-45` toolchain, the current software-AES TLSR8258 release images
+> are 272,600 bytes for the end-device sensor and 332,440 bytes for the parent
+> router.
 > See the [firmware-size report](docs/book/src/advanced/firmware-size.md).
 
 ```text

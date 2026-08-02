@@ -868,6 +868,7 @@ impl MacDriver for Efr32s2Mac {
     }
 }
 
+impl zigbee_crypto::ForwardAesProvider for Efr32s2Mac {}
 impl PlatformServices for Efr32s2Mac {
     fn monotonic_micros(&self) -> u32 {
         Instant::now().as_micros() as u32

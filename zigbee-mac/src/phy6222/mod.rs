@@ -943,6 +943,7 @@ impl MacDriver for Phy6222Mac {
     }
 }
 
+impl zigbee_crypto::ForwardAesProvider for Phy6222Mac {}
 impl PlatformServices for Phy6222Mac {
     fn monotonic_micros(&self) -> u32 {
         Instant::now().as_micros() as u32

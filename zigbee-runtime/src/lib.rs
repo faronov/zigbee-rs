@@ -989,6 +989,37 @@ mod resume_tests {
     }
 
     #[test]
+    fn factory_reset_clears_credentials_and_preserves_counter_bounds() {
+        let mut device = ZigbeeDevice::builder(MockMac::new([0x99; 8]))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.extended_pan_id = [0x11; 8];
+        state.pan_id = 0x1234;
+        state.short_address = 0x5678;
+        state.ieee_address = [0x99; 8];
+        state.network_key = [0xA5; 16];
+        state.staged_network_key_present = true;
+        state.staged_network_key = [0xC3; 16];
+        state.tclk_present = true;
+        state.trust_center_address = [0x22; 8];
+        state.trust_center_link_key = [0x5A; 16];
+        state.rejoin_pending = true;
+        state.global_counter_limit = 0x2A400;
+        state.tclk_counter_limit = 0x4804;
+
+        let mut store = RamSecurityStateStore::new();
+        store.store(&state).unwrap();
+        device.factory_reset_security_state(&mut store).unwrap();
+
+        let mut expected = PersistentSecurityState::empty();
+        expected.global_counter_limit = state.global_counter_limit;
+        expected.tclk_counter_limit = state.tclk_counter_limit;
+        assert_eq!(store.load().unwrap(), Some(expected));
+    }
+
+    #[test]
     fn identity_change_clears_credentials_and_preserves_counter_bounds() {
         const CURRENT_IEEE: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x99];
         const OLD_IEEE: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];

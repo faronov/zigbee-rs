@@ -968,6 +968,7 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
     }
 }
 
+impl<T: RadioInstance, R: RngInstance> zigbee_crypto::ForwardAesProvider for NrfMac<'_, T, R> {}
 impl<T: RadioInstance, R: RngInstance> PlatformServices for NrfMac<'_, T, R> {
     fn monotonic_micros(&self) -> u32 {
         embassy_time::Instant::now().as_micros() as u32

@@ -606,6 +606,13 @@ mod imp {
     use tlsr8258_hal::{flash, timer};
     use zigbee_types::*;
 
+    /// Hardware AES-128 accelerator, owned by the MAC only when the
+    /// `hardware-aes` feature selects the on-silicon CCM*/MMO backend. See
+    /// [`TelinkMac::install_aes_engine`] and the `ForwardAesProvider`
+    /// override below.
+    #[cfg(feature = "hardware-aes")]
+    use tlsr8258_hal::aes::{AesEngine, AesError};
+
     const ACK_WAIT_TICKS: u32 = timer::ms(8);
     const ASSOCIATION_DIRECT_WAIT_TICKS: u32 = timer::ms(500);
     const POST_ASSOCIATION_RX_TICKS: u32 = timer::ms(250);
@@ -674,6 +681,14 @@ mod imp {
         /// `tlsr8258_hal::rng`'s module docs for exactly what this
         /// provides and does not prove about entropy quality.
         rng: Option<Rng>,
+        /// Hardware AES-128 accelerator, present only under the
+        /// `hardware-aes` feature. Installed once by the composition root
+        /// via [`TelinkMac::install_aes_engine`] from the board's exclusive
+        /// `Aes` token, so there is exactly one engine and no global mutable
+        /// alias. `None` only in the window between construction and that
+        /// single install call.
+        #[cfg(feature = "hardware-aes")]
+        aes_engine: Option<AesEngine>,
     }
 
     impl TelinkMac {
@@ -700,6 +715,29 @@ mod imp {
         pub fn with_extended_address(extended_address: IeeeAddress) -> Self {
             let radio = Radio::take().expect("TLSR8258 radio already taken");
             Self::from_radio(radio, Some(extended_address))
+        }
+
+        /// Take ownership of the AES-128 accelerator and use it for all
+        /// subsequent CCM* and AES-MMO operations (via the
+        /// `ForwardAesProvider` override below).
+        ///
+        /// The composition root calls this exactly once, right after
+        /// construction, handing over the board's single exclusive
+        /// `Aes` token. Constructing the [`AesEngine`] here enables the
+        /// AES clock-gate and pulses its reset once; it is never
+        /// re-initialised afterwards. Before accepting the engine, this runs
+        /// back-to-back AES-128 known-answer tests against the real peripheral,
+        /// including a re-key/reuse cycle. Only compiled under the
+        /// `hardware-aes` feature.
+        #[cfg(feature = "hardware-aes")]
+        pub fn install_aes_engine(
+            &mut self,
+            aes: tlsr8258_hal::peripherals::Aes,
+        ) -> Result<(), AesError> {
+            let mut engine = AesEngine::new(aes, AesEngine::DEFAULT_TIMEOUT_ITERATIONS)?;
+            engine.self_test()?;
+            self.aes_engine = Some(engine);
+            Ok(())
         }
 
         fn from_radio(mut radio: Radio, address: Option<IeeeAddress>) -> Self {
@@ -747,6 +785,8 @@ mod imp {
                 pending_association_deliveries: heapless::Deque::new(),
                 clock: WrappingTickExtender::new(now_ticks),
                 rng: None,
+                #[cfg(feature = "hardware-aes")]
+                aes_engine: None,
             };
             mac.apply_radio_config();
             mac
@@ -1996,6 +2036,32 @@ mod imp {
                 tx_power_min: TxPower(TX_POWER_MIN_DBM),
                 tx_power_max: TxPower(TX_POWER_MAX_DBM),
             }
+        }
+    }
+
+    /// Software AES (the default) when `hardware-aes` is off — the standard
+    /// Telink image keeps the RustCrypto software core, exactly as before.
+    #[cfg(not(feature = "hardware-aes"))]
+    impl zigbee_crypto::ForwardAesProvider for TelinkMac {}
+
+    /// Hardware AES-128 backend for CCM* and AES-MMO. Hands back a
+    /// [`zigbee_crypto::tlsr8258::HardwareAes128`] borrowing this MAC's
+    /// exclusively-owned [`AesEngine`], so the RustCrypto software core is
+    /// dead-code-eliminated from the image. A missing engine (composition
+    /// root failed to call [`TelinkMac::install_aes_engine`]) is a firmware
+    /// wiring bug and traps loudly rather than silently falling back to
+    /// software.
+    #[cfg(feature = "hardware-aes")]
+    impl zigbee_crypto::ForwardAesProvider for TelinkMac {
+        fn forward_cipher(
+            &mut self,
+            key: &zigbee_crypto::AesKey,
+        ) -> impl zigbee_crypto::Aes128Forward + '_ {
+            let engine = self
+                .aes_engine
+                .as_mut()
+                .expect("AES engine not installed: call TelinkMac::install_aes_engine()");
+            zigbee_crypto::tlsr8258::HardwareAes128::new(engine, *key)
         }
     }
 

@@ -16,11 +16,11 @@
 //! ("ZigBeeAlliance09") pre-installed. During joining, the TC uses this key
 //! to distribute the actual network key securely.
 
-use aes::Aes128;
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockEncrypt, KeyInit};
 pub use zigbee_crypto::AesKey;
-use zigbee_crypto::{ccm_star_decrypt, ccm_star_encrypt};
+use zigbee_crypto::{
+    Aes128Forward, ForwardAesProvider, SoftwareAesProvider, ccm_star_decrypt_with,
+    ccm_star_encrypt_with,
+};
 use zigbee_types::IeeeAddress;
 
 /// Maximum number of link key entries.
@@ -389,6 +389,10 @@ impl ApsSecurity {
     /// * `security_header` - APS security auxiliary header
     ///
     /// Returns: encrypted payload + 4-byte MIC appended.
+    ///
+    /// Software-AES wrapper over [`Self::encrypt_with`]; the embedded data
+    /// path uses `encrypt_with` with the MAC so a hardware AES backend can
+    /// serve CCM*.
     pub fn encrypt(
         &self,
         aps_header: &[u8],
@@ -396,13 +400,63 @@ impl ApsSecurity {
         key: &AesKey,
         security_header: &ApsSecurityHeader,
     ) -> Option<heapless::Vec<u8, 128>> {
-        let nonce = self.build_nonce(security_header);
-        ccm_star_encrypt(key, &nonce, aps_header, payload)
+        self.encrypt_with(
+            &mut SoftwareAesProvider::new(),
+            aps_header,
+            payload,
+            key,
+            security_header,
+        )
     }
 
-    /// Decrypt an APS payload.
+    /// Encrypt an APS payload using CCM* keyed by `provider`.
+    ///
+    /// A hardware AES failure surfaces as `None` (never a silent software
+    /// fall-back) — see the `Err` arm.
+    pub fn encrypt_with<P: ForwardAesProvider>(
+        &self,
+        provider: &mut P,
+        aps_header: &[u8],
+        payload: &[u8],
+        key: &AesKey,
+        security_header: &ApsSecurityHeader,
+    ) -> Option<heapless::Vec<u8, 128>> {
+        let nonce = self.build_nonce(security_header);
+        let mut cipher = provider.forward_cipher(key);
+        match ccm_star_encrypt_with(&mut cipher, &nonce, aps_header, payload) {
+            Ok(result) => result,
+            Err(_hardware_error) => {
+                log::error!("[APS] Hardware AES encrypt failed; dropping frame");
+                None
+            }
+        }
+    }
+
+    /// Decrypt an APS payload (software-AES wrapper over
+    /// [`Self::decrypt_with`]).
     pub fn decrypt(
         &self,
+        aps_header: &[u8],
+        ciphertext: &[u8],
+        key: &AesKey,
+        security_header: &ApsSecurityHeader,
+    ) -> Option<heapless::Vec<u8, 128>> {
+        self.decrypt_with(
+            &mut SoftwareAesProvider::new(),
+            aps_header,
+            ciphertext,
+            key,
+            security_header,
+        )
+    }
+
+    /// Decrypt and verify an APS payload using CCM* keyed by `provider`.
+    ///
+    /// Returns `None` on a MIC mismatch **and** on a hardware AES failure —
+    /// both hard failures with no software fall-back.
+    pub fn decrypt_with<P: ForwardAesProvider>(
+        &self,
+        provider: &mut P,
         aps_header: &[u8],
         ciphertext: &[u8],
         key: &AesKey,
@@ -412,7 +466,14 @@ impl ApsSecurity {
             return None;
         }
         let nonce = self.build_nonce(security_header);
-        ccm_star_decrypt(key, &nonce, aps_header, ciphertext)
+        let mut cipher = provider.forward_cipher(key);
+        match ccm_star_decrypt_with(&mut cipher, &nonce, aps_header, ciphertext) {
+            Ok(result) => result,
+            Err(_hardware_error) => {
+                log::error!("[APS] Hardware AES decrypt failed; dropping frame");
+                None
+            }
+        }
     }
 
     /// Build CCM* nonce from APS security header.
@@ -496,14 +557,27 @@ mod ccm_tests {
 // ── Matyas-Meyer-Oseas Hash & HMAC-MMO ──────────────────────────
 // Used for APS key derivation (Zigbee spec Appendix B).
 
-/// Matyas-Meyer-Oseas AES-128 block cipher hash (Zigbee spec B.1.3).
+/// Matyas-Meyer-Oseas AES-128 block cipher hash (Zigbee spec B.1.3), keyed
+/// through `provider`.
 ///
 /// Processes `data` in 16-byte blocks:
 ///   H_0 = 0
 ///   H_i = AES(H_{i-1}, M_i) XOR M_i
 ///
-/// Input is padded per B.6: append 0x80, zeros, then 16-bit big-endian bit-length.
-fn matyas_meyer_oseas_hash(data: &[u8]) -> [u8; 16] {
+/// Input is padded per B.6: append 0x80, zeros, then 16-bit big-endian
+/// bit-length. MMO re-keys the block cipher on *every* block (the running
+/// hash becomes the next key), which is exactly what
+/// [`ForwardAesProvider::forward_cipher`] expresses — the software provider
+/// re-expands the key schedule per block just as the original code did, and
+/// a hardware provider re-loads its key register per block.
+///
+/// Returns `None` if the AES backend fails (a hardware accelerator timeout,
+/// impossible for the software provider), so callers surface the failure
+/// instead of deriving a silently-wrong key.
+fn matyas_meyer_oseas_hash_with<P: ForwardAesProvider>(
+    provider: &mut P,
+    data: &[u8],
+) -> Option<[u8; 16]> {
     let bit_len = (data.len() as u16).wrapping_mul(8);
 
     // Build padded message: data || 0x80 || zeros || bit_len_be16
@@ -518,23 +592,31 @@ fn matyas_meyer_oseas_hash(data: &[u8]) -> [u8; 16] {
     let mut hash = [0u8; 16];
 
     for chunk in padded[..padded_len].chunks(16) {
-        let cipher = <Aes128 as KeyInit>::new(GenericArray::from_slice(&hash));
-        let mut block = GenericArray::clone_from_slice(chunk);
-        cipher.encrypt_block(&mut block);
-
+        let mut block = [0u8; 16];
+        block.copy_from_slice(chunk);
+        {
+            // Key the forward permutation with the running hash H_{i-1}.
+            let mut cipher = provider.forward_cipher(&hash);
+            cipher.encrypt_block(&mut block).ok()?;
+        }
         // H_i = E(H_{i-1}, M_i) XOR M_i
         for j in 0..16 {
             hash[j] = block[j] ^ chunk[j];
         }
     }
 
-    hash
+    Some(hash)
 }
 
-/// HMAC-MMO keyed hash (Zigbee spec B.1.4).
+/// HMAC-MMO keyed hash (Zigbee spec B.1.4), keyed through `provider`.
 ///
-/// HMAC(Key, M) = Hash( (Key XOR opad) || Hash( (Key XOR ipad) || M ) )
-fn hmac_mmo(key: &[u8; 16], message: &[u8]) -> [u8; 16] {
+/// HMAC(Key, M) = Hash( (Key XOR opad) || Hash( (Key XOR ipad) || M ) ).
+/// Returns `None` on an AES backend failure.
+fn hmac_mmo_with<P: ForwardAesProvider>(
+    provider: &mut P,
+    key: &[u8; 16],
+    message: &[u8],
+) -> Option<[u8; 16]> {
     let mut ipad_key = [0x36u8; 16];
     let mut opad_key = [0x5Cu8; 16];
     for i in 0..16 {
@@ -547,35 +629,68 @@ fn hmac_mmo(key: &[u8; 16], message: &[u8]) -> [u8; 16] {
     inner_input[..16].copy_from_slice(&ipad_key);
     let inner_len = 16 + message.len();
     inner_input[16..inner_len].copy_from_slice(message);
-    let inner_hash = matyas_meyer_oseas_hash(&inner_input[..inner_len]);
+    let inner_hash = matyas_meyer_oseas_hash_with(provider, &inner_input[..inner_len])?;
 
     // Outer hash: Hash(opad_key || inner_hash)
     let mut outer_input = [0u8; 32];
     outer_input[..16].copy_from_slice(&opad_key);
     outer_input[16..32].copy_from_slice(&inner_hash);
-    matyas_meyer_oseas_hash(&outer_input)
+    matyas_meyer_oseas_hash_with(provider, &outer_input)
 }
 
 /// Derive Key-Transport Key from TC link key (Zigbee spec §4.5.3.4).
 ///
-/// Key-Transport Key = HMAC-MMO(Link Key, 0x00)
+/// Key-Transport Key = HMAC-MMO(Link Key, 0x00). Software-AES wrapper over
+/// [`derive_key_transport_key_with`].
 pub fn derive_key_transport_key(link_key: &AesKey) -> AesKey {
-    hmac_mmo(link_key, &[0x00])
+    derive_key_transport_key_with(&mut SoftwareAesProvider::new(), link_key)
+        .expect("software AES is infallible")
+}
+
+/// [`derive_key_transport_key`] keyed through `provider`; `None` on an AES
+/// backend failure.
+pub fn derive_key_transport_key_with<P: ForwardAesProvider>(
+    provider: &mut P,
+    link_key: &AesKey,
+) -> Option<AesKey> {
+    hmac_mmo_with(provider, link_key, &[0x00])
 }
 
 /// Derive Key-Load Key from TC link key (Zigbee spec §4.5.3.4).
 ///
-/// Key-Load Key = HMAC-MMO(Link Key, 0x02)
+/// Key-Load Key = HMAC-MMO(Link Key, 0x02). Software-AES wrapper over
+/// [`derive_key_load_key_with`].
 pub fn derive_key_load_key(link_key: &AesKey) -> AesKey {
-    hmac_mmo(link_key, &[0x02])
+    derive_key_load_key_with(&mut SoftwareAesProvider::new(), link_key)
+        .expect("software AES is infallible")
+}
+
+/// [`derive_key_load_key`] keyed through `provider`; `None` on an AES backend
+/// failure.
+pub fn derive_key_load_key_with<P: ForwardAesProvider>(
+    provider: &mut P,
+    link_key: &AesKey,
+) -> Option<AesKey> {
+    hmac_mmo_with(provider, link_key, &[0x02])
 }
 
 /// Derive the Verify-Key hash for APSME-VERIFY-KEY (Zigbee spec B.1.4).
 ///
 /// Verify-Key Hash = HMAC-MMO(Link Key, 0x03). The source IEEE address is a
 /// separate command field and is not part of the keyed-hash input.
+/// Software-AES wrapper over [`derive_verify_key_hash_with`].
 pub fn derive_verify_key_hash(link_key: &AesKey) -> AesKey {
-    hmac_mmo(link_key, &[0x03])
+    derive_verify_key_hash_with(&mut SoftwareAesProvider::new(), link_key)
+        .expect("software AES is infallible")
+}
+
+/// [`derive_verify_key_hash`] keyed through `provider`; `None` on an AES
+/// backend failure.
+pub fn derive_verify_key_hash_with<P: ForwardAesProvider>(
+    provider: &mut P,
+    link_key: &AesKey,
+) -> Option<AesKey> {
+    hmac_mmo_with(provider, link_key, &[0x03])
 }
 
 #[cfg(test)]

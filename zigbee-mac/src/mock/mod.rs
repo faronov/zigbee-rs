@@ -216,6 +216,7 @@ impl MockMac {
     }
 }
 
+impl zigbee_crypto::ForwardAesProvider for MockMac {}
 impl PlatformServices for MockMac {
     fn monotonic_micros(&self) -> u32 {
         self.time_micros

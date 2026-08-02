@@ -200,6 +200,7 @@ impl<P: RadioPhy> SoftMacCore<P> {
     }
 }
 
+impl<P: RadioPhy + PlatformServices> zigbee_crypto::ForwardAesProvider for SoftMacCore<P> {}
 impl<P: RadioPhy + PlatformServices> PlatformServices for SoftMacCore<P> {
     fn monotonic_micros(&self) -> u32 {
         self.phy.monotonic_micros()
@@ -1123,6 +1124,7 @@ mod tests {
         }
     }
 
+    impl zigbee_crypto::ForwardAesProvider for TestPhy {}
     impl PlatformServices for TestPhy {
         fn monotonic_micros(&self) -> u32 {
             123

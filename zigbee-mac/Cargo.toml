@@ -10,6 +10,7 @@ repository = "https://github.com/zigbee-rs/zigbee-rs"
 [dependencies]
 heapless = "0.9"
 zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
+zigbee-crypto = { version = "0.1.0", path = "../zigbee-crypto" }
 tlsr8258-hal = { path = "../tlsr8258-hal", optional = true }
 
 # ── ESP32-C6 backend ────────────────────────────────────────
@@ -83,6 +84,20 @@ tlsr8258 = [
 ]
 # Backward-compatible alias for the former ambiguous feature name.
 telink = ["tlsr8258"]
+
+# Opt-in TLSR8258 hardware AES-128 accelerator backend.
+#
+# Off by default (every platform, including the standard Telink build, uses
+# the software AES core). When enabled the Telink MAC takes ownership of the
+# `tlsr8258_hal::aes::AesEngine` and overrides
+# `ForwardAesProvider::forward_cipher` to hand CCM*/MMO a hardware-backed
+# cipher, which lets dead-code elimination drop the RustCrypto software AES
+# core from the image. NOT validated on silicon yet — do not enable in a
+# shipping image until the hardware gate in the task report is closed.
+hardware-aes = [
+    "tlsr8258",
+    "zigbee-crypto/tlsr8258",
+]
 
 # Telink with HAL crate — requires local tlsr82xx-hal (not available in CI)
 # telink-hal = [

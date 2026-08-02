@@ -92,10 +92,10 @@ With the pinned `tc32-45` toolchain, the current production payloads are:
 
 | Image | Raw payload | Complete-HAL baseline | Reduction | CI budget |
 |---|---:|---:|---:|---:|
-| End-device sensor | 272,148 B | 323,876 B | 51,728 B (16.0%) | 280 KiB |
-| Parent router | 331,852 B | 349,792 B | 17,940 B (5.1%) | 336 KiB |
+| End-device sensor | 272,600 B | 323,876 B | 51,276 B (15.8%) | 280 KiB |
+| Parent router | 332,440 B | 349,792 B | 17,352 B (5.0%) | 336 KiB |
 
-The router is 59,704 bytes larger because it retains route maintenance, child
+The router is 59,840 bytes larger because it retains route maintenance, child
 admission and aging, indirect delivery, parent-side MAC commands,
 Update-Device handling, and Parent Announce. The sensor compiles those paths
 out and retains only its leaf behavior, including the R22 End Device Timeout
@@ -181,7 +181,7 @@ Telink library is linked.
 | PWM | Six channels, normal/count/IR modes, CPU-fed IR FIFO, shadow cycle/duty, typed IRQ status | Basic register path is compile-tested; advanced modes are not silicon-tested |
 | Power management | Suspend/deep-sleep/retention entry, timer/pad/comparator wake-source arming, RC32K calibration, typed wake status | Timer-only suspend is hardware-proven. Pad/comparator wake and comparator front-end behavior remain unvalidated |
 | RNG | AES-128 CTR_DRBG with SHA-256-conditioned VBAT/GND ADC samples, stuck-source rejection, full ADC state restore | NIST DRBG vector passes; physical min-entropy is uncharacterized and still requires SP 800-90B work |
-| AES | Token-owned, bounded AES-128 ECB encrypt/decrypt plus optional `zigbee-crypto` forward-cipher backend | Vendor-protocol/KAT tested, never exercised on silicon; default timeout is unmeasured |
+| AES | Token-owned, bounded AES-128 ECB encrypt/decrypt, wired into NWK/APS CCM* and AES-MMO through the `zigbee-crypto` forward-cipher provider (opt-in `hardware-aes` feature) | Dual startup KAT, secured commissioning, TCLK exchange, ZHA interview, sustained traffic, and reset/resume are hardware-proven on TB-04 |
 
 `tlsr8258_hal::peripherals::Peripherals::take()` returns one
 `SerialController`, plus independent PWM, UART, ADC, AES, and non-`Clone` GPIO
@@ -224,13 +224,118 @@ through the public API.
 
 UART DMA, generic DMA-channel ownership, PWM DMA, complementary PWM outputs,
 USB, audio/PGA, QDEC, EMI/test features, and SWire debug control are not
-modeled. The AES accelerator is also not yet the default Zigbee CCM* path:
-NWK/APS currently call software free functions without carrying a persistent
-cipher object, so `MacCapabilities.hardware_security` remains `false`.
+modeled. The hardware-proven AES accelerator remains an opt-in Zigbee CCM*
+backend (`hardware-aes` feature — see below); software AES is the release
+default. `MacCapabilities.hardware_security` remains `false` because the MAC
+still performs Zigbee security in the Rust stack and exposes only a hardware
+block-cipher provider, not autonomous MAC security offload.
 
 Host tests and TC32 builds cover the complete API. TB-04 exposes no fixed
 I2C/SPI convenience constructor because fitted bus wiring is undocumented;
 applications choose from the validated generic route groups.
+
+## Hardware AES backend (opt-in)
+
+The `hardware-aes` Cargo feature makes the TLSR8258's AES-128 accelerator
+serve every Zigbee CCM* and AES-MMO operation, replacing the RustCrypto
+software core in the image. It is off by default but is now validated on a
+TB-04 parent router. Products must still opt in deliberately and retain the
+separate software-AES recovery image.
+
+### Architecture
+
+- `zigbee_crypto::ForwardAesProvider::forward_cipher(&mut self, key)` returns a
+  keyed forward AES-128 permutation. The software default returns
+  `SoftwareAes128`; `PlatformServices` requires this trait as a supertrait so
+  every backend is a provider.
+- Under `hardware-aes`, `TelinkMac` owns a `tlsr8258_hal::aes::AesEngine`
+  (installed once by the composition root from the board's exclusive `Aes`
+  token via `TelinkMac::install_aes_engine`) and overrides `forward_cipher`
+  to return a `HardwareAes128` borrowing that engine. There is no global
+  mutable alias and no repeated peripheral re-init. Installation runs two
+  back-to-back AES-128 known-answer vectors on the real accelerator before the
+  engine is accepted, including a re-key/reuse cycle required by AES-MMO.
+- NWK/APS security route through `_with<P: ForwardAesProvider>` variants
+  (`encrypt_with`, `decrypt_with`, `derive_*_with`, MMO) passing the owned
+  MAC. Plain non-`_with` wrappers stay software and are host-test only.
+- A hardware AES failure (bounded timeout / handshake error) surfaces as a
+  dropped frame (`BadCcmOutput` / `SecurityFail`), never a silent software
+  fall-back.
+
+### Build
+
+```bash
+# Standard (software AES) image:
+./scripts/tlsr8258.sh build sensor
+# Hardware-AES image (kept separately as *.hardware-aes.bin):
+./scripts/tlsr8258.sh build sensor-hardware-aes
+```
+
+Confirm the software AES core is absent from the hardware-AES image and the
+hardware engine is present:
+
+```bash
+NM=.toolchains/tc32-stage2-tc32-45/llvm/bin/llvm-nm
+ELF=examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor
+"$NM" -C "$ELF" | grep -c 'aes::soft::fixslice'                 # want 0 (present in software image)
+"$NM" -C "$ELF" | grep -c 'HardwareAes128\|AesEngine'           # want > 0
+```
+
+### Footprint (tc32-45, `-Os` `lto=fat`, one codegen unit)
+
+| Image | Software AES | Hardware AES | Δ flash | Δ RAM (`_ebss`) |
+|---|---|---|---|---|
+| Sensor | 272 600 B | 269 940 B | −2 660 B | +8 B |
+| Router | 332 440 B | 327 716 B | −4 724 B | +8 B |
+
+The hardware image removes the ~5 KiB RustCrypto core while adding the
+on-silicon startup KATs; the +8 B RAM is the `AesEngine` handle stored in the
+MAC. Both hardware images pass the TC32 layout/symbol gate (`_ebss` far below
+the stack, image below the `0x74000` security-journal boundary, reusable
+`TelinkMac` linked).
+
+### Hardware validation evidence
+
+The TB-04 parent-router image passed the following channel-15 acceptance run:
+
+- both startup AES-128 known-answer vectors passed on every boot;
+- association, Transport-Key installation, NWK CCM*, APS CCM*, and secured
+  Device Announcement completed;
+- Request-Key, unique-TCLK installation, AES-MMO Verify-Key, and Confirm-Key
+  each succeeded once with no rejection; the Verify-Key frame counter was
+  173,066;
+- Node, Active Endpoint, and Simple Descriptor requests completed, followed
+  by Basic and Identify traffic and ZHA availability;
+- the successful commissioning completed in 2.551 seconds and the capture
+  retained 22,773 packets over 658.874 seconds of secured traffic;
+- a separate reset capture resumed short address `0xBC92` without Beacon
+  Request, Association Request, or Device Announcement, then emitted secured
+  Link Status and relayed secured ZCL traffic for 7,231 captured packets.
+
+The first commissioning attempt exposed a persistence-procedure problem, not
+an AES error. A manually erased journal restarted the outgoing default-TCLK
+counter below the Trust Center's retained replay floor. The captured
+Request-Key ciphertext and MIC exactly matched an independent software CCM*
+calculation. Repeating commissioning with a credential-free journal record
+that retained the previous 173,056 counter bound completed immediately.
+
+### Safe recommissioning procedure
+
+1. Keep both the standard `.bin` recovery image and the separate
+   `.hardware-aes.bin` image.
+2. Back up the two-sector security journal before changing network state.
+3. Remove the device from ZHA and let the running firmware process Leave or
+   factory reset. The runtime clears credentials while preserving outgoing
+   counter bounds.
+4. Do **not** erase `0x74000..0x76000` merely to force a clean join. If raw
+   erasure is unavoidable, seed a valid uncommissioned record with the
+   previous counter bounds for that device identity; never copy old network
+   keys or TCLK credentials into the clean record.
+5. Flash with `./scripts/tlsr8258.sh flash router-hardware-aes`, open permit
+   joining, and confirm the secured join and TCLK exchange with an independent
+   sniffer.
+6. If validation fails, re-flash the standard software image. Both images use
+   the same persistent-state format.
 
 ## Current capability boundary
 

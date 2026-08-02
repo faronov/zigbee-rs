@@ -99,6 +99,7 @@ impl<T: RadioInstance, R: RngInstance> RadioPhy for NrfRadioPhy<'_, T, R> {
     }
 }
 
+impl<T: RadioInstance, R: RngInstance> zigbee_crypto::ForwardAesProvider for NrfRadioPhy<'_, T, R> {}
 impl<T: RadioInstance, R: RngInstance> PlatformServices for NrfRadioPhy<'_, T, R> {
     fn monotonic_micros(&self) -> u32 {
         embassy_time::Instant::now().as_micros() as u32

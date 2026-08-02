@@ -14,8 +14,8 @@ flash offsets are platform-specific.
 
 | Platform and role | Raw payload | Packaged image | CI raw budget |
 |---|---:|---:|---:|
-| TLSR8258 end-device sensor | 272,148 B | — | 280 KiB |
-| TLSR8258 parent router | 331,852 B | — | 336 KiB |
+| TLSR8258 end-device sensor (software AES) | 272,600 B | — | 280 KiB |
+| TLSR8258 parent router (software AES) | 332,440 B | — | 336 KiB |
 | BL702 end-device sensor | 165,058 B | 173,264 B | 192 KiB |
 | nRF52840 end-device sensor | 202,688 B | — | 220 KiB |
 | nRF52840 relay router | 192,704 B | — | — |
@@ -32,10 +32,10 @@ comparison:
 
 | TLSR8258 image | Complete-HAL baseline | Current | Reduction |
 |---|---:|---:|---:|
-| End-device sensor | 323,876 B | 272,148 B | 51,728 B (16.0%) |
-| Parent router | 349,792 B | 331,852 B | 17,940 B (5.1%) |
+| End-device sensor | 323,876 B | 272,600 B | 51,276 B (15.8%) |
+| Parent router | 349,792 B | 332,440 B | 17,352 B (5.0%) |
 
-The current router is 59,704 bytes larger than the sensor because it retains
+The current router is 59,840 bytes larger than the sensor because it retains
 the behavior a real parent needs: route maintenance, child admission and
 aging, indirect delivery, parent-side MAC commands, Update-Device handling,
 and Parent Announce. The sensor instead retains the R22 End Device Timeout
@@ -92,12 +92,18 @@ Oversized ZCL responses are dropped whole rather than truncated into malformed
 frames. Cluster-specific responses have a compile-time proof that their
 64-byte payload plus header fits the 128-byte pending-response buffer.
 
-## Deferred hardware-gated reductions
+## Hardware-gated and opt-in reductions
 
-The software AES implementation still contributes several KiB. TLSR8258 has
-an AES accelerator and a Rust HAL driver, but it will not become the default
-CCM* provider until real-silicon known-answer, secured join, sustained traffic,
-and sleep/resume tests pass.
+The TLSR8258 hardware-AES provider is now proven on a TB-04 router: two
+startup known-answer tests, CCM*, AES-MMO, Request-Key, Verify-Key/Confirm-Key,
+a complete ZHA interview, more than ten minutes of secured traffic, and
+reset/resume all passed under an independent channel-15 capture. The opt-in
+images are 269,940 bytes for the sensor and 327,716 bytes for the router,
+saving 2,660 and 4,724 bytes respectively with 8 additional bytes of RAM.
+
+Software AES remains the release default. The hardware provider is deliberately
+selected per product with `hardware-aes`, fails closed without a software
+fallback, and keeps a separately named recovery image.
 
 Compact TLSR8258 text placement, linker tail merging, and identical-code
 folding are also deferred until hardware soak testing confirms startup,

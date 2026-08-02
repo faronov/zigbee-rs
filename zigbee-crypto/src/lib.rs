@@ -46,15 +46,10 @@ const CCM_AI_FLAGS: u8 = 0x01;
 /// This trait exists so [`ccm_star_encrypt_with`]/[`ccm_star_decrypt_with`]
 /// can be generic over the cipher implementation while
 /// [`ccm_star_encrypt`]/[`ccm_star_decrypt`] (the crate's existing public
-/// API, unchanged) keep defaulting to [`SoftwareAes128`] on every
-/// platform. See the crate's module docs / this repository's task report
-/// for why wiring a hardware-backed implementation all the way through
-/// `zigbee-nwk`/`zigbee-aps`'s own public `encrypt`/`decrypt` call sites is
-/// *not* done here — those crates call the free functions directly with no
-/// persistent cipher object, so doing so would require adding a generic
-/// parameter (or a trait object) to their own public API, rippling to
-/// every platform's `zigbee-runtime` integration. That is an intentional,
-/// documented integration blocker, not an oversight.
+/// API, unchanged) keep defaulting to [`SoftwareAes128`]. Embedded NWK/APS
+/// paths obtain their keyed cipher through [`ForwardAesProvider`], allowing a
+/// platform-owned accelerator to serve CCM* and AES-MMO without changing the
+/// software-only public wrappers.
 pub trait Aes128Forward {
     /// Error type surfaced by [`Self::encrypt_block`]. Software
     /// implementations should use [`core::convert::Infallible`]; hardware
@@ -93,6 +88,68 @@ impl Aes128Forward for SoftwareAes128 {
         Ok(())
     }
 }
+
+/// A source of keyed forward AES-128 permutations.
+///
+/// # Why a *factory*, not a single keyed cipher
+///
+/// Both users of AES in the Zigbee stack want a *fresh* keyed permutation
+/// under a caller-chosen key:
+///
+/// * CCM* (`ccm_star_*`) keys the block cipher once per frame, then reuses
+///   that keyed permutation across every CBC-MAC / CTR block of the frame.
+/// * AES-MMO hashing (`zigbee-aps`'s key derivation) re-keys the block
+///   cipher **every block** — the running hash becomes the next block's
+///   key.
+///
+/// A single keyed [`Aes128Forward`] value cannot express the MMO case, so
+/// the abstraction that both share is "give me a keyed cipher for *this*
+/// key", i.e. this trait. [`forward_cipher`](Self::forward_cipher) is
+/// called once per frame by CCM* and once per block by MMO — the returned
+/// cipher's own [`Aes128Forward::encrypt_block`] (the true hot path) stays
+/// statically dispatched and inlinable, so only the (comparatively rare)
+/// re-key crosses the provider boundary.
+///
+/// # Software default, hardware override
+///
+/// The provided default returns [`SoftwareAes128`] on every platform, so a
+/// backend that says nothing keeps the exact software behaviour this crate
+/// has always had. A platform with an AES accelerator (e.g. the TLSR8258 —
+/// see `tlsr8258::HardwareAes128`) overrides
+/// [`forward_cipher`](Self::forward_cipher) to hand back a hardware-backed
+/// [`Aes128Forward`]; because the override returns a *different* concrete
+/// type, nothing in that platform's image references [`SoftwareAes128`] and
+/// the RustCrypto software core is dead-code-eliminated. No hardware error
+/// is ever silently swallowed: the returned cipher's
+/// [`Aes128Forward::Error`] flows out of `ccm_star_*_with` to the caller,
+/// which must surface it (never fall back to software).
+pub trait ForwardAesProvider {
+    /// Produce a forward AES-128 permutation keyed with `key`.
+    fn forward_cipher(&mut self, key: &AesKey) -> impl Aes128Forward + '_ {
+        SoftwareAes128::new(key)
+    }
+}
+
+/// Zero-sized [`ForwardAesProvider`] that always uses the software AES core.
+///
+/// This is the provider the crate's own software wrappers
+/// ([`ccm_star_encrypt`]/[`ccm_star_decrypt`] and the `zigbee-nwk` /
+/// `zigbee-aps` `*` non-`_with` entry points) pass, and the one host tests
+/// use to exercise the generic provider path without needing a platform
+/// MAC. It carries no state, so constructing one per operation costs
+/// nothing and preserves the "one key expansion per frame" behaviour CCM*
+/// has always had.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SoftwareAesProvider;
+
+impl SoftwareAesProvider {
+    /// Construct the (stateless) software provider.
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl ForwardAesProvider for SoftwareAesProvider {}
 
 /// Encrypt a Zigbee payload with AES-128-CCM* using M=4 and L=2.
 ///
@@ -540,6 +597,118 @@ mod tests {
             ccm_star_decrypt_with(&mut cipher, &nonce, &[], &encrypted)
                 .expect("infallible")
                 .is_none()
+        );
+    }
+
+    /// The [`ForwardAesProvider`] default hands back a cipher that drives
+    /// `ccm_star_*_with` to byte-identical output as the plain
+    /// [`ccm_star_encrypt`] wrapper — this is the seam every platform's
+    /// software path (and the not-`_with` `zigbee-nwk`/`zigbee-aps`
+    /// wrappers) rides on, so pin it against the captured APS golden
+    /// vector.
+    #[test]
+    fn software_provider_matches_plain_wrapper() {
+        let key = [
+            0x4B, 0xAB, 0x0F, 0x17, 0x3E, 0x14, 0x34, 0xA2, 0xD5, 0x72, 0xE1, 0xC1, 0xEF, 0x47,
+            0x87, 0x82,
+        ];
+        let nonce = [
+            0xF2, 0xA6, 0xC9, 0xFE, 0xFF, 0x27, 0x71, 0x84, 0x53, 0x50, 0x0B, 0x00, 0x35,
+        ];
+        let aad = [0x21, 0x95, 0x35, 0x53, 0x50, 0x0B, 0x00];
+        let plaintext = [0x05, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+        let mut provider = SoftwareAesProvider::new();
+        let mut cipher = provider.forward_cipher(&key);
+        let via_provider = match ccm_star_encrypt_with(&mut cipher, &nonce, &aad, &plaintext) {
+            Ok(Some(out)) => out,
+            _ => panic!("software is infallible, valid lengths"),
+        };
+        drop(cipher);
+        let via_wrapper = ccm_star_encrypt(&key, &nonce, &aad, &plaintext).expect("encrypt");
+        assert_eq!(via_provider, via_wrapper);
+
+        // And it round-trips through the provider-driven decrypt too.
+        let mut cipher = provider.forward_cipher(&key);
+        let decrypted = match ccm_star_decrypt_with(&mut cipher, &nonce, &aad, &via_provider) {
+            Ok(Some(out)) => out,
+            _ => panic!("software is infallible, valid MIC"),
+        };
+        assert_eq!(decrypted.as_slice(), plaintext);
+    }
+
+    /// A "hardware-shaped" provider — one whose cipher owns a bounded,
+    /// fallible [`Aes128Forward::Error`] like the real
+    /// [`tlsr8258::HardwareAes128`] — computing the *same* AES math must
+    /// produce the *same* CCM* output as the software provider. This is the
+    /// host stand-in for the on-silicon known-answer equivalence: it proves
+    /// the generic `ccm_star_*_with` plumbing is agnostic to the backend's
+    /// error type, and that a fallible backend's `Err` is surfaced (not
+    /// swallowed) by threading it back out of the outer `Result`.
+    #[test]
+    fn fallible_provider_is_equivalent_and_surfaces_errors() {
+        /// Wraps [`SoftwareAes128`] but reports a non-[`Infallible`] error,
+        /// optionally failing on the Nth block to model a hardware timeout.
+        struct FlakyCipher {
+            inner: SoftwareAes128,
+            fail_at: Option<u32>,
+            calls: u32,
+        }
+        #[derive(Debug, PartialEq)]
+        struct FakeHwError;
+        impl Aes128Forward for FlakyCipher {
+            type Error = FakeHwError;
+            fn encrypt_block(&mut self, block: &mut [u8; 16]) -> Result<(), Self::Error> {
+                self.calls += 1;
+                if self.fail_at == Some(self.calls) {
+                    return Err(FakeHwError);
+                }
+                self.inner.encrypt_block(block).unwrap();
+                Ok(())
+            }
+        }
+        struct FlakyProvider {
+            fail_at: Option<u32>,
+        }
+        impl ForwardAesProvider for FlakyProvider {
+            fn forward_cipher(&mut self, key: &AesKey) -> impl Aes128Forward + '_ {
+                FlakyCipher {
+                    inner: SoftwareAes128::new(key),
+                    fail_at: self.fail_at,
+                    calls: 0,
+                }
+            }
+        }
+
+        let key = [0x33; 16];
+        let nonce = [0x44; CCM_STAR_NONCE_LEN];
+        let aad = [1, 2, 3, 4, 5];
+        let plaintext = b"equivalence-across-backends";
+
+        // Equivalent output to software when the backend does not fail.
+        // (The provider's RPITIT return type erases the concrete `Error`,
+        // so match rather than `.expect`, which would need `Error: Debug`.)
+        let mut good = FlakyProvider { fail_at: None };
+        let mut cipher = good.forward_cipher(&key);
+        let hw = match ccm_star_encrypt_with(&mut cipher, &nonce, &aad, plaintext) {
+            Ok(Some(out)) => out,
+            _ => panic!("no failure requested, valid lengths"),
+        };
+        drop(cipher);
+        let sw = ccm_star_encrypt(&key, &nonce, &aad, plaintext).expect("encrypt");
+        assert_eq!(hw, sw);
+
+        // A backend failure is surfaced as `Err`, never as a silent
+        // success or a software fall-back. Drive the concrete cipher
+        // directly so its `FakeHwError` is nameable here.
+        let mut failing = FlakyCipher {
+            inner: SoftwareAes128::new(&key),
+            fail_at: Some(1),
+            calls: 0,
+        };
+        assert_eq!(
+            ccm_star_encrypt_with(&mut failing, &nonce, &aad, plaintext),
+            Err(FakeHwError)
         );
     }
 }

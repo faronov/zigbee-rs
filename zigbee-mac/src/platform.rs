@@ -2,10 +2,21 @@
 
 use core::cell::Cell;
 
+use zigbee_crypto::ForwardAesProvider;
+
 use crate::MacError;
 
 /// Clock, delay, and entropy services required by the portable stack.
-pub trait PlatformServices {
+///
+/// Every platform is also a [`ForwardAesProvider`]: by default that yields
+/// the software AES core (see [`ForwardAesProvider::forward_cipher`]'s
+/// provided default), so a backend that says nothing keeps the exact
+/// software crypto behaviour. A platform with an AES accelerator overrides
+/// `forward_cipher` — see the Telink MAC's `hardware-aes` implementation —
+/// so `zigbee-nwk`/`zigbee-aps` CCM* and AES-MMO key derivation run on
+/// hardware without any protocol-layer change and without a second,
+/// competing notion of engine ownership.
+pub trait PlatformServices: ForwardAesProvider {
     /// Monotonic time in microseconds, wrapping at `u32::MAX`.
     fn monotonic_micros(&self) -> u32;
 

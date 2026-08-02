@@ -187,6 +187,7 @@ impl RadioPhy for Bl702RadioPhy {
     }
 }
 
+impl zigbee_crypto::ForwardAesProvider for Bl702RadioPhy {}
 impl PlatformServices for Bl702RadioPhy {
     fn monotonic_micros(&self) -> u32 {
         Instant::now().as_micros() as u32
