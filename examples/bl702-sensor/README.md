@@ -39,11 +39,23 @@ The script creates:
 - `target/riscv32imc-unknown-none-elf/release/bl702-sensor.bin`
 - `target/riscv32imc-unknown-none-elf/release/bl702-sensor.flash.bin`
 
-The production raw payload is 165,058 bytes; the packaged flash image is
-173,264 bytes. Production release builds compile `log` records out while
+The production software-AES raw payload is 165,602 bytes; the packaged flash
+image is 173,808 bytes. Production release builds compile `log` records out while
 retaining the direct UART boot markers. The generated flash image contains the
 official 176-byte BL702 boot header, payload hash and CRC, a 32 MHz XTAL clock
 configuration, and the application at flash offset `0x2000`.
+
+For the opt-in SEC_ENG hardware-AES image:
+
+```bash
+BL702_HARDWARE_AES=1 ./build-image.sh
+```
+
+This preserves the standard recovery artifacts and creates
+`bl702-sensor.hardware-aes.bin` plus
+`bl702-sensor.hardware-aes.flash.bin`. The current raw/package sizes are
+161,570 and 169,776 bytes. The backend remains hardware-gated; software AES is
+the release default.
 
 For a release-optimized hardware diagnostic image with the full Zigbee UART
 trace, build with:
@@ -66,6 +78,12 @@ Connect the CH340 USB-serial port, hold BOOT/GPIO28, and run:
 The script auto-detects VID:PID `1A86:7523`, resets the board through RTS,
 programs and verifies the raw image, and requires the tool to print
 `[All Successful]`.
+
+To build and flash the opt-in hardware-AES image instead:
+
+```bash
+BL702_HARDWARE_AES=1 ./flash.sh
+```
 
 Release BOOT, open permit-join on the coordinator, then run:
 

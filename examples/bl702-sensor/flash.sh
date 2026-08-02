@@ -6,7 +6,11 @@ cd "$(dirname "$0")"
 PYTHON="${PYTHON:-python3}"
 BFLB_MCU_TOOL="${BFLB_MCU_TOOL:-bflb-mcu-tool}"
 PORT="${1:-${BL702_PORT:-}}"
-RAW_IMAGE=target/riscv32imc-unknown-none-elf/release/bl702-sensor.bin
+ARTIFACT_INFIX=""
+if [[ "${BL702_HARDWARE_AES:-0}" == "1" ]]; then
+    ARTIFACT_INFIX=".hardware-aes"
+fi
+RAW_IMAGE="target/riscv32imc-unknown-none-elf/release/bl702-sensor${ARTIFACT_INFIX}.bin"
 
 if [[ -z "$PORT" ]]; then
     PORT="$("$PYTHON" - <<'PY'
@@ -66,4 +70,5 @@ if ! grep -Fq '[All Successful]' "$LOG_FILE"; then
     exit 1
 fi
 
-echo "Flash verified. Release BOOT, then run: ./monitor.sh $PORT"
+echo "Flash verified: $RAW_IMAGE"
+echo "Release BOOT, then run: ./monitor.sh $PORT"
