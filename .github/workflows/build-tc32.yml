@@ -100,6 +100,14 @@ jobs:
               echo "$elf contains generic slice sorting" >&2
               exit 1
             fi
+            if "$NM" --demangle "$elf" | grep -q 'aes::soft::fixslice'; then
+              echo "$elf still links the software AES core" >&2
+              exit 1
+            fi
+            if ! "$NM" --demangle "$elf" | grep -Eq 'HardwareAes128|AesEngine'; then
+              echo "$elf is missing the TLSR8258 hardware AES backend" >&2
+              exit 1
+            fi
           done
           # Role split: the sleepy sensor must compile out the parent/router
           # maintenance subgraph (permit-join, routing, MAC parent-command
@@ -142,35 +150,6 @@ jobs:
             ./scripts/tlsr8258.sh build "$mode"
             cp tools/telink-tlsr8258-lab/target/tc32-unknown-none-elf/release/telink-tlsr8258-lab.bin \
               "target/tlsr8258-artifacts/telink-tlsr8258-${mode}.bin"
-          done
-
-      - name: Build hardware AES variants
-        run: |
-          ./scripts/tlsr8258.sh build sensor-hardware-aes
-          cp examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.hardware-aes.bin \
-            target/tlsr8258-artifacts/telink-tlsr8258-sensor.hardware-aes.bin
-          ./scripts/tlsr8258.sh build router-hardware-aes
-          cp examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router.hardware-aes.bin \
-            target/tlsr8258-artifacts/telink-tlsr8258-router.hardware-aes.bin
-          ./tools/firmware-size-report.sh telink-tlsr8258-sensor-hardware-aes \
-            target/tlsr8258-artifacts/telink-tlsr8258-sensor.hardware-aes.bin 286720 \
-            target/tlsr8258-artifacts/telink-tlsr8258-sensor.hardware-aes.size.json
-          ./tools/firmware-size-report.sh telink-tlsr8258-router-hardware-aes \
-            target/tlsr8258-artifacts/telink-tlsr8258-router.hardware-aes.bin 344064 \
-            target/tlsr8258-artifacts/telink-tlsr8258-router.hardware-aes.size.json
-          NM="$TC32_TOOLCHAIN_DIR/llvm/bin/llvm-nm"
-          for elf in \
-            examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor \
-            examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router
-          do
-            if "$NM" --demangle "$elf" | grep -q 'aes::soft::fixslice'; then
-              echo "$elf still links the software AES core" >&2
-              exit 1
-            fi
-            if ! "$NM" --demangle "$elf" | grep -Eq 'HardwareAes128|AesEngine'; then
-              echo "$elf is missing the TLSR8258 hardware AES backend" >&2
-              exit 1
-            fi
           done
 
       - name: Build standalone radio harness

@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
-zigbee-mac = { path = "../../zigbee-mac", features = ["tlsr8258"] }
+zigbee-mac = { path = "../../zigbee-mac", features = ["tlsr8258", "hardware-aes"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
@@ -14,12 +14,6 @@ tlsr8258-hal = { path = "../../tlsr8258-hal" }
 tlsr8258-rt = { path = "../../tlsr8258-rt" }
 tlsr8258-tb04 = { path = "../../boards/tlsr8258-tb04" }
 tlsr8258-tb04-product = { path = "../../products/tlsr8258-tb04" }
-
-[features]
-# Opt-in TLSR8258 hardware AES-128 backend for CCM*/MMO. Off by default
-# (standard software image). NOT hardware-validated yet — see the task
-# report's remaining hardware gate before shipping this variant.
-hardware-aes = ["zigbee-mac/hardware-aes"]
 
 [profile.release]
 opt-level = "s"

@@ -11,7 +11,7 @@ TLSRPGM="${TLSRPGM:-$HOME/TLSRPGM/TlsrPgm.py}"
 TELINK_PORT="${TELINK_PORT:-/dev/cu.usbserial-1410}"
 
 usage() {
-    echo "usage: $0 <check|build|flash> <crate-directory> <binary-name> [hardware-aes]" >&2
+    echo "usage: $0 <check|build|flash> <crate-directory> <binary-name>" >&2
     exit 2
 }
 
@@ -134,23 +134,10 @@ verify_layout() {
         "$rf_dma_start" "$rf_dma_end" "$rf_rx_buf" "$rf_tx_buf" "$rf_ack_tx_buf"
 }
 
-[[ $# -eq 3 || $# -eq 4 ]] || usage
+[[ $# -eq 3 ]] || usage
 command="$1"
 crate_dir="$2"
 binary_name="$3"
-variant="${4:-}"
-
-artifact_suffix=""
-case "$variant" in
-    "")
-        ;;
-    hardware-aes)
-        artifact_suffix=".hardware-aes"
-        ;;
-    *)
-        usage
-        ;;
-esac
 
 if [[ "$crate_dir" != /* ]]; then
     crate_dir="${ROOT_DIR}/${crate_dir}"
@@ -160,29 +147,20 @@ require_file "$CARGO_BIN" "tc32 cargo"
 
 target_dir="${crate_dir}/target/tc32-unknown-none-elf/release"
 elf="${target_dir}/${binary_name}"
-bin="${elf}${artifact_suffix}.bin"
+bin="${elf}.bin"
 
 case "$command" in
     check)
         (
             cd "$crate_dir"
-            if [[ -n "$variant" ]]; then
-                "$CARGO_BIN" check --release --bin "$binary_name" --features "$variant"
-            else
-                "$CARGO_BIN" check --release --bin "$binary_name"
-            fi
+            "$CARGO_BIN" check --release --bin "$binary_name"
         )
         ;;
     build|flash)
         (
             cd "$crate_dir"
-            if [[ -n "$variant" ]]; then
-                "$CARGO_BIN" rustc --release --bin "$binary_name" --features "$variant" -- \
-                    -C lto=fat -C opt-level=s -C codegen-units=1
-            else
-                "$CARGO_BIN" rustc --release --bin "$binary_name" -- \
-                    -C lto=fat -C opt-level=s -C codegen-units=1
-            fi
+            "$CARGO_BIN" rustc --release --bin "$binary_name" -- \
+                -C lto=fat -C opt-level=s -C codegen-units=1
         )
         require_file "$LLVM_OBJCOPY" "llvm-objcopy"
         require_file "$LLVM_NM" "llvm-nm"

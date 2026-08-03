@@ -221,9 +221,8 @@ impl RadioPhy for Bl702RadioPhy {
     }
 }
 
-/// Software AES (the default) when `hardware-aes-bl702` is off — the
-/// standard BL702 image keeps the RustCrypto software core, exactly as
-/// before.
+/// Generic software provider when `hardware-aes-bl702` is off. The production
+/// BL702 sensor always enables the hardware feature.
 #[cfg(not(feature = "hardware-aes-bl702"))]
 impl zigbee_crypto::ForwardAesProvider for Bl702RadioPhy {}
 

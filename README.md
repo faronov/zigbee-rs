@@ -11,8 +11,8 @@ Embassy and other embedded async runtimes.
 
 > **Role-specialized firmware:** sensor builds compile out parent/router
 > maintenance and parent state rather than carrying dormant code. With the
-> pinned `tc32-45` toolchain, the current software-AES TLSR8258 release images
-> are 272,600 bytes for the end-device sensor and 332,440 bytes for the parent
+> pinned `tc32-45` toolchain, the current hardware-AES TLSR8258 release images
+> are 269,960 bytes for the end-device sensor and 327,760 bytes for the parent
 > router.
 > See the [firmware-size report](docs/book/src/advanced/firmware-size.md).
 
@@ -155,11 +155,11 @@ and humidity remain synthetic. Battery reporting now samples the nominal
 internal VBAT/2 GPADC path, with an explicit synthetic fallback if conversion
 fails. The reusable BL702 HAL also provides I2C, SPI, GPIO, PWM, UART, timer,
 eFuse, and XIP flash, but the new sensor/flash paths still need silicon
-validation and application integration. An opt-in `hardware-aes` build
-(`BL702_HARDWARE_AES=1 ./build-image.sh`) routes Zigbee CCM*/AES-MMO through
-the SEC_ENG AES-128 accelerator and drops the software AES core; it is
-compile/build-proven only and not yet silicon-validated, so software AES
-remains the default recovery image.
+validation and application integration. The production image always routes
+Zigbee CCM*/AES-MMO through the token-owned SEC_ENG AES-128 accelerator and
+drops the software AES core. Two startup KATs, periodic radio operation, a
+complete secured ZHA join/TCLK exchange/interview, and encrypted reports are
+hardware-proven; reset/resume remains the final AES-related hardware gate.
 
 ### CC2340 firmware
 
@@ -284,9 +284,9 @@ AES-128 CTR_DRBG seeded from SHA-256-conditioned VBAT/GND ADC observations;
 the DRBG has a NIST known-answer test, but the physical entropy source still
 requires SP 800-90B characterization.
 
-The TLSR8258 AES block has a bounded, token-owned ECB driver and an opt-in,
-silicon-proven `zigbee-crypto` backend serving NWK/APS CCM* and AES-MMO.
-Software AES remains the recovery default. The Telink MAC still reports
+The TLSR8258 AES block has a bounded, token-owned ECB driver and is the
+standard production `zigbee-crypto` backend for NWK/APS CCM* and AES-MMO.
+The Telink MAC still reports
 `hardware_security = false` because the Rust stack performs security itself;
 the accelerator is a block-cipher provider, not autonomous MAC offload.
 

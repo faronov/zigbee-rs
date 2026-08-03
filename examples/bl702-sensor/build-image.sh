@@ -3,34 +3,19 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# Build mode selection (mutually exclusive):
-#   (default)                 standard software-AES production image
-#   BL702_DIAGNOSTIC_LOG=1    diagnostic-logging build (no production profile)
-#   BL702_HARDWARE_AES=1      opt-in SEC_ENG hardware-AES production image
-#
-# The hardware-AES variant is named with a `.hardware-aes` infix so it never
-# overwrites the standard recovery artifacts; the standard `cargo build
-# --release` output remains the default recovery image.
+# Every build uses the hardware-proven SEC_ENG AES backend. Set
+# BL702_DIAGNOSTIC_LOG=1 only to retain the full UART trace.
 TARGET_DIR=target/riscv32imc-unknown-none-elf/release
 ELF="$TARGET_DIR/bl702-sensor"
 
-if [[ "${BL702_DIAGNOSTIC_LOG:-0}" == "1" && "${BL702_HARDWARE_AES:-0}" == "1" ]]; then
-    echo "BL702_DIAGNOSTIC_LOG and BL702_HARDWARE_AES are mutually exclusive" >&2
-    exit 1
-fi
-
-ARTIFACT_INFIX=""
 if [[ "${BL702_DIAGNOSTIC_LOG:-0}" == "1" ]]; then
     cargo build --release --no-default-features --features diagnostic-logging
-elif [[ "${BL702_HARDWARE_AES:-0}" == "1" ]]; then
-    cargo build --release --features hardware-aes
-    ARTIFACT_INFIX=".hardware-aes"
 else
     cargo build --release
 fi
 
-RAW_IMAGE="$ELF$ARTIFACT_INFIX.bin"
-FLASH_IMAGE="$ELF$ARTIFACT_INFIX.flash.bin"
+RAW_IMAGE="$ELF.bin"
+FLASH_IMAGE="$ELF.flash.bin"
 
 OBJCOPY="${OBJCOPY:-$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)}"
 if [[ -z "$OBJCOPY" || ! -x "$OBJCOPY" ]]; then
@@ -39,14 +24,8 @@ if [[ -z "$OBJCOPY" || ! -x "$OBJCOPY" ]]; then
 fi
 "$OBJCOPY" -O binary "$ELF" "$RAW_IMAGE"
 
-BFLB_MCU_TOOL="${BFLB_MCU_TOOL:-bflb-mcu-tool}"
-if ! command -v "$BFLB_MCU_TOOL" >/dev/null 2>&1; then
-    echo "bflb-mcu-tool not found; install version 1.10.0 with pip" >&2
-    exit 1
-fi
-
 # Manual keeps the CPU on the 32 MHz XTAL; the tool default selects 144 MHz.
-"$BFLB_MCU_TOOL" \
+./run-bflb-mcu-tool.sh \
     --chipname=bl702 \
     --xtal=32M \
     --pllclk=Manual \
@@ -66,5 +45,26 @@ if [[ "$MAGIC" != "504e4642" ]]; then
 fi
 
 mv -f firmware.bin "$FLASH_IMAGE"
+
+python3 - "$FLASH_IMAGE" <<'PY'
+from pathlib import Path
+import sys
+
+image = Path(sys.argv[1]).read_bytes()
+if image[:4] != b"BFNP":
+    raise SystemExit("invalid BL702 boot image magic")
+
+# BL702 boot-header clock fields:
+# xtal_type=1 (32 MHz), pll_clk=1 (XTAL), hclk_div=0, bclk_div=0,
+# flash_clk_type=1 (XCLK).
+expected = bytes((1, 1, 0, 0, 1))
+actual = image[0x68:0x6D]
+if actual != expected:
+    raise SystemExit(
+        "invalid BL702 boot clocks at 0x68: "
+        f"expected {expected.hex(' ')}, got {actual.hex(' ')}"
+    )
+PY
+
 echo "Raw image:   $RAW_IMAGE"
 echo "Flash image: $FLASH_IMAGE"

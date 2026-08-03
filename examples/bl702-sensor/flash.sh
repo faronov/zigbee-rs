@@ -4,13 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PYTHON="${PYTHON:-python3}"
-BFLB_MCU_TOOL="${BFLB_MCU_TOOL:-bflb-mcu-tool}"
 PORT="${1:-${BL702_PORT:-}}"
-ARTIFACT_INFIX=""
-if [[ "${BL702_HARDWARE_AES:-0}" == "1" ]]; then
-    ARTIFACT_INFIX=".hardware-aes"
-fi
-RAW_IMAGE="target/riscv32imc-unknown-none-elf/release/bl702-sensor${ARTIFACT_INFIX}.bin"
+RAW_IMAGE="target/riscv32imc-unknown-none-elf/release/bl702-sensor.bin"
 
 if [[ -z "$PORT" ]]; then
     PORT="$("$PYTHON" - <<'PY'
@@ -55,7 +50,7 @@ PY
 LOG_FILE="$(mktemp -t bl702-flash.XXXXXX)"
 trap 'rm -f "$LOG_FILE"' EXIT
 
-"$BFLB_MCU_TOOL" \
+./run-bflb-mcu-tool.sh \
     --chipname=bl702 \
     --interface=uart \
     --port="$PORT" \

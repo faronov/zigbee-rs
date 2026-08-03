@@ -14,9 +14,8 @@ flash offsets are platform-specific.
 
 | Platform and role | Raw payload | Packaged image | CI raw budget |
 |---|---:|---:|---:|
-| TLSR8258 end-device sensor (software AES) | 272,600 B | — | 280 KiB |
-| TLSR8258 parent router (software AES) | 332,440 B | — | 336 KiB |
-| BL702 end-device sensor (software AES) | 165,602 B | 173,808 B | 192 KiB |
+| TLSR8258 end-device sensor (hardware AES) | 269,960 B | — | 280 KiB |
+| TLSR8258 parent router (hardware AES) | 327,760 B | — | 336 KiB |
 | BL702 end-device sensor (hardware AES) | 161,570 B | 169,776 B | 192 KiB |
 | nRF52840 end-device sensor | 202,688 B | — | 220 KiB |
 | nRF52840 relay router | 192,704 B | — | — |
@@ -33,10 +32,10 @@ comparison:
 
 | TLSR8258 image | Complete-HAL baseline | Current | Reduction |
 |---|---:|---:|---:|
-| End-device sensor | 323,876 B | 272,600 B | 51,276 B (15.8%) |
-| Parent router | 349,792 B | 332,440 B | 17,352 B (5.0%) |
+| End-device sensor | 323,876 B | 269,960 B | 53,916 B (16.6%) |
+| Parent router | 349,792 B | 327,760 B | 22,032 B (6.3%) |
 
-The current router is 59,840 bytes larger than the sensor because it retains
+The current router is 57,800 bytes larger than the sensor because it retains
 the behavior a real parent needs: route maintenance, child admission and
 aging, indirect delivery, parent-side MAC commands, Update-Device handling,
 and Parent Announce. The sensor instead retains the R22 End Device Timeout
@@ -87,39 +86,40 @@ CI also checks properties that a successful link alone cannot prove:
   absence from routers/relays;
 - BL702 absence of RV32A instructions and vendor radio symbols;
 - BL702 `_start_rust` placement in XIP flash;
-- BL702 hardware-AES variant rejects the RustCrypto software AES core and
-  requires the SEC_ENG backend, while re-running the RV32A/vendor/XIP gates;
-- TLSR8258 RAM-code, cache, BSS, DMA, and stack layout.
+- BL702 production rejects the RustCrypto software AES core and requires the
+  SEC_ENG backend, while re-running the RV32A/vendor/XIP gates;
+- TLSR8258 RAM-code, cache, BSS, DMA, and stack layout;
+- TLSR8258 production rejects the RustCrypto software AES core and requires
+  the token-owned accelerator backend.
 
 Oversized ZCL responses are dropped whole rather than truncated into malformed
 frames. Cluster-specific responses have a compile-time proof that their
 64-byte payload plus header fits the 128-byte pending-response buffer.
 
-## Hardware-gated and opt-in reductions
+## Hardware AES release policy
 
 The TLSR8258 hardware-AES provider is now proven on a TB-04 router: two
 startup known-answer tests, CCM*, AES-MMO, Request-Key, Verify-Key/Confirm-Key,
 a complete ZHA interview, more than ten minutes of secured traffic, and
-reset/resume all passed under an independent channel-15 capture. The opt-in
-images are 269,940 bytes for the sensor and 327,716 bytes for the router,
-saving 2,660 and 4,724 bytes respectively with 8 additional bytes of RAM.
-
-Software AES remains the release default. The hardware provider is deliberately
-selected per product with `hardware-aes`, fails closed without a software
-fallback, and keeps a separately named recovery image.
+reset/resume all passed under an independent channel-15 capture. The standard
+images are 269,960 bytes for the sensor and 327,760 bytes for the router,
+saving 2,640 and 4,680 bytes respectively over the former software builds with
+8 additional bytes of RAM. Both production manifests install the accelerator
+unconditionally and fail closed without a software fallback.
 
 The BL702 SEC_ENG hardware-AES provider is the first cross-platform follow-up
-to the TLSR8258 work. It is **compile/build-proven only** — it has **not** been
-run on BL702 silicon. Its register contract is transcribed from the
-open-source Bouffalo `bl_iot_sdk` SEC_ENG driver and cross-checked against a
-FIPS-197 known-answer vector, its two startup known-answer tests fail closed,
-and the release image links the SEC_ENG backend while dropping the RustCrypto
-software AES core (CI rejects any `aes::soft::fixslice` symbol and requires the
-`HardwareAes128`/`bl702_hal::aes` backend). In a local nightly build the opt-in
-image measured 161,570 bytes versus 165,602 bytes for the same-toolchain
-software build, saving 4,032 bytes and no additional RAM. On-silicon
-functional and timing validation (including SEC_ENG DMA/SRAM coherency) remains
-an open hardware gate.
+to the TLSR8258 work. Its two startup known-answer tests pass on XT-ZB1
+silicon, followed by periodic radio operation and a complete secured ZHA
+commissioning flow with Transport-Key, descriptors, binding, reporting, Trust
+Center link-key exchange, and encrypted application reports. The standard
+image links SEC_ENG while dropping the RustCrypto software AES core; it
+measures 161,570 bytes versus 165,602 bytes for the former software build,
+saving 4,032 bytes with no additional RAM. Silent reset/resume and a
+cycle-derived timeout bound remain open hardware gates.
+
+The reusable crypto crates retain the software provider for host tests and
+platforms without a proven accelerator. It is not linked into the BL702 or
+TLSR8258 production images.
 
 Compact TLSR8258 text placement, linker tail merging, and identical-code
 folding are also deferred until hardware soak testing confirms startup,

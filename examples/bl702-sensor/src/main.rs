@@ -169,12 +169,6 @@ async fn sensor(_spawner: Spawner, application: hal::ApplicationResources) {
     };
     // Retain ownership of unused application peripherals for the task's
     // lifetime. No physical environmental sensor is assumed on this board.
-    // The AES token is consumed by the hardware-AES backend when that
-    // feature is selected; otherwise it stays parked here and is dropped by
-    // dead-code elimination.
-    #[cfg(not(feature = "hardware-aes"))]
-    let _reserved_peripherals = (i2c0, spi_or_usb, power_control, pwm, uart1, aes, other_pins);
-    #[cfg(feature = "hardware-aes")]
     let _reserved_peripherals = (i2c0, spi_or_usb, power_control, pwm, uart1, other_pins);
 
     let ieee = device_ieee_address();
@@ -190,10 +184,8 @@ async fn sensor(_spawner: Spawner, application: hal::ApplicationResources) {
     }
 
     // Hand the exclusive SEC_ENG AES token to the radio phy so CCM*/AES-MMO
-    // run on the hardware accelerator. Only compiled under `hardware-aes`;
-    // the standard image leaves `aes` parked and uses software AES. The
-    // install runs on-silicon known-answer self-tests and fails closed.
-    #[cfg(feature = "hardware-aes")]
+    // run on the hardware accelerator. Installation runs two on-silicon
+    // known-answer self-tests and fails closed.
     if let Err(error) = radio.install_aes_engine(aes) {
         log::error!("hardware AES self-test failed: {error:?}");
         halt()

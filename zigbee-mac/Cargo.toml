@@ -86,31 +86,31 @@ tlsr8258 = [
 # Backward-compatible alias for the former ambiguous feature name.
 telink = ["tlsr8258"]
 
-# Opt-in TLSR8258 hardware AES-128 accelerator backend.
+# TLSR8258 hardware AES-128 accelerator backend.
 #
-# Off by default (every platform, including the standard Telink build, uses
-# the software AES core). When enabled the Telink MAC takes ownership of the
+# Kept as an explicit low-level feature so non-product test compositions can
+# still choose their provider. The production Telink sensor/router enable it
+# unconditionally. The MAC takes ownership of the
 # `tlsr8258_hal::aes::AesEngine` and overrides
 # `ForwardAesProvider::forward_cipher` to hand CCM*/MMO a hardware-backed
 # cipher, which lets dead-code elimination drop the RustCrypto software AES
-# core from the image. The backend is silicon-proven but remains opt-in while
-# software AES stays available as the conservative recovery/default image.
+# core from the image. The backend is silicon-proven through commissioning,
+# sustained secured traffic, and reset/resume.
 hardware-aes = [
     "tlsr8258",
     "zigbee-crypto/tlsr8258",
 ]
 
-# Opt-in BL702 SEC_ENG hardware AES-128 accelerator backend.
+# BL702 SEC_ENG hardware AES-128 accelerator backend.
 #
-# Off by default (the standard BL702 sensor image uses the software AES
-# core). When enabled the BL702 `SoftMacCore` phy (`Bl702RadioPhy`) takes
+# Kept as a separate low-level feature because it selects different HAL and
+# crypto backends from Telink. The production BL702 sensor enables it
+# unconditionally. `Bl702RadioPhy` takes
 # ownership of the `bl702_hal::aes::AesEngine` and overrides
 # `ForwardAesProvider::forward_cipher` to hand CCM*/MMO a hardware-backed
 # cipher, letting dead-code elimination drop the RustCrypto software AES core
-# from the image. NOT validated on silicon yet — do not enable in a shipping
-# image until the hardware gate in the task report is closed. Kept a
-# separate feature from the Telink `hardware-aes` above because the two
-# select different HAL crates and platform backends.
+# from the image. Startup KATs and full secured ZHA commissioning are
+# silicon-proven; silent reset/resume remains pending.
 hardware-aes-bl702 = [
     "bl702",
     "dep:bl702-hal",

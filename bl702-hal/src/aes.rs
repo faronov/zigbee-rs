@@ -108,17 +108,16 @@
 //! (`SF_CTRL_AES_*`): they do not share registers and are not alternative
 //! owners of the same path.
 //!
-//! # Hardware validation caveat
+//! # Hardware validation
 //!
-//! This module has **not** been exercised against real BL702 silicon. The
-//! register contract is transcribed from open-source vendor drivers and the
-//! byte/endianness mapping is cross-checked against a published FIPS-197
-//! known-answer vector, but the on-chip DMA timing, any cache-coherency
-//! requirement on the `MSA`/`MDA` SRAM buffers, and
-//! [`AesEngine::DEFAULT_TIMEOUT_ITERATIONS`] (a conservative placeholder,
-//! not a measured bound) all still require bench validation. Because
-//! [`AesEngine::self_test`] fails closed, a wrong assumption here rejects
-//! the engine rather than corrupting Zigbee security.
+//! Both startup known-answer vectors pass on XT-ZB1 silicon. The same engine
+//! then completed NWK/APS CCM*, AES-MMO Trust Center link-key derivation, a
+//! full secured ZHA interview, and encrypted reports under an independent
+//! channel-15 capture. [`AesEngine::DEFAULT_TIMEOUT_ITERATIONS`] remains a
+//! conservative, non-cycle-measured bound, and silent reset/resume still
+//! requires a dedicated acceptance capture. [`AesEngine::self_test`] fails
+//! closed, so a startup mismatch rejects the engine rather than corrupting
+//! Zigbee security.
 //!
 //! # No DMA-link, no CBC/CTR
 //!

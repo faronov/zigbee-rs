@@ -7,15 +7,11 @@ mode="${2:-sensor}"
 
 usage() {
     cat >&2 <<'EOF'
-usage: scripts/tlsr8258.sh <check|build|flash> [sensor|router|sensor-hardware-aes|router-hardware-aes|diag-assoc|diag-beacon|diag-smoke|diag-pm|lab-sensor]
+usage: scripts/tlsr8258.sh <check|build|flash> [sensor|router|diag-assoc|diag-beacon|diag-smoke|diag-pm|lab-sensor]
 
 Production firmware:
-  sensor       polling end-device sensor
-  router       always-on join/relay router
-  sensor-hardware-aes
-               sensor with the opt-in TLSR8258 AES accelerator backend
-  router-hardware-aes
-               router with the opt-in TLSR8258 AES accelerator backend
+  sensor       polling end-device sensor with hardware AES
+  router       always-on join/relay router with hardware AES
 
 Hardware lab:
   diag-assoc   association and MAC stress
@@ -39,14 +35,6 @@ case "$action:$mode" in
     check:runtime-router|build:runtime-router|flash:runtime-router)
         exec "$ROOT_DIR/tools/tlsr8258-firmware.sh" "$action" \
             examples/telink-tlsr8258-router telink-tlsr8258-router
-        ;;
-    check:sensor-hardware-aes|build:sensor-hardware-aes|flash:sensor-hardware-aes)
-        exec "$ROOT_DIR/tools/tlsr8258-firmware.sh" "$action" \
-            examples/telink-tlsr8258-sensor telink-tlsr8258-sensor hardware-aes
-        ;;
-    check:router-hardware-aes|build:router-hardware-aes|flash:router-hardware-aes)
-        exec "$ROOT_DIR/tools/tlsr8258-firmware.sh" "$action" \
-            examples/telink-tlsr8258-router telink-tlsr8258-router hardware-aes
         ;;
     check:lab-sensor|build:lab-sensor|flash:lab-sensor)
         exec "$ROOT_DIR/tools/telink-tlsr8258-lab/scripts/tlsr8258.sh" "$action" sensor

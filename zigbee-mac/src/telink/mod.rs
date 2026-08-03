@@ -2039,8 +2039,8 @@ mod imp {
         }
     }
 
-    /// Software AES (the default) when `hardware-aes` is off — the standard
-    /// Telink image keeps the RustCrypto software core, exactly as before.
+    /// Generic software provider when `hardware-aes` is off. The production
+    /// Telink sensor and router always enable the hardware feature.
     #[cfg(not(feature = "hardware-aes"))]
     impl zigbee_crypto::ForwardAesProvider for TelinkMac {}
 

@@ -155,9 +155,9 @@
 //! commissioning, Request-Key/Verify-Key/Confirm-Key, sustained traffic, and
 //! reset/resume all passed on a TB-04 router under an independent channel-15
 //! capture. [`AesEngine::DEFAULT_TIMEOUT_ITERATIONS`] remains a conservative
-//! bound rather than a cycle-measured timing guarantee, so the hardware
-//! backend stays opt-in and a separately named software-AES recovery image is
-//! retained.
+//! bound rather than a cycle-measured timing guarantee. The production
+//! TLSR8258 sensor and router nevertheless use this fail-closed backend
+//! unconditionally after the completed hardware acceptance run.
 //!
 //! # No DMA
 //!
