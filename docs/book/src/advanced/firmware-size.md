@@ -20,7 +20,7 @@ flash offsets are platform-specific.
 | nRF52840 end-device sensor | 202,688 B | — | 220 KiB |
 | nRF52840 relay router | 192,704 B | — | — |
 | nRF52833 end-device sensor | 125,544 B | — | — |
-| EFR32MG1 end-device sensor | 131,776 B | — | 160 KiB |
+| EFR32MG1 end-device sensor (hardware AES + OTA) | 137,532 B | — | 160 KiB |
 
 These are not benchmark-equivalent applications. Radio implementations,
 linker layouts, executor overhead, enabled peripherals, and application
@@ -91,6 +91,9 @@ CI also checks properties that a successful link alone cannot prove:
 - TLSR8258 RAM-code, cache, BSS, DMA, and stack layout;
 - TLSR8258 production rejects the RustCrypto software AES core and requires
   the token-owned accelerator backend.
+- EFR32MG1 production rejects the RustCrypto software AES core, requires the
+  CRYPTO backend, checks BUFC allocation geometry, and requires at least
+  16 KiB of linked stack.
 
 Oversized ZCL responses are dropped whole rather than truncated into malformed
 frames. Cluster-specific responses have a compile-time proof that their
@@ -117,9 +120,15 @@ measures 161,570 bytes versus 165,602 bytes for the former software build,
 saving 4,032 bytes with no additional RAM. Silent reset/resume and a
 cycle-derived timeout bound remain open hardware gates.
 
+The EFR32MG1 CRYPTO provider is also production-default. Two startup KATs,
+NWK/APS CCM*, Trust Center link-key derivation, full ZHA commissioning and
+interview, encrypted reporting, EM2 operation, and silent reset/resume passed
+on the TRÅDFRI target. The final factory-EUI image is 137,532 bytes with OTA
+enabled. Hardware failures stop startup; software AES is not linked.
+
 The reusable crypto crates retain the software provider for host tests and
 platforms without a proven accelerator. It is not linked into the BL702 or
-TLSR8258 production images.
+TLSR8258 or EFR32MG1 production images.
 
 Compact TLSR8258 text placement, linker tail merging, and identical-code
 folding are also deferred until hardware soak testing confirms startup,

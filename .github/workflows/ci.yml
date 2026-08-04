@@ -494,7 +494,6 @@ jobs:
   build-efr32mg1:
     name: Build EFR32MG1 sensor
     runs-on: ubuntu-latest
-    continue-on-error: true  # needs GSDK + arm-none-eabi-gcc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -519,8 +518,17 @@ jobs:
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
           ./tools/firmware-size-report.sh efr32mg1-sensor ${ELF}.bin 163840 ${ELF}.size.json
+          NM="$NM" examples/efr32mg1-sensor/check-layout.sh "$ELF"
           if "$NM" --demangle "$ELF" | grep -q 'core::slice::sort'; then
             echo "EFR32MG1 image contains generic slice sorting" >&2
+            exit 1
+          fi
+          if "$NM" --demangle "$ELF" | grep -q 'aes::soft::fixslice'; then
+            echo "EFR32MG1 production image still links the software AES core" >&2
+            exit 1
+          fi
+          if ! "$NM" --demangle "$ELF" | grep -Eq 'HardwareAes128|efr32mg1_hal::crypto'; then
+            echo "EFR32MG1 production image is missing the CRYPTO AES backend" >&2
             exit 1
           fi
           # The sensor must compile out the parent/router maintenance subgraph.

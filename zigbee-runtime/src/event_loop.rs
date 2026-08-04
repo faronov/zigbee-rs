@@ -63,7 +63,7 @@ fn automatic_poll_due(
 /// `CAN_ROUTE` split) so the large `TickResult` is built straight into the
 /// caller instead of copied back through an extra call frame.
 #[inline]
-fn sleep_decision_to_tick(decision: crate::power::SleepDecision) -> TickResult {
+pub(crate) fn sleep_decision_to_tick(decision: crate::power::SleepDecision) -> TickResult {
     match decision {
         crate::power::SleepDecision::StayAwake => TickResult::Idle,
         crate::power::SleepDecision::LightSleep(ms) => TickResult::RunAgain(ms),
@@ -97,6 +97,8 @@ pub enum StackEvent {
         /// Local endpoint that received the command.
         endpoint: u8,
         cluster_id: u16,
+        /// Whether this is a ZCL foundation or cluster-specific command.
+        frame_type: zigbee_zcl::frame::ZclFrameType,
         command_id: u8,
         /// ZCL sequence number (needed for response frames).
         seq_number: u8,
@@ -269,26 +271,6 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
         }
     }
 
-    pub(crate) async fn tick_without_secure_rejoin(
-        &mut self,
-        elapsed_secs: u16,
-        clusters: &mut [crate::ClusterRef<'_>],
-    ) -> TickResult {
-        // Phase 1: Handle pending user actions
-        if let Some(action) = self.pending_action.take() {
-            return self.handle_action(action).await;
-        }
-
-        self.flush_pending_responses().await;
-
-        // Phase 3: Only do reporting/maintenance if joined
-        if !self.is_joined() {
-            return TickResult::Idle;
-        }
-
-        self.tick_joined(elapsed_secs, clusters).await
-    }
-
     async fn retry_secure_rejoin(&mut self) -> TickResult {
         log::info!("[Runtime] Retrying secure rejoin");
         match self.secure_rejoin().await {
@@ -302,7 +284,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
     }
 
     #[inline(never)]
-    async fn flush_pending_responses(&mut self) {
+    pub(crate) async fn flush_pending_responses(&mut self) {
         while let Some(resp) = self.pending_responses.pop() {
             rt_trace!(
                 "[RT] zcl_tx dst=0x{:04X} src_ep={} dst_ep={} cluster=0x{:04X} len={}",
@@ -351,42 +333,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
     }
 
     #[inline(never)]
-    async fn tick_joined(
-        &mut self,
-        elapsed_secs: u16,
-        clusters: &mut [crate::ClusterRef<'_>],
-    ) -> TickResult {
-        self.run_aps_maintenance().await;
-        self.run_nwk_maintenance(elapsed_secs).await;
-        R::ed_advance_timers(self, elapsed_secs);
-
-        self.reporting.tick(elapsed_secs);
-        self.apply_fb_target_request(clusters);
-        self.run_finding_binding_tick(elapsed_secs).await;
-        self.send_due_reports(clusters).await;
-        self.update_pending_tx_flag();
-
-        let now_ms = self.advance_power_clock(elapsed_secs);
-        // The poll runs first so an End Device Timeout Response that arrives
-        // this tick cancels the response wait before it is serviced.
-        let poll_event = self.run_sleepy_poll(now_ms, clusters).await;
-        R::ed_service(self).await;
-        if let Some(event) = poll_event {
-            return TickResult::Event(event);
-        }
-        // A routing role keeps the sleep decision behind an out-of-line call to
-        // contain its large joined-tick future; a sleepy end device inlines it
-        // (compile-time `CAN_ROUTE` split) so the large `TickResult` is built
-        // straight into the caller instead of copied back through a call frame.
-        if R::CAN_ROUTE {
-            self.tick_power_state(now_ms)
-        } else {
-            sleep_decision_to_tick(self.power.decide(now_ms))
-        }
-    }
-
-    #[inline(never)]
-    async fn run_aps_maintenance(&mut self) {
+    pub(crate) async fn run_aps_maintenance(&mut self) {
         let aps = self.bdb.zdo_mut().aps_mut();
         let retransmit_frames = aps.age_ack_table();
         for frame in retransmit_frames.iter() {
@@ -416,7 +363,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
     /// bodies are additionally gated on the `router` capability feature, so a
     /// sensor build removes them from the image entirely.
     #[inline(never)]
-    async fn run_nwk_maintenance(&mut self, elapsed_secs: u16) {
+    pub(crate) async fn run_nwk_maintenance(&mut self, elapsed_secs: u16) {
         R::run_role_nwk_maintenance(self, elapsed_secs).await;
     }
 
@@ -496,7 +443,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
     }
 
     #[inline(never)]
-    fn apply_fb_target_request(&mut self, clusters: &mut [crate::ClusterRef<'_>]) {
+    pub(crate) fn apply_fb_target_request(&mut self, clusters: &mut [crate::ClusterRef<'_>]) {
         if let Some((ep, time_secs)) = self.bdb.fb_target_request.take()
             && self
                 .with_cluster_mut(ep, zigbee_zcl::ClusterId::IDENTIFY, clusters, |cluster| {
@@ -516,12 +463,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
     }
 
     #[inline(never)]
-    async fn run_finding_binding_tick(&mut self, elapsed_secs: u16) {
+    pub(crate) async fn run_finding_binding_tick(&mut self, elapsed_secs: u16) {
         let _ = self.bdb.tick_finding_binding(elapsed_secs).await;
     }
 
     #[inline(never)]
-    async fn send_due_reports(&mut self, clusters: &[crate::ClusterRef<'_>]) {
+    pub(crate) async fn send_due_reports(&mut self, clusters: &[crate::ClusterRef<'_>]) {
         for cr in clusters.iter() {
             let ep = cr.endpoint;
             let cid = cr.cluster.cluster_id().0;
@@ -530,18 +477,18 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
         }
     }
 
-    fn update_pending_tx_flag(&mut self) {
+    pub(crate) fn update_pending_tx_flag(&mut self) {
         self.power
             .set_pending_tx(!self.pending_responses.is_empty());
     }
 
-    fn advance_power_clock(&mut self, elapsed_secs: u16) -> u32 {
+    pub(crate) fn advance_power_clock(&mut self, elapsed_secs: u16) -> u32 {
         self.power_now_ms = advance_millis(self.power_now_ms, elapsed_secs);
         self.power_now_ms
     }
 
     #[inline(never)]
-    async fn run_sleepy_poll(
+    pub(crate) async fn run_sleepy_poll(
         &mut self,
         now_ms: u32,
         clusters: &mut [crate::ClusterRef<'_>],
@@ -587,13 +534,13 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
     /// lets the large `TickResult` be constructed directly into the caller
     /// rather than copied back through an extra call frame.
     #[inline(never)]
-    fn tick_power_state(&mut self, now_ms: u32) -> TickResult {
+    pub(crate) fn tick_power_state(&mut self, now_ms: u32) -> TickResult {
         sleep_decision_to_tick(self.power.decide(now_ms))
     }
 
     /// Handle a user-initiated action.
     #[inline(never)]
-    async fn handle_action(&mut self, action: UserAction) -> TickResult {
+    pub(crate) async fn handle_action(&mut self, action: UserAction) -> TickResult {
         match action {
             UserAction::Join => {
                 if self.secure_rejoin_pending() {

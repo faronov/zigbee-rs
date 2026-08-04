@@ -14,6 +14,10 @@ name = "efr32mg1-diag-em2"
 path = "src/bin/diag_em2.rs"
 
 [[bin]]
+name = "efr32mg1-diag-crypto"
+path = "src/bin/diag_crypto.rs"
+
+[[bin]]
 name = "efr32mg1-diag-rtcc-time"
 path = "src/bin/diag_rtcc_time.rs"
 
@@ -56,7 +60,7 @@ path = "src/bin/diag_ota_install.rs"
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-bdb = { path = "../../zigbee-bdb" }
-zigbee-mac = { path = "../../zigbee-mac", features = ["efr32", "efr32-trace"] }
+zigbee-mac = { path = "../../zigbee-mac", features = ["efr32-trace", "hardware-aes-efr32mg1"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }

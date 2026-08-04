@@ -436,7 +436,15 @@ static DEVICE: StaticCell<ZigbeeDevice<Efr32Mac>> = StaticCell::new();
 static APP: StaticCell<JoinApp> = StaticCell::new();
 
 fn build_app() -> &'static mut JoinApp {
-    let mac = Efr32Mac::new();
+    let chip = efr32mg1_hal::peripherals::Peripherals::take().unwrap_or_else(|| {
+        rtt_target::rprintln!("[EFR32][join] PERIPHERALS_TAKEN");
+        platform::halt()
+    });
+    let mut mac = Efr32Mac::new();
+    mac.install_aes_engine(chip.crypto).unwrap_or_else(|error| {
+        rtt_target::rprintln!("[EFR32][join] AES_KAT_FAIL error={:?}", error);
+        platform::halt()
+    });
     let mut ieee = mac.extended_address();
     let eui_variant = unsafe { core::ptr::read_volatile(&JOIN_EUI_VARIANT) };
     ieee[0] ^= 0x01;

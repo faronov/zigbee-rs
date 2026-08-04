@@ -186,17 +186,23 @@ zigbee-mac/src/
 
 ```toml
 # Series 1 (MG1P)
-zigbee-mac = { features = ["efr32"] }
+zigbee-mac = { features = ["efr32", "hardware-aes-efr32mg1"] }
 
 # Series 2 (MG21)
 zigbee-mac = { features = ["efr32s2"] }
 ```
 
+The production MG1 sensor always installs the token-owned CRYPTO accelerator.
+Two different AES-128 known-answer tests run before Zigbee security starts,
+and failures stop startup rather than falling back to software AES.
+
 ## Power Management
 
 Both EFR32 platforms implement radio sleep/wake via the **CMU (Clock
 Management Unit)**. The hardware-proven MG1P SED additionally uses an
-RTCC/LFRCO time driver and enters EM2 between parent polls:
+RTCC/LFRCO time driver and enters EM2 between parent polls. Arming RTCC CC1,
+clearing stale compare state, and entering EM2 happen in one interrupt-masked
+sequence so a wake event cannot be lost between the final check and sleep:
 
 ```rust
 device.mac_mut().radio_sleep();
@@ -219,6 +225,7 @@ Both `efr32mg1-sensor` and `efr32mg21-sensor` implement a Zigbee 3.0
 temperature & humidity end device with:
 
 - **Pure-Rust IEEE 802.15.4 radio driver** (no RAIL/GSDK)
+- MG1 CRYPTO-backed AES-128 for NWK/APS CCM* and Trust Center key derivation
 - Embassy async runtime (RTCC/LFRCO on MG1P; SysTick on MG21)
 - Proper interrupt vector table (34 IRQs for MG1P, 51 for MG21)
 - MG1P PB13 interrupt wake from EM2; short press samples sensors and a
@@ -229,6 +236,29 @@ temperature & humidity end device with:
 - Flash NV storage — network state persists across reboots
 - Default reporting with reportable change thresholds
 - MG1P RTCC/EM2 sleepy polling; radio sleep/wake on both series
+- MG1 Gecko Bootloader OTA client, including server-to-client foundation
+  attribute reads used by ZHA during interview
+
+## EFR32MG1 Hardware Acceptance
+
+The production MG1 image has completed the full end-device path against Home
+Assistant ZHA/Ember on channel 15:
+
+- two startup hardware-AES KATs, association, Transport-Key, Device Announce,
+  End Device Timeout, Request-Key, Verify-Key, and Confirm-Key;
+- Node, Active Endpoint, Simple, Power, Basic, Identify, measurement, and OTA
+  descriptor/attribute interview;
+- Configure Reporting, encrypted temperature/humidity/battery reports, and
+  Identify commands;
+- RTCC/LFRCO polling with EM2 sleep and PB13 interrupt wake;
+- crash-safe security-counter reservation and reset/resume without Beacon
+  Request, Association Request, Rejoin Request, or Device Announce.
+
+The BUFC RX ring is a 512-byte, word-aligned allocation. TX uses 128 bytes
+and RX metadata uses 64 bytes. A linked-ELF gate checks these geometry
+constraints and requires at least 16 KiB of stack. The accepted runtime image
+retained 4,832 bytes of measured stack margin after
+commissioning, interview, reporting, EM2, reset/resume, and Identify traffic.
 
 ## Troubleshooting
 
@@ -243,12 +273,14 @@ temperature & humidity end device with:
 ### Known Limitations
 
 - **Series 1 status** — the EFR32MG1P path is hardware-proven through
-  commissioning, ZHA interview, real SHT3x reporting, reset resume, and secure
-  rejoin, plus RTCC/EM2 polling and PB13 interrupt wake. Hardware reset cycles
-  also proved the two-sector security-journal rollover with monotonic counter
-  reservations and no invalid records. The TRÅDFRI linker preserves the
-  resident bootloader and native NVM3 while reserving separate Rust
-  security-journal and application-NV regions.
+  hardware-AES commissioning, complete ZHA interview including the OTA client,
+  real SHT3x reporting, Identify, silent reset/resume, secure rejoin, RTCC/EM2
+  polling, and PB13 interrupt wake. Hardware reset cycles also proved the
+  two-sector security-journal rollover with monotonic counter reservations and
+  no invalid records. The TRÅDFRI linker preserves the resident bootloader and
+  native NVM3 while reserving separate Rust security-journal and application-NV
+  regions. Installing a real OTA image and booting the upgraded application is
+  still pending.
 - **Series 2 status** — the EFR32MG21 pure-Rust radio initialization remains
   hardware-unverified.
 - **Board-specific sensing** — the proven TRÅDFRI MG1 target reads a real SHT3x

@@ -425,7 +425,9 @@ const BUFC_IFC: u32 = BUFC_BASE + 0x0E8;
 /// Our earlier pure-Rust bring-up only configured BUF0/BUF1 and left BUF2
 /// disabled, which matches the observed "TX works, RX never lands in BUFC"
 /// failure mode. These control values are taken from a runtime capture of the
-/// working EFR32MG1 GSDK firmware during active scan.
+/// working EFR32MG1 GSDK firmware during active scan. Series-1 RAIL encodes
+/// the FIFO capacity as `1 << (CTRL + 6)`, giving 128 bytes for BUF0,
+/// 512 bytes for BUF1, and 64 bytes for BUF2.
 const BUFC_BUF0_CTRL_GSDK: u32 = 0x0000_0001;
 const BUFC_BUF1_CTRL_GSDK: u32 = 0x0000_0003;
 const BUFC_BUF2_CTRL_GSDK: u32 = 0x0000_0000;
@@ -463,16 +465,14 @@ const PROTIMER_IEN: u32 = PROTIMER_BASE + 0x068;
 
 // ── Static RAM buffers for BUFC DMA ─────────────────────────────
 
-/// Word-aligned buffer wrapper for BUFC DMA.
-/// BUFC requires buffer addresses to be word-aligned (4 bytes).
-/// Rust `[u8; N]` has alignment 1, which is insufficient.
+/// BUFC FIFO storage must remain word-aligned while the radio is active.
 #[repr(C, align(4))]
 struct AlignedBuf<const N: usize>([u8; N]);
 
 /// TX RAM buffer pointed to by BUFC BUF0_ADDR.
 static BUFC_TX_RAM: SyncUnsafeCell<AlignedBuf<128>> = SyncUnsafeCell::new(AlignedBuf([0u8; 128]));
 /// RX RAM buffer pointed to by BUFC BUF1_ADDR.
-static BUFC_RX_RAM: SyncUnsafeCell<AlignedBuf<256>> = SyncUnsafeCell::new(AlignedBuf([0u8; 256]));
+static BUFC_RX_RAM: SyncUnsafeCell<AlignedBuf<512>> = SyncUnsafeCell::new(AlignedBuf([0u8; 512]));
 /// RX packet-queue / metadata buffer pointed to by BUFC BUF2_ADDR.
 static BUFC_RX_META_RAM: SyncUnsafeCell<AlignedBuf<64>> =
     SyncUnsafeCell::new(AlignedBuf([0u8; 64]));
@@ -2460,4 +2460,24 @@ fn rssi_to_lqi(rssi: i8) -> u8 {
     // Simple linear mapping: -100 dBm → 0, -20 dBm → 255
     let clamped = (rssi as i16).clamp(-100, -20);
     (((clamped + 100) as u16) * 255 / 80) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::{align_of, size_of};
+
+    #[test]
+    fn bufc_backing_rings_match_hardware_geometry() {
+        assert_eq!(size_of::<AlignedBuf<64>>(), 64);
+        assert_eq!(size_of::<AlignedBuf<128>>(), 128);
+        assert_eq!(size_of::<AlignedBuf<512>>(), 512);
+        assert_eq!(align_of::<AlignedBuf<64>>(), 4);
+        assert_eq!(align_of::<AlignedBuf<128>>(), 4);
+        assert_eq!(align_of::<AlignedBuf<512>>(), 4);
+
+        assert_eq!(BUFC_RX_META_RAM.get() as usize % 4, 0);
+        assert_eq!(BUFC_TX_RAM.get() as usize % 4, 0);
+        assert_eq!(BUFC_RX_RAM.get() as usize % 4, 0);
+    }
 }

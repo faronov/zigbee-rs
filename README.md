@@ -267,7 +267,7 @@ The TLSR8258 radio driver uses pure-Rust register access — no `libdrivers_8258
 |----------|----------------------|---------------------|
 | **BL702** | GPIO, I2C0, SPI0, GPADC/VBAT, PWM, UART0/1, timer, eFuse, XIP flash | UART, timer, eFuse, and radio paths hardware-proven; new GPIO/I2C/SPI/ADC/PWM/flash paths host-tested and RV32IMC-compiled, not yet silicon-tested |
 | **TLSR8258** | GPIO/edge capture, I2C, SPI, UART, ADC, PWM/IR, flash, timers/watchdog, IRQ/reset/clock, suspend/wake, RNG, AES-128 | Radio, GPIO, flash, timer-wake suspend, and deployed persistence paths have hardware evidence. UART, I2C/SPI, advanced PWM/capture, pad/comparator wake, RNG entropy quality, and AES remain silicon-validation gates |
-| **EFR32MG1** | GPIO, I2C, SPI, ADC, PWM, flash, RTCC, bootloader storage | Board peripheral paths hardware-proven except the limitations called out below |
+| **EFR32MG1** | GPIO, I2C, SPI, ADC, PWM, flash, RTCC/EM2, CRYPTO AES, bootloader storage | Production sensor path hardware-proven through commissioning, interview, reporting, Identify, and silent reset/resume |
 
 BL702 and TLSR8258 stateful bus/PWM constructors consume unique peripheral
 tokens. TLSR8258 I2C and SPI intentionally consume the same serial-controller
@@ -303,7 +303,7 @@ the accelerator is a block-cipher provider, not autonomous MAC offload.
 | **CC2340** | 🦀 Rust host + TI microcode | `thumbv6m-none-eabi` | Raw polling TX/RX implemented; hardware validation, CCA, IRQs, filtering, and auto-ACK pending |
 | **Telink TLSR8258** | 🦀 **Pure Rust** | `tc32-unknown-none-elf` | Real tc32 builds in the dedicated [modern-tc32](https://github.com/modern-tc32) CI workflow |
 | **PHY6222** | 🦀 **Pure Rust** | `thumbv6m-none-eabi` | Zero vendor blobs — direct register access! |
-| **EFR32MG1** | 🦀 **Pure Rust** | `thumbv7em-none-eabi` | Series 1, Cortex-M4F — hardware-proven direct register access |
+| **EFR32MG1** | 🦀 **Pure Rust** | `thumbv7em-none-eabi` | Series 1, Cortex-M4F — hardware-proven direct radio, CRYPTO AES, and RTCC/EM2 |
 | **EFR32MG21** | 🦀 **Pure Rust** | `thumbv8m.main-none-eabihf` | Series 2, Cortex-M33 — independent `efr32s2` module |
 
 > **Legend:** ✅ = functional radio driver · ⚡ = compile-only scaffold · 🦀 = Rust host driver. BL702 is hardware-tested on XT-ZB1; CC2340 still embeds official TI radio microcode as data.
@@ -441,7 +441,7 @@ The following hardware has been tested end-to-end with **Home Assistant + ZHA**:
 | **ESP32-H2-DevKitM-1** | ZHA (via zigpy) | ✅ Current refactor verified | Legacy NV migrated atomically to the security journal; reset/resume, reporting, TSENS, interview, and Identify verified on hardware. OTA absent. |
 | **BL702 XT-ZB1** | Home Assistant ZHA / Ember | ✅ End-device path verified | Pure-Rust RF calibration, join, TCLK exchange, interview, Identify, and reporting; temperature/humidity currently synthetic |
 | **TLSR8258** | Home Assistant ZHA / Ember | ✅ End-device and router paths verified | Join, TCLK exchange, interview, reporting, routed-frame relay, silent reset resume, and crash-safe counter persistence. Parent/child traffic has been exercised, but clean first-attempt sleepy-child commissioning with the corrected child image remains the release gate |
-| **EFR32MG1P TRÅDFRI** | Home Assistant ZHA / Ember | ✅ End-device path verified | Pure-Rust radio, SHT3x reporting, crash-safe journal rollover, reset resume, and secure rejoin |
+| **EFR32MG1P TRÅDFRI** | Home Assistant ZHA / Ember | ✅ End-device path verified | Pure-Rust radio, hardware AES, full interview including OTA attributes, SHT3x/battery reporting, EM2, crash-safe persistence, Identify, and silent reset/resume |
 
 All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling** (auto-erase NV + rejoin), and **default reporting configuration** (so devices report data even before the coordinator sends ConfigureReporting).
 
@@ -465,7 +465,7 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
   tables remain RAM-only across reboot. Real tc32 firmware requires the
   [modern-tc32](https://github.com/modern-tc32) toolchain.
 - **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence; temp/humidity sensors are simulated (battery ADC is real); comprehensive power management is implemented (two-tier sleep with AON system sleep ~3 µA, radio sleep/wake, flash deep power-down, GPIO leak prevention)
-- **EFR32MG1** is hardware-proven for an always-on end device, but EM2 sleep, wake-time radio restoration, battery ADC, and long-duration stability remain.
+- **EFR32MG1** is hardware-proven for hardware-AES commissioning, complete ZHA interview, SHT3x/battery reporting, RTCC/EM2, PB13 wake, and silent reset/resume. Downloading, activating, and booting a real Gecko Bootloader OTA upgrade remains pending.
 - **EFR32MG21** still uses an unverified pure-Rust radio initialization path and needs independent hardware validation.
 - **Test coverage** is basic — the mock examples exercise more than the test crate
 - **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal

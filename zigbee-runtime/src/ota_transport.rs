@@ -39,6 +39,7 @@ use zigbee_mac::MacDriver;
 use zigbee_types::ShortAddress;
 use zigbee_zcl::ClusterId;
 use zigbee_zcl::clusters::ota::{CMD_IMAGE_NOTIFY, OtaState};
+use zigbee_zcl::frame::ZclFrameType;
 
 /// Result of handing a [`StackEvent`] to [`OtaSession::handle_event`].
 #[derive(Debug)]
@@ -129,6 +130,7 @@ impl OtaSession {
             source_endpoint,
             endpoint: dst_endpoint,
             cluster_id,
+            frame_type,
             command_id,
             payload,
             ..
@@ -138,6 +140,9 @@ impl OtaSession {
         };
         if *cluster_id != ClusterId::OTA_UPGRADE.0 {
             return OtaEventOutcome::NotOta;
+        }
+        if *frame_type != ZclFrameType::ClusterSpecific {
+            return OtaEventOutcome::Ignored;
         }
         // No firmware backend on this device (checked layout disabled it) —
         // the traffic is OTA, but there is nothing to drive it with.
@@ -358,6 +363,7 @@ mod tests {
             source_endpoint: server.1,
             endpoint,
             cluster_id,
+            frame_type: ZclFrameType::ClusterSpecific,
             command_id,
             seq_number: 0,
             payload: buf,
@@ -428,6 +434,31 @@ mod tests {
             OtaState::Idle,
             "unrelated traffic must not touch the manager"
         );
+    }
+
+    #[test]
+    fn ota_foundation_command_is_not_treated_as_image_notify() {
+        let mut session = OtaSession::new();
+        let mut device = joined_device();
+        let mut mgr = manager(ENDPOINT);
+        let sent_before = device.mac_mut().tx_history().len();
+        let mut event = command_event(
+            SERVER_A,
+            ENDPOINT,
+            ClusterId::OTA_UPGRADE.0,
+            CMD_IMAGE_NOTIFY.0,
+            &[0x02, 0x00],
+        );
+        let StackEvent::CommandReceived { frame_type, .. } = &mut event else {
+            unreachable!();
+        };
+        *frame_type = ZclFrameType::Global;
+
+        let outcome = block_on(session.handle_event(&mut device, Some(&mut mgr), ENDPOINT, &event));
+
+        assert!(matches!(outcome, OtaEventOutcome::Ignored));
+        assert_eq!(mgr.state(), OtaState::Idle);
+        assert_eq!(device.mac_mut().tx_history().len(), sent_before);
     }
 
     #[test]

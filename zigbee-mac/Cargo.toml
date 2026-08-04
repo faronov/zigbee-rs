@@ -13,6 +13,7 @@ zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
 zigbee-crypto = { version = "0.1.0", path = "../zigbee-crypto" }
 tlsr8258-hal = { path = "../tlsr8258-hal", optional = true }
 bl702-hal = { path = "../bl702-hal", optional = true }
+efr32mg1-hal = { path = "../efr32mg1-hal", optional = true }
 
 # ── ESP32-C6 backend ────────────────────────────────────────
 esp-hal = { version = "1.0.0", features = ["rt", "unstable"], default-features = false, optional = true }
@@ -131,6 +132,13 @@ efr32 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 efr32-trace = []
+
+# EFR32MG1 CRYPTO AES-128 backend for NWK/APS CCM* and AES-MMO.
+hardware-aes-efr32mg1 = [
+    "efr32",
+    "dep:efr32mg1-hal",
+    "zigbee-crypto/efr32mg1",
+]
 
 efr32mg21 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",

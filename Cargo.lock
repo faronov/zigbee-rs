@@ -343,6 +343,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "efr32mg1-hal"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-storage",
+]
+
+[[package]]
 name = "embassy-embedded-hal"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1868,6 +1876,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "bl702-hal",
+ "efr32mg1-hal",
  "heapless 0.9.2",
  "tlsr8258-hal",
 ]
@@ -1877,6 +1886,7 @@ name = "zigbee-mac"
 version = "0.1.0"
 dependencies = [
  "bl702-hal",
+ "efr32mg1-hal",
  "embassy-futures",
  "embassy-nrf",
  "embassy-sync 0.7.2",

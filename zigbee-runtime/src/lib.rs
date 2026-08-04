@@ -3834,14 +3834,40 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         } else if recovery_action {
             self.pending_action = None;
             self.retry_secure_rejoin_with_security_store(store).await?
-        } else if self.pending_action.is_some() {
-            self.tick_without_secure_rejoin(elapsed_secs, clusters)
-                .await
-        } else if self.secure_rejoin_retry_due() {
+        } else if self.pending_action.is_none() && self.secure_rejoin_retry_due() {
             self.retry_secure_rejoin_with_security_store(store).await?
         } else {
-            self.tick_without_secure_rejoin(elapsed_secs, clusters)
-                .await
+            if let Some(action) = self.pending_action.take() {
+                self.handle_action(action).await
+            } else {
+                self.flush_pending_responses().await;
+                if !self.is_joined() {
+                    event_loop::TickResult::Idle
+                } else {
+                    // Keep the durable path direct too: another async wrapper
+                    // adds several KiB of transient stack on Series-1 devices.
+                    self.run_aps_maintenance().await;
+                    self.run_nwk_maintenance(elapsed_secs).await;
+                    R::ed_advance_timers(self, elapsed_secs);
+
+                    self.reporting.tick(elapsed_secs);
+                    self.apply_fb_target_request(clusters);
+                    self.run_finding_binding_tick(elapsed_secs).await;
+                    self.send_due_reports(clusters).await;
+                    self.update_pending_tx_flag();
+
+                    let now_ms = self.advance_power_clock(elapsed_secs);
+                    let poll_event = self.run_sleepy_poll(now_ms, clusters).await;
+                    R::ed_service(self).await;
+                    if let Some(event) = poll_event {
+                        event_loop::TickResult::Event(event)
+                    } else if R::CAN_ROUTE {
+                        self.tick_power_state(now_ms)
+                    } else {
+                        event_loop::sleep_decision_to_tick(self.power.decide(now_ms))
+                    }
+                }
+            }
         };
         // GSDK-style event-driven commissioning: after network-up the normal
         // tick above services ZDO/ZCL and sleepy polling, feeding the unique

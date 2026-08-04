@@ -2,8 +2,8 @@
 //!
 //! This module is the first "safe" power-management building block towards
 //! a future Embassy `EM2`-aware executor. It deliberately does **not** touch
-//! flash/NVM or the radio, and it does not replace the SysTick Embassy time
-//! driver used by production firmware (`examples/efr32mg1-sensor/src/time_driver.rs`).
+//! flash/NVM or the radio. Production uses RTCC CC0 for the Embassy time
+//! queue and reserves CC1 for blocking application EM2 sleeps.
 //!
 //! # Why RTCC and not a generic LETIMER/CRYOTIMER
 //!
@@ -210,10 +210,18 @@ pub const RTCC_IF_OF_BIT: u32 = 1 << 0;
 /// it is intentionally re-declared here instead of shared.
 pub const RTCC_IF_CC0_BIT: u32 = 1 << 1;
 
+/// RTCC `IF`/`IEN`/`IFC` bit for the channel-1 compare-match flag (bit 2).
+///
+/// Production reserves CC1 for blocking application EM2 sleeps so the
+/// Embassy time driver's CC0 alarm cannot be disarmed or reprogrammed by a
+/// concurrent sleep deadline.
+pub const RTCC_IF_CC1_BIT: u32 = 1 << 2;
+
 /// Which RTCC interrupt sources were latched the moment they were sampled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RtccFlags {
     pub cc0: bool,
+    pub cc1: bool,
     pub overflow: bool,
 }
 
@@ -222,6 +230,7 @@ pub struct RtccFlags {
 pub const fn decode_pending_flags(raw_if: u32) -> RtccFlags {
     RtccFlags {
         cc0: raw_if & RTCC_IF_CC0_BIT != 0,
+        cc1: raw_if & RTCC_IF_CC1_BIT != 0,
         overflow: raw_if & RTCC_IF_OF_BIT != 0,
     }
 }
@@ -356,25 +365,24 @@ mod hw {
     // RTCC (offsets cross-checked against GSDK 4.5.0 `efr32mg1p_rtcc.h`
     // `RTCC_TypeDef` / `RTCC_CC_TypeDef`).
     const RTCC_BASE: u32 = 0x4004_2000;
-    const RTCC_CTRL: u32 = RTCC_BASE + 0x00;
+    const RTCC_CTRL: u32 = RTCC_BASE;
     const RTCC_CNT: u32 = RTCC_BASE + 0x08;
     const RTCC_IF: u32 = RTCC_BASE + 0x18;
     const RTCC_IFC: u32 = RTCC_BASE + 0x20;
     const RTCC_IEN: u32 = RTCC_BASE + 0x24;
     const RTCC_CC0_CTRL: u32 = RTCC_BASE + 0x40;
     const RTCC_CC0_CCV: u32 = RTCC_BASE + 0x44;
+    const RTCC_CC1_CTRL: u32 = RTCC_BASE + 0x50;
+    const RTCC_CC1_CCV: u32 = RTCC_BASE + 0x54;
 
     const RTCC_CTRL_ENABLE: u32 = 1 << 0;
     const RTCC_CC_CTRL_MODE_OUTPUTCOMPARE: u32 = 0x2;
     const RTCC_IF_CC0: u32 = 1 << 1;
+    const RTCC_IF_CC1: u32 = 1 << 2;
     const RTCC_INTERRUPT_MASK: u32 = 0x7FF;
 
     /// Software wrap counter ("epoch"), incremented once per RTCC overflow
-    /// (`RTCC_IF_OF`) by whichever `RTCC` handler calls
-    /// [`bump_wrap_count`] — only the Embassy time driver in
-    /// `examples/efr32mg1-sensor/src/time_driver.rs` does; `diag-em2` never
-    /// enables the overflow interrupt (see [`enable_overflow_interrupt`]),
-    /// so this stays at `0` for that binary.
+    /// (`RTCC_IF_OF`) by whichever `RTCC` handler observes it.
     static WRAP_COUNT: AtomicU32 = AtomicU32::new(0);
 
     // EMU (offsets cross-checked against GSDK 4.5.0 `efr32mg1p_emu.h`
@@ -435,8 +443,9 @@ mod hw {
     }
 
     /// Brings up LFRCO, routes it to RTCC over the CMU "LFE" branch, and
-    /// configures RTCC channel 0 as a free-running output-compare wake
-    /// source. Does not touch flash, NVM, or the radio.
+    /// configures RTCC channels 0 and 1 as free-running output-compare wake
+    /// sources. CC0 belongs to the Embassy time driver; CC1 belongs to
+    /// blocking application sleep. Does not touch flash, NVM, or the radio.
     pub fn init() -> Result<(), PmError> {
         // EFR32xG1 gates CPU access to all low-energy peripheral registers
         // behind HFBUSCLKEN0.LE. GSDK's device initialization enables
@@ -474,6 +483,7 @@ mod hw {
             write(RTCC_IEN, 0);
             write(RTCC_IFC, RTCC_INTERRUPT_MASK);
             write(RTCC_CC0_CTRL, RTCC_CC_CTRL_MODE_OUTPUTCOMPARE);
+            write(RTCC_CC1_CTRL, RTCC_CC_CTRL_MODE_OUTPUTCOMPARE);
             write(RTCC_CTRL, RTCC_CTRL_ENABLE);
         }
         let initial_counter = now();
@@ -511,12 +521,36 @@ mod hw {
         unsafe { modify(RTCC_IEN, RTCC_IF_CC0, 0) };
     }
 
-    /// Must be called from the application's `RTCC` interrupt handler (see
-    /// `examples/efr32mg1-sensor` `diag-em2` wiring). Clears the hardware
-    /// flag and records the wake event.
+    /// Arms the application-owned CC1 wake deadline without touching CC0,
+    /// which is reserved for the Embassy timer queue.
+    #[inline(never)]
+    fn arm_sleep_wake(ticks_from_now: u32) -> u32 {
+        let deadline = super::deadline_from_now(now(), ticks_from_now);
+        unsafe {
+            write(RTCC_CC1_CCV, super::compare_from_deadline(deadline));
+            write(RTCC_IFC, RTCC_IF_CC1);
+            modify(RTCC_IEN, RTCC_IF_CC1, RTCC_IF_CC1);
+        }
+        deadline
+    }
+
+    /// Disables only the application-owned CC1 compare interrupt.
+    #[inline(never)]
+    fn disarm_sleep_wake() {
+        unsafe { modify(RTCC_IEN, RTCC_IF_CC1, 0) };
+    }
+
+    /// Standalone RTCC interrupt handler helper. Clears all HAL-owned compare
+    /// and overflow flags, records compare wake events, and advances the
+    /// software epoch on overflow.
     pub fn handle_interrupt() {
-        unsafe { write(RTCC_IFC, RTCC_IF_CC0) };
-        WAKE_EVENTS.fetch_add(1, Ordering::SeqCst);
+        let flags = take_pending_flags();
+        if flags.overflow {
+            bump_wrap_count();
+        }
+        if flags.cc0 || flags.cc1 {
+            WAKE_EVENTS.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// Current wake-event count, as observed by [`handle_interrupt`].
@@ -543,18 +577,19 @@ mod hw {
         flag_set(RTCC_IF, super::RTCC_IF_OF_BIT)
     }
 
-    /// Reads and clears whichever of the CC0-compare and overflow flags
+    /// Reads and clears whichever of the CC0/CC1 compare and overflow flags
     /// are currently pending, atomically with respect to each other (a
     /// single `IF` read followed by a single `IFC` write of exactly the
-    /// bits observed). Intended to be the *only* thing the Embassy time
-    /// driver's `RTCC` handler reads directly from hardware; it then calls
-    /// [`bump_wrap_count`] itself when the returned flags say `overflow`.
+    /// bits observed). This is the single hardware read/clear primitive used
+    /// by both the standalone handler and the Embassy time driver. Embassy
+    /// re-arms only for CC0/overflow; CC1 merely wakes a blocking application
+    /// sleep.
     pub fn take_pending_flags() -> super::RtccFlags {
         let raw = unsafe { read(RTCC_IF) };
         unsafe {
             write(
                 RTCC_IFC,
-                raw & (super::RTCC_IF_CC0_BIT | super::RTCC_IF_OF_BIT),
+                raw & (super::RTCC_IF_CC0_BIT | super::RTCC_IF_CC1_BIT | super::RTCC_IF_OF_BIT),
             )
         };
         super::decode_pending_flags(raw)
@@ -654,10 +689,28 @@ mod hw {
     }
 
     #[inline(always)]
-    fn wfi() {
-        // SAFETY: WFI is a hint instruction; it only suspends execution
-        // until the next interrupt/event and has no memory side effects.
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
+    fn disable_interrupts() -> u32 {
+        let primask: u32;
+        unsafe {
+            core::arch::asm!(
+                "mrs {primask}, PRIMASK",
+                "cpsid i",
+                primask = out(reg) primask,
+                options(nostack, preserves_flags),
+            )
+        };
+        primask
+    }
+
+    #[inline(always)]
+    fn restore_interrupts(primask: u32) {
+        unsafe {
+            core::arch::asm!(
+                "msr PRIMASK, {primask}",
+                primask = in(reg) primask,
+                options(nostack, preserves_flags),
+            )
+        };
     }
 
     /// Applies the DCDC safety gate, sets `SLEEPDEEP`, and executes one
@@ -665,11 +718,31 @@ mod hw {
     /// because the core was never actually asleep (e.g. a pending unmasked
     /// interrupt at call time).
     fn enter_em2_once() -> Result<(), PmError> {
-        apply_dcdc_lnhs_workaround()?;
-        unsafe { modify(SCB_SCR, SCB_SCR_SLEEPDEEP, SCB_SCR_SLEEPDEEP) };
-        wfi();
-        unsafe { modify(SCB_SCR, SCB_SCR_SLEEPDEEP, 0) };
+        let _ = enter_em2_once_unless(|| false)?;
         Ok(())
+    }
+
+    /// Atomically rechecks `abort` with IRQs masked immediately before WFI.
+    /// This closes the classic check-then-sleep race where an ISR can clear
+    /// its hardware edge after the caller's check but before the core sleeps.
+    fn enter_em2_once_unless<F>(mut abort: F) -> Result<bool, PmError>
+    where
+        F: FnMut() -> bool,
+    {
+        apply_dcdc_lnhs_workaround()?;
+        let primask = disable_interrupts();
+        if abort() {
+            restore_interrupts(primask);
+            return Ok(false);
+        }
+
+        unsafe { modify(SCB_SCR, SCB_SCR_SLEEPDEEP, SCB_SCR_SLEEPDEEP) };
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        unsafe { core::arch::asm!("dsb", "wfi", options(nomem, nostack, preserves_flags),) };
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        unsafe { modify(SCB_SCR, SCB_SCR_SLEEPDEEP, 0) };
+        restore_interrupts(primask);
+        Ok(true)
     }
 
     /// Sleeps in EM2 until the RTCC deadline previously armed with
@@ -735,9 +808,10 @@ mod hw {
         }
     }
 
-    /// Sleeps until the RTCC deadline or until `interrupted` observes an
-    /// application wake event. Other IRQs are treated as bounded spurious
-    /// wakes; the RTCC compare is disarmed on every normal return path.
+    /// Sleeps on the application-owned RTCC CC1 deadline or until
+    /// `interrupted` observes an application wake event. Other IRQs are
+    /// treated as bounded spurious wakes; CC1 is disarmed on every return
+    /// path while the Embassy time driver's CC0 state remains untouched.
     pub fn sleep_for_ticks_polled_until<F>(
         ticks_from_now: u32,
         mut interrupted: F,
@@ -745,28 +819,31 @@ mod hw {
     where
         F: FnMut() -> bool,
     {
-        let deadline = arm_wake(ticks_from_now);
+        let deadline = arm_sleep_wake(ticks_from_now);
         let mut attempts = 0u32;
         loop {
             if interrupted() {
-                disarm_wake();
+                disarm_sleep_wake();
                 return Ok(InterruptibleSleep::Interrupted { deadline });
             }
-            if let Err(error) = enter_em2_once() {
-                disarm_wake();
-                return Err(error);
+            match enter_em2_once_unless(|| interrupted() || super::ticks_reached(now(), deadline)) {
+                Ok(_) => {}
+                Err(error) => {
+                    disarm_sleep_wake();
+                    return Err(error);
+                }
             }
             if super::ticks_reached(now(), deadline) {
-                disarm_wake();
+                disarm_sleep_wake();
                 return Ok(InterruptibleSleep::Deadline { deadline });
             }
             if interrupted() {
-                disarm_wake();
+                disarm_sleep_wake();
                 return Ok(InterruptibleSleep::Interrupted { deadline });
             }
             attempts += 1;
             if attempts > DEFAULT_MAX_SPURIOUS_WAKES {
-                disarm_wake();
+                disarm_sleep_wake();
                 return Err(PmError::WakeTimeout);
             }
         }
@@ -958,6 +1035,15 @@ mod tests {
             decode_pending_flags(RTCC_IF_CC0_BIT),
             RtccFlags {
                 cc0: true,
+                cc1: false,
+                overflow: false
+            }
+        );
+        assert_eq!(
+            decode_pending_flags(RTCC_IF_CC1_BIT),
+            RtccFlags {
+                cc0: false,
+                cc1: true,
                 overflow: false
             }
         );
@@ -965,13 +1051,15 @@ mod tests {
             decode_pending_flags(RTCC_IF_OF_BIT),
             RtccFlags {
                 cc0: false,
+                cc1: false,
                 overflow: true
             }
         );
         assert_eq!(
-            decode_pending_flags(RTCC_IF_CC0_BIT | RTCC_IF_OF_BIT),
+            decode_pending_flags(RTCC_IF_CC0_BIT | RTCC_IF_CC1_BIT | RTCC_IF_OF_BIT),
             RtccFlags {
                 cc0: true,
+                cc1: true,
                 overflow: true
             }
         );
@@ -980,6 +1068,7 @@ mod tests {
             decode_pending_flags(0x7FF),
             RtccFlags {
                 cc0: true,
+                cc1: true,
                 overflow: true
             }
         );

@@ -10,6 +10,7 @@ package has no feature-selected entry points.
 |---|---|
 | `efr32mg1-diag-nv` | Write/read the bounded application-NV journal |
 | `efr32mg1-diag-em2` | Ten RTCC/EM2 cycles with retained SRAM canaries |
+| `efr32mg1-diag-crypto` | CRYPTO AES-128 KAT/re-key gate before and after EM2 |
 | `efr32mg1-diag-rtcc-time` | Embassy RTCC timer plus explicit EM2 waits |
 | `efr32mg1-diag-radio-em2` | Raw TX before and after repeated EM2 |
 | `efr32mg1-diag-sht` | I2C/SHT3x probe and repeated CRC-checked samples |
@@ -27,6 +28,7 @@ bootloader-safe linker script:
 ```bash
 cargo build --release --bin efr32mg1-diag-nv
 cargo build --release --bin efr32mg1-diag-em2
+cargo build --release --bin efr32mg1-diag-crypto
 cargo build --release --bin efr32mg1-diag-rtcc-time
 cargo build --release --bin efr32mg1-diag-radio-em2
 cargo build --release --bin efr32mg1-diag-sht
@@ -45,6 +47,8 @@ Verify each ELF before producing a HEX:
 ```bash
 tools/verify-layout.py \
   target/thumbv7em-none-eabi/release/efr32mg1-diag-em2
+tools/verify-layout.py \
+  target/thumbv7em-none-eabi/release/efr32mg1-diag-crypto
 tools/verify-layout.py \
   target/thumbv7em-none-eabi/release/efr32mg1-diag-ota-storage
 ```

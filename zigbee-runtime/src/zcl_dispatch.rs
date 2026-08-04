@@ -155,6 +155,12 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         })
     }
 
+    fn endpoint_has_client_cluster(&self, endpoint: u8, cluster_id: ClusterId) -> bool {
+        self.endpoints.iter().any(|configured| {
+            configured.endpoint == endpoint && configured.client_clusters.contains(&cluster_id)
+        })
+    }
+
     /// Resolve a server cluster on `endpoint` to a shared trait object.
     ///
     /// `#[inline(never)]` and deliberately non-generic: the endpoint/cluster
@@ -213,6 +219,26 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         }
     }
 
+    fn resolve_cluster_for_direction(
+        &self,
+        endpoint: u8,
+        cluster_id: ClusterId,
+        direction: ClusterDirection,
+    ) -> Option<&dyn Cluster> {
+        match direction {
+            ClusterDirection::ClientToServer => self.resolve_cluster(endpoint, cluster_id),
+            ClusterDirection::ServerToClient => {
+                if !self.endpoint_has_client_cluster(endpoint, cluster_id) {
+                    return None;
+                }
+                let cluster = self.clusters.iter().find(|cluster| {
+                    cluster.endpoint == endpoint && cluster.cluster.cluster_id() == cluster_id
+                })?;
+                Some(&*cluster.cluster)
+            }
+        }
+    }
+
     fn with_cluster<T>(
         &self,
         endpoint: u8,
@@ -229,6 +255,17 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         access: impl FnOnce(&mut dyn Cluster) -> T,
     ) -> Option<T> {
         self.resolve_cluster_mut(endpoint, cluster_id).map(access)
+    }
+
+    fn with_cluster_for_direction<T>(
+        &self,
+        endpoint: u8,
+        cluster_id: ClusterId,
+        direction: ClusterDirection,
+        access: impl FnOnce(&dyn Cluster) -> T,
+    ) -> Option<T> {
+        self.resolve_cluster_for_direction(endpoint, cluster_id, direction)
+            .map(access)
     }
 
     fn dispatch_inner(
@@ -575,8 +612,8 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         // ── Read Attributes (0x00) ──────────────────────────────
         if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
             && cmd_id == 0x00
-            && zcl_frame.header.direction() == ClusterDirection::ClientToServer
         {
+            let request_direction = zcl_frame.header.direction();
             if let Some(req) = zigbee_zcl::foundation::read_attributes::ReadAttributesRequest::parse(
                 zcl_frame.payload.as_slice(),
             ) {
@@ -595,14 +632,17 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                     src_addr,
                 );
                 // Find the cluster's attribute store
-                if let Some(response) =
-                    self.with_cluster(dst_ep, ClusterId(cluster_id), |cluster| {
+                if let Some(response) = self.with_cluster_for_direction(
+                    dst_ep,
+                    ClusterId(cluster_id),
+                    request_direction,
+                    |cluster| {
                         zigbee_zcl::foundation::read_attributes::process_read_dyn(
                             cluster.attributes(),
                             &req,
                         )
-                    })
-                {
+                    },
+                ) {
                     let payload_buf = &mut *self.zcl_scratch;
                     let payload_len = response.serialize(payload_buf).min(payload_buf.len());
                     rt_trace!(
@@ -616,7 +656,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                         payload_len,
                         response.records.len(),
                     );
-                    queue_global_response_inner(
+                    queue_global_response_for_direction_inner(
                         self.pending_responses,
                         src_addr,
                         src_endpoint,
@@ -624,6 +664,10 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                         cluster_id,
                         zcl_frame.header.seq_number,
                         0x01, // Read Attributes Response
+                        match request_direction {
+                            ClusterDirection::ClientToServer => ClusterDirection::ServerToClient,
+                            ClusterDirection::ServerToClient => ClusterDirection::ClientToServer,
+                        },
                         &payload_buf[..payload_len],
                     );
                 } else {
@@ -942,7 +986,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             }
 
             if zcl_frame.header.direction() == ClusterDirection::ServerToClient {
-                return Some(command_received_event(
+                return Some(cluster_command_received_event(
                     src_addr,
                     src_endpoint,
                     dst_ep,
@@ -1114,7 +1158,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                 return Some(event_loop::StackEvent::FactoryResetRequested);
             }
 
-            return Some(command_received_event(
+            return Some(cluster_command_received_event(
                 src_addr,
                 src_endpoint,
                 dst_ep,
@@ -1152,17 +1196,8 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
     }
 }
 
-/// Build the `CommandReceived` pass-through event shared by every foundation
-/// and cluster-specific branch of [`LocalZclCtx::dispatch_inner`].
+/// Build the `CommandReceived` pass-through event for a foundation command.
 ///
-/// Every dispatch arm ends by handing the raw ZCL command up to the async
-/// layer as an identical `StackEvent::CommandReceived`, copying the payload
-/// into a bounded `heapless::Vec`. Emitting that construction inline at each of
-/// the ~13 return sites monomorphised the `Vec::from_slice` copy and struct
-/// build once per arm inside the already-large `dispatch` symbol. Funnelling
-/// them through one `#[inline(never)]` builder compiles that tail exactly once
-/// while producing byte-identical events.
-#[inline(never)]
 fn command_received_event(
     src_addr: u16,
     src_endpoint: u8,
@@ -1172,11 +1207,59 @@ fn command_received_event(
     seq_number: u8,
     payload: &[u8],
 ) -> event_loop::StackEvent {
+    command_received_event_with_type(
+        src_addr,
+        src_endpoint,
+        dst_ep,
+        cluster_id,
+        cmd_id,
+        seq_number,
+        payload,
+        zigbee_zcl::frame::ZclFrameType::Global,
+    )
+}
+
+/// Build the same pass-through event for a cluster-specific command.
+fn cluster_command_received_event(
+    src_addr: u16,
+    src_endpoint: u8,
+    dst_ep: u8,
+    cluster_id: u16,
+    cmd_id: u8,
+    seq_number: u8,
+    payload: &[u8],
+) -> event_loop::StackEvent {
+    command_received_event_with_type(
+        src_addr,
+        src_endpoint,
+        dst_ep,
+        cluster_id,
+        cmd_id,
+        seq_number,
+        payload,
+        zigbee_zcl::frame::ZclFrameType::ClusterSpecific,
+    )
+}
+
+/// Keep the bounded payload copy and event construction out of each dispatch arm.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn command_received_event_with_type(
+    src_addr: u16,
+    src_endpoint: u8,
+    dst_ep: u8,
+    cluster_id: u16,
+    cmd_id: u8,
+    seq_number: u8,
+    payload: &[u8],
+    frame_type: zigbee_zcl::frame::ZclFrameType,
+) -> event_loop::StackEvent {
     event_loop::StackEvent::CommandReceived {
         src_addr,
         source_endpoint: src_endpoint,
         endpoint: dst_ep,
         cluster_id,
+        frame_type,
         command_id: cmd_id,
         seq_number,
         payload: heapless::Vec::from_slice(payload).unwrap_or_default(),
@@ -1262,12 +1345,32 @@ pub(crate) fn queue_global_response_inner<const N: usize>(
     response_cmd: u8,
     payload: &[u8],
 ) {
-    let mut frame = ZclFrame::new_global(
+    queue_global_response_for_direction_inner(
+        pending_responses,
+        dst_addr,
+        dst_endpoint,
+        src_endpoint,
+        cluster_id,
         seq,
-        CommandId(response_cmd),
+        response_cmd,
         ClusterDirection::ServerToClient,
-        true,
+        payload,
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_global_response_for_direction_inner<const N: usize>(
+    pending_responses: &mut heapless::Vec<PendingZclResponse, N>,
+    dst_addr: u16,
+    dst_endpoint: u8,
+    src_endpoint: u8,
+    cluster_id: u16,
+    seq: u8,
+    response_cmd: u8,
+    direction: ClusterDirection,
+    payload: &[u8],
+) {
+    let mut frame = ZclFrame::new_global(seq, CommandId(response_cmd), direction, true);
     for &b in payload {
         if frame.payload.push(b).is_err() {
             rt_trace!(
@@ -1391,6 +1494,7 @@ mod tests {
     use zigbee_zcl::clusters::basic::{BasicCluster, PowerSource};
     use zigbee_zcl::clusters::groups::GroupsCluster;
     use zigbee_zcl::clusters::identify::IdentifyCluster;
+    use zigbee_zcl::clusters::ota::OtaCluster;
     use zigbee_zcl::clusters::temperature::TemperatureCluster;
     use zigbee_zcl::foundation::reporting::ReportingEngine;
     use zigbee_zcl::frame::ZclFrame;
@@ -1415,9 +1519,17 @@ mod tests {
 
     impl Fixture {
         fn new(server_clusters: &[ClusterId]) -> Self {
+            Self::with_clusters(server_clusters, &[])
+        }
+
+        fn with_clusters(server_clusters: &[ClusterId], client_clusters: &[ClusterId]) -> Self {
             let mut servers = heapless::Vec::new();
             for c in server_clusters {
                 servers.push(*c).unwrap();
+            }
+            let mut clients = heapless::Vec::new();
+            for c in client_clusters {
+                clients.push(*c).unwrap();
             }
             let mut endpoints = heapless::Vec::new();
             endpoints
@@ -1427,7 +1539,7 @@ mod tests {
                     device_id: DeviceId::TEMPERATURE_SENSOR,
                     device_version: 1,
                     server_clusters: servers,
-                    client_clusters: heapless::Vec::new(),
+                    client_clusters: clients,
                 })
                 .unwrap();
             let mut identify = heapless::Vec::new();
@@ -1682,6 +1794,45 @@ mod tests {
             ],
         );
         assert_eq!(fx.pending[0].zcl_data.as_slice(), expected.as_slice());
+        assert_eq!(fx.pending[0].dst_addr.0, SRC_ADDR);
+        assert_eq!(fx.pending[0].dst_endpoint, SRC_EP);
+        assert_eq!(fx.pending[0].src_endpoint, EP);
+    }
+
+    #[test]
+    fn ota_client_read_attributes_frame_1643_queues_response() {
+        let mut fx = Fixture::with_clusters(&[], &[ClusterId::OTA_UPGRADE]);
+        let mut ota = OtaCluster::new(0x1234, 0x0001, 0x0102_0304);
+        let mut clusters = [ClusterRef {
+            endpoint: EP,
+            cluster: &mut ota,
+        }];
+
+        // Captured ZHA interview frame 1643: global, server→client, TSN 7,
+        // Read Attributes, CurrentFileVersion (0x0002).
+        let request = [0x18, 0x07, 0x00, 0x02, 0x00];
+        let outcome = fx.dispatch(&mut clusters, ClusterId::OTA_UPGRADE.0, &request);
+
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::CommandReceived {
+                frame_type: zigbee_zcl::frame::ZclFrameType::Global,
+                ..
+            })
+        ));
+        assert_eq!(fx.pending.len(), 1);
+        assert_eq!(
+            fx.pending[0].zcl_data.as_slice(),
+            &[
+                0x10, // global, client→server, disable default response
+                0x07, // matching TSN
+                0x01, // Read Attributes Response
+                0x02, 0x00, // CurrentFileVersion
+                0x00, // SUCCESS
+                0x23, // uint32
+                0x04, 0x03, 0x02, 0x01,
+            ]
+        );
         assert_eq!(fx.pending[0].dst_addr.0, SRC_ADDR);
         assert_eq!(fx.pending[0].dst_endpoint, SRC_EP);
         assert_eq!(fx.pending[0].src_endpoint, EP);

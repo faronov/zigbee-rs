@@ -28,6 +28,8 @@ const FAST_POLL_MS: u64 = 250;
 const SLOW_POLL_SECS: u64 = 30;
 const FAST_POLL_DURATION_SECS: u64 = 120;
 const RESTORED_FAST_POLL_SECS: u64 = 60;
+const INTERVIEW_CONFIGURATION_TIMEOUT_SECS: u64 = 120;
+const SECURE_REJOIN_FAILURE_LIMIT: u8 = 4;
 
 type SensorNode = ZigbeeNode<'static, Efr32Mac, SecurityStore, SensorProfile>;
 
@@ -44,10 +46,12 @@ pub struct SensorApp {
     was_fast_polling: bool,
     was_identifying: bool,
     interview_done: bool,
+    interview_deadline: Option<Instant>,
     needs_checkpoint: bool,
     needs_bootstrap_join: bool,
     awaiting_initial_configuration: bool,
     restoring_commissioned_state: bool,
+    consecutive_rejoin_failures: u8,
     ota_session: OtaSession,
 }
 
@@ -72,10 +76,12 @@ impl SensorApp {
             was_fast_polling: joined,
             was_identifying: false,
             interview_done: false,
+            interview_deadline: None,
             needs_checkpoint: false,
             needs_bootstrap_join: !joined,
             awaiting_initial_configuration: false,
             restoring_commissioned_state: false,
+            consecutive_rejoin_failures: 0,
             ota_session: OtaSession::new(),
         }
     }
@@ -101,9 +107,18 @@ impl SensorApp {
             if self.node.device().is_joined() {
                 self.node.device_mut().mac_mut().radio_wake();
                 self.service_joined_tick(now).await;
+                if !self.node.device().is_joined() {
+                    continue;
+                }
                 let direct_rx_ms = if poll_ms == FAST_POLL_MS { poll_ms } else { 0 };
                 self.service_direct_rx_window(direct_rx_ms).await;
+                if !self.node.device().is_joined() {
+                    continue;
+                }
                 self.service_joined_polls().await;
+                if !self.node.device().is_joined() {
+                    continue;
+                }
                 self.service_joined_post_rx();
 
                 if !self.awaiting_initial_configuration
@@ -136,6 +151,7 @@ impl SensorApp {
         self.interview_done = false;
         self.was_identifying = false;
         self.was_fast_polling = true;
+        self.consecutive_rejoin_failures = 0;
         platform::led_on();
     }
 
@@ -147,7 +163,12 @@ impl SensorApp {
         self.fast_poll_until = Instant::now() + Duration::from_secs(5);
         self.interview_done = true;
         self.awaiting_initial_configuration = false;
+        self.interview_deadline = None;
         platform::led_off();
+        rtt_target::rprintln!(
+            "[EFR32][sensor] INTERVIEW_CONFIGURED stack_high_water={}",
+            platform::stack_high_water_bytes()
+        );
     }
 
     fn checkpoint_security(&mut self) {
@@ -157,8 +178,13 @@ impl SensorApp {
     }
 
     async fn factory_reset(&mut self) {
-        if let Err(StartError::PersistenceFailed(error)) = self.node.factory_reset().await {
-            persistence_failure(error);
+        match self.node.factory_reset().await {
+            Ok(()) => {}
+            Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
+            Err(error) => {
+                rtt_target::rprintln!("[EFR32][sensor] FACTORY_RESET_FAIL error={:?}", error);
+                platform::halt_with_led();
+            }
         }
     }
 
@@ -166,12 +192,38 @@ impl SensorApp {
         match self.node.secure_rejoin().await {
             Ok(_) => {}
             Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
-            Err(_) => return false,
+            Err(error) => {
+                rtt_target::rprintln!("[EFR32][sensor] SECURE_REJOIN_FAIL error={:?}", error);
+                self.record_failed_rejoin().await;
+                return false;
+            }
         }
         self.reset_post_join_state();
         self.needs_bootstrap_join = false;
         self.needs_checkpoint = true;
+        rtt_target::rprintln!(
+            "[EFR32][sensor] SECURE_REJOIN_OK short=0x{:04X}",
+            self.node.device().short_address()
+        );
         true
+    }
+
+    async fn record_failed_rejoin(&mut self) {
+        self.consecutive_rejoin_failures = self.consecutive_rejoin_failures.saturating_add(1);
+        if self.consecutive_rejoin_failures < SECURE_REJOIN_FAILURE_LIMIT {
+            return;
+        }
+
+        rtt_target::rprintln!(
+            "[EFR32][sensor] STALE_NETWORK_RESET failures={}",
+            SECURE_REJOIN_FAILURE_LIMIT
+        );
+        self.factory_reset().await;
+        self.consecutive_rejoin_failures = 0;
+        self.needs_bootstrap_join = true;
+        self.awaiting_initial_configuration = false;
+        self.interview_deadline = None;
+        self.restoring_commissioned_state = false;
     }
 
     async fn bootstrap_join(&mut self) -> bool {
@@ -182,43 +234,88 @@ impl SensorApp {
             Err(error) => persistence_failure(error),
         };
         let had_commissioned_state = restored_state.is_some_and(|state| state.commissioned);
-        self.awaiting_initial_configuration = !had_commissioned_state;
         self.restoring_commissioned_state = had_commissioned_state;
 
         match self.node.start_or_resume().await {
             Ok(_) => {}
             Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
-            Err(_) => return false,
+            Err(error) => {
+                self.restoring_commissioned_state = false;
+                let diagnostics = self.node.device().steering_diagnostics();
+                rtt_target::rprintln!(
+                    "[EFR32][sensor] JOIN_FAIL error={:?} stage={:?} scan={}/{} closed={} join={}/{} status={} ch={} parent=0x{:04X} addr=0x{:04X}",
+                    error,
+                    diagnostics.stage,
+                    diagnostics.scan_requests,
+                    diagnostics.networks_discovered,
+                    diagnostics.permit_closed_rejects,
+                    diagnostics.join_successes,
+                    diagnostics.join_attempts,
+                    diagnostics.last_join_status,
+                    diagnostics.channel,
+                    diagnostics.parent_address,
+                    diagnostics.assigned_address
+                );
+                rtt_target::rprintln!(
+                    "[EFR32][sensor] JOIN_KEY passive={} polls={}/{} poll_err={} len={} nwk_sec={} result={:?} tkey={}",
+                    diagnostics.passive_rx_frames,
+                    diagnostics.poll_data_frames,
+                    diagnostics.poll_attempts,
+                    diagnostics.poll_errors,
+                    diagnostics.last_frame_len,
+                    diagnostics.nwk_security,
+                    diagnostics.key_frame_result,
+                    diagnostics.transport_key_received
+                );
+                return false;
+            }
         }
 
+        let now = Instant::now();
+        self.awaiting_initial_configuration = !had_commissioned_state;
+        self.interview_deadline = if had_commissioned_state {
+            None
+        } else {
+            Some(now + Duration::from_secs(INTERVIEW_CONFIGURATION_TIMEOUT_SECS))
+        };
         self.checkpoint_security();
-        let _ = self.node.device_mut().send_device_annce().await;
-        self.checkpoint_security();
+        if !had_commissioned_state {
+            let _ = self.node.device_mut().send_device_annce().await;
+            self.checkpoint_security();
+        }
         self.reset_post_join_state();
         if self.restoring_commissioned_state {
+            self.annce_retries_left = 0;
             self.fast_poll_until = Instant::now() + Duration::from_secs(RESTORED_FAST_POLL_SECS);
             self.restoring_commissioned_state = false;
         }
         self.needs_bootstrap_join = false;
         self.needs_checkpoint = true;
+        rtt_target::rprintln!(
+            "[EFR32][sensor] NETWORK_READY short=0x{:04X} pan=0x{:04X} channel={} stack_high_water={}",
+            self.node.device().short_address(),
+            self.node.device().pan_id(),
+            self.node.device().channel(),
+            platform::stack_high_water_bytes()
+        );
         true
     }
 
     async fn run_first_tick(&mut self) {
-        if self.needs_bootstrap_join && !self.node.device().is_joined() {
-            let _ = self.bootstrap_join().await;
-        }
+        let bootstrapped = self.needs_bootstrap_join
+            && !self.node.device().is_joined()
+            && self.bootstrap_join().await;
 
         let tick_result = self.node.tick(0).await;
         match tick_result {
-            Ok(TickResult::Event(ref event)) if update_status_led(event) => {
-                self.checkpoint_security();
+            Ok(result) => {
+                self.handle_tick_result(result).await;
             }
-            Ok(_) => {}
             Err(error) => node_failure(error),
         }
 
-        if !self.awaiting_initial_configuration
+        if self.node.device().is_joined()
+            && !self.awaiting_initial_configuration
             && let Err(error) = self.node.configure_default_reporting()
         {
             node_failure(NodeError::Profile(error));
@@ -227,12 +324,27 @@ impl SensorApp {
         self.sample_sht().await;
         self.last_report = Instant::now();
 
-        if self.node.device().is_joined() {
+        if self.node.device().is_joined() && !bootstrapped {
             self.reset_post_join_state();
         }
     }
 
     fn update_fast_poll_window(&mut self, now: Instant) -> u64 {
+        if self.awaiting_initial_configuration
+            && self
+                .interview_deadline
+                .is_some_and(|deadline| now >= deadline)
+        {
+            if let Err(error) = self.node.configure_default_reporting() {
+                node_failure(NodeError::Profile(error));
+            }
+            self.interview_done = true;
+            self.awaiting_initial_configuration = false;
+            self.interview_deadline = None;
+            platform::led_off();
+            rtt_target::rprintln!("[EFR32][sensor] INTERVIEW_TIMEOUT_USING_DEFAULT_REPORTING");
+        }
+
         let in_fast_poll = self.awaiting_initial_configuration
             || self
                 .node
@@ -259,10 +371,7 @@ impl SensorApp {
     async fn request_join_retry(&mut self) {
         if self.node.device().secure_rejoin_pending() {
             self.last_rejoin_attempt = Instant::now();
-            let result = self.node.tick(0).await;
-            if let Err(error) = result {
-                node_failure(error);
-            }
+            let _ = self.secure_rejoin().await;
             return;
         }
         let _ = self.bootstrap_join().await;
@@ -311,32 +420,118 @@ impl SensorApp {
             if self.process_ota_event(&event).await {
                 return false;
             }
-            match event {
-                StackEvent::RejoinRequested => {
-                    let _ = self.secure_rejoin().await;
-                    return true;
-                }
-                StackEvent::LeaveRequested => {
-                    self.factory_reset().await;
-                    self.needs_bootstrap_join = true;
-                    let _ = self.bootstrap_join().await;
-                    self.needs_checkpoint = false;
-                    return true;
-                }
-                _ if update_status_led(&event) => {
-                    self.reset_post_join_state();
-                    self.needs_checkpoint = true;
-                }
-                _ => {}
+            if self.handle_control_event(&event).await {
+                return true;
             }
         }
 
         self.update_interview_state();
+        if !self.node.device().is_joined() {
+            return true;
+        }
         let result = self.node.tick(0).await;
-        if let Err(error) = result {
-            node_failure(error);
+        match result {
+            Ok(result) => {
+                if self.handle_tick_result(result).await {
+                    return true;
+                }
+            }
+            Err(error) => node_failure(error),
         }
         false
+    }
+
+    async fn handle_tick_result(&mut self, result: TickResult) -> bool {
+        let TickResult::Event(event) = result else {
+            return false;
+        };
+        if self.process_ota_event(&event).await {
+            return false;
+        }
+        self.handle_control_event(&event).await
+    }
+
+    async fn handle_control_event(&mut self, event: &StackEvent) -> bool {
+        match event {
+            StackEvent::Joined {
+                short_address,
+                channel,
+                pan_id,
+            } => {
+                self.reset_post_join_state();
+                self.needs_bootstrap_join = false;
+                self.needs_checkpoint = true;
+                rtt_target::rprintln!(
+                    "[EFR32][sensor] JOINED short=0x{:04X} pan=0x{:04X} channel={}",
+                    short_address,
+                    pan_id,
+                    channel
+                );
+                false
+            }
+            StackEvent::CommissioningComplete { success: true } => {
+                self.consecutive_rejoin_failures = 0;
+                self.needs_checkpoint = true;
+                rtt_target::rprintln!(
+                    "[EFR32][sensor] COMMISSIONING_OK stack_high_water={}",
+                    platform::stack_high_water_bytes()
+                );
+                false
+            }
+            StackEvent::CommissioningComplete { success: false } => {
+                let diagnostics = self.node.device().steering_diagnostics();
+                rtt_target::rprintln!(
+                    "[EFR32][sensor] COMMISSIONING_FAILED stage={:?} request={}/{}/{} err={} verify={}/{} err={}",
+                    diagnostics.stage,
+                    diagnostics.request_key_send_successes,
+                    diagnostics.request_key_send_failures,
+                    diagnostics.request_key_attempts,
+                    diagnostics.request_key_error,
+                    diagnostics.verify_key_successes,
+                    diagnostics.verify_key_attempts,
+                    diagnostics.verify_key_error
+                );
+                rtt_target::rprintln!(
+                    "[EFR32][sensor] COMMISSIONING_TCLK installs={} confirm={}/{}/{} status={} node_desc={}/{}/{} timeout={} parse={} server=0x{:04X} rev={}",
+                    diagnostics.tclk_installations,
+                    diagnostics.confirm_key_successes,
+                    diagnostics.confirm_key_rejections,
+                    diagnostics.confirm_key_frames,
+                    diagnostics.last_confirm_key_status,
+                    diagnostics.node_desc_responses,
+                    diagnostics.node_desc_send_failures,
+                    diagnostics.node_desc_requests,
+                    diagnostics.node_desc_timeouts,
+                    diagnostics.node_desc_parse_failures,
+                    diagnostics.trust_center_server_mask,
+                    diagnostics.trust_center_stack_revision
+                );
+                if self.node.device().secure_rejoin_pending() {
+                    self.record_failed_rejoin().await;
+                } else {
+                    self.needs_bootstrap_join = true;
+                    self.awaiting_initial_configuration = false;
+                    self.interview_deadline = None;
+                    self.restoring_commissioned_state = false;
+                }
+                true
+            }
+            StackEvent::RejoinRequested => {
+                let _ = self.secure_rejoin().await;
+                true
+            }
+            StackEvent::LeaveRequested | StackEvent::FactoryResetRequested | StackEvent::Left => {
+                self.factory_reset().await;
+                self.needs_bootstrap_join = true;
+                self.awaiting_initial_configuration = false;
+                self.interview_deadline = None;
+                self.restoring_commissioned_state = false;
+                self.needs_checkpoint = false;
+                platform::led_off();
+                true
+            }
+            _ => false,
+        }
     }
 
     async fn service_joined_polls(&mut self) {
@@ -422,13 +617,17 @@ impl SensorApp {
         let elapsed = self.tick_elapsed_seconds(now);
         let result = self.node.tick(elapsed).await;
         match result {
-            Ok(TickResult::Event(ref event)) if update_status_led(event) => {
-                self.reset_post_join_state();
+            Ok(result) => {
+                if self.handle_tick_result(result).await {
+                    return;
+                }
             }
-            Ok(_) => {}
             Err(error) => node_failure(error),
         }
 
+        if !self.node.device().is_joined() {
+            return;
+        }
         self.service_ota(elapsed).await;
 
         if self.annce_retries_left > 0 && now.duration_since(self.last_annce).as_secs() >= 8 {
@@ -569,22 +768,4 @@ fn persistence_failure(_error: SecurityStoreError) -> ! {
 
 fn node_failure(_error: NodeError) -> ! {
     platform::halt_with_led()
-}
-
-fn update_status_led(event: &StackEvent) -> bool {
-    match event {
-        StackEvent::Joined { .. } => {
-            platform::led_on();
-            true
-        }
-        StackEvent::Left => {
-            platform::led_off();
-            false
-        }
-        StackEvent::LeaveRequested | StackEvent::RejoinRequested => {
-            platform::led_on();
-            false
-        }
-        _ => false,
-    }
 }

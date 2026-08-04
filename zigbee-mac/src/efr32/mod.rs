@@ -76,12 +76,18 @@ pub struct Efr32Mac {
     /// Returned by the next mlme_poll() call.
     pending_assoc_frame: Option<([u8; 128], usize)>,
     scan_diagnostics: ScanDiagnostics,
+    #[cfg(all(feature = "hardware-aes-efr32mg1", target_arch = "arm"))]
+    aes_engine: Option<efr32mg1_hal::crypto::AesEngine>,
 }
 
 impl Efr32Mac {
     pub fn new() -> Self {
-        let config = RadioConfig::default();
         let ieee = Self::read_factory_ieee();
+        Self::from_extended_address(ieee)
+    }
+
+    fn from_extended_address(ieee: IeeeAddress) -> Self {
+        let config = Self::radio_config_for_address(ieee);
         log::info!(
             "[MAC] IEEE: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
             ieee[0],
@@ -114,7 +120,31 @@ impl Efr32Mac {
             promiscuous: false,
             pending_assoc_frame: None,
             scan_diagnostics: ScanDiagnostics::default(),
+            #[cfg(all(feature = "hardware-aes-efr32mg1", target_arch = "arm"))]
+            aes_engine: None,
         }
+    }
+
+    fn radio_config_for_address(ieee: IeeeAddress) -> RadioConfig {
+        let mut config = RadioConfig::default();
+        config.extended_address = ieee;
+        config
+    }
+
+    /// Consume the CRYPTO token and install its AES-128 engine after two
+    /// on-silicon startup KATs.
+    #[cfg(all(feature = "hardware-aes-efr32mg1", target_arch = "arm"))]
+    pub fn install_aes_engine(
+        &mut self,
+        peripheral: efr32mg1_hal::peripherals::Crypto,
+    ) -> Result<(), efr32mg1_hal::crypto::AesError> {
+        let mut engine = efr32mg1_hal::crypto::AesEngine::new(
+            peripheral,
+            efr32mg1_hal::crypto::AesEngine::DEFAULT_TIMEOUT_ITERATIONS,
+        )?;
+        engine.self_test()?;
+        self.aes_engine = Some(engine);
+        Ok(())
     }
 
     /// Print a compact radio snapshot for bring-up diagnostics.
@@ -1185,7 +1215,23 @@ impl MacDriver for Efr32Mac {
     }
 }
 
+#[cfg(any(not(feature = "hardware-aes-efr32mg1"), not(target_arch = "arm")))]
 impl zigbee_crypto::ForwardAesProvider for Efr32Mac {}
+
+#[cfg(all(feature = "hardware-aes-efr32mg1", target_arch = "arm"))]
+impl zigbee_crypto::ForwardAesProvider for Efr32Mac {
+    fn forward_cipher(
+        &mut self,
+        key: &zigbee_crypto::AesKey,
+    ) -> impl zigbee_crypto::Aes128Forward + '_ {
+        let engine = self
+            .aes_engine
+            .as_mut()
+            .expect("AES engine not installed: call Efr32Mac::install_aes_engine()");
+        zigbee_crypto::efr32mg1::HardwareAes128::new(engine, *key)
+    }
+}
+
 impl PlatformServices for Efr32Mac {
     fn monotonic_micros(&self) -> u32 {
         Instant::now().as_micros() as u32
@@ -1197,6 +1243,19 @@ impl PlatformServices for Efr32Mac {
 
     fn fill_random(&mut self, _output: &mut [u8]) -> Result<(), MacError> {
         Err(MacError::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_ieee_is_forwarded_to_radio_ack_filter() {
+        let ieee = [0xF1, 0xF0, 0xDA, 0xFE, 0xFF, 0x6F, 0x0D, 0x02];
+        let config = Efr32Mac::radio_config_for_address(ieee);
+
+        assert_eq!(config.extended_address, ieee);
     }
 }
 

@@ -13,6 +13,7 @@ mod vectors;
 include!(concat!(env!("OUT_DIR"), "/firmware_version.rs"));
 
 use cortex_m as _;
+use efr32mg1_hal::peripherals::Peripherals;
 use efr32mg1_tradfri::resources::BoardResources;
 use embassy_executor::Spawner;
 use static_cell::StaticCell;
@@ -32,9 +33,7 @@ const SLOW_POLL_SECS: u32 = 30;
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
-    loop {
-        cortex_m::asm::nop();
-    }
+    platform::halt_with_led_raw()
 }
 
 #[embassy_executor::main]
@@ -43,9 +42,11 @@ async fn main(_spawner: Spawner) {
     // Take the singleton resource set. Each token is consumed exactly once,
     // enforcing mutual exclusion (PA0 → LED not PWM; flash → bootloader not SPI).
     let board = BoardResources::take().unwrap_or_else(|| platform::halt_with_led_raw());
+    let chip = Peripherals::take().unwrap_or_else(|| platform::halt_with_led_raw());
 
     // Platform startup owns only physical startup resources.
     platform::init(board.pa0, board.button);
+    platform::init_stack_watermark();
     platform::signal_boot().await;
 
     // Product policy selects the resident Gecko Bootloader OTA path rather
@@ -79,7 +80,13 @@ async fn main(_spawner: Spawner) {
             .unwrap_or_else(|_| platform::halt_with_led()),
     );
 
-    let device = ZigbeeDevice::builder(Efr32Mac::new())
+    let mut mac = Efr32Mac::new();
+    mac.install_aes_engine(chip.crypto)
+        .unwrap_or_else(|_| platform::halt_with_led());
+    let ieee = mac.extended_address();
+    rtt_target::rprintln!("[EFR32][sensor] AES_KAT_PASS ieee={:02X?}", ieee);
+
+    let device = ZigbeeDevice::builder(mac)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: SLOW_POLL_SECS * 1_000,
             wake_duration_ms: FAST_POLL_MS,
@@ -102,11 +109,16 @@ async fn main(_spawner: Spawner) {
     device.bdb_mut().attributes_mut().primary_channel_set = BDB_POPULAR_CHANNEL_SET;
     device.bdb_mut().attributes_mut().secondary_channel_set = BDB_POPULAR_CHANNEL_FALLBACK_SET;
 
-    let node = ZigbeeNode::new(
-        device,
-        SECURITY.init(efr32mg1_tradfri_product::storage::security_store()),
-        profile,
-    );
+    let security = SECURITY.init(efr32mg1_tradfri_product::storage::security_store());
+    match device.reset_security_state_if_identity_changed(security, ieee) {
+        Ok(true) => {
+            rtt_target::rprintln!("[EFR32][sensor] CLEARED_STALE_IDENTITY");
+        }
+        Ok(false) => {}
+        Err(_) => platform::halt_with_led(),
+    }
+
+    let node = ZigbeeNode::new(device, security, profile);
 
     APP.init(app::SensorApp::new(node, sht, battery))
         .run()

@@ -489,6 +489,42 @@ pub mod bl702 {
     pub use hardware::HardwareAes128;
 }
 
+/// Optional EFR32MG1 CRYPTO hardware-AES backend for [`Aes128Forward`].
+#[cfg(feature = "efr32mg1")]
+pub mod efr32mg1 {
+    #[cfg(target_arch = "arm")]
+    mod hardware {
+        use efr32mg1_hal::crypto::{AesEngine, AesError};
+
+        use crate::{Aes128Forward, AesKey};
+
+        /// Keyed AES-128 forward permutation borrowing the platform-owned
+        /// EFR32MG1 CRYPTO engine.
+        pub struct HardwareAes128<'engine> {
+            engine: &'engine mut AesEngine,
+            key: AesKey,
+        }
+
+        impl<'engine> HardwareAes128<'engine> {
+            pub fn new(engine: &'engine mut AesEngine, key: AesKey) -> Self {
+                Self { engine, key }
+            }
+        }
+
+        impl Aes128Forward for HardwareAes128<'_> {
+            type Error = AesError;
+
+            #[inline(always)]
+            fn encrypt_block(&mut self, block: &mut [u8; 16]) -> Result<(), Self::Error> {
+                self.engine.encrypt_block(&self.key, block)
+            }
+        }
+    }
+
+    #[cfg(target_arch = "arm")]
+    pub use hardware::HardwareAes128;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

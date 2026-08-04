@@ -2,8 +2,9 @@
 //!
 //! RTCC runs at the configured 32,768 Hz Embassy tick rate and remains
 //! available in EM2. A software queue multiplexes Embassy timers onto CC0,
-//! while `pm::now64` extends the 32-bit counter across overflow. This module
-//! is the sole owner of the production `RTCC` interrupt.
+//! while blocking application sleep uses CC1 and `pm::now64` extends the
+//! 32-bit counter across overflow. This module is the sole owner of the
+//! production `RTCC` interrupt.
 
 use core::cell::RefCell;
 use core::task::Waker;
@@ -107,15 +108,16 @@ pub fn init() {
 // ── RTCC interrupt handler ──────────────────────────────────────
 //
 // Owns the vector for every profile that compiles this module (see module
-// doc header). Reads and clears both flags it cares about in one shot
-// (`take_pending_flags`), advances the 64-bit epoch if the counter
-// wrapped, then re-arms hardware for whatever is now the soonest pending
-// software timer (if any).
+// doc header). Reads and clears CC0, CC1, and overflow in one shot. CC1 only
+// wakes the blocking application sleep; Embassy is re-armed exclusively for
+// its own CC0 event or an overflow that may expire a long software deadline.
 #[unsafe(no_mangle)]
 pub extern "C" fn RTCC() {
     let flags = pm::take_pending_flags();
     if flags.overflow {
         pm::bump_wrap_count();
     }
-    TIME_DRIVER.rearm();
+    if flags.cc0 || flags.overflow {
+        TIME_DRIVER.rearm();
+    }
 }

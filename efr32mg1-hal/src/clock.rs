@@ -136,6 +136,13 @@ pub fn enable_gpio_clock() {
 }
 
 #[inline]
+pub fn enable_crypto_clock() {
+    unsafe {
+        modify(CMU_HFBUSCLKEN0, 1 << 1, 1 << 1);
+    }
+}
+
+#[inline]
 pub fn enable_i2c0_clock() {
     unsafe {
         modify(CMU_CTRL, CMU_CTRL_HFPERCLKEN, CMU_CTRL_HFPERCLKEN);

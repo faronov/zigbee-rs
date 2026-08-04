@@ -5,7 +5,7 @@
 //! direct GPIO LED (not PWM). Product code separately selects the external
 //! flash owner for OTA.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use efr32mg1_tradfri::resources::{ButtonToken, Pa0Output};
 use efr32mg1_tradfri::{Button, Led};
@@ -20,6 +20,15 @@ static LED: Led = Led::new();
 /// Hardware initialization is performed by `ButtonToken::into_button()` during `init()`.
 static BUTTON: Button = Button::new();
 static BUTTON_EDGE_PENDING: AtomicBool = AtomicBool::new(false);
+static STACK_CANARY_LIMIT: AtomicU32 = AtomicU32::new(0);
+
+const STACK_CANARY: u32 = 0xE2F3_A4B5;
+const STACK_CANARY_HEADROOM: usize = 256;
+
+unsafe extern "C" {
+    static _stack_end: u8;
+    static _stack_start: u8;
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn GPIO_ODD() {
@@ -37,7 +46,7 @@ pub fn init(pa0: Pa0Output, button: ButtonToken) {
     let channels = rtt_target::rtt_init! {
         up: {
             0: {
-                size: 64,
+                size: 128,
                 mode: rtt_target::ChannelMode::NoBlockSkip,
                 name: "Terminal"
             }
@@ -68,6 +77,41 @@ pub fn init(pa0: Pa0Output, button: ButtonToken) {
         halt_with_led();
     }
     time_driver::init();
+}
+
+pub fn init_stack_watermark() {
+    let stack_end = core::ptr::addr_of!(_stack_end) as usize;
+    let limit =
+        (cortex_m::register::msp::read() as usize).saturating_sub(STACK_CANARY_HEADROOM) & !3;
+    if limit <= stack_end {
+        halt_with_led();
+    }
+
+    let mut cursor = stack_end;
+    while cursor < limit {
+        unsafe { core::ptr::write_volatile(cursor as *mut u32, STACK_CANARY) };
+        cursor += core::mem::size_of::<u32>();
+    }
+    STACK_CANARY_LIMIT.store(limit as u32, Ordering::Release);
+}
+
+pub fn stack_high_water_bytes() -> usize {
+    let limit = STACK_CANARY_LIMIT.load(Ordering::Acquire) as usize;
+    if limit == 0 {
+        return 0;
+    }
+
+    let stack_end = core::ptr::addr_of!(_stack_end) as usize;
+    let stack_start = core::ptr::addr_of!(_stack_start) as usize;
+    let mut cursor = stack_end;
+    while cursor < limit {
+        let word = unsafe { core::ptr::read_volatile(cursor as *const u32) };
+        if word != STACK_CANARY {
+            break;
+        }
+        cursor += core::mem::size_of::<u32>();
+    }
+    stack_start.saturating_sub(cursor)
 }
 
 pub async fn signal_boot() {
