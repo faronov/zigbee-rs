@@ -410,6 +410,61 @@ fn ota_cluster_block_write_action() {
 }
 
 #[test]
+fn ota_cluster_ignores_stale_and_future_blocks() {
+    let mut cluster = OtaCluster::new(0x1234, 0x0001, 1);
+    cluster.start_query();
+
+    let mut query_response = [0u8; 13];
+    query_response[0] = 0x00;
+    query_response[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    query_response[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    query_response[5..9].copy_from_slice(&2u32.to_le_bytes());
+    query_response[9..13].copy_from_slice(&128u32.to_le_bytes());
+    cluster.process_server_command(CMD_QUERY_NEXT_IMAGE_RESPONSE.0, &query_response);
+
+    let mut block = [0u8; 18];
+    block[0] = 0x00;
+    block[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    block[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    block[5..9].copy_from_slice(&2u32.to_le_bytes());
+    block[13] = 4;
+    block[14..18].copy_from_slice(&[1, 2, 3, 4]);
+
+    assert!(matches!(
+        cluster.process_server_command(CMD_IMAGE_BLOCK_RESPONSE.0, &block),
+        OtaAction::WriteBlock { offset: 0, .. }
+    ));
+    assert!(matches!(
+        cluster.state(),
+        OtaState::Downloading { offset: 4, .. }
+    ));
+
+    let stale = cluster.process_server_command_with_outcome(CMD_IMAGE_BLOCK_RESPONSE.0, &block);
+    assert!(!stale.accepted);
+    assert!(matches!(stale.action, OtaAction::None));
+
+    block[9..13].copy_from_slice(&8u32.to_le_bytes());
+    let future = cluster.process_server_command_with_outcome(CMD_IMAGE_BLOCK_RESPONSE.0, &block);
+    assert!(!future.accepted);
+    assert!(matches!(future.action, OtaAction::None));
+    assert!(matches!(
+        cluster.state(),
+        OtaState::Downloading { offset: 4, .. }
+    ));
+}
+
+#[test]
+fn ota_cluster_ignores_image_notify_while_active() {
+    let mut cluster = OtaCluster::new(0x1234, 0x0001, 1);
+    cluster.start_query();
+
+    let outcome = cluster.process_server_command_with_outcome(CMD_IMAGE_NOTIFY.0, &[0x00, 100]);
+    assert!(!outcome.accepted);
+    assert!(matches!(outcome.action, OtaAction::None));
+    assert_eq!(cluster.state(), OtaState::QuerySent);
+}
+
+#[test]
 fn ota_cluster_abort() {
     let mut cluster = OtaCluster::new(0x1234, 0x0001, 0x00000001);
     cluster.start_query();
@@ -562,6 +617,8 @@ fn ota_manager_full_download_flow() {
 
     // 3. Send OTA file data in 48-byte blocks
     let mut offset = 0u32;
+    let mut final_block = [0u8; 64];
+    let mut final_block_len = 0usize;
     while offset < ota_total {
         let end = ((offset + 48) as usize).min(ota_file.len());
         let chunk = &ota_file[offset as usize..end];
@@ -575,18 +632,32 @@ fn ota_manager_full_download_flow() {
         block[9..13].copy_from_slice(&offset.to_le_bytes());
         block[13] = chunk_len as u8;
         block[14..14 + chunk_len].copy_from_slice(chunk);
+        if end == ota_file.len() {
+            final_block_len = 14 + chunk_len;
+            final_block[..final_block_len].copy_from_slice(&block[..final_block_len]);
+        }
 
         let event = mgr.handle_incoming(0x05, &block[..14 + chunk_len], None);
         assert!(event.is_some()); // Progress event
 
-        // Tick to process write → next block request
-        mgr.tick(0);
-
         offset += chunk_len as u32;
+        if offset < ota_total {
+            let next = mgr
+                .take_pending_frame()
+                .expect("next block request must be queued immediately");
+            assert_eq!(pending_block_offset(&next), offset);
+        }
     }
 
-    // Download complete — tick should have triggered verify + end request
-    assert!(mgr.take_pending_frame().is_some()); // End request
+    // Download complete — verify + end request are queued by the final block.
+    assert!(mgr
+        .handle_incoming(0x05, &final_block[..final_block_len], None)
+        .is_none());
+    let end_request = mgr
+        .take_pending_frame()
+        .expect("duplicate final block must preserve Upgrade End Request");
+    assert_eq!(end_request.zcl_data[2], CMD_UPGRADE_END_REQUEST.0);
+    assert_eq!(mgr.state(), OtaState::WaitingActivate);
 
     // 4. Receive upgrade end response: upgrade NOW
     let mut end_resp = [0u8; 16];
@@ -728,6 +799,194 @@ fn ota_manager_requeues_request_after_transport_failure() {
         .take_pending_frame()
         .expect("block request replaces answered query retry");
     assert_eq!(next.zcl_data[2], CMD_IMAGE_BLOCK_REQUEST.0);
+}
+
+fn pending_block_offset(frame: &zigbee_runtime::ota::PendingOtaFrame) -> u32 {
+    u32::from_le_bytes([
+        frame.zcl_data[12],
+        frame.zcl_data[13],
+        frame.zcl_data[14],
+        frame.zcl_data[15],
+    ])
+}
+
+fn ota_manager_waiting_for_first_block(
+) -> zigbee_runtime::ota::OtaManager<zigbee_runtime::firmware_writer::MockFirmwareWriter> {
+    use zigbee_runtime::firmware_writer::MockFirmwareWriter;
+    use zigbee_runtime::ota::{OtaConfig, OtaManager};
+
+    let mut manager = OtaManager::new(
+        MockFirmwareWriter::new(4096),
+        OtaConfig {
+            manufacturer_code: 0x1234,
+            image_type: 0x0001,
+            current_version: 1,
+            endpoint: 1,
+            block_size: 48,
+            auto_accept: true,
+            hardware_version: None,
+        },
+    );
+    manager.start_query();
+    let _ = manager.take_pending_frame();
+
+    let mut response = [0u8; 13];
+    response[0] = 0x00;
+    response[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    response[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    response[5..9].copy_from_slice(&2u32.to_le_bytes());
+    response[9..13].copy_from_slice(&1024u32.to_le_bytes());
+    manager.handle_incoming(CMD_QUERY_NEXT_IMAGE_RESPONSE.0, &response, None);
+    manager
+}
+
+#[test]
+fn ota_manager_retries_expected_block_after_deadline() {
+    let mut manager = ota_manager_waiting_for_first_block();
+    let initial = manager
+        .take_pending_frame()
+        .expect("initial block request must be queued");
+    assert_eq!(pending_block_offset(&initial), 0);
+    let initial_seq = initial.zcl_data[1];
+
+    assert!(manager.tick(1).is_none());
+    assert!(manager.take_pending_frame().is_none());
+    assert!(manager.tick(1).is_none());
+    let retry = manager
+        .take_pending_frame()
+        .expect("first logical retry must be queued");
+    assert_eq!(pending_block_offset(&retry), 0);
+    assert_eq!(retry.zcl_data[1], initial_seq);
+
+    for _ in 0..2 {
+        assert!(manager.tick(2).is_none());
+        let retry = manager
+            .take_pending_frame()
+            .expect("bounded logical retry must be queued");
+        assert_eq!(pending_block_offset(&retry), 0);
+        assert_eq!(retry.zcl_data[1], initial_seq);
+    }
+
+    assert!(manager.tick(2).is_none());
+    assert!(manager.take_pending_frame().is_none());
+}
+
+#[test]
+fn ota_manager_queues_next_block_immediately_after_write() {
+    let mut manager = ota_manager_waiting_for_first_block();
+    let _ = manager.take_pending_frame();
+
+    let mut block = [0u8; 18];
+    block[0] = 0x00;
+    block[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    block[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    block[5..9].copy_from_slice(&2u32.to_le_bytes());
+    block[13] = 4;
+    block[14..18].copy_from_slice(&[1, 2, 3, 4]);
+
+    assert!(manager
+        .handle_incoming(CMD_IMAGE_BLOCK_RESPONSE.0, &block, None)
+        .is_some());
+    let next = manager
+        .take_pending_frame()
+        .expect("successful write must queue the next block without a tick");
+    assert_eq!(pending_block_offset(&next), 4);
+}
+
+#[test]
+fn ota_manager_stale_block_does_not_cancel_requeued_request() {
+    let mut manager = ota_manager_waiting_for_first_block();
+    let _ = manager.take_pending_frame();
+
+    let mut block = [0u8; 18];
+    block[0] = 0x00;
+    block[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    block[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    block[5..9].copy_from_slice(&2u32.to_le_bytes());
+    block[13] = 4;
+    block[14..18].copy_from_slice(&[1, 2, 3, 4]);
+    manager.handle_incoming(CMD_IMAGE_BLOCK_RESPONSE.0, &block, None);
+
+    let request = manager
+        .take_pending_frame()
+        .expect("next block request must be queued");
+    assert_eq!(pending_block_offset(&request), 4);
+    assert!(manager.requeue_pending_frame(request));
+
+    assert!(manager
+        .handle_incoming(CMD_IMAGE_BLOCK_RESPONSE.0, &block, None)
+        .is_none());
+    let preserved = manager
+        .take_pending_frame()
+        .expect("stale response must not clear the outstanding retry");
+    assert_eq!(pending_block_offset(&preserved), 4);
+}
+
+#[test]
+fn ota_manager_rejects_stale_status_only_block_response() {
+    let mut manager = ota_manager_waiting_for_first_block();
+    let initial = manager
+        .take_pending_frame()
+        .expect("initial block request must be queued");
+    let initial_seq = initial.zcl_data[1];
+
+    let mut block = [0u8; 18];
+    block[0] = 0x00;
+    block[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    block[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    block[5..9].copy_from_slice(&2u32.to_le_bytes());
+    block[13] = 4;
+    block[14..18].copy_from_slice(&[1, 2, 3, 4]);
+    manager.handle_incoming(CMD_IMAGE_BLOCK_RESPONSE.0, &block, None);
+
+    let current = manager
+        .take_pending_frame()
+        .expect("next block request must be queued");
+    let current_seq = current.zcl_data[1];
+    assert_ne!(current_seq, initial_seq);
+    assert!(manager.requeue_pending_frame(current));
+
+    let mut wait = [0u8; 11];
+    wait[0] = 0x97;
+    wait[1..5].copy_from_slice(&100u32.to_le_bytes());
+    wait[5..9].copy_from_slice(&110u32.to_le_bytes());
+    wait[9..11].copy_from_slice(&1u16.to_le_bytes());
+    assert!(manager
+        .handle_incoming_with_sequence(CMD_IMAGE_BLOCK_RESPONSE.0, &wait, Some(initial_seq), None)
+        .is_none());
+    assert!(matches!(
+        manager.state(),
+        OtaState::Downloading { offset: 4, .. }
+    ));
+    let preserved = manager
+        .take_pending_frame()
+        .expect("stale status response must not clear the current request");
+    assert_eq!(pending_block_offset(&preserved), 4);
+    assert_eq!(preserved.zcl_data[1], current_seq);
+}
+
+#[test]
+fn ota_manager_stale_block_does_not_refresh_response_timeout() {
+    use zigbee_runtime::event_loop::StackEvent;
+
+    let mut manager = ota_manager_waiting_for_first_block();
+    let _ = manager.take_pending_frame();
+
+    let mut block = [0u8; 18];
+    block[0] = 0x00;
+    block[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+    block[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+    block[5..9].copy_from_slice(&2u32.to_le_bytes());
+    block[13] = 4;
+    block[14..18].copy_from_slice(&[1, 2, 3, 4]);
+    manager.handle_incoming(CMD_IMAGE_BLOCK_RESPONSE.0, &block, None);
+    let _ = manager.take_pending_frame();
+
+    assert!(manager.tick(119).is_none());
+    assert!(manager
+        .handle_incoming(CMD_IMAGE_BLOCK_RESPONSE.0, &block, None)
+        .is_none());
+    assert!(matches!(manager.tick(1), Some(StackEvent::OtaFailed)));
 }
 
 #[test]

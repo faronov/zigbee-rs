@@ -53,6 +53,8 @@ pub enum AesError {
     /// A zero poll budget would make every hardware operation fail
     /// immediately.
     ZeroIterations,
+    /// The CRYPTO HFBUS clock could not be enabled.
+    ClockUnavailable,
     /// CRYPTO remained busy beyond the configured bounded wait.
     Timeout,
     /// An on-silicon known-answer result did not match standard AES-128.
@@ -61,6 +63,10 @@ pub enum AesError {
 
 #[cfg(any(target_arch = "arm", test))]
 trait CryptoRegisters {
+    fn crypto_clock_enabled(&mut self) -> bool {
+        true
+    }
+    fn enable_crypto_clock(&mut self) {}
     fn read_status(&mut self) -> u32;
     fn write_ctrl(&mut self, value: u32);
     fn write_wac(&mut self, value: u32);
@@ -90,6 +96,14 @@ impl HwRegisters {
 
 #[cfg(target_arch = "arm")]
 impl CryptoRegisters for HwRegisters {
+    fn crypto_clock_enabled(&mut self) -> bool {
+        clock::crypto_clock_enabled()
+    }
+
+    fn enable_crypto_clock(&mut self) {
+        clock::enable_crypto_clock();
+    }
+
     fn read_status(&mut self) -> u32 {
         unsafe { Self::read(REG_STATUS) }
     }
@@ -157,7 +171,17 @@ fn write_block_words(mut write_word: impl FnMut(u32), block: &[u8; 16]) {
 }
 
 #[cfg(any(target_arch = "arm", test))]
-fn run_block<R: CryptoRegisters>(
+fn restore_clock<R: CryptoRegisters>(registers: &mut R) -> Result<bool, AesError> {
+    let was_enabled = registers.crypto_clock_enabled();
+    registers.enable_crypto_clock();
+    if !registers.crypto_clock_enabled() {
+        return Err(AesError::ClockUnavailable);
+    }
+    Ok(!was_enabled)
+}
+
+#[cfg(any(target_arch = "arm", test))]
+fn run_block_clocked<R: CryptoRegisters>(
     registers: &mut R,
     key: &[u8; 16],
     input: &[u8; 16],
@@ -182,18 +206,43 @@ fn run_block<R: CryptoRegisters>(
 }
 
 #[cfg(any(target_arch = "arm", test))]
-fn self_test_with<R: CryptoRegisters>(
+fn self_test_clocked<R: CryptoRegisters>(
     registers: &mut R,
     timeout_iterations: u32,
 ) -> Result<(), AesError> {
     for (key, plaintext, ciphertext) in SELF_TEST_VECTORS.iter() {
         let mut output = [0u8; 16];
-        run_block(registers, key, plaintext, &mut output, timeout_iterations)?;
+        run_block_clocked(registers, key, plaintext, &mut output, timeout_iterations)?;
         if &output != ciphertext {
             return Err(AesError::KnownAnswerMismatch);
         }
     }
     Ok(())
+}
+
+#[cfg(any(target_arch = "arm", test))]
+fn run_block<R: CryptoRegisters>(
+    registers: &mut R,
+    key: &[u8; 16],
+    input: &[u8; 16],
+    output: &mut [u8; 16],
+    timeout_iterations: u32,
+) -> Result<(), AesError> {
+    if restore_clock(registers)? {
+        // Resident bootloader services may gate or repurpose CRYPTO. Validate
+        // the accelerator before publishing security output after a restore.
+        self_test_clocked(registers, timeout_iterations)?;
+    }
+    run_block_clocked(registers, key, input, output, timeout_iterations)
+}
+
+#[cfg(any(target_arch = "arm", test))]
+fn self_test_with<R: CryptoRegisters>(
+    registers: &mut R,
+    timeout_iterations: u32,
+) -> Result<(), AesError> {
+    restore_clock(registers)?;
+    self_test_clocked(registers, timeout_iterations)
 }
 
 /// Owns the EFR32MG1 CRYPTO AES-128 accelerator.
@@ -217,8 +266,9 @@ impl AesEngine {
         timeout_iterations: u32,
     ) -> Result<Self, AesError> {
         let timeout_iterations = validate_timeout_iterations(timeout_iterations)?;
-        clock::enable_crypto_clock();
-        wait_idle(&mut HwRegisters, timeout_iterations)?;
+        let mut registers = HwRegisters;
+        restore_clock(&mut registers)?;
+        wait_idle(&mut registers, timeout_iterations)?;
         Ok(Self {
             _peripheral: peripheral,
             timeout_iterations,
@@ -300,6 +350,10 @@ mod tests {
         started: bool,
         busy_before_start: bool,
         busy_reads_after_start: Option<u32>,
+        clock_enabled: bool,
+        clock_enable_succeeds: bool,
+        clock_enable_calls: u32,
+        force_zero_output: bool,
     }
 
     impl MockRegisters {
@@ -315,10 +369,20 @@ mod tests {
                 started: false,
                 busy_before_start: false,
                 busy_reads_after_start: Some(1),
+                clock_enabled: true,
+                clock_enable_succeeds: true,
+                clock_enable_calls: 0,
+                force_zero_output: false,
             }
         }
 
         fn encrypt_loaded_block(&mut self) {
+            if self.force_zero_output {
+                self.output_words = [0; 4];
+                self.output_index = 0;
+                return;
+            }
+
             let mut key = [0u8; 16];
             let mut input = [0u8; 16];
             for (index, word) in self.key_words.iter().enumerate() {
@@ -340,6 +404,17 @@ mod tests {
     }
 
     impl CryptoRegisters for MockRegisters {
+        fn crypto_clock_enabled(&mut self) -> bool {
+            self.clock_enabled
+        }
+
+        fn enable_crypto_clock(&mut self) {
+            self.clock_enable_calls += 1;
+            if self.clock_enable_succeeds {
+                self.clock_enabled = true;
+            }
+        }
+
         fn read_status(&mut self) -> u32 {
             if !self.started {
                 return if self.busy_before_start {
@@ -463,6 +538,56 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn clock_restore_revalidates_engine_before_encrypting() {
+        let (key, plaintext, ciphertext) = SELF_TEST_VECTORS[0];
+        let mut registers = MockRegisters::completing();
+        registers.clock_enabled = false;
+        let mut output = [0u8; 16];
+
+        run_block(&mut registers, &key, &plaintext, &mut output, 4).unwrap();
+
+        assert_eq!(output, ciphertext);
+        assert_eq!(registers.clock_enable_calls, 1);
+        assert_eq!(
+            registers
+                .events
+                .iter()
+                .filter(|event| matches!(event, Event::Cmd(_)))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn unavailable_clock_is_fail_closed() {
+        let mut registers = MockRegisters::completing();
+        registers.clock_enabled = false;
+        registers.clock_enable_succeeds = false;
+        let mut output = [0xA5; 16];
+
+        assert_eq!(
+            run_block(&mut registers, &[0; 16], &[0; 16], &mut output, 4),
+            Err(AesError::ClockUnavailable)
+        );
+        assert_eq!(output, [0xA5; 16]);
+        assert!(registers.events.is_empty());
+    }
+
+    #[test]
+    fn restored_dead_peripheral_is_fail_closed() {
+        let mut registers = MockRegisters::completing();
+        registers.clock_enabled = false;
+        registers.force_zero_output = true;
+        let mut output = [0x5A; 16];
+
+        assert_eq!(
+            run_block(&mut registers, &[0; 16], &[0; 16], &mut output, 4),
+            Err(AesError::KnownAnswerMismatch)
+        );
+        assert_eq!(output, [0x5A; 16]);
     }
 
     #[test]

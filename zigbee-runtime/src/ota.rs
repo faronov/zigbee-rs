@@ -23,6 +23,8 @@ use zigbee_zcl::frame::ZclFrame;
 use zigbee_zcl::{ClusterDirection, CommandId};
 
 const OTA_RESPONSE_TIMEOUT_SECS: u32 = 120;
+const OTA_BLOCK_RETRY_INTERVAL_SECS: u32 = 2;
+const OTA_BLOCK_MAX_RETRIES: u8 = 3;
 
 /// OTA configuration.
 #[derive(Debug, Clone)]
@@ -67,6 +69,13 @@ pub struct PendingOtaFrame {
     pub cluster_id: u16,
 }
 
+struct BlockRetry {
+    request: ImageBlockRequest,
+    zcl_seq: u8,
+    elapsed_secs: u32,
+    retries_sent: u8,
+}
+
 /// OTA Manager — coordinates OTA cluster + firmware writer.
 ///
 /// Handles the OTA file format: parses the OTA image header from the
@@ -80,10 +89,8 @@ pub struct OtaManager<F: FirmwareWriter> {
     writer: F,
     /// OTA configuration.
     config: OtaConfig,
-    /// Pending outgoing frame (queued for sending in tick()).
+    /// Pending outgoing frame queued for the transport.
     pending_frame: Option<PendingOtaFrame>,
-    /// Whether we need to request the next block after a write.
-    need_next_block: bool,
     /// ZCL sequence counter (borrowed from device).
     zcl_seq: u8,
     /// Download context — tracks header parsing and payload offset.
@@ -92,6 +99,8 @@ pub struct OtaManager<F: FirmwareWriter> {
     query_pending_accept: bool,
     /// Time spent waiting for the next OTA server response.
     response_wait_secs: u32,
+    /// Logical retry state for the currently outstanding block request.
+    block_retry: Option<BlockRetry>,
     /// Whether the verified image is waiting for application-controlled activation.
     activation_pending: bool,
 }
@@ -152,11 +161,11 @@ impl<F: FirmwareWriter> OtaManager<F> {
             writer,
             config,
             pending_frame: None,
-            need_next_block: false,
             zcl_seq: 0,
             download_ctx: OtaDownloadCtx::new(),
             query_pending_accept: false,
             response_wait_secs: 0,
+            block_retry: None,
             activation_pending: false,
         }
     }
@@ -199,6 +208,7 @@ impl<F: FirmwareWriter> OtaManager<F> {
     /// Initiate an OTA image query.
     pub fn start_query(&mut self) -> Option<StackEvent> {
         self.response_wait_secs = 0;
+        self.block_retry = None;
         self.activation_pending = false;
         let action = self.cluster.start_query();
         self.process_action(action)
@@ -213,16 +223,39 @@ impl<F: FirmwareWriter> OtaManager<F> {
         payload: &[u8],
         server_ieee: Option<u64>,
     ) -> Option<StackEvent> {
-        self.response_wait_secs = 0;
-        // A response proves that an ambiguously failed request reached the
-        // server, so discard any retry copy before queuing the next request.
-        self.pending_frame = None;
-        // Update UpgradeServerID from the server that sent us a command
-        if let Some(ieee) = server_ieee {
-            self.cluster.set_upgrade_server_id(ieee);
+        self.handle_incoming_with_sequence(cmd_id, payload, None, server_ieee)
+    }
+
+    /// Process an incoming OTA command with its ZCL transaction sequence.
+    pub fn handle_incoming_with_sequence(
+        &mut self,
+        cmd_id: u8,
+        payload: &[u8],
+        zcl_seq: Option<u8>,
+        server_ieee: Option<u64>,
+    ) -> Option<StackEvent> {
+        if cmd_id == ota::CMD_IMAGE_BLOCK_RESPONSE.0
+            && payload.first().is_some_and(|status| *status != 0x00)
+            && zcl_seq.is_some()
+            && self.block_retry.as_ref().map(|retry| retry.zcl_seq) != zcl_seq
+        {
+            return None;
         }
-        let action = self.cluster.process_server_command(cmd_id, payload);
-        self.process_action(action)
+
+        let outcome = self
+            .cluster
+            .process_server_command_with_outcome(cmd_id, payload);
+        if outcome.accepted {
+            self.response_wait_secs = 0;
+            // Only a matching response proves that the outstanding request
+            // reached the server. Stale blocks must not erase its retry copy.
+            self.pending_frame = None;
+            self.block_retry = None;
+            if let Some(ieee) = server_ieee {
+                self.cluster.set_upgrade_server_id(ieee);
+            }
+        }
+        self.process_action(outcome.action)
     }
 
     /// Tick the OTA engine (called from runtime tick).
@@ -243,42 +276,34 @@ impl<F: FirmwareWriter> OtaManager<F> {
             self.response_wait_secs = 0;
         }
 
-        // Handle pending next-block request after a write
-        if self.need_next_block {
-            self.need_next_block = false;
-
-            // Check if download is complete
-            if self.cluster.is_download_complete() {
-                // Save the firmware size BEFORE state transition
-                let fw_size = self.download_ctx.firmware_size;
-                self.cluster.mark_download_complete();
-                // Verify using actual firmware bytes written, not OTA file size
-                let verify_size = if fw_size > 0 {
-                    fw_size
-                } else {
-                    self.download_ctx.firmware_written
-                };
-                match self.writer.verify(verify_size, None) {
-                    Ok(()) => {
-                        let action = self.cluster.mark_verified();
-                        return self.process_action(action);
-                    }
-                    Err(e) => {
-                        log::warn!("[OTA] Verify failed: {:?}", e);
-                        let action = self.cluster.mark_failed();
-                        return self.process_action(action);
-                    }
-                }
-            }
-
-            // Request next block
-            let action = self.cluster.next_block_request();
+        // Handle WaitForData countdown
+        let action = self.cluster.tick(elapsed_secs);
+        if !matches!(&action, OtaAction::None) {
             return self.process_action(action);
         }
 
-        // Handle WaitForData countdown
-        let action = self.cluster.tick(elapsed_secs);
-        self.process_action(action)
+        let retry_request = if self.pending_frame.is_none()
+            && matches!(self.cluster.state(), OtaState::Downloading { .. })
+        {
+            self.block_retry.as_mut().and_then(|retry| {
+                retry.elapsed_secs = retry.elapsed_secs.saturating_add(elapsed_secs as u32);
+                if retry.elapsed_secs >= OTA_BLOCK_RETRY_INTERVAL_SECS
+                    && retry.retries_sent < OTA_BLOCK_MAX_RETRIES
+                {
+                    retry.elapsed_secs = 0;
+                    retry.retries_sent += 1;
+                    Some((retry.request.clone(), retry.zcl_seq))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        if let Some((request, zcl_seq)) = retry_request {
+            self.build_and_queue_block_request(&request, zcl_seq);
+        }
+        None
     }
 
     /// Take the pending outgoing frame (consumed by runtime to send via APS).
@@ -313,10 +338,10 @@ impl<F: FirmwareWriter> OtaManager<F> {
         self.cluster.abort();
         let _ = self.writer.abort();
         self.pending_frame = None;
-        self.need_next_block = false;
         self.download_ctx.reset();
         self.query_pending_accept = false;
         self.response_wait_secs = 0;
+        self.block_retry = None;
         self.activation_pending = false;
     }
 
@@ -343,6 +368,7 @@ impl<F: FirmwareWriter> OtaManager<F> {
             OtaAction::SendQuery(req) => {
                 // Reset download context for new OTA session
                 self.download_ctx.reset();
+                self.block_retry = None;
                 self.build_and_queue_request(ota::CMD_QUERY_NEXT_IMAGE_REQUEST, &req);
                 None
             }
@@ -380,7 +406,14 @@ impl<F: FirmwareWriter> OtaManager<F> {
                         }
                     }
                 }
-                self.build_and_queue_block_request(&req);
+                let zcl_seq = self.next_seq();
+                self.block_retry = Some(BlockRetry {
+                    request: req.clone(),
+                    zcl_seq,
+                    elapsed_secs: 0,
+                    retries_sent: 0,
+                });
+                self.build_and_queue_block_request(&req, zcl_seq);
                 // Emit OtaImageAvailable on first block request (start of download)
                 if req.file_offset == 0 {
                     let total = match self.cluster.state() {
@@ -397,8 +430,40 @@ impl<F: FirmwareWriter> OtaManager<F> {
             }
             OtaAction::WriteBlock { offset, data } => match self.write_ota_block(offset, &data) {
                 Ok(()) => {
-                    self.need_next_block = true;
                     let progress = self.cluster.progress_percent();
+                    if self.cluster.is_download_complete() {
+                        let verify_size = if self.download_ctx.firmware_size > 0 {
+                            self.download_ctx.firmware_size
+                        } else {
+                            self.download_ctx.firmware_written
+                        };
+                        self.cluster.mark_download_complete();
+                        match self.writer.verify(verify_size, None) {
+                            Ok(()) => {
+                                let action = self.cluster.mark_verified();
+                                let status = self.process_action(action);
+                                debug_assert!(status.is_none());
+                                if status.is_some() {
+                                    return status;
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("[OTA] Verify failed: {:?}", e);
+                                let action = self.cluster.mark_failed();
+                                return self.process_action(action);
+                            }
+                        }
+                    } else {
+                        // Queue the next stop-and-wait request now. The
+                        // transport that delivered this block can send it
+                        // before the application enters another poll cycle.
+                        let action = self.cluster.next_block_request();
+                        let followup = self.process_action(action);
+                        debug_assert!(followup.is_none());
+                        if followup.is_some() {
+                            return followup;
+                        }
+                    }
                     Some(StackEvent::OtaProgress { percent: progress })
                 }
                 Err(e) => {
@@ -409,11 +474,13 @@ impl<F: FirmwareWriter> OtaManager<F> {
                 }
             },
             OtaAction::SendEndRequest(req) => {
+                self.block_retry = None;
                 let failed = req.status != 0;
                 self.build_and_queue_end_request(&req);
                 failed.then_some(StackEvent::OtaFailed)
             }
             OtaAction::ActivateImage => {
+                self.block_retry = None;
                 self.activation_pending = true;
                 Some(StackEvent::OtaComplete)
             }
@@ -589,10 +656,9 @@ impl<F: FirmwareWriter> OtaManager<F> {
         self.queue_frame(frame);
     }
 
-    fn build_and_queue_block_request(&mut self, req: &ImageBlockRequest) {
-        let seq = self.next_seq();
+    fn build_and_queue_block_request(&mut self, req: &ImageBlockRequest, zcl_seq: u8) {
         let mut frame = ZclFrame::new_cluster_specific(
-            seq,
+            zcl_seq,
             ota::CMD_IMAGE_BLOCK_REQUEST,
             ClusterDirection::ClientToServer,
             false,

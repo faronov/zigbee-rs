@@ -630,9 +630,17 @@ impl SensorApp {
         }
         self.service_ota(elapsed).await;
 
-        if self.annce_retries_left > 0 && now.duration_since(self.last_annce).as_secs() >= 8 {
+        // A successful rejoin above resets `last_annce` after the caller's
+        // `now` was captured, so refresh the clock before comparing them.
+        let annce_now = Instant::now();
+        if self.annce_retries_left > 0
+            && annce_now
+                .saturating_duration_since(self.last_annce)
+                .as_secs()
+                >= 8
+        {
             self.annce_retries_left -= 1;
-            self.last_annce = now;
+            self.last_annce = annce_now;
             self.checkpoint_security();
             let _ = self.node.device_mut().send_device_annce().await;
             self.checkpoint_security();

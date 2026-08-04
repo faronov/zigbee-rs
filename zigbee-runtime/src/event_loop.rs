@@ -507,16 +507,11 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
             )
         {
             let indication = self.poll().await;
-            if forced {
-                // Only a keepalive-driven poll feeds the bounded failure
-                // counter; an application poll that finds nothing is normal.
-                // `forced` is only ever true for an `EndDevice`, so this
-                // dispatch reaches the client counter and no other role.
-                if let Err(error) = &indication {
-                    log::warn!("[Runtime] Forced keepalive poll failed: {:?}", error);
-                }
-                R::ed_note_forced_poll_result(self, indication.is_ok());
-            }
+            // Failure accounting and recovery now live in the single `poll()`
+            // choke point (which also covers application-driven OTA fast polls
+            // that call `poll()` directly), so this path only needs to consume a
+            // delivered frame. `forced` still selects the keepalive poll cadence
+            // in the gate above.
             if let Ok(Some(frame)) = indication {
                 return self.process_incoming(&frame, clusters).await;
             }

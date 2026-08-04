@@ -31,6 +31,7 @@ const CMU_OSCENCMD_HFXODIS: u32 = 1 << 3;
 const CMU_HFCLK_HFRCO: u32 = 1;
 const CMU_HFCLK_HFXO: u32 = 2;
 const CMU_HFCLKSTATUS_SELECTED_MASK: u32 = 0x7;
+const CMU_HFBUSCLKEN0_CRYPTO: u32 = 1 << 1;
 const CMU_HFPRESC_MASK: u32 = 0x1F00;
 const CMU_HFCOREPER_PRESC_MASK: u32 = 0x1FF00;
 
@@ -138,8 +139,17 @@ pub fn enable_gpio_clock() {
 #[inline]
 pub fn enable_crypto_clock() {
     unsafe {
-        modify(CMU_HFBUSCLKEN0, 1 << 1, 1 << 1);
+        modify(
+            CMU_HFBUSCLKEN0,
+            CMU_HFBUSCLKEN0_CRYPTO,
+            CMU_HFBUSCLKEN0_CRYPTO,
+        );
     }
+}
+
+#[inline]
+pub fn crypto_clock_enabled() -> bool {
+    unsafe { read(CMU_HFBUSCLKEN0) & CMU_HFBUSCLKEN0_CRYPTO != 0 }
 }
 
 #[inline]

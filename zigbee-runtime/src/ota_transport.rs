@@ -132,6 +132,7 @@ impl OtaSession {
             cluster_id,
             frame_type,
             command_id,
+            seq_number,
             payload,
             ..
         } = event
@@ -163,7 +164,12 @@ impl OtaSession {
             Some(_) => {}
         }
 
-        let status = manager.handle_incoming(*command_id, payload.as_slice(), None);
+        let status = manager.handle_incoming_with_sequence(
+            *command_id,
+            payload.as_slice(),
+            Some(*seq_number),
+            None,
+        );
         self.note_status(&status);
         self.send_pending(device, manager).await;
         if manager.state() == OtaState::Idle {
@@ -642,18 +648,22 @@ mod tests {
             let end = ((offset as usize) + CHUNK).min(ota_file.len());
             let chunk = &ota_file[offset as usize..end];
             let event = block_response_event(server, ENDPOINT, version, offset, chunk);
+            let final_block = end == ota_file.len();
+            let sent_before = device.mac_mut().tx_history().len();
             let outcome = block_on(session.handle_event(device, Some(mgr), ENDPOINT, &event));
             let OtaEventOutcome::Consumed(status) = outcome else {
                 panic!("block response must be consumed as OTA traffic");
             };
+            if final_block && matches!(status, Some(StackEvent::OtaProgress { .. })) {
+                assert_eq!(
+                    device.mac_mut().tx_history().len(),
+                    sent_before + 1,
+                    "final block must send Upgrade End Request without a service tick"
+                );
+                assert_eq!(mgr.state(), OtaState::WaitingActivate);
+            }
             last_status = status;
             offset = end as u32;
-            // Drive the tick: the manager needs one to turn the completed
-            // write into either the next block request or, once the last
-            // block lands, the verify + Upgrade End Request step.
-            if let Some(status) = block_on(session.service(device, Some(mgr), 0)) {
-                last_status = Some(status);
-            }
         }
         last_status
     }

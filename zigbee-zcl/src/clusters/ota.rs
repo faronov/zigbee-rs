@@ -130,6 +130,15 @@ pub enum OtaAction {
     None,
 }
 
+/// Result of processing one OTA server command.
+#[derive(Debug)]
+pub struct OtaCommandOutcome {
+    /// Action for the runtime to perform.
+    pub action: OtaAction,
+    /// Whether the command matched the current OTA transaction.
+    pub accepted: bool,
+}
+
 // ── Command structures ──────────────────────────────────────────
 
 /// Query Next Image Request (client → server).
@@ -529,7 +538,18 @@ impl OtaCluster {
     ///
     /// Returns the action(s) the runtime should perform.
     pub fn process_server_command(&mut self, cmd_id: u8, payload: &[u8]) -> OtaAction {
-        match cmd_id {
+        self.process_server_command_with_outcome(cmd_id, payload)
+            .action
+    }
+
+    /// Process an OTA command and report whether it matched the active transaction.
+    pub fn process_server_command_with_outcome(
+        &mut self,
+        cmd_id: u8,
+        payload: &[u8],
+    ) -> OtaCommandOutcome {
+        let previous_state = self.state;
+        let action = match cmd_id {
             0x00 => self.handle_image_notify(payload),
             0x02 => self.handle_query_response(payload),
             0x05 => self.handle_block_response(payload),
@@ -538,7 +558,9 @@ impl OtaCluster {
                 log::warn!("[OTA] Unknown server command: 0x{:02X}", cmd_id);
                 OtaAction::None
             }
-        }
+        };
+        let accepted = !matches!(action, OtaAction::None) || self.state != previous_state;
+        OtaCommandOutcome { action, accepted }
     }
 
     /// Tick the OTA engine (called periodically).
@@ -659,6 +681,14 @@ impl OtaCluster {
     // ── Private command handlers ─────────────────────────────
 
     fn handle_image_notify(&mut self, payload: &[u8]) -> OtaAction {
+        if self.state != OtaState::Idle {
+            log::debug!(
+                "[OTA] Image Notify received in state {:?}, ignoring",
+                self.state
+            );
+            return OtaAction::None;
+        }
+
         // ImageNotify payload type determines what fields are present:
         //   0 = jitter only, 1 = +mfg, 2 = +image_type, 3 = +version
         // If fields are present and don't match our device, ignore.
@@ -793,7 +823,10 @@ impl OtaCluster {
                     log::warn!("[OTA] Ignoring block for a different image or offset");
                     return OtaAction::None;
                 }
-                let new_offset = block.file_offset + block.data_size as u32;
+                let Some(new_offset) = block.file_offset.checked_add(block.data_size as u32) else {
+                    log::warn!("[OTA] Rejecting image block with overflowing offset");
+                    return self.mark_failed();
+                };
                 if block.data_size == 0 || new_offset > self.target_size {
                     log::warn!("[OTA] Rejecting empty or oversized image block");
                     return self.mark_failed();

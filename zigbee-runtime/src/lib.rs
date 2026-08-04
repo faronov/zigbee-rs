@@ -1663,6 +1663,26 @@ mod resume_tests {
         (device, store)
     }
 
+    /// A resumed *sleepy* end device whose automatic poll cadence is
+    /// `poll_interval_ms`, so `run_sleepy_poll` polls on the application (not
+    /// forced-keepalive) path once the interval elapses.
+    fn resumed_sleepy_end_device(
+        state: PersistentSecurityState,
+        poll_interval_ms: u32,
+    ) -> (ZigbeeDevice<MockMac>, RamSecurityStateStore) {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::EndDevice)
+            .power_mode(crate::power::PowerMode::Sleepy {
+                poll_interval_ms,
+                wake_duration_ms: 0,
+            })
+            .build();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&state).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        (device, store)
+    }
+
     /// A secured NWK End Device Timeout Response from the coordinator.
     fn ed_timeout_response(status: u8, parent_info: u8, counter: u32) -> zigbee_mac::MacFrame {
         nwk_frame(
@@ -2046,6 +2066,127 @@ mod resume_tests {
         assert!(
             device.secure_rejoin_pending(),
             "a parent that stops answering polls must trigger the rejoin path"
+        );
+    }
+
+    #[test]
+    fn application_driven_polls_that_lose_the_parent_ack_trigger_recovery() {
+        // An OTA fast poll is an *application-driven* poll: the app calls the
+        // public `poll()` directly (see `service_joined_polls`), bypassing the
+        // forced-keepalive gate entirely. A parent that has silently stopped
+        // MAC-ACKing Data Requests surfaces as `Err(NoAck)` from the MAC, which
+        // must now advance the bounded failure counter in the single `poll()`
+        // choke point and hand recovery to the secure-rejoin retry path —
+        // exactly like a missed keepalive.
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x01, true, 14));
+        let _ = device.take_forced_poll();
+        device.mac_mut().set_poll_failures(64);
+        assert!(!device.secure_rejoin_pending());
+
+        // Mirror the application OTA fast-poll loop: call `poll()` directly.
+        for _ in 0..10 {
+            let _ = block_on(device.poll());
+            if device.secure_rejoin_pending() {
+                break;
+            }
+        }
+
+        assert!(
+            device.secure_rejoin_pending(),
+            "no-ACK application/OTA polls must drive the same recovery as keepalive loss"
+        );
+    }
+
+    #[test]
+    fn application_driven_empty_polls_are_normal_and_never_trigger_recovery() {
+        // With nothing queued the MAC returns `Ok(None)` — an ACKed-but-empty
+        // poll. The parent is reachable, so ordinary empty application polls
+        // must neither advance the failure counter nor schedule a rejoin, even
+        // when driven from the application `poll()` fast-poll loop.
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x01, true, 14));
+        let _ = device.take_forced_poll();
+        assert!(!device.secure_rejoin_pending());
+
+        for _ in 0..10 {
+            let _ = block_on(device.poll());
+        }
+
+        assert!(
+            !device.secure_rejoin_pending(),
+            "an ACKed-empty poll is normal and must not be conflated with parent loss"
+        );
+        assert_eq!(
+            device.ed_timeout().failures,
+            0,
+            "successful empty polls keep the failure counter clear"
+        );
+    }
+
+    #[test]
+    fn a_recovered_parent_ack_clears_accumulated_poll_failures() {
+        // A few no-ACK polls that stop short of the threshold must not leave a
+        // latent count behind once the parent answers again: any acknowledged
+        // poll (empty or not) clears the counter through the same choke point.
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x01, true, 14));
+        let _ = device.take_forced_poll();
+
+        device.mac_mut().set_poll_failures(2);
+        let _ = block_on(device.poll());
+        let _ = block_on(device.poll());
+        assert_eq!(device.ed_timeout().failures, 2);
+        assert!(!device.secure_rejoin_pending());
+
+        // Parent answers (empty) — counter resets before it can trip recovery.
+        let _ = block_on(device.poll());
+        assert_eq!(device.ed_timeout().failures, 0);
+        assert!(!device.secure_rejoin_pending());
+    }
+
+    #[test]
+    fn sleepy_tick_polls_also_participate_in_failure_accounting() {
+        // The automatic sleepy-poll path (`run_sleepy_poll`) shares the same
+        // `poll()` choke point, so a silent parent recovers there too.
+        let (mut device, _store) =
+            resumed_sleepy_end_device(negotiated_state(0x01, true, 14), 1_000);
+        let _ = device.take_forced_poll();
+        device.mac_mut().set_poll_failures(64);
+
+        let mut now_ms = 0u32;
+        for _ in 0..10 {
+            now_ms = now_ms.wrapping_add(1_000);
+            let _ = block_on(device.run_sleepy_poll(now_ms, &mut []));
+            if device.secure_rejoin_pending() {
+                break;
+            }
+        }
+
+        assert!(
+            device.secure_rejoin_pending(),
+            "automatic sleepy polls must also drive recovery on parent loss"
+        );
+    }
+
+    #[test]
+    fn a_pending_rejoin_suppresses_further_failure_accounting() {
+        // Once a secure rejoin is scheduled, a persistently silent parent —
+        // which under an OTA fast-poll cadence can fail many times per second —
+        // must not re-arm the retry or churn the counter (a recovery storm).
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x01, true, 14));
+        device.schedule_secure_rejoin_retry();
+        assert!(device.secure_rejoin_pending());
+
+        for _ in 0..20 {
+            device.record_end_device_keepalive_failure();
+        }
+
+        assert!(
+            device.secure_rejoin_pending(),
+            "the already-scheduled rejoin must still be pending"
+        );
+        assert_eq!(
+            device.ed_timeout().failures,
+            0,
+            "no counter churn while a rejoin is already pending"
         );
     }
 
@@ -4565,16 +4706,36 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// Request keepalive, in which case a poll does not reset its child timer
     /// and must not postpone the next request either.
     pub async fn poll(&mut self) -> Result<Option<McpsDataIndication>, MacError> {
-        let frame = self
+        let frame = match self
             .bdb
             .zdo_mut()
             .aps_mut()
             .nwk_mut()
             .mac_mut()
             .mlme_poll()
-            .await?;
+            .await
+        {
+            Ok(frame) => frame,
+            Err(error) => {
+                // The MAC now distinguishes an ACKed-but-empty poll (`Ok(None)`)
+                // from a poll that exhausted retries with no MAC ACK (this
+                // `Err`, e.g. `NoAck`): the parent is silent. Feed the bounded
+                // consecutive-failure counter — this is the single choke point
+                // every poll passes through (forced keepalive, automatic sleepy,
+                // and application-driven OTA fast polls via the public API), so
+                // a silently-stalled parent drives the existing storm-guarded
+                // secure-rejoin recovery regardless of what issued the poll. The
+                // hook is inert on non-end-device roles.
+                log::debug!("[Runtime] Poll to parent failed: {:?}", error);
+                R::ed_note_forced_poll_result(self, false);
+                return Err(error);
+            }
+        };
         self.power.record_poll(self.power_now_ms);
         R::ed_note_poll(self);
+        // An acknowledged poll (empty or not) proves the parent is reachable and
+        // clears the consecutive-failure counter.
+        R::ed_note_forced_poll_result(self, true);
         match frame {
             Some(frame) => {
                 self.power.record_activity(self.power_now_ms);
@@ -5382,19 +5543,31 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         self.reset_end_device_keepalive();
     }
 
-    /// Count one forced keepalive failure and, once a small bounded threshold
-    /// is reached, hand recovery to the existing secured-rejoin retry path.
+    /// Count one failed poll to the parent (forced keepalive *or*
+    /// application-driven, e.g. an OTA fast poll) and, once a small bounded
+    /// threshold is reached, hand recovery to the existing secured-rejoin retry
+    /// path.
+    ///
+    /// A recovery is only *scheduled* once: while a secure rejoin is already
+    /// pending, further no-ACK polls neither advance the counter nor re-arm the
+    /// retry deadline. This prevents a persistently silent parent — which under
+    /// an OTA fast-poll cadence can produce many failures per second — from
+    /// repeatedly pushing the retry out (a recovery storm / livelock) and lets
+    /// the scheduled rejoin actually fire.
     pub(crate) fn record_end_device_keepalive_failure(&mut self)
     where
         R: crate::role::EndDeviceRole,
     {
+        if self.secure_rejoin_pending() {
+            return;
+        }
         let failures = self.ed_timeout().failures.saturating_add(1);
         self.ed_timeout_mut().failures = failures;
         if failures < Self::ED_TIMEOUT_MAX_FAILURES {
             return;
         }
         self.ed_timeout_mut().failures = 0;
-        log::warn!("[Runtime] Keepalive to parent failing — scheduling secure rejoin");
+        log::warn!("[Runtime] Polls to parent failing — scheduling secure rejoin");
         self.schedule_secure_rejoin_retry();
     }
 

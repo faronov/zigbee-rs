@@ -260,11 +260,12 @@ impl Efr32Mac {
     ///
     /// Implements IEEE 802.15.4-2011 §5.1.1.4 (unslotted CSMA-CA) with
     /// optional ACK reception and retry loop per `macMaxFrameRetries`.
+    /// Returns the ACK Frame Pending bit when an ACK was requested.
     async fn csma_ca_transmit(
         &mut self,
         frame: &[u8],
         ack_requested: bool,
-    ) -> Result<(), MacError> {
+    ) -> Result<bool, MacError> {
         let max_retries = if ack_requested {
             self.max_frame_retries
         } else {
@@ -319,7 +320,7 @@ impl Efr32Mac {
                 .map_err(Self::map_radio_err)?;
 
             if !ack_requested {
-                return Ok(());
+                return Ok(false);
             }
 
             // ── ACK wait ──
@@ -330,22 +331,12 @@ impl Efr32Mac {
             let ack_result =
                 select::select(self.driver.receive_ack(), Timer::after_micros(1500)).await;
 
-            if let select::Either::First(Ok(rx)) = ack_result {
-                if rx.len >= 3 {
-                    // PHR already stripped by driver
-                    let fc = u16::from_le_bytes([rx.data[0], rx.data[1]]);
-                    let frame_type = fc & 0x07;
-                    let ack_seq = rx.data[2];
-                    if frame_type == 0x02 && ack_seq == seq {
-                        #[cfg(feature = "efr32-trace")]
-                        efr32_trace!(
-                            "[MAC] ACK seq={} frame_pending={}",
-                            ack_seq,
-                            (fc & (1 << 4)) != 0
-                        );
-                        return Ok(());
-                    }
-                }
+            if let select::Either::First(Ok(rx)) = ack_result
+                && let Some(frame_pending) = matching_ack_frame_pending(&rx.data[..rx.len], seq)
+            {
+                #[cfg(feature = "efr32-trace")]
+                efr32_trace!("[MAC] ACK seq={} frame_pending={}", seq, frame_pending);
+                return Ok(frame_pending);
             }
 
             if attempt == max_retries {
@@ -943,6 +934,15 @@ impl MacDriver for Efr32Mac {
 
         let passes: u8 = if has_short { 2 } else { 1 };
 
+        // Track whether *any* pass drew a MAC ACK from the parent. A poll that
+        // is ACKed but carries no pending data is a completed empty poll
+        // (`Ok(None)`); a poll whose Data Requests all went unacknowledged is a
+        // lost-parent signal and must surface as an error, not be silently
+        // mapped to the same `Ok(None)`. `last_err` remembers why the last
+        // unacknowledged pass failed so the caller sees the real cause.
+        let mut any_ack = false;
+        let mut last_err: Option<MacError> = None;
+
         for pass in 0..passes {
             let data_req = if pass == 0 && has_short {
                 build_data_request(
@@ -970,7 +970,22 @@ impl MacDriver for Efr32Mac {
                 efr32_trace!("[MAC] data_poll extended");
             }
 
-            if self.csma_ca_transmit(&data_req, true).await.is_err() {
+            let frame_pending = match self.csma_ca_transmit(&data_req, true).await {
+                Ok(frame_pending) => {
+                    // An ACK arrived (with or without the frame-pending bit):
+                    // the parent is reachable, so this poll is not a no-ACK
+                    // loss regardless of what the receive window yields below.
+                    any_ack = true;
+                    frame_pending
+                }
+                Err(error) => {
+                    last_err = Some(error);
+                    continue;
+                }
+            };
+            if !frame_pending {
+                // Preserve the extended-address fallback without waiting for
+                // a frame the parent's ACK says is not pending.
                 continue;
             }
 
@@ -1054,7 +1069,10 @@ impl MacDriver for Efr32Mac {
             }
         }
 
-        Ok(None)
+        // No pass produced a data frame. Distinguish an ACKed-but-empty poll
+        // (parent answered, nothing pending) from a poll that drew no ACK at
+        // all (parent silent) so the runtime can drive recovery on the latter.
+        poll_terminal_outcome(any_ack, last_err)
     }
 
     async fn mlme_poll_timeout(&mut self, timeout_us: u32) -> Result<Option<MacFrame>, MacError> {
@@ -1257,9 +1275,74 @@ mod tests {
 
         assert_eq!(config.extended_address, ieee);
     }
+
+    #[test]
+    fn matching_ack_reports_frame_pending() {
+        assert_eq!(matching_ack_frame_pending(&[0x02, 0x00, 7], 7), Some(false));
+        assert_eq!(matching_ack_frame_pending(&[0x12, 0x00, 7], 7), Some(true));
+        assert_eq!(matching_ack_frame_pending(&[0x12, 0x00, 8], 7), None);
+        assert_eq!(matching_ack_frame_pending(&[0x11, 0x00, 7], 7), None);
+    }
+
+    #[test]
+    fn acked_empty_poll_is_distinct_from_a_no_ack_poll() {
+        // Parent ACKed at least one Data Request but had nothing pending:
+        // an ordinary empty poll, never conflated with a transport failure.
+        assert!(matches!(poll_terminal_outcome(true, None), Ok(None)));
+        assert!(
+            matches!(poll_terminal_outcome(true, Some(MacError::NoAck)), Ok(None)),
+            "an ACK on any pass wins even if an earlier pass went unacknowledged"
+        );
+
+        // No pass drew an ACK: the parent is silent. The real cause is
+        // surfaced (defaulting to NoAck) so the runtime can drive recovery.
+        assert!(matches!(
+            poll_terminal_outcome(false, None),
+            Err(MacError::NoAck)
+        ));
+        assert!(matches!(
+            poll_terminal_outcome(false, Some(MacError::NoAck)),
+            Err(MacError::NoAck)
+        ));
+        assert!(matches!(
+            poll_terminal_outcome(false, Some(MacError::ChannelAccessFailure)),
+            Err(MacError::ChannelAccessFailure)
+        ));
+    }
 }
 
 // ── Frame builders ──────────────────────────────────────────────
+
+/// Terminal outcome of an `mlme_poll` that returned neither a data frame nor a
+/// frame-pending ACK.
+///
+/// * `any_ack == true`  → the parent acknowledged at least one Data Request but
+///   had nothing pending: a completed empty poll, reported as `Ok(None)`.
+/// * `any_ack == false` → every Data Request went unacknowledged: the parent is
+///   silent, reported as the underlying error (`MacError::NoAck` by default) so
+///   the runtime can count the failure and drive recovery instead of treating a
+///   lost parent as an ordinary empty poll.
+fn poll_terminal_outcome(
+    any_ack: bool,
+    last_err: Option<MacError>,
+) -> Result<Option<MacFrame>, MacError> {
+    if any_ack {
+        Ok(None)
+    } else {
+        Err(last_err.unwrap_or(MacError::NoAck))
+    }
+}
+
+fn matching_ack_frame_pending(frame: &[u8], sequence: u8) -> Option<bool> {
+    if frame.len() < 3 {
+        return None;
+    }
+    let frame_control = u16::from_le_bytes([frame[0], frame[1]]);
+    if frame_control & 0x07 != 0x02 || frame[2] != sequence {
+        return None;
+    }
+    Some(frame_control & 0x0010 != 0)
+}
 
 fn build_beacon_request(seq: u8) -> [u8; 8] {
     let fc: u16 = 0x0803;
