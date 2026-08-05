@@ -1,6 +1,7 @@
 //! ESP32-C6 Zigbee SED application state machine.
 
 use embassy_time::{Duration, Instant, Timer};
+use esp32_zigbee_devkit_product::ota_transport::OtaTransport;
 use esp32_zigbee_devkit_product::profile::SensorProfile;
 use esp32_zigbee_devkit_product::storage::SecurityStore;
 use esp_hal::gpio::Input;
@@ -10,8 +11,6 @@ use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::node::{NodeError, ZigbeeNode};
 use zigbee_runtime::profile::{BatteryMeasurement, TemperatureHumidityMeasurement};
 use zigbee_runtime::security_store::SecurityStoreError;
-
-use crate::ota_client::OtaTransport;
 
 const REPORT_INTERVAL_SECS: u64 = 60;
 const FAST_POLL_MS: u64 = 250;

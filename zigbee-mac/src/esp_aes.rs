@@ -1,6 +1,7 @@
 use core::hint::spin_loop;
 
 const AES_IDLE: u32 = 0;
+#[cfg(test)]
 const AES_BUSY: u32 = 1;
 
 const KAT_KEY_1: [u8; 16] = [
@@ -35,7 +36,6 @@ pub(crate) trait AesRegisters {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AesEngineError {
     BusyTimeout,
-    StartTimeout,
     CompletionTimeout,
     KnownAnswerTestFailed(u8),
 }
@@ -81,7 +81,10 @@ impl<R: AesRegisters> AesDriver<R> {
         self.registers.write_input(input);
         self.registers.trigger();
 
-        self.wait_for_state(AES_BUSY, AesEngineError::StartTimeout)?;
+        // Typical-mode AES can complete before software samples the transient
+        // BUSY state. ESP-IDF and esp-hal therefore wait only for IDLE after
+        // triggering; requiring BUSY to be observed rejects valid fast
+        // completions on ESP32-C6.
         self.wait_for_state(AES_IDLE, AesEngineError::CompletionTimeout)?;
 
         let mut completed = [0u8; 16];
@@ -112,6 +115,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum Behavior {
         Normal,
+        CompletesBeforePolling,
         CorruptOutput,
         InitialBusy,
         NeverStarts,
@@ -172,6 +176,9 @@ mod tests {
             self.started = true;
             self.busy_observed = false;
             self.trigger_count += 1;
+            if matches!(self.behavior, Behavior::NeverStarts) {
+                return;
+            }
             self.output = if matches!(self.behavior, Behavior::CorruptOutput) {
                 [0; 16]
             } else {
@@ -192,6 +199,14 @@ mod tests {
     #[test]
     fn self_test_covers_reuse_and_rekeying() {
         let mut driver = AesDriver::new(MockRegisters::new(Behavior::Normal), 4);
+
+        assert_eq!(driver.self_test(), Ok(()));
+        assert_eq!(driver.registers.trigger_count, 2);
+    }
+
+    #[test]
+    fn self_test_accepts_completion_before_busy_can_be_sampled() {
+        let mut driver = AesDriver::new(MockRegisters::new(Behavior::CompletesBeforePolling), 4);
 
         assert_eq!(driver.self_test(), Ok(()));
         assert_eq!(driver.registers.trigger_count, 2);
@@ -220,15 +235,13 @@ mod tests {
     }
 
     #[test]
-    fn ignored_trigger_times_out_without_publishing_output() {
+    fn ignored_trigger_fails_startup_known_answer_test() {
         let mut driver = AesDriver::new(MockRegisters::new(Behavior::NeverStarts), 3);
-        let mut output = [0xa5; 16];
 
         assert_eq!(
-            driver.encrypt(&[0; 16], &[0; 16], &mut output),
-            Err(AesEngineError::StartTimeout)
+            driver.self_test(),
+            Err(AesEngineError::KnownAnswerTestFailed(1))
         );
-        assert_eq!(output, [0xa5; 16]);
     }
 
     #[test]

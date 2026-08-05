@@ -46,6 +46,18 @@ const AES_WAIT_LIMIT: u32 = 100_000;
 
 struct EspAesRegisters;
 
+fn release_aes_coupled_reset() {
+    // ESP-IDF's C6/H2 `aes_ll_reset_register()` clears the Digital Signature
+    // reset after resetting AES: the two blocks share reset logic, and AES can
+    // otherwise remain held in reset even though its own clock guard is live.
+    //
+    // Use the HAL's chip-specific PAC accessor rather than a fixed PCR offset:
+    // DS_CONF is at 0xe0 on C6 and 0xdc on H2.
+    esp_hal::peripherals::SYSTEM::regs()
+        .ds_conf()
+        .modify(|_, w| w.ds_rst_en().clear_bit());
+}
+
 impl EspAesRegisters {
     #[inline(always)]
     fn read(offset: usize) -> u32 {
@@ -116,6 +128,7 @@ struct EspAesEngine<'d> {
 impl<'d> EspAesEngine<'d> {
     fn new(peripheral: esp_hal::peripherals::AES<'d>) -> Result<Self, AesEngineError> {
         let peripheral = esp_hal::aes::Aes::new(peripheral);
+        release_aes_coupled_reset();
         let mut driver = AesDriver::new(EspAesRegisters, AES_WAIT_LIMIT);
         driver.self_test()?;
         Ok(Self {

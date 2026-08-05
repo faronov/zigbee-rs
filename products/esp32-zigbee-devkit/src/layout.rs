@@ -1,8 +1,5 @@
 //! Flash layout of the 4 MiB ESP32-C6/H2 Zigbee devkit partition table.
 //!
-//! This is C6-only product policy: the ESP32-H2 build keeps the default
-//! single-app partition table and has no OTA writer (see the crate docs).
-//!
 //! The single source of truth for the addresses is
 //! `partitions/esp32-4mb-ota.csv`; the constants below mirror it and the unit
 //! tests at the bottom of this file parse the CSV to prove they still agree.

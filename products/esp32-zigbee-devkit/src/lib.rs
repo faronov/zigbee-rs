@@ -13,8 +13,8 @@
 //! * [`profile`] — the endpoint/cluster profile this product selects, with
 //!   OTA composed in only where a backend for it exists.
 //!
-//! ESP32-C6 additionally owns a two-slot OTA partition table and firmware
-//! writer, gated behind the `esp32c6` feature:
+//! Both supported chips own a two-slot OTA partition table and firmware
+//! writer:
 //!
 //! * [`layout`] — the 4 MiB partition table these boards are flashed with.
 //! * [`otadata`] — ESP-IDF boot-slot selection records.
@@ -25,9 +25,8 @@
 //! * [`firmware`] — firmware version helpers shared by the OTA and Basic
 //!   clusters.
 //!
-//! ESP32-H2 has no OTA backend: it keeps the default single-app partition
-//! table and [`profile::SensorProfile`] never advertises the OTA Upgrade
-//! client cluster on that build.
+//! ESP32-C6 and ESP32-H2 use distinct OTA image types so a coordinator cannot
+//! offer an application image for the wrong chip.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -41,17 +40,19 @@ pub mod profile;
 #[cfg(target_os = "none")]
 pub mod storage;
 
-#[cfg(feature = "esp32c6")]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod esp_image;
-#[cfg(feature = "esp32c6")]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod firmware;
-#[cfg(feature = "esp32c6")]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod layout;
-#[cfg(feature = "esp32c6")]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod ota;
-#[cfg(feature = "esp32c6")]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
+pub mod ota_transport;
+#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod otadata;
-#[cfg(feature = "esp32c6")]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod sha256;
 
 pub const MANUFACTURER: &str = "Zigbee-RS";
@@ -67,11 +68,12 @@ pub const MODEL: &str = "ESP32-H2-Sensor";
 /// Manufacturer code advertised in `QueryNextImageRequest` and stamped into
 /// the OTA container by `tools/create-ota.py`. ZHA matches images on this
 /// pair, so the two must stay in sync.
-#[cfg(feature = "esp32c6")]
 pub const OTA_MANUFACTURER_CODE: u16 = 0x1234;
-/// Image type: 0x0001 = ESP32-C6 sensor.
+/// OTA image type assigned to the selected chip.
 #[cfg(feature = "esp32c6")]
 pub const OTA_IMAGE_TYPE: u16 = 0x0001;
+/// Image type: 0x0002 = ESP32-H2 sensor.
+#[cfg(feature = "esp32h2")]
+pub const OTA_IMAGE_TYPE: u16 = 0x0002;
 /// Hardware version reported to the OTA server.
-#[cfg(feature = "esp32c6")]
 pub const OTA_HARDWARE_VERSION: u16 = 1;

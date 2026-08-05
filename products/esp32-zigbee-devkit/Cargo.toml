@@ -12,6 +12,7 @@ embedded-storage = "0.3"
 log = "0.4"
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-bdb = { path = "../../zigbee-bdb" }
+zigbee-mac = { path = "../../zigbee-mac" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 esp32-zigbee-devkit = { path = "../../boards/esp32-zigbee-devkit" }
@@ -27,8 +28,5 @@ esp-storage = { version = "0.7", default-features = false, features = [
 
 [features]
 default = []
-# Only the ESP32-C6 build has an OTA-capable two-slot partition table today;
-# the ESP32-H2 build keeps the default single-app table (see
-# `docs/book/src/platform-guides/esp32.md`) and has no OTA writer.
 esp32c6 = ["esp32-zigbee-devkit/esp32c6", "zigbee-runtime/ota"]
-esp32h2 = ["esp32-zigbee-devkit/esp32h2"]
+esp32h2 = ["esp32-zigbee-devkit/esp32h2", "zigbee-runtime/ota"]

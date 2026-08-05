@@ -5,16 +5,13 @@ temperature sensor and reports temperature, humidity, and battery percentage.
 Network state is persisted to flash — the device survives reboots without
 re-pairing.
 
-> **✅ Verified** on ESP32-C6-DevKitC-1 with Home Assistant + ZHA (pre-refactor
-> build: flat NV persistence, direct `ZigbeeDevice` calls). Shows as
-> "Zigbee-RS ESP32-C6-Sensor" with Temperature, Humidity, and Battery entities.
->
-> **Hardware gate open:** the current code builds on a typed product profile,
-> `zigbee_runtime::node::ZigbeeNode`, and a crash-safe `SecurityStateJournal`
-> in place of the flat NV item store (see
-> [NV storage](../../docs/book/src/advanced/nv-storage.md)). This is
-> build- and host-test-verified only; commissioning, reporting, OTA, and
-> persistence have not yet been re-run against this exact code on hardware.
+> **✅ Hardware verified** on an ESP32-C6-DevKitC-1 revision 0.0 with Home
+> Assistant + ZHA. The current `ZigbeeNode` build passes its hardware-AES KAT,
+> migrates the legacy network state into the crash-safe security journal,
+> commissions and reports normally, advertises the OTA client, and has
+> transferred an OTA image through 18.3% before an intentional cancellation.
+> Full C6 activation remains a separate gate; the shared writer and activation
+> path completed a full v1-to-v2 upgrade on ESP32-H2.
 
 ## Hardware Requirements
 
@@ -65,6 +62,8 @@ the OTA client cluster.
 ## What It Demonstrates
 
 - Initialising the ESP32-C6 IEEE 802.15.4 radio with `esp-radio`
+- **Hardware-only AES-128** for Zigbee NWK/APS security, with two startup
+  known-answer tests and no software fallback
 - A typed product profile (`esp32_zigbee_devkit_product::profile::SensorProfile`)
   and `zigbee_runtime::node::ZigbeeNode`, instead of building the device and its
   cluster list by hand
@@ -91,17 +90,18 @@ the OTA client cluster.
 ## Operation
 
 1. Power on → restores saved network state from flash (if any) and auto-rejoins
-2. If no saved state → press BOOT to initiate BDB commissioning
+2. If no saved state → starts BDB commissioning automatically
 3. Once joined → reads on-chip temp sensor periodically, reports to coordinator
 4. Press BOOT → leaves the network and clears flash NV storage
 5. **Power cycle** → device reconnects automatically (no re-pairing needed!)
 
 ## OTA Updates
 
-> **Not yet run on hardware.** The device-side code and the packaging tool are
-> implemented and covered by host tests; moving an already-joined device onto
-> the two-slot partition table is a separate, deliberate step (see the
-> [ESP32 platform guide](../../docs/book/src/platform-guides/esp32.md)).
+> **Transfer path hardware verified.** A revision 0.0 C6 downloaded 18.3% of a
+> v1-to-v2 image through ZHA before the test was intentionally cancelled,
+> remaining on v1. The test exercised Image Notify, Query Next Image, block
+> requests/responses, lazy erase, and writes into `ota_1`. A complete C6
+> activation/reboot is still pending.
 
 The firmware hosts an **OTA Upgrade client** on endpoint 1 and stages images
 into whichever of `ota_0`/`ota_1` is not running, using
@@ -133,8 +133,8 @@ zigpy_config:
 ```
 
 The device advertises manufacturer `0x1234`, image type `0x0001` and hardware
-version 1 — the constants at the top of `src/main.rs` and in
-`tools/create-ota.py` must stay in sync.
+version 1. The canonical chip configuration lives in
+`../../tools/create-esp32-ota.py`; the local script is only a thin wrapper.
 
 ## Project Structure
 
@@ -143,11 +143,10 @@ esp32c6-sensor/
 ├── .cargo/config.toml    # Target, runner, rustflags, build-std
 ├── build.rs              # ESP32_OTA_VERSION -> FIRMWARE_VERSION
 ├── Cargo.toml            # Dependencies (esp-hal 1.0, esp-radio 0.17, product crate, zigbee-rs crates)
-├── tools/create-ota.py   # Build -> ESP image -> Zigbee OTA container -> zigpy index
+├── tools/create-ota.py   # Thin wrapper over ../../tools/create-esp32-ota.py
 └── src/
     ├── main.rs           # Composition root: platform startup + resource construction (#[esp_hal::main])
     ├── app.rs            # SensorApp: ZigbeeNode-driven event loop, button, poll windows
-    ├── ota_client.rs     # Thin logging/policy wrapper over runtime OtaSession
     └── time_driver.rs    # embassy-time driver
 ```
 
@@ -157,5 +156,5 @@ no dependency on `zigbee-runtime`. `products/esp32-zigbee-devkit` (the
 `esp32-zigbee-devkit-product` crate) owns the partition layout (the bounded
 8 KB NV window at the tail of `zbnv`, unchanged), the `otadata` codec, the OTA
 firmware writer, and the typed `SensorProfile` — shared by ESP32-C6 and
-ESP32-H2, with the two-slot partition table and OTA writer gated to the
-`esp32c6` feature.
+ESP32-H2. The shared OTA transport lives in the product crate; each example
+only supplies its platform resources and event loop.

@@ -790,6 +790,7 @@ dependencies = [
  "log",
  "zigbee-aps",
  "zigbee-bdb",
+ "zigbee-mac",
  "zigbee-runtime",
  "zigbee-zcl",
 ]

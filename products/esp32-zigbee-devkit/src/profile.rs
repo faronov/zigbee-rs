@@ -3,7 +3,7 @@
 //! Both chips report the same clusters (Temperature, Humidity, Power
 //! Configuration on the Home Automation Temperature Sensor device ID) with
 //! the same reporting cadence, so the base profile is shared. Only the
-//! ESP32-C6 build composes an OTA backend, and only when the checked
+//! selected ESP32 build composes an OTA backend, and only when the checked
 //! partition table on the device actually supports it — see
 //! [`OptionalOta`](zigbee_runtime::profile::OptionalOta).
 
@@ -48,7 +48,7 @@ pub fn base_profile() -> BaseSensorProfile {
 // is gated the same way. The chip-independent OTA writer logic underneath
 // it (`EspFirmwareWriter<MockFlash>`) is still exercised on the host by
 // `ota`'s own unit tests.
-#[cfg(all(feature = "esp32c6", target_os = "none"))]
+#[cfg(target_os = "none")]
 mod with_ota {
     use super::{BaseSensorProfile, base_profile};
     use crate::ota::{EspFirmwareWriter, EspOtaFlash};
@@ -56,12 +56,12 @@ mod with_ota {
     use zigbee_runtime::ota::{OtaConfig, OtaManager};
     use zigbee_runtime::profile::OptionalOta;
 
-    /// The ESP32-C6 profile: the shared base profile, with the OTA Upgrade
+    /// The ESP32 profile: the shared base profile, with the OTA Upgrade
     /// client cluster composed in only when the on-device partition table
     /// supports it.
     pub type SensorProfile = OptionalOta<BaseSensorProfile, EspFirmwareWriter<EspOtaFlash>>;
 
-    /// Build the ESP32-C6 profile.
+    /// Build the selected ESP32 profile.
     ///
     /// `reset` performs the software reset that hands control to the
     /// bootloader after an upgrade is staged and verified; it is provided by
@@ -86,7 +86,7 @@ mod with_ota {
         match EspFirmwareWriter::new(EspOtaFlash::new(), reset) {
             Ok(writer) => {
                 log::info!(
-                    "[ESP32-C6] OTA ready: running slot {}, staging slot {}, version {}",
+                    "[ESP32] OTA ready: running slot {}, staging slot {}, version {}",
                     writer.running_slot(),
                     writer.target_slot(),
                     firmware_version
@@ -96,7 +96,7 @@ mod with_ota {
             }
             Err(error) => {
                 log::warn!(
-                    "[ESP32-C6] OTA disabled: incompatible flash layout ({:?})",
+                    "[ESP32] OTA disabled: incompatible flash layout ({:?})",
                     error
                 );
                 OptionalOta::disabled(
@@ -110,17 +110,5 @@ mod with_ota {
     }
 }
 
-#[cfg(all(feature = "esp32c6", target_os = "none"))]
+#[cfg(target_os = "none")]
 pub use with_ota::{SensorProfile, sensor_profile};
-
-/// The ESP32-H2 profile: the shared base profile, no OTA. The H2 build keeps
-/// the default single-app partition table and has no OTA writer (see the
-/// crate docs).
-#[cfg(feature = "esp32h2")]
-pub type SensorProfile = BaseSensorProfile;
-
-/// Build the ESP32-H2 profile.
-#[cfg(feature = "esp32h2")]
-pub fn sensor_profile() -> SensorProfile {
-    base_profile()
-}

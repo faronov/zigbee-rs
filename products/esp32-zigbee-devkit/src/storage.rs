@@ -23,7 +23,7 @@ use crate::migration::{MigrationError, MigrationOutcome};
 
 /// Start of the reserved Zigbee NV window: the last 8 KiB of the physical
 /// flash chip. Deliberately the same addresses used before any partition
-/// table existed, so introducing one (on the ESP32-C6 build) does not move
+/// table existed, so introducing one does not move
 /// already-joined network state.
 pub const NV_OFFSET: u32 = 0x003F_E000;
 /// Size of the reserved Zigbee NV window (two 4 KiB sectors).
@@ -35,12 +35,12 @@ const SECTOR_B: u32 = SECURITY_JOURNAL_SECTOR_SIZE as u32;
 const _: () = assert!(NV_SIZE == 2 * SECURITY_JOURNAL_SECTOR_SIZE);
 const _: () = assert!(NV_OFFSET as usize + NV_SIZE == 0x0040_0000);
 
-// On the ESP32-C6 build `layout` independently mirrors these same addresses
+// On both OTA-capable builds `layout` independently mirrors these addresses
 // (it must stay host-testable, so it cannot import this `target_os = "none"`
 // module) — cross-check them here so the two cannot silently drift apart.
-#[cfg(feature = "esp32c6")]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 const _: () = assert!(NV_OFFSET == crate::layout::NV_OFFSET);
-#[cfg(feature = "esp32c6")]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 const _: () = assert!(NV_SIZE as u32 == crate::layout::NV_SIZE);
 
 /// The reserved 8 KiB Zigbee NV window, bounded within the physical chip.

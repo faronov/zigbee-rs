@@ -39,7 +39,6 @@ extern crate alloc;
 esp_bootloader_esp_idf::esp_app_desc!();
 
 mod app;
-mod ota_client;
 mod time_driver;
 
 include!(concat!(env!("OUT_DIR"), "/firmware_version.rs"));
