@@ -4,11 +4,16 @@ Nordic's nRF52840 and nRF52833 are ARM Cortex-M4F SoCs with a built-in
 IEEE 802.15.4 radio. The zigbee-rs nRF backend uses Embassy's radio driver
 for interrupt-driven, DMA-based TX/RX — **no SoftDevice required**.
 
-> **Prior hardware baseline verified:** The nRF52840-DK path was tested
-> end-to-end with **Home Assistant + ZHA**, including flash NV, NWK Leave,
-> reporting, Identify, and optional BME280/SHT31 sensors. The current
-> product/profile/`ZigbeeNode` refactor preserves those mechanisms and passes
-> host/cross-build validation, but has not yet been re-run on hardware.
+> **Current hardware baseline verified:** The product/profile/`ZigbeeNode`
+> sensor was tested end-to-end on an nRF52840-DK revision 2 with
+> **Home Assistant + ZHA**, including fresh commissioning, unique-TCLK
+> authentication, End Device Timeout, interview, reporting, Identify, durable
+> security state, and silent reset/resume.
+>
+> **Hardware-AES parity status:** Nordic ECB AES-128 is hardware-proven on
+> nRF52840 and mandatory in all four nRF builds. nRF52833 uses the same ECB
+> register layout and passes release-build/symbol gates, but still needs its
+> own on-silicon acceptance run.
 
 ## Hardware Overview
 
@@ -50,6 +55,48 @@ SoftDevice's RAM/Flash overhead.
 > (e.g., nice!nano with Adafruit bootloader), the `nrf52840-sensor-uf2`
 > example disables the SoftDevice at startup via an SVC call. See the
 > [UF2 section](#uf2-drag-and-drop-flash) below.
+
+## Fail-closed hardware AES-128
+
+The `nrf52840` and `nrf52833` MAC features always select the Nordic ECB
+backend (`hardware-aes-nrf`). `NrfEcbToken::take()` provides one process-wide
+owner because Embassy 0.3 does not expose ECB in its peripheral singleton.
+`NrfMac::install_aes_engine()` consumes that token, runs two back-to-back
+known-answer tests with different keys, and only then makes the engine
+available to NWK/APS CCM* and AES-MMO.
+
+Each transaction uses the 48-byte, word-aligned EasyDMA structure in Data RAM
+(key, cleartext, ciphertext), clears both sticky events, programs
+`ECBDATAPTR`, starts ECB, and waits with a finite bound. `ERRORECB`, timeout,
+or abort-cleanup failure is returned as a hard error; output is not published
+and software AES is never retried. Production examples halt before constructing
+the Zigbee device if token acquisition or either startup KAT fails. CI also
+rejects an nRF ELF containing `aes::soft::fixslice`/`SoftwareAes128`.
+
+Nordic documents the common nRF52840/nRF52833 ECB layout, Data-RAM-only
+EasyDMA requirement, and the fact that ECB shares the AES core with CCM/AAR:
+
+- [nRF52840 ECB product specification](https://docs.nordicsemi.com/r/bundle/ps_nrf52840/page/ecb.html)
+- [nRF52833 ECB product specification](https://docs.nordicsemi.com/r/bundle/ps_nrf52833/page/ecb.html)
+
+Physical acceptance completed on an nRF52840-DK revision 2:
+
+- both startup KATs passed on the ECB peripheral;
+- a factory-new device joined ZHA, installed the network key, completed the
+  unique Trust Center link-key Transport-Key/Verify-Key/Confirm-Key exchange,
+  negotiated End Device Timeout, and completed the full interview;
+- secured temperature, humidity, and battery reports were accepted;
+- a hardware reset restored the same PAN, parent, and short address without
+  scanning, association, or Device Announce;
+- a secured Identify command and its response succeeded after that silent
+  resume.
+
+The accepted nRF52840 sensor binary is 200,840 bytes and contains no
+`SoftwareAes128` or `aes::soft::fixslice` symbols.
+
+The hardware run also exposed and fixed a missing
+`MacAssociatedPanCoord` PIB implementation in the Nordic MAC backend. The
+nRF52833 build remains compile- and symbol-gate-proven only.
 
 ## Prerequisites
 

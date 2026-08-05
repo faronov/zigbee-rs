@@ -10,6 +10,7 @@
 //! - Software ACK generation and matching
 //! - Hardware CCA before transmission
 //! - RSSI measurement
+//! - Fail-closed AES-128 through the Nordic ECB EasyDMA peripheral
 //!
 //! # Dependencies
 //! - `embassy-nrf` with nrf52840 or nrf52833 feature
@@ -28,9 +29,11 @@ use crate::frames::{
     build_data_request, build_data_request_short, build_disassociation_notification, parse_beacon,
     parse_dest_address, parse_source_address,
 };
+use crate::nrf_aes::{EcbDataBlock, EcbRegisters, NrfAesDriver};
 use crate::pib::{self, PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use crate::{MacCapabilities, MacDriver, MacError, PlatformServices};
+use core::sync::atomic::{AtomicBool, Ordering};
 use zigbee_types::*;
 
 use embassy_futures::select;
@@ -45,6 +48,178 @@ use embassy_nrf52840 as embassy_nrf;
 use embassy_nrf::radio::Instance as RadioInstance;
 use embassy_nrf::radio::ieee802154::{Packet, Radio};
 use embassy_nrf::rng::{Instance as RngInstance, Rng};
+
+pub use crate::nrf_aes::NrfAesError;
+
+const ECB_BASE: usize = 0x4000_E000;
+const ECB_TASKS_STARTECB: usize = 0x000;
+const ECB_TASKS_STOPECB: usize = 0x004;
+const ECB_EVENTS_ENDECB: usize = 0x100;
+const ECB_EVENTS_ERRORECB: usize = 0x104;
+const ECB_INTENCLR: usize = 0x308;
+const ECB_ECBDATAPTR: usize = 0x504;
+const ECB_WAIT_LIMIT: u32 = 100_000;
+
+static ECB_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// Unique process-wide ownership token for the Nordic ECB peripheral.
+///
+/// Embassy 0.3 does not expose ECB in its `Peripherals` struct, so this
+/// backend provides equivalent singleton ownership locally. This token is
+/// not cloneable, and a successful acquisition is never released.
+pub struct NrfEcbToken {
+    _private: (),
+}
+
+impl NrfEcbToken {
+    /// Acquire the ECB peripheral exactly once.
+    pub fn take() -> Option<Self> {
+        ECB_TAKEN
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self { _private: () })
+    }
+}
+
+struct NrfEcbRegisters;
+
+impl NrfEcbRegisters {
+    fn prepare() -> Self {
+        Self::write(ECB_INTENCLR, 0x03);
+        Self::write(ECB_EVENTS_ENDECB, 0);
+        Self::write(ECB_EVENTS_ERRORECB, 0);
+        // Read-back prevents a following task write from overtaking event
+        // clearing on the peripheral bus.
+        let _ = Self::read(ECB_EVENTS_ERRORECB);
+        Self
+    }
+
+    #[inline(always)]
+    fn read(offset: usize) -> u32 {
+        // SAFETY: offsets are fixed registers in the nRF52833/nRF52840 ECB
+        // instance. The owning engine retains Embassy's unique ECB token.
+        unsafe { core::ptr::read_volatile((ECB_BASE + offset) as *const u32) }
+    }
+
+    #[inline(always)]
+    fn write(offset: usize, value: u32) {
+        // SAFETY: same exclusive-token and fixed-register argument as `read`.
+        unsafe { core::ptr::write_volatile((ECB_BASE + offset) as *mut u32, value) }
+    }
+
+    fn clear_event(offset: usize) {
+        Self::write(offset, 0);
+        let _ = Self::read(offset);
+    }
+}
+
+impl EcbRegisters for NrfEcbRegisters {
+    fn clear_end_event(&mut self) {
+        Self::clear_event(ECB_EVENTS_ENDECB);
+    }
+
+    fn clear_error_event(&mut self) {
+        Self::clear_event(ECB_EVENTS_ERRORECB);
+    }
+
+    fn set_data_ptr(&mut self, data: *mut EcbDataBlock) {
+        Self::write(ECB_ECBDATAPTR, data as u32);
+    }
+
+    fn start(&mut self) {
+        Self::write(ECB_TASKS_STARTECB, 1);
+    }
+
+    fn end_event(&mut self) -> bool {
+        Self::read(ECB_EVENTS_ENDECB) != 0
+    }
+
+    fn error_event(&mut self) -> bool {
+        Self::read(ECB_EVENTS_ERRORECB) != 0
+    }
+
+    fn stop(&mut self) {
+        Self::write(ECB_TASKS_STOPECB, 1);
+    }
+}
+
+struct NrfEcbEngine {
+    _token: NrfEcbToken,
+    driver: NrfAesDriver<NrfEcbRegisters>,
+}
+
+impl NrfEcbEngine {
+    fn new(token: NrfEcbToken) -> Self {
+        Self {
+            _token: token,
+            driver: NrfAesDriver::new(NrfEcbRegisters::prepare(), ECB_WAIT_LIMIT),
+        }
+    }
+
+    fn self_test(&mut self) -> Result<(), NrfAesError> {
+        self.driver.self_test()
+    }
+
+    #[inline(never)]
+    fn encrypt_block(&mut self, key: &[u8; 16], block: &mut [u8; 16]) -> Result<(), NrfAesError> {
+        let input = *block;
+        self.driver.encrypt(key, &input, block)
+    }
+}
+
+struct NrfAesState {
+    installed: Option<NrfEcbEngine>,
+    /// Retain the token and DMA storage after a rejected KAT. This leaves AES
+    /// unavailable while ensuring a failed abort can never outlive its buffer.
+    rejected: Option<NrfEcbEngine>,
+}
+
+impl NrfAesState {
+    const fn new() -> Self {
+        Self {
+            installed: None,
+            rejected: None,
+        }
+    }
+
+    fn install(&mut self, token: NrfEcbToken) -> Result<(), NrfAesError> {
+        if self.installed.is_some() || self.rejected.is_some() {
+            return Err(NrfAesError::AlreadyInstalled);
+        }
+
+        let mut engine = NrfEcbEngine::new(token);
+        match engine.self_test() {
+            Ok(()) => {
+                self.installed = Some(engine);
+                Ok(())
+            }
+            Err(error) => {
+                self.rejected = Some(engine);
+                Err(error)
+            }
+        }
+    }
+
+    fn engine_mut(&mut self) -> Option<&mut NrfEcbEngine> {
+        self.installed.as_mut()
+    }
+}
+
+struct NrfHardwareAes128<'engine> {
+    engine: Option<&'engine mut NrfEcbEngine>,
+    key: zigbee_crypto::AesKey,
+}
+
+impl zigbee_crypto::Aes128Forward for NrfHardwareAes128<'_> {
+    type Error = NrfAesError;
+
+    fn encrypt_block(&mut self, block: &mut [u8; 16]) -> Result<(), Self::Error> {
+        self.engine
+            .as_deref_mut()
+            .ok_or(NrfAesError::NotInstalled)?
+            .encrypt_block(&self.key, block)
+    }
+}
 
 /// nRF52840 802.15.4 MAC driver.
 ///
@@ -73,6 +248,7 @@ pub struct NrfMac<'a, T: RadioInstance, R: RngInstance> {
     rx_on_when_idle: bool,
     association_permit: bool,
     auto_request: bool,
+    associated_pan_coord: bool,
     dsn: u8,
     bsn: u8,
     beacon_payload: PibPayload,
@@ -87,6 +263,9 @@ pub struct NrfMac<'a, T: RadioInstance, R: RngInstance> {
     pending_assoc_frames: heapless::Deque<MacFrame, 2>,
     /// Per-device evolving state for sequence numbers and CSMA backoff.
     random_state: u32,
+    /// Exclusively-owned Nordic ECB accelerator. Production composition roots
+    /// install it and pass both startup KATs before constructing networking.
+    aes: NrfAesState,
 }
 
 impl<'a, T: RadioInstance, R: RngInstance> NrfMac<'a, T, R> {
@@ -119,6 +298,7 @@ impl<'a, T: RadioInstance, R: RngInstance> NrfMac<'a, T, R> {
             rx_on_when_idle: false,
             association_permit: false,
             auto_request: true,
+            associated_pan_coord: false,
             dsn: seed as u8,
             bsn: (seed >> 8) as u8,
             beacon_payload: PibPayload::new(),
@@ -129,7 +309,22 @@ impl<'a, T: RadioInstance, R: RngInstance> NrfMac<'a, T, R> {
             coord_extended_address: [0; 8],
             pending_assoc_frames: heapless::Deque::new(),
             random_state: seed.max(1),
+            aes: NrfAesState::new(),
         }
+    }
+
+    /// Consume the unique ECB token and install hardware AES after two
+    /// back-to-back AES-128 known-answer tests with different keys.
+    ///
+    /// A failed engine is retained only as rejected/quarantined ownership;
+    /// it is never made available to CCM* or AES-MMO.
+    pub fn install_aes_engine(&mut self, token: NrfEcbToken) -> Result<(), NrfAesError> {
+        self.aes.install(token)
+    }
+
+    /// Return the factory-programmed EUI-64 currently used by the MAC.
+    pub const fn extended_address(&self) -> IeeeAddress {
+        self.extended_address
     }
 
     /// Read the unique device IEEE (EUI-64) address from nRF52840 FICR registers.
@@ -412,6 +607,7 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
         &mut self,
         req: MlmeAssociateRequest,
     ) -> Result<MlmeAssociateConfirm, MacError> {
+        self.associated_pan_coord = false;
         self.set_channel(req.channel);
         match req.coord_address {
             MacAddress::Short(_, address) => {
@@ -500,6 +696,7 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
             .await?;
         self.short_address = ShortAddress(0xFFFF);
         self.pan_id = PanId(0xFFFF);
+        self.associated_pan_coord = false;
         Ok(())
     }
 
@@ -512,6 +709,7 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
             self.rx_on_when_idle = false;
             self.association_permit = false;
             self.auto_request = true;
+            self.associated_pan_coord = false;
             self.dsn = random as u8;
             self.bsn = (random >> 8) as u8;
             self.max_frame_retries = 3;
@@ -541,6 +739,7 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
             PibAttribute::MacCoordExtendedAddress => {
                 Ok(PibValue::ExtendedAddress(self.coord_extended_address))
             }
+            PibAttribute::MacAssociatedPanCoord => Ok(PibValue::Bool(self.associated_pan_coord)),
             PibAttribute::MacRxOnWhenIdle => Ok(PibValue::Bool(self.rx_on_when_idle)),
             PibAttribute::MacAssociationPermit => Ok(PibValue::Bool(self.association_permit)),
             PibAttribute::MacAutoRequest => Ok(PibValue::Bool(self.auto_request)),
@@ -608,6 +807,9 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
                 self.coord_extended_address = value
                     .as_extended_address()
                     .ok_or(MacError::InvalidParameter)?;
+            }
+            PibAttribute::MacAssociatedPanCoord => {
+                self.associated_pan_coord = value.as_bool().ok_or(MacError::InvalidParameter)?;
             }
             PibAttribute::MacExtendedAddress => {
                 self.extended_address = value
@@ -968,7 +1170,17 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
     }
 }
 
-impl<T: RadioInstance, R: RngInstance> zigbee_crypto::ForwardAesProvider for NrfMac<'_, T, R> {}
+impl<T: RadioInstance, R: RngInstance> zigbee_crypto::ForwardAesProvider for NrfMac<'_, T, R> {
+    fn forward_cipher(
+        &mut self,
+        key: &zigbee_crypto::AesKey,
+    ) -> impl zigbee_crypto::Aes128Forward + '_ {
+        NrfHardwareAes128 {
+            engine: self.aes.engine_mut(),
+            key: *key,
+        }
+    }
+}
 impl<T: RadioInstance, R: RngInstance> PlatformServices for NrfMac<'_, T, R> {
     fn monotonic_micros(&self) -> u32 {
         embassy_time::Instant::now().as_micros() as u32
@@ -1045,6 +1257,7 @@ impl<T: RadioInstance, R: RngInstance> NrfMac<'_, T, R> {
                 if status == AssociationStatus::Success {
                     self.short_address = ShortAddress(short_addr);
                 }
+                self.associated_pan_coord = status == AssociationStatus::Success;
                 // After Association Response, stay in RX to catch Transport-Key.
                 // ACK every frame — without ACK, coordinator retries and gives up.
                 if status == AssociationStatus::Success {

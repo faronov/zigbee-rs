@@ -65,13 +65,20 @@ esp32h2 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 nrf52840 = [
+    "hardware-aes-nrf",
     "dep:embassy-nrf52840",
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 nrf52833 = [
+    "hardware-aes-nrf",
     "dep:embassy-nrf52833",
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
+
+# Nordic ECB hardware AES-128 is mandatory for both nRF production backends.
+# This marker feature is pulled in by each chip feature; it is not an
+# independently selectable software/hardware switch.
+hardware-aes-nrf = []
 
 bl702 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",

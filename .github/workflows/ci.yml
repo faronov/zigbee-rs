@@ -121,6 +121,14 @@ jobs:
             echo "nRF52840 image contains generic slice sorting" >&2
             exit 1
           fi
+          if "$NM" --demangle "$ELF" | grep -Eq 'aes::soft::fixslice|SoftwareAes128'; then
+            echo "nRF52840 production image still links software AES" >&2
+            exit 1
+          fi
+          if ! "$NM" --demangle "$ELF" | grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver'; then
+            echo "nRF52840 production image is missing the Nordic ECB AES backend" >&2
+            exit 1
+          fi
           # A non-router sensor must compile out the parent/router maintenance
           # subgraph (permit-join, routing, MAC parent-command servicing, child
           # rejoin/Update-Device and Parent Announce). Representative symbols
@@ -173,6 +181,14 @@ jobs:
           NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
+          if "$NM" --demangle "$ELF" | grep -Eq 'aes::soft::fixslice|SoftwareAes128'; then
+            echo "nRF52840 router image still links software AES" >&2
+            exit 1
+          fi
+          if ! "$NM" --demangle "$ELF" | grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver'; then
+            echo "nRF52840 router image is missing the Nordic ECB AES backend" >&2
+            exit 1
+          fi
           # Role-state split: the nRF backend builds the forwarding-only
           # `RelayRouter` role via `build_relay()`. A relay routes but is not an
           # end device, so it must carry none of the R22 End Device Timeout
@@ -211,8 +227,17 @@ jobs:
         run: |
           ELF=examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor
           OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
+          if "$NM" --demangle "$ELF" | grep -Eq 'aes::soft::fixslice|SoftwareAes128'; then
+            echo "nRF52833 production image still links software AES" >&2
+            exit 1
+          fi
+          if ! "$NM" --demangle "$ELF" | grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver'; then
+            echo "nRF52833 production image is missing the Nordic ECB AES backend" >&2
+            exit 1
+          fi
       - name: Upload nRF52833 firmware
         uses: actions/upload-artifact@v4
         with:
@@ -245,8 +270,17 @@ jobs:
         run: |
           ELF=examples/nrf52840-sensor-uf2/target/thumbv7em-none-eabihf/release/nrf52840-sensor-uf2
           OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
+          if "$NM" --demangle "$ELF" | grep -Eq 'aes::soft::fixslice|SoftwareAes128'; then
+            echo "nRF52840 UF2 production image still links software AES" >&2
+            exit 1
+          fi
+          if ! "$NM" --demangle "$ELF" | grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver'; then
+            echo "nRF52840 UF2 image is missing the Nordic ECB AES backend" >&2
+            exit 1
+          fi
 
           echo "=== Firmware sizes ==="
           ls -la ${ELF}.bin ${ELF}.hex

@@ -194,6 +194,20 @@ async fn main(_spawner: Spawner) {
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
     let rng = rng::Rng::new(p.RNG, Irqs);
     let mut mac = zigbee_mac::nrf::NrfMac::new(radio, rng);
+    let Some(aes) = zigbee_mac::nrf::NrfEcbToken::take() else {
+        error!("Nordic ECB AES already owned; networking halted");
+        loop {
+            cortex_m::asm::wfi();
+        }
+    };
+    if mac.install_aes_engine(aes).is_err() {
+        error!("Nordic ECB AES startup KAT failed; networking halted");
+        loop {
+            cortex_m::asm::wfi();
+        }
+    }
+    let ieee = mac.extended_address();
+    info!("Nordic ECB hardware AES KAT passed");
     mac.set_tx_power(0);
     info!("Radio ready (TX 0 dBm)");
 
@@ -224,6 +238,17 @@ async fn main(_spawner: Spawner) {
             |ep| profile.configure_endpoint(ep),
         )
         .build();
+
+    match device.reset_security_state_if_identity_changed(&mut security_store, ieee) {
+        Ok(true) => warn!("Cleared persisted network state after IEEE address change"),
+        Ok(false) => {}
+        Err(error) => persistence_failure(error),
+    }
+    let resumed_at_boot = match security_store.load() {
+        Ok(Some(state)) => state.commissioned && !state.rejoin_pending,
+        Ok(None) => false,
+        Err(error) => persistence_failure(error),
+    };
 
     let mut node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
 
@@ -263,7 +288,11 @@ async fn main(_spawner: Spawner) {
     };
     let mut last_rejoin_attempt = Instant::now();
     let mut rejoin_count: u8 = 0;
-    let mut annce_retries_left: u8 = if node.device().is_joined() { 5 } else { 0 };
+    let mut annce_retries_left: u8 = if node.device().is_joined() && !resumed_at_boot {
+        5
+    } else {
+        0
+    };
     let mut last_annce = Instant::now();
     let mut was_fast_polling = node.device().is_joined();
     let mut interview_done = false;

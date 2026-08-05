@@ -214,6 +214,19 @@ async fn main(_spawner: Spawner) {
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
     let rng = rng::Rng::new(p.RNG, Irqs);
     let mut mac = zigbee_mac::nrf::NrfMac::new(radio, rng);
+    let Some(aes) = zigbee_mac::nrf::NrfEcbToken::take() else {
+        error!("Nordic ECB AES already owned; networking halted");
+        loop {
+            cortex_m::asm::wfi();
+        }
+    };
+    if mac.install_aes_engine(aes).is_err() {
+        error!("Nordic ECB AES startup KAT failed; networking halted");
+        loop {
+            cortex_m::asm::wfi();
+        }
+    }
+    info!("Nordic ECB hardware AES KAT passed");
     mac.set_tx_power(0);
 
     info!("Radio ready");

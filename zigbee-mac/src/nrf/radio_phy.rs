@@ -6,12 +6,16 @@ use embassy_futures::select::{Either, select};
 use embassy_time::Timer;
 
 use super::embassy_nrf::radio::Error as RadioError;
-use super::{Packet, Radio, RadioInstance, Rng, RngInstance};
+use super::{
+    NrfAesError, NrfAesState, NrfEcbToken, NrfHardwareAes128, Packet, Radio, RadioInstance, Rng,
+    RngInstance,
+};
 
 /// nRF52833/nRF52840 radio and RNG exposed through the portable PHY contract.
 pub struct NrfRadioPhy<'a, T: RadioInstance, R: RngInstance> {
     radio: Radio<'a, T>,
     rng: Rng<'a, R>,
+    aes: NrfAesState,
 }
 
 /// Shared software MAC using the nRF radio adapter.
@@ -19,7 +23,17 @@ pub type NrfSoftMac<'a, T, R> = SoftMacCore<NrfRadioPhy<'a, T, R>>;
 
 impl<'a, T: RadioInstance, R: RngInstance> NrfRadioPhy<'a, T, R> {
     pub fn new(radio: Radio<'a, T>, rng: Rng<'a, R>) -> Self {
-        Self { radio, rng }
+        Self {
+            radio,
+            rng,
+            aes: NrfAesState::new(),
+        }
+    }
+
+    /// Consume the unique ECB token and install hardware AES after both
+    /// startup known-answer tests pass.
+    pub fn install_aes_engine(&mut self, token: NrfEcbToken) -> Result<(), NrfAesError> {
+        self.aes.install(token)
     }
 }
 
@@ -99,7 +113,17 @@ impl<T: RadioInstance, R: RngInstance> RadioPhy for NrfRadioPhy<'_, T, R> {
     }
 }
 
-impl<T: RadioInstance, R: RngInstance> zigbee_crypto::ForwardAesProvider for NrfRadioPhy<'_, T, R> {}
+impl<T: RadioInstance, R: RngInstance> zigbee_crypto::ForwardAesProvider for NrfRadioPhy<'_, T, R> {
+    fn forward_cipher(
+        &mut self,
+        key: &zigbee_crypto::AesKey,
+    ) -> impl zigbee_crypto::Aes128Forward + '_ {
+        NrfHardwareAes128 {
+            engine: self.aes.engine_mut(),
+            key: *key,
+        }
+    }
+}
 impl<T: RadioInstance, R: RngInstance> PlatformServices for NrfRadioPhy<'_, T, R> {
     fn monotonic_micros(&self) -> u32 {
         embassy_time::Instant::now().as_micros() as u32

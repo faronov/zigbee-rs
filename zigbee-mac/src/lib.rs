@@ -32,8 +32,20 @@ pub mod platform;
 pub mod primitives;
 pub mod soft_mac;
 
+#[cfg(any(
+    test,
+    feature = "esp32c6",
+    feature = "esp32h2",
+    feature = "nrf52840",
+    feature = "nrf52833"
+))]
+mod aes_kat;
+
 #[cfg(any(test, feature = "esp32c6", feature = "esp32h2"))]
 mod esp_aes;
+
+#[cfg(any(test, feature = "nrf52840", feature = "nrf52833"))]
+mod nrf_aes;
 
 #[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod esp;
