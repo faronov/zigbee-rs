@@ -16,10 +16,13 @@ const REPORT_INTERVAL_SECS: u64 = 60;
 const FAST_POLL_MS: u64 = 250;
 const SLOW_POLL_SECS: u64 = 30;
 const FAST_POLL_DURATION_SECS: u64 = 120;
+const RESTORED_FAST_POLL_SECS: u64 = 60;
+const INTERVIEW_CONFIGURATION_TIMEOUT_SECS: u64 = 120;
 const JOIN_RETRY_SECS: u64 = 15;
 const ANNCE_RETRY_SECS: u64 = 8;
 const ANNCE_RETRIES: u8 = 5;
 const BUTTON_LONG_PRESS_SECS: u64 = 3;
+const SECURE_REJOIN_FAILURE_LIMIT: u8 = 4;
 
 type SensorNode<'a> = ZigbeeNode<'a, EspMac<'a>, SecurityStore, SensorProfile>;
 
@@ -37,42 +40,10 @@ fn node_failure(error: NodeError) -> ! {
     }
 }
 
-/// Whether `event` is worth logging and treating as "something changed".
-fn log_event(event: &StackEvent) -> bool {
-    match event {
-        StackEvent::Joined {
-            short_address,
-            channel,
-            pan_id,
-        } => {
-            esp_println::println!(
-                "[ESP32-H2] Joined! addr=0x{:04X} ch={} pan=0x{:04X}",
-                short_address,
-                channel,
-                pan_id
-            );
-            true
-        }
-        StackEvent::Left => {
-            esp_println::println!("[ESP32-H2] Left network");
-            false
-        }
-        StackEvent::ReportSent => {
-            esp_println::println!("[ESP32-H2] Report sent");
-            false
-        }
-        StackEvent::LeaveRequested | StackEvent::RejoinRequested => {
-            esp_println::println!("[ESP32-H2] Leave requested by coordinator");
-            false
-        }
-        StackEvent::CommissioningComplete { success } => {
-            esp_println::println!(
-                "[ESP32-H2] Commissioning: {}",
-                if *success { "ok" } else { "failed" }
-            );
-            false
-        }
-        _ => false,
+fn start_failure(error: StartError) -> ! {
+    esp_println::println!("[ESP32-H2] FATAL: lifecycle error {:?}", error);
+    loop {
+        core::hint::spin_loop();
     }
 }
 
@@ -88,8 +59,12 @@ pub struct SensorApp<'a> {
     last_rejoin_attempt: Instant,
     annce_retries_left: u8,
     last_annce: Instant,
+    was_identifying: bool,
     interview_done: bool,
+    interview_deadline: Option<Instant>,
     needs_bootstrap_join: bool,
+    awaiting_initial_configuration: bool,
+    consecutive_rejoin_failures: u8,
     button_was_pressed: bool,
 }
 
@@ -116,10 +91,14 @@ impl<'a> SensorApp<'a> {
                 now
             },
             last_rejoin_attempt: now,
-            annce_retries_left: if joined { ANNCE_RETRIES } else { 0 },
+            annce_retries_left: 0,
             last_annce: now,
+            was_identifying: false,
             interview_done: false,
+            interview_deadline: None,
             needs_bootstrap_join: !joined,
+            awaiting_initial_configuration: false,
+            consecutive_rejoin_failures: 0,
             button_was_pressed: false,
         }
     }
@@ -168,7 +147,8 @@ impl<'a> SensorApp<'a> {
             Ok(state) => state,
             Err(error) => persistence_failure(error),
         };
-        if restored_state.is_some_and(|state| state.commissioned) {
+        let had_commissioned_state = restored_state.is_some_and(|state| state.commissioned);
+        if had_commissioned_state {
             esp_println::println!("[ESP32-H2] Restored state — will rejoin");
         } else {
             esp_println::println!("[ESP32-H2] No saved state — auto-joining…");
@@ -183,10 +163,23 @@ impl<'a> SensorApp<'a> {
             Err(_) => return false,
         }
 
+        let now = Instant::now();
+        self.awaiting_initial_configuration = !had_commissioned_state;
+        self.interview_deadline = if had_commissioned_state {
+            None
+        } else {
+            Some(now + Duration::from_secs(INTERVIEW_CONFIGURATION_TIMEOUT_SECS))
+        };
         self.checkpoint_security();
-        let _ = self.node.device_mut().send_device_annce().await;
-        self.checkpoint_security();
+        if !had_commissioned_state {
+            let _ = self.node.device_mut().send_device_annce().await;
+            self.checkpoint_security();
+        }
         self.reset_post_join_state();
+        if had_commissioned_state {
+            self.annce_retries_left = 0;
+            self.fast_poll_until = Instant::now() + Duration::from_secs(RESTORED_FAST_POLL_SECS);
+        }
         self.needs_bootstrap_join = false;
         true
     }
@@ -198,21 +191,58 @@ impl<'a> SensorApp<'a> {
         self.last_rejoin_attempt = now;
         self.annce_retries_left = ANNCE_RETRIES;
         self.last_annce = now;
+        self.was_identifying = false;
         self.interview_done = false;
+        self.consecutive_rejoin_failures = 0;
+        self.led.set_low();
+    }
+
+    fn update_interview_state(&mut self) {
+        if self.interview_done || !self.node.reporting_is_configured() {
+            return;
+        }
+
+        self.fast_poll_until = Instant::now() + Duration::from_secs(5);
+        self.interview_done = true;
+        self.awaiting_initial_configuration = false;
+        self.interview_deadline = None;
+        self.led.set_high();
+        esp_println::println!("[ESP32-H2] Interview configured");
+    }
+
+    fn update_fast_poll_window(&mut self, now: Instant) -> u64 {
+        if self.awaiting_initial_configuration
+            && self
+                .interview_deadline
+                .is_some_and(|deadline| now >= deadline)
+        {
+            if let Err(error) = self.node.configure_default_reporting() {
+                node_failure(NodeError::Profile(error));
+            }
+            self.interview_done = true;
+            self.awaiting_initial_configuration = false;
+            self.interview_deadline = None;
+            self.led.set_high();
+            esp_println::println!("[ESP32-H2] Interview timeout — using default reporting");
+        }
+
+        let in_fast_poll = self.awaiting_initial_configuration
+            || self
+                .node
+                .device()
+                .is_identifying(esp32_zigbee_devkit_product::ENDPOINT)
+            || now < self.fast_poll_until;
+        if in_fast_poll {
+            FAST_POLL_MS
+        } else {
+            SLOW_POLL_SECS * 1_000
+        }
     }
 
     async fn request_join_retry(&mut self) {
         if self.node.device().secure_rejoin_pending() {
             self.last_rejoin_attempt = Instant::now();
-            match self.node.secure_rejoin().await {
-                Ok(_) => {
-                    self.checkpoint_security();
-                    self.reset_post_join_state();
-                    self.led.set_low();
-                }
-                Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
-                Err(_) => esp_println::println!("[ESP32-H2] Secure rejoin failed"),
-            }
+            let _ = self.secure_rejoin().await;
             return;
         }
         let _ = self.bootstrap_join().await;
@@ -223,9 +253,48 @@ impl<'a> SensorApp<'a> {
     /// leave (button toggle, coordinator Leave) and a hard factory reset
     /// (long button press, which also reboots).
     async fn factory_reset(&mut self) {
-        if let Err(StartError::PersistenceFailed(error)) = self.node.factory_reset().await {
-            persistence_failure(error);
+        match self.node.factory_reset().await {
+            Ok(()) => {}
+            Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
+            Err(error) => start_failure(error),
         }
+    }
+
+    async fn secure_rejoin(&mut self) -> bool {
+        match self.node.secure_rejoin().await {
+            Ok(_) => {}
+            Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
+            Err(_) => {
+                esp_println::println!("[ESP32-H2] Secure rejoin failed");
+                self.record_failed_rejoin().await;
+                return false;
+            }
+        }
+
+        self.checkpoint_security();
+        self.reset_post_join_state();
+        self.needs_bootstrap_join = false;
+        esp_println::println!(
+            "[ESP32-H2] Secure rejoin succeeded addr=0x{:04X}",
+            self.node.device().short_address()
+        );
+        true
+    }
+
+    async fn record_failed_rejoin(&mut self) {
+        self.consecutive_rejoin_failures = self.consecutive_rejoin_failures.saturating_add(1);
+        if self.consecutive_rejoin_failures < SECURE_REJOIN_FAILURE_LIMIT {
+            return;
+        }
+
+        esp_println::println!(
+            "[ESP32-H2] Stale network — resetting after repeated rejoin failures"
+        );
+        self.factory_reset().await;
+        self.consecutive_rejoin_failures = 0;
+        self.needs_bootstrap_join = true;
+        self.awaiting_initial_configuration = false;
+        self.interview_deadline = None;
     }
 
     pub async fn run(&mut self) -> ! {
@@ -238,34 +307,19 @@ impl<'a> SensorApp<'a> {
             }
             self.button_was_pressed = pressed;
 
-            let now = Instant::now();
-            let in_fast_poll = now < self.fast_poll_until;
-            let poll_ms = if in_fast_poll {
-                FAST_POLL_MS
-            } else {
-                SLOW_POLL_SECS * 1_000
-            };
+            let poll_ms = self.update_fast_poll_window(Instant::now());
             Timer::after(Duration::from_millis(poll_ms)).await;
 
             if self.node.device().is_joined() {
                 self.service_joined_polls().await;
+                if !self.node.device().is_joined() {
+                    continue;
+                }
                 self.service_joined_tick(Instant::now()).await;
-
-                if self
-                    .node
-                    .device()
-                    .is_identifying(esp32_zigbee_devkit_product::ENDPOINT)
-                {
-                    self.led.toggle();
+                if !self.node.device().is_joined() {
+                    continue;
                 }
-
-                if self.annce_retries_left > 0
-                    && Instant::now().duration_since(self.last_annce).as_secs() >= ANNCE_RETRY_SECS
-                {
-                    self.annce_retries_left -= 1;
-                    self.last_annce = Instant::now();
-                    let _ = self.node.device_mut().send_device_annce().await;
-                }
+                self.service_status_led();
             } else {
                 self.service_unjoined_cycle(Instant::now()).await;
             }
@@ -273,24 +327,27 @@ impl<'a> SensorApp<'a> {
     }
 
     async fn run_first_tick(&mut self) {
-        if self.needs_bootstrap_join && !self.node.device().is_joined() {
-            let _ = self.bootstrap_join().await;
-        }
+        let bootstrapped = self.needs_bootstrap_join
+            && !self.node.device().is_joined()
+            && self.bootstrap_join().await;
 
         match self.node.tick(0).await {
-            Ok(TickResult::Event(ref event)) if log_event(event) => self.checkpoint_security(),
-            Ok(_) => {}
+            Ok(result) => {
+                self.handle_tick_result(result).await;
+            }
             Err(error) => node_failure(error),
         }
 
-        if let Err(error) = self.node.configure_default_reporting() {
-            node_failure(NodeError::Profile(error));
+        if self.node.device().is_joined() && !self.awaiting_initial_configuration {
+            if let Err(error) = self.node.configure_default_reporting() {
+                node_failure(NodeError::Profile(error));
+            }
         }
         self.sample_battery();
         self.sample_temperature_and_humidity();
         self.last_report = Instant::now();
 
-        if self.node.device().is_joined() {
+        if self.node.device().is_joined() && !bootstrapped {
             self.reset_post_join_state();
         }
     }
@@ -302,45 +359,88 @@ impl<'a> SensorApp<'a> {
         };
 
         if let Some(event) = event {
-            match event {
-                StackEvent::RejoinRequested => {
-                    esp_println::println!("[ESP32-H2] Secure rejoin requested");
-                    match self.node.secure_rejoin().await {
-                        Ok(_) => {
-                            self.checkpoint_security();
-                            self.reset_post_join_state();
-                        }
-                        Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
-                        Err(_) => esp_println::println!("[ESP32-H2] Secure rejoin failed"),
-                    }
-                    return true;
-                }
-                StackEvent::LeaveRequested => {
-                    esp_println::println!("[ESP32-H2] Leave requested — erasing NV and rejoining");
-                    self.factory_reset().await;
-                    self.needs_bootstrap_join = true;
-                    let _ = self.bootstrap_join().await;
-                    return true;
-                }
-                _ if log_event(&event) => {
-                    self.checkpoint_security();
-                    self.fast_poll_until =
-                        Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                }
-                _ => {}
+            if self.handle_control_event(&event).await {
+                return true;
             }
         }
 
-        if !self.interview_done && self.node.reporting_is_configured() {
-            self.interview_done = true;
-            self.fast_poll_until = Instant::now() + Duration::from_secs(5);
-            self.led.set_high(); // OFF
-            esp_println::println!("[ESP32-H2] Interview done!");
+        self.update_interview_state();
+        if !self.node.device().is_joined() {
+            return true;
         }
-        if let Err(error) = self.node.tick(0).await {
-            node_failure(error);
+        match self.node.tick(0).await {
+            Ok(result) => {
+                if self.handle_tick_result(result).await {
+                    return true;
+                }
+            }
+            Err(error) => node_failure(error),
         }
         false
+    }
+
+    async fn handle_tick_result(&mut self, result: TickResult) -> bool {
+        let TickResult::Event(event) = result else {
+            return false;
+        };
+        self.handle_control_event(&event).await
+    }
+
+    async fn handle_control_event(&mut self, event: &StackEvent) -> bool {
+        match event {
+            StackEvent::Joined {
+                short_address,
+                channel,
+                pan_id,
+            } => {
+                self.reset_post_join_state();
+                self.needs_bootstrap_join = false;
+                self.checkpoint_security();
+                esp_println::println!(
+                    "[ESP32-H2] Joined addr=0x{:04X} ch={} pan=0x{:04X}",
+                    short_address,
+                    channel,
+                    pan_id
+                );
+                false
+            }
+            StackEvent::CommissioningComplete { success: true } => {
+                self.consecutive_rejoin_failures = 0;
+                self.checkpoint_security();
+                esp_println::println!("[ESP32-H2] Commissioning complete");
+                false
+            }
+            StackEvent::CommissioningComplete { success: false } => {
+                esp_println::println!("[ESP32-H2] Commissioning failed");
+                if self.node.device().secure_rejoin_pending() {
+                    self.record_failed_rejoin().await;
+                } else {
+                    self.needs_bootstrap_join = true;
+                    self.awaiting_initial_configuration = false;
+                    self.interview_deadline = None;
+                }
+                true
+            }
+            StackEvent::RejoinRequested => {
+                esp_println::println!("[ESP32-H2] Secure rejoin requested");
+                let _ = self.secure_rejoin().await;
+                true
+            }
+            StackEvent::LeaveRequested | StackEvent::FactoryResetRequested | StackEvent::Left => {
+                esp_println::println!("[ESP32-H2] Leaving network and clearing credentials");
+                self.factory_reset().await;
+                self.needs_bootstrap_join = true;
+                self.awaiting_initial_configuration = false;
+                self.interview_deadline = None;
+                self.led.set_high();
+                true
+            }
+            StackEvent::ReportSent => {
+                esp_println::println!("[ESP32-H2] Report sent");
+                false
+            }
+            _ => false,
+        }
     }
 
     async fn service_joined_polls(&mut self) {
@@ -357,21 +457,53 @@ impl<'a> SensorApp<'a> {
     }
 
     async fn service_joined_tick(&mut self, now: Instant) {
-        let elapsed_s = now.duration_since(self.last_report).as_secs();
+        let elapsed_s = now.saturating_duration_since(self.last_report).as_secs();
         if elapsed_s >= REPORT_INTERVAL_SECS {
             self.last_report = now;
             self.sample_temperature_and_humidity();
         }
 
-        let elapsed = now.duration_since(self.last_tick).as_secs().min(60);
-        self.last_tick += Duration::from_secs(elapsed);
-        if let Err(error) = self.node.tick(elapsed as u16).await {
-            node_failure(error);
+        let elapsed = now
+            .saturating_duration_since(self.last_tick)
+            .as_secs()
+            .min(60);
+        if elapsed != 0 {
+            self.last_tick += Duration::from_secs(elapsed);
+        }
+        match self.node.tick(elapsed as u16).await {
+            Ok(result) => {
+                if self.handle_tick_result(result).await {
+                    return;
+                }
+            }
+            Err(error) => node_failure(error),
+        }
+
+        if !self.node.device().is_joined() {
+            return;
+        }
+
+        let annce_now = Instant::now();
+        if self.annce_retries_left > 0
+            && annce_now
+                .saturating_duration_since(self.last_annce)
+                .as_secs()
+                >= ANNCE_RETRY_SECS
+        {
+            self.annce_retries_left -= 1;
+            self.last_annce = annce_now;
+            self.checkpoint_security();
+            let _ = self.node.device_mut().send_device_annce().await;
+            self.checkpoint_security();
         }
     }
 
     async fn service_unjoined_cycle(&mut self, now: Instant) {
-        if now.duration_since(self.last_rejoin_attempt).as_secs() >= 1 {
+        if now
+            .saturating_duration_since(self.last_rejoin_attempt)
+            .as_secs()
+            >= 1
+        {
             self.led.set_low();
             Timer::after(Duration::from_millis(80)).await;
             self.led.set_high();
@@ -380,10 +512,27 @@ impl<'a> SensorApp<'a> {
             Timer::after(Duration::from_millis(80)).await;
             self.led.set_high();
         }
-        if now.duration_since(self.last_rejoin_attempt).as_secs() >= JOIN_RETRY_SECS {
+        if now
+            .saturating_duration_since(self.last_rejoin_attempt)
+            .as_secs()
+            >= JOIN_RETRY_SECS
+        {
             esp_println::println!("[ESP32-H2] Retrying join…");
             self.request_join_retry().await;
         }
+    }
+
+    fn service_status_led(&mut self) {
+        let identifying = self
+            .node
+            .device()
+            .is_identifying(esp32_zigbee_devkit_product::ENDPOINT);
+        if identifying {
+            self.led.toggle();
+        } else if self.was_identifying {
+            self.led.set_high();
+        }
+        self.was_identifying = identifying;
     }
 
     async fn handle_button_press(&mut self) {

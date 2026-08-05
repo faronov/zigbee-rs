@@ -284,6 +284,18 @@ jobs:
       - name: Build ESP32-C6 sensor (release)
         working-directory: examples/esp32c6-sensor
         run: cargo build --release -Z build-std=core,alloc
+      - name: Check ESP32-C6 hardware AES
+        run: |
+          ELF=examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          if "$NM" --demangle "$ELF" | grep -Eq 'aes::soft::fixslice|SoftwareAes128'; then
+            echo "ESP32-C6 production image still links the software AES core" >&2
+            exit 1
+          fi
+          if ! "$NM" --demangle "$ELF" | grep -Eq 'EspHardwareAes128|EspAesEngine'; then
+            echo "ESP32-C6 production image is missing the hardware AES backend" >&2
+            exit 1
+          fi
       - name: Create firmware artifacts
         run: |
           ELF=examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
@@ -312,6 +324,18 @@ jobs:
       - name: Build ESP32-H2 sensor (release)
         working-directory: examples/esp32h2-sensor
         run: cargo build --release -Z build-std=core,alloc
+      - name: Check ESP32-H2 hardware AES
+        run: |
+          ELF=examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          if "$NM" --demangle "$ELF" | grep -Eq 'aes::soft::fixslice|SoftwareAes128'; then
+            echo "ESP32-H2 production image still links the software AES core" >&2
+            exit 1
+          fi
+          if ! "$NM" --demangle "$ELF" | grep -Eq 'EspHardwareAes128|EspAesEngine'; then
+            echo "ESP32-H2 production image is missing the hardware AES backend" >&2
+            exit 1
+          fi
       - name: Create firmware artifacts
         run: |
           ELF=examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor

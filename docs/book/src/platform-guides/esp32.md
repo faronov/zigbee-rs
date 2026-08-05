@@ -5,10 +5,11 @@ radio support, making them a great fit for zigbee-rs. Both chips share the
 same MAC driver code — only the HAL feature flag differs.
 
 > **✅ Hardware Verified:** The ESP32-C6 has been tested end-to-end on an
-> **ESP32-C6-DevKitC-1** board with **Home Assistant + ZHA**. It appears as
-> "Zigbee-RS ESP32-C6-Sensor" with Temperature, Humidity, and Battery entities.
-> Network state is persisted to flash — the device survives reboots without
-> re-pairing.
+> **ESP32-C6-DevKitC-1** board with **Home Assistant + ZHA**. The ESP32-H2
+> revision 1.2 has additionally passed the production hardware-AES and
+> persisted-resume gate: two startup KATs, secured traffic, preserved PAN
+> `0xDFE9` / address `0x44CB`, live sensor entities, and a silent restart
+> without re-pairing or `Device_annce`.
 
 ## Hardware Overview
 
@@ -22,7 +23,9 @@ same MAC driver code — only the HAL feature flag differs.
 
 Both chips have a built-in IEEE 802.15.4 radio driven by the `esp-radio`
 crate's `ieee802154` module. The radio supports hardware CRC, configurable
-TX power, RSSI/LQI measurement, and software address filtering.
+TX power, RSSI/LQI measurement, and software address filtering. Their shared
+AES accelerator supplies all production NWK/APS CCM* and AES-MMO operations;
+the hardware RNG supplies runtime entropy while the RF subsystem is active.
 
 ### Common Development Boards
 
@@ -170,12 +173,15 @@ If `espflash` times out:
 
 ## MAC Backend Notes
 
-The ESP32 MAC backend lives in `zigbee-mac/src/esp/`:
+The ESP32 MAC backend lives in `zigbee-mac/src/esp/`, with its reusable
+bounded AES register protocol beside it:
 
 ```
-zigbee-mac/src/esp/
-├── mod.rs      # EspMac struct, MacDriver trait impl, PIB management
-└── driver.rs   # Ieee802154Driver — low-level radio wrapper
+zigbee-mac/src/
+├── esp_aes.rs  # bounded AES protocol, KATs, timeout/dead-engine tests
+└── esp/
+    ├── mod.rs  # EspMac, AES ownership, MacDriver and platform services
+    └── driver.rs
 ```
 
 ### Feature Flags
@@ -201,6 +207,47 @@ esp-radio = { version = "0.17.0", features = ["esp32c6", "ieee802154", "unstable
 4. Scanning uses real beacon parsing — the radio enters RX mode and collects
    beacon frames across channels 11–26
 5. CSMA-CA is implemented in software with configurable backoff parameters
+6. `EspMac` exclusively owns `peripherals.AES`, runs two startup known-answer
+   tests, and exposes only the bounded hardware cipher to the Zigbee stack
+7. `PlatformServices::fill_random` reads the ESP hardware RNG; it never
+   substitutes predictable pseudo-random bytes
+
+### Hardware AES policy
+
+ESP32 production builds are hardware-only. `esp-hal` retains the AES token and
+clock guard, while zigbee-rs drives the shared H2/C6 register protocol directly
+because `esp-hal` 1.0.0's convenience method waits without a bound. Every block
+must observe:
+
+1. idle before programming;
+2. busy after the trigger;
+3. idle again before the result is published.
+
+Each phase has a finite iteration limit. A gated, stuck, or trigger-ignoring
+accelerator returns an error without modifying the caller's output and never
+falls back to RustCrypto. CI requires the `EspHardwareAes128` backend and
+rejects `aes::soft::fixslice` / `SoftwareAes128` symbols in both production
+ELFs.
+
+The ESP32-H2 revision 1.2 acceptance run on 2026-08-05 passed both KAT vectors
+on silicon and then resumed its existing secured network. ESP32-C6 uses the
+same documented base address and register layout; its release image passes the
+same build and linked-symbol gates, while a separate C6 on-silicon KAT rerun
+remains desirable when that board is next connected.
+
+The independent channel-15 capture
+`esp32h2-hardware-aes-event-parity-resume-20260805.pcap` contains 10,921
+packets over 351.785955 seconds (SHA-256
+`aba93a40d71c39cb46dee5d2ba0423de53f2a506c1a42b3d8c3c7504b265ef67`).
+Across two reset/resume cycles it contains no Beacon Request, Association
+Request, or Device Announce from the H2. Direct secured frames advance from
+NWK counter 21,335 to 22,364 across a fresh reservation, all with non-zero
+MICs; decoded temperature, humidity, and battery reports reached the
+coordinator. The final ESP application images are 285,792 bytes for H2
+(SHA-256
+`035b4e1dd4eaf4297d61745e516591826a435ecb50aa721f8a99249d491056b2`)
+and 326,752 bytes for C6 (SHA-256
+`1a9806a630ee032ac94966a3500fd62aaac205315fff91d12419591987d4ec9d`).
 
 ### Switching Chips
 
@@ -231,10 +278,19 @@ temperature & humidity end device around a typed product profile
 - **Crash-safe security-state journal** — network/security state persists
   across power cycles with a bounded frame-counter reservation (no re-pairing,
   no counter reuse after a crash)
+- **Hardware-only AES** — all NWK/APS CCM* and Trust Center key derivation use
+  the token-owned accelerator after two startup KATs
+- **Unified lifecycle events** — incoming frames and periodic `tick()` results
+  share one Joined/Commissioning/Rejoin/Leave/FactoryReset policy
+- **Bounded parent recovery** — repeated poll `NoAck` outcomes request a secure
+  rejoin; four consecutive failures discard stale credentials and commission
+  cleanly
+- **Silent persisted resume** — restored devices keep their identity and
+  counters without repeating `Device_annce`
 - **NWK Leave handler** — auto-erases state and rejoins when the coordinator
   sends Leave
-- **Default reporting** — configured from the shared profile at boot so data
-  flows before ZHA interview
+- **Interview-aware reporting** — coordinator configuration wins; after a
+  bounded timeout the shared default reporting policy is installed
 - **Identify cluster** (0x0003) — supports Identify, IdentifyQuery, TriggerEffect
 - **Battery percentage** reporting via Power Configuration cluster
 - Join/leave button (BOOT / GPIO9)
@@ -257,7 +313,9 @@ fn main() -> ! {
     // IEEE 802.15.4 MAC driver
     let ieee802154 = esp_radio::ieee802154::Ieee802154::new(peripherals.IEEE802154);
     let config = esp_radio::ieee802154::Config::default();
-    let mac = zigbee_mac::esp::EspMac::new(ieee802154, config);
+    let mut mac = zigbee_mac::esp::EspMac::new(ieee802154, config);
+    mac.install_aes_engine(peripherals.AES)
+        .expect("ESP hardware AES KAT");
 ```
 
 ### Device Setup
@@ -306,6 +364,12 @@ OTA transport (`src/ota_client.rs`) over whatever backend the profile
 composed in. Initial and retried commissioning goes through
 `ZigbeeNode::start_or_resume`/`secure_rejoin`/`factory_reset`, which
 `tick`/`process_incoming` alone do not perform.
+
+Both event sources feed the same control dispatcher: a
+`StackEvent::RejoinRequested` returned by a periodic tick is handled exactly
+like one returned while processing an incoming frame. Announce retry timing
+uses saturating time differences and refreshes the clock after asynchronous
+rejoin, preventing the stale-`Instant` underflow class fixed on EFR32MG1.
 
 The example's `OtaTransport` is only platform logging/poll-window policy. The
 server lock, APS retry, cleanup, and activation-pending state are shared in
@@ -399,9 +463,11 @@ pre-flash `0x3FE000..0x3FFFFF` dump contained the legacy `0xA55A` item records.
 After flashing without erasing NV, the product wrote committed `ZBSS`/`CMIT`
 journal records into the other sector, restored PAN `0xDFE9`, short address
 `0x44CB`, channel 15 and parent `0x1F0F`, and resumed with secured NWK counters
-above the legacy value. A subsequent reset reported `JournalPresent`, sent
-Device Announce, completed the ZHA interview, updated sensor entities, and
-answered Identify commands. The original legacy sector was still intact.
+above the legacy value. The 2026-08-05 hardware-AES/event-policy image then
+reported `JournalPresent`, restored the same identity without Beacon Request,
+Association Request, or `Device_annce`, resumed secured polls/reports, and
+updated the Home Assistant temperature, humidity, and battery entities. The
+original legacy sector remained intact.
 
 On boot, `ZigbeeNode::start_or_resume` checks for saved network state and, if
 present, performs a secure silent rejoin instead of full commissioning. If the
@@ -559,6 +625,7 @@ ESP32-H2 example does implement LED blinking during Identify.
 | `espflash` timeout | USB-UART bridge issue | Try a different USB cable/port |
 | Build error: `rust-src` not found | Missing component | `rustup component add rust-src` |
 | Linker error: `linkall.x` not found | `esp-hal` version mismatch | Check `esp-hal` version matches `esp-radio` |
+| Startup stops at hardware AES | KAT, clock, or accelerator handshake failed | Do not bypass it; inspect the AES clock/reset and register state |
 | Serial output garbled | Wrong baud rate | Default is 115200 — check monitor settings |
 | Device doesn't join network | Coordinator not in permit-join mode | Enable permit joining on your coordinator |
 | No beacon found | Wrong channel | Ensure coordinator and device scan the same channels |

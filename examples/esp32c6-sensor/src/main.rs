@@ -103,7 +103,10 @@ fn main() -> ! {
     // IEEE 802.15.4 radio
     let ieee802154 = esp_radio::ieee802154::Ieee802154::new(peripherals.IEEE802154);
     let config = esp_radio::ieee802154::Config::default();
-    let mac = zigbee_mac::esp::EspMac::new(ieee802154, config);
+    let mut mac = zigbee_mac::esp::EspMac::new(ieee802154, config);
+    mac.install_aes_engine(peripherals.AES)
+        .expect("ESP32-C6 hardware AES KAT");
+    esp_println::println!("[ESP32-C6] Hardware AES KAT passed");
     esp_println::println!("[ESP32-C6] Radio ready");
 
     // On-chip temperature sensor

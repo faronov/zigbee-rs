@@ -13,9 +13,12 @@
 //! - Software address filtering in RX path
 //! - CSMA-CA with backoff for TX
 //! - EUI-64 address from eFuse factory MAC
+//! - Bounded, fail-closed hardware AES-128 for Zigbee security
+//! - Hardware RNG service while the RF subsystem is active
 
 mod driver;
 
+use crate::esp_aes::{AesDriver, AesRegisters};
 use crate::pib::{self, PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use crate::{MacCapabilities, MacDriver, MacError, PlatformServices};
@@ -25,10 +28,131 @@ use zigbee_types::*;
 use embassy_time::{Duration, Instant, Timer};
 use esp_radio::ieee802154::{Config, Ieee802154};
 
+pub use crate::esp_aes::AesEngineError;
+
 /// How long to wait for the parent to deliver an indirect frame after a Data
 /// Request. The parent transmits the buffered frame immediately after the MAC
 /// acknowledgement, so this only has to cover CSMA plus one frame.
 const POLL_RESPONSE_MS: u64 = 250;
+const AES_BASE: usize = 0x6008_8000;
+const AES_KEY_OFFSET: usize = 0x00;
+const AES_TEXT_IN_OFFSET: usize = 0x20;
+const AES_TEXT_OUT_OFFSET: usize = 0x30;
+const AES_MODE_OFFSET: usize = 0x40;
+const AES_ENDIAN_OFFSET: usize = 0x44;
+const AES_TRIGGER_OFFSET: usize = 0x48;
+const AES_STATE_OFFSET: usize = 0x4c;
+const AES_WAIT_LIMIT: u32 = 100_000;
+
+struct EspAesRegisters;
+
+impl EspAesRegisters {
+    #[inline(always)]
+    fn read(offset: usize) -> u32 {
+        // SAFETY: `EspAesEngine` retains the unique AES peripheral token.
+        unsafe { core::ptr::read_volatile((AES_BASE + offset) as *const u32) }
+    }
+
+    #[inline(always)]
+    fn write(offset: usize, value: u32) {
+        // SAFETY: all offsets are fixed AES registers shared by C6 and H2.
+        unsafe { core::ptr::write_volatile((AES_BASE + offset) as *mut u32, value) }
+    }
+
+    fn write_words(offset: usize, bytes: &[u8; 16]) {
+        for index in 0..4 {
+            let start = index * 4;
+            Self::write(
+                offset + start,
+                u32::from_le_bytes([
+                    bytes[start],
+                    bytes[start + 1],
+                    bytes[start + 2],
+                    bytes[start + 3],
+                ]),
+            );
+        }
+    }
+}
+
+impl AesRegisters for EspAesRegisters {
+    fn state(&mut self) -> u32 {
+        Self::read(AES_STATE_OFFSET) & 0x03
+    }
+
+    fn configure_aes128_encrypt(&mut self) {
+        Self::write(AES_ENDIAN_OFFSET, 0);
+        Self::write(AES_MODE_OFFSET, 0);
+    }
+
+    fn write_key(&mut self, key: &[u8; 16]) {
+        Self::write_words(AES_KEY_OFFSET, key);
+    }
+
+    fn write_input(&mut self, input: &[u8; 16]) {
+        Self::write_words(AES_TEXT_IN_OFFSET, input);
+    }
+
+    fn trigger(&mut self) {
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        Self::write(AES_TRIGGER_OFFSET, 1);
+    }
+
+    fn read_output(&mut self, output: &mut [u8; 16]) {
+        for index in 0..4 {
+            let start = index * 4;
+            output[start..start + 4]
+                .copy_from_slice(&Self::read(AES_TEXT_OUT_OFFSET + start).to_le_bytes());
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct EspAesEngine<'d> {
+    _peripheral: esp_hal::aes::Aes<'d>,
+    driver: AesDriver<EspAesRegisters>,
+}
+
+impl<'d> EspAesEngine<'d> {
+    fn new(peripheral: esp_hal::peripherals::AES<'d>) -> Result<Self, AesEngineError> {
+        let peripheral = esp_hal::aes::Aes::new(peripheral);
+        let mut driver = AesDriver::new(EspAesRegisters, AES_WAIT_LIMIT);
+        driver.self_test()?;
+        Ok(Self {
+            _peripheral: peripheral,
+            driver,
+        })
+    }
+
+    fn encrypt_block(
+        &mut self,
+        key: &[u8; 16],
+        block: &mut [u8; 16],
+    ) -> Result<(), AesEngineError> {
+        let input = *block;
+        self.driver.encrypt(key, &input, block)
+    }
+}
+
+struct EspHardwareAes128<'engine, 'peripheral> {
+    engine: &'engine mut EspAesEngine<'peripheral>,
+    key: zigbee_crypto::AesKey,
+}
+
+impl<'engine, 'peripheral> EspHardwareAes128<'engine, 'peripheral> {
+    fn new(engine: &'engine mut EspAesEngine<'peripheral>, key: zigbee_crypto::AesKey) -> Self {
+        Self { engine, key }
+    }
+}
+
+impl zigbee_crypto::Aes128Forward for EspHardwareAes128<'_, '_> {
+    type Error = AesEngineError;
+
+    #[inline(always)]
+    fn encrypt_block(&mut self, block: &mut [u8; 16]) -> Result<(), Self::Error> {
+        self.engine.encrypt_block(&self.key, block)
+    }
+}
 
 /// ESP32 802.15.4 MAC driver.
 pub struct EspMac<'a> {
@@ -54,6 +178,7 @@ pub struct EspMac<'a> {
     tx_power: i8,
     /// Buffer for frames received during association (e.g. Transport-Key).
     pending_assoc_frame: Option<([u8; 128], usize)>,
+    aes_engine: Option<EspAesEngine<'a>>,
 }
 
 impl<'a> EspMac<'a> {
@@ -91,7 +216,17 @@ impl<'a> EspMac<'a> {
             promiscuous: false,
             tx_power: 0,
             pending_assoc_frame: None,
+            aes_engine: None,
         }
+    }
+
+    /// Install the exclusively-owned AES accelerator after two startup KATs.
+    pub fn install_aes_engine(
+        &mut self,
+        peripheral: esp_hal::peripherals::AES<'a>,
+    ) -> Result<(), AesEngineError> {
+        self.aes_engine = Some(EspAesEngine::new(peripheral)?);
+        Ok(())
     }
 
     /// Read IEEE EUI-64 address from ESP32 eFuse factory MAC.
@@ -956,7 +1091,18 @@ impl MacDriver for EspMac<'_> {
     }
 }
 
-impl zigbee_crypto::ForwardAesProvider for EspMac<'_> {}
+impl zigbee_crypto::ForwardAesProvider for EspMac<'_> {
+    fn forward_cipher(
+        &mut self,
+        key: &zigbee_crypto::AesKey,
+    ) -> impl zigbee_crypto::Aes128Forward + '_ {
+        let engine = self
+            .aes_engine
+            .as_mut()
+            .expect("AES engine not installed: call EspMac::install_aes_engine()");
+        EspHardwareAes128::new(engine, *key)
+    }
+}
 impl PlatformServices for EspMac<'_> {
     fn monotonic_micros(&self) -> u32 {
         Instant::now().as_micros() as u32
@@ -966,8 +1112,9 @@ impl PlatformServices for EspMac<'_> {
         Timer::after_micros(duration_us as u64).await;
     }
 
-    fn fill_random(&mut self, _output: &mut [u8]) -> Result<(), MacError> {
-        Err(MacError::Unsupported)
+    fn fill_random(&mut self, output: &mut [u8]) -> Result<(), MacError> {
+        esp_hal::rng::Rng::new().read(output);
+        Ok(())
     }
 }
 
