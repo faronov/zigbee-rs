@@ -7,21 +7,36 @@ use zigbee_types::ShortAddress;
 /// Many-to-one concentrator type (Zigbee R22 §3.4.1.3.1.1, bits 3-4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConcentratorType {
-    /// Low RAM concentrator (bit pattern 01) — devices MUST send Route Records
-    /// before every data frame because the concentrator may evict cached routes.
+    /// Low-RAM concentrator (many-to-one value 2): it does not maintain a
+    /// complete Route Record table, so routers send a Route Record before
+    /// every data frame routed to it.
     LowRam,
-    /// High RAM concentrator (bit pattern 11) — devices send Route Records once
-    /// and the concentrator caches them persistently.
+    /// High-RAM concentrator (many-to-one value 1): it maintains a Route
+    /// Record table, so a new Route Record is needed only for a new or changed
+    /// path.
     HighRam,
 }
 
 impl ConcentratorType {
     /// Route Request command_options byte for MTOR RREQ.
-    /// Bit 3 = many-to-one flag, Bit 4 = no route record (high RAM).
-    pub fn rreq_options(self) -> u8 {
+    ///
+    /// The two-bit many-to-one sub-field occupies bits 3-4:
+    /// value 1 (`0x08`) means a Route Record table is available, value 2
+    /// (`0x10`) means it is not, and value 3 (`0x18`) is reserved.
+    pub const fn rreq_options(self) -> u8 {
         match self {
-            ConcentratorType::LowRam => 0x08,  // bit 3 set
-            ConcentratorType::HighRam => 0x18, // bits 3+4 set
+            ConcentratorType::LowRam => 0x10,
+            ConcentratorType::HighRam => 0x08,
+        }
+    }
+
+    /// Decode the many-to-one sub-field from a Route Request command-options
+    /// byte. Zero is a normal Route Request and value three is reserved.
+    pub const fn from_rreq_options(options: u8) -> Option<Self> {
+        match (options >> 3) & 0x03 {
+            1 => Some(Self::HighRam),
+            2 => Some(Self::LowRam),
+            _ => None,
         }
     }
 }
@@ -30,6 +45,18 @@ impl ConcentratorType {
 
 /// Maximum relay hops in a source route (Zigbee spec limit).
 pub const MAX_SOURCE_ROUTE_RELAYS: usize = 8;
+
+/// Mix local timing and routing state for protocol jitter/neighbor selection.
+///
+/// Zigbee requires pseudo-random routing choices, not cryptographic entropy.
+/// Keeping this mixer inside NWK avoids pulling a platform entropy harvester
+/// and DRBG into constrained router images solely for a millisecond backoff.
+pub(crate) const fn routing_random_sample(mut seed: u32) -> u32 {
+    seed ^= 0xA511_E9B3;
+    seed ^= seed << 13;
+    seed ^= seed >> 17;
+    seed ^ (seed << 5)
+}
 
 /// Maximum number of source route table entries.
 #[cfg(feature = "router")]
@@ -121,6 +148,14 @@ impl SourceRouteTable {
             .map(|e| e.relay_list.as_slice())
     }
 
+    /// Current age of a stored source route, in seconds.
+    pub fn entry_age(&self, destination: ShortAddress) -> Option<u16> {
+        self.entries
+            .iter()
+            .find(|entry| entry.active && entry.destination == destination)
+            .map(|entry| entry.age)
+    }
+
     /// Remove a source route entry.
     pub fn remove(&mut self, destination: ShortAddress) {
         if let Some(entry) = self
@@ -132,10 +167,10 @@ impl SourceRouteTable {
         }
     }
 
-    /// Age all entries and expire those exceeding max_age.
-    pub fn age_and_expire(&mut self, max_age: u16) {
+    /// Age all entries by elapsed seconds and expire those exceeding max_age.
+    pub fn age_and_expire(&mut self, elapsed_secs: u16, max_age: u16) {
         for entry in self.entries.iter_mut().filter(|e| e.active) {
-            entry.age = entry.age.saturating_add(1);
+            entry.age = entry.age.saturating_add(elapsed_secs);
             if entry.age > max_age {
                 entry.active = false;
                 log::debug!(
@@ -144,6 +179,14 @@ impl SourceRouteTable {
                     entry.age,
                 );
             }
+        }
+    }
+
+    /// Age all entries by elapsed seconds without imposing an
+    /// implementation-specific expiry policy.
+    pub fn age_by(&mut self, elapsed_secs: u16) {
+        for entry in self.entries.iter_mut().filter(|entry| entry.active) {
+            entry.age = entry.age.saturating_add(elapsed_secs);
         }
     }
 
@@ -201,7 +244,8 @@ pub struct RouteEntry {
     pub many_to_one: bool,
     /// Whether a route record is required
     pub route_record_required: bool,
-    /// Low-RAM concentrators require a Route Record before every data frame.
+    /// Concentrators without a Route Record table require a Route Record
+    /// before every data frame.
     pub route_record_every_frame: bool,
     /// Whether the destination is a group address
     pub group_id: bool,
@@ -469,10 +513,10 @@ impl RoutingTable {
         }
     }
 
-    /// Age all route entries.
-    pub fn age_tick(&mut self) {
+    /// Age all route entries by elapsed seconds.
+    pub fn age_by(&mut self, elapsed_secs: u16) {
         for route in self.routes.iter_mut().filter(|r| r.active) {
-            route.age = route.age.saturating_add(1);
+            route.age = route.age.saturating_add(elapsed_secs);
         }
     }
 
@@ -492,11 +536,27 @@ impl RoutingTable {
             .find(|r| r.active && r.destination == destination && r.status == RouteStatus::Active)
     }
 
+    /// Whether a many-to-one route was retired after failure and has not yet
+    /// been replaced by a new MTOR discovery.
+    ///
+    /// R22 explicitly forbids automatic rediscovery of a failed many-to-one
+    /// route. Keeping this tombstone prevents tree/parent fallback from
+    /// silently reusing the destination until a new MTOR Route Request
+    /// installs an active entry.
+    pub fn has_failed_many_to_one(&self, destination: ShortAddress) -> bool {
+        if self.get_entry(destination).is_some() {
+            return false;
+        }
+        self.routes
+            .iter()
+            .any(|route| !route.active && route.destination == destination && route.many_to_one)
+    }
+
     /// Add or update a route to a many-to-one concentrator.
     ///
-    /// `concentrator_type`: controls whether `route_record_required` is set.
-    /// - `LowRam`: always set (concentrator may evict cached routes)
-    /// - `HighRam`: only set on first install (concentrator caches persistently)
+    /// `concentrator_type` controls the Route Record cadence:
+    /// - `LowRam`: always set because the concentrator has no route cache.
+    /// - `HighRam`: set on a new path or when the next hop changes.
     #[allow(clippy::result_unit_err)]
     pub fn update_route_many_to_one(
         &mut self,
@@ -505,24 +565,27 @@ impl RoutingTable {
         cost: u8,
         concentrator_type: ConcentratorType,
     ) -> Result<(), ()> {
-        // For LowRam, always require route record; for HighRam, only on new routes
-        let rr_required = concentrator_type == ConcentratorType::LowRam;
+        let no_route_cache = concentrator_type == ConcentratorType::LowRam;
 
-        // Update existing entry
+        // Update an existing or retired entry for this destination before
+        // consuming an unrelated free slot. Reusing a failed MTOR tombstone
+        // also makes the new discovery immediately authoritative.
         if let Some(entry) = self
             .routes
             .iter_mut()
-            .find(|r| r.active && r.destination == destination)
+            .find(|route| route.destination == destination)
         {
+            let new_or_changed_path = !entry.active || entry.next_hop != next_hop;
             entry.next_hop = next_hop;
             entry.path_cost = cost;
             entry.status = RouteStatus::Active;
             entry.many_to_one = true;
-            entry.route_record_every_frame = rr_required;
-            if rr_required {
+            entry.route_record_every_frame = no_route_cache;
+            if no_route_cache || new_or_changed_path {
                 entry.route_record_required = true;
             }
             entry.age = 0;
+            entry.active = true;
             return Ok(());
         }
 
@@ -533,7 +596,7 @@ impl RoutingTable {
             status: RouteStatus::Active,
             many_to_one: true,
             route_record_required: true, // Always required on first install
-            route_record_every_frame: rr_required,
+            route_record_every_frame: no_route_cache,
             group_id: false,
             path_cost: cost,
             age: 0,
@@ -561,8 +624,8 @@ impl RoutingTable {
 
     /// Clear a one-shot Route Record requirement after successful transmission.
     ///
-    /// Low-RAM concentrators require a fresh Route Record before every data
-    /// frame, so their requirement remains armed.
+    /// Low-RAM concentrators have no Route Record table and therefore require
+    /// a fresh Route Record before every data frame.
     pub fn clear_route_record_required(&mut self, destination: ShortAddress) {
         if let Some(entry) = self
             .routes
@@ -779,6 +842,7 @@ pub(crate) const MAX_RREQ_RECORDS: usize = 0;
 /// propagation after the broadcast transaction record has already expired
 /// (BTR entries live 9 s).
 const RREQ_RECORD_LIFETIME_SECS: u8 = 12;
+const MAX_RREQ_SENDERS: usize = crate::neighbor::MAX_NEIGHBORS;
 
 /// A route request this device has already acted upon.
 ///
@@ -791,6 +855,10 @@ const RREQ_RECORD_LIFETIME_SECS: u8 = 12;
 pub(crate) struct RreqRecord {
     originator: ShortAddress,
     route_request_id: u8,
+    /// Immediate neighbors whose copies were accepted at the current best
+    /// cost. Retained so their interleaved MAC retries stay suppressed.
+    senders: [ShortAddress; MAX_RREQ_SENDERS],
+    sender_count: u8,
     /// Best (lowest) accumulated cost this request has arrived with.
     forward_cost: u8,
     expiry: u8,
@@ -802,6 +870,8 @@ impl RreqRecord {
         Self {
             originator: ShortAddress(0xFFFF),
             route_request_id: 0,
+            senders: [ShortAddress(0xFFFF); MAX_RREQ_SENDERS],
+            sender_count: 0,
             forward_cost: 0xFF,
             expiry: 0,
             active: false,
@@ -810,7 +880,7 @@ impl RreqRecord {
 }
 
 /// Route request forwarding records — deduplicates route discoveries per
-/// (originator, route request ID) and keeps only strictly better paths.
+/// (originator, route request ID), path cost, and immediate sender.
 ///
 /// Compiled to zero capacity without the `router` feature, where nothing may
 /// be forwarded in the first place.
@@ -828,47 +898,75 @@ impl RreqRecordTable {
     /// Decide whether a route request may be acted upon, recording it.
     ///
     /// Returns `true` for a request that has not been seen inside the record
-    /// lifetime, or one that arrived over a *strictly* better path than the
-    /// best previously recorded one. A repeat at equal or worse cost returns
-    /// `false`, so a copy that travelled the long way around can neither
-    /// overwrite an installed route, nor re-arm a reply, nor restart the
-    /// propagation — including after the originator retried with a fresh NWK
-    /// sequence number that the broadcast transaction record cannot catch.
+    /// lifetime, a lower-cost copy, or an equal-cost copy from another
+    /// neighbor. R22 drops only a strictly more expensive path, while the
+    /// sender set lets NWK suppress repeated MAC transmissions of the same
+    /// copy without hiding an equal-cost alternate path.
     pub(crate) fn admit(
         &mut self,
         originator: ShortAddress,
         route_request_id: u8,
+        sender: ShortAddress,
         forward_cost: u8,
     ) -> bool {
         if let Some(entry) = self.entries.iter_mut().find(|e| {
             e.active && e.originator == originator && e.route_request_id == route_request_id
         }) {
-            if forward_cost >= entry.forward_cost {
+            if forward_cost > entry.forward_cost {
                 return false;
+            }
+            if forward_cost < entry.forward_cost {
+                entry.senders[0] = sender;
+                entry.sender_count = 1;
+            } else {
+                let sender_count = usize::from(entry.sender_count);
+                if entry.senders[..sender_count].contains(&sender) {
+                    return false;
+                }
+                if sender_count == entry.senders.len() {
+                    return false;
+                }
+                entry.senders[sender_count] = sender;
+                entry.sender_count += 1;
             }
             entry.forward_cost = forward_cost;
             entry.expiry = RREQ_RECORD_LIFETIME_SECS;
             return true;
         }
 
-        let slot = match self.entries.iter_mut().find(|e| !e.active) {
+        let slot = match self.entries.iter_mut().find(|entry| !entry.active) {
             Some(slot) => slot,
-            // Every record is live: evict the one closest to expiry rather
-            // than refusing to propagate. Yields `None` — and therefore no
-            // propagation at all — only in a zero-capacity build.
-            None => match self.entries.iter_mut().min_by_key(|e| e.expiry) {
-                Some(victim) => victim,
-                None => return false,
-            },
+            // A live route-discovery entry cannot be evicted: without a free
+            // entry this device has no routing capacity for another request.
+            None => return false,
         };
         *slot = RreqRecord {
             originator,
             route_request_id,
+            senders: {
+                let mut senders = [ShortAddress(0xFFFF); MAX_RREQ_SENDERS];
+                senders[0] = sender;
+                senders
+            },
+            sender_count: 1,
             forward_cost,
             expiry: RREQ_RECORD_LIFETIME_SECS,
             active: true,
         };
         true
+    }
+
+    /// Forget a request that could not allocate its corresponding routing
+    /// state. A device without both table entries has no routing capacity and
+    /// must not retain a half-created discovery.
+    pub(crate) fn remove(&mut self, originator: ShortAddress, route_request_id: u8) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+            entry.active
+                && entry.originator == originator
+                && entry.route_request_id == route_request_id
+        }) {
+            entry.active = false;
+        }
     }
 
     /// Age entries. Call every second.

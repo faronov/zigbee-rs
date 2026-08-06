@@ -229,12 +229,15 @@ pub(crate) struct QueuedRreqForward {
 /// A deferred Network Status (route error) to be sent asynchronously.
 #[derive(Debug, Clone)]
 pub struct PendingNetworkStatus {
-    /// Address to send the status toward (NWK source of the failed frame)
+    /// Destination address in the Network Status NWK header.
     pub destination: ShortAddress,
     /// Status code (e.g., 0x00 = no route available)
     pub status_code: u8,
-    /// The unreachable destination that triggered the error
+    /// Destination-address field in the Network Status command payload.
     pub failed_destination: ShortAddress,
+    /// Explicit MAC next hop. Many-to-one failures are injected through a
+    /// random router neighbor rather than resolved through the failed route.
+    pub next_hop: Option<ShortAddress>,
 }
 
 /// // Discover networks
@@ -631,8 +634,9 @@ impl<M: MacDriver> NwkLayer<M> {
             }
         }
 
-        // Age routing table entries
-        self.routing.age_tick();
+        // Route ages are wall-clock seconds, not maintenance-call counts.
+        self.routing.age_by(elapsed_secs);
+        self.source_route_table.age_by(elapsed_secs);
 
         // Fail route discoveries that never produced a Route Reply so a later
         // data request may retry instead of being suppressed forever.
@@ -652,7 +656,7 @@ impl<M: MacDriver> NwkLayer<M> {
         }
 
         // Periodic many-to-one RREQ for concentrators
-        if self.concentrator_active && self.joined {
+        if self.concentrator_active && self.joined && self.concentrator_interval != 0 {
             self.concentrator_counter = self.concentrator_counter.saturating_add(elapsed_secs);
             if self.concentrator_counter >= self.concentrator_interval {
                 self.concentrator_counter = 0;
@@ -693,7 +697,10 @@ impl<M: MacDriver> NwkLayer<M> {
         self.concentrator_active = true;
         self.concentrator_type = concentrator_type;
         self.concentrator_interval = interval_secs;
-        self.concentrator_counter = interval_secs; // Trigger immediately on first tick
+        self.concentrator_counter = 0;
+        // `nwkConcentratorDiscoveryTime == 0` means startup/explicit
+        // discovery only, not "send on every maintenance tick".
+        self.concentrator_rreq_due = true;
         self.concentrator_radius = radius;
         log::info!(
             "[NWK] Concentrator mode enabled ({:?}, interval={}s, radius={})",

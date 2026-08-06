@@ -8,9 +8,16 @@ use crate::frames::{
     NwkFrameControl, NwkFrameType, NwkHeader, RouteReply, RouteRequest,
 };
 use crate::nlde::{is_nwk_broadcast, is_unicast_address};
+use crate::routing::routing_random_sample;
 use crate::{NwkLayer, NwkStatus};
 use zigbee_mac::{AddressMode, MacDriver, McpsDataRequest, TxOptions};
 use zigbee_types::*;
+
+const ALL_ROUTERS_AND_COORDINATOR: ShortAddress = ShortAddress(0xFFFC);
+const RREQ_RELAY_RETRIES: u8 = 2;
+const RREQ_RETRY_INTERVAL_US: u32 = 254_000;
+const MIN_RREQ_JITTER_MS: u32 = 2;
+const MAX_RREQ_JITTER_MS: u32 = 128;
 
 impl<M: MacDriver> NwkLayer<M> {
     /// Build and send a NWK command frame.
@@ -34,6 +41,38 @@ impl<M: MacDriver> NwkLayer<M> {
         cmd_payload: &[u8],
         radius: u8,
     ) -> Result<(), NwkStatus> {
+        self.send_nwk_command_from_with_radius(
+            dst_addr,
+            self.nib.network_address,
+            Some(self.nib.ieee_address),
+            None,
+            cmd_id,
+            cmd_payload,
+            radius,
+            None,
+        )
+        .await
+    }
+
+    /// Build and send a NWK command with an explicit NWK source and optional
+    /// MAC next hop.
+    ///
+    /// The explicit source is required for a parent-generated Route Record on
+    /// behalf of its end-device child. The next-hop override is required for a
+    /// many-to-one route failure, which R22 injects through a random router
+    /// neighbor instead of consulting the failed route.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_nwk_command_from_with_radius(
+        &mut self,
+        dst_addr: ShortAddress,
+        src_addr: ShortAddress,
+        src_ieee: Option<IeeeAddress>,
+        dst_ieee: Option<IeeeAddress>,
+        cmd_id: NwkCommandId,
+        cmd_payload: &[u8],
+        radius: u8,
+        explicit_next_hop: Option<ShortAddress>,
+    ) -> Result<(), NwkStatus> {
         if !self.joined {
             return Err(NwkStatus::InvalidRequest);
         }
@@ -48,16 +87,16 @@ impl<M: MacDriver> NwkLayer<M> {
                 multicast: false,
                 security: self.nib.security_enabled,
                 source_route: false,
-                dst_ieee_present: false,
-                src_ieee_present: true,
+                dst_ieee_present: dst_ieee.is_some(),
+                src_ieee_present: src_ieee.is_some(),
                 end_device_initiator: false,
             },
             dst_addr,
-            src_addr: self.nib.network_address,
+            src_addr,
             radius,
             seq_number: seq,
-            dst_ieee: None,
-            src_ieee: Some(self.nib.ieee_address),
+            dst_ieee,
+            src_ieee,
             multicast_control: None,
             source_route: None,
         };
@@ -77,7 +116,10 @@ impl<M: MacDriver> NwkLayer<M> {
         let mut buf = [0u8; crate::nlde::MAX_NWK_FRAME];
         let total_len = self.build_nwk_frame(&header, &full_cmd[..cmd_len], &mut buf)?;
 
-        let next_hop = self.resolve_next_hop(dst_addr)?;
+        let next_hop = match explicit_next_hop {
+            Some(next_hop) => next_hop,
+            None => self.resolve_next_hop(dst_addr)?,
+        };
 
         self.mac
             .mcps_data(McpsDataRequest {
@@ -86,7 +128,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 payload: &buf[..total_len],
                 msdu_handle: seq,
                 tx_options: TxOptions {
-                    ack_tx: next_hop.0 != 0xFFFF,
+                    ack_tx: next_hop != ShortAddress::BROADCAST,
                     ..Default::default()
                 },
             })
@@ -253,6 +295,27 @@ impl<M: MacDriver> NwkLayer<M> {
         dest: ShortAddress,
         relay_list: &[ShortAddress],
     ) -> Result<(), NwkStatus> {
+        self.send_route_record_from(
+            dest,
+            self.nib.network_address,
+            self.nib.ieee_address,
+            relay_list,
+        )
+        .await
+    }
+
+    /// Send a Route Record whose NWK source is another local device.
+    ///
+    /// R22 requires a parent forwarding an end-device child's traffic over a
+    /// many-to-one route to originate a Route Record with the child's short
+    /// and IEEE addresses and with the parent as the first relay.
+    pub(crate) async fn send_route_record_from(
+        &mut self,
+        dest: ShortAddress,
+        source: ShortAddress,
+        source_ieee: IeeeAddress,
+        relay_list: &[ShortAddress],
+    ) -> Result<(), NwkStatus> {
         // The path is bounded by what a concentrator can store and
         // source-route over. A longer one is refused rather than silently
         // truncated into a record that names the wrong hops.
@@ -268,8 +331,17 @@ impl<M: MacDriver> NwkLayer<M> {
             offset += 2;
         }
 
-        self.send_nwk_command(dest, NwkCommandId::RouteRecord, &payload[..offset])
-            .await
+        self.send_nwk_command_from_with_radius(
+            dest,
+            source,
+            Some(source_ieee),
+            None,
+            NwkCommandId::RouteRecord,
+            &payload[..offset],
+            10,
+            None,
+        )
+        .await
     }
 
     /// Send a Network Status command (NWK command 0x03) for route errors.
@@ -285,9 +357,48 @@ impl<M: MacDriver> NwkLayer<M> {
         };
         let mut payload = [0u8; 4];
         let len = ns.serialize(&mut payload);
+        let dst_ieee = self.find_ieee_by_short(dest);
 
-        self.send_nwk_command(dest, NwkCommandId::NetworkStatus, &payload[..len])
-            .await
+        self.send_nwk_command_from_with_radius(
+            dest,
+            self.nib.network_address,
+            Some(self.nib.ieee_address),
+            dst_ieee,
+            NwkCommandId::NetworkStatus,
+            &payload[..len],
+            10,
+            None,
+        )
+        .await
+    }
+
+    /// Send a Network Status command through an explicit MAC next hop.
+    pub(crate) async fn send_network_status_via(
+        &mut self,
+        dest: ShortAddress,
+        status_code: u8,
+        failed_destination: ShortAddress,
+        next_hop: ShortAddress,
+    ) -> Result<(), NwkStatus> {
+        let ns = NetworkStatusCommand {
+            status_code,
+            destination: failed_destination,
+        };
+        let mut payload = [0u8; 4];
+        let len = ns.serialize(&mut payload);
+        let dst_ieee = self.find_ieee_by_short(dest);
+
+        self.send_nwk_command_from_with_radius(
+            dest,
+            self.nib.network_address,
+            Some(self.nib.ieee_address),
+            dst_ieee,
+            NwkCommandId::NetworkStatus,
+            &payload[..len],
+            10,
+            Some(next_hop),
+        )
+        .await
     }
 
     /// Send a Many-to-One Route Request (RREQ) broadcast.
@@ -295,11 +406,13 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Used by concentrators (coordinators) to establish reverse routes
     /// from all routers back to the concentrator.
     pub async fn send_many_to_one_rreq(&mut self) -> Result<(), NwkStatus> {
+        self.concentrator_rreq_due = false;
+        self.concentrator_counter = 0;
         let rreq_id = self.nib.next_route_request_id();
         let rreq = RouteRequest {
             command_options: self.concentrator_type.rreq_options(),
             route_request_id: rreq_id,
-            dst_addr: self.nib.network_address, // Concentrator is both source and dest
+            dst_addr: ALL_ROUTERS_AND_COORDINATOR,
             path_cost: 0,
             dst_ieee: None,
         };
@@ -316,7 +429,7 @@ impl<M: MacDriver> NwkLayer<M> {
         // Use concentrator_radius instead of default broadcast radius
         let radius = self.concentrator_radius;
         self.send_nwk_command_with_radius(
-            ShortAddress::BROADCAST,
+            ALL_ROUTERS_AND_COORDINATOR,
             NwkCommandId::RouteRequest,
             &payload[..len],
             radius,
@@ -392,23 +505,51 @@ impl<M: MacDriver> NwkLayer<M> {
         let mut buf = [0u8; crate::nlde::MAX_NWK_FRAME];
         let total_len = self.build_nwk_frame(&header, &cmd[..cmd_len], &mut buf)?;
 
-        self.mac
-            .mcps_data(McpsDataRequest {
-                src_addr_mode: AddressMode::Short,
-                dst_address: MacAddress::Short(self.nib.pan_id, ShortAddress::BROADCAST),
-                payload: &buf[..total_len],
-                // MAC transaction handle only — the NWK sequence number in the
-                // header above stays the originator's.
-                msdu_handle: self.nib.next_seq(),
-                tx_options: TxOptions {
-                    ack_tx: false,
-                    ..Default::default()
-                },
-            })
-            .await
-            .map_err(|_| NwkStatus::RouteError)?;
+        // R22 delays the original relay by 2*R[2,128] ms and retransmits it
+        // `nwkcRREQRetries` (2) times at the 254 ms retry interval. Reuse the
+        // same NWK frame for all three MAC broadcasts: they are retries of one
+        // discovery, not new NWK/security transactions.
+        let sample = routing_random_sample(
+            self.mac.monotonic_micros()
+                ^ (u32::from(self.nib.network_address.0) << 16)
+                ^ u32::from(pending.originator.0)
+                ^ (u32::from(pending.route_request_id) << 8)
+                ^ (u32::from(pending.path_cost) << 24)
+                ^ u32::from(pending.seq_number),
+        );
+        let jitter_span = MAX_RREQ_JITTER_MS - MIN_RREQ_JITTER_MS + 1;
+        let jitter_ms = 2 * (MIN_RREQ_JITTER_MS + sample % jitter_span);
+        self.mac.delay_micros(jitter_ms * 1_000).await;
 
-        Ok(())
+        let mut sent = false;
+        let msdu_handle = self.nib.next_seq();
+        for attempt in 0..=RREQ_RELAY_RETRIES {
+            if attempt != 0 {
+                self.mac.delay_micros(RREQ_RETRY_INTERVAL_US).await;
+            }
+            let result = self
+                .mac
+                .mcps_data(McpsDataRequest {
+                    src_addr_mode: AddressMode::Short,
+                    dst_address: MacAddress::Short(self.nib.pan_id, ShortAddress::BROADCAST),
+                    payload: &buf[..total_len],
+                    // MAC transaction handle only — the NWK sequence number in
+                    // the header above stays the originator's.
+                    msdu_handle,
+                    tx_options: TxOptions {
+                        ack_tx: false,
+                        ..Default::default()
+                    },
+                })
+                .await;
+            sent |= result.is_ok();
+        }
+
+        if sent {
+            Ok(())
+        } else {
+            Err(NwkStatus::RouteError)
+        }
     }
 
     /// Drain and send all queued route replies and Route Request forwards.
@@ -463,14 +604,26 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // Drain pending Network Status (route error) notifications
         while let Some(pending) = self.pending_route_errors.pop() {
-            if let Err(e) = self
-                .send_network_status(
-                    pending.destination,
-                    pending.status_code,
-                    pending.failed_destination,
-                )
-                .await
-            {
+            let result = match pending.next_hop {
+                Some(next_hop) => {
+                    self.send_network_status_via(
+                        pending.destination,
+                        pending.status_code,
+                        pending.failed_destination,
+                        next_hop,
+                    )
+                    .await
+                }
+                None => {
+                    self.send_network_status(
+                        pending.destination,
+                        pending.status_code,
+                        pending.failed_destination,
+                    )
+                    .await
+                }
+            };
+            if let Err(e) = result {
                 log::warn!(
                     "[NWK] Failed to send NetworkStatus to 0x{:04X}: {:?}",
                     pending.destination.0,
@@ -480,7 +633,7 @@ impl<M: MacDriver> NwkLayer<M> {
         }
 
         // Send concentrator many-to-one RREQ if due
-        if self.concentrator_rreq_due {
+        if self.concentrator_rreq_due && self.joined {
             self.concentrator_rreq_due = false;
             if let Err(e) = self.send_many_to_one_rreq().await {
                 log::warn!("[NWK] Failed to send concentrator RREQ: {:?}", e);

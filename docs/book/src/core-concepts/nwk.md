@@ -215,6 +215,7 @@ pub struct RouteEntry {
     pub status: RouteStatus,         // Active, DiscoveryUnderway, etc.
     pub many_to_one: bool,           // Concentrator route
     pub route_record_required: bool,
+    pub route_record_every_frame: bool, // Low-RAM concentrator
     pub group_id: bool,              // Multicast route
     pub path_cost: u8,               // Sum of link costs
     pub age: u16,                    // Ticks since last use

@@ -287,8 +287,10 @@ impl<M: MacDriver> DeviceBuilder<M> {
     /// Enable concentrator (many-to-one) mode for this device.
     ///
     /// Only valid for Router or Coordinator device types.
-    /// - `ctype`: LowRam (devices re-send Route Records each time) or HighRam (cached)
-    /// - `interval_secs`: how often to broadcast MTOR RREQ (default 60s)
+    /// - `ctype`: LowRam (no Route Record table, so records are re-sent) or
+    ///   HighRam (routes are cached)
+    /// - `interval_secs`: periodic MTOR discovery interval; `0` sends only at
+    ///   startup or on an explicit request
     /// - `radius`: hop limit for MTOR RREQ (default 5)
     pub fn concentrator(
         mut self,

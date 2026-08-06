@@ -126,15 +126,9 @@ impl NeighborEntry {
         e
     }
 
-    /// Calculate outgoing cost from LQI (Zigbee spec Section 3.6.3.1)
+    /// Calculate outgoing cost from LQI (Zigbee spec Section 3.6.3.1).
     pub fn update_cost_from_lqi(&mut self) {
-        self.outgoing_cost = match self.lqi {
-            0..=50 => 7,
-            51..=100 => 5,
-            101..=150 => 3,
-            151..=200 => 2,
-            201..=255 => 1,
-        };
+        self.outgoing_cost = link_cost_from_lqi(self.lqi);
     }
 
     /// Re-arm the R22 End Device Timeout deadline from the stored enumeration.
@@ -147,6 +141,18 @@ impl NeighborEntry {
         self.keepalive_remaining_secs = ed_timeout_enum_to_seconds(self.end_device_timeout)
             .or_else(|| ed_timeout_enum_to_seconds(ED_TIMEOUT_ENUM_DEFAULT))
             .unwrap_or(1);
+    }
+}
+
+/// Convert a received-frame LQI into the bounded Zigbee link cost used by
+/// route discovery.
+pub(crate) const fn link_cost_from_lqi(lqi: u8) -> u8 {
+    match lqi {
+        0..=50 => 7,
+        51..=100 => 5,
+        101..=150 => 3,
+        151..=200 => 2,
+        201..=255 => 1,
     }
 }
 

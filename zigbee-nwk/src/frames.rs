@@ -468,10 +468,10 @@ impl RouteReply {
 /// Network Status command (NWK command ID 0x03)
 ///
 /// Sent when a routing error occurs (e.g., relay failure, no route available).
-/// See Zigbee spec Table 3-44.
+/// See Zigbee R22 Table 3-51.
 #[derive(Debug, Clone, Copy)]
 pub struct NetworkStatusCommand {
-    /// Status code (Table 3-45):
+    /// Status code (Table 3-51):
     /// 0x00 = No route available
     /// 0x01 = Tree link failure
     /// 0x02 = Non-tree link failure
@@ -482,9 +482,10 @@ pub struct NetworkStatusCommand {
     /// 0x07 = Target device unavailable
     /// 0x08 = Target address unallocated
     /// 0x09 = Parent link failure
-    /// 0x0B = Address conflict
-    /// 0x0C = Route discovery failed
-    /// 0x0D = Route validation error
+    /// 0x0A = Validate route
+    /// 0x0B = Source route failure
+    /// 0x0C = Many-to-one route failure
+    /// 0x0D = Address conflict
     pub status_code: u8,
     /// Destination address that triggered the error
     pub destination: ShortAddress,
@@ -494,6 +495,8 @@ impl NetworkStatusCommand {
     pub const NO_ROUTE_AVAILABLE: u8 = 0x00;
     pub const TREE_LINK_FAILURE: u8 = 0x01;
     pub const NON_TREE_LINK_FAILURE: u8 = 0x02;
+    pub const SOURCE_ROUTE_FAILURE: u8 = 0x0B;
+    pub const MANY_TO_ONE_ROUTE_FAILURE: u8 = 0x0C;
 
     pub fn parse(data: &[u8]) -> Option<Self> {
         if data.len() < 3 {

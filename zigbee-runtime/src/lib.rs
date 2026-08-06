@@ -1509,12 +1509,17 @@ mod resume_tests {
         // frame reached us from NEIGHBOUR, and that is the only device the
         // route to the concentrator may go through.
         let rreq = RouteRequest {
-            command_options: 0x08,
+            command_options: zigbee_nwk::routing::ConcentratorType::LowRam.rreq_options(),
             route_request_id: 3,
-            dst_addr: COORDINATOR,
+            dst_addr: ShortAddress(0xFFFC),
             path_cost: 1,
             dst_ieee: None,
         };
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .update_neighbor_address(NEIGHBOUR, [0x22; 8]);
         let mut command = [0u8; 16];
         command[0] = NwkCommandId::RouteRequest as u8;
         let len = 1 + rreq.serialize(&mut command[1..]);
@@ -1547,7 +1552,11 @@ mod resume_tests {
         // And the forwarded copy is still the concentrator's own broadcast.
         block_on(device.bdb.zdo_mut().nwk_mut().process_pending_routing());
         let history = device.mac_mut().tx_history();
-        assert_eq!(history.len(), 1, "the request is carried one hop further");
+        assert_eq!(
+            history.len(),
+            3,
+            "the request is relayed once and retried twice"
+        );
         let (header, consumed) =
             zigbee_nwk::frames::NwkHeader::parse(history[0].payload.as_slice())
                 .expect("the forward parses");

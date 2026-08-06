@@ -419,6 +419,32 @@ closes.
 
 ---
 
+## R22 many-to-one and source routing
+
+The shared router engine implements the Zigbee R22 concentrator flow:
+
+- a high-RAM concentrator uses RREQ option `0x08`; a low-RAM concentrator uses
+  `0x10`, while `0x18` is rejected as reserved;
+- both the NWK destination and the RREQ payload destination are the all-router
+  broadcast `0xFFFC`;
+- a forwarding router requires a known reciprocal link cost, installs the
+  reverse route through the immediate previous hop, accepts equal-cost copies,
+  waits `2 * R[2,128] ms`, then sends the same secured RREQ frame three times
+  with 254 ms between transmissions;
+- a high-RAM route sends Route Record on a new or changed path. A low-RAM route
+  sends Route Record before every data frame. A parent originates the record
+  for a direct end-device child before relaying that child's data;
+- the concentrator builds source routes for the originator and intermediary
+  relays. Source-route failure (`0x0B`) returns to the source; many-to-one route
+  failure (`0x0C`) is redirected toward the concentrator through another router
+  and invalidates the stale return path.
+
+These paths are covered by the router-enabled host/runtime test matrix. Real
+multi-router acceptance with a sleepy child and an independent sniffer remains
+a hardware interoperability gate.
+
+---
+
 ## Current Implementation Status
 
 The coordinator, router, and Trust Center modules provide the data structures
@@ -438,7 +464,7 @@ remain the release gate.
 | Router child management | ✅ Provisional admission, authorization and rollback |
 | Child aging and timeout | ✅ Implemented, including indirect cleanup |
 | Route discovery (AODV) | ✅ Integrated with runtime forwarding |
-| Source routing / Route Record | ✅ Integrated with concentrator behavior |
+| R22 MTOR / source routing / Route Record | ✅ Integrated and host-tested; multi-router hardware acceptance pending |
 | Link status messages | ✅ Receive, maintenance and periodic sending |
 | Trust Center Update/Transport/Switch Key | ✅ APS security and Tunnel forwarding implemented |
 | Distributed security (TC-less) | ⚠️ Secured rejoin supported; full coordinator policy remains incomplete |
