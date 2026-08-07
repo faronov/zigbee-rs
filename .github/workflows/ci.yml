@@ -522,8 +522,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # 2026-08-06 started emitting unresolved __aeabi_u{read,write}{4,8}
+      # helpers for packed Cortex-M0 accesses.
       - uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-08-01
           targets: thumbv6m-none-eabi
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@v2

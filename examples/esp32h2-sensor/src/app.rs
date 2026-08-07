@@ -1,6 +1,7 @@
 //! ESP32-H2 Zigbee SED application state machine.
 
 use embassy_time::{Duration, Instant, Timer};
+use esp32_zigbee_devkit_product::ota_transport::OtaTransport;
 use esp32_zigbee_devkit_product::profile::SensorProfile;
 use esp32_zigbee_devkit_product::storage::SecurityStore;
 use esp_hal::gpio::{Input, Output};
@@ -52,6 +53,7 @@ pub struct SensorApp<'a> {
     button: Input<'a>,
     led: Output<'a>,
     temp_sensor: H2TemperatureSensor,
+    ota: OtaTransport,
     hum_tick: u32,
     last_report: Instant,
     last_tick: Instant,
@@ -82,6 +84,7 @@ impl<'a> SensorApp<'a> {
             button,
             led,
             temp_sensor,
+            ota: OtaTransport::new(),
             hum_tick: 0,
             last_report: now,
             last_tick: now,
@@ -104,7 +107,7 @@ impl<'a> SensorApp<'a> {
     }
 
     fn environment_mut(&mut self) -> &mut zigbee_runtime::profile::TemperatureHumidityBattery {
-        self.node.profile_mut().component_mut()
+        self.node.profile_mut().inner_mut().component_mut()
     }
 
     fn checkpoint_security(&mut self) {
@@ -231,6 +234,7 @@ impl<'a> SensorApp<'a> {
                 .node
                 .device()
                 .is_identifying(esp32_zigbee_devkit_product::ENDPOINT)
+            || OtaTransport::is_active(self.node.profile().backend())
             || now < self.fast_poll_until;
         if in_fast_poll {
             FAST_POLL_MS
@@ -359,6 +363,15 @@ impl<'a> SensorApp<'a> {
         };
 
         if let Some(event) = event {
+            if self.process_ota_event(&event).await {
+                match self.node.tick(0).await {
+                    Ok(result) => {
+                        self.handle_tick_result(result).await;
+                    }
+                    Err(error) => node_failure(error),
+                }
+                return false;
+            }
             if self.handle_control_event(&event).await {
                 return true;
             }
@@ -379,10 +392,27 @@ impl<'a> SensorApp<'a> {
         false
     }
 
+    async fn process_ota_event(&mut self, event: &StackEvent) -> bool {
+        let (device, profile) = self.node.device_and_profile_mut();
+        if !self
+            .ota
+            .handle_event(device, profile.backend_mut(), event)
+            .await
+        {
+            return false;
+        }
+
+        self.fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+        true
+    }
+
     async fn handle_tick_result(&mut self, result: TickResult) -> bool {
         let TickResult::Event(event) = result else {
             return false;
         };
+        if self.process_ota_event(&event).await {
+            return false;
+        }
         self.handle_control_event(&event).await
     }
 
@@ -481,6 +511,25 @@ impl<'a> SensorApp<'a> {
 
         if !self.node.device().is_joined() {
             return;
+        }
+
+        // Drive the OTA state machine and flush any queued request.
+        let (device, profile) = self.node.device_and_profile_mut();
+        self.ota
+            .service(device, profile.backend_mut(), elapsed as u16)
+            .await;
+        if self.ota.activation_pending() {
+            // Checkpoint first: activate() reboots into the staged image and
+            // anything not in NV by then is lost.
+            self.checkpoint_security();
+            esp_println::println!("[ESP32-H2] State saved — activating new image");
+            if self
+                .ota
+                .activate(self.node.profile_mut().backend_mut())
+                .is_err()
+            {
+                esp_println::println!("[ESP32-H2] OTA activation failed");
+            }
         }
 
         let annce_now = Instant::now();

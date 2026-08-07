@@ -9,7 +9,7 @@ zigbee-mac = { path = "../../zigbee-mac", features = ["esp32h2"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee-runtime = { path = "../../zigbee-runtime", features = ["ota"] }
 esp32-zigbee-devkit-product = { path = "../../products/esp32-zigbee-devkit", features = ["esp32h2"] }
 
 # ESP32-H2 HAL and runtime

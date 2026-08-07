@@ -6,27 +6,29 @@
 //! # Features
 //! - Auto-join on boot, secure rejoin on restart with saved state
 //! - Sleepy End Device: poll parent for indirect frames
-//! - Fast poll (250ms) during ZHA interview, slow poll (30s) normal
+//! - Fast poll (250ms) during ZHA interview/OTA, slow poll (30s) normal
 //! - Device_annce retries for reliable coordinator discovery
-//! - NWK Leave handler: auto-rejoin when coordinator sends Leave
-//! - Default reporting: temp/hum/battery reported without ZHA interview
+//! - OTA Upgrade client, cleanly omitted if the partition table is missing
+//!   or incompatible
 //! - Button: BOOT (GPIO9) — short=toggle, long=factory reset
 //!
 //! # Architecture
 //! `esp32-zigbee-devkit-product` (see `products/esp32-zigbee-devkit`) owns
 //! the typed [`SensorProfile`](esp32_zigbee_devkit_product::profile::SensorProfile)
-//! (endpoint/cluster declaration) and the durable
+//! (endpoint/cluster declaration + OTA composition) and the durable
 //! [`SecurityStore`](esp32_zigbee_devkit_product::storage::SecurityStore).
-//! This build has no OTA backend — see the crate docs and
-//! `docs/book/src/platform-guides/esp32.md`. This file is only the
-//! composition root: platform startup, resource construction, and handing
-//! both to [`zigbee_runtime::node::ZigbeeNode`] before running
-//! [`app::SensorApp`]'s event loop.
+//! This file is only the composition root: platform startup, resource
+//! construction, and handing both to [`zigbee_runtime::node::ZigbeeNode`]
+//! before running [`app::SensorApp`]'s event loop.
 //!
-//! # Build
+//! # Build & flash
 //! ```bash
 //! cargo build --release
-//! espflash flash --monitor target/riscv32imac-unknown-none-elf/release/esp32h2-sensor
+//! espflash flash \
+//!   --partition-table ../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv \
+//!   --target-app-partition ota_0 \
+//!   --erase-parts otadata \
+//!   --monitor target/riscv32imac-unknown-none-elf/release/esp32h2-sensor
 //! ```
 
 #![no_std]
@@ -39,6 +41,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 mod app;
 mod chip_temperature;
 mod time_driver;
+
+include!(concat!(env!("OUT_DIR"), "/firmware_version.rs"));
 
 use app::SensorApp;
 use chip_temperature::H2TemperatureSensor;
@@ -117,8 +121,7 @@ fn main() -> ! {
     esp_println::println!("[ESP32-H2] Hardware AES KAT passed");
     esp_println::println!("[ESP32-H2] Radio ready");
 
-    // Product-owned durable security store and endpoint profile (no OTA on
-    // this build — see `esp32_zigbee_devkit_product::profile`).
+    // Product-owned durable security store and endpoint/OTA profile.
     //
     // `open_security_store` also runs the one-time legacy persistence
     // migration (see `esp32_zigbee_devkit_product::migration`): a device
@@ -136,7 +139,16 @@ fn main() -> ! {
         }
     });
     esp_println::println!("[ESP32-H2] Persistence migration: {:?}", migration);
-    let profile = product::profile::sensor_profile();
+    let profile =
+        product::profile::sensor_profile(FIRMWARE_VERSION, esp_hal::system::software_reset);
+    esp_println::println!(
+        "[ESP32-H2] OTA {}",
+        if profile.is_enabled() {
+            "enabled"
+        } else {
+            "disabled (incompatible partition layout)"
+        }
+    );
 
     let device = ZigbeeDevice::builder(mac)
         .power_mode(PowerMode::Sleepy {
@@ -145,8 +157,9 @@ fn main() -> ! {
         })
         .manufacturer(product::MANUFACTURER)
         .model(product::MODEL)
+        .application_version(product::firmware::application_version(FIRMWARE_VERSION))
         .date_code(product::DATE_CODE)
-        .sw_build("0.1.0")
+        .sw_build(FIRMWARE_VERSION_STR)
         .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
         .endpoint(

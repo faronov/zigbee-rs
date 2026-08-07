@@ -7,9 +7,9 @@ same MAC driver code — only the HAL feature flag differs.
 > **✅ Hardware Verified:** The ESP32-C6 has been tested end-to-end on an
 > **ESP32-C6-DevKitC-1** board with **Home Assistant + ZHA**. The ESP32-H2
 > revision 1.2 has additionally passed the production hardware-AES and
-> persisted-resume gate: two startup KATs, secured traffic, preserved PAN
-> `0xDFE9` / address `0x44CB`, live sensor entities, and a silent restart
-> without re-pairing or `Device_annce`.
+> persisted-resume gate plus a complete v1-to-v2 OTA activation: two startup
+> KATs, secured traffic, preserved network identity, live sensor entities, and
+> a silent restart without re-pairing or `Device_annce`.
 
 ## Hardware Overview
 
@@ -97,11 +97,9 @@ build-std = ["core", "alloc"]
 ESP_LOG = "info"
 ```
 
-This is the ESP32-C6 OTA-capable runner. It always reinstalls the checked-in
+Both examples use this OTA-capable runner. It always reinstalls the checked-in
 partition table, writes the wired image to `ota_0`, and erases `otadata` so a
-previously selected `ota_1` cannot hide the newly flashed firmware. The H2
-example, which does not yet instantiate an OTA client, keeps the plain
-`espflash flash --monitor` runner.
+previously selected `ota_1` cannot hide the newly flashed firmware.
 
 The `linkall.x` linker script is provided by `esp-hal` and sets up the ESP32
 memory layout, interrupt vectors, and boot sequence.
@@ -220,20 +218,28 @@ because `esp-hal` 1.0.0's convenience method waits without a bound. Every block
 must observe:
 
 1. idle before programming;
-2. busy after the trigger;
-3. idle again before the result is published.
+2. a bounded return to idle after the trigger;
+3. completion before the result is published.
 
-Each phase has a finite iteration limit. A gated, stuck, or trigger-ignoring
-accelerator returns an error without modifying the caller's output and never
-falls back to RustCrypto. CI requires the `EspHardwareAes128` backend and
-rejects `aes::soft::fixslice` / `SoftwareAes128` symbols in both production
-ELFs.
+The BUSY state is transient and may complete before software can sample it,
+particularly on ESP32-C6, so it is not a valid start handshake. Each observable
+wait has a finite iteration limit, and the two startup KATs reject a gated,
+trigger-ignoring, corrupt, or non-reusable accelerator. A stuck busy operation
+returns an error without modifying the caller's output. There is no RustCrypto
+fallback. CI requires the `EspHardwareAes128` backend and rejects
+`aes::soft::fixslice` / `SoftwareAes128` symbols in both production ELFs.
 
 The ESP32-H2 revision 1.2 acceptance run on 2026-08-05 passed both KAT vectors
-on silicon and then resumed its existing secured network. ESP32-C6 uses the
-same documented base address and register layout; its release image passes the
-same build and linked-symbol gates, while a separate C6 on-silicon KAT rerun
-remains desirable when that board is next connected.
+on silicon and then resumed its existing secured network. An ESP32-C6 revision
+0.0 run later exposed two assumptions that were not portable: software cannot
+reliably sample the short BUSY interval, and Espressif's low-level AES reset
+sequence explicitly clears the Digital Signature reset because AES can
+otherwise remain held in reset. `EspAesEngine` now accepts an already-complete
+IDLE state and performs that coupled-reset release through esp-hal's
+chip-specific PAC accessor (`PCR.DS_CONF` is at 0xe0 on C6 and 0xdc on H2)
+before running the KATs. The corrected path passed both KAT vectors on an
+ESP32-C6 revision 0.0, and both release images pass the build and linked-symbol
+gates.
 
 The independent channel-15 capture
 `esp32h2-hardware-aes-event-parity-resume-20260805.pcap` contains 10,921
@@ -294,8 +300,8 @@ temperature & humidity end device around a typed product profile
 - **Identify cluster** (0x0003) — supports Identify, IdentifyQuery, TriggerEffect
 - **Battery percentage** reporting via Power Configuration cluster
 - Join/leave button (BOOT / GPIO9)
-- **OTA Upgrade client**, ESP32-C6 only, composed into the profile only when
-  the checked partition table matches
+- **OTA Upgrade client**, composed into the profile only when the checked
+  partition table matches
 
 ### Initialization
 
@@ -359,9 +365,9 @@ uses.)
 
 `SensorApp` (`src/app.rs` in each example) owns the event loop: button
 presses (join/leave/factory-reset), the fast/slow poll window, periodic
-sensor sampling, Device_annce retries, and — on the C6 build — driving the
-OTA transport (`src/ota_client.rs`) over whatever backend the profile
-composed in. Initial and retried commissioning goes through
+sensor sampling, Device_annce retries, and driving the shared product-layer
+`OtaTransport` over whatever backend the profile composed in. Initial and
+retried commissioning goes through
 `ZigbeeNode::start_or_resume`/`secure_rejoin`/`factory_reset`, which
 `tick`/`process_incoming` alone do not perform.
 
@@ -517,9 +523,11 @@ converts the result back to CSV to confirm the round trip.
 
 ## OTA Updates
 
-> **Status:** implemented in software and covered by host tests; **not yet
-> exercised on hardware**. Migrating a device to the two-slot layout rewrites
-> its partition table, which is a deliberate, separate step.
+> **Status:** implemented for both chips. ESP32-H2 completed a full v1-to-v2
+> ZHA download, SHA verification, `ota_1` activation, reboot, and preserved
+> network resume. ESP32-C6 has exercised the same path through 18.3% of a
+> transfer; complete C6 activation remains pending. Migrating a device to the
+> two-slot layout rewrites its partition table as a deliberate, separate step.
 
 ### How it works
 
@@ -554,15 +562,16 @@ The payload of the Zigbee container must be an **ESP application image**
 (`espflash save-image` output) — not an ELF and not a merged flash image:
 
 ```bash
-cd examples/esp32c6-sensor
-tools/create-ota.py 2            # writes target/ota/
+cd examples/esp32c6-sensor       # or examples/esp32h2-sensor
+tools/create-ota.py 2             # writes target/ota/
 ```
 
 The tool builds the firmware with `ESP32_OTA_VERSION=2`, runs
 `espflash save-image`, wraps the result in an OTA container
-(manufacturer `0x1234`, image type `0x0001`, hardware version 1), parses the
-container back and compares it byte for byte with the image, and regenerates a
-`zigpy_local` index with the sha3-256 checksums ZHA verifies:
+(manufacturer `0x1234`, image type `0x0001` for C6 or `0x0002` for H2,
+hardware version 1), parses the container back and compares it byte for byte
+with the image, and regenerates a `zigpy_local` index with the sha3-256
+checksums ZHA verifies:
 
 ```json
 {
@@ -606,6 +615,8 @@ These steps **write flash** and are not performed by `cargo build`:
    ```
 
    The configured `cargo run --release` runner executes the same command.
+   Use the corresponding H2 example directory and `esp32h2-sensor` binary for
+   an ESP32-H2 board.
 3. Confirm the device rejoins with its existing keys before publishing an
    image; only then run an upgrade from ZHA.
 

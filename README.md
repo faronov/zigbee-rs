@@ -437,8 +437,8 @@ The following hardware has been tested end-to-end with **Home Assistant + ZHA**:
 | Board | Coordinator | Status | Notes |
 |-------|-------------|--------|-------|
 | **nRF52840-DK** (PCA10056) | ZHA (via zigpy) | ✅ Prior baseline verified | Flash NV, Identify LED blink, BME280/SHT31 optional; current product/profile refactor awaits hardware revalidation |
-| **ESP32-C6-DevKitC-1** | ZHA (via zigpy) | ✅ Prior baseline verified | Temperature, Humidity, Battery and flash NV proven; current product/profile refactor and real OTA upgrade await hardware validation |
-| **ESP32-H2-DevKitM-1** | ZHA (via zigpy) | ✅ Current refactor verified | Legacy NV migrated atomically to the security journal; reset/resume, reporting, TSENS, interview, and Identify verified on hardware. OTA absent. |
+| **ESP32-C6-DevKitC-1** | ZHA (via zigpy) | ✅ Current refactor verified | Hardware AES, fresh commissioning, reporting, the OTA client, and a transfer through 18.3% are verified; full activation remains pending. |
+| **ESP32-H2-DevKitM-1** | ZHA (via zigpy) | ✅ Current refactor verified | Legacy NV migration, reset/resume, reporting, TSENS, interview, Identify, and a complete v1-to-v2 OTA activation are verified on hardware. |
 | **BL702 XT-ZB1** | Home Assistant ZHA / Ember | ✅ End-device path verified | Pure-Rust RF calibration, join, TCLK exchange, interview, Identify, and reporting; temperature/humidity currently synthetic |
 | **TLSR8258** | Home Assistant ZHA / Ember | ✅ End-device and router paths verified | Join, TCLK exchange, interview, reporting, routed-frame relay, silent reset resume, and crash-safe counter persistence. Parent/child traffic has been exercised, but clean first-attempt sleepy-child commissioning with the corrected child image remains the release gate |
 | **EFR32MG1P TRÅDFRI** | Home Assistant ZHA / Ember | ✅ End-device path verified | Pure-Rust radio, hardware AES, full interview including OTA attributes, SHT3x/battery reporting, EM2, crash-safe persistence, Identify, and silent reset/resume |
@@ -469,7 +469,7 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
 - **EFR32MG21** still uses an unverified pure-Rust radio initialization path and needs independent hardware validation.
 - **Test coverage** is basic — the mock examples exercise more than the test crate
 - **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal
-- **OTA** — the transport/session flow is shared in `zigbee-runtime`; EFR32MG1 has a Gecko Bootloader writer and ESP32-C6 has a checked dual-slot (`ota_0`/`ota_1` + `otadata`) writer. Real version-upgrade/reboot validation remains pending. ESP32-H2, nRF52840, and BL702 have no writer.
+- **OTA** — the transport/session flow is shared in `zigbee-runtime`; EFR32MG1 has a Gecko Bootloader writer, while ESP32-C6/H2 share a checked dual-slot (`ota_0`/`ota_1` + `otadata`) writer. H2 completed a real v1-to-v2 activation; full C6 activation and the EFR32 upgrade remain pending. nRF52840 and BL702 have no writer.
 
 ## Documentation
 
