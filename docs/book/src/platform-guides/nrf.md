@@ -487,9 +487,11 @@ fails to compile here until it is deliberately handled (OTA variants, which
 this product does not use, still get an explicit logged arm rather than
 being silently dropped). In particular:
 
-- `FactoryResetRequested` durably clears security state and rejoins, the
-  same as `LeaveRequested` already did — previously this event only
-  produced a log line.
+- `FactoryResetRequested` is treated as the Basic cluster Reset to Factory
+  Defaults operation: writable Basic attributes are reset, while network
+  state, security counters, bindings, and groups are preserved as required
+  by BDB. It is not conflated with a local installer factory-new action or
+  an NWK Leave.
 - `RejoinRequested` attempts a secure rejoin immediately.
 - A `CommissioningComplete { success: false }` while a secure rejoin is
   pending is retried, bounded by a small failure counter, before falling

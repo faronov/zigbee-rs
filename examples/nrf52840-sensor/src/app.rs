@@ -14,13 +14,13 @@
 //! - Every [`StackEvent`] variant is now matched explicitly in
 //!   [`handle_control_event`](SensorApp::handle_control_event), instead of a
 //!   wildcard arm that silently dropped anything not already special-cased.
-//!   In particular `FactoryResetRequested` previously only produced a log
-//!   line; it now durably clears security state and rejoins, the same as
-//!   `LeaveRequested` already did. This also unifies event handling between
-//!   the two places it used to be split across (after `process_incoming`,
-//!   and after the periodic `tick()`) — the periodic-tick path previously
-//!   never actually acted on `LeaveRequested`/`RejoinRequested`, only logged
-//!   them.
+//!   `FactoryResetRequested` is the Basic cluster Reset to Factory Defaults
+//!   notification, so it preserves the network and security state; the Basic
+//!   cluster has already reset its writable attributes before the event is
+//!   emitted. This also unifies event handling between the two places it used
+//!   to be split across (after `process_incoming`, and after the periodic
+//!   `tick()`) — the periodic-tick path previously never actually acted on
+//!   `LeaveRequested`/`RejoinRequested`, only logged them.
 //! - [`TickResult::RunAgain`] now records an absolute deadline and shortens
 //!   the next poll/sleep wait (see `crate::policy`) instead of being
 //!   discarded. Runtime elapsed time is tracked independently from the
@@ -565,8 +565,8 @@ impl<'a> SensorApp<'a> {
                 self.rejoin_after_reset().await
             }
             StackEvent::FactoryResetRequested => {
-                warn!("Factory reset requested by coordinator — resetting and rejoining");
-                self.rejoin_after_reset().await
+                info!("Basic cluster attributes reset to factory defaults");
+                false
             }
             StackEvent::RejoinRequested => {
                 info!("Coordinator requested secure rejoin");
@@ -599,9 +599,7 @@ impl<'a> SensorApp<'a> {
                         // changed underneath them.
                         let recommission = matches!(
                             event,
-                            StackEvent::RejoinRequested
-                                | StackEvent::LeaveRequested
-                                | StackEvent::FactoryResetRequested
+                            StackEvent::RejoinRequested | StackEvent::LeaveRequested
                         );
                         if self.handle_control_event(event).await {
                             self.fast_poll_until =
