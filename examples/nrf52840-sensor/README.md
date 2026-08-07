@@ -78,7 +78,7 @@ See `src/sensor.rs` for the recoverable probe/read wiring.
 
 ## What It Demonstrates
 
-- Embassy async event loop with `select3` (radio receive, button press, timer)
+- Embassy async event loop (`SensorApp::run` in `app.rs`) using `select` (button press vs. poll timer) plus a bounded per-iteration MAC poll/receive window
 - On-chip TEMP sensor or async external I2C sensor (BME280 / SHT31)
 - Building a Zigbee device with `ZigbeeDevice` builder API
 - ZCL endpoint 1 (Home Automation, device type 0x0302) with **Basic**,
@@ -151,8 +151,14 @@ nrf52840-sensor/
 └── src/
     ├── sensor.rs         # Recoverable BME280/SHT31 wiring over the shared
     │                     # zigbee-bme280 / zigbee-sht3x drivers (feature-gated)
+    ├── policy.rs         # Pure, host-tested poll-delay arbitration (honors
+    │                     # TickResult::RunAgain) — see tests/src/nrf52840_policy_tests.rs
+    ├── app.rs            # SensorApp: the full commissioning/event-loop
+    │                     # lifecycle (join/leave/rejoin, reporting, Identify,
+    │                     # button, durable checkpointing)
     └── main.rs           # Composition root: platform startup, resource
-                           # construction, Embassy event loop
+                           # construction, hardware AES + identity guard,
+                           # then hands everything to app::SensorApp::run()
 ```
 
 ## Architecture

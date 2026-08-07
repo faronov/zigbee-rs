@@ -9,13 +9,17 @@
 //! | `sensor-bme280` | BME280  | Temp + humidity + pressure       |
 //! | `sensor-sht31`  | SHT31   | Temp + humidity                  |
 //!
-//! This is a composition root: it owns platform startup (clocks, RAM
-//! power state, boot signal), resource construction from the
-//! `nrf52840-dk` board and `nrf52840-sensor-product` product crates, and
-//! the Embassy event loop. Endpoint/cluster composition, reporting
-//! defaults, and measurement mapping live in the shared
-//! `zigbee_runtime::profile` archetype selected by the product crate; NWK/
-//! APS/ZDO/BDB state machines live in `zigbee-runtime`.
+//! This file is only a composition root: it owns Embassy/Nordic platform
+//! startup (clocks, DC-DC, RAM power state, boot signal), board resource
+//! and sensor construction from the `nrf52840-dk` board and
+//! `nrf52840-sensor-product` product crates, hardware AES install + startup
+//! KAT, the crash-safe security journal, the concrete Zigbee profile, and
+//! the identity guard — then hands all of it to
+//! [`app::SensorApp`], which owns the full
+//! commissioning/event-loop lifecycle (see `app.rs`). Endpoint/cluster
+//! composition, reporting defaults, and measurement mapping live in the
+//! shared `zigbee_runtime::profile` archetype selected by the product
+//! crate; NWK/APS/ZDO/BDB state machines live in `zigbee-runtime`.
 //!
 //! ## Build & flash
 //! ```sh
@@ -32,19 +36,27 @@
 #![no_std]
 #![no_main]
 
+mod app;
+mod policy;
+#[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
+mod sensor;
+
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
 use embassy_nrf::saadc::{self, ChannelConfig, Saadc, VddInput};
 #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
 use embassy_nrf::temp::Temp;
-use embassy_nrf::{self as _, bind_interrupts, gpio, peripherals, radio, rng};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_nrf::{self as _, bind_interrupts, peripherals, radio, rng};
+use embassy_time::{Duration, Timer};
 
 use defmt::*;
 use {defmt_rtt as _, panic_probe as _};
 
-#[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
-mod sensor;
+use app::SensorApp;
+use zigbee_runtime::node::ZigbeeNode;
+use zigbee_runtime::power::PowerMode;
+use zigbee_runtime::profile::ApplicationProfile;
+use zigbee_runtime::ZigbeeDevice;
+use zigbee_zcl::clusters::basic::PowerSource;
 
 // Bridge `log` crate → defmt so stack-internal log::info!/debug! appear in RTT output.
 struct DefmtLogger;
@@ -64,21 +76,6 @@ impl log::Log for DefmtLogger {
     fn flush(&self) {}
 }
 static LOGGER: DefmtLogger = DefmtLogger;
-
-use nrf52840_sensor_product::profile::SensorProfile;
-use zigbee_mac::MacDriver;
-use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
-use zigbee_runtime::node::{NodeError, ZigbeeNode};
-use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::profile::{ApplicationProfile, TemperatureHumidityMeasurement};
-use zigbee_runtime::security_store::{SecurityStateStore, SecurityStoreError};
-use zigbee_runtime::ZigbeeDevice;
-use zigbee_zcl::clusters::basic::PowerSource;
-
-const REPORT_INTERVAL_SECS: u64 = 60;
-const FAST_POLL_MS: u64 = 250;
-const SLOW_POLL_SECS: u64 = 30;
-const FAST_POLL_DURATION_SECS: u64 = 120;
 
 #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
 bind_interrupts!(struct Irqs {
@@ -163,7 +160,7 @@ async fn main(_spawner: Spawner) {
 
     // LED1 / Button 1 (board-owned physical wiring).
     let mut led = nrf52840_dk::led(p.P0_13);
-    let mut button = nrf52840_dk::button(p.P0_11);
+    let button = nrf52840_dk::button(p.P0_11);
 
     // Boot signal: LED solid ON 2 seconds
     led.set_low(); // active LOW = ON
@@ -173,16 +170,14 @@ async fn main(_spawner: Spawner) {
 
     // ── Sensor init ──
     #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
-    let mut temp_sensor = Temp::new(p.TEMP, Irqs);
-    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
-    let mut hum_tick: u32 = 0;
+    let temp_sensor = Temp::new(p.TEMP, Irqs);
 
     #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
-    let mut env_sensor =
+    let env_sensor =
         sensor::Sensor::new(nrf52840_dk::sensor_i2c(p.TWISPI0, Irqs, p.P0_26, p.P0_27));
 
     // SAADC for battery voltage
-    let mut saadc_sensor = Saadc::new(
+    let saadc_sensor = Saadc::new(
         p.SAADC,
         Irqs,
         saadc::Config::default(),
@@ -211,12 +206,23 @@ async fn main(_spawner: Spawner) {
     mac.set_tx_power(0);
     info!("Radio ready (TX 0 dBm)");
 
-    // ── Atomic security journal (last 8 KiB of 1 MiB flash) ──
-    let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
-    let mut security_store = nrf52840_sensor_product::storage::security_store(nvmc);
-    info!("Security journal ready");
-
     // ── Product profile (endpoint, clusters, reporting defaults) ──
+    //
+    // `device`, `security_store`, `profile`, and `app` below are plain
+    // locals, not `StaticCell`s: this whole firmware is a single
+    // `#[embassy_executor::main]` future (never `Spawner::spawn`-ed
+    // alongside others), and `embassy-executor`'s task arena
+    // (`task-arena-size-32768`, see `Cargo.toml`) is a fixed-size static
+    // reservation regardless of what is stored inside the future — moving
+    // these into `StaticCell`s would only add a second, *additional*
+    // reservation on top of that unchanged 32 KiB arena instead of
+    // shrinking it, a net RAM cost with no benefit here. (That pattern
+    // pays off on the EFR32MG1/ESP32-H2 sensors specifically because they
+    // do *not* size the arena up for this data — they use the crate's
+    // default 4 KiB arena — so pulling large owned state out of the future
+    // is required just to fit.) Measured effect of *not* using
+    // `StaticCell` here: identical `.bss` to the pre-refactor single-file
+    // firmware (see the nRF platform guide for the exact byte counts).
     let mut profile = nrf52840_sensor_product::profile::sensor_profile();
 
     // ── Build device ──
@@ -239,522 +245,29 @@ async fn main(_spawner: Spawner) {
         )
         .build();
 
+    // ── Atomic security journal (last 8 KiB of 1 MiB flash) ──
+    let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
+    let mut security_store = nrf52840_sensor_product::storage::security_store(nvmc);
+    info!("Security journal ready");
+
     match device.reset_security_state_if_identity_changed(&mut security_store, ieee) {
         Ok(true) => warn!("Cleared persisted network state after IEEE address change"),
         Ok(false) => {}
-        Err(error) => persistence_failure(error),
-    }
-    let resumed_at_boot = match security_store.load() {
-        Ok(Some(state)) => state.commissioned && !state.rejoin_pending,
-        Ok(None) => false,
-        Err(error) => persistence_failure(error),
-    };
-
-    let mut node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
-
-    // Restore and reserve fresh security-counter ranges before any secured
-    // resume traffic, or commission with durable reservations on first boot.
-    if join_or_resume(&mut node).await {
-        led.set_low();
+        Err(error) => app::persistence_failure(error),
     }
 
-    // ── Read sensors once so clusters have real values for ZHA interview ──
-    read_sensors(
-        &mut node,
+    let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
+
+    let mut app = SensorApp::new(
+        node,
+        led,
+        button,
         #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
-        &mut temp_sensor,
+        temp_sensor,
         #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
-        &mut env_sensor,
-        #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
-        &mut hum_tick,
-        &mut saadc_sensor,
-    )
-    .await;
-
-    // ── Default reporting so device reports even without ZHA ConfigureReporting ──
-    if let Err(error) = node.configure_default_reporting() {
-        node_failure(NodeError::Profile(error));
-    }
-    info!("Default reporting configured");
-
-    // ── Main loop state ──
-    let mut last_report = Instant::now();
-    let mut fast_poll_until = if node.device().is_joined() {
-        info!("Fast poll ON ({}s) — post-join", FAST_POLL_DURATION_SECS);
-        led.set_low(); // LED ON
-        Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS)
-    } else {
-        Instant::now()
-    };
-    let mut last_rejoin_attempt = Instant::now();
-    let mut rejoin_count: u8 = 0;
-    let mut annce_retries_left: u8 = if node.device().is_joined() && !resumed_at_boot {
-        5
-    } else {
-        0
-    };
-    let mut last_annce = Instant::now();
-    let mut was_fast_polling = node.device().is_joined();
-    let mut interview_done = false;
-    loop {
-        let now = Instant::now();
-        let in_fast_poll = now < fast_poll_until;
-        let poll_ms = if in_fast_poll {
-            FAST_POLL_MS
-        } else {
-            SLOW_POLL_SECS * 1000
-        };
-
-        // Log transition from fast→slow poll
-        if was_fast_polling && !in_fast_poll {
-            let cfg = node
-                .device()
-                .configured_cluster_count(nrf52840_sensor_product::ENDPOINT);
-            info!(
-                "Fast poll OFF — {}/{} clusters configured",
-                cfg,
-                node.profile().expected_report_clusters()
-            );
-            was_fast_polling = false;
-            if !interview_done {
-                led.set_high(); // LED OFF
-            }
-        } else if in_fast_poll {
-            was_fast_polling = true;
-        }
-
-        // ── Sleep until button or poll timer wake ──
-        if node.device().is_joined() && node.device_mut().mac_mut().enter_low_power_idle().is_err()
-        {
-            warn!("Failed to disable RADIO before poll sleep");
-        }
-        match select(
-            button.wait_for_falling_edge(),
-            Timer::after(Duration::from_millis(poll_ms)),
-        )
-        .await
-        {
-            Either::First(_) => {
-                // Check for long press (3s = factory reset)
-                let held_long = matches!(
-                    select(
-                        button.wait_for_rising_edge(),
-                        Timer::after(Duration::from_secs(3)),
-                    )
-                    .await,
-                    Either::Second(_)
-                );
-
-                if held_long {
-                    info!("FACTORY RESET");
-                    if factory_reset(&mut node).await {
-                        info!("Security state reset — rebooting");
-                    }
-                    for _ in 0..5u8 {
-                        led.set_low();
-                        Timer::after(Duration::from_millis(100)).await;
-                        led.set_high();
-                        Timer::after(Duration::from_millis(100)).await;
-                    }
-                    cortex_m::peripheral::SCB::sys_reset();
-                } else if node.device().is_joined() {
-                    info!("Button → leave");
-                    if factory_reset(&mut node).await {
-                        led.set_high();
-                        info!("Left network and reset security state");
-                    }
-                } else {
-                    info!("Button → join");
-                    if join_or_resume(&mut node).await {
-                        led.set_low();
-                        fast_poll_until =
-                            Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                        annce_retries_left = 5;
-                        last_annce = Instant::now();
-                        interview_done = false;
-                    }
-                }
-                Timer::after(Duration::from_millis(300)).await;
-            }
-            Either::Second(_) => {} // Normal timeout — proceed to poll
-        }
-        // ── Poll parent for indirect frames (SED core) ──
-        if node.device().is_joined() {
-            for _poll_round in 0..4u8 {
-                match node.device_mut().poll().await {
-                    Ok(Some(ind)) => {
-                        let event = match node.process_incoming(&ind).await {
-                            Ok(event) => event,
-                            Err(error) => node_failure(error),
-                        };
-                        if let Some(ev) = event {
-                            match &ev {
-                                StackEvent::RejoinRequested => {
-                                    info!("Coordinator requested secure rejoin");
-                                    if secure_rejoin(&mut node).await {
-                                        fast_poll_until = Instant::now()
-                                            + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                        interview_done = false;
-                                        annce_retries_left = 5;
-                                        last_annce = Instant::now();
-                                        led.set_low();
-                                    }
-                                    break;
-                                }
-                                StackEvent::LeaveRequested => {
-                                    info!("Coordinator sent Leave — resetting and rejoining");
-                                    if factory_reset(&mut node).await
-                                        && join_or_resume(&mut node).await
-                                    {
-                                        fast_poll_until = Instant::now()
-                                            + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                        interview_done = false;
-                                        annce_retries_left = 5;
-                                        last_annce = Instant::now();
-                                        led.set_low();
-                                    }
-                                    break;
-                                }
-                                _ => {}
-                            }
-                            if log_event(&ev, &mut led) {
-                                fast_poll_until =
-                                    Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                            }
-                        }
-                        // Check if ZHA completed interview
-                        if !interview_done && node.reporting_is_configured() {
-                            info!(
-                                "Interview done! {}/{} clusters configured",
-                                node.device()
-                                    .configured_cluster_count(nrf52840_sensor_product::ENDPOINT),
-                                node.profile().expected_report_clusters()
-                            );
-                            fast_poll_until = Instant::now() + Duration::from_secs(5);
-                            interview_done = true;
-                            led.set_high(); // LED OFF — power save
-                        }
-                        // Tick to send queued ZCL responses
-                        if let Err(error) = node.tick(0).await {
-                            node_failure(error);
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
-            }
-
-            // ── Periodic tasks ──
-            let now2 = Instant::now();
-            let elapsed_s = now2.duration_since(last_report).as_secs();
-
-            if elapsed_s >= REPORT_INTERVAL_SECS {
-                last_report = now2;
-                read_sensors(
-                    &mut node,
-                    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
-                    &mut temp_sensor,
-                    #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
-                    &mut env_sensor,
-                    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
-                    &mut hum_tick,
-                    &mut saadc_sensor,
-                )
-                .await;
-            }
-
-            // Tick the runtime
-            let tick_elapsed = elapsed_s.min(60) as u16;
-            let tick_result = match node.tick(tick_elapsed).await {
-                Ok(result) => result,
-                Err(error) => node_failure(error),
-            };
-            if let TickResult::Event(ref e) = tick_result {
-                if log_event(e, &mut led) {
-                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                }
-            }
-
-            // Identify LED blink
-            if node
-                .device()
-                .is_identifying(nrf52840_sensor_product::ENDPOINT)
-            {
-                led.toggle();
-            }
-
-            // Device_annce retry
-            if annce_retries_left > 0 && now2.duration_since(last_annce).as_secs() >= 8 {
-                annce_retries_left -= 1;
-                last_annce = now2;
-                info!("Re-sending Device_annce ({} left)", annce_retries_left);
-                checkpoint_security(&mut node);
-                let _ = node.device_mut().send_device_annce().await;
-                checkpoint_security(&mut node);
-            }
-        } else {
-            // ── Not joined — blink and auto-retry ──
-            let now2 = Instant::now();
-            if now2.duration_since(last_rejoin_attempt).as_secs() >= 1 {
-                // Double blink
-                led.set_low();
-                Timer::after(Duration::from_millis(80)).await;
-                led.set_high();
-                Timer::after(Duration::from_millis(120)).await;
-                led.set_low();
-                Timer::after(Duration::from_millis(80)).await;
-                led.set_high();
-            }
-
-            if now2.duration_since(last_rejoin_attempt).as_secs() >= 15 {
-                rejoin_count = rejoin_count.wrapping_add(1);
-                last_rejoin_attempt = Instant::now();
-                info!("Not joined — retrying (attempt {})…", rejoin_count);
-                if let Err(error) = node.tick(0).await {
-                    node_failure(error);
-                }
-                if node.device().is_joined()
-                    || (!node.device().secure_rejoin_pending() && join_or_resume(&mut node).await)
-                {
-                    led.set_low();
-                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                    annce_retries_left = 5;
-                    last_annce = Instant::now();
-                    interview_done = false;
-                }
-            }
-        }
-    }
-}
-
-async fn join_or_resume<M, S>(node: &mut ZigbeeNode<'_, M, S, SensorProfile>) -> bool
-where
-    M: MacDriver,
-    S: SecurityStateStore,
-{
-    match node.start_or_resume().await {
-        Ok(short_address) => {
-            info!(
-                "Joined/resumed network: addr=0x{:04X} ch={} pan=0x{:04X}",
-                short_address,
-                node.device().channel(),
-                node.device().pan_id()
-            );
-            // The runtime owns the R22 End Device Timeout lifecycle: a fresh
-            // join or secured rejoin sends exactly one initial request, and a
-            // silent resume reuses the persisted parent relationship. Sending
-            // one here as well would duplicate the negotiation.
-            checkpoint_security(node);
-            true
-        }
-        Err(StartError::InitFailed) => {
-            warn!("Zigbee initialization failed");
-            false
-        }
-        Err(StartError::CommissioningFailed(status)) => {
-            warn!("Commissioning failed: status=0x{:02X}", status as u8);
-            false
-        }
-        Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
-    }
-}
-
-async fn secure_rejoin<M, S>(node: &mut ZigbeeNode<'_, M, S, SensorProfile>) -> bool
-where
-    M: MacDriver,
-    S: SecurityStateStore,
-{
-    match node.secure_rejoin().await {
-        Ok(short_address) => {
-            info!("Secure rejoin succeeded: addr=0x{:04X}", short_address);
-            checkpoint_security(node);
-            true
-        }
-        Err(StartError::InitFailed) => {
-            warn!("Secure rejoin initialization failed");
-            false
-        }
-        Err(StartError::CommissioningFailed(status)) => {
-            warn!("Secure rejoin failed: status=0x{:02X}", status as u8);
-            false
-        }
-        Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
-    }
-}
-
-async fn factory_reset<M, S>(node: &mut ZigbeeNode<'_, M, S, SensorProfile>) -> bool
-where
-    M: MacDriver,
-    S: SecurityStateStore,
-{
-    match node.factory_reset().await {
-        Ok(()) => true,
-        Err(StartError::InitFailed) => {
-            warn!("Factory reset initialization failed");
-            false
-        }
-        Err(StartError::CommissioningFailed(status)) => {
-            warn!("Factory reset failed: status=0x{:02X}", status as u8);
-            false
-        }
-        Err(StartError::PersistenceFailed(error)) => persistence_failure(error),
-    }
-}
-
-fn checkpoint_security<M, S>(node: &mut ZigbeeNode<'_, M, S, SensorProfile>)
-where
-    M: MacDriver,
-    S: SecurityStateStore,
-{
-    if let Err(error) = node.checkpoint_security() {
-        persistence_failure(error);
-    }
-}
-
-#[inline(never)]
-fn node_failure(error: NodeError) -> ! {
-    match error {
-        NodeError::Persistence(error) => persistence_failure(error),
-        NodeError::Profile(error) => {
-            error!("Profile error: {:?}", defmt::Debug2Format(&error));
-            core::panic!("profile error");
-        }
-    }
-}
-
-#[inline(never)]
-fn persistence_failure(error: SecurityStoreError) -> ! {
-    match error {
-        SecurityStoreError::NotFound => error!("Security persistence failed: not found"),
-        SecurityStoreError::Corrupt => error!("Security persistence failed: corrupt state"),
-        SecurityStoreError::Full => error!("Security persistence failed: full"),
-        SecurityStoreError::Hardware => error!("Security persistence failed: hardware"),
-        SecurityStoreError::CounterExhausted => {
-            error!("Security persistence failed: counter exhausted")
-        }
-        SecurityStoreError::GenerationExhausted => {
-            error!("Security persistence failed: generation exhausted")
-        }
-    }
-    core::panic!("security persistence failure");
-}
-
-/// Read all sensors and update the profile's environment/battery clusters.
-#[allow(unused_variables)]
-async fn read_sensors<M, S>(
-    node: &mut ZigbeeNode<'_, M, S, SensorProfile>,
-    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))] temp_sensor: &mut Temp<
-        '_,
-    >,
-    #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
-    env_sensor: &mut sensor::Sensor<'_>,
-    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))] hum_tick: &mut u32,
-    saadc: &mut Saadc<'_, 1>,
-) where
-    M: MacDriver,
-    S: SecurityStateStore,
-{
-    let environment = node.profile_mut().component_mut();
-
-    #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
-    {
-        if let Some(reading) = env_sensor.sample().await {
-            environment.update_environment(TemperatureHumidityMeasurement {
-                temperature_centi_celsius: reading.temperature_centi_celsius,
-                humidity_centi_percent: reading.humidity_centi_percent,
-            });
-            #[cfg(feature = "sensor-bme280")]
-            {
-                environment.update_pressure(reading.pressure_hpa);
-                info!(
-                    "T={}.{:02}°C H={}.{:02}% P={}hPa",
-                    reading.temperature_centi_celsius / 100,
-                    (reading.temperature_centi_celsius % 100).unsigned_abs(),
-                    reading.humidity_centi_percent / 100,
-                    reading.humidity_centi_percent % 100,
-                    reading.pressure_hpa,
-                );
-            }
-            #[cfg(not(feature = "sensor-bme280"))]
-            info!(
-                "T={}.{:02}°C H={}.{:02}%",
-                reading.temperature_centi_celsius / 100,
-                (reading.temperature_centi_celsius % 100).unsigned_abs(),
-                reading.humidity_centi_percent / 100,
-                reading.humidity_centi_percent % 100,
-            );
-        } else {
-            warn!("Environmental sensor read failed");
-        }
-    }
-
-    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
-    {
-        let raw_temp = temp_sensor.read().await;
-        let temp_hundredths = (raw_temp.to_bits() * 100 / 4) as i16;
-        *hum_tick = hum_tick.wrapping_add(1);
-        let hum_hundredths = 5000u16 + ((*hum_tick % 100) as u16).wrapping_mul(10);
-        environment.update_environment(TemperatureHumidityMeasurement {
-            temperature_centi_celsius: temp_hundredths,
-            humidity_centi_percent: hum_hundredths,
-        });
-        info!(
-            "T={}.{:02}°C H={}.{:02}% (on-chip)",
-            temp_hundredths / 100,
-            (temp_hundredths % 100).unsigned_abs(),
-            hum_hundredths / 100,
-            hum_hundredths % 100
-        );
-    }
-
-    // Battery
-    let mut buf = [0i16; 1];
-    saadc.sample(&mut buf).await;
-    let measurement = nrf52840_sensor_product::battery::battery_measurement(buf[0]);
-    info!(
-        "Battery: {}mV ({}%)",
-        nrf52840_sensor_product::battery::millivolts(buf[0]),
-        measurement.percentage_remaining / 2
+        env_sensor,
+        saadc_sensor,
     );
-    environment.update_battery(measurement);
-}
 
-/// LED ON = joined, blink = joining, OFF = idle. Returns true on join event.
-fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>) -> bool {
-    match event {
-        StackEvent::Joined {
-            short_address,
-            channel,
-            pan_id,
-        } => {
-            led.set_low(); // ON
-            info!(
-                "Joined! addr=0x{:04X} ch={} pan=0x{:04X}",
-                short_address, channel, pan_id
-            );
-            true
-        }
-        StackEvent::Left => {
-            led.set_high(); // OFF
-            info!("Left network");
-            false
-        }
-        StackEvent::ReportSent => {
-            info!("Report sent");
-            false
-        }
-        StackEvent::LeaveRequested | StackEvent::RejoinRequested => {
-            led.set_low(); // ON — rejoining
-            info!("Leave requested by coordinator");
-            false
-        }
-        StackEvent::CommissioningComplete { success } => {
-            info!("Commissioning: {}", if *success { "ok" } else { "failed" });
-            false
-        }
-        _ => {
-            info!("Stack event");
-            false
-        }
-    }
+    app.run().await
 }

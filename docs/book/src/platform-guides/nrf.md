@@ -447,38 +447,102 @@ on-chip temperature sensor and reports simulated humidity. Includes:
   reporting, persistence lifecycle, tick, and receive dispatch are shared
   rather than rebuilt in the example
 
-**Initialization:**
+#### Architecture: composition root + application state machine
+
+Like the EFR32MG1 and ESP32-H2 sensors, this firmware is split across three
+files under `src/`:
+
+| File | Owns |
+|------|------|
+| `main.rs` | Embassy/Nordic platform startup (clocks, DC-DC, boot signal), board/sensor resource construction, hardware AES install + startup KAT, the crash-safe security journal, the concrete product profile, and the identity guard. Builds `device`/`security_store`/`profile` as plain locals and hands borrows of them to `app::SensorApp`. |
+| `app.rs` | `SensorApp<'a>`, the full commissioning and event-loop lifecycle: bounded (four-round) MAC receive/poll windows, two-level fast/slow polling, the post-join interview window, Device_annce retries, button handling, and durable checkpointing. |
+| `policy.rs` | A small, dependency-free (`core` + `zigbee_runtime::event_loop` only) poll-delay arbitration helper, host-tested from `tests/src/nrf52840_policy_tests.rs` via the same `#[path]`-include technique as `tests/src/efr32mg1_pm_tests.rs`. |
+
+`main.rs` stays a thin composition root; `SensorApp::run()` in `app.rs` is
+the only place that drives the network.
+
+Unlike the EFR32MG1/ESP32-H2 sensors, `SensorApp<'a>` is lifetime-generic
+and **not** built via `StaticCell`/`build_into`. Those two products use the
+`embassy-executor` crate's *default* 4 KiB task arena (they set no
+`task-arena-size-*` feature), so `ZigbeeDevice`/security-store/profile must
+be pulled out into `'static` storage just to fit the future that big at
+all. This firmware explicitly requests a much larger arena
+(`task-arena-size-32768`, see `Cargo.toml`) sized for the whole
+single-future firmware, and that arena is a **fixed-size static
+reservation regardless of what's stored inside it** — so adding
+`StaticCell`s on top would only add a second, unnecessary reservation
+rather than shrink anything. Measured effect: building with plain locals
+(borrowed into `SensorApp<'a>` for the remainder of the never-returning
+`main()`) keeps `.bss` byte-for-byte identical to the pre-refactor
+single-file firmware; an earlier `StaticCell`-based version of this same
+refactor measured ~11.6 KiB of *additional* `.bss` for zero benefit, which
+is why this file does not use that pattern. See
+`examples/nrf52840-sensor/src/main.rs` for the full comment.
+
+#### Event handling
+
+`SensorApp::handle_control_event` matches every [`StackEvent`] variant
+explicitly — no wildcard arm, so adding a new variant to `zigbee-runtime`
+fails to compile here until it is deliberately handled (OTA variants, which
+this product does not use, still get an explicit logged arm rather than
+being silently dropped). In particular:
+
+- `FactoryResetRequested` durably clears security state and rejoins, the
+  same as `LeaveRequested` already did — previously this event only
+  produced a log line.
+- `RejoinRequested` attempts a secure rejoin immediately.
+- A `CommissioningComplete { success: false }` while a secure rejoin is
+  pending is retried, bounded by a small failure counter, before falling
+  back to a full factory reset and fresh join — a stale/unreachable parent
+  can no longer wedge the device indefinitely.
+
+`SensorApp` also honors [`TickResult::RunAgain`]: when the runtime asks to
+be ticked again sooner than the current fast/slow poll window (for example
+mid-Trust-Center-link-key exchange), the next poll/sleep wait is shortened
+accordingly instead of the request being discarded. Runtime elapsed seconds
+come from a separate monotonic `last_tick` clock rather than the cumulative
+age of the last sensor report, so extra `RunAgain` wakeups cannot advance
+reporting, Identify, NWK, or End Device Timeout timers faster than wall clock.
+A failed restored `rejoin_pending` attempt during boot is counted as the first
+bounded secure-rejoin failure rather than being lost before periodic retries
+begin.
+
+**Initialization (`main.rs`):**
 
 ```rust
-let p = embassy_nrf::init(Default::default());
+let p = embassy_nrf::init(config);
 
 // Board-owned physical wiring.
 let mut led = nrf52840_dk::led(p.P0_13);
-let mut button = nrf52840_dk::button(p.P0_11);
+let button = nrf52840_dk::button(p.P0_11);
 
-// IEEE 802.15.4 MAC driver (interrupt-driven, DMA-based)
+// IEEE 802.15.4 MAC driver (interrupt-driven, DMA-based) + hardware AES.
 let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
 let rng = rng::Rng::new(p.RNG, Irqs);
-let mac = zigbee_mac::nrf::NrfMac::new(radio, rng);
+let mut mac = zigbee_mac::nrf::NrfMac::new(radio, rng);
+mac.install_aes_engine(aes).expect("Nordic ECB AES startup KAT");
 
-// Product-owned persistence, identity, and concrete profile.
-let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
-let mut security = nrf52840_sensor_product::storage::security_store(nvmc);
+// Product-owned concrete profile and device — plain locals (see above).
 let mut profile = nrf52840_sensor_product::profile::sensor_profile();
-
 let mut device = ZigbeeDevice::builder(mac)
     // identity and endpoint come from nrf52840-sensor-product
     .build();
-let mut node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+
+// Product-owned persistence — same journal partition as before.
+let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
+let mut security_store = nrf52840_sensor_product::storage::security_store(nvmc);
+
+let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
+let mut app = SensorApp::new(node, led, button, /* sensors */);
+app.run().await
 ```
 
-**Real temperature reading:**
+**Real temperature reading (`app.rs`):**
 
 ```rust
 // Read actual die temperature (°C with 0.25° resolution)
-let temp_c = temp_sensor.read().await;
-let temp_hundredths = (temp_c.to_num::<f32>() * 100.0) as i16;
-temp_cluster.set_temperature(temp_hundredths);
+let temp_c = self.temp_sensor.read().await;
+let temp_hundredths = (temp_c.to_bits() * 100 / 4) as i16;
 ```
 
 ### nrf52840-sensor-uf2
