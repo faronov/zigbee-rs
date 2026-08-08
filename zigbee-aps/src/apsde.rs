@@ -246,6 +246,10 @@ struct ApsDecryptOutcome {
     aps_security_source: Option<IeeeAddress>,
     /// APS key identifier that selected the decryption key.
     aps_key_identifier: Option<u8>,
+    /// Whether the frame was secured with the *global* default Trust Center
+    /// link key (ZigBeeAlliance09) because no unique key is installed for the
+    /// source, rather than with an established unique link key.
+    aps_used_default_link_key: bool,
 }
 
 /// Verify and decrypt a secured incoming APS frame into `decrypted_buf`.
@@ -329,8 +333,11 @@ fn aps_decrypt_incoming<P: ForwardAesProvider>(
         .as_ref()
         .and_then(|address| security.find_any_key(address))
         .map(|entry| entry.key);
-    let uses_default_link_key = installed_link_key.is_none();
-    let base_link_key = installed_link_key.unwrap_or(*security.default_tc_link_key());
+    let default_link_key = *security.default_tc_link_key();
+    let base_link_key = installed_link_key.unwrap_or(default_link_key);
+    // An explicitly installed entry containing ZigBeeAlliance09 is still the
+    // global key, not a unique Trust Center link key.
+    let uses_default_link_key = base_link_key == default_link_key;
     let key = if key_id == crate::security::KEY_ID_DATA_KEY {
         base_link_key
     } else if key_id == crate::security::KEY_ID_KEY_TRANSPORT {
@@ -441,6 +448,7 @@ fn aps_decrypt_incoming<P: ForwardAesProvider>(
     Some(ApsDecryptOutcome {
         aps_security_source,
         aps_key_identifier,
+        aps_used_default_link_key: uses_default_link_key,
     })
 }
 
@@ -1085,6 +1093,7 @@ impl<M: MacDriver> ApsLayer<M> {
         let mut used_decrypted_buf = false;
         let mut aps_security_source = None;
         let mut aps_key_identifier = None;
+        let mut aps_used_default_link_key = false;
 
         // Phase 1: APS security decryption.
         //
@@ -1109,6 +1118,7 @@ impl<M: MacDriver> ApsLayer<M> {
             used_decrypted_buf = true;
             aps_security_source = outcome.aps_security_source;
             aps_key_identifier = outcome.aps_key_identifier;
+            aps_used_default_link_key = outcome.aps_used_default_link_key;
         }
 
         // Phase 2: Frame type dispatch
@@ -1245,6 +1255,11 @@ impl<M: MacDriver> ApsLayer<M> {
                                 && command.key_type == WIRE_KEY_TYPE_TC_LINK
                                 && aps_secured
                                 && aps_key_identifier == Some(crate::security::KEY_ID_DATA_KEY)
+                                // R21+ §4.7.3.6: Confirm-Key proves possession
+                                // of the *unique* Trust Center link key. One
+                                // secured under the global ZigBeeAlliance09 key
+                                // proves nothing and is never accepted.
+                                && !aps_used_default_link_key
                                 && nwk_src.0 == 0x0000
                                 && aps_security_source
                                     == nonzero_ieee(self.aib.aps_trust_center_address)
@@ -3116,6 +3131,73 @@ mod tests {
         );
         assert_eq!(aps.nwk().security().active_key().unwrap().seq_number, 1);
         assert_eq!(aps.nwk().nib().active_key_seq_number, 1);
+    }
+
+    /// R21+ §4.7.3.6: a Confirm-Key only proves possession of the **unique**
+    /// Trust Center link key. A Trust Center that secures Confirm-Key with the
+    /// global ZigBeeAlliance09 key (as some pre-R21-era coordinators do when
+    /// they never transported a unique key) proves nothing, so it must be
+    /// counted as a rejection and must never satisfy the BDB handshake.
+    #[test]
+    #[cfg(feature = "router")]
+    fn confirm_key_secured_with_the_global_key_is_rejected() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        aps.aib_mut().aps_trust_center_address = TC_IEEE;
+        let global_key = *aps.security().default_tc_link_key();
+        // Even if the global key has been materialized as a per-TC table entry
+        // (for example by a pre-R21 compatibility path), it is not unique and
+        // must never authenticate Confirm-Key.
+        aps.security_mut()
+            .add_key(crate::security::ApsLinkKeyEntry {
+                partner_address: TC_IEEE,
+                key: global_key,
+                key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+                outgoing_frame_counter: 0,
+                outgoing_frame_counter_limit: 0x1000,
+                incoming_frame_counter: 0,
+                incoming_frame_counter_valid: false,
+            })
+            .unwrap();
+
+        let tc_security = crate::security::ApsSecurity::new();
+        let mut confirm_key = [0u8; 11];
+        confirm_key[0] = crate::frames::ApsCommandId::ConfirmKey as u8;
+        confirm_key[1] = 0x00;
+        confirm_key[2] = WIRE_KEY_TYPE_TC_LINK;
+        confirm_key[3..11].copy_from_slice(&LOCAL_IEEE);
+        let mut frame = [0u8; 64];
+        let len = build_tc_secured_command_frame(
+            &tc_security,
+            &global_key,
+            &TC_IEEE,
+            0x21,
+            0x0000_0300,
+            crate::security::KEY_ID_DATA_KEY,
+            false,
+            &confirm_key,
+            &mut frame,
+        )
+        .unwrap();
+
+        let mut buf = ApsFrameBuffer::new();
+        assert!(
+            aps.process_incoming_aps_frame(
+                &frame[..len],
+                ShortAddress::COORDINATOR,
+                LOCAL_SHORT,
+                180,
+                IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+                &mut buf,
+            )
+            .is_none()
+        );
+        let stats = aps.security_handshake_stats();
+        assert_eq!(stats.confirm_key_received, 1);
+        assert_eq!(
+            stats.confirm_key_successes, 0,
+            "a global-key Confirm-Key must never be accepted"
+        );
+        assert_eq!(stats.confirm_key_rejections, 1);
     }
 
     /// End-to-end cover for the extracted `aps_decrypt_incoming` /

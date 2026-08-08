@@ -736,7 +736,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         }
         let local_ieee = self.nwk().nib().ieee_address;
         let targets_local_device = req.device_address == [0; 8] || req.device_address == local_ieee;
-        rsp[0] = if targets_local_device && !req.remove_children {
+        rsp[0] = if targets_local_device {
             ZdpStatus::Success
         } else {
             ZdpStatus::NotSupported
@@ -1197,6 +1197,20 @@ mod tests {
                 .find_by_ieee(&CHILD_IEEE)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn mgmt_leave_self_target_accepts_remove_children() {
+        let mut zdo = test_zdo();
+        let mut payload = [0u8; 10];
+        payload[0] = 0x42;
+        payload[9] = 0x40;
+
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_LEAVE_REQ, &payload))).unwrap();
+
+        let (cluster, body) = last_zdp_tx(&zdo).expect("Mgmt_Leave_rsp");
+        assert_eq!(cluster, crate::MGMT_LEAVE_RSP);
+        assert_eq!(body.as_slice(), &[0x42, ZdpStatus::Success as u8]);
     }
 
     // ── Unsupported / undefined clusters ────────────────────────

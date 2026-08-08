@@ -262,11 +262,12 @@ impl<M: MacDriver> BdbLayer<M> {
 
         // Step 2: Reset lower layers (NWK + MAC) — clears neighbor table,
         // security material, routing table, frame counters
-        let _ = self.zdo.nlme_reset(true);
+        let _ = self.zdo.nlme_reset(false);
 
         // Step 3: Clear APS state — binding table, group table, key table
         self.zdo.aps_mut().binding_table_mut().clear();
         self.zdo.aps_mut().group_table_mut().clear();
+        self.zdo.aps_mut().security_mut().clear_keys();
 
         // Step 4: Reset all BDB attributes to defaults
         self.reset_attributes();

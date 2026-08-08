@@ -14,7 +14,7 @@ pub const MAX_CLUSTERS: usize = 16;
 ///
 /// Zigbee Core R22 (revision 22) is the specification this stack implements,
 /// and R22 §2.3.2.3.10 requires the revision to be advertised in Node
-/// Descriptor server-mask bits 9..=14. A device that leaves the field at 0 is
+/// Descriptor server-mask bits 9..=15. A device that leaves the field at 0 is
 /// treated as pre-R21 by certified coordinators, which disables R21+ join and
 /// security behaviour.
 pub const STACK_COMPLIANCE_REVISION: u8 = 22;
@@ -118,21 +118,28 @@ impl NodeDescriptor {
     /// Mask of the advertised server services (bits 0..=6). Bits 7-8 are
     /// reserved and must stay clear.
     pub const SERVER_SERVICE_MASK: u16 = 0x007F;
-    /// Mask of the Stack Compliance Revision field (bits 9..=14).
-    pub const SERVER_STACK_REVISION_MASK: u16 = 0x7E00;
+    /// Mask of the Stack Compliance Revision field (bits 9..=15).
+    ///
+    /// R22 Table 2-34 gives the field seven bits (9..=15), not six: bit 15 is
+    /// part of the revision, not a reserved bit. Extracting only six bits
+    /// truncates the revision a peer advertises.
+    pub const SERVER_STACK_REVISION_MASK: u16 = 0xFE00;
+    /// Widest stack compliance revision the 7-bit field can carry.
+    pub const MAX_STACK_REVISION: u8 = 0x7F;
 
     /// Build a server mask from service bits and a stack compliance revision.
     ///
-    /// Reserved bits 7-8 and 15 are forced clear, and the revision is clamped
-    /// to the six bits the field actually has.
+    /// Reserved bits 7-8 are forced clear, and the revision is clamped to the
+    /// seven bits the field actually has.
     pub const fn server_mask(services: u16, stack_revision: u8) -> u16 {
         (services & Self::SERVER_SERVICE_MASK)
-            | (((stack_revision as u16) & 0x3F) << 9) & Self::SERVER_STACK_REVISION_MASK
+            | (((stack_revision & Self::MAX_STACK_REVISION) as u16) << 9)
+                & Self::SERVER_STACK_REVISION_MASK
     }
 
-    /// Zigbee stack compliance revision encoded in server-mask bits 9..=14.
+    /// Zigbee stack compliance revision encoded in server-mask bits 9..=15.
     pub const fn stack_revision(&self) -> u8 {
-        ((self.server_mask >> 9) & 0x3F) as u8
+        ((self.server_mask >> 9) & Self::MAX_STACK_REVISION as u16) as u8
     }
 
     /// Replace the stack compliance revision, leaving the service bits intact.

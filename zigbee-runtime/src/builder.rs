@@ -66,7 +66,7 @@ fn node_mac_capabilities(device_type: DeviceType, rx_on: bool, power_source: Pow
 
 /// Node Descriptor server mask for `device_type`.
 ///
-/// Always advertises the Core R22 Stack Compliance Revision (bits 9..=14);
+/// Always advertises the Core R22 Stack Compliance Revision (bits 9..=15);
 /// certified coordinators downgrade a device reporting revision 0 to pre-R21
 /// join and security behaviour.
 ///

@@ -53,17 +53,54 @@ fn node_descriptor_serialize_roundtrip() {
 
 #[test]
 fn server_mask_encodes_r22_and_drops_reserved_bits() {
-    // Reserved bits 7-8 and 15 must never reach the wire, and the revision is
-    // limited to the six bits the field has.
+    // Reserved bits 7-8 must never reach the wire, and the revision is limited
+    // to the seven bits (9..=15) the field has.
     let mask = NodeDescriptor::server_mask(0xFFFF, STACK_COMPLIANCE_REVISION);
     assert_eq!(mask, (22 << 9) | NodeDescriptor::SERVER_SERVICE_MASK);
-    assert_eq!(mask & 0x8180, 0);
+    assert_eq!(mask & 0x0180, 0);
+    // This stack stays on Zigbee Core R22.
+    assert_eq!(STACK_COMPLIANCE_REVISION, 22);
 
     let coordinator_mask = NodeDescriptor::server_mask(
         NodeDescriptor::SERVER_PRIMARY_TRUST_CENTER,
         STACK_COMPLIANCE_REVISION,
     );
     assert_eq!(coordinator_mask, 0x2C01);
+}
+
+#[test]
+fn stack_compliance_revision_is_a_seven_bit_field() {
+    // R22 Table 2-34 gives the Stack Compliance Revision bits 9..=15. Reading
+    // only six bits silently truncates any peer revision that sets bit 15.
+    assert_eq!(NodeDescriptor::SERVER_STACK_REVISION_MASK, 0xFE00);
+    assert_eq!(NodeDescriptor::MAX_STACK_REVISION, 0x7F);
+
+    let widest = NodeDescriptor {
+        server_mask: NodeDescriptor::server_mask(
+            NodeDescriptor::SERVER_PRIMARY_TRUST_CENTER,
+            NodeDescriptor::MAX_STACK_REVISION,
+        ),
+        ..NodeDescriptor::default()
+    };
+    assert_eq!(
+        widest.server_mask,
+        0xFE00 | NodeDescriptor::SERVER_PRIMARY_TRUST_CENTER
+    );
+    assert_eq!(widest.stack_revision(), 0x7F);
+
+    // A revision that only occupies bit 15 must not read back as 0.
+    let bit15_only = NodeDescriptor {
+        server_mask: 0x8000 | NodeDescriptor::SERVER_PRIMARY_TRUST_CENTER,
+        ..NodeDescriptor::default()
+    };
+    assert_eq!(bit15_only.stack_revision(), 0x40);
+
+    // Values wider than the field are clamped, never wrapped into a service bit.
+    let clamped = NodeDescriptor::server_mask(NodeDescriptor::SERVER_PRIMARY_TRUST_CENTER, 0xFF);
+    assert_eq!(
+        clamped,
+        0xFE00 | NodeDescriptor::SERVER_PRIMARY_TRUST_CENTER
+    );
 }
 
 #[test]

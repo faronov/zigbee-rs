@@ -768,6 +768,18 @@ impl<M: MacDriver> ZdoLayer<M> {
             .map_err(ZdpStatus::from)
     }
 
+    /// Leave the current network (wraps NLME-LEAVE).
+    ///
+    /// Sends a secured NWK Leave command and disassociates. `rejoin` selects
+    /// whether the device intends to rejoin, which decides how much of the NIB
+    /// survives the leave.
+    pub async fn nlme_leave(&mut self, rejoin: bool) -> Result<(), ZdpStatus> {
+        self.nwk_mut()
+            .nlme_leave(rejoin)
+            .await
+            .map_err(ZdpStatus::from)
+    }
+
     /// Reset the stack (wraps NLME-RESET).
     pub fn nlme_reset(&mut self, warm_start: bool) -> Result<(), ZdpStatus> {
         self.nwk_mut()

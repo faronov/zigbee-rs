@@ -229,45 +229,63 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
         self.send_due_reports(clusters).await;
         self.update_pending_tx_flag();
 
+        // GSDK-style event-driven commissioning: advance the unique Trust
+        // Center link-key handshake before normal tick result generation.
+        // A terminal transition is returned immediately. If it is still in
+        // progress, continue through polling and preserve any application event
+        // produced there for this tick.
+        if self.bdb.tclk_exchange_active()
+            && let Some(event) = self.advance_commissioning().await
+        {
+            return TickResult::Event(event);
+        }
+
         let now_ms = self.advance_power_clock(elapsed_secs);
         // The poll runs first so an End Device Timeout Response that arrives
         // this tick cancels the response wait before it is serviced.
         let poll_event = self.run_sleepy_poll(now_ms, clusters).await;
         R::ed_service(self).await;
+
         let result = if let Some(event) = poll_event {
             TickResult::Event(event)
         } else {
             self.tick_power_state(now_ms)
         };
-        self.advance_commissioning(result).await
+        self.commissioning_tick_hint(result)
     }
 
     /// Advance post-network commissioning without a durable security store.
     ///
     /// This is the platform-independent equivalent of GSDK's scheduled
-    /// update-tc-link-key event: normal ZDO/ZCL and polling work runs first,
-    /// then one bounded security step is performed.
-    async fn advance_commissioning(&mut self, result: TickResult) -> TickResult {
-        if matches!(result, TickResult::Event(_)) || !self.bdb.tclk_exchange_active() {
-            return result;
-        }
-
+    /// update-tc-link-key event: normal maintenance runs first, then exactly
+    /// one bounded security step is performed before polling/result generation.
+    /// Returns `Some` only for a terminal transition.
+    async fn advance_commissioning(&mut self) -> Option<StackEvent> {
         match self.bdb.advance_tclk_exchange(None).await {
-            zigbee_bdb::TclkProgress::InProgress => {
-                if matches!(result, TickResult::Idle) {
-                    TickResult::RunAgain(Self::COMMISSIONING_POLL_MS)
-                } else {
-                    result
-                }
-            }
+            zigbee_bdb::TclkProgress::InProgress => None,
             zigbee_bdb::TclkProgress::Complete => {
                 self.state_dirty = true;
-                TickResult::Event(StackEvent::CommissioningComplete { success: true })
+                Some(StackEvent::CommissioningComplete { success: true })
             }
             zigbee_bdb::TclkProgress::Failed(_) => {
                 self.mark_left();
-                TickResult::Event(StackEvent::CommissioningComplete { success: false })
+                Some(StackEvent::CommissioningComplete { success: false })
             }
+        }
+    }
+
+    /// Shorten a non-event tick result while commissioning security is running.
+    ///
+    /// The handshake advances one bounded step per tick, so the application must
+    /// come back quickly; an application event is never replaced by the hint.
+    pub(crate) fn commissioning_tick_hint(&self, result: TickResult) -> TickResult {
+        if !self.bdb.tclk_exchange_active() {
+            return result;
+        }
+        match result {
+            TickResult::Event(_) => result,
+            TickResult::RunAgain(ms) => TickResult::RunAgain(ms.min(Self::COMMISSIONING_POLL_MS)),
+            _ => TickResult::RunAgain(Self::COMMISSIONING_POLL_MS),
         }
     }
 
@@ -722,5 +740,331 @@ mod tests {
             sleep_decision_to_tick(SleepDecision::DeepSleep(60_000)),
             TickResult::RunAgain(60_000)
         ));
+    }
+}
+
+#[cfg(test)]
+mod commissioning_tick_tests {
+    //! Event-driven commissioning-security progress from the tick loop.
+    //!
+    //! GSDK advances the update-tc-link-key handshake from a scheduled event,
+    //! independently of whatever else the stack is doing. These tests pin the
+    //! platform-independent equivalent: every tick advances the handshake by
+    //! exactly one bounded step while it is active, a terminal transition is
+    //! reported immediately, and an ordinary application event is never
+    //! replaced by the commissioning poll hint.
+
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+
+    use zigbee_bdb::TclkStage;
+    use zigbee_mac::PlatformServices;
+    use zigbee_mac::mock::MockMac;
+    use zigbee_mac::primitives::ZigbeeBeaconPayload;
+    use zigbee_mac::primitives::{
+        AssociationStatus, MacFrame, MlmeAssociateConfirm, PanDescriptor, SuperframeSpec,
+    };
+    use zigbee_nwk::DeviceType;
+    use zigbee_nwk::frames::{NwkFrameControl, NwkFrameType, NwkHeader};
+    use zigbee_types::{IeeeAddress, MacAddress, PanId, ShortAddress};
+
+    use super::{StackEvent, TickResult};
+    use crate::ZigbeeDevice;
+    use crate::role::EndDevice;
+
+    const LOCAL_IEEE: IeeeAddress = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    const TC_IEEE: IeeeAddress = [0xAA; 8];
+    const NETWORK_KEY: [u8; 16] = [0x5A; 16];
+    const PAN: u16 = 0x1234;
+    const SHORT: u16 = 0x1A2B;
+    const CHANNEL: u8 = 15;
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut context = Context::from_waker(Waker::noop());
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// A plain NWK data frame as relayed by the parent, used to model
+    /// "Transport-Key received" together with the pre-installed network key.
+    fn parent_relayed_frame() -> heapless::Vec<u8, 32> {
+        let header = NwkHeader {
+            frame_control: NwkFrameControl {
+                frame_type: NwkFrameType::Data as u8,
+                protocol_version: 0x02,
+                discover_route: 0,
+                multicast: false,
+                security: false,
+                source_route: false,
+                dst_ieee_present: false,
+                src_ieee_present: false,
+                end_device_initiator: false,
+            },
+            dst_addr: ShortAddress(SHORT),
+            src_addr: ShortAddress::COORDINATOR,
+            radius: 30,
+            seq_number: 1,
+            dst_ieee: None,
+            src_ieee: None,
+            multicast_control: None,
+            source_route: None,
+        };
+        let mut buf = [0u8; 32];
+        let header_len = header.serialize(&mut buf);
+        let aps = [0x00u8, 0x01, 0x00, 0x00, 0x04, 0x01, 0x01, 0x2A];
+        buf[header_len..header_len + aps.len()].copy_from_slice(&aps);
+        let mut frame = heapless::Vec::new();
+        let _ = frame.extend_from_slice(&buf[..header_len + aps.len()]);
+        frame
+    }
+
+    /// A sleepy end device parked one poll away from a joinable coordinator.
+    ///
+    /// BDB initialization resets the lower layers (and therefore the mock's
+    /// scripted radio), so it runs *before* the coordinator is scripted.
+    fn joinable_device() -> ZigbeeDevice<MockMac, EndDevice> {
+        let mut device = ZigbeeDevice::builder(MockMac::new(LOCAL_IEEE))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        device.bdb_mut().initialize().expect("BDB initialize");
+        {
+            let nwk = device.bdb_mut().zdo_mut().aps_mut().nwk_mut();
+            nwk.set_rx_on_when_idle(false);
+            let mac = nwk.mac_mut();
+            mac.add_beacon(PanDescriptor {
+                channel: CHANNEL,
+                coord_address: MacAddress::Short(PanId(PAN), ShortAddress::COORDINATOR),
+                superframe_spec: SuperframeSpec {
+                    association_permit: true,
+                    pan_coordinator: true,
+                    ..Default::default()
+                },
+                lqi: 200,
+                security_use: false,
+                zigbee_beacon: ZigbeeBeaconPayload {
+                    protocol_id: 0,
+                    stack_profile: 2,
+                    protocol_version: 2,
+                    router_capacity: true,
+                    device_depth: 0,
+                    end_device_capacity: true,
+                    extended_pan_id: [0xBB; 8],
+                    tx_offset: [0xFF; 3],
+                    update_id: 0,
+                },
+            });
+            mac.set_associate_response(MlmeAssociateConfirm {
+                short_address: ShortAddress(SHORT),
+                status: AssociationStatus::Success,
+            });
+            let frame = parent_relayed_frame();
+            mac.enqueue_poll_response(MacFrame::from_slice(&frame).unwrap());
+        }
+        let nwk = device.bdb_mut().zdo_mut().aps_mut().nwk_mut();
+        nwk.security_mut().set_network_key(NETWORK_KEY, 0);
+        nwk.nib_mut().security_enabled = true;
+        device
+            .bdb_mut()
+            .zdo_mut()
+            .aps_mut()
+            .aib_mut()
+            .aps_trust_center_address = TC_IEEE;
+        device
+    }
+
+    fn advance_time(device: &mut ZigbeeDevice<MockMac, EndDevice>, micros: u32) {
+        block_on(
+            device
+                .bdb_mut()
+                .zdo_mut()
+                .aps_mut()
+                .nwk_mut()
+                .mac_mut()
+                .delay_micros(micros),
+        );
+    }
+
+    fn tick(device: &mut ZigbeeDevice<MockMac, EndDevice>) -> TickResult {
+        block_on(device.tick(1, &mut []))
+    }
+
+    /// Join and leave the device parked on the armed post-network handshake.
+    ///
+    /// This is `start()` minus its leading `initialize()` (already done while
+    /// building the joinable device): the same pre-network steering and the
+    /// same join completion the production entry point runs.
+    fn commissioning_device() -> ZigbeeDevice<MockMac, EndDevice> {
+        let mut device = joinable_device();
+        block_on(device.bdb_mut().network_steering()).expect("network steering");
+        assert_eq!(block_on(device.finish_join()).ok(), Some(SHORT));
+        assert!(
+            device.bdb().tclk_exchange_active(),
+            "network-up must arm the unique-TCLK handshake"
+        );
+        assert_eq!(
+            device.bdb().tclk_exchange_stage(),
+            Some(TclkStage::StartDelay)
+        );
+        device
+    }
+
+    #[test]
+    fn every_tick_advances_the_tclk_handshake_by_one_step() {
+        let mut device = commissioning_device();
+
+        // The start delay is short, but it is still enforced by the monotonic
+        // clock rather than by tick counting.
+        assert!(matches!(tick(&mut device), TickResult::RunAgain(50)));
+        assert_eq!(
+            device.bdb().tclk_exchange_stage(),
+            Some(TclkStage::StartDelay)
+        );
+
+        advance_time(&mut device, 300_000);
+        assert!(matches!(tick(&mut device), TickResult::RunAgain(50)));
+        assert_eq!(
+            device.bdb().tclk_exchange_stage(),
+            Some(TclkStage::SendNodeDesc)
+        );
+
+        assert!(matches!(tick(&mut device), TickResult::RunAgain(50)));
+        assert_eq!(
+            device.bdb().tclk_exchange_stage(),
+            Some(TclkStage::AwaitNodeDesc),
+            "the tick loop must transmit Node_Desc without an extra application step"
+        );
+    }
+
+    #[test]
+    fn an_application_event_is_never_replaced_by_the_commissioning_hint() {
+        let device = commissioning_device();
+        assert!(device.bdb().tclk_exchange_active());
+
+        // An ordinary tick result that carries an application event survives.
+        assert!(matches!(
+            device.commissioning_tick_hint(TickResult::Event(StackEvent::LeaveRequested)),
+            TickResult::Event(StackEvent::LeaveRequested)
+        ));
+        // Idle and long sleeps are shortened to the commissioning cadence.
+        assert!(matches!(
+            device.commissioning_tick_hint(TickResult::Idle),
+            TickResult::RunAgain(50)
+        ));
+        assert!(matches!(
+            device.commissioning_tick_hint(TickResult::RunAgain(60_000)),
+            TickResult::RunAgain(50)
+        ));
+        // A shorter deadline than the hint is preserved.
+        assert!(matches!(
+            device.commissioning_tick_hint(TickResult::RunAgain(10)),
+            TickResult::RunAgain(10)
+        ));
+    }
+
+    /// The durable tick path must behave exactly like the plain one: one
+    /// bounded handshake step per tick, terminal transition reported at once.
+    #[test]
+    fn the_durable_tick_path_advances_the_handshake_identically() {
+        use crate::security_store::RamSecurityStateStore;
+
+        let mut device = joinable_device();
+        let mut store = RamSecurityStateStore::new();
+        {
+            let mut persistence =
+                crate::CommissioningSecurityPersistence::new(&mut store).expect("persistence");
+            block_on(
+                device
+                    .bdb_mut()
+                    .network_steering_with_persistence(&mut persistence),
+            )
+            .expect("network steering");
+            assert!(persistence.take_error().is_none());
+        }
+        assert_eq!(block_on(device.finish_join()).ok(), Some(SHORT));
+        assert_eq!(
+            device.bdb().tclk_exchange_stage(),
+            Some(TclkStage::StartDelay)
+        );
+
+        let mut durable_tick = |device: &mut ZigbeeDevice<MockMac, EndDevice>| {
+            block_on(device.tick_with_security_store(1, &mut [], &mut store)).expect("durable tick")
+        };
+
+        assert!(matches!(
+            durable_tick(&mut device),
+            TickResult::RunAgain(50)
+        ));
+        advance_time(&mut device, 300_000);
+        assert!(matches!(
+            durable_tick(&mut device),
+            TickResult::RunAgain(50)
+        ));
+        assert_eq!(
+            device.bdb().tclk_exchange_stage(),
+            Some(TclkStage::SendNodeDesc)
+        );
+        assert!(matches!(
+            durable_tick(&mut device),
+            TickResult::RunAgain(50)
+        ));
+        assert_eq!(
+            device.bdb().tclk_exchange_stage(),
+            Some(TclkStage::AwaitNodeDesc)
+        );
+
+        // Nothing answers, so the handshake fails strictly and the durable path
+        // reports it exactly like the plain tick.
+        let mut terminal = None;
+        for _ in 0..512 {
+            match durable_tick(&mut device) {
+                TickResult::Event(event) => {
+                    terminal = Some(event);
+                    break;
+                }
+                _ => advance_time(&mut device, 500_000),
+            }
+        }
+        assert!(matches!(
+            terminal,
+            Some(StackEvent::CommissioningComplete { success: false })
+        ));
+        assert!(!device.bdb().tclk_exchange_active());
+        assert!(!device.is_joined());
+    }
+
+    #[test]
+    fn a_terminal_handshake_failure_is_reported_from_the_tick_loop() {
+        let mut device = commissioning_device();
+
+        // The mock coordinator answers nothing, so every message budget runs
+        // out and the exchange fails inside the overall deadline.
+        let mut terminal = None;
+        for _ in 0..512 {
+            match tick(&mut device) {
+                TickResult::Event(event) => {
+                    terminal = Some(event);
+                    break;
+                }
+                _ => advance_time(&mut device, 500_000),
+            }
+        }
+
+        assert!(
+            matches!(
+                terminal,
+                Some(StackEvent::CommissioningComplete { success: false })
+            ),
+            "a failed R21+ initial join must be reported, not silently retried"
+        );
+        assert!(!device.bdb().tclk_exchange_active());
+        assert!(
+            !device.is_joined(),
+            "a failed initial join must never stay commissioned"
+        );
     }
 }

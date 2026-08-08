@@ -1121,6 +1121,7 @@ mod resume_tests {
         store.store(&commissioned_state()).unwrap();
         block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
         device.mac_mut().clear_tx_history();
+        assert_eq!(device.bdb().zdo().aps().security().key_count(), 1);
         device
     }
 
@@ -1149,6 +1150,31 @@ mod resume_tests {
         );
         assert!(device.mac().tx_history().is_empty());
         assert!(device.is_joined());
+    }
+
+    #[test]
+    fn factory_reset_clears_live_security_and_preserves_counter_bounds() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::Router)
+            .build_router();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        let preserved = store.load().unwrap().unwrap();
+
+        assert!(device.bdb().zdo().nwk().security().active_key().is_some());
+        assert_eq!(device.bdb().zdo().aps().security().key_count(), 1);
+
+        block_on(device.factory_reset_with_security_store(&mut store)).unwrap();
+
+        assert!(!device.is_joined());
+        assert!(!device.bdb().is_on_network());
+        assert!(device.bdb().zdo().nwk().security().active_key().is_none());
+        assert_eq!(device.bdb().zdo().aps().security().key_count(), 0);
+        let reset = store.load().unwrap().unwrap();
+        assert!(!reset.commissioned);
+        assert_eq!(reset.global_counter_limit, preserved.global_counter_limit);
+        assert_eq!(reset.tclk_counter_limit, preserved.tclk_counter_limit);
     }
 
     /// Build the NWK frame a coordinator would put on air, secured with the
@@ -1247,6 +1273,119 @@ mod resume_tests {
             }
             .serialize(),
         ]
+    }
+
+    fn mgmt_leave_aps_payload(remove_children: bool, rejoin: bool) -> ([u8; 32], usize) {
+        let header = zigbee_aps::frames::ApsHeader {
+            frame_control: zigbee_aps::frames::ApsFrameControl {
+                frame_type: zigbee_aps::frames::ApsFrameType::Data as u8,
+                delivery_mode: zigbee_aps::frames::ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: false,
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: Some(0),
+            group_address: None,
+            cluster_id: Some(zigbee_zdo::MGMT_LEAVE_REQ),
+            profile_id: Some(zigbee_zdo::ZDP_PROFILE_ID),
+            src_endpoint: Some(0),
+            aps_counter: 1,
+            extended_header: None,
+        };
+        let mut payload = [0u8; 32];
+        let header_len = header.serialize(&mut payload);
+        payload[header_len] = 0x42;
+        payload[header_len + 9] = (u8::from(remove_children) << 6) | (u8::from(rejoin) << 7);
+        (payload, header_len + 10)
+    }
+
+    #[test]
+    fn secured_mgmt_leave_with_remove_children_clears_persisted_credentials() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::Router)
+            .build_router();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+        assert_eq!(device.bdb().zdo().aps().security().key_count(), 1);
+        let preserved = store.load().unwrap().unwrap();
+
+        let (aps_payload, aps_len) = mgmt_leave_aps_payload(true, false);
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &aps_payload[..aps_len],
+            1,
+            true,
+        );
+        let event = block_on(device.process_incoming_with_security_store(
+            &indication(frame),
+            &mut [],
+            &mut store,
+        ))
+        .unwrap();
+
+        assert!(matches!(event, Some(crate::event_loop::StackEvent::Left)));
+        assert!(!device.is_joined());
+        let reset = store.load().unwrap().unwrap();
+        assert!(!reset.commissioned);
+        assert_eq!(reset.ieee_address, [0; 8]);
+        assert_eq!(reset.network_key, [0; 16]);
+        assert_eq!(reset.trust_center_link_key, [0; 16]);
+        assert_eq!(reset.global_counter_limit, preserved.global_counter_limit);
+        assert_eq!(reset.tclk_counter_limit, preserved.tclk_counter_limit);
+        assert_eq!(device.bdb().zdo().aps().security().key_count(), 0);
+    }
+
+    #[test]
+    fn secured_mgmt_leave_rejoin_flag_requests_secure_rejoin() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::Router)
+            .build_router();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+
+        let (aps_payload, aps_len) = mgmt_leave_aps_payload(true, true);
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &aps_payload[..aps_len],
+            1,
+            true,
+        );
+        let event = block_on(device.process_incoming_with_security_store(
+            &indication(frame),
+            &mut [],
+            &mut store,
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            Some(crate::event_loop::StackEvent::RejoinRequested)
+        ));
+        assert!(!device.is_joined());
+        assert!(device.secure_rejoin_pending());
+        let persisted = store.load().unwrap().unwrap();
+        assert!(persisted.commissioned);
+        assert!(persisted.rejoin_pending);
+        assert_eq!(device.bdb().zdo().aps().security().key_count(), 1);
+    }
+
+    #[test]
+    fn failed_leave_notification_still_clears_local_security_state() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        device.mac_mut().set_tx_failures(1);
+
+        block_on(device.leave()).unwrap();
+
+        assert!(!device.is_joined());
+        assert!(device.bdb().zdo().nwk().security().active_key().is_none());
+        assert_eq!(device.bdb().zdo().aps().security().key_count(), 0);
     }
 
     #[test]
@@ -2696,7 +2835,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     const PENDING_CHILD_UPDATE_TIMEOUT_US: u32 = 10_000_000;
     /// Poll cadence hint while the event-driven commissioning security
     /// handshake is still running after network-up.
-    const COMMISSIONING_POLL_MS: u32 = 250;
+    ///
+    /// The handshake advances one bounded step per tick and its shortest
+    /// per-message response window is 1.5 s, so the application has to come
+    /// back well inside that window for retransmissions and the overall
+    /// 15 s deadline to be honoured.
+    const COMMISSIONING_POLL_MS: u32 = 50;
     /// How long an End Device Timeout Response may take to arrive. The
     /// response is delivered indirectly, so this has to cover the parent's
     /// transaction persistence plus one forced poll.
@@ -3076,6 +3220,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             .is_err()
         {
             log::warn!("[Runtime] Leave notification failed; clearing local state");
+            let _ = self.bdb.zdo_mut().nlme_reset(false);
         }
         self.mark_left();
         log::info!("[Runtime] Left network");
@@ -3085,6 +3230,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     fn mark_left(&mut self) {
         self.bdb.attributes_mut().node_is_on_a_network = false;
         self.bdb.zdo_mut().nwk_mut().set_joined(false);
+        let aps = self.bdb.zdo_mut().aps_mut();
+        aps.binding_table_mut().clear();
+        aps.group_table_mut().clear();
+        aps.security_mut().clear_keys();
         self.reset_identify_clusters();
         self.secure_rejoin_retry_at = None;
         R::ed_reset(self);
@@ -4006,9 +4155,23 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     self.send_due_reports(clusters).await;
                     self.update_pending_tx_flag();
 
+                    // Advance commissioning before polling/result generation.
+                    // A terminal transition wins immediately; otherwise the
+                    // poll still runs and any application event it produces is
+                    // returned without being replaced by commissioning.
+                    if self.bdb.tclk_exchange_active()
+                        && let Some(event) = self
+                            .advance_commissioning_with_security_store(store)
+                            .await?
+                    {
+                        self.refresh_security_state(store)?;
+                        return Ok(event_loop::TickResult::Event(event));
+                    }
+
                     let now_ms = self.advance_power_clock(elapsed_secs);
                     let poll_event = self.run_sleepy_poll(now_ms, clusters).await;
                     R::ed_service(self).await;
+
                     if let Some(event) = poll_event {
                         event_loop::TickResult::Event(event)
                     } else if R::CAN_ROUTE {
@@ -4019,27 +4182,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 }
             }
         };
-        // GSDK-style event-driven commissioning: after network-up the normal
-        // tick above services ZDO/ZCL and sleepy polling, feeding the unique
-        // Trust Center link-key handshake. Advance that handshake one bounded
-        // step here, unless the tick already produced an application event to
-        // return (which would otherwise be dropped).
-        let result = if !matches!(result, event_loop::TickResult::Event(_))
-            && self.bdb.tclk_exchange_active()
-        {
-            match self
-                .advance_commissioning_with_security_store(store)
-                .await?
-            {
-                Some(event) => event_loop::TickResult::Event(event),
-                None if matches!(result, event_loop::TickResult::Idle) => {
-                    event_loop::TickResult::RunAgain(Self::COMMISSIONING_POLL_MS)
-                }
-                None => result,
-            }
-        } else {
-            result
-        };
+        let result = self.commissioning_tick_hint(result);
         self.refresh_security_state(store)?;
         Ok(result)
     }
@@ -5196,11 +5339,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     return None;
                 }
                 if request.remove_children {
-                    log::warn!("[Runtime] Mgmt_Leave remove-children is unsupported");
-                    return None;
+                    log::info!(
+                        "[Runtime] Mgmt_Leave remove-children requested; local leave clears child state"
+                    );
                 }
                 log::info!("[Runtime] Executing NLME-LEAVE after Mgmt_Leave response sent");
-                let _ = self
+                let leave_result = self
                     .bdb
                     .zdo_mut()
                     .aps_mut()
@@ -5213,6 +5357,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     let now = self.bdb.zdo().nwk().mac().monotonic_micros();
                     self.secure_rejoin_retry_at = Some(now);
                     return Some(event_loop::StackEvent::RejoinRequested);
+                }
+                if leave_result.is_err() {
+                    log::warn!(
+                        "[Runtime] Mgmt_Leave notification failed; clearing local NWK state"
+                    );
+                    let _ = self.bdb.zdo_mut().nlme_reset(false);
                 }
                 self.mark_left();
                 return Some(event_loop::StackEvent::Left);

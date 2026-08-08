@@ -17,48 +17,141 @@
 //! APS security state — so normal ZDO/ZCL processing and sleepy-end-device
 //! polling continue between steps instead of being monopolised by one long
 //! future.
+//!
+//! # Retry model (GSDK `emberUpdateTcLinkKey(maxAttempts)`)
+//!
+//! GSDK budgets attempts **per message type**, not per whole procedure: the
+//! `maxAttempts` value is applied independently to the Node Descriptor probe,
+//! to the APS Request-Key, and to the Verify-Key, and it is reset when the
+//! next message type starts. A lost Confirm-Key therefore retransmits the
+//! Verify-Key — it never restarts the Node Descriptor probe, and it never
+//! discards the unique key the Trust Center already installed.
+//!
+//! This module implements exactly that: three independent transmission budgets
+//! of [`TCLK_MESSAGE_ATTEMPTS`] each, a short explicit retry backoff,
+//! per-message response windows, and one wrapping-safe overall deadline that
+//! strictly fails the exchange.
 
 use zigbee_types::{IeeeAddress, ShortAddress};
 
-/// Number of complete Node_Desc → Verify/Confirm attempts before failure.
+/// Transmissions allowed per message type before that stage's budget is
+/// exhausted (GSDK `EMBER_AF_PLUGIN_UPDATE_TC_LINK_KEY_MAX_ATTEMPTS`).
 ///
-/// Matches the official Telink/GSDK budget of one initial request plus three
-/// retries.
-pub(crate) const TCLK_EXCHANGE_ATTEMPTS: u8 = 4;
+/// The budget is *per message type* and is reset when a new message type is
+/// started, so Node_Desc, Request-Key and Verify-Key each get their own three
+/// transmissions.
+pub(crate) const TCLK_MESSAGE_ATTEMPTS: u8 = 3;
+
+/// Delay before retransmitting a message after a synchronous transmit failure
+/// or a rejected Confirm-Key.
+///
+/// GSDK advances the update-TCLK procedure from scheduled events rather than
+/// retrying on the next application tick. A 250 ms delay is long enough to
+/// avoid burning all three budgets on consecutive 50 ms runtime ticks, while
+/// remaining far shorter than the old whole-procedure 5 s cooldown.
+pub(crate) const TCLK_RETRY_BACKOFF_US: u32 = 250_000;
+
 /// Delay after `Device_annce` before the first Node_Desc request.
-pub(crate) const TCLK_EXCHANGE_START_DELAY_US: u32 = 1_200_000;
-/// Per-message response window for Node_Desc, Request-Key, and Verify-Key.
-pub(crate) const TCLK_EXCHANGE_TIMEOUT_US: u32 = 5_000_000;
+///
+/// GSDK schedules the update-tc-link-key event with a short jitter right after
+/// the announce; a fixed short delay keeps the whole first authentication pass
+/// inside [`TCLK_EXCHANGE_DEADLINE_US`].
+pub(crate) const TCLK_EXCHANGE_START_DELAY_US: u32 = 300_000;
+
+/// Response window for the Trust Center Node Descriptor probe.
+pub(crate) const TCLK_NODE_DESC_TIMEOUT_US: u32 = 1_500_000;
+
+/// Response window for APS Request-Key → Transport-Key (unique TCLK install).
+pub(crate) const TCLK_REQUEST_KEY_TIMEOUT_US: u32 = 3_000_000;
+
+/// Response window for APS Verify-Key → Confirm-Key.
+///
+/// Matches GSDK `VERIFY_KEY_TIMEOUT_MS` (5 s) in
+/// `app/framework/plugin/network-steering/network-steering.c`.
+pub(crate) const TCLK_VERIFY_KEY_TIMEOUT_US: u32 = 5_000_000;
+
+/// Overall deadline for the whole post-announce handshake.
+///
+/// Measured from the moment the exchange is armed. Expiry is a strict failure:
+/// the exchange never silently keeps running or defers success.
+pub(crate) const TCLK_EXCHANGE_DEADLINE_US: u32 = 15_000_000;
+
+/// Worst-case duration of the *first* pass through every stage.
+///
+/// One start delay plus one full response window per message type. This must
+/// stay strictly below [`TCLK_EXCHANGE_DEADLINE_US`] so a Trust Center that
+/// answers slowly — but answers — is never cut off mid-handshake by the
+/// overall deadline.
+pub(crate) const TCLK_FIRST_PASS_BUDGET_US: u32 = TCLK_EXCHANGE_START_DELAY_US
+    + TCLK_NODE_DESC_TIMEOUT_US
+    + TCLK_REQUEST_KEY_TIMEOUT_US
+    + TCLK_VERIFY_KEY_TIMEOUT_US;
+
+/// Maximum inter-attempt delay when each message type needs all three
+/// transmissions before one full response window succeeds.
+pub(crate) const TCLK_MAX_RETRY_BACKOFF_BUDGET_US: u32 =
+    (TCLK_MESSAGE_ATTEMPTS as u32 - 1) * 3 * TCLK_RETRY_BACKOFF_US;
+
+const _: () = assert!(TCLK_FIRST_PASS_BUDGET_US < TCLK_EXCHANGE_DEADLINE_US);
+const _: () = assert!(
+    TCLK_FIRST_PASS_BUDGET_US + TCLK_MAX_RETRY_BACKOFF_BUDGET_US < TCLK_EXCHANGE_DEADLINE_US
+);
 
 /// Stage of the bounded unique-TCLK handshake.
 ///
 /// Each stage advances by a single bounded action per
-/// [`crate::BdbLayer::advance_tclk_exchange`] call. `Send*` stages perform one
-/// transmit; `Await*` stages check non-blocking state and enforce the
-/// per-attempt timeout; `AttemptCooldown` drains the remainder of a failed
-/// attempt's window before retrying.
+/// [`crate::BdbLayer::advance_tclk_exchange`] call. `Send*` stages consume one
+/// transmission from their message type's budget and perform one transmit;
+/// `Retry*` stages wait out the short scheduled retransmission backoff;
+/// `Await*` stages check non-blocking state and enforce that message type's
+/// response window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TclkStage {
-    /// Waiting out the post-announce start delay before the first attempt.
+    /// Waiting out the post-announce start delay before the first probe.
     StartDelay,
-    /// Send Node_Desc_req to the Trust Center (start of an attempt).
+    /// Send Node_Desc_req to the Trust Center.
     SendNodeDesc,
+    /// Pace a Node_Desc_req retransmission after a synchronous send failure.
+    RetryNodeDesc,
     /// Await the Node_Desc_rsp to determine the Trust Center stack revision.
     AwaitNodeDesc,
     /// Send the APS Request-Key for a unique Trust Center link key.
     SendRequestKey,
+    /// Pace a Request-Key retransmission after a synchronous send failure.
+    RetryRequestKey,
     /// Await installation of the unique Trust Center link key.
     AwaitTclk,
     /// Send the APS Verify-Key proving possession of the unique key.
     SendVerifyKey,
+    /// Pace Verify-Key after a send failure or rejected Confirm-Key.
+    RetryVerifyKey,
     /// Await a successful Confirm-Key from the Trust Center.
     AwaitConfirmKey,
-    /// Drain the rest of a failed attempt's window before retrying.
-    AttemptCooldown,
     /// Terminal: exchange completed (pre-R21 or confirmed unique key).
     Complete,
-    /// Terminal: exchange failed after exhausting the attempt budget.
+    /// Terminal: exchange failed (deadline or an exhausted message budget).
     Failed,
+}
+
+impl TclkStage {
+    /// Timing window that applies while this stage is current.
+    pub(crate) const fn window_us(self) -> u32 {
+        match self {
+            Self::StartDelay => TCLK_EXCHANGE_START_DELAY_US,
+            Self::RetryNodeDesc | Self::RetryRequestKey | Self::RetryVerifyKey => {
+                TCLK_RETRY_BACKOFF_US
+            }
+            Self::SendNodeDesc | Self::AwaitNodeDesc => TCLK_NODE_DESC_TIMEOUT_US,
+            Self::SendRequestKey | Self::AwaitTclk => TCLK_REQUEST_KEY_TIMEOUT_US,
+            Self::SendVerifyKey | Self::AwaitConfirmKey => TCLK_VERIFY_KEY_TIMEOUT_US,
+            Self::Complete | Self::Failed => TCLK_EXCHANGE_DEADLINE_US,
+        }
+    }
+
+    /// Whether this stage is terminal.
+    pub(crate) const fn is_terminal(self) -> bool {
+        matches!(self, Self::Complete | Self::Failed)
+    }
 }
 
 /// Result of advancing the exchange by one bounded step.
@@ -68,7 +161,7 @@ pub enum TclkProgress {
     InProgress,
     /// The unique-TCLK exchange finished successfully (or was not required).
     Complete,
-    /// The exchange failed; the network has been reset and left consistently.
+    /// The exchange failed; the device left the network and cleaned up.
     Failed(crate::BdbStatus),
 }
 
@@ -82,9 +175,16 @@ pub struct TclkExchange {
     pub stage: TclkStage,
     pub(crate) tc_addr: ShortAddress,
     pub(crate) tc_ieee: IeeeAddress,
-    pub(crate) attempts_remaining: u8,
+    /// Node_Desc_req transmissions left.
+    pub(crate) node_desc_budget: u8,
+    /// APS Request-Key transmissions left.
+    pub(crate) request_key_budget: u8,
+    /// APS Verify-Key transmissions left.
+    pub(crate) verify_key_budget: u8,
+    /// Monotonic time at which the exchange was armed (overall deadline base).
     pub(crate) armed_at_us: u32,
-    pub(crate) attempt_started_us: u32,
+    /// Monotonic time at which the current stage's window started.
+    pub(crate) stage_started_us: u32,
     pub(crate) node_desc_slot: Option<usize>,
     pub(crate) confirm_success_baseline: u32,
     pub(crate) confirm_reject_baseline: u32,
@@ -99,9 +199,11 @@ impl TclkExchange {
             stage: TclkStage::StartDelay,
             tc_addr,
             tc_ieee,
-            attempts_remaining: TCLK_EXCHANGE_ATTEMPTS,
+            node_desc_budget: TCLK_MESSAGE_ATTEMPTS,
+            request_key_budget: TCLK_MESSAGE_ATTEMPTS,
+            verify_key_budget: TCLK_MESSAGE_ATTEMPTS,
             armed_at_us: now,
-            attempt_started_us: now,
+            stage_started_us: now,
             node_desc_slot: None,
             confirm_success_baseline: 0,
             confirm_reject_baseline: 0,
@@ -113,31 +215,68 @@ impl TclkExchange {
         now.wrapping_sub(self.armed_at_us) >= TCLK_EXCHANGE_START_DELAY_US
     }
 
-    /// Whether the current protocol stage has exhausted its 5 s window.
-    pub(crate) fn attempt_timed_out(&self, now: u32) -> bool {
-        now.wrapping_sub(self.attempt_started_us) >= TCLK_EXCHANGE_TIMEOUT_US
+    /// Whether the overall handshake deadline has expired (wrapping-safe).
+    pub(crate) fn deadline_expired(&self, now: u32) -> bool {
+        now.wrapping_sub(self.armed_at_us) >= TCLK_EXCHANGE_DEADLINE_US
     }
 
-    /// Start a fresh response window within the current exchange attempt.
-    pub(crate) fn restart_stage_timeout(&mut self, now: u32) {
-        self.attempt_started_us = now;
+    /// Whether the current stage has exhausted its timing window
+    /// (wrapping-safe).
+    pub(crate) fn stage_timed_out(&self, now: u32) -> bool {
+        now.wrapping_sub(self.stage_started_us) >= self.stage.window_us()
     }
 
-    /// Begin a (re)attempt: reset the per-attempt clock and slot, and move to
-    /// the initial `SendNodeDesc` stage.
-    pub(crate) fn begin_attempt(&mut self, now: u32) {
-        self.stage = TclkStage::SendNodeDesc;
-        self.attempt_started_us = now;
-        self.node_desc_slot = None;
+    /// Enter `stage` and start its response window at `now`.
+    pub(crate) fn enter(&mut self, stage: TclkStage, now: u32) {
+        self.stage = stage;
+        self.stage_started_us = now;
     }
 
-    /// Record a failed attempt.
+    /// Consume one Node_Desc_req transmission. `false` when exhausted.
+    pub(crate) fn take_node_desc_attempt(&mut self) -> bool {
+        Self::take(&mut self.node_desc_budget)
+    }
+
+    /// Whether another Node_Desc_req transmission is still allowed.
+    pub(crate) fn has_node_desc_attempt(&self) -> bool {
+        self.node_desc_budget > 0
+    }
+
+    /// Consume one APS Request-Key transmission. `false` when exhausted.
+    pub(crate) fn take_request_key_attempt(&mut self) -> bool {
+        Self::take(&mut self.request_key_budget)
+    }
+
+    /// Consume one APS Verify-Key transmission. `false` when exhausted.
+    pub(crate) fn take_verify_key_attempt(&mut self) -> bool {
+        Self::take(&mut self.verify_key_budget)
+    }
+
+    /// Whether another Verify-Key transmission is still allowed.
+    pub(crate) fn has_verify_key_attempt(&self) -> bool {
+        self.verify_key_budget > 0
+    }
+
+    /// Whether another Request-Key transmission is still allowed.
+    pub(crate) fn has_request_key_attempt(&self) -> bool {
+        self.request_key_budget > 0
+    }
+
+    /// Restore the Verify-Key budget when a *new* key establishment starts.
     ///
-    /// Returns `true` when the attempt budget is exhausted and the exchange
-    /// must fail; `false` when at least one attempt remains.
-    pub(crate) fn record_attempt_failure(&mut self) -> bool {
-        self.attempts_remaining = self.attempts_remaining.saturating_sub(1);
-        self.attempts_remaining == 0
+    /// GSDK applies `maxAttempts` per message type and resets it when the next
+    /// message type begins, so a fresh Request-Key gets a fresh Verify-Key
+    /// budget for the replacement key.
+    pub(crate) fn reset_verify_key_budget(&mut self) {
+        self.verify_key_budget = TCLK_MESSAGE_ATTEMPTS;
+    }
+
+    fn take(budget: &mut u8) -> bool {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        true
     }
 }
 
@@ -153,10 +292,12 @@ mod tests {
     }
 
     #[test]
-    fn new_arms_in_start_delay_with_full_budget() {
+    fn new_arms_in_start_delay_with_a_full_budget_per_message_type() {
         let ex = armed(1_000);
         assert_eq!(ex.stage, TclkStage::StartDelay);
-        assert_eq!(ex.attempts_remaining, TCLK_EXCHANGE_ATTEMPTS);
+        assert_eq!(ex.node_desc_budget, TCLK_MESSAGE_ATTEMPTS);
+        assert_eq!(ex.request_key_budget, TCLK_MESSAGE_ATTEMPTS);
+        assert_eq!(ex.verify_key_budget, TCLK_MESSAGE_ATTEMPTS);
         assert_eq!(ex.node_desc_slot, None);
     }
 
@@ -169,48 +310,78 @@ mod tests {
     }
 
     #[test]
-    fn begin_attempt_moves_to_send_and_resets_attempt_clock() {
+    fn each_stage_enforces_its_own_response_window() {
         let mut ex = armed(0);
-        ex.node_desc_slot = Some(3);
-        ex.begin_attempt(10_000);
-        assert_eq!(ex.stage, TclkStage::SendNodeDesc);
-        assert_eq!(ex.attempt_started_us, 10_000);
-        assert_eq!(ex.node_desc_slot, None);
-        assert!(!ex.attempt_timed_out(10_000));
-        assert!(ex.attempt_timed_out(10_000 + TCLK_EXCHANGE_TIMEOUT_US));
+        ex.enter(TclkStage::AwaitNodeDesc, 10_000);
+        assert!(!ex.stage_timed_out(10_000 + TCLK_NODE_DESC_TIMEOUT_US - 1));
+        assert!(ex.stage_timed_out(10_000 + TCLK_NODE_DESC_TIMEOUT_US));
+
+        ex.enter(TclkStage::AwaitTclk, 10_000);
+        assert!(!ex.stage_timed_out(10_000 + TCLK_NODE_DESC_TIMEOUT_US));
+        assert!(ex.stage_timed_out(10_000 + TCLK_REQUEST_KEY_TIMEOUT_US));
+
+        ex.enter(TclkStage::AwaitConfirmKey, 10_000);
+        assert!(!ex.stage_timed_out(10_000 + TCLK_REQUEST_KEY_TIMEOUT_US));
+        assert!(ex.stage_timed_out(10_000 + TCLK_VERIFY_KEY_TIMEOUT_US));
     }
 
     #[test]
-    fn attempt_timeout_uses_wrapping_arithmetic() {
+    fn stage_and_deadline_timeouts_use_wrapping_arithmetic() {
         // Arm near the u32 wraparound boundary.
         let start = u32::MAX - 100;
         let mut ex = armed(start);
-        ex.begin_attempt(start);
-        let after_wrap = start.wrapping_add(TCLK_EXCHANGE_TIMEOUT_US);
-        assert!(ex.attempt_timed_out(after_wrap));
-        assert!(!ex.attempt_timed_out(start.wrapping_add(TCLK_EXCHANGE_TIMEOUT_US - 1)));
+        ex.enter(TclkStage::AwaitConfirmKey, start);
+        assert!(!ex.stage_timed_out(start.wrapping_add(TCLK_VERIFY_KEY_TIMEOUT_US - 1)));
+        assert!(ex.stage_timed_out(start.wrapping_add(TCLK_VERIFY_KEY_TIMEOUT_US)));
+        assert!(!ex.deadline_expired(start.wrapping_add(TCLK_EXCHANGE_DEADLINE_US - 1)));
+        assert!(ex.deadline_expired(start.wrapping_add(TCLK_EXCHANGE_DEADLINE_US)));
     }
 
     #[test]
-    fn response_window_can_restart_within_an_attempt() {
+    fn retry_backoff_is_short_bounded_and_wrapping_safe() {
         let mut ex = armed(0);
-        ex.begin_attempt(1_000);
-        ex.restart_stage_timeout(2_000);
-        assert!(!ex.attempt_timed_out(2_000 + TCLK_EXCHANGE_TIMEOUT_US - 1));
-        assert!(ex.attempt_timed_out(2_000 + TCLK_EXCHANGE_TIMEOUT_US));
+        let start = u32::MAX - 100;
+        ex.enter(TclkStage::RetryVerifyKey, start);
+        assert!(!ex.stage_timed_out(start.wrapping_add(TCLK_RETRY_BACKOFF_US - 1)));
+        assert!(ex.stage_timed_out(start.wrapping_add(TCLK_RETRY_BACKOFF_US)));
+        const { assert!(TCLK_RETRY_BACKOFF_US < TCLK_VERIFY_KEY_TIMEOUT_US) };
     }
 
     #[test]
-    fn attempt_budget_exhausts_after_configured_attempts() {
+    fn message_budgets_are_independent_and_saturate() {
         let mut ex = armed(0);
-        // Three failures still leave a final attempt.
-        for _ in 0..(TCLK_EXCHANGE_ATTEMPTS - 1) {
-            assert!(!ex.record_attempt_failure());
+        for _ in 0..TCLK_MESSAGE_ATTEMPTS {
+            assert!(ex.take_verify_key_attempt());
         }
-        // The last failure exhausts the budget.
-        assert!(ex.record_attempt_failure());
-        // Further failures stay exhausted without underflow.
-        assert!(ex.record_attempt_failure());
-        assert_eq!(ex.attempts_remaining, 0);
+        assert!(!ex.take_verify_key_attempt());
+        assert_eq!(ex.verify_key_budget, 0);
+
+        // Retrying Verify-Key must not have consumed the other budgets.
+        assert_eq!(ex.node_desc_budget, TCLK_MESSAGE_ATTEMPTS);
+        assert!(ex.has_request_key_attempt());
+        assert!(ex.take_request_key_attempt());
+        assert_eq!(ex.request_key_budget, TCLK_MESSAGE_ATTEMPTS - 1);
+
+        // A fresh key establishment restores the Verify-Key budget only.
+        ex.reset_verify_key_budget();
+        assert_eq!(ex.verify_key_budget, TCLK_MESSAGE_ATTEMPTS);
+        assert_eq!(ex.request_key_budget, TCLK_MESSAGE_ATTEMPTS - 1);
+    }
+
+    #[test]
+    fn one_full_pass_of_every_stage_fits_inside_the_overall_deadline() {
+        // A Trust Center that answers at the edge of every window must still
+        // be able to finish the first authentication pass, even if every
+        // message type needs both permitted inter-attempt backoffs first.
+        const { assert!(TCLK_FIRST_PASS_BUDGET_US < TCLK_EXCHANGE_DEADLINE_US) };
+        const {
+            assert!(
+                TCLK_FIRST_PASS_BUDGET_US + TCLK_MAX_RETRY_BACKOFF_BUDGET_US
+                    < TCLK_EXCHANGE_DEADLINE_US
+            )
+        };
+        assert_eq!(TCLK_FIRST_PASS_BUDGET_US, 9_800_000);
+        assert_eq!(TCLK_MAX_RETRY_BACKOFF_BUDGET_US, 1_500_000);
+        assert_eq!(TCLK_EXCHANGE_DEADLINE_US, 15_000_000);
     }
 }

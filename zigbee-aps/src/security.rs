@@ -277,6 +277,12 @@ impl ApsSecurity {
         }
     }
 
+    /// Remove all negotiated link keys while retaining the configured default
+    /// Trust Center key.
+    pub fn clear_keys(&mut self) {
+        self.key_table.clear();
+    }
+
     /// Find a link key for a partner device.
     pub fn find_key(
         &self,
