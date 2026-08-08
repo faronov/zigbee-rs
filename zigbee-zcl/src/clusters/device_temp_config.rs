@@ -1,4 +1,10 @@
 //! Device Temperature Configuration cluster (0x0002).
+//!
+//! The ZCL specification defines `CurrentTemperature` (0x0000) in whole
+//! degrees Celsius. ZHA exposes this cluster as a diagnostic temperature
+//! entity with a divisor of 100, so this implementation intentionally stores
+//! current/min/max values and thresholds in centi-degrees for ZHA
+//! interoperability (2500 = 25.00 °C).
 
 use crate::attribute::{AttributeAccess, AttributeDefinition, AttributeStore};
 use crate::clusters::{AttributeStoreAccess, AttributeStoreMutAccess, Cluster};
@@ -14,6 +20,7 @@ pub const ATTR_LOW_TEMP_THRESHOLD: AttributeId = AttributeId(0x0011);
 pub const ATTR_HIGH_TEMP_THRESHOLD: AttributeId = AttributeId(0x0012);
 pub const ATTR_LOW_TEMP_DWELL_TRIP_POINT: AttributeId = AttributeId(0x0013);
 pub const ATTR_HIGH_TEMP_DWELL_TRIP_POINT: AttributeId = AttributeId(0x0014);
+pub const TEMPERATURE_UNAVAILABLE: i16 = i16::MIN;
 
 /// Device Temperature Configuration cluster.
 pub struct DeviceTempConfigCluster {
@@ -36,7 +43,7 @@ impl DeviceTempConfigCluster {
                 access: AttributeAccess::ReadOnly,
                 name: "CurrentTemperature",
             },
-            ZclValue::I16(0),
+            ZclValue::I16(TEMPERATURE_UNAVAILABLE),
         );
         let _ = store.register(
             AttributeDefinition {
@@ -45,7 +52,7 @@ impl DeviceTempConfigCluster {
                 access: AttributeAccess::ReadOnly,
                 name: "MinTempExperienced",
             },
-            ZclValue::I16(0),
+            ZclValue::I16(TEMPERATURE_UNAVAILABLE),
         );
         let _ = store.register(
             AttributeDefinition {
@@ -54,7 +61,7 @@ impl DeviceTempConfigCluster {
                 access: AttributeAccess::ReadOnly,
                 name: "MaxTempExperienced",
             },
-            ZclValue::I16(0),
+            ZclValue::I16(TEMPERATURE_UNAVAILABLE),
         );
         let _ = store.register(
             AttributeDefinition {
@@ -81,7 +88,7 @@ impl DeviceTempConfigCluster {
                 access: AttributeAccess::ReadWrite,
                 name: "LowTempThreshold",
             },
-            ZclValue::I16(-40),
+            ZclValue::I16(-4000),
         );
         let _ = store.register(
             AttributeDefinition {
@@ -90,7 +97,7 @@ impl DeviceTempConfigCluster {
                 access: AttributeAccess::ReadWrite,
                 name: "HighTempThreshold",
             },
-            ZclValue::I16(85),
+            ZclValue::I16(8500),
         );
         let _ = store.register(
             AttributeDefinition {
@@ -113,11 +120,48 @@ impl DeviceTempConfigCluster {
         Self { store }
     }
 
-    /// Update the device temperature (in degrees Celsius).
-    pub fn set_temperature(&mut self, temp_c: i16) {
+    /// Update the current device temperature in **centi-degrees Celsius**
+    /// (e.g., pass 2500 for 25.00 °C).  Also updates `MinTempExperienced`
+    /// and `MaxTempExperienced` when the new value extends the observed range.
+    pub fn set_temperature(&mut self, temp_centi_c: i16) {
+        let initialized = !matches!(
+            self.store.get(ATTR_CURRENT_TEMPERATURE),
+            Some(ZclValue::I16(TEMPERATURE_UNAVAILABLE))
+        );
+
         let _ = self
             .store
-            .set_raw(ATTR_CURRENT_TEMPERATURE, ZclValue::I16(temp_c));
+            .set_raw(ATTR_CURRENT_TEMPERATURE, ZclValue::I16(temp_centi_c));
+
+        if !initialized {
+            let _ = self
+                .store
+                .set_raw(ATTR_MIN_TEMP_EXPERIENCED, ZclValue::I16(temp_centi_c));
+            let _ = self
+                .store
+                .set_raw(ATTR_MAX_TEMP_EXPERIENCED, ZclValue::I16(temp_centi_c));
+            return;
+        }
+
+        let current_min = match self.store.get(ATTR_MIN_TEMP_EXPERIENCED) {
+            Some(ZclValue::I16(v)) => *v,
+            _ => i16::MAX,
+        };
+        if temp_centi_c < current_min {
+            let _ = self
+                .store
+                .set_raw(ATTR_MIN_TEMP_EXPERIENCED, ZclValue::I16(temp_centi_c));
+        }
+
+        let current_max = match self.store.get(ATTR_MAX_TEMP_EXPERIENCED) {
+            Some(ZclValue::I16(v)) => *v,
+            _ => i16::MIN,
+        };
+        if temp_centi_c > current_max {
+            let _ = self
+                .store
+                .set_raw(ATTR_MAX_TEMP_EXPERIENCED, ZclValue::I16(temp_centi_c));
+        }
     }
 }
 

@@ -1193,10 +1193,35 @@ mod config_clusters {
         let mut c = DeviceTempConfigCluster::new();
         assert_eq!(c.cluster_id(), ClusterId::DEVICE_TEMP_CONFIG);
 
-        c.set_temperature(42);
-        if let Some(ZclValue::I16(v)) = c.attributes().get(ATTR_CURRENT_TEMPERATURE.into()) {
-            assert_eq!(*v, 42);
-        }
+        assert_eq!(
+            c.attributes().get(ATTR_CURRENT_TEMPERATURE.into()),
+            Some(&ZclValue::I16(TEMPERATURE_UNAVAILABLE))
+        );
+
+        c.set_temperature(4_200);
+        assert_eq!(
+            c.attributes().get(ATTR_CURRENT_TEMPERATURE.into()),
+            Some(&ZclValue::I16(4_200))
+        );
+        assert_eq!(
+            c.attributes().get(ATTR_MIN_TEMP_EXPERIENCED.into()),
+            Some(&ZclValue::I16(4_200))
+        );
+        assert_eq!(
+            c.attributes().get(ATTR_MAX_TEMP_EXPERIENCED.into()),
+            Some(&ZclValue::I16(4_200))
+        );
+
+        c.set_temperature(3_800);
+        c.set_temperature(4_600);
+        assert_eq!(
+            c.attributes().get(ATTR_MIN_TEMP_EXPERIENCED.into()),
+            Some(&ZclValue::I16(3_800))
+        );
+        assert_eq!(
+            c.attributes().get(ATTR_MAX_TEMP_EXPERIENCED.into()),
+            Some(&ZclValue::I16(4_600))
+        );
 
         assert_eq!(
             c.handle_command(CommandId(0x00), &[]),
