@@ -315,6 +315,18 @@ Request-Key ciphertext and MIC exactly matched an independent software CCM*
 calculation. Repeating commissioning with a credential-free journal record
 that retained the previous 173,056 counter bound completed immediately.
 
+A later GSDK-style TCLK regression used the same TB-04 against ZHA. A fresh
+join reached network-up in 689 ms and completed the unique-TCLK exchange in
+4.247 seconds with one Node Descriptor, Request-Key, Verify-Key, and
+Confirm-Key pass and no rejection. ZHA then removed the router with
+`Remove Children` set; the device cleared its persisted credentials while
+retaining both counter floors, left normally, and immediately recommissioned
+from short address `0x7AF5` to `0x6131`. The second TCLK exchange completed in
+2.693 seconds, again on the first pass, and its Verify-Key counter advanced
+from 225,291 to 227,339. This run used ZHA state plus on-device RAM metrics,
+not an independent packet capture, so it is regression evidence rather than
+a substitute for the ZiGate capture gate below.
+
 ### Safe recommissioning procedure
 
 1. Back up the two-sector security journal before changing network state.
@@ -330,6 +342,46 @@ that retained the previous 173,056 counter bound completed immediately.
    sniffer.
 5. If a startup KAT fails, do not commission the device; diagnose the
    accelerator path or re-flash a previously known-good hardware-AES release.
+
+### ZiGate TCLK interoperability gate
+
+A router that appears online only while ZiGate permit-join is open is not
+gating ordinary traffic on the permit bit. The observed failure path is a
+post-join Trust Center link-key exchange failure: after the bounded TCLK
+attempts are exhausted, `reset_after_tclk_failure()` performs
+`nlme_reset(false)`, the runtime reports failed commissioning, and the
+application starts full network steering again. That new association succeeds
+only while permit-join remains open.
+
+The regression boundary changed the local Node Descriptor server mask from
+stack-compliance revision 0 to revision 22. ZiGate's build requires TCLK
+exchange for R21+ nodes and gives a newly joined node 15 seconds to complete
+authentication. The zigbee-rs exchange now starts after 300 ms and keeps
+independent three-transmission budgets for Node Descriptor, Request-Key, and
+Verify-Key. Their response windows are 1.5, 3, and 5 seconds respectively,
+with 250 ms paced retransmissions and one strict 15-second overall deadline.
+The first pass completes within 9.8 seconds; retries stay on the current
+message type, and a lost Confirm-Key retransmits Verify-Key without discarding
+the installed unique TCLK.
+
+ZiGate `v3.1d` also had a Trust Center callback bug:
+`APP_bSendHATransportKey` used
+`bSetTclkFlashFeature || u8Status == 1`. Version `v3.1e` changed this to `&&`
+and lists `Fix HATransportKey function (Device Authentification)`; current
+`v3.23` retains the fix. Check the radio version with ZiGate command `0x0010`
+and response `0x8010` before debugging the device.
+
+The exact failing stage and the key used by ZiGate's closed ZPS library for
+Confirm-Key are not established by its public source. Do not add a
+`ZigBeeAlliance09` fallback for Confirm-Key: that public key cannot prove
+possession of the negotiated pairwise TCLK. Diagnose with an independent
+capture plus `SteeringDiagnostics`:
+
+- Request-Key sent late or a coordinator Leave near 15 seconds indicates the
+  coordinator authentication timeout;
+- Verify-Key sent but no decryptable Confirm-Key requires an on-air key check;
+- a decrypted Confirm-Key with `confirm_key_rejections > 0` identifies a
+  field/source validation mismatch rather than a MIC/key-selection failure.
 
 ## Current capability boundary
 

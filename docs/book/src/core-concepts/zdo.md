@@ -113,7 +113,7 @@ additional mandatory fields even on failure.
 
 ## Stack Compliance Revision
 
-Node Descriptor server-mask bits 9..=14 carry the Stack Compliance Revision.
+Node Descriptor server-mask bits 9..=15 carry the Stack Compliance Revision.
 This stack advertises **revision 22** (Zigbee Core R22) via
 `zigbee_zdo::descriptors::STACK_COMPLIANCE_REVISION`; a device that leaves the
 field at 0 is treated as pre-R21 by certified coordinators. `zigbee-runtime`
@@ -494,6 +494,12 @@ let req = MgmtLeaveReq {
 
 let rsp = zdo.mgmt_leave_req(ShortAddress(0x1A2B), &req).await?;
 ```
+
+For an incoming self-targeted request, `remove_children` does not make the
+leave unsupported. The device sends `Mgmt_Leave_rsp` first, then performs the
+secured NWK leave. A non-rejoin leave clears network, binding, group, and
+negotiated APS-key state while preserving the persistent frame-counter floors;
+`rejoin: true` retains the credentials required for secure rejoin.
 
 ### Mgmt_Permit_Joining_req — Open/Close the Network
 

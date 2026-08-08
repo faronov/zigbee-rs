@@ -111,6 +111,16 @@ pub enum TickResult {
 - **`RunAgain(ms)`** — The stack has pending work and needs `tick()` called
   again within `ms` milliseconds.  Schedule accordingly.
 
+While the post-network unique Trust Center link-key handshake is running, every
+tick advances it by exactly one bounded step (even when the same tick also
+returns an application event, which is never dropped), and any non-event result
+is shortened to `RunAgain(50)` so retransmissions and the handshake's 15 s
+deadline are honoured. Send failures and rejected Confirm-Key responses remain
+in a dedicated 250 ms backoff state during those 50 ms service ticks; they do
+not consume another per-message attempt on every tick. A terminal transition is
+reported immediately as `CommissioningComplete { success }`. See
+[BDB — unique Trust Center link-key exchange](bdb.md#network-steering).
+
 ## `StackEvent` — What the Stack Tells You
 
 `StackEvent` is the primary way the stack communicates with your application.

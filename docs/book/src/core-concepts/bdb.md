@@ -186,20 +186,74 @@ depends on whether the device is already on a network.
 When `node_is_on_a_network` is `false`, steering performs a full join sequence:
 
 ```text
+Pre-network (awaited inside `network_steering`)
 1. Scan primary channels (11, 15, 20, 25) for open networks
    └── NLME-NETWORK-DISCOVERY
 2. Filter by extended PAN ID (if configured)
 3. Join the best-LQI network with permit-joining enabled
    └── NLME-JOIN
-4. Broadcast Device_annce
-5. Wait for Transport-Key from Trust Center
+4. Wait for Transport-Key from Trust Center (5 s)
    └── Poll parent via MAC Data Request
-6. Send APSME-REQUEST-KEY for unique TC link key
-7. Re-broadcast Device_annce (now secured)
+5. Reserve network security counters, broadcast Device_annce
+   └── returns: the network is up
+
+Post-network (one bounded step per tick — `advance_tclk_exchange`)
+6. Node_Desc_req to the Trust Center → stack compliance revision
+   └── pre-R21 Trust Center: no unique key is required, done
+7. APSME-REQUEST-KEY → Transport-Key installs the unique TC link key
+8. APS Verify-Key → Confirm-Key proves possession
+9. Re-broadcast Device_annce (now authenticated)
 ```
 
 If primary channels yield no results, secondary channels (all other 2.4 GHz
 channels) are scanned.
+
+#### Unique Trust Center link-key exchange (steps 6–8)
+
+Steps 6–8 mirror the Silicon Labs GSDK `update-tc-link-key` plugin, which the
+stack advances through scheduled events *after* the network is up. Retries are
+budgeted **per message type** (GSDK `emberUpdateTcLinkKey(maxAttempts)`), not
+per whole procedure:
+
+| Message           | Transmissions | Response window |
+| ----------------- | ------------- | --------------- |
+| Node_Desc_req     | 3             | 1.5 s           |
+| APS Request-Key   | 3             | 3 s             |
+| APS Verify-Key    | 3             | 5 s             |
+
+The first probe starts 300 ms after `Device_annce`, and the whole handshake has
+a wrapping-safe 15 s deadline. One full pass through every stage takes at most
+9.8 s, so a slow-but-answering Trust Center is never cut off. Both an expired
+deadline and an exhausted message budget fail the exchange strictly — there is
+no deferred or permissive "success".
+
+Synchronous transmit failures and rejected Confirm-Key responses use a
+dedicated **250 ms retry backoff**. This mirrors GSDK's scheduled-event pacing:
+it prevents the 50 ms runtime tick from spending all three transmissions in
+about 200 ms, but does not restore the old 5 s whole-procedure cooldown. Even
+all two inter-attempt backoffs for all three message types plus one full
+response window per stage total 11.3 s, inside the strict 15 s deadline.
+
+Because the budgets are independent:
+
+* a lost `Node_Desc_rsp` retransmits only `Node_Desc_req`;
+* a missing Transport-Key retransmits only Request-Key;
+* a lost Confirm-Key retransmits **Verify-Key**, keeping the unique key the
+  Trust Center already installed.
+
+A unique key that the Trust Center pushed unsolicited is never erased: the
+exchange reserves it and goes straight to Verify-Key. An unconfirmed unique key
+is dropped only when a replacement Request-Key is issued.
+
+`Confirm-Key` is accepted only when it is APS-secured with the *unique* link
+key. One secured with the global `ZigBeeAlliance09` key proves nothing and is
+always rejected.
+
+When the exchange fails during **initial** steering the device sends a secured
+NWK Leave (falling back to a local `NLME-RESET` if the Leave cannot be sent),
+clears the Trust Center key and reports
+`CommissioningComplete { success: false }` — a failed R21+ initial join never
+stays commissioned.
 
 ```rust
 // Configure and run steering
