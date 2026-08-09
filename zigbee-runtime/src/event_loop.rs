@@ -354,10 +354,21 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
     pub(crate) async fn run_aps_maintenance(&mut self) {
         let aps = self.bdb.zdo_mut().aps_mut();
         let retransmit_frames = aps.age_ack_table();
-        for frame in retransmit_frames.iter() {
+        let radius = aps.nwk().nib().max_depth.saturating_mul(2);
+        for retransmission in retransmit_frames.iter() {
+            // An APS retry repeats the *original unicast* (R22 §2.2.5.2.2).
+            // Broadcasting it instead would flood the network with a frame
+            // only one device expects, and the acknowledgement being waited
+            // for would still never arrive.
             let _ = aps
                 .nwk_mut()
-                .nlde_data_request(zigbee_types::ShortAddress(0xFFFF), 0, frame, true, false)
+                .nlde_data_request(
+                    retransmission.dst_addr,
+                    radius,
+                    &retransmission.frame,
+                    true,
+                    true,
+                )
                 .await;
         }
         aps.age_dup_table();
@@ -911,6 +922,64 @@ mod commissioning_tick_tests {
             Some(TclkStage::StartDelay)
         );
         device
+    }
+
+    /// R22 §2.2.5.2.2: an APS retransmission repeats the original *unicast*.
+    /// It used to be re-sent to `0xFFFF` with radius 0, which flooded the
+    /// network with a frame only one device was expecting while the
+    /// acknowledgement being waited for still never arrived.
+    ///
+    /// It is also paced by `apscAckWaitDuration` rather than by how often
+    /// maintenance happens to run: nothing goes out inside the wait window.
+    #[test]
+    fn an_unacknowledged_aps_unicast_is_retransmitted_to_its_own_destination() {
+        let mut device = commissioning_device();
+        const PEER: u16 = 0x4763;
+
+        device
+            .bdb_mut()
+            .zdo_mut()
+            .aps_mut()
+            .register_ack_pending(
+                0x31,
+                PEER,
+                &[0x40, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x31],
+            )
+            .expect("a free ACK slot");
+        device
+            .bdb_mut()
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut()
+            .clear_tx_history();
+
+        // Maintenance inside the acknowledgement window transmits nothing, no
+        // matter how often the application runs it.
+        for _ in 0..10 {
+            block_on(device.run_aps_maintenance());
+        }
+        assert!(
+            device.bdb().zdo().aps().nwk().mac().tx_history().is_empty(),
+            "no retry may be sent before apscAckWaitDuration has elapsed"
+        );
+
+        advance_time(&mut device, zigbee_aps::APS_ACK_WAIT_DURATION_US);
+        block_on(device.run_aps_maintenance());
+
+        let history = device.bdb().zdo().aps().nwk().mac().tx_history();
+        assert_eq!(history.len(), 1, "exactly one retransmission");
+        let (_nwk, _len) = zigbee_nwk::frames::NwkHeader::parse(history[0].payload.as_slice())
+            .expect("a parsable NWK frame");
+        assert_eq!(
+            _nwk.dst_addr,
+            ShortAddress(PEER),
+            "the retry keeps the original unicast destination, never 0xFFFF"
+        );
+        assert!(
+            _nwk.radius > 0,
+            "a retransmission must carry a usable radius"
+        );
     }
 
     #[test]

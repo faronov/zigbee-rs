@@ -225,7 +225,8 @@ The first probe starts 300 ms after `Device_annce`, and the whole handshake has
 a wrapping-safe 15 s deadline. One full pass through every stage takes at most
 9.8 s, so a slow-but-answering Trust Center is never cut off. Both an expired
 deadline and an exhausted message budget fail the exchange strictly — there is
-no deferred or permissive "success".
+no deferred or permissive "success", except the narrowly gated ACK-gated
+deferred retry described below.
 
 Synchronous transmit failures and rejected Confirm-Key responses use a
 dedicated **250 ms retry backoff**. This mirrors GSDK's scheduled-event pacing:
@@ -245,15 +246,69 @@ A unique key that the Trust Center pushed unsolicited is never erased: the
 exchange reserves it and goes straight to Verify-Key. An unconfirmed unique key
 is dropped only when a replacement Request-Key is issued.
 
-`Confirm-Key` is accepted only when it is APS-secured with the *unique* link
-key. One secured with the global `ZigBeeAlliance09` key proves nothing and is
-always rejected.
+`Confirm-Key` is a Trust Center *verdict*, and this state machine treats it as
+a security predicate: an authenticated rejection is a hard failure that leaves
+the network. So a `Confirm-Key` only reaches the exchange counters
+(`confirm_key_received` / `_successes` / `_rejections`) when it authenticates:
+APS-secured with a data key identifier under the *unique* Trust Center link
+key, NWK-secured, from the centralized Trust Center at `0x0000` with the
+configured Trust Center IEEE address as its APS security source, naming the
+Trust Center link-key type, and addressed to this device's own IEEE address.
+
+Anything else — unsecured, malformed, addressed elsewhere, or secured with the
+globally known `ZigBeeAlliance09` key — is counted only in
+`ApsSecurityHandshakeStats::confirm_key_ignored` and has no effect on
+commissioning. Without that split, a single forged unicast that requires no key
+material at all could both close the acknowledgement-gated path below and drive
+a commissioning device straight into its hard failure, i.e. kick it off the
+network on demand.
 
 When the exchange fails during **initial** steering the device sends a secured
 NWK Leave (falling back to a local `NLME-RESET` if the Leave cannot be sent),
 clears the Trust Center key and reports
 `CommissioningComplete { success: false }` — a failed R21+ initial join never
 stays commissioned.
+
+#### ACK-gated deferred retry
+
+One Trust Center behaviour does not fit "fail strictly": a coordinator that
+*acknowledges* our `Verify-Key` and then never sends `Confirm-Key` at all. A
+2026-08-09 capture proves ZiGate `v3.23` does exactly that — it transports a
+unique TCLK, returns a secured command-format APS acknowledgement for the
+`Verify-Key` within 13–63 ms, and emits no `Confirm-Key` (`0x10`) ever. The
+strict deadline then answered with our own broadcast NWK Leave at ~15 s,
+producing an endless join/leave/rejoin cycle.
+
+Because that acknowledgement is APS-secured, it is decrypted and MIC-verified
+under the *unique* link key: it is cryptographic proof that the Trust Center
+holds that key and received that exact `Verify-Key`. The stack records it as
+`ApsSecurityHandshakeStats::verify_key_acks` and uses it — narrowly. Every one
+of these must hold:
+
+* a **unique** (non-`ZigBeeAlliance09`) Trust Center link key is installed;
+* the `Verify-Key` was encrypted with that unique key;
+* the acknowledgement was APS-secured, used a data key, came from the
+  configured Trust Center, echoed that `Verify-Key`'s APS counter, and
+  authenticated under that same unique key; and
+* **no** `Confirm-Key` at all was received during this exchange (an
+  unauthenticated one does not count — it never moves `confirm_key_received`).
+
+Only then does the exchange refuse to leave. It keeps the joined network and
+runs bounded deferred rounds — `TCLK_DEFERRED_ROUNDS` (2) rounds spaced
+`TCLK_DEFERRED_RETRY_INTERVAL_US` (10 s) apart, each re-arming the Verify-Key
+budget and the 15 s deadline. If a valid `Confirm-Key` arrives during any of
+them the normal success path runs. When the rounds are spent, commissioning
+completes on the authenticated acknowledgement alone and the commissioned
+network is committed (`SteeringDiagnostics::tclk_acknowledged_completions`).
+
+This is deliberately **not** a timeout success:
+
+* without the authenticated acknowledgement, an expired deadline or exhausted
+  budget still fails strictly and leaves the network;
+* an explicit **authenticated** `Confirm-Key` rejection hard-fails — the last
+  condition above closes this path as soon as any authenticated `Confirm-Key`
+  is seen; and
+* a persistence error at the final commit hard-fails.
 
 ```rust
 // Configure and run steering

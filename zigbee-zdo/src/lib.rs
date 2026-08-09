@@ -468,6 +468,13 @@ impl<M: MacDriver> ZdoLayer<M> {
     // ── Internal helpers used by handler / device_announce ───
 
     /// Send a ZDP frame (unicast to `dst`).
+    ///
+    /// A unicast ZDP frame — request *and* response alike — is transmitted
+    /// with an APS acknowledgement requested (R22 §2.4.1.2): ZDP has no
+    /// application-level retry of its own, so the APS retry is what carries a
+    /// descriptor or management response through a transient route failure.
+    /// Broadcasts are never acknowledged; `send_zdp_broadcast` routes through
+    /// here with a broadcast address and must not set the bit.
     async fn send_zdp_unicast(
         &mut self,
         dst: ShortAddress,
@@ -487,6 +494,7 @@ impl<M: MacDriver> ZdoLayer<M> {
             payload,
             tx_options: ApsTxOptions {
                 use_nwk_key: true,
+                ack_request: crate::handler::is_unicast_short(dst),
                 ..ApsTxOptions::default()
             },
             radius: 0,

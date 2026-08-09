@@ -183,6 +183,13 @@ pub struct SteeringDiagnostics {
     pub confirm_key_successes: u32,
     pub confirm_key_rejections: u32,
     pub last_confirm_key_status: u8,
+    /// An APS acknowledgement of a unique-key Verify-Key authenticated during
+    /// this exchange (see
+    /// [`ApsSecurityHandshakeStats::verify_key_acks`](zigbee_aps::ApsSecurityHandshakeStats::verify_key_acks)).
+    pub verify_key_acknowledged: bool,
+    /// Exchanges completed on that authenticated acknowledgement because the
+    /// Trust Center never sent any Confirm-Key.
+    pub tclk_acknowledged_completions: u16,
 }
 
 impl SteeringDiagnostics {
@@ -336,6 +343,8 @@ impl<M: MacDriver> BdbLayer<M> {
     ) {
         let now = self.zdo.aps().nwk().mac().monotonic_micros();
         self.attributes.node_is_on_a_network = true;
-        self.tclk_exchange = Some(TclkExchange::new(tc_addr, tc_ieee, now));
+        let mut exchange = TclkExchange::new(tc_addr, tc_ieee, now);
+        exchange.baseline_handshake_counters(&self.zdo.aps().security_handshake_stats());
+        self.tclk_exchange = Some(exchange);
     }
 }

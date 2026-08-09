@@ -618,19 +618,101 @@ entries.  The timeout is controlled by `aib.aps_duplicate_rejection_timeout`
 
 When you send with `ack_request: true`, the APS layer:
 
-1. Registers the frame in the ACK table (up to 8 slots)
+1. Registers the frame in the ACK table (up to 8 slots), stamping it with the
+   monotonic time of the transmission
 2. Starts a retry counter (default: 3 retries)
-3. If no ACK arrives within one tick, retransmits the original frame
+3. Retransmits the original frame once a full `apscAckWaitDuration` has
+   elapsed without an ACK, then waits another full window before the next retry
 4. After all retries, reports `ApsStatus::NoAck`
+
+`apscAckWaitDuration` is the R22 constant `0.05 × 2 × nwkcMaxDepth` seconds; with
+this stack's `nwkcMaxDepth = 15` that is 1.5 s, exported as
+`zigbee_aps::APS_ACK_WAIT_DURATION_US`. The window is measured against the
+platform's monotonic microsecond clock, **not** against how often the
+application calls `age_ack_table()`. A device that runs maintenance every few
+milliseconds and one that runs it once a second therefore behave identically; a
+call-counted retry would put all four copies of the same unicast on the air
+within a few tens of milliseconds and then give up long before any
+acknowledgement could arrive.
 
 ```rust
 // In your periodic tick handler:
 let retransmissions = aps.age_ack_table();
-for frame_bytes in retransmissions {
-    // The APS layer has already prepared these for retransmission
-    aps.nwk_mut().nlde_data_request(/* ... */).await;
+for retransmission in retransmissions.iter() {
+    // Each entry carries the destination of the original unicast: an APS
+    // retry repeats that transmission, it never becomes a broadcast.
+    aps.nwk_mut()
+        .nlde_data_request(retransmission.dst_addr, radius, &retransmission.frame, true, false)
+        .await;
 }
 ```
+
+### Acknowledging received frames
+
+Receiving is symmetric: any unicast APS frame that arrives with the
+acknowledgement-request bit set queues a `PendingApsAck`, which the runtime
+flushes from `process_incoming` before it dispatches the frame. This covers
+**data frames and APS command frames alike**, on every path — including the
+`Tunnel` command, which returns early to forward the embedded key to a joining
+child instead of producing a data indication. There is a single pending slot,
+and `send_pending_aps_ack()` takes it, so an acknowledgement is never sent
+twice and is never left behind for an unrelated later frame to spend on the
+wrong APS counter.
+
+The two use different acknowledgement formats (R22 §2.2.5.1.1.5):
+
+| Acknowledged frame | `ack_format` | ACK contents                                        |
+| ------------------ | ------------ | --------------------------------------------------- |
+| Data               | `0`          | frame control, endpoints, cluster, profile, counter |
+| Command            | `1`          | frame control and APS counter only                  |
+
+The command acknowledgement this stack *generates* is exactly two octets on
+the wire. It is network-secured but never APS-secured, and it is only produced
+once a network key is active — the Transport-Key that delivers that first key
+cannot be acknowledged, and no stale acknowledgement is left queued for a later
+frame.
+
+Acknowledging is a *reception* acknowledgement, not acceptance:
+
+- a duplicate is discarded **after** its acknowledgement is regenerated
+  (R22 §2.2.4.1.3) — a duplicate only exists because the sender missed the
+  first ACK, so answering with silence guarantees it keeps retrying;
+- a command that subsequently fails its security validation is still
+  acknowledged; and
+- a request whose application-level response later fails to build or transmit
+  is still acknowledged.
+
+Command acknowledgement generation is plain R22 conformance. It is **not** a
+workaround for any particular Trust Center: in the 2026-08-09 ZiGate v3.23
+capture every `Transport-Key` and `Confirm-Key` from that coordinator carries
+`ack_request = 0`, so it never waited on an acknowledgement from the joining
+node. Coordinators that do set the bit need this path.
+
+### Receiving a secured command-format acknowledgement
+
+A Trust Center may *send* the command format APS-secured. ZiGate v3.23
+acknowledges our `Verify-Key` 13–63 ms later with frame control `0x32`:
+
+```text
+0x32  Ack frame type, unicast delivery, ack_format = 1, security = 1
+0x9A  APS counter — echoes the Verify-Key it acknowledges
+0x00  auxiliary security control: data key, OTA level 0, no extended nonce
+….    4-octet auxiliary frame counter
+….    4-octet MIC over a zero-length encrypted payload
+```
+
+Eleven octets in total. Parsing it correctly depends entirely on
+`ack_format`: reading it as a data acknowledgement consumes the auxiliary
+security header as endpoint/cluster/profile fields, and the acknowledgement
+then never matches the frame that caused it.
+
+Because it authenticates under the installed link key, such an acknowledgement
+is evidence about a *specific* outgoing frame. When it authenticates under a
+unique Trust Center link key and echoes the APS counter of a `Verify-Key` sent
+under that same key, the APS layer records it
+(`ApsSecurityHandshakeStats::verify_key_acks`) and BDB uses it — see
+[BDB commissioning](./bdb.md). It is never treated as a Confirm-Key: it carries
+no status field.
 
 ## Putting It Together
 

@@ -163,9 +163,42 @@ pub struct ApsSecurityHandshakeStats {
     pub verify_key_sent: u32,
     pub last_verify_key_frame_counter: u32,
     pub last_verify_key_trust_center: zigbee_types::IeeeAddress,
+    /// APS counter carried by the most recent Verify-Key transmission.
+    ///
+    /// An APS acknowledgement echoes the counter of the frame it acknowledges
+    /// (R22 §2.2.5.1.1.5), so this is what identifies *the* acknowledgement of
+    /// this Verify-Key rather than of some other APS frame.
+    pub last_verify_key_aps_counter: u8,
+    /// Whether the most recent Verify-Key was encrypted with the *unique*
+    /// Trust Center link key rather than the global ZigBeeAlliance09 key.
+    pub last_verify_key_used_unique_key: bool,
+    /// Whether the most recent Verify-Key is still awaiting its APS
+    /// acknowledgement. Cleared when that acknowledgement authenticates, so
+    /// one transmission can never be counted twice.
+    pub verify_key_ack_outstanding: bool,
+    /// Authenticated APS acknowledgements of a Verify-Key sent under a unique
+    /// Trust Center link key.
+    ///
+    /// Counted only when the acknowledgement was APS-secured, decrypted and
+    /// MIC-verified under that same unique key, came from the Trust Center,
+    /// and echoed [`Self::last_verify_key_aps_counter`]. It is therefore
+    /// cryptographic proof that the Trust Center holds the unique key and
+    /// received that exact Verify-Key — it is *not* a substitute for a
+    /// Confirm-Key status.
+    pub verify_key_acks: u32,
     pub confirm_key_received: u32,
     pub confirm_key_successes: u32,
     pub confirm_key_rejections: u32,
+    /// Confirm-Key frames that did not authenticate as coming from the
+    /// configured Trust Center under the unique Trust Center link key, or that
+    /// were malformed or addressed elsewhere.
+    ///
+    /// Kept separate on purpose: the three counters above are read by the BDB
+    /// key-exchange state machine as security predicates (a rejection leaves
+    /// the network), so an unauthenticated frame must never move them. This
+    /// one is pure diagnostics — a forged or stray Confirm-Key is visible
+    /// without being able to influence commissioning.
+    pub confirm_key_ignored: u32,
     pub last_confirm_key_status: u8,
     pub last_confirm_key_type: u8,
     pub last_confirm_key_key_identifier: u8,
@@ -182,9 +215,14 @@ impl Default for ApsSecurityHandshakeStats {
             verify_key_sent: 0,
             last_verify_key_frame_counter: 0,
             last_verify_key_trust_center: [0u8; 8],
+            last_verify_key_aps_counter: 0,
+            last_verify_key_used_unique_key: false,
+            verify_key_ack_outstanding: false,
+            verify_key_acks: 0,
             confirm_key_received: 0,
             confirm_key_successes: 0,
             confirm_key_rejections: 0,
+            confirm_key_ignored: 0,
             last_confirm_key_status: 0xFF,
             last_confirm_key_type: 0xFF,
             last_confirm_key_key_identifier: 0xFF,
@@ -225,6 +263,22 @@ pub struct PendingApsAck {
     pub cluster_id: u16,
     pub profile_id: u16,
     pub aps_counter: u8,
+    /// Acknowledgement-format sub-field (R22 §2.2.5.1.1.5).
+    ///
+    /// `true` acknowledges an APS *command* frame: the ACK carries neither
+    /// endpoints nor cluster/profile identifiers. `false` acknowledges a data
+    /// frame and echoes the addressing fields.
+    pub command: bool,
+}
+
+/// An APS unicast awaiting retransmission after its acknowledgement window.
+///
+/// Carries the destination alongside the frame so the retry repeats the
+/// original *unicast* transmission (R22 §2.2.5.2.2).
+#[derive(Debug, Clone)]
+pub struct ApsRetransmission {
+    pub dst_addr: zigbee_types::ShortAddress,
+    pub frame: heapless::Vec<u8, 128>,
 }
 
 /// APS Tunnel command awaiting hop-by-hop delivery to a joining child.
@@ -251,6 +305,21 @@ const APS_DUP_TABLE_SIZE: usize = 4;
 const APS_ACK_TABLE_SIZE: usize = 8;
 #[cfg(not(feature = "router"))]
 const APS_ACK_TABLE_SIZE: usize = 4;
+
+/// `apscAckWaitDuration` — how long a transmitter waits for an APS
+/// acknowledgement before retransmitting (R22 Table 2-24).
+///
+/// The normative value is `0.05 * 2 * nwkcMaxDepth` seconds. This stack's
+/// `nwkcMaxDepth` is 15 (the `max_depth` default in [`zigbee_nwk::nib`]), so
+/// the wait is 1.5 s.
+///
+/// It is expressed in microseconds because that is the unit of the stack's
+/// only monotonic clock ([`zigbee_mac::PlatformServices::monotonic_micros`]).
+/// Deriving the wait from that clock — rather than from how often the
+/// application happens to call [`ApsLayer::age_ack_table`] — is what keeps the
+/// retry interval identical on a 1 s router tick and on a sleepy device that
+/// runs maintenance far more often.
+pub const APS_ACK_WAIT_DURATION_US: u32 = 1_500_000;
 
 /// APS duplicate rejection entry
 #[derive(Debug, Clone, Copy)]
@@ -285,6 +354,15 @@ struct PendingApsAckEntry {
     confirmed: bool,
     /// Remaining retries (decremented each timeout tick)
     retries: u8,
+    /// Monotonic microsecond timestamp of the transmission this entry is
+    /// currently waiting on — the original send, or the most recent retry.
+    ///
+    /// A single `u32` per entry (16 bytes for the whole 4-entry sensor table)
+    /// is what turns [`ApsLayer::age_ack_table`] from "retransmit on every
+    /// call" into a real [`APS_ACK_WAIT_DURATION_US`] timer. Compared with the
+    /// monotonic clock by wrapping subtraction, so a `u32` microsecond counter
+    /// rolling over (every ~71.6 min) is handled without any extra state.
+    waiting_since_us: u32,
     /// Original serialized frame bytes for retransmission
     original_frame: heapless::Vec<u8, 128>,
 }
@@ -421,13 +499,23 @@ impl<M: MacDriver> ApsLayer<M> {
     }
 
     /// Register an outbound frame for ACK tracking.
-    /// Returns the slot index, or None if the table is full.
+    ///
+    /// The acknowledgement wait starts now: the entry records the monotonic
+    /// timestamp of this transmission, and [`Self::age_ack_table`] refuses to
+    /// retransmit until a full [`APS_ACK_WAIT_DURATION_US`] has elapsed since
+    /// it.
+    ///
+    /// Returns the slot index. When every slot is occupied by a transmission
+    /// still inside its acknowledgement window, the longest-waiting entry is
+    /// reused (and logged) so the newest transmission is always the one that
+    /// keeps its retries.
     pub fn register_ack_pending(
         &mut self,
         aps_counter: u8,
         dst_addr: u16,
         frame_bytes: &[u8],
     ) -> Option<usize> {
+        let now = self.nwk.mac().monotonic_micros();
         // Try to find an inactive slot to reuse
         for (i, entry) in self.ack_table.iter_mut().enumerate() {
             if !entry.active {
@@ -437,6 +525,7 @@ impl<M: MacDriver> ApsLayer<M> {
                     dst_addr,
                     confirmed: false,
                     retries: 3,
+                    waiting_since_us: now,
                     original_frame: heapless::Vec::new(),
                 };
                 let _ = entry.original_frame.extend_from_slice(frame_bytes);
@@ -451,14 +540,52 @@ impl<M: MacDriver> ApsLayer<M> {
             dst_addr,
             confirmed: false,
             retries: 3,
+            waiting_since_us: now,
             original_frame: heapless::Vec::new(),
         };
         let _ = new_entry.original_frame.extend_from_slice(frame_bytes);
         if self.ack_table.push(new_entry).is_ok() {
             return Some(idx);
         }
-        log::warn!("[APS] ACK tracking table full, cannot track counter={aps_counter}");
-        None
+
+        // Every slot is occupied by a transmission still inside its
+        // acknowledgement window. Entries now live for up to four
+        // `apscAckWaitDuration` windows instead of a handful of maintenance
+        // calls, so a burst — a ZDO interview answers several unicast requests
+        // in a row, and each one asks for an acknowledgement — can legitimately
+        // fill a 4-slot sensor table. Reuse the entry that has been waiting
+        // longest: it is the closest to timing out anyway, and dropping
+        // tracking for the *newest* frame would silently disable retries for
+        // exactly the traffic in flight.
+        let mut victim: Option<(usize, u32)> = None;
+        for (i, entry) in self.ack_table.iter().enumerate() {
+            let waited = now.wrapping_sub(entry.waiting_since_us);
+            if victim.is_none_or(|(_, longest)| waited > longest) {
+                victim = Some((i, waited));
+            }
+        }
+        let Some((idx, waited)) = victim else {
+            log::warn!("[APS] ACK tracking table full, cannot track counter={aps_counter}");
+            return None;
+        };
+        log::warn!(
+            "[APS] ACK table full — evicting counter={} (waited {} us) for counter={}",
+            self.ack_table[idx].aps_counter,
+            waited,
+            aps_counter,
+        );
+        let entry = &mut self.ack_table[idx];
+        *entry = PendingApsAckEntry {
+            active: true,
+            aps_counter,
+            dst_addr,
+            confirmed: false,
+            retries: 3,
+            waiting_since_us: now,
+            original_frame: heapless::Vec::new(),
+        };
+        let _ = entry.original_frame.extend_from_slice(frame_bytes);
+        Some(idx)
     }
 
     /// Deliver an incoming APS ACK. Returns true if matched a pending request.
@@ -495,31 +622,73 @@ impl<M: MacDriver> ApsLayer<M> {
 
     /// Age the ACK table. Returns frames that need retransmission.
     ///
-    /// When an unconfirmed entry still has retries, it decrements the retry
-    /// count and returns the original frame bytes for retransmission.
-    /// When retries are exhausted, the entry is deactivated.
-    pub fn age_ack_table(&mut self) -> heapless::Vec<heapless::Vec<u8, 128>, 4> {
-        let mut retransmit = heapless::Vec::<heapless::Vec<u8, 128>, 4>::new();
+    /// Retransmission is driven by *elapsed time*, not by call frequency: an
+    /// unconfirmed entry is left alone until a full
+    /// [`APS_ACK_WAIT_DURATION_US`] has passed since the transmission it is
+    /// waiting on (R22 §2.2.5.2.2, `apscAckWaitDuration`). Only then does it
+    /// consume one retry and return the original frame bytes together with the
+    /// short address the frame was originally addressed to; the wait then
+    /// restarts, so every successive retry gets its own full window. When the
+    /// retries are exhausted, the entry is deactivated one further window
+    /// later.
+    ///
+    /// This makes the behaviour identical whether the caller runs maintenance
+    /// once a second or every few milliseconds. Without it, each maintenance
+    /// call burned one retry, so a unicast that requested an acknowledgement
+    /// put four copies of the same frame on the air back to back and then gave
+    /// up long before any acknowledgement could arrive.
+    ///
+    /// The destination travels with the frame because an APS retransmission is
+    /// a *unicast* repeat of the original transmission (R22 §2.2.5.2.2):
+    /// re-sending it to a broadcast address would flood the network with a
+    /// frame only one device is expecting, and the acknowledgement it is
+    /// waiting for would still never arrive.
+    pub fn age_ack_table(&mut self) -> heapless::Vec<ApsRetransmission, APS_ACK_TABLE_SIZE> {
+        let now = self.nwk.mac().monotonic_micros();
+        let mut retransmit = heapless::Vec::<ApsRetransmission, APS_ACK_TABLE_SIZE>::new();
         for entry in self.ack_table.iter_mut() {
-            if entry.active && !entry.confirmed {
-                if entry.retries == 0 {
-                    log::warn!(
-                        "[APS] ACK timeout counter={} dst=0x{:04X}",
+            if !entry.active {
+                continue;
+            }
+            if entry.confirmed {
+                // The transmission is complete. Free the slot here: the table
+                // is small (4 entries on a sensor build), and leaving confirmed
+                // entries in place would permanently exhaust it after the first
+                // handful of acknowledged unicasts, silently dropping ACK
+                // tracking for everything sent afterwards.
+                entry.active = false;
+                entry.original_frame.clear();
+                continue;
+            }
+            // Wrapping subtraction: the monotonic microsecond clock rolls over
+            // every ~71.6 minutes, and only the difference matters.
+            if now.wrapping_sub(entry.waiting_since_us) < APS_ACK_WAIT_DURATION_US {
+                continue;
+            }
+            if entry.retries == 0 {
+                log::warn!(
+                    "[APS] ACK timeout counter={} dst=0x{:04X}",
+                    entry.aps_counter,
+                    entry.dst_addr,
+                );
+                entry.active = false;
+                entry.original_frame.clear();
+            } else {
+                entry.retries = entry.retries.saturating_sub(1);
+                entry.waiting_since_us = now;
+                if !entry.original_frame.is_empty() {
+                    log::debug!(
+                        "[APS] Retransmit counter={} dst=0x{:04X} retries_left={}",
                         entry.aps_counter,
                         entry.dst_addr,
+                        entry.retries,
                     );
-                    entry.active = false;
-                } else {
-                    entry.retries = entry.retries.saturating_sub(1);
-                    if !entry.original_frame.is_empty() {
-                        log::debug!(
-                            "[APS] Retransmit counter={} dst=0x{:04X} retries_left={}",
-                            entry.aps_counter,
-                            entry.dst_addr,
-                            entry.retries,
-                        );
-                        let _ = retransmit.push(entry.original_frame.clone());
-                    }
+                    retransmit
+                        .push(ApsRetransmission {
+                            dst_addr: zigbee_types::ShortAddress(entry.dst_addr),
+                            frame: entry.original_frame.clone(),
+                        })
+                        .expect("retransmission capacity matches the ACK table");
                 }
             }
         }

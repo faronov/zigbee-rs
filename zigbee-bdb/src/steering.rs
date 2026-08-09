@@ -312,14 +312,26 @@ mod tests {
             == Some(TEST_UNIQUE_TCLK)
     }
 
-    fn inject_rejected_confirm_key(bdb: &mut BdbLayer<MockMac>) {
+    /// Feed the APS layer a Confirm-Key **refusal** that authenticates as
+    /// coming from the Trust Center under the negotiated unique link key.
+    ///
+    /// Only such a frame may reach the exchange's rejection counter: an
+    /// unsecured or default-key Confirm-Key is forgeable by anyone, and the
+    /// BDB exchange reads a rejection as a hard failure that leaves the
+    /// network. `frame_counter` must increase across calls, because the APS
+    /// replay check commits it per key entry.
+    fn inject_rejected_confirm_key(bdb: &mut BdbLayer<MockMac>, frame_counter: u32) {
+        use zigbee_aps::security::{
+            ApsSecurity, ApsSecurityHeader, KEY_ID_DATA_KEY, SEC_LEVEL_ENC_MIC_32,
+        };
+
         let local_ieee = bdb.zdo().aps().nwk().nib().ieee_address;
         let header = ApsHeader {
             frame_control: ApsFrameControl {
                 frame_type: ApsFrameType::Command as u8,
                 delivery_mode: ApsDeliveryMode::Unicast as u8,
                 ack_format: false,
-                security: false,
+                security: true,
                 ack_request: false,
                 extended_header: false,
             },
@@ -331,12 +343,38 @@ mod tests {
             aps_counter: 0x51,
             extended_header: None,
         };
-        let mut frame = [0u8; 32];
+        let mut command = [0u8; 11];
+        command[0] = ApsCommandId::ConfirmKey as u8;
+        command[1] = 0x01; // non-success status
+        command[2] = 0x04; // Trust Center link-key type
+        command[3..11].copy_from_slice(&local_ieee);
+
+        // The Trust Center carries its IEEE address in the extended nonce so
+        // the receiver can build the CCM* nonce before authentication.
+        let wire_security = ApsSecurityHeader {
+            security_control: (KEY_ID_DATA_KEY << 3) | (1 << 5),
+            frame_counter,
+            source_address: Some(TEST_TC_IEEE),
+            key_seq_number: None,
+        };
+        let mut frame = [0u8; 64];
         let header_len = header.serialize(&mut frame);
-        frame[header_len] = ApsCommandId::ConfirmKey as u8;
-        frame[header_len + 1] = 0x01; // non-success status
-        frame[header_len + 2] = 0x04; // Trust Center link-key type
-        frame[header_len + 3..header_len + 11].copy_from_slice(&local_ieee);
+        let aux_len = wire_security.serialize(&mut frame[header_len..]);
+        let aad_len = header_len + aux_len;
+        // Zigbee transmits security level 0 but authenticates level 5.
+        let mut authenticated = [0u8; 32];
+        authenticated[..aad_len].copy_from_slice(&frame[..aad_len]);
+        authenticated[header_len] |= SEC_LEVEL_ENC_MIC_32;
+        let encrypted = ApsSecurity::new()
+            .encrypt(
+                &authenticated[..aad_len],
+                &command,
+                &TEST_UNIQUE_TCLK,
+                &wire_security,
+            )
+            .expect("CCM* over the Confirm-Key payload");
+        frame[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
+        let len = aad_len + encrypted.len();
 
         let before = bdb
             .zdo()
@@ -348,7 +386,7 @@ mod tests {
             bdb.zdo_mut()
                 .aps_mut()
                 .process_incoming_aps_frame(
-                    &frame[..header_len + 11],
+                    &frame[..len],
                     ShortAddress::COORDINATOR,
                     ShortAddress(TEST_SHORT_ADDR),
                     200,
@@ -682,6 +720,311 @@ mod tests {
         assert_eq!(bdb.steering_diagnostics().node_desc_requests, 0);
     }
 
+    // ── ACK-gated deferred retry (ZiGate v3.23, capture 2026-08-09) ──
+    //
+    // That Trust Center transports a unique TCLK, APS-acknowledges our
+    // Verify-Key with a *secured* command-format ACK encrypted under that same
+    // unique key within 13–63 ms, and then never emits Confirm-Key 0x10. The
+    // strict deadline used to answer that with a broadcast NWK Leave at ~15 s,
+    // which the capture shows originating from us, not from the coordinator.
+
+    /// Feed the APS layer the secured command-format acknowledgement the Trust
+    /// Center returns for the Verify-Key currently outstanding.
+    ///
+    /// This is the real reception path: the frame is CCM*-decrypted and
+    /// MIC-verified under the installed unique key, exactly like the captured
+    /// ZiGate frame.
+    fn inject_authenticated_verify_key_ack(bdb: &mut BdbLayer<MockMac>, frame_counter: u32) {
+        use zigbee_aps::security::{
+            ApsSecurity, ApsSecurityHeader, KEY_ID_DATA_KEY, SEC_LEVEL_ENC_MIC_32,
+        };
+
+        let stats = bdb.zdo().aps().security_handshake_stats();
+        assert!(
+            stats.verify_key_ack_outstanding,
+            "a Verify-Key must be in flight to be acknowledged"
+        );
+        assert!(
+            stats.last_verify_key_used_unique_key,
+            "the fixture must have sent Verify-Key under the unique key"
+        );
+        let aps_counter = stats.last_verify_key_aps_counter;
+
+        let header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Ack as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: true,
+                security: true,
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: None,
+            group_address: None,
+            cluster_id: None,
+            profile_id: None,
+            src_endpoint: None,
+            aps_counter,
+            extended_header: None,
+        };
+        let wire_security = ApsSecurityHeader {
+            security_control: KEY_ID_DATA_KEY << 3,
+            frame_counter,
+            source_address: None,
+            key_seq_number: None,
+        };
+
+        let mut frame = [0u8; 32];
+        let header_len = header.serialize(&mut frame);
+        let aux_len = wire_security.serialize(&mut frame[header_len..]);
+        let aad_len = header_len + aux_len;
+        let mut authenticated = [0u8; 16];
+        authenticated[..aad_len].copy_from_slice(&frame[..aad_len]);
+        authenticated[header_len] |= SEC_LEVEL_ENC_MIC_32;
+
+        let nonce_security = ApsSecurityHeader {
+            security_control: KEY_ID_DATA_KEY << 3,
+            frame_counter,
+            source_address: Some(TEST_TC_IEEE),
+            key_seq_number: None,
+        };
+        let encrypted = ApsSecurity::new()
+            .encrypt(
+                &authenticated[..aad_len],
+                &[],
+                &TEST_UNIQUE_TCLK,
+                &nonce_security,
+            )
+            .expect("CCM* over an empty payload");
+        frame[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
+        let len = aad_len + encrypted.len();
+        assert_eq!(len, 11, "the captured ZiGate ACK layout is 11 octets");
+
+        let before = bdb.zdo().aps().security_handshake_stats().verify_key_acks;
+        let mut decrypted = ApsFrameBuffer::new();
+        assert!(
+            bdb.zdo_mut()
+                .aps_mut()
+                .process_incoming_aps_frame(
+                    &frame[..len],
+                    ShortAddress::COORDINATOR,
+                    ShortAddress(TEST_SHORT_ADDR),
+                    200,
+                    IncomingNwkSecurity::new(true, Some(TEST_TC_IEEE)),
+                    &mut decrypted,
+                )
+                .is_none()
+        );
+        assert_eq!(
+            bdb.zdo().aps().security_handshake_stats().verify_key_acks,
+            before + 1,
+            "the fixture must reach the real authenticated-ACK path"
+        );
+    }
+
+    /// Advance the exchange with a 50 ms application tick until it terminates
+    /// or reaches `until`, whichever happens first.
+    fn run_tclk_until(
+        bdb: &mut BdbLayer<MockMac>,
+        until: TclkStage,
+    ) -> Result<TclkStage, TclkProgress> {
+        const TICK_US: u32 = 50_000;
+        for _ in 0..20_000 {
+            if bdb.tclk_exchange_stage() == Some(until) {
+                return Ok(until);
+            }
+            match step(bdb) {
+                TclkProgress::InProgress => advance_time(bdb, TICK_US),
+                terminal => return Err(terminal),
+            }
+        }
+        panic!("the exchange neither terminated nor reached {until:?}");
+    }
+
+    /// A joined device that has sent one Verify-Key under an installed unique
+    /// key and had it acknowledged by the Trust Center.
+    fn acknowledged_verify_key_bdb() -> BdbLayer<MockMac> {
+        let mut bdb = steered_bdb();
+        install_unique_tclk(&mut bdb);
+        set_stage(&mut bdb, TclkStage::SendVerifyKey);
+        assert_eq!(step(&mut bdb), TclkProgress::InProgress);
+        assert_eq!(stage(&bdb), TclkStage::AwaitConfirmKey);
+        inject_authenticated_verify_key_ack(&mut bdb, 0x0000_0300);
+        bdb
+    }
+
+    #[test]
+    fn an_acknowledged_verify_key_defers_instead_of_leaving_when_confirm_key_never_arrives() {
+        let mut bdb = acknowledged_verify_key_bdb();
+
+        let reached = run_tclk_until(&mut bdb, TclkStage::DeferredVerify)
+            .expect("an acknowledged Verify-Key must never fail the exchange");
+        assert_eq!(reached, TclkStage::DeferredVerify);
+
+        assert!(
+            bdb.is_on_network(),
+            "the joined network is preserved across the deferred retry"
+        );
+        assert!(
+            unique_tclk_installed(&bdb),
+            "the unique key the Trust Center already holds must not be discarded"
+        );
+        assert!(
+            bdb.steering_diagnostics().verify_key_acknowledged,
+            "the authenticated acknowledgement is what gates this path"
+        );
+        assert_eq!(
+            bdb.steering_diagnostics().confirm_key_frames,
+            0,
+            "no Confirm-Key was ever received"
+        );
+        assert_eq!(
+            bdb.tclk_exchange.as_ref().expect("armed").deferred_rounds,
+            crate::tclk_exchange::TCLK_DEFERRED_ROUNDS - 1,
+            "entering the deferred path consumes exactly one bounded round"
+        );
+    }
+
+    #[test]
+    fn deferred_rounds_are_bounded_and_complete_on_the_authenticated_acknowledgement() {
+        let mut bdb = acknowledged_verify_key_bdb();
+
+        let progress = run_tclk_until(&mut bdb, TclkStage::Failed)
+            .expect_err("the exchange must terminate, not stall in a stage");
+        assert_eq!(
+            progress,
+            TclkProgress::Complete,
+            "the bounded deferred rounds end in a completed, still-joined network"
+        );
+        assert!(bdb.is_on_network());
+        assert!(unique_tclk_installed(&bdb));
+        assert_eq!(
+            bdb.steering_diagnostics().tclk_acknowledged_completions,
+            1,
+            "completion on the acknowledgement alone is counted explicitly"
+        );
+        assert_eq!(bdb.steering_diagnostics().confirm_key_successes, 0);
+    }
+
+    /// Feed the APS layer an **unauthenticated** Confirm-Key refusal — the
+    /// frame any device within radio range can fabricate, since it carries no
+    /// APS security at all.
+    fn inject_forged_confirm_key(bdb: &mut BdbLayer<MockMac>) {
+        let local_ieee = bdb.zdo().aps().nwk().nib().ieee_address;
+        let header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Command as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: false,
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: None,
+            group_address: None,
+            cluster_id: None,
+            profile_id: None,
+            src_endpoint: None,
+            aps_counter: 0x52,
+            extended_header: None,
+        };
+        let mut frame = [0u8; 32];
+        let header_len = header.serialize(&mut frame);
+        frame[header_len] = ApsCommandId::ConfirmKey as u8;
+        frame[header_len + 1] = 0x01; // non-success status
+        frame[header_len + 2] = 0x04; // Trust Center link-key type
+        frame[header_len + 3..header_len + 11].copy_from_slice(&local_ieee);
+
+        let mut decrypted = ApsFrameBuffer::new();
+        assert!(
+            bdb.zdo_mut()
+                .aps_mut()
+                .process_incoming_aps_frame(
+                    &frame[..header_len + 11],
+                    ShortAddress::COORDINATOR,
+                    ShortAddress(TEST_SHORT_ADDR),
+                    200,
+                    IncomingNwkSecurity::new(true, Some(TEST_TC_IEEE)),
+                    &mut decrypted,
+                )
+                .is_none()
+        );
+        assert_eq!(
+            bdb.zdo()
+                .aps()
+                .security_handshake_stats()
+                .confirm_key_ignored,
+            1,
+            "the forged frame must be visible as ignored, not as an exchange event"
+        );
+    }
+
+    /// A Confirm-Key that never authenticated must not be able to steer
+    /// commissioning. Before the APS authentication gate it incremented both
+    /// `confirm_key_received` and `confirm_key_rejections`, so a single forged
+    /// unicast — no key material required — both closed the ACK-gated
+    /// compatibility path and drove the exchange straight into its hard
+    /// failure, i.e. an attacker could kick a commissioning device off the
+    /// network at will.
+    #[test]
+    fn a_forged_confirm_key_cannot_force_the_device_off_the_network() {
+        let mut bdb = acknowledged_verify_key_bdb();
+
+        inject_forged_confirm_key(&mut bdb);
+
+        let reached = run_tclk_until(&mut bdb, TclkStage::DeferredVerify)
+            .expect("a forged Confirm-Key must not fail the exchange");
+        assert_eq!(reached, TclkStage::DeferredVerify);
+        assert!(
+            bdb.is_on_network(),
+            "the forged refusal must never cause a leave"
+        );
+        assert!(unique_tclk_installed(&bdb));
+        assert_eq!(
+            bdb.steering_diagnostics().confirm_key_rejections,
+            0,
+            "an unauthenticated frame is not a Trust Center verdict"
+        );
+    }
+
+    #[test]
+    fn an_explicitly_rejected_confirm_key_still_hard_fails_after_an_acknowledged_verify_key() {
+        let mut bdb = acknowledged_verify_key_bdb();
+        // The Trust Center answers — with a refusal. That is not "Confirm-Key
+        // absent", so the compatibility path must stay closed. The frame
+        // counter follows the acknowledgement injected above, as the APS
+        // replay check requires.
+        inject_rejected_confirm_key(&mut bdb, 0x0000_0400);
+
+        let progress = run_tclk_until(&mut bdb, TclkStage::DeferredVerify)
+            .expect_err("a rejected Confirm-Key must never reach the deferred path");
+        assert_eq!(
+            progress,
+            TclkProgress::Failed(BdbStatus::TrustCenterLinkKeyExchangeFailure)
+        );
+        assert!(
+            !bdb.is_on_network(),
+            "an explicit rejection still leaves the network"
+        );
+        assert_eq!(bdb.steering_diagnostics().tclk_acknowledged_completions, 0);
+    }
+
+    #[test]
+    fn an_unacknowledged_verify_key_still_fails_strictly() {
+        let mut bdb = steered_bdb();
+        install_unique_tclk(&mut bdb);
+        set_stage(&mut bdb, TclkStage::SendVerifyKey);
+
+        let progress = run_tclk_until(&mut bdb, TclkStage::DeferredVerify)
+            .expect_err("without an authenticated ACK the strict path is unchanged");
+        assert_eq!(
+            progress,
+            TclkProgress::Failed(BdbStatus::TrustCenterLinkKeyExchangeFailure)
+        );
+        assert!(!bdb.is_on_network());
+        assert_eq!(bdb.steering_diagnostics().tclk_acknowledged_completions, 0);
+    }
+
     #[test]
     fn a_rejected_confirm_key_paces_verify_retry_and_keeps_the_unique_key() {
         const TICK_US: u32 = 50_000;
@@ -701,7 +1044,7 @@ mod tests {
             )
         );
 
-        inject_rejected_confirm_key(&mut bdb);
+        inject_rejected_confirm_key(&mut bdb, 0x0000_0400);
         assert_eq!(step(&mut bdb), TclkProgress::InProgress);
         assert_eq!(stage(&bdb), TclkStage::RetryVerifyKey);
 
@@ -1431,8 +1774,10 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Performs at most one non-blocking action per call — a single transmit,
     /// or a check of already-received ZDO/APS security state plus the
     /// per-attempt timeout — so the application/runtime keeps servicing normal
-    /// traffic between calls. Returns [`TclkProgress::Complete`] only after a
-    /// pre-R21 determination or a successful unique-key Verify/Confirm, and
+    /// traffic between calls. Returns [`TclkProgress::Complete`] after a
+    /// pre-R21 determination, a successful unique-key Verify/Confirm, or the
+    /// ACK-gated deferred path (see
+    /// [`Self::defer_or_finalize_acknowledged_tclk`]), and
     /// [`TclkProgress::Failed`] after resetting/leaving the network
     /// consistently once the attempt budget is exhausted (or on a persistence
     /// error). When no exchange is armed it returns [`TclkProgress::Complete`].
@@ -1954,7 +2299,10 @@ impl<M: MacDriver> BdbLayer<M> {
                     self.attributes.node_is_on_a_network = true;
                     let now = self.zdo.aps().nwk().mac().monotonic_micros();
                     self.steering_diagnostics.network_up_us = now;
-                    self.tclk_exchange = Some(TclkExchange::new(tc_addr, tc_ieee, now));
+                    let mut exchange = TclkExchange::new(tc_addr, tc_ieee, now);
+                    exchange
+                        .baseline_handshake_counters(&self.zdo.aps().security_handshake_stats());
+                    self.tclk_exchange = Some(exchange);
                     bdb_diag!("[BDB] steering=network_up addr=0x{:04X}", nwk_addr.0);
                     log::info!(
                         "[BDB:Steering] Network up as 0x{:04X} — unique TCLK exchange armed",
@@ -2287,12 +2635,21 @@ impl<M: MacDriver> BdbLayer<M> {
         let now = self.zdo.aps().nwk().mac().monotonic_micros();
 
         // The overall deadline is strict: no stage may keep running past it,
-        // and it never turns into a deferred or permissive success.
+        // and it never turns into a deferred or permissive success. The only
+        // way past it is the ACK-gated compatibility path, which requires
+        // cryptographic proof that the Trust Center received and authenticated
+        // our Verify-Key under the unique key.
         if !ex.stage.is_terminal() && ex.deadline_expired(now) {
             log::warn!(
                 "[BDB:Steering] Unique TCLK exchange deadline expired in stage {:?}",
                 ex.stage
             );
+            if let Some(progress) = self
+                .defer_or_finalize_acknowledged_tclk(ex, now, persistence.as_deref_mut())
+                .await
+            {
+                return progress;
+            }
             return self.finalize_exchange_failure(ex).await;
         }
 
@@ -2477,9 +2834,19 @@ impl<M: MacDriver> BdbLayer<M> {
             TclkStage::SendVerifyKey => {
                 if !ex.take_verify_key_attempt() {
                     // The unique key is installed but the Trust Center never
-                    // confirmed it. GSDK budgets Verify-Key separately from
-                    // Request-Key, so ask for a replacement key while that
-                    // budget lasts — and only then drop the unconfirmed key.
+                    // confirmed it. If it *acknowledged* our Verify-Key under
+                    // that unique key, a replacement key would be wrong — it
+                    // already has this one — so take the ACK-gated deferred
+                    // path instead of discarding security material.
+                    if let Some(progress) = self
+                        .defer_or_finalize_acknowledged_tclk(ex, now, persistence.as_deref_mut())
+                        .await
+                    {
+                        return progress;
+                    }
+                    // GSDK budgets Verify-Key separately from Request-Key, so
+                    // ask for a replacement key while that budget lasts — and
+                    // only then drop the unconfirmed key.
                     if ex.has_request_key_attempt() {
                         log::warn!(
                             "[BDB:Steering] Verify-Key budget exhausted — requesting a \
@@ -2566,9 +2933,100 @@ impl<M: MacDriver> BdbLayer<M> {
                 }
             }
 
+            TclkStage::DeferredVerify => {
+                self.steering_diagnostics.stage = SteeringStage::WaitingForConfirmKey;
+                // A Confirm-Key can still arrive during the scheduled gap.
+                let stats = self.zdo.aps().security_handshake_stats();
+                if stats.confirm_key_successes > ex.confirm_success_baseline {
+                    return self
+                        .finalize_tclk_success(ex, persistence.as_deref_mut())
+                        .await;
+                }
+                if stats.confirm_key_rejections > ex.confirm_reject_baseline {
+                    log::warn!(
+                        "[BDB:Steering] Confirm-Key rejected during deferred retry — failing"
+                    );
+                    return self.finalize_exchange_failure(ex).await;
+                }
+                if ex.stage_timed_out(now) {
+                    log::info!(
+                        "[BDB:Steering] Deferred unique-TCLK round starting ({} left)",
+                        ex.deferred_rounds
+                    );
+                    ex.enter(TclkStage::SendVerifyKey, now);
+                }
+                TclkProgress::InProgress
+            }
+
             TclkStage::Complete => TclkProgress::Complete,
             TclkStage::Failed => TclkProgress::Failed(BdbStatus::TrustCenterLinkKeyExchangeFailure),
         }
+    }
+
+    /// Whether the Trust Center has cryptographically proven, without ever
+    /// sending a Confirm-Key, that it holds the unique link key.
+    ///
+    /// Every condition below has to hold:
+    ///
+    /// - a *unique* Trust Center link key is installed for `ex.tc_ieee`;
+    /// - the last Verify-Key was encrypted with that unique key (the APS layer
+    ///   records which key it used);
+    /// - an APS acknowledgement echoing that Verify-Key's APS counter arrived,
+    ///   was APS-secured, and decrypted and MIC-verified under the same unique
+    ///   key (never under ZigBeeAlliance09);
+    /// - it came from the configured Trust Center; and
+    /// - **no** Confirm-Key at all has been received during this exchange.
+    ///
+    /// The last condition is what keeps this narrow: it applies only to
+    /// "Confirm-Key is absent", never to "Confirm-Key said no". A rejected
+    /// Confirm-Key moves `confirm_key_received` and takes the normal hard
+    /// failure path.
+    fn verify_key_acknowledged_under_unique_key(&self, ex: &TclkExchange) -> bool {
+        let stats = self.zdo.aps().security_handshake_stats();
+        stats.verify_key_acks != ex.verify_ack_baseline
+            && stats.confirm_key_received == ex.confirm_received_baseline
+            && stats.last_verify_key_used_unique_key
+            && stats.last_verify_key_trust_center == ex.tc_ieee
+            && self.has_unique_tc_link_key(&ex.tc_ieee)
+    }
+
+    /// ACK-gated compatibility for a Trust Center that acknowledges Verify-Key
+    /// but never emits Confirm-Key (observed: ZiGate v3.23, capture
+    /// 2026-08-09).
+    ///
+    /// Returns `None` when the proof does not hold, so the caller falls through
+    /// to its normal strict failure. Otherwise the joined network is preserved
+    /// and either another bounded deferred Verify-Key round is scheduled, or —
+    /// once those rounds are spent — the commissioned network is committed and
+    /// the exchange completes. Persistence failure at that commit still hard
+    /// fails.
+    async fn defer_or_finalize_acknowledged_tclk(
+        &mut self,
+        ex: &mut TclkExchange,
+        now: u32,
+        persistence: Option<&mut (dyn SecurityPersistence + '_)>,
+    ) -> Option<TclkProgress> {
+        if !self.verify_key_acknowledged_under_unique_key(ex) {
+            return None;
+        }
+        self.steering_diagnostics.verify_key_acknowledged = true;
+        if ex.take_deferred_round(now) {
+            log::warn!(
+                "[BDB:Steering] Verify-Key acknowledged under the unique key but no Confirm-Key \
+                 arrived — keeping the network and scheduling a deferred retry ({} left)",
+                ex.deferred_rounds,
+            );
+            return Some(TclkProgress::InProgress);
+        }
+        log::warn!(
+            "[BDB:Steering] Trust Center acknowledged the unique-key Verify-Key but never sent \
+             Confirm-Key — completing on the authenticated acknowledgement"
+        );
+        self.steering_diagnostics.tclk_acknowledged_completions = self
+            .steering_diagnostics
+            .tclk_acknowledged_completions
+            .saturating_add(1);
+        Some(self.finalize_tclk_success(ex, persistence).await)
     }
 
     /// Parse a Node_Desc_rsp and decide the next stage: pre-R21 completes the

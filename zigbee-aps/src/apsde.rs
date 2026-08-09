@@ -295,7 +295,14 @@ fn aps_decrypt_incoming<P: ForwardAesProvider>(
         return None;
     };
     if sec_hdr.source_address.is_none() {
-        sec_hdr.source_address = nwk_src_ieee.or_else(|| nonzero_ieee(tc_address));
+        // A frame without an extended nonce needs the sender IEEE resolved
+        // locally: it selects the link key and forms the CCM* nonce. An entry
+        // that only knows a short address reports an all-zero placeholder,
+        // which names no device — accepting it would pick the wrong key and
+        // build a wrong nonce, so fall through to the Trust Center address.
+        sec_hdr.source_address = nwk_src_ieee
+            .and_then(nonzero_ieee)
+            .or_else(|| nonzero_ieee(tc_address));
     }
     let aps_security_source = sec_hdr.source_address;
     aps_diag!(
@@ -1131,6 +1138,12 @@ impl<M: MacDriver> ApsLayer<M> {
                         nwk_src.0,
                         header.aps_counter
                     );
+                    // R22 §2.2.4.1.3: a duplicate is discarded *after* the
+                    // acknowledgement is regenerated. A duplicate only exists
+                    // because the sender did not see the first ACK, so
+                    // answering with silence guarantees it keeps retrying
+                    // until its own APS retry budget runs out.
+                    self.queue_data_ack(&header, nwk_src);
                     return None;
                 }
 
@@ -1191,6 +1204,19 @@ impl<M: MacDriver> ApsLayer<M> {
                 }
             }
             ApsFrameType::Ack => {
+                // An APS acknowledgement echoes the counter of the frame it
+                // acknowledges, so a *secured* one that authenticates under an
+                // installed unique link key is cryptographic evidence about a
+                // specific outgoing frame. Record that before the generic
+                // pending-transmission bookkeeping.
+                self.note_incoming_aps_ack(
+                    nwk_src,
+                    header.aps_counter,
+                    aps_secured,
+                    aps_security_source,
+                    aps_key_identifier,
+                    aps_used_default_link_key,
+                );
                 if !self.confirm_ack(nwk_src.0, header.aps_counter) {
                     log::debug!(
                         "APS ACK received (counter={}) - no matching pending",
@@ -1201,6 +1227,34 @@ impl<M: MacDriver> ApsLayer<M> {
             }
             ApsFrameType::Command => {
                 log::info!("[APS RX] APS Command frame, sec={}", aps_secured);
+                // R22 §2.2.4.1.3/§2.2.5.1.1.5: an APS *command* frame that
+                // requests an acknowledgement is acknowledged like any other
+                // APS frame, using the command acknowledgement format (no
+                // endpoints and no cluster/profile identifiers).
+                //
+                // This is generic R22 conformance, not a workaround for any
+                // particular Trust Center: the 2026-08-09 ZiGate v3.23 capture
+                // shows that coordinator sending every Transport-Key and
+                // Confirm-Key with `ack_request = 0`, so it never waited for an
+                // acknowledgement from us. Other coordinators do set the bit.
+                //
+                // The ACK is network-secured, so it is only queued once a
+                // network key is active — the initial Transport-Key that
+                // carries that key can never be acknowledged.
+                if header.frame_control.ack_request
+                    && header.frame_control.delivery_mode == ApsDeliveryMode::Unicast as u8
+                    && self.nwk.security().active_key().is_some()
+                {
+                    self.pending_aps_ack = Some(PendingApsAck {
+                        dst_addr: nwk_src,
+                        dst_endpoint: 0,
+                        src_endpoint: 0,
+                        cluster_id: 0,
+                        profile_id: 0,
+                        aps_counter: header.aps_counter,
+                        command: true,
+                    });
+                }
                 let cmd_payload = if used_decrypted_buf {
                     &decrypted_buf.data[..decrypted_buf.len]
                 } else {
@@ -1234,54 +1288,12 @@ impl<M: MacDriver> ApsLayer<M> {
                         log::debug!("APS Verify-Key from 0x{:04X}", nwk_src.0);
                     }
                     Some(crate::frames::ApsCommandId::ConfirmKey) => {
-                        self.security_handshake_stats.confirm_key_received = self
-                            .security_handshake_stats
-                            .confirm_key_received
-                            .wrapping_add(1);
-                        self.security_handshake_stats.last_confirm_key_source = nwk_src.0;
-                        self.security_handshake_stats.last_confirm_key_source_ieee =
-                            aps_security_source.unwrap_or([0u8; 8]);
-                        self.security_handshake_stats
-                            .last_confirm_key_key_identifier = aps_key_identifier.unwrap_or(0xFF);
-                        self.security_handshake_stats.last_confirm_key_aps_secured = aps_secured;
-                        self.security_handshake_stats.last_confirm_key_nwk_secured =
-                            nwk_security.secured;
-                        let valid = if let Some(command) = parse_confirm_key_command(cmd_data) {
-                            self.security_handshake_stats.last_confirm_key_status = command.status;
-                            self.security_handshake_stats.last_confirm_key_type = command.key_type;
-                            self.security_handshake_stats.last_confirm_key_destination =
-                                command.destination;
-                            command.status == 0x00
-                                && command.key_type == WIRE_KEY_TYPE_TC_LINK
-                                && aps_secured
-                                && aps_key_identifier == Some(crate::security::KEY_ID_DATA_KEY)
-                                // R21+ §4.7.3.6: Confirm-Key proves possession
-                                // of the *unique* Trust Center link key. One
-                                // secured under the global ZigBeeAlliance09 key
-                                // proves nothing and is never accepted.
-                                && !aps_used_default_link_key
-                                && nwk_src.0 == 0x0000
-                                && aps_security_source
-                                    == nonzero_ieee(self.aib.aps_trust_center_address)
-                                && command.destination == self.nwk.nib().ieee_address
-                        } else {
-                            self.security_handshake_stats.last_confirm_key_status = 0xFF;
-                            self.security_handshake_stats.last_confirm_key_type = 0xFF;
-                            self.security_handshake_stats.last_confirm_key_destination = [0u8; 8];
-                            false
-                        };
-                        if valid {
-                            self.security_handshake_stats.confirm_key_successes = self
-                                .security_handshake_stats
-                                .confirm_key_successes
-                                .wrapping_add(1);
-                        } else {
-                            self.security_handshake_stats.confirm_key_rejections = self
-                                .security_handshake_stats
-                                .confirm_key_rejections
-                                .wrapping_add(1);
-                        }
-                        log::debug!("APS Confirm-Key from 0x{:04X}", nwk_src.0);
+                        self.handle_confirm_key(
+                            cmd_data,
+                            nwk_src,
+                            command_security,
+                            aps_used_default_link_key,
+                        );
                     }
                     Some(other) => {
                         log::debug!("APS command {:?} from 0x{:04X}", other, nwk_src.0);
@@ -1299,16 +1311,7 @@ impl<M: MacDriver> ApsLayer<M> {
         }
 
         // Generate APS ACK if requested
-        if header.frame_control.ack_request {
-            self.pending_aps_ack = Some(PendingApsAck {
-                dst_addr: nwk_src,
-                dst_endpoint: header.src_endpoint.unwrap_or(0),
-                src_endpoint: header.dst_endpoint.unwrap_or(0),
-                cluster_id: header.cluster_id.unwrap_or(0),
-                profile_id: header.profile_id.unwrap_or(0),
-                aps_counter: header.aps_counter,
-            });
-        }
+        self.queue_data_ack(&header, nwk_src);
 
         // Determine addressing
         let dm = crate::frames::ApsDeliveryMode::from_u8(header.frame_control.delivery_mode)?;
@@ -1349,6 +1352,187 @@ impl<M: MacDriver> ApsLayer<M> {
             security_status: aps_secured || nwk_security.secured,
             lqi,
         })
+    }
+
+    /// Queue the data-format acknowledgement an incoming data frame asked for.
+    ///
+    /// Shared by the normal and duplicate reception paths so a retransmission
+    /// is acknowledged exactly like the frame it repeats (R22 §2.2.4.1.3).
+    /// Acknowledging is a *reception* acknowledgement, never acceptance: the
+    /// frame may still be dropped as a duplicate, or fail application-level
+    /// handling, after the acknowledgement is queued.
+    fn queue_data_ack(&mut self, header: &ApsHeader, nwk_src: ShortAddress) {
+        if !header.frame_control.ack_request {
+            return;
+        }
+        self.pending_aps_ack = Some(PendingApsAck {
+            dst_addr: nwk_src,
+            dst_endpoint: header.src_endpoint.unwrap_or(0),
+            src_endpoint: header.dst_endpoint.unwrap_or(0),
+            cluster_id: header.cluster_id.unwrap_or(0),
+            profile_id: header.profile_id.unwrap_or(0),
+            aps_counter: header.aps_counter,
+            command: false,
+        });
+    }
+
+    /// Record an incoming APS acknowledgement that authenticates the last
+    /// Verify-Key transmission.
+    ///
+    /// Reaching this function already means the frame was APS-decrypted and
+    /// MIC-verified (`aps_decrypt_incoming` returns `None` otherwise), so the
+    /// remaining checks establish *which* key authenticated it and *which*
+    /// frame it acknowledges:
+    ///
+    /// - the acknowledgement was APS-secured with a data key,
+    /// - the key that authenticated it was an installed link key, not the
+    ///   global ZigBeeAlliance09 key (`aps_used_default_link_key == false`),
+    /// - it came from the Trust Center (short *and* extended address),
+    /// - the Verify-Key it acknowledges was itself sent under the unique key,
+    /// - it echoes that Verify-Key's APS counter (R22 §2.2.5.1.1.5), and
+    /// - that Verify-Key is still awaiting its first acknowledgement.
+    ///
+    /// The result proves the Trust Center possesses the unique link key and
+    /// received that exact Verify-Key. It is deliberately **not** treated as a
+    /// Confirm-Key: it carries no status field, so it can never turn an
+    /// explicit rejection into a success.
+    fn note_incoming_aps_ack(
+        &mut self,
+        nwk_src: ShortAddress,
+        aps_counter: u8,
+        aps_secured: bool,
+        aps_security_source: Option<IeeeAddress>,
+        aps_key_identifier: Option<u8>,
+        aps_used_default_link_key: bool,
+    ) {
+        if !aps_secured
+            || aps_used_default_link_key
+            || aps_key_identifier != Some(crate::security::KEY_ID_DATA_KEY)
+            || nwk_src != ShortAddress::COORDINATOR
+        {
+            return;
+        }
+        let Some(trust_center) = centralized_trust_center(self.aib.aps_trust_center_address) else {
+            return;
+        };
+        if aps_security_source != Some(trust_center) {
+            return;
+        }
+        let stats = &mut self.security_handshake_stats;
+        if !stats.verify_key_ack_outstanding
+            || !stats.last_verify_key_used_unique_key
+            || stats.last_verify_key_trust_center != trust_center
+            || stats.last_verify_key_aps_counter != aps_counter
+        {
+            return;
+        }
+        stats.verify_key_ack_outstanding = false;
+        stats.verify_key_acks = stats.verify_key_acks.wrapping_add(1);
+        log::info!(
+            "[APS] Verify-Key (APS counter {}) acknowledged under the unique Trust Center link key",
+            aps_counter,
+        );
+    }
+
+    /// Handle an incoming APS Confirm-Key command (R21+ §4.7.3.6).
+    ///
+    /// A Confirm-Key is the Trust Center's verdict on the unique Trust Center
+    /// link key, and the BDB state machine treats that verdict as a security
+    /// predicate: a rejection is a hard failure that leaves the network. So
+    /// only a frame that *proves* it came from the Trust Center may move any
+    /// of the exchange counters. That requires all of:
+    ///
+    /// - APS security applied, decrypted and MIC-verified with the Data key
+    ///   identifier, and **not** under the globally known ZigBeeAlliance09 key
+    ///   (a default-key Confirm-Key proves nothing and is never accepted);
+    /// - the frame carried NWK security with an identified source, once a
+    ///   network key is active;
+    /// - the NWK source is the centralized Trust Center at 0x0000 and the APS
+    ///   security source is the configured Trust Center IEEE address;
+    /// - the payload parses, names the Trust Center link key type and is
+    ///   addressed to this device's own IEEE address.
+    ///
+    /// Anything else — unsecured, forged, malformed, someone else's
+    /// Confirm-Key — is counted in
+    /// [`ApsSecurityHandshakeStats::confirm_key_ignored`] and otherwise has no
+    /// effect. Without that separation an attacker who never held the unique
+    /// key could forge a rejection and force this device off the network, and
+    /// could equally suppress the acknowledgement-gated compatibility path by
+    /// moving `confirm_key_received`.
+    fn handle_confirm_key(
+        &mut self,
+        data: &[u8],
+        nwk_src: ShortAddress,
+        security: IncomingCommandSecurity,
+        aps_used_default_link_key: bool,
+    ) {
+        let Some(command) = parse_confirm_key_command(data) else {
+            log::warn!(
+                "[APS] ignoring malformed Confirm-Key from 0x{:04X}",
+                nwk_src.0
+            );
+            self.note_ignored_confirm_key();
+            return;
+        };
+
+        let authenticated = security.aps_secured
+            && !aps_used_default_link_key
+            && security.aps_key_identifier == Some(crate::security::KEY_ID_DATA_KEY)
+            && nwk_src == ShortAddress::COORDINATOR
+            // A Confirm-Key only ever arrives after the network key is in
+            // place, so it must be NWK-secured by an identified sender too.
+            // NWK security is hop by hop, so that sender is the last relay,
+            // not necessarily the Trust Center — the APS MIC below is what
+            // binds the frame to the Trust Center.
+            && (security.nwk_authenticated() || self.nwk.security().active_key().is_none())
+            && centralized_trust_center(self.aib.aps_trust_center_address).is_some()
+            && security.aps_source == centralized_trust_center(self.aib.aps_trust_center_address)
+            && command.key_type == WIRE_KEY_TYPE_TC_LINK
+            && command.destination == self.nwk.nib().ieee_address;
+
+        if !authenticated {
+            log::warn!(
+                "[APS] ignoring unauthenticated Confirm-Key from 0x{:04X} (aps_secured={} \
+                 default_key={} key_id={:?})",
+                nwk_src.0,
+                security.aps_secured,
+                aps_used_default_link_key,
+                security.aps_key_identifier,
+            );
+            self.note_ignored_confirm_key();
+            return;
+        }
+
+        let stats = &mut self.security_handshake_stats;
+        stats.confirm_key_received = stats.confirm_key_received.wrapping_add(1);
+        stats.last_confirm_key_source = nwk_src.0;
+        stats.last_confirm_key_source_ieee = security.aps_source.unwrap_or([0u8; 8]);
+        stats.last_confirm_key_key_identifier = security.aps_key_identifier.unwrap_or(0xFF);
+        stats.last_confirm_key_aps_secured = security.aps_secured;
+        stats.last_confirm_key_nwk_secured = security.nwk_secured;
+        stats.last_confirm_key_status = command.status;
+        stats.last_confirm_key_type = command.key_type;
+        stats.last_confirm_key_destination = command.destination;
+
+        if command.status == 0x00 {
+            stats.confirm_key_successes = stats.confirm_key_successes.wrapping_add(1);
+            log::info!("[APS] Confirm-Key SUCCESS from the Trust Center");
+        } else {
+            // An authenticated refusal under the negotiated unique key stays a
+            // hard failure for the BDB exchange.
+            stats.confirm_key_rejections = stats.confirm_key_rejections.wrapping_add(1);
+            log::warn!(
+                "[APS] Confirm-Key rejected by the Trust Center: status=0x{:02X}",
+                command.status
+            );
+        }
+    }
+
+    /// Record a Confirm-Key that never authenticated, without touching any
+    /// counter the BDB exchange reads.
+    fn note_ignored_confirm_key(&mut self) {
+        let stats = &mut self.security_handshake_stats;
+        stats.confirm_key_ignored = stats.confirm_key_ignored.wrapping_add(1);
     }
 
     fn authenticated_trust_center_source(
@@ -1496,7 +1680,8 @@ impl<M: MacDriver> ApsLayer<M> {
                 true,
                 &command,
             )
-            .await;
+            .await
+            .map(|_aps_counter| ());
 
         if has_unique_key {
             return encrypted;
@@ -1567,6 +1752,7 @@ impl<M: MacDriver> ApsLayer<M> {
             &command,
         )
         .await
+        .map(|_aps_counter| ())
     }
 
     /// Build and send an APSME-TRANSPORT-KEY command frame.
@@ -1642,6 +1828,7 @@ impl<M: MacDriver> ApsLayer<M> {
             &payload[..payload_len],
         )
         .await
+        .map(|_aps_counter| ())
     }
 
     /// Build and send an APSME-SWITCH-KEY command frame.
@@ -1677,6 +1864,7 @@ impl<M: MacDriver> ApsLayer<M> {
             &payload,
         )
         .await
+        .map(|_aps_counter| ())
     }
 
     /// Build and send an APSME-VERIFY-KEY command frame.
@@ -1708,18 +1896,32 @@ impl<M: MacDriver> ApsLayer<M> {
             dst.0
         );
         let payload = build_verify_key_command(src_ieee, key_type, hash);
+        // A Verify-Key is only ever answered by a *unique*-key Confirm-Key, so
+        // record which key encrypted it. `send_verify_key` may still fall back
+        // to the global ZigBeeAlliance09 key when no unique key is installed;
+        // an acknowledgement of that frame proves nothing about a unique key.
+        let used_unique_key = *key != *self.security.default_tc_link_key();
         self.security_handshake_stats.last_verify_key_frame_counter = frame_counter;
-        self.send_link_key_secured_command(
-            dst,
-            src_ieee,
-            key,
-            frame_counter,
-            crate::security::KEY_ID_DATA_KEY,
-            true,
-            true,
-            &payload,
-        )
-        .await?;
+        self.security_handshake_stats
+            .last_verify_key_used_unique_key = used_unique_key;
+        self.security_handshake_stats.verify_key_ack_outstanding = false;
+        let aps_counter = self
+            .send_link_key_secured_command(
+                dst,
+                src_ieee,
+                key,
+                frame_counter,
+                crate::security::KEY_ID_DATA_KEY,
+                true,
+                true,
+                &payload,
+            )
+            .await?;
+        // Armed only after the transmit succeeded: a Verify-Key that never
+        // left cannot be acknowledged, and leaving the slot armed would let a
+        // stale counter match an unrelated acknowledgement.
+        self.security_handshake_stats.last_verify_key_aps_counter = aps_counter;
+        self.security_handshake_stats.verify_key_ack_outstanding = true;
         self.security_handshake_stats.verify_key_sent = self
             .security_handshake_stats
             .verify_key_sent
@@ -1823,6 +2025,12 @@ impl<M: MacDriver> ApsLayer<M> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Transmit an APS command secured with a link key.
+    ///
+    /// Returns the APS counter the command was sent with, so a caller that
+    /// needs to recognise *its own* acknowledgement (R22 §2.2.5.1.1.5 echoes
+    /// the counter) can record it.
+    #[allow(clippy::too_many_arguments)]
     async fn send_link_key_secured_command(
         &mut self,
         dst: ShortAddress,
@@ -1833,7 +2041,7 @@ impl<M: MacDriver> ApsLayer<M> {
         ack_request: bool,
         nwk_security: bool,
         command: &[u8],
-    ) -> Result<(), ApsStatus> {
+    ) -> Result<u8, ApsStatus> {
         let aps_counter = self.next_aps_counter();
 
         let mut frame = [0u8; 80];
@@ -1855,7 +2063,7 @@ impl<M: MacDriver> ApsLayer<M> {
         self.nwk
             .nlde_data_request(dst, radius, &frame[..total], nwk_security, false)
             .await
-            .map(|_| ())
+            .map(|_| aps_counter)
             .map_err(|_| ApsStatus::NoAck)
     }
 
@@ -1867,20 +2075,23 @@ impl<M: MacDriver> ApsLayer<M> {
         };
 
         let aps_counter = ack_info.aps_counter;
+        // An ACK for an APS command frame carries no addressing fields
+        // (R22 §2.2.5.1.1.5); one for a data frame echoes them.
+        let addressed = !ack_info.command;
         let aps_header = ApsHeader {
             frame_control: ApsFrameControl {
                 frame_type: ApsFrameType::Ack as u8,
                 delivery_mode: ApsDeliveryMode::Unicast as u8,
-                ack_format: false,
+                ack_format: ack_info.command,
                 security: false,
                 ack_request: false,
                 extended_header: false,
             },
-            dst_endpoint: Some(ack_info.dst_endpoint),
+            dst_endpoint: addressed.then_some(ack_info.dst_endpoint),
             group_address: None,
-            cluster_id: Some(ack_info.cluster_id),
-            profile_id: Some(ack_info.profile_id),
-            src_endpoint: Some(ack_info.src_endpoint),
+            cluster_id: addressed.then_some(ack_info.cluster_id),
+            profile_id: addressed.then_some(ack_info.profile_id),
+            src_endpoint: addressed.then_some(ack_info.src_endpoint),
             aps_counter,
             extended_header: None,
         };
@@ -2258,6 +2469,17 @@ mod tests {
             }
             std::thread::yield_now();
         }
+    }
+
+    /// Advance the mock platform's monotonic clock.
+    ///
+    /// `MockMac::delay_micros` is the mock's clock source, so this is the same
+    /// time base [`ApsLayer::age_ack_table`] reads — the test never pokes a
+    /// private counter.
+    #[cfg(feature = "router")]
+    fn advance_aps_clock(aps: &mut ApsLayer<MockMac>, micros: u32) {
+        use zigbee_mac::PlatformServices;
+        block_on(aps.nwk_mut().mac_mut().delay_micros(micros));
     }
 
     #[cfg(feature = "router")]
@@ -3134,13 +3356,14 @@ mod tests {
     }
 
     /// R21+ §4.7.3.6: a Confirm-Key only proves possession of the **unique**
-    /// Trust Center link key. A Trust Center that secures Confirm-Key with the
-    /// global ZigBeeAlliance09 key (as some pre-R21-era coordinators do when
-    /// they never transported a unique key) proves nothing, so it must be
-    /// counted as a rejection and must never satisfy the BDB handshake.
+    /// Trust Center link key. A Confirm-Key secured with the global
+    /// ZigBeeAlliance09 key — which every Zigbee device on earth knows — proves
+    /// nothing, so it must not be accepted *and* must not be counted as a
+    /// rejection either: the BDB exchange reads the rejection counter as a
+    /// hard failure that leaves the network, and anyone could forge this frame.
     #[test]
     #[cfg(feature = "router")]
-    fn confirm_key_secured_with_the_global_key_is_rejected() {
+    fn confirm_key_secured_with_the_global_key_is_ignored() {
         let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
         aps.aib_mut().aps_trust_center_address = TC_IEEE;
         let global_key = *aps.security().default_tc_link_key();
@@ -3192,12 +3415,927 @@ mod tests {
             .is_none()
         );
         let stats = aps.security_handshake_stats();
-        assert_eq!(stats.confirm_key_received, 1);
         assert_eq!(
             stats.confirm_key_successes, 0,
             "a global-key Confirm-Key must never be accepted"
         );
+        assert_eq!(
+            stats.confirm_key_received, 0,
+            "and it is not part of the exchange at all"
+        );
+        assert_eq!(
+            stats.confirm_key_rejections, 0,
+            "counting it as a rejection would let anyone force a leave"
+        );
+        assert_eq!(stats.confirm_key_ignored, 1, "it is visible as ignored");
+    }
+
+    /// A forged Confirm-Key with no APS security at all must be inert. Before
+    /// the authentication gate it incremented both `confirm_key_received` and
+    /// `confirm_key_rejections`, which the BDB exchange reads as "the Trust
+    /// Center refused the key" — a hard failure that leaves the network.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_unauthenticated_confirm_key_cannot_move_the_exchange_counters() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        aps.aib_mut().aps_trust_center_address = TC_IEEE;
+        aps.security_mut()
+            .add_key(crate::security::ApsLinkKeyEntry {
+                partner_address: TC_IEEE,
+                key: UNIQUE_TCLK,
+                key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+                outgoing_frame_counter: 0,
+                outgoing_frame_counter_limit: 0x1000,
+                incoming_frame_counter: 0,
+                incoming_frame_counter_valid: false,
+            })
+            .unwrap();
+
+        let mut command = [0u8; 11];
+        command[0] = crate::frames::ApsCommandId::ConfirmKey as u8;
+        command[1] = 0x01; // a refusal — the dangerous one to forge
+        command[2] = WIRE_KEY_TYPE_TC_LINK;
+        command[3..11].copy_from_slice(&LOCAL_IEEE);
+        let frame = unsecured_command_frame(&command, 0x51);
+
+        let mut buf = ApsFrameBuffer::new();
+        assert!(
+            aps.process_incoming_aps_frame(
+                &frame,
+                ShortAddress::COORDINATOR,
+                LOCAL_SHORT,
+                180,
+                IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+                &mut buf,
+            )
+            .is_none()
+        );
+        let stats = aps.security_handshake_stats();
+        assert_eq!(stats.confirm_key_received, 0);
+        assert_eq!(stats.confirm_key_rejections, 0);
+        assert_eq!(stats.confirm_key_successes, 0);
+        assert_eq!(stats.confirm_key_ignored, 1);
+    }
+
+    /// A malformed Confirm-Key is equally inert, and a well-formed one for
+    /// *another* device is not this device's business either.
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_malformed_or_foreign_confirm_key_is_ignored() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        aps.aib_mut().aps_trust_center_address = TC_IEEE;
+        aps.security_mut()
+            .add_key(crate::security::ApsLinkKeyEntry {
+                partner_address: TC_IEEE,
+                key: UNIQUE_TCLK,
+                key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+                outgoing_frame_counter: 0,
+                outgoing_frame_counter_limit: 0x1000,
+                incoming_frame_counter: 0,
+                incoming_frame_counter_valid: false,
+            })
+            .unwrap();
+        let tc_security = crate::security::ApsSecurity::new();
+
+        // Truncated payload.
+        let truncated = [
+            crate::frames::ApsCommandId::ConfirmKey as u8,
+            0x00,
+            WIRE_KEY_TYPE_TC_LINK,
+        ];
+        let mut frame = [0u8; 64];
+        let len = build_tc_secured_command_frame(
+            &tc_security,
+            &UNIQUE_TCLK,
+            &TC_IEEE,
+            0x31,
+            0x0000_0500,
+            crate::security::KEY_ID_DATA_KEY,
+            false,
+            &truncated,
+            &mut frame,
+        )
+        .unwrap();
+        let mut buf = ApsFrameBuffer::new();
+        let _ = aps.process_incoming_aps_frame(
+            &frame[..len],
+            ShortAddress::COORDINATOR,
+            LOCAL_SHORT,
+            180,
+            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+            &mut buf,
+        );
+
+        // Well-formed, authenticated, but confirming somebody else's key.
+        let mut foreign = [0u8; 11];
+        foreign[0] = crate::frames::ApsCommandId::ConfirmKey as u8;
+        foreign[1] = 0x00;
+        foreign[2] = WIRE_KEY_TYPE_TC_LINK;
+        foreign[3..11].copy_from_slice(&CHILD_IEEE);
+        let mut foreign_frame = [0u8; 64];
+        let foreign_len = build_tc_secured_command_frame(
+            &tc_security,
+            &UNIQUE_TCLK,
+            &TC_IEEE,
+            0x32,
+            0x0000_0600,
+            crate::security::KEY_ID_DATA_KEY,
+            false,
+            &foreign,
+            &mut foreign_frame,
+        )
+        .unwrap();
+        let mut foreign_buf = ApsFrameBuffer::new();
+        let _ = aps.process_incoming_aps_frame(
+            &foreign_frame[..foreign_len],
+            ShortAddress::COORDINATOR,
+            LOCAL_SHORT,
+            180,
+            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+            &mut foreign_buf,
+        );
+
+        let stats = aps.security_handshake_stats();
+        assert_eq!(stats.confirm_key_received, 0);
+        assert_eq!(stats.confirm_key_rejections, 0);
+        assert_eq!(stats.confirm_key_successes, 0);
+        assert_eq!(stats.confirm_key_ignored, 2);
+    }
+
+    /// The other half of the gate: an **authenticated** refusal under the
+    /// negotiated unique Trust Center link key is still a real rejection, and
+    /// still reaches the BDB exchange's hard-failure path.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_authenticated_unique_key_confirm_key_rejection_is_counted() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        aps.aib_mut().aps_trust_center_address = TC_IEEE;
+        aps.security_mut()
+            .add_key(crate::security::ApsLinkKeyEntry {
+                partner_address: TC_IEEE,
+                key: UNIQUE_TCLK,
+                key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+                outgoing_frame_counter: 0,
+                outgoing_frame_counter_limit: 0x1000,
+                incoming_frame_counter: 0,
+                incoming_frame_counter_valid: false,
+            })
+            .unwrap();
+
+        let tc_security = crate::security::ApsSecurity::new();
+        let mut confirm_key = [0u8; 11];
+        confirm_key[0] = crate::frames::ApsCommandId::ConfirmKey as u8;
+        confirm_key[1] = 0xAD; // an explicit refusal
+        confirm_key[2] = WIRE_KEY_TYPE_TC_LINK;
+        confirm_key[3..11].copy_from_slice(&LOCAL_IEEE);
+        let mut frame = [0u8; 64];
+        let len = build_tc_secured_command_frame(
+            &tc_security,
+            &UNIQUE_TCLK,
+            &TC_IEEE,
+            0x41,
+            0x0000_0700,
+            crate::security::KEY_ID_DATA_KEY,
+            false,
+            &confirm_key,
+            &mut frame,
+        )
+        .unwrap();
+
+        let mut buf = ApsFrameBuffer::new();
+        assert!(
+            aps.process_incoming_aps_frame(
+                &frame[..len],
+                ShortAddress::COORDINATOR,
+                LOCAL_SHORT,
+                180,
+                IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+                &mut buf,
+            )
+            .is_none()
+        );
+        let stats = aps.security_handshake_stats();
+        assert_eq!(stats.confirm_key_received, 1);
         assert_eq!(stats.confirm_key_rejections, 1);
+        assert_eq!(stats.confirm_key_successes, 0);
+        assert_eq!(stats.confirm_key_ignored, 0);
+        assert_eq!(stats.last_confirm_key_status, 0xAD);
+    }
+
+    /// R22 §2.2.4.1.3 and §2.2.5.1.1.5: an APS *command* frame that requests an
+    /// acknowledgement is acknowledged like any other APS frame, and the ACK
+    /// uses the command format — no endpoints, cluster or profile identifier.
+    ///
+    /// Generic R22 conformance, not a workaround: in the 2026-08-09 ZiGate
+    /// v3.23 capture every Transport-Key and Confirm-Key carries
+    /// `ack_request = 0`, so that coordinator never waited on this ACK. Other
+    /// coordinators do set the bit.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_acknowledged_aps_command_queues_a_command_format_ack() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        aps.aib_mut().aps_trust_center_address = TC_IEEE;
+        let global_key = *aps.security().default_tc_link_key();
+
+        let tc_security = crate::security::ApsSecurity::new();
+        let mut confirm_key = [0u8; 11];
+        confirm_key[0] = crate::frames::ApsCommandId::ConfirmKey as u8;
+        confirm_key[1] = 0x00;
+        confirm_key[2] = WIRE_KEY_TYPE_TC_LINK;
+        confirm_key[3..11].copy_from_slice(&LOCAL_IEEE);
+        let mut frame = [0u8; 64];
+        let len = build_tc_secured_command_frame(
+            &tc_security,
+            &global_key,
+            &TC_IEEE,
+            0x21,
+            0x0000_0300,
+            crate::security::KEY_ID_DATA_KEY,
+            true,
+            &confirm_key,
+            &mut frame,
+        )
+        .unwrap();
+
+        let mut buf = ApsFrameBuffer::new();
+        assert!(
+            aps.process_incoming_aps_frame(
+                &frame[..len],
+                ShortAddress::COORDINATOR,
+                LOCAL_SHORT,
+                180,
+                IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+                &mut buf,
+            )
+            .is_none()
+        );
+
+        let pending = aps
+            .pending_aps_ack
+            .clone()
+            .expect("an APS command frame that requests an ACK must be acknowledged");
+        assert!(
+            pending.command,
+            "the ACK for a command frame uses the command acknowledgement format"
+        );
+        assert_eq!(pending.dst_addr, ShortAddress::COORDINATOR);
+        assert_eq!(pending.aps_counter, 0x21);
+
+        // …and it is actually put on the air, clearing the pending slot.
+        aps.nwk_mut().mac_mut().clear_tx_history();
+        assert!(block_on(aps.send_pending_aps_ack()).is_ok());
+        assert!(aps.pending_aps_ack.is_none());
+        assert_eq!(
+            aps.nwk().mac().tx_history().len(),
+            1,
+            "the command acknowledgement must be transmitted"
+        );
+    }
+
+    /// An APS command frame that does not request an acknowledgement must not
+    /// generate one — the extra unicast would be pure air time.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_unacknowledged_aps_command_queues_no_ack() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        aps.aib_mut().aps_trust_center_address = TC_IEEE;
+        let global_key = *aps.security().default_tc_link_key();
+
+        let tc_security = crate::security::ApsSecurity::new();
+        let mut confirm_key = [0u8; 11];
+        confirm_key[0] = crate::frames::ApsCommandId::ConfirmKey as u8;
+        confirm_key[1] = 0x00;
+        confirm_key[2] = WIRE_KEY_TYPE_TC_LINK;
+        confirm_key[3..11].copy_from_slice(&LOCAL_IEEE);
+        let mut frame = [0u8; 64];
+        let len = build_tc_secured_command_frame(
+            &tc_security,
+            &global_key,
+            &TC_IEEE,
+            0x22,
+            0x0000_0400,
+            crate::security::KEY_ID_DATA_KEY,
+            false,
+            &confirm_key,
+            &mut frame,
+        )
+        .unwrap();
+
+        let mut buf = ApsFrameBuffer::new();
+        let _ = aps.process_incoming_aps_frame(
+            &frame[..len],
+            ShortAddress::COORDINATOR,
+            LOCAL_SHORT,
+            180,
+            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+            &mut buf,
+        );
+        assert!(aps.pending_aps_ack.is_none());
+    }
+
+    /// The acknowledgement is network-secured, so it cannot be produced before
+    /// a network key is active. The Transport-Key that delivers that very key
+    /// must therefore never leave a pending ACK behind for a later frame to
+    /// flush with a stale APS counter.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_aps_command_before_the_network_key_queues_no_ack() {
+        let mut nwk = NwkLayer::new(MockMac::new(LOCAL_IEEE), DeviceType::EndDevice);
+        nwk.set_joined(true);
+        {
+            let nib = nwk.nib_mut();
+            nib.pan_id = TEST_PAN;
+            nib.network_address = LOCAL_SHORT;
+            nib.parent_address = ShortAddress::COORDINATOR;
+            nib.ieee_address = LOCAL_IEEE;
+        }
+        let mut aps = ApsLayer::new(nwk);
+        assert!(aps.nwk().security().active_key().is_none());
+
+        let tc_security = crate::security::ApsSecurity::new();
+        let transport_key_key =
+            crate::security::derive_key_transport_key(aps.security().default_tc_link_key());
+        let mut transport_key = [0u8; 35];
+        transport_key[0] = crate::frames::ApsCommandId::TransportKey as u8;
+        transport_key[1] = 0x01;
+        transport_key[2..18].copy_from_slice(&TEST_NETWORK_KEY);
+        transport_key[18] = 0;
+        transport_key[19..27].copy_from_slice(&LOCAL_IEEE);
+        transport_key[27..35].copy_from_slice(&TC_IEEE);
+        let mut frame = [0u8; 96];
+        let len = build_tc_secured_command_frame(
+            &tc_security,
+            &transport_key_key,
+            &TC_IEEE,
+            0x07,
+            0x0000_0100,
+            crate::security::KEY_ID_KEY_TRANSPORT,
+            true,
+            &transport_key,
+            &mut frame,
+        )
+        .unwrap();
+
+        let mut buf = ApsFrameBuffer::new();
+        let _ = aps.process_incoming_aps_frame(
+            &frame[..len],
+            ShortAddress::COORDINATOR,
+            LOCAL_SHORT,
+            180,
+            IncomingNwkSecurity::new(false, None),
+            &mut buf,
+        );
+        assert!(
+            aps.pending_aps_ack.is_none(),
+            "an ACK that cannot be network-secured must not be queued"
+        );
+    }
+
+    // ── Verify-Key acknowledgement (ZiGate v3.23 compatibility) ──
+
+    /// Build the *secured command-format* APS acknowledgement layout captured
+    /// in `zigbee-join.pcap` frame 464: frame control `0x32`, the echoed APS
+    /// counter, a five-octet auxiliary security header (data key, no extended
+    /// nonce) and a MIC over a zero-length payload.
+    #[cfg(feature = "router")]
+    fn build_secured_command_ack(
+        security: &crate::security::ApsSecurity,
+        link_key: &crate::security::AesKey,
+        source_ieee: &IeeeAddress,
+        aps_counter: u8,
+        frame_counter: u32,
+        frame: &mut [u8],
+    ) -> usize {
+        let header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Ack as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: true,
+                security: true,
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: None,
+            group_address: None,
+            cluster_id: None,
+            profile_id: None,
+            src_endpoint: None,
+            aps_counter,
+            extended_header: None,
+        };
+        // No extended nonce on the wire (matching the capture): the receiver
+        // resolves the source IEEE from the NWK source / Trust Center address.
+        let wire_header = crate::security::ApsSecurityHeader {
+            security_control: crate::security::KEY_ID_DATA_KEY << 3,
+            frame_counter,
+            source_address: None,
+            key_seq_number: None,
+        };
+        let header_len = header.serialize(frame);
+        let aux_len = wire_header.serialize(&mut frame[header_len..]);
+        let aad_len = header_len + aux_len;
+        assert_eq!(aad_len, 7, "2-octet header + 5-octet auxiliary header");
+
+        let mut authenticated = [0u8; 16];
+        authenticated[..aad_len].copy_from_slice(&frame[..aad_len]);
+        authenticated[header_len] |= crate::security::SEC_LEVEL_ENC_MIC_32;
+
+        // The CCM* nonce always uses the sender IEEE even when the frame omits
+        // it from the auxiliary header.
+        let nonce_header = crate::security::ApsSecurityHeader {
+            security_control: crate::security::KEY_ID_DATA_KEY << 3,
+            frame_counter,
+            source_address: Some(*source_ieee),
+            key_seq_number: None,
+        };
+        let encrypted = security
+            .encrypt(&authenticated[..aad_len], &[], link_key, &nonce_header)
+            .expect("CCM* over an empty payload");
+        assert_eq!(encrypted.len(), 4, "MIC-32 only");
+        frame[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
+        aad_len + encrypted.len()
+    }
+
+    #[cfg(feature = "router")]
+    const UNIQUE_TCLK: crate::security::AesKey = [0x5C; 16];
+
+    /// Install a unique Trust Center link key and send a Verify-Key under it,
+    /// returning the APS counter the Verify-Key went out with.
+    #[cfg(feature = "router")]
+    fn send_unique_key_verify_key(aps: &mut ApsLayer<MockMac>) -> u8 {
+        aps.aib_mut().aps_trust_center_address = TC_IEEE;
+        aps.security_mut()
+            .add_key(crate::security::ApsLinkKeyEntry {
+                partner_address: TC_IEEE,
+                key: UNIQUE_TCLK,
+                key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+                outgoing_frame_counter: 0,
+                outgoing_frame_counter_limit: 0x1000,
+                incoming_frame_counter: 0,
+                incoming_frame_counter_valid: false,
+            })
+            .unwrap();
+        block_on(aps.send_tc_verify_key(ShortAddress::COORDINATOR)).unwrap();
+        let stats = aps.security_handshake_stats();
+        assert!(stats.last_verify_key_used_unique_key);
+        assert!(stats.verify_key_ack_outstanding);
+        stats.last_verify_key_aps_counter
+    }
+
+    /// The ZiGate v3.23 answer to our Verify-Key (capture 2026-08-09, frames
+    /// 462 → 464): a secured command-format APS ACK echoing the Verify-Key's
+    /// APS counter, encrypted under the unique Trust Center link key. It
+    /// authenticates, and is recorded as proof that the Trust Center holds
+    /// that key and received that exact Verify-Key.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_authenticated_unique_key_ack_of_verify_key_is_recorded() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        let verify_counter = send_unique_key_verify_key(&mut aps);
+        assert_eq!(aps.security_handshake_stats().verify_key_acks, 0);
+
+        let tc_security = crate::security::ApsSecurity::new();
+        let mut frame = [0u8; 32];
+        let len = build_secured_command_ack(
+            &tc_security,
+            &UNIQUE_TCLK,
+            &TC_IEEE,
+            verify_counter,
+            0x0000_0322,
+            &mut frame,
+        );
+        assert_eq!(len, 11, "the captured ZiGate ACK is 11 octets");
+
+        let mut buf = ApsFrameBuffer::new();
+        assert!(
+            aps.process_incoming_aps_frame(
+                &frame[..len],
+                ShortAddress::COORDINATOR,
+                LOCAL_SHORT,
+                180,
+                IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+                &mut buf,
+            )
+            .is_none(),
+            "an ACK never surfaces as a data indication"
+        );
+
+        let stats = aps.security_handshake_stats();
+        assert_eq!(
+            stats.verify_key_acks, 1,
+            "the authenticated ACK of our Verify-Key must be recorded"
+        );
+        assert!(
+            !stats.verify_key_ack_outstanding,
+            "the outstanding slot is cleared so one transmission counts once"
+        );
+        assert_eq!(
+            stats.confirm_key_received, 0,
+            "an acknowledgement is never a Confirm-Key"
+        );
+    }
+
+    /// A secured ACK with the *wrong* APS counter belongs to some other frame
+    /// and must not be mistaken for the Verify-Key's acknowledgement.
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_unique_key_ack_for_another_aps_counter_is_ignored() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        let verify_counter = send_unique_key_verify_key(&mut aps);
+
+        let tc_security = crate::security::ApsSecurity::new();
+        let mut frame = [0u8; 32];
+        let len = build_secured_command_ack(
+            &tc_security,
+            &UNIQUE_TCLK,
+            &TC_IEEE,
+            verify_counter.wrapping_add(1),
+            0x0000_0322,
+            &mut frame,
+        );
+
+        let mut buf = ApsFrameBuffer::new();
+        let _ = aps.process_incoming_aps_frame(
+            &frame[..len],
+            ShortAddress::COORDINATOR,
+            LOCAL_SHORT,
+            180,
+            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+            &mut buf,
+        );
+        assert_eq!(aps.security_handshake_stats().verify_key_acks, 0);
+        assert!(aps.security_handshake_stats().verify_key_ack_outstanding);
+    }
+
+    /// An *unsecured* ACK proves nothing: anyone can emit one. It must never
+    /// count, however well its APS counter matches.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_unsecured_ack_of_verify_key_is_not_proof() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        let verify_counter = send_unique_key_verify_key(&mut aps);
+
+        let header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Ack as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: true,
+                security: false,
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: None,
+            group_address: None,
+            cluster_id: None,
+            profile_id: None,
+            src_endpoint: None,
+            aps_counter: verify_counter,
+            extended_header: None,
+        };
+        let mut frame = [0u8; 8];
+        let len = header.serialize(&mut frame);
+
+        let mut buf = ApsFrameBuffer::new();
+        let _ = aps.process_incoming_aps_frame(
+            &frame[..len],
+            ShortAddress::COORDINATOR,
+            LOCAL_SHORT,
+            180,
+            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+            &mut buf,
+        );
+        assert_eq!(aps.security_handshake_stats().verify_key_acks, 0);
+        assert!(aps.security_handshake_stats().verify_key_ack_outstanding);
+    }
+
+    /// A Verify-Key sent under the *global* ZigBeeAlliance09 key can be
+    /// acknowledged by any device holding that well-known key, so its
+    /// acknowledgement is never proof of a unique key.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_ack_of_a_global_key_verify_key_is_not_proof() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        aps.aib_mut().aps_trust_center_address = TC_IEEE;
+        let global_key = *aps.security().default_tc_link_key();
+        block_on(aps.send_tc_verify_key(ShortAddress::COORDINATOR)).unwrap_err();
+        // No TCLK entry at all: fall back to the generic Verify-Key path,
+        // which uses the global key.
+        let hash = crate::security::derive_verify_key_hash(&global_key);
+        block_on(aps.send_verify_key(
+            ShortAddress::COORDINATOR,
+            &LOCAL_IEEE,
+            WIRE_KEY_TYPE_TC_LINK,
+            &hash,
+        ))
+        .unwrap();
+        let stats = aps.security_handshake_stats();
+        assert!(
+            !stats.last_verify_key_used_unique_key,
+            "a global-key Verify-Key must be flagged as such"
+        );
+        let verify_counter = stats.last_verify_key_aps_counter;
+
+        let tc_security = crate::security::ApsSecurity::new();
+        let mut frame = [0u8; 32];
+        let len = build_secured_command_ack(
+            &tc_security,
+            &global_key,
+            &TC_IEEE,
+            verify_counter,
+            0x0000_0500,
+            &mut frame,
+        );
+
+        let mut buf = ApsFrameBuffer::new();
+        let _ = aps.process_incoming_aps_frame(
+            &frame[..len],
+            ShortAddress::COORDINATOR,
+            LOCAL_SHORT,
+            180,
+            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+            &mut buf,
+        );
+        assert_eq!(
+            aps.security_handshake_stats().verify_key_acks,
+            0,
+            "ZigBeeAlliance09 can never establish unique-key possession"
+        );
+    }
+
+    /// R22 §2.2.4.1.3: a duplicate unicast data frame is discarded *after* its
+    /// acknowledgement is regenerated. A duplicate only exists because the
+    /// sender did not see the first ACK, so answering with silence keeps it
+    /// retransmitting until its own budget runs out.
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_duplicate_data_frame_is_still_acknowledged() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        let header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Data as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: false,
+                ack_request: true,
+                extended_header: false,
+            },
+            dst_endpoint: Some(0x00),
+            group_address: None,
+            cluster_id: Some(0x0004),
+            profile_id: Some(0x0000),
+            src_endpoint: Some(0x00),
+            aps_counter: 0x77,
+            extended_header: None,
+        };
+        let mut frame = [0u8; 32];
+        let header_len = header.serialize(&mut frame);
+        frame[header_len..header_len + 4].copy_from_slice(&[0x11, 0x11, 0x11, 0x01]);
+        let len = header_len + 4;
+
+        let mut buf = ApsFrameBuffer::new();
+        assert!(
+            aps.process_incoming_aps_frame(
+                &frame[..len],
+                ShortAddress::COORDINATOR,
+                LOCAL_SHORT,
+                180,
+                IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+                &mut buf,
+            )
+            .is_some(),
+            "the first copy is dispatched"
+        );
+        let first = aps.pending_aps_ack.clone().expect("first copy is acked");
+        assert_eq!(first.aps_counter, 0x77);
+        assert!(!first.command);
+        aps.pending_aps_ack = None;
+
+        let mut buf = ApsFrameBuffer::new();
+        assert!(
+            aps.process_incoming_aps_frame(
+                &frame[..len],
+                ShortAddress::COORDINATOR,
+                LOCAL_SHORT,
+                180,
+                IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+                &mut buf,
+            )
+            .is_none(),
+            "a duplicate is not dispatched a second time"
+        );
+        let repeat = aps
+            .pending_aps_ack
+            .clone()
+            .expect("a duplicate must still be acknowledged");
+        assert_eq!(repeat.aps_counter, 0x77);
+        assert_eq!(repeat.dst_addr, ShortAddress::COORDINATOR);
+        assert!(!repeat.command);
+    }
+
+    /// An APS retransmission repeats the original *unicast* (R22 §2.2.5.2.2):
+    /// the destination travels with the frame so a retry can never be turned
+    /// into a network-wide broadcast.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_aps_retransmission_keeps_its_unicast_destination() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        aps.register_ack_pending(0x42, 0x1234, &[0xAA, 0xBB, 0xCC])
+            .expect("a free ACK slot");
+
+        advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US);
+        let retransmissions = aps.age_ack_table();
+        assert_eq!(retransmissions.len(), 1);
+        assert_eq!(retransmissions[0].dst_addr, ShortAddress(0x1234));
+        assert_eq!(retransmissions[0].frame.as_slice(), &[0xAA, 0xBB, 0xCC]);
+    }
+
+    /// A burst of acknowledged unicasts — a ZDO interview answers several in a
+    /// row — must not lose retry tracking for the newest frame just because
+    /// older transmissions are still inside their acknowledgement window.
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_full_ack_table_reuses_the_longest_waiting_slot() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        let capacity = crate::APS_ACK_TABLE_SIZE;
+
+        // Fill the table, each entry 100 ms apart and all still well inside
+        // their window.
+        for slot in 0..capacity {
+            assert_eq!(
+                aps.register_ack_pending(slot as u8, 0x1000 + slot as u16, &[slot as u8]),
+                Some(slot)
+            );
+            advance_aps_clock(&mut aps, 100_000);
+        }
+
+        // One more: it takes the oldest slot, and the oldest frame is gone.
+        let reused = aps
+            .register_ack_pending(0xEE, 0x2222, &[0xEE])
+            .expect("the newest transmission is always tracked");
+        assert_eq!(reused, 0, "the longest-waiting entry is the one reused");
+        assert!(
+            !aps.confirm_ack(0x1000, 0),
+            "the evicted transmission is no longer tracked"
+        );
+        assert!(
+            aps.confirm_ack(0x2222, 0xEE),
+            "the newest transmission is tracked"
+        );
+        assert!(
+            aps.confirm_ack(0x1000 + capacity as u16 - 1, capacity as u8 - 1),
+            "the other in-flight transmissions are untouched"
+        );
+    }
+
+    /// Router builds track eight acknowledged unicasts. If all eight become
+    /// due in the same maintenance pass, every one must be returned without
+    /// silently consuming retry budgets for entries beyond a smaller output
+    /// queue.
+    #[test]
+    #[cfg(feature = "router")]
+    fn every_due_ack_entry_is_returned_for_retransmission() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        let capacity = crate::APS_ACK_TABLE_SIZE;
+
+        for slot in 0..capacity {
+            aps.register_ack_pending(slot as u8, 0x1000 + slot as u16, &[slot as u8])
+                .expect("the router ACK table has room");
+        }
+
+        advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US);
+        let retransmissions = aps.age_ack_table();
+        assert_eq!(retransmissions.len(), capacity);
+        for (slot, retransmission) in retransmissions.iter().enumerate() {
+            assert_eq!(retransmission.dst_addr, ShortAddress(0x1000 + slot as u16));
+            assert_eq!(retransmission.frame.as_slice(), &[slot as u8]);
+        }
+    }
+
+    /// `apscAckWaitDuration` (R22 Table 2-24) is a *time*, not a call count.
+    /// Maintenance runs far more often than once per acknowledgement window —
+    /// on a sleepy build it can run every few milliseconds — and every one of
+    /// those calls used to consume a retry, so a single unicast put four
+    /// copies on the air back to back and then gave up within tens of
+    /// milliseconds, long before any acknowledgement could arrive.
+    #[test]
+    #[cfg(feature = "router")]
+    fn no_retransmission_happens_before_the_ack_wait_duration() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        aps.register_ack_pending(0x42, 0x1234, &[0xAA, 0xBB, 0xCC])
+            .expect("a free ACK slot");
+
+        // 20 ms of maintenance ticks all the way up to the window edge.
+        let mut elapsed = 0u32;
+        while elapsed + 20_000 < crate::APS_ACK_WAIT_DURATION_US {
+            assert!(
+                aps.age_ack_table().is_empty(),
+                "no retry may be sent {elapsed} us into the acknowledgement window"
+            );
+            advance_aps_clock(&mut aps, 20_000);
+            elapsed += 20_000;
+        }
+        // Still one tick short of the full window.
+        assert!(aps.age_ack_table().is_empty());
+
+        advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US - elapsed);
+        assert_eq!(
+            aps.age_ack_table().len(),
+            1,
+            "exactly one retry is due once the full window has elapsed"
+        );
+    }
+
+    /// Each successive retry gets its own full `apscAckWaitDuration`, and the
+    /// entry is only abandoned one further window after the last retry. With
+    /// `apscMaxFrameRetries = 3` that is four windows of tracking in total.
+    #[test]
+    #[cfg(feature = "router")]
+    fn successive_retransmissions_each_wait_a_full_ack_window() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        aps.register_ack_pending(0x42, 0x1234, &[0xAA, 0xBB, 0xCC])
+            .expect("a free ACK slot");
+
+        for retry in 1..=3 {
+            advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US - 1);
+            assert!(
+                aps.age_ack_table().is_empty(),
+                "retry {retry} must not start before its own full window"
+            );
+            advance_aps_clock(&mut aps, 1);
+            let retransmissions = aps.age_ack_table();
+            assert_eq!(
+                retransmissions.len(),
+                1,
+                "retry {retry} is due exactly once"
+            );
+            assert_eq!(retransmissions[0].dst_addr, ShortAddress(0x1234));
+        }
+
+        // The retry budget is spent; the entry still waits one last window
+        // before it is abandoned.
+        advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US - 1);
+        assert!(aps.age_ack_table().is_empty());
+        advance_aps_clock(&mut aps, 1);
+        assert!(
+            aps.age_ack_table().is_empty(),
+            "an exhausted entry times out instead of retransmitting again"
+        );
+        assert!(
+            aps.take_ack_status(0x42).is_none(),
+            "the timed-out entry has been released"
+        );
+    }
+
+    /// An acknowledgement that arrives inside the wait window ends the
+    /// transmission: no retry is ever put on the air and the slot is freed.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_acknowledgement_inside_the_window_cancels_the_retransmission() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        aps.register_ack_pending(0x42, 0x1234, &[0xAA, 0xBB, 0xCC])
+            .expect("a free ACK slot");
+
+        advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US / 2);
+        assert!(aps.confirm_ack(0x1234, 0x42));
+
+        assert!(
+            aps.age_ack_table().is_empty(),
+            "an acknowledged frame is never retransmitted"
+        );
+        advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US * 4);
+        assert!(
+            aps.age_ack_table().is_empty(),
+            "and it stays silent once the window it would have used has passed"
+        );
+        assert!(
+            aps.take_ack_status(0x42).is_none(),
+            "the acknowledged entry has been released"
+        );
+    }
+
+    /// A confirmed transmission must free its ACK-table slot. The table holds
+    /// four entries on a sensor build, so leaving confirmed entries active
+    /// would permanently exhaust it after the first handful of acknowledged
+    /// unicasts and silently stop tracking everything sent afterwards.
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_confirmed_transmission_frees_its_ack_slot() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        let capacity = crate::APS_ACK_TABLE_SIZE;
+
+        for round in 0..(capacity * 3) {
+            let counter = round as u8;
+            assert!(
+                aps.register_ack_pending(counter, 0x0000, &[0xDE, 0xAD])
+                    .is_some(),
+                "slot {round} must be available once earlier transmissions are confirmed"
+            );
+            assert!(aps.confirm_ack(0x0000, counter));
+            assert!(
+                aps.age_ack_table().is_empty(),
+                "a confirmed transmission is never retransmitted"
+            );
+        }
     }
 
     /// End-to-end cover for the extracted `aps_decrypt_incoming` /

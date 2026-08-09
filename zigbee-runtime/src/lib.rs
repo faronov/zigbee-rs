@@ -1717,6 +1717,160 @@ mod resume_tests {
         );
     }
 
+    /// R22 §2.2.4.1.3 / §2.2.5.1.1.5: an APS *command* frame that requests an
+    /// acknowledgement is acknowledged, and Tunnel is such a command. The
+    /// Tunnel path returns early from the receive routine — it forwards the
+    /// embedded key to the joining child instead of producing a data
+    /// indication — so the acknowledgement the APS layer queued has to be
+    /// flushed on that path too. Leaving it in the single pending slot would
+    /// either drop it or spend it on the APS counter of an unrelated later
+    /// frame, and the Trust Center would keep retransmitting the tunnelled
+    /// key through us.
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_tunnelled_key_that_requests_an_ack_is_acknowledged_and_still_forwarded() {
+        use zigbee_aps::frames::{
+            ApsCommandId, ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader,
+        };
+        use zigbee_aps::security::{ApsSecurityHeader, KEY_ID_KEY_TRANSPORT};
+        use zigbee_mac::CapabilityInfo;
+
+        const CHILD_IEEE: [u8; 8] = [0x33; 8];
+        const TUNNEL_APS_COUNTER: u8 = 0x37;
+
+        let mut device = resumed_router();
+
+        // The joining child the Trust Center is tunnelling a key to.
+        let child = {
+            let nwk = device.bdb.zdo_mut().aps_mut().nwk_mut();
+            nwk.nib_mut().permit_joining = true;
+            nwk.handle_child_association(
+                CHILD_IEEE,
+                CapabilityInfo {
+                    device_type_ffd: false,
+                    mains_powered: false,
+                    rx_on_when_idle: false,
+                    security_capable: true,
+                    allocate_address: true,
+                }
+                .to_byte(),
+            )
+            .expect("the child associates")
+        };
+
+        // The tunnelled payload: an APS-secured, key-transport-keyed command
+        // from the Trust Center. Only its header is inspected on this hop —
+        // the child owns the decryption — so the ciphertext is opaque here.
+        let embedded_header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Command as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: true,
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: None,
+            group_address: None,
+            cluster_id: None,
+            profile_id: None,
+            src_endpoint: None,
+            aps_counter: 0x12,
+            extended_header: None,
+        };
+        let embedded_security = ApsSecurityHeader {
+            security_control: (KEY_ID_KEY_TRANSPORT << 3) | (1 << 5),
+            frame_counter: 7,
+            source_address: Some(COORDINATOR_IEEE),
+            key_seq_number: None,
+        };
+        let mut embedded = [0u8; 64];
+        let mut embedded_len = embedded_header.serialize(&mut embedded);
+        embedded_len += embedded_security.serialize(&mut embedded[embedded_len..]);
+        embedded[embedded_len..embedded_len + 8].copy_from_slice(&[0xAB; 8]);
+        embedded_len += 8;
+
+        // The outer Tunnel command, unsecured at the APS layer as R22 requires
+        // and asking for an acknowledgement.
+        let tunnel_header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Command as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: false,
+                ack_request: true,
+                extended_header: false,
+            },
+            dst_endpoint: None,
+            group_address: None,
+            cluster_id: None,
+            profile_id: None,
+            src_endpoint: None,
+            aps_counter: TUNNEL_APS_COUNTER,
+            extended_header: None,
+        };
+        let mut aps_frame = [0u8; 96];
+        let mut aps_len = tunnel_header.serialize(&mut aps_frame);
+        aps_frame[aps_len] = ApsCommandId::Tunnel as u8;
+        aps_len += 1;
+        aps_frame[aps_len..aps_len + 8].copy_from_slice(&CHILD_IEEE);
+        aps_len += 8;
+        aps_frame[aps_len..aps_len + embedded_len].copy_from_slice(&embedded[..embedded_len]);
+        aps_len += embedded_len;
+
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &aps_frame[..aps_len],
+            31,
+            true,
+        );
+        device.mac_mut().clear_tx_history();
+
+        assert!(block_on(device.process_incoming(&indication(frame), &mut [])).is_none());
+
+        // The tunnelled key still reaches the sleepy child's indirect queue.
+        assert!(
+            device.bdb.zdo().nwk().indirect_queue().has_pending(child),
+            "the Tunnel must still be forwarded to the joining child"
+        );
+
+        // …and the acknowledgement went out. The child's copy is deliberately
+        // *not* NWK-secured and is held for its next poll, so the one frame on
+        // the air here is the acknowledgement to the Trust Center.
+        let history = device.mac_mut().tx_history();
+        assert_eq!(
+            history.len(),
+            1,
+            "the Tunnel command must be acknowledged exactly once"
+        );
+        let bytes = history[0].payload.as_slice();
+        let (nwk_header, nwk_consumed) =
+            zigbee_nwk::frames::NwkHeader::parse(bytes).expect("the acknowledgement parses");
+        assert_eq!(nwk_header.dst_addr, COORDINATOR);
+        assert!(nwk_header.frame_control.security);
+        let (aux, aux_len) = zigbee_nwk::security::NwkSecurityHeader::parse(&bytes[nwk_consumed..])
+            .expect("the acknowledgement is NWK-secured");
+        let aad_len = nwk_consumed + aux_len;
+        // Zigbee transmits security level 0 but authenticates the real level 5.
+        let mut aad = [0u8; 64];
+        aad[..aad_len].copy_from_slice(&bytes[..aad_len]);
+        aad[nwk_consumed] = (aad[nwk_consumed] & !0x07) | 0x05;
+        let plaintext = zigbee_nwk::security::NwkSecurity::new()
+            .decrypt(&aad[..aad_len], &bytes[aad_len..], &NETWORK_KEY, &aux)
+            .expect("the acknowledgement decrypts under the network key");
+        let (ack, _) = ApsHeader::parse(&plaintext).expect("the APS acknowledgement parses");
+        assert_eq!(ack.frame_control.frame_type, ApsFrameType::Ack as u8);
+        assert!(
+            ack.frame_control.ack_format,
+            "an APS command is acknowledged in the command format"
+        );
+        assert_eq!(
+            ack.aps_counter, TUNNEL_APS_COUNTER,
+            "the acknowledgement echoes the Tunnel's own APS counter"
+        );
+    }
+
     #[test]
     fn end_device_resume_does_not_start_router_operation() {
         let device = resumed_device(DeviceType::EndDevice);
@@ -5263,6 +5417,16 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             (indication, tunnel)
         };
         if let Some(tunnel) = pending_tunnel {
+            // A Tunnel command is an APS *command* frame like any other, so if
+            // it asked for an acknowledgement the APS layer queued one. Flush
+            // it before forwarding: the acknowledgement precedes the resulting
+            // application action (R22 §2.2.5.1), and this path returns early,
+            // so leaving the single pending-ACK slot occupied would either
+            // acknowledge the Tunnel with the APS counter of an unrelated later
+            // frame or drop the acknowledgement entirely — either way the Trust
+            // Center keeps retransmitting the tunnelled key. `send_pending_aps_ack`
+            // takes the slot, so this can never send it twice.
+            let _ = self.bdb.zdo_mut().aps_mut().send_pending_aps_ack().await;
             if let Err(error) = self.bdb.zdo_mut().aps_mut().forward_tunnel(&tunnel).await {
                 log::warn!("[Runtime] APS Tunnel forwarding failed: {:?}", error);
             }
@@ -5272,6 +5436,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             Some(v) => v,
             None => {
                 rt_trace!("[RT] aps_process=none");
+                // An APS *command* frame never produces a data indication, and
+                // neither does a duplicate that was dropped after its
+                // acknowledgement was regenerated (R22 §2.2.4.1.3). Either way
+                // the acknowledgement that was queued has to be flushed here or
+                // it would be left for an unrelated later frame.
+                let _ = self.bdb.zdo_mut().aps_mut().send_pending_aps_ack().await;
                 return None;
             }
         };

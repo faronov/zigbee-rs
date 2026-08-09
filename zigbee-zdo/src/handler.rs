@@ -30,7 +30,7 @@ const fn is_broadcast_short(addr: ShortAddress) -> bool {
 }
 
 /// Whether `addr` can name an individual device (`0x0000..=0xFFF7`).
-const fn is_unicast_short(addr: ShortAddress) -> bool {
+pub(crate) const fn is_unicast_short(addr: ShortAddress) -> bool {
     addr.0 < 0xFFF8
 }
 
@@ -1402,6 +1402,92 @@ mod tests {
     }
 
     // ── Supported requests keep working ─────────────────────────
+
+    /// Decode the APS header of the last frame the MAC sent.
+    fn last_aps_header(zdo: &ZdoLayer<MockMac>) -> Option<zigbee_aps::frames::ApsHeader> {
+        let record = zdo.nwk().mac().tx_history().last()?;
+        let frame = record.payload.as_slice();
+        let (_nwk, nwk_len) = zigbee_nwk::frames::NwkHeader::parse(frame)?;
+        let (aps, _) = zigbee_aps::frames::ApsHeader::parse(frame.get(nwk_len..)?)?;
+        Some(aps)
+    }
+
+    /// Reproduction cover for the ZiGate interview stall (capture 2026-08-09,
+    /// frame 1001): a unicast `Simple_Desc_req` addressed to this node for a
+    /// registered endpoint must produce a `Simple_Desc_rsp` (0x8004) carrying
+    /// the descriptor. z2m times out on cluster 32772 when this frame never
+    /// reaches the coordinator.
+    #[test]
+    fn unicast_simple_desc_request_answers_with_the_descriptor() {
+        let mut zdo = test_zdo();
+        let mut payload = [0u8; 4];
+        payload[0] = 0x51;
+        payload[1..3].copy_from_slice(&LOCAL_SHORT.0.to_le_bytes());
+        payload[3] = 1;
+        block_on(zdo.handle_indication(&unicast(crate::SIMPLE_DESC_REQ, &payload))).unwrap();
+
+        let (cluster, body) = last_zdp_tx(&zdo).expect("Simple_Desc_rsp must be transmitted");
+        assert_eq!(cluster, crate::SIMPLE_DESC_RSP);
+        assert_eq!(body[0], 0x51, "the response echoes the request TSN");
+        assert_eq!(body[1], ZdpStatus::Success as u8);
+        assert_eq!(u16::from_le_bytes([body[2], body[3]]), LOCAL_SHORT.0);
+        assert!(body[4] > 0, "a descriptor length must be reported");
+        assert_eq!(body[5], 1, "endpoint 1");
+        assert_eq!(u16::from_le_bytes([body[6], body[7]]), 0x0104);
+    }
+
+    /// A `Simple_Desc_req` for an endpoint this node does not have is still
+    /// answered — with `NOT_ACTIVE`, never with silence.
+    #[test]
+    fn unicast_simple_desc_request_for_an_unknown_endpoint_still_answers() {
+        let mut zdo = test_zdo();
+        let mut payload = [0u8; 4];
+        payload[0] = 0x52;
+        payload[1..3].copy_from_slice(&LOCAL_SHORT.0.to_le_bytes());
+        payload[3] = 9;
+        block_on(zdo.handle_indication(&unicast(crate::SIMPLE_DESC_REQ, &payload))).unwrap();
+
+        let (cluster, body) = last_zdp_tx(&zdo).expect("response frame");
+        assert_eq!(cluster, crate::SIMPLE_DESC_RSP);
+        assert_eq!(body[1], ZdpStatus::NotActive as u8);
+    }
+
+    /// R22 §2.4.1.2: a unicast ZDP frame is transmitted with an APS
+    /// acknowledgement requested. ZDP has no retry of its own, so the APS
+    /// retry is what carries a descriptor response through a transient route
+    /// failure — and the acknowledgement is what tells us it did not.
+    #[test]
+    fn a_unicast_zdp_response_requests_an_aps_acknowledgement() {
+        let mut zdo = test_zdo();
+        let mut payload = [0u8; 4];
+        payload[0] = 0x53;
+        payload[1..3].copy_from_slice(&LOCAL_SHORT.0.to_le_bytes());
+        payload[3] = 1;
+        block_on(zdo.handle_indication(&unicast(crate::SIMPLE_DESC_REQ, &payload))).unwrap();
+
+        let aps = last_aps_header(&zdo).expect("response frame");
+        assert!(
+            aps.frame_control.ack_request,
+            "a unicast ZDP response must request an APS acknowledgement"
+        );
+        assert_eq!(aps.cluster_id, Some(crate::SIMPLE_DESC_RSP));
+    }
+
+    /// A broadcast ZDP frame must never request an acknowledgement: there is
+    /// no single peer to answer, and every receiver answering would be a
+    /// broadcast storm.
+    #[test]
+    fn a_broadcast_zdp_frame_never_requests_an_aps_acknowledgement() {
+        let mut zdo = test_zdo();
+        block_on(zdo.device_annce(LOCAL_SHORT, LOCAL_IEEE)).unwrap();
+
+        let aps = last_aps_header(&zdo).expect("Device_annce frame");
+        assert_eq!(aps.cluster_id, Some(crate::DEVICE_ANNCE));
+        assert!(
+            !aps.frame_control.ack_request,
+            "a broadcast must not request an APS acknowledgement"
+        );
+    }
 
     #[test]
     fn unicast_active_ep_request_still_answers() {
