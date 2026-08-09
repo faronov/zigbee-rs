@@ -14,8 +14,8 @@ flash offsets are platform-specific.
 
 | Platform and role | Raw payload | Packaged image | CI raw budget |
 |---|---:|---:|---:|
-| TLSR8258 end-device sensor (hardware AES) | 269,960 B | — | 280 KiB |
-| TLSR8258 parent router (hardware AES) | 327,760 B | — | 336 KiB |
+| TLSR8258 end-device sensor (hardware AES) | 262,088 B | — | 280 KiB |
+| TLSR8258 parent router (hardware AES) | 317,868 B | — | 336 KiB |
 | BL702 end-device sensor (hardware AES) | 161,570 B | 169,776 B | 192 KiB |
 | nRF52840 end-device sensor | 202,688 B | — | 220 KiB |
 | nRF52840 relay router | 192,704 B | — | — |
@@ -32,10 +32,10 @@ comparison:
 
 | TLSR8258 image | Complete-HAL baseline | Current | Reduction |
 |---|---:|---:|---:|
-| End-device sensor | 323,876 B | 269,960 B | 53,916 B (16.6%) |
-| Parent router | 349,792 B | 327,760 B | 22,032 B (6.3%) |
+| End-device sensor | 323,876 B | 262,088 B | 61,788 B (19.1%) |
+| Parent router | 349,792 B | 317,868 B | 31,924 B (9.1%) |
 
-The current router is 57,800 bytes larger than the sensor because it retains
+The current router is 55,780 bytes larger than the sensor because it retains
 the behavior a real parent needs: route maintenance, child admission and
 aging, indirect delivery, parent-side MAC commands, Update-Device handling,
 and Parent Announce. The sensor instead retains the R22 End Device Timeout
@@ -104,11 +104,13 @@ frames. Cluster-specific responses have a compile-time proof that their
 The TLSR8258 hardware-AES provider is now proven on a TB-04 router: two
 startup known-answer tests, CCM*, AES-MMO, Request-Key, Verify-Key/Confirm-Key,
 a complete ZHA interview, more than ten minutes of secured traffic, and
-reset/resume all passed under an independent channel-15 capture. The standard
-images are 269,960 bytes for the sensor and 327,760 bytes for the router,
-saving 2,640 and 4,680 bytes respectively over the former software builds with
-8 additional bytes of RAM. Both production manifests install the accelerator
-unconditionally and fail closed without a software fallback.
+reset/resume all passed under an independent channel-15 capture. The initial
+hardware-AES release measured 269,960 bytes for the sensor and 327,760 bytes
+for the router, saving 2,640 and 4,680 bytes respectively over the former
+software builds with 8 additional bytes of RAM. The later receive-queue
+redesign reduced the current standard images to 262,088 and 317,868 bytes
+without changing that AES policy. Both production manifests install the
+accelerator unconditionally and fail closed without a software fallback.
 
 The BL702 SEC_ENG hardware-AES provider is the first cross-platform follow-up
 to the TLSR8258 work. Its two startup known-answer tests pass on XT-ZB1

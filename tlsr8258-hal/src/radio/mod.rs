@@ -347,6 +347,35 @@ pub struct ReceivedFrame {
 }
 
 impl ReceivedFrame {
+    /// Empty frame used to initialize the bounded receive queue's storage.
+    /// Never observable: [`RxQueue::pop`] only returns slots that
+    /// [`RxQueue::push`] has written.
+    #[cfg(any(target_arch = "tc32", test))]
+    const EMPTY: Self = Self {
+        data: [0; MAX_MAC_FRAME_LEN],
+        len: 0,
+        lqi: 0,
+        rssi: 0,
+    };
+
+    /// Build a frame value from an already length-validated MAC PSDU.
+    #[cfg(any(target_arch = "tc32", test))]
+    fn new(psdu: &[u8], lqi: u8, rssi: i8) -> Self {
+        let len = if psdu.len() > MAX_MAC_FRAME_LEN {
+            MAX_MAC_FRAME_LEN
+        } else {
+            psdu.len()
+        };
+        let mut data = [0u8; MAX_MAC_FRAME_LEN];
+        data[..len].copy_from_slice(&psdu[..len]);
+        Self {
+            data,
+            len: len as u8,
+            lqi,
+            rssi,
+        }
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         &self.data[..self.len as usize]
     }
@@ -367,6 +396,294 @@ pub enum RawRxOutcome {
     InvalidCrc,
 }
 
+/// Local MAC identity the bounded receive queue consults when it has to
+/// choose which frame to lose under overload.
+///
+/// This is the same identity [`Radio::set_ack_filter`] already publishes for
+/// the software-ACK path, so no new configuration surface is introduced.
+#[cfg(any(target_arch = "tc32", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RxAddressFilter {
+    pan_id: u16,
+    short_address: u16,
+    extended_address: [u8; 8],
+    enabled: bool,
+}
+
+/// Retention class of a received frame, ordered lowest-value = first to be
+/// sacrificed when the bounded receive queue is full.
+///
+/// Derived from the IEEE 802.15.4 MAC header alone (frame type + addressing
+/// fields, at most 13 bytes). No NWK/APS/ZCL parsing happens here, and the
+/// classification runs *after* the software ACK has already been sent, so it
+/// cannot extend the 192 us RX->ACK turnaround.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum RxPriority {
+    /// Provably not ours: another PAN, or a unicast to some other node.
+    /// Only queued while there is spare room.
+    Foreign = 0,
+    /// MAC acknowledgement captured outside a synchronous ACK window.
+    ///
+    /// ACK frames carry no destination, so a queued ACK cannot be proven to
+    /// belong to this node. Expected ACKs are consumed by the polled
+    /// `transmit_with_ack` path before they reach this queue; retain a queued
+    /// ACK over known-foreign traffic, but never over a broadcast or local
+    /// data frame.
+    Ack = 1,
+    /// Broadcast, or a frame with no destination addressing (beacons,
+    /// coordinator-directed frames). Cannot be proven irrelevant.
+    Broadcast = 2,
+    /// Unicast to this node's PAN + short or extended address.
+    Local = 3,
+}
+
+/// Classify `psdu` for the bounded receive queue's overload policy.
+///
+/// Deliberately conservative: anything that cannot be *proven* to belong to
+/// another node keeps at least [`RxPriority::Broadcast`], and while the
+/// local identity is unknown (`enabled == false`, or PAN id still 0xFFFF
+/// during scan/association) every frame is classified [`RxPriority::Local`]
+/// so the queue degrades to plain FIFO instead of guessing.
+#[cfg(any(target_arch = "tc32", test))]
+fn classify_rx_priority(psdu: &[u8], filter: &RxAddressFilter) -> RxPriority {
+    // Frame Control (2) + sequence number (1) is the shortest legal MAC
+    // header. Anything shorter is malformed; it cannot be an ACK for us.
+    if psdu.len() < 3 {
+        return RxPriority::Foreign;
+    }
+    let frame_control = u16::from_le_bytes([psdu[0], psdu[1]]);
+    let frame_type = frame_control & 0x07;
+    // Reserved frame types (0b100..0b111) are not IEEE 802.15.4-2006 frames.
+    if frame_type > 0x03 {
+        return RxPriority::Foreign;
+    }
+    if !filter.enabled || filter.pan_id == 0xFFFF {
+        return RxPriority::Local;
+    }
+    // Frame type 0b010 = Acknowledgement. An ACK carries no addressing, so
+    // it cannot outrank traffic known to be addressed to this node. ACKs
+    // expected by a local transmission are consumed synchronously and do not
+    // normally pass through this interrupt queue.
+    if frame_type == 0x02 {
+        return RxPriority::Ack;
+    }
+
+    let destination_mode = (frame_control >> 10) & 0x03;
+    let source_mode = (frame_control >> 14) & 0x03;
+    match destination_mode {
+        // No destination addressing: a beacon, or a frame implicitly
+        // addressed to the PAN coordinator. Never provably foreign.
+        0x00 => {
+            if source_mode == 0x00 {
+                // Neither address present and not an ACK: malformed.
+                RxPriority::Foreign
+            } else {
+                RxPriority::Broadcast
+            }
+        }
+        // 0b01 is reserved by IEEE 802.15.4-2006.
+        0x01 => RxPriority::Foreign,
+        0x02 => {
+            let Some(bytes) = psdu.get(3..7) else {
+                return RxPriority::Foreign;
+            };
+            let destination_pan = u16::from_le_bytes([bytes[0], bytes[1]]);
+            if destination_pan != filter.pan_id && destination_pan != 0xFFFF {
+                return RxPriority::Foreign;
+            }
+            let destination = u16::from_le_bytes([bytes[2], bytes[3]]);
+            if destination == 0xFFFF {
+                RxPriority::Broadcast
+            } else if filter.short_address < 0xFFF8 && destination == filter.short_address {
+                RxPriority::Local
+            } else {
+                RxPriority::Foreign
+            }
+        }
+        _ => {
+            let Some(bytes) = psdu.get(3..13) else {
+                return RxPriority::Foreign;
+            };
+            let destination_pan = u16::from_le_bytes([bytes[0], bytes[1]]);
+            if destination_pan != filter.pan_id && destination_pan != 0xFFFF {
+                return RxPriority::Foreign;
+            }
+            if bytes[2..10] == filter.extended_address {
+                RxPriority::Local
+            } else {
+                RxPriority::Foreign
+            }
+        }
+    }
+}
+
+/// Slot count of the bounded interrupt receive queue.
+///
+/// Sized from the five-hour channel-15 TB-04 capture rather than guessed:
+/// 463 720 decoded frames in ~18 000 s is a 26 frames/s mean, and the
+/// application's longest un-drained gap (CSMA backoff + TX + 8 ms ACK wait +
+/// `process_incoming`) is on the order of 100 ms. Sixteen 128-byte slots
+/// (2 KiB of the 64 KiB SRAM) cover ~600 ms at the observed mean rate and a
+/// 16-frame back-to-back burst. [`RxDiagnostics::queue_high_water`] reports
+/// the depth actually reached so this bound stays measured instead of
+/// re-guessed.
+#[cfg(any(target_arch = "tc32", test))]
+const IRQ_RX_QUEUE_CAPACITY: usize = 16;
+
+/// Outcome of one [`RxQueue::push`].
+#[cfg(any(target_arch = "tc32", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RxQueuePush {
+    /// There was room; nothing was lost.
+    Queued,
+    /// The queue was full and a strictly lower-priority queued frame was
+    /// sacrificed so this one could be kept.
+    Evicted,
+    /// The queue was full of frames at least as important as this one, so
+    /// this frame was dropped.
+    Dropped,
+}
+
+/// Bounded, priority-aware receive queue drained by the polled MAC windows
+/// and filled by [`handle_irq`].
+///
+/// Ordering is strict FIFO while there is room, which is the only behavior
+/// the MAC ever observes on an idle channel. Under overload the queue
+/// sacrifices the oldest strictly-lower-priority frame instead of the newest
+/// arrival, because the newest arrival is the one the upper layers are
+/// usually waiting for (an ACK, or a ZDO response addressed to us) while the
+/// stale entries are unrelated channel traffic this node only has to relay.
+///
+/// `order` is a permutation of every slot index: positions
+/// `head..head + len` are occupied and the remainder are free, so an
+/// eviction only shifts single-byte indices and never copies frame bytes.
+#[cfg(any(target_arch = "tc32", test))]
+struct RxQueue {
+    slots: [ReceivedFrame; IRQ_RX_QUEUE_CAPACITY],
+    priorities: [RxPriority; IRQ_RX_QUEUE_CAPACITY],
+    order: [u8; IRQ_RX_QUEUE_CAPACITY],
+    head: u8,
+    len: u8,
+    high_water: u8,
+    overflow: u32,
+    evicted: u32,
+}
+
+#[cfg(any(target_arch = "tc32", test))]
+impl RxQueue {
+    const fn new() -> Self {
+        let mut order = [0u8; IRQ_RX_QUEUE_CAPACITY];
+        let mut index = 0;
+        while index < IRQ_RX_QUEUE_CAPACITY {
+            order[index] = index as u8;
+            index += 1;
+        }
+        Self {
+            slots: [ReceivedFrame::EMPTY; IRQ_RX_QUEUE_CAPACITY],
+            priorities: [RxPriority::Foreign; IRQ_RX_QUEUE_CAPACITY],
+            order,
+            head: 0,
+            len: 0,
+            high_water: 0,
+            overflow: 0,
+            evicted: 0,
+        }
+    }
+
+    fn slot_at(&self, position: usize) -> usize {
+        self.order[(self.head as usize + position) % IRQ_RX_QUEUE_CAPACITY] as usize
+    }
+
+    fn push(&mut self, frame: ReceivedFrame, priority: RxPriority) -> RxQueuePush {
+        let len = self.len as usize;
+        if len == IRQ_RX_QUEUE_CAPACITY {
+            self.overflow = self.overflow.wrapping_add(1);
+            let Some(victim) = self.victim_for(priority) else {
+                return RxQueuePush::Dropped;
+            };
+            // Rotate the evicted slot index out of the occupied region and
+            // into the (currently empty) free region at the tail. Only
+            // `u8` indices move; the 128-byte frame bodies stay put.
+            let head = self.head as usize;
+            let evicted_slot = self.order[(head + victim) % IRQ_RX_QUEUE_CAPACITY];
+            let mut position = victim;
+            while position + 1 < len {
+                self.order[(head + position) % IRQ_RX_QUEUE_CAPACITY] =
+                    self.order[(head + position + 1) % IRQ_RX_QUEUE_CAPACITY];
+                position += 1;
+            }
+            self.order[(head + len - 1) % IRQ_RX_QUEUE_CAPACITY] = evicted_slot;
+            self.len -= 1;
+            self.evicted = self.evicted.wrapping_add(1);
+            self.store(frame, priority);
+            return RxQueuePush::Evicted;
+        }
+        self.store(frame, priority);
+        RxQueuePush::Queued
+    }
+
+    /// Oldest queued entry among those of the *lowest* priority present,
+    /// but only if that priority is strictly below the arriving frame's.
+    ///
+    /// Picking the global minimum (rather than the first entry that merely
+    /// happens to be lower) preserves all higher-value local and broadcast
+    /// traffic while sacrificing the stalest provably foreign frame first.
+    /// A linear scan over at most 16 one-byte priorities is a handful of
+    /// cycles and runs only when the queue is already full.
+    fn victim_for(&self, priority: RxPriority) -> Option<usize> {
+        let mut victim: Option<(usize, RxPriority)> = None;
+        for position in 0..self.len as usize {
+            let candidate = self.priorities[self.slot_at(position)];
+            if candidate >= priority {
+                continue;
+            }
+            match victim {
+                Some((_, lowest)) if lowest <= candidate => {}
+                _ => victim = Some((position, candidate)),
+            }
+        }
+        victim.map(|(position, _)| position)
+    }
+
+    fn store(&mut self, frame: ReceivedFrame, priority: RxPriority) {
+        let slot = self.slot_at(self.len as usize);
+        self.slots[slot] = frame;
+        self.priorities[slot] = priority;
+        self.len += 1;
+        if self.len > self.high_water {
+            self.high_water = self.len;
+        }
+    }
+
+    fn pop(&mut self) -> Option<ReceivedFrame> {
+        if self.len == 0 {
+            return None;
+        }
+        let slot = self.slot_at(0);
+        self.head = ((self.head as usize + 1) % IRQ_RX_QUEUE_CAPACITY) as u8;
+        self.len -= 1;
+        Some(self.slots[slot])
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    /// Cumulative frames lost at this queue, and how many of those losses
+    /// were low-priority evictions that saved a more important arrival.
+    #[cfg(test)]
+    const fn counters(&self) -> (u32, u32, u8) {
+        (self.overflow, self.evicted, self.high_water)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+}
+
 /// Bounded receive-path counters.
 ///
 /// These attribute a missing MAC acknowledgement to a specific stage of the
@@ -385,11 +702,26 @@ pub enum RawRxOutcome {
 ///   i.e. the buffer was consumed while the DMA writeback was still in
 ///   flight. A non-zero value here alongside `invalid_length` identifies a
 ///   DMA writeback race rather than a radio sensitivity problem.
-/// - `queue_overflow` counts frames dropped by the bounded interrupt queue
-///   because upper layers did not drain it in time (FIFO loss).
+/// - `queue_overflow` counts frames the bounded interrupt queue could not
+///   keep because upper layers did not drain it in time.
+/// - `queue_evicted` is the subset of `queue_overflow` where the lost frame
+///   was a strictly lower-priority one that was sacrificed to keep a newly
+///   arrived ACK or locally addressed frame. `queue_overflow -
+///   queue_evicted` is therefore the number of arrivals dropped outright,
+///   which is the number that must stay near zero.
+/// - `queue_high_water` is the deepest the queue ever got. It is the
+///   measurement that justifies (or refutes) `IRQ_RX_QUEUE_CAPACITY`: a
+///   value that never approaches the capacity means the bound is generous,
+///   and a value pinned at the capacity alongside a rising
+///   `queue_overflow - queue_evicted` means it is too small.
 /// - `serviced_irq` versus `serviced_polled` shows which servicing path is
 ///   actually running; `serviced_irq == 0` on an `rx_on_when_idle` router
 ///   means the RF interrupt is not reaching [`handle_irq`].
+///
+/// Frames that fail the length or CRC gate are counted in `invalid_length` /
+/// `invalid_crc` and are *not* queued: no consumer acts on them, and on a
+/// busy channel they were 14% of all completions, i.e. 14% of the queue
+/// slots that used to be spent on frames nothing could ever use.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RxDiagnostics {
     pub frames_valid: u32,
@@ -397,6 +729,8 @@ pub struct RxDiagnostics {
     pub invalid_crc: u32,
     pub dma_incomplete: u32,
     pub queue_overflow: u32,
+    pub queue_evicted: u32,
+    pub queue_high_water: u8,
     pub serviced_irq: u32,
     pub serviced_polled: u32,
 }
@@ -735,6 +1069,376 @@ mod tests {
     fn sleepy_device_preserves_bounded_rx_windows() {
         assert_eq!(idle_rx_state(false), IdleRxState::Off);
     }
+
+    const TEST_FILTER: RxAddressFilter = RxAddressFilter {
+        pan_id: 0x1A62,
+        short_address: 0x9F3C,
+        extended_address: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+        enabled: true,
+    };
+
+    /// MAC header: Frame Control, sequence number, destination PAN,
+    /// destination short address, then two payload bytes. Data frame with
+    /// short destination and short source addressing.
+    fn short_data_to(pan: u16, destination: u16) -> [u8; 9] {
+        let pan = pan.to_le_bytes();
+        let destination = destination.to_le_bytes();
+        [
+            0x61,
+            0x88,
+            0x42,
+            pan[0],
+            pan[1],
+            destination[0],
+            destination[1],
+            0xAA,
+            0xBB,
+        ]
+    }
+
+    /// Same, with extended destination addressing (dst addr mode 0b11).
+    fn extended_data_to(pan: u16, destination: [u8; 8]) -> [u8; 15] {
+        let pan = pan.to_le_bytes();
+        let mut psdu = [0u8; 15];
+        psdu[..3].copy_from_slice(&[0x61, 0x8C, 0x43]);
+        psdu[3..5].copy_from_slice(&pan);
+        psdu[5..13].copy_from_slice(&destination);
+        psdu[13..].copy_from_slice(&[0xAA, 0xBB]);
+        psdu
+    }
+
+    fn frame_with_priority(priority: RxPriority, tag: u8) -> (ReceivedFrame, RxPriority) {
+        (ReceivedFrame::new(&[tag; 5], 0xFF, -40), priority)
+    }
+
+    /// Drain the queue into a fixed buffer of first payload bytes.
+    fn drain_tags(queue: &mut RxQueue) -> ([u8; IRQ_RX_QUEUE_CAPACITY], usize) {
+        let mut tags = [0u8; IRQ_RX_QUEUE_CAPACITY];
+        let mut count = 0;
+        while let Some(frame) = queue.pop() {
+            tags[count] = frame.as_slice()[0];
+            count += 1;
+        }
+        (tags, count)
+    }
+
+    #[test]
+    fn priority_classifier_matches_short_extended_and_broadcast_modes() {
+        // Unicast to our short address inside our PAN.
+        assert_eq!(
+            classify_rx_priority(&short_data_to(0x1A62, 0x9F3C), &TEST_FILTER),
+            RxPriority::Local
+        );
+        // Unicast to our extended address inside our PAN.
+        assert_eq!(
+            classify_rx_priority(
+                &extended_data_to(0x1A62, TEST_FILTER.extended_address),
+                &TEST_FILTER
+            ),
+            RxPriority::Local
+        );
+        // MAC broadcast inside our PAN.
+        assert_eq!(
+            classify_rx_priority(&short_data_to(0x1A62, 0xFFFF), &TEST_FILTER),
+            RxPriority::Broadcast
+        );
+        // Broadcast PAN (a Beacon Request's addressing) is not foreign.
+        assert_eq!(
+            classify_rx_priority(&short_data_to(0xFFFF, 0xFFFF), &TEST_FILTER),
+            RxPriority::Broadcast
+        );
+        // Beacon: no destination addressing at all, short source only.
+        assert_eq!(
+            classify_rx_priority(&[0x00, 0x80, 0x01, 0x62, 0x1A, 0x00, 0x00], &TEST_FILTER),
+            RxPriority::Broadcast
+        );
+        // Acknowledgement, which carries no addressing fields at all.
+        assert_eq!(
+            classify_rx_priority(&[0x02, 0x00, 0x61], &TEST_FILTER),
+            RxPriority::Ack
+        );
+        assert_eq!(
+            classify_rx_priority(&[ack_frame_control(true), 0x00, 0x61], &TEST_FILTER),
+            RxPriority::Ack
+        );
+    }
+
+    #[test]
+    fn priority_classifier_rejects_other_pans_and_other_nodes() {
+        // Same PAN, some other node's short address.
+        assert_eq!(
+            classify_rx_priority(&short_data_to(0x1A62, 0x1234), &TEST_FILTER),
+            RxPriority::Foreign
+        );
+        // Another PAN entirely: exactly the traffic that filled the queue.
+        assert_eq!(
+            classify_rx_priority(&short_data_to(0x7788, 0x9F3C), &TEST_FILTER),
+            RxPriority::Foreign
+        );
+        // Same PAN, some other node's extended address.
+        assert_eq!(
+            classify_rx_priority(&extended_data_to(0x1A62, [0xFE; 8]), &TEST_FILTER),
+            RxPriority::Foreign
+        );
+    }
+
+    #[test]
+    fn priority_classifier_handles_malformed_frames_without_panicking() {
+        // Shorter than Frame Control + sequence number.
+        assert_eq!(classify_rx_priority(&[], &TEST_FILTER), RxPriority::Foreign);
+        assert_eq!(
+            classify_rx_priority(&[0x61], &TEST_FILTER),
+            RxPriority::Foreign
+        );
+        assert_eq!(
+            classify_rx_priority(&[0x61, 0x88], &TEST_FILTER),
+            RxPriority::Foreign
+        );
+        // Short destination addressing claimed but truncated.
+        assert_eq!(
+            classify_rx_priority(&[0x61, 0x88, 0x42, 0x62, 0x1A], &TEST_FILTER),
+            RxPriority::Foreign
+        );
+        // Extended destination addressing claimed but truncated.
+        assert_eq!(
+            classify_rx_priority(&[0x61, 0x8C, 0x42, 0x62, 0x1A, 0x11, 0x22], &TEST_FILTER),
+            RxPriority::Foreign
+        );
+        // Reserved destination addressing mode 0b01.
+        assert_eq!(
+            classify_rx_priority(&[0x61, 0x84, 0x42, 0x62, 0x1A, 0xAA, 0xBB], &TEST_FILTER),
+            RxPriority::Foreign
+        );
+        // Reserved frame type 0b101.
+        assert_eq!(
+            classify_rx_priority(&[0x65, 0x88, 0x42, 0x62, 0x1A, 0x3C, 0x9F], &TEST_FILTER),
+            RxPriority::Foreign
+        );
+        // Neither source nor destination addressing, and not an ACK.
+        assert_eq!(
+            classify_rx_priority(&[0x01, 0x00, 0x42], &TEST_FILTER),
+            RxPriority::Foreign
+        );
+    }
+
+    #[test]
+    fn priority_classifier_stays_neutral_before_the_local_identity_is_known() {
+        // Before `set_ack_filter`, and during scan/association when the PAN
+        // id is still 0xFFFF, nothing can be proven foreign, so every frame
+        // must classify identically and the queue must behave as pure FIFO.
+        let disabled = RxAddressFilter {
+            enabled: false,
+            ..TEST_FILTER
+        };
+        let unassociated = RxAddressFilter {
+            pan_id: 0xFFFF,
+            short_address: 0xFFFF,
+            ..TEST_FILTER
+        };
+        for filter in [disabled, unassociated] {
+            assert_eq!(
+                classify_rx_priority(&short_data_to(0x7788, 0x1234), &filter),
+                RxPriority::Local
+            );
+            assert_eq!(
+                classify_rx_priority(&short_data_to(0x1A62, 0xFFFF), &filter),
+                RxPriority::Local
+            );
+            // Before the local identity is known even an ACK cannot be
+            // attributed safely, so all valid frames share one FIFO class.
+            assert_eq!(
+                classify_rx_priority(&[0x02, 0x00, 0x61], &filter),
+                RxPriority::Local
+            );
+        }
+    }
+
+    #[test]
+    fn priority_classifier_ignores_an_unassigned_short_address() {
+        // 0xFFF8..=0xFFFF are not assignable short addresses. A frame to
+        // 0xFFFE must never be mistaken for a frame to an unjoined node.
+        let unassigned = RxAddressFilter {
+            short_address: 0xFFFE,
+            ..TEST_FILTER
+        };
+        assert_eq!(
+            classify_rx_priority(&short_data_to(0x1A62, 0xFFFE), &unassigned),
+            RxPriority::Foreign
+        );
+        // The extended address still identifies us before a short address
+        // is assigned, which is how an Association Response arrives.
+        assert_eq!(
+            classify_rx_priority(
+                &extended_data_to(0x1A62, TEST_FILTER.extended_address),
+                &unassigned
+            ),
+            RxPriority::Local
+        );
+    }
+
+    #[test]
+    fn rx_queue_is_strict_fifo_while_it_has_room() {
+        let mut queue = RxQueue::new();
+        for tag in 0..IRQ_RX_QUEUE_CAPACITY as u8 {
+            let (frame, priority) = frame_with_priority(RxPriority::Foreign, tag);
+            assert_eq!(queue.push(frame, priority), RxQueuePush::Queued);
+        }
+        assert_eq!(queue.len(), IRQ_RX_QUEUE_CAPACITY);
+        for tag in 0..IRQ_RX_QUEUE_CAPACITY as u8 {
+            assert_eq!(queue.pop().unwrap().as_slice(), [tag; 5]);
+        }
+        assert!(queue.pop().is_none());
+        // Nothing was lost, so neither counter moved.
+        assert_eq!(
+            queue.counters(),
+            (0, 0, IRQ_RX_QUEUE_CAPACITY as u8),
+            "an un-overflowed queue must not report any loss"
+        );
+    }
+
+    #[test]
+    fn rx_queue_wraps_without_reordering_or_losing_frames() {
+        let mut queue = RxQueue::new();
+        let mut expected = 0u8;
+        for tag in 0..(3 * IRQ_RX_QUEUE_CAPACITY) as u8 {
+            let (frame, priority) = frame_with_priority(RxPriority::Local, tag);
+            assert_eq!(queue.push(frame, priority), RxQueuePush::Queued);
+            if queue.len() == 4 {
+                for _ in 0..4 {
+                    assert_eq!(queue.pop().unwrap().as_slice(), [expected; 5]);
+                    expected += 1;
+                }
+            }
+        }
+        assert_eq!(queue.counters().0, 0);
+        assert_eq!(queue.counters().1, 0);
+    }
+
+    #[test]
+    fn overloaded_rx_queue_keeps_a_new_local_frame_over_stale_foreign_traffic() {
+        let mut queue = RxQueue::new();
+        for tag in 0..IRQ_RX_QUEUE_CAPACITY as u8 {
+            let (frame, priority) = frame_with_priority(RxPriority::Foreign, tag);
+            queue.push(frame, priority);
+        }
+        // The ZDO response the coordinator sent 45 ms after our request.
+        let (response, priority) = frame_with_priority(RxPriority::Local, 0xC1);
+        assert_eq!(queue.push(response, priority), RxQueuePush::Evicted);
+
+        // The oldest unrelated frame is the one that was sacrificed, and the
+        // surviving foreign frames keep their relative order.
+        for tag in 1..IRQ_RX_QUEUE_CAPACITY as u8 {
+            assert_eq!(queue.pop().unwrap().as_slice(), [tag; 5]);
+        }
+        assert_eq!(queue.pop().unwrap().as_slice(), [0xC1; 5]);
+        assert!(queue.pop().is_none());
+        assert_eq!(queue.counters().0, 1, "one frame was lost overall");
+        assert_eq!(queue.counters().1, 1, "and it was lost by eviction");
+    }
+
+    #[test]
+    fn overloaded_rx_queue_keeps_a_new_ack_over_stale_foreign_traffic() {
+        let mut queue = RxQueue::new();
+        for tag in 0..IRQ_RX_QUEUE_CAPACITY as u8 {
+            let (frame, priority) = frame_with_priority(RxPriority::Foreign, tag);
+            queue.push(frame, priority);
+        }
+        let (ack, priority) = frame_with_priority(RxPriority::Ack, 0xAC);
+        assert_eq!(queue.push(ack, priority), RxQueuePush::Evicted);
+        let (tags, count) = drain_tags(&mut queue);
+        let tags = &tags[..count];
+        assert!(tags.contains(&0xAC), "the ACK must survive: {tags:?}");
+        assert!(
+            !tags.contains(&0),
+            "the oldest foreign frame must be evicted"
+        );
+    }
+
+    #[test]
+    fn overloaded_rx_queue_keeps_local_data_over_queued_acks() {
+        let mut queue = RxQueue::new();
+        for tag in 0..IRQ_RX_QUEUE_CAPACITY as u8 {
+            let (frame, priority) = frame_with_priority(RxPriority::Ack, tag);
+            queue.push(frame, priority);
+        }
+        let (response, priority) = frame_with_priority(RxPriority::Local, 0xC1);
+        assert_eq!(queue.push(response, priority), RxQueuePush::Evicted);
+        let (tags, count) = drain_tags(&mut queue);
+        let tags = &tags[..count];
+        assert!(
+            tags.contains(&0xC1),
+            "a local ZDO response must survive queued foreign ACKs: {tags:?}"
+        );
+        assert!(!tags.contains(&0), "the oldest queued ACK must be evicted");
+    }
+
+    #[test]
+    fn overloaded_rx_queue_never_evicts_an_equally_important_frame() {
+        let mut queue = RxQueue::new();
+        for tag in 0..IRQ_RX_QUEUE_CAPACITY as u8 {
+            let (frame, priority) = frame_with_priority(RxPriority::Local, tag);
+            queue.push(frame, priority);
+        }
+        // Nothing queued is less important, so the arrival is dropped and
+        // the established FIFO order is preserved intact.
+        let (late, priority) = frame_with_priority(RxPriority::Local, 0xEE);
+        assert_eq!(queue.push(late, priority), RxQueuePush::Dropped);
+        // A foreign arrival is likewise dropped, not allowed to displace
+        // anything.
+        let (foreign, priority) = frame_with_priority(RxPriority::Foreign, 0xFA);
+        assert_eq!(queue.push(foreign, priority), RxQueuePush::Dropped);
+        for tag in 0..IRQ_RX_QUEUE_CAPACITY as u8 {
+            assert_eq!(queue.pop().unwrap().as_slice(), [tag; 5]);
+        }
+        assert!(queue.pop().is_none());
+        assert_eq!(queue.counters().0, 2, "both arrivals count as loss");
+        assert_eq!(queue.counters().1, 0, "neither was an eviction");
+    }
+
+    #[test]
+    fn rx_queue_evicts_the_oldest_lowest_priority_entry_only() {
+        let mut queue = RxQueue::new();
+        // Alternate foreign and local so eviction has a real choice.
+        for tag in 0..IRQ_RX_QUEUE_CAPACITY as u8 {
+            let priority = if tag % 2 == 0 {
+                RxPriority::Local
+            } else {
+                RxPriority::Foreign
+            };
+            let (frame, priority) = frame_with_priority(priority, tag);
+            queue.push(frame, priority);
+        }
+        let (local, priority) = frame_with_priority(RxPriority::Local, 0xAC);
+        assert_eq!(queue.push(local, priority), RxQueuePush::Evicted);
+        let (tags, count) = drain_tags(&mut queue);
+        let tags = &tags[..count];
+        // Tag 1 was the oldest foreign entry; every local entry survived.
+        assert!(!tags.contains(&1), "{tags:?}");
+        for local in (0..IRQ_RX_QUEUE_CAPACITY as u8).step_by(2) {
+            assert!(tags.contains(&local), "{tags:?}");
+        }
+        assert_eq!(tags.last(), Some(&0xAC));
+    }
+
+    #[test]
+    fn rx_queue_counters_are_cumulative_and_high_water_is_measured() {
+        let mut queue = RxQueue::new();
+        assert_eq!(queue.counters(), (0, 0, 0));
+        for tag in 0..4u8 {
+            let (frame, priority) = frame_with_priority(RxPriority::Foreign, tag);
+            queue.push(frame, priority);
+        }
+        assert_eq!(queue.counters(), (0, 0, 4));
+        for _ in 0..4 {
+            queue.pop();
+        }
+        // Draining must not walk the high-water mark back.
+        assert_eq!(queue.counters(), (0, 0, 4));
+        // `clear()` (retention sleep) also keeps the cumulative history: a
+        // reliability defect has to stay attributable across sleep cycles.
+        queue.clear();
+        assert_eq!(queue.counters(), (0, 0, 4));
+    }
 }
 
 #[cfg(target_arch = "tc32")]
@@ -744,7 +1448,7 @@ mod hw {
     use super::frame::{self, BeaconInfo};
     use super::{
         AckPendingAddress, AckPendingError, AckPendingTable, DMA_BUF_LEN, DmaBuf,
-        MAX_MAC_FRAME_LEN, RawRxOutcome, ReceivedFrame, phy,
+        MAX_MAC_FRAME_LEN, RawRxOutcome, ReceivedFrame, RxAddressFilter, RxQueue, RxQueuePush, phy,
     };
     use crate::timer;
 
@@ -790,13 +1494,7 @@ mod hw {
     static mut CCA_ATTEMPT_COUNT: u32 = 0;
     static mut CCA_BUSY_COUNT: u32 = 0;
     static mut CHANNEL_ACCESS_FAILURE_COUNT: u32 = 0;
-    const IRQ_RX_QUEUE_CAPACITY: usize = 8;
-    static mut IRQ_RX_QUEUE: [RawRxOutcome; IRQ_RX_QUEUE_CAPACITY] =
-        [RawRxOutcome::InvalidLength; IRQ_RX_QUEUE_CAPACITY];
-    static mut IRQ_RX_QUEUE_HEAD: u8 = 0;
-    static mut IRQ_RX_QUEUE_LEN: u8 = 0;
-    static mut IRQ_RX_QUEUE_OVERFLOW_COUNT: u32 = 0;
-    // Receive-path diagnostics. Written only from the RX servicing paths
+    static mut IRQ_RX_QUEUE: RxQueue = RxQueue::new(); // Receive-path diagnostics. Written only from the RX servicing paths
     // that already run, read only by `rx_diagnostics()`. Nothing in the
     // driver branches on them, so they cannot change radio behavior; the
     // only cost is one load/store per already-completed frame, all of it
@@ -974,6 +1672,7 @@ mod hw {
     /// Snapshot the bounded receive-path counters. See
     /// [`super::RxDiagnostics`] for how each field is meant to be read.
     pub fn rx_diagnostics() -> super::RxDiagnostics {
+        let (queue_overflow, queue_evicted, queue_high_water) = irq_rx_queue_counters();
         unsafe {
             super::RxDiagnostics {
                 frames_valid: core::ptr::read_volatile(core::ptr::addr_of!(RX_VALID_FRAME_COUNT)),
@@ -984,9 +1683,9 @@ mod hw {
                 dma_incomplete: core::ptr::read_volatile(core::ptr::addr_of!(
                     RX_DMA_INCOMPLETE_COUNT
                 )),
-                queue_overflow: core::ptr::read_volatile(core::ptr::addr_of!(
-                    IRQ_RX_QUEUE_OVERFLOW_COUNT
-                )),
+                queue_overflow,
+                queue_evicted,
+                queue_high_water,
                 serviced_irq: core::ptr::read_volatile(core::ptr::addr_of!(RX_SERVICED_IRQ_COUNT)),
                 serviced_polled: core::ptr::read_volatile(core::ptr::addr_of!(
                     RX_SERVICED_POLLED_COUNT
@@ -1177,9 +1876,9 @@ mod hw {
             if frames_seen >= max_frames {
                 break;
             }
-            if let Some(outcome) = pop_irq_rx() {
+            if let Some(frame) = pop_irq_rx() {
                 frames_seen += 1;
-                if on_frame(outcome) {
+                if on_frame(RawRxOutcome::Frame(frame)) {
                     break;
                 }
                 continue;
@@ -1477,50 +2176,74 @@ mod hw {
 
     #[inline(always)]
     fn queue_completed_rx() {
-        let outcome = take_completed_rx();
-        push_irq_rx(outcome);
+        if let RawRxOutcome::Frame(frame) = take_completed_rx() {
+            push_irq_rx(frame);
+        }
     }
 
     fn clear_irq_rx_queue() {
         unsafe {
-            core::ptr::write_volatile(core::ptr::addr_of_mut!(IRQ_RX_QUEUE_HEAD), 0);
-            core::ptr::write_volatile(core::ptr::addr_of_mut!(IRQ_RX_QUEUE_LEN), 0);
+            (*core::ptr::addr_of_mut!(IRQ_RX_QUEUE)).clear();
         }
     }
 
-    fn push_irq_rx(outcome: RawRxOutcome) {
-        unsafe {
-            let len = core::ptr::read_volatile(core::ptr::addr_of!(IRQ_RX_QUEUE_LEN)) as usize;
-            if len == IRQ_RX_QUEUE_CAPACITY {
-                increment_counter(core::ptr::addr_of_mut!(IRQ_RX_QUEUE_OVERFLOW_COUNT));
-                return;
-            }
-            let head = core::ptr::read_volatile(core::ptr::addr_of!(IRQ_RX_QUEUE_HEAD)) as usize;
-            let index = (head + len) % IRQ_RX_QUEUE_CAPACITY;
-            let queue = core::ptr::addr_of_mut!(IRQ_RX_QUEUE).cast::<RawRxOutcome>();
-            core::ptr::write_volatile(queue.add(index), outcome);
-            compiler_fence(Ordering::Release);
-            core::ptr::write_volatile(core::ptr::addr_of_mut!(IRQ_RX_QUEUE_LEN), (len + 1) as u8);
-        }
+    /// Queue one length/CRC-valid frame for the polled MAC windows.
+    ///
+    /// Runs after [`maybe_send_software_ack`] has already transmitted, so
+    /// neither the header classification nor a possible eviction can eat
+    /// into the RX->ACK turnaround budget.
+    ///
+    /// # Exclusion
+    ///
+    /// Queue mutation is limited to this function and [`pop_irq_rx`], and
+    /// those two can never run concurrently: every producer path other than
+    /// [`handle_irq`] already sits behind [`begin_radio_operation`]'s
+    /// `mask_cpu_rx_irq()`, and the single consumer
+    /// ([`rx_raw_window_until`]) runs entirely inside that same mask.
+    /// [`irq_rx_queue_counters`] briefly takes the same mask for a coherent
+    /// read-only snapshot. The `compiler_fence`s keep queue stores from being
+    /// reordered across the mask/unmask boundary.
+    fn push_irq_rx(frame: ReceivedFrame) {
+        let filter = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ACK_FILTER)) };
+        let priority = super::classify_rx_priority(
+            frame.as_slice(),
+            &RxAddressFilter {
+                pan_id: filter.pan_id,
+                short_address: filter.short_address,
+                extended_address: filter.extended_address,
+                enabled: filter.enabled != 0,
+            },
+        );
+        compiler_fence(Ordering::Release);
+        // The return value is intentionally unused here: `RxQueue` already
+        // accounts for every outcome in its own cumulative counters, which
+        // `rx_diagnostics()` exports. There is no silent failure path.
+        let _: RxQueuePush =
+            unsafe { (*core::ptr::addr_of_mut!(IRQ_RX_QUEUE)).push(frame, priority) };
+        compiler_fence(Ordering::Release);
     }
 
-    fn pop_irq_rx() -> Option<RawRxOutcome> {
-        unsafe {
-            let len = core::ptr::read_volatile(core::ptr::addr_of!(IRQ_RX_QUEUE_LEN));
-            if len == 0 {
-                return None;
-            }
-            compiler_fence(Ordering::Acquire);
-            let head = core::ptr::read_volatile(core::ptr::addr_of!(IRQ_RX_QUEUE_HEAD)) as usize;
-            let queue = core::ptr::addr_of!(IRQ_RX_QUEUE).cast::<RawRxOutcome>();
-            let outcome = core::ptr::read_volatile(queue.add(head));
-            core::ptr::write_volatile(
-                core::ptr::addr_of_mut!(IRQ_RX_QUEUE_HEAD),
-                ((head + 1) % IRQ_RX_QUEUE_CAPACITY) as u8,
-            );
-            core::ptr::write_volatile(core::ptr::addr_of_mut!(IRQ_RX_QUEUE_LEN), len - 1);
-            Some(outcome)
-        }
+    fn pop_irq_rx() -> Option<ReceivedFrame> {
+        compiler_fence(Ordering::Acquire);
+        let frame = unsafe { (*core::ptr::addr_of_mut!(IRQ_RX_QUEUE)).pop() };
+        compiler_fence(Ordering::Acquire);
+        frame
+    }
+
+    fn irq_rx_queue_counters() -> (u32, u32, u8) {
+        let restore_irq = mask_cpu_rx_irq();
+        compiler_fence(Ordering::Acquire);
+        let queue = core::ptr::addr_of!(IRQ_RX_QUEUE);
+        let counters = unsafe {
+            (
+                core::ptr::read_volatile(core::ptr::addr_of!((*queue).overflow)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*queue).evicted)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*queue).high_water)),
+            )
+        };
+        compiler_fence(Ordering::Acquire);
+        restore_cpu_rx_irq(restore_irq);
+        counters
     }
 
     fn perform_csma_ca() -> bool {
@@ -1814,15 +2537,8 @@ mod hw {
             return RawRxOutcome::InvalidLength;
         };
         let frame_len = dma_len - 2;
-        let mut data = [0u8; MAX_MAC_FRAME_LEN];
-        data[..frame_len].copy_from_slice(&psdu[..frame_len]);
         increment_counter(core::ptr::addr_of_mut!(RX_VALID_FRAME_COUNT));
-        RawRxOutcome::Frame(ReceivedFrame {
-            data,
-            len: frame_len as u8,
-            lqi,
-            rssi,
-        })
+        RawRxOutcome::Frame(ReceivedFrame::new(&psdu[..frame_len], lqi, rssi))
     }
 
     fn classify_and_report(received: &ReceivedFrame, on_frame: &mut impl FnMut(RxOutcome)) {

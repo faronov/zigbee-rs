@@ -53,6 +53,11 @@ struct QueuedCommandEvent {
 #[cfg(any(target_arch = "tc32", test))]
 struct CommandEventQueue {
     events: heapless::Deque<QueuedCommandEvent, COMMAND_EVENT_QUEUE_CAPACITY>,
+    /// Cumulative events lost because the bounded queue was full. Never
+    /// reset by [`Self::clear`]: a loss has to stay attributable across
+    /// rejoin and retention-sleep cycles.
+    overflow: u32,
+    high_water: u8,
 }
 
 #[cfg(any(target_arch = "tc32", test))]
@@ -60,10 +65,18 @@ impl CommandEventQueue {
     const fn new() -> Self {
         Self {
             events: heapless::Deque::new(),
+            overflow: 0,
+            high_water: 0,
         }
     }
 
     /// Retain the oldest events when the bounded queue is full.
+    ///
+    /// Unlike data indications, MAC command events are self-generated
+    /// transaction state (child polls, association requests) rather than
+    /// unrelated channel traffic, so there is no lower-value class to
+    /// sacrifice and the oldest transaction stays authoritative. The loss
+    /// is counted rather than swallowed.
     fn push(&mut self, event: MacCommandEvent) -> bool {
         self.push_with_association_poll_state(event, false)
     }
@@ -75,12 +88,19 @@ impl CommandEventQueue {
         event: MacCommandEvent,
         association_poll_serviced: bool,
     ) -> bool {
-        self.events
+        let queued = self
+            .events
             .push_back(QueuedCommandEvent {
                 event,
                 association_poll_serviced,
             })
-            .is_ok()
+            .is_ok();
+        if queued {
+            self.record_depth();
+        } else {
+            self.overflow = self.overflow.wrapping_add(1);
+        }
+        queued
     }
 
     fn pop_queued(&mut self) -> Option<QueuedCommandEvent> {
@@ -88,7 +108,20 @@ impl CommandEventQueue {
     }
 
     fn push_queued_front(&mut self, event: QueuedCommandEvent) -> bool {
-        self.events.push_front(event).is_ok()
+        let queued = self.events.push_front(event).is_ok();
+        if queued {
+            self.record_depth();
+        } else {
+            self.overflow = self.overflow.wrapping_add(1);
+        }
+        queued
+    }
+
+    fn record_depth(&mut self) {
+        let depth = self.events.len() as u8;
+        if depth > self.high_water {
+            self.high_water = depth;
+        }
     }
 
     #[cfg(test)]
@@ -101,9 +134,81 @@ impl CommandEventQueue {
     }
 }
 
+/// Retention class of a queued [`McpsDataIndication`], ordered lowest-value
+/// = first to be sacrificed when the bounded queue is full.
+///
+/// Mirrors `tlsr8258_hal::radio::RxPriority` one layer up, where the full
+/// parsed destination address is already available.
+#[cfg(any(target_arch = "tc32", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+enum IndicationPriority {
+    /// Accepted only because of promiscuous mode or a broadcast PAN: not
+    /// addressed to this node at all.
+    Foreign = 0,
+    /// Broadcast inside this node's PAN.
+    Broadcast = 1,
+    /// Unicast to this node's short or extended address.
+    Local = 2,
+}
+
+/// Classify a parsed destination address against the local identity.
+#[cfg(any(target_arch = "tc32", test))]
+fn indication_priority(
+    pan_id: PanId,
+    short_address: zigbee_types::ShortAddress,
+    extended_address: &IeeeAddress,
+    destination: &MacAddress,
+) -> IndicationPriority {
+    match destination {
+        MacAddress::Short(pan, address) => {
+            if address.0 >= 0xFFF8 {
+                if pan.0 == pan_id.0 || pan.0 == 0xFFFF {
+                    IndicationPriority::Broadcast
+                } else {
+                    IndicationPriority::Foreign
+                }
+            } else if pan.0 == pan_id.0 && short_address.0 < 0xFFF8 && address.0 == short_address.0
+            {
+                IndicationPriority::Local
+            } else {
+                IndicationPriority::Foreign
+            }
+        }
+        MacAddress::Extended(pan, address) => {
+            if pan.0 == pan_id.0 && address == extended_address {
+                IndicationPriority::Local
+            } else {
+                IndicationPriority::Foreign
+            }
+        }
+    }
+}
+
+#[cfg(any(target_arch = "tc32", test))]
+struct QueuedIndication {
+    indication: McpsDataIndication,
+    priority: IndicationPriority,
+}
+
+/// Bounded queue of MAC data indications that were received while the
+/// caller was waiting for something else (an ACK, an Association Response,
+/// a child poll).
+///
+/// Ordering is strict FIFO while there is room. Under overload the queue
+/// sacrifices the oldest strictly-lower-priority entry rather than refusing
+/// the arrival, because the newest frame addressed to this node is the one
+/// an upper layer is actively waiting for while stale broadcast/foreign
+/// entries are only relay traffic.
 #[cfg(any(target_arch = "tc32", test))]
 struct DataIndicationQueue {
-    indications: heapless::Vec<McpsDataIndication, DATA_INDICATION_QUEUE_CAPACITY>,
+    indications: heapless::Vec<QueuedIndication, DATA_INDICATION_QUEUE_CAPACITY>,
+    /// Cumulative indications lost at this queue, and how many of those
+    /// losses were evictions that saved a more important arrival. Never
+    /// reset by [`Self::clear`].
+    overflow: u32,
+    evicted: u32,
+    high_water: u8,
 }
 
 #[cfg(any(target_arch = "tc32", test))]
@@ -111,19 +216,55 @@ impl DataIndicationQueue {
     const fn new() -> Self {
         Self {
             indications: heapless::Vec::new(),
+            overflow: 0,
+            evicted: 0,
+            high_water: 0,
         }
     }
 
-    /// Retain the oldest indications when the bounded queue is full.
-    fn push(&mut self, indication: McpsDataIndication) -> bool {
-        self.indications.push(indication).is_ok()
+    /// Queue `indication`, sacrificing the oldest strictly-lower-priority
+    /// entry if the queue is full. Returns `false` only when the queue was
+    /// full of entries at least as important as this one.
+    fn push(&mut self, indication: McpsDataIndication, priority: IndicationPriority) -> bool {
+        if self.indications.is_full() {
+            self.overflow = self.overflow.wrapping_add(1);
+            let Some(victim) = self.victim_for(priority) else {
+                return false;
+            };
+            self.indications.remove(victim);
+            self.evicted = self.evicted.wrapping_add(1);
+        }
+        let queued = self
+            .indications
+            .push(QueuedIndication {
+                indication,
+                priority,
+            })
+            .is_ok();
+        debug_assert!(queued);
+        let depth = self.indications.len() as u8;
+        if depth > self.high_water {
+            self.high_water = depth;
+        }
+        queued
+    }
+
+    /// Oldest entry among those of the lowest priority present, but only if
+    /// that priority is strictly below the arriving indication's.
+    fn victim_for(&self, priority: IndicationPriority) -> Option<usize> {
+        self.indications
+            .iter()
+            .enumerate()
+            .filter(|(_, queued)| queued.priority < priority)
+            .min_by_key(|(_, queued)| queued.priority)
+            .map(|(index, _)| index)
     }
 
     fn pop(&mut self) -> Option<McpsDataIndication> {
         if self.indications.is_empty() {
             None
         } else {
-            Some(self.indications.remove(0))
+            Some(self.indications.remove(0).indication)
         }
     }
 
@@ -131,17 +272,50 @@ impl DataIndicationQueue {
         &mut self,
         mut predicate: impl FnMut(&McpsDataIndication) -> bool,
     ) -> Option<McpsDataIndication> {
-        let index = self.indications.iter().position(&mut predicate)?;
-        Some(self.indications.remove(index))
+        let index = self
+            .indications
+            .iter()
+            .position(|queued| predicate(&queued.indication))?;
+        Some(self.indications.remove(index).indication)
     }
 
-    fn any_matching(&self, predicate: impl FnMut(&McpsDataIndication) -> bool) -> bool {
-        self.indications.iter().any(predicate)
+    fn any_matching(&self, mut predicate: impl FnMut(&McpsDataIndication) -> bool) -> bool {
+        self.indications
+            .iter()
+            .any(|queued| predicate(&queued.indication))
     }
 
+    /// Drop every retained indication without discarding the cumulative
+    /// loss counters.
     fn clear(&mut self) {
         self.indications.clear();
     }
+
+    const fn counters(&self) -> (u32, u32, u8) {
+        (self.overflow, self.evicted, self.high_water)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.indications.len()
+    }
+}
+
+/// Bounded MAC queue diagnostics, reported separately from the HAL's
+/// interrupt receive queue so a loss can be attributed to the exact stage
+/// that dropped it.
+///
+/// `data_indication_overflow - data_indication_evicted` is the number of
+/// indications dropped outright; that difference is the number that has to
+/// stay at zero. `*_high_water` is what justifies (or refutes) each
+/// capacity from a real capture instead of a guess.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MacQueueDiagnostics {
+    pub data_indication_overflow: u32,
+    pub data_indication_evicted: u32,
+    pub data_indication_high_water: u8,
+    pub command_event_overflow: u32,
+    pub command_event_high_water: u8,
 }
 
 #[cfg(any(target_arch = "tc32", test))]
@@ -963,6 +1137,25 @@ mod imp {
             tlsr8258_hal::radio::rx_diagnostics()
         }
 
+        /// Snapshot of the bounded MAC queue counters.
+        ///
+        /// Deliberately separate from
+        /// [`TelinkMac::rx_diagnostics`]`().queue_*`: the HAL counters cover
+        /// the interrupt queue between the radio and this MAC, these cover
+        /// the MAC's own retained indications and command events. A frame
+        /// lost at one stage must never be attributable to the other.
+        pub fn queue_diagnostics(&self) -> super::MacQueueDiagnostics {
+            let (data_indication_overflow, data_indication_evicted, data_indication_high_water) =
+                self.pending_data.counters();
+            super::MacQueueDiagnostics {
+                data_indication_overflow,
+                data_indication_evicted,
+                data_indication_high_water,
+                command_event_overflow: self.pending_events.overflow,
+                command_event_high_water: self.pending_events.high_water,
+            }
+        }
+
         fn next_bsn(&mut self) -> u8 {
             let sequence = self.bsn;
             self.bsn = self.bsn.wrapping_add(1);
@@ -1115,7 +1308,9 @@ mod imp {
                                 if let Some(indication) =
                                     Self::parse_data_indication_for(&received, candidate_filter)
                                 {
-                                    let _ = pending_data.push(indication);
+                                    let priority =
+                                        Self::indication_priority(candidate_filter, &indication);
+                                    let _ = pending_data.push(indication, priority);
                                 }
                             }
                         }
@@ -1173,7 +1368,8 @@ mod imp {
                     } else if let Some(indication) =
                         Self::parse_data_indication_for(&received, filter)
                     {
-                        let _ = pending_data.push(indication);
+                        let priority = Self::indication_priority(filter, &indication);
+                        let _ = pending_data.push(indication, priority);
                     }
                     false
                 });
@@ -1205,7 +1401,8 @@ mod imp {
                             Self::parse_data_indication_for(&received, filter)
                         {
                             let exact = Self::is_exact_destination(filter, &indication.dst_address);
-                            let _ = pending_data.push(indication);
+                            let priority = Self::indication_priority(filter, &indication);
+                            let _ = pending_data.push(indication, priority);
                             return exact;
                         }
                         false
@@ -1513,7 +1710,8 @@ mod imp {
                                 indication = Some(candidate);
                                 return true;
                             }
-                            let _ = pending_data.push(candidate);
+                            let priority = Self::indication_priority(filter, &candidate);
+                            let _ = pending_data.push(candidate, priority);
                         }
                         false
                     });
@@ -1594,7 +1792,8 @@ mod imp {
                         }
                         if let Some(indication) = Self::parse_data_indication_for(&received, filter)
                         {
-                            let _ = pending_data.push(indication);
+                            let priority = Self::indication_priority(filter, &indication);
+                            let _ = pending_data.push(indication, priority);
                         }
                         false
                     });
@@ -1672,6 +1871,20 @@ mod imp {
                     pan.0 == filter.pan_id.0 && *address == filter.extended_address
                 }
             }
+        }
+
+        /// Retention class of `indication` for the bounded
+        /// [`super::DataIndicationQueue`]'s overload policy.
+        fn indication_priority(
+            filter: AddressFilter,
+            indication: &McpsDataIndication,
+        ) -> super::IndicationPriority {
+            super::indication_priority(
+                filter.pan_id,
+                filter.short_address,
+                &filter.extended_address,
+                &indication.dst_address,
+            )
         }
 
         fn transmit_data_request(
@@ -2736,6 +2949,243 @@ mod tests {
         assert!(queue.pop().is_none());
     }
 
+    #[test]
+    fn command_queue_counts_every_overflow_instead_of_swallowing_it() {
+        let mut queue = CommandEventQueue::new();
+        assert_eq!(queue.overflow, 0);
+        for lqi in 0..COMMAND_EVENT_QUEUE_CAPACITY as u8 {
+            assert!(queue.push(expect_command(&build_beacon_request(lqi), lqi)));
+        }
+        assert_eq!(queue.high_water, COMMAND_EVENT_QUEUE_CAPACITY as u8);
+        assert_eq!(queue.overflow, 0, "a queue with room reports no loss");
+        for extra in 0..3u8 {
+            assert!(!queue.push(expect_command(
+                &build_beacon_request(90 + extra),
+                90 + extra
+            )));
+        }
+        assert_eq!(queue.overflow, 3);
+        // Draining and clearing must not erase the cumulative history.
+        queue.clear();
+        assert_eq!(queue.overflow, 3);
+        assert_eq!(queue.high_water, COMMAND_EVENT_QUEUE_CAPACITY as u8);
+    }
+
+    #[test]
+    fn indication_priority_classifies_short_extended_and_broadcast_destinations() {
+        let pan_id = PanId(0x1A62);
+        let short_address = ShortAddress(0x9F3C);
+        let extended_address = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let classify = |destination: MacAddress| {
+            indication_priority(pan_id, short_address, &extended_address, &destination)
+        };
+
+        assert_eq!(
+            classify(MacAddress::Short(pan_id, short_address)),
+            IndicationPriority::Local
+        );
+        assert_eq!(
+            classify(MacAddress::Extended(pan_id, extended_address)),
+            IndicationPriority::Local
+        );
+        assert_eq!(
+            classify(MacAddress::Short(pan_id, ShortAddress(0xFFFF))),
+            IndicationPriority::Broadcast
+        );
+        // Zigbee's other MAC-visible broadcast addresses.
+        assert_eq!(
+            classify(MacAddress::Short(pan_id, ShortAddress(0xFFFD))),
+            IndicationPriority::Broadcast
+        );
+        assert_eq!(
+            classify(MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF))),
+            IndicationPriority::Broadcast
+        );
+        // Another node in our PAN, and a broadcast in someone else's PAN.
+        assert_eq!(
+            classify(MacAddress::Short(pan_id, ShortAddress(0x1234))),
+            IndicationPriority::Foreign
+        );
+        assert_eq!(
+            classify(MacAddress::Short(PanId(0x7788), ShortAddress(0xFFFF))),
+            IndicationPriority::Foreign
+        );
+        assert_eq!(
+            classify(MacAddress::Extended(pan_id, [0xFE; 8])),
+            IndicationPriority::Foreign
+        );
+        assert_eq!(
+            classify(MacAddress::Extended(PanId(0x7788), extended_address)),
+            IndicationPriority::Foreign
+        );
+    }
+
+    #[test]
+    fn indication_priority_never_matches_an_unassigned_short_address() {
+        let pan_id = PanId(0x1A62);
+        let extended_address = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        // Before an Association Response assigns a short address, the PIB
+        // still holds 0xFFFF. A broadcast must not be mistaken for a
+        // unicast to this node.
+        assert_eq!(
+            indication_priority(
+                pan_id,
+                ShortAddress(0xFFFF),
+                &extended_address,
+                &MacAddress::Short(pan_id, ShortAddress(0xFFFF)),
+            ),
+            IndicationPriority::Broadcast
+        );
+        // The extended address still identifies us, which is how the
+        // post-association frame arrives.
+        assert_eq!(
+            indication_priority(
+                pan_id,
+                ShortAddress(0xFFFF),
+                &extended_address,
+                &MacAddress::Extended(pan_id, extended_address),
+            ),
+            IndicationPriority::Local
+        );
+    }
+
+    #[test]
+    fn data_indication_queue_is_fifo_and_reports_no_loss_while_it_has_room() {
+        let destination = MacAddress::Short(PanId(0x1234), ShortAddress(0x0001));
+        let mut queue = DataIndicationQueue::new();
+        for payload in 0..DATA_INDICATION_QUEUE_CAPACITY as u8 {
+            assert!(queue.push(
+                data_indication(&destination, payload),
+                IndicationPriority::Local,
+            ));
+        }
+        assert_eq!(queue.len(), DATA_INDICATION_QUEUE_CAPACITY);
+        for payload in 0..DATA_INDICATION_QUEUE_CAPACITY as u8 {
+            assert_eq!(queue.pop().unwrap().payload.as_slice(), &[payload]);
+        }
+        assert!(queue.pop().is_none());
+        assert_eq!(
+            queue.counters(),
+            (0, 0, DATA_INDICATION_QUEUE_CAPACITY as u8),
+            "an un-overflowed queue must not report any loss"
+        );
+    }
+
+    #[test]
+    fn overloaded_data_indication_queue_keeps_a_new_local_frame() {
+        let pan_id = PanId(0x1234);
+        let broadcast = MacAddress::Short(pan_id, ShortAddress(0xFFFF));
+        let local = MacAddress::Short(pan_id, ShortAddress(0x0001));
+        let mut queue = DataIndicationQueue::new();
+        for payload in 0..DATA_INDICATION_QUEUE_CAPACITY as u8 {
+            assert!(queue.push(
+                data_indication(&broadcast, payload),
+                IndicationPriority::Broadcast,
+            ));
+        }
+        // The ZDO response addressed to this node arrives while the queue is
+        // still full of unrelated broadcast relay traffic.
+        assert!(queue.push(data_indication(&local, 0xC1), IndicationPriority::Local));
+        assert_eq!(
+            queue.counters(),
+            (1, 1, DATA_INDICATION_QUEUE_CAPACITY as u8),
+            "the loss must be recorded as an eviction, not a dropped arrival"
+        );
+
+        // The oldest broadcast was sacrificed; the rest kept their order and
+        // the addressed frame is retained at the tail.
+        for payload in 1..DATA_INDICATION_QUEUE_CAPACITY as u8 {
+            assert_eq!(queue.pop().unwrap().payload.as_slice(), &[payload]);
+        }
+        assert_eq!(queue.pop().unwrap().payload.as_slice(), &[0xC1]);
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn overloaded_data_indication_queue_evicts_the_lowest_priority_entry_only() {
+        let pan_id = PanId(0x1234);
+        let broadcast = MacAddress::Short(pan_id, ShortAddress(0xFFFF));
+        let foreign = MacAddress::Short(pan_id, ShortAddress(0x2222));
+        let local = MacAddress::Short(pan_id, ShortAddress(0x0001));
+        let mut queue = DataIndicationQueue::new();
+        // Broadcast first, so the oldest entry outranks the foreign ones.
+        assert!(queue.push(
+            data_indication(&broadcast, 0xB0),
+            IndicationPriority::Broadcast,
+        ));
+        for payload in 1..DATA_INDICATION_QUEUE_CAPACITY as u8 {
+            assert!(queue.push(
+                data_indication(&foreign, payload),
+                IndicationPriority::Foreign,
+            ));
+        }
+        assert!(queue.push(data_indication(&local, 0xC1), IndicationPriority::Local));
+
+        // The oldest *lowest-priority* entry (payload 1) is gone; the older
+        // but more valuable broadcast survived.
+        assert_eq!(queue.pop().unwrap().payload.as_slice(), &[0xB0]);
+        for payload in 2..DATA_INDICATION_QUEUE_CAPACITY as u8 {
+            assert_eq!(queue.pop().unwrap().payload.as_slice(), &[payload]);
+        }
+        assert_eq!(queue.pop().unwrap().payload.as_slice(), &[0xC1]);
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn overloaded_data_indication_queue_never_evicts_an_equally_important_entry() {
+        let pan_id = PanId(0x1234);
+        let local = MacAddress::Short(pan_id, ShortAddress(0x0001));
+        let mut queue = DataIndicationQueue::new();
+        for payload in 0..DATA_INDICATION_QUEUE_CAPACITY as u8 {
+            assert!(queue.push(data_indication(&local, payload), IndicationPriority::Local));
+        }
+        // Nothing queued is less important, so the arrival is refused and
+        // the refusal is reported instead of being swallowed.
+        assert!(!queue.push(data_indication(&local, 0xEE), IndicationPriority::Local));
+        assert!(!queue.push(
+            data_indication(&MacAddress::Short(pan_id, ShortAddress(0x2222)), 0xFA),
+            IndicationPriority::Foreign,
+        ));
+        assert_eq!(
+            queue.counters(),
+            (2, 0, DATA_INDICATION_QUEUE_CAPACITY as u8),
+            "both arrivals count as loss, neither as an eviction"
+        );
+        for payload in 0..DATA_INDICATION_QUEUE_CAPACITY as u8 {
+            assert_eq!(queue.pop().unwrap().payload.as_slice(), &[payload]);
+        }
+    }
+
+    #[test]
+    fn mac_and_hal_queue_losses_are_reported_through_distinct_counters() {
+        // The HAL interrupt queue and this MAC queue have independent
+        // capacities and independent overload policies; a loss at one must
+        // never be attributable to the other. Overflow the MAC queue only
+        // and check that its counters, and nothing else, move.
+        let pan_id = PanId(0x1234);
+        let local = MacAddress::Short(pan_id, ShortAddress(0x0001));
+        let mut data = DataIndicationQueue::new();
+        let mut events = CommandEventQueue::new();
+        for payload in 0..DATA_INDICATION_QUEUE_CAPACITY as u8 {
+            assert!(data.push(data_indication(&local, payload), IndicationPriority::Local));
+        }
+        assert!(!data.push(data_indication(&local, 0xEE), IndicationPriority::Local));
+
+        assert_eq!(data.counters().0, 1);
+        assert_eq!(
+            events.overflow, 0,
+            "a data indication loss must not be charged to the command queue"
+        );
+
+        // ...and the reverse.
+        for lqi in 0..COMMAND_EVENT_QUEUE_CAPACITY as u8 {
+            assert!(events.push(expect_command(&build_beacon_request(lqi), lqi)));
+        }
+        assert!(!events.push(expect_command(&build_beacon_request(99), 99)));
+        assert_eq!(events.overflow, 1);
+        assert_eq!(data.counters().0, 1, "unchanged by a command queue loss");
+    }
+
     fn association_response(child: IeeeAddress) -> MlmeAssociateResponse {
         MlmeAssociateResponse {
             device_address: child,
@@ -2947,7 +3397,10 @@ mod tests {
         // deliver_association_response() waits for its ACK. The next receive
         // loop iteration must inspect the queue before checking its deadline.
         let mut normal_data = DataIndicationQueue::new();
-        assert!(normal_data.push(data_indication(&coordinator, 0xAA)));
+        assert!(normal_data.push(
+            data_indication(&coordinator, 0xAA),
+            IndicationPriority::Local
+        ));
         assert_eq!(
             take_pending_data(&mut normal_data)
                 .unwrap()
@@ -2961,8 +3414,14 @@ mod tests {
         let mut poll_data = DataIndicationQueue::new();
         let unrelated = MacAddress::Short(pan_id, ShortAddress(0x2222));
         let local_extended = MacAddress::Extended(pan_id, extended_address);
-        assert!(poll_data.push(data_indication(&unrelated, 0xBB)));
-        assert!(poll_data.push(data_indication(&local_extended, 0xCC)));
+        assert!(poll_data.push(
+            data_indication(&unrelated, 0xBB),
+            IndicationPriority::Foreign
+        ));
+        assert!(poll_data.push(
+            data_indication(&local_extended, 0xCC),
+            IndicationPriority::Local
+        ));
         assert_eq!(
             take_pending_poll_data(&mut poll_data, pan_id, short_address, &extended_address,)
                 .unwrap()
@@ -3003,7 +3462,7 @@ mod tests {
             panic!("expected data indication");
         };
         let mut data = DataIndicationQueue::new();
-        assert!(data.push(indication));
+        assert!(data.push(indication, IndicationPriority::Local));
 
         // A full command queue cannot consume or block the data queue.
         assert_eq!(data.pop().unwrap().payload.as_slice(), &[0xAA]);
@@ -3030,7 +3489,7 @@ mod tests {
             else {
                 panic!("expected data indication");
             };
-            assert!(data.push(indication));
+            assert!(data.push(indication, IndicationPriority::Local));
         }
         assert!(events.push(expect_command(&build_beacon_request(99), 99)));
 
@@ -3069,7 +3528,7 @@ mod tests {
         let Some(ParsedIncomingFrame::Data(indication)) = parse_incoming_frame(&frame, 2) else {
             panic!("expected data indication");
         };
-        assert!(data.push(indication));
+        assert!(data.push(indication, IndicationPriority::Local));
         associations
             .enqueue(association_response(child), 100, 10)
             .unwrap();

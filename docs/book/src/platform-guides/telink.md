@@ -439,9 +439,36 @@ implicated:
 
 All three are host-tested only. The remaining gate is a post-flash capture:
 whether the plug now stays joined past 15 s and whether `Simple_Desc_rsp`
-appears on air. A separate workstream owns the TLSR8258 MAC
-acknowledgement/retransmission defect visible in the same capture, which is the
-most likely remaining cause of the lost response frame itself.
+appears on air.
+
+The same trace also rules out the Node Descriptor parser. The coordinator's
+`Node_Desc_rsp` for TSN 97 is well formed, advertises stack-compliance revision
+22, and passes the host parser test. It arrived on air 45 ms after the request
+but did not reach the pending ZDO response slot; the request was retried at the
+exact 1.5-second timeout boundary. That timing is a receive-delivery loss, not
+a parse rejection.
+
+Live RAM diagnostics on the TB-04 then proved the lower-layer mechanism. Over
+397,519 valid received frames, the old eight-slot interrupt queue reported
+17,685 overflows, while `dma_incomplete` remained zero. Invalid-length and
+invalid-CRC outcomes also consumed bounded queue slots even though the MAC
+discarded them immediately. The fix therefore stays above the RF registers:
+
+- invalid outcomes are counted but never occupy the interrupt queue;
+- the queue has 16 measured slots and moves only slot indices during
+  overload, avoiding the old 129-byte volatile copies in interrupt context;
+- local unicast traffic outranks broadcasts, unattributable queued ACKs, and
+  provably foreign traffic, so stale channel traffic cannot evict a new ZDO
+  response;
+- expected transmit ACKs remain on the synchronous polled ACK path and do not
+  depend on the interrupt queue; and
+- HAL and MAC queue overflow, eviction, and high-water counters are exported
+  separately through `TELINK_JOIN_METRICS`.
+
+`overflow - evicted` is the number of arrivals dropped outright. The
+post-flash ZiGate gate requires that value to stay at zero for both data
+queues, no command-event overflow, and delivery of the first Node/Simple
+Descriptor responses without a timeout retry.
 
 ## Current capability boundary
 

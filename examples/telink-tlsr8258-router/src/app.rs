@@ -95,6 +95,26 @@ struct JoinMetrics {
     mac_last_foreign_ack_sequence: AtomicU32,
     /// `0x100 | dsn` for the most recent expired ACK window, else `0`.
     mac_last_expired_sequence: AtomicU32,
+    // Receive-queue overload accounting. Appended after the existing radio
+    // block so every offset above stays stable for RAM dumps taken from the
+    // previous firmware.
+    //
+    // `radio_rx_queue_overflow` keeps its original meaning (total frames
+    // lost at the HAL interrupt queue). `radio_rx_queue_evicted` is the
+    // subset of those losses where a lower-priority queued frame was
+    // sacrificed to keep a more valuable newly arrived frame, so
+    // `overflow - evicted` is the count of arrivals dropped outright and is
+    // the number that has to stay at zero. `radio_rx_queue_high_water` is
+    // what makes the queue capacity a measurement rather than a guess.
+    radio_rx_queue_evicted: AtomicU32,
+    radio_rx_queue_high_water: AtomicU32,
+    // The MAC's own bounded queues, counted separately from the HAL's so a
+    // loss is attributable to exactly one stage.
+    mac_data_queue_overflow: AtomicU32,
+    mac_data_queue_evicted: AtomicU32,
+    mac_data_queue_high_water: AtomicU32,
+    mac_command_queue_overflow: AtomicU32,
+    mac_command_queue_high_water: AtomicU32,
 }
 
 impl JoinMetrics {
@@ -158,6 +178,13 @@ impl JoinMetrics {
             mac_ack_window_frames_seen: AtomicU32::new(0),
             mac_last_foreign_ack_sequence: AtomicU32::new(0),
             mac_last_expired_sequence: AtomicU32::new(0),
+            radio_rx_queue_evicted: AtomicU32::new(0),
+            radio_rx_queue_high_water: AtomicU32::new(0),
+            mac_data_queue_overflow: AtomicU32::new(0),
+            mac_data_queue_evicted: AtomicU32::new(0),
+            mac_data_queue_high_water: AtomicU32::new(0),
+            mac_command_queue_overflow: AtomicU32::new(0),
+            mac_command_queue_high_water: AtomicU32::new(0),
         }
     }
 
@@ -179,10 +206,30 @@ impl JoinMetrics {
             .store(rx.dma_incomplete, Ordering::Relaxed);
         self.radio_rx_queue_overflow
             .store(rx.queue_overflow, Ordering::Relaxed);
+        self.radio_rx_queue_evicted
+            .store(rx.queue_evicted, Ordering::Relaxed);
+        self.radio_rx_queue_high_water
+            .store(u32::from(rx.queue_high_water), Ordering::Relaxed);
         self.radio_rx_serviced_irq
             .store(rx.serviced_irq, Ordering::Relaxed);
         self.radio_rx_serviced_polled
             .store(rx.serviced_polled, Ordering::Relaxed);
+
+        let queues = mac.queue_diagnostics();
+        self.mac_data_queue_overflow
+            .store(queues.data_indication_overflow, Ordering::Relaxed);
+        self.mac_data_queue_evicted
+            .store(queues.data_indication_evicted, Ordering::Relaxed);
+        self.mac_data_queue_high_water.store(
+            u32::from(queues.data_indication_high_water),
+            Ordering::Relaxed,
+        );
+        self.mac_command_queue_overflow
+            .store(queues.command_event_overflow, Ordering::Relaxed);
+        self.mac_command_queue_high_water.store(
+            u32::from(queues.command_event_high_water),
+            Ordering::Relaxed,
+        );
 
         let ack = mac.ack_diagnostics();
         self.mac_tx_attempts

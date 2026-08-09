@@ -40,6 +40,27 @@ CPU and is restart-intrusive on the tested programmer, so stop the acceptance
 capture before inspecting RAM or flash and treat every SWire read as another
 reset/resume test.
 
+### Receive-queue overload accounting
+
+TLSR8258 has no hardware MAC address filter, so on a busy channel the radio
+interrupts for every CRC-valid frame on air regardless of destination. The
+last three fields of each queue's group make an overload attributable to one
+exact stage, and every field is cumulative since boot (never cleared by a
+rejoin):
+
+| Field | Meaning |
+|-------|---------|
+| `radio_rx_queue_overflow` | frames lost at the HAL interrupt queue |
+| `radio_rx_queue_evicted` | subset of the above where a lower-priority queued frame was sacrificed to keep a more valuable newly arrived frame |
+| `radio_rx_queue_high_water` | deepest the 16-slot HAL queue ever got |
+| `mac_data_queue_overflow` / `mac_data_queue_evicted` / `mac_data_queue_high_water` | the same three for the MAC's own retained `McpsDataIndication` queue |
+| `mac_command_queue_overflow` / `mac_command_queue_high_water` | the MAC command-event queue, which has no lower-value class to evict |
+
+`overflow - evicted` is the number of arrivals dropped outright at that
+stage; that difference is the number that has to stay at zero. A
+`high_water` pinned at the capacity while that difference rises means the
+capacity is genuinely too small rather than the drain being too slow.
+
 Home Assistant ZHA and an independent channel-15 sniffer have verified:
 
 - association, Transport-Key, Device_annce, interview, and TCLK exchange;
