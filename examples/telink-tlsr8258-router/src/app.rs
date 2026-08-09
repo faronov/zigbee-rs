@@ -73,6 +73,28 @@ struct JoinMetrics {
     zdo_response_attempts: AtomicU32,
     zdo_response_successes: AtomicU32,
     zdo_response_failures: AtomicU32,
+    // Radio receive/acknowledgement diagnostics. Appended at the end so
+    // the offsets of every field above stay stable for existing RAM dumps.
+    // Snapshotted once per second, never per frame, so reading them cannot
+    // perturb the turnaround-critical radio path.
+    radio_rx_frames_valid: AtomicU32,
+    radio_rx_invalid_length: AtomicU32,
+    radio_rx_invalid_crc: AtomicU32,
+    radio_rx_dma_incomplete: AtomicU32,
+    radio_rx_queue_overflow: AtomicU32,
+    radio_rx_serviced_irq: AtomicU32,
+    radio_rx_serviced_polled: AtomicU32,
+    mac_tx_attempts: AtomicU32,
+    mac_ack_windows: AtomicU32,
+    mac_ack_matched: AtomicU32,
+    mac_ack_windows_expired: AtomicU32,
+    mac_ack_frames_seen: AtomicU32,
+    mac_foreign_acks: AtomicU32,
+    mac_ack_window_frames_seen: AtomicU32,
+    /// `0x100 | dsn` when an unmatched ACK has been seen, else `0`.
+    mac_last_foreign_ack_sequence: AtomicU32,
+    /// `0x100 | dsn` for the most recent expired ACK window, else `0`.
+    mac_last_expired_sequence: AtomicU32,
 }
 
 impl JoinMetrics {
@@ -120,7 +142,73 @@ impl JoinMetrics {
             zdo_response_attempts: AtomicU32::new(0),
             zdo_response_successes: AtomicU32::new(0),
             zdo_response_failures: AtomicU32::new(0),
+            radio_rx_frames_valid: AtomicU32::new(0),
+            radio_rx_invalid_length: AtomicU32::new(0),
+            radio_rx_invalid_crc: AtomicU32::new(0),
+            radio_rx_dma_incomplete: AtomicU32::new(0),
+            radio_rx_queue_overflow: AtomicU32::new(0),
+            radio_rx_serviced_irq: AtomicU32::new(0),
+            radio_rx_serviced_polled: AtomicU32::new(0),
+            mac_tx_attempts: AtomicU32::new(0),
+            mac_ack_windows: AtomicU32::new(0),
+            mac_ack_matched: AtomicU32::new(0),
+            mac_ack_windows_expired: AtomicU32::new(0),
+            mac_ack_frames_seen: AtomicU32::new(0),
+            mac_foreign_acks: AtomicU32::new(0),
+            mac_ack_window_frames_seen: AtomicU32::new(0),
+            mac_last_foreign_ack_sequence: AtomicU32::new(0),
+            mac_last_expired_sequence: AtomicU32::new(0),
         }
+    }
+
+    /// Snapshot the HAL receive-path and MAC acknowledgement counters.
+    ///
+    /// These are cumulative since boot and are deliberately *not* cleared by
+    /// `begin_attempt`: a retransmission defect has to be attributable
+    /// across rejoins, and the whole point is to compare the totals against
+    /// one sniffer capture covering the same interval.
+    fn capture_radio(&self, mac: &TelinkMac) {
+        let rx = mac.rx_diagnostics();
+        self.radio_rx_frames_valid
+            .store(rx.frames_valid, Ordering::Relaxed);
+        self.radio_rx_invalid_length
+            .store(rx.invalid_length, Ordering::Relaxed);
+        self.radio_rx_invalid_crc
+            .store(rx.invalid_crc, Ordering::Relaxed);
+        self.radio_rx_dma_incomplete
+            .store(rx.dma_incomplete, Ordering::Relaxed);
+        self.radio_rx_queue_overflow
+            .store(rx.queue_overflow, Ordering::Relaxed);
+        self.radio_rx_serviced_irq
+            .store(rx.serviced_irq, Ordering::Relaxed);
+        self.radio_rx_serviced_polled
+            .store(rx.serviced_polled, Ordering::Relaxed);
+
+        let ack = mac.ack_diagnostics();
+        self.mac_tx_attempts
+            .store(ack.tx_attempts, Ordering::Relaxed);
+        self.mac_ack_windows
+            .store(ack.ack_windows, Ordering::Relaxed);
+        self.mac_ack_matched
+            .store(ack.ack_matched, Ordering::Relaxed);
+        self.mac_ack_windows_expired
+            .store(ack.ack_windows_expired, Ordering::Relaxed);
+        self.mac_ack_frames_seen
+            .store(ack.ack_frames_seen, Ordering::Relaxed);
+        self.mac_foreign_acks
+            .store(ack.foreign_acks, Ordering::Relaxed);
+        self.mac_ack_window_frames_seen
+            .store(ack.window_frames_seen, Ordering::Relaxed);
+        self.mac_last_foreign_ack_sequence.store(
+            ack.last_foreign_ack_sequence
+                .map_or(0, |dsn| 0x100 | u32::from(dsn)),
+            Ordering::Relaxed,
+        );
+        self.mac_last_expired_sequence.store(
+            ack.last_expired_sequence
+                .map_or(0, |dsn| 0x100 | u32::from(dsn)),
+            Ordering::Relaxed,
+        );
     }
 
     fn begin_attempt(&self, started_us: u32) {
@@ -545,6 +633,11 @@ pub fn run() -> ! {
                     let elapsed_secs = (elapsed / one_second).min(u16::MAX as u32) as u16;
                     tick_anchor = tick_anchor.wrapping_add(u32::from(elapsed_secs) * one_second);
                     identify_elapsed = identify_elapsed.wrapping_add(u32::from(elapsed_secs));
+                    // Bounded radio diagnostics: one snapshot per second, on
+                    // a tick that already runs, so the retransmission
+                    // counters can be correlated with a sniffer capture
+                    // without adding any per-frame work.
+                    TELINK_JOIN_METRICS.capture_radio(node.device().mac());
                     elapsed_secs
                 } else {
                     0

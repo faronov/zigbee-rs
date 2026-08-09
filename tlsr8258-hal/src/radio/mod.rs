@@ -367,6 +367,40 @@ pub enum RawRxOutcome {
     InvalidCrc,
 }
 
+/// Bounded receive-path counters.
+///
+/// These attribute a missing MAC acknowledgement to a specific stage of the
+/// receive path from a single RAM read, without any per-frame logging that
+/// would perturb the turnaround-critical software-ACK sequence:
+///
+/// - `frames_valid` far below the number of frames the sniffer saw on air
+///   while `invalid_length` and `invalid_crc` stay near zero means the
+///   baseband never reported those frames at all: RX was disabled, still
+///   in TX/RX turnaround, or on the wrong channel.
+/// - `invalid_length` / `invalid_crc` rising with the loss means frames do
+///   reach the DMA buffer but fail the TLSR8258 length/CRC gate before any
+///   ACK decision is made.
+/// - `dma_incomplete` counts frames whose baseband end-of-packet flag was
+///   observed while the RX DMA transfer-complete latch was still clear,
+///   i.e. the buffer was consumed while the DMA writeback was still in
+///   flight. A non-zero value here alongside `invalid_length` identifies a
+///   DMA writeback race rather than a radio sensitivity problem.
+/// - `queue_overflow` counts frames dropped by the bounded interrupt queue
+///   because upper layers did not drain it in time (FIFO loss).
+/// - `serviced_irq` versus `serviced_polled` shows which servicing path is
+///   actually running; `serviced_irq == 0` on an `rx_on_when_idle` router
+///   means the RF interrupt is not reaching [`handle_irq`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RxDiagnostics {
+    pub frames_valid: u32,
+    pub invalid_length: u32,
+    pub invalid_crc: u32,
+    pub dma_incomplete: u32,
+    pub queue_overflow: u32,
+    pub serviced_irq: u32,
+    pub serviced_polled: u32,
+}
+
 /// Exclusive handle to the TLSR8258 radio/DMA engine.
 ///
 /// TLSR8258 has one RF block and this HAL uses fixed application-linked DMA
@@ -762,6 +796,17 @@ mod hw {
     static mut IRQ_RX_QUEUE_HEAD: u8 = 0;
     static mut IRQ_RX_QUEUE_LEN: u8 = 0;
     static mut IRQ_RX_QUEUE_OVERFLOW_COUNT: u32 = 0;
+    // Receive-path diagnostics. Written only from the RX servicing paths
+    // that already run, read only by `rx_diagnostics()`. Nothing in the
+    // driver branches on them, so they cannot change radio behavior; the
+    // only cost is one load/store per already-completed frame, all of it
+    // outside the RX->ACK turnaround window.
+    static mut RX_VALID_FRAME_COUNT: u32 = 0;
+    static mut RX_INVALID_LENGTH_COUNT: u32 = 0;
+    static mut RX_INVALID_CRC_COUNT: u32 = 0;
+    static mut RX_DMA_INCOMPLETE_COUNT: u32 = 0;
+    static mut RX_SERVICED_IRQ_COUNT: u32 = 0;
+    static mut RX_SERVICED_POLLED_COUNT: u32 = 0;
 
     /// The two `reg_irq_mask`/`reg_irq_src` bits this module's RX path
     /// gates as a single unit: [`crate::irq::IrqSource::Dma`] (bit 4, the
@@ -921,6 +966,30 @@ mod hw {
                 cca_busy: core::ptr::read_volatile(core::ptr::addr_of!(CCA_BUSY_COUNT)),
                 channel_access_failures: core::ptr::read_volatile(core::ptr::addr_of!(
                     CHANNEL_ACCESS_FAILURE_COUNT
+                )),
+            }
+        }
+    }
+
+    /// Snapshot the bounded receive-path counters. See
+    /// [`super::RxDiagnostics`] for how each field is meant to be read.
+    pub fn rx_diagnostics() -> super::RxDiagnostics {
+        unsafe {
+            super::RxDiagnostics {
+                frames_valid: core::ptr::read_volatile(core::ptr::addr_of!(RX_VALID_FRAME_COUNT)),
+                invalid_length: core::ptr::read_volatile(core::ptr::addr_of!(
+                    RX_INVALID_LENGTH_COUNT
+                )),
+                invalid_crc: core::ptr::read_volatile(core::ptr::addr_of!(RX_INVALID_CRC_COUNT)),
+                dma_incomplete: core::ptr::read_volatile(core::ptr::addr_of!(
+                    RX_DMA_INCOMPLETE_COUNT
+                )),
+                queue_overflow: core::ptr::read_volatile(core::ptr::addr_of!(
+                    IRQ_RX_QUEUE_OVERFLOW_COUNT
+                )),
+                serviced_irq: core::ptr::read_volatile(core::ptr::addr_of!(RX_SERVICED_IRQ_COUNT)),
+                serviced_polled: core::ptr::read_volatile(core::ptr::addr_of!(
+                    RX_SERVICED_POLLED_COUNT
                 )),
             }
         }
@@ -1120,6 +1189,7 @@ mod hw {
             }
             if phy::rx_done() {
                 let outcome = take_completed_rx();
+                increment_counter(core::ptr::addr_of_mut!(RX_SERVICED_POLLED_COUNT));
                 frames_seen += 1;
                 if on_frame(outcome) {
                     break;
@@ -1153,6 +1223,7 @@ mod hw {
                     break;
                 }
                 queue_completed_rx();
+                increment_counter(core::ptr::addr_of_mut!(RX_SERVICED_IRQ_COUNT));
             }
         }
         if !phy::rx_done() {
@@ -1378,6 +1449,12 @@ mod hw {
         // Anchor RX->TX settling before clearing status or parsing. The
         // pending lookup and ACK encoding run inside the hardware settle.
         let rx_complete_ticks = timer::now_ticks();
+        // Diagnostic only, sampled before `rx_done_clear()` destroys the
+        // latch: did the RX DMA writeback finish before this frame was
+        // consumed? One register read, absorbed by the settle below.
+        if !phy::rx_dma_done() {
+            increment_counter(core::ptr::addr_of_mut!(RX_DMA_INCOMPLETE_COUNT));
+        }
         phy::rx_done_clear();
         compiler_fence(Ordering::Acquire);
         let completed_rx_ptr = active_rx_ptr();
@@ -1718,23 +1795,28 @@ mod hw {
 
     fn decode_received_frame(buf: &[u8]) -> RawRxOutcome {
         if !frame::packet_length_ok(buf) {
+            increment_counter(core::ptr::addr_of_mut!(RX_INVALID_LENGTH_COUNT));
             return RawRxOutcome::InvalidLength;
         }
         if !frame::packet_crc_ok(buf) {
+            increment_counter(core::ptr::addr_of_mut!(RX_INVALID_CRC_COUNT));
             return RawRxOutcome::InvalidCrc;
         }
         let dma_len = frame::payload_len(buf) as usize;
         if dma_len < 2 || dma_len - 2 > MAX_MAC_FRAME_LEN {
+            increment_counter(core::ptr::addr_of_mut!(RX_INVALID_LENGTH_COUNT));
             return RawRxOutcome::InvalidLength;
         }
         let rssi = frame::packet_rssi(buf);
         let lqi = frame::rssi_to_lqi(rssi);
         let Some(psdu) = frame::mac_psdu(buf) else {
+            increment_counter(core::ptr::addr_of_mut!(RX_INVALID_LENGTH_COUNT));
             return RawRxOutcome::InvalidLength;
         };
         let frame_len = dma_len - 2;
         let mut data = [0u8; MAX_MAC_FRAME_LEN];
         data[..frame_len].copy_from_slice(&psdu[..frame_len]);
+        increment_counter(core::ptr::addr_of_mut!(RX_VALID_FRAME_COUNT));
         RawRxOutcome::Frame(ReceivedFrame {
             data,
             len: frame_len as u8,
@@ -1775,6 +1857,7 @@ mod hw {
 #[cfg(target_arch = "tc32")]
 pub use hw::{
     CsmaStats, RX_WINDOW_TICKS, RxOutcome, TX_TIMEOUT_TICKS, TxOutcome, csma_stats,
-    dma_buffers_aligned, handle_irq, init, rx_raw_window_for, rx_window, rx_window_for,
-    send_beacon_request, send_mac_frame, set_ack_filter, set_channel, software_ack_stats,
+    dma_buffers_aligned, handle_irq, init, rx_diagnostics, rx_raw_window_for, rx_window,
+    rx_window_for, send_beacon_request, send_mac_frame, set_ack_filter, set_channel,
+    software_ack_stats,
 };

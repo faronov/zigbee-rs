@@ -287,6 +287,19 @@ pub fn rx_done() -> bool {
     unsafe { r16(REG_RF_IRQ_STATUS) & 0x01 != 0 }
 }
 
+/// RX DMA transfer-complete latch for RF DMA channel 2
+/// (`REG_DMA_IRQ_STATUS` bit 2).
+///
+/// [`rx_done`] reports the *baseband* end-of-packet signal. This reports
+/// that the DMA engine finished writing that packet (including its
+/// hardware trailer) into SRAM. Reading both distinguishes "the radio
+/// never received the frame" from "the radio received it but the buffer
+/// was consumed before the DMA writeback completed". `rx_done_clear()`
+/// clears this latch, so it must be sampled before that call.
+pub fn rx_dma_done() -> bool {
+    unsafe { r8(REG_DMA_IRQ_STATUS) & 0x04 != 0 }
+}
+
 pub fn rx_done_clear() {
     unsafe {
         w8(REG_RF_IRQ_STATUS, 0x01);

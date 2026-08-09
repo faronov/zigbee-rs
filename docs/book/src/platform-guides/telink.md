@@ -383,6 +383,66 @@ capture plus `SteeringDiagnostics`:
 - a decrypted Confirm-Key with `confirm_key_rejections > 0` identifies a
   field/source validation mismatch rather than a MIC/key-selection failure.
 
+### ZiGate v3.23 rejoin cycle — what the 2026-08-09 capture proves
+
+A ZiGate `v3.23` run against a TLSR8258 plug (IEEE `02:95:cf:76:15:2d:1f:56`)
+showed a repeating cycle: join, a mostly successful z2m interview, `device
+left` roughly 15 seconds after the join, then an immediate rejoin — three times
+in one capture. The capture settles what is actually happening:
+
+- ZiGate transports a **unique** TCLK, and our `Verify-Key` hashes are
+  cryptographically correct and encrypted under that unique key.
+- Every `Verify-Key` we send sets `ack_request = 1`, and ZiGate answers within
+  13–63 ms with a **secured command-format APS acknowledgement** — frame
+  control `0x32`, `ack_format = 1`, no endpoint/cluster/profile fields, the
+  same APS counter. The pre-fix parser misread that layout as a data
+  acknowledgement.
+- ZiGate **never** emits `Confirm-Key` (`0x10`).
+- The Leave is **ours**: a broadcast NWK Leave with `Request = 0` at ~15.15 s
+  and ~15.20 s, i.e. our own strict TCLK deadline
+  (`TCLK_EXCHANGE_DEADLINE_US`) firing. Coordinator eviction is refuted.
+- ZiGate's `Transport-Key` commands all carry `ack_request = 0`. Any earlier
+  claim that a missing device acknowledgement of `Transport-Key`/`Confirm-Key`
+  caused eviction is **false**.
+
+Two fixes follow, and they are independent:
+
+1. **APS acknowledgement format.** `ApsHeader` now honours `ack_format` on both
+   parse and serialise, so ZiGate's secured command-format acknowledgement is
+   recognised. Generating a command-format acknowledgement for an APS command
+   that requests one is kept as generic R22 conformance hardening — it is not
+   the ZiGate root cause, because that coordinator never asks for one.
+2. **ACK-gated deferred TCLK retry.** When a unique TCLK was installed, the
+   `Verify-Key` was sent under it, and the matching secured acknowledgement
+   authenticated under that same key, BDB no longer leaves the network merely
+   because `Confirm-Key` is absent. It keeps the joined network and runs
+   bounded deferred `Verify-Key` rounds. An explicit `Confirm-Key` rejection,
+   or a persistence error, still hard-fails, and no `ZigBeeAlliance09`
+   `Confirm-Key` is ever accepted. See
+   [BDB commissioning](../core-concepts/bdb.md).
+
+The same capture also shows the `Simple_Desc_req` for `0x83a6`/endpoint 1
+(frame 1001) being received and APS-acknowledged while no `Simple_Desc_rsp`
+(`0x8004`) ever reaches the coordinator, which is the z2m timeout on cluster
+32772. Host tests prove the ZDO dispatcher always produces that response, so
+the loss is below ZDO. Three transmit-side defects fixed alongside are directly
+implicated:
+
+- unicast ZDP frames requested **no** APS acknowledgement, so a lost response
+  had no APS retransmission and no delivery failure signal (R22 §2.4.1.2
+  requires the acknowledgement);
+- a duplicate incoming data frame was dropped **without** regenerating its
+  acknowledgement, so a coordinator retransmission was answered with silence;
+  and
+- APS retransmissions were sent to `0xFFFF` instead of the original unicast
+  destination.
+
+All three are host-tested only. The remaining gate is a post-flash capture:
+whether the plug now stays joined past 15 s and whether `Simple_Desc_rsp`
+appears on air. A separate workstream owns the TLSR8258 MAC
+acknowledgement/retransmission defect visible in the same capture, which is the
+most likely remaining cause of the lost response frame itself.
+
 ## Current capability boundary
 
 The TLSR8258 backend provides active/passive/energy scan, association, data

@@ -588,6 +588,151 @@ pub(crate) fn validate_router_start(req: &MlmeStartRequest) -> Result<(), MacErr
     Ok(())
 }
 
+/// Classification of one frame surfaced inside a MAC ACK wait window.
+///
+/// Kept separate from `imp::TelinkMac::transmit_with_ack` so the exact
+/// acceptance rule (frame type *and* sequence number) is host-testable and
+/// so the diagnostic counters below can distinguish "no ACK ever reached
+/// the MAC" from "an ACK reached the MAC but carried a different DSN".
+#[cfg(any(target_arch = "tc32", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AckWindowFrame {
+    /// An ACK whose sequence number matches the frame just transmitted.
+    Match { frame_pending: bool },
+    /// A well-formed ACK for some *other* sequence number. Seeing these
+    /// while the expected ACK never matches means the receive path works
+    /// and the defect is in sequence-number handling, not in RX enable or
+    /// turnaround.
+    ForeignAck { sequence: u8 },
+    /// Anything that is not an ACK frame (data, command, beacon, runt).
+    NotAnAck,
+}
+
+/// Frame type field of the 802.15.4 Frame Control Field.
+#[cfg(any(target_arch = "tc32", test))]
+const FRAME_TYPE_MASK: u16 = 0x0007;
+#[cfg(any(target_arch = "tc32", test))]
+const FRAME_TYPE_ACK: u16 = 0x0002;
+/// Frame Pending bit of the 802.15.4 Frame Control Field.
+#[cfg(any(target_arch = "tc32", test))]
+const FRAME_PENDING_BIT: u16 = 1 << 4;
+
+/// Classify one received MAC frame against the sequence number of the frame
+/// currently awaiting acknowledgement.
+///
+/// `data` is a MAC frame with the FCS already removed (TLSR8258 validates
+/// and strips it in hardware), so a valid ACK is exactly three bytes:
+/// two Frame Control bytes plus the sequence number.
+#[cfg(any(target_arch = "tc32", test))]
+pub(crate) fn classify_ack_window_frame(data: &[u8], expected_sequence: u8) -> AckWindowFrame {
+    if data.len() < 3 {
+        return AckWindowFrame::NotAnAck;
+    }
+    let frame_control = u16::from_le_bytes([data[0], data[1]]);
+    if frame_control & FRAME_TYPE_MASK != FRAME_TYPE_ACK {
+        return AckWindowFrame::NotAnAck;
+    }
+    let sequence = data[2];
+    if sequence == expected_sequence {
+        AckWindowFrame::Match {
+            frame_pending: frame_control & FRAME_PENDING_BIT != 0,
+        }
+    } else {
+        AckWindowFrame::ForeignAck { sequence }
+    }
+}
+
+/// Bounded MAC-level transmit/acknowledgement counters.
+///
+/// These exist to make an on-air retransmission burst attributable from a
+/// single RAM read after the fact, without any per-frame logging that would
+/// perturb the turnaround-critical radio path. Every field saturates
+/// instead of wrapping so a long soak cannot make a large count look small.
+///
+/// Reading them together with [`tlsr8258_hal::radio::rx_diagnostics`]
+/// separates the four candidate failure modes for a retransmission that
+/// follows a valid on-air ACK:
+///
+/// - `ack_windows_expired > 0` with `ack_frames_seen == 0`: no ACK frame
+///   ever reached the MAC — the receiver was not listening, was still in
+///   turnaround, or the frame was rejected inside the HAL (cross-check the
+///   HAL's `invalid_length` / `invalid_crc` / `dma_incomplete` counters).
+/// - `foreign_acks > 0` with `last_foreign_ack_sequence` set: ACKs arrive
+///   but carry an unexpected DSN — a sequence-number defect.
+/// - `window_frames_seen` far below the number of frames on air: the
+///   receive path, not the ACK logic, is losing frames.
+/// - HAL `queue_overflow > 0`: frames reached the HAL and were dropped by
+///   the bounded interrupt queue.
+#[cfg(any(target_arch = "tc32", test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AckDiagnostics {
+    /// Frames handed to the radio with an ACK requested, including retries.
+    pub tx_attempts: u32,
+    /// ACK wait windows opened.
+    pub ack_windows: u32,
+    /// Windows that produced a sequence-matched ACK.
+    pub ack_matched: u32,
+    /// Windows that ended without a sequence-matched ACK.
+    pub ack_windows_expired: u32,
+    /// ACK frames (any DSN) surfaced to the MAC inside an ACK window.
+    pub ack_frames_seen: u32,
+    /// ACK frames surfaced with a DSN other than the expected one.
+    pub foreign_acks: u32,
+    /// Total frames of any kind surfaced inside ACK windows.
+    pub window_frames_seen: u32,
+    /// DSN of the most recent unmatched ACK, or `None` if none was seen.
+    pub last_foreign_ack_sequence: Option<u8>,
+    /// DSN awaited by the most recent expired window.
+    pub last_expired_sequence: Option<u8>,
+}
+
+#[cfg(any(target_arch = "tc32", test))]
+impl AckDiagnostics {
+    const fn new() -> Self {
+        Self {
+            tx_attempts: 0,
+            ack_windows: 0,
+            ack_matched: 0,
+            ack_windows_expired: 0,
+            ack_frames_seen: 0,
+            foreign_acks: 0,
+            window_frames_seen: 0,
+            last_foreign_ack_sequence: None,
+            last_expired_sequence: None,
+        }
+    }
+
+    /// Record one classified frame observed inside an ACK wait window.
+    fn record_window_frame(&mut self, frame: AckWindowFrame) {
+        self.window_frames_seen = self.window_frames_seen.saturating_add(1);
+        match frame {
+            AckWindowFrame::Match { .. } => {
+                self.ack_frames_seen = self.ack_frames_seen.saturating_add(1);
+            }
+            AckWindowFrame::ForeignAck { sequence } => {
+                self.ack_frames_seen = self.ack_frames_seen.saturating_add(1);
+                self.foreign_acks = self.foreign_acks.saturating_add(1);
+                self.last_foreign_ack_sequence = Some(sequence);
+            }
+            AckWindowFrame::NotAnAck => {}
+        }
+    }
+
+    fn record_window_result(&mut self, matched: bool, expected_sequence: u8) {
+        self.ack_windows = self.ack_windows.saturating_add(1);
+        if matched {
+            self.ack_matched = self.ack_matched.saturating_add(1);
+        } else {
+            self.ack_windows_expired = self.ack_windows_expired.saturating_add(1);
+            self.last_expired_sequence = Some(expected_sequence);
+        }
+    }
+
+    fn record_tx_attempt(&mut self) {
+        self.tx_attempts = self.tx_attempts.saturating_add(1);
+    }
+}
+
 #[cfg(target_arch = "tc32")]
 mod imp {
     use crate::frames::{
@@ -681,6 +826,10 @@ mod imp {
         /// `tlsr8258_hal::rng`'s module docs for exactly what this
         /// provides and does not prove about entropy quality.
         rng: Option<Rng>,
+        /// Bounded transmit/acknowledgement counters. Diagnostic only: never
+        /// read by the MAC itself, so they cannot change any decision or
+        /// timing. See [`super::AckDiagnostics`] for how to read them.
+        ack_diagnostics: super::AckDiagnostics,
         /// Hardware AES-128 accelerator, present only under the
         /// `hardware-aes` feature. Installed once by the composition root
         /// via [`TelinkMac::install_aes_engine`] from the board's exclusive
@@ -785,6 +934,7 @@ mod imp {
                 pending_association_deliveries: heapless::Deque::new(),
                 clock: WrappingTickExtender::new(now_ticks),
                 rng: None,
+                ack_diagnostics: super::AckDiagnostics::new(),
                 #[cfg(feature = "hardware-aes")]
                 aes_engine: None,
             };
@@ -796,6 +946,21 @@ mod imp {
             let sequence = self.dsn;
             self.dsn = self.dsn.wrapping_add(1);
             sequence
+        }
+
+        /// Snapshot of the bounded transmit/acknowledgement counters.
+        ///
+        /// Intended to be read once per observation window (for example
+        /// into an application RAM metrics block that a debugger dumps
+        /// after a sniffer capture), not polled in a hot loop.
+        pub fn ack_diagnostics(&self) -> super::AckDiagnostics {
+            self.ack_diagnostics
+        }
+
+        /// Snapshot of the HAL receive-path counters that pair with
+        /// [`TelinkMac::ack_diagnostics`].
+        pub fn rx_diagnostics(&self) -> tlsr8258_hal::radio::RxDiagnostics {
+            tlsr8258_hal::radio::rx_diagnostics()
         }
 
         fn next_bsn(&mut self) -> u8 {
@@ -890,6 +1055,7 @@ mod imp {
                         continue;
                     }
                 }
+                self.ack_diagnostics.record_tx_attempt();
 
                 if !ack_requested {
                     return Ok(AckResult::default());
@@ -903,6 +1069,7 @@ mod imp {
                 let pending_events = &mut self.pending_events;
                 let pending_data = &mut self.pending_data;
                 let pending_associations = &self.pending_outgoing_associations;
+                let diagnostics = &mut self.ack_diagnostics;
                 self.radio
                     .receive_raw_until(ACK_WAIT_TICKS, MAX_RECEIVE_FRAMES, |outcome| {
                         let RawRxOutcome::Frame(received) = outcome else {
@@ -910,11 +1077,10 @@ mod imp {
                         };
                         let data = received.as_slice();
                         if data.len() >= 3 {
-                            let frame_control = u16::from_le_bytes([data[0], data[1]]);
-                            if frame_control & 0x07 == 0x02 && data[2] == sequence {
-                                ack = Some(AckResult {
-                                    frame_pending: frame_control & (1 << 4) != 0,
-                                });
+                            let classified = super::classify_ack_window_frame(data, sequence);
+                            diagnostics.record_window_frame(classified);
+                            if let super::AckWindowFrame::Match { frame_pending } = classified {
+                                ack = Some(AckResult { frame_pending });
                                 return true;
                             }
                             let (_, destination, _, _) = parse_mac_addresses(data);
@@ -955,6 +1121,8 @@ mod imp {
                         }
                         false
                     });
+                self.ack_diagnostics
+                    .record_window_result(ack.is_some(), sequence);
                 if association_response.is_some() {
                     self.pending_association_response = association_response;
                 }
@@ -2181,6 +2349,147 @@ mod tests {
                 update_id: 1,
             },
         }
+    }
+
+    /// Build the exact three-byte form the TLSR8258 HAL surfaces for an
+    /// ACK: two Frame Control bytes plus the DSN, with the hardware-checked
+    /// FCS already stripped.
+    fn ack_frame(sequence: u8, frame_pending: bool) -> [u8; 3] {
+        let frame_control: u16 = 0x0002 | if frame_pending { 1 << 4 } else { 0 };
+        let [low, high] = frame_control.to_le_bytes();
+        [low, high, sequence]
+    }
+
+    #[test]
+    fn ack_window_matches_only_the_transmitted_sequence_number() {
+        assert_eq!(
+            classify_ack_window_frame(&ack_frame(0x87, false), 0x87),
+            AckWindowFrame::Match {
+                frame_pending: false
+            }
+        );
+        assert_eq!(
+            classify_ack_window_frame(&ack_frame(0x87, true), 0x87),
+            AckWindowFrame::Match {
+                frame_pending: true
+            }
+        );
+        assert_eq!(
+            classify_ack_window_frame(&ack_frame(0x86, false), 0x87),
+            AckWindowFrame::ForeignAck { sequence: 0x86 }
+        );
+    }
+
+    #[test]
+    fn ack_window_rejects_non_ack_and_runt_frames() {
+        // Data frame carrying the awaited sequence number must not be
+        // mistaken for its acknowledgement.
+        let data = [0x61u8, 0x88, 0x87, 0x34, 0x12];
+        assert_eq!(
+            classify_ack_window_frame(&data, 0x87),
+            AckWindowFrame::NotAnAck
+        );
+        // MAC command frame (type 3) with the same sequence number.
+        let command = [0x63u8, 0x88, 0x87, 0x34, 0x12, 0x04];
+        assert_eq!(
+            classify_ack_window_frame(&command, 0x87),
+            AckWindowFrame::NotAnAck
+        );
+        // Truncated frames can never satisfy the match.
+        assert_eq!(
+            classify_ack_window_frame(&[0x02, 0x00], 0x87),
+            AckWindowFrame::NotAnAck
+        );
+        assert_eq!(
+            classify_ack_window_frame(&[], 0x87),
+            AckWindowFrame::NotAnAck
+        );
+    }
+
+    #[test]
+    fn ack_window_match_ignores_reserved_frame_control_bits() {
+        // Only the frame-type and Frame Pending fields may influence the
+        // decision; a parent that sets other reserved/version bits in its
+        // ACK must still be accepted.
+        let mut frame = ack_frame(0x10, false);
+        frame[1] |= 0x10; // frame version field
+        assert_eq!(
+            classify_ack_window_frame(&frame, 0x10),
+            AckWindowFrame::Match {
+                frame_pending: false
+            }
+        );
+    }
+
+    #[test]
+    fn ack_diagnostics_separate_missing_acks_from_wrong_sequence_numbers() {
+        // Window 1: nothing but unrelated traffic, then expiry. This is
+        // the capture's signature — a retransmission with no ACK ever
+        // surfaced to the MAC.
+        let mut diagnostics = AckDiagnostics::new();
+        diagnostics.record_tx_attempt();
+        diagnostics.record_window_frame(classify_ack_window_frame(
+            &[0x61, 0x88, 0x01, 0x34, 0x12],
+            0x87,
+        ));
+        diagnostics.record_window_result(false, 0x87);
+
+        assert_eq!(diagnostics.tx_attempts, 1);
+        assert_eq!(diagnostics.ack_windows, 1);
+        assert_eq!(diagnostics.ack_windows_expired, 1);
+        assert_eq!(diagnostics.ack_frames_seen, 0);
+        assert_eq!(diagnostics.foreign_acks, 0);
+        assert_eq!(diagnostics.window_frames_seen, 1);
+        assert_eq!(diagnostics.last_expired_sequence, Some(0x87));
+        assert_eq!(diagnostics.last_foreign_ack_sequence, None);
+
+        // Window 2: an ACK arrives but for the previous DSN. That is a
+        // sequence-number defect and must be counted separately.
+        diagnostics.record_tx_attempt();
+        diagnostics.record_window_frame(classify_ack_window_frame(&ack_frame(0x86, false), 0x87));
+        diagnostics.record_window_result(false, 0x87);
+
+        assert_eq!(diagnostics.ack_frames_seen, 1);
+        assert_eq!(diagnostics.foreign_acks, 1);
+        assert_eq!(diagnostics.last_foreign_ack_sequence, Some(0x86));
+        assert_eq!(diagnostics.ack_matched, 0);
+
+        // Window 3: the retransmission is acknowledged correctly.
+        diagnostics.record_tx_attempt();
+        diagnostics.record_window_frame(classify_ack_window_frame(&ack_frame(0x87, true), 0x87));
+        diagnostics.record_window_result(true, 0x87);
+
+        assert_eq!(diagnostics.tx_attempts, 3);
+        assert_eq!(diagnostics.ack_windows, 3);
+        assert_eq!(diagnostics.ack_matched, 1);
+        assert_eq!(diagnostics.ack_windows_expired, 2);
+        assert_eq!(diagnostics.ack_frames_seen, 2);
+        assert_eq!(diagnostics.window_frames_seen, 3);
+    }
+
+    #[test]
+    fn ack_diagnostics_saturate_instead_of_wrapping() {
+        let mut diagnostics = AckDiagnostics {
+            tx_attempts: u32::MAX,
+            ack_windows: u32::MAX,
+            ack_matched: u32::MAX,
+            ack_windows_expired: u32::MAX,
+            ack_frames_seen: u32::MAX,
+            foreign_acks: u32::MAX,
+            window_frames_seen: u32::MAX,
+            ..AckDiagnostics::new()
+        };
+        diagnostics.record_tx_attempt();
+        diagnostics.record_window_frame(AckWindowFrame::ForeignAck { sequence: 1 });
+        diagnostics.record_window_result(true, 1);
+        diagnostics.record_window_result(false, 2);
+
+        assert_eq!(diagnostics.tx_attempts, u32::MAX);
+        assert_eq!(diagnostics.ack_windows, u32::MAX);
+        assert_eq!(diagnostics.ack_matched, u32::MAX);
+        assert_eq!(diagnostics.ack_windows_expired, u32::MAX);
+        assert_eq!(diagnostics.foreign_acks, u32::MAX);
+        assert_eq!(diagnostics.window_frames_seen, u32::MAX);
     }
 
     #[test]
