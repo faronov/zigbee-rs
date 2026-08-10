@@ -96,31 +96,38 @@ jobs:
           SENSOR_ELF=examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor
           ROUTER_ELF=examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router
           for elf in "$SENSOR_ELF" "$ROUTER_ELF"; do
-            if "$NM" --demangle "$elf" | grep -q 'core::slice::sort'; then
+            syms="$("$NM" --demangle "$elf")"
+            if grep -q 'core::slice::sort' <<<"$syms"; then
               echo "$elf contains generic slice sorting" >&2
               exit 1
             fi
-            if "$NM" --demangle "$elf" | grep -q 'aes::soft::fixslice'; then
+            if grep -Eq 'aes::soft|SoftwareAes128' <<<"$syms"; then
               echo "$elf still links the software AES core" >&2
               exit 1
             fi
-            if ! "$NM" --demangle "$elf" | grep -Eq 'HardwareAes128|AesEngine'; then
+            if ! grep -q 'HardwareAes128' <<<"$syms"; then
               echo "$elf is missing the TLSR8258 hardware AES backend" >&2
               exit 1
             fi
+            if ! grep -q 'install_aes_engine' <<<"$syms"; then
+              echo "$elf never installs the TLSR8258 AES engine" >&2
+              exit 1
+            fi
           done
+          SENSOR_SYMS="$("$NM" --demangle "$SENSOR_ELF")"
+          ROUTER_SYMS="$("$NM" --demangle "$ROUTER_ELF")"
           # Role split: the sleepy sensor must compile out the parent/router
           # maintenance subgraph (permit-join, routing, MAC parent-command
           # servicing, child rejoin/Update-Device, Parent Announce), while the
           # router still links it. These names are verified present in the
           # router image and absent from the sensor image.
           PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
-          if "$NM" --demangle "$SENSOR_ELF" | grep -Eq "($PARENT_SYMS)"; then
+          if grep -Eq "($PARENT_SYMS)" <<<"$SENSOR_SYMS"; then
             echo "TLSR8258 sensor links parent/router maintenance symbols:" >&2
-            "$NM" --demangle "$SENSOR_ELF" | grep -E "($PARENT_SYMS)" >&2
+            grep -E "($PARENT_SYMS)" <<<"$SENSOR_SYMS" >&2
             exit 1
           fi
-          if ! "$NM" --demangle "$ROUTER_ELF" | grep -Eq 'handle_parent_command|queue_pending_child_update'; then
+          if ! grep -Eq 'handle_parent_command|queue_pending_child_update' <<<"$ROUTER_SYMS"; then
             echo "TLSR8258 router is missing expected parent maintenance symbols" >&2
             exit 1
           fi
@@ -132,13 +139,13 @@ jobs:
           # client). These are client-only runtime symbols, not the generic
           # server helpers.
           ED_CLIENT_SYMS='resume_end_device_timeout|service_end_device_timeout|apply_end_device_timeout_change|send_ed_timeout_request_tracked'
-          if "$NM" --demangle "$ROUTER_ELF" | grep -Eq "($ED_CLIENT_SYMS)"; then
+          if grep -Eq "($ED_CLIENT_SYMS)" <<<"$ROUTER_SYMS"; then
             echo "TLSR8258 router links End Device Timeout CLIENT lifecycle symbols:" >&2
-            "$NM" --demangle "$ROUTER_ELF" | grep -E "($ED_CLIENT_SYMS)" >&2
+            grep -E "($ED_CLIENT_SYMS)" <<<"$ROUTER_SYMS" >&2
             exit 1
           fi
           for sym in resume_end_device_timeout service_end_device_timeout apply_end_device_timeout_change send_ed_timeout_request_tracked; do
-            if ! "$NM" --demangle "$SENSOR_ELF" | grep -q "$sym"; then
+            if ! grep -q "$sym" <<<"$SENSOR_SYMS"; then
               echo "TLSR8258 sensor is missing End Device Timeout CLIENT symbol: $sym" >&2
               exit 1
             fi

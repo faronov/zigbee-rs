@@ -117,15 +117,16 @@ jobs:
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
           ./tools/firmware-size-report.sh nrf52840-sensor ${ELF}.bin 225280 ${ELF}.size.json
-          if "$NM" --demangle "$ELF" | grep -q 'core::slice::sort'; then
+          SYMS="$("$NM" --demangle "$ELF")"
+          if grep -q 'core::slice::sort' <<<"$SYMS"; then
             echo "nRF52840 image contains generic slice sorting" >&2
             exit 1
           fi
-          if "$NM" --demangle "$ELF" | grep -Eq 'aes::soft::fixslice|SoftwareAes128'; then
+          if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
             echo "nRF52840 production image still links software AES" >&2
             exit 1
           fi
-          if ! "$NM" --demangle "$ELF" | grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver'; then
+          if ! grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver' <<<"$SYMS"; then
             echo "nRF52840 production image is missing the Nordic ECB AES backend" >&2
             exit 1
           fi
@@ -181,11 +182,12 @@ jobs:
           NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
-          if "$NM" --demangle "$ELF" | grep -Eq 'aes::soft::fixslice|SoftwareAes128'; then
+          SYMS="$("$NM" --demangle "$ELF")"
+          if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
             echo "nRF52840 router image still links software AES" >&2
             exit 1
           fi
-          if ! "$NM" --demangle "$ELF" | grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver'; then
+          if ! grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver' <<<"$SYMS"; then
             echo "nRF52840 router image is missing the Nordic ECB AES backend" >&2
             exit 1
           fi
@@ -230,11 +232,12 @@ jobs:
           NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
-          if "$NM" --demangle "$ELF" | grep -Eq 'aes::soft::fixslice|SoftwareAes128'; then
+          SYMS="$("$NM" --demangle "$ELF")"
+          if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
             echo "nRF52833 production image still links software AES" >&2
             exit 1
           fi
-          if ! "$NM" --demangle "$ELF" | grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver'; then
+          if ! grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver' <<<"$SYMS"; then
             echo "nRF52833 production image is missing the Nordic ECB AES backend" >&2
             exit 1
           fi
@@ -273,11 +276,12 @@ jobs:
           NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
-          if "$NM" --demangle "$ELF" | grep -Eq 'aes::soft::fixslice|SoftwareAes128'; then
+          SYMS="$("$NM" --demangle "$ELF")"
+          if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
             echo "nRF52840 UF2 production image still links software AES" >&2
             exit 1
           fi
-          if ! "$NM" --demangle "$ELF" | grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver'; then
+          if ! grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver' <<<"$SYMS"; then
             echo "nRF52840 UF2 image is missing the Nordic ECB AES backend" >&2
             exit 1
           fi
@@ -322,11 +326,12 @@ jobs:
         run: |
           ELF=examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
-          if "$NM" --demangle "$ELF" | grep -Eq 'aes::soft::fixslice|SoftwareAes128'; then
+          SYMS="$("$NM" --demangle "$ELF")"
+          if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
             echo "ESP32-C6 production image still links the software AES core" >&2
             exit 1
           fi
-          if ! "$NM" --demangle "$ELF" | grep -Eq 'EspHardwareAes128|EspAesEngine'; then
+          if ! grep -Eq 'EspHardwareAes128|EspAesEngine' <<<"$SYMS"; then
             echo "ESP32-C6 production image is missing the hardware AES backend" >&2
             exit 1
           fi
@@ -362,11 +367,12 @@ jobs:
         run: |
           ELF=examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
-          if "$NM" --demangle "$ELF" | grep -Eq 'aes::soft::fixslice|SoftwareAes128'; then
+          SYMS="$("$NM" --demangle "$ELF")"
+          if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
             echo "ESP32-H2 production image still links the software AES core" >&2
             exit 1
           fi
-          if ! "$NM" --demangle "$ELF" | grep -Eq 'EspHardwareAes128|EspAesEngine'; then
+          if ! grep -Eq 'EspHardwareAes128|EspAesEngine' <<<"$SYMS"; then
             echo "ESP32-H2 production image is missing the hardware AES backend" >&2
             exit 1
           fi
@@ -428,11 +434,12 @@ jobs:
           OBJDUMP=$(find "$(rustc --print sysroot)" -name llvm-objdump -print -quit)
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           ./tools/firmware-size-report.sh bl702-sensor "$RAW" 196608 ${ELF}.size.json
-          if "$NM" --demangle "$ELF" | grep -q 'aes::soft::fixslice'; then
+          SYMS="$("$NM" --demangle "$ELF")"
+          if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
             echo "BL702 production image still links the software AES core" >&2
             exit 1
           fi
-          if ! "$NM" --demangle "$ELF" | grep -Eq 'HardwareAes128|bl702_hal::aes'; then
+          if ! grep -Eq 'HardwareAes128|bl702_hal::aes' <<<"$SYMS"; then
             echo "BL702 production image is missing the SEC_ENG AES backend" >&2
             exit 1
           fi
@@ -580,15 +587,16 @@ jobs:
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
           ./tools/firmware-size-report.sh efr32mg1-sensor ${ELF}.bin 163840 ${ELF}.size.json
           NM="$NM" examples/efr32mg1-sensor/check-layout.sh "$ELF"
-          if "$NM" --demangle "$ELF" | grep -q 'core::slice::sort'; then
+          SYMS="$("$NM" --demangle "$ELF")"
+          if grep -q 'core::slice::sort' <<<"$SYMS"; then
             echo "EFR32MG1 image contains generic slice sorting" >&2
             exit 1
           fi
-          if "$NM" --demangle "$ELF" | grep -q 'aes::soft::fixslice'; then
+          if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
             echo "EFR32MG1 production image still links the software AES core" >&2
             exit 1
           fi
-          if ! "$NM" --demangle "$ELF" | grep -Eq 'HardwareAes128|efr32mg1_hal::crypto'; then
+          if ! grep -Eq 'HardwareAes128|efr32mg1_hal::crypto' <<<"$SYMS"; then
             echo "EFR32MG1 production image is missing the CRYPTO AES backend" >&2
             exit 1
           fi
