@@ -716,32 +716,58 @@ impl<M: MacDriver> ZdoLayer<M> {
         payload: &[u8],
         rsp: &mut [u8],
     ) -> Result<usize, ZdoError> {
-        let req = MgmtLeaveReq::parse(payload)?;
         // Note: actual leave is triggered by setting a flag that the runtime polls.
         // We can't call async nlme_leave from a sync context, and the leave needs
-        // to happen AFTER we've sent the response. Set a flag and return success.
-        log::info!("[ZDO] Mgmt_Leave_req received — leave will be executed after response");
+        // to happen AFTER we've attempted the response. Validate here with the
+        // same classifier the runtime uses to decide whether the request was
+        // accepted independently of response delivery.
+        let targets_local_device = match self.classify_mgmt_leave_request(src, payload) {
+            Ok(request) => request.is_some(),
+            Err(error @ ZdoError::InvalidData) => {
+                log::warn!(
+                    "[ZDO] Ignoring Mgmt_Leave_req from unauthorized source 0x{:04X}",
+                    src.0
+                );
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        log::info!("[ZDO] Mgmt_Leave_req received — leave will be executed after response attempt");
         if rsp.is_empty() {
             return Err(ZdoError::BufferTooSmall);
         }
-        if self.nwk().device_type() == zigbee_nwk::DeviceType::EndDevice
-            && src != self.nwk().nib().parent_address
-            && src != ShortAddress::COORDINATOR
-        {
-            log::warn!(
-                "[ZDO] Ignoring Mgmt_Leave_req from unauthorized source 0x{:04X}",
-                src.0
-            );
-            return Err(ZdoError::InvalidData);
-        }
-        let local_ieee = self.nwk().nib().ieee_address;
-        let targets_local_device = req.device_address == [0; 8] || req.device_address == local_ieee;
         rsp[0] = if targets_local_device {
             ZdpStatus::Success
         } else {
             ZdpStatus::NotSupported
         } as u8;
         Ok(1)
+    }
+
+    /// Classify a Mgmt_Leave request using ZDO-owned source and target policy.
+    ///
+    /// `Ok(Some(request))` means the request is well formed, authorized, and
+    /// targets this device, so the runtime must execute it even if transmitting
+    /// `Mgmt_Leave_rsp` fails. `Ok(None)` is a valid authorized request for a
+    /// different device; `Err` is malformed or unauthorized.
+    pub fn classify_mgmt_leave_request(
+        &self,
+        src: ShortAddress,
+        payload: &[u8],
+    ) -> Result<Option<MgmtLeaveReq>, ZdoError> {
+        let request = MgmtLeaveReq::parse(payload)?;
+        if self.nwk().device_type() == zigbee_nwk::DeviceType::EndDevice
+            && src != self.nwk().nib().parent_address
+            && src != ShortAddress::COORDINATOR
+        {
+            return Err(ZdoError::InvalidData);
+        }
+        let local_ieee = self.nwk().nib().ieee_address;
+        if request.device_address == [0; 8] || request.device_address == local_ieee {
+            Ok(Some(request))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn handle_mgmt_permit_joining_req(
