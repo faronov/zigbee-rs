@@ -3,26 +3,38 @@ name = "nrf52833-sensor"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# External I2C sensor (pick one; SDA=P0.26, SCL=P0.27 on the PCA10100
+# Arduino header). Forwards to the product crate too, since BME280 adds a
+# Pressure Measurement cluster to the profile. Mirrors the identical
+# features in examples/nrf52840-sensor.
+sensor-bme280 = ["nrf52833-sensor-product/sensor-bme280", "dep:zigbee-bme280"]  # Bosch BME280 temperature + humidity + pressure
+sensor-sht31  = ["dep:zigbee-sht3x"]                                            # Sensirion SHT31 temperature + humidity
+
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["nrf52833"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
-zigbee-aps = { path = "../../zigbee-aps" }
-zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+nrf-sensor-app = { path = "../../apps/nrf-sensor" }
+nrf52833-dk = { path = "../../boards/nrf52833-dk" }
+nrf52833-sensor-product = { path = "../../products/nrf52833-sensor" }
+zigbee-bme280 = { package = "zigbee-bme280", path = "../../drivers/bme280", optional = true }
+zigbee-sht3x = { package = "zigbee-sht3x", path = "../../drivers/sht3x", optional = true }
 
 # nRF52833 Embassy HAL
 embassy-nrf = { version = "0.3", features = ["nrf52833", "time-driver-rtc1", "gpiote"] }
 embassy-executor = { version = "0.7", features = ["task-arena-size-32768", "arch-cortex-m", "executor-thread"] }
 embassy-time = "0.4"
 embassy-futures = "0.1"
-static_cell = "2"
 cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"
 defmt = "1.0"
 defmt-rtt = "1.0"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 embedded-hal = "1.0"
+log = "0.4"
 
 [profile.release]
 opt-level = "s"

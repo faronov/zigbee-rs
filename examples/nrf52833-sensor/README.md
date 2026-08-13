@@ -1,77 +1,122 @@
-# nRF52833 Zigbee Temperature Sensor
+# nRF52833 Zigbee Sensor (production)
 
-An async Embassy-based Zigbee 3.0 end device for the **Nordic nRF52833** that
-reads real temperature from the on-chip TEMP peripheral and reports simulated
-humidity. Uses `defmt` + RTT for logging.
+An async Embassy-based Zigbee 3.0 **sleepy end device** for the Nordic
+nRF52833-DK (PCA10100). It runs the *same* application as
+`examples/nrf52840-sensor` — both firmwares are thin composition roots over
+the shared [`apps/nrf-sensor`](../../apps/nrf-sensor) crate — so the two
+products cannot drift apart in commissioning, persistence, polling,
+reporting, or button behavior.
 
 ## Hardware Requirements
 
-- nRF52833-DK (PCA10100) or any nRF52833 board with a debug probe
-- Button 1 (P0.11, active low) for join/leave control
-- Debug probe (J-Link on-board for DK, or external probe-rs-compatible)
+- nRF52833-DK (PCA10100) or any nRF52833 board with a debug probe and a
+  32 MHz crystal (required by the 802.15.4 radio)
+- LED1 (P0.13) and Button 1 (P0.11) — wired by
+  [`boards/nrf52833-dk`](../../boards/nrf52833-dk)
+- Optional external I2C sensor on P0.26 (SDA) / P0.27 (SCL)
+- Debug probe (on-board J-Link on the DK, or any probe-rs-compatible probe)
 
 ## Prerequisites
 
-- Rust stable toolchain
+- Rust nightly toolchain
 - `probe-rs`: `cargo install probe-rs-tools`
 - Target: `thumbv7em-none-eabihf` (configured in `.cargo/config.toml`)
 
 No vendor libraries, SoftDevice, or binary blobs are needed — the project
-drives the 802.15.4 radio directly via `embassy-nrf`.
+drives the 802.15.4 radio directly via `embassy-nrf`, and AES-128 runs on the
+Nordic ECB peripheral (software AES is rejected by CI symbol gates).
 
 ## Build
 
 ```sh
-cargo build --release
+cargo build --release                          # on-chip TEMP + synthetic humidity
+cargo build --release --features sensor-bme280 # BME280: temp + humidity + pressure
+cargo build --release --features sensor-sht31  # SHT31: temp + humidity
 ```
 
 ## Flash & Run
 
 ```sh
+cargo run --release
+# or
 probe-rs run --chip nRF52833_xxAA target/thumbv7em-none-eabihf/release/nrf52833-sensor
 ```
 
-Or use the configured runner:
+## Operation
 
-```sh
-cargo run --release
-```
+1. Power on → LED1 solid for 2 s (boot signal).
+2. **Commissioning starts automatically** — no button press is required. If
+   durable state exists, the device resumes silently instead of scanning.
+3. While unjoined: LED1 double-blinks and a join is retried every 15 s.
+4. Once joined: LED1 on, 250 ms fast polling for 120 s (or until the
+   coordinator finishes `ConfigureReporting`), then 30 s slow polling.
+   Sensors are sampled and reported every 60 s.
+5. Security state (network key, frame counters, parent, short address) is
+   checkpointed to a protected flash partition after every lifecycle event.
+
+Button 1 is an **operator override only**:
+
+| Action | Effect |
+|--------|--------|
+| Short press while joined | Read sensors and force an immediate temperature, humidity, and battery report |
+| Short press while unjoined | Start a join/resume attempt immediately |
+| Hold 3 s | Durable factory reset, LED confirmation blink, reboot |
+
+The device declares its interview configuration complete only after it has
+received coordinator-originated `ConfigureReporting` commands for every
+reportable cluster in the active profile (3/3 for the on-chip/SHT31 build,
+4/4 with BME280 pressure). RTT logs show the current count.
 
 ## What It Demonstrates
 
-- Embassy async event loop with `select3` (radio receive, button press, timer)
-- On-chip TEMP sensor reading via `embassy_nrf::temp::Temp`
-- Building a Zigbee device with `ZigbeeDevice` builder API
-- ZCL endpoint 1 (Home Automation, device type 0x0302) with
-  **Temperature Measurement** and **Relative Humidity** server clusters
-- Processing incoming MAC frames and generating ZCL attribute reports
-- Button-driven network join/leave via `UserAction::Toggle`
-- RAM power-down of unused banks (128 KB total, saves ~80 KB)
-- `defmt` structured logging over RTT
+- Automatic cold-start commissioning, silent resume, and bounded
+  secure-rejoin retry with a factory-reset fallback
+- Crash-safe `SecurityStateJournal` in the last 8 KiB of flash, which
+  survives reset *and* a firmware reflash
+- Factory FICR `DEVICEID`-derived EUI-64 (never a constant)
+- Nordic ECB hardware AES-128 with two startup known-answer tests
+- ZHA interview, `Identify`, and NWK-secured Temperature/Humidity/Battery
+  reporting from the shared `zigbee-runtime` profile archetype
+- `defmt` structured logging over RTT, with the stack's own `log` records
+  bridged into it
 
-## Differences from nRF52840-sensor
+## Layer Ownership
 
-- Uses `nrf52833` feature for `embassy-nrf` and `zigbee-mac`
-- Chip: nRF52833_xxAA (512 KB Flash, 128 KB RAM vs 1 MB / 256 KB)
-- Runner: `probe-rs run --chip nRF52833_xxAA`
-- No external sensor support (on-chip TEMP only) — see `nrf52840-sensor`
-  for BME280/SHT31 I2C sensor integration
+| Concern | Crate |
+|---------|-------|
+| Lifecycle, polling, reporting, button, LED | `apps/nrf-sensor` |
+| Identity, memory map, security partition, battery curve, profile | `products/nrf52833-sensor` |
+| LED1 / Button 1 / sensor I2C pins | `boards/nrf52833-dk` |
+| Radio, RNG, SAADC, TEMP, NVMC, clocks | `embassy-nrf` |
 
-## Operation
+## Differences from nrf52840-sensor
 
-1. Power on → device starts idle (not joined)
-2. Press Button 1 → initiates BDB commissioning (network steering)
-3. Once joined → reads temperature every 30 s, ticks the Zigbee stack
-4. Press Button 1 again → leaves the network
+Only what the silicon forces:
+
+| | nRF52840 | nRF52833 |
+|-|----------|----------|
+| Flash / RAM | 1 MiB / 256 KiB | 512 KiB / 128 KiB |
+| Application flash | 1016 KiB | 504 KiB |
+| Security journal | `0x000FE000` | `0x0007E000` |
+| Model string | `nRF52840-Sensor` | `nRF52833-Sensor` |
+| DC/DC | `reg0` + `reg1` | `reg1` only (`embassy-nrf` exposes `reg0` for nRF52840 only) |
+| Runner | `--chip nRF52840_xxAA` | `--chip nRF52833_xxAA` |
+
+Everything else — endpoint, clusters, reporting defaults, timings, retry
+bounds, persistence points — is literally the same code.
 
 ## Project Structure
 
 ```
 nrf52833-sensor/
-├── .cargo/config.toml   # Target, runner (probe-rs), DEFMT_LOG level
-├── Cargo.toml            # Dependencies (embassy-nrf 0.3 nrf52833, zigbee-rs crates)
-├── build.rs              # Linker script flags (-Tlink.x -Tdefmt.x)
-├── memory.x              # Memory layout: 512 KB Flash, 128 KB RAM
+├── .cargo/config.toml   # Target, runner, linker script search path, DEFMT_LOG
+├── Cargo.toml           # Dependencies + optional external-sensor features
 └── src/
-    └── main.rs           # Async entry point (#[embassy_executor::main])
+    ├── main.rs          # Composition root only (platform startup + wiring)
+    └── sensor.rs        # Optional BME280/SHT31 I2C source
 ```
+
+The memory layout lives in `products/nrf52833-sensor/link/memory.x`, not
+here — the product owns the flash boundaries, and its link-time `ASSERT`s
+fail the build if the application region would ever overlap the security
+journal.
