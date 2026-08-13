@@ -29,6 +29,7 @@ use zigbee_zcl::frame::ZclFrame;
 use zigbee_zcl::{ClusterDirection, ClusterId, CommandId, ZclStatus};
 
 use crate::event_loop;
+use crate::remote_reporting::{RecordOutcome, RemoteReportingState};
 use crate::{
     ClusterRef, EndpointConfig, EndpointIdentifyCluster, PENDING_ZCL_DATA_CAP, PendingZclResponse,
 };
@@ -93,6 +94,11 @@ pub(crate) struct LocalZclCtx<'a, 'c, const N: usize> {
     basic_cluster: &'a mut BasicCluster,
     identify_clusters: &'a mut [EndpointIdentifyCluster],
     reporting: &'a mut ReportingEngine,
+    /// Interview record of clusters a remote client configured in full.
+    ///
+    /// Held next to, and kept strictly distinct from, `reporting`: the engine
+    /// above also contains the product's own default configurations.
+    remote_reporting: &'a mut RemoteReportingState,
     pending_responses: &'a mut heapless::Vec<PendingZclResponse, N>,
     clusters: &'a mut [ClusterRef<'c>],
     zcl_scratch: &'a mut [u8; 253],
@@ -107,6 +113,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         basic_cluster: &'a mut BasicCluster,
         identify_clusters: &'a mut [EndpointIdentifyCluster],
         reporting: &'a mut ReportingEngine,
+        remote_reporting: &'a mut RemoteReportingState,
         pending_responses: &'a mut heapless::Vec<PendingZclResponse, N>,
         clusters: &'a mut [ClusterRef<'c>],
         zcl_scratch: &'a mut [u8; 253],
@@ -116,6 +123,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             basic_cluster,
             identify_clusters,
             reporting,
+            remote_reporting,
             pending_responses,
             clusters,
             zcl_scratch,
@@ -350,7 +358,20 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             });
         }
 
-        // Check if this is Configure Reporting (0x06) — coordinator configuring our reports
+        // Check if this is Configure Reporting (0x06) — a remote ZCL client
+        // (typically the coordinator, during its interview) configuring the
+        // reports this device should send.
+        //
+        // Two independent results come out of this branch. The per-record
+        // status list drives the standards-mandated Configure Reporting
+        // Response (0x07) and is unchanged. Separately, the cluster is added
+        // to the runtime's remote-reporting record *only* when the whole
+        // command was well formed and every record succeeded — see
+        // [`crate::remote_reporting`]. Anything less (empty or malformed
+        // payload, unsupported attribute, unreportable attribute,
+        // invalid/disabled data type, reporting-table capacity failure) is
+        // reported to the client but never counts towards interview
+        // completion.
         if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
             && cmd_id == 0x06
             && zcl_frame.header.direction() == ClusterDirection::ClientToServer
@@ -366,6 +387,14 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             let mut i = 0usize;
             let mut records = 0usize;
             let mut parse_ok = true;
+            let mut all_records_succeeded = true;
+            // Outbound (device→client) reporting progress may only be advanced
+            // by a command made *entirely* of Send-direction records. A
+            // Receive-direction record configures how *this* device consumes a
+            // client's reports, never what it sends, so a receive-only or
+            // mixed command must not count towards interview completion even if
+            // every record is individually accepted.
+            let mut all_records_send = true;
             rt_trace!(
                 "[RT] zcl_cfg_reporting ep={} cluster=0x{:04X} len={}",
                 dst_ep,
@@ -383,6 +412,9 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                         break;
                     }
                 };
+                if direction == ReportDirection::Receive {
+                    all_records_send = false;
+                }
                 i += 1;
                 if i + 2 > payload.len() {
                     parse_ok = false;
@@ -464,18 +496,20 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                     }
                 };
 
-                let attr_access = self
+                let attr_definition = self
                     .with_cluster(dst_ep, ClusterId(cluster_id), |cluster| {
                         cluster
                             .attributes()
                             .find(cfg.attribute_id)
-                            .map(|definition| definition.access)
+                            .map(|definition| (definition.access, definition.data_type))
                     })
                     .flatten();
                 let status = if !zigbee_zcl::data_types::is_data_type_enabled(cfg.data_type) {
                     ZclStatus::InvalidDataType
-                } else if let Some(access) = attr_access {
-                    if cfg.direction == ReportDirection::Send && !access.is_reportable() {
+                } else if let Some((access, attribute_type)) = attr_definition {
+                    if cfg.direction == ReportDirection::Send && cfg.data_type != attribute_type {
+                        ZclStatus::InvalidDataType
+                    } else if cfg.direction == ReportDirection::Send && !access.is_reportable() {
                         ZclStatus::UnreportableAttribute
                     } else {
                         match self
@@ -489,6 +523,9 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                 } else {
                     ZclStatus::UnsupportedAttribute
                 };
+                if status != ZclStatus::Success {
+                    all_records_succeeded = false;
+                }
                 let _ = response.records.push(ConfigureReportingStatusRecord {
                     status,
                     direction: cfg.direction,
@@ -528,6 +565,43 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                     payload.len(),
                 );
             }
+
+            // Interview accounting: only a well-formed, non-empty command made
+            // entirely of Send-direction records whose statuses were all
+            // `Success` advances outbound reporting progress. A partially
+            // rejected command (the client did not get what it asked for) or a
+            // receive-only/mixed command (which does not configure what this
+            // device *sends*) is answered but never counts.
+            if parse_ok && records > 0 && all_records_succeeded && all_records_send {
+                match self.remote_reporting.record(dst_ep, cluster_id) {
+                    RecordOutcome::Added | RecordOutcome::AlreadyRecorded => {}
+                    RecordOutcome::Full => {
+                        // Never a silent success: the cluster genuinely is not
+                        // tracked, so say so rather than let an application
+                        // wait on a count that can no longer grow.
+                        log::warn!(
+                            "[Runtime] Remote reporting record full; ep={} cluster=0x{:04X} not tracked",
+                            dst_ep,
+                            cluster_id
+                        );
+                    }
+                }
+                let configured_clusters = self.remote_reporting.cluster_count(dst_ep);
+                rt_trace!(
+                    "[RT] zcl_cfg_reporting remote_ok ep={} cluster=0x{:04X} clusters={}",
+                    dst_ep,
+                    cluster_id,
+                    configured_clusters,
+                );
+                return Some(event_loop::StackEvent::ReportingConfigured {
+                    src_addr,
+                    source_endpoint: src_endpoint,
+                    endpoint: dst_ep,
+                    cluster_id,
+                    configured_clusters,
+                });
+            }
+
             return Some(command_received_event(
                 src_addr,
                 src_endpoint,
@@ -1489,6 +1563,7 @@ pub(crate) fn queue_read_reporting_response<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::{GroupTableAction, LocalZclCtx};
+    use crate::remote_reporting::RemoteReportingState;
     use crate::{ClusterRef, EndpointConfig, EndpointIdentifyCluster, PendingZclResponse};
     use zigbee_zcl::clusters::Cluster;
     use zigbee_zcl::clusters::basic::{BasicCluster, PowerSource};
@@ -1501,6 +1576,7 @@ mod tests {
     use zigbee_zcl::{ClusterDirection, ClusterId, CommandId, DeviceId, ZclStatus};
 
     const EP: u8 = 1;
+    const EP2: u8 = 2;
     const SRC_ADDR: u16 = 0x1234;
     const SRC_EP: u8 = 3;
     const SEQ: u8 = 0x42;
@@ -1513,6 +1589,7 @@ mod tests {
         basic: BasicCluster,
         identify: heapless::Vec<EndpointIdentifyCluster, { crate::MAX_ENDPOINTS }>,
         reporting: ReportingEngine,
+        remote_reporting: RemoteReportingState,
         pending: heapless::Vec<PendingZclResponse, 4>,
         scratch: [u8; 253],
     }
@@ -1520,6 +1597,32 @@ mod tests {
     impl Fixture {
         fn new(server_clusters: &[ClusterId]) -> Self {
             Self::with_clusters(server_clusters, &[])
+        }
+
+        /// Same as [`Self::new`], but the server clusters are configured on a
+        /// second local endpoint as well, so per-endpoint behavior can be
+        /// exercised.
+        fn with_second_endpoint(server_clusters: &[ClusterId]) -> Self {
+            let mut fx = Self::new(server_clusters);
+            let mut servers = heapless::Vec::new();
+            for c in server_clusters {
+                servers.push(*c).unwrap();
+            }
+            fx.endpoints
+                .push(EndpointConfig {
+                    endpoint: EP2,
+                    profile_id: 0x0104,
+                    device_id: DeviceId::TEMPERATURE_SENSOR,
+                    device_version: 1,
+                    server_clusters: servers,
+                    client_clusters: heapless::Vec::new(),
+                })
+                .unwrap();
+            let _ = fx.identify.push(EndpointIdentifyCluster {
+                endpoint: EP2,
+                cluster: IdentifyCluster::new(),
+            });
+            fx
         }
 
         fn with_clusters(server_clusters: &[ClusterId], client_clusters: &[ClusterId]) -> Self {
@@ -1552,6 +1655,7 @@ mod tests {
                 basic: BasicCluster::new("TestCo", "M1", "20240101", "1.0", PowerSource::Battery),
                 identify,
                 reporting: ReportingEngine::new(),
+                remote_reporting: RemoteReportingState::new(),
                 pending: heapless::Vec::new(),
                 scratch: [0u8; 253],
             }
@@ -1565,16 +1669,29 @@ mod tests {
             cluster_id: u16,
             frame: &[u8],
         ) -> super::LocalZclOutcome {
+            self.dispatch_to_endpoint(EP, clusters, cluster_id, frame)
+        }
+
+        /// Dispatch against an explicit local endpoint, so endpoint
+        /// separation of the remote-reporting record can be exercised.
+        fn dispatch_to_endpoint(
+            &mut self,
+            endpoint: u8,
+            clusters: &mut [ClusterRef<'_>],
+            cluster_id: u16,
+            frame: &[u8],
+        ) -> super::LocalZclOutcome {
             LocalZclCtx::new(
                 &self.endpoints,
                 &mut self.basic,
                 &mut self.identify,
                 &mut self.reporting,
+                &mut self.remote_reporting,
                 &mut self.pending,
                 clusters,
                 &mut self.scratch,
             )
-            .dispatch(EP, SRC_EP, cluster_id, SRC_ADDR, frame)
+            .dispatch(endpoint, SRC_EP, cluster_id, SRC_ADDR, frame)
         }
     }
 
@@ -1649,6 +1766,51 @@ mod tests {
                 v.push(i).unwrap();
             }
             Ok(v)
+        }
+        fn attributes(&self) -> &dyn zigbee_zcl::clusters::AttributeStoreAccess {
+            &self.store
+        }
+        fn attributes_mut(&mut self) -> &mut dyn zigbee_zcl::clusters::AttributeStoreMutAccess {
+            &mut self.store
+        }
+    }
+
+    /// Minimal application cluster with a single **write-only** attribute —
+    /// i.e. one that exists but can never be reported. Used to exercise the
+    /// `UnreportableAttribute` branch of Configure Reporting; every attribute
+    /// of the standard measurement clusters is reportable.
+    struct WriteOnlyCluster {
+        store: zigbee_zcl::attribute::AttributeStore<1>,
+    }
+
+    impl WriteOnlyCluster {
+        const CID: ClusterId = ClusterId(0xFC01);
+        const ATTR: zigbee_zcl::AttributeId = zigbee_zcl::AttributeId(0x0000);
+        fn new() -> Self {
+            let mut store = zigbee_zcl::attribute::AttributeStore::new();
+            let _ = store.register(
+                zigbee_zcl::attribute::AttributeDefinition {
+                    id: Self::ATTR,
+                    data_type: zigbee_zcl::data_types::ZclDataType::I16,
+                    access: zigbee_zcl::attribute::AttributeAccess::WriteOnly,
+                    name: "WriteOnly",
+                },
+                zigbee_zcl::data_types::ZclValue::I16(0),
+            );
+            Self { store }
+        }
+    }
+
+    impl Cluster for WriteOnlyCluster {
+        fn cluster_id(&self) -> ClusterId {
+            Self::CID
+        }
+        fn handle_command(
+            &mut self,
+            _cmd: CommandId,
+            _payload: &[u8],
+        ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+            Err(ZclStatus::UnsupClusterCommand)
         }
         fn attributes(&self) -> &dyn zigbee_zcl::clusters::AttributeStoreAccess {
             &self.store
@@ -1905,6 +2067,553 @@ mod tests {
                 )
                 .is_some()
         );
+    }
+
+    // ── Remote (client-configured) reporting interview state ──
+    //
+    // These lock the rule in `crate::remote_reporting`: a cluster is recorded
+    // only after a non-empty, well-formed Configure Reporting command made
+    // entirely of Send-direction records in which *every* record succeeded.
+    // Each test also checks that the standards-mandated Configure Reporting
+    // Response (0x07) behavior is unchanged, so the interview accounting can
+    // never be "fixed" by weakening the response.
+
+    /// One Send record for a reportable attribute: `[dir, attr_lo, attr_hi,
+    /// type, min_lo, min_hi, max_lo, max_hi, change_lo, change_hi]`.
+    fn configure_reporting_record(attr_id: u16, data_type: u8) -> [u8; 10] {
+        let attr = attr_id.to_le_bytes();
+        [
+            0x00, attr[0], attr[1], data_type, 0x0A, 0x00, 0x3C, 0x00, 0x05, 0x00,
+        ]
+    }
+
+    fn temperature_clusters(cluster: &mut TemperatureCluster) -> [ClusterRef<'_>; 1] {
+        [ClusterRef {
+            endpoint: EP,
+            cluster,
+        }]
+    }
+
+    /// Every record succeeded → exactly one distinct cluster is recorded and
+    /// the dedicated event carries the running count.
+    #[test]
+    fn successful_remote_configure_reporting_records_one_cluster() {
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        let req = global_request(0x06, true, &configure_reporting_record(0x0000, 0x29));
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::ReportingConfigured {
+                src_addr: SRC_ADDR,
+                source_endpoint: SRC_EP,
+                endpoint: EP,
+                cluster_id: 0x0402,
+                configured_clusters: 1,
+            })
+        ));
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 1);
+        assert!(fx.remote_reporting.contains(EP, ClusterId::TEMPERATURE.0));
+
+        // Standards behavior unchanged: an all-Success command still answers
+        // with a 0x07 response.
+        assert_eq!(fx.pending.len(), 1);
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.header.command_id.0, 0x07);
+    }
+
+    /// Re-configuring the same cluster (ZHA re-runs the interview after a
+    /// rejoin, and coordinators retry) must not inflate the count.
+    #[test]
+    fn repeated_remote_configure_reporting_does_not_double_count() {
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        let req = global_request(0x06, true, &configure_reporting_record(0x0000, 0x29));
+        for _ in 0..3 {
+            fx.dispatch(
+                &mut temperature_clusters(&mut temp),
+                ClusterId::TEMPERATURE.0,
+                &req,
+            );
+        }
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 1);
+
+        // A second attribute on the same cluster is still one cluster.
+        let req = global_request(0x06, true, &configure_reporting_record(0x0000, 0x29));
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::ReportingConfigured {
+                configured_clusters: 1,
+                ..
+            })
+        ));
+        assert_eq!(fx.remote_reporting.total_cluster_count(), 1);
+    }
+
+    /// Locally configured defaults populate the reporting engine but are not
+    /// a remote interview — the historical bug this state exists to fix.
+    #[test]
+    fn local_default_reporting_does_not_affect_the_remote_count() {
+        use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
+
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        fx.reporting
+            .configure_for_cluster(
+                EP,
+                ClusterId::TEMPERATURE.0,
+                ReportingConfig {
+                    direction: ReportDirection::Send,
+                    attribute_id: zigbee_zcl::AttributeId(0x0000),
+                    data_type: zigbee_zcl::data_types::ZclDataType::I16,
+                    min_interval: 10,
+                    max_interval: 60,
+                    reportable_change: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(fx.reporting.configured_cluster_count(EP), 1);
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert!(fx.remote_reporting.is_empty());
+    }
+
+    /// An unsupported attribute is answered per-record but never counted.
+    #[test]
+    fn unsupported_attribute_is_not_counted() {
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        let req = global_request(0x06, true, &configure_reporting_record(0x00FF, 0x29));
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.header.command_id.0, 0x07);
+        assert_eq!(resp.payload[0], ZclStatus::UnsupportedAttribute as u8);
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::CommandReceived {
+                command_id: 0x06,
+                ..
+            })
+        ));
+    }
+
+    /// A known but unreportable (write-only) attribute is likewise not an
+    /// interview step.
+    #[test]
+    fn unreportable_attribute_is_not_counted() {
+        let mut fx = Fixture::new(&[WriteOnlyCluster::CID]);
+        let mut cluster = WriteOnlyCluster::new();
+        let req = global_request(
+            0x06,
+            true,
+            &configure_reporting_record(WriteOnlyCluster::ATTR.0, 0x29),
+        );
+        let outcome = fx.dispatch(
+            &mut [ClusterRef {
+                endpoint: EP,
+                cluster: &mut cluster,
+            }],
+            WriteOnlyCluster::CID.0,
+            &req,
+        );
+
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.header.command_id.0, 0x07);
+        assert_eq!(resp.payload[0], ZclStatus::UnreportableAttribute as u8);
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::CommandReceived { .. })
+        ));
+    }
+
+    /// A known, enabled ZCL type still has to match the attribute's declared
+    /// type. Temperature MeasuredValue is `I16`; presenting it as `U16` is an
+    /// `InvalidDataType` rejection, not interview progress.
+    #[test]
+    fn mismatched_attribute_data_type_is_not_counted() {
+        use zigbee_zcl::foundation::reporting::ReportDirection;
+
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        let req = global_request(0x06, true, &configure_reporting_record(0x0000, 0x21));
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.header.command_id.0, 0x07);
+        assert_eq!(resp.payload[0], ZclStatus::InvalidDataType as u8);
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert!(
+            fx.reporting
+                .get_config(
+                    EP,
+                    ClusterId::TEMPERATURE.0,
+                    ReportDirection::Send,
+                    zigbee_zcl::AttributeId(0x0000),
+                )
+                .is_none()
+        );
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::CommandReceived { .. })
+        ));
+    }
+
+    /// A data type this build does not support yields `InvalidDataType`;
+    /// the record is answered but the cluster is not counted. Only runs where
+    /// a type is genuinely disabled (`cargo test -p zigbee-runtime
+    /// --no-default-features`) — with both float features on, no standard
+    /// type is disabled.
+    #[cfg(not(feature = "float32"))]
+    #[test]
+    fn disabled_data_type_is_not_counted() {
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        // Float32 (0x39) with a 4-byte reportable change.
+        let req = global_request(
+            0x06,
+            true,
+            &[
+                0x00, 0x00, 0x00, 0x39, 0x0A, 0x00, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ],
+        );
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.header.command_id.0, 0x07);
+        assert_eq!(resp.payload[0], ZclStatus::InvalidDataType as u8);
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::CommandReceived { .. })
+        ));
+    }
+
+    /// An unknown data-type byte fails the parse: no response is queued (the
+    /// command is malformed) and nothing is counted.
+    #[test]
+    fn unknown_data_type_is_not_counted() {
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        let req = global_request(0x06, true, &configure_reporting_record(0x0000, 0xFE));
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+
+        assert!(fx.pending.is_empty());
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::CommandReceived { .. })
+        ));
+    }
+
+    /// A truncated record and an empty payload are both malformed/empty
+    /// commands, not completed interview steps.
+    #[test]
+    fn malformed_and_empty_commands_are_not_counted() {
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+
+        // Truncated: direction + attribute + type, then nothing.
+        let truncated = global_request(0x06, true, &[0x00, 0x00, 0x00, 0x29, 0x0A]);
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &truncated,
+        );
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::CommandReceived { .. })
+        ));
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+
+        // Empty payload: zero records.
+        let empty = global_request(0x06, true, &[]);
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &empty,
+        );
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::CommandReceived { .. })
+        ));
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert!(fx.pending.is_empty());
+    }
+
+    /// A command that configures one attribute successfully and is rejected
+    /// for another did not give the client what it asked for. The successful
+    /// record still lands in the reporting engine (per-record semantics), but
+    /// the cluster is *not* recorded as remotely configured.
+    #[test]
+    fn partially_rejected_command_configures_engine_but_is_not_counted() {
+        use zigbee_zcl::foundation::reporting::ReportDirection;
+
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        let mut payload = heapless::Vec::<u8, 32>::new();
+        payload
+            .extend_from_slice(&configure_reporting_record(0x0000, 0x29))
+            .unwrap();
+        payload
+            .extend_from_slice(&configure_reporting_record(0x00FF, 0x29))
+            .unwrap();
+        let req = global_request(0x06, true, &payload);
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+
+        // Per-record response: Success for 0x0000, failure for 0x00FF.
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.header.command_id.0, 0x07);
+        assert_eq!(resp.payload[0], ZclStatus::Success as u8);
+        assert_eq!(resp.payload[4], ZclStatus::UnsupportedAttribute as u8);
+        assert!(
+            fx.reporting
+                .get_config(
+                    EP,
+                    ClusterId::TEMPERATURE.0,
+                    ReportDirection::Send,
+                    zigbee_zcl::AttributeId(0x0000),
+                )
+                .is_some()
+        );
+        // …but the interview step is not complete.
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::CommandReceived { .. })
+        ));
+    }
+
+    /// A reporting-table capacity failure is a rejection, not a completed
+    /// configuration.
+    #[test]
+    fn reporting_capacity_failure_is_not_counted() {
+        use zigbee_zcl::foundation::reporting::{
+            MAX_REPORT_CONFIGS, ReportDirection, ReportingConfig,
+        };
+
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        // Fill the engine with unrelated configurations.
+        for n in 0..MAX_REPORT_CONFIGS {
+            fx.reporting
+                .configure_for_cluster(
+                    EP,
+                    0x1000 + n as u16,
+                    ReportingConfig {
+                        direction: ReportDirection::Send,
+                        attribute_id: zigbee_zcl::AttributeId(n as u16),
+                        data_type: zigbee_zcl::data_types::ZclDataType::I16,
+                        min_interval: 10,
+                        max_interval: 60,
+                        reportable_change: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        let req = global_request(0x06, true, &configure_reporting_record(0x0000, 0x29));
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.payload[0], ZclStatus::InsufficientSpace as u8);
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::CommandReceived { .. })
+        ));
+    }
+
+    /// The same cluster on two endpoints is two distinct interview steps.
+    #[test]
+    fn remote_reporting_separates_endpoints() {
+        let mut fx = Fixture::with_second_endpoint(&[ClusterId::TEMPERATURE]);
+        let mut temp1 = TemperatureCluster::new(-4000, 12500);
+        let mut temp2 = TemperatureCluster::new(-4000, 12500);
+        let req = global_request(0x06, true, &configure_reporting_record(0x0000, 0x29));
+
+        fx.dispatch_to_endpoint(
+            EP,
+            &mut [ClusterRef {
+                endpoint: EP,
+                cluster: &mut temp1,
+            }],
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+        let outcome = fx.dispatch_to_endpoint(
+            EP2,
+            &mut [ClusterRef {
+                endpoint: EP2,
+                cluster: &mut temp2,
+            }],
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::ReportingConfigured {
+                endpoint: EP2,
+                configured_clusters: 1,
+                ..
+            })
+        ));
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 1);
+        assert_eq!(fx.remote_reporting.cluster_count(EP2), 1);
+        assert_eq!(fx.remote_reporting.total_cluster_count(), 2);
+    }
+
+    /// A new commissioning/rejoin lifecycle starts from an empty record.
+    #[test]
+    fn resetting_clears_the_remote_interview_record() {
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        let req = global_request(0x06, true, &configure_reporting_record(0x0000, 0x29));
+        fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 1);
+
+        fx.remote_reporting.clear();
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert!(!fx.remote_reporting.contains(EP, ClusterId::TEMPERATURE.0));
+
+        // …and a later command re-populates it.
+        fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 1);
+    }
+
+    /// A single Receive-direction record: `[dir=Receive, attr_lo, attr_hi,
+    /// timeout_lo, timeout_hi]`.
+    fn receive_reporting_record(attr_id: u16, timeout: u16) -> [u8; 5] {
+        let attr = attr_id.to_le_bytes();
+        let to = timeout.to_le_bytes();
+        [0x01, attr[0], attr[1], to[0], to[1]]
+    }
+
+    /// A receive-only Configure Reporting command configures how this device
+    /// *consumes* a client's reports, not what it *sends*. Even though the
+    /// record is individually accepted (the attribute exists and reporting is
+    /// registered, so the 0x07 status is Success), it must not advance
+    /// outbound interview progress. This is the historical bug: a Receive
+    /// record on a valid attribute returns Success and would otherwise be
+    /// counted as a completed send-reporting step.
+    #[test]
+    fn receive_only_configure_reporting_is_not_counted() {
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        let req = global_request(0x06, true, &receive_reporting_record(0x0000, 0x003C));
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+
+        // Standards behavior unchanged: the per-record status is Success and a
+        // 0x07 response is still queued …
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.header.command_id.0, 0x07);
+        assert_eq!(resp.payload[0], ZclStatus::Success as u8);
+        // … but outbound reporting progress is untouched, and this is not the
+        // dedicated ReportingConfigured event.
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::CommandReceived {
+                command_id: 0x06,
+                ..
+            })
+        ));
+    }
+
+    /// A command mixing a successful Send record and a Receive record is not
+    /// a pure send-reporting configuration, so it too must not advance
+    /// outbound interview progress even though every record is accepted.
+    #[test]
+    fn mixed_send_and_receive_configure_reporting_is_not_counted() {
+        use zigbee_zcl::foundation::reporting::ReportDirection;
+
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        let mut payload = heapless::Vec::<u8, 32>::new();
+        payload
+            .extend_from_slice(&configure_reporting_record(0x0000, 0x29))
+            .unwrap();
+        payload
+            .extend_from_slice(&receive_reporting_record(0x0000, 0x003C))
+            .unwrap();
+        let req = global_request(0x06, true, &payload);
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+
+        // Both records are individually accepted …
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.header.command_id.0, 0x07);
+        assert_eq!(resp.payload[0], ZclStatus::Success as u8);
+        // … and the Send record still lands in the engine (per-record
+        // semantics) …
+        assert!(
+            fx.reporting
+                .get_config(
+                    EP,
+                    ClusterId::TEMPERATURE.0,
+                    ReportDirection::Send,
+                    zigbee_zcl::AttributeId(0x0000),
+                )
+                .is_some()
+        );
+        // … but the mixed command does not count as a completed send-reporting
+        // interview step.
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::CommandReceived { .. })
+        ));
     }
 
     #[test]

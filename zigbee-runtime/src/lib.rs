@@ -55,6 +55,7 @@ pub mod ota;
 pub mod ota_transport;
 pub mod power;
 pub mod profile;
+pub mod remote_reporting;
 pub mod role;
 pub mod security_journal;
 pub mod security_store;
@@ -64,6 +65,8 @@ pub(crate) mod zcl_dispatch;
 
 use zigbee_aps::ApsAddress;
 use zigbee_bdb::BdbLayer;
+/// Re-exported so composition roots that depend only on `zigbee-runtime` can
+/// select the unique-TCLK entry policy exposed via [`BdbLayer`].
 use zigbee_mac::pib::PibPayload;
 use zigbee_mac::{
     AssociationStatus, MacCommandEvent, MacDriver, MacError, McpsDataIndication,
@@ -473,6 +476,11 @@ mod builder_cluster_tests {
                 built.bdb().zdo().node_descriptor(),
                 built_into.bdb().zdo().node_descriptor(),
                 "descriptors must match across build paths"
+            );
+            assert_eq!(
+                built.remote_reporting(),
+                built_into.remote_reporting(),
+                "remote reporting state must be initialized across build paths"
             );
         }
 
@@ -1164,11 +1172,14 @@ mod resume_tests {
 
         assert!(device.bdb().zdo().nwk().security().active_key().is_some());
         assert_eq!(device.bdb().zdo().aps().security().key_count(), 1);
+        let _ = device.remote_reporting.record(1, 0x0402);
+        assert_eq!(device.remote_reporting_cluster_count(1), 1);
 
         block_on(device.factory_reset_with_security_store(&mut store)).unwrap();
 
         assert!(!device.is_joined());
         assert!(!device.bdb().is_on_network());
+        assert_eq!(device.remote_reporting_cluster_count(1), 0);
         assert!(device.bdb().zdo().nwk().security().active_key().is_none());
         assert_eq!(device.bdb().zdo().aps().security().key_count(), 0);
         let reset = store.load().unwrap().unwrap();
@@ -1275,6 +1286,21 @@ mod resume_tests {
         ]
     }
 
+    /// A parent leaving of its own accord (`request = false`), which the NWK
+    /// layer surfaces as [`NwkCommandOutcome::ParentLeft`] rather than a
+    /// requested leave.
+    fn parent_leave_command() -> [u8; 2] {
+        [
+            zigbee_nwk::frames::NwkCommandId::Leave as u8,
+            zigbee_nwk::frames::LeaveCommand {
+                remove_children: false,
+                request: false,
+                rejoin: false,
+            }
+            .serialize(),
+        ]
+    }
+
     fn mgmt_leave_aps_payload(remove_children: bool, rejoin: bool) -> ([u8; 32], usize) {
         let header = zigbee_aps::frames::ApsHeader {
             frame_control: zigbee_aps::frames::ApsFrameControl {
@@ -1310,6 +1336,8 @@ mod resume_tests {
         block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
         device.mac_mut().clear_tx_history();
         assert_eq!(device.bdb().zdo().aps().security().key_count(), 1);
+        let _ = device.remote_reporting.record(1, 0x0402);
+        assert_eq!(device.remote_reporting_cluster_count(1), 1);
         let preserved = store.load().unwrap().unwrap();
 
         let (aps_payload, aps_len) = mgmt_leave_aps_payload(true, false);
@@ -1337,6 +1365,7 @@ mod resume_tests {
         assert_eq!(reset.global_counter_limit, preserved.global_counter_limit);
         assert_eq!(reset.tclk_counter_limit, preserved.tclk_counter_limit);
         assert_eq!(device.bdb().zdo().aps().security().key_count(), 0);
+        assert_eq!(device.remote_reporting_cluster_count(1), 0);
     }
 
     #[test]
@@ -1433,6 +1462,148 @@ mod resume_tests {
         ));
         assert!(!device.is_joined());
         assert!(!device.secure_rejoin_pending());
+    }
+
+    #[test]
+    fn nwk_leave_with_rejoin_clears_remote_reporting_immediately() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        let _ = device.remote_reporting.record(1, 0x0402);
+        assert_eq!(device.remote_reporting_cluster_count(1), 1);
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Command,
+            ShortAddress(OUR_SHORT),
+            &leave_command(true),
+            1,
+            true,
+        );
+
+        let event = block_on(device.process_incoming(&indication(frame), &mut []));
+
+        assert!(matches!(
+            event,
+            Some(crate::event_loop::StackEvent::RejoinRequested)
+        ));
+        // Cleared immediately on the accepted inbound leave, before any later
+        // rejoin/lifecycle action.
+        assert_eq!(device.remote_reporting_cluster_count(1), 0);
+    }
+
+    #[test]
+    fn nwk_leave_without_rejoin_clears_remote_reporting_immediately() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        let _ = device.remote_reporting.record(1, 0x0402);
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Command,
+            ShortAddress(OUR_SHORT),
+            &leave_command(false),
+            1,
+            true,
+        );
+
+        let event = block_on(device.process_incoming(&indication(frame), &mut []));
+
+        assert!(matches!(
+            event,
+            Some(crate::event_loop::StackEvent::LeaveRequested)
+        ));
+        assert_eq!(device.remote_reporting_cluster_count(1), 0);
+    }
+
+    #[test]
+    fn parent_leave_clears_remote_reporting_immediately() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        let _ = device.remote_reporting.record(1, 0x0402);
+        assert_eq!(device.remote_reporting_cluster_count(1), 1);
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Command,
+            ShortAddress(OUR_SHORT),
+            &parent_leave_command(),
+            1,
+            true,
+        );
+
+        let event = block_on(device.process_incoming(&indication(frame), &mut []));
+
+        assert!(matches!(
+            event,
+            Some(crate::event_loop::StackEvent::RejoinRequested)
+        ));
+        assert_eq!(device.remote_reporting_cluster_count(1), 0);
+    }
+
+    #[test]
+    fn secured_mgmt_leave_rejoin_clears_remote_reporting_immediately() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::Router)
+            .build_router();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+        let _ = device.remote_reporting.record(1, 0x0402);
+        assert_eq!(device.remote_reporting_cluster_count(1), 1);
+
+        let (aps_payload, aps_len) = mgmt_leave_aps_payload(true, true);
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &aps_payload[..aps_len],
+            1,
+            true,
+        );
+        let event = block_on(device.process_incoming_with_security_store(
+            &indication(frame),
+            &mut [],
+            &mut store,
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            Some(crate::event_loop::StackEvent::RejoinRequested)
+        ));
+        // The Mgmt_Leave rejoin transition drops the interview record without
+        // waiting for the later `mark_left`.
+        assert_eq!(device.remote_reporting_cluster_count(1), 0);
+    }
+
+    #[test]
+    fn accepted_mgmt_leave_rejoin_survives_response_tx_failure() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::Router)
+            .build_router();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+        let _ = device.remote_reporting.record(1, 0x0402);
+        // Fail the Mgmt_Leave_rsp transmission. The accepted request must
+        // still clear interview state and enter the requested rejoin path.
+        device.mac_mut().set_tx_failures(1);
+
+        let (aps_payload, aps_len) = mgmt_leave_aps_payload(true, true);
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &aps_payload[..aps_len],
+            1,
+            true,
+        );
+        let event = block_on(device.process_incoming_with_security_store(
+            &indication(frame),
+            &mut [],
+            &mut store,
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            Some(crate::event_loop::StackEvent::RejoinRequested)
+        ));
+        assert!(!device.is_joined());
+        assert!(device.secure_rejoin_pending());
+        assert_eq!(device.remote_reporting_cluster_count(1), 0);
+        assert_eq!(device.bdb().zdo().diagnostics().response_failures, 1);
     }
 
     #[test]
@@ -2800,7 +2971,17 @@ pub struct ZigbeeDevice<M: MacDriver, R: crate::role::DeviceRole = crate::role::
     /// Application endpoint configurations.
     endpoints: heapless::Vec<EndpointConfig, MAX_ENDPOINTS>,
     /// ZCL attribute reporting engine.
+    ///
+    /// Holds *every* reporting configuration — the product's own defaults as
+    /// well as anything a remote client configured. Interview completion is
+    /// therefore tracked separately in `remote_reporting`.
     reporting: ReportingEngine,
+    /// Clusters a remote ZCL client successfully configured reporting for.
+    ///
+    /// See [`remote_reporting`](crate::remote_reporting) — deliberately
+    /// distinct from `reporting` so a locally installed default can never be
+    /// mistaken for a completed coordinator interview.
+    remote_reporting: remote_reporting::RemoteReportingState,
     /// Power management.
     power: PowerManager,
     /// Monotonic millisecond clock accumulated from `tick()` deltas.
@@ -3023,6 +3204,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// transition.
     #[inline(never)]
     pub async fn start(&mut self) -> Result<u16, event_loop::StartError> {
+        self.remote_reporting.clear();
         rt_trace!("[RT] start: init");
         let r = self.bdb.initialize();
         rt_trace!("[RT] bdb_init={}", if r.is_ok() { "ok" } else { "ERR" });
@@ -3054,6 +3236,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         &mut self,
         store: &mut S,
     ) -> Result<u16, event_loop::StartError> {
+        self.remote_reporting.clear();
         let r = self.bdb.initialize();
         if r.is_err() {
             return Err(event_loop::StartError::InitFailed);
@@ -3085,6 +3268,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         &mut self,
         store: &mut S,
     ) -> Result<u16, event_loop::StartError> {
+        self.remote_reporting.clear();
         if self.bdb.initialize().is_err() {
             return Err(event_loop::StartError::InitFailed);
         }
@@ -3152,6 +3336,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// and marks `node_is_on_a_network = true`.
     #[inline(never)]
     pub async fn rejoin(&mut self) -> Result<u16, event_loop::StartError> {
+        self.remote_reporting.clear();
         log::info!("[Runtime] Resuming on previous network…");
         let addr = self.configure_restored_network().await?;
 
@@ -3252,6 +3437,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// with the rejoin bit set or when silent resume can no longer poll.
     #[inline(never)]
     pub async fn secure_rejoin(&mut self) -> Result<u16, event_loop::StartError> {
+        self.remote_reporting.clear();
         self.bdb.zdo_mut().nwk_mut().set_joined(false);
         let mut result = match self.bdb.rejoin_previous_network().await {
             Ok(()) => self.finish_join().await,
@@ -3389,6 +3575,9 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         aps.group_table_mut().clear();
         aps.security_mut().clear_keys();
         self.reset_identify_clusters();
+        // The interview belongs to the network that was just left; the next
+        // coordinator re-runs it from scratch.
+        self.remote_reporting.clear();
         self.secure_rejoin_retry_at = None;
         R::ed_reset(self);
         self.state_dirty = true;
@@ -3433,6 +3622,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
 
         self.basic_cluster.reset_to_factory_defaults();
         self.reset_identify_clusters();
+        self.remote_reporting.clear();
         self.secure_rejoin_retry_at = None;
         R::ed_reset(self);
         log::info!("[Runtime] Factory reset complete");
@@ -3659,17 +3849,98 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
 
     // ── Reporting / Interview Detection ────────────────────
 
-    /// Check if reporting has been configured for a specific cluster.
+    /// Check whether this device has any reporting configuration for a
+    /// specific cluster.
     ///
-    /// Returns `true` after ZHA sends Configure Reporting for this cluster,
-    /// which is the last step of the interview process per-cluster.
+    /// This includes locally installed defaults, so it answers whether the
+    /// reporting engine can produce reports for the cluster, not whether a
+    /// remote client completed its interview. Use
+    /// [`is_cluster_remotely_configured`](Self::is_cluster_remotely_configured)
+    /// for remote Configure Reporting state.
     pub fn is_cluster_reporting_configured(&self, endpoint: u8, cluster_id: u16) -> bool {
         self.reporting.has_cluster_configured(endpoint, cluster_id)
     }
 
-    /// Count how many distinct clusters have reporting configured on an endpoint.
+    /// Count how many distinct clusters have *any* reporting configuration on
+    /// an endpoint.
+    ///
+    /// This includes the product's own defaults installed through
+    /// [`ApplicationProfile::configure_default_reporting`](crate::profile::ApplicationProfile::configure_default_reporting),
+    /// so it answers "will this device send reports?", **not** "has a remote
+    /// client finished configuring us?". Use
+    /// [`remote_reporting_cluster_count`](Self::remote_reporting_cluster_count)
+    /// for interview completion.
     pub fn configured_cluster_count(&self, endpoint: u8) -> usize {
         self.reporting.configured_cluster_count(endpoint)
+    }
+
+    // ── Remote (client-configured) reporting ───────────────
+
+    /// The clusters a remote ZCL client has successfully configured reporting
+    /// for, tracked separately from local defaults.
+    ///
+    /// See [`crate::remote_reporting`] for the exact recording rule.
+    pub const fn remote_reporting(&self) -> &remote_reporting::RemoteReportingState {
+        &self.remote_reporting
+    }
+
+    /// Whether a remote client fully configured reporting for this cluster.
+    ///
+    /// `true` only after a non-empty, well-formed Configure Reporting command
+    /// for `(endpoint, cluster_id)` made entirely of Send-direction records in
+    /// which every record returned `Success`. A locally configured default
+    /// never sets this.
+    pub fn is_cluster_remotely_configured(&self, endpoint: u8, cluster_id: u16) -> bool {
+        self.remote_reporting.contains(endpoint, cluster_id)
+    }
+
+    /// Number of distinct clusters a remote client configured on `endpoint`.
+    ///
+    /// This is generic diagnostic state and may include unrelated server
+    /// clusters. Do not use a bare count comparison for profile interview
+    /// completion; use [`remote_reporting_covers`](Self::remote_reporting_covers)
+    /// with the profile's exact expected cluster IDs, or use
+    /// [`ZigbeeNode::remote_reporting_is_complete`](crate::node::ZigbeeNode::remote_reporting_is_complete).
+    pub fn remote_reporting_cluster_count(&self, endpoint: u8) -> usize {
+        self.remote_reporting.cluster_count(endpoint)
+    }
+
+    /// Number of cluster IDs from `expected` that a remote client has fully
+    /// configured for outbound reporting on `endpoint`.
+    ///
+    /// Unlike [`remote_reporting_cluster_count`](Self::remote_reporting_cluster_count),
+    /// unrelated clusters retained by the generic state do not inflate this
+    /// profile/application progress count.
+    pub fn remote_reporting_coverage(&self, endpoint: u8, expected: &[u16]) -> usize {
+        expected
+            .iter()
+            .filter(|&&cluster_id| self.remote_reporting.contains(endpoint, cluster_id))
+            .count()
+    }
+
+    /// Whether a remote client has fully configured reporting for *every*
+    /// cluster in `expected` on `endpoint`.
+    ///
+    /// Exact-membership interview completion: unlike a bare
+    /// [`remote_reporting_cluster_count`](Self::remote_reporting_cluster_count)
+    /// comparison, a coordinator that configured an unrelated cluster cannot
+    /// substitute for a missing expected one. Applications built on the
+    /// profile/node contract get this via
+    /// [`ZigbeeNode::remote_reporting_is_complete`](crate::node::ZigbeeNode::remote_reporting_is_complete);
+    /// this device-level entry point serves products that compose clusters
+    /// directly and pass their own expected cluster-ID list.
+    pub fn remote_reporting_covers(&self, endpoint: u8, expected: &[u16]) -> bool {
+        self.remote_reporting_coverage(endpoint, expected) == expected.len()
+    }
+
+    /// Forget every remotely configured cluster.
+    ///
+    /// Network start, resume, secured rejoin, leave, and factory-reset paths
+    /// clear this automatically. This explicit API is available to
+    /// applications that begin an equivalent product-specific lifecycle
+    /// outside those entry points.
+    pub fn reset_remote_reporting(&mut self) {
+        self.remote_reporting.clear();
     }
 
     // ── NV Persistence ─────────────────────────────────────
@@ -4208,6 +4479,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             .map_err(event_loop::StartError::CommissioningFailed)?;
         self.basic_cluster.reset_to_factory_defaults();
         self.reset_identify_clusters();
+        self.remote_reporting.clear();
         self.state_dirty = false;
         self.secure_rejoin_retry_at = None;
         R::ed_reset(self);
@@ -5186,6 +5458,11 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             zigbee_nwk::nlde::NwkCommandOutcome::ParentLeft { src } => {
                 rt_trace!("[RT] parent_left src=0x{:04X}", src.0);
                 log::warn!("[RX] Parent 0x{:04X} left the network", src.0);
+                // The interview belongs to the network we just lost the parent
+                // for; drop it now rather than waiting for the eventual
+                // rejoin/leave lifecycle action, so a stale record can never be
+                // read as "interview complete" during the rejoin window.
+                self.remote_reporting.clear();
                 let now = self.bdb.zdo().nwk().mac().monotonic_micros();
                 self.secure_rejoin_retry_at = Some(now);
                 Some(event_loop::StackEvent::RejoinRequested)
@@ -5207,6 +5484,11 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     remove_children,
                     rejoin
                 );
+                // Whether or not the coordinator asked us to rejoin, the
+                // current network's interview is over; clear the remote
+                // reporting record immediately on this accepted inbound leave
+                // rather than deferring to a later `mark_left`/factory-reset.
+                self.remote_reporting.clear();
                 if rejoin {
                     let now = self.bdb.zdo().nwk().mac().monotonic_micros();
                     self.secure_rejoin_retry_at = Some(now);
@@ -5483,37 +5765,45 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 log::warn!("[Runtime] Ignoring unsecured Mgmt_Leave_req");
                 return None;
             }
-            let zdo_handled = match self.bdb.zdo_mut().handle_indication(&aps_indication).await {
+            // Classify Mgmt_Leave acceptance before attempting its response.
+            // Response delivery is independent: a valid authorized local
+            // leave remains accepted even when Mgmt_Leave_rsp cannot be sent.
+            let accepted_mgmt_leave = if cluster_id == zigbee_zdo::MGMT_LEAVE_REQ {
+                aps_indication.payload.get(1..).and_then(|payload| {
+                    self.bdb
+                        .zdo()
+                        .classify_mgmt_leave_request(ShortAddress(src_addr), payload)
+                        .ok()
+                        .flatten()
+                })
+            } else {
+                None
+            };
+            match self.bdb.zdo_mut().handle_indication(&aps_indication).await {
                 Ok(()) => {
                     rt_trace!("[RT] zdo_ok cluster=0x{:04X}", cluster_id);
                     log::info!("[Runtime] ZDO OK cluster=0x{:04X}", cluster_id);
-                    true
                 }
                 Err(e) => {
                     rt_trace!("[RT] zdo_fail cluster=0x{:04X} err={:?}", cluster_id, e);
                     log::warn!("[Runtime] ZDO FAIL cluster=0x{:04X}: {:?}", cluster_id, e,);
-                    false
                 }
-            };
+            }
 
-            // After ZDO processes Mgmt_Leave_req, execute the actual leave
-            if cluster_id == zigbee_zdo::MGMT_LEAVE_REQ && zdo_handled {
-                let request = aps_indication.payload.get(1..).and_then(|payload| {
-                    zigbee_zdo::network_mgmt::MgmtLeaveReq::parse(payload).ok()
-                })?;
-                let local_ieee = self.bdb.zdo().nwk().nib().ieee_address;
-                if request.device_address != [0; 8] && request.device_address != local_ieee {
-                    log::warn!(
-                        "[Runtime] Mgmt_Leave target is not local; child leave is unsupported"
-                    );
-                    return None;
-                }
+            // Execute every accepted local Mgmt_Leave after its response
+            // attempt, whether that attempt succeeded or failed.
+            if let Some(request) = accepted_mgmt_leave {
                 if request.remove_children {
                     log::info!(
                         "[Runtime] Mgmt_Leave remove-children requested; local leave clears child state"
                     );
                 }
-                log::info!("[Runtime] Executing NLME-LEAVE after Mgmt_Leave response sent");
+                // The accepted request ends this network's interview
+                // immediately. Clear before awaiting the leave notification so
+                // neither a slow/failed transmission nor the later lifecycle
+                // action can leave stale completion visible.
+                self.remote_reporting.clear();
+                log::info!("[Runtime] Executing NLME-LEAVE after Mgmt_Leave response attempt");
                 let leave_result = self
                     .bdb
                     .zdo_mut()
@@ -5556,6 +5846,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             &mut self.basic_cluster,
             &mut self.identify_clusters,
             &mut self.reporting,
+            &mut self.remote_reporting,
             &mut self.pending_responses,
             clusters,
             zcl_scratch,

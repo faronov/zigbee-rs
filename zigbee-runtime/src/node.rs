@@ -125,10 +125,63 @@ where
         profile.configure_default_reporting(device)
     }
 
-    pub fn reporting_is_configured(&self) -> bool {
+    /// Number of reportable clusters this profile expects a remote client to
+    /// configure during its interview.
+    ///
+    /// Forwarded from the profile so an application can compare it against
+    /// [`remote_reporting_cluster_count`](Self::remote_reporting_cluster_count)
+    /// without importing
+    /// [`ApplicationProfile`].
+    pub fn expected_report_clusters(&self) -> usize {
+        self.profile.expected_report_clusters()
+    }
+
+    /// Number of this profile's expected reportable clusters a remote ZCL
+    /// client has fully configured on the profile endpoint.
+    ///
+    /// Unrelated clusters retained by the generic remote-reporting state do not
+    /// inflate this profile progress count. Counts only completed outbound
+    /// Configure Reporting commands — never the defaults installed by
+    /// [`configure_default_reporting`](Self::configure_default_reporting).
+    pub fn remote_reporting_cluster_count(&self) -> usize {
+        let mut expected = crate::profile::ExpectedReportClusters::new();
+        self.profile.expected_report_cluster_ids(&mut expected);
         self.device
-            .configured_cluster_count(self.profile.endpoint())
-            >= self.profile.expected_report_clusters()
+            .remote_reporting_coverage(self.profile.endpoint(), &expected)
+    }
+
+    /// Whether a remote client has configured reporting for *exactly* the
+    /// set of clusters this profile expects during its interview.
+    ///
+    /// This checks exact membership of
+    /// [`ApplicationProfile::expected_report_cluster_ids`]
+    /// against the remote-reporting record, not a bare count: a coordinator
+    /// that configured an unrelated cluster (or fewer than every required one)
+    /// cannot satisfy completion, and a missing required cluster cannot be
+    /// substituted by an unexpected one.
+    ///
+    /// This replaced the old `reporting_is_configured`, which counted the
+    /// [`ReportingEngine`](zigbee_zcl::foundation::reporting::ReportingEngine)
+    /// and therefore returned `true` for a device that had only configured
+    /// its own defaults (including via an interview-timeout fallback).
+    pub fn remote_reporting_is_complete(&self) -> bool {
+        let mut expected = crate::profile::ExpectedReportClusters::new();
+        self.profile.expected_report_cluster_ids(&mut expected);
+        self.device
+            .remote_reporting_covers(self.profile.endpoint(), &expected)
+    }
+
+    /// Whether a remote client fully configured reporting for `cluster_id` on
+    /// this profile's endpoint.
+    pub fn is_cluster_remotely_configured(&self, cluster_id: u16) -> bool {
+        self.device
+            .is_cluster_remotely_configured(self.profile.endpoint(), cluster_id)
+    }
+
+    /// Forget the remote interview record for a new commissioning/rejoin
+    /// lifecycle.
+    pub fn reset_remote_reporting(&mut self) {
+        self.device.reset_remote_reporting();
     }
 
     pub async fn tick(&mut self, elapsed_secs: u16) -> Result<TickResult, NodeError> {

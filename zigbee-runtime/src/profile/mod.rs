@@ -837,6 +837,59 @@ mod tests {
     }
 
     #[test]
+    fn interview_completion_requires_exact_expected_clusters() {
+        use crate::ZigbeeDevice;
+        use zigbee_mac::mock::MockMac;
+
+        let profile = profile();
+        let mut expected = ExpectedReportClusters::new();
+        profile.expected_report_cluster_ids(&mut expected);
+        assert_eq!(
+            expected.as_slice(),
+            &[
+                ClusterId::TEMPERATURE.0,
+                ClusterId::HUMIDITY.0,
+                ClusterId::POWER_CONFIG.0,
+            ]
+        );
+        // The derived count must match the exact-ID set exactly.
+        assert_eq!(profile.expected_report_clusters(), expected.len());
+
+        let mut device = ZigbeeDevice::builder(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8])).build();
+        let ep = profile.endpoint();
+
+        // Only an unrelated Basic cluster configured: not remotely complete.
+        device.remote_reporting.record(ep, ClusterId::BASIC.0);
+        assert_eq!(device.remote_reporting_coverage(ep, &expected), 0);
+        assert!(!device.remote_reporting_covers(ep, &expected));
+
+        // Add two of the three required clusters. Now three distinct clusters
+        // are recorded, so a bare `count >= expected_count` check (3 >= 3)
+        // would wrongly report the interview complete …
+        device.remote_reporting.record(ep, ClusterId::TEMPERATURE.0);
+        device.remote_reporting.record(ep, ClusterId::HUMIDITY.0);
+        assert_eq!(device.remote_reporting_cluster_count(ep), 3);
+        assert_eq!(
+            device.remote_reporting_cluster_count(ep),
+            profile.expected_report_clusters()
+        );
+        assert_eq!(device.remote_reporting_coverage(ep, &expected), 2);
+        // … but exact membership still fails: POWER_CONFIG was never
+        // configured and the unrelated BASIC cluster cannot substitute for it.
+        assert!(!device.remote_reporting_covers(ep, &expected));
+
+        // Configuring the actually-missing cluster completes the interview.
+        device
+            .remote_reporting
+            .record(ep, ClusterId::POWER_CONFIG.0);
+        assert_eq!(
+            device.remote_reporting_coverage(ep, &expected),
+            expected.len()
+        );
+        assert!(device.remote_reporting_covers(ep, &expected));
+    }
+
+    #[test]
     fn endpoint_and_cluster_refs_come_from_the_same_profile() {
         let mut profile = profile();
         let endpoint = EndpointBuilder {

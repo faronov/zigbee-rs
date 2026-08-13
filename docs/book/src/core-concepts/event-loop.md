@@ -182,7 +182,75 @@ StackEvent::DefaultResponse {
 
 /// An attribute report was sent successfully.
 StackEvent::ReportSent
+
+/// A remote ZCL client (typically the coordinator, during its interview)
+/// fully configured attribute reporting for one of our clusters.
+StackEvent::ReportingConfigured {
+    src_addr: u16,
+    source_endpoint: u8,      // Remote endpoint that sent the command
+    endpoint: u8,             // Local endpoint whose cluster was configured
+    cluster_id: u16,
+    configured_clusters: usize, // Distinct clusters remotely configured on `endpoint`
+}
 ```
+
+### Interview Completion — Remote vs. Local Reporting
+
+`ReportingConfigured` is emitted **only** when a well-formed global Configure
+Reporting (0x06, client→server) command was fully processed, was non-empty,
+contained only Send-direction records, and *every one of its status records
+returned `Success`*. A malformed or empty command, a receive-only or mixed
+Send/Receive command, an unsupported or unreportable attribute, an
+invalid/disabled data type, or a reporting-table capacity failure still
+produces the Configure Reporting Response (0x07) required by the
+specification, but yields the generic `CommandReceived` event and does **not**
+count as outbound interview progress.
+
+The runtime keeps that record in
+[`zigbee_runtime::remote_reporting`](https://docs.rs/zigbee-runtime), separate
+from the `ReportingEngine`:
+
+| Query | Counts | Use for |
+| --- | --- | --- |
+| `device.configured_cluster_count(ep)` | every reporting configuration, including the product's own defaults | "will this device send reports?" |
+| `device.remote_reporting_cluster_count(ep)` | every distinct server cluster a remote client configured in full, including unrelated clusters | diagnostics only |
+| `device.remote_reporting_coverage(ep, expected)` / `remote_reporting_covers(ep, expected)` | exact expected cluster IDs present in the remote record | direct-composition interview progress/completion |
+| `device.is_cluster_remotely_configured(ep, cluster)` | one cluster, remote only | per-cluster interview state |
+| `device.reset_remote_reporting()` | — | start of a new commissioning/rejoin lifecycle |
+
+`ZigbeeNode` exposes the same state against its profile's endpoint:
+`remote_reporting_cluster_count()`, `remote_reporting_is_complete()`,
+`is_cluster_remotely_configured(cluster)`, `expected_report_clusters()` and
+`reset_remote_reporting()`. Its progress count and completion check are
+filtered through the active profile's exact expected reportable cluster IDs,
+so an unrelated Basic cluster cannot replace a missing sensor cluster.
+
+Interview detection must use the profile-aware exact-membership check.
+Counting either the reporting engine or arbitrary entries in the generic
+remote record is insufficient: the engine includes local defaults, while the
+generic record can include unrelated server clusters. An interview-timeout
+fallback installs defaults precisely *because* no coordinator arrived:
+
+```rust,ignore
+// Fallback: keep reporting even though nobody interviewed us.
+if awaiting_initial_configuration && now >= interview_deadline {
+    node.configure_default_reporting()?;      // local defaults only
+    log::info!(
+        "interview timeout — using default reporting (remote configured {}/{})",
+        node.remote_reporting_cluster_count(), // still 0 — no interview happened
+        node.expected_report_clusters(),
+    );
+}
+
+// Real interview completion.
+if node.remote_reporting_is_complete() {
+    // leave the fast-poll window, park the commissioning LED
+}
+```
+
+The record is live network state, never persisted: it is cleared when the
+device leaves the network or is factory reset, and should be reset explicitly
+on a fresh join/rejoin, because the new coordinator re-runs the interview.
 
 ### OTA Events
 

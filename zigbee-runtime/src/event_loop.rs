@@ -116,6 +116,35 @@ pub enum StackEvent {
         /// Status code from the remote device.
         status: u8,
     },
+    /// A remote ZCL client successfully configured attribute reporting.
+    ///
+    /// Emitted **only** after a non-empty, well-formed global Configure
+    /// Reporting (0x06, client→server) command made entirely of Send-direction
+    /// records was fully processed and *every* status record returned
+    /// `Success`. An empty or malformed command, a receive-only or mixed
+    /// command, an unsupported or unreportable attribute, an invalid/disabled
+    /// data type, a reporting-table capacity failure, or any other
+    /// unsuccessful record still produces the generic
+    /// [`CommandReceived`](Self::CommandReceived) event instead, so an
+    /// application keying interview completion off this event can never count
+    /// a rejected or inbound-reporting-only configuration.
+    ///
+    /// This is what "the remote client finished configuring reporting"
+    /// actually means; it is unrelated to defaults the product configured for
+    /// itself (see [`crate::remote_reporting`]).
+    ReportingConfigured {
+        src_addr: u16,
+        /// Remote APS endpoint that sent the command.
+        source_endpoint: u8,
+        /// Local endpoint whose cluster was configured.
+        endpoint: u8,
+        cluster_id: u16,
+        /// Distinct clusters a remote client has now configured on
+        /// `endpoint`, including this one and any unrelated server clusters.
+        /// This generic count is diagnostic only; profile completion must
+        /// check the profile's exact expected cluster IDs.
+        configured_clusters: usize,
+    },
     /// Permit joining status changed.
     PermitJoinChanged { open: bool },
     /// Attribute report was sent successfully.

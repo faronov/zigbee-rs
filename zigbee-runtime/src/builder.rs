@@ -522,6 +522,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             bdb,
             endpoints: self.endpoints,
             reporting: ReportingEngine::new(),
+            remote_reporting: crate::remote_reporting::RemoteReportingState::new(),
             power: PowerManager::new(self.power_mode),
             power_now_ms: 0,
             automatic_polling: self.automatic_polling,
@@ -751,6 +752,8 @@ impl<M: MacDriver> DeviceBuilder<M> {
 
             core::ptr::addr_of_mut!((*dst).endpoints).write(endpoints);
             core::ptr::addr_of_mut!((*dst).reporting).write(ReportingEngine::new());
+            core::ptr::addr_of_mut!((*dst).remote_reporting)
+                .write(crate::remote_reporting::RemoteReportingState::new());
             core::ptr::addr_of_mut!((*dst).power).write(PowerManager::new(power_mode));
             core::ptr::addr_of_mut!((*dst).power_now_ms).write(0);
             core::ptr::addr_of_mut!((*dst).automatic_polling).write(automatic_polling);

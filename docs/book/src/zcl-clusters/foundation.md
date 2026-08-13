@@ -136,6 +136,28 @@ Each `ReportingConfig` contains:
 | `max_interval` | Maximum seconds between reports (0xFFFF = disable periodic) |
 | `reportable_change` | Minimum value change to trigger report (analog types only) |
 
+Each record gets its own status in the 0x07 response — `UNSUPPORTED_ATTRIBUTE`,
+`UNREPORTABLE_ATTRIBUTE`, `INVALID_DATA_TYPE` or `INSUFFICIENT_SPACE` for a
+record the device cannot honour, and `SUCCESS` for the rest. Records that
+succeeded stay configured even when a sibling record in the same command
+failed.
+
+### Interview state (runtime)
+
+`zigbee-runtime` additionally records which `(endpoint, cluster)` pairs a
+**remote** client configured, in
+[`remote_reporting`](https://docs.rs/zigbee-runtime) — separate from the
+`ReportingEngine`, which also holds the product's own default configurations.
+A cluster is recorded only when the whole command was well formed *and every
+record returned `SUCCESS`*, the command was non-empty, and every record used
+the Send direction. Receive-only and mixed-direction commands do not advance
+outbound reporting progress. A qualifying command is surfaced as
+`StackEvent::ReportingConfigured` instead of the generic `CommandReceived`.
+Profile-backed applications determine completion by checking the active
+profile's exact expected cluster IDs; an unrelated configured server cluster
+cannot replace a missing reportable cluster. See
+[the event loop chapter](../core-concepts/event-loop.md).
+
 ---
 
 ## Report Attributes (0x0A)

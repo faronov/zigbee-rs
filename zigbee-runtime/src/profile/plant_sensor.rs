@@ -485,6 +485,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(device.configured_cluster_count(1), 4);
+        // Local defaults are not a coordinator interview: the remote record
+        // stays empty until a remote client actually configures reporting.
+        assert_eq!(device.remote_reporting_cluster_count(1), 0);
+        assert!(!device.is_cluster_remotely_configured(1, ClusterId::TEMPERATURE.0));
 
         let soil_config = device
             .reporting()
