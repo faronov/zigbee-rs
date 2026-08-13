@@ -43,6 +43,7 @@ use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::efr32s2::Efr32s2Mac;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
 use zigbee_runtime::power::PowerMode;
+use zigbee_runtime::profile::TemperatureHumidityBattery;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::PowerSource;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
@@ -54,8 +55,6 @@ const REPORT_INTERVAL_SECS: u64 = 60;
 const FAST_POLL_MS: u64 = 250;
 const SLOW_POLL_SECS: u64 = 30;
 const FAST_POLL_DURATION_SECS: u64 = 120;
-const EXPECTED_REPORT_CLUSTERS: usize = 3; // PowerConfig + Temp + Humidity
-
 // ── EFR32MG21P GPIO ─────────────────────────────────────────────
 
 mod pins {
@@ -162,13 +161,18 @@ async fn main(_spawner: Spawner) {
         .sw_build("0.1.0")
         .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, DeviceId::TEMPERATURE_SENSOR, |ep| {
-            ep.cluster_server(ClusterId::BASIC)
-                .cluster_server(ClusterId::IDENTIFY)
-                .cluster_server(ClusterId::POWER_CONFIG)
-                .cluster_server(ClusterId::TEMPERATURE)
-                .cluster_server(ClusterId::HUMIDITY)
-        })
+        .endpoint(
+            1,
+            PROFILE_HOME_AUTOMATION,
+            DeviceId::TEMPERATURE_SENSOR,
+            |ep| {
+                ep.cluster_server(ClusterId::BASIC)
+                    .cluster_server(ClusterId::IDENTIFY)
+                    .cluster_server(ClusterId::POWER_CONFIG)
+                    .cluster_server(ClusterId::TEMPERATURE)
+                    .cluster_server(ClusterId::HUMIDITY)
+            },
+        )
         .build();
 
     // Restore previous network state from flash
@@ -245,11 +249,14 @@ async fn main(_spawner: Spawner) {
         };
 
         if was_fast_polling && !in_fast_poll {
-            let cfg = device.configured_cluster_count(1);
+            let cfg = device.remote_reporting_coverage(
+                1,
+                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
+            );
             log::info!(
-                "[EFR32] Fast poll OFF — {}/{} clusters configured",
+                "[EFR32] Fast poll OFF — {}/{} clusters configured by remote client",
                 cfg,
-                EXPECTED_REPORT_CLUSTERS
+                TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS.len()
             );
             was_fast_polling = false;
             if !interview_done {
@@ -314,6 +321,7 @@ async fn main(_spawner: Spawner) {
                             annce_retries_left = 5;
                             last_annce = Instant::now();
                             interview_done = false;
+                            device.reset_remote_reporting();
                         }
                         StackEvent::Left => {
                             log_event(e);
@@ -363,6 +371,9 @@ async fn main(_spawner: Spawner) {
                                         fast_poll_until = Instant::now()
                                             + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                         interview_done = false;
+                                        // New lifecycle — the coordinator
+                                        // re-runs its interview.
+                                        device.reset_remote_reporting();
                                         annce_retries_left = 5;
                                         last_annce = Instant::now();
                                         led_on();
@@ -381,6 +392,7 @@ async fn main(_spawner: Spawner) {
                                     fast_poll_until = Instant::now()
                                         + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                     interview_done = false;
+                                    device.reset_remote_reporting();
                                     annce_retries_left = 5;
                                     last_annce = Instant::now();
                                     led_on();
@@ -395,13 +407,22 @@ async fn main(_spawner: Spawner) {
                                 needs_save = true;
                             }
                         }
+                        // Interview completion counts only clusters a remote
+                        // client configured in full; local defaults do not
+                        // qualify.
                         if !interview_done {
-                            let cfg_count = device.configured_cluster_count(1);
-                            if cfg_count >= EXPECTED_REPORT_CLUSTERS {
+                            let cfg_count = device.remote_reporting_coverage(
+                                1,
+                                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
+                            );
+                            if device.remote_reporting_covers(
+                                1,
+                                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
+                            ) {
                                 log::info!(
-                                    "[EFR32] Interview done! {}/{} clusters",
+                                    "[EFR32] Interview done! {}/{} clusters configured remotely",
                                     cfg_count,
-                                    EXPECTED_REPORT_CLUSTERS
+                                    TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS.len()
                                 );
                                 fast_poll_until = Instant::now() + Duration::from_secs(5);
                                 interview_done = true;
@@ -467,6 +488,10 @@ async fn main(_spawner: Spawner) {
                 },
             ];
             if let TickResult::Event(ref e) = device.tick(tick_elapsed, &mut clusters).await {
+                if matches!(e, StackEvent::Joined { .. }) {
+                    interview_done = false;
+                    device.reset_remote_reporting();
+                }
                 if log_event(e) {
                     fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                 }
@@ -531,6 +556,7 @@ async fn main(_spawner: Spawner) {
                     annce_retries_left = 5;
                     last_annce = Instant::now();
                     interview_done = false;
+                    device.reset_remote_reporting();
                     device.save_state(&mut nv);
                     log::info!("[EFR32] State saved to flash");
                 }
@@ -563,6 +589,13 @@ fn log_event(event: &StackEvent) -> bool {
         }
         StackEvent::ReportSent => {
             log::info!("[EFR32] Report sent");
+            false
+        }
+        StackEvent::ReportingConfigured { cluster_id, .. } => {
+            log::info!(
+                "[EFR32] Remote Configure Reporting accepted: cluster=0x{:04X}",
+                cluster_id
+            );
             false
         }
         StackEvent::LeaveRequested | StackEvent::RejoinRequested => {
@@ -623,8 +656,7 @@ fn setup_default_reporting(device: &mut ZigbeeDevice<Efr32s2Mac>) {
         ClusterId::POWER_CONFIG.0,
         ReportingConfig {
             direction: ReportDirection::Send,
-            attribute_id:
-                zigbee_zcl::clusters::power_config::ATTR_BATTERY_PERCENTAGE_REMAINING,
+            attribute_id: zigbee_zcl::clusters::power_config::ATTR_BATTERY_PERCENTAGE_REMAINING,
             data_type: ZclDataType::U8,
             min_interval: 300,
             max_interval: 3600,

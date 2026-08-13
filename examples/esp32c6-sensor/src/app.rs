@@ -190,11 +190,20 @@ impl<'a> SensorApp<'a> {
         self.annce_retries_left = ANNCE_RETRIES;
         self.last_annce = now;
         self.interview_done = false;
+        // New network lifecycle — the coordinator re-runs its interview.
+        self.node.reset_remote_reporting();
         self.consecutive_rejoin_failures = 0;
     }
 
+    /// Leave the post-join fast-poll window once a *remote* client finished
+    /// configuring reporting.
+    ///
+    /// Keyed on `zigbee-runtime`'s remote-reporting record rather than the
+    /// reporting engine, which also holds this product's own defaults
+    /// (including the interview-timeout fallback below) and therefore cannot
+    /// tell a completed coordinator interview from self-configuration.
     fn update_interview_state(&mut self) {
-        if self.interview_done || !self.node.reporting_is_configured() {
+        if self.interview_done || !self.node.remote_reporting_is_complete() {
             return;
         }
 
@@ -202,7 +211,11 @@ impl<'a> SensorApp<'a> {
         self.interview_done = true;
         self.awaiting_initial_configuration = false;
         self.interview_deadline = None;
-        esp_println::println!("[ESP32-C6] Interview configured");
+        esp_println::println!(
+            "[ESP32-C6] Interview configured by remote client ({}/{} clusters)",
+            self.node.remote_reporting_cluster_count(),
+            self.node.expected_report_clusters()
+        );
     }
 
     fn update_fast_poll_window(&mut self, now: Instant) -> u64 {
@@ -214,10 +227,16 @@ impl<'a> SensorApp<'a> {
             if let Err(error) = self.node.configure_default_reporting() {
                 node_failure(NodeError::Profile(error));
             }
+            // Fallback only — local defaults, not a completed interview. The
+            // remote count is logged so the two are never confused.
             self.interview_done = true;
             self.awaiting_initial_configuration = false;
             self.interview_deadline = None;
-            esp_println::println!("[ESP32-C6] Interview timeout — using default reporting");
+            esp_println::println!(
+                "[ESP32-C6] Interview timeout — using default reporting (remote configured {}/{} clusters)",
+                self.node.remote_reporting_cluster_count(),
+                self.node.expected_report_clusters()
+            );
         }
 
         let in_fast_poll = self.awaiting_initial_configuration

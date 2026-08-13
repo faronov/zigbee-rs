@@ -238,6 +238,13 @@ temperature & humidity end device with:
 - MG1P RTCC/EM2 sleepy polling; radio sleep/wake on both series
 - MG1 Gecko Bootloader OTA client, including server-to-client foundation
   attribute reads used by ZHA during interview
+- Interview completion detected from the runtime's *remote* reporting record
+  (`ZigbeeNode::remote_reporting_is_complete()`), never from the local
+  reporting engine. The `INTERVIEW_CONFIGURATION_TIMEOUT_SECS` fallback still
+  installs this product's default reporting so a device nobody interviewed
+  keeps reporting, and logs `INTERVIEW_TIMEOUT_USING_DEFAULT_REPORTING
+  remote_clusters=n/m` so the fallback is never mistaken for a completed
+  coordinator interview (`INTERVIEW_CONFIGURED remote_clusters=n/m`).
 
 ## EFR32MG1 Hardware Acceptance
 

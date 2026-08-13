@@ -31,6 +31,7 @@ use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::cc2340::Cc2340Mac;
 use zigbee_runtime::event_loop::StackEvent;
 use zigbee_runtime::power::PowerMode;
+use zigbee_runtime::profile::TemperatureHumidityBattery;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::PowerSource;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
@@ -42,8 +43,6 @@ const REPORT_INTERVAL_SECS: u64 = 30;
 const FAST_POLL_MS: u64 = 250;
 const SLOW_POLL_SECS: u64 = 10;
 const FAST_POLL_DURATION_SECS: u64 = 120;
-const EXPECTED_REPORT_CLUSTERS: usize = 3;
-
 // ── CC2340R5 hardware constants ─────────────────────────────────
 
 /// DIO pin assignments for LP-EM-CC2340R5
@@ -262,6 +261,9 @@ async fn main(_spawner: Spawner) {
                                     fast_poll_until = Instant::now()
                                         + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                     interview_done = false;
+                                    // New lifecycle: the coordinator re-runs
+                                    // its interview from scratch.
+                                    device.reset_remote_reporting();
                                 } else {
                                     log::warn!("[CC2340] Secure rejoin failed");
                                 }
@@ -270,14 +272,29 @@ async fn main(_spawner: Spawner) {
                             if matches!(ev, StackEvent::Joined { .. }) {
                                 fast_poll_until =
                                     Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                device.reset_remote_reporting();
                             }
                         }
+                        // Interview completion counts only clusters a *remote*
+                        // client configured in full (see
+                        // `zigbee_runtime::remote_reporting`); the reporting
+                        // engine's own defaults do not qualify.
                         if !interview_done
-                            && device.configured_cluster_count(1) >= EXPECTED_REPORT_CLUSTERS
+                            && device.remote_reporting_covers(
+                                1,
+                                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
+                            )
                         {
                             interview_done = true;
                             fast_poll_until = Instant::now() + Duration::from_secs(5);
-                            log::info!("[CC2340] Interview done — ending fast poll");
+                            log::info!(
+                                "[CC2340] Interview done ({}/{} clusters configured remotely) — ending fast poll",
+                                device.remote_reporting_coverage(
+                                    1,
+                                    &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
+                                ),
+                                TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS.len()
+                            );
                         }
                         let mut cls2 = [
                             ClusterRef {
@@ -374,6 +391,7 @@ async fn main(_spawner: Spawner) {
                     annce_retries_left = 5;
                     last_annce = Instant::now();
                     interview_done = false;
+                    device.reset_remote_reporting();
                     log::info!("[CC2340] Joined!");
                 }
             }

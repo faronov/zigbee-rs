@@ -149,14 +149,25 @@ impl SensorApp {
         self.annce_retries_left = 5;
         self.last_annce = now;
         self.interview_done = false;
+        // New network lifecycle — the coordinator re-runs its interview.
+        self.node.reset_remote_reporting();
         self.was_identifying = false;
         self.was_fast_polling = true;
         self.consecutive_rejoin_failures = 0;
         platform::led_on();
     }
 
+    /// Leave the post-join fast-poll window once a *remote* client has
+    /// finished configuring reporting.
+    ///
+    /// Keyed on `zigbee-runtime`'s remote-reporting record, not on the
+    /// reporting engine: the engine also holds this product's own defaults
+    /// (installed at boot for a restored network, and by the interview
+    /// timeout fallback in [`Self::update_fast_poll_window`]), so counting it
+    /// declared the interview complete for a device no coordinator had
+    /// spoken to.
     fn update_interview_state(&mut self) {
-        if self.interview_done || !self.node.reporting_is_configured() {
+        if self.interview_done || !self.node.remote_reporting_is_complete() {
             return;
         }
 
@@ -166,7 +177,9 @@ impl SensorApp {
         self.interview_deadline = None;
         platform::led_off();
         rtt_target::rprintln!(
-            "[EFR32][sensor] INTERVIEW_CONFIGURED stack_high_water={}",
+            "[EFR32][sensor] INTERVIEW_CONFIGURED remote_clusters={}/{} stack_high_water={}",
+            self.node.remote_reporting_cluster_count(),
+            self.node.expected_report_clusters(),
             platform::stack_high_water_bytes()
         );
     }
@@ -338,11 +351,19 @@ impl SensorApp {
             if let Err(error) = self.node.configure_default_reporting() {
                 node_failure(NodeError::Profile(error));
             }
+            // Fallback only: local defaults keep the product reporting, but
+            // the coordinator never completed its interview. The remote
+            // count below stays as-is precisely so the two cases remain
+            // distinguishable in the log and on the next tick.
             self.interview_done = true;
             self.awaiting_initial_configuration = false;
             self.interview_deadline = None;
             platform::led_off();
-            rtt_target::rprintln!("[EFR32][sensor] INTERVIEW_TIMEOUT_USING_DEFAULT_REPORTING");
+            rtt_target::rprintln!(
+                "[EFR32][sensor] INTERVIEW_TIMEOUT_USING_DEFAULT_REPORTING remote_clusters={}/{}",
+                self.node.remote_reporting_cluster_count(),
+                self.node.expected_report_clusters()
+            );
         }
 
         let in_fast_poll = self.awaiting_initial_configuration

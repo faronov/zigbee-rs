@@ -295,8 +295,12 @@ temperature & humidity end device around a typed product profile
   counters without repeating `Device_annce`
 - **NWK Leave handler** — auto-erases state and rejoins when the coordinator
   sends Leave
-- **Interview-aware reporting** — coordinator configuration wins; after a
-  bounded timeout the shared default reporting policy is installed
+- **Interview-aware reporting** — completion is read from the runtime's
+  *remote* reporting record (`ZigbeeNode::remote_reporting_is_complete()`),
+  which counts only Configure Reporting commands the stack accepted in full;
+  after a bounded timeout the shared default reporting policy is installed
+  instead and logged with the remote count (`remote configured n/m clusters`)
+  so a fallback is never reported as a completed coordinator interview
 - **Identify cluster** (0x0003) — supports Identify, IdentifyQuery, TriggerEffect
 - **Battery percentage** reporting via Power Configuration cluster
 - Join/leave button (BOOT / GPIO9)

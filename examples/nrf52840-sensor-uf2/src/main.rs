@@ -44,12 +44,14 @@ use {defmt_rtt as _, panic_probe as _};
 // Bridge `log` crate → defmt so stack-internal log::info!/debug!/warn!/error! appear in RTT output.
 struct DefmtLogger;
 impl log::Log for DefmtLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool { true }
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
     fn log(&self, record: &log::Record) {
         match record.level() {
             log::Level::Error => defmt::error!("{}", defmt::Display2Format(record.args())),
-            log::Level::Warn  => defmt::warn!("{}", defmt::Display2Format(record.args())),
-            log::Level::Info  => defmt::info!("{}", defmt::Display2Format(record.args())),
+            log::Level::Warn => defmt::warn!("{}", defmt::Display2Format(record.args())),
+            log::Level::Info => defmt::info!("{}", defmt::Display2Format(record.args())),
             log::Level::Debug => defmt::debug!("{}", defmt::Display2Format(record.args())),
             log::Level::Trace => defmt::trace!("{}", defmt::Display2Format(record.args())),
         }
@@ -61,6 +63,7 @@ static LOGGER: DefmtLogger = DefmtLogger;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
 use zigbee_runtime::power::PowerMode;
+use zigbee_runtime::profile::TemperatureHumidityBattery;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::PowerSource;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
@@ -72,8 +75,6 @@ const REPORT_INTERVAL_SECS: u64 = 60;
 const FAST_POLL_MS: u64 = 250; // Fast poll during interview (250ms)
 const SLOW_POLL_SECS: u64 = 30; // Normal poll interval (10s)
 const FAST_POLL_DURATION_SECS: u64 = 120; // Max fast-poll window (safety timeout)
-const EXPECTED_REPORT_CLUSTERS: usize = 3; // PowerConfig + Temp + Humidity
-
 bind_interrupts!(struct Irqs {
     RADIO => radio::InterruptHandler<peripherals::RADIO>;
     RNG => rng::InterruptHandler<peripherals::RNG>;
@@ -144,7 +145,11 @@ fn create_led(p: &mut embassy_nrf::Peripherals) -> gpio::Output<'static> {
 fn led_on(led: &mut gpio::Output<'_>) {
     #[cfg(feature = "board-promicro")]
     led.set_high(); // active HIGH
-    #[cfg(any(feature = "board-mdk", feature = "board-nrf-dongle", feature = "board-nrf-dk"))]
+    #[cfg(any(
+        feature = "board-mdk",
+        feature = "board-nrf-dongle",
+        feature = "board-nrf-dk"
+    ))]
     led.set_low(); // active LOW
 }
 
@@ -152,7 +157,11 @@ fn led_on(led: &mut gpio::Output<'_>) {
 fn led_off(led: &mut gpio::Output<'_>) {
     #[cfg(feature = "board-promicro")]
     led.set_low();
-    #[cfg(any(feature = "board-mdk", feature = "board-nrf-dongle", feature = "board-nrf-dk"))]
+    #[cfg(any(
+        feature = "board-mdk",
+        feature = "board-nrf-dongle",
+        feature = "board-nrf-dk"
+    ))]
     led.set_high();
 }
 
@@ -175,7 +184,9 @@ fn create_button(_p: &mut embassy_nrf::Peripherals) -> Option<gpio::Input<'stati
 async fn main(_spawner: Spawner) {
     // ProMicro: must disable SoftDevice before embassy init (SD owns RTC1)
     #[cfg(feature = "board-promicro")]
-    unsafe { disable_softdevice() };
+    unsafe {
+        disable_softdevice()
+    };
 
     // Start HFCLK from external crystal via embassy config — REQUIRED for 802.15.4 radio.
     let mut config = embassy_nrf::config::Config::default();
@@ -234,7 +245,7 @@ async fn main(_spawner: Spawner) {
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
     let mut power_cluster = PowerConfigCluster::new();
-    power_cluster.set_battery_size(4);     // AAA
+    power_cluster.set_battery_size(4); // AAA
     power_cluster.set_battery_quantity(2); // 2× AAA
     power_cluster.set_battery_rated_voltage(15); // 1.5V per cell
     let mut hum_tick: u32 = 0;
@@ -250,13 +261,18 @@ async fn main(_spawner: Spawner) {
         .sw_build("0.1.0")
         .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, PROFILE_HOME_AUTOMATION, DeviceId::TEMPERATURE_SENSOR, |ep| {
-            ep.cluster_server(ClusterId::BASIC)
-                .cluster_server(ClusterId::IDENTIFY)
-                .cluster_server(ClusterId::POWER_CONFIG)
-                .cluster_server(ClusterId::TEMPERATURE)
-                .cluster_server(ClusterId::HUMIDITY)
-        })
+        .endpoint(
+            1,
+            PROFILE_HOME_AUTOMATION,
+            DeviceId::TEMPERATURE_SENSOR,
+            |ep| {
+                ep.cluster_server(ClusterId::BASIC)
+                    .cluster_server(ClusterId::IDENTIFY)
+                    .cluster_server(ClusterId::POWER_CONFIG)
+                    .cluster_server(ClusterId::TEMPERATURE)
+                    .cluster_server(ClusterId::HUMIDITY)
+            },
+        )
         .build();
 
     // ── Boot signal: LED solid ON 1 second (all boards) ──
@@ -268,12 +284,23 @@ async fn main(_spawner: Spawner) {
     info!("Auto-joining network…");
     device.user_action(UserAction::Join);
     let mut clusters = [
-        ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+        ClusterRef {
+            endpoint: 1,
+            cluster: &mut temp_cluster,
+        },
+        ClusterRef {
+            endpoint: 1,
+            cluster: &mut hum_cluster,
+        },
+        ClusterRef {
+            endpoint: 1,
+            cluster: &mut power_cluster,
+        },
     ];
     if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-        if log_event(e, &mut led) {
+        let reporting_complete = device
+            .remote_reporting_covers(1, &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS);
+        if log_event(e, &mut led, reporting_complete) {
             // Join happened during init tick
         }
     }
@@ -295,9 +322,13 @@ async fn main(_spawner: Spawner) {
         saadc_inst.sample(&mut buf).await;
         let raw = buf[0].max(0) as u32;
         let voltage_mv = raw * 3600 / 4096;
-        let pct = if voltage_mv >= 3000 { 100u8 }
-                  else if voltage_mv <= 1800 { 0 }
-                  else { ((voltage_mv - 1800) * 100 / 1200) as u8 };
+        let pct = if voltage_mv >= 3000 {
+            100u8
+        } else if voltage_mv <= 1800 {
+            0
+        } else {
+            ((voltage_mv - 1800) * 100 / 1200) as u8
+        };
         power_cluster.set_battery_voltage((voltage_mv / 100) as u8);
         power_cluster.set_battery_percentage(pct * 2); // ZCL: 0.5% units
         info!("Battery: {}mV ({}%)", voltage_mv, pct);
@@ -329,12 +360,23 @@ async fn main(_spawner: Spawner) {
     loop {
         let now = Instant::now();
         let in_fast_poll = now < fast_poll_until;
-        let poll_ms = if in_fast_poll { FAST_POLL_MS } else { SLOW_POLL_SECS * 1000 };
+        let poll_ms = if in_fast_poll {
+            FAST_POLL_MS
+        } else {
+            SLOW_POLL_SECS * 1000
+        };
 
         // Log transition from fast→slow poll
         if was_fast_polling && !in_fast_poll {
-            let cfg = device.configured_cluster_count(1);
-            info!("Fast poll OFF — {}/{} clusters configured", cfg, EXPECTED_REPORT_CLUSTERS);
+            let cfg = device.remote_reporting_coverage(
+                1,
+                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
+            );
+            info!(
+                "Fast poll OFF — {}/{} clusters configured by remote client",
+                cfg,
+                TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS.len()
+            );
             was_fast_polling = false;
             // Always turn LED off when fast-poll expires (power save fallback)
             if !interview_done {
@@ -378,13 +420,37 @@ async fn main(_spawner: Spawner) {
                         }
                         cortex_m::peripheral::SCB::sys_reset();
                     } else {
-                        info!("Button → {}", if device.is_joined() { "leave" } else { "join" });
+                        info!(
+                            "Button → {}",
+                            if device.is_joined() { "leave" } else { "join" }
+                        );
+                        let was_joined = device.is_joined();
                         device.user_action(UserAction::Toggle);
-                        let _ = device.tick(0, &mut [
-                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                        ]).await;
+                        let _ = device
+                            .tick(
+                                0,
+                                &mut [
+                                    ClusterRef {
+                                        endpoint: 1,
+                                        cluster: &mut temp_cluster,
+                                    },
+                                    ClusterRef {
+                                        endpoint: 1,
+                                        cluster: &mut hum_cluster,
+                                    },
+                                    ClusterRef {
+                                        endpoint: 1,
+                                        cluster: &mut power_cluster,
+                                    },
+                                ],
+                            )
+                            .await;
+                        if !was_joined && device.is_joined() {
+                            interview_done = false;
+                            device.reset_remote_reporting();
+                            fast_poll_until =
+                                Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                        }
                     }
                 }
                 Either::Second(_) => {} // Normal timeout — proceed to poll
@@ -399,9 +465,18 @@ async fn main(_spawner: Spawner) {
                 match device.poll().await {
                     Ok(Some(ind)) => {
                         let mut cls = [
-                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut temp_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut hum_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut power_cluster,
+                            },
                         ];
                         if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
                             if matches!(&ev, StackEvent::RejoinRequested) {
@@ -410,23 +485,41 @@ async fn main(_spawner: Spawner) {
                                     fast_poll_until = Instant::now()
                                         + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                     interview_done = false;
+                                    // New lifecycle — the coordinator re-runs
+                                    // its interview from scratch.
+                                    device.reset_remote_reporting();
                                 } else {
                                     warn!("Secure rejoin failed");
                                 }
                                 break;
                             }
-                            if log_event(&ev, &mut led) {
-                                fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                            let reporting_complete = device.remote_reporting_covers(
+                                1,
+                                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
+                            );
+                            if log_event(&ev, &mut led, reporting_complete) {
+                                fast_poll_until =
+                                    Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                 info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
                             }
                         }
-                        // Check if ZHA completed Configure Reporting for all clusters
-                        // (last step of the interview per-cluster)
+                        // Check if a remote client completed Configure
+                        // Reporting for all expected clusters. Local default
+                        // reporting is deliberately not interview progress.
                         if !interview_done {
-                            let cfg_count = device.configured_cluster_count(1);
-                            if cfg_count >= EXPECTED_REPORT_CLUSTERS {
-                                info!("Interview done! {}/{} clusters configured — ending fast poll",
-                                      cfg_count, EXPECTED_REPORT_CLUSTERS);
+                            let cfg_count = device.remote_reporting_coverage(
+                                1,
+                                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
+                            );
+                            if device.remote_reporting_covers(
+                                1,
+                                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
+                            ) {
+                                info!(
+                                    "Interview done! {}/{} clusters configured remotely — ending fast poll",
+                                    cfg_count,
+                                    TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS.len()
+                                );
                                 // Give 5s grace for any remaining ZHA requests
                                 fast_poll_until = Instant::now() + Duration::from_secs(5);
                                 interview_done = true;
@@ -435,11 +528,25 @@ async fn main(_spawner: Spawner) {
                             }
                         }
                         // Immediately tick to send any queued ZCL responses
-                        let _ = device.tick(0, &mut [
-                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                        ]).await;
+                        let _ = device
+                            .tick(
+                                0,
+                                &mut [
+                                    ClusterRef {
+                                        endpoint: 1,
+                                        cluster: &mut temp_cluster,
+                                    },
+                                    ClusterRef {
+                                        endpoint: 1,
+                                        cluster: &mut hum_cluster,
+                                    },
+                                    ClusterRef {
+                                        endpoint: 1,
+                                        cluster: &mut power_cluster,
+                                    },
+                                ],
+                            )
+                            .await;
                     }
                     Ok(None) => break,
                     Err(_) => break,
@@ -474,9 +581,13 @@ async fn main(_spawner: Spawner) {
                 saadc_inst.sample(&mut buf).await;
                 let raw = buf[0].max(0) as u32;
                 let voltage_mv = raw * 3600 / 4096;
-                let pct = if voltage_mv >= 3000 { 100u8 }
-                          else if voltage_mv <= 1800 { 0 }
-                          else { ((voltage_mv - 1800) * 100 / 1200) as u8 };
+                let pct = if voltage_mv >= 3000 {
+                    100u8
+                } else if voltage_mv <= 1800 {
+                    0
+                } else {
+                    ((voltage_mv - 1800) * 100 / 1200) as u8
+                };
                 power_cluster.set_battery_voltage((voltage_mv / 100) as u8);
                 power_cluster.set_battery_percentage(pct * 2);
                 info!("Battery: {}mV ({}%)", voltage_mv, pct);
@@ -484,12 +595,31 @@ async fn main(_spawner: Spawner) {
 
             // Tick the runtime (sends queued responses, reports, etc.)
             let tick_elapsed = elapsed_s.min(60) as u16;
-            if let TickResult::Event(ref e) = device.tick(tick_elapsed, &mut [
-                ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-            ]).await {
-                if log_event(e, &mut led) {
+            if let TickResult::Event(ref e) = device
+                .tick(
+                    tick_elapsed,
+                    &mut [
+                        ClusterRef {
+                            endpoint: 1,
+                            cluster: &mut temp_cluster,
+                        },
+                        ClusterRef {
+                            endpoint: 1,
+                            cluster: &mut hum_cluster,
+                        },
+                        ClusterRef {
+                            endpoint: 1,
+                            cluster: &mut power_cluster,
+                        },
+                    ],
+                )
+                .await
+            {
+                let reporting_complete = device.remote_reporting_covers(
+                    1,
+                    &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
+                );
+                if log_event(e, &mut led, reporting_complete) {
                     fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                     info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
                 }
@@ -501,7 +631,7 @@ async fn main(_spawner: Spawner) {
                 last_annce = now2;
                 info!("Re-sending Device_annce ({} left)", annce_retries_left);
                 match device.send_device_annce().await {
-                    Ok(()) => {},
+                    Ok(()) => {}
                     Err(_) => info!("Device_annce retry failed"),
                 }
             }
@@ -523,11 +653,25 @@ async fn main(_spawner: Spawner) {
                 last_rejoin_attempt = Instant::now();
                 info!("Not joined — retrying (attempt {})…", rejoin_count);
                 device.user_action(UserAction::Join);
-                let _ = device.tick(0, &mut [
-                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut power_cluster },
-                ]).await;
+                let _ = device
+                    .tick(
+                        0,
+                        &mut [
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut temp_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut hum_cluster,
+                            },
+                            ClusterRef {
+                                endpoint: 1,
+                                cluster: &mut power_cluster,
+                            },
+                        ],
+                    )
+                    .await;
                 // If join succeeded during tick, activate fast-poll for interview
                 if device.is_joined() {
                     info!("Joined! addr=0x{:04X}", device.short_address());
@@ -536,6 +680,7 @@ async fn main(_spawner: Spawner) {
                     annce_retries_left = 5;
                     last_annce = Instant::now();
                     interview_done = false;
+                    device.reset_remote_reporting();
                     led_on(&mut led);
                 }
             }
@@ -543,8 +688,14 @@ async fn main(_spawner: Spawner) {
     }
 }
 
-/// LED ON = joined, LED OFF = not joined. Returns true if this is a join event.
-fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>) -> bool {
+/// LED ON = joined, LED OFF = not joined.
+///
+/// Returns whether the caller should open the generic fast-poll window: joins
+/// always do, while Configure Reporting activity does so only until the exact
+/// profile-owned expected cluster set is complete. This preserves the
+/// completion path's 5-second grace and still gives an incomplete interview
+/// time to finish.
+fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>, reporting_complete: bool) -> bool {
     match event {
         StackEvent::Joined {
             short_address,
@@ -563,14 +714,35 @@ fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>) -> bool {
             info!("Left network");
             false
         }
-        StackEvent::ReportSent => { info!("Report sent"); false }
-        StackEvent::CommissioningComplete { success } => {
-            info!(
-                "Commissioning: {}",
-                if *success { "ok" } else { "failed" }
-            );
+        StackEvent::ReportSent => {
+            info!("Report sent");
             false
         }
-        _ => { info!("Stack event"); false }
+        StackEvent::ReportingConfigured { cluster_id, .. } => {
+            info!(
+                "Remote Configure Reporting accepted: cluster=0x{:04X}",
+                cluster_id
+            );
+            !reporting_complete
+        }
+        StackEvent::CommandReceived {
+            cluster_id,
+            command_id: 0x06,
+            ..
+        } => {
+            warn!(
+                "Remote Configure Reporting rejected: cluster=0x{:04X}",
+                cluster_id
+            );
+            !reporting_complete
+        }
+        StackEvent::CommissioningComplete { success } => {
+            info!("Commissioning: {}", if *success { "ok" } else { "failed" });
+            false
+        }
+        _ => {
+            info!("Stack event");
+            false
+        }
     }
 }
