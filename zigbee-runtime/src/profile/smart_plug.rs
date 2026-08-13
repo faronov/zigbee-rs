@@ -26,7 +26,7 @@
 //! own endpoint composition — see [`crate::templates::smart_plug`] for a
 //! preset that includes them alongside the lower-level `DeviceBuilder` API.
 
-use super::{ApplicationClusters, ProfileComponent, ProfileError};
+use super::{ApplicationClusters, ExpectedReportClusters, ProfileComponent, ProfileError};
 use crate::builder::EndpointBuilder;
 use crate::{ClusterRef, ZigbeeDevice};
 use zigbee_mac::MacDriver;
@@ -235,8 +235,12 @@ impl ProfileComponent for SmartPlug {
         Ok(())
     }
 
-    fn expected_report_clusters(&self) -> usize {
-        2 + usize::from(self.metering.is_some())
+    fn expected_report_cluster_ids(&self, out: &mut ExpectedReportClusters) {
+        let _ = out.push(ClusterId::ON_OFF.0);
+        let _ = out.push(ClusterId::ELECTRICAL_MEASUREMENT.0);
+        if self.metering.is_some() {
+            let _ = out.push(ClusterId::METERING.0);
+        }
     }
 
     fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(

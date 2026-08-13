@@ -1,6 +1,6 @@
 //! Home Automation range-extender profile.
 
-use super::{ApplicationClusters, ProfileComponent, ProfileError};
+use super::{ApplicationClusters, ExpectedReportClusters, ProfileComponent, ProfileError};
 use crate::ZigbeeDevice;
 use crate::builder::EndpointBuilder;
 use zigbee_mac::MacDriver;
@@ -32,6 +32,8 @@ impl ProfileComponent for RangeExtender {
     ) -> Result<(), ProfileError> {
         Ok(())
     }
+
+    fn expected_report_cluster_ids(&self, _out: &mut ExpectedReportClusters) {}
 }
 
 #[cfg(test)]

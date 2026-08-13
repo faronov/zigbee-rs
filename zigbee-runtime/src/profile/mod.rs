@@ -66,6 +66,23 @@ pub const MAX_APPLICATION_CLUSTERS: usize = MAX_CLUSTERS_PER_ENDPOINT;
 
 pub type ApplicationClusters<'a> = Vec<ClusterRef<'a>, MAX_APPLICATION_CLUSTERS>;
 
+/// Maximum number of distinct server cluster IDs one endpoint's profile can
+/// expect a remote client to configure Send-direction reporting for. An
+/// endpoint cannot have more reportable clusters than it has clusters, so
+/// this reuses [`MAX_APPLICATION_CLUSTERS`].
+pub const MAX_EXPECTED_REPORT_CLUSTERS: usize = MAX_APPLICATION_CLUSTERS;
+
+/// The exact set of server cluster IDs a profile expects a remote client to
+/// configure Send-direction reporting for during its interview.
+///
+/// Interview completion is defined as *every* one of these being present in
+/// the remote-reporting record (see [`crate::remote_reporting`]); a
+/// coordinator that configures an unrelated cluster cannot substitute for a
+/// missing expected one. This is the shared profile/runtime contract behind
+/// [`crate::node::ZigbeeNode::remote_reporting_is_complete`] — the count is
+/// derived from it, never hardcoded per platform.
+pub type ExpectedReportClusters = Vec<u16, MAX_EXPECTED_REPORT_CLUSTERS>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileError {
     TooManyClusters,
@@ -86,8 +103,19 @@ pub trait ProfileComponent {
         clusters: &mut ApplicationClusters<'a>,
     ) -> Result<(), ProfileError>;
 
+    /// Exact server cluster IDs this component expects a remote client to
+    /// configure Send-direction reporting for on `endpoint`. Push each
+    /// expected cluster ID into `out`; a component that expects no reporting
+    /// must implement this explicitly and leave `out` unchanged.
+    fn expected_report_cluster_ids(&self, out: &mut ExpectedReportClusters);
+
+    /// Number of reportable clusters, derived from
+    /// [`expected_report_cluster_ids`](Self::expected_report_cluster_ids) so
+    /// the count and the exact ID set can never drift apart.
     fn expected_report_clusters(&self) -> usize {
-        0
+        let mut ids = ExpectedReportClusters::new();
+        self.expected_report_cluster_ids(&mut ids);
+        ids.len()
     }
 
     fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
@@ -111,7 +139,20 @@ pub trait ApplicationProfile {
         clusters: &mut ApplicationClusters<'a>,
     ) -> Result<(), ProfileError>;
 
-    fn expected_report_clusters(&self) -> usize;
+    /// Exact server cluster IDs this profile expects a remote client to
+    /// configure Send-direction reporting for on its endpoint. Interview
+    /// completion checks exact membership of this set — see
+    /// [`ExpectedReportClusters`] and
+    /// [`crate::node::ZigbeeNode::remote_reporting_is_complete`].
+    fn expected_report_cluster_ids(&self, out: &mut ExpectedReportClusters);
+
+    /// Number of reportable clusters, derived from
+    /// [`expected_report_cluster_ids`](Self::expected_report_cluster_ids).
+    fn expected_report_clusters(&self) -> usize {
+        let mut ids = ExpectedReportClusters::new();
+        self.expected_report_cluster_ids(&mut ids);
+        ids.len()
+    }
 
     fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
         &self,
@@ -170,8 +211,8 @@ impl<C: ProfileComponent> ApplicationProfile for DeviceProfile<C> {
         self.component.collect_clusters(self.endpoint, clusters)
     }
 
-    fn expected_report_clusters(&self) -> usize {
-        self.component.expected_report_clusters()
+    fn expected_report_cluster_ids(&self, out: &mut ExpectedReportClusters) {
+        self.component.expected_report_cluster_ids(out);
     }
 
     fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
@@ -264,6 +305,18 @@ pub struct TemperatureHumidityBattery {
 }
 
 impl TemperatureHumidityBattery {
+    /// Exact reportable server clusters owned by this shared profile
+    /// component.
+    ///
+    /// Direct-composition platform examples use this same contract for
+    /// interview completion, so they cannot drift from the profile-backed
+    /// products or reintroduce local masks/counts.
+    pub const EXPECTED_REPORT_CLUSTER_IDS: [u16; 3] = [
+        ClusterId::TEMPERATURE.0,
+        ClusterId::HUMIDITY.0,
+        ClusterId::POWER_CONFIG.0,
+    ];
+
     pub fn new(
         temperature_range: TemperatureRange,
         battery: BatteryDescriptor,
@@ -361,8 +414,11 @@ impl ProfileComponent for TemperatureHumidityBattery {
         Ok(())
     }
 
-    fn expected_report_clusters(&self) -> usize {
-        3
+    fn expected_report_cluster_ids(&self, out: &mut ExpectedReportClusters) {
+        let ids = Self::EXPECTED_REPORT_CLUSTER_IDS;
+        let _ = out.push(ids[0]);
+        let _ = out.push(ids[1]);
+        let _ = out.push(ids[2]);
     }
 
     fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
@@ -484,8 +540,9 @@ impl ProfileComponent for TemperatureHumidityPressureBattery {
             .map_err(|_| ProfileError::TooManyClusters)
     }
 
-    fn expected_report_clusters(&self) -> usize {
-        self.inner.expected_report_clusters() + 1
+    fn expected_report_cluster_ids(&self, out: &mut ExpectedReportClusters) {
+        self.inner.expected_report_cluster_ids(out);
+        let _ = out.push(ClusterId::PRESSURE.0);
     }
 
     fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
@@ -573,8 +630,8 @@ impl<P: ApplicationProfile, F: crate::firmware_writer::FirmwareWriter> Applicati
             .map_err(|_| ProfileError::TooManyClusters)
     }
 
-    fn expected_report_clusters(&self) -> usize {
-        self.inner.expected_report_clusters()
+    fn expected_report_cluster_ids(&self, out: &mut ExpectedReportClusters) {
+        self.inner.expected_report_cluster_ids(out);
     }
 
     fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
@@ -742,8 +799,8 @@ impl<P: ApplicationProfile, F: crate::firmware_writer::FirmwareWriter> Applicati
             .map_err(|_| ProfileError::TooManyClusters)
     }
 
-    fn expected_report_clusters(&self) -> usize {
-        self.inner.expected_report_clusters()
+    fn expected_report_cluster_ids(&self, out: &mut ExpectedReportClusters) {
+        self.inner.expected_report_cluster_ids(out);
     }
 
     fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(

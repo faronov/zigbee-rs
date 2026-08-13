@@ -15,7 +15,8 @@
 //! would misrepresent the device as security equipment when it is not.
 
 use super::{
-    ApplicationClusters, BatteryDescriptor, BatteryMeasurement, ProfileComponent, ProfileError,
+    ApplicationClusters, BatteryDescriptor, BatteryMeasurement, ExpectedReportClusters,
+    ProfileComponent, ProfileError,
 };
 use crate::builder::EndpointBuilder;
 use crate::{ClusterRef, ZigbeeDevice};
@@ -178,8 +179,12 @@ impl ProfileComponent for OccupancyLight {
         Ok(())
     }
 
-    fn expected_report_clusters(&self) -> usize {
-        2 + usize::from(self.battery.is_some())
+    fn expected_report_cluster_ids(&self, out: &mut ExpectedReportClusters) {
+        let _ = out.push(ClusterId::OCCUPANCY.0);
+        let _ = out.push(ClusterId::ILLUMINANCE.0);
+        if self.battery.is_some() {
+            let _ = out.push(ClusterId::POWER_CONFIG.0);
+        }
     }
 
     fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
