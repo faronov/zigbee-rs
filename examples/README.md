@@ -26,8 +26,8 @@ than in application logic.
 | Example | Status |
 |---|---|
 | `mock-sleepy-sensor` | Canonical host SED lifecycle |
-| `nrf52840-sensor` | Nordic platform SED |
-| `nrf52833-sensor` | Nordic platform SED |
+| `nrf52840-sensor` | Nordic platform SED; hardware-proven on PCA10056 |
+| `nrf52833-sensor` | Same application (`apps/nrf-sensor`) as `nrf52840-sensor`; hardware-proven on PCA10100 |
 | `esp32c6-sensor`, `esp32h2-sensor` | Espressif platform SEDs |
 | `cc2340-sensor` | TI platform SED |
 | `phy6222-sensor` | Compile-tested PHY62x2 SED; deep sleep disabled |

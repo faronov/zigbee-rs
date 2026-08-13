@@ -8,12 +8,13 @@ for interrupt-driven, DMA-based TX/RX — **no SoftDevice required**.
 > sensor was tested end-to-end on an nRF52840-DK revision 2 with
 > **Home Assistant + ZHA**, including fresh commissioning, unique-TCLK
 > authentication, End Device Timeout, interview, reporting, Identify, durable
-> security state, and silent reset/resume.
+> security state, and silent reset/resume. The **nRF52833-DK (PCA10100)** now
+> runs the *same* application crate (`apps/nrf-sensor`) and has been verified
+> on hardware for join, interview, secured reporting, durable persistence and
+> silent resume — see [nRF52833 hardware acceptance](#nrf52833-hardware-acceptance).
 >
 > **Hardware-AES parity status:** Nordic ECB AES-128 is hardware-proven on
-> nRF52840 and mandatory in all four nRF builds. nRF52833 uses the same ECB
-> register layout and passes release-build/symbol gates, but still needs its
-> own on-silicon acceptance run.
+> both nRF52840 and nRF52833, and is mandatory in all four nRF builds.
 
 ## Hardware Overview
 
@@ -95,8 +96,64 @@ The accepted nRF52840 sensor binary is 200,840 bytes and contains no
 `SoftwareAes128` or `aes::soft::fixslice` symbols.
 
 The hardware run also exposed and fixed a missing
-`MacAssociatedPanCoord` PIB implementation in the Nordic MAC backend. The
-nRF52833 build remains compile- and symbol-gate-proven only.
+`MacAssociatedPanCoord` PIB implementation in the Nordic MAC backend.
+
+### nRF52833 hardware acceptance
+
+The nRF52833-DK (PCA10100, J-Link serial `001050692138`) was accepted with
+the same firmware application, on the same ZHA network:
+
+- both ECB startup KATs passed (`Nordic ECB hardware AES KAT passed`);
+- the EUI-64 came from FICR `DEVICEID` (`15:46:65:AD:B8:B3:99:97`), not a
+  constant, and ZHA registered the little-endian counterpart
+  `97:99:b3:b8:ad:65:46:15`;
+- the device commissioned **automatically at boot** — no button press — and
+  joined PAN `0xDFE9` on channel 15 as short address `0xF86B` through parent
+  `0x1F0F`;
+- ZHA completed the interview and read the product identity
+  (`Zigbee-RS` / `nRF52833-Sensor`), endpoint 1 = `0x0302`
+  Temperature Sensor with input clusters `0x0000, 0x0001, 0x0003, 0x0402,
+  0x0405`, node descriptor `logical_type = 2` (End Device);
+- the device independently observed coordinator-originated
+  `ConfigureReporting` for Power Configuration, Temperature, and Humidity,
+  then logged `Interview configuration complete: 3/3 clusters`;
+- NWK-secured Temperature (`0x0402`) and Humidity (`0x0405`) reports were
+  MAC-ACKed and accepted; ZHA created Identify, Battery, Temperature, and
+  Humidity entities;
+- a short Button 1 press forced a fresh sensor/battery sample and immediate
+  reports for all three configured clusters; Home Assistant updated to
+  23.0 °C / 52.3 % / 100 %;
+- a ZDO `NWK_ADDR_REQ` from a neighbour was answered (`ZDO OK`);
+- after a **reflash and reset**, the device resumed silently from the
+  crash-safe journal at `0x0007_E000` — same PAN, channel, parent, and short
+  address, with no scan, association, or Device Announce. `probe-rs` rewrites
+  only the 504 KiB application region, so this also demonstrates that the
+  protected partition survives a firmware update.
+
+Not yet exercised on nRF52833 silicon: the 3 s long-press durable factory
+reset, battery-percentage reporting over its full reporting interval, and
+long-duration low-power current measurement.
+
+### Shared nRF sensor application
+
+`apps/nrf-sensor` holds one copy of the sensor lifecycle for every nRF
+product. It is generic over the security store, the profile component, the
+fitted environmental sensor, and the battery chemistry, so nRF52840 and
+nRF52833 cannot drift apart:
+
+| Concern | Owner |
+|---------|-------|
+| Commissioning, resume, retry, polling, interview, reporting, button, LED | `apps/nrf-sensor` |
+| Identity strings, flash layout, security partition, battery curve, profile | `products/nrf5283x-sensor` |
+| LED1/Button 1/I2C pins | `boards/nrf5283x-dk` |
+| Radio, RNG, SAADC, TEMP, NVMC, clocks | `embassy-nrf` |
+
+The only intentional runtime difference between the two products is the
+DC/DC configuration: `embassy-nrf` exposes the VDDH→VDD first stage (`reg0`)
+only for nRF52840, so the nRF52833 composition root enables the second stage
+(`reg1`) alone. On a PCA10100 running in normal-voltage mode (VDDH tied to
+VDD) REG0 is bypassed anyway, so this is a HAL/API difference rather than a
+behavioral one.
 
 ## Prerequisites
 
@@ -227,11 +284,20 @@ RAM   : ORIGIN = 0x20000000, LENGTH = 256K
 `SecurityStateJournal`; the board crate owns no flash addresses or persistence
 policy.
 
-**nRF52833**:
+**nRF52833 sensor product** (no bootloader; last 8 KiB protected for Zigbee
+security persistence, exactly mirroring the nRF52840 product):
 ```
-FLASH : ORIGIN = 0x00000000, LENGTH = 512K
+FLASH : ORIGIN = 0x00000000, LENGTH = 504K
 RAM   : ORIGIN = 0x20000000, LENGTH = 128K
 ```
+
+`products/nrf52833-sensor/link/memory.x` owns this layout. The protected
+`0x0007E000..0x0007FFFF` region contains the two-sector crash-safe
+`SecurityStateJournal`. Both nRF `memory.x` files carry link-time `ASSERT`s
+that fail the build if the application region is ever grown over the journal
+partition, or if the region stops matching the part's real memories; the
+matching `const` assertions in each product's `storage.rs` check the same
+partition from the Rust side.
 
 **nRF52840 UF2 (with SoftDevice S140 bootloader)**:
 ```
@@ -447,21 +513,42 @@ on-chip temperature sensor and reports simulated humidity. Includes:
   reporting, persistence lifecycle, tick, and receive dispatch are shared
   rather than rebuilt in the example
 
-#### Architecture: composition root + application state machine
+#### Architecture: composition root + shared application state machine
 
-Like the EFR32MG1 and ESP32-H2 sensors, this firmware is split across three
-files under `src/`:
+Like the EFR32MG1 and ESP32-H2 sensors, this firmware separates platform
+startup from the lifecycle — but unlike them, the lifecycle is **not** part
+of the example. It lives in `apps/nrf-sensor` and is shared verbatim with
+`examples/nrf52833-sensor`:
 
 | File | Owns |
 |------|------|
-| `main.rs` | Embassy/Nordic platform startup (clocks, DC-DC, boot signal), board/sensor resource construction, hardware AES install + startup KAT, the crash-safe security journal, the concrete product profile, and the identity guard. Builds `device`/`security_store`/`profile` as plain locals and hands borrows of them to `app::SensorApp`. |
-| `app.rs` | `SensorApp<'a>`, the full commissioning and event-loop lifecycle: bounded (four-round) MAC receive/poll windows, two-level fast/slow polling, the post-join interview window, Device_annce retries, button handling, and durable checkpointing. |
-| `policy.rs` | A small, dependency-free (`core` + `zigbee_runtime::event_loop` only) poll-delay arbitration helper, host-tested from `tests/src/nrf52840_policy_tests.rs` via the same `#[path]`-include technique as `tests/src/efr32mg1_pm_tests.rs`. |
+| `examples/nrf5283x-sensor/src/main.rs` | Embassy/Nordic platform startup (clocks, DC-DC, boot signal), board/sensor resource construction, hardware AES install + startup KAT, the crash-safe security journal, the concrete product profile, the battery-policy binding, and the identity guard. Builds `device`/`security_store`/`profile` as plain locals and hands borrows of them to `SensorApp`. |
+| `examples/nrf5283x-sensor/src/sensor.rs` | Optional external BME280/SHT31 I2C source (board-typed, therefore per-example). |
+| `apps/nrf-sensor/src/app.rs` | `SensorApp<'a, S, C, E, B>`, the full commissioning and event-loop lifecycle: bounded (four-round) MAC receive/poll windows, two-level fast/slow polling, the post-join interview window, Device_annce retries, button handling, and durable checkpointing. |
+| `apps/nrf-sensor/src/environment.rs` | `EnvironmentSource` / `EnvironmentSink` traits plus the chip-generic on-chip `TEMP` source. |
+| `apps/nrf-sensor/src/battery.rs` | The `BatteryPolicy` trait a composition root uses to inject its *product's* chemistry — the app crate never depends on a product. |
+| `apps/nrf-sensor/src/policy.rs` | A small, dependency-free (`core` + `zigbee_runtime::event_loop` only) poll-delay arbitration helper, host-tested from `tests/src/nrf_sensor_policy_tests.rs` via the same `#[path]`-include technique as `tests/src/efr32mg1_pm_tests.rs`. |
 
-`main.rs` stays a thin composition root; `SensorApp::run()` in `app.rs` is
-the only place that drives the network.
+Interview detection is **not** application state. The app reacts to
+`StackEvent::ReportingConfigured` — emitted by `zigbee-runtime` only for a
+non-empty Configure Reporting command made entirely of Send-direction records
+whose every record succeeded — and reads the `n/n` progress straight from
+`ZigbeeNode::remote_reporting_cluster_count()` /
+`remote_reporting_is_complete()`. Those node APIs filter the runtime's generic
+record through the active profile's exact expected cluster IDs, so an
+unrelated cluster cannot substitute for a missing sensor cluster. A rejected,
+receive-only, or mixed-direction command arrives as the generic
+`CommandReceived` and is logged as non-progress rather than counted.
 
-Unlike the EFR32MG1/ESP32-H2 sensors, `SensorApp<'a>` is lifetime-generic
+`main.rs` stays a thin composition root; `SensorApp::run()` is the only place
+that drives the network, for every nRF product.
+
+`SensorApp` is generic over the security store `S`, the profile component
+`C`, the environmental source `E`, and the battery policy `B`. All four are
+monomorphized, so a product pays exactly what it uses and neither product
+can silently diverge from the other's lifecycle.
+
+Unlike the EFR32MG1/ESP32-H2 sensors, `SensorApp` is lifetime-generic
 and **not** built via `StaticCell`/`build_into`. Those two products use the
 `embassy-executor` crate's *default* 4 KiB task arena (they set no
 `task-arena-size-*` feature), so `ZigbeeDevice`/security-store/profile must
@@ -539,12 +626,12 @@ let mut app = SensorApp::new(node, led, button, /* sensors */);
 app.run().await
 ```
 
-**Real temperature reading (`app.rs`):**
+**Real temperature reading (`apps/nrf-sensor/src/environment.rs`):**
 
 ```rust
 // Read actual die temperature (°C with 0.25° resolution)
-let temp_c = self.temp_sensor.read().await;
-let temp_hundredths = (temp_c.to_bits() * 100 / 4) as i16;
+let raw_temp = self.temp.read().await;
+let temperature_centi_celsius = (raw_temp.to_bits() * 100 / 4) as i16;
 ```
 
 ### nrf52840-sensor-uf2
@@ -601,14 +688,14 @@ DEFMT_LOG = "debug"
 
 ```
 INFO  Zigbee-RS nRF52840 sensor starting…
-INFO  Radio ready
-INFO  NV: restored network state from flash
-INFO  Default reporting configured (temp: 60-300s, hum: 60-300s, battery: 300-3600s)
-INFO  Device ready — press Button 1 to join/leave
-INFO  [btn] Joining network…
-INFO  [scan] Scanning channels 11-26…
-INFO  [scan] Found network: ch=15, PAN=0x1AAA
-INFO  [join] Association successful, addr=0x1234
-INFO  [sensor] T=23.75°C  H=52.30%  Battery=100%
-INFO  [nv] State saved to flash
+INFO  Nordic ECB hardware AES KAT passed
+INFO  Radio ready (TX 0 dBm)
+INFO  Security journal ready
+INFO  Joined/resumed network: addr=0x1234 ch=15 pan=0x1AAA
+INFO  Default reporting configured
+INFO  Remote ConfigureReporting: cluster=0x0402 3/3 clusters
+INFO  Interview configuration complete: 3/3 clusters
+INFO  Button → force report (interview configuration 3/3)
+INFO  T=23.75°C H=52.30%
+INFO  Battery: 3000mV (100%)
 ```

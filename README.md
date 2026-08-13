@@ -298,7 +298,7 @@ the accelerator is a block-cipher provider, not autonomous MAC offload.
 | **ESP32-C6** | ✅ esp-ieee802154 | `riscv32imac-unknown-none-elf` | Native 802.15.4 radio |
 | **ESP32-H2** | ✅ esp-ieee802154 | `riscv32imac-unknown-none-elf` | Native 802.15.4 radio |
 | **nRF52840** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
-| **nRF52833** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
+| **nRF52833** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral; runs the same `apps/nrf-sensor` firmware as nRF52840 — join, interview, secured reporting and silent resume hardware-tested |
 | **BL702** | 🦀 Pure-Rust direct registers | `riscv32imc-unknown-none-elf` | XT-ZB1 RF, join, ZHA interview, security, and reporting hardware-tested |
 | **CC2340** | 🦀 Rust host + TI microcode | `thumbv6m-none-eabi` | Raw polling TX/RX implemented; hardware validation, CCA, IRQs, filtering, and auto-ACK pending |
 | **Telink TLSR8258** | 🦀 **Pure Rust** | `tc32-unknown-none-elf` | Real tc32 builds in the dedicated [modern-tc32](https://github.com/modern-tc32) CI workflow |
@@ -373,13 +373,18 @@ zigbee-rs/
 ├── tlsr8258-hal/              # TLSR8258 radio and reusable peripheral HAL
 ├── boards/
 │   ├── bl702-xt-zb1/          # XT-ZB1 wiring and ownership tokens
+│   ├── nrf52833-dk/           # PCA10100 wiring (LED1, Button 1, sensor I2C)
+│   ├── nrf52840-dk/           # PCA10056 wiring (LED1, Button 1, sensor I2C)
 │   └── tlsr8258-tb04/         # TB-04 wiring, LEDs, flash and pin ownership
 ├── products/
 │   ├── bl702-xt-zb1/          # XT-ZB1 storage and linker policy
 │   ├── efr32mg1-tradfri/      # TRADFRI sensor profile, storage, linker policy
 │   ├── esp32-zigbee-devkit/   # ESP32 product profiles and partitions
+│   ├── nrf52833-sensor/       # nRF52833 profile, storage, linker policy
 │   ├── nrf52840-sensor/       # nRF52840 profile, storage, linker policy
 │   └── tlsr8258-tb04/         # TB-04 storage and linker policy
+├── apps/
+│   └── nrf-sensor/            # Shared nRF sensor lifecycle (52833 + 52840)
 ├── drivers/                   # Transport-independent sensor drivers (blocking + async)
 │   ├── sht3x/                 # Sensirion SHT3x temperature + humidity
 │   ├── sht4x/                 # Sensirion SHT4x temperature + humidity
@@ -397,7 +402,7 @@ zigbee-rs/
 │   ├── esp32h2-sensor/        # ESP32-H2 firmware
 │   ├── nrf52840-sensor/       # nRF52840-DK (probe-rs) + BME280/SHT31 + flash NV
 │   ├── nrf52840-sensor-uf2/   # nice!nano / ProMicro (UF2 drag-drop, simple demo)
-│   ├── nrf52833-sensor/       # nRF52833-DK (probe-rs)
+│   ├── nrf52833-sensor/       # nRF52833-DK (probe-rs) + BME280/SHT31 + flash NV
 │   ├── nrf52840-router/       # nRF52840 Zigbee router (relay, permit join, Link Status)
 │   ├── bl702-sensor/          # XT-ZB1 pure-Rust Zigbee sensor
 │   ├── cc2340-sensor/         # TI CC2340R5 (SDK-backed compile, hardware pending)

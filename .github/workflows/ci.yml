@@ -47,6 +47,14 @@ jobs:
       - run: cargo test -p zigbee-zcl --no-default-features
       - run: cargo test -p zigbee-zcl --no-default-features --features float32
       - run: cargo test -p zigbee-zcl --no-default-features --features float64
+      # nRF product crates are excluded from the root workspace (they pull in
+      # `embassy-nrf`), but their battery-curve and profile logic is
+      # host-testable because the hardware dependencies are
+      # `cfg(target_os = "none")`-gated.
+      - run: cargo test --manifest-path products/nrf52840-sensor/Cargo.toml
+      - run: cargo test --manifest-path products/nrf52840-sensor/Cargo.toml --features sensor-bme280
+      - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml
+      - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml --features sensor-bme280
 
   clippy:
     name: Clippy
@@ -79,6 +87,13 @@ jobs:
           cargo fmt --manifest-path boards/bl702-xt-zb1/Cargo.toml -- --check
           cargo fmt --manifest-path products/bl702-xt-zb1/Cargo.toml -- --check
           cargo fmt --manifest-path examples/bl702-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path apps/nrf-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/nrf52840-dk/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/nrf52833-dk/Cargo.toml -- --check
+          cargo fmt --manifest-path products/nrf52840-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path products/nrf52833-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/nrf52840-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/nrf52833-sensor/Cargo.toml -- --check
 
   doc:
     name: Doc
@@ -232,7 +247,25 @@ jobs:
           NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
           $OBJCOPY -O binary $ELF ${ELF}.bin
           $OBJCOPY -O ihex   $ELF ${ELF}.hex
+          # Same tight size budget as the nRF52840 sensor: the two images
+          # are the same firmware and currently differ by only a few bytes,
+          # so a regression in either shows up immediately. The 504 KiB
+          # application region is checked separately below — that is the
+          # hard, brick-class boundary, this is the growth gate.
+          ./tools/firmware-size-report.sh nrf52833-sensor ${ELF}.bin 225280 ${ELF}.size.json
+          # The application must never reach the protected security journal
+          # at 0x0007E000. memory.x asserts the region boundary at link
+          # time; this asserts the produced image against it as well.
+          IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
+          if [ "$IMAGE_BYTES" -gt 516096 ]; then
+            echo "nRF52833 image ($IMAGE_BYTES B) overruns the 504 KiB application flash region" >&2
+            exit 1
+          fi
           SYMS="$("$NM" --demangle "$ELF")"
+          if grep -q 'core::slice::sort' <<<"$SYMS"; then
+            echo "nRF52833 image contains generic slice sorting" >&2
+            exit 1
+          fi
           if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
             echo "nRF52833 production image still links software AES" >&2
             exit 1
@@ -241,6 +274,27 @@ jobs:
             echo "nRF52833 production image is missing the Nordic ECB AES backend" >&2
             exit 1
           fi
+          # Same role-split gates as the nRF52840 sensor: this is a sleepy
+          # end device, so the parent/router maintenance subgraph must be
+          # compiled out and the R22 End Device Timeout *client* lifecycle
+          # must be retained.
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
+            echo "nRF52833 sensor links parent/router maintenance symbols:" >&2
+            grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
+            exit 1
+          fi
+          for sym in resume_end_device_timeout service_end_device_timeout apply_end_device_timeout_change send_ed_timeout_request_tracked; do
+            if ! grep -q "$sym" <<<"$SYMS"; then
+              echo "nRF52833 sensor is missing End Device Timeout CLIENT symbol: $sym" >&2
+              exit 1
+            fi
+          done
+      - name: Build nRF52833 sensor variants (release)
+        working-directory: examples/nrf52833-sensor
+        run: |
+          cargo build --release --features sensor-bme280
+          cargo build --release --features sensor-sht31
       - name: Upload nRF52833 firmware
         uses: actions/upload-artifact@v4
         with:
@@ -248,6 +302,7 @@ jobs:
           path: |
             examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor.bin
             examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor.hex
+            examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor.size.json
 
   build-nrf52840-uf2:
     name: Build nRF52840 sensor (UF2)
