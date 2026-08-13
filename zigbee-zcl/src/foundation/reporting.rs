@@ -271,6 +271,20 @@ impl ReportingEngine {
         }
     }
 
+    /// Make every locally-sent report due on the next reporting pass.
+    ///
+    /// This bypasses the configured minimum interval and value-change
+    /// threshold exactly once. It is intended for explicit operator actions
+    /// such as a device button requesting an immediate telemetry snapshot.
+    pub fn force_all_due(&mut self) {
+        for state in self.states.iter_mut() {
+            if state.config.direction == ReportDirection::Send {
+                state.elapsed = u16::MAX;
+                state.last_value = None;
+            }
+        }
+    }
+
     /// Check all configured reports and generate a `ReportAttributes` payload
     /// if any reports are due.
     pub fn check_and_report<const N: usize>(

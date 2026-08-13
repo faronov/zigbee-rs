@@ -761,6 +761,43 @@ fn reporting_engine_max_interval() {
 }
 
 #[test]
+fn reporting_engine_force_all_due_bypasses_intervals_and_change_thresholds() {
+    let mut store: AttributeStore<4> = AttributeStore::new();
+    store
+        .register(
+            AttributeDefinition {
+                id: AttributeId(0x0000),
+                data_type: ZclDataType::I16,
+                access: AttributeAccess::Reportable,
+                name: "Temp",
+            },
+            ZclValue::I16(2200),
+        )
+        .unwrap();
+
+    let mut engine = ReportingEngine::new();
+    engine
+        .configure(ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: AttributeId(0x0000),
+            data_type: ZclDataType::I16,
+            min_interval: 300,
+            max_interval: 0xFFFF,
+            reportable_change: Some(ZclValue::I16(100)),
+        })
+        .unwrap();
+
+    engine.tick(300);
+    assert!(engine.check_and_report(&store).is_some());
+    assert!(engine.check_and_report(&store).is_none());
+
+    engine.force_all_due();
+    let report = engine.check_and_report(&store).unwrap();
+    assert_eq!(report.reports.len(), 1);
+    assert_eq!(report.reports[0].value, ZclValue::I16(2200));
+}
+
+#[test]
 fn reporting_engine_value_change() {
     let mut store: AttributeStore<4> = AttributeStore::new();
     store
