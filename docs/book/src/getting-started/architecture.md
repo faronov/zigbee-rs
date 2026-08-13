@@ -39,6 +39,31 @@ platform/chip HAL    radio, clocks, sleep, reset, raw flash controller
 A board crate must not depend on `zigbee-runtime`. Product code depends on the
 board and selects the storage/OTA policy used by the application.
 
+An application crate may be shared by several products of the same chip
+family. `apps/nrf-sensor` is the reference: it owns the whole nRF sensor
+lifecycle (commissioning, silent resume, bounded secure-rejoin retry, poll
+windows, interview detection, Device_annce retries, reporting, button
+semantics) once, and both `examples/nrf52840-sensor` and
+`examples/nrf52833-sensor` run it unmodified. It is generic over the four
+things that legitimately differ per product — the security store, the profile
+component, the fitted environmental sensor, and the battery chemistry — and
+those are bound in each firmware's composition root, so the application crate
+never depends on a product or a board:
+
+```rust,ignore
+// examples/nrf52833-sensor/src/main.rs — composition root
+struct Battery;                                       // product chemistry
+impl nrf_sensor_app::BatteryPolicy for Battery { /* … */ }
+
+let mut profile = nrf52833_sensor_product::profile::sensor_profile();
+let mut store = nrf52833_sensor_product::storage::security_store(nvmc);
+let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+
+let mut app: SensorApp<'_, _, _, _, Battery> =
+    SensorApp::new(node, led, button, environment, saadc);
+app.run().await
+```
+
 ## Board Resource Ownership
 
 Where fitted peripherals have alternative owners, board crates expose typed

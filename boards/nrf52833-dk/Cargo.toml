@@ -1,0 +1,11 @@
+[package]
+name = "nrf52833-dk"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board support for the Nordic nRF52833 DK (PCA10100)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+embassy-nrf = { version = "0.3", features = ["nrf52833"] }
