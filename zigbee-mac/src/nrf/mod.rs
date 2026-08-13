@@ -60,6 +60,13 @@ const ECB_INTENCLR: usize = 0x308;
 const ECB_ECBDATAPTR: usize = 0x504;
 const ECB_WAIT_LIMIT: u32 = 100_000;
 
+/// Depth of the association-time receive queue.
+///
+/// A channel that already carries an active mesh delivers unrelated broadcast
+/// traffic throughout the join, so this has to absorb that background while
+/// still retaining the association response and the APS Transport-Key.
+const ASSOC_FRAME_QUEUE_LEN: usize = 8;
+
 static ECB_TAKEN: AtomicBool = AtomicBool::new(false);
 
 /// Unique process-wide ownership token for the Nordic ECB peripheral.
@@ -260,7 +267,12 @@ pub struct NrfMac<'a, T: RadioInstance, R: RngInstance> {
     /// macCoordExtendedAddress — extended address of the coordinator/parent
     coord_extended_address: IeeeAddress,
     /// Frames received while association is still completing.
-    pending_assoc_frames: heapless::Deque<MacFrame, 2>,
+    ///
+    /// Sized for a busy channel: the frame that actually matters here is the
+    /// APS Transport-Key, and it arrives *after* the association response, so
+    /// unrelated mesh broadcasts captured in the meantime must not be able to
+    /// crowd it out.
+    pending_assoc_frames: heapless::Deque<MacFrame, ASSOC_FRAME_QUEUE_LEN>,
     /// Per-device evolving state for sequence numbers and CSMA backoff.
     random_state: u32,
     /// Exclusively-owned Nordic ECB accelerator. Production composition roots
@@ -364,9 +376,16 @@ impl<'a, T: RadioInstance, R: RngInstance> NrfMac<'a, T, R> {
             );
             return;
         };
-        if self.pending_assoc_frames.push_back(frame).is_err() {
-            log::warn!("[MAC] Association-time frame queue full");
+        // Evict the oldest entry instead of rejecting the newest. The frames
+        // that complete a join (association response, then the APS
+        // Transport-Key) are always the most recent ones, so a queue already
+        // filled with unrelated mesh broadcasts must never be allowed to
+        // permanently discard them.
+        if self.pending_assoc_frames.is_full() {
+            let _ = self.pending_assoc_frames.pop_front();
+            log::debug!("[MAC] Association-time frame queue full — evicted oldest frame");
         }
+        let _ = self.pending_assoc_frames.push_back(frame);
     }
 
     /// Set the radio channel (11-26 for 2.4 GHz Zigbee).
@@ -477,12 +496,12 @@ impl<'a, T: RadioInstance, R: RngInstance> NrfMac<'a, T, R> {
     ) -> Result<heapless::Vec<PanDescriptor, MAX_PAN_DESCRIPTORS>, MacError> {
         self.set_channel(channel);
 
-        // Send beacon request
+        // The beacon request must survive a busy channel: a single CCA-busy
+        // result would otherwise abort this channel entirely, which is exactly
+        // what happens on the channel that already carries the mesh we want to
+        // join. Use the normal CSMA-CA backoff path instead of a bare TX.
         let mut pkt = self.beacon_request_frame();
-        self.radio
-            .try_send(&mut pkt)
-            .await
-            .map_err(|_| MacError::RadioError)?;
+        self.try_send_with_csma(&mut pkt).await?;
 
         let delay_us = pib::scan_duration_us(duration);
         let mut descriptors = heapless::Vec::new();
@@ -510,28 +529,59 @@ impl<'a, T: RadioInstance, R: RngInstance> NrfMac<'a, T, R> {
         Ok(descriptors)
     }
 
-    /// Receive and parse beacons until cancelled.
+    /// Receive and parse beacons until the scan-duration timer cancels this
+    /// future.
+    ///
+    /// The loop budget must never be spent on frames that are not beacons.
+    /// A Zigbee channel that already carries an active mesh delivers a
+    /// continuous stream of data frames, ACKs and CRC failures, so a bounded
+    /// count of *receive operations* ends the scan long before the scan
+    /// duration elapses and hides the networks that beacon later — including
+    /// the coordinator, which is usually the node with permit-join open.
+    /// Only a full descriptor list stops the scan early; everything else keeps
+    /// listening and lets the caller's timer decide when the channel is done.
     async fn collect_beacons(
         &mut self,
         channel: u8,
         descriptors: &mut heapless::Vec<PanDescriptor, MAX_PAN_DESCRIPTORS>,
     ) -> Result<(), MacError> {
-        let mut rx_pkt = Packet::new();
+        // A radio that fails back-to-back this many times is wedged rather
+        // than merely hearing corrupted traffic. Bail out instead of spinning
+        // for the rest of the scan window. Reset on every successful receive.
+        const MAX_CONSECUTIVE_RADIO_ERRORS: u32 = 64;
 
-        for _ in 0..MAX_PAN_DESCRIPTORS {
+        let mut rx_pkt = Packet::new();
+        let mut consecutive_errors = 0u32;
+
+        loop {
             match self.radio.receive(&mut rx_pkt).await {
                 Ok(()) => {
+                    consecutive_errors = 0;
                     let data = rx_pkt.as_ref();
-                    if let Some(pd) = parse_beacon(channel, data, rx_pkt.lqi()) {
-                        if descriptors.push(pd).is_err() {
-                            break;
-                        }
+                    let Some(pd) = parse_beacon(channel, data, rx_pkt.lqi()) else {
+                        continue;
+                    };
+                    // Descriptor slots are the scarce resource on a dense mesh.
+                    // A router that beacons twice within one window must not
+                    // consume a slot that another PAN still needs.
+                    if descriptors
+                        .iter()
+                        .any(|existing| existing.coord_address == pd.coord_address)
+                    {
+                        continue;
+                    }
+                    if descriptors.push(pd).is_err() {
+                        return Ok(());
                     }
                 }
-                Err(_) => continue,
+                Err(_) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= MAX_CONSECUTIVE_RADIO_ERRORS {
+                        return Err(MacError::RadioError);
+                    }
+                }
             }
         }
-        Ok(())
     }
 }
 
@@ -621,20 +671,21 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
         }
 
         // Build Association Request command frame
-        let mut pkt = Packet::new();
         let frame = build_association_request(
             self.next_dsn(),
             &req.coord_address,
             &self.extended_address,
             &req.capability_info,
         );
-        pkt.copy_from_slice(&frame);
 
-        // Transmit
-        self.radio
-            .try_send(&mut pkt)
-            .await
-            .map_err(|_| MacError::RadioError)?;
+        // IEEE 802.15.4 §6.4.1: the association request is an acknowledged
+        // MAC command. A bare CCA-gated transmit neither retries a busy
+        // channel nor confirms the coordinator actually heard us, so a lost
+        // request was previously indistinguishable from a coordinator that
+        // never answered — the join then burned all five poll attempts
+        // waiting for a response to a frame that was never delivered.
+        self.send_acknowledged_frame(&frame, self.max_frame_retries)
+            .await?;
 
         // Per IEEE 802.15.4 §5.3.2.1: wait, then poll with Data Request.
         // Poll multiple times — the coordinator may need time to process.
@@ -643,12 +694,15 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
             let delay = if poll_attempt == 0 { 200 } else { 500 };
             Timer::after_millis(delay).await;
 
-            // Send Data Request to poll for indirect Association Response
+            // Send Data Request to poll for indirect Association Response.
+            // CSMA-CA backoff only; the ACK window is deliberately not consumed
+            // here so the coordinator's indirect Association Response is left
+            // for wait_assoc_response below.
             let data_req =
                 build_data_request(self.next_dsn(), &req.coord_address, &self.extended_address);
             let mut dreq_pkt = Packet::new();
             dreq_pkt.copy_from_slice(&data_req);
-            let _ = self.radio.try_send(&mut dreq_pkt).await;
+            let _ = self.try_send_with_csma(&mut dreq_pkt).await;
 
             // Wait up to 1.5s per poll for Association Response
             let timeout_us: u64 = 1_500_000;
