@@ -628,6 +628,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrf-sensor-app"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "defmt",
+ "embassy-futures",
+ "embassy-nrf",
+ "embassy-time",
+ "zigbee-mac",
+ "zigbee-runtime",
+]
+
+[[package]]
 name = "nrf52840-dk"
 version = "0.1.0"
 dependencies = [
@@ -648,6 +661,7 @@ dependencies = [
  "embassy-time",
  "embedded-hal 1.0.0",
  "log",
+ "nrf-sensor-app",
  "nrf52840-dk",
  "nrf52840-sensor-product",
  "panic-probe",

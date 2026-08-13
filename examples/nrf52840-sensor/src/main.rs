@@ -36,8 +36,6 @@
 #![no_std]
 #![no_main]
 
-mod app;
-mod policy;
 #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
 mod sensor;
 
@@ -51,12 +49,29 @@ use embassy_time::{Duration, Timer};
 use defmt::*;
 use {defmt_rtt as _, panic_probe as _};
 
-use app::SensorApp;
+#[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
+use nrf_sensor_app::OnChipTemperature;
+use nrf_sensor_app::{BatteryPolicy, SensorApp};
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::profile::ApplicationProfile;
+use zigbee_runtime::profile::{ApplicationProfile, BatteryMeasurement};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_zcl::clusters::basic::PowerSource;
+
+/// Binds this product's battery chemistry (`products/nrf52840-sensor`) to
+/// the shared application. Zero-sized: the calls monomorphize back into the
+/// same direct arithmetic the firmware inlined before the extraction.
+struct Battery;
+
+impl BatteryPolicy for Battery {
+    fn millivolts(raw_sample: i16) -> u32 {
+        nrf52840_sensor_product::battery::millivolts(raw_sample)
+    }
+
+    fn measurement(raw_sample: i16) -> BatteryMeasurement {
+        nrf52840_sensor_product::battery::battery_measurement(raw_sample)
+    }
+}
 
 // Bridge `log` crate → defmt so stack-internal log::info!/debug! appear in RTT output.
 struct DefmtLogger;
@@ -145,8 +160,7 @@ async fn main(_spawner: Spawner) {
     log::set_max_level(log::LevelFilter::Debug);
 
     let mut config = embassy_nrf::config::Config::default();
-    // Use internal RC for HFCLK — radio requests XTAL automatically when needed.
-    // Saves ~250µA vs keeping external XTAL always on.
+    // HFCLK from the DK's external crystal — required for the 802.15.4 radio.
     config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
     // Enable DC-DC converter for ~40% lower current draw
     config.dcdc = embassy_nrf::config::DcdcConfig {
@@ -170,10 +184,10 @@ async fn main(_spawner: Spawner) {
 
     // ── Sensor init ──
     #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
-    let temp_sensor = Temp::new(p.TEMP, Irqs);
+    let environment = OnChipTemperature::new(Temp::new(p.TEMP, Irqs));
 
     #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
-    let env_sensor =
+    let environment =
         sensor::Sensor::new(nrf52840_dk::sensor_i2c(p.TWISPI0, Irqs, p.P0_26, p.P0_27));
 
     // SAADC for battery voltage
@@ -253,21 +267,13 @@ async fn main(_spawner: Spawner) {
     match device.reset_security_state_if_identity_changed(&mut security_store, ieee) {
         Ok(true) => warn!("Cleared persisted network state after IEEE address change"),
         Ok(false) => {}
-        Err(error) => app::persistence_failure(error),
+        Err(error) => nrf_sensor_app::persistence_failure(error),
     }
 
     let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
 
-    let mut app = SensorApp::new(
-        node,
-        led,
-        button,
-        #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
-        temp_sensor,
-        #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
-        env_sensor,
-        saadc_sensor,
-    );
+    let mut app: SensorApp<'_, _, _, _, Battery> =
+        SensorApp::new(node, led, button, environment, saadc_sensor);
 
     app.run().await
 }

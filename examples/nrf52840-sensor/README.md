@@ -19,7 +19,7 @@ default reporting, and auto-recovery on sensor failure.
 ## Hardware Requirements
 
 - nRF52840-DK (PCA10056) or any nRF52840 board with a debug probe
-- Button 1 (P0.11, active low) for join/leave control
+- Button 1 (P0.11, active low) for forced reporting, immediate join, and factory reset
 - Debug probe (J-Link on-board for DK, or external probe-rs-compatible)
 - (Optional) BME280 or SHT31 breakout wired to I2C (see below)
 
@@ -78,7 +78,7 @@ See `src/sensor.rs` for the recoverable probe/read wiring.
 
 ## What It Demonstrates
 
-- Embassy async event loop (`SensorApp::run` in `app.rs`) using `select` (button press vs. poll timer) plus a bounded per-iteration MAC poll/receive window
+- Embassy async event loop (`SensorApp::run` in `apps/nrf-sensor`) using `select` (button press vs. poll timer) plus a bounded per-iteration MAC poll/receive window
 - On-chip TEMP sensor or async external I2C sensor (BME280 / SHT31)
 - Building a Zigbee device with `ZigbeeDevice` builder API
 - ZCL endpoint 1 (Home Automation, device type 0x0302) with **Basic**,
@@ -138,28 +138,31 @@ stable environment.
 
 1. Power on → atomically restores saved security state (if any) and auto-resumes
 2. If no saved state → automatically initiates BDB commissioning
-3. Once joined → reads sensors every 30 s, reports to coordinator; state saved to flash
-4. Press Button 1 → leaves the network and records factory-reset security state
-5. **Power cycle** → device reconnects automatically (no re-pairing needed!)
+3. Once joined → reads sensors every 60 s, reports to coordinator; state saved to flash
+4. Short-press Button 1 → force an immediate sensor and battery report
+5. Hold Button 1 for 3 s → durable factory reset and reboot
+6. **Power cycle** → device reconnects automatically (no re-pairing needed!)
 
 ## Project Structure
 
 ```
 nrf52840-sensor/
-├── .cargo/config.toml   # Target, runner (probe-rs), DEFMT_LOG level
+├── .cargo/config.toml   # Target, runner (probe-rs), linker path, DEFMT_LOG
 ├── Cargo.toml            # Features (sensor-bme280, sensor-sht31), deps
 └── src/
     ├── sensor.rs         # Recoverable BME280/SHT31 wiring over the shared
     │                     # zigbee-bme280 / zigbee-sht3x drivers (feature-gated)
-    ├── policy.rs         # Pure, host-tested poll-delay arbitration (honors
-    │                     # TickResult::RunAgain) — see tests/src/nrf52840_policy_tests.rs
-    ├── app.rs            # SensorApp: the full commissioning/event-loop
-    │                     # lifecycle (join/leave/rejoin, reporting, Identify,
-    │                     # button, durable checkpointing)
     └── main.rs           # Composition root: platform startup, resource
-                           # construction, hardware AES + identity guard,
-                           # then hands everything to app::SensorApp::run()
+                          # construction, hardware AES + identity guard,
+                          # battery-policy binding, then hands everything to
+                          # nrf_sensor_app::SensorApp::run()
 ```
+
+The lifecycle itself is **not** in this example. `SensorApp` (join/leave/
+rejoin, polling, reporting, Identify, button, durable checkpointing) and the
+host-tested poll-delay `policy` live in [`apps/nrf-sensor`](../../apps/nrf-sensor)
+and are shared byte-for-byte with `examples/nrf52833-sensor`; the host tests
+for `policy` are in `tests/src/nrf_sensor_policy_tests.rs`.
 
 ## Architecture
 
@@ -167,7 +170,10 @@ This example is a composition root only. Physical wiring, memory layout,
 persistence, and Zigbee protocol behavior are owned by separate crates:
 
 ```
-nrf52840-sensor (example)   startup, resource construction, event loop
+nrf52840-sensor (example)   startup, resource construction, policy binding
+        |
+nrf-sensor-app              full commissioning/event-loop lifecycle, shared
+        |                   with examples/nrf52833-sensor (apps/nrf-sensor)
         |
 nrf52840-sensor-product     identity, link/memory.x, security journal
         |                   partition, concrete profile (products/nrf52840-sensor)
@@ -183,3 +189,7 @@ curve (`src/battery.rs`) and the concrete Zigbee profile (`src/profile.rs`,
 built from the shared `zigbee_runtime::profile::TemperatureHumidityBattery`
 archetype). `boards/nrf52840-dk` only wires LED1, Button 1, and the sensor
 I2C bus pins, and has no dependency on `zigbee-runtime`.
+
+`link/memory.x` additionally carries link-time `ASSERT`s that fail the build
+if the application region is ever grown over the journal partition — the
+Rust-side `const` assertions in `src/storage.rs` check the same boundary.

@@ -16,6 +16,7 @@ zigbee-mac = { path = "../../zigbee-mac", features = ["nrf52840"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+nrf-sensor-app = { path = "../../apps/nrf-sensor" }
 nrf52840-dk = { path = "../../boards/nrf52840-dk" }
 nrf52840-sensor-product = { path = "../../products/nrf52840-sensor" }
 zigbee-bme280 = { package = "zigbee-bme280", path = "../../drivers/bme280", optional = true }
