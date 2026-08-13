@@ -34,11 +34,19 @@ Production join/interview timing is exported through the retained
 security reservation, `Device_annce`, network-up, TCLK completion, and the
 first Node/Active Endpoint/Simple Descriptor requests. The appended security
 diagnostics include Request-Key/Verify-Key attempts, the exact outgoing
-Verify-Key APS frame counter, Confirm-Key status/source/security fields, and
-ZDO response success/failure counters. Reading SRAM through SWire halts the
-CPU and is restart-intrusive on the tested programmer, so stop the acceptance
-capture before inspecting RAM or flash and treat every SWire read as another
-reset/resume test.
+Verify-Key count, the legacy APS security frame-counter field (zero for the
+R22-compliant APS-unsecured command), Confirm-Key status/source/security
+fields, and ZDO response success/failure counters. Reading SRAM through SWire
+halts the CPU and is restart-intrusive on the tested programmer, so stop the
+acceptance capture before inspecting RAM or flash and treat every SWire read as
+another reset/resume test.
+
+ZiGate v3.23 hardware acceptance confirms the corrected path on the first
+association: NWK-secured `Verify-Key` used APS frame control `0x41` with no APS
+auxiliary security header, ZiGate returned an authenticated successful
+`Confirm-Key`, and commissioning completed in 1.982 seconds without a Leave or
+reassociation. The legacy Verify-Key APS security-counter diagnostic remained
+zero.
 
 ### Receive-queue overload accounting
 

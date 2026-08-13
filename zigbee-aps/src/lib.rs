@@ -161,31 +161,19 @@ pub enum ApsAddress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApsSecurityHandshakeStats {
     pub verify_key_sent: u32,
+    /// Legacy APS security frame-counter diagnostic.
+    ///
+    /// R22 requires Verify-Key to be sent without APS encryption, so compliant
+    /// transmissions leave this at zero and do not consume the Trust Center
+    /// link key's outgoing security counter.
     pub last_verify_key_frame_counter: u32,
     pub last_verify_key_trust_center: zigbee_types::IeeeAddress,
     /// APS counter carried by the most recent Verify-Key transmission.
     ///
-    /// An APS acknowledgement echoes the counter of the frame it acknowledges
-    /// (R22 §2.2.5.1.1.5), so this is what identifies *the* acknowledgement of
-    /// this Verify-Key rather than of some other APS frame.
+    /// This is the ordinary one-octet APS sequence counter, not an APS security
+    /// frame counter. It is retained for wire diagnostics only; an
+    /// acknowledgement of Verify-Key is never proof of link-key possession.
     pub last_verify_key_aps_counter: u8,
-    /// Whether the most recent Verify-Key was encrypted with the *unique*
-    /// Trust Center link key rather than the global ZigBeeAlliance09 key.
-    pub last_verify_key_used_unique_key: bool,
-    /// Whether the most recent Verify-Key is still awaiting its APS
-    /// acknowledgement. Cleared when that acknowledgement authenticates, so
-    /// one transmission can never be counted twice.
-    pub verify_key_ack_outstanding: bool,
-    /// Authenticated APS acknowledgements of a Verify-Key sent under a unique
-    /// Trust Center link key.
-    ///
-    /// Counted only when the acknowledgement was APS-secured, decrypted and
-    /// MIC-verified under that same unique key, came from the Trust Center,
-    /// and echoed [`Self::last_verify_key_aps_counter`]. It is therefore
-    /// cryptographic proof that the Trust Center holds the unique key and
-    /// received that exact Verify-Key — it is *not* a substitute for a
-    /// Confirm-Key status.
-    pub verify_key_acks: u32,
     pub confirm_key_received: u32,
     pub confirm_key_successes: u32,
     pub confirm_key_rejections: u32,
@@ -216,9 +204,6 @@ impl Default for ApsSecurityHandshakeStats {
             last_verify_key_frame_counter: 0,
             last_verify_key_trust_center: [0u8; 8],
             last_verify_key_aps_counter: 0,
-            last_verify_key_used_unique_key: false,
-            verify_key_ack_outstanding: false,
-            verify_key_acks: 0,
             confirm_key_received: 0,
             confirm_key_successes: 0,
             confirm_key_rejections: 0,

@@ -4659,12 +4659,12 @@ fn bump_marker(addr: u32) {
 
 /// Bare-metal APS-Verify-Key sender.
 ///
-/// Builds: NWK-secured(APS-secured(VerifyKey || 0x04 || src_ieee || hash[16]))
+/// Builds: NWK-secured(APS-unsecured(VerifyKey || 0x04 || src_ieee || hash[16]))
 /// destined for the TC (0x0000).
 ///
 /// Marker layout (MODE-relative, audited free zone +0x148..+0x167):
 ///   +0x148  u32 entry counter
-///   +0x14C  u32 APS-encrypt OK counter
+///   +0x14C  u32 APS frame-built counter
 ///   +0x150  u32 NWK-encrypt OK counter
 ///   +0x154  u32 last MAC TX result (0=Ok, 0x8000_00xx=Err code)
 ///   +0x158  u32 attempt MAC result (0=Ok, 0x8000_00xx=Err code)
@@ -4680,11 +4680,9 @@ fn bump_marker(addr: u32) {
 fn send_verify_key_aps(
     mac: &mut Tlsr8258Mac,
     nwk_security: &mut NwkSecurity,
-    aps_security: &mut ApsSecurity,
     nwk_frame_counter: &mut u32,
     nwk_seq: &mut u8,
     aps_seq: &mut u8,
-    aps_fc_out: &mut u32,
     hash: &[u8; 16],
 ) -> Result<(), MacError> {
     bump_marker(DBG_MODE_BASE + 0x148);
@@ -4696,14 +4694,17 @@ fn send_verify_key_aps(
     plain[2..10].copy_from_slice(&mac.extended_address);
     plain[10..26].copy_from_slice(hash);
 
-    // ── APS header (Command, secured, ack-requested) ──
+    // ── APS header (Command, unsecured, ack-requested) ──
+    //
+    // R22 Table 4-7 and §4.4.7.1.3 require Verify-Key to omit APS
+    // encryption. The enclosing NWK frame below remains secured.
     let aps_counter = *aps_seq;
     let aps_header = ApsHeader {
         frame_control: ApsFrameControl {
             frame_type: ApsFrameType::Command as u8,
             delivery_mode: ApsDeliveryMode::Unicast as u8,
             ack_format: false,
-            security: true,
+            security: false,
             ack_request: true,
             extended_header: false,
         },
@@ -4717,35 +4718,14 @@ fn send_verify_key_aps(
     };
     *aps_seq = aps_seq.wrapping_add(1);
 
-    // ── APS aux header: ENC-MIC-32, key_id=Data(0=TC link), ext_nonce=1 ──
-    let aps_sec_hdr = ApsSecurityHeader {
-        security_control: SEC_LEVEL_ENC_MIC_32 | (KEY_ID_DATA_KEY << 3) | 0x20,
-        frame_counter: *aps_fc_out,
-        source_address: Some(mac.extended_address),
-        key_seq_number: None,
-    };
-    *aps_fc_out = aps_fc_out.wrapping_add(1);
-
     let mut aps_buf = [0u8; 64];
     let aps_hdr_len = aps_header.serialize(&mut aps_buf);
-    let aps_aux_len = aps_sec_hdr.serialize(&mut aps_buf[aps_hdr_len..]);
-    let aps_aad_end = aps_hdr_len + aps_aux_len;
-
-    let tc_key = *aps_security.default_tc_link_key();
-    let ct_mic = match aps_security.encrypt(&aps_buf[..aps_aad_end], &plain, &tc_key, &aps_sec_hdr)
-    {
-        Some(ct) => ct,
-        None => {
-            mark32(DBG_MODE_BASE + 0x154, 0x5A50FF01);
-            return Err(MacError::SecurityError);
-        }
-    };
-    bump_marker(DBG_MODE_BASE + 0x14C);
-    if aps_aad_end + ct_mic.len() > aps_buf.len() {
+    if aps_hdr_len + plain.len() > aps_buf.len() {
         return Err(MacError::FrameTooLong);
     }
-    aps_buf[aps_aad_end..aps_aad_end + ct_mic.len()].copy_from_slice(&ct_mic);
-    let aps_total = aps_aad_end + ct_mic.len();
+    aps_buf[aps_hdr_len..aps_hdr_len + plain.len()].copy_from_slice(&plain);
+    let aps_total = aps_hdr_len + plain.len();
+    bump_marker(DBG_MODE_BASE + 0x14C);
 
     // ── NWK header (secured, unicast to TC) ──
     let nwk_dst = ShortAddress(0x0000);
@@ -6456,7 +6436,6 @@ fn sensor_main() -> ! {
                         let persisted_frame_counter =
                             load_persisted_network_state(&mut nwk_security);
                         let mut aps_security = ApsSecurity::new();
-                        let mut aps_fc_out: u32 = 1; // Cycle 23: outgoing APS frame counter for TC link key
                         let mut nwk_frame_counter = persisted_frame_counter
                             .as_ref()
                             .map(|s| s.frame_counter)
@@ -6574,20 +6553,18 @@ fn sensor_main() -> ! {
 
                         // Step 4: APS Verify-Key (single attempt) with the
                         // spec-correct HMAC-MMO_{TC link key}(our_ieee_le) hash
-                        // per ZB-3.0 R22 §4.4.11.2 / §B.1.4. Per §4.4.10 ZHA
-                        // will not register the device until the VK ->
-                        // ConfirmKey handshake completes.
+                        // per ZB-3.0 R22 §4.4.7.1.3 / §4.5.3. The command is
+                        // APS-unencrypted and completion still requires the
+                        // Trust Center's Confirm-Key.
                         {
                             let tc_link_key = *aps_security.default_tc_link_key();
                             let vk_hash = derive_verify_key_hash(&tc_link_key);
                             let res = send_verify_key_aps(
                                 &mut mac,
                                 &mut nwk_security,
-                                &mut aps_security,
                                 &mut nwk_frame_counter,
                                 &mut nwk_seq,
                                 &mut aps_seq,
-                                &mut aps_fc_out,
                                 &vk_hash,
                             );
                             mark32(DBG_MODE_BASE + 0x158, mac_result_code(&res));

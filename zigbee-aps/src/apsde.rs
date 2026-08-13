@@ -1204,19 +1204,6 @@ impl<M: MacDriver> ApsLayer<M> {
                 }
             }
             ApsFrameType::Ack => {
-                // An APS acknowledgement echoes the counter of the frame it
-                // acknowledges, so a *secured* one that authenticates under an
-                // installed unique link key is cryptographic evidence about a
-                // specific outgoing frame. Record that before the generic
-                // pending-transmission bookkeeping.
-                self.note_incoming_aps_ack(
-                    nwk_src,
-                    header.aps_counter,
-                    aps_secured,
-                    aps_security_source,
-                    aps_key_identifier,
-                    aps_used_default_link_key,
-                );
                 if !self.confirm_ack(nwk_src.0, header.aps_counter) {
                     log::debug!(
                         "APS ACK received (counter={}) - no matching pending",
@@ -1374,64 +1361,6 @@ impl<M: MacDriver> ApsLayer<M> {
             aps_counter: header.aps_counter,
             command: false,
         });
-    }
-
-    /// Record an incoming APS acknowledgement that authenticates the last
-    /// Verify-Key transmission.
-    ///
-    /// Reaching this function already means the frame was APS-decrypted and
-    /// MIC-verified (`aps_decrypt_incoming` returns `None` otherwise), so the
-    /// remaining checks establish *which* key authenticated it and *which*
-    /// frame it acknowledges:
-    ///
-    /// - the acknowledgement was APS-secured with a data key,
-    /// - the key that authenticated it was an installed link key, not the
-    ///   global ZigBeeAlliance09 key (`aps_used_default_link_key == false`),
-    /// - it came from the Trust Center (short *and* extended address),
-    /// - the Verify-Key it acknowledges was itself sent under the unique key,
-    /// - it echoes that Verify-Key's APS counter (R22 §2.2.5.1.1.5), and
-    /// - that Verify-Key is still awaiting its first acknowledgement.
-    ///
-    /// The result proves the Trust Center possesses the unique link key and
-    /// received that exact Verify-Key. It is deliberately **not** treated as a
-    /// Confirm-Key: it carries no status field, so it can never turn an
-    /// explicit rejection into a success.
-    fn note_incoming_aps_ack(
-        &mut self,
-        nwk_src: ShortAddress,
-        aps_counter: u8,
-        aps_secured: bool,
-        aps_security_source: Option<IeeeAddress>,
-        aps_key_identifier: Option<u8>,
-        aps_used_default_link_key: bool,
-    ) {
-        if !aps_secured
-            || aps_used_default_link_key
-            || aps_key_identifier != Some(crate::security::KEY_ID_DATA_KEY)
-            || nwk_src != ShortAddress::COORDINATOR
-        {
-            return;
-        }
-        let Some(trust_center) = centralized_trust_center(self.aib.aps_trust_center_address) else {
-            return;
-        };
-        if aps_security_source != Some(trust_center) {
-            return;
-        }
-        let stats = &mut self.security_handshake_stats;
-        if !stats.verify_key_ack_outstanding
-            || !stats.last_verify_key_used_unique_key
-            || stats.last_verify_key_trust_center != trust_center
-            || stats.last_verify_key_aps_counter != aps_counter
-        {
-            return;
-        }
-        stats.verify_key_ack_outstanding = false;
-        stats.verify_key_acks = stats.verify_key_acks.wrapping_add(1);
-        log::info!(
-            "[APS] Verify-Key (APS counter {}) acknowledged under the unique Trust Center link key",
-            aps_counter,
-        );
     }
 
     /// Handle an incoming APS Confirm-Key command (R21+ §4.7.3.6).
@@ -1597,15 +1526,17 @@ impl<M: MacDriver> ApsLayer<M> {
     async fn send_unsecured_aps_command(
         &mut self,
         dst: ShortAddress,
+        ack_request: bool,
         cmd_payload: &[u8],
-    ) -> Result<(), ApsStatus> {
+    ) -> Result<u8, ApsStatus> {
+        let aps_counter = self.next_aps_counter();
         let aps_header = ApsHeader {
             frame_control: ApsFrameControl {
                 frame_type: ApsFrameType::Command as u8,
                 delivery_mode: ApsDeliveryMode::Unicast as u8,
                 ack_format: false,
                 security: false,
-                ack_request: false,
+                ack_request,
                 extended_header: false,
             },
             dst_endpoint: None,
@@ -1613,7 +1544,7 @@ impl<M: MacDriver> ApsLayer<M> {
             cluster_id: None,
             profile_id: None,
             src_endpoint: None,
-            aps_counter: self.next_aps_counter(),
+            aps_counter,
             extended_header: None,
         };
 
@@ -1628,7 +1559,7 @@ impl<M: MacDriver> ApsLayer<M> {
         self.nwk
             .nlde_data_request(dst, radius, &frame[..total], true, false)
             .await
-            .map(|_| ())
+            .map(|_| aps_counter)
             .map_err(nwk_status_to_aps)
     }
 
@@ -1688,8 +1619,9 @@ impl<M: MacDriver> ApsLayer<M> {
         }
 
         let nwk_only = self
-            .send_unsecured_aps_command(ShortAddress::COORDINATOR, &command)
-            .await;
+            .send_unsecured_aps_command(ShortAddress::COORDINATOR, false, &command)
+            .await
+            .map(|_| ());
         match (encrypted, nwk_only) {
             (Ok(()), Ok(())) => Ok(()),
             (Ok(()), Err(error)) => {
@@ -1794,8 +1726,9 @@ impl<M: MacDriver> ApsLayer<M> {
         };
         if key_type == 0x01 && *dst_ieee == BROADCAST_IEEE {
             return self
-                .send_unsecured_aps_command(ShortAddress::BROADCAST, &payload[..payload_len])
-                .await;
+                .send_unsecured_aps_command(ShortAddress::BROADCAST, false, &payload[..payload_len])
+                .await
+                .map(|_| ());
         }
 
         let (base_key, frame_counter) = self
@@ -1846,8 +1779,9 @@ impl<M: MacDriver> ApsLayer<M> {
         let payload = [crate::frames::ApsCommandId::SwitchKey as u8, key_seq_number];
         if *dst_ieee == BROADCAST_IEEE {
             return self
-                .send_unsecured_aps_command(ShortAddress::BROADCAST, &payload)
-                .await;
+                .send_unsecured_aps_command(ShortAddress::BROADCAST, false, &payload)
+                .await
+                .map(|_| ());
         }
         let local_ieee = self.nwk.nib().ieee_address;
         let (link_key, frame_counter) = self
@@ -1875,53 +1809,19 @@ impl<M: MacDriver> ApsLayer<M> {
         key_type: u8,
         hash: &[u8; 16],
     ) -> Result<(), ApsStatus> {
-        let (key, frame_counter) = self
-            .next_current_tc_link_key_material()
-            .ok_or(ApsStatus::SecurityFail)?;
-        self.send_verify_key_with_material(dst, src_ieee, key_type, hash, &key, frame_counter)
-            .await
-    }
-
-    async fn send_verify_key_with_material(
-        &mut self,
-        dst: ShortAddress,
-        src_ieee: &IeeeAddress,
-        key_type: u8,
-        hash: &[u8; 16],
-        key: &crate::security::AesKey,
-        frame_counter: u32,
-    ) -> Result<(), ApsStatus> {
         log::info!(
             "[APS] Sending Verify-Key to 0x{:04X} type={key_type}",
             dst.0
         );
         let payload = build_verify_key_command(src_ieee, key_type, hash);
-        // A Verify-Key is only ever answered by a *unique*-key Confirm-Key, so
-        // record which key encrypted it. `send_verify_key` may still fall back
-        // to the global ZigBeeAlliance09 key when no unique key is installed;
-        // an acknowledgement of that frame proves nothing about a unique key.
-        let used_unique_key = *key != *self.security.default_tc_link_key();
-        self.security_handshake_stats.last_verify_key_frame_counter = frame_counter;
-        self.security_handshake_stats
-            .last_verify_key_used_unique_key = used_unique_key;
-        self.security_handshake_stats.verify_key_ack_outstanding = false;
-        let aps_counter = self
-            .send_link_key_secured_command(
-                dst,
-                src_ieee,
-                key,
-                frame_counter,
-                crate::security::KEY_ID_DATA_KEY,
-                true,
-                true,
-                &payload,
-            )
-            .await?;
-        // Armed only after the transmit succeeded: a Verify-Key that never
-        // left cannot be acknowledged, and leaving the slot armed would let a
-        // stale counter match an unrelated acknowledgement.
+        // R22 Table 4-7 and §4.4.7.1.3 require Verify-Key to be APS
+        // unencrypted. The enclosing NWK frame remains secured. Retain the ACK
+        // request used by current coordinators for delivery reliability, but
+        // never treat that transport acknowledgement as proof of TCLK
+        // possession; only Confirm-Key carries the Trust Center verdict.
+        let aps_counter = self.send_unsecured_aps_command(dst, true, &payload).await?;
+        self.security_handshake_stats.last_verify_key_frame_counter = 0;
         self.security_handshake_stats.last_verify_key_aps_counter = aps_counter;
-        self.security_handshake_stats.verify_key_ack_outstanding = true;
         self.security_handshake_stats.verify_key_sent = self
             .security_handshake_stats
             .verify_key_sent
@@ -1931,7 +1831,9 @@ impl<M: MacDriver> ApsLayer<M> {
 
     /// Send APSME-VERIFY-KEY using the installed per-device Trust Center link
     /// key. BDB calls this only after Transport-Key installed that exact key;
-    /// falling back here would hash and encrypt with the wrong security state.
+    /// falling back here would hash with the wrong security state. The
+    /// resulting Verify-Key command itself is APS-unencrypted as required by
+    /// R22.
     pub async fn send_tc_verify_key(&mut self, tc_addr: ShortAddress) -> Result<(), ApsStatus> {
         let local_ieee = self.nwk.nib().ieee_address;
         let tc_ieee =
@@ -1941,22 +1843,11 @@ impl<M: MacDriver> ApsLayer<M> {
             .find_key(&tc_ieee, crate::security::ApsKeyType::TrustCenterLinkKey)
             .map(|entry| entry.key)
             .ok_or(ApsStatus::SecurityFail)?;
-        let frame_counter = self
-            .security
-            .next_frame_counter(&tc_ieee, crate::security::ApsKeyType::TrustCenterLinkKey)
-            .ok_or(ApsStatus::SecurityFail)?;
         let hash = crate::security::derive_verify_key_hash_with(self.nwk.mac_mut(), &tc_key)
             .ok_or(ApsStatus::SecurityFail)?;
         self.security_handshake_stats.last_verify_key_trust_center = tc_ieee;
-        self.send_verify_key_with_material(
-            tc_addr,
-            &local_ieee,
-            WIRE_KEY_TYPE_TC_LINK,
-            &hash,
-            &tc_key,
-            frame_counter,
-        )
-        .await
+        self.send_verify_key(tc_addr, &local_ieee, WIRE_KEY_TYPE_TC_LINK, &hash)
+            .await
     }
 
     fn next_default_tc_link_key_frame_counter(&mut self) -> Option<u32> {
@@ -2446,6 +2337,8 @@ mod tests {
     #[cfg(feature = "router")]
     const CHILD_IEEE: IeeeAddress = [0x30; 8];
     #[cfg(feature = "router")]
+    const UNIQUE_TCLK: crate::security::AesKey = [0x5C; 16];
+    #[cfg(feature = "router")]
     const LOCAL_SHORT: ShortAddress = ShortAddress(0x1111);
     #[cfg(feature = "router")]
     const CHILD_SHORT: ShortAddress = ShortAddress(0x2222);
@@ -2713,49 +2606,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn verify_key_frame_uses_data_key_security() {
-        let ieee = [0x25, 0x34, 0x36, 0x39, 0x33, 0x4E, 0x55, 0x02];
-        let hash = [
-            0x1A, 0xB1, 0x28, 0xDF, 0x16, 0x39, 0xA1, 0x24, 0x6A, 0xAB, 0xA7, 0x2A, 0x6A, 0x55,
-            0x91, 0x24,
-        ];
-        let command = build_verify_key_command(&ieee, 0x04, &hash);
-        let security = crate::security::ApsSecurity::new();
-        let mut frame = [0u8; 80];
-
-        let len = build_tc_secured_command_frame(
-            &security,
-            security.default_tc_link_key(),
-            &ieee,
-            0x5A,
-            0x0102_0304,
-            crate::security::KEY_ID_DATA_KEY,
-            true,
-            &command,
-            &mut frame,
-        )
-        .unwrap();
-
-        assert_eq!(
-            &frame[..len],
-            &[
-                0x61, 0x5A, 0x20, 0x04, 0x03, 0x02, 0x01, 0x25, 0x34, 0x36, 0x39, 0x33, 0x4E, 0x55,
-                0x02, 0x05, 0x0C, 0xAA, 0xF6, 0xA2, 0xAF, 0xE2, 0x3A, 0x0E, 0xF8, 0xC6, 0x1B, 0x66,
-                0x6B, 0xBE, 0xAA, 0x33, 0x6F, 0x9E, 0x24, 0xC4, 0xE7, 0x7E, 0x23, 0x3C, 0x74, 0xB0,
-                0x12, 0x60, 0x62,
-            ]
-        );
-
-        assert_secured_command_round_trip(
-            &security,
-            security.default_tc_link_key(),
-            crate::security::KEY_ID_DATA_KEY,
-            &frame[..len],
-            &command,
-        );
-    }
-
     fn assert_secured_command_round_trip(
         security: &crate::security::ApsSecurity,
         key: &crate::security::AesKey,
@@ -2910,7 +2760,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "router")]
-    fn tc_verify_key_requires_the_installed_key_and_uses_its_counter() {
+    fn tc_verify_key_is_aps_unsecured_and_does_not_consume_the_tclk_counter() {
         let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
         aps.aib_mut().aps_trust_center_address = TC_IEEE;
         assert_eq!(
@@ -2926,7 +2776,9 @@ mod tests {
                 key,
                 key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
                 outgoing_frame_counter: 0x1234,
-                outgoing_frame_counter_limit: 0x1800,
+                // Verify-Key must still send at the limit because it has no
+                // APS auxiliary security header and spends no TCLK counter.
+                outgoing_frame_counter_limit: 0x1234,
                 incoming_frame_counter: 0,
                 incoming_frame_counter_valid: false,
             })
@@ -2935,19 +2787,45 @@ mod tests {
         block_on(aps.send_tc_verify_key(ShortAddress::COORDINATOR)).unwrap();
         let history = aps.nwk().mac().tx_history();
         assert_eq!(history.len(), 1);
+        let (nwk_header, _) =
+            zigbee_nwk::frames::NwkHeader::parse(history[0].payload.as_slice()).unwrap();
+        assert!(nwk_header.frame_control.security);
+
         let frame = nwk_payload(&history[0]);
-        let (_, header_len) = ApsHeader::parse(&frame).unwrap();
-        let (security_header, _) =
-            crate::security::ApsSecurityHeader::parse(&frame[header_len..]).unwrap();
-        assert_eq!(security_header.frame_counter, 0x1234);
+        let (header, header_len) = ApsHeader::parse(&frame).unwrap();
+        assert_eq!(header_len, 2);
+        assert_eq!(frame[0], 0x41);
+        assert_eq!(
+            ApsFrameType::from_u8(header.frame_control.frame_type),
+            Some(ApsFrameType::Command)
+        );
+        assert_eq!(
+            ApsDeliveryMode::from_u8(header.frame_control.delivery_mode),
+            Some(ApsDeliveryMode::Unicast)
+        );
+        assert!(!header.frame_control.security);
+        assert!(header.frame_control.ack_request);
+        let hash = crate::security::derive_verify_key_hash(&key);
+        assert_eq!(
+            &frame[header_len..],
+            &build_verify_key_command(&LOCAL_IEEE, WIRE_KEY_TYPE_TC_LINK, &hash)
+        );
+        assert_eq!(frame.len(), 28);
+
+        let key_entry = aps
+            .security()
+            .find_key(&TC_IEEE, crate::security::ApsKeyType::TrustCenterLinkKey)
+            .unwrap();
+        assert_eq!(key_entry.outgoing_frame_counter, 0x1234);
         assert_eq!(
             aps.security_handshake_stats().last_verify_key_frame_counter,
-            0x1234
+            0
         );
         assert_eq!(
             aps.security_handshake_stats().last_verify_key_trust_center,
             TC_IEEE
         );
+        assert_eq!(aps.security_handshake_stats().verify_key_sent, 1);
     }
 
     #[test]
@@ -3788,277 +3666,6 @@ mod tests {
         assert!(
             aps.pending_aps_ack.is_none(),
             "an ACK that cannot be network-secured must not be queued"
-        );
-    }
-
-    // ── Verify-Key acknowledgement (ZiGate v3.23 compatibility) ──
-
-    /// Build the *secured command-format* APS acknowledgement layout captured
-    /// in `zigbee-join.pcap` frame 464: frame control `0x32`, the echoed APS
-    /// counter, a five-octet auxiliary security header (data key, no extended
-    /// nonce) and a MIC over a zero-length payload.
-    #[cfg(feature = "router")]
-    fn build_secured_command_ack(
-        security: &crate::security::ApsSecurity,
-        link_key: &crate::security::AesKey,
-        source_ieee: &IeeeAddress,
-        aps_counter: u8,
-        frame_counter: u32,
-        frame: &mut [u8],
-    ) -> usize {
-        let header = ApsHeader {
-            frame_control: ApsFrameControl {
-                frame_type: ApsFrameType::Ack as u8,
-                delivery_mode: ApsDeliveryMode::Unicast as u8,
-                ack_format: true,
-                security: true,
-                ack_request: false,
-                extended_header: false,
-            },
-            dst_endpoint: None,
-            group_address: None,
-            cluster_id: None,
-            profile_id: None,
-            src_endpoint: None,
-            aps_counter,
-            extended_header: None,
-        };
-        // No extended nonce on the wire (matching the capture): the receiver
-        // resolves the source IEEE from the NWK source / Trust Center address.
-        let wire_header = crate::security::ApsSecurityHeader {
-            security_control: crate::security::KEY_ID_DATA_KEY << 3,
-            frame_counter,
-            source_address: None,
-            key_seq_number: None,
-        };
-        let header_len = header.serialize(frame);
-        let aux_len = wire_header.serialize(&mut frame[header_len..]);
-        let aad_len = header_len + aux_len;
-        assert_eq!(aad_len, 7, "2-octet header + 5-octet auxiliary header");
-
-        let mut authenticated = [0u8; 16];
-        authenticated[..aad_len].copy_from_slice(&frame[..aad_len]);
-        authenticated[header_len] |= crate::security::SEC_LEVEL_ENC_MIC_32;
-
-        // The CCM* nonce always uses the sender IEEE even when the frame omits
-        // it from the auxiliary header.
-        let nonce_header = crate::security::ApsSecurityHeader {
-            security_control: crate::security::KEY_ID_DATA_KEY << 3,
-            frame_counter,
-            source_address: Some(*source_ieee),
-            key_seq_number: None,
-        };
-        let encrypted = security
-            .encrypt(&authenticated[..aad_len], &[], link_key, &nonce_header)
-            .expect("CCM* over an empty payload");
-        assert_eq!(encrypted.len(), 4, "MIC-32 only");
-        frame[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
-        aad_len + encrypted.len()
-    }
-
-    #[cfg(feature = "router")]
-    const UNIQUE_TCLK: crate::security::AesKey = [0x5C; 16];
-
-    /// Install a unique Trust Center link key and send a Verify-Key under it,
-    /// returning the APS counter the Verify-Key went out with.
-    #[cfg(feature = "router")]
-    fn send_unique_key_verify_key(aps: &mut ApsLayer<MockMac>) -> u8 {
-        aps.aib_mut().aps_trust_center_address = TC_IEEE;
-        aps.security_mut()
-            .add_key(crate::security::ApsLinkKeyEntry {
-                partner_address: TC_IEEE,
-                key: UNIQUE_TCLK,
-                key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
-                outgoing_frame_counter: 0,
-                outgoing_frame_counter_limit: 0x1000,
-                incoming_frame_counter: 0,
-                incoming_frame_counter_valid: false,
-            })
-            .unwrap();
-        block_on(aps.send_tc_verify_key(ShortAddress::COORDINATOR)).unwrap();
-        let stats = aps.security_handshake_stats();
-        assert!(stats.last_verify_key_used_unique_key);
-        assert!(stats.verify_key_ack_outstanding);
-        stats.last_verify_key_aps_counter
-    }
-
-    /// The ZiGate v3.23 answer to our Verify-Key (capture 2026-08-09, frames
-    /// 462 → 464): a secured command-format APS ACK echoing the Verify-Key's
-    /// APS counter, encrypted under the unique Trust Center link key. It
-    /// authenticates, and is recorded as proof that the Trust Center holds
-    /// that key and received that exact Verify-Key.
-    #[test]
-    #[cfg(feature = "router")]
-    fn an_authenticated_unique_key_ack_of_verify_key_is_recorded() {
-        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
-        let verify_counter = send_unique_key_verify_key(&mut aps);
-        assert_eq!(aps.security_handshake_stats().verify_key_acks, 0);
-
-        let tc_security = crate::security::ApsSecurity::new();
-        let mut frame = [0u8; 32];
-        let len = build_secured_command_ack(
-            &tc_security,
-            &UNIQUE_TCLK,
-            &TC_IEEE,
-            verify_counter,
-            0x0000_0322,
-            &mut frame,
-        );
-        assert_eq!(len, 11, "the captured ZiGate ACK is 11 octets");
-
-        let mut buf = ApsFrameBuffer::new();
-        assert!(
-            aps.process_incoming_aps_frame(
-                &frame[..len],
-                ShortAddress::COORDINATOR,
-                LOCAL_SHORT,
-                180,
-                IncomingNwkSecurity::new(true, Some(TC_IEEE)),
-                &mut buf,
-            )
-            .is_none(),
-            "an ACK never surfaces as a data indication"
-        );
-
-        let stats = aps.security_handshake_stats();
-        assert_eq!(
-            stats.verify_key_acks, 1,
-            "the authenticated ACK of our Verify-Key must be recorded"
-        );
-        assert!(
-            !stats.verify_key_ack_outstanding,
-            "the outstanding slot is cleared so one transmission counts once"
-        );
-        assert_eq!(
-            stats.confirm_key_received, 0,
-            "an acknowledgement is never a Confirm-Key"
-        );
-    }
-
-    /// A secured ACK with the *wrong* APS counter belongs to some other frame
-    /// and must not be mistaken for the Verify-Key's acknowledgement.
-    #[test]
-    #[cfg(feature = "router")]
-    fn a_unique_key_ack_for_another_aps_counter_is_ignored() {
-        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
-        let verify_counter = send_unique_key_verify_key(&mut aps);
-
-        let tc_security = crate::security::ApsSecurity::new();
-        let mut frame = [0u8; 32];
-        let len = build_secured_command_ack(
-            &tc_security,
-            &UNIQUE_TCLK,
-            &TC_IEEE,
-            verify_counter.wrapping_add(1),
-            0x0000_0322,
-            &mut frame,
-        );
-
-        let mut buf = ApsFrameBuffer::new();
-        let _ = aps.process_incoming_aps_frame(
-            &frame[..len],
-            ShortAddress::COORDINATOR,
-            LOCAL_SHORT,
-            180,
-            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
-            &mut buf,
-        );
-        assert_eq!(aps.security_handshake_stats().verify_key_acks, 0);
-        assert!(aps.security_handshake_stats().verify_key_ack_outstanding);
-    }
-
-    /// An *unsecured* ACK proves nothing: anyone can emit one. It must never
-    /// count, however well its APS counter matches.
-    #[test]
-    #[cfg(feature = "router")]
-    fn an_unsecured_ack_of_verify_key_is_not_proof() {
-        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
-        let verify_counter = send_unique_key_verify_key(&mut aps);
-
-        let header = ApsHeader {
-            frame_control: ApsFrameControl {
-                frame_type: ApsFrameType::Ack as u8,
-                delivery_mode: ApsDeliveryMode::Unicast as u8,
-                ack_format: true,
-                security: false,
-                ack_request: false,
-                extended_header: false,
-            },
-            dst_endpoint: None,
-            group_address: None,
-            cluster_id: None,
-            profile_id: None,
-            src_endpoint: None,
-            aps_counter: verify_counter,
-            extended_header: None,
-        };
-        let mut frame = [0u8; 8];
-        let len = header.serialize(&mut frame);
-
-        let mut buf = ApsFrameBuffer::new();
-        let _ = aps.process_incoming_aps_frame(
-            &frame[..len],
-            ShortAddress::COORDINATOR,
-            LOCAL_SHORT,
-            180,
-            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
-            &mut buf,
-        );
-        assert_eq!(aps.security_handshake_stats().verify_key_acks, 0);
-        assert!(aps.security_handshake_stats().verify_key_ack_outstanding);
-    }
-
-    /// A Verify-Key sent under the *global* ZigBeeAlliance09 key can be
-    /// acknowledged by any device holding that well-known key, so its
-    /// acknowledgement is never proof of a unique key.
-    #[test]
-    #[cfg(feature = "router")]
-    fn an_ack_of_a_global_key_verify_key_is_not_proof() {
-        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
-        aps.aib_mut().aps_trust_center_address = TC_IEEE;
-        let global_key = *aps.security().default_tc_link_key();
-        block_on(aps.send_tc_verify_key(ShortAddress::COORDINATOR)).unwrap_err();
-        // No TCLK entry at all: fall back to the generic Verify-Key path,
-        // which uses the global key.
-        let hash = crate::security::derive_verify_key_hash(&global_key);
-        block_on(aps.send_verify_key(
-            ShortAddress::COORDINATOR,
-            &LOCAL_IEEE,
-            WIRE_KEY_TYPE_TC_LINK,
-            &hash,
-        ))
-        .unwrap();
-        let stats = aps.security_handshake_stats();
-        assert!(
-            !stats.last_verify_key_used_unique_key,
-            "a global-key Verify-Key must be flagged as such"
-        );
-        let verify_counter = stats.last_verify_key_aps_counter;
-
-        let tc_security = crate::security::ApsSecurity::new();
-        let mut frame = [0u8; 32];
-        let len = build_secured_command_ack(
-            &tc_security,
-            &global_key,
-            &TC_IEEE,
-            verify_counter,
-            0x0000_0500,
-            &mut frame,
-        );
-
-        let mut buf = ApsFrameBuffer::new();
-        let _ = aps.process_incoming_aps_frame(
-            &frame[..len],
-            ShortAddress::COORDINATOR,
-            LOCAL_SHORT,
-            180,
-            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
-            &mut buf,
-        );
-        assert_eq!(
-            aps.security_handshake_stats().verify_key_acks,
-            0,
-            "ZigBeeAlliance09 can never establish unique-key possession"
         );
     }
 

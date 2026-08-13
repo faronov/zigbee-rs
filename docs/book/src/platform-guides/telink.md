@@ -298,8 +298,8 @@ The TB-04 parent-router image passed the following channel-15 acceptance run:
 - association, Transport-Key installation, NWK CCM*, APS CCM*, and secured
   Device Announcement completed;
 - Request-Key, unique-TCLK installation, AES-MMO Verify-Key, and Confirm-Key
-  each succeeded once with no rejection; the Verify-Key frame counter was
-  173,066;
+  each succeeded once with no rejection in the pre-fix image; its legacy
+  APS-secured Verify-Key used frame counter 173,066;
 - Node, Active Endpoint, and Simple Descriptor requests completed, followed
   by Basic and Identify traffic and ZHA availability;
 - the successful commissioning completed in 2.551 seconds and the capture
@@ -326,6 +326,11 @@ from short address `0x7AF5` to `0x6131`. The second TCLK exchange completed in
 from 225,291 to 227,339. This run used ZHA state plus on-device RAM metrics,
 not an independent packet capture, so it is regression evidence rather than
 a substitute for the ZiGate capture gate below.
+
+Those runs remain valid hardware-AES and runtime evidence. The corrected
+APS-unsecured Verify-Key wire format now also has the fresh ZiGate
+commissioning capture described below; reset/resume remains covered by the
+earlier hardware-AES acceptance run.
 
 ### Safe recommissioning procedure
 
@@ -371,57 +376,69 @@ and lists `Fix HATransportKey function (Device Authentification)`; current
 `v3.23` retains the fix. Check the radio version with ZiGate command `0x0010`
 and response `0x8010` before debugging the device.
 
-The exact failing stage and the key used by ZiGate's closed ZPS library for
-Confirm-Key are not established by its public source. Do not add a
-`ZigBeeAlliance09` fallback for Confirm-Key: that public key cannot prove
-possession of the negotiated pairwise TCLK. Diagnose with an independent
-capture plus `SteeringDiagnostics`:
+Do not add a `ZigBeeAlliance09` fallback for Confirm-Key: that public key
+cannot prove possession of the negotiated pairwise TCLK. Diagnose with an
+independent capture plus `SteeringDiagnostics`:
 
 - Request-Key sent late or a coordinator Leave near 15 seconds indicates the
   coordinator authentication timeout;
-- Verify-Key sent but no decryptable Confirm-Key requires an on-air key check;
+- Verify-Key must have APS frame control `0x41`: command, unicast,
+  acknowledgement requested, APS security disabled;
+- a non-zero legacy `last_verify_key_frame_counter` means the sender consumed a
+  TCLK APS security counter and emitted the wrong wire format;
 - a decrypted Confirm-Key with `confirm_key_rejections > 0` identifies a
   field/source validation mismatch rather than a MIC/key-selection failure.
 
-### ZiGate v3.23 rejoin cycle — what the 2026-08-09 capture proves
+### ZiGate v3.23 Verify-Key wire-format isolation
 
-A ZiGate `v3.23` run against a TLSR8258 plug (IEEE `02:95:cf:76:15:2d:1f:56`)
-showed a repeating cycle: join, a mostly successful z2m interview, `device
-left` roughly 15 seconds after the join, then an immediate rejoin — three times
-in one capture. The capture settles what is actually happening:
+The decisive 2026-08-13 channel-15 capture contains a successful factory IKEA
+join and the first clean TLSR8258 attempt in the same ZiGate network:
 
-- ZiGate transports a **unique** TCLK, and our `Verify-Key` hashes are
-  cryptographically correct and encrypted under that unique key.
-- Every `Verify-Key` we send sets `ack_request = 1`, and ZiGate answers within
-  13–63 ms with a **secured command-format APS acknowledgement** — frame
-  control `0x32`, `ack_format = 1`, no endpoint/cluster/profile fields, the
-  same APS counter. The pre-fix parser misread that layout as a data
-  acknowledgement.
-- ZiGate **never** emits `Confirm-Key` (`0x10`).
-- The Leave is **ours**: a broadcast NWK Leave with `Request = 0` at ~15.15 s
-  and ~15.20 s, i.e. our own strict TCLK deadline
-  (`TCLK_EXCHANGE_DEADLINE_US`) firing. Coordinator eviction is refuted.
-- ZiGate's `Transport-Key` commands all carry `ack_request = 0`. Any earlier
-  claim that a missing device acknowledgement of `Transport-Key`/`Confirm-Key`
-  caused eviction is **false**.
+- IKEA sends `Verify-Key` with APS frame control `0x41`: command, unicast,
+  acknowledgement requested, **APS security disabled**. ZiGate validates the
+  hash and sends `Confirm-Key`.
+- TLSR8258 sent the same semantic command with `0x61`: the APS security bit was
+  set and a Data-Key auxiliary header/MIC followed. ZiGate acknowledged the
+  frame but never entered its Verify-Key hash-validation callback and never
+  sent `Confirm-Key`.
+- Command ID `0x0F`, key type `0x04`, source IEEE address, hash, destination,
+  and timing were otherwise correct.
 
-Two fixes follow, and they are independent:
+This matches R22 Table 4-7 and §4.4.7.1.3: `Verify-Key` **shall not be APS
+encrypted**. The implementation now:
 
-1. **APS acknowledgement format.** `ApsHeader` now honours `ack_format` on both
-   parse and serialise, so ZiGate's secured command-format acknowledgement is
-   recognised. Generating a command-format acknowledgement for an APS command
-   that requests one is kept as generic R22 conformance hardening — it is not
-   the ZiGate root cause, because that coordinator never asks for one.
-2. **ACK-gated deferred TCLK retry.** When a unique TCLK was installed, the
-   `Verify-Key` was sent under it, and the matching secured acknowledgement
-   authenticated under that same key, BDB no longer leaves the network merely
-   because `Confirm-Key` is absent. It keeps the joined network and runs
-   bounded deferred `Verify-Key` rounds. An explicit `Confirm-Key` rejection,
-   or a persistence error, still hard-fails, and no `ZigBeeAlliance09`
-   `Confirm-Key` is ever accepted. See
-   [BDB commissioning](../core-concepts/bdb.md).
+1. sends `Verify-Key` as `0x41`, inside a secured NWK frame, with no APS
+   auxiliary security header or MIC;
+2. computes the hash from the installed unique TCLK but does not consume that
+   key's outgoing APS security counter;
+3. treats any APS acknowledgement as delivery feedback only — commissioning
+   requires an authenticated successful `Confirm-Key`; and
+4. uses the normal 300 ms delay and Node Descriptor probe again; the
+   timing-only fast diagnostic policy was removed.
 
-The same capture also shows the `Simple_Desc_req` for `0x83a6`/endpoint 1
+The older 2026-08-09 capture remains useful proof that command-format APS ACKs
+must parse according to `ack_format`, but its ACK cannot be used as proof of
+unique-key possession.
+
+A fresh first-attempt ZiGate v3.23 acceptance capture now closes this gate:
+
+- the router associated once as `0x7329`, with no Leave or second Association
+  Request in the capture;
+- frame 4885 is the router's NWK-secured `Verify-Key` with APS frame control
+  `0x41`, no APS auxiliary security header, and no APS MIC;
+- ZiGate returned the command-format APS ACK in frame 4889 and an APS-secured
+  successful `Confirm-Key` in frame 4891, 31.566 ms after `Verify-Key`;
+- ZiGate's sanitized diagnostic counters recorded one completed hash
+  validation and one successful Confirm-Key send;
+- `TELINK_JOIN_METRICS` recorded one Request-Key, one Verify-Key, one
+  authenticated successful Confirm-Key, TCLK completion at 1.971 s, full
+  commissioning at 1.982 s, and a zero legacy Verify-Key APS security counter.
+
+The capture contains 7,481 packets over 209.336444 seconds and has SHA-256
+`fd649cafadb9aa94526fe4aab24d5ce8fd6ecf5a7680ffeb722b541a78409b91`.
+
+The older 2026-08-09 capture also shows the `Simple_Desc_req` for
+`0x83a6`/endpoint 1
 (frame 1001) being received and APS-acknowledged while no `Simple_Desc_rsp`
 (`0x8004`) ever reaches the coordinator, which is the z2m timeout on cluster
 32772. Host tests prove the ZDO dispatcher always produces that response, so

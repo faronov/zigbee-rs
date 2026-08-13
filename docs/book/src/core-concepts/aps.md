@@ -682,16 +682,16 @@ Acknowledging is a *reception* acknowledgement, not acceptance:
 - a request whose application-level response later fails to build or transmit
   is still acknowledged.
 
-Command acknowledgement generation is plain R22 conformance. It is **not** a
-workaround for any particular Trust Center: in the 2026-08-09 ZiGate v3.23
-capture every `Transport-Key` and `Confirm-Key` from that coordinator carries
-`ack_request = 0`, so it never waited on an acknowledgement from the joining
-node. Coordinators that do set the bit need this path.
+Command acknowledgement generation is retained for coordinators that set the
+bit. R22's general acknowledgement machinery defines this format, while
+R22 §4.4.10 normally sets the bit to zero on APS commands; later revisions and
+real devices use acknowledged unicast commands.
 
 ### Receiving a secured command-format acknowledgement
 
-A Trust Center may *send* the command format APS-secured. ZiGate v3.23
-acknowledges our `Verify-Key` 13–63 ms later with frame control `0x32`:
+A peer may send the command acknowledgement itself APS-secured. A ZiGate v3.23
+capture of the old, incorrectly APS-secured `Verify-Key` path contained frame
+control `0x32`:
 
 ```text
 0x32  Ack frame type, unicast delivery, ack_format = 1, security = 1
@@ -706,13 +706,27 @@ Eleven octets in total. Parsing it correctly depends entirely on
 security header as endpoint/cluster/profile fields, and the acknowledgement
 then never matches the frame that caused it.
 
-Because it authenticates under the installed link key, such an acknowledgement
-is evidence about a *specific* outgoing frame. When it authenticates under a
-unique Trust Center link key and echoes the APS counter of a `Verify-Key` sent
-under that same key, the APS layer records it
-(`ApsSecurityHandshakeStats::verify_key_acks`) and BDB uses it — see
-[BDB commissioning](./bdb.md). It is never treated as a Confirm-Key: it carries
-no status field.
+Correct parsing remains necessary for generic APS reliability, but an
+acknowledgement is only evidence of frame reception. It carries no Verify-Key
+hash-validation result and can never complete Trust Center link-key
+verification.
+
+R22 Table 4-7 and §4.4.7.1.3 require `Verify-Key` itself to be **APS
+unencrypted**. The stack therefore sends the command as:
+
+```text
+0x41  command, unicast, APS security = 0, acknowledgement requested
+....  APS counter
+0x0F  Verify-Key
+0x04  Trust Center link-key type
+....  local IEEE address and 16-byte keyed hash
+```
+
+The enclosing NWK frame remains secured. There is no APS auxiliary security
+header or MIC, and the unique TCLK outgoing security counter is not consumed.
+The acknowledgement-request bit is retained for deployed-device
+interoperability, but BDB waits for an authenticated successful `Confirm-Key`
+before committing commissioning.
 
 ## Putting It Together
 

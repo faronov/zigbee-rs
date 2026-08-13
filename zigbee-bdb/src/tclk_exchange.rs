@@ -73,28 +73,9 @@ pub(crate) const TCLK_VERIFY_KEY_TIMEOUT_US: u32 = 5_000_000;
 /// Overall deadline for the whole post-announce handshake.
 ///
 /// Measured from the moment the exchange is armed. Expiry is a strict failure:
-/// the exchange never silently keeps running or defers success.
-///
-/// The one exception is the ACK-gated deferred retry below, which re-arms this
-/// deadline for each bounded deferred round. It is entered only on
-/// cryptographic proof (see [`TCLK_DEFERRED_ROUNDS`]), never on a timeout
-/// alone.
+/// the exchange never silently keeps running or converts a transport
+/// acknowledgement into key-verification success.
 pub(crate) const TCLK_EXCHANGE_DEADLINE_US: u32 = 15_000_000;
-
-/// Spacing between two ACK-gated deferred Verify-Key rounds.
-///
-/// GSDK's `update-tc-link-key` plugin re-runs the procedure from a scheduled
-/// event rather than failing the network when a Confirm-Key does not arrive;
-/// this is the equivalent scheduled gap.
-pub(crate) const TCLK_DEFERRED_RETRY_INTERVAL_US: u32 = 10_000_000;
-
-/// Bounded number of deferred Verify-Key rounds.
-///
-/// Each round re-arms the Verify-Key budget and the overall deadline, so the
-/// whole compatibility path is bounded by
-/// `TCLK_DEFERRED_ROUNDS * (TCLK_DEFERRED_RETRY_INTERVAL_US +
-/// TCLK_EXCHANGE_DEADLINE_US)` and can never run forever.
-pub(crate) const TCLK_DEFERRED_ROUNDS: u8 = 2;
 
 /// Worst-case duration of the *first* pass through every stage.
 ///
@@ -147,12 +128,6 @@ pub enum TclkStage {
     RetryVerifyKey,
     /// Await a successful Confirm-Key from the Trust Center.
     AwaitConfirmKey,
-    /// Wait out the scheduled gap before another ACK-gated Verify-Key round.
-    ///
-    /// Only reachable when the Trust Center authenticated an APS
-    /// acknowledgement of our Verify-Key under the *unique* link key and never
-    /// sent any Confirm-Key at all. The network stays joined across this stage.
-    DeferredVerify,
     /// Terminal: exchange completed (pre-R21 or confirmed unique key).
     Complete,
     /// Terminal: exchange failed (deadline or an exhausted message budget).
@@ -170,7 +145,6 @@ impl TclkStage {
             Self::SendNodeDesc | Self::AwaitNodeDesc => TCLK_NODE_DESC_TIMEOUT_US,
             Self::SendRequestKey | Self::AwaitTclk => TCLK_REQUEST_KEY_TIMEOUT_US,
             Self::SendVerifyKey | Self::AwaitConfirmKey => TCLK_VERIFY_KEY_TIMEOUT_US,
-            Self::DeferredVerify => TCLK_DEFERRED_RETRY_INTERVAL_US,
             Self::Complete | Self::Failed => TCLK_EXCHANGE_DEADLINE_US,
         }
     }
@@ -215,21 +189,7 @@ pub struct TclkExchange {
     pub(crate) node_desc_slot: Option<usize>,
     pub(crate) confirm_success_baseline: u32,
     pub(crate) confirm_reject_baseline: u32,
-    /// `ApsSecurityHandshakeStats::confirm_key_received` when the exchange was
-    /// armed.
-    ///
-    /// The ACK-gated deferred retry is only for a Trust Center that sends *no*
-    /// Confirm-Key at all. Any Confirm-Key received during this exchange —
-    /// accepted or rejected — moves this counter and closes that path, so an
-    /// explicit rejection always reaches the normal hard failure.
-    pub(crate) confirm_received_baseline: u32,
-    /// `ApsSecurityHandshakeStats::verify_key_acks` when the exchange was
-    /// armed. The deferred path requires this counter to have moved.
-    pub(crate) verify_ack_baseline: u32,
-    /// Remaining ACK-gated deferred Verify-Key rounds.
-    pub(crate) deferred_rounds: u8,
-    /// Whether the exchange has entered ACK-gated deferred compatibility mode.
-    pub(crate) deferred: bool,
+    pub(crate) verify_key_was_sent: bool,
 }
 
 impl TclkExchange {
@@ -249,10 +209,7 @@ impl TclkExchange {
             node_desc_slot: None,
             confirm_success_baseline: 0,
             confirm_reject_baseline: 0,
-            confirm_received_baseline: 0,
-            verify_ack_baseline: 0,
-            deferred_rounds: TCLK_DEFERRED_ROUNDS,
-            deferred: false,
+            verify_key_was_sent: false,
         }
     }
 
@@ -268,25 +225,6 @@ impl TclkExchange {
     ) {
         self.confirm_success_baseline = stats.confirm_key_successes;
         self.confirm_reject_baseline = stats.confirm_key_rejections;
-        self.confirm_received_baseline = stats.confirm_key_received;
-        self.verify_ack_baseline = stats.verify_key_acks;
-    }
-
-    /// Re-arm the overall deadline and the Verify-Key budget for one bounded
-    /// deferred round, consuming that round.
-    ///
-    /// Returns `false` when no deferred round is left, so the caller must
-    /// finalise instead of deferring again.
-    pub(crate) fn take_deferred_round(&mut self, now: u32) -> bool {
-        if self.deferred_rounds == 0 {
-            return false;
-        }
-        self.deferred_rounds -= 1;
-        self.deferred = true;
-        self.armed_at_us = now;
-        self.reset_verify_key_budget();
-        self.enter(TclkStage::DeferredVerify, now);
-        true
     }
 
     /// Whether the post-announce start delay has elapsed.
@@ -336,6 +274,16 @@ impl TclkExchange {
         self.verify_key_budget > 0
     }
 
+    /// Whether at least one Verify-Key transmission succeeded for this key.
+    pub(crate) fn verify_key_was_sent(&self) -> bool {
+        self.verify_key_was_sent
+    }
+
+    /// Record a successful Verify-Key transmission.
+    pub(crate) fn mark_verify_key_sent(&mut self) {
+        self.verify_key_was_sent = true;
+    }
+
     /// Whether another Request-Key transmission is still allowed.
     pub(crate) fn has_request_key_attempt(&self) -> bool {
         self.request_key_budget > 0
@@ -348,6 +296,7 @@ impl TclkExchange {
     /// budget for the replacement key.
     pub(crate) fn reset_verify_key_budget(&mut self) {
         self.verify_key_budget = TCLK_MESSAGE_ATTEMPTS;
+        self.verify_key_was_sent = false;
     }
 
     fn take(budget: &mut u8) -> bool {
