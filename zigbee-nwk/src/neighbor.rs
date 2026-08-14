@@ -53,8 +53,27 @@ pub struct NeighborEntry {
     pub relationship: Relationship,
     /// Link Quality Indicator (rolling average)
     pub lqi: u8,
-    /// Outgoing cost (1-7, derived from LQI)
+    /// Incoming cost (1-7) — this device's own estimate of the cost of the
+    /// link *from* this neighbor, derived from [`Self::lqi`] (R22 §3.6.3.1).
+    ///
+    /// This is the value advertised in the incoming-cost field of a Link
+    /// Status entry naming this neighbor (R22 §3.4.8.3.2).
+    pub incoming_cost: u8,
+    /// Outgoing cost (0-7) — the cost of the link *to* this neighbor, as
+    /// measured by the neighbor itself (R22 §3.6.1.5).
+    ///
+    /// Only ever written from a received Link Status command that names this
+    /// device, or reset to `0` by router aging. `0` means "no Link Status
+    /// listing this device has been received", which R22 §3.6.3.5.2 treats as
+    /// "this link may not be used for many-to-one or symmetric-link routing".
     pub outgoing_cost: u8,
+    /// Number of `nwkLinkStatusPeriod` intervals since the last Link Status
+    /// command frame was received from this neighbor (R22 §3.6.1.5), saturated
+    /// at [`ROUTER_AGE_LIMIT`] + 1.
+    ///
+    /// Separate from [`Self::age`], which counts seconds and drives neighbor
+    /// eviction ordering and provisional-child expiry.
+    pub link_status_age: u8,
     /// Network depth of the neighbor
     pub depth: u8,
     /// Permit joining (for routers/coordinator)
@@ -105,7 +124,9 @@ impl NeighborEntry {
             security_capable: false,
             relationship: Relationship::Sibling,
             lqi: 0,
-            outgoing_cost: 7,
+            incoming_cost: link_cost_from_lqi(0),
+            outgoing_cost: 0,
+            link_status_age: 0,
             depth: 0,
             permit_joining: false,
             age: 0,
@@ -126,9 +147,38 @@ impl NeighborEntry {
         e
     }
 
-    /// Calculate outgoing cost from LQI (Zigbee spec Section 3.6.3.1).
-    pub fn update_cost_from_lqi(&mut self) {
-        self.outgoing_cost = link_cost_from_lqi(self.lqi);
+    /// Calculate the incoming link cost from LQI (R22 §3.6.3.1).
+    ///
+    /// Only the *incoming* cost is a local measurement. The outgoing cost is
+    /// the neighbor's own measurement and may only be written by Link Status
+    /// receive processing (R22 §3.6.3.4.2) or cleared by router aging
+    /// (§3.6.3.4.3).
+    pub fn update_incoming_cost_from_lqi(&mut self) {
+        self.incoming_cost = link_cost_from_lqi(self.lqi);
+    }
+
+    /// Fold a freshly received frame's LQI into the rolling average and
+    /// refresh the incoming link cost.
+    ///
+    /// R22 §3.6.1.5 requires a neighbor table entry to be updated on every
+    /// frame received from that neighbor; §3.6.3.1 requires the initial cost
+    /// estimate to be based on *average* LQI rather than a single sample.
+    pub fn observe_frame(&mut self, lqi: u8) {
+        self.lqi = if self.lqi == 0 {
+            lqi
+        } else {
+            (((self.lqi as u16) * 3 + lqi as u16) / 4) as u8
+        };
+        self.update_incoming_cost_from_lqi();
+    }
+
+    /// Whether this neighbor is a router or the coordinator, i.e. a device
+    /// that participates in routing and exchanges Link Status frames.
+    pub fn is_router(&self) -> bool {
+        matches!(
+            self.device_type,
+            NeighborDeviceType::Router | NeighborDeviceType::Coordinator
+        )
     }
 
     /// Re-arm the R22 End Device Timeout deadline from the stored enumeration.
@@ -157,6 +207,14 @@ pub const fn link_cost_from_lqi(lqi: u8) -> u8 {
         201..=255 => 1,
     }
 }
+
+/// `nwkLinkStatusPeriod` — seconds between Link Status command frames
+/// (R22 Table 3-58 default `0x0f`).
+pub const LINK_STATUS_PERIOD_SECS: u16 = 15;
+
+/// `nwkRouterAgeLimit` — missed Link Status frames after which a router
+/// neighbor's outgoing cost is discarded (R22 Table 3-58 default `3`).
+pub const ROUTER_AGE_LIMIT: u8 = 3;
 
 /// NWK neighbor table
 pub struct NeighborTable {
@@ -306,6 +364,75 @@ impl NeighborTable {
         for entry in self.entries.iter_mut().filter(|e| e.active) {
             entry.age = entry.age.saturating_add(1);
         }
+    }
+
+    /// Age router neighbors by one `nwkLinkStatusPeriod` (R22 §3.6.3.4.3).
+    ///
+    /// A router that fails to send [`ROUTER_AGE_LIMIT`] Link Status frames in
+    /// a row has its outgoing cost discarded: the reverse-direction cost we
+    /// hold for it is no longer evidence of a working link, so it must not
+    /// keep feeding many-to-one or symmetric-link route decisions. End devices
+    /// never issue Link Status frames and are therefore never aged this way.
+    pub fn age_router_link_status(&mut self) {
+        for entry in self
+            .entries
+            .iter_mut()
+            .filter(|entry| entry.active && entry.is_router())
+        {
+            entry.link_status_age = entry
+                .link_status_age
+                .saturating_add(1)
+                .min(ROUTER_AGE_LIMIT.saturating_add(1));
+            if entry.link_status_age > ROUTER_AGE_LIMIT && entry.outgoing_cost != 0 {
+                log::debug!(
+                    "[NWK] Router neighbor 0x{:04X} stale after {} missed link status frames",
+                    entry.network_address.0,
+                    entry.link_status_age,
+                );
+                entry.outgoing_cost = 0;
+            }
+        }
+    }
+
+    /// Collect this device's router neighbors, sorted ascending by network
+    /// address as R22 §3.4.8.3.2 requires of the link status list.
+    ///
+    /// The list is built by insertion rather than by sorting afterwards:
+    /// `[T]::sort_unstable_by_key` instantiates the generic pattern-defeating
+    /// quicksort, which costs several kilobytes of flash — far more than the
+    /// whole link status path — for a list bounded by
+    /// [`MAX_NEIGHBORS`] entries.
+    pub fn router_link_status_entries(
+        &self,
+    ) -> heapless::Vec<crate::frames::LinkStatusEntry, MAX_NEIGHBORS> {
+        let mut entries: heapless::Vec<crate::frames::LinkStatusEntry, MAX_NEIGHBORS> =
+            heapless::Vec::new();
+        for neighbor in self
+            .iter()
+            .filter(|neighbor| neighbor.is_router() && neighbor.network_address.0 < 0xFFF8)
+        {
+            let entry = crate::frames::LinkStatusEntry {
+                address: neighbor.network_address,
+                // R22 §3.4.8.3.2: our own estimate of the link from them, and
+                // the outgoing cost field straight out of the neighbor table.
+                incoming_cost: neighbor.incoming_cost.clamp(1, 7),
+                outgoing_cost: neighbor.outgoing_cost,
+            };
+            let position = entries
+                .iter()
+                .position(|existing| existing.address.0 > entry.address.0)
+                .unwrap_or(entries.len());
+            if entries.push(entry).is_err() {
+                break;
+            }
+            // Shift the tail up by one to open `position`.
+            let mut index = entries.len() - 1;
+            while index > position {
+                entries.swap(index, index - 1);
+                index -= 1;
+            }
+        }
+        entries
     }
 
     /// Remove provisional children that did not prove network-key possession.

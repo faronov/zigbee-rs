@@ -94,6 +94,28 @@ pub enum NwkCommandOutcome {
         /// Requested Timeout Enumeration (already parsed to 0..=14).
         requested_timeout: u8,
     },
+    /// An address conflict was detected on *this* device's own short address
+    /// (R22 §3.6.1.9.2). The NWK layer has already informed the network where
+    /// R22 requires it; the runtime owns the resolution, which either rejoins
+    /// or applies a new locally chosen address with
+    /// [`NwkLayer::assign_new_local_address`](crate::NwkLayer::assign_new_local_address)
+    /// followed by persistence and a `Device_annce`.
+    AddressConflict {
+        /// The address that is in conflict — still this device's address until
+        /// the resolution runs.
+        previous: ShortAddress,
+        /// How R22 §3.6.1.9.3 requires this device to obtain a new address.
+        resolution: crate::conflict::AddressConflictResolution,
+    },
+    /// An address conflict was detected on the address of an end-device child
+    /// of this device (R22 §3.6.1.9.3). The parent must pick a new address for
+    /// the child and inform it with an unsolicited Rejoin Response.
+    ChildAddressConflict {
+        /// The child's current (conflicting) short address.
+        child: ShortAddress,
+        /// The child's IEEE address, which does not change.
+        ieee: IeeeAddress,
+    },
 }
 
 /// NWK data confirm — result of NLDE-DATA.request.
@@ -807,8 +829,11 @@ impl<M: MacDriver> NwkLayer<M> {
     ) -> Option<NwkIndication<'a>> {
         // A command outcome describes exactly one frame. Clearing it before
         // any early return keeps an outcome from an earlier Leave from being
-        // picked up after some later frame that reported nothing.
+        // picked up after some later frame that reported nothing. The same
+        // holds for the frame's authentication status, which the layers above
+        // read while this frame is being delivered.
         self.pending_command_outcome = None;
+        self.rx_authenticated = false;
 
         // Parse NWK header
         let (header, consumed) = NwkHeader::parse(mac_payload)?;
@@ -819,7 +844,17 @@ impl<M: MacDriver> NwkLayer<M> {
         // Never accept or relay a frame we originated: a neighbour's
         // rebroadcast of our own broadcast would otherwise be delivered to the
         // upper layer and rebroadcast again by us.
+        //
+        // A frame that carries our short address but somebody else's identity
+        // is not ours at all: it is the R22 §3.6.1.9.2 evidence of an address
+        // conflict on `nwkNetworkAddress`, checked here — the only point where
+        // such a frame is still in hand — before the frame is dropped.
         if src == self.nib.network_address {
+            if let Some(outcome) =
+                self.detect_self_addressed_conflict(&header, mac_payload, consumed)
+            {
+                self.record_command_outcome(outcome);
+            }
             log::debug!(
                 "[NWK] Dropping self-originated frame seq={}",
                 header.seq_number
@@ -952,6 +987,9 @@ impl<M: MacDriver> NwkLayer<M> {
         } else {
             NwkPayload::Plain(&mac_payload[consumed..])
         };
+        // A network without NWK security has no stronger evidence to offer, so
+        // its plaintext headers are all the identity there is.
+        self.rx_authenticated = !self.nib.security_enabled || payload.security_source().is_some();
         if let Some(security_source) = payload.security_source()
             && self.find_ieee_by_short(src) == Some(security_source)
             && self.authorize_child(src)
@@ -968,6 +1006,20 @@ impl<M: MacDriver> NwkLayer<M> {
         // child's data relayed on to the coordinator still counts.
         if let Some(security_source) = payload.security_source() {
             self.refresh_child_keepalive_secured(src, security_source);
+        }
+
+        // ── R22 §3.6.1.9.2 address conflict detection ──
+        // Runs on the authenticated frame only (see above) and records what it
+        // finds as a command outcome for the runtime: resolving a conflict is
+        // asynchronous work. Kept in one out-of-line helper so the receive
+        // future itself does not grow.
+        if let Some(outcome) = self.detect_frame_address_conflict(
+            &header,
+            is_for_us && !is_broadcast,
+            prev_hop.unwrap_or(src) == src,
+            payload.security_source(),
+        ) {
+            self.record_command_outcome(outcome);
         }
 
         // Two commands are not handled by the generic broadcast and relay
@@ -1072,14 +1124,16 @@ impl<M: MacDriver> NwkLayer<M> {
             let previous_hop = prev_hop
                 .filter(|hop| is_unicast_address(*hop) && *hop != self.nib.network_address)
                 .unwrap_or(src);
-            self.pending_command_outcome = self.dispatch_nwk_command(
+            if let Some(outcome) = self.dispatch_nwk_command(
                 &header,
                 previous_hop,
                 lqi,
                 secured,
                 payload.security_source(),
                 payload.as_slice(),
-            );
+            ) {
+                self.record_command_outcome(outcome);
+            }
             return None;
         }
 
@@ -1792,6 +1846,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Routing and neighbour maintenance commands are handled entirely here.
     /// Commands that change the device's network lifecycle are reported back
     /// so the layer above can schedule a rejoin or update persistence.
+    #[inline(never)]
     fn dispatch_nwk_command(
         &mut self,
         header: &NwkHeader,
@@ -1839,7 +1894,23 @@ impl<M: MacDriver> NwkLayer<M> {
             Some(NwkCommandId::RouteReply) => self.handle_route_reply(prev_hop, cmd_payload),
             Some(NwkCommandId::RouteRecord) => self.handle_route_record(src, cmd_payload),
             Some(NwkCommandId::LinkStatus) => self.handle_link_status(src, cmd_payload),
-            Some(NwkCommandId::NetworkStatus) => self.handle_network_status(src, cmd_payload),
+            Some(NwkCommandId::NetworkStatus) => {
+                return self.handle_network_status(src, cmd_payload);
+            }
+            // R22 §3.6.1.13.2: only the network manager acts on a report, and
+            // the resulting Network Update is broadcast from the async path.
+            // A report that produces nothing — a duplicate of one already being
+            // acted on, a foreign network, a device that is not the manager —
+            // must never clear an update that is still waiting to go out, or
+            // the manager would change PAN ID without telling anyone.
+            Some(NwkCommandId::NetworkReport) => {
+                if let Some(update) = self.handle_network_report(cmd_payload) {
+                    self.pending_pan_id_broadcast = Some(update);
+                }
+            }
+            // R22 §3.6.1.13.3: adopt the new PAN identifier after
+            // nwkNetworkBroadcastDeliveryTime.
+            Some(NwkCommandId::NetworkUpdate) => self.handle_network_update(src, cmd_payload),
             Some(NwkCommandId::EdTimeoutResponse) => {
                 self.handle_ed_timeout_response(src, dst, cmd_payload)
             }
@@ -1873,6 +1944,154 @@ impl<M: MacDriver> NwkLayer<M> {
     }
 
     // ── NWK Command Handlers ─────────────────────────────────
+
+    /// Park a lifecycle outcome for the layer above, keeping the more urgent
+    /// one when a single frame produces two.
+    ///
+    /// One frame can both reveal an address conflict and carry a command that
+    /// reports something itself. There is one outcome slot per frame, so the
+    /// events are ordered by how much of the device's membership they decide:
+    /// losing the network outranks changing address, which outranks any
+    /// per-child service action.
+    pub(crate) fn record_command_outcome(&mut self, outcome: NwkCommandOutcome) {
+        fn priority(outcome: &NwkCommandOutcome) -> u8 {
+            match outcome {
+                NwkCommandOutcome::LeaveRequested { .. } | NwkCommandOutcome::ParentLeft { .. } => {
+                    3
+                }
+                NwkCommandOutcome::AddressConflict { .. } => 2,
+                NwkCommandOutcome::ChildAddressConflict { .. } => 1,
+                NwkCommandOutcome::ChildRejoinRequest { .. }
+                | NwkCommandOutcome::EndDeviceTimeoutRequest { .. } => 0,
+            }
+        }
+        let replace = self
+            .pending_command_outcome
+            .as_ref()
+            .is_none_or(|existing| priority(&outcome) > priority(existing));
+        if replace {
+            self.pending_command_outcome = Some(outcome);
+        }
+    }
+
+    /// R22 §3.6.1.9.2 detection on an authenticated received frame.
+    ///
+    /// Two statements of identity can appear in a NWK header:
+    ///
+    /// * the destination IEEE address, checked "even if it is the
+    ///   0xff..ff address" — a frame addressed to our short address but to
+    ///   another identity means two devices answer to it;
+    /// * the source IEEE address, which travels end to end and is therefore
+    ///   the identity a relayed frame still carries. On a frame received
+    ///   straight from its originator the auxiliary security header names the
+    ///   same device, so a disagreement there is a forged header rather than an
+    ///   address conflict and is refused as evidence.
+    #[inline(never)]
+    fn detect_frame_address_conflict(
+        &mut self,
+        header: &NwkHeader,
+        addressed_to_us: bool,
+        single_hop: bool,
+        security_source: Option<IeeeAddress>,
+    ) -> Option<NwkCommandOutcome> {
+        if !self.joined || !self.address_conflict_detection_enabled() {
+            return None;
+        }
+        // An unsecured unicast is still accepted on a secured network so that
+        // pre-key APS commissioning traffic arrives, and its NWK header is
+        // plaintext a device with no keys at all can write. Resolving a
+        // conflict changes this device's own address or costs it a rejoin, so
+        // only an authenticated header may claim one.
+        if self.nib.security_enabled && security_source.is_none() {
+            return None;
+        }
+
+        if addressed_to_us
+            && let Some(dst_ieee) = header.dst_ieee
+            && dst_ieee != self.nib.ieee_address
+        {
+            log::warn!(
+                "[NWK] Frame for 0x{:04X} names another IEEE address",
+                header.dst_addr.0,
+            );
+            return Some(self.detect_local_address_conflict());
+        }
+
+        if !cfg!(feature = "router") {
+            // A non-routing build keeps no network-wide address map: it detects
+            // a conflict on its *own* address (above, and from the network's
+            // own R22 §3.6.1.9.3 announcement) and rejoins, which is the only
+            // resolution R22 gives an end device.
+            return None;
+        }
+        let src_ieee = header.src_ieee?;
+        if single_hop && security_source.is_some_and(|source| source != src_ieee) {
+            log::warn!(
+                "[NWK] Ignoring inconsistent identity for 0x{:04X}",
+                header.src_addr.0,
+            );
+            return None;
+        }
+        match self.note_address_information(header.src_addr, src_ieee) {
+            crate::conflict::AddressCheck::Conflict { outcome } => outcome,
+            crate::conflict::AddressCheck::Consistent => None,
+        }
+    }
+
+    /// Detect an address conflict revealed by a frame that claims *our* short
+    /// address as its source (R22 §3.6.1.9.2).
+    ///
+    /// Only an authenticated identity may move this device's address: on a
+    /// secured network the frame must carry NWK security whose source IEEE
+    /// address differs from ours *and* pass CCM*, so a forged header alone
+    /// cannot push a device off its address. On an unsecured network the NWK
+    /// header's source IEEE address is the only evidence available.
+    ///
+    /// R22 ignores a conflicting broadcast during the first
+    /// `nwkNetworkBroadcastDeliveryTime` of operation, because this device's
+    /// own earlier broadcasts may still be in flight.
+    #[inline(never)]
+    fn detect_self_addressed_conflict(
+        &mut self,
+        header: &NwkHeader,
+        mac_payload: &[u8],
+        consumed: usize,
+    ) -> Option<NwkCommandOutcome> {
+        if !cfg!(feature = "router") || !self.joined || !self.address_conflict_detection_enabled() {
+            // A non-routing build leaves this detection to the routers around
+            // it, which announce the conflict with a Network Status command
+            // (R22 §3.6.1.9.3); acting on that announcement is what an end
+            // device can do about it either way.
+            return None;
+        }
+        if let Some(src_ieee) = header.src_ieee
+            && src_ieee == self.nib.ieee_address
+        {
+            return None;
+        }
+        if is_nwk_broadcast(header.dst_addr)
+            && self.mac.monotonic_micros() < crate::conflict::NETWORK_BROADCAST_DELIVERY_TIME_US
+        {
+            return None;
+        }
+
+        if self.nib.security_enabled {
+            if !header.frame_control.security {
+                return None;
+            }
+            let after_header = mac_payload.get(consumed..)?;
+            let (aux, _) = crate::security::NwkSecurityHeader::parse(after_header)?;
+            if aux.source_address == self.nib.ieee_address {
+                return None;
+            }
+            // A frame that cannot be authenticated proves nothing at all.
+            self.authenticate_incoming(mac_payload, consumed, header.src_addr)?;
+        } else if header.src_ieee.is_none() {
+            return None;
+        }
+
+        Some(self.detect_local_address_conflict())
+    }
 
     fn handle_rejoin_request(
         &self,
@@ -2165,6 +2384,14 @@ impl<M: MacDriver> NwkLayer<M> {
         lqi: u8,
         payload: &[u8],
     ) {
+        if !self.can_route() {
+            // R22 §3.6.3.5.2: route discovery is a router and coordinator
+            // procedure — a parent answers a route request on behalf of its end
+            // device children. A device that cannot route has no route
+            // discovery table to record the request in and no routing table to
+            // install the result into, so it must not reply or propagate.
+            return;
+        }
         let originator = header.src_addr;
         let Some(rreq) = crate::frames::RouteRequest::parse(payload) else {
             log::warn!("[NWK] Malformed RREQ from 0x{:04X}", prev_hop.0);
@@ -2432,6 +2659,12 @@ impl<M: MacDriver> NwkLayer<M> {
     /// of the route being installed. The RREP names the originator that
     /// started the discovery, which is where the reply is forwarded on to.
     fn handle_route_reply(&mut self, prev_hop: ShortAddress, payload: &[u8]) {
+        if !self.can_route() {
+            // A Route Reply answers a Route Request, which only a router or the
+            // coordinator originates (see `discover_route`), and it installs a
+            // next hop into a routing table a non-routing build does not have.
+            return;
+        }
         let Some(rrep) = crate::frames::RouteReply::parse(payload) else {
             log::warn!("[NWK] Malformed RREP from 0x{:04X}", prev_hop.0);
             return;
@@ -2495,6 +2728,11 @@ impl<M: MacDriver> NwkLayer<M> {
     /// concentrator is last. The source-route index starts at that last entry,
     /// while the regular routing-table next hop is the same last relay.
     fn handle_route_record(&mut self, src: ShortAddress, payload: &[u8]) {
+        if !self.can_route() {
+            // A Route Record exists to fill a concentrator's source route
+            // table, which only a routing device keeps.
+            return;
+        }
         if payload.is_empty() {
             log::warn!("[NWK] Malformed RouteRecord from 0x{:04X}", src.0);
             return;
@@ -2568,42 +2806,70 @@ impl<M: MacDriver> NwkLayer<M> {
         }
     }
 
-    /// Handle incoming Link Status command.
+    /// Handle an incoming Link Status command (R22 §3.6.3.4.2).
+    ///
+    /// The sender's neighbor table age is reset first, because the frame itself
+    /// is the proof of life R22 ages routers against — that happens whether or
+    /// not the frame says anything about us.
+    ///
+    /// The address range a frame covers is derived from its first and last
+    /// entries together with the first-frame and last-frame flags. If our
+    /// address falls outside that range this fragment simply does not describe
+    /// us and is discarded. If it falls inside, our own entry decides the
+    /// outgoing cost of the link to the sender: the incoming cost it reports if
+    /// we are listed, and `0` — "no usable reverse cost" — if we are not.
+    ///
+    /// End devices do not process Link Status frames, and a build without the
+    /// routing capability has no route decisions for a reverse link cost to
+    /// feed, so the whole handler is compiled out of one
+    /// ([`can_route`](crate::NwkLayer::can_route) is a compile-time `false`
+    /// there).
     fn handle_link_status(&mut self, src: ShortAddress, payload: &[u8]) {
-        let Some(ls) = crate::frames::LinkStatusCommand::parse(payload) else {
+        if !self.can_route() {
+            return;
+        }
+        let Some(report) = crate::frames::LinkStatusReport::parse(payload) else {
             log::warn!("[NWK] Malformed LinkStatus from 0x{:04X}", src.0);
             return;
         };
 
-        log::debug!(
-            "[NWK] LinkStatus from 0x{:04X}: {} entries",
-            src.0,
-            ls.entries.len()
-        );
-
-        // Check if any entry references us, and update the neighbor's cost
         let our_addr = self.nib.network_address;
-        for entry in &ls.entries {
-            if entry.address == our_addr {
-                // This neighbor reports its cost to/from us
-                if let Some(neighbor) = self.neighbors.find_by_short_mut(src) {
-                    neighbor.outgoing_cost = entry.incoming_cost.clamp(1, 7);
-                    log::debug!(
-                        "[NWK] Updated link cost to 0x{:04X}: outgoing={}",
-                        src.0,
-                        neighbor.outgoing_cost
-                    );
-                }
-                break;
-            }
+        let Some(neighbor) = self.neighbors.find_by_short_mut(src) else {
+            log::debug!("[NWK] LinkStatus from unknown neighbor 0x{:04X}", src.0);
+            return;
+        };
+        // R22 §3.6.3.4.2: reset the age of the transmitting device's entry.
+        neighbor.link_status_age = 0;
+        neighbor.age = 0;
+
+        if !report.covers(our_addr) {
+            log::debug!(
+                "[NWK] LinkStatus fragment from 0x{:04X} does not cover 0x{:04X}",
+                src.0,
+                our_addr.0,
+            );
+            return;
         }
+
+        let outgoing_cost = report.incoming_cost_for(our_addr).unwrap_or(0);
+        neighbor.outgoing_cost = outgoing_cost & 0x07;
+        log::debug!(
+            "[NWK] LinkStatus from 0x{:04X}: {} entries, our outgoing cost {}",
+            src.0,
+            report.len(),
+            outgoing_cost,
+        );
     }
 
     /// Handle incoming Network Status command (route error notification).
-    fn handle_network_status(&mut self, src: ShortAddress, payload: &[u8]) {
+    fn handle_network_status(
+        &mut self,
+        src: ShortAddress,
+        payload: &[u8],
+    ) -> Option<NwkCommandOutcome> {
         let Some(ns) = crate::frames::NetworkStatusCommand::parse(payload) else {
             log::warn!("[NWK] Malformed NetworkStatus from 0x{:04X}", src.0);
-            return;
+            return None;
         };
 
         log::info!(
@@ -2624,8 +2890,14 @@ impl<M: MacDriver> NwkLayer<M> {
                 self.source_route_table.remove(ns.destination);
                 self.routing.remove(ns.destination);
             }
+            // R22 §3.6.1.9.3 — the network is being told that two devices hold
+            // the address in the destination field.
+            crate::frames::NetworkStatusCommand::ADDRESS_CONFLICT => {
+                return self.handle_network_status_address_conflict(ns.destination);
+            }
             _ => {}
         }
+        None
     }
 }
 
@@ -2971,9 +3243,18 @@ mod tests {
     }
 
     /// Register a neighbour with an explicit link cost.
+    ///
+    /// The IEEE address is the one that device actually uses in these tests, so
+    /// a frame from it is consistent with the neighbour table and does not look
+    /// like an R22 §3.6.1.9.2 address conflict.
     #[cfg(feature = "router")]
     fn neighbour_with_cost(nwk: &mut NwkLayer<MockMac>, addr: ShortAddress, cost: u8) {
-        nwk.update_neighbor_address(addr, [addr.0 as u8; 8]);
+        let ieee = match addr {
+            ORIGIN => ORIGIN_IEEE,
+            OUR_ADDR => RELAY_IEEE,
+            other => [other.0 as u8; 8],
+        };
+        nwk.update_neighbor_address(addr, ieee);
         let neighbor = nwk
             .neighbors
             .find_by_short_mut(addr)
@@ -2987,6 +3268,7 @@ mod tests {
             5 => 75,
             _ => 25,
         };
+        neighbor.update_incoming_cost_from_lqi();
     }
 
     #[test]
@@ -4021,16 +4303,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "router")]
     fn link_status_is_handled_internally_without_a_lifecycle_outcome() {
-        let mut nwk = node(DeviceType::EndDevice, OUR_ADDR);
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
         nwk.neighbors
             .add_or_update(crate::neighbor::NeighborEntry::new_from_annce(
                 PEER, [0x0B; 8],
             ))
             .unwrap();
-        // One entry naming us, with incoming cost 3 (low nibble bits 0..2).
+        // One entry naming us, with incoming cost 3 (R22 Figure 3-23 bits 0-2),
+        // flagged as both the first and the last frame of the sender's list.
         let body = [
-            0x01u8,
+            0x61u8,
             (OUR_ADDR.0 & 0xFF) as u8,
             (OUR_ADDR.0 >> 8) as u8,
             0x03,

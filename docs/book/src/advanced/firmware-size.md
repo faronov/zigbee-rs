@@ -14,13 +14,54 @@ flash offsets are platform-specific.
 
 | Platform and role | Raw payload | Packaged image | CI raw budget |
 |---|---:|---:|---:|
-| TLSR8258 end-device sensor (hardware AES) | 262,088 B | — | 280 KiB |
-| TLSR8258 parent router (hardware AES) | 317,868 B | — | 336 KiB |
-| BL702 end-device sensor (hardware AES) | 161,570 B | 169,776 B | 192 KiB |
-| nRF52840 end-device sensor | 202,688 B | — | 220 KiB |
-| nRF52840 relay router | 192,704 B | — | — |
-| nRF52833 end-device sensor | 125,544 B | — | — |
-| EFR32MG1 end-device sensor (hardware AES + OTA) | 137,532 B | — | 160 KiB |
+| TLSR8258 end-device sensor (hardware AES) | 271,836 B | — | 280 KiB |
+| TLSR8258 parent router (hardware AES) | 328,404 B | — | 336 KiB |
+| BL702 end-device sensor (hardware AES) | 178,082 B | — | 192 KiB |
+| nRF52840 end-device sensor | 222,336 B | — | 220 KiB |
+| nRF52840 relay router | 225,560 B | — | — |
+| nRF52833 end-device sensor | 222,336 B | — | 220 KiB |
+| EFR32MG1 end-device sensor (hardware AES + OTA) | 151,284 B | — | 160 KiB |
+
+The TLSR8258 rows are `scripts/tlsr8258.sh build sensor` / `build router` on
+the pinned `tc32-45` toolchain, which is exactly what CI builds; they leave
+14,884 and 15,660 bytes of budget headroom respectively. The BL702, nRF and
+EFR32 raw payloads were re-measured with the same release profiles CI builds.
+Packaged images were not rebuilt. CI remains the authoritative source per
+commit, because it enforces the budget column with
+`tools/firmware-size-report.sh`.
+
+R22 conformance work moves these numbers in both directions. Adding NWK address
+and PAN identifier conflict resolution (R22 §3.6.1.9, §3.6.1.13) grew the
+router image, while restricting route discovery, Route Reply and Route Record
+processing to devices that can actually route (R22 §3.6.3.5.2) removed that
+code from every end-device image. Both images then dropped well below their
+pre-conformance size once the runtime stopped folding its maintenance,
+commissioning and receive coroutines into two enormous ones (see
+[coroutine outlining](#coroutine-outlining-on-tc32)):
+
+| TLSR8258 image | Before router maintenance | With R22 conflict/Link Status work | After outlining |
+|---|---:|---:|---:|
+| End-device sensor | 286,288 B | 286,512 B | 271,836 B |
+| Parent router | 338,276 B | 346,280 B | 328,404 B |
+
+The middle column is why this matters: the router exceeded its 344,064-byte
+budget by 2,216 bytes and the sensor had 208 bytes left. No R22 behavior was
+removed to recover the budget.
+
+### RAM and stack alongside these payloads
+
+Flash is not the only budget. The same builds report:
+
+| TLSR8258 image | `.bss` end | `block_on` coroutine frame | SVC stack headroom |
+|---|---:|---:|---:|
+| End-device sensor | `0x844C60` | 8,772 B | 7,612 B |
+| Parent router | `0x847694` | 9,388 B | 6,996 B |
+
+The SVC stack is a fixed 16 KiB (`_svc_stack_bottom = 0x0084BC00`), and the
+application future is pinned inside `block_on`'s frame, so that frame is the
+single largest stack consumer. Conflict resolution and the Link Status /
+router-aging state added 192 bytes of static RAM to the router and 64 to the
+sensor; the outlining work added 480 and 56 bytes to the coroutine frame.
 
 These are not benchmark-equivalent applications. Radio implementations,
 linker layouts, executor overhead, enabled peripherals, and application
@@ -32,10 +73,10 @@ comparison:
 
 | TLSR8258 image | Complete-HAL baseline | Current | Reduction |
 |---|---:|---:|---:|
-| End-device sensor | 323,876 B | 262,088 B | 61,788 B (19.1%) |
-| Parent router | 349,792 B | 317,868 B | 31,924 B (9.1%) |
+| End-device sensor | 323,876 B | 271,836 B | 52,040 B (16.1%) |
+| Parent router | 349,792 B | 328,404 B | 21,388 B (6.1%) |
 
-The current router is 55,780 bytes larger than the sensor because it retains
+The current router is 56,568 bytes larger than the sensor because it retains
 the behavior a real parent needs: route maintenance, child admission and
 aging, indirect delivery, parent-side MAC commands, Update-Device handling,
 and Parent Announce. The sensor instead retains the R22 End Device Timeout
@@ -66,9 +107,51 @@ as roughly `0.3 MB`, but the raw binaries are no longer close in size.
   changing protocol behavior.
 
 Size work is retained only when both role images improve or a deliberate
-role-specific tradeoff is justified. Async outlining that merely moves a
-future constructor is not assumed to help: on TC32 it often nests another poll
-state machine and increases flash.
+role-specific tradeoff is justified.
+
+## Coroutine outlining on TC32
+
+An `async fn` body compiles to a coroutine whose resume function is a separate
+MIR body. `#[inline(never)]` on the `async fn` applies to the constructor that
+returns the future, **not** to that resume function, so a future awaited from
+exactly one place is folded into its caller's coroutine however it is
+annotated. That is how `tick_with_security_store` and `process_incoming`
+reached 59,796 and 26,224 bytes in the router image: every maintenance,
+commissioning, transmit and receive sub-future was merged into two enormous
+functions.
+
+Three forms were measured on the pinned `tc32-45` router build over the same
+set of outlined awaits:
+
+| Form | Router flash | `block_on` frame |
+|---|---:|---:|
+| Inline `.await` | 345,088 B | 8,908 B |
+| Generic `async fn` wrapper | 330,784 B | 22,676 B |
+| `await_out_of_line!` (`Pin<&mut dyn Future>`) | 329,720 B | 9,388 B |
+
+The shipped image adds three more outlined awaits in router maintenance,
+reaching 328,404 B at the same coroutine frame size.
+
+The generic `async fn` wrapper is the trap: the caller ends up holding the
+moved-from temporary *and* the wrapper coroutine across the await, so every
+outlined future's state is stored twice and the frame nearly triples — past
+the 16 KiB SVC stack. Pinning the future at the call site and polling it
+through `Pin<&mut dyn Future>` leaves the state exactly where an inline
+`.await` would have put it and moves only the code, which is what
+`await_out_of_line!` in `zigbee-runtime` does.
+
+Reserve it for large sub-futures awaited once — periodic maintenance,
+lifecycle transitions, per-frame processing. On a small leaf call the vtable
+and indirect call cost more than the inlining saves. Outlining a *synchronous*
+step with `#[inline(never)]` is roughly flash-neutral by comparison and is
+worth doing for coroutine-size rather than flash reasons.
+
+The other half of the reduction is deduplication: an `.await` embeds the
+awaited future's state machine, so two textual copies of `start()` or
+`leave()` are two copies of the whole join or leave sequence in flash. Folding
+`UserAction::Toggle` onto the join/leave it resolves to, and selecting the
+user-requested and automatically due secured rejoins together, removed those
+duplicates.
 
 ## Correctness and regression gates
 
@@ -108,9 +191,10 @@ reset/resume all passed under an independent channel-15 capture. The initial
 hardware-AES release measured 269,960 bytes for the sensor and 327,760 bytes
 for the router, saving 2,640 and 4,680 bytes respectively over the former
 software builds with 8 additional bytes of RAM. The later receive-queue
-redesign reduced the current standard images to 262,088 and 317,868 bytes
-without changing that AES policy. Both production manifests install the
-accelerator unconditionally and fail closed without a software fallback.
+redesign and the coroutine outlining above reduced the current standard images
+to 271,836 and 328,404 bytes without changing that AES policy. Both production
+manifests install the accelerator unconditionally and fail closed without a
+software fallback.
 
 The BL702 SEC_ENG hardware-AES provider is the first cross-platform follow-up
 to the TLSR8258 work. Its two startup known-answer tests pass on XT-ZB1

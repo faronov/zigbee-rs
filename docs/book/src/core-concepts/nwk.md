@@ -316,7 +316,9 @@ pub struct NeighborEntry {
     pub rx_on_when_idle: bool,          // false = sleepy
     pub relationship: Relationship,      // Parent/Child/Sibling/etc.
     pub lqi: u8,                        // Link Quality (rolling average)
-    pub outgoing_cost: u8,              // 1-7, derived from LQI
+    pub incoming_cost: u8,              // 1-7, our own estimate from LQI
+    pub outgoing_cost: u8,              // 0-7, reported by the neighbor itself
+    pub link_status_age: u8,            // Missed nwkLinkStatusPeriod intervals
     pub depth: u8,                      // Network depth
     pub permit_joining: bool,           // For routers/coordinators
     pub security_capable: bool,          // Child can authenticate with NWK security
@@ -340,8 +342,16 @@ pub enum Relationship {
 
 ### Link Cost Calculation
 
-LQI (Link Quality Indicator, 0–255) is converted to an outgoing cost (1–7)
-used by the routing algorithm:
+A Zigbee link has **two** costs, and R22 keeps them apart (§3.6.1.5, §3.6.3.1):
+
+* **incoming cost** — this device's own estimate of the link *from* the
+  neighbor, derived from the rolling average LQI. Always `1..=7`.
+* **outgoing cost** — the cost of the link *to* the neighbor, as measured by
+  the neighbor and reported in its Link Status command. `0` means "no Link
+  Status naming this device has been received yet", which is not a cheap link
+  but an *unknown* one.
+
+LQI (Link Quality Indicator, 0–255) maps to the incoming cost as:
 
 | LQI Range | Cost | Quality |
 |-----------|------|---------|
@@ -350,6 +360,64 @@ used by the routing algorithm:
 | 101–150 | 3 | Fair |
 | 51–100 | 5 | Poor |
 | 0–50 | 7 | Very poor |
+
+Route discovery uses the worse of the two directions,
+`max(incoming, outgoing)`. A many-to-one Route Request from a neighbor whose
+outgoing cost is still `0` is discarded (R22 §3.6.3.5.2): the reverse direction
+of that link has never been demonstrated, so a route built on it could not
+carry the concentrator's traffic back.
+
+### Link Status (R22 §3.4.8, §3.6.3.4)
+
+Routers and the coordinator broadcast their link costs every
+`nwkLinkStatusPeriod` (15 s) to the router-only broadcast address `0xFFFC`
+with radius 1 and no MAC retries — a one-hop broadcast that is never relayed.
+End devices neither send nor process Link Status frames.
+
+The list holds one entry per **router** neighbor, sorted ascending by network
+address, each carrying this device's incoming cost and the neighbor table's
+outgoing cost. A list that does not fit in one frame is fragmented: consecutive
+frames overlap by one entry (the last address of frame N is the first address
+of frame N+1), the first fragment sets the *first frame* bit, the last sets the
+*last frame* bit, and a single-frame list sets both.
+
+On receipt (§3.6.3.4.2) a router resets the sender's age, works out the address
+range the frame covers from those two bits, and — if its own address is inside
+that range — takes its outgoing cost from its own entry, or sets it to `0` when
+the frame covers it but does not list it. Missing `nwkRouterAgeLimit` (3)
+consecutive Link Status frames from a router neighbor also resets that cost to
+`0` (§3.6.3.4.3).
+
+### Address and PAN ID conflicts (R22 §3.6.1.9, §3.6.1.13)
+
+Two devices can end up on the same 16-bit network address, and two networks on
+the same 16-bit PAN identifier. Both are resolved by NWK commands, in
+[`zigbee_nwk::conflict`]:
+
+* An address conflict is detected from an authenticated frame whose destination
+  IEEE address is not ours but whose destination *short* address is, from a
+  frame or `Device_annce` that pairs a known short address with a different
+  IEEE address, and from a Network Status command with status code `0x0D`.
+  A router or the coordinator announces the conflict by broadcasting that
+  command to `0xFFFD` after a random jitter (cancelled if an identical
+  announcement arrives first). The device that must move either picks a new
+  random address — stochastic addressing on a router — or rejoins, which is
+  what an end device always does. A parent reassigns a conflicting end-device
+  child with an unsolicited Rejoin Response.
+* A PAN ID conflict is reported to `nwkManagerAddr` with a Network Report
+  (0x09) listing the PAN identifiers seen nearby. The network manager picks a
+  replacement that appears in neither that list nor its own neighborhood,
+  increments `nwkUpdateId`, and broadcasts a Network Update (0x0A). Every
+  router applies the new PAN identifier only after
+  `nwkNetworkBroadcastDeliveryTime`, so the announcement can still cross the
+  network on the old one.
+
+Only routers and the coordinator process Network Report and Network Update, and
+only they announce another device's address conflict; a non-routing build keeps
+none of that code. It still detects and resolves a conflict on its *own*
+address, which R22 resolves by rejoining.
+
+[`zigbee_nwk::conflict`]: https://docs.rs/zigbee-nwk
 
 ### Table Operations
 

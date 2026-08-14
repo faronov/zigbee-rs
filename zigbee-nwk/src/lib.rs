@@ -35,6 +35,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod conflict;
 pub mod frames;
 pub mod indirect;
 pub mod neighbor;
@@ -240,6 +241,28 @@ pub struct PendingNetworkStatus {
     pub next_hop: Option<ShortAddress>,
 }
 
+/// An address-conflict broadcast waiting out its R22 §3.6.1.9.3 jitter.
+///
+/// The broadcast is cancelled if an identical Network Status (same status code
+/// and same offending address) is received during the delay, so a conflict
+/// observed by several routers produces one broadcast rather than a storm.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingAddressConflict {
+    /// Offending 16-bit address carried in the command payload.
+    pub(crate) address: ShortAddress,
+    /// Monotonic microsecond timestamp at which the broadcast may go out.
+    pub(crate) send_after_us: u32,
+}
+
+/// A PAN identifier update accepted from the network manager, waiting out
+/// `nwkNetworkBroadcastDeliveryTime` before it is applied (R22 §3.6.1.13.3).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingPanIdUpdate {
+    pub(crate) new_pan_id: zigbee_types::PanId,
+    /// Monotonic microsecond timestamp at which the new PAN ID takes effect.
+    pub(crate) apply_at_us: u32,
+}
+
 /// // Discover networks
 /// let networks = nwk.nlme_network_discovery(ChannelMask::ALL_2_4GHZ, 3).await?;
 ///
@@ -299,6 +322,23 @@ pub struct NwkLayer<M: MacDriver> {
     concentrator_radius: u8,
     /// Source route table — stores full relay paths from Route Records.
     source_route_table: routing::SourceRouteTable,
+    /// Address-conflict broadcasts waiting out their R22 §3.6.1.9.3 jitter.
+    ///
+    /// Only a router or the coordinator originates one, so a non-routing
+    /// build compiles the queue to zero capacity.
+    #[cfg(feature = "router")]
+    pending_conflicts: heapless::Vec<PendingAddressConflict, 4>,
+    #[cfg(not(feature = "router"))]
+    pending_conflicts: heapless::Vec<PendingAddressConflict, 0>,
+    /// PAN identifier update accepted from the network manager and waiting out
+    /// `nwkNetworkBroadcastDeliveryTime` (R22 §3.6.1.13.3).
+    pending_pan_id_update: Option<PendingPanIdUpdate>,
+    /// A Network Update the network manager owes the network after accepting a
+    /// PAN identifier conflict report, broadcast on the next async pass.
+    pending_pan_id_broadcast: Option<frames::PanIdUpdate>,
+    /// Seconds elapsed in the current `nwkLinkStatusPeriod` interval, used to
+    /// age router neighbors (R22 §3.6.3.4.3).
+    link_status_age_counter: u16,
     /// Counter for stochastic child address assignment.
     next_child_addr_offset: u16,
     /// Lifecycle outcome of the NWK command in the frame currently being
@@ -308,6 +348,14 @@ pub struct NwkLayer<M: MacDriver> {
     /// Reset at the start of every `process_incoming_nwk_frame` call so it can
     /// only ever describe that call's frame.
     pending_command_outcome: Option<nlde::NwkCommandOutcome>,
+    /// Whether the frame currently being processed carried a verified identity
+    /// — it passed NWK CCM*, or the network runs without NWK security at all.
+    ///
+    /// Reset per frame alongside [`Self::pending_command_outcome`], and read by
+    /// the layers above (ZDO `Device_annce`) inside the same receive pass, so
+    /// an unauthenticated frame can never be treated as evidence of an address
+    /// conflict.
+    pub(crate) rx_authenticated: bool,
 }
 
 impl<M: MacDriver> NwkLayer<M> {
@@ -351,8 +399,13 @@ impl<M: MacDriver> NwkLayer<M> {
             concentrator_rreq_due: false,
             concentrator_radius: 5,
             source_route_table: routing::SourceRouteTable::new(),
+            pending_conflicts: heapless::Vec::new(),
+            pending_pan_id_update: None,
+            pending_pan_id_broadcast: None,
+            link_status_age_counter: 0,
             next_child_addr_offset: 1,
             pending_command_outcome: None,
+            rx_authenticated: false,
         }
     }
 
@@ -399,8 +452,13 @@ impl<M: MacDriver> NwkLayer<M> {
             core::ptr::addr_of_mut!((*slot).concentrator_radius).write(5);
             core::ptr::addr_of_mut!((*slot).source_route_table)
                 .write(routing::SourceRouteTable::new());
+            core::ptr::addr_of_mut!((*slot).pending_conflicts).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*slot).pending_pan_id_update).write(None);
+            core::ptr::addr_of_mut!((*slot).pending_pan_id_broadcast).write(None);
+            core::ptr::addr_of_mut!((*slot).link_status_age_counter).write(0);
             core::ptr::addr_of_mut!((*slot).next_child_addr_offset).write(1);
             core::ptr::addr_of_mut!((*slot).pending_command_outcome).write(None);
+            core::ptr::addr_of_mut!((*slot).rx_authenticated).write(false);
         }
     }
 
@@ -585,6 +643,43 @@ impl<M: MacDriver> NwkLayer<M> {
         let _ = self.neighbors.add_or_update(entry);
     }
 
+    /// Record a `Device_annce`-style statement of identity and act on any
+    /// address conflict it reveals.
+    ///
+    /// R22 §2.4.4.1.? has every device update its address map from a
+    /// `Device_annce`, and §3.6.1.9.2 makes the same announcement one of the
+    /// places an address conflict becomes visible. A conflicting announcement
+    /// does *not* overwrite the mapping this device already holds: the conflict
+    /// is announced instead, and whichever device has to move announces its new
+    /// address afterwards.
+    ///
+    /// The resulting lifecycle outcome is parked for the layer above, which
+    /// collects it with [`take_command_outcome`](Self::take_command_outcome)
+    /// exactly as it does for a NWK command.
+    ///
+    /// An announcement that arrived unauthenticated on a secured network is
+    /// recorded exactly as before but is never read as a conflict: an
+    /// unsecured unicast is accepted so pre-key commissioning traffic can
+    /// arrive, and a device with no keys must not be able to make anybody
+    /// change address or rejoin. [`Self::rx_authenticated`] describes the frame
+    /// this announcement was carried in — ZDO processing runs inside the same
+    /// receive pass that set it.
+    pub fn note_announced_address(&mut self, address: ShortAddress, ieee: IeeeAddress) {
+        if self.nib.security_enabled && !self.rx_authenticated {
+            self.update_neighbor_address(address, ieee);
+            return;
+        }
+        if let conflict::AddressCheck::Conflict { outcome } =
+            self.note_address_information(address, ieee)
+        {
+            if let Some(outcome) = outcome {
+                self.record_command_outcome(outcome);
+            }
+            return;
+        }
+        self.update_neighbor_address(address, ieee);
+    }
+
     /// Age the neighbour cache on a non-routing end device.
     ///
     /// A router ages the same table inside [`tick_router_maintenance`]; a
@@ -649,9 +744,21 @@ impl<M: MacDriver> NwkLayer<M> {
         // Periodic link status for routers/coordinators
         if self.device_type != DeviceType::EndDevice && self.joined {
             self.link_status_counter = self.link_status_counter.saturating_add(elapsed_secs);
-            if self.link_status_counter >= 15 {
+            if self.link_status_counter >= neighbor::LINK_STATUS_PERIOD_SECS {
                 self.link_status_counter = 0;
                 self.link_status_due = true;
+            }
+            // R22 §3.6.3.4.3: a router neighbor's age counts whole
+            // nwkLinkStatusPeriod intervals, and its outgoing cost is
+            // discarded once nwkRouterAgeLimit of them pass without a Link
+            // Status. Counted separately from the second-resolution `age`
+            // field, which drives eviction ordering and provisional-child
+            // expiry.
+            self.link_status_age_counter =
+                self.link_status_age_counter.saturating_add(elapsed_secs);
+            while self.link_status_age_counter >= neighbor::LINK_STATUS_PERIOD_SECS {
+                self.link_status_age_counter -= neighbor::LINK_STATUS_PERIOD_SECS;
+                self.neighbors.age_router_link_status();
             }
         }
 
@@ -970,7 +1077,12 @@ impl<M: MacDriver> NwkLayer<M> {
             security_capable,
             relationship: neighbor::Relationship::Child,
             lqi: 0xFF,
-            outgoing_cost: 1,
+            // R22 §3.6.1.5: the outgoing cost is the neighbor's own
+            // measurement and stays unknown until a Link Status naming
+            // this device arrives (§3.6.3.4.2).
+            incoming_cost: neighbor::link_cost_from_lqi(0xFF),
+            outgoing_cost: 0,
+            link_status_age: 0,
             depth: self.nib.depth.saturating_add(1),
             permit_joining: false,
             age: 0,
@@ -1309,7 +1421,12 @@ impl<M: MacDriver> NwkLayer<M> {
             security_capable: capability_info.security_capable,
             relationship: neighbor::Relationship::UnauthenticatedChild,
             lqi: 0xFF,
-            outgoing_cost: 1,
+            // R22 §3.6.1.5: the outgoing cost is the neighbor's own
+            // measurement and stays unknown until a Link Status naming
+            // this device arrives (§3.6.3.4.2).
+            incoming_cost: neighbor::link_cost_from_lqi(0xFF),
+            outgoing_cost: 0,
+            link_status_age: 0,
             depth: self.nib.depth + 1,
             permit_joining: false,
             age: 0,
@@ -1498,7 +1615,12 @@ impl<M: MacDriver> NwkLayer<M> {
                 neighbor::Relationship::UnauthenticatedChild
             },
             lqi: 0xFF,
-            outgoing_cost: 1,
+            // R22 §3.6.1.5: the outgoing cost is the neighbor's own
+            // measurement and stays unknown until a Link Status naming
+            // this device arrives (§3.6.3.4.2).
+            incoming_cost: neighbor::link_cost_from_lqi(0xFF),
+            outgoing_cost: 0,
+            link_status_age: 0,
             depth: self.nib.depth.saturating_add(1),
             permit_joining: false,
             age: 0,

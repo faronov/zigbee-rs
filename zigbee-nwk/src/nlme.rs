@@ -803,7 +803,12 @@ impl<M: MacDriver> NwkLayer<M> {
             security_capable: true,
             relationship: Relationship::Parent,
             lqi: network.lqi,
-            outgoing_cost: 1,
+            // R22 §3.6.1.5: the outgoing cost is the neighbor's own
+            // measurement and stays unknown until a Link Status naming
+            // this device arrives (§3.6.3.4.2).
+            incoming_cost: crate::neighbor::link_cost_from_lqi(network.lqi),
+            outgoing_cost: 0,
+            link_status_age: 0,
             depth: network.depth,
             permit_joining: network.permit_joining,
             age: 0,
@@ -1261,7 +1266,12 @@ impl<M: MacDriver> NwkLayer<M> {
                         security_capable: true,
                         relationship: Relationship::Parent,
                         lqi: network.lqi,
-                        outgoing_cost: 1,
+                        // R22 §3.6.1.5: the outgoing cost is the neighbor's own
+                        // measurement and stays unknown until a Link Status naming
+                        // this device arrives (§3.6.3.4.2).
+                        incoming_cost: crate::neighbor::link_cost_from_lqi(network.lqi),
+                        outgoing_cost: 0,
+                        link_status_age: 0,
                         depth: network.depth,
                         permit_joining: network.permit_joining,
                         age: 0,
@@ -1411,6 +1421,13 @@ impl<M: MacDriver> NwkLayer<M> {
         self.joined = false;
         self.neighbors = crate::neighbor::NeighborTable::new();
         self.routing = crate::routing::RoutingTable::new();
+        // Conflict work belongs to the network being left: an address-conflict
+        // announcement names an address this device no longer holds, and a
+        // deferred PAN identifier switch would retune the radio away from
+        // whatever network it joins next (R22 §3.6.1.9.3, §3.6.1.13.3).
+        self.pending_conflicts.clear();
+        self.pending_pan_id_update = None;
+        self.pending_pan_id_broadcast = None;
         if !rejoin {
             self.nib.network_address = ShortAddress(0xFFFF);
             self.nib.pan_id = PanId(0xFFFF);
@@ -1649,6 +1666,9 @@ impl<M: MacDriver> NwkLayer<M> {
             self.routing = crate::routing::RoutingTable::new();
             self.security = crate::security::NwkSecurity::new();
             self.joined = false;
+            self.pending_conflicts.clear();
+            self.pending_pan_id_update = None;
+            self.pending_pan_id_broadcast = None;
         }
 
         self.mac

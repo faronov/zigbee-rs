@@ -439,6 +439,16 @@ The shared router engine implements the Zigbee R22 concentrator flow:
   failure (`0x0C`) is redirected toward the concentrator through another router
   and invalidates the stale return path.
 
+R22 §3.6.3.5.2 is enforced on both sides of a link: a many-to-one Route Request
+from a neighbor whose outgoing cost is still unknown (`0`) is discarded, and
+that cost only becomes known when the neighbor's Link Status names this device.
+A freshly joined router therefore installs concentrator routes after the first
+Link Status period rather than on an assumed link.
+
+Route discovery, Route Reply and Route Record processing are refused outright by
+a device that cannot route: an end device's parent answers route discovery on
+its behalf, so a non-routing build links none of that code.
+
 These paths are covered by the router-enabled host/runtime test matrix. Real
 multi-router acceptance with a sleepy child and an independent sniffer remains
 a hardware interoperability gate.
@@ -465,7 +475,9 @@ remain the release gate.
 | Child aging and timeout | ✅ Implemented, including indirect cleanup |
 | Route discovery (AODV) | ✅ Integrated with runtime forwarding |
 | R22 MTOR / source routing / Route Record | ✅ Integrated and host-tested; multi-router hardware acceptance pending |
-| Link status messages | ✅ Receive, maintenance and periodic sending |
+| Link status messages | ✅ R22 §3.4.8 framing, router-only sorted list, one-entry-overlap fragmentation, §3.6.3.4 receive and aging (host-tested; on-air capture pending) |
+| Address conflict resolution | ✅ R22 §3.6.1.9 detection, `0x0D` announcement with jitter, local address change or rejoin, end-device child reassignment (host-tested; multi-device hardware acceptance pending) |
+| PAN ID conflict resolution | ✅ R22 §3.6.1.13 Network Report and Network Update receive/processing with deferred PAN ID switch; beacon-driven detection is exposed as an API but not yet driven by a continuous beacon monitor |
 | Trust Center Update/Transport/Switch Key | ✅ APS security and Tunnel forwarding implemented |
 | Distributed security (TC-less) | ⚠️ Secured rejoin supported; full coordinator policy remains incomplete |
 | TLSR8258 router MAC | ✅ Join, silent restart, Link Status and NWK relay hardware-verified; corrected-image first-attempt child acceptance remains gated |

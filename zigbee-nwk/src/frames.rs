@@ -3,7 +3,7 @@
 //! Implements NWK frame header encoding/decoding per Zigbee PRO R22 spec
 //! Chapter 3.3. Handles both data frames and command frames.
 
-use zigbee_types::{IeeeAddress, ShortAddress};
+use zigbee_types::{IeeeAddress, PanId, ShortAddress};
 
 /// NWK frame types (2-bit field in Frame Control)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,6 +497,17 @@ impl NetworkStatusCommand {
     pub const NON_TREE_LINK_FAILURE: u8 = 0x02;
     pub const SOURCE_ROUTE_FAILURE: u8 = 0x0B;
     pub const MANY_TO_ONE_ROUTE_FAILURE: u8 = 0x0C;
+    /// R22 Table 3-51 — the destination address field names an address that
+    /// two devices in this network are using (§3.6.1.9.3).
+    pub const ADDRESS_CONFLICT: u8 = 0x0D;
+    /// R22 Table 3-51 — PAN identifier update, reported to the next higher
+    /// layer when a Network Update command changes the short PAN ID
+    /// (§3.6.1.13.2, §3.6.1.13.3).
+    pub const PAN_ID_UPDATE: u8 = 0x0F;
+    /// R22 Table 3-51 — network address update, reported to the next higher
+    /// layer when address conflict resolution assigns a new short address
+    /// (§3.6.1.9.3).
+    pub const NETWORK_ADDRESS_UPDATE: u8 = 0x10;
 
     pub fn parse(data: &[u8]) -> Option<Self> {
         if data.len() < 3 {
@@ -516,58 +527,309 @@ impl NetworkStatusCommand {
     }
 }
 
-/// Link status entry (one neighbor's link quality)
-#[derive(Debug, Clone, Copy)]
+/// Link status entry (one router neighbor's link costs, R22 Figure 3-23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkStatusEntry {
     pub address: ShortAddress,
+    /// This device's own estimate of the link cost *from* the neighbor
+    /// (1..=7). R22 §3.4.8.3.2.
     pub incoming_cost: u8,
+    /// The neighbor table's outgoing cost for this neighbor — the cost the
+    /// neighbor last reported for the reverse direction. `0` means no Link
+    /// Status naming this device has been received from it (R22 §3.6.1.5).
     pub outgoing_cost: u8,
 }
 
-/// Link Status command (NWK command ID 0x08)
+/// Entry count carried by the 5-bit entry-count sub-field (R22 Figure 3-22).
+pub const MAX_LINK_STATUS_ENTRIES: usize = 31;
+
+/// Link status entries this stack places in a single command frame.
+///
+/// One entry is three octets, so 16 entries occupy 49 payload octets. With the
+/// NWK header (8 octets plus the mandatory source IEEE address), the security
+/// auxiliary header and the MIC, that stays inside a 127-octet MAC frame with
+/// room to spare. A neighbor table with more router neighbors than this is
+/// fragmented across several frames (R22 §3.4.8.3.2).
+pub const LINK_STATUS_ENTRIES_PER_FRAME: usize = 16;
+
+/// Command options bit 5 — first frame of the sender's link status.
+pub const LINK_STATUS_FIRST_FRAME: u8 = 0x20;
+/// Command options bit 6 — last frame of the sender's link status.
+pub const LINK_STATUS_LAST_FRAME: u8 = 0x40;
+/// Command options bits 0-4 — entry count.
+pub const LINK_STATUS_COUNT_MASK: u8 = 0x1F;
+
+/// Link Status command (NWK command ID 0x08) built for transmission.
+///
+/// R22 §3.4.8.3.1: the command options octet carries the entry count in bits
+/// 0-4, the first-frame flag in bit 5 and the last-frame flag in bit 6. A
+/// sender whose whole link status fits in one frame sets **both** flags.
 #[derive(Debug, Clone)]
 pub struct LinkStatusCommand {
-    pub entries: heapless::Vec<LinkStatusEntry, 16>,
+    /// First frame of this sender's link status list.
+    pub first_frame: bool,
+    /// Last frame of this sender's link status list.
+    pub last_frame: bool,
+    pub entries: heapless::Vec<LinkStatusEntry, LINK_STATUS_ENTRIES_PER_FRAME>,
 }
 
 impl LinkStatusCommand {
-    /// Parse Link Status from payload (after command ID byte).
-    pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.is_empty() {
-            return None;
-        }
-        let count = (data[0] & 0x1F) as usize;
-        let mut entries = heapless::Vec::new();
-        let mut offset = 1;
-        for _ in 0..count {
-            if data.len() < offset + 3 {
-                break;
-            }
-            let address = ShortAddress(u16::from_le_bytes([data[offset], data[offset + 1]]));
-            let cost_byte = data[offset + 2];
-            let incoming_cost = cost_byte & 0x07;
-            let outgoing_cost = (cost_byte >> 3) & 0x07;
-            let _ = entries.push(LinkStatusEntry {
-                address,
-                incoming_cost,
-                outgoing_cost,
-            });
-            offset += 3;
-        }
-        Some(Self { entries })
+    /// Serialized size of this command's payload (after the command ID byte).
+    pub fn wire_size(&self) -> usize {
+        1 + 3 * self.entries.len()
     }
 
-    /// Serialize to buffer. Returns bytes written.
-    pub fn serialize(&self, buf: &mut [u8]) -> usize {
-        buf[0] = self.entries.len() as u8;
+    /// Serialize to buffer. Returns bytes written, or `None` if `buf` is too
+    /// small for the whole list — a truncated list would advertise link costs
+    /// for entries that are not in the frame.
+    pub fn serialize(&self, buf: &mut [u8]) -> Option<usize> {
+        let size = self.wire_size();
+        if buf.len() < size {
+            return None;
+        }
+        let mut options = (self.entries.len() as u8) & LINK_STATUS_COUNT_MASK;
+        if self.first_frame {
+            options |= LINK_STATUS_FIRST_FRAME;
+        }
+        if self.last_frame {
+            options |= LINK_STATUS_LAST_FRAME;
+        }
+        buf[0] = options;
         let mut offset = 1;
         for entry in &self.entries {
             buf[offset] = (entry.address.0 & 0xFF) as u8;
             buf[offset + 1] = ((entry.address.0 >> 8) & 0xFF) as u8;
-            buf[offset + 2] = (entry.incoming_cost & 0x07) | ((entry.outgoing_cost & 0x07) << 3);
+            // R22 Figure 3-23: incoming cost in bits 0-2, bit 3 reserved,
+            // outgoing cost in bits 4-6, bit 7 reserved.
+            buf[offset + 2] = (entry.incoming_cost & 0x07) | ((entry.outgoing_cost & 0x07) << 4);
             offset += 3;
         }
-        offset
+        Some(size)
+    }
+}
+
+/// A received Link Status command, borrowed from the authenticated payload.
+///
+/// Receive processing (R22 §3.6.3.4.2) only needs the covered address range
+/// and this device's own entry, so the list is never copied: a sender may
+/// legitimately carry up to [`MAX_LINK_STATUS_ENTRIES`] entries, which is more
+/// than this stack ever transmits itself.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkStatusReport<'a> {
+    first_frame: bool,
+    last_frame: bool,
+    entries: &'a [u8],
+}
+
+impl<'a> LinkStatusReport<'a> {
+    /// Parse a Link Status payload (after the command ID byte).
+    ///
+    /// Returns `None` when the frame carries fewer entry octets than its own
+    /// entry count claims: a short list would otherwise silently change the
+    /// covered address range and, with it, whether a missing entry means
+    /// "cost unknown" or "this frame says nothing about me".
+    pub fn parse(data: &'a [u8]) -> Option<Self> {
+        let options = *data.first()?;
+        let count = (options & LINK_STATUS_COUNT_MASK) as usize;
+        let end = 1 + 3 * count;
+        if data.len() < end {
+            return None;
+        }
+        Some(Self {
+            first_frame: options & LINK_STATUS_FIRST_FRAME != 0,
+            last_frame: options & LINK_STATUS_LAST_FRAME != 0,
+            entries: &data[1..end],
+        })
+    }
+
+    pub const fn first_frame(&self) -> bool {
+        self.first_frame
+    }
+
+    pub const fn last_frame(&self) -> bool {
+        self.last_frame
+    }
+
+    pub const fn len(&self) -> usize {
+        self.entries.len() / 3
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterate the entries in the order they appear on the wire (R22 requires
+    /// ascending network address order).
+    pub fn iter(&self) -> impl Iterator<Item = LinkStatusEntry> + 'a {
+        self.entries.chunks_exact(3).map(|chunk| LinkStatusEntry {
+            address: ShortAddress(u16::from_le_bytes([chunk[0], chunk[1]])),
+            incoming_cost: chunk[2] & 0x07,
+            outgoing_cost: (chunk[2] >> 4) & 0x07,
+        })
+    }
+
+    /// Whether `address` falls inside the range this frame describes.
+    ///
+    /// R22 §3.6.3.4.2 derives the range from the first and last addresses in
+    /// the list together with the first-frame and last-frame flags: a first
+    /// frame covers everything below its first entry and a last frame
+    /// everything above its last entry, so a single frame (both flags) covers
+    /// the whole address space and an intermediate fragment covers only the
+    /// span it lists.
+    pub fn covers(&self, address: ShortAddress) -> bool {
+        let mut entries = self.iter();
+        let Some(first) = entries.next() else {
+            // An empty list only says something when it is the sender's whole
+            // link status: "no router neighbors at all".
+            return self.first_frame && self.last_frame;
+        };
+        let last = entries.last().unwrap_or(first);
+        let lower = if self.first_frame {
+            0x0000
+        } else {
+            first.address.0
+        };
+        let upper = if self.last_frame {
+            0xFFFF
+        } else {
+            last.address.0
+        };
+        (lower..=upper).contains(&address.0)
+    }
+
+    /// The incoming cost this sender reported for `address`, if listed.
+    pub fn incoming_cost_for(&self, address: ShortAddress) -> Option<u8> {
+        self.iter()
+            .find(|entry| entry.address == address)
+            .map(|entry| entry.incoming_cost)
+    }
+}
+
+// ── Network Report / Network Update (R22 §3.4.9, §3.4.10) ───────
+
+/// Command options bits 0-4 — report/update information record count.
+pub const NWK_REPORT_COUNT_MASK: u8 = 0x1F;
+/// Command options bits 5-7 — report/update command identifier.
+pub const NWK_REPORT_ID_SHIFT: u8 = 5;
+/// Report command identifier 0x00 — PAN identifier conflict (R22 Figure 3-26).
+pub const NWK_REPORT_PAN_ID_CONFLICT: u8 = 0x00;
+/// Update command identifier 0x00 — PAN identifier update (R22 Figure 3-30).
+pub const NWK_UPDATE_PAN_ID_UPDATE: u8 = 0x00;
+/// PAN identifiers this stack reports in one PAN ID conflict report.
+pub const MAX_PAN_ID_CONFLICT_REPORT: usize = 8;
+
+/// Network Report command (NWK command ID 0x09) of type PAN identifier
+/// conflict.
+///
+/// Payload (R22 Figure 3-24): command options, the 64-bit EPID of the
+/// reporter's network, then `count` 16-bit PAN identifiers observed in the
+/// reporter's neighborhood (R22 Figure 3-27).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanIdConflictReport {
+    pub epid: IeeeAddress,
+    pub pan_ids: heapless::Vec<PanId, MAX_PAN_ID_CONFLICT_REPORT>,
+}
+
+impl PanIdConflictReport {
+    pub fn wire_size(&self) -> usize {
+        9 + 2 * self.pan_ids.len()
+    }
+
+    pub fn serialize(&self, buf: &mut [u8]) -> Option<usize> {
+        let size = self.wire_size();
+        if buf.len() < size {
+            return None;
+        }
+        buf[0] = ((self.pan_ids.len() as u8) & NWK_REPORT_COUNT_MASK)
+            | (NWK_REPORT_PAN_ID_CONFLICT << NWK_REPORT_ID_SHIFT);
+        buf[1..9].copy_from_slice(&self.epid);
+        let mut offset = 9;
+        for pan_id in &self.pan_ids {
+            buf[offset..offset + 2].copy_from_slice(&pan_id.0.to_le_bytes());
+            offset += 2;
+        }
+        Some(size)
+    }
+
+    /// Parse a Network Report payload (after the command ID byte).
+    ///
+    /// Returns `None` for a truncated frame, and for a report command
+    /// identifier this stack does not implement — R22 defines only PAN
+    /// identifier conflict (0x00); 0x01..=0x07 are reserved.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 9 {
+            return None;
+        }
+        let count = (data[0] & NWK_REPORT_COUNT_MASK) as usize;
+        if data[0] >> NWK_REPORT_ID_SHIFT != NWK_REPORT_PAN_ID_CONFLICT {
+            return None;
+        }
+        let end = 9 + 2 * count;
+        if data.len() < end {
+            return None;
+        }
+        let mut epid = [0u8; 8];
+        epid.copy_from_slice(&data[1..9]);
+        let mut pan_ids = heapless::Vec::new();
+        for chunk in data[9..end].chunks_exact(2) {
+            // A report from a dense neighborhood may name more PAN IDs than
+            // this build stores. The excess is dropped rather than rejecting
+            // the report: every PAN ID that *is* kept still constrains the
+            // replacement PAN ID choice.
+            let _ = pan_ids.push(PanId(u16::from_le_bytes([chunk[0], chunk[1]])));
+        }
+        Some(Self { epid, pan_ids })
+    }
+}
+
+/// Network Update command (NWK command ID 0x0A) of type PAN identifier update.
+///
+/// Payload (R22 Figure 3-28): command options, the 64-bit EPID of the network
+/// being updated, the sender's `nwkUpdateId`, then the single new 16-bit PAN
+/// identifier (R22 Figure 3-31).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanIdUpdate {
+    pub epid: IeeeAddress,
+    pub update_id: u8,
+    pub new_pan_id: PanId,
+}
+
+impl PanIdUpdate {
+    pub const WIRE_SIZE: usize = 12;
+
+    pub fn serialize(&self, buf: &mut [u8]) -> Option<usize> {
+        if buf.len() < Self::WIRE_SIZE {
+            return None;
+        }
+        // R22 §3.4.10.3.4: a PAN identifier update carries exactly one record.
+        buf[0] = 1 | (NWK_UPDATE_PAN_ID_UPDATE << NWK_REPORT_ID_SHIFT);
+        buf[1..9].copy_from_slice(&self.epid);
+        buf[9] = self.update_id;
+        buf[10..12].copy_from_slice(&self.new_pan_id.0.to_le_bytes());
+        Some(Self::WIRE_SIZE)
+    }
+
+    /// Parse a Network Update payload (after the command ID byte).
+    ///
+    /// Returns `None` for a truncated frame, an update command identifier
+    /// other than PAN identifier update, or a record count other than the
+    /// single record R22 §3.4.10.3.4 mandates for that type.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < Self::WIRE_SIZE {
+            return None;
+        }
+        if data[0] >> NWK_REPORT_ID_SHIFT != NWK_UPDATE_PAN_ID_UPDATE
+            || data[0] & NWK_REPORT_COUNT_MASK != 1
+        {
+            return None;
+        }
+        let mut epid = [0u8; 8];
+        epid.copy_from_slice(&data[1..9]);
+        Some(Self {
+            epid,
+            update_id: data[9],
+            new_pan_id: PanId(u16::from_le_bytes([data[10], data[11]])),
+        })
     }
 }
 
@@ -724,8 +986,11 @@ impl EdTimeoutResponse {
 mod tests {
     use super::NwkHeader;
     use super::{
-        ED_TIMEOUT_ENUM_MAX, EdTimeoutRequest, EdTimeoutResponse, ed_timeout_enum_to_seconds,
+        ED_TIMEOUT_ENUM_MAX, EdTimeoutRequest, EdTimeoutResponse, LINK_STATUS_FIRST_FRAME,
+        LINK_STATUS_LAST_FRAME, LinkStatusCommand, LinkStatusEntry, LinkStatusReport,
+        NWK_REPORT_ID_SHIFT, PanIdConflictReport, PanIdUpdate, ed_timeout_enum_to_seconds,
     };
+    use zigbee_types::{PanId, ShortAddress};
 
     #[test]
     fn rejects_malformed_source_route_subframes() {
@@ -804,5 +1069,173 @@ mod tests {
             Some(response)
         );
         assert_eq!(EdTimeoutResponse::parse(&[0x00]), None);
+    }
+
+    // ── R22 §3.4.8 Link Status ──────────────────────────────────
+
+    #[test]
+    fn link_status_options_and_cost_octet_match_r22_bit_layout() {
+        // R22 Figure 3-22: entry count bits 0-4, first frame bit 5, last frame
+        // bit 6. R22 Figure 3-23: incoming cost bits 0-2, bit 3 reserved,
+        // outgoing cost bits 4-6, bit 7 reserved.
+        let mut command = LinkStatusCommand {
+            first_frame: true,
+            last_frame: true,
+            entries: heapless::Vec::new(),
+        };
+        command
+            .entries
+            .push(LinkStatusEntry {
+                address: ShortAddress(0x1234),
+                incoming_cost: 3,
+                outgoing_cost: 5,
+            })
+            .unwrap();
+
+        let mut buf = [0xAAu8; 8];
+        assert_eq!(command.serialize(&mut buf), Some(4));
+        assert_eq!(buf[..4], [0x61, 0x34, 0x12, 0x53]);
+
+        let report = LinkStatusReport::parse(&buf[..4]).expect("the frame parses");
+        assert!(report.first_frame() && report.last_frame());
+        assert_eq!(report.len(), 1);
+        let entry = report.iter().next().unwrap();
+        assert_eq!(entry.address, ShortAddress(0x1234));
+        assert_eq!(entry.incoming_cost, 3);
+        assert_eq!(entry.outgoing_cost, 5);
+    }
+
+    #[test]
+    fn link_status_reserved_bits_are_not_decoded_as_cost() {
+        // Bits 3 and 7 are reserved: a sender that sets them must not change
+        // the costs a receiver reads.
+        let report =
+            LinkStatusReport::parse(&[0x61, 0x34, 0x12, 0x53 | 0x88]).expect("the frame parses");
+        let entry = report.iter().next().unwrap();
+        assert_eq!(entry.incoming_cost, 3);
+        assert_eq!(entry.outgoing_cost, 5);
+    }
+
+    #[test]
+    fn link_status_rejects_a_list_shorter_than_its_entry_count() {
+        // Two entries claimed, one supplied: the covered range and the
+        // "listed or not" answer would both be wrong.
+        assert!(LinkStatusReport::parse(&[0x62, 0x34, 0x12, 0x11]).is_none());
+        assert!(LinkStatusReport::parse(&[]).is_none());
+    }
+
+    #[test]
+    fn link_status_covered_range_follows_the_first_and_last_flags() {
+        let entries = [
+            0x02u8 | LINK_STATUS_FIRST_FRAME,
+            0x00,
+            0x10,
+            0x11,
+            0x00,
+            0x20,
+            0x11,
+        ];
+        let first = LinkStatusReport::parse(&entries).expect("the frame parses");
+        // A first frame covers everything below its first entry ...
+        assert!(first.covers(ShortAddress(0x0001)));
+        assert!(first.covers(ShortAddress(0x2000)));
+        // ... but nothing above its last entry, because a later frame does.
+        assert!(!first.covers(ShortAddress(0x2001)));
+
+        let last = [
+            0x02u8 | LINK_STATUS_LAST_FRAME,
+            0x00,
+            0x20,
+            0x11,
+            0x00,
+            0x30,
+            0x11,
+        ];
+        let last = LinkStatusReport::parse(&last).expect("the frame parses");
+        assert!(!last.covers(ShortAddress(0x1FFF)));
+        assert!(last.covers(ShortAddress(0x3000)));
+        assert!(last.covers(ShortAddress(0xF000)));
+
+        let middle = [0x02u8, 0x00, 0x20, 0x11, 0x00, 0x30, 0x11];
+        let middle = LinkStatusReport::parse(&middle).expect("the frame parses");
+        assert!(!middle.covers(ShortAddress(0x1000)));
+        assert!(middle.covers(ShortAddress(0x2500)));
+        assert!(!middle.covers(ShortAddress(0x4000)));
+    }
+
+    #[test]
+    fn an_empty_single_frame_link_status_covers_every_address() {
+        // "I have no router neighbours at all" is a statement about the whole
+        // address space; an empty *fragment* says nothing.
+        let whole = LinkStatusReport::parse(&[LINK_STATUS_FIRST_FRAME | LINK_STATUS_LAST_FRAME])
+            .expect("the frame parses");
+        assert!(whole.covers(ShortAddress(0x1234)));
+        assert_eq!(whole.incoming_cost_for(ShortAddress(0x1234)), None);
+
+        let fragment = LinkStatusReport::parse(&[0x00]).expect("the frame parses");
+        assert!(!fragment.covers(ShortAddress(0x1234)));
+    }
+
+    // ── R22 §3.4.9 / §3.4.10 Network Report and Network Update ──
+
+    #[test]
+    fn pan_id_conflict_report_round_trips_with_the_r22_field_order() {
+        let mut report = PanIdConflictReport {
+            epid: [0x11; 8],
+            pan_ids: heapless::Vec::new(),
+        };
+        report.pan_ids.push(PanId(0x1234)).unwrap();
+        report.pan_ids.push(PanId(0xABCD)).unwrap();
+
+        let mut buf = [0xAAu8; 16];
+        assert_eq!(report.serialize(&mut buf), Some(13));
+        // Command options: count 2 in bits 0-4, report identifier 0 (PAN ID
+        // conflict) in bits 5-7.
+        assert_eq!(buf[0], 0x02);
+        assert_eq!(buf[1..9], [0x11; 8]);
+        assert_eq!(buf[9..13], [0x34, 0x12, 0xCD, 0xAB]);
+        assert_eq!(PanIdConflictReport::parse(&buf[..13]), Some(report));
+    }
+
+    #[test]
+    fn network_report_rejects_reserved_types_and_truncation() {
+        let mut buf = [0u8; 13];
+        buf[0] = 0x02 | (1 << NWK_REPORT_ID_SHIFT); // reserved report type 1
+        assert!(PanIdConflictReport::parse(&buf).is_none());
+
+        let mut buf = [0u8; 12];
+        buf[0] = 0x02; // two PAN IDs claimed, only one supplied
+        assert!(PanIdConflictReport::parse(&buf).is_none());
+        assert!(PanIdConflictReport::parse(&[0x00; 8]).is_none());
+    }
+
+    #[test]
+    fn pan_id_update_round_trips_with_the_r22_field_order() {
+        let update = PanIdUpdate {
+            epid: [0x22; 8],
+            update_id: 7,
+            new_pan_id: PanId(0xBEEF),
+        };
+        let mut buf = [0xAAu8; PanIdUpdate::WIRE_SIZE];
+        assert_eq!(update.serialize(&mut buf), Some(12));
+        // One record, update identifier 0 (PAN identifier update).
+        assert_eq!(buf[0], 0x01);
+        assert_eq!(buf[1..9], [0x22; 8]);
+        assert_eq!(buf[9], 7);
+        assert_eq!(buf[10..12], [0xEF, 0xBE]);
+        assert_eq!(PanIdUpdate::parse(&buf), Some(update));
+    }
+
+    #[test]
+    fn network_update_rejects_reserved_types_and_wrong_record_counts() {
+        let mut buf = [0u8; PanIdUpdate::WIRE_SIZE];
+        buf[0] = 0x01 | (1 << NWK_REPORT_ID_SHIFT); // reserved update type 1
+        assert!(PanIdUpdate::parse(&buf).is_none());
+
+        let mut buf = [0u8; PanIdUpdate::WIRE_SIZE];
+        buf[0] = 0x02; // R22 §3.4.10.3.4 allows exactly one record
+        assert!(PanIdUpdate::parse(&buf).is_none());
+
+        assert!(PanIdUpdate::parse(&[0x01; 11]).is_none());
     }
 }

@@ -461,7 +461,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
         let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
         let _ = nwk.tick_permit_joining(elapsed_secs).await;
         nwk.tick_router_maintenance(elapsed_secs);
-        nwk.process_pending_routing().await;
+        await_out_of_line!(nwk.process_pending_routing());
     }
 
     /// Parent/router periodic maintenance — present only in `router` builds and
@@ -489,13 +489,13 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
             // owns; the NWK layer already cleaned the indirect queue, routing,
             // replay counters and MAC Frame Pending for each one.
             let evicted = nwk.age_end_device_children(elapsed_secs);
-            nwk.process_pending_routing().await;
+            await_out_of_line!(nwk.process_pending_routing());
             evicted
         };
         for child in evicted {
             self.forget_evicted_child(child);
         }
-        let _ = self.service_parent_commands_inner().await;
+        let _ = await_out_of_line!(self.service_parent_commands_inner());
         self.bdb
             .zdo_mut()
             .tick_parent_annce_transactions(elapsed_secs);
@@ -593,10 +593,31 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
     }
 
     /// Handle a user-initiated action.
+    ///
+    /// `Toggle` is resolved to the join or leave it means for the current
+    /// membership state *before* the dispatch below, so `start()` and
+    /// `leave()` are each awaited from exactly one place. An `.await` embeds
+    /// the awaited future's state machine in this one, so a second textual
+    /// copy of either call is a second copy of the whole join or leave
+    /// sequence in flash.
     #[inline(never)]
     pub(crate) async fn handle_action(&mut self, action: UserAction) -> TickResult {
+        let action = match action {
+            UserAction::Toggle if self.is_joined() => {
+                log::info!("[Runtime] User action: Toggle → Leave");
+                UserAction::Leave
+            }
+            UserAction::Toggle => {
+                log::info!("[Runtime] User action: Toggle → Join");
+                UserAction::Join
+            }
+            other => other,
+        };
         match action {
-            UserAction::Join => {
+            // `Toggle` cannot reach here — it was resolved above — and is
+            // folded into the join arm rather than into an unreachable branch
+            // so no panic path is linked for a state that cannot occur.
+            UserAction::Join | UserAction::Toggle => {
                 if self.secure_rejoin_pending() {
                     return self.retry_secure_rejoin().await;
                 }
@@ -627,32 +648,6 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
                 log::info!("[Runtime] User action: Leave");
                 let _ = self.leave().await;
                 TickResult::Event(StackEvent::Left)
-            }
-            UserAction::Toggle => {
-                if self.is_joined() {
-                    log::info!("[Runtime] User action: Toggle → Leave");
-                    let _ = self.leave().await;
-                    TickResult::Event(StackEvent::Left)
-                } else {
-                    if self.secure_rejoin_pending() {
-                        return self.retry_secure_rejoin().await;
-                    }
-                    log::info!("[Runtime] User action: Toggle → Join");
-                    match self.start().await {
-                        Ok(addr) => {
-                            let ch = self.channel();
-                            let pan = self.pan_id();
-                            TickResult::Event(StackEvent::Joined {
-                                short_address: addr,
-                                channel: ch,
-                                pan_id: pan,
-                            })
-                        }
-                        Err(_) => {
-                            TickResult::Event(StackEvent::CommissioningComplete { success: false })
-                        }
-                    }
-                }
             }
             UserAction::PermitJoin(duration) => {
                 log::info!("[Runtime] User action: PermitJoin({}s)", duration);

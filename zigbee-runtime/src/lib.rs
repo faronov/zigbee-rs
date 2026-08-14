@@ -42,6 +42,41 @@ macro_rules! rt_trace {
     ($($arg:tt)*) => {};
 }
 
+/// Await a future with its state machine emitted out of line.
+///
+/// An `async fn` body compiles to a coroutine whose resume function is a
+/// separate MIR body, and `#[inline(never)]` on the `async fn` applies to the
+/// constructor that returns the future rather than to that resume function. A
+/// future awaited from exactly one place is therefore folded into its caller's
+/// state machine however it is annotated, which is how the runtime's tick and
+/// receive futures grow into single functions of tens of kilobytes.
+///
+/// Polling through `Pin<&mut dyn Future>` puts the resume function behind a
+/// vtable, so it is emitted once as its own function and the caller keeps only
+/// the poll loop. The future is still pinned in the caller's own coroutine
+/// frame, where an inline `.await` would also have put it, so this costs one
+/// static vtable, one indirect call, and whatever the coroutine layout can no
+/// longer overlap now that the sub-future is one opaque blob — measured at
+/// +480 bytes of frame for the whole TLSR8258 router tick and receive path
+/// against 16.7 KiB of flash.
+///
+/// It must stay a macro: wrapping the same thing in a generic `async fn` makes
+/// the caller hold the moved-from temporary *and* the wrapper coroutine across
+/// the await, so every outlined future's state is stored twice. That form
+/// measured +13.8 KiB of coroutine frame on the same build, past the 16 KiB
+/// SVC stack.
+///
+/// Use it for large sub-futures awaited once — periodic maintenance, lifecycle
+/// transitions, per-frame processing. On a small leaf call the vtable and the
+/// indirect call cost more than the inlining saves.
+macro_rules! await_out_of_line {
+    ($future:expr) => {{
+        let future = core::pin::pin!($future);
+        let future: core::pin::Pin<&mut dyn core::future::Future<Output = _>> = future;
+        future.await
+    }};
+}
+
 pub mod builder;
 pub mod child_store;
 pub mod event_loop;
@@ -1201,6 +1236,8 @@ mod resume_tests {
     // neighbour that is neither us nor our parent.
     #[cfg(feature = "router")]
     const NEIGHBOUR: ShortAddress = ShortAddress(0x2222);
+    #[cfg(feature = "router")]
+    const NEIGHBOUR_IEEE: [u8; 8] = [0x22; 8];
 
     fn commissioned_state() -> PersistentSecurityState {
         let mut state = PersistentSecurityState::empty();
@@ -1297,6 +1334,30 @@ mod resume_tests {
         frame_counter: u32,
         secured: bool,
     ) -> zigbee_mac::MacFrame {
+        nwk_frame_from(
+            frame_type,
+            COORDINATOR,
+            COORDINATOR_IEEE,
+            dst,
+            payload,
+            frame_counter,
+            secured,
+        )
+    }
+
+    /// The same frame, originated by an explicit device rather than by the
+    /// coordinator — a Link Status, say, which describes its sender's own
+    /// links and can only come from a neighbour.
+    #[allow(clippy::too_many_arguments)]
+    fn nwk_frame_from(
+        frame_type: zigbee_nwk::frames::NwkFrameType,
+        src: ShortAddress,
+        src_ieee: [u8; 8],
+        dst: ShortAddress,
+        payload: &[u8],
+        frame_counter: u32,
+        secured: bool,
+    ) -> zigbee_mac::MacFrame {
         use zigbee_nwk::frames::{NwkFrameControl, NwkHeader};
         use zigbee_nwk::security::{NwkSecurity, NwkSecurityHeader};
 
@@ -1313,7 +1374,7 @@ mod resume_tests {
                 end_device_initiator: false,
             },
             dst_addr: dst,
-            src_addr: COORDINATOR,
+            src_addr: src,
             radius: 5,
             seq_number: frame_counter as u8,
             dst_ieee: None,
@@ -1328,7 +1389,7 @@ mod resume_tests {
             let sec_hdr = NwkSecurityHeader {
                 security_control: NwkSecurityHeader::ZIGBEE_DEFAULT,
                 frame_counter,
-                source_address: COORDINATOR_IEEE,
+                source_address: src_ieee,
                 key_seq_number: KEY_SEQUENCE,
             };
             let sec_len = sec_hdr.serialize(&mut buf[hdr_len..]);
@@ -1904,6 +1965,120 @@ mod resume_tests {
         assert!(!device.is_joined());
     }
 
+    /// R22 §3.6.1.9.3: "If the conflict is detected on a ZigBee end device ...
+    /// the device shall perform a rejoin to obtain a new address." An end
+    /// device therefore reports a rejoin rather than picking an address, and
+    /// keeps the one it has until the rejoin assigns another.
+    #[test]
+    fn an_announced_conflict_on_our_own_address_makes_an_end_device_rejoin() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .update_neighbor_address(COORDINATOR, COORDINATOR_IEEE);
+
+        let status = [
+            zigbee_nwk::frames::NwkCommandId::NetworkStatus as u8,
+            zigbee_nwk::frames::NetworkStatusCommand::ADDRESS_CONFLICT,
+            (OUR_SHORT & 0xFF) as u8,
+            (OUR_SHORT >> 8) as u8,
+        ];
+        let event = block_on(device.process_incoming(
+            &indication(nwk_frame(
+                zigbee_nwk::frames::NwkFrameType::Command,
+                ShortAddress(0xFFFD),
+                &status,
+                33,
+                true,
+            )),
+            &mut [],
+        ));
+
+        assert!(matches!(
+            event,
+            Some(crate::event_loop::StackEvent::RejoinRequested)
+        ));
+        assert_eq!(
+            device.bdb().zdo().nwk().nib().network_address.0,
+            OUR_SHORT,
+            "an end device keeps its address until the rejoin assigns one",
+        );
+        assert!(
+            device.mac().tx_history().is_empty(),
+            "an end device never announces another device's conflict",
+        );
+    }
+
+    /// R22 §3.6.1.9.3: a Network Status naming this device's own address makes
+    /// a stochastically addressed router pick a new one, announce it with a
+    /// `Device_annce`, and persist it — no rejoin, and no leave event.
+    #[cfg(feature = "router")]
+    #[test]
+    fn an_announced_conflict_on_our_own_address_moves_a_router_and_is_persisted() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::Router)
+            .build_router();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .update_neighbor_address(NEIGHBOUR, NEIGHBOUR_IEEE);
+
+        let status = [
+            zigbee_nwk::frames::NwkCommandId::NetworkStatus as u8,
+            zigbee_nwk::frames::NetworkStatusCommand::ADDRESS_CONFLICT,
+            (OUR_SHORT & 0xFF) as u8,
+            (OUR_SHORT >> 8) as u8,
+        ];
+        let event = block_on(device.process_incoming(
+            &indication_from(
+                nwk_frame_from(
+                    zigbee_nwk::frames::NwkFrameType::Command,
+                    NEIGHBOUR,
+                    NEIGHBOUR_IEEE,
+                    ShortAddress(0xFFFD),
+                    &status,
+                    31,
+                    true,
+                ),
+                NEIGHBOUR,
+            ),
+            &mut [],
+        ));
+
+        assert!(
+            event.is_none(),
+            "a router resolves its own conflict without leaving the network",
+        );
+        let assigned = device.bdb().zdo().nwk().nib().network_address;
+        assert_ne!(
+            assigned.0, OUR_SHORT,
+            "the conflicting address was given up"
+        );
+        assert!(assigned.0 < 0xFFF8);
+        assert!(
+            device.is_joined(),
+            "resolving an address conflict is not a leave",
+        );
+
+        // R22 §3.6.1.9.2 requires a Device_annce (or a route discovery) before
+        // anything else is sent under the new address.
+        assert!(
+            !device.mac().tx_history().is_empty(),
+            "the new address is announced",
+        );
+
+        // The durable record must follow, or a silent resume would come back
+        // on the address that was in conflict.
+        device.refresh_security_state(&mut store).unwrap();
+        assert_eq!(store.load().unwrap().unwrap().short_address, assigned.0);
+    }
+
     // Relaying needs the router routing/BTR/source-route tables, which are
     // compiled to zero capacity without `zigbee-nwk/router`. Run with
     // `cargo test -p zigbee-runtime --features router`.
@@ -1913,6 +2088,55 @@ mod resume_tests {
         use zigbee_nwk::frames::{NwkCommandId, RouteRequest};
 
         let mut device = resumed_router();
+
+        // R22 §3.6.3.5.2: a many-to-one request from a neighbour whose
+        // outgoing cost is unknown is discarded, because the reverse direction
+        // of that link has never been demonstrated. The neighbour's Link
+        // Status is what establishes it (§3.6.3.4.2), so it comes first — as
+        // it does on a real network.
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .update_neighbor_address(NEIGHBOUR, NEIGHBOUR_IEEE);
+        let link_status = [
+            NwkCommandId::LinkStatus as u8,
+            // First and last frame, one entry: our address at incoming cost 1.
+            0x61,
+            (OUR_SHORT & 0xFF) as u8,
+            (OUR_SHORT >> 8) as u8,
+            0x01,
+        ];
+        assert!(
+            block_on(device.process_incoming(
+                &indication_from(
+                    nwk_frame_from(
+                        zigbee_nwk::frames::NwkFrameType::Command,
+                        NEIGHBOUR,
+                        NEIGHBOUR_IEEE,
+                        ShortAddress(0xFFFC),
+                        &link_status,
+                        20,
+                        true,
+                    ),
+                    NEIGHBOUR,
+                ),
+                &mut []
+            ))
+            .is_none()
+        );
+        assert_eq!(
+            device
+                .bdb
+                .zdo()
+                .nwk()
+                .neighbor_table()
+                .find_by_short(NEIGHBOUR)
+                .expect("the neighbour is known")
+                .outgoing_cost,
+            1,
+            "the Link Status establishes the reverse link cost",
+        );
 
         // The concentrator (our coordinator) originated this many-to-one
         // request; the NWK header still names it several hops later. The
@@ -1925,11 +2149,6 @@ mod resume_tests {
             path_cost: 1,
             dst_ieee: None,
         };
-        device
-            .bdb
-            .zdo_mut()
-            .nwk_mut()
-            .update_neighbor_address(NEIGHBOUR, [0x22; 8]);
         let mut command = [0u8; 16];
         command[0] = NwkCommandId::RouteRequest as u8;
         let len = 1 + rreq.serialize(&mut command[1..]);
@@ -2909,6 +3128,12 @@ pub enum ParentNwkOutcome {
         src: ShortAddress,
         ieee: IeeeAddress,
         requested_timeout: u8,
+    },
+    /// An end-device child's short address is in conflict (R22 §3.6.1.9.3):
+    /// pick a new one for it and send an unsolicited Rejoin Response.
+    ChildAddressConflict {
+        child: ShortAddress,
+        ieee: IeeeAddress,
     },
 }
 
@@ -4341,14 +4566,25 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             .security()
             .staged_key()
             .map(|entry| (entry.key, entry.seq_number));
+        // R22 §3.6.1.13.3 makes the *short* PAN ID mutable at runtime: the
+        // network manager can move the whole network off a conflicting one.
+        // The extended PAN ID and the IEEE address stay the record's identity
+        // anchors, so a short PAN ID that moved while they agree is adopted
+        // below rather than read as a corrupt record.
+        let pan_id_changed = nib.pan_id.0 != state.pan_id;
         if nib.ieee_address != state.ieee_address
-            || nib.pan_id.0 != state.pan_id
+            || nib.extended_pan_id != state.extended_pan_id
             || nib.outgoing_frame_counter > nib.outgoing_frame_counter_limit
             || nib.outgoing_frame_counter_limit != state.global_counter_limit
             || nib.active_key_seq_number != active_network_key.seq_number
         {
             return Err(SecurityStoreError::Corrupt);
         }
+        // R22 §3.6.1.9.3 address conflict resolution can move this device's
+        // own short address. Persisting the new one is what keeps a later
+        // silent resume from restoring the address that was in conflict.
+        let short_address_changed =
+            nib.network_address.0 != state.short_address && nib.network_address.0 < 0xFFF8;
         let network_key_changed = state.network_key != active_network_key.key
             || state.key_sequence != active_network_key.seq_number;
         if network_key_changed {
@@ -4401,6 +4637,22 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             state.parent_information = nib.parent_information;
             state.parent_information_valid = nib.parent_information_valid;
             state.end_device_timeout = nib.end_device_timeout;
+        }
+        if pan_id_changed {
+            log::warn!(
+                "[Runtime] Persisting PAN ID change 0x{:04X} -> 0x{:04X}",
+                state.pan_id,
+                nib.pan_id.0,
+            );
+            state.pan_id = nib.pan_id.0;
+        }
+        if short_address_changed {
+            log::warn!(
+                "[Runtime] Persisting short address change 0x{:04X} -> 0x{:04X}",
+                state.short_address,
+                nib.network_address.0,
+            );
+            state.short_address = nib.network_address.0;
         }
 
         // Set when a unique Trust Center link key transported at runtime is
@@ -4506,6 +4758,8 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             || network_key_changed
             || staged_key_changed
             || update_id_changed
+            || pan_id_changed
+            || short_address_changed
             || end_device_timeout_changed;
         let mut new_global_limit = nib.outgoing_frame_counter_limit;
         if nib
@@ -4681,43 +4935,53 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             Some(UserAction::Leave | UserAction::FactoryReset)
         ) || (matches!(self.pending_action, Some(UserAction::Toggle))
             && self.is_joined());
+        // A user action that asks for recovery and a due automatic retry both
+        // resolve to the same secured rejoin. They are selected together so
+        // that rejoin is awaited from a single place: an `.await` embeds the
+        // awaited future here, and a second copy of this one would carry a
+        // second copy of the whole secured-rejoin sequence in flash.
         let recovery_action = self.secure_rejoin_pending()
             && matches!(
                 self.pending_action,
                 Some(UserAction::Join | UserAction::Rejoin | UserAction::Toggle)
             );
+        let rejoin_now =
+            recovery_action || (self.pending_action.is_none() && self.secure_rejoin_retry_due());
         let result = if security_reset_action {
             self.pending_action = None;
-            self.factory_reset_with_security_store(store)
-                .await
-                .map_err(|error| match error {
+            await_out_of_line!(self.factory_reset_with_security_store(store)).map_err(|error| {
+                match error {
                     event_loop::StartError::PersistenceFailed(error) => error,
                     _ => SecurityStoreError::Hardware,
-                })?;
+                }
+            })?;
             event_loop::TickResult::Event(event_loop::StackEvent::Left)
-        } else if recovery_action {
+        } else if rejoin_now {
+            // Already `None` on the due-retry path; consumed here on the
+            // user-action path so the action is not replayed next tick.
             self.pending_action = None;
-            self.retry_secure_rejoin_with_security_store(store).await?
-        } else if self.pending_action.is_none() && self.secure_rejoin_retry_due() {
-            self.retry_secure_rejoin_with_security_store(store).await?
+            await_out_of_line!(self.retry_secure_rejoin_with_security_store(store))?
         } else {
             if let Some(action) = self.pending_action.take() {
-                self.handle_action(action).await
+                await_out_of_line!(self.handle_action(action))
             } else {
-                self.flush_pending_responses().await;
+                await_out_of_line!(self.flush_pending_responses());
                 if !self.is_joined() {
                     event_loop::TickResult::Idle
                 } else {
-                    // Keep the durable path direct too: another async wrapper
-                    // adds several KiB of transient stack on Series-1 devices.
-                    self.run_aps_maintenance().await;
-                    self.run_nwk_maintenance(elapsed_secs).await;
+                    // Still driven straight from this tick: wrapping the
+                    // sequence in a further `async fn` adds several KiB of
+                    // transient stack on Series-1 devices. `await_out_of_line!`
+                    // keeps each step's state pinned right here and moves only
+                    // its code out of this coroutine.
+                    await_out_of_line!(self.run_aps_maintenance());
+                    await_out_of_line!(self.run_nwk_maintenance(elapsed_secs));
                     R::ed_advance_timers(self, elapsed_secs);
 
                     self.reporting.tick(elapsed_secs);
                     self.apply_fb_target_request(clusters);
-                    self.run_finding_binding_tick(elapsed_secs).await;
-                    self.send_due_reports(clusters).await;
+                    await_out_of_line!(self.run_finding_binding_tick(elapsed_secs));
+                    await_out_of_line!(self.send_due_reports(clusters));
                     self.update_pending_tx_flag();
 
                     // Advance commissioning before polling/result generation.
@@ -4725,17 +4989,17 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     // poll still runs and any application event it produces is
                     // returned without being replaced by commissioning.
                     if self.bdb.tclk_exchange_active()
-                        && let Some(event) = self
-                            .advance_commissioning_with_security_store(store)
-                            .await?
+                        && let Some(event) = await_out_of_line!(
+                            self.advance_commissioning_with_security_store(store)
+                        )?
                     {
                         self.refresh_security_state(store)?;
                         return Ok(event_loop::TickResult::Event(event));
                     }
 
                     let now_ms = self.advance_power_clock(elapsed_secs);
-                    let poll_event = self.run_sleepy_poll(now_ms, clusters).await;
-                    R::ed_service(self).await;
+                    let poll_event = await_out_of_line!(self.run_sleepy_poll(now_ms, clusters));
+                    await_out_of_line!(R::ed_service(self));
 
                     if let Some(event) = poll_event {
                         event_loop::TickResult::Event(event)
@@ -5698,7 +5962,80 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 .await;
                 None
             }
+            zigbee_nwk::nlde::NwkCommandOutcome::AddressConflict {
+                previous,
+                resolution,
+            } => {
+                self.resolve_local_address_conflict(previous, resolution)
+                    .await
+            }
+            zigbee_nwk::nlde::NwkCommandOutcome::ChildAddressConflict { child, ieee } => {
+                // R22 §3.6.1.9.3: only the parent of the conflicting child may
+                // reassign it, so this goes through the parent role hook and is
+                // never linked into a relay or end-device build.
+                R::service_parent_nwk_outcome(
+                    self,
+                    ParentNwkOutcome::ChildAddressConflict { child, ieee },
+                )
+                .await;
+                None
+            }
         }
+    }
+
+    /// Apply R22 §3.6.1.9.3 to a conflict on this device's own short address.
+    ///
+    /// A device that must rejoin re-enters the network through the existing
+    /// secured-rejoin path, which is also what clears the interview record. A
+    /// stochastically addressed router instead picks a new address, announces
+    /// it with a `Device_annce` as R22 §3.6.1.9.2 requires before it sends
+    /// anything else, and lets the next persistence pass adopt it. If picking a
+    /// new address fails there is no safe address left to operate under, so the
+    /// device falls back to rejoining.
+    async fn resolve_local_address_conflict(
+        &mut self,
+        previous: ShortAddress,
+        resolution: zigbee_nwk::conflict::AddressConflictResolution,
+    ) -> Option<event_loop::StackEvent> {
+        // A build without the routing capability can only rejoin, so the
+        // resolution the NWK layer chose is unused there.
+        let _ = resolution;
+        log::warn!("[RX] Address conflict on our address 0x{:04X}", previous.0);
+        #[cfg(feature = "router")]
+        if resolution == zigbee_nwk::conflict::AddressConflictResolution::NewLocalAddress {
+            let assigned = self
+                .bdb
+                .zdo_mut()
+                .aps_mut()
+                .nwk_mut()
+                .assign_new_local_address()
+                .await;
+            match assigned {
+                Ok(address) => {
+                    if let Err(error) = self.send_device_annce().await {
+                        log::warn!(
+                            "[Runtime] Device_annce after address change failed: {:?}",
+                            error
+                        );
+                    }
+                    log::warn!(
+                        "[Runtime] Short address 0x{:04X} replaced by 0x{:04X}",
+                        previous.0,
+                        address.0,
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    log::error!("[Runtime] Address conflict resolution failed: {:?}", error);
+                }
+            }
+        }
+        // Rejoin branch: an end device, a device whose address came from its
+        // parent, or a router that could not pick a replacement.
+        self.remote_reporting.clear();
+        let now = self.bdb.zdo().nwk().mac().monotonic_micros();
+        self.secure_rejoin_retry_at = Some(now);
+        Some(event_loop::StackEvent::RejoinRequested)
     }
 
     /// Perform a router's response to a parent-only NWK command outcome.
@@ -5743,6 +6080,66 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     );
                 }
             }
+            ParentNwkOutcome::ChildAddressConflict { child, ieee } => {
+                self.reassign_conflicting_child(child, ieee).await;
+            }
+        }
+    }
+
+    /// R22 §3.6.1.9.3 parent behavior for a child whose address is in conflict.
+    ///
+    /// The parent picks a new address for the child and informs it with an
+    /// unsolicited Rejoin Response addressed to the child's *current* address —
+    /// a sleepy child still polls under that address until it has the response,
+    /// so the delivery path is exactly the one a solicited rejoin uses,
+    /// including the indirect queue.
+    #[cfg(feature = "router")]
+    async fn reassign_conflicting_child(&mut self, child: ShortAddress, ieee: IeeeAddress)
+    where
+        R: crate::role::ParentRole,
+    {
+        let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
+        let Some(entry) = nwk.neighbor_table().find_by_short(child) else {
+            return;
+        };
+        if entry.ieee_address != ieee {
+            // The table moved on between detection and here; the child this
+            // outcome describes is no longer the one at that address.
+            return;
+        }
+        let rx_on_when_idle = entry.rx_on_when_idle;
+        let assigned = nwk.assign_child_address(&ieee);
+        if assigned == child {
+            log::warn!(
+                "[Runtime] No alternative address for child 0x{:04X}",
+                child.0
+            );
+            return;
+        }
+        log::warn!(
+            "[Runtime] Reassigning conflicting child 0x{:04X} -> 0x{:04X}",
+            child.0,
+            assigned.0,
+        );
+        match nwk
+            .send_rejoin_response(child, ieee, assigned, 0x00, true, rx_on_when_idle)
+            .await
+        {
+            Ok(_) => {
+                // The child answers to the new address from the moment it
+                // receives the response; the old entry must not linger and
+                // keep attracting traffic for it.
+                let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
+                nwk.remove_neighbor(child);
+                nwk.update_neighbor_address(assigned, ieee);
+            }
+            Err(error) => {
+                log::warn!(
+                    "[Runtime] Unsolicited Rejoin Response to 0x{:04X} failed: {:?}",
+                    child.0,
+                    error,
+                );
+            }
         }
     }
 
@@ -5785,9 +6182,11 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
 
         let (nwk_indication, command_outcome) = {
             let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
-            let nwk_indication = nwk
-                .process_incoming_nwk_frame_from(mac_payload, indication.lqi, previous_hop)
-                .await;
+            let nwk_indication = await_out_of_line!(nwk.process_incoming_nwk_frame_from(
+                mac_payload,
+                indication.lqi,
+                previous_hop
+            ));
             // Collected in the same borrow as the call that produced it: the
             // NWK layer clears this slot per frame, so nothing stale can leak
             // into a later frame.
@@ -5935,7 +6334,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             } else {
                 None
             };
-            match self.bdb.zdo_mut().handle_indication(&aps_indication).await {
+            match await_out_of_line!(self.bdb.zdo_mut().handle_indication(&aps_indication)) {
                 Ok(()) => {
                     rt_trace!("[RT] zdo_ok cluster=0x{:04X}", cluster_id);
                     log::info!("[Runtime] ZDO OK cluster=0x{:04X}", cluster_id);
@@ -5960,13 +6359,13 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 // action can leave stale completion visible.
                 self.remote_reporting.clear();
                 log::info!("[Runtime] Executing NLME-LEAVE after Mgmt_Leave response attempt");
-                let leave_result = self
-                    .bdb
-                    .zdo_mut()
-                    .aps_mut()
-                    .nwk_mut()
-                    .nlme_leave(request.rejoin)
-                    .await;
+                let leave_result = await_out_of_line!(
+                    self.bdb
+                        .zdo_mut()
+                        .aps_mut()
+                        .nwk_mut()
+                        .nlme_leave(request.rejoin)
+                );
                 if request.rejoin {
                     self.bdb.zdo_mut().nwk_mut().set_joined(false);
                     self.reset_identify_clusters();
@@ -5982,6 +6381,14 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 }
                 self.mark_left();
                 return Some(event_loop::StackEvent::Left);
+            }
+
+            // A `Device_annce` can reveal an address conflict (R22 §3.6.1.9.2),
+            // which the NWK layer parks as a lifecycle outcome exactly as a NWK
+            // command does. Collect it here, after ZDO processing, so it is
+            // resolved now rather than left in the slot for a later frame.
+            if let Some(command) = self.bdb.zdo_mut().nwk_mut().take_command_outcome() {
+                return self.handle_nwk_command_outcome(command).await;
             }
 
             return None;

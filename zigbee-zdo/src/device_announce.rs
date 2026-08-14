@@ -82,9 +82,13 @@ impl<M: MacDriver> ZdoLayer<M> {
             annce.ieee_addr,
             annce.capability,
         );
-        // Update NWK neighbor table with the announced short/IEEE address mapping
+        // Update the NWK address map with the announced short/IEEE pairing.
+        // R22 §3.6.1.9.2 lists `Device_annce` as one of the places an address
+        // conflict is detected, so this goes through the NWK layer's conflict
+        // check rather than overwriting the mapping unconditionally; a conflict
+        // is parked as a NWK lifecycle outcome for the runtime.
         self.nwk_mut()
-            .update_neighbor_address(annce.nwk_addr, annce.ieee_addr);
+            .note_announced_address(annce.nwk_addr, annce.ieee_addr);
         Ok(annce)
     }
 }
