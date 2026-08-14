@@ -591,20 +591,100 @@ impl<M: MacDriver> ZdoLayer<M> {
     }
 
     /// Request a Simple_Desc from a remote node.
+    ///
+    /// **Legacy**: asynchronous ZDO response delivery cannot complete inside
+    /// this one-shot call, so it returns `Timeout`. New callers must use
+    /// [`Self::start_simple_desc_req`] plus [`Self::take_response`] instead.
+    #[deprecated(note = "use start_simple_desc_req plus take_response")]
     pub async fn simple_desc_req(
         &mut self,
         dst: ShortAddress,
         endpoint: u8,
     ) -> Result<descriptors::SimpleDescriptor, ZdpStatus> {
+        let (slot, _) = self.start_simple_desc_req(dst, endpoint).await?;
+        self.cancel_pending(slot);
+        Err(ZdpStatus::Timeout)
+    }
+
+    /// Start an event-driven Simple_Desc_req and return its pending-response
+    /// slot and transaction-sequence number.
+    ///
+    /// Unlike [`Self::simple_desc_req`], this does not block waiting for the
+    /// response: the caller polls [`Self::take_response`] on the returned slot
+    /// (and must [`Self::cancel_pending`] it on timeout) from its own bounded
+    /// tick/poll step, so normal ZDO/ZCL traffic keeps flowing while the
+    /// asynchronous `Simple_Desc_rsp` is in flight.
+    pub async fn start_simple_desc_req(
+        &mut self,
+        dst: ShortAddress,
+        endpoint: u8,
+    ) -> Result<(usize, u8), ZdpStatus> {
         let tsn = self.next_seq();
-        let mut buf = [0u8; 4]; // TSN(1) + addr(2) + ep(1)
+        let mut buf = [0u8; 4]; // TSN(1) + NWK_addr(2) + endpoint(1)
         buf[0] = tsn;
         buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
         buf[3] = endpoint;
-        log::debug!("[ZDO] Simple_Desc_req dst=0x{:04X} ep={}", dst.0, endpoint,);
-        let _slot = self.register_pending(tsn, SIMPLE_DESC_RSP);
-        let _ = self.send_zdp_unicast(dst, SIMPLE_DESC_REQ, &buf).await;
-        Err(ZdpStatus::Timeout)
+        let slot = self
+            .register_pending(tsn, SIMPLE_DESC_RSP)
+            .ok_or(ZdpStatus::TableFull)?;
+        log::debug!(
+            "[ZDO] Simple_Desc_req (event-driven) dst=0x{:04X} ep={}",
+            dst.0,
+            endpoint,
+        );
+        if self
+            .send_zdp_unicast(dst, SIMPLE_DESC_REQ, &buf)
+            .await
+            .is_err()
+        {
+            self.cancel_pending(slot);
+            return Err(ZdpStatus::NotActive);
+        }
+        Ok((slot, tsn))
+    }
+
+    /// Start an event-driven IEEE_addr_req (resolve NWK address → IEEE
+    /// address) and return its pending-response slot and transaction-sequence
+    /// number.
+    ///
+    /// Always requests [`crate::discovery::RequestType::Single`] — Finding &
+    /// Binding and other callers only need the address of the single queried
+    /// device, never its associated-device list.
+    pub async fn start_ieee_addr_req(
+        &mut self,
+        dst: ShortAddress,
+    ) -> Result<(usize, u8), ZdpStatus> {
+        let tsn = self.next_seq();
+        // TSN(1) + NWK_addr_of_interest(2) + request_type(1) + start_index(1)
+        let mut buf = [0u8; 5];
+        buf[0] = tsn;
+        buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
+        buf[3] = crate::discovery::RequestType::Single as u8;
+        buf[4] = 0; // start_index — unused for a Single request
+        let slot = self
+            .register_pending(tsn, IEEE_ADDR_RSP)
+            .ok_or(ZdpStatus::TableFull)?;
+        log::debug!("[ZDO] IEEE_addr_req dst=0x{:04X}", dst.0);
+        if self
+            .send_zdp_unicast(dst, IEEE_ADDR_REQ, &buf)
+            .await
+            .is_err()
+        {
+            self.cancel_pending(slot);
+            return Err(ZdpStatus::NotActive);
+        }
+        Ok((slot, tsn))
+    }
+
+    /// Return the transaction-sequence number registered for a pending
+    /// request slot, if any. Primarily useful for tests that need to build a
+    /// matching response frame for an event-driven request.
+    pub fn pending_tsn(&self, slot: usize) -> Option<u8> {
+        if slot < MAX_PENDING_ZDP && self.pending_responses[slot].active {
+            Some(self.pending_responses[slot].tsn)
+        } else {
+            None
+        }
     }
 
     /// Request active endpoints from a remote node.

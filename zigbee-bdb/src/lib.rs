@@ -227,6 +227,18 @@ pub struct BdbLayer<M: MacDriver> {
     pub fb_window_remaining: u16,
     /// Endpoint being used for F&B initiator procedure.
     fb_initiator_endpoint: u8,
+    /// Current stage of the event-driven F&B initiator descriptor/binding
+    /// state machine. `Idle` when no initiator procedure is running.
+    fb_stage: finding_binding::FbStage,
+    /// Deduplicated (nwk_addr, endpoint) targets still to be processed after
+    /// the identify-response collection window closed.
+    fb_targets: heapless::Vec<finding_binding::FbTarget, 8>,
+    /// The target currently being resolved/bound (IEEE lookup → Simple_Desc →
+    /// binding), if any.
+    fb_current: Option<finding_binding::FbTarget>,
+    /// IEEE address resolved for `fb_current`, once known. Never a `[0; 8]`
+    /// placeholder — a unicast binding is only created once this is `Some`.
+    fb_current_ieee: Option<zigbee_types::IeeeAddress>,
     /// In-flight event-driven unique Trust Center link-key exchange.
     ///
     /// Armed after network-up + `Device_annce`; advanced one bounded step per
@@ -248,6 +260,10 @@ impl<M: MacDriver> BdbLayer<M> {
             fb_identify_responses: heapless::Vec::new(),
             fb_window_remaining: 0,
             fb_initiator_endpoint: 0,
+            fb_stage: finding_binding::FbStage::Idle,
+            fb_targets: heapless::Vec::new(),
+            fb_current: None,
+            fb_current_ieee: None,
             tclk_exchange: None,
         }
     }
@@ -268,6 +284,10 @@ impl<M: MacDriver> BdbLayer<M> {
             core::ptr::addr_of_mut!((*slot).fb_identify_responses).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).fb_window_remaining).write(0);
             core::ptr::addr_of_mut!((*slot).fb_initiator_endpoint).write(0);
+            core::ptr::addr_of_mut!((*slot).fb_stage).write(finding_binding::FbStage::Idle);
+            core::ptr::addr_of_mut!((*slot).fb_targets).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*slot).fb_current).write(None);
+            core::ptr::addr_of_mut!((*slot).fb_current_ieee).write(None);
             core::ptr::addr_of_mut!((*slot).tclk_exchange).write(None);
         }
     }
@@ -308,11 +328,24 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Called as part of factory reset — restores all BDB attributes
     /// to their default values and clears internal F&B state.
     pub fn reset_attributes(&mut self) {
+        // Never leak a pending ZDO request-response slot: cancel it before
+        // the F&B state that references it is discarded.
+        match self.fb_stage {
+            finding_binding::FbStage::AwaitIeee { slot, .. }
+            | finding_binding::FbStage::AwaitSimpleDesc { slot, .. } => {
+                self.zdo.cancel_pending(slot);
+            }
+            _ => {}
+        }
         self.attributes = BdbAttributes::default();
         self.fb_target_request = None;
         self.fb_identify_responses.clear();
         self.fb_window_remaining = 0;
         self.fb_initiator_endpoint = 0;
+        self.fb_stage = finding_binding::FbStage::Idle;
+        self.fb_targets.clear();
+        self.fb_current = None;
+        self.fb_current_ieee = None;
         self.tclk_exchange = None;
         self.state = BdbState::Idle;
     }
