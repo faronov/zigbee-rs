@@ -214,6 +214,15 @@ device identity. Existing TB-04 sensor/router EUI offsets remain unchanged
 for deployed persistence and ZHA compatibility; new products should use the
 unchanged factory/UID-derived EUI.
 
+The factory slot uses Telink's vendor byte layout rather than the internal
+on-air byte order used by the Rust MAC. The HAL validates the OUI patterns
+used by the vendor stack and decodes raw bytes as `[6, 7, 0, 1, 2, 3, 4, 5]`.
+For example, raw `db 77 69 38 c1 a4 55 ed` becomes internal
+`55 ed db 77 69 38 c1 a4`, or canonical
+`a4:c1:38:69:77:db:ed:55`. If the factory slot is absent, the stable flash
+UID supplies five device-unique bytes and the internal address ends in
+`38 c1 a4`, preserving the canonical Telink `a4:c1:38` prefix.
+
 Zbit `ZB25WD40B`/`ZB25WD80B` parts require a real ADC check before every
 physical page program or sector erase. The HAL drives PC5 high, samples it,
 and fails closed below 2200 mV, at 500 mV or more fluctuation, or whenever

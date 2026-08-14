@@ -8,6 +8,7 @@ use embedded_storage::nor_flash::{
 };
 
 use super::mmio::REG_IRQ_EN;
+use super::telink_ieee::{decode_telink_ieee, generated_telink_ieee, valid_factory_bytes};
 
 const REG_MSPI_DATA: u32 = 0x80000C;
 const REG_MSPI_CTRL: u32 = 0x80000D;
@@ -624,37 +625,14 @@ pub fn verify_geometry(expected: FlashGeometry) -> Result<(), FlashError> {
 fn factory_ieee_unchecked(geometry: FlashGeometry, address: &mut [u8; 8]) -> u8 {
     *address = [0xFFu8; 8];
     let read_ok = read_bytes(geometry.factory_ieee_address(), address);
-    let all_ff = address[0] == 0xFF
-        && address[1] == 0xFF
-        && address[2] == 0xFF
-        && address[3] == 0xFF
-        && address[4] == 0xFF
-        && address[5] == 0xFF
-        && address[6] == 0xFF
-        && address[7] == 0xFF;
-    let all_zero = address[0] == 0
-        && address[1] == 0
-        && address[2] == 0
-        && address[3] == 0
-        && address[4] == 0
-        && address[5] == 0
-        && address[6] == 0
-        && address[7] == 0;
-    let valid = read_ok && !all_ff && !all_zero;
-    if valid {
+    if read_ok && valid_factory_bytes(*address) {
+        *address = decode_telink_ieee(*address);
         return IEEE_SOURCE_FACTORY;
     }
 
     let mut uid = [0u8; 16];
     if read_uid(&mut uid) && uid_is_valid(&uid) {
-        address[0] = uid[6];
-        address[1] = uid[5];
-        address[2] = uid[4];
-        address[3] = uid[3];
-        address[4] = uid[2];
-        address[5] = uid[1];
-        address[6] = uid[0];
-        address[7] = 0x02;
+        *address = generated_telink_ieee(&uid);
         return IEEE_SOURCE_FLASH_UID;
     }
 

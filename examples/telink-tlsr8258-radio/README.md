@@ -46,7 +46,7 @@ beyond a `bx lr` stub — see [Design notes](#design-notes)).
 | Module | Role |
 |---|---|
 | [`platform`](src/platform/mod.rs) | Boot vectors/startup asm, MMIO register helpers, clocks, Timer0-based bounded waits, GPIO/LED, linker-symbol accessors + layout self-checks |
-| [`tlsr8258_hal::flash`](../../tlsr8258-hal/src/flash.rs) | Factory EUI / flash UID reads and stable UID-derived locally administered EUI fallback |
+| [`tlsr8258_hal::flash`](../../tlsr8258-hal/src/flash.rs) | Telink-layout factory EUI decoding and stable flash-UID-derived EUI fallback |
 | [`tlsr8258_hal::radio`](../../tlsr8258-hal/src/radio/mod.rs) | PHY init, DMA TX/RX, immediate TX-done→RX transition, CCA/CSMA-CA, software ACK, bounded waits, and frame classification |
 | [`tlsr8258_hal::radio::frame`](../../tlsr8258-hal/src/radio/frame.rs) | **Pure, host-testable** Beacon, Association Request/Response, Data Request, data, ACK, and DMA framing/parsing |
 | [`mac_test`](src/mac_test.rs) | The explicit raw test state machine: channel cycle, TX, bounded RX window, outcome recording |
