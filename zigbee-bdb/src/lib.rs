@@ -113,6 +113,7 @@ pub enum SteeringStage {
     TrustCenterLinkKeyExchangeFailed = 15,
     QueryingTrustCenterNodeDescriptor = 16,
     PersistenceFailed = 17,
+    PermitJoiningFailed = 18,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

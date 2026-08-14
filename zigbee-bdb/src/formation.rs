@@ -1,4 +1,4 @@
-//! Network Formation commissioning (BDB v3.0.1 spec §8.4).
+//! Network Formation commissioning (BDB v3.0.1 spec §8.3).
 //!
 //! Network Formation is only available on coordinator-capable devices.
 //! It creates a new Zigbee PAN using `NLME-NETWORK-FORMATION`.
@@ -22,26 +22,30 @@ use zigbee_types::ShortAddress;
 use crate::attributes::BDB_MIN_COMMISSIONING_TIME;
 use crate::{BdbLayer, BdbStatus};
 
-/// Scan duration exponent for ED scan during formation.
-const SCAN_DURATION: u8 = 3;
-
 impl<M: MacDriver> BdbLayer<M> {
-    /// Execute the Network Formation procedure (BDB spec §8.4).
+    /// Execute the Network Formation procedure (BDB spec §8.3).
     ///
     /// Only coordinator-capable devices may form a network.
     /// On success, the device becomes the PAN coordinator and Trust Center.
     pub async fn network_formation(&mut self) -> Result<(), BdbStatus> {
+        self.attributes.commissioning_status =
+            crate::attributes::BdbCommissioningStatus::InProgress;
+
         // Step 1: Verify coordinator capability
         if self.zdo.nwk().device_type() != DeviceType::Coordinator
             || !self.zdo.nwk().mac().capabilities().coordinator
         {
             log::warn!("[BDB:Formation] Not a coordinator — skipping");
+            self.attributes.commissioning_status =
+                crate::attributes::BdbCommissioningStatus::NotPermitted;
             return Err(BdbStatus::NotPermitted);
         }
 
         if self.attributes.node_is_on_a_network {
             log::info!("[BDB:Formation] Already on a network");
-            return Ok(());
+            self.attributes.commissioning_status =
+                crate::attributes::BdbCommissioningStatus::OnANetwork;
+            return Err(BdbStatus::NotPermitted);
         }
 
         // Acquire security material before NLME starts a PAN. If entropy is
@@ -75,7 +79,7 @@ impl<M: MacDriver> BdbLayer<M> {
 
             match self
                 .zdo
-                .nlme_network_formation(channel_mask, SCAN_DURATION)
+                .nlme_network_formation(channel_mask, self.attributes.scan_duration)
                 .await
             {
                 Ok(()) => {
@@ -131,7 +135,11 @@ impl<M: MacDriver> BdbLayer<M> {
         // Broadcast Mgmt_Permit_Joining_req so all routers open
         let _ = self
             .zdo
-            .mgmt_permit_joining_req(ShortAddress::BROADCAST, duration, true)
+            .mgmt_permit_joining_req(
+                ShortAddress::BROADCAST_ROUTERS_AND_COORDINATOR,
+                duration,
+                true,
+            )
             .await;
 
         self.attributes.node_is_on_a_network = true;

@@ -1,4 +1,4 @@
-//! Network Steering commissioning (BDB v3.0.1 spec §8.3).
+//! Network Steering commissioning (BDB v3.0.1 spec §§8.1–8.2).
 //!
 //! Network Steering has two operating modes depending on whether the
 //! device is already on a network:
@@ -41,9 +41,6 @@ macro_rules! bdb_diag {
     ($($arg:tt)*) => {};
 }
 
-/// Default scan duration exponent for active scan (2^n + 1 superframes).
-/// Exponent 3 ≈ 138 ms per channel — good balance of speed vs. reliability.
-const SCAN_DURATION: u8 = 3;
 // The unique Trust Center link-key handshake timing/budget lives in the
 // event-driven state machine (`crate::tclk_exchange`).
 const TCLK_MIN_STACK_REVISION: u8 = 21;
@@ -436,6 +433,86 @@ mod tests {
         bdb
     }
 
+    fn joined_router_bdb() -> BdbLayer<MockMac> {
+        let ieee = [0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28];
+        let mac = MockMac::new(ieee);
+        let mut nwk = NwkLayer::new(mac, DeviceType::Router);
+        nwk.set_joined(true);
+        nwk.security_mut().set_network_key(TEST_NETWORK_KEY, 0);
+        {
+            let nib = nwk.nib_mut();
+            nib.network_address = ShortAddress(0x3344);
+            nib.pan_id = PanId(TEST_PAN_ID);
+            nib.extended_pan_id = [0xBB; 8];
+            nib.logical_channel = TEST_CHANNEL;
+            nib.security_enabled = true;
+        }
+        let aps = ApsLayer::new(nwk);
+        let mut zdo = ZdoLayer::new(aps);
+        zdo.set_local_nwk_addr(ShortAddress(0x3344));
+        zdo.set_local_ieee_addr(ieee);
+        let mut bdb = BdbLayer::new(zdo);
+        bdb.attributes_mut().node_is_on_a_network = true;
+        bdb
+    }
+
+    fn transmitted_nwk_destination(bdb: &BdbLayer<MockMac>, index: usize) -> ShortAddress {
+        NwkHeader::parse(
+            bdb.zdo()
+                .nwk()
+                .mac()
+                .tx_history()
+                .get(index)
+                .expect("expected transmitted frame")
+                .payload
+                .as_slice(),
+        )
+        .map(|(header, _)| header.dst_addr)
+        .expect("transmitted frame must contain a NWK header")
+    }
+
+    #[test]
+    fn on_network_end_device_broadcasts_permit_joining_to_all_routers() {
+        let mut bdb = steered_bdb();
+        bdb.zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut()
+            .clear_tx_history();
+
+        assert_eq!(block_on(bdb.steer_on_network()), Ok(()));
+        assert_eq!(bdb.zdo().nwk().mac().tx_history().len(), 1);
+        assert_eq!(
+            transmitted_nwk_destination(&bdb, 0),
+            ShortAddress::BROADCAST_ROUTERS_AND_COORDINATOR,
+        );
+        assert!(
+            !bdb.zdo().nwk().nib().permit_joining,
+            "an end device broadcasts the request but cannot admit children locally"
+        );
+        assert_eq!(
+            bdb.attributes().commissioning_status,
+            crate::attributes::BdbCommissioningStatus::Success,
+        );
+    }
+
+    #[test]
+    fn on_network_router_broadcasts_before_opening_local_permit_joining() {
+        let mut bdb = joined_router_bdb();
+
+        assert_eq!(block_on(bdb.steer_on_network()), Ok(()));
+        assert_eq!(bdb.zdo().nwk().mac().tx_history().len(), 1);
+        assert_eq!(
+            transmitted_nwk_destination(&bdb, 0),
+            ShortAddress::BROADCAST_ROUTERS_AND_COORDINATOR,
+        );
+        assert!(bdb.zdo().nwk().nib().permit_joining);
+        assert_eq!(
+            bdb.zdo().nwk().nib().permit_joining_duration,
+            core::cmp::min(BDB_MIN_COMMISSIONING_TIME, 254) as u8,
+        );
+    }
+
     /// Walk the start delay and land on the first Node_Desc transmission.
     fn arrive_at_send_node_desc(bdb: &mut BdbLayer<MockMac>) {
         advance_time(bdb, TCLK_EXCHANGE_START_DELAY_US);
@@ -785,6 +862,38 @@ mod tests {
         assert_eq!(step(&mut bdb), TclkProgress::InProgress);
         assert_eq!(stage(&bdb), TclkStage::AwaitConfirmKey);
         bdb
+    }
+
+    #[test]
+    fn successful_off_network_steering_broadcasts_permit_joining_before_completion() {
+        let mut bdb = waiting_for_confirm_key_bdb();
+        bdb.zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut()
+            .clear_tx_history();
+
+        inject_successful_confirm_key(&mut bdb, 0x0000_0300);
+        assert_eq!(step(&mut bdb), TclkProgress::Complete);
+
+        let history = bdb.zdo().nwk().mac().tx_history();
+        assert_eq!(
+            history.len(),
+            2,
+            "completion broadcasts Permit Joining, then the authenticated Device_annce"
+        );
+        assert_eq!(
+            transmitted_nwk_destination(&bdb, 0),
+            ShortAddress::BROADCAST_ROUTERS_AND_COORDINATOR,
+        );
+        assert_eq!(
+            transmitted_nwk_destination(&bdb, 1),
+            ShortAddress::BROADCAST_RX_ON_WHEN_IDLE,
+        );
+        assert_eq!(
+            bdb.attributes().commissioning_status,
+            crate::attributes::BdbCommissioningStatus::Success,
+        );
     }
 
     fn inject_verify_key_ack(bdb: &mut BdbLayer<MockMac>) {
@@ -1570,7 +1679,12 @@ mod tests {
     #[test]
     fn pre_r21_commits_configured_default_trust_center_key() {
         let tc_ieee = [0xAA; 8];
-        let mut bdb = test_bdb();
+        let mut bdb = steered_bdb();
+        bdb.zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut()
+            .clear_tx_history();
         let expected_key = *bdb.zdo().aps().security().default_tc_link_key();
         let mut exchange = TclkExchange::new(ShortAddress::COORDINATOR, tc_ieee, 0);
         let mut persistence = TestPersistence::default();
@@ -1614,7 +1728,7 @@ impl<M: MacDriver> BdbLayer<M> {
             >= TRANSPORT_KEY_WAIT_US
     }
 
-    /// Execute the Network Steering procedure (BDB spec §8.3).
+    /// Execute the Network Steering procedure (BDB spec §§8.1–8.2).
     ///
     /// Behaviour depends on `bdbNodeIsOnANetwork`:
     /// - **Not on network**: scan → join → announce → TC key exchange
@@ -1648,6 +1762,8 @@ impl<M: MacDriver> BdbLayer<M> {
     ) -> Result<(), BdbStatus> {
         self.steering_diagnostics = SteeringDiagnostics::default();
         self.tclk_exchange = None;
+        self.attributes.commissioning_status =
+            crate::attributes::BdbCommissioningStatus::InProgress;
         if self.attributes.node_is_on_a_network {
             self.steer_on_network().await
         } else {
@@ -1771,7 +1887,7 @@ impl<M: MacDriver> BdbLayer<M> {
                 self.steering_diagnostics.scan_requests.saturating_add(1);
             let networks = match self
                 .zdo
-                .nlme_network_discovery(channel_mask, SCAN_DURATION)
+                .nlme_network_discovery(channel_mask, self.attributes.scan_duration)
                 .await
             {
                 Ok(n) => n,
@@ -2248,8 +2364,7 @@ impl<M: MacDriver> BdbLayer<M> {
         } else {
             self.steering_diagnostics.stage = SteeringStage::NoNetworks;
         }
-        self.attributes.commissioning_status =
-            crate::attributes::BdbCommissioningStatus::NoScanResponse;
+        self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::NoNetwork;
         Err(BdbStatus::NoScanResponse)
     }
 
@@ -2925,9 +3040,10 @@ impl<M: MacDriver> BdbLayer<M> {
     async fn finalize_pre_r21(
         &mut self,
         ex: &mut TclkExchange,
-        persistence: Option<&mut (dyn SecurityPersistence + '_)>,
+        mut persistence: Option<&mut (dyn SecurityPersistence + '_)>,
     ) -> TclkProgress {
-        if let Some(persistence) = persistence {
+        let mut state_to_commit = None;
+        if let Some(persistence) = persistence.as_deref_mut() {
             let key = *self.zdo.aps().security().default_tc_link_key();
             let mut state = TrustCenterLinkKeyState {
                 partner_address: ex.tc_ieee,
@@ -2964,13 +3080,21 @@ impl<M: MacDriver> BdbLayer<M> {
                 log::error!("[BDB:Steering] Failed to install pre-R21 Trust Center key");
                 return self.finalize_persistence_failure(ex).await;
             }
-            if let Err(error) = persistence.commit_network(&state) {
-                log::error!(
-                    "[BDB:Steering] Failed to commit pre-R21 commissioned network: {:?}",
-                    error
-                );
-                return self.finalize_persistence_failure(ex).await;
-            }
+            state_to_commit = Some(state);
+        }
+
+        if let Err(status) = self.activate_permit_joining_after_steering().await {
+            return self.finalize_post_auth_steering_failure(ex, status).await;
+        }
+
+        if let (Some(persistence), Some(state)) = (persistence, state_to_commit)
+            && let Err(error) = persistence.commit_network(&state)
+        {
+            log::error!(
+                "[BDB:Steering] Failed to commit pre-R21 commissioned network: {:?}",
+                error
+            );
+            return self.finalize_persistence_failure(ex).await;
         }
         self.mark_commissioned_success(ex)
     }
@@ -2981,6 +3105,9 @@ impl<M: MacDriver> BdbLayer<M> {
         ex: &mut TclkExchange,
         persistence: Option<&mut (dyn SecurityPersistence + '_)>,
     ) -> TclkProgress {
+        if let Err(status) = self.activate_permit_joining_after_steering().await {
+            return self.finalize_post_auth_steering_failure(ex, status).await;
+        }
         if let Some(persistence) = persistence
             && let Err(error) = self.commit_persisted_network(persistence, &ex.tc_ieee)
         {
@@ -3000,7 +3127,8 @@ impl<M: MacDriver> BdbLayer<M> {
         self.steering_diagnostics.stage = SteeringStage::TrustCenterLinkKeyExchangeFailed;
         self.attributes.commissioning_status =
             crate::attributes::BdbCommissioningStatus::TcLinkKeyExchangeFailure;
-        self.leave_after_tclk_failure(&ex.tc_ieee).await;
+        self.leave_after_initial_commissioning_failure(&ex.tc_ieee)
+            .await;
         TclkProgress::Failed(BdbStatus::TrustCenterLinkKeyExchangeFailure)
     }
 
@@ -3009,8 +3137,23 @@ impl<M: MacDriver> BdbLayer<M> {
         self.cancel_pending_tclk_response(ex);
         ex.stage = TclkStage::Failed;
         self.steering_diagnostics.stage = SteeringStage::PersistenceFailed;
-        self.leave_after_tclk_failure(&ex.tc_ieee).await;
+        self.leave_after_initial_commissioning_failure(&ex.tc_ieee)
+            .await;
         TclkProgress::Failed(BdbStatus::PersistenceFailure)
+    }
+
+    async fn finalize_post_auth_steering_failure(
+        &mut self,
+        ex: &mut TclkExchange,
+        status: BdbStatus,
+    ) -> TclkProgress {
+        self.cancel_pending_tclk_response(ex);
+        ex.stage = TclkStage::Failed;
+        self.steering_diagnostics.stage = SteeringStage::PermitJoiningFailed;
+        self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::NoNetwork;
+        self.leave_after_initial_commissioning_failure(&ex.tc_ieee)
+            .await;
+        TclkProgress::Failed(status)
     }
 
     /// Release any ZDO client transaction still owned by the exchange.
@@ -3034,10 +3177,13 @@ impl<M: MacDriver> BdbLayer<M> {
     /// secured NWK Leave is best effort: if it cannot be sent (no key, already
     /// down, radio error) the local stack is still reset so the device never
     /// stays commissioned after a failed R21+ initial join.
-    async fn leave_after_tclk_failure(&mut self, tc_ieee: &zigbee_types::IeeeAddress) {
+    async fn leave_after_initial_commissioning_failure(
+        &mut self,
+        tc_ieee: &zigbee_types::IeeeAddress,
+    ) {
         match self.zdo.nlme_leave(false).await {
             Ok(()) => {
-                log::info!("[BDB:Steering] Left the network after failed authentication");
+                log::info!("[BDB:Steering] Left the network after commissioning failure");
             }
             Err(status) => {
                 log::warn!(
@@ -3061,40 +3207,43 @@ impl<M: MacDriver> BdbLayer<M> {
     async fn steer_on_network(&mut self) -> Result<(), BdbStatus> {
         log::info!("[BDB:Steering] Already on network — opening permit joining");
 
-        // Can only permit joining on coordinator / router
-        if self.zdo.nwk().device_type() == DeviceType::EndDevice {
-            log::debug!("[BDB:Steering] End device — skipping permit joining");
-            // End devices can only trigger steering-on-network by sending
-            // Mgmt_Permit_Joining_req to their parent / coordinator.
-            let _ = self
-                .zdo
-                .mgmt_permit_joining_req(
-                    ShortAddress::COORDINATOR,
-                    BDB_MIN_COMMISSIONING_TIME as u8,
-                    true,
-                )
-                .await;
-            return Ok(());
+        if let Err(status) = self.activate_permit_joining_after_steering().await {
+            self.attributes.commissioning_status =
+                crate::attributes::BdbCommissioningStatus::NotPermitted;
+            return Err(status);
         }
-
-        // Open local permit joining (duration = bdbcMinCommissioningTime)
-        // Duration is capped at 254 (0xFE) seconds per Zigbee spec.
-        let duration = core::cmp::min(BDB_MIN_COMMISSIONING_TIME, 254) as u8;
-
-        self.zdo
-            .nlme_permit_joining(duration)
-            .await
-            .map_err(|_| BdbStatus::SteeringFailure)?;
-
-        // Broadcast Mgmt_Permit_Joining_req to all routers
-        self.zdo
-            .mgmt_permit_joining_req(ShortAddress::BROADCAST, duration, true)
-            .await
-            .map_err(|_| BdbStatus::SteeringFailure)?;
 
         self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::Success;
 
-        log::info!("[BDB:Steering] Permit joining opened for {}s", duration,);
+        log::info!(
+            "[BDB:Steering] Permit joining requested for {}s",
+            core::cmp::min(BDB_MIN_COMMISSIONING_TIME, 254),
+        );
+        Ok(())
+    }
+
+    /// Complete BDB steering by extending the network-wide permit-joining
+    /// window, then opening the local association flag when this node can
+    /// admit children (BDB v3.0.1 §§8.1 step 3–4 and 8.2 steps 14–15).
+    async fn activate_permit_joining_after_steering(&mut self) -> Result<(), BdbStatus> {
+        let duration = core::cmp::min(BDB_MIN_COMMISSIONING_TIME, 254) as u8;
+
+        self.zdo
+            .mgmt_permit_joining_req(
+                ShortAddress::BROADCAST_ROUTERS_AND_COORDINATOR,
+                duration,
+                true,
+            )
+            .await
+            .map_err(|_| BdbStatus::SteeringFailure)?;
+
+        if self.zdo.nwk().device_type() != DeviceType::EndDevice {
+            self.zdo
+                .nlme_permit_joining(duration)
+                .await
+                .map_err(|_| BdbStatus::SteeringFailure)?;
+        }
+
         Ok(())
     }
 
