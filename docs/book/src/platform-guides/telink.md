@@ -93,9 +93,9 @@ With the pinned `tc32-45` toolchain, the current production payloads are:
 | Image | Raw payload | Complete-HAL baseline | Reduction | CI budget |
 |---|---:|---:|---:|---:|
 | End-device sensor | 271,836 B | 323,876 B | 52,040 B (16.1%) | 280 KiB |
-| Parent router | 328,404 B | 349,792 B | 21,388 B (6.1%) | 336 KiB |
+| Parent router | 328,396 B | 349,792 B | 21,396 B (6.1%) | 336 KiB |
 
-The router is 56,568 bytes larger because it retains route maintenance, child
+The router is 56,560 bytes larger because it retains route maintenance, child
 admission and aging, indirect delivery, parent-side MAC commands,
 Update-Device handling, and Parent Announce. The sensor compiles those paths
 out and retains only its leaf behavior, including the R22 End Device Timeout

@@ -513,12 +513,10 @@ where
             Err(_) => LoopControl::Recommission,
         },
         StackEvent::BasicResetToFactoryDefaults => LoopControl::Continue,
-        StackEvent::LeaveRequested => {
-            match node.factory_reset().await {
-                Ok(()) => LoopControl::Recommission,
-                Err(_) => LoopControl::Fatal,
-            }
-        }
+        StackEvent::LeaveRequested => match node.factory_reset().await {
+            Ok(()) => LoopControl::Recommission,
+            Err(_) => LoopControl::Fatal,
+        },
         StackEvent::Left | StackEvent::CommissioningComplete { success: false } => {
             LoopControl::Recommission
         }

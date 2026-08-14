@@ -15,7 +15,7 @@ flash offsets are platform-specific.
 | Platform and role | Raw payload | Packaged image | CI raw budget |
 |---|---:|---:|---:|
 | TLSR8258 end-device sensor (hardware AES) | 271,836 B | — | 280 KiB |
-| TLSR8258 parent router (hardware AES) | 328,404 B | — | 336 KiB |
+| TLSR8258 parent router (hardware AES) | 328,396 B | — | 336 KiB |
 | BL702 end-device sensor (hardware AES) | 178,082 B | — | 192 KiB |
 | nRF52840 end-device sensor | 222,336 B | — | 220 KiB |
 | nRF52840 relay router | 225,560 B | — | — |
@@ -24,7 +24,7 @@ flash offsets are platform-specific.
 
 The TLSR8258 rows are `scripts/tlsr8258.sh build sensor` / `build router` on
 the pinned `tc32-45` toolchain, which is exactly what CI builds; they leave
-14,884 and 15,660 bytes of budget headroom respectively. The BL702, nRF and
+14,884 and 15,668 bytes of budget headroom respectively. The BL702, nRF and
 EFR32 raw payloads were re-measured with the same release profiles CI builds.
 Packaged images were not rebuilt. CI remains the authoritative source per
 commit, because it enforces the budget column with
@@ -42,7 +42,7 @@ commissioning and receive coroutines into two enormous ones (see
 | TLSR8258 image | Before router maintenance | With R22 conflict/Link Status work | After outlining |
 |---|---:|---:|---:|
 | End-device sensor | 286,288 B | 286,512 B | 271,836 B |
-| Parent router | 338,276 B | 346,280 B | 328,404 B |
+| Parent router | 338,276 B | 346,280 B | 328,396 B |
 
 The middle column is why this matters: the router exceeded its 344,064-byte
 budget by 2,216 bytes and the sensor had 208 bytes left. No R22 behavior was
@@ -74,9 +74,9 @@ comparison:
 | TLSR8258 image | Complete-HAL baseline | Current | Reduction |
 |---|---:|---:|---:|
 | End-device sensor | 323,876 B | 271,836 B | 52,040 B (16.1%) |
-| Parent router | 349,792 B | 328,404 B | 21,388 B (6.1%) |
+| Parent router | 349,792 B | 328,396 B | 21,396 B (6.1%) |
 
-The current router is 56,568 bytes larger than the sensor because it retains
+The current router is 56,560 bytes larger than the sensor because it retains
 the behavior a real parent needs: route maintenance, child admission and
 aging, indirect delivery, parent-side MAC commands, Update-Device handling,
 and Parent Announce. The sensor instead retains the R22 End Device Timeout
@@ -130,7 +130,7 @@ set of outlined awaits:
 | `await_out_of_line!` (`Pin<&mut dyn Future>`) | 329,720 B | 9,388 B |
 
 The shipped image adds three more outlined awaits in router maintenance,
-reaching 328,404 B at the same coroutine frame size.
+reaching 328,396 B at the same coroutine frame size.
 
 The generic `async fn` wrapper is the trap: the caller ends up holding the
 moved-from temporary *and* the wrapper coroutine across the await, so every
@@ -192,7 +192,7 @@ hardware-AES release measured 269,960 bytes for the sensor and 327,760 bytes
 for the router, saving 2,640 and 4,680 bytes respectively over the former
 software builds with 8 additional bytes of RAM. The later receive-queue
 redesign and the coroutine outlining above reduced the current standard images
-to 271,836 and 328,404 bytes without changing that AES policy. Both production
+to 271,836 and 328,396 bytes without changing that AES policy. Both production
 manifests install the accelerator unconditionally and fail closed without a
 software fallback.
 

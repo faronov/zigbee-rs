@@ -661,11 +661,15 @@ impl<'a> LinkStatusReport<'a> {
     /// Iterate the entries in the order they appear on the wire (R22 requires
     /// ascending network address order).
     pub fn iter(&self) -> impl Iterator<Item = LinkStatusEntry> + 'a {
-        self.entries.chunks_exact(3).map(|chunk| LinkStatusEntry {
-            address: ShortAddress(u16::from_le_bytes([chunk[0], chunk[1]])),
-            incoming_cost: chunk[2] & 0x07,
-            outgoing_cost: (chunk[2] >> 4) & 0x07,
-        })
+        self.entries
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|chunk| LinkStatusEntry {
+                address: ShortAddress(u16::from_le_bytes([chunk[0], chunk[1]])),
+                incoming_cost: chunk[2] & 0x07,
+                outgoing_cost: (chunk[2] >> 4) & 0x07,
+            })
     }
 
     /// Whether `address` falls inside the range this frame describes.
@@ -771,7 +775,7 @@ impl PanIdConflictReport {
         let mut epid = [0u8; 8];
         epid.copy_from_slice(&data[1..9]);
         let mut pan_ids = heapless::Vec::new();
-        for chunk in data[9..end].chunks_exact(2) {
+        for chunk in data[9..end].as_chunks::<2>().0 {
             // A report from a dense neighborhood may name more PAN IDs than
             // this build stores. The excess is dropped rather than rejecting
             // the report: every PAN ID that *is* kept still constrains the
