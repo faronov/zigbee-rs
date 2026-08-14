@@ -93,7 +93,7 @@ impl<M: MacDriver> BdbLayer<M> {
         }
 
         self.attributes.commissioning_status =
-            crate::attributes::BdbCommissioningStatus::SteeringFormationFailure;
+            crate::attributes::BdbCommissioningStatus::FormationFailure;
         Err(BdbStatus::FormationFailure)
     }
 

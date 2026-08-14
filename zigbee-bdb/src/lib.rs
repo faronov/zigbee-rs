@@ -4,10 +4,10 @@
 //!
 //! | Method              | Module              | BDB spec |
 //! |---------------------|---------------------|----------|
-//! | Network Steering    | [`steering`]        | §8.3     |
-//! | Network Formation   | [`formation`]       | §8.4     |
-//! | Finding & Binding   | [`finding_binding`] | §8.5     |
-//! | Touchlink           | [`touchlink`]       | §8.7     |
+//! | Network Steering    | [`steering`]        | §§8.1–8.2 |
+//! | Network Formation   | [`formation`]       | §8.3     |
+//! | Finding & Binding   | [`finding_binding`] | §§8.4–8.5 |
+//! | Touchlink           | `touchlink` feature | §§8.6–8.7 |
 //!
 //! # Architecture
 //! ```text
@@ -21,7 +21,7 @@
 //! │  ├── steering: join existing network │
 //! │  ├── formation: create network       │
 //! │  ├── finding_binding: EZ-Mode F&B    │
-//! │  ├── touchlink: proximity comm.      │
+//! │  ├── touchlink: experimental feature │
 //! │  └── attributes: BDB attributes      │
 //! └──────────────┬───────────────────────┘
 //!                │ ZDP services / NLME-*
@@ -40,6 +40,7 @@ pub mod security_persistence;
 pub mod state_machine;
 pub mod steering;
 pub mod tclk_exchange;
+#[cfg(feature = "touchlink")]
 pub mod touchlink;
 
 use zigbee_mac::MacDriver;

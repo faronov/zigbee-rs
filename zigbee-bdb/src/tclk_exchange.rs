@@ -28,9 +28,10 @@
 //! discards the unique key the Trust Center already installed.
 //!
 //! This module implements exactly that: three independent transmission budgets
-//! of [`TCLK_MESSAGE_ATTEMPTS`] each, a short explicit retry backoff,
-//! per-message response windows, and one wrapping-safe overall deadline that
-//! strictly fails the exchange.
+//! of [`TCLK_MESSAGE_ATTEMPTS`] each, a short explicit retry backoff, the
+//! BDB-defined five-second response window for every attempt, and one
+//! wrapping-safe overall deadline that cannot expire before all attempt
+//! budgets have been available.
 
 use zigbee_types::{IeeeAddress, ShortAddress};
 
@@ -58,24 +59,29 @@ pub(crate) const TCLK_RETRY_BACKOFF_US: u32 = 250_000;
 /// inside [`TCLK_EXCHANGE_DEADLINE_US`].
 pub(crate) const TCLK_EXCHANGE_START_DELAY_US: u32 = 300_000;
 
+/// `bdbcTCLinkKeyExchangeTimeout` (BDB v3.0.1 Table 1): five seconds.
+pub(crate) const BDBC_TC_LINK_KEY_EXCHANGE_TIMEOUT_US: u32 = 5_000_000;
+
 /// Response window for the Trust Center Node Descriptor probe.
-pub(crate) const TCLK_NODE_DESC_TIMEOUT_US: u32 = 1_500_000;
+pub(crate) const TCLK_NODE_DESC_TIMEOUT_US: u32 = BDBC_TC_LINK_KEY_EXCHANGE_TIMEOUT_US;
 
 /// Response window for APS Request-Key → Transport-Key (unique TCLK install).
-pub(crate) const TCLK_REQUEST_KEY_TIMEOUT_US: u32 = 3_000_000;
+pub(crate) const TCLK_REQUEST_KEY_TIMEOUT_US: u32 = BDBC_TC_LINK_KEY_EXCHANGE_TIMEOUT_US;
 
 /// Response window for APS Verify-Key → Confirm-Key.
-///
-/// Matches GSDK `VERIFY_KEY_TIMEOUT_MS` (5 s) in
-/// `app/framework/plugin/network-steering/network-steering.c`.
-pub(crate) const TCLK_VERIFY_KEY_TIMEOUT_US: u32 = 5_000_000;
+pub(crate) const TCLK_VERIFY_KEY_TIMEOUT_US: u32 = BDBC_TC_LINK_KEY_EXCHANGE_TIMEOUT_US;
 
 /// Overall deadline for the whole post-announce handshake.
 ///
 /// Measured from the moment the exchange is armed. Expiry is a strict failure:
 /// the exchange never silently keeps running or converts a transport
-/// acknowledgement into key-verification success.
-pub(crate) const TCLK_EXCHANGE_DEADLINE_US: u32 = 15_000_000;
+/// acknowledgement into key-verification success. The deadline includes every
+/// BDB-permitted response window, every retry backoff, and one second of
+/// scheduler margin.
+pub(crate) const TCLK_EXCHANGE_DEADLINE_US: u32 = TCLK_EXCHANGE_START_DELAY_US
+    + TCLK_MAX_RESPONSE_WINDOW_BUDGET_US
+    + TCLK_MAX_RETRY_BACKOFF_BUDGET_US
+    + 1_000_000;
 
 /// Worst-case duration of the *first* pass through every stage.
 ///
@@ -93,9 +99,17 @@ pub(crate) const TCLK_FIRST_PASS_BUDGET_US: u32 = TCLK_EXCHANGE_START_DELAY_US
 pub(crate) const TCLK_MAX_RETRY_BACKOFF_BUDGET_US: u32 =
     (TCLK_MESSAGE_ATTEMPTS as u32 - 1) * 3 * TCLK_RETRY_BACKOFF_US;
 
+/// Maximum time spent waiting for responses if every message type consumes
+/// its complete BDB attempt budget.
+pub(crate) const TCLK_MAX_RESPONSE_WINDOW_BUDGET_US: u32 =
+    TCLK_MESSAGE_ATTEMPTS as u32 * 3 * BDBC_TC_LINK_KEY_EXCHANGE_TIMEOUT_US;
+
 const _: () = assert!(TCLK_FIRST_PASS_BUDGET_US < TCLK_EXCHANGE_DEADLINE_US);
 const _: () = assert!(
-    TCLK_FIRST_PASS_BUDGET_US + TCLK_MAX_RETRY_BACKOFF_BUDGET_US < TCLK_EXCHANGE_DEADLINE_US
+    TCLK_EXCHANGE_START_DELAY_US
+        + TCLK_MAX_RESPONSE_WINDOW_BUDGET_US
+        + TCLK_MAX_RETRY_BACKOFF_BUDGET_US
+        < TCLK_EXCHANGE_DEADLINE_US
 );
 
 /// Stage of the bounded unique-TCLK handshake.
@@ -345,12 +359,25 @@ mod tests {
         assert!(ex.stage_timed_out(10_000 + TCLK_NODE_DESC_TIMEOUT_US));
 
         ex.enter(TclkStage::AwaitTclk, 10_000);
-        assert!(!ex.stage_timed_out(10_000 + TCLK_NODE_DESC_TIMEOUT_US));
+        assert!(!ex.stage_timed_out(10_000 + TCLK_REQUEST_KEY_TIMEOUT_US - 1));
         assert!(ex.stage_timed_out(10_000 + TCLK_REQUEST_KEY_TIMEOUT_US));
 
         ex.enter(TclkStage::AwaitConfirmKey, 10_000);
-        assert!(!ex.stage_timed_out(10_000 + TCLK_REQUEST_KEY_TIMEOUT_US));
+        assert!(!ex.stage_timed_out(10_000 + TCLK_VERIFY_KEY_TIMEOUT_US - 1));
         assert!(ex.stage_timed_out(10_000 + TCLK_VERIFY_KEY_TIMEOUT_US));
+
+        assert_eq!(
+            TCLK_NODE_DESC_TIMEOUT_US,
+            BDBC_TC_LINK_KEY_EXCHANGE_TIMEOUT_US
+        );
+        assert_eq!(
+            TCLK_REQUEST_KEY_TIMEOUT_US,
+            BDBC_TC_LINK_KEY_EXCHANGE_TIMEOUT_US
+        );
+        assert_eq!(
+            TCLK_VERIFY_KEY_TIMEOUT_US,
+            BDBC_TC_LINK_KEY_EXCHANGE_TIMEOUT_US
+        );
     }
 
     #[test]
@@ -397,19 +424,19 @@ mod tests {
     }
 
     #[test]
-    fn one_full_pass_of_every_stage_fits_inside_the_overall_deadline() {
-        // A Trust Center that answers at the edge of every window must still
-        // be able to finish the first authentication pass, even if every
-        // message type needs both permitted inter-attempt backoffs first.
+    fn every_bdb_attempt_window_fits_inside_the_overall_deadline() {
         const { assert!(TCLK_FIRST_PASS_BUDGET_US < TCLK_EXCHANGE_DEADLINE_US) };
         const {
             assert!(
-                TCLK_FIRST_PASS_BUDGET_US + TCLK_MAX_RETRY_BACKOFF_BUDGET_US
+                TCLK_EXCHANGE_START_DELAY_US
+                    + TCLK_MAX_RESPONSE_WINDOW_BUDGET_US
+                    + TCLK_MAX_RETRY_BACKOFF_BUDGET_US
                     < TCLK_EXCHANGE_DEADLINE_US
             )
         };
-        assert_eq!(TCLK_FIRST_PASS_BUDGET_US, 9_800_000);
+        assert_eq!(TCLK_FIRST_PASS_BUDGET_US, 15_300_000);
+        assert_eq!(TCLK_MAX_RESPONSE_WINDOW_BUDGET_US, 45_000_000);
         assert_eq!(TCLK_MAX_RETRY_BACKOFF_BUDGET_US, 1_500_000);
-        assert_eq!(TCLK_EXCHANGE_DEADLINE_US, 15_000_000);
+        assert_eq!(TCLK_EXCHANGE_DEADLINE_US, 47_800_000);
     }
 }

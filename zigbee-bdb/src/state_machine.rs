@@ -1,7 +1,8 @@
-//! BDB top-level commissioning state machine (BDB v3.0.1 spec §8.1–§8.2).
+//! BDB initialization and commissioning state machine (BDB v3.0.1 §§7–8).
 //!
 //! The state machine orchestrates the four commissioning methods in priority
-//! order: Touchlink → Steering → Formation → Finding & Binding.
+//! order: Touchlink (when explicitly enabled) → Steering → Formation →
+//! Finding & Binding.
 //!
 //! ```text
 //!                         ┌──────────┐
@@ -45,14 +46,14 @@ use crate::{BdbLayer, BdbStatus};
 pub struct CommissioningMode(pub u8);
 
 impl CommissioningMode {
-    /// Touchlink commissioning (BDB §8.7)
-    pub const TOUCHLINK: Self = Self(0x01);
-    /// Network Steering (BDB §8.3) — join existing network / open permit joining
-    pub const STEERING: Self = Self(0x02);
-    /// Network Formation (BDB §8.4) — create new PAN (coordinator only)
-    pub const FORMATION: Self = Self(0x04);
-    /// Finding & Binding (BDB §8.5) — EZ-Mode automatic binding
-    pub const FINDING_BINDING: Self = Self(0x08);
+    /// Network Steering (BDB §§8.1–8.2) — join or open permit joining.
+    pub const STEERING: Self = Self(1 << 0);
+    /// Network Formation (BDB §8.3) — create a new PAN.
+    pub const FORMATION: Self = Self(1 << 1);
+    /// Finding & Binding (BDB §§8.4–8.5).
+    pub const FINDING_BINDING: Self = Self(1 << 2);
+    /// Touchlink commissioning (BDB §§8.6–8.7).
+    pub const TOUCHLINK: Self = Self(1 << 3);
     /// All methods enabled
     pub const ALL: Self = Self(0x0F);
 
@@ -80,22 +81,22 @@ impl CommissioningMode {
 pub enum BdbState {
     /// No commissioning in progress.
     Idle,
-    /// Running BDB initialisation (spec §8.1).
+    /// Running BDB initialisation (spec §7.1).
     Initializing,
-    /// Network Steering is in progress (spec §8.3).
+    /// Network Steering is in progress (spec §§8.1–8.2).
     NetworkSteering,
-    /// Network Formation is in progress (spec §8.4).
+    /// Network Formation is in progress (spec §8.3).
     NetworkFormation,
-    /// Finding & Binding is in progress (spec §8.5).
+    /// Finding & Binding is in progress (spec §§8.4–8.5).
     FindingBinding,
-    /// Touchlink commissioning is in progress (spec §8.7).
+    /// Touchlink commissioning is in progress (spec §§8.6–8.7).
     Touchlink,
 }
 
 // ── State machine implementation ────────────────────────────
 
 impl<M: MacDriver> BdbLayer<M> {
-    /// BDB initialisation procedure (BDB spec §8.1).
+    /// BDB initialisation procedure (BDB spec §7.1).
     ///
     /// Must be called once after power-on/reset before any commissioning.
     /// Sets up the device-type–dependent commissioning capabilities and
@@ -110,19 +111,22 @@ impl<M: MacDriver> BdbLayer<M> {
             return Err(BdbStatus::NotPermitted);
         }
 
-        // Determine commissioning capabilities based on device type
+        // Network steering is mandatory. Formation depends on the logical
+        // type; optional F&B and Touchlink capabilities must be explicitly
+        // enabled by the application before initialization.
         let device_type = self.zdo.nwk().device_type();
-        let cap = match device_type {
-            DeviceType::Coordinator => CommissioningMode::STEERING
-                .or(CommissioningMode::FORMATION)
-                .or(CommissioningMode::FINDING_BINDING),
-            DeviceType::Router => CommissioningMode::STEERING
-                .or(CommissioningMode::FINDING_BINDING)
-                .or(CommissioningMode::TOUCHLINK),
-            DeviceType::EndDevice => CommissioningMode::STEERING
-                .or(CommissioningMode::FINDING_BINDING)
-                .or(CommissioningMode::TOUCHLINK),
-        };
+        let requested_capabilities = self.attributes.node_commissioning_capability;
+        let mut cap = CommissioningMode::STEERING;
+        if device_type == DeviceType::Coordinator {
+            cap = cap.or(CommissioningMode::FORMATION);
+        }
+        if requested_capabilities.contains(CommissioningMode::FINDING_BINDING) {
+            cap = cap.or(CommissioningMode::FINDING_BINDING);
+        }
+        #[cfg(feature = "touchlink")]
+        if requested_capabilities.contains(CommissioningMode::TOUCHLINK) {
+            cap = cap.or(CommissioningMode::TOUCHLINK);
+        }
         self.attributes.node_commissioning_capability = cap;
 
         // Sync on-network state with NWK layer
@@ -137,7 +141,7 @@ impl<M: MacDriver> BdbLayer<M> {
         Ok(())
     }
 
-    /// Top-level commissioning dispatcher (BDB spec §8.2).
+    /// Top-level commissioning dispatcher (BDB spec §8).
     ///
     /// Runs each enabled commissioning method in the spec-defined order:
     /// 1. Touchlink (if enabled)
@@ -152,7 +156,7 @@ impl<M: MacDriver> BdbLayer<M> {
     pub async fn commission(&mut self) -> Result<(), BdbStatus> {
         let mode = self.attributes.commissioning_mode;
         let cap = self.attributes.node_commissioning_capability;
-        // Gate requested mode by device capabilities (BDB spec §8.2)
+        // Gate requested mode by the BDB Table 5 capability bitmap.
         let effective = CommissioningMode(mode.0 & cap.0);
         log::info!(
             "[BDB] Commissioning start (requested=0x{:02X}, cap=0x{:02X}, effective=0x{:02X})",
@@ -163,6 +167,8 @@ impl<M: MacDriver> BdbLayer<M> {
 
         if effective.is_empty() {
             log::warn!("[BDB] No commissioning methods available for this device type");
+            self.attributes.commissioning_status =
+                crate::attributes::BdbCommissioningStatus::NotPermitted;
             return Err(BdbStatus::NotPermitted);
         }
 
@@ -170,6 +176,7 @@ impl<M: MacDriver> BdbLayer<M> {
         let mut last_error = None;
 
         // ── 1. Touchlink ────────────────────────────────────
+        #[cfg(feature = "touchlink")]
         if effective.contains(CommissioningMode::TOUCHLINK) {
             self.state = BdbState::Touchlink;
             match self.touchlink_commissioning().await {
@@ -313,7 +320,7 @@ impl<M: MacDriver> BdbLayer<M> {
     }
 
     /// BDB rejoin procedure — attempt to rejoin the previous network using
-    /// the stored NWK key (BDB spec §8.3 "steering on network" fallback).
+    /// the stored NWK key (BDB spec §7.1 steps 4–5).
     ///
     /// Call this when the device loses its parent or detects network loss.
     /// It performs:

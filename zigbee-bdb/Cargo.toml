@@ -21,6 +21,7 @@ default = ["float32", "float64"]
 float32 = ["zigbee-zcl/float32"]
 float64 = ["zigbee-zcl/float64"]
 trace = ["zigbee-aps/trace", "zigbee-nwk/trace"]
+touchlink = []
 
 [dev-dependencies]
 zigbee-mac = { version = "0.1.0", path = "../zigbee-mac", features = ["mock"] }

@@ -2,8 +2,8 @@
 
 use zigbee_aps::ApsLayer;
 use zigbee_bdb::attributes::{
-    BdbAttributes, BdbCommissioningStatus, NodeJoinLinkKeyType, BDB_MIN_COMMISSIONING_TIME,
-    BDB_PRIMARY_CHANNEL_SET, BDB_SECONDARY_CHANNEL_SET,
+    BdbAttributes, BdbCommissioningStatus, NodeJoinLinkKeyType, TcLinkKeyExchangeMethod,
+    BDB_MIN_COMMISSIONING_TIME, BDB_PRIMARY_CHANNEL_SET, BDB_SECONDARY_CHANNEL_SET,
 };
 use zigbee_bdb::state_machine::{BdbState, CommissioningMode};
 use zigbee_bdb::{BdbLayer, BdbStatus};
@@ -38,6 +38,10 @@ fn bdb_layer_not_on_network_by_default() {
 
 #[test]
 fn commissioning_mode_individual_flags() {
+    assert_eq!(CommissioningMode::STEERING.0, 1 << 0);
+    assert_eq!(CommissioningMode::FORMATION.0, 1 << 1);
+    assert_eq!(CommissioningMode::FINDING_BINDING.0, 1 << 2);
+    assert_eq!(CommissioningMode::TOUCHLINK.0, 1 << 3);
     assert!(CommissioningMode::TOUCHLINK.contains(CommissioningMode::TOUCHLINK));
     assert!(!CommissioningMode::TOUCHLINK.contains(CommissioningMode::STEERING));
     assert!(CommissioningMode::STEERING.contains(CommissioningMode::STEERING));
@@ -83,9 +87,71 @@ fn bdb_attributes_defaults() {
         attrs.node_join_link_key_type,
         NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey
     );
-    assert_eq!(attrs.trust_center_node_join_timeout, 10);
+    assert!(!attrs.join_uses_install_code_key);
+    assert_eq!(attrs.scan_duration, 3);
+    assert_eq!(attrs.tc_link_key_exchange_attempts, 0);
+    assert_eq!(attrs.tc_link_key_exchange_attempts_max, 3);
+    assert_eq!(
+        attrs.tc_link_key_exchange_method,
+        TcLinkKeyExchangeMethod::ApsRequestKey
+    );
+    assert_eq!(attrs.trust_center_node_join_timeout, 15);
     assert!(attrs.trust_center_require_key_exchange);
     assert_eq!(attrs.steering_attempts_remaining, 5);
+}
+
+#[test]
+fn node_join_link_key_types_match_bdb_table_6() {
+    assert_eq!(
+        NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey as u8,
+        0x00
+    );
+    assert_eq!(
+        NodeJoinLinkKeyType::DistributedSecurityGlobalLinkKey as u8,
+        0x01
+    );
+    assert_eq!(
+        NodeJoinLinkKeyType::InstallCodeDerivedPreconfiguredLinkKey as u8,
+        0x02
+    );
+    assert_eq!(
+        NodeJoinLinkKeyType::TouchlinkPreconfiguredLinkKey as u8,
+        0x03
+    );
+}
+
+#[test]
+fn commissioning_status_contains_every_bdb_table_4_value() {
+    assert_eq!(BdbCommissioningStatus::Success as u8, 0x00);
+    assert_eq!(BdbCommissioningStatus::InProgress as u8, 0x01);
+    assert_eq!(BdbCommissioningStatus::NotAaCapable as u8, 0x02);
+    assert_eq!(BdbCommissioningStatus::NoNetwork as u8, 0x03);
+    assert_eq!(BdbCommissioningStatus::TargetFailure as u8, 0x04);
+    assert_eq!(BdbCommissioningStatus::FormationFailure as u8, 0x05);
+    assert_eq!(BdbCommissioningStatus::NoIdentifyQueryResponse as u8, 0x06);
+    assert_eq!(BdbCommissioningStatus::BindingTableFull as u8, 0x07);
+    assert_eq!(BdbCommissioningStatus::NoScanResponse as u8, 0x08);
+    assert_eq!(BdbCommissioningStatus::NotPermitted as u8, 0x09);
+    assert_eq!(BdbCommissioningStatus::TcLinkKeyExchangeFailure as u8, 0x0A);
+    assert_eq!(BdbCommissioningStatus::NotOnANetwork as u8, 0x0B);
+    assert_eq!(BdbCommissioningStatus::OnANetwork as u8, 0x0C);
+}
+
+#[test]
+fn initialization_advertises_only_implemented_default_capabilities() {
+    let mut end_device = make_bdb(DeviceType::EndDevice);
+    end_device.initialize().unwrap();
+    assert_eq!(
+        end_device.attributes().node_commissioning_capability,
+        CommissioningMode::STEERING
+    );
+
+    let mut coordinator = make_bdb(DeviceType::Coordinator);
+    coordinator.initialize().unwrap();
+    assert_eq!(
+        coordinator.attributes().node_commissioning_capability,
+        CommissioningMode::STEERING.or(CommissioningMode::FORMATION)
+    );
 }
 
 #[test]

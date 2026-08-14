@@ -1,4 +1,4 @@
-//! Touchlink commissioning (BDB v3.0.1 spec §8.7).
+//! Experimental Touchlink commissioning (BDB v3.0.1 spec §§8.6–8.7).
 //!
 //! Touchlink (formerly ZLL commissioning) is a proximity-based method
 //! that allows devices to join a network by being brought physically
@@ -16,10 +16,9 @@
 //! key transport during commissioning.
 //!
 //! ## Status
-//! This module provides the full protocol logic. Actual over-the-air
-//! transmission requires Inter-PAN frame support in the MAC layer.
-//! When the MAC layer does not support Inter-PAN, the protocol will
-//! gracefully degrade and return `TouchlinkFailure`.
+//! This module is incomplete and available only through the off-by-default
+//! `touchlink` feature. It must not be advertised as a conformant Touchlink
+//! capability until the complete Inter-PAN procedures are implemented.
 
 use zigbee_mac::MacDriver;
 use zigbee_types::{IeeeAddress, MacAddress, PanId, ShortAddress};
@@ -40,7 +39,7 @@ pub const TOUCHLINK_PRIMARY_CHANNELS: [u8; 4] = [11, 15, 20, 25];
 
 /// ZLL / Touchlink pre-configured link key (used for key transport).
 pub const TOUCHLINK_PRECONFIGURED_LINK_KEY: [u8; 16] = [
-    0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF,
+    0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF,
 ];
 
 /// Scan duration per channel in milliseconds.
@@ -178,7 +177,7 @@ fn generate_transaction_id(ieee: &IeeeAddress, counter: &mut u32) -> TouchlinkTr
 // ── Implementation ──────────────────────────────────────────
 
 impl<M: MacDriver> BdbLayer<M> {
-    /// Execute Touchlink commissioning as initiator (BDB spec §8.7).
+    /// Execute Touchlink commissioning as initiator (BDB spec §8.6).
     ///
     /// Implements the full Touchlink scan → select → join protocol.
     /// If the MAC layer does not support Inter-PAN frames the scan
@@ -265,7 +264,7 @@ impl<M: MacDriver> BdbLayer<M> {
         if responses.is_empty() {
             log::warn!("[BDB:Touchlink] No scan responses received");
             self.attributes.commissioning_status =
-                crate::attributes::BdbCommissioningStatus::TlNoScanResponse;
+                crate::attributes::BdbCommissioningStatus::NoScanResponse;
             return Err(BdbStatus::TouchlinkFailure);
         }
 
@@ -315,7 +314,7 @@ impl<M: MacDriver> BdbLayer<M> {
         if join_result.is_err() {
             log::warn!("[BDB:Touchlink] Network Join Request TX failed");
             self.attributes.commissioning_status =
-                crate::attributes::BdbCommissioningStatus::TlTargetFailure;
+                crate::attributes::BdbCommissioningStatus::TargetFailure;
             return Err(BdbStatus::TouchlinkFailure);
         }
 

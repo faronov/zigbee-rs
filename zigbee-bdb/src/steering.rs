@@ -1483,7 +1483,7 @@ mod tests {
         );
         assert_eq!(
             bdb.attributes().commissioning_status,
-            crate::attributes::BdbCommissioningStatus::SteeringFormationFailure,
+            crate::attributes::BdbCommissioningStatus::NoNetwork,
         );
 
         let diagnostics = bdb.steering_diagnostics();
@@ -2162,7 +2162,7 @@ impl<M: MacDriver> BdbLayer<M> {
                     // already reserved outgoing frame-counter space.
                     if let Err(status) = self.announce_with_retry(announce, nwk_addr, ieee).await {
                         self.attributes.commissioning_status =
-                            crate::attributes::BdbCommissioningStatus::SteeringFormationFailure;
+                            crate::attributes::BdbCommissioningStatus::NoNetwork;
                         bdb_diag!("[BDB] device_annce=failed status={:?}", status);
                         log::error!(
                             "[BDB:Steering] Device_annce failed after {} attempts ({:?}) — \
