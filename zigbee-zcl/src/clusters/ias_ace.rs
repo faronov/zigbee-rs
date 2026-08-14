@@ -254,4 +254,13 @@ impl Cluster for IasAceCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// `PanelStatus` is driven exclusively by this cluster's own Arm/
+    /// Emergency/Fire/Panic commands (no external hardware feed), so a
+    /// Basic cluster reset returns it to the idle, disarmed state.
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self
+            .store
+            .set_raw(ATTR_PANEL_STATUS, ZclValue::Enum8(PANEL_STATUS_DISARMED));
+    }
 }

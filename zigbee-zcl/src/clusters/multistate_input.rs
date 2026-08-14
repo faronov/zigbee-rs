@@ -132,4 +132,17 @@ impl Cluster for MultistateInputCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self
+            .store
+            .set_raw(ATTR_DESCRIPTION, ZclValue::CharString(heapless::Vec::new()));
+        let _ = self
+            .store
+            .set_raw(ATTR_OUT_OF_SERVICE, ZclValue::Bool(false));
+        let _ = self.store.set_raw(ATTR_RELIABILITY, ZclValue::Enum8(0x00));
+        // PresentValue is a live sensor reading fed by the driver via
+        // `set_value`, and NumberOfStates is a physical-capability
+        // constructor parameter — neither is reset here.
+    }
 }

@@ -133,4 +133,38 @@ impl Cluster for IdentifyCluster {
     fn generated_commands(&self) -> heapless::Vec<u8, 32> {
         heapless::Vec::from_slice(&[0x00]).unwrap_or_default()
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self.store.set_raw(ATTR_IDENTIFY_TIME, ZclValue::U16(0));
+        self.pending_effect = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_clears_identify_timer_and_pending_effect() {
+        let mut cluster = IdentifyCluster::new();
+        // Start identifying and queue a trigger-effect command.
+        cluster
+            .handle_command(CMD_IDENTIFY, &30u16.to_le_bytes())
+            .unwrap();
+        cluster
+            .handle_command(CMD_TRIGGER_EFFECT, &[0x00, 0x00])
+            .unwrap();
+        assert!(cluster.is_identifying());
+        assert!(cluster.has_pending_effect());
+
+        Cluster::reset_to_factory_defaults(&mut cluster);
+
+        assert!(!cluster.is_identifying());
+        assert_eq!(
+            cluster.attributes().get(ATTR_IDENTIFY_TIME),
+            Some(&ZclValue::U16(0))
+        );
+        assert!(!cluster.has_pending_effect());
+        assert!(cluster.take_pending_effect().is_none());
+    }
 }

@@ -541,7 +541,13 @@ impl SensorApp {
                 let _ = self.secure_rejoin().await;
                 true
             }
-            StackEvent::LeaveRequested | StackEvent::FactoryResetRequested | StackEvent::Left => {
+            StackEvent::BasicResetToFactoryDefaults => {
+                rtt_target::rprintln!(
+                    "[EFR32][sensor] Basic cluster attributes reset to factory defaults"
+                );
+                false
+            }
+            StackEvent::LeaveRequested | StackEvent::Left => {
                 self.factory_reset().await;
                 self.needs_bootstrap_join = true;
                 self.awaiting_initial_configuration = false;

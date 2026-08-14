@@ -145,4 +145,10 @@ impl Cluster for IasWdCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self.store.set_raw(ATTR_MAX_DURATION, ZclValue::U16(240));
+        self.warning_mode = 0;
+        self.warning_duration = 0;
+    }
 }

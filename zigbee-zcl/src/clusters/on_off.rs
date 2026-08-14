@@ -213,4 +213,62 @@ impl Cluster for OnOffCluster {
     fn received_commands(&self) -> heapless::Vec<u8, 32> {
         heapless::Vec::from_slice(&[0x00, 0x01, 0x02, 0x40, 0x41, 0x42]).unwrap_or_default()
     }
+
+    /// `OnOff` and `GlobalSceneControl` are driven exclusively by this
+    /// cluster's own commands (Off/On/Toggle/OffWithEffect/
+    /// OnWithRecallGlobalScene), so a Basic cluster reset restores them to
+    /// their factory-shipped values alongside the writable timers/config.
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self.store.set_raw(ATTR_ON_OFF, ZclValue::Bool(false));
+        let _ = self
+            .store
+            .set_raw(ATTR_GLOBAL_SCENE_CONTROL, ZclValue::Bool(true));
+        let _ = self.store.set_raw(ATTR_ON_TIME, ZclValue::U16(0));
+        let _ = self.store.set_raw(ATTR_OFF_WAIT_TIME, ZclValue::U16(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_START_UP_ON_OFF, ZclValue::Enum8(0xFF));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_restores_nonzero_defaults_and_clears_timers() {
+        let mut cluster = OnOffCluster::new();
+        cluster.handle_command(CMD_ON, &[]).unwrap();
+        cluster
+            .handle_command(CMD_OFF_WITH_EFFECT, &[0x00, 0x00])
+            .unwrap();
+        cluster
+            .handle_command(CMD_ON_WITH_TIMED_OFF, &[0x00, 0x0A, 0x00, 0x05, 0x00])
+            .unwrap();
+        assert!(cluster.is_on());
+        assert_eq!(
+            cluster.attributes().get(ATTR_GLOBAL_SCENE_CONTROL),
+            Some(&ZclValue::Bool(false))
+        );
+
+        Cluster::reset_to_factory_defaults(&mut cluster);
+
+        assert!(!cluster.is_on());
+        assert_eq!(
+            cluster.attributes().get(ATTR_GLOBAL_SCENE_CONTROL),
+            Some(&ZclValue::Bool(true))
+        );
+        assert_eq!(
+            cluster.attributes().get(ATTR_ON_TIME),
+            Some(&ZclValue::U16(0))
+        );
+        assert_eq!(
+            cluster.attributes().get(ATTR_OFF_WAIT_TIME),
+            Some(&ZclValue::U16(0))
+        );
+        assert_eq!(
+            cluster.attributes().get(ATTR_START_UP_ON_OFF),
+            Some(&ZclValue::Enum8(0xFF))
+        );
+    }
 }

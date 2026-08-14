@@ -93,4 +93,9 @@ impl Cluster for IlluminanceCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// No writable attributes: `MeasuredValue` is a live sensor reading fed
+    /// by the driver, and the remaining attributes are fixed physical-range
+    /// configuration supplied at construction.
+    fn reset_to_factory_defaults(&mut self) {}
 }

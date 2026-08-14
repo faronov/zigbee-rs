@@ -174,4 +174,27 @@ impl Cluster for TimeCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// `LastSetTime` is read-only but is fed exclusively by `set_time`
+    /// alongside the writable `Time` attribute (no independent hardware
+    /// clock feed in this cluster), so it is reset back to the same
+    /// "never set" sentinel to keep the pair consistent.
+    /// `StandardTime`/`LocalTime` are read-only derived values with no
+    /// writer in this cluster and are left untouched.
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self.store.set_raw(ATTR_TIME, ZclValue::UtcTime(0xFFFFFFFF));
+        let _ = self
+            .store
+            .set_raw(ATTR_TIME_STATUS, ZclValue::Bitmap8(0x00));
+        let _ = self.store.set_raw(ATTR_TIME_ZONE, ZclValue::I32(0));
+        let _ = self.store.set_raw(ATTR_DST_START, ZclValue::U32(0));
+        let _ = self.store.set_raw(ATTR_DST_END, ZclValue::U32(0));
+        let _ = self.store.set_raw(ATTR_DST_SHIFT, ZclValue::I32(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_LAST_SET_TIME, ZclValue::UtcTime(0xFFFFFFFF));
+        let _ = self
+            .store
+            .set_raw(ATTR_VALID_UNTIL_TIME, ZclValue::UtcTime(0xFFFFFFFF));
+    }
 }

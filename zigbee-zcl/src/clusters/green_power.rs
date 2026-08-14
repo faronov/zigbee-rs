@@ -332,4 +332,26 @@ impl Cluster for GreenPowerCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// Every Proxy-side attribute is read-only capability/statistics.
+    /// Sink-side pairing/security-window configuration is reset to its
+    /// spec defaults; the sink/proxy tables themselves hold no GPD pairing
+    /// state in this implementation (always empty placeholders) so there is
+    /// nothing security-sensitive to clear.
+    fn reset_to_factory_defaults(&mut self) {
+        if matches!(self.role, GpRole::Sink | GpRole::Combined) {
+            let _ = self
+                .store
+                .set_raw(ATTR_GPS_COMMUNICATION_MODE, ZclValue::Bitmap8(0x01));
+            let _ = self
+                .store
+                .set_raw(ATTR_GPS_COMMISSIONING_EXIT_MODE, ZclValue::Bitmap8(0x01));
+            let _ = self
+                .store
+                .set_raw(ATTR_GPS_COMMISSIONING_WINDOW, ZclValue::U16(180));
+            let _ = self
+                .store
+                .set_raw(ATTR_GPS_SECURITY_LEVEL, ZclValue::Bitmap8(0x06));
+        }
+    }
 }

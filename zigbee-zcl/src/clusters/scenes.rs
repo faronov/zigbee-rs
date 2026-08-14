@@ -404,4 +404,21 @@ impl Cluster for ScenesCluster {
     fn generated_commands(&self) -> heapless::Vec<u8, 32> {
         heapless::Vec::from_slice(&[0x00, 0x01, 0x02, 0x03, 0x04, 0x06]).unwrap_or_default()
     }
+
+    /// The scene table and its tracking attributes are owned entirely by
+    /// this cluster (not an APS binding/group relationship), so a Basic
+    /// cluster reset clears it back to the fresh-out-of-box state — the
+    /// same effect as `RemoveAllScenes` for every group.
+    fn reset_to_factory_defaults(&mut self) {
+        for scene in &mut self.scenes {
+            *scene = SceneEntry::empty();
+        }
+        let _ = self.store.set_raw(ATTR_SCENE_COUNT, ZclValue::U8(0));
+        let _ = self.store.set_raw(ATTR_CURRENT_SCENE, ZclValue::U8(0));
+        let _ = self.store.set_raw(ATTR_CURRENT_GROUP, ZclValue::U16(0));
+        let _ = self.store.set_raw(ATTR_SCENE_VALID, ZclValue::Bool(false));
+        let _ = self
+            .store
+            .set_raw(ATTR_LAST_CONFIGURED_BY, ZclValue::IeeeAddr(0));
+    }
 }

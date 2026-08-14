@@ -93,4 +93,14 @@ impl Cluster for FanControlCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self
+            .store
+            .set_raw(ATTR_FAN_MODE, ZclValue::Enum8(FAN_MODE_AUTO));
+        let _ = self.store.set_raw(
+            ATTR_FAN_MODE_SEQUENCE,
+            ZclValue::Enum8(FAN_SEQ_LOW_MED_HIGH_AUTO),
+        );
+    }
 }

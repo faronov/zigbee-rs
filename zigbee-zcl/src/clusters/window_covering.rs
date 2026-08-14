@@ -241,4 +241,17 @@ impl Cluster for WindowCoveringCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// `CurrentPositionLiftPercentage`/`...TiltPercentage` are driven
+    /// exclusively by this cluster's own Up/Down/GoTo commands (no
+    /// independent position-sensor feed in this crate), so a Basic cluster
+    /// reset restores them to the fully-open factory default alongside the
+    /// writable `Mode` attribute. `WindowCoveringType` and the installed
+    /// lift/tilt limits are physical-installation configuration and are
+    /// preserved.
+    fn reset_to_factory_defaults(&mut self) {
+        self.set_lift_percentage(0);
+        self.set_tilt_percentage(0);
+        let _ = self.store.set_raw(ATTR_MODE, ZclValue::Bitmap8(0x00));
+    }
 }

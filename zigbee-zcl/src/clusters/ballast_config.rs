@@ -200,4 +200,29 @@ impl Cluster for BallastConfigCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        // PhysicalMinLevel/PhysicalMaxLevel/BallastStatus/LampQuantity are
+        // read-only physical-capability attributes and are preserved.
+        let _ = self.store.set_raw(ATTR_MIN_LEVEL, ZclValue::U8(1));
+        let _ = self.store.set_raw(ATTR_MAX_LEVEL, ZclValue::U8(254));
+        let _ = self.store.set_raw(ATTR_POWER_ON_LEVEL, ZclValue::U8(254));
+        let _ = self
+            .store
+            .set_raw(ATTR_POWER_ON_FADE_TIME, ZclValue::U16(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_INTRINSIC_BALLAST_FACTOR, ZclValue::U8(0xFF));
+        let _ = self
+            .store
+            .set_raw(ATTR_BALLAST_FACTOR_ADJUSTMENT, ZclValue::U8(0xFF));
+        let _ = self
+            .store
+            .set_raw(ATTR_LAMP_RATED_HOURS, ZclValue::U32(0x00FFFFFF));
+        let _ = self.store.set_raw(ATTR_LAMP_BURN_HOURS, ZclValue::U32(0));
+        let _ = self.store.set_raw(ATTR_LAMP_ALARM_MODE, ZclValue::U8(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_LAMP_BURN_HOURS_TRIP_POINT, ZclValue::U32(0x00FFFFFF));
+    }
 }

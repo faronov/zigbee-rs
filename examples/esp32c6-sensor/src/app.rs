@@ -462,7 +462,13 @@ impl<'a> SensorApp<'a> {
                 let _ = self.secure_rejoin().await;
                 true
             }
-            StackEvent::LeaveRequested | StackEvent::FactoryResetRequested | StackEvent::Left => {
+            StackEvent::BasicResetToFactoryDefaults => {
+                esp_println::println!(
+                    "[ESP32-C6] Basic cluster attributes reset to factory defaults"
+                );
+                false
+            }
+            StackEvent::LeaveRequested | StackEvent::Left => {
                 esp_println::println!("[ESP32-C6] Leaving network and clearing credentials");
                 self.factory_reset().await;
                 self.needs_bootstrap_join = true;

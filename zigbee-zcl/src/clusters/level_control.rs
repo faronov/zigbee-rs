@@ -268,4 +268,69 @@ impl Cluster for LevelControlCluster {
         heapless::Vec::from_slice(&[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07])
             .unwrap_or_default()
     }
+
+    /// `CurrentLevel`/`RemainingTime` are driven exclusively by this
+    /// cluster's own Move/Step/MoveToLevel commands and transition engine
+    /// (no external hardware feed), so a Basic cluster reset stops any
+    /// in-flight transition and restores them alongside the writable
+    /// configuration attributes. `MinLevel`/`MaxLevel` are fixed spec
+    /// constants and are left untouched.
+    fn reset_to_factory_defaults(&mut self) {
+        self.transitions.stop_all();
+        let _ = self.store.set_raw(ATTR_CURRENT_LEVEL, ZclValue::U8(0x00));
+        let _ = self.store.set_raw(ATTR_REMAINING_TIME, ZclValue::U16(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_ON_OFF_TRANSITION_TIME, ZclValue::U16(0));
+        let _ = self.store.set_raw(ATTR_ON_LEVEL, ZclValue::U8(0xFF));
+        let _ = self.store.set_raw(ATTR_OPTIONS, ZclValue::Bitmap8(0x00));
+        let _ = self
+            .store
+            .set_raw(ATTR_STARTUP_CURRENT_LEVEL, ZclValue::U8(0xFF));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_stops_transitions_and_restores_nonzero_defaults() {
+        let mut cluster = LevelControlCluster::new();
+        cluster
+            .handle_command(CMD_MOVE_TO_LEVEL, &[0x80, 0x64, 0x00])
+            .unwrap();
+        cluster
+            .attributes_mut()
+            .set(ATTR_ON_LEVEL, ZclValue::U8(10))
+            .unwrap();
+        cluster
+            .attributes_mut()
+            .set(ATTR_STARTUP_CURRENT_LEVEL, ZclValue::U8(10))
+            .unwrap();
+        assert_ne!(
+            cluster.attributes().get(ATTR_REMAINING_TIME),
+            Some(&ZclValue::U16(0))
+        );
+
+        Cluster::reset_to_factory_defaults(&mut cluster);
+
+        assert_eq!(cluster.current_level(), 0x00);
+        assert_eq!(
+            cluster.attributes().get(ATTR_REMAINING_TIME),
+            Some(&ZclValue::U16(0))
+        );
+        assert_eq!(
+            cluster.attributes().get(ATTR_ON_LEVEL),
+            Some(&ZclValue::U8(0xFF))
+        );
+        assert_eq!(
+            cluster.attributes().get(ATTR_STARTUP_CURRENT_LEVEL),
+            Some(&ZclValue::U8(0xFF))
+        );
+        // Transition engine must actually be stopped, not just RemainingTime
+        // zeroed — advancing time should produce no further updates.
+        cluster.tick(100);
+        assert_eq!(cluster.current_level(), 0x00);
+    }
 }

@@ -119,4 +119,20 @@ impl Cluster for AnalogValueCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self
+            .store
+            .set_raw(ATTR_OUT_OF_SERVICE, ZclValue::Bool(false));
+        let _ = self
+            .store
+            .set_raw(ATTR_PRESENT_VALUE, ZclValue::Float32(0.0));
+        let _ = self.store.set_raw(ATTR_RELIABILITY, ZclValue::U8(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_RELINQUISH_DEFAULT, ZclValue::Float32(0.0));
+        let _ = self
+            .store
+            .set_raw(ATTR_ENGINEERING_UNITS, ZclValue::U16(95));
+    }
 }

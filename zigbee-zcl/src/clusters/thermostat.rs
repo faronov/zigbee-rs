@@ -484,4 +484,39 @@ impl Cluster for ThermostatCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// `LocalTemperature`/`OutdoorTemperature`/`Occupancy` are live sensor
+    /// readings fed by the driver and the absolute setpoint limits are
+    /// fixed spec constants — all preserved. The weekly schedule table is
+    /// owned entirely by this cluster (not a binding/group relationship),
+    /// so it is cleared the same way `ClearWeeklySchedule` does.
+    /// `ThermostatRunningMode` is a derived read-only value recomputed by
+    /// `tick` from the writable attributes reset below.
+    fn reset_to_factory_defaults(&mut self) {
+        self.schedule.clear();
+        let _ = self
+            .store
+            .set_raw(ATTR_OCCUPIED_COOLING_SETPOINT, ZclValue::I16(2600));
+        let _ = self
+            .store
+            .set_raw(ATTR_OCCUPIED_HEATING_SETPOINT, ZclValue::I16(2000));
+        let _ = self
+            .store
+            .set_raw(ATTR_MIN_HEAT_SETPOINT_LIMIT, ZclValue::I16(700));
+        let _ = self
+            .store
+            .set_raw(ATTR_MAX_HEAT_SETPOINT_LIMIT, ZclValue::I16(3000));
+        let _ = self
+            .store
+            .set_raw(ATTR_MIN_COOL_SETPOINT_LIMIT, ZclValue::I16(1600));
+        let _ = self
+            .store
+            .set_raw(ATTR_MAX_COOL_SETPOINT_LIMIT, ZclValue::I16(3200));
+        let _ = self
+            .store
+            .set_raw(ATTR_CONTROL_SEQUENCE_OF_OPERATION, ZclValue::Enum8(0x04));
+        let _ = self
+            .store
+            .set_raw(ATTR_SYSTEM_MODE, ZclValue::Enum8(SYSTEM_MODE_AUTO));
+    }
 }

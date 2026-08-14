@@ -182,4 +182,25 @@ impl Cluster for DeviceTempConfigCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        // CurrentTemperature/MinTempExperienced/MaxTempExperienced/
+        // OverTempTotalDwell are read-only history fed by the driver via
+        // `set_temperature` and are preserved.
+        let _ = self
+            .store
+            .set_raw(ATTR_DEVICE_TEMP_ALARM_MASK, ZclValue::U8(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_LOW_TEMP_THRESHOLD, ZclValue::I16(-4000));
+        let _ = self
+            .store
+            .set_raw(ATTR_HIGH_TEMP_THRESHOLD, ZclValue::I16(8500));
+        let _ = self
+            .store
+            .set_raw(ATTR_LOW_TEMP_DWELL_TRIP_POINT, ZclValue::U32(1));
+        let _ = self
+            .store
+            .set_raw(ATTR_HIGH_TEMP_DWELL_TRIP_POINT, ZclValue::U32(1));
+    }
 }

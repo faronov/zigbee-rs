@@ -1025,4 +1025,31 @@ impl Cluster for OtaCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// Resets only the in-memory OTA *transport* conversation state back to
+    /// idle — it does not touch image identity (`manufacturer_code`,
+    /// `image_type`, `current_version`), the product-configured
+    /// `hardware_version`, or any staged/verified image bytes, which live
+    /// in the runtime's `FirmwareWriter`/staging storage outside this
+    /// cluster. A Zigbee OTA client can always safely restart from a fresh
+    /// `QueryNextImageRequest`, so abandoning an in-flight download's
+    /// offset bookkeeping here is safe and never erases or writes flash.
+    fn reset_to_factory_defaults(&mut self) {
+        self.state = OtaState::Idle;
+        self.target_version = 0;
+        self.target_size = 0;
+        self.block_size = DEFAULT_BLOCK_SIZE;
+        let _ = self
+            .store
+            .set_raw(ATTR_IMAGE_UPGRADE_STATUS, ZclValue::Enum8(STATUS_NORMAL));
+        let _ = self
+            .store
+            .set_raw(ATTR_FILE_OFFSET, ZclValue::U32(0xFFFFFFFF));
+        let _ = self
+            .store
+            .set_raw(ATTR_DOWNLOADED_FILE_VERSION, ZclValue::U32(0xFFFFFFFF));
+        let _ = self
+            .store
+            .set_raw(ATTR_DOWNLOADED_STACK_VERSION, ZclValue::U16(0xFFFF));
+    }
 }

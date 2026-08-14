@@ -72,4 +72,12 @@ impl Cluster for OnOffSwitchConfigCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        // SwitchType is a physical-capability constructor parameter and is
+        // preserved; SwitchActions is the only writable attribute.
+        let _ = self
+            .store
+            .set_raw(ATTR_SWITCH_ACTIONS, ZclValue::Enum8(SWITCH_ACTION_ON_OFF));
+    }
 }

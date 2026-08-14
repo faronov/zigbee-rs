@@ -130,4 +130,21 @@ impl Cluster for OccupancyCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        // OccupancySensorType/Bitmap are physical-capability constructor
+        // parameters and are preserved. Occupancy itself is a live sensor
+        // reading fed by the driver via `set_occupied`.
+        let _ = self.store.set_raw(ATTR_PIR_O_TO_U_DELAY, ZclValue::U16(0));
+        let _ = self.store.set_raw(ATTR_PIR_U_TO_O_DELAY, ZclValue::U16(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_PIR_U_TO_O_THRESHOLD, ZclValue::U8(1));
+        let _ = self
+            .store
+            .set_raw(ATTR_ULTRASONIC_O_TO_U_DELAY, ZclValue::U16(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_ULTRASONIC_U_TO_O_DELAY, ZclValue::U16(0));
+    }
 }

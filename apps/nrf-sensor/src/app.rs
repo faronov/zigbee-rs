@@ -33,7 +33,7 @@
 //! - Every [`StackEvent`] variant is now matched explicitly in
 //!   [`handle_control_event`](SensorApp::handle_control_event), instead of a
 //!   wildcard arm that silently dropped anything not already special-cased.
-//!   `FactoryResetRequested` is the Basic cluster Reset to Factory Defaults
+//!   `BasicResetToFactoryDefaults` is the Basic cluster Reset to Factory Defaults
 //!   notification, so it preserves the network and security state; the Basic
 //!   cluster has already reset its writable attributes before the event is
 //!   emitted. This also unifies event handling between the two places it used
@@ -603,7 +603,7 @@ where
                 info!("Leave requested by coordinator — resetting and rejoining");
                 self.rejoin_after_reset().await
             }
-            StackEvent::FactoryResetRequested => {
+            StackEvent::BasicResetToFactoryDefaults => {
                 info!("Basic cluster attributes reset to factory defaults");
                 false
             }

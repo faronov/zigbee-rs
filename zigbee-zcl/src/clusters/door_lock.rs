@@ -461,4 +461,79 @@ impl Cluster for DoorLockCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// PIN/RFID user codes (`pins`) are a security credential store and
+    /// MUST NOT be cleared by a Basic cluster reset (only an explicit,
+    /// authorized `ClearAllPINCodes` command may do that). `LockState` and
+    /// `DoorState` reflect real physical security state — the former only
+    /// ever changes via an explicit Lock/Unlock/Toggle command and the
+    /// latter via the door sensor driver — so neither is overwritten here
+    /// to avoid ever falsely reporting an unlocked/open state. Only the
+    /// writable configuration attributes and the transient auto-relock
+    /// timer are reset.
+    fn reset_to_factory_defaults(&mut self) {
+        self.auto_relock_remaining = 0;
+        let _ = self.store.set_raw(ATTR_DOOR_OPEN_EVENTS, ZclValue::U32(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_DOOR_CLOSED_EVENTS, ZclValue::U32(0));
+        let _ = self.store.set_raw(ATTR_OPEN_PERIOD, ZclValue::U16(0));
+        let _ = self.store.set_raw(
+            ATTR_LANGUAGE,
+            ZclValue::CharString(heapless::Vec::from_slice(b"en").unwrap_or_default()),
+        );
+        let _ = self.store.set_raw(ATTR_AUTO_RELOCK_TIME, ZclValue::U32(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_OPERATING_MODE, ZclValue::Enum8(OPERATING_MODE_NORMAL));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_preserves_pin_codes_and_lock_state_but_clears_config_and_timer() {
+        let mut cluster = DoorLockCluster::new(LOCK_TYPE_DEAD_BOLT);
+        cluster
+            .handle_command(
+                CMD_SET_PIN_CODE,
+                &[0x01, 0x00, 0x01, 0x00, 0x04, 1, 2, 3, 4],
+            )
+            .unwrap();
+        cluster
+            .attributes_mut()
+            .set(ATTR_AUTO_RELOCK_TIME, ZclValue::U32(60))
+            .unwrap();
+        cluster.handle_command(CMD_UNLOCK_DOOR, &[]).unwrap();
+        cluster
+            .attributes_mut()
+            .set(ATTR_OPEN_PERIOD, ZclValue::U16(30))
+            .unwrap();
+        assert_eq!(cluster.lock_state(), LOCK_STATE_UNLOCKED);
+        assert_eq!(cluster.auto_relock_remaining, 60);
+
+        Cluster::reset_to_factory_defaults(&mut cluster);
+
+        // Security-sensitive state survives the reset.
+        assert_eq!(cluster.lock_state(), LOCK_STATE_UNLOCKED);
+        let mut resp = cluster
+            .handle_command(CMD_GET_PIN_CODE, &[0x01, 0x00])
+            .unwrap();
+        // user_id(2) + status(1) + user_type(1) + pin_len(1) + pin(4)
+        assert_eq!(resp.len(), 9);
+        assert_eq!(resp.remove(4), 4); // pin_len preserved (code not cleared)
+
+        // Transient/config state is reset.
+        assert_eq!(cluster.auto_relock_remaining, 0);
+        assert_eq!(
+            cluster.attributes().get(ATTR_OPEN_PERIOD),
+            Some(&ZclValue::U16(0))
+        );
+        assert_eq!(
+            cluster.attributes().get(ATTR_AUTO_RELOCK_TIME),
+            Some(&ZclValue::U32(0))
+        );
+    }
 }

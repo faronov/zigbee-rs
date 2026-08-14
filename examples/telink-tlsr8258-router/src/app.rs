@@ -512,7 +512,8 @@ where
             Err(StartError::PersistenceFailed(_)) => LoopControl::Fatal,
             Err(_) => LoopControl::Recommission,
         },
-        StackEvent::LeaveRequested | StackEvent::FactoryResetRequested => {
+        StackEvent::BasicResetToFactoryDefaults => LoopControl::Continue,
+        StackEvent::LeaveRequested => {
             match node.factory_reset().await {
                 Ok(()) => LoopControl::Recommission,
                 Err(_) => LoopControl::Fatal,

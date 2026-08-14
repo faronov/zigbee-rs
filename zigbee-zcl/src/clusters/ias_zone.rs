@@ -253,4 +253,17 @@ impl Cluster for IasZoneCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// `ZoneState`/`ZoneID`/`IAS_CIE_Address` describe the CIE enrollment
+    /// relationship — analogous to a binding — and MUST NOT be cleared by a
+    /// Basic cluster reset; only a full BDB factory reset (which also
+    /// leaves the network) may un-enroll the zone. `ZoneStatus` is a live
+    /// alarm-condition reading fed by the driver via `set_zone_status`, and
+    /// `ZoneType` is a physical-capability constructor parameter.
+    /// `CurrentZoneSensitivityLevel` is the only attribute reset here.
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self
+            .store
+            .set_raw(ATTR_CURRENT_ZONE_SENSITIVITY_LEVEL, ZclValue::U8(0));
+    }
 }

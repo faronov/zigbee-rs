@@ -192,6 +192,12 @@ impl Cluster for MeteringCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// No writable attributes. `CurrentSummationDelivered`/`...Received` are
+    /// durable, billing-relevant cumulative registers and MUST survive a
+    /// Basic cluster reset; the remaining attributes are fixed unit/scaling
+    /// configuration supplied at construction.
+    fn reset_to_factory_defaults(&mut self) {}
 }
 
 #[cfg(test)]

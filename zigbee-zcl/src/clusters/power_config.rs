@@ -190,4 +190,24 @@ impl Cluster for PowerConfigCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        // BatteryVoltage/BatteryPercentageRemaining are live sensor readings
+        // fed by the driver via `set_battery_voltage`/`set_battery_percentage`
+        // and are preserved.
+        let _ = self.store.set_raw(ATTR_BATTERY_SIZE, ZclValue::Enum8(0xFF));
+        let _ = self.store.set_raw(ATTR_BATTERY_QUANTITY, ZclValue::U8(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_BATTERY_RATED_VOLTAGE, ZclValue::U8(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_BATTERY_ALARM_MASK, ZclValue::Bitmap8(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_BATTERY_VOLTAGE_MIN_THRESHOLD, ZclValue::U8(0));
+        // Recompute BatteryAlarmState now that the mask/threshold above have
+        // been reset (the threshold-disabled case clears it to 0).
+        self.update_alarm_state();
+    }
 }

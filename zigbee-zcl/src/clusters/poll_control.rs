@@ -240,4 +240,26 @@ impl Cluster for PollControlCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self
+            .store
+            .set_raw(ATTR_CHECK_IN_INTERVAL, ZclValue::U32(14400));
+        let _ = self
+            .store
+            .set_raw(ATTR_FAST_POLL_TIMEOUT, ZclValue::U16(40));
+        // LongPollInterval/ShortPollInterval are technically ReadOnly per
+        // their access mode but are mutated by SetLongPollInterval/
+        // SetShortPollInterval — restore them to their power-on defaults
+        // too so a stale negotiated interval cannot survive a reset.
+        let _ = self
+            .store
+            .set_raw(ATTR_LONG_POLL_INTERVAL, ZclValue::U32(24));
+        let _ = self
+            .store
+            .set_raw(ATTR_SHORT_POLL_INTERVAL, ZclValue::U16(4));
+        self.fast_polling = false;
+        self.ticks_since_checkin = 0;
+        self.fast_poll_remaining = 0;
+    }
 }

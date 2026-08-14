@@ -211,4 +211,9 @@ impl Cluster for DiagnosticsCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// No writable attributes: every counter is a monitoring statistic
+    /// maintained by the stack, not application state a Basic cluster reset
+    /// should discard.
+    fn reset_to_factory_defaults(&mut self) {}
 }

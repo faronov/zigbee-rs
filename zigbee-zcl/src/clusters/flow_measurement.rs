@@ -88,4 +88,9 @@ impl Cluster for FlowMeasurementCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// No writable attributes: `MeasuredValue` is a live sensor reading fed
+    /// by the driver, and `MinMeasuredValue`/`MaxMeasuredValue`/`Tolerance`
+    /// are fixed physical-range configuration supplied at construction.
+    fn reset_to_factory_defaults(&mut self) {}
 }

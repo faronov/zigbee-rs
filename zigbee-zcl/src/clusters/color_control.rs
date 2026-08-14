@@ -852,4 +852,39 @@ impl Cluster for ColorControlCluster {
         ])
         .unwrap_or_default()
     }
+
+    /// `CurrentHue`/`CurrentSaturation`/`CurrentX`/`CurrentY`/
+    /// `ColorTemperatureMireds`/`ColorMode`/`Enhanced*`/`ColorLoop*` are
+    /// driven exclusively by this cluster's own color commands and
+    /// transition/color-loop engine (no external hardware feed), so a Basic
+    /// cluster reset stops any in-flight transition and restores them
+    /// alongside the writable `Options` attribute. `ColorCapabilities` and
+    /// the physical color-temperature min/max are fixed capability
+    /// constants and are left untouched.
+    fn reset_to_factory_defaults(&mut self) {
+        self.transitions.stop_all();
+        let _ = self.store.set_raw(ATTR_CURRENT_HUE, ZclValue::U8(0));
+        let _ = self.store.set_raw(ATTR_CURRENT_SATURATION, ZclValue::U8(0));
+        let _ = self.store.set_raw(ATTR_REMAINING_TIME, ZclValue::U16(0));
+        let _ = self.store.set_raw(ATTR_CURRENT_X, ZclValue::U16(0x616B));
+        let _ = self.store.set_raw(ATTR_CURRENT_Y, ZclValue::U16(0x607D));
+        let _ = self
+            .store
+            .set_raw(ATTR_COLOR_TEMPERATURE_MIREDS, ZclValue::U16(250));
+        let _ = self
+            .store
+            .set_raw(ATTR_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_XY));
+        let _ = self.store.set_raw(ATTR_OPTIONS, ZclValue::Bitmap8(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_ENHANCED_CURRENT_HUE, ZclValue::U16(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_ENHANCED_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_XY));
+        let _ = self.store.set_raw(ATTR_COLOR_LOOP_ACTIVE, ZclValue::U8(0));
+        let _ = self
+            .store
+            .set_raw(ATTR_COLOR_LOOP_DIRECTION, ZclValue::U8(0));
+        let _ = self.store.set_raw(ATTR_COLOR_LOOP_TIME, ZclValue::U16(25));
+    }
 }

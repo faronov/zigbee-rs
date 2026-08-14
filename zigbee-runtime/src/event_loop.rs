@@ -159,8 +159,9 @@ pub enum StackEvent {
     OtaFailed,
     /// OTA: Server requested delayed activation — reboot after `delay_secs`.
     OtaDelayedActivation { delay_secs: u32 },
-    /// Basic cluster: factory reset requested by coordinator.
-    FactoryResetRequested,
+    /// Basic cluster Reset to Factory Defaults: reset application attributes
+    /// only; network state, frame counters, groups, and bindings stay intact.
+    BasicResetToFactoryDefaults,
     /// NWK Leave command received from coordinator — device should rejoin.
     LeaveRequested,
     /// NWK Leave command explicitly requested a secured network rejoin.

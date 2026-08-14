@@ -276,6 +276,16 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             .map(access)
     }
 
+    fn reset_zcl_to_factory_defaults(&mut self) {
+        self.basic_cluster.reset_to_factory_defaults();
+        for entry in self.identify_clusters.iter_mut() {
+            entry.cluster.reset_to_factory_defaults();
+        }
+        for cluster in self.clusters.iter_mut() {
+            cluster.cluster.reset_to_factory_defaults();
+        }
+    }
+
     fn dispatch_inner(
         &mut self,
         dst_ep: u8,
@@ -1229,7 +1239,8 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                 && cmd_status == ZclStatus::Success
                 && zcl_frame.header.direction() == ClusterDirection::ClientToServer
             {
-                return Some(event_loop::StackEvent::FactoryResetRequested);
+                self.reset_zcl_to_factory_defaults();
+                return Some(event_loop::StackEvent::BasicResetToFactoryDefaults);
             }
 
             return Some(cluster_command_received_event(
@@ -1563,14 +1574,19 @@ pub(crate) fn queue_read_reporting_response<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::{GroupTableAction, LocalZclCtx};
+    use crate::event_loop::StackEvent;
     use crate::remote_reporting::RemoteReportingState;
     use crate::{ClusterRef, EndpointConfig, EndpointIdentifyCluster, PendingZclResponse};
     use zigbee_zcl::clusters::Cluster;
-    use zigbee_zcl::clusters::basic::{BasicCluster, PowerSource};
+    use zigbee_zcl::clusters::basic::{
+        ATTR_LOCATION_DESCRIPTION, BasicCluster, CMD_RESET_TO_FACTORY_DEFAULTS, PowerSource,
+    };
     use zigbee_zcl::clusters::groups::GroupsCluster;
     use zigbee_zcl::clusters::identify::IdentifyCluster;
+    use zigbee_zcl::clusters::on_off::{ATTR_START_UP_ON_OFF, CMD_ON, OnOffCluster};
     use zigbee_zcl::clusters::ota::OtaCluster;
     use zigbee_zcl::clusters::temperature::TemperatureCluster;
+    use zigbee_zcl::data_types::ZclValue;
     use zigbee_zcl::foundation::reporting::ReportingEngine;
     use zigbee_zcl::frame::ZclFrame;
     use zigbee_zcl::{ClusterDirection, ClusterId, CommandId, DeviceId, ZclStatus};
@@ -1773,6 +1789,7 @@ mod tests {
         fn attributes_mut(&mut self) -> &mut dyn zigbee_zcl::clusters::AttributeStoreMutAccess {
             &mut self.store
         }
+        fn reset_to_factory_defaults(&mut self) {}
     }
 
     /// Minimal application cluster with a single **write-only** attribute —
@@ -1818,6 +1835,62 @@ mod tests {
         fn attributes_mut(&mut self) -> &mut dyn zigbee_zcl::clusters::AttributeStoreMutAccess {
             &mut self.store
         }
+        fn reset_to_factory_defaults(&mut self) {}
+    }
+
+    #[test]
+    fn basic_reset_resets_all_mounted_cluster_attributes() {
+        let mut fx = Fixture::new(&[ClusterId::BASIC, ClusterId::IDENTIFY, ClusterId::ON_OFF]);
+        let location = heapless::Vec::from_slice(b"Kitchen").unwrap();
+        fx.basic
+            .attributes_mut()
+            .set(ATTR_LOCATION_DESCRIPTION, ZclValue::CharString(location))
+            .unwrap();
+        fx.identify[0]
+            .cluster
+            .handle_command(
+                zigbee_zcl::clusters::identify::CMD_IDENTIFY,
+                &30u16.to_le_bytes(),
+            )
+            .unwrap();
+        fx.identify[0]
+            .cluster
+            .handle_command(
+                zigbee_zcl::clusters::identify::CMD_TRIGGER_EFFECT,
+                &[0x00, 0x00],
+            )
+            .unwrap();
+        let mut on_off = OnOffCluster::new();
+        on_off.handle_command(CMD_ON, &[]).unwrap();
+        on_off
+            .attributes_mut()
+            .set(ATTR_START_UP_ON_OFF, ZclValue::Enum8(0x01))
+            .unwrap();
+        let request = cluster_request(CMD_RESET_TO_FACTORY_DEFAULTS.0, true, &[]);
+        let outcome = {
+            let mut clusters = [ClusterRef {
+                endpoint: EP,
+                cluster: &mut on_off,
+            }];
+            fx.dispatch(&mut clusters, ClusterId::BASIC.0, &request)
+        };
+
+        assert!(matches!(
+            outcome.event,
+            Some(StackEvent::BasicResetToFactoryDefaults)
+        ));
+        assert_eq!(fx.basic.manufacturer_name(), "TestCo");
+        match fx.basic.attributes().get(ATTR_LOCATION_DESCRIPTION) {
+            Some(ZclValue::CharString(value)) => assert!(value.is_empty()),
+            value => panic!("unexpected LocationDescription after reset: {value:?}"),
+        }
+        assert!(!fx.identify[0].cluster.is_identifying());
+        assert!(!fx.identify[0].cluster.has_pending_effect());
+        assert!(!on_off.is_on());
+        assert_eq!(
+            on_off.attributes().get(ATTR_START_UP_ON_OFF),
+            Some(&ZclValue::Enum8(0xFF))
+        );
     }
 
     /// Queue-policy lock (non-blocking finding): a maximal cluster-specific

@@ -84,4 +84,12 @@ impl Cluster for IlluminanceLevelCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self
+            .store
+            .set_raw(ATTR_ILLUMINANCE_TARGET_LEVEL, ZclValue::U16(0));
+        // LevelStatus is a live threshold-comparison output fed by the
+        // driver via `set_level_status`, not a client-writable attribute.
+    }
 }

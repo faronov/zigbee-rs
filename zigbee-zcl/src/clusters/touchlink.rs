@@ -144,4 +144,13 @@ impl Cluster for TouchlinkCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// `TouchlinkState` is driven exclusively by this cluster's own
+    /// Scan/Identify request handlers (no external hardware feed), so a
+    /// Basic cluster reset returns it to idle.
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self
+            .store
+            .set_raw(ATTR_TOUCHLINK_STATE, ZclValue::Enum8(STATE_IDLE));
+    }
 }

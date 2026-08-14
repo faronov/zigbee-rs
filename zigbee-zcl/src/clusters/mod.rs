@@ -87,6 +87,29 @@ pub trait Cluster {
     fn generated_commands(&self) -> heapless::Vec<u8, 32> {
         heapless::Vec::new()
     }
+
+    /// Restore this cluster's writable application attributes and transient
+    /// command/effect state to their constructor (factory) defaults, as part
+    /// of BDB 3.0.1 / ZCL Basic cluster `ResetToFactoryDefaults` handling.
+    ///
+    /// Implementations MUST NOT:
+    /// - touch APS group or binding tables, network/security state, or any
+    ///   commissioning/enrollment relationship (e.g. IAS CIE binding) —
+    ///   those are reset only by the full BDB factory-reset procedure;
+    /// - erase security-sensitive credential stores (e.g. Door Lock PIN
+    ///   codes) or durable security frame counters/keys;
+    /// - discard cumulative metering/energy registers or other durable
+    ///   billing-relevant data;
+    /// - clobber read-only identity, physical capability, or calibration
+    ///   attributes supplied by the product at construction time (e.g.
+    ///   manufacturer/model strings, sensor min/max range, zone/switch
+    ///   type).
+    ///
+    /// Every in-tree implementation provides an explicit body — including a
+    /// deliberate no-op for clusters with no resettable state — so that
+    /// adding a new writable attribute or piece of transient command state
+    /// forces an explicit decision here rather than a silent default.
+    fn reset_to_factory_defaults(&mut self);
 }
 
 /// Type-erased read access to an attribute store.

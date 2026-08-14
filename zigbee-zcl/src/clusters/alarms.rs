@@ -125,4 +125,11 @@ impl Cluster for AlarmsCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        // AlarmCount tracks the pending-alarm log, which the cluster's own
+        // Reset Alarm(s) commands already clear to 0 — restore that idle
+        // state here too.
+        let _ = self.store.set_raw(ATTR_ALARM_COUNT, ZclValue::U16(0));
+    }
 }

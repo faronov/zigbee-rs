@@ -253,4 +253,46 @@ impl Cluster for BasicCluster {
     fn received_commands(&self) -> heapless::Vec<u8, 32> {
         heapless::Vec::from_slice(&[0x00]).unwrap_or_default()
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        BasicCluster::reset_to_factory_defaults(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_preserves_identity_and_clears_location() {
+        let mut cluster = BasicCluster::new(
+            "Acme Corp",
+            "Widget-1000",
+            "20240101",
+            "1.2.3",
+            PowerSource::MainsSinglePhase,
+        );
+        cluster
+            .attributes_mut()
+            .set(
+                ATTR_LOCATION_DESCRIPTION,
+                ZclValue::CharString(heapless::Vec::from_slice(b"Living Room").unwrap()),
+            )
+            .unwrap();
+
+        Cluster::reset_to_factory_defaults(&mut cluster);
+
+        assert_eq!(cluster.manufacturer_name(), "Acme Corp");
+        assert_eq!(cluster.model_identifier(), "Widget-1000");
+        assert_eq!(cluster.date_code(), "20240101");
+        assert_eq!(cluster.sw_build_id(), "1.2.3");
+        assert_eq!(
+            cluster.attributes().get(ATTR_POWER_SOURCE),
+            Some(&ZclValue::Enum8(PowerSource::MainsSinglePhase as u8))
+        );
+        assert_eq!(
+            cluster.attributes().get(ATTR_LOCATION_DESCRIPTION),
+            Some(&ZclValue::CharString(heapless::Vec::new()))
+        );
+    }
 }

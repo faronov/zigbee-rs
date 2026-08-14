@@ -114,4 +114,13 @@ impl Cluster for BinaryInputCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self
+            .store
+            .set_raw(ATTR_OUT_OF_SERVICE, ZclValue::Bool(false));
+        let _ = self.store.set_raw(ATTR_RELIABILITY, ZclValue::U8(0));
+        // PresentValue is a live sensor reading fed by the driver via
+        // `set_present_value`, not a client-writable attribute — preserved.
+    }
 }

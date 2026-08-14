@@ -245,4 +245,9 @@ impl Cluster for GroupsCluster {
     fn generated_commands(&self) -> heapless::Vec<u8, 32> {
         heapless::Vec::from_slice(&[0x00, 0x01, 0x02, 0x03]).unwrap_or_default()
     }
+
+    /// `NameSupport` is read-only, and group membership mirrors the APS
+    /// group table, which a Basic cluster reset MUST NOT touch (that is the
+    /// job of the full BDB factory-reset procedure). Deliberate no-op.
+    fn reset_to_factory_defaults(&mut self) {}
 }

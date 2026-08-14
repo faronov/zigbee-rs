@@ -120,4 +120,18 @@ impl Cluster for ThermostatUiCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self.store.set_raw(
+            ATTR_TEMPERATURE_DISPLAY_MODE,
+            ZclValue::Enum8(DISPLAY_CELSIUS),
+        );
+        let _ = self
+            .store
+            .set_raw(ATTR_KEYPAD_LOCKOUT, ZclValue::Enum8(KEYPAD_NO_LOCKOUT));
+        let _ = self.store.set_raw(
+            ATTR_SCHEDULE_PROGRAMMING_VISIBILITY,
+            ZclValue::Enum8(SCHEDULE_ENABLED),
+        );
+    }
 }

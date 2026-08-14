@@ -269,6 +269,11 @@ impl Cluster for ElectricalMeasurementCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    /// No writable attributes: every attribute is a live measurement or
+    /// fixed AC scaling configuration set by the product/board at
+    /// installation time, not application state reset by a ZCL command.
+    fn reset_to_factory_defaults(&mut self) {}
 }
 
 #[cfg(test)]
