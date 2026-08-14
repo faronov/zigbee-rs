@@ -38,6 +38,7 @@ pub const APS_MAX_PAYLOAD: usize = 80;
 
 const WIRE_KEY_TYPE_TC_LINK: u8 = 0x04;
 const BROADCAST_IEEE: IeeeAddress = [0xFF; 8];
+const BROADCAST_NETWORK_KEY_DESTINATION: IeeeAddress = [0; 8];
 
 #[derive(Debug, Clone, Copy)]
 struct IncomingCommandSecurity {
@@ -1705,10 +1706,15 @@ impl<M: MacDriver> ApsLayer<M> {
         payload[0] = crate::frames::ApsCommandId::TransportKey as u8;
         payload[1] = key_type;
         payload[2..18].copy_from_slice(key);
+        let broadcast_network_key = key_type == 0x01 && *dst_ieee == BROADCAST_IEEE;
         let payload_len = match key_type {
             0x01 => {
                 payload[18] = key_seq_number;
-                payload[19..27].copy_from_slice(dst_ieee);
+                payload[19..27].copy_from_slice(if broadcast_network_key {
+                    &BROADCAST_NETWORK_KEY_DESTINATION
+                } else {
+                    dst_ieee
+                });
                 payload[27..35].copy_from_slice(src_ieee);
                 35
             }
@@ -1724,7 +1730,7 @@ impl<M: MacDriver> ApsLayer<M> {
             }
             _ => return Err(ApsStatus::InvalidParameter),
         };
-        if key_type == 0x01 && *dst_ieee == BROADCAST_IEEE {
+        if broadcast_network_key {
             return self
                 .send_unsecured_aps_command(ShortAddress::BROADCAST, false, &payload[..payload_len])
                 .await
@@ -2057,7 +2063,7 @@ impl<M: MacDriver> ApsLayer<M> {
                 let key_seq = data[17];
                 let mut destination_ieee = [0u8; 8];
                 destination_ieee.copy_from_slice(&data[18..26]);
-                let broadcast_update = destination_ieee == BROADCAST_IEEE;
+                let broadcast_update = destination_ieee == BROADCAST_NETWORK_KEY_DESTINATION;
                 if destination_ieee != self.nwk.nib().ieee_address && !broadcast_update {
                     log::warn!("[APS] Transport-Key: network key is for another device");
                     return;
@@ -2916,7 +2922,7 @@ mod tests {
         assert_eq!(command[1], 0x01);
         assert_eq!(&command[2..18], &next_key);
         assert_eq!(command[18], 7);
-        assert_eq!(&command[19..27], &BROADCAST_IEEE);
+        assert_eq!(&command[19..27], &BROADCAST_NETWORK_KEY_DESTINATION);
 
         assert_eq!(
             block_on(aps.apsme_switch_key(&crate::apsme::ApsmeSwitchKeyRequest {
@@ -3183,8 +3189,10 @@ mod tests {
         let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
         aps.aib_mut().aps_trust_center_address = TC_IEEE;
         let next_key = [0xB6; 16];
-        let transport =
-            unsecured_command_frame(&network_key_command(next_key, 1, BROADCAST_IEEE), 3);
+        let transport = unsecured_command_frame(
+            &network_key_command(next_key, 1, BROADCAST_NETWORK_KEY_DESTINATION),
+            3,
+        );
         let mut decrypted = ApsFrameBuffer::new();
 
         let _ = aps.process_incoming_aps_frame(
@@ -3198,8 +3206,10 @@ mod tests {
         assert_eq!(aps.nwk().security().active_key().unwrap().seq_number, 0);
         assert_eq!(aps.nwk().security().key_by_seq(1).unwrap().key, next_key);
 
-        let forged =
-            unsecured_command_frame(&network_key_command([0xC7; 16], 2, BROADCAST_IEEE), 4);
+        let forged = unsecured_command_frame(
+            &network_key_command([0xC7; 16], 2, BROADCAST_NETWORK_KEY_DESTINATION),
+            4,
+        );
         let _ = aps.process_incoming_aps_frame(
             &forged,
             ShortAddress::COORDINATOR,
@@ -3231,6 +3241,27 @@ mod tests {
         );
         assert_eq!(aps.nwk().security().active_key().unwrap().seq_number, 1);
         assert_eq!(aps.nwk().nib().active_key_seq_number, 1);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn all_ones_network_key_destination_is_not_a_broadcast_update() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        aps.aib_mut().aps_trust_center_address = TC_IEEE;
+        let transport =
+            unsecured_command_frame(&network_key_command([0xC7; 16], 2, BROADCAST_IEEE), 4);
+        let mut decrypted = ApsFrameBuffer::new();
+
+        let _ = aps.process_incoming_aps_frame(
+            &transport,
+            ShortAddress::COORDINATOR,
+            LOCAL_SHORT,
+            42,
+            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+            &mut decrypted,
+        );
+
+        assert!(aps.nwk().security().key_by_seq(2).is_none());
     }
 
     /// R21+ §4.7.3.6: a Confirm-Key only proves possession of the **unique**
