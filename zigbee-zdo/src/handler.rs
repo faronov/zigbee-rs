@@ -7,6 +7,7 @@ use zigbee_aps::apsde::ApsdeDataIndication;
 use zigbee_aps::binding::{BindingDst, BindingDstMode, BindingEntry};
 use zigbee_aps::{ApsAddress, ApsAddressMode};
 use zigbee_mac::MacDriver;
+use zigbee_nwk::nlme::nwk_update_id_is_newer;
 use zigbee_types::ShortAddress;
 
 use crate::binding_mgmt::{BindReq, BindTarget};
@@ -32,6 +33,59 @@ const fn is_broadcast_short(addr: ShortAddress) -> bool {
 /// Whether `addr` can name an individual device (`0x0000..=0xFFF7`).
 pub(crate) const fn is_unicast_short(addr: ShortAddress) -> bool {
     addr.0 < 0xFFF8
+}
+
+/// Outcome of validating an incoming `nwkUpdateId` against the local one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateIdAdoption {
+    /// Adopt the incoming update state and apply the requested change.
+    Adopt,
+    /// Same update state and the requested change is already in effect: a
+    /// retransmission. Answer SUCCESS but change nothing.
+    AlreadyApplied,
+    /// Stale, ambiguous, or an equal update ID demanding a *different*
+    /// configuration. Answer with the invalid-request status and change
+    /// nothing.
+    Reject,
+}
+
+/// R22 §3.4.12 `Mgmt_NWK_Update_req` update-state validation.
+///
+/// `local` is the locally held `nwkUpdateId` from
+/// [`Nib::nwk_update_id`](zigbee_nwk::nib::Nib::nwk_update_id) — `None` when
+/// this device holds no authoritative update state. `already_matches` says
+/// whether the configuration the request asks for (channel, or NWK manager
+/// address) is the one already in effect.
+///
+/// The rules, in order:
+///
+/// * unknown local state — nothing to order the request against and nothing to
+///   protect, so the incoming ID is adopted;
+/// * strictly newer (wrap-aware, [`nwk_update_id_is_newer`]) — adopted;
+/// * equal and the requested configuration already matches — idempotent
+///   retransmission, accepted without mutating anything;
+/// * equal but demanding a *different* configuration — two different network
+///   states claim the same update ID; the request is refused rather than
+///   silently splitting the network;
+/// * older or exactly half a window away (unorderable) — refused.
+///
+/// This never mutates anything, so the caller can validate before touching the
+/// NIB or PIB.
+pub(crate) const fn nwk_update_id_adoption(
+    local: Option<u8>,
+    incoming: u8,
+    already_matches: bool,
+) -> UpdateIdAdoption {
+    let Some(local) = local else {
+        return UpdateIdAdoption::Adopt;
+    };
+    if nwk_update_id_is_newer(incoming, local) {
+        return UpdateIdAdoption::Adopt;
+    }
+    if incoming == local && already_matches {
+        return UpdateIdAdoption::AlreadyApplied;
+    }
+    UpdateIdAdoption::Reject
 }
 
 /// Single formatting site for every ZDP frame the dispatcher does not answer
@@ -854,33 +908,72 @@ impl<M: MacDriver> ZdoLayer<M> {
             } => {
                 // Find the single channel bit set in scan_channels
                 let channel = (0u8..=26).find(|&ch| scan_channels & (1 << ch) != 0);
-                if let Some(ch) = channel {
-                    log::info!(
-                        "[ZDO] Mgmt_NWK_Update: channel change to {ch} (update_id={nwk_update_id})"
-                    );
-                    match self.nwk_mut().nlme_set_channel(ch).await {
-                        Ok(()) => {
-                            self.nwk_mut().nib_mut().update_id = nwk_update_id;
-                            if rsp.is_empty() {
-                                return Err(ZdoError::BufferTooSmall);
-                            }
-                            rsp[0] = ZdpStatus::Success as u8;
-                            Ok(1)
-                        }
-                        Err(_) => {
-                            if rsp.is_empty() {
-                                return Err(ZdoError::BufferTooSmall);
-                            }
-                            rsp[0] = ZdpStatus::InvRequestType as u8;
-                            Ok(1)
-                        }
-                    }
-                } else {
+                let Some(ch) = channel else {
                     if rsp.is_empty() {
                         return Err(ZdoError::BufferTooSmall);
                     }
                     rsp[0] = ZdpStatus::InvRequestType as u8;
-                    Ok(1)
+                    return Ok(1);
+                };
+
+                // R22 §3.4.12 — the update ID orders network update state.
+                // Validate *before* touching the NIB/PIB so a stale or
+                // ambiguous request can never move the radio off-channel.
+                let current_channel = self.nwk().nib().logical_channel;
+                match nwk_update_id_adoption(
+                    self.nwk().nib().nwk_update_id(),
+                    nwk_update_id,
+                    ch == current_channel,
+                ) {
+                    UpdateIdAdoption::Reject => {
+                        log::warn!(
+                            "[ZDO] Mgmt_NWK_Update: rejected channel change to {ch} \
+                             (update_id={nwk_update_id}, local {:?}, current channel {current_channel})",
+                            self.nwk().nib().nwk_update_id(),
+                        );
+                        if rsp.is_empty() {
+                            return Err(ZdoError::BufferTooSmall);
+                        }
+                        rsp[0] = ZdpStatus::InvRequestType as u8;
+                        Ok(1)
+                    }
+                    UpdateIdAdoption::AlreadyApplied => {
+                        // Same update state, already on the requested channel:
+                        // a retransmission. Confirm without re-tuning.
+                        log::debug!(
+                            "[ZDO] Mgmt_NWK_Update: channel change to {ch} already applied \
+                             (update_id={nwk_update_id})"
+                        );
+                        if rsp.is_empty() {
+                            return Err(ZdoError::BufferTooSmall);
+                        }
+                        rsp[0] = ZdpStatus::Success as u8;
+                        Ok(1)
+                    }
+                    UpdateIdAdoption::Adopt => {
+                        log::info!(
+                            "[ZDO] Mgmt_NWK_Update: channel change to {ch} (update_id={nwk_update_id})"
+                        );
+                        match self.nwk_mut().nlme_set_channel(ch).await {
+                            Ok(()) => {
+                                // Only a channel change that actually took
+                                // effect may advance the update state.
+                                self.nwk_mut().nib_mut().set_nwk_update_id(nwk_update_id);
+                                if rsp.is_empty() {
+                                    return Err(ZdoError::BufferTooSmall);
+                                }
+                                rsp[0] = ZdpStatus::Success as u8;
+                                Ok(1)
+                            }
+                            Err(_) => {
+                                if rsp.is_empty() {
+                                    return Err(ZdoError::BufferTooSmall);
+                                }
+                                rsp[0] = ZdpStatus::InvRequestType as u8;
+                                Ok(1)
+                            }
+                        }
+                    }
                 }
             }
             MgmtNwkUpdateReq::ManagerChange {
@@ -888,17 +981,53 @@ impl<M: MacDriver> ZdoLayer<M> {
                 nwk_manager_addr,
                 ..
             } => {
-                log::info!(
-                    "[ZDO] Mgmt_NWK_Update: manager change to 0x{:04X} (update_id={nwk_update_id})",
-                    nwk_manager_addr.0,
-                );
-                self.nwk_mut().nib_mut().nwk_manager_addr = nwk_manager_addr;
-                self.nwk_mut().nib_mut().update_id = nwk_update_id;
-                if rsp.is_empty() {
-                    return Err(ZdoError::BufferTooSmall);
+                let current_manager = self.nwk().nib().nwk_manager_addr;
+                match nwk_update_id_adoption(
+                    self.nwk().nib().nwk_update_id(),
+                    nwk_update_id,
+                    nwk_manager_addr == current_manager,
+                ) {
+                    UpdateIdAdoption::Reject => {
+                        log::warn!(
+                            "[ZDO] Mgmt_NWK_Update: rejected manager change to 0x{:04X} \
+                             (update_id={nwk_update_id}, local {:?}, current manager 0x{:04X})",
+                            nwk_manager_addr.0,
+                            self.nwk().nib().nwk_update_id(),
+                            current_manager.0,
+                        );
+                        if rsp.is_empty() {
+                            return Err(ZdoError::BufferTooSmall);
+                        }
+                        rsp[0] = ZdpStatus::InvRequestType as u8;
+                        Ok(1)
+                    }
+                    UpdateIdAdoption::AlreadyApplied => {
+                        log::debug!(
+                            "[ZDO] Mgmt_NWK_Update: manager change to 0x{:04X} already applied \
+                             (update_id={nwk_update_id})",
+                            nwk_manager_addr.0,
+                        );
+                        if rsp.is_empty() {
+                            return Err(ZdoError::BufferTooSmall);
+                        }
+                        rsp[0] = ZdpStatus::Success as u8;
+                        Ok(1)
+                    }
+                    UpdateIdAdoption::Adopt => {
+                        log::info!(
+                            "[ZDO] Mgmt_NWK_Update: manager change to 0x{:04X} (update_id={nwk_update_id})",
+                            nwk_manager_addr.0,
+                        );
+                        let nib = self.nwk_mut().nib_mut();
+                        nib.nwk_manager_addr = nwk_manager_addr;
+                        nib.set_nwk_update_id(nwk_update_id);
+                        if rsp.is_empty() {
+                            return Err(ZdoError::BufferTooSmall);
+                        }
+                        rsp[0] = ZdpStatus::Success as u8;
+                        Ok(1)
+                    }
                 }
-                rsp[0] = ZdpStatus::Success as u8;
-                Ok(1)
             }
         }
     }
@@ -1527,5 +1656,262 @@ mod tests {
         assert_eq!(cluster, crate::ACTIVE_EP_RSP);
         assert_eq!(body[0], 0x41);
         assert_eq!(body[1], ZdpStatus::Success as u8);
+    }
+
+    // ── Mgmt_NWK_Update adoption (R22 §3.4.12) ──────────────
+
+    const START_CHANNEL: u8 = 15;
+    const NEW_CHANNEL: u8 = 20;
+    const NEW_MANAGER: ShortAddress = ShortAddress(0x1A2B);
+
+    /// A commissioned device holding a known-good `nwkUpdateId`.
+    fn test_zdo_on_channel(update_id: Option<u8>) -> ZdoLayer<MockMac> {
+        let mut zdo = test_zdo();
+        {
+            let nib = zdo.nwk_mut().nib_mut();
+            nib.logical_channel = START_CHANNEL;
+            nib.restore_nwk_update_id(update_id);
+        }
+        zdo
+    }
+
+    fn channel_change(tsn: u8, channel: u8, nwk_update_id: u8) -> [u8; 7] {
+        let mut payload = [0u8; 7];
+        payload[0] = tsn;
+        payload[1..5].copy_from_slice(&(1u32 << channel).to_le_bytes());
+        payload[5] = 0xFE;
+        payload[6] = nwk_update_id;
+        payload
+    }
+
+    fn manager_change(tsn: u8, manager: ShortAddress, nwk_update_id: u8) -> [u8; 9] {
+        let mut payload = [0u8; 9];
+        payload[0] = tsn;
+        payload[1..5].copy_from_slice(&0u32.to_le_bytes());
+        payload[5] = 0xFF;
+        payload[6] = nwk_update_id;
+        payload[7..9].copy_from_slice(&manager.0.to_le_bytes());
+        payload
+    }
+
+    fn zdp_status(zdo: &ZdoLayer<MockMac>) -> u8 {
+        let (cluster, body) = last_zdp_tx(zdo).expect("Mgmt_NWK_Update_rsp must be transmitted");
+        assert_eq!(cluster, crate::MGMT_NWK_UPDATE_RSP);
+        body[1]
+    }
+
+    /// The pure classification, independent of any NIB.
+    #[test]
+    fn update_id_adoption_classification_is_wrap_aware() {
+        // Unknown local state accepts anything, and never reports "already
+        // applied" — there is no known state to be idempotent against.
+        assert_eq!(
+            nwk_update_id_adoption(None, 0x00, false),
+            UpdateIdAdoption::Adopt
+        );
+        assert_eq!(
+            nwk_update_id_adoption(None, 0xF0, true),
+            UpdateIdAdoption::Adopt
+        );
+
+        // Strictly newer, including across the wrap.
+        assert_eq!(
+            nwk_update_id_adoption(Some(5), 6, false),
+            UpdateIdAdoption::Adopt
+        );
+        assert_eq!(
+            nwk_update_id_adoption(Some(0xFF), 0x00, false),
+            UpdateIdAdoption::Adopt
+        );
+
+        // Equal: idempotent only when the requested configuration is already
+        // in effect; equal-but-different is a conflict.
+        assert_eq!(
+            nwk_update_id_adoption(Some(7), 7, true),
+            UpdateIdAdoption::AlreadyApplied
+        );
+        assert_eq!(
+            nwk_update_id_adoption(Some(7), 7, false),
+            UpdateIdAdoption::Reject
+        );
+
+        // Older, and the unorderable half-window, are refused in both
+        // directions even when the configuration happens to match.
+        assert_eq!(
+            nwk_update_id_adoption(Some(7), 6, true),
+            UpdateIdAdoption::Reject
+        );
+        assert_eq!(
+            nwk_update_id_adoption(Some(0x00), 0xFF, true),
+            UpdateIdAdoption::Reject
+        );
+        assert_eq!(
+            nwk_update_id_adoption(Some(0x00), 0x80, false),
+            UpdateIdAdoption::Reject
+        );
+        assert_eq!(
+            nwk_update_id_adoption(Some(0x80), 0x00, false),
+            UpdateIdAdoption::Reject
+        );
+    }
+
+    #[test]
+    fn mgmt_nwk_update_adopts_a_newer_channel_change() {
+        let mut zdo = test_zdo_on_channel(Some(4));
+        let payload = channel_change(0x61, NEW_CHANNEL, 5);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &payload))).unwrap();
+
+        assert_eq!(zdp_status(&zdo), ZdpStatus::Success as u8);
+        assert_eq!(zdo.nwk().nib().logical_channel, NEW_CHANNEL);
+        assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(5));
+    }
+
+    /// Wrap-aware: 0x00 is newer than 0xFF, not eight generations older.
+    #[test]
+    fn mgmt_nwk_update_adopts_a_channel_change_across_the_wrap() {
+        let mut zdo = test_zdo_on_channel(Some(0xFF));
+        let payload = channel_change(0x62, NEW_CHANNEL, 0x00);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &payload))).unwrap();
+
+        assert_eq!(zdp_status(&zdo), ZdpStatus::Success as u8);
+        assert_eq!(zdo.nwk().nib().logical_channel, NEW_CHANNEL);
+        assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(0x00));
+    }
+
+    /// A stale request must not move the radio off-channel: a device that
+    /// followed it would be deaf on a channel the network has left behind.
+    #[test]
+    fn mgmt_nwk_update_rejects_a_stale_channel_change_without_retuning() {
+        let mut zdo = test_zdo_on_channel(Some(9));
+        let payload = channel_change(0x63, NEW_CHANNEL, 8);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &payload))).unwrap();
+
+        assert_eq!(zdp_status(&zdo), ZdpStatus::InvRequestType as u8);
+        assert_eq!(zdo.nwk().nib().logical_channel, START_CHANNEL);
+        assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(9));
+    }
+
+    /// The unorderable half-window distance is refused, not guessed at.
+    #[test]
+    fn mgmt_nwk_update_rejects_an_ambiguous_channel_change() {
+        let mut zdo = test_zdo_on_channel(Some(0x00));
+        let payload = channel_change(0x64, NEW_CHANNEL, 0x80);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &payload))).unwrap();
+
+        assert_eq!(zdp_status(&zdo), ZdpStatus::InvRequestType as u8);
+        assert_eq!(zdo.nwk().nib().logical_channel, START_CHANNEL);
+        assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(0x00));
+    }
+
+    /// Equal update ID, same channel: a retransmission. Confirm, change
+    /// nothing.
+    #[test]
+    fn mgmt_nwk_update_treats_an_equal_matching_channel_change_as_idempotent() {
+        let mut zdo = test_zdo_on_channel(Some(3));
+        let payload = channel_change(0x65, START_CHANNEL, 3);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &payload))).unwrap();
+
+        assert_eq!(zdp_status(&zdo), ZdpStatus::Success as u8);
+        assert_eq!(zdo.nwk().nib().logical_channel, START_CHANNEL);
+        assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(3));
+    }
+
+    /// Equal update ID but a *different* channel: two network states claiming
+    /// the same update ID. Refuse rather than split the network.
+    #[test]
+    fn mgmt_nwk_update_rejects_an_equal_but_conflicting_channel_change() {
+        let mut zdo = test_zdo_on_channel(Some(3));
+        let payload = channel_change(0x66, NEW_CHANNEL, 3);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &payload))).unwrap();
+
+        assert_eq!(zdp_status(&zdo), ZdpStatus::InvRequestType as u8);
+        assert_eq!(zdo.nwk().nib().logical_channel, START_CHANNEL);
+        assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(3));
+    }
+
+    /// Unknown local state has nothing to order the request against, so the
+    /// incoming ID is adopted — and becomes known-good from then on.
+    #[test]
+    fn mgmt_nwk_update_adopts_a_channel_change_when_local_state_is_unknown() {
+        let mut zdo = test_zdo_on_channel(None);
+        assert_eq!(zdo.nwk().nib().nwk_update_id(), None);
+
+        // An update ID that a fabricated local `0` would have called stale.
+        let payload = channel_change(0x67, NEW_CHANNEL, 0xF0);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &payload))).unwrap();
+
+        assert_eq!(zdp_status(&zdo), ZdpStatus::Success as u8);
+        assert_eq!(zdo.nwk().nib().logical_channel, NEW_CHANNEL);
+        assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(0xF0));
+
+        // Now that the state is known, the same request is a conflict-free
+        // retransmission, and an older one is refused.
+        let repeat = channel_change(0x68, NEW_CHANNEL, 0xF0);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &repeat))).unwrap();
+        assert_eq!(zdp_status(&zdo), ZdpStatus::Success as u8);
+
+        let stale = channel_change(0x69, START_CHANNEL, 0xEF);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &stale))).unwrap();
+        assert_eq!(zdp_status(&zdo), ZdpStatus::InvRequestType as u8);
+        assert_eq!(zdo.nwk().nib().logical_channel, NEW_CHANNEL);
+    }
+
+    /// A channel-change request that names no channel is refused before the
+    /// update state is even consulted.
+    #[test]
+    fn mgmt_nwk_update_rejects_a_channel_change_without_a_channel() {
+        let mut zdo = test_zdo_on_channel(Some(3));
+        let mut payload = [0u8; 7];
+        payload[0] = 0x6A;
+        payload[1..5].copy_from_slice(&0u32.to_le_bytes());
+        payload[5] = 0xFE;
+        payload[6] = 9;
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &payload))).unwrap();
+
+        assert_eq!(zdp_status(&zdo), ZdpStatus::InvRequestType as u8);
+        assert_eq!(zdo.nwk().nib().logical_channel, START_CHANNEL);
+        assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(3));
+    }
+
+    #[test]
+    fn mgmt_nwk_update_manager_change_follows_the_same_rules() {
+        // Newer: adopted.
+        let mut zdo = test_zdo_on_channel(Some(4));
+        let original_manager = zdo.nwk().nib().nwk_manager_addr;
+        let payload = manager_change(0x71, NEW_MANAGER, 5);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &payload))).unwrap();
+        assert_eq!(zdp_status(&zdo), ZdpStatus::Success as u8);
+        assert_eq!(zdo.nwk().nib().nwk_manager_addr, NEW_MANAGER);
+        assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(5));
+
+        // Stale: refused, manager untouched.
+        let stale = manager_change(0x72, ShortAddress(0x4444), 4);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &stale))).unwrap();
+        assert_eq!(zdp_status(&zdo), ZdpStatus::InvRequestType as u8);
+        assert_eq!(zdo.nwk().nib().nwk_manager_addr, NEW_MANAGER);
+        assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(5));
+
+        // Equal and already applied: idempotent.
+        let repeat = manager_change(0x73, NEW_MANAGER, 5);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &repeat))).unwrap();
+        assert_eq!(zdp_status(&zdo), ZdpStatus::Success as u8);
+        assert_eq!(zdo.nwk().nib().nwk_manager_addr, NEW_MANAGER);
+
+        // Equal but naming a different manager: refused.
+        let conflicting = manager_change(0x74, ShortAddress(0x5555), 5);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &conflicting)))
+            .unwrap();
+        assert_eq!(zdp_status(&zdo), ZdpStatus::InvRequestType as u8);
+        assert_eq!(zdo.nwk().nib().nwk_manager_addr, NEW_MANAGER);
+        assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(5));
+
+        // Unknown local state adopts, from the original manager.
+        let mut zdo = test_zdo_on_channel(None);
+        assert_eq!(zdo.nwk().nib().nwk_manager_addr, original_manager);
+        let payload = manager_change(0x75, NEW_MANAGER, 0xC0);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &payload))).unwrap();
+        assert_eq!(zdp_status(&zdo), ZdpStatus::Success as u8);
+        assert_eq!(zdo.nwk().nib().nwk_manager_addr, NEW_MANAGER);
+        assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(0xC0));
     }
 }

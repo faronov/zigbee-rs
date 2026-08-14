@@ -12,7 +12,8 @@ use crate::frames::{
     FRAG_NONE, FRAG_SUBSEQUENT,
 };
 use crate::{
-    ApsAddress, ApsAddressMode, ApsLayer, ApsStatus, ApsTxOptions, PendingApsAck, PendingApsTunnel,
+    ApsAddress, ApsAddressMode, ApsLayer, ApsStatus, ApsTxOptions, PendingApsAck,
+    PendingApsSecurity, PendingApsTunnel,
 };
 use zigbee_crypto::ForwardAesProvider;
 #[cfg(test)]
@@ -39,6 +40,18 @@ pub const APS_MAX_PAYLOAD: usize = 80;
 const WIRE_KEY_TYPE_TC_LINK: u8 = 0x04;
 const BROADCAST_IEEE: IeeeAddress = [0xFF; 8];
 const BROADCAST_NETWORK_KEY_DESTINATION: IeeeAddress = [0; 8];
+
+/// Link-key material reserved for one outgoing APS-secured frame.
+///
+/// The `origin` names the key-pair entry the counter was drawn from
+/// (R22 `apsDeviceKeyPairSet`), so a retransmission can draw the *next*
+/// counter from the same entry instead of repeating this one.
+#[derive(Debug, Clone, Copy)]
+struct OutgoingApsSecurity {
+    key: crate::security::AesKey,
+    frame_counter: u32,
+    origin: crate::security::ApsKeyOrigin,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct IncomingCommandSecurity {
@@ -336,76 +349,165 @@ fn aps_decrypt_incoming<P: ForwardAesProvider>(
         sec_hdr.source_address.is_some() as u8,
     );
 
-    let installed_link_key = sec_hdr
-        .source_address
-        .as_ref()
-        .and_then(|address| security.find_any_key(address))
-        .map(|entry| entry.key);
     let default_link_key = *security.default_tc_link_key();
-    let base_link_key = installed_link_key.unwrap_or(default_link_key);
-    // An explicitly installed entry containing ZigBeeAlliance09 is still the
-    // global key, not a unique Trust Center link key.
-    let uses_default_link_key = base_link_key == default_link_key;
-    let key = if key_id == crate::security::KEY_ID_DATA_KEY {
-        base_link_key
-    } else if key_id == crate::security::KEY_ID_KEY_TRANSPORT {
-        crate::security::derive_key_transport_key_with(provider, &base_link_key)?
-    } else if key_id == crate::security::KEY_ID_KEY_LOAD {
-        crate::security::derive_key_load_key_with(provider, &base_link_key)?
-    } else {
-        log::warn!("[APS] Unsupported key_id={} in APS security", key_id);
-        return None;
-    };
-
-    let replay_key_type = crate::security::ApsKeyType::TrustCenterLinkKey;
-    if let Some(addr) = &sec_hdr.source_address
-        && !security.check_frame_counter(addr, replay_key_type, sec_hdr.frame_counter)
+    if key_id != crate::security::KEY_ID_DATA_KEY
+        && key_id != crate::security::KEY_ID_KEY_TRANSPORT
+        && key_id != crate::security::KEY_ID_KEY_LOAD
     {
-        log::warn!(
-            "[APS] Replay detected: frame counter {} from src",
-            sec_hdr.frame_counter
-        );
+        log::warn!("[APS] Unsupported key_id={} in APS security", key_id);
         return None;
     }
 
+    // Candidate key-pair entries (R22 `apsDeviceKeyPairSet`), most specific
+    // first. The frame does not name the entry that secured it, so each
+    // candidate carries its own replay window and its own key: the counter is
+    // checked against the candidate *before* decrypting with it, and committed
+    // to the candidate whose MIC verified. Binding the window to a fixed key
+    // type instead left an application link key with no replay protection at
+    // all (the Trust Center entry it checked did not exist, so every counter
+    // was accepted and every commit was a no-op).
+    let mut candidates: heapless::Vec<
+        (crate::security::ApsKeyOrigin, crate::security::AesKey),
+        { crate::security::MAX_KEY_PAIRS_PER_PARTNER },
+    > = heapless::Vec::new();
+    if let Some(address) = sec_hdr.source_address {
+        for pair in security.key_pairs_for(&address) {
+            let _ = candidates.push((
+                crate::security::ApsKeyOrigin::KeyPair {
+                    partner: address,
+                    key_type: pair.key_type,
+                },
+                pair.key,
+            ));
+        }
+    }
+    if candidates.is_empty() {
+        // No key-pair entry for this partner: first contact still runs under
+        // the preconfigured global key, which owns no per-partner counter.
+        let _ = candidates.push((
+            crate::security::ApsKeyOrigin::PreconfiguredGlobal,
+            default_link_key,
+        ));
+    }
+
+    let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
+    let mut accepted: Option<(crate::security::ApsKeyOrigin, bool)> = None;
+    for (origin, base_link_key) in candidates.iter().copied() {
+        if !security.check_frame_counter_for(&origin, sec_hdr.frame_counter) {
+            log::warn!(
+                "[APS] Replay detected: frame counter {} from src",
+                sec_hdr.frame_counter
+            );
+            continue;
+        }
+        // An explicitly installed entry containing ZigBeeAlliance09 is still
+        // the global key, not a unique Trust Center link key.
+        let uses_default_link_key = base_link_key == default_link_key;
+        if decrypt_with_link_key(
+            provider,
+            security,
+            key_id,
+            &base_link_key,
+            uses_default_link_key,
+            nwk_has_active_key,
+            aad,
+            aad_raw,
+            ciphertext,
+            &sec_hdr,
+            decrypted_buf,
+        ) {
+            accepted = Some((origin, uses_default_link_key));
+            break;
+        }
+    }
+
+    // `aps_diag!` compiles away without the `trace` feature, which is why this
+    // reads like a bare `?` to clippy — the log line is the point.
+    #[allow(clippy::question_mark)]
+    let Some((origin, uses_default_link_key)) = accepted else {
+        aps_diag!(
+            "[APS] decrypt ALL FAILED key_id={} ct_len={}",
+            key_id,
+            ciphertext.len()
+        );
+        return None;
+    };
+    security.commit_frame_counter_for(&origin, sec_hdr.frame_counter);
+
+    Some(ApsDecryptOutcome {
+        aps_security_source,
+        aps_key_identifier,
+        aps_used_default_link_key: uses_default_link_key,
+    })
+}
+
+/// Attempt every accepted CCM* variant for one candidate link key.
+///
+/// The ladder is the historical one, now applied per key-pair candidate:
+/// derived key × {patched AAD, raw AAD}, then — only for a key-transport frame
+/// still running under the global key on a node without an active network key
+/// — the raw Trust Center key × {patched AAD, raw AAD}, because some stacks do
+/// not derive the key-transport key. Returns whether a MIC verified; the
+/// caller owns the replay check and the single post-success commit.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn decrypt_with_link_key<P: ForwardAesProvider>(
+    provider: &mut P,
+    security: &crate::security::ApsSecurity,
+    key_id: u8,
+    base_link_key: &crate::security::AesKey,
+    uses_default_link_key: bool,
+    nwk_has_active_key: bool,
+    aad: &[u8],
+    aad_raw: &[u8],
+    ciphertext: &[u8],
+    sec_hdr: &crate::security::ApsSecurityHeader,
+    decrypted_buf: &mut ApsFrameBuffer,
+) -> bool {
+    let key = if key_id == crate::security::KEY_ID_KEY_TRANSPORT {
+        match crate::security::derive_key_transport_key_with(provider, base_link_key) {
+            Some(key) => key,
+            None => return false,
+        }
+    } else if key_id == crate::security::KEY_ID_KEY_LOAD {
+        match crate::security::derive_key_load_key_with(provider, base_link_key) {
+            Some(key) => key,
+            None => return false,
+        }
+    } else {
+        *base_link_key
+    };
+
     // Try decrypt with patched AAD (standard: OTA level→5).
-    // If that fails AND this is a key-transport frame, try fallback approaches:
-    //   1. AAD with original OTA security level (some coordinators don't strip)
-    //   2. Raw TC link key instead of derived key-transport key
-    let mut decrypt_ok = false;
     if decrypt_into(
         provider,
         security,
         aad,
         ciphertext,
         &key,
-        &sec_hdr,
+        sec_hdr,
         decrypted_buf,
     ) {
         aps_diag!("[APS] decrypt succeeded with patched AAD");
-        decrypt_ok = true;
+        return true;
     }
 
     // Fallback: try with un-patched AAD (original OTA security level)
-    if !decrypt_ok {
-        let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
-        if decrypt_into(
-            provider,
-            security,
-            aad_raw,
-            ciphertext,
-            &key,
-            &sec_hdr,
-            decrypted_buf,
-        ) {
-            aps_diag!("[APS] decrypt succeeded with raw AAD");
-            decrypt_ok = true;
-        }
+    if decrypt_into(
+        provider,
+        security,
+        aad_raw,
+        ciphertext,
+        &key,
+        sec_hdr,
+        decrypted_buf,
+    ) {
+        aps_diag!("[APS] decrypt succeeded with raw AAD");
+        return true;
     }
 
     // Fallback for key-transport: try raw TC link key (some impls don't derive)
-    if !decrypt_ok
-        && key_id == crate::security::KEY_ID_KEY_TRANSPORT
+    if key_id == crate::security::KEY_ID_KEY_TRANSPORT
         && uses_default_link_key
         && !nwk_has_active_key
     {
@@ -416,48 +518,27 @@ fn aps_decrypt_incoming<P: ForwardAesProvider>(
             aad,
             ciphertext,
             &tc_key,
-            &sec_hdr,
+            sec_hdr,
             decrypted_buf,
         ) {
             aps_diag!("[APS] key-transport decrypt succeeded with raw TC key");
-            decrypt_ok = true;
+            return true;
         }
-        // Try with un-patched AAD
-        if !decrypt_ok {
-            let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
-            if decrypt_into(
-                provider,
-                security,
-                aad_raw,
-                ciphertext,
-                &tc_key,
-                &sec_hdr,
-                decrypted_buf,
-            ) {
-                aps_diag!("[APS] key-transport decrypt succeeded with raw TC key and raw AAD");
-                decrypt_ok = true;
-            }
+        if decrypt_into(
+            provider,
+            security,
+            aad_raw,
+            ciphertext,
+            &tc_key,
+            sec_hdr,
+            decrypted_buf,
+        ) {
+            aps_diag!("[APS] key-transport decrypt succeeded with raw TC key and raw AAD");
+            return true;
         }
     }
 
-    if decrypt_ok {
-        if let Some(addr) = &sec_hdr.source_address {
-            security.commit_frame_counter(addr, replay_key_type, sec_hdr.frame_counter);
-        }
-    } else {
-        aps_diag!(
-            "[APS] decrypt ALL FAILED key_id={} ct_len={}",
-            key_id,
-            ciphertext.len()
-        );
-        return None;
-    }
-
-    Some(ApsDecryptOutcome {
-        aps_security_source,
-        aps_key_identifier,
-        aps_used_default_link_key: uses_default_link_key,
-    })
+    false
 }
 
 // ── APSDE-DATA.request ──────────────────────────────────────────
@@ -654,13 +735,13 @@ impl<M: MacDriver> ApsLayer<M> {
             }
 
             let dst_ieee = self.nwk.find_ieee_by_short(nwk_dst);
-            let (key, frame_counter) = self
+            let material = self
                 .next_aps_link_key_material(dst_ieee.as_ref())
                 .ok_or(ApsStatus::SecurityFail)?;
             let src_ieee = self.nwk.nib().ieee_address;
             let sec_hdr = crate::security::ApsSecurityHeader {
                 security_control: crate::security::ApsSecurityHeader::APS_DEFAULT_EXT_NONCE,
-                frame_counter,
+                frame_counter: material.frame_counter,
                 source_address: Some(src_ieee),
                 key_seq_number: None,
             };
@@ -668,65 +749,61 @@ impl<M: MacDriver> ApsLayer<M> {
             let aps_counter = self.next_aps_counter();
             let aps_header = self.build_data_header(delivery_mode, req, aps_counter, true, false);
 
-            // Serialize header for AAD
-            let mut aad_buf = [0u8; 32];
-            let hdr_len = aps_header.serialize(&mut aad_buf);
-            let sec_hdr_len = sec_hdr.serialize(&mut aad_buf[hdr_len..]);
-            let aad = &aad_buf[..hdr_len + sec_hdr_len];
+            // The plaintext form — APS header followed by the payload — is
+            // both what CCM* authenticates and what a retransmission has to be
+            // re-secured from, so it is built once here.
+            let mut plaintext = [0u8; 128];
+            let aps_hdr_len = aps_header.serialize(&mut plaintext);
+            let plaintext_len = aps_hdr_len + req.payload.len();
+            if plaintext_len > plaintext.len() {
+                return Err(ApsStatus::AsduTooLong);
+            }
+            plaintext[aps_hdr_len..plaintext_len].copy_from_slice(req.payload);
 
-            if let Some(enc) =
-                self.security
-                    .encrypt_with(self.nwk.mac_mut(), aad, req.payload, &key, &sec_hdr)
-            {
-                let mut encrypted_buf = [0u8; 128];
-                let mut offset = 0;
-                let aps_hdr_len = aps_header.serialize(&mut encrypted_buf);
-                offset += aps_hdr_len;
-                let sec_len = sec_hdr.serialize(&mut encrypted_buf[offset..]);
-                offset += sec_len;
-                if offset + enc.len() > encrypted_buf.len() {
-                    return Err(ApsStatus::AsduTooLong);
-                }
-                encrypted_buf[offset..offset + enc.len()].copy_from_slice(&enc);
-                let total = offset + enc.len();
-
-                let nwk_result = self
-                    .nwk
-                    .nlde_data_request(
-                        nwk_dst,
-                        radius,
-                        &encrypted_buf[..total],
-                        req.tx_options.use_nwk_key,
-                        true,
-                    )
-                    .await;
-
-                match nwk_result {
-                    Ok(_) => {
-                        if req.tx_options.ack_request {
-                            self.register_ack_pending(
-                                aps_counter,
-                                nwk_dst.0,
-                                &encrypted_buf[..total],
-                            );
-                        }
-                        return Ok(ApsdeDataConfirm {
-                            status: ApsStatus::Success,
-                            dst_addr_mode: req.dst_addr_mode,
-                            dst_address: req.dst_address,
-                            dst_endpoint: req.dst_endpoint,
-                            src_endpoint: req.src_endpoint,
-                            aps_counter,
-                        });
-                    }
-                    Err(nwk_err) => {
-                        return Err(nwk_status_to_aps(nwk_err));
-                    }
-                }
-            } else {
+            let Some(frame) = self.assemble_secured_frame(
+                &plaintext[..aps_hdr_len],
+                &plaintext[aps_hdr_len..plaintext_len],
+                &material.key,
+                &sec_hdr,
+            ) else {
                 log::warn!("[APS] APS encryption failed");
                 return Err(ApsStatus::SecurityFail);
-            }
+            };
+
+            let nwk_result = self
+                .nwk
+                .nlde_data_request(nwk_dst, radius, &frame, req.tx_options.use_nwk_key, true)
+                .await;
+
+            return match nwk_result {
+                Ok(_) => {
+                    if req.tx_options.ack_request {
+                        // Track the *plaintext* frame: a retry must be secured
+                        // again with a fresh counter, never replayed as the
+                        // same nonce and ciphertext.
+                        self.register_secured_ack_pending(
+                            aps_counter,
+                            nwk_dst.0,
+                            &plaintext[..plaintext_len],
+                            PendingApsSecurity {
+                                origin: material.origin,
+                                src_ieee,
+                                security_control: sec_hdr.security_control,
+                                header_len: aps_hdr_len as u8,
+                            },
+                        );
+                    }
+                    Ok(ApsdeDataConfirm {
+                        status: ApsStatus::Success,
+                        dst_addr_mode: req.dst_addr_mode,
+                        dst_address: req.dst_address,
+                        dst_endpoint: req.dst_endpoint,
+                        src_endpoint: req.src_endpoint,
+                        aps_counter,
+                    })
+                }
+                Err(nwk_err) => Err(nwk_status_to_aps(nwk_err)),
+            };
         }
 
         // Check if fragmentation is needed
@@ -1006,12 +1083,12 @@ impl<M: MacDriver> ApsLayer<M> {
             };
 
             // Encrypt this fragment
-            let (link_key, frame_counter) = self
+            let material = self
                 .next_aps_link_key_material(dst_ieee.as_ref())
                 .ok_or(ApsStatus::SecurityFail)?;
             let sec_hdr = crate::security::ApsSecurityHeader {
                 security_control: crate::security::ApsSecurityHeader::APS_DEFAULT_EXT_NONCE,
-                frame_counter,
+                frame_counter: material.frame_counter,
                 source_address: Some(src_ieee),
                 key_seq_number: None,
             };
@@ -1023,7 +1100,7 @@ impl<M: MacDriver> ApsLayer<M> {
 
             if let Some(enc) =
                 self.security
-                    .encrypt_with(self.nwk.mac_mut(), aad, chunk, &link_key, &sec_hdr)
+                    .encrypt_with(self.nwk.mac_mut(), aad, chunk, &material.key, &sec_hdr)
             {
                 let mut frag_buf = [0u8; 128];
                 let mut offset = frag_header.serialize(&mut frag_buf);
@@ -1866,7 +1943,7 @@ impl<M: MacDriver> ApsLayer<M> {
     fn next_aps_link_key_material(
         &mut self,
         destination: Option<&IeeeAddress>,
-    ) -> Option<(crate::security::AesKey, u32)> {
+    ) -> Option<OutgoingApsSecurity> {
         if let Some(destination) = destination
             && let Some((key, key_type)) = self
                 .security
@@ -1874,12 +1951,105 @@ impl<M: MacDriver> ApsLayer<M> {
                 .map(|entry| (entry.key, entry.key_type))
         {
             let frame_counter = self.security.next_frame_counter(destination, key_type)?;
-            return Some((key, frame_counter));
+            return Some(OutgoingApsSecurity {
+                key,
+                frame_counter,
+                origin: crate::security::ApsKeyOrigin::KeyPair {
+                    partner: *destination,
+                    key_type,
+                },
+            });
         }
 
         let key = *self.security.default_tc_link_key();
         let frame_counter = self.next_default_tc_link_key_frame_counter()?;
-        Some((key, frame_counter))
+        Some(OutgoingApsSecurity {
+            key,
+            frame_counter,
+            origin: crate::security::ApsKeyOrigin::PreconfiguredGlobal,
+        })
+    }
+
+    /// Reserve the next outgoing APS frame counter of `origin`.
+    ///
+    /// Returns `None` when the key-pair entry is gone or its durably reserved
+    /// counter range is exhausted — never a reused counter.
+    fn next_frame_counter_for(&mut self, origin: &crate::security::ApsKeyOrigin) -> Option<u32> {
+        match origin {
+            crate::security::ApsKeyOrigin::KeyPair { partner, key_type } => {
+                self.security.next_frame_counter(partner, *key_type)
+            }
+            crate::security::ApsKeyOrigin::PreconfiguredGlobal => {
+                self.next_default_tc_link_key_frame_counter()
+            }
+        }
+    }
+
+    /// Re-secure an APS retransmission held as `header || plaintext payload`.
+    ///
+    /// Every retry is encrypted again with a *fresh* frame counter of the same
+    /// key-pair entry, so no nonce and no ciphertext is ever repeated
+    /// (R22 §4.4.1.1) and a receiver enforcing APS replay protection accepts
+    /// the retry. The APS header — hence the APS counter the acknowledgement
+    /// and duplicate rejection use — is copied through unchanged.
+    pub(crate) fn resecure_retransmission(
+        &mut self,
+        security: &PendingApsSecurity,
+        plaintext_frame: &[u8],
+    ) -> Option<heapless::Vec<u8, 128>> {
+        let header_len = usize::from(security.header_len);
+        if header_len > plaintext_frame.len() {
+            return None;
+        }
+        let key = self.security.key_for_origin(&security.origin)?;
+        let frame_counter = self.next_frame_counter_for(&security.origin)?;
+        let sec_hdr = crate::security::ApsSecurityHeader {
+            security_control: security.security_control,
+            frame_counter,
+            source_address: crate::security::ApsSecurityHeader::extended_nonce(
+                security.security_control,
+            )
+            .then_some(security.src_ieee),
+            key_seq_number: None,
+        };
+
+        let (header, payload) = plaintext_frame.split_at(header_len);
+        self.assemble_secured_frame(header, payload, &key, &sec_hdr)
+    }
+
+    /// Assemble one APS-secured frame: `header || auxiliary header ||
+    /// CCM*(payload)`.
+    ///
+    /// The auxiliary header is serialized into the frame and authenticated in
+    /// place, so the original send and every retransmission share a single
+    /// emission of this assembly and of its CCM* call.
+    #[inline(never)]
+    fn assemble_secured_frame(
+        &mut self,
+        aps_header: &[u8],
+        payload: &[u8],
+        key: &crate::security::AesKey,
+        sec_hdr: &crate::security::ApsSecurityHeader,
+    ) -> Option<heapless::Vec<u8, 128>> {
+        let mut frame = [0u8; 128];
+        if aps_header.len() >= frame.len() {
+            return None;
+        }
+        frame[..aps_header.len()].copy_from_slice(aps_header);
+        let sec_hdr_len = sec_hdr.serialize(&mut frame[aps_header.len()..]);
+        let aad_len = aps_header.len() + sec_hdr_len;
+        let encrypted = self.security.encrypt_with(
+            self.nwk.mac_mut(),
+            &frame[..aad_len],
+            payload,
+            key,
+            sec_hdr,
+        )?;
+        if aad_len + encrypted.len() > frame.len() {
+            return None;
+        }
+        frame[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
+        heapless::Vec::from_slice(&frame[..aad_len + encrypted.len()]).ok()
     }
 
     fn next_current_tc_link_key_material(&mut self) -> Option<(crate::security::AesKey, u32)> {
@@ -4101,5 +4271,402 @@ mod tests {
             .find_key(&TC_IEEE, crate::security::ApsKeyType::TrustCenterLinkKey)
             .unwrap();
         assert_eq!(unchanged.incoming_frame_counter, 0x0000_0100);
+    }
+
+    // ── APS replay scoping and secured-retry re-encryption ─────────
+
+    /// Build an APS-secured *data* frame as a peer would send it, with an
+    /// extended nonce carrying `src_ieee` (R22 §4.5.1) so the receiver can
+    /// resolve the key-pair entry without a neighbour lookup.
+    #[cfg(feature = "router")]
+    fn secured_data_frame(
+        key: &crate::security::AesKey,
+        src_ieee: &IeeeAddress,
+        aps_counter: u8,
+        frame_counter: u32,
+        payload: &[u8],
+    ) -> heapless::Vec<u8, 128> {
+        let header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Data as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: true,
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: Some(0x01),
+            group_address: None,
+            cluster_id: Some(0x0402),
+            profile_id: Some(0x0104),
+            src_endpoint: Some(0x01),
+            aps_counter,
+            extended_header: None,
+        };
+        let security_header = crate::security::ApsSecurityHeader {
+            security_control: crate::security::ApsSecurityHeader::APS_DEFAULT_EXT_NONCE,
+            frame_counter,
+            source_address: Some(*src_ieee),
+            key_seq_number: None,
+        };
+
+        let mut frame = [0u8; 128];
+        let header_len = header.serialize(&mut frame);
+        let security_header_len = security_header.serialize(&mut frame[header_len..]);
+        let aad_len = header_len + security_header_len;
+        let encrypted = crate::security::ApsSecurity::new()
+            .encrypt(&frame[..aad_len], payload, key, &security_header)
+            .expect("peer encrypts the frame");
+        frame[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
+        heapless::Vec::from_slice(&frame[..aad_len + encrypted.len()]).unwrap()
+    }
+
+    #[cfg(feature = "router")]
+    fn deliver_secured_data(aps: &mut ApsLayer<MockMac>, frame: &[u8]) -> bool {
+        let mut buf = ApsFrameBuffer::new();
+        aps.process_incoming_aps_frame(
+            frame,
+            CHILD_SHORT,
+            LOCAL_SHORT,
+            180,
+            IncomingNwkSecurity::new(true, Some(CHILD_IEEE)),
+            &mut buf,
+        )
+        .is_some()
+    }
+
+    #[cfg(feature = "router")]
+    fn incoming_counter(
+        aps: &ApsLayer<MockMac>,
+        key_type: crate::security::ApsKeyType,
+    ) -> (u32, bool) {
+        let entry = aps
+            .security()
+            .find_key(&CHILD_IEEE, key_type)
+            .expect("the key-pair entry is installed");
+        (
+            entry.incoming_frame_counter,
+            entry.incoming_frame_counter_valid,
+        )
+    }
+
+    /// R22 §4.4.1: the incoming (replay) frame counter belongs to the
+    /// *key-pair entry*, not to the peer. A partner that holds only an
+    /// application link key used to be checked against a Trust Center entry
+    /// that does not exist, so every counter was accepted and every commit was
+    /// a no-op — the frames had no replay protection at all.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_application_link_key_has_its_own_replay_window() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        let app_key = [0xB2; 16];
+        aps.security_mut()
+            .add_key(crate::security::ApsLinkKeyEntry {
+                partner_address: CHILD_IEEE,
+                key: app_key,
+                key_type: crate::security::ApsKeyType::ApplicationLinkKey,
+                outgoing_frame_counter: 0,
+                outgoing_frame_counter_limit: 0x1000,
+                incoming_frame_counter: 0,
+                incoming_frame_counter_valid: false,
+            })
+            .unwrap();
+
+        let payload = [0x18, 0x07, 0x0B];
+        assert!(
+            deliver_secured_data(
+                &mut aps,
+                &secured_data_frame(&app_key, &CHILD_IEEE, 0x01, 0x0000_0100, &payload),
+            ),
+            "a frame secured with the installed application link key is accepted"
+        );
+        assert_eq!(
+            incoming_counter(&aps, crate::security::ApsKeyType::ApplicationLinkKey),
+            (0x0000_0100, true),
+            "the counter is committed to the application key-pair entry"
+        );
+
+        // A replayed security counter under a *fresh* APS counter bypasses
+        // duplicate rejection, so only the key-pair replay window can stop it.
+        assert!(
+            !deliver_secured_data(
+                &mut aps,
+                &secured_data_frame(&app_key, &CHILD_IEEE, 0x02, 0x0000_0100, &payload),
+            ),
+            "a replayed APS frame counter is rejected"
+        );
+        assert!(
+            !deliver_secured_data(
+                &mut aps,
+                &secured_data_frame(&app_key, &CHILD_IEEE, 0x03, 0x0000_0050, &payload),
+            ),
+            "an older APS frame counter is rejected"
+        );
+        assert_eq!(
+            incoming_counter(&aps, crate::security::ApsKeyType::ApplicationLinkKey),
+            (0x0000_0100, true),
+            "a rejected replay never advances the window"
+        );
+
+        assert!(
+            deliver_secured_data(
+                &mut aps,
+                &secured_data_frame(&app_key, &CHILD_IEEE, 0x04, 0x0000_0101, &payload),
+            ),
+            "forward progress is still accepted"
+        );
+        assert_eq!(
+            incoming_counter(&aps, crate::security::ApsKeyType::ApplicationLinkKey),
+            (0x0000_0101, true),
+        );
+    }
+
+    /// Two key-pair entries for the same partner are two security contexts
+    /// with two independent counter spaces. Advancing one must neither admit
+    /// a replay under the other nor suppress its legitimate lower counters.
+    #[test]
+    #[cfg(feature = "router")]
+    fn distinct_key_pair_entries_keep_independent_replay_windows() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        let tc_key = [0xA1; 16];
+        let app_key = [0xB2; 16];
+        for (key, key_type) in [
+            (tc_key, crate::security::ApsKeyType::TrustCenterLinkKey),
+            (app_key, crate::security::ApsKeyType::ApplicationLinkKey),
+        ] {
+            aps.security_mut()
+                .add_key(crate::security::ApsLinkKeyEntry {
+                    partner_address: CHILD_IEEE,
+                    key,
+                    key_type,
+                    outgoing_frame_counter: 0,
+                    outgoing_frame_counter_limit: 0x1000,
+                    incoming_frame_counter: 0,
+                    incoming_frame_counter_valid: false,
+                })
+                .unwrap();
+        }
+
+        let payload = [0x18, 0x07, 0x0B];
+        assert!(
+            deliver_secured_data(
+                &mut aps,
+                &secured_data_frame(&app_key, &CHILD_IEEE, 0x01, 0x0000_0200, &payload),
+            ),
+            "the application link key decrypts even though the TC entry is tried first"
+        );
+        assert_eq!(
+            incoming_counter(&aps, crate::security::ApsKeyType::ApplicationLinkKey),
+            (0x0000_0200, true),
+        );
+        assert_eq!(
+            incoming_counter(&aps, crate::security::ApsKeyType::TrustCenterLinkKey),
+            (0, false),
+            "the Trust Center window is untouched by application-key traffic"
+        );
+
+        // Far below the application key's window, yet perfectly valid for the
+        // Trust Center key-pair entry's own window.
+        assert!(
+            deliver_secured_data(
+                &mut aps,
+                &secured_data_frame(&tc_key, &CHILD_IEEE, 0x02, 0x0000_0010, &payload),
+            ),
+            "the Trust Center key has an independent counter space"
+        );
+        assert_eq!(
+            incoming_counter(&aps, crate::security::ApsKeyType::TrustCenterLinkKey),
+            (0x0000_0010, true),
+        );
+        assert_eq!(
+            incoming_counter(&aps, crate::security::ApsKeyType::ApplicationLinkKey),
+            (0x0000_0200, true),
+            "and committing it leaves the application window alone"
+        );
+
+        assert!(
+            !deliver_secured_data(
+                &mut aps,
+                &secured_data_frame(&tc_key, &CHILD_IEEE, 0x03, 0x0000_0010, &payload),
+            ),
+            "the Trust Center window still rejects its own replay"
+        );
+        assert_eq!(
+            incoming_counter(&aps, crate::security::ApsKeyType::TrustCenterLinkKey),
+            (0x0000_0010, true),
+        );
+    }
+
+    /// Send one APS-secured, acknowledged unicast and return the layer plus
+    /// the plaintext payload used.
+    #[cfg(feature = "router")]
+    fn secured_unicast_node(limit: u32) -> (ApsLayer<MockMac>, crate::security::AesKey) {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        let link_key = [0xC3; 16];
+        aps.nwk_mut()
+            .update_neighbor_address(CHILD_SHORT, CHILD_IEEE);
+        aps.security_mut()
+            .add_key(crate::security::ApsLinkKeyEntry {
+                partner_address: CHILD_IEEE,
+                key: link_key,
+                key_type: crate::security::ApsKeyType::ApplicationLinkKey,
+                outgoing_frame_counter: 0,
+                outgoing_frame_counter_limit: limit,
+                incoming_frame_counter: 0,
+                incoming_frame_counter_valid: false,
+            })
+            .unwrap();
+        (aps, link_key)
+    }
+
+    #[cfg(feature = "router")]
+    const SECURED_PAYLOAD: [u8; 5] = [0x01, 0x02, 0x03, 0x04, 0x05];
+
+    #[cfg(feature = "router")]
+    fn send_secured_unicast(aps: &mut ApsLayer<MockMac>) -> u8 {
+        let request = ApsdeDataRequest {
+            dst_addr_mode: ApsAddressMode::Short,
+            dst_address: ApsAddress::Short(CHILD_SHORT),
+            dst_endpoint: 0x01,
+            profile_id: 0x0104,
+            cluster_id: 0x0006,
+            src_endpoint: 0x01,
+            payload: &SECURED_PAYLOAD,
+            tx_options: ApsTxOptions {
+                security_enabled: true,
+                use_nwk_key: true,
+                ack_request: true,
+                fragmentation_permitted: false,
+                include_extended_nonce: true,
+            },
+            radius: 0,
+            alias_src_addr: None,
+            alias_seq: None,
+        };
+        block_on(aps.apsde_data_request(&request))
+            .expect("the secured unicast is sent")
+            .aps_counter
+    }
+
+    /// Split a secured APS frame into (header bytes, security header,
+    /// decrypted payload), verifying the MIC with `key`.
+    #[cfg(feature = "router")]
+    fn secured_data_parts(
+        frame: &[u8],
+        key: &crate::security::AesKey,
+    ) -> (
+        heapless::Vec<u8, 32>,
+        crate::security::ApsSecurityHeader,
+        heapless::Vec<u8, 128>,
+    ) {
+        let (header, header_len) = ApsHeader::parse(frame).expect("APS header parses");
+        assert!(header.frame_control.security, "the frame is APS-secured");
+        let (security_header, security_header_len) =
+            crate::security::ApsSecurityHeader::parse(&frame[header_len..])
+                .expect("APS auxiliary header parses");
+        let aad_len = header_len + security_header_len;
+        let payload = crate::security::ApsSecurity::new()
+            .decrypt(&frame[..aad_len], &frame[aad_len..], key, &security_header)
+            .expect("the MIC verifies and the payload decrypts");
+        (
+            heapless::Vec::from_slice(&frame[..header_len]).unwrap(),
+            security_header,
+            payload,
+        )
+    }
+
+    /// R22 §4.4.1.1 forbids reusing an APS frame counter with the same key,
+    /// and this stack's own receive path (and any conformant peer) drops a
+    /// repeated one as a replay. A secured unicast that lost its first copy
+    /// therefore could never be acknowledged while the retry replayed the
+    /// stored ciphertext. Every retry must instead be encrypted again under
+    /// the next counter of the same key-pair entry, with the APS header — and
+    /// with it the APS counter the acknowledgement is keyed on — unchanged.
+    #[test]
+    #[cfg(feature = "router")]
+    fn every_secured_retransmission_uses_a_fresh_frame_counter() {
+        let (mut aps, link_key) = secured_unicast_node(0x1000);
+        let aps_counter = send_secured_unicast(&mut aps);
+
+        let original = nwk_payload(&aps.nwk().mac().tx_history()[0]);
+        let (original_header, original_security, original_payload) =
+            secured_data_parts(&original, &link_key);
+        assert_eq!(original_payload.as_slice(), &SECURED_PAYLOAD);
+        let mut previous_frame = original.clone();
+
+        for retry in 1..=3u32 {
+            advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US);
+            let retransmissions = aps.age_ack_table();
+            assert_eq!(retransmissions.len(), 1, "retry {retry} is due");
+            assert_eq!(retransmissions[0].dst_addr, CHILD_SHORT);
+
+            let frame = retransmissions[0].frame.clone();
+            let (header, security_header, payload) = secured_data_parts(&frame, &link_key);
+            assert_eq!(
+                header, original_header,
+                "retry {retry} repeats the original APS header, including its APS counter"
+            );
+            assert_eq!(
+                security_header.frame_counter,
+                original_security.frame_counter + retry,
+                "retry {retry} draws a fresh APS frame counter"
+            );
+            assert_eq!(
+                security_header.source_address, original_security.source_address,
+                "the CCM* nonce source is unchanged"
+            );
+            assert_eq!(
+                payload.as_slice(),
+                &SECURED_PAYLOAD,
+                "retry {retry} re-encrypts the same plaintext with a valid MIC"
+            );
+            assert_ne!(
+                frame.as_slice(),
+                previous_frame.as_slice(),
+                "retry {retry} must not put the same nonce and ciphertext on the air again"
+            );
+            previous_frame = frame;
+        }
+
+        assert!(
+            aps.confirm_ack(CHILD_SHORT.0, aps_counter),
+            "the retries stay part of the same APS transaction"
+        );
+    }
+
+    /// A retry can only be re-secured while the key-pair entry still exists
+    /// and its durably reserved counter range still has room. Neither may
+    /// degrade into replaying the previous ciphertext: the retry is dropped
+    /// and the transaction released instead.
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_retransmission_is_dropped_when_no_fresh_counter_can_be_reserved() {
+        // Reservation of exactly one counter: the original send consumes it.
+        let (mut aps, _link_key) = secured_unicast_node(1);
+        let aps_counter = send_secured_unicast(&mut aps);
+
+        advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US);
+        assert!(
+            aps.age_ack_table().is_empty(),
+            "an exhausted counter reservation must not replay the secured frame"
+        );
+        assert!(
+            aps.take_ack_status(aps_counter).is_none(),
+            "the transaction is released instead of retrying with stale security"
+        );
+
+        // Same for a key-pair entry that disappeared (Remove-Device, re-key).
+        let (mut aps, _link_key) = secured_unicast_node(0x1000);
+        let aps_counter = send_secured_unicast(&mut aps);
+        assert!(
+            aps.security_mut()
+                .remove_key(&CHILD_IEEE, crate::security::ApsKeyType::ApplicationLinkKey)
+        );
+        advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US);
+        assert!(
+            aps.age_ack_table().is_empty(),
+            "a removed key-pair entry must not fall back to another key"
+        );
+        assert!(aps.take_ack_status(aps_counter).is_none());
     }
 }

@@ -468,6 +468,16 @@ migration reports `MigratedCounters` instead: the counter floors are still
 carried over and the device re-pairs once. It never fabricates the missing
 identity, and never silently reuses counters.
 
+`nwkUpdateId` is migrated with its validity. A legacy region that really holds
+the `NwkUpdateId` item keeps that value as authoritative; one that does not
+migrates as *unknown*, which journal record version 4 encodes explicitly (flags
+bit 7) without changing the 98-byte state or the slot geometry. The network is
+still kept (`MigratedNetwork`): an unknown update state simply means rejoin
+parent selection rejects nothing as stale until the update state is learned
+from the network, whereas migrating the absent item as a known `0` would make
+every beacon advertising `0x81..=0xFF` look stale and could strand the device
+off its own network.
+
 The migration was exercised on an ESP32-H2 revision 1.2 on 2026-07-26. The
 pre-flash `0x3FE000..0x3FFFFF` dump contained the legacy `0xA55A` item records.
 After flashing without erasing NV, the product wrote committed `ZBSS`/`CMIT`

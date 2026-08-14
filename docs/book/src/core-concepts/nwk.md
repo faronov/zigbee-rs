@@ -134,7 +134,56 @@ pub enum JoinMethod {
 - **Association** is the normal path for a fresh device.
 - **Rejoin** is used after power loss when the device has saved network state
   (NV storage).  It's faster because it skips the full BDB commissioning.
+  Candidate parents are filtered and ranked by
+  `NwkLayer::select_rejoin_parents` (R22 §3.6.1.4.2: matching extended PAN ID,
+  capacity for the requested device type, only the most recent wrap-aware
+  `nwkUpdateId`, link cost ≤ 3, then minimum depth — see
+  [BDB → Rejoin](bdb.md)); `nlme_join` itself refuses a foreign, stale,
+  capacity-less or unusable-link candidate with `NwkStatus::InvalidRequest`
+  without transmitting.
 - **Direct** is used by coordinators to pre-authorize devices.
+
+### `nwkUpdateId` validity
+
+`nwkUpdateId` is a *serial number*, so `0` is an ordinary live value, not an
+"unset" marker. The NIB therefore carries an explicit `update_id_valid` flag
+and exposes `Nib::nwk_update_id() -> Option<u8>`; every decision that *rejects*
+a peer for holding an older update state must go through that accessor.
+
+The value becomes known-good at exactly these points:
+
+- network formation (the coordinator defines the network's update state);
+- a successful association;
+- a successful rejoin — including one that started from an unknown state;
+- a security-journal restore whose record marks the update state valid —
+  record version 4 stores that validity explicitly in flags bit 7, and records
+  written by versions 1..=3 (which predate the bit) always count as valid
+  because their stored byte was authoritative in the firmware that wrote it;
+- a legacy NV record that actually contains a valid `NwkUpdateId` item;
+- an accepted `Mgmt_NWK_Update` channel/manager change.
+
+It is *unknown* on a factory-new device, after a full leave, after a legacy NV
+restore whose record predates the `NwkUpdateId` item, and after restoring a
+security-journal record that was itself migrated from a persistence format
+which never stored the value (the legacy ESP32 log-structured NV region, for
+instance). Legacy `save_state` writes the item only when the value is known and
+**deletes** it otherwise, and the journal encodes "unknown" rather than a known
+`0`, so a reboot cannot turn an unknown state into an authoritative `0`. Once
+the update state *is* learned, `refresh_security_state` adopts it durably.
+
+While unknown, rejoin does not reject any candidate as stale — a fabricated
+reference of `0` would make every advertised id in `0x81..=0xFF` look stale and
+strand the device off its own network. The scan is still narrowed to a single
+update id, chosen by a forward-only wrap-aware pairwise comparison with
+discovery order breaking ambiguous ties, and the rejoin that succeeds makes
+that id authoritative.
+
+`Mgmt_NWK_Update` (ZDO §3.4.12) applies the same distinction before it touches
+the NIB or PIB: an unknown local state accepts the incoming id, a known state
+advances only on a strictly newer id (`nwk_update_id_is_newer`), an equal id is
+idempotent only when the requested channel/manager is already in effect, and
+equal-but-conflicting, older or ambiguous ids are answered with
+`INV_REQUESTTYPE` without changing anything.
 
 ## Network Formation (Coordinator)
 
@@ -344,7 +393,8 @@ of the MAC PIB.
 | `max_depth` | `u8` | Maximum network depth | 15 |
 | `max_routers` | `u8` | Max child routers | 5 |
 | `max_children` | `u8` | Max child end devices | 20 |
-| `update_id` | `u8` | Network update counter | 0 |
+| `update_id` | `u8` | Network update counter (`nwkUpdateId`) | 0 |
+| `update_id_valid` | `bool` | Whether `update_id` is known-good | `false` |
 
 #### Addressing
 

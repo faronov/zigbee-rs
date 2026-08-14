@@ -26,6 +26,10 @@ use zigbee_types::IeeeAddress;
 /// Maximum number of link key entries.
 pub const MAX_KEY_TABLE_ENTRIES: usize = 16;
 
+/// Number of distinct key-pair entries one partner can hold: a Trust Center
+/// link key and an application link key (R22 Table 4-15 key types 0x01/0x03).
+pub const MAX_KEY_PAIRS_PER_PARTNER: usize = 2;
+
 /// Well-known Zigbee 3.0 default Trust Center link key ("ZigBeeAlliance09").
 pub const DEFAULT_TC_LINK_KEY: [u8; 16] = [
     0x5A, 0x69, 0x67, 0x42, 0x65, 0x65, 0x41, 0x6C, // ZigBeeAl
@@ -198,6 +202,42 @@ impl ApsSecurityHeader {
 
 // ── Link key table entry ────────────────────────────────────────
 
+/// Identifies the security material that protects one APS frame.
+///
+/// R22 §4.4.1 scopes *all* APS security state — the key itself, the outgoing
+/// frame counter and the incoming (replay) frame counter — to a single entry
+/// of the `apsDeviceKeyPairSet`, i.e. to a (partner address, key type) pair.
+/// A device may simultaneously hold a Trust Center link key *and* an
+/// application link key for the same partner; those are two independent
+/// key-pair entries with two independent counter spaces, so "the peer" is not
+/// a sufficient identity for replay protection or for reserving an outgoing
+/// counter.
+///
+/// [`Self::PreconfiguredGlobal`] names the well-known global key used before
+/// any key-pair entry exists for a partner. It has no per-partner counter
+/// state: the entry is created only when a unique key is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApsKeyOrigin {
+    /// A key-table entry (`apsDeviceKeyPairSet`).
+    KeyPair {
+        /// Partner IEEE address of the entry.
+        partner: IeeeAddress,
+        /// Key type of the entry.
+        key_type: ApsKeyType,
+    },
+    /// The preconfigured global link key — no key-pair entry is installed.
+    PreconfiguredGlobal,
+}
+
+/// A key-pair entry candidate: which entry it is and the key it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApsKeyPair {
+    /// Key type of the key-table entry.
+    pub key_type: ApsKeyType,
+    /// Key material held by the entry.
+    pub key: AesKey,
+}
+
 /// APS link key table entry — stores a per-device key.
 #[derive(Debug, Clone)]
 pub struct ApsLinkKeyEntry {
@@ -312,6 +352,49 @@ impl ApsSecurity {
             .or_else(|| self.find_key(partner, ApsKeyType::ApplicationLinkKey))
     }
 
+    /// Key-pair entries that can secure traffic with `partner`, most specific
+    /// first (Trust Center link key, then application link key).
+    ///
+    /// An incoming APS frame does not name the key-pair entry that secured it
+    /// — the key identifier only distinguishes data/key-transport/key-load
+    /// derivations of *some* link key (R22 Table 4-29). When a partner holds
+    /// both a Trust Center and an application link key, the receiver must be
+    /// able to try each entry and bind the replay counter to the one whose MIC
+    /// actually verified, instead of assuming one of them.
+    pub fn key_pairs_for(
+        &self,
+        partner: &IeeeAddress,
+    ) -> heapless::Vec<ApsKeyPair, MAX_KEY_PAIRS_PER_PARTNER> {
+        let mut pairs = heapless::Vec::new();
+        for key_type in [
+            ApsKeyType::TrustCenterLinkKey,
+            ApsKeyType::ApplicationLinkKey,
+        ] {
+            if let Some(entry) = self.find_key(partner, key_type) {
+                let _ = pairs.push(ApsKeyPair {
+                    key_type,
+                    key: entry.key,
+                });
+            }
+        }
+        pairs
+    }
+
+    /// Key material currently installed for `origin`.
+    ///
+    /// Returns `None` when the key-pair entry named by `origin` has been
+    /// removed (a Remove-Device, a re-key that dropped the entry, or a factory
+    /// reset), so a caller that must re-secure a frame fails explicitly rather
+    /// than falling back to another key.
+    pub fn key_for_origin(&self, origin: &ApsKeyOrigin) -> Option<AesKey> {
+        match origin {
+            ApsKeyOrigin::KeyPair { partner, key_type } => {
+                self.find_key(partner, *key_type).map(|entry| entry.key)
+            }
+            ApsKeyOrigin::PreconfiguredGlobal => Some(self.default_tc_link_key),
+        }
+    }
+
     /// Get the key table as a slice.
     pub fn key_table(&self) -> &[ApsLinkKeyEntry] {
         &self.key_table
@@ -359,6 +442,33 @@ impl ApsSecurity {
         {
             entry.incoming_frame_counter = counter;
             entry.incoming_frame_counter_valid = true;
+        }
+    }
+
+    /// Replay check scoped to the key-pair entry that would decrypt the frame.
+    ///
+    /// The replay window belongs to the key, not to the peer: a partner that
+    /// holds both a Trust Center and an application link key has two
+    /// independent windows, and advancing one must never suppress or admit a
+    /// frame protected by the other.
+    ///
+    /// [`ApsKeyOrigin::PreconfiguredGlobal`] has no key-pair entry and
+    /// therefore no committed counter — first contact under the well-known
+    /// global key is admitted, exactly as an unknown partner is.
+    pub fn check_frame_counter_for(&self, origin: &ApsKeyOrigin, counter: u32) -> bool {
+        match origin {
+            ApsKeyOrigin::KeyPair { partner, key_type } => {
+                self.check_frame_counter(partner, *key_type, counter)
+            }
+            ApsKeyOrigin::PreconfiguredGlobal => true,
+        }
+    }
+
+    /// Commit a verified frame counter to the key-pair entry named by
+    /// `origin`. Call only after the MIC has verified with that entry's key.
+    pub fn commit_frame_counter_for(&mut self, origin: &ApsKeyOrigin, counter: u32) {
+        if let ApsKeyOrigin::KeyPair { partner, key_type } = origin {
+            self.commit_frame_counter(partner, *key_type, counter);
         }
     }
 

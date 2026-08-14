@@ -2526,6 +2526,7 @@ impl<M: MacDriver> BdbLayer<M> {
             depth: nib.depth,
             parent_address: nib.parent_address.0,
             update_id: nib.update_id,
+            update_id_valid: nib.update_id_valid,
             network_key,
             key_sequence,
             outgoing_frame_counter: nib.outgoing_frame_counter,

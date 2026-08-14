@@ -69,16 +69,27 @@ raw NOR traits, but they intentionally provide different semantics.
 | 1 | 80 bytes | 92 | initial layout |
 | 2 | 97 bytes | 112 | staged network key |
 | 3 | 98 bytes | 112 | R22 End Device Timeout negotiation |
+| 4 | 98 bytes | 112 | `nwkUpdateId` validity |
 
 Version 3 reuses flags bit 6 for `parent_information_valid`, the previously
 unused encoded byte 11 for `parent_information` and the new byte 97 for
-`end_device_timeout`. Nothing else moved: the 128-byte slot size, 116-byte
-record prefix and byte-124 commit marker are unchanged, so the crash-safety
-scheme and every existing partition layout are unaffected. Version 1 and 2
-records are still decoded through their own explicit paths and migrate to
-"never negotiated, default enumeration 8".
+`end_device_timeout`. Version 4 adds no byte at all: it claims the last free
+flags bit, bit 7, for `update_id_valid`, so versions 3 and 4 have the *same*
+encoded length and are told apart by the version byte alone. Nothing else
+moved: the 128-byte slot size, 116-byte record prefix and byte-124 commit
+marker are unchanged, so the crash-safety scheme and every existing partition
+layout are unaffected. Version 1 and 2 records are still decoded through their
+own explicit paths and migrate to "never negotiated, default enumeration 8".
 
-> **Downgrade is not supported.** Once this firmware has written a version 3
+Versions 1..=3 predate the validity bit, and their stored `update_id` was
+authoritative in the firmware that wrote it, so they decode with
+`update_id_valid = true` — an existing installation keeps the update state it
+had. Only a version 4 record can express "unknown", which is what lets a
+record migrated from a persistence format that never stored `NwkUpdateId` (the
+legacy ESP32 log-structured NV region, say) avoid claiming an authoritative
+`0`. A version 3 record carrying bit 7 is corrupt, not an early version 4.
+
+> **Downgrade is not supported.** Once this firmware has written a version 4
 > record, older firmware will skip it while scanning and select the newest
 > record it *can* decode — an older generation with stale counters, a stale
 > parent and possibly a stale network key. Reusing those reservations would

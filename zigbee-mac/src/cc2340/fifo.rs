@@ -79,13 +79,35 @@ pub(super) enum FifoError {
     NoSpace,
     MalformedEntry,
     MetadataMismatch,
+    /// The PBE FIFO configuration does not append RSSI, so no per-frame link
+    /// quality can be derived. See [`ReceivedFrame::rssi`].
+    MissingRssi,
+    /// The PBE appended RSSI, but it is TI's "no valid reading" sentinel.
+    InvalidRssi,
 }
+
+/// TI reports "RSSI not available" as `0x7F` (`+127 dBm`), a level the radio
+/// cannot physically measure.
+const RSSI_INVALID: i8 = 127;
 
 pub(super) struct ReceivedFrame {
     pub data: [u8; MAX_PHY_FRAME_LEN],
     pub len: usize,
+    /// Received signal strength in dBm, as appended by the PBE.
+    ///
+    /// This is the only calibrated per-frame quality metric this radio
+    /// reports, and therefore the source of the stack's normalized LQI (see
+    /// [`crate::lqi::from_rssi_dbm`]). Decoding fails rather than inventing a
+    /// value when it is absent or invalid.
     pub rssi: i8,
-    pub lqi: u8,
+    /// Raw modem LQI byte appended by the PBE when `FIFOCFG.APPEND_LQI` is set.
+    ///
+    /// **Diagnostic only.** On CC2340 this is a modem/frequency-offset
+    /// estimate whose scale and polarity are undocumented; it is *not* an
+    /// IEEE 802.15.4 LQI and must never be reported as one, placed in a
+    /// `PanDescriptor`, or used for NWK link cost. `None` when the FIFO is not
+    /// configured to append it.
+    pub modem_lqi: Option<u8>,
 }
 
 #[inline(always)]
@@ -101,6 +123,17 @@ pub(super) fn clear_events(mask: u32) {
 #[inline(always)]
 pub(super) fn end_cause() -> u8 {
     read16(PBE_COMMON_ENDCAUSE) as u8
+}
+
+/// Whether the RX FIFO still holds at least the header of another entry.
+///
+/// `EVENT_RX_OK` announces "one or more frames arrived", not "exactly one".
+/// After consuming an entry the event may only be cleared once the FIFO has
+/// actually been drained, or a queued frame would sit unread until the next
+/// reception re-raised the event.
+#[inline(always)]
+pub(super) fn rx_data_pending() -> bool {
+    (read32(PBE_RXFREADABLE) as usize) >= 4
 }
 
 pub(super) fn reset_tx() {
@@ -297,24 +330,31 @@ fn decode_rx_entry(
     if fifo_config & FIFOCFG_APPEND_STATUS != 0 {
         metadata_offset += 1;
     }
-    let lqi = if fifo_config & FIFOCFG_APPEND_LQI != 0 {
+    // Raw modem estimate: consumed only to keep the metadata offset aligned and
+    // to expose as diagnostics. Never used as the stack's LQI.
+    let modem_lqi = if fifo_config & FIFOCFG_APPEND_LQI != 0 {
         let value = entry_byte(words, metadata_offset);
         metadata_offset += 1;
-        value
+        Some(value)
     } else {
-        0
+        None
     };
-    let rssi = if fifo_config & FIFOCFG_APPEND_RSSI != 0 {
-        entry_byte(words, metadata_offset) as i8
-    } else {
-        i8::MIN
-    };
+    if fifo_config & FIFOCFG_APPEND_RSSI == 0 {
+        // Without RSSI there is no defensible link quality for this frame.
+        // Reporting a success-shaped `lqi = 0` would look like a real, very
+        // bad link and would poison NWK link cost and parent selection.
+        return Err(FifoError::MissingRssi);
+    }
+    let rssi = entry_byte(words, metadata_offset) as i8;
+    if rssi == RSSI_INVALID {
+        return Err(FifoError::InvalidRssi);
+    }
 
     Ok(ReceivedFrame {
         data,
         len: frame_length,
         rssi,
-        lqi,
+        modem_lqi,
     })
 }
 
@@ -400,6 +440,27 @@ mod tests {
     const TEST_FIFO_CONFIG: u16 =
         FIFOCFG_APPEND_LQI | FIFOCFG_APPEND_RSSI | FIFOCFG_APPEND_TIMESTAMP;
 
+    /// Build an RX FIFO entry for `frame` with `metadata` appended verbatim.
+    fn rx_entry(frame: &[u8], metadata: &[u8]) -> ([u32; MAX_FIFO_ENTRY_WORDS], usize) {
+        let entry_length = 1 + 1 + frame.len() + metadata.len();
+        let mut words = [0u32; MAX_FIFO_ENTRY_WORDS];
+
+        set_entry_byte(&mut words, 0, entry_length as u8);
+        set_entry_byte(&mut words, 1, (entry_length >> 8) as u8);
+        set_entry_byte(&mut words, 2, 0);
+        set_entry_byte(&mut words, 3, (frame.len() + 2) as u8);
+        for (index, byte) in frame.iter().copied().enumerate() {
+            set_entry_byte(&mut words, 4 + index, byte);
+        }
+
+        let metadata_start = 2 + entry_length - metadata.len();
+        for (index, byte) in metadata.iter().copied().enumerate() {
+            set_entry_byte(&mut words, metadata_start + index, byte);
+        }
+
+        (words, padded_entry_len(entry_length) / 4)
+    }
+
     #[test]
     fn encodes_tx_data_entry_with_phr_and_padding() {
         let frame = [0x61, 0x88, 0x42, 0xAA, 0xBB];
@@ -423,35 +484,123 @@ mod tests {
     #[test]
     fn decodes_rx_entry_and_strips_phr_fcs_and_metadata() {
         let frame = [0x61, 0x88, 0x42, 0xAA, 0xBB];
-        let entry_length = 1 + 1 + frame.len() + 6;
-        let mut words = [0u32; MAX_FIFO_ENTRY_WORDS];
+        // LQI, RSSI, then the 4-byte timestamp.
+        let metadata = [201, (-42i8) as u8, 0x11, 0x22, 0x33, 0x44];
+        let (words, word_count) = rx_entry(&frame, &metadata);
 
-        set_entry_byte(&mut words, 0, entry_length as u8);
-        set_entry_byte(&mut words, 1, 0);
-        set_entry_byte(&mut words, 2, 0);
-        set_entry_byte(&mut words, 3, (frame.len() + 2) as u8);
-        for (index, byte) in frame.iter().copied().enumerate() {
-            set_entry_byte(&mut words, 4 + index, byte);
-        }
-        let metadata_start = 2 + entry_length - 6;
-        set_entry_byte(&mut words, metadata_start, 201);
-        set_entry_byte(&mut words, metadata_start + 1, (-42i8) as u8);
-        set_entry_byte(&mut words, metadata_start + 2, 0x11);
-        set_entry_byte(&mut words, metadata_start + 3, 0x22);
-        set_entry_byte(&mut words, metadata_start + 4, 0x33);
-        set_entry_byte(&mut words, metadata_start + 5, 0x44);
-
-        let decoded = decode_rx_entry(
-            &words[..padded_entry_len(entry_length) / 4],
-            TEST_FIFO_CONFIG,
-            6,
-        )
-        .unwrap();
+        let decoded = decode_rx_entry(&words[..word_count], TEST_FIFO_CONFIG, metadata.len())
+            .expect("entry with LQI, RSSI and timestamp should decode");
 
         assert_eq!(decoded.len, frame.len());
         assert_eq!(&decoded.data[..decoded.len], &frame);
-        assert_eq!(decoded.lqi, 201);
         assert_eq!(decoded.rssi, -42);
+        assert_eq!(decoded.modem_lqi, Some(201));
+    }
+
+    /// Metadata is positioned by FIFO configuration order, not by luck: with
+    /// STATUS enabled every following field shifts by one byte.
+    #[test]
+    fn honours_metadata_ordering_with_status_lqi_rssi_and_timestamp() {
+        const CONFIG: u16 = FIFOCFG_APPEND_STATUS
+            | FIFOCFG_APPEND_LQI
+            | FIFOCFG_APPEND_RSSI
+            | FIFOCFG_APPEND_TIMESTAMP;
+
+        let frame = [0x61, 0x88, 0x07];
+        // STATUS, LQI, RSSI, timestamp[4].
+        let metadata = [0x5A, 0x99, (-70i8) as u8, 0xDE, 0xAD, 0xBE, 0xEF];
+        let (words, word_count) = rx_entry(&frame, &metadata);
+
+        let decoded = decode_rx_entry(&words[..word_count], CONFIG, metadata.len())
+            .expect("status/LQI/RSSI/timestamp entry should decode");
+
+        assert_eq!(&decoded.data[..decoded.len], &frame);
+        // Not the status byte and not the timestamp byte.
+        assert_eq!(decoded.modem_lqi, Some(0x99));
+        assert_eq!(decoded.rssi, -70);
+    }
+
+    /// The appended modem LQI is optional; RSSI alone is enough to produce a
+    /// frame, because the stack's LQI comes from RSSI.
+    #[test]
+    fn decodes_without_append_lqi_and_reports_no_modem_lqi() {
+        const CONFIG: u16 = FIFOCFG_APPEND_RSSI | FIFOCFG_APPEND_TIMESTAMP;
+
+        let frame = [0x61, 0x88, 0x01, 0x02];
+        let metadata = [(-55i8) as u8, 0x11, 0x22, 0x33, 0x44];
+        let (words, word_count) = rx_entry(&frame, &metadata);
+
+        let decoded = decode_rx_entry(&words[..word_count], CONFIG, metadata.len())
+            .expect("RSSI alone must be sufficient to decode a frame");
+
+        assert_eq!(&decoded.data[..decoded.len], &frame);
+        assert_eq!(decoded.modem_lqi, None);
+        assert_eq!(decoded.rssi, -55);
+        // And the stack still gets a real, usable link quality.
+        assert_eq!(
+            crate::lqi::from_rssi_dbm(decoded.rssi),
+            crate::lqi::from_rssi_dbm(-55)
+        );
+    }
+
+    /// Without RSSI there is nothing to derive LQI from. Failing loudly beats
+    /// returning a frame carrying a fabricated `lqi = 0`, which is
+    /// indistinguishable from a genuinely dead link.
+    #[test]
+    fn rejects_entries_without_appended_rssi() {
+        const CONFIG: u16 = FIFOCFG_APPEND_LQI | FIFOCFG_APPEND_TIMESTAMP;
+
+        let frame = [0x61, 0x88, 0x03];
+        let metadata = [0x7B, 0x11, 0x22, 0x33, 0x44];
+        let (words, word_count) = rx_entry(&frame, &metadata);
+
+        assert_eq!(
+            decode_rx_entry(&words[..word_count], CONFIG, metadata.len()).err(),
+            Some(FifoError::MissingRssi)
+        );
+    }
+
+    #[test]
+    fn rejects_ti_invalid_rssi_sentinel() {
+        let frame = [0x61, 0x88, 0x04];
+        let metadata = [180, RSSI_INVALID as u8, 0x11, 0x22, 0x33, 0x44];
+        let (words, word_count) = rx_entry(&frame, &metadata);
+
+        assert_eq!(
+            decode_rx_entry(&words[..word_count], TEST_FIFO_CONFIG, metadata.len()).err(),
+            Some(FifoError::InvalidRssi)
+        );
+    }
+
+    /// The regression this change fixes: the CC2340 modem LQI byte is a raw
+    /// frequency-offset estimate on an undocumented scale. It must not become
+    /// the stack's IEEE LQI, which is RSSI-derived and independent of it.
+    #[test]
+    fn modem_lqi_is_diagnostic_and_never_the_stack_lqi() {
+        let frame = [0x61, 0x88, 0x05];
+        // A weak link (-90 dBm) that the modem happens to report as 0xFF.
+        let metadata = [0xFF, (-90i8) as u8, 0x00, 0x00, 0x00, 0x00];
+        let (words, word_count) = rx_entry(&frame, &metadata);
+
+        let decoded = decode_rx_entry(&words[..word_count], TEST_FIFO_CONFIG, metadata.len())
+            .expect("entry should decode");
+        let stack_lqi = crate::lqi::from_rssi_dbm(decoded.rssi);
+
+        assert_eq!(decoded.modem_lqi, Some(0xFF));
+        // The raw byte would claim a perfect link; the real one is poor.
+        assert_ne!(stack_lqi, 0xFF);
+        assert!(
+            stack_lqi < 64,
+            "weak RSSI must yield a low LQI, got {stack_lqi}"
+        );
+
+        // And two frames with identical RSSI but opposite modem bytes are
+        // indistinguishable to the stack.
+        let (other_words, other_count) =
+            rx_entry(&frame, &[0x00, (-90i8) as u8, 0x00, 0x00, 0x00, 0x00]);
+        let other = decode_rx_entry(&other_words[..other_count], TEST_FIFO_CONFIG, 6).unwrap();
+        assert_eq!(other.modem_lqi, Some(0x00));
+        assert_eq!(crate::lqi::from_rssi_dbm(other.rssi), stack_lqi);
     }
 
     #[test]

@@ -206,3 +206,246 @@ fn bdb_status_discriminants() {
 fn bdb_min_commissioning_time_is_180s() {
     assert_eq!(BDB_MIN_COMMISSIONING_TIME, 180);
 }
+
+// ── 7. R22 rejoin parent selection (BDB path, §3.6.1.4.2) ──
+
+const REJOIN_EPID: zigbee_types::IeeeAddress = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+const FOREIGN_EPID: zigbee_types::IeeeAddress = [0x99; 8];
+const REJOIN_PAN: zigbee_types::PanId = zigbee_types::PanId(0x1A2B);
+
+/// Beacon from a potential rejoin parent. Joining is always closed, because
+/// R22 §3.6.1.4.2 allows rejoin into a closed network.
+fn rejoin_beacon(
+    router: u16,
+    lqi: u8,
+    update_id: u8,
+    depth: u8,
+    extended_pan_id: zigbee_types::IeeeAddress,
+) -> zigbee_mac::primitives::PanDescriptor {
+    rejoin_beacon_with_capacity(router, lqi, update_id, depth, extended_pan_id, true, true)
+}
+
+/// [`rejoin_beacon`] with explicit beacon capacity bits.
+fn rejoin_beacon_with_capacity(
+    router: u16,
+    lqi: u8,
+    update_id: u8,
+    depth: u8,
+    extended_pan_id: zigbee_types::IeeeAddress,
+    router_capacity: bool,
+    end_device_capacity: bool,
+) -> zigbee_mac::primitives::PanDescriptor {
+    zigbee_mac::primitives::PanDescriptor {
+        channel: 15,
+        coord_address: zigbee_types::MacAddress::Short(
+            REJOIN_PAN,
+            zigbee_types::ShortAddress(router),
+        ),
+        superframe_spec: zigbee_mac::primitives::SuperframeSpec {
+            beacon_order: 15,
+            superframe_order: 15,
+            final_cap_slot: 15,
+            battery_life_ext: false,
+            pan_coordinator: router == 0x0000,
+            association_permit: false,
+        },
+        lqi,
+        security_use: false,
+        zigbee_beacon: zigbee_mac::primitives::ZigbeeBeaconPayload {
+            protocol_id: 0,
+            stack_profile: 2,
+            protocol_version: 2,
+            router_capacity,
+            device_depth: depth,
+            end_device_capacity,
+            extended_pan_id,
+            tx_offset: [0xFF; 3],
+            update_id,
+        },
+    }
+}
+
+/// BDB layer restored onto `REJOIN_EPID` at network update state `update_id`,
+/// with `previous_parent` as the last known parent.
+fn commissioned_bdb(
+    device_type: DeviceType,
+    update_id: u8,
+    previous_parent: u16,
+) -> BdbLayer<MockMac> {
+    let mut bdb = make_bdb(device_type);
+    bdb.attributes_mut().node_is_on_a_network = true;
+    let nib = bdb.zdo_mut().nwk_mut().nib_mut();
+    nib.extended_pan_id = REJOIN_EPID;
+    nib.pan_id = REJOIN_PAN;
+    nib.network_address = zigbee_types::ShortAddress(0x4321);
+    nib.logical_channel = 15;
+    // A commissioned device holds a *known-good* update state; setting the
+    // raw field alone would leave it unknown and disable the staleness gate.
+    nib.set_nwk_update_id(update_id);
+    nib.parent_address = zigbee_types::ShortAddress(previous_parent);
+    bdb
+}
+
+/// The parents actually addressed by transmitted rejoin attempts, in order.
+fn rejoin_targets(bdb: &BdbLayer<MockMac>) -> std::vec::Vec<u16> {
+    bdb.zdo()
+        .nwk()
+        .mac()
+        .tx_history()
+        .iter()
+        .map(|record| match record.dst {
+            zigbee_types::MacAddress::Short(_, addr) => addr.0,
+            zigbee_types::MacAddress::Extended(_, _) => 0xFFFF,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn bdb_rejoin_attempts_only_the_most_recent_update_id_by_depth() {
+    let mut bdb = commissioned_bdb(DeviceType::EndDevice, 0xFF, 0x0001);
+    {
+        let mac = bdb.zdo_mut().nwk_mut().mac_mut();
+        // Stale network update state with the strongest link — never tried.
+        mac.add_beacon(rejoin_beacon(0x0001, 250, 0xFE, 0, REJOIN_EPID));
+        // Not stale, but an older update id than the freshest beacon below,
+        // so R22 drops it from the suitable set despite depth 0.
+        mac.add_beacon(rejoin_beacon(0x0002, 250, 0xFF, 0, REJOIN_EPID));
+        // Foreign network — never tried.
+        mac.add_beacon(rejoin_beacon(0x0003, 250, 0x00, 0, FOREIGN_EPID));
+        // Update id wrapped forward: the most recent state discovered.
+        mac.add_beacon(rejoin_beacon(0x0004, 250, 0x00, 4, REJOIN_EPID));
+        mac.add_beacon(rejoin_beacon(0x0005, 130, 0x00, 2, REJOIN_EPID));
+        // Most recent update id but unusable link cost (LQI 100 -> cost 5).
+        mac.add_beacon(rejoin_beacon(0x0006, 100, 0x00, 0, REJOIN_EPID));
+    }
+
+    // No parent answers the Rejoin Request in the mock, so every suitable
+    // candidate is tried in order and the procedure ultimately fails.
+    assert_eq!(
+        bdb.rejoin_previous_network().await,
+        Err(BdbStatus::SteeringFailure)
+    );
+    // Minimum depth first: 0x0005 (depth 2) before 0x0004 (depth 4), even
+    // though 0x0004 has the better link.
+    assert_eq!(rejoin_targets(&bdb), std::vec![0x0005, 0x0004]);
+}
+
+#[tokio::test]
+async fn bdb_rejoin_skips_parents_without_capacity_for_our_device_type() {
+    let mut bdb = commissioned_bdb(DeviceType::EndDevice, 4, 0x0001);
+    {
+        let mac = bdb.zdo_mut().nwk_mut().mac_mut();
+        // Shallowest, best link, but no end-device capacity.
+        mac.add_beacon(rejoin_beacon_with_capacity(
+            0x0001,
+            250,
+            4,
+            0,
+            REJOIN_EPID,
+            true,
+            false,
+        ));
+        mac.add_beacon(rejoin_beacon_with_capacity(
+            0x0002,
+            160,
+            4,
+            3,
+            REJOIN_EPID,
+            false,
+            true,
+        ));
+    }
+
+    assert_eq!(
+        bdb.rejoin_previous_network().await,
+        Err(BdbStatus::SteeringFailure)
+    );
+    assert_eq!(rejoin_targets(&bdb), std::vec![0x0002]);
+}
+
+#[tokio::test]
+async fn bdb_rejoin_breaks_equal_depth_ties_deterministically() {
+    let mut bdb = commissioned_bdb(DeviceType::EndDevice, 4, 0x0002);
+    {
+        let mac = bdb.zdo_mut().nwk_mut().mac_mut();
+        mac.add_beacon(rejoin_beacon(0x0001, 210, 4, 1, REJOIN_EPID));
+        mac.add_beacon(rejoin_beacon(0x0002, 210, 4, 1, REJOIN_EPID));
+        mac.add_beacon(rejoin_beacon(0x0003, 210, 4, 1, REJOIN_EPID));
+    }
+
+    assert_eq!(
+        bdb.rejoin_previous_network().await,
+        Err(BdbStatus::SteeringFailure)
+    );
+    // All three tie on update id, depth and link cost, so the implementation
+    // tie-breaks apply: previous parent first, then discovery order.
+    assert_eq!(rejoin_targets(&bdb), std::vec![0x0002, 0x0001, 0x0003]);
+}
+
+#[tokio::test]
+async fn bdb_rejoin_orders_equal_depth_candidates_by_link_cost() {
+    let mut bdb = commissioned_bdb(DeviceType::EndDevice, 4, 0xFFFF);
+    {
+        let mac = bdb.zdo_mut().nwk_mut().mac_mut();
+        mac.add_beacon(rejoin_beacon(0x0001, 130, 4, 1, REJOIN_EPID)); // cost 3
+        mac.add_beacon(rejoin_beacon(0x0002, 250, 4, 1, REJOIN_EPID)); // cost 1
+        mac.add_beacon(rejoin_beacon(0x0003, 160, 4, 1, REJOIN_EPID)); // cost 2
+    }
+
+    assert_eq!(
+        bdb.rejoin_previous_network().await,
+        Err(BdbStatus::SteeringFailure)
+    );
+    assert_eq!(rejoin_targets(&bdb), std::vec![0x0002, 0x0003, 0x0001]);
+}
+
+#[tokio::test]
+async fn bdb_rejoin_works_on_a_closed_network() {
+    let mut bdb = commissioned_bdb(DeviceType::EndDevice, 4, 0x0001);
+    {
+        let mac = bdb.zdo_mut().nwk_mut().mac_mut();
+        // association_permit is false on every beacon built here.
+        mac.add_beacon(rejoin_beacon(0x0001, 250, 4, 1, REJOIN_EPID));
+    }
+
+    assert_eq!(
+        bdb.rejoin_previous_network().await,
+        Err(BdbStatus::SteeringFailure)
+    );
+    assert_eq!(
+        rejoin_targets(&bdb),
+        std::vec![0x0001],
+        "a closed network must still be rejoined"
+    );
+}
+
+#[tokio::test]
+async fn bdb_rejoin_reports_failure_when_no_candidate_is_suitable() {
+    let mut bdb = commissioned_bdb(DeviceType::EndDevice, 0x10, 0x0001);
+    {
+        let mac = bdb.zdo_mut().nwk_mut().mac_mut();
+        // Stale, foreign, unusable-link and no-capacity candidates only.
+        mac.add_beacon(rejoin_beacon(0x0001, 250, 0x0F, 0, REJOIN_EPID));
+        mac.add_beacon(rejoin_beacon(0x0002, 250, 0x10, 0, FOREIGN_EPID));
+        mac.add_beacon(rejoin_beacon(0x0003, 30, 0x10, 0, REJOIN_EPID));
+        mac.add_beacon(rejoin_beacon_with_capacity(
+            0x0004,
+            250,
+            0x10,
+            0,
+            REJOIN_EPID,
+            true,
+            false,
+        ));
+    }
+
+    assert_eq!(
+        bdb.rejoin_previous_network().await,
+        Err(BdbStatus::SteeringFailure)
+    );
+    assert!(
+        rejoin_targets(&bdb).is_empty(),
+        "no rejoin request may be sent when every candidate is rejected"
+    );
+    assert_eq!(*bdb.state(), BdbState::Idle);
+}

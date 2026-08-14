@@ -7,16 +7,25 @@
 //! | 1       | 80 bytes      | 92         | initial layout               |
 //! | 2       | 97 bytes      | 112        | staged network key           |
 //! | 3       | 98 bytes      | 112        | R22 End Device Timeout state |
+//! | 4       | 98 bytes      | 112        | `nwkUpdateId` validity bit   |
 //!
 //! Slot size, record prefix length and commit offset never changed, so a
 //! newer firmware reads every older record in place and the two-sector
-//! crash-safety scheme is unaffected.
+//! crash-safety scheme is unaffected. Version 4 adds no byte at all: it claims
+//! the last free flags bit (bit 7) inside the existing 98-byte state, so
+//! version 3 and version 4 records are distinguished by the version byte
+//! alone, never by length.
+//!
+//! Versions 1..=3 predate the validity bit. Their `update_id` byte was
+//! authoritative in the firmware that wrote it, so those records decode with
+//! `update_id_valid = true`; only a version 4 record may say "unknown". A
+//! version 3 record carrying bit 7 is corrupt, not an early version 4.
 //!
 //! # Downgrade is not supported
 //!
-//! Once this firmware has written a version 3 record, **downgrading to
-//! firmware that predates version 3 is unsupported**. Older firmware does not
-//! recognise version 3 and skips those records while scanning, so it would
+//! Once this firmware has written a version 4 record, **downgrading to
+//! firmware that predates version 4 is unsupported**. Older firmware does not
+//! recognise version 4 and skips those records while scanning, so it would
 //! select the newest record it *can* decode — an older generation with stale
 //! counters, a stale parent and possibly a stale network key. Reusing those
 //! reservations would replay NWK/APS frame counters. Recommission the device
@@ -26,7 +35,7 @@ use embedded_storage::nor_flash::NorFlash;
 
 use crate::security_store::{
     ENCODED_SECURITY_STATE_LEN, LEGACY_ENCODED_SECURITY_STATE_LEN, PersistentSecurityState,
-    SecurityStateStore, SecurityStoreError, V2_ENCODED_SECURITY_STATE_LEN,
+    SecurityStateStore, SecurityStoreError, StateFormat, V2_ENCODED_SECURITY_STATE_LEN,
 };
 
 pub const SECURITY_JOURNAL_SECTOR_SIZE: usize = 4096;
@@ -37,7 +46,8 @@ pub const SECURITY_JOURNAL_SLOTS_PER_SECTOR: usize =
 const RECORD_MAGIC: [u8; 4] = *b"ZBSS";
 const LEGACY_RECORD_VERSION: u8 = 1;
 const V2_RECORD_VERSION: u8 = 2;
-const RECORD_VERSION: u8 = 3;
+const V3_RECORD_VERSION: u8 = 3;
+const RECORD_VERSION: u8 = 4;
 const LEGACY_RECORD_CRC_OFFSET: usize = 92;
 const RECORD_CRC_OFFSET: usize = 112;
 const RECORD_PREFIX_LEN: usize = 116;
@@ -110,15 +120,17 @@ impl<S: NorFlash> SecurityStateJournal<S> {
             return None;
         }
 
-        let (crc_offset, encoded_len) = match (record[4], record[5] as usize) {
-            (RECORD_VERSION, ENCODED_SECURITY_STATE_LEN) => {
-                (RECORD_CRC_OFFSET, ENCODED_SECURITY_STATE_LEN)
-            }
+        let (crc_offset, format) = match (record[4], record[5] as usize) {
+            (RECORD_VERSION, ENCODED_SECURITY_STATE_LEN) => (RECORD_CRC_OFFSET, StateFormat::V4),
+            // Same length as the current format, so the version byte is the
+            // only thing that distinguishes them: a v3 record must not be
+            // allowed to carry the v4 validity bit.
+            (V3_RECORD_VERSION, ENCODED_SECURITY_STATE_LEN) => (RECORD_CRC_OFFSET, StateFormat::V3),
             (V2_RECORD_VERSION, V2_ENCODED_SECURITY_STATE_LEN) => {
-                (RECORD_CRC_OFFSET, V2_ENCODED_SECURITY_STATE_LEN)
+                (RECORD_CRC_OFFSET, StateFormat::V2)
             }
             (LEGACY_RECORD_VERSION, LEGACY_ENCODED_SECURITY_STATE_LEN) => {
-                (LEGACY_RECORD_CRC_OFFSET, LEGACY_ENCODED_SECURITY_STATE_LEN)
+                (LEGACY_RECORD_CRC_OFFSET, StateFormat::V1)
             }
             _ => return None,
         };
@@ -133,21 +145,26 @@ impl<S: NorFlash> SecurityStateJournal<S> {
         }
 
         let generation = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-        // Each version decodes through its own fixed-size buffer, so an older
-        // record can never be read with the newer field offsets or accept a
-        // flag bit its layout predates.
-        let state = match encoded_len {
-            ENCODED_SECURITY_STATE_LEN => {
+        // Each version decodes through its own fixed-size buffer and its own
+        // entry point, so an older record can never be read with the newer
+        // field offsets or accept a flag bit its layout predates.
+        let state = match format {
+            StateFormat::V4 => {
                 let mut encoded_state = [0u8; ENCODED_SECURITY_STATE_LEN];
                 encoded_state.copy_from_slice(&record[12..12 + ENCODED_SECURITY_STATE_LEN]);
                 PersistentSecurityState::decode(&encoded_state).ok()?
             }
-            V2_ENCODED_SECURITY_STATE_LEN => {
+            StateFormat::V3 => {
+                let mut encoded_state = [0u8; ENCODED_SECURITY_STATE_LEN];
+                encoded_state.copy_from_slice(&record[12..12 + ENCODED_SECURITY_STATE_LEN]);
+                PersistentSecurityState::decode_v3(&encoded_state).ok()?
+            }
+            StateFormat::V2 => {
                 let mut encoded_state = [0u8; V2_ENCODED_SECURITY_STATE_LEN];
                 encoded_state.copy_from_slice(&record[12..12 + V2_ENCODED_SECURITY_STATE_LEN]);
                 PersistentSecurityState::decode_v2(&encoded_state).ok()?
             }
-            _ => {
+            StateFormat::V1 => {
                 let mut encoded_state = [0u8; LEGACY_ENCODED_SECURITY_STATE_LEN];
                 encoded_state.copy_from_slice(&record[12..12 + LEGACY_ENCODED_SECURITY_STATE_LEN]);
                 PersistentSecurityState::decode_legacy(&encoded_state).ok()?
@@ -443,14 +460,16 @@ mod tests {
         state
     }
 
-    /// Write a pre-v3 record by hand, exactly as the older firmware did.
+    /// Write a pre-v4 record by hand, exactly as the older firmware did.
     ///
-    /// The v3-only content (flags bit 6 and encoded byte 11) is stripped, so
-    /// the bytes on flash are byte-for-byte what firmware predating the R22
-    /// End Device Timeout fields would have written. Everything past
-    /// `encoded_len` stays erased (0xFF), which is what makes this a real
-    /// migration test: a decoder that wrongly indexed encoded byte 97 would
-    /// read 0xFF and reject the record.
+    /// Content the target version predates is stripped: flags bit 7
+    /// (`update_id_valid`, v4) for every older version, and flags bit 6 plus
+    /// encoded byte 11 (the R22 End Device Timeout fields, v3) for the shorter
+    /// v1/v2 layouts. The bytes on flash are therefore byte-for-byte what the
+    /// older firmware would have written. Everything past `encoded_len` stays
+    /// erased (0xFF), which is what makes this a real migration test: a
+    /// decoder that wrongly indexed encoded byte 97 would read 0xFF and reject
+    /// the record.
     fn write_migrated_record(
         flash: &mut MockFlash,
         version: u8,
@@ -460,6 +479,9 @@ mod tests {
     ) {
         let mut current = [0u8; ENCODED_SECURITY_STATE_LEN];
         state.encode(&mut current);
+        if version < RECORD_VERSION {
+            current[0] &= !(1 << 7);
+        }
         if encoded_len < ENCODED_SECURITY_STATE_LEN {
             current[0] &= !(1 << 6);
             current[11] = 0;
@@ -486,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn version_three_records_round_trip_the_end_device_timeout() {
+    fn current_records_round_trip_the_end_device_timeout() {
         let mut expected = state(0x400);
         expected.parent_information = 0x02;
         expected.parent_information_valid = true;
@@ -505,9 +527,142 @@ mod tests {
         );
     }
 
+    /// Version 4 must be able to persist "this device holds no authoritative
+    /// `nwkUpdateId`" and read it back as exactly that — the whole reason the
+    /// revision exists.
+    #[test]
+    fn current_records_round_trip_update_id_validity() {
+        for (update_id, valid) in [(0x2A, true), (0x00, true), (0x00, false)] {
+            let mut expected = state(0x400);
+            expected.update_id = update_id;
+            expected.update_id_valid = valid;
+
+            let mut journal =
+                SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+            journal.store(&expected).unwrap();
+            // Force a rescan so the value comes back off the flash.
+            journal.storage_mut();
+            assert_eq!(journal.load(), Ok(Some(expected)), "{update_id}/{valid}");
+            assert_eq!(journal.storage().data[4], RECORD_VERSION);
+            // No byte was added: the validity lives in flags bit 7 of the
+            // unchanged 98-byte state.
+            assert_eq!(
+                journal.storage().data[5] as usize,
+                ENCODED_SECURITY_STATE_LEN
+            );
+            assert_eq!(journal.storage().data[12] & (1 << 7) != 0, valid);
+            assert_eq!(journal.storage().data[12 + 3], update_id);
+        }
+    }
+
+    /// A version 3 record is the same length as a version 4 one, so only the
+    /// version byte separates them. Its `update_id` was authoritative when it
+    /// was written and must stay so.
+    #[test]
+    fn version_three_records_load_with_an_authoritative_update_id() {
+        for update_id in [0x00u8, 0x2A] {
+            let mut stored = state(0x400);
+            stored.update_id = update_id;
+            stored.update_id_valid = true;
+            stored.parent_information = 0x02;
+            stored.parent_information_valid = true;
+            stored.end_device_timeout = 14;
+
+            let mut flash = MockFlash::new();
+            write_migrated_record(
+                &mut flash,
+                V3_RECORD_VERSION,
+                ENCODED_SECURITY_STATE_LEN,
+                RECORD_CRC_OFFSET,
+                &stored,
+            );
+            assert_eq!(flash.data[12] & (1 << 7), 0, "v3 never wrote bit 7");
+
+            let mut journal =
+                SecurityStateJournal::new(flash, 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+            let migrated = journal.load().unwrap().unwrap();
+            assert_eq!(migrated, stored, "update_id {update_id}");
+            assert!(migrated.update_id_valid);
+            // The version 3 fields it owns are still decoded in place.
+            assert_eq!(migrated.parent_information, 0x02);
+            assert_eq!(migrated.end_device_timeout, 14);
+        }
+    }
+
+    #[test]
+    fn version_three_records_reject_the_version_four_flag_bit() {
+        // Byte 0 bit 7 only exists from v4 onwards; a v3 record carrying it is
+        // corrupt rather than a valid "update ID is valid" record. The same
+        // bytes under the v4 version byte are accepted, so the version byte —
+        // not the length — is what makes the difference.
+        for (version, expected) in [(V3_RECORD_VERSION, None), (RECORD_VERSION, Some(0x2Au8))] {
+            let mut stored = state(0x400);
+            stored.update_id = 0x2A;
+            stored.update_id_valid = true;
+
+            let mut flash = MockFlash::new();
+            write_migrated_record(
+                &mut flash,
+                version,
+                ENCODED_SECURITY_STATE_LEN,
+                RECORD_CRC_OFFSET,
+                &stored,
+            );
+            // Set bit 7 regardless of the version the record claims.
+            flash.data[12] |= 1 << 7;
+            let crc = crc32(&flash.data[..RECORD_CRC_OFFSET]);
+            flash.data[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4]
+                .copy_from_slice(&crc.to_le_bytes());
+
+            let mut journal =
+                SecurityStateJournal::new(flash, 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+            assert_eq!(
+                journal.load().unwrap().map(|state| state.update_id),
+                expected,
+                "version {version}"
+            );
+        }
+    }
+
+    /// The migrating decoders must not invent an update state that the older
+    /// record could not have held.
+    #[test]
+    fn version_one_and_two_records_keep_their_stored_update_id() {
+        let mut stored = state(0x400);
+        stored.update_id = 0x2A;
+        stored.update_id_valid = true;
+
+        for (version, encoded_len, crc_offset) in [
+            (
+                LEGACY_RECORD_VERSION,
+                LEGACY_ENCODED_SECURITY_STATE_LEN,
+                LEGACY_RECORD_CRC_OFFSET,
+            ),
+            (
+                V2_RECORD_VERSION,
+                V2_ENCODED_SECURITY_STATE_LEN,
+                RECORD_CRC_OFFSET,
+            ),
+        ] {
+            let mut flash = MockFlash::new();
+            write_migrated_record(&mut flash, version, encoded_len, crc_offset, &stored);
+            assert_eq!(flash.data[12] & (1 << 7), 0, "v{version} never wrote bit 7");
+
+            let mut journal =
+                SecurityStateJournal::new(flash, 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+            let migrated = journal.load().unwrap().unwrap();
+            assert_eq!(migrated.update_id, 0x2A, "v{version}");
+            assert!(migrated.update_id_valid, "v{version}");
+        }
+    }
+
     #[test]
     fn legacy_version_one_record_is_still_loaded() {
-        let expected = state(0x400);
+        // A v1 record predates the validity bit; its stored update ID was
+        // authoritative in the firmware that wrote it, so it migrates as
+        // known-good.
+        let mut expected = state(0x400);
+        expected.update_id_valid = true;
         let mut flash = MockFlash::new();
         write_migrated_record(
             &mut flash,

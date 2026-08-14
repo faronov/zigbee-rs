@@ -886,10 +886,13 @@ pub extern "C" fn LL_IRQ() {
 // ── Utility ─────────────────────────────────────────────────────
 
 /// Convert RSSI to LQI (Link Quality Indicator, 0–255).
+///
+/// Delegates to the shared stack-wide policy in [`crate::lqi::from_rssi_dbm`]
+/// so every backend that has no IEEE-normalized hardware quality byte uses one
+/// definition. Behaviour is unchanged from the previous local copy; the
+/// endpoint/monotonicity tests below still cover it.
 fn rssi_to_lqi(rssi: i8) -> u8 {
-    // Simple linear mapping: -100 dBm → 0, -20 dBm → 255
-    let clamped = (rssi as i16).clamp(-100, -20);
-    (((clamped + 100) as u16) * 255 / 80) as u8
+    crate::lqi::from_rssi_dbm(rssi)
 }
 
 #[cfg(test)]

@@ -10,14 +10,19 @@ use zigbee_bdb::{
 use zigbee_nwk::frames::{ED_TIMEOUT_ENUM_DEFAULT, ED_TIMEOUT_ENUM_MAX, PARENT_INFO_MASK};
 use zigbee_types::IeeeAddress;
 
-/// Encoded length of the current (version 3) record.
+/// Encoded length of the current (version 4) record.
 ///
-/// Version 3 appends the R22 End Device Timeout negotiation result to the
+/// Version 3 appended the R22 End Device Timeout negotiation result to the
 /// version 2 layout: flags bit 6 carries `parent_information_valid`, the
 /// previously unused encoded byte 11 carries `parent_information`, and the new
-/// byte 97 carries `end_device_timeout`. No other field moved, so the journal
-/// slot geometry (slot size, CRC offset, prefix length and commit offset) is
-/// unchanged.
+/// byte 97 carries `end_device_timeout`.
+///
+/// Version 4 adds *no* byte at all: it claims the last free flags bit, bit 7,
+/// for `update_id_valid`, so a record can finally say "this device holds no
+/// authoritative `nwkUpdateId`" instead of implying a known `0`. The encoded
+/// length is therefore identical to version 3, and the journal slot geometry
+/// (slot size, CRC offset, prefix length and commit offset) is unchanged for
+/// every version since 2.
 pub const ENCODED_SECURITY_STATE_LEN: usize = 98;
 /// Encoded length of a version 2 record (staged network key, no ED timeout).
 pub(crate) const V2_ENCODED_SECURITY_STATE_LEN: usize = 97;
@@ -31,6 +36,7 @@ const FLAG_REJOIN_PENDING: u8 = 1 << 3;
 const FLAG_LEGACY_DEFAULT_TCLK: u8 = 1 << 4;
 const FLAG_STAGED_NETWORK_KEY: u8 = 1 << 5;
 const FLAG_PARENT_INFORMATION_VALID: u8 = 1 << 6;
+const FLAG_UPDATE_ID_VALID: u8 = 1 << 7;
 
 /// Encoded record layout revision.
 ///
@@ -43,8 +49,12 @@ pub(crate) enum StateFormat {
     V1,
     /// 97 bytes: staged network key, no End Device Timeout fields.
     V2,
-    /// 98 bytes: staged network key and End Device Timeout fields.
+    /// 98 bytes: staged network key and End Device Timeout fields, but no
+    /// `nwkUpdateId` validity bit — the stored update ID is authoritative by
+    /// construction.
     V3,
+    /// 98 bytes: as version 3, plus flags bit 7 carrying `update_id_valid`.
+    V4,
 }
 
 impl StateFormat {
@@ -58,6 +68,12 @@ impl StateFormat {
             Self::V1 => common,
             Self::V2 => common | FLAG_STAGED_NETWORK_KEY,
             Self::V3 => common | FLAG_STAGED_NETWORK_KEY | FLAG_PARENT_INFORMATION_VALID,
+            Self::V4 => {
+                common
+                    | FLAG_STAGED_NETWORK_KEY
+                    | FLAG_PARENT_INFORMATION_VALID
+                    | FLAG_UPDATE_ID_VALID
+            }
         }
     }
 
@@ -66,7 +82,17 @@ impl StateFormat {
     }
 
     const fn has_end_device_timeout(self) -> bool {
-        matches!(self, Self::V3)
+        matches!(self, Self::V3 | Self::V4)
+    }
+
+    /// Whether the format encodes `nwkUpdateId` validity explicitly.
+    ///
+    /// Versions 1..=3 predate the bit. Their stored `update_id` was written by
+    /// firmware whose NIB had no unknown state at all and whose restore path
+    /// installed the byte unconditionally, so it stays authoritative on
+    /// migration — anything else would silently drop live update state.
+    const fn has_update_id_valid(self) -> bool {
+        matches!(self, Self::V4)
     }
 }
 
@@ -91,7 +117,23 @@ pub struct PersistentSecurityState {
     pub channel: u8,
     pub depth: u8,
     pub parent_address: u16,
+    /// `nwkUpdateId` as this device last knew it.
+    ///
+    /// Only meaningful while [`Self::update_id_valid`] is set; it is `0` in
+    /// every other case, exactly as
+    /// [`Nib::clear_nwk_update_id`](zigbee_nwk::nib::Nib::clear_nwk_update_id)
+    /// leaves the live field.
     pub update_id: u8,
+    /// Whether [`Self::update_id`] is a known-good network update state.
+    ///
+    /// `nwkUpdateId` is a serial number, so `0` is an ordinary live value and
+    /// never an "unset" marker. A record migrated from a persistence format
+    /// that never stored the item — such as a legacy ESP32 log-structured NV
+    /// region — genuinely knows nothing about the network's update state, and
+    /// restoring that silence as an authoritative `0` would make every beacon
+    /// advertising `0x81..=0xFF` look stale and strand the device off its own
+    /// network. Encoded in flags bit 7 from record version 4 onwards.
+    pub update_id_valid: bool,
     pub network_key: [u8; 16],
     pub key_sequence: u8,
     pub staged_network_key_present: bool,
@@ -156,6 +198,7 @@ impl PersistentSecurityState {
             depth: 0,
             parent_address: 0,
             update_id: 0,
+            update_id_valid: false,
             network_key: [0; 16],
             key_sequence: 0,
             staged_network_key_present: false,
@@ -206,6 +249,10 @@ impl PersistentSecurityState {
             FLAG_PARENT_INFORMATION_VALID
         } else {
             0
+        }) | (if self.update_id_valid {
+            FLAG_UPDATE_ID_VALID
+        } else {
+            0
         });
         output[1] = self.channel;
         output[2] = self.depth;
@@ -229,6 +276,14 @@ impl PersistentSecurityState {
     }
 
     pub fn decode(input: &[u8; ENCODED_SECURITY_STATE_LEN]) -> Result<Self, SecurityStoreError> {
+        Self::decode_bytes(input, StateFormat::V4)
+    }
+
+    /// Decode a version 3 record: same length as the current format, but
+    /// without the `update_id_valid` bit.
+    pub(crate) fn decode_v3(
+        input: &[u8; ENCODED_SECURITY_STATE_LEN],
+    ) -> Result<Self, SecurityStoreError> {
         Self::decode_bytes(input, StateFormat::V3)
     }
 
@@ -261,6 +316,14 @@ impl PersistentSecurityState {
         state.channel = input[1];
         state.depth = input[2];
         state.update_id = input[3];
+        // Versions 1..=3 have no validity bit: the byte they stored was
+        // authoritative in the firmware that wrote it, so it stays
+        // authoritative here. Only version 4 can express "unknown".
+        state.update_id_valid = if format.has_update_id_valid() {
+            flags & FLAG_UPDATE_ID_VALID != 0
+        } else {
+            true
+        };
         state.pan_id = u16::from_le_bytes([input[4], input[5]]);
         state.short_address = u16::from_le_bytes([input[6], input[7]]);
         state.parent_address = u16::from_le_bytes([input[8], input[9]]);
@@ -341,6 +404,12 @@ impl PersistentSecurityState {
         {
             return Err(SecurityStoreError::Corrupt);
         }
+        // An unknown `nwkUpdateId` carries no value at all, exactly as the NIB
+        // holds it. Allowing a residual byte here would let a later revision
+        // (or a corrupt record) resurrect it as authoritative update state.
+        if !self.update_id_valid && self.update_id != 0 {
+            return Err(SecurityStoreError::Corrupt);
+        }
         Ok(())
     }
 }
@@ -416,6 +485,7 @@ impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersist
         self.state.depth = state.depth;
         self.state.parent_address = state.parent_address;
         self.state.update_id = state.update_id;
+        self.state.update_id_valid = state.update_id_valid;
         self.state.network_key = state.network_key;
         self.state.key_sequence = state.key_sequence;
         self.state.staged_network_key_present = false;
@@ -524,6 +594,7 @@ mod tests {
             depth: 1,
             parent_address: 0,
             update_id: 3,
+            update_id_valid: true,
             network_key: [4; 16],
             key_sequence: 5,
             outgoing_frame_counter: counter,
@@ -553,6 +624,7 @@ mod tests {
         state.depth = 1;
         state.parent_address = 0x1111;
         state.update_id = 9;
+        state.update_id_valid = true;
         state.network_key = [3; 16];
         state.key_sequence = 4;
         state.staged_network_key_present = true;
@@ -617,6 +689,105 @@ mod tests {
             Err(SecurityStoreError::Corrupt),
             "advertised bits without validity are impossible"
         );
+    }
+
+    /// The `update_id_valid` bit is the whole point of record version 4: a
+    /// state that knows its update ID and one that does not must survive a
+    /// round trip as *different* states.
+    #[test]
+    fn update_id_validity_round_trips_through_the_current_format() {
+        let mut known = PersistentSecurityState::empty();
+        known.update_id = 0x2A;
+        known.update_id_valid = true;
+        let mut encoded = [0u8; ENCODED_SECURITY_STATE_LEN];
+        known.encode(&mut encoded);
+        assert_eq!(
+            encoded[0] & (1 << 7),
+            1 << 7,
+            "flags bit 7 carries validity"
+        );
+        assert_eq!(encoded[3], 0x2A, "byte 3 still carries the update ID");
+        assert_eq!(PersistentSecurityState::decode(&encoded), Ok(known));
+
+        // A genuine, authoritative 0 is not the same state as "unknown", and
+        // only the flag bit tells them apart.
+        let mut known_zero = PersistentSecurityState::empty();
+        known_zero.update_id_valid = true;
+        let mut encoded_zero = [0u8; ENCODED_SECURITY_STATE_LEN];
+        known_zero.encode(&mut encoded_zero);
+        assert_eq!(encoded_zero[0] & (1 << 7), 1 << 7);
+        assert_eq!(
+            PersistentSecurityState::decode(&encoded_zero),
+            Ok(known_zero)
+        );
+
+        let unknown = PersistentSecurityState::empty();
+        let mut encoded_unknown = [0u8; ENCODED_SECURITY_STATE_LEN];
+        unknown.encode(&mut encoded_unknown);
+        assert_eq!(encoded_unknown[0] & (1 << 7), 0);
+        assert_eq!(encoded_unknown[3], 0);
+        let decoded = PersistentSecurityState::decode(&encoded_unknown).unwrap();
+        assert_eq!(decoded, unknown);
+        assert!(!decoded.update_id_valid);
+        assert_ne!(decoded, known_zero, "unknown is not an authoritative 0");
+    }
+
+    #[test]
+    fn an_empty_state_holds_no_authoritative_update_state() {
+        let state = PersistentSecurityState::empty();
+        assert!(!state.update_id_valid);
+        assert_eq!(state.update_id, 0);
+        assert_eq!(state.validate(), Ok(()));
+    }
+
+    #[test]
+    fn an_unknown_update_id_may_not_carry_a_value() {
+        let mut state = PersistentSecurityState::empty();
+        state.update_id = 7;
+        assert_eq!(
+            state.validate(),
+            Err(SecurityStoreError::Corrupt),
+            "an update ID without validity is impossible"
+        );
+    }
+
+    /// A version 3 record has the *same* length as the current one, so the
+    /// version byte is the only thing separating them.
+    #[test]
+    fn a_v3_record_has_no_validity_bit_and_stays_authoritative() {
+        let mut state = PersistentSecurityState::empty();
+        state.update_id = 0x2A;
+        state.update_id_valid = true;
+        state.parent_information = 0x02;
+        state.parent_information_valid = true;
+        state.end_device_timeout = 14;
+        let mut encoded = [0u8; ENCODED_SECURITY_STATE_LEN];
+        state.encode(&mut encoded);
+
+        // Firmware that predates version 4 never set bit 7 …
+        encoded[0] &= !(1 << 7);
+        let migrated = PersistentSecurityState::decode_v3(&encoded).unwrap();
+        assert_eq!(migrated, state, "the v3 update ID stays authoritative");
+        // … including for the value 0, which such a record still meant
+        // literally.
+        let mut zero = encoded;
+        zero[3] = 0;
+        let migrated_zero = PersistentSecurityState::decode_v3(&zero).unwrap();
+        assert_eq!(migrated_zero.update_id, 0);
+        assert!(migrated_zero.update_id_valid);
+        // The version 3 fields it does own are decoded normally.
+        assert_eq!(migrated_zero.parent_information, 0x02);
+        assert!(migrated_zero.parent_information_valid);
+        assert_eq!(migrated_zero.end_device_timeout, 14);
+
+        // The version 4 flag bit does not exist in the v3 layout.
+        encoded[0] |= 1 << 7;
+        assert_eq!(
+            PersistentSecurityState::decode_v3(&encoded),
+            Err(SecurityStoreError::Corrupt)
+        );
+        // The very same bytes are a valid version 4 record.
+        assert_eq!(PersistentSecurityState::decode(&encoded), Ok(state));
     }
 
     #[test]

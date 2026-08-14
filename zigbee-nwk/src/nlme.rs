@@ -93,6 +93,296 @@ pub fn sort_network_descriptors_by(
     }
 }
 
+/// Highest link cost that R22 §3.6.1.4.1/§3.6.1.4.2 accept for a prospective
+/// parent.
+///
+/// Link costs are derived from beacon LQI via
+/// [`link_cost_from_lqi`](crate::neighbor::link_cost_from_lqi) and run from `1`
+/// (best) to `7` (worst); anything above this bound is not usable as a parent.
+pub const MAX_PARENT_LINK_COST: u8 = 3;
+
+/// Wrap-aware "strictly newer" test for the 8-bit `nwkUpdateId`.
+///
+/// `nwkUpdateId` is a serial number, not an integer: it wraps from `0xFF` to
+/// `0x00` while the network keeps moving forward. `candidate` is newer than
+/// `reference` when it lies in the following half of the 8-bit circle, i.e.
+/// `(candidate - reference) mod 256` is in `1..=127`.
+///
+/// The exact half-window distance (`128`) is ambiguous under serial-number
+/// arithmetic and is deliberately reported as "not newer" in both directions.
+///
+/// Parent selection needs the "equal or newer" form
+/// ([`nwk_update_id_is_current`]); this strict form is the comparison a NWK
+/// Update / channel-change handler needs before adopting a new update state.
+pub const fn nwk_update_id_is_newer(candidate: u8, reference: u8) -> bool {
+    let delta = candidate.wrapping_sub(reference);
+    delta != 0 && delta < 0x80
+}
+
+/// Wrap-aware "not stale" test for the 8-bit `nwkUpdateId`.
+///
+/// Returns `true` when `candidate` is equal to or newer than `reference`, the
+/// comparison R22 §3.6.1.4.1 states for beacon `nwkUpdateId`. The ambiguous
+/// half-window distance (`128`) is treated as stale, so a candidate whose
+/// network update state cannot be ordered against ours is never preferred over
+/// a candidate that can.
+pub const fn nwk_update_id_is_current(candidate: u8, reference: u8) -> bool {
+    candidate.wrapping_sub(reference) < 0x80
+}
+
+/// R22 rejoin parent-candidate eligibility and ordering (§3.6.1.4.2, which
+/// reuses the association procedure of §3.6.1.4.1 with MAC association
+/// replaced by the NWK Rejoin Request/Response exchange).
+///
+/// The normative filter after the scan keeps a candidate only when it
+///
+/// - belongs to the network we are rejoining (`nwkExtendedPANID`);
+/// - advertises capacity **for the device type being requested** —
+///   `router_capacity` when rejoining as a router, `end_device_capacity` when
+///   rejoining as an end device;
+/// - carries an `nwkUpdateId` that is not older than the one we hold
+///   (wrap-aware serial-number comparison, §3.6.1.4.1) and, among the
+///   candidates that survive the above, is the **most recent** one seen in
+///   this scan;
+/// - has a link cost of at most [`MAX_PARENT_LINK_COST`].
+///
+/// Of the resulting suitable parents the normative choice is the one at
+/// **minimum depth**. Everything below depth in [`Self::precedes`] is an
+/// implementation tie-break, chosen only to make selection deterministic.
+///
+/// Unlike association, rejoin deliberately does **not** require
+/// `permit_joining`: §3.6.1.4.2 explicitly allows a rejoin into a closed
+/// network. Capacity, however, is still required by the same text.
+///
+/// # Unknown local update state
+///
+/// The staleness comparison is only defined against a *known-good* local
+/// `nwkUpdateId` (see [`Nib::nwk_update_id`](crate::nib::Nib::nwk_update_id)).
+/// A device that has never held authoritative update state — factory-new, or
+/// restored from a record that predates the item — carries
+/// [`None`] here. In that case no candidate is rejected as stale; the scan's
+/// most recent update ID is still narrowed down to a single deterministic
+/// value, and a successful rejoin makes it authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RejoinParentCriteria {
+    /// Extended PAN ID of the network we are rejoining (`nwkExtendedPANID`).
+    pub extended_pan_id: IeeeAddress,
+    /// Our own `nwkUpdateId` when it is known-good; candidates older than it
+    /// are stale. `None` when this device holds no authoritative update state,
+    /// which disables the staleness gate rather than defaulting it to `0`.
+    pub nwk_update_id: Option<u8>,
+    /// Device type we are requesting to rejoin as. Selects which beacon
+    /// capacity bit a candidate must advertise.
+    pub device_type: DeviceType,
+    /// Parent we were attached to. Implementation tie-break only.
+    pub previous_parent: Option<ShortAddress>,
+}
+
+impl RejoinParentCriteria {
+    /// Criteria for rejoining `extended_pan_id` as `device_type` while holding
+    /// the network update state `nwk_update_id`.
+    ///
+    /// Pass `None` for `nwk_update_id` when the local update state is not
+    /// known-good; pass the value from
+    /// [`Nib::nwk_update_id`](crate::nib::Nib::nwk_update_id) otherwise.
+    pub const fn new(
+        extended_pan_id: IeeeAddress,
+        nwk_update_id: Option<u8>,
+        device_type: DeviceType,
+    ) -> Self {
+        Self {
+            extended_pan_id,
+            nwk_update_id,
+            device_type,
+            previous_parent: None,
+        }
+    }
+
+    /// Prefer `parent` when every other criterion ties.
+    ///
+    /// This is an implementation tie-break, not a normative priority.
+    pub const fn with_previous_parent(mut self, parent: ShortAddress) -> Self {
+        self.previous_parent = Some(parent);
+        self
+    }
+
+    /// Whether `candidate` advertises capacity for the requested device type.
+    ///
+    /// A coordinator does not rejoin; should one ever be configured this way
+    /// it is an FFD and is checked against the router capacity bit.
+    pub const fn has_required_capacity(&self, candidate: &NetworkDescriptor) -> bool {
+        match self.device_type {
+            DeviceType::EndDevice => candidate.end_device_capacity,
+            DeviceType::Router | DeviceType::Coordinator => candidate.router_capacity,
+        }
+    }
+
+    /// Link cost of `candidate`, or `None` when it is invalid or unusable.
+    ///
+    /// A cost of `0` is invalid (link costs start at `1`) and a cost above
+    /// [`MAX_PARENT_LINK_COST`] is too poor to parent us.
+    pub fn link_cost(&self, candidate: &NetworkDescriptor) -> Option<u8> {
+        let cost = crate::neighbor::link_cost_from_lqi(candidate.lqi);
+        if cost == 0 || cost > MAX_PARENT_LINK_COST {
+            return None;
+        }
+        Some(cost)
+    }
+
+    /// Whether `candidate`'s advertised `nwkUpdateId` is not older than ours.
+    ///
+    /// Always `true` when the local update state is unknown: without a
+    /// reference there is no defensible way to call a candidate stale, and
+    /// rejecting on a fabricated reference of `0` would strand the device.
+    pub const fn update_id_is_acceptable(&self, candidate: &NetworkDescriptor) -> bool {
+        match self.nwk_update_id {
+            Some(local) => nwk_update_id_is_current(candidate.update_id, local),
+            None => true,
+        }
+    }
+
+    /// Distance of `candidate`'s network update state ahead of ours, when ours
+    /// is known.
+    ///
+    /// Only meaningful for base-eligible candidates, where it is bounded by
+    /// `127` and therefore a totally ordered freshness key (larger is
+    /// fresher) even across a wrap of the 8-bit serial number. `None` when the
+    /// local update state is unknown, where no such total order exists; see
+    /// [`Self::most_recent_update_id`].
+    pub const fn freshness(&self, candidate: &NetworkDescriptor) -> Option<u8> {
+        match self.nwk_update_id {
+            Some(local) => Some(candidate.update_id.wrapping_sub(local)),
+            None => None,
+        }
+    }
+
+    /// Per-candidate ("base") eligibility: everything R22 requires that can be
+    /// decided from a single beacon without seeing the rest of the scan.
+    ///
+    /// Network identity, capacity for the requested device type, a
+    /// non-stale `nwkUpdateId` (only enforced when ours is known) and a usable
+    /// link cost. The "most recent update ID in the scan" rule is *not* part
+    /// of this; see [`Self::is_suitable`].
+    pub fn is_base_eligible(&self, candidate: &NetworkDescriptor) -> bool {
+        candidate.extended_pan_id == self.extended_pan_id
+            && self.has_required_capacity(candidate)
+            && self.update_id_is_acceptable(candidate)
+            && self.link_cost(candidate).is_some()
+    }
+
+    /// The single most recent `nwkUpdateId` advertised by a base-eligible
+    /// candidate in `networks`, or `None` when there is no such candidate.
+    ///
+    /// With a known local update state, freshness is the wrap-aware distance
+    /// ahead of it, which is bounded by `127` for base-eligible candidates, so
+    /// the maximum is well defined and deterministic even across a wrap.
+    ///
+    /// With an unknown local update state there is no reference point and
+    /// therefore no total order — serial-number comparison is not transitive
+    /// over an arbitrary set. The result is instead the fixed point of a
+    /// left-to-right fold that only ever moves forward: the first base-eligible
+    /// candidate in discovery order seeds the answer, and a later candidate
+    /// replaces it only when it is strictly newer under
+    /// [`nwk_update_id_is_newer`]. Older and ambiguous (half-window) values
+    /// leave the answer untouched, so discovery order breaks every tie and the
+    /// outcome is deterministic for a given scan.
+    pub fn most_recent_update_id(&self, networks: &[NetworkDescriptor]) -> Option<u8> {
+        let mut eligible = networks
+            .iter()
+            .filter(|candidate| self.is_base_eligible(candidate));
+
+        match self.nwk_update_id {
+            Some(local) => eligible
+                .filter_map(|candidate| self.freshness(candidate))
+                .max()
+                .map(|freshness| local.wrapping_add(freshness)),
+            None => {
+                let mut most_recent = eligible.next()?.update_id;
+                for candidate in eligible {
+                    if nwk_update_id_is_newer(candidate.update_id, most_recent) {
+                        most_recent = candidate.update_id;
+                    }
+                }
+                Some(most_recent)
+            }
+        }
+    }
+
+    /// Whether `candidate` is a suitable rejoin parent, given the most recent
+    /// update ID discovered in the same scan.
+    ///
+    /// Base-eligible candidates that carry an older (but still non-stale)
+    /// update ID are excluded: R22 keeps only the most recent one.
+    pub fn is_suitable(&self, candidate: &NetworkDescriptor, most_recent_update_id: u8) -> bool {
+        self.is_base_eligible(candidate) && candidate.update_id == most_recent_update_id
+    }
+
+    /// Strict ordering used to rank candidates: `true` when `candidate`
+    /// outranks `other`.
+    ///
+    /// Normative part:
+    /// 1. suitable candidates before unsuitable ones;
+    /// 2. **minimum depth** — the only preference R22 states among suitable
+    ///    parents.
+    ///
+    /// Implementation tie-breaks, applied only at equal depth to keep the
+    /// attempt order deterministic:
+    /// 3. lower link cost;
+    /// 4. the previous parent, when configured;
+    /// 5. discovery order (the sort is stable).
+    pub fn precedes(
+        &self,
+        candidate: &NetworkDescriptor,
+        other: &NetworkDescriptor,
+        most_recent_update_id: u8,
+    ) -> bool {
+        let candidate_suitable = self.is_suitable(candidate, most_recent_update_id);
+        if candidate_suitable != self.is_suitable(other, most_recent_update_id) {
+            return candidate_suitable;
+        }
+        if !candidate_suitable {
+            return false;
+        }
+
+        // Normative: minimum depth wins.
+        if candidate.depth != other.depth {
+            return candidate.depth < other.depth;
+        }
+
+        // Implementation tie-breaks below this line.
+        let candidate_cost = self.link_cost(candidate).unwrap_or(u8::MAX);
+        let other_cost = self.link_cost(other).unwrap_or(u8::MAX);
+        if candidate_cost != other_cost {
+            return candidate_cost < other_cost;
+        }
+
+        match self.previous_parent {
+            Some(previous) => {
+                candidate.router_address == previous && other.router_address != previous
+            }
+            None => false,
+        }
+    }
+
+    /// Order `networks` in place and return how many leading entries are
+    /// suitable rejoin parents.
+    ///
+    /// Unsuitable entries are kept at the tail in discovery order rather than
+    /// dropped, so callers can still report them as diagnostics.
+    pub fn select(&self, networks: &mut [NetworkDescriptor]) -> usize {
+        let Some(most_recent_update_id) = self.most_recent_update_id(networks) else {
+            return 0;
+        };
+        sort_network_descriptors_by(networks, |candidate, other| {
+            self.precedes(candidate, other, most_recent_update_id)
+        });
+        networks
+            .iter()
+            .position(|network| !self.is_suitable(network, most_recent_update_id))
+            .unwrap_or(networks.len())
+    }
+}
+
 /// Join method
 #[derive(Debug, Clone, Copy)]
 pub enum JoinMethod {
@@ -118,6 +408,37 @@ fn zigbee_capability_info(device_type: DeviceType, rx_on_when_idle: bool) -> Cap
 
 /// NLME management primitive implementations.
 impl<M: MacDriver> NwkLayer<M> {
+    // ── Rejoin parent selection ─────────────────────────────
+
+    /// R22 rejoin parent criteria derived from the current NIB.
+    ///
+    /// Uses `nwkExtendedPANID`, the locally held `nwkUpdateId` — only when it
+    /// is known-good, so an unknown state never rejects candidates as stale —
+    /// and the device type we rejoin as (which selects the required beacon
+    /// capacity bit), and keeps the previous parent as an implementation
+    /// tie-break.
+    pub fn rejoin_parent_criteria(&self) -> RejoinParentCriteria {
+        let criteria = RejoinParentCriteria::new(
+            self.nib.extended_pan_id,
+            self.nib.nwk_update_id(),
+            self.device_type,
+        );
+        if self.nib.parent_address == ShortAddress(0xFFFF) {
+            criteria
+        } else {
+            criteria.with_previous_parent(self.nib.parent_address)
+        }
+    }
+
+    /// Order a discovery result for rejoin and return the suitable count.
+    ///
+    /// The first `n` returned entries are, in order, the rejoin parents this
+    /// device may attach to; the remainder are retained for diagnostics only
+    /// and must not be used as parents.
+    pub fn select_rejoin_parents(&self, networks: &mut [NetworkDescriptor]) -> usize {
+        self.rejoin_parent_criteria().select(networks)
+    }
+
     // ── NLME-NETWORK-DISCOVERY ──────────────────────────────
 
     /// Discover available Zigbee networks on the given channels.
@@ -280,6 +601,10 @@ impl<M: MacDriver> NwkLayer<M> {
         self.nib.logical_channel = best_channel;
         self.nib.network_address = ShortAddress::COORDINATOR;
         self.nib.depth = 0;
+        // The coordinator defines the network's update state, so forming one
+        // makes the local `nwkUpdateId` authoritative from `0` onwards. The
+        // beacon payload we start advertising carries this value.
+        self.nib.set_nwk_update_id(0);
 
         // Read our IEEE address from MAC
         if let Ok(PibValue::ExtendedAddress(addr)) =
@@ -399,7 +724,10 @@ impl<M: MacDriver> NwkLayer<M> {
         self.nib.pan_id = network.pan_id;
         self.nib.logical_channel = network.logical_channel;
         self.nib.extended_pan_id = network.extended_pan_id;
-        self.nib.update_id = network.update_id;
+        // A successful association is an authoritative statement of the
+        // network's update state: adopt the parent's beacon value and mark it
+        // known-good.
+        self.nib.set_nwk_update_id(network.update_id);
         self.nib.stack_profile = network.stack_profile;
         self.nib.parent_address = join_target;
         // Authoritative parent assignment: the R22 End Device Timeout has to
@@ -507,6 +835,46 @@ impl<M: MacDriver> NwkLayer<M> {
         self.rejoin_diagnostics.candidate_attempts =
             self.rejoin_diagnostics.candidate_attempts.saturating_add(1);
         self.rejoin_diagnostics.last_parent = network.router_address.0;
+
+        // R22 §3.6.1.4.1/§3.6.1.4.2 — never rejoin through a candidate that is
+        // on another network, does not advertise capacity for our device type,
+        // advertises a stale nwkUpdateId, or has an unusable link cost.
+        //
+        // The staleness part of that gate only applies when our own update
+        // state is known-good; `RejoinParentCriteria` carries that validity,
+        // so an unknown local state skips the comparison here exactly as it
+        // does in whole-scan selection.
+        //
+        // This is the mechanical, per-candidate part of the rule only. The
+        // "most recent update ID in the scan" and the minimum-depth preference
+        // are policy over the whole discovery result and cannot be decided
+        // here; callers rank candidates with `select_rejoin_parents` first.
+        let criteria = self.rejoin_parent_criteria();
+        if !criteria.is_base_eligible(network) {
+            match criteria.nwk_update_id {
+                Some(local) => log::warn!(
+                    "[NWK] Rejoin candidate 0x{:04X} rejected: update_id={} (local {}) lqi={} \
+                     router_cap={} ed_cap={}",
+                    network.router_address.0,
+                    network.update_id,
+                    local,
+                    network.lqi,
+                    network.router_capacity,
+                    network.end_device_capacity,
+                ),
+                None => log::warn!(
+                    "[NWK] Rejoin candidate 0x{:04X} rejected: update_id={} (local unknown) \
+                     lqi={} router_cap={} ed_cap={}",
+                    network.router_address.0,
+                    network.update_id,
+                    network.lqi,
+                    network.router_capacity,
+                    network.end_device_capacity,
+                ),
+            }
+            self.rejoin_diagnostics.last_status = NwkStatus::InvalidRequest as u8;
+            return Err(NwkStatus::InvalidRequest);
+        }
 
         // Rejoin uses NWK-level Rejoin Request command (encrypted with network key)
         // This is used when a device has been disconnected but still knows the network key
@@ -853,7 +1221,11 @@ impl<M: MacDriver> NwkLayer<M> {
                     self.nib.extended_pan_id = network.extended_pan_id;
                     self.nib.pan_id = network.pan_id;
                     self.nib.logical_channel = network.logical_channel;
-                    self.nib.update_id = network.update_id;
+                    // The parent accepted the rejoin, so the update state we
+                    // rejoined against is now authoritative — including the
+                    // case where we started from an unknown local state and
+                    // picked this candidate's ID by discovery order.
+                    self.nib.set_nwk_update_id(network.update_id);
                     // Update depth from beacon (parent depth + 1)
                     self.nib.depth = network.depth.saturating_add(1);
                     let _ = self
@@ -1046,6 +1418,11 @@ impl<M: MacDriver> NwkLayer<M> {
             self.nib.logical_channel = 0;
             self.nib.depth = 0;
             self.nib.extended_pan_id = [0u8; 8];
+            // We no longer belong to any network, so the update state we held
+            // describes nothing. Clearing it (rather than leaving a stale
+            // byte behind) keeps a later rejoin from filtering candidates
+            // against a network we have left.
+            self.nib.clear_nwk_update_id();
             self.security = crate::security::NwkSecurity::new();
             // The parent relationship is gone: no advertised keepalive method
             // survives a full leave.
@@ -1107,24 +1484,37 @@ impl<M: MacDriver> NwkLayer<M> {
         Err(NwkStatus::NoNetworks)
     }
 
-    /// Scan on `mask` and attempt rejoin on the first network matching
-    /// `ext_pan`.
+    /// Scan on `mask` and attempt rejoin on the suitable parents of `ext_pan`,
+    /// minimum depth first (R22 §3.6.1.4.2 ordering).
     async fn try_rejoin_on_mask(
         &mut self,
         mask: ChannelMask,
         ext_pan: &IeeeAddress,
     ) -> Result<ShortAddress, NwkStatus> {
-        let networks = self.nlme_network_discovery(mask, 3).await?;
-        for net in &networks {
-            if net.extended_pan_id == *ext_pan {
-                match self.nlme_join(net, JoinMethod::Rejoin).await {
-                    Ok(addr) => {
-                        log::info!("[NWK] Orphan recovery succeeded — addr=0x{:04X}", addr.0);
-                        return Ok(addr);
-                    }
-                    Err(e) => {
-                        log::debug!("[NWK] Rejoin attempt failed: {:?}", e);
-                    }
+        let mut networks = self.nlme_network_discovery(mask, 3).await?;
+        let criteria =
+            RejoinParentCriteria::new(*ext_pan, self.nib.nwk_update_id(), self.device_type());
+        let criteria = if self.nib.parent_address == ShortAddress(0xFFFF) {
+            criteria
+        } else {
+            criteria.with_previous_parent(self.nib.parent_address)
+        };
+        let suitable = criteria.select(&mut networks);
+        if suitable == 0 {
+            log::warn!(
+                "[NWK] Orphan recovery: {} beacon(s), none suitable as rejoin parent",
+                networks.len()
+            );
+            return Err(NwkStatus::NoNetworks);
+        }
+        for net in &networks[..suitable] {
+            match self.nlme_join(net, JoinMethod::Rejoin).await {
+                Ok(addr) => {
+                    log::info!("[NWK] Orphan recovery succeeded — addr=0x{:04X}", addr.0);
+                    return Ok(addr);
+                }
+                Err(e) => {
+                    log::debug!("[NWK] Rejoin attempt failed: {:?}", e);
                 }
             }
         }
@@ -1347,6 +1737,499 @@ mod tests {
         );
     }
 
+    // ── R22 rejoin parent selection (§3.6.1.4.2) ────────────
+
+    const REJOIN_EPID: IeeeAddress = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+    const OTHER_EPID: IeeeAddress = [0x99; 8];
+
+    fn candidate(
+        router_address: u16,
+        lqi: u8,
+        update_id: u8,
+        depth: u8,
+        extended_pan_id: IeeeAddress,
+    ) -> NetworkDescriptor {
+        NetworkDescriptor {
+            extended_pan_id,
+            pan_id: PanId(0x1234),
+            logical_channel: 15,
+            stack_profile: 2,
+            zigbee_version: 2,
+            beacon_order: 15,
+            superframe_order: 15,
+            // Rejoin is allowed into a closed network, so every candidate in
+            // these tests has joining closed.
+            permit_joining: false,
+            router_capacity: true,
+            end_device_capacity: true,
+            update_id,
+            lqi,
+            router_address: ShortAddress(router_address),
+            depth,
+        }
+    }
+
+    /// `candidate` with the advertised beacon capacity bits overridden.
+    fn candidate_with_capacity(
+        router_address: u16,
+        lqi: u8,
+        update_id: u8,
+        depth: u8,
+        router_capacity: bool,
+        end_device_capacity: bool,
+    ) -> NetworkDescriptor {
+        NetworkDescriptor {
+            router_capacity,
+            end_device_capacity,
+            ..candidate(router_address, lqi, update_id, depth, REJOIN_EPID)
+        }
+    }
+
+    /// LQI values whose derived link cost is unambiguous for these tests.
+    const GOOD_LQI: u8 = 220; // cost 1
+    const FAIR_LQI: u8 = 160; // cost 2
+    const WEAK_LQI: u8 = 120; // cost 3
+    const UNUSABLE_LQI: u8 = 100; // cost 5 — above MAX_PARENT_LINK_COST
+
+    /// Criteria for an end device holding a *known-good* local update state.
+    fn end_device_criteria(nwk_update_id: u8) -> RejoinParentCriteria {
+        RejoinParentCriteria::new(REJOIN_EPID, Some(nwk_update_id), DeviceType::EndDevice)
+    }
+
+    /// Criteria for an end device that holds no authoritative update state.
+    fn end_device_criteria_unknown() -> RejoinParentCriteria {
+        RejoinParentCriteria::new(REJOIN_EPID, None, DeviceType::EndDevice)
+    }
+
+    fn addresses<const N: usize>(networks: &[NetworkDescriptor; N]) -> [u16; N] {
+        core::array::from_fn(|index| networks[index].router_address.0)
+    }
+
+    #[test]
+    fn update_id_comparison_wraps_in_both_directions() {
+        // Forward wrap: 0x00 immediately follows 0xFF.
+        assert!(nwk_update_id_is_newer(0x00, 0xFF));
+        assert!(nwk_update_id_is_newer(0x02, 0xFE));
+        // The same pair must not compare newer in the reverse direction.
+        assert!(!nwk_update_id_is_newer(0xFF, 0x00));
+        assert!(!nwk_update_id_is_newer(0xFE, 0x02));
+        // Plain integer ordering would get both of these wrong.
+        assert!(nwk_update_id_is_newer(0x80, 0x01));
+        assert!(!nwk_update_id_is_newer(0x01, 0x80));
+        // Equality is never "newer", in either direction.
+        assert!(!nwk_update_id_is_newer(0x42, 0x42));
+        // The ambiguous half-window (delta 128) is unordered: not newer and
+        // stale in both directions, so it can never be selected.
+        assert!(!nwk_update_id_is_newer(0x80, 0x00));
+        assert!(!nwk_update_id_is_newer(0x00, 0x80));
+        assert!(!nwk_update_id_is_current(0x80, 0x00));
+        assert!(!nwk_update_id_is_current(0x00, 0x80));
+        // "Current" accepts equal or newer.
+        assert!(nwk_update_id_is_current(0x42, 0x42));
+        assert!(nwk_update_id_is_current(0x00, 0xFF));
+        assert!(!nwk_update_id_is_current(0xFF, 0x00));
+    }
+
+    #[test]
+    fn rejoin_requires_capacity_for_the_requested_device_type() {
+        let end_device = end_device_criteria(5);
+        let router = RejoinParentCriteria::new(REJOIN_EPID, Some(5), DeviceType::Router);
+
+        let both = candidate_with_capacity(0x0001, GOOD_LQI, 5, 1, true, true);
+        let routers_only = candidate_with_capacity(0x0002, GOOD_LQI, 5, 1, true, false);
+        let end_devices_only = candidate_with_capacity(0x0003, GOOD_LQI, 5, 1, false, true);
+        let full = candidate_with_capacity(0x0004, GOOD_LQI, 5, 1, false, false);
+
+        assert!(end_device.is_base_eligible(&both));
+        assert!(!end_device.is_base_eligible(&routers_only));
+        assert!(end_device.is_base_eligible(&end_devices_only));
+        assert!(!end_device.is_base_eligible(&full));
+
+        assert!(router.is_base_eligible(&both));
+        assert!(router.is_base_eligible(&routers_only));
+        assert!(!router.is_base_eligible(&end_devices_only));
+        assert!(!router.is_base_eligible(&full));
+    }
+
+    #[test]
+    fn rejoin_does_not_require_permit_joining() {
+        // Every candidate built here has `permit_joining == false`; a closed
+        // network must still be rejoinable (R22 §3.6.1.4.2).
+        let criteria = end_device_criteria(5);
+        let closed = candidate(0x0001, GOOD_LQI, 5, 1, REJOIN_EPID);
+        assert!(!closed.permit_joining);
+        assert!(criteria.is_base_eligible(&closed));
+
+        let mut networks = [closed];
+        assert_eq!(criteria.select(&mut networks), 1);
+    }
+
+    #[test]
+    fn rejoin_rejects_stale_update_id_across_wrap() {
+        // Local update id just after the wrap: 0xFF is one update behind us.
+        let criteria = end_device_criteria(0x00);
+        assert!(!criteria.is_base_eligible(&candidate(0x0001, GOOD_LQI, 0xFF, 1, REJOIN_EPID)));
+        assert!(criteria.is_base_eligible(&candidate(0x0002, GOOD_LQI, 0x00, 1, REJOIN_EPID)));
+        assert!(criteria.is_base_eligible(&candidate(0x0003, GOOD_LQI, 0x01, 1, REJOIN_EPID)));
+
+        // Local update id just before the wrap: 0x00 is one update ahead.
+        let criteria = end_device_criteria(0xFF);
+        assert!(!criteria.is_base_eligible(&candidate(0x0001, GOOD_LQI, 0xFE, 1, REJOIN_EPID)));
+        assert!(criteria.is_base_eligible(&candidate(0x0002, GOOD_LQI, 0xFF, 1, REJOIN_EPID)));
+        assert!(criteria.is_base_eligible(&candidate(0x0003, GOOD_LQI, 0x00, 1, REJOIN_EPID)));
+    }
+
+    #[test]
+    fn rejoin_rejects_other_networks_and_unusable_link_costs() {
+        let criteria = end_device_criteria(0x05);
+
+        // Another network is never a rejoin candidate.
+        assert!(!criteria.is_base_eligible(&candidate(0x0001, GOOD_LQI, 0x05, 1, OTHER_EPID)));
+
+        // Link cost above MAX_PARENT_LINK_COST is unusable — a hard gate, not
+        // a ranking penalty.
+        assert_eq!(
+            criteria.link_cost(&candidate(0x0002, UNUSABLE_LQI, 0x05, 1, REJOIN_EPID)),
+            None
+        );
+        assert!(!criteria.is_base_eligible(&candidate(0x0002, UNUSABLE_LQI, 0x05, 1, REJOIN_EPID)));
+        // An unreported/zero LQI is not treated as a perfect link.
+        assert!(!criteria.is_base_eligible(&candidate(0x0003, 0, 0x05, 1, REJOIN_EPID)));
+        // The worst still-usable cost is accepted.
+        assert_eq!(
+            criteria.link_cost(&candidate(0x0004, WEAK_LQI, 0x05, 1, REJOIN_EPID)),
+            Some(MAX_PARENT_LINK_COST)
+        );
+        assert!(criteria.is_base_eligible(&candidate(0x0004, WEAK_LQI, 0x05, 1, REJOIN_EPID)));
+    }
+
+    #[test]
+    fn rejoin_keeps_only_the_most_recent_update_id() {
+        let criteria = end_device_criteria(4);
+        let mut networks = [
+            // Base-eligible but one update behind the freshest beacon: still
+            // "not stale", yet R22 keeps only the most recent update id.
+            candidate(0x0001, GOOD_LQI, 4, 0, REJOIN_EPID),
+            candidate(0x0002, WEAK_LQI, 5, 3, REJOIN_EPID),
+            candidate(0x0003, FAIR_LQI, 5, 7, REJOIN_EPID),
+        ];
+
+        assert_eq!(criteria.most_recent_update_id(&networks), Some(5));
+        assert!(criteria.is_base_eligible(&networks[0]));
+        assert!(!criteria.is_suitable(&networks[0], 5));
+
+        let suitable = criteria.select(&mut networks);
+
+        assert_eq!(suitable, 2);
+        assert_eq!(addresses(&networks), [0x0002, 0x0003, 0x0001]);
+    }
+
+    #[test]
+    fn most_recent_update_id_is_deterministic_across_wrap() {
+        let criteria = end_device_criteria(0xFE);
+        let networks = [
+            candidate(0x0001, GOOD_LQI, 0xFE, 0, REJOIN_EPID), // delta 0
+            candidate(0x0002, GOOD_LQI, 0x01, 0, REJOIN_EPID), // delta 3 — freshest
+            candidate(0x0003, GOOD_LQI, 0xFF, 0, REJOIN_EPID), // delta 1
+            candidate(0x0004, GOOD_LQI, 0xFD, 0, REJOIN_EPID), // stale, ignored
+            candidate(0x0005, GOOD_LQI, 0x02, 0, OTHER_EPID),  // other network
+        ];
+
+        assert_eq!(criteria.most_recent_update_id(&networks), Some(0x01));
+
+        // Only stale / foreign / unusable candidates: nothing to select.
+        let none = [
+            candidate(0x0001, GOOD_LQI, 0xFD, 0, REJOIN_EPID),
+            candidate(0x0002, UNUSABLE_LQI, 0x01, 0, REJOIN_EPID),
+            candidate(0x0003, GOOD_LQI, 0x01, 0, OTHER_EPID),
+        ];
+        assert_eq!(criteria.most_recent_update_id(&none), None);
+        let mut none = none;
+        assert_eq!(criteria.select(&mut none), 0);
+    }
+
+    // ── Unknown local nwkUpdateId ───────────────────────────
+
+    /// A device that holds no authoritative update state must not reject
+    /// candidates as stale. With a fabricated reference of `0`, every ID in
+    /// `0x81..=0xFF` would look stale and the device could never get back on
+    /// its own network.
+    #[test]
+    fn unknown_local_update_id_never_rejects_a_candidate_as_stale() {
+        let criteria = end_device_criteria_unknown();
+        assert_eq!(criteria.nwk_update_id, None);
+
+        for update_id in [0x00u8, 0x01, 0x7F, 0x80, 0x81, 0xFE, 0xFF] {
+            let network = candidate(0x0001, GOOD_LQI, update_id, 1, REJOIN_EPID);
+            assert!(
+                criteria.update_id_is_acceptable(&network),
+                "update id {update_id:#04X} must not be stale against an unknown local state"
+            );
+            assert!(criteria.is_base_eligible(&network));
+            assert_eq!(criteria.freshness(&network), None);
+        }
+
+        // Every other gate still applies unchanged.
+        assert!(!criteria.is_base_eligible(&candidate(0x0002, GOOD_LQI, 0x42, 1, OTHER_EPID)));
+        assert!(!criteria.is_base_eligible(&candidate(0x0003, UNUSABLE_LQI, 0x42, 1, REJOIN_EPID)));
+        assert!(!criteria.is_base_eligible(&candidate_with_capacity(
+            0x0004, GOOD_LQI, 0x42, 1, true, false
+        )));
+
+        // The known-state gate is unchanged by all this.
+        let known = end_device_criteria(0x00);
+        assert!(!known.is_base_eligible(&candidate(0x0001, GOOD_LQI, 0xFF, 1, REJOIN_EPID)));
+    }
+
+    /// With no reference point the most recent ID is the fixed point of a
+    /// forward-only pairwise fold in discovery order, and the selection still
+    /// narrows to exactly one update ID.
+    #[test]
+    fn unknown_local_update_id_picks_a_deterministic_most_recent_across_wrap() {
+        let criteria = end_device_criteria_unknown();
+
+        // A chain that wraps: 0xFD -> 0xFE -> 0x02 are each strictly newer
+        // than the one before, so the fold walks forward to 0x02.
+        let networks = [
+            candidate(0x0001, GOOD_LQI, 0xFD, 0, REJOIN_EPID),
+            candidate(0x0002, GOOD_LQI, 0xFE, 0, REJOIN_EPID),
+            candidate(0x0003, GOOD_LQI, 0x02, 0, REJOIN_EPID),
+            // Older than the running answer: must not pull it back.
+            candidate(0x0004, GOOD_LQI, 0xFF, 0, REJOIN_EPID),
+        ];
+        assert_eq!(criteria.most_recent_update_id(&networks), Some(0x02));
+
+        // Discovery order does not change which ID wins when the set is
+        // orderable end to end.
+        let reordered = [
+            candidate(0x0004, GOOD_LQI, 0xFF, 0, REJOIN_EPID),
+            candidate(0x0003, GOOD_LQI, 0x02, 0, REJOIN_EPID),
+            candidate(0x0001, GOOD_LQI, 0xFD, 0, REJOIN_EPID),
+            candidate(0x0002, GOOD_LQI, 0xFE, 0, REJOIN_EPID),
+        ];
+        assert_eq!(criteria.most_recent_update_id(&reordered), Some(0x02));
+
+        // Ambiguous half-window pair: neither is newer, so discovery order
+        // decides — deterministically, and without inventing an ordering.
+        let ambiguous = [
+            candidate(0x0001, GOOD_LQI, 0x00, 0, REJOIN_EPID),
+            candidate(0x0002, GOOD_LQI, 0x80, 0, REJOIN_EPID),
+        ];
+        assert_eq!(criteria.most_recent_update_id(&ambiguous), Some(0x00));
+        let ambiguous_reversed = [
+            candidate(0x0002, GOOD_LQI, 0x80, 0, REJOIN_EPID),
+            candidate(0x0001, GOOD_LQI, 0x00, 0, REJOIN_EPID),
+        ];
+        assert_eq!(
+            criteria.most_recent_update_id(&ambiguous_reversed),
+            Some(0x80)
+        );
+
+        // Ineligible candidates never seed or move the answer.
+        let with_noise = [
+            candidate(0x0009, GOOD_LQI, 0x7F, 0, OTHER_EPID),
+            candidate(0x000A, UNUSABLE_LQI, 0x7E, 0, REJOIN_EPID),
+            candidate(0x0001, GOOD_LQI, 0xFD, 0, REJOIN_EPID),
+            candidate(0x0003, GOOD_LQI, 0x02, 0, REJOIN_EPID),
+        ];
+        assert_eq!(criteria.most_recent_update_id(&with_noise), Some(0x02));
+
+        // No eligible candidate at all is still "nothing to select".
+        assert_eq!(
+            criteria.most_recent_update_id(&[candidate(0x0001, GOOD_LQI, 0x02, 0, OTHER_EPID)]),
+            None
+        );
+    }
+
+    /// Unknown local state still narrows the scan to one update ID and then
+    /// ranks by the normative minimum-depth rule.
+    #[test]
+    fn unknown_local_update_id_still_keeps_only_one_update_id() {
+        let criteria = end_device_criteria_unknown();
+        let mut networks = [
+            candidate(0x0001, GOOD_LQI, 0xFE, 0, REJOIN_EPID), // older
+            candidate(0x0002, WEAK_LQI, 0x01, 3, REJOIN_EPID), // newest
+            candidate(0x0003, GOOD_LQI, 0x01, 1, REJOIN_EPID), // newest, shallower
+            candidate(0x0004, GOOD_LQI, 0x00, 0, REJOIN_EPID), // older
+        ];
+
+        let suitable = criteria.select(&mut networks);
+
+        assert_eq!(suitable, 2);
+        assert_eq!(addresses(&networks), [0x0003, 0x0002, 0x0001, 0x0004]);
+    }
+
+    /// The criteria derived from the NIB carry the validity flag, so an
+    /// un-commissioned NIB never claims to hold update state `0`.
+    #[test]
+    fn rejoin_criteria_report_unknown_update_id_from_a_factory_new_nib() {
+        let mut nwk = NwkLayer::new(MockMac::new([3; 8]), DeviceType::EndDevice);
+        nwk.nib.extended_pan_id = REJOIN_EPID;
+
+        assert_eq!(nwk.nib.nwk_update_id(), None);
+        assert_eq!(nwk.rejoin_parent_criteria().nwk_update_id, None);
+
+        // A beacon that a fabricated local `0` would have called stale.
+        let stale_looking = candidate(0x0001, GOOD_LQI, 0xF0, 1, REJOIN_EPID);
+        assert!(
+            nwk.rejoin_parent_criteria()
+                .is_base_eligible(&stale_looking)
+        );
+
+        // Adopting an update state switches the gate on.
+        nwk.nib.set_nwk_update_id(0x00);
+        assert_eq!(nwk.rejoin_parent_criteria().nwk_update_id, Some(0x00));
+        assert!(
+            !nwk.rejoin_parent_criteria()
+                .is_base_eligible(&stale_looking)
+        );
+
+        // And clearing it takes the gate back off.
+        nwk.nib.clear_nwk_update_id();
+        assert_eq!(nwk.rejoin_parent_criteria().nwk_update_id, None);
+    }
+
+    /// A restore that carries no update state must land in the unknown state,
+    /// not in a known `0`.
+    #[test]
+    fn restoring_an_absent_update_id_leaves_it_unknown() {
+        let mut nib = crate::nib::Nib::new();
+
+        nib.restore_nwk_update_id(Some(0x2A));
+        assert_eq!(nib.nwk_update_id(), Some(0x2A));
+        assert!(nib.update_id_valid);
+
+        nib.restore_nwk_update_id(None);
+        assert_eq!(nib.nwk_update_id(), None);
+        assert!(!nib.update_id_valid);
+        // The raw byte is reset too, so nothing can read a stale value.
+        assert_eq!(nib.update_id, 0);
+
+        // A known 0 and an unknown state are distinguishable.
+        nib.set_nwk_update_id(0);
+        assert_eq!(nib.nwk_update_id(), Some(0));
+    }
+
+    #[test]
+    fn rejoin_orders_suitable_candidates_by_minimum_depth_first() {
+        let criteria = end_device_criteria(7);
+        let mut networks = [
+            candidate(0x0001, GOOD_LQI, 7, 4, REJOIN_EPID),
+            candidate(0x0002, WEAK_LQI, 7, 0, REJOIN_EPID),
+            candidate(0x0003, GOOD_LQI, 7, 2, REJOIN_EPID),
+            candidate(0x0004, FAIR_LQI, 7, 1, REJOIN_EPID),
+        ];
+
+        let suitable = criteria.select(&mut networks);
+
+        // Depth is normative and outranks link cost: the deepest candidate
+        // loses even with the best link, and the shallowest wins with the
+        // worst still-usable link.
+        assert_eq!(suitable, 4);
+        assert_eq!(addresses(&networks), [0x0002, 0x0004, 0x0003, 0x0001]);
+    }
+
+    #[test]
+    fn rejoin_ties_at_equal_depth_are_deterministic() {
+        let criteria = end_device_criteria(3);
+        // Implementation tie-break 1: lower link cost at equal depth.
+        let mut networks = [
+            candidate(0x0001, WEAK_LQI, 3, 2, REJOIN_EPID),
+            candidate(0x0002, GOOD_LQI, 3, 2, REJOIN_EPID),
+            candidate(0x0003, FAIR_LQI, 3, 2, REJOIN_EPID),
+        ];
+        assert_eq!(criteria.select(&mut networks), 3);
+        assert_eq!(addresses(&networks), [0x0002, 0x0003, 0x0001]);
+
+        // Implementation tie-break 2: scan order when nothing else differs.
+        let identical = |address: u16| candidate(address, GOOD_LQI, 3, 2, REJOIN_EPID);
+        let mut networks = [identical(0x0003), identical(0x0001), identical(0x0002)];
+        assert_eq!(criteria.select(&mut networks), 3);
+        assert_eq!(addresses(&networks), [0x0003, 0x0001, 0x0002]);
+
+        // Implementation tie-break 3: previous parent, ahead of scan order but
+        // behind depth and cost.
+        let criteria = criteria.with_previous_parent(ShortAddress(0x0002));
+        let mut networks = [identical(0x0003), identical(0x0001), identical(0x0002)];
+        assert_eq!(criteria.select(&mut networks), 3);
+        assert_eq!(addresses(&networks), [0x0002, 0x0003, 0x0001]);
+
+        // The previous parent never beats the normative depth rule.
+        let mut networks = [
+            candidate(0x0002, GOOD_LQI, 3, 3, REJOIN_EPID),
+            candidate(0x0001, WEAK_LQI, 3, 1, REJOIN_EPID),
+        ];
+        assert_eq!(criteria.select(&mut networks), 2);
+        assert_eq!(addresses(&networks), [0x0001, 0x0002]);
+    }
+
+    #[test]
+    fn rejoin_selection_keeps_unsuitable_candidates_at_the_tail() {
+        let criteria = end_device_criteria(4);
+        let mut networks = [
+            candidate(0x0001, UNUSABLE_LQI, 4, 1, REJOIN_EPID), // link cost
+            candidate(0x0002, GOOD_LQI, 3, 1, REJOIN_EPID),     // stale
+            candidate(0x0003, GOOD_LQI, 4, 3, REJOIN_EPID),     // suitable
+            candidate(0x0004, GOOD_LQI, 4, 1, OTHER_EPID),      // other network
+            candidate(0x0005, FAIR_LQI, 4, 1, REJOIN_EPID),     // suitable
+            candidate_with_capacity(0x0006, GOOD_LQI, 4, 0, true, false), // no ED capacity
+        ];
+
+        let suitable = criteria.select(&mut networks);
+
+        // 0x0005 is shallower than 0x0003, so depth puts it first.
+        assert_eq!(suitable, 2);
+        assert_eq!(
+            addresses(&networks),
+            [0x0005, 0x0003, 0x0001, 0x0002, 0x0004, 0x0006]
+        );
+        let most_recent = criteria
+            .most_recent_update_id(&networks)
+            .expect("a suitable candidate exists");
+        assert!(
+            networks[..suitable]
+                .iter()
+                .all(|network| criteria.is_suitable(network, most_recent))
+        );
+        assert!(
+            networks[suitable..]
+                .iter()
+                .all(|network| !criteria.is_suitable(network, most_recent))
+        );
+    }
+
+    #[test]
+    fn rejoin_criteria_track_the_nib() {
+        let mut nwk = NwkLayer::new(
+            MockMac::new([1, 2, 3, 4, 5, 6, 7, 8]),
+            DeviceType::EndDevice,
+        );
+        nwk.nib.extended_pan_id = REJOIN_EPID;
+        nwk.nib.set_nwk_update_id(9);
+
+        // No parent yet — nothing to prefer on a tie.
+        assert_eq!(nwk.rejoin_parent_criteria(), end_device_criteria(9));
+        assert_eq!(
+            nwk.rejoin_parent_criteria().device_type,
+            DeviceType::EndDevice
+        );
+
+        nwk.nib.parent_address = ShortAddress(0x1234);
+        assert_eq!(
+            nwk.rejoin_parent_criteria(),
+            end_device_criteria(9).with_previous_parent(ShortAddress(0x1234))
+        );
+
+        // A router rejoins against the router capacity bit instead.
+        let mut router = NwkLayer::new(MockMac::new([2; 8]), DeviceType::Router);
+        router.nib.extended_pan_id = REJOIN_EPID;
+        router.nib.set_nwk_update_id(9);
+        assert_eq!(
+            router.rejoin_parent_criteria(),
+            RejoinParentCriteria::new(REJOIN_EPID, Some(9), DeviceType::Router)
+        );
+    }
+
     #[test]
     fn zigbee_capability_bytes_match_reference_stack() {
         assert_eq!(
@@ -1532,9 +2415,18 @@ mod tests {
         nwk.security_mut().set_network_key(KEY, 0);
         nwk.security_mut().commit_frame_counter(&PARENT_IEEE, 5);
 
+        // This NIB was never given an authoritative update state, so the
+        // staleness gate is off and the candidate is attempted on its merits.
+        assert_eq!(nwk.nib().nwk_update_id(), None);
+
         assert_eq!(
             block_on(nwk.nlme_join(&network, JoinMethod::Rejoin)),
             Err(NwkStatus::NotPermitted)
+        );
+        assert_eq!(
+            nwk.nib().nwk_update_id(),
+            None,
+            "a refused rejoin must not make the candidate's update id authoritative"
         );
         assert_eq!(nwk.mac().poll_count(), 2);
         assert!(!nwk.security().check_frame_counter(&PARENT_IEEE, 6));
@@ -1548,6 +2440,12 @@ mod tests {
         );
         assert_eq!(nwk.mac().poll_count(), 3);
         assert_eq!(nwk.nib().pan_id, PAN_ID);
+        assert_eq!(
+            nwk.nib().nwk_update_id(),
+            Some(network.update_id),
+            "the parent accepted us, so the update state we rejoined against \
+             is now authoritative"
+        );
         assert!(!nwk.security().check_frame_counter(&PARENT_IEEE, 7));
         assert!(nwk.security().check_frame_counter(&PARENT_IEEE, 8));
 

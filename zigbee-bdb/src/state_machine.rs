@@ -33,7 +33,7 @@
 //! ```
 
 use zigbee_mac::MacDriver;
-use zigbee_nwk::{DeviceType, nlme::sort_network_descriptors_by};
+use zigbee_nwk::DeviceType;
 
 use crate::{BdbLayer, BdbStatus};
 
@@ -353,8 +353,6 @@ impl<M: MacDriver> BdbLayer<M> {
 
         let nib = self.zdo.nwk().nib();
         let channel = nib.logical_channel;
-        let extended_pan_id = nib.extended_pan_id;
-        let previous_parent = nib.parent_address;
         let channel_mask = zigbee_types::ChannelMask(1u32 << channel);
 
         self.zdo.nwk_mut().reset_rejoin_diagnostics();
@@ -366,25 +364,30 @@ impl<M: MacDriver> BdbLayer<M> {
                 return Err(BdbStatus::NoScanResponse);
             }
         };
-        sort_network_descriptors_by(&mut networks, |candidate, current| {
-            match (
-                candidate.router_address == previous_parent,
-                current.router_address == previous_parent,
-            ) {
-                (true, false) => true,
-                (false, true) => false,
-                _ => candidate.lqi > current.lqi,
-            }
-        });
+        // R22 §3.6.1.4.2 — keep only candidates on our network that advertise
+        // capacity for our device type, are not stale, carry the most recent
+        // nwkUpdateId seen in this scan and have a link cost of at most 3.
+        // Suitable parents are then tried at minimum depth first.
+        let suitable = self.zdo.nwk().select_rejoin_parents(&mut networks);
+        if suitable == 0 {
+            log::warn!(
+                "[BDB] Rejoin: {} beacon(s) on channel {}, none suitable as parent",
+                networks.len(),
+                channel,
+            );
+            self.state = BdbState::Idle;
+            return Err(BdbStatus::SteeringFailure);
+        }
 
-        for network in networks
-            .iter()
-            .filter(|network| network.extended_pan_id == extended_pan_id)
-        {
+        for network in &networks[..suitable] {
             log::info!(
-                "[BDB] Rejoin: trying PAN 0x{:04X} ch {}",
+                "[BDB] Rejoin: trying PAN 0x{:04X} ch {} via 0x{:04X} (update_id={} LQI={} depth={})",
                 network.pan_id.0,
                 network.logical_channel,
+                network.router_address.0,
+                network.update_id,
+                network.lqi,
+                network.depth,
             );
 
             match self.zdo.nlme_rejoin(network).await {

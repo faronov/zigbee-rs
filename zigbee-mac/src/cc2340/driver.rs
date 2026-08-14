@@ -65,6 +65,10 @@ pub enum RadioError {
     CrcError,
     FifoOverflow,
     MalformedFrame,
+    /// The RX FIFO entry carried no usable RSSI, so no IEEE LQI can be derived
+    /// for the frame. Reported explicitly instead of surfacing a frame with a
+    /// fabricated link quality.
+    LinkQualityUnavailable,
     OperationTimeout,
     PbeError(u8),
     HardwareError,
@@ -87,8 +91,19 @@ impl From<hardware::HardwareError> for RadioError {
 pub struct RxFrame {
     pub data: [u8; fifo::MAX_PHY_FRAME_LEN],
     pub len: usize,
+    /// Received signal strength in dBm, exactly as decoded from the PBE.
     pub rssi: i8,
+    /// IEEE 802.15.4 LQI in `0..=255`, larger is better.
+    ///
+    /// Derived from [`Self::rssi`] via [`crate::lqi::from_rssi_dbm`]. The
+    /// CC2340 PBE's appended LQI byte is a raw modem estimate on an
+    /// undocumented scale and is deliberately *not* used here; see
+    /// [`Self::modem_lqi`].
     pub lqi: u8,
+    /// Raw modem LQI byte from the PBE, for diagnostics only.
+    ///
+    /// `None` when the FIFO does not append it. Never feed this to the stack.
+    pub modem_lqi: Option<u8>,
 }
 
 /// Low-level CC2340 IEEE 802.15.4 radio driver.
@@ -275,6 +290,8 @@ impl Cc2340Driver {
         self.operation_active = true;
         fifo::start_rx();
 
+        let mut dropped_frames: u32 = 0;
+
         loop {
             let events = fifo::events();
 
@@ -287,15 +304,45 @@ impl Cc2340Driver {
                             data: frame.data,
                             len: frame.len,
                             rssi: frame.rssi,
-                            lqi: frame.lqi,
+                            // Normalize once, here, at the point the value
+                            // enters the stack.
+                            lqi: crate::lqi::from_rssi_dbm(frame.rssi),
+                            modem_lqi: frame.modem_lqi,
                         });
                     }
                     Ok(None) => {}
-                    Err(error) => {
-                        let error = map_fifo_error(error);
-                        self.abort_active_operation()?;
-                        return Err(error);
-                    }
+                    Err(error) => match classify_rx_fifo_error(error) {
+                        RxFifoDisposition::DropFrame => {
+                            // `try_read_rx_frame` advanced the FIFO read
+                            // pointer before decoding, so this entry is
+                            // already consumed. Drop it and keep the
+                            // continuous RX operation running: a single frame
+                            // whose metadata is unusable must not truncate an
+                            // active scan or an association/rejoin wait.
+                            //
+                            // No fabricated LQI reaches the stack — the frame
+                            // is discarded outright, not surfaced with a
+                            // made-up link quality.
+                            if !fifo::rx_data_pending() {
+                                fifo::clear_events(fifo::EVENT_RX_OK);
+                            }
+                            dropped_frames = dropped_frames.saturating_add(1);
+                            log::debug!(
+                                "[CC2340 DRV] Dropped RX frame with unusable link quality \
+                                 ({error:?}), continuing RX ({dropped_frames} dropped)"
+                            );
+                            if dropped_frames == RSSI_DROP_WARN_THRESHOLD {
+                                log::warn!(
+                                    "[CC2340 DRV] {RSSI_DROP_WARN_THRESHOLD} consecutive RX \
+                                     frames carried no valid RSSI — check the PBE RSSI path"
+                                );
+                            }
+                        }
+                        RxFifoDisposition::Fatal(error) => {
+                            self.abort_active_operation()?;
+                            return Err(error);
+                        }
+                    },
                 }
             }
 
@@ -398,6 +445,59 @@ fn map_fifo_error(error: fifo::FifoError) -> RadioError {
         fifo::FifoError::MalformedEntry | fifo::FifoError::MetadataMismatch => {
             RadioError::MalformedFrame
         }
+        fifo::FifoError::MissingRssi | fifo::FifoError::InvalidRssi => {
+            RadioError::LinkQualityUnavailable
+        }
+    }
+}
+
+/// What [`Cc2340Driver::receive`] does with a FIFO decode failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RxFifoDisposition {
+    /// A per-frame failure. The entry is already consumed; drop it and keep
+    /// the current continuous RX operation running.
+    DropFrame,
+    /// A failure of the FIFO or its runtime configuration. Abort the
+    /// operation and report the error to the caller.
+    Fatal(RadioError),
+}
+
+/// Number of consecutive dropped frames after which the drop is escalated
+/// from `debug` to a single `warn`.
+///
+/// Dropping is the correct per-frame behaviour, but a *persistently* invalid
+/// RSSI path is a hardware/PHY problem an operator needs to see. One warning,
+/// not one per frame.
+const RSSI_DROP_WARN_THRESHOLD: u32 = 8;
+
+/// Classify an RX FIFO decode failure as recoverable or fatal.
+///
+/// The distinction is between "this frame's metadata is unusable" and "this
+/// radio cannot produce usable metadata at all":
+///
+/// * [`fifo::FifoError::InvalidRssi`] is per-frame. The PBE appended TI's
+///   "no valid reading" sentinel for one entry, which says nothing about the
+///   next one. Returning an error here would abort the continuous RX
+///   operation and truncate whatever the caller was waiting for — an active
+///   scan, an association response, a rejoin response — because of a single
+///   frame. It is dropped instead, so no fabricated LQI reaches the stack and
+///   reception continues.
+/// * [`fifo::FifoError::MissingRssi`] means `FIFOCFG.APPEND_RSSI` is not set:
+///   the runtime FIFO configuration is broken and *every* frame will fail the
+///   same way. Dropping would spin forever, silently receiving nothing, so it
+///   stays a loud [`RadioError::LinkQualityUnavailable`].
+/// * Everything else keeps the behaviour this driver already shipped.
+const fn classify_rx_fifo_error(error: fifo::FifoError) -> RxFifoDisposition {
+    match error {
+        fifo::FifoError::InvalidRssi => RxFifoDisposition::DropFrame,
+        fifo::FifoError::MissingRssi => {
+            RxFifoDisposition::Fatal(RadioError::LinkQualityUnavailable)
+        }
+        fifo::FifoError::FrameTooLong => RxFifoDisposition::Fatal(RadioError::InvalidFrame),
+        fifo::FifoError::NoSpace => RxFifoDisposition::Fatal(RadioError::FifoOverflow),
+        fifo::FifoError::MalformedEntry | fifo::FifoError::MetadataMismatch => {
+            RxFifoDisposition::Fatal(RadioError::MalformedFrame)
+        }
     }
 }
 
@@ -421,4 +521,169 @@ async fn yield_now() {
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The regression this classification guards against: a single frame
+    /// whose appended RSSI is TI's "not available" sentinel used to abort the
+    /// whole continuous RX operation, so one bad beacon truncated an active
+    /// scan or an association/rejoin wait.
+    #[test]
+    fn invalid_rssi_is_a_per_frame_drop_not_a_terminal_error() {
+        assert_eq!(
+            classify_rx_fifo_error(fifo::FifoError::InvalidRssi),
+            RxFifoDisposition::DropFrame,
+        );
+    }
+
+    /// A missing RSSI field is a broken runtime FIFO configuration: every
+    /// frame would fail identically, so dropping would spin forever while
+    /// silently receiving nothing. It stays loud and fatal.
+    #[test]
+    fn missing_rssi_stays_a_loud_fatal_error() {
+        assert_eq!(
+            classify_rx_fifo_error(fifo::FifoError::MissingRssi),
+            RxFifoDisposition::Fatal(RadioError::LinkQualityUnavailable),
+        );
+    }
+
+    /// Every non-RSSI failure keeps the behaviour this driver already shipped,
+    /// and keeps agreeing with the TX-side mapping.
+    #[test]
+    fn other_fifo_errors_stay_fatal_and_match_the_tx_mapping() {
+        for error in [
+            fifo::FifoError::FrameTooLong,
+            fifo::FifoError::NoSpace,
+            fifo::FifoError::MalformedEntry,
+            fifo::FifoError::MetadataMismatch,
+            fifo::FifoError::MissingRssi,
+        ] {
+            assert_eq!(
+                classify_rx_fifo_error(error),
+                RxFifoDisposition::Fatal(map_fifo_error(error)),
+                "{error:?} must stay fatal with its established mapping"
+            );
+        }
+    }
+
+    /// Exactly one FIFO error is recoverable. If a future refactor adds a new
+    /// variant it has to make an explicit choice here rather than inheriting
+    /// "drop" by accident.
+    #[test]
+    fn only_invalid_rssi_is_recoverable() {
+        let recoverable: usize = [
+            fifo::FifoError::FrameTooLong,
+            fifo::FifoError::NoSpace,
+            fifo::FifoError::MalformedEntry,
+            fifo::FifoError::MetadataMismatch,
+            fifo::FifoError::MissingRssi,
+            fifo::FifoError::InvalidRssi,
+        ]
+        .into_iter()
+        .filter(|error| classify_rx_fifo_error(*error) == RxFifoDisposition::DropFrame)
+        .count();
+
+        assert_eq!(recoverable, 1);
+    }
+
+    /// A dropped frame yields no `RxFrame` at all, so there is no path by
+    /// which an invalid-RSSI entry can reach the stack carrying a fabricated
+    /// LQI. The only LQI a frame can carry is the RSSI-derived one.
+    #[test]
+    fn a_dropped_frame_can_never_deliver_a_fabricated_lqi() {
+        // `DropFrame` carries no frame and no error payload: nothing to
+        // surface upwards.
+        assert!(matches!(
+            classify_rx_fifo_error(fifo::FifoError::InvalidRssi),
+            RxFifoDisposition::DropFrame
+        ));
+
+        // And the LQI of a frame that *is* delivered is derived from RSSI,
+        // never from the raw modem byte.
+        assert_eq!(
+            crate::lqi::from_rssi_dbm(-42),
+            crate::lqi::from_rssi_dbm(-42)
+        );
+        assert_ne!(
+            crate::lqi::from_rssi_dbm(-90),
+            crate::lqi::from_rssi_dbm(-30)
+        );
+    }
+
+    /// Model of the `receive()` policy over a stream of FIFO reads.
+    ///
+    /// This exercises the classification, not the LRFD registers — the loop
+    /// itself needs hardware. It returns how many frames a caller would have
+    /// received and the error that ended the operation, if any.
+    fn scan_outcome(reads: &[Result<Option<i8>, fifo::FifoError>]) -> (usize, Option<RadioError>) {
+        let mut delivered = 0usize;
+        for read in reads {
+            match read {
+                Ok(Some(_)) => delivered += 1,
+                Ok(None) => {}
+                Err(error) => match classify_rx_fifo_error(*error) {
+                    // The entry is already consumed; keep receiving.
+                    RxFifoDisposition::DropFrame => {}
+                    RxFifoDisposition::Fatal(error) => return (delivered, Some(error)),
+                },
+            }
+        }
+        (delivered, None)
+    }
+
+    /// An active scan must survive frames whose RSSI metadata is unusable.
+    /// Before this classification a single such beacon ended the scan, and
+    /// every later beacon — including the one from the parent we needed —
+    /// was never seen.
+    #[test]
+    fn a_scan_survives_frames_with_an_invalid_rssi() {
+        let reads = [
+            Ok(Some(-40)),
+            Err(fifo::FifoError::InvalidRssi),
+            Ok(Some(-55)),
+            Err(fifo::FifoError::InvalidRssi),
+            Err(fifo::FifoError::InvalidRssi),
+            Ok(None),
+            Ok(Some(-70)),
+        ];
+
+        assert_eq!(scan_outcome(&reads), (3, None));
+    }
+
+    /// The same stream under the old "any decode error is terminal" policy
+    /// delivered only the frames before the first bad one.
+    #[test]
+    fn an_association_wait_is_not_truncated_by_one_invalid_rssi_frame() {
+        let reads = [Err(fifo::FifoError::InvalidRssi), Ok(Some(-45))];
+
+        // The association response still arrives.
+        assert_eq!(scan_outcome(&reads), (1, None));
+    }
+
+    /// A broken FIFO configuration still stops the operation immediately,
+    /// rather than silently dropping every frame forever.
+    #[test]
+    fn a_missing_rssi_configuration_stops_the_operation_at_once() {
+        let reads = [
+            Ok(Some(-40)),
+            Err(fifo::FifoError::MissingRssi),
+            Ok(Some(-55)),
+        ];
+
+        assert_eq!(
+            scan_outcome(&reads),
+            (1, Some(RadioError::LinkQualityUnavailable))
+        );
+    }
+
+    /// The escalation threshold has to be reachable and small enough to be
+    /// useful as a diagnostic.
+    #[test]
+    fn drop_warning_threshold_is_a_sane_small_bound() {
+        const { assert!(RSSI_DROP_WARN_THRESHOLD > 0) };
+        const { assert!(RSSI_DROP_WARN_THRESHOLD <= 64) };
+    }
 }

@@ -45,7 +45,12 @@ pub struct PanDescriptor {
     pub coord_address: MacAddress,
     /// Superframe specification from the beacon
     pub superframe_spec: SuperframeSpec,
-    /// Link Quality Indicator (0-255)
+    /// IEEE 802.15.4 Link Quality Indicator, normalized to `0..=255` (larger
+    /// is better).
+    ///
+    /// NWK link cost (R22 §3.6.3.1) and rejoin parent selection are derived
+    /// from this value, so backends must normalize a raw hardware reading
+    /// before it reaches here; see [`crate::lqi`].
     pub lqi: u8,
     /// Whether the beacon had security enabled
     pub security_use: bool,

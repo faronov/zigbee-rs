@@ -721,6 +721,7 @@ mod resume_tests {
         state.depth = 2;
         state.parent_address = 0x0001;
         state.update_id = 7;
+        state.update_id_valid = true;
         state.network_key = [0xCC; 16];
         state.key_sequence = 3;
         state.global_counter_limit = FLOOR;
@@ -758,6 +759,12 @@ mod resume_tests {
         assert_eq!(reserved.global_counter_limit, FLOOR + RESERVATION);
         assert_eq!(reserved.tclk_counter_limit, FLOOR + RESERVATION);
         let nib = device.bdb.zdo().nwk().nib();
+        assert_eq!(
+            nib.nwk_update_id(),
+            Some(7),
+            "a record that marks its update state valid restores it as \
+             authoritative"
+        );
         assert!(
             (FLOOR..nib.outgoing_frame_counter_limit).contains(&nib.outgoing_frame_counter),
             "the live counter resumes inside the fresh reservation (the resume \
@@ -804,6 +811,99 @@ mod resume_tests {
             state.short_address
         );
         assert_eq!(rebooted.pan_id(), 0x1234);
+    }
+
+    /// A record migrated from a persistence format that never stored
+    /// `NwkUpdateId` restores as *unknown*, and stays unknown across further
+    /// persistence — the reboot must not be able to promote the placeholder
+    /// into an authoritative `0`, which would make every beacon advertising
+    /// `0x81..=0xFF` look stale and strand the device off its own network.
+    #[test]
+    fn an_unknown_persisted_update_id_restores_and_persists_as_unknown() {
+        const IEEE_ADDRESS: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
+        const FLOOR: u32 = 0x2400;
+        const RESERVATION: u32 = zigbee_bdb::FRAME_COUNTER_RESERVATION_SIZE;
+
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.legacy_default_tclk = true;
+        state.extended_pan_id = [0xAA; 8];
+        state.pan_id = 0x1234;
+        state.short_address = 0x5678;
+        state.ieee_address = IEEE_ADDRESS;
+        state.channel = 15;
+        state.depth = 2;
+        state.parent_address = 0x0001;
+        // The migrated record carries no update state at all.
+        state.update_id = 0;
+        state.update_id_valid = false;
+        state.network_key = [0xCC; 16];
+        state.key_sequence = 3;
+        state.global_counter_limit = FLOOR;
+        state.tclk_counter_limit = FLOOR;
+
+        let mut store = RamSecurityStateStore::new();
+        store.store(&state).unwrap();
+
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        assert!(device.restore_security_state(&mut store).unwrap());
+
+        let nib = device.bdb.zdo().nwk().nib();
+        assert_eq!(
+            nib.nwk_update_id(),
+            None,
+            "an unknown persisted update state must never restore as a known 0"
+        );
+        assert!(!nib.update_id_valid);
+        assert_eq!(
+            nib.pan_id.0, 0x1234,
+            "the rest of the record still restored"
+        );
+
+        // Rejoin parent selection therefore rejects nothing as stale.
+        assert_eq!(
+            device
+                .bdb
+                .zdo()
+                .nwk()
+                .rejoin_parent_criteria()
+                .nwk_update_id,
+            None
+        );
+
+        // Further persistence keeps it unknown rather than writing a known 0.
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .nib_mut()
+            .outgoing_frame_counter = FLOOR + RESERVATION - 1;
+        assert!(device.refresh_security_state(&mut store).unwrap());
+        let persisted = store.load().unwrap().unwrap();
+        assert_eq!(persisted.update_id, 0);
+        assert!(!persisted.update_id_valid);
+
+        // A reboot on that record is still unknown, not a known 0.
+        let mut rebooted = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        assert!(rebooted.restore_security_state(&mut store).unwrap());
+        assert_eq!(rebooted.bdb.zdo().nwk().nib().nwk_update_id(), None);
+
+        // Once the network's update state is genuinely learned — a rejoin or
+        // an accepted `Mgmt_NWK_Update` — it is adopted durably.
+        rebooted
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .nib_mut()
+            .set_nwk_update_id(0x90);
+        assert!(rebooted.refresh_security_state(&mut store).unwrap());
+        let learned = store.load().unwrap().unwrap();
+        assert_eq!(learned.update_id, 0x90);
+        assert!(learned.update_id_valid);
     }
 
     #[test]
@@ -3531,7 +3631,19 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         state.channel = nib.logical_channel;
         state.depth = nib.depth;
         state.parent_address = nib.parent_address.0;
-        state.update_id = nib.update_id;
+        // Round-trip the NIB's own notion of validity: a rejoin that started
+        // from an unknown update state and has not yet learned one must not be
+        // persisted as an authoritative `0`.
+        match nib.nwk_update_id() {
+            Some(update_id) => {
+                state.update_id = update_id;
+                state.update_id_valid = true;
+            }
+            None => {
+                state.update_id = 0;
+                state.update_id_valid = false;
+            }
+        }
         // A secured rejoin re-selects a parent, so the negotiation the NWK
         // layer just reset (and whatever the new parent has already answered)
         // is committed together with the new parent address.
@@ -4130,7 +4242,17 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             nib.logical_channel = state.channel;
             nib.depth = state.depth;
             nib.parent_address = ShortAddress(state.parent_address);
-            nib.update_id = state.update_id;
+            // Record version 4 stores `nwkUpdateId` validity explicitly, so a
+            // record migrated from a format that never held the value (a
+            // legacy log-structured NV region, say) restores as *unknown*
+            // rather than as an authoritative `0`. Records written by
+            // versions 1..=3 always decode as valid, so an existing
+            // installation keeps the update state it had.
+            nib.restore_nwk_update_id(if state.update_id_valid {
+                Some(state.update_id)
+            } else {
+                None
+            });
             nib.active_key_seq_number = state.key_sequence;
             nib.security_enabled = true;
             // The stored parent relationship is still in force after a silent
@@ -4252,6 +4374,22 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             }
         };
 
+        // A device restored with an unknown `nwkUpdateId` — a migrated record,
+        // say — learns one from its first successful rejoin or from an
+        // accepted `Mgmt_NWK_Update`. Adopt that durably so the unknown state
+        // is not re-read on every boot. The converse never happens here: an
+        // unknown NIB value leaves the stored record untouched, so this path
+        // can never promote a placeholder into an authoritative `0`.
+        let update_id_changed = match nib.nwk_update_id() {
+            Some(update_id) => {
+                let changed = !state.update_id_valid || state.update_id != update_id;
+                state.update_id = update_id;
+                state.update_id_valid = true;
+                changed
+            }
+            None => false,
+        };
+
         // R22 End Device Timeout negotiation result. Persisting it is what
         // lets a silent resume pick the cheap MAC-poll keepalive instead of
         // renegotiating on every reboot; the NIB is authoritative here because
@@ -4367,6 +4505,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         let mut changed = adopted_current.is_some()
             || network_key_changed
             || staged_key_changed
+            || update_id_changed
             || end_device_timeout_changed;
         let mut new_global_limit = nib.outgoing_frame_counter_limit;
         if nib
@@ -4700,7 +4839,18 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             NvItemId::NwkParentAddress,
             &nib.parent_address.0.to_le_bytes(),
         );
-        let _ = nv.write(NvItemId::NwkUpdateId, &[nib.update_id]);
+        // Only a known-good `nwkUpdateId` may be written. Persisting the
+        // placeholder of an unknown state would let the next boot read back a
+        // "known" 0 and start rejecting every beacon in 0x81..=0xFF as stale,
+        // so the item is removed instead and the unknown state survives.
+        match nib.nwk_update_id() {
+            Some(update_id) => {
+                let _ = nv.write(NvItemId::NwkUpdateId, &[update_id]);
+            }
+            None => {
+                let _ = nv.delete(NvItemId::NwkUpdateId);
+            }
+        }
 
         // NWK security — active key + frame counter
         if let Some(key_entry) = self.bdb.zdo().nwk().security().active_key() {
@@ -4784,9 +4934,15 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             Ok(2) => ShortAddress(u16::from_le_bytes([buf[0], buf[1]])),
             _ => ShortAddress(0x0000),
         };
+        // A record written before this item existed — or one saved while the
+        // update state was unknown — says nothing about the network's update
+        // state. Restore "unknown" rather than a known 0.
         let update_id = match nv.read(NvItemId::NwkUpdateId, &mut buf) {
-            Ok(1) => buf[0],
-            _ => 0,
+            Ok(1) => Some(buf[0]),
+            _ => {
+                log::debug!("[NV] No NwkUpdateId item — nwkUpdateId restored as unknown");
+                None
+            }
         };
 
         // Apply to NIB
@@ -4798,7 +4954,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             nib.extended_pan_id = epid;
             nib.depth = depth;
             nib.parent_address = parent;
-            nib.update_id = update_id;
+            nib.restore_nwk_update_id(update_id);
             // Restore IEEE address (critical for NWK security headers)
             let mut ieee_buf = [0u8; 8];
             if let Ok(8) = nv.read(NvItemId::NwkIeeeAddress, &mut ieee_buf) {
@@ -6443,7 +6599,8 @@ mod parent_router_tests {
             nib.network_address = ROUTER;
             nib.extended_pan_id = [0xA5; 8];
             nib.depth = 3;
-            nib.update_id = 7;
+            // A router on a network holds an authoritative update state.
+            nib.set_nwk_update_id(7);
         }
         device
     }
@@ -6485,7 +6642,8 @@ mod parent_router_tests {
             nib.network_address = ROUTER;
             nib.extended_pan_id = [0xA5; 8];
             nib.depth = 3;
-            nib.update_id = 7;
+            // A router on a network holds an authoritative update state.
+            nib.set_nwk_update_id(7);
         }
         device
     }
@@ -7822,5 +7980,157 @@ mod role_tests {
         // doctests on `ZigbeeDevice` and by `EndDeviceRole` being implemented
         // for `EndDevice` only; a relay/router simply has no `ed_timeout()` or
         // `send_ed_timeout_request` method to call.
+    }
+}
+
+/// Legacy item-by-item NV persistence of `nwkUpdateId` (R22 §3.6.1.4.1).
+///
+/// The item is optional in that format: records written before it existed
+/// carry no update state at all. Restoring such a record as a *known* `0`
+/// would arm the rejoin staleness gate against a value the device never
+/// learned, and every beacon in `0x81..=0xFF` would then look stale.
+#[cfg(test)]
+mod legacy_nv_update_id_tests {
+    use super::ZigbeeDevice;
+    use crate::nv_storage::{NvItemId, NvStorage, RamNvStorage};
+    use zigbee_mac::mock::MockMac;
+    use zigbee_nwk::DeviceType;
+
+    const IEEE: [u8; 8] = [0x21; 8];
+
+    fn new_device() -> ZigbeeDevice<MockMac> {
+        ZigbeeDevice::builder(MockMac::new(IEEE))
+            .device_type(DeviceType::EndDevice)
+            .build()
+    }
+
+    /// A minimal legacy record that `restore_state` accepts, without the
+    /// `NwkUpdateId` item.
+    fn write_legacy_record(nv: &mut RamNvStorage) {
+        nv.write(NvItemId::BdbNodeIsOnNetwork, &[1]).unwrap();
+        nv.write(NvItemId::NwkPanId, &0x1A2Bu16.to_le_bytes())
+            .unwrap();
+        nv.write(NvItemId::NwkChannel, &[15]).unwrap();
+        nv.write(NvItemId::NwkShortAddress, &0x4321u16.to_le_bytes())
+            .unwrap();
+        nv.write(NvItemId::NwkExtendedPanId, &[0xAA; 8]).unwrap();
+        nv.write(NvItemId::NwkIeeeAddress, &IEEE).unwrap();
+        nv.write(NvItemId::NwkDepth, &[1]).unwrap();
+        nv.write(NvItemId::NwkParentAddress, &0x0000u16.to_le_bytes())
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_restore_without_the_item_leaves_the_update_id_unknown() {
+        let mut nv = RamNvStorage::new();
+        write_legacy_record(&mut nv);
+        assert!(!nv.exists(NvItemId::NwkUpdateId).unwrap());
+
+        let mut device = new_device();
+        assert!(device.restore_state(&mut nv));
+
+        let nib = device.bdb.zdo().nwk().nib();
+        assert_eq!(
+            nib.nwk_update_id(),
+            None,
+            "an absent NwkUpdateId item must restore as unknown, never as a known 0"
+        );
+        assert!(!nib.update_id_valid);
+
+        // The rest of the record still restored.
+        assert_eq!(nib.logical_channel, 15);
+        assert_eq!(nib.network_address.0, 0x4321);
+    }
+
+    #[test]
+    fn legacy_restore_with_the_item_marks_the_update_id_known() {
+        let mut nv = RamNvStorage::new();
+        write_legacy_record(&mut nv);
+        nv.write(NvItemId::NwkUpdateId, &[0x2A]).unwrap();
+
+        let mut device = new_device();
+        assert!(device.restore_state(&mut nv));
+        assert_eq!(device.bdb.zdo().nwk().nib().nwk_update_id(), Some(0x2A));
+
+        // Including a genuine, authoritative 0.
+        let mut nv = RamNvStorage::new();
+        write_legacy_record(&mut nv);
+        nv.write(NvItemId::NwkUpdateId, &[0]).unwrap();
+        let mut device = new_device();
+        assert!(device.restore_state(&mut nv));
+        assert_eq!(device.bdb.zdo().nwk().nib().nwk_update_id(), Some(0));
+    }
+
+    /// A malformed item is not authoritative either.
+    #[test]
+    fn legacy_restore_ignores_a_wrong_length_item() {
+        let mut nv = RamNvStorage::new();
+        write_legacy_record(&mut nv);
+        nv.write(NvItemId::NwkUpdateId, &[0x07, 0x08]).unwrap();
+
+        let mut device = new_device();
+        assert!(device.restore_state(&mut nv));
+        assert_eq!(device.bdb.zdo().nwk().nib().nwk_update_id(), None);
+    }
+
+    #[test]
+    fn saving_an_unknown_update_id_removes_the_item_instead_of_writing_zero() {
+        let mut nv = RamNvStorage::new();
+        // A stale item from a previous commissioning.
+        nv.write(NvItemId::NwkUpdateId, &[0x2A]).unwrap();
+
+        let device = new_device();
+        assert_eq!(device.bdb.zdo().nwk().nib().nwk_update_id(), None);
+        device.save_state(&mut nv);
+
+        assert!(
+            !nv.exists(NvItemId::NwkUpdateId).unwrap(),
+            "an unknown update state must not be persisted as a known value"
+        );
+    }
+
+    #[test]
+    fn saving_a_known_update_id_writes_the_item() {
+        let mut nv = RamNvStorage::new();
+        let mut device = new_device();
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .nib_mut()
+            .set_nwk_update_id(0x2A);
+        device.save_state(&mut nv);
+
+        let mut buf = [0u8; 4];
+        assert_eq!(nv.read(NvItemId::NwkUpdateId, &mut buf).unwrap(), 1);
+        assert_eq!(buf[0], 0x2A);
+    }
+
+    /// Save/reboot/restore round trip: an unknown state stays unknown across a
+    /// reboot, and cannot be promoted to a known `0`.
+    #[test]
+    fn an_unknown_update_id_survives_a_save_and_restore_cycle_as_unknown() {
+        let mut nv = RamNvStorage::new();
+        write_legacy_record(&mut nv);
+        nv.write(NvItemId::NwkUpdateId, &[0x2A]).unwrap();
+
+        let mut device = new_device();
+        assert!(device.restore_state(&mut nv));
+        assert_eq!(device.bdb.zdo().nwk().nib().nwk_update_id(), Some(0x2A));
+
+        // Something clears the update state (a leave, say) and the record is
+        // saved again.
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .nib_mut()
+            .clear_nwk_update_id();
+        write_legacy_record(&mut nv);
+        device.save_state(&mut nv);
+
+        let mut rebooted = new_device();
+        assert!(rebooted.restore_state(&mut nv));
+        assert_eq!(rebooted.bdb.zdo().nwk().nib().nwk_update_id(), None);
     }
 }

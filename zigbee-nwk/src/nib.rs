@@ -32,8 +32,27 @@ pub struct Nib {
     pub max_routers: u8,
     /// Maximum number of child end devices
     pub max_children: u8,
-    /// Network update ID
+    /// `nwkUpdateId` — the network's update state as this device knows it.
+    ///
+    /// Only meaningful while [`Self::update_id_valid`] is set. Read it through
+    /// [`Self::nwk_update_id`] rather than directly whenever the answer is
+    /// used to *reject* something: a factory-new device holds `0` here purely
+    /// as a placeholder, and `0` is a perfectly ordinary live update state.
     pub update_id: u8,
+    /// Whether [`Self::update_id`] is a known-good network update state.
+    ///
+    /// A factory-new device, and a device restored from a persistence record
+    /// that predates the `NwkUpdateId` item, hold no authoritative update
+    /// state at all. That is materially different from holding update state
+    /// `0`: the R22 §3.6.1.4.1 staleness comparison is only meaningful against
+    /// a known value, and treating an unknown state as `0` would reject every
+    /// beacon whose update ID is in `0x81..=0xFF` as "stale" and strand the
+    /// device off its own network.
+    ///
+    /// Set by network formation, successful association, successful rejoin,
+    /// a security-journal restore (which only ever describes commissioned
+    /// state), an explicit valid NV item, and an accepted `Mgmt_NWK_Update`.
+    pub update_id_valid: bool,
     /// NWK manager address (for frequency agility)
     pub nwk_manager_addr: ShortAddress,
 
@@ -155,6 +174,8 @@ impl Nib {
             max_routers: 5,
             max_children: 20,
             update_id: 0,
+            // Factory-new: no authoritative network update state is held.
+            update_id_valid: false,
             nwk_manager_addr: ShortAddress::COORDINATOR,
             ieee_address: [0u8; 8],
             parent_address: ShortAddress(0xFFFF),
@@ -221,6 +242,56 @@ impl Nib {
         self.outgoing_frame_counter = current;
         self.outgoing_frame_counter_limit = limit;
         true
+    }
+
+    // ── nwkUpdateId ─────────────────────────────────────────
+
+    /// The locally held `nwkUpdateId`, or `None` when it is not known-good.
+    ///
+    /// Every decision that *rejects* a peer for carrying an older update ID —
+    /// rejoin parent selection (R22 §3.6.1.4.1/§3.6.1.4.2) and
+    /// `Mgmt_NWK_Update` adoption — must go through this accessor, so an
+    /// unknown local state cannot masquerade as update state `0`.
+    pub const fn nwk_update_id(&self) -> Option<u8> {
+        if self.update_id_valid {
+            Some(self.update_id)
+        } else {
+            None
+        }
+    }
+
+    /// Adopt `update_id` as the authoritative network update state.
+    ///
+    /// Call only from a point that actually establishes the network's update
+    /// state: network formation, successful association, successful rejoin,
+    /// a security-journal restore, a valid explicit NV item, or an accepted
+    /// `Mgmt_NWK_Update`.
+    pub fn set_nwk_update_id(&mut self, update_id: u8) {
+        self.update_id = update_id;
+        self.update_id_valid = true;
+    }
+
+    /// Drop the locally held `nwkUpdateId` back to "unknown".
+    ///
+    /// Used on factory reset and on restore paths whose record carries no
+    /// update state. The stored byte is reset to `0` as well so a stale value
+    /// can never be observed through the raw field.
+    pub fn clear_nwk_update_id(&mut self) {
+        self.update_id = 0;
+        self.update_id_valid = false;
+    }
+
+    /// Install an optionally present persisted `nwkUpdateId`.
+    ///
+    /// `None` deliberately restores the *unknown* state rather than `0`: a
+    /// persistence record that predates the item says nothing about the
+    /// network's update state, and a reboot must not be able to promote that
+    /// silence into an authoritative `0`.
+    pub fn restore_nwk_update_id(&mut self, update_id: Option<u8>) {
+        match update_id {
+            Some(value) => self.set_nwk_update_id(value),
+            None => self.clear_nwk_update_id(),
+        }
     }
 
     // ── R22 End Device Timeout (client side) ────────────────

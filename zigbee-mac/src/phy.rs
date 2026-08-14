@@ -50,6 +50,11 @@ pub struct PhyCapabilities {
 pub struct PhyRxFrame {
     data: [u8; MAX_PHY_FRAME_LEN],
     len: u8,
+    /// IEEE 802.15.4 Link Quality Indicator, normalized to `0..=255` (larger
+    /// is better).
+    ///
+    /// Backends whose hardware reports a different scale must convert before
+    /// constructing this frame; see [`crate::lqi`].
     pub lqi: u8,
 }
 

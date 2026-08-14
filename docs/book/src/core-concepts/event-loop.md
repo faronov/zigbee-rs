@@ -440,8 +440,8 @@ threshold.
 **Persistence.** `parent_information`, `parent_information_valid` and
 `end_device_timeout` are stored in the durable security state (record version
 3), so a reboot resumes with the negotiated keepalive method instead of
-renegotiating. Note that **downgrading to firmware older than record version 3
-is unsupported** once a version 3 record has been written.
+renegotiating. Note that **downgrading to firmware older than the current
+record version (4) is unsupported** once such a record has been written.
 
 ## Complete Event Loop Example
 

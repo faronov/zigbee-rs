@@ -145,8 +145,10 @@ impl NeighborEntry {
 }
 
 /// Convert a received-frame LQI into the bounded Zigbee link cost used by
-/// route discovery.
-pub(crate) const fn link_cost_from_lqi(lqi: u8) -> u8 {
+/// route discovery and by parent selection (R22 §3.6.3.1).
+///
+/// The result is always in `1..=7`; `1` is the best link and `7` the worst.
+pub const fn link_cost_from_lqi(lqi: u8) -> u8 {
     match lqi {
         0..=50 => 7,
         51..=100 => 5,

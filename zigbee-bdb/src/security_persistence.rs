@@ -29,7 +29,14 @@ pub struct NetworkSecurityState {
     pub channel: u8,
     pub depth: u8,
     pub parent_address: u16,
+    /// `nwkUpdateId` as the NIB holds it, or `0` when it is not known-good.
     pub update_id: u8,
+    /// Whether [`Self::update_id`] is an authoritative network update state.
+    ///
+    /// Carried explicitly so persistence can never promote the placeholder of
+    /// an unknown state into a known `0` (see
+    /// [`Nib::nwk_update_id`](zigbee_nwk::nib::Nib::nwk_update_id)).
+    pub update_id_valid: bool,
     pub network_key: AesKey,
     pub key_sequence: u8,
     pub outgoing_frame_counter: u32,

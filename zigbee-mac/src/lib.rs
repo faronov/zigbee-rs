@@ -26,6 +26,7 @@
 extern crate alloc;
 
 pub mod frames;
+pub mod lqi;
 pub mod phy;
 pub mod pib;
 pub mod platform;

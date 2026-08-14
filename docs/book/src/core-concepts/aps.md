@@ -492,6 +492,29 @@ pub struct ApsLinkKeyEntry {
 Each entry pairs a partner's IEEE address with a 128-bit AES key and
 independent frame counters for replay protection.
 
+#### Replay windows belong to the key, not to the peer
+
+R22 §4.4.1 scopes APS security state to a *key-pair entry* — the
+(partner address, key type) pair — so a partner that holds both a Trust Center
+link key and an application link key owns **two** independent counter spaces.
+`ApsKeyOrigin` names that entry (or `PreconfiguredGlobal` for the well-known
+global key, which has no entry and therefore no committed counter):
+
+```rust
+pub enum ApsKeyOrigin {
+    KeyPair { partner: IeeeAddress, key_type: ApsKeyType },
+    PreconfiguredGlobal,
+}
+```
+
+An incoming secured frame does not name the entry that protected it — the key
+identifier only selects the data/key-transport/key-load derivation of *some*
+link key. The receive path therefore walks the candidate entries for the
+source (`ApsSecurity::key_pairs_for`, Trust Center key first), checks each
+candidate's own replay window *before* decrypting with it, and commits the
+counter to the entry whose MIC actually verified
+(`check_frame_counter_for` / `commit_frame_counter_for`).
+
 ### Key Management Primitives
 
 ```rust
@@ -621,8 +644,10 @@ When you send with `ack_request: true`, the APS layer:
 1. Registers the frame in the ACK table (up to 8 slots), stamping it with the
    monotonic time of the transmission
 2. Starts a retry counter (default: 3 retries)
-3. Retransmits the original frame once a full `apscAckWaitDuration` has
-   elapsed without an ACK, then waits another full window before the next retry
+3. Retransmits the frame once a full `apscAckWaitDuration` has
+   elapsed without an ACK, then waits another full window before the next
+   retry (an APS-secured frame is re-secured with a fresh frame counter — see
+   below)
 4. After all retries, reports `ApsStatus::NoAck`
 
 `apscAckWaitDuration` is the R22 constant `0.05 × 2 × nwkcMaxDepth` seconds; with
@@ -646,6 +671,25 @@ for retransmission in retransmissions.iter() {
         .await;
 }
 ```
+
+### Secured retries are re-encrypted, never replayed
+
+An APS-secured unicast is tracked in its **plaintext** form (APS header plus
+unencrypted payload) together with the `ApsKeyOrigin` it was secured under.
+`age_ack_table()` encrypts every retry again with the *next* frame counter of
+that key-pair entry.
+
+Re-sending the stored ciphertext would repeat the CCM* nonce, which R22
+§4.4.1.1 forbids, and any receiver that implements APS replay protection —
+including this stack — drops the repeat, so a secured unicast whose first copy
+was lost could never be acknowledged. The APS header is copied through
+unchanged, so the APS counter that the acknowledgement and the receiver's
+duplicate rejection are keyed on (R22 §2.2.5.1.1.5) is identical across the
+whole transaction.
+
+If the key-pair entry has been removed, or its durably reserved outgoing
+counter range is exhausted, the retry is **dropped** and the transaction
+released — it is never sent with a stale counter.
 
 ### Acknowledging received frames
 

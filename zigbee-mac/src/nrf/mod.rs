@@ -558,7 +558,10 @@ impl<'a, T: RadioInstance, R: RngInstance> NrfMac<'a, T, R> {
                 Ok(()) => {
                     consecutive_errors = 0;
                     let data = rx_pkt.as_ref();
-                    let Some(pd) = parse_beacon(channel, data, rx_pkt.lqi()) else {
+                    // `Packet::lqi()` is the raw Nordic ED byte; PanDescriptor
+                    // carries an IEEE 802.15.4 LQI. Normalize exactly once.
+                    let lqi = crate::lqi::nrf_from_hardware(rx_pkt.lqi());
+                    let Some(pd) = parse_beacon(channel, data, lqi) else {
                         continue;
                     };
                     // Descriptor slots are the scarce resource on a dense mesh.
@@ -1193,18 +1196,17 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
                 }
             }
 
-            log::info!(
-                "[nRF RX] Accepted frame {} bytes, LQI {}",
-                data.len(),
-                rx_pkt.lqi()
-            );
+            // `Packet::lqi()` is the raw Nordic ED byte; the indication and
+            // this log line must both report the IEEE 802.15.4 LQI.
+            let lqi = crate::lqi::nrf_from_hardware(rx_pkt.lqi());
+            log::info!("[nRF RX] Accepted frame {} bytes, LQI {}", data.len(), lqi);
 
             let payload_data = &data[header_len..];
             if let Some(mac_frame) = MacFrame::from_slice(payload_data) {
                 return Ok(McpsDataIndication {
                     src_address: src,
                     dst_address: dst,
-                    lqi: rx_pkt.lqi(),
+                    lqi,
                     payload: mac_frame,
                     security_use: (fc >> 3) & 1 != 0,
                 });

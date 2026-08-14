@@ -348,8 +348,39 @@ struct PendingApsAckEntry {
     /// monotonic clock by wrapping subtraction, so a `u32` microsecond counter
     /// rolling over (every ~71.6 min) is handled without any extra state.
     waiting_since_us: u32,
-    /// Original serialized frame bytes for retransmission
+    /// Frame bytes held for retransmission.
+    ///
+    /// For an unsecured frame these are the exact bytes that went out. For an
+    /// APS-secured frame they are the *plaintext* form — APS header followed
+    /// by the unencrypted payload — because every retry has to be secured
+    /// again with a fresh frame counter (see [`PendingApsSecurity`]).
     original_frame: heapless::Vec<u8, 128>,
+    /// APS security context of the original transmission, when it was secured.
+    security: Option<PendingApsSecurity>,
+}
+
+/// Everything needed to re-secure an APS retransmission.
+///
+/// R22 §4.4.1.1 derives the CCM* nonce from (source address, frame counter,
+/// security control) and requires a frame counter never to be reused with the
+/// same key. Re-sending the stored ciphertext therefore repeats a nonce, and
+/// any receiver that implements APS replay protection correctly (including
+/// this stack, see `ApsSecurity::check_frame_counter_for`) drops every retry —
+/// so a secured unicast that lost its first copy could never be acknowledged.
+/// Keeping the security context instead lets the retry be encrypted again with
+/// the next counter of the *same key-pair entry*, while the APS header — and
+/// with it the APS counter the acknowledgement and duplicate rejection are
+/// keyed on (R22 §2.2.5.1.1.5) — is byte-identical.
+#[derive(Debug, Clone, Copy)]
+struct PendingApsSecurity {
+    /// Key-pair entry (or preconfigured global key) that secured the frame.
+    origin: security::ApsKeyOrigin,
+    /// Local IEEE address that forms the CCM* nonce source address.
+    src_ieee: zigbee_types::IeeeAddress,
+    /// Security control byte of the original auxiliary header.
+    security_control: u8,
+    /// Length of the APS header prefix inside `original_frame`.
+    header_len: u8,
 }
 
 /// The APS layer — owns the NWK layer and all APS state.
@@ -500,6 +531,33 @@ impl<M: MacDriver> ApsLayer<M> {
         dst_addr: u16,
         frame_bytes: &[u8],
     ) -> Option<usize> {
+        self.register_ack_pending_inner(aps_counter, dst_addr, frame_bytes, None)
+    }
+
+    /// Register an APS-secured outbound frame for ACK tracking.
+    ///
+    /// `plaintext_frame` is the APS header followed by the *unencrypted*
+    /// payload; `security` records the key-pair entry, nonce source and
+    /// security-control byte the frame went out with, so
+    /// [`Self::age_ack_table`] can encrypt each retry again under a fresh
+    /// frame counter instead of replaying the original ciphertext.
+    pub(crate) fn register_secured_ack_pending(
+        &mut self,
+        aps_counter: u8,
+        dst_addr: u16,
+        plaintext_frame: &[u8],
+        security: PendingApsSecurity,
+    ) -> Option<usize> {
+        self.register_ack_pending_inner(aps_counter, dst_addr, plaintext_frame, Some(security))
+    }
+
+    fn register_ack_pending_inner(
+        &mut self,
+        aps_counter: u8,
+        dst_addr: u16,
+        frame_bytes: &[u8],
+        security: Option<PendingApsSecurity>,
+    ) -> Option<usize> {
         let now = self.nwk.mac().monotonic_micros();
         // Try to find an inactive slot to reuse
         for (i, entry) in self.ack_table.iter_mut().enumerate() {
@@ -512,6 +570,7 @@ impl<M: MacDriver> ApsLayer<M> {
                     retries: 3,
                     waiting_since_us: now,
                     original_frame: heapless::Vec::new(),
+                    security,
                 };
                 let _ = entry.original_frame.extend_from_slice(frame_bytes);
                 return Some(i);
@@ -527,6 +586,7 @@ impl<M: MacDriver> ApsLayer<M> {
             retries: 3,
             waiting_since_us: now,
             original_frame: heapless::Vec::new(),
+            security,
         };
         let _ = new_entry.original_frame.extend_from_slice(frame_bytes);
         if self.ack_table.push(new_entry).is_ok() {
@@ -568,6 +628,7 @@ impl<M: MacDriver> ApsLayer<M> {
             retries: 3,
             waiting_since_us: now,
             original_frame: heapless::Vec::new(),
+            security,
         };
         let _ = entry.original_frame.extend_from_slice(frame_bytes);
         Some(idx)
@@ -628,10 +689,20 @@ impl<M: MacDriver> ApsLayer<M> {
     /// re-sending it to a broadcast address would flood the network with a
     /// frame only one device is expecting, and the acknowledgement it is
     /// waiting for would still never arrive.
+    ///
+    /// An APS-secured frame is *re-secured*, never replayed: the retry is
+    /// encrypted again under the next frame counter of the key-pair entry that
+    /// secured the original (R22 §4.4.1.1 forbids reusing a counter, and a
+    /// receiver enforcing replay protection drops a repeated one). The APS
+    /// header — including the APS counter the acknowledgement is keyed on — is
+    /// unchanged, so the transaction semantics are identical. If that key-pair
+    /// entry is gone, or its durable counter reservation is exhausted, the
+    /// retry is dropped and the entry released rather than sent with stale
+    /// security.
     pub fn age_ack_table(&mut self) -> heapless::Vec<ApsRetransmission, APS_ACK_TABLE_SIZE> {
         let now = self.nwk.mac().monotonic_micros();
-        let mut retransmit = heapless::Vec::<ApsRetransmission, APS_ACK_TABLE_SIZE>::new();
-        for entry in self.ack_table.iter_mut() {
+        let mut due = heapless::Vec::<usize, APS_ACK_TABLE_SIZE>::new();
+        for (index, entry) in self.ack_table.iter_mut().enumerate() {
             if !entry.active {
                 continue;
             }
@@ -668,12 +739,41 @@ impl<M: MacDriver> ApsLayer<M> {
                         entry.dst_addr,
                         entry.retries,
                     );
+                    due.push(index)
+                        .expect("one due index per ACK table entry at most");
+                }
+            }
+        }
+
+        // Second pass: build the frames. Re-securing needs `&mut self`
+        // (a fresh outgoing frame counter and the MAC's AES backend), so it
+        // cannot run while the ACK table is borrowed above.
+        let mut retransmit = heapless::Vec::<ApsRetransmission, APS_ACK_TABLE_SIZE>::new();
+        for index in due {
+            let dst_addr = zigbee_types::ShortAddress(self.ack_table[index].dst_addr);
+            let Some(security) = self.ack_table[index].security else {
+                let frame = self.ack_table[index].original_frame.clone();
+                retransmit
+                    .push(ApsRetransmission { dst_addr, frame })
+                    .expect("retransmission capacity matches the ACK table");
+                continue;
+            };
+            let plaintext = self.ack_table[index].original_frame.clone();
+            match self.resecure_retransmission(&security, &plaintext) {
+                Some(frame) => {
                     retransmit
-                        .push(ApsRetransmission {
-                            dst_addr: zigbee_types::ShortAddress(entry.dst_addr),
-                            frame: entry.original_frame.clone(),
-                        })
+                        .push(ApsRetransmission { dst_addr, frame })
                         .expect("retransmission capacity matches the ACK table");
+                }
+                None => {
+                    log::error!(
+                        "[APS] Cannot re-secure retransmission counter={} dst=0x{:04X}; dropping",
+                        self.ack_table[index].aps_counter,
+                        self.ack_table[index].dst_addr,
+                    );
+                    let entry = &mut self.ack_table[index];
+                    entry.active = false;
+                    entry.original_frame.clear();
                 }
             }
         }

@@ -46,6 +46,15 @@
 //! cannot restart it below a used value. `restore_security_state` then reserves
 //! a further block from both floors before any secured frame is sent.
 //!
+//! `nwkUpdateId` is migrated with its validity: a legacy record that really
+//! holds the `NwkUpdateId` item keeps that value as authoritative, and one
+//! that does not migrates as *unknown* (journal record version 4, flags bit
+//! 7). An unknown update state is a representable, recoverable state — rejoin
+//! parent selection simply rejects nothing as stale until the network's update
+//! state is learned — so the network is still kept. Promoting the absent item
+//! into a known `0` would instead make every beacon advertising `0x81..=0xFF`
+//! look stale and strand the device off its own network.
+//!
 //! If the legacy record cannot be represented as a commissioned network — no
 //! stored IEEE address, or field values the new format rejects — the migration
 //! degrades explicitly to [`MigrationOutcome::MigratedCounters`]: the counter
@@ -301,7 +310,15 @@ fn decode_legacy<S: NvStorage>(
     let depth = read_item::<_, 1>(nv, NvItemId::NwkDepth)?.map_or(1, |b| b[0]);
     let parent_address =
         read_item::<_, 2>(nv, NvItemId::NwkParentAddress)?.map_or(0, u16::from_le_bytes);
-    let update_id = read_item::<_, 1>(nv, NvItemId::NwkUpdateId)?.map_or(0, |b| b[0]);
+    // A legacy image that never wrote this item knows nothing about the
+    // network's update state. Record version 4 can say so — flags bit 7 —
+    // so the migrated record keeps `update_id = 0, update_id_valid = false`
+    // instead of promoting the placeholder into an authoritative `0`, which
+    // would make every beacon advertising `0x81..=0xFF` look stale. The
+    // network itself is still migrated: an unknown update state is a
+    // representable, recoverable state, and the rejoin that follows
+    // establishes it from the parent's beacon.
+    let update_id = read_item::<_, 1>(nv, NvItemId::NwkUpdateId)?.map(|b| b[0]);
 
     let counter_floor = reserved_counter_floor(live_counter);
 
@@ -313,7 +330,8 @@ fn decode_legacy<S: NvStorage>(
     state.channel = channel;
     state.depth = depth;
     state.parent_address = parent_address;
-    state.update_id = update_id;
+    state.update_id = update_id.unwrap_or(0);
+    state.update_id_valid = update_id.is_some();
     state.network_key = network_key;
     state.key_sequence = key_sequence;
     // NWK security and the legacy image's default-global-key APS traffic share
@@ -524,6 +542,13 @@ mod tests {
     /// omitted to model a legacy record saved before the MAC address was
     /// known.
     fn legacy_image(fc: u32, ieee: Option<[u8; 8]>) -> MockFlash {
+        legacy_image_with(fc, ieee, Some(7))
+    }
+
+    /// Like [`legacy_image`], but the `NwkUpdateId` item can be omitted to
+    /// model a legacy record written before that item existed, or saved while
+    /// the update state was unknown.
+    fn legacy_image_with(fc: u32, ieee: Option<[u8; 8]>, update_id: Option<u8>) -> MockFlash {
         let mut flash = MockFlash::erased();
         {
             let mut nv =
@@ -540,7 +565,9 @@ mod tests {
             nv.write(NvItemId::NwkDepth, &[2]).unwrap();
             nv.write(NvItemId::NwkParentAddress, &0x0001u16.to_le_bytes())
                 .unwrap();
-            nv.write(NvItemId::NwkUpdateId, &[7]).unwrap();
+            if let Some(update_id) = update_id {
+                nv.write(NvItemId::NwkUpdateId, &[update_id]).unwrap();
+            }
             nv.write(NvItemId::NwkKey, &[0xCC; 16]).unwrap();
             nv.write(NvItemId::NwkKeySeqNum, &[3]).unwrap();
             nv.write(NvItemId::NwkFrameCounter, &fc.to_le_bytes())
@@ -580,6 +607,10 @@ mod tests {
         assert_eq!(state.depth, 2);
         assert_eq!(state.parent_address, 0x0001);
         assert_eq!(state.update_id, 7);
+        assert!(
+            state.update_id_valid,
+            "a legacy record that really holds the item migrates as authoritative"
+        );
         assert_eq!(state.network_key, [0xCC; 16]);
         assert_eq!(state.key_sequence, 3);
         assert!(!state.rejoin_pending);
@@ -590,6 +621,50 @@ mod tests {
         assert!(!state.tclk_present);
         assert_eq!(state.trust_center_address, [0; 8]);
         assert_eq!(state.trust_center_link_key, [0; 16]);
+    }
+
+    /// A legacy image that never wrote `NwkUpdateId` knows nothing about the
+    /// network's update state. Record version 4 can say so, so the network is
+    /// still migrated — an unknown update state is representable and the
+    /// rejoin that follows establishes it — while the placeholder is never
+    /// promoted into an authoritative `0`.
+    #[test]
+    fn a_legacy_record_without_the_update_id_item_migrates_with_unknown_update_state() {
+        let mut flash = legacy_image_with(0x2000, Some([0xBB; 8]), None);
+        assert_eq!(
+            migrate(&mut flash, SECTOR_A, SECTOR_B),
+            Ok(MigrationOutcome::MigratedNetwork),
+            "an unknown update state is recoverable; the network must be kept"
+        );
+
+        let state = loaded(flash).expect("migrated state present");
+        assert!(state.commissioned);
+        assert!(state.legacy_default_tclk);
+        assert_eq!(state.pan_id, 0x1234);
+        assert_eq!(state.network_key, [0xCC; 16]);
+        assert_eq!(
+            state.update_id, 0,
+            "an unknown update state carries no value"
+        );
+        assert!(
+            !state.update_id_valid,
+            "an absent legacy item must never migrate as an authoritative 0"
+        );
+    }
+
+    /// An authoritative `0` in the legacy region is a real update state and
+    /// must be distinguishable from the absent item above.
+    #[test]
+    fn a_legacy_update_id_of_zero_migrates_as_authoritative() {
+        let mut flash = legacy_image_with(0x2000, Some([0xBB; 8]), Some(0));
+        assert_eq!(
+            migrate(&mut flash, SECTOR_A, SECTOR_B),
+            Ok(MigrationOutcome::MigratedNetwork)
+        );
+
+        let state = loaded(flash).expect("migrated state present");
+        assert_eq!(state.update_id, 0);
+        assert!(state.update_id_valid);
     }
 
     #[test]

@@ -628,9 +628,83 @@ bdb.leave_and_rejoin().await?;
 
 The rejoin procedure:
 1. Scan the last-known channel for the previous network
-2. Attempt `NLME-JOIN` with Rejoin method (uses stored NWK key)
-3. Broadcast `Device_annce`
-4. If rejoin fails, fall back to full Network Steering
+2. Filter and rank the beacons with the R22 rejoin parent rules (see below) and
+   reject everything that is not a suitable parent
+3. Attempt `NLME-JOIN` with Rejoin method (uses stored NWK key), minimum-depth
+   candidate first, moving on to the next suitable parent on failure
+4. Broadcast `Device_annce`
+5. If rejoin fails, fall back to full Network Steering
+
+### Rejoin parent selection (R22 §3.6.1.4.2)
+
+§3.6.1.4.2 defines NWK rejoin as identical to association (§3.6.1.4.1) except
+that MAC association is replaced by the NWK Rejoin Request/Response exchange
+and that joining into a **closed** network is allowed.
+
+`NwkLayer::select_rejoin_parents` (built from
+`zigbee_nwk::nlme::RejoinParentCriteria`) both filters and orders the discovery
+result.
+
+**Base eligibility** — decidable from a single beacon
+(`RejoinParentCriteria::is_base_eligible`). All of the following must hold:
+
+- its extended PAN ID equals `nwkExtendedPANID`;
+- it advertises capacity **for the device type being requested**:
+  `router_capacity` when rejoining as a router, `end_device_capacity` when
+  rejoining as an end device. R22 requires capacity even though it drops the
+  permit-joining requirement;
+- its `nwkUpdateId` is equal to or newer than ours, compared as an **8-bit
+  serial number** so a network that wrapped `0xFF → 0x00` still counts as
+  fresher — a stale parent is rejected even if its signal is the strongest,
+  and the ambiguous half-window distance (128) is treated as stale in both
+  directions. This gate applies **only when our own `nwkUpdateId` is
+  known-good**: `RejoinParentCriteria::nwk_update_id` is an `Option<u8>` fed
+  from `Nib::nwk_update_id()`, and a device that holds no authoritative update
+  state (factory-new, or restored from a record that carries no update state)
+  rejects nothing as stale — see
+  [NWK → `nwkUpdateId` validity](nwk.md);
+- its link cost (derived from beacon LQI, R22 §3.6.3.1) is valid and at most
+  `MAX_PARENT_LINK_COST` (3). This is a hard gate, not a ranking penalty.
+
+**Suitability** — decidable only over the whole scan result. Among the
+base-eligible candidates, only those carrying the **single most recent**
+`nwkUpdateId` are suitable; base-eligible candidates advertising an older (but
+not stale) update id are dropped. "Most recent" is computed as the maximum
+wrap-aware distance ahead of our own `nwkUpdateId`, which is bounded by 127 for
+base-eligible candidates and is therefore deterministic across a wrap
+(`RejoinParentCriteria::most_recent_update_id`).
+
+With an **unknown** local update state there is no reference point, and
+serial-number comparison over an arbitrary set is not a total order. The most
+recent id is then the fixed point of a left-to-right, forward-only fold: the
+first base-eligible candidate in discovery order seeds the answer and a later
+one replaces it only when it is *strictly newer*, so older and ambiguous values
+never pull it back and discovery order breaks every tie. The selection is still
+narrowed to exactly one update id, and the rejoin that succeeds makes that id
+authoritative.
+
+**Ordering** of the suitable candidates:
+
+1. **minimum depth** — the only preference R22 states, and therefore the only
+   normative ranking rule;
+2. *implementation tie-break*: lower link cost at equal depth;
+3. *implementation tie-break*: the previous parent;
+4. *implementation tie-break*: discovery order (the sort is stable).
+
+Rules 2–4 are chosen purely to make the attempt order deterministic; the
+specification does not rank them.
+
+`NLME-JOIN` with the Rejoin method re-checks **base eligibility** only, so a
+hand-picked descriptor cannot bypass the per-candidate rules; such a candidate
+fails with `NwkStatus::InvalidRequest` before any frame is transmitted. It
+carries the same known-vs-unknown update-state semantics as whole-scan
+selection, because it is built from the same `RejoinParentCriteria`. The
+guard deliberately does not apply the most-recent-update-id rule: without the
+scan set it cannot know which update id was the most recent, and that filter
+stays with the policy layer (`select_rejoin_parents`).
+
+Permit-joining is deliberately *not* required: §3.6.1.4.2 allows rejoin into a
+closed network. It continues to apply to association-based Network Steering.
 
 ## Complete Example: End Device Commissioning
 
