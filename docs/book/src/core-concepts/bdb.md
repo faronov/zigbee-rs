@@ -7,6 +7,12 @@ used button sequences, others relied on proprietary apps.  BDB defines four
 universal methods so that any Zigbee 3.0 device can join any Zigbee 3.0
 network.
 
+> zigbee-rs uses **BDB 3.0.1 (`16-02828-012`) with Zigbee PRO R22** as
+> its production baseline. Touchlink remains experimental, is compiled out by
+> default, and is never advertised as an available commissioning method unless
+> the `zigbee-bdb/touchlink` feature and the application capability bit are
+> both enabled.
+
 ```text
 ┌──────────────────────────────────────┐
 │  Application                         │
@@ -47,8 +53,8 @@ let mode = CommissioningMode::STEERING;
 // Enable steering + finding & binding
 let mode = CommissioningMode::STEERING.or(CommissioningMode::FINDING_BINDING);
 
-// Enable everything
-let mode = CommissioningMode::ALL; // 0x0F
+// Request every compiled and device-supported method
+let mode = CommissioningMode::ALL; // 0x0F; still gated by capabilities
 
 // Check what's enabled
 if mode.contains(CommissioningMode::FORMATION) {
@@ -60,10 +66,10 @@ The four bits:
 
 | Constant | Value | Method |
 |---|---|---|
-| `CommissioningMode::TOUCHLINK` | `0x01` | Touchlink |
-| `CommissioningMode::STEERING` | `0x02` | Network Steering |
-| `CommissioningMode::FORMATION` | `0x04` | Network Formation |
-| `CommissioningMode::FINDING_BINDING` | `0x08` | Finding & Binding |
+| `CommissioningMode::STEERING` | `0x01` | Network Steering |
+| `CommissioningMode::FORMATION` | `0x02` | Network Formation |
+| `CommissioningMode::FINDING_BINDING` | `0x04` | Finding & Binding |
+| `CommissioningMode::TOUCHLINK` | `0x08` | Touchlink |
 | `CommissioningMode::ALL` | `0x0F` | All of the above |
 
 ## The `BdbLayer` Struct
@@ -153,13 +159,15 @@ capability mask automatically:
 
 | Device Type | Available Modes |
 |---|---|
-| **Coordinator** | Steering + Formation + Finding & Binding |
-| **Router** | Steering + Finding & Binding + Touchlink |
-| **End Device** | Steering + Finding & Binding + Touchlink |
+| **Coordinator** | Steering + Formation; optional Finding & Binding / Touchlink |
+| **Router** | Steering; optional Finding & Binding / Touchlink |
+| **End Device** | Steering; optional Finding & Binding / Touchlink |
 
 The requested mode is intersected with the capability mask to produce the
-*effective* commissioning mode.  If you request Formation on an End Device,
-it is silently skipped.
+*effective* commissioning mode. Finding & Binding must be enabled explicitly
+in `node_commissioning_capability`. Touchlink additionally requires the
+off-by-default Cargo feature. If you request Formation on an End Device, it is
+silently skipped.
 
 ## Initialization
 
@@ -364,15 +372,23 @@ devices that are currently in Identify mode (e.g., LED blinking after a button
 press).
 
 ```text
-1. Broadcast Identify Query to 0xFFFD
+1. Send a NWK-secured Identify Query:
+   • NWK destination 0xFFFF
+   • APS destination endpoint 0xFF
+   • actual initiator source endpoint and profile
 2. Collect responses for 180 seconds (bdbcMinCommissioningTime)
-3. For each responding target:
-   a. Send Active_EP_req to get endpoint list
-   b. Send Simple_Desc_req for each endpoint
+3. Deduplicate each responding (NWK address, endpoint)
+4. For each target:
+   a. In unicast mode, resolve its IEEE address from cache or IEEE_addr_req
+   b. Send an asynchronous Simple_Desc_req for the responding endpoint
    c. Match clusters:
       • Our output clusters ↔ their input clusters
       • Our input clusters ↔ their output clusters
-   d. Create local binding + send ZDP Bind_req to remote
+   d. If commissioning_group_id == 0xFFFF:
+      • create local unicast bindings to (IEEE address, endpoint)
+   e. Otherwise:
+      • create group bindings instead of unicast bindings
+      • send APS-acknowledged Groups Add Group to the target
 ```
 
 ```rust
@@ -398,7 +414,13 @@ The cluster matching algorithm:
   cluster (server → client).
 - Both endpoints must share the same profile ID (or one must be the wildcard
   `0xFFFF`).
-- If `commissioning_group_id` is not `0xFFFF`, group bindings are also created.
+- Unicast and group mode are mutually exclusive. Group mode does not require
+  the target's IEEE address.
+- IEEE and Simple Descriptor responses are handled by bounded, asynchronous
+  pending-response slots, so normal APS/ZDO/ZCL processing continues while
+  each five-second response window is open.
+- Bindings are created only in the initiator's local APS binding table; F&B
+  does not send a remote ZDP `Bind_req`.
 
 ### Target — The Device That Gets Bound To
 
@@ -413,8 +435,9 @@ This sets `fb_target_request` to `Some((endpoint, 180))`.  Your runtime reads
 this and writes the `IdentifyTime` attribute on the Identify cluster, which
 makes the device respond to Identify Query broadcasts.
 
-The target's normal APS/ZCL processing handles incoming `Simple_Desc_req`
-and `Bind_req` from the initiator automatically.
+The target's normal APS/ZCL processing handles the Identify Query and
+`Simple_Desc_req`. In group mode it also handles the Groups `Add Group`
+command.
 
 ## Touchlink
 
@@ -568,7 +591,7 @@ pub enum BdbCommissioningStatus {
 
 ## Factory Reset
 
-BDB provides a standardized factory reset procedure:
+BDB provides a full factory-new procedure:
 
 ```rust
 bdb.factory_reset().await?;
@@ -582,6 +605,13 @@ This performs:
 
 After factory reset, the device is in a "fresh out of box" state and must be
 commissioned again.
+
+This is distinct from the Basic cluster **Reset to Factory Defaults** command.
+That command produces `StackEvent::BasicResetToFactoryDefaults` and resets
+writable application-cluster attributes to their defaults while preserving
+network membership, NWK/APS keys, outgoing counter floors, groups, and
+bindings. Applications must not translate the Basic command into Leave or the
+full `bdb.factory_reset()` operation.
 
 ## Rejoin
 

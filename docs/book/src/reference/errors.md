@@ -306,10 +306,12 @@ Errors originating from ZDO internal processing.
 | `FormationFailure` | `0x05` | Network formation failed |
 | `SteeringFailure` | `0x06` | Network steering failed after all retries |
 | `NoIdentifyResponse` | `0x07` | No Identify Query response during Finding & Binding |
-| `BindingTableFull` | `0x08` | Binding table full or cluster matching failed |
+| `BindingTableFull` | `0x08` | Binding table full during Finding & Binding |
 | `TouchlinkFailure` | `0x09` | Touchlink commissioning failed or is not supported |
 | `TargetFailure` | `0x0A` | Target device is not in identifying mode |
 | `Timeout` | `0x0B` | The operation timed out |
+| `TrustCenterLinkKeyExchangeFailure` | `0x0C` | Trust Center link-key exchange failed |
+| `PersistenceFailure` | `0x0D` | Security state could not be durably persisted |
 
 ### `BdbCommissioningStatus`
 
@@ -323,15 +325,17 @@ one-shot return value.
 |---------|------|---------|
 | `Success` | `0x00` | Last commissioning attempt succeeded (default) |
 | `InProgress` | `0x01` | Commissioning is in progress |
-| `NoNetwork` | `0x02` | Device is not on a network |
-| `TlTargetFailure` | `0x03` | Touchlink target failure |
-| `TlNotAddressAssignment` | `0x04` | Touchlink address assignment failure |
-| `TlNoScanResponse` | `0x05` | Touchlink scan received no response |
-| `NotPermitted` | `0x06` | Operation not permitted for this device type |
-| `SteeringFormationFailure` | `0x07` | Network steering or formation failed |
-| `NoIdentifyQueryResponse` | `0x08` | Finding & Binding received no Identify response |
-| `BindingTableFull` | `0x09` | Binding table is full |
-| `NoScanResponse` | `0x0A` | No scan response received |
+| `NotAaCapable` | `0x02` | Device is not address-assignment capable |
+| `NoNetwork` | `0x03` | No suitable network was found |
+| `TargetFailure` | `0x04` | Touchlink target procedure failed |
+| `FormationFailure` | `0x05` | Network formation failed |
+| `NoIdentifyQueryResponse` | `0x06` | Finding & Binding received no Identify response |
+| `BindingTableFull` | `0x07` | Binding table is full |
+| `NoScanResponse` | `0x08` | No scan response received |
+| `NotPermitted` | `0x09` | Operation is not permitted |
+| `TcLinkKeyExchangeFailure` | `0x0A` | Trust Center link-key exchange failed |
+| `NotOnANetwork` | `0x0B` | Procedure required the node to be on a network |
+| `OnANetwork` | `0x0C` | Procedure required the node to be off-network |
 
 ---
 

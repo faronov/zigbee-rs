@@ -277,8 +277,8 @@ StackEvent::OtaDelayedActivation { delay_secs: u32 }
 ### Maintenance Events
 
 ```rust,ignore
-/// Coordinator requested a factory reset via Basic cluster.
-StackEvent::FactoryResetRequested
+/// Basic cluster Reset to Factory Defaults completed for application state.
+StackEvent::BasicResetToFactoryDefaults
 ```
 
 ## `UserAction` — What Your App Can Do
@@ -485,8 +485,9 @@ loop {
                     StackEvent::CommandReceived { cluster_id, command_id, .. } => {
                         log::info!("Command 0x{:02X} on cluster 0x{:04X}", command_id, cluster_id);
                     }
-                    StackEvent::FactoryResetRequested => {
-                        device.user_action(UserAction::FactoryReset);
+                    StackEvent::BasicResetToFactoryDefaults => {
+                        // Application attributes are reset by the runtime.
+                        // Network and security state remain intact.
                     }
                     _ => {}
                 }

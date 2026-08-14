@@ -397,7 +397,7 @@ Pre-configured `DeviceBuilder` shortcuts in `zigbee_runtime::templates`:
 | `OtaProgress { percent }` | OTA download progress |
 | `OtaComplete` / `OtaFailed` | OTA finished |
 | `OtaDelayedActivation { delay_secs }` | OTA activation delayed |
-| `FactoryResetRequested` | Factory reset requested |
+| `BasicResetToFactoryDefaults` | Basic cluster application attributes were reset; network/security state is preserved |
 
 ### `PowerManager`
 
