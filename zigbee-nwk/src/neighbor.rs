@@ -108,6 +108,24 @@ pub struct NeighborEntry {
     /// yields an unconfirmed restored child to whichever parent it actually
     /// keeps alive with, and defends a child it is actively parenting.
     pub keepalive_confirmed: bool,
+    /// This end-device child still has to be named in a R22 Parent Announce
+    /// (§2.4.3.1.12).
+    ///
+    /// Set for every end-device child when the `apsParentAnnounceTimer` first
+    /// expires after a reboot ("construct the message"; the spec explicitly
+    /// ignores Keepalive Received at that point), cleared as each child is
+    /// packed into a broadcast chunk. A keepalive received *after* that
+    /// construction also clears it, which is R22's "if the device must send
+    /// multiple Parent_annce messages but receives a keepalive from an end
+    /// device before it has sent the message, it shall not include that device
+    /// in the message".
+    ///
+    /// Keeping the pending set as one bit per neighbour avoids a second
+    /// 32×8-byte IEEE snapshot buffer in a router build, and gating it on the
+    /// `router` feature keeps an end-device neighbour table exactly the size
+    /// it was: only a parent ever sends a Parent Announce.
+    #[cfg(feature = "router")]
+    pub parent_annce_pending: bool,
     /// Extended PAN ID of neighbor's network
     pub extended_pan_id: IeeeAddress,
     /// Whether this entry is occupied
@@ -133,6 +151,8 @@ impl NeighborEntry {
             end_device_timeout: ED_TIMEOUT_ENUM_DEFAULT,
             keepalive_remaining_secs: 0,
             keepalive_confirmed: false,
+            #[cfg(feature = "router")]
+            parent_annce_pending: false,
             extended_pan_id: [0; 8],
             active: false,
         }

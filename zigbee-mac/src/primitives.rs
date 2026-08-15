@@ -255,6 +255,39 @@ pub struct MlmeAssociateResponseDelivery {
     pub result: Result<(), MacError>,
 }
 
+/// A coordinator/router received an Orphan Notification command.
+///
+/// The command carries no payload beyond the orphan's extended address, which
+/// is the only identity a parent may use to decide whether the device is its
+/// child (R22 §3.6.1.4.3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlmeOrphanIndication {
+    /// Extended address of the orphaned device.
+    pub orphan_address: IeeeAddress,
+    /// Broadcast destination carried by the notification.
+    pub destination_address: MacAddress,
+    pub lqi: u8,
+    /// Whether MAC security was enabled on the received command.
+    pub security_use: bool,
+}
+
+/// MLME-ORPHAN.response — a parent's answer to an orphan notification.
+///
+/// `associated_member == false` terminates the procedure without transmitting
+/// anything (R22 §3.6.1.4.3.2: "the procedure shall be terminated without
+/// indication to the higher layer"); it exists so a backend can distinguish an
+/// explicit "not my child" decision from a dropped event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlmeOrphanResponse {
+    /// Extended address of the orphaned device.
+    pub orphan_address: IeeeAddress,
+    /// Network address this parent already holds for the orphan; sent in the
+    /// Coordinator Realignment `Short Address` field.
+    pub short_address: ShortAddress,
+    /// Whether the orphan is a child of this device.
+    pub associated_member: bool,
+}
+
 /// MAC management/command event delivered independently of MCPS data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MacCommandEvent {
@@ -262,6 +295,7 @@ pub enum MacCommandEvent {
     AssociationRequest(MlmeAssociateIndication),
     AssociationResponseDelivery(MlmeAssociateResponseDelivery),
     DataRequest(MlmeDataRequestIndication),
+    OrphanNotification(MlmeOrphanIndication),
 }
 
 /// MLME-ASSOCIATE.response — coordinator's reply to association request

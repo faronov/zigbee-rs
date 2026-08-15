@@ -157,6 +157,9 @@ fn test_neighbor_table_add_and_find() {
         end_device_timeout: zigbee_nwk::frames::ED_TIMEOUT_ENUM_DEFAULT,
         keepalive_remaining_secs: 0,
         keepalive_confirmed: false,
+        // The `tests` crate always builds `zigbee-nwk` with `router`, so this
+        // router-only field is unconditionally present here.
+        parent_annce_pending: false,
         extended_pan_id: [0; 8],
         active: true,
     };
@@ -188,6 +191,9 @@ fn test_neighbor_table_aging() {
         end_device_timeout: zigbee_nwk::frames::ED_TIMEOUT_ENUM_DEFAULT,
         keepalive_remaining_secs: 0,
         keepalive_confirmed: false,
+        // The `tests` crate always builds `zigbee-nwk` with `router`, so this
+        // router-only field is unconditionally present here.
+        parent_annce_pending: false,
         extended_pan_id: [0; 8],
         active: true,
     };

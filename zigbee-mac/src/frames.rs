@@ -308,6 +308,185 @@ pub enum FrameBuildError {
     InvalidParameter,
 }
 
+// ── Orphan notification / coordinator realignment ───────────────
+
+/// IEEE 802.15.4 Orphan Notification MAC command identifier.
+pub const MAC_CMD_ORPHAN_NOTIFICATION: u8 = 0x06;
+/// IEEE 802.15.4 Coordinator Realignment MAC command identifier.
+pub const MAC_CMD_COORDINATOR_REALIGNMENT: u8 = 0x08;
+
+/// Build an Orphan Notification MAC command (IEEE 802.15.4 §7.3.6).
+///
+/// Broadcast on the orphan scan channel with both PAN IDs set to `0xFFFF`
+/// (so PAN ID compression is set), a short broadcast destination and the
+/// orphan's extended address as source. No ACK is requested — the parent
+/// answers with a Coordinator Realignment.
+pub fn build_orphan_notification(seq: u8, own_extended: &IeeeAddress) -> heapless::Vec<u8, 24> {
+    // Command (0b011), PAN ID compression (bit 6), dst short (0b10 << 10),
+    // src extended (0b11 << 14). No ACK request: the realignment is the reply.
+    let frame_control: u16 = 0x0003 | (1 << 6) | (0b10 << 10) | (0b11 << 14);
+    let mut frame = heapless::Vec::new();
+    let _ = frame.extend_from_slice(&frame_control.to_le_bytes());
+    let _ = frame.push(seq);
+    let _ = frame.extend_from_slice(&PanId::BROADCAST.0.to_le_bytes());
+    let _ = frame.extend_from_slice(&ShortAddress::BROADCAST.0.to_le_bytes());
+    let _ = frame.extend_from_slice(own_extended);
+    let _ = frame.push(MAC_CMD_ORPHAN_NOTIFICATION);
+    frame
+}
+
+/// Parse an Orphan Notification, returning the orphan's extended address.
+///
+/// Accepts only the normative framing: a MAC command frame with PAN ID
+/// compression, a broadcast short destination in the broadcast PAN and an
+/// extended source. Anything else (including a short-source "orphan", which
+/// would let an unidentifiable device solicit a realignment) is rejected.
+pub fn parse_orphan_notification(data: &[u8]) -> Option<IeeeAddress> {
+    if data.len() != 16 {
+        return None;
+    }
+    let frame_control = u16::from_le_bytes([*data.first()?, *data.get(1)?]);
+    if frame_control != 0xC843 {
+        return None;
+    }
+    let dst_pan = u16::from_le_bytes([*data.get(3)?, *data.get(4)?]);
+    let dst_addr = u16::from_le_bytes([*data.get(5)?, *data.get(6)?]);
+    if dst_pan != PanId::BROADCAST.0 || dst_addr != ShortAddress::BROADCAST.0 {
+        return None;
+    }
+    let mut orphan = [0u8; 8];
+    orphan.copy_from_slice(data.get(7..15)?);
+    if *data.get(15)? != MAC_CMD_ORPHAN_NOTIFICATION {
+        return None;
+    }
+    if orphan == [0u8; 8] || orphan == [0xFF; 8] {
+        return None;
+    }
+    Some(orphan)
+}
+
+/// Build a Coordinator Realignment MAC command sent in response to an Orphan
+/// Notification (IEEE 802.15.4 §7.3.8).
+///
+/// R22 Annex D requires the Frame Version field to be zero in a ZigBee
+/// coordinator realignment, which this framing satisfies.
+///
+/// Orphan-response framing: destination PAN `0xFFFF` with the orphan's
+/// extended address, source PAN `macPANId` with this device's extended
+/// address, ACK requested, no PAN ID compression. The `Short Address` field
+/// carries the address the parent already holds for the orphan, which is what
+/// re-attaches a restored child without a fresh association.
+pub fn build_coordinator_realignment_orphan_response(
+    seq: u8,
+    pan_id: PanId,
+    coordinator_short: ShortAddress,
+    coordinator_extended: &IeeeAddress,
+    channel: u8,
+    orphan_extended: &IeeeAddress,
+    orphan_short: ShortAddress,
+) -> Result<heapless::Vec<u8, 32>, FrameBuildError> {
+    if pan_id == PanId::BROADCAST
+        || *coordinator_extended == [0xFF; 8]
+        || *orphan_extended == [0xFF; 8]
+        || *orphan_extended == [0x00; 8]
+        || !(0x0001..=0xFFF7).contains(&orphan_short.0)
+        || coordinator_short.0 >= 0xFFF8
+        || orphan_short == coordinator_short
+        || !(11..=26).contains(&channel)
+    {
+        return Err(FrameBuildError::InvalidParameter);
+    }
+
+    // Command (0b011), ACK request (bit 5), extended dst (0b11 << 10),
+    // extended src (0b11 << 14). Frame version stays 0.
+    let frame_control: u16 = 0x0003 | (1 << 5) | (0b11 << 10) | (0b11 << 14);
+    let mut frame = heapless::Vec::new();
+    let mut put = |bytes: &[u8]| -> Result<(), FrameBuildError> {
+        frame
+            .extend_from_slice(bytes)
+            .map_err(|_| FrameBuildError::FrameTooLong)
+    };
+    put(&frame_control.to_le_bytes())?;
+    put(&[seq])?;
+    put(&PanId::BROADCAST.0.to_le_bytes())?;
+    put(orphan_extended)?;
+    put(&pan_id.0.to_le_bytes())?;
+    put(coordinator_extended)?;
+    put(&[MAC_CMD_COORDINATOR_REALIGNMENT])?;
+    put(&pan_id.0.to_le_bytes())?;
+    put(&coordinator_short.0.to_le_bytes())?;
+    put(&[channel])?;
+    put(&orphan_short.0.to_le_bytes())?;
+    Ok(frame)
+}
+
+/// A decoded Coordinator Realignment payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinatorRealignment {
+    pub pan_id: PanId,
+    pub coordinator_short: ShortAddress,
+    pub channel: u8,
+    /// Address assigned to the realigned device (`0xFFFF` in a broadcast
+    /// realignment, which does not re-address anyone).
+    pub short_address: ShortAddress,
+}
+
+/// Parse a Coordinator Realignment received as an orphan response.
+///
+/// Returns the realignment parameters together with the extended addresses of
+/// the responding coordinator/router and of the realigned device, so a caller
+/// can verify the frame was addressed to it before adopting the parameters.
+pub fn parse_coordinator_realignment_orphan_response(
+    data: &[u8],
+) -> Option<(CoordinatorRealignment, IeeeAddress, IeeeAddress)> {
+    if data.len() != 31 {
+        return None;
+    }
+    let frame_control = u16::from_le_bytes([*data.first()?, *data.get(1)?]);
+    if frame_control != 0xCC23 {
+        return None;
+    }
+    let destination_pan = u16::from_le_bytes([*data.get(3)?, *data.get(4)?]);
+    if destination_pan != PanId::BROADCAST.0 {
+        return None;
+    }
+    let mut destination = [0u8; 8];
+    destination.copy_from_slice(data.get(5..13)?);
+    let source_pan = u16::from_le_bytes([*data.get(13)?, *data.get(14)?]);
+    let mut source = [0u8; 8];
+    source.copy_from_slice(data.get(15..23)?);
+    if *data.get(23)? != MAC_CMD_COORDINATOR_REALIGNMENT {
+        return None;
+    }
+    let pan_id = PanId(u16::from_le_bytes([*data.get(24)?, *data.get(25)?]));
+    let coordinator_short = ShortAddress(u16::from_le_bytes([*data.get(26)?, *data.get(27)?]));
+    let channel = *data.get(28)?;
+    let short_address = ShortAddress(u16::from_le_bytes([*data.get(29)?, *data.get(30)?]));
+    if pan_id.0 != source_pan
+        || pan_id == PanId::BROADCAST
+        || source == [0u8; 8]
+        || source == [0xFF; 8]
+        || destination == [0u8; 8]
+        || destination == [0xFF; 8]
+        || coordinator_short.0 >= 0xFFF8
+        || !(0x0001..=0xFFF7).contains(&short_address.0)
+        || short_address == coordinator_short
+        || !(11..=26).contains(&channel)
+    {
+        return None;
+    }
+    Some((
+        CoordinatorRealignment {
+            pan_id,
+            coordinator_short,
+            channel,
+            short_address,
+        },
+        source,
+        destination,
+    ))
+}
+
 /// Build a data frame without an FCS. The radio backend appends the FCS.
 #[allow(clippy::too_many_arguments)]
 pub fn build_data_frame(
@@ -1024,6 +1203,215 @@ mod tests {
             on_air_source,
             ieee_address_as_be_word(&ieee).to_be_bytes(),
             "hardware filter must be programmed with the bytes we transmit"
+        );
+    }
+
+    // ── Orphan notification / coordinator realignment ───────────
+
+    const ORPHAN_IEEE: IeeeAddress = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    const PARENT_IEEE: IeeeAddress = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7];
+
+    #[test]
+    fn orphan_notification_matches_the_ieee_802_15_4_golden_frame() {
+        // IEEE 802.15.4 §7.3.6: FC = command | PAN ID compression | short dst
+        // | extended src = 0xC803, broadcast PAN and short destination, then
+        // the orphan's extended address and command id 0x06.
+        let frame = build_orphan_notification(0x5A, &ORPHAN_IEEE);
+        assert_eq!(
+            frame.as_slice(),
+            &[
+                0x43, 0xC8, // frame control (0xC843)
+                0x5A, // sequence number
+                0xFF, 0xFF, // destination PAN = 0xFFFF
+                0xFF, 0xFF, // destination address = 0xFFFF
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // source IEEE
+                0x06, // Orphan Notification
+            ]
+        );
+        assert_eq!(parse_orphan_notification(&frame), Some(ORPHAN_IEEE));
+    }
+
+    #[test]
+    fn orphan_notification_parser_rejects_non_normative_framing() {
+        let good = build_orphan_notification(1, &ORPHAN_IEEE);
+
+        // A short source cannot identify an orphan.
+        let mut short_source = good.clone();
+        short_source[1] = 0x88; // src mode 0b10
+        assert_eq!(parse_orphan_notification(&short_source), None);
+
+        // Unicast destination is not an orphan notification.
+        let mut unicast = good.clone();
+        unicast[5] = 0x34;
+        unicast[6] = 0x12;
+        assert_eq!(parse_orphan_notification(&unicast), None);
+
+        // Wrong command identifier.
+        let mut wrong_command = good.clone();
+        let last = wrong_command.len() - 1;
+        wrong_command[last] = 0x07;
+        assert_eq!(parse_orphan_notification(&wrong_command), None);
+
+        // Without PAN ID compression the addressing layout differs.
+        let mut no_compression = good.clone();
+        no_compression[0] = 0x03;
+        assert_eq!(parse_orphan_notification(&no_compression), None);
+
+        // A data frame is not a command frame, and a truncated frame is not a
+        // frame at all.
+        let mut data_frame = good.clone();
+        data_frame[0] = 0x01;
+        assert_eq!(parse_orphan_notification(&data_frame), None);
+        assert_eq!(parse_orphan_notification(&good[..good.len() - 1]), None);
+
+        // An all-zero / broadcast "orphan" identity is not a device.
+        let mut zero_orphan = good.clone();
+        zero_orphan[7..15].copy_from_slice(&[0u8; 8]);
+        assert_eq!(parse_orphan_notification(&zero_orphan), None);
+    }
+
+    #[test]
+    fn coordinator_realignment_matches_the_ieee_802_15_4_golden_frame() {
+        // IEEE 802.15.4 §7.3.8 orphan response: FC = command | ACK request |
+        // extended dst | extended src = 0xCC23 (frame version 0, as R22
+        // Annex D requires), destination PAN 0xFFFF with the orphan's IEEE,
+        // source PAN = macPANId with the parent's IEEE, then the payload.
+        let frame = build_coordinator_realignment_orphan_response(
+            0x7E,
+            PanId(0x1A62),
+            ShortAddress(0x0000),
+            &PARENT_IEEE,
+            15,
+            &ORPHAN_IEEE,
+            ShortAddress(0x89AB),
+        )
+        .unwrap();
+        assert_eq!(
+            frame.as_slice(),
+            &[
+                0x23, 0xCC, // frame control
+                0x7E, // sequence number
+                0xFF, 0xFF, // destination PAN = 0xFFFF
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // orphan IEEE
+                0x62, 0x1A, // source PAN = macPANId
+                0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, // parent IEEE
+                0x08, // Coordinator Realignment
+                0x62, 0x1A, // PAN identifier
+                0x00, 0x00, // coordinator short address
+                0x0F, // logical channel
+                0xAB, 0x89, // realigned device short address
+            ]
+        );
+        let frame_control = u16::from_le_bytes([frame[0], frame[1]]);
+        assert_eq!((frame_control >> 12) & 0x03, 0, "frame version must be 0");
+
+        let (realignment, source, destination) =
+            parse_coordinator_realignment_orphan_response(&frame).unwrap();
+        assert_eq!(realignment.pan_id, PanId(0x1A62));
+        assert_eq!(realignment.coordinator_short, ShortAddress(0x0000));
+        assert_eq!(realignment.channel, 15);
+        assert_eq!(realignment.short_address, ShortAddress(0x89AB));
+        assert_eq!(source, PARENT_IEEE);
+        assert_eq!(destination, ORPHAN_IEEE);
+    }
+
+    #[test]
+    fn coordinator_realignment_rejects_unusable_parameters() {
+        let build = |pan: PanId, coord: ShortAddress, channel: u8, short: ShortAddress| {
+            build_coordinator_realignment_orphan_response(
+                0,
+                pan,
+                coord,
+                &PARENT_IEEE,
+                channel,
+                &ORPHAN_IEEE,
+                short,
+            )
+        };
+        // Broadcast PAN is never a real network.
+        assert_eq!(
+            build(PanId::BROADCAST, ShortAddress(0), 15, ShortAddress(2)),
+            Err(FrameBuildError::InvalidParameter)
+        );
+        // A realigned device must get a usable unicast address.
+        for short in [0x0000u16, 0xFFFE, 0xFFFF] {
+            assert_eq!(
+                build(PanId(1), ShortAddress(0), 15, ShortAddress(short)),
+                Err(FrameBuildError::InvalidParameter)
+            );
+        }
+        // The parent may not hand the orphan its own address.
+        assert_eq!(
+            build(PanId(1), ShortAddress(0x1234), 15, ShortAddress(0x1234)),
+            Err(FrameBuildError::InvalidParameter)
+        );
+        // Channels outside the 2.4 GHz page-0 range are not operable.
+        for channel in [0u8, 10, 27] {
+            assert_eq!(
+                build(PanId(1), ShortAddress(0), channel, ShortAddress(2)),
+                Err(FrameBuildError::InvalidParameter)
+            );
+        }
+    }
+
+    #[test]
+    fn coordinator_realignment_parser_rejects_a_pan_id_mismatch() {
+        let mut frame = build_coordinator_realignment_orphan_response(
+            0,
+            PanId(0x1A62),
+            ShortAddress(0x0000),
+            &PARENT_IEEE,
+            15,
+            &ORPHAN_IEEE,
+            ShortAddress(0x89AB),
+        )
+        .unwrap();
+        // Payload PAN identifier no longer matches the MHR source PAN.
+        frame[24] = 0x63;
+        assert_eq!(parse_coordinator_realignment_orphan_response(&frame), None);
+    }
+
+    #[test]
+    fn orphan_and_realignment_parsers_reject_non_r22_frame_control_and_trailing_data() {
+        let orphan = build_orphan_notification(1, &ORPHAN_IEEE);
+        let mut secured_orphan = orphan.clone();
+        secured_orphan[0] |= 1 << 3;
+        assert_eq!(parse_orphan_notification(&secured_orphan), None);
+        let mut versioned_orphan = orphan.clone();
+        versioned_orphan[1] |= 1 << 4;
+        assert_eq!(parse_orphan_notification(&versioned_orphan), None);
+        let mut extended_orphan = orphan.clone();
+        extended_orphan.push(0).unwrap();
+        assert_eq!(parse_orphan_notification(&extended_orphan), None);
+
+        let realignment = build_coordinator_realignment_orphan_response(
+            0,
+            PanId(0x1A62),
+            ShortAddress(0),
+            &PARENT_IEEE,
+            15,
+            &ORPHAN_IEEE,
+            ShortAddress(0x89AB),
+        )
+        .unwrap();
+        let mut versioned_realignment = realignment.clone();
+        versioned_realignment[1] |= 1 << 4;
+        assert_eq!(
+            parse_coordinator_realignment_orphan_response(&versioned_realignment),
+            None
+        );
+        let mut wrong_destination_pan = realignment.clone();
+        wrong_destination_pan[3] = 0x34;
+        wrong_destination_pan[4] = 0x12;
+        assert_eq!(
+            parse_coordinator_realignment_orphan_response(&wrong_destination_pan),
+            None
+        );
+        let mut extended_realignment = realignment.clone();
+        extended_realignment.push(0).unwrap();
+        assert_eq!(
+            parse_coordinator_realignment_orphan_response(&extended_realignment),
+            None
         );
     }
 }

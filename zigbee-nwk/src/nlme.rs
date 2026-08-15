@@ -815,6 +815,8 @@ impl<M: MacDriver> NwkLayer<M> {
             end_device_timeout: crate::frames::ED_TIMEOUT_ENUM_DEFAULT,
             keepalive_remaining_secs: 0,
             keepalive_confirmed: false,
+            #[cfg(feature = "router")]
+            parent_annce_pending: false,
             extended_pan_id: network.extended_pan_id,
             active: true,
         };
@@ -1278,6 +1280,8 @@ impl<M: MacDriver> NwkLayer<M> {
                         end_device_timeout: crate::frames::ED_TIMEOUT_ENUM_DEFAULT,
                         keepalive_remaining_secs: 0,
                         keepalive_confirmed: false,
+                        #[cfg(feature = "router")]
+                        parent_annce_pending: false,
                         extended_pan_id: network.extended_pan_id,
                         active: true,
                     };

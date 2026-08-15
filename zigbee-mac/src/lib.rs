@@ -203,6 +203,21 @@ pub trait MacDriver: PlatformServices {
     /// any pending indirect frame.
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError>;
 
+    /// MLME-ORPHAN.response — answer an orphan notification from a child.
+    ///
+    /// A parent that recognises the orphan as its child transmits a
+    /// Coordinator Realignment carrying the PAN ID, this device's short
+    /// address, the operating channel and the network address the parent
+    /// already holds for the orphan (IEEE 802.15.4 §7.3.8, R22 §3.6.1.4.3.2).
+    /// With `associated_member == false` the primitive completes without
+    /// transmitting anything, as R22 requires.
+    ///
+    /// Backends that cannot act as a parent retain this unsupported default,
+    /// so the capability claim stays truthful.
+    async fn mlme_orphan_response(&mut self, _rsp: MlmeOrphanResponse) -> Result<(), MacError> {
+        Err(MacError::Unsupported)
+    }
+
     /// Poll the coordinator, discarding any response completed after the
     /// supplied timeout.
     async fn mlme_poll_timeout(&mut self, timeout_us: u32) -> Result<Option<MacFrame>, MacError> {
@@ -321,15 +336,17 @@ pub struct MacCapabilities {
 /// parent-side 802.15.4 operations required to accept and serve children.
 ///
 /// The base [`MacDriver`] trait keeps `mlme_beacon_response`,
-/// `set_indirect_data_pending`, `mcps_indirect_data`, `mac_command_event` and
-/// `mac_command_event_timeout` as `Unsupported`/`NoData` defaults so that an
+/// `set_indirect_data_pending`, `mcps_indirect_data`,
+/// `mac_command_event`, `mac_command_event_timeout` and
+/// `mlme_orphan_response` as `Unsupported`/`NoData` defaults so that an
 /// **end-device** backend needs to implement only [`MacDriver`]. Implementing
 /// `ParentMacDriver` is an explicit, *truthful* assertion that a backend
 /// overrides those parent primitives with real behavior:
 ///
 /// - on-demand beacon response to a Beacon Request,
 /// - association indication → response with ACK Frame Pending,
-/// - child Data Request events with indirect (frame-pending) delivery.
+/// - child Data Request events with indirect (frame-pending) delivery,
+/// - orphan notification indication → Coordinator Realignment response.
 ///
 /// A backend that only satisfies the [`MacDriver`] defaults (returning
 /// `Unsupported`/`NoData`) **must not** implement this trait, so a router role

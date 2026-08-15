@@ -7591,10 +7591,14 @@ mod tests {
             "a router child does not use the End Device Timeout deadline"
         );
 
+        // R22 §2.4.3.1.12 announces only Device Type == ZigBee End Device
+        // (0x02); the restored router child is deliberately excluded.
         let ieees: heapless::Vec<IeeeAddress, 8> = parent.authenticated_child_ieees();
-        assert_eq!(ieees.len(), 2);
-        assert!(ieees.contains(&ORIGIN_IEEE));
-        assert!(ieees.contains(&RESTORED_CHILD_IEEE));
+        assert_eq!(ieees.as_slice(), &[ORIGIN_IEEE]);
+        assert!(
+            !ieees.contains(&RESTORED_CHILD_IEEE),
+            "a router child is never named in a Parent Announce"
+        );
 
         // An end device never restores children or announces them.
         let mut end = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
@@ -7630,6 +7634,181 @@ mod tests {
         // An unrelated IEEE that we do not parent is neither kept nor dropped.
         let outcome = parent.apply_parent_annce(&[[0x99; 8]]);
         assert!(outcome.kept.is_empty() && outcome.dropped.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_parent_annce_never_touches_a_router_child() {
+        // R22 §2.4.4.2.22 processes only Device Type == ZigBee End Device
+        // (0x02). A router child that is announced by someone else must be
+        // neither defended nor evicted.
+        let mut parent = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        assert!(parent.restore_child(RESTORED_CHILD_IEEE, RESTORED_CHILD, true, true, true, 8));
+
+        let outcome = parent.apply_parent_annce(&[RESTORED_CHILD_IEEE]);
+        assert!(
+            outcome.kept.is_empty() && outcome.dropped.is_empty(),
+            "a router child is outside Parent Announce reconciliation"
+        );
+        assert!(
+            parent
+                .neighbor_table()
+                .find_by_short(RESTORED_CHILD)
+                .is_some(),
+            "an unconfirmed router child survives a Parent Announce"
+        );
+
+        // The same rule applies to the response path.
+        assert!(
+            parent
+                .remove_children_by_ieee(&[RESTORED_CHILD_IEEE])
+                .is_empty()
+        );
+        assert!(
+            parent
+                .neighbor_table()
+                .find_by_short(RESTORED_CHILD)
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn parent_annce_construction_marks_every_end_device_child_and_chunks_them() {
+        let mut parent = parent_with_sleepy_child();
+        assert!(parent.restore_child(RESTORED_CHILD_IEEE, RESTORED_CHILD, false, true, false, 8));
+        // A router child is never part of the announcement.
+        assert!(parent.restore_child([0x5A; 8], ShortAddress(0x0501), true, true, true, 8));
+
+        assert!(!parent.has_parent_annce_pending());
+        assert_eq!(
+            parent.mark_parent_annce_pending(),
+            2,
+            "both end-device children are marked; the router child is not"
+        );
+        assert!(parent.has_parent_annce_pending());
+
+        // One child per chunk: two chunks, then nothing left.
+        let first = parent.take_parent_annce_chunk::<1>();
+        assert_eq!(first.len(), 1);
+        assert!(parent.has_parent_annce_pending());
+        let second = parent.take_parent_annce_chunk::<1>();
+        assert_eq!(second.len(), 1);
+        assert!(!parent.has_parent_annce_pending());
+        assert!(parent.take_parent_annce_chunk::<4>().is_empty());
+
+        let announced = [first[0], second[0]];
+        assert!(announced.contains(&ORIGIN_IEEE));
+        assert!(announced.contains(&RESTORED_CHILD_IEEE));
+        assert!(!announced.contains(&[0x5A; 8]));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_keepalive_removes_a_child_from_a_not_yet_sent_parent_annce_message() {
+        // R22 §2.4.3.1.12: "If the device must send multiple Parent_annce
+        // messages but receives a keepalive from an end device before it has
+        // sent the Parent_Annce message, it shall not include that device in
+        // the message."
+        let mut parent = parent_with_sleepy_child();
+        assert!(parent.restore_child(RESTORED_CHILD_IEEE, RESTORED_CHILD, false, true, false, 8));
+        assert_eq!(parent.mark_parent_annce_pending(), 2);
+
+        // First message carries one child; the other is still outstanding.
+        let first = parent.take_parent_annce_chunk::<1>();
+        assert_eq!(first.len(), 1);
+        let remaining = if first[0] == ORIGIN_IEEE {
+            (RESTORED_CHILD, RESTORED_CHILD_IEEE)
+        } else {
+            (ORIGIN, ORIGIN_IEEE)
+        };
+
+        // A poll from the outstanding child arrives before the next message.
+        let _ = block_on(parent.service_child_data_request(MacAddress::Short(PAN, remaining.0)));
+
+        assert!(
+            !parent.has_parent_annce_pending(),
+            "a keepalive clears the outstanding announcement for that child"
+        );
+        let second = parent.take_parent_annce_chunk::<4>();
+        assert!(
+            !second.contains(&remaining.1),
+            "the child that kept alive is excluded from the additional message"
+        );
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_orphan_is_realigned_only_when_it_is_an_authenticated_child() {
+        let parent = parent_with_sleepy_child();
+        assert_eq!(parent.orphan_child_short(&ORIGIN_IEEE), Some(ORIGIN));
+
+        // A device we have never parented is not our child.
+        assert_eq!(parent.orphan_child_short(&[0x99; 8]), None);
+
+        // A provisionally admitted child has not proven network-key
+        // possession, so it must associate rather than be realigned.
+        let mut provisional = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        provisional
+            .handle_child_association(RESTORED_CHILD_IEEE, 0x80)
+            .ok();
+        provisional.nib_mut().permit_joining = true;
+        let assigned = provisional
+            .handle_child_association(RESTORED_CHILD_IEEE, 0x80)
+            .expect("provisional admission");
+        assert!(provisional.child_is_unauthenticated(assigned));
+        assert_eq!(provisional.orphan_child_short(&RESTORED_CHILD_IEEE), None);
+        assert!(provisional.authorize_child(assigned));
+        assert_eq!(
+            provisional.orphan_child_short(&RESTORED_CHILD_IEEE),
+            Some(assigned),
+            "an authorized child is realigned to the address we already hold"
+        );
+
+        // An end device has no children and never answers an orphan.
+        let end = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+        assert_eq!(end.orphan_child_short(&ORIGIN_IEEE), None);
+
+        // A router that is not joined cannot realign anyone onto its network.
+        let mut unjoined = parent_with_sleepy_child();
+        unjoined.set_joined(false);
+        assert_eq!(unjoined.orphan_child_short(&ORIGIN_IEEE), None);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn the_child_table_fingerprint_tracks_every_persisted_field() {
+        let mut parent = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        let empty = parent.child_table_fingerprint();
+        assert_eq!(empty, 0, "no children hashes to the empty-table value");
+
+        assert!(parent.restore_child(ORIGIN_IEEE, ORIGIN, false, true, false, 8));
+        let one = parent.child_table_fingerprint();
+        assert_ne!(one, empty, "an admission changes the fingerprint");
+        assert_eq!(
+            parent.child_table_fingerprint(),
+            one,
+            "an unchanged table keeps its fingerprint"
+        );
+
+        // A negotiated End Device Timeout is persisted, so it must move the
+        // fingerprint.
+        block_on(parent.respond_to_end_device_timeout_request(ORIGIN, ORIGIN_IEEE, 14)).unwrap();
+        let renegotiated = parent.child_table_fingerprint();
+        assert_ne!(renegotiated, one);
+
+        // A keepalive is *not* persisted, so it must not move it.
+        let _ = block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN)));
+        assert_eq!(parent.child_table_fingerprint(), renegotiated);
+
+        // Eviction returns to the empty-table fingerprint.
+        assert_eq!(parent.remove_children_by_ieee(&[ORIGIN_IEEE]).len(), 1);
+        assert_eq!(parent.child_table_fingerprint(), empty);
+
+        // A non-routing device has no child table to persist.
+        let end = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+        assert_eq!(end.child_table_fingerprint(), 0);
     }
 
     #[test]

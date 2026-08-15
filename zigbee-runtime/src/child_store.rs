@@ -21,18 +21,31 @@
 //! prove liveness rather than being evicted immediately after a reboot, and it
 //! avoids rewriting flash every time a countdown ticks.
 //!
+//! # Network binding
+//!
+//! Every record also stores the **extended PAN ID** the children belong to.
+//! A restore whose stored EPID does not match the network the device is
+//! currently on is rejected with [`ChildStoreError::ForeignNetwork`] rather
+//! than being applied, so a child table left over from a previous network
+//! (after a factory reset and rejoin, or after moving a device between
+//! networks) can never re-admit devices that are not this parent's children,
+//! and can never seed an orphan/realignment answer for a stranger.
+//!
 //! # Record versions and downgrade
 //!
-//! | version | encoded child table              |
-//! |---------|----------------------------------|
-//! | 1       | count + per-child identity/timeout |
+//! | version | encoded child table                                |
+//! |---------|----------------------------------------------------|
+//! | 1       | count + per-child identity/timeout (no EPID binding) |
+//! | 2       | extended PAN ID + count + per-child identity/timeout |
 //!
 //! A record whose version this firmware does not recognise is skipped while
 //! scanning, exactly like a corrupt one, so **downgrading** to firmware that
 //! predates a version simply drops the persisted child table: children then
 //! re-appear through normal association/rejoin and keepalive, and no security
 //! counter is affected because child state is independent of the security
-//! journal.
+//! journal. Version 1 is deliberately *not* accepted by this firmware: it
+//! carries no network binding, so it cannot be validated against the current
+//! network and is discarded rather than trusted.
 
 use embedded_storage::nor_flash::NorFlash;
 use zigbee_nwk::frames::{ED_TIMEOUT_ENUM_DEFAULT, ED_TIMEOUT_ENUM_MAX};
@@ -49,8 +62,9 @@ pub const MAX_PERSISTED_CHILDREN: usize = 32;
 /// timeout enumeration (1).
 const CHILD_ENTRY_LEN: usize = 12;
 
-/// Encoded size of the largest child table: a one-byte count plus entries.
-pub const MAX_ENCODED_CHILD_TABLE_LEN: usize = 1 + MAX_PERSISTED_CHILDREN * CHILD_ENTRY_LEN;
+/// Encoded size of the largest child table: the 8-byte extended PAN ID
+/// binding, a one-byte count, then the entries.
+pub const MAX_ENCODED_CHILD_TABLE_LEN: usize = 8 + 1 + MAX_PERSISTED_CHILDREN * CHILD_ENTRY_LEN;
 
 const CHILD_FLAG_RX_ON_WHEN_IDLE: u8 = 1 << 0;
 const CHILD_FLAG_SECURITY_CAPABLE: u8 = 1 << 1;
@@ -69,6 +83,9 @@ pub enum ChildStoreError {
     Hardware,
     /// The two-sector generation counter would wrap.
     GenerationExhausted,
+    /// The stored table belongs to a different network than the one this
+    /// device is currently commissioned on.
+    ForeignNetwork,
 }
 
 /// One authenticated child as persisted.
@@ -147,17 +164,33 @@ impl PersistentChild {
 }
 
 /// A crash-safe snapshot of a router/coordinator's authenticated child table.
+///
+/// The snapshot is bound to the extended PAN ID the children belong to. A
+/// restore validates that binding against the network the device is actually
+/// on, so a table from a previous network can never re-admit strangers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistentChildTable {
+    extended_pan_id: IeeeAddress,
     children: heapless::Vec<PersistentChild, MAX_PERSISTED_CHILDREN>,
 }
 
 impl PersistentChildTable {
-    /// An empty table (no children).
-    pub const fn new() -> Self {
+    /// An empty table (no children) bound to `extended_pan_id`.
+    pub const fn new(extended_pan_id: IeeeAddress) -> Self {
         Self {
+            extended_pan_id,
             children: heapless::Vec::new(),
         }
+    }
+
+    /// Extended PAN ID this table's children belong to.
+    pub const fn extended_pan_id(&self) -> IeeeAddress {
+        self.extended_pan_id
+    }
+
+    /// Whether this table describes children of `extended_pan_id`.
+    pub fn matches_network(&self, extended_pan_id: &IeeeAddress) -> bool {
+        self.extended_pan_id == *extended_pan_id
     }
 
     /// Append a child, failing once the table is full.
@@ -180,10 +213,19 @@ impl PersistentChildTable {
         self.children.iter()
     }
 
-    /// Validate the whole table: every child is structurally valid and no two
-    /// children share a short address or IEEE identity.
+    /// Validate the whole table: it names a real network, every child is
+    /// structurally valid, and no two children share a short address or IEEE
+    /// identity.
     pub fn validate(&self) -> Result<(), ChildStoreError> {
         if self.children.len() > MAX_PERSISTED_CHILDREN {
+            return Err(ChildStoreError::Corrupt);
+        }
+        // An all-zero or all-ones EPID is not a commissioned network, so a
+        // record carrying one could never be validated against a live NIB.
+        // Reject it as corrupt instead of storing an unusable binding.
+        if !self.children.is_empty()
+            && (self.extended_pan_id == [0u8; 8] || self.extended_pan_id == [0xFFu8; 8])
+        {
             return Err(ChildStoreError::Corrupt);
         }
         for (index, child) in self.children.iter().enumerate() {
@@ -201,11 +243,13 @@ impl PersistentChildTable {
 
     /// Encode into `out`, returning the used length.
     ///
-    /// Layout (version 1): `count` byte followed by `count` fixed-size child
-    /// records. The caller owns the version/CRC/commit framing.
+    /// Layout (version 2): extended PAN ID (8) then a `count` byte followed by
+    /// `count` fixed-size child records. The caller owns the version/CRC/commit
+    /// framing.
     pub fn encode(&self, out: &mut [u8; MAX_ENCODED_CHILD_TABLE_LEN]) -> usize {
-        out[0] = self.children.len() as u8;
-        let mut offset = 1;
+        out[0..8].copy_from_slice(&self.extended_pan_id);
+        out[8] = self.children.len() as u8;
+        let mut offset = 9;
         for child in &self.children {
             let mut entry = [0u8; CHILD_ENTRY_LEN];
             child.encode(&mut entry);
@@ -215,19 +259,21 @@ impl PersistentChildTable {
         offset
     }
 
-    /// Decode a version-1 encoded table, validating structure and length.
+    /// Decode a version-2 encoded table, validating structure and length.
     pub fn decode(bytes: &[u8]) -> Result<Self, ChildStoreError> {
-        let count = *bytes.first().ok_or(ChildStoreError::Corrupt)? as usize;
+        let mut extended_pan_id = [0u8; 8];
+        extended_pan_id.copy_from_slice(bytes.get(0..8).ok_or(ChildStoreError::Corrupt)?);
+        let count = *bytes.get(8).ok_or(ChildStoreError::Corrupt)? as usize;
         if count > MAX_PERSISTED_CHILDREN {
             return Err(ChildStoreError::Corrupt);
         }
-        let expected_len = 1 + count * CHILD_ENTRY_LEN;
+        let expected_len = 9 + count * CHILD_ENTRY_LEN;
         if bytes.len() != expected_len {
             return Err(ChildStoreError::Corrupt);
         }
-        let mut table = Self::new();
+        let mut table = Self::new(extended_pan_id);
         for index in 0..count {
-            let start = 1 + index * CHILD_ENTRY_LEN;
+            let start = 9 + index * CHILD_ENTRY_LEN;
             let mut entry = [0u8; CHILD_ENTRY_LEN];
             entry.copy_from_slice(&bytes[start..start + CHILD_ENTRY_LEN]);
             table.push(PersistentChild::decode(&entry)?)?;
@@ -238,8 +284,10 @@ impl PersistentChildTable {
 }
 
 impl Default for PersistentChildTable {
+    /// An empty, unbound table. Only useful as a placeholder — an empty table
+    /// carries no children, so its (zero) network binding is never applied.
     fn default() -> Self {
-        Self::new()
+        Self::new([0u8; 8])
     }
 }
 
@@ -295,7 +343,7 @@ pub const CHILD_JOURNAL_SLOTS_PER_SECTOR: usize =
     CHILD_JOURNAL_SECTOR_SIZE / CHILD_JOURNAL_SLOT_SIZE;
 
 const RECORD_MAGIC: [u8; 4] = *b"ZBCT";
-const RECORD_VERSION: u8 = 1;
+const RECORD_VERSION: u8 = 2;
 /// Encoded table starts here (magic 4 + version 1 + len 2 + reserved 1 +
 /// generation 4).
 const RECORD_ENCODED_OFFSET: usize = 12;
@@ -596,8 +644,11 @@ mod tests {
         }
     }
 
+    /// Extended PAN ID every test table is bound to.
+    const EPID: IeeeAddress = [0xAA, 0xBB, 0xCC, 0xDD, 0x01, 0x02, 0x03, 0x04];
+
     fn table(children: &[PersistentChild]) -> PersistentChildTable {
-        let mut table = PersistentChildTable::new();
+        let mut table = PersistentChildTable::new(EPID);
         for c in children {
             table.push(*c).unwrap();
         }
@@ -618,7 +669,7 @@ mod tests {
             let original = table(children);
             let mut encoded = [0u8; MAX_ENCODED_CHILD_TABLE_LEN];
             let len = original.encode(&mut encoded);
-            assert_eq!(len, 1 + children.len() * CHILD_ENTRY_LEN);
+            assert_eq!(len, 8 + 1 + children.len() * CHILD_ENTRY_LEN);
             assert_eq!(PersistentChildTable::decode(&encoded[..len]), Ok(original));
         }
     }
@@ -636,7 +687,7 @@ mod tests {
                 .iter()
                 .copied()
                 .enumerate()
-                .map(|(i, b)| if i == 12 { 15 } else { b })
+                .map(|(i, b)| if i == 20 { 15 } else { b })
                 .collect::<std::vec::Vec<_>>()
             ),
             Err(ChildStoreError::Corrupt),
@@ -646,8 +697,8 @@ mod tests {
         // Reserved short address 0x0000.
         let mut zero_short = [0u8; MAX_ENCODED_CHILD_TABLE_LEN];
         let len = table(&[child(1, 0x0002, 8)]).encode(&mut zero_short);
-        zero_short[9] = 0;
-        zero_short[10] = 0; // clear the short low/high bytes
+        zero_short[17] = 0;
+        zero_short[18] = 0; // clear the short low/high bytes
         assert_eq!(
             PersistentChildTable::decode(&zero_short[..len]),
             Err(ChildStoreError::Corrupt)

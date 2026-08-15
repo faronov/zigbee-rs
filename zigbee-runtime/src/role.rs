@@ -132,7 +132,8 @@ impl RoleState for EndDeviceState {
 /// `ZigbeeDevice` monomorphization:
 /// - the bounded queue of deferred Trust Center Update-Device notifications
 ///   awaiting an indirect Rejoin Response delivery, and
-/// - the flag that a R22 Parent Announce is due after a child table restore.
+/// - the fingerprint of the last child table committed to durable storage,
+///   which is what makes child-table persistence self-tracking.
 ///
 /// A non-parent role never allocates any of this because its
 /// [`DeviceRole::State`] is [`NonParentState`] (relay) or [`EndDeviceState`]
@@ -143,10 +144,16 @@ pub struct ParentState {
     /// Trust Center notifications deferred until an indirect Rejoin Response is
     /// actually transmitted and acknowledged.
     pub(crate) pending_child_updates: heapless::Vec<crate::PendingChildUpdate, 8>,
-    /// A R22 Parent Announce is due once a restored child table is
-    /// authoritative and the network is up. Set by `restore_child_table` and
-    /// drained by the joined tick.
-    pub(crate) parent_annce_due: bool,
+    /// Fingerprint of the authenticated child table as last committed to the
+    /// product's durable [`ChildTableStore`](crate::child_store::ChildTableStore),
+    /// and whether any snapshot has been committed at all this power cycle.
+    ///
+    /// Compared against
+    /// [`NwkLayer::child_table_fingerprint`](zigbee_nwk::NwkLayer::child_table_fingerprint)
+    /// so admissions, evictions, address changes and restores all mark the
+    /// table dirty without instrumenting each call site.
+    pub(crate) persisted_child_fingerprint: u32,
+    pub(crate) child_table_persisted: bool,
 }
 
 impl sealed::Sealed for ParentState {}
@@ -155,7 +162,8 @@ impl RoleState for ParentState {
     fn new() -> Self {
         ParentState {
             pending_child_updates: heapless::Vec::new(),
-            parent_annce_due: false,
+            persisted_child_fingerprint: 0,
+            child_table_persisted: false,
         }
     }
 }
@@ -592,7 +600,7 @@ impl DeviceRole for Router {
         #[cfg(feature = "router")]
         {
             device.run_parent_nwk_maintenance(elapsed_secs).await;
-            device.service_due_parent_annce().await;
+            device.service_due_parent_annce(elapsed_secs).await;
         }
         #[cfg(not(feature = "router"))]
         let _ = (device, elapsed_secs);

@@ -55,6 +55,7 @@ pub struct MockMac {
     tx_history: Vec<TxRecord, 16>,
     beacon_responses: Vec<MlmeBeaconResponse, 8>,
     association_responses: Vec<MlmeAssociateResponse, 8>,
+    orphan_responses: Vec<MlmeOrphanResponse, 8>,
     indirect_pending_history: Vec<(MacAddress, bool), 16>,
     rx_queue: Vec<McpsDataIndication, 8>,
     command_queue: Vec<MacCommandEvent, 8>,
@@ -114,6 +115,7 @@ impl MockMac {
             tx_history: Vec::new(),
             beacon_responses: Vec::new(),
             association_responses: Vec::new(),
+            orphan_responses: Vec::new(),
             indirect_pending_history: Vec::new(),
             rx_queue: Vec::new(),
             command_queue: Vec::new(),
@@ -205,6 +207,12 @@ impl MockMac {
 
     pub fn association_responses(&self) -> &[MlmeAssociateResponse] {
         &self.association_responses
+    }
+
+    /// Every MLME-ORPHAN.response this MAC was asked to emit, including the
+    /// "not my child" decisions that transmit nothing.
+    pub fn orphan_responses(&self) -> &[MlmeOrphanResponse] {
+        &self.orphan_responses
     }
 
     pub fn indirect_pending_history(&self) -> &[(MacAddress, bool)] {
@@ -330,6 +338,43 @@ impl MacDriver for MockMac {
         Ok(())
     }
 
+    async fn mlme_orphan_response(&mut self, rsp: MlmeOrphanResponse) -> Result<(), MacError> {
+        // Record the decision either way; only an associated member results in
+        // a Coordinator Realignment on the air.
+        let associated_member = rsp.associated_member;
+        let orphan_address = rsp.orphan_address;
+        let short_address = rsp.short_address;
+        self.orphan_responses
+            .push(rsp)
+            .map_err(|_| MacError::TransactionOverflow)?;
+        if !associated_member {
+            return Ok(());
+        }
+        let frame = crate::frames::build_coordinator_realignment_orphan_response(
+            self.dsn,
+            self.pan_id,
+            self.short_address,
+            &self.ieee_address,
+            self.channel,
+            &orphan_address,
+            short_address,
+        )
+        .map_err(|_| MacError::InvalidParameter)?;
+        self.dsn = self.dsn.wrapping_add(1);
+        let record = TxRecord {
+            dst: MacAddress::Extended(PanId::BROADCAST, orphan_address),
+            payload_len: frame.len(),
+            payload: MacFrame::from_slice(&frame).ok_or(MacError::FrameTooLong)?,
+            handle: 0,
+            ack_requested: true,
+            frame_pending: false,
+            indirect: false,
+        };
+        self.tx_history
+            .push(record)
+            .map_err(|_| MacError::TransactionOverflow)
+    }
+
     async fn mlme_beacon_response(&mut self, rsp: MlmeBeaconResponse) -> Result<(), MacError> {
         self.beacon_responses
             .push(rsp)
@@ -360,6 +405,7 @@ impl MacDriver for MockMac {
         self.tx_history.clear();
         self.beacon_responses.clear();
         self.association_responses.clear();
+        self.orphan_responses.clear();
         self.indirect_pending_history.clear();
         self.command_queue.clear();
         Ok(())
@@ -550,7 +596,7 @@ impl MacDriver for MockMac {
 }
 
 // The mock MAC overrides all parent-side primitives (beacon response,
-// association response, Frame Pending, indirect delivery and MAC command
-// events), so it can back a router/parent role in host tests.
+// association response, orphan response, Frame Pending, indirect delivery and
+// MAC command events), so it can back a router/parent role in host tests.
 impl crate::ParentMacDriver for MockMac {}
 impl crate::sealed::SealedParent for MockMac {}

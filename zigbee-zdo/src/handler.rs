@@ -180,11 +180,57 @@ impl<M: MacDriver> ZdoLayer<M> {
         }
 
         // --- R22 Parent Announce (router/coordinator child reconciliation) ---
+        #[cfg(feature = "router")]
         if cluster == crate::PARENT_ANNCE {
-            self.process_parent_annce(src_short, tsn, payload).await?;
+            let exact_destination = matches!(
+                (ind.dst_addr_mode, ind.dst_address),
+                (
+                    ApsAddressMode::Short,
+                    ApsAddress::Short(ShortAddress(crate::BROADCAST_ROUTERS))
+                )
+            );
+            let announcer = match ind.src_address {
+                ApsAddress::Short(source) if is_unicast_short(source) => source,
+                _ => return Ok(()),
+            };
+            if !exact_destination
+                || (self.nwk().nib().security_enabled && !ind.security_status)
+                || self
+                    .nwk()
+                    .neighbor_table()
+                    .find_by_short(announcer)
+                    .is_some_and(|entry| {
+                        entry.device_type == zigbee_nwk::neighbor::NeighborDeviceType::EndDevice
+                    })
+            {
+                log_zdp_exception(cluster, "non-normative or unauthenticated Parent_annce");
+                return Ok(());
+            }
+            self.process_parent_annce(announcer, tsn, payload).await?;
             return Ok(());
         }
+        #[cfg(feature = "router")]
         if cluster == crate::PARENT_ANNCE_RSP {
+            let responder = match ind.src_address {
+                ApsAddress::Short(source) if is_unicast_short(source) => source,
+                _ => return Ok(()),
+            };
+            if !self.indication_is_unicast(ind)
+                || (self.nwk().nib().security_enabled && !ind.security_status)
+                || self
+                    .nwk()
+                    .neighbor_table()
+                    .find_by_short(responder)
+                    .is_some_and(|entry| {
+                        entry.device_type == zigbee_nwk::neighbor::NeighborDeviceType::EndDevice
+                    })
+            {
+                log_zdp_exception(
+                    cluster,
+                    "non-unicast, unauthenticated or end-device Parent_annce_rsp",
+                );
+                return Ok(());
+            }
             self.process_parent_annce_rsp(tsn, payload);
             return Ok(());
         }
@@ -1214,6 +1260,16 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "router")]
+    fn router_broadcast(cluster: u16, payload: &[u8]) -> ApsdeDataIndication<'_> {
+        indication(
+            cluster,
+            ApsAddressMode::Short,
+            ApsAddress::Short(ShortAddress(crate::BROADCAST_ROUTERS)),
+            payload,
+        )
+    }
+
     /// Decode the ZDP cluster and payload of the last frame the MAC sent.
     fn last_zdp_tx(zdo: &ZdoLayer<MockMac>) -> Option<(u16, heapless::Vec<u8, 64>)> {
         let record = zdo.nwk().mac().tx_history().last()?;
@@ -1264,7 +1320,7 @@ mod tests {
         payload[1] = 1;
         payload[2..].copy_from_slice(&CHILD_IEEE);
 
-        block_on(zdo.handle_indication(&broadcast(crate::PARENT_ANNCE, &payload))).unwrap();
+        block_on(zdo.handle_indication(&router_broadcast(crate::PARENT_ANNCE, &payload))).unwrap();
 
         let (cluster, body) = last_zdp_tx(&zdo).expect("Parent_annce_rsp");
         assert_eq!(cluster, crate::PARENT_ANNCE_RSP);
@@ -1272,6 +1328,95 @@ mod tests {
         assert_eq!(body[1], ZdpStatus::Success as u8);
         assert_eq!(body[2], 1);
         assert_eq!(&body[3..], &CHILD_IEEE);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn parent_annce_requires_the_secured_all_routers_broadcast() {
+        let mut zdo = test_zdo_for(DeviceType::Router);
+        assert!(zdo.nwk_mut().restore_child(
+            CHILD_IEEE,
+            CHILD_SHORT,
+            false,
+            true,
+            false,
+            zigbee_nwk::frames::ED_TIMEOUT_ENUM_DEFAULT,
+        ));
+        zdo.nwk_mut().nib_mut().security_enabled = true;
+        let mut payload = [0u8; 10];
+        payload[0] = 0xA5;
+        payload[1] = 1;
+        payload[2..].copy_from_slice(&CHILD_IEEE);
+
+        let mut unsecured = router_broadcast(crate::PARENT_ANNCE, &payload);
+        unsecured.security_status = false;
+        block_on(zdo.handle_indication(&unsecured)).unwrap();
+        assert!(
+            zdo.nwk()
+                .neighbor_table()
+                .find_by_ieee(&CHILD_IEEE)
+                .is_some(),
+            "an unsecured frame cannot evict a restored child"
+        );
+
+        block_on(zdo.handle_indication(&broadcast(crate::PARENT_ANNCE, &payload))).unwrap();
+        assert!(
+            zdo.nwk()
+                .neighbor_table()
+                .find_by_ieee(&CHILD_IEEE)
+                .is_some(),
+            "0xFFFD is not the normative Parent_annce destination"
+        );
+
+        block_on(zdo.handle_indication(&unicast(crate::PARENT_ANNCE, &payload))).unwrap();
+        assert!(
+            zdo.nwk()
+                .neighbor_table()
+                .find_by_ieee(&CHILD_IEEE)
+                .is_some(),
+            "a unicast Parent_annce must be dropped"
+        );
+
+        block_on(zdo.handle_indication(&router_broadcast(crate::PARENT_ANNCE, &payload))).unwrap();
+        assert!(
+            zdo.nwk()
+                .neighbor_table()
+                .find_by_ieee(&CHILD_IEEE)
+                .is_none(),
+            "the normative secured broadcast still reconciles an unconfirmed child"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn parent_annce_rsp_requires_security_on_a_secured_network() {
+        let mut zdo = test_zdo_for(DeviceType::Router);
+        add_confirmed_child(&mut zdo, CHILD_SHORT, CHILD_IEEE);
+        block_on(zdo.send_parent_annce()).unwrap();
+        let (_, announcement) = last_zdp_tx(&zdo).expect("Parent_annce");
+        let tsn = announcement[0];
+        zdo.nwk_mut().nib_mut().security_enabled = true;
+
+        let response = parent_annce_rsp(tsn, ZdpStatus::Success as u8, CHILD_IEEE);
+        let mut unsecured = unicast(crate::PARENT_ANNCE_RSP, &response);
+        unsecured.security_status = false;
+        block_on(zdo.handle_indication(&unsecured)).unwrap();
+        assert!(
+            zdo.nwk()
+                .neighbor_table()
+                .find_by_ieee(&CHILD_IEEE)
+                .is_some(),
+            "an unsecured response cannot relinquish an active child"
+        );
+
+        block_on(zdo.handle_indication(&unicast(crate::PARENT_ANNCE_RSP, &response))).unwrap();
+        assert!(
+            zdo.nwk()
+                .neighbor_table()
+                .find_by_ieee(&CHILD_IEEE)
+                .is_none(),
+            "a secured correlated response still relinquishes the child"
+        );
     }
 
     #[test]

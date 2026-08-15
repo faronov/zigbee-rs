@@ -26,7 +26,7 @@ use crate::primitives::MlmeStartRequest;
 use crate::primitives::{
     AssociationStatus, MacCommandEvent, McpsDataIndication, MlmeAssociateIndication,
     MlmeAssociateResponse, MlmeAssociateResponseDelivery, MlmeBeaconRequestIndication,
-    MlmeDataRequestIndication, PanDescriptor, PanDescriptorList,
+    MlmeDataRequestIndication, MlmeOrphanIndication, PanDescriptor, PanDescriptorList,
 };
 #[cfg(any(target_arch = "tc32", test))]
 use zigbee_types::{IeeeAddress, MacAddress, PanId};
@@ -548,6 +548,9 @@ impl ParsedIncomingFrame {
             Self::Command(MacCommandEvent::DataRequest(indication)) => {
                 &indication.destination_address
             }
+            Self::Command(MacCommandEvent::OrphanNotification(indication)) => {
+                &indication.destination_address
+            }
         }
     }
 }
@@ -699,6 +702,26 @@ fn parse_incoming_frame(data: &[u8], lqi: u8) -> Option<ParsedIncomingFrame> {
                     security_use,
                 },
             )))
+        }
+        // Orphan Notification: broadcast short destination in the broadcast
+        // PAN, extended source, PAN ID compression, no ACK. Delegated to the
+        // shared strict parser so every backend accepts exactly one framing.
+        crate::frames::MAC_CMD_ORPHAN_NOTIFICATION
+            if data.len() == payload_offset + 1
+                && dst_mode == 2
+                && src_mode == 3
+                && pan_compress
+                && !ack_request =>
+        {
+            let orphan_address = crate::frames::parse_orphan_notification(data)?;
+            Some(ParsedIncomingFrame::Command(
+                MacCommandEvent::OrphanNotification(MlmeOrphanIndication {
+                    orphan_address,
+                    destination_address: destination,
+                    lqi,
+                    security_use,
+                }),
+            ))
         }
         _ => None,
     }
@@ -2121,6 +2144,36 @@ mod imp {
             }
         }
 
+        async fn mlme_orphan_response(
+            &mut self,
+            rsp: crate::primitives::MlmeOrphanResponse,
+        ) -> Result<(), MacError> {
+            // R22 §3.6.1.4.3.2: a device that is not our child terminates the
+            // procedure without any transmission.
+            if !rsp.associated_member {
+                return Ok(());
+            }
+            let sequence = self.next_dsn();
+            let frame = frames::build_coordinator_realignment_orphan_response(
+                sequence,
+                self.pan_id,
+                self.short_address,
+                &self.extended_address,
+                self.phy_channel,
+                &rsp.orphan_address,
+                rsp.short_address,
+            )
+            .map_err(|error| match error {
+                frames::FrameBuildError::FrameTooLong => MacError::FrameTooLong,
+                frames::FrameBuildError::InvalidParameter => MacError::InvalidParameter,
+            })?;
+            // The orphan has its receiver on for the duration of its orphan
+            // scan, so this is a direct transmission with the ACK the
+            // realignment framing requests.
+            self.transmit_with_ack(&frame, sequence, true, None)
+                .map(|_| ())
+        }
+
         async fn mlme_disassociate(
             &mut self,
             _req: MlmeDisassociateRequest,
@@ -2870,6 +2923,42 @@ mod tests {
                 security_use: false,
             })
         );
+    }
+
+    #[test]
+    fn parses_an_orphan_notification_into_a_parent_command_event() {
+        let orphan: IeeeAddress = [0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12];
+        let frame = crate::frames::build_orphan_notification(7, &orphan);
+        assert_eq!(
+            expect_command(&frame, 77),
+            MacCommandEvent::OrphanNotification(MlmeOrphanIndication {
+                orphan_address: orphan,
+                destination_address: MacAddress::Short(PanId::BROADCAST, ShortAddress::BROADCAST),
+                lqi: 77,
+                security_use: false,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_an_orphan_notification_with_a_non_normative_shape() {
+        let orphan: IeeeAddress = [0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12];
+        let good = crate::frames::build_orphan_notification(7, &orphan);
+
+        // An ACK request is not part of the orphan notification framing.
+        let mut acked = good.clone();
+        acked[0] |= 1 << 5;
+        assert!(parse_incoming_frame(&acked, 10).is_none());
+
+        // Trailing payload after the command identifier.
+        let mut trailing: heapless::Vec<u8, 24> = good.clone();
+        trailing.push(0xAA).unwrap();
+        assert!(parse_incoming_frame(&trailing, 10).is_none());
+
+        // A security-enabled command cannot be classified from a raw PSDU.
+        let mut secured = good.clone();
+        secured[0] |= 1 << 3;
+        assert!(parse_incoming_frame(&secured, 10).is_none());
     }
 
     #[test]

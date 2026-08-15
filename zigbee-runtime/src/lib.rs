@@ -105,7 +105,7 @@ use zigbee_bdb::BdbLayer;
 use zigbee_mac::pib::PibPayload;
 use zigbee_mac::{
     AssociationStatus, MacCommandEvent, MacDriver, MacError, McpsDataIndication,
-    MlmeAssociateResponse, MlmeBeaconResponse,
+    MlmeAssociateResponse, MlmeBeaconResponse, MlmeOrphanResponse,
 };
 // `CapabilityInfo` is only decoded on the parent-side Rejoin Request path,
 // which is compiled solely in `router` builds.
@@ -615,7 +615,7 @@ mod resume_tests {
         // A populated store is irrelevant to a sensor: it owns no child table
         // API to load it through, and its tick performs no parent maintenance.
         let mut store = crate::child_store::RamChildTableStore::new();
-        let mut table = crate::child_store::PersistentChildTable::new();
+        let mut table = crate::child_store::PersistentChildTable::new([0x0Au8; 8]);
         table
             .push(crate::child_store::PersistentChild {
                 ieee_address: [1; 8],
@@ -629,9 +629,9 @@ mod resume_tests {
         store.store(&table).unwrap();
         assert!(store.load().unwrap().is_some());
 
-        // The sensor owns no Parent Announce state at all — its role state is
-        // the zero-sized `NonParentState`, so there is no `parent_annce_due`
-        // field to inspect — and its tick transmits nothing.
+        // The sensor is not a parent: the Parent Announce and child-table
+        // persistence helpers are bounded on `ParentRole`, so it cannot even
+        // name them, and its tick transmits nothing.
         block_on(sensor.tick(1, &mut []));
         assert!(sensor.mac().tx_history().is_empty());
     }
@@ -3274,6 +3274,27 @@ pub struct EndDeviceTimeoutSnapshot {
 /// let _ = device.announce_parent();
 /// ```
 ///
+/// ```compile_fail
+/// use zigbee_runtime::ZigbeeDevice;
+/// use zigbee_runtime::child_store::RamChildTableStore;
+/// use zigbee_mac::mock::MockMac;
+///
+/// let mut device = ZigbeeDevice::builder(MockMac::new([0x11; 8])).build();
+/// let mut store = RamChildTableStore::new();
+/// // Durable child-table persistence is parent-only: a leaf device has no
+/// // children, so `save_child_table_if_dirty` does not exist on it.
+/// let _ = device.save_child_table_if_dirty(&mut store);
+/// ```
+///
+/// ```compile_fail
+/// use zigbee_runtime::ZigbeeDevice;
+/// use zigbee_mac::mock::MockMac;
+///
+/// let device = ZigbeeDevice::builder(MockMac::new([0x11; 8])).build();
+/// // So is the dirty query that drives it.
+/// let _ = device.child_table_dirty();
+/// ```
+///
 /// Symmetrically, the R22 End Device Timeout **client** API is bounded on
 /// [`EndDeviceRole`](crate::role::EndDeviceRole), so a router-typed device
 /// cannot name it — the following does not compile (rather than being a
@@ -3388,15 +3409,33 @@ impl<M: MacDriver, R: crate::role::ParentRole> ZigbeeDevice<M, R> {
             .await
     }
 
-    /// Broadcast a R22 Parent Announce for this router/coordinator's children.
+    /// Schedule the R22 Parent Announce for this router/coordinator's
+    /// end-device children.
     ///
-    /// Explicit runtime hook. A router product calls it after
-    /// [`restore_child_table`](Self::restore_child_table) (and after the
-    /// network is up) so any former parent of a child that has since moved
-    /// prunes its stale entry. Also fired automatically by the joined tick once
-    /// after a child table is restored. Only available on a parent role, so a
-    /// leaf device cannot emit it.
-    pub async fn announce_parent(&mut self) -> Result<(), zigbee_zdo::ZdoError> {
+    /// Starts `apsParentAnnounceTimer` (10 s + 0..=10 s jitter, R22
+    /// §2.4.3.1.12). The child list is built when that timer expires, and the
+    /// joined tick performs the broadcast; a table larger than one frame arms a
+    /// fresh jittered timer before each additional message. Fired automatically
+    /// by [`restore_child_table`](Self::restore_child_table), so a product
+    /// normally does not call this — it exists for a product that rebuilds its
+    /// child table by some other means.
+    ///
+    /// Only available on a parent role, so a leaf device cannot emit it.
+    pub fn announce_parent(&mut self) {
+        // `apsParentAnnounceTimer` lives in the ZDO layer's `router` build; a
+        // non-routing build has no child table to announce, so this is a
+        // structural no-op there rather than a link error.
+        #[cfg(feature = "router")]
+        self.bdb.zdo_mut().schedule_parent_annce();
+    }
+
+    /// Broadcast the Parent Announce immediately, bypassing
+    /// `apsParentAnnounceTimer`.
+    ///
+    /// The jittered [`announce_parent`](Self::announce_parent) is the normative
+    /// path; this is the un-jittered escape hatch for lab binaries and
+    /// deterministic tests. Only available on a parent role.
+    pub async fn announce_parent_now(&mut self) -> Result<(), zigbee_zdo::ZdoError> {
         self.send_parent_annce_inner().await
     }
 
@@ -3415,10 +3454,34 @@ impl<M: MacDriver, R: crate::role::ParentRole> ZigbeeDevice<M, R> {
     /// Only available on a parent role — a leaf device has no children to
     /// persist.
     pub fn save_child_table<S: child_store::ChildTableStore>(
-        &self,
+        &mut self,
         store: &mut S,
     ) -> Result<(), child_store::ChildStoreError> {
-        self.save_child_table_inner(store)
+        self.save_child_table_inner(store)?;
+        self.mark_child_table_persisted();
+        Ok(())
+    }
+
+    /// Replace the durable child table with an empty snapshot.
+    ///
+    /// A product must call this before recommissioning after Leave or factory
+    /// reset. Extended-PAN-ID binding alone cannot distinguish two separate
+    /// memberships in the same network, so retaining the old snapshot could
+    /// re-admit former children and answer their orphan notifications with
+    /// stale short addresses.
+    pub fn clear_persisted_child_table<S: child_store::ChildTableStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<(), child_store::ChildStoreError> {
+        #[cfg(feature = "router")]
+        self.bdb.zdo_mut().cancel_parent_annce();
+        self.bdb.zdo_mut().nwk_mut().clear_child_table();
+        store.store(&child_store::PersistentChildTable::default())?;
+        let state = R::parent_state_mut(&mut self.role_state);
+        state.pending_child_updates.clear();
+        state.persisted_child_fingerprint = 0;
+        state.child_table_persisted = true;
+        Ok(())
     }
 
     /// Restore the authenticated child table from durable persistence.
@@ -3430,6 +3493,49 @@ impl<M: MacDriver, R: crate::role::ParentRole> ZigbeeDevice<M, R> {
     ) -> Result<usize, child_store::ChildStoreError> {
         self.restore_child_table_inner(store)
     }
+
+    /// Whether the live child table differs from the last snapshot committed
+    /// to durable storage.
+    ///
+    /// Mirrors [`state_dirty`](Self::state_dirty) for the child table: a
+    /// product checks it after `tick`/`process_incoming` and calls
+    /// [`save_child_table_if_dirty`](Self::save_child_table_if_dirty). It
+    /// becomes true on any change to the persisted fields — admission,
+    /// authorization, rejoin with a new short address, End Device Timeout
+    /// aging, leave, Parent Announce reconciliation or a restore — because it
+    /// compares a fingerprint of the whole table rather than relying on each
+    /// mutation site remembering to flag itself.
+    pub fn child_table_dirty(&self) -> bool {
+        let state = R::parent_state(&self.role_state);
+        !state.child_table_persisted
+            || state.persisted_child_fingerprint != self.bdb.zdo().nwk().child_table_fingerprint()
+    }
+
+    /// Persist the child table only when it actually changed.
+    ///
+    /// Returns `Ok(true)` when a snapshot was written, `Ok(false)` when the
+    /// stored table was already current. This is the call a router product
+    /// puts in its event loop: flash is only written on a real child lifecycle
+    /// transition, never on every tick.
+    pub fn save_child_table_if_dirty<S: child_store::ChildTableStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<bool, child_store::ChildStoreError> {
+        if !self.child_table_dirty() {
+            return Ok(false);
+        }
+        self.save_child_table_inner(store)?;
+        self.mark_child_table_persisted();
+        Ok(true)
+    }
+
+    /// Record that the live child table is now the committed snapshot.
+    fn mark_child_table_persisted(&mut self) {
+        let fingerprint = self.bdb.zdo().nwk().child_table_fingerprint();
+        let state = R::parent_state_mut(&mut self.role_state);
+        state.persisted_child_fingerprint = fingerprint;
+        state.child_table_persisted = true;
+    }
 }
 
 /// Test-only accessors for the parent runtime state, so parent tests reach the
@@ -3438,14 +3544,19 @@ impl<M: MacDriver, R: crate::role::ParentRole> ZigbeeDevice<M, R> {
 /// field (which no longer exists on a leaf/relay device).
 #[cfg(all(test, feature = "router"))]
 impl<M: MacDriver, R: crate::role::ParentRole> ZigbeeDevice<M, R> {
-    /// Whether a R22 Parent Announce is currently marked due.
+    /// Whether a R22 Parent Announce is currently scheduled
+    /// (`apsParentAnnounceTimer` running).
     fn parent_annce_due(&self) -> bool {
-        R::parent_state(&self.role_state).parent_annce_due
+        self.bdb.zdo().parent_annce_timer_secs() != 0
     }
 
-    /// Force the Parent Announce due flag (mirrors a post-restore state).
+    /// Schedule / cancel the Parent Announce (mirrors a post-restore state).
     fn set_parent_annce_due(&mut self, due: bool) {
-        R::parent_state_mut(&mut self.role_state).parent_annce_due = due;
+        if due {
+            self.bdb.zdo_mut().schedule_parent_annce();
+        } else {
+            self.bdb.zdo_mut().cancel_parent_annce();
+        }
     }
 
     /// Number of queued deferred Trust Center Update-Device notifications.
@@ -4304,7 +4415,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     ) -> Result<(), child_store::ChildStoreError> {
         use zigbee_nwk::neighbor::{NeighborDeviceType, Relationship};
 
-        let mut table = child_store::PersistentChildTable::new();
+        // The snapshot is bound to the network these children belong to, so a
+        // later restore can reject a table left over from a previous network.
+        let mut table =
+            child_store::PersistentChildTable::new(self.bdb.zdo().nwk().nib().extended_pan_id);
         for entry in self.bdb.zdo().nwk().neighbor_table().iter() {
             if entry.relationship != Relationship::Child {
                 continue;
@@ -4356,6 +4470,16 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         if !self.bdb.zdo().nwk().can_route() {
             return Ok(0);
         }
+        // A persisted table only describes children of the network it was
+        // taken on. Restoring it onto a different (or not yet known) network
+        // would install neighbours that are not this device's children, and
+        // could then answer an orphan notification for a stranger, so a
+        // mismatch is an explicit error rather than a silent partial restore.
+        let extended_pan_id = self.bdb.zdo().nwk().nib().extended_pan_id;
+        if !table.is_empty() && !table.matches_network(&extended_pan_id) {
+            log::warn!("[Runtime] Persisted child table belongs to another network — discarded");
+            return Err(child_store::ChildStoreError::ForeignNetwork);
+        }
         let mut restored = 0;
         let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
         for child in table.children() {
@@ -4370,49 +4494,62 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 restored += 1;
             }
         }
-        // Restored child state is now authoritative, so a R22 Parent Announce
-        // is due once the network is up. This is tied to the product's
-        // explicit restore call rather than invented automatically.
-        if restored > 0 {
-            R::parent_state_mut(&mut self.role_state).parent_annce_due = true;
-        }
+        // R22 §2.4.3.1.12 generating conditions: the device has rebooted and
+        // is a joined, authenticated router/coordinator. Schedule the jittered
+        // `apsParentAnnounceTimer` rather than announcing now; the child list
+        // is built when it expires, so a child that (re)joins during the delay
+        // is announced too. Scheduled even when nothing was restored, because
+        // an empty constructed message is discarded at expiry anyway and a
+        // child re-admitted meanwhile must still be reconciled.
+        #[cfg(feature = "router")]
+        self.bdb.zdo_mut().schedule_parent_annce();
+        // What is now live is exactly what is stored, so the table is not
+        // dirty until something changes it.
+        self.mark_child_table_persisted();
         log::info!("[Runtime] Restored {restored} children from durable child table");
         Ok(restored)
     }
 
-    /// Broadcast a R22 Parent Announce for this router/coordinator's children.
+    /// Broadcast a R22 Parent Announce for this router/coordinator's
+    /// end-device children immediately, bypassing `apsParentAnnounceTimer`.
     ///
-    /// Private implementation of the Parent Announce transmit. Bounded on
-    /// [`ParentRole`](crate::role::ParentRole) since it clears the parent-only
-    /// due flag; the event loop's due-announce servicing reaches it through the
-    /// static role dispatch, so a leaf device never links it.
+    /// Private implementation of the un-jittered transmit. Bounded on
+    /// [`ParentRole`](crate::role::ParentRole), so a leaf device never links
+    /// it.
     async fn send_parent_annce_inner(&mut self) -> Result<(), zigbee_zdo::ZdoError>
     where
         R: crate::role::ParentRole,
     {
-        R::parent_state_mut(&mut self.role_state).parent_annce_due = false;
+        #[cfg(feature = "router")]
+        self.bdb.zdo_mut().cancel_parent_annce();
         self.bdb.zdo_mut().send_parent_annce().await
     }
 
-    /// Send a due Parent Announce once the restored child table is
-    /// authoritative and the network is up. Dispatched from the joined tick
-    /// only for a [`Router`](crate::role::Router) role (see
+    /// Age `apsParentAnnounceTimer` and broadcast one message when it expires.
+    ///
+    /// Dispatched from the joined tick only for a
+    /// [`Router`](crate::role::Router) role (see
     /// [`DeviceRole::run_role_nwk_maintenance`](crate::role::DeviceRole::run_role_nwk_maintenance)),
     /// so a non-parent role never links the Parent Announce transmit code.
+    ///
+    /// The timer only advances once the network is actually up, so the R22
+    /// "joined and authenticated" precondition holds at expiry rather than the
+    /// announcement firing into a network this device has not rejoined yet.
     #[cfg(feature = "router")]
-    pub(crate) async fn service_due_parent_annce(&mut self)
+    pub(crate) async fn service_due_parent_annce(&mut self, elapsed_secs: u16)
     where
         R: crate::role::ParentRole,
     {
-        if !R::parent_state(&self.role_state).parent_annce_due {
-            return;
-        }
         if !self.is_joined() || !self.bdb.zdo().nwk().can_route() {
             return;
         }
-        if let Err(error) = self.send_parent_annce_inner().await {
-            // Keep the flag set so a later tick retries once the path is up.
-            R::parent_state_mut(&mut self.role_state).parent_annce_due = true;
+        if !self.bdb.zdo_mut().tick_parent_annce_timer(elapsed_secs) {
+            return;
+        }
+        if let Err(error) = self.bdb.zdo_mut().send_due_parent_annce().await {
+            // Re-arm so a later tick retries once the path is up; the pending
+            // per-child flags are untouched by a failed transmit.
+            self.bdb.zdo_mut().schedule_parent_annce();
             log::warn!("[Runtime] Parent_annce send failed: {:?}", error);
         }
     }
@@ -5588,6 +5725,37 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     self.complete_pending_child_update(child).await?;
                 }
                 Ok(())
+            }
+            MacCommandEvent::OrphanNotification(indication) => {
+                // R22 §3.6.1.4.3.2 parent procedure. The NWK layer decides
+                // whether the orphan is genuinely one of this device's
+                // authenticated children; if it is not, the primitive is still
+                // issued with `associated_member = false` so a backend can
+                // observe the explicit "not my child" decision, and it
+                // transmits nothing.
+                let short_address = self
+                    .bdb
+                    .zdo()
+                    .nwk()
+                    .orphan_child_short(&indication.orphan_address);
+                let response = MlmeOrphanResponse {
+                    orphan_address: indication.orphan_address,
+                    short_address: short_address.unwrap_or(ShortAddress(0xFFFF)),
+                    associated_member: short_address.is_some(),
+                };
+                if let Some(short_address) = short_address {
+                    log::info!(
+                        "[Runtime] Orphan 0x{:04X} is our child — realigning",
+                        short_address.0
+                    );
+                }
+                self.bdb
+                    .zdo_mut()
+                    .aps_mut()
+                    .nwk_mut()
+                    .mac_mut()
+                    .mlme_orphan_response(response)
+                    .await
             }
         }
     }
@@ -6966,9 +7134,9 @@ mod parent_router_tests {
     use zigbee_mac::frames::parse_zigbee_beacon;
     use zigbee_mac::mock::MockMac;
     use zigbee_mac::{
-        AssociationStatus, CapabilityInfo, MacCommandEvent, MacError, MacFrame, McpsDataIndication,
-        MlmeAssociateIndication, MlmeAssociateResponseDelivery, MlmeBeaconRequestIndication,
-        MlmeDataRequestIndication,
+        AssociationStatus, CapabilityInfo, MacCommandEvent, MacDriver, MacError, MacFrame,
+        McpsDataIndication, MlmeAssociateIndication, MlmeAssociateResponseDelivery,
+        MlmeBeaconRequestIndication, MlmeDataRequestIndication,
     };
     use zigbee_nwk::DeviceType;
     use zigbee_types::{IeeeAddress, MacAddress, PanId, ShortAddress};
@@ -7014,6 +7182,29 @@ mod parent_router_tests {
 
     fn centralized_router() -> ZigbeeDevice<MockMac, Router> {
         let mut device = router();
+        // A joined router's MAC PIB carries macPANId / macShortAddress /
+        // phyCurrentChannel (start/resume writes them). The parent-side MAC
+        // primitives that must name the network — the Coordinator Realignment
+        // in particular — read them from the PIB, so the test router mirrors
+        // the resumed state instead of only setting the NIB.
+        {
+            let mac = device.mac_mut();
+            block_on(mac.mlme_set(
+                zigbee_mac::PibAttribute::MacPanId,
+                zigbee_mac::PibValue::PanId(PAN),
+            ))
+            .unwrap();
+            block_on(mac.mlme_set(
+                zigbee_mac::PibAttribute::MacShortAddress,
+                zigbee_mac::PibValue::ShortAddress(ROUTER),
+            ))
+            .unwrap();
+            block_on(mac.mlme_set(
+                zigbee_mac::PibAttribute::PhyCurrentChannel,
+                zigbee_mac::PibValue::U8(15),
+            ))
+            .unwrap();
+        }
         let aps = device.bdb_mut().zdo_mut().aps_mut();
         aps.aib_mut().aps_trust_center_address = TC_IEEE;
         let nwk = aps.nwk_mut();
@@ -7068,9 +7259,10 @@ mod parent_router_tests {
             nib.permit_joining_duration = 1;
         }
         relay.mac_mut().enqueue_command_event(beacon_request());
-        // A relay's role state is the zero-sized `NonParentState`: it has no
-        // `parent_annce_due` field at all, so the type system already forbids a
-        // relay from ever queuing (or servicing) a Parent Announce.
+        // A relay's role state is the zero-sized `NonParentState`, and the
+        // Parent Announce schedule/transmit helpers are bounded on
+        // `ParentRole`, so the type system already forbids a relay from ever
+        // scheduling (or servicing) a Parent Announce.
         relay.mac_mut().clear_tx_history();
 
         let mut clusters: [ClusterRef<'_>; 0] = [];
@@ -7112,6 +7304,15 @@ mod parent_router_tests {
             security_capable: true,
             allocate_address: true,
         }
+    }
+
+    fn orphan_notification(orphan: IeeeAddress) -> MacCommandEvent {
+        MacCommandEvent::OrphanNotification(zigbee_mac::MlmeOrphanIndication {
+            orphan_address: orphan,
+            destination_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+            lqi: 160,
+            security_use: false,
+        })
     }
 
     fn data_request(source_address: MacAddress) -> MacCommandEvent {
@@ -7833,6 +8034,289 @@ mod parent_router_tests {
         );
     }
 
+    /// The whole R22 restored-parent path in one place: a router reboots,
+    /// restores its persisted child table, and only then can answer an orphan
+    /// notification from that child with a Coordinator Realignment.
+    #[test]
+    fn a_restored_child_is_realigned_after_an_orphan_notification() {
+        let mut device = centralized_router();
+        const CHILD: ShortAddress = ShortAddress(0x89AB);
+        authenticated_sleepy_child(&mut device, CHILD);
+
+        let mut store = crate::child_store::RamChildTableStore::new();
+        device.save_child_table(&mut store).unwrap();
+
+        // Fresh power cycle: nothing is known until the table is restored.
+        let mut rebooted = centralized_router();
+        rebooted
+            .mac_mut()
+            .enqueue_command_event(orphan_notification(CHILD_IEEE));
+        block_on(rebooted.service_parent_commands());
+        assert_eq!(
+            rebooted.mac().orphan_responses().len(),
+            1,
+            "the orphan procedure runs, but"
+        );
+        assert!(
+            !rebooted.mac().orphan_responses()[0].associated_member,
+            "an unknown device is not our child, so no realignment is sent"
+        );
+        assert!(
+            rebooted.mac().tx_history().is_empty(),
+            "R22 terminates the procedure without transmitting"
+        );
+
+        // Restore, then the same notification is answered with a realignment
+        // naming the address this parent already holds for the child.
+        assert_eq!(rebooted.restore_child_table(&mut store).unwrap(), 1);
+        rebooted.mac_mut().clear_tx_history();
+        rebooted
+            .mac_mut()
+            .enqueue_command_event(orphan_notification(CHILD_IEEE));
+        block_on(rebooted.service_parent_commands());
+
+        let responses = rebooted.mac().orphan_responses();
+        let response = responses.last().unwrap();
+        assert!(response.associated_member);
+        assert_eq!(response.orphan_address, CHILD_IEEE);
+        assert_eq!(response.short_address, CHILD);
+
+        let tx = rebooted.mac().tx_history();
+        assert_eq!(tx.len(), 1, "exactly one Coordinator Realignment");
+        let (realignment, source, destination) =
+            zigbee_mac::frames::parse_coordinator_realignment_orphan_response(
+                tx[0].payload.as_slice(),
+            )
+            .expect("a well-formed coordinator realignment");
+        assert_eq!(destination, CHILD_IEEE);
+        assert_eq!(source, ROUTER_IEEE);
+        assert_eq!(realignment.pan_id, PAN);
+        assert_eq!(realignment.coordinator_short, ROUTER);
+        assert_eq!(
+            realignment.short_address, CHILD,
+            "the child keeps the address the parent persisted for it"
+        );
+        assert!(tx[0].ack_requested, "an orphan response requests an ACK");
+    }
+
+    #[test]
+    fn an_orphan_that_is_not_our_child_is_never_realigned() {
+        let mut device = centralized_router();
+        const CHILD: ShortAddress = ShortAddress(0x89AB);
+        authenticated_sleepy_child(&mut device, CHILD);
+        device.mac_mut().clear_tx_history();
+
+        device
+            .mac_mut()
+            .enqueue_command_event(orphan_notification([0x77; 8]));
+        block_on(device.service_parent_commands());
+
+        assert!(!device.mac().orphan_responses()[0].associated_member);
+        assert!(
+            device.mac().tx_history().is_empty(),
+            "a stranger must not be handed an address on our network"
+        );
+    }
+
+    #[test]
+    fn a_child_table_from_another_network_is_rejected_rather_than_restored() {
+        let mut device = centralized_router();
+        const CHILD: ShortAddress = ShortAddress(0x89AB);
+        authenticated_sleepy_child(&mut device, CHILD);
+        let mut store = crate::child_store::RamChildTableStore::new();
+        device.save_child_table(&mut store).unwrap();
+
+        // The same firmware, now commissioned onto a different network.
+        let mut rejoined = centralized_router();
+        rejoined
+            .bdb_mut()
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .nib_mut()
+            .extended_pan_id = [0x5C; 8];
+
+        assert_eq!(
+            rejoined.restore_child_table(&mut store),
+            Err(crate::child_store::ChildStoreError::ForeignNetwork)
+        );
+        assert!(
+            rejoined
+                .bdb()
+                .zdo()
+                .nwk()
+                .known_child_by_ieee(&CHILD_IEEE)
+                .is_none(),
+            "no stale child is admitted from a foreign network record"
+        );
+
+        // And therefore it still cannot answer an orphan notification.
+        rejoined
+            .mac_mut()
+            .enqueue_command_event(orphan_notification(CHILD_IEEE));
+        block_on(rejoined.service_parent_commands());
+        assert!(!rejoined.mac().orphan_responses()[0].associated_member);
+    }
+
+    #[test]
+    fn a_corrupt_child_table_record_is_surfaced_and_admits_nothing() {
+        // A journal slot whose CRC no longer covers its contents is skipped by
+        // the scan, so the store reports "nothing persisted" rather than
+        // handing back a half-decoded table.
+        let mut device = centralized_router();
+        const CHILD: ShortAddress = ShortAddress(0x89AB);
+        authenticated_sleepy_child(&mut device, CHILD);
+
+        let mut store = crate::child_store::RamChildTableStore::new();
+        device.save_child_table(&mut store).unwrap();
+
+        // Structurally impossible table: two children on one short address.
+        let mut corrupt = crate::child_store::PersistentChildTable::new([0xA5; 8]);
+        for ieee in [[0x01u8; 8], [0x02u8; 8]] {
+            corrupt
+                .push(crate::child_store::PersistentChild {
+                    ieee_address: ieee,
+                    short_address: CHILD.0,
+                    rx_on_when_idle: false,
+                    security_capable: true,
+                    is_router: false,
+                    end_device_timeout: 8,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            corrupt.validate(),
+            Err(crate::child_store::ChildStoreError::Corrupt),
+            "a duplicate short address can never describe a real child table"
+        );
+
+        let mut rebooted = centralized_router();
+        assert_eq!(
+            rebooted.restore_child_table(&mut crate::child_store::RamChildTableStore::new()),
+            Ok(0),
+            "an empty store is not an error, it is simply no children"
+        );
+        assert!(
+            rebooted
+                .bdb()
+                .zdo()
+                .nwk()
+                .known_child_by_ieee(&CHILD_IEEE)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_child_table_is_persisted_on_lifecycle_transitions_only() {
+        use crate::child_store::ChildTableStore;
+
+        let mut device = centralized_router();
+        let mut store = crate::child_store::RamChildTableStore::new();
+
+        // Nothing committed yet, so the empty table is still "dirty".
+        assert!(device.child_table_dirty());
+        assert!(device.save_child_table_if_dirty(&mut store).unwrap());
+        assert!(!device.child_table_dirty());
+        assert!(
+            !device.save_child_table_if_dirty(&mut store).unwrap(),
+            "an unchanged table writes no flash"
+        );
+
+        // Admission + authorization is a lifecycle transition.
+        const CHILD: ShortAddress = ShortAddress(0x89AB);
+        authenticated_sleepy_child(&mut device, CHILD);
+        assert!(device.child_table_dirty());
+        assert!(device.save_child_table_if_dirty(&mut store).unwrap());
+        assert_eq!(store.load().unwrap().unwrap().len(), 1);
+
+        // A keepalive poll is not persisted state.
+        device
+            .mac_mut()
+            .enqueue_command_event(data_request(MacAddress::Short(PAN, CHILD)));
+        block_on(device.service_parent_commands());
+        assert!(
+            !device.child_table_dirty(),
+            "a keepalive changes no persisted field"
+        );
+
+        // A negotiated End Device Timeout is persisted state.
+        block_on(
+            device
+                .bdb_mut()
+                .zdo_mut()
+                .aps_mut()
+                .nwk_mut()
+                .respond_to_end_device_timeout_request(CHILD, CHILD_IEEE, 0),
+        )
+        .unwrap();
+        assert!(device.child_table_dirty());
+        assert!(device.save_child_table_if_dirty(&mut store).unwrap());
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .unwrap()
+                .children()
+                .next()
+                .unwrap()
+                .end_device_timeout,
+            0
+        );
+
+        // Aging the child out is a lifecycle transition too. Enumeration 0 is
+        // a 10 s window, so one tick retires it.
+        let window = zigbee_nwk::frames::ed_timeout_enum_to_seconds(0).unwrap() as u16;
+        let mut clusters: [ClusterRef<'_>; 0] = [];
+        block_on(device.tick(window, &mut clusters));
+        assert!(device.child_table_dirty());
+        assert!(device.save_child_table_if_dirty(&mut store).unwrap());
+        assert!(store.load().unwrap().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clearing_the_child_store_blocks_same_network_stale_restore_and_orphan_response() {
+        use crate::child_store::ChildTableStore;
+
+        let mut device = centralized_router();
+        const CHILD: ShortAddress = ShortAddress(0x89AB);
+        authenticated_sleepy_child(&mut device, CHILD);
+        let mut store = crate::child_store::RamChildTableStore::new();
+        device.save_child_table(&mut store).unwrap();
+        device.announce_parent();
+
+        device.clear_persisted_child_table(&mut store).unwrap();
+        assert!(store.load().unwrap().unwrap().is_empty());
+        assert!(
+            device
+                .bdb()
+                .zdo()
+                .nwk()
+                .known_child_by_ieee(&CHILD_IEEE)
+                .is_none(),
+            "the live child relationship is invalid once membership is abandoned"
+        );
+        assert!(
+            !device.parent_annce_due(),
+            "a reset snapshot also cancels a stale Parent Announce"
+        );
+
+        let mut recommissioned = centralized_router();
+        assert_eq!(
+            recommissioned.restore_child_table(&mut store).unwrap(),
+            0,
+            "the same EPID must not resurrect children from the old membership"
+        );
+        recommissioned
+            .mac_mut()
+            .enqueue_command_event(orphan_notification(CHILD_IEEE));
+        block_on(recommissioned.service_parent_commands());
+        assert!(!recommissioned.mac().orphan_responses()[0].associated_member);
+        assert!(
+            recommissioned.mac().tx_history().is_empty(),
+            "a former child is not realigned after the reset snapshot was cleared"
+        );
+    }
+
     #[test]
     fn a_joined_router_tick_ages_out_a_silent_child() {
         let mut device = centralized_router();
@@ -7869,14 +8353,20 @@ mod parent_router_tests {
         authenticated_sleepy_child(&mut device, CHILD);
 
         // A finite permit window, a queued MAC parent command, and a Parent
-        // Announce marked due (as `restore_child_table` does after a reboot).
+        // Announce scheduled (as `restore_child_table` does after a reboot).
         open_for_joining(&mut device, 1);
         device.mac_mut().enqueue_command_event(beacon_request());
         device.set_parent_annce_due(true);
         device.mac_mut().clear_tx_history();
 
+        // One tick long enough to retire the whole jittered
+        // `apsParentAnnounceTimer` window (base + max jitter), so the due
+        // broadcast is deterministic without pinning the jitter sample.
+        const ANNOUNCE_WINDOW_SECS: u16 =
+            zigbee_zdo::parent_annce::APS_PARENT_ANNOUNCE_BASE_TIMER_SECS
+                + zigbee_zdo::parent_annce::APS_PARENT_ANNOUNCE_JITTER_MAX_SECS;
         let mut clusters: [ClusterRef<'_>; 0] = [];
-        block_on(device.tick(1, &mut clusters));
+        block_on(device.tick(ANNOUNCE_WINDOW_SECS, &mut clusters));
 
         // Permit-join expiry (run_parent_nwk_maintenance → tick_permit_joining).
         assert!(
@@ -7906,7 +8396,7 @@ mod parent_router_tests {
             "a due Parent Announce broadcast goes out on the tick"
         );
 
-        // The child is still within its End Device Timeout window after 1 s.
+        // The child is still within its End Device Timeout window.
         assert!(
             device
                 .bdb()
@@ -7943,7 +8433,7 @@ mod parent_router_tests {
     fn announce_parent_broadcasts_only_when_there_are_children() {
         // A childless router has nothing to reconcile.
         let mut empty = centralized_router();
-        block_on(empty.announce_parent()).unwrap();
+        block_on(empty.announce_parent_now()).unwrap();
         assert!(empty.mac().tx_history().is_empty());
 
         // With a child, exactly one broadcast Parent Announce goes out.
@@ -7951,7 +8441,7 @@ mod parent_router_tests {
         const CHILD: ShortAddress = ShortAddress(0x89AB);
         authenticated_sleepy_child(&mut device, CHILD);
         device.mac_mut().clear_tx_history();
-        block_on(device.announce_parent()).unwrap();
+        block_on(device.announce_parent_now()).unwrap();
 
         let tx = device.mac().tx_history();
         assert_eq!(tx.len(), 1, "one Parent_annce broadcast frame");
@@ -8294,7 +8784,8 @@ mod role_tests {
             .device_type(DeviceType::Router)
             .build_router();
         assert!(block_on(device.permit_joining(0)).is_ok());
-        assert!(block_on(device.announce_parent()).is_ok());
+        device.announce_parent();
+        assert!(block_on(device.announce_parent_now()).is_ok());
         let mut child_store = crate::child_store::RamChildTableStore::new();
         assert!(device.save_child_table(&mut child_store).is_ok());
     }

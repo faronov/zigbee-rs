@@ -51,7 +51,13 @@ pub const MAX_SOURCE_ROUTE_RELAYS: usize = 8;
 /// Zigbee requires pseudo-random routing choices, not cryptographic entropy.
 /// Keeping this mixer inside NWK avoids pulling a platform entropy harvester
 /// and DRBG into constrained router images solely for a millisecond backoff.
-pub(crate) const fn routing_random_sample(mut seed: u32) -> u32 {
+///
+/// Public because R22 requires the same class of non-cryptographic jitter
+/// above NWK as well — `apsParentAnnounceTimer` (§2.4.3.1.12) is drawn from it
+/// by ZDO. It must never be used where unpredictability matters: keys, frame
+/// counters, nonces and address selection against an adversary all require
+/// `PlatformServices::fill_random`.
+pub const fn routing_random_sample(mut seed: u32) -> u32 {
     seed ^= 0xA511_E9B3;
     seed ^= seed << 13;
     seed ^= seed >> 17;

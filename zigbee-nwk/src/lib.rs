@@ -967,6 +967,12 @@ impl<M: MacDriver> NwkLayer<M> {
             entry.refresh_end_device_timeout();
             entry.age = 0;
             entry.keepalive_confirmed = true;
+            // R22 §2.4.3.1.12: a keepalive received before an outstanding
+            // Parent_annce message has been sent excludes this child from it.
+            #[cfg(feature = "router")]
+            {
+                entry.parent_annce_pending = false;
+            }
         }
     }
 
@@ -991,6 +997,11 @@ impl<M: MacDriver> NwkLayer<M> {
             entry.refresh_end_device_timeout();
             entry.age = 0;
             entry.keepalive_confirmed = true;
+            // R22 §2.4.3.1.12 keepalive exclusion (see the poll path above).
+            #[cfg(feature = "router")]
+            {
+                entry.parent_annce_pending = false;
+            }
         }
     }
 
@@ -1090,6 +1101,8 @@ impl<M: MacDriver> NwkLayer<M> {
             keepalive_remaining_secs: 0,
             // Restored from flash — not yet heard from this power cycle.
             keepalive_confirmed: false,
+            #[cfg(feature = "router")]
+            parent_annce_pending: false,
             extended_pan_id: self.nib.extended_pan_id,
             active: true,
         };
@@ -1115,10 +1128,36 @@ impl<M: MacDriver> NwkLayer<M> {
         self.neighbors.remove(short);
     }
 
-    /// Collect the IEEE addresses of every authenticated child of this parent.
+    /// Remove every child relationship and its coupled runtime state.
     ///
-    /// Used to build a R22 Parent Announce after a router restores or rebuilds
-    /// its child table. Empty on a non-routing device.
+    /// Used when the current network membership is abandoned. This does not
+    /// depend on `can_route()`: Leave/factory reset may already have cleared
+    /// the joined flag before the product invalidates its durable child table.
+    pub fn clear_child_table(&mut self) {
+        let mut children: heapless::Vec<(ShortAddress, IeeeAddress), { neighbor::MAX_NEIGHBORS }> =
+            heapless::Vec::new();
+        for entry in self.neighbors.iter() {
+            if matches!(
+                entry.relationship,
+                neighbor::Relationship::Child
+                    | neighbor::Relationship::UnauthenticatedChild
+                    | neighbor::Relationship::PreviousChild
+            ) {
+                let _ = children.push((entry.network_address, entry.ieee_address));
+            }
+        }
+        for (short, ieee) in children {
+            self.evict_child(short, &ieee);
+        }
+    }
+
+    /// Collect the IEEE addresses of every authenticated **end-device** child
+    /// of this parent.
+    ///
+    /// R22 §2.4.3.1.12 builds the Parent Announce from neighbour table entries
+    /// whose Device Type is ZigBee End Device (0x02) only: a router child has
+    /// its own child table and is never reconciled this way. Empty on a
+    /// non-routing device.
     pub fn authenticated_child_ieees<const N: usize>(&self) -> heapless::Vec<IeeeAddress, N> {
         let mut out = heapless::Vec::new();
         if !self.can_route() {
@@ -1126,6 +1165,7 @@ impl<M: MacDriver> NwkLayer<M> {
         }
         for entry in self.neighbors.iter() {
             if entry.relationship == neighbor::Relationship::Child
+                && entry.device_type == neighbor::NeighborDeviceType::EndDevice
                 && out.push(entry.ieee_address).is_err()
             {
                 break;
@@ -1134,24 +1174,113 @@ impl<M: MacDriver> NwkLayer<M> {
         out
     }
 
+    /// "Construct the message" step of R22 §2.4.3.1.12: mark every
+    /// authenticated end-device child as still to be announced.
+    ///
+    /// The spec is explicit that Keepalive Received is *not* considered at
+    /// construction time, so every end-device child is marked regardless of
+    /// whether it has been heard from. Returns how many children were marked;
+    /// `0` means the constructed message would have `NumberOfChildren == 0`
+    /// and must be discarded rather than sent.
+    #[cfg(feature = "router")]
+    pub fn mark_parent_annce_pending(&mut self) -> usize {
+        if !self.can_route() {
+            return 0;
+        }
+        let mut marked = 0;
+        for entry in self.neighbors.iter_mut_all() {
+            let announceable = entry.relationship == neighbor::Relationship::Child
+                && entry.device_type == neighbor::NeighborDeviceType::EndDevice;
+            entry.parent_annce_pending = announceable;
+            if announceable {
+                marked += 1;
+            }
+        }
+        marked
+    }
+
+    /// A non-routing build has no child table to announce.
+    #[cfg(not(feature = "router"))]
+    pub fn mark_parent_annce_pending(&mut self) -> usize {
+        0
+    }
+
+    /// Whether any end-device child still has to be named in a Parent Announce.
+    #[cfg(feature = "router")]
+    pub fn has_parent_annce_pending(&self) -> bool {
+        self.neighbors
+            .iter()
+            .any(|entry| entry.parent_annce_pending)
+    }
+
+    /// A non-routing build never has an outstanding Parent Announce.
+    #[cfg(not(feature = "router"))]
+    pub fn has_parent_annce_pending(&self) -> bool {
+        false
+    }
+
+    /// Take up to `N` children still awaiting announcement, clearing their
+    /// pending flags.
+    ///
+    /// Each call yields the payload of exactly one `Parent_annce` broadcast;
+    /// R22 requires a fresh jittered `apsParentAnnounceTimer` before each
+    /// additional message, which the caller enforces.
+    #[cfg(feature = "router")]
+    pub fn take_parent_annce_chunk<const N: usize>(&mut self) -> heapless::Vec<IeeeAddress, N> {
+        let mut chunk = heapless::Vec::new();
+        if !self.can_route() {
+            return chunk;
+        }
+        for entry in self.neighbors.iter_mut_all() {
+            if !entry.parent_annce_pending {
+                continue;
+            }
+            if chunk.push(entry.ieee_address).is_err() {
+                break;
+            }
+            entry.parent_annce_pending = false;
+        }
+        chunk
+    }
+
+    /// A non-routing build never announces a child.
+    #[cfg(not(feature = "router"))]
+    pub fn take_parent_annce_chunk<const N: usize>(&mut self) -> heapless::Vec<IeeeAddress, N> {
+        heapless::Vec::new()
+    }
+
+    /// Drop every outstanding Parent Announce obligation.
+    ///
+    /// Used when the announcement sequence is abandoned (leave, factory reset,
+    /// or a fresh construction superseding an unfinished one).
+    pub fn clear_parent_annce_pending(&mut self) {
+        #[cfg(feature = "router")]
+        for entry in self.neighbors.iter_mut_all() {
+            entry.parent_annce_pending = false;
+        }
+    }
+
     /// Apply an incoming R22 Parent Announce to this parent's child table.
     ///
-    /// For each announced child that this device also holds as its own
-    /// authenticated child:
-    /// - if this device has **confirmed** the child's liveness this power cycle
-    ///   (a poll, End Device Timeout Request or valid secured traffic), it is
-    ///   actively parenting the child, so the child is kept and returned in
-    ///   `kept` — the caller reports it in the Parent Announce Response so the
-    ///   announcer drops its stale copy;
-    /// - otherwise the child has not been heard from since boot (typically a
-    ///   record just restored from flash), so the announcer's live claim wins:
-    ///   the child is evicted (with all coupled state) and returned in
-    ///   `dropped`.
+    /// R22 §2.4.4.2.22 "Effect on Receipt": each announced Extended Address is
+    /// looked up in the neighbour table and only an entry whose Device Type is
+    /// ZigBee End Device (0x02) is processed. A router child is never
+    /// reconciled this way, so a Parent Announce can never dislodge a router
+    /// child.
     ///
-    /// The confirmed-liveness gate is what makes this safe across a
-    /// simultaneous reboot: neither router drops a child it is actually
-    /// keeping alive, and an unconfirmed restored record yields rather than
-    /// being defended against the real parent.
+    /// For each matching end-device child:
+    /// - Keepalive Received TRUE — this device is actively parenting the child,
+    ///   so the relationship is kept unmodified and the child is returned in
+    ///   `kept` for the `Parent_annce_rsp` that makes the announcer prune its
+    ///   stale copy;
+    /// - Keepalive Received FALSE — the entry is removed (with all coupled
+    ///   state) and returned in `dropped`.
+    ///
+    /// [`keepalive_confirmed`](neighbor::NeighborEntry::keepalive_confirmed) is
+    /// this stack's Keepalive Received: a child restored from flash starts
+    /// FALSE, so it yields to whichever parent actually keeps it alive, while
+    /// neither router drops a child it is genuinely serving after a
+    /// simultaneous reboot.
     pub fn apply_parent_annce(&mut self, announced: &[IeeeAddress]) -> ParentAnnceOutcome {
         let mut outcome = ParentAnnceOutcome::default();
         if !self.can_route() {
@@ -1159,7 +1288,10 @@ impl<M: MacDriver> NwkLayer<M> {
         }
         for ieee in announced {
             let (short, confirmed) = match self.neighbors.find_by_ieee(ieee) {
-                Some(entry) if entry.relationship == neighbor::Relationship::Child => {
+                Some(entry)
+                    if entry.relationship == neighbor::Relationship::Child
+                        && entry.device_type == neighbor::NeighborDeviceType::EndDevice =>
+                {
                     (entry.network_address, entry.keepalive_confirmed)
                 }
                 _ => continue,
@@ -1180,9 +1312,12 @@ impl<M: MacDriver> NwkLayer<M> {
 
     /// Drop children named in a Parent Announce Response.
     ///
-    /// The responder is actively parenting these children, so this device
-    /// (which announced them) relinquishes its stale records. Returns the
-    /// evicted short addresses so the caller can drop coupled runtime state.
+    /// R22 §2.4.4.2.22 "Effect on Receipt" of `Parent_annce_rsp`: delete the
+    /// neighbour table entry for each named Extended Address whose Device Type
+    /// is ZigBee End Device (0x02); any other entry is left untouched. The
+    /// responder is actively parenting these children, so this device (which
+    /// announced them) relinquishes its stale records. Returns the evicted
+    /// short addresses so the caller can drop coupled runtime state.
     pub fn remove_children_by_ieee(
         &mut self,
         ieees: &[IeeeAddress],
@@ -1193,7 +1328,10 @@ impl<M: MacDriver> NwkLayer<M> {
         }
         for ieee in ieees {
             let short = match self.neighbors.find_by_ieee(ieee) {
-                Some(entry) if entry.relationship == neighbor::Relationship::Child => {
+                Some(entry)
+                    if entry.relationship == neighbor::Relationship::Child
+                        && entry.device_type == neighbor::NeighborDeviceType::EndDevice =>
+                {
                     entry.network_address
                 }
                 _ => continue,
@@ -1202,6 +1340,85 @@ impl<M: MacDriver> NwkLayer<M> {
             let _ = dropped.push(short);
         }
         dropped
+    }
+
+    /// R22 §3.6.1.4.3.2 parent orphan procedure — resolve an orphan's extended
+    /// address to the network address this device already holds for it.
+    ///
+    /// "The NLME shall first determine whether the orphaned device is its
+    /// child. This is accomplished by comparing the extended address of the
+    /// orphaned device with the addresses of its children, as recorded in its
+    /// neighbor table. If a match is found … the NLME shall obtain the
+    /// corresponding 16-bit network address and include it in its subsequent
+    /// orphan response … If an address match is not found … the procedure
+    /// shall be terminated without indication to the higher layer."
+    ///
+    /// The match is deliberately narrow:
+    /// - only a joined router/coordinator answers at all;
+    /// - only an **authenticated** [`Child`](neighbor::Relationship::Child) is
+    ///   a child — a provisional
+    ///   [`UnauthenticatedChild`](neighbor::Relationship::UnauthenticatedChild)
+    ///   has not proven network-key possession and must complete association
+    ///   instead of being realigned;
+    /// - the stored short address must still be a usable unicast address that
+    ///   is not this device's own.
+    ///
+    /// Everything else — including a child table entry restored from corrupt
+    /// or foreign persistence, which never reaches the neighbour table — yields
+    /// `None` and therefore no coordinator realignment.
+    pub fn orphan_child_short(&self, orphan: &IeeeAddress) -> Option<ShortAddress> {
+        if !self.can_route() || !self.joined {
+            return None;
+        }
+        let entry = self.neighbors.find_by_ieee(orphan)?;
+        if entry.relationship != neighbor::Relationship::Child {
+            return None;
+        }
+        let short = entry.network_address;
+        if !(0x0001..=0xFFF7).contains(&short.0) || short == self.nib.network_address {
+            return None;
+        }
+        Some(short)
+    }
+
+    /// Order-independent fingerprint of this device's authenticated child
+    /// table, covering exactly the fields the durable child store persists.
+    ///
+    /// The runtime compares this against the fingerprint of the last committed
+    /// snapshot to decide whether a save is needed, which cannot miss a
+    /// mutation the way instrumenting every admission/eviction/address-change
+    /// call site could. `0` on a device with no children (and on any
+    /// non-routing device), which is also the fingerprint of a stored empty
+    /// table.
+    pub fn child_table_fingerprint(&self) -> u32 {
+        let mut accumulator = 0u32;
+        if !self.can_route() {
+            return accumulator;
+        }
+        for entry in self.neighbors.iter() {
+            if entry.relationship != neighbor::Relationship::Child {
+                continue;
+            }
+            // FNV-1a over the persisted fields, summed so the result does not
+            // depend on neighbour table slot order.
+            let mut hash = 0x811C_9DC5u32;
+            let mut mix = |byte: u8| {
+                hash ^= u32::from(byte);
+                hash = hash.wrapping_mul(0x0100_0193);
+            };
+            for byte in entry.ieee_address {
+                mix(byte);
+            }
+            for byte in entry.network_address.0.to_le_bytes() {
+                mix(byte);
+            }
+            mix(u8::from(entry.rx_on_when_idle));
+            mix(u8::from(entry.security_capable));
+            mix(u8::from(entry.is_router()));
+            mix(entry.end_device_timeout);
+            accumulator = accumulator.wrapping_add(hash);
+        }
+        accumulator
     }
 
     /// Queue one already-built NWK frame for a sleepy child and arm the MAC
@@ -1436,6 +1653,8 @@ impl<M: MacDriver> NwkLayer<M> {
             end_device_timeout: frames::ED_TIMEOUT_ENUM_DEFAULT,
             keepalive_remaining_secs: 0,
             keepalive_confirmed: false,
+            #[cfg(feature = "router")]
+            parent_annce_pending: false,
             extended_pan_id: self.nib.extended_pan_id,
             active: true,
         };
@@ -1629,6 +1848,8 @@ impl<M: MacDriver> NwkLayer<M> {
             // A secured rejoin is a live admission; a provisional (unsecured)
             // one is not confirmed until it proves the network key.
             keepalive_confirmed: secured,
+            #[cfg(feature = "router")]
+            parent_annce_pending: false,
             extended_pan_id: self.nib.extended_pan_id,
             active: true,
         };

@@ -55,6 +55,12 @@ pub const ZDP_PROFILE_ID: u16 = 0x0000;
 /// Broadcast address for RxOnWhenIdle devices (used for Device_annce).
 pub const BROADCAST_RX_ON_IDLE: u16 = 0xFFFD;
 
+/// Broadcast address for all routers and the coordinator.
+///
+/// R22 §2.4.3.1.12 requires `Parent_annce` to use this address: only devices
+/// with a child table act on it, and an end device that receives one drops it.
+pub const BROADCAST_ROUTERS: u16 = 0xFFFC;
+
 // ── ZDP cluster identifiers ────────────────────────────────────
 
 // Device and service discovery
@@ -222,6 +228,17 @@ pub struct ZdoLayer<M: MacDriver> {
     local_ieee_addr: IeeeAddress,
     /// Pending ZDP request-response table for TSN correlation.
     pending_responses: [PendingZdpResponse; MAX_PENDING_ZDP],
+    /// `apsParentAnnounceTimer` (R22 Table 2-24, AIB id 0xCE): seconds left
+    /// before the next `Parent_annce` broadcast, `0` when not running.
+    ///
+    /// Only a router/coordinator ever runs this timer, so it is gated on the
+    /// `router` feature and a leaf build's `ZdoLayer` keeps its previous size.
+    #[cfg(feature = "router")]
+    parent_annce_timer_secs: u16,
+    /// Whether the current timer belongs to an already-constructed,
+    /// potentially multi-frame Parent Announce sequence.
+    #[cfg(feature = "router")]
+    parent_annce_sequence_active: bool,
     diagnostics: ZdoDiagnostics,
 }
 
@@ -271,6 +288,10 @@ impl<M: MacDriver> ZdoLayer<M> {
             local_nwk_addr: ShortAddress::UNASSIGNED,
             local_ieee_addr: [0u8; 8],
             pending_responses: core::array::from_fn(|_| PendingZdpResponse::default()),
+            #[cfg(feature = "router")]
+            parent_annce_timer_secs: 0,
+            #[cfg(feature = "router")]
+            parent_annce_sequence_active: false,
             diagnostics: ZdoDiagnostics::default(),
         }
     }
@@ -291,6 +312,10 @@ impl<M: MacDriver> ZdoLayer<M> {
             core::ptr::addr_of_mut!((*slot).local_ieee_addr).write([0u8; 8]);
             core::ptr::addr_of_mut!((*slot).pending_responses)
                 .write(core::array::from_fn(|_| PendingZdpResponse::default()));
+            #[cfg(feature = "router")]
+            core::ptr::addr_of_mut!((*slot).parent_annce_timer_secs).write(0);
+            #[cfg(feature = "router")]
+            core::ptr::addr_of_mut!((*slot).parent_annce_sequence_active).write(false);
             core::ptr::addr_of_mut!((*slot).diagnostics).write(ZdoDiagnostics::default());
         }
     }
@@ -514,7 +539,22 @@ impl<M: MacDriver> ZdoLayer<M> {
         cluster_id: u16,
         payload: &[u8],
     ) -> Result<(), ZdoError> {
-        self.send_zdp_unicast(ShortAddress(BROADCAST_RX_ON_IDLE), cluster_id, payload)
+        self.send_zdp_broadcast_to(BROADCAST_RX_ON_IDLE, cluster_id, payload)
+            .await
+    }
+
+    /// Send a ZDP broadcast frame to an explicit broadcast address.
+    ///
+    /// Each ZDP broadcast has a *normative* destination — `Device_annce` uses
+    /// 0xFFFD while `Parent_annce` must use 0xFFFC (R22 §2.4.3.1.12) — so the
+    /// address is a parameter rather than a single stack-wide default.
+    async fn send_zdp_broadcast_to(
+        &mut self,
+        destination: u16,
+        cluster_id: u16,
+        payload: &[u8],
+    ) -> Result<(), ZdoError> {
+        self.send_zdp_unicast(ShortAddress(destination), cluster_id, payload)
             .await
     }
 
