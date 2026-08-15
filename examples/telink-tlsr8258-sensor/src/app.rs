@@ -164,7 +164,12 @@ pub fn run() -> ! {
             cluster: hum_cluster,
         },
     ];
-    let mut security_store = tlsr8258_tb04_product::storage::security_store(resources.flash);
+    // The sensor is not a parent, so it only ever claims the security
+    // partition; the child-table partition token is dropped here and the
+    // child-table journal code never enters the sensor image.
+    let (security_partition, _child_partition) =
+        tlsr8258_tb04_product::storage::split_flash(resources.flash);
+    let mut security_store = tlsr8258_tb04_product::storage::security_store(security_partition);
     if device
         .reset_security_state_if_identity_changed(&mut security_store, ieee_address)
         .is_err()

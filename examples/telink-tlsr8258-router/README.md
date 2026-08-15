@@ -11,7 +11,7 @@ src/app.rs       router role, commissioning, receive and maintenance loop
 ../../boards/tlsr8258-tb04
                  TB-04 LEDs, flash token, and typed resources
 ../../products/tlsr8258-tb04
-                 security partition, journal, and linker layout
+                 security/child partitions, journals, and linker layout
 ```
 
 The firmware joins as an FFD, keeps the radio in continuous receive, relays
@@ -19,9 +19,9 @@ NWK traffic, and sends normal router maintenance frames. The bounded parent
 path handles beacon requests, permit joining, child association, and indirect
 delivery to polling sleepy children.
 
-The child/neighbor table is currently RAM-only; children must re-associate
-after a router reboot. Security/network commissioning state remains
-crash-safely persisted.
+Authenticated children are restored from a dedicated crash-safe journal before
+the router answers orphan notifications. Parent Announce then reconciles stale
+records with other routers; route state remains RAM-only.
 
 The application drives the stack from bounded RX events and processes every
 `StackEvent`/`TickResult`, including failed commissioning, leave/rejoin, and

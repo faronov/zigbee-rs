@@ -30,7 +30,8 @@ verify_layout() {
     local sdata=0 ebss=0 svc_bottom=0
     local rf_dma_start=0 rf_dma_end=0
     local rf_rx_buf=0 rf_tx_buf=0 rf_ack_tx_buf=0
-    local security_nv_start=0
+    local security_nv_start=0 security_nv_end=0
+    local child_nv_start=0 child_nv_end=0
     local value name
 
     while read -r value _ name; do
@@ -50,6 +51,9 @@ verify_layout() {
             *RF_TX_BUF) rf_tx_buf=$((16#$value)) ;;
             *RF_ACK_TX_BUF) rf_ack_tx_buf=$((16#$value)) ;;
             _security_nv_start_) security_nv_start=$((16#$value)) ;;
+            _security_nv_end_) security_nv_end=$((16#$value)) ;;
+            _child_nv_start_) child_nv_start=$((16#$value)) ;;
+            _child_nv_end_) child_nv_end=$((16#$value)) ;;
         esac
     done < <("$LLVM_NM" "$elf")
 
@@ -124,14 +128,31 @@ verify_layout() {
 
     local size
     size=$(wc -c < "$bin" | tr -d ' ')
-    if (( security_nv_start == 0 || size > security_nv_start )); then
-        printf 'layout-check FAIL: image is %d bytes, security journal starts at 0x%X\n' \
-            "$size" "$security_nv_start" >&2
+    if (( child_nv_start == 0 || size > child_nv_start )); then
+        printf 'layout-check FAIL: image is %d bytes, child-table journal starts at 0x%X\n' \
+            "$size" "$child_nv_start" >&2
         exit 1
     fi
-    printf 'layout-check OK: image=%d B flash_limit=0x%X ram_code=%d B data=0x%X bss_end=0x%X rf_dma=[0x%X..0x%X) (rx=0x%X tx=0x%X ack=0x%X)\n' \
-        "$size" "$security_nv_start" "$((ramcode_end - ramcode_start))" "$sdata" "$ebss" \
-        "$rf_dma_start" "$rf_dma_end" "$rf_rx_buf" "$rf_tx_buf" "$rf_ack_tx_buf"
+    # The journals must be ordered below Telink's factory EUI/config sectors.
+    # Reaching 0x76000 would erase the device identity; reaching 0x77000 would
+    # also erase factory configuration and ADC calibration.
+    if (( child_nv_end == 0 || security_nv_start == 0 || security_nv_end == 0 )); then
+        echo "layout-check FAIL: NV journal symbols are missing" >&2
+        exit 1
+    fi
+    if (( child_nv_start >= child_nv_end ||
+          security_nv_start >= security_nv_end ||
+          child_nv_end > security_nv_start ||
+          security_nv_end > 0x76000 )); then
+        printf 'layout-check FAIL: child NV [0x%X..0x%X), security NV [0x%X..0x%X), factory EUI starts at 0x76000\n' \
+            "$child_nv_start" "$child_nv_end" "$security_nv_start" "$security_nv_end" >&2
+        exit 1
+    fi
+
+    printf 'layout-check OK: image=%d B flash_limit=0x%X ram_code=%d B data=0x%X bss_end=0x%X rf_dma=[0x%X..0x%X) (rx=0x%X tx=0x%X ack=0x%X) sec_nv=[0x%X..0x%X) child_nv=[0x%X..0x%X)\n' \
+        "$size" "$child_nv_start" "$((ramcode_end - ramcode_start))" "$sdata" "$ebss" \
+        "$rf_dma_start" "$rf_dma_end" "$rf_rx_buf" "$rf_tx_buf" "$rf_ack_tx_buf" \
+        "$security_nv_start" "$security_nv_end" "$child_nv_start" "$child_nv_end"
 }
 
 [[ $# -eq 3 ]] || usage
