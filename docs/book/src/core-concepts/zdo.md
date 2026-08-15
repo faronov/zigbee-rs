@@ -626,36 +626,88 @@ for &ep in &eps.active_ep_list {
 
 ## Parent Announce (`Parent_annce` 0x001F / `Parent_annce_rsp` 0x801F)
 
-`Parent_annce` is the R22 ZDP primitive a router/coordinator uses to reconcile
-its child table with the rest of the network after it restores or rebuilds it.
-It is a **ZDP** command carried over APS on endpoint 0 (not a NWK-layer
-command), restricted to routing devices — end devices have no child table, so
-`send_parent_annce()` is a no-op on them and the receive path is gated on
-`can_route()`.
+`Parent_annce` is the R22 ZDP primitive a rebooted router/coordinator uses to
+reconcile its **end-device** child table with the rest of the network. It is a
+**ZDP** command carried over APS on endpoint 0 (not a NWK-layer command),
+restricted to routing devices — an end device drops it with no further
+processing (R22 §2.4.3.1.12), so the whole receive path is compiled out of a
+non-`router` build and `send_parent_annce()` is a no-op on a device that cannot
+route.
 
-| Cluster | Payload |
-|---------|---------|
-| `Parent_annce` 0x001F | `NumberOfChildren(1)` then that many `IEEE(8)` |
-| `Parent_annce_rsp` 0x801F | `Status(1)`, `NumberOfChildren(1)`, then `IEEE(8)` |
+| Cluster | Payload | Destination |
+|---------|---------|-------------|
+| `Parent_annce` 0x001F | `NumberOfChildren(1)` then that many `IEEE(8)` | broadcast **0xFFFC** (all routers + coordinator) |
+| `Parent_annce_rsp` 0x801F | `Status(1)`, `NumberOfChildren(1)`, then `IEEE(8)` | unicast back to the announcer |
 
-Behaviour (`zigbee_zdo::parent_annce`):
+### Generation and `apsParentAnnounceTimer`
 
-- **Send** — after a router's restored child state is authoritative,
-  `ZigbeeDevice::announce_parent()` (also fired once automatically by the joined
-  tick following `restore_child_table`) broadcasts the IEEE addresses of its
-  authenticated children.
-- **Receive `Parent_annce`** — for each announced child the receiver also
-  holds: if it has **confirmed** the child's liveness this power cycle it keeps
-  the child and reports it in a `Parent_annce_rsp`; otherwise (an unconfirmed
-  record just restored from flash) it yields the child to the announcer and
-  evicts it. This confirmed-liveness gate is what makes simultaneous reboots
-  safe — neither router drops a child it is actually keeping alive.
-- **Receive `Parent_annce_rsp`** — the announcer relinquishes every child the
-  responder is keeping.
+R22 §2.4.3.1.12 requires the message when the device **has rebooted** *and* is
+**joined and authenticated**. `ZigbeeDevice::restore_child_table` therefore
+schedules it, and `ZigbeeDevice::announce_parent()` schedules it explicitly.
+Scheduling starts `apsParentAnnounceTimer`:
 
-The confirmed-liveness bit is set by any keepalive (poll, End Device Timeout
-Request, valid secured traffic) or live admission, and is `false` for a child
-restored from persistence until it is next heard from.
+```text
+apsParentAnnounceTimer = apsParentAnnounceBaseTimer (10 s)
+                       + random(0 ..= apsParentAnnounceJitterMax (10 s))
+```
+
+The child list is built when that timer **expires**, not when it is scheduled,
+so a child that (re)joins during the delay is announced and one that leaves is
+not. At construction every neighbour whose Device Type is ZigBee End Device
+(0x02) is marked — R22 is explicit that Keepalive Received is *not* considered
+at this point — and a router child is never included. A constructed message with
+`NumberOfChildren == 0` is discarded, never sent.
+
+A table larger than one frame is split: each **additional** message arms a fresh
+jittered `apsParentAnnounceTimer` before it is sent, and a keepalive received
+from a child before its message goes out removes it from that message.
+
+Receiving a **broadcast** `Parent_annce` while this device's own timer is
+running re-calculates and restarts it. That is the storm/loop guard: routers
+rebooting together spread their broadcasts out instead of answering each other
+immediately. Only the normative NWK-secured `0xFFFC` broadcast is accepted;
+unicast, wrong-destination, and unsecured forms are dropped without changing
+the child table. Receiving a valid announcement never *starts* an idle timer.
+
+`ZigbeeDevice::announce_parent_now()` is the un-jittered escape hatch for lab
+binaries and deterministic tests; production uses the scheduled path.
+
+### Reconciliation
+
+- **Receive `Parent_annce`** — only a neighbour whose Device Type is ZigBee End
+  Device (0x02) is processed. If Keepalive Received is TRUE the parent/child
+  relationship is kept unmodified and the child is reported in a
+  `Parent_annce_rsp`; if it is FALSE the entry is removed. A router child is
+  neither defended nor evicted.
+- **Receive `Parent_annce_rsp`** — the announcer deletes its neighbour entry for
+  each named end-device child; any other entry is left untouched. On a secured
+  network the correlated unicast response must also be NWK/APS authenticated.
+
+This stack's Keepalive Received is the per-neighbour `keepalive_confirmed` bit,
+set by any keepalive (MAC poll, End Device Timeout Request, valid secured
+traffic) or live admission, and `false` for a child restored from persistence
+until it is next heard from. That gate is what makes simultaneous reboots safe:
+neither router drops a child it is actually keeping alive, while an unconfirmed
+restored record yields to whichever parent really serves the child.
+
+## Orphan notification and coordinator realignment
+
+R22 §3.6.1.4.3.2 gives the parent side of the orphan procedure. When a MAC
+delivers `MacCommandEvent::OrphanNotification`, a router/coordinator compares
+the orphan's extended address against its neighbour table:
+
+- an **authenticated** `Child` match yields the short address the parent already
+  holds, which is issued through `MacDriver::mlme_orphan_response` and sent as an
+  IEEE 802.15.4 Coordinator Realignment (§7.3.8, frame version 0 per R22
+  Annex D) carrying the PAN ID, the parent's short address, the operating
+  channel and that same child address;
+- anything else — an unknown device, a provisional
+  `UnauthenticatedChild` that has not proven network-key possession, or a child
+  that was never restored because its persisted record belonged to another
+  network — terminates the procedure with **no transmission at all**.
+
+This is why the child table must be restored before the router starts answering:
+without it, a returning child is a stranger and has to associate again.
 
 ## Summary
 

@@ -466,8 +466,10 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
   runtime integration remain unvalidated. The router's parent path is
   software-complete and has been exercised on hardware, but release still
   requires a clean first-attempt sleepy-child join and complete ZHA interview
-  with the corrected child image under an independent sniffer. Child and route
-  tables remain RAM-only across reboot. Real tc32 firmware requires the
+  with the corrected child image under an independent sniffer. The router child
+  table is now crash-safely persisted; route state remains RAM-only, and the
+  orphan/realignment plus flash-journal paths still need hardware validation.
+  Real tc32 firmware requires the
   [modern-tc32](https://github.com/modern-tc32) toolchain.
 - **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence; temp/humidity sensors are simulated (battery ADC is real); comprehensive power management is implemented (two-tier sleep with AON system sleep ~3 µA, radio sleep/wake, flash deep power-down, GPIO leak prevention)
 - **EFR32MG1** is hardware-proven for hardware-AES commissioning, complete ZHA interview, SHT3x/battery reporting, RTCC/EM2, PB13 wake, and silent reset/resume. Downloading, activating, and booting a real Gecko Bootloader OTA upgrade remains pending.

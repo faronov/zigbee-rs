@@ -92,19 +92,24 @@ With the pinned `tc32-45` toolchain, the current production payloads are:
 
 | Image | Raw payload | Complete-HAL baseline | Reduction | CI budget |
 |---|---:|---:|---:|---:|
-| End-device sensor | 271,836 B | 323,876 B | 52,040 B (16.1%) | 280 KiB |
-| Parent router | 328,396 B | 349,792 B | 21,396 B (6.1%) | 336 KiB |
+| End-device sensor | 271,492 B | 323,876 B | 52,384 B (16.2%) | 280 KiB |
+| Parent router | 338,520 B | 349,792 B | 11,272 B (3.2%) | 336 KiB |
 
-The router is 56,560 bytes larger because it retains route maintenance, child
-admission and aging, indirect delivery, parent-side MAC commands,
-Update-Device handling, and Parent Announce. The sensor compiles those paths
-out and retains only its leaf behavior, including the R22 End Device Timeout
-client. See [Firmware Size and Role Specialization](../advanced/firmware-size.md)
+The router is 67,028 bytes larger because it retains route maintenance, child
+admission and aging, indirect delivery, parent-side MAC commands, the R22 orphan
+procedure and coordinator realignment, Update-Device handling, the durable
+child-table journal, and Parent Announce. The sensor compiles every one of those
+paths out — an end-device image links no `parent_annce`, `child_store` or orphan
+symbol at all — and retains only its leaf behavior, including the R22 End Device
+Timeout client. See [Firmware Size and Role Specialization](../advanced/firmware-size.md)
 for the cross-platform measurements and CI gates.
 
 `tools/tlsr8258-firmware.sh` builds with tc32-45, emits the binary, and checks
 the cache reservation, RAM code, BSS/stack separation, production image size,
-and absence of the legacy lab MAC.
+and absence of the legacy lab MAC. It also fails the build if the security
+journal (`0x74000..0x76000`) and the router child-table journal
+(`0x72000..0x74000`) overlap or reach Telink's factory EUI/config sectors at
+`0x76000..0x78000`.
 
 ### Sensor
 
@@ -131,9 +136,10 @@ Request, Association Request, or Device_annce.
 
 The bounded parent path now handles beacon requests, finite or indefinite
 permit joining, child association, and indirect delivery to polling sleepy
-children. Child-table entries are RAM-only and children must re-associate
-after router reboot; commissioned network and security state remain
-persistent.
+children. Authenticated child-table entries and commissioned security state
+are crash-safely persisted in separate journals; route state remains RAM-only.
+After reboot the child table is restored before orphan processing and
+reconciled through the jittered R22 Parent Announce procedure.
 
 The security path waits for the over-the-air Association Response ACK before
 notifying the Trust Center, forwards tunneled Transport-Key commands without
@@ -193,8 +199,9 @@ nested-safe IRQ critical section.
 `boards/tlsr8258-tb04::resources::BoardResources` retains the serial, UART,
 ADC, AES, lighting, PC5, and fitted-flash ownership. The production sensor
 and router install the owned ADC/PC5 flash-voltage guard before constructing
-the security journal. `products/tlsr8258-tb04` bounds that journal to
-`0x74000..0x76000`; the linker script prevents firmware overlap.
+the journals. `products/tlsr8258-tb04` bounds the router child table to
+`0x72000..0x74000` and security state to `0x74000..0x76000`; the linker script
+keeps firmware below both and preserves Telink factory data above them.
 
 ### Flash geometry and identity
 
@@ -296,7 +303,7 @@ ELF=examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-
 The hardware image removes the ~5 KiB RustCrypto core while adding the
 on-silicon startup KATs; the +8 B RAM is the `AesEngine` handle stored in the
 MAC. Both hardware images pass the TC32 layout/symbol gate (`_ebss` far below
-the stack, image below the `0x74000` security-journal boundary, reusable
+the stack, image below the `0x72000` child-journal boundary, reusable
 `TelinkMac` linked).
 
 ### Hardware validation evidence
@@ -343,14 +350,17 @@ earlier hardware-AES acceptance run.
 
 ### Safe recommissioning procedure
 
-1. Back up the two-sector security journal before changing network state.
+1. Back up the two-sector child and security journals before changing network
+   state.
 2. Remove the device from ZHA and let the running firmware process Leave or
    factory reset. The runtime clears credentials while preserving outgoing
    counter bounds.
-3. Do **not** erase `0x74000..0x76000` merely to force a clean join. If raw
-   erasure is unavoidable, seed a valid uncommissioned record with the
-   previous counter bounds for that device identity; never copy old network
-   keys or TCLK credentials into the clean record.
+3. Do **not** erase `0x72000..0x76000` merely to force a clean join. Normal
+   Leave/factory-reset handling commits an empty child table while preserving
+   outgoing counter bounds in the security journal. If raw erasure is
+   unavoidable, seed a valid uncommissioned security record with the previous
+   counter bounds for that device identity; never copy old network keys or
+   TCLK credentials into the clean record.
 4. Flash with `./scripts/tlsr8258.sh flash router`, open permit
    joining, and confirm the secured join and TCLK exchange with an independent
    sniffer.

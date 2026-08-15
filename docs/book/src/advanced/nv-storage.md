@@ -118,24 +118,76 @@ tick.
 | `RamChildTableStore` | Complete generic store for a router **without** a configured child-table partition — keeps the table for the current power cycle only and never claims durable persistence. |
 | `ChildTableJournal<S: NorFlash>` | Two-sector crash-safe journal (its own sectors, not the security journal's) with generation numbers, a CRC over the record prefix and a trailing commit marker written last. |
 
-The record is versioned (`ZBCT`, version 1). An unrecognised version is skipped
-like a corrupt record, so downgrading simply drops the persisted child table:
-children re-appear through normal association/rejoin and keepalive, and no
-security counter is affected. Wire it through `ZigbeeDevice::save_child_table`
-and `restore_child_table`; a successful restore schedules a Parent Announce.
+### Network binding
 
-> **Partition not yet allocated.** No product linker script currently reserves
-> child-table sectors, so a router opts in with `RamChildTableStore` today.
-> Durable child persistence on hardware requires allocating two dedicated
-> sectors (distinct from the security journal's) in the product memory map and
-> constructing a `ChildTableJournal` over them — a remaining hardware gate.
+Every record stores the **extended PAN ID** its children belong to. A restore
+validates that binding against the network the device is currently on and
+returns `ChildStoreError::ForeignNetwork` on a mismatch instead of applying it.
+Without this, a table left over from a previous network (after a factory reset
+and rejoin, or after moving a device between networks) could re-admit devices
+that are not this parent's children — and then answer an orphan notification
+with a coordinator realignment for a stranger.
+
+### Record versions
+
+| version | encoded child table |
+|---|---|
+| 1 | count + per-child identity/timeout (no network binding) |
+| 2 | extended PAN ID + count + per-child identity/timeout |
+
+An unrecognised version is skipped like a corrupt record, so downgrading simply
+drops the persisted child table: children re-appear through normal
+association/rejoin and keepalive, and no security counter is affected. Version 1
+is deliberately **not** accepted — it carries no network binding, so it cannot be
+validated against the current network.
+
+### Runtime API (parent role only)
+
+Every one of these lives behind `role::ParentRole`, so an end-device build
+cannot even name them.
+
+| Call | Meaning |
+|---|---|
+| `restore_child_table(store)` | Re-install persisted children and schedule the R22 Parent Announce. Returns the number restored; a corrupt, unreadable or foreign-network record is an explicit `Err`, never a silent "no children". |
+| `clear_persisted_child_table(store)` | Commit an empty snapshot and cancel Parent Announce before Leave/factory-reset recommissioning. This is required even when the new membership uses the same extended PAN ID. |
+| `child_table_dirty()` | Whether the live table differs from the last committed snapshot. Compares a fingerprint of every persisted field, so it cannot miss an admission, authorization, rejoin re-addressing, End Device Timeout eviction, leave or Parent Announce reconciliation. |
+| `save_child_table_if_dirty(store)` | Writes only when something actually changed — a steady-state tick writes no flash. |
+| `save_child_table(store)` | Unconditional snapshot. |
+
+A router product calls `restore_child_table` once the network is up and
+`save_child_table_if_dirty` from its event loop, mirroring the
+`state_dirty()` / `save_state()` rhythm used for application state. Every path
+that abandons the current membership calls `clear_persisted_child_table`
+before recommissioning; EPID matching alone cannot distinguish two separate
+memberships in the same network.
+
+### Product partition (TLSR8258 TB-04)
+
+The TB-04 product reserves two dedicated 4 KiB sectors for the child table,
+strictly before the security journal and Telink factory data:
+
+```text
+0x72000..0x74000  child-table journal (router/coordinator child records)
+0x74000..0x76000  security journal  (frame counters, keys, network state)
+0x76000..0x77000  Telink factory EUI-64 (read-only)
+0x77000..0x78000  Telink factory config and ADC calibration (read-only)
+```
+
+`products::tlsr8258_tb04::storage::split_flash` consumes the board's single
+onboard-flash token and hands back one zero-sized token per partition, so the
+two journals cannot be constructed twice or address each other's sectors. The
+linker exports `_child_nv_start_`/`_child_nv_end_` and
+`tools/tlsr8258-firmware.sh` fails the build if the image reaches the child
+journal, the two NV regions overlap, or either journal reaches the factory
+EUI/config sectors. The sensor product drops the child-table token, so the
+journal code never enters a sensor image.
 
 ## Platform ownership
 
 | Platform | Flash controller | Current partition owner | Store |
 |---|---|---|---|
 | BL702 | `bl702-hal` mask-ROM XIP flash | `products/bl702-xt-zb1` | Security journal; destructive silicon validation pending |
-| TLSR8258 | `tlsr8258-hal` | `products/tlsr8258-tb04` | Security journal; geometry-aware identity and fail-closed Zbit voltage guard |
+| TLSR8258 | `tlsr8258-hal` | `products/tlsr8258-tb04` | Security journal + child-table journal (router build); geometry-aware identity and fail-closed Zbit voltage guard |
 | nRF52840 | Embassy NVMC | `products/nrf52840-sensor` | Security journal |
 | PHY6222/PHY6252 | `phy6222-hal` | `boards/phy62x2-evk` | Security journal |
 | ESP32-C6/H2 | `esp_storage::FlashStorage` | `products/esp32-zigbee-devkit` | Security journal |

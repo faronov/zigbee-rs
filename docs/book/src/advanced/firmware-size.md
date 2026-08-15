@@ -14,20 +14,21 @@ flash offsets are platform-specific.
 
 | Platform and role | Raw payload | Packaged image | CI raw budget |
 |---|---:|---:|---:|
-| TLSR8258 end-device sensor (hardware AES) | 271,836 B | — | 280 KiB |
-| TLSR8258 parent router (hardware AES) | 328,396 B | — | 336 KiB |
-| BL702 end-device sensor (hardware AES) | 178,082 B | — | 192 KiB |
-| nRF52840 end-device sensor | 222,336 B | — | 220 KiB |
-| nRF52840 relay router | 225,560 B | — | — |
-| nRF52833 end-device sensor | 222,336 B | — | 220 KiB |
-| EFR32MG1 end-device sensor (hardware AES + OTA) | 151,284 B | — | 160 KiB |
+| TLSR8258 end-device sensor (hardware AES) | 271,492 B | — | 280 KiB |
+| TLSR8258 parent router (hardware AES) | 338,520 B | — | 336 KiB |
+| BL702 end-device sensor (hardware AES) | 176,930 B | 185,136 B | 192 KiB |
+| nRF52840 end-device sensor | 220,104 B | — | 220 KiB |
+| nRF52840 relay router | 225,368 B | — | — |
+| nRF52833 end-device sensor | 220,096 B | — | 220 KiB |
+| EFR32MG1 end-device sensor (hardware AES + OTA) | 150,456 B | — | 160 KiB |
 
 The TLSR8258 rows are `scripts/tlsr8258.sh build sensor` / `build router` on
 the pinned `tc32-45` toolchain, which is exactly what CI builds; they leave
-14,884 and 15,668 bytes of budget headroom respectively. The BL702, nRF and
-EFR32 raw payloads were re-measured with the same release profiles CI builds.
-Packaged images were not rebuilt. CI remains the authoritative source per
-commit, because it enforces the budget column with
+15,228 and 5,544 bytes of budget headroom respectively. The BL702, nRF and
+EFR32 raw payloads were re-measured with the same release profiles CI builds,
+and the BL702 packaged image was regenerated with `bflb-mcu-tool` 1.10.0. CI
+remains the authoritative source per commit, because it enforces the budget
+column with
 `tools/firmware-size-report.sh`.
 
 R22 conformance work moves these numbers in both directions. Adding NWK address
@@ -55,7 +56,7 @@ Flash is not the only budget. The same builds report:
 | TLSR8258 image | `.bss` end | `block_on` coroutine frame | SVC stack headroom |
 |---|---:|---:|---:|
 | End-device sensor | `0x844C60` | 8,772 B | 7,612 B |
-| Parent router | `0x847694` | 9,388 B | 6,996 B |
+| Parent router | `0x84769C` | 9,388 B | 6,996 B |
 
 The SVC stack is a fixed 16 KiB (`_svc_stack_bottom = 0x0084BC00`), and the
 application future is pinned inside `block_on`'s frame, so that frame is the
@@ -73,14 +74,15 @@ comparison:
 
 | TLSR8258 image | Complete-HAL baseline | Current | Reduction |
 |---|---:|---:|---:|
-| End-device sensor | 323,876 B | 271,836 B | 52,040 B (16.1%) |
-| Parent router | 349,792 B | 328,396 B | 21,396 B (6.1%) |
+| End-device sensor | 323,876 B | 271,492 B | 52,384 B (16.2%) |
+| Parent router | 349,792 B | 338,520 B | 11,272 B (3.2%) |
 
-The current router is 56,560 bytes larger than the sensor because it retains
+The current router is 67,028 bytes larger than the sensor because it retains
 the behavior a real parent needs: route maintenance, child admission and
 aging, indirect delivery, parent-side MAC commands, Update-Device handling,
-and Parent Announce. The sensor instead retains the R22 End Device Timeout
-client and polling lifecycle. GitHub's rounded artifact display may show both
+the orphan procedure and coordinator realignment, the durable child-table
+journal, and Parent Announce. The sensor instead retains the R22 End Device
+Timeout client and polling lifecycle. GitHub's rounded artifact display may show both
 as roughly `0.3 MB`, but the raw binaries are no longer close in size.
 
 ## What is specialized
@@ -130,7 +132,12 @@ set of outlined awaits:
 | `await_out_of_line!` (`Pin<&mut dyn Future>`) | 329,720 B | 9,388 B |
 
 The shipped image adds three more outlined awaits in router maintenance,
-reaching 328,396 B at the same coroutine frame size.
+reaching 328,396 B at the same coroutine frame size. The R22 parent-persistence
+work (durable child-table journal, orphan procedure and coordinator
+realignment, `apsParentAnnounceTimer`) later added 10,124 B to the router,
+bringing it to 338,520 B — still 5,544 B inside its 344,064-byte budget — while
+every end-device image *shrank*, because the Parent Announce receive path is now
+compiled out of a non-`router` build entirely.
 
 The generic `async fn` wrapper is the trap: the caller ends up holding the
 moved-from temporary *and* the wrapper coroutine across the await, so every
@@ -192,7 +199,7 @@ hardware-AES release measured 269,960 bytes for the sensor and 327,760 bytes
 for the router, saving 2,640 and 4,680 bytes respectively over the former
 software builds with 8 additional bytes of RAM. The later receive-queue
 redesign and the coroutine outlining above reduced the current standard images
-to 271,836 and 328,396 bytes without changing that AES policy. Both production
+to 271,492 and 338,520 bytes without changing that AES policy. Both production
 manifests install the accelerator unconditionally and fail closed without a
 software fallback.
 
@@ -200,17 +207,19 @@ The BL702 SEC_ENG hardware-AES provider is the first cross-platform follow-up
 to the TLSR8258 work. Its two startup known-answer tests pass on XT-ZB1
 silicon, followed by periodic radio operation and a complete secured ZHA
 commissioning flow with Transport-Key, descriptors, binding, reporting, Trust
-Center link-key exchange, and encrypted application reports. The standard
-image links SEC_ENG while dropping the RustCrypto software AES core; it
-measures 161,570 bytes versus 165,602 bytes for the former software build,
-saving 4,032 bytes with no additional RAM. Silent reset/resume and a
-cycle-derived timeout bound remain open hardware gates.
+Center link-key exchange, and encrypted application reports. The hardware-AES
+conversion measured 161,570 bytes versus 165,602 bytes for the former software
+build, saving 4,032 bytes with no additional RAM. Later stack work brings the
+current production payload to 176,930 bytes while still excluding the software
+AES core. Silent reset/resume and a cycle-derived timeout bound remain open
+hardware gates.
 
 The EFR32MG1 CRYPTO provider is also production-default. Two startup KATs,
 NWK/APS CCM*, Trust Center link-key derivation, full ZHA commissioning and
 interview, encrypted reporting, EM2 operation, and silent reset/resume passed
-on the TRÅDFRI target. The final factory-EUI image is 137,532 bytes with OTA
-enabled. Hardware failures stop startup; software AES is not linked.
+on the TRÅDFRI target. The hardware-acceptance factory-EUI image was 137,532
+bytes with OTA enabled; the current production payload is 150,456 bytes.
+Hardware failures stop startup; software AES is not linked.
 
 The reusable crypto crates retain the software provider for host tests and
 platforms without a proven accelerator. It is not linked into the BL702 or

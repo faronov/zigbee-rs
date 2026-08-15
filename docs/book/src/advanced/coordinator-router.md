@@ -80,8 +80,9 @@ monomorphization's `tick` future never materializes the child-serving futures:
 - `RelayRouter` also runs permit-join expiry, router / link-status / route-table
   / concentrator maintenance and pending routing transmission;
 - `Router` additionally runs child End Device Timeout aging, MAC parent-command
-  servicing, Parent Announce transaction aging and a due Parent Announce, in the
-  pre-split order.
+  servicing (including the R22 orphan procedure), Parent Announce transaction
+  aging, and ages `apsParentAnnounceTimer` to broadcast one due Parent Announce
+  message, in the pre-split order.
 
 `parent_mode_active()` now also requires `R::IS_PARENT`, so a relay never enters
 parent servicing even though it routes.
@@ -95,7 +96,14 @@ Each role also carries a *distinct* inline runtime state
 - `EndDevice` holds `EndDeviceState`, which owns only the R22 End Device Timeout
   *client* lifecycle (see [event loop](../core-concepts/event-loop.md#end-device-timeout-keepalive));
 - `Router` holds `ParentState`, which owns only the deferred Trust Center
-  Update-Device queue and the pending Parent Announce flag.
+  Update-Device queue and the fingerprint of the last child table committed to
+  durable storage (what makes
+  [child-table persistence](nv-storage.md#child-table-routercoordinator)
+  self-tracking).
+
+`apsParentAnnounceTimer` itself lives in `ZdoLayer` behind the `router` feature,
+and the per-neighbour "still to be announced" bit lives in the neighbour table
+behind the same feature, so a leaf build carries neither.
 
 Because the client lifecycle helpers are bounded on `EndDeviceRole` and reached
 through static role hooks, a router/relay links none of the client code and a

@@ -631,14 +631,25 @@ the `u16` neighbour age counter). The deadline is:
 Router children age via Link Status, not this deadline; unauthenticated
 (provisional) children keep the existing short provisional-child timer.
 
-### Durable child table and Parent Announce
+### Durable child table, Parent Announce and the orphan procedure
 
 A router persists its authenticated children through a **separate** crash-safe
-store (`child_store`), independent of the security journal — see
-[NV storage → Child table](../advanced/nv-storage.md). After the restored child
-state is authoritative, `announce_parent()` broadcasts a R22 **Parent Announce**
-(ZDP `Parent_annce`, 0x001F) so a former parent of a child that has since moved
+store (`child_store`), independent of the security journal and bound to the
+extended PAN ID the children belong to — see
+[NV storage → Child table](../advanced/nv-storage.md). `restore_child_table()`
+re-installs them and schedules the R22 **Parent Announce**
+(ZDP `Parent_annce`, 0x001F, broadcast to 0xFFFC after
+`apsParentAnnounceTimer`), so a former parent of a child that has since moved
 prunes its stale record; see [ZDO → Parent Announce](./zdo.md).
+
+Restoring the table is also what lets the rebooted router answer the R22
+§3.6.1.4.3.2 **parent orphan procedure**: `NwkLayer::orphan_child_short()`
+resolves an orphan's extended address to the network address the parent already
+holds, but only for a joined router/coordinator and only for an *authenticated*
+`Child`. Everything else — an unknown device, a provisional
+`UnauthenticatedChild`, or a child that was never restored because its record
+belonged to another network — yields `None`, and the MAC transmits no
+coordinator realignment at all.
 
 ## `NwkStatus` — Error Codes
 
