@@ -2091,7 +2091,6 @@ impl<M: MacDriver> ApsLayer<M> {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// Transmit an APS command secured with a link key.
     ///
     /// Returns the APS counter the command was sent with, so a caller that
