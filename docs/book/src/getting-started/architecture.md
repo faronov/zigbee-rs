@@ -39,30 +39,49 @@ platform/chip HAL    radio, clocks, sleep, reset, raw flash controller
 A board crate must not depend on `zigbee-runtime`. Product code depends on the
 board and selects the storage/OTA policy used by the application.
 
-An application crate may be shared by several products of the same chip
-family. `apps/nrf-sensor` is the reference: it owns the whole nRF sensor
-lifecycle (commissioning, silent resume, bounded secure-rejoin retry, poll
-windows, interview detection, Device_annce retries, reporting, button
-semantics) once, and both `examples/nrf52840-sensor` and
-`examples/nrf52833-sensor` run it unmodified. It is generic over the four
-things that legitimately differ per product — the security store, the profile
-component, the fitted environmental sensor, and the battery chemistry — and
-those are bound in each firmware's composition root, so the application crate
-never depends on a product or a board:
+`apps/sensor-sed` is the reusable sleepy-sensor application layer. It owns
+commissioning, silent resume, bounded secure-rejoin retry, poll windows,
+interview detection, Device_annce retries, reporting cadence, button
+semantics, status indication, and durable checkpoints. It is generic over the
+MAC, security store, typed profile component, measurements, lifecycle
+platform, radio-power transition, and diagnostics sink; every capability is
+monomorphized.
+
+Chip GPIO/timer/reset/radio details stay outside that crate. For Nordic,
+`apps/nrf-sensor` now contains only the `embassy-nrf` adapters
+(`NrfPlatform`, `NrfRadioPower`, `NrfBattery`, `OnChipTemperature`, and compact
+`defmt` diagnostics). The nRF52840 composition root selects those adapters
+directly:
 
 ```rust,ignore
-// examples/nrf52833-sensor/src/main.rs — composition root
+// examples/nrf52840-sensor/src/main.rs — composition root
 struct Battery;                                       // product chemistry
 impl nrf_sensor_app::BatteryPolicy for Battery { /* … */ }
 
-let mut profile = nrf52833_sensor_product::profile::sensor_profile();
-let mut store = nrf52833_sensor_product::storage::security_store(nvmc);
+let mut profile = nrf52840_sensor_product::profile::sensor_profile();
+let mut store = nrf52840_sensor_product::storage::security_store(nvmc);
 let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
 
-let mut app: SensorApp<'_, _, _, _, Battery> =
-    SensorApp::new(node, led, button, environment, saadc);
+let mut app = sensor_sed_app::SensorApp::new(
+    node,
+    nrf_sensor_app::NrfPlatform::new(led, button),
+    nrf_sensor_app::NrfRadioPower,
+    nrf_sensor_app::NrfDiagnostics,
+    environment,
+    nrf_sensor_app::NrfBattery::<Battery>::new(saadc),
+);
 app.run().await
 ```
+
+A second platform composes the same application by implementing
+`LifecyclePlatform` with its native monotonic instant and button/LED/reset
+mechanisms, implementing `RadioPower<ItsMac>`, and supplying concrete
+`EnvironmentSource`, `BatterySource`, and `Diagnostics` types. Its product
+still owns identity, profile, persistence partition, and OTA policy; no board
+or HAL dependency enters `apps/sensor-sed`. This first slice is intentionally
+the no-OTA nRF sensor path: an OTA-enabled product must add an explicit static
+OTA lifecycle capability before using this application rather than treating
+ignored OTA events as support.
 
 ## Board Resource Ownership
 

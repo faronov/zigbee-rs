@@ -2,10 +2,10 @@
 
 An async Embassy-based Zigbee 3.0 **sleepy end device** for the Nordic
 nRF52833-DK (PCA10100). It runs the *same* application as
-`examples/nrf52840-sensor` — both firmwares are thin composition roots over
-the shared [`apps/nrf-sensor`](../../apps/nrf-sensor) crate — so the two
-products cannot drift apart in commissioning, persistence, polling,
-reporting, or button behavior.
+`examples/nrf52840-sensor`. The lifecycle is in
+[`apps/sensor-sed`](../../apps/sensor-sed); this root currently reaches it
+through the source-compatible Nordic adapter in
+[`apps/nrf-sensor`](../../apps/nrf-sensor).
 
 ## Hardware Requirements
 
@@ -84,7 +84,8 @@ reportable cluster in the active profile (3/3 for the on-chip/SHT31 build,
 
 | Concern | Crate |
 |---------|-------|
-| Lifecycle, polling, reporting, button, LED | `apps/nrf-sensor` |
+| Lifecycle, polling, reporting, button semantics | `apps/sensor-sed` |
+| Nordic GPIO/time/reset, radio sleep, SAADC, TEMP, diagnostics | `apps/nrf-sensor` |
 | Identity, memory map, security partition, battery curve, profile | `products/nrf52833-sensor` |
 | LED1 / Button 1 / sensor I2C pins | `boards/nrf52833-dk` |
 | Radio, RNG, SAADC, TEMP, NVMC, clocks | `embassy-nrf` |

@@ -11,6 +11,7 @@ members = [
     "zigbee-zcl",
     "zigbee-runtime",
     "zigbee",
+    "apps/sensor-sed",
     "drivers/sht3x",
     "drivers/bme280",
     "drivers/sht4x",

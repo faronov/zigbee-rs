@@ -18,10 +18,10 @@
 //! the identity guard — then hands all of it to
 //! [`nrf_sensor_app::SensorApp`], which owns the full
 //! commissioning/event-loop lifecycle *shared with the nRF52840 sensor*
-//! (see `apps/nrf-sensor/src/app.rs`). Endpoint/cluster composition,
-//! reporting defaults, and measurement mapping live in the shared
-//! `zigbee_runtime::profile` archetype selected by the product crate;
-//! NWK/APS/ZDO/BDB state machines live in `zigbee-runtime`.
+//! through the compatibility adapter over `apps/sensor-sed`.
+//! Endpoint/cluster composition, reporting defaults, and measurement mapping
+//! live in the shared `zigbee_runtime::profile` archetype selected by the
+//! product crate; NWK/APS/ZDO/BDB state machines live in `zigbee-runtime`.
 //!
 //! The device commissions automatically at boot and resumes silently after
 //! a reset; Button 1 is only an operator override (short press =

@@ -3,7 +3,7 @@ name = "nrf-sensor-app"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Shared Zigbee sleepy-end-device sensor application for Nordic nRF52 products"
+description = "Nordic adapters for the shared Zigbee sleepy-sensor application"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
@@ -15,6 +15,7 @@ publish = false
 # `nrf52833`). Naming a chip here would make the crate usable by exactly one
 # product, which is the opposite of its purpose.
 [dependencies]
+sensor-sed-app = { path = "../sensor-sed" }
 zigbee-mac = { path = "../../zigbee-mac" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 

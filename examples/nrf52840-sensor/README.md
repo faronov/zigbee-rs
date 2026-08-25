@@ -78,7 +78,7 @@ See `src/sensor.rs` for the recoverable probe/read wiring.
 
 ## What It Demonstrates
 
-- Embassy async event loop (`SensorApp::run` in `apps/nrf-sensor`) using `select` (button press vs. poll timer) plus a bounded per-iteration MAC poll/receive window
+- Shared async lifecycle (`SensorApp::run` in `apps/sensor-sed`) with the Nordic wait/radio adapters plus a bounded per-iteration MAC poll/receive window
 - On-chip TEMP sensor or async external I2C sensor (BME280 / SHT31)
 - Building a Zigbee device with `ZigbeeDevice` builder API
 - ZCL endpoint 1 (Home Automation, device type 0x0302) with **Basic**,
@@ -155,14 +155,14 @@ nrf52840-sensor/
     └── main.rs           # Composition root: platform startup, resource
                           # construction, hardware AES + identity guard,
                           # battery-policy binding, then hands everything to
-                          # nrf_sensor_app::SensorApp::run()
+                          # sensor_sed_app::SensorApp::run()
 ```
 
 The lifecycle itself is **not** in this example. `SensorApp` (join/leave/
-rejoin, polling, reporting, Identify, button, durable checkpointing) and the
-host-tested poll-delay `policy` live in [`apps/nrf-sensor`](../../apps/nrf-sensor)
-and are shared byte-for-byte with `examples/nrf52833-sensor`; the host tests
-for `policy` are in `tests/src/nrf_sensor_policy_tests.rs`.
+rejoin, polling, reporting, Identify, button, durable checkpointing) and its
+host tests live in [`apps/sensor-sed`](../../apps/sensor-sed). Nordic
+clock/GPIO/radio/SAADC/diagnostic adapters live in
+[`apps/nrf-sensor`](../../apps/nrf-sensor).
 
 ## Architecture
 
@@ -171,15 +171,12 @@ persistence, and Zigbee protocol behavior are owned by separate crates:
 
 ```
 nrf52840-sensor (example)   startup, resource construction, policy binding
-        |
-nrf-sensor-app              full commissioning/event-loop lifecycle, shared
-        |                   with examples/nrf52833-sensor (apps/nrf-sensor)
-        |
-nrf52840-sensor-product     identity, link/memory.x, security journal
-        |                   partition, concrete profile (products/nrf52840-sensor)
-        |
-nrf52840-dk (board)         LED1/Button 1/sensor-I2C pin wiring only
-                            (boards/nrf52840-dk; no zigbee-runtime dependency)
+        ├── sensor-sed-app          commissioning/event-loop lifecycle
+        ├── nrf-sensor-app          Nordic static capability adapters
+        ├── nrf52840-sensor-product identity, link/memory.x, security journal,
+        │                           battery policy, concrete profile
+        └── nrf52840-dk             LED1/Button 1/sensor-I2C pin wiring only;
+                                    no zigbee-runtime dependency
 ```
 
 `products/nrf52840-sensor` owns the NVMC partition (`src/storage.rs`) and

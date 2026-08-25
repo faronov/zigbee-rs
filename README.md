@@ -298,7 +298,7 @@ the accelerator is a block-cipher provider, not autonomous MAC offload.
 | **ESP32-C6** | ✅ esp-ieee802154 | `riscv32imac-unknown-none-elf` | Native 802.15.4 radio |
 | **ESP32-H2** | ✅ esp-ieee802154 | `riscv32imac-unknown-none-elf` | Native 802.15.4 radio |
 | **nRF52840** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
-| **nRF52833** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral; runs the same `apps/nrf-sensor` firmware as nRF52840 — join, interview, secured reporting and silent resume hardware-tested |
+| **nRF52833** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral; runs the same `apps/sensor-sed` lifecycle as nRF52840 through Nordic adapters — join, interview, secured reporting and silent resume hardware-tested before this extraction |
 | **BL702** | 🦀 Pure-Rust direct registers | `riscv32imc-unknown-none-elf` | XT-ZB1 RF, join, ZHA interview, security, and reporting hardware-tested |
 | **CC2340** | 🦀 Rust host + TI microcode | `thumbv6m-none-eabi` | Raw polling TX/RX implemented; hardware validation, CCA, IRQs, filtering, and auto-ACK pending |
 | **Telink TLSR8258** | 🦀 **Pure Rust** | `tc32-unknown-none-elf` | Real tc32 builds in the dedicated [modern-tc32](https://github.com/modern-tc32) CI workflow |

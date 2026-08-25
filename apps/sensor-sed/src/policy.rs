@@ -1,5 +1,4 @@
-//! Pure poll-delay arbitration for [`crate::app::SensorApp`], factored out so
-//! it can be tested on the host.
+//! Pure poll-delay arbitration for [`crate::app::SensorApp`].
 //!
 //! Interview state is deliberately *not* here: which clusters a remote client
 //! configured for reporting is common Zigbee state owned by
@@ -11,15 +10,9 @@
 //! non-empty, well-formed Configure Reporting command made entirely of
 //! Send-direction records whose every record succeeded.
 //!
-//! This module touches nothing but `core` and `zigbee_runtime::event_loop`
-//! (both host-buildable — see `zigbee-runtime`'s own `cargo test`), unlike
-//! the rest of this crate which needs the real `thumbv7em-none-eabihf`
-//! target and Nordic hardware. `tests/src/nrf_sensor_policy_tests.rs`
-//! `#[path]`-includes this exact file into the workspace's host test crate,
-//! the same way `tests/src/efr32mg1_pm_tests.rs` mirrors `efr32mg1-hal`'s
-//! `pm.rs`, so the arbitration logic exercised on the host is byte-for-byte
-//! what runs on hardware — now for every nRF sensor product, not just the
-//! nRF52840.
+//! The whole `apps/sensor-sed` crate is host-buildable, so these tests run
+//! directly as normal crate unit tests while the same functions are
+//! monomorphized into embedded firmware.
 
 use zigbee_runtime::event_loop::TickResult;
 

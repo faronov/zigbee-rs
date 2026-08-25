@@ -4,12 +4,13 @@ Nordic's nRF52840 and nRF52833 are ARM Cortex-M4F SoCs with a built-in
 IEEE 802.15.4 radio. The zigbee-rs nRF backend uses Embassy's radio driver
 for interrupt-driven, DMA-based TX/RX — **no SoftDevice required**.
 
-> **Current hardware baseline verified:** The product/profile/`ZigbeeNode`
+> **Hardware baseline before the app-layer extraction:** The
+> product/profile/`ZigbeeNode`
 > sensor was tested end-to-end on an nRF52840-DK revision 2 with
 > **Home Assistant + ZHA**, including fresh commissioning, unique-TCLK
 > authentication, End Device Timeout, interview, reporting, Identify, durable
 > security state, and silent reset/resume. The **nRF52833-DK (PCA10100)** now
-> runs the *same* application crate (`apps/nrf-sensor`) and has been verified
+> runs the same lifecycle and has been verified
 > on hardware for join, interview, secured reporting, durable persistence and
 > silent resume — see [nRF52833 hardware acceptance](#nrf52833-hardware-acceptance).
 >
@@ -134,16 +135,18 @@ Not yet exercised on nRF52833 silicon: the 3 s long-press durable factory
 reset, battery-percentage reporting over its full reporting interval, and
 long-duration low-power current measurement.
 
-### Shared nRF sensor application
+### Shared sleepy-sensor application
 
-`apps/nrf-sensor` holds one copy of the sensor lifecycle for every nRF
-product. It is generic over the security store, the profile component, the
-fitted environmental sensor, and the battery chemistry, so nRF52840 and
-nRF52833 cannot drift apart:
+`apps/sensor-sed` holds the platform-independent lifecycle.
+`apps/nrf-sensor` supplies the Nordic GPIO/time/reset, radio-sleep, SAADC,
+on-chip-temperature, and `defmt` adapters. The nRF52840 root composes those
+capabilities directly; nRF52833 temporarily retains a source-compatible
+adapter wrapper over the same lifecycle:
 
 | Concern | Owner |
 |---------|-------|
-| Commissioning, resume, retry, polling, interview, reporting, button, LED | `apps/nrf-sensor` |
+| Commissioning, resume, retry, polling, interview, reporting, button semantics | `apps/sensor-sed` |
+| Nordic GPIO/time/reset, radio sleep, SAADC, on-chip TEMP, diagnostics | `apps/nrf-sensor` |
 | Identity strings, flash layout, security partition, battery curve, profile | `products/nrf5283x-sensor` |
 | LED1/Button 1/I2C pins | `boards/nrf5283x-dk` |
 | Radio, RNG, SAADC, TEMP, NVMC, clocks | `embassy-nrf` |
@@ -517,17 +520,17 @@ on-chip temperature sensor and reports simulated humidity. Includes:
 
 Like the EFR32MG1 and ESP32-H2 sensors, this firmware separates platform
 startup from the lifecycle — but unlike them, the lifecycle is **not** part
-of the example. It lives in `apps/nrf-sensor` and is shared verbatim with
-`examples/nrf52833-sensor`:
+of the example. It lives in `apps/sensor-sed`; Nordic-only capability
+implementations live in `apps/nrf-sensor`:
 
 | File | Owns |
 |------|------|
 | `examples/nrf5283x-sensor/src/main.rs` | Embassy/Nordic platform startup (clocks, DC-DC, boot signal), board/sensor resource construction, hardware AES install + startup KAT, the crash-safe security journal, the concrete product profile, the battery-policy binding, and the identity guard. Builds `device`/`security_store`/`profile` as plain locals and hands borrows of them to `SensorApp`. |
 | `examples/nrf5283x-sensor/src/sensor.rs` | Optional external BME280/SHT31 I2C source (board-typed, therefore per-example). |
-| `apps/nrf-sensor/src/app.rs` | `SensorApp<'a, S, C, E, B>`, the full commissioning and event-loop lifecycle: bounded (four-round) MAC receive/poll windows, two-level fast/slow polling, the post-join interview window, Device_annce retries, button handling, and durable checkpointing. |
-| `apps/nrf-sensor/src/environment.rs` | `EnvironmentSource` / `EnvironmentSink` traits plus the chip-generic on-chip `TEMP` source. |
-| `apps/nrf-sensor/src/battery.rs` | The `BatteryPolicy` trait a composition root uses to inject its *product's* chemistry — the app crate never depends on a product. |
-| `apps/nrf-sensor/src/policy.rs` | A small, dependency-free (`core` + `zigbee_runtime::event_loop` only) poll-delay arbitration helper, host-tested from `tests/src/nrf_sensor_policy_tests.rs` via the same `#[path]`-include technique as `tests/src/efr32mg1_pm_tests.rs`. |
+| `apps/sensor-sed/src/app.rs` | Generic `SensorApp`, the full commissioning and event-loop lifecycle: bounded MAC receive/poll windows, fast/slow polling, interview window, Device_annce retries, button handling, and durable checkpointing. |
+| `apps/sensor-sed/src/{capabilities,battery,environment,diagnostics}.rs` | Static capability seams for platform lifecycle services, radio power, measurements, profile updates, and diagnostics. |
+| `apps/sensor-sed/src/policy.rs` | Host-tested poll-delay arbitration used unchanged by firmware. |
+| `apps/nrf-sensor/src/{platform,battery,environment,diagnostics}.rs` | `embassy-nrf` and product-policy adapters; no Zigbee lifecycle state machine. |
 
 Interview detection is **not** application state. The app reacts to
 `StackEvent::ReportingConfigured` — emitted by `zigbee-runtime` only for a
@@ -543,10 +546,9 @@ receive-only, or mixed-direction command arrives as the generic
 `main.rs` stays a thin composition root; `SensorApp::run()` is the only place
 that drives the network, for every nRF product.
 
-`SensorApp` is generic over the security store `S`, the profile component
-`C`, the environmental source `E`, and the battery policy `B`. All four are
-monomorphized, so a product pays exactly what it uses and neither product
-can silently diverge from the other's lifecycle.
+`SensorApp` is generic over the MAC, security store, profile component,
+environment and battery sources, lifecycle platform, radio-power capability,
+and diagnostics sink. All are monomorphized.
 
 Unlike the EFR32MG1/ESP32-H2 sensors, `SensorApp` is lifetime-generic
 and **not** built via `StaticCell`/`build_into`. Those two products use the
@@ -622,7 +624,14 @@ let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
 let mut security_store = nrf52840_sensor_product::storage::security_store(nvmc);
 
 let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
-let mut app = SensorApp::new(node, led, button, /* sensors */);
+let mut app = SensorApp::new(
+    node,
+    nrf_sensor_app::NrfPlatform::new(led, button),
+    nrf_sensor_app::NrfRadioPower,
+    nrf_sensor_app::NrfDiagnostics,
+    environment,
+    nrf_sensor_app::NrfBattery::<Battery>::new(saadc),
+);
 app.run().await
 ```
 

@@ -1,0 +1,17 @@
+[package]
+name = "sensor-sed-app"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Platform-independent Zigbee sleepy-end-device sensor lifecycle"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+zigbee-mac = { path = "../../zigbee-mac" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+
+[dev-dependencies]
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }

@@ -13,8 +13,6 @@ mod integration_tests;
 #[cfg(test)]
 mod mac_tests;
 #[cfg(test)]
-mod nrf_sensor_policy_tests;
-#[cfg(test)]
 mod nwk_tests;
 #[cfg(test)]
 mod ota_tests;
