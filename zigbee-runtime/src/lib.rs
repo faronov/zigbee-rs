@@ -1435,6 +1435,57 @@ mod resume_tests {
         indication
     }
 
+    #[cfg(feature = "router")]
+    fn aps_unicast_payload(
+        dst_endpoint: u8,
+        src_endpoint: u8,
+        cluster_id: u16,
+        profile_id: u16,
+        aps_counter: u8,
+        payload: &[u8],
+    ) -> heapless::Vec<u8, 128> {
+        let header = zigbee_aps::frames::ApsHeader {
+            frame_control: zigbee_aps::frames::ApsFrameControl {
+                frame_type: zigbee_aps::frames::ApsFrameType::Data as u8,
+                delivery_mode: zigbee_aps::frames::ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: false,
+                ack_request: true,
+                extended_header: false,
+            },
+            dst_endpoint: Some(dst_endpoint),
+            group_address: None,
+            cluster_id: Some(cluster_id),
+            profile_id: Some(profile_id),
+            src_endpoint: Some(src_endpoint),
+            aps_counter,
+            extended_header: None,
+        };
+        let mut frame = [0u8; 128];
+        let header_len = header.serialize(&mut frame);
+        frame[header_len..header_len + payload.len()].copy_from_slice(payload);
+        heapless::Vec::from_slice(&frame[..header_len + payload.len()]).unwrap()
+    }
+
+    #[cfg(feature = "router")]
+    fn decrypt_outbound_nwk_payload(frame: &zigbee_mac::MacFrame) -> heapless::Vec<u8, 128> {
+        let bytes = frame.as_slice();
+        let (header, header_len) =
+            zigbee_nwk::frames::NwkHeader::parse(bytes).expect("outbound NWK frame parses");
+        assert!(header.frame_control.security);
+        assert_eq!(header.dst_addr, COORDINATOR);
+        let (security, security_len) =
+            zigbee_nwk::security::NwkSecurityHeader::parse(&bytes[header_len..])
+                .expect("outbound NWK security header parses");
+        let aad_len = header_len + security_len;
+        let mut aad = [0u8; 64];
+        aad[..aad_len].copy_from_slice(&bytes[..aad_len]);
+        aad[header_len] = (aad[header_len] & !0x07) | 0x05;
+        zigbee_nwk::security::NwkSecurity::new()
+            .decrypt(&aad[..aad_len], &bytes[aad_len..], &NETWORK_KEY, &security)
+            .expect("outbound NWK frame authenticates")
+    }
+
     fn leave_command(rejoin: bool) -> [u8; 2] {
         [
             zigbee_nwk::frames::NwkCommandId::Leave as u8,
@@ -1811,6 +1862,158 @@ mod resume_tests {
             "a committed frame counter must reject the replay"
         );
         assert_eq!(device.nwk_rx_security_stats().decrypt_successes, 1);
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn late_rebroadcast_does_not_break_secured_active_ep_or_on_off_responses() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::Router)
+            .endpoint(
+                1,
+                0x0104,
+                zigbee_zcl::DeviceId::MAINS_POWER_OUTLET,
+                |endpoint| endpoint.cluster_server(zigbee_zcl::ClusterId::ON_OFF),
+            )
+            .build_router();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+
+        // A neighbour has re-secured a broadcast originated by this device:
+        // the end-to-end NWK source is our short address, no source IEEE was
+        // present in that header, and the auxiliary source names the relay.
+        block_on(zigbee_mac::PlatformServices::delay_micros(
+            device.mac_mut(),
+            zigbee_nwk::conflict::NETWORK_BROADCAST_DELIVERY_TIME_US + 1,
+        ));
+        let rebroadcast = nwk_frame_from(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            NEIGHBOUR_IEEE,
+            ShortAddress::BROADCAST,
+            &[0xAA],
+            0x31,
+            true,
+        );
+        assert!(
+            block_on(device.process_incoming(&indication_from(rebroadcast, NEIGHBOUR), &mut [],))
+                .is_none()
+        );
+        assert_eq!(
+            device.bdb().zdo().nwk().nib().network_address,
+            ShortAddress(OUR_SHORT),
+            "the relay security identity must not move the plug's address"
+        );
+        device.mac_mut().clear_tx_history();
+
+        // Secured Active_EP_req traverses MAC → NWK → APS → ZDO and produces
+        // the secured response Zigbee2MQTT waits for during interview.
+        let active_ep_request = aps_unicast_payload(
+            0,
+            0,
+            zigbee_zdo::ACTIVE_EP_REQ,
+            zigbee_zdo::ZDP_PROFILE_ID,
+            0x20,
+            &[0x41, OUR_SHORT as u8, (OUR_SHORT >> 8) as u8],
+        );
+        let active_ep_frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            active_ep_request.as_slice(),
+            1,
+            true,
+        );
+        assert!(block_on(device.process_incoming(&indication(active_ep_frame), &mut [])).is_none());
+        {
+            let response = decrypt_outbound_nwk_payload(
+                &device
+                    .mac()
+                    .tx_history()
+                    .last()
+                    .expect("Active_EP_rsp was transmitted")
+                    .payload,
+            );
+            let (aps, consumed) = zigbee_aps::frames::ApsHeader::parse(&response)
+                .expect("Active_EP_rsp APS header parses");
+            assert_eq!(aps.cluster_id, Some(zigbee_zdo::ACTIVE_EP_RSP));
+            assert_eq!(aps.src_endpoint, Some(0));
+            assert_eq!(aps.dst_endpoint, Some(0));
+            assert_eq!(
+                &response[consumed..],
+                &[0x41, 0x00, OUR_SHORT as u8, (OUR_SHORT >> 8) as u8, 1, 1]
+            );
+        }
+        device.mac_mut().clear_tx_history();
+
+        // A secured genOnOff.off reaches endpoint 1, changes the actuator, and
+        // emits the command-0x0B Success Default Response expected by ZiGate.
+        let mut on_off = zigbee_zcl::clusters::on_off::OnOffCluster::new();
+        zigbee_zcl::clusters::Cluster::handle_command(
+            &mut on_off,
+            zigbee_zcl::clusters::on_off::CMD_ON,
+            &[],
+        )
+        .unwrap();
+        let zcl_request = zigbee_zcl::frame::ZclFrame::new_cluster_specific(
+            0x52,
+            zigbee_zcl::clusters::on_off::CMD_OFF,
+            zigbee_zcl::ClusterDirection::ClientToServer,
+            false,
+        );
+        let mut zcl_bytes = [0u8; 16];
+        let zcl_len = zcl_request.serialize(&mut zcl_bytes).unwrap();
+        let on_off_request = aps_unicast_payload(
+            1,
+            1,
+            zigbee_zcl::ClusterId::ON_OFF.0,
+            0x0104,
+            0x21,
+            &zcl_bytes[..zcl_len],
+        );
+        let on_off_frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            on_off_request.as_slice(),
+            2,
+            true,
+        );
+        {
+            let mut clusters = [super::ClusterRef {
+                endpoint: 1,
+                cluster: &mut on_off,
+            }];
+            assert!(
+                block_on(device.process_incoming(&indication(on_off_frame), &mut clusters))
+                    .is_some()
+            );
+            block_on(device.flush_pending_responses());
+        }
+        assert!(!on_off.is_on());
+
+        let response = decrypt_outbound_nwk_payload(
+            &device
+                .mac()
+                .tx_history()
+                .last()
+                .expect("On/Off Default Response was transmitted")
+                .payload,
+        );
+        let (aps, consumed) =
+            zigbee_aps::frames::ApsHeader::parse(&response).expect("On/Off APS header parses");
+        assert_eq!(aps.cluster_id, Some(zigbee_zcl::ClusterId::ON_OFF.0));
+        assert_eq!(aps.src_endpoint, Some(1));
+        assert_eq!(aps.dst_endpoint, Some(1));
+        let zcl = zigbee_zcl::frame::ZclFrame::parse(&response[consumed..])
+            .expect("On/Off Default Response parses");
+        assert_eq!(zcl.header.seq_number, 0x52);
+        assert_eq!(zcl.header.command_id.0, 0x0B);
+        assert_eq!(
+            zcl.header.direction(),
+            zigbee_zcl::ClusterDirection::ServerToClient
+        );
+        assert_eq!(zcl.payload.as_slice(), &[0x00, 0x00]);
     }
 
     // Relaying needs the router routing/BTR/source-route tables, which are

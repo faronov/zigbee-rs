@@ -2041,15 +2041,15 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Detect an address conflict revealed by a frame that claims *our* short
     /// address as its source (R22 §3.6.1.9.2).
     ///
-    /// Only an authenticated identity may move this device's address: on a
-    /// secured network the frame must carry NWK security whose source IEEE
-    /// address differs from ours *and* pass CCM*, so a forged header alone
-    /// cannot push a device off its address. On an unsecured network the NWK
-    /// header's source IEEE address is the only evidence available.
+    /// Only an explicit origin identity in the NWK header may move this
+    /// device's address. The auxiliary security source is hop-by-hop: a router
+    /// legitimately re-securing our own broadcast names itself there while
+    /// preserving our NWK source address. It therefore authenticates the frame
+    /// but is not evidence that another device owns our short address.
     ///
-    /// R22 ignores a conflicting broadcast during the first
-    /// `nwkNetworkBroadcastDeliveryTime` of operation, because this device's
-    /// own earlier broadcasts may still be in flight.
+    /// On a secured network the frame must additionally pass CCM*, so a forged
+    /// header alone cannot push a device off its address. On an unsecured
+    /// network the explicit NWK source IEEE is the only evidence available.
     #[inline(never)]
     fn detect_self_addressed_conflict(
         &mut self,
@@ -2064,14 +2064,8 @@ impl<M: MacDriver> NwkLayer<M> {
             // device can do about it either way.
             return None;
         }
-        if let Some(src_ieee) = header.src_ieee
-            && src_ieee == self.nib.ieee_address
-        {
-            return None;
-        }
-        if is_nwk_broadcast(header.dst_addr)
-            && self.mac.monotonic_micros() < crate::conflict::NETWORK_BROADCAST_DELIVERY_TIME_US
-        {
+        let src_ieee = header.src_ieee?;
+        if src_ieee == self.nib.ieee_address {
             return None;
         }
 
@@ -2079,15 +2073,8 @@ impl<M: MacDriver> NwkLayer<M> {
             if !header.frame_control.security {
                 return None;
             }
-            let after_header = mac_payload.get(consumed..)?;
-            let (aux, _) = crate::security::NwkSecurityHeader::parse(after_header)?;
-            if aux.source_address == self.nib.ieee_address {
-                return None;
-            }
             // A frame that cannot be authenticated proves nothing at all.
             self.authenticate_incoming(mac_payload, consumed, header.src_addr)?;
-        } else if header.src_ieee.is_none() {
-            return None;
         }
 
         Some(self.detect_local_address_conflict())
@@ -4855,6 +4842,102 @@ mod tests {
         assert!(block_on(relay.process_incoming_nwk_frame(&on_air, 42)).is_none());
         assert_eq!(relay.rx_security_stats().replay_rejections, 1);
         assert_eq!(relay.mac.tx_history().len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_late_secured_rebroadcast_without_origin_ieee_is_not_an_address_conflict() {
+        let on_air = secured_frame_on_air(ShortAddress::BROADCAST, &[0x5A, 0xA5]);
+        let (origin_header, _) = NwkHeader::parse(&on_air).expect("originated frame parses");
+        assert_eq!(origin_header.src_addr, ORIGIN);
+        assert_eq!(
+            origin_header.src_ieee, None,
+            "ordinary originated data carries no explicit NWK source IEEE"
+        );
+
+        let mut relay = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        assert!(
+            relay
+                .nib
+                .set_frame_counter_reservation(RESERVED_FLOOR, RESERVED_FLOOR + 8)
+        );
+        let _ = block_on(relay.process_incoming_nwk_frame(&on_air, 42));
+        let rebroadcast = recorded_frame(&relay, 0);
+        let (relayed_header, consumed) =
+            NwkHeader::parse(&rebroadcast).expect("rebroadcast parses");
+        assert_eq!(relayed_header.src_addr, ORIGIN);
+        assert_eq!(relayed_header.src_ieee, None);
+        let (aux, _) = crate::security::NwkSecurityHeader::parse(&rebroadcast[consumed..])
+            .expect("rebroadcast carries relay security");
+        assert_eq!(
+            aux.source_address, RELAY_IEEE,
+            "the hop security identity is the relay, not the NWK originator"
+        );
+
+        let mut origin = secured_node(DeviceType::Router, ORIGIN, ORIGIN_IEEE);
+        block_on(
+            origin
+                .mac_mut()
+                .delay_micros(crate::conflict::NETWORK_BROADCAST_DELIVERY_TIME_US + 1),
+        );
+        assert!(
+            block_on(origin.process_incoming_nwk_frame_from(&rebroadcast, 42, Some(OUR_ADDR),))
+                .is_none()
+        );
+        assert_eq!(
+            origin.take_command_outcome(),
+            None,
+            "a relay's auxiliary IEEE is not source-address conflict evidence"
+        );
+        assert_eq!(
+            origin.nib().network_address,
+            ORIGIN,
+            "the legitimate rebroadcast cannot move the local address"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_explicit_different_origin_ieee_still_reports_a_self_address_conflict() {
+        let mut impostor = secured_node(DeviceType::Router, ORIGIN, DEST_IEEE);
+        let mut header = frame(NwkFrameType::Data, ORIGIN, ShortAddress::BROADCAST);
+        header.frame_control.security = true;
+        header.frame_control.src_ieee_present = true;
+        header.src_ieee = Some(DEST_IEEE);
+        let mut frame_bytes = [0u8; 128];
+        let frame_len = impostor
+            .build_nwk_frame(&header, &[0xC1, 0xA4], &mut frame_bytes)
+            .expect("the conflicting originated frame builds");
+
+        let mut relay = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        assert!(
+            relay
+                .nib
+                .set_frame_counter_reservation(RESERVED_FLOOR, RESERVED_FLOOR + 8)
+        );
+        let _ = block_on(relay.process_incoming_nwk_frame(&frame_bytes[..frame_len], 42));
+        let rebroadcast = recorded_frame(&relay, 0);
+        let (relayed_header, consumed) =
+            NwkHeader::parse(&rebroadcast).expect("rebroadcast parses");
+        assert_eq!(relayed_header.src_addr, ORIGIN);
+        assert_eq!(relayed_header.src_ieee, Some(DEST_IEEE));
+        let (aux, _) = crate::security::NwkSecurityHeader::parse(&rebroadcast[consumed..])
+            .expect("rebroadcast carries relay security");
+        assert_eq!(aux.source_address, RELAY_IEEE);
+
+        let mut local = secured_node(DeviceType::Router, ORIGIN, ORIGIN_IEEE);
+        assert!(
+            block_on(local.process_incoming_nwk_frame_from(&rebroadcast, 42, Some(OUR_ADDR),))
+                .is_none()
+        );
+        assert_eq!(
+            local.take_command_outcome(),
+            Some(NwkCommandOutcome::AddressConflict {
+                previous: ORIGIN,
+                resolution: crate::conflict::AddressConflictResolution::NewLocalAddress,
+            }),
+            "an authenticated explicit NWK origin identity retains conflict detection"
+        );
     }
 
     #[test]
