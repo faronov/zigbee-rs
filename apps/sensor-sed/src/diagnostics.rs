@@ -3,6 +3,8 @@
 use zigbee_runtime::profile::ProfileError;
 use zigbee_runtime::security_store::SecurityStoreError;
 
+use crate::environment::EnvironmentReading;
+
 /// Semantic lifecycle diagnostics emitted by [`crate::SensorApp`].
 ///
 /// Keeping formatting outside the shared crate avoids coupling every product
@@ -38,14 +40,16 @@ pub enum DiagnosticEvent {
     SecureRejoinLimitReached {
         failures: u8,
     },
+    Environment(EnvironmentReading),
     EnvironmentReadFailed,
+    BatteryReadFailed,
     Battery {
         millivolts: u32,
         percentage: u8,
     },
     DefaultReportingConfigured,
     FastPollStarted {
-        duration_secs: u64,
+        duration_ms: u32,
     },
     Joined {
         short_address: u16,
@@ -91,7 +95,7 @@ pub enum DiagnosticEvent {
         open: bool,
     },
     ReportSent,
-    OtaEventIgnored,
+    UnexpectedOtaEvent,
     LeaveRequested,
     BasicResetToFactoryDefaults,
     RejoinRequested,
@@ -108,11 +112,12 @@ pub enum DiagnosticEvent {
         expected: usize,
     },
     ButtonJoin,
+    ButtonLeave,
     FastPollStopped {
         configured: usize,
         expected: usize,
     },
-    RadioSleepPreparationFailed,
+    WakeFailed,
 }
 
 /// Compile-time-selected diagnostics sink.

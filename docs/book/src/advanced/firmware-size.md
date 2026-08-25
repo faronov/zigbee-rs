@@ -17,9 +17,9 @@ flash offsets are platform-specific.
 | TLSR8258 end-device sensor (hardware AES) | 271,492 B | — | 280 KiB |
 | TLSR8258 parent router (hardware AES) | 338,520 B | — | 336 KiB |
 | BL702 end-device sensor (hardware AES) | 176,930 B | 185,136 B | 192 KiB |
-| nRF52840 end-device sensor | 220,104 B | — | 220 KiB |
+| nRF52840 end-device sensor | 224,272 B | — | 220 KiB |
 | nRF52840 relay router | 225,368 B | — | — |
-| nRF52833 end-device sensor | 220,096 B | — | 220 KiB |
+| nRF52833 end-device sensor | 224,336 B | — | 220 KiB |
 | EFR32MG1 end-device sensor (hardware AES + OTA) | 150,456 B | — | 160 KiB |
 
 The TLSR8258 rows are `scripts/tlsr8258.sh build sensor` / `build router` on

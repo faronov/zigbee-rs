@@ -1,6 +1,7 @@
 //! Nordic environmental-sensor adapters for the shared SED lifecycle.
 
-use defmt::info;
+use core::convert::Infallible;
+
 use sensor_sed_app::{EnvironmentReading, EnvironmentSource};
 
 /// The nRF52 on-chip `TEMP` peripheral, plus the synthetic humidity ramp
@@ -20,25 +21,17 @@ impl<'d> OnChipTemperature<'d> {
 }
 
 impl EnvironmentSource for OnChipTemperature<'_> {
-    async fn sample(&mut self) -> Option<EnvironmentReading> {
+    type Error = Infallible;
+
+    async fn sample(&mut self) -> Result<EnvironmentReading, Self::Error> {
         let raw_temp = self.temp.read().await;
         let temperature_centi_celsius = (raw_temp.to_bits() * 100 / 4) as i16;
         self.humidity_tick = self.humidity_tick.wrapping_add(1);
         let humidity_centi_percent = 5000u16 + ((self.humidity_tick % 100) as u16).wrapping_mul(10);
-        Some(EnvironmentReading {
+        Ok(EnvironmentReading {
             temperature_centi_celsius,
             humidity_centi_percent,
             pressure_tenth_kpa: None,
         })
-    }
-
-    fn log_reading(&self, reading: &EnvironmentReading) {
-        info!(
-            "T={}.{:02}°C H={}.{:02}% (on-chip)",
-            reading.temperature_centi_celsius / 100,
-            (reading.temperature_centi_celsius % 100).unsigned_abs(),
-            reading.humidity_centi_percent / 100,
-            reading.humidity_centi_percent % 100
-        );
     }
 }

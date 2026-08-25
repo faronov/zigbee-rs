@@ -683,6 +683,7 @@ dependencies = [
  "embassy-nrf",
  "embedded-storage",
  "nrf52840-dk",
+ "sensor-sed-app",
  "zigbee-aps",
  "zigbee-runtime",
  "zigbee-zcl",

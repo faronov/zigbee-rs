@@ -4485,6 +4485,16 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         !matches!(self.power.mode(), power::PowerMode::AlwaysOn)
     }
 
+    /// Whether [`tick`](Self::tick) owns sleepy-end-device parent polling.
+    ///
+    /// Applications that drain a bounded parent-poll window themselves must
+    /// disable this through
+    /// [`DeviceBuilder::automatic_polling`](crate::builder::DeviceBuilder::automatic_polling)
+    /// so each indirect frame has exactly one poll owner.
+    pub const fn automatic_polling_enabled(&self) -> bool {
+        self.automatic_polling
+    }
+
     /// Whether the network state has changed since last save.
     ///
     /// Check this after `tick()` returns — if true, call `save_state(nv)`

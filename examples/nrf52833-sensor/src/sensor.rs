@@ -100,24 +100,17 @@ mod bme280_sensor {
         }
     }
     impl nrf_sensor_app::EnvironmentSource for Sensor<'_> {
-        async fn sample(&mut self) -> Option<nrf_sensor_app::EnvironmentReading> {
-            let measurement = Sensor::sample(self).await?;
-            Some(nrf_sensor_app::EnvironmentReading {
+        type Error = ();
+
+        async fn sample(
+            &mut self,
+        ) -> Result<nrf_sensor_app::EnvironmentReading, Self::Error> {
+            let measurement = Sensor::sample(self).await.ok_or(())?;
+            Ok(nrf_sensor_app::EnvironmentReading {
                 temperature_centi_celsius: measurement.temperature_centi_celsius,
                 humidity_centi_percent: measurement.humidity_centi_percent,
                 pressure_tenth_kpa: Some(measurement.pressure_hpa),
             })
-        }
-
-        fn log_reading(&self, reading: &nrf_sensor_app::EnvironmentReading) {
-            defmt::info!(
-                "T={}.{:02}°C H={}.{:02}% P={}hPa",
-                reading.temperature_centi_celsius / 100,
-                (reading.temperature_centi_celsius % 100).unsigned_abs(),
-                reading.humidity_centi_percent / 100,
-                reading.humidity_centi_percent % 100,
-                reading.pressure_tenth_kpa.unwrap_or(0),
-            );
         }
     }
 }
@@ -217,23 +210,17 @@ mod sht31_sensor {
         }
     }
     impl nrf_sensor_app::EnvironmentSource for Sensor<'_> {
-        async fn sample(&mut self) -> Option<nrf_sensor_app::EnvironmentReading> {
-            let measurement = Sensor::sample(self).await?;
-            Some(nrf_sensor_app::EnvironmentReading {
+        type Error = ();
+
+        async fn sample(
+            &mut self,
+        ) -> Result<nrf_sensor_app::EnvironmentReading, Self::Error> {
+            let measurement = Sensor::sample(self).await.ok_or(())?;
+            Ok(nrf_sensor_app::EnvironmentReading {
                 temperature_centi_celsius: measurement.temperature_centi_celsius,
                 humidity_centi_percent: measurement.humidity_centi_percent,
                 pressure_tenth_kpa: None,
             })
-        }
-
-        fn log_reading(&self, reading: &nrf_sensor_app::EnvironmentReading) {
-            defmt::info!(
-                "T={}.{:02}°C H={}.{:02}%",
-                reading.temperature_centi_celsius / 100,
-                (reading.temperature_centi_celsius % 100).unsigned_abs(),
-                reading.humidity_centi_percent / 100,
-                reading.humidity_centi_percent % 100,
-            );
         }
     }
 }

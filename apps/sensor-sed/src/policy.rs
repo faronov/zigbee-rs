@@ -1,28 +1,128 @@
-//! Pure poll-delay arbitration for [`crate::app::SensorApp`].
-//!
-//! Interview state is deliberately *not* here: which clusters a remote client
-//! configured for reporting is common Zigbee state owned by
-//! [`zigbee_runtime::remote_reporting`], reached through
-//! `ZigbeeNode::remote_reporting_cluster_count` /
-//! `remote_reporting_is_complete`. This app used to keep its own cluster
-//! bitmask, which double-counted nothing but also happily counted commands
-//! the stack had *rejected* — the runtime now records a cluster only after a
-//! non-empty, well-formed Configure Reporting command made entirely of
-//! Send-direction records whose every record succeeded.
-//!
-//! The whole `apps/sensor-sed` crate is host-buildable, so these tests run
-//! directly as normal crate unit tests while the same functions are
-//! monomorphized into embedded firmware.
+//! Product-selected sleepy-sensor policy and pure deadline arbitration.
 
 use zigbee_runtime::event_loop::TickResult;
+use zigbee_runtime::power::PowerMode;
 
-/// Extract the runtime's requested "run again within this many ms" from a
-/// tick result, if any.
+/// What a short user-button press means for this product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortPressAction {
+    None,
+    JoinOnly,
+    ForceReport,
+    ToggleJoin,
+}
+
+pub trait UserActionPolicy {
+    const SHORT_PRESS: ShortPressAction;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoUserAction;
+
+impl UserActionPolicy for NoUserAction {
+    const SHORT_PRESS: ShortPressAction = ShortPressAction::None;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct JoinOnlyAction;
+
+impl UserActionPolicy for JoinOnlyAction {
+    const SHORT_PRESS: ShortPressAction = ShortPressAction::JoinOnly;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ForceReportAction;
+
+impl UserActionPolicy for ForceReportAction {
+    const SHORT_PRESS: ShortPressAction = ShortPressAction::ForceReport;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ToggleJoinAction;
+
+impl UserActionPolicy for ToggleJoinAction {
+    const SHORT_PRESS: ShortPressAction = ShortPressAction::ToggleJoin;
+}
+
+/// Maximum sleep depth a platform may use while waiting between parent polls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepDepth {
+    /// Keep clocks and radio ownership active; only await the timer/button.
+    Active,
+    /// Quiesce the radio and use a light/suspend sleep with retained state.
+    Idle,
+    /// Use a retention sleep that requires explicit MAC/radio restoration.
+    Retention,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ButtonPolicy {
+    pub long_press_ms: Option<u32>,
+    pub debounce_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusPolicy {
+    pub unjoined_blink_period_ms: u32,
+    pub blink_on_ms: u32,
+    pub blink_gap_ms: u32,
+    pub reset_blinks: u8,
+    pub reset_phase_ms: u32,
+}
+
+/// All product-tunable behavior owned by the environmental SED archetype.
 ///
-/// [`TickResult::RunAgain`] is the stack asking to be ticked again sooner
-/// than the caller's own periodic schedule — for example while a Trust
-/// Center link-key exchange or a light-sleep decision is in progress.
-/// `Idle` and `Event` results carry no such request.
+/// Durations are bounded `u32` milliseconds so 32-bit MCUs do not pay for
+/// repeated `u64` arithmetic. Platform-native rollover is handled by the
+/// selected wake controller's mark/elapsed implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SensorPolicy {
+    pub sample_interval_ms: u32,
+    pub fast_poll_ms: u32,
+    pub slow_poll_ms: u32,
+    pub fresh_join_fast_ms: u32,
+    pub restored_fast_ms: u32,
+    pub wake_duration_ms: u32,
+    pub join_retry_ms: u32,
+    pub announce_retry_ms: u32,
+    pub announce_retries: u8,
+    pub secure_rejoin_failure_limit: u8,
+    pub interview_complete_grace_ms: u32,
+    pub button: ButtonPolicy,
+    pub status: StatusPolicy,
+    pub sleep_depth: SleepDepth,
+}
+
+impl SensorPolicy {
+    pub const fn is_valid(&self) -> bool {
+        self.sample_interval_ms != 0
+            && self.fast_poll_ms != 0
+            && self.slow_poll_ms != 0
+            && self.wake_duration_ms != 0
+            && self.join_retry_ms != 0
+            && self.announce_retry_ms != 0
+            && self.secure_rejoin_failure_limit != 0
+            && self.interview_complete_grace_ms != 0
+            && self.button.debounce_ms != 0
+            && match self.button.long_press_ms {
+                Some(duration_ms) => duration_ms != 0,
+                None => true,
+            }
+            && self.status.unjoined_blink_period_ms != 0
+            && self.status.blink_on_ms != 0
+            && self.status.blink_gap_ms != 0
+            && self.status.reset_phase_ms != 0
+    }
+
+    pub const fn power_mode(&self) -> PowerMode {
+        PowerMode::Sleepy {
+            poll_interval_ms: self.slow_poll_ms,
+            wake_duration_ms: self.wake_duration_ms,
+        }
+    }
+}
+
+/// Extract the runtime's requested "run again within this many ms".
 pub fn run_again_delay_ms(result: &TickResult) -> Option<u32> {
     match result {
         TickResult::Idle | TickResult::Event(_) => None,
@@ -30,32 +130,25 @@ pub fn run_again_delay_ms(result: &TickResult) -> Option<u32> {
     }
 }
 
-/// Resolve the next poll/sleep delay, honoring an earlier `RunAgain`
-/// deadline over the fixed fast/slow poll window.
-///
-/// A `RunAgain` request only ever *shortens* the wait — it never lengthens
-/// past whatever fast/slow poll window is already in effect — and a
-/// zero-millisecond request is treated as "as soon as possible" (1 ms)
-/// rather than a busy loop.
-pub fn resolve_poll_delay_ms(base_poll_ms: u64, run_again_ms: Option<u64>) -> u64 {
-    match run_again_ms {
-        Some(delay_ms) => base_poll_ms.min(delay_ms.max(1)),
-        None => base_poll_ms,
-    }
+/// Remaining time until an interval expires.
+pub const fn remaining_ms(elapsed_ms: u32, interval_ms: u32) -> u32 {
+    interval_ms.saturating_sub(elapsed_ms)
 }
 
-/// Whether Configure Reporting activity should request the generic fast-poll
-/// extension.
+/// Select the next bounded wait from the base parent-poll cadence and every
+/// independently scheduled piece of application work.
 ///
-/// When a remote client's Configure Reporting completes the interview,
-/// [`crate::app::SensorApp`] sets a short grace window before a sleepy end
-/// device returns to bounded long polling. The generic ~120s extension its
-/// event callers apply on coordinator activity must therefore be requested
-/// *only while outbound reporting progress is still incomplete* — requesting
-/// it once reporting is complete would overwrite that short grace and keep
-/// the radio awake for no reason. This applies both to accepted
-/// `ReportingConfigured` events and rejected Configure Reporting commands:
-/// neither may reopen the generic window after the interview is complete.
+/// Zero means "run as soon as the executor can schedule us" and is converted
+/// to one millisecond to avoid an accidental busy loop.
+pub fn resolve_wait_delay_ms(base_poll_ms: u32, deadlines_ms: &[Option<u32>]) -> u32 {
+    let mut delay_ms = base_poll_ms.max(1);
+    for deadline_ms in deadlines_ms.iter().flatten() {
+        delay_ms = delay_ms.min((*deadline_ms).max(1));
+    }
+    delay_ms
+}
+
+/// Whether Configure Reporting activity should extend generic fast polling.
 pub fn configure_reporting_requests_generic_extension(reporting_complete: bool) -> bool {
     !reporting_complete
 }
@@ -80,30 +173,30 @@ mod tests {
     }
 
     #[test]
-    fn run_again_only_shortens_the_wait() {
-        assert_eq!(resolve_poll_delay_ms(30_000, Some(1_500)), 1_500);
-        assert_eq!(resolve_poll_delay_ms(250, Some(1_500)), 250);
-        assert_eq!(resolve_poll_delay_ms(30_000, None), 30_000);
+    fn every_due_deadline_can_shorten_the_poll_wait() {
+        assert_eq!(
+            resolve_wait_delay_ms(30_000, &[Some(8_000), Some(60_000), None]),
+            8_000
+        );
+        assert_eq!(resolve_wait_delay_ms(250, &[Some(1_500), Some(8_000)]), 250);
+        assert_eq!(resolve_wait_delay_ms(30_000, &[None, None]), 30_000);
     }
 
     #[test]
-    fn a_zero_run_again_delay_does_not_busy_loop() {
-        assert_eq!(resolve_poll_delay_ms(30_000, Some(0)), 1);
+    fn a_due_deadline_does_not_busy_loop() {
+        assert_eq!(resolve_wait_delay_ms(30_000, &[Some(0)]), 1);
     }
 
     #[test]
-    fn configure_reporting_after_completion_does_not_request_the_generic_extension() {
-        // Regression for the 5s completion grace being overwritten by the
-        // generic 120s extension: once reporting progress is complete, neither
-        // the successful final event nor a later rejected command may request
-        // the generic extension, so the short grace window is retained.
+    fn remaining_time_saturates_at_zero() {
+        assert_eq!(remaining_ms(400, 1_000), 600);
+        assert_eq!(remaining_ms(1_000, 1_000), 0);
+        assert_eq!(remaining_ms(1_500, 1_000), 0);
+    }
+
+    #[test]
+    fn configure_reporting_after_completion_keeps_the_short_grace() {
         assert!(!configure_reporting_requests_generic_extension(true));
-    }
-
-    #[test]
-    fn configure_reporting_while_incomplete_requests_the_generic_extension() {
-        // Genuine interview progress keeps the fast-poll window open so the
-        // coordinator can finish configuring the remaining clusters.
         assert!(configure_reporting_requests_generic_extension(false));
     }
 }

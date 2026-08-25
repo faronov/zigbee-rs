@@ -528,8 +528,8 @@ implementations live in `apps/nrf-sensor`:
 | `examples/nrf5283x-sensor/src/main.rs` | Embassy/Nordic platform startup (clocks, DC-DC, boot signal), board/sensor resource construction, hardware AES install + startup KAT, the crash-safe security journal, the concrete product profile, the battery-policy binding, and the identity guard. Builds `device`/`security_store`/`profile` as plain locals and hands borrows of them to `SensorApp`. |
 | `examples/nrf5283x-sensor/src/sensor.rs` | Optional external BME280/SHT31 I2C source (board-typed, therefore per-example). |
 | `apps/sensor-sed/src/app.rs` | Generic `SensorApp`, the full commissioning and event-loop lifecycle: bounded MAC receive/poll windows, fast/slow polling, interview window, Device_annce retries, button handling, and durable checkpointing. |
-| `apps/sensor-sed/src/{capabilities,battery,environment,diagnostics}.rs` | Static capability seams for platform lifecycle services, radio power, measurements, profile updates, and diagnostics. |
-| `apps/sensor-sed/src/policy.rs` | Host-tested poll-delay arbitration used unchanged by firmware. |
+| `apps/sensor-sed/src/{capabilities,parts,ota,battery,environment,diagnostics}.rs` | Atomic MAC quiesce/wait/readiness, semantic status, explicit resource ownership, OTA/profile pairing, fallible measurements, profile updates, supervision, and diagnostics. |
+| `apps/sensor-sed/src/policy.rs` | Product-selected `u32` timing policy plus host-tested deadline arbitration. |
 | `apps/nrf-sensor/src/{platform,battery,environment,diagnostics}.rs` | `embassy-nrf` and product-policy adapters; no Zigbee lifecycle state machine. |
 
 Interview detection is **not** application state. The app reacts to
@@ -546,9 +546,12 @@ receive-only, or mixed-direction command arrives as the generic
 `main.rs` stays a thin composition root; `SensorApp::run()` is the only place
 that drives the network, for every nRF product.
 
-`SensorApp` is generic over the MAC, security store, profile component,
-environment and battery sources, lifecycle platform, radio-power capability,
-and diagnostics sink. All are monomorphized.
+The public application type is `SensorApp<'a, M, S, P, R>`: MAC, security
+store, complete application profile, and one explicit resource bundle.
+`SensorSedParts<W, St, E, B, O, A, Sv, D>` retains concrete ownership of the
+wake controller, status, sensors, OTA lifecycle, user action, supervisor, and
+diagnostics capabilities. Nothing is hidden behind dynamic dispatch; all
+parts are monomorphized.
 
 Unlike the EFR32MG1/ESP32-H2 sensors, `SensorApp` is lifetime-generic
 and **not** built via `StaticCell`/`build_into`. Those two products use the
@@ -616,6 +619,8 @@ mac.install_aes_engine(aes).expect("Nordic ECB AES startup KAT");
 // Product-owned concrete profile and device — plain locals (see above).
 let mut profile = nrf52840_sensor_product::profile::sensor_profile();
 let mut device = ZigbeeDevice::builder(mac)
+    .power_mode(nrf52840_sensor_product::policy::SENSOR_POLICY.power_mode())
+    .automatic_polling(false)
     // identity and endpoint come from nrf52840-sensor-product
     .build();
 
@@ -626,12 +631,19 @@ let mut security_store = nrf52840_sensor_product::storage::security_store(nvmc);
 let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
 let mut app = SensorApp::new(
     node,
-    nrf_sensor_app::NrfPlatform::new(led, button),
-    nrf_sensor_app::NrfRadioPower,
-    nrf_sensor_app::NrfDiagnostics,
-    environment,
-    nrf_sensor_app::NrfBattery::<Battery>::new(saadc),
-);
+    &nrf52840_sensor_product::policy::SENSOR_POLICY,
+    sensor_sed_app::SensorSedParts {
+        wake: nrf_sensor_app::NrfWakeController::new(button),
+        status: nrf_sensor_app::NrfStatus::new(led),
+        environment,
+        battery: nrf_sensor_app::NrfBattery::<Battery>::new(saadc),
+        ota: sensor_sed_app::NoOta,
+        actions: nrf52840_sensor_product::policy::USER_ACTIONS,
+        supervisor: nrf_sensor_app::NrfSupervisor,
+        diagnostics: nrf_sensor_app::NrfDiagnostics,
+    },
+)
+.expect("manual SensorApp polling requires automatic_polling(false)");
 app.run().await
 ```
 

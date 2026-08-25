@@ -13,8 +13,8 @@
 //!
 //! [`SensorApp`] is a source-compatible wrapper for the not-yet-migrated
 //! nRF52833 composition root. New roots should construct
-//! [`sensor_sed_app::SensorApp`] directly from [`NrfPlatform`],
-//! [`NrfRadioPower`], and [`NrfBattery`].
+//! [`sensor_sed_app::SensorApp`] directly from [`NrfWakeController`],
+//! [`NrfStatus`], [`NrfSupervisor`], and [`NrfBattery`].
 
 #![no_std]
 
@@ -28,5 +28,5 @@ pub use app::SensorApp;
 pub use battery::{BatteryPolicy, NrfBattery};
 pub use diagnostics::{NrfDiagnostics, persistence_failure};
 pub use environment::OnChipTemperature;
-pub use platform::{NrfPlatform, NrfRadioPower, SensorMac};
+pub use platform::{NrfStatus, NrfSupervisor, NrfWakeController, SensorMac};
 pub use sensor_sed_app::{EnvironmentReading, EnvironmentSink, EnvironmentSource, policy};

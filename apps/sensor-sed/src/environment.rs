@@ -1,56 +1,59 @@
-//! Platform-independent environmental measurement source and sink abstractions.
-//!
-//! [`EnvironmentSource`] is whatever fitted hardware produces a reading.
-//! Concrete on-chip and I2C adapters stay in platform/board-facing crates.
-//!
-//! [`EnvironmentSink`] is the profile component the reading is written to.
-//! Implementing it for the shared `zigbee-runtime` archetypes lets the
-//! application update temperature/humidity/battery — and, when the product
-//! selected a pressure-capable component, pressure — without knowing which
-//! archetype the product chose.
+//! Environmental measurement source and profile-update abstractions.
 
 use zigbee_runtime::profile::{
-    BatteryMeasurement, TemperatureHumidityBattery, TemperatureHumidityMeasurement,
-    TemperatureHumidityPressureBattery,
+    ApplicationProfile, BatteryMeasurement, DeviceProfile, ProfileComponent,
+    TemperatureHumidityBattery, TemperatureHumidityMeasurement, TemperatureHumidityPressureBattery,
 };
 
-/// One complete environmental sample.
-///
-/// `pressure_tenth_kpa` is `None` for sources with no pressure channel; the
-/// application then never calls [`EnvironmentSink::update_pressure`], which
-/// keeps a product without a Pressure Measurement cluster unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvironmentReading {
     pub temperature_centi_celsius: i16,
     pub humidity_centi_percent: u16,
-    /// In the Pressure Measurement cluster's own units (whole hPa).
+    /// Pressure Measurement cluster units (whole hPa).
     pub pressure_tenth_kpa: Option<i16>,
 }
 
-/// A fitted environmental sensor.
-///
-/// `async fn` in a trait is deliberate: embedded executors commonly run this
-/// lifecycle on one thread, and requiring `Send` would wrongly reject sensor
-/// drivers that hold a borrowed bus.
+/// A fitted asynchronous environmental sensor.
 #[allow(async_fn_in_trait)]
 pub trait EnvironmentSource {
-    /// Take one reading. `None` means the read failed and the previously
-    /// reported cluster values must be left untouched.
-    async fn sample(&mut self) -> Option<EnvironmentReading>;
+    type Error;
 
-    /// Log a successful reading.
-    ///
-    /// Each source owns its own log line so the exact diagnostic text
-    /// (and the set of fields that are meaningful for that part) is
-    /// preserved rather than flattened into one generic format string.
-    fn log_reading(&self, reading: &EnvironmentReading);
+    async fn sample(&mut self) -> Result<EnvironmentReading, Self::Error>;
+}
+
+/// Synchronous sensor contract used by constrained or polling-only HALs.
+pub trait BlockingEnvironmentSource {
+    type Error;
+
+    fn sample(&mut self) -> Result<EnvironmentReading, Self::Error>;
+}
+
+/// Zero-allocation adapter that exposes a blocking sensor through the shared
+/// async application contract.
+pub struct BlockingEnvironment<T>(T);
+
+impl<T> BlockingEnvironment<T> {
+    pub const fn new(inner: T) -> Self {
+        Self(inner)
+    }
+
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T: BlockingEnvironmentSource> EnvironmentSource for BlockingEnvironment<T> {
+    type Error = T::Error;
+
+    async fn sample(&mut self) -> Result<EnvironmentReading, Self::Error> {
+        self.0.sample()
+    }
 }
 
 /// Profile component that accepts environmental and battery measurements.
 pub trait EnvironmentSink {
     fn update_environment(&mut self, measurement: TemperatureHumidityMeasurement);
     fn update_battery(&mut self, measurement: BatteryMeasurement);
-    /// Only called when the source actually produced a pressure channel.
     fn update_pressure(&mut self, _tenth_kpa: i16) {}
 }
 
@@ -75,5 +78,70 @@ impl EnvironmentSink for TemperatureHumidityPressureBattery {
 
     fn update_pressure(&mut self, tenth_kpa: i16) {
         TemperatureHumidityPressureBattery::update_pressure(self, tenth_kpa);
+    }
+}
+
+/// Application profile understood by this environmental-sensor archetype.
+///
+/// This is deliberately narrower than a universal "sensor behavior" trait:
+/// temperature and humidity remain the archetype's required measurements.
+pub trait EnvironmentalSensorProfile: ApplicationProfile {
+    fn update_environment(&mut self, measurement: TemperatureHumidityMeasurement);
+    fn update_battery(&mut self, measurement: BatteryMeasurement);
+    fn update_pressure(&mut self, tenth_kpa: i16);
+}
+
+impl<C> EnvironmentalSensorProfile for DeviceProfile<C>
+where
+    C: ProfileComponent + EnvironmentSink,
+{
+    fn update_environment(&mut self, measurement: TemperatureHumidityMeasurement) {
+        self.component_mut().update_environment(measurement);
+    }
+
+    fn update_battery(&mut self, measurement: BatteryMeasurement) {
+        self.component_mut().update_battery(measurement);
+    }
+
+    fn update_pressure(&mut self, tenth_kpa: i16) {
+        self.component_mut().update_pressure(tenth_kpa);
+    }
+}
+
+#[cfg(feature = "ota")]
+impl<P, F> EnvironmentalSensorProfile for zigbee_runtime::profile::WithOta<P, F>
+where
+    P: EnvironmentalSensorProfile,
+    F: zigbee_runtime::firmware_writer::FirmwareWriter,
+{
+    fn update_environment(&mut self, measurement: TemperatureHumidityMeasurement) {
+        self.inner_mut().update_environment(measurement);
+    }
+
+    fn update_battery(&mut self, measurement: BatteryMeasurement) {
+        self.inner_mut().update_battery(measurement);
+    }
+
+    fn update_pressure(&mut self, tenth_kpa: i16) {
+        self.inner_mut().update_pressure(tenth_kpa);
+    }
+}
+
+#[cfg(feature = "ota")]
+impl<P, F> EnvironmentalSensorProfile for zigbee_runtime::profile::OptionalOta<P, F>
+where
+    P: EnvironmentalSensorProfile,
+    F: zigbee_runtime::firmware_writer::FirmwareWriter,
+{
+    fn update_environment(&mut self, measurement: TemperatureHumidityMeasurement) {
+        self.inner_mut().update_environment(measurement);
+    }
+
+    fn update_battery(&mut self, measurement: BatteryMeasurement) {
+        self.inner_mut().update_battery(measurement);
+    }
+
+    fn update_pressure(&mut self, tenth_kpa: i16) {
+        self.inner_mut().update_pressure(tenth_kpa);
     }
 }

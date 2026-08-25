@@ -9,6 +9,7 @@
 #![no_std]
 
 pub mod battery;
+pub mod policy;
 pub mod profile;
 #[cfg(target_os = "none")]
 pub mod storage;

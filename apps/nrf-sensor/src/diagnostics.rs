@@ -71,9 +71,30 @@ impl Diagnostics for NrfDiagnostics {
                 "Secure rejoin failed {} times — resetting and rejoining fresh",
                 failures
             ),
+            DiagnosticEvent::Environment(reading) => {
+                if let Some(pressure) = reading.pressure_tenth_kpa {
+                    defmt::info!(
+                        "T={}.{:02}°C H={}.{:02}% P={}hPa",
+                        reading.temperature_centi_celsius / 100,
+                        (reading.temperature_centi_celsius % 100).unsigned_abs(),
+                        reading.humidity_centi_percent / 100,
+                        reading.humidity_centi_percent % 100,
+                        pressure,
+                    );
+                } else {
+                    defmt::info!(
+                        "T={}.{:02}°C H={}.{:02}%",
+                        reading.temperature_centi_celsius / 100,
+                        (reading.temperature_centi_celsius % 100).unsigned_abs(),
+                        reading.humidity_centi_percent / 100,
+                        reading.humidity_centi_percent % 100,
+                    );
+                }
+            }
             DiagnosticEvent::EnvironmentReadFailed => {
                 defmt::warn!("Environmental sensor read failed")
             }
+            DiagnosticEvent::BatteryReadFailed => defmt::warn!("Battery read failed"),
             DiagnosticEvent::Battery {
                 millivolts,
                 percentage,
@@ -81,8 +102,8 @@ impl Diagnostics for NrfDiagnostics {
             DiagnosticEvent::DefaultReportingConfigured => {
                 defmt::info!("Default reporting configured")
             }
-            DiagnosticEvent::FastPollStarted { duration_secs } => {
-                defmt::info!("Fast poll ON ({}s) — post-join", duration_secs)
+            DiagnosticEvent::FastPollStarted { duration_ms } => {
+                defmt::info!("Fast poll ON ({}ms) — post-join", duration_ms)
             }
             DiagnosticEvent::Joined {
                 short_address,
@@ -167,8 +188,8 @@ impl Diagnostics for NrfDiagnostics {
                 defmt::info!("Permit join changed: open={}", open)
             }
             DiagnosticEvent::ReportSent => defmt::info!("Report sent"),
-            DiagnosticEvent::OtaEventIgnored => {
-                defmt::debug!("OTA event ignored — this firmware build has no OTA client")
+            DiagnosticEvent::UnexpectedOtaEvent => {
+                defmt::warn!("Unexpected OTA event for a non-OTA profile")
             }
             DiagnosticEvent::LeaveRequested => {
                 defmt::info!("Leave requested by coordinator — resetting and rejoining")
@@ -198,6 +219,7 @@ impl Diagnostics for NrfDiagnostics {
                 expected
             ),
             DiagnosticEvent::ButtonJoin => defmt::info!("Button → join"),
+            DiagnosticEvent::ButtonLeave => defmt::info!("Button → leave"),
             DiagnosticEvent::FastPollStopped {
                 configured,
                 expected,
@@ -206,9 +228,7 @@ impl Diagnostics for NrfDiagnostics {
                 configured,
                 expected
             ),
-            DiagnosticEvent::RadioSleepPreparationFailed => {
-                defmt::warn!("Failed to disable RADIO before poll sleep")
-            }
+            DiagnosticEvent::WakeFailed => defmt::error!("Atomic radio wait failed"),
         }
     }
 }

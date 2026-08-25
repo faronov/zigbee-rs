@@ -7,6 +7,9 @@ description = "Platform-independent Zigbee sleepy-end-device sensor lifecycle"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
+[features]
+ota = ["zigbee-runtime/ota"]
+
 [dependencies]
 zigbee-mac = { path = "../../zigbee-mac" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }

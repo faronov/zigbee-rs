@@ -43,15 +43,19 @@ board and selects the storage/OTA policy used by the application.
 commissioning, silent resume, bounded secure-rejoin retry, poll windows,
 interview detection, Device_annce retries, reporting cadence, button
 semantics, status indication, and durable checkpoints. It is generic over the
-MAC, security store, typed profile component, measurements, lifecycle
-platform, radio-power transition, and diagnostics sink; every capability is
-monomorphized.
+MAC, security store, complete application profile, and one explicit
+`SensorSedParts` resource bundle; every capability is monomorphized.
+
+The product supplies a plain `SensorPolicy` value for timing and UI policy.
+Behavior that changes async control flow, such as the short-button action, is
+a zero-sized static capability. This keeps TC32/RV32 builds from retaining
+every unused behavior branch while avoiding const-generic timing values.
 
 Chip GPIO/timer/reset/radio details stay outside that crate. For Nordic,
 `apps/nrf-sensor` now contains only the `embassy-nrf` adapters
-(`NrfPlatform`, `NrfRadioPower`, `NrfBattery`, `OnChipTemperature`, and compact
-`defmt` diagnostics). The nRF52840 composition root selects those adapters
-directly:
+(`NrfWakeController`, `NrfStatus`, `NrfSupervisor`, `NrfBattery`,
+`OnChipTemperature`, and compact `defmt` diagnostics). The nRF52840
+composition root selects those adapters directly:
 
 ```rust,ignore
 // examples/nrf52840-sensor/src/main.rs — composition root
@@ -60,28 +64,65 @@ impl nrf_sensor_app::BatteryPolicy for Battery { /* … */ }
 
 let mut profile = nrf52840_sensor_product::profile::sensor_profile();
 let mut store = nrf52840_sensor_product::storage::security_store(nvmc);
+let mut device = ZigbeeDevice::builder(mac)
+    .power_mode(nrf52840_sensor_product::policy::SENSOR_POLICY.power_mode())
+    // SensorApp owns the bounded parent-poll window.
+    .automatic_polling(false)
+    // identity and endpoint configuration omitted
+    .build();
 let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
 
 let mut app = sensor_sed_app::SensorApp::new(
     node,
-    nrf_sensor_app::NrfPlatform::new(led, button),
-    nrf_sensor_app::NrfRadioPower,
-    nrf_sensor_app::NrfDiagnostics,
-    environment,
-    nrf_sensor_app::NrfBattery::<Battery>::new(saadc),
-);
+    &nrf52840_sensor_product::policy::SENSOR_POLICY,
+    sensor_sed_app::SensorSedParts {
+        wake: nrf_sensor_app::NrfWakeController::new(button),
+        status: nrf_sensor_app::NrfStatus::new(led),
+        environment,
+        battery: nrf_sensor_app::NrfBattery::<Battery>::new(saadc),
+        ota: sensor_sed_app::NoOta,
+        actions: nrf52840_sensor_product::policy::USER_ACTIONS,
+        supervisor: nrf_sensor_app::NrfSupervisor,
+        diagnostics: nrf_sensor_app::NrfDiagnostics,
+    },
+)
+.expect("manual SensorApp polling requires automatic_polling(false)");
 app.run().await
 ```
 
 A second platform composes the same application by implementing
-`LifecyclePlatform` with its native monotonic instant and button/LED/reset
-mechanisms, implementing `RadioPower<ItsMac>`, and supplying concrete
-`EnvironmentSource`, `BatterySource`, and `Diagnostics` types. Its product
-still owns identity, profile, persistence partition, and OTA policy; no board
-or HAL dependency enters `apps/sensor-sed`. This first slice is intentionally
-the no-OTA nRF sensor path: an OTA-enabled product must add an explicit static
-OTA lifecycle capability before using this application rather than treating
-ignored OTA events as support.
+`WakeController<ItsMac>` with an opaque platform-native mark, rollover-safe
+`u32` duration helpers, and one atomic quiesce → wait → MAC-ready operation.
+A backend such as `NrfMac` may satisfy MAC readiness through a proven lazy
+transition in its next normal RX/TX operation. A backend whose retention mode
+loses clocks or radio state, including TLSR8258, must restore that state inside
+`wait` before returning success. The remaining concrete parts are
+`StatusSink`, `EnvironmentSource`, `BatterySource`, `OtaLifecycle`,
+`Supervisor`, and `Diagnostics`. `BlockingEnvironment` and `BlockingBattery`
+adapt bounded synchronous TC32/BL702 drivers without requiring Embassy.
+
+`SensorApp::new` rejects a device with runtime automatic polling still
+enabled, preventing two independent owners from polling the same parent.
+`SensorApp` is generic over `P: EnvironmentalSensorProfile`, so a plain
+`DeviceProfile` and an OTA-decorated profile can share the archetype. `NoOta`
+only implements `OtaLifecycle` for profiles that explicitly opt into
+`NonOtaProfile`. The standard temperature/humidity/battery components (with
+or without pressure) make that assertion through `NonOtaComponent`; an
+arbitrary `ProfileComponent` does not qualify implicitly, and OTA decorators
+remain excluded.
+
+Expected second-platform composition:
+
+| Platform | Wake/status choices | Notes |
+|----------|---------------------|-------|
+| ESP32-H2 | active Embassy timer + GPIO status | `OptionalOta` profile and ESP OTA transport |
+| ESP32-C6 | active timer + `NoStatus` until WS2812 is selected | same app, no fake binary LED |
+| BL702 XT-ZB1 | polling wake + `NoStatus` | blocking ADC adapter; no unproven PDS/HBN claim |
+| TLSR8258 SED | `block_on`, wrapping timer marks, initially active 250 ms polling | retention sleep only after separate MAC restore/current validation |
+
+Telink smart plugs do **not** instantiate `sensor-sed`; relay, metering,
+always-on router receive, child persistence, and mains startup behavior belong
+in a separate `apps/plug-router` archetype.
 
 ## Board Resource Ownership
 

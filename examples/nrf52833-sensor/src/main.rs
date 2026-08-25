@@ -60,7 +60,6 @@ use {defmt_rtt as _, panic_probe as _};
 use nrf_sensor_app::OnChipTemperature;
 use nrf_sensor_app::{BatteryPolicy, SensorApp};
 use zigbee_runtime::node::ZigbeeNode;
-use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::profile::{ApplicationProfile, BatteryMeasurement};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_zcl::clusters::basic::PowerSource;
@@ -228,10 +227,8 @@ async fn main(_spawner: Spawner) {
 
     // ── Build device ──
     let mut device = ZigbeeDevice::builder(mac)
-        .power_mode(PowerMode::Sleepy {
-            poll_interval_ms: 10_000,
-            wake_duration_ms: 500,
-        })
+        .power_mode(nrf52833_sensor_product::policy::SENSOR_POLICY.power_mode())
+        .automatic_polling(false)
         .manufacturer(nrf52833_sensor_product::MANUFACTURER)
         .model(nrf52833_sensor_product::MODEL)
         .date_code(nrf52833_sensor_product::DATE_CODE)
@@ -260,7 +257,14 @@ async fn main(_spawner: Spawner) {
     let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
 
     let mut app: SensorApp<'_, _, _, _, Battery> =
-        SensorApp::new(node, led, button, environment, saadc_sensor);
+        SensorApp::new(
+            node,
+            &nrf52833_sensor_product::policy::SENSOR_POLICY,
+            led,
+            button,
+            environment,
+            saadc_sensor,
+        );
 
     app.run().await
 }

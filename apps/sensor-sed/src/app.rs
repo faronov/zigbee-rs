@@ -15,12 +15,12 @@
 //! | was | now |
 //! |-----|-----|
 //! | `nrf52840_sensor_product::storage::SecurityStore` | `S: SecurityStateStore` |
-//! | `nrf52840_sensor_product::profile::SensorProfile` | `DeviceProfile<C>` |
+//! | `nrf52840_sensor_product::profile::SensorProfile` | `P: EnvironmentalSensorProfile` |
 //! | `nrf52840_sensor_product::ENDPOINT` | `profile.endpoint()` (same value) |
 //! | nRF SAADC + product battery curve | `B: BatterySource` |
 //! | `Temp` / `crate::sensor::Sensor` (cfg-selected) | `E: EnvironmentSource` |
-//! | Embassy clock/button/LED/reset | `I: LifecyclePlatform` |
-//! | `NrfMac::enter_low_power_idle` | `R: RadioPower<M>` |
+//! | Embassy clock/button + radio sleep | `W: WakeController<M>` |
+//! | LED and reset/watchdog | `St: StatusSink`, `Sv: Supervisor` |
 //! | `defmt` calls | `D: Diagnostics` |
 //!
 //! Every capability is monomorphized. This crate has no platform `cfg`, HAL
@@ -38,126 +38,149 @@
 //!   to be split across (after `process_incoming`, and after the periodic
 //!   `tick()`) — the periodic-tick path previously never actually acted on
 //!   `LeaveRequested`/`RejoinRequested`, only logged them.
-//! - [`TickResult::RunAgain`] now records an absolute deadline and shortens
+//! - [`TickResult::RunAgain`] now records a rollover-safe mark + duration and shortens
 //!   the next poll/sleep wait (see `crate::policy`) instead of being
 //!   discarded. Runtime elapsed time is tracked independently from the
 //!   sensor-report cadence, so those additional wakeups cannot advance stack
 //!   timers faster than wall clock.
 //! - Secure-rejoin failures are counted once per boot-time, direct, or
 //!   runtime-driven attempt and fall back to a fresh join after the bounded
-//!   `SECURE_REJOIN_FAILURE_LIMIT`.
+//!   product policy limit.
+//! - Construction rejects a device whose runtime automatic parent polling is
+//!   still enabled, so the bounded manual poll window has exactly one owner.
 
 use zigbee_mac::MacDriver;
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::node::{NodeError, ZigbeeNode};
-use zigbee_runtime::profile::{
-    ApplicationProfile, DeviceProfile, ProfileComponent, TemperatureHumidityMeasurement,
-};
+use zigbee_runtime::profile::TemperatureHumidityMeasurement;
+use zigbee_runtime::role::EndDevice;
 use zigbee_runtime::security_store::SecurityStateStore;
 
 use crate::battery::BatterySource;
-use crate::capabilities::{LifecyclePlatform, RadioPower, WakeReason};
+use crate::capabilities::{
+    SensorStatus, StatusSink, Supervisor, WaitRequest, WakeController, WakeReason,
+};
 use crate::diagnostics::{DiagnosticEvent, Diagnostics};
-use crate::environment::{EnvironmentSink, EnvironmentSource};
-use crate::policy;
+use crate::environment::{EnvironmentSource, EnvironmentalSensorProfile};
+use crate::ota::{OtaEventOutcome, OtaLifecycle, is_ota_event};
+use crate::parts::{SensorSedParts, SensorSedResources};
+use crate::policy::{self, SensorPolicy, ShortPressAction, SleepDepth, UserActionPolicy};
 
-const REPORT_INTERVAL_SECS: u64 = 60;
-const FAST_POLL_MS: u64 = 250;
-const SLOW_POLL_SECS: u64 = 30;
-const FAST_POLL_DURATION_SECS: u64 = 120;
-const JOIN_RETRY_SECS: u64 = 15;
-const ANNCE_RETRY_SECS: u64 = 8;
-const ANNCE_RETRIES: u8 = 5;
-const BUTTON_LONG_PRESS_SECS: u64 = 3;
-/// Consecutive failed secure-rejoin attempts (each retried on the
-/// `JOIN_RETRY_SECS` cadence, or immediately on a fresh
-/// `CommissioningComplete { success: false }`) before falling back to a full
-/// factory reset and fresh join. Matches the bound already proven on the
-/// EFR32MG1 and ESP32-H2 sensors.
-const SECURE_REJOIN_FAILURE_LIMIT: u8 = 4;
+type SensorNode<'a, M, S, P> = ZigbeeNode<'a, M, S, P, EndDevice>;
 
-type SensorNode<'a, M, S, C> = ZigbeeNode<'a, M, S, DeviceProfile<C>>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensorAppError {
+    AutomaticPollingEnabled,
+    InvalidPolicy,
+}
 
-pub struct SensorApp<'a, M, S, C, E, B, I, R, D>
+pub struct SensorApp<'a, M, S, P, R>
 where
     M: MacDriver,
     S: SecurityStateStore,
-    C: ProfileComponent + EnvironmentSink,
-    E: EnvironmentSource,
-    B: BatterySource,
-    I: LifecyclePlatform,
-    R: RadioPower<M>,
-    D: Diagnostics,
+    P: EnvironmentalSensorProfile,
+    R: SensorSedResources<M>,
 {
-    node: SensorNode<'a, M, S, C>,
+    node: SensorNode<'a, M, S, P>,
+    policy: &'static SensorPolicy,
+    resources: R,
     /// Cached `profile.endpoint()`. Identical to the product's `ENDPOINT`
     /// constant this used to import; read once so the hot paths do not
     /// re-borrow the profile just to name the endpoint.
     endpoint: u8,
-    platform: I,
-    radio_power: R,
-    diagnostics: D,
-    environment: E,
-    battery: B,
-    last_report: I::Instant,
-    last_tick: I::Instant,
-    fast_poll_until: I::Instant,
-    last_rejoin_attempt: I::Instant,
+    last_report: R::Mark,
+    last_tick: R::Mark,
+    fast_poll_started: R::Mark,
+    fast_poll_duration_ms: u32,
+    last_rejoin_attempt: R::Mark,
+    last_status: R::Mark,
     rejoin_count: u8,
     annce_retries_left: u8,
-    last_annce: I::Instant,
+    last_annce: R::Mark,
     was_fast_polling: bool,
+    was_identifying: bool,
+    identify_phase_on: bool,
     interview_done: bool,
     consecutive_rejoin_failures: u8,
-    /// Absolute deadline from the most recent `TickResult::RunAgain`.
-    ///
-    /// Storing a platform instant, rather than retaining the relative duration,
-    /// ensures time spent processing incoming frames or button activity does
-    /// not restart the runtime's requested delay.
-    run_again_deadline: Option<I::Instant>,
+    run_again: Option<(R::Mark, u32)>,
 }
 
-impl<'a, M, S, C, E, B, I, R, D> SensorApp<'a, M, S, C, E, B, I, R, D>
+impl<'a, M, S, P, W, St, E, B, O, A, Sv, D>
+    SensorApp<'a, M, S, P, SensorSedParts<W, St, E, B, O, A, Sv, D>>
 where
     M: MacDriver,
     S: SecurityStateStore,
-    C: ProfileComponent + EnvironmentSink,
+    P: EnvironmentalSensorProfile,
+    W: WakeController<M>,
+    St: StatusSink,
     E: EnvironmentSource,
     B: BatterySource,
-    I: LifecyclePlatform,
-    R: RadioPower<M>,
+    O: OtaLifecycle<M, S, P>,
+    A: UserActionPolicy,
+    Sv: Supervisor,
     D: Diagnostics,
 {
     pub fn new(
-        node: SensorNode<'a, M, S, C>,
-        platform: I,
-        radio_power: R,
-        diagnostics: D,
-        environment: E,
-        battery: B,
-    ) -> Self {
-        let now = platform.now();
+        node: SensorNode<'a, M, S, P>,
+        policy: &'static SensorPolicy,
+        parts: SensorSedParts<W, St, E, B, O, A, Sv, D>,
+    ) -> Result<Self, SensorAppError> {
+        if node.device().automatic_polling_enabled() {
+            return Err(SensorAppError::AutomaticPollingEnabled);
+        }
+        if !policy.is_valid() {
+            return Err(SensorAppError::InvalidPolicy);
+        }
+
+        let now = parts.wake.mark();
         let endpoint = node.profile().endpoint();
-        Self {
+        Ok(Self {
             node,
+            policy,
+            resources: parts,
             endpoint,
-            platform,
-            radio_power,
-            diagnostics,
-            environment,
-            battery,
             last_report: now,
             last_tick: now,
-            fast_poll_until: now,
+            fast_poll_started: now,
+            fast_poll_duration_ms: 0,
             last_rejoin_attempt: now,
+            last_status: now,
             rejoin_count: 0,
             annce_retries_left: 0,
             last_annce: now,
             was_fast_polling: false,
+            was_identifying: false,
+            identify_phase_on: false,
             interview_done: false,
             consecutive_rejoin_failures: 0,
-            run_again_deadline: None,
-        }
+            run_again: None,
+        })
+    }
+
+    fn mark(&self) -> W::Mark {
+        self.resources.wake.mark()
+    }
+
+    fn elapsed_ms(&self, since: W::Mark) -> u32 {
+        W::elapsed_ms(self.mark(), since)
+    }
+
+    fn start_fast_poll(&mut self, duration_ms: u32) {
+        self.fast_poll_started = self.mark();
+        self.fast_poll_duration_ms = duration_ms;
+    }
+
+    fn fast_poll_active(&self) -> bool {
+        self.elapsed_ms(self.fast_poll_started) < self.fast_poll_duration_ms
+    }
+
+    #[inline(never)]
+    fn wake_failure(&mut self) -> ! {
+        self.resources
+            .diagnostics
+            .record(DiagnosticEvent::WakeFailed);
+        self.resources.status.set(SensorStatus::Fault);
+        self.resources.supervisor.reset()
     }
 
     #[inline(never)]
@@ -165,8 +188,10 @@ where
         &mut self,
         error: zigbee_runtime::security_store::SecurityStoreError,
     ) -> ! {
-        self.diagnostics
+        self.resources
+            .diagnostics
             .record(DiagnosticEvent::SecurityFailure(error));
+        self.resources.status.set(SensorStatus::Fault);
         core::panic!("security persistence failure");
     }
 
@@ -175,8 +200,10 @@ where
         match error {
             NodeError::Persistence(error) => self.persistence_failure(error),
             NodeError::Profile(error) => {
-                self.diagnostics
+                self.resources
+                    .diagnostics
                     .record(DiagnosticEvent::ProfileFailure(error));
+                self.resources.status.set(SensorStatus::Fault);
                 core::panic!("profile error");
             }
         }
@@ -194,13 +221,13 @@ where
     /// request returned by this call is therefore measured from completion
     /// of this call, not merged with an already-serviced relative delay.
     async fn tick(&mut self, elapsed_secs: u16) -> TickResult {
-        self.run_again_deadline = None;
+        self.run_again = None;
         let result = match self.node.tick(elapsed_secs).await {
             Ok(result) => result,
             Err(error) => self.node_failure(error),
         };
         if let Some(delay_ms) = policy::run_again_delay_ms(&result) {
-            self.run_again_deadline = Some(I::add_millis(self.platform.now(), u64::from(delay_ms)));
+            self.run_again = Some((self.mark(), delay_ms));
         }
         result
     }
@@ -212,20 +239,24 @@ where
         if let TickResult::Event(event) = &result
             && self.handle_control_event(event).await
         {
-            self.fast_poll_until =
-                I::add_millis(self.platform.now(), FAST_POLL_DURATION_SECS * 1_000);
+            self.start_fast_poll(self.policy.fresh_join_fast_ms);
         }
     }
 
     fn reset_post_join_state(&mut self) {
-        let now = self.platform.now();
-        self.platform.led_on();
-        self.fast_poll_until = I::add_millis(now, FAST_POLL_DURATION_SECS * 1_000);
+        let now = self.mark();
+        self.resources
+            .status
+            .set(SensorStatus::Joined { active: true });
+        self.start_fast_poll(self.policy.fresh_join_fast_ms);
         self.last_tick = now;
         self.last_rejoin_attempt = now;
-        self.annce_retries_left = ANNCE_RETRIES;
+        self.last_status = now;
+        self.annce_retries_left = self.policy.announce_retries;
         self.last_annce = now;
         self.interview_done = false;
+        self.was_identifying = false;
+        self.identify_phase_on = false;
         // A fresh join/rejoin means the coordinator re-runs its interview.
         self.node.reset_remote_reporting();
         self.was_fast_polling = true;
@@ -239,14 +270,16 @@ where
     /// firmware exactly: only the very first cold-boot join is allowed to
     /// suppress its Device_annce retries.
     async fn join_or_resume(&mut self) -> bool {
-        self.run_again_deadline = None;
+        self.run_again = None;
         match self.node.start_or_resume().await {
             Ok(short_address) => {
-                self.diagnostics.record(DiagnosticEvent::JoinedOrResumed {
-                    short_address,
-                    channel: self.node.device().channel(),
-                    pan_id: self.node.device().pan_id(),
-                });
+                self.resources
+                    .diagnostics
+                    .record(DiagnosticEvent::JoinedOrResumed {
+                        short_address,
+                        channel: self.node.device().channel(),
+                        pan_id: self.node.device().pan_id(),
+                    });
                 // The runtime owns the R22 End Device Timeout lifecycle: a
                 // fresh join or secured rejoin sends exactly one initial
                 // request, and a silent resume reuses the persisted parent
@@ -256,12 +289,14 @@ where
                 true
             }
             Err(StartError::InitFailed) => {
-                self.diagnostics
+                self.resources
+                    .diagnostics
                     .record(DiagnosticEvent::ZigbeeInitializationFailed);
                 false
             }
             Err(StartError::CommissioningFailed(status)) => {
-                self.diagnostics
+                self.resources
+                    .diagnostics
                     .record(DiagnosticEvent::CommissioningFailed {
                         status: status as u8,
                     });
@@ -293,21 +328,24 @@ where
     }
 
     async fn secure_rejoin(&mut self) -> bool {
-        self.run_again_deadline = None;
+        self.run_again = None;
         match self.node.secure_rejoin().await {
             Ok(short_address) => {
-                self.diagnostics
+                self.resources
+                    .diagnostics
                     .record(DiagnosticEvent::SecureRejoinSucceeded { short_address });
                 self.checkpoint_security();
                 true
             }
             Err(StartError::InitFailed) => {
-                self.diagnostics
+                self.resources
+                    .diagnostics
                     .record(DiagnosticEvent::SecureRejoinInitializationFailed);
                 self.record_failed_rejoin().await
             }
             Err(StartError::CommissioningFailed(status)) => {
-                self.diagnostics
+                self.resources
+                    .diagnostics
                     .record(DiagnosticEvent::SecureRejoinFailed {
                         status: status as u8,
                     });
@@ -318,16 +356,18 @@ where
     }
 
     async fn factory_reset(&mut self) -> bool {
-        self.run_again_deadline = None;
+        self.run_again = None;
         match self.node.factory_reset().await {
             Ok(()) => true,
             Err(StartError::InitFailed) => {
-                self.diagnostics
+                self.resources
+                    .diagnostics
                     .record(DiagnosticEvent::FactoryResetInitializationFailed);
                 false
             }
             Err(StartError::CommissioningFailed(status)) => {
-                self.diagnostics
+                self.resources
+                    .diagnostics
                     .record(DiagnosticEvent::FactoryResetFailed {
                         status: status as u8,
                     });
@@ -356,14 +396,16 @@ where
     /// failures use this path, so one over-the-air attempt is counted once.
     async fn record_failed_rejoin(&mut self) -> bool {
         self.consecutive_rejoin_failures = self.consecutive_rejoin_failures.saturating_add(1);
-        if self.consecutive_rejoin_failures < SECURE_REJOIN_FAILURE_LIMIT {
-            self.diagnostics
+        if self.consecutive_rejoin_failures < self.policy.secure_rejoin_failure_limit {
+            self.resources
+                .diagnostics
                 .record(DiagnosticEvent::SecureRejoinPending {
                     failures: self.consecutive_rejoin_failures,
                 });
             return false;
         }
-        self.diagnostics
+        self.resources
+            .diagnostics
             .record(DiagnosticEvent::SecureRejoinLimitReached {
                 failures: self.consecutive_rejoin_failures,
             });
@@ -376,34 +418,41 @@ where
     /// a failed environmental read still leaves the previous cluster
     /// values in place and still proceeds to the battery measurement.
     async fn read_sensors(&mut self) {
-        let reading = self.environment.sample().await;
-        match &reading {
-            Some(reading) => self.environment.log_reading(reading),
-            None => self
+        match self.resources.environment.sample().await {
+            Ok(reading) => {
+                self.resources
+                    .diagnostics
+                    .record(DiagnosticEvent::Environment(reading));
+                self.node
+                    .profile_mut()
+                    .update_environment(TemperatureHumidityMeasurement {
+                        temperature_centi_celsius: reading.temperature_centi_celsius,
+                        humidity_centi_percent: reading.humidity_centi_percent,
+                    });
+                if let Some(pressure) = reading.pressure_tenth_kpa {
+                    self.node.profile_mut().update_pressure(pressure);
+                }
+            }
+            Err(_) => self
+                .resources
                 .diagnostics
                 .record(DiagnosticEvent::EnvironmentReadFailed),
         }
 
-        let environment = self.node.profile_mut().component_mut();
-        if let Some(reading) = reading {
-            environment.update_environment(TemperatureHumidityMeasurement {
-                temperature_centi_celsius: reading.temperature_centi_celsius,
-                humidity_centi_percent: reading.humidity_centi_percent,
-            });
-            if let Some(pressure) = reading.pressure_tenth_kpa {
-                environment.update_pressure(pressure);
+        match self.resources.battery.sample().await {
+            Ok(Some(battery)) => {
+                self.resources.diagnostics.record(DiagnosticEvent::Battery {
+                    millivolts: battery.millivolts,
+                    percentage: battery.measurement.percentage_remaining / 2,
+                });
+                self.node.profile_mut().update_battery(battery.measurement);
             }
+            Ok(None) => {}
+            Err(_) => self
+                .resources
+                .diagnostics
+                .record(DiagnosticEvent::BatteryReadFailed),
         }
-
-        let battery = self.battery.sample().await;
-        self.diagnostics.record(DiagnosticEvent::Battery {
-            millivolts: battery.millivolts,
-            percentage: battery.measurement.percentage_remaining / 2,
-        });
-        self.node
-            .profile_mut()
-            .component_mut()
-            .update_battery(battery.measurement);
     }
 
     /// One-time cold-boot bootstrap: silent-resume detection (only this
@@ -419,7 +468,9 @@ where
         };
 
         if self.join_or_resume_with_rejoin_tracking().await {
-            self.platform.led_on();
+            self.resources
+                .status
+                .set(SensorStatus::Joined { active: true });
         }
 
         self.read_sensors().await;
@@ -427,33 +478,71 @@ where
         if let Err(error) = self.node.configure_default_reporting() {
             self.node_failure(NodeError::Profile(error));
         }
-        self.diagnostics
+        self.resources
+            .diagnostics
             .record(DiagnosticEvent::DefaultReportingConfigured);
 
-        let now = self.platform.now();
+        let now = self.mark();
         self.last_report = now;
         self.last_tick = now;
         self.last_rejoin_attempt = now;
+        self.last_status = now;
         self.rejoin_count = 0;
         self.last_annce = now;
         self.interview_done = false;
         self.node.reset_remote_reporting();
         let joined = self.node.device().is_joined();
         self.was_fast_polling = joined;
-        self.fast_poll_until = if joined {
-            self.diagnostics.record(DiagnosticEvent::FastPollStarted {
-                duration_secs: FAST_POLL_DURATION_SECS,
-            });
-            self.platform.led_on();
-            I::add_millis(now, FAST_POLL_DURATION_SECS * 1_000)
+        self.was_identifying = false;
+        self.identify_phase_on = false;
+        if joined {
+            let duration_ms = if resumed_at_boot {
+                self.policy.restored_fast_ms
+            } else {
+                self.policy.fresh_join_fast_ms
+            };
+            self.resources
+                .diagnostics
+                .record(DiagnosticEvent::FastPollStarted { duration_ms });
+            self.resources
+                .status
+                .set(SensorStatus::Joined { active: true });
+            self.start_fast_poll(duration_ms);
         } else {
-            now
-        };
+            self.fast_poll_started = now;
+            self.fast_poll_duration_ms = 0;
+            self.resources.status.set(SensorStatus::Off);
+        }
         self.annce_retries_left = if joined && !resumed_at_boot {
-            ANNCE_RETRIES
+            self.policy.announce_retries
         } else {
             0
         };
+    }
+
+    async fn handle_ota_event(&mut self, event: &StackEvent) -> bool {
+        debug_assert!(is_ota_event(event));
+        if !O::ENABLED {
+            self.resources
+                .diagnostics
+                .record(DiagnosticEvent::UnexpectedOtaEvent);
+            return false;
+        }
+        match self.resources.ota.handle_event(&mut self.node, event).await {
+            OtaEventOutcome::NotHandled | OtaEventOutcome::Unexpected => {
+                self.resources
+                    .diagnostics
+                    .record(DiagnosticEvent::UnexpectedOtaEvent);
+                false
+            }
+            OtaEventOutcome::Handled { keep_awake_ms } => {
+                self.resources.status.set(SensorStatus::Ota);
+                if let Some(duration_ms) = keep_awake_ms {
+                    self.start_fast_poll(duration_ms);
+                }
+                true
+            }
+        }
     }
 
     /// Handle one control-plane [`StackEvent`], explicitly — every variant
@@ -468,7 +557,7 @@ where
                 channel,
                 pan_id,
             } => {
-                self.diagnostics.record(DiagnosticEvent::Joined {
+                self.resources.diagnostics.record(DiagnosticEvent::Joined {
                     short_address: *short_address,
                     channel: *channel,
                     pan_id: *pan_id,
@@ -478,8 +567,8 @@ where
                 true
             }
             StackEvent::Left => {
-                self.diagnostics.record(DiagnosticEvent::Left);
-                self.platform.led_off();
+                self.resources.diagnostics.record(DiagnosticEvent::Left);
+                self.resources.status.set(SensorStatus::Off);
                 // The stack already marked itself left (and `state_dirty`);
                 // persist that promptly rather than waiting for the next
                 // scheduled checkpoint. No rejoin action here — the normal
@@ -493,12 +582,14 @@ where
                 cluster_id,
                 attr_id,
             } => {
-                self.diagnostics.record(DiagnosticEvent::AttributeReport {
-                    src_addr: *src_addr,
-                    endpoint: *endpoint,
-                    cluster_id: *cluster_id,
-                    attr_id: *attr_id,
-                });
+                self.resources
+                    .diagnostics
+                    .record(DiagnosticEvent::AttributeReport {
+                        src_addr: *src_addr,
+                        endpoint: *endpoint,
+                        cluster_id: *cluster_id,
+                        attr_id: *attr_id,
+                    });
                 false
             }
             StackEvent::ReportingConfigured { cluster_id, .. } => {
@@ -510,21 +601,25 @@ where
                 let expected = self.node.expected_report_clusters();
                 let configured = self.node.remote_reporting_cluster_count();
                 let complete = self.node.remote_reporting_is_complete();
-                self.diagnostics
+                self.resources
+                    .diagnostics
                     .record(DiagnosticEvent::ReportingConfigured {
                         cluster_id: *cluster_id,
                         configured,
                         expected,
                     });
                 if complete && !self.interview_done {
-                    self.diagnostics
-                        .record(DiagnosticEvent::InterviewConfigurationComplete {
+                    self.resources.diagnostics.record(
+                        DiagnosticEvent::InterviewConfigurationComplete {
                             configured,
                             expected,
-                        });
-                    self.fast_poll_until = I::add_millis(self.platform.now(), 5_000);
+                        },
+                    );
+                    self.start_fast_poll(self.policy.interview_complete_grace_ms);
                     self.interview_done = true;
-                    self.platform.led_off();
+                    self.resources
+                        .status
+                        .set(SensorStatus::Joined { active: false });
                 }
                 // Generic fast-poll extension only while reporting progress is
                 // still incomplete: once complete, returning `false` here lets
@@ -547,31 +642,37 @@ where
                     // window open only while reporting remains incomplete,
                     // and never overwrite the completed interview's 5-second
                     // grace.
-                    self.diagnostics.record(DiagnosticEvent::ReportingRejected {
-                        cluster_id: *cluster_id,
-                        configured: self.node.remote_reporting_cluster_count(),
-                        expected: self.node.expected_report_clusters(),
-                    });
+                    self.resources
+                        .diagnostics
+                        .record(DiagnosticEvent::ReportingRejected {
+                            cluster_id: *cluster_id,
+                            configured: self.node.remote_reporting_cluster_count(),
+                            expected: self.node.expected_report_clusters(),
+                        });
                     return policy::configure_reporting_requests_generic_extension(
                         self.node.remote_reporting_is_complete(),
                     );
                 }
-                self.diagnostics.record(DiagnosticEvent::UnhandledCommand {
-                    src_addr: *src_addr,
-                    cluster_id: *cluster_id,
-                    command_id: *command_id,
-                });
+                self.resources
+                    .diagnostics
+                    .record(DiagnosticEvent::UnhandledCommand {
+                        src_addr: *src_addr,
+                        cluster_id: *cluster_id,
+                        command_id: *command_id,
+                    });
                 false
             }
             StackEvent::CommissioningComplete { success: true } => {
-                self.diagnostics
+                self.resources
+                    .diagnostics
                     .record(DiagnosticEvent::CommissioningComplete { success: true });
                 self.consecutive_rejoin_failures = 0;
                 self.checkpoint_security();
                 false
             }
             StackEvent::CommissioningComplete { success: false } => {
-                self.diagnostics
+                self.resources
+                    .diagnostics
                     .record(DiagnosticEvent::CommissioningComplete { success: false });
                 if self.node.device().secure_rejoin_pending() {
                     self.record_failed_rejoin().await
@@ -586,47 +687,49 @@ where
                 status,
                 ..
             } => {
-                self.diagnostics.record(DiagnosticEvent::DefaultResponse {
-                    src_addr: *src_addr,
-                    cluster_id: *cluster_id,
-                    command_id: *command_id,
-                    status: *status,
-                });
+                self.resources
+                    .diagnostics
+                    .record(DiagnosticEvent::DefaultResponse {
+                        src_addr: *src_addr,
+                        cluster_id: *cluster_id,
+                        command_id: *command_id,
+                        status: *status,
+                    });
                 false
             }
             StackEvent::PermitJoinChanged { open } => {
-                self.diagnostics
+                self.resources
+                    .diagnostics
                     .record(DiagnosticEvent::PermitJoinChanged { open: *open });
                 false
             }
             StackEvent::ReportSent => {
-                self.diagnostics.record(DiagnosticEvent::ReportSent);
+                self.resources
+                    .diagnostics
+                    .record(DiagnosticEvent::ReportSent);
                 false
             }
             StackEvent::OtaImageAvailable { .. }
             | StackEvent::OtaProgress { .. }
             | StackEvent::OtaComplete
             | StackEvent::OtaFailed
-            | StackEvent::OtaDelayedActivation { .. } => {
-                // This first shared lifecycle slice accepts a bare
-                // `DeviceProfile<C>`, not an OTA-decorated profile. These
-                // events should therefore be unreachable, but remain
-                // explicit so a future OTA capability cannot be added
-                // without deliberately defining its lifecycle.
-                self.diagnostics.record(DiagnosticEvent::OtaEventIgnored);
-                false
-            }
+            | StackEvent::OtaDelayedActivation { .. } => self.handle_ota_event(event).await,
             StackEvent::LeaveRequested => {
-                self.diagnostics.record(DiagnosticEvent::LeaveRequested);
+                self.resources
+                    .diagnostics
+                    .record(DiagnosticEvent::LeaveRequested);
                 self.rejoin_after_reset().await
             }
             StackEvent::BasicResetToFactoryDefaults => {
-                self.diagnostics
+                self.resources
+                    .diagnostics
                     .record(DiagnosticEvent::BasicResetToFactoryDefaults);
                 false
             }
             StackEvent::RejoinRequested => {
-                self.diagnostics.record(DiagnosticEvent::RejoinRequested);
+                self.resources
+                    .diagnostics
+                    .record(DiagnosticEvent::RejoinRequested);
                 let rejoined = self.secure_rejoin().await;
                 if rejoined {
                     self.reset_post_join_state();
@@ -659,8 +762,7 @@ where
                             StackEvent::RejoinRequested | StackEvent::LeaveRequested
                         );
                         if self.handle_control_event(event).await {
-                            self.fast_poll_until =
-                                I::add_millis(self.platform.now(), FAST_POLL_DURATION_SECS * 1_000);
+                            self.start_fast_poll(self.policy.fresh_join_fast_ms);
                         }
                         if recommission {
                             break;
@@ -682,37 +784,57 @@ where
     /// elapsed time uses its own whole-second clock so `RunAgain` wakeups and
     /// incoming-frame flush ticks cannot repeatedly charge the stack for the
     /// same wall-clock interval.
-    async fn service_periodic_joined(&mut self, now: I::Instant) {
-        let elapsed_s = I::elapsed_millis(now, self.last_report) / 1_000;
-        if elapsed_s >= REPORT_INTERVAL_SECS {
-            self.last_report = now;
+    async fn service_periodic_joined(&mut self) {
+        if self.elapsed_ms(self.last_report) >= self.policy.sample_interval_ms {
+            self.last_report = self.mark();
             self.read_sensors().await;
         }
 
-        let tick_elapsed = (I::elapsed_millis(now, self.last_tick) / 1_000).min(60);
+        let tick_elapsed = (self.elapsed_ms(self.last_tick) / 1_000).min(60);
         if tick_elapsed != 0 {
-            self.last_tick = I::add_millis(self.last_tick, tick_elapsed * 1_000);
+            self.last_tick = W::add_ms(self.last_tick, tick_elapsed * 1_000);
         }
         self.tick_and_handle(tick_elapsed as u16).await;
+
+        if O::ENABLED {
+            let ota = self
+                .resources
+                .ota
+                .service(&mut self.node, tick_elapsed as u16)
+                .await;
+            if let Some(duration_ms) = ota.keep_awake_ms {
+                self.resources.status.set(SensorStatus::Ota);
+                self.start_fast_poll(duration_ms);
+            }
+        }
 
         // Matches the original firmware exactly: these two checks run
         // unconditionally after the tick above, even on the (rare) iteration
         // where that tick's event just left the network — `is_identifying`
         // naturally reads false and a stale `send_device_annce` is already
         // tolerated (`let _ = ...`) below.
-        // Identify LED blink.
-        if self.node.device().is_identifying(self.endpoint) {
-            self.platform.led_toggle();
+        let identifying = self.node.device().is_identifying(self.endpoint);
+        if identifying {
+            self.identify_phase_on = !self.identify_phase_on;
+            self.resources.status.set(SensorStatus::Identifying {
+                on: self.identify_phase_on,
+            });
+        } else if self.was_identifying {
+            self.identify_phase_on = false;
+            self.resources.status.set(SensorStatus::Joined {
+                active: self.fast_poll_active(),
+            });
         }
+        self.was_identifying = identifying;
 
         // Device_annce retry.
-        let now2 = self.platform.now();
         if self.annce_retries_left > 0
-            && I::elapsed_millis(now2, self.last_annce) / 1_000 >= ANNCE_RETRY_SECS
+            && self.elapsed_ms(self.last_annce) >= self.policy.announce_retry_ms
         {
             self.annce_retries_left -= 1;
-            self.last_annce = now2;
-            self.diagnostics
+            self.last_annce = self.mark();
+            self.resources
+                .diagnostics
                 .record(DiagnosticEvent::DeviceAnnounceRetry {
                     retries_left: self.annce_retries_left,
                 });
@@ -728,24 +850,44 @@ where
     /// call `secure_rejoin()` in the same cycle or each failure would produce
     /// two over-the-air attempts. Fresh commissioning is started only when no
     /// durable secure-rejoin retry remains pending.
-    async fn service_unjoined(&mut self, now: I::Instant) {
-        if I::elapsed_millis(now, self.last_rejoin_attempt) >= 1_000 {
+    async fn service_unjoined(&mut self) {
+        if self.elapsed_ms(self.last_status) >= self.policy.status.unjoined_blink_period_ms {
+            self.last_status = self.mark();
             // Double blink.
-            self.platform.led_on();
-            self.platform.delay_ms(80).await;
-            self.platform.led_off();
-            self.platform.delay_ms(120).await;
-            self.platform.led_on();
-            self.platform.delay_ms(80).await;
-            self.platform.led_off();
+            self.resources
+                .status
+                .set(SensorStatus::Joining { on: true });
+            self.resources
+                .wake
+                .delay_ms(self.policy.status.blink_on_ms)
+                .await;
+            self.resources
+                .status
+                .set(SensorStatus::Joining { on: false });
+            self.resources
+                .wake
+                .delay_ms(self.policy.status.blink_gap_ms)
+                .await;
+            self.resources
+                .status
+                .set(SensorStatus::Joining { on: true });
+            self.resources
+                .wake
+                .delay_ms(self.policy.status.blink_on_ms)
+                .await;
+            self.resources
+                .status
+                .set(SensorStatus::Joining { on: false });
         }
 
-        if I::elapsed_millis(now, self.last_rejoin_attempt) / 1_000 >= JOIN_RETRY_SECS {
+        if self.elapsed_ms(self.last_rejoin_attempt) >= self.policy.join_retry_ms {
             self.rejoin_count = self.rejoin_count.wrapping_add(1);
-            self.last_rejoin_attempt = self.platform.now();
-            self.diagnostics.record(DiagnosticEvent::JoinRetry {
-                attempt: self.rejoin_count,
-            });
+            self.last_rejoin_attempt = self.mark();
+            self.resources
+                .diagnostics
+                .record(DiagnosticEvent::JoinRetry {
+                    attempt: self.rejoin_count,
+                });
             let had_secure_rejoin_pending = self.node.device().secure_rejoin_pending();
             self.tick_and_handle(0).await;
 
@@ -766,102 +908,240 @@ where
         }
     }
 
-    async fn handle_button_press(&mut self) {
-        // Check for long press (3s = factory reset).
-        let held_long = self
-            .platform
-            .button_held_for(BUTTON_LONG_PRESS_SECS * 1_000)
-            .await;
+    async fn join_from_button(&mut self) {
+        self.resources
+            .diagnostics
+            .record(DiagnosticEvent::ButtonJoin);
+        if self.join_or_resume_with_rejoin_tracking().await {
+            self.reset_post_join_state();
+        }
+    }
 
-        if held_long {
-            self.diagnostics
-                .record(DiagnosticEvent::FactoryResetRequested);
-            if self.factory_reset().await {
-                self.diagnostics
-                    .record(DiagnosticEvent::SecurityResetRebooting);
-            }
-            for _ in 0..5u8 {
-                self.platform.led_on();
-                self.platform.delay_ms(100).await;
-                self.platform.led_off();
-                self.platform.delay_ms(100).await;
-            }
-            self.platform.reset();
-        } else if self.node.device().is_joined() {
-            let configured = self.node.remote_reporting_cluster_count();
-            let expected = self.node.expected_report_clusters();
-            self.diagnostics.record(DiagnosticEvent::ForceReport {
+    async fn force_report_from_button(&mut self) {
+        let configured = self.node.remote_reporting_cluster_count();
+        let expected = self.node.expected_report_clusters();
+        self.resources
+            .diagnostics
+            .record(DiagnosticEvent::ForceReport {
                 configured,
                 expected,
             });
-            self.platform.led_on();
-            self.read_sensors().await;
-            self.node.device_mut().reporting_mut().force_all_due();
-            self.tick_and_handle(0).await;
-            self.last_report = self.platform.now();
-            self.fast_poll_until = I::add_millis(self.platform.now(), 5_000);
-            self.platform.led_off();
+        self.resources
+            .status
+            .set(SensorStatus::Reporting { on: true });
+        self.read_sensors().await;
+        self.node.device_mut().reporting_mut().force_all_due();
+        self.tick_and_handle(0).await;
+        self.last_report = self.mark();
+        self.start_fast_poll(self.policy.interview_complete_grace_ms);
+        self.resources
+            .status
+            .set(SensorStatus::Reporting { on: false });
+    }
+
+    #[inline(never)]
+    fn next_wait_ms(&self) -> (u32, bool) {
+        #[inline(always)]
+        fn shorten(current_ms: u32, candidate_ms: u32) -> u32 {
+            current_ms.min(candidate_ms.max(1))
+        }
+
+        let now = self.mark();
+        let joined = self.node.device().is_joined();
+        let identifying = self.node.device().is_identifying(self.endpoint);
+        let ota_active = O::ENABLED && self.resources.ota.is_active(self.node.profile());
+        let in_fast_poll = W::elapsed_ms(now, self.fast_poll_started) < self.fast_poll_duration_ms
+            || identifying
+            || ota_active;
+        let mut wait_ms = if in_fast_poll {
+            self.policy.fast_poll_ms
         } else {
-            self.diagnostics.record(DiagnosticEvent::ButtonJoin);
-            if self.join_or_resume_with_rejoin_tracking().await {
-                self.reset_post_join_state();
+            self.policy.slow_poll_ms
+        };
+
+        if let Some((started, delay_ms)) = self.run_again {
+            wait_ms = shorten(
+                wait_ms,
+                policy::remaining_ms(W::elapsed_ms(now, started), delay_ms),
+            );
+        }
+
+        if joined {
+            wait_ms = shorten(
+                wait_ms,
+                policy::remaining_ms(
+                    W::elapsed_ms(now, self.last_report),
+                    self.policy.sample_interval_ms,
+                ),
+            );
+            if self.annce_retries_left > 0 {
+                wait_ms = shorten(
+                    wait_ms,
+                    policy::remaining_ms(
+                        W::elapsed_ms(now, self.last_annce),
+                        self.policy.announce_retry_ms,
+                    ),
+                );
+            }
+        } else {
+            wait_ms = shorten(
+                wait_ms,
+                policy::remaining_ms(
+                    W::elapsed_ms(now, self.last_rejoin_attempt),
+                    self.policy.join_retry_ms,
+                ),
+            );
+            wait_ms = shorten(
+                wait_ms,
+                policy::remaining_ms(
+                    W::elapsed_ms(now, self.last_status),
+                    self.policy.status.unjoined_blink_period_ms,
+                ),
+            );
+        }
+
+        if O::ENABLED
+            && let Some(ota_ms) = self.resources.ota.next_deadline_ms(self.node.profile())
+        {
+            wait_ms = shorten(wait_ms, ota_ms);
+        }
+        if let Some(watchdog_ms) = self.resources.supervisor.max_wait_ms() {
+            wait_ms = shorten(wait_ms, watchdog_ms);
+        }
+
+        (wait_ms.max(1), in_fast_poll)
+    }
+
+    async fn handle_button_press(&mut self) {
+        let held_long = match self.policy.button.long_press_ms {
+            Some(duration_ms) => self.resources.wake.button_held_for(duration_ms).await,
+            None => false,
+        };
+
+        if held_long {
+            self.resources
+                .diagnostics
+                .record(DiagnosticEvent::FactoryResetRequested);
+            if self.factory_reset().await {
+                self.resources
+                    .diagnostics
+                    .record(DiagnosticEvent::SecurityResetRebooting);
+            }
+            for _ in 0..self.policy.status.reset_blinks {
+                self.resources
+                    .status
+                    .set(SensorStatus::Resetting { on: true });
+                self.resources
+                    .wake
+                    .delay_ms(self.policy.status.reset_phase_ms)
+                    .await;
+                self.resources
+                    .status
+                    .set(SensorStatus::Resetting { on: false });
+                self.resources
+                    .wake
+                    .delay_ms(self.policy.status.reset_phase_ms)
+                    .await;
+            }
+            self.resources.supervisor.reset();
+        } else {
+            match A::SHORT_PRESS {
+                ShortPressAction::None => {}
+                ShortPressAction::JoinOnly => {
+                    if !self.node.device().is_joined() {
+                        self.join_from_button().await;
+                    }
+                }
+                ShortPressAction::ForceReport => {
+                    if self.node.device().is_joined() {
+                        self.force_report_from_button().await;
+                    } else {
+                        self.join_from_button().await;
+                    }
+                }
+                ShortPressAction::ToggleJoin => {
+                    if self.node.device().is_joined() {
+                        self.resources
+                            .diagnostics
+                            .record(DiagnosticEvent::ButtonLeave);
+                        if self.factory_reset().await {
+                            self.resources.status.set(SensorStatus::Off);
+                        }
+                    } else {
+                        self.join_from_button().await;
+                    }
+                }
             }
         }
-        self.platform.delay_ms(300).await;
+        self.resources
+            .wake
+            .delay_ms(self.policy.button.debounce_ms)
+            .await;
     }
 
     pub async fn run(&mut self) -> ! {
         self.cold_start().await;
 
         loop {
-            let now = self.platform.now();
-            let in_fast_poll = now < self.fast_poll_until;
-            let base_poll_ms = if in_fast_poll {
-                FAST_POLL_MS
-            } else {
-                SLOW_POLL_SECS * 1000
-            };
-            let run_again_ms = self
-                .run_again_deadline
-                .map(|deadline| I::elapsed_millis(deadline, now));
-            let poll_ms = policy::resolve_poll_delay_ms(base_poll_ms, run_again_ms);
+            let (poll_ms, in_fast_poll) = self.next_wait_ms();
 
             // Log transition from fast→slow poll.
             if self.was_fast_polling && !in_fast_poll {
                 let cfg = self.node.remote_reporting_cluster_count();
-                self.diagnostics.record(DiagnosticEvent::FastPollStopped {
-                    configured: cfg,
-                    expected: self.node.expected_report_clusters(),
-                });
+                self.resources
+                    .diagnostics
+                    .record(DiagnosticEvent::FastPollStopped {
+                        configured: cfg,
+                        expected: self.node.expected_report_clusters(),
+                    });
                 self.was_fast_polling = false;
-                if !self.interview_done {
-                    self.platform.led_off();
+                if !self.was_identifying {
+                    self.resources
+                        .status
+                        .set(SensorStatus::Joined { active: false });
                 }
             } else if in_fast_poll {
                 self.was_fast_polling = true;
             }
 
-            // Sleep until button or poll timer wake.
-            if self.node.device().is_joined() {
-                let prepare_result = {
-                    let mac = self.node.device_mut().mac_mut();
-                    self.radio_power.prepare_for_sleep(mac)
-                };
-                if prepare_result.is_err() {
-                    self.diagnostics
-                        .record(DiagnosticEvent::RadioSleepPreparationFailed);
-                }
-            }
-            match self.platform.wait_for_wake(poll_ms).await {
+            self.resources.supervisor.heartbeat();
+            let ota_active = O::ENABLED && self.resources.ota.is_active(self.node.profile());
+            let sleep_depth = if self.node.device().is_joined() && !ota_active {
+                self.policy.sleep_depth
+            } else {
+                SleepDepth::Active
+            };
+            let wait_result = {
+                let node = &mut self.node;
+                let resources = &mut self.resources;
+                let mac = node.device_mut().mac_mut();
+                resources
+                    .wake
+                    .wait(
+                        mac,
+                        WaitRequest {
+                            timeout_ms: poll_ms,
+                            sleep_depth,
+                        },
+                    )
+                    .await
+            };
+            let wake_reason = match wait_result {
+                Ok(wake_reason) => wake_reason,
+                Err(_) => self.wake_failure(),
+            };
+            self.resources.supervisor.heartbeat();
+
+            match wake_reason {
                 WakeReason::Button => self.handle_button_press().await,
                 WakeReason::Timer => {}
             }
 
             if self.node.device().is_joined() {
                 self.service_joined_polls().await;
-                self.service_periodic_joined(self.platform.now()).await;
+                self.service_periodic_joined().await;
             } else {
-                self.service_unjoined(self.platform.now()).await;
+                self.service_unjoined().await;
             }
         }
     }

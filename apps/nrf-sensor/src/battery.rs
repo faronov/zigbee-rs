@@ -11,7 +11,7 @@
 //! monomorphize away to the same direct arithmetic the original
 //! single-product firmware inlined.
 
-use core::marker::PhantomData;
+use core::{convert::Infallible, marker::PhantomData};
 
 use embassy_nrf::saadc::Saadc;
 use sensor_sed_app::{BatteryReading, BatterySource};
@@ -43,12 +43,14 @@ impl<B> NrfBattery<B> {
 }
 
 impl<B: BatteryPolicy> BatterySource for NrfBattery<B> {
-    async fn sample(&mut self) -> BatteryReading {
+    type Error = Infallible;
+
+    async fn sample(&mut self) -> Result<Option<BatteryReading>, Self::Error> {
         let mut samples = [0i16; 1];
         self.saadc.sample(&mut samples).await;
-        BatteryReading {
+        Ok(Some(BatteryReading {
             millivolts: B::millivolts(samples[0]),
             measurement: B::measurement(samples[0]),
-        }
+        }))
     }
 }
