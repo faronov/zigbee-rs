@@ -727,6 +727,7 @@ where
                     .record(DiagnosticEvent::PermitJoinChanged { open: *open });
                 false
             }
+            StackEvent::ApsSecurityIndication(_) => false,
             StackEvent::ReportSent => {
                 self.resources
                     .diagnostics

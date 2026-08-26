@@ -552,6 +552,8 @@ let _ = ZigbeeDevice::builder(MockMac::new([0; 8])).build_router();
             power_now_ms: 0,
             automatic_polling: self.automatic_polling,
             pending_action: None,
+            #[cfg(feature = "router")]
+            pending_security_indication: None,
             zcl_seq: 0,
             basic_cluster: BasicCluster::new_with_application_version(
                 self.manufacturer_name,

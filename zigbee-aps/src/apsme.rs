@@ -20,6 +20,32 @@ const BROADCAST_IEEE: IeeeAddress = [0xFF; 8];
 // Key Management Primitives
 // ════════════════════════════════════════════════════════════════
 
+/// Durably reserved outgoing APS frame-counter range for a new link key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApsFrameCounterReservation {
+    current: u32,
+    limit: u32,
+}
+
+impl ApsFrameCounterReservation {
+    /// Create a non-empty `[current, limit)` reservation.
+    pub const fn new(current: u32, limit: u32) -> Option<Self> {
+        if current < limit {
+            Some(Self { current, limit })
+        } else {
+            None
+        }
+    }
+
+    pub const fn current(self) -> u32 {
+        self.current
+    }
+
+    pub const fn limit(self) -> u32 {
+        self.limit
+    }
+}
+
 /// APSME-TRANSPORT-KEY.request — distribute a key to a device.
 #[derive(Debug)]
 pub struct ApsmeTransportKeyRequest {
@@ -31,6 +57,10 @@ pub struct ApsmeTransportKeyRequest {
     pub key: [u8; 16],
     /// Network-key sequence number; ignored for link-key types.
     pub key_seq_number: u8,
+    /// Durable outgoing-counter reservation for a transported Trust Center or
+    /// application link key. Network-key transport does not create an APS
+    /// key-pair entry and therefore uses `None`.
+    pub link_key_counter_reservation: Option<ApsFrameCounterReservation>,
 }
 
 /// APSME-REQUEST-KEY.request — request a key from the Trust Center.
@@ -70,9 +100,72 @@ pub enum ApsUpdateDeviceStatus {
     StandardDeviceUnsecuredJoin = 0x01,
     DeviceLeft = 0x02,
     StandardDeviceUnsecuredRejoin = 0x03,
-    HighSecurityDeviceSecuredRejoin = 0x04,
-    HighSecurityDeviceUnsecuredJoin = 0x05,
-    HighSecurityDeviceUnsecuredRejoin = 0x07,
+}
+
+impl ApsUpdateDeviceStatus {
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x00 => Some(Self::StandardDeviceSecuredRejoin),
+            0x01 => Some(Self::StandardDeviceUnsecuredJoin),
+            0x02 => Some(Self::DeviceLeft),
+            0x03 => Some(Self::StandardDeviceUnsecuredRejoin),
+            _ => None,
+        }
+    }
+}
+
+/// Key type accepted in an APS Request-Key command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ApsRequestKeyType {
+    ApplicationLink = 0x02,
+    TrustCenterLink = 0x04,
+}
+
+impl ApsRequestKeyType {
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x02 => Some(Self::ApplicationLink),
+            0x04 => Some(Self::TrustCenterLink),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApsmeUpdateDeviceIndication {
+    pub source_address: IeeeAddress,
+    pub device_address: IeeeAddress,
+    pub device_short_address: ShortAddress,
+    pub status: ApsUpdateDeviceStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApsmeRemoveDeviceIndication {
+    pub source_address: IeeeAddress,
+    pub child_address: IeeeAddress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApsmeRequestKeyIndication {
+    pub source_address: IeeeAddress,
+    pub key_type: ApsRequestKeyType,
+    pub partner_address: Option<IeeeAddress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApsmeVerifyKeyIndication {
+    pub source_address: IeeeAddress,
+    pub key_type: u8,
+    pub hash: [u8; 16],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApsmeSecurityIndication {
+    UpdateDevice(ApsmeUpdateDeviceIndication),
+    RemoveDevice(ApsmeRemoveDeviceIndication),
+    RequestKey(ApsmeRequestKeyIndication),
+    VerifyKey(ApsmeVerifyKeyIndication),
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -281,12 +374,16 @@ impl<M: MacDriver> ApsLayer<M> {
         // key-load key, not with the key contained in its own payload.
         let pending_entry = match req.key_type {
             ApsKeyType::TrustCenterLinkKey | ApsKeyType::ApplicationLinkKey => {
+                let Some(reservation) = req.link_key_counter_reservation else {
+                    log::error!("APSME-TRANSPORT-KEY: link key has no durable counter reservation");
+                    return ApsStatus::InvalidParameter;
+                };
                 Some(ApsLinkKeyEntry {
                     partner_address: req.dst_address,
                     key: req.key,
                     key_type: req.key_type,
-                    outgoing_frame_counter: 0,
-                    outgoing_frame_counter_limit: u32::MAX,
+                    outgoing_frame_counter: reservation.current(),
+                    outgoing_frame_counter_limit: reservation.limit(),
                     incoming_frame_counter: 0,
                     incoming_frame_counter_valid: false,
                 })

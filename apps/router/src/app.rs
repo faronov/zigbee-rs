@@ -1065,6 +1065,7 @@ where
             StackEvent::DefaultResponse { .. } => Ok(EventControl::Continue),
             StackEvent::ReportingConfigured { .. } => Ok(EventControl::Continue),
             StackEvent::PermitJoinChanged { .. } => Ok(EventControl::Continue),
+            StackEvent::ApsSecurityIndication(_) => Ok(EventControl::Continue),
             StackEvent::ReportSent => Ok(EventControl::Continue),
             StackEvent::OtaImageAvailable { .. } => Ok(EventControl::Continue),
             StackEvent::OtaProgress { .. } => Ok(EventControl::Continue),

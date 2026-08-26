@@ -3880,6 +3880,11 @@ pub struct ZigbeeDevice<M: MacDriver, R: crate::role::DeviceRole = crate::role::
     automatic_polling: bool,
     /// Pending user action (set by button press, consumed by tick).
     pending_action: Option<UserAction>,
+    /// Locally generated Trust Center command awaiting the application-facing
+    /// event loop. Incoming commands stay in the APS receive slot only for the
+    /// duration of `process_incoming()`.
+    #[cfg(feature = "router")]
+    pending_security_indication: Option<zigbee_aps::apsme::ApsmeSecurityIndication>,
     /// ZCL transaction sequence counter.
     zcl_seq: u8,
     /// Standard clusters owned and configured by DeviceBuilder.
@@ -4990,6 +4995,15 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// Will be processed on the next call to `tick()`.
     pub fn user_action(&mut self, action: UserAction) {
         self.pending_action = Some(action);
+    }
+
+    /// Take the next parsed APSME security command awaiting Trust Center
+    /// policy.
+    #[cfg(feature = "router")]
+    pub fn take_pending_security_indication(
+        &mut self,
+    ) -> Option<zigbee_aps::apsme::ApsmeSecurityIndication> {
+        self.pending_security_indication.take()
     }
 
     // ── Query state ─────────────────────────────────────────
@@ -6343,6 +6357,14 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     ) -> Result<event_loop::TickResult, SecurityStoreError> {
         self.refresh_security_state(store)?;
         self.tick_identify_clusters(elapsed_secs);
+        #[cfg(feature = "router")]
+        if self.pending_action.is_none()
+            && let Some(indication) = self.take_pending_security_indication()
+        {
+            return Ok(event_loop::TickResult::Event(
+                event_loop::StackEvent::ApsSecurityIndication(indication),
+            ));
+        }
         let security_reset_action = matches!(
             self.pending_action,
             Some(UserAction::Leave | UserAction::FactoryReset)
@@ -6773,18 +6795,14 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     }
 
     fn child_update_status(
-        security_capable: bool,
         secured_rejoin: Option<bool>,
     ) -> zigbee_aps::apsme::ApsUpdateDeviceStatus {
         use zigbee_aps::apsme::ApsUpdateDeviceStatus;
 
-        match (security_capable, secured_rejoin) {
-            (false, None) => ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin,
-            (true, None) => ApsUpdateDeviceStatus::HighSecurityDeviceUnsecuredJoin,
-            (false, Some(true)) => ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
-            (true, Some(true)) => ApsUpdateDeviceStatus::HighSecurityDeviceSecuredRejoin,
-            (false, Some(false)) => ApsUpdateDeviceStatus::StandardDeviceUnsecuredRejoin,
-            (true, Some(false)) => ApsUpdateDeviceStatus::HighSecurityDeviceUnsecuredRejoin,
+        match secured_rejoin {
+            None => ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin,
+            Some(true) => ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
+            Some(false) => ApsUpdateDeviceStatus::StandardDeviceUnsecuredRejoin,
         }
     }
 
@@ -6798,13 +6816,46 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             TrustCenterMode::Distributed => Ok(()),
             TrustCenterMode::Unknown => Err(zigbee_aps::ApsStatus::InvalidParameter),
             TrustCenterMode::Centralized => {
-                self.bdb
-                    .zdo_mut()
-                    .aps_mut()
-                    .send_update_device(&device_address, device_short_address, status)
-                    .await
+                if self.bdb.zdo().aps().is_trust_center() {
+                    #[cfg(feature = "router")]
+                    {
+                        self.queue_local_update_device(device_address, device_short_address, status)
+                    }
+                    #[cfg(not(feature = "router"))]
+                    {
+                        Err(zigbee_aps::ApsStatus::InvalidParameter)
+                    }
+                } else {
+                    self.bdb
+                        .zdo_mut()
+                        .aps_mut()
+                        .send_update_device(&device_address, device_short_address, status)
+                        .await
+                }
             }
         }
+    }
+
+    #[cfg(feature = "router")]
+    fn queue_local_update_device(
+        &mut self,
+        device_address: IeeeAddress,
+        device_short_address: ShortAddress,
+        status: zigbee_aps::apsme::ApsUpdateDeviceStatus,
+    ) -> Result<(), zigbee_aps::ApsStatus> {
+        if self.pending_security_indication.is_some() {
+            return Err(zigbee_aps::ApsStatus::TableFull);
+        }
+        self.pending_security_indication =
+            Some(zigbee_aps::apsme::ApsmeSecurityIndication::UpdateDevice(
+                zigbee_aps::apsme::ApsmeUpdateDeviceIndication {
+                    source_address: self.bdb.zdo().aps().nwk().nib().ieee_address,
+                    device_address,
+                    device_short_address,
+                    status,
+                },
+            ));
+        Ok(())
     }
 
     fn prune_pending_child_updates(&mut self)
@@ -6976,13 +7027,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     return Err(error);
                 }
 
-                let security_capable = self
-                    .bdb
-                    .zdo()
-                    .nwk()
-                    .child_security_capable(&delivery.device_address)
-                    .ok_or(MacError::InvalidParameter)?;
-                let status = Self::child_update_status(security_capable, None);
+                let status = Self::child_update_status(None);
                 self.notify_trust_center_of_child(
                     delivery.device_address,
                     delivery.short_address,
@@ -7285,7 +7330,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             return;
         }
 
-        let update_status = Self::child_update_status(capability.security_capable, Some(secured));
+        let update_status = Self::child_update_status(Some(secured));
         match delivery {
             zigbee_nwk::RejoinResponseDelivery::Direct => {
                 if let Err(error) = self
@@ -7690,7 +7735,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         let aps_decrypt_buf = unsafe { &mut *self.scratch.aps.get() };
 
         // APS layer: parse APS header
-        let (aps_indication, pending_tunnel) = {
+        let (aps_indication, pending_tunnel, pending_security_indication) = {
             let aps = self.bdb.zdo_mut().aps_mut();
             let indication = aps.process_incoming_aps_frame(
                 &buf[..len],
@@ -7701,7 +7746,13 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 aps_decrypt_buf,
             );
             let tunnel = aps.take_pending_tunnel();
-            (indication, tunnel)
+            #[cfg(feature = "router")]
+            let security_indication = aps.take_pending_security_indication();
+            #[cfg(not(feature = "router"))]
+            let security_indication: Option<
+                zigbee_aps::apsme::ApsmeSecurityIndication,
+            > = None;
+            (indication, tunnel, security_indication)
         };
         if let Some(tunnel) = pending_tunnel {
             // A Tunnel command is an APS *command* frame like any other, so if
@@ -7718,6 +7769,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 log::warn!("[Runtime] APS Tunnel forwarding failed: {:?}", error);
             }
             return None;
+        }
+        if let Some(indication) = pending_security_indication {
+            let _ = self.bdb.zdo_mut().aps_mut().send_pending_aps_ack().await;
+            return Some(event_loop::StackEvent::ApsSecurityIndication(indication));
         }
         let aps_indication = match aps_indication {
             Some(v) => v,
@@ -8499,6 +8554,44 @@ mod parent_router_tests {
         device
     }
 
+    fn centralized_coordinator() -> ZigbeeDevice<MockMac, Router> {
+        let mut device = ZigbeeDevice::builder(MockMac::new(ROUTER_IEEE)).build_coordinator();
+        device.bdb_mut().attributes_mut().node_is_on_a_network = true;
+        {
+            let mac = device.mac_mut();
+            block_on(mac.mlme_set(
+                zigbee_mac::PibAttribute::MacPanId,
+                zigbee_mac::PibValue::PanId(PAN),
+            ))
+            .unwrap();
+            block_on(mac.mlme_set(
+                zigbee_mac::PibAttribute::MacShortAddress,
+                zigbee_mac::PibValue::ShortAddress(ShortAddress::COORDINATOR),
+            ))
+            .unwrap();
+            block_on(mac.mlme_set(
+                zigbee_mac::PibAttribute::PhyCurrentChannel,
+                zigbee_mac::PibValue::U8(15),
+            ))
+            .unwrap();
+        }
+        let aps = device.bdb_mut().zdo_mut().aps_mut();
+        aps.aib_mut().aps_trust_center_address = ROUTER_IEEE;
+        let nwk = aps.nwk_mut();
+        nwk.set_joined(true);
+        nwk.security_mut().set_network_key(NETWORK_KEY, 0);
+        let nib = nwk.nib_mut();
+        nib.pan_id = PAN;
+        nib.network_address = ShortAddress::COORDINATOR;
+        nib.extended_pan_id = [0xA5; 8];
+        nib.ieee_address = ROUTER_IEEE;
+        nib.depth = 0;
+        nib.security_enabled = true;
+        nib.active_key_seq_number = 0;
+        nib.set_nwk_update_id(7);
+        device
+    }
+
     fn beacon_request() -> MacCommandEvent {
         MacCommandEvent::BeaconRequest(MlmeBeaconRequestIndication {
             destination_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
@@ -8888,6 +8981,39 @@ mod parent_router_tests {
                 .nwk()
                 .known_child_by_ieee(&CHILD_IEEE),
             Some(response.short_address)
+        );
+    }
+
+    #[test]
+    fn coordinator_admits_its_child_without_sending_update_device_to_itself() {
+        let mut device = centralized_coordinator();
+        open_for_joining(&mut device, 0xFF);
+
+        block_on(
+            device.handle_parent_command(association_request(
+                CHILD_IEEE,
+                sleepy_child_capabilities(),
+            )),
+        )
+        .unwrap();
+        let response = device.mac().association_responses()[0].clone();
+        let step = block_on(device.service_parent_commands());
+
+        assert_eq!(step.failures, 0);
+        assert!(
+            device.mac().tx_history().is_empty(),
+            "the local Trust Center must not send Update-Device to itself"
+        );
+        assert_eq!(
+            device.take_pending_security_indication(),
+            Some(zigbee_aps::apsme::ApsmeSecurityIndication::UpdateDevice(
+                zigbee_aps::apsme::ApsmeUpdateDeviceIndication {
+                    source_address: ROUTER_IEEE,
+                    device_address: CHILD_IEEE,
+                    device_short_address: response.short_address,
+                    status: zigbee_aps::apsme::ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin,
+                }
+            ))
         );
     }
 

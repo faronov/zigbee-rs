@@ -149,6 +149,12 @@ pub enum StackEvent {
     },
     /// Permit joining status changed.
     PermitJoinChanged { open: bool },
+    /// A parsed APSME security command is ready for Trust Center policy.
+    ///
+    /// The APS layer has already authenticated the transport and validated
+    /// the command's wire-level invariants. Coordinator policy decides the
+    /// resulting admission, key, or removal action.
+    ApsSecurityIndication(zigbee_aps::apsme::ApsmeSecurityIndication),
     /// Attribute report was sent successfully.
     ReportSent,
     /// OTA: New image available from server.

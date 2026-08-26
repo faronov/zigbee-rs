@@ -195,6 +195,12 @@ pub struct ApsSecurityHandshakeStats {
     pub last_confirm_key_source: u16,
     pub last_confirm_key_source_ieee: zigbee_types::IeeeAddress,
     pub last_confirm_key_destination: zigbee_types::IeeeAddress,
+    /// Malformed or unauthenticated Trust Center command indications dropped
+    /// before reaching the runtime.
+    pub security_commands_ignored: u32,
+    /// Valid indications dropped because the single upper-layer handoff slot
+    /// was still occupied.
+    pub security_indications_dropped: u32,
 }
 
 impl Default for ApsSecurityHandshakeStats {
@@ -216,6 +222,8 @@ impl Default for ApsSecurityHandshakeStats {
             last_confirm_key_source: 0xFFFF,
             last_confirm_key_source_ieee: [0u8; 8],
             last_confirm_key_destination: [0u8; 8],
+            security_commands_ignored: 0,
+            security_indications_dropped: 0,
         }
     }
 }
@@ -404,6 +412,9 @@ pub struct ApsLayer<M: MacDriver> {
     pending_aps_ack: Option<PendingApsAck>,
     /// Pending APS Tunnel payload to forward without NWK security.
     pending_tunnel: Option<PendingApsTunnel>,
+    /// Parsed Trust Center / parent security command for the runtime.
+    #[cfg(feature = "router")]
+    pending_security_indication: Option<apsme::ApsmeSecurityIndication>,
     /// APS duplicate rejection table
     dup_table: [ApsDuplicateEntry; APS_DUP_TABLE_SIZE],
     /// Outbound APS ACK tracking (frames awaiting ACK confirmation)
@@ -426,6 +437,8 @@ impl<M: MacDriver> ApsLayer<M> {
             security_handshake_stats: ApsSecurityHandshakeStats::default(),
             pending_aps_ack: None,
             pending_tunnel: None,
+            #[cfg(feature = "router")]
+            pending_security_indication: None,
             dup_table: [ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE],
             ack_table: heapless::Vec::new(),
             fragment_rx: fragment::FragmentReassembly::new(),
@@ -449,6 +462,8 @@ impl<M: MacDriver> ApsLayer<M> {
                 .write(ApsSecurityHandshakeStats::default());
             core::ptr::addr_of_mut!((*slot).pending_aps_ack).write(None);
             core::ptr::addr_of_mut!((*slot).pending_tunnel).write(None);
+            #[cfg(feature = "router")]
+            core::ptr::addr_of_mut!((*slot).pending_security_indication).write(None);
             core::ptr::addr_of_mut!((*slot).dup_table)
                 .write([ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE]);
             core::ptr::addr_of_mut!((*slot).ack_table).write(heapless::Vec::new());

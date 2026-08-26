@@ -60,6 +60,7 @@ struct IncomingCommandSecurity {
     aps_secured: bool,
     aps_source: Option<IeeeAddress>,
     aps_key_identifier: Option<u8>,
+    aps_used_default_link_key: bool,
 }
 
 impl IncomingCommandSecurity {
@@ -1337,6 +1338,7 @@ impl<M: MacDriver> ApsLayer<M> {
                     aps_secured,
                     aps_source: aps_security_source,
                     aps_key_identifier,
+                    aps_used_default_link_key,
                 };
                 aps_diag!("[APS] command ID={:02X} data={}", cmd_id, cmd_data.len());
                 match crate::frames::ApsCommandId::from_u8(cmd_id) {
@@ -1349,8 +1351,17 @@ impl<M: MacDriver> ApsLayer<M> {
                     Some(crate::frames::ApsCommandId::Tunnel) => {
                         self.handle_tunnel(cmd_data, nwk_src, nwk_security.secured, aps_secured);
                     }
+                    Some(crate::frames::ApsCommandId::UpdateDevice) => {
+                        self.handle_update_device(cmd_data, command_security);
+                    }
+                    Some(crate::frames::ApsCommandId::RemoveDevice) => {
+                        self.handle_remove_device(cmd_data, command_security);
+                    }
+                    Some(crate::frames::ApsCommandId::RequestKey) => {
+                        self.handle_request_key(cmd_data, command_security);
+                    }
                     Some(crate::frames::ApsCommandId::VerifyKey) => {
-                        log::debug!("APS Verify-Key from 0x{:04X}", nwk_src.0);
+                        self.handle_verify_key(cmd_data, command_security);
                     }
                     Some(crate::frames::ApsCommandId::ConfirmKey) => {
                         self.handle_confirm_key(
@@ -1359,9 +1370,6 @@ impl<M: MacDriver> ApsLayer<M> {
                             command_security,
                             aps_used_default_link_key,
                         );
-                    }
-                    Some(other) => {
-                        log::debug!("APS command {:?} from 0x{:04X}", other, nwk_src.0);
                     }
                     None => {
                         log::debug!("Unknown APS command 0x{:02X}", cmd_id);
@@ -1542,6 +1550,218 @@ impl<M: MacDriver> ApsLayer<M> {
         stats.confirm_key_ignored = stats.confirm_key_ignored.wrapping_add(1);
     }
 
+    fn ignore_security_command(&mut self) {
+        self.security_handshake_stats.security_commands_ignored = self
+            .security_handshake_stats
+            .security_commands_ignored
+            .saturating_add(1);
+    }
+
+    fn queue_security_indication(
+        &mut self,
+        indication: crate::apsme::ApsmeSecurityIndication,
+    ) -> bool {
+        #[cfg(feature = "router")]
+        {
+            if self.pending_security_indication.is_some() {
+                self.security_handshake_stats.security_indications_dropped = self
+                    .security_handshake_stats
+                    .security_indications_dropped
+                    .saturating_add(1);
+                return false;
+            }
+            self.pending_security_indication = Some(indication);
+            true
+        }
+        #[cfg(not(feature = "router"))]
+        {
+            let _ = indication;
+            self.security_handshake_stats.security_indications_dropped = self
+                .security_handshake_stats
+                .security_indications_dropped
+                .saturating_add(1);
+            false
+        }
+    }
+
+    fn authenticated_nwk_source(
+        &mut self,
+        security: IncomingCommandSecurity,
+    ) -> Option<IeeeAddress> {
+        let Some(source) = security.nwk_source else {
+            self.ignore_security_command();
+            return None;
+        };
+        if !security.nwk_secured || source == [0u8; 8] || source == [0xFFu8; 8] {
+            self.ignore_security_command();
+            return None;
+        }
+        Some(source)
+    }
+
+    fn has_unique_trust_center_link_key(&self, source: &IeeeAddress) -> bool {
+        let default_key = *self.security.default_tc_link_key();
+        self.security
+            .find_key(source, crate::security::ApsKeyType::TrustCenterLinkKey)
+            .is_some_and(|entry| entry.key != default_key)
+    }
+
+    fn valid_data_key_security(
+        &mut self,
+        source: IeeeAddress,
+        security: IncomingCommandSecurity,
+        aps_required: bool,
+    ) -> bool {
+        if !security.aps_secured {
+            if aps_required {
+                self.ignore_security_command();
+                return false;
+            }
+            return true;
+        }
+        let valid = security.aps_source == Some(source)
+            && security.aps_key_identifier == Some(crate::security::KEY_ID_DATA_KEY)
+            && (!self.has_unique_trust_center_link_key(&source)
+                || !security.aps_used_default_link_key);
+        if !valid {
+            self.ignore_security_command();
+        }
+        valid
+    }
+
+    fn handle_update_device(&mut self, data: &[u8], security: IncomingCommandSecurity) {
+        let Some(source_address) = self.authenticated_nwk_source(security) else {
+            return;
+        };
+        let aps_required = self.has_unique_trust_center_link_key(&source_address);
+        if !self.valid_data_key_security(source_address, security, aps_required) || data.len() != 11
+        {
+            if data.len() != 11 {
+                self.ignore_security_command();
+            }
+            return;
+        }
+
+        let mut device_address = [0u8; 8];
+        device_address.copy_from_slice(&data[..8]);
+        let device_short_address = ShortAddress(u16::from_le_bytes([data[8], data[9]]));
+        let Some(status) = crate::apsme::ApsUpdateDeviceStatus::from_u8(data[10]) else {
+            self.ignore_security_command();
+            return;
+        };
+        if device_address == [0u8; 8]
+            || device_address == [0xFFu8; 8]
+            || device_address == self.nwk.nib().ieee_address
+            || device_short_address.0 == 0
+            || device_short_address.0 > 0xFFF7
+        {
+            self.ignore_security_command();
+            return;
+        }
+
+        self.queue_security_indication(crate::apsme::ApsmeSecurityIndication::UpdateDevice(
+            crate::apsme::ApsmeUpdateDeviceIndication {
+                source_address,
+                device_address,
+                device_short_address,
+                status,
+            },
+        ));
+    }
+
+    fn handle_remove_device(&mut self, data: &[u8], security: IncomingCommandSecurity) {
+        let Some(source_address) = self.authenticated_nwk_source(security) else {
+            return;
+        };
+        let trust_center = self.aib.aps_trust_center_address;
+        if data.len() != 8
+            || source_address != trust_center
+            || !self.valid_data_key_security(source_address, security, true)
+        {
+            if data.len() != 8 || source_address != trust_center {
+                self.ignore_security_command();
+            }
+            return;
+        }
+
+        let mut child_address = [0u8; 8];
+        child_address.copy_from_slice(data);
+        if self.nwk.known_child_by_ieee(&child_address).is_none() {
+            self.ignore_security_command();
+            return;
+        }
+        self.queue_security_indication(crate::apsme::ApsmeSecurityIndication::RemoveDevice(
+            crate::apsme::ApsmeRemoveDeviceIndication {
+                source_address,
+                child_address,
+            },
+        ));
+    }
+
+    fn handle_request_key(&mut self, data: &[u8], security: IncomingCommandSecurity) {
+        let Some(source_address) = self.authenticated_nwk_source(security) else {
+            return;
+        };
+        if !self.valid_data_key_security(source_address, security, true) {
+            return;
+        }
+        let Some(key_type) = data
+            .first()
+            .and_then(|value| crate::apsme::ApsRequestKeyType::from_u8(*value))
+        else {
+            self.ignore_security_command();
+            return;
+        };
+        let partner_address = match key_type {
+            crate::apsme::ApsRequestKeyType::TrustCenterLink if data.len() == 1 => None,
+            crate::apsme::ApsRequestKeyType::ApplicationLink if data.len() == 9 => {
+                let mut partner = [0u8; 8];
+                partner.copy_from_slice(&data[1..9]);
+                if partner == [0u8; 8] || partner == [0xFFu8; 8] {
+                    self.ignore_security_command();
+                    return;
+                }
+                Some(partner)
+            }
+            _ => {
+                self.ignore_security_command();
+                return;
+            }
+        };
+        self.queue_security_indication(crate::apsme::ApsmeSecurityIndication::RequestKey(
+            crate::apsme::ApsmeRequestKeyIndication {
+                source_address,
+                key_type,
+                partner_address,
+            },
+        ));
+    }
+
+    fn handle_verify_key(&mut self, data: &[u8], security: IncomingCommandSecurity) {
+        let Some(source_address) = self.authenticated_nwk_source(security) else {
+            return;
+        };
+        if security.aps_secured || data.len() != 25 || data[0] != WIRE_KEY_TYPE_TC_LINK {
+            self.ignore_security_command();
+            return;
+        }
+        let mut declared_source = [0u8; 8];
+        declared_source.copy_from_slice(&data[1..9]);
+        if declared_source != source_address {
+            self.ignore_security_command();
+            return;
+        }
+        let mut hash = [0u8; 16];
+        hash.copy_from_slice(&data[9..25]);
+        self.queue_security_indication(crate::apsme::ApsmeSecurityIndication::VerifyKey(
+            crate::apsme::ApsmeVerifyKeyIndication {
+                source_address,
+                key_type: data[0],
+                hash,
+            },
+        ));
+    }
+
     fn authenticated_trust_center_source(
         &self,
         src: ShortAddress,
@@ -1712,6 +1932,53 @@ impl<M: MacDriver> ApsLayer<M> {
             }
             (Err(_), Err(error)) => Err(error),
         }
+    }
+
+    /// Whether this device is the configured centralized Trust Center.
+    pub fn is_trust_center(&self) -> bool {
+        centralized_trust_center(self.aib.aps_trust_center_address)
+            == Some(self.nwk.nib().ieee_address)
+    }
+
+    /// Deliver an Update-Device indication locally when the Trust Center is
+    /// itself the joining device's parent.
+    #[cfg(feature = "router")]
+    pub fn indicate_local_update_device(
+        &mut self,
+        device_address: IeeeAddress,
+        device_short_address: ShortAddress,
+        status: crate::apsme::ApsUpdateDeviceStatus,
+    ) -> Result<(), ApsStatus> {
+        if !self.is_trust_center()
+            || device_address == [0u8; 8]
+            || device_address == [0xFFu8; 8]
+            || device_address == self.nwk.nib().ieee_address
+            || device_short_address.0 == 0
+            || device_short_address.0 > 0xFFF7
+        {
+            return Err(ApsStatus::InvalidParameter);
+        }
+        let indication = crate::apsme::ApsmeSecurityIndication::UpdateDevice(
+            crate::apsme::ApsmeUpdateDeviceIndication {
+                source_address: self.nwk.nib().ieee_address,
+                device_address,
+                device_short_address,
+                status,
+            },
+        );
+        if self.queue_security_indication(indication) {
+            Ok(())
+        } else {
+            Err(ApsStatus::TableFull)
+        }
+    }
+
+    /// Return and clear the parsed Trust Center / parent security indication.
+    #[cfg(feature = "router")]
+    pub fn take_pending_security_indication(
+        &mut self,
+    ) -> Option<crate::apsme::ApsmeSecurityIndication> {
+        self.pending_security_indication.take()
     }
 
     /// Return and clear the APS Tunnel command captured during receive.
@@ -2877,6 +3144,7 @@ mod tests {
                 aps_secured: true,
                 aps_source: Some(TC_IEEE),
                 aps_key_identifier: Some(crate::security::KEY_ID_KEY_LOAD),
+                aps_used_default_link_key: true,
             },
         );
 
@@ -2921,6 +3189,7 @@ mod tests {
                 aps_secured: true,
                 aps_source: Some(TC_IEEE),
                 aps_key_identifier: Some(crate::security::KEY_ID_KEY_LOAD),
+                aps_used_default_link_key: false,
             },
         );
 
@@ -3064,6 +3333,64 @@ mod tests {
 
     #[test]
     #[cfg(feature = "router")]
+    fn apsme_link_key_transport_requires_a_durable_counter_reservation() {
+        let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+        aps.nwk_mut().nib_mut().permit_joining = true;
+        aps.nwk_mut()
+            .handle_child_association(
+                CHILD_IEEE,
+                CapabilityInfo {
+                    device_type_ffd: false,
+                    mains_powered: false,
+                    rx_on_when_idle: true,
+                    security_capable: false,
+                    allocate_address: true,
+                }
+                .to_byte(),
+            )
+            .unwrap();
+        let key = [0xB7; 16];
+
+        assert_eq!(
+            block_on(
+                aps.apsme_transport_key(&crate::apsme::ApsmeTransportKeyRequest {
+                    dst_address: CHILD_IEEE,
+                    key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+                    key,
+                    key_seq_number: 0,
+                    link_key_counter_reservation: None,
+                })
+            ),
+            ApsStatus::InvalidParameter
+        );
+        assert!(aps.nwk().mac().tx_history().is_empty());
+        assert!(crate::apsme::ApsFrameCounterReservation::new(0x2000, 0x2000).is_none());
+
+        let reservation = crate::apsme::ApsFrameCounterReservation::new(0x2000, 0x2400).unwrap();
+        assert_eq!(
+            block_on(
+                aps.apsme_transport_key(&crate::apsme::ApsmeTransportKeyRequest {
+                    dst_address: CHILD_IEEE,
+                    key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+                    key,
+                    key_seq_number: 0,
+                    link_key_counter_reservation: Some(reservation),
+                })
+            ),
+            ApsStatus::Success
+        );
+        assert_eq!(aps.nwk().mac().tx_history().len(), 1);
+        let entry = aps
+            .security()
+            .find_key(&CHILD_IEEE, crate::security::ApsKeyType::TrustCenterLinkKey)
+            .unwrap();
+        assert_eq!(entry.key, key);
+        assert_eq!(entry.outgoing_frame_counter, 0x2000);
+        assert_eq!(entry.outgoing_frame_counter_limit, 0x2400);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
     fn apsme_broadcast_key_rotation_uses_nwk_security_and_requested_sequence() {
         let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
         let next_key = [0xB4; 16];
@@ -3074,6 +3401,7 @@ mod tests {
                     key_type: crate::security::ApsKeyType::NetworkKey,
                     key: next_key,
                     key_seq_number: 7,
+                    link_key_counter_reservation: None,
                 })
             ),
             ApsStatus::Success
@@ -3124,7 +3452,7 @@ mod tests {
             CHILD_IEEE[7],
             CHILD_SHORT.0 as u8,
             (CHILD_SHORT.0 >> 8) as u8,
-            crate::apsme::ApsUpdateDeviceStatus::HighSecurityDeviceUnsecuredJoin as u8,
+            crate::apsme::ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin as u8,
         ];
 
         let mut global = aps_node(DeviceType::Router, LOCAL_SHORT);
@@ -3132,7 +3460,7 @@ mod tests {
         block_on(global.send_update_device(
             &CHILD_IEEE,
             CHILD_SHORT,
-            crate::apsme::ApsUpdateDeviceStatus::HighSecurityDeviceUnsecuredJoin,
+            crate::apsme::ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin,
         ))
         .unwrap();
         let history = global.nwk().mac().tx_history();
@@ -3167,7 +3495,7 @@ mod tests {
         block_on(unique.send_update_device(
             &CHILD_IEEE,
             CHILD_SHORT,
-            crate::apsme::ApsUpdateDeviceStatus::HighSecurityDeviceUnsecuredJoin,
+            crate::apsme::ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin,
         ))
         .unwrap();
         let history = unique.nwk().mac().tx_history();
@@ -3175,6 +3503,221 @@ mod tests {
         assert_eq!(
             aps_command(&nwk_payload(&history[0]), &unique_key).as_slice(),
             expected
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn update_device_indication_rejects_reserved_status_and_own_identity() {
+        let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+        aps.aib_mut().aps_trust_center_address = LOCAL_IEEE;
+        let mut command = [0u8; 12];
+        command[0] = crate::frames::ApsCommandId::UpdateDevice as u8;
+        command[1..9].copy_from_slice(&CHILD_IEEE);
+        command[9..11].copy_from_slice(&CHILD_SHORT.0.to_le_bytes());
+        command[11] = crate::apsme::ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin as u8;
+        let mut scratch = ApsFrameBuffer::new();
+
+        let frame = unsecured_command_frame(&command, 1);
+        aps.process_incoming_aps_frame(
+            &frame,
+            ShortAddress(0x4455),
+            ShortAddress::COORDINATOR,
+            200,
+            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+            &mut scratch,
+        );
+        assert_eq!(
+            aps.take_pending_security_indication(),
+            Some(crate::apsme::ApsmeSecurityIndication::UpdateDevice(
+                crate::apsme::ApsmeUpdateDeviceIndication {
+                    source_address: TC_IEEE,
+                    device_address: CHILD_IEEE,
+                    device_short_address: CHILD_SHORT,
+                    status: crate::apsme::ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin,
+                }
+            ))
+        );
+
+        command[11] = 0x05;
+        let frame = unsecured_command_frame(&command, 2);
+        aps.process_incoming_aps_frame(
+            &frame,
+            ShortAddress(0x4455),
+            ShortAddress::COORDINATOR,
+            200,
+            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+            &mut scratch,
+        );
+        assert!(aps.take_pending_security_indication().is_none());
+
+        command[1..9].copy_from_slice(&LOCAL_IEEE);
+        command[11] = crate::apsme::ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin as u8;
+        let frame = unsecured_command_frame(&command, 3);
+        aps.process_incoming_aps_frame(
+            &frame,
+            ShortAddress(0x4455),
+            ShortAddress::COORDINATOR,
+            200,
+            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+            &mut scratch,
+        );
+        assert!(aps.take_pending_security_indication().is_none());
+        assert_eq!(aps.security_handshake_stats().security_commands_ignored, 2);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn request_key_requires_aps_data_key_security_and_valid_type() {
+        let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+        aps.aib_mut().aps_trust_center_address = LOCAL_IEEE;
+        let command = [crate::frames::ApsCommandId::RequestKey as u8, 0x04];
+        let mut scratch = ApsFrameBuffer::new();
+
+        let frame = unsecured_command_frame(&command, 1);
+        aps.process_incoming_aps_frame(
+            &frame,
+            CHILD_SHORT,
+            ShortAddress::COORDINATOR,
+            200,
+            IncomingNwkSecurity::new(true, Some(CHILD_IEEE)),
+            &mut scratch,
+        );
+        assert!(aps.take_pending_security_indication().is_none());
+
+        let mut secured = [0u8; 80];
+        let secured_len = build_tc_secured_command_frame(
+            aps.security(),
+            aps.security().default_tc_link_key(),
+            &CHILD_IEEE,
+            2,
+            1,
+            crate::security::KEY_ID_DATA_KEY,
+            false,
+            &command,
+            &mut secured,
+        )
+        .unwrap();
+        aps.process_incoming_aps_frame(
+            &secured[..secured_len],
+            CHILD_SHORT,
+            ShortAddress::COORDINATOR,
+            200,
+            IncomingNwkSecurity::new(true, Some(CHILD_IEEE)),
+            &mut scratch,
+        );
+        assert_eq!(
+            aps.take_pending_security_indication(),
+            Some(crate::apsme::ApsmeSecurityIndication::RequestKey(
+                crate::apsme::ApsmeRequestKeyIndication {
+                    source_address: CHILD_IEEE,
+                    key_type: crate::apsme::ApsRequestKeyType::TrustCenterLink,
+                    partner_address: None,
+                }
+            ))
+        );
+
+        let invalid = [crate::frames::ApsCommandId::RequestKey as u8, 0x01];
+        let invalid_len = build_tc_secured_command_frame(
+            aps.security(),
+            aps.security().default_tc_link_key(),
+            &CHILD_IEEE,
+            3,
+            2,
+            crate::security::KEY_ID_DATA_KEY,
+            false,
+            &invalid,
+            &mut secured,
+        )
+        .unwrap();
+        aps.process_incoming_aps_frame(
+            &secured[..invalid_len],
+            CHILD_SHORT,
+            ShortAddress::COORDINATOR,
+            200,
+            IncomingNwkSecurity::new(true, Some(CHILD_IEEE)),
+            &mut scratch,
+        );
+        assert!(aps.take_pending_security_indication().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn verify_key_must_be_aps_unsecured_and_bind_its_declared_source() {
+        let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+        aps.aib_mut().aps_trust_center_address = LOCAL_IEEE;
+        let hash = [0xA5; 16];
+        let command = build_verify_key_command(&CHILD_IEEE, WIRE_KEY_TYPE_TC_LINK, &hash);
+        let mut scratch = ApsFrameBuffer::new();
+
+        let frame = unsecured_command_frame(&command, 1);
+        aps.process_incoming_aps_frame(
+            &frame,
+            CHILD_SHORT,
+            ShortAddress::COORDINATOR,
+            200,
+            IncomingNwkSecurity::new(true, Some(CHILD_IEEE)),
+            &mut scratch,
+        );
+        assert_eq!(
+            aps.take_pending_security_indication(),
+            Some(crate::apsme::ApsmeSecurityIndication::VerifyKey(
+                crate::apsme::ApsmeVerifyKeyIndication {
+                    source_address: CHILD_IEEE,
+                    key_type: WIRE_KEY_TYPE_TC_LINK,
+                    hash,
+                }
+            ))
+        );
+
+        let mut secured = [0u8; 80];
+        let secured_len = build_tc_secured_command_frame(
+            aps.security(),
+            aps.security().default_tc_link_key(),
+            &CHILD_IEEE,
+            2,
+            1,
+            crate::security::KEY_ID_DATA_KEY,
+            false,
+            &command,
+            &mut secured,
+        )
+        .unwrap();
+        aps.process_incoming_aps_frame(
+            &secured[..secured_len],
+            CHILD_SHORT,
+            ShortAddress::COORDINATOR,
+            200,
+            IncomingNwkSecurity::new(true, Some(CHILD_IEEE)),
+            &mut scratch,
+        );
+        assert!(aps.take_pending_security_indication().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn coordinator_handles_its_child_update_locally_without_air_traffic() {
+        let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+        aps.aib_mut().aps_trust_center_address = LOCAL_IEEE;
+
+        aps.indicate_local_update_device(
+            CHILD_IEEE,
+            CHILD_SHORT,
+            crate::apsme::ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin,
+        )
+        .unwrap();
+
+        assert!(aps.nwk().mac().tx_history().is_empty());
+        assert_eq!(
+            aps.take_pending_security_indication(),
+            Some(crate::apsme::ApsmeSecurityIndication::UpdateDevice(
+                crate::apsme::ApsmeUpdateDeviceIndication {
+                    source_address: LOCAL_IEEE,
+                    device_address: CHILD_IEEE,
+                    device_short_address: CHILD_SHORT,
+                    status: crate::apsme::ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin,
+                }
+            ))
         );
     }
 

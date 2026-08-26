@@ -49,6 +49,7 @@ pub enum StackEventSummary {
     PermitJoinChanged {
         open: bool,
     },
+    ApsSecurityIndication,
     ReportSent,
     OtaImageAvailable {
         version: u32,
@@ -142,6 +143,7 @@ pub fn summarize_stack_event(event: &StackEvent) -> StackEventSummary {
         StackEvent::PermitJoinChanged { open } => {
             StackEventSummary::PermitJoinChanged { open: *open }
         }
+        StackEvent::ApsSecurityIndication(_) => StackEventSummary::ApsSecurityIndication,
         StackEvent::ReportSent => StackEventSummary::ReportSent,
         StackEvent::OtaImageAvailable { version, size } => StackEventSummary::OtaImageAvailable {
             version: *version,
