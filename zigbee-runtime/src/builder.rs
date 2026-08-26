@@ -566,6 +566,8 @@ let _ = ZigbeeDevice::builder(MockMac::new([0; 8])).build_router();
             pending_responses: heapless::Vec::new(),
             scratch: super::RuntimeScratch::new(),
             state_dirty: false,
+            persisted_aps_table_fingerprint: 0,
+            aps_tables_persisted: false,
             secure_rejoin_retry_at: None,
             role_state: <R as DeviceRole>::State::new(),
             _role: core::marker::PhantomData,

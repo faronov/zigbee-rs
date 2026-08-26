@@ -7,6 +7,7 @@ use core::marker::PhantomData;
 use zigbee_mac::ParentMacDriver;
 use zigbee_mac::{MacDriver, MacError};
 use zigbee_nwk::DeviceType;
+use zigbee_runtime::aps_table_store::{ApsTableStore, ApsTableStoreError};
 use zigbee_runtime::child_store::ChildStoreError;
 #[cfg(feature = "router")]
 use zigbee_runtime::child_store::ChildTableStore;
@@ -29,6 +30,33 @@ use crate::parts::RouterParts;
 use crate::policy::RouterPolicy;
 
 type RouterNode<'a, M, S, P, R> = ZigbeeNode<'a, M, S, P, R>;
+
+/// Compile-time absence of durable APS binding/group storage.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoApsTables;
+
+/// Product-owned durable APS binding/group store.
+pub struct PersistentApsTables<A> {
+    store: A,
+}
+
+impl<A> PersistentApsTables<A> {
+    pub const fn new(store: A) -> Self {
+        Self { store }
+    }
+
+    pub const fn store(&self) -> &A {
+        &self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut A {
+        &mut self.store
+    }
+
+    pub fn into_inner(self) -> A {
+        self.store
+    }
+}
 
 /// Application events produced during one finite application step.
 ///
@@ -238,6 +266,130 @@ enum ChildRestore {
     Discarded(ChildStoreError),
 }
 
+#[doc(hidden)]
+pub enum ApsRestore {
+    NotApplicable,
+    Restored(usize),
+    Discarded(ApsTableStoreError),
+}
+
+#[doc(hidden)]
+pub trait ApsTableLifecycle<M, S, P, R>
+where
+    M: MacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    R: DeviceRole,
+{
+    fn restore(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<ApsRestore, ApsTableStoreError>;
+
+    fn persist_if_dirty(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<bool, ApsTableStoreError>;
+
+    fn clear(&mut self, node: &mut RouterNode<'_, M, S, P, R>) -> Result<bool, ApsTableStoreError>;
+
+    fn clear_stale_before_fresh(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<bool, ApsTableStoreError>;
+}
+
+impl<M, S, P, R> ApsTableLifecycle<M, S, P, R> for NoApsTables
+where
+    M: MacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    R: DeviceRole,
+{
+    fn restore(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<ApsRestore, ApsTableStoreError> {
+        Ok(ApsRestore::NotApplicable)
+    }
+
+    fn persist_if_dirty(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<bool, ApsTableStoreError> {
+        Ok(false)
+    }
+
+    fn clear(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<bool, ApsTableStoreError> {
+        Ok(false)
+    }
+
+    fn clear_stale_before_fresh(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<bool, ApsTableStoreError> {
+        Ok(false)
+    }
+}
+
+impl<M, S, P, R, A> ApsTableLifecycle<M, S, P, R> for PersistentApsTables<A>
+where
+    M: MacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    R: DeviceRole,
+    A: ApsTableStore,
+{
+    fn restore(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<ApsRestore, ApsTableStoreError> {
+        match node.device_mut().restore_aps_tables(&mut self.store) {
+            Ok(count) => Ok(ApsRestore::Restored(count)),
+            Err(error @ (ApsTableStoreError::Corrupt | ApsTableStoreError::ForeignNetwork)) => {
+                node.device_mut()
+                    .clear_persisted_aps_tables(&mut self.store)?;
+                Ok(ApsRestore::Discarded(error))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn persist_if_dirty(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<bool, ApsTableStoreError> {
+        node.device_mut().save_aps_tables_if_dirty(&mut self.store)
+    }
+
+    fn clear(&mut self, node: &mut RouterNode<'_, M, S, P, R>) -> Result<bool, ApsTableStoreError> {
+        node.device_mut()
+            .clear_persisted_aps_tables(&mut self.store)?;
+        Ok(true)
+    }
+
+    fn clear_stale_before_fresh(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<bool, ApsTableStoreError> {
+        let should_clear = match self.store.load() {
+            Ok(None) => false,
+            Ok(Some(snapshot)) => !snapshot.is_empty(),
+            Err(ApsTableStoreError::Corrupt | ApsTableStoreError::ForeignNetwork) => true,
+            Err(error) => return Err(error),
+        };
+        if !should_clear {
+            return Ok(false);
+        }
+        node.device_mut()
+            .clear_persisted_aps_tables(&mut self.store)?;
+        Ok(true)
+    }
+}
+
 trait ChildLifecycle<M, S, P, R>
 where
     M: MacDriver,
@@ -404,21 +556,16 @@ enum EventControl {
     Stop,
 }
 
-struct RouterCore<'a, M, S, P, R, C, K, St, Sv, D, O>
+struct RouterCore<'a, M, S, P, R, C, A, K, St, Sv, D, O>
 where
     M: MacDriver,
     S: SecurityStateStore,
     P: ApplicationProfile,
     R: DeviceRole,
-    C: ChildLifecycle<M, S, P, R>,
-    K: StartupPath<R> + TickPath<R>,
-    St: StatusSink,
-    Sv: Supervisor,
-    D: Diagnostics,
-    O: RouterObserver<M, R>,
 {
     node: RouterNode<'a, M, S, P, R>,
     children: C,
+    aps_tables: A,
     policy: &'static RouterPolicy,
     parts: RouterParts<St, Sv, D>,
     last_tick_us: u32,
@@ -434,13 +581,14 @@ where
     _observer: PhantomData<O>,
 }
 
-impl<'a, M, S, P, R, C, K, St, Sv, D, O> RouterCore<'a, M, S, P, R, C, K, St, Sv, D, O>
+impl<'a, M, S, P, R, C, A, K, St, Sv, D, O> RouterCore<'a, M, S, P, R, C, A, K, St, Sv, D, O>
 where
     M: MacDriver,
     S: SecurityStateStore,
     P: ApplicationProfile,
     R: DeviceRole,
     C: ChildLifecycle<M, S, P, R>,
+    A: ApsTableLifecycle<M, S, P, R>,
     K: StartupPath<R> + TickPath<R>,
     St: StatusSink,
     Sv: Supervisor,
@@ -450,6 +598,7 @@ where
     fn new(
         node: RouterNode<'a, M, S, P, R>,
         children: C,
+        aps_tables: A,
         policy: &'static RouterPolicy,
         parts: RouterParts<St, Sv, D>,
     ) -> Result<Self, RouterAppError> {
@@ -470,6 +619,7 @@ where
         Ok(Self {
             node,
             children,
+            aps_tables,
             policy,
             parts,
             last_tick_us: now,
@@ -565,11 +715,35 @@ where
         Ok(())
     }
 
+    fn restore_aps_tables(&mut self) -> Result<(), RouterAppError> {
+        match self.aps_tables.restore(&mut self.node)? {
+            ApsRestore::NotApplicable => {}
+            ApsRestore::Restored(count) => self
+                .parts
+                .diagnostics
+                .record(DiagnosticEvent::ApsTablesRestored { count }),
+            ApsRestore::Discarded(error) => self
+                .parts
+                .diagnostics
+                .record(DiagnosticEvent::ApsTablesDiscarded { error }),
+        }
+        Ok(())
+    }
+
     fn persist_children_if_dirty(&mut self) -> Result<(), RouterAppError> {
         if self.children.persist_if_dirty(&mut self.node)? {
             self.parts
                 .diagnostics
                 .record(DiagnosticEvent::ChildTableSaved);
+        }
+        Ok(())
+    }
+
+    fn persist_aps_tables_if_dirty(&mut self) -> Result<(), RouterAppError> {
+        if self.aps_tables.persist_if_dirty(&mut self.node)? {
+            self.parts
+                .diagnostics
+                .record(DiagnosticEvent::ApsTablesSaved);
         }
         Ok(())
     }
@@ -583,11 +757,29 @@ where
         Ok(())
     }
 
+    fn clear_aps_tables(&mut self) -> Result<(), RouterAppError> {
+        if self.aps_tables.clear(&mut self.node)? {
+            self.parts
+                .diagnostics
+                .record(DiagnosticEvent::ApsTablesCleared);
+        }
+        Ok(())
+    }
+
     fn clear_stale_children_before_fresh(&mut self) -> Result<(), RouterAppError> {
         if self.children.clear_stale_before_fresh(&mut self.node)? {
             self.parts
                 .diagnostics
                 .record(DiagnosticEvent::ChildTableCleared);
+        }
+        Ok(())
+    }
+
+    fn clear_stale_aps_tables_before_fresh(&mut self) -> Result<(), RouterAppError> {
+        if self.aps_tables.clear_stale_before_fresh(&mut self.node)? {
+            self.parts
+                .diagnostics
+                .record(DiagnosticEvent::ApsTablesCleared);
         }
         Ok(())
     }
@@ -614,6 +806,7 @@ where
         // No receive/tick/parent-command path is entered before this returns.
         self.checkpoint_security()?;
         self.restore_children()?;
+        self.restore_aps_tables()?;
         self.node.reset_remote_reporting();
         self.retry_delay_ms = self.policy.join_retry_initial_ms;
         self.secure_rejoin_failures = 0;
@@ -678,6 +871,7 @@ where
             .map_err(RouterAppError::Start)?;
         self.parts.diagnostics.record(DiagnosticEvent::FactoryReset);
         self.clear_children()?;
+        self.clear_aps_tables()?;
         self.node.reset_remote_reporting();
         self.run_again_deadline_us = None;
         self.last_identifying = None;
@@ -862,6 +1056,7 @@ where
                     self.note_secure_rejoin_failure(None).await?;
                 } else {
                     self.clear_children()?;
+                    self.clear_aps_tables()?;
                     self.node.reset_remote_reporting();
                     self.schedule_immediate_recommission();
                 }
@@ -963,6 +1158,7 @@ where
                         events.incoming = Some(event);
                         if !self.pending_factory_reset {
                             self.persist_children_if_dirty()?;
+                            self.persist_aps_tables_if_dirty()?;
                         }
                         if matches!(control, EventControl::Stop) {
                             self.parts.supervisor.heartbeat();
@@ -978,6 +1174,7 @@ where
         // Parent command servicing surrounds receive_timeout and may mutate
         // the child table even when no normal data indication arrived.
         self.persist_children_if_dirty()?;
+        self.persist_aps_tables_if_dirty()?;
 
         let elapsed_secs = self.elapsed_tick_secs();
         self.run_again_deadline_us = None;
@@ -987,6 +1184,7 @@ where
             .await?;
         if !self.pending_factory_reset {
             self.persist_children_if_dirty()?;
+            self.persist_aps_tables_if_dirty()?;
         }
         if matches!(control, EventControl::Continue) {
             self.refresh_online_status();
@@ -1045,6 +1243,7 @@ where
             // Clear before fresh steering/formation, including the
             // same-extended-PAN-ID case that EPID binding cannot distinguish.
             self.clear_stale_children_before_fresh()?;
+            self.clear_stale_aps_tables_before_fresh()?;
         }
         self.node
             .configure_default_reporting()
@@ -1101,10 +1300,22 @@ where
 
 #[cfg(feature = "router")]
 type RelayCore<'a, M, S, P, St, Sv, D, O> =
-    RouterCore<'a, M, S, P, RelayRouter, NoChildren, RelayArchetype, St, Sv, D, O>;
+    RouterCore<'a, M, S, P, RelayRouter, NoChildren, NoApsTables, RelayArchetype, St, Sv, D, O>;
 
-type AlwaysOnEndDeviceCore<'a, M, S, P, St, Sv, D, O> =
-    RouterCore<'a, M, S, P, EndDevice, NoChildren, AlwaysOnEndDeviceArchetype, St, Sv, D, O>;
+type AlwaysOnEndDeviceCore<'a, M, S, P, St, Sv, D, O> = RouterCore<
+    'a,
+    M,
+    S,
+    P,
+    EndDevice,
+    NoChildren,
+    NoApsTables,
+    AlwaysOnEndDeviceArchetype,
+    St,
+    Sv,
+    D,
+    O,
+>;
 
 /// Mains-powered, non-routing Zigbee end-device application.
 ///
@@ -1144,7 +1355,7 @@ where
         parts: RouterParts<St, Sv, D>,
     ) -> Result<Self, RouterAppError> {
         Ok(Self {
-            core: RouterCore::new(node, NoChildren, policy, parts)?,
+            core: RouterCore::new(node, NoChildren, NoApsTables, policy, parts)?,
         })
     }
 
@@ -1261,7 +1472,7 @@ where
         parts: RouterParts<St, Sv, D>,
     ) -> Result<Self, RouterAppError> {
         Ok(Self {
-            core: RouterCore::new(node, children, policy, parts)?,
+            core: RouterCore::new(node, children, NoApsTables, policy, parts)?,
         })
     }
 
@@ -1350,12 +1561,12 @@ where
 }
 
 #[cfg(feature = "router")]
-type ParentCore<'a, M, S, P, C, St, Sv, D, O> =
-    RouterCore<'a, M, S, P, Router, PersistentChildren<C>, ParentArchetype, St, Sv, D, O>;
+type ParentCore<'a, M, S, P, C, A, St, Sv, D, O> =
+    RouterCore<'a, M, S, P, Router, PersistentChildren<C>, A, ParentArchetype, St, Sv, D, O>;
 
 /// Child-capable persistent router application.
 #[cfg(feature = "router")]
-pub struct ParentRouterApp<'a, M, S, P, C, St, Sv, D, O = NoObserver>
+pub struct ParentRouterApp<'a, M, S, P, C, St, Sv, D, O = NoObserver, A = NoApsTables>
 where
     M: ParentMacDriver,
     S: SecurityStateStore,
@@ -1366,11 +1577,11 @@ where
     D: Diagnostics,
     O: RouterObserver<M, Router>,
 {
-    core: ParentCore<'a, M, S, P, C, St, Sv, D, O>,
+    core: ParentCore<'a, M, S, P, C, A, St, Sv, D, O>,
 }
 
 #[cfg(feature = "router")]
-impl<'a, M, S, P, C, St, Sv, D, O> ParentRouterApp<'a, M, S, P, C, St, Sv, D, O>
+impl<'a, M, S, P, C, St, Sv, D, O, A> ParentRouterApp<'a, M, S, P, C, St, Sv, D, O, A>
 where
     M: ParentMacDriver,
     S: SecurityStateStore,
@@ -1380,16 +1591,18 @@ where
     Sv: Supervisor,
     D: Diagnostics,
     O: RouterObserver<M, Router>,
+    A: ApsTableLifecycle<M, S, P, Router>,
 {
     /// Construct with a statically selected non-default observer type `O`.
-    pub fn new_observed(
+    pub fn new_observed_with_aps_tables(
         node: RouterNode<'a, M, S, P, Router>,
         children: PersistentChildren<C>,
+        aps_tables: A,
         policy: &'static RouterPolicy,
         parts: RouterParts<St, Sv, D>,
     ) -> Result<Self, RouterAppError> {
         Ok(Self {
-            core: RouterCore::new(node, children, policy, parts)?,
+            core: RouterCore::new(node, children, aps_tables, policy, parts)?,
         })
     }
 
@@ -1407,6 +1620,14 @@ where
 
     pub fn children_mut(&mut self) -> &mut PersistentChildren<C> {
         &mut self.core.children
+    }
+
+    pub const fn aps_tables(&self) -> &A {
+        &self.core.aps_tables
+    }
+
+    pub fn aps_tables_mut(&mut self) -> &mut A {
+        &mut self.core.aps_tables
     }
 
     pub fn parts(&self) -> &RouterParts<St, Sv, D> {
@@ -1461,7 +1682,29 @@ where
 }
 
 #[cfg(feature = "router")]
-impl<'a, M, S, P, C, St, Sv, D> ParentRouterApp<'a, M, S, P, C, St, Sv, D, NoObserver>
+impl<'a, M, S, P, C, St, Sv, D, O> ParentRouterApp<'a, M, S, P, C, St, Sv, D, O, NoApsTables>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    O: RouterObserver<M, Router>,
+{
+    pub fn new_observed(
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<Self, RouterAppError> {
+        Self::new_observed_with_aps_tables(node, children, NoApsTables, policy, parts)
+    }
+}
+
+#[cfg(feature = "router")]
+impl<'a, M, S, P, C, St, Sv, D> ParentRouterApp<'a, M, S, P, C, St, Sv, D, NoObserver, NoApsTables>
 where
     M: ParentMacDriver,
     S: SecurityStateStore,
@@ -1482,12 +1725,7 @@ where
 }
 
 #[cfg(feature = "router")]
-type CoordinatorCore<'a, M, S, P, C, St, Sv, D, O> =
-    RouterCore<'a, M, S, P, Router, PersistentChildren<C>, CoordinatorArchetype, St, Sv, D, O>;
-
-/// Coordinator composition frontend over the parent runtime role.
-#[cfg(feature = "router")]
-pub struct CoordinatorApp<'a, M, S, P, C, St, Sv, D, O = NoObserver>
+impl<'a, M, S, P, C, St, Sv, D, A> ParentRouterApp<'a, M, S, P, C, St, Sv, D, NoObserver, A>
 where
     M: ParentMacDriver,
     S: SecurityStateStore,
@@ -1496,13 +1734,26 @@ where
     St: StatusSink,
     Sv: Supervisor,
     D: Diagnostics,
-    O: RouterObserver<M, Router>,
+    A: ApsTableLifecycle<M, S, P, Router>,
 {
-    core: CoordinatorCore<'a, M, S, P, C, St, Sv, D, O>,
+    pub fn new_with_aps_tables(
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        aps_tables: A,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<Self, RouterAppError> {
+        Self::new_observed_with_aps_tables(node, children, aps_tables, policy, parts)
+    }
 }
 
 #[cfg(feature = "router")]
-impl<'a, M, S, P, C, St, Sv, D, O> CoordinatorApp<'a, M, S, P, C, St, Sv, D, O>
+type CoordinatorCore<'a, M, S, P, C, A, St, Sv, D, O> =
+    RouterCore<'a, M, S, P, Router, PersistentChildren<C>, A, CoordinatorArchetype, St, Sv, D, O>;
+
+/// Coordinator composition frontend over the parent runtime role.
+#[cfg(feature = "router")]
+pub struct CoordinatorApp<'a, M, S, P, C, St, Sv, D, O = NoObserver, A = NoApsTables>
 where
     M: ParentMacDriver,
     S: SecurityStateStore,
@@ -1513,15 +1764,32 @@ where
     D: Diagnostics,
     O: RouterObserver<M, Router>,
 {
+    core: CoordinatorCore<'a, M, S, P, C, A, St, Sv, D, O>,
+}
+
+#[cfg(feature = "router")]
+impl<'a, M, S, P, C, St, Sv, D, O, A> CoordinatorApp<'a, M, S, P, C, St, Sv, D, O, A>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    O: RouterObserver<M, Router>,
+    A: ApsTableLifecycle<M, S, P, Router>,
+{
     /// Construct with a statically selected non-default observer type `O`.
-    pub fn new_observed(
+    pub fn new_observed_with_aps_tables(
         node: RouterNode<'a, M, S, P, Router>,
         children: PersistentChildren<C>,
+        aps_tables: A,
         policy: &'static RouterPolicy,
         parts: RouterParts<St, Sv, D>,
     ) -> Result<Self, RouterAppError> {
         Ok(Self {
-            core: RouterCore::new(node, children, policy, parts)?,
+            core: RouterCore::new(node, children, aps_tables, policy, parts)?,
         })
     }
 
@@ -1539,6 +1807,14 @@ where
 
     pub fn children_mut(&mut self) -> &mut PersistentChildren<C> {
         &mut self.core.children
+    }
+
+    pub const fn aps_tables(&self) -> &A {
+        &self.core.aps_tables
+    }
+
+    pub fn aps_tables_mut(&mut self) -> &mut A {
+        &mut self.core.aps_tables
     }
 
     pub fn parts(&self) -> &RouterParts<St, Sv, D> {
@@ -1583,7 +1859,29 @@ where
 }
 
 #[cfg(feature = "router")]
-impl<'a, M, S, P, C, St, Sv, D> CoordinatorApp<'a, M, S, P, C, St, Sv, D, NoObserver>
+impl<'a, M, S, P, C, St, Sv, D, O> CoordinatorApp<'a, M, S, P, C, St, Sv, D, O, NoApsTables>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    O: RouterObserver<M, Router>,
+{
+    pub fn new_observed(
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<Self, RouterAppError> {
+        Self::new_observed_with_aps_tables(node, children, NoApsTables, policy, parts)
+    }
+}
+
+#[cfg(feature = "router")]
+impl<'a, M, S, P, C, St, Sv, D> CoordinatorApp<'a, M, S, P, C, St, Sv, D, NoObserver, NoApsTables>
 where
     M: ParentMacDriver,
     S: SecurityStateStore,
@@ -1600,5 +1898,28 @@ where
         parts: RouterParts<St, Sv, D>,
     ) -> Result<Self, RouterAppError> {
         Self::new_observed(node, children, policy, parts)
+    }
+}
+
+#[cfg(feature = "router")]
+impl<'a, M, S, P, C, St, Sv, D, A> CoordinatorApp<'a, M, S, P, C, St, Sv, D, NoObserver, A>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    A: ApsTableLifecycle<M, S, P, Router>,
+{
+    pub fn new_with_aps_tables(
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        aps_tables: A,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<Self, RouterAppError> {
+        Self::new_observed_with_aps_tables(node, children, aps_tables, policy, parts)
     }
 }

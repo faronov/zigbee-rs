@@ -2,6 +2,7 @@
 
 use zigbee_mac::MacError;
 use zigbee_nwk::DeviceType;
+use zigbee_runtime::aps_table_store::ApsTableStoreError;
 use zigbee_runtime::child_store::ChildStoreError;
 use zigbee_runtime::event_loop::StartError;
 use zigbee_runtime::node::NodeError;
@@ -24,6 +25,7 @@ pub enum RouterAppError {
     Start(StartError),
     Node(NodeError),
     Security(SecurityStoreError),
+    ApsTables(ApsTableStoreError),
     ChildStore(ChildStoreError),
     Mac(MacError),
 }
@@ -43,6 +45,12 @@ impl From<SecurityStoreError> for RouterAppError {
 impl From<ChildStoreError> for RouterAppError {
     fn from(error: ChildStoreError) -> Self {
         Self::ChildStore(error)
+    }
+}
+
+impl From<ApsTableStoreError> for RouterAppError {
+    fn from(error: ApsTableStoreError) -> Self {
+        Self::ApsTables(error)
     }
 }
 

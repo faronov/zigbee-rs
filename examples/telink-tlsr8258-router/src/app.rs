@@ -6,7 +6,10 @@
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use router_app::{NoDiagnostics, ParentRouterApp, PersistentChildren, RouterObserver, RouterParts};
+use router_app::{
+    NoDiagnostics, ParentRouterApp, PersistentApsTables, PersistentChildren, RouterObserver,
+    RouterParts,
+};
 use zigbee_mac::{PlatformServices, telink::TelinkMac};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
@@ -611,13 +614,14 @@ pub fn run() -> ! {
         )
         .build_router_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
 
-    let (security_partition, child_partition) =
+    let (security_partition, child_partition, aps_partition) =
         tlsr8258_tb04_product::storage::split_flash(resources.flash);
     let mut security_store = tlsr8258_tb04_product::storage::security_store(security_partition);
     // Product-owned durable child table, on its own two flash sectors. The
     // runtime owns the record format and restore semantics; the product owns
     // where the bytes live and when they are written.
     let child_store = tlsr8258_tb04_product::storage::child_table_store(child_partition);
+    let aps_table_store = tlsr8258_tb04_product::storage::aps_table_store(aps_partition);
     if device
         .reset_security_state_if_identity_changed(&mut security_store, ieee_address)
         .is_err()
@@ -628,9 +632,20 @@ pub fn run() -> ! {
     let children = PersistentChildren::new(child_store);
     let (status, supervisor) = led_adapters(leds);
     let parts = RouterParts::new(status, supervisor, NoDiagnostics);
-    let mut app = match ParentRouterApp::<_, _, _, _, _, _, _, TelinkJoinObserver>::new_observed(
+    let mut app = match ParentRouterApp::<
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        TelinkJoinObserver,
+        _,
+    >::new_observed_with_aps_tables(
         node,
         children,
+        PersistentApsTables::new(aps_table_store),
         &ROUTER_POLICY,
         parts,
     ) {

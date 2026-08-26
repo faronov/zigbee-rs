@@ -115,7 +115,7 @@ image sizes.
 | example | frontend | child support | validation |
 |---|---|---|---|
 | [`nrf52840-router`](nrf52840-router/) | `AlwaysOnEndDeviceApp` | none | build/layout; HIL acceptance open |
-| [`telink-tlsr8258-router`](telink-tlsr8258-router/) | `ParentRouterApp` | persistent child table | join/restart/relay proven; corrected child acceptance gate open |
+| [`telink-tlsr8258-router`](telink-tlsr8258-router/) | `ParentRouterApp` | persistent children, bindings, and groups | join/restart/relay proven; corrected child acceptance gate open |
 
 ## Telink power variants
 

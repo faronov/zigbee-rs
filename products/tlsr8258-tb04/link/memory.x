@@ -7,19 +7,20 @@
  *   0x850000             top of SRAM
  *
  * A is the RAM-code preload size rounded up to 256 bytes. The product-owned
- * NV partitions occupy flash 0x72000..0x76000:
+ * NV partitions occupy flash 0x70000..0x76000:
+ *   0x70000..0x72000  APS binding/group journal
  *   0x72000..0x74000  child-table journal (router/coordinator child records)
  *   0x74000..0x76000  security journal (frame counters, keys, network state)
  * Telink factory data remains untouched:
  *   0x76000..0x77000  factory EUI-64
  *   0x77000..0x78000  factory config and ADC calibration
  * They are separate two-sector journals on purpose: the security record is
- * rewritten on every frame-counter reservation, the child table only on a
- * child lifecycle transition.
+ * rewritten on every frame-counter reservation, while the APS and child
+ * journals are rewritten only when their respective tables change.
  */
 MEMORY
 {
-    FLASH : ORIGIN = 0x00000000, LENGTH = 0x72000
+    FLASH : ORIGIN = 0x00000000, LENGTH = 0x70000
     RAM   : ORIGIN = 0x00840000, LENGTH = 0x10000
 }
 
@@ -132,6 +133,8 @@ SECTIONS
     _bin_size_ = _code_size_ + SIZEOF(.data);
     _bin_size_div_16 = (_bin_size_ + 15) / 16;
     _etext = _dstored_;
+    _aps_nv_start_ = 0x70000;
+    _aps_nv_end_ = 0x72000;
     _child_nv_start_ = 0x72000;
     _child_nv_end_ = 0x74000;
     _security_nv_start_ = 0x74000;
@@ -176,8 +179,10 @@ SECTIONS
     _assert_retention_top_guard = ASSERT(!_retention_image_enabled_ ||
         (_retention_limit_ - _irq_stack_top) >= 0x400,
         "ERROR: LOW32K top guard is smaller than 1 KiB");
-    _assert_image_below_child_nv = ASSERT(_bin_size_ <= _child_nv_start_,
-        "ERROR: firmware image overlaps child-table journal at 0x72000");
+    _assert_image_below_aps_nv = ASSERT(_bin_size_ <= _aps_nv_start_,
+        "ERROR: firmware image overlaps APS-table journal at 0x70000");
+    _assert_aps_nv_before_child_nv = ASSERT(_aps_nv_end_ <= _child_nv_start_,
+        "ERROR: APS-table journal overlaps the child-table journal");
     _assert_child_nv_before_security_nv = ASSERT(_child_nv_end_ <= _security_nv_start_,
         "ERROR: child-table journal overlaps the security journal");
     _assert_security_nv_before_factory_eui = ASSERT(_security_nv_end_ <= 0x76000,

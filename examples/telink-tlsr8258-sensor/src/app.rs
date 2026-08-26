@@ -101,7 +101,7 @@ pub fn run() -> ! {
         .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
 
     // This end device owns only the existing two-sector security journal.
-    let (security_partition, _child_partition) =
+    let (security_partition, _child_partition, _aps_partition) =
         tlsr8258_tb04_product::storage::split_flash(resources.flash);
     let mut security_store = tlsr8258_tb04_product::storage::security_store(security_partition);
 
@@ -398,7 +398,7 @@ pub fn cold_run() -> ! {
     // node creates its long-lived mutable device borrow.
     initialize_retention_context(device.mac_mut());
 
-    let (security_partition, _child_partition) =
+    let (security_partition, _child_partition, _aps_partition) =
         tlsr8258_tb04_product::storage::split_flash(resources.flash);
     let security_store = unsafe {
         TELINK_RETAINED_SECURITY_STORAGE.initialize(

@@ -77,6 +77,7 @@ macro_rules! await_out_of_line {
     }};
 }
 
+pub mod aps_table_store;
 pub mod builder;
 pub mod child_store;
 pub mod event_loop;
@@ -3895,6 +3896,12 @@ pub struct ZigbeeDevice<M: MacDriver, R: crate::role::DeviceRole = crate::role::
     scratch: RuntimeScratch,
     /// Flag: network state has changed and should be persisted.
     state_dirty: bool,
+    /// Fingerprint of APS binding/group state at the last successful durable
+    /// checkpoint.
+    persisted_aps_table_fingerprint: u32,
+    /// Whether an APS table snapshot has been loaded or stored this power
+    /// cycle.
+    aps_tables_persisted: bool,
     /// Earliest monotonic time for the next automatic secure-rejoin attempt.
     secure_rejoin_retry_at: Option<u32>,
     /// Per-role runtime state (see [`crate::role::RoleState`]).
@@ -5314,6 +5321,101 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     }
 
     // ── NV Persistence ─────────────────────────────────────
+
+    /// Whether the live APS binding/group tables differ from the last
+    /// successfully loaded or stored snapshot.
+    pub fn aps_tables_dirty(&self) -> bool {
+        !self.aps_tables_persisted
+            || self.persisted_aps_table_fingerprint != self.live_aps_table_fingerprint()
+    }
+
+    /// Persist the APS binding and group tables for the current network.
+    pub fn save_aps_tables<S: aps_table_store::ApsTableStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<(), aps_table_store::ApsTableStoreError> {
+        let aps = self.bdb.zdo().aps();
+        let snapshot = aps_table_store::PersistentApsTables::capture(
+            self.bdb.zdo().nwk().nib().extended_pan_id,
+            aps.binding_table(),
+            aps.group_table(),
+        )?;
+        store.store(&snapshot)?;
+        self.mark_aps_tables_persisted();
+        Ok(())
+    }
+
+    /// Persist APS binding/group tables only when their full fingerprint
+    /// changed.
+    ///
+    /// Returns `Ok(true)` when a snapshot was written.
+    pub fn save_aps_tables_if_dirty<S: aps_table_store::ApsTableStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<bool, aps_table_store::ApsTableStoreError> {
+        if !self.aps_tables_dirty() {
+            return Ok(false);
+        }
+        self.save_aps_tables(store)?;
+        Ok(true)
+    }
+
+    /// Restore APS binding/group tables for the currently joined network.
+    ///
+    /// A non-empty snapshot from another Extended PAN ID is rejected instead
+    /// of installing application state from an old membership.
+    pub fn restore_aps_tables<S: aps_table_store::ApsTableStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<usize, aps_table_store::ApsTableStoreError> {
+        let snapshot = store.load()?;
+        let aps = self.bdb.zdo_mut().aps_mut();
+        let Some(snapshot) = snapshot else {
+            aps.binding_table_mut().clear();
+            aps.group_table_mut().clear();
+            self.mark_aps_tables_persisted();
+            return Ok(0);
+        };
+        snapshot.validate()?;
+        let extended_pan_id = self.bdb.zdo().nwk().nib().extended_pan_id;
+        if !snapshot.is_empty() && !snapshot.matches_network(&extended_pan_id) {
+            return Err(aps_table_store::ApsTableStoreError::ForeignNetwork);
+        }
+
+        let restored = snapshot.bindings().len() + snapshot.groups().len();
+        let aps = self.bdb.zdo_mut().aps_mut();
+        *aps.binding_table_mut() = snapshot.bindings().clone();
+        *aps.group_table_mut() = snapshot.groups().clone();
+        self.mark_aps_tables_persisted();
+        Ok(restored)
+    }
+
+    /// Clear both live and durable APS binding/group state.
+    pub fn clear_persisted_aps_tables<S: aps_table_store::ApsTableStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<(), aps_table_store::ApsTableStoreError> {
+        let aps = self.bdb.zdo_mut().aps_mut();
+        aps.binding_table_mut().clear();
+        aps.group_table_mut().clear();
+        store.store(&aps_table_store::PersistentApsTables::new([0u8; 8]))?;
+        self.mark_aps_tables_persisted();
+        Ok(())
+    }
+
+    fn live_aps_table_fingerprint(&self) -> u32 {
+        let aps = self.bdb.zdo().aps();
+        aps_table_store::aps_table_fingerprint(
+            self.bdb.zdo().nwk().nib().extended_pan_id,
+            aps.binding_table(),
+            aps.group_table(),
+        )
+    }
+
+    fn mark_aps_tables_persisted(&mut self) {
+        self.persisted_aps_table_fingerprint = self.live_aps_table_fingerprint();
+        self.aps_tables_persisted = true;
+    }
 
     /// Snapshot this router/coordinator's authenticated child table into a
     /// durable [`ChildTableStore`](crate::child_store::ChildTableStore).
@@ -9064,6 +9166,68 @@ mod parent_router_tests {
         let (forward_header, consumed) = zigbee_nwk::frames::NwkHeader::parse(bytes).unwrap();
         assert!(!forward_header.frame_control.security);
         assert_eq!(&bytes[consumed..], &embedded[..embedded_len]);
+    }
+
+    // ── APS binding/group persistence ───────────────────────
+
+    #[test]
+    fn aps_tables_are_network_bound_and_persisted_only_when_dirty() {
+        use crate::aps_table_store::{ApsTableStore, ApsTableStoreError, RamApsTableStore};
+        use zigbee_aps::binding::BindingEntry;
+
+        let mut device = centralized_router();
+        let mut store = RamApsTableStore::new();
+
+        assert!(device.aps_tables_dirty());
+        assert!(device.save_aps_tables_if_dirty(&mut store).unwrap());
+        assert!(!device.aps_tables_dirty());
+        assert!(!device.save_aps_tables_if_dirty(&mut store).unwrap());
+
+        let aps = device.bdb_mut().zdo_mut().aps_mut();
+        aps.binding_table_mut()
+            .add(BindingEntry::unicast(ROUTER_IEEE, 1, 0x0006, CHILD_IEEE, 1))
+            .unwrap();
+        assert!(aps.group_table_mut().add_group(0x1234, 1));
+        assert!(device.aps_tables_dirty());
+        assert!(device.save_aps_tables_if_dirty(&mut store).unwrap());
+        assert_eq!(
+            store.load().unwrap().unwrap().bindings().len(),
+            1,
+            "the whole binding table is stored"
+        );
+
+        let mut rebooted = centralized_router();
+        assert_eq!(rebooted.restore_aps_tables(&mut store).unwrap(), 2);
+        assert!(!rebooted.aps_tables_dirty());
+        assert_eq!(rebooted.bdb().zdo().aps().binding_table().len(), 1);
+        assert!(
+            rebooted
+                .bdb()
+                .zdo()
+                .aps()
+                .group_table()
+                .is_member(0x1234, 1)
+        );
+
+        let mut foreign = centralized_router();
+        foreign
+            .bdb_mut()
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .nib_mut()
+            .extended_pan_id = [0x5C; 8];
+        assert_eq!(
+            foreign.restore_aps_tables(&mut store),
+            Err(ApsTableStoreError::ForeignNetwork)
+        );
+        assert!(foreign.bdb().zdo().aps().binding_table().is_empty());
+
+        rebooted.clear_persisted_aps_tables(&mut store).unwrap();
+        assert!(rebooted.bdb().zdo().aps().binding_table().is_empty());
+        assert!(rebooted.bdb().zdo().aps().group_table().is_empty());
+        assert!(store.load().unwrap().unwrap().is_empty());
+        assert!(!rebooted.aps_tables_dirty());
     }
 
     // ── R22 End Device Timeout server + persistence (runtime) ─

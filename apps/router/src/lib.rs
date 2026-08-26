@@ -17,11 +17,11 @@
 //! reset operation that a product can call directly before `step()`.
 //!
 //! The crate owns commissioning/resume/rejoin, bounded receive/tick
-//! scheduling, durable security checkpoints, and parent child-table
-//! lifecycle. It does not own platform startup, pins, fitted peripherals,
-//! product identity, or profile behavior. Every integration capability is
-//! statically selected; there is no allocator, trait object, runtime role
-//! switch, or generic platform provider.
+//! scheduling, durable security checkpoints, APS binding/group persistence,
+//! and parent child-table lifecycle. It does not own platform startup, pins,
+//! fitted peripherals, product identity, or profile behavior. Every
+//! integration capability is statically selected; there is no allocator,
+//! trait object, runtime role switch, or generic platform provider.
 
 #![no_std]
 
@@ -34,7 +34,9 @@ mod observer;
 mod parts;
 mod policy;
 
-pub use app::{AlwaysOnEndDeviceApp, StepEvents};
+pub use app::{AlwaysOnEndDeviceApp, NoApsTables, PersistentApsTables, StepEvents};
+#[doc(hidden)]
+pub use app::{ApsRestore, ApsTableLifecycle};
 #[cfg(feature = "router")]
 pub use app::{CoordinatorApp, ParentRouterApp, RelayRouterApp};
 pub use capabilities::{

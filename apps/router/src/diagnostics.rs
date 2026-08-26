@@ -1,5 +1,6 @@
 //! Typed lifecycle diagnostics with a statically selected backend.
 
+use zigbee_runtime::aps_table_store::ApsTableStoreError;
 use zigbee_runtime::child_store::ChildStoreError;
 use zigbee_runtime::event_loop::{StackEvent, StartError};
 
@@ -195,6 +196,14 @@ pub enum DiagnosticEvent {
     },
     ChildTableSaved,
     ChildTableCleared,
+    ApsTablesRestored {
+        count: usize,
+    },
+    ApsTablesDiscarded {
+        error: ApsTableStoreError,
+    },
+    ApsTablesSaved,
+    ApsTablesCleared,
     FrameReceived,
     StackEvent(StackEventSummary),
     RunAgain {

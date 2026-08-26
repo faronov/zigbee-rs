@@ -19,7 +19,7 @@ pub const MAX_ENDPOINTS_PER_GROUP: usize = 8;
 ///
 /// Each entry maps a 16-bit group address to a list of local endpoints
 /// that are members of the group.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupEntry {
     /// 16-bit group address (0x0000-0xFFFF)
     pub group_address: u16,
@@ -30,6 +30,7 @@ pub struct GroupEntry {
 // ── Group table ─────────────────────────────────────────────────
 
 /// Fixed-capacity APS group table.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupTable {
     groups: heapless::Vec<GroupEntry, MAX_GROUPS>,
 }

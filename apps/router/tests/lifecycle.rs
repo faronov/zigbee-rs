@@ -5,12 +5,14 @@ use std::sync::Mutex;
 
 use router_app::{
     AlwaysOnEndDeviceApp, CoordinatorApp, DiagnosticEvent, Diagnostics, NoChildren, NoDiagnostics,
-    NoObserver, NoStatus, NodeArchetype, ParentRouterApp, PersistentChildren, RelayRouterApp,
-    RouterAppError, RouterObserver, RouterParts, RouterPolicy, RouterStatus, StatusSink,
-    Supervisor,
+    NoObserver, NoStatus, NodeArchetype, ParentRouterApp, PersistentApsTables, PersistentChildren,
+    RelayRouterApp, RouterAppError, RouterObserver, RouterParts, RouterPolicy, RouterStatus,
+    StatusSink, Supervisor,
 };
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
+use zigbee_aps::binding::{BindingEntry, BindingTable};
 use zigbee_aps::frames::{ApsCommandId, ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader};
+use zigbee_aps::group::GroupTable;
 use zigbee_aps::security::{
     ApsSecurity, ApsSecurityHeader, KEY_ID_KEY_TRANSPORT, SEC_LEVEL_ENC_MIC_32,
     derive_key_transport_key,
@@ -26,6 +28,9 @@ use zigbee_nwk::frames::{NwkFrameControl, NwkFrameType, NwkHeader};
 use zigbee_nwk::security::{NwkSecurity, NwkSecurityHeader};
 use zigbee_runtime::UserAction;
 use zigbee_runtime::ZigbeeDevice;
+use zigbee_runtime::aps_table_store::{
+    ApsTableStore, PersistentApsTables as ApsTableSnapshot, RamApsTableStore,
+};
 use zigbee_runtime::child_store::{
     ChildStoreError, ChildTableStore, PersistentChild, PersistentChildTable,
 };
@@ -1072,6 +1077,79 @@ fn parent_persists_only_when_dirty_and_clears_children_before_recommission() {
     );
     assert!(app.children().store().table.as_ref().unwrap().is_empty());
     assert!(!app.node().device().is_joined());
+}
+
+#[test]
+fn parent_restores_and_clears_durable_aps_tables_with_network_lifecycle() {
+    let mut bindings = BindingTable::new();
+    bindings
+        .add(BindingEntry::unicast(LOCAL_IEEE, 1, 0x0006, [0x77; 8], 1))
+        .unwrap();
+    let mut groups = GroupTable::new();
+    assert!(groups.add_group(0x1234, 1));
+    let snapshot = ApsTableSnapshot::capture(EXTENDED_PAN_ID, &bindings, &groups).unwrap();
+    let mut aps_store = RamApsTableStore::new();
+    aps_store.store(&snapshot).unwrap();
+
+    let mut profile = profile();
+    let mut device = parent_device(&mut profile);
+    let mut security = security_store(false);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let mut app = ParentRouterApp::new_with_aps_tables(
+        node,
+        PersistentChildren::new(CountingChildStore::default()),
+        PersistentApsTables::new(aps_store),
+        &POLICY,
+        RouterParts::new(
+            NoStatus,
+            TestSupervisor::default(),
+            RecordingDiagnostics::default(),
+        ),
+    )
+    .unwrap();
+
+    block_on(app.initialize()).unwrap();
+    assert_eq!(
+        app.node().device().bdb().zdo().aps().binding_table().len(),
+        1
+    );
+    assert!(
+        app.node()
+            .device()
+            .bdb()
+            .zdo()
+            .aps()
+            .group_table()
+            .is_member(0x1234, 1)
+    );
+    assert!(
+        app.parts()
+            .diagnostics
+            .events
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::ApsTablesRestored { count: 2 }))
+    );
+
+    app.node_mut()
+        .device_mut()
+        .user_action(UserAction::FactoryReset);
+    let events = block_on(app.step()).unwrap();
+    assert!(matches!(events.tick, Some(StackEvent::Left)));
+    assert!(
+        app.aps_tables_mut()
+            .store_mut()
+            .load()
+            .unwrap()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        app.parts()
+            .diagnostics
+            .events
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::ApsTablesCleared))
+    );
 }
 
 #[test]
