@@ -3,13 +3,17 @@
 use core::mem::MaybeUninit;
 
 use crate::power::{PowerManager, PowerMode};
-use crate::role::{DeviceRole, EndDevice, RelayRouter, RoleState, Router};
+use crate::role::{DeviceRole, EndDevice, RoleState};
+#[cfg(any(feature = "router", test))]
+use crate::role::{RelayRouter, Router};
 use crate::{
     EndpointConfig, EndpointIdentifyCluster, MAX_CLUSTERS_PER_ENDPOINT, MAX_ENDPOINTS, ZigbeeDevice,
 };
 use zigbee_aps::ApsLayer;
 use zigbee_bdb::BdbLayer;
-use zigbee_mac::{MacDriver, ParentMacDriver};
+use zigbee_mac::MacDriver;
+#[cfg(any(feature = "router", test))]
+use zigbee_mac::ParentMacDriver;
 use zigbee_nwk::{DeviceType, NwkLayer};
 use zigbee_types::*;
 use zigbee_zcl::clusters::basic::{BasicCluster, PowerSource};
@@ -333,16 +337,26 @@ impl<M: MacDriver> DeviceBuilder<M> {
     /// Build the ZigbeeDevice with the full BDB→ZDO→APS→NWK→MAC stack.
     ///
     /// Produces an [`EndDevice`]-role device (the default role), preserving
-    /// existing `ZigbeeDevice<M>` source. To build a routing device, use
-    /// [`build_relay`](Self::build_relay) (forwarding-only) or
-    /// [`build_router`](Self::build_router) (child-accepting parent, bounded on
-    /// a genuine [`ParentMacDriver`] backend).
+    /// existing `ZigbeeDevice<M>` source. Router advertising is available only
+    /// with the `router` feature and a genuine [`ParentMacDriver`] backend.
     ///
     /// # Panics
     ///
     /// Panics if [`device_type`](Self::device_type) was set to a non-end-device
     /// type — that is a role/device-type misconfiguration, not a valid end
     /// device. Use [`try_build`](Self::try_build) for a non-panicking result.
+    #[cfg_attr(
+        not(feature = "router"),
+        doc = r#"
+```compile_fail
+use zigbee_mac::mock::MockMac;
+use zigbee_runtime::ZigbeeDevice;
+
+// A non-router image cannot construct a Router descriptor.
+let _ = ZigbeeDevice::builder(MockMac::new([0; 8])).build_router();
+```
+"#
+    )]
     #[inline]
     pub fn build(self) -> ZigbeeDevice<M, EndDevice> {
         match ergonomic_device_type::<EndDevice>(self.device_type) {
@@ -361,10 +375,10 @@ impl<M: MacDriver> DeviceBuilder<M> {
 
     /// Build a forwarding-only [`RelayRouter`] device.
     ///
-    /// A relay is an always-on FFD that relays NWK traffic and runs router
-    /// maintenance but **cannot accept children**, so it needs only the base
-    /// [`MacDriver`] surface — it honestly models a backend whose MAC has no
-    /// parent-side association primitives. It builds as [`DeviceType::Router`].
+    /// A relay is an always-on FFD that relays NWK traffic but does not retain
+    /// children. It may advertise [`DeviceType::Router`] only in a `router`
+    /// build and only with a [`ParentMacDriver`] backend, so an incapable MAC
+    /// can never claim router conformance.
     ///
     /// # Panics
     ///
@@ -372,7 +386,11 @@ impl<M: MacDriver> DeviceBuilder<M> {
     /// than [`DeviceType::Router`]. Use
     /// [`try_build_relay`](Self::try_build_relay) for a non-panicking result.
     #[inline]
-    pub fn build_relay(self) -> ZigbeeDevice<M, RelayRouter> {
+    #[cfg(any(feature = "router", test))]
+    pub fn build_relay(self) -> ZigbeeDevice<M, RelayRouter>
+    where
+        M: ParentMacDriver,
+    {
         match ergonomic_device_type::<RelayRouter>(self.device_type) {
             Some(device_type) => self.assemble::<RelayRouter>(device_type),
             None => build_panic(),
@@ -381,7 +399,11 @@ impl<M: MacDriver> DeviceBuilder<M> {
 
     /// Fallible [`build_relay`](Self::build_relay).
     #[inline]
-    pub fn try_build_relay(self) -> Result<ZigbeeDevice<M, RelayRouter>, BuildError> {
+    #[cfg(any(feature = "router", test))]
+    pub fn try_build_relay(self) -> Result<ZigbeeDevice<M, RelayRouter>, BuildError>
+    where
+        M: ParentMacDriver,
+    {
         let device_type = self.resolve_device_type::<RelayRouter>()?;
         Ok(self.assemble::<RelayRouter>(device_type))
     }
@@ -400,6 +422,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
     /// [`DeviceType::EndDevice`]. Use
     /// [`try_build_router`](Self::try_build_router) for a non-panicking result.
     #[inline]
+    #[cfg(any(feature = "router", test))]
     pub fn build_router(self) -> ZigbeeDevice<M, Router>
     where
         M: ParentMacDriver,
@@ -412,6 +435,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
 
     /// Fallible [`build_router`](Self::build_router).
     #[inline]
+    #[cfg(any(feature = "router", test))]
     pub fn try_build_router(self) -> Result<ZigbeeDevice<M, Router>, BuildError>
     where
         M: ParentMacDriver,
@@ -429,6 +453,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
     /// Panics if [`device_type`](Self::device_type) was set to a
     /// non-coordinator type.
     #[inline]
+    #[cfg(any(feature = "router", test))]
     pub fn build_coordinator(mut self) -> ZigbeeDevice<M, Router>
     where
         M: ParentMacDriver,
@@ -552,8 +577,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
     /// This avoids the extra closure frame introduced by
     /// `StaticCell::init_with(|| builder.build())` on small MCUs. Produces an
     /// [`EndDevice`]-role device; use
-    /// [`build_relay_into`](Self::build_relay_into) or
-    /// [`build_router_into`](Self::build_router_into) for a routing device.
+    /// a `router`-feature build with `ParentMacDriver` for a routing device.
     ///
     /// # Panics
     ///
@@ -587,10 +611,14 @@ impl<M: MacDriver> DeviceBuilder<M> {
     ///
     /// Panics on a role/device-type mismatch.
     #[inline]
+    #[cfg(any(feature = "router", test))]
     pub fn build_relay_into(
         self,
         dst: &mut MaybeUninit<ZigbeeDevice<M, RelayRouter>>,
-    ) -> &mut ZigbeeDevice<M, RelayRouter> {
+    ) -> &mut ZigbeeDevice<M, RelayRouter>
+    where
+        M: ParentMacDriver,
+    {
         match ergonomic_device_type::<RelayRouter>(self.device_type) {
             Some(device_type) => self.assemble_into::<RelayRouter>(device_type, dst),
             None => build_panic(),
@@ -599,10 +627,14 @@ impl<M: MacDriver> DeviceBuilder<M> {
 
     /// Fallible [`build_relay_into`](Self::build_relay_into).
     #[inline]
+    #[cfg(any(feature = "router", test))]
     pub fn try_build_relay_into(
         self,
         dst: &mut MaybeUninit<ZigbeeDevice<M, RelayRouter>>,
-    ) -> Result<&mut ZigbeeDevice<M, RelayRouter>, BuildError> {
+    ) -> Result<&mut ZigbeeDevice<M, RelayRouter>, BuildError>
+    where
+        M: ParentMacDriver,
+    {
         let device_type = self.resolve_device_type::<RelayRouter>()?;
         Ok(self.assemble_into::<RelayRouter>(device_type, dst))
     }
@@ -615,6 +647,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
     ///
     /// Panics on a role/device-type mismatch.
     #[inline]
+    #[cfg(any(feature = "router", test))]
     pub fn build_router_into(
         self,
         dst: &mut MaybeUninit<ZigbeeDevice<M, Router>>,
@@ -630,6 +663,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
 
     /// Fallible [`build_router_into`](Self::build_router_into).
     #[inline]
+    #[cfg(any(feature = "router", test))]
     pub fn try_build_router_into(
         self,
         dst: &mut MaybeUninit<ZigbeeDevice<M, Router>>,
@@ -648,6 +682,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
     ///
     /// Panics on a role/device-type mismatch.
     #[inline]
+    #[cfg(any(feature = "router", test))]
     pub fn build_coordinator_into(
         mut self,
         dst: &mut MaybeUninit<ZigbeeDevice<M, Router>>,

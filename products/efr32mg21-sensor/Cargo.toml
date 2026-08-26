@@ -1,0 +1,21 @@
+[package]
+name = "efr32mg21-sensor-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product configuration for the BRD4181A EFR32MG21 sensor"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Keep this product independently testable without changing the repository
+# workspace or its lockfile.
+[workspace]
+
+[dependencies]
+efr32mg21-devkit = { path = "../../boards/efr32mg21-devkit" }
+efr32mg21-hal = { path = "../../efr32mg21-hal" }
+embedded-storage = "0.3"
+sensor-sed-app = { path = "../../apps/sensor-sed" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }

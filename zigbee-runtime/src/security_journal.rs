@@ -59,7 +59,16 @@ const _: () = assert!(12 + ENCODED_SECURITY_STATE_LEN <= RECORD_CRC_OFFSET);
 const _: () = assert!(12 + V2_ENCODED_SECURITY_STATE_LEN <= RECORD_CRC_OFFSET);
 const _: () = assert!(12 + LEGACY_ENCODED_SECURITY_STATE_LEN <= LEGACY_RECORD_CRC_OFFSET);
 
-pub struct SecurityStateJournal<S> {
+/// Crash-safe security-state journal with two independently erasable sectors.
+///
+/// `SECTOR_SIZE` is the size of each logical journal sector, not a product
+/// partition address. It defaults to 4 KiB for existing products. A product
+/// whose flash erase unit is larger selects its actual sector size in the
+/// type, for example
+/// `SecurityStateJournal<PartitionFlash, { 8 * 1024 }>`. The product-owned
+/// `PartitionFlash` remains responsible for translating the relative journal
+/// offsets to its protected physical partition.
+pub struct SecurityStateJournal<S, const SECTOR_SIZE: usize = SECURITY_JOURNAL_SECTOR_SIZE> {
     storage: S,
     sectors: [u32; 2],
     cached: Option<LocatedState>,
@@ -73,8 +82,35 @@ struct LocatedState {
     state: PersistentSecurityState,
 }
 
+impl<S, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE> {
+    /// Bytes in one configured logical journal sector.
+    pub const SECTOR_SIZE: usize = SECTOR_SIZE;
+    /// Fixed record size independent of the selected physical erase size.
+    pub const SLOT_SIZE: usize = SECURITY_JOURNAL_SLOT_SIZE;
+    /// Number of committed-record slots in one configured journal sector.
+    pub const SLOTS_PER_SECTOR: usize = SECTOR_SIZE / SECURITY_JOURNAL_SLOT_SIZE;
+}
+
 impl<S: NorFlash> SecurityStateJournal<S> {
+    /// Construct the default 4 KiB-sector journal.
+    ///
+    /// Existing products should continue to use this constructor. Products
+    /// with a different physical erase sector use
+    /// [`Self::new_with_sector_size`] through a type alias that fixes
+    /// `SECTOR_SIZE`.
     pub const fn new(storage: S, first_sector: u32, second_sector: u32) -> Self {
+        Self::new_with_sector_size(storage, first_sector, second_sector)
+    }
+}
+
+impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE> {
+    /// Construct a journal whose two logical sectors are `SECTOR_SIZE` bytes.
+    ///
+    /// Sector offsets are relative to `storage`; the product owns any
+    /// translation from those offsets to physical flash partitions.
+    pub const fn new_with_sector_size(storage: S, first_sector: u32, second_sector: u32) -> Self {
+        assert!(SECTOR_SIZE >= SECURITY_JOURNAL_SLOT_SIZE);
+        assert!(SECTOR_SIZE.is_multiple_of(SECURITY_JOURNAL_SLOT_SIZE));
         Self {
             storage,
             sectors: [first_sector, second_sector],
@@ -177,7 +213,7 @@ impl<S: NorFlash> SecurityStateJournal<S> {
         let mut newest: Option<LocatedState> = None;
         let mut record = [0u8; SECURITY_JOURNAL_SLOT_SIZE];
         for sector in 0..2 {
-            for slot in 0..SECURITY_JOURNAL_SLOTS_PER_SECTOR {
+            for slot in 0..Self::SLOTS_PER_SECTOR {
                 self.read_slot(sector, slot, &mut record)?;
                 let Some((generation, state)) = Self::decode_record(&record) else {
                     continue;
@@ -200,13 +236,16 @@ impl<S: NorFlash> SecurityStateJournal<S> {
 
     fn current(&mut self) -> Result<Option<LocatedState>, SecurityStoreError> {
         if self.sectors[0] == self.sectors[1]
-            || self.sectors[0].abs_diff(self.sectors[1]) < SECURITY_JOURNAL_SECTOR_SIZE as u32
+            || SECTOR_SIZE < SECURITY_JOURNAL_SLOT_SIZE
+            || !SECTOR_SIZE.is_multiple_of(SECURITY_JOURNAL_SLOT_SIZE)
+            || SECTOR_SIZE > u32::MAX as usize
+            || self.sectors[0].abs_diff(self.sectors[1]) < SECTOR_SIZE as u32
             || S::READ_SIZE == 0
             || S::WRITE_SIZE == 0
             || S::ERASE_SIZE == 0
             || !SECURITY_JOURNAL_SLOT_SIZE.is_multiple_of(S::READ_SIZE)
             || !SECURITY_JOURNAL_SLOT_SIZE.is_multiple_of(S::WRITE_SIZE)
-            || !SECURITY_JOURNAL_SECTOR_SIZE.is_multiple_of(S::ERASE_SIZE)
+            || !SECTOR_SIZE.is_multiple_of(S::ERASE_SIZE)
             || !RECORD_PREFIX_LEN.is_multiple_of(S::WRITE_SIZE)
             || !RECORD_COMMIT_OFFSET.is_multiple_of(S::WRITE_SIZE)
             || !RECORD_COMMIT.len().is_multiple_of(S::WRITE_SIZE)
@@ -214,7 +253,7 @@ impl<S: NorFlash> SecurityStateJournal<S> {
             || !(self.sectors[1] as usize).is_multiple_of(S::ERASE_SIZE)
             || self.sectors.iter().any(|sector| {
                 (*sector as usize)
-                    .checked_add(SECURITY_JOURNAL_SECTOR_SIZE)
+                    .checked_add(SECTOR_SIZE)
                     .is_none_or(|end| end > self.storage.capacity())
             })
         {
@@ -229,7 +268,7 @@ impl<S: NorFlash> SecurityStateJournal<S> {
 
     fn first_erased_slot(&mut self, sector: usize) -> Result<Option<usize>, SecurityStoreError> {
         let mut record = [0u8; SECURITY_JOURNAL_SLOT_SIZE];
-        for slot in 0..SECURITY_JOURNAL_SLOTS_PER_SECTOR {
+        for slot in 0..Self::SLOTS_PER_SECTOR {
             self.read_slot(sector, slot, &mut record)?;
             if record.iter().all(|byte| *byte == 0xFF) {
                 return Ok(Some(slot));
@@ -280,7 +319,9 @@ impl<S: NorFlash> SecurityStateJournal<S> {
     }
 }
 
-impl<S: NorFlash> SecurityStateStore for SecurityStateJournal<S> {
+impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
+    for SecurityStateJournal<S, SECTOR_SIZE>
+{
     fn load(&mut self) -> Result<Option<PersistentSecurityState>, SecurityStoreError> {
         Ok(self.current()?.map(|located| located.state))
     }
@@ -315,7 +356,7 @@ impl<S: NorFlash> SecurityStateStore for SecurityStateJournal<S> {
             let sector = self.sectors[target];
             let result = self
                 .storage
-                .erase(sector, sector + SECURITY_JOURNAL_SECTOR_SIZE as u32)
+                .erase(sector, sector + SECTOR_SIZE as u32)
                 .map_err(|_| SecurityStoreError::Hardware)
                 .and_then(|()| self.write_record(target, 0, generation, state));
             if result.is_ok() {
@@ -334,7 +375,7 @@ impl<S: NorFlash> SecurityStateStore for SecurityStateJournal<S> {
         let sector = self.sectors[0];
         let result = self
             .storage
-            .erase(sector, sector + SECURITY_JOURNAL_SECTOR_SIZE as u32)
+            .erase(sector, sector + SECTOR_SIZE as u32)
             .map_err(|_| SecurityStoreError::Hardware)
             .and_then(|()| self.write_record(0, 0, generation, state));
         if result.is_ok() {

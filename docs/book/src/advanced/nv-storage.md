@@ -1,237 +1,165 @@
 # NV Storage
 
-The storage stack separates portable persistence algorithms from flash
-controllers, physical board wiring, and product-specific partition layouts:
+Persistence separates physical flash, product layout, and Zigbee durability
+semantics:
 
 ```text
-zigbee-runtime      persistence algorithms and Zigbee security semantics
-embedded-storage    common raw NOR flash traits
-<chip>-hal          flash controller implementation
-boards/<board>      physical flash chip/bus wiring only
-products/<product>  bounded partitions, linker layout, bootloader/OTA policy
-examples/<role>     application behavior and scheduling
+chip HAL            flash controller and raw NOR operations
+board               physical flash resource
+product             bounded partitions, linker map, migration/reset policy
+zigbee-runtime      journals and security/child semantics
+application         when to restore, checkpoint, clear, or activate OTA
 ```
 
-Application/NV partition addresses must not be placed in examples or generic
-chip HALs. They depend on the board, bootloader, OTA layout, and linked
-firmware region, so the product owns them. Vendor-defined factory metadata
-locations are different: a chip HAL may model them when they are derived from
-the verified fitted flash geometry.
-
-## Generic application NV
-
-`NvStorage` is an item-oriented interface for ordinary application and stack
-state:
-
-```rust
-pub trait NvStorage {
-    fn read(
-        &mut self,
-        id: NvItemId,
-        buf: &mut [u8],
-    ) -> Result<usize, NvError>;
-    fn write(&mut self, id: NvItemId, data: &[u8]) -> Result<(), NvError>;
-    fn delete(&mut self, id: NvItemId) -> Result<(), NvError>;
-    fn exists(&mut self, id: NvItemId) -> Result<bool, NvError>;
-    fn item_length(&mut self, id: NvItemId) -> Result<usize, NvError>;
-    fn compact(&mut self) -> Result<(), NvError>;
-}
-```
-
-`RamNvStorage` implements this interface for host tests.
-`LogStructuredNv<F>` provides flash-backed storage when `F` implements
-`embedded_storage::nor_flash::NorFlash`. It uses two erase sectors, appends
-new item versions, and copies live values during compaction.
-
-```rust
-use zigbee_runtime::log_nv::LogStructuredNv;
-
-let nv = LogStructuredNv::new(flash_partition, 0, erase_size)?;
-```
-
-The flash value passed here is already bounded to the product-owned partition.
-Offsets are relative to that partition, not absolute chip addresses.
+Partition addresses belong to the product, not a generic HAL or example loop.
 
 ## Security state
 
-Zigbee network keys and outgoing frame counters require stronger guarantees
-than generic item storage. `SecurityStateJournal<F>` is a separate two-sector
-atomic journal with CRC, generations, read-back verification, and a final
-commit marker. It also supports crash-safe outgoing-counter reservations.
+`SecurityStateJournal<F>` is a two-sector atomic journal for:
 
-Do not replace the security journal with `LogStructuredNv`. Both use the same
-raw NOR traits, but they intentionally provide different semantics.
+- network identity and keys;
+- outgoing NWK/APS counter reservations;
+- parent and commissioned state;
+- staged key/update state;
+- End Device Timeout client state.
 
-### Record versions
+Each record has a version, generation, CRC, read-back verification, and a
+commit marker written last. The scanner tolerates erased, torn, corrupt, and
+unknown-version slots and selects the newest valid generation.
 
-| Version | Encoded state | CRC offset | Added |
-|---|---|---|---|
-| 1 | 80 bytes | 92 | initial layout |
-| 2 | 97 bytes | 112 | staged network key |
-| 3 | 98 bytes | 112 | R22 End Device Timeout negotiation |
-| 4 | 98 bytes | 112 | `nwkUpdateId` validity |
+Outgoing counters are reserved ahead in durable storage. After a crash, the
+runtime resumes above the reservation rather than reusing a secured frame
+counter.
 
-Version 3 reuses flags bit 6 for `parent_information_valid`, the previously
-unused encoded byte 11 for `parent_information` and the new byte 97 for
-`end_device_timeout`. Version 4 adds no byte at all: it claims the last free
-flags bit, bit 7, for `update_id_valid`, so versions 3 and 4 have the *same*
-encoded length and are told apart by the version byte alone. Nothing else
-moved: the 128-byte slot size, 116-byte record prefix and byte-124 commit
-marker are unchanged, so the crash-safety scheme and every existing partition
-layout are unaffected. Version 1 and 2 records are still decoded through their
-own explicit paths and migrate to "never negotiated, default enumeration 8".
+Do not replace the security journal with generic `LogStructuredNv`; their
+durability contracts are different.
 
-Versions 1..=3 predate the validity bit, and their stored `update_id` was
-authoritative in the firmware that wrote it, so they decode with
-`update_id_valid = true` — an existing installation keeps the update state it
-had. Only a version 4 record can express "unknown", which is what lets a
-record migrated from a persistence format that never stored `NwkUpdateId` (the
-legacy ESP32 log-structured NV region, say) avoid claiming an authoritative
-`0`. A version 3 record carrying bit 7 is corrupt, not an early version 4.
+The default journal sector is 4 KiB. A product with another physical erase
+size fixes that size in the type while retaining the same journal logic:
 
-> **Downgrade is not supported.** Once this firmware has written a version 4
-> record, older firmware will skip it while scanning and select the newest
-> record it *can* decode — an older generation with stale counters, a stale
-> parent and possibly a stale network key. Reusing those reservations would
-> replay NWK/APS frame counters. Recommission the device instead of
-> downgrading.
+```rust,ignore
+type SecurityStore =
+    SecurityStateJournal<PartitionFlash, { PRODUCT_SECURITY_SECTOR_SIZE }>;
 
-## Child table (router/coordinator)
-
-A router persists its authenticated child table through a **separate** durable
-store (`zigbee_runtime::child_store`), kept independent of the security journal
-on purpose: the security record is rewritten on every frame-counter reservation
-and must stay small, whereas the child table is a larger, lower-frequency
-snapshot. The child store never reads or writes NWK/APS frame counters, so
-restoring or discarding it can never replay a secured frame.
-
-Each child persists its IEEE identity, short address, capability/configuration
-(rx-on-when-idle, security-capable, router vs end device) and accepted End
-Device Timeout enumeration. The live aging countdown is **not** persisted — on
-restore each end-device child's deadline is re-armed to the full window of its
-enumeration, granting it a fresh window to prove liveness rather than being
-evicted immediately after a reboot, and avoiding a flash write per countdown
-tick.
-
-| Backend | Use |
-|---|---|
-| `RamChildTableStore` | Complete generic store for a router **without** a configured child-table partition — keeps the table for the current power cycle only and never claims durable persistence. |
-| `ChildTableJournal<S: NorFlash>` | Two-sector crash-safe journal (its own sectors, not the security journal's) with generation numbers, a CRC over the record prefix and a trailing commit marker written last. |
-
-### Network binding
-
-Every record stores the **extended PAN ID** its children belong to. A restore
-validates that binding against the network the device is currently on and
-returns `ChildStoreError::ForeignNetwork` on a mismatch instead of applying it.
-Without this, a table left over from a previous network (after a factory reset
-and rejoin, or after moving a device between networks) could re-admit devices
-that are not this parent's children — and then answer an orphan notification
-with a coordinator realignment for a stranger.
-
-### Record versions
-
-| version | encoded child table |
-|---|---|
-| 1 | count + per-child identity/timeout (no network binding) |
-| 2 | extended PAN ID + count + per-child identity/timeout |
-
-An unrecognised version is skipped like a corrupt record, so downgrading simply
-drops the persisted child table: children re-appear through normal
-association/rejoin and keepalive, and no security counter is affected. Version 1
-is deliberately **not** accepted — it carries no network binding, so it cannot be
-validated against the current network.
-
-### Runtime API (parent role only)
-
-Every one of these lives behind `role::ParentRole`, so an end-device build
-cannot even name them.
-
-| Call | Meaning |
-|---|---|
-| `restore_child_table(store)` | Re-install persisted children and schedule the R22 Parent Announce. Returns the number restored; a corrupt, unreadable or foreign-network record is an explicit `Err`, never a silent "no children". |
-| `clear_persisted_child_table(store)` | Commit an empty snapshot and cancel Parent Announce before Leave/factory-reset recommissioning. This is required even when the new membership uses the same extended PAN ID. |
-| `child_table_dirty()` | Whether the live table differs from the last committed snapshot. Compares a fingerprint of every persisted field, so it cannot miss an admission, authorization, rejoin re-addressing, End Device Timeout eviction, leave or Parent Announce reconciliation. |
-| `save_child_table_if_dirty(store)` | Writes only when something actually changed — a steady-state tick writes no flash. |
-| `save_child_table(store)` | Unconditional snapshot. |
-
-A router product calls `restore_child_table` once the network is up and
-`save_child_table_if_dirty` from its event loop, mirroring the
-`state_dirty()` / `save_state()` rhythm used for application state. Every path
-that abandons the current membership calls `clear_persisted_child_table`
-before recommissioning; EPID matching alone cannot distinguish two separate
-memberships in the same network.
-
-### Product partition (TLSR8258 TB-04)
-
-The TB-04 product reserves two dedicated 4 KiB sectors for the child table,
-strictly before the security journal and Telink factory data:
-
-```text
-0x72000..0x74000  child-table journal (router/coordinator child records)
-0x74000..0x76000  security journal  (frame counters, keys, network state)
-0x76000..0x77000  Telink factory EUI-64 (read-only)
-0x77000..0x78000  Telink factory config and ADC calibration (read-only)
+let store = SecurityStore::new_with_sector_size(
+    partition_flash,
+    0,
+    PRODUCT_SECURITY_SECTOR_SIZE as u32,
+);
 ```
 
-`products::tlsr8258_tb04::storage::split_flash` consumes the board's single
-onboard-flash token and hands back one zero-sized token per partition, so the
-two journals cannot be constructed twice or address each other's sectors. The
-linker exports `_child_nv_start_`/`_child_nv_end_` and
-`tools/tlsr8258-firmware.sh` fails the build if the image reaches the child
-journal, the two NV regions overlap, or either journal reaches the factory
-EUI/config sectors. The sensor product drops the child-table token, so the
-journal code never enters a sensor image.
+`PartitionFlash` translates those relative offsets into the product-owned
+protected address range. Boards never supply partition addresses or a
+product-specific journal wrapper.
 
-## Platform ownership
+Current records use version 4. Older supported records decode through explicit
+migration paths. Downgrading to firmware that cannot understand the current
+record version is not supported because selecting an older counter reservation
+can create replay risk.
 
-| Platform | Flash controller | Current partition owner | Store |
-|---|---|---|---|
-| BL702 | `bl702-hal` mask-ROM XIP flash | `products/bl702-xt-zb1` | Security journal; destructive silicon validation pending |
-| TLSR8258 | `tlsr8258-hal` | `products/tlsr8258-tb04` | Security journal + child-table journal (router build); geometry-aware identity and fail-closed Zbit voltage guard |
-| nRF52840 | Embassy NVMC | `products/nrf52840-sensor` | Security journal |
-| PHY6222/PHY6252 | `phy6222-hal` | `boards/phy62x2-evk` | Security journal |
-| ESP32-C6/H2 | `esp_storage::FlashStorage` | `products/esp32-zigbee-devkit` | Security journal |
-| EFR32MG1P | `efr32mg1-hal` MSC | `products/efr32mg1-tradfri` | Security journal + separate generic NV |
-| EFR32MG21 | `efr32mg21-hal` MSC | `boards/efr32mg21-devkit` | Generic NV |
+## Generic application NV
 
-BL702, TLSR8258, EFR32MG1P, ESP32-C6/H2, and nRF52840 are product-split platforms:
-`boards/<board>` exposes only the physical chip flash resource (raw
-whole-chip read/write/erase, no partition or NV knowledge, no
-`zigbee-runtime` dependency), and `products/<product>` bounds it to a window
-and constructs the store. The remaining board-owned rows are legacy
-boundaries that will migrate after the API is proven across more platforms.
-Partition wrappers validate bounds and translate relative offsets to
-physical addresses. Product linker scripts (or, on ESP32, the product-owned
-partition table) reserve the same regions so application code cannot overlap
-persistent storage.
+`NvStorage` is the item API for non-security state. `LogStructuredNv<F>`
+implements it over two NOR sectors. EFR32MG1 uses a separate application-NV
+partition in addition to its security journal.
 
-### TLSR8258 geometry and write safety
+## Parent child table
 
-TLSR8258 factory EUI-64 and ADC-calibration sectors move with flash capacity.
-The HAL supports the Telink 512 KiB, 1 MiB, 2 MiB, and 4 MiB layouts.
-Non-512-KiB products must verify the JEDEC capacity before reading those
-sectors; otherwise ordinary application data at another geometry's address
-could be accepted as a plausible device identity.
+Child persistence is intentionally separate from security state:
 
-The TB-04 product remains a 512 KiB layout. Its security journal occupies
-`0x74000..0x76000`, immediately below the factory EUI sector, and its
-production examples preserve their deployed EUI offsets.
+- `PersistentChildren<C>` is used by `ParentRouterApp` and `CoordinatorApp`;
+- `ChildTableJournal<F>` stores bounded child snapshots;
+- `NoChildren` is used by `RelayRouterApp`.
 
-Zbit `ZB25WD40B`/`ZB25WD80B` flash writes have an additional hardware
-requirement. Before each physical page program or sector erase, the HAL calls
-the owned ADC/PC5 guard and requires a measured voltage above 2200 mV with
-less than 500 mV fluctuation. Missing, busy, or failed ADC readings return a
-flash error; there is no constant-voltage fallback. Multi-page writes repeat
-the check for every page rather than trusting one stale measurement.
+The child journal stores the extended PAN ID and each admitted child's
+identity/configuration/timeout enumeration. It does not store NWK/APS outgoing
+counters. Restoring a foreign-network or corrupt snapshot is an explicit
+error and the stale record is cleared before fresh parent operation.
 
-## Adding a platform
+The runtime writes only when the child table fingerprint changes. Factory
+reset clears child persistence before recommissioning, even if the next
+network has the same extended PAN ID.
+
+## Current product partitions
+
+| product | security state | other protected storage |
+|---|---|---|
+| nRF52840 DK sensor/router | `0xFE000..0x100000` | UF2 variants use board-specific product maps |
+| nRF52833 sensor | `0x7E000..0x80000` | — |
+| ESP32-C6/H2 | `0x3FE000..0x400000` | OTA slots and `otadata` are separate product partitions |
+| BL702 XT-ZB1 | `0xFE000..0x100000` | — |
+| CC2340R5 | `0x7E000..0x80000` | — |
+| PHY6222 | `0x7E000..0x80000` | — |
+| PHY6252 | `0x3E000..0x40000` | — |
+| EFR32MG1 | `0x37000..0x39000` | application NV `0x39000..0x3A000`; bootloader/native regions preserved |
+| EFR32MG21 | `0x7C000..0x80000` | bootloader `0x00000..0x04000` |
+| TLSR8258 TB-04 | `0x74000..0x76000` | child `0x72000..0x74000`, factory EUI/config `0x76000..0x78000` |
+
+Linker scripts and Rust partition wrappers independently assert the same
+boundaries.
+
+## Ownership examples
+
+### ESP32
+
+The board exposes raw chip flash. The product checks the 4 MiB partition table,
+constructs a bounded security journal, performs legacy migration, and owns the
+OTA writer. Neither example hard-codes the final 8 KiB address.
+
+### TLSR8258
+
+The product consumes one board flash token and splits it into distinct
+child/security/factory capabilities. The sensor drops the child token; the
+router consumes it. Zbit page program/erase requires a fresh, stable ADC/PC5
+voltage check and fails closed.
+
+### EFR32MG1
+
+The product reserves security and generic application NV separately. Direct
+USART0 access to external OTA storage and Gecko Bootloader-managed access are
+alternative owners of the same physical path.
+
+### EFR32MG21
+
+The product bounds raw board flash to `0x7C000..0x80000` and instantiates
+`SecurityStateJournal<PartitionFlash, { 8 * 1024 }>`. Its linker script keeps
+the same region out of the application image.
+
+## Identity and reset order
+
+Before resuming persisted state, compare it with the factory/device EUI-64.
+If identity changed, clear incompatible membership before constructing a
+running node.
+
+A durable factory reset must:
+
+1. stop new secured work;
+2. clear security state;
+3. clear child state for parent products;
+4. preserve factory identity/calibration and bootloader/OTA regions;
+5. reset or start fresh commissioning.
+
+OTA activation follows the same safety rule: checkpoint security before the
+reset-causing activation call.
+
+## Hardware status
+
+- nRF, ESP32, EFR32MG1, and deployed TLSR8258 security persistence have
+  hardware evidence.
+- BL702 journal integration builds, but destructive erase/program and
+  reset/resume remain open.
+- PHY62x2, CC2340, and EFR32MG21 flash paths remain hardware-unverified.
+- Telink child-table persistence exists and passes host/target checks; complete
+  corrected-image child acceptance remains a router HIL gate.
+
+## Adding a backend
 
 1. Implement `ReadNorFlash` and `NorFlash` in the chip HAL.
-2. Expose only physical flash wiring from the board crate.
-3. Define a bounded partition wrapper in the product crate.
-4. Reserve that partition in the product linker layout.
-5. Construct `SecurityStateJournal` or `LogStructuredNv` in the product.
-6. Pass the resulting store to the application without exposing addresses.
+2. Expose the physical flash token from the board.
+3. Bound it to product partitions.
+4. reserve the same regions in the product linker layout;
+5. construct the correct journal in the product;
+6. pass the store to `ZigbeeNode`/the shared application.
 
-Flash errors must be returned to the storage algorithm. Reads, writes, and
-erases must never be treated as successful after a controller failure.
+Return controller failures. Never turn a failed erase/program/read-back into
+success.

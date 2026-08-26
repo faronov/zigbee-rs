@@ -62,7 +62,7 @@ use crate::capabilities::{
 };
 use crate::diagnostics::{DiagnosticEvent, Diagnostics};
 use crate::environment::{EnvironmentSource, EnvironmentalSensorProfile};
-use crate::ota::{OtaEventOutcome, OtaLifecycle, is_ota_event};
+use crate::ota::{OtaActivationOutcome, OtaEventOutcome, OtaLifecycle, is_ota_event};
 use crate::parts::{SensorSedParts, SensorSedResources};
 use crate::policy::{self, SensorPolicy, ShortPressAction, SleepDepth, UserActionPolicy};
 
@@ -72,6 +72,12 @@ type SensorNode<'a, M, S, P> = ZigbeeNode<'a, M, S, P, EndDevice>;
 pub enum SensorAppError {
     AutomaticPollingEnabled,
     InvalidPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensorLifecycleError {
+    AlreadyInitialized,
+    NotInitialized,
 }
 
 pub struct SensorApp<'a, M, S, P, R>
@@ -103,6 +109,7 @@ where
     interview_done: bool,
     consecutive_rejoin_failures: u8,
     run_again: Option<(R::Mark, u32)>,
+    initialized: bool,
 }
 
 impl<'a, M, S, P, W, St, E, B, O, A, Sv, D>
@@ -128,7 +135,7 @@ where
         if node.device().automatic_polling_enabled() {
             return Err(SensorAppError::AutomaticPollingEnabled);
         }
-        if !policy.is_valid() {
+        if !policy.is_valid_for_status(St::PRESENT) {
             return Err(SensorAppError::InvalidPolicy);
         }
 
@@ -154,6 +161,7 @@ where
             interview_done: false,
             consecutive_rejoin_failures: 0,
             run_again: None,
+            initialized: false,
         })
     }
 
@@ -520,28 +528,40 @@ where
         };
     }
 
-    async fn handle_ota_event(&mut self, event: &StackEvent) -> bool {
-        debug_assert!(is_ota_event(event));
-        if !O::ENABLED {
-            self.resources
-                .diagnostics
-                .record(DiagnosticEvent::UnexpectedOtaEvent);
-            return false;
+    fn apply_ota_outcome(&mut self, keep_awake_ms: Option<u32>, activation_pending: bool) -> bool {
+        self.resources.status.set(SensorStatus::Ota);
+        if let Some(duration_ms) = keep_awake_ms {
+            self.start_fast_poll(duration_ms);
         }
+        if activation_pending {
+            // Activation may reset immediately. Persist network keys and
+            // security counters before handing control back to the product.
+            self.checkpoint_security();
+            if matches!(
+                self.resources.ota.activate(&mut self.node),
+                OtaActivationOutcome::Failed
+            ) {
+                self.resources.status.set(SensorStatus::Fault);
+            }
+        }
+        true
+    }
+
+    /// Give every stack event to the selected OTA lifecycle before generic
+    /// application matching. `None` is the only fall-through result.
+    async fn handle_ota_event(&mut self, event: &StackEvent) -> Option<bool> {
         match self.resources.ota.handle_event(&mut self.node, event).await {
-            OtaEventOutcome::NotHandled | OtaEventOutcome::Unexpected => {
+            OtaEventOutcome::NotHandled => None,
+            OtaEventOutcome::Unexpected => {
                 self.resources
                     .diagnostics
                     .record(DiagnosticEvent::UnexpectedOtaEvent);
-                false
+                Some(false)
             }
-            OtaEventOutcome::Handled { keep_awake_ms } => {
-                self.resources.status.set(SensorStatus::Ota);
-                if let Some(duration_ms) = keep_awake_ms {
-                    self.start_fast_poll(duration_ms);
-                }
-                true
-            }
+            OtaEventOutcome::Handled {
+                keep_awake_ms,
+                activation_pending,
+            } => Some(self.apply_ota_outcome(keep_awake_ms, activation_pending)),
         }
     }
 
@@ -551,6 +571,10 @@ where
     /// represents coordinator/network activity that should extend the
     /// fast-poll window.
     async fn handle_control_event(&mut self, event: &StackEvent) -> bool {
+        if let Some(handled) = self.handle_ota_event(event).await {
+            return handled;
+        }
+
         match event {
             StackEvent::Joined {
                 short_address,
@@ -713,7 +737,13 @@ where
             | StackEvent::OtaProgress { .. }
             | StackEvent::OtaComplete
             | StackEvent::OtaFailed
-            | StackEvent::OtaDelayedActivation { .. } => self.handle_ota_event(event).await,
+            | StackEvent::OtaDelayedActivation { .. } => {
+                debug_assert!(is_ota_event(event));
+                self.resources
+                    .diagnostics
+                    .record(DiagnosticEvent::UnexpectedOtaEvent);
+                false
+            }
             StackEvent::LeaveRequested => {
                 self.resources
                     .diagnostics
@@ -802,9 +832,8 @@ where
                 .ota
                 .service(&mut self.node, tick_elapsed as u16)
                 .await;
-            if let Some(duration_ms) = ota.keep_awake_ms {
-                self.resources.status.set(SensorStatus::Ota);
-                self.start_fast_poll(duration_ms);
+            if ota.keep_awake_ms.is_some() || ota.activation_pending {
+                self.apply_ota_outcome(ota.keep_awake_ms, ota.activation_pending);
             }
         }
 
@@ -813,19 +842,21 @@ where
         // where that tick's event just left the network — `is_identifying`
         // naturally reads false and a stale `send_device_annce` is already
         // tolerated (`let _ = ...`) below.
-        let identifying = self.node.device().is_identifying(self.endpoint);
-        if identifying {
-            self.identify_phase_on = !self.identify_phase_on;
-            self.resources.status.set(SensorStatus::Identifying {
-                on: self.identify_phase_on,
-            });
-        } else if self.was_identifying {
-            self.identify_phase_on = false;
-            self.resources.status.set(SensorStatus::Joined {
-                active: self.fast_poll_active(),
-            });
+        if St::PRESENT {
+            let identifying = self.node.device().is_identifying(self.endpoint);
+            if identifying {
+                self.identify_phase_on = !self.identify_phase_on;
+                self.resources.status.set(SensorStatus::Identifying {
+                    on: self.identify_phase_on,
+                });
+            } else if self.was_identifying {
+                self.identify_phase_on = false;
+                self.resources.status.set(SensorStatus::Joined {
+                    active: self.fast_poll_active(),
+                });
+            }
+            self.was_identifying = identifying;
         }
-        self.was_identifying = identifying;
 
         // Device_annce retry.
         if self.annce_retries_left > 0
@@ -851,7 +882,9 @@ where
     /// two over-the-air attempts. Fresh commissioning is started only when no
     /// durable secure-rejoin retry remains pending.
     async fn service_unjoined(&mut self) {
-        if self.elapsed_ms(self.last_status) >= self.policy.status.unjoined_blink_period_ms {
+        if St::PRESENT
+            && self.elapsed_ms(self.last_status) >= self.policy.status.unjoined_blink_period_ms
+        {
             self.last_status = self.mark();
             // Double blink.
             self.resources
@@ -948,16 +981,23 @@ where
 
         let now = self.mark();
         let joined = self.node.device().is_joined();
-        let identifying = self.node.device().is_identifying(self.endpoint);
+        let identifying = St::PRESENT && self.node.device().is_identifying(self.endpoint);
         let ota_active = O::ENABLED && self.resources.ota.is_active(self.node.profile());
-        let in_fast_poll = W::elapsed_ms(now, self.fast_poll_started) < self.fast_poll_duration_ms
-            || identifying
-            || ota_active;
+        let fast_poll_elapsed_ms = W::elapsed_ms(now, self.fast_poll_started);
+        let timed_fast_poll = fast_poll_elapsed_ms < self.fast_poll_duration_ms;
+        let in_fast_poll = timed_fast_poll || identifying || ota_active;
         let mut wait_ms = if in_fast_poll {
             self.policy.fast_poll_ms
         } else {
             self.policy.slow_poll_ms
         };
+
+        if timed_fast_poll {
+            wait_ms = shorten(
+                wait_ms,
+                policy::remaining_ms(fast_poll_elapsed_ms, self.fast_poll_duration_ms),
+            );
+        }
 
         if let Some((started, delay_ms)) = self.run_again {
             wait_ms = shorten(
@@ -991,13 +1031,15 @@ where
                     self.policy.join_retry_ms,
                 ),
             );
-            wait_ms = shorten(
-                wait_ms,
-                policy::remaining_ms(
-                    W::elapsed_ms(now, self.last_status),
-                    self.policy.status.unjoined_blink_period_ms,
-                ),
-            );
+            if St::PRESENT {
+                wait_ms = shorten(
+                    wait_ms,
+                    policy::remaining_ms(
+                        W::elapsed_ms(now, self.last_status),
+                        self.policy.status.unjoined_blink_period_ms,
+                    ),
+                );
+            }
         }
 
         if O::ENABLED
@@ -1027,21 +1069,23 @@ where
                     .diagnostics
                     .record(DiagnosticEvent::SecurityResetRebooting);
             }
-            for _ in 0..self.policy.status.reset_blinks {
-                self.resources
-                    .status
-                    .set(SensorStatus::Resetting { on: true });
-                self.resources
-                    .wake
-                    .delay_ms(self.policy.status.reset_phase_ms)
-                    .await;
-                self.resources
-                    .status
-                    .set(SensorStatus::Resetting { on: false });
-                self.resources
-                    .wake
-                    .delay_ms(self.policy.status.reset_phase_ms)
-                    .await;
+            if St::PRESENT {
+                for _ in 0..self.policy.status.reset_blinks {
+                    self.resources
+                        .status
+                        .set(SensorStatus::Resetting { on: true });
+                    self.resources
+                        .wake
+                        .delay_ms(self.policy.status.reset_phase_ms)
+                        .await;
+                    self.resources
+                        .status
+                        .set(SensorStatus::Resetting { on: false });
+                    self.resources
+                        .wake
+                        .delay_ms(self.policy.status.reset_phase_ms)
+                        .await;
+                }
             }
             self.resources.supervisor.reset();
         } else {
@@ -1079,70 +1123,104 @@ where
             .await;
     }
 
-    pub async fn run(&mut self) -> ! {
+    /// Perform the one-time boot/resume lifecycle.
+    ///
+    /// Event-loop integrations that own their outer scheduler call this once,
+    /// then invoke [`step`](Self::step) whenever they want the application to
+    /// advance by one finite wait/service iteration.
+    pub async fn initialize(&mut self) -> Result<(), SensorLifecycleError> {
+        if self.initialized {
+            return Err(SensorLifecycleError::AlreadyInitialized);
+        }
         self.cold_start().await;
+        self.initialized = true;
+        Ok(())
+    }
 
-        loop {
-            let (poll_ms, in_fast_poll) = self.next_wait_ms();
+    async fn step_initialized(&mut self) {
+        let (poll_ms, in_fast_poll) = self.next_wait_ms();
 
-            // Log transition from fast→slow poll.
-            if self.was_fast_polling && !in_fast_poll {
-                let cfg = self.node.remote_reporting_cluster_count();
+        // Log transition from fast→slow poll.
+        if self.was_fast_polling && !in_fast_poll {
+            let cfg = self.node.remote_reporting_cluster_count();
+            self.resources
+                .diagnostics
+                .record(DiagnosticEvent::FastPollStopped {
+                    configured: cfg,
+                    expected: self.node.expected_report_clusters(),
+                });
+            self.was_fast_polling = false;
+            if !self.was_identifying {
                 self.resources
-                    .diagnostics
-                    .record(DiagnosticEvent::FastPollStopped {
-                        configured: cfg,
-                        expected: self.node.expected_report_clusters(),
-                    });
-                self.was_fast_polling = false;
-                if !self.was_identifying {
-                    self.resources
-                        .status
-                        .set(SensorStatus::Joined { active: false });
-                }
-            } else if in_fast_poll {
-                self.was_fast_polling = true;
+                    .status
+                    .set(SensorStatus::Joined { active: false });
             }
+        } else if in_fast_poll {
+            self.was_fast_polling = true;
+        }
 
-            self.resources.supervisor.heartbeat();
-            let ota_active = O::ENABLED && self.resources.ota.is_active(self.node.profile());
-            let sleep_depth = if self.node.device().is_joined() && !ota_active {
-                self.policy.sleep_depth
+        self.resources.supervisor.heartbeat();
+        let ota_active = O::ENABLED && self.resources.ota.is_active(self.node.profile());
+        let sleep_depth = if self.node.device().is_joined() && !ota_active {
+            if in_fast_poll {
+                self.policy.fast_sleep_depth
             } else {
-                SleepDepth::Active
-            };
-            let wait_result = {
-                let node = &mut self.node;
-                let resources = &mut self.resources;
-                let mac = node.device_mut().mac_mut();
-                resources
-                    .wake
-                    .wait(
-                        mac,
-                        WaitRequest {
-                            timeout_ms: poll_ms,
-                            sleep_depth,
-                        },
-                    )
-                    .await
-            };
-            let wake_reason = match wait_result {
-                Ok(wake_reason) => wake_reason,
-                Err(_) => self.wake_failure(),
-            };
-            self.resources.supervisor.heartbeat();
-
-            match wake_reason {
-                WakeReason::Button => self.handle_button_press().await,
-                WakeReason::Timer => {}
+                self.policy.slow_sleep_depth
             }
+        } else {
+            SleepDepth::Active
+        };
+        let wait_result = {
+            let node = &mut self.node;
+            let resources = &mut self.resources;
+            let mac = node.device_mut().mac_mut();
+            resources
+                .wake
+                .wait(
+                    mac,
+                    WaitRequest {
+                        timeout_ms: poll_ms,
+                        sleep_depth,
+                    },
+                )
+                .await
+        };
+        let wake_reason = match wait_result {
+            Ok(wake_reason) => wake_reason,
+            Err(_) => self.wake_failure(),
+        };
+        self.resources.supervisor.heartbeat();
 
-            if self.node.device().is_joined() {
-                self.service_joined_polls().await;
-                self.service_periodic_joined().await;
-            } else {
-                self.service_unjoined().await;
-            }
+        match wake_reason {
+            WakeReason::Button => self.handle_button_press().await,
+            WakeReason::Timer => {}
+        }
+
+        if self.node.device().is_joined() {
+            self.service_joined_polls().await;
+            self.service_periodic_joined().await;
+        } else {
+            self.service_unjoined().await;
+        }
+    }
+
+    /// Advance one finite wait/service iteration.
+    pub async fn step(&mut self) -> Result<(), SensorLifecycleError> {
+        if !self.initialized {
+            return Err(SensorLifecycleError::NotInitialized);
+        }
+        self.step_initialized().await;
+        Ok(())
+    }
+
+    /// Convenience wrapper identical to one [`initialize`](Self::initialize)
+    /// followed by an infinite sequence of [`step`](Self::step) iterations.
+    pub async fn run(&mut self) -> ! {
+        if self.initialize().await.is_err() {
+            core::panic!();
+        }
+        loop {
+            self.step_initialized().await;
         }
     }
 }

@@ -1,668 +1,187 @@
-//! # Zigbee-RS EFR32MG21P Sensor (SED)
+//! BRD4181A EFR32MG21 environmental sleepy-end-device composition root.
 //!
-//! Full-featured Zigbee 3.0 sleepy end device for EFR32MG21P-based boards.
-//! Pure-Rust radio driver — no RAIL library, no GSDK, no binary blobs.
-//!
-//! # Hardware
-//! - EFR32MG21P (256KB flash, 32KB SRAM), ARM Cortex-M33F @ 80 MHz
-//! - 2.4 GHz radio with IEEE 802.15.4 + BLE support
-//! - Common boards: IKEA TRÅDFRI, Thunderboard Sense, BRD4151A
-//!
-//! # Features
-//! - Auto-join on boot (no button required)
-//! - Sleepy End Device: poll parent for indirect frames
-//! - Fast poll (250ms) during ZHA interview, slow poll (10s) normal
-//! - LED status: triple-blink boot, double-blink joining, solid joined
-//! - Button: short press = toggle join/leave, long press = factory reset
-//! - Device_annce retries for reliable coordinator discovery
-//!
-//! # Build
-//! ```bash
-//! cargo build --release
-//! ```
+//! The reusable lifecycle is `sensor-sed-app`; this file owns only startup,
+//! exclusive board resources, identity validation, and static capability
+//! assembly. Temperature, humidity, and battery readings are explicitly
+//! synthetic/fixed until real sensors are fitted and qualified.
 
 #![no_std]
 #![no_main]
 
+mod platform;
 #[cfg(feature = "stubs")]
 mod stubs;
-
 mod time_driver;
 mod vectors;
 
-use cortex_m as _;
-use panic_halt as _;
+use efr32mg21_devkit::resources::BoardResources;
+use efr32mg21_sensor_product as product;
+use embassy_executor::Spawner;
+use sensor_sed_app::{FixedBattery, NoOta, SensorApp, SensorSedParts};
+use static_cell::StaticCell;
+use zigbee_mac::{
+    MacDriver,
+    efr32s2::Efr32s2Mac,
+    pib::{PibAttribute, PibValue},
+};
+use zigbee_runtime::{
+    ZigbeeDevice,
+    node::ZigbeeNode,
+    profile::{ApplicationProfile, BatteryMeasurement},
+};
+use zigbee_types::ChannelMask;
+use zigbee_zcl::clusters::basic::PowerSource;
+
 #[allow(unused_imports)]
 use vectors::__INTERRUPTS;
 
-use efr32mg21_devkit::storage;
-use embassy_executor::Spawner;
-use embassy_time::{Duration, Instant, Timer};
+type AppParts = SensorSedParts<
+    platform::Brd4181aWake,
+    platform::Pb0Status,
+    platform::SyntheticEnvironment,
+    FixedBattery,
+    NoOta,
+    sensor_sed_app::ToggleJoinAction,
+    platform::Efr32Supervisor,
+    platform::RttDiagnostics,
+>;
+type SharedSensorApp = SensorApp<
+    'static,
+    Efr32s2Mac,
+    product::storage::SecurityStore,
+    product::profile::SensorProfile,
+    AppParts,
+>;
 
-use zigbee_aps::PROFILE_HOME_AUTOMATION;
-use zigbee_mac::efr32s2::Efr32s2Mac;
-use zigbee_runtime::event_loop::{StackEvent, TickResult};
-use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::profile::TemperatureHumidityBattery;
-use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
-use zigbee_zcl::clusters::basic::PowerSource;
-use zigbee_zcl::clusters::humidity::HumidityCluster;
-use zigbee_zcl::clusters::power_config::PowerConfigCluster;
-use zigbee_zcl::clusters::temperature::TemperatureCluster;
-use zigbee_zcl::{ClusterId, DeviceId};
-
-const REPORT_INTERVAL_SECS: u64 = 60;
-const FAST_POLL_MS: u64 = 250;
-const SLOW_POLL_SECS: u64 = 30;
-const FAST_POLL_DURATION_SECS: u64 = 120;
-// ── EFR32MG21P GPIO ─────────────────────────────────────────────
-
-mod pins {
-    // GPIO pin numbers — adjust for your board
-    pub const LED: u8 = 6; // LED on PF6 (Thunderboard Sense)
-    pub const BTN: u8 = 7; // Button on PF7 (Thunderboard Sense)
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    platform::halt()
 }
-
-// Simple GPIO access via memory-mapped registers
-// EFR32MG21P GPIO base = 0x4000_A000
-fn gpio_set_output(pin: u8) {
-    let port = (pin / 16) as u32;
-    let pin_in_port = (pin % 16) as u32;
-    let mode_reg = 0x4000_A004 + port * 0x30 + if pin_in_port >= 8 { 4 } else { 0 };
-    let shift = (pin_in_port % 8) * 4;
-    unsafe {
-        let old = core::ptr::read_volatile(mode_reg as *const u32);
-        // Mode 4 = push-pull output
-        core::ptr::write_volatile(mode_reg as *mut u32, (old & !(0xF << shift)) | (4 << shift));
-    }
-}
-
-fn gpio_write(pin: u8, high: bool) {
-    let port = (pin / 16) as u32;
-    let pin_in_port = (pin % 16) as u32;
-    let reg = if high {
-        0x4000_A018 + port * 0x30 // DOUTSET
-    } else {
-        0x4000_A01C + port * 0x30 // DOUTCLR
-    };
-    unsafe {
-        core::ptr::write_volatile(reg as *mut u32, 1 << pin_in_port);
-    }
-}
-
-fn gpio_read(pin: u8) -> bool {
-    let port = (pin / 16) as u32;
-    let pin_in_port = (pin % 16) as u32;
-    let din_reg = 0x4000_A010 + port * 0x30; // DIN
-    let val = unsafe { core::ptr::read_volatile(din_reg as *const u32) };
-    (val >> pin_in_port) & 1 != 0
-}
-
-fn led_on() {
-    gpio_write(pins::LED, true);
-}
-fn led_off() {
-    gpio_write(pins::LED, false);
-}
-
-// ── Main ────────────────────────────────────────────────────────
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
+    let BoardResources {
+        clocks,
+        led0,
+        button0,
+        flash,
+    } = BoardResources::take().unwrap_or_else(|| platform::halt());
+
+    efr32mg21_devkit::init_clocks(clocks).unwrap_or_else(|_| platform::halt());
     time_driver::init();
+    rtt_target::rtt_init_log!(log::LevelFilter::Info);
 
-    // Unmask radio IRQ (FRC_PRI = IRQ 1)
-    unsafe {
-        cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::FrcPri);
-    }
+    let mut led = led0.into_led();
+    let button = button0.into_button();
+    platform::enable_button_interrupt();
+    platform::signal_boot(&mut led).await;
 
-    log::info!("[EFR32] Zigbee Sensor starting (pure Rust!)");
+    log::info!(
+        "[EFR32] {} on {} / {} ({})",
+        product::MODEL,
+        efr32mg21_devkit::BOARD_RADIO,
+        efr32mg21_devkit::BOARD_MAIN,
+        efr32mg21_devkit::MCU_PART
+    );
+    log::warn!("[EFR32] SYNTHETIC temperature/humidity and FIXED 3000 mV battery");
+    log::info!("[EFR32] idle mode is radio-off WFE with 1 kHz SysTick; not EM2");
 
-    // GPIO init
-    gpio_set_output(pins::LED);
-    led_off();
+    // The radio FRC interrupt is independent from the PD2 GPIO_EVEN input.
+    cortex_m::peripheral::NVIC::unpend(vectors::Interrupt::FrcPri);
+    // SAFETY: Efr32s2Mac is the sole FRC peripheral owner.
+    unsafe { cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::FrcPri) };
 
-    // Boot signal: triple blink
-    for _ in 0..3u8 {
-        led_on();
-        Timer::after(Duration::from_millis(100)).await;
-        led_off();
-        Timer::after(Duration::from_millis(100)).await;
-    }
-    Timer::after(Duration::from_millis(500)).await;
-
-    // Radio + MAC
     let mac = Efr32s2Mac::new();
-    log::info!("[EFR32] Radio ready");
-
-    // Flash NV storage
-    let mut nv = storage::application_nv().expect("failed to initialize application NV");
-    log::info!("[EFR32] Flash NV storage ready");
-
-    let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
-    let mut hum_cluster = HumidityCluster::new(0, 10000);
-    let mut power_cluster = PowerConfigCluster::new();
-    power_cluster.set_battery_size(4); // AAA
-    power_cluster.set_battery_quantity(2); // 2× AAA
-    power_cluster.set_battery_rated_voltage(15); // 1.5V
-
-    // Simulated sensor state
-    let mut hum_tick: u32 = 0;
-
-    // Build device (SED)
-    let mut device = ZigbeeDevice::builder(mac)
-        .power_mode(PowerMode::Sleepy {
-            poll_interval_ms: 10_000,
-            wake_duration_ms: 500,
-        })
-        .manufacturer("Zigbee-RS")
-        .model("EFR32MG21-Sensor")
-        .date_code("20260402")
-        .sw_build("0.1.0")
-        .power_source(PowerSource::Battery)
-        .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(
-            1,
-            PROFILE_HOME_AUTOMATION,
-            DeviceId::TEMPERATURE_SENSOR,
-            |ep| {
-                ep.cluster_server(ClusterId::BASIC)
-                    .cluster_server(ClusterId::IDENTIFY)
-                    .cluster_server(ClusterId::POWER_CONFIG)
-                    .cluster_server(ClusterId::TEMPERATURE)
-                    .cluster_server(ClusterId::HUMIDITY)
-            },
-        )
-        .build();
-
-    // Restore previous network state from flash
-    let restored = device.restore_state(&mut nv);
-    if restored {
-        log::info!("[EFR32] Restored state from flash — will rejoin");
-        device.user_action(UserAction::Rejoin);
-    } else {
-        log::info!("[EFR32] No saved state — auto-joining…");
-        device.user_action(UserAction::Join);
-    }
-    let mut clusters = [
-        ClusterRef {
-            endpoint: 1,
-            cluster: &mut temp_cluster,
-        },
-        ClusterRef {
-            endpoint: 1,
-            cluster: &mut hum_cluster,
-        },
-        ClusterRef {
-            endpoint: 1,
-            cluster: &mut power_cluster,
-        },
-    ];
-    if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-        if log_event(e) {
-            device.save_state(&mut nv);
-            log::info!("[EFR32] Network state saved to flash");
-        }
-    }
-
-    // Default reporting so device reports even before ZHA interview
-    setup_default_reporting(&mut device);
-
-    // Set initial sensor values
-    {
-        let temp: i16 = 2250;
-        temp_cluster.set_temperature(temp);
-        hum_cluster.set_humidity(5000u16);
-
-        // Simulated battery (replace with real ADC reading)
-        let batt_pct: u8 = 100;
-        power_cluster.set_battery_voltage(30); // 3.0V
-        power_cluster.set_battery_percentage(batt_pct * 2);
-        log::info!("[EFR32] Initial: T=22.50°C H=50.00% Batt=3000mV (100%)");
-    }
-
-    // ── Main loop state ──
-    let mut last_report = Instant::now();
-    let mut fast_poll_until = if device.is_joined() {
-        log::info!("[EFR32] Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
-        led_on();
-        Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS)
-    } else {
-        Instant::now()
-    };
-    let mut last_rejoin_attempt = Instant::now();
-    let mut rejoin_count: u8 = 0;
-    let mut annce_retries_left: u8 = if device.is_joined() { 5 } else { 0 };
-    let mut last_annce = Instant::now();
-    let mut was_fast_polling = device.is_joined();
-    let mut interview_done = false;
-    let mut button_was_pressed = false;
-    let mut needs_save = false;
-
-    loop {
-        let now = Instant::now();
-        let in_fast_poll = now < fast_poll_until;
-        let poll_ms = if in_fast_poll {
-            FAST_POLL_MS
-        } else {
-            SLOW_POLL_SECS * 1000
-        };
-
-        if was_fast_polling && !in_fast_poll {
-            let cfg = device.remote_reporting_coverage(
-                1,
-                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
-            );
-            log::info!(
-                "[EFR32] Fast poll OFF — {}/{} clusters configured by remote client",
-                cfg,
-                TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS.len()
-            );
-            was_fast_polling = false;
-            if !interview_done {
-                led_off();
-            }
-        } else if in_fast_poll {
-            was_fast_polling = true;
-        }
-
-        // ── Button check ──
-        let pressed = !gpio_read(pins::BTN); // active LOW
-        if pressed && !button_was_pressed {
-            let mut held_long = false;
-            let press_start = Instant::now();
-            while !gpio_read(pins::BTN) {
-                if press_start.elapsed().as_secs() >= 3 {
-                    held_long = true;
-                    break;
-                }
-                Timer::after(Duration::from_millis(50)).await;
-            }
-
-            if held_long {
-                log::info!("[EFR32] FACTORY RESET");
-                device.factory_reset(Some(&mut nv)).await;
-                log::info!("[EFR32] NV cleared — rebooting");
-                for _ in 0..5u8 {
-                    led_on();
-                    Timer::after(Duration::from_millis(100)).await;
-                    led_off();
-                    Timer::after(Duration::from_millis(100)).await;
-                }
-                cortex_m::peripheral::SCB::sys_reset();
-            } else {
-                log::info!(
-                    "[EFR32] Button → {}",
-                    if device.is_joined() { "leave" } else { "join" }
-                );
-                device.user_action(UserAction::Toggle);
-                let mut cls = [
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut temp_cluster,
-                    },
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut hum_cluster,
-                    },
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut power_cluster,
-                    },
-                ];
-                if let TickResult::Event(ref e) = device.tick(0, &mut cls).await {
-                    match e {
-                        StackEvent::Joined { .. } => {
-                            log_event(e);
-                            device.save_state(&mut nv);
-                            log::info!("[EFR32] State saved to flash");
-                            fast_poll_until =
-                                Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                            annce_retries_left = 5;
-                            last_annce = Instant::now();
-                            interview_done = false;
-                            device.reset_remote_reporting();
-                        }
-                        StackEvent::Left => {
-                            log_event(e);
-                            device.factory_reset(Some(&mut nv)).await;
-                            log::info!("[EFR32] NV cleared");
-                        }
-                        _ => {
-                            log_event(e);
-                        }
-                    }
-                }
-                Timer::after(Duration::from_millis(300)).await;
-            }
-        }
-        button_was_pressed = pressed;
-
-        // ── Sleep until next poll ──
-        // Light sleep: radio off, CPU in WFE via embassy Timer
-        device.mac_mut().radio_sleep();
-        Timer::after(Duration::from_millis(poll_ms)).await;
-        device.mac_mut().radio_wake();
-
-        // ── Poll parent for indirect frames (SED core) ──
-        if device.is_joined() {
-            for _poll_round in 0..4u8 {
-                match device.poll().await {
-                    Ok(Some(ind)) => {
-                        let mut cls = [
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut temp_cluster,
-                            },
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut hum_cluster,
-                            },
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut power_cluster,
-                            },
-                        ];
-                        if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
-                            match &ev {
-                                StackEvent::RejoinRequested => {
-                                    log::info!("[EFR32] Secure rejoin requested");
-                                    if device.secure_rejoin().await.is_ok() {
-                                        fast_poll_until = Instant::now()
-                                            + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                        interview_done = false;
-                                        // New lifecycle — the coordinator
-                                        // re-runs its interview.
-                                        device.reset_remote_reporting();
-                                        annce_retries_left = 5;
-                                        last_annce = Instant::now();
-                                        led_on();
-                                        needs_save = true;
-                                    } else {
-                                        log::warn!("[EFR32] Secure rejoin failed");
-                                    }
-                                    break;
-                                }
-                                StackEvent::LeaveRequested => {
-                                    log::info!(
-                                        "[EFR32] Leave requested — erasing NV and rejoining"
-                                    );
-                                    device.factory_reset(Some(&mut nv)).await;
-                                    device.user_action(UserAction::Join);
-                                    fast_poll_until = Instant::now()
-                                        + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                    interview_done = false;
-                                    device.reset_remote_reporting();
-                                    annce_retries_left = 5;
-                                    last_annce = Instant::now();
-                                    led_on();
-                                    break;
-                                }
-                                _ => {}
-                            }
-                            if log_event(&ev) {
-                                fast_poll_until =
-                                    Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                log::info!("[EFR32] Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
-                                needs_save = true;
-                            }
-                        }
-                        // Interview completion counts only clusters a remote
-                        // client configured in full; local defaults do not
-                        // qualify.
-                        if !interview_done {
-                            let cfg_count = device.remote_reporting_coverage(
-                                1,
-                                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
-                            );
-                            if device.remote_reporting_covers(
-                                1,
-                                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
-                            ) {
-                                log::info!(
-                                    "[EFR32] Interview done! {}/{} clusters configured remotely",
-                                    cfg_count,
-                                    TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS.len()
-                                );
-                                fast_poll_until = Instant::now() + Duration::from_secs(5);
-                                interview_done = true;
-                                led_off();
-                            }
-                        }
-                        let mut cls2 = [
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut temp_cluster,
-                            },
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut hum_cluster,
-                            },
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut power_cluster,
-                            },
-                        ];
-                        let _ = device.tick(0, &mut cls2).await;
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
-            }
-
-            // ── Periodic sensor readings ──
-            let now2 = Instant::now();
-            let elapsed_s = now2.duration_since(last_report).as_secs();
-
-            if elapsed_s >= REPORT_INTERVAL_SECS {
-                last_report = now2;
-
-                // Simulated temp/humidity (replace with I2C sensor)
-                let temp_hundredths: i16 = 2250 + ((hum_tick % 50) as i16 - 25);
-                hum_tick = hum_tick.wrapping_add(1);
-                let hum_hundredths: u16 = 5000 + ((hum_tick % 100) as u16) * 10;
-                temp_cluster.set_temperature(temp_hundredths);
-                hum_cluster.set_humidity(hum_hundredths);
-                log::info!(
-                    "[EFR32] T={}.{:02}°C H={}.{:02}%",
-                    temp_hundredths / 100,
-                    (temp_hundredths % 100).unsigned_abs(),
-                    hum_hundredths / 100,
-                    hum_hundredths % 100,
-                );
-            }
-
-            let tick_elapsed = elapsed_s.min(60) as u16;
-            let mut clusters = [
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut temp_cluster,
-                },
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut hum_cluster,
-                },
-                ClusterRef {
-                    endpoint: 1,
-                    cluster: &mut power_cluster,
-                },
-            ];
-            if let TickResult::Event(ref e) = device.tick(tick_elapsed, &mut clusters).await {
-                if matches!(e, StackEvent::Joined { .. }) {
-                    interview_done = false;
-                    device.reset_remote_reporting();
-                }
-                if log_event(e) {
-                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                }
-            }
-
-            // Identify LED blink
-            if device.is_identifying(1) {
-                let on = gpio_read(pins::LED);
-                gpio_write(pins::LED, !on);
-            }
-
-            // Device_annce retry
-            if annce_retries_left > 0 && now2.duration_since(last_annce).as_secs() >= 8 {
-                annce_retries_left -= 1;
-                last_annce = now2;
-                log::info!("[EFR32] Device_annce retry ({} left)", annce_retries_left);
-                let _ = device.send_device_annce().await;
-            }
-
-            if needs_save {
-                needs_save = false;
-                device.save_state(&mut nv);
-                log::info!("[EFR32] State saved to flash (deferred)");
-            }
-        } else {
-            // ── Not joined — blink and auto-retry ──
-            let now2 = Instant::now();
-            if now2.duration_since(last_rejoin_attempt).as_secs() >= 1 {
-                led_on();
-                Timer::after(Duration::from_millis(80)).await;
-                led_off();
-                Timer::after(Duration::from_millis(120)).await;
-                led_on();
-                Timer::after(Duration::from_millis(80)).await;
-                led_off();
-            }
-
-            if now2.duration_since(last_rejoin_attempt).as_secs() >= 15 {
-                rejoin_count = rejoin_count.wrapping_add(1);
-                last_rejoin_attempt = Instant::now();
-                log::info!("[EFR32] Not joined — retrying (attempt {})…", rejoin_count);
-                device.user_action(UserAction::Join);
-                let mut cls = [
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut temp_cluster,
-                    },
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut hum_cluster,
-                    },
-                    ClusterRef {
-                        endpoint: 1,
-                        cluster: &mut power_cluster,
-                    },
-                ];
-                let _ = device.tick(0, &mut cls).await;
-                if device.is_joined() {
-                    log::info!("[EFR32] Joined! addr=0x{:04X}", device.short_address());
-                    led_on();
-                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                    annce_retries_left = 5;
-                    last_annce = Instant::now();
-                    interview_done = false;
-                    device.reset_remote_reporting();
-                    device.save_state(&mut nv);
-                    log::info!("[EFR32] State saved to flash");
-                }
-            }
-        }
-    }
-}
-
-/// Log stack events. Returns true on join event.
-fn log_event(event: &StackEvent) -> bool {
-    match event {
-        StackEvent::Joined {
-            short_address,
-            channel,
-            pan_id,
-        } => {
-            led_on();
-            log::info!(
-                "[EFR32] Joined! addr=0x{:04X} ch={} pan=0x{:04X}",
-                short_address,
-                channel,
-                pan_id
-            );
-            true
-        }
-        StackEvent::Left => {
-            led_off();
-            log::info!("[EFR32] Left network");
-            false
-        }
-        StackEvent::ReportSent => {
-            log::info!("[EFR32] Report sent");
-            false
-        }
-        StackEvent::ReportingConfigured { cluster_id, .. } => {
-            log::info!(
-                "[EFR32] Remote Configure Reporting accepted: cluster=0x{:04X}",
-                cluster_id
-            );
-            false
-        }
-        StackEvent::LeaveRequested | StackEvent::RejoinRequested => {
-            led_on();
-            log::info!("[EFR32] Leave requested by coordinator");
-            false
-        }
-        StackEvent::CommissioningComplete { success } => {
-            log::info!(
-                "[EFR32] Commissioning: {}",
-                if *success { "ok" } else { "failed" }
-            );
-            false
+    let ieee = match mac.mlme_get(PibAttribute::MacExtendedAddress).await {
+        Ok(PibValue::ExtendedAddress(address)) if address != [0; 8] && address != [0xFF; 8] => {
+            address
         }
         _ => {
-            log::info!("[EFR32] Stack event");
-            false
+            log::error!("[EFR32] no valid IEEE EUI-64");
+            platform::halt()
+        }
+    };
+
+    static SECURITY: StaticCell<product::storage::SecurityStore> = StaticCell::new();
+    static PROFILE: StaticCell<product::profile::SensorProfile> = StaticCell::new();
+    static DEVICE: StaticCell<ZigbeeDevice<Efr32s2Mac>> = StaticCell::new();
+    static APP: StaticCell<SharedSensorApp> = StaticCell::new();
+
+    let profile = PROFILE.init(product::profile::sensor_profile());
+    let device = ZigbeeDevice::builder(mac)
+        .power_mode(product::policy::SENSOR_POLICY.power_mode())
+        .automatic_polling(false)
+        .manufacturer(product::MANUFACTURER)
+        .model(product::MODEL)
+        .application_version(product::APPLICATION_VERSION)
+        .date_code(product::DATE_CODE)
+        .sw_build(product::SW_BUILD)
+        .power_source(PowerSource::Battery)
+        .channels(ChannelMask::ALL_2_4GHZ)
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        .build_into(DEVICE.uninit());
+
+    let (security_store, migration) =
+        product::storage::security_store(flash).unwrap_or_else(|error| {
+            log::error!("[EFR32] security journal open/migration failed: {error:?}");
+            platform::halt()
+        });
+    let security_store = SECURITY.init(security_store);
+    match migration {
+        product::storage::MigrationDisposition::ExistingJournal => {
+            log::info!("[EFR32] valid security journal preserved")
+        }
+        product::storage::MigrationDisposition::FreshReset => {
+            log::warn!("[EFR32] blank/legacy persistence reset; fresh join required")
         }
     }
+
+    // This identity guard is deliberately before ZigbeeNode construction:
+    // persisted keys/counters may never be resumed under a different EUI-64.
+    match device.reset_security_state_if_identity_changed(security_store, ieee) {
+        Ok(true) => log::warn!("[EFR32] cleared journal after IEEE identity change"),
+        Ok(false) => {}
+        Err(error) => {
+            log::error!("[EFR32] identity guard failed: {error:?}");
+            platform::halt()
+        }
+    }
+
+    let node = ZigbeeNode::new(device, security_store, profile);
+    let app = SensorApp::new(
+        node,
+        &product::policy::SENSOR_POLICY,
+        SensorSedParts {
+            wake: platform::Brd4181aWake::new(button),
+            status: platform::Pb0Status::new(led),
+            environment: platform::SyntheticEnvironment::new(),
+            battery: FixedBattery::new(
+                3_000,
+                BatteryMeasurement {
+                    voltage_100mv: 30,
+                    percentage_remaining: 200,
+                },
+            ),
+            ota: NoOta,
+            actions: product::policy::USER_ACTIONS,
+            supervisor: platform::Efr32Supervisor,
+            diagnostics: platform::RttDiagnostics,
+        },
+    )
+    .unwrap_or_else(|error| {
+        log::error!("[EFR32] invalid SensorApp composition: {error:?}");
+        platform::halt()
+    });
+
+    APP.init(app).run().await
 }
 
-/// Configure default reporting intervals with reportable change thresholds.
-fn setup_default_reporting(device: &mut ZigbeeDevice<Efr32s2Mac>) {
-    use zigbee_zcl::data_types::{ZclDataType, ZclValue};
-    use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
-
-    // Temperature: report every 60-300s, min change 0.5°C (50 centidegrees)
-    let _ = device.reporting_mut().configure_for_cluster(
-        1,
-        ClusterId::TEMPERATURE.0,
-        ReportingConfig {
-            direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::clusters::temperature::ATTR_MEASURED_VALUE,
-            data_type: ZclDataType::I16,
-            min_interval: 60,
-            max_interval: 300,
-            reportable_change: Some(ZclValue::I16(50)),
-        },
-    );
-
-    // Humidity: report every 60-300s, min change 1% (100 centi-%)
-    let _ = device.reporting_mut().configure_for_cluster(
-        1,
-        ClusterId::HUMIDITY.0,
-        ReportingConfig {
-            direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::clusters::humidity::ATTR_MEASURED_VALUE,
-            data_type: ZclDataType::U16,
-            min_interval: 60,
-            max_interval: 300,
-            reportable_change: Some(ZclValue::U16(100)),
-        },
-    );
-
-    // Battery: report every 300-3600s, min change 2% (4 in 0.5% units)
-    let _ = device.reporting_mut().configure_for_cluster(
-        1,
-        ClusterId::POWER_CONFIG.0,
-        ReportingConfig {
-            direction: ReportDirection::Send,
-            attribute_id: zigbee_zcl::clusters::power_config::ATTR_BATTERY_PERCENTAGE_REMAINING,
-            data_type: ZclDataType::U8,
-            min_interval: 300,
-            max_interval: 3600,
-            reportable_change: Some(ZclValue::U8(4)),
-        },
-    );
-
-    log::info!("[EFR32] Default reporting configured (with change thresholds)");
+#[unsafe(no_mangle)]
+extern "C" fn GPIO_EVEN() {
+    platform::gpio_even_irq();
 }

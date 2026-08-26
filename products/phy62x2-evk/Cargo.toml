@@ -1,0 +1,28 @@
+[package]
+name = "phy62x2-evk-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product identity, layout, persistence, and policy for the PHY62x2 EVK sensor"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# This migration is intentionally standalone and does not edit the repository
+# workspace membership.
+[workspace]
+
+[features]
+default = ["phy6222"]
+phy6222 = ["phy62x2-evk/phy6222"]
+phy6252 = ["phy62x2-evk/phy6252"]
+
+[dependencies]
+embedded-storage = "0.3"
+sensor-sed-app = { path = "../../apps/sensor-sed" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["constrained-memory"] }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[target.'cfg(target_os = "none")'.dependencies]
+phy62x2-evk = { path = "../../boards/phy62x2-evk", default-features = false }

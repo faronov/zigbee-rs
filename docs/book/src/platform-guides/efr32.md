@@ -1,318 +1,159 @@
-# EFR32 (MG1 & MG21)
+# Silicon Labs EFR32
 
-The Silicon Labs EFR32 Mighty Gecko family is one of the most widely deployed
-Zigbee platforms — found in IKEA TRÅDFRI modules, Sonoff ZBDongle-E, and many
-commercial products. zigbee-rs supports both **Series 1 (EFR32MG1P)** and
-**Series 2 (EFR32MG21)** with pure-Rust radio drivers — no GSDK, no RAIL
-library, no binary blobs.
+The repository supports two distinct products:
 
-## Hardware Overview
+- EFR32MG1P TRÅDFRI environmental sleepy end device;
+- EFR32MG21 BRD4181A development sensor.
 
-| Spec | EFR32MG1P (Series 1) | EFR32MG21 (Series 2) |
-|------|---------------------|---------------------|
-| **Core** | ARM Cortex-M4F @ 40 MHz | ARM Cortex-M33 @ 80 MHz |
-| **Flash** | 256 KB | 512 KB |
-| **SRAM** | 32 KB nominal; `0x7c00` bytes usable on the proven part | 64 KB |
-| **Radio** | 2.4 GHz IEEE 802.15.4 + BLE | 2.4 GHz IEEE 802.15.4 + BLE |
-| **Security** | CRYPTO engine | Secure Element (SE) + TrustZone |
-| **Target** | `thumbv7em-none-eabi` | `thumbv8m.main-none-eabihf` |
-| **Flash page size** | 2 KB | 8 KB |
+Both use the shared `SensorApp`; their boards, products, clocks, storage, and
+power behavior are intentionally separate.
 
-### Why EFR32?
+## EFR32MG1P TRÅDFRI
 
-- **Ubiquitous** — used in IKEA TRÅDFRI, Sonoff, and many commercial Zigbee products
-- **Pure Rust** — zigbee-rs needs no GSDK, no RAIL library, no vendor blobs
-- **Well-documented** — Silicon Labs reference manuals available for register-level programming
-- **Excellent radio** — high sensitivity, good range, mature 802.15.4 support
+### Layering and fitted hardware
 
-### Common Boards and Modules
-
-| Board | Series | Form Factor | Notes |
-|-------|--------|-------------|-------|
-| **IKEA TRÅDFRI modules** | Series 1 | PCB modules | EFR32MG1P, widely available |
-| **Thunderboard Sense (BRD4151A)** | Series 1 | Dev board | EFR32MG1P + sensors |
-| **BRD4100A** | Series 1 | Radio board | EFR32MG1P evaluation |
-| **BRD4180A** | Series 2 | Radio board | EFR32MG21A020F1024IM32 |
-| **BRD4181A** | Series 2 | Radio board | EFR32MG21A020F512IM32 |
-| **Sonoff ZBDongle-E** | Series 2 | USB dongle | EFR32MG21, popular coordinator |
-
-### Series 1 vs Series 2 Register Differences
-
-The two series have different peripheral base addresses, requiring separate
-MAC modules (`efr32/` and `efr32s2/`):
-
-| Peripheral | Series 1 Base | Series 2 Base |
-|-----------|--------------|--------------|
-| Radio (RAC, FRC, MODEM, etc.) | `0x40080000–0x40087FFF` | `0x40090000–0x40095FFF` |
-| CMU (Clock Management Unit) | `0x400E4000` | `0x40008000` |
-| GPIO | `0x4000A000` | `0x4003C000` |
-| MSC (Flash Controller) | `0x400E0000` | `0x40030000` |
-
-## Prerequisites
-
-### Rust Toolchain
-
-```bash
-rustup default nightly
-rustup update nightly
-
-# Series 1 (MG1P — Cortex-M4F)
-rustup target add thumbv7em-none-eabi
-
-# Series 2 (MG21 — Cortex-M33)
-rustup target add thumbv8m.main-none-eabihf
-
-# rust-src for build-std
-rustup component add rust-src
+```text
+efr32mg1-hal + Efr32Mac
+        ↓
+boards/efr32mg1-tradfri
+        ↓
+products/efr32mg1-tradfri
+        ↓
+examples/efr32mg1-sensor
 ```
 
-### No Vendor SDK Required!
+The typed board resources keep fitted peripherals independently testable:
 
-Unlike the traditional Silicon Labs development flow (which requires GSDK +
-RAIL library + Simplicity Studio), the zigbee-rs EFR32 backends need **no
-vendor libraries, no SDK download, no environment variables**. Everything is
-in Rust.
+| resource | wiring |
+|---|---|
+| direct or TIMER0 PWM LED | PA0, active high |
+| user button | PB13, active low |
+| SHT3x I²C | I2C0, PC10 SDA / PC11 SCL, 10 kHz |
+| supply measurement | ADC0 AVDD |
+| direct external flash | USART0: PD13 CLK, PD14 MISO, PD15 MOSI, PB11 CS |
+| wake timer | RTCC/LFRCO |
 
-### Debug Probe
+Direct USART0 access and Gecko Bootloader storage access consume alternative
+owners of the same external-flash path. They cannot coexist through the typed
+board API.
 
-Any ARM SWD debugger works:
+The product owns identity, profile, battery chemistry, sensor mapping, policy,
+linker regions, persistence, and Gecko Bootloader OTA selection.
 
-- **J-Link** — included with Silicon Labs dev kits
-- **ST-Link** — widely available, inexpensive
-- **DAPLink / CMSIS-DAP** — open-source, many options
-- **probe-rs** — recommended Rust-native tool
+### Power and lifecycle
 
-## Building
+The product policy selects:
 
-### EFR32MG1P (Series 1)
+```text
+fast wait: Active
+slow wait: Retention
+```
+
+Fast commissioning/interview/OTA windows remain active. Joined steady-state
+polls use RTCC/LFRCO wake and EM2 after the platform has quiesced the radio and
+applied the Series-1 DCDC safety gate. PB13 remains an external wake source.
+
+The shared app routes OTA first, checkpoints security, and only then calls the
+product activation backend.
+
+### Memory
+
+The product linker layout preserves bootloader, application, generic NV, and
+security regions. The usable SRAM region is exactly `0x7C00` bytes. It is not
+the nominal rounded 32 KiB total.
+
+Current release measurement:
+
+| value | bytes |
+|---|---:|
+| raw image | 156,612 |
+| static `.data + .bss` | 14,912 |
+
+### Validation
+
+Hardware-proven:
+
+- commissioning and security;
+- CRYPTO hardware AES;
+- ZHA interview/reporting;
+- SHT3x and supply/battery measurement;
+- Identify and button behavior;
+- crash-safe persistence and reset/resume;
+- RTCC wake and EM2.
+
+Still open: a real Zigbee OTA download, bootloader install, reboot into the new
+version, and retained commissioned state.
+
+## EFR32MG21 BRD4181A
+
+### Exact target
+
+| item | value |
+|---|---|
+| radio board | BRD4181A |
+| main board | BRD4001A |
+| MCU | EFR32MG21A020F512IM32 |
+| HFXO | 38.4 MHz |
+| HFXO CTUNE | 133 |
+| LED0 | PB0, active high |
+| BTN0 | PD2, active low |
+
+These are the fitted BRD4181A pins. Other Series-2 kit pin maps do not apply.
+BRD4001A provides BTN0's external bias, so the board adapter uses no internal
+pull and routes PD2 through EXTI line 2.
+
+### Composition and power
+
+```text
+efr32mg21-hal + Efr32s2Mac
+        ↓
+boards/efr32mg21-devkit
+        ↓
+products/efr32mg21-sensor
+        ↓
+examples/efr32mg21-sensor
+```
+
+The product uses a non-OTA environmental profile, `NoOta`, synthetic
+temperature/humidity, a fixed 3000 mV battery value, and `Idle` for both fast
+and slow waits.
+
+`Idle` is radio-gated WFE driven by the real 1 kHz SysTick. It is not EM2 and
+no deep-sleep current is claimed.
+
+### Memory layout
+
+```text
+0x00000000..0x00004000  bootloader
+0x00004000..0x0007C000  application
+0x0007C000..0x00080000  persistence
+```
+
+The 16 KiB persistence window is two 8 KiB security-journal sectors.
+
+Current release measurement:
+
+| value | bytes |
+|---|---:|
+| raw image | 203,180 |
+| static `.data + .bss` | 17,136 |
+
+### Build
+
+Both products use `nightly-2026-03-23`:
 
 ```bash
 cd examples/efr32mg1-sensor
-cargo build --release
-```
+cargo +nightly-2026-03-23 build --release --locked
+python3 tools/verify-layout.py \
+  target/thumbv7em-none-eabi/release/efr32mg1-sensor
 
-The MG1 production package always builds the sleepy end device. Explicitly
-named hardware diagnostics are built separately, for example:
-
-```bash
-cd tools/efr32mg1-lab
-cargo build --release --bin efr32mg1-diag-sht
-```
-
-### EFR32MG21 (Series 2)
-
-```bash
-cd examples/efr32mg21-sensor
-cargo build --release
-```
-
-No `--features stubs` required — both projects build without any external
-libraries.
-
-### CI Build
-
-Both targets build in CI alongside the other 11 firmware targets. The CI
-workflow extracts `.bin` and `.hex` artifacts from the ELF output:
-
-```bash
-OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-$OBJCOPY -O binary $ELF ${ELF}.bin
-$OBJCOPY -O ihex   $ELF ${ELF}.hex
-```
-
-## Flashing
-
-### EFR32MG1P (Series 1)
-
-```bash
-# With probe-rs
-probe-rs run --chip EFR32MG1P target/thumbv7em-none-eabi/release/efr32mg1-sensor
-
-# With openocd
-openocd -f interface/cmsis-dap.cfg -f target/efm32.cfg \
-  -c "program target/thumbv7em-none-eabi/release/efr32mg1-sensor verify reset exit"
-
-# With Simplicity Commander (Silicon Labs tool)
-commander flash target/thumbv7em-none-eabi/release/efr32mg1-sensor.hex
-```
-
-### EFR32MG21 (Series 2)
-
-```bash
-# With probe-rs
-probe-rs run --chip EFR32MG21A020F512IM32 \
+cd ../efr32mg21-sensor
+cargo +nightly-2026-03-23 build --release --locked
+python3 tools/verify-layout.py \
   target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor
-
-# With openocd
-openocd -f interface/cmsis-dap.cfg -f target/efm32.cfg \
-  -c "program target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor verify reset exit"
-
-# With Simplicity Commander
-commander flash target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.hex
 ```
 
-## Pure-Rust Radio Driver
-
-Both EFR32 backends use direct register access for the radio — no RAIL
-library, no co-processor mailbox protocol. The radio hardware consists of
-several interconnected blocks:
-
-| Block | Function |
-|-------|----------|
-| **RAC** | Radio Controller — state machine, PA |
-| **FRC** | Frame Controller — CRC, format |
-| **MODEM** | O-QPSK modulation/demodulation |
-| **SYNTH** | PLL frequency synthesizer |
-| **AGC** | Automatic gain control, RSSI |
-| **BUFC** | TX/RX buffer controller |
-
-All blocks are configured via memory-mapped registers. The Series 1 and
-Series 2 register maps are structurally similar but use different base
-addresses (see table above), which is why they live in separate MAC modules.
-
-### MAC Backend Structure
-
-```
-zigbee-mac/src/
-├── efr32/             # Series 1 (EFR32MG1P)
-│   ├── mod.rs         # Efr32Mac struct, MacDriver trait impl
-│   └── driver.rs      # Efr32Driver — pure-Rust register-level radio driver
-└── efr32s2/           # Series 2 (EFR32MG21)
-    ├── mod.rs         # Efr32S2Mac struct, MacDriver trait impl
-    └── driver.rs      # Efr32S2Driver — pure-Rust register-level radio driver
-```
-
-### Feature Flags
-
-```toml
-# Series 1 (MG1P)
-zigbee-mac = { features = ["efr32", "hardware-aes-efr32mg1"] }
-
-# Series 2 (MG21)
-zigbee-mac = { features = ["efr32s2"] }
-```
-
-The production MG1 sensor always installs the token-owned CRYPTO accelerator.
-Two different AES-128 known-answer tests run before Zigbee security starts,
-and failures stop startup rather than falling back to software AES.
-
-## Power Management
-
-Both EFR32 platforms implement radio sleep/wake via the **CMU (Clock
-Management Unit)**. The hardware-proven MG1P SED additionally uses an
-RTCC/LFRCO time driver and enters EM2 between parent polls. Arming RTCC CC1,
-clearing stale compare state, and entering EM2 happen in one interrupt-masked
-sequence so a wake event cannot be lost between the final check and sleep:
-
-```rust
-device.mac_mut().radio_sleep();
-pm::sleep_for_ticks(pm::ms_to_ticks(poll_ms, pm::LFRCO_HZ))?;
-device.mac_mut().radio_wake();
-```
-
-The CMU register addresses differ between Series 1 and Series 2 (see
-register table above), but the sleep/wake interface is identical.
-
-Series 2 still uses radio clock gating only; its deep-sleep path remains
-hardware-unverified.
-
-See the [Power Management](../advanced/power.md) chapter for the full
-cross-platform power framework.
-
-## What the Examples Demonstrate
-
-Both `efr32mg1-sensor` and `efr32mg21-sensor` implement a Zigbee 3.0
-temperature & humidity end device with:
-
-- **Pure-Rust IEEE 802.15.4 radio driver** (no RAIL/GSDK)
-- MG1 CRYPTO-backed AES-128 for NWK/APS CCM* and Trust Center key derivation
-- Embassy async runtime (RTCC/LFRCO on MG1P; SysTick on MG21)
-- Proper interrupt vector table (34 IRQs for MG1P, 51 for MG21)
-- MG1P PB13 interrupt wake from EM2; short press samples sensors and a
-  three-second hold performs factory reset
-- LED status indication + Identify blink
-- ZCL Temperature Measurement + Relative Humidity + Identify clusters
-- MG1P ADC0 AVDD battery measurement and Power Configuration reporting
-- Flash NV storage — network state persists across reboots
-- Default reporting with reportable change thresholds
-- MG1P RTCC/EM2 sleepy polling; radio sleep/wake on both series
-- MG1 Gecko Bootloader OTA client, including server-to-client foundation
-  attribute reads used by ZHA during interview
-- Interview completion detected from the runtime's *remote* reporting record
-  (`ZigbeeNode::remote_reporting_is_complete()`), never from the local
-  reporting engine. The `INTERVIEW_CONFIGURATION_TIMEOUT_SECS` fallback still
-  installs this product's default reporting so a device nobody interviewed
-  keeps reporting, and logs `INTERVIEW_TIMEOUT_USING_DEFAULT_REPORTING
-  remote_clusters=n/m` so the fallback is never mistaken for a completed
-  coordinator interview (`INTERVIEW_CONFIGURED remote_clusters=n/m`).
-
-## EFR32MG1 Hardware Acceptance
-
-The production MG1 image has completed the full end-device path against Home
-Assistant ZHA/Ember on channel 15:
-
-- two startup hardware-AES KATs, association, Transport-Key, Device Announce,
-  End Device Timeout, Request-Key, Verify-Key, and Confirm-Key;
-- Node, Active Endpoint, Simple, Power, Basic, Identify, measurement, and OTA
-  descriptor/attribute interview;
-- Configure Reporting, encrypted temperature/humidity/battery reports, and
-  Identify commands;
-- RTCC/LFRCO polling with EM2 sleep and PB13 interrupt wake;
-- crash-safe security-counter reservation and reset/resume without Beacon
-  Request, Association Request, Rejoin Request, or Device Announce.
-
-The BUFC RX ring is a 512-byte, word-aligned allocation. TX uses 128 bytes
-and RX metadata uses 64 bytes. A linked-ELF gate checks these geometry
-constraints and requires at least 16 KiB of stack. The accepted runtime image
-retained 4,832 bytes of measured stack margin after
-commissioning, interview, reporting, EM2, reset/resume, and Identify traffic.
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `probe-rs` can't connect | Wrong chip name | Use `EFR32MG1P` (S1) or `EFR32MG21A020F512IM32` (S2) |
-| Flash write fails (MG21) | Wrong page size | Series 2 uses 8 KB pages (vs 2 KB for Series 1) |
-| Radio not working | Platform or clock setup | MG1 requires the board-specific HFXO/radio sequence; MG21 remains hardware-unverified |
-| Build fails with linker errors | Wrong target | Use `thumbv7em-none-eabi` (S1) or `thumbv8m.main-none-eabihf` (S2) |
-| No serial output | No logger configured | Add a defmt or RTT logger for debug output |
-
-### Known Limitations
-
-- **Series 1 status** — the EFR32MG1P path is hardware-proven through
-  hardware-AES commissioning, complete ZHA interview including the OTA client,
-  real SHT3x reporting, Identify, silent reset/resume, secure rejoin, RTCC/EM2
-  polling, and PB13 interrupt wake. Hardware reset cycles also proved the
-  two-sector security-journal rollover with monotonic counter reservations and
-  no invalid records. The TRÅDFRI linker preserves the resident bootloader and
-  native NVM3 while reserving separate Rust security-journal and application-NV
-  regions. Installing a real OTA image and booting the upgraded application is
-  still pending.
-- **Series 2 status** — the EFR32MG21 pure-Rust radio initialization remains
-  hardware-unverified.
-- **Board-specific sensing** — the proven TRÅDFRI MG1 target reads a real SHT3x
-  on I2C0 PC10/PC11 and measures AVDD through ADC0. Other EFR examples may
-  still use placeholder values.
-- **Series 2 deep sleep** — the MG21 path has not yet received the hardware-
-  proven RTCC/EM2 integration used by MG1P.
-
----
-
-## Why Pure Rust on EFR32 Matters
-
-The traditional Silicon Labs development flow requires:
-- **GSDK** (Gecko SDK) — a large multi-GB SDK download
-- **RAIL library** — pre-compiled radio abstraction layer (binary blob)
-- **Simplicity Studio** — Eclipse-based IDE
-
-The zigbee-rs pure-Rust approach eliminates all of this. The radio is
-configured entirely through documented memory-mapped registers, making the
-firmware:
-
-1. **Fully auditable** — every line of radio code is visible
-2. **Trivially reproducible** — just `cargo build`, no SDK setup
-3. **Vendor-independent** — no binary blobs, no license restrictions
-4. **Small** — no unused vendor code linked in
-
-This is the 3rd and 4th pure-Rust radio driver in zigbee-rs (after PHY6222
-and TLSR8258), demonstrating that the approach scales across chip families.
+MG21 currently passes compile, clippy, image, linker, and persistence-layout
+checks. Its complete startup/radio/join/flash/power path remains
+HIL-unverified.

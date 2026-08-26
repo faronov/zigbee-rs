@@ -83,17 +83,73 @@ impl WakeController<SensorMac> for NrfWakeController {
     }
 }
 
-pub struct NrfStatus {
-    led: gpio::Output<'static>,
-}
+/// Timer-only Nordic wait adapter for boards without a usable application
+/// button.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NrfTimerWakeController;
 
-impl NrfStatus {
-    pub const fn new(led: gpio::Output<'static>) -> Self {
-        Self { led }
+impl WakeController<SensorMac> for NrfTimerWakeController {
+    type Mark = Instant;
+    type Error = MacError;
+
+    fn mark(&self) -> Self::Mark {
+        Instant::now()
+    }
+
+    fn add_ms(mark: Self::Mark, duration_ms: u32) -> Self::Mark {
+        mark + Duration::from_millis(u64::from(duration_ms))
+    }
+
+    fn elapsed_ms(later: Self::Mark, earlier: Self::Mark) -> u32 {
+        later
+            .saturating_duration_since(earlier)
+            .as_millis()
+            .min(u64::from(u32::MAX)) as u32
+    }
+
+    async fn wait(
+        &mut self,
+        mac: &mut SensorMac,
+        request: WaitRequest,
+    ) -> Result<WakeReason, Self::Error> {
+        match request.sleep_depth {
+            SleepDepth::Active => {}
+            SleepDepth::Idle => mac.enter_low_power_idle()?,
+            SleepDepth::Retention => return Err(MacError::Unsupported),
+        }
+        Timer::after(Duration::from_millis(u64::from(request.timeout_ms))).await;
+        Ok(WakeReason::Timer)
+    }
+
+    async fn button_held_for(&mut self, _duration_ms: u32) -> bool {
+        false
+    }
+
+    async fn delay_ms(&mut self, duration_ms: u32) {
+        Timer::after(Duration::from_millis(u64::from(duration_ms))).await;
     }
 }
 
-impl StatusSink for NrfStatus {
+/// Polarity-aware Nordic semantic status LED.
+pub struct NrfPolarityStatus<const ACTIVE_LOW: bool> {
+    led: gpio::Output<'static>,
+}
+
+impl<const ACTIVE_LOW: bool> NrfPolarityStatus<ACTIVE_LOW> {
+    pub const fn new(led: gpio::Output<'static>) -> Self {
+        Self { led }
+    }
+
+    fn set_on(&mut self, on: bool) {
+        if on == ACTIVE_LOW {
+            self.led.set_low();
+        } else {
+            self.led.set_high();
+        }
+    }
+}
+
+impl<const ACTIVE_LOW: bool> StatusSink for NrfPolarityStatus<ACTIVE_LOW> {
     fn set(&mut self, status: SensorStatus) {
         let on = match status {
             SensorStatus::Off => false,
@@ -104,13 +160,12 @@ impl StatusSink for NrfStatus {
             SensorStatus::Joined { active } => active,
             SensorStatus::Ota | SensorStatus::Fault => true,
         };
-        if on {
-            self.led.set_low();
-        } else {
-            self.led.set_high();
-        }
+        self.set_on(on);
     }
 }
+
+/// Source-compatible active-low status adapter for the Nordic DKs.
+pub type NrfStatus = NrfPolarityStatus<true>;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NrfSupervisor;

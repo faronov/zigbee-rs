@@ -219,6 +219,16 @@ impl PersistentSecurityState {
         }
     }
 
+    /// Whether this record describes the PAN coordinator itself.
+    ///
+    /// A coordinator owns short address `0x0000`, has depth zero, and has no
+    /// parent. This shape is unambiguous in a Zigbee network and lets the
+    /// existing record format represent a coordinator without inventing a
+    /// self-referential Trust Center link key or consuming another format bit.
+    pub(crate) const fn is_coordinator_network(&self) -> bool {
+        self.short_address == 0x0000 && self.depth == 0 && self.parent_address == 0xFFFF
+    }
+
     pub fn encode(&self, output: &mut [u8; ENCODED_SECURITY_STATE_LEN]) {
         output.fill(0);
         output[0] = (if self.commissioned {
@@ -354,13 +364,32 @@ impl PersistentSecurityState {
     }
 
     pub fn validate(&self) -> Result<(), SecurityStoreError> {
+        let coordinator = self.is_coordinator_network();
         if self.commissioned
             && (!(11..=26).contains(&self.channel)
                 || self.pan_id == 0xFFFF
                 || self.short_address == 0xFFFF
                 || self.ieee_address == [0; 8]
                 || self.global_counter_limit == 0
-                || !(self.tclk_present || self.legacy_default_tclk))
+                || !(coordinator || self.tclk_present || self.legacy_default_tclk))
+        {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        // The coordinator is the Trust Center; it never holds a unique TCLK
+        // with itself and never has an end-device parent relationship. Keep
+        // those representations disjoint so a corrupt leaf record cannot be
+        // reinterpreted as a coordinator merely because it carries address 0.
+        if coordinator
+            && (self.tclk_present
+                || self.legacy_default_tclk
+                || self.trust_center_address != [0; 8]
+                || self.trust_center_link_key != [0; 16]
+                || self.tclk_incoming_counter != 0
+                || self.tclk_incoming_counter_valid
+                || self.rejoin_pending
+                || self.parent_information != 0
+                || self.parent_information_valid
+                || self.end_device_timeout != ED_TIMEOUT_ENUM_DEFAULT)
         {
             return Err(SecurityStoreError::Corrupt);
         }
@@ -444,6 +473,42 @@ impl<'a, S: SecurityStateStore> CommissioningSecurityPersistence<'a, S> {
 
     pub(crate) fn take_error(&mut self) -> Option<SecurityStoreError> {
         self.last_error.take()
+    }
+
+    #[cfg(any(feature = "router", test))]
+    pub(crate) fn reserve_coordinator_network_security(
+        &mut self,
+        state: &NetworkSecurityState,
+    ) -> Result<CounterReservation, SecurityStoreError> {
+        match <Self as SecurityPersistence>::reserve_network_security(self, state) {
+            Ok(reservation) => Ok(reservation),
+            Err(SecurityPersistenceError::Storage) => {
+                Err(self.take_error().unwrap_or(SecurityStoreError::Hardware))
+            }
+            Err(SecurityPersistenceError::CounterExhausted) => {
+                Err(SecurityStoreError::CounterExhausted)
+            }
+            Err(SecurityPersistenceError::InvalidState) => Err(SecurityStoreError::Corrupt),
+        }
+    }
+
+    /// Mark a freshly formed coordinator network as committed.
+    ///
+    /// Network formation has no unique-TCLK exchange: the coordinator is the
+    /// Trust Center. The network reservation must already be durable and
+    /// installed in the live NIB before this transition is committed.
+    #[cfg(any(feature = "router", test))]
+    pub(crate) fn commit_coordinator_network(&mut self) -> Result<(), SecurityStoreError> {
+        if !self.state.is_coordinator_network()
+            || self.state.tclk_present
+            || self.state.legacy_default_tclk
+        {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        self.state.commissioned = true;
+        self.state.rejoin_pending = false;
+        self.state.validate()?;
+        self.store.store(&self.state)
     }
 
     fn reserve_from(
@@ -738,6 +803,37 @@ mod tests {
         assert!(!state.update_id_valid);
         assert_eq!(state.update_id, 0);
         assert_eq!(state.validate(), Ok(()));
+    }
+
+    #[test]
+    fn coordinator_state_needs_no_self_tclk_and_round_trips() {
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.extended_pan_id = [1; 8];
+        state.pan_id = 0x1234;
+        state.short_address = 0x0000;
+        state.ieee_address = [2; 8];
+        state.channel = 15;
+        state.depth = 0;
+        state.parent_address = 0xFFFF;
+        state.update_id = 3;
+        state.update_id_valid = true;
+        state.network_key = [4; 16];
+        state.global_counter_limit = 0x400;
+        assert!(state.is_coordinator_network());
+        assert_eq!(state.validate(), Ok(()));
+
+        let mut encoded = [0u8; ENCODED_SECURITY_STATE_LEN];
+        state.encode(&mut encoded);
+        assert_eq!(PersistentSecurityState::decode(&encoded), Ok(state));
+
+        // An interrupted coordinator reservation is intentionally still
+        // readable: the next boot forms a new PAN while preserving the
+        // abandoned counter floor.
+        state.commissioned = false;
+        assert_eq!(state.validate(), Ok(()));
+        state.encode(&mut encoded);
+        assert_eq!(PersistentSecurityState::decode(&encoded), Ok(state));
     }
 
     #[test]

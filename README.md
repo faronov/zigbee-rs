@@ -1,489 +1,225 @@
 # zigbee-rs
 
-A complete Zigbee PRO R22 protocol stack written in Rust, targeting embedded
-`no_std` environments. Built on `async` traits for seamless integration with
-Embassy and other embedded async runtimes.
+Heap-free, `no_std`, pure-Rust Zigbee PRO for embedded devices.
 
-> **Specification roadmap:** Zigbee PRO R22 with BDB 3.0.1 remains the active
-> production target. R23/BDB 3.1 is a deferred, optional roadmap item rather
-> than a current release goal. R23 support must remain compile-time isolated
-> so it adds no code or RAM to R22 products.
-
-> **Role-specialized firmware:** sensor builds compile out parent/router
-> maintenance and parent state rather than carrying dormant code. With the
-> pinned `tc32-45` toolchain, the current hardware-AES TLSR8258 release images
-> are 269,960 bytes for the end-device sensor and 327,760 bytes for the parent
-> router.
-> See the [firmware-size report](docs/book/src/advanced/firmware-size.md).
-
-```text
-63,000+ lines of Rust · 199 source files · 30 crates · 45 ZCL clusters · 12 hardware platforms · 300+ tests · 5 pure-Rust radios · crash-safe NV storage across nRF, ESP32, BL702, and TLSR8258
-```
+This worktree is the final cross-platform application-model migration on
+`experiment/zephyr-app-model`. The source documentation is authoritative for
+this branch. GitHub Pages is deployed only from `main`/`master`, so these pages
+will not appear at the public Pages URL until the branch is merged and the
+documentation workflow deploys it.
 
 ## Architecture
 
+Dependencies and ownership flow in one direction:
+
 ```text
-┌──────────────────────────────────────────────────────┐
-│                    zigbee (top)                       │
-│           coordinator · router · re-exports           │
-├──────────────────────────────────────────────────────┤
-│  zigbee-runtime   │  zigbee-bdb    │  zigbee-zcl     │
-│  builder, power,  │  commissioning │  45 clusters,    │
-│  NV storage,      │  steering,     │  foundation,     │
-│  device templates  │  formation     │  reporting       │
-├───────────────────┴────────────────┴─────────────────┤
-│                    zigbee-zdo                          │
-│          discovery · binding · network mgmt           │
-├──────────────────────────────────────────────────────┤
-│                    zigbee-aps                          │
-│          frames · binding · groups · security         │
-├──────────────────────────────────────────────────────┤
-│                    zigbee-nwk                          │
-│      frames · routing (AODV+tree) · security · NIB   │
-├──────────────────────────────────────────────────────┤
-│                    zigbee-mac                          │
-│  MacDriver trait · 12 backends (see table below)     │
-├──────────────────────────────────────────────────────┤
-│           zigbee-crypto · zigbee-types                │
-│ low-stack AES-CCM* · addresses · PANs · channels     │
-└──────────────────────────────────────────────────────┘
+platform/chip HAL + MacDriver
+        ↓
+board resources and fitted wiring
+        ↓
+product identity/profile/policy/storage/linker/OTA
+        ↓
+sensor-sed or router-app composition root
 ```
 
-## Quick Start
+The Zigbee protocol path remains shared:
 
-### Mock examples (no hardware needed)
+```text
+application profile
+        |
+zigbee-runtime::ZigbeeNode
+        |
+BDB -> ZCL/ZDO -> APS -> NWK -> MAC
+        |
+platform radio backend
+```
+
+- **HAL/MAC crates** own clocks, GPIO, buses, timers, flash controllers,
+  radio mechanisms, and `MacDriver` implementations.
+- **Board crates** own physical pins and fitted peripherals. They expose typed
+  resources and do not depend on `zigbee-runtime`.
+- **Product crates** own manufacturer/model identity, endpoint profile,
+  battery and scheduling policy, protected partitions, linker layout,
+  persistence, and OTA/bootloader selection.
+- **`apps/sensor-sed` and `apps/router`** own reusable commissioning,
+  receive/tick processing, reporting, persistence integration, and lifecycle
+  behavior.
+- **Example `main.rs` files** are composition roots: platform startup,
+  resource construction, and the outer executor/event loop.
+
+The detailed design is in the
+[architecture chapter](docs/book/src/getting-started/architecture.md).
+
+## Sleepy sensor application
+
+`sensor_sed_app::SensorApp` receives one explicit ownership bundle:
+
+```rust,ignore
+let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
+let mut app = SensorApp::new(
+    node,
+    &product::policy::SENSOR_POLICY,
+    SensorSedParts {
+        wake,
+        status,
+        environment,
+        battery,
+        ota,
+        actions,
+        supervisor,
+        diagnostics,
+    },
+)?;
+```
+
+`SensorSedParts` is a bundle, not a platform provider: it has no resource
+lookup, constructors, MAC, profile, store, or product policy. Each field is a
+narrow capability with visible ownership.
+
+`SensorPolicy` independently selects `fast_sleep_depth` and
+`slow_sleep_depth` as `Active`, `Idle`, or `Retention`. The shared application
+arbitrates parent polls, stack deadlines, reporting, status, user input,
+watchdog service, and OTA deadlines into one bounded wait.
+
+The lifecycle can be embedded in another scheduler:
+
+```rust,ignore
+app.initialize().await?; // one finite boot/resume transition
+loop {
+    app.step().await?;    // one finite wait/service iteration
+}
+// app.run().await is convenience sugar for the same sequence.
+```
+
+OTA events are routed to the selected `OtaLifecycle` before generic event
+matching. Reset-causing activation happens only after the shared lifecycle has
+checkpointed security state. `NoOta` is accepted only for a profile that
+statically implements `NonOtaProfile`.
+
+`NoStatus::PRESENT` is `false`; status-only blink deadlines and waits compile
+out rather than becoming no-op runtime work.
+
+## Router and coordinator applications
+
+The shared router application exposes role-safe frontends:
+
+| frontend | runtime role | child capability | permitted startup |
+|---|---|---|---|
+| `AlwaysOnEndDeviceApp` | `EndDevice` | none | steering/resume only |
+| `RelayRouterApp` | `RelayRouter` | `NoChildren` | steering/resume only |
+| `ParentRouterApp` | `Router` | `PersistentChildren` | steering/resume only |
+| `CoordinatorApp` | `Router` | `PersistentChildren` | formation or persisted-PAN restart |
+
+```rust,ignore
+let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
+let mut end_device = AlwaysOnEndDeviceApp::new(
+    node,
+    &product::policy::ALWAYS_ON_END_DEVICE_POLICY,
+    RouterParts::new(status, supervisor, diagnostics),
+)?;
+
+end_device.initialize().await?;
+let events = end_device.step().await?;
+```
+
+`AlwaysOnEndDeviceApp` requires only `MacDriver`. Every frontend that
+advertises `DeviceType::Router` requires both the `router` feature and
+`ParentMacDriver`; a backend without parent-side association and
+indirect-delivery primitives cannot construct one. The nRF52840 example is
+therefore an always-on End Device. `router-app` has no default features:
+parent/relay/coordinator products must explicitly enable
+`router-app/features = ["router"]`, while End Device products compile without
+route, parent, or child-table capacities.
+
+All four frontends provide finite `initialize()` and `step()` operations plus
+the infinite `run()` convenience wrapper.
+
+## Why the configuration is static
+
+There is no devicetree, Kconfig, heap allocator, runtime hardware discovery,
+or broad “platform” god trait in the embedded application path.
+
+- Rust board/product types encode wiring, identity, layout, and policy.
+- Cargo features select genuinely alternative hardware or image variants.
+- Narrow traits describe one capability at a time.
+- Concrete generic types preserve ownership and let the linker remove unused
+  peripherals, status behavior, OTA, parent support, and diagnostics.
+- `heapless` and fixed-capacity tables bound memory use.
+
+Public application composition uses no trait objects or allocation.
+`zigbee-runtime` has one tightly scoped internal
+`Pin<&mut dyn Future<...>>` outlining path used to control TC32 code size; it
+does not allocate and is not a platform abstraction.
+
+## Porting a product
+
+Keep the shared application and protocol crates unchanged:
+
+1. Implement or reuse the chip HAL, monotonic clock, flash controller, radio,
+   and `MacDriver`.
+2. Add a board crate that maps fitted pins and returns typed resources.
+3. Add a product crate that selects identity, profile, policy, protected
+   storage, linker layout, and optional OTA backend.
+4. Implement the narrow application adapters required by `SensorSedParts` or
+   `RouterParts`.
+5. Compose them in a short example `main.rs`.
+6. Prove startup and raw 802.15.4 first, then scan, association, Zigbee
+   security, interview/reporting, reset/resume, sleep, and OTA as separate
+   hardware gates.
+
+Only board/platform adapters and product choices should change when the same
+sensor or router behavior is moved to a new MCU.
+
+## Current targets
+
+“Build” means the pinned release image compiles and passes its layout checks;
+it is not a hardware claim.
+
+| target | role/application | build | hardware validation |
+|---|---|---:|---|
+| nRF52840 DK | environmental SED | yes | commissioning, reporting, AES, persistence, and reset/resume proven |
+| nRF52833 DK | environmental SED | yes | commissioning, reporting, AES, persistence, and reset/resume proven |
+| nRF52840 DK | always-on End Device | yes | commissioning/resume and continuous-RX HIL remain open |
+| ESP32-C6 | environmental SED + optional OTA | yes | OTA transfer reached 18.3%; complete activation still open |
+| ESP32-H2 | environmental SED + optional OTA | yes | v1→v2 OTA activation, reboot, and commissioned-state retention proven |
+| BL702 XT-ZB1 | environmental SED | yes | radio/commissioning/interview proven; destructive flash persistence validation open |
+| PHY6222/PHY6252 EVK | environmental SED | yes | complete radio/join/persistence path remains hardware-unverified |
+| CC2340R5 | environmental SED | yes | radio HIL and entropy backend remain open; commissioning fails closed |
+| EFR32MG1P TRÅDFRI | environmental SED | yes | commissioning, interview, sensors, persistence, reset/resume, and EM2 proven; real OTA install open |
+| EFR32MG21 BRD4181A | environmental SED | yes | complete hardware path remains HIL-unverified |
+| TLSR8258 TB-04 | environmental SED | yes | default SUSPEND primitive proven; repeated application-level sleep/network HIL remains open |
+| TLSR8258 TB-04 | child-capable router | yes | join, restart, Link Status, and relay proven; corrected-image first-attempt child acceptance remains open |
+
+See [BUILD.md](BUILD.md) for pinned commands, measured images, partition
+boundaries, and exact remaining gates.
+
+## Quick host checks
+
+The general toolchain is pinned to `nightly-2026-03-23`:
 
 ```bash
-# Temperature + humidity sensor simulation
-cargo run -p mock-sensor
-
-# Coordinator (network formation + device join)
-cargo run -p mock-coordinator
-
-# Dimmable light
-cargo run -p mock-light
-
-# Sleepy end device (full SED lifecycle)
-cargo run -p mock-sleepy-sensor
+cargo +nightly-2026-03-23 test --workspace --locked
+cargo +nightly-2026-03-23 test -p sensor-sed-app --features ota --locked
+cargo +nightly-2026-03-23 test -p zigbee-runtime --features router --locked
+cargo +nightly-2026-03-23 clippy --workspace --all-targets --locked -- -D warnings
+cargo +nightly-2026-03-23 fmt --all -- --check
 ```
 
-### Build the entire workspace
-
-```bash
-cargo build
-cargo test
-```
-
-### ESP32-C6 / ESP32-H2 firmware
-
-```bash
-cd examples/esp32c6-sensor   # or esp32h2-sensor
-cargo build --release -Z build-std=core,alloc
-espflash flash target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
-```
-
-Or flash via the [web flasher](https://faronov.github.io/zigbee-rs/) (no tools needed, just a browser with Web Serial).
-
-### nRF52840 firmware (with debug probe)
-
-```bash
-cd examples/nrf52840-sensor
-# Default (on-chip temp):
-cargo build --release
-# With BME280 sensor (temp + humidity + pressure):
-cargo build --release --features sensor-bme280
-# With SHT31 sensor (temp + humidity):
-cargo build --release --features sensor-sht31
-probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-sensor
-```
-
-### nRF52840 router (with debug probe)
-
-```bash
-cd examples/nrf52840-router
-cargo build --release
-probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-router
-```
-
-> **Router mode** — joins as an always-on FFD, relays frames, and sends
-> periodic Link Status broadcasts. Child association is not implemented yet.
-
-### Telink TLSR8258 parent router — EXPERIMENTAL
-
-```bash
-./scripts/tlsr8258.sh build router
-./scripts/tlsr8258.sh flash router
-```
-
-> **Router mode (Telink)** — joins as an FFD, relays routed and broadcast NWK
-> traffic, sends router maintenance frames, responds to beacon requests, and
-> admits polling sleepy children while permit joining is open. Association
-> Response delivery, Trust Center Update-Device/Tunnel handling, indirect
-> queues, child authorization, and rejoin are implemented. ZHA join,
-> TCLK exchange, interview, Identify, routed-frame relay, and silent
-> reset/resume are hardware-proven. The reset capture contained no scan,
-> association, or Device_annce traffic. Parent timing and Frame Pending still
-> require the child-device sniffer gate documented in
-> `examples/telink-tlsr8258-router/README.md`.
-
-> **Flash NV storage** — network state is saved to internal flash (last 8 KB) and automatically
-> restored on power-up. No re-pairing after power cycles!
-
-### nRF52840 firmware (nice!nano / ProMicro — UF2 drag-and-drop)
-
-```bash
-cd examples/nrf52840-sensor-uf2
-cargo build --release
-# Convert to UF2 (CI does this automatically):
-# uf2conv.py -c -f 0xADA52840 -b 0x26000 firmware.bin -o firmware.uf2
-# Double-tap RESET → copy .uf2 to the "NICENANO" USB drive
-```
-
-### BL702 firmware
-
-```bash
-cd examples/bl702-sensor
-python3 -m pip install bflb-mcu-tool==1.10.0 pyserial
-./build-image.sh
-```
-
-This builds a pure-Rust XT-ZB1 sleepy Zigbee sensor with live
-ACAL/KCAL/ROSCAL/RCCAL, polling RX/TX, CCA, and energy detection. No Bouffalo
-archive is linked. Direct RF operation, joining, ZHA interview, Trust Center
-link-key exchange, and attribute reporting are hardware-tested. Temperature
-and humidity remain synthetic. Battery reporting now samples the nominal
-internal VBAT/2 GPADC path, with an explicit synthetic fallback if conversion
-fails. The reusable BL702 HAL also provides I2C, SPI, GPIO, PWM, UART, timer,
-eFuse, and XIP flash, but the new sensor/flash paths still need silicon
-validation and application integration. The production image always routes
-Zigbee CCM*/AES-MMO through the token-owned SEC_ENG AES-128 accelerator and
-drops the software AES core. Two startup KATs, periodic radio operation, a
-complete secured ZHA join/TCLK exchange/interview, and encrypted reports are
-hardware-proven; reset/resume remains the final AES-related hardware gate.
-
-### CC2340 firmware
-
-```bash
-cd examples/cc2340-sensor
-
-# Compile-only fallback without radio assets:
-cargo build --release
-
-# Embed TI radio microcode/configuration:
-CC2340_SDK_DIR=/path/to/simplelink_lowpower_f3_sdk cargo build --release
-```
-
-The CC2340 host driver is Rust and does not link RCL or ZBOSS. A build without
-`CC2340_SDK_DIR` compiles, but radio initialization returns
-`FirmwareUnavailable`.
-
-### Telink TLSR8258 firmware (pure Rust — no vendor SDK!)
-
-```bash
-./scripts/tlsr8258.sh build sensor
-./scripts/tlsr8258.sh build router
-```
-
-> The TLSR8258 radio driver uses pure-Rust register access. For real tc32
-> firmware, use the [modern-tc32](https://github.com/modern-tc32) toolchain.
-> The HAL also exposes typed single-owner GPIO, I2C, SPI, UART, ADC, PWM,
-> flash, timer/watchdog, IRQ/reset/clock, wake/capture, RNG, and AES APIs.
-> Hardware bring-up diagnostics live separately in
-> `tools/telink-tlsr8258-lab`.
-
-### PHY6222 firmware (pure Rust — no vendor SDK!)
-
-```bash
-cd examples/phy6222-sensor
-cargo build --release   # no stubs, no vendor blobs needed!
-```
-
-### EFR32MG1 firmware (pure Rust — no vendor SDK!)
-
-```bash
-cd examples/efr32mg1-sensor
-cargo build --release   # no stubs, no GSDK, no RAIL library needed!
-tools/verify-layout.py target/thumbv7em-none-eabi/release/efr32mg1-sensor
-```
-
-> The TRÅDFRI image is linked at `0x4000` for the resident Gecko bootloader.
-> It is an unconditional 30-second RTCC/EM2 sleepy end device. Hardware
-> diagnostics are separate binaries under `tools/efr32mg1-lab`. Verify every
-> ELF before creating a flash image.
-
-### EFR32MG21 firmware (pure Rust — no vendor SDK!)
-
-```bash
-cd examples/efr32mg21-sensor
-cargo build --release   # no stubs, no GSDK, no RAIL library needed!
-```
-
-> Series 2 Cortex-M33 — independent `efr32s2` MAC module. Works with
-> Sonoff ZBDongle-E and BRD4180A/BRD4181A dev kits.
-
-### Vendor Libraries
-
-Some experimental backends depend on vendor radio libraries. A successful
-stub build proves only that the Rust side compiles.
-
-#### BL702 — direct Rust radio + retained legacy FFI
-
-The direct backend reconstructs the BL702 digital PHY, analog calibration,
-channel synthesizer, M154 FIFO, CCA, RX, and TX register paths in Rust. The
-XT-ZB1 sensor builds for `riscv32imc-unknown-none-elf` and links no vendor
-code. The RV32A instructions emitted by `riscv32imac` trap on the tested
-BL702.
-
-The old `Bl702Mac` FFI backend remains side-by-side for comparison with
-Bouffalo's `liblmac154.a` and `libbl702_rf.a`. Those archives use the
-`ilp32f` ABI and are not used by the Rust sensor.
-
-#### CC2340 — TI SimpleLink Low Power F3 SDK
-
-```bash
-# Download TI SimpleLink SDK from https://www.ti.com/tool/SIMPLELINK-LOWPOWER-F3-SDK
-export CC2340_SDK_DIR=/path/to/simplelink_lowpower_f3_sdk
-cd examples/cc2340-sensor && cargo build --release
-```
-
-The build script does not link TI host libraries. It imports TI's official
-IEEE PBE/MCE/RFE microcode, PHY register configuration, and LP-EM-CC2340R5 PA
-table as build-time data. Rust code owns LRFD setup, FIFO access, and the
-radio operation state machine.
-
-#### Telink TLSR8258 — Pure Rust (no vendor library needed)
-
-```bash
-./scripts/tlsr8258.sh build sensor
-```
-
-The TLSR8258 radio driver uses pure-Rust register access — no `libdrivers_8258.a` required.
-
-> **PHY6222**, **TLSR8258**, **EFR32MG1**, **EFR32MG21**, and **nRF52840/52833** and **ESP32-C6/H2** do **not** need any vendor libraries.
-
-## Peripheral HALs
-
-| Platform | Reusable peripherals | Validation boundary |
-|----------|----------------------|---------------------|
-| **BL702** | GPIO, I2C0, SPI0, GPADC/VBAT, PWM, UART0/1, timer, eFuse, XIP flash | UART, timer, eFuse, and radio paths hardware-proven; new GPIO/I2C/SPI/ADC/PWM/flash paths host-tested and RV32IMC-compiled, not yet silicon-tested |
-| **TLSR8258** | GPIO/edge capture, I2C, SPI, UART, ADC, PWM/IR, flash, timers/watchdog, IRQ/reset/clock, suspend/wake, RNG, AES-128 | Radio, GPIO, flash, timer-wake suspend, and deployed persistence paths have hardware evidence. UART, I2C/SPI, advanced PWM/capture, pad/comparator wake, RNG entropy quality, and AES remain silicon-validation gates |
-| **EFR32MG1** | GPIO, I2C, SPI, ADC, PWM, flash, RTCC/EM2, CRYPTO AES, bootloader storage | Production sensor path hardware-proven through commissioning, interview, reporting, Identify, and silent reset/resume |
-
-BL702 and TLSR8258 stateful bus/PWM constructors consume unique peripheral
-tokens. TLSR8258 I2C and SPI intentionally consume the same serial-controller
-token and non-`Clone` route pins because those functions overlap in hardware.
-Their board crates preserve exclusive ownership even when an application
-leaves a peripheral unused.
-
-TLSR8258 factory data is geometry-specific for 512 KiB, 1 MiB, 2 MiB, and
-4 MiB flashes. Non-512-KiB products must verify the JEDEC capacity before
-reading the factory EUI-64 or ADC calibration. Zbit program/erase operations
-fail closed unless the owned ADC/PC5 voltage guard measures a safe, stable
-supply immediately before each physical operation. The RNG uses an
-AES-128 CTR_DRBG seeded from SHA-256-conditioned VBAT/GND ADC observations;
-the DRBG has a NIST known-answer test, but the physical entropy source still
-requires SP 800-90B characterization.
-
-The TLSR8258 AES block has a bounded, token-owned ECB driver and is the
-standard production `zigbee-crypto` backend for NWK/APS CCM* and AES-MMO.
-The Telink MAC still reports
-`hardware_security = false` because the Rust stack performs security itself;
-the accelerator is a block-cipher provider, not autonomous MAC offload.
-
-## MAC Backends
-
-| Backend | Radio driver | Target | Notes |
-|---------|-------------|--------|-------|
-| **MockMac** | ✅ Simulation | Host (macOS/Linux/Windows) | Full protocol sim, no hardware |
-| **ESP32-C6** | ✅ esp-ieee802154 | `riscv32imac-unknown-none-elf` | Native 802.15.4 radio |
-| **ESP32-H2** | ✅ esp-ieee802154 | `riscv32imac-unknown-none-elf` | Native 802.15.4 radio |
-| **nRF52840** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
-| **nRF52833** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral; runs the same `apps/sensor-sed` lifecycle as nRF52840 through Nordic adapters — join, interview, secured reporting and silent resume hardware-tested before this extraction |
-| **BL702** | 🦀 Pure-Rust direct registers | `riscv32imc-unknown-none-elf` | XT-ZB1 RF, join, ZHA interview, security, and reporting hardware-tested |
-| **CC2340** | 🦀 Rust host + TI microcode | `thumbv6m-none-eabi` | Raw polling TX/RX implemented; hardware validation, CCA, IRQs, filtering, and auto-ACK pending |
-| **Telink TLSR8258** | 🦀 **Pure Rust** | `tc32-unknown-none-elf` | Real tc32 builds in the dedicated [modern-tc32](https://github.com/modern-tc32) CI workflow |
-| **PHY6222** | 🦀 **Pure Rust** | `thumbv6m-none-eabi` | Zero vendor blobs — direct register access! |
-| **EFR32MG1** | 🦀 **Pure Rust** | `thumbv7em-none-eabi` | Series 1, Cortex-M4F — hardware-proven direct radio, CRYPTO AES, and RTCC/EM2 |
-| **EFR32MG21** | 🦀 **Pure Rust** | `thumbv8m.main-none-eabihf` | Series 2, Cortex-M33 — independent `efr32s2` module |
-
-> **Legend:** ✅ = functional radio driver · ⚡ = compile-only scaffold · 🦀 = Rust host driver. BL702 is hardware-tested on XT-ZB1; CC2340 still embeds official TI radio microcode as data.
-
-All 12 supported firmware targets build in CI and produce downloadable artifacts.
-
-## ZCL Clusters (45)
-
-**General:** Basic, Power Config, Device Temp Config, Identify, Groups, Scenes, On/Off,
-On/Off Switch Config, Level Control, Alarms, Time, Analog Input, Analog Output, Analog
-Value, Binary Input, Binary Output, Binary Value, Multistate Input, OTA Upgrade, Poll
-Control, Green Power, Diagnostics
-
-**Closures:** Door Lock, Window Covering
-
-**HVAC:** Thermostat, Fan Control, Thermostat UI Config
-
-**Lighting:** Color Control, Ballast Config
-
-**Measurement:** Illuminance, Illuminance Level, Temperature, Pressure, Flow, Humidity,
-Occupancy, Electrical, Carbon Dioxide, PM2.5, Soil Moisture
-
-**Security:** IAS Zone, IAS ACE, IAS WD
-
-**Smart Energy:** Metering
-
-**Touchlink:** Commissioning
-
-## Design Principles
-
-- **`#![no_std]`** everywhere — no heap allocation, `heapless` for bounded collections
-- **`async` MacDriver trait** — 13 methods, no `Send`/`Sync` requirement
-- **Platform-agnostic** — same stack code runs on mock, ESP32, nRF, BL702, CC2340, Telink, PHY6222, EFR32
-- **Power-aware** — two-phase polling (fast/slow), DC-DC, TX power reduction, radio sleep, CPU suspend, system sleep, flash deep power-down, GPIO preparation, reportable change thresholds
-- **Five pure-Rust radios** — BL702, PHY6222, TLSR8258, EFR32MG1, and EFR32MG21 need zero vendor blobs
-- **Router support** — full relay, RREQ rebroadcast, Link Status, indirect queue, source routing
-- **Manual frame parsing** — no `serde`, bitfield encode/decode for all frame types
-- **Embassy-compatible** — designed for single-threaded async executors
-- **Layered crates** — each layer wraps the one below: `NwkLayer<M: MacDriver>`
-- **CI-enforced** — every push builds all 12 supported firmware targets + clippy + fmt + tests
-
-## Project Structure
-
-```
-zigbee-rs/
-├── zigbee-types/              # Core types (addresses, channels)
-├── zigbee-crypto/             # Shared low-stack AES-CCM* primitives
-├── zigbee-mac/                # MAC layer + platform backends
-│   └── src/
-│       ├── mock/              # Full mock for host testing
-│       ├── esp/               # ESP32-C6/H2 (esp-ieee802154)
-│       ├── nrf/               # nRF52840/52833 (radio peripheral)
-│       ├── bl702/             # BL702 direct Rust radio + legacy FFI
-│       ├── cc2340/            # CC2340 Rust host driver + TI radio microcode
-│       ├── telink/            # TLSR8258 pure-Rust backend
-│       ├── phy6222/           # PHY6222 (pure Rust radio driver!)
-│       ├── efr32/             # EFR32MG1 (pure Rust radio driver!)
-│       └── efr32s2/           # EFR32MG21 Series 2 (pure Rust radio driver!)
-├── zigbee-nwk/                # Network layer (routing, security, router relay)
-├── zigbee-aps/                # Application Support (binding, groups)
-├── zigbee-zdo/                # Device Objects (discovery, mgmt)
-├── zigbee-bdb/                # Base Device Behavior (commissioning)
-├── zigbee-zcl/                # Zigbee Cluster Library (45 clusters)
-├── zigbee-runtime/            # Device builder, power, NV storage
-├── zigbee/                    # Top-level: coordinator, router
-├── bl702-hal/                 # BL702 GPIO, buses, ADC, PWM, flash, clocks
-├── tlsr8258-hal/              # TLSR8258 radio and reusable peripheral HAL
-├── boards/
-│   ├── bl702-xt-zb1/          # XT-ZB1 wiring and ownership tokens
-│   ├── nrf52833-dk/           # PCA10100 wiring (LED1, Button 1, sensor I2C)
-│   ├── nrf52840-dk/           # PCA10056 wiring (LED1, Button 1, sensor I2C)
-│   └── tlsr8258-tb04/         # TB-04 wiring, LEDs, flash and pin ownership
-├── products/
-│   ├── bl702-xt-zb1/          # XT-ZB1 storage and linker policy
-│   ├── efr32mg1-tradfri/      # TRADFRI sensor profile, storage, linker policy
-│   ├── esp32-zigbee-devkit/   # ESP32 product profiles and partitions
-│   ├── nrf52833-sensor/       # nRF52833 profile, storage, linker policy
-│   ├── nrf52840-sensor/       # nRF52840 profile, storage, linker policy
-│   └── tlsr8258-tb04/         # TB-04 storage and linker policy
-├── apps/
-│   └── nrf-sensor/            # Shared nRF sensor lifecycle (52833 + 52840)
-├── drivers/                   # Transport-independent sensor drivers (blocking + async)
-│   ├── sht3x/                 # Sensirion SHT3x temperature + humidity
-│   ├── sht4x/                 # Sensirion SHT4x temperature + humidity
-│   ├── scd4x/                 # Sensirion SCD4x CO2 + temperature + humidity
-│   ├── bme280/                # Bosch BME280/BMP280 temperature + humidity + pressure
-│   ├── bme680/                # Bosch BME680 temperature + humidity + pressure
-│   └── bh1750/                # ROHM BH1750 ambient light
-├── tests/                     # Integration tests
-├── examples/
-│   ├── mock-sensor/           # Host: temp+humidity sensor
-│   ├── mock-coordinator/      # Host: coordinator
-│   ├── mock-light/            # Host: dimmable light
-│   ├── mock-sleepy-sensor/    # Host: SED demo
-│   ├── esp32c6-sensor/        # ESP32-C6 firmware (NV flash storage, on-chip temp sensor, Identify)
-│   ├── esp32h2-sensor/        # ESP32-H2 firmware
-│   ├── nrf52840-sensor/       # nRF52840-DK (probe-rs) + BME280/SHT31 + flash NV
-│   ├── nrf52840-sensor-uf2/   # nice!nano / ProMicro (UF2 drag-drop, simple demo)
-│   ├── nrf52833-sensor/       # nRF52833-DK (probe-rs) + BME280/SHT31 + flash NV
-│   ├── nrf52840-router/       # nRF52840 Zigbee router (relay, permit join, Link Status)
-│   ├── bl702-sensor/          # XT-ZB1 pure-Rust Zigbee sensor
-│   ├── cc2340-sensor/         # TI CC2340R5 (SDK-backed compile, hardware pending)
-│   ├── telink-tlsr8258-sensor/# Telink TLSR8258 polling end-device sensor
-│   ├── telink-tlsr8258-router/# Telink TLSR8258 parent router
-│   ├── phy6222-sensor/        # PHY6222 — pure Rust, no vendor SDK!
-│   ├── efr32mg1-sensor/       # EFR32MG1P — pure Rust, Series 1 Cortex-M4F!
-│   └── efr32mg21-sensor/      # EFR32MG21 — pure Rust, Series 2 Cortex-M33!
-├── docs/
-│   ├── book/                  # mdBook source → GitHub Pages
-│   └── flasher/               # ESP web flasher (GitHub Pages)
-├── tools/
-│   └── telink-tlsr8258-lab/  # Telink hardware diagnostics and legacy regression firmware
-└── BUILD.md                   # Comprehensive build guide
-```
-
-## CI / Firmware Artifacts
-
-Every push builds **12 supported firmware targets** plus workspace checks:
-
-| Job | What it does |
-|-----|-------------|
-| Check | `cargo check --workspace` |
-| Test | `cargo test --workspace` |
-| Clippy | `cargo clippy --workspace` |
-| Format | `cargo fmt --check` |
-| Doc | `cargo doc --workspace --no-deps` |
-| Build × 12 | Each supported platform produces a downloadable firmware artifact |
-| Deploy | Book + web flasher published to GitHub Pages |
-
-Download firmware artifacts from the [Actions tab](https://github.com/faronov/zigbee-rs/actions).
-
-## Verified Hardware
-
-The following hardware has been tested end-to-end with **Home Assistant + ZHA**:
-
-| Board | Coordinator | Status | Notes |
-|-------|-------------|--------|-------|
-| **nRF52840-DK** (PCA10056) | ZHA (via zigpy) | ✅ Prior baseline verified | Flash NV, Identify LED blink, BME280/SHT31 optional; current product/profile refactor awaits hardware revalidation |
-| **ESP32-C6-DevKitC-1** | ZHA (via zigpy) | ✅ Current refactor verified | Hardware AES, fresh commissioning, reporting, the OTA client, and a transfer through 18.3% are verified; full activation remains pending. |
-| **ESP32-H2-DevKitM-1** | ZHA (via zigpy) | ✅ Current refactor verified | Legacy NV migration, reset/resume, reporting, TSENS, interview, Identify, and a complete v1-to-v2 OTA activation are verified on hardware. |
-| **BL702 XT-ZB1** | Home Assistant ZHA / Ember | ✅ End-device path verified | Pure-Rust RF calibration, join, TCLK exchange, interview, Identify, and reporting; temperature/humidity currently synthetic |
-| **TLSR8258** | Home Assistant ZHA / Ember | ✅ End-device and router paths verified | Join, TCLK exchange, interview, reporting, routed-frame relay, silent reset resume, and crash-safe counter persistence. Parent/child traffic has been exercised, but clean first-attempt sleepy-child commissioning with the corrected child image remains the release gate |
-| **EFR32MG1P TRÅDFRI** | Home Assistant ZHA / Ember | ✅ End-device path verified | Pure-Rust radio, hardware AES, full interview including OTA attributes, SHT3x/battery reporting, EM2, crash-safe persistence, Identify, and silent reset/resume |
-
-All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling** (auto-erase NV + rejoin), and **default reporting configuration** (so devices report data even before the coordinator sends ConfigureReporting).
-
-## Known Limitations
-
-- **CC2340** has Rust LRFD bring-up and polling raw TX/RX, but no target has
-  been connected yet. CCA, IRQ-driven completion, hardware address filtering,
-  auto-ACK, temperature compensation, and a real Embassy time driver remain.
-- **BL702** now has product-owned crash-safe network/security persistence in
-  the final 8 KiB of the XT-ZB1's 1 MiB flash. The integration compiles and is
-  covered by host tests, but erase/program and reset-resume still require
-  hardware validation. Retention sleep is not implemented. The new
-  I2C/SPI/ADC/PWM paths also still require hardware validation.
-- **Telink TLSR8258** production examples are split by role. The sensor is a
-  polling end device, not yet a retention SED. Timer-only suspend is
-  hardware-proven in the HAL, while pad/comparator wake paths and production
-  runtime integration remain unvalidated. The router's parent path is
-  software-complete and has been exercised on hardware, but release still
-  requires a clean first-attempt sleepy-child join and complete ZHA interview
-  with the corrected child image under an independent sniffer. The router child
-  table is now crash-safely persisted; route state remains RAM-only, and the
-  orphan/realignment plus flash-journal paths still need hardware validation.
-  Real tc32 firmware requires the
-  [modern-tc32](https://github.com/modern-tc32) toolchain.
-- **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence; temp/humidity sensors are simulated (battery ADC is real); comprehensive power management is implemented (two-tier sleep with AON system sleep ~3 µA, radio sleep/wake, flash deep power-down, GPIO leak prevention)
-- **EFR32MG1** is hardware-proven for hardware-AES commissioning, complete ZHA interview, SHT3x/battery reporting, RTCC/EM2, PB13 wake, and silent reset/resume. Downloading, activating, and booting a real Gecko Bootloader OTA upgrade remains pending.
-- **EFR32MG21** still uses an unverified pure-Rust radio initialization path and needs independent hardware validation.
-- **Test coverage** is basic — the mock examples exercise more than the test crate
-- **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal
-- **OTA** — the transport/session flow is shared in `zigbee-runtime`; EFR32MG1 has a Gecko Bootloader writer, while ESP32-C6/H2 share a checked dual-slot (`ota_0`/`ota_1` + `otadata`) writer. H2 completed a real v1-to-v2 activation; full C6 activation and the EFR32 upgrade remain pending. nRF52840 and BL702 have no writer.
+ESP32 and PHY6222 use `nightly-2026-08-01`. TLSR8258 uses the
+`tc32-stage2-tc32-45` target toolchain; its host-side tools use Rust `1.94.1`.
 
 ## Documentation
 
-- **[The zigbee-rs Book](https://faronov.github.io/zigbee-rs/)** — online guide: architecture, platform setup, ZCL clusters, power management, OTA
-- **[BUILD.md](BUILD.md)** — detailed instructions for building, flashing, sensor/display integration, debugging, and peripheral wiring
-- **[API docs](https://docs.rs/zigbee-rs)** — generated from `cargo doc --workspace`
+- [Book source and navigation](docs/book/src/SUMMARY.md)
+- [Build and validation matrix](BUILD.md)
+- [Examples](examples/README.md)
+- [API map](docs/book/src/reference/api.md)
+- [Architecture](docs/book/src/getting-started/architecture.md)
+- [NV storage](docs/book/src/advanced/nv-storage.md)
+- [Power management](docs/book/src/advanced/power.md)
+- [OTA](docs/book/src/advanced/ota.md)
+- [Coordinator and router roles](docs/book/src/advanced/coordinator-router.md)
 
 ## License
 
-GPL-2.0 (forked from zigbee-rs)
+Workspace crates declare `MIT OR Apache-2.0`.

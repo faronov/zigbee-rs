@@ -109,6 +109,14 @@ hardware-aes = [
     "zigbee-crypto/tlsr8258",
 ]
 
+# TLSR8258 reset-on-wake restoration hooks. Kept separate from `tlsr8258`
+# so the validated full-SRAM SUSPEND production images do not gain a second
+# resume path until the dedicated proof is selected.
+telink-retention-proof = [
+    "tlsr8258",
+    "tlsr8258-hal/retention-proof",
+]
+
 # BL702 SEC_ENG hardware AES-128 accelerator backend.
 #
 # Kept as a separate low-level feature because it selects different HAL and

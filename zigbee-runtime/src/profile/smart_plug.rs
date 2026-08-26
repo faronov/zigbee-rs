@@ -128,6 +128,11 @@ impl SmartPlug {
         self.on_off.tick();
     }
 
+    /// Advance OnTime/OffWaitTime by multiple elapsed deciseconds.
+    pub fn tick_on_off_by(&mut self, elapsed_deciseconds: u32) {
+        self.on_off.tick_by(elapsed_deciseconds);
+    }
+
     /// Apply `StartUpOnOff` on device power-on. See
     /// [`OnOffCluster::apply_startup`].
     pub fn apply_startup_on_off(&mut self, previous_on: bool) {

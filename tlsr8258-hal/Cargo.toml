@@ -6,6 +6,13 @@ license = "MIT OR Apache-2.0"
 description = "Pure-Rust TLSR8258 platform and IEEE 802.15.4 hardware support"
 repository = "https://github.com/faronov/zigbee-rs"
 
+[features]
+default = []
+# Compile-time marker used by the dedicated LOW32K proof images. The PM
+# implementation remains available to host tests; target-only restoration
+# callers are selected by this feature in the MAC/product composition.
+retention-proof = []
+
 [dependencies]
 embedded-hal = "1.0"
 embedded-storage = "0.3"

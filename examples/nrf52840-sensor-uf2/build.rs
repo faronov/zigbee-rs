@@ -1,44 +1,42 @@
-use std::env;
-use std::fs::File;
-use std::io::Write;
-use std::path::PathBuf;
+use std::{env, fs, path::PathBuf};
+
+fn enabled(name: &str) -> bool {
+    env::var_os(name).is_some()
+}
 
 fn main() {
-    let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let selections = [
+        (enabled("CARGO_FEATURE_BOARD_PROMICRO"), "uf2-promicro.x"),
+        (enabled("CARGO_FEATURE_BOARD_MDK"), "uf2-mdk.x"),
+        (enabled("CARGO_FEATURE_BOARD_NRF_DONGLE"), "uf2-pca10059.x"),
+        (enabled("CARGO_FEATURE_BOARD_NRF_DK"), "uf2-dk.x"),
+    ];
+    let selected: Vec<_> = selections
+        .into_iter()
+        .filter_map(|(enabled, script)| enabled.then_some(script))
+        .collect();
+    assert_eq!(
+        selected.len(),
+        1,
+        "select exactly one nRF52840 UF2 board feature"
+    );
 
-    // Board-specific memory layout:
-    // - ProMicro: SoftDevice S140 present → app at 0x26000, RAM at 0x20002000
-    // - MDK / PCA10059: no SoftDevice → app at 0x1000, full RAM
-    // - DK: no bootloader at all → app at 0x0000, full everything
-    let memory_x = if cfg!(feature = "board-promicro") {
-        r#"MEMORY
-{
-  FLASH : ORIGIN = 0x00026000, LENGTH = 808K
-  RAM   : ORIGIN = 0x20002000, LENGTH = 248K
-}
-"#
-    } else if cfg!(feature = "board-nrf-dk") {
-        r#"MEMORY
-{
-  FLASH : ORIGIN = 0x00000000, LENGTH = 1024K
-  RAM   : ORIGIN = 0x20000000, LENGTH = 256K
-}
-"#
-    } else {
-        r#"MEMORY
-{
-  FLASH : ORIGIN = 0x00001000, LENGTH = 1020K
-  RAM   : ORIGIN = 0x20000000, LENGTH = 256K
-}
-"#
-    };
-    File::create(out.join("memory.x"))
-        .unwrap()
-        .write_all(memory_x.as_bytes())
-        .unwrap();
-    println!("cargo:rustc-link-search={}", out.display());
-    println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rustc-link-arg-bins=--noinhibit-exec");
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let product_link = manifest.join("../../products/nrf52840-sensor/link");
+    let script = product_link.join(selected[0]);
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("memory.x");
+    fs::copy(&script, &output).expect("copy selected product linker map");
+
+    println!(
+        "cargo:rustc-link-search={}",
+        output.parent().unwrap().display()
+    );
     println!("cargo:rustc-link-arg-bins=-Tlink.x");
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
+    for script in ["uf2-promicro.x", "uf2-mdk.x", "uf2-pca10059.x", "uf2-dk.x"] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            product_link.join(script).display()
+        );
+    }
 }

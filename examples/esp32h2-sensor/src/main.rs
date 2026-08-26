@@ -8,8 +8,7 @@
 //! - Sleepy End Device: poll parent for indirect frames
 //! - Fast poll (250ms) during ZHA interview/OTA, slow poll (30s) normal
 //! - Device_annce retries for reliable coordinator discovery
-//! - OTA Upgrade client, cleanly omitted if the partition table is missing
-//!   or incompatible
+//! - OTA Upgrade client, requiring the product OTA partition table
 //! - Button: BOOT (GPIO9) — short=toggle, long=factory reset
 //!
 //! # Architecture
@@ -19,7 +18,7 @@
 //! [`SecurityStore`](esp32_zigbee_devkit_product::storage::SecurityStore).
 //! This file is only the composition root: platform startup, resource
 //! construction, and handing both to [`zigbee_runtime::node::ZigbeeNode`]
-//! before running [`app::SensorApp`]'s event loop.
+//! before running the shared [`sensor_sed_app::SensorApp`] lifecycle.
 //!
 //! # Build & flash
 //! ```bash
@@ -38,26 +37,44 @@ extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-mod app;
 mod chip_temperature;
+mod platform;
 mod time_driver;
 
 include!(concat!(env!("OUT_DIR"), "/firmware_version.rs"));
 
-use app::SensorApp;
 use chip_temperature::H2TemperatureSensor;
 use esp_backtrace as _;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+use platform::{ActiveLowStatus, ActiveWake, EspDiagnostics, EspSupervisor, H2Environment};
 
 use embassy_futures::block_on;
+use sensor_sed_app::{FixedBattery, SensorApp, SensorSedParts, ToggleJoinAction};
 use static_cell::StaticCell;
 
 use esp32_zigbee_devkit_product as product;
 use zigbee_runtime::node::ZigbeeNode;
-use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::profile::ApplicationProfile;
+use zigbee_runtime::profile::{ApplicationProfile, BatteryMeasurement};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_zcl::clusters::basic::PowerSource;
+
+type H2Parts = SensorSedParts<
+    ActiveWake<'static>,
+    ActiveLowStatus<'static>,
+    H2Environment,
+    FixedBattery,
+    product::ota_transport::OtaTransport,
+    ToggleJoinAction,
+    EspSupervisor,
+    EspDiagnostics,
+>;
+type H2App = SensorApp<
+    'static,
+    zigbee_mac::esp::EspMac<'static>,
+    product::storage::SecurityStore,
+    product::profile::SensorProfile,
+    H2Parts,
+>;
 
 // Bridge `log` crate → esp_println
 struct EspLogger;
@@ -140,21 +157,21 @@ fn main() -> ! {
     });
     esp_println::println!("[ESP32-H2] Persistence migration: {:?}", migration);
     let profile =
-        product::profile::sensor_profile(FIRMWARE_VERSION, esp_hal::system::software_reset);
-    esp_println::println!(
-        "[ESP32-H2] OTA {}",
-        if profile.is_enabled() {
-            "enabled"
-        } else {
-            "disabled (incompatible partition layout)"
-        }
-    );
+        product::profile::sensor_profile(FIRMWARE_VERSION, esp_hal::system::software_reset)
+            .unwrap_or_else(|error| {
+                esp_println::println!(
+                    "[ESP32-H2] FATAL: required OTA partition layout is invalid: {:?}",
+                    error
+                );
+                loop {
+                    core::hint::spin_loop();
+                }
+            });
+    esp_println::println!("[ESP32-H2] OTA enabled");
 
     let device = ZigbeeDevice::builder(mac)
-        .power_mode(PowerMode::Sleepy {
-            poll_interval_ms: 10_000,
-            wake_duration_ms: 500,
-        })
+        .power_mode(product::policy::SENSOR_POLICY.power_mode())
+        .automatic_polling(false)
         .manufacturer(product::MANUFACTURER)
         .model(product::MODEL)
         .application_version(product::firmware::application_version(FIRMWARE_VERSION))
@@ -178,14 +195,33 @@ fn main() -> ! {
     static SECURITY: StaticCell<product::storage::SecurityStore> = StaticCell::new();
     static PROFILE: StaticCell<product::profile::SensorProfile> = StaticCell::new();
     static DEVICE: StaticCell<ZigbeeDevice<zigbee_mac::esp::EspMac<'static>>> = StaticCell::new();
-    static APP: StaticCell<SensorApp<'static>> = StaticCell::new();
+    static APP: StaticCell<H2App> = StaticCell::new();
 
     let security = SECURITY.init(security);
     let profile = PROFILE.init(profile);
     let device = DEVICE.init(device);
 
     let node = ZigbeeNode::new(device, security, profile);
-    let app = APP.init(SensorApp::new(node, button, led, temp_sensor));
+    let parts = SensorSedParts {
+        wake: ActiveWake::new(button),
+        status: ActiveLowStatus::new(led),
+        environment: H2Environment::new(temp_sensor),
+        battery: FixedBattery::new(
+            3_300,
+            BatteryMeasurement {
+                voltage_100mv: 33,
+                percentage_remaining: 200,
+            },
+        ),
+        ota: product::ota_transport::OtaTransport::new(),
+        actions: ToggleJoinAction,
+        supervisor: EspSupervisor,
+        diagnostics: EspDiagnostics,
+    };
+    let app = APP.init(
+        SensorApp::new(node, &product::policy::SENSOR_POLICY, parts)
+            .expect("valid ESP32-H2 sensor application composition"),
+    );
 
     esp_println::println!("[ESP32-H2] Flash NV storage ready (security-state journal)");
 

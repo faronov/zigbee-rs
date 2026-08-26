@@ -3,9 +3,8 @@
 //! Both chips report the same clusters (Temperature, Humidity, Power
 //! Configuration on the Home Automation Temperature Sensor device ID) with
 //! the same reporting cadence, so the base profile is shared. Only the
-//! selected ESP32 build composes an OTA backend, and only when the checked
-//! partition table on the device actually supports it — see
-//! [`OptionalOta`](zigbee_runtime::profile::OptionalOta).
+//! selected ESP32 build has an OTA backend. The checked partition table is a
+//! startup requirement, so the OTA client descriptor never changes at runtime.
 
 use crate::ENDPOINT;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
@@ -53,13 +52,31 @@ mod with_ota {
     use super::{BaseSensorProfile, base_profile};
     use crate::ota::{EspFirmwareWriter, EspOtaFlash};
     use crate::{ENDPOINT, OTA_HARDWARE_VERSION, OTA_IMAGE_TYPE, OTA_MANUFACTURER_CODE};
+    use zigbee_runtime::firmware_writer::FirmwareError;
     use zigbee_runtime::ota::{OtaConfig, OtaManager};
-    use zigbee_runtime::profile::OptionalOta;
+    use zigbee_runtime::profile::{ProfileError, WithOta};
 
-    /// The ESP32 profile: the shared base profile, with the OTA Upgrade
-    /// client cluster composed in only when the on-device partition table
-    /// supports it.
-    pub type SensorProfile = OptionalOta<BaseSensorProfile, EspFirmwareWriter<EspOtaFlash>>;
+    /// The ESP32 profile: the shared base profile plus the mandatory OTA
+    /// Upgrade client cluster.
+    pub type SensorProfile = WithOta<BaseSensorProfile, EspFirmwareWriter<EspOtaFlash>>;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SensorProfileError {
+        Firmware(FirmwareError),
+        Profile(ProfileError),
+    }
+
+    impl From<FirmwareError> for SensorProfileError {
+        fn from(error: FirmwareError) -> Self {
+            Self::Firmware(error)
+        }
+    }
+
+    impl From<ProfileError> for SensorProfileError {
+        fn from(error: ProfileError) -> Self {
+            Self::Profile(error)
+        }
+    }
 
     /// Build the selected ESP32 profile.
     ///
@@ -68,12 +85,14 @@ mod with_ota {
     /// the composition root (`main.rs`) rather than depended on directly here,
     /// so this crate does not need an `esp-hal` dependency of its own.
     ///
-    /// A missing or incompatible partition table disables OTA without
-    /// preventing the sensor from joining and reporting: the endpoint simply
-    /// does not advertise the OTA Upgrade client cluster. This also avoids
-    /// bricking a remotely upgraded image if its layout expectations ever
-    /// differ from the table installed on the device.
-    pub fn sensor_profile(firmware_version: u32, reset: fn() -> !) -> SensorProfile {
+    /// A missing or incompatible partition table is an explicit startup
+    /// failure. This OTA-capable image always advertises the OTA Upgrade
+    /// client cluster, so it cannot safely continue with a different endpoint
+    /// descriptor after partition discovery.
+    pub fn sensor_profile(
+        firmware_version: u32,
+        reset: fn() -> !,
+    ) -> Result<SensorProfile, SensorProfileError> {
         let config = OtaConfig {
             manufacturer_code: OTA_MANUFACTURER_CODE,
             image_type: OTA_IMAGE_TYPE,
@@ -83,32 +102,19 @@ mod with_ota {
             auto_accept: true,
             hardware_version: Some(OTA_HARDWARE_VERSION),
         };
-        match EspFirmwareWriter::new(EspOtaFlash::new(), reset) {
-            Ok(writer) => {
-                log::info!(
-                    "[ESP32] OTA ready: running slot {}, staging slot {}, version {}",
-                    writer.running_slot(),
-                    writer.target_slot(),
-                    firmware_version
-                );
-                OptionalOta::enabled(base_profile(), OtaManager::new(writer, config))
-                    .expect("OTA endpoint matches the base profile endpoint")
-            }
-            Err(error) => {
-                log::warn!(
-                    "[ESP32] OTA disabled: incompatible flash layout ({:?})",
-                    error
-                );
-                OptionalOta::disabled(
-                    base_profile(),
-                    OTA_MANUFACTURER_CODE,
-                    OTA_IMAGE_TYPE,
-                    firmware_version,
-                )
-            }
-        }
+        let writer = EspFirmwareWriter::new(EspOtaFlash::new(), reset)?;
+        log::info!(
+            "[ESP32] OTA ready: running slot {}, staging slot {}, version {}",
+            writer.running_slot(),
+            writer.target_slot(),
+            firmware_version
+        );
+        Ok(WithOta::new(
+            base_profile(),
+            OtaManager::new(writer, config),
+        )?)
     }
 }
 
 #[cfg(target_os = "none")]
-pub use with_ota::{SensorProfile, sensor_profile};
+pub use with_ota::{SensorProfile, SensorProfileError, sensor_profile};

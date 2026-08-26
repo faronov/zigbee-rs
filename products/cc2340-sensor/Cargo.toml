@@ -1,0 +1,22 @@
+[package]
+name = "cc2340-sensor-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product policy and persistence for the LP-EM-CC2340R5 sensor"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# This product is intentionally standalone and is not added to the repository
+# workspace by the CC2340 platform-services repair.
+[workspace]
+
+[dependencies]
+embedded-storage = "0.3"
+sensor-sed-app = { path = "../../apps/sensor-sed" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[target.'cfg(target_os = "none")'.dependencies]
+lp-em-cc2340r5 = { path = "../../boards/lp-em-cc2340r5" }

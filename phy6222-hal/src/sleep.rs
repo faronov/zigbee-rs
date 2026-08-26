@@ -21,8 +21,8 @@
 //! The AON domain has a 24-bit counter clocked at ~32 kHz (RC oscillator).
 //! A compare channel (RTCCC0) can wake the CPU from system sleep.
 
-use crate::regs::*;
 use crate::flash::FlashError;
+use crate::regs::*;
 use core::convert::Infallible;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

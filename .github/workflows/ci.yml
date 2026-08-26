@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, experiment/zephyr-app-model]
   pull_request:
+  workflow_dispatch:
 
 # Allow deploying to GitHub Pages
 permissions:
@@ -19,34 +20,49 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_TOOLCHAIN: nightly-2026-03-23
+  ESP_PHY_RUST_TOOLCHAIN: nightly-2026-08-01
+  ESPFLASH_VERSION: 4.5.0
+  CC2340_SDK_COMMIT: 68ca021502383f367d0bf2a5517fdd0dcb0ef909
+  UF2_COMMIT: 90e9741f217f5a40c98ba74d663e408041037578
 
 jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
-      - run: cargo check -p zigbee-mac --features mock
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: x86_64-unknown-linux-gnu-workspace-${{ env.RUST_TOOLCHAIN }}-all-targets-${{ hashFiles('Cargo.lock') }}
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo check -p zigbee-mac --features mock --locked
 
   test:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: x86_64-unknown-linux-gnu-workspace-${{ env.RUST_TOOLCHAIN }}-tests-${{ hashFiles('Cargo.lock') }}
+      - run: cargo test --workspace --locked
+      - run: cargo test -p sensor-sed-app --features ota --locked
       # The router relay tests are gated on `zigbee-runtime/router`, which is
       # off in the workspace build so sensors do not link the routing tables.
-      - run: cargo test -p zigbee-runtime --features router
-      - run: cargo test -p zigbee-zdo --features router
-      - run: cargo test -p zigbee-runtime --no-default-features
-      - run: cargo test -p zigbee-zcl --no-default-features
-      - run: cargo test -p zigbee-zcl --no-default-features --features float32
-      - run: cargo test -p zigbee-zcl --no-default-features --features float64
+      - run: cargo test -p router-app --features router --locked
+      - run: cargo test -p zigbee-runtime --features router --locked
+      - run: cargo test -p zigbee-zdo --features router --locked
+      - run: cargo test -p zigbee-runtime --no-default-features --locked
+      - run: cargo test -p zigbee-zcl --no-default-features --locked
+      - run: cargo test -p zigbee-zcl --no-default-features --features float32 --locked
+      - run: cargo test -p zigbee-zcl --no-default-features --features float64 --locked
       # nRF product crates are excluded from the root workspace (they pull in
       # `embassy-nrf`), but their battery-curve and profile logic is
       # host-testable because the hardware dependencies are
@@ -56,30 +72,112 @@ jobs:
       - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml
       - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml --features sensor-bme280
 
+  standalone-host:
+    name: Host ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: LP-EM-CC2340R5 board
+            manifest: boards/lp-em-cc2340r5/Cargo.toml
+            workspace: boards/lp-em-cc2340r5
+            locked: false
+            features: ""
+          - name: CC2340 sensor product
+            manifest: products/cc2340-sensor/Cargo.toml
+            workspace: products/cc2340-sensor
+            locked: false
+            features: ""
+          - name: nRF52840 always-on End Device product
+            manifest: products/nrf52840-router/Cargo.toml
+            workspace: products/nrf52840-router
+            locked: true
+            features: ""
+          - name: EFR32MG21 board
+            manifest: boards/efr32mg21-devkit/Cargo.toml
+            workspace: boards/efr32mg21-devkit
+            locked: true
+            features: ""
+          - name: EFR32MG21 sensor product
+            manifest: products/efr32mg21-sensor/Cargo.toml
+            workspace: products/efr32mg21-sensor
+            locked: true
+            features: ""
+          - name: PHY6222 sensor product
+            manifest: products/phy62x2-evk/Cargo.toml
+            workspace: products/phy62x2-evk
+            locked: false
+            features: ""
+          - name: PHY6252 sensor product
+            manifest: products/phy62x2-evk/Cargo.toml
+            workspace: products/phy62x2-evk
+            locked: false
+            features: phy6252
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ matrix.workspace }}
+          cache-targets: false
+          key: x86_64-unknown-linux-gnu-host-${{ matrix.name }}-${{ matrix.features }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', 'boards/**/Cargo.lock', 'products/**/Cargo.lock', 'boards/**/Cargo.toml', 'products/**/Cargo.toml') }}
+      - name: Test and lint standalone crate
+        run: |
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          LOCKED=
+          if [[ "${{ matrix.locked }}" == true ]]; then
+            LOCKED=--locked
+          fi
+          if [[ -n "${{ matrix.features }}" ]]; then
+            cargo test --manifest-path "${{ matrix.manifest }}" \
+              --target "$HOST_TARGET" $LOCKED \
+              --no-default-features --features "${{ matrix.features }}"
+            cargo clippy --manifest-path "${{ matrix.manifest }}" \
+              --target "$HOST_TARGET" --all-targets $LOCKED \
+              --no-default-features --features "${{ matrix.features }}" -- -D warnings
+          else
+            cargo test --manifest-path "${{ matrix.manifest }}" \
+              --target "$HOST_TARGET" $LOCKED
+            cargo clippy --manifest-path "${{ matrix.manifest }}" \
+              --target "$HOST_TARGET" --all-targets $LOCKED -- -D warnings
+          fi
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace -- -D warnings
-      - run: cargo clippy -p zigbee-runtime --features router --all-targets -- -D warnings
-      - run: cargo clippy -p zigbee-zdo --features router --all-targets -- -D warnings
-      - run: cargo clippy -p zigbee-runtime --no-default-features --all-targets -- -D warnings
-      - run: cargo clippy -p zigbee-zcl --no-default-features --all-targets -- -D warnings
-      - run: cargo clippy -p zigbee-zcl --no-default-features --features float32 --all-targets -- -D warnings
-      - run: cargo clippy -p zigbee-zcl --no-default-features --features float64 --all-targets -- -D warnings
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: x86_64-unknown-linux-gnu-workspace-${{ env.RUST_TOOLCHAIN }}-clippy-${{ hashFiles('Cargo.lock') }}
+      - run: cargo clippy --workspace --locked -- -D warnings
+      - run: cargo clippy -p sensor-sed-app --all-targets --locked -- -D warnings
+      - run: cargo clippy -p router-app --all-targets --features router --locked -- -D warnings
+      - run: cargo clippy -p router-app --no-default-features --locked -- -D warnings
+      - run: cargo clippy -p sensor-sed-app --features ota --locked -- -D warnings
+      - run: cargo clippy -p zigbee-runtime --features router --locked -- -D warnings
+      - run: cargo clippy -p zigbee-zdo --features router --locked -- -D warnings
+      - run: cargo clippy -p zigbee-runtime --no-default-features --locked -- -D warnings
+      - run: cargo clippy -p zigbee-zcl --no-default-features --locked -- -D warnings
+      - run: cargo clippy -p zigbee-zcl --no-default-features --features float32 --locked -- -D warnings
+      - run: cargo clippy -p zigbee-zcl --no-default-features --features float64 --locked -- -D warnings
 
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - run: |
           cargo fmt --all -- --check
@@ -92,17 +190,36 @@ jobs:
           cargo fmt --manifest-path boards/nrf52833-dk/Cargo.toml -- --check
           cargo fmt --manifest-path products/nrf52840-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path products/nrf52833-sensor/Cargo.toml -- --check
-          cargo fmt --manifest-path examples/nrf52840-sensor/Cargo.toml -- --check
-          cargo fmt --manifest-path examples/nrf52833-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/lp-em-cc2340r5/Cargo.toml -- --check
+          cargo fmt --manifest-path products/cc2340-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path products/nrf52840-router/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/nrf52840-mdk-usb-dongle/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/nrf52840-pca10059/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/nrf52840-promicro/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/efr32mg21-devkit/Cargo.toml -- --check
+          cargo fmt --manifest-path products/efr32mg21-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path products/phy62x2-evk/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/nrf52840-router/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/nrf52840-sensor-uf2/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/esp32c6-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/esp32h2-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/cc2340-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/phy6222-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/efr32mg1-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/efr32mg21-sensor/Cargo.toml -- --check
 
   doc:
     name: Doc
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --workspace --no-deps
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: x86_64-unknown-linux-gnu-workspace-${{ env.RUST_TOOLCHAIN }}-doc-${{ hashFiles('Cargo.lock') }}
+      - run: cargo doc --workspace --no-deps --locked
 
   # ── Cross-compile hardware examples ──────────────────────────
   # These are standalone crates (not workspace members) targeting
@@ -114,29 +231,69 @@ jobs:
   # source change and made the 220 KiB growth gate non-reproducible.
 
   build-nrf52840:
-    name: Build nRF52840 sensor
+    name: Build nRF52840 sensor (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            features: ""
+            budget: 225280
+            artifact: nrf52840-sensor-firmware
+          - variant: bme280
+            features: sensor-bme280
+            budget: 245760
+            artifact: nrf52840-sensor-bme280-firmware
+          - variant: sht31
+            features: sensor-sht31
+            budget: 241664
+            artifact: nrf52840-sensor-sht31-firmware
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
-          toolchain: nightly-2026-03-23
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: thumbv7em-none-eabihf
           components: llvm-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/nrf52840-sensor
+          key: thumbv7em-nrf52840-sensor-${{ env.RUST_TOOLCHAIN }}-${{ matrix.variant }}-${{ hashFiles('examples/nrf52840-sensor/Cargo.lock', 'products/nrf52840-sensor/link/**') }}
       - name: Build nRF52840 sensor (release)
         working-directory: examples/nrf52840-sensor
-        run: cargo build --release
+        run: |
+          if [[ -n "${{ matrix.features }}" ]]; then
+            cargo build --release --locked --features "${{ matrix.features }}"
+          else
+            cargo build --release --locked
+          fi
       - name: Create firmware artifacts
         run: |
           ELF=examples/nrf52840-sensor/target/thumbv7em-none-eabihf/release/nrf52840-sensor
-          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
-          $OBJCOPY -O binary $ELF ${ELF}.bin
-          $OBJCOPY -O ihex   $ELF ${ELF}.hex
-          ./tools/firmware-size-report.sh nrf52840-sensor ${ELF}.bin 225280 ${ELF}.size.json
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+          "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+          # Measured on nightly-2026-03-23: default=223344 B,
+          # BME280=230560 B and SHT31=227040 B intentionally use their
+          # larger feature-specific budgets. Keep the default sensor within
+          # its strict 220 KiB gate, separate from the hard 0x000FE000
+          # partition boundary.
+          ./tools/firmware-size-report.sh \
+            nrf52840-sensor-${{ matrix.variant }} ${ELF}.bin \
+            ${{ matrix.budget }} ${ELF}.size.json
+          IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
+          if [ "$IMAGE_BYTES" -gt 1040384 ]; then
+            echo "nRF52840 image ($IMAGE_BYTES B) overruns application flash ending at 0x000FE000" >&2
+            exit 1
+          fi
+          LAYOUT="$("$NM" -n "$ELF")"
+          if ! grep -q '^000fe000 A _security_partition_start$' <<<"$LAYOUT" ||
+             ! grep -q '^00100000 A _security_partition_end$' <<<"$LAYOUT"; then
+            echo "nRF52840 sensor linker symbols do not preserve 0x000FE000..0x00100000" >&2
+            exit 1
+          fi
           SYMS="$("$NM" --demangle "$ELF")"
           if grep -q 'core::slice::sort' <<<"$SYMS"; then
             echo "nRF52840 image contains generic slice sorting" >&2
@@ -164,7 +321,6 @@ jobs:
           # belongs to the end-device role, so its `#[inline(never)]` helpers
           # must be retained in the sensor image (and are compiled out of the
           # relay/router — verified in the router job below).
-          ED_CLIENT_SYMS='resume_end_device_timeout|service_end_device_timeout|apply_end_device_timeout_change|send_ed_timeout_request_tracked'
           for sym in resume_end_device_timeout service_end_device_timeout apply_end_device_timeout_change send_ed_timeout_request_tracked; do
             if ! "$NM" --demangle "$ELF" | grep -q "$sym"; then
               echo "nRF52840 sensor is missing End Device Timeout CLIENT symbol: $sym" >&2
@@ -172,100 +328,186 @@ jobs:
             fi
           done
       - name: Upload nRF52840 firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: nrf52840-sensor-firmware
+          name: ${{ matrix.artifact }}
           path: |
             examples/nrf52840-sensor/target/thumbv7em-none-eabihf/release/nrf52840-sensor.bin
             examples/nrf52840-sensor/target/thumbv7em-none-eabihf/release/nrf52840-sensor.hex
             examples/nrf52840-sensor/target/thumbv7em-none-eabihf/release/nrf52840-sensor.size.json
+          if-no-files-found: error
 
-  build-nrf52840-router:
-    name: Build nRF52840 router
+  build-nrf52840-always-on-end-device:
+    name: Build nRF52840 always-on End Device
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
-          toolchain: nightly-2026-03-23
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: thumbv7em-none-eabihf
           components: llvm-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/nrf52840-router
-      - name: Build nRF52840 router (release)
+          key: thumbv7em-nrf52840-router-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('examples/nrf52840-router/Cargo.lock', 'products/nrf52840-router/link/**') }}
+      - name: Build nRF52840 always-on End Device (release)
         working-directory: examples/nrf52840-router
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: Create firmware artifacts
         run: |
           ELF=examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router
-          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
-          $OBJCOPY -O binary $ELF ${ELF}.bin
-          $OBJCOPY -O ihex   $ELF ${ELF}.hex
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+          "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+          # Measured routing-free AlwaysOnEndDeviceApp image: 214864 B. The 248 KiB
+          # non-sensor regression budget remains below the independent 1016
+          # KiB physical application boundary.
+          ./tools/firmware-size-report.sh nrf52840-always-on-end-device ${ELF}.bin 253952 ${ELF}.size.json
+          IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
+          if [ "$IMAGE_BYTES" -gt 1040384 ]; then
+            echo "nRF52840 always-on End Device ($IMAGE_BYTES B) overruns application flash ending at 0x000FE000" >&2
+            exit 1
+          fi
           SYMS="$("$NM" --demangle "$ELF")"
           if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
-            echo "nRF52840 router image still links software AES" >&2
+            echo "nRF52840 always-on End Device image still links software AES" >&2
             exit 1
           fi
           if ! grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver' <<<"$SYMS"; then
-            echo "nRF52840 router image is missing the Nordic ECB AES backend" >&2
+            echo "nRF52840 always-on End Device image is missing the Nordic ECB AES backend" >&2
             exit 1
           fi
-          # Role-state split: the nRF backend builds the forwarding-only
-          # `RelayRouter` role via `build_relay()`. A relay routes but is not an
-          # end device, so it must carry none of the R22 End Device Timeout
-          # *client* lifecycle — those `#[inline(never)]` helpers must be
-          # compiled out entirely (they are retained in the sensor image).
-          ED_CLIENT_SYMS='resume_end_device_timeout|service_end_device_timeout|apply_end_device_timeout_change|send_ed_timeout_request_tracked'
-          if "$NM" --demangle "$ELF" | grep -Eq "($ED_CLIENT_SYMS)"; then
-            echo "nRF52840 relay links End Device Timeout CLIENT lifecycle symbols:" >&2
-            "$NM" --demangle "$ELF" | grep -E "($ED_CLIENT_SYMS)" >&2
+          # AlwaysOnEndDeviceApp must enter only the typed steering startup/tick
+          # path. Coordinator formation and persisted-PAN restart are separate
+          # futures selected only by CoordinatorApp.
+          COORDINATOR_STARTUP_SYMS='network_formation|start_fresh_coordinator|start_or_resume_coordinator|persist_formed_coordinator|resume_coordinator_network'
+          if grep -Eq "($COORDINATOR_STARTUP_SYMS)" <<<"$SYMS"; then
+            echo "nRF52840 always-on End Device links coordinator startup symbols:" >&2
+            grep -E "($COORDINATOR_STARTUP_SYMS)" <<<"$SYMS" >&2
             exit 1
           fi
-      - name: Upload nRF52840 router firmware
-        uses: actions/upload-artifact@v4
+          # The product linker owns the final two 4 KiB flash pages. Assert
+          # both exported boundaries in addition to memory.x's link-time
+          # ASSERTs, so an accidental fallback to the old full-flash layout
+          # cannot pass artifact generation.
+          LAYOUT="$("$NM" -n "$ELF")"
+          if ! grep -q '^000fe000 A _security_partition_start$' <<<"$LAYOUT"; then
+            echo "nRF52840 always-on End Device security journal does not start at 0x000FE000" >&2
+            exit 1
+          fi
+          if ! grep -q '^00100000 A _security_partition_end$' <<<"$LAYOUT"; then
+            echo "nRF52840 always-on End Device security journal does not end at 0x00100000" >&2
+            exit 1
+          fi
+          # NrfMac has no ParentMacDriver. The image must therefore be a
+          # non-routing, receiver-on End Device — never a RelayRouter.
+          if ! grep -Eq 'zigbee_runtime::role::EndDevice.*router_app::children::NoChildren.*router_app::app::AlwaysOnEndDeviceArchetype' <<<"$SYMS"; then
+            echo "nRF52840 image is missing AlwaysOnEndDeviceApp composition symbols" >&2
+            exit 1
+          fi
+          if grep -q 'zigbee_runtime::role::RelayRouter' <<<"$SYMS"; then
+            echo "nRF52840 End Device still links RelayRouter" >&2
+            exit 1
+          fi
+          if ! grep -q 'nrf52840_router_product::storage::target::SecurityFlash' <<<"$SYMS"; then
+            echo "nRF52840 always-on End Device is missing its product security journal" >&2
+            exit 1
+          fi
+          ROUTER_OR_PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if grep -Eq "($ROUTER_OR_PARENT_SYMS)" <<<"$SYMS"; then
+            echo "nRF52840 End Device links router or parent symbols:" >&2
+            grep -E "($ROUTER_OR_PARENT_SYMS)" <<<"$SYMS" >&2
+            exit 1
+          fi
+          if cargo tree --locked --manifest-path examples/nrf52840-router/Cargo.toml \
+              -e features -i zigbee-runtime | grep -q 'zigbee-runtime feature "router"'; then
+            echo "nRF52840 End Device dependency graph enables zigbee-runtime/router" >&2
+            exit 1
+          fi
+          # Receiver-on-when-idle does not make an End Device a router. The
+          # R22 End Device Timeout client lifecycle remains required.
+          for sym in resume_end_device_timeout service_end_device_timeout apply_end_device_timeout_change send_ed_timeout_request_tracked; do
+            if ! "$NM" --demangle "$ELF" | grep -q "$sym"; then
+              echo "nRF52840 End Device is missing End Device Timeout CLIENT symbol: $sym" >&2
+              exit 1
+            fi
+          done
+      - name: Upload nRF52840 always-on End Device firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: nrf52840-router-firmware
+          name: nrf52840-always-on-end-device-firmware
           path: |
             examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.bin
             examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.hex
+            examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.size.json
+          if-no-files-found: error
 
   build-nrf52833:
-    name: Build nRF52833 sensor
+    name: Build nRF52833 sensor (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            features: ""
+            budget: 225280
+            artifact: nrf52833-sensor-firmware
+          - variant: bme280
+            features: sensor-bme280
+            budget: 245760
+            artifact: nrf52833-sensor-bme280-firmware
+          - variant: sht31
+            features: sensor-sht31
+            budget: 241664
+            artifact: nrf52833-sensor-sht31-firmware
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
-          toolchain: nightly-2026-03-23
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: thumbv7em-none-eabihf
           components: llvm-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/nrf52833-sensor
+          key: thumbv7em-nrf52833-sensor-${{ env.RUST_TOOLCHAIN }}-${{ matrix.variant }}-${{ hashFiles('examples/nrf52833-sensor/Cargo.lock', 'products/nrf52833-sensor/link/**') }}
       - name: Build nRF52833 sensor (release)
         working-directory: examples/nrf52833-sensor
-        run: cargo build --release
+        run: |
+          if [[ -n "${{ matrix.features }}" ]]; then
+            cargo build --release --locked --features "${{ matrix.features }}"
+          else
+            cargo build --release --locked
+          fi
       - name: Create firmware artifacts
         run: |
           ELF=examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor
-          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
-          $OBJCOPY -O binary $ELF ${ELF}.bin
-          $OBJCOPY -O ihex   $ELF ${ELF}.hex
-          # Same tight size budget as the nRF52840 sensor: the two images
-          # are the same firmware and currently differ by only a few bytes,
-          # so a regression in either shows up immediately. The 504 KiB
-          # application region is checked separately below — that is the
-          # hard, brick-class boundary, this is the growth gate.
-          ./tools/firmware-size-report.sh nrf52833-sensor ${ELF}.bin 225280 ${ELF}.size.json
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+          "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+          # Measured on nightly-2026-03-23: default=223400 B,
+          # BME280=230976 B and SHT31=227128 B intentionally use their
+          # larger feature-specific budgets. Keep the default sensor within
+          # its strict 220 KiB gate while the 504 KiB boundary remains hard.
+          ./tools/firmware-size-report.sh \
+            nrf52833-sensor-${{ matrix.variant }} ${ELF}.bin \
+            ${{ matrix.budget }} ${ELF}.size.json
           # The application must never reach the protected security journal
           # at 0x0007E000. memory.x asserts the region boundary at link
           # time; this asserts the produced image against it as well.
           IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
           if [ "$IMAGE_BYTES" -gt 516096 ]; then
             echo "nRF52833 image ($IMAGE_BYTES B) overruns the 504 KiB application flash region" >&2
+            exit 1
+          fi
+          LAYOUT="$("$NM" -n "$ELF")"
+          if ! grep -q '^0007e000 A _security_partition_start$' <<<"$LAYOUT" ||
+             ! grep -q '^00080000 A _security_partition_end$' <<<"$LAYOUT"; then
+            echo "nRF52833 linker symbols do not preserve 0x0007E000..0x00080000" >&2
             exit 1
           fi
           SYMS="$("$NM" --demangle "$ELF")"
@@ -297,49 +539,96 @@ jobs:
               exit 1
             fi
           done
-      - name: Build nRF52833 sensor variants (release)
-        working-directory: examples/nrf52833-sensor
-        run: |
-          cargo build --release --features sensor-bme280
-          cargo build --release --features sensor-sht31
       - name: Upload nRF52833 firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: nrf52833-sensor-firmware
+          name: ${{ matrix.artifact }}
           path: |
             examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor.bin
             examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor.hex
             examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor.size.json
+          if-no-files-found: error
 
   build-nrf52840-uf2:
-    name: Build nRF52840 sensor (UF2)
+    name: Build nRF52840 sensor UF2 (${{ matrix.board }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board: promicro
+            feature: board-promicro
+            artifact: nrf52840-sensor-uf2-firmware
+            app_start: "00026000"
+            app_end: "000ee000"
+            security_start: "000ee000"
+            security_end: "000f0000"
+            bootloader_start: "000f4000"
+            boot_state_start: "000fe000"
+          - board: mdk
+            feature: board-mdk
+            artifact: nrf52840-sensor-uf2-mdk-firmware
+            app_start: "00001000"
+            app_end: "000f2000"
+            security_start: "000f2000"
+            security_end: "000f4000"
+            bootloader_start: "000f4000"
+            boot_state_start: "000fe000"
+          - board: pca10059
+            feature: board-nrf-dongle
+            artifact: nrf52840-sensor-uf2-pca10059-firmware
+            app_start: "00001000"
+            app_end: "000f2000"
+            security_start: "000f2000"
+            security_end: "000f4000"
+            bootloader_start: "000f4000"
+            boot_state_start: "000fe000"
+          - board: dk
+            feature: board-nrf-dk
+            artifact: nrf52840-sensor-uf2-dk-firmware
+            app_start: "00000000"
+            app_end: "000fe000"
+            security_start: "000fe000"
+            security_end: "00100000"
+            bootloader_start: "00100000"
+            boot_state_start: "00100000"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
-          toolchain: nightly-2026-03-23
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: thumbv7em-none-eabihf
           components: llvm-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/nrf52840-sensor-uf2
-      - uses: actions/setup-python@v5
+          key: thumbv7em-nrf52840-uf2-${{ env.RUST_TOOLCHAIN }}-${{ matrix.board }}-${{ hashFiles('examples/nrf52840-sensor-uf2/Cargo.lock', 'products/nrf52840-sensor/link/uf2-*.x') }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          python-version: '3.x'
+          python-version: "3.12.11"
       - name: Install UF2 converter
-        run: pip install --quiet intelhex
+        run: python -m pip install --disable-pip-version-check --no-deps intelhex==2.3.0
       - name: Build nRF52840 UF2 sensor (release)
         working-directory: examples/nrf52840-sensor-uf2
-        run: cargo build --release
+        run: cargo build --release --locked --no-default-features --features "${{ matrix.feature }}"
       - name: Create firmware artifacts (.bin, .hex, .uf2)
         run: |
           ELF=examples/nrf52840-sensor-uf2/target/thumbv7em-none-eabihf/release/nrf52840-sensor-uf2
-          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
-          $OBJCOPY -O binary $ELF ${ELF}.bin
-          $OBJCOPY -O ihex   $ELF ${ELF}.hex
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+          "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+          # All four final images measure 221736..223456 B. The 232 KiB
+          # regression budget is independent of each board's checked linker
+          # partition boundary.
+          ./tools/firmware-size-report.sh \
+            nrf52840-sensor-uf2-${{ matrix.board }} ${ELF}.bin \
+            237568 ${ELF}.size.json
           SYMS="$("$NM" --demangle "$ELF")"
+          if grep -q 'core::slice::sort' <<<"$SYMS"; then
+            echo "nRF52840 UF2 image contains generic slice sorting" >&2
+            exit 1
+          fi
           if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
             echo "nRF52840 UF2 production image still links software AES" >&2
             exit 1
@@ -348,23 +637,65 @@ jobs:
             echo "nRF52840 UF2 image is missing the Nordic ECB AES backend" >&2
             exit 1
           fi
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
+            echo "nRF52840 UF2 sensor links parent/router maintenance symbols:" >&2
+            grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
+            exit 1
+          fi
+          for sym in resume_end_device_timeout service_end_device_timeout apply_end_device_timeout_change send_ed_timeout_request_tracked; do
+            if ! grep -q "$sym" <<<"$SYMS"; then
+              echo "nRF52840 UF2 sensor is missing End Device Timeout CLIENT symbol: $sym" >&2
+              exit 1
+            fi
+          done
+
+          LAYOUT="$("$NM" -n "$ELF")"
+          expect_symbol() {
+            actual=$(awk -v name="$1" '$3 == name { print $1; exit }' <<<"$LAYOUT")
+            if [[ "$actual" != "$2" ]]; then
+              echo "$1 is ${actual:-missing}, expected $2 for ${{ matrix.board }}" >&2
+              exit 1
+            fi
+          }
+          expect_symbol _application_start "${{ matrix.app_start }}"
+          expect_symbol _application_end "${{ matrix.app_end }}"
+          expect_symbol _security_partition_start "${{ matrix.security_start }}"
+          expect_symbol _security_partition_end "${{ matrix.security_end }}"
+          expect_symbol _bootloader_start "${{ matrix.bootloader_start }}"
+          expect_symbol _boot_state_start "${{ matrix.boot_state_start }}"
+          IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
+          APP_START=$((16#${{ matrix.app_start }}))
+          SECURITY_START=$((16#${{ matrix.security_start }}))
+          if (( APP_START + IMAGE_BYTES > SECURITY_START )); then
+            printf 'nRF52840 UF2 %s image [0x%X..0x%X) reaches security at 0x%X\n' \
+              '${{ matrix.board }}' "$APP_START" "$((APP_START + IMAGE_BYTES))" \
+              "$SECURITY_START" >&2
+            exit 1
+          fi
 
           echo "=== Firmware sizes ==="
           ls -la ${ELF}.bin ${ELF}.hex
 
-          # Download uf2conv.py from Microsoft's UF2 repo
-          curl -sL https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2conv.py -o uf2conv.py
-          curl -sL https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2families.json -o uf2families.json
+          # Fetch the converter from one immutable Microsoft UF2 revision.
+          curl --fail --location --retry 3 \
+            "https://raw.githubusercontent.com/microsoft/uf2/${UF2_COMMIT}/utils/uf2conv.py" \
+            -o /tmp/uf2conv.py
+          curl --fail --location --retry 3 \
+            "https://raw.githubusercontent.com/microsoft/uf2/${UF2_COMMIT}/utils/uf2families.json" \
+            -o /tmp/uf2families.json
           # Convert .hex → .uf2 (hex already contains base address info)
-          python uf2conv.py -c -f 0xADA52840 ${ELF}.hex -o ${ELF}.uf2
+          python /tmp/uf2conv.py -c -f 0xADA52840 ${ELF}.hex -o ${ELF}.uf2
       - name: Upload nRF52840 UF2 firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: nrf52840-sensor-uf2-firmware
+          name: ${{ matrix.artifact }}
           path: |
             examples/nrf52840-sensor-uf2/target/thumbv7em-none-eabihf/release/nrf52840-sensor-uf2.bin
             examples/nrf52840-sensor-uf2/target/thumbv7em-none-eabihf/release/nrf52840-sensor-uf2.hex
             examples/nrf52840-sensor-uf2/target/thumbv7em-none-eabihf/release/nrf52840-sensor-uf2.uf2
+            examples/nrf52840-sensor-uf2/target/thumbv7em-none-eabihf/release/nrf52840-sensor-uf2.size.json
+          if-no-files-found: error
 
   # esp-hal 1.0.0's MMIO const references are rejected by the stricter CTFE
   # provenance checks in nightly-2026-08-02. Pin only the ESP builds to the
@@ -373,19 +704,23 @@ jobs:
     name: Build ESP32-C6 sensor
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
-          toolchain: nightly-2026-08-01
+          toolchain: ${{ env.ESP_PHY_RUST_TOOLCHAIN }}
           targets: riscv32imac-unknown-none-elf
           components: rust-src, llvm-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/esp32c6-sensor
+          key: riscv32imac-esp32c6-${{ env.ESP_PHY_RUST_TOOLCHAIN }}-ota-${{ hashFiles('examples/esp32c6-sensor/Cargo.lock', 'products/esp32-zigbee-devkit/partitions/**') }}
+      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: espflash@${{ env.ESPFLASH_VERSION }}
       - name: Build ESP32-C6 sensor (release)
         working-directory: examples/esp32c6-sensor
-        run: cargo build --release -Z build-std=core,alloc
-      - name: Check ESP32-C6 hardware AES
+        run: cargo build --release --locked -Z build-std=core,alloc
+      - name: Check ESP32-C6 hardware AES and role split
         run: |
           ELF=examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
@@ -398,35 +733,60 @@ jobs:
             echo "ESP32-C6 production image is missing the hardware AES backend" >&2
             exit 1
           fi
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
+            echo "ESP32-C6 sensor links parent/router maintenance symbols:" >&2
+            grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
+            exit 1
+          fi
       - name: Create firmware artifacts
         run: |
           ELF=examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
-          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          $OBJCOPY -O binary $ELF ${ELF}.bin
+          CSV=products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv
+          espflash save-image --skip-update-check --chip esp32c6 \
+            --partition-table "$CSV" --target-app-partition ota_0 \
+            "$ELF" "${ELF}.app.bin"
+          espflash save-image --skip-update-check --chip esp32c6 \
+            --merge --skip-padding --flash-size 4mb \
+            --partition-table "$CSV" --target-app-partition ota_0 \
+            "$ELF" "${ELF}.bin"
+          python3 products/esp32-zigbee-devkit/partitions/check-app-image-size.py \
+            --chip esp32c6 --slot ota_0 --merged "${ELF}.bin" "${ELF}.app.bin"
+          # Final app image measured 354512 B. Keep its regression budget
+          # independent of the checked 0x1F0000-byte physical OTA slot.
+          ./tools/firmware-size-report.sh \
+            esp32c6-sensor "${ELF}.app.bin" 368640 "${ELF}.size.json"
       - name: Upload ESP32-C6 firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: esp32c6-sensor-firmware
           path: |
             examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/release/esp32c6-sensor.bin
+            examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/release/esp32c6-sensor.app.bin
+            examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/release/esp32c6-sensor.size.json
+          if-no-files-found: error
 
   build-esp32h2:
     name: Build ESP32-H2 sensor
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
-          toolchain: nightly-2026-08-01
+          toolchain: ${{ env.ESP_PHY_RUST_TOOLCHAIN }}
           targets: riscv32imac-unknown-none-elf
           components: rust-src, llvm-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/esp32h2-sensor
+          key: riscv32imac-esp32h2-${{ env.ESP_PHY_RUST_TOOLCHAIN }}-ota-${{ hashFiles('examples/esp32h2-sensor/Cargo.lock', 'products/esp32-zigbee-devkit/partitions/**') }}
+      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: espflash@${{ env.ESPFLASH_VERSION }}
       - name: Build ESP32-H2 sensor (release)
         working-directory: examples/esp32h2-sensor
-        run: cargo build --release -Z build-std=core,alloc
-      - name: Check ESP32-H2 hardware AES
+        run: cargo build --release --locked -Z build-std=core,alloc
+      - name: Check ESP32-H2 hardware AES and role split
         run: |
           ELF=examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
@@ -439,54 +799,86 @@ jobs:
             echo "ESP32-H2 production image is missing the hardware AES backend" >&2
             exit 1
           fi
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
+            echo "ESP32-H2 sensor links parent/router maintenance symbols:" >&2
+            grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
+            exit 1
+          fi
       - name: Create firmware artifacts
         run: |
           ELF=examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor
-          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          $OBJCOPY -O binary $ELF ${ELF}.bin
+          CSV=products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv
+          espflash save-image --skip-update-check --chip esp32h2 \
+            --partition-table "$CSV" --target-app-partition ota_0 \
+            "$ELF" "${ELF}.app.bin"
+          espflash save-image --skip-update-check --chip esp32h2 \
+            --merge --skip-padding --flash-size 4mb \
+            --partition-table "$CSV" --target-app-partition ota_0 \
+            "$ELF" "${ELF}.bin"
+          python3 products/esp32-zigbee-devkit/partitions/check-app-image-size.py \
+            --chip esp32h2 --slot ota_0 --merged "${ELF}.bin" "${ELF}.app.bin"
+          # Final app image measured 339568 B. Keep its regression budget
+          # independent of the checked 0x1F0000-byte physical OTA slot.
+          ./tools/firmware-size-report.sh \
+            esp32h2-sensor "${ELF}.app.bin" 352256 "${ELF}.size.json"
       - name: Upload ESP32-H2 firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: esp32h2-sensor-firmware
           path: |
             examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.bin
+            examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.app.bin
+            examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.size.json
+          if-no-files-found: error
 
   build-bl702:
     name: Build BL702 sensor
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: riscv32imc-unknown-none-elf
           components: rust-src, llvm-tools, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             bl702-hal
             boards/bl702-xt-zb1
             products/bl702-xt-zb1
             examples/bl702-sensor
+          key: riscv32imc-bl702-${{ env.RUST_TOOLCHAIN }}-boot-image-${{ hashFiles('bl702-hal/Cargo.lock', 'boards/bl702-xt-zb1/Cargo.lock', 'products/bl702-xt-zb1/Cargo.lock', 'examples/bl702-sensor/Cargo.lock', 'products/bl702-xt-zb1/link/**') }}
       - name: Test and lint BL702 platform crates
         run: |
           HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-          cargo test --manifest-path bl702-hal/Cargo.toml --target "$HOST_TARGET"
-          cargo test --manifest-path boards/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET"
-          cargo test --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET"
-          cargo clippy --manifest-path bl702-hal/Cargo.toml --target "$HOST_TARGET" -- -D warnings
-          cargo clippy --manifest-path boards/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" -- -D warnings
-          cargo clippy --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" -- -D warnings
-          cargo clippy --manifest-path bl702-hal/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
-          cargo clippy --manifest-path boards/bl702-xt-zb1/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
-          cargo clippy --manifest-path products/bl702-xt-zb1/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
+          cargo test --locked --manifest-path bl702-hal/Cargo.toml --target "$HOST_TARGET"
+          cargo test --locked --manifest-path boards/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET"
+          cargo test --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET"
+          cargo clippy --locked --manifest-path bl702-hal/Cargo.toml --target "$HOST_TARGET" -- -D warnings
+          cargo clippy --locked --manifest-path boards/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" -- -D warnings
+          cargo clippy --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" -- -D warnings
+          cargo clippy --locked --manifest-path bl702-hal/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
+          cargo clippy --locked --manifest-path boards/bl702-xt-zb1/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
+          cargo clippy --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
       - name: Build BL702 sensor (release)
         working-directory: examples/bl702-sensor
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: Clippy BL702 production composition
         working-directory: examples/bl702-sensor
-        run: cargo clippy --release --target riscv32imc-unknown-none-elf -- -D warnings
-      - name: Install Bouffalo image tool
-        run: python3 -m pip install --disable-pip-version-check bflb-mcu-tool==1.10.0
+        run: cargo clippy --release --locked --target riscv32imc-unknown-none-elf -- -D warnings
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: 3.11.9
+      - name: Install pinned Bouffalo image tool
+        run: |
+          PACKAGE="$RUNNER_TEMP/bflb-mcu-tool-1.10.0.tar.gz"
+          python3 -m pip download --disable-pip-version-check --no-deps \
+            --dest "$RUNNER_TEMP" bflb-mcu-tool==1.10.0
+          echo "cd09a9b2a5652ad8623ae275a49179c48edd8c90a893851000b08e3b104a46ac  $PACKAGE" \
+            | sha256sum --check
+          python3 -m pip install --disable-pip-version-check "$PACKAGE"
       - name: Create firmware artifacts
         working-directory: examples/bl702-sensor
         run: ./build-image.sh
@@ -494,9 +886,21 @@ jobs:
         run: |
           ELF=examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor
           RAW=${ELF}.bin
+          FLASH=${ELF}.flash.bin
           OBJDUMP=$(find "$(rustc --print sysroot)" -name llvm-objdump -print -quit)
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
-          ./tools/firmware-size-report.sh bl702-sensor "$RAW" 196608 ${ELF}.size.json
+          RAW_BYTES=$(stat -c '%s' "$RAW")
+          FLASH_BYTES=$(stat -c '%s' "$FLASH")
+          if (( RAW_BYTES > 0x80000 )); then
+            echo "BL702 linked XIP image is ${RAW_BYTES} B; the physical XIP slot is 0x80000 B" >&2
+            exit 1
+          fi
+          if (( FLASH_BYTES > 0xFE000 )); then
+            echo "BL702 boot image is ${FLASH_BYTES} B; security storage starts at physical 0xFE000" >&2
+            exit 1
+          fi
+          # Final linked raw image measured 182786 B.
+          ./tools/firmware-size-report.sh bl702-sensor "$RAW" 192512 ${ELF}.size.json
           SYMS="$("$NM" --demangle "$ELF")"
           if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
             echo "BL702 production image still links the software AES core" >&2
@@ -532,7 +936,7 @@ jobs:
             exit 1
           fi
       - name: Upload BL702 sensor
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bl702-sensor-firmware
           path: |
@@ -540,6 +944,7 @@ jobs:
             examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.bin
             examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.flash.bin
             examples/bl702-sensor/target/riscv32imc-unknown-none-elf/release/bl702-sensor.size.json
+          if-no-files-found: error
 
 
   # ── CC2340 (TI, ARM Cortex-M0+) ────────────────────────────
@@ -547,41 +952,93 @@ jobs:
     name: Build CC2340 sensor
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: thumbv6m-none-eabi
           components: rust-src, llvm-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/cc2340-sensor
-      - name: Checkout pinned TI radio sources
+          cache-targets: false
+          key: thumbv6m-cc2340-${{ env.RUST_TOOLCHAIN }}-fallback-sdk-${{ env.CC2340_SDK_COMMIT }}-${{ hashFiles('examples/cc2340-sensor/Cargo.lock', 'examples/cc2340-sensor/memory.x') }}
+      - name: Build CC2340 explicit fallback mode
+        working-directory: examples/cc2340-sensor
         run: |
-          SDK_DIR="$RUNNER_TEMP/simplelink-lowpower-f3-sdk"
-          git init "$SDK_DIR"
-          git -C "$SDK_DIR" remote add origin https://github.com/TexasInstruments/simplelink-lowpower-f3-sdk.git
-          git -C "$SDK_DIR" sparse-checkout init --cone
-          git -C "$SDK_DIR" sparse-checkout set source/ti/devices/cc23x0r5 source/ti/devices/radioconfig
-          git -C "$SDK_DIR" fetch --depth=1 --filter=blob:none origin 68ca021502383f367d0bf2a5517fdd0dcb0ef909
-          git -C "$SDK_DIR" checkout --detach FETCH_HEAD
-      - name: Build CC2340 sensor (release)
+          env -u CC2340_SDK_DIR cargo build --release --locked --target-dir target/fallback
+          ELF=target/fallback/thumbv6m-none-eabi/release/cc2340-sensor
+          if ! grep -aFq 'radio firmware unavailable' "$ELF"; then
+            echo "CC2340 fallback image is missing its unavailable-radio marker" >&2
+            exit 1
+          fi
+          if grep -aFq 'TI SimpleLink Low Power F3 SDK cc23x0r5/rf_patches' "$ELF"; then
+            echo "CC2340 fallback image unexpectedly contains the SDK radio marker" >&2
+            exit 1
+          fi
+      - name: Check out pinned TI radio sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: TexasInstruments/simplelink-lowpower-f3-sdk
+          ref: ${{ env.CC2340_SDK_COMMIT }}
+          path: .ci/simplelink-lowpower-f3-sdk
+          fetch-depth: 1
+          sparse-checkout: |
+            source/ti/devices/cc23x0r5
+            source/ti/devices/radioconfig
+      - name: Build CC2340 pinned-SDK mode
         working-directory: examples/cc2340-sensor
         env:
-          CC2340_SDK_DIR: ${{ runner.temp }}/simplelink-lowpower-f3-sdk
-        run: cargo build --release
-      - name: Create firmware artifacts
+          CC2340_SDK_DIR: ${{ github.workspace }}/.ci/simplelink-lowpower-f3-sdk
+        run: cargo build --release --locked --target-dir target/sdk
+      - name: Check CC2340 SDK, layout, AES, and role gates
         run: |
-          ELF=examples/cc2340-sensor/target/thumbv6m-none-eabi/release/cc2340-sensor
-          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          $OBJCOPY -O binary $ELF ${ELF}.bin
-          $OBJCOPY -O ihex   $ELF ${ELF}.hex
+          ELF=examples/cc2340-sensor/target/sdk/thumbv6m-none-eabi/release/cc2340-sensor
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          if ! grep -aFq 'TI SimpleLink Low Power F3 SDK cc23x0r5/rf_patches' "$ELF"; then
+            echo "CC2340 SDK image is missing the pinned radio-firmware marker" >&2
+            exit 1
+          fi
+          LAYOUT="$("$NM" -n "$ELF")"
+          if ! grep -q '^0007e000 A _security_partition_start$' <<<"$LAYOUT" ||
+             ! grep -q '^00080000 A _security_partition_end$' <<<"$LAYOUT"; then
+            echo "CC2340 linker symbols do not preserve 0x0007E000..0x00080000" >&2
+            exit 1
+          fi
+          SYMS="$("$NM" --demangle "$ELF")"
+          if ! grep -Eq 'SoftwareAes128|aes::soft' <<<"$SYMS"; then
+            echo "CC2340 image is missing its currently supported software AES backend" >&2
+            exit 1
+          fi
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
+            echo "CC2340 sensor links parent/router maintenance symbols:" >&2
+            grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
+            exit 1
+          fi
+      - name: Create CC2340 firmware artifacts
+        run: |
+          ELF=examples/cc2340-sensor/target/sdk/thumbv6m-none-eabi/release/cc2340-sensor
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+          "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+          PHYSICAL_BYTES=$(stat -c '%s' "${ELF}.bin")
+          if (( PHYSICAL_BYTES > 0x7E000 )); then
+            echo "CC2340 application is ${PHYSICAL_BYTES} B; protected security storage starts at 0x7E000" >&2
+            exit 1
+          fi
+          # Final pinned-SDK image measured 212688 B.
+          ./tools/firmware-size-report.sh \
+            cc2340-sensor "${ELF}.bin" 225280 "${ELF}.size.json"
       - name: Upload CC2340 firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cc2340-sensor-firmware
           path: |
-            examples/cc2340-sensor/target/thumbv6m-none-eabi/release/cc2340-sensor.bin
-            examples/cc2340-sensor/target/thumbv6m-none-eabi/release/cc2340-sensor.hex
+            examples/cc2340-sensor/target/sdk/thumbv6m-none-eabi/release/cc2340-sensor.bin
+            examples/cc2340-sensor/target/sdk/thumbv6m-none-eabi/release/cc2340-sensor.hex
+            examples/cc2340-sensor/target/sdk/thumbv6m-none-eabi/release/cc2340-sensor.size.json
+          if-no-files-found: error
 
   # ── Telink TLSR8258 (tc32) ───────────────────────────────────
   # Built by .github/workflows/build-tc32.yml using the public
@@ -591,64 +1048,85 @@ jobs:
     name: Build PHY6222 sensor
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # 2026-08-06 started emitting unresolved __aeabi_u{read,write}{4,8}
       # helpers for packed Cortex-M0 accesses.
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
-          toolchain: nightly-2026-08-01
+          toolchain: ${{ env.ESP_PHY_RUST_TOOLCHAIN }}
           targets: thumbv6m-none-eabi
           components: rust-src, llvm-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/phy6222-sensor
+          cache-targets: false
+          key: thumbv6m-phy6222-${{ env.ESP_PHY_RUST_TOOLCHAIN }}-xip-130816-${{ hashFiles('examples/phy6222-sensor/Cargo.lock', 'products/phy62x2-evk/link/**') }}
       - name: Build PHY6222 sensor (release)
         working-directory: examples/phy6222-sensor
-        run: cargo build --release
+        run: cargo build --release --locked
+      - name: Check PHY6222 layout, AES backend, and role split
+        run: |
+          ELF=examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          sh examples/phy6222-sensor/check-layout.sh "$ELF"
+          SYMS="$("$NM" --demangle "$ELF")"
+          if ! grep -Eq 'SoftwareAes128|aes::soft' <<<"$SYMS"; then
+            echo "PHY6222 image is missing its currently supported software AES backend" >&2
+            exit 1
+          fi
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
+            echo "PHY6222 sensor links parent/router maintenance symbols:" >&2
+            grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
+            exit 1
+          fi
       - name: Create firmware artifacts
         run: |
           ELF=examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor
-          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          $OBJCOPY -O ihex   $ELF ${ELF}.hex
-          sh examples/phy6222-sensor/check-layout.sh $ELF
-          cargo run --quiet -p phy62x2-image -- ${ELF}.hex ${ELF}.phy6.bin
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          "$OBJCOPY" -O ihex "$ELF" "${ELF}.hex"
+          cargo run --quiet --locked -p phy62x2-image -- "${ELF}.hex" "${ELF}.phy6.bin"
       - name: Upload PHY6222 firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: phy6222-sensor-firmware
           path: |
             examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor
             examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor.hex
             examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor.phy6.bin
+          if-no-files-found: error
 
   # ── EFR32MG1P (Silicon Labs, ARM Cortex-M4F) ─────────────────
   build-efr32mg1:
     name: Build EFR32MG1 sensor
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: thumbv7em-none-eabi
-          components: rust-src, llvm-tools
-      - uses: Swatinem/rust-cache@v2
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/efr32mg1-sensor
-      - name: Install ARM toolchain
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-arm-none-eabi
+          key: thumbv7em-efr32mg1-${{ env.RUST_TOOLCHAIN }}-tradfri-sed-${{ hashFiles('examples/efr32mg1-sensor/Cargo.lock', 'products/efr32mg1-tradfri/link/**', 'efr32mg1-hal/link/**') }}
       - name: Build EFR32MG1 sensor (release)
         working-directory: examples/efr32mg1-sensor
-        run: cargo build --release
+        run: cargo build --release --locked
+      - name: Clippy EFR32MG1 production composition
+        working-directory: examples/efr32mg1-sensor
+        run: cargo clippy --release --locked --target thumbv7em-none-eabi -- -D warnings
       - name: Create firmware artifacts
         run: |
           ELF=examples/efr32mg1-sensor/target/thumbv7em-none-eabi/release/efr32mg1-sensor
-          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          NM=$(find $(rustc --print sysroot) -name llvm-nm | head -1)
-          $OBJCOPY -O binary $ELF ${ELF}.bin
-          $OBJCOPY -O ihex   $ELF ${ELF}.hex
-          ./tools/firmware-size-report.sh efr32mg1-sensor ${ELF}.bin 163840 ${ELF}.size.json
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+          "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+          # Final binary measured 156612 B.
+          ./tools/firmware-size-report.sh efr32mg1-sensor ${ELF}.bin 167936 ${ELF}.size.json
+          python3 examples/efr32mg1-sensor/tools/verify-layout.py "$ELF"
           NM="$NM" examples/efr32mg1-sensor/check-layout.sh "$ELF"
           SYMS="$("$NM" --demangle "$ELF")"
           if grep -q 'core::slice::sort' <<<"$SYMS"; then
@@ -671,42 +1149,66 @@ jobs:
             exit 1
           fi
       - name: Upload EFR32MG1 firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: efr32mg1-sensor-firmware
           path: |
             examples/efr32mg1-sensor/target/thumbv7em-none-eabi/release/efr32mg1-sensor.bin
             examples/efr32mg1-sensor/target/thumbv7em-none-eabi/release/efr32mg1-sensor.hex
             examples/efr32mg1-sensor/target/thumbv7em-none-eabi/release/efr32mg1-sensor.size.json
+          if-no-files-found: error
 
   build-efr32mg21:
     name: Build EFR32MG21 sensor
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: thumbv8m.main-none-eabihf
-          components: rust-src, llvm-tools
-      - uses: Swatinem/rust-cache@v2
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/efr32mg21-sensor
+          key: thumbv8m-efr32mg21-${{ env.RUST_TOOLCHAIN }}-sed-${{ hashFiles('examples/efr32mg21-sensor/Cargo.lock', 'products/efr32mg21-sensor/link/**', 'efr32mg21-hal/link/**') }}
       - name: Build EFR32MG21 sensor (release)
         working-directory: examples/efr32mg21-sensor
-        run: cargo build --release
+        run: cargo build --release --locked
+      - name: Clippy EFR32MG21 production composition
+        working-directory: examples/efr32mg21-sensor
+        run: cargo clippy --release --locked --target thumbv8m.main-none-eabihf -- -D warnings
       - name: Create firmware artifacts
         run: |
           ELF=examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor
-          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
-          $OBJCOPY -O binary $ELF ${ELF}.bin
-          $OBJCOPY -O ihex   $ELF ${ELF}.hex
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+          "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+          # Final binary measured 201192 B.
+          ./tools/firmware-size-report.sh efr32mg21-sensor ${ELF}.bin 212992 ${ELF}.size.json
+          python3 examples/efr32mg21-sensor/tools/verify-layout.py "$ELF"
+          SYMS="$("$NM" --demangle "$ELF")"
+          if ! grep -Eq 'SoftwareAes128|aes::soft' <<<"$SYMS"; then
+            echo "EFR32MG21 image is missing its currently supported software AES backend" >&2
+            exit 1
+          fi
+          # The sensor must compile out the parent/router maintenance subgraph.
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
+            echo "EFR32MG21 sensor links parent/router maintenance symbols:" >&2
+            grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
+            exit 1
+          fi
       - name: Upload EFR32MG21 firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: efr32mg21-sensor-firmware
           path: |
             examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.bin
             examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.hex
+            examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.size.json
+          if-no-files-found: error
 
   # ── Deploy Book + Web Flasher to GitHub Pages ────────────────
   # Builds the mdBook documentation and bundles it with the
@@ -720,24 +1222,24 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install mdBook
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
         with:
-          tool: mdbook
+          tool: mdbook@0.5.4
 
       - name: Build book
         run: mdbook build docs/book
 
       - name: Download ESP32-C6 firmware
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: esp32c6-sensor-firmware
           path: docs/flasher/firmware
 
       - name: Download ESP32-H2 firmware
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: esp32h2-sensor-firmware
           path: docs/flasher/firmware
@@ -768,13 +1270,13 @@ jobs:
           cp -r docs/flasher _site/flasher
 
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
           path: _site
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

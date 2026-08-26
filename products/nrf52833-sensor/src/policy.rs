@@ -27,5 +27,8 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
         reset_blinks: 5,
         reset_phase_ms: 100,
     },
-    sleep_depth: SleepDepth::Idle,
+    // Preserve the Nordic behavior proven before the policy split: RADIO is
+    // disabled for both joined fast-poll and steady-state slow-poll waits.
+    fast_sleep_depth: SleepDepth::Idle,
+    slow_sleep_depth: SleepDepth::Idle,
 };

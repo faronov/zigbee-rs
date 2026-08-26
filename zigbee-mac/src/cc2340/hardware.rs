@@ -131,9 +131,8 @@ pub(crate) fn setup_device_trim() {
     });
 
     if trim_state > 0xFC {
-        let initial = (0x23 << 0) | (0x23 << 6) | (0x8 << 12) | (0x7F << 16) | (0x12 << 23);
-        let target =
-            (0x23 << 0) | (0x23 << 6) | (0x3 << 12) | (0x7F << 16) | (0x12 << 23) | (1 << 30);
+        let initial = 0x23 | (0x23 << 6) | (0x8 << 12) | (0x7F << 16) | (0x12 << 23);
+        let target = 0x23 | (0x23 << 6) | (0x3 << 12) | (0x7F << 16) | (0x12 << 23) | (1 << 30);
         write32(CKMD_HFXTINIT, initial);
         write32(CKMD_HFXTTARG, target);
     }
@@ -450,8 +449,8 @@ pub(crate) fn program_frequency(frequency: u32) -> Result<(), HardwareError> {
     } else {
         find_pll_m_base(compensated_frequency)
     };
-    write32(RFE32_PLLM0, compensated_pll_m * pre_cal0 << 2);
-    write32(RFE32_PLLM1, compensated_pll_m * pre_cal1 << 2);
+    write32(RFE32_PLLM0, (compensated_pll_m * pre_cal0) << 2);
+    write32(RFE32_PLLM1, (compensated_pll_m * pre_cal1) << 2);
 
     if !wait_until(SYNTH_DIVIDER_READY_TICKS, || read32(RFE_DIVSTA) & 1 == 0) {
         return Err(HardwareError::SynthDividerTimeout);

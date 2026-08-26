@@ -666,6 +666,7 @@ dependencies = [
  "nrf52833-dk",
  "nrf52833-sensor-product",
  "panic-probe",
+ "sensor-sed-app",
  "zigbee-bme280",
  "zigbee-mac",
  "zigbee-nwk",
@@ -806,6 +807,7 @@ version = "0.1.0"
 dependencies = [
  "zigbee-mac",
  "zigbee-runtime",
+ "zigbee-zcl",
 ]
 
 [[package]]

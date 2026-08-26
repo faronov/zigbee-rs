@@ -53,7 +53,7 @@ unsafe extern "C" {
     fn PRS_ASYNC_CH1();
     fn PRS_ASYNC_CH2();
     fn PRS_ASYNC_CH3();
-    fn FRC_PRI();     // IRQ 36: Frame Controller — Priority (radio RX/TX)
+    fn FRC_PRI(); // IRQ 36: Frame Controller — Priority (radio RX/TX)
     fn FRC();
     fn MODEM();
     fn PROTIMER();
@@ -76,57 +76,65 @@ unsafe extern "C" {
 #[unsafe(link_section = ".vector_table.interrupts")]
 #[unsafe(no_mangle)]
 pub static __INTERRUPTS: [Vector; 51] = [
-    Vector { handler: EMU },            // IRQ  0: Energy Management Unit
-    Vector { handler: SE },             // IRQ  1: Secure Element
-    Vector { handler: IADC },           // IRQ  2: Incremental ADC
-    Vector { handler: GPIO_EVEN },      // IRQ  3: GPIO Even Pins
-    Vector { handler: TIMER0 },         // IRQ  4: Timer 0
-    Vector { handler: USART0_RX },      // IRQ  5: USART0 RX
-    Vector { handler: USART0_TX },      // IRQ  6: USART0 TX
-    Vector { handler: USART1_RX },      // IRQ  7: USART1 RX
-    Vector { handler: USART1_TX },      // IRQ  8: USART1 TX
-    Vector { handler: USART2_RX },      // IRQ  9: USART2 RX
-    Vector { handler: USART2_TX },      // IRQ 10: USART2 TX
-    Vector { handler: I2C0 },           // IRQ 11: I2C 0
-    Vector { handler: I2C1 },           // IRQ 12: I2C 1
-    Vector { handler: GPIO_ODD },       // IRQ 13: GPIO Odd Pins
-    Vector { handler: LDMA },           // IRQ 14: Linked DMA Controller
-    Vector { handler: LDMA_CH0 },       // IRQ 15: LDMA Channel 0
-    Vector { handler: LDMA_CH1 },       // IRQ 16: LDMA Channel 1
-    Vector { handler: LDMA_CH2 },       // IRQ 17: LDMA Channel 2
-    Vector { handler: LDMA_CH3 },       // IRQ 18: LDMA Channel 3
-    Vector { handler: LDMA_CH4 },       // IRQ 19: LDMA Channel 4
-    Vector { handler: LDMA_CH5 },       // IRQ 20: LDMA Channel 5
-    Vector { handler: LDMA_CH6 },       // IRQ 21: LDMA Channel 6
-    Vector { handler: LDMA_CH7 },       // IRQ 22: LDMA Channel 7
-    Vector { handler: TIMER1 },         // IRQ 23: Timer 1
-    Vector { handler: TIMER2 },         // IRQ 24: Timer 2
-    Vector { handler: TIMER3 },         // IRQ 25: Timer 3
-    Vector { handler: WDOG0 },          // IRQ 26: Watchdog Timer 0
-    Vector { handler: WDOG1 },          // IRQ 27: Watchdog Timer 1
-    Vector { handler: SYSCFG },         // IRQ 28: System Configuration
-    Vector { handler: MSC },            // IRQ 29: Memory System Controller
-    Vector { handler: CRYPTO },         // IRQ 30: Crypto Accelerator
-    Vector { handler: CMU },            // IRQ 31: Clock Management Unit
-    Vector { handler: PRS_ASYNC_CH0 },  // IRQ 32: PRS Async Channel 0
-    Vector { handler: PRS_ASYNC_CH1 },  // IRQ 33: PRS Async Channel 1
-    Vector { handler: PRS_ASYNC_CH2 },  // IRQ 34: PRS Async Channel 2
-    Vector { handler: PRS_ASYNC_CH3 },  // IRQ 35: PRS Async Channel 3
-    Vector { handler: FRC_PRI },        // IRQ 36: Frame Controller — Priority
-    Vector { handler: FRC },            // IRQ 37: Frame Controller
-    Vector { handler: MODEM },          // IRQ 38: Modem
-    Vector { handler: PROTIMER },       // IRQ 39: Protocol Timer
-    Vector { handler: RAC_RSM },        // IRQ 40: Radio Controller — State Machine
-    Vector { handler: RAC_SEQ },        // IRQ 41: Radio Controller — Sequencer
-    Vector { handler: RDMAILBOX },      // IRQ 42: Radio DMA Mailbox
-    Vector { handler: RFSENSE },        // IRQ 43: RF Sense
-    Vector { handler: PRORTC },         // IRQ 44: Protocol Real-Time Counter
-    Vector { handler: SYNTH },          // IRQ 45: Frequency Synthesizer
-    Vector { handler: BUFC },           // IRQ 46: Buffer Controller
-    Vector { handler: AGC },            // IRQ 47: Automatic Gain Control
-    Vector { handler: LETIMER0 },       // IRQ 48: Low Energy Timer 0
-    Vector { handler: BURTC },          // IRQ 49: Backup Real-Time Counter
-    Vector { handler: RTCC },           // IRQ 50: Real-Time Counter and Calendar
+    Vector { handler: EMU },       // IRQ  0: Energy Management Unit
+    Vector { handler: SE },        // IRQ  1: Secure Element
+    Vector { handler: IADC },      // IRQ  2: Incremental ADC
+    Vector { handler: GPIO_EVEN }, // IRQ  3: GPIO Even Pins
+    Vector { handler: TIMER0 },    // IRQ  4: Timer 0
+    Vector { handler: USART0_RX }, // IRQ  5: USART0 RX
+    Vector { handler: USART0_TX }, // IRQ  6: USART0 TX
+    Vector { handler: USART1_RX }, // IRQ  7: USART1 RX
+    Vector { handler: USART1_TX }, // IRQ  8: USART1 TX
+    Vector { handler: USART2_RX }, // IRQ  9: USART2 RX
+    Vector { handler: USART2_TX }, // IRQ 10: USART2 TX
+    Vector { handler: I2C0 },      // IRQ 11: I2C 0
+    Vector { handler: I2C1 },      // IRQ 12: I2C 1
+    Vector { handler: GPIO_ODD },  // IRQ 13: GPIO Odd Pins
+    Vector { handler: LDMA },      // IRQ 14: Linked DMA Controller
+    Vector { handler: LDMA_CH0 },  // IRQ 15: LDMA Channel 0
+    Vector { handler: LDMA_CH1 },  // IRQ 16: LDMA Channel 1
+    Vector { handler: LDMA_CH2 },  // IRQ 17: LDMA Channel 2
+    Vector { handler: LDMA_CH3 },  // IRQ 18: LDMA Channel 3
+    Vector { handler: LDMA_CH4 },  // IRQ 19: LDMA Channel 4
+    Vector { handler: LDMA_CH5 },  // IRQ 20: LDMA Channel 5
+    Vector { handler: LDMA_CH6 },  // IRQ 21: LDMA Channel 6
+    Vector { handler: LDMA_CH7 },  // IRQ 22: LDMA Channel 7
+    Vector { handler: TIMER1 },    // IRQ 23: Timer 1
+    Vector { handler: TIMER2 },    // IRQ 24: Timer 2
+    Vector { handler: TIMER3 },    // IRQ 25: Timer 3
+    Vector { handler: WDOG0 },     // IRQ 26: Watchdog Timer 0
+    Vector { handler: WDOG1 },     // IRQ 27: Watchdog Timer 1
+    Vector { handler: SYSCFG },    // IRQ 28: System Configuration
+    Vector { handler: MSC },       // IRQ 29: Memory System Controller
+    Vector { handler: CRYPTO },    // IRQ 30: Crypto Accelerator
+    Vector { handler: CMU },       // IRQ 31: Clock Management Unit
+    Vector {
+        handler: PRS_ASYNC_CH0,
+    }, // IRQ 32: PRS Async Channel 0
+    Vector {
+        handler: PRS_ASYNC_CH1,
+    }, // IRQ 33: PRS Async Channel 1
+    Vector {
+        handler: PRS_ASYNC_CH2,
+    }, // IRQ 34: PRS Async Channel 2
+    Vector {
+        handler: PRS_ASYNC_CH3,
+    }, // IRQ 35: PRS Async Channel 3
+    Vector { handler: FRC_PRI },   // IRQ 36: Frame Controller — Priority
+    Vector { handler: FRC },       // IRQ 37: Frame Controller
+    Vector { handler: MODEM },     // IRQ 38: Modem
+    Vector { handler: PROTIMER },  // IRQ 39: Protocol Timer
+    Vector { handler: RAC_RSM },   // IRQ 40: Radio Controller — State Machine
+    Vector { handler: RAC_SEQ },   // IRQ 41: Radio Controller — Sequencer
+    Vector { handler: RDMAILBOX }, // IRQ 42: Radio DMA Mailbox
+    Vector { handler: RFSENSE },   // IRQ 43: RF Sense
+    Vector { handler: PRORTC },    // IRQ 44: Protocol Real-Time Counter
+    Vector { handler: SYNTH },     // IRQ 45: Frequency Synthesizer
+    Vector { handler: BUFC },      // IRQ 46: Buffer Controller
+    Vector { handler: AGC },       // IRQ 47: Automatic Gain Control
+    Vector { handler: LETIMER0 },  // IRQ 48: Low Energy Timer 0
+    Vector { handler: BURTC },     // IRQ 49: Backup Real-Time Counter
+    Vector { handler: RTCC },      // IRQ 50: Real-Time Counter and Calendar
 ];
 
 /// EFR32MG21 peripheral interrupt numbers for NVIC control.

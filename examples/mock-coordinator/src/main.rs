@@ -1,270 +1,159 @@
-//! Mock Coordinator Example
-//!
-//! Demonstrates forming a Zigbee network using the zigbee-rs stack.
-//!
-//! This example:
-//! 1. Creates a MockMac configured for coordinator operation
-//! 2. Performs an energy detection scan to select the best channel
-//! 3. Forms the network via MLME-START
-//! 4. Sets up the Trust Center with default link key
-//! 5. Configures address allocation and permit-joining
-//! 6. Prints complete network information
-//!
-//! Run with: cargo run -p mock-coordinator
+//! Finite host composition of a persisted Zigbee coordinator.
 
-use zigbee::coordinator::{Coordinator, CoordinatorConfig};
-use zigbee::trust_center::{DEFAULT_TC_LINK_KEY, TrustCenter};
-use zigbee_mac::MacDriver;
+use router_app::{
+    CoordinatorApp, NoDiagnostics, NoStatus, NoSupervisor, PersistentChildren, RouterParts,
+    RouterPolicy,
+};
+use zigbee_aps::PROFILE_HOME_AUTOMATION;
+use zigbee_mac::EdValue;
 use zigbee_mac::mock::MockMac;
-use zigbee_mac::primitives::*;
-use zigbee_runtime::builder::DeviceBuilder;
-use zigbee_types::*;
+use zigbee_runtime::ZigbeeDevice;
+use zigbee_runtime::child_store::RamChildTableStore;
+use zigbee_runtime::node::ZigbeeNode;
+use zigbee_runtime::power::PowerMode;
+use zigbee_runtime::profile::{ApplicationProfile, DeviceProfile, RangeExtender};
+use zigbee_runtime::role::Router;
+use zigbee_runtime::security_store::{RamSecurityStateStore, SecurityStateStore};
+use zigbee_types::ChannelMask;
+use zigbee_zcl::DeviceId;
+use zigbee_zcl::clusters::basic::PowerSource;
 
-fn main() {
-    println!("╔══════════════════════════════════════════════════════╗");
-    println!("║  zigbee-rs Mock Coordinator                         ║");
-    println!("╚══════════════════════════════════════════════════════╝");
-    println!();
+const COORDINATOR_IEEE: [u8; 8] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
 
-    // ── Step 1: Create MockMac for coordinator ──────────────────────
-    println!("── Step 1: Initialize Coordinator MAC ──");
+static POLICY: RouterPolicy = RouterPolicy {
+    max_receive_slice_us: 1_000,
+    join_retry_initial_ms: 10,
+    join_retry_max_ms: 100,
+    secure_rejoin_failure_limit: 2,
+};
 
-    let coord_ieee: IeeeAddress = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
-    let mut mac = MockMac::new(coord_ieee);
-    println!(
-        "  IEEE address: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        coord_ieee[0],
-        coord_ieee[1],
-        coord_ieee[2],
-        coord_ieee[3],
-        coord_ieee[4],
-        coord_ieee[5],
-        coord_ieee[6],
-        coord_ieee[7]
-    );
+type CoordinatorProfile = DeviceProfile<RangeExtender>;
 
-    // Add energy scan results — lower energy = quieter channel
-    let ed_results = [
-        EdValue {
+fn coordinator_profile() -> CoordinatorProfile {
+    DeviceProfile::new(
+        1,
+        PROFILE_HOME_AUTOMATION,
+        DeviceId::COMBINED_INTERFACE,
+        RangeExtender,
+    )
+}
+
+fn coordinator_device(
+    profile: &CoordinatorProfile,
+    include_energy_scan: bool,
+) -> ZigbeeDevice<MockMac, Router> {
+    let mut mac = MockMac::new(COORDINATOR_IEEE);
+    mac.set_rx_delay_us(u32::MAX);
+    if include_energy_scan {
+        mac.add_energy(EdValue {
             channel: 11,
-            energy: 180,
-        }, // Noisy
-        EdValue {
-            channel: 15,
-            energy: 45,
-        }, // Quiet — best choice
-        EdValue {
-            channel: 20,
             energy: 90,
-        }, // Moderate
-        EdValue {
-            channel: 25,
-            energy: 60,
-        }, // Fairly quiet
-    ];
-    for ed in &ed_results {
-        mac.add_energy(*ed);
+        });
+        mac.add_energy(EdValue {
+            channel: 15,
+            energy: 20,
+        });
     }
-    println!("  Configured energy scan results for 4 channels");
-    println!();
-
-    // ── Step 2: Energy Detection Scan ───────────────────────────────
-    println!("── Step 2: Energy Detection Scan ──");
-
-    let selected_channel = pollster::block_on(async {
-        mac.mlme_reset(true).expect("Reset failed");
-        println!("  MLME-RESET.request(setDefaultPIB=true) → OK");
-
-        let scan_req = MlmeScanRequest {
-            scan_type: ScanType::Ed,
-            channel_mask: ChannelMask::ALL_2_4GHZ,
-            scan_duration: 5,
-        };
-        let scan_result = mac.mlme_scan(scan_req).await.expect("ED scan failed");
-        println!(
-            "  MLME-SCAN.request(ED) → {} measurements",
-            scan_result.energy_list.len()
-        );
-
-        // Select the channel with lowest energy (quietest)
-        let mut best_channel = 11u8;
-        let mut lowest_energy = 255u8;
-        for ed in &scan_result.energy_list {
-            let marker = if ed.energy < lowest_energy {
-                " ← best"
-            } else {
-                ""
-            };
-            println!(
-                "    Channel {}: energy level {}{}",
-                ed.channel, ed.energy, marker
-            );
-            if ed.energy < lowest_energy {
-                lowest_energy = ed.energy;
-                best_channel = ed.channel;
-            }
-        }
-        println!(
-            "  Selected channel {} (energy={})",
-            best_channel, lowest_energy
-        );
-        best_channel
-    });
-    println!();
-
-    // ── Step 3: Form the Network ────────────────────────────────────
-    println!("── Step 3: NLME-NETWORK-FORMATION ──");
-
-    let pan_id = PanId(0x1A62);
-    pollster::block_on(async {
-        let start_req = MlmeStartRequest {
-            pan_id,
-            channel: selected_channel,
-            beacon_order: 15, // Non-beacon network (ZigBee PRO)
-            superframe_order: 15,
-            pan_coordinator: true,
-            battery_life_ext: false,
-        };
-        mac.mlme_start(start_req).await.expect("Start failed");
-        println!("  MLME-START.request → Network formed!");
-        println!("    PAN ID:          0x{:04X}", pan_id.0);
-        println!("    Channel:         {}", selected_channel);
-        println!("    Short address:   0x0000 (coordinator)");
-        println!("    Beacon order:    15 (non-beacon)");
-
-        // Set coordinator short address via PIB
-        mac.mlme_set(
-            zigbee_mac::pib::PibAttribute::MacShortAddress,
-            zigbee_mac::pib::PibValue::ShortAddress(ShortAddress::COORDINATOR),
-        )
-        .await
-        .expect("Set short address failed");
-
-        mac.mlme_set(
-            zigbee_mac::pib::PibAttribute::MacAssociationPermit,
-            zigbee_mac::pib::PibValue::Bool(true),
-        )
-        .await
-        .expect("Set association permit failed");
-
-        println!("    Association:     PERMITTED");
-    });
-    println!();
-
-    // ── Step 4: Trust Center Setup ──────────────────────────────────
-    println!("── Step 4: Trust Center Configuration ──");
-
-    let mut coordinator = Coordinator::new(CoordinatorConfig {
-        channel_mask: ChannelMask::ALL_2_4GHZ,
-        extended_pan_id: coord_ieee,
-        centralized_security: true,
-        require_install_codes: false,
-        max_children: 20,
-        max_depth: 5,
-        initial_permit_join_duration: 254, // Open for joining
-    });
-
-    // Generate and set network key
-    coordinator.generate_network_key();
-    let nwk_key = coordinator.network_key();
-    println!("  Network key: {:02X?}", nwk_key);
-
-    // Set up Trust Center
-    let mut tc = TrustCenter::new(*nwk_key);
-    tc.set_require_install_codes(false);
-    println!(
-        "  TC link key: {:02X?} (ZigBeeAlliance09)",
-        DEFAULT_TC_LINK_KEY
-    );
-    println!("  Install codes: NOT required");
-
-    // Mark network as formed
-    coordinator.mark_formed();
-    println!("  Network formed: {}", coordinator.is_formed());
-    println!();
-
-    // ── Step 5: Simulate Device Joining ─────────────────────────────
-    println!("── Step 5: Simulate Device Joining ──");
-
-    let joining_devices = [
-        (
-            [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44],
-            "Temp/Humidity Sensor",
-        ),
-        (
-            [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80],
-            "Dimmable Light",
-        ),
-        (
-            [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE],
-            "Smart Plug",
-        ),
-    ];
-
-    for (ieee, name) in &joining_devices {
-        if coordinator.can_accept_child() {
-            let short = coordinator.allocate_address();
-
-            // TC provides the link key for the joining device
-            let link_key = tc.link_key_for_device(ieee);
-            let _ = tc.set_link_key(
-                *ieee,
-                link_key,
-                zigbee::trust_center::TcKeyType::DefaultGlobal,
-            );
-
-            println!(
-                "  Device '{}' joined: IEEE {:02X?} → short 0x{:04X}",
-                name, ieee, short.0
-            );
-        }
-    }
-    println!();
-
-    // ── Step 6: Build Coordinator ZigbeeDevice ──────────────────────
-    println!("── Step 6: Build Coordinator Runtime Device ──");
-
-    // Create a second MockMac for the DeviceBuilder (the first is consumed above)
-    let mac_for_device = MockMac::new(coord_ieee);
-    // `build_router()` is bounded on `zigbee_mac::ParentMacDriver`: it produces
-    // a typed `ZigbeeDevice<_, Router>`, which the MockMac backend can satisfy
-    // because it genuinely implements the parent-side MAC primitives. A leaf
-    // end-device MAC could not construct this.
-    let device = DeviceBuilder::new(mac_for_device)
+    ZigbeeDevice::builder(mac)
         .manufacturer("Zigbee-RS")
         .model("MockCoordinator-01")
-        .date_code("20250101")
-        .sw_build("0.1.0")
-        .channels(ChannelMask::ALL_2_4GHZ)
-        .endpoint(1, 0x0104, zigbee_zcl::DeviceId::COMBINED_INTERFACE, |ep| {
-            ep.cluster_server(zigbee_zcl::ClusterId::BASIC)
-                .cluster_server(zigbee_zcl::ClusterId::IDENTIFY)
-        })
-        .build_router();
+        .power_source(PowerSource::MainsSinglePhase)
+        .power_mode(PowerMode::AlwaysOn)
+        .channels(ChannelMask((1 << 11) | (1 << 15)))
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        .build_coordinator()
+}
 
-    println!("  Built coordinator device with HA profile");
-    println!("  Endpoint 1: Basic + Identify clusters");
-    println!();
+fn live_network_key(device: &ZigbeeDevice<MockMac, Router>) -> [u8; 16] {
+    device
+        .bdb()
+        .zdo()
+        .nwk()
+        .security()
+        .active_key()
+        .expect("coordinator has an active network key")
+        .key
+}
 
-    // ── Step 7: Network Summary ─────────────────────────────────────
-    println!("── Network Summary ──");
-    println!("  ┌─────────────────────────────────────────────┐");
-    println!(
-        "  │ PAN ID:            0x{:04X}                  │",
-        pan_id.0
-    );
-    println!(
-        "  │ Channel:           {}                      │",
-        selected_channel
-    );
-    println!("  │ Coordinator:       0x0000                   │");
-    println!("  │ Security:          Centralized (TC)         │");
-    println!("  │ Joined devices:    3                        │");
-    println!("  │ Association:       OPEN                     │");
-    println!("  │ Network formed:    true                     │");
-    println!("  └─────────────────────────────────────────────┘");
-    println!();
-    println!("✓ Mock coordinator example completed successfully!");
+fn main() {
+    pollster::block_on(async {
+        println!("zigbee-rs finite CoordinatorApp persistence demo");
 
-    drop(device);
+        let mut security_store = RamSecurityStateStore::new();
+        let (pan_id, channel, network_key) = {
+            let mut profile = coordinator_profile();
+            let mut device = coordinator_device(&profile, true);
+            let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
+            let mut app = CoordinatorApp::new(
+                node,
+                PersistentChildren::new(RamChildTableStore::new()),
+                &POLICY,
+                RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+            )
+            .expect("valid coordinator composition");
+
+            app.initialize().await.expect("form coordinator PAN");
+            let pan_id = app.node().device().pan_id();
+            let channel = app.node().device().channel();
+            let network_key = live_network_key(app.node().device());
+            println!(
+                "  formed PAN 0x{pan_id:04X} on channel {channel} as 0x{:04X}",
+                app.node().device().short_address()
+            );
+            let events = app.step().await.expect("finite coordinator step");
+            println!(
+                "  completed formation step with {} event(s)",
+                events.iter().count()
+            );
+            (pan_id, channel, network_key)
+        };
+
+        let formed_state = security_store
+            .load()
+            .expect("load formed coordinator state")
+            .expect("formed coordinator state exists");
+        assert!(formed_state.commissioned);
+        assert_eq!(formed_state.short_address, 0x0000);
+        assert_eq!(formed_state.depth, 0);
+        assert_eq!(formed_state.parent_address, 0xFFFF);
+
+        {
+            let mut profile = coordinator_profile();
+            let mut device = coordinator_device(&profile, false);
+            let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
+            let mut app = CoordinatorApp::new(
+                node,
+                PersistentChildren::new(RamChildTableStore::new()),
+                &POLICY,
+                RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+            )
+            .expect("valid restarted coordinator composition");
+
+            app.initialize()
+                .await
+                .expect("restart persisted coordinator PAN");
+            assert_eq!(app.node().device().pan_id(), pan_id);
+            assert_eq!(app.node().device().channel(), channel);
+            assert_eq!(live_network_key(app.node().device()), network_key);
+            assert!(
+                app.node().device().mac().tx_history().is_empty(),
+                "persisted coordinator restart must not re-form or associate"
+            );
+            println!(
+                "  restarted the same PAN 0x{pan_id:04X} on channel {channel} without re-formation"
+            );
+            let events = app.step().await.expect("finite restarted step");
+            println!(
+                "  completed restarted step with {} event(s)",
+                events.iter().count()
+            );
+        }
+
+        println!("CoordinatorApp persistence demo complete");
+    });
 }

@@ -17,9 +17,10 @@ zigbee-zdo  = { version = "0.1.0", path = "../zigbee-zdo" }
 log = "0.4"
 
 [features]
-default = ["float32", "float64"]
+default = ["float32", "float64", "router"]
 float32 = ["zigbee-zcl/float32"]
 float64 = ["zigbee-zcl/float64"]
+router = []
 trace = ["zigbee-aps/trace", "zigbee-nwk/trace"]
 touchlink = []
 

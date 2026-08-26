@@ -426,7 +426,9 @@ mod tests {
     use zigbee_aps::ApsLayer;
     use zigbee_mac::mock::MockMac;
     use zigbee_nwk::{DeviceType, NwkLayer};
-    use zigbee_types::{MacAddress, PanId};
+    #[cfg(feature = "router")]
+    use zigbee_types::MacAddress;
+    use zigbee_types::PanId;
 
     const A: IeeeAddress = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
     const B: IeeeAddress = [0xAA; 8];

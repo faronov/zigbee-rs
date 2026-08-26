@@ -6,5 +6,5 @@ description = "Pure-Rust HAL for PHY6222/PHY6226/PHY6252 SoC — no vendor SDK"
 
 [dependencies]
 cortex-m = "0.7"
+embedded-hal = "1.0"
 embedded-storage = "0.3"
-log = "0.4"

@@ -9,9 +9,9 @@ TARGET_DIR=target/riscv32imc-unknown-none-elf/release
 ELF="$TARGET_DIR/bl702-sensor"
 
 if [[ "${BL702_DIAGNOSTIC_LOG:-0}" == "1" ]]; then
-    cargo build --release --no-default-features --features diagnostic-logging
+    cargo build --release --locked --no-default-features --features diagnostic-logging
 else
-    cargo build --release
+    cargo build --release --locked
 fi
 
 RAW_IMAGE="$ELF.bin"

@@ -29,7 +29,15 @@ lab = []
 diag-beacon = ["lab"]
 diag-assoc = ["lab"]
 diag-smoke = ["lab"]
-diag-pm = ["lab", "dep:tlsr8258-hal"]
+diag-pm = ["lab", "dep:tlsr8258-hal", "zigbee-mac/tlsr8258"]
+diag-retention = [
+    "lab",
+    "dep:tlsr8258-hal",
+    "tlsr8258-hal/retention-proof",
+    "zigbee-mac/tlsr8258",
+    "zigbee-mac/hardware-aes",
+    "zigbee-mac/telink-retention-proof",
+]
 sensor = ["lab"]
 
 [profile.release]

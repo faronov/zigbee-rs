@@ -1,358 +1,227 @@
-# Architecture Overview
+# Architecture
 
-zigbee-rs is a complete Zigbee PRO R22 protocol stack written in Rust, split
-across **9 crates** that mirror the standard Zigbee layer model. Every crate is
-`#![no_std]` and heap-free — suitable for the smallest microcontrollers.
+The final application model separates portable behavior from the mechanisms
+and policy that vary by chip, board, and product.
 
-## Layer Diagram
-
-```text
-┌─────────────────────────────────────┐
-│  Product + application profile      │
-├─────────────────────────────────────┤
-│  zigbee-runtime (ZigbeeNode)        │
-├──────┬──────┬───────┬──────┬───────┤
-│  BDB │  ZCL │  ZDO  │  APS │       │
-├──────┴──────┴───────┴──────┤       │
-│         zigbee-nwk          │ types │
-├─────────────────────────────┤       │
-│         zigbee-mac          │       │
-├─────────────────────────────┴───────┤
-│      Hardware (radio)               │
-└─────────────────────────────────────┘
-```
-
-The top-level **`zigbee`** crate re-exports everything and adds
-coordinator/router role support. Most applications interact with the
-`zigbee-runtime` layer through `ZigbeeNode`, which composes a
-`ZigbeeDevice`, durable security store, and typed application profile.
-
-Hardware composition follows a separate dependency direction:
+## Layer ownership
 
 ```text
-application/profile  device behavior and measurement mapping
-product              identity, flash layout, bootloader/OTA selection
-board                physical pins, buses, buttons, LEDs, fitted devices
-platform/chip HAL    radio, clocks, sleep, reset, raw flash controller
+platform/chip HAL + MacDriver
+        ↓
+board resources and fitted wiring
+        ↓
+product identity/profile/policy/storage/linker/OTA
+        ↓
+sensor-sed or router-app composition root
 ```
 
-A board crate must not depend on `zigbee-runtime`. Product code depends on the
-board and selects the storage/OTA policy used by the application.
+| layer | owns | must not own |
+|---|---|---|
+| chip HAL / MAC | clocks, GPIO, buses, timers, flash controller, radio, AES mechanism, `MacDriver` | product identity, clusters, battery chemistry, partition policy |
+| board | pins, buses, LEDs, buttons, sensors, physical flash devices, exclusive resources | Zigbee runtime, endpoint behavior, product storage policy |
+| product | manufacturer/model, profile, reporting defaults, battery mapping, wait policy, linker map, persistence partitions, OTA/bootloader policy | generic chip mechanisms or hidden board discovery |
+| application/profile | commissioning lifecycle, measurements-to-ZCL mapping, reporting, commands, role behavior | platform startup and physical pin acquisition |
+| composition root | startup, concrete resource construction, executor/event loop | duplicated BDB/ZCL/ZDO/APS/NWK/MAC state machines |
 
-`apps/sensor-sed` is the reusable sleepy-sensor application layer. It owns
-commissioning, silent resume, bounded secure-rejoin retry, poll windows,
-interview detection, Device_annce retries, reporting cadence, button
-semantics, status indication, and durable checkpoints. It is generic over the
-MAC, security store, complete application profile, and one explicit
-`SensorSedParts` resource bundle; every capability is monomorphized.
+The protocol path remains shared:
 
-The product supplies a plain `SensorPolicy` value for timing and UI policy.
-Behavior that changes async control flow, such as the short-button action, is
-a zero-sized static capability. This keeps TC32/RV32 builds from retaining
-every unused behavior branch while avoiding const-generic timing values.
+```text
+application profile
+        |
+zigbee-runtime::ZigbeeNode
+        |
+BDB -> ZCL/ZDO -> APS -> NWK -> MAC
+        |
+platform radio backend
+```
 
-Chip GPIO/timer/reset/radio details stay outside that crate. For Nordic,
-`apps/nrf-sensor` now contains only the `embassy-nrf` adapters
-(`NrfWakeController`, `NrfStatus`, `NrfSupervisor`, `NrfBattery`,
-`OnChipTemperature`, and compact `defmt` diagnostics). The nRF52840
-composition root selects those adapters directly:
+## Sleepy sensor frontend
+
+`apps/sensor-sed` owns the reusable environmental sleepy-end-device lifecycle.
+The composition root supplies every capability explicitly:
 
 ```rust,ignore
-// examples/nrf52840-sensor/src/main.rs — composition root
-struct Battery;                                       // product chemistry
-impl nrf_sensor_app::BatteryPolicy for Battery { /* … */ }
+let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
 
-let mut profile = nrf52840_sensor_product::profile::sensor_profile();
-let mut store = nrf52840_sensor_product::storage::security_store(nvmc);
-let mut device = ZigbeeDevice::builder(mac)
-    .power_mode(nrf52840_sensor_product::policy::SENSOR_POLICY.power_mode())
-    // SensorApp owns the bounded parent-poll window.
-    .automatic_polling(false)
-    // identity and endpoint configuration omitted
-    .build();
-let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
-
-let mut app = sensor_sed_app::SensorApp::new(
+let mut app = SensorApp::new(
     node,
-    &nrf52840_sensor_product::policy::SENSOR_POLICY,
-    sensor_sed_app::SensorSedParts {
-        wake: nrf_sensor_app::NrfWakeController::new(button),
-        status: nrf_sensor_app::NrfStatus::new(led),
+    &product::policy::SENSOR_POLICY,
+    SensorSedParts {
+        wake,
+        status,
         environment,
-        battery: nrf_sensor_app::NrfBattery::<Battery>::new(saadc),
-        ota: sensor_sed_app::NoOta,
-        actions: nrf52840_sensor_product::policy::USER_ACTIONS,
-        supervisor: nrf_sensor_app::NrfSupervisor,
-        diagnostics: nrf_sensor_app::NrfDiagnostics,
+        battery,
+        ota,
+        actions,
+        supervisor,
+        diagnostics,
     },
-)
-.expect("manual SensorApp polling requires automatic_polling(false)");
-app.run().await
+)?;
 ```
 
-A second platform composes the same application by implementing
-`WakeController<ItsMac>` with an opaque platform-native mark, rollover-safe
-`u32` duration helpers, and one atomic quiesce → wait → MAC-ready operation.
-A backend such as `NrfMac` may satisfy MAC readiness through a proven lazy
-transition in its next normal RX/TX operation. A backend whose retention mode
-loses clocks or radio state, including TLSR8258, must restore that state inside
-`wait` before returning success. The remaining concrete parts are
-`StatusSink`, `EnvironmentSource`, `BatterySource`, `OtaLifecycle`,
-`Supervisor`, and `Diagnostics`. `BlockingEnvironment` and `BlockingBattery`
-adapt bounded synchronous TC32/BL702 drivers without requiring Embassy.
+`SensorSedParts<W, St, E, B, O, A, Sv, D>` is only an ownership bundle. It
+does not create peripherals, search for a platform, own the MAC/profile/store,
+or hide product policy.
 
-`SensorApp::new` rejects a device with runtime automatic polling still
-enabled, preventing two independent owners from polling the same parent.
-`SensorApp` is generic over `P: EnvironmentalSensorProfile`, so a plain
-`DeviceProfile` and an OTA-decorated profile can share the archetype. `NoOta`
-only implements `OtaLifecycle` for profiles that explicitly opt into
-`NonOtaProfile`. The standard temperature/humidity/battery components (with
-or without pressure) make that assertion through `NonOtaComponent`; an
-arbitrary `ProfileComponent` does not qualify implicitly, and OTA decorators
-remain excluded.
+The fields are deliberately narrow:
 
-Expected second-platform composition:
+- `wake`: monotonic time, button wake, and atomic MAC wait transition;
+- `status`: semantic status indication;
+- `environment`: environmental measurements;
+- `battery`: voltage and ZCL battery mapping;
+- `ota`: OTA transport and activation lifecycle;
+- `actions`: product-selected short-button behavior;
+- `supervisor`: watchdog heartbeat and reset;
+- `diagnostics`: typed lifecycle events.
 
-| Platform | Wake/status choices | Notes |
-|----------|---------------------|-------|
-| ESP32-H2 | active Embassy timer + GPIO status | `OptionalOta` profile and ESP OTA transport |
-| ESP32-C6 | active timer + `NoStatus` until WS2812 is selected | same app, no fake binary LED |
-| BL702 XT-ZB1 | polling wake + `NoStatus` | blocking ADC adapter; no unproven PDS/HBN claim |
-| TLSR8258 SED | `block_on`, wrapping timer marks, initially active 250 ms polling | retention sleep only after separate MAC restore/current validation |
-
-Telink smart plugs do **not** instantiate `sensor-sed`; relay, metering,
-always-on router receive, child persistence, and mains startup behavior belong
-in a separate `apps/plug-router` archetype.
-
-## Board Resource Ownership
-
-Where fitted peripherals have alternative owners, board crates expose typed
-resources that enforce mutual exclusion at the type level. The EFR32MG1
-TRÅDFRI board is the reference example:
+### Finite lifecycle
 
 ```rust,ignore
-let board = BoardResources::take().unwrap();
-
-// PA0: choose EITHER direct GPIO LED OR TIMER0 PWM (not both)
-let led = board.pa0.into_led();        // excludes PWM
-// let pwm = board.pa0.into_led_pwm(); // would fail: token consumed
-
-// Product policy chooses EITHER direct SPI OR bootloader-managed flash.
-let ota_flash = board.external_flash.into_bootloader_managed();
-let profile = product::profile::sensor_profile(firmware_version, ota_flash)?;
-
-// Remaining tokens are consumed individually
-let i2c = board.sensor_i2c.into_sensor_i2c()?;
-let supply = board.supply_adc.into_supply_monitor()?;
-```
-
-Each token is consumed exactly once. Unused tokens are dropped and the linker
-eliminates the dead driver code. The bootloader ownership marker is retained by
-the product OTA writer for its full lifetime, so the direct USART0 SPI path
-cannot be selected through the typed API at the same time. Peripheral
-diagnostics should exercise the same typed constructors as production.
-Chip-internal radio, RTCC timing, and internal flash remain HAL/platform or
-product resources rather than board tokens; their existing diagnostics stay
-independently buildable.
-
-ESP32-C6/H2 and nRF52840 use their vendor-independent HAL types directly for
-chip-internal flash/radio mechanisms. Their board crates still remain
-physical-only: the ESP board exposes raw whole-chip flash, while the nRF DK
-board maps LED, button, and sensor-I2C pins. Product crates add partitions,
-persistence, identity, and the concrete profile.
-
-## Crate Roles
-
-| Crate | Role |
-|-------|------|
-| **`zigbee-types`** | Core types shared by all layers: `IeeeAddress`, `ShortAddress`, `PanId`, `ChannelMask`, `MacAddress`. No dependencies. |
-| **`zigbee-crypto`** | Shared low-stack Zigbee AES-CCM* primitives used by NWK and APS. |
-| **`zigbee-mac`** | IEEE 802.15.4 MAC layer. Defines the async `MacDriver` trait and ships backends for Mock, ESP32-C6/H2, nRF52840/52833, BL702, CC2340, TLSR8258, PHY6222, EFR32MG1, and EFR32MG21. |
-| **`zigbee-nwk`** | Network layer. Frame parsing, AODV + tree routing, NWK security (AES-CCM\*), the NIB (Network Information Base), and the `NwkLayer<M: MacDriver>` wrapper. |
-| **`zigbee-aps`** | Application Support Sub-layer. APS frame encode/decode, binding table, group table, APS security, fragmentation, and duplicate detection. |
-| **`zigbee-zdo`** | Zigbee Device Objects (endpoint 0). Handles discovery (`Active_EP_req`, `Simple_Desc_req`, `Match_Desc_req`), binding, and network management requests. |
-| **`zigbee-bdb`** | Base Device Behavior. Implements BDB commissioning: network steering (end devices join), network formation (coordinators create), Finding & Binding, and Touchlink. |
-| **`zigbee-zcl`** | Zigbee Cluster Library. 33 clusters, foundation commands (Read/Write/Report/Discover Attributes), attribute storage engine, and reporting engine. |
-| **`zigbee-runtime`** | The integration layer your application uses. Provides `DeviceBuilder`, `ZigbeeDevice`, typed application profiles, `ZigbeeNode`, persistence algorithms, reporting, and power management. |
-| **`zigbee`** | Top-level umbrella crate. Re-exports all sub-crates and adds coordinator/router role implementations. |
-
-## Reusable Typed Profiles
-
-`zigbee_runtime::profile` owns cluster instances, endpoint composition,
-default reporting, and application-value mapping. Product crates select and
-configure these reusable archetypes:
-
-| Archetype | Implemented composition |
-|-----------|-------------------------|
-| `TemperatureHumidityBattery` | Temperature + humidity + power configuration |
-| `TemperatureHumidityPressureBattery` | `TemperatureHumidityBattery` plus a mandatory Pressure Measurement cluster, via `TemperatureHumidityBattery::with_pressure` |
-| `AirQuality` | CO₂ + temperature + humidity; optional battery |
-| `Thermostat` | Thermostat local temperature/setpoint/schedule controls; optional humidity and battery |
-| `OccupancyLight` | Occupancy sensing + illuminance; optional battery |
-| `PlantSensor` | Soil moisture + temperature + illuminance; optional battery |
-| `SmartPlug` | On/Off + basic electrical measurement; optional delivered-energy/demand metering |
-
-Profiles do not advertise decorative clusters. For example, the air-quality
-profile does not add PM2.5 until a product supplies that measurement, the
-occupancy profile does not pretend to be an IAS security zone, and the smart
-plug does not claim unimplemented Simple Metering commands. Illuminance input
-is the ZCL-encoded measured value; the `no_std` runtime does not invent a
-floating-point `log10` conversion.
-
-Most "optional cluster" archetypes above (`AirQuality`, `Thermostat`,
-`OccupancyLight`, `PlantSensor`) hold their optional cluster as an
-`Option<Cluster>` field, which is appropriate when most products using that
-archetype are expected to fit the optional hardware. Pressure is different:
-it is the one uncommon variant of `TemperatureHumidityBattery`, fitted only
-by the nRF52840 BME280 product, while EFR32 and ESP32 products never call
-`with_pressure`. Because `ClusterRef` holds `&mut dyn Cluster`, an
-`Option<PressureCluster>` field on `TemperatureHumidityBattery` would still
-link `PressureCluster`'s `Cluster` vtable and attribute storage into *every*
-firmware built from that archetype — EFR32 and ESP32 included — regardless
-of whether it is ever `Some`. `with_pressure` therefore returns the distinct
-`TemperatureHumidityPressureBattery` type instead, so only the one product
-that actually composes it pays for it.
-
-## Data Flow
-
-### TX Path (Application → Radio)
-
-When your application updates an attribute or sends a report, data flows
-**down** through the stack:
-
-```text
-Application
-  │  set_temperature(2350)
-  ▼
-ZCL         serialize attribute report frame
-  │
-  ▼
-APS         wrap in APS Data Request, add APS header + security
-  │
-  ▼
-NWK         add NWK header, route lookup, NWK encryption (AES-CCM*)
-  │
-  ▼
-MAC         add MAC header, CRC, call MacDriver::mcps_data_request()
-  │
-  ▼
-Radio       802.15.4 RF transmission
-```
-
-In code, this is what happens when the runtime's `tick()` method detects a due
-attribute report:
-
-```rust,ignore
-// Inside tick() → check_and_send_cluster_reports() → send_report()
-//   builds ZCL frame → APS Data Request → NWK Data Request → MAC Data Request
-```
-
-### RX Path (Radio → Application)
-
-Incoming frames flow **up**. The application drives this by calling
-`node.device_mut().receive()` and then `node.process_incoming()`:
-
-```text
-Radio       802.15.4 frame received
-  │
-  ▼
-MAC         MacDriver::mcps_data_indication() returns raw frame
-  │
-  ▼
-NWK         parse NWK header, verify destination, decrypt if secured
-  │
-  ▼
-APS         parse APS header, de-duplicate, reassemble fragments
-  │
-  ▼
-ZDO / ZCL   endpoint 0 → ZDO handles automatically
-             endpoints 1-240 → ZCL dispatches to your clusters
-  │
-  ▼
-Application  StackEvent returned to your code
-```
-
-## Async Model
-
-zigbee-rs is designed for **single-threaded cooperative async** runtimes,
-primarily [Embassy](https://embassy.dev/):
-
-- **`no_std` throughout** — no heap allocation, no `std::thread`, no OS.
-- **`async` without `Send`/`Sync`** — the `MacDriver` trait uses `async fn`
-  methods with no `Send` bounds, matching Embassy's single-core executor model.
-- **Periodic ticks** — your main loop calls `node.tick(elapsed_secs)` periodically.
-  The profile owns the application clusters, so callers do not rebuild
-  `ClusterRef` arrays before every operation.
-  Between ticks the executor can run other tasks (sensor reads, display updates,
-  button debouncing). The runtime never blocks indefinitely.
-- **`select!` pattern** — the idiomatic event loop uses `embassy_futures::select`
-  to race `device.receive()` against a timer, processing whichever fires first:
-
-```rust,ignore
+app.initialize().await?; // exactly one boot/resume lifecycle
 loop {
-    match select(device.receive(), Timer::after(Duration::from_secs(10))).await {
-        Either::First(Ok(frame)) => {
-            node.process_incoming(&frame).await;
-        }
-        Either::First(Err(_)) => {}  // MAC error, retry
-        Either::Second(_) => {
-            // Timer fired — run periodic maintenance
-            node.tick(10).await;
-        }
-    }
+    app.step().await?;    // exactly one bounded wait/service iteration
 }
 ```
 
-On host machines (mock examples), `pollster::block_on` replaces Embassy as the
-executor, so the same stack code compiles for both embedded and desktop.
+`run()` is convenience sugar for `initialize()` followed by infinite
+`step()` iterations. The finite methods make the same application usable
+inside Embassy, a platform-owned loop, a host test, or reset-on-wake Telink
+composition without duplicating behavior.
 
-## Memory Model
+Construction rejects a `ZigbeeDevice` with automatic polling enabled. The
+application must be the single owner of sleepy-end-device parent polling.
 
-Every buffer and collection in zigbee-rs has a **compile-time upper bound**:
+### Fast and slow waits
 
-- **`heapless::Vec<T, N>`** — fixed-capacity vectors for endpoint lists,
-  cluster lists, pending responses, and frame buffers. No `alloc` crate needed.
-- **Const generics** — limits like `MAX_ENDPOINTS` (8) and
-  `MAX_CLUSTERS_PER_ENDPOINT` (16) are `const` values, so the compiler knows
-  the exact memory footprint at build time.
-- **Static allocation** — `ZigbeeDevice` and all its nested layers
-  (`BdbLayer<M>` → `ZdoLayer` → `ApsLayer` → `NwkLayer<M>` → `M`) live on
-  the stack or in a `static` cell. There is no `Box`, `Rc`, or `Arc`.
-- **No `serde`** — frame serialization/deserialization uses manual bitfield
-  parsing, keeping binary size small and avoiding trait-object overhead.
-
-This means you can predict the **exact RAM usage** of a zigbee-rs device at
-compile time — critical for microcontrollers with 32–64 KB of SRAM.
-
-### Typical Memory Budget
-
-| Component | Approximate Size |
-|-----------|-----------------|
-| `ZigbeeDevice` (full stack) | ~4–6 KB |
-| Each ZCL cluster instance | 100–500 bytes |
-| NWK routing table | ~200 bytes |
-| APS binding + group tables | ~300 bytes |
-| Frame buffers (TX + RX) | ~256 bytes each |
-
-## Layer Nesting
-
-Each layer wraps the one below it using generics, not trait objects:
+`SensorPolicy` independently selects:
 
 ```rust,ignore
-ZigbeeDevice<M: MacDriver>
-  └── BdbLayer<M>
-        └── ZdoLayer<M>
-              └── ApsLayer<M>
-                    └── NwkLayer<M>
-                          └── M   // your MacDriver (MockMac, Esp32Mac, ...)
+fast_sleep_depth: SleepDepth,
+slow_sleep_depth: SleepDepth,
 ```
 
-This means the **concrete MAC type propagates** all the way up. There is zero
-dynamic dispatch in the stack path — the compiler monomorphizes everything,
-producing tight, inlineable code for each target platform.
+The values are:
 
-## What's Next?
+- `Active`: keep the platform active and wait only for timer/button;
+- `Idle`: quiesce the radio and use a retained light/suspend wait;
+- `Retention`: enter a retention mode that requires explicit restoration.
 
-- **[Your First Device](./first-device.md)** — build a temperature sensor step by step
-- **[The Device Builder](../core-concepts/builder.md)** — detailed builder API reference
-- **[The Event Loop](../core-concepts/event-loop.md)** — how `tick()` and `process_incoming()` work
+The shared application uses the fast depth during commissioning, interview,
+commands, and other short-poll windows. It uses the slow depth only during the
+joined steady state. If OTA is active, the wait is forced active.
+
+A `WakeController::wait` operation is atomic from the application's point of
+view: prepare the MAC/radio, wait, restore every required clock/radio/MAC
+invariant, then return.
+
+### OTA-first routing
+
+Every stack event is offered to `OtaLifecycle::handle_event` before generic
+application matching. An OTA implementation reports that activation is
+pending; it does not reset directly. The shared lifecycle first checkpoints
+network keys and security counters, then invokes activation.
+
+`NoOta` is not a permissive fallback. It implements the lifecycle only for a
+profile that explicitly implements `NonOtaProfile`, so a profile advertising
+the OTA client cannot accidentally be paired with no transport.
+
+### Absent status hardware
+
+`NoStatus::PRESENT` is `false`. Policy validation ignores meaningless blink
+durations, and status-only deadlines/delays compile out. This is used by
+products such as BL702 and ESP32-C6 rather than carrying fake LED work.
+
+## Router and coordinator frontends
+
+`apps/router` exposes four public always-on frontends:
+
+| frontend | runtime role | child lifecycle | startup path |
+|---|---|---|---|
+| `AlwaysOnEndDeviceApp` | `EndDevice` | none | network steering/resume |
+| `RelayRouterApp` | `RelayRouter` | `NoChildren` | network steering/resume |
+| `ParentRouterApp` | `Router` | `PersistentChildren` | network steering/resume |
+| `CoordinatorApp` | `Router` | `PersistentChildren` | formation or persisted-PAN restart |
+
+```rust,ignore
+let mut relay = RelayRouterApp::new(
+    ZigbeeNode::new(&mut device, &mut security_store, &mut profile),
+    NoChildren,
+    &product::policy::ROUTER_POLICY,
+    RouterParts::new(status, supervisor, diagnostics),
+)?;
+
+relay.initialize().await?;
+let events = relay.step().await?;
+```
+
+`AlwaysOnEndDeviceApp` requires only `MacDriver`. Every frontend that
+advertises `DeviceType::Router` (`RelayRouterApp`, `ParentRouterApp`, and
+`CoordinatorApp`) requires the `router` feature and `ParentMacDriver`.
+This makes unsupported parent/coordinator operations unconstructible rather
+than success-shaped no-ops.
+
+`AlwaysOnEndDeviceApp` accepts only a `ZigbeeNode<..., EndDevice>` built with
+`PowerMode::AlwaysOn`; it verifies `DeviceType::EndDevice` and
+`macRxOnWhenIdle`. It owns steering, rejoin, reset, bounded receive/tick, and
+security checkpoints, but compiles out routing and child lifecycle.
+
+```rust,ignore
+let mut plug = AlwaysOnEndDeviceApp::new(
+    ZigbeeNode::new(&mut device, &mut security_store, &mut profile),
+    &product::policy::ALWAYS_ON_END_DEVICE_POLICY,
+    RouterParts::new(status, supervisor, diagnostics),
+)?;
+
+plug.initialize().await?;
+loop {
+    let events = plug.step().await?;
+    // Synchronize fitted relay hardware from profile state here.
+}
+```
+
+The nRF52840 example is therefore an `AlwaysOnEndDeviceApp`. The TLSR8258
+router has the parent primitives and uses `ParentRouterApp +
+PersistentChildren`.
+
+All four frontends expose finite `initialize()` and `step()` operations and
+the infinite `run()` wrapper. `StepEvents` returns the bounded incoming/tick
+events so a product such as a relay plug can synchronize fitted hardware after
+the shared profile handles a command.
+
+## Why there is no devicetree, Kconfig, or god trait
+
+Rust types already encode the selected resources:
+
+- the board constructor consumes concrete pin/peripheral tokens;
+- the product type fixes identity, profile, policy, partitions, and linker
+  map;
+- the application parts list every capability;
+- the role frontend fixes startup and parent capability;
+- Cargo features select real image alternatives, not runtime discovery.
+
+A broad `Platform` trait would hide ownership, force unrelated peripherals
+into one implementation, and make mutually exclusive resources harder to
+prove. Narrow traits keep LED, wake, sensor, flash, OTA, and reset choices
+independent and let dead-code elimination remove unused paths.
+
+The embedded application path has no allocator and public composition has no
+trait objects. Concrete generic types monomorphize. `zigbee-runtime` does use a
+single internal pinned `dyn Future` outlining mechanism for TC32 size; it is
+bounded, non-allocating, and unrelated to platform configuration.
+
+## Porting recipe
+
+For the same product behavior on a new MCU:
+
+1. Implement the chip's clock/timer/radio/flash primitives and `MacDriver`.
+2. Add a board crate that maps fitted hardware and returns exclusive typed
+   resources.
+3. Add a product crate for identity, profile, battery conversion, policy,
+   persistence partitions, linker layout, and OTA choice.
+4. Implement the narrow `SensorSedParts` or `RouterParts` adapters.
+5. Compose them in `main.rs`; do not copy the application state machine.
+6. Advance through startup, raw 802.15.4, scan, association, Zigbee security,
+   interview/reporting, reset/rejoin, power, and OTA gates.
+
+Only the board/platform adapters and product selections should change. The
+profile, shared application, `ZigbeeNode`, and protocol crates stay the same.

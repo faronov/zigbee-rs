@@ -15,7 +15,7 @@
 # Core Concepts
 
 - [The Device Builder](./core-concepts/builder.md)
-- [The Event Loop](./core-concepts/event-loop.md)
+- [The Application Lifecycle](./core-concepts/event-loop.md)
 - [MAC Layer & Backends](./core-concepts/mac.md)
 - [Network Layer](./core-concepts/nwk.md)
 - [APS Layer](./core-concepts/aps.md)

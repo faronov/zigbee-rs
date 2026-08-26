@@ -42,7 +42,8 @@ static POLICY: SensorPolicy = SensorPolicy {
         reset_blinks: 5,
         reset_phase_ms: 100,
     },
-    sleep_depth: SleepDepth::Idle,
+    fast_sleep_depth: SleepDepth::Idle,
+    slow_sleep_depth: SleepDepth::Idle,
 };
 
 struct MockWake {

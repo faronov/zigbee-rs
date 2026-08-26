@@ -439,6 +439,31 @@ fn adc_flash_voltage_guard() -> flash::VoltageReading {
     }
 }
 
+/// Restore and verify the retained PC5/Zbit flash-voltage guard after a
+/// reset-on-wake LOW32K cycle.
+///
+/// This follows the same full ADC reinitialization and real sample path as
+/// the guard callback, rejects a missing retained owner/pin, and reinstalls
+/// the callback before application service can reach a journal write.
+#[cfg(all(target_arch = "tc32", feature = "retention-proof"))]
+#[inline(never)]
+pub fn restore_flash_voltage_guard() -> Result<(), AdcError> {
+    with_exclusive(|| {
+        let state = unsafe { &mut *FLASH_VOLTAGE_STATE.0.get() };
+        if state._owner.is_none() {
+            return Err(AdcError::NotConfigured);
+        }
+        let pin = state.pin.as_ref().ok_or(AdcError::NotConfigured)?;
+        init()?;
+        configure_gpio_channel(pin, true)?;
+        set_powered(true)?;
+        let _ = sample_with_fluctuation_mv(&mut state.buffer, state.calibration)?;
+        Ok(())
+    })?;
+    flash::set_voltage_guard(adc_flash_voltage_guard);
+    Ok(())
+}
+
 /// Read and interpret the factory ADC calibration block, transcribed from
 /// `drv_calib_adc_verf()`'s GPIO branch in `proj/drivers/drv_calibration.c`
 /// (the 8258-only two-point/one-point selection logic; the 8278-only VBAT

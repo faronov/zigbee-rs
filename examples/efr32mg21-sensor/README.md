@@ -1,124 +1,69 @@
-# EFR32MG21 Zigbee Sensor — Pure Rust Radio!
+# EFR32MG21 sensor (BRD4181A + BRD4001A)
 
-A `no_std` Zigbee 3.0 end device firmware for the **EFR32MG21** (ARM Cortex-M33),
-reporting temperature and humidity via ZCL clusters 0x0402 and 0x0405.
+Compile-tested `no_std` composition of the shared environmental
+`SensorApp`.
 
-**This example uses a pure-Rust IEEE 802.15.4 radio driver** — no RAIL library,
-no GSDK, no binary blobs. All radio hardware access is through direct register
-writes in Rust.
+## Exact target
 
-> **⚠️ Scaffold Implementation:** The radio register values are simplified
-> approximations. The exact register sequences for 802.15.4 mode need
-> verification against the EFR32xG21 Reference Manual or extraction from the
-> RAIL library source.
+| item | value |
+|---|---|
+| MCU | EFR32MG21A020F512IM32 |
+| HFXO | 38.4 MHz, CTUNE 133 |
+| LED0 | PB0, active high |
+| BTN0 | PD2, active low |
 
-## Hardware
+The WSTK provides the button bias. These are the current BRD4181A pins.
 
-- **MCU:** EFR32MG21 (512KB flash, 64KB SRAM) — ARM Cortex-M33 @ 80 MHz
-- **Radio:** Built-in 2.4 GHz IEEE 802.15.4 + BLE (pure Rust driver)
-- **Boards:** BRD4180A, BRD4181A, and many third-party modules
-- **Button:** Adjust GPIO pin in `pins` module for your board
-- **LED:** Adjust GPIO pin in `pins` module for your board
+## Application
 
-## Series 1 vs Series 2 Differences
+- `DeviceProfile<TemperatureHumidityBattery>`;
+- synthetic temperature/humidity;
+- fixed 3000 mV battery;
+- `NoOta`;
+- short press toggles join/leave;
+- three-second hold requests durable factory reset;
+- `Idle` for both fast and slow waits.
 
-| Feature | EFR32MG1P (Series 1) | EFR32MG21 (Series 2) |
-|---------|---------------------|---------------------|
-| CPU | Cortex-M4F @ 40 MHz | Cortex-M33 @ 80 MHz |
-| Flash | 256 KB | 512 KB |
-| RAM | 32 KB | 64 KB |
-| Security | CRYPTO engine | Secure Element (SE) + TrustZone |
-| Radio base | 0x40080000–0x40087FFF | 0x40090000–0x40095FFF |
-| CMU base | 0x400E4000 | 0x40008000 |
-| GPIO base | 0x4000A000 | 0x4003C000 |
-| MSC base | 0x400E0000 | 0x40030000 |
-| Flash page | 2 KB | 8 KB |
+`Idle` gates the radio and uses WFE with the real 1 kHz SysTick. It is not EM2.
+`Retention` is unsupported.
 
-## Prerequisites
+## Ownership
 
-- Rust nightly with `thumbv8m.main-none-eabihf` target
-- Any ARM SWD debugger (J-Link, ST-Link, DAPLink, etc.)
-
-```bash
-rustup target add thumbv8m.main-none-eabihf
+```text
+efr32mg21-hal + Efr32s2Mac
+        ↓
+boards/efr32mg21-devkit
+        ↓
+products/efr32mg21-sensor
+        ↓
+this root + sensor_sed_app::SensorApp
 ```
 
-## Vendor Library Setup
+The product owns identity, profile, policy, bounded storage, and linker map.
+The board owns PB0/PD2, clocks, and physical flash.
 
-**None required!** 🎉
+## Layout
 
-The EFR32MG21 radio driver is implemented entirely in Rust using direct register
-access. No GSDK, no RAIL library, no precompiled `.a` files, no environment
-variables to configure.
+```text
+0x00000000..0x00004000  bootloader
+0x00004000..0x0007C000  application
+0x0007C000..0x00080000  security persistence
+0x20000000..0x20010000  SRAM
+```
 
-## Building
+## Build
 
 ```bash
 cd examples/efr32mg21-sensor
-cargo build --release
+cargo +nightly-2026-03-23 build --release --locked
+python3 tools/verify-layout.py \
+  target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor
 ```
 
-No `--features stubs` required — the project builds without any external libraries.
+Current raw image: **203,180 B**.
 
-## Flashing
+## Validation
 
-Use any ARM SWD debugger — the EFR32MG21 is a standard Cortex-M33:
-
-```bash
-# With probe-rs
-probe-rs run --chip EFR32MG21A020F512IM32 target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor
-
-# With openocd
-openocd -f interface/cmsis-dap.cfg -f target/efm32.cfg \
-  -c "program target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor verify reset exit"
-
-# With Simplicity Commander (Silicon Labs tool)
-commander flash target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.hex
-```
-
-## What It Demonstrates
-
-- **Pure-Rust IEEE 802.15.4 radio driver** for EFR32MG21 (no RAIL/GSDK)
-- Zigbee 3.0 end device on the EFR32MG21 Series 2 platform
-- Embassy async runtime on Cortex-M33 with SysTick time driver
-- Proper interrupt vector table (51 entries for all EFR32MG21 peripherals)
-- No vendor dependencies — fully auditable, reproducible builds
-- Button-driven network join/leave with edge detection
-- LED status indication + identify blink
-- ZCL Temperature Measurement + Relative Humidity + Identify clusters
-- Flash NV storage — network state persists across reboots (8 KB pages)
-- Default reporting with reportable change thresholds
-- Radio sleep/wake for power management
-
-## Radio Architecture
-
-The EFR32MG21 radio blocks (Series 2 base addresses):
-
-| Block | Base Address | Function |
-|-------|-------------|----------|
-| RAC   | 0x40093000  | Radio Controller — state machine, PA |
-| FRC   | 0x40090000  | Frame Controller — CRC, format |
-| MODEM | 0x40094000  | O-QPSK modulation/demodulation |
-| SYNTH | 0x40092000  | PLL frequency synthesizer |
-| AGC   | 0x40095000  | Automatic gain control, RSSI |
-| BUFC  | 0x40091000  | TX/RX buffer controller |
-
-All blocks are configured via memory-mapped registers — no co-processor
-or mailbox protocol needed.
-
-## Project Structure
-
-```
-efr32mg21-sensor/
-├── .cargo/config.toml   # Target: thumbv8m.main-none-eabihf, build-std
-├── Cargo.toml            # Dependencies (no vendor libs!)
-├── device.x              # EFR32MG21 interrupt vector names (51 IRQs)
-└── src/
-    ├── main.rs           # Entry point, device setup, sensor loop
-    ├── time_driver.rs    # Embassy time driver (SysTick @ 80 MHz, 1ms tick)
-    ├── vectors.rs        # Interrupt vector table + NVIC Interrupt enum
-    └── stubs.rs          # CI stubs (not needed for real builds)
-```
-
-`efr32mg21-hal` owns the MSC flash controller. `boards/efr32mg21-devkit` owns
-the bounded 16 KB application-NV partition and linker layout.
+Compile, clippy, linker, image, and persistence-layout checks pass. The
+complete startup/radio/factory-EUI/join/reporting/flash/button/idle path remains
+HIL-unverified.

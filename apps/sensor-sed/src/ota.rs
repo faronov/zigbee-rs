@@ -8,6 +8,7 @@ use zigbee_runtime::profile::{
     TemperatureHumidityPressureBattery,
 };
 use zigbee_runtime::security_store::SecurityStateStore;
+use zigbee_zcl::ClusterId;
 
 /// Explicit assertion that a profile component does not advertise OTA.
 ///
@@ -31,18 +32,29 @@ impl<C: NonOtaComponent> NonOtaProfile for DeviceProfile<C> {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtaEventOutcome {
     NotHandled,
-    Handled { keep_awake_ms: Option<u32> },
+    Handled {
+        keep_awake_ms: Option<u32>,
+        activation_pending: bool,
+    },
     Unexpected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtaActivationOutcome {
+    Activated,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OtaServiceOutcome {
     pub keep_awake_ms: Option<u32>,
+    pub activation_pending: bool,
 }
 
 impl OtaServiceOutcome {
     pub const IDLE: Self = Self {
         keep_awake_ms: None,
+        activation_pending: false,
     };
 }
 
@@ -73,6 +85,14 @@ where
         node: &mut ZigbeeNode<'_, M, S, P>,
         elapsed_secs: u16,
     ) -> OtaServiceOutcome;
+
+    /// Activate a verified image after the shared lifecycle has checkpointed
+    /// the Zigbee security state.
+    ///
+    /// `handle_event` and `service` must report `activation_pending` instead
+    /// of activating directly. This keeps the reset-causing operation behind
+    /// the application's durable checkpoint.
+    fn activate(&mut self, node: &mut ZigbeeNode<'_, M, S, P>) -> OtaActivationOutcome;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -113,10 +133,18 @@ where
     ) -> OtaServiceOutcome {
         OtaServiceOutcome::IDLE
     }
+
+    fn activate(&mut self, _node: &mut ZigbeeNode<'_, M, S, P>) -> OtaActivationOutcome {
+        OtaActivationOutcome::Failed
+    }
 }
 
 pub const fn is_ota_event(event: &StackEvent) -> bool {
     matches!(
+        event,
+        StackEvent::CommandReceived { cluster_id, .. }
+            if *cluster_id == ClusterId::OTA_UPGRADE.0
+    ) || matches!(
         event,
         StackEvent::OtaImageAvailable { .. }
             | StackEvent::OtaProgress { .. }

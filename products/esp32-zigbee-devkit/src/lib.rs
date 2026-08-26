@@ -36,6 +36,7 @@ compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 
 pub mod migration;
+pub mod policy;
 pub mod profile;
 #[cfg(target_os = "none")]
 pub mod storage;

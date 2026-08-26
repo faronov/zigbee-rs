@@ -4,9 +4,8 @@
 //! Uses the SysTick exception (always available on Cortex-M33) so no
 //! EFR32-specific timer peripherals are needed.
 //!
-//! # Clock assumption
-//! HCLK = 80 MHz (EFR32MG21 default with HFXO).
-//! If your board uses a different system clock, adjust `HCLK_HZ`.
+//! HCLK is configured to BRD4181A's 38.4 MHz HFXO by `platform::init` before
+//! this driver starts.
 
 use core::cell::RefCell;
 use cortex_m::interrupt::Mutex;
@@ -16,19 +15,15 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 // ── Configuration ───────────────────────────────────────────────
 
-/// EFR32MG21 system clock (HCLK) frequency in Hz.
-/// Default: 80 MHz from HFXO.
-const HCLK_HZ: u32 = 80_000_000;
+/// BRD4181A system clock (HCLK) frequency in Hz.
+const HCLK_HZ: u32 = efr32mg21_devkit::HCLK_HZ;
 
 /// SysTick fires every 1 ms.
-const SYSTICK_RELOAD: u32 = HCLK_HZ / 1000 - 1; // 79_999
+const SYSTICK_RELOAD: u32 = HCLK_HZ / 1000 - 1; // 38_399
 
 /// Embassy ticks per SysTick overflow.
 /// Embassy TICK_HZ = 1_000_000, SysTick overflow = 1 ms = 1000 ticks.
 const TICKS_PER_MS: u64 = 1_000;
-
-/// HCLK cycles per Embassy tick (for sub-ms interpolation).
-const HCLK_PER_TICK: u64 = (HCLK_HZ / 1_000_000) as u64; // 80
 
 // ── SysTick register addresses (ARM standard) ──────────────────
 
@@ -82,7 +77,7 @@ impl embassy_time_driver::Driver for Efr32TimeDriver {
 
             let remaining = unsafe { core::ptr::read_volatile(SYST_CVR as *const u32) } as u64;
             let elapsed_in_period = (SYSTICK_RELOAD as u64) - remaining;
-            let sub_ms_ticks = elapsed_in_period / HCLK_PER_TICK;
+            let sub_ms_ticks = elapsed_in_period * 1_000_000 / HCLK_HZ as u64;
 
             full_ms * TICKS_PER_MS + sub_ms_ticks
         })

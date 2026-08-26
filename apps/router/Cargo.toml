@@ -1,0 +1,23 @@
+[package]
+name = "router-app"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Platform-independent always-on End Device, router, and coordinator lifecycle"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[features]
+default = []
+router = ["zigbee-runtime/router"]
+
+[dependencies]
+zigbee-mac = { path = "../../zigbee-mac" }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+
+[dev-dependencies]
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }

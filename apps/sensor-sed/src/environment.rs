@@ -126,22 +126,3 @@ where
         self.inner_mut().update_pressure(tenth_kpa);
     }
 }
-
-#[cfg(feature = "ota")]
-impl<P, F> EnvironmentalSensorProfile for zigbee_runtime::profile::OptionalOta<P, F>
-where
-    P: EnvironmentalSensorProfile,
-    F: zigbee_runtime::firmware_writer::FirmwareWriter,
-{
-    fn update_environment(&mut self, measurement: TemperatureHumidityMeasurement) {
-        self.inner_mut().update_environment(measurement);
-    }
-
-    fn update_battery(&mut self, measurement: BatteryMeasurement) {
-        self.inner_mut().update_battery(measurement);
-    }
-
-    fn update_pressure(&mut self, tenth_kpa: i16) {
-        self.inner_mut().update_pressure(tenth_kpa);
-    }
-}

@@ -4,18 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cc2340-sensor-product = { path = "../../products/cc2340-sensor" }
+lp-em-cc2340r5 = { path = "../../boards/lp-em-cc2340r5" }
+sensor-sed-app = { path = "../../apps/sensor-sed" }
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["cc2340"] }
-zigbee-nwk = { path = "../../zigbee-nwk" }
-zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 
 # Embassy async runtime
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
-embassy-time = { version = "0.5" }
-embassy-time-driver = "0.2"
-embassy-futures = "0.1"
+embassy-time = "0.5"
 
 # ARM Cortex-M0+ support
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
@@ -23,12 +22,10 @@ cortex-m-rt = "0.7"
 
 # Logging
 log = "0.4"
+rtt-target = "0.6"
 
 # Panic handler for embedded target
 panic-halt = "1.0"
-
-# Portable atomics for Cortex-M0+ (no native atomics)
-portable-atomic = { version = "1", features = ["unsafe-assume-single-core"] }
 
 [profile.release]
 opt-level = "s"

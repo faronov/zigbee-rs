@@ -1138,9 +1138,9 @@ name = "mock-coordinator"
 version = "0.1.0"
 dependencies = [
  "pollster",
- "zigbee",
+ "router-app",
+ "zigbee-aps",
  "zigbee-mac",
- "zigbee-nwk",
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zcl",
@@ -1151,9 +1151,9 @@ name = "mock-light"
 version = "0.1.0"
 dependencies = [
  "pollster",
- "zigbee",
+ "router-app",
+ "zigbee-aps",
  "zigbee-mac",
- "zigbee-nwk",
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zcl",
@@ -1163,13 +1163,8 @@ dependencies = [
 name = "mock-sensor"
 version = "0.1.0"
 dependencies = [
+ "mock-sleepy-sensor",
  "pollster",
- "zigbee",
- "zigbee-mac",
- "zigbee-nwk",
- "zigbee-runtime",
- "zigbee-types",
- "zigbee-zcl",
 ]
 
 [[package]]
@@ -1177,9 +1172,9 @@ name = "mock-sleepy-sensor"
 version = "0.1.0"
 dependencies = [
  "pollster",
+ "sensor-sed-app",
  "zigbee-aps",
  "zigbee-mac",
- "zigbee-nwk",
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zcl",
@@ -1400,6 +1395,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "router-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-aps",
+ "zigbee-mac",
+ "zigbee-nwk",
+ "zigbee-runtime",
+ "zigbee-types",
+ "zigbee-zcl",
+]
+
+[[package]]
 name = "rtt-target"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1452,7 +1459,9 @@ version = "0.1.0"
 dependencies = [
  "zigbee-aps",
  "zigbee-mac",
+ "zigbee-nwk",
  "zigbee-runtime",
+ "zigbee-types",
  "zigbee-zcl",
 ]
 

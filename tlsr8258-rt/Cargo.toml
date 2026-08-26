@@ -6,6 +6,12 @@ license = "MIT OR Apache-2.0"
 description = "TLSR8258 reset vector, IRQ context, and Rust startup"
 repository = "https://github.com/faronov/zigbee-rs"
 
+[features]
+default = []
+# Reset-on-wake LOW32K startup. The default runtime keeps the byte-identical
+# cold-only startup used by production until the retention image passes HIL.
+retention-proof = []
+
 [dependencies]
 
 [lints.rust]

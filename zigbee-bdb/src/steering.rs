@@ -23,6 +23,7 @@ use zigbee_zdo::ZdoLayer;
 use zigbee_zdo::ZdpStatus;
 use zigbee_zdo::discovery::NodeDescRsp;
 
+#[cfg(any(feature = "router", test))]
 use crate::attributes::BDB_MIN_COMMISSIONING_TIME;
 use crate::tclk_exchange::{TclkExchange, TclkProgress, TclkStage};
 use crate::{
@@ -3084,6 +3085,7 @@ impl<M: MacDriver> BdbLayer<M> {
             state_to_commit = Some(state);
         }
 
+        #[cfg(any(feature = "router", test))]
         if let Err(status) = self.activate_permit_joining_after_steering().await {
             return self.finalize_post_auth_steering_failure(ex, status).await;
         }
@@ -3106,6 +3108,7 @@ impl<M: MacDriver> BdbLayer<M> {
         ex: &mut TclkExchange,
         persistence: Option<&mut (dyn SecurityPersistence + '_)>,
     ) -> TclkProgress {
+        #[cfg(any(feature = "router", test))]
         if let Err(status) = self.activate_permit_joining_after_steering().await {
             return self.finalize_post_auth_steering_failure(ex, status).await;
         }
@@ -3143,6 +3146,7 @@ impl<M: MacDriver> BdbLayer<M> {
         TclkProgress::Failed(BdbStatus::PersistenceFailure)
     }
 
+    #[cfg(any(feature = "router", test))]
     async fn finalize_post_auth_steering_failure(
         &mut self,
         ex: &mut TclkExchange,
@@ -3205,6 +3209,15 @@ impl<M: MacDriver> BdbLayer<M> {
     ///
     /// Opens the network for joining and broadcasts Mgmt_Permit_Joining_req
     /// so that routers in the network also open their permit joining.
+    #[cfg(not(any(feature = "router", test)))]
+    async fn steer_on_network(&mut self) -> Result<(), BdbStatus> {
+        log::warn!("[BDB:Steering] End Device cannot open permit joining");
+        self.attributes.commissioning_status =
+            crate::attributes::BdbCommissioningStatus::NotPermitted;
+        Err(BdbStatus::NotPermitted)
+    }
+
+    #[cfg(any(feature = "router", test))]
     async fn steer_on_network(&mut self) -> Result<(), BdbStatus> {
         log::info!("[BDB:Steering] Already on network — opening permit joining");
 
@@ -3226,6 +3239,7 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Complete BDB steering by extending the network-wide permit-joining
     /// window, then opening the local association flag when this node can
     /// admit children (BDB v3.0.1 §§8.1 step 3–4 and 8.2 steps 14–15).
+    #[cfg(any(feature = "router", test))]
     async fn activate_permit_joining_after_steering(&mut self) -> Result<(), BdbStatus> {
         let duration = core::cmp::min(BDB_MIN_COMMISSIONING_TIME, 254) as u8;
 

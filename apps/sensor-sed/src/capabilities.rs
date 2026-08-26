@@ -66,6 +66,13 @@ pub enum SensorStatus {
 }
 
 pub trait StatusSink {
+    /// Whether this product has a fitted status indicator.
+    ///
+    /// The shared lifecycle uses this compile-time capability to remove
+    /// status-only deadlines and delay waits entirely when no indicator is
+    /// fitted. Implementations with real hardware inherit `true`.
+    const PRESENT: bool = true;
+
     fn set(&mut self, status: SensorStatus);
 }
 
@@ -73,6 +80,8 @@ pub trait StatusSink {
 pub struct NoStatus;
 
 impl StatusSink for NoStatus {
+    const PRESENT: bool = false;
+
     fn set(&mut self, _status: SensorStatus) {}
 }
 

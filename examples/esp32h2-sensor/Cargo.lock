@@ -787,6 +787,7 @@ dependencies = [
  "esp-storage",
  "esp32-zigbee-devkit",
  "log",
+ "sensor-sed-app",
  "zigbee-aps",
  "zigbee-bdb",
  "zigbee-mac",
@@ -847,11 +848,9 @@ dependencies = [
 name = "esp32h2-sensor"
 version = "0.1.0"
 dependencies = [
- "critical-section",
  "embassy-futures",
  "embassy-time",
  "embassy-time-driver",
- "embedded-hal 1.0.0",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
@@ -861,10 +860,9 @@ dependencies = [
  "esp32-zigbee-devkit-product",
  "log",
  "portable-atomic",
+ "sensor-sed-app",
  "static_cell",
- "zigbee-aps",
  "zigbee-mac",
- "zigbee-nwk",
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zcl",
@@ -1359,6 +1357,15 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "sensor-sed-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-mac",
+ "zigbee-runtime",
+ "zigbee-zcl",
+]
 
 [[package]]
 name = "serde"

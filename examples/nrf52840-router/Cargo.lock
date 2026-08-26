@@ -181,15 +181,6 @@ dependencies = [
 
 [[package]]
 name = "defmt"
-version = "0.3.100"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0963443817029b2024136fc4dd07a5107eb8f977eaf18fcd1fdeb11306b64ad"
-dependencies = [
- "defmt 1.0.1",
-]
-
-[[package]]
-name = "defmt"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "548d977b6da32fa1d1fda2876453da1e7df63ad0304c8b3dae4dbe7b96f39b78"
@@ -222,12 +213,12 @@ dependencies = [
 
 [[package]]
 name = "defmt-rtt"
-version = "0.4.2"
+version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6eca0aae8aa2cf8333200ecbd236274697bc0a394765c858b3d9372eb1abcfa"
+checksum = "05144944c117db54127a8ac17a3c9a28d55e7047bfddb950bcd20b4a94c79b10"
 dependencies = [
  "critical-section",
- "defmt 0.3.100",
+ "defmt",
 ]
 
 [[package]]
@@ -637,24 +628,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrf52840-dk"
+version = "0.1.0"
+dependencies = [
+ "embassy-nrf",
+]
+
+[[package]]
 name = "nrf52840-router"
 version = "0.1.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
- "defmt 0.3.100",
+ "defmt",
  "defmt-rtt",
  "embassy-executor",
  "embassy-nrf",
  "embassy-time",
  "log",
+ "nrf52840-dk",
+ "nrf52840-router-product",
  "panic-probe",
- "static_cell",
- "zigbee-aps",
+ "router-app",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-runtime",
  "zigbee-types",
+ "zigbee-zcl",
+]
+
+[[package]]
+name = "nrf52840-router-product"
+version = "0.1.0"
+dependencies = [
+ "embassy-nrf",
+ "embedded-storage",
+ "nrf52840-dk",
+ "router-app",
+ "zigbee-aps",
+ "zigbee-nwk",
+ "zigbee-runtime",
  "zigbee-zcl",
 ]
 
@@ -669,12 +682,12 @@ dependencies = [
 
 [[package]]
 name = "panic-probe"
-version = "0.3.2"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4047d9235d1423d66cc97da7d07eddb54d4f154d6c13805c6d0793956f4f25b0"
+checksum = "fd402d00b0fb94c5aee000029204a46884b1262e0c443f166d86d2c0747e1a1a"
 dependencies = [
  "cortex-m",
- "defmt 0.3.100",
+ "defmt",
 ]
 
 [[package]]
@@ -736,6 +749,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 
 [[package]]
+name = "router-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-mac",
+ "zigbee-nwk",
+ "zigbee-runtime",
+]
+
+[[package]]
 name = "rtt-target"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -775,15 +797,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "static_cell"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0530892bb4fa575ee0da4b86f86c667132a94b74bb72160f58ee5a4afec74c23"
-dependencies = [
- "portable-atomic",
-]
 
 [[package]]
 name = "strsim"

@@ -174,7 +174,7 @@ core::arch::global_asm!(
     "tjl _start",
 );
 
-#[cfg(target_arch = "tc32")]
+#[cfg(all(target_arch = "tc32", not(feature = "retention-proof")))]
 core::arch::global_asm!(
     ".section .vectors.startup, \"ax\"",
     ".global _start",
@@ -208,3 +208,114 @@ core::arch::global_asm!(
     "4:",
     "tjl _rust_entry",
 );
+
+// The retention image has a deliberately separate startup body. Detection is
+// performed before either the `.data` load or `.bss` clear: cold boot takes
+// the ordinary C/Rust initialization path, while a valid LOW32K wake keeps
+// every writable byte intact and enters a fresh Rust root on freshly reset
+// banked stacks. An unreadable or unexpected mode never aliases to cold boot.
+#[cfg(all(target_arch = "tc32", feature = "retention-proof"))]
+core::arch::global_asm!(
+    ".section .vectors.startup, \"ax\"",
+    ".global _start",
+    ".type _start, %function",
+    "_start:",
+    "tjl __tlsr8258_retention_probe",
+    "cmp r0, #0",
+    "beq 1f",
+    "cmp r0, #1",
+    "beq 5f",
+    "tjl _rust_retention_fault_entry",
+    // Cold entry: initialize all ordinary writable sections. Explicit
+    // `.retained` cells are NOLOAD and are initialized by the composition
+    // root before its validity marker is committed.
+    "1:",
+    "ldr r0, =_sdata",
+    "ldr r1, =_edata",
+    "cmp r0, r1",
+    "bhs 3f",
+    "subs r1, r0",
+    "ldr r2, =_etext",
+    "2:",
+    "ldrb r3, [r2]",
+    "strb r3, [r0]",
+    "adds r2, #1",
+    "adds r0, #1",
+    "subs r1, #1",
+    "bne 2b",
+    "3:",
+    "ldr r0, =_sbss",
+    "ldr r1, =_ebss",
+    "cmp r0, r1",
+    "bhs 4f",
+    "subs r1, r0",
+    "movs r2, #0",
+    "6:",
+    "strb r2, [r0]",
+    "adds r0, #1",
+    "subs r1, #1",
+    "bne 6b",
+    "4:",
+    "tjl _rust_cold_entry",
+    // Retention entry: no copy, no clear, and no jump back into the old
+    // async frame. __reset has already installed fresh SVC/IRQ stack tops.
+    "5:",
+    "tjl _rust_retention_entry",
+);
+
+/// Tri-state early-boot probe used only by the feature-gated LOW32K image.
+///
+/// Return values are an ABI between the Rust probe and `_start`:
+/// `0 = cold`, `1 = valid LOW32K mode`, `2 = unreadable/unexpected`.
+/// The implementation uses no writable Rust state and bounds the analog-bus
+/// wait, so it is valid before `.data`/`.bss` initialization.
+#[cfg(all(target_arch = "tc32", feature = "retention-proof"))]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".ram_code")]
+extern "C" fn __tlsr8258_retention_probe() -> u32 {
+    const REG_ANALOG_ADDR: u32 = 0x0080_00b8;
+    const REG_ANALOG_DATA: u32 = REG_ANALOG_ADDR + 1;
+    const REG_ANALOG_TRIGGER: u32 = REG_ANALOG_ADDR + 2;
+    const REG_IRQ_ENABLE: u32 = 0x0080_0643;
+    const LOW32K_MODE_REGISTER: u8 = 0x7e;
+    const LOW32K_MODE: u8 = 0x07;
+    const POLL_LIMIT: u32 = 100_000;
+
+    unsafe {
+        let irq = core::ptr::read_volatile(REG_IRQ_ENABLE as *const u8);
+        core::ptr::write_volatile(REG_IRQ_ENABLE as *mut u8, 0);
+        core::ptr::write_volatile(REG_ANALOG_ADDR as *mut u8, LOW32K_MODE_REGISTER);
+        core::ptr::write_volatile(REG_ANALOG_TRIGGER as *mut u8, 0x40);
+
+        let mut count = 0;
+        let mut ready = false;
+        while count < POLL_LIMIT {
+            if core::ptr::read_volatile(REG_ANALOG_TRIGGER as *const u8) & 1 == 0 {
+                ready = true;
+                break;
+            }
+            core::arch::asm!("nop");
+            count += 1;
+        }
+        let mode = if ready {
+            core::ptr::read_volatile(REG_ANALOG_DATA as *const u8)
+        } else {
+            0xff
+        };
+        core::ptr::write_volatile(REG_ANALOG_TRIGGER as *mut u8, 0);
+        let result = if !ready {
+            2
+        } else if mode == 0 {
+            0
+        } else if mode == LOW32K_MODE {
+            1
+        } else {
+            2
+        };
+        // A retention/fault entry must stay globally masked until the PM
+        // completion token restores the exact recorded state. Cold startup
+        // preserves the reset-time value as before.
+        core::ptr::write_volatile(REG_IRQ_ENABLE as *mut u8, if result == 0 { irq } else { 0 });
+        result
+    }
+}

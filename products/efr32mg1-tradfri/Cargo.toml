@@ -11,6 +11,9 @@ publish = false
 efr32mg1-hal = { path = "../../efr32mg1-hal" }
 efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
 embedded-storage = "0.3"
+rtt-target = "0.6"
+sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"] }
 zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-mac = { path = "../../zigbee-mac" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["ota"] }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }

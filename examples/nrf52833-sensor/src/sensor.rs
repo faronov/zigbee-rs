@@ -102,9 +102,7 @@ mod bme280_sensor {
     impl nrf_sensor_app::EnvironmentSource for Sensor<'_> {
         type Error = ();
 
-        async fn sample(
-            &mut self,
-        ) -> Result<nrf_sensor_app::EnvironmentReading, Self::Error> {
+        async fn sample(&mut self) -> Result<nrf_sensor_app::EnvironmentReading, Self::Error> {
             let measurement = Sensor::sample(self).await.ok_or(())?;
             Ok(nrf_sensor_app::EnvironmentReading {
                 temperature_centi_celsius: measurement.temperature_centi_celsius,
@@ -212,9 +210,7 @@ mod sht31_sensor {
     impl nrf_sensor_app::EnvironmentSource for Sensor<'_> {
         type Error = ();
 
-        async fn sample(
-            &mut self,
-        ) -> Result<nrf_sensor_app::EnvironmentReading, Self::Error> {
+        async fn sample(&mut self) -> Result<nrf_sensor_app::EnvironmentReading, Self::Error> {
             let measurement = Sensor::sample(self).await.ok_or(())?;
             Ok(nrf_sensor_app::EnvironmentReading {
                 temperature_centi_celsius: measurement.temperature_centi_celsius,

@@ -90,6 +90,12 @@ impl Phy6222TimeDriver {
     }
 }
 
+impl Default for Phy6222TimeDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl embassy_time_driver::Driver for Phy6222TimeDriver {
     fn now(&self) -> u64 {
         cortex_m::interrupt::free(|_| now_locked())

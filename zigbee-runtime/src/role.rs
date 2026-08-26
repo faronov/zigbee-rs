@@ -13,23 +13,25 @@
 //! # Why a type and not just a feature
 //!
 //! A MAC backend that cannot accept children (see
-//! [`zigbee_mac::ParentMacDriver`]) must not be able to *construct* a router.
-//! Encoding the role as a type lets router construction be bounded on a genuine
-//! parent MAC, and lets parent-only operational APIs live in trait-bounded impl
-//! blocks so an end device never exposes them as success-shaped no-ops.
+//! [`zigbee_mac::ParentMacDriver`]) must not be able to *construct or
+//! advertise* a router. Router and relay construction is additionally gated on
+//! the `router` Cargo feature. Encoding the role as a type lets router
+//! construction be bounded on a genuine parent MAC, and lets parent-only
+//! operational APIs live in trait-bounded impl blocks so an end device never
+//! exposes them as success-shaped no-ops.
 //!
 //! # The three roles
 //!
 //! | role | [`CAN_ROUTE`] | [`IS_PARENT`] | builder | MAC bound |
 //! |------|---------------|---------------|---------|-----------|
 //! | [`EndDevice`]   | `false` | `false` | [`build`]        | [`MacDriver`] |
-//! | [`RelayRouter`] | `true`  | `false` | [`build_relay`]  | [`MacDriver`] |
-//! | [`Router`]      | `true`  | `true`  | [`build_router`] | [`ParentMacDriver`] |
+//! | [`RelayRouter`] | `true`  | `false` | [`build_relay`]  | [`ParentMacDriver`] + `router` |
+//! | [`Router`]      | `true`  | `true`  | [`build_router`] | [`ParentMacDriver`] + `router` |
 //!
 //! A [`RelayRouter`] forwards NWK traffic (it is an FFD that relays and runs
-//! link-status / route maintenance) but *cannot* accept and serve children,
-//! which honestly models a backend whose MAC has no parent-side association
-//! primitives yet (e.g. the nRF radio backend).
+//! link-status / route maintenance) but does not retain child lifecycle state.
+//! It still requires a `router` build and [`ParentMacDriver`] to advertise the
+//! Zigbee Router device type; a non-parent backend must use [`EndDevice`].
 //!
 //! # Source compatibility
 //!
@@ -472,10 +474,11 @@ impl EndDeviceRole for EndDevice {
 /// Forwarding-only router role: relays NWK traffic and runs router maintenance,
 /// but cannot accept or serve children.
 ///
-/// Honestly models an always-on FFD whose MAC backend implements only the base
-/// [`MacDriver`] surface (no parent-side association /
-/// beacon / indirect primitives), so it must not advertise or behave as a
-/// child-accepting parent. Constructed with
+/// This role does not retain child lifecycle state, but router construction is
+/// still gated on the `router` feature and a
+/// [`ParentMacDriver`](zigbee_mac::ParentMacDriver). A MAC lacking those
+/// parent primitives must use [`EndDevice`] and cannot advertise
+/// `DeviceType::Router`. Constructed with
 /// [`build_relay`](crate::builder::DeviceBuilder::build_relay).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RelayRouter;

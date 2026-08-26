@@ -138,17 +138,17 @@ pub struct MacCapabilities {
 zigbee-rs ships with MAC backends for a wide range of 802.15.4 radios.  Each
 backend is behind a Cargo feature flag:
 
-| Backend | Feature Flag | Chip(s) | Notes |
-|---------|-------------|---------|-------|
-| **ESP32** | `esp32c6`, `esp32h2` | ESP32-C6, ESP32-H2 | Espressif IEEE 802.15.4 radio, `esp-ieee802154` HAL |
-| **nRF** | `nrf52840`, `nrf52833` | nRF52840, nRF52833 | Nordic 802.15.4 radio, `embassy-nrf` peripherals |
-| **BL702** | `bl702` | BL702, BL706 | Direct Rust `RadioPhy`; XT-ZB1 join and ZHA reporting hardware-tested |
-| **CC2340** | `cc2340` | CC2340R5 | TI SimpleLink, Cortex-M0+ with 802.15.4 |
-| **Telink TLSR8258** | `tlsr8258` | TLSR8258 | Pure-Rust TLSR8258 radio and MAC; `telink` remains a compatibility alias |
-| **PHY6222** | `phy6222` | PHY6222 | Phyplus BLE+802.15.4 combo SoC |
-| **EFR32MG1** | `efr32` | EFR32MG1P | Silicon Labs Series 1, Cortex-M4F — pure Rust (direct register access) |
-| **EFR32MG21** | `efr32s2` | EFR32MG21 | Silicon Labs Series 2, Cortex-M33 — pure Rust (direct register access) |
-| **Mock** | `mock` | — | In-memory mock for unit tests and CI |
+| Backend | Feature flag | Current validation |
+|---|---|---|
+| ESP32-C6/H2 | `esp32c6`, `esp32h2` | sensor paths hardware-tested; H2 full OTA proven, C6 activation open |
+| nRF52840/52833 | `nrf52840`, `nrf52833` | both sensor paths hardware-proven; nRF52840 always-on End Device HIL open |
+| BL702 | `bl702` | XT-ZB1 radio, commissioning, interview, and reporting hardware-proven |
+| CC2340R5 | `cc2340` | compiles with pinned SDK; radio HIL and entropy open |
+| TLSR8258 | `tlsr8258` | secured sensor/router paths hardware-tested; `telink` is a compatibility alias |
+| PHY6222 | `phy6222` | compile/layout only; complete radio path unverified |
+| EFR32MG1 | `efr32` | TRÅDFRI sensor path hardware-proven except real OTA install |
+| EFR32MG21 | `efr32s2` | BRD4181A build/layout only; complete HIL open |
+| Mock | `mock` | host tests |
 
 ### Choosing a Backend
 
@@ -159,25 +159,17 @@ Enable exactly one backend in your `Cargo.toml`:
 zigbee-mac = { path = "../zigbee-mac", features = ["esp32c6"] }
 ```
 
-The rest of the stack is completely platform-independent — changing backends is
-a one-line Cargo feature change plus updating the MAC initialization code.
+The protocol and shared application remain platform-independent, but a port is
+not only a feature change. The composition root must also select:
 
-**Decision guide:**
+- chip startup and the concrete `MacDriver`;
+- a board resource crate;
+- product identity/profile/policy/storage/linker/OTA;
+- narrow wake/status/sensor/supervisor/diagnostic adapters.
 
-- **ESP32-C6 / ESP32-H2** — Best for Wi-Fi+Zigbee combo (C6) or pure Zigbee
-  (H2).  Great ESP-IDF ecosystem and tooling.
-- **nRF52840** — Best for ultra-low-power battery sensors.  Excellent BLE+Zigbee
-  combo.  Mature Embassy async support.
-- **BL702** — Low cost, good for high-volume products.
-- **CC2340R5** — TI ecosystem, good for industrial applications.
-- **Telink TLSR8258** — Very low cost and widely used in commercial Zigbee
-  products. The current backend is pure Rust and needs no vendor SDK.
-- **PHY6222** — Budget BLE+802.15.4 combo, pure-Rust radio driver, suitable for simple sensors.
-- **EFR32MG1** — Silicon Labs Series 1 (Cortex-M4F), used in IKEA TRÅDFRI modules.
-  Pure-Rust radio driver — no GSDK/RAIL required. Great for repurposing existing hardware.
-- **EFR32MG21** — Silicon Labs Series 2 (Cortex-M33), used in Sonoff ZBDongle-E.
-  Pure-Rust radio driver with separate `efr32s2` module (different register map from Series 1).
-- **Mock** — Use for testing your application logic without hardware.
+Use the [platform guides](../platform-guides/nrf.md) to choose only among paths
+whose validation level meets the product's requirements. A compile-only
+backend is not a production recommendation.
 
 ## The Mock Backend
 

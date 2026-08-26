@@ -25,11 +25,8 @@
 //! * physical storage, version policy, and boot selection — owned by each
 //!   platform's [`FirmwareWriter`](crate::firmware_writer::FirmwareWriter);
 //! * *when* to react to a status — fast-poll window extensions, console
-//!   logging, and the checkpoint-before-activate ordering differ between a
-//!   profile where OTA is mandatory ([`crate::profile::WithOta`]) and one
-//!   where a checked partition/bootloader layout can leave it absent
-//!   ([`crate::profile::OptionalOta`]), so callers pass `Option<&mut
-//!   OtaManager<F>>` and keep that policy themselves.
+//!   logging, and the checkpoint-before-activate ordering remain product
+//!   policy, so callers own their concrete [`OtaManager`].
 
 use crate::ZigbeeDevice;
 use crate::event_loop::StackEvent;
@@ -48,9 +45,8 @@ pub enum OtaEventOutcome {
     NotOta,
     /// The event *was* OTA Upgrade cluster traffic, but this session
     /// declined to act on it: the endpoint didn't match, another server is
-    /// already mid-transfer, only an Image Notify may start a transfer with
-    /// an unknown server, or there is no firmware backend at all (a checked
-    /// layout left it absent). The caller should still treat the traffic as
+    /// already mid-transfer, or only an Image Notify may start a transfer
+    /// with an unknown server. The caller should still treat the traffic as
     /// handled — do not fall through to other command handling — but there
     /// is no status to react to.
     ///
@@ -68,10 +64,8 @@ pub enum OtaEventOutcome {
 
 /// Network session bookkeeping for one OTA client endpoint.
 ///
-/// Generic over the firmware writer `F` so the same type drives either a
-/// mandatory [`OtaManager`] (always passed as `Some`) or an optional one
-/// behind [`crate::profile::OtaBackend`] (a checked layout can leave it
-/// `None` for the lifetime of the device).
+/// Generic over the firmware writer `F` so the same type drives each product's
+/// concrete [`OtaManager`].
 #[derive(Debug, Default)]
 pub struct OtaSession {
     /// (short address, endpoint) of the server driving the current transfer.
@@ -100,16 +94,14 @@ impl OtaSession {
     }
 
     /// Whether a transfer is in flight (drives fast polling).
-    pub fn is_active<F: FirmwareWriter>(manager: Option<&OtaManager<F>>) -> bool {
-        manager.is_some_and(|manager| {
-            matches!(
-                manager.state(),
-                OtaState::QuerySent
-                    | OtaState::Downloading { .. }
-                    | OtaState::Verifying
-                    | OtaState::WaitingActivate
-            )
-        })
+    pub fn is_active<F: FirmwareWriter>(manager: &OtaManager<F>) -> bool {
+        matches!(
+            manager.state(),
+            OtaState::QuerySent
+                | OtaState::Downloading { .. }
+                | OtaState::Verifying
+                | OtaState::WaitingActivate
+        )
     }
 
     /// Handle a stack event that may be OTA Upgrade cluster traffic.
@@ -121,7 +113,7 @@ impl OtaSession {
     pub async fn handle_event<M: MacDriver, F: FirmwareWriter>(
         &mut self,
         device: &mut ZigbeeDevice<M>,
-        manager: Option<&mut OtaManager<F>>,
+        manager: &mut OtaManager<F>,
         endpoint: u8,
         event: &StackEvent,
     ) -> OtaEventOutcome {
@@ -145,11 +137,6 @@ impl OtaSession {
         if *frame_type != ZclFrameType::ClusterSpecific {
             return OtaEventOutcome::Ignored;
         }
-        // No firmware backend on this device (checked layout disabled it) —
-        // the traffic is OTA, but there is nothing to drive it with.
-        let Some(manager) = manager else {
-            return OtaEventOutcome::Ignored;
-        };
         if *dst_endpoint != endpoint {
             return OtaEventOutcome::Ignored;
         }
@@ -185,10 +172,9 @@ impl OtaSession {
     pub async fn service<M: MacDriver, F: FirmwareWriter>(
         &mut self,
         device: &mut ZigbeeDevice<M>,
-        manager: Option<&mut OtaManager<F>>,
+        manager: &mut OtaManager<F>,
         elapsed_secs: u16,
     ) -> Option<StackEvent> {
-        let manager = manager?;
         let status = manager.tick(elapsed_secs);
         self.note_status(&status);
         self.send_pending(device, manager).await;
@@ -199,12 +185,9 @@ impl OtaSession {
     /// state that must survive the reset into the staged image.
     pub fn activate<F: FirmwareWriter>(
         &mut self,
-        manager: Option<&mut OtaManager<F>>,
+        manager: &mut OtaManager<F>,
     ) -> Result<(), FirmwareError> {
         self.activation_pending = false;
-        let Some(manager) = manager else {
-            return Err(FirmwareError::ActivateFailed);
-        };
         let result = manager.activate();
         if result.is_err() {
             self.cleanup_pending = true;
@@ -426,13 +409,13 @@ mod tests {
             pan_id: 0x1234,
         };
         assert!(matches!(
-            block_on(session.handle_event(&mut device, Some(&mut mgr), ENDPOINT, &joined)),
+            block_on(session.handle_event(&mut device, &mut mgr, ENDPOINT, &joined)),
             OtaEventOutcome::NotOta
         ));
 
         let other_cluster = command_event(SERVER_A, ENDPOINT, ClusterId::BASIC.0, 0x00, &[]);
         assert!(matches!(
-            block_on(session.handle_event(&mut device, Some(&mut mgr), ENDPOINT, &other_cluster)),
+            block_on(session.handle_event(&mut device, &mut mgr, ENDPOINT, &other_cluster)),
             OtaEventOutcome::NotOta
         ));
         assert_eq!(
@@ -460,36 +443,11 @@ mod tests {
         };
         *frame_type = ZclFrameType::Global;
 
-        let outcome = block_on(session.handle_event(&mut device, Some(&mut mgr), ENDPOINT, &event));
+        let outcome = block_on(session.handle_event(&mut device, &mut mgr, ENDPOINT, &event));
 
         assert!(matches!(outcome, OtaEventOutcome::Ignored));
         assert_eq!(mgr.state(), OtaState::Idle);
         assert_eq!(device.mac_mut().tx_history().len(), sent_before);
-    }
-
-    #[test]
-    fn disabled_backend_consumes_ota_traffic_without_state() {
-        let mut session = OtaSession::new();
-        let mut device = joined_device();
-        let sent_before = device.mac_mut().tx_history().len();
-
-        assert!(!OtaSession::is_active::<MockFirmwareWriter>(None));
-
-        let event = image_notify(SERVER_A, ENDPOINT);
-        let outcome: OtaEventOutcome =
-            block_on(session.handle_event::<MockMac, MockFirmwareWriter>(
-                &mut device,
-                None,
-                ENDPOINT,
-                &event,
-            ));
-        assert!(matches!(outcome, OtaEventOutcome::Ignored));
-        assert!(!session.activation_pending());
-        assert_eq!(
-            device.mac_mut().tx_history().len(),
-            sent_before,
-            "a missing backend must not send anything"
-        );
     }
 
     #[test]
@@ -500,7 +458,7 @@ mod tests {
         let sent_before = device.mac_mut().tx_history().len();
 
         let event = image_notify(SERVER_A, ENDPOINT + 1);
-        let outcome = block_on(session.handle_event(&mut device, Some(&mut mgr), ENDPOINT, &event));
+        let outcome = block_on(session.handle_event(&mut device, &mut mgr, ENDPOINT, &event));
         assert!(matches!(outcome, OtaEventOutcome::Ignored));
         assert_eq!(mgr.state(), OtaState::Idle);
         assert_eq!(device.mac_mut().tx_history().len(), sent_before);
@@ -514,10 +472,10 @@ mod tests {
         let sent_before = device.mac_mut().tx_history().len();
 
         let event = image_notify(SERVER_A, ENDPOINT);
-        let outcome = block_on(session.handle_event(&mut device, Some(&mut mgr), ENDPOINT, &event));
+        let outcome = block_on(session.handle_event(&mut device, &mut mgr, ENDPOINT, &event));
         assert!(matches!(outcome, OtaEventOutcome::Consumed(None)));
         assert_eq!(mgr.state(), OtaState::QuerySent);
-        assert!(OtaSession::is_active(Some(&mgr)));
+        assert!(OtaSession::is_active(&mgr));
         assert_eq!(
             device.mac_mut().tx_history().len(),
             sent_before + 1,
@@ -533,7 +491,7 @@ mod tests {
 
         block_on(session.handle_event(
             &mut device,
-            Some(&mut mgr),
+            &mut mgr,
             ENDPOINT,
             &image_notify(SERVER_A, ENDPOINT),
         ));
@@ -541,7 +499,7 @@ mod tests {
 
         let outcome = block_on(session.handle_event(
             &mut device,
-            Some(&mut mgr),
+            &mut mgr,
             ENDPOINT,
             &image_notify(SERVER_B, ENDPOINT),
         ));
@@ -615,15 +573,10 @@ mod tests {
         version: u32,
     ) -> Option<StackEvent> {
         let total = ota_file.len() as u32;
-        block_on(session.handle_event(
-            device,
-            Some(mgr),
-            ENDPOINT,
-            &image_notify(server, ENDPOINT),
-        ));
+        block_on(session.handle_event(device, mgr, ENDPOINT, &image_notify(server, ENDPOINT)));
         let outcome = block_on(session.handle_event(
             device,
-            Some(mgr),
+            mgr,
             ENDPOINT,
             &command_event(
                 server,
@@ -650,7 +603,7 @@ mod tests {
             let event = block_response_event(server, ENDPOINT, version, offset, chunk);
             let final_block = end == ota_file.len();
             let sent_before = device.mac_mut().tx_history().len();
-            let outcome = block_on(session.handle_event(device, Some(mgr), ENDPOINT, &event));
+            let outcome = block_on(session.handle_event(device, mgr, ENDPOINT, &event));
             let OtaEventOutcome::Consumed(status) = outcome else {
                 panic!("block response must be consumed as OTA traffic");
             };
@@ -690,7 +643,7 @@ mod tests {
         end_resp[12..16].copy_from_slice(&0u32.to_le_bytes()); // upgrade now
         let outcome = block_on(session.handle_event(
             &mut device,
-            Some(&mut mgr),
+            &mut mgr,
             ENDPOINT,
             &command_event(
                 SERVER_A,
@@ -710,7 +663,7 @@ mod tests {
         );
 
         // The application checkpoints here, then activates.
-        assert!(session.activate(Some(&mut mgr)).is_ok());
+        assert!(session.activate(&mut mgr).is_ok());
         assert!(!session.activation_pending());
         assert!(mgr.writer().is_activated());
     }
@@ -739,7 +692,7 @@ mod tests {
         // The session must accept a brand new server after the reset.
         let outcome = block_on(session.handle_event(
             &mut device,
-            Some(&mut mgr),
+            &mut mgr,
             ENDPOINT,
             &image_notify(SERVER_B, ENDPOINT),
         ));

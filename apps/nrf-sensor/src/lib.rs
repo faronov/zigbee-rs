@@ -11,22 +11,22 @@
 //! chip HAL     ← embassy-nrf
 //! ```
 //!
-//! [`SensorApp`] is a source-compatible wrapper for the not-yet-migrated
-//! nRF52833 composition root. New roots should construct
-//! [`sensor_sed_app::SensorApp`] directly from [`NrfWakeController`],
-//! [`NrfStatus`], [`NrfSupervisor`], and [`NrfBattery`].
+//! Composition roots construct [`sensor_sed_app::SensorApp`] directly from
+//! [`NrfWakeController`], [`NrfStatus`], [`NrfSupervisor`], and
+//! [`NrfBattery`].
 
 #![no_std]
 
-pub mod app;
 pub mod battery;
 pub mod diagnostics;
 pub mod environment;
 pub mod platform;
 
-pub use app::SensorApp;
 pub use battery::{BatteryPolicy, NrfBattery};
 pub use diagnostics::{NrfDiagnostics, persistence_failure};
 pub use environment::OnChipTemperature;
-pub use platform::{NrfStatus, NrfSupervisor, NrfWakeController, SensorMac};
+pub use platform::{
+    NrfPolarityStatus, NrfStatus, NrfSupervisor, NrfTimerWakeController, NrfWakeController,
+    SensorMac,
+};
 pub use sensor_sed_app::{EnvironmentReading, EnvironmentSink, EnvironmentSource, policy};

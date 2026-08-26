@@ -6,29 +6,23 @@
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use zigbee_aps::PROFILE_HOME_AUTOMATION;
-use zigbee_mac::{MacDriver, MacError, PlatformServices, telink::TelinkMac};
+use router_app::{NoDiagnostics, ParentRouterApp, PersistentChildren, RouterObserver, RouterParts};
+use zigbee_mac::{PlatformServices, telink::TelinkMac};
 use zigbee_runtime::ZigbeeDevice;
-use zigbee_runtime::child_store::{ChildStoreError, ChildTableStore};
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::profile::{ApplicationProfile, DeviceProfile, RangeExtender};
-use zigbee_runtime::role::{ParentRole, Router};
-use zigbee_runtime::security_store::SecurityStateStore;
-use zigbee_zcl::DeviceId;
+use zigbee_runtime::profile::ApplicationProfile;
+use zigbee_runtime::role::Router;
 use zigbee_zcl::clusters::basic::PowerSource;
 
 use tlsr8258_tb04::{leds::StatusLeds, resources::BoardResources};
+use tlsr8258_tb04_product::router::{ROUTER_POLICY, led_adapters, range_extender_profile};
 
 // Distinct from the sensor runtime's `DEVICE_EUI_OFFSET` (0x33) so a router
 // and a sensor built from the same factory-programmed part never collide on
 // IEEE address if someone reflashes one board with both images over time.
 const DEVICE_EUI_OFFSET: u8 = 0x52; // 'R' for Router
-const ENDPOINT: u8 = 1;
-const MAX_RX_SLICE_US: u32 = 20_000;
-const JOIN_RETRY_MIN_MS: u32 = 5_000;
-const JOIN_RETRY_MAX_MS: u32 = 60_000;
 
 #[repr(C)]
 struct JoinMetrics {
@@ -491,49 +485,64 @@ impl JoinMetrics {
 #[unsafe(no_mangle)]
 static TELINK_JOIN_METRICS: JoinMetrics = JoinMetrics::new();
 
-enum LoopControl {
-    Continue,
-    Recommission,
-    Fatal,
-}
+/// Zero-storage static observer that preserves the debugger ABI of
+/// `TELINK_JOIN_METRICS` while the shared app owns the lifecycle.
+struct TelinkJoinObserver;
 
-async fn apply_stack_event<M, S, P, R, C>(
-    node: &mut ZigbeeNode<'_, M, S, P, R>,
-    child_store: &mut C,
-    event: StackEvent,
-) -> LoopControl
-where
-    M: MacDriver,
-    S: SecurityStateStore,
-    P: ApplicationProfile,
-    R: ParentRole,
-    C: ChildTableStore,
-{
-    let outcome = match event {
-        StackEvent::RejoinRequested => match node.secure_rejoin().await {
-            Ok(_) => LoopControl::Continue,
-            Err(StartError::PersistenceFailed(_)) => LoopControl::Fatal,
-            Err(_) => LoopControl::Recommission,
-        },
-        StackEvent::BasicResetToFactoryDefaults => LoopControl::Continue,
-        StackEvent::LeaveRequested => match node.factory_reset().await {
-            Ok(()) => LoopControl::Recommission,
-            Err(_) => LoopControl::Fatal,
-        },
-        StackEvent::Left | StackEvent::CommissioningComplete { success: false } => {
-            LoopControl::Recommission
+impl RouterObserver<TelinkMac, Router> for TelinkJoinObserver {
+    fn on_commissioning_attempt(
+        _device: &ZigbeeDevice<TelinkMac, Router>,
+        _attempt: u32,
+        started_us: u32,
+    ) {
+        TELINK_JOIN_METRICS.begin_attempt(started_us);
+    }
+
+    fn on_start_result(device: &ZigbeeDevice<TelinkMac, Router>, result: Result<u16, StartError>) {
+        if matches!(result, Ok(_) | Err(StartError::CommissioningFailed(_))) {
+            TELINK_JOIN_METRICS.capture_steering(device);
         }
-        _ => LoopControl::Continue,
-    };
-    if matches!(outcome, LoopControl::Recommission)
-        && node
-            .device_mut()
-            .clear_persisted_child_table(child_store)
-            .is_err()
-    {
-        LoopControl::Fatal
-    } else {
-        outcome
+    }
+
+    fn on_secure_rejoin_result(
+        device: &ZigbeeDevice<TelinkMac, Router>,
+        _result: Result<u16, StartError>,
+    ) {
+        TELINK_JOIN_METRICS.capture_steering(device);
+    }
+
+    fn on_network_ready(device: &ZigbeeDevice<TelinkMac, Router>) {
+        // ParentRouterApp calls this only after the durable child table has
+        // been restored, so no observer work can open parent traffic early.
+        TELINK_JOIN_METRICS.capture_steering(device);
+    }
+
+    fn on_frame_received(_device: &ZigbeeDevice<TelinkMac, Router>, _receive_elapsed_us: u32) {
+        TELINK_JOIN_METRICS.record_rx();
+    }
+
+    fn on_frame_processed(
+        device: &ZigbeeDevice<TelinkMac, Router>,
+        _event: Option<&StackEvent>,
+        _elapsed_us: u32,
+    ) {
+        TELINK_JOIN_METRICS.capture_interview(device);
+    }
+
+    fn on_stack_event(device: &ZigbeeDevice<TelinkMac, Router>, event: &StackEvent) {
+        if matches!(event, StackEvent::CommissioningComplete { success: true }) {
+            TELINK_JOIN_METRICS.mark_commissioning_complete(device);
+        }
+    }
+
+    fn on_tick(device: &ZigbeeDevice<TelinkMac, Router>, elapsed_secs: u16, _result: &TickResult) {
+        TELINK_JOIN_METRICS.capture_interview(device);
+        TELINK_JOIN_METRICS.capture_steering(device);
+        if elapsed_secs != 0 {
+            // Bounded snapshot only on the existing one-second stack tick,
+            // never in the turnaround-critical IRQ or per-frame path.
+            TELINK_JOIN_METRICS.capture_radio(device.mac());
+        }
     }
 }
 
@@ -541,6 +550,10 @@ fn failure(leds: &StatusLeds) -> ! {
     leds.green.write(false);
     leds.blue.write(false);
     leds.red.write(true);
+    halted()
+}
+
+fn halted() -> ! {
     loop {
         tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(1_000));
     }
@@ -580,12 +593,7 @@ pub fn run() -> ! {
     }
 
     static mut DEVICE_STORAGE: MaybeUninit<Device> = MaybeUninit::uninit();
-    let mut profile = DeviceProfile::new(
-        ENDPOINT,
-        PROFILE_HOME_AUTOMATION,
-        DeviceId::RANGE_EXTENDER,
-        RangeExtender,
-    );
+    let mut profile = range_extender_profile();
 
     let device = ZigbeeDevice::builder(mac)
         .power_mode(PowerMode::AlwaysOn)
@@ -609,172 +617,32 @@ pub fn run() -> ! {
     // Product-owned durable child table, on its own two flash sectors. The
     // runtime owns the record format and restore semantics; the product owns
     // where the bytes live and when they are written.
-    let mut child_store = tlsr8258_tb04_product::storage::child_table_store(child_partition);
+    let child_store = tlsr8258_tb04_product::storage::child_table_store(child_partition);
     if device
         .reset_security_state_if_identity_changed(&mut security_store, ieee_address)
         .is_err()
     {
         failure(&leds);
     }
-    let mut node = ZigbeeNode::new(device, &mut security_store, &mut profile);
-
-    // Single root future for the whole firmware: start/resume with join-retry
-    // backoff, MAX_RX_SLICE_US-bounded receive windows, `process_incoming`,
-    // parent command servicing, tick/`RunAgain` scheduling, metrics timestamps,
-    // LED states, and factory-reset/rejoin all run inside this one future so
-    // `tlsr8258_rt::block_on` is monomorphized exactly once. Synchronous chip,
-    // ADC, LED, MAC, device, and node initialization above stays outside the
-    // future. This never returns (`Output = !`).
-    let app = async move {
-        'commission: loop {
-            leds.green.write(false);
-            leds.blue.write(false);
-            leds.red.write(true);
-
-            let mut retry_delay_ms = JOIN_RETRY_MIN_MS;
-            loop {
-                TELINK_JOIN_METRICS.begin_attempt(node.device().mac().monotonic_micros());
-                match node.start_or_resume().await {
-                    Ok(_) => break,
-                    Err(StartError::CommissioningFailed(_)) => {
-                        let diagnostics = node.device().steering_diagnostics();
-                        let announce_exhausted = diagnostics.device_annce_exhausted();
-                        TELINK_JOIN_METRICS.capture_steering(node.device());
-                        if announce_exhausted {
-                            if node.factory_reset().await.is_err()
-                                || node
-                                    .device_mut()
-                                    .clear_persisted_child_table(&mut child_store)
-                                    .is_err()
-                            {
-                                failure(&leds);
-                            }
-                        }
-                        tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(retry_delay_ms));
-                        retry_delay_ms = retry_delay_ms.saturating_mul(2).min(JOIN_RETRY_MAX_MS);
-                    }
-                    Err(_) => failure(&leds),
-                }
-            }
-            TELINK_JOIN_METRICS.capture_steering(node.device());
-
-            // R22 §3.6.1.4.3.2 / §2.4.3.1.12: the child table has to be live
-            // again *before* any orphan notification or Parent Announce is
-            // answered, so restore it as soon as the network is up. A record
-            // from a different network, or a corrupt one, is reported as an
-            // error by the runtime rather than silently applied; the router
-            // then continues with an empty child table (children re-associate
-            // or rejoin normally) instead of admitting stale devices. The
-            // restore also arms `apsParentAnnounceTimer`.
-            match node.device_mut().restore_child_table(&mut child_store) {
-                Ok(_) => {}
-                Err(ChildStoreError::Hardware) => failure(&leds),
-                Err(_) => {
-                    // Corrupt or foreign record: drop it and re-persist the
-                    // (empty) live table so the stale one cannot be read again.
-                    let _ = node.device_mut().save_child_table(&mut child_store);
-                }
-            }
-
-            // Solid green = joined and relaying. Unlike the sensor runtime,
-            // there is no battery/sensor state to report — this LED state is
-            // the entire "am I alive and joined" signal for the router.
-            leds.red.write(false);
-            leds.green.write(true);
-            leds.blue.write(false);
-
-            let mut identify_elapsed = 0u32;
-            let one_second = tlsr8258_hal::timer::ms(1_000);
-            let mut tick_anchor = tlsr8258_hal::timer::now_ticks();
-            let mut rx_slice_us = MAX_RX_SLICE_US;
-
-            loop {
-                let mut event = None;
-                match node.device_mut().receive_timeout(rx_slice_us).await {
-                    Ok(indication) => {
-                        TELINK_JOIN_METRICS.record_rx();
-                        match node.process_incoming(&indication).await {
-                            Ok(stack_event) => event = stack_event,
-                            Err(_) => failure(&leds),
-                        }
-                    }
-                    Err(MacError::NoData) => {}
-                    Err(_) => failure(&leds),
-                }
-                TELINK_JOIN_METRICS.capture_interview(node.device());
-
-                if let Some(stack_event) = event {
-                    if matches!(
-                        stack_event,
-                        StackEvent::CommissioningComplete { success: true }
-                    ) {
-                        TELINK_JOIN_METRICS.mark_commissioning_complete(node.device());
-                    }
-                    match apply_stack_event(&mut node, &mut child_store, stack_event).await {
-                        LoopControl::Continue => {}
-                        LoopControl::Recommission => continue 'commission,
-                        LoopControl::Fatal => failure(&leds),
-                    }
-                }
-
-                let now = tlsr8258_hal::timer::now_ticks();
-                let elapsed = now.wrapping_sub(tick_anchor);
-                let elapsed_secs = if elapsed >= one_second {
-                    let elapsed_secs = (elapsed / one_second).min(u16::MAX as u32) as u16;
-                    tick_anchor = tick_anchor.wrapping_add(u32::from(elapsed_secs) * one_second);
-                    identify_elapsed = identify_elapsed.wrapping_add(u32::from(elapsed_secs));
-                    // Bounded radio diagnostics: one snapshot per second, on
-                    // a tick that already runs, so the retransmission
-                    // counters can be correlated with a sniffer capture
-                    // without adding any per-frame work.
-                    TELINK_JOIN_METRICS.capture_radio(node.device().mac());
-                    elapsed_secs
-                } else {
-                    0
-                };
-
-                match node.tick(elapsed_secs).await {
-                    Ok(TickResult::Idle) => rx_slice_us = MAX_RX_SLICE_US,
-                    Ok(TickResult::RunAgain(delay_ms)) => {
-                        rx_slice_us = delay_ms.max(1).saturating_mul(1_000).min(MAX_RX_SLICE_US);
-                    }
-                    Ok(TickResult::Event(stack_event)) => {
-                        rx_slice_us = MAX_RX_SLICE_US;
-                        if matches!(
-                            stack_event,
-                            StackEvent::CommissioningComplete { success: true }
-                        ) {
-                            TELINK_JOIN_METRICS.mark_commissioning_complete(node.device());
-                        }
-                        match apply_stack_event(&mut node, &mut child_store, stack_event).await {
-                            LoopControl::Continue => {}
-                            LoopControl::Recommission => continue 'commission,
-                            LoopControl::Fatal => failure(&leds),
-                        }
-                    }
-                    Err(_) => failure(&leds),
-                }
-                TELINK_JOIN_METRICS.capture_steering(node.device());
-
-                // Persist only on a real child lifecycle transition
-                // (admission, authorization, rejoin re-addressing, End Device
-                // Timeout eviction, leave, Parent Announce reconciliation).
-                // A steady-state tick writes no flash.
-                if node
-                    .device_mut()
-                    .save_child_table_if_dirty(&mut child_store)
-                    .is_err()
-                {
-                    failure(&leds);
-                }
-
-                if node.device().is_identifying(ENDPOINT) {
-                    leds.blue.write((identify_elapsed & 1) == 0);
-                } else {
-                    leds.blue.write(false);
-                }
-            }
-        }
+    let node = ZigbeeNode::new(device, &mut security_store, &mut profile);
+    let children = PersistentChildren::new(child_store);
+    let (status, supervisor) = led_adapters(leds);
+    let parts = RouterParts::new(status, supervisor, NoDiagnostics);
+    let mut app = match ParentRouterApp::<_, _, _, _, _, _, _, TelinkJoinObserver>::new_observed(
+        node,
+        children,
+        &ROUTER_POLICY,
+        parts,
+    ) {
+        Ok(app) => app,
+        // The LEDs were initialized red before ownership moved into the
+        // adapters. Constructor failure is therefore still fail-closed.
+        Err(_) => halted(),
     };
-    tlsr8258_rt::block_on(app)
+
+    // The shared parent app now owns commissioning, child restore/persist/
+    // clear, bounded receive, tick, rejoin, and retry behavior. The device
+    // itself remains in caller-owned static storage, and this is the only
+    // root future/`block_on` monomorphization in the firmware.
+    tlsr8258_rt::block_on(app.run())
 }

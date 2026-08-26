@@ -4,6 +4,7 @@
 //! Writes and erases go through the SPIF controller at `0x4000C800`.
 //! Cache must be bypassed during write/erase operations.
 
+use crate::peripherals::FlashToken;
 use crate::regs::*;
 use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
@@ -64,12 +65,19 @@ impl NorFlashError for FlashError {
 }
 
 pub struct Phy62x2Flash {
+    _token: FlashToken,
     capacity: usize,
 }
 
 impl Phy62x2Flash {
-    pub const fn new(capacity: usize) -> Self {
-        Self { capacity }
+    pub fn new(token: FlashToken, capacity: usize) -> Result<Self, FlashError> {
+        if capacity == 0 || capacity > MAX_FLASH_CAPACITY as usize {
+            return Err(FlashError::OutOfRange);
+        }
+        Ok(Self {
+            _token: token,
+            capacity,
+        })
     }
 
     fn validate_range(&self, offset: u32, length: usize) -> Result<(), FlashError> {
@@ -120,7 +128,9 @@ impl NorFlash for Phy62x2Flash {
     }
 
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
-        if offset as usize % Self::WRITE_SIZE != 0 || bytes.len() % Self::WRITE_SIZE != 0 {
+        if !(offset as usize).is_multiple_of(Self::WRITE_SIZE)
+            || !bytes.len().is_multiple_of(Self::WRITE_SIZE)
+        {
             return Err(FlashError::UnalignedSector);
         }
         self.validate_range(offset, bytes.len())?;
@@ -129,7 +139,7 @@ impl NorFlash for Phy62x2Flash {
 }
 
 /// Read bytes from flash via XIP (memory-mapped, no SPIF commands needed).
-pub fn read(offset: u32, buf: &mut [u8]) -> Result<(), FlashError> {
+fn read(offset: u32, buf: &mut [u8]) -> Result<(), FlashError> {
     validate_range(offset, buf.len())?;
     let addr = (FLASH_BASE + offset) as *const u8;
     for (i, b) in buf.iter_mut().enumerate() {
@@ -144,7 +154,7 @@ pub fn read(offset: u32, buf: &mut [u8]) -> Result<(), FlashError> {
 /// cache bypass makes XIP instruction fetches unsafe.
 #[unsafe(link_section = ".data.ram_code")]
 #[inline(never)]
-pub fn erase_sector(offset: u32) -> Result<(), FlashError> {
+fn erase_sector(offset: u32) -> Result<(), FlashError> {
     if offset & (SECTOR_SIZE - 1) != 0 {
         return Err(FlashError::UnalignedSector);
     }
@@ -175,7 +185,7 @@ fn erase_sector_inner(offset: u32) -> Result<(), FlashError> {
 /// cache bypass makes XIP instruction fetches unsafe.
 #[unsafe(link_section = ".data.ram_code")]
 #[inline(never)]
-pub fn write(offset: u32, data: &[u8]) -> Result<(), FlashError> {
+fn write(offset: u32, data: &[u8]) -> Result<(), FlashError> {
     validate_range(offset, data.len())?;
 
     let primask = disable_interrupts!();
@@ -217,12 +227,9 @@ fn write_inner(offset: u32, data: &[u8]) -> Result<(), FlashError> {
         }
 
         // Page Program
-        let wr_words = ((chunk_len + 3) / 4) as u32;
-        let fcmd = (0x02u32 << 24)
-            | 0x8_0001
-            | (2 << 16)
-            | 0x8000
-            | (wr_words.saturating_sub(1) << 12);
+        let wr_words = chunk_len.div_ceil(4) as u32;
+        let fcmd =
+            (0x02u32 << 24) | 0x8_0001 | (2 << 16) | 0x8000 | (wr_words.saturating_sub(1) << 12);
         reg_write(SPIF_FCMD, fcmd);
         spif_wait_idle()?;
         spif_wait_not_busy()?;
@@ -257,10 +264,8 @@ fn write_enable() -> Result<(), FlashError> {
 #[inline(never)]
 fn spif_wait_idle() -> Result<(), FlashError> {
     for _ in 0..100_000u32 {
-        if reg_read(SPIF_FCMD) & 0x02 == 0 {
-            if reg_read(SPIF_CONFIG) & 0x8000_0000 != 0 {
-                return Ok(());
-            }
+        if reg_read(SPIF_FCMD) & 0x02 == 0 && reg_read(SPIF_CONFIG) & 0x8000_0000 != 0 {
+            return Ok(());
         }
         ram_nop!();
     }

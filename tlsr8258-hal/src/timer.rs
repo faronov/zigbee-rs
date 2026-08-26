@@ -43,6 +43,19 @@
 pub const TICKS_PER_MS: u32 = 24_000;
 pub const TICKS_PER_US: u32 = 24;
 
+/// Calculate the Timer0 value that preserves application monotonic time over
+/// a full-SRAM SUSPEND interval measured by the separate 16 MHz PM timer.
+///
+/// Splitting the exact 3/2 ratio into quotient and remainder avoids an
+/// overflowing intermediate and preserves Timer0's native wrapping semantics.
+pub const fn rebased_ticks_after_suspend(timer0_before: u32, elapsed_system_ticks: u32) -> u32 {
+    let half = elapsed_system_ticks / 2;
+    let elapsed_timer0_ticks = half
+        .wrapping_mul(TICKS_PER_MS / (crate::pm::SYSTEM_TIMER_TICKS_PER_MS / 2))
+        .wrapping_add(elapsed_system_ticks & 1);
+    timer0_before.wrapping_add(elapsed_timer0_ticks)
+}
+
 /// `reg_tmr_ctrl` bit 0 (`FLD_TMR0_EN`, `register.h`).
 const FLD_TMR0_EN: u8 = 1 << 0;
 /// `reg_tmr_ctrl` bits 1..2 (`FLD_TMR0_MODE`, `register.h`). `0` selects
@@ -99,6 +112,21 @@ pub fn init() {
 #[cfg(target_arch = "tc32")]
 pub fn now_ticks() -> u32 {
     unsafe { super::mmio::r32(super::mmio::REG_TMR0_TICK) }
+}
+
+/// Rebase Timer0 after full-SRAM SUSPEND and radio reinitialization.
+///
+/// Call this from the PM restore phase, after radio/MAC restoration (which
+/// reinitializes Timer0) and before global interrupts are restored. Returning
+/// the programmed value lets an on-device diagnostic verify the transaction.
+#[cfg(target_arch = "tc32")]
+#[inline(never)]
+pub fn rebase_after_suspend(timer0_before: u32, elapsed_system_ticks: u32) -> u32 {
+    let rebased = rebased_ticks_after_suspend(timer0_before, elapsed_system_ticks);
+    unsafe {
+        super::mmio::w32(super::mmio::REG_TMR0_TICK, rebased);
+    }
+    rebased
 }
 
 /// Whether Timer0 is currently enabled. HAL operations whose bounded waits
@@ -300,6 +328,19 @@ mod tests {
             (FLD_TMR0_EN | FLD_TMR0_MODE_MASK) & (FLD_TMR1_EN | FLD_TMR1_MODE_MASK),
             0
         );
+    }
+
+    #[test]
+    fn suspend_rebase_converts_16mhz_elapsed_time_to_timer0_24mhz() {
+        assert_eq!(rebased_ticks_after_suspend(10, 16_000), 24_010);
+        assert_eq!(rebased_ticks_after_suspend(10, 4_000_000), 6_000_010);
+        assert_eq!(rebased_ticks_after_suspend(10, 1), 11);
+        assert_eq!(rebased_ticks_after_suspend(10, 2), 13);
+    }
+
+    #[test]
+    fn suspend_rebase_preserves_timer0_wrapping_semantics() {
+        assert_eq!(rebased_ticks_after_suspend(u32::MAX - 5, 16), 18);
     }
 
     #[test]

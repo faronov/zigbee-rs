@@ -21,7 +21,12 @@ log = "0.4"
 default = ["float32", "float64"]
 float32 = ["zigbee-bdb/float32", "zigbee-zcl/float32"]
 float64 = ["zigbee-bdb/float64", "zigbee-zcl/float64"]
-router = ["zigbee-aps/router", "zigbee-nwk/router", "zigbee-zdo/router"]
+router = [
+    "zigbee-aps/router",
+    "zigbee-bdb/router",
+    "zigbee-nwk/router",
+    "zigbee-zdo/router",
+]
 ota = []
 trace = ["zigbee-bdb/trace", "zigbee-aps/trace", "zigbee-nwk/trace"]
 constrained-memory = [

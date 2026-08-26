@@ -30,7 +30,7 @@ pub mod ota;
 pub mod parts;
 pub mod policy;
 
-pub use app::{SensorApp, SensorAppError};
+pub use app::{SensorApp, SensorAppError, SensorLifecycleError};
 pub use battery::{
     BatteryReading, BatterySource, BlockingBattery, BlockingBatterySource, FixedBattery,
 };
@@ -43,8 +43,8 @@ pub use environment::{
     EnvironmentSource, EnvironmentalSensorProfile,
 };
 pub use ota::{
-    NoOta, NonOtaComponent, NonOtaProfile, OtaEventOutcome, OtaLifecycle, OtaServiceOutcome,
-    is_ota_event,
+    NoOta, NonOtaComponent, NonOtaProfile, OtaActivationOutcome, OtaEventOutcome, OtaLifecycle,
+    OtaServiceOutcome, is_ota_event,
 };
 pub use parts::SensorSedParts;
 pub use policy::{

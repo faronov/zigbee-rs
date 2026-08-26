@@ -100,10 +100,47 @@ where
             .refresh_security_state(&mut *self.security_store)
     }
 
-    pub async fn start_or_resume(&mut self) -> Result<u16, StartError> {
+    pub fn start_or_resume(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<u16, StartError>> {
+        #[cfg(any(feature = "router", test))]
+        let future = self
+            .device
+            .start_or_resume_with_security_store(&mut *self.security_store);
+        #[cfg(not(any(feature = "router", test)))]
+        let future = self
+            .device
+            .start_or_resume_steering_with_security_store(&mut *self.security_store);
+        future
+    }
+
+    /// Resume or freshly join a non-coordinator network through Network
+    /// Steering only.
+    ///
+    /// Router and relay application frontends use this method instead of the
+    /// legacy device-type-aware startup future so coordinator formation cannot
+    /// become part of their async state machine.
+    pub fn start_or_resume_steering(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<u16, StartError>> {
         self.device
-            .start_or_resume_with_security_store(&mut *self.security_store)
-            .await
+            .start_or_resume_steering_with_security_store(&mut *self.security_store)
+    }
+
+    /// Resume or freshly form a coordinator PAN.
+    ///
+    /// Available only on the parent-capable runtime role; the method still
+    /// rejects a [`Router`](crate::role::Router) configured as an ordinary
+    /// router before touching coordinator startup state.
+    #[cfg(any(feature = "router", test))]
+    pub fn start_or_resume_coordinator(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<u16, StartError>>
+    where
+        R: crate::role::ParentRole,
+    {
+        self.device
+            .start_or_resume_coordinator_with_security_store(&mut *self.security_store)
     }
 
     pub async fn secure_rejoin(&mut self) -> Result<u16, StartError> {
@@ -198,6 +235,98 @@ where
             .map_err(NodeError::Persistence)
     }
 
+    /// Tick a non-coordinator node with a steering-only pending-action path.
+    pub async fn tick_steering(&mut self, elapsed_secs: u16) -> Result<TickResult, NodeError> {
+        let Self {
+            device,
+            security_store,
+            profile,
+        } = self;
+        let mut clusters = ApplicationClusters::new();
+        profile.collect_clusters(&mut clusters)?;
+        device
+            .tick_with_steering_security_store(
+                elapsed_secs,
+                clusters.as_mut_slice(),
+                *security_store,
+            )
+            .await
+            .map_err(NodeError::Persistence)
+    }
+
+    /// Steering-only tick that leaves a requested durable reset for the
+    /// application composition root to commit.
+    pub async fn tick_steering_deferred_reset(
+        &mut self,
+        elapsed_secs: u16,
+    ) -> Result<TickResult, NodeError> {
+        let Self {
+            device,
+            security_store,
+            profile,
+        } = self;
+        let mut clusters = ApplicationClusters::new();
+        profile.collect_clusters(&mut clusters)?;
+        device
+            .tick_with_steering_security_store_deferred_reset(
+                elapsed_secs,
+                clusters.as_mut_slice(),
+                *security_store,
+            )
+            .await
+            .map_err(NodeError::Persistence)
+    }
+
+    /// Tick a coordinator with a formation-only pending-action path.
+    #[cfg(any(feature = "router", test))]
+    pub async fn tick_coordinator(&mut self, elapsed_secs: u16) -> Result<TickResult, NodeError>
+    where
+        R: crate::role::ParentRole,
+    {
+        let Self {
+            device,
+            security_store,
+            profile,
+        } = self;
+        let mut clusters = ApplicationClusters::new();
+        profile.collect_clusters(&mut clusters)?;
+        device
+            .tick_with_coordinator_security_store(
+                elapsed_secs,
+                clusters.as_mut_slice(),
+                *security_store,
+            )
+            .await
+            .map_err(NodeError::Persistence)
+    }
+
+    /// Coordinator tick that leaves a requested durable reset for the
+    /// application composition root to commit.
+    #[cfg(any(feature = "router", test))]
+    pub async fn tick_coordinator_deferred_reset(
+        &mut self,
+        elapsed_secs: u16,
+    ) -> Result<TickResult, NodeError>
+    where
+        R: crate::role::ParentRole,
+    {
+        let Self {
+            device,
+            security_store,
+            profile,
+        } = self;
+        let mut clusters = ApplicationClusters::new();
+        profile.collect_clusters(&mut clusters)?;
+        device
+            .tick_with_coordinator_security_store_deferred_reset(
+                elapsed_secs,
+                clusters.as_mut_slice(),
+                *security_store,
+            )
+            .await
+            .map_err(NodeError::Persistence)
+    }
+
     pub async fn process_incoming(
         &mut self,
         indication: &McpsDataIndication,
@@ -211,6 +340,29 @@ where
         profile.collect_clusters(&mut clusters)?;
         device
             .process_incoming_with_security_store(
+                indication,
+                clusters.as_mut_slice(),
+                *security_store,
+            )
+            .await
+            .map_err(NodeError::Persistence)
+    }
+
+    /// Process one frame while deferring durable Leave/factory-reset
+    /// mutation to the application composition root.
+    pub async fn process_incoming_deferred_reset(
+        &mut self,
+        indication: &McpsDataIndication,
+    ) -> Result<Option<StackEvent>, NodeError> {
+        let Self {
+            device,
+            security_store,
+            profile,
+        } = self;
+        let mut clusters = ApplicationClusters::new();
+        profile.collect_clusters(&mut clusters)?;
+        device
+            .process_incoming_with_security_store_deferred_reset(
                 indication,
                 clusters.as_mut_slice(),
                 *security_store,

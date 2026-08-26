@@ -1,6 +1,7 @@
 //! Recoverable SHT3x discovery for the production sensor.
 
 use embassy_time::{Duration, Timer};
+use sensor_sed_app::{EnvironmentReading, EnvironmentSource};
 
 pub type Sht3x = zigbee_sht3x::Sht3x<efr32mg1_tradfri::SensorI2c>;
 
@@ -34,6 +35,7 @@ impl Sensor {
                     return true;
                 }
             }
+
             i2c = sensor.release();
         }
 
@@ -66,5 +68,18 @@ impl Sensor {
             return None;
         }
         self.read_active().await
+    }
+}
+
+impl EnvironmentSource for Sensor {
+    type Error = ();
+
+    async fn sample(&mut self) -> Result<EnvironmentReading, Self::Error> {
+        let measurement = Sensor::sample(self).await.ok_or(())?;
+        Ok(EnvironmentReading {
+            temperature_centi_celsius: measurement.temperature_centi_celsius,
+            humidity_centi_percent: measurement.humidity_centi_percent,
+            pressure_tenth_kpa: None,
+        })
     }
 }

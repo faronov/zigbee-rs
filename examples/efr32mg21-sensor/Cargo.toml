@@ -2,39 +2,39 @@
 name = "efr32mg21-sensor"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
-zigbee-types = { path = "../../zigbee-types" }
-zigbee-mac = { path = "../../zigbee-mac", features = ["efr32mg21"] }
-zigbee-nwk = { path = "../../zigbee-nwk" }
-zigbee-aps = { path = "../../zigbee-aps" }
-zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
-efr32mg21-devkit = { path = "../../boards/efr32mg21-devkit" }
-
-# Embassy async runtime
-embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
-embassy-time = { version = "0.5" }
-embassy-time-driver = "0.2"
-embassy-futures = "0.1"
-
-# ARM Cortex-M33 support
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = { version = "0.7", features = ["device"] }
-
-# Data structures for no_std
-heapless = "0.8"
-
-# Logging
+efr32mg21-devkit = { path = "../../boards/efr32mg21-devkit" }
+efr32mg21-hal = { path = "../../efr32mg21-hal" }
+efr32mg21-sensor-product = { path = "../../products/efr32mg21-sensor" }
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
+embassy-futures = "0.1"
+embassy-time = { version = "0.5", features = ["tick-hz-1_000"] }
+embassy-time-driver = "0.2"
 log = "0.4"
-
-# Panic handler for embedded target
-panic-halt = "1.0"
+rtt-target = { version = "0.6", features = ["log"] }
+sensor-sed-app = { path = "../../apps/sensor-sed" }
+static_cell = "2"
+zigbee-mac = { path = "../../zigbee-mac", features = ["efr32mg21"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 
 [features]
 default = []
 stubs = []
 
+[profile.dev]
+opt-level = 1
+codegen-units = 1
+debug = true
+lto = false
+
 [profile.release]
 opt-level = "s"
+codegen-units = 1
 lto = true
+debug = false

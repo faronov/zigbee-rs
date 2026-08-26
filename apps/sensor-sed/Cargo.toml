@@ -13,8 +13,10 @@ ota = ["zigbee-runtime/ota"]
 [dependencies]
 zigbee-mac = { path = "../../zigbee-mac" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 
 [dev-dependencies]
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
-zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-types = { path = "../../zigbee-types" }

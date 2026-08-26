@@ -16,6 +16,7 @@ zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["constrained-memory", "ota"] }
+sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"] }
 efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
 efr32mg1-tradfri-product = { path = "../../products/efr32mg1-tradfri" }
 efr32mg1-hal = { path = "../../efr32mg1-hal" }

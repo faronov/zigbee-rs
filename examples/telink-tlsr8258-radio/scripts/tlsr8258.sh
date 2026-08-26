@@ -77,7 +77,7 @@ run_cargo() {
     require_file "$CARGO_BIN" "tc32 cargo"
     (
         cd "$EXAMPLE_DIR"
-        env CARGO_HOME="$CARGO_HOME" "$CARGO_BIN" "$cargo_subcommand" --release \
+        env CARGO_HOME="$CARGO_HOME" "$CARGO_BIN" "$cargo_subcommand" --release --locked \
             --target tc32-unknown-none-elf \
             -Z build-std=core -Z build-std-features=compiler-builtins-mem \
             "$@"
@@ -307,9 +307,9 @@ cmd_test() {
         cd "$EXAMPLE_DIR"
         local host_target
         host_target=$(rustc -vV | awk '/^host:/ {print $2}')
-        cargo test --target "$host_target" "$@"
+        cargo test --locked --target "$host_target" "$@"
         cargo test --manifest-path "$REPO_DIR/tlsr8258-hal/Cargo.toml" \
-            --target "$host_target" "$@"
+            --locked --target "$host_target" "$@"
     )
 }
 

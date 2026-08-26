@@ -90,11 +90,22 @@ pub struct SensorPolicy {
     pub interview_complete_grace_ms: u32,
     pub button: ButtonPolicy,
     pub status: StatusPolicy,
-    pub sleep_depth: SleepDepth,
+    /// Wait depth while joined and the fast-poll window is active.
+    pub fast_sleep_depth: SleepDepth,
+    /// Wait depth while joined in the steady-state slow-poll period.
+    pub slow_sleep_depth: SleepDepth,
 }
 
 impl SensorPolicy {
     pub const fn is_valid(&self) -> bool {
+        self.is_valid_for_status(true)
+    }
+
+    /// Validate the policy for a statically known status capability.
+    ///
+    /// Products without a fitted status indicator do not need meaningful
+    /// blink periods because those deadlines and waits are compiled out.
+    pub const fn is_valid_for_status(&self, status_present: bool) -> bool {
         self.sample_interval_ms != 0
             && self.fast_poll_ms != 0
             && self.slow_poll_ms != 0
@@ -108,10 +119,11 @@ impl SensorPolicy {
                 Some(duration_ms) => duration_ms != 0,
                 None => true,
             }
-            && self.status.unjoined_blink_period_ms != 0
-            && self.status.blink_on_ms != 0
-            && self.status.blink_gap_ms != 0
-            && self.status.reset_phase_ms != 0
+            && (!status_present
+                || (self.status.unjoined_blink_period_ms != 0
+                    && self.status.blink_on_ms != 0
+                    && self.status.blink_gap_ms != 0
+                    && self.status.reset_phase_ms != 0))
     }
 
     pub const fn power_mode(&self) -> PowerMode {

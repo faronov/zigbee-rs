@@ -7,11 +7,27 @@ description = "Product flash layout and persistence policy for TLSR8258 TB-04 fi
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
+[features]
+default = ["router"]
+router = ["dep:router-app", "router-app/router", "zigbee-runtime/router"]
+sensor = ["dep:sensor-sed-app", "dep:zigbee-mac"]
+retention-proof = [
+    "sensor",
+    "tlsr8258-hal/retention-proof",
+    "zigbee-mac/telink-retention-proof",
+]
+retention-proof-10s = ["retention-proof"]
+
 [dependencies]
 embedded-storage = "0.3"
+router-app = { path = "../../apps/router", optional = true }
+sensor-sed-app = { path = "../../apps/sensor-sed", optional = true }
 tlsr8258-hal = { path = "../../tlsr8258-hal" }
 tlsr8258-tb04 = { path = "../../boards/tlsr8258-tb04" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-mac = { path = "../../zigbee-mac", optional = true }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

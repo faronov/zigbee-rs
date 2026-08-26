@@ -14,7 +14,6 @@ embedded-storage = "0.3"
 embassy-time-driver = "0.2"
 phy6222-hal = { path = "../../phy6222-hal" }
 portable-atomic = { version = "1", features = ["critical-section"] }
-zigbee-runtime = { path = "../../zigbee-runtime" }
 
 [features]
 default = []

@@ -51,6 +51,7 @@ SECTIONS
     {
         *(.text._start);
         *(.text._start.*);
+        KEEP(*(.retention_image_marker));
         *(.text .text.*);
         *(.rodata .rodata.*);
         *(.ARM.exidx .ARM.exidx.*);
@@ -84,6 +85,20 @@ SECTIONS
         _ebss = .;
     } > RAM
 
+    /* Key application/profile/lifecycle cells and the PM hand-off record are
+     * explicit NOLOAD retained state in the proof image. Cold startup
+     * initializes them manually; retention startup never copies/clears them.
+     */
+    .retained (NOLOAD) :
+    {
+        . = ALIGN(4);
+        _retained_start_ = .;
+        KEEP(*(.retained));
+        KEEP(*(.retained.*));
+        . = ALIGN(4);
+        _retained_end_ = .;
+    } > RAM
+
     .rf_dma (NOLOAD) :
     {
         . = ALIGN(4);
@@ -93,11 +108,25 @@ SECTIONS
         _rf_dma_end_ = .;
     } > RAM
 
-    /* Keep a 16 KiB SVC stack and 1 KiB IRQ stack at the top of SRAM. */
-    _svc_stack_bottom = 0x0084BC00;
-    _svc_stack_top    = 0x0084FC00;
-    _irq_stack_bottom = 0x0084FC00;
-    _irq_stack_top    = 0x00850000;
+    /*
+     * The feature image emits TELINK_RETENTION_IMAGE. It places a fresh,
+     * deliberately smaller root stack, IRQ stack and guards wholly in LOW32K.
+     * The default image retains the original top-of-64K stack addresses.
+     */
+    _retention_image_enabled_ = DEFINED(TELINK_RETENTION_IMAGE);
+    _retention_limit_ = 0x00848000;
+    _retention_stack_guard_start_ =
+        _retention_image_enabled_ ? ((_rf_dma_end_ + 15) & ~15) : 0;
+    _retention_stack_guard_end_ =
+        _retention_image_enabled_ ? _retention_stack_guard_start_ + 0x100 : 0;
+    _retention_svc_bottom_ =
+        (_retention_stack_guard_end_ + 0xFF) & ~0xFF;
+
+    _svc_stack_bottom = _retention_image_enabled_ ? _retention_svc_bottom_ : 0x0084BC00;
+    _svc_stack_top    = _retention_image_enabled_ ? 0x00847800 : 0x0084FC00;
+    _irq_stack_bottom = _retention_image_enabled_ ? 0x00847800 : 0x0084FC00;
+    _irq_stack_top    = _retention_image_enabled_ ? 0x00847C00 : 0x00850000;
+    _retention_top_guard_end_ = _retention_image_enabled_ ? _retention_limit_ : 0;
     _stack_top = _svc_stack_top;
 
     _bin_size_ = _code_size_ + SIZEOF(.data);
@@ -130,6 +159,23 @@ SECTIONS
         "ERROR: .rf_dma overlaps the TLSR8258 I-cache tag/data reservation");
     _assert_dma_under_stack = ASSERT(_rf_dma_end_ <= _svc_stack_bottom,
         "ERROR: .rf_dma extends into the SVC stack region");
+    _assert_retained_state_low32 = ASSERT(!_retention_image_enabled_ ||
+        (_retained_end_ <= _retention_limit_ && _rf_dma_end_ <= _retention_limit_),
+        "ERROR: retained writable/RF state exceeds LOW32K");
+    _assert_retention_guard = ASSERT(!_retention_image_enabled_ ||
+        (_retention_stack_guard_end_ - _retention_stack_guard_start_) >= 0x100,
+        "ERROR: LOW32K state/stack guard is smaller than 256 bytes");
+    _assert_retention_svc_size = ASSERT(!_retention_image_enabled_ ||
+        (_svc_stack_top - _svc_stack_bottom) >= 0x2000,
+        "ERROR: retained fresh-root SVC stack is smaller than 8 KiB");
+    _assert_retention_stacks_low32 = ASSERT(!_retention_image_enabled_ ||
+        (_svc_stack_bottom >= _retention_stack_guard_end_ &&
+         _svc_stack_top <= _irq_stack_bottom &&
+         _irq_stack_top <= _retention_limit_),
+        "ERROR: retained stack/guard ranges overlap or exceed LOW32K");
+    _assert_retention_top_guard = ASSERT(!_retention_image_enabled_ ||
+        (_retention_limit_ - _irq_stack_top) >= 0x400,
+        "ERROR: LOW32K top guard is smaller than 1 KiB");
     _assert_image_below_child_nv = ASSERT(_bin_size_ <= _child_nv_start_,
         "ERROR: firmware image overlaps child-table journal at 0x72000");
     _assert_child_nv_before_security_nv = ASSERT(_child_nv_end_ <= _security_nv_start_,

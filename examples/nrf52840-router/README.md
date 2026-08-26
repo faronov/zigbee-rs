@@ -1,98 +1,60 @@
-# nRF52840 Zigbee Router
+# nRF52840 always-on Zigbee End Device
 
-A `no_std` experimental Full Function Device target for the
-**nRF52840-DK**. It joins an existing network with the router capability bit
-and exercises always-on receive and NWK forwarding paths.
+This `no_std` nRF52840-DK image composes the shared
+`router_app::AlwaysOnEndDeviceApp`.
 
-Because the nRF MAC does not implement `MLME-ASSOCIATE.response` (it cannot
-accept child devices or buffer indirect frames for sleeping children), this
-target uses the honest forwarding-only **`RelayRouter`** logical role
-(`CAN_ROUTE = true`, `IS_PARENT = false`), constructed with `build_relay()`.
-`NrfMac` is not a `ParentMacDriver`, so it cannot construct the parent `Router`
-role; the relay role relays and runs router/link-status maintenance but never
-advertises or behaves as a child-accepting parent.
+The Nordic MAC backend does not implement `ParentMacDriver`, association
+responses, pending transactions, or indirect delivery. The image therefore
+builds `DeviceType::EndDevice` with `PowerMode::AlwaysOn`, which advertises
+`macRxOnWhenIdle = true` without claiming router or child-parent behavior.
 
-## Hardware
+The frontend exposes finite `initialize()` and `step()` calls. This root uses
+them directly so it can service the three-second reset button between bounded
+always-on End Device steps.
 
-- **MCU:** Nordic nRF52840 — ARM Cortex-M4F, 64 MHz, 1 MB Flash, 256 KB RAM
-- **Radio:** Built-in IEEE 802.15.4 (no SoftDevice needed)
-- **Board:** nRF52840-DK (PCA10056)
-- **LED1 (P0.13):** Solid ON = joined, blink = joining
-- **LED2 (P0.14):** Blinks on frame relay
-- **Button 1 (P0.11):** Short press = toggle join/leave, long press = factory reset
+## Product behavior
 
-## Features
+- Home Automation **Simple Sensor** profile on endpoint 1:
+  Basic and Identify servers only.
+- Always-on power mode and continuous bounded receive slices; no
+  application-side sleep between slices.
+- Crash-safe security-state journal in the protected top 8 KiB of flash
+  (`0x000FE000..0x00100000`).
+- Factory-programmed FICR EUI-64, with persisted identity mismatch guard.
+- Nordic ECB hardware AES installed only after both startup known-answer tests.
+- DK external high-frequency crystal (`ExternalXtal`) and both applicable
+  DC-DC regulators enabled.
+- Button 1 held for three seconds performs a journal-aware factory reset and
+  only then resets the MCU. A short press has no protocol action.
 
-- Joins existing Zigbee network as a router (FFD)
-- Continuous RX (`rx_on_when_idle = true`)
-- Exercises unicast and broadcast forwarding paths
-- RREQ rebroadcast for route discovery
-- Periodic Link Status broadcasts (every 15 seconds)
-- NWK Leave handler with auto-rejoin
-- Button-driven join/leave with factory reset
+## Indicators
 
-## Prerequisites
+- **LED1 / P0.13 — semantic status:** solid on when online, alternate state on
+  commissioning/rejoin attempts, dark during Identify, solid on for reset or
+  fault.
+- **LED2 / P0.14 — RX activity:** toggles for each normal MAC data indication.
+  It indicates reception, not proof that the frame was forwarded.
 
-```bash
-rustup target add thumbv7em-none-eabihf
-cargo install probe-rs-tools
-```
+## Build and flash
 
-## Building
+CI and release measurements use the pinned compiler:
 
 ```bash
 cd examples/nrf52840-router
-cargo build --release
+cargo +nightly-2026-03-23 build --release --locked
+cargo +nightly-2026-03-23 run --release --locked
 ```
 
-## Flashing
+The linker consumes `products/nrf52840-router/link/memory.x`; the product's
+Rust constants and linker `ASSERT`s independently protect the two-page
+security journal.
 
-```bash
-# Flash + live defmt log output
-cargo run --release
+The current raw image budget is checked by CI; rebuild after this role change
+before treating any previous forwarding-relay measurement as applicable.
 
-# Or flash only
-probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-router
-```
+## Hardware validation still required
 
-## How It Works
-
-Unlike sensor examples (which are Sleepy End Devices), the router:
-
-1. **Never sleeps** — radio is always on to relay frames
-2. **Exercises forwarding** — unicast and broadcast NWK paths stay active
-3. **Sends Link Status** — periodic broadcasts so neighbors know it's alive
-4. **Participates in routing** — AODV route discovery and RREQ rebroadcast
-
-Child admission remains disabled until the backend implements association
-indications/responses, pending transactions, and indirect transmission.
-
-The router uses `PowerMode::AlwaysOn` and does not implement any sleep
-logic. DC-DC converters are enabled for lower power consumption while
-the radio is continuously active.
-
-## Project Structure
-
-```
-nrf52840-router/
-├── .cargo/config.toml   # Target: thumbv7em-none-eabihf, probe-rs runner
-├── Cargo.toml            # Dependencies
-├── build.rs              # Linker script setup
-├── memory.x              # Flash @ 0x00000000, RAM @ 0x20000000
-└── src/
-    └── main.rs           # Router entry point, event loop, frame relay
-```
-
-## Expected Serial Output (via RTT)
-
-```
-INFO  Zigbee-RS nRF52840 ROUTER starting…
-INFO  Radio ready
-INFO  Device ready — press Button 1 to join/leave
-INFO  [btn] Joining network…
-INFO  [scan] Scanning channels 11-26…
-INFO  [scan] Found network: ch=15, PAN=0x1AAA
-INFO  [join] Association successful, addr=0x5678
-INFO  [router] Link Status broadcast
-INFO  [relay] Relayed frame 0x1234 → 0x0000
-```
+Before release, verify on an nRF52840-DK that commissioning/resume survives
+power loss, LED2 follows RX activity, the three-second reset clears membership
+without counter rollback, and the always-on End Device remains reachable
+without advertising or admitting children.

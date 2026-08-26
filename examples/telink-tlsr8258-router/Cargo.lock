@@ -136,6 +136,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "router-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-mac",
+ "zigbee-nwk",
+ "zigbee-runtime",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -156,6 +165,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "telink-tlsr8258-router"
 version = "0.1.0"
 dependencies = [
+ "router-app",
  "tlsr8258-hal",
  "tlsr8258-rt",
  "tlsr8258-tb04",
@@ -194,9 +204,12 @@ name = "tlsr8258-tb04-product"
 version = "0.1.0"
 dependencies = [
  "embedded-storage",
+ "router-app",
  "tlsr8258-hal",
  "tlsr8258-tb04",
+ "zigbee-aps",
  "zigbee-runtime",
+ "zigbee-zcl",
 ]
 
 [[package]]

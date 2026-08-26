@@ -8,10 +8,10 @@ name = "mock-coordinator"
 path = "src/main.rs"
 
 [dependencies]
-zigbee-types = { path = "../../zigbee-types" }
+router-app = { path = "../../apps/router", features = ["router"] }
+zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
-zigbee-nwk = { path = "../../zigbee-nwk" }
-zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
-zigbee = { path = "../../zigbee" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["router"] }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 pollster = "0.4"

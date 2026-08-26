@@ -2,7 +2,7 @@ name: Build TLSR8258 (tc32)
 
 on:
   push:
-    branches: [master, main, develop]
+    branches: [master, main, develop, experiment/zephyr-app-model]
     paths:
       - "examples/telink-tlsr8258-sensor/**"
       - "examples/telink-tlsr8258-router/**"
@@ -15,10 +15,12 @@ on:
       - "boards/tlsr8258-tb04/**"
       - "products/tlsr8258-tb04/**"
       - "tlsr8258-rt/**"
+      - "apps/router/**"
+      - "apps/sensor-sed/**"
       - "zigbee-*/**"
       - ".github/workflows/build-tc32.yml"
   pull_request:
-    branches: [master, main, develop]
+    branches: [master, main, develop, experiment/zephyr-app-model]
     paths:
       - "examples/telink-tlsr8258-sensor/**"
       - "examples/telink-tlsr8258-router/**"
@@ -31,6 +33,8 @@ on:
       - "boards/tlsr8258-tb04/**"
       - "products/tlsr8258-tb04/**"
       - "tlsr8258-rt/**"
+      - "apps/router/**"
+      - "apps/sensor-sed/**"
       - "zigbee-*/**"
       - ".github/workflows/build-tc32.yml"
   workflow_dispatch:
@@ -45,25 +49,43 @@ concurrency:
 env:
   TC32_TOOLCHAIN_URL: https://github.com/modern-tc32/rust/releases/download/tc32-stage2-tc32-45/tc32-rust-toolchain-linux-amd64.tar.gz
   TC32_TOOLCHAIN_DIR: ${{ github.workspace }}/.toolchains/tc32-stage2-tc32-45
+  TC32_TOOLCHAIN_SHA256: 916732a6f5e19da722e735cb267192dbd5dda155f0701287fab52a54b852c9b7
+  HOST_RUST_TOOLCHAIN: 1.94.1
 
 jobs:
   build:
     name: Production and lab firmware
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 75
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.HOST_RUST_TOOLCHAIN }}
+          components: clippy
+
+      - name: Cache tc32-45 toolchain
+        id: cache-tc32-toolchain
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.TC32_TOOLCHAIN_DIR }}
+          key: tc32-toolchain-linux-amd64-${{ env.TC32_TOOLCHAIN_SHA256 }}
 
       - name: Install tc32-45 toolchain
+        if: steps.cache-tc32-toolchain.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$TC32_TOOLCHAIN_DIR"
           curl -fL --retry 3 "$TC32_TOOLCHAIN_URL" -o /tmp/tc32.tar.gz
+          echo "$TC32_TOOLCHAIN_SHA256  /tmp/tc32.tar.gz" | sha256sum -c -
           tar -xzf /tmp/tc32.tar.gz --strip-components=1 -C "$TC32_TOOLCHAIN_DIR"
+
+      - name: Verify tc32-45 toolchain
+        run: |
           "$TC32_TOOLCHAIN_DIR/bin/rustc" --version --verbose
 
       - name: Cache tc32 build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -75,11 +97,17 @@ jobs:
             products/tlsr8258-tb04/target
             tools/telink-tlsr8258-lab/target
             examples/telink-tlsr8258-radio/target
-          key: tc32-45-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '**/memory*.x') }}
+          key: tc32-45-${{ env.TC32_TOOLCHAIN_SHA256 }}-${{ env.HOST_RUST_TOOLCHAIN }}-${{ runner.os }}-tc32-unknown-none-elf-prod-retention-router-pm-retention-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '**/memory*.x', 'scripts/tlsr8258.sh', 'tools/tlsr8258-firmware.sh', 'tools/telink-tlsr8258-lab/scripts/tlsr8258.sh', 'examples/telink-tlsr8258-radio/scripts/tlsr8258.sh') }}
 
-      - name: Build production sensor and router
+      - name: Build production sensor variants and parent router
         run: |
           mkdir -p target/tlsr8258-artifacts
+          ./scripts/tlsr8258.sh build sensor-retention
+          cp examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.retention-250.bin \
+            target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-250.bin
+          ./scripts/tlsr8258.sh build sensor-retention-10s
+          cp examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.retention-10s.bin \
+            target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-10s.bin
           ./scripts/tlsr8258.sh build sensor
           cp examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-sensor.bin
@@ -87,10 +115,16 @@ jobs:
           cp examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-router.bin
           ./tools/firmware-size-report.sh telink-tlsr8258-sensor \
-            target/tlsr8258-artifacts/telink-tlsr8258-sensor.bin 286720 \
+            target/tlsr8258-artifacts/telink-tlsr8258-sensor.bin 294912 \
             target/tlsr8258-artifacts/telink-tlsr8258-sensor.size.json
+          ./tools/firmware-size-report.sh telink-tlsr8258-sensor-retention-250 \
+            target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-250.bin 299008 \
+            target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-250.size.json
+          ./tools/firmware-size-report.sh telink-tlsr8258-sensor-retention-10s \
+            target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-10s.bin 299008 \
+            target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-10s.size.json
           ./tools/firmware-size-report.sh telink-tlsr8258-router \
-            target/tlsr8258-artifacts/telink-tlsr8258-router.bin 344064 \
+            target/tlsr8258-artifacts/telink-tlsr8258-router.bin 356352 \
             target/tlsr8258-artifacts/telink-tlsr8258-router.size.json
           NM="$TC32_TOOLCHAIN_DIR/llvm/bin/llvm-nm"
           SENSOR_ELF=examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor
@@ -116,6 +150,15 @@ jobs:
           done
           SENSOR_SYMS="$("$NM" --demangle "$SENSOR_ELF")"
           ROUTER_SYMS="$("$NM" --demangle "$ROUTER_ELF")"
+          # ParentRouterApp must enter only the typed steering startup/tick
+          # path. The coordinator formation future and its CTR-DRBG entropy
+          # implementation must be absent from the parent-router image.
+          COORDINATOR_STARTUP_SYMS='network_formation|start_fresh_coordinator|start_or_resume_coordinator|persist_formed_coordinator|resume_coordinator_network|tlsr8258_hal::rng::CtrDrbg'
+          if grep -Eq "($COORDINATOR_STARTUP_SYMS)" <<<"$ROUTER_SYMS"; then
+            echo "TLSR8258 parent router links coordinator startup symbols:" >&2
+            grep -E "($COORDINATOR_STARTUP_SYMS)" <<<"$ROUTER_SYMS" >&2
+            exit 1
+          fi
           # Role split: the sleepy sensor must compile out the parent/router
           # maintenance subgraph (permit-join, routing, MAC parent-command
           # servicing, child rejoin/Update-Device, Parent Announce), while the
@@ -153,9 +196,13 @@ jobs:
 
       - name: Build hardware lab matrix
         run: |
-          for mode in diag-beacon diag-assoc diag-smoke diag-pm lab-sensor; do
+          for mode in diag-beacon diag-assoc diag-smoke diag-pm diag-retention lab-sensor; do
             ./scripts/tlsr8258.sh build "$mode"
-            cp tools/telink-tlsr8258-lab/target/tc32-unknown-none-elf/release/telink-tlsr8258-lab.bin \
+            source=tools/telink-tlsr8258-lab/target/tc32-unknown-none-elf/release/telink-tlsr8258-lab.bin
+            if [[ "$mode" == diag-retention ]]; then
+              source=tools/telink-tlsr8258-lab/target/tc32-unknown-none-elf/release/telink-tlsr8258-lab.retention.bin
+            fi
+            cp "$source" \
               "target/tlsr8258-artifacts/telink-tlsr8258-${mode}.bin"
           done
 
@@ -168,18 +215,39 @@ jobs:
 
       - name: Run host HAL and radio tests
         run: |
-          HOST_TARGET="$(rustc +stable -vV | sed -n 's/^host: //p')"
-          cargo +stable test --manifest-path tlsr8258-hal/Cargo.toml \
-            --release --target "$HOST_TARGET"
-          cargo +stable test --manifest-path boards/tlsr8258-tb04/Cargo.toml \
-            --release --target "$HOST_TARGET"
-          cargo +stable test --manifest-path products/tlsr8258-tb04/Cargo.toml \
-            --release --target "$HOST_TARGET"
-          cargo +stable test --manifest-path examples/telink-tlsr8258-radio/Cargo.toml \
-            --release --target "$HOST_TARGET"
+          HOST_TARGET="$(rustc "+${HOST_RUST_TOOLCHAIN}" -vV | sed -n 's/^host: //p')"
+          for manifest in \
+            tlsr8258-hal/Cargo.toml \
+            boards/tlsr8258-tb04/Cargo.toml \
+            products/tlsr8258-tb04/Cargo.toml
+          do
+            cargo "+${HOST_RUST_TOOLCHAIN}" test --manifest-path "$manifest" \
+              --release --locked --target "$HOST_TARGET"
+            cargo "+${HOST_RUST_TOOLCHAIN}" clippy --manifest-path "$manifest" \
+              --release --locked --target "$HOST_TARGET" --all-targets -- -D warnings
+          done
+          # The radio harness is a no_std binary on non-test host builds, so
+          # lint its host-test target rather than fabricating a host panic
+          # handler. Its fixed diagnostic-record size assertion is
+          # intentionally a runtime unit-test assertion.
+          cargo "+${HOST_RUST_TOOLCHAIN}" test \
+            --manifest-path examples/telink-tlsr8258-radio/Cargo.toml \
+            --release --locked --target "$HOST_TARGET"
+          cargo "+${HOST_RUST_TOOLCHAIN}" clippy \
+            --manifest-path examples/telink-tlsr8258-radio/Cargo.toml \
+            --release --locked --target "$HOST_TARGET" --tests -- \
+            -D warnings -A clippy::assertions_on_constants
+          cargo "+${HOST_RUST_TOOLCHAIN}" test \
+            --manifest-path products/tlsr8258-tb04/Cargo.toml \
+            --release --locked --target "$HOST_TARGET" \
+            --no-default-features --features sensor
+          cargo "+${HOST_RUST_TOOLCHAIN}" test \
+            --manifest-path products/tlsr8258-tb04/Cargo.toml \
+            --release --locked --target "$HOST_TARGET" \
+            --no-default-features --features retention-proof
 
       - name: Upload TLSR8258 binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: telink-tlsr8258-tc32-45-${{ github.sha }}
           path: |
@@ -192,14 +260,15 @@ jobs:
     name: Formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.HOST_RUST_TOOLCHAIN }}
+          components: rustfmt
       - name: Check formatting
         run: |
-          cargo fmt --all -- --check
-          cargo fmt --manifest-path tlsr8258-hal/Cargo.toml -- --check
-          cargo fmt --manifest-path boards/tlsr8258-tb04/Cargo.toml -- --check
-          cargo fmt --manifest-path products/tlsr8258-tb04/Cargo.toml -- --check
-          cargo fmt --manifest-path examples/telink-tlsr8258-sensor/Cargo.toml -- --check
-          cargo fmt --manifest-path examples/telink-tlsr8258-router/Cargo.toml -- --check
-          cargo fmt --manifest-path tools/telink-tlsr8258-lab/Cargo.toml -- --check
-          cargo fmt --manifest-path examples/telink-tlsr8258-radio/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --all -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path tlsr8258-hal/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path boards/tlsr8258-tb04/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path examples/telink-tlsr8258-router/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path examples/telink-tlsr8258-radio/Cargo.toml -- --check

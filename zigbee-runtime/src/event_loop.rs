@@ -31,6 +31,8 @@
 //! }
 //! ```
 
+use core::future::Future;
+
 use zigbee_aps::apsde::ApsdeDataRequest;
 use zigbee_aps::{ApsAddress, ApsAddressMode, ApsStatus, ApsTxOptions};
 use zigbee_mac::MacDriver;
@@ -188,6 +190,47 @@ pub enum StartError {
     CommissioningFailed(zigbee_bdb::BdbStatus),
     /// Durable security-state storage failed.
     PersistenceFailed(crate::security_store::SecurityStoreError),
+}
+
+/// Static fresh-start selection for pending user actions.
+///
+/// The marker is consumed by the store-backed tick before async lowering.
+/// Typed router application frontends therefore materialize only their allowed
+/// join future even though the legacy generic tick remains device-type aware.
+pub(crate) trait ActionStartup<R: crate::role::DeviceRole> {
+    fn start<M: MacDriver>(
+        device: &mut crate::ZigbeeDevice<M, R>,
+    ) -> impl Future<Output = Result<u16, StartError>>;
+}
+
+pub(crate) struct DynamicActionStartup;
+pub(crate) struct SteeringActionStartup;
+#[cfg(any(feature = "router", test))]
+pub(crate) struct CoordinatorActionStartup;
+
+impl<R: crate::role::DeviceRole> ActionStartup<R> for DynamicActionStartup {
+    fn start<M: MacDriver>(
+        device: &mut crate::ZigbeeDevice<M, R>,
+    ) -> impl Future<Output = Result<u16, StartError>> {
+        device.start()
+    }
+}
+
+impl<R: crate::role::DeviceRole> ActionStartup<R> for SteeringActionStartup {
+    fn start<M: MacDriver>(
+        device: &mut crate::ZigbeeDevice<M, R>,
+    ) -> impl Future<Output = Result<u16, StartError>> {
+        device.start_steering()
+    }
+}
+
+#[cfg(any(feature = "router", test))]
+impl<R: crate::role::ParentRole> ActionStartup<R> for CoordinatorActionStartup {
+    fn start<M: MacDriver>(
+        device: &mut crate::ZigbeeDevice<M, R>,
+    ) -> impl Future<Output = Result<u16, StartError>> {
+        device.start_coordinator()
+    }
 }
 
 /// Errors returned while sending application ZCL traffic.
@@ -602,6 +645,16 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
     /// sequence in flash.
     #[inline(never)]
     pub(crate) async fn handle_action(&mut self, action: UserAction) -> TickResult {
+        self.handle_action_with::<DynamicActionStartup>(action)
+            .await
+    }
+
+    /// Handle one action with a statically selected fresh-start path.
+    #[inline(never)]
+    pub(crate) async fn handle_action_with<A>(&mut self, action: UserAction) -> TickResult
+    where
+        A: ActionStartup<R>,
+    {
         let action = match action {
             UserAction::Toggle if self.is_joined() => {
                 log::info!("[Runtime] User action: Toggle → Leave");
@@ -622,10 +675,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
                     return self.retry_secure_rejoin().await;
                 }
                 log::info!("[Runtime] User action: Join");
-                match self.start().await {
+                match A::start(self).await {
                     Ok(addr) => {
-                        // `start()` owns the single initial End Device Timeout
-                        // Request for this join.
+                        // The selected fresh-start path owns the single initial
+                        // End Device Timeout Request for this join.
                         let ch = self.channel();
                         let pan = self.pan_id();
                         TickResult::Event(StackEvent::Joined {

@@ -223,6 +223,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "heapless",
+ "tlsr8258-hal",
 ]
 
 [[package]]
@@ -231,6 +232,7 @@ version = "0.1.0"
 dependencies = [
  "heapless",
  "log",
+ "tlsr8258-hal",
  "zigbee-crypto",
  "zigbee-types",
 ]

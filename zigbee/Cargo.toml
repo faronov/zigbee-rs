@@ -13,7 +13,7 @@ zigbee-mac = { version = "0.1.0", path = "../zigbee-mac" }
 zigbee-nwk = { version = "0.1.0", path = "../zigbee-nwk" }
 zigbee-aps = { version = "0.1.0", path = "../zigbee-aps" }
 zigbee-zdo = { version = "0.1.0", path = "../zigbee-zdo" }
-zigbee-bdb = { version = "0.1.0", path = "../zigbee-bdb", default-features = false }
+zigbee-bdb = { version = "0.1.0", path = "../zigbee-bdb", default-features = false, features = ["router"] }
 zigbee-zcl = { version = "0.1.0", path = "../zigbee-zcl", default-features = false }
 zigbee-runtime = { version = "0.1.0", path = "../zigbee-runtime", default-features = false }
 log = "0.4"

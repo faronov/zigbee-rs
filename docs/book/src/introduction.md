@@ -1,152 +1,86 @@
 # Introduction
 
-**zigbee-rs** is a complete Zigbee PRO R22 protocol stack written in Rust,
-targeting embedded `no_std` environments. It runs on real hardware — ESP32,
-nRF52, BL702, and more — yet the same code compiles and runs on your laptop
-for rapid iteration without touching a single wire.
+`zigbee-rs` is a heap-free, `no_std`, pure-Rust Zigbee PRO stack with reusable
+sleepy-sensor, router, and coordinator application frontends.
 
-## Specification Baseline and Roadmap
+This book describes the current `experiment/zephyr-app-model` worktree. The
+book source is authoritative for the branch. GitHub Pages deploys only after a
+push to `main` or `master`, so this revision is not public on Pages until the
+branch is merged and deployed.
 
-Zigbee PRO R22 with BDB 3.0.1 is the active production baseline. Current work
-prioritizes R22 conformance, smaller firmware, and hardware validation across
-the supported platforms.
+## What is shared
 
-R23 with BDB 3.1 is intentionally deferred as an optional roadmap item. When
-implemented, its revision marker and mandatory TLV/security surface will be
-compile-time isolated so R23 code is absent from R22 firmware images.
+The protocol and lifecycle path is:
 
 ```text
-63,000+ lines of Rust · 199 source files · 30 crates · 45 ZCL clusters · 12 hardware platforms
+application profile
+        |
+sensor-sed / router-app
+        |
+zigbee-runtime::ZigbeeNode
+        |
+BDB -> ZCL/ZDO -> APS -> NWK -> MAC
+        |
+platform radio backend
 ```
 
-## Why Rust for Zigbee?
+The stack supplies:
 
-Zigbee stacks have traditionally been written in C, shipping as opaque vendor
-blobs tied to a specific chipset. zigbee-rs takes a different approach:
+- IEEE 802.15.4 MAC integration;
+- NWK routing and security;
+- APS security, binding, groups, and fragmentation;
+- ZDO discovery and device management;
+- ZCL clusters, reporting, and OTA transport;
+- BDB commissioning;
+- crash-safe security-state and child-table persistence;
+- reusable finite application lifecycles.
 
-- **Memory safety without a runtime.** Rust's ownership model eliminates
-  buffer overflows, use-after-free, and data races at compile time — exactly
-  the classes of bugs that plague C-based embedded stacks.
-- **`#![no_std]` and zero heap allocation.** The entire stack builds without
-  the standard library. Bounded collections from [`heapless`] replace
-  `Vec` and `HashMap`, so every buffer size is known at compile time.
-- **`async`/`await` on bare metal.** The MAC layer is an async trait with 13
-  methods. Embassy, `pollster`, or any single-threaded executor can drive
-  the stack — no RTOS threads, no mutexes.
-- **Type-safe ZCL.** Each cluster is a Rust struct with typed attributes.
-  You call `temp.set_temperature(2350)` instead of stuffing bytes into an
-  anonymous attribute table. The compiler catches mismatched types before
-  your firmware ever runs.
-- **One stack, many chips.** The platform-specific code lives behind a single
-  `MacDriver` trait. Swap an `impl` and the same application logic runs on
-  ESP32-C6, nRF52840, BL702, or a host mock.
+## What varies by target
 
-[`heapless`]: https://docs.rs/heapless
+```text
+platform/chip HAL + MacDriver
+        ↓
+board resources and fitted wiring
+        ↓
+product identity/profile/policy/storage/linker/OTA
+        ↓
+short composition root
+```
 
-## Project Scope
+Moving an existing product behavior to another MCU should change board and
+platform adapters, not copy the Zigbee or application state machines.
 
-zigbee-rs is structured as a Cargo workspace with **9 crates**, each
-responsible for one protocol layer:
+## Static embedded design
 
-| Crate | Role |
-|-------|------|
-| `zigbee-types` | Core types — `IeeeAddress`, `ShortAddress`, `PanId`, `ChannelMask` |
-| `zigbee-mac` | IEEE 802.15.4 MAC layer + 10 hardware backends |
-| `zigbee-nwk` | Network layer — AODV + tree routing, NWK security, NIB |
-| `zigbee-aps` | Application Support — binding, groups, APS security |
-| `zigbee-zdo` | Zigbee Device Objects — discovery, binding, network management |
-| `zigbee-bdb` | Base Device Behavior — steering, formation, commissioning |
-| `zigbee-zcl` | Zigbee Cluster Library — 33 clusters, foundation frames, reporting |
-| `zigbee-runtime` | Device builder, power management, NV storage, device templates |
-| `zigbee` | Top-level crate — coordinator, router, re-exports |
+The embedded path uses:
 
-The ZCL layer implements **33 clusters** spanning General, Measurement &
-Sensing, Lighting, HVAC, Closures, Security, Smart Energy, and Touchlink.
+- concrete generic types;
+- fixed-capacity and `heapless` storage;
+- explicit ownership bundles;
+- narrow capability traits;
+- product-owned linker and persistence boundaries.
 
-The MAC layer provides **11 supported chip targets**:
+It does not require devicetree, Kconfig, a heap allocator, runtime hardware
+discovery, or a broad platform “god trait.” Public application composition has
+no trait objects. One internal outlined `dyn Future` path in `zigbee-runtime`
+controls TC32 code size without allocation; it is not a platform API.
 
-| Backend | Target | Notes |
-|---------|--------|-------|
-| MockMac | Host (macOS / Linux / Windows) | Full protocol simulation, no hardware |
-| ESP32-C6 | `riscv32imac-unknown-none-elf` | Native 802.15.4 via `esp-ieee802154` |
-| ESP32-H2 | `riscv32imac-unknown-none-elf` | Native 802.15.4 via `esp-ieee802154` |
-| nRF52840 | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
-| nRF52833 | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
-| BL702 | `riscv32imc-unknown-none-elf` | Pure-Rust direct-register radio; XT-ZB1 join, ZHA interview, and reporting hardware-tested |
-| CC2340 | `thumbv6m-none-eabi` | Rust LRFD host driver + official TI radio microcode; hardware validation pending |
-| TLSR8258 | `tc32-unknown-none-elf` | **Pure Rust** TLSR8258 radio and MAC |
-| PHY6222 | `thumbv6m-none-eabi` | **Pure Rust** — zero vendor blobs! |
-| EFR32MG1 | `thumbv7em-none-eabi` | **Pure Rust** Series 1 radio |
-| EFR32MG21 | `thumbv8m.main-none-eabihf` | **Pure Rust** Series 2 radio |
+## Validation language
 
-## Current Status
+This book distinguishes:
 
-zigbee-rs is functional for end devices and has a shared Zigbee PRO router
-engine. The mock examples exercise the end-device lifecycle, while router
-tests cover forwarding, route discovery, source routing, parent admission,
-indirect delivery, and Trust Center security flows. Every hardware target
-builds successfully in CI.
+- **compiles** — target code builds;
+- **host-tested** — portable behavior passed host tests;
+- **hardware-tested** — a named primitive or path ran on silicon;
+- **production path proven** — the complete product flow passed its stated
+  hardware acceptance.
 
-**What works today:**
+A release image that reaches a sleep instruction is not proof of current
+consumption or correct wake restoration. A compiled flash journal is not proof
+of power-loss safety on that controller. Platform guides state the remaining
+hardware gates explicitly.
 
-- End device join flow (scan → associate → start)
-- ZCL cluster creation and typed attribute read/write
-- Device builder with templates for common sensor profiles
-- MockMac for host-side development and testing
-- ESP32-C6/H2 and nRF52840/52833 firmware that compiles and flashes
-- A pure-Rust BL702 XT-ZB1 sensor with hardware-tested RF, joining, ZHA interview, Trust Center security, and reporting
-- Zigbee PRO relay, broadcast transaction records, AODV route discovery,
-  source routes, Route Record, and Link Status
-- Telink TLSR8258 parent-router software with child authorization, indirect
-  queues, Transport-Key Tunnel forwarding, and rejoin handling
-- AES-CCM* encryption (via RustCrypto, `no_std`)
-
-**In development:**
-
-- Full coordinator operation
-- Clean first-attempt TLSR8258 sleepy-child commissioning and interview with
-  the corrected child image under an over-the-air sniffer
-- OTA firmware upgrade flow
-- Expanded test coverage
-- Install-code and additional production Trust Center policy
-
-## What You Can Build
-
-With zigbee-rs you can create standard Zigbee Home Automation devices that
-interoperate with coordinators like Zigbee2MQTT, ZHA, and deCONZ:
-
-- **Temperature & humidity sensors** — the `mock-sensor` example is a complete
-  starting point
-- **Motion and occupancy detectors** — using the IAS Zone and Occupancy
-  clusters
-- **Smart switches and plugs** — On/Off cluster with optional Metering
-- **Dimmable lights** — On/Off + Level Control + Color Control
-- **Door and window sensors** — IAS Zone with contact closure
-- **Thermostats** — HVAC clusters for temperature setpoint control
-
-## How This Book Is Organized
-
-This book is divided into six parts:
-
-1. **Getting Started** — Install the toolchain, run the mock examples, and
-   build your first device. No hardware required.
-
-2. **Core Concepts** — Walk through each protocol layer: the Device Builder,
-   the event loop, MAC, NWK, APS, ZDO, and BDB commissioning.
-
-3. **ZCL Clusters** — Learn the ZCL foundation, then dive into each cluster
-   category: General, Measurement, Lighting, HVAC, Closures, Security,
-   and Smart Energy. Includes a guide to writing custom clusters.
-
-4. **Platform Guides** — Hardware-specific instructions for ESP32, nRF52,
-   BL702, CC2340, Telink, and PHY6222. Covers wiring, flashing, and
-   debugging on each chip.
-
-5. **Advanced Topics** — Power management for sleepy end devices, NV storage,
-   security, OTA updates, and coordinator/router operation.
-
-6. **Reference** — API quick reference, PIB attributes, ZCL cluster table,
-   error types, and a glossary of Zigbee terminology.
-
-Ready to get started? Head to the [Quick Start](./getting-started/quickstart.md)
-to run your first zigbee-rs example in under five minutes.
+Start with [Architecture](getting-started/architecture.md), then run the
+[Quick Start](getting-started/quickstart.md). Exact toolchains, measurements,
+and build commands are in the repository's
+[`BUILD.md`](https://github.com/faronov/zigbee-rs/blob/experiment/zephyr-app-model/BUILD.md).

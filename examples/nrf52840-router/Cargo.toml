@@ -7,9 +7,11 @@ edition = "2021"
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["nrf52840"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
-zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["router"] }
+router-app = { path = "../../apps/router" }
+nrf52840-dk = { path = "../../boards/nrf52840-dk" }
+nrf52840-router-product = { path = "../../products/nrf52840-router" }
 
 # nRF52840 HAL + Embassy
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
@@ -18,13 +20,13 @@ embassy-time = "0.4"
 
 cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"
-defmt = "0.3"
-defmt-rtt = "0.4"
-panic-probe = { version = "0.3", features = ["print-defmt"] }
-static_cell = "2"
+defmt = "1.0"
+defmt-rtt = "1.0"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
 log = "0.4"
 
 [profile.release]
 opt-level = "s"
 debug = 2
 lto = true
+codegen-units = 1

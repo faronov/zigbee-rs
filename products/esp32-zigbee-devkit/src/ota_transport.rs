@@ -1,17 +1,25 @@
-//! Application-facing transport for the shared ESP32 OTA backend.
+//! Application-facing lifecycle for the shared ESP32 OTA backend.
 //!
 //! ZCL decoding, request construction, retry timing and the OTA state machine
-//! live in [`zigbee_runtime::ota_transport::OtaSession`]. This wrapper keeps
-//! the ESP32 application loops small and gives both chips identical policy.
+//! live in [`zigbee_runtime::ota_transport::OtaSession`]. This wrapper pairs
+//! that session with the product's mandatory
+//! [`WithOta`](zigbee_runtime::profile::WithOta) profile and the shared
+//! sleepy-sensor application.
 
+use sensor_sed_app::{
+    OtaActivationOutcome as AppOtaActivationOutcome, OtaEventOutcome as AppOtaEventOutcome,
+    OtaLifecycle, OtaServiceOutcome, is_ota_event,
+};
 use zigbee_mac::MacDriver;
-use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::event_loop::StackEvent;
-use zigbee_runtime::firmware_writer::{FirmwareError, FirmwareWriter};
-use zigbee_runtime::ota_transport::{OtaEventOutcome, OtaSession};
-use zigbee_runtime::profile::OtaBackend;
+use zigbee_runtime::firmware_writer::FirmwareWriter;
+use zigbee_runtime::node::ZigbeeNode;
+use zigbee_runtime::ota_transport::{OtaEventOutcome as RuntimeOtaEventOutcome, OtaSession};
+use zigbee_runtime::profile::{ApplicationProfile, WithOta};
+use zigbee_runtime::security_store::SecurityStateStore;
 
 use crate::ENDPOINT;
+use crate::policy::OTA_KEEP_AWAKE_MS;
 
 /// Logging and policy wrapper around the shared [`OtaSession`] transport.
 pub struct OtaTransport {
@@ -26,68 +34,7 @@ impl OtaTransport {
         }
     }
 
-    /// Whether an OTA download, verification or activation wait is active.
-    pub fn is_active<W: FirmwareWriter>(backend: &OtaBackend<W>) -> bool {
-        OtaSession::is_active(backend.manager())
-    }
-
-    /// Feed a decoded stack event to the OTA client.
-    pub async fn handle_event<M, W>(
-        &mut self,
-        device: &mut ZigbeeDevice<M>,
-        backend: &mut OtaBackend<W>,
-        event: &StackEvent,
-    ) -> bool
-    where
-        M: MacDriver,
-        W: FirmwareWriter,
-    {
-        let outcome = self
-            .session
-            .handle_event(device, backend.manager_mut(), ENDPOINT, event)
-            .await;
-        match outcome {
-            OtaEventOutcome::NotOta => false,
-            OtaEventOutcome::Ignored => true,
-            OtaEventOutcome::Consumed(status) => {
-                self.log_status(status);
-                true
-            }
-        }
-    }
-
-    /// Advance timers and send any request queued by the OTA engine.
-    pub async fn service<M, W>(
-        &mut self,
-        device: &mut ZigbeeDevice<M>,
-        backend: &mut OtaBackend<W>,
-        elapsed_seconds: u16,
-    ) where
-        M: MacDriver,
-        W: FirmwareWriter,
-    {
-        let status = self
-            .session
-            .service(device, backend.manager_mut(), elapsed_seconds)
-            .await;
-        self.log_status(status);
-    }
-
-    /// Whether the application should checkpoint security state and activate.
-    pub fn activation_pending(&self) -> bool {
-        self.session.activation_pending()
-    }
-
-    /// Mark the staged slot active. A real ESP backend resets and never
-    /// returns after this succeeds.
-    pub fn activate<W: FirmwareWriter>(
-        &mut self,
-        backend: &mut OtaBackend<W>,
-    ) -> Result<(), FirmwareError> {
-        self.session.activate(backend.manager_mut())
-    }
-
-    fn log_status(&mut self, status: Option<StackEvent>) {
+    fn log_status(&mut self, status: Option<&StackEvent>) {
         match status {
             Some(StackEvent::OtaImageAvailable { version, size }) => {
                 log::info!("[ESP OTA] image 0x{:08X} ({} bytes)", version, size);
@@ -105,6 +52,102 @@ impl OtaTransport {
                 log::info!("[ESP OTA] image verified, awaiting checkpoint");
             }
             _ => {}
+        }
+    }
+}
+
+impl<M, S, P, F> OtaLifecycle<M, S, WithOta<P, F>> for OtaTransport
+where
+    M: MacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    F: FirmwareWriter,
+{
+    const ENABLED: bool = true;
+
+    fn is_active(&self, profile: &WithOta<P, F>) -> bool {
+        OtaSession::is_active(profile.ota())
+    }
+
+    fn next_deadline_ms(&self, _profile: &WithOta<P, F>) -> Option<u32> {
+        // OtaManager advances in whole seconds from `service`; while it is
+        // active the shared SensorApp already selects the fast poll cadence.
+        None
+    }
+
+    async fn handle_event(
+        &mut self,
+        node: &mut ZigbeeNode<'_, M, S, WithOta<P, F>>,
+        event: &StackEvent,
+    ) -> AppOtaEventOutcome {
+        let outcome = {
+            let (device, profile) = node.device_and_profile_mut();
+            self.session
+                .handle_event(device, profile.ota_mut(), ENDPOINT, event)
+                .await
+        };
+
+        match outcome {
+            RuntimeOtaEventOutcome::NotOta if !is_ota_event(event) => {
+                AppOtaEventOutcome::NotHandled
+            }
+            RuntimeOtaEventOutcome::NotOta => {
+                // Status events normally originate inside OtaSession and are
+                // logged through `Consumed`, but accepting one here keeps the
+                // product lifecycle total over every OTA StackEvent.
+                self.log_status(Some(event));
+                AppOtaEventOutcome::Handled {
+                    keep_awake_ms: Some(OTA_KEEP_AWAKE_MS),
+                    activation_pending: self.session.activation_pending()
+                        || matches!(event, StackEvent::OtaComplete),
+                }
+            }
+            RuntimeOtaEventOutcome::Ignored => AppOtaEventOutcome::Handled {
+                keep_awake_ms: Some(OTA_KEEP_AWAKE_MS),
+                activation_pending: self.session.activation_pending(),
+            },
+            RuntimeOtaEventOutcome::Consumed(status) => {
+                self.log_status(status.as_ref());
+                AppOtaEventOutcome::Handled {
+                    keep_awake_ms: Some(OTA_KEEP_AWAKE_MS),
+                    activation_pending: self.session.activation_pending(),
+                }
+            }
+        }
+    }
+
+    async fn service(
+        &mut self,
+        node: &mut ZigbeeNode<'_, M, S, WithOta<P, F>>,
+        elapsed_secs: u16,
+    ) -> OtaServiceOutcome {
+        let status = {
+            let (device, profile) = node.device_and_profile_mut();
+            self.session
+                .service(device, profile.ota_mut(), elapsed_secs)
+                .await
+        };
+        self.log_status(status.as_ref());
+
+        OtaServiceOutcome {
+            keep_awake_ms: status.as_ref().map(|_| OTA_KEEP_AWAKE_MS),
+            activation_pending: self.session.activation_pending(),
+        }
+    }
+
+    fn activate(
+        &mut self,
+        node: &mut ZigbeeNode<'_, M, S, WithOta<P, F>>,
+    ) -> AppOtaActivationOutcome {
+        // SensorApp checkpoints its SecurityStateStore immediately before this
+        // method. A successful ESP writer activation resets and does not
+        // return; a returned error leaves the current boot slot authoritative.
+        match self.session.activate(node.profile_mut().ota_mut()) {
+            Ok(()) => AppOtaActivationOutcome::Activated,
+            Err(error) => {
+                log::error!("[ESP OTA] activation failed: {:?}", error);
+                AppOtaActivationOutcome::Failed
+            }
         }
     }
 }

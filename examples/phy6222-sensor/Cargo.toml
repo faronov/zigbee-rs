@@ -4,45 +4,31 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-zigbee-types = { path = "../../zigbee-types" }
-zigbee-mac = { path = "../../zigbee-mac", features = ["phy6222"] }
-zigbee-nwk = { path = "../../zigbee-nwk" }
-zigbee-aps = { path = "../../zigbee-aps" }
-zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
+sensor-sed-app = { path = "../../apps/sensor-sed" }
+zigbee-mac = { path = "../../zigbee-mac", default-features = false, features = ["phy6222"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["constrained-memory"] }
 phy62x2-evk = { path = "../../boards/phy62x2-evk", default-features = false }
+phy62x2-evk-product = { path = "../../products/phy62x2-evk", default-features = false }
 
 # Embassy async runtime
-embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
-embassy-time = { version = "0.5" }
-embassy-time-driver = "0.2"
-embassy-futures = "0.1"
+embassy-executor = { version = "0.7", default-features = false, features = ["arch-cortex-m", "executor-thread"] }
+embassy-time = { version = "0.5", default-features = false }
 
 # ARM Cortex-M0 support
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = { version = "0.7", features = ["device"] }
 
-# PHY6222 HAL — pure Rust GPIO, I2C, ADC, flash drivers
-phy6222-hal = { path = "../../phy6222-hal" }
-
-# Data structures for no_std
-heapless = "0.8"
-
-# Logging
-log = "0.4"
+# Compile out transitive logging in the production image.
+log = { version = "0.4", default-features = false }
 
 # Panic handler for embedded target
 panic-halt = "1.0"
 
-# Cortex-M0 has no native 32-bit atomics; emulate them with the platform
-# critical-section implementation instead of making an unsupported assumption.
-portable-atomic = { version = "1", features = ["critical-section"] }
-
 [features]
-default = ["phy6222"]
-phy6222 = ["phy62x2-evk/phy6222"]
-phy6252 = ["phy62x2-evk/phy6252"]
-stubs = []
+default = ["production", "phy6222"]
+production = ["log/release_max_level_off"]
+phy6222 = ["phy62x2-evk/phy6222", "phy62x2-evk-product/phy6222"]
+phy6252 = ["phy62x2-evk/phy6252", "phy62x2-evk-product/phy6252"]
 
 [profile.release]
 opt-level = "z"

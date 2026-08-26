@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 embedded-storage = "0.3"
 log = "0.4"
+sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"] }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-bdb = { path = "../../zigbee-bdb" }
 zigbee-mac = { path = "../../zigbee-mac" }

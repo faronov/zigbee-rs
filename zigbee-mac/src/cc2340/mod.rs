@@ -34,11 +34,33 @@ use crate::pib::{PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use crate::{MacCapabilities, MacDriver, MacError, PlatformServices};
 use driver::Cc2340Driver;
-pub use driver::RadioConfig;
+pub use driver::{RadioConfig, RadioError};
 use zigbee_types::*;
 
 use embassy_futures::select;
 use embassy_time::{Instant, Timer};
+
+/// Invalid factory or configured IEEE identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityError {
+    UnprogrammedExtendedAddress,
+}
+
+/// The CC2340 backend has no independently verified entropy peripheral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntropyDisposition {
+    /// `PlatformServices::fill_random` returns `MacError::Unsupported` and
+    /// never substitutes deterministic bytes for cryptographic entropy.
+    UnavailableFailClosed,
+}
+
+/// Safe radio power state exposed by the current direct-register backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadioSleepDisposition {
+    /// The radio may be quiesced between operations, but clocks and firmware
+    /// stay active. Retention and full-off restoration are not claimed.
+    ActiveOnly,
+}
 
 /// CC2340 802.15.4 MAC driver.
 pub struct Cc2340Mac {
@@ -64,14 +86,25 @@ pub struct Cc2340Mac {
 }
 
 impl Cc2340Mac {
-    /// Create a new CC2340 MAC driver with default PIB values.
-    pub fn new() -> Self {
-        Self {
-            driver: Cc2340Driver::new(RadioConfig::default()),
+    /// Create a CC2340 MAC with a validated factory EUI-64.
+    ///
+    /// Erased all-zero and all-`0xFF` identities are rejected before any
+    /// radio hardware is touched.
+    pub fn new(extended_address: IeeeAddress) -> Result<Self, IdentityError> {
+        if !valid_ieee_address(extended_address) {
+            return Err(IdentityError::UnprogrammedExtendedAddress);
+        }
+
+        let radio_config = RadioConfig {
+            ieee_addr: extended_address,
+            ..RadioConfig::default()
+        };
+        Ok(Self {
+            driver: Cc2340Driver::new(radio_config),
             short_address: ShortAddress(0xFFFF),
             pan_id: PanId(0xFFFF),
             channel: 11,
-            extended_address: [0u8; 8],
+            extended_address,
             coord_short_address: ShortAddress(0x0000),
             rx_on_when_idle: false,
             association_permit: false,
@@ -85,18 +118,41 @@ impl Cc2340Mac {
             max_frame_retries: 3,
             promiscuous: false,
             tx_power: 5,
-        }
+        })
+    }
+
+    /// Return the EUI-64 selected before MAC construction.
+    pub const fn extended_address(&self) -> IeeeAddress {
+        self.extended_address
+    }
+
+    /// Initialize the radio while preserving the low-level availability error.
+    ///
+    /// Compile-only images therefore distinguish `FirmwareUnavailable` from
+    /// `RadioConfigUnavailable` without collapsing either into `MacError`.
+    pub fn initialize_radio(&mut self) -> Result<(), RadioError> {
+        self.driver.init()
+    }
+
+    pub const fn entropy_disposition(&self) -> EntropyDisposition {
+        EntropyDisposition::UnavailableFailClosed
+    }
+
+    pub const fn radio_sleep_disposition(&self) -> RadioSleepDisposition {
+        RadioSleepDisposition::ActiveOnly
+    }
+
+    /// Quiesce any in-flight operation before an active-clock wait.
+    ///
+    /// This deliberately does not call `deinit`: a correct low-power restore
+    /// sequence has not yet been proven on CC2340R52 hardware.
+    pub fn prepare_active_wait(&mut self) -> Result<(), RadioError> {
+        self.driver.prepare_active_wait()
     }
 
     fn next_dsn(&mut self) -> u8 {
         let seq = self.dsn;
         self.dsn = self.dsn.wrapping_add(1);
-        seq
-    }
-
-    fn next_bsn(&mut self) -> u8 {
-        let seq = self.bsn;
-        self.bsn = self.bsn.wrapping_add(1);
         seq
     }
 
@@ -205,18 +261,11 @@ impl Cc2340Mac {
 
         let deadline = Timer::after(embassy_time::Duration::from_millis(duration_ms as u64));
         let collect = async {
-            loop {
-                match self.driver.receive().await {
-                    Ok(rx_frame) => {
-                        if let Some(desc) = Self::parse_beacon(
-                            &rx_frame.data[..rx_frame.len],
-                            rx_frame.lqi,
-                            channel,
-                        ) {
-                            let _ = results.push(desc);
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(rx_frame) = self.driver.receive().await {
+                if let Some(desc) =
+                    Self::parse_beacon(&rx_frame.data[..rx_frame.len], rx_frame.lqi, channel)
+                {
+                    let _ = results.push(desc);
                 }
             }
         };
@@ -449,12 +498,12 @@ impl MacDriver for Cc2340Mac {
                 let mut pan_descriptors: PanDescriptorList = heapless::Vec::new();
 
                 for ch in 11u8..=26 {
-                    if let Some(channel) = Channel::from_number(ch) {
-                        if req.channel_mask.contains(channel) {
-                            let beacons = self.scan_channel_active(ch, scan_duration_ms).await;
-                            for desc in beacons {
-                                let _ = pan_descriptors.push(desc);
-                            }
+                    if let Some(channel) = Channel::from_number(ch)
+                        && req.channel_mask.contains(channel)
+                    {
+                        let beacons = self.scan_channel_active(ch, scan_duration_ms).await;
+                        for desc in beacons {
+                            let _ = pan_descriptors.push(desc);
                         }
                     }
                 }
@@ -475,14 +524,14 @@ impl MacDriver for Cc2340Mac {
                 let mut energy_list: EdList = heapless::Vec::new();
 
                 for ch in 11u8..=26 {
-                    if let Some(channel) = Channel::from_number(ch) {
-                        if req.channel_mask.contains(channel) {
-                            let energy = self.scan_channel_ed(ch).await;
-                            let _ = energy_list.push(EdValue {
-                                channel: ch,
-                                energy,
-                            });
-                        }
+                    if let Some(channel) = Channel::from_number(ch)
+                        && req.channel_mask.contains(channel)
+                    {
+                        let energy = self.scan_channel_ed(ch).await;
+                        let _ = energy_list.push(EdValue {
+                            channel: ch,
+                            energy,
+                        });
                     }
                 }
 
@@ -666,6 +715,9 @@ impl MacDriver for Cc2340Mac {
                 self.sync_radio_config();
             }
             (MacExtendedAddress, PibValue::ExtendedAddress(v)) => {
+                if !valid_ieee_address(v) {
+                    return Err(MacError::InvalidParameter);
+                }
                 self.extended_address = v;
                 self.sync_radio_config();
             }
@@ -888,5 +940,78 @@ impl PlatformServices for Cc2340Mac {
 
     fn fill_random(&mut self, _output: &mut [u8]) -> Result<(), MacError> {
         Err(MacError::Unsupported)
+    }
+}
+
+/// Validate an EUI-64 without imposing a byte-order interpretation.
+pub const fn valid_ieee_address(address: IeeeAddress) -> bool {
+    let mut index = 0;
+    let mut all_zero = true;
+    let mut all_erased = true;
+    while index < address.len() {
+        all_zero &= address[index] == 0;
+        all_erased &= address[index] == 0xFF;
+        index += 1;
+    }
+    !all_zero && !all_erased
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID_IEEE: IeeeAddress = [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE];
+
+    #[test]
+    fn identity_constructor_rejects_unprogrammed_values() {
+        assert!(matches!(
+            Cc2340Mac::new([0; 8]),
+            Err(IdentityError::UnprogrammedExtendedAddress)
+        ));
+        assert!(matches!(
+            Cc2340Mac::new([0xFF; 8]),
+            Err(IdentityError::UnprogrammedExtendedAddress)
+        ));
+
+        let mac = Cc2340Mac::new(VALID_IEEE).unwrap();
+        assert_eq!(mac.extended_address(), VALID_IEEE);
+    }
+
+    #[test]
+    fn entropy_is_explicitly_fail_closed() {
+        let mut mac = Cc2340Mac::new(VALID_IEEE).unwrap();
+        let mut output = [0xA5; 8];
+        assert_eq!(
+            mac.entropy_disposition(),
+            EntropyDisposition::UnavailableFailClosed
+        );
+        assert_eq!(mac.fill_random(&mut output), Err(MacError::Unsupported));
+        assert_eq!(output, [0xA5; 8]);
+    }
+
+    #[test]
+    fn only_active_radio_wait_is_advertised() {
+        let mut mac = Cc2340Mac::new(VALID_IEEE).unwrap();
+        assert_eq!(
+            mac.radio_sleep_disposition(),
+            RadioSleepDisposition::ActiveOnly
+        );
+        assert_eq!(mac.prepare_active_wait(), Ok(()));
+    }
+
+    #[test]
+    fn compile_only_availability_error_is_preserved_before_mmio() {
+        let expected = if firmware::images().is_none() {
+            RadioError::FirmwareUnavailable
+        } else if config::ieee_802154_phy_writes().is_none() {
+            RadioError::RadioConfigUnavailable
+        } else {
+            // A complete SDK would continue into real MMIO and is therefore a
+            // hardware-only test.
+            return;
+        };
+
+        let mut mac = Cc2340Mac::new(VALID_IEEE).unwrap();
+        assert_eq!(mac.initialize_radio(), Err(expected));
     }
 }

@@ -3,7 +3,7 @@ name = "nrf52840-sensor-product"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Product configuration for the nRF52840-DK Zigbee sensor firmware"
+description = "Product configuration for nRF52840 Zigbee sensor firmware"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
@@ -11,6 +11,12 @@ publish = false
 # Adds a Pressure Measurement cluster to the profile for the BME280 variant.
 # Keep in sync with the `sensor-bme280` feature in examples/nrf52840-sensor.
 sensor-bme280 = []
+# Explicit deployment contracts used by the standalone UF2 composition.
+# Exactly one is selected there; the normal DK/J-Link sensor selects none.
+deployment-promicro-uf2 = []
+deployment-mdk-uf2 = []
+deployment-pca10059-uf2 = []
+deployment-dk = []
 
 [dependencies]
 sensor-sed-app = { path = "../../apps/sensor-sed" }

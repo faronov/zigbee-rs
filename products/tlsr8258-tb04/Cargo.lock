@@ -136,6 +136,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "router-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-mac",
+ "zigbee-nwk",
+ "zigbee-runtime",
+]
+
+[[package]]
+name = "sensor-sed-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-mac",
+ "zigbee-runtime",
+ "zigbee-zcl",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -174,9 +192,14 @@ name = "tlsr8258-tb04-product"
 version = "0.1.0"
 dependencies = [
  "embedded-storage",
+ "router-app",
+ "sensor-sed-app",
  "tlsr8258-hal",
  "tlsr8258-tb04",
+ "zigbee-aps",
+ "zigbee-mac",
  "zigbee-runtime",
+ "zigbee-zcl",
 ]
 
 [[package]]
@@ -231,6 +254,7 @@ version = "0.1.0"
 dependencies = [
  "heapless",
  "log",
+ "tlsr8258-hal",
  "zigbee-crypto",
  "zigbee-types",
 ]

@@ -945,6 +945,8 @@ mod imp {
         TX_POWER_MAX_DBM, TX_POWER_MIN_DBM, TxOutcome,
     };
     use tlsr8258_hal::rng::Rng;
+    #[cfg(feature = "telink-retention-proof")]
+    use tlsr8258_hal::rng::RngError;
     use tlsr8258_hal::{flash, timer};
     use zigbee_types::*;
 
@@ -954,6 +956,17 @@ mod imp {
     /// override below.
     #[cfg(feature = "hardware-aes")]
     use tlsr8258_hal::aes::{AesEngine, AesError};
+
+    /// Fail-closed causes while recreating hardware behind a retained Telink
+    /// MAC. No application service or IRQ re-enable is allowed after an
+    /// error.
+    #[cfg(all(feature = "hardware-aes", feature = "telink-retention-proof"))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TelinkRetentionResumeError {
+        AesNotInstalled,
+        Aes(AesError),
+        Rng(RngError),
+    }
 
     const ACK_WAIT_TICKS: u32 = timer::ms(8);
     const ASSOCIATION_DIRECT_WAIT_TICKS: u32 = timer::ms(500);
@@ -1197,11 +1210,12 @@ mod imp {
             self.radio.set_rx_on_when_idle(self.rx_on_when_idle);
         }
 
-        /// Quiesce the RF/DMA block before entering TLSR8258 retention sleep.
+        /// Quiesce the RF/DMA block before entering TLSR8258 low power.
         ///
         /// Call only after the synchronous MAC operation in progress has
         /// completed. Any frame retained from an ACK window is discarded
         /// because its DMA contents are not valid after wake.
+        #[inline(never)]
         pub fn prepare_for_sleep(&mut self) {
             self.pending_data.clear();
             self.pending_events.clear();
@@ -1209,10 +1223,14 @@ mod imp {
             self.radio.prepare_for_sleep();
         }
 
-        /// Restore the RF/DMA block after TLSR8258 retention wake.
+        /// Restore the RF/DMA block after TLSR8258 wake.
         ///
         /// The PHY initialization resets the channel and hardware filters, so
         /// reapply all PIB-backed radio state before the next MAC operation.
+        /// It also reinitializes Timer0; an in-place SUSPEND coordinator must
+        /// rebase application monotonic time after this call and before
+        /// interrupts resume.
+        #[inline(never)]
         pub fn resume_after_sleep(&mut self) {
             self.radio.init();
             self.pending_association_response = None;
@@ -1220,6 +1238,25 @@ mod imp {
             self.pending_events.clear();
             self.pending_association_deliveries.clear();
             self.apply_radio_config();
+        }
+
+        /// Restore every hardware-backed capability after LOW32K reset while
+        /// preserving retained PIB, security-facing MAC counters and optional
+        /// DRBG state.
+        #[cfg(all(feature = "hardware-aes", feature = "telink-retention-proof"))]
+        #[inline(never)]
+        pub fn resume_after_retention(&mut self) -> Result<(), TelinkRetentionResumeError> {
+            self.resume_after_sleep();
+            self.aes_engine
+                .as_mut()
+                .ok_or(TelinkRetentionResumeError::AesNotInstalled)?
+                .resume_after_retention()
+                .map_err(TelinkRetentionResumeError::Aes)?;
+            if let Some(rng) = self.rng.as_mut() {
+                rng.resume_after_retention()
+                    .map_err(TelinkRetentionResumeError::Rng)?;
+            }
+            Ok(())
         }
 
         fn channel(&self) -> u8 {
@@ -2550,6 +2587,12 @@ mod imp {
 
 #[cfg(target_arch = "tc32")]
 pub use imp::TelinkMac;
+#[cfg(all(
+    target_arch = "tc32",
+    feature = "hardware-aes",
+    feature = "telink-retention-proof"
+))]
+pub use imp::TelinkRetentionResumeError;
 
 // The Telink soft-MAC genuinely implements the parent-side primitives
 // (`mlme_beacon_response`, `set_indirect_data_pending`, `mcps_indirect_data`,

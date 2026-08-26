@@ -3,17 +3,31 @@ name = "telink-tlsr8258-sensor"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Explicit reset-on-wake proof images. The 10-second selection includes the
+# same restoration path and changes only the steady-state slow-poll policy.
+retention-proof = [
+    "tlsr8258-hal/retention-proof",
+    "tlsr8258-rt/retention-proof",
+    "zigbee-mac/telink-retention-proof",
+    "tlsr8258-tb04-product/retention-proof",
+]
+retention-proof-10s = [
+    "retention-proof",
+    "tlsr8258-tb04-product/retention-proof-10s",
+]
+
 [dependencies]
+sensor-sed-app = { path = "../../apps/sensor-sed" }
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["tlsr8258", "hardware-aes"] }
-zigbee-nwk = { path = "../../zigbee-nwk" }
-zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["constrained-memory"] }
 tlsr8258-hal = { path = "../../tlsr8258-hal" }
 tlsr8258-rt = { path = "../../tlsr8258-rt" }
 tlsr8258-tb04 = { path = "../../boards/tlsr8258-tb04" }
-tlsr8258-tb04-product = { path = "../../products/tlsr8258-tb04" }
+tlsr8258-tb04-product = { path = "../../products/tlsr8258-tb04", default-features = false, features = ["sensor"] }
 
 [profile.release]
 opt-level = "s"

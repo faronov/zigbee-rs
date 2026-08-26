@@ -53,29 +53,29 @@ pub enum Pull {
 /// Each pin has a 2-bit field at chip-specific positions.
 pub fn set_pull(pin: u8, pull: Pull) {
     let (reg_offset, bit_h, bit_l) = match pin {
-        0  => (AON_IOCTL0, 2, 1),
-        1  => (AON_IOCTL0, 5, 4),
-        2  => (AON_IOCTL0, 8, 7),
-        3  => (AON_IOCTL0, 11, 10),
-        4  => (AON_IOCTL0, 23, 22),  // P7
-        5  => (AON_IOCTL0, 29, 28),  // P9
-        6  => (AON_IOCTL1, 2, 1),    // P10
-        7  => (AON_IOCTL1, 5, 4),    // P11
-        8  => (AON_IOCTL1, 14, 13),  // P14
-        9  => (AON_IOCTL1, 17, 16),  // P15
-        10 => (AON_IOCTL1, 20, 19),  // P16
-        11 => (AON_IOCTL1, 23, 22),  // P17
-        12 => (AON_IOCTL1, 26, 25),  // P18
-        13 => (AON_IOCTL2, 2, 1),    // P20
-        14 => (AON_IOCTL2, 11, 10),  // P23
-        15 => (AON_IOCTL2, 14, 13),  // P24
-        16 => (AON_IOCTL2, 17, 16),  // P25
-        17 => (AON_IOCTL2, 20, 19),  // P26
-        18 => (AON_IOCTL2, 23, 22),  // P27
-        19 => (AON_PMCTL0, 5, 4),    // P31
-        20 => (AON_PMCTL0, 8, 7),    // P32
-        21 => (AON_PMCTL0, 11, 10),  // P33
-        22 => (AON_PMCTL0, 14, 13),  // P34
+        0 => (AON_IOCTL0, 2, 1),
+        1 => (AON_IOCTL0, 5, 4),
+        2 => (AON_IOCTL0, 8, 7),
+        3 => (AON_IOCTL0, 11, 10),
+        4 => (AON_IOCTL0, 23, 22),  // P7
+        5 => (AON_IOCTL0, 29, 28),  // P9
+        6 => (AON_IOCTL1, 2, 1),    // P10
+        7 => (AON_IOCTL1, 5, 4),    // P11
+        8 => (AON_IOCTL1, 14, 13),  // P14
+        9 => (AON_IOCTL1, 17, 16),  // P15
+        10 => (AON_IOCTL1, 20, 19), // P16
+        11 => (AON_IOCTL1, 23, 22), // P17
+        12 => (AON_IOCTL1, 26, 25), // P18
+        13 => (AON_IOCTL2, 2, 1),   // P20
+        14 => (AON_IOCTL2, 11, 10), // P23
+        15 => (AON_IOCTL2, 14, 13), // P24
+        16 => (AON_IOCTL2, 17, 16), // P25
+        17 => (AON_IOCTL2, 20, 19), // P26
+        18 => (AON_IOCTL2, 23, 22), // P27
+        19 => (AON_PMCTL0, 5, 4),   // P31
+        20 => (AON_PMCTL0, 8, 7),   // P32
+        21 => (AON_PMCTL0, 11, 10), // P33
+        22 => (AON_PMCTL0, 14, 13), // P34
         _ => return,
     };
 
@@ -102,14 +102,14 @@ pub fn set_fmux(pin: u8, fmux: u8) {
     reg_write(sel_addr, (old & !mask) | ((fmux as u32) << shift));
 
     // Enable full-mux for this pin
-    let mux_en_addr = AP_IOMUX_BASE + 0x00;
+    let mux_en_addr = AP_IOMUX_BASE;
     let mux_en = reg_read(mux_en_addr);
     reg_write(mux_en_addr, mux_en | (1 << pin));
 }
 
 /// Disable IOMUX for a pin (return to GPIO mode).
 pub fn clear_fmux(pin: u8) {
-    let mux_en_addr = AP_IOMUX_BASE + 0x00;
+    let mux_en_addr = AP_IOMUX_BASE;
     let mux_en = reg_read(mux_en_addr);
     reg_write(mux_en_addr, mux_en & !(1 << pin));
 }

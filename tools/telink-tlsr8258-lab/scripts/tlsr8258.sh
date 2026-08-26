@@ -36,9 +36,9 @@ declare -a CARGO_FEATURE_ARGS=()
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/tlsr8258.sh check [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm]
-  scripts/tlsr8258.sh build [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm]
-  scripts/tlsr8258.sh flash [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm]
+  scripts/tlsr8258.sh check [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm|diag-retention]
+  scripts/tlsr8258.sh build [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm|diag-retention]
+  scripts/tlsr8258.sh flash [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm|diag-retention]
   scripts/tlsr8258.sh dump-boot [word-count]
   scripts/tlsr8258.sh dump-mode [word-count]
   scripts/tlsr8258.sh dump <address> [word-count]
@@ -50,10 +50,10 @@ Usage:
   scripts/tlsr8258.sh pgm-go
   scripts/tlsr8258.sh probe-list
   scripts/tlsr8258.sh probe-info
-  scripts/tlsr8258.sh probe-attach [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm]
-  scripts/tlsr8258.sh probe-list-rtt [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm]
-  scripts/tlsr8258.sh probe-debug [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm]
-  scripts/tlsr8258.sh probe-gdb [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm]
+  scripts/tlsr8258.sh probe-attach [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm|diag-retention]
+  scripts/tlsr8258.sh probe-list-rtt [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm|diag-retention]
+  scripts/tlsr8258.sh probe-debug [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm|diag-retention]
+  scripts/tlsr8258.sh probe-gdb [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm|diag-retention]
 
 Environment overrides:
   TC32_TOOLCHAIN  Path to tc32-stage2 toolchain root
@@ -108,6 +108,11 @@ resolve_mode() {
             BIN_NAME="telink-tlsr8258-lab"
             CARGO_FEATURE_ARGS=(--no-default-features --features diag-pm)
             ;;
+        diag-retention)
+            MODE_NAME="diag-retention"
+            BIN_NAME="telink-tlsr8258-lab"
+            CARGO_FEATURE_ARGS=(--no-default-features --features diag-retention)
+            ;;
         *)
             echo "Unsupported mode: ${mode}" >&2
             usage >&2
@@ -115,7 +120,11 @@ resolve_mode() {
             ;;
     esac
     ELF_PATH="${TARGET_DIR}/${BIN_NAME}"
-    BIN_PATH="${TARGET_DIR}/${BIN_NAME}.bin"
+    if [[ "$MODE_NAME" == "diag-retention" ]]; then
+        BIN_PATH="${TARGET_DIR}/${BIN_NAME}.retention.bin"
+    else
+        BIN_PATH="${TARGET_DIR}/${BIN_NAME}.bin"
+    fi
 }
 
 run_cargo() {
@@ -123,7 +132,7 @@ run_cargo() {
     shift
     require_file "$CARGO_BIN" "tc32 cargo"
     (
-        local -a cargo_args=("$cargo_subcommand" --release)
+        local -a cargo_args=("$cargo_subcommand" --release --locked)
         if (( ${#CARGO_FEATURE_ARGS[@]} > 0 )); then
             cargo_args+=("${CARGO_FEATURE_ARGS[@]}")
         fi
@@ -149,8 +158,9 @@ verify_layout() {
     require_file "$nm" "llvm-nm"
     local ramcode_end=0 ramcode_start=0 ramcode_aligned=0
     local ictag_start=0 ictag_end=0 icache_data_end=0 sdata=0
-    local ebss=0 svc_bot=0 svc_top=0 irq_top=0
+    local ebss=0 svc_bot=0 svc_top=0 irq_bottom=0 irq_top=0
     local rf_dma_start=0 rf_dma_end=0
+    local retained_start=0 retained_end=0 guard_start=0 guard_end=0
     local rf_rx_buf=0 rf_tx_buf=0
     local line value name
     while read -r line; do
@@ -168,7 +178,12 @@ verify_layout() {
             _ebss)              ebss=$((16#$value)) ;;
             _svc_stack_bottom)  svc_bot=$((16#$value)) ;;
             _svc_stack_top)     svc_top=$((16#$value)) ;;
+            _irq_stack_bottom)  irq_bottom=$((16#$value)) ;;
             _irq_stack_top)     irq_top=$((16#$value)) ;;
+            _retained_start_)   retained_start=$((16#$value)) ;;
+            _retained_end_)     retained_end=$((16#$value)) ;;
+            _retention_stack_guard_start_) guard_start=$((16#$value)) ;;
+            _retention_stack_guard_end_) guard_end=$((16#$value)) ;;
             _rf_dma_start_)     rf_dma_start=$((16#$value)) ;;
             _rf_dma_end_)       rf_dma_end=$((16#$value)) ;;
             *RF_RX_BUF)         rf_rx_buf=$((16#$value)) ;;
@@ -217,11 +232,79 @@ verify_layout() {
             "$rf_dma_end" "$svc_bot" >&2
         exit 1
     fi
-    if [[ "$MODE_NAME" == "diag-pm" ]] \
+    if [[ "$MODE_NAME" == "diag-pm" || "$MODE_NAME" == "diag-retention" ]] \
         && (( svc_top > 0x848000 || irq_top > 0x848000 )); then
-        printf 'layout-check FAIL: LOW32K stacks exceed retention: SVC top=0x%X IRQ top=0x%X\n' \
+        printf 'layout-check FAIL: PM stacks exceed the conservative 0x848000 envelope: SVC top=0x%X IRQ top=0x%X\n' \
             "$svc_top" "$irq_top" >&2
         exit 1
+    fi
+    if [[ "$MODE_NAME" == "diag-pm" ]]; then
+        local required
+        for required in \
+            "cpu_suspend_timer_rc_transaction" \
+            "rebase_after_suspend" \
+            "prepare_for_sleep" \
+            "resume_after_sleep" \
+            "pm::hw::start_suspend" \
+            "pm::hw::sleep_start"
+        do
+            if ! "$nm" -C "$ELF_PATH" | awk -v required="$required" '
+                index($0, required) { found = 1 }
+                END { exit(found ? 0 : 1) }
+            '; then
+                printf 'pm-symbol-check FAIL: missing %s\n' "$required" >&2
+                exit 1
+            fi
+        done
+        if "$nm" -C "$ELF_PATH" | awk '
+            /cpu_sleep_timer_rc|cpu_sleep_wakeup_rc|PROFILE_LOW32K/ { found = 1 }
+            END { exit(found ? 0 : 1) }
+        '; then
+            echo "pm-symbol-check FAIL: diag-pm links the LOW32K retention path" >&2
+            exit 1
+        fi
+        echo "pm-symbol-check OK: atomic SUSPEND + MAC restore + Timer0 rebase; LOW32K absent"
+    fi
+    if [[ "$MODE_NAME" == "diag-retention" ]]; then
+        if (( retained_start == 0 || retained_end < retained_start ||
+              retained_end > 0x848000 || rf_dma_end > guard_start ||
+              guard_end - guard_start < 0x100 || guard_end > svc_bot ||
+              svc_top > irq_bottom || irq_top > 0x848000 ||
+              0x848000 - irq_top < 0x400 )); then
+            printf 'retention-layout-check FAIL: retained=[0x%X..0x%X) dma_end=0x%X guard=[0x%X..0x%X) svc=[0x%X..0x%X) irq=[0x%X..0x%X)\n' \
+                "$retained_start" "$retained_end" "$rf_dma_end" "$guard_start" "$guard_end" \
+                "$svc_bot" "$svc_top" "$irq_bottom" "$irq_top" >&2
+            exit 1
+        fi
+        local required
+        for required in \
+            "cpu_sleep_timer_rc_retention_transaction" \
+            "begin_low32k_resume" \
+            "complete_low32k_resume" \
+            "resume_after_retention" \
+            "TELINK_RETENTION_LAB_STATE" \
+            "TELINK_RETENTION_LAB_MAC" \
+            "TELINK_RETENTION_LAB_STATUS" \
+            "AesEngine>::resume_after_retention" \
+            "install_aes_engine"
+        do
+            if ! "$nm" -C "$ELF_PATH" | awk -v required="$required" '
+                index($0, required) { found = 1 }
+                END { exit(found ? 0 : 1) }
+            '; then
+                printf 'retention-symbol-check FAIL: missing %s\n' "$required" >&2
+                exit 1
+            fi
+        done
+        if "$nm" -C "$ELF_PATH" | awk '
+            /aes::soft|SoftwareAes128/ { found = 1 }
+            END { exit(found ? 0 : 1) }
+        '; then
+            echo "retention-symbol-check FAIL: software AES linked" >&2
+            exit 1
+        fi
+        echo "retention-symbol-check OK: LOW32K hand-off + fresh entry + MAC/AES/ADC restore"
+        echo "retention-HIL markers: start=0x52540000 cycles=0x52542001..0x52542004 pass=0x5254600D fail=0xDEADxxxx"
     fi
     # The flash erase/program path must remain in RAM because executing flash
     # erase from XIP flash hangs the bus. Require at least 256 bytes of
