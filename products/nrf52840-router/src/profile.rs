@@ -24,9 +24,9 @@ pub fn always_on_end_device_profile() -> AlwaysOnEndDeviceProfile {
 mod tests {
     use super::*;
     use zigbee_mac::mock::MockMac;
+    use zigbee_nwk::DeviceType;
     use zigbee_runtime::ZigbeeDevice;
     use zigbee_runtime::profile::ApplicationProfile;
-    use zigbee_nwk::DeviceType;
     use zigbee_runtime::role::EndDevice;
 
     #[test]

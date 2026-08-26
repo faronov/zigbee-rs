@@ -23,8 +23,8 @@ use embassy_time::{Duration, Instant};
 
 use nrf52840_router_product::status::StatusLedState;
 use router_app::{
-    AlwaysOnEndDeviceApp, DiagnosticEvent, Diagnostics, NodeArchetype, RouterAppError,
-    RouterParts, RouterStatus, StackEventSummary, StatusSink, Supervisor,
+    AlwaysOnEndDeviceApp, DiagnosticEvent, Diagnostics, NodeArchetype, RouterAppError, RouterParts,
+    RouterStatus, StackEventSummary, StatusSink, Supervisor,
 };
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::node::ZigbeeNode;
@@ -207,8 +207,7 @@ impl Supervisor for NrfResetOnlySupervisor {
     }
 }
 
-type NrfEndDeviceParts =
-    RouterParts<DkRouterStatus, NrfResetOnlySupervisor, DkRouterDiagnostics>;
+type NrfEndDeviceParts = RouterParts<DkRouterStatus, NrfResetOnlySupervisor, DkRouterDiagnostics>;
 
 fn fatal(parts: &mut NrfEndDeviceParts, error: RouterAppError) -> ! {
     parts.diagnostics.record(DiagnosticEvent::Fatal(error));
