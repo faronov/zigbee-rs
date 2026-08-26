@@ -18,7 +18,7 @@
 
 pub use zigbee_crypto::AesKey;
 use zigbee_crypto::{
-    Aes128Forward, ForwardAesProvider, SoftwareAesProvider, ccm_star_decrypt_with,
+    ForwardAesProvider, SoftwareAesProvider, aes_mmo_hash_with, ccm_star_decrypt_with,
     ccm_star_encrypt_with,
 };
 use zigbee_types::IeeeAddress;
@@ -673,57 +673,6 @@ mod ccm_tests {
 // ── Matyas-Meyer-Oseas Hash & HMAC-MMO ──────────────────────────
 // Used for APS key derivation (Zigbee spec Appendix B).
 
-/// Matyas-Meyer-Oseas AES-128 block cipher hash (Zigbee spec B.1.3), keyed
-/// through `provider`.
-///
-/// Processes `data` in 16-byte blocks:
-///   H_0 = 0
-///   H_i = AES(H_{i-1}, M_i) XOR M_i
-///
-/// Input is padded per B.6: append 0x80, zeros, then 16-bit big-endian
-/// bit-length. MMO re-keys the block cipher on *every* block (the running
-/// hash becomes the next key), which is exactly what
-/// [`ForwardAesProvider::forward_cipher`] expresses — the software provider
-/// re-expands the key schedule per block just as the original code did, and
-/// a hardware provider re-loads its key register per block.
-///
-/// Returns `None` if the AES backend fails (a hardware accelerator timeout,
-/// impossible for the software provider), so callers surface the failure
-/// instead of deriving a silently-wrong key.
-fn matyas_meyer_oseas_hash_with<P: ForwardAesProvider>(
-    provider: &mut P,
-    data: &[u8],
-) -> Option<[u8; 16]> {
-    let bit_len = (data.len() as u16).wrapping_mul(8);
-
-    // Build padded message: data || 0x80 || zeros || bit_len_be16
-    // Pad to next multiple of 16 bytes
-    let padded_len = (data.len() + 1 + 2).div_ceil(16) * 16;
-    let mut padded = [0u8; 80]; // Max 80 bytes (enough for HMAC inputs)
-    padded[..data.len()].copy_from_slice(data);
-    padded[data.len()] = 0x80;
-    padded[padded_len - 2] = (bit_len >> 8) as u8;
-    padded[padded_len - 1] = bit_len as u8;
-
-    let mut hash = [0u8; 16];
-
-    for chunk in padded[..padded_len].chunks(16) {
-        let mut block = [0u8; 16];
-        block.copy_from_slice(chunk);
-        {
-            // Key the forward permutation with the running hash H_{i-1}.
-            let mut cipher = provider.forward_cipher(&hash);
-            cipher.encrypt_block(&mut block).ok()?;
-        }
-        // H_i = E(H_{i-1}, M_i) XOR M_i
-        for j in 0..16 {
-            hash[j] = block[j] ^ chunk[j];
-        }
-    }
-
-    Some(hash)
-}
-
 /// HMAC-MMO keyed hash (Zigbee spec B.1.4), keyed through `provider`.
 ///
 /// HMAC(Key, M) = Hash( (Key XOR opad) || Hash( (Key XOR ipad) || M ) ).
@@ -745,13 +694,13 @@ fn hmac_mmo_with<P: ForwardAesProvider>(
     inner_input[..16].copy_from_slice(&ipad_key);
     let inner_len = 16 + message.len();
     inner_input[16..inner_len].copy_from_slice(message);
-    let inner_hash = matyas_meyer_oseas_hash_with(provider, &inner_input[..inner_len])?;
+    let inner_hash = aes_mmo_hash_with(provider, &inner_input[..inner_len]).ok()?;
 
     // Outer hash: Hash(opad_key || inner_hash)
     let mut outer_input = [0u8; 32];
     outer_input[..16].copy_from_slice(&opad_key);
     outer_input[16..32].copy_from_slice(&inner_hash);
-    matyas_meyer_oseas_hash_with(provider, &outer_input)
+    aes_mmo_hash_with(provider, &outer_input).ok()
 }
 
 /// Derive Key-Transport Key from TC link key (Zigbee spec §4.5.3.4).
