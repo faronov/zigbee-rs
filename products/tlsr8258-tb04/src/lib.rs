@@ -70,12 +70,19 @@ mod tests {
         assert!(
             CHILD_TABLE_PARTITION_START + CHILD_TABLE_PARTITION_SIZE as u32
                 <= SECURITY_PARTITION_START,
-            "the two journals must never share an erase sector"
+            "the child-table and security journals must never share an erase sector"
         );
         assert_eq!(
             SECURITY_PARTITION_START + SECURITY_PARTITION_SIZE as u32,
             FACTORY_EUI_SECTOR_START,
             "NV journals must stop before Telink's factory EUI-64 sector"
         );
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn range_extender_uses_the_compact_single_endpoint_capacity() {
+        assert_eq!(zigbee_runtime::MAX_ENDPOINTS, 2);
+        assert_eq!(zigbee_zcl::foundation::reporting::MAX_REPORT_CONFIGS, 4);
     }
 }

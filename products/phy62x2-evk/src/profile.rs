@@ -7,8 +7,20 @@ use zigbee_runtime::profile::{
     TemperatureRange,
 };
 use zigbee_zcl::DeviceId;
+use zigbee_zcl::foundation::reporting::MAX_REPORT_CONFIGS;
 
 pub type SensorProfile = DeviceProfile<TemperatureHumidityBattery>;
+
+const APPLICATION_ENDPOINT_COUNT: usize = 1;
+const SERVER_CLUSTER_COUNT: usize = 5;
+const DEFAULT_REPORT_CONFIG_COUNT: usize =
+    TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS.len();
+
+const _: () = {
+    assert!(APPLICATION_ENDPOINT_COUNT <= zigbee_runtime::MAX_ENDPOINTS);
+    assert!(SERVER_CLUSTER_COUNT <= zigbee_runtime::MAX_CLUSTERS_PER_ENDPOINT);
+    assert!(DEFAULT_REPORT_CONFIG_COUNT <= MAX_REPORT_CONFIGS);
+};
 
 const TEMPERATURE_RANGE: TemperatureRange = TemperatureRange {
     min_centi_celsius: -4_000,
@@ -46,5 +58,7 @@ mod tests {
         assert_eq!(profile.profile_id(), PROFILE_HOME_AUTOMATION);
         assert_eq!(profile.device_id(), DeviceId::TEMPERATURE_SENSOR);
         assert_eq!(profile.expected_report_clusters(), 3);
+        assert_eq!(zigbee_runtime::MAX_ENDPOINTS, 2);
+        assert_eq!(MAX_REPORT_CONFIGS, 4);
     }
 }

@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-sensor-sed-app = { path = "../../apps/sensor-sed" }
+# The product provisions only centralized Trust Center commissioning and has
+# no Groups server; keep the shared app's optional capabilities disabled.
+sensor-sed-app = { path = "../../apps/sensor-sed", default-features = false }
 zigbee-mac = { path = "../../zigbee-mac", default-features = false, features = ["phy6222"] }
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["constrained-memory"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["compact-single-endpoint", "constrained-memory"] }
 phy62x2-evk = { path = "../../boards/phy62x2-evk", default-features = false }
 phy62x2-evk-product = { path = "../../products/phy62x2-evk", default-features = false }
 

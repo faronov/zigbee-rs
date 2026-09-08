@@ -9,6 +9,21 @@ use sensor_sed_app::{
 use zigbee_mac::phy6222::Phy6222Mac;
 
 const BUTTON_SAMPLE_MS: u32 = 10;
+const EMBASSY_TICKS_PER_MS: u32 = 1_000;
+
+/// Low 32 bits of the board's 1 MHz monotonic.
+///
+/// The mark wraps every ~71 minutes, while this product's longest unchecked
+/// application interval is 120 seconds and every platform wait is at most
+/// 10 seconds. Wrapping subtraction therefore preserves every lifecycle
+/// deadline while avoiding 64-bit division on Cortex-M0.
+fn monotonic_mark() -> u32 {
+    Instant::now().as_ticks() as u32
+}
+
+fn elapsed_mark_ms(later: u32, earlier: u32) -> u32 {
+    later.wrapping_sub(earlier) / EMBASSY_TICKS_PER_MS
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeError {
@@ -25,15 +40,12 @@ impl PhyWakeController {
     }
 
     async fn wait_for_button_or_timer(&self, timeout_ms: u32) -> WakeReason {
-        let started = Instant::now();
+        let started = monotonic_mark();
         loop {
             if self.button.is_pressed() {
                 return WakeReason::Button;
             }
-            let elapsed = Instant::now()
-                .saturating_duration_since(started)
-                .as_millis()
-                .min(u64::from(u32::MAX)) as u32;
+            let elapsed = elapsed_mark_ms(monotonic_mark(), started);
             if elapsed >= timeout_ms {
                 return WakeReason::Timer;
             }
@@ -47,22 +59,19 @@ impl PhyWakeController {
 }
 
 impl WakeController<Phy6222Mac> for PhyWakeController {
-    type Mark = Instant;
+    type Mark = u32;
     type Error = WakeError;
 
     fn mark(&self) -> Self::Mark {
-        Instant::now()
+        monotonic_mark()
     }
 
     fn add_ms(mark: Self::Mark, duration_ms: u32) -> Self::Mark {
-        mark + Duration::from_millis(u64::from(duration_ms))
+        mark.wrapping_add(duration_ms.saturating_mul(EMBASSY_TICKS_PER_MS))
     }
 
     fn elapsed_ms(later: Self::Mark, earlier: Self::Mark) -> u32 {
-        later
-            .saturating_duration_since(earlier)
-            .as_millis()
-            .min(u64::from(u32::MAX)) as u32
+        elapsed_mark_ms(later, earlier)
     }
 
     async fn wait(
@@ -87,9 +96,9 @@ impl WakeController<Phy6222Mac> for PhyWakeController {
     }
 
     async fn button_held_for(&mut self, duration_ms: u32) -> bool {
-        let started = Instant::now();
+        let started = monotonic_mark();
         while self.button.is_pressed() {
-            if Self::elapsed_ms(Instant::now(), started) >= duration_ms {
+            if elapsed_mark_ms(monotonic_mark(), started) >= duration_ms {
                 return true;
             }
             Timer::after(Duration::from_millis(u64::from(BUTTON_SAMPLE_MS))).await;

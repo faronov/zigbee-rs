@@ -9,8 +9,17 @@ publish = false
 
 [features]
 default = ["router"]
-router = ["dep:router-app", "router-app/router", "zigbee-runtime/router"]
-sensor = ["dep:sensor-sed-app", "dep:zigbee-mac"]
+router = [
+    "dep:router-app",
+    "router-app/router",
+    "zigbee-runtime/router",
+    "zigbee-runtime/compact-single-endpoint",
+]
+sensor = [
+    "dep:sensor-sed-app",
+    "dep:zigbee-mac",
+    "zigbee-runtime/compact-single-endpoint",
+]
 retention-proof = [
     "sensor",
     "tlsr8258-hal/retention-proof",
@@ -28,6 +37,9 @@ zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-mac = { path = "../../zigbee-mac", optional = true }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[dev-dependencies]
+zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

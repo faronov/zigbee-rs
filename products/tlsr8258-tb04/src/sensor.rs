@@ -29,7 +29,7 @@ use zigbee_zcl::clusters::humidity::HumidityCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 use zigbee_zcl::data_types::{ZclDataType, ZclValue};
-use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
+use zigbee_zcl::foundation::reporting::{MAX_REPORT_CONFIGS, ReportDirection, ReportingConfig};
 use zigbee_zcl::{ClusterId, DeviceId};
 
 #[cfg(target_arch = "tc32")]
@@ -51,6 +51,16 @@ pub const MANUFACTURER: &str = "Zigbee-RS";
 pub const MODEL: &str = "TLSR8258-Runtime";
 pub const DATE_CODE: &str = "20260718";
 pub const SW_BUILD: &str = "0.1.0";
+
+const APPLICATION_ENDPOINT_COUNT: usize = 1;
+const SERVER_CLUSTER_COUNT: usize = 5;
+const DEFAULT_REPORT_CONFIG_COUNT: usize = 2;
+
+const _: () = {
+    assert!(APPLICATION_ENDPOINT_COUNT <= zigbee_runtime::MAX_ENDPOINTS);
+    assert!(SERVER_CLUSTER_COUNT <= zigbee_runtime::MAX_CLUSTERS_PER_ENDPOINT);
+    assert!(DEFAULT_REPORT_CONFIG_COUNT <= MAX_REPORT_CONFIGS);
+};
 
 pub const USER_ACTIONS: NoUserAction = NoUserAction;
 
@@ -782,10 +792,26 @@ impl Diagnostics for TelinkNoDiagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zigbee_mac::mock::MockMac;
     use zigbee_runtime::profile::ApplicationProfile;
+    use zigbee_zcl::ZclStatus;
+
+    fn extra_report(index: usize) -> ReportingConfig {
+        ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: zigbee_zcl::AttributeId(0x7000 + index as u16),
+            data_type: ZclDataType::U16,
+            min_interval: 1,
+            max_interval: 60,
+            reportable_change: Some(ZclValue::U16(1)),
+        }
+    }
 
     #[test]
-    fn profile_preserves_endpoint_and_reporting_identity() {
+    fn compact_capacity_fits_the_complete_product_profile() {
+        assert_eq!(zigbee_runtime::MAX_ENDPOINTS, 2);
+        assert_eq!(MAX_REPORT_CONFIGS, 4);
+
         let profile = sensor_profile();
         assert_eq!(profile.endpoint(), ENDPOINT);
         assert_eq!(profile.profile_id(), PROFILE_HOME_AUTOMATION);
@@ -795,6 +821,57 @@ mod tests {
         assert_eq!(
             expected.as_slice(),
             [ClusterId::TEMPERATURE.0, ClusterId::HUMIDITY.0]
+        );
+
+        let mut device = ZigbeeDevice::builder(MockMac::new([0x11; 8]))
+            .endpoint(
+                profile.endpoint(),
+                profile.profile_id(),
+                profile.device_id(),
+                |endpoint| profile.configure_endpoint(endpoint),
+            )
+            .build();
+
+        assert_eq!(device.endpoints().len(), APPLICATION_ENDPOINT_COUNT);
+        assert_eq!(
+            device.endpoints()[0].server_clusters.as_slice(),
+            &[
+                ClusterId::BASIC,
+                ClusterId::POWER_CONFIG,
+                ClusterId::IDENTIFY,
+                ClusterId::TEMPERATURE,
+                ClusterId::HUMIDITY,
+            ]
+        );
+        assert!(device.endpoints()[0].client_clusters.is_empty());
+        assert_eq!(
+            device.bdb().zdo().endpoints().len(),
+            APPLICATION_ENDPOINT_COUNT
+        );
+
+        profile.configure_default_reporting(&mut device).unwrap();
+        assert_eq!(
+            device.reporting().configured_cluster_count(ENDPOINT),
+            DEFAULT_REPORT_CONFIG_COUNT
+        );
+
+        for index in DEFAULT_REPORT_CONFIG_COUNT..MAX_REPORT_CONFIGS {
+            assert_eq!(
+                device.reporting_mut().configure_for_cluster(
+                    ENDPOINT,
+                    0x7000 + index as u16,
+                    extra_report(index),
+                ),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            device.reporting_mut().configure_for_cluster(
+                ENDPOINT,
+                0x7FFF,
+                extra_report(MAX_REPORT_CONFIGS),
+            ),
+            Err(ZclStatus::InsufficientSpace)
         );
     }
 

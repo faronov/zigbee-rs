@@ -187,7 +187,10 @@ verify_layout() {
     case "$binary_name:$image_feature" in
         telink-tlsr8258-sensor:) regression_budget=294912 ;;
         telink-tlsr8258-sensor:retention-proof*) regression_budget=299008 ;;
-        telink-tlsr8258-router:) regression_budget=356352 ;;
+        # R22 parent-router gate: the next 4 KiB boundary above the baseline
+        # 427,776 B image is 0x69000.
+        # The hard physical boundary remains the APS journal at 0x70000.
+        telink-tlsr8258-router:) regression_budget=430080 ;;
     esac
     if (( regression_budget != 0 && size > regression_budget )); then
         printf 'layout-check FAIL: %s image=%d exceeds %d-byte regression gate\n' \

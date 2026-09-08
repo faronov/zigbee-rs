@@ -316,7 +316,7 @@ verify_layout() {
         exit 1
     fi
     # The security journal starts at 0x74000 and factory data at 0x76000.
-    # Lab images are allowed to exceed the production slot but must not reach
+    # The legacy 256 KiB threshold is informational; lab images must not reach
     # the security journal or factory data.
     if [[ -f "$BIN_PATH" ]]; then
         local bin_size
@@ -327,7 +327,7 @@ verify_layout() {
             exit 1
         fi
         if (( bin_size > 0x40000 )); then
-            printf 'layout-check WARN: .bin size=%d (0x%X) exceeds 256 KiB production/OTA slot\n' \
+            printf 'layout-check WARN: .bin size=%d (0x%X) exceeds the legacy 256 KiB lab threshold\n' \
                 "$bin_size" "$bin_size" >&2
         fi
     fi

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master, experiment/zephyr-app-model]
+    branches: [main, master, experiment/zephyr-app-model, experiment/r22-bdb-complete]
   pull_request:
   workflow_dispatch:
 
@@ -53,13 +53,23 @@ jobs:
         with:
           key: x86_64-unknown-linux-gnu-workspace-${{ env.RUST_TOOLCHAIN }}-tests-${{ hashFiles('Cargo.lock') }}
       - run: cargo test --workspace --locked
+      # Keep sensor feature graphs isolated from workspace feature unification.
+      - run: cargo test -p sensor-sed-app --locked
+      - run: cargo test -p sensor-sed-app --no-default-features --locked
       - run: cargo test -p sensor-sed-app --features ota --locked
       # The router relay tests are gated on `zigbee-runtime/router`, which is
       # off in the workspace build so sensors do not link the routing tables.
-      - run: cargo test -p router-app --features router --locked
-      - run: cargo test -p zigbee-runtime --features router --locked
+      - run: cargo test -p zigbee-aps --all-features --locked
+      - run: cargo test -p zigbee-bdb --all-features --locked
+      - run: cargo test -p router-app --all-features --locked
+      - run: cargo test -p zigbee-runtime --all-features --locked
+      - run: cargo test -p zigbee-tests --all-features --locked
       - run: cargo test -p zigbee-zdo --features router --locked
       - run: cargo test -p zigbee-runtime --no-default-features --locked
+      # Do not combine these with --workspace/--all-features: unification hid
+      # missing mandatory TCLK features in both production frontends.
+      - run: cargo test -p router-app --no-default-features --test production_graph --locked
+      - run: cargo test -p zigbee --no-default-features --test production_graph --locked
       - run: cargo test -p zigbee-zcl --no-default-features --locked
       - run: cargo test -p zigbee-zcl --no-default-features --features float32 --locked
       - run: cargo test -p zigbee-zcl --no-default-features --features float64 --locked
@@ -160,10 +170,13 @@ jobs:
           key: x86_64-unknown-linux-gnu-workspace-${{ env.RUST_TOOLCHAIN }}-clippy-${{ hashFiles('Cargo.lock') }}
       - run: cargo clippy --workspace --locked -- -D warnings
       - run: cargo clippy -p sensor-sed-app --all-targets --locked -- -D warnings
-      - run: cargo clippy -p router-app --all-targets --features router --locked -- -D warnings
+      - run: cargo clippy -p sensor-sed-app --all-targets --no-default-features --locked -- -D warnings
+      - run: cargo clippy -p zigbee-aps --all-targets --all-features --locked -- -D warnings
+      - run: cargo clippy -p zigbee-bdb --all-targets --all-features --locked -- -D warnings
+      - run: cargo clippy -p router-app --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p router-app --no-default-features --locked -- -D warnings
-      - run: cargo clippy -p sensor-sed-app --features ota --locked -- -D warnings
-      - run: cargo clippy -p zigbee-runtime --features router --locked -- -D warnings
+      - run: cargo clippy -p sensor-sed-app --all-targets --features ota --locked -- -D warnings
+      - run: cargo clippy -p zigbee-runtime --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zdo --features router --locked -- -D warnings
       - run: cargo clippy -p zigbee-runtime --no-default-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zcl --no-default-features --locked -- -D warnings
@@ -275,8 +288,8 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          # Measured on nightly-2026-03-23: default=223344 B,
-          # BME280=230560 B and SHT31=227040 B intentionally use their
+          # Measured on nightly-2026-03-23 (2026-09-06): default=224472 B,
+          # BME280=231792 B and SHT31=228216 B intentionally use their
           # larger feature-specific budgets. Keep the default sensor within
           # its strict 220 KiB gate, separate from the hard 0x000FE000
           # partition boundary.
@@ -361,7 +374,7 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          # Measured routing-free AlwaysOnEndDeviceApp image: 214864 B. The 248 KiB
+          # With mandatory centralized TCLK: 226584 B (2026-09-07). The 248 KiB
           # non-sensor regression budget remains below the independent 1016
           # KiB physical application boundary.
           ./tools/firmware-size-report.sh nrf52840-always-on-end-device ${ELF}.bin 253952 ${ELF}.size.json
@@ -377,6 +390,10 @@ jobs:
           fi
           if ! grep -Eq 'NrfHardwareAes128|NrfEcbEngine|nrf_aes::NrfAesDriver' <<<"$SYMS"; then
             echo "nRF52840 always-on End Device image is missing the Nordic ECB AES backend" >&2
+            exit 1
+          fi
+          if ! grep -Eq 'advance_commissioning_with_security_store|advance_tclk_exchange|step_tclk_exchange' <<<"$SYMS"; then
+            echo "nRF52840 always-on End Device is missing centralized TCLK commissioning" >&2
             exit 1
           fi
           # AlwaysOnEndDeviceApp must enter only the typed steering startup/tick
@@ -424,6 +441,11 @@ jobs:
           if cargo tree --locked --manifest-path examples/nrf52840-router/Cargo.toml \
               -e features -i zigbee-runtime | grep -q 'zigbee-runtime feature "router"'; then
             echo "nRF52840 End Device dependency graph enables zigbee-runtime/router" >&2
+            exit 1
+          fi
+          if ! cargo tree --locked --manifest-path examples/nrf52840-router/Cargo.toml \
+              -e features -i zigbee-runtime | grep -q 'zigbee-runtime feature "centralized-tclk"'; then
+            echo "nRF52840 always-on End Device is missing centralized TCLK commissioning" >&2
             exit 1
           fi
           # Receiver-on-when-idle does not make an End Device a router. The
@@ -489,8 +511,8 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          # Measured on nightly-2026-03-23: default=223400 B,
-          # BME280=230976 B and SHT31=227128 B intentionally use their
+          # Measured on nightly-2026-03-23 (2026-09-06): default=224464 B,
+          # BME280=231784 B and SHT31=228208 B intentionally use their
           # larger feature-specific budgets. Keep the default sensor within
           # its strict 220 KiB gate while the 504 KiB boundary remains hard.
           ./tools/firmware-size-report.sh \
@@ -618,9 +640,9 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          # All four final images measure 221736..223456 B. The 232 KiB
-          # regression budget is independent of each board's checked linker
-          # partition boundary.
+          # Final linked images: ProMicro=222968 B, MDK=222848 B,
+          # PCA10059=224536 B, and DK=224552 B. The 232 KiB regression budget
+          # is independent of each board's checked linker partition boundary.
           ./tools/firmware-size-report.sh \
             nrf52840-sensor-uf2-${{ matrix.board }} ${ELF}.bin \
             237568 ${ELF}.size.json
@@ -752,7 +774,8 @@ jobs:
             "$ELF" "${ELF}.bin"
           python3 products/esp32-zigbee-devkit/partitions/check-app-image-size.py \
             --chip esp32c6 --slot ota_0 --merged "${ELF}.bin" "${ELF}.app.bin"
-          # Final app image measured 354512 B. Keep its regression budget
+          # 2026-09-08 app image is 369248 B and fails this unchanged gate.
+          # Keep its regression budget
           # independent of the checked 0x1F0000-byte physical OTA slot.
           ./tools/firmware-size-report.sh \
             esp32c6-sensor "${ELF}.app.bin" 368640 "${ELF}.size.json"
@@ -818,10 +841,10 @@ jobs:
             "$ELF" "${ELF}.bin"
           python3 products/esp32-zigbee-devkit/partitions/check-app-image-size.py \
             --chip esp32h2 --slot ota_0 --merged "${ELF}.bin" "${ELF}.app.bin"
-          # Final app image measured 339568 B. Keep its regression budget
+          # 2026-09-08 app image measured 354096 B. Keep its regression budget
           # independent of the checked 0x1F0000-byte physical OTA slot.
           ./tools/firmware-size-report.sh \
-            esp32h2-sensor "${ELF}.app.bin" 352256 "${ELF}.size.json"
+            esp32h2-sensor "${ELF}.app.bin" 356352 "${ELF}.size.json"
       - name: Upload ESP32-H2 firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -899,7 +922,7 @@ jobs:
             echo "BL702 boot image is ${FLASH_BYTES} B; security storage starts at physical 0xFE000" >&2
             exit 1
           fi
-          # Final linked raw image measured 182786 B.
+          # Final linked raw image measured 189442 B.
           ./tools/firmware-size-report.sh bl702-sensor "$RAW" 192512 ${ELF}.size.json
           SYMS="$("$NM" --demangle "$ELF")"
           if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
@@ -1027,7 +1050,7 @@ jobs:
             echo "CC2340 application is ${PHYSICAL_BYTES} B; protected security storage starts at 0x7E000" >&2
             exit 1
           fi
-          # Final pinned-SDK image measured 212688 B.
+          # Final pinned-SDK image measured 223536 B.
           ./tools/firmware-size-report.sh \
             cc2340-sensor "${ELF}.bin" 225280 "${ELF}.size.json"
       - name: Upload CC2340 firmware
@@ -1124,7 +1147,7 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          # Final binary measured 156612 B.
+          # 2026-09-08 binary measured 163236 B.
           ./tools/firmware-size-report.sh efr32mg1-sensor ${ELF}.bin 167936 ${ELF}.size.json
           python3 examples/efr32mg1-sensor/tools/verify-layout.py "$ELF"
           NM="$NM" examples/efr32mg1-sensor/check-layout.sh "$ELF"
@@ -1185,7 +1208,7 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          # Final binary measured 201192 B.
+          # Final binary measured 202820 B.
           ./tools/firmware-size-report.sh efr32mg21-sensor ${ELF}.bin 212992 ${ELF}.size.json
           python3 examples/efr32mg21-sensor/tools/verify-layout.py "$ELF"
           SYMS="$("$NM" --demangle "$ELF")"

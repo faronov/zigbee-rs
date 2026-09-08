@@ -2,7 +2,7 @@ name: Build TLSR8258 (tc32)
 
 on:
   push:
-    branches: [master, main, develop, experiment/zephyr-app-model]
+    branches: [master, main, develop, experiment/zephyr-app-model, experiment/r22-bdb-complete]
     paths:
       - "examples/telink-tlsr8258-sensor/**"
       - "examples/telink-tlsr8258-router/**"
@@ -20,7 +20,7 @@ on:
       - "zigbee-*/**"
       - ".github/workflows/build-tc32.yml"
   pull_request:
-    branches: [master, main, develop, experiment/zephyr-app-model]
+    branches: [master, main, develop, experiment/zephyr-app-model, experiment/r22-bdb-complete]
     paths:
       - "examples/telink-tlsr8258-sensor/**"
       - "examples/telink-tlsr8258-router/**"
@@ -123,8 +123,10 @@ jobs:
           ./tools/firmware-size-report.sh telink-tlsr8258-sensor-retention-10s \
             target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-10s.bin 299008 \
             target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-10s.size.json
+          # R22 parent-router regression gate is 0x69000; the linker/layout
+          # hard-stop remains the APS journal at physical address 0x70000.
           ./tools/firmware-size-report.sh telink-tlsr8258-router \
-            target/tlsr8258-artifacts/telink-tlsr8258-router.bin 356352 \
+            target/tlsr8258-artifacts/telink-tlsr8258-router.bin 430080 \
             target/tlsr8258-artifacts/telink-tlsr8258-router.size.json
           NM="$TC32_TOOLCHAIN_DIR/llvm/bin/llvm-nm"
           SENSOR_ELF=examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor

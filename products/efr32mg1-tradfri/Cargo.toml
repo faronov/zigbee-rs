@@ -15,5 +15,8 @@ rtt-target = "0.6"
 sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"] }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-mac = { path = "../../zigbee-mac" }
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["ota"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["compact-single-endpoint", "ota"] }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[dev-dependencies]
+zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }

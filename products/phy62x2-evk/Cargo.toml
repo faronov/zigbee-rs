@@ -18,9 +18,10 @@ phy6252 = ["phy62x2-evk/phy6252"]
 
 [dependencies]
 embedded-storage = "0.3"
-sensor-sed-app = { path = "../../apps/sensor-sed" }
+# No distributed-security key or Groups server is provisioned by this product.
+sensor-sed-app = { path = "../../apps/sensor-sed", default-features = false }
 zigbee-aps = { path = "../../zigbee-aps" }
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["constrained-memory"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["compact-single-endpoint", "constrained-memory"] }
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 

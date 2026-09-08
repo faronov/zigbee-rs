@@ -49,7 +49,7 @@ pub struct ApsTablePartition(());
 ///
 /// The board crate rightly owns *one* physical flash device; how that device
 /// is divided is product policy. Consuming the board token here and handing
-/// back one zero-sized token per partition means the two journals cannot be
+/// back one zero-sized token per partition means the three journals cannot be
 /// constructed twice or aliased, without the board knowing anything about
 /// Zigbee persistence.
 pub const fn split_flash(
