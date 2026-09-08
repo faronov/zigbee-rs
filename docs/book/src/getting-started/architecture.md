@@ -6,21 +6,24 @@ and policy that vary by chip, board, and product.
 ## Layer ownership
 
 ```text
-platform/chip HAL + MacDriver
+application/profile  device behavior, clusters, measurement mapping
         ↓
-board resources and fitted wiring
+product              identity, layout, persistence, bootloader/OTA
         ↓
-product identity/profile/policy/storage/linker/OTA
+board                physical wiring and fitted hardware
         ↓
-sensor-sed or router-app composition root
+platform/chip HAL    clocks, GPIO, buses, timers, flash, radio
 ```
+
+The example `main.rs` is the composition root that constructs and connects
+all four layers; it is not another owner of protocol behavior.
 
 | layer | owns | must not own |
 |---|---|---|
 | chip HAL / MAC | clocks, GPIO, buses, timers, flash controller, radio, AES mechanism, `MacDriver` | product identity, clusters, battery chemistry, partition policy |
 | board | pins, buses, LEDs, buttons, sensors, physical flash devices, exclusive resources | Zigbee runtime, endpoint behavior, product storage policy |
-| product | manufacturer/model, profile, reporting defaults, battery mapping, wait policy, linker map, persistence partitions, OTA/bootloader policy | generic chip mechanisms or hidden board discovery |
-| application/profile | commissioning lifecycle, measurements-to-ZCL mapping, reporting, commands, role behavior | platform startup and physical pin acquisition |
+| product | manufacturer/model, concrete profile selection, battery mapping, wait policy, linker map, persistence partitions, OTA/bootloader policy | endpoint/cluster implementation, generic chip mechanisms, or hidden board discovery |
+| application/profile | device behavior, endpoint declarations, cluster composition, reporting defaults, measurements-to-ZCL mapping | platform startup, product layout, and physical pin acquisition |
 | composition root | startup, concrete resource construction, executor/event loop | duplicated BDB/ZCL/ZDO/APS/NWK/MAC state machines |
 
 The protocol path remains shared:
@@ -133,14 +136,16 @@ products such as BL702 and ESP32-C6 rather than carrying fake LED work.
 
 ## Router and coordinator frontends
 
-`apps/router` exposes four public always-on frontends:
+`apps/router` exposes six public always-on frontends:
 
 | frontend | runtime role | child lifecycle | startup path |
 |---|---|---|---|
 | `AlwaysOnEndDeviceApp` | `EndDevice` | none | network steering/resume |
 | `RelayRouterApp` | `RelayRouter` | `NoChildren` | network steering/resume |
 | `ParentRouterApp` | `Router` | `PersistentChildren` | network steering/resume |
+| `DistributedRouterApp` | `Router` | `PersistentChildren` | distributed formation/persisted-PAN restart |
 | `CoordinatorApp` | `Router` | `PersistentChildren` | formation or persisted-PAN restart |
+| `TrustCenterCoordinatorApp` | `Router` | `PersistentChildren` plus durable TC devices | centralized formation/restart and TC transaction recovery |
 
 ```rust,ignore
 let mut relay = RelayRouterApp::new(
@@ -154,9 +159,10 @@ relay.initialize().await?;
 let events = relay.step().await?;
 ```
 
-`AlwaysOnEndDeviceApp` requires only `MacDriver`. Every frontend that
-advertises `DeviceType::Router` (`RelayRouterApp`, `ParentRouterApp`, and
-`CoordinatorApp`) requires the `router` feature and `ParentMacDriver`.
+`AlwaysOnEndDeviceApp` requires only `MacDriver`. Every routing frontend
+(`RelayRouterApp`, `ParentRouterApp`, `DistributedRouterApp`, and
+`CoordinatorApp`, including its `TrustCenterCoordinatorApp` wrapper) requires
+the `router` feature and `ParentMacDriver`.
 This makes unsupported parent/coordinator operations unconstructible rather
 than success-shaped no-ops.
 
@@ -179,11 +185,32 @@ loop {
 }
 ```
 
-The nRF52840 example is therefore an `AlwaysOnEndDeviceApp`. The TLSR8258
+Only the tc32 Telink backend and host-only `MockMac` implement
+`ParentMacDriver`. Telink advertises router capability but not coordinator
+capability; no production backend advertises Coordinator or Trust-Center
+server support. The nRF52840 example is therefore an
+`AlwaysOnEndDeviceApp`, despite its historical directory name. The TLSR8258
 router has the parent primitives and uses `ParentRouterApp +
-PersistentChildren`.
+PersistentChildren`; coordinator composition remains mock-only.
 
-All four frontends expose finite `initialize()` and `step()` operations and
+## Orthogonal compile-time capacities
+
+Role, commissioning procedure, and fixed product capacity are separate:
+
+- `sleepy-end-device` selects End Device polling/power behavior and retains
+  centralized joining/TCLK handling; distributed-security joining is an
+  orthogonal capability enabled by the shared sensor app by default;
+- `finding-binding-target` supplies only target Identify/response behavior,
+  while `finding-binding` adds the full initiator state machine;
+- `application-link-key-installation` is a product opt-in that additionally
+  requires durable APS-table storage;
+- `compact-single-endpoint` provides two application-endpoint slots and four
+  reporting entries without removing Zigbee behavior.
+
+The EFR32MG1, PHY62x2 sensor, and TLSR8258 sensor/router products currently
+select the compact capacity, after compile-time profile assertions and tests.
+
+All six frontends expose finite `initialize()` and `step()` operations and
 the infinite `run()` wrapper. `StepEvents` returns the bounded incoming/tick
 events so a product such as a relay plug can synchronize fitted hardware after
 the shared profile handles a command.

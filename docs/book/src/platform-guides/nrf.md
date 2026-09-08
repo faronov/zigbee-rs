@@ -7,14 +7,16 @@ resource crates, product-owned profiles/policy/storage, and
 ## Layering
 
 ```text
-embassy-nrf + zigbee_mac::nrf::NrfMac
+environmental profile / always-on End Device behavior
+        ↓
+nrf52840-sensor / nrf52833-sensor / nrf52840-router product
         ↓
 nrf52840-dk / nrf52833-dk / UF2 board crate
         ↓
-nrf52840-sensor or nrf52833-sensor product
-        ↓
-short sensor composition root
+embassy-nrf + zigbee_mac::nrf::NrfMac
 ```
+
+The short example root constructs and connects these layers.
 
 `apps/nrf-sensor` contains Nordic capability adapters such as
 `NrfWakeController`, `NrfStatus`, `NrfBattery`, diagnostics, and supervisor.
@@ -82,7 +84,7 @@ UF2; do not infer an address from a flat binary.
 
 | product | application end | security journal |
 |---|---:|---:|
-| nRF52840 DK sensor/router | `0x000FE000` | `0x000FE000..0x00100000` |
+| nRF52840 DK sensor/always-on End Device | `0x000FE000` | `0x000FE000..0x00100000` |
 | nRF52833 sensor | `0x0007E000` | `0x0007E000..0x00080000` |
 
 The product constructs `SecurityStateJournal` over Embassy NVMC. FICR-derived
@@ -126,22 +128,24 @@ cd ../nrf52840-router
 cargo +nightly-2026-03-23 build --release --locked
 ```
 
-Measured raw images:
+Measured release images on 2026-09-06:
 
-| image | bytes |
-|---|---:|
-| nRF52840 default / BME280 / SHT31 | 223,344 / 230,560 / 227,040 |
-| nRF52833 default / BME280 / SHT31 | 223,400 / 230,976 / 227,128 |
-| nRF52840 always-on End Device | 214,864 |
-| UF2 board variants before container | 221,736–223,456 |
+| image | bytes | regression gate |
+|---|---:|---:|
+| nRF52840 default / BME280 / SHT31 | 224,472 / 231,792 / 228,216 | 225,280 / 245,760 / 241,664 |
+| nRF52833 default / BME280 / SHT31 | 224,464 / 231,784 / 228,208 | 225,280 / 245,760 / 241,664 |
+| nRF52840 always-on End Device | 210,072 | 253,952 |
+| UF2 ProMicro / MDK / PCA10059 / DK | 222,968 / 222,848 / 224,536 / 224,552 | 237,568 each |
 
 CI also checks the product partition symbols, hardware-AES symbols, and
 role-specific symbol removal.
 
 ## Validation
 
-The nRF52840 and nRF52833 sensor paths are hardware-proven for commissioning,
-interview/reporting, hardware AES, security persistence, and reset/resume.
+The exact images above are build/layout-tested. Earlier nRF52840 and nRF52833
+sensor images produced hardware evidence for commissioning,
+interview/reporting, hardware AES, security persistence, and reset/resume; that
+is not a byte-for-byte rerun of the 2026-09-06 images.
 
 The nRF52840 always-on End Device compiles and passes role/layout checks. Its
 complete HIL acceptance—commissioning/resume, continuous receive, reset, and

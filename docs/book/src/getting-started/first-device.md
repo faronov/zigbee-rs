@@ -9,7 +9,11 @@ application state machine.
 - Forwarding-only mains device: `router_app::RelayRouterApp`.
 - Child-admitting router: `router_app::ParentRouterApp` and a real
   `ParentMacDriver`.
-- Coordinator: `router_app::CoordinatorApp` and a real `ParentMacDriver`.
+- Router-owned distributed PAN: `router_app::DistributedRouterApp`, a real
+  `ParentMacDriver`, and a provisioned certified distributed-security key.
+- Coordinator: `router_app::CoordinatorApp` and a real coordinator-capable
+  `ParentMacDriver`. The current repository has no such production backend;
+  coordinator and Trust-Center compositions are mock-only.
 
 Do not select a router role for a battery sensor. Do not select a parent role
 for a MAC backend that lacks association responses, pending transactions, and
@@ -18,11 +22,17 @@ indirect delivery.
 ## Create the four ownership layers
 
 ```text
-<chip>-hal/                 generic chip mechanisms
+application/profile         device behavior and clusters
+        ↓
+products/<product>/         identity, profile selection, layout, storage, OTA
+        ↓
 boards/<board>/             fitted pins and peripherals
-products/<product>/         identity, profile, policy, layout, storage, OTA
-examples/<product-role>/    composition root
+        ↓
+<chip>-hal/                 generic chip mechanisms
 ```
+
+`examples/<product-role>/main.rs` is the short composition root that wires
+the four layers.
 
 ### 1. Chip HAL and MAC
 
@@ -138,7 +148,9 @@ let mut app = RelayRouterApp::new(
 
 Use `ParentRouterApp` only after constructing a `ZigbeeDevice<_, Router>` from
 a `ParentMacDriver` and a separate child-table store. Use `CoordinatorApp`
-when formation and persisted-PAN restart are the intended product behavior.
+only when formation and persisted-PAN restart are the intended product
+behavior and the backend truthfully advertises coordinator capability. Today,
+that composition is host/mock-only.
 
 ## Persistence checklist
 

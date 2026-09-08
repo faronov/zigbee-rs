@@ -49,8 +49,16 @@ cargo +nightly-2026-03-23 build --release --locked \
 ```
 
 `board-promicro` is the default when no feature flags are supplied.
-The four current linked images measure **221,736–223,456 B** before UF2
-container overhead.
+
+| board | linked bytes before UF2 | regression gate |
+|---|---:|---:|
+| ProMicro | 222,968 | 237,568 |
+| MDK | 222,848 | 237,568 |
+| PCA10059 | 224,536 | 237,568 |
+| DK | 224,552 | 237,568 |
+
+These exact images are build/layout-tested. Bootloader compatibility and
+security-journal preservation remain board-specific hardware gates.
 
 ## Package from Intel HEX
 

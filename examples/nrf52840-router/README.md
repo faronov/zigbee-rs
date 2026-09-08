@@ -49,8 +49,9 @@ The linker consumes `products/nrf52840-router/link/memory.x`; the product's
 Rust constants and linker `ASSERT`s independently protect the two-page
 security journal.
 
-The current raw image budget is checked by CI; rebuild after this role change
-before treating any previous forwarding-relay measurement as applicable.
+Previous forwarding-relay measurements do not apply to this role. The current
+exact raw image is 210,072 B against a 253,952 B regression gate. It is
+build/layout-tested, not hardware-tested.
 
 ## Hardware validation still required
 

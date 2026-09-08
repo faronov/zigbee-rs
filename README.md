@@ -2,25 +2,32 @@
 
 Heap-free, `no_std`, pure-Rust Zigbee PRO for embedded devices.
 
-This worktree is the final cross-platform application-model migration on
-`experiment/zephyr-app-model`. The source documentation is authoritative for
-this branch. GitHub Pages is deployed only from `main`/`master`, so these pages
-will not appear at the public Pages URL until the branch is merged and the
-documentation workflow deploys it.
+This worktree is the cross-platform application-model and Zigbee Core R22 /
+BDB 3.0.1 hardening branch, `experiment/r22-bdb-complete`. The source
+documentation is authoritative for this branch. GitHub Pages is deployed only
+from `main`/`master`, so these pages will not appear at the public Pages URL
+until the branch is merged and the documentation workflow deploys it.
+
+The normative target is Zigbee Core R22 (`05-3474-22`) with BDB 3.0.1
+(`16-02828-012`). Passing host/build matrices is not a certification claim;
+the per-platform hardware and interoperability gates below remain explicit.
 
 ## Architecture
 
 Dependencies and ownership flow in one direction:
 
 ```text
-platform/chip HAL + MacDriver
+application/profile  device behavior, clusters, measurement mapping
         ↓
-board resources and fitted wiring
+product              identity, layout, persistence, bootloader/OTA
         ↓
-product identity/profile/policy/storage/linker/OTA
+board                physical wiring and fitted hardware
         ↓
-sensor-sed or router-app composition root
+platform/chip HAL    clocks, GPIO, buses, timers, flash, radio
 ```
+
+Example `main.rs` files are composition roots that wire these layers; they are
+not another ownership layer.
 
 The Zigbee protocol path remains shared:
 
@@ -38,12 +45,15 @@ platform radio backend
   radio mechanisms, and `MacDriver` implementations.
 - **Board crates** own physical pins and fitted peripherals. They expose typed
   resources and do not depend on `zigbee-runtime`.
-- **Product crates** own manufacturer/model identity, endpoint profile,
-  battery and scheduling policy, protected partitions, linker layout,
+- **Product crates** own manufacturer/model identity, the selected concrete
+  profile, battery and scheduling policy, protected partitions, linker layout,
   persistence, and OTA/bootloader selection.
-- **`apps/sensor-sed` and `apps/router`** own reusable commissioning,
-  receive/tick processing, reporting, persistence integration, and lifecycle
-  behavior.
+- **Profiles** own endpoint declarations, cluster composition, reporting
+  defaults, and measurement-to-ZCL conversion.
+- **`zigbee-runtime`** owns common commissioning, receive/tick processing,
+  reporting, persistence integration, power lifecycle, and OTA plumbing.
+- **`apps/sensor-sed` and `apps/router`** expose reusable, finite
+  product-facing application frontends over that runtime.
 - **Example `main.rs` files** are composition roots: platform startup,
   resource construction, and the outer executor/event loop.
 
@@ -108,7 +118,9 @@ The shared router application exposes role-safe frontends:
 | `AlwaysOnEndDeviceApp` | `EndDevice` | none | steering/resume only |
 | `RelayRouterApp` | `RelayRouter` | `NoChildren` | steering/resume only |
 | `ParentRouterApp` | `Router` | `PersistentChildren` | steering/resume only |
+| `DistributedRouterApp` | `Router` | `PersistentChildren` | distributed formation or persisted-PAN restart |
 | `CoordinatorApp` | `Router` | `PersistentChildren` | formation or persisted-PAN restart |
+| `TrustCenterCoordinatorApp` | `Router` | `PersistentChildren` plus durable TC devices | centralized formation/restart and TC transaction recovery |
 
 ```rust,ignore
 let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
@@ -125,14 +137,42 @@ let events = end_device.step().await?;
 `AlwaysOnEndDeviceApp` requires only `MacDriver`. Every frontend that
 advertises `DeviceType::Router` requires both the `router` feature and
 `ParentMacDriver`; a backend without parent-side association and
-indirect-delivery primitives cannot construct one. The nRF52840 example is
-therefore an always-on End Device. `router-app` has no default features:
-parent/relay/coordinator products must explicitly enable
-`router-app/features = ["router"]`, while End Device products compile without
-route, parent, or child-table capacities.
+indirect-delivery primitives cannot construct one. Of the in-tree MACs, only
+the real Telink TLSR8258 backend and host-only `MockMac` implement
+`ParentMacDriver`. Telink advertises router capability but not coordinator
+capability. No production backend advertises Coordinator or Trust-Center
+server support, so coordinator composition remains mock-only.
 
-All four frontends provide finite `initialize()` and `step()` operations plus
+The misleadingly named `examples/nrf52840-router` therefore composes
+`AlwaysOnEndDeviceApp`, not a Zigbee router. `router-app` has no default
+features: parent/distributed/coordinator products must explicitly enable its
+router support, while End Device products compile without route, parent, or
+child-table capacities.
+
+`DistributedRouterApp` additionally requires a product-certified distributed
+global link key before initialization; the public BDB test key is not a
+production default.
+
+All six frontends provide finite `initialize()` and `step()` operations plus
 the infinite `run()` convenience wrapper.
+
+## Feature boundaries
+
+- `sleepy-end-device` is the truthful End Device polling/power feature name.
+  It retains centralized joining and TCLK handling. Distributed-security
+  joining is an orthogonal capability enabled by the shared sensor app by
+  default; products that provision no distributed key may disable it.
+- `finding-binding-target` provides only the target side: Identify mode and
+  normal response handling. Full initiator Finding & Binding is the separate
+  `finding-binding` feature, which includes target support.
+- `application-link-key-installation` is an optional product capability. It is
+  enabled only when the composition also owns durable APS-table storage;
+  `NoApsTables` rejects installation rather than accepting a volatile key.
+- `compact-single-endpoint` is an orthogonal product-capacity choice, not a
+  Zigbee role or behavior cut. It provides two application-endpoint slots and
+  four reporting entries. The EFR32MG1, PHY62x2 sensor, and TLSR8258
+  sensor/router products currently select it, after compile-time
+  profile-capacity assertions and tests.
 
 ## Why the configuration is static
 
@@ -173,22 +213,25 @@ sensor or router behavior is moved to a new MCU.
 ## Current targets
 
 “Build” means the pinned release image compiles and passes its layout checks;
-it is not a hardware claim.
+it is not a hardware claim. The exact 2026-08-27 image measurements are
+build/layout-tested only. Hardware evidence in the last column is prior
+path-level evidence unless an exact-image rerun is explicitly named; this
+worktree records no such rerun for the current byte-for-byte images.
 
 | target | role/application | build | hardware validation |
 |---|---|---:|---|
-| nRF52840 DK | environmental SED | yes | commissioning, reporting, AES, persistence, and reset/resume proven |
-| nRF52833 DK | environmental SED | yes | commissioning, reporting, AES, persistence, and reset/resume proven |
+| nRF52840 DK | environmental sleepy End Device | yes | prior path evidence covers commissioning, reporting, AES, persistence, and reset/resume |
+| nRF52833 DK | environmental sleepy End Device | yes | prior path evidence covers commissioning, reporting, AES, persistence, and reset/resume |
 | nRF52840 DK | always-on End Device | yes | commissioning/resume and continuous-RX HIL remain open |
-| ESP32-C6 | environmental SED + optional OTA | yes | OTA transfer reached 18.3%; complete activation still open |
-| ESP32-H2 | environmental SED + optional OTA | yes | v1→v2 OTA activation, reboot, and commissioned-state retention proven |
-| BL702 XT-ZB1 | environmental SED | yes | radio/commissioning/interview proven; destructive flash persistence validation open |
-| PHY6222/PHY6252 EVK | environmental SED | yes | complete radio/join/persistence path remains hardware-unverified |
-| CC2340R5 | environmental SED | yes | radio HIL and entropy backend remain open; commissioning fails closed |
-| EFR32MG1P TRÅDFRI | environmental SED | yes | commissioning, interview, sensors, persistence, reset/resume, and EM2 proven; real OTA install open |
-| EFR32MG21 BRD4181A | environmental SED | yes | complete hardware path remains HIL-unverified |
-| TLSR8258 TB-04 | environmental SED | yes | default SUSPEND primitive proven; repeated application-level sleep/network HIL remains open |
-| TLSR8258 TB-04 | child-capable router | yes | join, restart, Link Status, and relay proven; corrected-image first-attempt child acceptance remains open |
+| ESP32-C6 | environmental sleepy End Device + OTA | yes | prior C6 evidence covers commissioning/reporting and OTA to 18.3%; complete activation remains open |
+| ESP32-H2 | environmental sleepy End Device + OTA | yes | prior H2 evidence covers v1→v2 activation, reboot, and retained commissioned state |
+| BL702 XT-ZB1 | environmental sleepy End Device | yes | prior path evidence covers radio/commissioning/interview; destructive flash persistence remains open |
+| PHY6222/PHY6252 EVK | environmental sleepy End Device | yes | PHY6222 and PHY6252 exact cross-build/layout image measurements; complete hardware path remains unverified |
+| CC2340R5 | environmental sleepy End Device | yes | pinned-SDK and fallback compile/link paths pass; radio HIL and entropy remain open |
+| EFR32MG1P TRÅDFRI | environmental sleepy End Device | yes | prior path evidence covers commissioning through EM2; real OTA install remains open |
+| EFR32MG21 BRD4181A | environmental sleepy End Device | yes | complete hardware path remains HIL-unverified |
+| TLSR8258 TB-04 | environmental sleepy End Device | yes | prior evidence covers the SUSPEND primitive; repeated application/network acceptance remains open |
+| TLSR8258 TB-04 | child-capable router | yes | prior evidence covers join/restart/Link Status/relay; corrected-image child acceptance remains open |
 
 See [BUILD.md](BUILD.md) for pinned commands, measured images, partition
 boundaries, and exact remaining gates.
@@ -214,6 +257,7 @@ ESP32 and PHY6222 use `nightly-2026-08-01`. TLSR8258 uses the
 - [Build and validation matrix](BUILD.md)
 - [Examples](examples/README.md)
 - [API map](docs/book/src/reference/api.md)
+- [R22 / BDB implementation status](docs/book/src/reference/conformance.md)
 - [Architecture](docs/book/src/getting-started/architecture.md)
 - [NV storage](docs/book/src/advanced/nv-storage.md)
 - [Power management](docs/book/src/advanced/power.md)

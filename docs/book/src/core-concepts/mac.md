@@ -2,7 +2,9 @@
 
 The MAC (Medium Access Control) layer is the boundary between the
 platform-independent Zigbee stack and the hardware-specific 802.15.4 radio.
-In zigbee-rs, this boundary is defined by a single trait: **`MacDriver`**.
+In zigbee-rs, **`MacDriver`** is the End Device-capable core boundary.
+Backends that genuinely implement the parent primitives additionally carry
+the sealed **`ParentMacDriver`** capability.
 
 ```text
 ┌──────────────────────────────────────────┐
@@ -14,9 +16,10 @@ In zigbee-rs, this boundary is defined by a single trait: **`MacDriver`**.
 └──────────────────────────────────────────┘
 ```
 
-Each hardware platform implements `MacDriver` once (~500 lines of
-platform-specific code).  The entire upper stack is built against this trait and
-never touches hardware directly.
+Each hardware platform exposes a `MacDriver`; the upper stack never touches
+radio hardware directly. Parent/router construction additionally requires the
+sealed `ParentMacDriver` marker rather than relying on success-shaped default
+methods.
 
 ## The `MacDriver` Trait
 
@@ -140,15 +143,21 @@ backend is behind a Cargo feature flag:
 
 | Backend | Feature flag | Current validation |
 |---|---|---|
-| ESP32-C6/H2 | `esp32c6`, `esp32h2` | sensor paths hardware-tested; H2 full OTA proven, C6 activation open |
-| nRF52840/52833 | `nrf52840`, `nrf52833` | both sensor paths hardware-proven; nRF52840 always-on End Device HIL open |
-| BL702 | `bl702` | XT-ZB1 radio, commissioning, interview, and reporting hardware-proven |
+| ESP32-C6/H2 | `esp32c6`, `esp32h2` | real pure-Rust `esp-radio` End Device backends; prior path evidence exists, current exact images are build/layout-tested |
+| nRF52840/52833 | `nrf52840`, `nrf52833` | End Device backends; prior sensor-path evidence exists, current exact images are build/layout-tested |
+| BL702 | `bl702` | End Device backend; prior XT-ZB1 radio/commissioning evidence exists |
 | CC2340R5 | `cc2340` | compiles with pinned SDK; radio HIL and entropy open |
-| TLSR8258 | `tlsr8258` | secured sensor/router paths hardware-tested; `telink` is a compatibility alias |
+| TLSR8258 | `tlsr8258` | only production `ParentMacDriver`; advertises router but not coordinator; `telink` is a compatibility alias |
 | PHY6222 | `phy6222` | compile/layout only; complete radio path unverified |
-| EFR32MG1 | `efr32` | TRÅDFRI sensor path hardware-proven except real OTA install |
-| EFR32MG21 | `efr32s2` | BRD4181A build/layout only; complete HIL open |
-| Mock | `mock` | host tests |
+| EFR32MG1 | `efr32` | End Device backend; prior TRÅDFRI path evidence exists, real OTA install open |
+| EFR32MG21 | `efr32mg21` | BRD4181A build/layout only; complete HIL open |
+| Mock | `mock` | host-only `ParentMacDriver`; router/coordinator/Trust-Center tests |
+
+All real backends currently implement the End Device primitives. Only Telink
+and `MockMac` implement the sealed `ParentMacDriver`. Telink reports
+`router: true` and `coordinator: false`; every other real backend uses
+`MacCapabilities::non_parent`. No production backend can currently advertise
+or construct a Coordinator/Trust-Center server path.
 
 ### Choosing a Backend
 
@@ -222,8 +231,10 @@ impl MacDriver for MyRadioMac {
     }
 
     async fn mlme_associate_response(&mut self, rsp: MlmeAssociateResponse) -> Result<(), MacError> {
-        // Coordinator/Router: send Association Response frame
-        todo!()
+        // PARENT-ONLY. Leave this returning `Err(MacError::Unsupported)` unless
+        // you are also implementing the other parent primitives and
+        // `ParentMacDriver` — see "Parent capability boundary" below.
+        Err(MacError::Unsupported)
     }
 
     async fn mlme_disassociate(&mut self, req: MlmeDisassociateRequest) -> Result<(), MacError> {
@@ -237,8 +248,13 @@ impl MacDriver for MyRadioMac {
     }
 
     async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
-        // Configure radio as PAN coordinator/router on the given channel
-        todo!()
+        // PARENT-ONLY. Starting a PAN asserts that this device will answer
+        // Beacon Requests, admit children and deliver indirect transactions.
+        // Until your backend implements `ParentMacDriver`, delegate to the
+        // shared helper so the request shape is still validated and the
+        // missing capability is reported explicitly instead of being
+        // swallowed by an `Ok(())` that only retunes the radio.
+        start_requires_parent_capability(&req)
     }
 
     async fn mlme_get(&self, attr: PibAttribute) -> Result<PibValue, MacError> {
@@ -269,21 +285,29 @@ impl MacDriver for MyRadioMac {
     }
 
     fn capabilities(&self) -> MacCapabilities {
-        MacCapabilities {
-            coordinator: true,
-            router: true,
-            hardware_security: false,
-            max_payload: 102,
-            tx_power_min: TxPower(-20),
-            tx_power_max: TxPower(8),
-        }
+        // A new backend starts life without parent capability: the
+        // `MacDriver` parent primitives above are still `Unsupported`
+        // defaults, so it can neither relay for a network nor admit
+        // children. `non_parent()` forces `coordinator: false` and
+        // `router: false`, which makes the dishonest claim unrepresentable.
+        //
+        // Do NOT hand-write `MacCapabilities { router: true, .. }` to "enable"
+        // a router: the runtime arms parent servicing from these flags and
+        // `zigbee-bdb` gates network formation on `coordinator`, so an
+        // untruthful flag arms parent mode over primitives that can only
+        // fail. Router construction is separately blocked by the sealed
+        // `ParentMacDriver` bound described below.
+        MacCapabilities::non_parent(102, TxPower(-20), TxPower(8))
     }
 }
 ```
 
-> **Tip:** Study the existing `esp` or `nrf` backends for reference — they
-> handle all the edge cases (scan timing, CSMA-CA retry, ACK waiting, indirect
-> TX for sleepy devices).
+> **Tip:** For the end-device primitives (scan timing, CSMA-CA retry, ACK
+> waiting, poll handling), study the existing `esp`, `nrf` or `efr32`
+> backends. Note that none of those is a parent: for the parent-side
+> primitives — beacon response, association response, orphan realignment and
+> frame-pending indirect delivery — the only in-tree hardware reference is the
+> Telink backend (`zigbee-mac/src/telink/`), together with the host `MockMac`.
 
 ## MAC Primitives Reference
 
@@ -524,4 +548,48 @@ which the parent behaviour is reviewed.
 A backend that only satisfies the `MacDriver` defaults **must not** implement
 it. This lets the runtime bound router construction on a genuine parent MAC
 rather than on the Cargo `router` feature alone — see
-[Coordinator & Router](../advanced/coordinator-router.md#logical-roles-are-types).
+[Coordinator & Router](../advanced/coordinator-router.md#runtime-roles).
+
+### What a parent backend must actually implement
+
+All six primitives below have `Unsupported`/`NoData` defaults. Overriding
+**every** one of them with real behaviour is the precondition for
+`impl ParentMacDriver`:
+
+| primitive | parent behaviour required |
+|---|---|
+| `mlme_associate_response` | Retain the response as a bounded indirect transaction, arm ACK Frame Pending for the joiner's EUI-64, transmit only after its extended-address Data Request. |
+| `mlme_beacon_response` | Emit an on-demand beacon answering a Beacon Request. |
+| `mlme_orphan_response` | Answer an orphan notification with a Coordinator Realignment; transmit nothing when `associated_member == false`. |
+| `set_indirect_data_pending` | Maintain a **bounded** per-child source-match set that selects the Frame Pending bit of the ACK sent to that child's Data Request. |
+| `mcps_indirect_data` | Transmit one already-dequeued indirect transaction. |
+| `mac_command_event` / `..._timeout` | Surface Beacon Request, Association Request, Data Request and Orphan Notification events without losing concurrently received data frames. |
+
+The binding hardware constraint is `set_indirect_data_pending`: IEEE 802.15.4
+requires the acknowledgement to leave the antenna within `aTurnaroundTime`
+(192 µs) of the received frame, so the Frame Pending decision has to happen on
+the ACK path itself — in practice an ISR or a hardware source-match table. No
+polling loop can meet it. This, not the Cargo `router` feature, is why most
+in-tree backends are end-device only.
+
+### Reporting capability honestly
+
+Until those primitives exist, a backend reports its descriptor through
+`MacCapabilities::non_parent(max_payload, tx_power_min, tx_power_max)`, which
+forces `coordinator: false` and `router: false`, and answers MLME-START with
+`start_requires_parent_capability(&req)`. Both live in `zigbee-mac::primitives`
+and are shared by every non-parent backend, so the boundary is stated once.
+
+These flags are load-bearing, not documentation: the runtime arms parent
+servicing from `capabilities().router` / `.coordinator`, and `zigbee-bdb`
+network formation is gated on `.coordinator`. A backend that claimed
+`router: true` while keeping the defaults would arm parent mode over
+primitives that can only return `Unsupported`.
+
+A parent-capable backend instead validates the request with
+`validate_router_start(&req)` — which accepts only the Zigbee non-beacon shape
+(`beacon_order == superframe_order == 15`, `pan_coordinator == false`, channel
+11..=26, non-broadcast PAN ID) — and then applies its own radio
+configuration. `MacCapabilities::coordinator` remains a *separate* claim that
+no in-tree hardware backend makes yet, so PAN-coordinator starts are rejected
+with `Unsupported` on every platform.

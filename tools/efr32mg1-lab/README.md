@@ -83,6 +83,7 @@ the Embassy time driver and owns its minimal `RTCC` handler; all async
 diagnostics include the RTCC Embassy handler. `diag-nv` initializes neither.
 
 Historical `sed-diag` retained milestone records and the one-shot
-`sed-migrate` gate were retired during the production/lab split. Their
-hardware-proven outcomes remain documented in repository history; they are
-not general-purpose diagnostics.
+`sed-migrate` gate were retired during the production/lab split. Their prior
+hardware evidence remains documented in repository history; it is not an
+exact-image claim for current production firmware, and these are not
+general-purpose diagnostics.

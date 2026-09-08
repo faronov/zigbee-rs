@@ -30,14 +30,16 @@ The WSTK provides the button bias. These are the current BRD4181A pins.
 ## Ownership
 
 ```text
-efr32mg21-hal + Efr32s2Mac
-        ↓
-boards/efr32mg21-devkit
+environmental non-OTA profile
         ↓
 products/efr32mg21-sensor
         ↓
-this root + sensor_sed_app::SensorApp
+boards/efr32mg21-devkit
+        ↓
+efr32mg21-hal + Efr32s2Mac
 ```
+
+This example is the composition root.
 
 The product owns identity, profile, policy, bounded storage, and linker map.
 The board owns PB0/PD2, clocks, and physical flash.
@@ -60,7 +62,10 @@ python3 tools/verify-layout.py \
   target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor
 ```
 
-Current raw image: **203,180 B**.
+Current raw image: **202,820 B** against a **212,992 B** regression gate.
+`.data` is **308 B**, `.bss` is **18,280 B**, static total is **18,588 B**,
+and the linked available stack is **46,944 B**. This product has no OTA
+packaging path.
 
 ## Validation
 

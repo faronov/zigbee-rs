@@ -63,19 +63,23 @@ The shared application also shortens the wait for:
 
 | product | fast | slow | implementation/status |
 |---|---|---|---|
-| nRF52840/52833 sensor | `Idle` | `Idle` | radio-off retained System-ON wait; sensor path hardware-proven |
+| nRF52840/52833 sensor | `Idle` | `Idle` | radio-off retained System-ON wait; prior sensor-path hardware evidence |
 | ESP32-C6/H2 | `Active` | `Active` | no low-power claim |
 | BL702 | `Active` | `Active` | polling executor; no PDS/HBN claim |
 | CC2340 | `Active` | `Active` | commissioning/radio HIL pending |
 | PHY6222/6252 | `Idle` | `Idle` | radio sleep + real timer; retention rejected, hardware path unverified |
-| EFR32MG1 | `Active` | `Retention` | RTCC/LFRCO EM2 steady state hardware-proven |
+| EFR32MG1 | `Active` | `Retention` | prior RTCC/LFRCO EM2 path evidence |
 | EFR32MG21 | `Idle` | `Idle` | radio-gated WFE + 1 kHz SysTick; not EM2, HIL pending |
 | TLSR8258 default | `Active` | `Idle` | full-SRAM timer SUSPEND |
 | TLSR8258 retention proof | `Active` | `Retention` | feature-gated LOW32K reset-on-wake |
 
-Routers are always-on. `RelayRouterApp`, `ParentRouterApp`, and
-`CoordinatorApp` run bounded receive/tick slices but do not use sleepy
-end-device parent polling.
+Routers are always-on. `RelayRouterApp`, `ParentRouterApp`,
+`DistributedRouterApp`, and `CoordinatorApp` run bounded receive/tick slices
+but do not use sleepy end-device parent polling.
+
+These statements describe product policies and prior path evidence. The exact
+2026-09-06 release images are build/layout-tested unless an exact-image HIL
+rerun is separately recorded.
 
 ## Telink variants
 

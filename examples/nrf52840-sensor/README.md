@@ -5,18 +5,17 @@
 ## Architecture
 
 ```text
-embassy-nrf + NrfMac
-        ↓
-boards/nrf52840-dk
+environmental Sleepy End Device profile
         ↓
 products/nrf52840-sensor
         ↓
-this composition root
+boards/nrf52840-dk
         ↓
-sensor_sed_app::SensorApp
+embassy-nrf + NrfMac
 ```
 
-`main.rs` initializes clocks, Nordic radio/RNG/AES, board resources, product
+`main.rs` is the composition root. It initializes clocks, Nordic radio/RNG/AES,
+board resources, product
 profile, and the product-owned security journal. Commissioning, parent
 polling, reporting, Identify, reset/rejoin, and persistence checkpoints live
 in `apps/sensor-sed`.
@@ -78,15 +77,16 @@ probe-rs run --chip nRF52840_xxAA \
 
 Measured raw images:
 
-| variant | bytes |
-|---|---:|
-| default | 223,344 |
-| BME280 | 230,560 |
-| SHT31 | 227,040 |
+| variant | bytes | regression gate |
+|---|---:|---:|
+| default | 224,472 | 225,280 |
+| BME280 | 231,792 | 245,760 |
+| SHT31 | 228,216 | 241,664 |
 
 ## Validation
 
-Hardware-proven on nRF52840:
+The exact images above are build/layout-tested. Earlier nRF52840 images
+produced hardware evidence for:
 
 - commissioning and secure resume;
 - Nordic hardware AES;

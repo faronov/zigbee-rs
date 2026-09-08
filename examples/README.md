@@ -8,16 +8,17 @@ finite demonstrations of the same shared application frontends.
 An embedded `main.rs` is a composition root:
 
 ```text
-chip HAL / MacDriver
+application/profile
+        ↓
+product identity, profile selection, policy, storage, linker, OTA
         ↓
 board resources
         ↓
-product profile, policy, storage, linker, OTA
-        ↓
-sensor_sed_app::SensorApp or router_app frontend
+chip HAL / MacDriver
 ```
 
-It may initialize clocks, construct exclusive peripherals, install the radio
+The example `main.rs` wires those four layers. It may initialize clocks,
+construct exclusive peripherals, install the radio
 and AES backend, open product-owned storage, build the profile/device, and run
 the platform executor. It must not copy commissioning, polling, reporting,
 router, persistence, or OTA state machines out of the shared application and
@@ -76,6 +77,8 @@ coordinator compositions explicitly enable its `router` feature.
 
 The nRF52840 always-on End Device example is deliberately the first case. Its
 MAC lacks `ParentMacDriver`, so it cannot advertise a Router descriptor.
+Only Telink TLSR8258 and host-only `MockMac` implement `ParentMacDriver`, and
+no production backend advertises coordinator capability.
 
 ## Host examples
 
@@ -93,19 +96,23 @@ cargo +nightly-2026-03-23 run --locked
 
 ## Sensor firmware
 
+The exact 2026-09-06 images are build/layout-tested. “Prior evidence” below
+describes earlier path-level hardware runs, not a byte-for-byte rerun of the
+current image.
+
 | example | board/chip | wait depths | status and OTA | validation |
 |---|---|---|---|---|
-| [`nrf52840-sensor`](nrf52840-sensor/) | PCA10056 / nRF52840 | `Idle` / `Idle` | fitted LED, `NoOta` | hardware-proven |
-| [`nrf52833-sensor`](nrf52833-sensor/) | PCA10100 / nRF52833 | `Idle` / `Idle` | fitted LED, `NoOta` | hardware-proven |
+| [`nrf52840-sensor`](nrf52840-sensor/) | PCA10056 / nRF52840 | `Idle` / `Idle` | fitted LED, `NoOta` | build/layout; prior sensor-path evidence |
+| [`nrf52833-sensor`](nrf52833-sensor/) | PCA10100 / nRF52833 | `Idle` / `Idle` | fitted LED, `NoOta` | build/layout; prior sensor-path evidence |
 | [`nrf52840-sensor-uf2`](nrf52840-sensor-uf2/) | ProMicro, MDK, PCA10059, or DK | `Idle` / `Idle` | board-dependent status, `NoOta` | build/layout matrix; bootloader compatibility remains board-specific |
-| [`esp32c6-sensor`](esp32c6-sensor/) | ESP32-C6 DevKit | `Active` / `Active` | `NoStatus`, optional OTA | 18.3% OTA transfer proven; activation open |
-| [`esp32h2-sensor`](esp32h2-sensor/) | ESP32-H2 | `Active` / `Active` | active-low LED, optional OTA | complete v1→v2 OTA proven |
-| [`bl702-sensor`](bl702-sensor/) | XT-ZB1 / BL702 | `Active` / `Active` | `NoStatus`, `NoOta` | radio/Zigbee proven; destructive persistence gate open |
-| [`phy6222-sensor`](phy6222-sensor/) | PHY6222/PHY6252 EVK | `Idle` / `Idle` | fitted status, `NoOta` | compile/layout only |
+| [`esp32c6-sensor`](esp32c6-sensor/) | ESP32-C6 DevKit | `Active` / `Active` | `NoStatus`, OTA | real `esp-radio`; prior commissioning/reporting and 18.3% OTA evidence; activation open |
+| [`esp32h2-sensor`](esp32h2-sensor/) | ESP32-H2 | `Active` / `Active` | active-low LED, OTA | real `esp-radio`; prior complete v1→v2 OTA evidence |
+| [`bl702-sensor`](bl702-sensor/) | XT-ZB1 / BL702 | `Active` / `Active` | `NoStatus`, `NoOta` | build/layout; prior radio/Zigbee evidence; destructive persistence open |
+| [`phy6222-sensor`](phy6222-sensor/) | PHY6222/PHY6252 EVK | `Idle` / `Idle` | fitted status, `NoOta` | exact feature images build/layout-tested; hardware path open |
 | [`cc2340-sensor`](cc2340-sensor/) | LP-EM-CC2340R5 | `Active` / `Active` | fitted status, `NoOta` | compile/layout only; entropy fails closed |
-| [`efr32mg1-sensor`](efr32mg1-sensor/) | TRÅDFRI / EFR32MG1P | `Active` / `Retention` | fitted LEDs, OTA | hardware-proven except real OTA install |
+| [`efr32mg1-sensor`](efr32mg1-sensor/) | TRÅDFRI / EFR32MG1P | `Active` / `Retention` | fitted LEDs, OTA | build/layout; prior path evidence; real OTA install open |
 | [`efr32mg21-sensor`](efr32mg21-sensor/) | BRD4181A / EFR32MG21 | `Idle` / `Idle` | PB0 LED, `NoOta` | compile/layout only |
-| [`telink-tlsr8258-sensor`](telink-tlsr8258-sensor/) | TB-04 / TLSR8258 | `Active` / `Idle` by default | RGB status, `NoOta` | default SUSPEND build plus feature-gated retention proofs |
+| [`telink-tlsr8258-sensor`](telink-tlsr8258-sensor/) | TB-04 / TLSR8258 | `Active` / `Idle` by default | RGB status, `NoOta` | exact images build/layout-tested; prior SUSPEND primitive evidence; LOW32K HIL open |
 
 See [the build matrix](../BUILD.md) for exact pinned commands and measured
 image sizes.
@@ -115,7 +122,7 @@ image sizes.
 | example | frontend | child support | validation |
 |---|---|---|---|
 | [`nrf52840-router`](nrf52840-router/) | `AlwaysOnEndDeviceApp` | none | build/layout; HIL acceptance open |
-| [`telink-tlsr8258-router`](telink-tlsr8258-router/) | `ParentRouterApp` | persistent children, bindings, and groups | join/restart/relay proven; corrected child acceptance gate open |
+| [`telink-tlsr8258-router`](telink-tlsr8258-router/) | `ParentRouterApp` | persistent children, bindings, groups, optional durable application-key installation | build/layout; prior join/restart/relay evidence; corrected child acceptance open |
 
 ## Telink power variants
 
@@ -130,7 +137,8 @@ From the repository root:
 
 The default sensor uses full-SRAM timer `SUSPEND`. The two retention images
 are feature-gated LOW32K reset-on-wake proofs at 250 ms and 10 seconds.
-The independent retention HIL reports pass with marker `0x5254600D`.
+The independent retention HIL reports completion only with marker
+`0x5254600D`; that hardware gate remains open for the current proof images.
 
 ## Porting
 

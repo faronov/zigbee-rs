@@ -63,6 +63,7 @@
 # Reference
 
 - [API Quick Reference](./reference/api.md)
+- [R22 / BDB Status](./reference/conformance.md)
 - [PIB Attributes](./reference/pib.md)
 - [ZCL Cluster Table](./reference/zcl-table.md)
 - [Error Types](./reference/errors.md)

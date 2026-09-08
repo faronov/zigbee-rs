@@ -1,9 +1,25 @@
 # Build and validation
 
 This file records the commands and measurements for the current
-`experiment/zephyr-app-model` worktree. A successful build proves compilation,
+`experiment/r22-bdb-complete` worktree. A successful build proves compilation,
 linking, and the checks named below. It does not prove radio timing, flash
 durability, sleep current, or OTA activation on hardware.
+
+Validation terms in this file are strict:
+
+- **protocol implementation** means the code path exists and unsupported
+  capabilities fail explicitly;
+- **host-tested** means portable state-machine or wire behavior passed host
+  tests;
+- **cross-compiled/build-tested** means the pinned target image and named
+  layout/symbol checks passed;
+- **exact-image HIL/packet capture** means that exact byte image was flashed
+  and observed on hardware or over the air;
+- **certified** means an external Zigbee certification result.
+
+The project targets Zigbee Core R22 (`05-3474-22`) and BDB 3.0.1
+(`16-02828-012`). BDB 3.1 is R23-or-newer future guidance. Nothing in this
+file is a certification claim.
 
 ## Pinned tools
 
@@ -41,58 +57,76 @@ from their own manifest or directory.
 
 ## Current release measurements
 
-These are flashable payloads rebuilt from the current dirty worktree with the
-pinned toolchains. Regression budgets and protected-region checks remain in
-`.github/workflows/ci.yml`.
+Baseline snapshot: **2026-09-06**, with TLSR8258 parent-router measurements
+refreshed **2026-09-07** and EFR32MG1/ESP32-C6/H2 refreshed **2026-09-08**.
+The parent router and ESP32-C6 currently fail their regression budgets;
+EFR32MG1 and ESP32-H2 pass their
+build/layout gates. These are not exact-image hardware reruns. Prior
+hardware evidence is called out separately below.
 
-| image | measured bytes | artifact |
-|---|---:|---|
-| nRF52840 sensor, default | 223,344 | raw `.bin` |
-| nRF52840 sensor, BME280 | 230,560 | raw `.bin` |
-| nRF52840 sensor, SHT31 | 227,040 | raw `.bin` |
-| nRF52833 sensor, default | 223,400 | raw `.bin` |
-| nRF52833 sensor, BME280 | 230,976 | raw `.bin` |
-| nRF52833 sensor, SHT31 | 227,128 | raw `.bin` |
-| nRF52840 always-on End Device | 214,864 | raw `.bin` |
-| nRF52840 UF2 board variants | 221,736–223,456 | linked image before UF2 container |
-| ESP32-C6 sensor | 354,512 | application image |
-| ESP32-H2 sensor | 339,568 | application image |
-| BL702 sensor | 182,786 | raw linked image |
-| BL702 sensor | 190,992 | packaged boot image |
-| CC2340 sensor, pinned SDK | 212,688 | raw `.bin` |
-| PHY6222 sensor | 129,556 | packaged `.phy6.bin` |
-| EFR32MG1 sensor | 156,612 | raw `.bin` |
-| EFR32MG21 sensor | 201,192 | raw `.bin` |
-| TLSR8258 sensor, default SUSPEND | 279,652 | raw `.bin` |
-| TLSR8258 sensor, LOW32K 250 ms proof | 284,436 | raw `.bin` |
-| TLSR8258 sensor, LOW32K 10 s proof | 284,440 | raw `.bin` |
-| TLSR8258 parent router | 343,660 | raw `.bin` |
+| image | measured bytes | gate bytes | gate headroom | measured artifact |
+|---|---:|---:|---:|---|
+| PHY6222 sensor | 130,624 | 130,816 hard XIP | 192 | occupied XIP span |
+| PHY6252 feature-selected sensor | 130,464 | 130,816 hard XIP | 352 | occupied XIP span |
+| BL702 sensor | 189,442 | 192,512 regression | 3,070 | raw linked `.bin` |
+| nRF52840 sensor, default | 224,472 | 225,280 regression | 808 | raw `.bin` |
+| nRF52840 sensor, BME280 | 231,792 | 245,760 regression | 13,968 | raw `.bin` |
+| nRF52840 sensor, SHT31 | 228,216 | 241,664 regression | 13,448 | raw `.bin` |
+| nRF52840 always-on End Device | 210,072 | 253,952 regression | 43,880 | raw `.bin` |
+| nRF52840 UF2 ProMicro | 222,968 | 237,568 regression | 14,600 | linked image before UF2 |
+| nRF52840 UF2 MDK | 222,848 | 237,568 regression | 14,720 | linked image before UF2 |
+| nRF52840 UF2 PCA10059 | 224,536 | 237,568 regression | 13,032 | linked image before UF2 |
+| nRF52840 UF2 DK | 224,552 | 237,568 regression | 13,016 | linked image before UF2 |
+| nRF52833 sensor, default | 224,464 | 225,280 regression | 816 | raw `.bin` |
+| nRF52833 sensor, BME280 | 231,784 | 245,760 regression | 13,976 | raw `.bin` |
+| nRF52833 sensor, SHT31 | 228,208 | 241,664 regression | 13,456 | raw `.bin` |
+| EFR32MG1 sensor | 163,236 | 167,936 regression | 4,700 | raw `.bin` |
+| EFR32MG21 sensor | 202,820 | 212,992 regression | 10,172 | raw `.bin` |
+| CC2340R5 sensor, pinned SDK | 223,536 | 225,280 regression | 1,744 | raw `.bin` |
+| ESP32-C6 sensor | 369,248 | 368,640 regression | -608 | application image; over budget |
+| ESP32-H2 sensor | 354,096 | 356,352 regression | 2,256 | application image |
+| TLSR8258 sensor, default SUSPEND | 290,616 | 294,912 regression | 4,296 | raw `.bin` |
+| TLSR8258 sensor, LOW32K 250 ms | 295,548 | 299,008 regression | 3,460 | raw `.bin` |
+| TLSR8258 sensor, LOW32K 10 s | 295,552 | 299,008 regression | 3,456 | raw `.bin` |
+| TLSR8258 parent router | 433,756 | 430,080 regression | -3,676 | raw `.bin`; over budget |
 
-The ESP merged flash images are 420,048 B (C6) and 405,104 B (H2), but the
-application-image values above are the useful firmware growth measurements.
+Additional exact packaging and physical limits:
+
+- PHY6252 now has the separate exact feature-selected occupied-XIP
+  measurement shown above; its hardware path remains unverified.
+- BL702's packaged boot image is 197,648 B. The packager/device physical slot
+  is 1,044,480 B; the product still independently protects its
+  `0x000FE000..0x00100000` security journal and linked XIP limit.
+- EFR32MG1's prior Zigbee OTA container is 162,538 B and assumes the resident
+  Gecko bootloader; it has not been regenerated for the current image.
+- EFR32MG21 has no OTA packaging path.
+- CC2340R5's physical application slot is 516,096 B.
+- ESP32-C6/H2 merged flash images are 434,784 B and 419,632 B respectively.
+  The prior 368,098 B C6 and 352,994 B H2 Zigbee OTA containers
+  have not been regenerated for the current applications. Each OTA slot is
+  2,031,616 B.
+- TLSR8258's physical application boundary is 458,752 B (`0x70000`).
 
 ### Static RAM snapshot
 
-Current `llvm-size` `.data + .bss` values, excluding stack and fragmented
-linker reservations:
+Exact RAM/layout measurements recorded with this snapshot:
 
-| image | static bytes |
-|---|---:|
-| nRF52840 sensor, default | 37,464 |
-| nRF52833 sensor, default | 37,464 |
-| nRF52840 always-on End Device | 4,232 |
-| ESP32-C6 sensor | 52,268 |
-| ESP32-H2 sensor | 51,848 |
-| BL702 sensor | 31,984 |
-| PHY6222 sensor | 4,288 |
-| EFR32MG1 sensor | 14,912 |
-| EFR32MG21 sensor | 17,136 |
-| TLSR8258 sensor | 13,468 |
-| TLSR8258 router | 24,280 |
+| image | `.data` | `.bss` | static total | available/linked stack |
+|---|---:|---:|---:|---:|
+| PHY6222 / PHY6252 | 652 | 4,288 | 4,940 | 54,384 |
+| EFR32MG1 | 260 | 14,720 | 14,980 | 16,760 |
+| EFR32MG21 | 308 | 18,280 | 18,588 | 46,944 |
+| CC2340R5 | 16 | 4,756 | 4,772 | — |
+| ESP32-C6 | 3,008 | 50,344 | 53,352 | — |
+| ESP32-H2 | 2,652 | 50,272 | 52,924 | — |
+| TLSR8258 LOW32K fresh-root SVC stack | — | — | — | 8,448 |
 
-EFR32MG1's application still has exactly `0x7C00` bytes of usable SRAM. Do not
-replace that linker region with a nominal 32 KiB total. Static-section numbers
-are not stack-headroom proof; use each target's linker/layout checker.
+ESP32-H2 initialized data includes 84 B in `.data.wifi`.
+EFR32MG1's application still has exactly `0x7C00` bytes of usable SRAM. Its
+available stack is 376 B above the 16 KiB gate. The TLSR8258 retained
+fresh-root SVC stack is 256 B above its 8 KiB gate. Static-section numbers are
+not runtime high-water proof; use each target's linker/layout checker and
+hardware watermark where available.
 
 ## nRF52840 and nRF52833
 
@@ -116,9 +150,10 @@ non-OTA profiles with `NoOta`. The nRF52840 always-on image is
 `AlwaysOnEndDeviceApp`, so its non-parent MAC never advertises
 `DeviceType::Router`.
 
-Sensor commissioning, reporting, hardware AES, persistence, and reset/resume
-are hardware-proven on nRF52840 and nRF52833. The new always-on End Device
-composition still needs its complete HIL acceptance run.
+Earlier nRF52840/nRF52833 sensor images produced hardware evidence for
+commissioning, reporting, hardware AES, persistence, and reset/resume. The
+exact 2026-09-06 images above have build/layout evidence only. The always-on
+End Device composition still needs its complete HIL acceptance run.
 
 ### UF2 variants
 
@@ -163,10 +198,19 @@ has an active-low status LED. Both use a concrete OTA transport with
 `WithOta`, and OTA events enter the OTA lifecycle before generic
 application handling.
 
-- H2: full v1→v2 download, activation, reboot, and retained commissioned state
-  are hardware-proven.
-- C6: transfer through 18.3% is hardware-proven; complete activation remains
-  open.
+These are real pure-Rust `esp-radio` IEEE 802.15.4 backends, not scaffolds.
+Earlier hardware runs provide narrow path evidence:
+
+- H2: a full v1→v2 download, activation, reboot, and retained commissioned
+  state were demonstrated.
+- C6: commissioning/reporting and transfer through 18.3% were demonstrated;
+  complete activation remains open.
+
+Those runs are not recorded as reruns of the exact 369,248 B and 354,096 B
+images in the current measurement table. The C6 image fits its physical OTA
+slot but fails its independent regression budget. A controlled build before
+the shared OTA deadline fix was already 369,184 B; the fix adds 64 B. Neither
+the budget nor the selected compiler was changed.
 
 ## BL702 XT-ZB1
 
@@ -183,8 +227,10 @@ retains the larger UART diagnostic trace.
 The product owns `0x000FE000..0x00100000` as the two-sector security journal.
 The shared sensor uses `NoStatus`, `NoOta`, `NoUserAction`, and
 `Active`/`Active` waits. Temperature and humidity are synthetic; battery uses
-the GPADC path. Radio commissioning and ZHA interview are hardware-proven.
-Destructive sector erase/program plus reset/resume persistence remains open.
+the GPADC path. Earlier images produced radio commissioning and ZHA interview
+evidence. The exact 189,442 B raw / 197,648 B boot-image pair is build/package
+tested only. Destructive sector erase/program plus reset/resume persistence
+remains open.
 
 ## CC2340R5
 
@@ -193,6 +239,15 @@ CI builds two forms:
 1. a fallback compile with `CC2340_SDK_DIR` unset, which must fail radio
    initialization with `FirmwareUnavailable`;
 2. the release image against the pinned TI SDK commit.
+
+The fallback command used by CI is:
+
+```bash
+cd examples/cc2340-sensor
+env -u CC2340_SDK_DIR \
+  cargo +nightly-2026-03-23 build --release --locked \
+  --target-dir target/fallback
+```
 
 ```bash
 git clone https://github.com/TexasInstruments/simplelink-lowpower-f3-sdk.git
@@ -210,7 +265,8 @@ to RTT diagnostics and the selected lifecycle action/status behavior. The
 product reserves `0x0007E000..0x00080000` for security state and selects
 `Active`/`Active` waits, synthetic/fixed measurements, and software AES.
 Commissioning is not claimed: radio HIL is pending and the entropy backend
-deliberately fails closed.
+deliberately fails closed. The pinned-SDK image is 223,536 B, static RAM is
+4,772 B, and the physical application slot is 516,096 B.
 
 ## PHY6222 / PHY6252
 
@@ -218,10 +274,15 @@ deliberately fails closed.
 cd examples/phy6222-sensor
 cargo +nightly-2026-08-01 build --release --locked
 
-# Layout-only PHY6252 selection; still unverified on hardware.
+# Cross-build the PHY6252 feature image; still unverified on hardware.
 cargo +nightly-2026-08-01 build --release --locked \
   --no-default-features --features phy6252
 ```
+
+The PHY6222 occupied XIP span is 130,624 B against the hard 130,816 B gate.
+The exact PHY6252 feature image occupies 130,464 B against the same hard gate,
+leaving 352 B. Both values are cross-build/layout measurements, not hardware
+proof.
 
 Package the default PHY6222 image exactly as CI does:
 
@@ -263,10 +324,15 @@ python3 tools/verify-layout.py \
   target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor
 ```
 
-EFR32MG1 uses `Active` fast waits and `Retention` slow waits. Commissioning,
-hardware AES, SHT3x and battery reporting, Identify, persistence,
-reset/resume, RTCC wake, and EM2 are hardware-proven. A real OTA image
-install/reboot remains open.
+EFR32MG1 uses `Active` fast waits and `Retention` slow waits. Its exact image
+is 163,236 B; `.data` is 260 B, `.bss` is 14,720 B, and 16,760 B remains for
+the linked stack (376 B above the 16 KiB gate). The prior 162,538 B Zigbee OTA
+container has not been regenerated; it assumes the resident Gecko bootloader.
+Earlier images produced
+hardware evidence for commissioning, hardware AES, SHT3x and battery
+reporting, Identify, persistence, reset/resume, RTCC wake, and EM2. A real OTA
+install/reboot remains open, and the current exact image has no recorded HIL
+rerun.
 
 EFR32MG21 targets BRD4181A on BRD4001A:
 
@@ -278,7 +344,9 @@ EFR32MG21 targets BRD4181A on BRD4001A:
 - persistence: `0x0007C000..0x00080000`
 
 Its `Idle` wait is radio-gated WFE with a 1 kHz SysTick, not EM2. The complete
-MG21 hardware path remains HIL-unverified.
+MG21 hardware path remains HIL-unverified. The current raw image is 202,820 B;
+`.data` is 308 B, `.bss` is 18,280 B, and the linked available stack is
+46,944 B. There is no MG21 OTA packaging path.
 
 ## Telink TLSR8258
 
@@ -314,9 +382,19 @@ Its completion marker is `0x5254600D`; `0xDEADxxxx` indicates failure. A
 compile-time symbol/layout pass is not the HIL completion marker.
 
 The router is `ParentRouterApp + PersistentChildren`. Its product partitions
-are `0x72000..0x74000` for children, `0x74000..0x76000` for security,
+are `0x70000..0x72000` for APS bindings/groups/application keys,
+`0x72000..0x74000` for children, `0x74000..0x76000` for security,
 `0x76000..0x77000` for factory EUI, and `0x77000..0x78000` for factory
 configuration/calibration.
+
+The router measures 433,756 B, exceeding its unchanged 430,080 B (`0x69000`)
+regression gate by 3,676 B. This blocks release. The gate was introduced
+above the earlier 427,776 B R22 image, replacing the pre-R22 356,352 B gate.
+The physical `0x70000` boundary and all journals are unchanged: 24,996 B of
+physical headroom remains, and the gate-to-boundary separation is 28,672 B.
+
+The LOW32K images retain an 8,448 B fresh-root SVC stack, 256 B above the
+8 KiB gate.
 
 ## Documentation
 

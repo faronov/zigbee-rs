@@ -7,16 +7,17 @@ it makes no low-power sleep claim.
 ## Architecture
 
 ```text
-esp-hal + esp-radio + EspMac
-        ↓
-boards/esp32-zigbee-devkit
+environmental OTA profile
         ↓
 products/esp32-zigbee-devkit
         ↓
-this composition root
+boards/esp32-zigbee-devkit
         ↓
-sensor_sed_app::SensorApp
+esp-hal + esp-radio + EspMac
 ```
+
+This uses the real pure-Rust `esp-radio` IEEE 802.15.4 backend, not a
+scaffold. `main.rs` is the composition root.
 
 The root supplies:
 
@@ -58,7 +59,10 @@ cargo +nightly-2026-08-01 run --release --locked -Z build-std=core,alloc
 The configured runner installs the partition table, writes `ota_0`, and clears
 `otadata`. Back up commissioned state before the first layout migration.
 
-Current application image: **354,512 B**.
+Current application image: **368,032 B** against a **368,640 B** regression
+gate. The merged flash image is **433,568 B**, the Zigbee OTA v2 container is
+**368,098 B**, the OTA slot is **2,031,616 B**, and static `.data + .bss` is
+**53,268 B**.
 
 ## OTA image
 
@@ -71,7 +75,8 @@ the appended SHA-256, then writes `otadata` only after the security checkpoint.
 
 ## Validation
 
-Hardware-tested on ESP32-C6:
+The exact current application and package artifacts are
+build/layout/package-tested. Earlier ESP32-C6 images demonstrated:
 
 - hardware AES KAT and secured commissioning/reporting;
 - migration to the crash-safe security journal;
@@ -79,4 +84,5 @@ Hardware-tested on ESP32-C6:
 - transfer progress through 18.3% before intentional cancellation.
 
 Complete C6 verification, activation, reboot into the new version, and retained
-commissioned state remain open.
+commissioned state remain open. The earlier run is not an exact-image rerun of
+the current 368,032 B application image.

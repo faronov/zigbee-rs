@@ -15,7 +15,7 @@ commissioning, polling, or reporting state machine.
 | radio, RNG, ECB, SAADC, TEMP, NVMC | `embassy-nrf` / `zigbee-mac` |
 | LED1 P0.13, Button 1 P0.11, I²C P0.26/P0.27 | `boards/nrf52833-dk` |
 | identity, profile, battery curve, wait policy, linker/storage | `products/nrf52833-sensor` |
-| Zigbee sensor lifecycle | `apps/sensor-sed` |
+| common Zigbee lifecycle | `zigbee-runtime` through `apps/sensor-sed` |
 | startup and resource construction | this example |
 
 The product uses `Idle` for both fast and slow waits and explicitly selects
@@ -39,11 +39,11 @@ probe-rs run --chip nRF52833_xxAA \
 
 Measured images:
 
-| variant | bytes |
-|---|---:|
-| default | 223,400 |
-| BME280 | 230,976 |
-| SHT31 | 227,128 |
+| variant | bytes | regression gate |
+|---|---:|---:|
+| default | 224,464 | 225,280 |
+| BME280 | 231,784 | 245,760 |
+| SHT31 | 228,208 | 241,664 |
 
 ## Storage and security
 
@@ -63,6 +63,7 @@ Measured images:
 
 ## Validation
 
-Commissioning, ZHA interview/reporting, hardware AES, security persistence,
-and reset/resume are hardware-proven. A release build is not a measured
-current or battery-life claim.
+The exact images above are build/layout-tested. Earlier nRF52833 images
+produced commissioning, ZHA interview/reporting, hardware AES, security
+persistence, and reset/resume evidence. A release build is not an exact-image
+HIL rerun or a measured current/battery-life claim.

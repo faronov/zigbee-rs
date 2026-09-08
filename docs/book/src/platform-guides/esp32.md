@@ -6,18 +6,21 @@ implementation, and the platform-independent sleepy-sensor lifecycle.
 ## Layering
 
 ```text
-esp-hal + esp-radio + EspMac
+environmental OTA profile
+        ↓
+products/esp32-zigbee-devkit (identity, policy, partitions, OTA)
         ↓
 boards/esp32-zigbee-devkit (physical flash resource)
         ↓
-products/esp32-zigbee-devkit (profile, policy, partitions, OTA)
-        ↓
-ESP32-C6 or ESP32-H2 composition root
+esp-hal + esp-radio + EspMac
 ```
 
 The example root owns chip startup, radio resources, button/LED/temperature
 adapters, and `block_on`. `SensorApp` owns commissioning, parent polling,
 reporting, persistence checkpoints, and OTA-first event routing.
+
+Both targets use the real pure-Rust `esp-radio` IEEE 802.15.4 backend; these
+are not scaffold radios.
 
 ## Application parts and policy
 
@@ -87,14 +90,22 @@ cargo +nightly-2026-08-01 run --release --locked -Z build-std=core,alloc
 
 Back up commissioned state before the first partition-table migration.
 
-Measured application images:
+Measured images: C6 and H2 refreshed on 2026-09-08:
 
-| image | bytes | static `.data + .bss` |
-|---|---:|---:|
-| ESP32-C6 | 354,512 | 52,268 |
-| ESP32-H2 | 339,568 | 51,848 |
+| image | application | regression gate | merged flash | Zigbee OTA v2 | static `.data + .bss` |
+|---|---:|---:|---:|---:|---:|
+| ESP32-C6 | 369,248 | 368,640 | 434,784 | not regenerated | 53,352 |
+| ESP32-H2 | 354,096 | 356,352 | 419,632 | not regenerated | 52,924 |
 
-The corresponding merged flash images are 420,048 B and 405,104 B.
+Each physical OTA slot is 2,031,616 B.
+The RAM totals include `.data.wifi` (80 B on C6 and 84 B on H2). The prior
+368,098 B C6 and 352,994 B H2 Zigbee OTA containers do not represent the
+current applications.
+The current application/merged artifacts are build/layout-tested; the
+hardware results below are earlier path evidence, not exact-image reruns.
+C6 exceeds its unchanged regression budget by 608 B despite fitting the
+physical slot. Its controlled build before the OTA deadline fix was already
+369,184 B (544 B over budget); the fix adds 64 B.
 
 ## OTA packaging
 
@@ -112,7 +123,7 @@ types, so a server cannot offer one chip's image to the other.
 
 ### ESP32-H2
 
-Hardware-proven on a 4 MiB ESP32-H2 revision 1.2 path:
+An earlier 4 MiB ESP32-H2 revision 1.2 image demonstrated:
 
 - migration to the security journal;
 - secure reset/resume and reporting;
@@ -121,10 +132,13 @@ Hardware-proven on a 4 MiB ESP32-H2 revision 1.2 path:
 - retained IEEE address, PAN, parent, network credentials, and counters.
 
 Fresh factory-reset commissioning and long-duration power behavior remain
-separate gates.
+separate gates. The exact 354,096 B application image above has build/layout
+evidence only.
 
 ### ESP32-C6
 
-Commissioning/reporting and the OTA transfer path are hardware-tested. A
-v1→v2 image reached 18.3% before intentional cancellation. Complete C6
-verification/activation/reboot remains open.
+Earlier C6 hardware runs demonstrated commissioning/reporting and OTA transfer
+to 18.3% before intentional cancellation. Complete C6
+verification/activation/reboot remains open. The exact 369,248 B application
+image above has build/physical-layout evidence only and fails its regression
+size gate.

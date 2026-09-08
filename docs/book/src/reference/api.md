@@ -52,7 +52,14 @@ Reusable always-on End Device, router, and coordinator lifecycle.
 | `AlwaysOnEndDeviceApp` | `EndDevice` | `MacDriver` |
 | `RelayRouterApp` | `RelayRouter` | `NoChildren`, `router` + `ParentMacDriver` |
 | `ParentRouterApp` | `Router` | `PersistentChildren<C>`, `router` + `ParentMacDriver` |
+| `DistributedRouterApp` | `Router` | `PersistentChildren<C>`, provisioned distributed key, `router` + `ParentMacDriver` |
 | `CoordinatorApp` | `Router` | `PersistentChildren<C>`, `router` + `ParentMacDriver` |
+| `TrustCenterCoordinatorApp` | `Router` | Coordinator requirements plus `TrustCenterDeviceStore`, `trust-center` |
+
+Only Telink TLSR8258 and host-only `MockMac` currently implement
+`ParentMacDriver`; Telink advertises router but not coordinator capability.
+Therefore the only current production parent-router composition is Telink,
+while Coordinator/Trust-Center server frontends remain mock-only.
 
 Each frontend provides:
 
@@ -61,6 +68,11 @@ initialize().await?; // finite startup/resume/formation
 let events = step().await?; // finite receive/tick cycle
 run().await;          // infinite wrapper
 ```
+
+`TrustCenterCoordinatorApp::request_network_key_rotation().await` durably
+starts a centralized broadcast or unicast Network-Key update. Subsequent
+finite `step()` calls resume distribution, Switch-Key, local activation, and
+cross-journal cleanup.
 
 `StepEvents` contains at most one incoming event and one tick event. Router
 parts contain status, supervisor, and diagnostics capabilities.
@@ -108,6 +120,28 @@ deferred-reset initialize/step variants, make fitted outputs and application
 state durable, then call `complete_pending_factory_reset_and_recommission()`;
 the ordinary frontend methods still commit resets automatically.
 
+`ZigbeeDevice::rejoin_with_security_store()` applies the persisted R22 policy:
+secured rejoin first, centralized Trust Center fallback only for centralized
+`NodeJoinLinkKeyType` values, and durable current-key/counter commit before
+`Device_annce`.
+
+### Parent lifecycle outcomes
+
+Parent applications expose bounded progress rather than treating queued
+delivery as completion:
+
+| API | meaning |
+|---|---|
+| `zigbee_nwk::ChildPollOutcome::Delivered { kind, .. }` | identifies normal data, a child update, or a Leave delivered by a MAC poll |
+| `zigbee_nwk::LeaveRequestDelivery` | distinguishes direct delivery from a sleepy child's indirect queue |
+| `ChildRemovalOutcome::Pending` | a durable Remove-Device transaction is waiting for indirect Leave delivery |
+| `ChildDepartureOutcome::PendingRemote` | `Update-Device(DeviceLeft)` is waiting for its APS ACK |
+| `ApsLayer::send_update_device_acked()` | starts the ACK-tracked Trust Center notification and returns its `ApsAckHandle` |
+
+Applications that exhaustively match these enums must retain the pending
+states across ticks. Only the completed outcome permits the corresponding
+child-journal transaction to be cleared.
+
 ### Profiles
 
 `zigbee_runtime::profile` contains platform-independent endpoint archetypes,
@@ -115,17 +149,29 @@ including environmental sensors, relay plugs/lights, and `WithOta` composition.
 Profiles own endpoint declarations, cluster composition, reporting defaults,
 and measurement-to-ZCL conversion.
 
+Capacity features are independent of role and protocol behavior.
+`compact-single-endpoint` keeps two application endpoint slots and four
+reporting entries. It is currently selected only by EFR32MG1 and TLSR8258
+sensor/router products after profile-capacity assertions.
+
 ### Persistence
 
 | API | use |
 |---|---|
-| `SecurityStateStore` | abstract load/store/clear of commissioned security state |
-| `SecurityStateJournal<F, SECTOR_SIZE = 4 KiB>` | two-sector crash-safe keys/counter journal |
+| `SecurityStateStore` | commissioned state plus durable incoming replay-floor operations |
+| `SecurityStateJournal<F, SECTOR_SIZE = 4 KiB>` | two-sector crash-safe keys, outgoing reservations, and incoming replay log |
 | `NvStorage` / `LogStructuredNv<F>` | generic non-security items |
 | `ChildTableStore` / `ChildTableJournal<F>` | separate parent child-table persistence |
 
+`application-link-key-installation` is an optional product capability, not an
+automatic property of every End Device or router. The composition must also
+select `PersistentApsTables<A>`; `NoApsTables` leaves incoming application-key
+Transport-Key installation disabled.
+
 The product supplies a bounded flash partition. The board supplies only the
-physical flash resource.
+physical flash resource. Parent/coordinator products must size the logical
+sector for replay-domain count, traffic, and erase endurance; 4 KiB is only the
+compatibility default.
 
 ### OTA
 

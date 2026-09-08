@@ -5,7 +5,7 @@ Zigbee and IEEE 802.15.4 terminology used throughout zigbee-rs.
 | Term | Definition |
 |------|------------|
 | **APS** | Application Support Sub-layer. Provides addressing, binding, group management, and reliable delivery between application endpoints. Implemented in the `zigbee-aps` crate. |
-| **BDB** | Base Device Behavior. Defines standard commissioning procedures (steering, formation, Finding & Binding, Touchlink) that all Zigbee 3.0 devices must support. Implemented in the `zigbee-bdb` crate. |
+| **BDB** | Base Device Behavior. Defines standard commissioning procedures such as steering, formation, Finding & Binding, and optional Touchlink. Required capabilities depend on the logical device role and advertised commissioning support. Implemented in the `zigbee-bdb` crate. |
 | **Binding** | A persistent link in the APS binding table that maps a local cluster to a remote device or group. Bindings enable indirect addressing so an application can send data without knowing the destination address at compile time. |
 | **Channel** | One of the sixteen IEEE 802.15.4 radio channels (11–26) in the 2.4 GHz band. Zigbee PRO primarily uses channels 11, 15, 20, and 25 for network formation. |
 | **Cluster** | A ZCL construct grouping related attributes and commands (e.g. On/Off, Temperature Measurement). Each cluster has a 16-bit ID and is hosted on an endpoint. Defined and parsed in the `zigbee-zcl` crate. |
@@ -41,4 +41,4 @@ Zigbee and IEEE 802.15.4 terminology used throughout zigbee-rs.
 | **ZCL** | Zigbee Cluster Library. Defines the standard set of clusters, attributes, commands, and data types used by Zigbee applications. Implemented in the `zigbee-zcl` crate. |
 | **ZDO** | Zigbee Device Object. The management entity on endpoint 0 that handles device and service discovery, binding, and network management. Implemented in the `zigbee-zdo` crate. |
 | **ZDP** | Zigbee Device Profile. The protocol (request/response commands) used to communicate with the ZDO on a remote device. `ZdpStatus` codes are returned in every ZDP response. |
-| **Zigbee PRO** | The Zigbee PRO feature set (also called Zigbee PRO 2023 in the latest revision). It includes mesh networking, frequency agility, and stochastic addressing. zigbee-rs implements the Zigbee PRO stack. |
+| **Zigbee PRO** | The Zigbee PRO feature set, including mesh networking, frequency agility, and stochastic addressing. This branch targets Zigbee Core R22 (`05-3474-22`); later R23/BDB 3.1 material is future guidance, not the current baseline. |

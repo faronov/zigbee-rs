@@ -6,14 +6,16 @@ LP-EM-CC2340R5 / CC2340R52.
 ## Current architecture
 
 ```text
-CC2340 register/radio mechanisms + MacDriver
-        ↓
-boards/lp-em-cc2340r5
+environmental Sleepy End Device profile
         ↓
 products/cc2340-sensor
         ↓
-this composition root + sensor_sed_app::SensorApp
+boards/lp-em-cc2340r5
+        ↓
+CC2340 register/radio mechanisms + MacDriver
 ```
+
+This example is the composition root.
 
 The board supplies real SysTick time, IOC/GPIO configuration, typed raw
 LED/button resources, reset, identity, and flash:
@@ -59,11 +61,18 @@ CC2340_SDK_DIR=/absolute/path/to/simplelink-lowpower-f3-sdk \
   cargo +nightly-2026-03-23 build --release --locked --target-dir target/sdk
 ```
 
-Pinned-SDK image: **212,688 B**.
+Pinned-SDK image: **223,536 B** against a **225,280 B** regression gate.
+Static RAM is **4,772 B** and the physical application slot is **516,096 B**.
 
 With `CC2340_SDK_DIR` unset, the fallback build compiles but radio
 initialization returns `FirmwareUnavailable`. It is not a flashable radio
 product.
+
+```bash
+env -u CC2340_SDK_DIR \
+  cargo +nightly-2026-03-23 build --release --locked \
+  --target-dir target/fallback
+```
 
 ## Hardware gates
 

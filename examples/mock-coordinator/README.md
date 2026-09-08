@@ -1,6 +1,6 @@
 # Finite mock coordinator
 
-Host demonstration of the typed `router_app::CoordinatorApp`.
+Host demonstration of the typed `router_app::TrustCenterCoordinatorApp`.
 
 The first app instance forms a PAN and persists its coordinator state. The
 second instance uses the same security store and proves that
@@ -8,15 +8,18 @@ second instance uses the same security store and proves that
 Both execute finite `step()` calls.
 
 ```rust,ignore
-let mut app = CoordinatorApp::new(
+let mut app = TrustCenterCoordinatorApp::new(
     node,
     PersistentChildren::new(RamChildTableStore::new()),
+    RamTrustCenterDeviceStore::new(),
     &POLICY,
     RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
 )?;
 ```
 
-Only `CoordinatorApp` can select formation/persisted-PAN restart.
+Only the coordinator frontends can select formation/persisted-PAN restart.
+`TrustCenterCoordinatorApp` additionally owns the durable per-device key
+database and executes authenticated Trust Center commands internally.
 `RelayRouterApp` and `ParentRouterApp` select steering instead.
 
 ## Run

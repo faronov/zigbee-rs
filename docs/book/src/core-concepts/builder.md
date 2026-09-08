@@ -48,11 +48,18 @@ let coordinator = ZigbeeDevice::builder(parent_mac).build_coordinator();
 ```
 
 `build_relay`, `build_router`, and `build_coordinator` do not exist without
-the `router` feature. The terminal method selects the canonical `DeviceType`. A conflicting
-`.device_type(...)` is rejected. `try_build*` returns a typed `BuildError`;
-the convenience `build*` form panics on invalid static composition.
+the `router` feature. The terminal method selects the canonical `DeviceType`.
+A conflicting `.device_type(...)` is rejected. `try_build*` returns a typed
+`BuildError`; the convenience `build*` form panics on invalid static
+composition.
 
 Parent-only APIs are unavailable to end devices and relays.
+
+Only Telink TLSR8258 and host-only `MockMac` implement `ParentMacDriver`.
+Telink advertises router capability but not coordinator capability, so current
+production firmware can build a Telink parent router but no production
+Coordinator/Trust-Center server. `examples/nrf52840-router` uses `build()` and
+`AlwaysOnEndDeviceApp`.
 
 ## Sleepy-end-device polling
 
@@ -144,7 +151,11 @@ app.run().await
 ```
 
 For routers, pair `build_relay` with `RelayRouterApp`, `build_router` with
-`ParentRouterApp`, and `build_coordinator` with `CoordinatorApp`.
+`ParentRouterApp` or `DistributedRouterApp`, and `build_coordinator` with
+`CoordinatorApp`. The distributed frontend additionally requires a provisioned
+distributed-security global key before initialization. These APIs are
+protocol/application implementations; production support additionally
+requires a matching truthful backend and product composition.
 
 See [Architecture](../getting-started/architecture.md) and
 [The Event Loop](event-loop.md).

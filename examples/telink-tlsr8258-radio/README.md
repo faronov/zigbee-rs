@@ -211,8 +211,11 @@ not redundant):
 5. Diagnostic record address (`== 0x0084FE00`) and reserved size (warns if
    `!= 512`, fails if `< 64`).
 6. `.ram_code` fits under the absolute `.text` base (`<= 0x8000`).
-7. Image size: **warns** past the 256 KiB production/OTA slot (`0x40000`),
-   **fails** if it reaches the factory-data region (`0x76000`).
+7. Image size: this diagnostic's local script still emits a legacy warning
+   above `0x40000`, then **fails** at its linked security journal
+   (`0x74000`). The warning is not the current production gate: the R22
+   sensor/router products use explicit regression budgets and a physical
+   application boundary at `0x70000`.
 
 ## Design notes / limitations
 
@@ -222,8 +225,8 @@ not redundant):
   `0x801276`, `0x801277`, `0x800430`) followed by the 28-entry Zigbee-250K
   table. This crate transcribes that faithfully as 6+28
   (`radio::phy::rf_phy_init_zigbee`) with an explicit code comment flagging
-  the discrepancy from the task description's "5+28" — the hardware-proven
-  sensor lab is treated as authoritative.
+  the discrepancy from the task description's "5+28" — the recorded
+  sensor-lab hardware evidence is treated as authoritative for this primitive.
 - **Fully polled test harness:** the IRQ vector remains a bare `bx lr` stub;
   the same mandatory TX-done→RX transition that the SDK performs in its TX
   ISR is performed synchronously in the polled send function. All waits are

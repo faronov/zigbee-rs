@@ -12,7 +12,7 @@ ready-to-flash production image yet.
 Implemented:
 
 - PHY62x2 ROM-compatible SRAM/XIP linker layout;
-- hard 130816-byte XIP application-slot gate;
+- hard 130,816-byte XIP application-slot gate;
 - PHY6 segmented image generator;
 - crash-safe `SecurityStateJournal` persistence;
 - factory-identity guard that rejects the shared fallback address;
@@ -50,8 +50,16 @@ cargo +nightly-2026-08-01 build --release --locked \
   --no-default-features --features phy6252
 ```
 
-PHY6252 remains unverified; selecting the feature only prevents the known
-out-of-range 512 KiB NV addresses.
+The PHY6252 feature-selected image is separately cross-built and
+layout-checked; it remains unverified on hardware. Selecting the feature also
+prevents the known out-of-range 512 KiB NV addresses.
+
+Both PHY62x2 product variants select centralized Trust Center commissioning.
+They do not provision a distributed-security key, so distributed commissioning
+and its post-join permit-opening path are compiled out; a persisted distributed
+network is rejected rather than resumed. The product also has one application
+endpoint, no Groups server, and three default reports, so it selects the shared
+compact endpoint/reporting capacities and omits the unused Groups-to-APS bridge.
 
 ## ROM image layout
 
@@ -106,5 +114,12 @@ identity, battery chemistry, lifecycle policy, profile, and ROM-aware linker
 layout. `boards/phy62x2-evk` owns only fitted wiring, whole-device flash, and
 platform timing. `phy6222-hal` provides exclusive raw peripheral mechanisms.
 
-The current packaged PHY6222 image is **129,556 B**. No AON sleep current or
-battery-life value is claimed.
+Exact occupied-XIP measurements:
+
+| feature image | occupied XIP span | hard gate | headroom |
+|---|---:|---:|---:|
+| PHY6222 | 130,624 | 130,816 | 192 |
+| PHY6252 | 130,464 | 130,816 | 352 |
+
+The packaged PHY6 file includes loader metadata and is not the gate metric. No
+AON sleep current or battery-life value is claimed.

@@ -6,14 +6,20 @@ EFR32MG1P132F256IM32.
 ## Architecture
 
 ```text
-efr32mg1-hal + Efr32Mac
-        ↓
-boards/efr32mg1-tradfri
+environmental OTA profile
         ↓
 products/efr32mg1-tradfri
         ↓
-this root + sensor_sed_app::SensorApp
+boards/efr32mg1-tradfri
+        ↓
+efr32mg1-hal + Efr32Mac
 ```
+
+This example is the composition root.
+
+The product selects `compact-single-endpoint` only after profile assertions
+prove that the two application-endpoint/four-report capacity is sufficient.
+This is a capacity choice, not a Zigbee behavior cut.
 
 The shared app owns commissioning, fast/slow polling, reporting, Identify,
 security checkpoints, and OTA-first event routing. The root owns startup and
@@ -62,7 +68,10 @@ python3 tools/verify-layout.py \
   target/thumbv7em-none-eabi/release/efr32mg1-sensor
 ```
 
-Current raw image: **156,612 B**. Never use a mass erase on this layout.
+Current raw image: **162,396 B** against a **167,936 B** regression gate.
+`.data` is **260 B**, `.bss` is **14,680 B**, static total is **14,940 B**,
+and the linked available stack is **16,800 B**—**416 B** above the 16 KiB
+gate. Never use a mass erase on this layout.
 
 ## OTA
 
@@ -72,11 +81,13 @@ tools/create-ota.sh 2
 
 The product writer stages a GBL through Gecko Bootloader access. `SensorApp`
 checkpoints security before activation. A real Zigbee download/install/reboot
-has not yet completed on hardware.
+has not yet completed on hardware. The current Zigbee OTA container is
+**162,538 B** and assumes the resident Gecko bootloader.
 
 ## Validation
 
-Hardware-proven:
+The exact current image/container are build/layout/package-tested. Earlier
+TRÅDFRI images produced hardware evidence for:
 
 - commissioning, hardware AES, and ZHA interview;
 - SHT3x and battery reporting;

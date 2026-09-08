@@ -13,13 +13,13 @@ power behavior are intentionally separate.
 ### Layering and fitted hardware
 
 ```text
-efr32mg1-hal + Efr32Mac
-        ↓
-boards/efr32mg1-tradfri
+environmental OTA profile
         ↓
 products/efr32mg1-tradfri
         ↓
-examples/efr32mg1-sensor
+boards/efr32mg1-tradfri
+        ↓
+efr32mg1-hal + Efr32Mac
 ```
 
 The typed board resources keep fitted peripherals independently testable:
@@ -39,6 +39,9 @@ board API.
 
 The product owns identity, profile, battery chemistry, sensor mapping, policy,
 linker regions, persistence, and Gecko Bootloader OTA selection.
+It selects the orthogonal `compact-single-endpoint` capacity only after
+profile assertions prove that two application-endpoint slots and four
+reporting entries are sufficient; no Zigbee behavior is removed.
 
 ### Power and lifecycle
 
@@ -62,16 +65,25 @@ The product linker layout preserves bootloader, application, generic NV, and
 security regions. The usable SRAM region is exactly `0x7C00` bytes. It is not
 the nominal rounded 32 KiB total.
 
-Current release measurement:
+Current measurement (2026-09-08):
 
 | value | bytes |
 |---|---:|
-| raw image | 156,612 |
-| static `.data + .bss` | 14,912 |
+| raw image | 163,236 |
+| regression gate | 167,936 |
+| `.data` | 260 |
+| `.bss` | 14,720 |
+| static total | 14,980 |
+| available linked stack | 16,760 |
+
+The stack has 376 B above the 16 KiB gate. The previous 162,538 B Zigbee OTA
+container has not been regenerated for this image. OTA packaging assumes
+the resident Gecko bootloader.
 
 ### Validation
 
-Hardware-proven:
+The exact raw image above is build/layout-tested, not OTA-qualified. Earlier
+TRÅDFRI images produced hardware evidence for:
 
 - commissioning and security;
 - CRYPTO hardware AES;
@@ -105,13 +117,13 @@ pull and routes PD2 through EXTI line 2.
 ### Composition and power
 
 ```text
-efr32mg21-hal + Efr32s2Mac
-        ↓
-boards/efr32mg21-devkit
+environmental non-OTA profile
         ↓
 products/efr32mg21-sensor
         ↓
-examples/efr32mg21-sensor
+boards/efr32mg21-devkit
+        ↓
+efr32mg21-hal + Efr32s2Mac
 ```
 
 The product uses a non-OTA environmental profile, `NoOta`, synthetic
@@ -135,8 +147,14 @@ Current release measurement:
 
 | value | bytes |
 |---|---:|
-| raw image | 203,180 |
-| static `.data + .bss` | 17,136 |
+| raw image | 202,820 |
+| regression gate | 212,992 |
+| `.data` | 308 |
+| `.bss` | 18,280 |
+| static total | 18,588 |
+| available linked stack | 46,944 |
+
+There is no EFR32MG21 OTA packaging path.
 
 ### Build
 

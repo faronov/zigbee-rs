@@ -13,6 +13,10 @@ network.
 > the `zigbee-bdb/touchlink` feature and the application capability bit are
 > both enabled.
 
+The feature name `sleepy-end-device` describes End Device polling and power
+behavior. It does **not** select centralized security. Required centralized
+joining/TCLK handling and distributed-security joining both remain available.
+
 ```text
 ┌──────────────────────────────────────┐
 │  Application                         │
@@ -39,7 +43,7 @@ network.
 |---|---|---|
 | **Network Steering** | Join an existing network (or open it for others) | End Devices, Routers |
 | **Network Formation** | Create a new PAN from scratch | Coordinators |
-| **Finding & Binding** | Automatically create bindings between compatible endpoints | All device types |
+| **Finding & Binding** | Initiator automatically creates bindings between compatible endpoints | Any role whose product enables the full initiator feature |
 | **Touchlink** | Join via physical proximity (Inter-PAN) | Lights, remotes |
 
 Each mode can be enabled or disabled independently through a bitmask:
@@ -164,10 +168,11 @@ capability mask automatically:
 | **End Device** | Steering; optional Finding & Binding / Touchlink |
 
 The requested mode is intersected with the capability mask to produce the
-*effective* commissioning mode. Finding & Binding must be enabled explicitly
-in `node_commissioning_capability`. Touchlink additionally requires the
-off-by-default Cargo feature. If you request Formation on an End Device, it is
-silently skipped.
+*effective* commissioning mode. Finding & Binding initiator behavior must be
+enabled explicitly in `node_commissioning_capability`. Touchlink additionally
+requires the off-by-default Cargo feature. Unsupported bits are removed; if
+no requested method remains, `commission()` returns `NotPermitted` rather than
+reporting success.
 
 ## Initialization
 
@@ -330,10 +335,14 @@ form networks.
 2. Form network on primary channels
    └── NLME-NETWORK-FORMATION (energy scan + selection)
 3. If primary channels fail, try secondary channels
-4. Configure Trust Center policies
-5. Install NWK key
-6. Open permit joining for 180 seconds
+4. Install the fresh NWK key and durably reserve its outgoing counter range
+5. Commit the centralized or distributed security model
+6. Configure Trust Center policies
+7. Open permit joining for 180 seconds
 ```
+
+If either durable commit fails, BDB rolls the provisional PAN back before
+Permit Joining or any other on-network success becomes visible.
 
 ```rust
 // Configure as coordinator
@@ -364,6 +373,11 @@ endpoints on different devices.  It uses the **Identify cluster** (0x0003) to
 discover targets.
 
 There are two roles:
+
+- `finding-binding-target` compiles only the target-side Identify and response
+  plumbing. `apps/sensor-sed` selects this smaller capability.
+- `finding-binding` includes `finding-binding-target` and adds the full
+  initiator state machine described below.
 
 ### Initiator — The Device That Creates Bindings
 
@@ -438,6 +452,9 @@ makes the device respond to Identify Query broadcasts.
 The target's normal APS/ZCL processing handles the Identify Query and
 `Simple_Desc_req`. In group mode it also handles the Groups `Add Group`
 command.
+
+Target support alone does not make the device an F&B initiator and does not
+set the `FINDING_BINDING` commissioning-mode bit.
 
 ## Touchlink
 
@@ -545,9 +562,9 @@ BDB_MIN_COMMISSIONING_TIME // 180
 ```rust
 pub enum NodeJoinLinkKeyType {
     DefaultGlobalTrustCenterLinkKey = 0x00, // "ZigBeeAlliance09"
-    IcDerivedTrustCenterLinkKey    = 0x01, // install code
-    AppTrustCenterLinkKey          = 0x02, // pre-configured
-    TouchlinkPreconfiguredLinkKey  = 0x03, // ZLL key
+    DistributedSecurityGlobalLinkKey = 0x01,
+    InstallCodeDerivedPreconfiguredLinkKey = 0x02,
+    TouchlinkPreconfiguredLinkKey = 0x03,
 }
 ```
 
@@ -705,6 +722,26 @@ stays with the policy layer (`select_rejoin_parents`).
 
 Permit-joining is deliberately *not* required: §3.6.1.4.2 allows rejoin into a
 closed network. It continues to apply to association-based Network Steering.
+
+### Persisted security selection
+
+The shared runtime/application startup path uses the durable
+`node_join_link_key_type` rather than treating every persisted network alike:
+
+1. attempt a secured NWK rejoin with the stored active network key;
+2. if it fails and the persisted type is centralized (`0x00` or `0x02`),
+   attempt an unsecured Trust Center rejoin;
+3. wait for the current network key encrypted under the retained APS Trust
+   Center link key;
+4. reserve and persist the received key, sequence, parent state, Trust Center
+   incoming counter, and outgoing NWK counter range;
+5. only then broadcast `Device_annce` and enable normal application traffic.
+
+Types `0x01` and `0x03` identify distributed security. They never take the
+Trust Center fallback; R22 §4.6.3.3.2 permits that procedure only in a
+centralized security network. A failed key-state commit sends no
+`Device_annce`, keeps the durable rejoin-pending marker, and retries after
+reboot with the old committed state.
 
 ## Complete Example: End Device Commissioning
 

@@ -493,7 +493,7 @@ where
 }
 
 /// Async (embedded-hal-async 1.0) counterpart of the blocking API. See the
-/// crate-root [`super::Bme280`] documentation; register map, calibration
+/// crate-root [`crate::Bme280`] documentation; register map, calibration
 /// parsing and compensation formulas are shared, not duplicated.
 pub mod asynch {
     use embedded_hal_async::i2c::{I2c, SevenBitAddress};

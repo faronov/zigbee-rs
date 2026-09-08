@@ -6,18 +6,17 @@ Pure-Rust TB-04 environmental sleepy end device using the shared
 ## Ownership
 
 ```text
-tlsr8258-hal + TelinkMac + tlsr8258-rt
-        ↓
-boards/tlsr8258-tb04
+environmental Sleepy End Device profile
         ↓
 products/tlsr8258-tb04
         ↓
-this composition/reset root
+boards/tlsr8258-tb04
         ↓
-sensor_sed_app::SensorApp
+tlsr8258-hal + TelinkMac + tlsr8258-rt
 ```
 
-`src/app.rs` assembles borrowed/static TC32 resources and reset-on-wake entry.
+This example is the composition/reset root. `src/app.rs` assembles
+borrowed/static TC32 resources and reset-on-wake entry.
 It does not contain a separate commissioning, polling, reporting, or
 persistence state machine.
 
@@ -76,22 +75,27 @@ Install `tc32-stage2-tc32-45` under
 
 Current images:
 
-| image | bytes |
-|---|---:|
-| default SUSPEND | 279,652 |
-| LOW32K 250 ms | 284,436 |
-| LOW32K 10 s | 284,440 |
+| image | bytes | regression gate |
+|---|---:|---:|
+| default SUSPEND | 290,616 | 294,912 |
+| LOW32K 250 ms | 295,548 | 299,008 |
+| LOW32K 10 s | 295,552 | 299,008 |
+
+The retained fresh-root SVC stack is 8,448 B, 256 B above its 8 KiB gate.
 
 ## Storage
 
 The product security journal is `0x74000..0x76000`. Factory EUI/config remain
-at `0x76000..0x78000`. The sensor does not consume the router child-table
-partition token.
+at `0x76000..0x78000`. The sensor drops the router-only APS-table and
+child-table partition tokens. The product selects the orthogonal
+`compact-single-endpoint` capacity only after asserting that its one endpoint
+and report set fit the two-endpoint/four-report limits.
 
 ## Validation
 
-Hardware evidence exists for the secured TB-04 Zigbee/AES/persistence path and
-the timer SUSPEND primitive. Remaining acceptance includes repeated
+The exact images above are build/layout-tested. Earlier hardware evidence
+exists for the secured TB-04 Zigbee/AES/persistence path and the timer SUSPEND
+primitive. Remaining acceptance includes repeated
 application-level SUSPEND with network/counter checks and measured current,
 plus LOW32K completion using the marker above.
 

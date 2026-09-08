@@ -68,6 +68,8 @@ calling the reset-causing activation method.
 
 - `RelayRouterApp` — forwarding only, `NoChildren`;
 - `ParentRouterApp` — child-capable, `PersistentChildren`;
+- `DistributedRouterApp` — child-capable distributed PAN owner,
+  `PersistentChildren`;
 - `CoordinatorApp` — formation/persisted-PAN restart,
   `PersistentChildren`.
 

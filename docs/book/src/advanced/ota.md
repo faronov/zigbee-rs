@@ -36,6 +36,18 @@ The OTA implementation reports `activation_pending`; it must not reset from
 This keeps a reset-causing bootloader transition behind the durable security
 checkpoint.
 
+An OTA-handled event retains the lifecycle's explicit `keep_awake_ms` window;
+generic commissioning activity must not replace it with a shorter or longer
+deadline. Periodic OTA service uses the same checkpoint/activation path.
+If reading or writing the security checkpoint fails, the application records
+the persistence fault and stops before invoking activation.
+
+The shared sensor host regressions cover both event-driven and service-driven
+activation, failed checkpoint reads and counter-reservation writes, recovery
+with non-reused counters, and OTA windows shorter and longer than the normal
+commissioning window. These use a real `ZigbeeNode` with `MockMac` and an
+instrumented store; they do not qualify a physical flash writer or bootloader.
+
 ## Profile pairing
 
 `NoOta` implements `OtaLifecycle` only for `NonOtaProfile`. A profile owner
@@ -63,8 +75,8 @@ geometry, boot selection, and reset.
 
 | product | staging/activation | status |
 |---|---|---|
-| ESP32-C6 | inactive `ota_0`/`ota_1`, appended SHA-256, redundant `otadata` | transfer hardware-tested through 18.3%; complete activation open |
-| ESP32-H2 | same product writer/layout | full v1→v2 activation/reboot/network retention proven |
+| ESP32-C6 | inactive `ota_0`/`ota_1`, appended SHA-256, redundant `otadata` | prior C6 run reached 18.3%; current exact image has build/layout evidence only |
+| ESP32-H2 | same product writer/layout | prior H2 run demonstrated v1→v2 activation/reboot/network retention; current exact image has build/layout evidence only |
 | EFR32MG1 | Gecko Bootloader storage slot 0 through `BootloaderFlashAccess` | writer implemented; real Zigbee download/install/reboot open |
 | nRF52840/52833 | no writer in current products | `NoOta` |
 | BL702 | no OTA partition/writer | `NoOta`; raw flash validation still open |
@@ -91,7 +103,10 @@ tools/create-ota.py 2
 ```
 
 The build-time version is shared by the Basic cluster and OTA container. C6
-and H2 use distinct image types.
+and H2 use distinct image types. The prior 2026-09-06 containers are
+368,098 B and 352,994 B respectively; these packages are build/package-tested,
+not exact-image HIL reruns, and have not been regenerated for the
+2026-09-08 application images.
 
 ## EFR32MG1 ownership
 
@@ -119,3 +134,6 @@ An OTA path is complete only after hardware proves:
 
 A compiled `FirmwareWriter`, successful transfer fragment, or bootloader API
 call is not by itself complete OTA support.
+
+No current exact 2026-09-06 image is documented as rerunning those hardware
+OTA demonstrations.

@@ -6,14 +6,16 @@ archives.
 ## Composition
 
 ```text
-bl702-hal + Bl702RadioPhy + SoftMacCore
-        ↓
-boards/bl702-xt-zb1
+environmental Sleepy End Device profile
         ↓
 products/bl702-xt-zb1
         ↓
-this root + sensor_sed_app::SensorApp
+boards/bl702-xt-zb1
+        ↓
+bl702-hal + Bl702RadioPhy + SoftMacCore
 ```
+
+This example is the composition root.
 
 The root constructs explicit `SensorSedParts`:
 
@@ -30,7 +32,7 @@ path is claimed.
 
 ## Radio and Zigbee validation
 
-Hardware-proven:
+Earlier XT-ZB1 images produced hardware evidence for:
 
 - cold ACAL/KCAL/ROSCAL/RCCAL;
 - channel selection, CCA/ED, RX, and TX;
@@ -72,11 +74,15 @@ Current production images:
 
 | artifact | bytes |
 |---|---:|
-| raw binary | 182,786 |
-| packaged boot image | 190,992 |
+| raw binary | 189,442 |
+| raw regression gate | 192,512 |
+| raw gate headroom | 3,070 |
+| packaged boot image | 197,648 |
+| packager/device physical slot | 1,044,480 |
 
 The package script verifies BL702 boot magic and explicit 32 MHz XTAL clock
-fields.
+fields. These exact artifacts are build/package/layout-tested; the earlier
+radio evidence is not an exact-image rerun.
 
 ## Flash and monitor
 

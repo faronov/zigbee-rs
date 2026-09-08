@@ -7,14 +7,16 @@ RISC-V products.
 ## Layering
 
 ```text
-tlsr8258-hal + TelinkMac + tlsr8258-rt
-        ↓
-boards/tlsr8258-tb04
+sensor or parent-router product behavior
         ↓
 products/tlsr8258-tb04
         ↓
-sensor or router composition root
+boards/tlsr8258-tb04
+        ↓
+tlsr8258-hal + TelinkMac + tlsr8258-rt
 ```
+
+The sensor/router `main.rs` files are the short composition roots.
 
 The board owns fitted LEDs, flash/ADC resources, and physical wiring. The
 product owns identity, profile, battery/poll behavior, sleep policy,
@@ -100,15 +102,17 @@ security checkpoints, and child-table restore/save/clear.
 The 512 KiB TB-04 product preserves:
 
 ```text
-0x00000..0x72000  application
+0x00000..0x70000  application
+0x70000..0x72000  APS binding/group/application-key journal
 0x72000..0x74000  child-table journal
 0x74000..0x76000  security journal
 0x76000..0x77000  factory EUI-64
 0x77000..0x78000  factory config and ADC calibration
 ```
 
-The sensor drops the child-table token so child persistence code is removed.
-The router consumes both independent journal tokens.
+The sensor keeps only the security token and drops the APS/child tokens, so
+those persistence paths are removed. The router consumes all three independent
+journal tokens.
 
 Flash geometry is verified before factory-data access on non-512-KiB layouts.
 Zbit writes require the ADC/PC5 voltage guard before every page program or
@@ -126,14 +130,24 @@ tools use Rust `1.94.1`.
 ./scripts/tlsr8258.sh build router
 ```
 
-Current images:
+Current images (sensor baseline 2026-09-06; router refreshed 2026-09-07):
 
-| image | bytes |
-|---|---:|
-| default SUSPEND sensor | 279,652 |
-| LOW32K 250 ms proof | 284,436 |
-| LOW32K 10 s proof | 284,440 |
-| parent router | 343,660 |
+| image | bytes | regression gate | headroom |
+|---|---:|---:|---:|
+| default SUSPEND sensor | 290,616 | 294,912 | 4,296 |
+| LOW32K 250 ms proof | 295,548 | 299,008 | 3,460 |
+| LOW32K 10 s proof | 295,552 | 299,008 | 3,456 |
+| parent router | 433,756 | 430,080 | -3,676 |
+
+The retained LOW32K fresh-root SVC stack is 8,448 B, 256 B above its 8 KiB
+gate.
+
+The router's old 356,352 B gate was a pre-R22 baseline. The unchanged
+430,080 B (`0x69000`) gate was introduced above the earlier 427,776 B image.
+The current router exceeds it by 3,676 B, blocking release. Neither the
+physical 458,752 B (`0x70000`) application boundary nor any journal moved.
+The current image has 24,996 B of physical headroom; the gate-to-boundary
+separation remains 28,672 B.
 
 Independent diagnostics remain under `tools/telink-tlsr8258-lab`:
 
@@ -144,7 +158,8 @@ Independent diagnostics remain under `tools/telink-tlsr8258-lab`:
 
 ## Validation
 
-Hardware-proven on TB-04:
+The exact images above are build/layout-tested. Earlier TB-04 images produced
+hardware evidence for:
 
 - hardware AES KAT, secured commissioning, TCLK exchange, ZHA interview, and
   sustained traffic;
