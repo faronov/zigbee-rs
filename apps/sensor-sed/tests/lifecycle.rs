@@ -4,23 +4,20 @@ use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::task::{Wake, Waker};
 
+use sensor_sed_app::SensorLifecycleError;
 use sensor_sed_app::{
     BatterySource, ButtonPolicy, DiagnosticEvent, Diagnostics, EnvironmentReading,
     EnvironmentSource, NoOta, NoStatus, NoUserAction, OtaActivationOutcome, OtaEventOutcome,
-    OtaLifecycle, OtaServiceOutcome, SensorApp, SensorLifecycleError, SensorPolicy, SensorSedParts,
-    SensorStatus, SleepDepth, StatusPolicy, StatusSink, Supervisor, WaitRequest, WakeController,
-    WakeReason,
+    OtaLifecycle, OtaServiceOutcome, SensorApp, SensorPolicy, SensorSedParts, SensorStatus,
+    SleepDepth, StatusPolicy, StatusSink, Supervisor, WaitRequest, WakeController, WakeReason,
 };
-use zigbee_aps::frames::{ApsCommandId, ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader};
-use zigbee_aps::security::{
-    ApsSecurity, ApsSecurityHeader, KEY_ID_DATA_KEY, KEY_ID_KEY_TRANSPORT, SEC_LEVEL_ENC_MIC_32,
-    derive_key_transport_key,
-};
+use zigbee_aps::frames::ApsCommandId;
+use zigbee_aps::frames::{ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader};
+use zigbee_aps::security::{ApsSecurity, ApsSecurityHeader, KEY_ID_DATA_KEY, SEC_LEVEL_ENC_MIC_32};
+use zigbee_aps::security::{KEY_ID_KEY_TRANSPORT, derive_key_transport_key};
 use zigbee_mac::mock::MockMac;
-use zigbee_mac::primitives::{
-    AssociationStatus, MacFrame, MlmeAssociateConfirm, PanDescriptor, SuperframeSpec,
-    ZigbeeBeaconPayload,
-};
+use zigbee_mac::primitives::{AssociationStatus, MlmeAssociateConfirm};
+use zigbee_mac::primitives::{MacFrame, PanDescriptor, SuperframeSpec, ZigbeeBeaconPayload};
 use zigbee_mac::{MacDriver, PlatformServices};
 use zigbee_nwk::frames::{LeaveCommand, NwkCommandId, NwkFrameControl, NwkFrameType, NwkHeader};
 use zigbee_nwk::security::{NwkSecurity, NwkSecurityHeader};
@@ -251,10 +248,17 @@ impl Supervisor for RecordingSupervisor<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointFailure {
+    Load,
+    Store,
+}
+
 struct CountingStore<'a> {
     inner: RamSecurityStateStore,
     store_calls: &'a Cell<u32>,
     load_calls: Option<&'a Cell<u32>>,
+    checkpoint_failure: Option<&'a Cell<Option<CheckpointFailure>>>,
 }
 
 impl<'a> CountingStore<'a> {
@@ -263,6 +267,7 @@ impl<'a> CountingStore<'a> {
             inner: RamSecurityStateStore::new(),
             store_calls,
             load_calls: None,
+            checkpoint_failure: None,
         }
     }
 
@@ -273,6 +278,7 @@ impl<'a> CountingStore<'a> {
             inner,
             store_calls,
             load_calls: None,
+            checkpoint_failure: None,
         }
     }
 
@@ -292,17 +298,44 @@ impl SecurityStateStore for CountingStore<'_> {
         if let Some(load_calls) = self.load_calls {
             load_calls.set(load_calls.get().saturating_add(1));
         }
+        if let Some(failure) = self.checkpoint_failure
+            && failure.get() == Some(CheckpointFailure::Load)
+        {
+            failure.set(None);
+            return Err(SecurityStoreError::Hardware);
+        }
         self.inner.load()
     }
 
     fn store(&mut self, state: &PersistentSecurityState) -> Result<(), SecurityStoreError> {
         self.store_calls
             .set(self.store_calls.get().saturating_add(1));
+        if let Some(failure) = self.checkpoint_failure
+            && failure.get() == Some(CheckpointFailure::Store)
+        {
+            failure.set(None);
+            return Err(SecurityStoreError::Hardware);
+        }
         self.inner.store(state)
+    }
+
+    fn visit_replay_counters(
+        &mut self,
+        visitor: &mut dyn FnMut(zigbee_runtime::security_store::PersistentReplayCounter),
+    ) -> Result<(), SecurityStoreError> {
+        self.inner.visit_replay_counters(visitor)
+    }
+
+    fn commit_replay_counter(
+        &mut self,
+        replay: zigbee_runtime::security_store::PersistentReplayCounter,
+    ) -> Result<(), SecurityStoreError> {
+        self.inner.commit_replay_counter(replay)
     }
 }
 
 struct RecordingOta<'a> {
+    keep_awake_ms: u32,
     seen_raw_command: &'a Cell<bool>,
     activated: &'a Cell<u32>,
     loads_at_handle: &'a Cell<u32>,
@@ -342,7 +375,7 @@ where
             self.seen_raw_command.set(true);
             self.loads_at_handle.set(self.load_calls.get());
             OtaEventOutcome::Handled {
-                keep_awake_ms: Some(25),
+                keep_awake_ms: Some(self.keep_awake_ms),
                 activation_pending: true,
             }
         } else {
@@ -362,6 +395,99 @@ where
         self.checkpoint_before_activation
             .set(self.load_calls.get() > self.loads_at_handle.get());
         self.activated.set(self.activated.get().saturating_add(1));
+        OtaActivationOutcome::Activated
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationTrigger {
+    Event,
+    Service,
+}
+
+struct CheckpointOta<'a> {
+    trigger: ActivationTrigger,
+    failure: Option<CheckpointFailure>,
+    fault: &'a Cell<Option<CheckpointFailure>>,
+    requested: &'a Cell<bool>,
+    activated: &'a Cell<u32>,
+    limit_before: &'a Cell<u32>,
+}
+
+impl CheckpointOta<'_> {
+    fn request<M: MacDriver, S: SecurityStateStore, P: ApplicationProfile>(
+        &self,
+        node: &mut ZigbeeNode<'_, M, S, P>,
+    ) {
+        let nib = node.device_mut().bdb_mut().zdo_mut().nwk_mut().nib_mut();
+        self.limit_before.set(nib.outgoing_frame_counter_limit);
+        nib.outgoing_frame_counter = nib.outgoing_frame_counter_limit - 1;
+        self.fault.set(self.failure);
+        self.requested.set(true);
+    }
+}
+
+impl<M: MacDriver, S: SecurityStateStore, P: ApplicationProfile> OtaLifecycle<M, S, P>
+    for CheckpointOta<'_>
+{
+    const ENABLED: bool = true;
+
+    fn is_active(&self, _profile: &P) -> bool {
+        self.requested.get() && self.activated.get() == 0
+    }
+
+    fn next_deadline_ms(&self, _profile: &P) -> Option<u32> {
+        None
+    }
+
+    async fn handle_event(
+        &mut self,
+        node: &mut ZigbeeNode<'_, M, S, P>,
+        event: &StackEvent,
+    ) -> OtaEventOutcome {
+        if self.trigger == ActivationTrigger::Event
+            && matches!(event, StackEvent::CommandReceived { cluster_id, command_id: 0x77, .. }
+                if *cluster_id == ClusterId::OTA_UPGRADE.0)
+        {
+            self.request(node);
+            OtaEventOutcome::Handled {
+                keep_awake_ms: Some(250),
+                activation_pending: true,
+            }
+        } else {
+            OtaEventOutcome::NotHandled
+        }
+    }
+
+    async fn service(
+        &mut self,
+        node: &mut ZigbeeNode<'_, M, S, P>,
+        _elapsed_secs: u16,
+    ) -> OtaServiceOutcome {
+        if self.trigger == ActivationTrigger::Service && !self.requested.get() {
+            self.request(node);
+            OtaServiceOutcome {
+                keep_awake_ms: Some(250),
+                activation_pending: true,
+            }
+        } else {
+            OtaServiceOutcome::IDLE
+        }
+    }
+
+    fn activate(&mut self, node: &mut ZigbeeNode<'_, M, S, P>) -> OtaActivationOutcome {
+        let persisted = node.load_security_state().unwrap().unwrap();
+        assert!(persisted.global_counter_limit > self.limit_before.get());
+        assert_eq!(
+            persisted.global_counter_limit,
+            node.device()
+                .bdb()
+                .zdo()
+                .nwk()
+                .nib()
+                .outgoing_frame_counter_limit
+        );
+        self.activated.set(self.activated.get() + 1);
         OtaActivationOutcome::Activated
     }
 }
@@ -655,6 +781,23 @@ fn configure_reporting_frame(
     )
 }
 
+fn identify_query_frame(frame_counter: u32) -> MacFrame {
+    let frame_control = ZclFrameHeader::build_frame_control(
+        ZclFrameType::ClusterSpecific,
+        false,
+        ClusterDirection::ClientToServer,
+        false,
+    );
+    zcl_data_frame(
+        ClusterId::IDENTIFY,
+        frame_control,
+        frame_counter as u8,
+        0x01,
+        &[],
+        frame_counter,
+    )
+}
+
 fn basic_reset_request(frame_counter: u32) -> MacFrame {
     let frame_control = ZclFrameHeader::build_frame_control(
         ZclFrameType::ClusterSpecific,
@@ -878,6 +1021,78 @@ fn cold_join_and_one_time_initialization_use_real_node_lifecycle() {
             .iter()
             .any(|event| matches!(event, DiagnosticEvent::FastPollStarted { duration_ms: 100 }))
     );
+}
+
+#[test]
+fn finding_binding_target_applies_identify_time_and_answers_query() {
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let status = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::with_state(commissioned_state(0x02), &store_calls);
+    let mut profile = test_profile();
+    let mut device = test_device(&profile, &BASE_POLICY);
+
+    {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let wake = RecordingWake::new(
+            0,
+            vec![Vec::new(), vec![identify_query_frame(1)]],
+            &waits,
+            &poll_counts,
+            &delay_calls,
+        );
+        let mut app = SensorApp::new(
+            node,
+            &BASE_POLICY,
+            parts(
+                wake,
+                RecordingStatus { events: &status },
+                NoOta,
+                &environment_samples,
+                &battery_samples,
+                &heartbeats,
+                &diagnostics,
+            ),
+        )
+        .expect("construct sensor app");
+
+        assert_eq!(block_on(app.initialize()), Ok(()));
+        assert_eq!(block_on(app.finding_binding_target()), Ok(()));
+        block_on(app.step()).expect("apply IdentifyTime");
+        block_on(app.step()).expect("process Identify Query");
+    }
+
+    assert!(device.is_identifying(1));
+    let record = device
+        .mac()
+        .tx_history()
+        .last()
+        .expect("Identify Query must produce a response");
+    let bytes = record.payload.as_slice();
+    let (_, nwk_len) = NwkHeader::parse(bytes).expect("response NWK header");
+    let (security_header, security_len) =
+        NwkSecurityHeader::parse(&bytes[nwk_len..]).expect("response NWK security header");
+    let aad_len = nwk_len + security_len;
+    let mut aad = [0u8; 64];
+    aad[..aad_len].copy_from_slice(&bytes[..aad_len]);
+    aad[nwk_len] = (aad[nwk_len] & !0x07) | 0x05;
+    let plaintext = NwkSecurity::new()
+        .decrypt(
+            &aad[..aad_len],
+            &bytes[aad_len..],
+            &NETWORK_KEY,
+            &security_header,
+        )
+        .expect("Identify Query response must authenticate");
+    let (aps_header, aps_len) = ApsHeader::parse(&plaintext).expect("response APS header");
+    assert_eq!(aps_header.cluster_id, Some(ClusterId::IDENTIFY.0));
+    assert_eq!(plaintext[aps_len + 2], 0x00);
 }
 
 #[test]
@@ -1246,8 +1461,7 @@ fn secure_rejoin_request_recovers_through_the_mock_parent() {
     )));
 }
 
-#[test]
-fn raw_ota_command_is_handled_before_generic_matching_and_activation_is_checkpointed() {
+fn check_raw_ota_routing(keep_awake_ms: u32) {
     let waits = RefCell::new(Vec::new());
     let poll_counts = RefCell::new(Vec::new());
     let delay_calls = Cell::new(0);
@@ -1277,6 +1491,7 @@ fn raw_ota_command_is_handled_before_generic_matching_and_activation_is_checkpoi
             &delay_calls,
         );
         let ota = RecordingOta {
+            keep_awake_ms,
             seen_raw_command: &seen_raw_command,
             activated: &activated,
             loads_at_handle: &loads_at_handle,
@@ -1299,6 +1514,26 @@ fn raw_ota_command_is_handled_before_generic_matching_and_activation_is_checkpoi
         .unwrap();
         block_on(app.initialize()).unwrap();
         block_on(app.step()).unwrap();
+        for _ in 0..keep_awake_ms.div_ceil(BASE_POLICY.fast_poll_ms) {
+            block_on(app.step()).unwrap();
+        }
+        assert!(
+            waits
+                .borrow()
+                .iter()
+                .all(|wait| wait.sleep_depth == SleepDepth::Active),
+            "generic event handling must not shorten the OTA keep-awake window: {:?}",
+            waits.borrow()
+        );
+        assert_eq!(
+            waits
+                .borrow()
+                .iter()
+                .map(|wait| wait.timeout_ms)
+                .sum::<u32>(),
+            BASE_POLICY.fast_poll_ms + keep_awake_ms
+        );
+        block_on(app.step()).unwrap();
     }
 
     assert!(
@@ -1310,6 +1545,10 @@ fn raw_ota_command_is_handled_before_generic_matching_and_activation_is_checkpoi
     );
     assert_eq!(activated.get(), 1);
     assert!(checkpoint_before_activation.get());
+    assert_eq!(
+        waits.borrow().last().unwrap().sleep_depth,
+        SleepDepth::Retention
+    );
     assert!(!diagnostics.borrow().iter().any(|event| matches!(
         event,
         DiagnosticEvent::UnhandledCommand {
@@ -1318,6 +1557,127 @@ fn raw_ota_command_is_handled_before_generic_matching_and_activation_is_checkpoi
             ..
         } if *cluster_id == ClusterId::OTA_UPGRADE.0
     )));
+}
+
+#[test]
+fn raw_ota_command_is_handled_before_generic_matching_and_activation_is_checkpointed() {
+    for keep_awake_ms in [25, 250] {
+        check_raw_ota_routing(keep_awake_ms);
+    }
+}
+
+fn check_ota_activation_checkpoints(trigger: ActivationTrigger) {
+    for failure in [
+        None,
+        Some(CheckpointFailure::Load),
+        Some(CheckpointFailure::Store),
+    ] {
+        let waits = RefCell::new(Vec::new());
+        let poll_counts = RefCell::new(Vec::new());
+        let delay_calls = Cell::new(0);
+        let environment_samples = Cell::new(0);
+        let battery_samples = Cell::new(0);
+        let heartbeats = Cell::new(0);
+        let diagnostics = RefCell::new(Vec::new());
+        let status = RefCell::new(Vec::new());
+        let store_calls = Cell::new(0);
+        let fault = Cell::new(None);
+        let requested = Cell::new(false);
+        let activated = Cell::new(0);
+        let limit_before = Cell::new(0);
+        let mut store = CountingStore::with_state(commissioned_state(0x02), &store_calls);
+        store.checkpoint_failure = Some(&fault);
+        let mut profile = test_profile();
+        let mut device = test_device(&profile, &BASE_POLICY);
+        {
+            let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+            let batches = if trigger == ActivationTrigger::Event {
+                vec![vec![raw_ota_command(1)]]
+            } else {
+                Vec::new()
+            };
+            let wake = RecordingWake::new(0, batches, &waits, &poll_counts, &delay_calls);
+            let ota = CheckpointOta {
+                trigger,
+                failure,
+                fault: &fault,
+                requested: &requested,
+                activated: &activated,
+                limit_before: &limit_before,
+            };
+            let mut app = SensorApp::new(
+                node,
+                &BASE_POLICY,
+                parts(
+                    wake,
+                    RecordingStatus { events: &status },
+                    ota,
+                    &environment_samples,
+                    &battery_samples,
+                    &heartbeats,
+                    &diagnostics,
+                ),
+            )
+            .unwrap();
+            block_on(app.initialize()).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                block_on(app.step()).unwrap();
+            }));
+            assert!(
+                requested.get(),
+                "{trigger:?}/{failure:?} must reach activation intent"
+            );
+            assert_eq!(fault.get(), None, "the selected fault must actually fire");
+            if failure.is_some() {
+                let panic = result.expect_err("checkpoint failure must stop the lifecycle");
+                assert_eq!(
+                    panic.downcast_ref::<&str>().copied(),
+                    Some("security persistence failure")
+                );
+                assert_eq!(activated.get(), 0);
+                assert!(
+                    diagnostics
+                        .borrow()
+                        .contains(&DiagnosticEvent::SecurityFailure(
+                            SecurityStoreError::Hardware
+                        ))
+                );
+                assert_eq!(status.borrow().last(), Some(&SensorStatus::Fault));
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(activated.get(), 1);
+            }
+        }
+        let persisted = store.load().unwrap().unwrap();
+        assert!(persisted.commissioned);
+        assert_eq!(persisted.network_key, NETWORK_KEY);
+        if failure.is_some() {
+            assert_eq!(persisted.global_counter_limit, limit_before.get());
+            assert_eq!(
+                device.bdb().zdo().nwk().nib().outgoing_frame_counter_limit,
+                limit_before.get(),
+                "a failed checkpoint must not release a new live reservation"
+            );
+        }
+        let mut rebooted = test_device(&profile, &BASE_POLICY);
+        let mut node = ZigbeeNode::new(&mut rebooted, &mut store, &mut profile);
+        block_on(node.start_or_resume()).unwrap();
+        assert!(
+            node.device().bdb().zdo().nwk().nib().outgoing_frame_counter
+                >= persisted.global_counter_limit,
+            "reboot must skip the entire old reservation after {trigger:?}/{failure:?}"
+        );
+    }
+}
+
+#[test]
+fn ota_event_activation_requires_successful_security_checkpoint() {
+    check_ota_activation_checkpoints(ActivationTrigger::Event);
+}
+
+#[test]
+fn ota_service_activation_requires_successful_security_checkpoint() {
+    check_ota_activation_checkpoints(ActivationTrigger::Service);
 }
 
 #[test]

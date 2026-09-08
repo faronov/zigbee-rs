@@ -330,6 +330,49 @@ pub struct MacCapabilities {
     pub tx_power_max: TxPower,
 }
 
+impl MacCapabilities {
+    /// Capabilities for a backend that does **not** implement the sealed
+    /// [`ParentMacDriver`] parent primitives.
+    ///
+    /// [`coordinator`](Self::coordinator) and [`router`](Self::router) are
+    /// forced to `false` because a backend that retains the
+    /// `Unsupported`/`NoData` [`MacDriver`] defaults for
+    /// `mlme_associate_response`, `mlme_beacon_response`,
+    /// `mlme_orphan_response`, `set_indirect_data_pending`,
+    /// `mcps_indirect_data` and `mac_command_event` can neither relay for a
+    /// network nor admit children.
+    ///
+    /// This matters beyond documentation: the runtime activates parent
+    /// servicing on `capabilities().router` / `.coordinator`, and
+    /// `zigbee-bdb` network formation is gated on `.coordinator`. A backend
+    /// that reported `router: true` while keeping the defaults would arm
+    /// parent mode over primitives that can only fail — so the claim is made
+    /// unrepresentable here rather than repeated as a literal in every
+    /// backend.
+    ///
+    /// A backend that gains real parent primitives (and therefore
+    /// `ParentMacDriver`) must stop using this constructor and state its
+    /// capabilities explicitly, which is the point at which the claim is
+    /// reviewed.
+    pub const fn non_parent(
+        max_payload: u16,
+        tx_power_min: TxPower,
+        tx_power_max: TxPower,
+    ) -> Self {
+        Self {
+            coordinator: false,
+            router: false,
+            // Every in-tree backend performs Zigbee CCM* in the portable Rust
+            // stack, so none offloads autonomous MAC-level security. A
+            // backend that genuinely does must not use this constructor.
+            hardware_security: false,
+            max_payload,
+            tx_power_min,
+            tx_power_max,
+        }
+    }
+}
+
 // ── Parent-side capability boundary ─────────────────────────────
 
 /// Capability marker for a MAC backend that genuinely implements the
@@ -357,7 +400,7 @@ pub struct MacCapabilities {
 ///
 /// # Sealed, audited capability assertion — not compiler proof
 ///
-/// `ParentMacDriver` is **sealed**: its supertrait [`sealed::SealedParent`] can
+/// `ParentMacDriver` is **sealed**: its private `SealedParent` supertrait can
 /// only be named inside this crate, so the trait can be implemented **only by
 /// in-tree MAC backends** whose parent primitives have actually been reviewed.
 /// This is deliberately an *audited assertion*, not a mechanical proof — the

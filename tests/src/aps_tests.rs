@@ -516,7 +516,7 @@ fn test_security_add_find_remove_key() {
         key,
         key_type: ApsKeyType::TrustCenterLinkKey,
         outgoing_frame_counter: 0,
-        outgoing_frame_counter_limit: u32::MAX,
+        outgoing_frame_counter_limit: 0x400,
         incoming_frame_counter: 0,
         incoming_frame_counter_valid: false,
     };
@@ -542,7 +542,7 @@ fn test_security_frame_counter_replay_protection() {
         key: [0x22; 16],
         key_type: ApsKeyType::ApplicationLinkKey,
         outgoing_frame_counter: 0,
-        outgoing_frame_counter_limit: u32::MAX,
+        outgoing_frame_counter_limit: 0x400,
         incoming_frame_counter: 0,
         incoming_frame_counter_valid: false,
     };

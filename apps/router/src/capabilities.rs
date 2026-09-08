@@ -11,6 +11,7 @@ pub enum NodeArchetype {
     AlwaysOnEndDevice,
     RelayRouter,
     ParentRouter,
+    DistributedRouter,
     Coordinator,
 }
 

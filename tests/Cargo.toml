@@ -12,7 +12,7 @@ zigbee-aps = { path = "../zigbee-aps" }
 zigbee-zdo = { path = "../zigbee-zdo" }
 zigbee-bdb = { path = "../zigbee-bdb" }
 zigbee-zcl = { path = "../zigbee-zcl" }
-zigbee-runtime = { path = "../zigbee-runtime", features = ["ota"] }
+zigbee-runtime = { path = "../zigbee-runtime", features = ["ota", "router"] }
 zigbee = { path = "../zigbee" }
 heapless = "0.9"
 tokio = { version = "1", features = ["macros", "rt"] }

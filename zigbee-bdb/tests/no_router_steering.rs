@@ -36,3 +36,18 @@ fn no_router_end_device_cannot_open_permit_joining() {
     );
     assert!(bdb.zdo().nwk().mac().tx_history().is_empty());
 }
+
+#[cfg(feature = "end-device")]
+#[test]
+fn end_device_formation_is_explicitly_rejected() {
+    let mac = MockMac::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+    let nwk = NwkLayer::new(mac, DeviceType::EndDevice);
+    let aps = ApsLayer::new(nwk);
+    let zdo = ZdoLayer::new(aps);
+    let mut bdb = BdbLayer::new(zdo);
+
+    assert_eq!(
+        block_on(bdb.network_formation()),
+        Err(BdbStatus::NotPermitted)
+    );
+}

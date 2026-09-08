@@ -6,18 +6,28 @@
 //! restored into a newly commissioned one.
 
 use embedded_storage::nor_flash::NorFlash;
+use heapless::Vec;
 use zigbee_aps::binding::{
     BindingDst, BindingDstMode, BindingEntry, BindingTable, MAX_BINDING_ENTRIES,
 };
 use zigbee_aps::group::{GroupTable, MAX_ENDPOINTS_PER_GROUP, MAX_GROUPS};
+use zigbee_aps::security::{ApsKeyType, ApsLinkKeyEntry, ApsSecurity, MAX_KEY_TABLE_ENTRIES};
 use zigbee_types::IeeeAddress;
 
 const BINDING_ENTRY_LEN: usize = 21;
 const GROUP_ENTRY_MAX_LEN: usize = 3 + MAX_ENDPOINTS_PER_GROUP;
+const APPLICATION_KEY_ENTRY_LEN: usize = 33;
+pub(crate) const APPLICATION_KEY_LOW_WATER: u32 = 32;
+pub(crate) const APPLICATION_KEY_RESERVATION: u32 = 0x400;
 
 /// Largest encoded APS table snapshot for the selected role feature set.
-pub const MAX_ENCODED_APS_TABLES_LEN: usize =
-    8 + 1 + MAX_BINDING_ENTRIES * BINDING_ENTRY_LEN + 1 + MAX_GROUPS * GROUP_ENTRY_MAX_LEN;
+pub const MAX_ENCODED_APS_TABLES_LEN: usize = 8
+    + 1
+    + MAX_BINDING_ENTRIES * BINDING_ENTRY_LEN
+    + 1
+    + MAX_GROUPS * GROUP_ENTRY_MAX_LEN
+    + 1
+    + MAX_KEY_TABLE_ENTRIES * APPLICATION_KEY_ENTRY_LEN;
 
 /// Stable fingerprint of the live APS tables and their Zigbee network.
 ///
@@ -28,6 +38,7 @@ pub fn aps_table_fingerprint(
     extended_pan_id: IeeeAddress,
     bindings: &BindingTable,
     groups: &GroupTable,
+    security: &ApsSecurity,
 ) -> u32 {
     fn update(mut hash: u32, bytes: &[u8]) -> u32 {
         for byte in bytes {
@@ -37,8 +48,20 @@ pub fn aps_table_fingerprint(
         hash
     }
 
-    let mut hash = update(0x811C_9DC5, &[bindings.len() as u8, groups.len() as u8]);
-    if bindings.is_empty() && groups.is_empty() {
+    let application_key_count = security
+        .key_table()
+        .iter()
+        .filter(|entry| entry.key_type == ApsKeyType::ApplicationLinkKey)
+        .count();
+    let mut hash = update(
+        0x811C_9DC5,
+        &[
+            bindings.len() as u8,
+            groups.len() as u8,
+            application_key_count as u8,
+        ],
+    );
+    if bindings.is_empty() && groups.is_empty() && application_key_count == 0 {
         return hash;
     }
     hash = update(hash, &extended_pan_id);
@@ -66,17 +89,37 @@ pub fn aps_table_fingerprint(
         hash = update(hash, &[group.endpoint_list.len() as u8]);
         hash = update(hash, group.endpoint_list.as_slice());
     }
+    for entry in security
+        .key_table()
+        .iter()
+        .filter(|entry| entry.key_type == ApsKeyType::ApplicationLinkKey)
+    {
+        hash = update(hash, &entry.partner_address);
+        hash = update(hash, &entry.key);
+        hash = update(hash, &entry.outgoing_frame_counter_limit.to_le_bytes());
+    }
     hash
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistentApplicationLinkKey {
+    pub partner_address: IeeeAddress,
+    pub key: [u8; 16],
+    pub outgoing_frame_counter_limit: u32,
+    pub incoming_frame_counter: u32,
+    pub incoming_frame_counter_valid: bool,
 }
 
 /// APS table persistence failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApsTableStoreError {
+    PersistenceRequired,
     Corrupt,
     Full,
     Hardware,
     GenerationExhausted,
     ForeignNetwork,
+    CounterExhausted,
 }
 
 /// Network-bound APS binding and group table snapshot.
@@ -85,6 +128,7 @@ pub struct PersistentApsTables {
     extended_pan_id: IeeeAddress,
     bindings: BindingTable,
     groups: GroupTable,
+    application_keys: Vec<PersistentApplicationLinkKey, MAX_KEY_TABLE_ENTRIES>,
 }
 
 impl PersistentApsTables {
@@ -94,6 +138,7 @@ impl PersistentApsTables {
             extended_pan_id,
             bindings: BindingTable::new(),
             groups: GroupTable::new(),
+            application_keys: Vec::new(),
         }
     }
 
@@ -107,7 +152,52 @@ impl PersistentApsTables {
             extended_pan_id,
             bindings: bindings.clone(),
             groups: groups.clone(),
+            application_keys: Vec::new(),
         };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Capture APS tables and reserve finite counter ranges for every
+    /// application link key.
+    pub fn capture_with_security(
+        extended_pan_id: IeeeAddress,
+        bindings: &BindingTable,
+        groups: &GroupTable,
+        security: &ApsSecurity,
+    ) -> Result<Self, ApsTableStoreError> {
+        let mut snapshot = Self::capture(extended_pan_id, bindings, groups)?;
+        for entry in security
+            .key_table()
+            .iter()
+            .filter(|entry| entry.key_type == ApsKeyType::ApplicationLinkKey)
+        {
+            let low = entry
+                .outgoing_frame_counter_limit
+                .saturating_sub(entry.outgoing_frame_counter)
+                <= APPLICATION_KEY_LOW_WATER;
+            let limit = if entry.outgoing_frame_counter >= entry.outgoing_frame_counter_limit || low
+            {
+                let current = entry
+                    .outgoing_frame_counter
+                    .max(entry.outgoing_frame_counter_limit);
+                current
+                    .checked_add(APPLICATION_KEY_RESERVATION)
+                    .ok_or(ApsTableStoreError::CounterExhausted)?
+            } else {
+                entry.outgoing_frame_counter_limit
+            };
+            snapshot
+                .application_keys
+                .push(PersistentApplicationLinkKey {
+                    partner_address: entry.partner_address,
+                    key: entry.key,
+                    outgoing_frame_counter_limit: limit,
+                    incoming_frame_counter: entry.incoming_frame_counter,
+                    incoming_frame_counter_valid: entry.incoming_frame_counter_valid,
+                })
+                .map_err(|_| ApsTableStoreError::Full)?;
+        }
         snapshot.validate()?;
         Ok(snapshot)
     }
@@ -128,12 +218,37 @@ impl PersistentApsTables {
         &self.groups
     }
 
+    pub fn application_keys(&self) -> &[PersistentApplicationLinkKey] {
+        self.application_keys.as_slice()
+    }
+
+    pub(crate) fn application_keys_mut(&mut self) -> &mut [PersistentApplicationLinkKey] {
+        self.application_keys.as_mut_slice()
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.bindings.is_empty() && self.groups.is_empty()
+        self.bindings.is_empty() && self.groups.is_empty() && self.application_keys.is_empty()
     }
 
     pub fn fingerprint(&self) -> u32 {
-        aps_table_fingerprint(self.extended_pan_id, &self.bindings, &self.groups)
+        let mut security = ApsSecurity::new();
+        for stored in &self.application_keys {
+            let _ = security.add_key(ApsLinkKeyEntry {
+                partner_address: stored.partner_address,
+                key: stored.key,
+                key_type: ApsKeyType::ApplicationLinkKey,
+                outgoing_frame_counter: stored.outgoing_frame_counter_limit.saturating_sub(1),
+                outgoing_frame_counter_limit: stored.outgoing_frame_counter_limit,
+                incoming_frame_counter: stored.incoming_frame_counter,
+                incoming_frame_counter_valid: stored.incoming_frame_counter_valid,
+            });
+        }
+        aps_table_fingerprint(
+            self.extended_pan_id,
+            &self.bindings,
+            &self.groups,
+            &security,
+        )
     }
 
     pub fn validate(&self) -> Result<(), ApsTableStoreError> {
@@ -174,6 +289,17 @@ impl PersistentApsTables {
                 }
             }
         }
+        for (index, key) in self.application_keys.iter().enumerate() {
+            if key.partner_address == [0u8; 8]
+                || key.partner_address == [0xFFu8; 8]
+                || key.outgoing_frame_counter_limit == 0
+                || self.application_keys[index + 1..]
+                    .iter()
+                    .any(|other| other.partner_address == key.partner_address)
+            {
+                return Err(ApsTableStoreError::Corrupt);
+            }
+        }
         Ok(())
     }
 
@@ -212,6 +338,18 @@ impl PersistentApsTables {
             offset += 3;
             out[offset..offset + group.endpoint_list.len()].copy_from_slice(&group.endpoint_list);
             offset += group.endpoint_list.len();
+        }
+        out[offset] = self.application_keys.len() as u8;
+        offset += 1;
+        for key in &self.application_keys {
+            out[offset..offset + 8].copy_from_slice(&key.partner_address);
+            out[offset + 8..offset + 24].copy_from_slice(&key.key);
+            out[offset + 24..offset + 28]
+                .copy_from_slice(&key.outgoing_frame_counter_limit.to_le_bytes());
+            out[offset + 28..offset + 32]
+                .copy_from_slice(&key.incoming_frame_counter.to_le_bytes());
+            out[offset + 32] = u8::from(key.incoming_frame_counter_valid);
+            offset += APPLICATION_KEY_ENTRY_LEN;
         }
         offset
     }
@@ -291,6 +429,51 @@ impl PersistentApsTables {
             }
             offset += endpoint_count;
         }
+        // Version-1 snapshots ended after the group table. Treat them as
+        // carrying no application keys.
+        if offset == bytes.len() {
+            snapshot.validate()?;
+            return Ok(snapshot);
+        }
+        let application_key_count =
+            usize::from(*bytes.get(offset).ok_or(ApsTableStoreError::Corrupt)?);
+        offset += 1;
+        if application_key_count > MAX_KEY_TABLE_ENTRIES {
+            return Err(ApsTableStoreError::Corrupt);
+        }
+        for _ in 0..application_key_count {
+            let encoded = bytes
+                .get(offset..offset + APPLICATION_KEY_ENTRY_LEN)
+                .ok_or(ApsTableStoreError::Corrupt)?;
+            if encoded[32] > 1 {
+                return Err(ApsTableStoreError::Corrupt);
+            }
+            let mut partner_address = [0u8; 8];
+            partner_address.copy_from_slice(&encoded[0..8]);
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&encoded[8..24]);
+            snapshot
+                .application_keys
+                .push(PersistentApplicationLinkKey {
+                    partner_address,
+                    key,
+                    outgoing_frame_counter_limit: u32::from_le_bytes([
+                        encoded[24],
+                        encoded[25],
+                        encoded[26],
+                        encoded[27],
+                    ]),
+                    incoming_frame_counter: u32::from_le_bytes([
+                        encoded[28],
+                        encoded[29],
+                        encoded[30],
+                        encoded[31],
+                    ]),
+                    incoming_frame_counter_valid: encoded[32] != 0,
+                })
+                .map_err(|_| ApsTableStoreError::Full)?;
+            offset += APPLICATION_KEY_ENTRY_LEN;
+        }
         if offset != bytes.len() {
             return Err(ApsTableStoreError::Corrupt);
         }
@@ -338,17 +521,21 @@ impl ApsTableStore for RamApsTableStore {
 /// Erase-unit size assumed for each journal sector.
 pub const APS_TABLE_JOURNAL_SECTOR_SIZE: usize = 4096;
 /// Size of one APS-table journal slot.
-pub const APS_TABLE_JOURNAL_SLOT_SIZE: usize = 1024;
+pub const APS_TABLE_JOURNAL_SLOT_SIZE: usize = 2048;
 pub const APS_TABLE_JOURNAL_SLOTS_PER_SECTOR: usize =
     APS_TABLE_JOURNAL_SECTOR_SIZE / APS_TABLE_JOURNAL_SLOT_SIZE;
 
 const RECORD_MAGIC: [u8; 4] = *b"ZBAT";
-const RECORD_VERSION: u8 = 1;
+const RECORD_VERSION: u8 = 2;
 const RECORD_ENCODED_OFFSET: usize = 12;
 const RECORD_CRC_OFFSET: usize = APS_TABLE_JOURNAL_SLOT_SIZE - 12;
 const RECORD_PREFIX_LEN: usize = APS_TABLE_JOURNAL_SLOT_SIZE - 8;
 const RECORD_COMMIT_OFFSET: usize = APS_TABLE_JOURNAL_SLOT_SIZE - 8;
 const RECORD_COMMIT: [u8; 4] = *b"CMIT";
+const LEGACY_SLOT_SIZE: usize = 1024;
+const LEGACY_SLOTS_PER_SECTOR: usize = APS_TABLE_JOURNAL_SECTOR_SIZE / LEGACY_SLOT_SIZE;
+const LEGACY_CRC_OFFSET: usize = LEGACY_SLOT_SIZE - 12;
+const LEGACY_COMMIT_OFFSET: usize = LEGACY_SLOT_SIZE - 8;
 
 const _: () = assert!(RECORD_ENCODED_OFFSET + MAX_ENCODED_APS_TABLES_LEN <= RECORD_CRC_OFFSET);
 
@@ -426,7 +613,7 @@ impl<S: NorFlash> ApsTableJournal<S> {
         record: &[u8; APS_TABLE_JOURNAL_SLOT_SIZE],
     ) -> Option<(u32, PersistentApsTables)> {
         if record[0..4] != RECORD_MAGIC
-            || record[4] != RECORD_VERSION
+            || !matches!(record[4], 1 | RECORD_VERSION)
             || record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4] != RECORD_COMMIT
         {
             return None;
@@ -444,6 +631,34 @@ impl<S: NorFlash> ApsTableJournal<S> {
             record[RECORD_CRC_OFFSET + 3],
         ]);
         if crate::security_journal::crc32(&record[..RECORD_CRC_OFFSET]) != expected_crc {
+            return None;
+        }
+        let generation = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
+        let tables = PersistentApsTables::decode(
+            &record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len],
+        )
+        .ok()?;
+        Some((generation, tables))
+    }
+
+    fn decode_legacy_record(record: &[u8; LEGACY_SLOT_SIZE]) -> Option<(u32, PersistentApsTables)> {
+        if record[0..4] != RECORD_MAGIC
+            || record[4] != 1
+            || record[LEGACY_COMMIT_OFFSET..LEGACY_COMMIT_OFFSET + 4] != RECORD_COMMIT
+        {
+            return None;
+        }
+        let encoded_len = u16::from_le_bytes([record[5], record[6]]) as usize;
+        if RECORD_ENCODED_OFFSET + encoded_len > LEGACY_CRC_OFFSET {
+            return None;
+        }
+        let expected_crc = u32::from_le_bytes([
+            record[LEGACY_CRC_OFFSET],
+            record[LEGACY_CRC_OFFSET + 1],
+            record[LEGACY_CRC_OFFSET + 2],
+            record[LEGACY_CRC_OFFSET + 3],
+        ]);
+        if crate::security_journal::crc32(&record[..LEGACY_CRC_OFFSET]) != expected_crc {
             return None;
         }
         let generation = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
@@ -472,6 +687,32 @@ impl<S: NorFlash> ApsTableJournal<S> {
                         sector,
                         tables,
                     });
+                }
+            }
+        }
+        if LEGACY_SLOT_SIZE.is_multiple_of(S::READ_SIZE) {
+            let mut legacy = [0u8; LEGACY_SLOT_SIZE];
+            for sector in 0..2 {
+                for slot in 0..LEGACY_SLOTS_PER_SECTOR {
+                    self.storage
+                        .read(
+                            self.sectors[sector] + (slot * LEGACY_SLOT_SIZE) as u32,
+                            &mut legacy,
+                        )
+                        .map_err(|_| ApsTableStoreError::Hardware)?;
+                    let Some((generation, tables)) = Self::decode_legacy_record(&legacy) else {
+                        continue;
+                    };
+                    if newest
+                        .as_ref()
+                        .is_none_or(|current| generation > current.generation)
+                    {
+                        newest = Some(LocatedTables {
+                            generation,
+                            sector,
+                            tables,
+                        });
+                    }
                 }
             }
         }
@@ -741,6 +982,36 @@ mod tests {
         let flash = journal.into_storage();
         let mut reopened = ApsTableJournal::new(flash, 0, APS_TABLE_JOURNAL_SECTOR_SIZE as u32);
         assert_eq!(reopened.load(), Ok(Some(expected)));
+    }
+
+    #[test]
+    fn journal_migrates_version_one_1024_byte_slots() {
+        let expected = snapshot();
+        let mut encoded = [0u8; MAX_ENCODED_APS_TABLES_LEN];
+        let current_len = expected.encode(&mut encoded);
+        let legacy_len = current_len - 1;
+        let mut record = [0xFFu8; LEGACY_SLOT_SIZE];
+        record[0..4].copy_from_slice(&RECORD_MAGIC);
+        record[4] = 1;
+        record[5..7].copy_from_slice(&(legacy_len as u16).to_le_bytes());
+        record[8..12].copy_from_slice(&7u32.to_le_bytes());
+        record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + legacy_len]
+            .copy_from_slice(&encoded[..legacy_len]);
+        let crc = crate::security_journal::crc32(&record[..LEGACY_CRC_OFFSET]);
+        record[LEGACY_CRC_OFFSET..LEGACY_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        record[LEGACY_COMMIT_OFFSET..LEGACY_COMMIT_OFFSET + 4].copy_from_slice(&RECORD_COMMIT);
+
+        let mut flash = MockFlash::new();
+        flash.bytes[..LEGACY_SLOT_SIZE].copy_from_slice(&record);
+        let mut journal = ApsTableJournal::new(flash, 0, APS_TABLE_JOURNAL_SECTOR_SIZE as u32);
+        assert_eq!(journal.load(), Ok(Some(expected.clone())));
+
+        let mut replacement = expected;
+        assert!(replacement.groups.add_group(0x4567, 1));
+        journal.store(&replacement).unwrap();
+        let flash = journal.into_storage();
+        let mut reopened = ApsTableJournal::new(flash, 0, APS_TABLE_JOURNAL_SECTOR_SIZE as u32);
+        assert_eq!(reopened.load(), Ok(Some(replacement)));
     }
 
     #[test]

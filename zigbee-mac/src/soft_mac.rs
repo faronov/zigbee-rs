@@ -200,7 +200,7 @@ impl<P: RadioPhy> SoftMacCore<P> {
     }
 }
 
-/// A [`SoftMacCore`] is a [`ForwardAesProvider`] by delegating to its phy,
+/// A [`SoftMacCore`] is a [`zigbee_crypto::ForwardAesProvider`] by delegating to its phy,
 /// so a platform whose `RadioPhy` overrides `forward_cipher` with a
 /// hardware AES backend (e.g. the BL702 phy under `hardware-aes-bl702`)
 /// serves CCM*/AES-MMO from hardware, while every phy that keeps the

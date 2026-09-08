@@ -770,19 +770,13 @@ fn upsert_pan_descriptor(descriptors: &mut PanDescriptorList, mut descriptor: Pa
 /// - `pan_id` must not be the broadcast PAN ID `0xFFFF`.
 #[cfg(any(target_arch = "tc32", test))]
 pub(crate) fn validate_router_start(req: &MlmeStartRequest) -> Result<(), MacError> {
-    if req.pan_coordinator {
-        return Err(MacError::Unsupported);
-    }
-    if req.beacon_order != 15 || req.superframe_order != 15 {
-        return Err(MacError::Unsupported);
-    }
-    if !(11..=26).contains(&req.channel) {
-        return Err(MacError::InvalidParameter);
-    }
-    if req.pan_id.0 == 0xFFFF {
-        return Err(MacError::InvalidParameter);
-    }
-    Ok(())
+    // The rules above are not Telink-specific: they describe the only
+    // MLME-START shape a Zigbee non-beacon router may accept. They now live in
+    // `crate::primitives` so every backend — and every future parent backend
+    // added by the radio bring-up gates — validates identically against one
+    // host-tested implementation. This wrapper is retained so the Telink
+    // module keeps its own regression tests and local call site.
+    crate::primitives::validate_router_start(req)
 }
 
 /// Classification of one frame surfaced inside a MAC ACK wait window.

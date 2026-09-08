@@ -228,6 +228,17 @@ impl Default for ApsSecurityHandshakeStats {
     }
 }
 
+/// Link-key regime that authenticated the initial Network-Key Transport-Key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkKeyJoinMethod {
+    /// Centralized network using the configured precommissioned global key.
+    CentralizedPreconfiguredGlobal,
+    /// Centralized network using a partner-specific preconfigured key entry.
+    CentralizedKeyPair,
+    /// Distributed network using the distributed-security global key.
+    DistributedSecurityGlobal,
+}
+
 // ── TX Options ──────────────────────────────────────────────────
 
 /// APSDE-DATA.request TX options bitfield.
@@ -274,13 +285,48 @@ pub struct ApsRetransmission {
     pub frame: heapless::Vec<u8, 128>,
 }
 
+/// Stable identity of one acknowledged APS unicast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApsAckHandle {
+    dst_addr: u16,
+    generation: u16,
+    aps_counter: u8,
+}
+
+impl ApsAckHandle {
+    const fn new(dst_addr: u16, aps_counter: u8, generation: u16) -> Self {
+        Self {
+            dst_addr,
+            generation,
+            aps_counter,
+        }
+    }
+
+    pub const fn destination(self) -> zigbee_types::ShortAddress {
+        zigbee_types::ShortAddress(self.dst_addr)
+    }
+
+    pub const fn aps_counter(self) -> u8 {
+        self.aps_counter
+    }
+}
+
+/// Current delivery state of an acknowledged APS unicast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApsAckStatus {
+    Pending,
+    Confirmed,
+}
+
 /// APS Tunnel command awaiting hop-by-hop delivery to a joining child.
+#[cfg(any(feature = "router", test))]
 #[derive(Debug, Clone)]
 pub struct PendingApsTunnel {
     pub destination: zigbee_types::IeeeAddress,
     frame: heapless::Vec<u8, 128>,
 }
 
+#[cfg(any(feature = "router", test))]
 impl PendingApsTunnel {
     pub fn frame(&self) -> &[u8] {
         self.frame.as_slice()
@@ -339,6 +385,9 @@ impl ApsDuplicateEntry {
 struct PendingApsAckEntry {
     /// Whether this slot is in use
     active: bool,
+    /// Monotonic in-RAM identity that prevents a stale handle from matching a
+    /// later transaction which reused the same destination and APS counter.
+    generation: u16,
     /// APS counter of the sent frame
     aps_counter: u8,
     /// Destination short address
@@ -367,7 +416,10 @@ struct PendingApsAckEntry {
     security: Option<PendingApsSecurity>,
 }
 
-/// Everything needed to re-secure an APS retransmission.
+/// Everything needed to re-secure an APS data retransmission.
+///
+/// Only APSDE data registers this context, using `APS_DEFAULT_EXT_NONCE`.
+/// R22 security commands never enter the retransmission table.
 ///
 /// R22 §4.4.1.1 derives the CCM* nonce from (source address, frame counter,
 /// security control) and requires a frame counter never to be reused with the
@@ -385,10 +437,18 @@ struct PendingApsSecurity {
     origin: security::ApsKeyOrigin,
     /// Local IEEE address that forms the CCM* nonce source address.
     src_ieee: zigbee_types::IeeeAddress,
-    /// Security control byte of the original auxiliary header.
-    security_control: u8,
     /// Length of the APS header prefix inside `original_frame`.
     header_len: u8,
+}
+
+/// Accepted parent Network-Key forwarding change awaiting a durable snapshot.
+#[cfg(feature = "router")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkKeyForwardingIntent {
+    /// A later standard/high-security Network-Key transport superseded fanout.
+    Stop,
+    /// A standard Network-Key descriptor with an all-zero destination.
+    Forward(u8),
 }
 
 /// The APS layer — owns the NWK layer and all APS state.
@@ -411,14 +471,44 @@ pub struct ApsLayer<M: MacDriver> {
     /// Pending APS ACK to send after processing incoming frame
     pending_aps_ack: Option<PendingApsAck>,
     /// Pending APS Tunnel payload to forward without NWK security.
+    #[cfg(any(feature = "router", test))]
     pending_tunnel: Option<PendingApsTunnel>,
+    /// Protection that authenticated the most recently installed initial NWK key.
+    network_key_join_method: Option<NetworkKeyJoinMethod>,
     /// Parsed Trust Center / parent security command for the runtime.
     #[cfg(feature = "router")]
     pending_security_indication: Option<apsme::ApsmeSecurityIndication>,
+    /// Its durable upper-layer mutation has not completed yet.
+    #[cfg(feature = "router")]
+    pending_security_indication_persistence: bool,
+    /// APS replay floor held until that upper-layer mutation is durable.
+    #[cfg(feature = "router")]
+    pending_security_indication_replay: Option<security::ApsReplayCounter>,
+    /// Authenticated Trust Center Remove-Device targeted at this device.
+    pending_local_remove_device: bool,
+    /// Whether Transport-Key may install an application link key.
+    application_link_key_installation_enabled: bool,
+    /// Whether a Network Transport-Key must wait for an external security
+    /// snapshot before its replay floor becomes live.
+    network_key_persistence_enabled: bool,
+    /// A newly installed network key awaits that durable snapshot.
+    pending_network_key_persistence: bool,
+    /// Replay floor held until the network key snapshot is durable.
+    pending_network_key_replay: Option<security::ApsReplayCounter>,
+    #[cfg(feature = "router")]
+    network_key_forwarding_intent: Option<NetworkKeyForwardingIntent>,
+    /// A newly installed application link key awaits durable APS-table storage.
+    pending_application_key_persistence: bool,
+    /// Replay floor held until the corresponding application key is durable.
+    pending_application_key_replay: Option<security::ApsReplayCounter>,
     /// APS duplicate rejection table
     dup_table: [ApsDuplicateEntry; APS_DUP_TABLE_SIZE],
     /// Outbound APS ACK tracking (frames awaiting ACK confirmation)
     ack_table: heapless::Vec<PendingApsAckEntry, APS_ACK_TABLE_SIZE>,
+    /// Recently confirmed handles retained for durable upper-layer delivery.
+    ack_completions: heapless::Vec<ApsAckHandle, APS_ACK_TABLE_SIZE>,
+    /// Identity assigned to the next acknowledged outbound transaction.
+    next_ack_generation: u16,
     /// Fragment reassembly buffer for incoming fragmented frames
     fragment_rx: fragment::FragmentReassembly,
 }
@@ -436,11 +526,28 @@ impl<M: MacDriver> ApsLayer<M> {
             aps_counter: 0,
             security_handshake_stats: ApsSecurityHandshakeStats::default(),
             pending_aps_ack: None,
+            #[cfg(any(feature = "router", test))]
             pending_tunnel: None,
+            network_key_join_method: None,
             #[cfg(feature = "router")]
             pending_security_indication: None,
+            #[cfg(feature = "router")]
+            pending_security_indication_persistence: false,
+            #[cfg(feature = "router")]
+            pending_security_indication_replay: None,
+            pending_local_remove_device: false,
+            application_link_key_installation_enabled: false,
+            network_key_persistence_enabled: false,
+            pending_network_key_persistence: false,
+            pending_network_key_replay: None,
+            #[cfg(feature = "router")]
+            network_key_forwarding_intent: None,
+            pending_application_key_persistence: false,
+            pending_application_key_replay: None,
             dup_table: [ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE],
             ack_table: heapless::Vec::new(),
+            ack_completions: heapless::Vec::new(),
+            next_ack_generation: 1,
             fragment_rx: fragment::FragmentReassembly::new(),
         }
     }
@@ -461,12 +568,29 @@ impl<M: MacDriver> ApsLayer<M> {
             core::ptr::addr_of_mut!((*slot).security_handshake_stats)
                 .write(ApsSecurityHandshakeStats::default());
             core::ptr::addr_of_mut!((*slot).pending_aps_ack).write(None);
+            #[cfg(any(feature = "router", test))]
             core::ptr::addr_of_mut!((*slot).pending_tunnel).write(None);
+            core::ptr::addr_of_mut!((*slot).network_key_join_method).write(None);
             #[cfg(feature = "router")]
             core::ptr::addr_of_mut!((*slot).pending_security_indication).write(None);
+            #[cfg(feature = "router")]
+            core::ptr::addr_of_mut!((*slot).pending_security_indication_persistence).write(false);
+            #[cfg(feature = "router")]
+            core::ptr::addr_of_mut!((*slot).pending_security_indication_replay).write(None);
+            core::ptr::addr_of_mut!((*slot).pending_local_remove_device).write(false);
+            core::ptr::addr_of_mut!((*slot).application_link_key_installation_enabled).write(false);
+            core::ptr::addr_of_mut!((*slot).network_key_persistence_enabled).write(false);
+            core::ptr::addr_of_mut!((*slot).pending_network_key_persistence).write(false);
+            core::ptr::addr_of_mut!((*slot).pending_network_key_replay).write(None);
+            #[cfg(feature = "router")]
+            core::ptr::addr_of_mut!((*slot).network_key_forwarding_intent).write(None);
+            core::ptr::addr_of_mut!((*slot).pending_application_key_persistence).write(false);
+            core::ptr::addr_of_mut!((*slot).pending_application_key_replay).write(None);
             core::ptr::addr_of_mut!((*slot).dup_table)
                 .write([ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE]);
             core::ptr::addr_of_mut!((*slot).ack_table).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*slot).ack_completions).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*slot).next_ack_generation).write(1);
             core::ptr::addr_of_mut!((*slot).fragment_rx).write(fragment::FragmentReassembly::new());
         }
     }
@@ -480,6 +604,100 @@ impl<M: MacDriver> ApsLayer<M> {
 
     pub fn security_handshake_stats(&self) -> ApsSecurityHandshakeStats {
         self.security_handshake_stats
+    }
+
+    /// Take the link-key regime recorded by the initial Network-Key transport.
+    pub fn take_network_key_join_method(&mut self) -> Option<NetworkKeyJoinMethod> {
+        self.network_key_join_method.take()
+    }
+
+    /// Take an authenticated Remove-Device command addressed to this node.
+    pub fn take_local_remove_device(&mut self) -> bool {
+        core::mem::take(&mut self.pending_local_remove_device)
+    }
+
+    /// Enable or disable application-link-key installation by Transport-Key.
+    ///
+    /// It is disabled by default. A composition root enables it only when it
+    /// owns durable APS key-table storage.
+    pub fn set_application_link_key_installation_enabled(&mut self, enabled: bool) {
+        self.application_link_key_installation_enabled = enabled;
+    }
+
+    pub fn set_network_key_persistence_enabled(&mut self, enabled: bool) {
+        self.network_key_persistence_enabled = enabled;
+        if !enabled {
+            self.pending_network_key_persistence = false;
+            self.pending_network_key_replay = None;
+        }
+    }
+
+    pub const fn network_key_persistence_pending(&self) -> bool {
+        self.pending_network_key_persistence
+    }
+
+    pub const fn pending_network_key_replay(&self) -> Option<security::ApsReplayCounter> {
+        self.pending_network_key_replay
+    }
+
+    /// Inspect a received forwarding change without authorizing transmission.
+    #[cfg(feature = "router")]
+    pub const fn network_key_forwarding_intent(&self) -> Option<NetworkKeyForwardingIntent> {
+        self.network_key_forwarding_intent
+    }
+
+    /// Request TC-local fanout of its staged zero-destination update.
+    ///
+    /// The runtime must checkpoint this intent with the key before sending.
+    #[cfg(feature = "router")]
+    pub fn request_network_key_forwarding(&mut self, sequence: u8) -> Result<(), ApsStatus> {
+        if self.nwk.device_type() != zigbee_nwk::DeviceType::Coordinator
+            || self.aib.aps_trust_center_address != self.nwk.nib().ieee_address
+            || self
+                .nwk
+                .security()
+                .staged_key()
+                .is_none_or(|key| key.seq_number != sequence)
+        {
+            return Err(ApsStatus::InvalidParameter);
+        }
+        self.network_key_forwarding_intent = Some(NetworkKeyForwardingIntent::Forward(sequence));
+        Ok(())
+    }
+
+    /// Complete only after the key and forwarding intent are durably stored.
+    #[cfg(feature = "router")]
+    pub fn complete_network_key_forwarding_checkpoint(&mut self) {
+        self.network_key_forwarding_intent = None;
+    }
+
+    pub fn complete_network_key_persistence(&mut self) {
+        if let Some(replay) = self.pending_network_key_replay.take() {
+            self.security.commit_replay_counter(replay);
+        }
+        self.pending_network_key_persistence = false;
+        self.network_key_persistence_enabled = false;
+    }
+
+    pub fn abort_network_key_persistence(&mut self) {
+        self.pending_network_key_persistence = false;
+        self.pending_network_key_replay = None;
+        self.network_key_persistence_enabled = false;
+    }
+
+    pub const fn application_key_persistence_pending(&self) -> bool {
+        self.pending_application_key_persistence
+    }
+
+    pub const fn pending_application_key_replay(&self) -> Option<security::ApsReplayCounter> {
+        self.pending_application_key_replay
+    }
+
+    pub fn complete_application_key_persistence(&mut self) {
+        if let Some(replay) = self.pending_application_key_replay.take() {
+            self.security.commit_replay_counter(replay);
+        }
+        self.pending_application_key_persistence = false;
     }
 
     /// Check if an APS frame is a duplicate. Returns true if duplicate.
@@ -573,12 +791,18 @@ impl<M: MacDriver> ApsLayer<M> {
         frame_bytes: &[u8],
         security: Option<PendingApsSecurity>,
     ) -> Option<usize> {
+        let generation = self.next_ack_generation;
+        self.next_ack_generation = self.next_ack_generation.wrapping_add(1);
+        if self.next_ack_generation == 0 {
+            self.next_ack_generation = 1;
+        }
         let now = self.nwk.mac().monotonic_micros();
         // Try to find an inactive slot to reuse
         for (i, entry) in self.ack_table.iter_mut().enumerate() {
             if !entry.active {
                 *entry = PendingApsAckEntry {
                     active: true,
+                    generation,
                     aps_counter,
                     dst_addr,
                     confirmed: false,
@@ -595,6 +819,7 @@ impl<M: MacDriver> ApsLayer<M> {
         let idx = self.ack_table.len();
         let mut new_entry = PendingApsAckEntry {
             active: true,
+            generation,
             aps_counter,
             dst_addr,
             confirmed: false,
@@ -637,6 +862,7 @@ impl<M: MacDriver> ApsLayer<M> {
         let entry = &mut self.ack_table[idx];
         *entry = PendingApsAckEntry {
             active: true,
+            generation,
             aps_counter,
             dst_addr,
             confirmed: false,
@@ -649,6 +875,14 @@ impl<M: MacDriver> ApsLayer<M> {
         Some(idx)
     }
 
+    #[cfg(all(test, feature = "router"))]
+    pub(crate) fn ack_handle(&self, dst_addr: u16, aps_counter: u8) -> Option<ApsAckHandle> {
+        self.ack_table.iter().find_map(|entry| {
+            (entry.active && entry.aps_counter == aps_counter && entry.dst_addr == dst_addr)
+                .then_some(ApsAckHandle::new(dst_addr, aps_counter, entry.generation))
+        })
+    }
+
     /// Deliver an incoming APS ACK. Returns true if matched a pending request.
     pub fn confirm_ack(&mut self, src_addr: u16, aps_counter: u8) -> bool {
         for entry in self.ack_table.iter_mut() {
@@ -658,6 +892,15 @@ impl<M: MacDriver> ApsLayer<M> {
                 && !entry.confirmed
             {
                 entry.confirmed = true;
+                let handle = ApsAckHandle::new(src_addr, aps_counter, entry.generation);
+                if !self.ack_completions.contains(&handle) {
+                    if self.ack_completions.is_full() {
+                        self.ack_completions.remove(0);
+                    }
+                    self.ack_completions
+                        .push(handle)
+                        .expect("completion capacity checked above");
+                }
                 log::debug!(
                     "[APS] ACK confirmed counter={} from 0x{:04X}",
                     aps_counter,
@@ -667,6 +910,56 @@ impl<M: MacDriver> ApsLayer<M> {
             }
         }
         false
+    }
+
+    /// Observe an acknowledged unicast without consuming its delivery result.
+    pub fn ack_status(&self, handle: ApsAckHandle) -> Option<ApsAckStatus> {
+        if self.ack_completions.contains(&handle) {
+            return Some(ApsAckStatus::Confirmed);
+        }
+        self.ack_table.iter().find_map(|entry| {
+            (entry.active
+                && entry.generation == handle.generation
+                && entry.aps_counter == handle.aps_counter
+                && entry.dst_addr == handle.dst_addr)
+                .then_some(if entry.confirmed {
+                    ApsAckStatus::Confirmed
+                } else {
+                    ApsAckStatus::Pending
+                })
+        })
+    }
+
+    /// Release ACK tracking after an upper-layer durable transaction records
+    /// the delivery outcome.
+    pub fn clear_ack_status(&mut self, handle: ApsAckHandle) {
+        if let Some(index) = self
+            .ack_completions
+            .iter()
+            .position(|completed| *completed == handle)
+        {
+            self.ack_completions.swap_remove(index);
+        }
+        if let Some(entry) = self.ack_table.iter_mut().find(|entry| {
+            entry.active
+                && entry.generation == handle.generation
+                && entry.aps_counter == handle.aps_counter
+                && entry.dst_addr == handle.dst_addr
+        }) {
+            entry.active = false;
+            entry.original_frame.clear();
+        }
+    }
+
+    /// Cancel every outbound ACK transaction and invalidate all outstanding
+    /// handles. The generation counter deliberately continues across resets,
+    /// so a later reuse of the same APS counter cannot match an old handle.
+    pub fn cancel_all_ack_tracking(&mut self) {
+        for entry in &mut self.ack_table {
+            entry.active = false;
+            entry.original_frame.clear();
+        }
+        self.ack_completions.clear();
     }
 
     /// Check if a specific APS counter has been ACK'd. Clears the slot if confirmed.

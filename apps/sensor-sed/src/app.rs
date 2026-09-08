@@ -80,6 +80,12 @@ pub enum SensorLifecycleError {
     NotInitialized,
 }
 
+/// Starting BDB Finding & Binding target mode was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingBindingTargetError {
+    Rejected,
+}
+
 pub struct SensorApp<'a, M, S, P, R>
 where
     M: MacDriver,
@@ -180,6 +186,25 @@ where
 
     fn fast_poll_active(&self) -> bool {
         self.elapsed_ms(self.fast_poll_started) < self.fast_poll_duration_ms
+    }
+
+    /// Start Finding & Binding target mode on this sensor endpoint.
+    ///
+    /// The BDB layer requests `IdentifyTime =
+    /// bdbcMinCommissioningTime`; the runtime applies it on its next tick and
+    /// handles Identify Query requests during that interval.
+    pub async fn finding_binding_target(&mut self) -> Result<(), FindingBindingTargetError> {
+        let result = self
+            .node
+            .device_mut()
+            .bdb_mut()
+            .finding_binding_target(self.endpoint)
+            .await;
+        if result.is_err() {
+            return Err(FindingBindingTargetError::Rejected);
+        }
+        self.start_fast_poll(self.policy.fresh_join_fast_ms);
+        Ok(())
     }
 
     #[inline(never)]
@@ -528,7 +553,7 @@ where
         };
     }
 
-    fn apply_ota_outcome(&mut self, keep_awake_ms: Option<u32>, activation_pending: bool) -> bool {
+    fn apply_ota_outcome(&mut self, keep_awake_ms: Option<u32>, activation_pending: bool) {
         self.resources.status.set(SensorStatus::Ota);
         if let Some(duration_ms) = keep_awake_ms {
             self.start_fast_poll(duration_ms);
@@ -544,7 +569,6 @@ where
                 self.resources.status.set(SensorStatus::Fault);
             }
         }
-        true
     }
 
     /// Give every stack event to the selected OTA lifecycle before generic
@@ -561,7 +585,12 @@ where
             OtaEventOutcome::Handled {
                 keep_awake_ms,
                 activation_pending,
-            } => Some(self.apply_ota_outcome(keep_awake_ms, activation_pending)),
+            } => {
+                self.apply_ota_outcome(keep_awake_ms, activation_pending);
+                // OTA owns its deadline; do not replace it with the generic
+                // commissioning-activity window.
+                Some(false)
+            }
         }
     }
 
@@ -728,6 +757,7 @@ where
                 false
             }
             StackEvent::ApsSecurityIndication(_) => false,
+            StackEvent::DeviceAnnounced { .. } => false,
             StackEvent::ReportSent => {
                 self.resources
                     .diagnostics

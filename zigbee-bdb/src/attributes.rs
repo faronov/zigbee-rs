@@ -51,6 +51,25 @@ pub enum NodeJoinLinkKeyType {
     TouchlinkPreconfiguredLinkKey = 0x03,
 }
 
+impl NodeJoinLinkKeyType {
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x00 => Some(Self::DefaultGlobalTrustCenterLinkKey),
+            0x01 => Some(Self::DistributedSecurityGlobalLinkKey),
+            0x02 => Some(Self::InstallCodeDerivedPreconfiguredLinkKey),
+            0x03 => Some(Self::TouchlinkPreconfiguredLinkKey),
+            _ => None,
+        }
+    }
+
+    pub const fn is_distributed(self) -> bool {
+        matches!(
+            self,
+            Self::DistributedSecurityGlobalLinkKey | Self::TouchlinkPreconfiguredLinkKey
+        )
+    }
+}
+
 /// Method used to replace the initial Trust Center link key after joining.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
@@ -60,6 +79,55 @@ pub enum TcLinkKeyExchangeMethod {
     ApsRequestKey = 0x00,
     /// Certificate-Based Key Establishment.
     CertificateBasedKeyExchange = 0x01,
+}
+
+/// Trust Center install-code admission policy (R22 Table 4-33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum TrustCenterInstallCodePolicy {
+    Unsupported = 0x00,
+    #[default]
+    Supported = 0x01,
+    Required = 0x02,
+}
+
+/// Trust Center policy for requests to replace a Trust Center link key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum TrustCenterLinkKeyRequestPolicy {
+    Never = 0x00,
+    AnyDevice = 0x01,
+    #[default]
+    ProvisionalOnly = 0x02,
+}
+
+/// Trust Center policy for application link-key requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum ApplicationLinkKeyRequestPolicy {
+    Never = 0x00,
+    #[default]
+    AnyPair = 0x01,
+    AllowListOnly = 0x02,
+}
+
+/// Network-key update transport selected by the Trust Center.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum NetworkKeyUpdateMethod {
+    #[default]
+    Broadcast = 0x00,
+    Unicast = 0x01,
+}
+
+impl NetworkKeyUpdateMethod {
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x00 => Some(Self::Broadcast),
+            0x01 => Some(Self::Unicast),
+            _ => None,
+        }
+    }
 }
 
 // ── BDB commissioning status ────────────────────────────────
@@ -109,6 +177,33 @@ pub struct BdbAttributes {
     /// Whether the Trust Center admits only nodes provisioned with install codes.
     pub join_uses_install_code_key: bool,
 
+    /// Whether the Trust Center accepts previously unknown devices.
+    pub trust_center_allow_joins: bool,
+
+    /// Whether only devices already present in the key table may join/rejoin.
+    pub trust_center_use_whitelist: bool,
+
+    /// Install-code support/requirement policy.
+    pub trust_center_install_code_policy: TrustCenterInstallCodePolicy,
+
+    /// Whether well-known/default-key rejoins are accepted.
+    pub trust_center_allow_rejoins: bool,
+
+    /// Policy for Trust Center link-key replacement requests.
+    pub trust_center_link_key_request_policy: TrustCenterLinkKeyRequestPolicy,
+
+    /// Policy for application link-key requests.
+    pub trust_center_application_key_request_policy: ApplicationLinkKeyRequestPolicy,
+
+    /// Periodic network-key update interval in minutes; zero disables it.
+    pub trust_center_network_key_update_period: u32,
+
+    /// Broadcast or per-device unicast network-key update.
+    pub trust_center_network_key_update_method: NetworkKeyUpdateMethod,
+
+    /// Whether a remote Mgmt_Permit_Joining request may alter TC policy.
+    pub trust_center_allow_remote_policy_change: bool,
+
     /// Bitmask indicating which commissioning modes this device supports
     /// (based on hardware and device type).
     pub node_commissioning_capability: CommissioningMode,
@@ -157,6 +252,15 @@ impl Default for BdbAttributes {
             joining_node_eui64: [0u8; 8],
             joining_node_new_tc_link_key: [0u8; 16],
             join_uses_install_code_key: false,
+            trust_center_allow_joins: true,
+            trust_center_use_whitelist: false,
+            trust_center_install_code_policy: TrustCenterInstallCodePolicy::Supported,
+            trust_center_allow_rejoins: false,
+            trust_center_link_key_request_policy: TrustCenterLinkKeyRequestPolicy::ProvisionalOnly,
+            trust_center_application_key_request_policy: ApplicationLinkKeyRequestPolicy::AnyPair,
+            trust_center_network_key_update_period: 0,
+            trust_center_network_key_update_method: NetworkKeyUpdateMethod::Broadcast,
+            trust_center_allow_remote_policy_change: false,
             node_commissioning_capability: CommissioningMode::STEERING,
             node_is_on_a_network: false,
             node_join_link_key_type: NodeJoinLinkKeyType::default(),

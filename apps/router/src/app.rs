@@ -8,16 +8,23 @@ use zigbee_mac::ParentMacDriver;
 use zigbee_mac::{MacDriver, MacError};
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::aps_table_store::{ApsTableStore, ApsTableStoreError};
-use zigbee_runtime::child_store::ChildStoreError;
 #[cfg(feature = "router")]
 use zigbee_runtime::child_store::ChildTableStore;
+use zigbee_runtime::child_store::{
+    ChildDepartureOutcome, ChildLeaveCascadeOutcome, ChildReassignmentOutcome, ChildRemovalOutcome,
+    ChildStoreError,
+};
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::ApplicationProfile;
 use zigbee_runtime::role::{DeviceRole, EndDevice};
 #[cfg(feature = "router")]
 use zigbee_runtime::role::{RelayRouter, Router};
-use zigbee_runtime::security_store::SecurityStateStore;
+use zigbee_runtime::security_store::{ReplayCounterTombstone, SecurityStateStore};
+#[cfg(feature = "trust-center")]
+use zigbee_runtime::trust_center_runtime::TrustCenterRuntime;
+#[cfg(feature = "trust-center")]
+use zigbee_runtime::trust_center_store::TrustCenterDeviceStore;
 
 use crate::capabilities::{NodeArchetype, RouterStatus, StatusSink, Supervisor};
 use crate::children::NoChildren;
@@ -119,6 +126,8 @@ struct RelayArchetype;
 #[cfg(feature = "router")]
 struct ParentArchetype;
 #[cfg(feature = "router")]
+struct DistributedArchetype;
+#[cfg(feature = "router")]
 struct CoordinatorArchetype;
 
 impl Archetype<EndDevice> for AlwaysOnEndDeviceArchetype {
@@ -139,6 +148,12 @@ impl Archetype<Router> for ParentArchetype {
 }
 
 #[cfg(feature = "router")]
+impl Archetype<Router> for DistributedArchetype {
+    const ID: NodeArchetype = NodeArchetype::DistributedRouter;
+    const DEVICE_TYPE: DeviceType = DeviceType::Router;
+}
+
+#[cfg(feature = "router")]
 impl Archetype<Router> for CoordinatorArchetype {
     const ID: NodeArchetype = NodeArchetype::Coordinator;
     const DEVICE_TYPE: DeviceType = DeviceType::Coordinator;
@@ -154,6 +169,20 @@ impl StartupPath<EndDevice> for AlwaysOnEndDeviceArchetype {
         P: ApplicationProfile,
     {
         node.start_or_resume_steering()
+    }
+}
+
+#[cfg(feature = "router")]
+impl StartupPath<Router> for DistributedArchetype {
+    fn start<'a, M, S, P>(
+        node: &'a mut RouterNode<'_, M, S, P, Router>,
+    ) -> impl Future<Output = Result<u16, StartError>> + 'a
+    where
+        M: MacDriver,
+        S: SecurityStateStore,
+        P: ApplicationProfile,
+    {
+        node.start_or_resume_distributed_network()
     }
 }
 
@@ -244,6 +273,21 @@ impl TickPath<Router> for ParentArchetype {
 }
 
 #[cfg(feature = "router")]
+impl TickPath<Router> for DistributedArchetype {
+    fn tick<'a, M, S, P>(
+        node: &'a mut RouterNode<'_, M, S, P, Router>,
+        elapsed_secs: u16,
+    ) -> impl Future<Output = Result<TickResult, zigbee_runtime::node::NodeError>> + 'a
+    where
+        M: MacDriver,
+        S: SecurityStateStore,
+        P: ApplicationProfile,
+    {
+        node.tick_distributed_deferred_reset(elapsed_secs)
+    }
+}
+
+#[cfg(feature = "router")]
 impl TickPath<Router> for CoordinatorArchetype {
     fn tick<'a, M, S, P>(
         node: &'a mut RouterNode<'_, M, S, P, Router>,
@@ -281,6 +325,8 @@ where
     P: ApplicationProfile,
     R: DeviceRole,
 {
+    const DURABLE_APPLICATION_KEYS: bool;
+
     fn restore(
         &mut self,
         node: &mut RouterNode<'_, M, S, P, R>,
@@ -306,6 +352,8 @@ where
     P: ApplicationProfile,
     R: DeviceRole,
 {
+    const DURABLE_APPLICATION_KEYS: bool = false;
+
     fn restore(
         &mut self,
         _node: &mut RouterNode<'_, M, S, P, R>,
@@ -343,6 +391,8 @@ where
     R: DeviceRole,
     A: ApsTableStore,
 {
+    const DURABLE_APPLICATION_KEYS: bool = true;
+
     fn restore(
         &mut self,
         node: &mut RouterNode<'_, M, S, P, R>,
@@ -413,6 +463,59 @@ where
         &mut self,
         node: &mut RouterNode<'_, M, S, P, R>,
     ) -> Result<bool, ChildStoreError>;
+
+    fn stage_removal(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+        child_address: &[u8; 8],
+    ) -> Result<bool, ChildStoreError>;
+
+    fn pending_replay_tombstones(
+        &mut self,
+        node: &RouterNode<'_, M, S, P, R>,
+    ) -> Result<[Option<[u8; 8]>; 2], ChildStoreError>;
+
+    fn stage_reassignment(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<bool, ChildStoreError>;
+
+    async fn service_pending_reassignment(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<ChildReassignmentOutcome, ChildStoreError>;
+
+    fn stage_departure(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<bool, ChildStoreError>;
+
+    async fn service_pending_departure(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<ChildDepartureOutcome, ChildStoreError>;
+
+    #[cfg(feature = "trust-center")]
+    fn complete_local_departure(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+        child_address: &[u8; 8],
+    ) -> Result<bool, ChildStoreError>;
+
+    fn stage_leave_cascade(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<bool, ChildStoreError>;
+
+    async fn service_pending_leave_cascade(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<ChildLeaveCascadeOutcome, ChildStoreError>;
+
+    async fn service_pending_removal(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, R>,
+    ) -> Result<ChildRemovalOutcome, ChildStoreError>;
 }
 
 #[cfg(feature = "router")]
@@ -449,6 +552,79 @@ where
     ) -> Result<bool, ChildStoreError> {
         Ok(false)
     }
+
+    fn stage_removal(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, RelayRouter>,
+        _child_address: &[u8; 8],
+    ) -> Result<bool, ChildStoreError> {
+        Ok(false)
+    }
+
+    fn pending_replay_tombstones(
+        &mut self,
+        _node: &RouterNode<'_, M, S, P, RelayRouter>,
+    ) -> Result<[Option<[u8; 8]>; 2], ChildStoreError> {
+        Ok([None, None])
+    }
+
+    fn stage_reassignment(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, RelayRouter>,
+    ) -> Result<bool, ChildStoreError> {
+        Ok(false)
+    }
+
+    async fn service_pending_reassignment(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, RelayRouter>,
+    ) -> Result<ChildReassignmentOutcome, ChildStoreError> {
+        Ok(ChildReassignmentOutcome::None)
+    }
+
+    fn stage_departure(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, RelayRouter>,
+    ) -> Result<bool, ChildStoreError> {
+        Ok(false)
+    }
+
+    async fn service_pending_departure(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, RelayRouter>,
+    ) -> Result<ChildDepartureOutcome, ChildStoreError> {
+        Ok(ChildDepartureOutcome::None)
+    }
+
+    #[cfg(feature = "trust-center")]
+    fn complete_local_departure(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, RelayRouter>,
+        _child_address: &[u8; 8],
+    ) -> Result<bool, ChildStoreError> {
+        Ok(false)
+    }
+
+    fn stage_leave_cascade(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, RelayRouter>,
+    ) -> Result<bool, ChildStoreError> {
+        Ok(false)
+    }
+
+    async fn service_pending_leave_cascade(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, RelayRouter>,
+    ) -> Result<ChildLeaveCascadeOutcome, ChildStoreError> {
+        Ok(ChildLeaveCascadeOutcome::None)
+    }
+
+    async fn service_pending_removal(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, RelayRouter>,
+    ) -> Result<ChildRemovalOutcome, ChildStoreError> {
+        Ok(ChildRemovalOutcome::None)
+    }
 }
 
 impl<M, S, P> ChildLifecycle<M, S, P, EndDevice> for NoChildren
@@ -483,6 +659,79 @@ where
         _node: &mut RouterNode<'_, M, S, P, EndDevice>,
     ) -> Result<bool, ChildStoreError> {
         Ok(false)
+    }
+
+    fn stage_removal(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, EndDevice>,
+        _child_address: &[u8; 8],
+    ) -> Result<bool, ChildStoreError> {
+        Ok(false)
+    }
+
+    fn pending_replay_tombstones(
+        &mut self,
+        _node: &RouterNode<'_, M, S, P, EndDevice>,
+    ) -> Result<[Option<[u8; 8]>; 2], ChildStoreError> {
+        Ok([None, None])
+    }
+
+    fn stage_reassignment(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, EndDevice>,
+    ) -> Result<bool, ChildStoreError> {
+        Ok(false)
+    }
+
+    async fn service_pending_reassignment(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, EndDevice>,
+    ) -> Result<ChildReassignmentOutcome, ChildStoreError> {
+        Ok(ChildReassignmentOutcome::None)
+    }
+
+    fn stage_departure(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, EndDevice>,
+    ) -> Result<bool, ChildStoreError> {
+        Ok(false)
+    }
+
+    async fn service_pending_departure(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, EndDevice>,
+    ) -> Result<ChildDepartureOutcome, ChildStoreError> {
+        Ok(ChildDepartureOutcome::None)
+    }
+
+    #[cfg(feature = "trust-center")]
+    fn complete_local_departure(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, EndDevice>,
+        _child_address: &[u8; 8],
+    ) -> Result<bool, ChildStoreError> {
+        Ok(false)
+    }
+
+    fn stage_leave_cascade(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, EndDevice>,
+    ) -> Result<bool, ChildStoreError> {
+        Ok(false)
+    }
+
+    async fn service_pending_leave_cascade(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, EndDevice>,
+    ) -> Result<ChildLeaveCascadeOutcome, ChildStoreError> {
+        Ok(ChildLeaveCascadeOutcome::None)
+    }
+
+    async fn service_pending_removal(
+        &mut self,
+        _node: &mut RouterNode<'_, M, S, P, EndDevice>,
+    ) -> Result<ChildRemovalOutcome, ChildStoreError> {
+        Ok(ChildRemovalOutcome::None)
     }
 }
 
@@ -548,12 +797,117 @@ where
             .clear_persisted_child_table(self.store_mut())?;
         Ok(true)
     }
+
+    fn stage_removal(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, Router>,
+        child_address: &[u8; 8],
+    ) -> Result<bool, ChildStoreError> {
+        node.device_mut()
+            .stage_child_removal(self.store_mut(), child_address)
+    }
+
+    fn pending_replay_tombstones(
+        &mut self,
+        node: &RouterNode<'_, M, S, P, Router>,
+    ) -> Result<[Option<[u8; 8]>; 2], ChildStoreError> {
+        // Avoid touching flash on the steady-state path; restore/staging keeps
+        // these role flags synchronized with the durable transactions.
+        if !node.device().child_removal_pending() && !node.device().child_departure_pending() {
+            return Ok([None, None]);
+        }
+        let Some(table) = self.store_mut().load()? else {
+            return Ok([None, None]);
+        };
+        table.validate()?;
+        Ok([
+            table.pending_removal().map(|child| child.ieee_address),
+            table.pending_departure().map(|child| child.ieee_address),
+        ])
+    }
+
+    fn stage_reassignment(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, Router>,
+    ) -> Result<bool, ChildStoreError> {
+        node.device_mut()
+            .stage_pending_child_reassignment(self.store_mut())
+    }
+
+    async fn service_pending_reassignment(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, Router>,
+    ) -> Result<ChildReassignmentOutcome, ChildStoreError> {
+        node.device_mut()
+            .service_pending_child_reassignment(self.store_mut())
+            .await
+    }
+
+    fn stage_departure(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, Router>,
+    ) -> Result<bool, ChildStoreError> {
+        node.device_mut()
+            .stage_pending_child_departure(self.store_mut())
+    }
+
+    async fn service_pending_departure(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, Router>,
+    ) -> Result<ChildDepartureOutcome, ChildStoreError> {
+        node.device_mut()
+            .service_pending_child_departure(self.store_mut())
+            .await
+    }
+
+    #[cfg(feature = "trust-center")]
+    fn complete_local_departure(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, Router>,
+        child_address: &[u8; 8],
+    ) -> Result<bool, ChildStoreError> {
+        node.device_mut()
+            .complete_local_child_departure(self.store_mut(), child_address)
+    }
+
+    fn stage_leave_cascade(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, Router>,
+    ) -> Result<bool, ChildStoreError> {
+        node.device_mut()
+            .stage_pending_child_leave_cascade(self.store_mut())
+    }
+
+    async fn service_pending_leave_cascade(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, Router>,
+    ) -> Result<ChildLeaveCascadeOutcome, ChildStoreError> {
+        node.device_mut()
+            .service_pending_child_leave_cascade(self.store_mut())
+            .await
+    }
+
+    async fn service_pending_removal(
+        &mut self,
+        node: &mut RouterNode<'_, M, S, P, Router>,
+    ) -> Result<ChildRemovalOutcome, ChildStoreError> {
+        node.device_mut()
+            .service_pending_child_removal(self.store_mut())
+            .await
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventControl {
     Continue,
     Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaveCascadeControl {
+    Inactive,
+    Progress,
+    Completed { rejoin: bool },
 }
 
 struct RouterCore<'a, M, S, P, R, C, A, K, St, Sv, D, O>
@@ -576,6 +930,8 @@ where
     run_again_deadline_us: Option<u32>,
     last_identifying: Option<bool>,
     pending_factory_reset: bool,
+    pending_security_indication_commit: bool,
+    pending_child_lifecycle_replay_commit: bool,
     initialized: bool,
     _archetype: PhantomData<K>,
     _observer: PhantomData<O>,
@@ -615,7 +971,16 @@ where
                 actual,
             });
         }
+        #[cfg(feature = "application-link-key-installation")]
+        let mut node = node;
         let now = node.device().mac().monotonic_micros();
+        #[cfg(feature = "application-link-key-installation")]
+        node.device_mut()
+            .set_application_link_key_installation_enabled(A::DURABLE_APPLICATION_KEYS);
+        #[cfg(not(feature = "application-link-key-installation"))]
+        if A::DURABLE_APPLICATION_KEYS {
+            return Err(RouterAppError::ApplicationLinkKeyInstallationUnavailable);
+        }
         Ok(Self {
             node,
             children,
@@ -630,6 +995,8 @@ where
             run_again_deadline_us: None,
             last_identifying: None,
             pending_factory_reset: false,
+            pending_security_indication_commit: false,
+            pending_child_lifecycle_replay_commit: false,
             initialized: false,
             _archetype: PhantomData,
             _observer: PhantomData,
@@ -727,6 +1094,23 @@ where
                 .diagnostics
                 .record(DiagnosticEvent::ApsTablesDiscarded { error }),
         }
+        self.node
+            .tombstone_retired_application_link_key_replay_counters()?;
+        // Application link keys are installed by the APS-table restore, after
+        // startup restored NWK/TCLK state. Re-apply the durable replay log now
+        // so those key-pair domains are protected before receive begins.
+        self.node.restore_replay_state()?;
+        Ok(())
+    }
+
+    fn tombstone_retired_core_key_replay_counters(&mut self) -> Result<(), RouterAppError> {
+        self.node.tombstone_retired_network_key_replay_counters()?;
+        self.node
+            .tombstone_retired_global_aps_key_replay_counters()?;
+        if K::DEVICE_TYPE != DeviceType::Coordinator {
+            self.node
+                .tombstone_retired_trust_center_link_key_replay_counters()?;
+        }
         Ok(())
     }
 
@@ -739,11 +1123,132 @@ where
         Ok(())
     }
 
-    fn persist_aps_tables_if_dirty(&mut self) -> Result<(), RouterAppError> {
+    fn stage_pending_child_reassignment(&mut self) -> Result<(), RouterAppError> {
+        if self.children.stage_reassignment(&mut self.node)? {
+            self.parts
+                .diagnostics
+                .record(DiagnosticEvent::ChildTableSaved);
+        }
+        Ok(())
+    }
+
+    async fn service_pending_child_reassignment(&mut self) -> Result<(), RouterAppError> {
+        let _ = self
+            .children
+            .service_pending_reassignment(&mut self.node)
+            .await?;
+        Ok(())
+    }
+
+    fn stage_pending_child_departure(&mut self) -> Result<(), RouterAppError> {
+        if self.children.stage_departure(&mut self.node)? {
+            self.parts
+                .diagnostics
+                .record(DiagnosticEvent::ChildTableSaved);
+        }
+        Ok(())
+    }
+
+    fn tombstone_pending_child_replay_domains(&mut self) -> Result<(), RouterAppError> {
+        let addresses = self.children.pending_replay_tombstones(&self.node)?;
+        for address in addresses.into_iter().flatten() {
+            self.node
+                .tombstone_replay_counters(ReplayCounterTombstone::Device(address))?;
+        }
+        Ok(())
+    }
+
+    async fn service_pending_child_departure(&mut self) -> Result<(), RouterAppError> {
+        self.tombstone_pending_child_replay_domains()?;
+        let _ = self
+            .children
+            .service_pending_departure(&mut self.node)
+            .await?;
+        Ok(())
+    }
+
+    fn stage_pending_child_leave_cascade(&mut self) -> Result<(), RouterAppError> {
+        if self.children.stage_leave_cascade(&mut self.node)? {
+            self.parts
+                .diagnostics
+                .record(DiagnosticEvent::ChildTableSaved);
+        }
+        Ok(())
+    }
+
+    async fn service_pending_child_leave_cascade(
+        &mut self,
+    ) -> Result<LeaveCascadeControl, RouterAppError> {
+        self.tombstone_pending_child_replay_domains()?;
+        match self
+            .children
+            .service_pending_leave_cascade(&mut self.node)
+            .await?
+        {
+            ChildLeaveCascadeOutcome::None => Ok(LeaveCascadeControl::Inactive),
+            ChildLeaveCascadeOutcome::Progress => Ok(LeaveCascadeControl::Progress),
+            ChildLeaveCascadeOutcome::Completed { rejoin } => {
+                Ok(LeaveCascadeControl::Completed { rejoin })
+            }
+        }
+    }
+
+    async fn service_pending_child_removal(&mut self) -> Result<(), RouterAppError> {
+        self.tombstone_pending_child_replay_domains()?;
+        match self
+            .children
+            .service_pending_removal(&mut self.node)
+            .await?
+        {
+            ChildRemovalOutcome::None => {}
+            ChildRemovalOutcome::Pending { .. } => {}
+            ChildRemovalOutcome::Retry {
+                child_address,
+                short_address,
+                attempts,
+                error,
+            } => self
+                .parts
+                .diagnostics
+                .record(DiagnosticEvent::ChildRemovalRetry {
+                    child_address,
+                    short_address,
+                    attempts,
+                    error,
+                }),
+            ChildRemovalOutcome::Completed {
+                child_address,
+                short_address,
+                attempts,
+                delivered,
+            } => self
+                .parts
+                .diagnostics
+                .record(DiagnosticEvent::ChildRemovalCompleted {
+                    child_address,
+                    short_address,
+                    attempts,
+                    delivered,
+                }),
+        }
+        Ok(())
+    }
+
+    async fn persist_aps_tables_if_dirty(&mut self) -> Result<(), RouterAppError> {
         if self.aps_tables.persist_if_dirty(&mut self.node)? {
             self.parts
                 .diagnostics
                 .record(DiagnosticEvent::ApsTablesSaved);
+        }
+        self.node
+            .tombstone_retired_application_link_key_replay_counters()?;
+        if self.node.device().application_key_persistence_pending() {
+            if !A::DURABLE_APPLICATION_KEYS {
+                return Err(RouterAppError::ApsTables(
+                    ApsTableStoreError::PersistenceRequired,
+                ));
+            }
+            self.node.complete_application_key_persistence().await?;
         }
         Ok(())
     }
@@ -807,6 +1312,7 @@ where
         self.checkpoint_security()?;
         self.restore_children()?;
         self.restore_aps_tables()?;
+        self.tombstone_retired_core_key_replay_counters()?;
         self.node.reset_remote_reporting();
         self.retry_delay_ms = self.policy.join_retry_initial_ms;
         self.secure_rejoin_failures = 0;
@@ -875,6 +1381,8 @@ where
         self.node.reset_remote_reporting();
         self.run_again_deadline_us = None;
         self.last_identifying = None;
+        self.pending_security_indication_commit = false;
+        self.pending_child_lifecycle_replay_commit = false;
         Ok(())
     }
 
@@ -1013,6 +1521,27 @@ where
         }
     }
 
+    async fn perform_secure_rejoin(&mut self) -> Result<(), RouterAppError> {
+        self.set_status(RouterStatus::Rejoining {
+            archetype: K::ID,
+            failures: self.secure_rejoin_failures,
+        });
+        let started_us = self.now_us();
+        O::on_secure_rejoin_attempt(self.node.device(), started_us);
+        let result = self.node.secure_rejoin().await;
+        O::on_secure_rejoin_result(self.node.device(), result);
+        match result {
+            Ok(short_address) => {
+                self.parts
+                    .diagnostics
+                    .record(DiagnosticEvent::SecureRejoinSucceeded { short_address });
+                self.activate_network(short_address)?;
+            }
+            Err(error) => self.note_secure_rejoin_failure(Some(error)).await?,
+        }
+        Ok(())
+    }
+
     fn set_run_again(&mut self, delay_ms: u32) -> Result<(), RouterAppError> {
         if delay_ms > RouterPolicy::max_relative_delay_us() / 1_000 {
             return Err(RouterAppError::InvalidRunAgainDelay { delay_ms });
@@ -1065,7 +1594,28 @@ where
             StackEvent::DefaultResponse { .. } => Ok(EventControl::Continue),
             StackEvent::ReportingConfigured { .. } => Ok(EventControl::Continue),
             StackEvent::PermitJoinChanged { .. } => Ok(EventControl::Continue),
-            StackEvent::ApsSecurityIndication(_) => Ok(EventControl::Continue),
+            StackEvent::DeviceAnnounced { .. } => Ok(EventControl::Continue),
+            StackEvent::ApsSecurityIndication(indication) => {
+                if let zigbee_aps::apsme::ApsmeSecurityIndication::RemoveDevice(removal) =
+                    indication
+                {
+                    if self
+                        .children
+                        .stage_removal(&mut self.node, &removal.child_address)?
+                    {
+                        self.parts
+                            .diagnostics
+                            .record(DiagnosticEvent::ChildRemovalStaged {
+                                child_address: removal.child_address,
+                            });
+                    }
+                    self.node
+                        .tombstone_replay_counters(ReplayCounterTombstone::Device(
+                            removal.child_address,
+                        ))?;
+                }
+                Ok(EventControl::Continue)
+            }
             StackEvent::ReportSent => Ok(EventControl::Continue),
             StackEvent::OtaImageAvailable { .. } => Ok(EventControl::Continue),
             StackEvent::OtaProgress { .. } => Ok(EventControl::Continue),
@@ -1084,23 +1634,7 @@ where
                 Ok(EventControl::Stop)
             }
             StackEvent::RejoinRequested => {
-                self.set_status(RouterStatus::Rejoining {
-                    archetype: K::ID,
-                    failures: self.secure_rejoin_failures,
-                });
-                let started_us = self.now_us();
-                O::on_secure_rejoin_attempt(self.node.device(), started_us);
-                let result = self.node.secure_rejoin().await;
-                O::on_secure_rejoin_result(self.node.device(), result);
-                match result {
-                    Ok(short_address) => {
-                        self.parts
-                            .diagnostics
-                            .record(DiagnosticEvent::SecureRejoinSucceeded { short_address });
-                        self.activate_network(short_address)?;
-                    }
-                    Err(error) => self.note_secure_rejoin_failure(Some(error)).await?,
-                }
+                self.perform_secure_rejoin().await?;
                 // The network relationship changed underneath this service
                 // iteration. Never continue into a second tick against it.
                 Ok(EventControl::Stop)
@@ -1133,33 +1667,76 @@ where
         }
     }
 
-    async fn step_joined(&mut self) -> Result<StepEvents, RouterAppError> {
+    async fn complete_pending_receive_durability<const DEFER_SECURITY: bool>(
+        &mut self,
+    ) -> Result<(), RouterAppError> {
+        if self.pending_security_indication_commit && !DEFER_SECURITY {
+            self.node.complete_security_indication_persistence().await?;
+            self.pending_security_indication_commit = false;
+        }
+        if self.pending_child_lifecycle_replay_commit {
+            self.node.complete_child_nwk_lifecycle_persistence().await?;
+            self.pending_child_lifecycle_replay_commit = false;
+        }
+        Ok(())
+    }
+
+    async fn step_joined<const DEFER_SECURITY: bool>(
+        &mut self,
+    ) -> Result<StepEvents, RouterAppError> {
         let mut events = StepEvents::default();
         self.parts.supervisor.heartbeat();
+        await_out_of_line!(self.complete_pending_receive_durability::<DEFER_SECURITY>())?;
+        await_out_of_line!(self.persist_aps_tables_if_dirty())?;
+        match await_out_of_line!(self.service_pending_child_leave_cascade())? {
+            LeaveCascadeControl::Completed { rejoin: true } => {
+                await_out_of_line!(self.perform_secure_rejoin())?;
+                return Ok(events);
+            }
+            LeaveCascadeControl::Completed { rejoin: false } => {
+                self.request_factory_reset();
+                return Ok(events);
+            }
+            LeaveCascadeControl::Progress => {}
+            LeaveCascadeControl::Inactive => {
+                await_out_of_line!(self.service_pending_child_reassignment())?;
+                await_out_of_line!(self.service_pending_child_departure())?;
+                await_out_of_line!(self.service_pending_child_removal())?;
+            }
+        }
 
         let timeout_us = self.next_wait_us(false);
         if timeout_us != 0 {
             let started_us = self.now_us();
             O::on_before_receive(self.node.device(), timeout_us);
-            match self.node.device_mut().receive_timeout(timeout_us).await {
+            match await_out_of_line!(self.node.device_mut().receive_timeout(timeout_us)) {
                 Ok(indication) => {
                     let receive_elapsed_us = self.now_us().wrapping_sub(started_us);
                     self.parts
                         .diagnostics
                         .record(DiagnosticEvent::FrameReceived);
                     O::on_frame_received(self.node.device(), receive_elapsed_us);
-                    let event = self
-                        .node
-                        .process_incoming_deferred_reset(&indication)
-                        .await?;
+                    let event =
+                        await_out_of_line!(self.node.process_incoming_deferred_reset(&indication))?;
                     let elapsed_us = self.now_us().wrapping_sub(started_us);
                     O::on_frame_processed(self.node.device(), event.as_ref(), elapsed_us);
                     if let Some(event) = event {
-                        let control = self.handle_stack_event(&event).await?;
+                        let security_indication =
+                            matches!(&event, StackEvent::ApsSecurityIndication(_));
+                        let control = await_out_of_line!(self.handle_stack_event(&event))?;
                         events.incoming = Some(event);
+                        if security_indication && !DEFER_SECURITY {
+                            self.pending_security_indication_commit = true;
+                        }
                         if !self.pending_factory_reset {
                             self.persist_children_if_dirty()?;
-                            self.persist_aps_tables_if_dirty()?;
+                            await_out_of_line!(self.persist_aps_tables_if_dirty())?;
+                        }
+                        if security_indication && !DEFER_SECURITY {
+                            await_out_of_line!(
+                                self.node.complete_security_indication_persistence()
+                            )?;
+                            self.pending_security_indication_commit = false;
                         }
                         if matches!(control, EventControl::Stop) {
                             self.parts.supervisor.heartbeat();
@@ -1174,18 +1751,53 @@ where
 
         // Parent command servicing surrounds receive_timeout and may mutate
         // the child table even when no normal data indication arrived.
+        self.stage_pending_child_leave_cascade()?;
+        self.stage_pending_child_reassignment()?;
+        self.stage_pending_child_departure()?;
+        self.pending_child_lifecycle_replay_commit = true;
         self.persist_children_if_dirty()?;
-        self.persist_aps_tables_if_dirty()?;
+        await_out_of_line!(self.node.complete_child_nwk_lifecycle_persistence())?;
+        self.pending_child_lifecycle_replay_commit = false;
+        match await_out_of_line!(self.service_pending_child_leave_cascade())? {
+            LeaveCascadeControl::Completed { rejoin: true } => {
+                await_out_of_line!(self.perform_secure_rejoin())?;
+                return Ok(events);
+            }
+            LeaveCascadeControl::Completed { rejoin: false } => {
+                self.request_factory_reset();
+                return Ok(events);
+            }
+            LeaveCascadeControl::Progress => {}
+            LeaveCascadeControl::Inactive => {
+                await_out_of_line!(self.service_pending_child_reassignment())?;
+                await_out_of_line!(self.service_pending_child_departure())?;
+            }
+        }
+        await_out_of_line!(self.persist_aps_tables_if_dirty())?;
 
         let elapsed_secs = self.elapsed_tick_secs();
         self.run_again_deadline_us = None;
-        let result = K::tick(&mut self.node, elapsed_secs).await?;
-        let control = self
-            .handle_tick_result(elapsed_secs, result, &mut events)
-            .await?;
+        let result = await_out_of_line!(K::tick(&mut self.node, elapsed_secs))?;
+        let control =
+            await_out_of_line!(self.handle_tick_result(elapsed_secs, result, &mut events))?;
+        if matches!(
+            events.tick.as_ref(),
+            Some(StackEvent::ApsSecurityIndication(_))
+        ) && !DEFER_SECURITY
+        {
+            self.pending_security_indication_commit = true;
+        }
         if !self.pending_factory_reset {
             self.persist_children_if_dirty()?;
-            self.persist_aps_tables_if_dirty()?;
+            await_out_of_line!(self.persist_aps_tables_if_dirty())?;
+        }
+        if matches!(
+            events.tick.as_ref(),
+            Some(StackEvent::ApsSecurityIndication(_))
+        ) && !DEFER_SECURITY
+        {
+            await_out_of_line!(self.node.complete_security_indication_persistence())?;
+            self.pending_security_indication_commit = false;
         }
         if matches!(control, EventControl::Continue) {
             self.refresh_online_status();
@@ -1201,21 +1813,20 @@ where
         if !self.node.device().secure_rejoin_pending()
             && Self::deadline_due(self.now_us(), self.retry_deadline_us)
         {
-            self.attempt_start().await?;
+            await_out_of_line!(self.attempt_start())?;
             self.parts.supervisor.heartbeat();
             return Ok(events);
         }
 
         let wait_us = self.next_wait_us(!self.node.device().secure_rejoin_pending());
         if wait_us != 0 {
-            self.node.device_mut().mac_mut().delay_micros(wait_us).await;
+            await_out_of_line!(self.node.device_mut().mac_mut().delay_micros(wait_us));
         }
 
         let elapsed_secs = self.elapsed_tick_secs();
         self.run_again_deadline_us = None;
-        let result = K::tick(&mut self.node, elapsed_secs).await?;
-        self.handle_tick_result(elapsed_secs, result, &mut events)
-            .await?;
+        let result = await_out_of_line!(K::tick(&mut self.node, elapsed_secs))?;
+        await_out_of_line!(self.handle_tick_result(elapsed_secs, result, &mut events))?;
         // An unjoined parent cannot admit or age children. In particular, do
         // not let the role state's initially-dirty empty table overwrite a
         // valid durable snapshot while a persisted secured rejoin is retrying.
@@ -1260,17 +1871,23 @@ where
         self.complete_pending_factory_reset_and_recommission().await
     }
 
-    async fn step_deferred_factory_reset(&mut self) -> Result<StepEvents, RouterAppError> {
+    async fn step_deferred_factory_reset_mode<const DEFER_SECURITY: bool>(
+        &mut self,
+    ) -> Result<StepEvents, RouterAppError> {
         if !self.initialized {
             return Err(RouterAppError::NotInitialized);
         }
         if self.pending_factory_reset {
             Ok(StepEvents::default())
         } else if self.node.device().is_joined() {
-            self.step_joined().await
+            self.step_joined::<DEFER_SECURITY>().await
         } else {
             self.step_unjoined().await
         }
+    }
+
+    async fn step_deferred_factory_reset(&mut self) -> Result<StepEvents, RouterAppError> {
+        self.step_deferred_factory_reset_mode::<false>().await
     }
 
     async fn step(&mut self) -> Result<StepEvents, RouterAppError> {
@@ -1292,7 +1909,11 @@ where
             self.fatal(error);
         }
         loop {
-            if let Err(error) = self.step().await {
+            // `step` and its `step_deferred_factory_reset*` forwarders are thin
+            // enough that LLVM inlines the whole `step_joined` body here. The
+            // loop's resume dispatch then re-emits that body on every resume
+            // edge, so it must be awaited behind a vtable.
+            if let Err(error) = await_out_of_line!(self.step()) {
                 self.fatal(error);
             }
         }
@@ -1748,6 +2369,702 @@ where
     }
 }
 
+/// Coordinator frontend with an authoritative, durable Zigbee Trust Center.
+#[cfg(feature = "trust-center")]
+pub struct TrustCenterCoordinatorApp<'a, M, S, P, C, T, St, Sv, D, O = NoObserver, A = NoApsTables>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    T: TrustCenterDeviceStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    O: RouterObserver<M, Router>,
+{
+    coordinator: CoordinatorApp<'a, M, S, P, C, St, Sv, D, O, A>,
+    trust_center: TrustCenterRuntime<T>,
+    pending_local_child_departure_completion: Option<[u8; 8]>,
+}
+
+#[cfg(feature = "trust-center")]
+impl<'a, M, S, P, C, T, St, Sv, D, O, A>
+    TrustCenterCoordinatorApp<'a, M, S, P, C, T, St, Sv, D, O, A>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    T: TrustCenterDeviceStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    O: RouterObserver<M, Router>,
+    A: ApsTableLifecycle<M, S, P, Router>,
+{
+    pub fn new_observed_with_aps_tables(
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        aps_tables: A,
+        trust_center_store: T,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<Self, RouterAppError> {
+        Ok(Self {
+            coordinator: CoordinatorApp::new_observed_with_aps_tables(
+                node, children, aps_tables, policy, parts,
+            )?,
+            trust_center: TrustCenterRuntime::new(trust_center_store),
+            pending_local_child_departure_completion: None,
+        })
+    }
+
+    pub const fn coordinator(&self) -> &CoordinatorApp<'a, M, S, P, C, St, Sv, D, O, A> {
+        &self.coordinator
+    }
+
+    pub fn coordinator_mut(&mut self) -> &mut CoordinatorApp<'a, M, S, P, C, St, Sv, D, O, A> {
+        &mut self.coordinator
+    }
+
+    pub const fn trust_center(&self) -> &TrustCenterRuntime<T> {
+        &self.trust_center
+    }
+
+    pub fn trust_center_mut(&mut self) -> &mut TrustCenterRuntime<T> {
+        &mut self.trust_center
+    }
+
+    pub const fn node(&self) -> &RouterNode<'a, M, S, P, Router> {
+        self.coordinator.node()
+    }
+
+    pub fn node_mut(&mut self) -> &mut RouterNode<'a, M, S, P, Router> {
+        self.coordinator.node_mut()
+    }
+
+    pub fn provision_install_code(
+        &mut self,
+        address: [u8; 8],
+        install_code: &[u8],
+    ) -> Result<[u8; 16], RouterAppError> {
+        let key = self.trust_center.provision_install_code(
+            self.coordinator.node_mut().device_mut(),
+            address,
+            install_code,
+        )?;
+        self.coordinator
+            .node_mut()
+            .tombstone_retired_trust_center_link_key_replay_counters()?;
+        Ok(key)
+    }
+
+    pub fn provision_trust_center_link_key(
+        &mut self,
+        address: [u8; 8],
+        key: [u8; 16],
+    ) -> Result<(), RouterAppError> {
+        self.trust_center.provision_link_key(
+            self.coordinator.node_mut().device_mut(),
+            address,
+            key,
+        )?;
+        self.coordinator
+            .node_mut()
+            .tombstone_retired_trust_center_link_key_replay_counters()?;
+        Ok(())
+    }
+
+    pub async fn initialize(&mut self) -> Result<(), RouterAppError> {
+        let commissioned = self
+            .coordinator
+            .node_mut()
+            .load_security_state()?
+            .is_some_and(|state| state.commissioned);
+        if !commissioned {
+            // The factory-new security record is the cross-journal reset
+            // tombstone. Clear a possibly stale same-EPID Trust Center table
+            // before formation can make it look current again.
+            self.trust_center
+                .clear(self.coordinator.node_mut().device_mut())?;
+        }
+        self.coordinator.initialize().await?;
+        self.ensure_trust_center_initialized().await?;
+        Ok(())
+    }
+
+    pub async fn initialize_deferred_factory_reset(&mut self) -> Result<(), RouterAppError> {
+        let commissioned = self
+            .coordinator
+            .node_mut()
+            .load_security_state()?
+            .is_some_and(|state| state.commissioned);
+        if !commissioned {
+            self.trust_center
+                .clear(self.coordinator.node_mut().device_mut())?;
+        }
+        self.coordinator.initialize_deferred_factory_reset().await?;
+        self.ensure_trust_center_initialized().await?;
+        Ok(())
+    }
+
+    pub const fn factory_reset_pending(&self) -> bool {
+        self.coordinator.factory_reset_pending()
+    }
+
+    pub async fn complete_pending_factory_reset_and_recommission(
+        &mut self,
+    ) -> Result<(), RouterAppError> {
+        if !self.coordinator.factory_reset_pending() {
+            return Ok(());
+        }
+        // Commit the factory-new security record first. If power fails before
+        // that commit, every auxiliary journal is still intact and the old
+        // network can resume. Once it commits, startup clears stale
+        // Trust-Center/child/APS state before any fresh formation.
+        self.coordinator
+            .complete_pending_factory_reset_and_recommission()
+            .await?;
+        self.trust_center
+            .clear(self.coordinator.node_mut().device_mut())?;
+        Ok(())
+    }
+
+    pub async fn urgent_factory_reset_and_recommission(&mut self) -> Result<(), RouterAppError> {
+        self.coordinator
+            .urgent_factory_reset_and_recommission()
+            .await?;
+        self.trust_center
+            .clear(self.coordinator.node_mut().device_mut())?;
+        Ok(())
+    }
+
+    pub async fn step_deferred_factory_reset(&mut self) -> Result<StepEvents, RouterAppError> {
+        // A failed TC/replay restore can leave the NWK coordinator running.
+        // Retry the barrier before the core is allowed to receive or tick;
+        // checking only after core.step() exposes a partially restored table.
+        self.ensure_trust_center_initialized().await?;
+        // Finish a failed revocation before another indication can replace
+        // its pending replay tombstone.
+        self.service_trust_center_replay_retirements()?;
+        self.complete_pending_security_indication_durability()
+            .await?;
+        let events = self
+            .coordinator
+            .core
+            .step_deferred_factory_reset_mode::<true>()
+            .await?;
+        if !self.coordinator.factory_reset_pending() {
+            self.ensure_trust_center_initialized().await?;
+            self.handle_security_events(&events).await?;
+            self.service_trust_center_replay_retirements()?;
+            self.trust_center
+                .poll(self.coordinator.node_mut().device_mut())
+                .await?;
+            self.service_trust_center_replay_retirements()?;
+            self.service_network_key_rotation(false)?;
+            self.stage_pending_trust_center_child_removal()?;
+        }
+        Ok(events)
+    }
+
+    async fn ensure_trust_center_initialized(&mut self) -> Result<(), RouterAppError> {
+        if self.coordinator.factory_reset_pending()
+            || !self.coordinator.node().device().is_joined()
+            || self.trust_center.is_initialized()
+        {
+            return Ok(());
+        }
+        let (device, replay_store) = self.coordinator.node_mut().device_and_security_store_mut();
+        self.trust_center
+            .initialize_with_security_store(device, replay_store)
+            .await?;
+        self.service_trust_center_replay_retirements()?;
+        self.service_network_key_rotation(false)?;
+        self.stage_pending_trust_center_child_removal()
+    }
+
+    pub async fn step(&mut self) -> Result<StepEvents, RouterAppError> {
+        let events = self.step_deferred_factory_reset().await?;
+        self.complete_pending_factory_reset_and_recommission()
+            .await?;
+        Ok(events)
+    }
+
+    async fn handle_security_events(&mut self, events: &StepEvents) -> Result<(), RouterAppError> {
+        for event in events.iter() {
+            if let StackEvent::DeviceAnnounced {
+                address,
+                short_address,
+                capabilities,
+            } = event
+            {
+                self.trust_center.handle_device_announce(
+                    self.coordinator.node().device(),
+                    *address,
+                    *short_address,
+                    *capabilities,
+                )?;
+            }
+            if let StackEvent::ApsSecurityIndication(indication) = event {
+                self.coordinator.core.pending_security_indication_commit = true;
+                let local_child_departure = match indication {
+                    zigbee_aps::apsme::ApsmeSecurityIndication::UpdateDevice(indication)
+                        if indication.status
+                            == zigbee_aps::apsme::ApsUpdateDeviceStatus::DeviceLeft
+                            && indication.source_address
+                                == self
+                                    .coordinator
+                                    .node()
+                                    .device()
+                                    .bdb()
+                                    .zdo()
+                                    .nwk()
+                                    .nib()
+                                    .ieee_address =>
+                    {
+                        Some(indication.device_address)
+                    }
+                    _ => None,
+                };
+                if let Err(error) = self
+                    .trust_center
+                    .handle_indication(self.coordinator.node_mut().device_mut(), *indication)
+                    .await
+                {
+                    self.coordinator.core.pending_security_indication_commit = false;
+                    return Err(error.into());
+                }
+                if let Err(error) = self.service_trust_center_replay_retirements() {
+                    self.coordinator.core.pending_security_indication_commit = false;
+                    return Err(error);
+                }
+                if let Err(error) = self.stage_pending_trust_center_child_removal() {
+                    self.coordinator.core.pending_security_indication_commit = false;
+                    return Err(error);
+                }
+                self.pending_local_child_departure_completion = local_child_departure;
+                self.complete_pending_security_indication_durability()
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn complete_pending_security_indication_durability(
+        &mut self,
+    ) -> Result<(), RouterAppError> {
+        if self.coordinator.core.pending_security_indication_commit {
+            self.service_trust_center_replay_retirements()?;
+            self.coordinator
+                .node_mut()
+                .complete_security_indication_persistence()
+                .await?;
+            self.coordinator.core.pending_security_indication_commit = false;
+        }
+        if let Some(child_address) = self.pending_local_child_departure_completion {
+            let core = &mut self.coordinator.core;
+            core.children
+                .complete_local_departure(&mut core.node, &child_address)?;
+            self.pending_local_child_departure_completion = None;
+        }
+        Ok(())
+    }
+
+    fn service_trust_center_replay_retirements(&mut self) -> Result<(), RouterAppError> {
+        while let Some(address) = self.trust_center.pending_device_replay_tombstone() {
+            self.coordinator
+                .node_mut()
+                .tombstone_replay_counters(ReplayCounterTombstone::Device(address))?;
+            self.trust_center.complete_pending_device_revocation(
+                self.coordinator.node_mut().device_mut(),
+                address,
+            )?;
+        }
+        self.coordinator
+            .node_mut()
+            .tombstone_retired_trust_center_link_key_replay_counters()?;
+        Ok(())
+    }
+
+    /// Start a centralized Network-Key rotation using the configured BDB
+    /// broadcast/unicast update method.
+    ///
+    /// The staged key and Trust Center intent are committed in separate
+    /// journals with recovery ordering; normal `step()` calls perform
+    /// distribution, Switch-Key, activation, and transaction cleanup.
+    pub async fn request_network_key_rotation(&mut self) -> Result<(), RouterAppError> {
+        self.ensure_trust_center_initialized().await?;
+        self.service_network_key_rotation(true)
+    }
+
+    fn service_network_key_rotation(&mut self, force_start: bool) -> Result<(), RouterAppError> {
+        if self.trust_center.pending_network_key_activation().is_some() {
+            let activated = self
+                .trust_center
+                .activate_pending_network_key(self.coordinator.node_mut().device_mut())?;
+            if activated {
+                self.coordinator.core.checkpoint_security()?;
+            }
+            let (device, replay_store) =
+                self.coordinator.node_mut().device_and_security_store_mut();
+            self.trust_center
+                .complete_network_key_rotation(device, replay_store)?;
+            return Ok(());
+        }
+        if self.trust_center.network_key_rotation().is_some() {
+            return Ok(());
+        }
+
+        let due = self
+            .trust_center
+            .network_key_rotation_due(self.coordinator.node().device());
+        let orphaned = self
+            .trust_center
+            .has_orphaned_network_key_preparation(self.coordinator.node().device());
+        if !force_start && !due && !orphaned {
+            return Ok(());
+        }
+        let method = self
+            .coordinator
+            .node()
+            .device()
+            .bdb()
+            .attributes()
+            .trust_center_network_key_update_method;
+        let target_sequence = self
+            .trust_center
+            .prepare_network_key_rotation(self.coordinator.node_mut().device_mut())?;
+        self.coordinator.core.checkpoint_security()?;
+        self.coordinator
+            .node_mut()
+            .tombstone_retired_network_key_replay_counters()?;
+        if method == zigbee_runtime::trust_center_runtime::NetworkKeyUpdateMethod::Broadcast {
+            let (device, store) = self.coordinator.node_mut().device_and_security_store_mut();
+            if !device.begin_network_key_forwarding(store)? {
+                return Err(zigbee_runtime::trust_center_runtime::TrustCenterRuntimeError::NetworkKeyRotationNotPrepared.into());
+            }
+        }
+        self.trust_center.commit_network_key_rotation(
+            self.coordinator.node().device(),
+            target_sequence,
+            method,
+        )?;
+        Ok(())
+    }
+
+    fn stage_pending_trust_center_child_removal(&mut self) -> Result<(), RouterAppError> {
+        let Some(child_address) = self
+            .trust_center
+            .pending_local_child_removal(self.coordinator.node().device())
+        else {
+            return Ok(());
+        };
+        let core = &mut self.coordinator.core;
+        if core
+            .children
+            .stage_removal(&mut core.node, &child_address)?
+        {
+            core.parts
+                .diagnostics
+                .record(DiagnosticEvent::ChildRemovalStaged { child_address });
+        }
+        Ok(())
+    }
+
+    pub async fn run(&mut self) -> ! {
+        if let Err(error) = self.initialize().await {
+            self.coordinator.core.fatal(error);
+        }
+        loop {
+            // Same outlining boundary as `RouterCore::run`: the inlined
+            // `step_joined` body would otherwise be re-emitted at every
+            // resume edge of this loop.
+            if let Err(error) = await_out_of_line!(self.step()) {
+                self.coordinator.core.fatal(error);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "trust-center")]
+impl<'a, M, S, P, C, T, St, Sv, D, O>
+    TrustCenterCoordinatorApp<'a, M, S, P, C, T, St, Sv, D, O, NoApsTables>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    T: TrustCenterDeviceStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    O: RouterObserver<M, Router>,
+{
+    pub fn new_observed(
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        trust_center_store: T,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<Self, RouterAppError> {
+        Self::new_observed_with_aps_tables(
+            node,
+            children,
+            NoApsTables,
+            trust_center_store,
+            policy,
+            parts,
+        )
+    }
+}
+
+#[cfg(feature = "trust-center")]
+impl<'a, M, S, P, C, T, St, Sv, D>
+    TrustCenterCoordinatorApp<'a, M, S, P, C, T, St, Sv, D, NoObserver, NoApsTables>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    T: TrustCenterDeviceStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+{
+    pub fn new(
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        trust_center_store: T,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<Self, RouterAppError> {
+        Self::new_observed(node, children, trust_center_store, policy, parts)
+    }
+}
+
+#[cfg(feature = "trust-center")]
+impl<'a, M, S, P, C, T, St, Sv, D, A>
+    TrustCenterCoordinatorApp<'a, M, S, P, C, T, St, Sv, D, NoObserver, A>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    T: TrustCenterDeviceStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    A: ApsTableLifecycle<M, S, P, Router>,
+{
+    pub fn new_with_aps_tables(
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        aps_tables: A,
+        trust_center_store: T,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<Self, RouterAppError> {
+        Self::new_observed_with_aps_tables(
+            node,
+            children,
+            aps_tables,
+            trust_center_store,
+            policy,
+            parts,
+        )
+    }
+}
+
+#[cfg(feature = "router")]
+type DistributedCore<'a, M, S, P, C, A, St, Sv, D, O> =
+    RouterCore<'a, M, S, P, Router, PersistentChildren<C>, A, DistributedArchetype, St, Sv, D, O>;
+
+/// Child-capable router that owns a distributed-security PAN.
+///
+/// The product must provision its certified distributed-security global link
+/// key before initialization. This frontend can only resume or form a
+/// distributed PAN; it cannot steer into a centralized network.
+#[cfg(feature = "router")]
+pub struct DistributedRouterApp<'a, M, S, P, C, St, Sv, D, O = NoObserver, A = NoApsTables>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    O: RouterObserver<M, Router>,
+{
+    core: DistributedCore<'a, M, S, P, C, A, St, Sv, D, O>,
+}
+
+#[cfg(feature = "router")]
+impl<'a, M, S, P, C, St, Sv, D, O, A> DistributedRouterApp<'a, M, S, P, C, St, Sv, D, O, A>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    O: RouterObserver<M, Router>,
+    A: ApsTableLifecycle<M, S, P, Router>,
+{
+    /// Construct with statically selected observer and APS-table store types.
+    pub fn new_observed_with_aps_tables(
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        aps_tables: A,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<Self, RouterAppError> {
+        Ok(Self {
+            core: RouterCore::new(node, children, aps_tables, policy, parts)?,
+        })
+    }
+
+    pub const fn node(&self) -> &RouterNode<'a, M, S, P, Router> {
+        &self.core.node
+    }
+
+    pub fn node_mut(&mut self) -> &mut RouterNode<'a, M, S, P, Router> {
+        &mut self.core.node
+    }
+
+    pub const fn children(&self) -> &PersistentChildren<C> {
+        &self.core.children
+    }
+
+    pub fn children_mut(&mut self) -> &mut PersistentChildren<C> {
+        &mut self.core.children
+    }
+
+    pub const fn aps_tables(&self) -> &A {
+        &self.core.aps_tables
+    }
+
+    pub fn aps_tables_mut(&mut self) -> &mut A {
+        &mut self.core.aps_tables
+    }
+
+    pub fn parts(&self) -> &RouterParts<St, Sv, D> {
+        &self.core.parts
+    }
+
+    pub fn parts_mut(&mut self) -> &mut RouterParts<St, Sv, D> {
+        &mut self.core.parts
+    }
+
+    pub async fn initialize(&mut self) -> Result<(), RouterAppError> {
+        self.core.initialize().await
+    }
+
+    pub async fn initialize_deferred_factory_reset(&mut self) -> Result<(), RouterAppError> {
+        self.core.initialize_deferred_factory_reset().await
+    }
+
+    pub const fn factory_reset_pending(&self) -> bool {
+        self.core.factory_reset_pending()
+    }
+
+    pub async fn complete_pending_factory_reset_and_recommission(
+        &mut self,
+    ) -> Result<(), RouterAppError> {
+        self.core
+            .complete_pending_factory_reset_and_recommission()
+            .await
+    }
+
+    /// Urgently clear durable network, child, and APS state, then schedule
+    /// fresh distributed formation.
+    pub async fn urgent_factory_reset_and_recommission(&mut self) -> Result<(), RouterAppError> {
+        self.core.urgent_factory_reset_and_recommission().await
+    }
+
+    pub async fn step(&mut self) -> Result<StepEvents, RouterAppError> {
+        self.core.step().await
+    }
+
+    pub async fn step_deferred_factory_reset(&mut self) -> Result<StepEvents, RouterAppError> {
+        self.core.step_deferred_factory_reset().await
+    }
+
+    pub async fn run(&mut self) -> ! {
+        self.core.run().await
+    }
+}
+
+#[cfg(feature = "router")]
+impl<'a, M, S, P, C, St, Sv, D, O> DistributedRouterApp<'a, M, S, P, C, St, Sv, D, O, NoApsTables>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    O: RouterObserver<M, Router>,
+{
+    pub fn new_observed(
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<Self, RouterAppError> {
+        Self::new_observed_with_aps_tables(node, children, NoApsTables, policy, parts)
+    }
+}
+
+#[cfg(feature = "router")]
+impl<'a, M, S, P, C, St, Sv, D>
+    DistributedRouterApp<'a, M, S, P, C, St, Sv, D, NoObserver, NoApsTables>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+{
+    pub fn new(
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<Self, RouterAppError> {
+        Self::new_observed(node, children, policy, parts)
+    }
+}
+
+#[cfg(feature = "router")]
+impl<'a, M, S, P, C, St, Sv, D, A> DistributedRouterApp<'a, M, S, P, C, St, Sv, D, NoObserver, A>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    A: ApsTableLifecycle<M, S, P, Router>,
+{
+    pub fn new_with_aps_tables(
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        aps_tables: A,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<Self, RouterAppError> {
+        Self::new_observed_with_aps_tables(node, children, aps_tables, policy, parts)
+    }
+}
+
 #[cfg(feature = "router")]
 type CoordinatorCore<'a, M, S, P, C, A, St, Sv, D, O> =
     RouterCore<'a, M, S, P, Router, PersistentChildren<C>, A, CoordinatorArchetype, St, Sv, D, O>;
@@ -1844,6 +3161,10 @@ where
         self.core
             .complete_pending_factory_reset_and_recommission()
             .await
+    }
+
+    pub async fn urgent_factory_reset_and_recommission(&mut self) -> Result<(), RouterAppError> {
+        self.core.urgent_factory_reset_and_recommission().await
     }
 
     pub async fn step(&mut self) -> Result<StepEvents, RouterAppError> {

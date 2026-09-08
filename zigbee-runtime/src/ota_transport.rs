@@ -1,6 +1,6 @@
 //! OTA session transport — the network bookkeeping every platform needs.
 //!
-//! [`OtaManager`](crate::ota::OtaManager) owns the OTA cluster state machine:
+//! [`OtaManager`] owns the OTA cluster state machine:
 //! which query/block/upgrade-end command to send next, how to parse the OTA
 //! image header, and when a download is complete. It has no notion of the
 //! network: it only queues a [`PendingOtaFrame`](crate::ota::PendingOtaFrame)
@@ -23,7 +23,7 @@
 //! * image parsing/validation and query/block/upgrade sequencing — owned by
 //!   [`OtaManager`];
 //! * physical storage, version policy, and boot selection — owned by each
-//!   platform's [`FirmwareWriter`](crate::firmware_writer::FirmwareWriter);
+//!   platform's [`FirmwareWriter`];
 //! * *when* to react to a status — fast-poll window extensions, console
 //!   logging, and the checkpoint-before-activate ordering remain product
 //!   policy, so callers own their concrete [`OtaManager`].

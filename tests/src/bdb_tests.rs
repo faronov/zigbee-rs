@@ -12,8 +12,11 @@ use zigbee_nwk::{DeviceType, NwkLayer};
 use zigbee_types::ChannelMask;
 use zigbee_zdo::ZdoLayer;
 
+const REJOIN_NETWORK_KEY: [u8; 16] = [0x5A; 16];
+const REJOIN_DEVICE_IEEE: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+
 fn make_bdb(device_type: DeviceType) -> BdbLayer<MockMac> {
-    let mac = MockMac::new([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+    let mac = MockMac::new(REJOIN_DEVICE_IEEE);
     let nwk = NwkLayer::new(mac, device_type);
     let aps = ApsLayer::new(nwk);
     let zdo = ZdoLayer::new(aps);
@@ -274,15 +277,23 @@ fn commissioned_bdb(
 ) -> BdbLayer<MockMac> {
     let mut bdb = make_bdb(device_type);
     bdb.attributes_mut().node_is_on_a_network = true;
-    let nib = bdb.zdo_mut().nwk_mut().nib_mut();
-    nib.extended_pan_id = REJOIN_EPID;
-    nib.pan_id = REJOIN_PAN;
-    nib.network_address = zigbee_types::ShortAddress(0x4321);
-    nib.logical_channel = 15;
-    // A commissioned device holds a *known-good* update state; setting the
-    // raw field alone would leave it unknown and disable the staleness gate.
-    nib.set_nwk_update_id(update_id);
-    nib.parent_address = zigbee_types::ShortAddress(previous_parent);
+    let nwk = bdb.zdo_mut().nwk_mut();
+    nwk.security_mut().set_network_key(REJOIN_NETWORK_KEY, 0);
+    {
+        let nib = nwk.nib_mut();
+        nib.extended_pan_id = REJOIN_EPID;
+        nib.pan_id = REJOIN_PAN;
+        nib.network_address = zigbee_types::ShortAddress(0x4321);
+        nib.logical_channel = 15;
+        nib.ieee_address = REJOIN_DEVICE_IEEE;
+        nib.security_enabled = true;
+        nib.active_key_seq_number = 0;
+        nib.outgoing_frame_counter_limit = 0x400;
+        // A commissioned device holds a *known-good* update state; setting the
+        // raw field alone would leave it unknown and disable the staleness gate.
+        nib.set_nwk_update_id(update_id);
+        nib.parent_address = zigbee_types::ShortAddress(previous_parent);
+    }
     bdb
 }
 

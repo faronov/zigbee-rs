@@ -30,7 +30,7 @@ pub mod ota;
 pub mod parts;
 pub mod policy;
 
-pub use app::{SensorApp, SensorAppError, SensorLifecycleError};
+pub use app::{FindingBindingTargetError, SensorApp, SensorAppError, SensorLifecycleError};
 pub use battery::{
     BatteryReading, BatterySource, BlockingBattery, BlockingBatterySource, FixedBattery,
 };

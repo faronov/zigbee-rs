@@ -538,9 +538,15 @@ mod tests {
             .build();
         let component =
             SmartPlug::new(SmartPlugReporting::default()).with_metering(UNIT_KWH, 1, 1_000);
-        component
-            .configure_default_reporting(1, &mut device)
-            .unwrap();
+        let result = component.configure_default_reporting(1, &mut device);
+        if zigbee_zcl::foundation::reporting::MAX_REPORT_CONFIGS < 6 {
+            assert_eq!(
+                result,
+                Err(ProfileError::Reporting(ZclStatus::InsufficientSpace))
+            );
+            return;
+        }
+        result.unwrap();
 
         assert_eq!(device.configured_cluster_count(1), 3);
 

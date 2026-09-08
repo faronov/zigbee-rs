@@ -8,11 +8,14 @@ repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
 [features]
+default = ["distributed-security", "groups"]
+distributed-security = ["zigbee-runtime/distributed-security"]
+groups = ["zigbee-runtime/groups"]
 ota = ["zigbee-runtime/ota"]
 
 [dependencies]
 zigbee-mac = { path = "../../zigbee-mac" }
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["sleepy-end-device", "finding-binding-target"] }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 
 [dev-dependencies]

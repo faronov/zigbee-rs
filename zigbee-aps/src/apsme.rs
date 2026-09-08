@@ -99,7 +99,7 @@ pub enum ApsUpdateDeviceStatus {
     StandardDeviceSecuredRejoin = 0x00,
     StandardDeviceUnsecuredJoin = 0x01,
     DeviceLeft = 0x02,
-    StandardDeviceUnsecuredRejoin = 0x03,
+    StandardDeviceTrustCenterRejoin = 0x03,
 }
 
 impl ApsUpdateDeviceStatus {
@@ -108,7 +108,7 @@ impl ApsUpdateDeviceStatus {
             0x00 => Some(Self::StandardDeviceSecuredRejoin),
             0x01 => Some(Self::StandardDeviceUnsecuredJoin),
             0x02 => Some(Self::DeviceLeft),
-            0x03 => Some(Self::StandardDeviceUnsecuredRejoin),
+            0x03 => Some(Self::StandardDeviceTrustCenterRejoin),
             _ => None,
         }
     }

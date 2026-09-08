@@ -838,8 +838,6 @@ impl Default for BtrTable {
 /// remember the discoveries that are still inside their lifetime.
 #[cfg(feature = "router")]
 pub(crate) const MAX_RREQ_RECORDS: usize = 8;
-#[cfg(not(feature = "router"))]
-pub(crate) const MAX_RREQ_RECORDS: usize = 0;
 
 /// Lifetime of a route-request forwarding record, in seconds.
 ///
@@ -847,7 +845,9 @@ pub(crate) const MAX_RREQ_RECORDS: usize = 0;
 /// describes so a late duplicate of the *same* request cannot restart the
 /// propagation after the broadcast transaction record has already expired
 /// (BTR entries live 9 s).
+#[cfg(feature = "router")]
 const RREQ_RECORD_LIFETIME_SECS: u8 = 12;
+#[cfg(feature = "router")]
 const MAX_RREQ_SENDERS: usize = crate::neighbor::MAX_NEIGHBORS;
 
 /// A route request this device has already acted upon.
@@ -857,6 +857,7 @@ const MAX_RREQ_SENDERS: usize = crate::neighbor::MAX_NEIGHBORS;
 /// every hop it is propagated over. The NWK sequence number cannot be used for
 /// this: a retry from the originator carries a fresh sequence number, so the
 /// broadcast transaction record no longer suppresses it.
+#[cfg(feature = "router")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RreqRecord {
     originator: ShortAddress,
@@ -871,6 +872,7 @@ pub(crate) struct RreqRecord {
     active: bool,
 }
 
+#[cfg(feature = "router")]
 impl RreqRecord {
     const fn empty() -> Self {
         Self {
@@ -890,10 +892,12 @@ impl RreqRecord {
 ///
 /// Compiled to zero capacity without the `router` feature, where nothing may
 /// be forwarded in the first place.
+#[cfg(feature = "router")]
 pub(crate) struct RreqRecordTable {
     entries: [RreqRecord; MAX_RREQ_RECORDS],
 }
 
+#[cfg(feature = "router")]
 impl RreqRecordTable {
     pub(crate) const fn new() -> Self {
         Self {
@@ -1001,6 +1005,7 @@ impl RreqRecordTable {
     }
 }
 
+#[cfg(feature = "router")]
 impl Default for RreqRecordTable {
     fn default() -> Self {
         Self::new()

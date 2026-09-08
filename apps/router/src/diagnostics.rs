@@ -50,6 +50,11 @@ pub enum StackEventSummary {
         open: bool,
     },
     ApsSecurityIndication,
+    DeviceAnnounced {
+        address: [u8; 8],
+        short_address: u16,
+        capabilities: u8,
+    },
     ReportSent,
     OtaImageAvailable {
         version: u32,
@@ -144,6 +149,15 @@ pub fn summarize_stack_event(event: &StackEvent) -> StackEventSummary {
             StackEventSummary::PermitJoinChanged { open: *open }
         }
         StackEvent::ApsSecurityIndication(_) => StackEventSummary::ApsSecurityIndication,
+        StackEvent::DeviceAnnounced {
+            address,
+            short_address,
+            capabilities,
+        } => StackEventSummary::DeviceAnnounced {
+            address: *address,
+            short_address: short_address.0,
+            capabilities: *capabilities,
+        },
         StackEvent::ReportSent => StackEventSummary::ReportSent,
         StackEvent::OtaImageAvailable { version, size } => StackEventSummary::OtaImageAvailable {
             version: *version,
@@ -198,6 +212,21 @@ pub enum DiagnosticEvent {
     },
     ChildTableSaved,
     ChildTableCleared,
+    ChildRemovalStaged {
+        child_address: [u8; 8],
+    },
+    ChildRemovalRetry {
+        child_address: [u8; 8],
+        short_address: u16,
+        attempts: u8,
+        error: zigbee_nwk::NwkStatus,
+    },
+    ChildRemovalCompleted {
+        child_address: [u8; 8],
+        short_address: u16,
+        attempts: u8,
+        delivered: bool,
+    },
     ApsTablesRestored {
         count: usize,
     },

@@ -779,8 +779,15 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
         Ok(())
     }
 
-    async fn mlme_start(&mut self, _req: MlmeStartRequest) -> Result<(), MacError> {
-        Err(MacError::Unsupported)
+    async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
+        // `NrfMac` does not implement `ParentMacDriver`: `NrfRadioPhy::send_ack`
+        // returns `PhyError::Unsupported` because embassy-nrf exposes only
+        // CCA-gated TX, so no acknowledgement — let alone one carrying a
+        // Frame Pending bit — can be emitted inside aTurnaroundTime. This
+        // backend already failed closed; routing the rejection through the
+        // shared helper keeps the reason greppable and validates the request
+        // shape.
+        start_requires_parent_capability(&req)
     }
 
     async fn mlme_get(&self, attr: PibAttribute) -> Result<PibValue, MacError> {
@@ -1215,14 +1222,7 @@ impl<T: RadioInstance, R: RngInstance> MacDriver for NrfMac<'_, T, R> {
     }
 
     fn capabilities(&self) -> MacCapabilities {
-        MacCapabilities {
-            coordinator: false,
-            router: false,
-            hardware_security: false,
-            max_payload: 102,
-            tx_power_min: TxPower(-20),
-            tx_power_max: TxPower(8), // nRF52840: -20 to +8 dBm
-        }
+        MacCapabilities::non_parent(102, TxPower(-20), TxPower(8)) // nRF52840: -20 to +8 dBm
     }
 }
 

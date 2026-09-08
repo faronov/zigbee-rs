@@ -664,16 +664,10 @@ impl MacDriver for Cc2340Mac {
     }
 
     async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
-        self.pan_id = req.pan_id;
-        self.channel = req.channel;
-
-        self.sync_radio_config();
-        log::info!(
-            "[CC2340] PAN started: 0x{:04X} ch={}",
-            req.pan_id.0,
-            req.channel
-        );
-        Ok(())
+        // `Cc2340Mac` does not implement `ParentMacDriver`: hardware auto-ACK
+        // is left disabled (`PBE_IEEE_CFGAUTOACK = 0`) and every parent
+        // primitive keeps its `Unsupported` default. Fail explicitly.
+        start_requires_parent_capability(&req)
     }
 
     async fn mlme_get(&self, attr: PibAttribute) -> Result<PibValue, MacError> {
@@ -917,14 +911,7 @@ impl MacDriver for Cc2340Mac {
     }
 
     fn capabilities(&self) -> MacCapabilities {
-        MacCapabilities {
-            coordinator: false,
-            router: true,
-            hardware_security: false,
-            max_payload: 116,
-            tx_power_min: TxPower(-20),
-            tx_power_max: TxPower(8),
-        }
+        MacCapabilities::non_parent(116, TxPower(-20), TxPower(8))
     }
 }
 

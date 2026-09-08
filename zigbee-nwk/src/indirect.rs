@@ -6,6 +6,8 @@
 
 use zigbee_types::ShortAddress;
 
+use crate::IndirectFrameKind;
+
 #[cfg(feature = "router")]
 pub const MAX_INDIRECT: usize = 8;
 #[cfg(not(feature = "router"))]
@@ -18,6 +20,7 @@ pub struct IndirectEntry {
     pub dst_addr: ShortAddress,
     pub frame: [u8; MAX_FRAME_SIZE],
     pub len: usize,
+    pub kind: IndirectFrameKind,
     /// Remaining lifetime in seconds (spec: 7.68s ≈ nwkIndirectPollTimeout)
     pub ttl: u8,
     order: u32,
@@ -30,6 +33,7 @@ impl IndirectEntry {
             dst_addr: ShortAddress(0xFFFF),
             frame: [0; MAX_FRAME_SIZE],
             len: 0,
+            kind: IndirectFrameKind::Data,
             ttl: 0,
             order: 0,
             active: false,
@@ -46,11 +50,16 @@ pub struct IndirectQueue {
 pub struct PendingIndirectFrame {
     frame: [u8; MAX_FRAME_SIZE],
     len: usize,
+    kind: IndirectFrameKind,
 }
 
 impl PendingIndirectFrame {
     pub fn as_slice(&self) -> &[u8] {
         &self.frame[..self.len]
+    }
+
+    pub fn kind(&self) -> IndirectFrameKind {
+        self.kind
     }
 }
 
@@ -68,6 +77,15 @@ impl IndirectQueue {
     }
 
     pub(crate) fn enqueue_with_slot(&mut self, dst: ShortAddress, frame: &[u8]) -> Option<usize> {
+        self.enqueue_tagged_with_slot(dst, frame, IndirectFrameKind::Data)
+    }
+
+    pub(crate) fn enqueue_tagged_with_slot(
+        &mut self,
+        dst: ShortAddress,
+        frame: &[u8],
+        kind: IndirectFrameKind,
+    ) -> Option<usize> {
         if frame.len() > MAX_FRAME_SIZE {
             return None;
         }
@@ -76,6 +94,7 @@ impl IndirectQueue {
         entry.dst_addr = dst;
         entry.frame[..frame.len()].copy_from_slice(frame);
         entry.len = frame.len();
+        entry.kind = kind;
         entry.ttl = 8; // ~7.68s
         entry.order = self.next_order;
         self.next_order = self.next_order.wrapping_add(1);
@@ -118,6 +137,7 @@ impl IndirectQueue {
         Some(PendingIndirectFrame {
             frame,
             len: entry.len,
+            kind: entry.kind,
         })
     }
 
@@ -131,6 +151,13 @@ impl IndirectQueue {
     /// Check if there are pending frames for a child.
     pub fn has_pending(&self, child: ShortAddress) -> bool {
         self.entries.iter().any(|e| e.active && e.dst_addr == child)
+    }
+
+    /// Check whether one child has a queued transaction of the requested kind.
+    pub(crate) fn has_pending_kind(&self, child: ShortAddress, kind: IndirectFrameKind) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.active && entry.dst_addr == child && entry.kind == kind)
     }
 
     /// Count pending frames for one child without modifying FIFO order.
@@ -150,6 +177,20 @@ impl IndirectQueue {
         {
             entry.active = false;
         }
+    }
+
+    /// Remove only transactions of one kind for one child.
+    pub(crate) fn remove_kind(&mut self, child: ShortAddress, kind: IndirectFrameKind) -> bool {
+        let mut removed = false;
+        for entry in self
+            .entries
+            .iter_mut()
+            .filter(|entry| entry.active && entry.dst_addr == child && entry.kind == kind)
+        {
+            entry.active = false;
+            removed = true;
+        }
+        removed
     }
 
     /// Iterate child addresses that currently have queued transactions.

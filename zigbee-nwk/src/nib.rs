@@ -55,6 +55,12 @@ pub struct Nib {
     pub update_id_valid: bool,
     /// NWK manager address (for frequency agility)
     pub nwk_manager_addr: ShortAddress,
+    /// The current address/parent checkpoint still needs a successful
+    /// `Device_annce` before the transition is complete.
+    pub device_announce_pending: bool,
+    /// The current parent was selected by an unsecured Trust Center rejoin
+    /// and has not yet proved possession of the active NWK key.
+    pub parent_link_provisional: bool,
 
     // ── Addressing ──────────────────────────────────────
     /// Own IEEE (extended) address
@@ -177,6 +183,8 @@ impl Nib {
             // Factory-new: no authoritative network update state is held.
             update_id_valid: false,
             nwk_manager_addr: ShortAddress::COORDINATOR,
+            device_announce_pending: false,
+            parent_link_provisional: false,
             ieee_address: [0u8; 8],
             parent_address: ShortAddress(0xFFFF),
             address_assign: AddressAssignMethod::Stochastic,
@@ -194,7 +202,7 @@ impl Nib {
             security_enabled: false,
             active_key_seq_number: 0,
             outgoing_frame_counter: 0,
-            outgoing_frame_counter_limit: u32::MAX,
+            outgoing_frame_counter_limit: 0,
             sequence_number: 0,
             route_request_id: 0,
             permit_joining: false,
@@ -528,6 +536,6 @@ mod tests {
         let mut nib = Nib::new();
         assert!(!nib.set_frame_counter_reservation(10, 9));
         assert_eq!(nib.outgoing_frame_counter, 0);
-        assert_eq!(nib.outgoing_frame_counter_limit, u32::MAX);
+        assert_eq!(nib.outgoing_frame_counter_limit, 0);
     }
 }

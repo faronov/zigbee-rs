@@ -817,13 +817,13 @@ impl MacDriver for Efr32Mac {
     }
 
     async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
-        self.pan_id = req.pan_id;
-        self.channel = req.channel;
-        self.driver.update_config(|c| {
-            c.pan_id = req.pan_id.0;
-            c.channel = req.channel;
-        });
-        Ok(())
+        // `Efr32Mac` does not implement `ParentMacDriver`. The ISR software
+        // ACK path exists and is silicon-proven, but it composes a fixed
+        // `0x02` FCF with the Frame Pending bit clear and there is no
+        // per-child source-match table, so a polling child can never be told
+        // that data is waiting. Fail explicitly rather than reporting a
+        // router start the backend cannot honour.
+        start_requires_parent_capability(&req)
     }
 
     async fn mlme_get(&self, attr: PibAttribute) -> Result<PibValue, MacError> {
@@ -1222,14 +1222,7 @@ impl MacDriver for Efr32Mac {
     }
 
     fn capabilities(&self) -> MacCapabilities {
-        MacCapabilities {
-            coordinator: false,
-            router: true,
-            hardware_security: false,
-            max_payload: 102,
-            tx_power_min: TxPower(-20),
-            tx_power_max: TxPower(19),
-        }
+        MacCapabilities::non_parent(102, TxPower(-20), TxPower(19))
     }
 }
 

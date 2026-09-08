@@ -360,6 +360,8 @@ fn test_leave_command_serialize() {
 
 const REJOIN_EPID: IeeeAddress = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
 const FOREIGN_EPID: IeeeAddress = [0x99; 8];
+const REJOIN_NETWORK_KEY: [u8; 16] = [0x5A; 16];
+const REJOIN_DEVICE_IEEE: IeeeAddress = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
 
 /// Zigbee PRO beacon for a router that could parent a rejoining device.
 ///
@@ -416,15 +418,22 @@ fn rejoin_beacon_with_capacity(
 /// at network update state `update_id`.
 fn commissioned_device(update_id: u8, device_type: DeviceType) -> NwkLayer<MockMac> {
     let mut nwk = NwkLayer::new(make_mock_mac(), device_type);
-    let nib = nwk.nib_mut();
-    nib.extended_pan_id = REJOIN_EPID;
-    nib.pan_id = PanId(0x1A2B);
-    nib.network_address = ShortAddress(0x1234);
-    nib.logical_channel = 15;
-    // A commissioned device holds a *known-good* update state; setting the
-    // raw field alone would leave it unknown and disable the staleness gate.
-    nib.set_nwk_update_id(update_id);
-    nib.parent_address = ShortAddress(0x0001);
+    nwk.security_mut().set_network_key(REJOIN_NETWORK_KEY, 0);
+    {
+        let nib = nwk.nib_mut();
+        nib.extended_pan_id = REJOIN_EPID;
+        nib.pan_id = PanId(0x1A2B);
+        nib.network_address = ShortAddress(0x1234);
+        nib.logical_channel = 15;
+        nib.ieee_address = REJOIN_DEVICE_IEEE;
+        nib.security_enabled = true;
+        nib.active_key_seq_number = 0;
+        nib.outgoing_frame_counter_limit = 0x400;
+        // A commissioned device holds a *known-good* update state; setting the
+        // raw field alone would leave it unknown and disable the staleness gate.
+        nib.set_nwk_update_id(update_id);
+        nib.parent_address = ShortAddress(0x0001);
+    }
     nwk
 }
 

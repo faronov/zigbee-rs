@@ -5,12 +5,22 @@ use crate::clusters::AttributeStoreAccess;
 use crate::data_types::{self, ZclDataType, ZclValue};
 use crate::{AttributeId, ZclStatus};
 
-/// Maximum number of reporting configurations tracked simultaneously.
-#[cfg(not(feature = "constrained-memory"))]
-pub const MAX_REPORT_CONFIGS: usize = 16;
+/// Compact reporting capacity for a product with one application endpoint
+/// and a small, fixed report set.
+#[cfg(feature = "compact-single-endpoint")]
+pub const MAX_REPORT_CONFIGS: usize = 4;
 /// Reduced reporting capacity for devices with tightly constrained SRAM.
-#[cfg(feature = "constrained-memory")]
+#[cfg(all(
+    not(feature = "compact-single-endpoint"),
+    feature = "constrained-memory"
+))]
 pub const MAX_REPORT_CONFIGS: usize = 8;
+/// Default reporting capacity for general-purpose products.
+#[cfg(all(
+    not(feature = "compact-single-endpoint"),
+    not(feature = "constrained-memory")
+))]
+pub const MAX_REPORT_CONFIGS: usize = 16;
 
 /// Direction field in a reporting configuration record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -604,5 +614,52 @@ impl ReadReportingConfigResponse {
             }
         }
         pos
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(attribute_id: u16) -> ReportingConfig {
+        ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: AttributeId(attribute_id),
+            data_type: ZclDataType::U16,
+            min_interval: 1,
+            max_interval: 60,
+            reportable_change: Some(ZclValue::U16(1)),
+        }
+    }
+
+    #[test]
+    fn capacity_features_select_the_smallest_requested_table() {
+        let expected = if cfg!(feature = "compact-single-endpoint") {
+            4
+        } else if cfg!(feature = "constrained-memory") {
+            8
+        } else {
+            16
+        };
+        assert_eq!(MAX_REPORT_CONFIGS, expected);
+    }
+
+    #[test]
+    fn reporting_overflow_is_explicit() {
+        let mut engine = ReportingEngine::new();
+        for index in 0..MAX_REPORT_CONFIGS {
+            assert_eq!(
+                engine.configure_for_cluster(1, index as u16, config(index as u16)),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            engine.configure_for_cluster(
+                1,
+                MAX_REPORT_CONFIGS as u16,
+                config(MAX_REPORT_CONFIGS as u16),
+            ),
+            Err(ZclStatus::InsufficientSpace)
+        );
     }
 }

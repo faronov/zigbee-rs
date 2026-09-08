@@ -64,6 +64,7 @@ const _: () =
 /// dispatcher (it lives in the `ClusterRef` slice), but the mirrored APS group
 /// table is owned by the `M`-generic APS layer, so the concrete request is
 /// bubbled up for the async caller to apply through `apsme_*`.
+#[cfg(any(feature = "groups", test))]
 pub(crate) enum GroupTableAction {
     Add { group: u16, endpoint: u8 },
     Remove { group: u16, endpoint: u8 },
@@ -78,7 +79,9 @@ pub(crate) enum GroupTableAction {
 /// APS/BDB layers after the borrow of runtime-local state is released.
 pub(crate) struct LocalZclOutcome {
     pub(crate) event: Option<event_loop::StackEvent>,
+    #[cfg(any(feature = "groups", test))]
     pub(crate) group_action: Option<GroupTableAction>,
+    #[cfg(any(feature = "finding-binding", test))]
     pub(crate) fb_identify_target: Option<(u16, u8)>,
 }
 
@@ -102,7 +105,9 @@ pub(crate) struct LocalZclCtx<'a, 'c, const N: usize> {
     pending_responses: &'a mut heapless::Vec<PendingZclResponse, N>,
     clusters: &'a mut [ClusterRef<'c>],
     zcl_scratch: &'a mut [u8; 253],
+    #[cfg(any(feature = "groups", test))]
     group_action: Option<GroupTableAction>,
+    #[cfg(any(feature = "finding-binding", test))]
     fb_identify_target: Option<(u16, u8)>,
 }
 
@@ -127,7 +132,9 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             pending_responses,
             clusters,
             zcl_scratch,
+            #[cfg(any(feature = "groups", test))]
             group_action: None,
+            #[cfg(any(feature = "finding-binding", test))]
             fb_identify_target: None,
         }
     }
@@ -152,7 +159,9 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         let event = self.dispatch_inner(dst_ep, src_endpoint, cluster_id, src_addr, payload);
         LocalZclOutcome {
             event,
+            #[cfg(any(feature = "groups", test))]
             group_action: self.group_action,
+            #[cfg(any(feature = "finding-binding", test))]
             fb_identify_target: self.fb_identify_target,
         }
     }
@@ -1055,18 +1064,21 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
 
         // ── Cluster-specific command dispatch ────────────────────
         if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::ClusterSpecific {
-            // Intercept Identify Query Response (cluster 0x0003, cmd 0x00, server→client)
-            // for F&B initiator target collection
-            if cluster_id == ClusterId::IDENTIFY.0
-                && cmd_id == zigbee_zcl::clusters::identify::CMD_IDENTIFY_QUERY_RESPONSE.0
-                && zcl_frame.header.direction() == ClusterDirection::ServerToClient
+            #[cfg(any(feature = "finding-binding", test))]
             {
-                self.fb_identify_target = Some((src_addr, src_endpoint));
-                log::debug!(
-                    "[Runtime] F&B: Identify Query Response from 0x{:04X} ep {}",
-                    src_addr,
-                    src_endpoint,
-                );
+                // Intercept Identify Query Response (cluster 0x0003, cmd
+                // 0x00, server→client) for F&B initiator target collection.
+                if cluster_id == ClusterId::IDENTIFY.0
+                    && cmd_id == zigbee_zcl::clusters::identify::CMD_IDENTIFY_QUERY_RESPONSE.0
+                    && zcl_frame.header.direction() == ClusterDirection::ServerToClient
+                {
+                    self.fb_identify_target = Some((src_addr, src_endpoint));
+                    log::debug!(
+                        "[Runtime] F&B: Identify Query Response from 0x{:04X} ep {}",
+                        src_addr,
+                        src_endpoint,
+                    );
+                }
             }
 
             if zcl_frame.header.direction() == ClusterDirection::ServerToClient {
@@ -1100,6 +1112,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                 }
 
                 // Groups cluster → APS group table bridge
+                #[cfg(any(feature = "groups", test))]
                 if cluster_id == ClusterId::GROUPS.0 {
                     // Parse group action from command ID and sync to APS table.
                     // Can't use GroupsCluster::take_action() through trait object,
@@ -1368,10 +1381,11 @@ fn command_received_event_with_type(
 ///   genuinely overflow; historically it serialized into a scratch buffer and
 ///   returned without queueing when the copy into the `PendingZclResponse`
 ///   buffer overflowed.
-/// * The Read Reporting Configuration response path historically serialized
-///   into a 128-byte buffer, so a maximum-size response (3 header bytes + a
-///   128-byte payload = 131 bytes) failed serialization and queued nothing —
-///   i.e. it dropped (regression: `read_reporting_max_response_is_dropped`).
+/// * The Read Reporting Configuration response path serializes into a
+///   128-byte payload buffer. Capacity profiles whose maximum framed response
+///   exceeds `PENDING_ZCL_DATA_CAP` drop it whole; smaller profiles queue the
+///   complete response (regression:
+///   `read_reporting_max_response_is_queued_whole_or_dropped`).
 /// * The default / configure-reporting / cluster-specific paths build frames
 ///   that are provably small enough that the drop branch never runs (see the
 ///   module-level `const _` assertion for the cluster-specific bound).
@@ -1562,12 +1576,10 @@ pub(crate) fn queue_read_reporting_response<const N: usize>(
         src_endpoint,
         cluster_id,
         &frame,
-        // A maximum Read Reporting Configuration Response is 3 header bytes + a
-        // 128-byte payload = 131 bytes, exceeding PENDING_ZCL_DATA_CAP. Restore
-        // the exact prior behavior: the historical helper serialized into a
-        // 128-byte buffer, so such a frame failed serialization and queued
-        // nothing — i.e. the oversized frame is dropped, not truncated
-        // (regression: `read_reporting_max_response_is_dropped`).
+        // Capacity profiles that produce more than PENDING_ZCL_DATA_CAP bytes
+        // retain the exact prior drop-whole behavior. Compact profiles can fit
+        // their complete maximum response and queue it without truncation
+        // (regression: `read_reporting_max_response_is_queued_whole_or_dropped`).
     );
 }
 
@@ -1937,24 +1949,20 @@ mod tests {
     }
 
     /// Regression lock for the Read Reporting Configuration response overflow
-    /// policy (non-blocking finding): a maximum-size response serializes to a
-    /// frame larger than `PENDING_ZCL_DATA_CAP`. The historical helper
-    /// serialized into a 128-byte buffer, so such a frame failed serialization
-    /// and queued *nothing* — it is dropped, not truncated. This pins the
-    /// shared `queue_frame`'s drop-on-overflow policy for the read-reporting
-    /// path so it can never silently revert to enqueueing a truncated frame.
+    /// policy: a maximum-size response is queued whole when it fits the active
+    /// capacity profile, or dropped whole when it exceeds
+    /// `PENDING_ZCL_DATA_CAP`. It is never truncated.
     #[test]
-    fn read_reporting_max_response_is_dropped() {
+    fn read_reporting_max_response_is_queued_whole_or_dropped() {
         use zigbee_zcl::data_types::{ZclDataType, ZclValue};
         use zigbee_zcl::foundation::reporting::{
             ReadReportingConfigResponse, ReadReportingConfigResponseRecord, ReportDirection,
             ReportingConfig,
         };
 
-        // Build the largest possible response: every record is a Send record
-        // carrying a config with an 8-byte reportable change, so the serialized
-        // payload fills the 128-byte builder buffer and the framed response
-        // (3 header + 128 payload = 131 bytes) exceeds PENDING_ZCL_DATA_CAP.
+        // Build the largest response permitted by the active reporting
+        // capacity. Every record is a Send record carrying a config with an
+        // 8-byte reportable change.
         let mut response = ReadReportingConfigResponse {
             records: heapless::Vec::new(),
         };
@@ -1979,8 +1987,7 @@ mod tests {
         }
 
         // Independently reconstruct the full serialized 0x09 frame the helper
-        // builds, and confirm it really does overflow the queue buffer, so the
-        // drop policy is genuinely exercised (not a fits-whole no-op).
+        // builds so the expected queue/drop result is tied to its actual size.
         let mut frame =
             ZclFrame::new_global(SEQ, CommandId(0x09), ClusterDirection::ServerToClient, true);
         let mut payload_buf = [0u8; 128];
@@ -1990,7 +1997,6 @@ mod tests {
         }
         let mut full = [0u8; 256];
         let full_len = frame.serialize(&mut full).unwrap();
-        assert!(full_len > crate::PENDING_ZCL_DATA_CAP);
 
         let mut pending: heapless::Vec<PendingZclResponse, 4> = heapless::Vec::new();
         super::queue_read_reporting_response(
@@ -2003,9 +2009,14 @@ mod tests {
             &response,
         );
 
-        // Dropped: an oversized framed response queues nothing rather than
-        // enqueueing a truncated (malformed) frame.
-        assert!(pending.is_empty());
+        if full_len > crate::PENDING_ZCL_DATA_CAP {
+            // Dropped: an oversized framed response queues nothing rather than
+            // enqueueing a truncated (malformed) frame.
+            assert!(pending.is_empty());
+        } else {
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].zcl_data.as_slice(), &full[..full_len]);
+        }
     }
 
     #[test]

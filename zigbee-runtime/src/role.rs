@@ -47,6 +47,7 @@
 //! [`ParentMacDriver`]: zigbee_mac::ParentMacDriver
 
 use zigbee_mac::MacDriver;
+use zigbee_types::{IeeeAddress, ShortAddress};
 
 use crate::ZigbeeDevice;
 
@@ -143,6 +144,9 @@ impl RoleState for EndDeviceState {
 /// [`ParentRole::parent_state`]/[`ParentRole::parent_state_mut`], so parent
 /// helpers get safe, `unsafe`-free access to the concrete state.
 pub struct ParentState {
+    /// Volatile progress reconstructed from the durable Network-Key snapshot.
+    #[cfg(feature = "router")]
+    pub(crate) network_key_forwarding: crate::ParentNetworkKeyForwarding,
     /// Trust Center notifications deferred until an indirect Rejoin Response is
     /// actually transmitted and acknowledged.
     pub(crate) pending_child_updates: heapless::Vec<crate::PendingChildUpdate, 8>,
@@ -156,6 +160,35 @@ pub struct ParentState {
     /// table dirty without instrumenting each call site.
     pub(crate) persisted_child_fingerprint: u32,
     pub(crate) child_table_persisted: bool,
+    /// At least one crash-safe Trust Center Remove-Device transaction is
+    /// present in the durable child snapshot.
+    pub(crate) pending_child_removal: bool,
+    /// Child whose queued Leave request was acknowledged by the MAC but whose
+    /// durable removal record has not yet been cleared.
+    pub(crate) delivered_child_leave: Option<IeeeAddress>,
+    /// Address-conflict intent selected by the NWK receive path but not yet
+    /// committed to the child journal.
+    pub(crate) pending_child_reassignment: Option<crate::PendingChildReassignment>,
+    /// At least one committed child-address reassignment is waiting for its
+    /// unsolicited Rejoin Response.
+    pub(crate) child_reassignment_pending: bool,
+    /// Old child address whose indirect Rejoin Response reached the MAC.
+    pub(crate) delivered_child_reassignment: Option<ShortAddress>,
+    /// Child removed by an authenticated Leave frame but not yet committed as
+    /// a durable DeviceLeft notification intent.
+    pub(crate) pending_child_departure: Option<crate::PendingChildDeparture>,
+    /// At least one committed departure record awaits Trust Center handling.
+    pub(crate) child_departure_pending: bool,
+    /// A local coordinator/Trust Center indication has been emitted for the
+    /// current departure and is waiting for composition-root persistence.
+    pub(crate) child_departure_local_queued: bool,
+    /// Local submission whose child-journal completion still needs to commit.
+    pub(crate) child_departure_remote_submitted: Option<IeeeAddress>,
+    /// Parent-directed remove-children Leave accepted by NWK but not yet
+    /// committed to the child journal. The value is the Leave rejoin bit.
+    pub(crate) pending_child_leave_cascade: Option<bool>,
+    /// A committed remove-children cascade is being serviced.
+    pub(crate) child_leave_cascade_pending: bool,
 }
 
 impl sealed::Sealed for ParentState {}
@@ -163,9 +196,22 @@ impl RoleState for ParentState {
     #[inline]
     fn new() -> Self {
         ParentState {
+            #[cfg(feature = "router")]
+            network_key_forwarding: crate::ParentNetworkKeyForwarding::new(),
             pending_child_updates: heapless::Vec::new(),
             persisted_child_fingerprint: 0,
             child_table_persisted: false,
+            pending_child_removal: false,
+            delivered_child_leave: None,
+            pending_child_reassignment: None,
+            child_reassignment_pending: false,
+            delivered_child_reassignment: None,
+            pending_child_departure: None,
+            child_departure_pending: false,
+            child_departure_local_queued: false,
+            child_departure_remote_submitted: None,
+            pending_child_leave_cascade: None,
+            child_leave_cascade_pending: false,
         }
     }
 }
@@ -180,6 +226,14 @@ impl RoleState for ParentState {
 ///
 /// [`run_role_nwk_maintenance`]: DeviceRole::run_role_nwk_maintenance
 pub trait DeviceRole: sealed::Sealed + Sized {
+    /// A committed snapshot may arm parent-only Network-Key distribution.
+    #[cfg(feature = "router")]
+    #[doc(hidden)]
+    fn record_network_key_snapshot<M: MacDriver>(
+        _device: &mut ZigbeeDevice<M, Self>,
+        _state: &crate::security_store::PersistentSecurityState,
+    ) {
+    }
     /// Whether this role accepts and serves children (router/coordinator side).
     const IS_PARENT: bool;
     /// Whether this role relays NWK traffic and runs router maintenance.
@@ -187,6 +241,26 @@ pub trait DeviceRole: sealed::Sealed + Sized {
     /// `true` for both [`RelayRouter`] and [`Router`]; a [`RelayRouter`] routes
     /// without parenting.
     const CAN_ROUTE: bool;
+    /// Whether this role ever issues an MCPS-DATA (MAC data) poll to a parent.
+    ///
+    /// Only an [`EndDevice`] has a parent to poll: R22 §3.6.1.4 / IEEE
+    /// 802.15.4 indirect transmission is the mechanism by which an
+    /// `MacRxOnWhenIdle == FALSE` child retrieves buffered frames. A
+    /// [`RelayRouter`] and a [`Router`] keep the receiver enabled while idle
+    /// and receive addressed frames directly, so they neither schedule an
+    /// automatic poll nor a keepalive forced poll —
+    /// [`ed_take_forced_poll`](Self::ed_take_forced_poll) is already constant
+    /// `false` for them.
+    ///
+    /// Making that a role constant (rather than only a runtime power-mode
+    /// test) lets the joined tick drop the whole poll-and-consume branch for a
+    /// routing monomorphization. That branch embeds a *complete second copy* of
+    /// the receive path — the non-security-store `process_incoming`, its
+    /// `NwkLayer::process_incoming_nwk_frame_from_with_replay_commit`
+    /// instantiation and its `aps_decrypt_incoming` instantiation — which a
+    /// router can never execute because it drives receive through the durable
+    /// security-store path instead.
+    const POLLS_PARENT: bool;
     /// Human-readable role name for diagnostics.
     const NAME: &'static str;
 
@@ -233,6 +307,15 @@ pub trait DeviceRole: sealed::Sealed + Sized {
         device: &mut ZigbeeDevice<M, Self>,
         outcome: crate::ParentNwkOutcome,
     ) -> impl core::future::Future<Output = ()>;
+
+    /// Record a parent-only remove-children Leave transaction without adding
+    /// parent state to end-device or relay monomorphizations.
+    #[doc(hidden)]
+    fn record_child_leave_cascade<M: MacDriver>(
+        device: &mut ZigbeeDevice<M, Self>,
+        rejoin: bool,
+        remove_children: bool,
+    );
 
     /// Interleave bounded MAC parent-command servicing around a receive window.
     ///
@@ -283,6 +366,64 @@ pub trait DeviceRole: sealed::Sealed + Sized {
     fn ed_service<M: MacDriver>(
         device: &mut ZigbeeDevice<M, Self>,
     ) -> impl core::future::Future<Output = ()>;
+
+    /// Run the joined tick's parent poll, if this role has a parent to poll.
+    ///
+    /// Statically dispatched for the same reason as
+    /// [`run_role_nwk_maintenance`](Self::run_role_nwk_maintenance): the poll
+    /// branch consumes a delivered frame through
+    /// `ZigbeeDevice::process_incoming`, so a role that materializes this
+    /// future materializes a *complete second copy* of the receive path —
+    /// `process_incoming`, its `NwkLayer` replay-commit instantiation and its
+    /// `aps_decrypt_incoming` instantiation — beside the durable
+    /// security-store receive path the device actually uses.
+    ///
+    /// A runtime `if !R::POLLS_PARENT` inside the poll future cannot remove
+    /// that: a coroutine's suspension states are laid out before
+    /// monomorphization, so the unreachable states are still emitted. Only
+    /// never naming the future on the routing roles removes the code, which is
+    /// what this hook does — [`RelayRouter`] and [`Router`] resolve to
+    /// `core::future::ready(None)`.
+    #[doc(hidden)]
+    fn ed_run_poll<M: MacDriver>(
+        device: &mut ZigbeeDevice<M, Self>,
+        now_ms: u32,
+        clusters: &mut [crate::ClusterRef<'_>],
+    ) -> impl core::future::Future<Output = Option<crate::event_loop::StackEvent>>;
+
+    /// Run the joined tick's parent poll against the durable security store.
+    ///
+    /// This is the hook the production tick uses. It exists for two reasons.
+    ///
+    /// *Correctness*: a sleepy end device receives nearly all addressed
+    /// traffic as a poll response, so the delivered frame must commit its NWK
+    /// replay counter and lifecycle transition to the security journal exactly
+    /// like a frame taken by the main receive path (R22 §4.5.2). The volatile
+    /// [`ed_run_poll`](Self::ed_run_poll) sibling is retained only for the
+    /// storeless [`ZigbeeDevice::tick`](crate::ZigbeeDevice::tick) test path.
+    ///
+    /// *Codegen*: routing roles resolve this to `ready(Ok(None))` and
+    /// therefore never name the poll future, which keeps the poll — and the
+    /// receive path it consumes — out of every routing image. A runtime
+    /// `if !R::POLLS_PARENT` inside the future cannot do that: a coroutine's
+    /// suspension states are laid out before monomorphization, so the
+    /// unreachable states are still emitted.
+    #[doc(hidden)]
+    fn ed_run_poll_with_security_store<
+        M: MacDriver,
+        S: crate::security_store::SecurityStateStore,
+        const DEFER_RESET: bool,
+    >(
+        device: &mut ZigbeeDevice<M, Self>,
+        now_ms: u32,
+        clusters: &mut [crate::ClusterRef<'_>],
+        store: &mut S,
+    ) -> impl core::future::Future<
+        Output = Result<
+            Option<crate::event_loop::StackEvent>,
+            crate::security_store::SecurityStoreError,
+        >,
+    >;
 
     /// Consume a client forced-poll request. Always `false` for the
     /// non-end-device roles, which never schedule a keepalive poll.
@@ -368,6 +509,7 @@ impl sealed::Sealed for EndDevice {}
 impl DeviceRole for EndDevice {
     const IS_PARENT: bool = false;
     const CAN_ROUTE: bool = false;
+    const POLLS_PARENT: bool = true;
     const NAME: &'static str = "end-device";
     type State = EndDeviceState;
 
@@ -388,6 +530,15 @@ impl DeviceRole for EndDevice {
     ) {
         // A leaf end device never answers a parent-only NWK outcome.
         let _ = (device, outcome);
+    }
+
+    #[inline]
+    fn record_child_leave_cascade<M: MacDriver>(
+        device: &mut ZigbeeDevice<M, Self>,
+        rejoin: bool,
+        remove_children: bool,
+    ) {
+        let _ = (device, rejoin, remove_children);
     }
 
     #[inline]
@@ -425,6 +576,34 @@ impl DeviceRole for EndDevice {
         device: &mut ZigbeeDevice<M, Self>,
     ) -> impl core::future::Future<Output = ()> {
         device.service_end_device_timeout()
+    }
+
+    #[inline]
+    fn ed_run_poll<M: MacDriver>(
+        device: &mut ZigbeeDevice<M, Self>,
+        now_ms: u32,
+        clusters: &mut [crate::ClusterRef<'_>],
+    ) -> impl core::future::Future<Output = Option<crate::event_loop::StackEvent>> {
+        device.run_sleepy_poll(now_ms, clusters)
+    }
+
+    #[inline]
+    fn ed_run_poll_with_security_store<
+        M: MacDriver,
+        S: crate::security_store::SecurityStateStore,
+        const DEFER_RESET: bool,
+    >(
+        device: &mut ZigbeeDevice<M, Self>,
+        now_ms: u32,
+        clusters: &mut [crate::ClusterRef<'_>],
+        store: &mut S,
+    ) -> impl core::future::Future<
+        Output = Result<
+            Option<crate::event_loop::StackEvent>,
+            crate::security_store::SecurityStoreError,
+        >,
+    > {
+        device.run_sleepy_poll_with_security_store::<S, DEFER_RESET>(now_ms, clusters, store)
     }
 
     #[inline]
@@ -487,6 +666,7 @@ impl sealed::Sealed for RelayRouter {}
 impl DeviceRole for RelayRouter {
     const IS_PARENT: bool = false;
     const CAN_ROUTE: bool = true;
+    const POLLS_PARENT: bool = false;
     const NAME: &'static str = "relay-router";
     type State = NonParentState;
 
@@ -513,6 +693,15 @@ impl DeviceRole for RelayRouter {
         // is true, it must not answer a child Rejoin Request or serve End
         // Device Timeout — that is the correctness hole this dispatch closes.
         let _ = (device, outcome);
+    }
+
+    #[inline]
+    fn record_child_leave_cascade<M: MacDriver>(
+        device: &mut ZigbeeDevice<M, Self>,
+        rejoin: bool,
+        remove_children: bool,
+    ) {
+        let _ = (device, rejoin, remove_children);
     }
 
     #[inline]
@@ -549,6 +738,35 @@ impl DeviceRole for RelayRouter {
     ) -> impl core::future::Future<Output = ()> {
         let _ = device;
         core::future::ready(())
+    }
+    #[inline]
+    fn ed_run_poll<M: MacDriver>(
+        device: &mut ZigbeeDevice<M, Self>,
+        now_ms: u32,
+        clusters: &mut [crate::ClusterRef<'_>],
+    ) -> impl core::future::Future<Output = Option<crate::event_loop::StackEvent>> {
+        let _ = (device, now_ms, clusters);
+        core::future::ready(None)
+    }
+
+    #[inline]
+    fn ed_run_poll_with_security_store<
+        M: MacDriver,
+        S: crate::security_store::SecurityStateStore,
+        const DEFER_RESET: bool,
+    >(
+        device: &mut ZigbeeDevice<M, Self>,
+        now_ms: u32,
+        clusters: &mut [crate::ClusterRef<'_>],
+        store: &mut S,
+    ) -> impl core::future::Future<
+        Output = Result<
+            Option<crate::event_loop::StackEvent>,
+            crate::security_store::SecurityStoreError,
+        >,
+    > {
+        let _ = (device, now_ms, clusters, store);
+        core::future::ready(Ok(None))
     }
     #[inline]
     fn ed_take_forced_poll<M: MacDriver>(device: &mut ZigbeeDevice<M, Self>) -> bool {
@@ -588,8 +806,16 @@ pub struct Router;
 
 impl sealed::Sealed for Router {}
 impl DeviceRole for Router {
+    #[cfg(feature = "router")]
+    fn record_network_key_snapshot<M: MacDriver>(
+        device: &mut ZigbeeDevice<M, Self>,
+        state: &crate::security_store::PersistentSecurityState,
+    ) {
+        device.record_parent_network_key_snapshot(state);
+    }
     const IS_PARENT: bool = true;
     const CAN_ROUTE: bool = true;
+    const POLLS_PARENT: bool = false;
     const NAME: &'static str = "router";
     type State = ParentState;
 
@@ -624,10 +850,26 @@ impl DeviceRole for Router {
     }
 
     #[inline]
+    fn record_child_leave_cascade<M: MacDriver>(
+        device: &mut ZigbeeDevice<M, Self>,
+        rejoin: bool,
+        remove_children: bool,
+    ) {
+        if remove_children {
+            device.role_state.pending_child_leave_cascade = Some(rejoin);
+        }
+    }
+
+    #[inline]
     async fn run_role_parent_servicing<M: MacDriver>(device: &mut ZigbeeDevice<M, Self>) {
         // A router interleaves bounded MAC parent-command servicing; the inner
         // helper self-gates on `parent_mode_active`, so it is inert until the
         // device is a joined, child-capable parent.
+        //
+        // Measured: `await_out_of_line!` here costs +68 bytes. The servicing
+        // body is far past LLVM's inline threshold, so both RX-slice awaits
+        // already reach the single copy emitted for the maintenance call site;
+        // the macro would only add a vtable and frame on the hot RX path.
         #[cfg(feature = "router")]
         {
             let _ = device.service_parent_commands_inner().await;
@@ -667,6 +909,35 @@ impl DeviceRole for Router {
         core::future::ready(())
     }
     #[inline]
+    fn ed_run_poll<M: MacDriver>(
+        device: &mut ZigbeeDevice<M, Self>,
+        now_ms: u32,
+        clusters: &mut [crate::ClusterRef<'_>],
+    ) -> impl core::future::Future<Output = Option<crate::event_loop::StackEvent>> {
+        let _ = (device, now_ms, clusters);
+        core::future::ready(None)
+    }
+
+    #[inline]
+    fn ed_run_poll_with_security_store<
+        M: MacDriver,
+        S: crate::security_store::SecurityStateStore,
+        const DEFER_RESET: bool,
+    >(
+        device: &mut ZigbeeDevice<M, Self>,
+        now_ms: u32,
+        clusters: &mut [crate::ClusterRef<'_>],
+        store: &mut S,
+    ) -> impl core::future::Future<
+        Output = Result<
+            Option<crate::event_loop::StackEvent>,
+            crate::security_store::SecurityStoreError,
+        >,
+    > {
+        let _ = (device, now_ms, clusters, store);
+        core::future::ready(Ok(None))
+    }
+    #[inline]
     fn ed_take_forced_poll<M: MacDriver>(device: &mut ZigbeeDevice<M, Self>) -> bool {
         let _ = device;
         false
@@ -692,6 +963,7 @@ impl DeviceRole for Router {
         let _ = device;
     }
 }
+
 impl RoutingRole for Router {}
 impl ParentRole for Router {
     #[inline]

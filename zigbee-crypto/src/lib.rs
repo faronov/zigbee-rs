@@ -9,6 +9,20 @@ use aes::cipher::{BlockEncrypt, KeyInit};
 /// A 128-bit AES key.
 pub type AesKey = [u8; 16];
 
+/// Stable non-secret identity for binding persisted counter state to a key.
+///
+/// This is not used as authentication material. A collision can only retain a
+/// stale high replay floor (fail closed); it cannot make a forged frame pass
+/// CCM authentication.
+pub fn key_fingerprint(key: &AesKey) -> u32 {
+    let mut hash = 0x811C_9DC5u32;
+    for byte in key {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
 /// AES-CCM* nonce length used by Zigbee.
 pub const CCM_STAR_NONCE_LEN: usize = 13;
 /// MIC length for Zigbee ENC-MIC-32 security.

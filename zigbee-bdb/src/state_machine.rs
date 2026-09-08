@@ -33,6 +33,7 @@
 //! ```
 
 use zigbee_mac::MacDriver;
+#[cfg(any(not(feature = "end-device"), feature = "router"))]
 use zigbee_nwk::DeviceType;
 
 use crate::{BdbLayer, BdbStatus};
@@ -95,6 +96,25 @@ pub enum BdbState {
 
 // ── State machine implementation ────────────────────────────
 
+/// An end-device image does not link coordinator network formation.
+///
+/// Keep the public BDB entry point so generic downstream application code gets
+/// an explicit `NotPermitted` result rather than a configuration-dependent
+/// missing method.
+#[cfg(all(
+    feature = "end-device",
+    not(feature = "formation"),
+    not(feature = "router"),
+    not(test)
+))]
+impl<M: MacDriver> BdbLayer<M> {
+    pub async fn network_formation(&mut self) -> Result<(), BdbStatus> {
+        self.attributes.commissioning_status =
+            crate::attributes::BdbCommissioningStatus::NotPermitted;
+        Err(BdbStatus::NotPermitted)
+    }
+}
+
 impl<M: MacDriver> BdbLayer<M> {
     /// BDB initialisation procedure (BDB spec §7.1).
     ///
@@ -115,11 +135,27 @@ impl<M: MacDriver> BdbLayer<M> {
         // type; optional F&B and Touchlink capabilities must be explicitly
         // enabled by the application before initialization.
         let device_type = self.zdo.nwk().device_type();
+        #[cfg(any(feature = "finding-binding", feature = "touchlink", test))]
         let requested_capabilities = self.attributes.node_commissioning_capability;
+        #[cfg(any(
+            not(feature = "end-device"),
+            feature = "finding-binding",
+            feature = "touchlink",
+            test
+        ))]
         let mut cap = CommissioningMode::STEERING;
+        #[cfg(not(any(
+            not(feature = "end-device"),
+            feature = "finding-binding",
+            feature = "touchlink",
+            test
+        )))]
+        let cap = CommissioningMode::STEERING;
+        #[cfg(any(not(feature = "end-device"), feature = "router"))]
         if device_type == DeviceType::Coordinator {
             cap = cap.or(CommissioningMode::FORMATION);
         }
+        #[cfg(any(feature = "finding-binding", test))]
         if requested_capabilities.contains(CommissioningMode::FINDING_BINDING) {
             cap = cap.or(CommissioningMode::FINDING_BINDING);
         }
@@ -198,6 +234,7 @@ impl<M: MacDriver> BdbLayer<M> {
                 Ok(()) => {
                     log::info!("[BDB] Network Steering reached network-up");
                     any_success = true;
+                    #[cfg(feature = "centralized-tclk")]
                     if self.tclk_exchange_active() {
                         self.state = BdbState::Idle;
                         return Ok(());
@@ -211,6 +248,7 @@ impl<M: MacDriver> BdbLayer<M> {
         }
 
         // ── 3. Network Formation ────────────────────────────
+        #[cfg(any(not(feature = "end-device"), feature = "router"))]
         if effective.contains(CommissioningMode::FORMATION) {
             self.state = BdbState::NetworkFormation;
             match self.network_formation().await {
@@ -226,6 +264,7 @@ impl<M: MacDriver> BdbLayer<M> {
         }
 
         // ── 4. Finding & Binding ────────────────────────────
+        #[cfg(any(feature = "finding-binding", test))]
         if effective.contains(CommissioningMode::FINDING_BINDING) {
             self.state = BdbState::FindingBinding;
             match self.finding_binding_initiator(1).await {
@@ -275,6 +314,7 @@ impl<M: MacDriver> BdbLayer<M> {
         self.zdo.aps_mut().binding_table_mut().clear();
         self.zdo.aps_mut().group_table_mut().clear();
         self.zdo.aps_mut().security_mut().clear_keys();
+        self.zdo.aps_mut().cancel_all_ack_tracking();
 
         // Step 4: Reset all BDB attributes to defaults
         self.reset_attributes();
@@ -341,14 +381,67 @@ impl<M: MacDriver> BdbLayer<M> {
     }
 
     /// Rejoin only the previously commissioned network using the stored NWK
-    /// key. Failure leaves the commissioned state intact and never falls back
-    /// to factory-new steering.
+    /// key. Failure preserves the stored credentials but rolls the live NWK
+    /// and BDB joined flags back to off-network, and never falls back to
+    /// factory-new steering.
     pub async fn rejoin_previous_network(&mut self) -> Result<(), BdbStatus> {
+        let mut volatile_commit = |_| true;
+        self.rejoin_previous_network_with_replay_commit(&mut volatile_commit)
+            .await?;
+        let nwk_addr = self.zdo.nwk().nib().network_address;
+        let ieee = self.zdo.nwk().nib().ieee_address;
+        let _ = self.zdo.device_annce(nwk_addr, ieee).await;
+        Ok(())
+    }
+
+    /// Rejoin while committing the secured response replay floor before the
+    /// new parent relationship is accepted.
+    pub async fn rejoin_previous_network_with_replay_commit<F>(
+        &mut self,
+        replay_commit: &mut F,
+    ) -> Result<(), BdbStatus>
+    where
+        F: FnMut(zigbee_nwk::security::NwkReplayCounter) -> bool,
+    {
+        self.rejoin_previous_network_mode(replay_commit, false)
+            .await
+    }
+
+    /// Perform an unsecured NWK rejoin on a centralized network, then wait
+    /// for the current network key under APS Trust Center link-key security.
+    ///
+    /// The caller must durably reserve the received key/counters before
+    /// broadcasting Device_annce or allowing normal traffic.
+    pub async fn trust_center_rejoin_previous_network(&mut self) -> Result<(), BdbStatus> {
+        if self.attributes.node_join_link_key_type.is_distributed() {
+            return Err(BdbStatus::NotPermitted);
+        }
+        let mut volatile_commit = |_| true;
+        self.rejoin_previous_network_mode(&mut volatile_commit, true)
+            .await
+    }
+
+    async fn rejoin_previous_network_mode<F>(
+        &mut self,
+        replay_commit: &mut F,
+        trust_center_rejoin: bool,
+    ) -> Result<(), BdbStatus>
+    where
+        F: FnMut(zigbee_nwk::security::NwkReplayCounter) -> bool,
+    {
         if !self.attributes.node_is_on_a_network {
             return Err(BdbStatus::NotOnNetwork);
         }
 
         self.state = BdbState::NetworkSteering;
+        self.attributes.commissioning_status =
+            crate::attributes::BdbCommissioningStatus::InProgress;
+        // A restored network record is only authorization to attempt the
+        // over-the-air rejoin. It must not remain visible as a live joined
+        // relationship while the candidate parent and (for TC rejoin) current
+        // network key are still provisional.
+        self.zdo.nwk_mut().set_joined(false);
+        self.attributes.node_is_on_a_network = false;
         log::info!("[BDB] Attempting rejoin on previous network…");
 
         let nib = self.zdo.nwk().nib();
@@ -360,7 +453,9 @@ impl<M: MacDriver> BdbLayer<M> {
             Ok(n) => n,
             Err(_) => {
                 log::warn!("[BDB] Rejoin: no networks found on channel {}", channel);
-                self.state = BdbState::Idle;
+                self.rollback_failed_rejoin(
+                    crate::attributes::BdbCommissioningStatus::NoScanResponse,
+                );
                 return Err(BdbStatus::NoScanResponse);
             }
         };
@@ -375,7 +470,7 @@ impl<M: MacDriver> BdbLayer<M> {
                 networks.len(),
                 channel,
             );
-            self.state = BdbState::Idle;
+            self.rollback_failed_rejoin(crate::attributes::BdbCommissioningStatus::NoNetwork);
             return Err(BdbStatus::SteeringFailure);
         }
 
@@ -390,13 +485,43 @@ impl<M: MacDriver> BdbLayer<M> {
                 network.depth,
             );
 
-            match self.zdo.nlme_rejoin(network).await {
+            let rejoin = if trust_center_rejoin {
+                self.zdo
+                    .nlme_trust_center_rejoin_with_replay_commit(network, replay_commit)
+                    .await
+            } else {
+                self.zdo
+                    .nlme_rejoin_with_replay_commit(network, replay_commit)
+                    .await
+            };
+            match rejoin {
                 Ok(nwk_addr) => {
-                    // Re-announce
-                    let ieee = self.zdo.nwk().nib().ieee_address;
-                    let _ = self.zdo.device_annce(nwk_addr, ieee).await;
+                    if trust_center_rejoin {
+                        // The old network key may be stale. Keep the APS link
+                        // key, but remove live NWK material so an unsecured
+                        // Transport-Key is treated as authorization rather
+                        // than as an unauthenticated key update.
+                        let nwk = self.zdo.aps_mut().nwk_mut();
+                        nwk.security_mut().clear_network_keys();
+                        nwk.nib_mut().security_enabled = false;
+
+                        if !self.wait_for_transport_key().await {
+                            log::warn!(
+                                "[BDB] Trust Center rejoin accepted but no current network key arrived"
+                            );
+                            self.rollback_failed_rejoin(
+                                crate::attributes::BdbCommissioningStatus::NoNetwork,
+                            );
+                            return Err(BdbStatus::SteeringFailure);
+                        }
+                        // Keep the persisted Table 6 regime authoritative.
+                        // A rejoin may use a later generated unique TCLK, for
+                        // which Table 6 has no separate value.
+                        let _ = self.zdo.aps_mut().take_network_key_join_method();
+                    }
 
                     log::info!("[BDB] Rejoin successful as 0x{:04X}", nwk_addr.0);
+                    self.attributes.node_is_on_a_network = true;
                     self.attributes.commissioning_status =
                         crate::attributes::BdbCommissioningStatus::Success;
                     self.state = BdbState::Idle;
@@ -413,7 +538,197 @@ impl<M: MacDriver> BdbLayer<M> {
         }
 
         log::warn!("[BDB] Previous network did not accept secured rejoin");
-        self.state = BdbState::Idle;
+        self.rollback_failed_rejoin(crate::attributes::BdbCommissioningStatus::NoNetwork);
         Err(BdbStatus::SteeringFailure)
+    }
+
+    fn rollback_failed_rejoin(
+        &mut self,
+        commissioning_status: crate::attributes::BdbCommissioningStatus,
+    ) {
+        self.zdo.nwk_mut().set_joined(false);
+        self.attributes.node_is_on_a_network = false;
+        self.attributes.commissioning_status = commissioning_status;
+        self.state = BdbState::Idle;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::future::Future;
+    use zigbee_aps::ApsLayer;
+    use zigbee_mac::mock::MockMac;
+    #[cfg(feature = "centralized-tclk")]
+    use zigbee_mac::primitives::McpsDataIndication;
+    use zigbee_mac::primitives::{PanDescriptor, SuperframeSpec, ZigbeeBeaconPayload};
+    use zigbee_nwk::NwkLayer;
+    #[cfg(feature = "centralized-tclk")]
+    use zigbee_nwk::frames::{NwkCommandId, NwkFrameControl, NwkFrameType, NwkHeader};
+    use zigbee_types::{MacAddress, PanId, ShortAddress};
+    use zigbee_zdo::ZdoLayer;
+
+    const DEVICE_IEEE: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    const TC_IEEE: [u8; 8] = [0xAA; 8];
+    const EPID: [u8; 8] = [0xBB; 8];
+    const PAN_ID: PanId = PanId(0x1234);
+    const OLD_ADDRESS: ShortAddress = ShortAddress(0x2345);
+    #[cfg(feature = "centralized-tclk")]
+    const NEW_ADDRESS: ShortAddress = ShortAddress(0x3456);
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        use core::task::{Context, Poll, Waker};
+
+        let mut context = Context::from_waker(Waker::noop());
+        let mut future = core::pin::pin!(future);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+        }
+    }
+
+    fn rejoin_beacon() -> PanDescriptor {
+        PanDescriptor {
+            channel: 15,
+            coord_address: MacAddress::Short(PAN_ID, ShortAddress::COORDINATOR),
+            superframe_spec: SuperframeSpec {
+                association_permit: true,
+                pan_coordinator: true,
+                ..Default::default()
+            },
+            lqi: 250,
+            security_use: false,
+            zigbee_beacon: ZigbeeBeaconPayload {
+                protocol_id: 0,
+                stack_profile: 2,
+                protocol_version: 2,
+                router_capacity: true,
+                device_depth: 0,
+                end_device_capacity: true,
+                extended_pan_id: EPID,
+                tx_offset: [0xFF; 3],
+                update_id: 0,
+            },
+        }
+    }
+
+    #[cfg(feature = "centralized-tclk")]
+    fn unsecured_rejoin_response() -> zigbee_mac::MacFrame {
+        let header = NwkHeader {
+            frame_control: NwkFrameControl {
+                frame_type: NwkFrameType::Command as u8,
+                protocol_version: 2,
+                discover_route: 0,
+                multicast: false,
+                security: false,
+                source_route: false,
+                dst_ieee_present: true,
+                src_ieee_present: true,
+                end_device_initiator: false,
+            },
+            dst_addr: OLD_ADDRESS,
+            src_addr: ShortAddress::COORDINATOR,
+            radius: 1,
+            seq_number: 0x43,
+            dst_ieee: Some(DEVICE_IEEE),
+            src_ieee: Some(TC_IEEE),
+            multicast_control: None,
+            source_route: None,
+        };
+        let payload = [
+            NwkCommandId::RejoinResponse as u8,
+            NEW_ADDRESS.0 as u8,
+            (NEW_ADDRESS.0 >> 8) as u8,
+            0,
+        ];
+        let mut frame = [0u8; 64];
+        let header_len = header.serialize(&mut frame);
+        frame[header_len..header_len + payload.len()].copy_from_slice(&payload);
+        zigbee_mac::MacFrame::from_slice(&frame[..header_len + payload.len()]).unwrap()
+    }
+
+    fn restored_bdb(with_beacon: bool) -> BdbLayer<MockMac> {
+        let mut mac = MockMac::new(DEVICE_IEEE);
+        if with_beacon {
+            mac.add_beacon(rejoin_beacon());
+        }
+        let mut nwk = NwkLayer::new(mac, zigbee_nwk::DeviceType::EndDevice);
+        nwk.set_joined(true);
+        nwk.security_mut().set_network_key([0x5A; 16], 0);
+        {
+            let nib = nwk.nib_mut();
+            nib.extended_pan_id = EPID;
+            nib.pan_id = PAN_ID;
+            nib.network_address = OLD_ADDRESS;
+            nib.ieee_address = DEVICE_IEEE;
+            nib.logical_channel = 15;
+            nib.parent_address = ShortAddress::COORDINATOR;
+            nib.set_nwk_update_id(0);
+            nib.security_enabled = true;
+            nib.outgoing_frame_counter_limit = 0x400;
+        }
+        let aps = ApsLayer::new(nwk);
+        let mut zdo = ZdoLayer::new(aps);
+        zdo.set_local_nwk_addr(OLD_ADDRESS);
+        zdo.set_local_ieee_addr(DEVICE_IEEE);
+        zdo.aps_mut().aib_mut().aps_trust_center_address = TC_IEEE;
+        let mut bdb = BdbLayer::new(zdo);
+        bdb.attributes_mut().node_is_on_a_network = true;
+        bdb
+    }
+
+    #[test]
+    fn failed_rejoin_scan_rolls_back_live_joined_flags() {
+        let mut bdb = restored_bdb(false);
+
+        assert_eq!(
+            block_on(bdb.rejoin_previous_network()),
+            Err(BdbStatus::NoScanResponse)
+        );
+        assert!(!bdb.zdo().nwk().is_joined());
+        assert!(!bdb.is_on_network());
+        assert_eq!(bdb.state(), &BdbState::Idle);
+    }
+
+    #[test]
+    fn initialization_preserves_requested_finding_binding_test_capability() {
+        let mut bdb = restored_bdb(false);
+        bdb.attributes_mut().node_commissioning_capability = CommissioningMode::FINDING_BINDING;
+
+        assert_eq!(bdb.initialize(), Ok(()));
+        assert!(
+            bdb.attributes()
+                .node_commissioning_capability
+                .contains(CommissioningMode::FINDING_BINDING)
+        );
+    }
+
+    #[cfg(feature = "centralized-tclk")]
+    #[test]
+    fn trust_center_rejoin_without_transport_key_rolls_back_provisional_join() {
+        let mut bdb = restored_bdb(true);
+        bdb.zdo_mut()
+            .nwk_mut()
+            .mac_mut()
+            .enqueue_rx(McpsDataIndication {
+                src_address: MacAddress::Short(PAN_ID, ShortAddress::COORDINATOR),
+                dst_address: MacAddress::Short(PAN_ID, OLD_ADDRESS),
+                lqi: 250,
+                payload: unsecured_rejoin_response(),
+                security_use: false,
+            });
+
+        assert_eq!(
+            block_on(bdb.trust_center_rejoin_previous_network()),
+            Err(BdbStatus::SteeringFailure)
+        );
+        assert!(!bdb.zdo().nwk().is_joined());
+        assert!(!bdb.is_on_network());
+        assert_eq!(
+            bdb.attributes().commissioning_status,
+            crate::attributes::BdbCommissioningStatus::NoNetwork
+        );
+        assert_eq!(bdb.state(), &BdbState::Idle);
     }
 }

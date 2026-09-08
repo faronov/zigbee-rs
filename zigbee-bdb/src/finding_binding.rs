@@ -27,33 +27,48 @@
 //! the target's **input** cluster (or vice versa), and both endpoints
 //! share the same application profile ID.
 
+#[cfg(any(feature = "finding-binding", test))]
 use zigbee_aps::apsde::ApsdeDataRequest;
+#[cfg(any(feature = "finding-binding", test))]
 use zigbee_aps::binding::BindingEntry;
+#[cfg(any(feature = "finding-binding", test))]
 use zigbee_aps::{ApsAddress, ApsAddressMode, ApsTxOptions};
 use zigbee_mac::MacDriver;
+#[cfg(any(feature = "finding-binding", test))]
 use zigbee_types::ShortAddress;
+#[cfg(any(feature = "finding-binding", test))]
 use zigbee_zcl::ClusterDirection;
+#[cfg(any(feature = "finding-binding", test))]
 use zigbee_zcl::clusters::groups::CMD_ADD_GROUP;
+#[cfg(any(feature = "finding-binding", test))]
 use zigbee_zcl::frame::{ZclFrameHeader, ZclFrameType};
+#[cfg(any(feature = "finding-binding", test))]
 use zigbee_zdo::ZdpStatus;
+#[cfg(any(feature = "finding-binding", test))]
 use zigbee_zdo::descriptors::SimpleDescriptor;
+#[cfg(any(feature = "finding-binding", test))]
 use zigbee_zdo::discovery::{IeeeAddrRsp, SimpleDescRsp};
 
+#[cfg(any(feature = "finding-binding", test))]
 use crate::attributes::BDB_MIN_COMMISSIONING_TIME;
 use crate::{BdbLayer, BdbStatus};
 
 // ── Identify / Groups cluster constants ─────────────────────
 
 /// ZCL Identify cluster ID
+#[cfg(any(feature = "finding-binding", feature = "finding-binding-target", test))]
 const CLUSTER_IDENTIFY: u16 = 0x0003;
 
 /// ZCL Groups cluster ID
+#[cfg(any(feature = "finding-binding", test))]
 const CLUSTER_GROUPS: u16 = 0x0004;
 
 /// Identify Query command ID (cluster-specific, client → server)
+#[cfg(any(feature = "finding-binding", test))]
 const CMD_IDENTIFY_QUERY: u8 = 0x01;
 
 /// Default F&B window (seconds) — spec says minimum 180 s.
+#[cfg(any(feature = "finding-binding", test))]
 const FB_WINDOW_SECONDS: u16 = BDB_MIN_COMMISSIONING_TIME;
 
 /// Bounded response window for the event-driven IEEE_addr_req /
@@ -63,9 +78,11 @@ const FB_WINDOW_SECONDS: u16 = BDB_MIN_COMMISSIONING_TIME;
 /// `BDBC_TC_LINK_KEY_EXCHANGE_TIMEOUT_US`), long enough for one APS-acked
 /// unicast round trip plus normal processing/queueing delay, but always
 /// bounded so a silent target can never wedge the initiator procedure.
+#[cfg(any(feature = "finding-binding", test))]
 const FB_ZDP_RESPONSE_TIMEOUT_US: u32 = 5_000_000;
 
 /// A single (nwk_addr, endpoint) that responded to our Identify Query.
+#[cfg(any(feature = "finding-binding", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FbTarget {
     /// NWK short address of the responding node.
@@ -83,6 +100,7 @@ pub(crate) struct FbTarget {
 /// `Simple_Desc_rsp` themselves, delivered by the runtime via
 /// [`zigbee_zdo::ZdoLayer::deliver_client_response`]) keeps flowing between
 /// steps.
+#[cfg(any(feature = "finding-binding", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FbStage {
     /// No initiator procedure running.
@@ -102,6 +120,7 @@ pub(crate) enum FbStage {
 
 // ── Initiator ───────────────────────────────────────────────
 
+#[cfg(any(feature = "finding-binding", test))]
 impl<M: MacDriver> BdbLayer<M> {
     /// Run Finding & Binding as **initiator** on the given local endpoint.
     ///
@@ -174,6 +193,10 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Returns `true` if the F&B procedure just reached a terminal state
     /// (success, no response, or binding table full) this call.
     pub async fn tick_finding_binding(&mut self, elapsed_secs: u16) -> bool {
+        if self.fb_target_remaining.is_some() {
+            return self.tick_finding_binding_target(elapsed_secs);
+        }
+
         match self.fb_stage {
             FbStage::Idle => false,
             FbStage::Collecting => self.tick_collecting(elapsed_secs),
@@ -440,7 +463,7 @@ impl<M: MacDriver> BdbLayer<M> {
             "[BDB:F&B] Broadcasting Identify Query from ep {} profile=0x{:04X} (window={}s)",
             local_endpoint,
             profile_id,
-            FB_WINDOW_SECONDS,
+            crate::attributes::BDB_MIN_COMMISSIONING_TIME,
         );
 
         // Build ZCL Identify Query frame:
@@ -711,7 +734,23 @@ impl<M: MacDriver> BdbLayer<M> {
 
 // ── Target ──────────────────────────────────────────────────
 
+#[cfg(any(feature = "finding-binding", feature = "finding-binding-target", test))]
 impl<M: MacDriver> BdbLayer<M> {
+    /// Complete the target half once the runtime has applied IdentifyTime.
+    ///
+    /// The Identify cluster owns the actual IdentifyTime countdown. BDB only
+    /// waits for the queued attribute write to be consumed successfully; it
+    /// must not maintain a second timer that can drift from the ZCL attribute.
+    pub fn tick_finding_binding_target(&mut self, _elapsed_secs: u16) -> bool {
+        if self.fb_target_remaining.is_none() || self.fb_target_request.is_some() {
+            return false;
+        }
+
+        self.fb_target_remaining = None;
+        self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::Success;
+        true
+    }
+
     /// Enter Finding & Binding as **target** on the given local endpoint.
     ///
     /// The target enters Identify mode so that initiators can discover it.
@@ -727,8 +766,15 @@ impl<M: MacDriver> BdbLayer<M> {
             return Err(BdbStatus::NotOnNetwork);
         }
 
-        // Verify we have a local simple descriptor for this endpoint
-        if self.zdo.get_local_descriptor(local_endpoint).is_none() {
+        // A target must expose the Identify server on this endpoint. This also
+        // makes consumption of the queued IdentifyTime write a valid success
+        // signal rather than merely evidence that a request was dequeued.
+        let Some(descriptor) = self.zdo.get_local_descriptor(local_endpoint) else {
+            self.attributes.commissioning_status =
+                crate::attributes::BdbCommissioningStatus::NotPermitted;
+            return Err(BdbStatus::NotPermitted);
+        };
+        if !descriptor.input_clusters.contains(&CLUSTER_IDENTIFY) {
             self.attributes.commissioning_status =
                 crate::attributes::BdbCommissioningStatus::NotPermitted;
             return Err(BdbStatus::NotPermitted);
@@ -739,18 +785,23 @@ impl<M: MacDriver> BdbLayer<M> {
         log::info!(
             "[BDB:F&B] Target mode on ep {} for {}s",
             local_endpoint,
-            FB_WINDOW_SECONDS,
+            crate::attributes::BDB_MIN_COMMISSIONING_TIME,
         );
 
         // Request the runtime to set IdentifyTime on the Identify cluster
         // for this endpoint to bdbcMinCommissioningTime (180 s).
         // The runtime reads this and writes the attribute on the next tick.
-        self.fb_target_request = Some((local_endpoint, FB_WINDOW_SECONDS));
+        self.fb_target_request = Some((
+            local_endpoint,
+            crate::attributes::BDB_MIN_COMMISSIONING_TIME,
+        ));
 
         // The device's normal APS/ZCL processing handles incoming
         // Simple_Desc_req and Bind_req from the initiator.
 
-        self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::Success;
+        // This is only an in-flight completion marker. IdentifyTime itself is
+        // owned and decremented by the ZCL Identify cluster.
+        self.fb_target_remaining = Some(0);
         Ok(())
     }
 }
@@ -823,6 +874,7 @@ mod tests {
             nib.network_address = ShortAddress(0x0001);
             nib.ieee_address = LOCAL_IEEE;
             nib.security_enabled = true;
+            nib.outgoing_frame_counter_limit = 0x400;
         }
         let aps = ApsLayer::new(nwk);
         let mut zdo = ZdoLayer::new(aps);
@@ -1386,6 +1438,56 @@ mod tests {
         assert_eq!(
             bdb.attributes().commissioning_status,
             crate::attributes::BdbCommissioningStatus::BindingTableFull
+        );
+    }
+
+    #[test]
+    fn target_completion_follows_identify_time_application() {
+        let mut bdb = fb_ready_bdb_with_clusters(&[CLUSTER_IDENTIFY], &[ON_OFF_CLUSTER]);
+
+        assert_eq!(block_on(bdb.finding_binding_target(LOCAL_EP)), Ok(()));
+        assert_eq!(
+            bdb.fb_target_request,
+            Some((LOCAL_EP, crate::attributes::BDB_MIN_COMMISSIONING_TIME))
+        );
+        assert_eq!(
+            bdb.attributes().commissioning_status,
+            crate::attributes::BdbCommissioningStatus::InProgress
+        );
+
+        // Elapsed time alone cannot complete target commissioning: the ZCL
+        // Identify cluster owns that timer, and the write is still pending.
+        assert!(!block_on(bdb.tick_finding_binding(
+            crate::attributes::BDB_MIN_COMMISSIONING_TIME
+        )));
+        assert_eq!(
+            bdb.attributes().commissioning_status,
+            crate::attributes::BdbCommissioningStatus::InProgress
+        );
+
+        // Consuming the request models a successful IdentifyTime write by the
+        // runtime. BDB completes immediately instead of running a shadow timer.
+        let _ = bdb.fb_target_request.take();
+        assert!(block_on(bdb.tick_finding_binding(0)));
+        assert_eq!(
+            bdb.attributes().commissioning_status,
+            crate::attributes::BdbCommissioningStatus::Success
+        );
+        assert!(bdb.fb_target_remaining.is_none());
+    }
+
+    #[test]
+    fn target_rejects_an_endpoint_without_an_identify_server() {
+        let mut bdb = fb_ready_bdb();
+
+        assert_eq!(
+            block_on(bdb.finding_binding_target(LOCAL_EP)),
+            Err(BdbStatus::NotPermitted)
+        );
+        assert!(bdb.fb_target_request.is_none());
+        assert_eq!(
+            bdb.attributes().commissioning_status,
+            crate::attributes::BdbCommissioningStatus::NotPermitted
         );
     }
 }

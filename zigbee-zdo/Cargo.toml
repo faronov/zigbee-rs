@@ -16,6 +16,8 @@ log = "0.4"
 [features]
 default = []
 constrained-memory = []
+compact-single-endpoint = []
+end-device = []
 router = ["zigbee-aps/router", "zigbee-nwk/router"]
 
 [dev-dependencies]

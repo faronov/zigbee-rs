@@ -377,6 +377,63 @@ pub struct MlmeStartRequest {
     pub battery_life_ext: bool,
 }
 
+/// Validate an MLME-START.request that a **parent-capable** backend is willing
+/// to honour as a Zigbee non-beacon *router* start.
+///
+/// Zigbee PRO R22 operates exclusively in non-beacon mode, so the only start a
+/// router accepts has `beacon_order == superframe_order == 15` and
+/// `pan_coordinator == false`. A PAN-coordinator start is a *separate*
+/// capability ([`MacCapabilities::coordinator`](crate::MacCapabilities)) that no
+/// in-tree backend implements yet, so it is rejected here rather than silently
+/// treated as a router start.
+///
+/// Shared by every backend that accepts MLME-START so the accepted parameter
+/// shape is identical across platforms and host-testable in one place.
+///
+/// # Errors
+///
+/// - [`MacError::Unsupported`] — a PAN-coordinator start, or beacon mode.
+/// - [`MacError::InvalidParameter`] — channel outside the 2.4 GHz O-QPSK page-0
+///   range 11..=26, or the broadcast PAN ID `0xFFFF`.
+pub fn validate_router_start(req: &MlmeStartRequest) -> Result<(), MacError> {
+    if req.pan_coordinator {
+        return Err(MacError::Unsupported);
+    }
+    if req.beacon_order != 15 || req.superframe_order != 15 {
+        return Err(MacError::Unsupported);
+    }
+    if !(11..=26).contains(&req.channel) {
+        return Err(MacError::InvalidParameter);
+    }
+    if req.pan_id.0 == 0xFFFF {
+        return Err(MacError::InvalidParameter);
+    }
+    Ok(())
+}
+
+/// The MLME-START.request outcome for a backend that does **not** implement the
+/// sealed [`ParentMacDriver`](crate::ParentMacDriver) parent primitives.
+///
+/// Starting a PAN — as coordinator or as router — is an assertion that the
+/// device will answer Beacon Requests, admit children and deliver indirect
+/// transactions. A backend that retains the `Unsupported`/`NoData`
+/// [`MacDriver`](crate::MacDriver) defaults for those primitives can do none of
+/// that, so it must fail explicitly instead of returning `Ok(())` after merely
+/// retuning its channel and PAN ID: a silent success makes the NWK layer
+/// believe a router started, which is exactly the dishonest capability claim
+/// the `ParentMacDriver` seal exists to prevent.
+///
+/// Malformed requests are still reported as [`MacError::InvalidParameter`] so a
+/// caller can distinguish a programming error from a missing capability.
+///
+/// This function never returns `Ok`. When a backend gains real parent
+/// primitives (and therefore `ParentMacDriver`), replace the call with
+/// [`validate_router_start`] plus the platform's own radio configuration.
+pub fn start_requires_parent_capability(req: &MlmeStartRequest) -> Result<(), MacError> {
+    validate_router_start(req)?;
+    Err(MacError::Unsupported)
+}
+
 // ── Data service ────────────────────────────────────────────────
 
 /// Transmit options for MCPS-DATA
@@ -475,5 +532,166 @@ impl MacFrame {
 impl Default for MacFrame {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod start_validation_tests {
+    use super::*;
+
+    fn router_start() -> MlmeStartRequest {
+        MlmeStartRequest {
+            pan_id: PanId(0x1A62),
+            channel: 15,
+            beacon_order: 15,
+            superframe_order: 15,
+            pan_coordinator: false,
+            battery_life_ext: false,
+        }
+    }
+
+    #[test]
+    fn well_formed_router_start_is_accepted() {
+        assert_eq!(validate_router_start(&router_start()), Ok(()));
+    }
+
+    #[test]
+    fn pan_coordinator_start_is_unsupported() {
+        let mut req = router_start();
+        req.pan_coordinator = true;
+        assert_eq!(validate_router_start(&req), Err(MacError::Unsupported));
+    }
+
+    #[test]
+    fn beacon_mode_start_is_unsupported() {
+        let mut req = router_start();
+        req.beacon_order = 8;
+        assert_eq!(validate_router_start(&req), Err(MacError::Unsupported));
+
+        let mut req = router_start();
+        req.superframe_order = 8;
+        assert_eq!(validate_router_start(&req), Err(MacError::Unsupported));
+    }
+
+    #[test]
+    fn channel_outside_page_zero_is_invalid() {
+        for channel in [0u8, 10, 27, 255] {
+            let mut req = router_start();
+            req.channel = channel;
+            assert_eq!(
+                validate_router_start(&req),
+                Err(MacError::InvalidParameter),
+                "channel {channel} must be rejected"
+            );
+        }
+        for channel in 11..=26u8 {
+            let mut req = router_start();
+            req.channel = channel;
+            assert_eq!(validate_router_start(&req), Ok(()));
+        }
+    }
+
+    #[test]
+    fn broadcast_pan_id_is_invalid() {
+        let mut req = router_start();
+        req.pan_id = PanId(0xFFFF);
+        assert_eq!(validate_router_start(&req), Err(MacError::InvalidParameter));
+    }
+
+    // ── Non-parent backends ──────────────────────────────────────
+
+    #[test]
+    fn non_parent_backend_never_starts_a_pan() {
+        // Even a perfectly well-formed router start must fail: the backend
+        // cannot answer Beacon Requests or serve children.
+        assert_eq!(
+            start_requires_parent_capability(&router_start()),
+            Err(MacError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn non_parent_backend_rejects_coordinator_start() {
+        let mut req = router_start();
+        req.pan_coordinator = true;
+        assert_eq!(
+            start_requires_parent_capability(&req),
+            Err(MacError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn non_parent_backend_reports_malformed_requests_distinctly() {
+        // A missing capability and a programming error must stay
+        // distinguishable at the call site.
+        let mut req = router_start();
+        req.channel = 99;
+        assert_eq!(
+            start_requires_parent_capability(&req),
+            Err(MacError::InvalidParameter)
+        );
+    }
+}
+
+#[cfg(test)]
+mod parent_capability_tests {
+    use crate::{MacCapabilities, TxPower};
+
+    /// Every in-tree non-parent backend routes its descriptor through
+    /// `MacCapabilities::non_parent`. Exercising the exact argument sets used
+    /// by nRF, ESP32, EFR32MG1, EFR32MG21, BL702, CC2340 and PHY62x2 pins the
+    /// invariant for all of them: a backend that keeps the `MacDriver`
+    /// parent-primitive defaults can never advertise a routing or
+    /// coordinating capability.
+    #[test]
+    fn non_parent_backends_never_claim_router_or_coordinator() {
+        let backends = [
+            ("nrf", 102u16, TxPower(-20), TxPower(8)),
+            ("esp", 102, TxPower(-24), TxPower(21)),
+            ("efr32", 102, TxPower(-20), TxPower(19)),
+            ("efr32s2", 102, TxPower(-20), TxPower(19)),
+            ("bl702", 102, TxPower(-21), TxPower(14)),
+            ("cc2340", 116, TxPower(-20), TxPower(8)),
+            ("phy6222", 102, TxPower(0), TxPower(10)),
+        ];
+
+        for (name, payload, min, max) in backends {
+            let capabilities = MacCapabilities::non_parent(payload, min, max);
+            assert!(
+                !capabilities.router,
+                "{name} must not advertise router capability without ParentMacDriver"
+            );
+            assert!(
+                !capabilities.coordinator,
+                "{name} must not advertise coordinator capability without ParentMacDriver"
+            );
+            assert!(
+                !capabilities.hardware_security,
+                "{name} performs Zigbee CCM* in the Rust stack"
+            );
+            assert_eq!(capabilities.max_payload, payload);
+            assert_eq!(capabilities.tx_power_min.0, min.0);
+            assert_eq!(capabilities.tx_power_max.0, max.0);
+        }
+    }
+
+    /// The runtime arms parent servicing from `capabilities().router` and
+    /// `zigbee-bdb` gates network formation on `.coordinator`, so a genuine
+    /// parent backend must still be able to claim both. This guards against
+    /// "fix" attempts that force every backend to `false`.
+    #[cfg(feature = "mock")]
+    #[test]
+    fn a_sealed_parent_backend_can_still_claim_parent_capability() {
+        use crate::{ParentMacDriver, mock::MockMac};
+
+        // Only type-checks because `MockMac` implements the sealed trait.
+        fn requires_parent_mac<M: ParentMacDriver>(mac: &M) -> crate::MacCapabilities {
+            mac.capabilities()
+        }
+
+        let mac = MockMac::new([0x11; 8]);
+        let capabilities = requires_parent_mac(&mac);
+        assert!(capabilities.router);
+        assert!(capabilities.coordinator);
     }
 }

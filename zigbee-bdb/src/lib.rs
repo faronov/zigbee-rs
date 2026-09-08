@@ -34,24 +34,30 @@
 #![allow(async_fn_in_trait)]
 
 pub mod attributes;
+#[cfg(any(feature = "finding-binding", feature = "finding-binding-target", test))]
 pub mod finding_binding;
+#[cfg(any(not(feature = "end-device"), feature = "formation", test))]
 pub mod formation;
 pub mod security_persistence;
 pub mod state_machine;
 pub mod steering;
+#[cfg(feature = "centralized-tclk")]
 pub mod tclk_exchange;
 #[cfg(feature = "touchlink")]
 pub mod touchlink;
+#[cfg(feature = "trust-center")]
+pub mod trust_center;
 
 use zigbee_mac::MacDriver;
 use zigbee_zdo::ZdoLayer;
 
-pub use attributes::BdbAttributes;
+pub use attributes::{BdbAttributes, NodeJoinLinkKeyType};
 pub use security_persistence::{
     CounterReservation, FRAME_COUNTER_RESERVATION_SIZE, NetworkSecurityState, SecurityPersistence,
     SecurityPersistenceError, TrustCenterLinkKeyState,
 };
 pub use state_machine::{BdbState, CommissioningMode};
+#[cfg(feature = "centralized-tclk")]
 pub use tclk_exchange::{TclkExchange, TclkProgress, TclkStage};
 
 // ── BDB status codes ────────────────────────────────────────
@@ -218,32 +224,45 @@ pub struct BdbLayer<M: MacDriver> {
     attributes: BdbAttributes,
     state: BdbState,
     steering_diagnostics: SteeringDiagnostics,
-    /// Pending Find & Bind target request: (endpoint, identify_time_secs)
+    /// Pending Find & Bind target request: (endpoint, identify_time_secs).
+    #[cfg(any(feature = "finding-binding", feature = "finding-binding-target", test))]
     pub fb_target_request: Option<(u8, u16)>,
+    /// Remaining Find & Bind target Identify interval, armed only after the
+    /// runtime has applied [`Self::fb_target_request`] to the ZCL cluster.
+    #[cfg(any(feature = "finding-binding", feature = "finding-binding-target", test))]
+    fb_target_remaining: Option<u16>,
     /// Collected F&B identify query responses: (nwk_addr, endpoint).
+    #[cfg(any(feature = "finding-binding", test))]
     pub fb_identify_responses: heapless::Vec<(u16, u8), 8>,
     /// F&B initiator window — seconds remaining to collect responses.
     /// When > 0, the initiator is waiting for Identify Query Responses.
+    #[cfg(any(feature = "finding-binding", test))]
     pub fb_window_remaining: u16,
     /// Endpoint being used for F&B initiator procedure.
+    #[cfg(any(feature = "finding-binding", test))]
     fb_initiator_endpoint: u8,
     /// Current stage of the event-driven F&B initiator descriptor/binding
     /// state machine. `Idle` when no initiator procedure is running.
+    #[cfg(any(feature = "finding-binding", test))]
     fb_stage: finding_binding::FbStage,
     /// Deduplicated (nwk_addr, endpoint) targets still to be processed after
     /// the identify-response collection window closed.
+    #[cfg(any(feature = "finding-binding", test))]
     fb_targets: heapless::Vec<finding_binding::FbTarget, 8>,
     /// The target currently being resolved/bound (IEEE lookup → Simple_Desc →
     /// binding), if any.
+    #[cfg(any(feature = "finding-binding", test))]
     fb_current: Option<finding_binding::FbTarget>,
     /// IEEE address resolved for `fb_current`, once known. Never a `[0; 8]`
     /// placeholder — a unicast binding is only created once this is `Some`.
+    #[cfg(any(feature = "finding-binding", test))]
     fb_current_ieee: Option<zigbee_types::IeeeAddress>,
     /// In-flight event-driven unique Trust Center link-key exchange.
     ///
     /// Armed after network-up + `Device_annce`; advanced one bounded step per
     /// tick/poll via [`BdbLayer::advance_tclk_exchange`]. `None` when no
     /// post-network commissioning security handshake is pending.
+    #[cfg(feature = "centralized-tclk")]
     tclk_exchange: Option<TclkExchange>,
 }
 
@@ -256,14 +275,25 @@ impl<M: MacDriver> BdbLayer<M> {
             attributes: BdbAttributes::default(),
             state: BdbState::Idle,
             steering_diagnostics: SteeringDiagnostics::default(),
+            #[cfg(any(feature = "finding-binding", feature = "finding-binding-target", test))]
             fb_target_request: None,
+            #[cfg(any(feature = "finding-binding", feature = "finding-binding-target", test))]
+            fb_target_remaining: None,
+            #[cfg(any(feature = "finding-binding", test))]
             fb_identify_responses: heapless::Vec::new(),
+            #[cfg(any(feature = "finding-binding", test))]
             fb_window_remaining: 0,
+            #[cfg(any(feature = "finding-binding", test))]
             fb_initiator_endpoint: 0,
+            #[cfg(any(feature = "finding-binding", test))]
             fb_stage: finding_binding::FbStage::Idle,
+            #[cfg(any(feature = "finding-binding", test))]
             fb_targets: heapless::Vec::new(),
+            #[cfg(any(feature = "finding-binding", test))]
             fb_current: None,
+            #[cfg(any(feature = "finding-binding", test))]
             fb_current_ieee: None,
+            #[cfg(feature = "centralized-tclk")]
             tclk_exchange: None,
         }
     }
@@ -280,14 +310,22 @@ impl<M: MacDriver> BdbLayer<M> {
             core::ptr::addr_of_mut!((*slot).state).write(BdbState::Idle);
             core::ptr::addr_of_mut!((*slot).steering_diagnostics)
                 .write(SteeringDiagnostics::default());
-            core::ptr::addr_of_mut!((*slot).fb_target_request).write(None);
-            core::ptr::addr_of_mut!((*slot).fb_identify_responses).write(heapless::Vec::new());
-            core::ptr::addr_of_mut!((*slot).fb_window_remaining).write(0);
-            core::ptr::addr_of_mut!((*slot).fb_initiator_endpoint).write(0);
-            core::ptr::addr_of_mut!((*slot).fb_stage).write(finding_binding::FbStage::Idle);
-            core::ptr::addr_of_mut!((*slot).fb_targets).write(heapless::Vec::new());
-            core::ptr::addr_of_mut!((*slot).fb_current).write(None);
-            core::ptr::addr_of_mut!((*slot).fb_current_ieee).write(None);
+            #[cfg(any(feature = "finding-binding", feature = "finding-binding-target", test))]
+            {
+                core::ptr::addr_of_mut!((*slot).fb_target_request).write(None);
+                core::ptr::addr_of_mut!((*slot).fb_target_remaining).write(None);
+            }
+            #[cfg(any(feature = "finding-binding", test))]
+            {
+                core::ptr::addr_of_mut!((*slot).fb_identify_responses).write(heapless::Vec::new());
+                core::ptr::addr_of_mut!((*slot).fb_window_remaining).write(0);
+                core::ptr::addr_of_mut!((*slot).fb_initiator_endpoint).write(0);
+                core::ptr::addr_of_mut!((*slot).fb_stage).write(finding_binding::FbStage::Idle);
+                core::ptr::addr_of_mut!((*slot).fb_targets).write(heapless::Vec::new());
+                core::ptr::addr_of_mut!((*slot).fb_current).write(None);
+                core::ptr::addr_of_mut!((*slot).fb_current_ieee).write(None);
+            }
+            #[cfg(feature = "centralized-tclk")]
             core::ptr::addr_of_mut!((*slot).tclk_exchange).write(None);
         }
     }
@@ -330,40 +368,63 @@ impl<M: MacDriver> BdbLayer<M> {
     pub fn reset_attributes(&mut self) {
         // Never leak a pending ZDO request-response slot: cancel it before
         // the F&B state that references it is discarded.
-        match self.fb_stage {
-            finding_binding::FbStage::AwaitIeee { slot, .. }
-            | finding_binding::FbStage::AwaitSimpleDesc { slot, .. } => {
-                self.zdo.cancel_pending(slot);
+        #[cfg(any(feature = "finding-binding", test))]
+        {
+            match self.fb_stage {
+                finding_binding::FbStage::AwaitIeee { slot, .. }
+                | finding_binding::FbStage::AwaitSimpleDesc { slot, .. } => {
+                    self.zdo.cancel_pending(slot);
+                }
+                _ => {}
             }
-            _ => {}
         }
         self.attributes = BdbAttributes::default();
-        self.fb_target_request = None;
-        self.fb_identify_responses.clear();
-        self.fb_window_remaining = 0;
-        self.fb_initiator_endpoint = 0;
-        self.fb_stage = finding_binding::FbStage::Idle;
-        self.fb_targets.clear();
-        self.fb_current = None;
-        self.fb_current_ieee = None;
-        self.tclk_exchange = None;
+        #[cfg(any(feature = "finding-binding", feature = "finding-binding-target", test))]
+        {
+            self.fb_target_request = None;
+            self.fb_target_remaining = None;
+        }
+        #[cfg(any(feature = "finding-binding", test))]
+        {
+            self.fb_identify_responses.clear();
+            self.fb_window_remaining = 0;
+            self.fb_initiator_endpoint = 0;
+            self.fb_stage = finding_binding::FbStage::Idle;
+            self.fb_targets.clear();
+            self.fb_current = None;
+            self.fb_current_ieee = None;
+        }
+        #[cfg(feature = "centralized-tclk")]
+        {
+            self.tclk_exchange = None;
+        }
         self.state = BdbState::Idle;
     }
 
     /// Whether an event-driven unique Trust Center link-key exchange is still
     /// running. The runtime uses this to decide when to advance commissioning
     /// security from its tick/poll loop.
+    #[cfg(feature = "centralized-tclk")]
     pub fn tclk_exchange_active(&self) -> bool {
         self.tclk_exchange.is_some()
     }
 
+    /// Whether a centralized unique-TCLK exchange is in progress.
+    ///
+    /// A distributed-security-only build never arms this optional procedure.
+    #[cfg(not(feature = "centralized-tclk"))]
+    pub const fn tclk_exchange_active(&self) -> bool {
+        false
+    }
+
     /// The current stage of the in-flight unique-TCLK exchange, if any.
+    #[cfg(feature = "centralized-tclk")]
     pub fn tclk_exchange_stage(&self) -> Option<TclkStage> {
         self.tclk_exchange.as_ref().map(|exchange| exchange.stage)
     }
 
     /// Arm a unique-TCLK exchange directly, bypassing scan/join, for tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "centralized-tclk"))]
     pub(crate) fn arm_tclk_exchange_for_test(
         &mut self,
         tc_addr: zigbee_types::ShortAddress,

@@ -1,8 +1,8 @@
 //! Finite host composition of a persisted Zigbee coordinator.
 
 use router_app::{
-    CoordinatorApp, NoDiagnostics, NoStatus, NoSupervisor, PersistentChildren, RouterParts,
-    RouterPolicy,
+    NoDiagnostics, NoStatus, NoSupervisor, PersistentChildren, RouterParts, RouterPolicy,
+    TrustCenterCoordinatorApp,
 };
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::EdValue;
@@ -14,6 +14,7 @@ use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::profile::{ApplicationProfile, DeviceProfile, RangeExtender};
 use zigbee_runtime::role::Router;
 use zigbee_runtime::security_store::{RamSecurityStateStore, SecurityStateStore};
+use zigbee_runtime::trust_center_store::{RamTrustCenterDeviceStore, TrustCenterDeviceStore};
 use zigbee_types::ChannelMask;
 use zigbee_zcl::DeviceId;
 use zigbee_zcl::clusters::basic::PowerSource;
@@ -82,16 +83,17 @@ fn live_network_key(device: &ZigbeeDevice<MockMac, Router>) -> [u8; 16] {
 
 fn main() {
     pollster::block_on(async {
-        println!("zigbee-rs finite CoordinatorApp persistence demo");
+        println!("zigbee-rs finite TrustCenterCoordinatorApp persistence demo");
 
         let mut security_store = RamSecurityStateStore::new();
-        let (pan_id, channel, network_key) = {
+        let (pan_id, channel, network_key, trust_center_state) = {
             let mut profile = coordinator_profile();
             let mut device = coordinator_device(&profile, true);
             let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
-            let mut app = CoordinatorApp::new(
+            let mut app = TrustCenterCoordinatorApp::new(
                 node,
                 PersistentChildren::new(RamChildTableStore::new()),
+                RamTrustCenterDeviceStore::new(),
                 &POLICY,
                 RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
             )
@@ -101,6 +103,12 @@ fn main() {
             let pan_id = app.node().device().pan_id();
             let channel = app.node().device().channel();
             let network_key = live_network_key(app.node().device());
+            let trust_center_state = app
+                .trust_center_mut()
+                .store_mut()
+                .load()
+                .expect("load Trust Center state")
+                .expect("Trust Center state exists");
             println!(
                 "  formed PAN 0x{pan_id:04X} on channel {channel} as 0x{:04X}",
                 app.node().device().short_address()
@@ -110,7 +118,7 @@ fn main() {
                 "  completed formation step with {} event(s)",
                 events.iter().count()
             );
-            (pan_id, channel, network_key)
+            (pan_id, channel, network_key, trust_center_state)
         };
 
         let formed_state = security_store
@@ -126,9 +134,14 @@ fn main() {
             let mut profile = coordinator_profile();
             let mut device = coordinator_device(&profile, false);
             let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
-            let mut app = CoordinatorApp::new(
+            let mut trust_center_store = RamTrustCenterDeviceStore::new();
+            trust_center_store
+                .store(&trust_center_state)
+                .expect("restore Trust Center state");
+            let mut app = TrustCenterCoordinatorApp::new(
                 node,
                 PersistentChildren::new(RamChildTableStore::new()),
+                trust_center_store,
                 &POLICY,
                 RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
             )
@@ -154,6 +167,6 @@ fn main() {
             );
         }
 
-        println!("CoordinatorApp persistence demo complete");
+        println!("TrustCenterCoordinatorApp persistence demo complete");
     });
 }

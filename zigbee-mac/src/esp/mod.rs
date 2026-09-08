@@ -710,11 +710,14 @@ impl MacDriver for EspMac<'_> {
     }
 
     async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
-        self.pan_id = req.pan_id;
-        self.channel = req.channel;
-        self.driver.update_config(|cfg| cfg.channel = req.channel);
-        self.sync_radio_filter();
-        Ok(())
+        // `EspMac` does not implement `ParentMacDriver`: it keeps the
+        // `Unsupported` defaults for association response, beacon response,
+        // orphan response and indirect delivery. The radio has hardware
+        // auto-ACK TX, but nothing programs a per-child Frame Pending
+        // source-match table, so it cannot serve a child's Data Request.
+        // Retuning the PAN/channel and returning `Ok(())` would tell NWK a
+        // router started; fail explicitly instead.
+        start_requires_parent_capability(&req)
     }
 
     async fn mlme_get(&self, attribute: PibAttribute) -> Result<PibValue, MacError> {
@@ -1093,14 +1096,7 @@ impl MacDriver for EspMac<'_> {
     }
 
     fn capabilities(&self) -> MacCapabilities {
-        MacCapabilities {
-            coordinator: false,
-            router: true,
-            hardware_security: false,
-            max_payload: 102,
-            tx_power_min: TxPower(-24),
-            tx_power_max: TxPower(21),
-        }
+        MacCapabilities::non_parent(102, TxPower(-24), TxPower(21))
     }
 }
 

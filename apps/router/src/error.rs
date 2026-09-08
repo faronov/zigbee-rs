@@ -7,12 +7,17 @@ use zigbee_runtime::child_store::ChildStoreError;
 use zigbee_runtime::event_loop::StartError;
 use zigbee_runtime::node::NodeError;
 use zigbee_runtime::security_store::SecurityStoreError;
+#[cfg(feature = "trust-center")]
+use zigbee_runtime::trust_center_runtime::TrustCenterRuntimeError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouterAppError {
     InvalidPolicy,
     /// An always-on lifecycle was given a sleepy or receiver-off device.
     NotAlwaysOnDevice,
+    /// The selected APS-table lifecycle requires receiving application link
+    /// keys, but this product did not select that optional capability.
+    ApplicationLinkKeyInstallationUnavailable,
     WrongDeviceType {
         expected: DeviceType,
         actual: DeviceType,
@@ -27,6 +32,8 @@ pub enum RouterAppError {
     Security(SecurityStoreError),
     ApsTables(ApsTableStoreError),
     ChildStore(ChildStoreError),
+    #[cfg(feature = "trust-center")]
+    TrustCenter(TrustCenterRuntimeError),
     Mac(MacError),
 }
 
@@ -57,5 +64,12 @@ impl From<ApsTableStoreError> for RouterAppError {
 impl From<MacError> for RouterAppError {
     fn from(error: MacError) -> Self {
         Self::Mac(error)
+    }
+}
+
+#[cfg(feature = "trust-center")]
+impl From<TrustCenterRuntimeError> for RouterAppError {
+    fn from(error: TrustCenterRuntimeError) -> Self {
+        Self::TrustCenter(error)
     }
 }

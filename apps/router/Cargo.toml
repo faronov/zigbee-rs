@@ -8,16 +8,23 @@ repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
 [features]
-default = []
-router = ["zigbee-runtime/router"]
+default = ["centralized-tclk", "distributed-security", "groups"]
+application-link-key-installation = ["zigbee-runtime/application-link-key-installation"]
+centralized-tclk = ["zigbee-runtime/centralized-tclk"]
+distributed-security = ["zigbee-runtime/distributed-security"]
+groups = ["zigbee-runtime/groups"]
+router = ["zigbee-runtime/router", "application-link-key-installation"]
+trust-center = ["router", "zigbee-runtime/trust-center"]
 
 [dependencies]
+zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-mac = { path = "../../zigbee-mac" }
 zigbee-nwk = { path = "../../zigbee-nwk" }
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+# Every steering frontend, including the routing-free always-on ED, must
+# finish centralized commissioning. This is mandatory even with defaults off.
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["centralized-tclk"] }
 
 [dev-dependencies]
-zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
