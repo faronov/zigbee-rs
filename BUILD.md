@@ -1,8 +1,8 @@
 # Build and validation
 
-This file records the commands and measurements for the current
-`experiment/r22-bdb-complete` worktree. A successful build proves compilation,
-linking, and the checks named below. It does not prove radio timing, flash
+This file records build commands and dated image measurements for `master`.
+A successful build proves compilation, linking, and the checks named below.
+It does not prove radio timing, flash
 durability, sleep current, or OTA activation on hardware.
 
 Validation terms in this file are strict:
@@ -55,19 +55,27 @@ cargo +nightly-2026-03-23 fmt --all -- --check
 The root workspace deliberately excludes most hardware images. Build those
 from their own manifest or directory.
 
-## Current release measurements
+## Size policy and recorded measurements
+
+Artificial regression budgets are no longer enforced. Size reports still
+measure final artifacts, but exceeding a former budget does not fail the
+build. Physical Flash/RAM limits, protected partitions, OTA-slot bounds,
+stack reserves, and linker/layout checks remain mandatory.
 
 Baseline snapshot: **2026-09-06**, with TLSR8258 parent-router measurements
 refreshed **2026-09-07** and EFR32MG1/ESP32-C6/H2 refreshed **2026-09-08**.
-The parent router and ESP32-C6 currently fail their regression budgets;
-EFR32MG1 and ESP32-H2 pass their
-build/layout gates. These are not exact-image hardware reruns. Prior
-hardware evidence is called out separately below.
+The parent router and ESP32-C6 failed the regression budgets enforced at those
+snapshots; EFR32MG1 and ESP32-H2 passed their build/layout gates. Those former
+budgets are now historical comparisons, not live blockers. PHY62x2 occupied-XIP
+measurements were refreshed **2026-09-15**: PHY6222 fits, while PHY6252 still
+fails the physical limit. These are not exact-image hardware reruns. Prior
+hardware evidence is called out separately below. Margins against former
+budgets are not physical headroom.
 
-| image | measured bytes | gate bytes | gate headroom | measured artifact |
+| image | measured bytes | physical limit / former regression budget | margin vs reference | measured artifact |
 |---|---:|---:|---:|---|
-| PHY6222 sensor | 130,624 | 130,816 hard XIP | 192 | occupied XIP span |
-| PHY6252 feature-selected sensor | 130,464 | 130,816 hard XIP | 352 | occupied XIP span |
+| PHY6222 sensor | 130,752 | 130,816 hard XIP | 64 | occupied XIP span |
+| PHY6252 feature-selected sensor | 130,912 | 130,816 hard XIP | -96 | failed-link occupied XIP span |
 | BL702 sensor | 189,442 | 192,512 regression | 3,070 | raw linked `.bin` |
 | nRF52840 sensor, default | 224,472 | 225,280 regression | 808 | raw `.bin` |
 | nRF52840 sensor, BME280 | 231,792 | 245,760 regression | 13,968 | raw `.bin` |
@@ -83,17 +91,18 @@ hardware evidence is called out separately below.
 | EFR32MG1 sensor | 163,236 | 167,936 regression | 4,700 | raw `.bin` |
 | EFR32MG21 sensor | 202,820 | 212,992 regression | 10,172 | raw `.bin` |
 | CC2340R5 sensor, pinned SDK | 223,536 | 225,280 regression | 1,744 | raw `.bin` |
-| ESP32-C6 sensor | 369,248 | 368,640 regression | -608 | application image; over budget |
+| ESP32-C6 sensor | 369,248 | 368,640 regression | -608 | application image; above former budget |
 | ESP32-H2 sensor | 354,096 | 356,352 regression | 2,256 | application image |
 | TLSR8258 sensor, default SUSPEND | 290,616 | 294,912 regression | 4,296 | raw `.bin` |
 | TLSR8258 sensor, LOW32K 250 ms | 295,548 | 299,008 regression | 3,460 | raw `.bin` |
 | TLSR8258 sensor, LOW32K 10 s | 295,552 | 299,008 regression | 3,456 | raw `.bin` |
-| TLSR8258 parent router | 433,756 | 430,080 regression | -3,676 | raw `.bin`; over budget |
+| TLSR8258 parent router | 433,756 | 430,080 regression | -3,676 | raw `.bin`; above former budget |
 
 Additional exact packaging and physical limits:
 
-- PHY6252 now has the separate exact feature-selected occupied-XIP
-  measurement shown above; its hardware path remains unverified.
+- PHY6252's feature-selected failed link is 96 B over the mandatory 130,816 B
+  XIP slot. No current executable/package is qualified; its hardware path
+  remains unverified.
 - BL702's packaged boot image is 197,648 B. The packager/device physical slot
   is 1,044,480 B; the product still independently protects its
   `0x000FE000..0x00100000` security journal and linked XIP limit.
@@ -207,10 +216,11 @@ Earlier hardware runs provide narrow path evidence:
   complete activation remains open.
 
 Those runs are not recorded as reruns of the exact 369,248 B and 354,096 B
-images in the current measurement table. The C6 image fits its physical OTA
-slot but fails its independent regression budget. A controlled build before
-the shared OTA deadline fix was already 369,184 B; the fix adds 64 B. Neither
-the budget nor the selected compiler was changed.
+images in the recorded measurement table. That C6 image fits its physical OTA
+slot but failed its then-enforced regression budget. A controlled build before
+the shared OTA deadline fix was already 369,184 B; the fix added 64 B without
+changing the budget or selected compiler at the time. That artificial budget
+has since been removed; physical OTA and other validation checks remain.
 
 ## BL702 XT-ZB1
 
@@ -265,8 +275,9 @@ to RTT diagnostics and the selected lifecycle action/status behavior. The
 product reserves `0x0007E000..0x00080000` for security state and selects
 `Active`/`Active` waits, synthetic/fixed measurements, and software AES.
 Commissioning is not claimed: radio HIL is pending and the entropy backend
-deliberately fails closed. The pinned-SDK image is 223,536 B, static RAM is
-4,772 B, and the physical application slot is 516,096 B.
+deliberately fails closed. The recorded pre-static-task pinned-SDK image is
+223,536 B; its 4,772 B static-RAM figure is not a current task-capacity check.
+The physical application slot remains 516,096 B.
 
 ## PHY6222 / PHY6252
 
@@ -274,15 +285,16 @@ deliberately fails closed. The pinned-SDK image is 223,536 B, static RAM is
 cd examples/phy6222-sensor
 cargo +nightly-2026-08-01 build --release --locked
 
-# Cross-build the PHY6252 feature image; still unverified on hardware.
+# This PHY6252 feature build currently fails the physical XIP limit.
 cargo +nightly-2026-08-01 build --release --locked \
   --no-default-features --features phy6252
 ```
 
-The PHY6222 occupied XIP span is 130,624 B against the hard 130,816 B gate.
-The exact PHY6252 feature image occupies 130,464 B against the same hard gate,
-leaving 352 B. Both values are cross-build/layout measurements, not hardware
-proof.
+The default PHY6222 occupied XIP span is 130,752 B against the hard 130,816 B
+gate, leaving 64 B. The exact PHY6252 feature build has a failed-link span of
+130,912 B, exceeding the same physical gate by 96 B; it produces no validated
+executable/package. These limits remain mandatory after removal of artificial
+regression budgets. Neither measurement is hardware proof.
 
 Package the default PHY6222 image exactly as CI does:
 
@@ -387,11 +399,13 @@ are `0x70000..0x72000` for APS bindings/groups/application keys,
 `0x76000..0x77000` for factory EUI, and `0x77000..0x78000` for factory
 configuration/calibration.
 
-The router measures 433,756 B, exceeding its unchanged 430,080 B (`0x69000`)
-regression gate by 3,676 B. This blocks release. The gate was introduced
-above the earlier 427,776 B R22 image, replacing the pre-R22 356,352 B gate.
-The physical `0x70000` boundary and all journals are unchanged: 24,996 B of
-physical headroom remains, and the gate-to-boundary separation is 28,672 B.
+The recorded router snapshot measured 433,756 B, exceeding its then-enforced
+430,080 B (`0x69000`) regression budget by 3,676 B. That historical gate was
+introduced above the earlier 427,776 B R22 image, replacing the pre-R22
+356,352 B budget. Artificial regression budgets no longer block builds.
+The mandatory physical `0x70000` boundary and all journals are unchanged:
+that snapshot has 24,996 B of physical headroom. The 28,672 B difference
+between the former budget and physical boundary is not a reserved partition.
 
 The LOW32K images retain an 8,448 B fresh-root SVC stack, 256 B above the
 8 KiB gate.
@@ -404,5 +418,7 @@ mdbook build docs/book
 ```
 
 Pages deployment is intentionally gated to pushes on `main`/`master`.
-Building this experiment branch validates the book locally but does not
-publish it.
+Documentation can deploy after its core/code checks succeed even when a
+required firmware job fails, but prebuilt binaries and one-click installation
+require successful firmware jobs. Removing artificial size budgets does not
+bypass physical layout, image, or other required checks.

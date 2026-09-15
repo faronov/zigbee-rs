@@ -136,15 +136,16 @@ cargo +nightly-2026-03-23 build --release --locked
 
 Measured release images on 2026-09-06:
 
-| image | bytes | regression gate |
+| image | bytes | former regression budget |
 |---|---:|---:|
 | nRF52840 default / BME280 / SHT31 | 224,472 / 231,792 / 228,216 | 225,280 / 245,760 / 241,664 |
 | nRF52833 default / BME280 / SHT31 | 224,464 / 231,784 / 228,208 | 225,280 / 245,760 / 241,664 |
 | nRF52840 always-on End Device | 210,072 | 253,952 |
 | UF2 ProMicro / MDK / PCA10059 / DK | 222,968 / 222,848 / 224,536 / 224,552 | 237,568 each |
 
-CI also checks the product partition symbols, hardware-AES symbols, and
-role-specific symbol removal.
+The former budgets are historical comparisons, not enforced thresholds.
+CI still measures image bytes and checks physical memory limits, product
+partition symbols, hardware-AES symbols, and role-specific symbol removal.
 
 ## Validation
 

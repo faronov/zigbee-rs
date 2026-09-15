@@ -70,16 +70,18 @@ Diagnostic logging:
 BL702_DIAGNOSTIC_LOG=1 ./build-image.sh
 ```
 
-Current production images:
+Recorded production images and historical budget comparison:
 
 | artifact | bytes |
 |---|---:|
 | raw binary | 189,442 |
-| raw regression gate | 192,512 |
-| raw gate headroom | 3,070 |
+| former raw regression budget (not enforced) | 192,512 |
+| former budget minus raw bytes | 3,070 |
 | packaged boot image | 197,648 |
 | packager/device physical slot | 1,044,480 |
 
+The artificial regression budget no longer fails builds. Physical image,
+protected-journal, RAM, and stack boundaries remain mandatory.
 The package script verifies BL702 boot magic and explicit 32 MHz XTAL clock
 fields. These exact artifacts are build/package/layout-tested; the earlier
 radio evidence is not an exact-image rerun.

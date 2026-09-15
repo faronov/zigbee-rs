@@ -237,7 +237,7 @@ still require independent packet captures and HIL.
 | product | validation |
 |---|---|
 | nRF52840 always-on End Device | builds, layout/role-symbol gates pass; complete HIL acceptance open |
-| TLSR8258 parent router | current 433,756 B image exceeds the unchanged 430,080 B regression gate by 3,676 B; prior join, silent restart, Link Status, and NWK relay evidence exists; corrected-image first-attempt child join/interview open |
+| TLSR8258 parent router | recorded 433,756 B snapshot exceeded the then-enforced 430,080 B regression budget by 3,676 B; that artificial budget is no longer enforced, but the physical `0x70000` application boundary and journals remain protected; prior join, silent restart, Link Status, and NWK relay evidence exists; corrected-image first-attempt child join/interview open |
 | coordinator | finite formation/restart host-tested; no production hardware coordinator path claimed |
 
 Do not call a non-parent backend a router, and do not call a host-tested

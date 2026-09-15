@@ -4,6 +4,11 @@ Embedded size is measured from the final release artifact produced by the
 target's pinned toolchain. The ELF file size on the host is not a flash-usage
 number.
 
+Size reports remain measurements, but artificial regression budgets are no
+longer enforced. A larger image does not fail a build merely for exceeding a
+previous snapshot's budget. Physical Flash/RAM limits, protected partitions,
+OTA-slot bounds, stack reserves, and linker/layout checks remain mandatory.
+
 ## Local image snapshots
 
 Baseline snapshot: **2026-09-06**. EFR32MG1 was refreshed **2026-09-08**.
@@ -12,15 +17,18 @@ and ESP32-C6/H2 rows were refreshed
 **2026-09-10**. These are named local build snapshots, not the latest remote
 CI results; unrefreshed rows do not describe the current working tree.
 PHY6222 and PHY6252 occupied-XIP measurements were refreshed **2026-09-15**.
-The recorded parent router and all four ESP variants **fail their regression
-budgets**; the current PHY6252 variant **fails its physical linker limit**.
+The recorded parent router and all four ESP variants exceeded the regression
+budgets enforced at the time; those former budgets are no longer build
+blockers. The current PHY6252 variant **fails its physical linker limit**.
 Prior hardware evidence is not an exact-image HIL rerun unless
 explicitly stated.
 
-The gate column is a regression budget except for PHY6222 and PHY6252, where
-it is the hard XIP slot limit.
+The reference column contains former, unenforced regression budgets except
+for PHY6222 and PHY6252, where it is the mandatory physical XIP slot limit.
+The margin is reference minus measured bytes, not physical headroom for the
+former-budget rows.
 
-| image | measured | gate | headroom | metric |
+| image | measured | physical limit / former budget | margin vs reference | metric |
 |---|---:|---:|---:|---|
 | PHY6222 sensor | 130,752 | 130,816 | 64 | occupied XIP span |
 | PHY6252 feature-selected sensor | 130,912 | 130,816 | -96 | failed-link occupied XIP span |
@@ -33,10 +41,10 @@ it is the hard XIP slot limit.
 | EFR32MG21 sensor | 202,068 | 212,992 | 10,924 | raw binary |
 | CC2340R5 pinned-SDK sensor (pre-static-task snapshot) | 223,536 | 225,280 | 1,744 | historical raw binary; not rebuilt |
 | CC2340R5 fallback sensor | 213,160 | 225,280 | 12,120 | raw binary; radio firmware unavailable |
-| ESP32-C6 sensor default / `light-sleep` | 381,056 / 392,080 | 368,640 each | -12,416 / -23,440 | application images; over budget |
-| ESP32-H2 sensor default / `light-sleep` | 365,920 / 376,640 | 356,352 each | -9,568 / -20,288 | application images; over budget |
+| ESP32-C6 sensor default / `light-sleep` | 381,056 / 392,080 | 368,640 each | -12,416 / -23,440 | application images; above former budget |
+| ESP32-H2 sensor default / `light-sleep` | 365,920 / 376,640 | 356,352 each | -9,568 / -20,288 | application images; above former budget |
 | TLSR8258 default / LOW32K 250 ms / LOW32K 10 s | 290,616 / 295,548 / 295,552 | 294,912 / 299,008 / 299,008 | 4,296 / 3,460 / 3,456 | raw binaries |
-| TLSR8258 parent router | 436,072 | 430,080 | -5,992 | raw binary; over budget |
+| TLSR8258 parent router | 436,072 | 430,080 | -5,992 | raw binary; above former budget |
 
 The measurements use:
 
@@ -65,21 +73,23 @@ Additional artifacts and physical limits:
   OTA slot: 2,031,616 B each. Their regenerated version-1 Zigbee OTA containers
   are 381,122/392,146 B for C6 and 365,986/376,706 B for H2.
   These combined-fix images have host validation, not hardware execution
-  evidence, and all remain over their unchanged regression budgets.
+  evidence. Exceeding their former regression budgets no longer blocks builds;
+  the physical OTA-slot and other validation checks still apply.
 - PHY6252 has the separate failed-link occupied-XIP measurement shown above;
-  the earlier in-budget image is not the current source, and its hardware path
-  remains unverified.
+  the earlier image that fitted the slot is not the current source, and its
+  hardware path remains unverified.
 - TLSR8258 physical application boundary: 458,752 B (`0x70000`), followed by
   APS/child/security journals at `0x70000`/`0x72000`/`0x74000`.
 
-The TLSR8258 router's 430,080 B (`0x69000`) gate replaces the pre-R22
-356,352 B baseline. It was set above the earlier 427,776 B image.
-The current 436,072 B image exceeds it by 5,992 B, blocking release.
-The physical 458,752 B (`0x70000`) boundary and journals did not move:
-22,680 B of physical headroom remains, but that does not waive the
-regression gate. The gate-to-boundary separation is 28,672 B. The existing
-TC32 toolchain linked the persistent-APS composition with its physical
-memory assertions; its build command still fails the regression-size gate.
+The TLSR8258 router's former 430,080 B (`0x69000`) regression budget replaced
+the pre-R22 356,352 B baseline and was set above the earlier 427,776 B image.
+The recorded 436,072 B image exceeded it by 5,992 B and failed that historical
+gate. That artificial threshold is no longer enforced. The mandatory physical
+458,752 B (`0x70000`) boundary and journals did not move: this snapshot has
+22,680 B of physical headroom. The 28,672 B gap between the former budget and
+the physical boundary was not a reserved partition. The existing TC32
+toolchain linked the persistent-APS composition with its physical memory
+assertions; removing the regression gate does not establish hardware acceptance.
 
 ## RAM and stack snapshot
 
@@ -105,16 +115,17 @@ EFR32MG1 has exactly `0x7C00` bytes of usable SRAM and 376 B of margin above
 its 16 KiB stack gate. TLSR8258's retained SVC stack has 256 B above its 8 KiB
 gate. These linked values are not runtime high-water measurements.
 
-## Two independent limits
+## Measurement versus physical limits
 
-Every production build should check:
+Every production build must retain:
 
-1. **regression budget** — catches unexpected growth;
-2. **physical boundary** — prevents overlap with bootloader, security,
-   child-table, factory, or OTA regions.
+- **size measurement** — reports the final artifact's bytes for comparison;
+- **physical boundary checks** — prevent overlap with bootloader, security,
+  child-table, factory, or OTA regions and preserve usable RAM and stack reserves.
 
-Passing a growth budget does not prove the linker boundary, and vice versa.
-CI checks both for targets with protected partitions.
+There is no arbitrary regression-budget failure. A size report is not proof of
+physical fit: product linker assertions, layout checks, and image/OTA
+validation remain independent, mandatory checks.
 
 ## Why the application model remains small
 
@@ -156,6 +167,16 @@ OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
 stat -f '%z' path/to/firmware.bin   # macOS
 ```
 
+Machine-readable artifact measurement, from the repository root:
+
+```bash
+./tools/firmware-size-report.sh sensor path/to/firmware.bin path/to/firmware.size.json
+```
+
+The three arguments are image name, binary, and output JSON. The report
+contains measurements without regression-budget, remaining-budget, or
+exceeded-budget fields; it does not enforce an artificial growth threshold.
+
 Static sections:
 
 ```bash
@@ -164,6 +185,6 @@ SIZE=$(find "$(rustc --print sysroot)" -name llvm-size -print -quit)
 ```
 
 Use the platform packager instead of raw `objcopy` for ESP, BL702, PHY62x2,
-and UF2 deployment formats. Exact commands and current budgets are in
-[`BUILD.md`](https://github.com/faronov/zigbee-rs/blob/experiment/r22-bdb-complete/BUILD.md)
+and UF2 deployment formats. Exact commands and physical checks are in
+[`BUILD.md`](https://github.com/faronov/zigbee-rs/blob/master/BUILD.md)
 and `.github/workflows/ci.yml`.

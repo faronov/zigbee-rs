@@ -62,7 +62,9 @@ python3 tools/verify-layout.py \
   target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor
 ```
 
-Current raw image: **202,820 B** against a **212,992 B** regression gate.
+Recorded raw image: **202,820 B** against the former **212,992 B** regression
+budget, which is no longer enforced. Physical application, persistence, RAM,
+and stack checks remain mandatory.
 `.data` is **308 B**, `.bss` is **18,280 B**, static total is **18,588 B**,
 and the linked available stack is **46,944 B**. This product has no OTA
 packaging path.

@@ -130,9 +130,10 @@ tools use Rust `1.94.1`.
 ./scripts/tlsr8258.sh build router
 ```
 
-Current images (sensor baseline 2026-09-06; router refreshed 2026-09-10):
+Recorded images (sensor baseline 2026-09-06; router refreshed 2026-09-10).
+Former regression budgets are historical comparisons, no longer enforced:
 
-| image | bytes | regression gate | headroom |
+| image | bytes | former regression budget | former budget minus bytes |
 |---|---:|---:|---:|
 | default SUSPEND sensor | 290,616 | 294,912 | 4,296 |
 | LOW32K 250 ms proof | 295,548 | 299,008 | 3,460 |
@@ -142,12 +143,13 @@ Current images (sensor baseline 2026-09-06; router refreshed 2026-09-10):
 The retained LOW32K fresh-root SVC stack is 8,448 B, 256 B above its 8 KiB
 gate.
 
-The router's old 356,352 B gate was a pre-R22 baseline. The unchanged
-430,080 B (`0x69000`) gate was introduced above the earlier 427,776 B image.
-The current router exceeds it by 5,992 B, blocking release. Neither the
-physical 458,752 B (`0x70000`) application boundary nor any journal moved.
-The current image has 22,680 B of physical headroom; the gate-to-boundary
-separation remains 28,672 B.
+The router's old 356,352 B budget was a pre-R22 baseline. The former
+430,080 B (`0x69000`) budget was introduced above the earlier 427,776 B image.
+The recorded router exceeded it by 5,992 B and failed that historical gate.
+The artificial budget is no longer enforced. Neither the mandatory physical
+458,752 B (`0x70000`) application boundary nor any journal moved.
+The recorded image has 22,680 B of physical headroom; the 28,672 B difference
+between the former budget and physical boundary is not a reserved partition.
 
 Independent diagnostics remain under `tools/telink-tlsr8258-lab`:
 
@@ -159,10 +161,11 @@ Independent diagnostics remain under `tools/telink-tlsr8258-lab`:
 ## Validation
 
 The recorded sensor images passed build/layout checks. The refreshed router
-links with the physical memory assertions and the durable Bind/Unbind path,
-but its build command fails the unchanged regression-size gate. The existing
-TC32 toolchain was not modified. Earlier TB-04 images produced hardware
-evidence for:
+linked with the physical memory assertions and the durable Bind/Unbind path,
+but its build command failed the regression-size gate enforced at the time.
+That artificial gate has since been removed; physical limits and the hardware
+gates below remain. The existing TC32 toolchain was not modified. Earlier TB-04
+images produced hardware evidence for:
 
 - hardware AES KAT, secured commissioning, TCLK exchange, ZHA interview, and
   sustained traffic;

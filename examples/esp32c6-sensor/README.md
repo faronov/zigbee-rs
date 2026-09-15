@@ -59,10 +59,13 @@ cargo +nightly-2026-08-01 run --release --locked -Z build-std=core,alloc
 The configured runner installs the partition table, writes `ota_0`, and clears
 `otadata`. Back up commissioned state before the first layout migration.
 
-Current application image: **368,032 B** against a **368,640 B** regression
-gate. The merged flash image is **433,568 B**, the Zigbee OTA v2 container is
+Recorded application image: **368,032 B** against the former **368,640 B**
+regression budget, which is no longer enforced. The merged flash image is
+**433,568 B**, the Zigbee OTA v2 container is
 **368,098 B**, the OTA slot is **2,031,616 B**, and static `.data + .bss` is
 **53,268 B**.
+
+Physical partition, OTA-slot, RAM, and image/layout checks remain mandatory.
 
 ## OTA image
 
@@ -75,7 +78,7 @@ the appended SHA-256, then writes `otadata` only after the security checkpoint.
 
 ## Validation
 
-The exact current application and package artifacts are
+The recorded application and package artifacts are
 build/layout/package-tested. Earlier ESP32-C6 images demonstrated:
 
 - hardware AES KAT and secured commissioning/reporting;
@@ -85,4 +88,4 @@ build/layout/package-tested. Earlier ESP32-C6 images demonstrated:
 
 Complete C6 verification, activation, reboot into the new version, and retained
 commissioned state remain open. The earlier run is not an exact-image rerun of
-the current 368,032 B application image.
+the recorded 368,032 B application image.

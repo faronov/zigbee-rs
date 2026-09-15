@@ -73,13 +73,17 @@ Install `tc32-stage2-tc32-45` under
 ./scripts/tlsr8258.sh build sensor-retention-10s
 ```
 
-Current images:
+Recorded images and former regression budgets:
 
-| image | bytes | regression gate |
+| image | bytes | former regression budget |
 |---|---:|---:|
 | default SUSPEND | 290,616 | 294,912 |
 | LOW32K 250 ms | 295,548 | 299,008 |
 | LOW32K 10 s | 295,552 | 299,008 |
+
+These artificial budgets are no longer enforced. The physical `0x70000`
+application boundary, protected journals/factory data, RAM, and stack checks
+remain mandatory.
 
 The retained fresh-root SVC stack is 8,448 B, 256 B above its 8 KiB gate.
 

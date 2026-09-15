@@ -60,18 +60,21 @@ Flashable image:
 examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router.bin
 ```
 
-Current size: **427,776 B** against the **430,080 B** (`0x69000`)
-regression gate, leaving **2,304 B**. The old **356,352 B** gate was the
-pre-R22 baseline. The current gate is the next 4 KiB boundary above the
-measured image.
+Recorded size snapshot: **427,776 B** against the former **430,080 B**
+(`0x69000`) regression budget, with a **2,304 B** margin to that budget.
+The old **356,352 B** budget was the pre-R22 baseline; its successor was the
+next 4 KiB boundary above this snapshot. These artificial budgets are no longer
+enforced. Newer snapshots are recorded in the
+[firmware-size chapter](../../docs/book/src/advanced/firmware-size.md).
 
-The physical application boundary remains **458,752 B** (`0x70000`), leaving
-**30,976 B** above the image and **28,672 B** between the gate and the APS
-journal. All journal locations are unchanged.
+The mandatory physical application boundary remains **458,752 B** (`0x70000`),
+leaving **30,976 B** above this snapshot. The **28,672 B** difference between
+the former budget and APS journal is not a reserved partition. All journal
+locations, RAM, and stack limits are unchanged.
 
 ## Hardware evidence
 
-The exact current image is build/layout-tested. Earlier TB-04 router images
+The recorded image is build/layout-tested. Earlier TB-04 router images
 produced hardware evidence for:
 
 - association, Transport-Key, Device Announce, TCLK exchange, and interview;

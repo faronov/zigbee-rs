@@ -68,7 +68,9 @@ python3 tools/verify-layout.py \
   target/thumbv7em-none-eabi/release/efr32mg1-sensor
 ```
 
-Current raw image: **162,396 B** against a **167,936 B** regression gate.
+Recorded raw image: **162,396 B** against the former **167,936 B** regression
+budget, which is no longer enforced. Physical Flash/RAM, partition, OTA, and
+stack checks remain mandatory.
 `.data` is **260 B**, `.bss` is **14,680 B**, static total is **14,940 B**,
 and the linked available stack is **16,800 B**—**416 B** above the 16 KiB
 gate. Never use a mass erase on this layout.
@@ -86,7 +88,7 @@ has not yet completed on hardware. The current Zigbee OTA container is
 
 ## Validation
 
-The exact current image/container are build/layout/package-tested. Earlier
+The recorded image/container are build/layout/package-tested. Earlier
 TRÅDFRI images produced hardware evidence for:
 
 - commissioning, hardware AES, and ZHA interview;

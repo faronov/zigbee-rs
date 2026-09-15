@@ -214,8 +214,9 @@ not redundant):
 7. Image size: this diagnostic's local script still emits a legacy warning
    above `0x40000`, then **fails** at its linked security journal
    (`0x74000`). The warning is not the current production gate: the R22
-   sensor/router products use explicit regression budgets and a physical
-   application boundary at `0x70000`.
+   sensor/router products report image bytes without enforcing artificial
+   regression budgets and retain the physical application boundary at
+   `0x70000`.
 
 ## Design notes / limitations
 

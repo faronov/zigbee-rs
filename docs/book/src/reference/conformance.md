@@ -91,8 +91,8 @@ sensor/router products select it only after profile assertions.
 - production Coordinator/Trust Center hardware composition;
 - repeated power-cut validation of every product's security, child and APS
   flash journals;
-- final firmware-size/layout gates and hardware acceptance for every release
-  image.
+- final physical Flash/RAM/OTA/stack and layout checks, with hardware acceptance
+  for every release image.
 
 The host lifecycle suite additionally sweeps initial-key completion and
 sleepy-child Network-Key rotation across journal commit failures; see
@@ -101,11 +101,12 @@ Shared sensor OTA activation is blocked on checkpoint failures and retains
 its product-selected wake deadline. Neither result closes the hardware gates
 above.
 
-Further TLSR8258 size optimization and 512 KiB OTA work are deferred. This does
-not waive the production size gate, introduce a TLSR OTA writer, or promote
-the experimental compiler into a release toolchain.
-The refreshed ESP32-C6 image also exceeds its unchanged regression budget;
-physical OTA-slot fit is not a release waiver.
+Further TLSR8258 size optimization and 512 KiB OTA work are deferred. Removing
+artificial regression budgets does not waive physical memory or stack limits,
+introduce a TLSR OTA writer, or promote the experimental compiler into a
+release toolchain. Recorded ESP32-C6 regression-budget failures remain
+historical evidence, not current build blockers. Physical OTA-slot fit alone
+is still not hardware acceptance or a conformance claim.
 
-See [`BUILD.md`](https://github.com/faronov/zigbee-rs/blob/experiment/r22-bdb-complete/BUILD.md)
+See [`BUILD.md`](https://github.com/faronov/zigbee-rs/blob/master/BUILD.md)
 for exact target commands and evidence.

@@ -150,13 +150,18 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc
 To build the retained-sleep variant in either example directory, add
 `--features light-sleep`. This feature does not change partitions, OTA identity
 or network persistence. CI links both opt-in images and runs the real-image
-OTA corpus separately from the default images, with unchanged size budgets.
+OTA corpus separately from the default images. Size reports measure the
+artifacts without enforcing artificial regression budgets; physical OTA-slot
+and other layout checks remain mandatory.
 
 Documentation can be published after its core/code checks pass even when a
-firmware size gate fails. In that case the site includes no prebuilt ESP
-binaries, its firmware manifest has no builds, and one-click installation is
+required firmware job fails a build, physical limit, or other check. In that
+case the site includes no prebuilt ESP binaries, its firmware manifest has no
+builds, and one-click installation is
 disabled with a link to the failing CI run. The existing ESP32-C6, ESP32-H2 and
-BL702 job gates must all pass before prebuilt ESP firmware is published.
+BL702 jobs must all succeed before prebuilt ESP firmware is published.
+Exceeding a former regression budget no longer fails those jobs; binaries and
+one-click installation can become available when all remaining checks pass.
 The flasher's custom-file mode remains an explicit user-supplied operation,
 not a qualification of that file or automatic flashing.
 
@@ -171,7 +176,7 @@ Back up commissioned state before the first partition-table migration.
 
 Local integrated snapshot (2026-09-10), not remote CI or hardware results:
 
-| image | application | regression gate | merged flash | Zigbee OTA v1 | static `.data + .bss` |
+| image | application | former regression budget | merged flash | Zigbee OTA v1 | static `.data + .bss` |
 |---|---:|---:|---:|---:|---:|
 | ESP32-C6 default | 381,056 | 368,640 | 446,592 | 381,122 | 53,796 |
 | ESP32-C6 `light-sleep` | 392,080 | 368,640 | 457,616 | 392,146 | 53,992 |
@@ -185,9 +190,10 @@ for C6 and 201,312/200,640 B for H2, not measured high-water marks.
 The applications passed structural/layout and host flash-mock staging,
 verification, and activation checks. The hardware results below are earlier
 path evidence, not exact-image reruns.
-All four images exceed their unchanged regression budgets: default/light C6
-by 12,416/23,440 B and H2 by 9,568/20,288 B. Physical slot fit does not clear
-those release blockers.
+All four snapshots exceeded their then-enforced regression budgets:
+default/light C6 by 12,416/23,440 B and H2 by 9,568/20,288 B. Those historical
+failures remain recorded, but the former budgets are no longer build blockers.
+The physical slot and other image/layout checks remain mandatory.
 These sizes include the combined idle, OTA, reporting, and runtime changes;
 their differences from earlier snapshots are not isolated per-fix costs.
 
@@ -219,8 +225,8 @@ combined with `--features`.
 Ordinary product host tests leave the artifact-dependent tests ignored.
 Each CI firmware build explicitly enables them with `--include-ignored`,
 using its freshly generated application and the shared Python/Rust validation
-corpus before applying the size gate. These exercise flash mocks, not the
-physical device.
+corpus alongside size reporting and physical image/layout checks. These
+exercise flash mocks, not the physical device.
 
 ## Hardware validation
 
@@ -236,11 +242,12 @@ An earlier 4 MiB ESP32-H2 revision 1.2 image demonstrated:
 
 Fresh factory-reset commissioning and long-duration power behavior remain
 separate gates. Neither current H2 variant above has hardware execution
-evidence, and both exceed their regression budget.
+evidence. Removing artificial size budgets does not close those hardware gates.
 
 ### ESP32-C6
 
 Earlier C6 hardware runs demonstrated commissioning/reporting and OTA transfer
 to 18.3% before intentional cancellation. Complete C6
 verification/activation/reboot remains open. Neither current C6 variant above
-has hardware execution evidence, and both fail their regression size gate.
+has hardware execution evidence. The former regression budgets are not live
+build gates.

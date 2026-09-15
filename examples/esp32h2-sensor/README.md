@@ -42,10 +42,13 @@ cargo +nightly-2026-08-01 run --release --locked -Z build-std=core,alloc
 ```
 
 Use `espflash 4.5.0`. The configured runner writes `ota_0` and clears
-`otadata`. Current application image: **352,928 B** against a **356,352 B**
-regression gate. The merged flash image is **418,464 B**, the Zigbee OTA v2
+`otadata`. Recorded application image: **352,928 B** against the former
+**356,352 B** regression budget, which is no longer enforced.
+The merged flash image is **418,464 B**, the Zigbee OTA v2
 container is **352,994 B**, the OTA slot is **2,031,616 B**, and static
 `.data + .bss` is **52,892 B**.
+
+Physical partition, OTA-slot, RAM, and image/layout checks remain mandatory.
 
 ## OTA
 
@@ -59,7 +62,7 @@ checkpoints Zigbee keys/counters.
 
 ## Hardware validation
 
-The exact current application and package artifacts are
+The recorded application and package artifacts are
 build/layout/package-tested. An earlier ESP32-H2 revision 1.2 image with 4 MiB
 flash demonstrated:
 
@@ -71,4 +74,4 @@ flash demonstrated:
 
 Fresh factory-reset commissioning and long-duration power behavior remain
 separate gates. This product currently makes no low-power sleep claim, and the
-earlier OTA run is not an exact-image rerun of the current 352,928 B image.
+earlier OTA run is not an exact-image rerun of the recorded 352,928 B image.

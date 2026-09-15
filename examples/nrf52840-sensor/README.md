@@ -75,13 +75,16 @@ probe-rs run --chip nRF52840_xxAA \
   target/thumbv7em-none-eabihf/release/nrf52840-sensor
 ```
 
-Measured raw images:
+Recorded raw images; former regression budgets are historical comparisons only:
 
-| variant | bytes | regression gate |
+| variant | bytes | former regression budget |
 |---|---:|---:|
 | default | 224,472 | 225,280 |
 | BME280 | 231,792 | 245,760 |
 | SHT31 | 228,216 | 241,664 |
+
+Size reporting no longer enforces these artificial budgets. Physical memory,
+protected-partition, and stack checks remain mandatory.
 
 ## Validation
 

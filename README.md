@@ -2,11 +2,11 @@
 
 Heap-free, `no_std`, pure-Rust Zigbee PRO for embedded devices.
 
-This worktree is the cross-platform application-model and Zigbee Core R22 /
-BDB 3.0.1 hardening branch, `experiment/r22-bdb-complete`. The source
-documentation is authoritative for this branch. GitHub Pages is deployed only
-from `main`/`master`, so these pages will not appear at the public Pages URL
-until the branch is merged and the documentation workflow deploys it.
+The cross-platform application model and Zigbee Core R22 / BDB 3.0.1
+hardening work are integrated on `master`. GitHub Pages deploys from
+`main`/`master`; documentation can publish without firmware binaries when
+required firmware jobs fail. Prebuilt binaries and one-click installation
+require those jobs to succeed.
 
 The normative target is Zigbee Core R22 (`05-3474-22`) with BDB 3.0.1
 (`16-02828-012`). Passing host/build matrices is not a certification claim;
@@ -226,7 +226,7 @@ worktree records no such rerun for the current byte-for-byte images.
 | ESP32-C6 | environmental sleepy End Device + OTA | yes | prior C6 evidence covers commissioning/reporting and OTA to 18.3%; complete activation remains open |
 | ESP32-H2 | environmental sleepy End Device + OTA | yes | prior H2 evidence covers v1→v2 activation, reboot, and retained commissioned state |
 | BL702 XT-ZB1 | environmental sleepy End Device | yes | prior path evidence covers radio/commissioning/interview; destructive flash persistence remains open |
-| PHY6222/PHY6252 EVK | environmental sleepy End Device | yes | PHY6222 and PHY6252 exact cross-build/layout image measurements; complete hardware path remains unverified |
+| PHY6222/PHY6252 EVK | environmental sleepy End Device | yes | PHY6222 occupies 130,752 B of its physical 130,816 B XIP slot (64 B free); PHY6252 failed-link span is 130,912 B (96 B over); complete hardware path remains unverified |
 | CC2340R5 | environmental sleepy End Device | yes | pinned-SDK and fallback compile/link paths pass; radio HIL and entropy remain open |
 | EFR32MG1P TRÅDFRI | environmental sleepy End Device | yes | prior path evidence covers commissioning through EM2; real OTA install remains open |
 | EFR32MG21 BRD4181A | environmental sleepy End Device | yes | complete hardware path remains HIL-unverified |
@@ -235,6 +235,11 @@ worktree records no such rerun for the current byte-for-byte images.
 
 See [BUILD.md](BUILD.md) for pinned commands, measured images, partition
 boundaries, and exact remaining gates.
+
+Firmware byte counts remain reported, but artificial regression budgets no
+longer fail builds. Real Flash/RAM limits, protected partitions, OTA-slot
+bounds, stack reserves, and linker/layout checks remain mandatory. Removing
+the former budgets does not establish hardware acceptance.
 
 ## Quick host checks
 

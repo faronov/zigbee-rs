@@ -61,8 +61,11 @@ CC2340_SDK_DIR=/absolute/path/to/simplelink-lowpower-f3-sdk \
   cargo +nightly-2026-03-23 build --release --locked --target-dir target/sdk
 ```
 
-Pinned-SDK image: **223,536 B** against a **225,280 B** regression gate.
-Static RAM is **4,772 B** and the physical application slot is **516,096 B**.
+Recorded pre-static-task pinned-SDK image: **223,536 B** against the former
+**225,280 B** regression budget, which is no longer enforced. That snapshot's
+**4,772 B** static-RAM figure is not a current task-capacity check.
+The physical application slot remains **516,096 B**; memory, partition, and
+stack checks remain mandatory.
 
 With `CC2340_SDK_DIR` unset, the fallback build compiles but radio
 initialization returns `FirmwareUnavailable`. It is not a flashable radio
