@@ -50,9 +50,9 @@ cargo +nightly-2026-08-01 build --release --locked \
   --no-default-features --features phy6252
 ```
 
-The PHY6252 feature-selected image is separately cross-built and
-layout-checked; it remains unverified on hardware. Selecting the feature also
-prevents the known out-of-range 512 KiB NV addresses.
+The PHY6252 feature-selected build currently fails the physical XIP gate by
+96 bytes; it does not produce a validated image. Selecting the feature prevents
+the known out-of-range 512 KiB NV addresses, but hardware remains unverified.
 
 Both PHY62x2 product variants select centralized Trust Center commissioning.
 They do not provision a distributed-security key, so distributed commissioning
@@ -114,12 +114,24 @@ identity, battery chemistry, lifecycle policy, profile, and ROM-aware linker
 layout. `boards/phy62x2-evk` owns only fitted wiring, whole-device flash, and
 platform timing. `phy6222-hal` provides exclusive raw peripheral mechanisms.
 
-Exact occupied-XIP measurements:
+Occupied-XIP measurements with `nightly-2026-08-01` on macOS:
 
-| feature image | occupied XIP span | hard gate | headroom |
+| feature image | occupied XIP span | hard gate | result |
 |---|---:|---:|---:|
-| PHY6222 | 130,624 | 130,816 | 192 |
-| PHY6252 | 130,464 | 130,816 | 352 |
+| PHY6222 (default) | 130,752 | 130,816 | 64 bytes free |
+| PHY6252 (`--no-default-features --features phy6252`) | 130,912 | 130,816 | 96 bytes over |
+
+The PHY target configuration enables linker identical-code folding
+(`--icf=all`) for identical monomorphized functions. With unchanged compiler,
+features, software AES, and linker boundaries, the default occupied span falls
+from 132,416 to 130,752 bytes. SRAM placement and size are unchanged. Folded
+functions can share addresses; function-address uniqueness is not an identity
+contract. The layout check still requires the flash-operation path in SRAM.
+
+The default measurement is from the linked ELF and passes the layout, AES, and
+role checks. The PHY6252 measurement is from the failed link map; folding reduces
+its previous 1,760-byte overflow but does not make that feature image fit. These
+local measurements do not establish Linux CI or hardware qualification.
 
 The packaged PHY6 file includes loader metadata and is not the gate metric. No
 AON sleep current or battery-life value is claimed.

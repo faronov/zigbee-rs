@@ -19,7 +19,8 @@ require_vma() {
 }
 
 require_ram_symbol() {
-    address=$("$NM" -n -C "$ELF" | awk -v name="$1" 'index($0, name) { print $1; exit }')
+    # A same-prefix helper must not hide a missing required routine.
+    address=$("$NM" -n -C "$ELF" | awk -v name="$1" '$3 == name { print $1; exit }')
     case "$address" in
         1fff*) ;;
         *)

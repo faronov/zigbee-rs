@@ -4,6 +4,8 @@ target = "thumbv6m-none-eabi"
 [target.thumbv6m-none-eabi]
 rustflags = [
     "-L", "../../products/phy62x2-evk/link",
+    # Share identical monomorphized functions within the fixed XIP slot.
+    "-C", "link-arg=--icf=all",
     "-C", "link-arg=-Tphy6222.x",
 ]
 

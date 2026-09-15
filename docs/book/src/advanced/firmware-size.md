@@ -4,15 +4,17 @@ Embedded size is measured from the final release artifact produced by the
 target's pinned toolchain. The ELF file size on the host is not a flash-usage
 number.
 
-## Current images
+## Local image snapshots
 
 Baseline snapshot: **2026-09-06**. EFR32MG1 was refreshed **2026-09-08**.
 The TLSR8258 parent-router, always-on nRF52840, EFR32MG21, CC2340 fallback,
 and ESP32-C6/H2 rows were refreshed
 **2026-09-10**. These are named local build snapshots, not the latest remote
 CI results; unrefreshed rows do not describe the current working tree.
+PHY6222 and PHY6252 occupied-XIP measurements were refreshed **2026-09-15**.
 The recorded parent router and all four ESP variants **fail their regression
-budgets**. Prior hardware evidence is not an exact-image HIL rerun unless
+budgets**; the current PHY6252 variant **fails its physical linker limit**.
+Prior hardware evidence is not an exact-image HIL rerun unless
 explicitly stated.
 
 The gate column is a regression budget except for PHY6222 and PHY6252, where
@@ -20,8 +22,8 @@ it is the hard XIP slot limit.
 
 | image | measured | gate | headroom | metric |
 |---|---:|---:|---:|---|
-| PHY6222 sensor | 130,624 | 130,816 | 192 | occupied XIP span |
-| PHY6252 feature-selected sensor | 130,464 | 130,816 | 352 | occupied XIP span |
+| PHY6222 sensor | 130,752 | 130,816 | 64 | occupied XIP span |
+| PHY6252 feature-selected sensor | 130,912 | 130,816 | -96 | failed-link occupied XIP span |
 | BL702 sensor | 189,442 | 192,512 | 3,070 | raw binary |
 | nRF52840 default / BME280 / SHT31 | 224,472 / 231,792 / 228,216 | 225,280 / 245,760 / 241,664 | 808 / 13,968 / 13,448 | raw binaries |
 | nRF52840 always-on End Device | 231,280 | 253,952 | 22,672 | file-backed flash span |
@@ -44,6 +46,13 @@ The measurements use:
 
 Changing the compiler invalidates direct size comparisons.
 
+The September 15 PHY62x2 measurements keep `nightly-2026-08-01` and the
+existing product feature sets, with target-local identical-code folding.
+The default PHY6222 build and layout checks pass locally, but its 64-byte
+margin still needs confirmation by Linux CI. PHY6252's 130,912-byte span is
+measured from the failed link map: no current executable or package is
+qualified for that variant.
+
 Additional artifacts and physical limits:
 
 - BL702 boot image: 197,648 B; physical slot: 1,044,480 B.
@@ -56,8 +65,9 @@ Additional artifacts and physical limits:
   are 381,122/392,146 B for C6 and 365,986/376,706 B for H2.
   These combined-fix images have host validation, not hardware execution
   evidence, and all remain over their unchanged regression budgets.
-- PHY6252 has the separate exact feature-selected occupied-XIP measurement
-  shown above; its hardware path remains unverified.
+- PHY6252 has the separate failed-link occupied-XIP measurement shown above;
+  the earlier in-budget image is not the current source, and its hardware path
+  remains unverified.
 - TLSR8258 physical application boundary: 458,752 B (`0x70000`), followed by
   APS/child/security journals at `0x70000`/`0x72000`/`0x74000`.
 
