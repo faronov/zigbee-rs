@@ -215,6 +215,15 @@ the infinite `run()` wrapper. `StepEvents` returns the bounded incoming/tick
 events so a product such as a relay plug can synchronize fitted hardware after
 the shared profile handles a command.
 
+Router-app initialization becomes complete only after startup and auxiliary
+store restoration succeed. A transient initialization error may be retried
+with `initialize()`; `step()` returns `NotInitialized` until then. If a later
+join/rejoin activation fails while restoring child/APS state or replay floors,
+the next step retries that activation barrier before receiving, ticking, or
+writing live tables. An unread durable snapshot is never replaced by the empty
+live tables left by a failed restore. `run()` retains its fatal-reset policy
+for lifecycle errors.
+
 ## Why there is no devicetree, Kconfig, or god trait
 
 Rust types already encode the selected resources:

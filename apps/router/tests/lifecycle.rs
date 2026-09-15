@@ -980,6 +980,467 @@ struct FailingApsStore {
     fail_next_store: bool,
 }
 
+/// A transient restore failure must not turn an unread snapshot into an empty
+/// successful write on the next public lifecycle call.
+struct ReadFailApsStore {
+    inner: RamApsTableStore,
+    fail_read: bool,
+}
+
+impl ApsTableStore for ReadFailApsStore {
+    fn load(
+        &mut self,
+    ) -> Result<Option<ApsTableSnapshot>, zigbee_runtime::aps_table_store::ApsTableStoreError> {
+        if core::mem::take(&mut self.fail_read) {
+            return Err(zigbee_runtime::aps_table_store::ApsTableStoreError::Hardware);
+        }
+        self.inner.load()
+    }
+
+    fn store(
+        &mut self,
+        snapshot: &ApsTableSnapshot,
+    ) -> Result<(), zigbee_runtime::aps_table_store::ApsTableStoreError> {
+        self.inner.store(snapshot)
+    }
+}
+
+fn binding_request_indication(unbind: bool, frame_counter: u32) -> McpsDataIndication {
+    binding_request_with_security(unbind, frame_counter, false)
+}
+
+fn binding_request_with_security(
+    unbind: bool,
+    frame_counter: u32,
+    aps_secured: bool,
+) -> McpsDataIndication {
+    let header = ApsHeader {
+        frame_control: ApsFrameControl {
+            frame_type: ApsFrameType::Data as u8,
+            delivery_mode: ApsDeliveryMode::Unicast as u8,
+            ack_request: true,
+            security: aps_secured,
+            ..Default::default()
+        },
+        dst_endpoint: Some(0),
+        group_address: None,
+        cluster_id: Some(if unbind { 0x0022 } else { 0x0021 }),
+        profile_id: Some(0),
+        src_endpoint: Some(0),
+        aps_counter: frame_counter as u8,
+        extended_header: None,
+    };
+    let mut aps = [0; 96];
+    let n = header.serialize(&mut aps);
+    let mut command = vec![9];
+    command.extend_from_slice(&LOCAL_IEEE);
+    command.push(1);
+    command.extend_from_slice(&0x0006u16.to_le_bytes());
+    command.push(3); // IEEE destination + endpoint
+    command.extend_from_slice(&COORDINATOR_IEEE);
+    command.push(1);
+    let len = if aps_secured {
+        let security_header = ApsSecurityHeader {
+            security_control: (KEY_ID_DATA_KEY << 3) | (1 << 5),
+            frame_counter,
+            source_address: Some(COORDINATOR_IEEE),
+            key_seq_number: None,
+        };
+        let aad_len = n + security_header.serialize(&mut aps[n..]);
+        let mut aad = aps;
+        aad[n] |= SEC_LEVEL_ENC_MIC_32;
+        let encrypted = ApsSecurity::new()
+            .encrypt(&aad[..aad_len], &command, &[0x5A; 16], &security_header)
+            .unwrap();
+        aps[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
+        aad_len + encrypted.len()
+    } else {
+        aps[n..n + command.len()].copy_from_slice(&command);
+        n + command.len()
+    };
+    McpsDataIndication {
+        src_address: MacAddress::Short(PanId(PAN_ID), ShortAddress::COORDINATOR),
+        dst_address: MacAddress::Short(PanId(PAN_ID), ShortAddress(SHORT_ADDRESS)),
+        lqi: 220,
+        payload: secured_nwk_frame(
+            NwkFrameType::Data,
+            ShortAddress::COORDINATOR,
+            COORDINATOR_IEEE,
+            ShortAddress(SHORT_ADDRESS),
+            frame_counter as u8,
+            frame_counter,
+            &aps[..len],
+        ),
+        security_use: false,
+    }
+}
+
+fn binding_responses(mac: &MockMac, unbind: bool) -> Vec<Vec<u8>> {
+    mac.tx_history()
+        .iter()
+        .filter_map(|tx| {
+            let (_, payload) = decrypt_outbound_nwk(&tx.payload)?;
+            let (header, n) = ApsHeader::parse(&payload)?;
+            (header.cluster_id == Some(if unbind { 0x8022 } else { 0x8021 }))
+                .then(|| payload[n..].to_vec())
+        })
+        .collect()
+}
+
+#[test]
+fn bind_store_failure_holds_response_ack_and_replay_across_reboot() {
+    for aps_secured in [false, true] {
+        assert_bind_store_failure_recovers_after_reboot(aps_secured);
+    }
+}
+
+fn assert_bind_store_failure_recovers_after_reboot(aps_secured: bool) {
+    let mut p = profile();
+    let mut device = parent_device(&mut p);
+    let mut security = security_store(false);
+    let mut app = ParentRouterApp::new_with_aps_tables(
+        ZigbeeNode::new(&mut device, &mut security, &mut p),
+        PersistentChildren::new(CountingChildStore::default()),
+        PersistentApsTables::new(FailingApsStore {
+            inner: RamApsTableStore::new(),
+            fail_next_store: true,
+        }),
+        &POLICY,
+        RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
+    )
+    .unwrap();
+    block_on(app.initialize()).unwrap();
+    let mac = app.node_mut().device_mut().mac_mut();
+    mac.clear_tx_history();
+    mac.set_rx_delay_us(0);
+    mac.enqueue_rx(binding_request_with_security(false, 100, aps_secured));
+    assert!(matches!(
+        block_on(app.step()),
+        Err(RouterAppError::ApsTables(_))
+    ));
+    assert_eq!(app.node().device().aps().binding_table().len(), 1);
+    assert!(
+        binding_responses(app.node().device().mac(), false).is_empty(),
+        "Bind SUCCESS must not escape a failed snapshot commit"
+    );
+    assert_eq!(outbound_aps_ack_count(app.node().device().mac()), 0);
+    let aps_store = core::mem::take(&mut app.aps_tables_mut().store_mut().inner);
+    drop(app);
+    assert_eq!(nwk_replay_count(&mut security), 0);
+    security
+        .visit_replay_counters(&mut |_| panic!("a replay floor escaped the failed snapshot"))
+        .unwrap();
+
+    // Power loss before persistence: exactly the same authenticated request
+    // remains acceptable, and the new response describes a durable binding.
+    let mut reboot_profile = profile();
+    let mut reboot_device = parent_device(&mut reboot_profile);
+    let mut reboot = ParentRouterApp::new_with_aps_tables(
+        ZigbeeNode::new(&mut reboot_device, &mut security, &mut reboot_profile),
+        PersistentChildren::new(CountingChildStore::default()),
+        PersistentApsTables::new(aps_store),
+        &POLICY,
+        RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
+    )
+    .unwrap();
+    block_on(reboot.initialize()).unwrap();
+    let mac = reboot.node_mut().device_mut().mac_mut();
+    mac.clear_tx_history();
+    mac.set_rx_delay_us(0);
+    mac.enqueue_rx(binding_request_with_security(false, 100, aps_secured));
+    block_on(reboot.step()).unwrap();
+    assert_eq!(reboot.node().device().aps().binding_table().len(), 1);
+    assert_eq!(
+        reboot
+            .aps_tables_mut()
+            .store_mut()
+            .load()
+            .unwrap()
+            .unwrap()
+            .bindings()
+            .len(),
+        1
+    );
+    assert_eq!(
+        binding_responses(reboot.node().device().mac(), false),
+        vec![vec![9, 0]]
+    );
+    assert_eq!(outbound_aps_ack_count(reboot.node().device().mac()), 1);
+    drop(reboot);
+    assert_eq!(nwk_replay_count(&mut security), 1);
+}
+
+#[test]
+fn failed_initial_aps_restore_blocks_step_and_can_be_retried() {
+    let mut bindings = BindingTable::new();
+    bindings
+        .add(BindingEntry::unicast(LOCAL_IEEE, 1, 6, COORDINATOR_IEEE, 1))
+        .unwrap();
+    let snapshot =
+        ApsTableSnapshot::capture(EXTENDED_PAN_ID, &bindings, &GroupTable::new()).unwrap();
+    let mut stored = RamApsTableStore::new();
+    stored.store(&snapshot).unwrap();
+    let mut p = profile();
+    let mut device = parent_device(&mut p);
+    let mut security = security_store(false);
+    let mut app = ParentRouterApp::new_with_aps_tables(
+        ZigbeeNode::new(&mut device, &mut security, &mut p),
+        PersistentChildren::new(CountingChildStore::default()),
+        PersistentApsTables::new(ReadFailApsStore {
+            inner: stored,
+            fail_read: true,
+        }),
+        &POLICY,
+        RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
+    )
+    .unwrap();
+    assert!(matches!(
+        block_on(app.initialize()),
+        Err(RouterAppError::ApsTables(_))
+    ));
+    assert!(app.node().device().is_joined());
+    assert!(matches!(
+        block_on(app.step()),
+        Err(RouterAppError::NotInitialized)
+    ));
+    assert_eq!(
+        app.aps_tables_mut()
+            .store_mut()
+            .inner
+            .load()
+            .unwrap()
+            .unwrap()
+            .bindings()
+            .len(),
+        1
+    );
+    block_on(app.initialize()).unwrap();
+    assert_eq!(app.node().device().aps().binding_table().len(), 1);
+    block_on(app.step()).unwrap();
+    assert_eq!(
+        app.aps_tables_mut()
+            .store_mut()
+            .inner
+            .load()
+            .unwrap()
+            .unwrap()
+            .bindings()
+            .len(),
+        1
+    );
+}
+
+fn binding_store(present: bool) -> RamApsTableStore {
+    let mut bindings = BindingTable::new();
+    if present {
+        bindings
+            .add(BindingEntry::unicast(LOCAL_IEEE, 1, 6, COORDINATOR_IEEE, 1))
+            .unwrap();
+    }
+    let mut store = RamApsTableStore::new();
+    store
+        .store(&ApsTableSnapshot::capture(EXTENDED_PAN_ID, &bindings, &GroupTable::new()).unwrap())
+        .unwrap();
+    store
+}
+
+#[test]
+fn secured_bind_and_unbind_retry_each_durable_boundary_without_reapplying() {
+    use zigbee_runtime::binding_persistence::BindingPersistenceError;
+
+    for unbind in [false, true] {
+        for failure in 0..3 {
+            let mut p = profile();
+            let mut device = parent_device(&mut p);
+            let mut security = FailingApsReplayStore {
+                inner: security_store(false),
+                fail_next_nwk_replay: failure == 1,
+                fail_next_aps_replay: failure == 2,
+                ..Default::default()
+            };
+            let mut app = ParentRouterApp::new_with_aps_tables(
+                ZigbeeNode::new(&mut device, &mut security, &mut p),
+                PersistentChildren::new(CountingChildStore::default()),
+                PersistentApsTables::new(FailingApsStore {
+                    inner: binding_store(unbind),
+                    fail_next_store: failure == 0,
+                }),
+                &POLICY,
+                RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
+            )
+            .unwrap();
+            block_on(app.initialize()).unwrap();
+            let mac = app.node_mut().device_mut().mac_mut();
+            mac.clear_tx_history();
+            mac.set_rx_delay_us(0);
+            mac.enqueue_rx(binding_request_with_security(unbind, 100, true));
+            let result = block_on(app.step());
+            if failure == 0 {
+                assert!(matches!(result, Err(RouterAppError::ApsTables(_))));
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(RouterAppError::Binding(BindingPersistenceError::Security(
+                            SecurityStoreError::Hardware
+                        )))
+                    ),
+                    "{result:?}"
+                );
+            }
+            assert!(app.node().device().binding_persistence_pending());
+            assert!(app.node().device().aps().pending_data_replay().is_some());
+            if failure == 0 {
+                assert_eq!(
+                    block_on(app.node_mut().complete_binding_persistence()),
+                    Err(BindingPersistenceError::SnapshotRequired)
+                );
+            }
+            assert_eq!(outbound_aps_ack_count(app.node().device().mac()), 0);
+            assert!(binding_responses(app.node().device().mac(), unbind).is_empty());
+            let durable_len = app
+                .aps_tables_mut()
+                .store_mut()
+                .inner
+                .load()
+                .unwrap()
+                .unwrap()
+                .bindings()
+                .len();
+            assert_eq!(
+                durable_len,
+                usize::from(if failure == 0 { unbind } else { !unbind })
+            );
+            let (_, store) = app.node_mut().device_and_security_store_mut();
+            let mut floors = Vec::new();
+            store
+                .visit_replay_counters(&mut |floor| floors.push(floor))
+                .unwrap();
+            assert_eq!(floors.len(), usize::from(failure == 2));
+            assert!(
+                floors
+                    .iter()
+                    .all(|floor| matches!(floor, PersistentReplayCounter::Nwk(_)))
+            );
+
+            // Even a caller bypassing app.step cannot overwrite the held
+            // request with another receive while persistence is pending.
+            let next = binding_request_with_security(!unbind, 101, true);
+            assert!(matches!(
+                block_on(app.node_mut().process_incoming_deferred_reset(&next)),
+                Err(zigbee_runtime::node::NodeError::Persistence(
+                    SecurityStoreError::Full
+                ))
+            ));
+            assert!(matches!(
+                block_on(app.node_mut().tick_steering(1)),
+                Err(zigbee_runtime::node::NodeError::Persistence(
+                    SecurityStoreError::Full
+                ))
+            ));
+            app.node_mut()
+                .device_mut()
+                .mac_mut()
+                .set_rx_delay_us(u32::MAX);
+            block_on(app.step()).unwrap();
+            assert!(!app.node().device().binding_persistence_pending());
+            assert_eq!(
+                app.aps_tables_mut()
+                    .store_mut()
+                    .inner
+                    .load()
+                    .unwrap()
+                    .unwrap()
+                    .bindings()
+                    .len(),
+                usize::from(!unbind)
+            );
+            assert_eq!(
+                binding_responses(app.node().device().mac(), unbind),
+                vec![vec![9, 0]]
+            );
+            let frames: Vec<_> = app
+                .node()
+                .device()
+                .mac()
+                .tx_history()
+                .iter()
+                .filter_map(|tx| {
+                    let (_, payload) = decrypt_outbound_nwk(&tx.payload)?;
+                    ApsHeader::parse(&payload).map(|(header, _)| header)
+                })
+                .collect();
+            let ack = frames
+                .iter()
+                .position(|header| header.frame_control.frame_type == ApsFrameType::Ack as u8)
+                .unwrap();
+            let response = frames
+                .iter()
+                .position(|header| header.cluster_id == Some(if unbind { 0x8022 } else { 0x8021 }))
+                .unwrap();
+            assert!(ack < response);
+            let (_, store) = app.node_mut().device_and_security_store_mut();
+            floors.clear();
+            store
+                .visit_replay_counters(&mut |floor| floors.push(floor))
+                .unwrap();
+            assert_eq!(floors.len(), 2);
+        }
+    }
+}
+
+#[test]
+fn binding_ack_transport_failure_retains_ack_and_prepared_response() {
+    use zigbee_runtime::binding_persistence::BindingPersistenceError;
+
+    let mut p = profile();
+    let mut device = parent_device(&mut p);
+    let mut security = security_store(false);
+    let mut app = ParentRouterApp::new_with_aps_tables(
+        ZigbeeNode::new(&mut device, &mut security, &mut p),
+        PersistentChildren::new(CountingChildStore::default()),
+        PersistentApsTables::new(binding_store(true)),
+        &POLICY,
+        RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
+    )
+    .unwrap();
+    block_on(app.initialize()).unwrap();
+    let mac = app.node_mut().device_mut().mac_mut();
+    mac.clear_tx_history();
+    mac.set_rx_delay_us(0);
+    mac.set_tx_failures(100);
+    mac.enqueue_rx(binding_request_indication(true, 100));
+    assert!(matches!(
+        block_on(app.step()),
+        Err(RouterAppError::Binding(
+            BindingPersistenceError::Acknowledgement(zigbee_aps::ApsStatus::NoAck)
+        ))
+    ));
+    assert!(app.node().device().binding_persistence_pending());
+    assert!(
+        app.aps_tables_mut()
+            .store_mut()
+            .load()
+            .unwrap()
+            .unwrap()
+            .bindings()
+            .is_empty()
+    );
+    assert!(binding_responses(app.node().device().mac(), true).is_empty());
+    app.node_mut().device_mut().mac_mut().set_tx_failures(0);
+    app.node_mut()
+        .device_mut()
+        .mac_mut()
+        .set_rx_delay_us(u32::MAX);
+    block_on(app.step()).unwrap();
+    assert_eq!(outbound_aps_ack_count(app.node().device().mac()), 1);
+    assert_eq!(
+        binding_responses(app.node().device().mac(), true),
+        vec![vec![9, 0]]
+    );
+    assert!(!app.node().device().binding_persistence_pending());
+}
+
 impl ApsTableStore for FailingApsStore {
     fn load(
         &mut self,

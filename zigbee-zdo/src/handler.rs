@@ -21,6 +21,15 @@ use crate::{ZDO_ENDPOINT, ZdoError, ZdoLayer, ZdpStatus};
 /// A ZDP response cluster is always `request | ZDP_RESPONSE_BIT` (R22 2.4.4).
 const ZDP_RESPONSE_BIT: u16 = 0x8000;
 
+/// An already-applied Bind/Unbind result whose transmission is owned by the
+/// caller. Persist the binding table before releasing this response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedBindingResponse {
+    source: ShortAddress,
+    cluster: u16,
+    payload: [u8; 2],
+}
+
 /// R22 Table 2-145 `NOT_AUTHORIZED`.
 ///
 /// Trust Center policy procedures return APS-internal status values to the
@@ -423,18 +432,81 @@ impl<M: MacDriver> ZdoLayer<M> {
             Err(err) => return Err(err),
         };
 
-        // --- Send response ---
+        self.send_response(src_short, rsp_cluster, &rsp_buf[..rsp_len])
+            .await
+    }
+
+    /// Apply a Bind/Unbind request without sending its response. Parsing,
+    /// mutation and status selection are shared with the ordinary dispatcher.
+    /// A malformed broadcast is dropped, as in `handle_indication`.
+    pub fn prepare_binding_response(
+        &mut self,
+        ind: &ApsdeDataIndication<'_>,
+    ) -> Result<Option<PreparedBindingResponse>, ZdoError> {
+        if ind.dst_endpoint != ZDO_ENDPOINT {
+            return Err(ZdoError::InvalidData);
+        }
+        let (&tsn, payload) = ind.payload.split_first().ok_or(ZdoError::InvalidLength)?;
+        let mut response = [tsn, 0];
+        let (cluster, result) = match ind.cluster_id {
+            crate::BIND_REQ => (
+                crate::BIND_RSP,
+                self.handle_bind_req(payload, &mut response[1..]),
+            ),
+            crate::UNBIND_REQ => (
+                crate::UNBIND_RSP,
+                self.handle_unbind_req(payload, &mut response[1..]),
+            ),
+            _ => return Err(ZdoError::InvalidData),
+        };
+        self.diagnostics.indications = self.diagnostics.indications.wrapping_add(1);
+        self.diagnostics.last_cluster = ind.cluster_id;
+        match result {
+            Ok(_) => {}
+            Err(ZdoError::InvalidLength | ZdoError::InvalidData)
+                if !self.indication_is_unicast(ind) =>
+            {
+                log_zdp_exception(ind.cluster_id, "malformed broadcast — dropped");
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
+        let source = match ind.src_address {
+            ApsAddress::Short(address) => address,
+            _ => ShortAddress::COORDINATOR,
+        };
+        Ok(Some(PreparedBindingResponse {
+            source,
+            cluster,
+            payload: response,
+        }))
+    }
+
+    /// Send an already-applied binding response without applying the request
+    /// again. On failure the caller retains the response and may retry it.
+    pub async fn send_prepared_binding_response(
+        &mut self,
+        response: &PreparedBindingResponse,
+    ) -> Result<(), ZdoError> {
+        self.send_response(response.source, response.cluster, &response.payload)
+            .await
+    }
+
+    async fn send_response(
+        &mut self,
+        src_short: ShortAddress,
+        rsp_cluster: u16,
+        payload: &[u8],
+    ) -> Result<(), ZdoError> {
         log::info!(
             "[ZDO TX] rsp cluster=0x{:04X} to 0x{:04X} len={}",
             rsp_cluster,
             src_short.0,
-            rsp_len
+            payload.len()
         );
         self.diagnostics.response_attempts = self.diagnostics.response_attempts.wrapping_add(1);
         self.diagnostics.last_response_cluster = rsp_cluster;
-        let tx_result = self
-            .send_zdp_unicast(src_short, rsp_cluster, &rsp_buf[..rsp_len])
-            .await;
+        let tx_result = self.send_zdp_unicast(src_short, rsp_cluster, payload).await;
         if tx_result.is_ok() {
             self.diagnostics.response_successes =
                 self.diagnostics.response_successes.wrapping_add(1);
@@ -1350,6 +1422,72 @@ mod tests {
 
     fn tx_count(zdo: &ZdoLayer<MockMac>) -> usize {
         zdo.nwk().mac().tx_history().len()
+    }
+
+    #[test]
+    fn prepared_binding_response_defers_transmit_and_preserves_unbind_status_on_retry() {
+        for dst in [
+            BindTarget::Group(0x1234),
+            BindTarget::Unicast {
+                dst_addr: [0x42; 8],
+                dst_endpoint: 1,
+            },
+        ] {
+            let mut zdo = test_zdo();
+            let request = BindReq {
+                src_addr: LOCAL_IEEE,
+                src_endpoint: 1,
+                cluster_id: 0x0006,
+                dst,
+            };
+            let mut payload = [0u8; 22];
+            payload[0] = 0x79;
+            let len = 1 + request.serialize(&mut payload[1..]).unwrap();
+            let prepared = zdo
+                .prepare_binding_response(&unicast(crate::BIND_REQ, &payload[..len]))
+                .unwrap()
+                .unwrap();
+            assert_eq!(zdo.aps().binding_table().len(), 1);
+            assert_eq!(tx_count(&zdo), 0);
+            block_on(zdo.send_prepared_binding_response(&prepared)).unwrap();
+            let (cluster, response) = last_zdp_tx(&zdo).unwrap();
+            assert_eq!(cluster, crate::BIND_RSP);
+            assert_eq!(response.as_slice(), &[0x79, ZdpStatus::Success as u8]);
+
+            let prepared = zdo
+                .prepare_binding_response(&unicast(crate::UNBIND_REQ, &payload[..len]))
+                .unwrap()
+                .unwrap();
+            assert!(zdo.aps().binding_table().is_empty());
+            assert_eq!(tx_count(&zdo), 1);
+            zdo.nwk_mut().mac_mut().set_tx_failures(100);
+            assert!(matches!(
+                block_on(zdo.send_prepared_binding_response(&prepared)),
+                Err(ZdoError::ApsError(_))
+            ));
+            zdo.nwk_mut().mac_mut().set_tx_failures(0);
+            block_on(zdo.send_prepared_binding_response(&prepared)).unwrap();
+            let (cluster, response) = last_zdp_tx(&zdo).unwrap();
+            assert_eq!(cluster, crate::UNBIND_RSP);
+            assert_eq!(response.as_slice(), &[0x79, ZdpStatus::Success as u8]);
+        }
+    }
+
+    #[test]
+    fn prepared_binding_rejects_truncation_without_mutation_or_transmit() {
+        let mut zdo = test_zdo();
+        for cluster in [crate::BIND_REQ, crate::UNBIND_REQ] {
+            assert_eq!(
+                zdo.prepare_binding_response(&unicast(cluster, &[0x79, 0])),
+                Err(ZdoError::InvalidLength)
+            );
+            assert_eq!(
+                zdo.prepare_binding_response(&broadcast(cluster, &[0x79, 0])),
+                Ok(None)
+            );
+        }
+        assert!(zdo.aps().binding_table().is_empty());
+        assert_eq!(tx_count(&zdo), 0);
     }
 
     #[cfg(feature = "router")]

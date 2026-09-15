@@ -170,6 +170,21 @@ participate in APS acknowledgement or retransmission.
 `NoApsTables` therefore disables application-link-key installation rather than
 accepting a mutation that cannot survive reboot.
 
+Bind/Unbind reception in a router application selecting `PersistentApsTables`
+also spans both stores. ZDO prepares an owned response while applying the
+mutation, without transmitting it. The application commits the APS snapshot;
+the runtime then commits the NWK and, when present, APS replay floors before
+sending the APS ACK and finally the prepared ZDO response. A single pending
+transaction blocks another store-backed receive/tick until completion.
+Storage errors retain the transaction; ACK/response transport errors retain the unsent work for a
+bounded retry on the next `step()`, without applying Bind/Unbind again.
+
+Before the snapshot commits, a reboot retains the previous tables and does
+not retire the incoming replay counter. After it commits, the binding mutation
+survives reboot. The prepared response itself is RAM-owned, not a persistent
+response cache. Compositions using `NoApsTables` retain their existing volatile
+binding behavior.
+
 ## Generic application NV
 
 `NvStorage` is the item API for non-security state. `LogStructuredNv<F>`

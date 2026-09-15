@@ -501,6 +501,8 @@ pub struct ApsLayer<M: MacDriver> {
     pending_application_key_persistence: bool,
     /// Replay floor held until the corresponding application key is durable.
     pending_application_key_replay: Option<security::ApsReplayCounter>,
+    /// Verified data-frame replay floor held for an upper-layer durable mutation.
+    pending_data_replay: Option<security::ApsReplayCounter>,
     /// APS duplicate rejection table
     dup_table: [ApsDuplicateEntry; APS_DUP_TABLE_SIZE],
     /// Outbound APS ACK tracking (frames awaiting ACK confirmation)
@@ -544,6 +546,7 @@ impl<M: MacDriver> ApsLayer<M> {
             network_key_forwarding_intent: None,
             pending_application_key_persistence: false,
             pending_application_key_replay: None,
+            pending_data_replay: None,
             dup_table: [ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE],
             ack_table: heapless::Vec::new(),
             ack_completions: heapless::Vec::new(),
@@ -586,6 +589,7 @@ impl<M: MacDriver> ApsLayer<M> {
             core::ptr::addr_of_mut!((*slot).network_key_forwarding_intent).write(None);
             core::ptr::addr_of_mut!((*slot).pending_application_key_persistence).write(false);
             core::ptr::addr_of_mut!((*slot).pending_application_key_replay).write(None);
+            core::ptr::addr_of_mut!((*slot).pending_data_replay).write(None);
             core::ptr::addr_of_mut!((*slot).dup_table)
                 .write([ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE]);
             core::ptr::addr_of_mut!((*slot).ack_table).write(heapless::Vec::new());
@@ -698,6 +702,22 @@ impl<M: MacDriver> ApsLayer<M> {
             self.security.commit_replay_counter(replay);
         }
         self.pending_application_key_persistence = false;
+    }
+
+    pub const fn pending_data_replay(&self) -> Option<security::ApsReplayCounter> {
+        self.pending_data_replay
+    }
+
+    /// Apply the live floor only after the caller has committed the data-frame
+    /// side effect and this replay counter. Does not release the pending ACK.
+    pub fn complete_data_persistence(&mut self) {
+        if let Some(replay) = self.pending_data_replay.take() {
+            self.security.commit_replay_counter(replay);
+        }
+    }
+
+    pub fn abort_data_persistence(&mut self) {
+        self.pending_data_replay = None;
     }
 
     /// Check if an APS frame is a duplicate. Returns true if duplicate.
@@ -881,6 +901,13 @@ impl<M: MacDriver> ApsLayer<M> {
             (entry.active && entry.aps_counter == aps_counter && entry.dst_addr == dst_addr)
                 .then_some(ApsAckHandle::new(dst_addr, aps_counter, entry.generation))
         })
+    }
+
+    /// Whether an outbound unicast still needs its peer's acknowledgement.
+    pub fn has_pending_ack(&self) -> bool {
+        self.ack_table
+            .iter()
+            .any(|entry| entry.active && !entry.confirmed)
     }
 
     /// Deliver an incoming APS ACK. Returns true if matched a pending request.

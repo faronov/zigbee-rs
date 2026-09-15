@@ -78,6 +78,7 @@ macro_rules! await_out_of_line {
 }
 
 pub mod aps_table_store;
+pub mod binding_persistence;
 pub mod builder;
 pub mod child_store;
 pub mod event_loop;
@@ -5917,6 +5918,7 @@ pub struct ZigbeeDevice<M: MacDriver, R: crate::role::DeviceRole = crate::role::
     trust_center_removal_pending: bool,
     /// Accepted Mgmt_Leave whose response waits for durable reset/rejoin intent.
     deferred_mgmt_leave: Option<DeferredMgmtLeave>,
+    binding_persistence: binding_persistence::BindingPersistence,
     /// ZCL transaction sequence counter.
     zcl_seq: u8,
     /// Standard clusters owned and configured by DeviceBuilder.
@@ -8167,9 +8169,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     }
 
     fn mark_left(&mut self) {
+        self.binding_persistence.response = None;
         self.bdb.attributes_mut().node_is_on_a_network = false;
         self.bdb.zdo_mut().nwk_mut().set_joined(false);
         let aps = self.bdb.zdo_mut().aps_mut();
+        aps.abort_data_persistence();
+        aps.discard_pending_aps_ack();
         aps.binding_table_mut().clear();
         aps.group_table_mut().clear();
         aps.security_mut().clear_keys();
@@ -8249,6 +8254,16 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// Whether the device is currently joined to a network.
     pub fn is_joined(&self) -> bool {
         self.bdb.is_on_network() && self.bdb.zdo().nwk().is_joined()
+    }
+
+    /// Protocol exchanges which must stay responsive instead of entering a
+    /// long radio-off wait. Hardware queue/ACK quiescence is checked by the MAC.
+    pub fn has_pending_protocol_work(&self) -> bool {
+        self.bdb.tclk_exchange_active()
+            || self.secure_rejoin_pending()
+            || self.pending_action.is_some()
+            || !self.pending_responses.is_empty()
+            || self.bdb.zdo().aps().has_pending_ack()
     }
 
     /// Whether a coordinator-requested secure rejoin still needs retrying.
@@ -9997,6 +10012,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// An accepted `Mgmt_Leave_req` still commits its security-state transition
     /// before the APS ACK and `Mgmt_Leave_rsp`; only the later cross-journal
     /// child/APS/application cleanup remains deferred.
+    ///
+    /// An occupied binding transaction returns `SecurityStoreError::Full`
+    /// without processing the new frame. Save the APS tables and complete the
+    /// pending binding transaction before receiving another frame.
     pub async fn process_incoming_with_security_store_deferred_reset<S: SecurityStateStore>(
         &mut self,
         indication: &McpsDataIndication,
@@ -10016,6 +10035,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         clusters: &mut [ClusterRef<'_>],
         store: &mut S,
     ) -> Result<Option<event_loop::StackEvent>, SecurityStoreError> {
+        if self.binding_persistence_pending() {
+            log::error!("[Runtime] Binding transaction must complete before another receive");
+            return Err(SecurityStoreError::Full);
+        }
         self.refresh_security_state(store)?;
         self.tombstone_retired_security_state_replay_counters(store)?;
         self.set_nwk_lifecycle_persistence_enabled(true);
@@ -10044,7 +10067,14 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             self.bdb.zdo_mut().aps_mut().discard_pending_aps_ack();
             self.abort_nwk_lifecycle_persistence();
             self.abort_network_key_persistence();
+            self.bdb.zdo_mut().aps_mut().abort_data_persistence();
             return Err(error);
+        }
+        if self.binding_persistence_pending() {
+            // The composition must save its APS snapshot before either replay
+            // floor becomes durable or any ACK/response can escape.
+            self.defer_aps_ack = false;
+            return Ok(event);
         }
         let trust_center_removal = core::mem::take(&mut self.trust_center_removal_pending);
         let deferred_mgmt_leave = self.deferred_mgmt_leave.take();
@@ -10070,12 +10100,18 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                         replay,
                     ))?;
                 }
+                if let Some(replay) = self.bdb.zdo().aps().pending_data_replay() {
+                    store.commit_replay_counter(security_store::PersistentReplayCounter::Aps(
+                        replay,
+                    ))?;
+                }
             }
             Ok(())
         })();
         self.defer_aps_ack = false;
         match persist_result {
             Ok(()) => {
+                self.bdb.zdo_mut().aps_mut().complete_data_persistence();
                 if let Some((replay, persistence)) = self.pending_nwk_lifecycle_replay() {
                     match persistence {
                         zigbee_nwk::nlde::NwkLifecyclePersistence::ChildState => {}
@@ -10216,6 +10252,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             }
             Err(error) => {
                 self.bdb.zdo_mut().aps_mut().discard_pending_aps_ack();
+                self.bdb.zdo_mut().aps_mut().abort_data_persistence();
                 self.abort_nwk_lifecycle_persistence();
                 self.abort_network_key_persistence();
                 Err(error)
@@ -10390,6 +10427,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         clusters: &mut [ClusterRef<'_>],
         store: &mut S,
     ) -> Result<event_loop::TickResult, SecurityStoreError> {
+        if self.binding_persistence_pending() {
+            log::error!("[Runtime] Binding transaction must complete before ticking");
+            return Err(SecurityStoreError::Full);
+        }
         self.refresh_security_state(store)?;
         self.tombstone_retired_security_state_replay_counters(store)?;
         self.flush_pending_device_announce_with_security_store(store)
@@ -11969,6 +12010,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     where
         F: FnMut(security_store::PersistentReplayCounter) -> bool,
     {
+        if self.binding_persistence_pending() {
+            log::error!("[Runtime] Dropping frame while a binding transaction is pending");
+            return None;
+        }
         let mac_payload = indication.payload.as_slice();
 
         // NWK layer: header parsing, broadcast eligibility, BTR/relay for
@@ -12052,6 +12097,9 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
 
         let buf = unsafe { &*self.scratch.nwk.get() };
         let defer_device_announce_replay = is_device_announce_aps_frame(&buf[..len]);
+        let defer_binding = self.defer_aps_ack
+            && self.binding_persistence.enabled
+            && binding_persistence::is_binding_request(&buf[..len]);
 
         rt_trace!(
             "[RT] nwk src=0x{:04X} dst=0x{:04X} sec={} len={}",
@@ -12072,6 +12120,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             self.pending_nwk_lifecycle_replay(),
             Some((_, zigbee_nwk::nlde::NwkLifecyclePersistence::LocalData))
         ) && !defer_device_announce_replay
+            && !defer_binding
             && !self
                 .commit_pending_nwk_lifecycle_replay(replay_commit)
                 .await
@@ -12087,13 +12136,14 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             let aps = self.bdb.zdo_mut().aps_mut();
             let mut commit =
                 |counter| replay_commit(security_store::PersistentReplayCounter::Aps(counter));
-            let indication = aps.process_incoming_aps_frame_with_replay_commit(
+            let indication = aps.process_incoming_aps_frame_with_data_persistence(
                 &buf[..len],
                 src,
                 dst,
                 indication.lqi,
                 zigbee_aps::apsde::IncomingNwkSecurity::new(nwk_security, nwk_security_source),
                 aps_decrypt_buf,
+                defer_binding,
                 &mut commit,
             );
             #[cfg(feature = "router")]
@@ -12187,6 +12237,13 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         self.send_pending_aps_ack_if_ready().await;
 
         if dst_ep == 0x00 {
+            if defer_binding {
+                match self.bdb.zdo_mut().prepare_binding_response(&aps_indication) {
+                    Ok(response) => self.binding_persistence.response = response,
+                    Err(error) => log::warn!("[Runtime] Invalid binding request: {:?}", error),
+                }
+                return None;
+            }
             let announced = authenticated_device_announcement(&aps_indication, src, nwk_security);
             if cluster_id == zigbee_zdo::DEVICE_ANNCE && announced.is_none() {
                 return None;

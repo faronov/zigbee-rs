@@ -130,23 +130,23 @@ tools use Rust `1.94.1`.
 ./scripts/tlsr8258.sh build router
 ```
 
-Current images (sensor baseline 2026-09-06; router refreshed 2026-09-07):
+Current images (sensor baseline 2026-09-06; router refreshed 2026-09-10):
 
 | image | bytes | regression gate | headroom |
 |---|---:|---:|---:|
 | default SUSPEND sensor | 290,616 | 294,912 | 4,296 |
 | LOW32K 250 ms proof | 295,548 | 299,008 | 3,460 |
 | LOW32K 10 s proof | 295,552 | 299,008 | 3,456 |
-| parent router | 433,756 | 430,080 | -3,676 |
+| parent router | 436,072 | 430,080 | -5,992 |
 
 The retained LOW32K fresh-root SVC stack is 8,448 B, 256 B above its 8 KiB
 gate.
 
 The router's old 356,352 B gate was a pre-R22 baseline. The unchanged
 430,080 B (`0x69000`) gate was introduced above the earlier 427,776 B image.
-The current router exceeds it by 3,676 B, blocking release. Neither the
+The current router exceeds it by 5,992 B, blocking release. Neither the
 physical 458,752 B (`0x70000`) application boundary nor any journal moved.
-The current image has 24,996 B of physical headroom; the gate-to-boundary
+The current image has 22,680 B of physical headroom; the gate-to-boundary
 separation remains 28,672 B.
 
 Independent diagnostics remain under `tools/telink-tlsr8258-lab`:
@@ -158,8 +158,11 @@ Independent diagnostics remain under `tools/telink-tlsr8258-lab`:
 
 ## Validation
 
-The exact images above are build/layout-tested. Earlier TB-04 images produced
-hardware evidence for:
+The recorded sensor images passed build/layout checks. The refreshed router
+links with the physical memory assertions and the durable Bind/Unbind path,
+but its build command fails the unchanged regression-size gate. The existing
+TC32 toolchain was not modified. Earlier TB-04 images produced hardware
+evidence for:
 
 - hardware AES KAT, secured commissioning, TCLK exchange, ZHA interview, and
   sustained traffic;

@@ -279,6 +279,7 @@ struct ApsDecryptOutcome {
     /// Network Transport-Key replay floor deferred until its network-security
     /// snapshot is durable.
     deferred_network_key_replay: Option<crate::security::ApsReplayCounter>,
+    deferred_data_replay: Option<crate::security::ApsReplayCounter>,
     /// Trust Center / parent command replay floor deferred until its
     /// upper-layer transaction is durable.
     #[cfg(feature = "router")]
@@ -320,6 +321,7 @@ fn aps_decrypt_incoming<P>(
     defer_application_key_replay: bool,
     defer_network_key_replay: bool,
     defer_security_indication_replay: bool,
+    defer_data_replay: bool,
     replay_commit: &mut dyn FnMut(crate::security::ApsReplayCounter) -> bool,
 ) -> Option<ApsDecryptOutcome>
 where
@@ -506,6 +508,7 @@ where
     #[cfg(not(feature = "router"))]
     let _ = defer_security_indication_replay;
     let application_replay_deferred = deferred_application_key_replay.is_some();
+    let deferred_data_replay = (!replay_duplicate && defer_data_replay).then_some(replay);
     #[cfg(feature = "router")]
     let security_indication_replay_deferred = deferred_security_indication_replay.is_some();
     #[cfg(not(feature = "router"))]
@@ -514,6 +517,7 @@ where
         && !application_replay_deferred
         && deferred_network_key_replay.is_none()
         && !security_indication_replay_deferred
+        && deferred_data_replay.is_none()
     {
         if !replay_commit(replay) {
             log::error!("[APS] Durable replay-counter commit failed");
@@ -534,6 +538,7 @@ where
         },
         deferred_application_key_replay,
         deferred_network_key_replay,
+        deferred_data_replay,
         #[cfg(feature = "router")]
         deferred_security_indication_replay,
         replay_duplicate,
@@ -1291,7 +1296,38 @@ impl<M: MacDriver> ApsLayer<M> {
         decrypted_buf: &'a mut ApsFrameBuffer,
         replay_commit: &mut dyn FnMut(crate::security::ApsReplayCounter) -> bool,
     ) -> Option<ApsdeDataIndication<'a>> {
+        self.process_incoming_aps_frame_with_data_persistence(
+            nwk_payload,
+            nwk_src,
+            nwk_dst,
+            lqi,
+            nwk_security,
+            decrypted_buf,
+            false,
+            replay_commit,
+        )
+    }
+
+    /// As above, optionally hold a data frame's verified APS replay floor.
+    /// The caller must complete or abort data persistence before processing
+    /// another frame and must not release the pending ACK before completion.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_incoming_aps_frame_with_data_persistence<'a>(
+        &mut self,
+        nwk_payload: &'a [u8],
+        nwk_src: ShortAddress,
+        nwk_dst: ShortAddress,
+        lqi: u8,
+        nwk_security: IncomingNwkSecurity,
+        decrypted_buf: &'a mut ApsFrameBuffer,
+        defer_data_replay: bool,
+        replay_commit: &mut dyn FnMut(crate::security::ApsReplayCounter) -> bool,
+    ) -> Option<ApsdeDataIndication<'a>> {
         aps_diag!("[APS] RX {} bytes", nwk_payload.len());
+        if self.pending_data_replay.is_some() {
+            log::error!("[APS] Dropping frame while a data-frame durable commit is pending");
+            return None;
+        }
         if self.pending_application_key_replay.is_some() {
             log::error!("[APS] Dropping frame while an application-key durable commit is pending");
             return None;
@@ -1356,6 +1392,7 @@ impl<M: MacDriver> ApsLayer<M> {
                     && self.network_key_persistence_enabled,
                 cfg!(feature = "router")
                     && header.frame_control.frame_type == ApsFrameType::Command as u8,
+                defer_data_replay && header.frame_control.frame_type == ApsFrameType::Data as u8,
                 replay_commit,
             )?;
             used_decrypted_buf = true;
@@ -1365,6 +1402,7 @@ impl<M: MacDriver> ApsLayer<M> {
             aps_used_distributed_link_key = outcome.aps_used_distributed_link_key;
             deferred_application_key_replay = outcome.deferred_application_key_replay;
             deferred_network_key_replay = outcome.deferred_network_key_replay;
+            self.pending_data_replay = outcome.deferred_data_replay;
             #[cfg(feature = "router")]
             {
                 deferred_security_indication_replay = outcome.deferred_security_indication_replay;
@@ -3157,9 +3195,10 @@ impl<M: MacDriver> ApsLayer<M> {
         Ok(aps_counter)
     }
 
-    /// Send a pending APS ACK if one is queued.
+    /// Send a pending APS ACK if one is queued. Retain ownership on transport
+    /// failure or cancellation so durable callers can retry before responding.
     pub async fn send_pending_aps_ack(&mut self) -> Result<(), ApsStatus> {
-        let ack_info = match self.pending_aps_ack.take() {
+        let ack_info = match self.pending_aps_ack.clone() {
             Some(info) => info,
             None => return Ok(()),
         };
@@ -3190,10 +3229,11 @@ impl<M: MacDriver> ApsLayer<M> {
         let hdr_len = aps_header.serialize(&mut buf);
 
         let radius = self.nwk.nib().max_depth.saturating_mul(2);
-        let _ = self
-            .nwk
+        self.nwk
             .nlde_data_request(ack_info.dst_addr, radius, &buf[..hdr_len], true, false)
-            .await;
+            .await
+            .map_err(|_| ApsStatus::NoAck)?;
+        self.pending_aps_ack = None;
 
         log::debug!(
             "[APS] Sent ACK (counter={}) to 0x{:04X}",

@@ -161,6 +161,17 @@ where
         Ok(())
     }
 
+    /// Release a prepared binding response after the composition has saved
+    /// the APS-table snapshot. Both replay floors and the ACK are ordered
+    /// by the runtime's bounded binding transaction.
+    pub async fn complete_binding_persistence(
+        &mut self,
+    ) -> Result<(), crate::binding_persistence::BindingPersistenceError> {
+        self.device
+            .complete_binding_persistence(&mut *self.security_store)
+            .await
+    }
+
     pub async fn complete_security_indication_persistence(&mut self) -> Result<(), NodeError> {
         #[cfg(feature = "router")]
         {

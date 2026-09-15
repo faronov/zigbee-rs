@@ -557,6 +557,7 @@ let _ = ZigbeeDevice::builder(MockMac::new([0; 8])).build_router();
             defer_aps_ack: false,
             trust_center_removal_pending: false,
             deferred_mgmt_leave: None,
+            binding_persistence: Default::default(),
             zcl_seq: 0,
             basic_cluster: BasicCluster::new_with_application_version(
                 self.manufacturer_name,

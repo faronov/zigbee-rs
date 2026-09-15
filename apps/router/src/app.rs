@@ -933,6 +933,9 @@ where
     pending_security_indication_commit: bool,
     pending_child_lifecycle_replay_commit: bool,
     initialized: bool,
+    /// A joined network is not usable until every auxiliary restore and replay
+    /// barrier succeeds. Also covers a failed activation during later rejoin.
+    network_activation_pending: bool,
     _archetype: PhantomData<K>,
     _observer: PhantomData<O>,
 }
@@ -971,7 +974,6 @@ where
                 actual,
             });
         }
-        #[cfg(feature = "application-link-key-installation")]
         let mut node = node;
         let now = node.device().mac().monotonic_micros();
         #[cfg(feature = "application-link-key-installation")]
@@ -981,6 +983,8 @@ where
         if A::DURABLE_APPLICATION_KEYS {
             return Err(RouterAppError::ApplicationLinkKeyInstallationUnavailable);
         }
+        node.device_mut()
+            .set_binding_persistence_enabled(A::DURABLE_APPLICATION_KEYS);
         Ok(Self {
             node,
             children,
@@ -998,6 +1002,7 @@ where
             pending_security_indication_commit: false,
             pending_child_lifecycle_replay_commit: false,
             initialized: false,
+            network_activation_pending: false,
             _archetype: PhantomData,
             _observer: PhantomData,
         })
@@ -1250,6 +1255,14 @@ where
             }
             self.node.complete_application_key_persistence().await?;
         }
+        if self.node.device().binding_persistence_pending() {
+            if !A::DURABLE_APPLICATION_KEYS {
+                return Err(RouterAppError::ApsTables(
+                    ApsTableStoreError::PersistenceRequired,
+                ));
+            }
+            self.node.complete_binding_persistence().await?;
+        }
         Ok(())
     }
 
@@ -1309,6 +1322,7 @@ where
 
     fn activate_network(&mut self, short_address: u16) -> Result<(), RouterAppError> {
         // No receive/tick/parent-command path is entered before this returns.
+        self.network_activation_pending = true;
         self.checkpoint_security()?;
         self.restore_children()?;
         self.restore_aps_tables()?;
@@ -1329,6 +1343,7 @@ where
             });
         self.refresh_online_status();
         O::on_network_ready(self.node.device());
+        self.network_activation_pending = false;
         Ok(())
     }
 
@@ -1383,6 +1398,7 @@ where
         self.last_identifying = None;
         self.pending_security_indication_commit = false;
         self.pending_child_lifecycle_replay_commit = false;
+        self.network_activation_pending = false;
         Ok(())
     }
 
@@ -1840,7 +1856,6 @@ where
         if self.initialized {
             return Err(RouterAppError::AlreadyInitialized);
         }
-        self.initialized = true;
         self.set_status(RouterStatus::Starting { archetype: K::ID });
         self.parts
             .diagnostics
@@ -1863,7 +1878,9 @@ where
         self.parts
             .diagnostics
             .record(DiagnosticEvent::DefaultReportingConfigured);
-        self.attempt_start().await
+        self.attempt_start().await?;
+        self.initialized = true;
+        Ok(())
     }
 
     async fn initialize(&mut self) -> Result<(), RouterAppError> {
@@ -1880,6 +1897,9 @@ where
         if self.pending_factory_reset {
             Ok(StepEvents::default())
         } else if self.node.device().is_joined() {
+            if self.network_activation_pending {
+                self.activate_network(self.node.device().short_address())?;
+            }
             self.step_joined::<DEFER_SECURITY>().await
         } else {
             self.step_unjoined().await

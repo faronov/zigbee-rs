@@ -3,6 +3,7 @@
 use zigbee_mac::MacError;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::aps_table_store::ApsTableStoreError;
+use zigbee_runtime::binding_persistence::BindingPersistenceError;
 use zigbee_runtime::child_store::ChildStoreError;
 use zigbee_runtime::event_loop::StartError;
 use zigbee_runtime::node::NodeError;
@@ -31,6 +32,7 @@ pub enum RouterAppError {
     Node(NodeError),
     Security(SecurityStoreError),
     ApsTables(ApsTableStoreError),
+    Binding(BindingPersistenceError),
     ChildStore(ChildStoreError),
     #[cfg(feature = "trust-center")]
     TrustCenter(TrustCenterRuntimeError),
@@ -58,6 +60,12 @@ impl From<ChildStoreError> for RouterAppError {
 impl From<ApsTableStoreError> for RouterAppError {
     fn from(error: ApsTableStoreError) -> Self {
         Self::ApsTables(error)
+    }
+}
+
+impl From<BindingPersistenceError> for RouterAppError {
+    fn from(error: BindingPersistenceError) -> Self {
+        Self::Binding(error)
     }
 }
 
