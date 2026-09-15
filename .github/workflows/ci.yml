@@ -161,7 +161,8 @@ jobs:
         with:
           workspaces: ${{ matrix.workspace }}
           cache-targets: false
-          key: x86_64-unknown-linux-gnu-host-${{ matrix.name }}-${{ matrix.features }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', 'boards/**/Cargo.lock', 'products/**/Cargo.lock', 'boards/**/Cargo.toml', 'products/**/Cargo.toml') }}
+          # Variant names are unique; raw feature lists contain cache-invalid commas.
+          key: x86_64-unknown-linux-gnu-host-${{ matrix.name }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', 'boards/**/Cargo.lock', 'products/**/Cargo.lock', 'boards/**/Cargo.toml', 'products/**/Cargo.toml') }}
       - name: Test and lint standalone crate
         run: |
           HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"

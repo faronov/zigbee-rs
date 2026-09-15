@@ -48,8 +48,9 @@ Changing the compiler invalidates direct size comparisons.
 
 The September 15 PHY62x2 measurements keep `nightly-2026-08-01` and the
 existing product feature sets, with target-local identical-code folding.
-The default PHY6222 build and layout checks pass locally, but its 64-byte
-margin still needs confirmation by Linux CI. PHY6252's 130,912-byte span is
+The default PHY6222 build and layout checks pass locally and in Linux CI for
+`b788186`, both at 130,752 bytes. The 64-byte margin remains narrow.
+PHY6252's 130,912-byte span is
 measured from the failed link map: no current executable or package is
 qualified for that variant.
 
