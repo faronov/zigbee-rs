@@ -2,101 +2,13 @@
 
 use core::convert::Infallible;
 
-use embassy_time::{Duration, Instant, Timer};
-use esp_hal::gpio::{Input, Output};
+use esp_hal::gpio::Output;
 use sensor_sed_app::{
-    DiagnosticEvent, Diagnostics, EnvironmentReading, EnvironmentSource, SensorStatus, SleepDepth,
-    StatusSink, Supervisor, WaitRequest, WakeController, WakeReason,
+    DiagnosticEvent, Diagnostics, EnvironmentReading, EnvironmentSource, SensorStatus, StatusSink,
+    Supervisor,
 };
-use zigbee_mac::esp::EspMac;
 
 use crate::chip_temperature::H2TemperatureSensor;
-
-const BUTTON_POLL_MS: u32 = 10;
-const HELD_POLL_MS: u32 = 25;
-
-fn elapsed_ms(later: Instant, earlier: Instant) -> u32 {
-    later
-        .saturating_duration_since(earlier)
-        .as_millis()
-        .min(u32::MAX as u64) as u32
-}
-
-/// Active-only timer/button wait.
-///
-/// The current ESP radio and polling time driver cannot perform the atomic
-/// quiesce/sleep/restore operation required by deeper SensorApp wait modes.
-pub struct ActiveWake<'d> {
-    button: Input<'d>,
-}
-
-impl<'d> ActiveWake<'d> {
-    pub const fn new(button: Input<'d>) -> Self {
-        Self { button }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WakeError {
-    UnsupportedDepth(SleepDepth),
-}
-
-impl<'button, 'radio> WakeController<EspMac<'radio>> for ActiveWake<'button> {
-    type Mark = Instant;
-    type Error = WakeError;
-
-    fn mark(&self) -> Self::Mark {
-        Instant::now()
-    }
-
-    fn add_ms(mark: Self::Mark, duration_ms: u32) -> Self::Mark {
-        mark + Duration::from_millis(duration_ms as u64)
-    }
-
-    fn elapsed_ms(later: Self::Mark, earlier: Self::Mark) -> u32 {
-        elapsed_ms(later, earlier)
-    }
-
-    async fn wait(
-        &mut self,
-        _mac: &mut EspMac<'radio>,
-        request: WaitRequest,
-    ) -> Result<WakeReason, Self::Error> {
-        if request.sleep_depth != SleepDepth::Active {
-            return Err(WakeError::UnsupportedDepth(request.sleep_depth));
-        }
-
-        let started = Instant::now();
-        loop {
-            if self.button.is_low() {
-                return Ok(WakeReason::Button);
-            }
-
-            let elapsed = elapsed_ms(Instant::now(), started);
-            if elapsed >= request.timeout_ms {
-                return Ok(WakeReason::Timer);
-            }
-
-            let delay_ms = (request.timeout_ms - elapsed).min(BUTTON_POLL_MS);
-            Timer::after(Duration::from_millis(delay_ms as u64)).await;
-        }
-    }
-
-    async fn button_held_for(&mut self, duration_ms: u32) -> bool {
-        let started = Instant::now();
-        while self.button.is_low() {
-            if elapsed_ms(Instant::now(), started) >= duration_ms {
-                return true;
-            }
-            Timer::after(Duration::from_millis(HELD_POLL_MS as u64)).await;
-        }
-        false
-    }
-
-    async fn delay_ms(&mut self, duration_ms: u32) {
-        Timer::after(Duration::from_millis(duration_ms as u64)).await;
-    }
-}
 
 /// GPIO8 status LED, active low.
 pub struct ActiveLowStatus<'d> {

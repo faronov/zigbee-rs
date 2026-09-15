@@ -1,9 +1,7 @@
 //! Shared sleepy-sensor application policy for both ESP32 devkits.
 //!
-//! The current platform wait implementation is deliberately active-only:
-//! neither the polling Embassy time driver nor the ESP MAC backend exposes the
-//! atomic radio quiesce/restore transition required for idle or retention
-//! sleep. Both policy depths therefore remain [`SleepDepth::Active`].
+//! `light-sleep` opts into retained PMU sleep between slow parent polls.
+//! Fast commissioning/interview and OTA windows remain radio-on.
 
 use sensor_sed_app::{ButtonPolicy, SensorPolicy, SleepDepth, StatusPolicy};
 
@@ -14,7 +12,11 @@ pub const OTA_KEEP_AWAKE_MS: u32 = 120_000;
 pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
     sample_interval_ms: 60_000,
     fast_poll_ms: 250,
-    slow_poll_ms: 30_000,
+    slow_poll_ms: if cfg!(feature = "light-sleep") {
+        5_000
+    } else {
+        30_000
+    },
     fresh_join_fast_ms: OTA_KEEP_AWAKE_MS,
     restored_fast_ms: 60_000,
     wake_duration_ms: 500,
@@ -35,7 +37,11 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
         reset_phase_ms: 100,
     },
     fast_sleep_depth: SleepDepth::Active,
-    slow_sleep_depth: SleepDepth::Active,
+    slow_sleep_depth: if cfg!(feature = "light-sleep") {
+        SleepDepth::Idle
+    } else {
+        SleepDepth::Active
+    },
 };
 
 #[cfg(test)]
@@ -47,6 +53,12 @@ mod tests {
         assert!(SENSOR_POLICY.is_valid_for_status(true));
         assert!(SENSOR_POLICY.is_valid_for_status(false));
         assert_eq!(SENSOR_POLICY.fast_sleep_depth, SleepDepth::Active);
-        assert_eq!(SENSOR_POLICY.slow_sleep_depth, SleepDepth::Active);
+        if cfg!(feature = "light-sleep") {
+            assert_eq!(SENSOR_POLICY.slow_sleep_depth, SleepDepth::Idle);
+            assert_eq!(SENSOR_POLICY.slow_poll_ms, 5_000);
+        } else {
+            assert_eq!(SENSOR_POLICY.slow_sleep_depth, SleepDepth::Active);
+            assert_eq!(SENSOR_POLICY.slow_poll_ms, 30_000);
+        }
     }
 }

@@ -29,6 +29,7 @@ use embassy_time::{Duration, Instant, Timer};
 use esp_radio::ieee802154::{Config, Ieee802154};
 
 pub use crate::esp_aes::AesEngineError;
+pub use esp_radio::ieee802154::SuspendError;
 
 /// How long to wait for the parent to deliver an indirect frame after a Data
 /// Request. The parent transmits the buffered frame immediately after the MAC
@@ -195,6 +196,23 @@ pub struct EspMac<'a> {
 }
 
 impl<'a> EspMac<'a> {
+    /// Quiesce the radio only when the application owns an idle sleepy ED.
+    /// Pending association/data frames veto sleep without consuming them.
+    pub fn try_suspend(&mut self) -> Result<(), SuspendError> {
+        if self.pending_assoc_frame.is_some() {
+            return Err(SuspendError::PendingReceive);
+        }
+        if self.rx_on_when_idle || self.promiscuous {
+            return Err(SuspendError::Busy);
+        }
+        self.driver.try_suspend()
+    }
+
+    /// Restore PHY and RX before the stack resumes after retained light sleep.
+    pub fn resume(&mut self) {
+        self.driver.resume();
+    }
+
     pub fn new(ieee802154: Ieee802154<'a>, mut config: Config) -> Self {
         let ieee = Self::read_efuse_ieee();
 
@@ -308,9 +326,10 @@ impl<'a> EspMac<'a> {
 
     /// Transmit a frame. The driver waits for TX completion internally.
     async fn transmit_frame(&mut self, frame: &[u8]) -> Result<(), MacError> {
-        self.driver
-            .transmit(frame)
-            .map_err(|_| MacError::RadioError)?;
+        self.driver.transmit(frame).map_err(|error| {
+            log::warn!("[ESP MAC] transmit failed: {:?}", error);
+            MacError::RadioError
+        })?;
         Ok(())
     }
 

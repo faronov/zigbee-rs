@@ -46,12 +46,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Test ESP application image preflight
+        run: python3 -m unittest discover -s products/esp32-zigbee-devkit/partitions -p 'test_esp_app_image.py' -v
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: x86_64-unknown-linux-gnu-workspace-${{ env.RUST_TOOLCHAIN }}-tests-${{ hashFiles('Cargo.lock') }}
+      - name: Test retained ESP HAL clock and timer helpers
+        run: |
+          rustc --edition 2024 --test vendor/esp-hal/tests/retained_sleep_host.rs \
+            -o "$RUNNER_TEMP/esp-hal-sleep-tests"
+          "$RUNNER_TEMP/esp-hal-sleep-tests"
       - run: cargo test --workspace --locked
       # Keep sensor feature graphs isolated from workspace feature unification.
       - run: cargo test -p sensor-sed-app --locked
@@ -99,6 +106,26 @@ jobs:
             workspace: products/cc2340-sensor
             locked: false
             features: ""
+          - name: ESP32-C6 sensor product
+            manifest: products/esp32-zigbee-devkit/Cargo.toml
+            workspace: products/esp32-zigbee-devkit
+            locked: false
+            features: esp32c6
+          - name: ESP32-H2 sensor product
+            manifest: products/esp32-zigbee-devkit/Cargo.toml
+            workspace: products/esp32-zigbee-devkit
+            locked: false
+            features: esp32h2
+          - name: ESP32-C6 light-sleep product
+            manifest: products/esp32-zigbee-devkit/Cargo.toml
+            workspace: products/esp32-zigbee-devkit
+            locked: false
+            features: esp32c6,light-sleep
+          - name: ESP32-H2 light-sleep product
+            manifest: products/esp32-zigbee-devkit/Cargo.toml
+            workspace: products/esp32-zigbee-devkit
+            locked: false
+            features: esp32h2,light-sleep
           - name: nRF52840 always-on End Device product
             manifest: products/nrf52840-router/Cargo.toml
             workspace: products/nrf52840-router
@@ -774,7 +801,16 @@ jobs:
             "$ELF" "${ELF}.bin"
           python3 products/esp32-zigbee-devkit/partitions/check-app-image-size.py \
             --chip esp32c6 --slot ota_0 --merged "${ELF}.bin" "${ELF}.app.bin"
-          # 2026-09-08 app image is 369248 B and fails this unchanged gate.
+          export ESP_OTA_TEST_IMAGE="$PWD/${ELF}.app.bin"
+          export ESP_OTA_C6_IMAGE="$ESP_OTA_TEST_IMAGE"
+          export ESP_OTA_PREFLIGHT_CORPUS="$RUNNER_TEMP/esp32c6-ota-corpus"
+          python3 products/esp32-zigbee-devkit/partitions/test_esp_app_image.py \
+            --write-corpus "$ESP_OTA_PREFLIGHT_CORPUS" --chip esp32c6
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo test --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
+            --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/esp32c6-ota-host" \
+            --no-default-features --features esp32c6 -- --include-ignored
+          # 2026-09-10 local app image is 377360 B and fails this unchanged gate.
           # Keep its regression budget
           # independent of the checked 0x1F0000-byte physical OTA slot.
           ./tools/firmware-size-report.sh \
@@ -841,7 +877,17 @@ jobs:
             "$ELF" "${ELF}.bin"
           python3 products/esp32-zigbee-devkit/partitions/check-app-image-size.py \
             --chip esp32h2 --slot ota_0 --merged "${ELF}.bin" "${ELF}.app.bin"
-          # 2026-09-08 app image measured 354096 B. Keep its regression budget
+          export ESP_OTA_TEST_IMAGE="$PWD/${ELF}.app.bin"
+          export ESP_OTA_H2_IMAGE="$ESP_OTA_TEST_IMAGE"
+          export ESP_OTA_PREFLIGHT_CORPUS="$RUNNER_TEMP/esp32h2-ota-corpus"
+          python3 products/esp32-zigbee-devkit/partitions/test_esp_app_image.py \
+            --write-corpus "$ESP_OTA_PREFLIGHT_CORPUS" --chip esp32h2
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo test --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
+            --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/esp32h2-ota-host" \
+            --no-default-features --features esp32h2 -- --include-ignored
+          # 2026-09-10 local app image is 362112 B and fails this unchanged gate.
+          # Keep its regression budget
           # independent of the checked 0x1F0000-byte physical OTA slot.
           ./tools/firmware-size-report.sh \
             esp32h2-sensor "${ELF}.app.bin" 356352 "${ELF}.size.json"
@@ -854,6 +900,62 @@ jobs:
             examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.app.bin
             examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.size.json
           if-no-files-found: error
+
+  build-esp-light-sleep:
+    name: Build ${{ matrix.chip }} retained light sleep
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - chip: esp32c6
+            budget: 368640
+          - chip: esp32h2
+            budget: 356352
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.ESP_PHY_RUST_TOOLCHAIN }}
+          targets: riscv32imac-unknown-none-elf
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: examples/${{ matrix.chip }}-sensor
+          key: ${{ matrix.chip }}-light-sleep-${{ env.ESP_PHY_RUST_TOOLCHAIN }}-${{ hashFiles('vendor/**', 'examples/esp32*/Cargo.lock') }}
+      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: espflash@${{ env.ESPFLASH_VERSION }}
+      - name: Link retained-sleep firmware
+        working-directory: examples/${{ matrix.chip }}-sensor
+        run: cargo build --release --locked --features light-sleep -Z build-std=core,alloc
+      - name: Validate actual application and OTA corpus before size gate
+        env:
+          CHIP: ${{ matrix.chip }}
+          BUDGET: ${{ matrix.budget }}
+        run: |
+          ELF="examples/$CHIP-sensor/target/riscv32imac-unknown-none-elf/release/$CHIP-sensor"
+          CSV=products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv
+          espflash save-image --skip-update-check --chip "$CHIP" \
+            --partition-table "$CSV" --target-app-partition ota_0 "$ELF" "${ELF}.app.bin"
+          espflash save-image --skip-update-check --chip "$CHIP" --merge --skip-padding \
+            --flash-size 4mb --partition-table "$CSV" --target-app-partition ota_0 "$ELF" "${ELF}.bin"
+          python3 products/esp32-zigbee-devkit/partitions/check-app-image-size.py \
+            --chip "$CHIP" --slot ota_0 --merged "${ELF}.bin" "${ELF}.app.bin"
+          export ESP_OTA_TEST_IMAGE="$PWD/${ELF}.app.bin"
+          export ESP_OTA_PREFLIGHT_CORPUS="$RUNNER_TEMP/$CHIP-light-sleep-corpus"
+          if [[ "$CHIP" == esp32c6 ]]; then
+            export ESP_OTA_C6_IMAGE="$ESP_OTA_TEST_IMAGE"
+          else
+            export ESP_OTA_H2_IMAGE="$ESP_OTA_TEST_IMAGE"
+          fi
+          python3 products/esp32-zigbee-devkit/partitions/test_esp_app_image.py \
+            --write-corpus "$ESP_OTA_PREFLIGHT_CORPUS" --chip "$CHIP"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo test --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
+            --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/$CHIP-light-sleep-host" \
+            --no-default-features --features "$CHIP,light-sleep" -- --include-ignored
+          ./tools/firmware-size-report.sh "$CHIP-light-sleep" "${ELF}.app.bin" "$BUDGET" "${ELF}.size.json"
 
   build-bl702:
     name: Build BL702 sensor
@@ -1208,7 +1310,7 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          # Final binary measured 202820 B.
+          # 2026-09-10 local binary measured 202068 B.
           ./tools/firmware-size-report.sh efr32mg21-sensor ${ELF}.bin 212992 ${ELF}.size.json
           python3 examples/efr32mg21-sensor/tools/verify-layout.py "$ELF"
           SYMS="$("$NM" --demangle "$ELF")"

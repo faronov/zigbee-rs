@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 embedded-storage = "0.3"
+embassy-time-queue-utils = { version = "0.1", features = ["generic-queue-8"] }
 log = "0.4"
 sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"] }
 zigbee-aps = { path = "../../zigbee-aps" }
@@ -22,6 +23,11 @@ esp32-zigbee-devkit = { path = "../../boards/esp32-zigbee-devkit" }
 # `RawFlash` returns (`embedded_storage::nor_flash::ErrorType::Error`); all
 # flash access itself goes through the board crate.
 [target.'cfg(target_os = "none")'.dependencies]
+critical-section = "1.2"
+embassy-time = "0.4"
+embassy-futures = "0.1"
+embassy-time-driver = { version = "0.2", features = ["tick-hz-1_000_000"] }
+esp-hal = { version = "=1.0.0", features = ["unstable"] }
 esp-storage = { version = "0.7", default-features = false, features = [
     "bytewise-read",
     "critical-section",
@@ -29,5 +35,10 @@ esp-storage = { version = "0.7", default-features = false, features = [
 
 [features]
 default = []
-esp32c6 = ["esp32-zigbee-devkit/esp32c6", "zigbee-runtime/ota"]
-esp32h2 = ["esp32-zigbee-devkit/esp32h2", "zigbee-runtime/ota"]
+light-sleep = []
+esp32c6 = ["esp32-zigbee-devkit/esp32c6", "esp-hal/esp32c6", "zigbee-runtime/ota"]
+esp32h2 = ["esp32-zigbee-devkit/esp32h2", "esp-hal/esp32h2", "zigbee-runtime/ota"]
+
+[patch.crates-io]
+esp-hal = { path = "../../vendor/esp-hal" }
+esp-radio = { path = "../../vendor/esp-radio" }

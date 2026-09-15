@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Verify an ESP application image and its merged 4 MiB flash image."""
+"""Check ESP application structure, physical slot size and merged flash layout.
+
+Actual silicon/eFuse revision compatibility is checked on the receiving device;
+this offline check does not authenticate firmware or prove it will boot.
+"""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import pathlib
 import struct
 import sys
 from dataclasses import dataclass
 
+from esp_app_image import CHIP_IDS, IMAGE_MAGIC as ESP_IMAGE_MAGIC, validate_application
+
 FLASH_SIZE = 0x0040_0000
 PARTITION_TABLE_OFFSET = 0x0000_8000
 PARTITION_ENTRY_SIZE = 32
-ESP_IMAGE_MAGIC = 0xE9
-ESP_DIGEST_BYTES = 32
-CHIP_IDS = {"esp32c6": 0x000D, "esp32h2": 0x0010}
 
 EXPECTED_LAYOUT = {
     "otadata": (0x0000_9000, 0x0000_2000),
@@ -83,25 +85,10 @@ def load_partitions() -> dict[str, Partition]:
 
 def check_application_image(path: pathlib.Path, chip: str, slot: Partition) -> bytes:
     image = path.read_bytes()
-    if len(image) < 24 + ESP_DIGEST_BYTES or image[0] != ESP_IMAGE_MAGIC:
-        raise SystemExit(f"{path}: not an ESP application image")
-    if image[1] == 0:
-        raise SystemExit(f"{path}: image declares no loadable segments")
-    chip_id = struct.unpack_from("<H", image, 12)[0]
-    if chip_id != CHIP_IDS[chip]:
-        raise SystemExit(
-            f"{path}: chip id 0x{chip_id:04X}, expected 0x{CHIP_IDS[chip]:04X}"
-        )
-    if image[23] != 1:
-        raise SystemExit(f"{path}: image does not carry an appended SHA-256")
-    if hashlib.sha256(image[:-ESP_DIGEST_BYTES]).digest() != image[-ESP_DIGEST_BYTES:]:
-        raise SystemExit(f"{path}: appended SHA-256 does not match")
-    if slot.offset + len(image) > slot.end:
-        raise SystemExit(
-            f"{path}: physical range 0x{slot.offset:06X}.."
-            f"0x{slot.offset + len(image):06X} exceeds {slot.name} end "
-            f"0x{slot.end:06X}"
-        )
+    try:
+        validate_application(image, CHIP_IDS[chip], slot.offset, slot.size)
+    except ValueError as error:
+        raise SystemExit(f"{path}: {error}") from error
     return image
 
 

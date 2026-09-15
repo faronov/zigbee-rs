@@ -9,6 +9,8 @@ use crate::policy::SleepDepth;
 pub enum WakeReason {
     Button,
     Timer,
+    /// Pending radio/interrupt work prevented sleep and needs servicing.
+    Activity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +32,8 @@ pub struct WaitRequest {
 /// [`wait`](Self::wait), before returning `Ok`. Preparation failure returns
 /// `Err` without entering the wait; required restoration failure also returns
 /// `Err`.
+/// Pending work may veto an otherwise valid wait and return [`WakeReason::Activity`]
+/// with the MAC still usable, without claiming that sleep occurred.
 #[allow(async_fn_in_trait)]
 pub trait WakeController<M: MacDriver> {
     /// Opaque platform-native monotonic timestamp.

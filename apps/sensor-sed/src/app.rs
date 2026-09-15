@@ -1012,11 +1012,14 @@ where
 
         let now = self.mark();
         let joined = self.node.device().is_joined();
-        let identifying = St::PRESENT && self.node.device().is_identifying(self.endpoint);
+        let identifying = self.node.device().is_identifying(self.endpoint);
         let ota_active = O::ENABLED && self.resources.ota.is_active(self.node.profile());
         let fast_poll_elapsed_ms = W::elapsed_ms(now, self.fast_poll_started);
         let timed_fast_poll = fast_poll_elapsed_ms < self.fast_poll_duration_ms;
-        let in_fast_poll = timed_fast_poll || identifying || ota_active;
+        let in_fast_poll = timed_fast_poll
+            || identifying
+            || ota_active
+            || self.node.device().has_pending_protocol_work();
         let mut wait_ms = if in_fast_poll {
             self.policy.fast_poll_ms
         } else {
@@ -1192,7 +1195,10 @@ where
 
         self.resources.supervisor.heartbeat();
         let ota_active = O::ENABLED && self.resources.ota.is_active(self.node.profile());
-        let sleep_depth = if self.node.device().is_joined() && !ota_active {
+        let sleep_depth = if self.node.device().is_joined()
+            && !ota_active
+            && !self.node.device().has_pending_protocol_work()
+        {
             if in_fast_poll {
                 self.policy.fast_sleep_depth
             } else {
@@ -1224,7 +1230,7 @@ where
 
         match wake_reason {
             WakeReason::Button => self.handle_button_press().await,
-            WakeReason::Timer => {}
+            WakeReason::Timer | WakeReason::Activity => {}
         }
 
         if self.node.device().is_joined() {

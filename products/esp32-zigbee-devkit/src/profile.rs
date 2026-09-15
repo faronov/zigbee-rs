@@ -50,9 +50,8 @@ pub fn base_profile() -> BaseSensorProfile {
 #[cfg(target_os = "none")]
 mod with_ota {
     use super::{BaseSensorProfile, base_profile};
-    use crate::ota::{EspFirmwareWriter, EspOtaFlash};
+    use crate::ota::{EspFirmwareWriter, EspOtaFlash, OtaInitError};
     use crate::{ENDPOINT, OTA_HARDWARE_VERSION, OTA_IMAGE_TYPE, OTA_MANUFACTURER_CODE};
-    use zigbee_runtime::firmware_writer::FirmwareError;
     use zigbee_runtime::ota::{OtaConfig, OtaManager};
     use zigbee_runtime::profile::{ProfileError, WithOta};
 
@@ -62,13 +61,13 @@ mod with_ota {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SensorProfileError {
-        Firmware(FirmwareError),
+        OtaInitialization(OtaInitError),
         Profile(ProfileError),
     }
 
-    impl From<FirmwareError> for SensorProfileError {
-        fn from(error: FirmwareError) -> Self {
-            Self::Firmware(error)
+    impl From<OtaInitError> for SensorProfileError {
+        fn from(error: OtaInitError) -> Self {
+            Self::OtaInitialization(error)
         }
     }
 
@@ -83,10 +82,11 @@ mod with_ota {
     /// `reset` performs the software reset that hands control to the
     /// bootloader after an upgrade is staged and verified; it is provided by
     /// the composition root (`main.rs`) rather than depended on directly here,
-    /// so this crate does not need an `esp-hal` dependency of its own.
+    /// keeping reset policy in the composition root.
     ///
-    /// A missing or incompatible partition table is an explicit startup
-    /// failure. This OTA-capable image always advertises the OTA Upgrade
+    /// A missing/incompatible partition table or unavailable live MMU
+    /// running-image evidence is an explicit typed startup failure.
+    /// This OTA-capable image always advertises the OTA Upgrade
     /// client cluster, so it cannot safely continue with a different endpoint
     /// descriptor after partition discovery.
     pub fn sensor_profile(

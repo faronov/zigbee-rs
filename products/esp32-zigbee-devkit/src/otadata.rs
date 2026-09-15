@@ -11,8 +11,10 @@
 //!     28     4  crc          (u32, little endian) — CRC-32 of ota_seq only
 //! ```
 //!
-//! The second stage bootloader picks the entry with the highest valid sequence
-//! number and boots slot `(ota_seq - 1) % 2`. An entry counts as valid when its
+//! The second stage bootloader prefers the entry with the highest valid sequence
+//! number and tries slot `(ota_seq - 1) % 2`. It can fall back to another image
+//! WITHOUT rewriting these entries. Metadata never identifies the running slot.
+//! An entry counts as valid when its
 //! CRC matches and the sequence number is neither `0` nor `0xFFFF_FFFF`
 //! (the erased value), which is why a freshly erased `otadata` makes the
 //! bootloader fall back to `ota_0` — exactly the state the devkit is in before
@@ -196,23 +198,11 @@ impl OtaData {
             .map(|index| index as u8)
     }
 
-    /// Slot the bootloader would boot, if `otadata` selects one.
+    /// Preferred slot, if `otadata` selects one. NOT the executing slot:
+    /// bootloader image-validation failure can cause fallback without a rewrite.
     pub fn active_slot(&self) -> Option<u8> {
         let max = self.max_seq()?;
         Some(((max - 1) % OTA_SLOT_COUNT as u32) as u8)
-    }
-
-    /// Slot that is running right now.
-    ///
-    /// With no valid entry the bootloader falls back to the first application
-    /// partition, so the running slot is `ota_0`.
-    pub fn running_slot(&self) -> u8 {
-        self.active_slot().unwrap_or(0)
-    }
-
-    /// Slot an update must be staged into.
-    pub fn target_slot(&self) -> u8 {
-        (self.running_slot() + 1) % OTA_SLOT_COUNT
     }
 
     /// Build the entry that makes the bootloader select `slot`.
@@ -308,13 +298,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_otadata_runs_slot_zero_and_targets_slot_one() {
+    fn empty_otadata_has_no_preference_and_can_select_either_slot() {
         let data = OtaData::decode([&ERASED, &ERASED]);
         assert_eq!(data.max_seq(), None);
         assert_eq!(data.active_slot(), None);
         assert_eq!(data.active_sector(), None);
-        assert_eq!(data.running_slot(), 0);
-        assert_eq!(data.target_slot(), 1);
+        assert_eq!(data.activation_for(0).unwrap().entry.slot(), Some(0));
 
         let activation = data.activation_for(1).unwrap();
         assert_eq!(activation.sector, 0);
@@ -333,7 +322,6 @@ mod tests {
         assert_eq!(data.max_seq(), Some(5));
         assert_eq!(data.active_sector(), Some(1));
         assert_eq!(data.active_slot(), Some(0));
-        assert_eq!(data.target_slot(), 1);
 
         let flipped = OtaData::decode([&high, &low]);
         assert_eq!(flipped.active_sector(), Some(0));
@@ -349,7 +337,6 @@ mod tests {
         let data = OtaData::decode([&corrupt, &good]);
         assert_eq!(data.max_seq(), Some(4));
         assert_eq!(data.active_slot(), Some(1));
-        assert_eq!(data.target_slot(), 0);
 
         // The corrupt sector is the one that gets rewritten.
         let activation = data.activation_for(0).unwrap();
@@ -366,7 +353,7 @@ mod tests {
         let data = OtaData::decode([&newest, &oldest]);
         assert_eq!(data.active_sector(), Some(0));
 
-        let activation = data.activation_for(data.target_slot()).unwrap();
+        let activation = data.activation_for(1).unwrap();
         assert_eq!(activation.sector, 1, "must rewrite the stale sector");
         assert_eq!(activation.sector_offset, SECTOR_SIZE);
         assert!(activation.entry.seq > data.max_seq().unwrap());
@@ -376,7 +363,6 @@ mod tests {
         let applied = OtaData::decode([&newest, &activation.entry.encode()]);
         assert_eq!(applied.active_slot(), Some(1));
         assert_eq!(applied.active_sector(), Some(1));
-        assert_eq!(applied.target_slot(), 0);
     }
 
     #[test]
@@ -399,7 +385,6 @@ mod tests {
         let last = OtaSelectEntry::new(0xFFFF_FFFE, STATE_VALID).encode();
         let data = OtaData::decode([&last, &ERASED]);
         assert_eq!(data.active_slot(), Some(1));
-        assert_eq!(data.target_slot(), 0);
         assert_eq!(data.activation_for(0), Err(OtaDataError::SequenceExhausted));
         assert_eq!(data.activation_for(2), Err(OtaDataError::UnknownSlot));
 

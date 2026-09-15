@@ -3,41 +3,61 @@
 //!
 //! # How an upgrade runs
 //!
-//! 1. `otadata` is read to learn which slot the bootloader is currently booting
-//!    (`ota_0` when `otadata` is erased) and the *other* slot becomes the
-//!    staging target. The running image is never written to.
+//! 1. Live MMU evidence identifies the executing application's slot. The other
+//!    slot becomes the staging target. `otadata` is only a boot preference:
+//!    the bootloader can fall back without rewriting it. Missing evidence is
+//!    an explicit error, even when metadata is erased.
 //! 2. [`FirmwareWriter::erase_slot`] is bookkeeping only. Erasing 1.9 MiB up
 //!    front would hold a critical section for many seconds — `esp-storage`
 //!    masks interrupts around every ROM flash call — and the radio would miss
 //!    every parent poll in the meantime. Instead each 4 KiB sector is erased
 //!    lazily, immediately before the first byte lands in it, which spreads the
 //!    erase cost across the download at ~1 sector per 4 KiB of payload.
-//! 3. Zigbee delivers ragged blocks (the last one is almost never a multiple of
-//!    4), but ESP flash programs 4-byte words. Sub-word tails are buffered in
+//! 3. Zigbee may deliver ragged blocks, but ESP flash programs 4-byte words.
+//!    Sub-word tails are buffered in
 //!    RAM until the next block completes the word; the final partial word is
 //!    padded with `0xFF` — the erased value — so no byte of the image is ever
 //!    altered and the padding lives past the end of the image.
-//! 4. [`FirmwareWriter::verify`] re-reads the staged slot: the ESP image magic,
-//!    the chip ID and the appended SHA-256 all have to check out. Nothing about
-//!    the transfer is trusted.
+//! 4. [`FirmwareWriter::verify`] re-reads and validates the complete ESP image
+//!    structure, chip compatibility, XOR checksum and appended SHA-256.
+//!    This is integrity checking, NOT secure-boot authentication.
 //! 5. [`FirmwareWriter::activate`] writes one 32-byte `otadata` entry into the
 //!    sector that does not hold the active entry and resets the chip. A power
-//!    failure at any point before that write leaves the old entry — and the old
-//!    firmware — in charge.
+//!    failure leaves the previous entry intact and never erases the executing
+//!    firmware. An old preference may already refer to a failed image; it is
+//!    not proof of which fallback the bootloader will try on the next reset.
 
 use zigbee_runtime::firmware_writer::{FirmwareError, FirmwareWriter};
 
-use crate::esp_image::{
-    DIGEST_SIZE, EXPECTED_CHIP_ID, EspImageHeader, HEADER_SIZE, ImageError, hashed_range,
-};
+use crate::esp_image::{DIGEST_SIZE, ImageCompatibility, ImageReadError, verify_image};
 use crate::layout::{
     EXPECTED_PARTITIONS, OTA_SLOT_SIZE, OTADATA_OFFSET, PARTITION_ENTRY_SIZE,
     PARTITION_TABLE_OFFSET, SECTOR_SIZE, WORD_SIZE, ota_slot_offset, otadata_sector_offset,
 };
 use crate::otadata::{ENTRY_SIZE, OtaData, OtaSelectEntry};
 
-/// Chunk size used when re-reading the staged image for hashing.
-const VERIFY_CHUNK: usize = 256;
+#[path = "running_image.rs"]
+mod running_image;
+pub use running_image::RunningImageError;
+
+/// Initialization failures are distinguishable before any erase/write occurs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtaInitError {
+    Flash(FirmwareError),
+    RunningImage(RunningImageError),
+}
+
+impl From<FirmwareError> for OtaInitError {
+    fn from(error: FirmwareError) -> Self {
+        Self::Flash(error)
+    }
+}
+
+impl From<RunningImageError> for OtaInitError {
+    fn from(error: RunningImageError) -> Self {
+        Self::RunningImage(error)
+    }
+}
 
 /// Raw flash access needed to stage an image.
 ///
@@ -45,6 +65,18 @@ const VERIFY_CHUNK: usize = 256;
 /// offsets, writes are word aligned and erases are whole sectors, which is what
 /// both the ROM routines and the host mock implement.
 pub trait OtaFlash {
+    /// Actual executing-image evidence (e.g. live MMU translation), never an
+    /// otadata preference, image-version comparison, or an assumed slot zero.
+    /// The default deliberately disables OTA on backends without evidence.
+    fn running_slot(&mut self) -> Result<u8, RunningImageError> {
+        Err(RunningImageError::Unavailable)
+    }
+
+    /// Read actual silicon/eFuse revisions for image compatibility checks.
+    fn image_compatibility(&mut self) -> Result<ImageCompatibility, FirmwareError> {
+        Err(FirmwareError::HardwareError)
+    }
+
     /// Read `buffer.len()` bytes starting at `address`.
     fn read(&mut self, address: u32, buffer: &mut [u8]) -> Result<(), FirmwareError>;
 
@@ -86,17 +118,21 @@ pub struct EspFirmwareWriter<F: OtaFlash> {
 }
 
 impl<F: OtaFlash> EspFirmwareWriter<F> {
-    /// Create a writer, choosing the staging slot from `otadata`.
+    /// Create a writer using actual executing-image evidence, not `otadata`.
     ///
     /// `reset` performs the software reset that hands control back to the
     /// bootloader; it is only called from [`FirmwareWriter::activate`], after
     /// the new `otadata` entry has been programmed and read back.
-    pub fn new(flash: F, reset: fn() -> !) -> Result<Self, FirmwareError> {
+    pub fn new(mut flash: F, reset: fn() -> !) -> Result<Self, OtaInitError> {
+        let running_slot = flash.running_slot()?;
+        if running_slot >= crate::layout::OTA_SLOT_COUNT {
+            return Err(RunningImageError::OutsideOtaSlots.into());
+        }
         let mut writer = Self {
             flash,
             reset,
-            running_slot: 0,
-            target_slot: 1,
+            running_slot,
+            target_slot: (running_slot + 1) % crate::layout::OTA_SLOT_COUNT,
             state: State::Idle,
             written: 0,
             flushed: 0,
@@ -106,7 +142,6 @@ impl<F: OtaFlash> EspFirmwareWriter<F> {
             finalized: false,
         };
         writer.validate_partition_table()?;
-        writer.select_target_slot()?;
         Ok(writer)
     }
 
@@ -139,11 +174,12 @@ impl<F: OtaFlash> EspFirmwareWriter<F> {
             return Err(FirmwareError::ActivateFailed);
         }
 
+        self.check_running_image()
+            .map_err(|_| FirmwareError::ActivateFailed)?;
+        // Revalidate before committing boot preference, including flash errors
+        // or corruption occurring after verify().
+        self.verify_staged_image(None)?;
         let data = self.read_otadata()?;
-        if data.running_slot() == self.target_slot {
-            // The staging slot became the running slot behind our back.
-            return Err(FirmwareError::ActivateFailed);
-        }
 
         let activation = data
             .activation_for(self.target_slot)
@@ -198,11 +234,10 @@ impl<F: OtaFlash> EspFirmwareWriter<F> {
         Ok(())
     }
 
-    fn select_target_slot(&mut self) -> Result<(), FirmwareError> {
-        let data = self.read_otadata()?;
-        self.running_slot = data.running_slot();
-        self.target_slot = data.target_slot();
-        debug_assert_ne!(self.running_slot, self.target_slot);
+    fn check_running_image(&mut self) -> Result<(), RunningImageError> {
+        if self.flash.running_slot()? != self.running_slot {
+            return Err(RunningImageError::Changed);
+        }
         Ok(())
     }
 
@@ -263,31 +298,18 @@ impl<F: OtaFlash> EspFirmwareWriter<F> {
     }
 
     fn verify_staged_image(&mut self, expected_hash: Option<&[u8]>) -> Result<(), FirmwareError> {
-        let size = self.written;
-        let (start, end) = hashed_range(size).map_err(image_rejected)?;
-
-        let mut header = [0u8; HEADER_SIZE];
-        self.flash.read(self.slot_base(), &mut header)?;
-        EspImageHeader::parse(&header, EXPECTED_CHIP_ID).map_err(image_rejected)?;
-
-        let mut hasher = crate::sha256::Sha256::new();
-        let mut cursor = start;
-        let mut buffer = [0u8; VERIFY_CHUNK];
-        while cursor < end {
-            let take = (end - cursor).min(VERIFY_CHUNK as u32) as usize;
-            self.flash
-                .read(self.slot_base() + cursor, &mut buffer[..take])?;
-            hasher.update(&buffer[..take]);
-            cursor += take as u32;
-        }
-        let digest = hasher.finalize();
-
-        let mut stored = [0u8; DIGEST_SIZE];
-        self.flash.read(self.slot_base() + end, &mut stored)?;
-        if digest != stored {
-            log::warn!("[ESP OTA] staged image SHA-256 mismatch");
-            return Err(FirmwareError::VerifyFailed);
-        }
+        let compatibility = self.flash.image_compatibility()?;
+        let base = self.slot_base();
+        let digest = verify_image(self.written, base, compatibility, |offset, buffer| {
+            self.flash.read(base + offset, buffer)
+        })
+        .map_err(|error| match error {
+            ImageReadError::Read(error) => error,
+            ImageReadError::Image(error) => {
+                log::warn!("[ESP OTA] staged image rejected: {:?}", error);
+                FirmwareError::VerifyFailed
+            }
+        })?;
 
         if let Some(expected) = expected_hash
             && (expected.len() != DIGEST_SIZE || expected != digest)
@@ -300,19 +322,14 @@ impl<F: OtaFlash> EspFirmwareWriter<F> {
     }
 }
 
-fn image_rejected(error: ImageError) -> FirmwareError {
-    log::warn!("[ESP OTA] staged image rejected: {:?}", error);
-    match error {
-        ImageError::TooSmall => FirmwareError::VerifyFailed,
-        _ => FirmwareError::VerifyFailed,
-    }
-}
-
 impl<F: OtaFlash> FirmwareWriter for EspFirmwareWriter<F> {
     /// Prepare for a download. No flash is erased here; see the module docs.
     fn erase_slot(&mut self) -> Result<(), FirmwareError> {
         self.reset_staging();
-        self.select_target_slot()?;
+        self.check_running_image().map_err(|error| {
+            log::error!("[ESP OTA] running-image evidence lost: {:?}", error);
+            FirmwareError::HardwareError
+        })?;
         self.state = State::Staging;
         log::info!(
             "[ESP OTA] staging into slot {} (running slot {})",
@@ -444,6 +461,20 @@ impl Default for EspOtaFlash {
 
 #[cfg(target_os = "none")]
 impl OtaFlash for EspOtaFlash {
+    fn running_slot(&mut self) -> Result<u8, RunningImageError> {
+        running_image::detect()
+    }
+
+    fn image_compatibility(&mut self) -> Result<ImageCompatibility, FirmwareError> {
+        use esp_hal::efuse::Efuse;
+        let (major, minor) = Efuse::block_version();
+        Ok(ImageCompatibility {
+            chip_id: crate::esp_image::EXPECTED_CHIP_ID,
+            chip_revision: Efuse::chip_revision(),
+            efuse_block_revision: major as u16 * 100 + minor as u16,
+        })
+    }
+
     fn read(&mut self, address: u32, buffer: &mut [u8]) -> Result<(), FirmwareError> {
         use embedded_storage::nor_flash::ReadNorFlash;
         self.flash
@@ -480,7 +511,8 @@ impl OtaFlash for EspOtaFlash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::esp_image::IMAGE_MAGIC;
+    use crate::esp_image::tests::{application as esp_image, compatibility, rehash};
+    use crate::esp_image::{EXPECTED_CHIP_ID, HEADER_SIZE, IMAGE_MAGIC};
     use crate::layout::{FLASH_SIZE, OTA_0_OFFSET, OTA_1_OFFSET, is_ota_writable};
     use crate::otadata::STATE_VALID;
     use crate::sha256::sha256;
@@ -492,6 +524,7 @@ mod tests {
         erased: Vec<u32>,
         writes: Vec<(u32, usize)>,
         fail_write_at: Option<u32>,
+        running: Result<u8, RunningImageError>,
     }
 
     impl MockFlash {
@@ -501,6 +534,7 @@ mod tests {
                 erased: Vec::new(),
                 writes: Vec::new(),
                 fail_write_at: None,
+                running: Ok(0),
             }
         }
 
@@ -528,6 +562,14 @@ mod tests {
     }
 
     impl OtaFlash for MockFlash {
+        fn running_slot(&mut self) -> Result<u8, RunningImageError> {
+            self.running
+        }
+
+        fn image_compatibility(&mut self) -> Result<ImageCompatibility, FirmwareError> {
+            Ok(compatibility())
+        }
+
         fn read(&mut self, address: u32, buffer: &mut [u8]) -> Result<(), FirmwareError> {
             let end = address as usize + buffer.len();
             assert!(end <= self.data.len(), "read out of flash");
@@ -575,21 +617,6 @@ mod tests {
         panic!("reset must not be called from a host test");
     }
 
-    /// Build a minimal but structurally valid ESP application image.
-    fn esp_image(chip_id: u16, payload_len: usize) -> Vec<u8> {
-        let mut image = vec![0u8; HEADER_SIZE + payload_len];
-        image[0] = IMAGE_MAGIC;
-        image[1] = 1; // one segment
-        image[12..14].copy_from_slice(&chip_id.to_le_bytes());
-        image[23] = 1; // hash appended
-        for (index, byte) in image[HEADER_SIZE..].iter_mut().enumerate() {
-            *byte = (index % 251) as u8;
-        }
-        let digest = sha256(&image);
-        image.extend_from_slice(&digest);
-        image
-    }
-
     fn new_writer(flash: MockFlash) -> EspFirmwareWriter<MockFlash> {
         EspFirmwareWriter::new(flash, never_resets).expect("writer")
     }
@@ -609,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn erased_otadata_stages_into_slot_one() {
+    fn actual_slot_zero_stages_into_slot_one() {
         let writer = new_writer(MockFlash::new());
         assert_eq!(writer.running_slot(), 0);
         assert_eq!(writer.target_slot(), 1);
@@ -620,14 +647,15 @@ mod tests {
     fn rejects_flash_without_the_required_partition_table() {
         assert!(matches!(
             EspFirmwareWriter::new(MockFlash::erased(), never_resets),
-            Err(FirmwareError::HardwareError)
+            Err(OtaInitError::Flash(FirmwareError::HardwareError))
         ));
     }
 
     #[test]
     fn running_slot_one_stages_into_slot_zero() {
-        // seq 2 -> slot (2 - 1) % 2 == 1
-        let writer = new_writer(MockFlash::with_otadata(2, 0));
+        let mut flash = MockFlash::new();
+        flash.running = Ok(1); // evidence, even with ERASED metadata
+        let writer = new_writer(flash);
         assert_eq!(writer.running_slot(), 1);
         assert_eq!(writer.target_slot(), 0);
     }
@@ -669,13 +697,10 @@ mod tests {
 
     #[test]
     fn ragged_blocks_are_reassembled_byte_exactly() {
-        // 48-byte Zigbee blocks over a payload whose length is not a multiple
-        // of four: every intermediate write must still be word aligned.
+        // ESP images are 16-byte aligned, but transport blocks need not be.
         let image = esp_image(EXPECTED_CHIP_ID, 501);
-        assert_ne!(image.len() % 4, 0, "test needs a ragged tail");
-
         let mut writer = new_writer(MockFlash::new());
-        stage(&mut writer, &image, 48).expect("staged");
+        stage(&mut writer, &image, 47).expect("staged");
 
         let staged = writer.flash.slice(OTA_1_OFFSET, image.len());
         assert_eq!(staged, image.as_slice());
@@ -904,6 +929,196 @@ mod tests {
         assert_eq!(
             writer.write_block(image.len() as u32, &[0u8; 4]),
             Err(FirmwareError::WriteFailed)
+        );
+    }
+
+    #[test]
+    fn bootloader_fallback_never_erases_the_executing_slot() {
+        // IDF 5.5.1 can fail the preferred image and fall back WITHOUT
+        // rewriting valid, non-erased otadata. Exercise both directions,
+        // erased metadata, and a restart after activation without a reset.
+        for actual in 0..2 {
+            for preferred_seq in [None, Some(1), Some(2)] {
+                let mut flash = match preferred_seq {
+                    Some(seq) => MockFlash::with_otadata(seq, 0),
+                    None => MockFlash::new(),
+                };
+                flash.running = Ok(actual);
+                let base = ota_slot_offset(actual) as usize;
+                flash.data[base..base + OTA_SLOT_SIZE as usize].fill(0xA5);
+                let mut writer = new_writer(flash);
+                assert_eq!(writer.running_slot(), actual);
+                assert_eq!(writer.target_slot(), 1 - actual);
+                let image = esp_image(EXPECTED_CHIP_ID, 8192);
+                for _ in 0..2 {
+                    stage(&mut writer, &image, 47).unwrap();
+                    writer.stage_activation().unwrap();
+                }
+                assert!(
+                    writer.flash.data[base..base + OTA_SLOT_SIZE as usize]
+                        .iter()
+                        .all(|byte| *byte == 0xA5)
+                );
+                for address in &writer.flash.erased {
+                    assert!(!(*address >= base as u32 && *address < base as u32 + OTA_SLOT_SIZE));
+                }
+                for (address, _) in &writer.flash.writes {
+                    assert!(!(*address >= base as u32 && *address < base as u32 + OTA_SLOT_SIZE));
+                }
+                assert_eq!(
+                    writer.read_otadata().unwrap().active_slot(),
+                    Some(1 - actual)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_evidence_defaults_to_typed_failure_before_any_flash_access() {
+        struct NoEvidence;
+        impl OtaFlash for NoEvidence {
+            fn read(&mut self, _: u32, _: &mut [u8]) -> Result<(), FirmwareError> {
+                panic!("must fail before flash access");
+            }
+            fn write(&mut self, _: u32, _: &[u8]) -> Result<(), FirmwareError> {
+                panic!("must never write");
+            }
+            fn erase_sector(&mut self, _: u32) -> Result<(), FirmwareError> {
+                panic!("must never erase");
+            }
+        }
+        assert!(matches!(
+            EspFirmwareWriter::new(NoEvidence, never_resets),
+            Err(OtaInitError::RunningImage(RunningImageError::Unavailable))
+        ));
+        let mut flash = MockFlash::new();
+        flash.running = Ok(2);
+        assert!(matches!(
+            EspFirmwareWriter::new(flash, never_resets),
+            Err(OtaInitError::RunningImage(
+                RunningImageError::OutsideOtaSlots
+            ))
+        ));
+    }
+
+    #[test]
+    fn lost_or_changed_running_evidence_fails_closed() {
+        for evidence in [Err(RunningImageError::Unavailable), Ok(1)] {
+            let mut writer = new_writer(MockFlash::new());
+            writer.flash.running = evidence;
+            assert_eq!(writer.erase_slot(), Err(FirmwareError::HardwareError));
+            assert_eq!(
+                writer.write_block(0, &[0; 4]),
+                Err(FirmwareError::WriteFailed)
+            );
+            assert!(writer.flash.erased.is_empty());
+            assert!(writer.flash.writes.is_empty());
+
+            let mut writer = new_writer(MockFlash::new());
+            stage(&mut writer, &esp_image(EXPECTED_CHIP_ID, 4), 48).unwrap();
+            let erases = writer.flash.erased.len();
+            let writes = writer.flash.writes.len();
+            writer.flash.running = evidence;
+            assert_eq!(
+                writer.stage_activation(),
+                Err(FirmwareError::ActivateFailed)
+            );
+            assert_eq!(writer.flash.erased.len(), erases);
+            assert_eq!(writer.flash.writes.len(), writes);
+        }
+    }
+
+    #[test]
+    fn original_public_repro_cannot_verify_or_activate() {
+        let mut image = vec![0; HEADER_SIZE + DIGEST_SIZE];
+        image[0] = IMAGE_MAGIC;
+        image[1] = 17;
+        image[12..14].copy_from_slice(&EXPECTED_CHIP_ID.to_le_bytes());
+        image[23] = 1;
+        rehash(&mut image);
+        let mut writer = new_writer(MockFlash::new());
+        assert_eq!(
+            stage(&mut writer, &image, 48),
+            Err(FirmwareError::VerifyFailed)
+        );
+        assert_eq!(
+            writer.stage_activation(),
+            Err(FirmwareError::ActivateFailed)
+        );
+        assert_eq!(writer.read_otadata().unwrap().active_slot(), None);
+        assert!(
+            writer
+                .flash
+                .erased
+                .iter()
+                .all(|address| *address >= OTA_1_OFFSET)
+        );
+    }
+
+    #[test]
+    fn hash_correct_but_checksum_invalid_cannot_activate() {
+        let mut image = esp_image(EXPECTED_CHIP_ID, 64);
+        let checksum = image.len() - DIGEST_SIZE - 1;
+        image[checksum] ^= 1;
+        rehash(&mut image);
+        let mut writer = new_writer(MockFlash::new());
+        assert_eq!(
+            stage(&mut writer, &image, 47),
+            Err(FirmwareError::VerifyFailed)
+        );
+        assert_eq!(
+            writer.stage_activation(),
+            Err(FirmwareError::ActivateFailed)
+        );
+        assert_eq!(writer.read_otadata().unwrap().active_slot(), None);
+    }
+
+    #[test]
+    fn activation_rechecks_flash_integrity_after_verification() {
+        let image = esp_image(EXPECTED_CHIP_ID, 64);
+        let mut writer = new_writer(MockFlash::new());
+        stage(&mut writer, &image, 48).unwrap();
+        writer.flash.data[OTA_1_OFFSET as usize + 300] ^= 1;
+        assert_eq!(writer.stage_activation(), Err(FirmwareError::VerifyFailed));
+        assert_eq!(writer.read_otadata().unwrap().active_slot(), None);
+    }
+
+    #[test]
+    fn partial_final_word_is_padded_but_not_accepted_as_an_image() {
+        let mut writer = new_writer(MockFlash::new());
+        writer.erase_slot().unwrap();
+        writer.write_block(0, &[1, 2, 3]).unwrap();
+        assert!(writer.flash.writes.is_empty());
+        assert_eq!(writer.verify(3, None), Err(FirmwareError::VerifyFailed));
+        assert_eq!(writer.flash.slice(OTA_1_OFFSET, 4), &[1, 2, 3, 0xFF]);
+        assert_eq!(
+            writer.stage_activation(),
+            Err(FirmwareError::ActivateFailed)
+        );
+    }
+
+    /// Explicit opt-in, never silently passes without a real generated file:
+    /// ESP_OTA_TEST_IMAGE=/path/to/espflash-save-image.app.bin cargo test ... \
+    ///   generated_application_image -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires ESP_OTA_TEST_IMAGE: real espflash-generated application binary"]
+    fn generated_application_image() {
+        let path = std::env::var("ESP_OTA_TEST_IMAGE").expect("set ESP_OTA_TEST_IMAGE");
+        let image = std::fs::read(&path).expect("read actual application image");
+        for actual in 0..2 {
+            let mut flash = MockFlash::with_otadata((2 - actual) as u32, 0);
+            flash.running = Ok(actual);
+            let mut writer = new_writer(flash);
+            stage(&mut writer, &image, 48).expect("real image verifies");
+            writer.stage_activation().expect("real image activates");
+            assert_eq!(
+                writer.flash.slice(ota_slot_offset(1 - actual), image.len()),
+                image
+            );
+        }
+        println!(
+            "verified and activated {} bytes in both slots: {path}",
+            image.len()
         );
     }
 }

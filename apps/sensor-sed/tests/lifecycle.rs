@@ -127,6 +127,7 @@ impl Diagnostics for RecordingDiagnostics<'_> {
 
 struct RecordingWake<'a> {
     now: u32,
+    activity_once: bool,
     batches: Vec<Vec<MacFrame>>,
     next_batch: usize,
     waits: &'a RefCell<Vec<WaitRequest>>,
@@ -144,6 +145,7 @@ impl<'a> RecordingWake<'a> {
     ) -> Self {
         Self {
             now,
+            activity_once: false,
             batches,
             next_batch: 0,
             waits,
@@ -183,10 +185,15 @@ impl WakeController<MockMac> for RecordingWake<'_> {
             }
         }
         self.next_batch = self.next_batch.saturating_add(1);
-        self.now = Self::add_ms(self.now, request.timeout_ms);
-        mac.delay_micros(request.timeout_ms.saturating_mul(1_000))
-            .await;
-        Ok(WakeReason::Timer)
+        let activity = core::mem::take(&mut self.activity_once);
+        let elapsed = if activity { 0 } else { request.timeout_ms };
+        self.now = Self::add_ms(self.now, elapsed);
+        mac.delay_micros(elapsed.saturating_mul(1_000)).await;
+        Ok(if activity {
+            WakeReason::Activity
+        } else {
+            WakeReason::Timer
+        })
     }
 
     async fn button_held_for(&mut self, _duration_ms: u32) -> bool {
@@ -1192,6 +1199,15 @@ fn each_step_has_one_bounded_four_round_poll_owner() {
 
 #[test]
 fn reporting_completion_uses_short_grace_then_the_slow_wait_depth() {
+    exercise_reporting_completion(false);
+}
+
+#[test]
+fn receive_activity_without_sleep_is_processed_before_rechecking_idle() {
+    exercise_reporting_completion(true);
+}
+
+fn exercise_reporting_completion(activity: bool) {
     let waits = RefCell::new(Vec::new());
     let poll_counts = RefCell::new(Vec::new());
     let delay_calls = Cell::new(0);
@@ -1212,7 +1228,8 @@ fn reporting_completion_uses_short_grace_then_the_slow_wait_depth() {
 
     {
         let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
-        let wake = RecordingWake::new(0, vec![reports], &waits, &poll_counts, &delay_calls);
+        let mut wake = RecordingWake::new(0, vec![reports], &waits, &poll_counts, &delay_calls);
+        wake.activity_once = activity;
         let mut app = SensorApp::new(
             node,
             &BASE_POLICY,
@@ -1269,6 +1286,41 @@ fn reporting_completion_uses_short_grace_then_the_slow_wait_depth() {
             expected: 3,
         }
     )));
+}
+
+#[test]
+fn unconfirmed_aps_delivery_vetoes_idle_until_confirmed_or_cancelled() {
+    let profile = test_profile();
+    let mut device = test_device(&profile, &BASE_POLICY);
+    assert!(!device.has_pending_protocol_work());
+    assert!(
+        device
+            .bdb_mut()
+            .zdo_mut()
+            .aps_mut()
+            .register_ack_pending(7, 0x1234, &[0, 1, 2])
+            .is_some()
+    );
+    assert!(device.has_pending_protocol_work());
+    assert!(!device.bdb_mut().zdo_mut().aps_mut().confirm_ack(0x5678, 7));
+    assert!(device.has_pending_protocol_work());
+    assert!(device.bdb_mut().zdo_mut().aps_mut().confirm_ack(0x1234, 7));
+    assert!(!device.has_pending_protocol_work());
+    assert!(
+        device
+            .bdb_mut()
+            .zdo_mut()
+            .aps_mut()
+            .register_ack_pending(8, 0x1234, &[0, 1, 2])
+            .is_some()
+    );
+    assert!(device.has_pending_protocol_work());
+    device
+        .bdb_mut()
+        .zdo_mut()
+        .aps_mut()
+        .cancel_all_ack_tracking();
+    assert!(!device.has_pending_protocol_work());
 }
 
 #[test]

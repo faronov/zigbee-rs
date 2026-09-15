@@ -39,16 +39,16 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 mod chip_temperature;
 mod platform;
-mod time_driver;
 
 include!(concat!(env!("OUT_DIR"), "/firmware_version.rs"));
 
 use chip_temperature::H2TemperatureSensor;
+use esp32_zigbee_devkit_product::wake::SensorWake;
 use esp_backtrace as _;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
-use platform::{ActiveLowStatus, ActiveWake, EspDiagnostics, EspSupervisor, H2Environment};
+use platform::{ActiveLowStatus, EspDiagnostics, EspSupervisor, H2Environment};
 
-use embassy_futures::block_on;
+use esp32_zigbee_devkit_product::executor::block_on;
 use sensor_sed_app::{FixedBattery, SensorApp, SensorSedParts, ToggleJoinAction};
 use static_cell::StaticCell;
 
@@ -59,7 +59,7 @@ use zigbee_runtime::ZigbeeDevice;
 use zigbee_zcl::clusters::basic::PowerSource;
 
 type H2Parts = SensorSedParts<
-    ActiveWake<'static>,
+    SensorWake<'static>,
     ActiveLowStatus<'static>,
     H2Environment,
     FixedBattery,
@@ -101,7 +101,21 @@ fn main() -> ! {
     log::set_max_level(log::LevelFilter::Info);
 
     // Start embassy time driver
-    time_driver::init();
+    product::time_driver::init(peripherals.SYSTIMER);
+
+    #[cfg(feature = "light-sleep")]
+    let sleep = Some(product::sleep::LightSleep::new(
+        esp_hal::rtc_cntl::Rtc::new(peripherals.LPWR),
+        peripherals.LP_TIMER,
+        peripherals.PMU,
+        peripherals.LP_AON,
+    ));
+    #[cfg(not(feature = "light-sleep"))]
+    let sleep = None;
+    esp_println::println!(
+        "[ESP32-H2] retained light sleep: {}",
+        cfg!(feature = "light-sleep")
+    );
 
     esp_println::println!("[ESP32-H2] Zigbee Sensor starting");
 
@@ -203,7 +217,7 @@ fn main() -> ! {
 
     let node = ZigbeeNode::new(device, security, profile);
     let parts = SensorSedParts {
-        wake: ActiveWake::new(button),
+        wake: SensorWake::new(button, sleep),
         status: ActiveLowStatus::new(led),
         environment: H2Environment::new(temp_sensor),
         battery: FixedBattery::new(

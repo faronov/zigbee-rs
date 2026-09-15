@@ -37,7 +37,30 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use esp_radio::ieee802154::{Config, Error, Ieee802154};
+use esp_radio::ieee802154::{Config, Ieee802154, SuspendError};
+
+#[derive(Debug)]
+pub enum Error {
+    Radio(esp_radio::ieee802154::Error),
+    InvalidLength,
+    TransmitTimeout,
+}
+
+impl From<esp_radio::ieee802154::Error> for Error {
+    fn from(error: esp_radio::ieee802154::Error) -> Self {
+        Self::Radio(error)
+    }
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Radio(error) => write!(f, "{error}"),
+            Self::InvalidLength => f.write_str("invalid IEEE 802.15.4 frame length"),
+            Self::TransmitTimeout => f.write_str("transmission completion timed out"),
+        }
+    }
+}
 
 /// TX completion flag — set by ISR callback, cleared before TX.
 static TX_COMPLETE: AtomicBool = AtomicBool::new(false);
@@ -176,6 +199,9 @@ impl<'a> Ieee802154Driver<'a> {
     /// INCLUDING FCS. We add +2 padding so the full frame is transmitted.
     /// Uses TX-done callback for precise completion detection (~500µs typical).
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
+        if frame.len() > 125 {
+            return Err(Error::InvalidLength);
+        }
         let mut padded = [0u8; 129];
         padded[..frame.len()].copy_from_slice(frame);
 
@@ -198,8 +224,9 @@ impl<'a> Ieee802154Driver<'a> {
         if timed_out {
             // The radio is stuck in `Transmit`; esp-radio's abort handlers only
             // clear status bits and never re-arm, so force RX back on.
-            log::warn!("[ESP TX] no TX-done within 10ms, forcing RX re-arm");
-            self.rearm_receive();
+            log::warn!("[ESP TX] no TX-done within 10ms, cancelling failed TX");
+            self.driver.cancel_transmit();
+            return Err(Error::TransmitTimeout);
         }
         // On the normal path the ISR already put us back into RX
         // (`rx_when_idle`), so nothing to do — and calling `start_receive()`
@@ -207,6 +234,20 @@ impl<'a> Ieee802154Driver<'a> {
         // in the meantime.
 
         Ok(())
+    }
+
+    pub fn try_suspend(&mut self) -> Result<(), SuspendError> {
+        if !self.pending.is_empty() {
+            return Err(SuspendError::PendingReceive);
+        }
+        self.driver.try_suspend()?;
+        self.rx_armed = false;
+        Ok(())
+    }
+
+    pub fn resume(&mut self) {
+        self.driver.resume();
+        self.rx_armed = true;
     }
 
     /// Transmit a frame that requested an acknowledgement and wait for the ACK.
