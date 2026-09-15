@@ -48,6 +48,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Test ESP application image preflight
         run: python3 -m unittest discover -s products/esp32-zigbee-devkit/partitions -p 'test_esp_app_image.py' -v
+      - name: Test fail-closed Pages firmware publication
+        run: python3 -m unittest discover -s tools -p 'test_prepare_pages.py' -v
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -1337,13 +1339,20 @@ jobs:
           if-no-files-found: error
 
   # ── Deploy Book + Web Flasher to GitHub Pages ────────────────
-  # Builds the mdBook documentation and bundles it with the
-  # ESP web flasher and latest firmware binaries.
+  # Documentation may publish after core checks pass. Firmware is included
+  # only when every original firmware dependency passes; otherwise install is disabled.
   deploy-site:
     name: Deploy Site
-    needs: [check, test, clippy, fmt, build-esp32c6, build-esp32h2, build-bl702]
+    needs: [check, test, clippy, fmt, doc, build-esp32c6, build-esp32h2, build-bl702]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    if: >-
+      ${{
+        !cancelled() && github.event_name == 'push' &&
+        (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') &&
+        needs.check.result == 'success' && needs.test.result == 'success' &&
+        needs.clippy.result == 'success' && needs.fmt.result == 'success' &&
+        needs.doc.result == 'success'
+      }}
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -1359,41 +1368,31 @@ jobs:
         run: mdbook build docs/book
 
       - name: Download ESP32-C6 firmware
+        if: needs.build-esp32c6.result == 'success' && needs.build-esp32h2.result == 'success' && needs.build-bl702.result == 'success'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: esp32c6-sensor-firmware
-          path: docs/flasher/firmware
+          path: ${{ runner.temp }}/pages-firmware
 
       - name: Download ESP32-H2 firmware
+        if: needs.build-esp32c6.result == 'success' && needs.build-esp32h2.result == 'success' && needs.build-bl702.result == 'success'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: esp32h2-sensor-firmware
-          path: docs/flasher/firmware
-
-      - name: Generate firmware manifest
-        run: |
-          cat > docs/flasher/manifest.json << 'EOF'
-          {
-            "name": "Zigbee-RS Sensor Firmware",
-            "version": "${{ github.sha }}",
-            "builds": [
-              {
-                "chipFamily": "ESP32-C6",
-                "parts": [{ "path": "./firmware/esp32c6-sensor.bin", "offset": 0 }]
-              },
-              {
-                "chipFamily": "ESP32-H2",
-                "parts": [{ "path": "./firmware/esp32h2-sensor.bin", "offset": 0 }]
-              }
-            ]
-          }
-          EOF
+          path: ${{ runner.temp }}/pages-firmware
 
       - name: Assemble site
+        env:
+          C6_RESULT: ${{ needs.build-esp32c6.result }}
+          H2_RESULT: ${{ needs.build-esp32h2.result }}
+          BL702_RESULT: ${{ needs.build-bl702.result }}
         run: |
-          mkdir -p _site
-          cp -r docs/book/book/* _site/
-          cp -r docs/flasher _site/flasher
+          python3 tools/prepare-pages.py \
+            --book docs/book/book --flasher docs/flasher/index.html \
+            --firmware "$RUNNER_TEMP/pages-firmware" --output _site \
+            --revision "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
+            --esp32c6-result "$C6_RESULT" --esp32h2-result "$H2_RESULT" \
+            --bl702-result "$BL702_RESULT"
 
       - name: Setup Pages
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5

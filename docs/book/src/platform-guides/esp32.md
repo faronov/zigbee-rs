@@ -152,6 +152,14 @@ To build the retained-sleep variant in either example directory, add
 or network persistence. CI links both opt-in images and runs the real-image
 OTA corpus separately from the default images, with unchanged size budgets.
 
+Documentation can be published after its core/code checks pass even when a
+firmware size gate fails. In that case the site includes no prebuilt ESP
+binaries, its firmware manifest has no builds, and one-click installation is
+disabled with a link to the failing CI run. The existing ESP32-C6, ESP32-H2 and
+BL702 job gates must all pass before prebuilt ESP firmware is published.
+The flasher's custom-file mode remains an explicit user-supplied operation,
+not a qualification of that file or automatic flashing.
+
 The configured runner installs the product partition table, writes `ota_0`,
 and clears `otadata`:
 
