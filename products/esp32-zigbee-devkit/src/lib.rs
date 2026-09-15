@@ -35,10 +35,22 @@ compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 #[cfg(not(any(feature = "esp32c6", feature = "esp32h2")))]
 compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 
+#[cfg(any(target_os = "none", test))]
+pub mod executor;
 pub mod migration;
+pub mod policy;
 pub mod profile;
+pub mod sleep;
 #[cfg(target_os = "none")]
 pub mod storage;
+#[cfg(any(target_os = "none", test))]
+pub mod time_driver;
+#[cfg(any(target_os = "none", test))]
+pub mod wake;
+
+#[cfg(test)]
+#[path = "../../../vendor/esp-radio/src/ieee802154/suspend.rs"]
+mod radio_suspend_tests;
 
 #[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod esp_image;

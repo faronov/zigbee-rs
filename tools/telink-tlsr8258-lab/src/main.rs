@@ -17,7 +17,10 @@
 
 #![no_std]
 #![no_main]
-#![cfg_attr(feature = "diag-pm", allow(dead_code, unused_assignments))]
+#![cfg_attr(
+    any(feature = "diag-pm", feature = "diag-retention"),
+    allow(dead_code, unused_assignments, unused_variables)
+)]
 
 // `diag-smoke` is a standalone diagnostic build that exercises flash + Timer0
 // + IEEE-from-flash on hardware. It must not coexist with the normal sensor
@@ -33,6 +36,15 @@ compile_error!(
     "feature `diag-pm` is mutually exclusive with `sensor`; \
      build with `--no-default-features --features diag-pm`"
 );
+
+#[cfg(all(feature = "diag-retention", feature = "sensor"))]
+compile_error!(
+    "feature `diag-retention` is mutually exclusive with `sensor`; \
+     build with `--no-default-features --features diag-retention`"
+);
+
+#[cfg(all(feature = "diag-retention", feature = "diag-pm"))]
+compile_error!("select exactly one of `diag-pm` and `diag-retention`");
 
 // Custom panic handler that records a panic-sentinel in SRAM so we can detect
 // silent panics via the dump tool. Writes:
@@ -375,6 +387,8 @@ core::arch::global_asm!(
     // initialization. A non-zero retention mode skips .data copy and .bss
     // clear so the LOW32K state survives the wake reboot.
     "tjl _is_retention_boot",
+    "cmp r0, #2",
+    "beq 5f",
     "cmp r0, #0",
     "bne 4f",
     "ldr r0, =_sdata",
@@ -410,20 +424,37 @@ core::arch::global_asm!(
     "ldr r1, =0x57A70013",
     "str r1, [r0, #0]",
     "tjl _rust_entry",
+    "5:",
+    "tjl _retention_probe_fault",
 );
 
 #[unsafe(no_mangle)]
 extern "C" fn _is_retention_boot() -> u32 {
-    #[cfg(feature = "diag-pm")]
+    #[cfg(feature = "diag-retention")]
     {
-        return u32::from(
-            tlsr8258_hal::mmio::analog_read(0x7e)
-                .map(|mode| mode != 0)
-                .unwrap_or(false),
-        );
+        let result = match tlsr8258_hal::mmio::analog_read(0x7e) {
+            Ok(0) => 0,
+            Ok(tlsr8258_hal::pm::DEEPSLEEP_MODE_RET_SRAM_LOW32K) => 1,
+            Ok(_) | Err(_) => 2,
+        };
+        if result != 0 {
+            tlsr8258_hal::mmio::disable_all_irqs();
+        }
+        return result;
     }
-    #[cfg(not(feature = "diag-pm"))]
+    #[cfg(not(feature = "diag-retention"))]
     0
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn _retention_probe_fault() -> ! {
+    unsafe {
+        core::ptr::write_volatile(0x0084F1F0 as *mut u32, 0x5254_F001);
+        core::ptr::write_volatile(0x0080006f as *mut u8, 0x20);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// Rust entry point — called from the assembly startup after RAM init.
@@ -437,7 +468,7 @@ pub unsafe extern "C" fn _rust_entry() -> ! {
 //
 // Direct MMIO based on Telink C SDK. No HAL dependency for boot.
 
-#[cfg(feature = "diag-pm")]
+#[cfg(any(feature = "diag-pm", feature = "diag-retention"))]
 #[inline(never)]
 fn chip_init() {
     if tlsr8258_hal::clocks::init().is_err() {
@@ -466,7 +497,7 @@ fn chip_init() {
     tlsr8258_hal::timer::init();
 }
 
-#[cfg(not(feature = "diag-pm"))]
+#[cfg(not(any(feature = "diag-pm", feature = "diag-retention")))]
 #[inline(never)]
 fn chip_init() {
     let pc_out = (REG_BASE + 0x593) as *mut u8;
@@ -7041,9 +7072,13 @@ fn main_loop() -> ! {
     #[cfg(all(not(feature = "sensor"), feature = "diag-pm"))]
     diag_pm_main();
 
+    #[cfg(all(not(feature = "sensor"), feature = "diag-retention"))]
+    diag_retention_main();
+
     #[cfg(all(
         not(feature = "sensor"),
         not(feature = "diag-pm"),
+        not(feature = "diag-retention"),
         feature = "diag-smoke",
     ))]
     diag_smoke_main();
@@ -7051,6 +7086,7 @@ fn main_loop() -> ! {
     #[cfg(all(
         not(feature = "sensor"),
         not(feature = "diag-pm"),
+        not(feature = "diag-retention"),
         not(feature = "diag-smoke"),
         feature = "diag-assoc",
     ))]
@@ -7059,12 +7095,17 @@ fn main_loop() -> ! {
     #[cfg(all(
         not(feature = "sensor"),
         not(feature = "diag-pm"),
+        not(feature = "diag-retention"),
         not(feature = "diag-smoke"),
         not(feature = "diag-assoc"),
     ))]
     executor::block_on(diag_beacon_main(rx_buf));
 
-    #[cfg(all(not(feature = "sensor"), not(feature = "diag-pm")))]
+    #[cfg(all(
+        not(feature = "sensor"),
+        not(feature = "diag-pm"),
+        not(feature = "diag-retention")
+    ))]
     loop {}
 }
 
@@ -7126,95 +7167,32 @@ fn diag_pm_error_code(error: tlsr8258_hal::pm::PmError) -> u32 {
         PmError::EmptyWakeSource => 0x0B,
         PmError::UnsupportedWakeSource => 0x0C,
         PmError::PadWakePortUnsupported => 0x0D,
-    }
-}
-
-#[cfg(feature = "diag-pm")]
-fn diag_pm_record_wake(cycle: u32, status: u8, entered: bool) {
-    const PM_BASE: u32 = DBG_MODE_BASE + 0x80;
-
-    let retained = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PM_CANARY)) };
-    let expected = 0xC0DE_0000 ^ cycle;
-    let post_offset = 0x20 + (cycle - 1) * 0x20;
-
-    mark32(PM_BASE + 0x00, 0x504D_2000);
-    mark32(PM_BASE + 0x08, cycle);
-    mark32(PM_BASE + 0x1C, u32::from(status));
-    mark32(PM_BASE + 0x20, retained);
-    if !diag_pm_log(
-        post_offset,
-        0x504D_2000 | cycle,
-        retained,
-        u32::from(status),
-    ) {
-        diag_pm_fail(0x305);
-    }
-    if retained != expected {
-        diag_pm_fail(0x300);
-    }
-    if !entered {
-        diag_pm_fail(0x301);
-    }
-    if status & tlsr8258_hal::pm::WAKEUP_STATUS_TIMER == 0 {
-        diag_pm_fail(0x302 | (u32::from(status) << 8));
-    }
-    if tlsr8258_hal::pm::write_retention(tlsr8258_hal::pm::RetentionRegister::Reg7, status).is_err()
-    {
-        diag_pm_fail(0x303);
+        PmError::RetentionRecordInvalid => 0x0E,
+        PmError::RetentionModeMissing => 0x0F,
+        PmError::RetentionWakeInvalid => 0x10,
     }
 }
 
 #[cfg(feature = "diag-pm")]
 fn diag_pm_main() -> ! {
-    use tlsr8258_hal::mmio::{REG_BASE, r32};
-    use tlsr8258_hal::pm::{self, RetentionRegister};
+    use tlsr8258_hal::pm::{self, SuspendTransactionPhase};
+    use zigbee_mac::telink::TelinkMac;
+    use zigbee_mac::{PibAttribute, PibValue};
 
     const PM_BASE: u32 = DBG_MODE_BASE + 0x80;
-    const REG_SYSTEM_TICK: u32 = REG_BASE + 0x740;
-    const ONE_SECOND_TICKS: u32 = 16_000_000;
+    const SUSPEND_MS: u32 = 250;
+    const SUSPEND_SYSTEM_TICKS: u32 = pm::system_timer_ms(SUSPEND_MS);
+    const MIN_TIMER0_ELAPSED: u32 = tlsr8258_hal::timer::ms(SUSPEND_MS);
+    const MAX_TIMER0_ELAPSED: u32 = tlsr8258_hal::timer::ms(500);
     const TEST_CYCLES: u32 = 4;
 
-    let retention_boot = tlsr8258_hal::mmio::analog_read(0x7e)
-        .map(|mode| mode != 0)
-        .unwrap_or(false);
-    if !retention_boot {
-        let peripherals =
-            tlsr8258_hal::peripherals::Peripherals::take().unwrap_or_else(|| diag_pm_fail(0x060));
-        let adc = tlsr8258_hal::adc::Adc::new(
-            peripherals.adc,
-            tlsr8258_hal::flash::FlashGeometry::KiB512,
-        )
-        .unwrap_or_else(|_| diag_pm_fail(0x061));
-        adc.install_flash_voltage_guard(peripherals.pins.pc5)
-            .unwrap_or_else(|_| diag_pm_fail(0x062));
-    }
-
-    if retention_boot {
-        let cycle = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PM_CYCLE)) };
-        if cycle == 0 || cycle > TEST_CYCLES {
-            diag_pm_fail(0x071);
-        }
-        let status = tlsr8258_hal::mmio::analog_read(0x44).unwrap_or_else(|_| diag_pm_fail(0x072));
-        diag_pm_record_wake(cycle, status, true);
-        if cycle >= TEST_CYCLES {
-            let _ = diag_pm_log(0x090, 0x504D_600D, cycle, 0);
-            mark32(PM_BASE + 0x00, 0x504D_600D);
-            board::LED_BLUE.write(true);
-            loop {
-                unsafe { core::arch::asm!("nop") };
-            }
-        }
-    } else {
-        mark32(PM_BASE + 0x00, 0x504D_0002);
-        if tlsr8258_hal::flash::erase_sector(PM_LOG_SECTOR).is_err()
-            || !diag_pm_log(0, 0x504D_0002, 0, 0)
-        {
-            diag_pm_fail(0x070);
-        }
-        unsafe {
-            core::ptr::write_volatile(core::ptr::addr_of_mut!(PM_CYCLE), 0);
-        }
-    }
+    let peripherals =
+        tlsr8258_hal::peripherals::Peripherals::take().unwrap_or_else(|| diag_pm_fail(0x060));
+    let adc =
+        tlsr8258_hal::adc::Adc::new(peripherals.adc, tlsr8258_hal::flash::FlashGeometry::KiB512)
+            .unwrap_or_else(|_| diag_pm_fail(0x061));
+    adc.install_flash_voltage_guard(peripherals.pins.pc5)
+        .unwrap_or_else(|_| diag_pm_fail(0x062));
 
     if let Err(error) = pm::system_timer_init() {
         diag_pm_fail(0x080 | diag_pm_error_code(error));
@@ -7227,15 +7205,31 @@ fn diag_pm_main() -> ! {
     {
         diag_pm_fail(0x102);
     }
-    mark32(PM_BASE + 0x00, 0x504D_0002);
+
+    mark32(PM_BASE + 0x00, 0x504D_0003);
+    if tlsr8258_hal::flash::erase_sector(PM_LOG_SECTOR).is_err()
+        || !diag_pm_log(0, 0x504D_0003, SUSPEND_MS, TEST_CYCLES)
+    {
+        diag_pm_fail(0x070);
+    }
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(PM_CYCLE), 0);
+    }
+
+    // Exercise the same reusable MAC hooks as the production sensor. The
+    // fixed local EUI is diagnostic-only and never joins or writes security
+    // state.
+    let mut mac = TelinkMac::with_extended_address([0x02, 0, 0, 0, 0, 0, 0, 0x82]);
+    if executor::block_on(mac.mlme_set(PibAttribute::PhyCurrentChannel, PibValue::U8(15))).is_err()
+    {
+        diag_pm_fail(0x110);
+    }
 
     board::LED_RED.write(false);
     board::LED_GREEN.write(true);
     board::LED_BLUE.write(false);
 
-    loop {
-        let cycle =
-            unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PM_CYCLE)).wrapping_add(1) };
+    for cycle in 1..=TEST_CYCLES {
         unsafe {
             core::ptr::write_volatile(core::ptr::addr_of_mut!(PM_CYCLE), cycle);
         }
@@ -7243,58 +7237,363 @@ fn diag_pm_main() -> ! {
         unsafe {
             core::ptr::write_volatile(core::ptr::addr_of_mut!(PM_CANARY), canary);
         }
-        if pm::write_retention(RetentionRegister::Reg6, cycle as u8).is_err() {
-            diag_pm_fail(0x101);
-        }
-        if tlsr8258_hal::mmio::analog_write(pm::DEEP_ANA_REG0, 0x80 | (cycle as u8 & 0x3F)).is_err()
-        {
-            diag_pm_fail(0x103);
-        }
 
-        let before = unsafe { r32(REG_SYSTEM_TICK) };
-        let wakeup_tick = before.wrapping_add(ONE_SECOND_TICKS);
-        let pre_offset = 0x10 + (cycle - 1) * 0x20;
-        if !diag_pm_log(pre_offset, 0x504D_1000 | cycle, before, wakeup_tick) {
-            diag_pm_fail(0x104);
-        }
-        if cycle == 1 {
-            let calib = unsafe { r32(REG_BASE + 0x750) };
-            let tick_32k = match (
-                tlsr8258_hal::mmio::analog_read(0x43),
-                tlsr8258_hal::mmio::analog_read(0x42),
-                tlsr8258_hal::mmio::analog_read(0x41),
-                tlsr8258_hal::mmio::analog_read(0x40),
-            ) {
-                (Ok(b3), Ok(b2), Ok(b1), Ok(b0)) => {
-                    (u32::from(b3) << 24)
-                        | (u32::from(b2) << 16)
-                        | (u32::from(b1) << 8)
-                        | u32::from(b0)
-                }
-                _ => diag_pm_fail(0x105),
-            };
-            let target_32k = pm::calc::target_32k_short(
-                pm::calc::adjusted_wake_tick(wakeup_tick),
-                before.wrapping_add(pm::calc::TICK_SETUP_OFFSET),
-                calib as u16,
-                tick_32k,
-            )
-            .unwrap_or_else(|| diag_pm_fail(0x106));
-            if !diag_pm_log(0x0A0, 0x504D_3001, calib, tick_32k)
-                || !diag_pm_log(0x0B0, 0x504D_3002, target_32k, 0)
-            {
-                diag_pm_fail(0x107);
-            }
-        }
+        let app_before_us = mac.monotonic_micros();
+        let mut timer0_before = 0;
+        let mut system_before = 0;
+        let mut rebased_timer0 = 0;
+        let mut hook_flags = 0u32;
+
         mark32(PM_BASE + 0x08, cycle);
-        mark32(PM_BASE + 0x0C, before);
-        mark32(PM_BASE + 0x10, wakeup_tick);
         mark32(PM_BASE + 0x00, 0x504D_1000);
 
-        match pm::cpu_sleep_timer_rc(wakeup_tick) {
-            Ok(never) => match never {},
-            Err(error) => diag_pm_fail(0x200 | diag_pm_error_code(error)),
+        let status =
+            pm::cpu_suspend_timer_rc_transaction(SUSPEND_SYSTEM_TICKS, |phase| match phase {
+                SuspendTransactionPhase::Prepare => {
+                    if hook_flags != 0 {
+                        hook_flags |= 0x100;
+                    }
+                    timer0_before = tlsr8258_hal::timer::now_ticks();
+                    system_before = pm::system_timer_ticks();
+                    mac.prepare_for_sleep();
+                    hook_flags |= 0x01;
+                }
+                SuspendTransactionPhase::Restore => {
+                    if hook_flags != 0x01 {
+                        hook_flags |= 0x200;
+                    }
+                    mac.resume_after_sleep();
+                    let elapsed_system = pm::system_timer_ticks().wrapping_sub(system_before);
+                    rebased_timer0 =
+                        tlsr8258_hal::timer::rebase_after_suspend(timer0_before, elapsed_system);
+                    hook_flags |= 0x02;
+                }
+            })
+            .unwrap_or_else(|error| diag_pm_fail(0x200 | diag_pm_error_code(error)));
+
+        let retained = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PM_CANARY)) };
+        let timer0_after = tlsr8258_hal::timer::now_ticks();
+        let timer0_elapsed = timer0_after.wrapping_sub(timer0_before);
+        let app_elapsed_us = mac.monotonic_micros().wrapping_sub(app_before_us);
+
+        mark32(PM_BASE + 0x0C, system_before);
+        mark32(PM_BASE + 0x10, timer0_before);
+        mark32(PM_BASE + 0x14, rebased_timer0);
+        mark32(PM_BASE + 0x18, timer0_after);
+        mark32(PM_BASE + 0x1C, u32::from(status.raw()));
+        mark32(PM_BASE + 0x20, retained);
+        mark32(PM_BASE + 0x24, timer0_elapsed);
+        mark32(PM_BASE + 0x28, hook_flags);
+        mark32(PM_BASE + 0x2C, app_elapsed_us);
+
+        if retained != canary {
+            diag_pm_fail(0x300);
         }
+        if hook_flags != 0x03 {
+            diag_pm_fail(0x301 | (hook_flags << 8));
+        }
+        if !status.entered_low_power() {
+            diag_pm_fail(0x302);
+        }
+        if !status.woke_by_timer() {
+            diag_pm_fail(0x303 | (u32::from(status.raw()) << 8));
+        }
+        if timer0_elapsed < MIN_TIMER0_ELAPSED || timer0_elapsed > MAX_TIMER0_ELAPSED {
+            diag_pm_fail(0x304);
+        }
+        if app_elapsed_us < SUSPEND_MS * 1_000 || app_elapsed_us > 500_000 {
+            diag_pm_fail(0x305);
+        }
+
+        // A bounded receive immediately after wake exercises the restored RF
+        // path. NoData and a valid received frame are both healthy outcomes.
+        match executor::block_on(mac.mcps_data_indication_timeout(1_000)) {
+            Ok(_) | Err(MacError::NoData) => {}
+            Err(_) => diag_pm_fail(0x306),
+        }
+        if executor::block_on(mac.mlme_set(PibAttribute::PhyCurrentChannel, PibValue::U8(15)))
+            .is_err()
+        {
+            diag_pm_fail(0x307);
+        }
+
+        let log_offset = 0x10 + (cycle - 1) * 0x20;
+        if !diag_pm_log(
+            log_offset,
+            0x504D_2000 | cycle,
+            timer0_elapsed,
+            (u32::from(status.raw()) << 24) | app_elapsed_us.min(0x00FF_FFFF),
+        ) {
+            diag_pm_fail(0x308);
+        }
+    }
+
+    let _ = diag_pm_log(0x090, 0x504D_600D, TEST_CYCLES, SUSPEND_MS);
+    mark32(PM_BASE + 0x00, 0x504D_600D);
+    board::LED_BLUE.write(true);
+    loop {
+        unsafe { core::arch::asm!("nop") };
+    }
+}
+
+// ─── LOW32K reset-on-wake harness ─────────────────────────────────────────
+
+#[cfg(feature = "diag-retention")]
+struct RetentionLabCell<T>(core::cell::UnsafeCell<core::mem::MaybeUninit<T>>);
+#[cfg(feature = "diag-retention")]
+unsafe impl<T> Sync for RetentionLabCell<T> {}
+
+#[cfg(feature = "diag-retention")]
+impl<T> RetentionLabCell<T> {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()))
+    }
+
+    unsafe fn initialize(&'static self, value: T) -> &'static mut T {
+        unsafe { (&mut *self.0.get()).write(value) }
+    }
+
+    unsafe fn get(&'static self) -> &'static mut T {
+        unsafe { (&mut *self.0.get()).assume_init_mut() }
+    }
+}
+
+#[cfg(feature = "diag-retention")]
+const RETENTION_LAB_MAGIC: u32 = 0x5254_4c31; // "RTL1"
+#[cfg(feature = "diag-retention")]
+const RETENTION_LAB_CANARY: u32 = 0xc0de_32a5;
+#[cfg(feature = "diag-retention")]
+const RETENTION_LAB_CYCLES: u32 = 4;
+#[cfg(feature = "diag-retention")]
+const RETENTION_LAB_MS: u32 = 250;
+
+#[cfg(feature = "diag-retention")]
+#[repr(C)]
+struct RetentionLabState {
+    marker: u32,
+    marker_inverse: u32,
+    cycle: u32,
+    canary: u32,
+    mac_before_us: u32,
+    record: tlsr8258_hal::pm::Low32kResumeRecord,
+}
+
+#[cfg(feature = "diag-retention")]
+impl RetentionLabState {
+    const fn invalid() -> Self {
+        Self {
+            marker: 0,
+            marker_inverse: !0,
+            cycle: 0,
+            canary: 0,
+            mac_before_us: 0,
+            record: tlsr8258_hal::pm::Low32kResumeRecord::new(),
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.marker == RETENTION_LAB_MAGIC
+            && self.marker_inverse == !RETENTION_LAB_MAGIC
+            && self.canary == RETENTION_LAB_CANARY
+            && self.cycle < RETENTION_LAB_CYCLES
+            && self.record.is_armed_and_valid()
+    }
+}
+
+#[cfg(feature = "diag-retention")]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".retained.lab")]
+static TELINK_RETENTION_LAB_STATE: RetentionLabCell<RetentionLabState> =
+    RetentionLabCell::new();
+
+#[cfg(feature = "diag-retention")]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".retained.lab")]
+static TELINK_RETENTION_LAB_MAC: RetentionLabCell<zigbee_mac::telink::TelinkMac> =
+    RetentionLabCell::new();
+
+#[cfg(feature = "diag-retention")]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".retained.lab")]
+static TELINK_RETENTION_LAB_STATUS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "diag-retention")]
+unsafe extern "C" {
+    static _retention_stack_guard_start_: u8;
+    static _retention_stack_guard_end_: u8;
+}
+
+#[cfg(feature = "diag-retention")]
+fn retention_lab_guard(fill: bool) -> bool {
+    let mut cursor = core::ptr::addr_of!(_retention_stack_guard_start_) as *mut u8;
+    let end = core::ptr::addr_of!(_retention_stack_guard_end_) as *mut u8;
+    while cursor < end {
+        if fill {
+            unsafe { core::ptr::write_volatile(cursor, 0xa5) };
+        } else if unsafe { core::ptr::read_volatile(cursor) } != 0xa5 {
+            return false;
+        }
+        cursor = unsafe { cursor.add(1) };
+    }
+    true
+}
+
+#[cfg(feature = "diag-retention")]
+fn diag_retention_fail(code: u32) -> ! {
+    TELINK_RETENTION_LAB_STATUS.store(0xdead_0000 | (code & 0xffff), Ordering::SeqCst);
+    mark32(DBG_MODE_BASE + 0x80, 0x5254_dead);
+    mark32(DBG_MODE_BASE + 0x84, code);
+    board::LED_GREEN.write(false);
+    board::LED_BLUE.write(false);
+    board::LED_RED.write(true);
+    let _ = tlsr8258_hal::mmio::analog_write(0x7e, 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(feature = "diag-retention")]
+fn diag_retention_enter(
+    state: &'static mut RetentionLabState,
+    mac: &'static mut zigbee_mac::telink::TelinkMac,
+) -> ! {
+    use tlsr8258_hal::pm::{self, SuspendTransactionPhase};
+
+    state.mac_before_us = mac.monotonic_micros();
+    TELINK_RETENTION_LAB_STATUS.store(0x5254_1000 | state.cycle, Ordering::SeqCst);
+    let mut timer0_before = 0;
+    let mut system_before = 0;
+    let result = pm::cpu_sleep_timer_rc_retention_transaction(
+        pm::system_timer_ms(RETENTION_LAB_MS),
+        &mut state.record,
+        |phase| match phase {
+            SuspendTransactionPhase::Prepare => {
+                timer0_before = tlsr8258_hal::timer::now_ticks();
+                system_before = pm::system_timer_ticks();
+                mac.prepare_for_sleep();
+            }
+            SuspendTransactionPhase::Restore => {
+                mac.resume_after_sleep();
+                let elapsed = pm::system_timer_ticks().wrapping_sub(system_before);
+                tlsr8258_hal::timer::rebase_after_suspend(timer0_before, elapsed);
+            }
+        },
+    );
+    match result {
+        Ok(never) => match never {},
+        Err(_) => diag_retention_fail(0x201),
+    }
+}
+
+#[cfg(feature = "diag-retention")]
+fn diag_retention_main() -> ! {
+    use core::sync::atomic::{Ordering as FenceOrdering, compiler_fence};
+    use tlsr8258_hal::pm;
+    use zigbee_mac::telink::TelinkMac;
+    use zigbee_mac::{PibAttribute, PibValue};
+
+    let mode = tlsr8258_hal::mmio::analog_read(0x7e)
+        .unwrap_or_else(|_| diag_retention_fail(0x001));
+    if mode == 0 {
+        retention_lab_guard(true);
+        TELINK_RETENTION_LAB_STATUS.store(0x5254_0000, Ordering::SeqCst);
+
+        let peripherals = tlsr8258_hal::peripherals::Peripherals::take()
+            .unwrap_or_else(|| diag_retention_fail(0x010));
+        let adc = tlsr8258_hal::adc::Adc::new(
+            peripherals.adc,
+            tlsr8258_hal::flash::FlashGeometry::KiB512,
+        )
+        .unwrap_or_else(|_| diag_retention_fail(0x011));
+        adc.install_flash_voltage_guard(peripherals.pins.pc5)
+            .unwrap_or_else(|_| diag_retention_fail(0x012));
+
+        let mut mac =
+            TelinkMac::with_extended_address([0x02, 0, 0, 0, 0, 0, 0, 0x82]);
+        mac.install_aes_engine(peripherals.aes)
+            .unwrap_or_else(|_| diag_retention_fail(0x013));
+        if executor::block_on(
+            mac.mlme_set(PibAttribute::PhyCurrentChannel, PibValue::U8(15)),
+        )
+        .is_err()
+        {
+            diag_retention_fail(0x014);
+        }
+
+        if pm::system_timer_init().is_err() || pm::rc_32k_init_and_cal().is_err() {
+            diag_retention_fail(0x015);
+        }
+
+        let state = unsafe {
+            TELINK_RETENTION_LAB_STATE.initialize(RetentionLabState {
+                marker: 0,
+                marker_inverse: !RETENTION_LAB_MAGIC,
+                cycle: 0,
+                canary: RETENTION_LAB_CANARY,
+                mac_before_us: 0,
+                record: pm::Low32kResumeRecord::new(),
+            })
+        };
+        let mac = unsafe { TELINK_RETENTION_LAB_MAC.initialize(mac) };
+        compiler_fence(FenceOrdering::SeqCst);
+        state.marker = RETENTION_LAB_MAGIC;
+
+        board::LED_RED.write(false);
+        board::LED_GREEN.write(true);
+        board::LED_BLUE.write(false);
+        diag_retention_enter(state, mac);
+    }
+
+    if mode != pm::DEEPSLEEP_MODE_RET_SRAM_LOW32K {
+        diag_retention_fail(0x020);
+    }
+    if !retention_lab_guard(false) {
+        diag_retention_fail(0x021);
+    }
+    let state = unsafe { TELINK_RETENTION_LAB_STATE.get() };
+    if !state.valid() {
+        diag_retention_fail(0x022);
+    }
+    let mac = unsafe { TELINK_RETENTION_LAB_MAC.get() };
+    let token =
+        pm::begin_low32k_resume(&state.record).unwrap_or_else(|_| diag_retention_fail(0x023));
+    mac.resume_after_retention()
+        .unwrap_or_else(|_| diag_retention_fail(0x024));
+    tlsr8258_hal::adc::restore_flash_voltage_guard()
+        .unwrap_or_else(|_| diag_retention_fail(0x025));
+    let status = pm::complete_low32k_resume(&mut state.record, token)
+        .unwrap_or_else(|_| diag_retention_fail(0x026));
+    if !status.entered_low_power() || !status.woke_by_timer() {
+        diag_retention_fail(0x027);
+    }
+    if !retention_lab_guard(false) {
+        diag_retention_fail(0x02a);
+    }
+    let elapsed_us = mac.monotonic_micros().wrapping_sub(state.mac_before_us);
+    if elapsed_us < RETENTION_LAB_MS * 1_000 || elapsed_us > 500_000 {
+        diag_retention_fail(0x028);
+    }
+    match executor::block_on(mac.mcps_data_indication_timeout(1_000)) {
+        Ok(_) | Err(MacError::NoData) => {}
+        Err(_) => diag_retention_fail(0x029),
+    }
+
+    state.cycle += 1;
+    TELINK_RETENTION_LAB_STATUS.store(0x5254_2000 | state.cycle, Ordering::SeqCst);
+    mark32(DBG_MODE_BASE + 0x80, 0x5254_2000 | state.cycle);
+    mark32(DBG_MODE_BASE + 0x84, elapsed_us);
+    mark32(DBG_MODE_BASE + 0x88, u32::from(status.raw()));
+    if state.cycle < RETENTION_LAB_CYCLES {
+        diag_retention_enter(state, mac);
+    }
+
+    TELINK_RETENTION_LAB_STATUS.store(0x5254_600d, Ordering::SeqCst);
+    mark32(DBG_MODE_BASE + 0x80, 0x5254_600d);
+    board::LED_RED.write(false);
+    board::LED_GREEN.write(true);
+    board::LED_BLUE.write(true);
+    loop {
+        core::hint::spin_loop();
     }
 }
 

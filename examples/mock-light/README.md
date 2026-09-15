@@ -1,48 +1,30 @@
-# Mock Dimmable Light
+# Finite mock dimmable-light relay
 
-Simulates a mains-powered dimmable light (Zigbee router) using `MockMac`.
-Demonstrates On/Off and Level Control cluster command handling with visual
-brightness feedback. No hardware required.
+Host demonstration of a forwarding-only
+`router_app::RelayRouterApp + NoChildren`.
 
-## What It Demonstrates
+The example seeds persisted router security state, initializes the shared
+frontend, applies On/Off and Level Control behavior through the profile, and
+runs two finite `step()` calls.
 
-- **Network join as router** — FFD, mains-powered, rx-on-when-idle
-- **Device template** — `templates::dimmable_light()` (HA Device ID `0x0101`)
-- **On/Off cluster** — `CMD_ON`, `CMD_OFF`, `CMD_TOGGLE` command handling
-- **Level Control cluster** — `CMD_MOVE_TO_LEVEL` with transition times, `CMD_STEP` (up/down)
-- **Visual state** — brightness bar rendered after each command (💡 / ⚫)
-- **Attribute reading** — On/Off state, GlobalSceneControl, CurrentLevel, MinLevel, MaxLevel
+```rust,ignore
+let mut app = RelayRouterApp::new(
+    node,
+    NoChildren,
+    &POLICY,
+    RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+)?;
 
-## Build & Run
-
-```sh
-cargo run -p mock-light
+app.initialize().await?;
+let events = app.step().await?;
 ```
 
-## Expected Output
+It does not model a child-admitting parent. Use it to understand how a plug or
+light composition synchronizes fitted hardware after `StepEvents`.
 
-1. Joins network on channel 15, PAN `0x1A62`, assigned short address `0x5E3D`
-2. Builds dimmable light device (endpoint 1: Basic, Identify, Groups, Scenes, On/Off, Level Control)
-3. Executes On/Off commands: ON → TOGGLE → TOGGLE → OFF
-4. Executes Level Control commands: MoveToLevel(50) → MoveToLevel(254) → Step(up, 30) → Step(down, 100) → MoveToLevel(10)
-5. Reads all On/Off and Level Control cluster attributes
-6. Prints MAC capabilities (coordinator, router, max_payload)
+## Run
 
-## Project Structure
-
+```bash
+cd examples/mock-light
+cargo +nightly-2026-03-23 run --locked
 ```
-mock-light/
-├── Cargo.toml      # Dependencies: zigbee-*, pollster
-└── src/
-    └── main.rs     # Light simulation (~290 lines)
-```
-
-## Dependencies
-
-| Crate | Purpose |
-|---|---|
-| `zigbee-mac` (mock) | MockMac, scan + associate |
-| `zigbee-zcl` | OnOffCluster, LevelControlCluster, typed cluster/device IDs |
-| `zigbee-runtime` | DeviceBuilder, templates |
-| `zigbee-types` | IeeeAddress, PanId, ChannelMask |
-| `pollster` | Block on async MAC calls |

@@ -3,6 +3,8 @@
 use zigbee_aps::security::{AesKey, ApsKeyType};
 use zigbee_types::IeeeAddress;
 
+use crate::attributes::NodeJoinLinkKeyType;
+
 /// Official Telink outgoing-security-counter reservation size.
 pub const FRAME_COUNTER_RESERVATION_SIZE: u32 = 0x400;
 
@@ -40,6 +42,10 @@ pub struct NetworkSecurityState {
     pub network_key: AesKey,
     pub key_sequence: u8,
     pub outgoing_frame_counter: u32,
+    /// Security model learned from the initial Network-Key Transport-Key.
+    pub trust_center_address: IeeeAddress,
+    /// Link-key regime that decrypted the initial network key.
+    pub node_join_link_key_type: NodeJoinLinkKeyType,
 }
 
 /// Unique Trust Center link-key state installed during commissioning.
@@ -80,4 +86,10 @@ pub trait SecurityPersistence {
         &mut self,
         trust_center_link_key: &TrustCenterLinkKeyState,
     ) -> Result<(), SecurityPersistenceError>;
+
+    /// Mark a distributed-security network commissioned after `Device_annce`.
+    ///
+    /// Distributed networks have no Trust Center and therefore no unique-TCLK
+    /// exchange to provide the centralized commit point.
+    fn commit_distributed_network(&mut self) -> Result<(), SecurityPersistenceError>;
 }

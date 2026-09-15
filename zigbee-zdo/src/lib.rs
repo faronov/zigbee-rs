@@ -131,6 +131,10 @@ pub enum ZdpStatus {
     TableFull = 0x87,
     NoEntry = 0x88,
     NoDescriptor = 0x89,
+    /// APS status returned when remote Trust Center policy changes are disabled.
+    IllegalRequest = 0xA3,
+    /// R22 §4.7.3.2 status for a TC-significant request while whitelist mode is active.
+    TrustCenterPolicyNotSupported = 0xAA,
 }
 
 impl ZdpStatus {
@@ -148,6 +152,8 @@ impl ZdpStatus {
             0x87 => Some(Self::TableFull),
             0x88 => Some(Self::NoEntry),
             0x89 => Some(Self::NoDescriptor),
+            0xA3 => Some(Self::IllegalRequest),
+            0xAA => Some(Self::TrustCenterPolicyNotSupported),
             _ => None,
         }
     }
@@ -202,10 +208,22 @@ pub enum ZdoError {
 
 // ── The ZDO layer ───────────────────────────────────────────────
 
-#[cfg(not(feature = "constrained-memory"))]
-const MAX_LOCAL_ENDPOINTS: usize = 32;
-#[cfg(feature = "constrained-memory")]
-const MAX_LOCAL_ENDPOINTS: usize = 4;
+/// Maximum application endpoints retained in the local descriptor registry.
+///
+/// `compact-single-endpoint` is a product-topology choice, not a Zigbee role:
+/// it keeps room for the selected application endpoint plus one spare.
+#[cfg(feature = "compact-single-endpoint")]
+pub const MAX_LOCAL_ENDPOINTS: usize = 2;
+#[cfg(all(
+    not(feature = "compact-single-endpoint"),
+    feature = "constrained-memory"
+))]
+pub const MAX_LOCAL_ENDPOINTS: usize = 4;
+#[cfg(all(
+    not(feature = "compact-single-endpoint"),
+    not(feature = "constrained-memory")
+))]
+pub const MAX_LOCAL_ENDPOINTS: usize = 32;
 
 /// Zigbee Device Object layer, generic over the MAC driver.
 ///
@@ -228,6 +246,12 @@ pub struct ZdoLayer<M: MacDriver> {
     local_ieee_addr: IeeeAddress,
     /// Pending ZDP request-response table for TSN correlation.
     pending_responses: [PendingZdpResponse; MAX_PENDING_ZDP],
+    /// Whether this Trust Center accepts remote TC-significant permit-join changes.
+    trust_center_allow_remote_policy_change: bool,
+    /// Whether the Trust Center currently restricts admission to its whitelist.
+    trust_center_use_whitelist: bool,
+    /// Accepted TC policy update for the owning BDB layer to consume.
+    pending_trust_center_allow_joins: Option<bool>,
     /// `apsParentAnnounceTimer` (R22 Table 2-24, AIB id 0xCE): seconds left
     /// before the next `Parent_annce` broadcast, `0` when not running.
     ///
@@ -288,6 +312,9 @@ impl<M: MacDriver> ZdoLayer<M> {
             local_nwk_addr: ShortAddress::UNASSIGNED,
             local_ieee_addr: [0u8; 8],
             pending_responses: core::array::from_fn(|_| PendingZdpResponse::default()),
+            trust_center_allow_remote_policy_change: false,
+            trust_center_use_whitelist: false,
+            pending_trust_center_allow_joins: None,
             #[cfg(feature = "router")]
             parent_annce_timer_secs: 0,
             #[cfg(feature = "router")]
@@ -312,6 +339,9 @@ impl<M: MacDriver> ZdoLayer<M> {
             core::ptr::addr_of_mut!((*slot).local_ieee_addr).write([0u8; 8]);
             core::ptr::addr_of_mut!((*slot).pending_responses)
                 .write(core::array::from_fn(|_| PendingZdpResponse::default()));
+            core::ptr::addr_of_mut!((*slot).trust_center_allow_remote_policy_change).write(false);
+            core::ptr::addr_of_mut!((*slot).trust_center_use_whitelist).write(false);
+            core::ptr::addr_of_mut!((*slot).pending_trust_center_allow_joins).write(None);
             #[cfg(feature = "router")]
             core::ptr::addr_of_mut!((*slot).parent_annce_timer_secs).write(0);
             #[cfg(feature = "router")]
@@ -327,6 +357,21 @@ impl<M: MacDriver> ZdoLayer<M> {
         let s = self.seq;
         self.seq = self.seq.wrapping_add(1);
         s
+    }
+
+    /// Synchronize the Trust Center policy used by incoming Mgmt_Permit_Joining requests.
+    pub fn set_trust_center_permit_joining_policy(
+        &mut self,
+        allow_remote_policy_change: bool,
+        use_whitelist: bool,
+    ) {
+        self.trust_center_allow_remote_policy_change = allow_remote_policy_change;
+        self.trust_center_use_whitelist = use_whitelist;
+    }
+
+    /// Take an accepted remote update to `trust_center_allow_joins`.
+    pub fn take_trust_center_allow_joins_update(&mut self) -> Option<bool> {
+        self.pending_trust_center_allow_joins.take()
     }
 
     // ── Pending ZDP request-response ────────────────────────
@@ -563,8 +608,7 @@ impl<M: MacDriver> ZdoLayer<M> {
     /// Broadcast Device_annce (ZDP cluster 0x0013) after joining.
     ///
     /// Provided for backwards compatibility — prefer
-    /// [`device_announce::ZdoLayer::send_device_annce`] for the full
-    /// implementation.
+    /// [`Self::send_device_annce`] for the full implementation.
     pub async fn device_annce(
         &mut self,
         nwk_addr: ShortAddress,
@@ -852,7 +896,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         network: &NetworkDescriptor,
     ) -> Result<ShortAddress, ZdpStatus> {
         self.nwk_mut()
-            .nlme_join(network, JoinMethod::Association)
+            .nlme_join_association(network)
             .await
             .map_err(ZdpStatus::from)
     }
@@ -864,6 +908,52 @@ impl<M: MacDriver> ZdoLayer<M> {
     ) -> Result<ShortAddress, ZdpStatus> {
         self.nwk_mut()
             .nlme_join(network, JoinMethod::Rejoin)
+            .await
+            .map_err(ZdpStatus::from)
+    }
+
+    /// Rejoin with a durable incoming NWK replay commit hook.
+    pub async fn nlme_rejoin_with_replay_commit<F>(
+        &mut self,
+        network: &NetworkDescriptor,
+        replay_commit: &mut F,
+    ) -> Result<ShortAddress, ZdpStatus>
+    where
+        F: FnMut(zigbee_nwk::security::NwkReplayCounter) -> bool,
+    {
+        self.nwk_mut()
+            .nlme_join_with_replay_commit(network, JoinMethod::Rejoin, replay_commit)
+            .await
+            .map_err(ZdpStatus::from)
+    }
+
+    /// Rejoin a centralized network without NWK security so the Trust Center
+    /// can authorize the node and transport the current network key.
+    pub async fn nlme_trust_center_rejoin(
+        &mut self,
+        network: &NetworkDescriptor,
+    ) -> Result<ShortAddress, ZdpStatus> {
+        let mut volatile_commit = |_| true;
+        self.nlme_trust_center_rejoin_with_replay_commit(network, &mut volatile_commit)
+            .await
+    }
+
+    /// Trust Center rejoin with a durable incoming NWK replay commit hook.
+    ///
+    /// Takes the same commit hook as [`Self::nlme_rejoin_with_replay_commit`]
+    /// so both rejoin flavours resolve to one `join_via_rejoin`
+    /// monomorphization instead of two, and so a Rejoin Response that does
+    /// arrive NWK-secured commits its counter durably on this path too.
+    pub async fn nlme_trust_center_rejoin_with_replay_commit<F>(
+        &mut self,
+        network: &NetworkDescriptor,
+        replay_commit: &mut F,
+    ) -> Result<ShortAddress, ZdpStatus>
+    where
+        F: FnMut(zigbee_nwk::security::NwkReplayCounter) -> bool,
+    {
+        self.nwk_mut()
+            .nlme_join_with_replay_commit(network, JoinMethod::TrustCenterRejoin, replay_commit)
             .await
             .map_err(ZdpStatus::from)
     }
@@ -913,5 +1003,52 @@ impl<M: MacDriver> ZdoLayer<M> {
         self.nwk_mut()
             .nlme_reset(warm_start)
             .map_err(ZdpStatus::from)
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    use zigbee_mac::mock::MockMac;
+    use zigbee_nwk::DeviceType;
+
+    fn descriptor(endpoint: u8) -> SimpleDescriptor {
+        SimpleDescriptor {
+            endpoint,
+            profile_id: 0x0104,
+            device_id: 0x0302,
+            device_version: 1,
+            input_clusters: heapless::Vec::new(),
+            output_clusters: heapless::Vec::new(),
+        }
+    }
+
+    fn zdo() -> ZdoLayer<MockMac> {
+        let nwk = NwkLayer::new(MockMac::new([0x11; 8]), DeviceType::EndDevice);
+        ZdoLayer::new(ApsLayer::new(nwk))
+    }
+
+    #[test]
+    fn capacity_features_select_the_smallest_requested_table() {
+        let expected = if cfg!(feature = "compact-single-endpoint") {
+            2
+        } else if cfg!(feature = "constrained-memory") {
+            4
+        } else {
+            32
+        };
+        assert_eq!(MAX_LOCAL_ENDPOINTS, expected);
+    }
+
+    #[test]
+    fn local_endpoint_overflow_is_explicit() {
+        let mut zdo = zdo();
+        for endpoint in 1..=MAX_LOCAL_ENDPOINTS {
+            assert_eq!(zdo.register_endpoint(descriptor(endpoint as u8)), Ok(()));
+        }
+        assert_eq!(
+            zdo.register_endpoint(descriptor(240)),
+            Err(ZdpStatus::TableFull)
+        );
     }
 }

@@ -1,283 +1,151 @@
-//! Mock Dimmable Light Example
-//!
-//! Demonstrates an On/Off + Level Control light device using the zigbee-rs stack.
-//!
-//! This example:
-//! 1. Creates a MockMac and joins a network
-//! 2. Creates On/Off, Level Control, and Basic clusters
-//! 3. Handles On/Off/Toggle commands
-//! 4. Handles MoveToLevel commands with transition times
-//! 5. Prints light state changes at each step
-//!
-//! Run with: cargo run -p mock-light
+//! Finite host composition of a forwarding dimmable-light router.
 
-use zigbee_mac::MacDriver;
+use router_app::{
+    NoChildren, NoDiagnostics, NoStatus, NoSupervisor, RelayRouterApp, RouterParts, RouterPolicy,
+};
+use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::mock::MockMac;
-use zigbee_mac::primitives::*;
-use zigbee_runtime::templates;
-use zigbee_types::*;
+use zigbee_runtime::ZigbeeDevice;
+use zigbee_runtime::node::ZigbeeNode;
+use zigbee_runtime::power::PowerMode;
+use zigbee_runtime::profile::{ApplicationProfile, DeviceProfile, DimmableLight};
+use zigbee_runtime::security_store::{
+    PersistentSecurityState, RamSecurityStateStore, SecurityStateStore,
+};
+use zigbee_types::ShortAddress;
+use zigbee_zcl::DeviceId;
 use zigbee_zcl::clusters::Cluster;
-use zigbee_zcl::clusters::level_control::{self, CMD_MOVE_TO_LEVEL, CMD_STEP, LevelControlCluster};
-use zigbee_zcl::clusters::on_off::{self, CMD_OFF, CMD_ON, CMD_TOGGLE, OnOffCluster};
+use zigbee_zcl::clusters::basic::PowerSource;
+use zigbee_zcl::clusters::level_control::{CMD_MOVE_TO_LEVEL, CMD_MOVE_TO_LEVEL_WITH_ON_OFF};
+use zigbee_zcl::clusters::on_off::CMD_TOGGLE;
 
-/// Print the current light state in a visual format.
-fn print_light_state(on_off: &OnOffCluster, level: &LevelControlCluster) {
-    let is_on = on_off.is_on();
-    let brightness = level.current_level();
-    let percent = (brightness as f64 / 254.0 * 100.0).round() as u8;
+const LIGHT_IEEE: [u8; 8] = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
+const COORDINATOR_IEEE: [u8; 8] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
+const PAN_ID: u16 = 0x1A62;
+const CHANNEL: u8 = 15;
 
-    let bar_len = (brightness as usize * 20) / 254;
-    let bar: String = "█".repeat(bar_len) + &"░".repeat(20 - bar_len);
+static POLICY: RouterPolicy = RouterPolicy {
+    max_receive_slice_us: 1_000,
+    join_retry_initial_ms: 10,
+    join_retry_max_ms: 100,
+    secure_rejoin_failure_limit: 2,
+};
 
-    if is_on {
-        println!("    💡 ON  [{bar}] {percent}% (level={brightness})");
-    } else {
-        println!("    ⚫ OFF [{bar}] {percent}% (level={brightness})");
-    }
+fn commissioned_router_state() -> PersistentSecurityState {
+    let mut state = PersistentSecurityState::empty();
+    state.commissioned = true;
+    state.extended_pan_id = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+    state.pan_id = PAN_ID;
+    state.short_address = 0x5E3D;
+    state.ieee_address = LIGHT_IEEE;
+    state.channel = CHANNEL;
+    state.depth = 1;
+    state.parent_address = ShortAddress::COORDINATOR.0;
+    state.update_id = 0;
+    state.update_id_valid = true;
+    state.network_key = [0x42; 16];
+    state.key_sequence = 0;
+    state.global_counter_limit = 0x400;
+    state.tclk_present = true;
+    state.trust_center_address = COORDINATOR_IEEE;
+    state.trust_center_link_key = [0x5A; 16];
+    state.tclk_counter_limit = 0x400;
+    state.validate().expect("valid router security state");
+    state
+}
+
+fn print_light_state(label: &str, light: &DimmableLight) {
+    println!(
+        "  {label}: on={}, level={}",
+        light.is_on(),
+        light.current_level()
+    );
 }
 
 fn main() {
-    println!("╔══════════════════════════════════════════════════════╗");
-    println!("║  zigbee-rs Mock Dimmable Light                      ║");
-    println!("╚══════════════════════════════════════════════════════╝");
-    println!();
-
-    // ── Step 1: Create MockMac and join network ─────────────────────
-    println!("── Step 1: Join Network ──");
-
-    let light_ieee: IeeeAddress = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
-    let mut mac = MockMac::new(light_ieee);
-
-    // Configure a coordinator beacon
-    let pan_id = PanId(0x1A62);
-    mac.add_beacon(PanDescriptor {
-        channel: 15,
-        coord_address: MacAddress::Short(pan_id, ShortAddress::COORDINATOR),
-        superframe_spec: SuperframeSpec {
-            beacon_order: 15,
-            superframe_order: 15,
-            final_cap_slot: 15,
-            battery_life_ext: false,
-            pan_coordinator: true,
-            association_permit: true,
-        },
-        lqi: 200,
-        security_use: false,
-        zigbee_beacon: ZigbeeBeaconPayload {
-            protocol_id: 0x00,
-            stack_profile: 2,
-            protocol_version: 2,
-            router_capacity: true,
-            device_depth: 0,
-            end_device_capacity: true,
-            extended_pan_id: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
-            tx_offset: [0xFF, 0xFF, 0xFF],
-            update_id: 0,
-        },
-    });
-
-    let assigned_short = ShortAddress(0x5E3D);
-    mac.set_associate_response(MlmeAssociateConfirm {
-        short_address: assigned_short,
-        status: AssociationStatus::Success,
-    });
-
     pollster::block_on(async {
-        mac.mlme_reset(true).expect("Reset failed");
-        println!("  MLME-RESET → OK");
+        println!("zigbee-rs finite RelayRouterApp dimmable-light demo");
 
-        // Scan
-        let scan = mac
-            .mlme_scan(MlmeScanRequest {
-                scan_type: ScanType::Active,
-                channel_mask: ChannelMask::ALL_2_4GHZ,
-                scan_duration: 3,
-            })
-            .await
-            .expect("Scan failed");
+        let mut profile = DeviceProfile::new(
+            1,
+            PROFILE_HOME_AUTOMATION,
+            DeviceId::DIMMABLE_LIGHT,
+            DimmableLight::default(),
+        );
+        let mut mac = MockMac::new(LIGHT_IEEE);
+        mac.set_rx_delay_us(u32::MAX);
+        let mut device = ZigbeeDevice::builder(mac)
+            .manufacturer("Zigbee-RS")
+            .model("MockDimLight-01")
+            .power_source(PowerSource::MainsSinglePhase)
+            .power_mode(PowerMode::AlwaysOn)
+            .endpoint(
+                profile.endpoint(),
+                profile.profile_id(),
+                profile.device_id(),
+                |endpoint| profile.configure_endpoint(endpoint),
+            )
+            .build_relay();
+        let mut store = RamSecurityStateStore::new();
+        store
+            .store(&commissioned_router_state())
+            .expect("seed persisted router network");
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let mut app = RelayRouterApp::new(
+            node,
+            NoChildren,
+            &POLICY,
+            RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+        )
+        .expect("valid forwarding-light composition");
+
+        app.initialize().await.expect("resume light router");
         println!(
-            "  MLME-SCAN(Active) → found {} PAN(s)",
-            scan.pan_descriptors.len()
+            "  resumed router 0x{:04X} on PAN 0x{:04X}, channel {}",
+            app.node().device().short_address(),
+            app.node().device().pan_id(),
+            app.node().device().channel()
+        );
+        print_light_state("initial", app.node().profile().component());
+
+        app.node_mut()
+            .profile_mut()
+            .component_mut()
+            .level_control_mut()
+            .handle_command(CMD_MOVE_TO_LEVEL_WITH_ON_OFF, &[200, 0, 0])
+            .expect("MoveToLevelWithOnOff");
+        print_light_state(
+            "MoveToLevelWithOnOff(200)",
+            app.node().profile().component(),
         );
 
-        // Associate
-        let best = &scan.pan_descriptors[0];
-        let assoc = mac
-            .mlme_associate(MlmeAssociateRequest {
-                channel: best.channel,
-                coord_address: best.coord_address,
-                capability_info: CapabilityInfo {
-                    device_type_ffd: true, // Lights are routers (FFD)
-                    mains_powered: true,
-                    rx_on_when_idle: true,
-                    security_capable: false,
-                    allocate_address: true,
-                },
-            })
-            .await
-            .expect("Association failed");
-        println!(
-            "  MLME-ASSOCIATE → short_addr=0x{:04X}, status={:?}",
-            assoc.short_address.0, assoc.status
+        app.node_mut()
+            .profile_mut()
+            .component_mut()
+            .on_off_mut()
+            .handle_command(CMD_TOGGLE, &[])
+            .expect("Toggle");
+        print_light_state("Toggle", app.node().profile().component());
+
+        app.node_mut()
+            .profile_mut()
+            .component_mut()
+            .level_control_mut()
+            .handle_command(CMD_MOVE_TO_LEVEL, &[32, 0, 0])
+            .expect("standalone MoveToLevel");
+        print_light_state(
+            "standalone MoveToLevel(32)",
+            app.node().profile().component(),
         );
+
+        for step in 1..=2 {
+            let events = app.step().await.expect("finite router step");
+            println!(
+                "  completed finite router step {step}/2 with {} event(s)",
+                events.iter().count()
+            );
+        }
+
+        println!("RelayRouterApp dimmable-light demo complete");
     });
-    println!();
-
-    // ── Step 2: Build dimmable light via template ───────────────────
-    println!("── Step 2: Build Dimmable Light Device ──");
-
-    let mac_for_device = MockMac::new(light_ieee);
-    let device = templates::dimmable_light(mac_for_device)
-        .manufacturer("Zigbee-RS")
-        .model("MockDimLight-01")
-        .date_code("20250101")
-        .sw_build("0.1.0")
-        .build_router();
-
-    println!("  Device type: Router (mains-powered light)");
-    println!("  HA Device ID: 0x0101 (Dimmable Light)");
-    println!("  Endpoint 1 clusters:");
-    println!("    - Basic (0x0000)");
-    println!("    - Identify (0x0003)");
-    println!("    - Groups (0x0004)");
-    println!("    - Scenes (0x0005)");
-    println!("    - On/Off (0x0006)");
-    println!("    - Level Control (0x0008)");
-    println!();
-
-    // ── Step 3: Create cluster instances ─────────────────────────────
-    println!("── Step 3: Initialize Clusters ──");
-
-    let mut on_off = OnOffCluster::new();
-    let mut level = LevelControlCluster::new();
-
-    println!("  Initial state:");
-    print_light_state(&on_off, &level);
-    println!();
-
-    // ── Step 4: Handle On/Off commands ──────────────────────────────
-    println!("── Step 4: On/Off Commands ──");
-
-    println!("  → CMD_ON (0x01)");
-    let _ = on_off.handle_command(CMD_ON, &[]);
-    print_light_state(&on_off, &level);
-
-    // Set initial brightness since light was just turned on
-    let move_payload = [0xC8, 0x00, 0x00]; // level=200, transition=0
-    let _ = level.handle_command(CMD_MOVE_TO_LEVEL, &move_payload);
-    println!("  → MoveToLevel(200, transition=0)");
-    print_light_state(&on_off, &level);
-
-    println!("  → CMD_TOGGLE (0x02)");
-    let _ = on_off.handle_command(CMD_TOGGLE, &[]);
-    print_light_state(&on_off, &level);
-
-    println!("  → CMD_TOGGLE (0x02)");
-    let _ = on_off.handle_command(CMD_TOGGLE, &[]);
-    print_light_state(&on_off, &level);
-
-    println!("  → CMD_OFF (0x00)");
-    let _ = on_off.handle_command(CMD_OFF, &[]);
-    print_light_state(&on_off, &level);
-    println!();
-
-    // ── Step 5: Handle Level Control commands ───────────────────────
-    println!("── Step 5: Level Control Commands ──");
-
-    // Turn on first
-    let _ = on_off.handle_command(CMD_ON, &[]);
-
-    // MoveToLevel: level=50, transition=10 (1 second)
-    let payload = [50u8, 0x0A, 0x00]; // level, transition_time LE
-    let _ = level.handle_command(CMD_MOVE_TO_LEVEL, &payload);
-    println!("  → MoveToLevel(50, transition=10)");
-    print_light_state(&on_off, &level);
-
-    // MoveToLevel: level=254, transition=20 (2 seconds)
-    let payload = [254u8, 0x14, 0x00];
-    let _ = level.handle_command(CMD_MOVE_TO_LEVEL, &payload);
-    println!("  → MoveToLevel(254, transition=20) — full brightness");
-    print_light_state(&on_off, &level);
-
-    // Step up: mode=0(up), step=30, transition=5
-    let payload = [0u8, 30, 0x05, 0x00]; // mode, step_size, transition LE
-    let current_before = level.current_level();
-    let _ = level.handle_command(CMD_STEP, &payload);
-    println!(
-        "  → Step(up, step=30, transition=5): {} → {}",
-        current_before,
-        level.current_level()
-    );
-    print_light_state(&on_off, &level);
-
-    // Step down: mode=1(down), step=100, transition=10
-    let payload = [1u8, 100, 0x0A, 0x00];
-    let current_before = level.current_level();
-    let _ = level.handle_command(CMD_STEP, &payload);
-    println!(
-        "  → Step(down, step=100, transition=10): {} → {}",
-        current_before,
-        level.current_level()
-    );
-    print_light_state(&on_off, &level);
-
-    // MoveToLevel: dim to 10
-    let payload = [10u8, 0x00, 0x00];
-    let _ = level.handle_command(CMD_MOVE_TO_LEVEL, &payload);
-    println!("  → MoveToLevel(10, transition=0) — very dim");
-    print_light_state(&on_off, &level);
-    println!();
-
-    // ── Step 6: Read all cluster attributes ─────────────────────────
-    println!("── Step 6: Read Cluster Attributes ──");
-
-    println!("  On/Off cluster:");
-    let oo_attrs = on_off.attributes();
-    for attr_id in &[
-        on_off::ATTR_ON_OFF,
-        on_off::ATTR_GLOBAL_SCENE_CONTROL,
-        on_off::ATTR_ON_TIME,
-        on_off::ATTR_OFF_WAIT_TIME,
-    ] {
-        if let Some(val) = oo_attrs.get(*attr_id) {
-            let name = oo_attrs.find(*attr_id).map(|d| d.name).unwrap_or("?");
-            println!("    0x{:04X} ({}) = {:?}", attr_id.0, name, val);
-        }
-    }
-
-    println!("  Level Control cluster:");
-    let lc_attrs = level.attributes();
-    for attr_id in &[
-        level_control::ATTR_CURRENT_LEVEL,
-        level_control::ATTR_MIN_LEVEL,
-        level_control::ATTR_MAX_LEVEL,
-        level_control::ATTR_ON_OFF_TRANSITION_TIME,
-        level_control::ATTR_ON_LEVEL,
-    ] {
-        if let Some(val) = lc_attrs.get(*attr_id) {
-            let name = lc_attrs.find(*attr_id).map(|d| d.name).unwrap_or("?");
-            println!("    0x{:04X} ({}) = {:?}", attr_id.0, name, val);
-        }
-    }
-    println!();
-
-    // ── Step 7: Verify MockMac state ────────────────────────────────
-    println!("── Step 7: MAC Verification ──");
-    let caps = mac.capabilities();
-    println!("  MAC capabilities:");
-    println!("    coordinator:      {}", caps.coordinator);
-    println!("    router:           {}", caps.router);
-    println!("    hardware_security: {}", caps.hardware_security);
-    println!("    max_payload:      {}", caps.max_payload);
-
-    println!();
-    println!("✓ Mock dimmable light example completed successfully!");
-    println!("  This demonstrates:");
-    println!("  • Network join as a router device");
-    println!("  • On/Off cluster with ON, OFF, TOGGLE commands");
-    println!("  • Level Control with MoveToLevel and Step commands");
-    println!("  • Visual light state feedback");
-    println!("  • Attribute reading via the Cluster trait");
-
-    drop(device);
 }

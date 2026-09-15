@@ -38,12 +38,12 @@ fn test_tc_link_key_per_device() {
     let key1 = [0x11; 16];
 
     // Default: returns well-known key
-    assert_eq!(tc.link_key_for_device(&dev1), DEFAULT_TC_LINK_KEY);
+    assert_eq!(tc.link_key_for_device(&dev1), Some(DEFAULT_TC_LINK_KEY));
 
     // Set device-specific key
     tc.set_link_key(dev1, key1, TcKeyType::InstallCode).unwrap();
-    assert_eq!(tc.link_key_for_device(&dev1), key1);
-    assert_eq!(tc.link_key_for_device(&dev2), DEFAULT_TC_LINK_KEY);
+    assert_eq!(tc.link_key_for_device(&dev1), Some(key1));
+    assert_eq!(tc.link_key_for_device(&dev2), Some(DEFAULT_TC_LINK_KEY));
     assert_eq!(tc.device_count(), 1);
 }
 
@@ -58,10 +58,24 @@ fn test_tc_join_acceptance() {
     // With install code requirement
     tc.set_require_install_codes(true);
     assert!(!tc.should_accept_join(&dev));
-
-    // Provision install code key
-    tc.set_link_key(dev, [0x42; 16], TcKeyType::InstallCode)
+    assert_eq!(tc.link_key_for_device(&dev), None);
+    tc.set_link_key(dev, [0x42; 16], TcKeyType::ApplicationDefined)
         .unwrap();
+    assert!(!tc.should_accept_join(&dev));
+    assert_eq!(tc.link_key_for_device(&dev), None);
+
+    let install_code = [
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0xD4, 0x90,
+    ];
+    let key = tc.provision_install_code(dev, &install_code).unwrap();
+    assert_eq!(
+        key,
+        [
+            0xFA, 0x80, 0x81, 0xCA, 0xAA, 0x41, 0xD5, 0xAD, 0xE9, 0xB5, 0x65, 0x87, 0x99, 0x26,
+            0x8B, 0x88,
+        ]
+    );
     assert!(tc.should_accept_join(&dev));
 }
 

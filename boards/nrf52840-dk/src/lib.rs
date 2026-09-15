@@ -1,8 +1,8 @@
 //! Board support for the Nordic nRF52840 DK (PCA10056).
 //!
 //! This crate exposes only the DK's physically fitted, board-specific
-//! wiring: LED1, Button 1, and the external I2C sensor header (BME280/SHT31
-//! breakout). It has no dependency on `zigbee-runtime` and owns no
+//! wiring: LED1, LED2, Button 1, and the external I2C sensor header
+//! (BME280/SHT31 breakout). It has no dependency on `zigbee-runtime` and owns no
 //! partition layout, NV placement, security persistence, or firmware
 //! identity — those are product concerns. See `products/nrf52840-sensor`
 //! for the product crate that builds on this board and selects them.
@@ -29,6 +29,19 @@ pub const SENSOR_I2C_FREQUENCY: twim::Frequency = twim::Frequency::K400;
 
 /// Construct LED1 (P0.13) as a push-pull output, initially off (active low).
 pub fn led(pin: peripherals::P0_13) -> gpio::Output<'static> {
+    gpio::Output::new(pin, gpio::Level::High, gpio::OutputDrive::Standard)
+}
+
+/// Construct LED1 (P0.13) as the product status output, initially off.
+///
+/// This named alias lets always-on products state the semantic purpose while
+/// preserving [`led`] for the existing sensor composition.
+pub fn status_led(pin: peripherals::P0_13) -> gpio::Output<'static> {
+    led(pin)
+}
+
+/// Construct LED2 (P0.14) as an active-low RX-activity output, initially off.
+pub fn rx_activity_led(pin: peripherals::P0_14) -> gpio::Output<'static> {
     gpio::Output::new(pin, gpio::Level::High, gpio::OutputDrive::Standard)
 }
 

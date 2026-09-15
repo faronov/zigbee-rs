@@ -23,6 +23,13 @@ use zigbee_types::*;
 use embassy_futures::select;
 use embassy_time::{Instant, Timer};
 
+const fn scan_duration_ms(scan_duration: u8) -> Option<u32> {
+    if scan_duration > 14 {
+        return None;
+    }
+    Some(((1u32 << scan_duration) * 384 / 25) + 1)
+}
+
 /// PHY6222 IEEE 802.15.4 MAC driver.
 ///
 /// Pure-Rust implementation using direct register access — no vendor FFI.
@@ -304,7 +311,14 @@ impl MacDriver for Phy6222Mac {
         let mut pan_descriptors: PanDescriptorList = heapless::Vec::new();
         let mut energy_list: EdList = heapless::Vec::new();
 
-        let scan_duration_ms = ((1u64 << req.scan_duration as u64) * 15360 / 1000) + 1;
+        // IEEE 802.15.4 scan duration is
+        // aBaseSuperframeDuration * (2^n + 1) symbols. This backend keeps the
+        // existing rounded per-channel window, but evaluates the bounded
+        // n <= 14 result in u32 so Cortex-M0 does not retain a general u64
+        // division runtime solely for scan timing.
+        let Some(scan_duration_ms) = scan_duration_ms(req.scan_duration) else {
+            return Err(MacError::InvalidParameter);
+        };
 
         for ch in 11u8..=26 {
             if req.channel_mask.0 & (1u32 << ch) == 0 {
@@ -333,7 +347,7 @@ impl MacDriver for Phy6222Mac {
 
                     // Collect multiple beacons within the scan duration window
                     let deadline = embassy_time::Instant::now()
-                        + embassy_time::Duration::from_millis(scan_duration_ms);
+                        + embassy_time::Duration::from_millis(u64::from(scan_duration_ms));
                     while !pan_descriptors.is_full() {
                         let now = embassy_time::Instant::now();
                         if now >= deadline {
@@ -354,7 +368,7 @@ impl MacDriver for Phy6222Mac {
                 }
                 ScanType::Passive => {
                     let deadline = embassy_time::Instant::now()
-                        + embassy_time::Duration::from_millis(scan_duration_ms);
+                        + embassy_time::Duration::from_millis(u64::from(scan_duration_ms));
                     while !pan_descriptors.is_full() {
                         let now = embassy_time::Instant::now();
                         if now >= deadline {
@@ -576,13 +590,10 @@ impl MacDriver for Phy6222Mac {
     }
 
     async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
-        self.pan_id = req.pan_id;
-        self.channel = req.channel;
-        self.driver.update_config(|c| {
-            c.pan_id = req.pan_id.0;
-            c.channel = req.channel;
-        });
-        Ok(())
+        // `Phy6222Mac` does not implement `ParentMacDriver`: it has no
+        // frame-pending ACK path and keeps every parent primitive at its
+        // `Unsupported` default. Fail explicitly.
+        start_requires_parent_capability(&req)
     }
 
     async fn mlme_get(&self, attr: PibAttribute) -> Result<PibValue, MacError> {
@@ -925,21 +936,14 @@ impl MacDriver for Phy6222Mac {
     }
 
     fn capabilities(&self) -> MacCapabilities {
-        MacCapabilities {
-            coordinator: false,
-            router: true,
-            hardware_security: false,
-            // Nominal payload for the common short-dst/short-src case
-            // (9-byte MHR, 125-byte PSDU-minus-FCS budget → 116 bytes, of
-            // which 102 is a conservative figure matching other backends).
-            // `mcps_data` does not rely on this constant for correctness:
-            // the actual bound is enforced per-frame by
-            // `frames::build_data_frame`, which accounts for the real
-            // addressing-mode overhead and the 2-byte hardware FCS.
-            max_payload: 102,
-            tx_power_min: TxPower(0),
-            tx_power_max: TxPower(10),
-        }
+        // Nominal payload for the common short-dst/short-src case
+        // (9-byte MHR, 125-byte PSDU-minus-FCS budget → 116 bytes, of
+        // which 102 is a conservative figure matching other backends).
+        // `mcps_data` does not rely on this constant for correctness:
+        // the actual bound is enforced per-frame by
+        // `frames::build_data_frame`, which accounts for the real
+        // addressing-mode overhead and the 2-byte hardware FCS.
+        MacCapabilities::non_parent(102, TxPower(0), TxPower(10))
     }
 }
 
@@ -1093,6 +1097,14 @@ mod tests {
 
     fn fc_of(frame: &[u8]) -> u16 {
         u16::from_le_bytes([frame[0], frame[1]])
+    }
+
+    #[test]
+    fn scan_duration_is_bounded_and_preserves_existing_rounding() {
+        assert_eq!(scan_duration_ms(0), Some(16));
+        assert_eq!(scan_duration_ms(5), Some(492));
+        assert_eq!(scan_duration_ms(14), Some(251_659));
+        assert_eq!(scan_duration_ms(15), None);
     }
 
     // ── (1) data-frame base FCF must not always set ACK request ─────

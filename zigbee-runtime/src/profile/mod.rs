@@ -1,7 +1,7 @@
 //! Typed application profiles that own their ZCL cluster instances.
 //!
 //! Besides the shared [`ProfileComponent`] / [`ApplicationProfile`] traits,
-//! [`DeviceProfile`], the optional `WithOta` / `OptionalOta` decorators, the original
+//! [`DeviceProfile`], the [`WithOta`] decorator, the original
 //! [`TemperatureHumidityBattery`] sensor archetype, and its
 //! [`TemperatureHumidityPressureBattery`] pressure-composed sibling (built
 //! via [`TemperatureHumidityBattery::with_pressure`]) defined in this
@@ -13,6 +13,7 @@
 //!
 //! - `AirQuality` — CO₂ + temperature + humidity, optional battery; requires
 //!   the `float32` feature.
+//! - [`dimmable_light::DimmableLight`] — commanded On/Off + Level Control.
 //! - [`thermostat::Thermostat`] — local temperature + full thermostat controls,
 //!   optional humidity/battery.
 //! - [`occupancy_light::OccupancyLight`] — occupancy + illuminance sensing,
@@ -24,13 +25,13 @@
 //! - [`smart_plug::SmartPlug`] — On/Off + electrical measurement, optional
 //!   metering.
 //!
-//! `WithOta` always adds the OTA Upgrade client cluster; `OptionalOta` is
-//! for platforms where the firmware backend may fail to construct (a checked
-//! partition/bootloader layout that does not match this device) and OTA must
-//! be cleanly omitted rather than block commissioning.
+//! `WithOta` adds the OTA Upgrade client cluster. Products that select this
+//! profile must construct a working firmware writer before they build their
+//! endpoint descriptor.
 
 #[cfg(feature = "float32")]
 pub mod air_quality;
+pub mod dimmable_light;
 pub mod occupancy_light;
 pub mod plant_sensor;
 pub mod range_extender;
@@ -39,6 +40,7 @@ pub mod thermostat;
 
 #[cfg(feature = "float32")]
 pub use air_quality::{AirQuality, AirQualityMeasurement, AirQualityReporting};
+pub use dimmable_light::{DimmableLight, DimmableLightReporting};
 pub use occupancy_light::{OccupancyLight, OccupancyLightMeasurement, OccupancyLightReporting};
 pub use plant_sensor::{PlantSensor, PlantSensorMeasurement, PlantSensorReporting};
 pub use range_extender::RangeExtender;
@@ -482,7 +484,7 @@ impl ProfileComponent for TemperatureHumidityBattery {
 /// cluster, built via [`TemperatureHumidityBattery::with_pressure`].
 ///
 /// This is a separate, statically-composed type (the same decorator shape
-/// as `WithOta` / `OptionalOta` below) rather than an `Option` field on
+/// as `WithOta` below) rather than an `Option` field on
 /// `TemperatureHumidityBattery`, so that products which never call
 /// `with_pressure` — every current EFR32 and ESP32 product — never
 /// monomorphize or link [`PressureCluster`]'s `Cluster` vtable and
@@ -626,175 +628,6 @@ impl<P: ApplicationProfile, F: crate::firmware_writer::FirmwareWriter> Applicati
             .push(ClusterRef {
                 endpoint,
                 cluster: ota.cluster_mut(),
-            })
-            .map_err(|_| ProfileError::TooManyClusters)
-    }
-
-    fn expected_report_cluster_ids(&self, out: &mut ExpectedReportClusters) {
-        self.inner.expected_report_cluster_ids(out);
-    }
-
-    fn configure_default_reporting<M: MacDriver, R: crate::role::DeviceRole>(
-        &self,
-        device: &mut ZigbeeDevice<M, R>,
-    ) -> Result<(), ProfileError> {
-        self.inner.configure_default_reporting(device)
-    }
-}
-
-/// The OTA cluster instance behind [`OptionalOta`]: either a live
-/// [`crate::ota::OtaManager`] or an inert [`zigbee_zcl::clusters::ota::OtaCluster`]
-/// that reports the current firmware version but never accepts an upgrade.
-///
-/// The variants are intentionally not boxed: this crate is heap-free, and a
-/// platform that cannot construct a firmware writer still needs to hold the
-/// disabled state inline in the same statically sized profile.
-#[cfg(feature = "ota")]
-#[allow(clippy::large_enum_variant)]
-pub enum OtaBackend<F: crate::firmware_writer::FirmwareWriter> {
-    Enabled(crate::ota::OtaManager<F>),
-    Disabled(zigbee_zcl::clusters::ota::OtaCluster),
-}
-
-#[cfg(feature = "ota")]
-impl<F: crate::firmware_writer::FirmwareWriter> OtaBackend<F> {
-    /// Whether the endpoint should advertise the OTA Upgrade client cluster.
-    pub fn is_enabled(&self) -> bool {
-        matches!(self, Self::Enabled(_))
-    }
-
-    /// The ZCL cluster instance, whichever backend is active.
-    pub fn cluster_mut(&mut self) -> &mut zigbee_zcl::clusters::ota::OtaCluster {
-        match self {
-            Self::Enabled(manager) => manager.cluster_mut(),
-            Self::Disabled(cluster) => cluster,
-        }
-    }
-
-    /// The live manager, if the firmware backend was constructed successfully.
-    pub fn manager(&self) -> Option<&crate::ota::OtaManager<F>> {
-        match self {
-            Self::Enabled(manager) => Some(manager),
-            Self::Disabled(_) => None,
-        }
-    }
-
-    /// The live manager, if the firmware backend was constructed successfully.
-    pub fn manager_mut(&mut self) -> Option<&mut crate::ota::OtaManager<F>> {
-        match self {
-            Self::Enabled(manager) => Some(manager),
-            Self::Disabled(_) => None,
-        }
-    }
-}
-
-/// Like [`WithOta`], but tolerates a firmware backend that could not be
-/// constructed — for example a checked partition or bootloader layout that
-/// does not match what the writer requires on this particular device.
-///
-/// The endpoint then omits the OTA Upgrade client cluster and the profile
-/// behaves like a normal Zigbee device: commissioning, reporting and every
-/// other application cluster keep working. Nothing panics or halts startup
-/// just because OTA hardware is unavailable or unrecognised.
-#[cfg(feature = "ota")]
-pub struct OptionalOta<P, F: crate::firmware_writer::FirmwareWriter> {
-    inner: P,
-    backend: OtaBackend<F>,
-}
-
-#[cfg(feature = "ota")]
-impl<P: ApplicationProfile, F: crate::firmware_writer::FirmwareWriter> OptionalOta<P, F> {
-    /// Compose with a successfully constructed firmware writer.
-    pub fn enabled(inner: P, ota: crate::ota::OtaManager<F>) -> Result<Self, ProfileError> {
-        if inner.endpoint() != ota.endpoint() {
-            return Err(ProfileError::EndpointMismatch {
-                profile_endpoint: inner.endpoint(),
-                component_endpoint: ota.endpoint(),
-            });
-        }
-        Ok(Self {
-            inner,
-            backend: OtaBackend::Enabled(ota),
-        })
-    }
-
-    /// Compose without a firmware writer. The OTA Upgrade client cluster is
-    /// not advertised on the endpoint; a plain [`zigbee_zcl::clusters::ota::OtaCluster`]
-    /// still reports the running version to anything that reads it directly.
-    pub fn disabled(
-        inner: P,
-        manufacturer_code: u16,
-        image_type: u16,
-        current_version: u32,
-    ) -> Self {
-        let cluster = zigbee_zcl::clusters::ota::OtaCluster::new(
-            manufacturer_code,
-            image_type,
-            current_version,
-        );
-        Self {
-            inner,
-            backend: OtaBackend::Disabled(cluster),
-        }
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.backend.is_enabled()
-    }
-
-    pub const fn inner(&self) -> &P {
-        &self.inner
-    }
-
-    pub fn inner_mut(&mut self) -> &mut P {
-        &mut self.inner
-    }
-
-    pub const fn backend(&self) -> &OtaBackend<F> {
-        &self.backend
-    }
-
-    pub fn backend_mut(&mut self) -> &mut OtaBackend<F> {
-        &mut self.backend
-    }
-}
-
-#[cfg(feature = "ota")]
-impl<P: ApplicationProfile, F: crate::firmware_writer::FirmwareWriter> ApplicationProfile
-    for OptionalOta<P, F>
-{
-    fn endpoint(&self) -> u8 {
-        self.inner.endpoint()
-    }
-
-    fn profile_id(&self) -> u16 {
-        self.inner.profile_id()
-    }
-
-    fn device_id(&self) -> DeviceId {
-        self.inner.device_id()
-    }
-
-    fn configure_endpoint(&self, endpoint: EndpointBuilder) -> EndpointBuilder {
-        let endpoint = self.inner.configure_endpoint(endpoint);
-        if self.is_enabled() {
-            endpoint.cluster_client(ClusterId::OTA_UPGRADE)
-        } else {
-            endpoint
-        }
-    }
-
-    fn collect_clusters<'a>(
-        &'a mut self,
-        clusters: &mut ApplicationClusters<'a>,
-    ) -> Result<(), ProfileError> {
-        let Self { inner, backend } = self;
-        let endpoint = inner.endpoint();
-        inner.collect_clusters(clusters)?;
-        clusters
-            .push(ClusterRef {
-                endpoint,
-                cluster: backend.cluster_mut(),
             })
             .map_err(|_| ProfileError::TooManyClusters)
     }
@@ -1101,134 +934,6 @@ mod tests {
         );
         assert!(matches!(
             WithOta::new(profile(), ota),
-            Err(ProfileError::EndpointMismatch {
-                profile_endpoint: 1,
-                component_endpoint: 2,
-            })
-        ));
-    }
-
-    /// Zero-sized [`crate::firmware_writer::FirmwareWriter`] stub. Unlike
-    /// `MockFirmwareWriter` (a 256 KB RAM buffer, sized for exercising real
-    /// staged-image byte layout), `OptionalOta` composition only needs *some*
-    /// writer to exist, so a stub avoids inflating every test stack frame
-    /// that touches it.
-    #[cfg(feature = "ota")]
-    struct StubWriter;
-
-    #[cfg(feature = "ota")]
-    impl crate::firmware_writer::FirmwareWriter for StubWriter {
-        fn erase_slot(&mut self) -> Result<(), crate::firmware_writer::FirmwareError> {
-            Ok(())
-        }
-        fn write_block(
-            &mut self,
-            _offset: u32,
-            _data: &[u8],
-        ) -> Result<(), crate::firmware_writer::FirmwareError> {
-            Ok(())
-        }
-        fn verify(
-            &mut self,
-            _expected_size: u32,
-            _expected_hash: Option<&[u8]>,
-        ) -> Result<(), crate::firmware_writer::FirmwareError> {
-            Ok(())
-        }
-        fn activate(&mut self) -> Result<(), crate::firmware_writer::FirmwareError> {
-            Ok(())
-        }
-        fn slot_size(&self) -> u32 {
-            1024
-        }
-        fn abort(&mut self) -> Result<(), crate::firmware_writer::FirmwareError> {
-            Ok(())
-        }
-    }
-
-    #[cfg(feature = "ota")]
-    #[test]
-    fn optional_ota_enabled_adds_client_and_runtime_cluster() {
-        use crate::ota::{OtaConfig, OtaManager};
-
-        let ota = OtaManager::new(
-            StubWriter,
-            OtaConfig {
-                endpoint: 1,
-                ..OtaConfig::default()
-            },
-        );
-        let mut profile = OptionalOta::enabled(profile(), ota).unwrap();
-        assert!(profile.is_enabled());
-        let endpoint = EndpointBuilder {
-            endpoint: 1,
-            profile_id: PROFILE_HOME_AUTOMATION,
-            device_id: DeviceId::TEMPERATURE_SENSOR,
-            device_version: 1,
-            server_clusters: Vec::new(),
-            client_clusters: Vec::new(),
-        };
-        let endpoint = profile.configure_endpoint(endpoint);
-        assert_eq!(
-            endpoint.client_clusters.as_slice(),
-            &[ClusterId::OTA_UPGRADE]
-        );
-
-        let mut clusters = ApplicationClusters::new();
-        profile.collect_clusters(&mut clusters).unwrap();
-        assert_eq!(clusters.len(), 4);
-        assert_eq!(
-            clusters.last().map(|cluster| cluster.cluster.cluster_id()),
-            Some(ClusterId::OTA_UPGRADE)
-        );
-    }
-
-    #[cfg(feature = "ota")]
-    #[test]
-    fn optional_ota_disabled_omits_client_cluster_but_keeps_endpoint_working() {
-        let mut profile = OptionalOta::<_, StubWriter>::disabled(profile(), 0x1234, 0x0001, 1);
-        assert!(!profile.is_enabled());
-        let endpoint = EndpointBuilder {
-            endpoint: 1,
-            profile_id: PROFILE_HOME_AUTOMATION,
-            device_id: DeviceId::TEMPERATURE_SENSOR,
-            device_version: 1,
-            server_clusters: Vec::new(),
-            client_clusters: Vec::new(),
-        };
-        let endpoint = profile.configure_endpoint(endpoint);
-        assert!(
-            endpoint.client_clusters.is_empty(),
-            "a disabled backend must not advertise the OTA client cluster"
-        );
-        assert_eq!(profile.expected_report_clusters(), 3);
-
-        // The inert cluster is still collected, so a client that addresses
-        // cluster 0x0019 directly gets a well-formed (if unsupported) reply
-        // instead of nothing being dispatched at all.
-        let mut clusters = ApplicationClusters::new();
-        profile.collect_clusters(&mut clusters).unwrap();
-        assert_eq!(clusters.len(), 4);
-        assert_eq!(
-            clusters.last().map(|cluster| cluster.cluster.cluster_id()),
-            Some(ClusterId::OTA_UPGRADE)
-        );
-    }
-
-    #[cfg(feature = "ota")]
-    #[test]
-    fn optional_ota_rejects_endpoint_mismatch_when_enabled() {
-        use crate::ota::{OtaConfig, OtaManager};
-
-        let ota = OtaManager::new(
-            StubWriter,
-            OtaConfig {
-                endpoint: 2,
-                ..OtaConfig::default()
-            },
-        );
-        assert!(matches!(
-            OptionalOta::enabled(profile(), ota),
             Err(ProfileError::EndpointMismatch {
                 profile_endpoint: 1,
                 component_endpoint: 2,

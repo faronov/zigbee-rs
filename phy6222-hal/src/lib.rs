@@ -8,6 +8,7 @@
 //! - [`i2c`] — DesignWare I2C master, 100kHz/400kHz, polling mode
 //! - [`adc`] — ADC single-shot battery voltage measurement
 //! - [`flash`] — SPIF flash controller: read (XIP), write, sector erase
+//! - [`Peripherals`] — exclusive ownership tokens for stateful peripherals
 //!
 //! Boot layout, flash size, and ROM services vary by chip. Applications must
 //! select and validate a concrete device layout rather than assuming PHY6222
@@ -19,5 +20,8 @@ pub mod adc;
 pub mod flash;
 pub mod gpio;
 pub mod i2c;
+pub mod peripherals;
 pub mod regs;
 pub mod sleep;
+
+pub use peripherals::Peripherals;

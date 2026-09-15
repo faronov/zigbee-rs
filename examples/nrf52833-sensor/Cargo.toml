@@ -18,6 +18,7 @@ zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 nrf-sensor-app = { path = "../../apps/nrf-sensor" }
+sensor-sed-app = { path = "../../apps/sensor-sed" }
 nrf52833-dk = { path = "../../boards/nrf52833-dk" }
 nrf52833-sensor-product = { path = "../../products/nrf52833-sensor" }
 zigbee-bme280 = { package = "zigbee-bme280", path = "../../drivers/bme280", optional = true }

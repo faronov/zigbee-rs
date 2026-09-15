@@ -416,8 +416,8 @@ name = "phy6222-hal"
 version = "0.1.0"
 dependencies = [
  "cortex-m",
+ "embedded-hal 1.0.0",
  "embedded-storage",
- "log",
 ]
 
 [[package]]
@@ -427,21 +427,14 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "embassy-executor",
- "embassy-futures",
  "embassy-time 0.5.1",
- "embassy-time-driver",
- "heapless 0.8.0",
  "log",
  "panic-halt",
- "phy6222-hal",
  "phy62x2-evk",
- "portable-atomic",
- "zigbee-aps",
+ "phy62x2-evk-product",
+ "sensor-sed-app",
  "zigbee-mac",
- "zigbee-nwk",
  "zigbee-runtime",
- "zigbee-types",
- "zigbee-zcl",
 ]
 
 [[package]]
@@ -454,7 +447,19 @@ dependencies = [
  "embedded-storage",
  "phy6222-hal",
  "portable-atomic",
+]
+
+[[package]]
+name = "phy62x2-evk-product"
+version = "0.1.0"
+dependencies = [
+ "embedded-storage",
+ "phy62x2-evk",
+ "sensor-sed-app",
+ "zigbee-aps",
  "zigbee-runtime",
+ "zigbee-types",
+ "zigbee-zcl",
 ]
 
 [[package]]
@@ -524,6 +529,15 @@ name = "semver-parser"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
+
+[[package]]
+name = "sensor-sed-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-mac",
+ "zigbee-runtime",
+ "zigbee-zcl",
+]
 
 [[package]]
 name = "stable_deref_trait"

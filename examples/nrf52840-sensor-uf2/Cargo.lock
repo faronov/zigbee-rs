@@ -628,6 +628,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrf-sensor-app"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "defmt",
+ "embassy-futures",
+ "embassy-nrf",
+ "embassy-time",
+ "sensor-sed-app",
+ "zigbee-mac",
+ "zigbee-runtime",
+]
+
+[[package]]
+name = "nrf52840-dk"
+version = "0.1.0"
+dependencies = [
+ "embassy-nrf",
+]
+
+[[package]]
+name = "nrf52840-mdk-usb-dongle"
+version = "0.1.0"
+dependencies = [
+ "embassy-nrf",
+]
+
+[[package]]
+name = "nrf52840-pca10059"
+version = "0.1.0"
+dependencies = [
+ "embassy-nrf",
+]
+
+[[package]]
+name = "nrf52840-promicro"
+version = "0.1.0"
+dependencies = [
+ "embassy-nrf",
+]
+
+[[package]]
+name = "nrf52840-sensor-product"
+version = "0.1.0"
+dependencies = [
+ "embassy-nrf",
+ "embedded-storage",
+ "nrf52840-dk",
+ "sensor-sed-app",
+ "zigbee-aps",
+ "zigbee-runtime",
+ "zigbee-zcl",
+]
+
+[[package]]
 name = "nrf52840-sensor-uf2"
 version = "0.1.0"
 dependencies = [
@@ -636,16 +691,18 @@ dependencies = [
  "defmt",
  "defmt-rtt",
  "embassy-executor",
- "embassy-futures",
  "embassy-nrf",
  "embassy-time",
- "embedded-hal 1.0.0",
  "log",
+ "nrf-sensor-app",
+ "nrf52840-dk",
+ "nrf52840-mdk-usb-dongle",
+ "nrf52840-pca10059",
+ "nrf52840-promicro",
+ "nrf52840-sensor-product",
  "panic-probe",
- "static_cell",
- "zigbee-aps",
+ "sensor-sed-app",
  "zigbee-mac",
- "zigbee-nwk",
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zcl",
@@ -764,19 +821,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
 
 [[package]]
+name = "sensor-sed-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-mac",
+ "zigbee-runtime",
+ "zigbee-zcl",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "static_cell"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0530892bb4fa575ee0da4b86f86c667132a94b74bb72160f58ee5a4afec74c23"
-dependencies = [
- "portable-atomic",
-]
 
 [[package]]
 name = "strsim"

@@ -9,11 +9,12 @@ mod cluster_tests;
 #[cfg(test)]
 mod efr32mg1_pm_tests;
 #[cfg(test)]
+#[path = "../../examples/efr32mg21-sensor/src/time_snapshot.rs"]
+mod efr32mg21_time_snapshot;
+#[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
 mod mac_tests;
-#[cfg(test)]
-mod nrf_sensor_policy_tests;
 #[cfg(test)]
 mod nwk_tests;
 #[cfg(test)]

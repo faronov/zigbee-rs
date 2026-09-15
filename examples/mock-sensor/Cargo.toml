@@ -8,10 +8,5 @@ name = "mock-sensor"
 path = "src/main.rs"
 
 [dependencies]
-zigbee-types = { path = "../../zigbee-types" }
-zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
-zigbee-nwk = { path = "../../zigbee-nwk" }
-zigbee-zcl = { path = "../../zigbee-zcl" }
-zigbee-runtime = { path = "../../zigbee-runtime" }
-zigbee = { path = "../../zigbee" }
+mock-sleepy-sensor = { path = "../mock-sleepy-sensor" }
 pollster = "0.4"

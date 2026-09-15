@@ -9,6 +9,20 @@ use aes::cipher::{BlockEncrypt, KeyInit};
 /// A 128-bit AES key.
 pub type AesKey = [u8; 16];
 
+/// Stable non-secret identity for binding persisted counter state to a key.
+///
+/// This is not used as authentication material. A collision can only retain a
+/// stale high replay floor (fail closed); it cannot make a forged frame pass
+/// CCM authentication.
+pub fn key_fingerprint(key: &AesKey) -> u32 {
+    let mut hash = 0x811C_9DC5u32;
+    for byte in key {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
 /// AES-CCM* nonce length used by Zigbee.
 pub const CCM_STAR_NONCE_LEN: usize = 13;
 /// MIC length for Zigbee ENC-MIC-32 security.
@@ -150,6 +164,131 @@ impl SoftwareAesProvider {
 }
 
 impl ForwardAesProvider for SoftwareAesProvider {}
+
+/// Failure while hashing data with Zigbee's AES-MMO construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AesMmoError {
+    /// The input length cannot be represented by the 16-bit bit-length field.
+    InputTooLong,
+    /// The selected AES backend failed.
+    CipherFailure,
+}
+
+/// Failure while validating or deriving a Zigbee install-code link key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallCodeError {
+    /// The full code must contain 6, 8, 12, or 16 data bytes plus a 2-byte CRC.
+    InvalidLength,
+    /// The appended little-endian CRC-16/X-25 does not match the code bytes.
+    InvalidCrc,
+    /// The selected AES backend failed while computing the AES-MMO hash.
+    CipherFailure,
+}
+
+fn aes_mmo_compress<P: ForwardAesProvider>(
+    provider: &mut P,
+    hash: &mut AesKey,
+    message: &[u8; 16],
+) -> Result<(), AesMmoError> {
+    let mut encrypted = *message;
+    {
+        let mut cipher = provider.forward_cipher(hash);
+        cipher
+            .encrypt_block(&mut encrypted)
+            .map_err(|_| AesMmoError::CipherFailure)?;
+    }
+    for (dst, (&ciphertext, &plaintext)) in
+        hash.iter_mut().zip(encrypted.iter().zip(message.iter()))
+    {
+        *dst = ciphertext ^ plaintext;
+    }
+    Ok(())
+}
+
+/// Zigbee AES-MMO hash (Core R22 Annex B.1.3) using software AES.
+pub fn aes_mmo_hash(data: &[u8]) -> Result<AesKey, AesMmoError> {
+    aes_mmo_hash_with(&mut SoftwareAesProvider::new(), data)
+}
+
+/// Zigbee AES-MMO hash using a platform-provided forward AES implementation.
+///
+/// The message is padded with `0x80`, zeroes, and a 16-bit big-endian bit
+/// length as defined by the Zigbee security specification.
+pub fn aes_mmo_hash_with<P: ForwardAesProvider>(
+    provider: &mut P,
+    data: &[u8],
+) -> Result<AesKey, AesMmoError> {
+    let bit_len = data
+        .len()
+        .checked_mul(8)
+        .and_then(|len| u16::try_from(len).ok())
+        .ok_or(AesMmoError::InputTooLong)?;
+    let mut hash = [0u8; 16];
+    let mut chunks = data.chunks_exact(16);
+
+    for chunk in &mut chunks {
+        let mut block = [0u8; 16];
+        block.copy_from_slice(chunk);
+        aes_mmo_compress(provider, &mut hash, &block)?;
+    }
+
+    let remainder = chunks.remainder();
+    let mut final_block = [0u8; 16];
+    final_block[..remainder.len()].copy_from_slice(remainder);
+    final_block[remainder.len()] = 0x80;
+    if remainder.len() > 13 {
+        aes_mmo_compress(provider, &mut hash, &final_block)?;
+        final_block = [0u8; 16];
+    }
+    final_block[14..16].copy_from_slice(&bit_len.to_be_bytes());
+    aes_mmo_compress(provider, &mut hash, &final_block)?;
+    Ok(hash)
+}
+
+/// Calculate the CRC appended to a Zigbee installation code.
+///
+/// Zigbee uses CRC-16/X-25 (`poly=0x1021`, reflected form `0x8408`,
+/// `init=0xFFFF`, `xorout=0xFFFF`) and stores the result little-endian.
+pub fn install_code_crc(data: &[u8]) -> u16 {
+    let mut crc = 0xFFFFu16;
+    for &byte in data {
+        crc ^= u16::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x8408
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// Validate an installation code and derive its preconfigured link key.
+///
+/// The input includes the trailing 2-byte little-endian CRC. The complete
+/// validated value, including that CRC, is the AES-MMO hash input.
+pub fn derive_install_code_key(code: &[u8]) -> Result<AesKey, InstallCodeError> {
+    derive_install_code_key_with(&mut SoftwareAesProvider::new(), code)
+}
+
+/// [`derive_install_code_key`] using a platform-provided AES implementation.
+pub fn derive_install_code_key_with<P: ForwardAesProvider>(
+    provider: &mut P,
+    code: &[u8],
+) -> Result<AesKey, InstallCodeError> {
+    if !matches!(code.len(), 8 | 10 | 14 | 18) {
+        return Err(InstallCodeError::InvalidLength);
+    }
+
+    let data_len = code.len() - 2;
+    let expected_crc = u16::from_le_bytes([code[data_len], code[data_len + 1]]);
+    if install_code_crc(&code[..data_len]) != expected_crc {
+        return Err(InstallCodeError::InvalidCrc);
+    }
+
+    aes_mmo_hash_with(provider, code).map_err(|_| InstallCodeError::CipherFailure)
+}
 
 /// Encrypt a Zigbee payload with AES-128-CCM* using M=4 and L=2.
 ///
@@ -523,6 +662,53 @@ pub mod efr32mg1 {
 
     #[cfg(target_arch = "arm")]
     pub use hardware::HardwareAes128;
+}
+
+#[cfg(test)]
+mod install_code_tests {
+    use super::*;
+
+    const SILABS_INSTALL_CODE: [u8; 18] = [
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0xD4, 0x90,
+    ];
+
+    #[test]
+    fn install_code_crc_matches_silicon_labs_vectors() {
+        assert_eq!(
+            install_code_crc(&[
+                0x83, 0xFE, 0xD3, 0x40, 0x7A, 0x93, 0x97, 0x23, 0xA5, 0xC6, 0x39, 0xB2, 0x69, 0x16,
+                0xD5, 0x05,
+            ]),
+            0xB5C3
+        );
+        assert_eq!(install_code_crc(&SILABS_INSTALL_CODE[..16]), 0x90D4);
+    }
+
+    #[test]
+    fn install_code_derivation_matches_silicon_labs_link_key() {
+        assert_eq!(
+            derive_install_code_key(&SILABS_INSTALL_CODE),
+            Ok([
+                0xFA, 0x80, 0x81, 0xCA, 0xAA, 0x41, 0xD5, 0xAD, 0xE9, 0xB5, 0x65, 0x87, 0x99, 0x26,
+                0x8B, 0x88,
+            ])
+        );
+    }
+
+    #[test]
+    fn install_code_validation_is_fail_closed() {
+        let mut corrupted = SILABS_INSTALL_CODE;
+        corrupted[0] ^= 1;
+        assert_eq!(
+            derive_install_code_key(&corrupted),
+            Err(InstallCodeError::InvalidCrc)
+        );
+        assert_eq!(
+            derive_install_code_key(&SILABS_INSTALL_CODE[..17]),
+            Err(InstallCodeError::InvalidLength)
+        );
+    }
 }
 
 #[cfg(test)]

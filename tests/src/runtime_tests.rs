@@ -92,7 +92,9 @@ fn test_temperature_sensor_template() {
 
 #[test]
 fn test_on_off_light_template() {
-    let device = templates::on_off_light(make_mock()).build_router();
+    let device = templates::on_off_light(make_mock())
+        .device_type(DeviceType::Router)
+        .build_router();
     assert_eq!(device.device_type(), DeviceType::Router);
     assert!(device.endpoints()[0]
         .server_clusters
@@ -101,7 +103,9 @@ fn test_on_off_light_template() {
 
 #[test]
 fn test_color_temperature_light_template() {
-    let device = templates::color_temperature_light(make_mock()).build_router();
+    let device = templates::color_temperature_light(make_mock())
+        .device_type(DeviceType::Router)
+        .build_router();
     assert!(device.endpoints()[0]
         .server_clusters
         .contains(&ClusterId::COLOR_CONTROL));
@@ -115,7 +119,9 @@ fn test_color_temperature_light_template() {
 
 #[test]
 fn test_smart_plug_template() {
-    let device = templates::smart_plug(make_mock()).build_router();
+    let device = templates::smart_plug(make_mock())
+        .device_type(DeviceType::Router)
+        .build_router();
     assert!(device.endpoints()[0]
         .server_clusters
         .contains(&ClusterId::ELECTRICAL_MEASUREMENT));

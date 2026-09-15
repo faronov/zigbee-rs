@@ -4,8 +4,8 @@
 //! crash-safe security persistence partition (`storage`), the battery
 //! chemistry policy (`battery`), and the concrete Zigbee profile
 //! (`profile`) built from shared `zigbee-runtime` archetypes. See
-//! `boards/nrf52833-dk` for the physical wiring this product selects and
-//! `apps/nrf-sensor` for the shared application lifecycle it runs.
+//! `boards/nrf52833-dk` for the physical wiring this product selects. Its
+//! composition root runs the shared lifecycle from `apps/sensor-sed`.
 //!
 //! The only intentional differences from `products/nrf52840-sensor` are the
 //! ones the silicon forces:
@@ -24,6 +24,7 @@
 #![no_std]
 
 pub mod battery;
+pub mod policy;
 pub mod profile;
 #[cfg(target_os = "none")]
 pub mod storage;

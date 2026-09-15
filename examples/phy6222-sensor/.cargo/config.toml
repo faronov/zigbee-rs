@@ -3,12 +3,14 @@ target = "thumbv6m-none-eabi"
 
 [target.thumbv6m-none-eabi]
 rustflags = [
-    "-L", "../../boards/phy62x2-evk/link",
+    "-L", "../../products/phy62x2-evk/link",
+    # Share identical monomorphized functions within the fixed XIP slot.
+    "-C", "link-arg=--icf=all",
     "-C", "link-arg=-Tphy6222.x",
 ]
 
 [unstable]
-build-std = ["core", "alloc"]
+build-std = ["core"]
 
 [env]
 DEFMT_LOG = "info"

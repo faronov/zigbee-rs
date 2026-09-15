@@ -1,6 +1,7 @@
 //! CC2340 IEEE 802.15.4 PHY settings imported at build time.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Widths present only when the SDK-generated PHY table uses them.
 pub(crate) enum RegisterWidth {
     U16,
     U32,

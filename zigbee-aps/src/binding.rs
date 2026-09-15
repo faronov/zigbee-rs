@@ -40,7 +40,7 @@ pub enum BindingDstMode {
 ///
 /// Each entry maps:
 ///   (src_addr, src_endpoint, cluster_id) → destination
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingEntry {
     /// Source IEEE address (this device, typically)
     pub src_addr: IeeeAddress,
@@ -95,6 +95,7 @@ impl BindingEntry {
 // ── Binding table ───────────────────────────────────────────────
 
 /// Fixed-capacity binding table.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingTable {
     entries: heapless::Vec<BindingEntry, MAX_BINDING_ENTRIES>,
 }

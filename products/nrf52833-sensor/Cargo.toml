@@ -13,6 +13,7 @@ publish = false
 sensor-bme280 = []
 
 [dependencies]
+sensor-sed-app = { path = "../../apps/sensor-sed" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }

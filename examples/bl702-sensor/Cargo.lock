@@ -36,11 +36,9 @@ dependencies = [
  "panic-halt",
  "riscv",
  "riscv-rt",
- "zigbee-aps",
+ "sensor-sed-app",
  "zigbee-mac",
- "zigbee-nwk",
  "zigbee-runtime",
- "zigbee-types",
  "zigbee-zcl",
 ]
 
@@ -58,7 +56,11 @@ dependencies = [
  "bl702-hal",
  "bl702-xt-zb1",
  "embedded-storage",
+ "sensor-sed-app",
+ "zigbee-aps",
  "zigbee-runtime",
+ "zigbee-types",
+ "zigbee-zcl",
 ]
 
 [[package]]
@@ -514,6 +516,15 @@ dependencies = [
  "critical-section",
  "portable-atomic",
  "ufmt-write",
+]
+
+[[package]]
+name = "sensor-sed-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-mac",
+ "zigbee-runtime",
+ "zigbee-zcl",
 ]
 
 [[package]]

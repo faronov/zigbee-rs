@@ -16,8 +16,8 @@ bl702-hal = { path = "../bl702-hal", optional = true }
 efr32mg1-hal = { path = "../efr32mg1-hal", optional = true }
 
 # ── ESP32-C6 backend ────────────────────────────────────────
-esp-hal = { version = "1.0.0", features = ["rt", "unstable"], default-features = false, optional = true }
-esp-radio = { version = "0.17.0", features = ["ieee802154", "unstable"], default-features = false, optional = true }
+esp-hal = { version = "=1.0.0", features = ["rt", "unstable"], default-features = false, optional = true }
+esp-radio = { version = "=0.17.0", features = ["ieee802154", "unstable"], default-features = false, optional = true }
 esp-alloc = { version = "0.9.0", optional = true }
 esp-sync = { version = "0.1.0", optional = true }
 
@@ -107,6 +107,14 @@ telink = ["tlsr8258"]
 hardware-aes = [
     "tlsr8258",
     "zigbee-crypto/tlsr8258",
+]
+
+# TLSR8258 reset-on-wake restoration hooks. Kept separate from `tlsr8258`
+# so the validated full-SRAM SUSPEND production images do not gain a second
+# resume path until the dedicated proof is selected.
+telink-retention-proof = [
+    "tlsr8258",
+    "tlsr8258-hal/retention-proof",
 ]
 
 # BL702 SEC_ENG hardware AES-128 accelerator backend.

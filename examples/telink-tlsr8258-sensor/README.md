@@ -1,41 +1,102 @@
-# TLSR8258 Zigbee Sensor
+# TLSR8258 Zigbee sensor
 
-A pure-Rust polling Zigbee end device for the Telink TLSR8258/TB-04 board.
-This directory contains one firmware role and no hardware bring-up code.
+Pure-Rust TB-04 environmental sleepy end device using the shared
+`sensor_sed_app::SensorApp`.
 
-## What to read
+## Ownership
 
 ```text
-src/main.rs      reset glue and application selection
-src/app.rs       Zigbee device, clusters, commissioning, polling, reporting
-../../boards/tlsr8258-tb04
-                 TB-04 LEDs, flash token, and typed resources
-../../products/tlsr8258-tb04
-                 security partition, journal, and linker layout
+environmental Sleepy End Device profile
+        ↓
+products/tlsr8258-tb04
+        ↓
+boards/tlsr8258-tb04
+        ↓
+tlsr8258-hal + TelinkMac + tlsr8258-rt
 ```
 
-The application exposes Basic, Power Configuration, Identify, Temperature,
-and Relative Humidity clusters. Synthetic temperature and humidity values
-change every 30 seconds so reporting can be tested without an external sensor.
+This example is the composition/reset root. `src/app.rs` assembles
+borrowed/static TC32 resources and reset-on-wake entry.
+It does not contain a separate commissioning, polling, reporting, or
+persistence state machine.
 
-This is a polling Zigbee end device (`rx_on_when_idle = false`), but it does
-not yet enter TLSR8258 retention sleep. A separate sleepy-end-device example
-will be added only after retention startup and radio resume are hardware-proven.
+The profile exposes Basic, Power Configuration, Identify, Temperature, and
+Relative Humidity. Temperature/humidity are synthetic.
+
+## Default power path
+
+The default product policy is:
+
+```text
+fast wait: Active
+slow wait: Idle
+slow poll: 250 ms
+```
+
+`Idle` is an atomic full-SRAM timer `SUSPEND` transaction:
+
+1. quiesce MAC/RF/DMA;
+2. enter SUSPEND using the calibrated RC32K wake source;
+3. restore clocks, timer, radio, DMA, AES, and MAC state;
+4. return to the shared `step()` lifecycle.
+
+The default sensor does enter SUSPEND. LOW32K retention is a separate
+feature-gated image.
+
+## LOW32K proof images
+
+```bash
+./scripts/tlsr8258.sh build sensor-retention
+./scripts/tlsr8258.sh build sensor-retention-10s
+```
+
+- `sensor-retention`: reset-on-wake `Retention`, 250 ms slow cadence.
+- `sensor-retention-10s`: the same restore path, 10-second slow cadence.
+
+The independent retention HIL uses:
+
+```text
+pass: 0x5254600D
+fail: 0xDEADxxxx
+```
+
+A successful build or symbol check is not the pass marker.
 
 ## Build
 
-Install the `tc32-stage2-tc32-45` toolchain under
-`.toolchains/tc32-stage2-tc32-45`, then run from the repository root:
+Install `tc32-stage2-tc32-45` under
+`.toolchains/tc32-stage2-tc32-45`, then from the repository root:
 
 ```bash
 ./scripts/tlsr8258.sh build sensor
+./scripts/tlsr8258.sh build sensor-retention
+./scripts/tlsr8258.sh build sensor-retention-10s
 ```
 
-The flashable image is:
+Current images:
 
-```text
-examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin
-```
+| image | bytes | regression gate |
+|---|---:|---:|
+| default SUSPEND | 290,616 | 294,912 |
+| LOW32K 250 ms | 295,548 | 299,008 |
+| LOW32K 10 s | 295,552 | 299,008 |
 
-Hardware diagnostics and the legacy manual stack live in
-`tools/telink-tlsr8258-lab`, not in this example.
+The retained fresh-root SVC stack is 8,448 B, 256 B above its 8 KiB gate.
+
+## Storage
+
+The product security journal is `0x74000..0x76000`. Factory EUI/config remain
+at `0x76000..0x78000`. The sensor drops the router-only APS-table and
+child-table partition tokens. The product selects the orthogonal
+`compact-single-endpoint` capacity only after asserting that its one endpoint
+and report set fit the two-endpoint/four-report limits.
+
+## Validation
+
+The exact images above are build/layout-tested. Earlier hardware evidence
+exists for the secured TB-04 Zigbee/AES/persistence path and the timer SUSPEND
+primitive. Remaining acceptance includes repeated
+application-level SUSPEND with network/counter checks and measured current,
+plus LOW32K completion using the marker above.
+
+Hardware diagnostics stay under `tools/telink-tlsr8258-lab`.

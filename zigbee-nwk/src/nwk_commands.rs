@@ -4,13 +4,13 @@
 //! (Route Request, Route Reply, Link Status, Route Record).
 
 use crate::frames::{
-    EdTimeoutRequest, LINK_STATUS_ENTRIES_PER_FRAME, LinkStatusCommand, NetworkStatusCommand,
-    NwkCommandId, NwkFrameControl, NwkFrameType, NwkHeader, PanIdConflictReport, PanIdUpdate,
-    RouteReply, RouteRequest,
+    EdTimeoutRequest, LINK_STATUS_ENTRIES_PER_FRAME, LeaveCommand, LinkStatusCommand,
+    NetworkStatusCommand, NwkCommandId, NwkFrameControl, NwkFrameType, NwkHeader,
+    PanIdConflictReport, PanIdUpdate, RouteReply, RouteRequest,
 };
 use crate::nlde::{is_nwk_broadcast, is_unicast_address};
 use crate::routing::routing_random_sample;
-use crate::{NwkLayer, NwkStatus};
+use crate::{IndirectFrameKind, LeaveRequestDelivery, NwkLayer, NwkStatus};
 use zigbee_mac::{AddressMode, MacDriver, McpsDataRequest, TxOptions};
 use zigbee_types::*;
 
@@ -23,6 +23,35 @@ const MIN_RREQ_JITTER_MS: u32 = 2;
 const MAX_RREQ_JITTER_MS: u32 = 128;
 
 impl<M: MacDriver> NwkLayer<M> {
+    /// Send a secured NWK Leave request to a child or router.
+    pub async fn send_leave_request(
+        &mut self,
+        destination: ShortAddress,
+        remove_children: bool,
+        rejoin: bool,
+    ) -> Result<LeaveRequestDelivery, NwkStatus> {
+        if !is_unicast_address(destination) {
+            return Err(NwkStatus::InvalidRequest);
+        }
+        let command = LeaveCommand {
+            remove_children,
+            request: true,
+            rejoin,
+        };
+        let indirect = self
+            .send_nwk_command_with_delivery(
+                destination,
+                NwkCommandId::Leave,
+                &[command.serialize()],
+            )
+            .await?;
+        Ok(if indirect {
+            LeaveRequestDelivery::Indirect
+        } else {
+            LeaveRequestDelivery::Direct
+        })
+    }
+
     /// Build and send a NWK command frame.
     async fn send_nwk_command(
         &mut self,
@@ -30,10 +59,30 @@ impl<M: MacDriver> NwkLayer<M> {
         cmd_id: NwkCommandId,
         cmd_payload: &[u8],
     ) -> Result<(), NwkStatus> {
+        self.send_nwk_command_with_delivery(dst_addr, cmd_id, cmd_payload)
+            .await
+            .map(|_| ())
+    }
+
+    async fn send_nwk_command_with_delivery(
+        &mut self,
+        dst_addr: ShortAddress,
+        cmd_id: NwkCommandId,
+        cmd_payload: &[u8],
+    ) -> Result<bool, NwkStatus> {
         let is_broadcast = is_nwk_broadcast(dst_addr);
         let radius = if is_broadcast { 30 } else { 10 };
-        self.send_nwk_command_with_radius(dst_addr, cmd_id, cmd_payload, radius)
-            .await
+        self.send_nwk_command_from_with_radius_delivery(
+            dst_addr,
+            self.nib.network_address,
+            Some(self.nib.ieee_address),
+            None,
+            cmd_id,
+            cmd_payload,
+            radius,
+            None,
+        )
+        .await
     }
 
     /// Build and send a NWK command frame with explicit radius.
@@ -76,6 +125,32 @@ impl<M: MacDriver> NwkLayer<M> {
         radius: u8,
         explicit_next_hop: Option<ShortAddress>,
     ) -> Result<(), NwkStatus> {
+        self.send_nwk_command_from_with_radius_delivery(
+            dst_addr,
+            src_addr,
+            src_ieee,
+            dst_ieee,
+            cmd_id,
+            cmd_payload,
+            radius,
+            explicit_next_hop,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_nwk_command_from_with_radius_delivery(
+        &mut self,
+        dst_addr: ShortAddress,
+        src_addr: ShortAddress,
+        src_ieee: Option<IeeeAddress>,
+        dst_ieee: Option<IeeeAddress>,
+        cmd_id: NwkCommandId,
+        cmd_payload: &[u8],
+        radius: u8,
+        explicit_next_hop: Option<ShortAddress>,
+    ) -> Result<bool, NwkStatus> {
         if !self.joined {
             return Err(NwkStatus::InvalidRequest);
         }
@@ -124,6 +199,34 @@ impl<M: MacDriver> NwkLayer<M> {
             None => self.resolve_next_hop(dst_addr)?,
         };
 
+        let sleepy_direct_child = explicit_next_hop.is_none()
+            && next_hop == dst_addr
+            && self.neighbors.find_by_short(next_hop).is_some_and(|entry| {
+                entry.relationship == crate::neighbor::Relationship::Child && !entry.rx_on_when_idle
+            });
+        if sleepy_direct_child {
+            let kind = if cmd_id == NwkCommandId::Leave {
+                IndirectFrameKind::Leave
+            } else {
+                IndirectFrameKind::Data
+            };
+            let Some(slot) =
+                self.indirect
+                    .enqueue_tagged_with_slot(next_hop, &buf[..total_len], kind)
+            else {
+                return Err(NwkStatus::FrameNotBuffered);
+            };
+            if self
+                .mac
+                .set_indirect_data_pending(MacAddress::Short(self.nib.pan_id, next_hop), true)
+                .is_err()
+            {
+                self.indirect.remove_slot(slot);
+                return Err(NwkStatus::FrameNotBuffered);
+            }
+            return Ok(true);
+        }
+
         self.mac
             .mcps_data(McpsDataRequest {
                 src_addr_mode: AddressMode::Short,
@@ -138,7 +241,7 @@ impl<M: MacDriver> NwkLayer<M> {
             .await
             .map_err(|_| NwkStatus::RouteError)?;
 
-        Ok(())
+        Ok(false)
     }
 
     /// Send a Route Request (RREQ) broadcast.
@@ -427,15 +530,13 @@ impl<M: MacDriver> NwkLayer<M> {
     ///
     /// R22 §3.6.1.9.3: the offending 16-bit address goes in the command's
     /// destination address field and the frame is broadcast to `0xFFFD`, i.e.
-    /// every device with `macRxOnWhenIdle = TRUE`. Only a router or the
-    /// coordinator originates this broadcast.
+    /// every device with `macRxOnWhenIdle = TRUE`. A router/coordinator reports
+    /// foreign conflicts; any device, including an end device, reports a
+    /// conflict on its own address before it changes/rejoins.
     pub(crate) async fn send_address_conflict_status(
         &mut self,
         offending_address: ShortAddress,
     ) -> Result<(), NwkStatus> {
-        if !self.can_route() {
-            return Err(NwkStatus::InvalidRequest);
-        }
         let ns = NetworkStatusCommand {
             status_code: NetworkStatusCommand::ADDRESS_CONFLICT,
             destination: offending_address,
@@ -519,10 +620,38 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Sent by the network manager only. The NWK destination is the `0xFFFF`
     /// broadcast address so the coordinator and every router receive it, and
     /// the payload carries the manager's freshly incremented `nwkUpdateId`.
+    ///
+    /// The local transition is committed only after the MAC accepts the
+    /// broadcast. `handle_network_report` prepares the same transition for the
+    /// direct manager API, so undo that preparation before awaiting the send;
+    /// a failed request must leave the PAN identifier, channel, update ID and
+    /// delivery timer exactly where they were.
     pub(crate) async fn send_pan_id_update(
         &mut self,
-        update: PanIdUpdate,
+        mut update: PanIdUpdate,
     ) -> Result<(), NwkStatus> {
+        let queued_broadcast = self.pending_pan_id_broadcast.is_some_and(|pending| {
+            pending.epid == update.epid && pending.new_pan_id == update.new_pan_id
+        });
+        if queued_broadcast && self.nib.nwk_update_id() == Some(update.update_id) {
+            // A crash-safe restore stores the pre-send update ID together with
+            // the staged PAN identifier. Reconstruct the command's next serial
+            // number without advancing the local NIB before MAC acceptance.
+            update.update_id = update.update_id.wrapping_add(1);
+        }
+        let transition_was_prepared = !queued_broadcast
+            && self.nib.nwk_update_id() == Some(update.update_id)
+            && self
+                .pending_pan_id_update
+                .is_some_and(|pending| pending.new_pan_id == update.new_pan_id);
+        if transition_was_prepared {
+            // A joined network manager has an authoritative update ID. The
+            // prepared value is exactly one serial-number step ahead, including
+            // the 0xFF -> 0x00 wrap.
+            self.nib.set_nwk_update_id(update.update_id.wrapping_sub(1));
+            self.pending_pan_id_update = None;
+        }
+
         if !self.can_route() {
             return Err(NwkStatus::InvalidRequest);
         }
@@ -535,12 +664,40 @@ impl<M: MacDriver> NwkLayer<M> {
             update.new_pan_id.0,
             update.update_id,
         );
-        self.send_nwk_command(
-            ShortAddress::BROADCAST,
-            NwkCommandId::NetworkUpdate,
-            &payload[..len],
-        )
-        .await
+        let result = self
+            .send_nwk_command(
+                ShortAddress::BROADCAST,
+                NwkCommandId::NetworkUpdate,
+                &payload[..len],
+            )
+            .await;
+        if result.is_ok() {
+            self.nib.set_nwk_update_id(update.update_id);
+            self.arm_pan_id_update(update.new_pan_id);
+        }
+        result
+    }
+
+    /// Queue a manager-generated Network Update without committing its local
+    /// transition before the asynchronous send path runs.
+    ///
+    /// `handle_network_report` also performs the receive-side transition used
+    /// by ordinary Network Update consumers. For a manager originating the
+    /// command that ordering is too early, so preserve the chosen update
+    /// payload while restoring the pre-report NIB state. The pending PAN slot
+    /// also retains the selected identifier for crash-safe persistence, but it
+    /// is not eligible to run while the outbound broadcast remains pending.
+    #[cfg(feature = "router")]
+    pub(crate) fn queue_pan_id_update_from_report(&mut self, payload: &[u8]) {
+        if self.pending_pan_id_broadcast.is_some() {
+            return;
+        }
+
+        let previous_update_id = self.nib.nwk_update_id();
+        if let Some(update) = self.handle_network_report(payload) {
+            self.nib.restore_nwk_update_id(previous_update_id);
+            self.pending_pan_id_broadcast = Some(update);
+        }
     }
 
     /// Send a Network Status command through an explicit MAC next hop.
@@ -742,10 +899,11 @@ impl<M: MacDriver> NwkLayer<M> {
             let mut payload = [0u8; 32];
             let len = rrep.serialize(&mut payload);
 
-            if let Err(e) = self
-                .send_nwk_command(pending.next_hop, NwkCommandId::RouteReply, &payload[..len])
-                .await
-            {
+            if let Err(e) = zigbee_types::await_out_of_line!(self.send_nwk_command(
+                pending.next_hop,
+                NwkCommandId::RouteReply,
+                &payload[..len]
+            )) {
                 log::warn!(
                     "[NWK] Failed to send queued RREP to 0x{:04X}: {:?}",
                     pending.next_hop.0,
@@ -756,7 +914,7 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // Drain accepted Route Request forwards
         while let Some(pending) = self.pending_rreq_forwards.pop() {
-            if let Err(e) = self.forward_route_request(&pending).await {
+            if let Err(e) = zigbee_types::await_out_of_line!(self.forward_route_request(&pending)) {
                 log::warn!(
                     "[NWK] Failed to forward RREQ for 0x{:04X}: {:?}",
                     pending.rreq_dst.0,
@@ -776,23 +934,17 @@ impl<M: MacDriver> NwkLayer<M> {
         // Drain pending Network Status (route error) notifications
         while let Some(pending) = self.pending_route_errors.pop() {
             let result = match pending.next_hop {
-                Some(next_hop) => {
-                    self.send_network_status_via(
-                        pending.destination,
-                        pending.status_code,
-                        pending.failed_destination,
-                        next_hop,
-                    )
-                    .await
-                }
-                None => {
-                    self.send_network_status(
-                        pending.destination,
-                        pending.status_code,
-                        pending.failed_destination,
-                    )
-                    .await
-                }
+                Some(next_hop) => zigbee_types::await_out_of_line!(self.send_network_status_via(
+                    pending.destination,
+                    pending.status_code,
+                    pending.failed_destination,
+                    next_hop,
+                )),
+                None => zigbee_types::await_out_of_line!(self.send_network_status(
+                    pending.destination,
+                    pending.status_code,
+                    pending.failed_destination,
+                )),
             };
             if let Err(e) = result {
                 log::warn!(
@@ -817,6 +969,42 @@ impl<M: MacDriver> NwkLayer<M> {
         self.process_pending_conflicts().await;
     }
 
+    /// Apply deferred end-device NWK lifecycle work.
+    ///
+    /// An end device neither relays nor maintains routes, but it still has two
+    /// bounded deferred NWK obligations: announce a locally detected address
+    /// conflict to `0xFFFD`, and switch to an authenticated Network Update's
+    /// PAN ID after `nwkNetworkBroadcastDeliveryTime`. Keep this separate from
+    /// router maintenance so a leaf never links the routing subgraph.
+    pub async fn process_pending_end_device_lifecycle(&mut self) {
+        if self.device_type == crate::DeviceType::EndDevice {
+            self.process_pending_conflicts().await;
+        }
+    }
+
+    /// Finish an end device's locally detected address-conflict announcement.
+    ///
+    /// The caller invokes this only after the receive path made the rejoin
+    /// intent and authenticated replay floor durable. Waiting here keeps the
+    /// bounded R22 broadcast jitter out of the generic receive path while
+    /// ensuring the `0x0D` status is sent before the caller exposes the rejoin
+    /// event to a composition root.
+    pub async fn complete_pending_end_device_conflict_announcement(&mut self) {
+        if self.device_type != crate::DeviceType::EndDevice {
+            return;
+        }
+        let Some(pending) = self.pending_conflicts.first().copied() else {
+            return;
+        };
+        let remaining = pending
+            .send_after_us
+            .wrapping_sub(self.mac.monotonic_micros());
+        if remaining != 0 && remaining < u32::MAX / 2 {
+            self.mac.delay_micros(remaining).await;
+        }
+        self.process_pending_conflicts().await;
+    }
+
     /// Transmit address-conflict broadcasts and apply PAN identifier updates
     /// whose deadlines have passed.
     ///
@@ -834,10 +1022,14 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // The network manager owes the network a Network Update after it
         // accepted a PAN identifier conflict report (R22 §3.6.1.13.2).
-        if let Some(update) = self.pending_pan_id_broadcast.take()
-            && let Err(e) = self.send_pan_id_update(update).await
-        {
-            log::warn!("[NWK] Failed to broadcast PAN ID update: {:?}", e);
+        #[cfg(feature = "router")]
+        if let Some(update) = self.pending_pan_id_broadcast {
+            match self.send_pan_id_update(update).await {
+                Ok(()) => self.pending_pan_id_broadcast = None,
+                Err(e) => {
+                    log::warn!("[NWK] Failed to broadcast PAN ID update: {:?}", e);
+                }
+            }
         }
 
         while let Some(index) = self
@@ -855,7 +1047,12 @@ impl<M: MacDriver> NwkLayer<M> {
             }
         }
 
-        if let Some(pending) = self.pending_pan_id_update
+        #[cfg(feature = "router")]
+        let may_apply_pan_id_update = self.pending_pan_id_broadcast.is_none();
+        #[cfg(not(feature = "router"))]
+        let may_apply_pan_id_update = true;
+        if may_apply_pan_id_update
+            && let Some(pending) = self.pending_pan_id_update
             && now.wrapping_sub(pending.apply_at_us) < u32::MAX / 2
         {
             self.pending_pan_id_update = None;
@@ -865,6 +1062,7 @@ impl<M: MacDriver> NwkLayer<M> {
                     pending.new_pan_id.0,
                     e,
                 );
+                self.arm_pan_id_update(pending.new_pan_id);
             }
         }
     }
@@ -875,6 +1073,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// the new PAN identifier; a router only has to retune the MAC PIB, since
     /// it is not the beacon-issuing PAN coordinator.
     async fn apply_pan_id(&mut self, new_pan_id: PanId) -> Result<(), NwkStatus> {
+        #[cfg(feature = "router")]
         if self.device_type == crate::DeviceType::Coordinator {
             self.mac
                 .mlme_start(zigbee_mac::MlmeStartRequest {
@@ -896,6 +1095,14 @@ impl<M: MacDriver> NwkLayer<M> {
                 .await
                 .map_err(|_| NwkStatus::InvalidRequest)?;
         }
+        #[cfg(not(feature = "router"))]
+        self.mac
+            .mlme_set(
+                zigbee_mac::PibAttribute::MacPanId,
+                zigbee_mac::PibValue::PanId(new_pan_id),
+            )
+            .await
+            .map_err(|_| NwkStatus::InvalidRequest)?;
         log::warn!(
             "[NWK] PAN ID changed 0x{:04X} -> 0x{:04X}",
             self.nib.pan_id.0,

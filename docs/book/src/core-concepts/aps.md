@@ -457,9 +457,14 @@ pub enum ApsKeyType {
     TrustCenterLinkKey      = 0x01, // shared with TC
     NetworkKey              = 0x02, // shared by all devices
     ApplicationLinkKey      = 0x03, // between two app devices
-    DistributedGlobalLinkKey = 0x04, // for distributed TC networks
 }
 ```
+
+`0x04` is **not** an APS StandardKeyType for a distributed global key. On the
+wire, `0x04` names a Trust Center link key in Transport-Key/Request-Key
+commands. A distributed-security global link key is separate provisioned
+configuration used to derive the initial Key-Transport key; it is never added
+to the APS key table as a fifth `ApsKeyType`.
 
 The **well-known default TC link key** is the ASCII string `"ZigBeeAlliance09"`:
 
@@ -473,6 +478,16 @@ pub const DEFAULT_TC_LINK_KEY: [u8; 16] = [
 Every Zigbee 3.0 device ships with this key pre-installed.  During joining,
 the Trust Center encrypts the actual network key with this well-known key so
 it can be delivered securely over the air.
+
+Distributed networks instead use a product-specific certified global link
+key. `zigbee-rs` deliberately has no production default:
+
+```rust,ignore
+device.set_distributed_security_link_key(product::DISTRIBUTED_SECURITY_KEY);
+```
+
+The public `D0..DF` BDB test key is available only for certification tests and
+must not be shipped as a production credential.
 
 ### Link Key Table
 

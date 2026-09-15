@@ -132,15 +132,17 @@ impl Cc2340Driver {
         if self.configured {
             return Ok(());
         }
-        let frequency =
-            hardware::channel_frequency(self.config.channel).ok_or(RadioError::InvalidChannel)?;
-        let tx_power =
-            config::tx_power(self.config.tx_power_dbm).ok_or(RadioError::InvalidTxPower)?;
 
         if !self.images_loaded {
+            // Keep compile-only availability modes observable before consulting
+            // generated PHY-dependent tables such as the PA settings.
             let images = firmware::images().ok_or(RadioError::FirmwareUnavailable)?;
             let phy_writes =
                 config::ieee_802154_phy_writes().ok_or(RadioError::RadioConfigUnavailable)?;
+            let frequency = hardware::channel_frequency(self.config.channel)
+                .ok_or(RadioError::InvalidChannel)?;
+            let tx_power =
+                config::tx_power(self.config.tx_power_dbm).ok_or(RadioError::InvalidTxPower)?;
 
             hardware::setup_device_trim();
             hardware::enable_radio_clocks()?;
@@ -370,6 +372,15 @@ impl Cc2340Driver {
         if let Err(error) = self.abort_active_operation() {
             log::error!("[CC2340 DRV] Failed to abort radio operation: {error:?}");
         }
+    }
+
+    /// Stop an in-flight PBE operation while retaining the initialized radio.
+    ///
+    /// This is the only power-wait transition currently exposed by the MAC;
+    /// `deinit` is deliberately not used for application waits until
+    /// firmware/trim restoration is validated on hardware.
+    pub fn prepare_active_wait(&mut self) -> Result<(), RadioError> {
+        self.abort_active_operation()
     }
 
     fn prepare_operation(&mut self) -> Result<(), RadioError> {

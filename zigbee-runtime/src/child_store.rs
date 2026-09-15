@@ -37,6 +37,9 @@
 //! |---------|----------------------------------------------------|
 //! | 1       | count + per-child identity/timeout (no EPID binding) |
 //! | 2       | extended PAN ID + count + per-child identity/timeout |
+//! | 3       | v2 + crash-safe pending Remove-Device state per child |
+//! | 4       | v3 + pending child-address reassignment intent         |
+//! | 5       | v4 + DeviceLeft notification and remove-children intents |
 //!
 //! A record whose version this firmware does not recognise is skipped while
 //! scanning, exactly like a corrupt one, so **downgrading** to firmware that
@@ -58,19 +61,38 @@ use zigbee_types::IeeeAddress;
 /// below).
 pub const MAX_PERSISTED_CHILDREN: usize = 32;
 
-/// Encoded size of one child record: IEEE (8) + short (2) + flags (1) +
-/// timeout enumeration (1).
-const CHILD_ENTRY_LEN: usize = 12;
+/// Encoded size of one version-2/version-3 child record.
+const LEGACY_CHILD_ENTRY_LEN: usize = 12;
+/// Encoded size of one current child record: the legacy fields plus a
+/// two-byte pending replacement address.
+const CHILD_ENTRY_LEN: usize = 14;
 
 /// Encoded size of the largest child table: the 8-byte extended PAN ID
 /// binding, a one-byte count, then the entries.
-pub const MAX_ENCODED_CHILD_TABLE_LEN: usize = 8 + 1 + MAX_PERSISTED_CHILDREN * CHILD_ENTRY_LEN;
+pub const MAX_ENCODED_CHILD_TABLE_LEN: usize = 8 + 2 + MAX_PERSISTED_CHILDREN * CHILD_ENTRY_LEN;
+
+const TABLE_FLAG_LEAVE_CASCADE_PENDING: u8 = 1 << 0;
+const TABLE_FLAG_LEAVE_CASCADE_REJOIN: u8 = 1 << 1;
+const TABLE_FLAG_MASK: u8 = TABLE_FLAG_LEAVE_CASCADE_PENDING | TABLE_FLAG_LEAVE_CASCADE_REJOIN;
 
 const CHILD_FLAG_RX_ON_WHEN_IDLE: u8 = 1 << 0;
 const CHILD_FLAG_SECURITY_CAPABLE: u8 = 1 << 1;
 const CHILD_FLAG_ROUTER: u8 = 1 << 2;
-const CHILD_FLAG_MASK: u8 =
+const CHILD_FLAG_REMOVAL_PENDING: u8 = 1 << 3;
+const CHILD_REMOVAL_ATTEMPTS_SHIFT: u8 = 4;
+const CHILD_REMOVAL_ATTEMPTS_MASK: u8 = 0b11 << CHILD_REMOVAL_ATTEMPTS_SHIFT;
+const CHILD_FLAG_REASSIGNMENT_PENDING: u8 = 1 << 6;
+const CHILD_FLAG_DEPARTURE_PENDING: u8 = 1 << 7;
+const CHILD_FLAG_V2_MASK: u8 =
     CHILD_FLAG_RX_ON_WHEN_IDLE | CHILD_FLAG_SECURITY_CAPABLE | CHILD_FLAG_ROUTER;
+const CHILD_FLAG_V3_MASK: u8 =
+    CHILD_FLAG_V2_MASK | CHILD_FLAG_REMOVAL_PENDING | CHILD_REMOVAL_ATTEMPTS_MASK;
+
+/// Failed NWK Leave transmissions attempted before the parent removes the
+/// child locally anyway. The Trust Center has already revoked the device, so
+/// retaining an unreachable child indefinitely is less safe than bounded
+/// best-effort delivery.
+pub const MAX_CHILD_REMOVAL_ATTEMPTS: u8 = 3;
 
 /// Errors from the child-table store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +110,100 @@ pub enum ChildStoreError {
     ForeignNetwork,
 }
 
+/// Result of one bounded pending Remove-Device service attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildRemovalOutcome {
+    /// No durable removal transaction is pending.
+    None,
+    /// Delivery is queued for a sleepy child and awaits its next MAC poll.
+    Pending {
+        child_address: IeeeAddress,
+        short_address: u16,
+        attempts: u8,
+    },
+    /// NWK Leave delivery failed and the transaction remains durable.
+    Retry {
+        child_address: IeeeAddress,
+        short_address: u16,
+        attempts: u8,
+        error: zigbee_nwk::NwkStatus,
+    },
+    /// The child was evicted and the durable transaction was cleared.
+    Completed {
+        child_address: IeeeAddress,
+        short_address: u16,
+        attempts: u8,
+        delivered: bool,
+    },
+}
+
+/// Result of one pending child-address reassignment service attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildReassignmentOutcome {
+    /// No durable reassignment transaction is pending.
+    None,
+    /// A sleepy child's response is queued and awaits an actual poll delivery.
+    Pending {
+        child_address: IeeeAddress,
+        old_short_address: u16,
+        new_short_address: u16,
+    },
+    /// The unsolicited Rejoin Response could not be sent; the intent remains
+    /// durable and will be retried.
+    Retry {
+        child_address: IeeeAddress,
+        old_short_address: u16,
+        new_short_address: u16,
+        error: zigbee_nwk::NwkStatus,
+    },
+    /// The response was accepted by the NWK delivery path and the new child
+    /// address was committed.
+    Completed {
+        child_address: IeeeAddress,
+        old_short_address: u16,
+        new_short_address: u16,
+        delivery: zigbee_nwk::RejoinResponseDelivery,
+    },
+}
+
+/// Result of one durable child-departure notification service attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildDepartureOutcome {
+    /// No child departure is waiting for Trust Center notification.
+    None,
+    /// A local Trust Center indication was queued and must be durably handled
+    /// by the coordinator composition before the child record is cleared.
+    PendingLocal {
+        child_address: IeeeAddress,
+        short_address: u16,
+    },
+    /// Trust Center delivery could not be started; the durable record remains.
+    Retry {
+        child_address: IeeeAddress,
+        short_address: u16,
+        error: zigbee_aps::ApsStatus,
+    },
+    /// Local notification handling or remote command submission completed,
+    /// and the departure record was removed from the child journal.
+    /// Remote submission is not proof of Trust Center receipt.
+    Completed {
+        child_address: IeeeAddress,
+        short_address: u16,
+    },
+}
+
+/// Result of one durable remove-children Leave cascade service pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildLeaveCascadeOutcome {
+    /// No cascade transaction is pending.
+    None,
+    /// At least one child still has a bounded Leave/eviction transaction.
+    Progress,
+    /// Every child was checkpointed as removed; the parent may now honour its
+    /// own Leave/Rejoin request.
+    Completed { rejoin: bool },
+}
+
 /// One authenticated child as persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PersistentChild {
@@ -103,6 +219,19 @@ pub struct PersistentChild {
     pub is_router: bool,
     /// Accepted R22 End Device Timeout enumeration (0..=14).
     pub end_device_timeout: u8,
+    /// A Trust Center Remove-Device command was durably accepted for this
+    /// child and still needs its parent-side NWK Leave/eviction transaction.
+    pub removal_pending: bool,
+    /// Failed NWK Leave transmissions already committed for the pending
+    /// removal.
+    pub removal_attempts: u8,
+    /// Replacement short address selected for a crash-safe child-address
+    /// conflict transaction. The current `short_address` remains the response
+    /// destination until the unsolicited Rejoin Response is sent.
+    pub reassignment_address: Option<u16>,
+    /// The child has left the live neighbor table but its Update-Device
+    /// (DeviceLeft) notification is not yet complete.
+    pub departure_pending: bool,
 }
 
 impl PersistentChild {
@@ -119,19 +248,75 @@ impl PersistentChild {
         if self.is_router {
             flags |= CHILD_FLAG_ROUTER;
         }
+        if self.removal_pending {
+            flags |= CHILD_FLAG_REMOVAL_PENDING;
+            flags |= self.removal_attempts << CHILD_REMOVAL_ATTEMPTS_SHIFT;
+        }
+        if self.reassignment_address.is_some() {
+            flags |= CHILD_FLAG_REASSIGNMENT_PENDING;
+        }
+        if self.departure_pending {
+            flags |= CHILD_FLAG_DEPARTURE_PENDING;
+        }
         out[10] = flags;
         out[11] = self.end_device_timeout;
+        out[12..14].copy_from_slice(&self.reassignment_address.unwrap_or(0xFFFF).to_le_bytes());
     }
 
     fn decode(bytes: &[u8; CHILD_ENTRY_LEN]) -> Result<Self, ChildStoreError> {
         let flags = bytes[10];
-        if flags & !CHILD_FLAG_MASK != 0 {
+        let reassignment_pending = flags & CHILD_FLAG_REASSIGNMENT_PENDING != 0;
+        let departure_pending = flags & CHILD_FLAG_DEPARTURE_PENDING != 0;
+        let reassignment_raw = u16::from_le_bytes([bytes[12], bytes[13]]);
+        if reassignment_pending != (reassignment_raw != 0xFFFF) {
+            return Err(ChildStoreError::Corrupt);
+        }
+        let mut legacy = [0u8; LEGACY_CHILD_ENTRY_LEN];
+        legacy.copy_from_slice(&bytes[..LEGACY_CHILD_ENTRY_LEN]);
+        legacy[10] &= !CHILD_FLAG_REASSIGNMENT_PENDING;
+        legacy[10] &= !CHILD_FLAG_DEPARTURE_PENDING;
+        let mut child = Self::decode_fields(
+            &legacy,
+            true,
+            reassignment_pending.then_some(reassignment_raw),
+        )?;
+        child.departure_pending = departure_pending;
+        child.validate()?;
+        Ok(child)
+    }
+
+    fn decode_v3(bytes: &[u8; LEGACY_CHILD_ENTRY_LEN]) -> Result<Self, ChildStoreError> {
+        Self::decode_fields(bytes, true, None)
+    }
+
+    fn decode_v2(bytes: &[u8; LEGACY_CHILD_ENTRY_LEN]) -> Result<Self, ChildStoreError> {
+        Self::decode_fields(bytes, false, None)
+    }
+
+    fn decode_fields(
+        bytes: &[u8],
+        removal_state_supported: bool,
+        reassignment_address: Option<u16>,
+    ) -> Result<Self, ChildStoreError> {
+        let flags = bytes[10];
+        let allowed_flags = if removal_state_supported {
+            CHILD_FLAG_V3_MASK
+        } else {
+            CHILD_FLAG_V2_MASK
+        };
+        if flags & !allowed_flags != 0 {
             return Err(ChildStoreError::Corrupt);
         }
         let mut ieee_address = [0u8; 8];
         ieee_address.copy_from_slice(&bytes[0..8]);
         let short_address = u16::from_le_bytes([bytes[8], bytes[9]]);
         let end_device_timeout = bytes[11];
+        let removal_pending = removal_state_supported && flags & CHILD_FLAG_REMOVAL_PENDING != 0;
+        let removal_attempts = if removal_pending {
+            (flags & CHILD_REMOVAL_ATTEMPTS_MASK) >> CHILD_REMOVAL_ATTEMPTS_SHIFT
+        } else {
+            0
+        };
         let child = Self {
             ieee_address,
             short_address,
@@ -139,6 +324,10 @@ impl PersistentChild {
             security_capable: flags & CHILD_FLAG_SECURITY_CAPABLE != 0,
             is_router: flags & CHILD_FLAG_ROUTER != 0,
             end_device_timeout,
+            removal_pending,
+            removal_attempts,
+            reassignment_address,
+            departure_pending: false,
         };
         child.validate()?;
         Ok(child)
@@ -159,6 +348,22 @@ impl PersistentChild {
         if self.ieee_address == [0u8; 8] {
             return Err(ChildStoreError::Corrupt);
         }
+        if self.removal_attempts > MAX_CHILD_REMOVAL_ATTEMPTS
+            || (!self.removal_pending && self.removal_attempts != 0)
+        {
+            return Err(ChildStoreError::Corrupt);
+        }
+        if let Some(reassignment_address) = self.reassignment_address
+            && (self.removal_pending
+                || self.departure_pending
+                || reassignment_address == self.short_address
+                || !(0x0001..=0xFFF7).contains(&reassignment_address))
+        {
+            return Err(ChildStoreError::Corrupt);
+        }
+        if self.departure_pending && self.removal_pending {
+            return Err(ChildStoreError::Corrupt);
+        }
         Ok(())
     }
 }
@@ -171,6 +376,8 @@ impl PersistentChild {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistentChildTable {
     extended_pan_id: IeeeAddress,
+    leave_cascade_pending: bool,
+    leave_cascade_rejoin: bool,
     children: heapless::Vec<PersistentChild, MAX_PERSISTED_CHILDREN>,
 }
 
@@ -179,6 +386,8 @@ impl PersistentChildTable {
     pub const fn new(extended_pan_id: IeeeAddress) -> Self {
         Self {
             extended_pan_id,
+            leave_cascade_pending: false,
+            leave_cascade_rejoin: false,
             children: heapless::Vec::new(),
         }
     }
@@ -208,9 +417,268 @@ impl PersistentChildTable {
         self.children.is_empty()
     }
 
+    /// Whether a parent Leave must wait for child Leave/eviction checkpoints.
+    pub const fn leave_cascade_pending(&self) -> bool {
+        self.leave_cascade_pending
+    }
+
+    /// Rejoin bit carried by the parent-directed Leave request.
+    pub const fn leave_cascade_rejoin(&self) -> bool {
+        self.leave_cascade_rejoin
+    }
+
     /// Iterate the stored children.
     pub fn children(&self) -> impl Iterator<Item = &PersistentChild> {
         self.children.iter()
+    }
+
+    /// Find a child by its IEEE identity.
+    pub fn child(&self, ieee_address: &IeeeAddress) -> Option<&PersistentChild> {
+        self.children
+            .iter()
+            .find(|child| child.ieee_address == *ieee_address)
+    }
+
+    /// Mark one stored child for crash-safe parent-side removal.
+    ///
+    /// Replaying the same authenticated Remove-Device command is idempotent
+    /// and preserves the already committed retry count.
+    pub fn stage_removal(&mut self, ieee_address: &IeeeAddress) -> Result<bool, ChildStoreError> {
+        let Some(child) = self
+            .children
+            .iter_mut()
+            .find(|child| child.ieee_address == *ieee_address)
+        else {
+            return Ok(false);
+        };
+        if child.departure_pending {
+            return Ok(false);
+        }
+        if child.removal_pending {
+            return Ok(false);
+        }
+        // Remove-Device supersedes an address-conflict reassignment. Keeping
+        // both intents would persist an invalid child and reboot forever.
+        child.reassignment_address = None;
+        child.removal_pending = true;
+        child.removal_attempts = 0;
+        self.validate()?;
+        Ok(true)
+    }
+
+    /// First pending removal, in stable child-table order.
+    pub fn pending_removal(&self) -> Option<&PersistentChild> {
+        self.children.iter().find(|child| child.removal_pending)
+    }
+
+    /// Durably stage a replacement address before sending the unsolicited
+    /// Rejoin Response required for a child-address conflict.
+    pub fn stage_reassignment(
+        &mut self,
+        ieee_address: &IeeeAddress,
+        new_short_address: u16,
+    ) -> Result<bool, ChildStoreError> {
+        let Some(child) = self
+            .children
+            .iter_mut()
+            .find(|child| child.ieee_address == *ieee_address)
+        else {
+            return Ok(false);
+        };
+        if child.reassignment_address == Some(new_short_address) {
+            return Ok(false);
+        }
+        if child.reassignment_address.is_some() || child.removal_pending {
+            return Err(ChildStoreError::Corrupt);
+        }
+        child.reassignment_address = Some(new_short_address);
+        self.validate()?;
+        Ok(true)
+    }
+
+    /// First pending address reassignment, in stable child-table order.
+    pub fn pending_reassignment(&self) -> Option<&PersistentChild> {
+        self.children
+            .iter()
+            .find(|child| child.reassignment_address.is_some())
+    }
+
+    /// Commit a delivered child-address reassignment.
+    pub fn complete_reassignment(
+        &mut self,
+        ieee_address: &IeeeAddress,
+    ) -> Result<bool, ChildStoreError> {
+        let Some(child) = self
+            .children
+            .iter_mut()
+            .find(|child| child.ieee_address == *ieee_address)
+        else {
+            return Ok(false);
+        };
+        let Some(new_short_address) = child.reassignment_address.take() else {
+            return Err(ChildStoreError::Corrupt);
+        };
+        child.short_address = new_short_address;
+        self.validate()?;
+        Ok(true)
+    }
+
+    /// Retain a departed child until its parent has notified the centralized
+    /// Trust Center with Update-Device(DeviceLeft).
+    pub fn stage_departure(
+        &mut self,
+        mut departed: PersistentChild,
+    ) -> Result<bool, ChildStoreError> {
+        if let Some(child) = self
+            .children
+            .iter_mut()
+            .find(|child| child.ieee_address == departed.ieee_address)
+        {
+            if child.departure_pending {
+                return Ok(false);
+            }
+            if child.removal_pending || child.reassignment_address.is_some() {
+                return Err(ChildStoreError::Corrupt);
+            }
+            child.departure_pending = true;
+            self.validate()?;
+            return Ok(true);
+        }
+        departed.removal_pending = false;
+        departed.removal_attempts = 0;
+        departed.reassignment_address = None;
+        departed.departure_pending = true;
+        self.push(departed)?;
+        self.validate()?;
+        Ok(true)
+    }
+
+    /// First child waiting for Update-Device(DeviceLeft).
+    pub fn pending_departure(&self) -> Option<&PersistentChild> {
+        self.children.iter().find(|child| child.departure_pending)
+    }
+
+    /// Iterate all durable departure records.
+    pub fn pending_departures(&self) -> impl Iterator<Item = &PersistentChild> {
+        self.children.iter().filter(|child| child.departure_pending)
+    }
+
+    /// Remove a completed child-departure notification.
+    pub fn complete_departure(
+        &mut self,
+        ieee_address: &IeeeAddress,
+    ) -> Result<bool, ChildStoreError> {
+        let Some(index) = self
+            .children
+            .iter()
+            .position(|child| child.ieee_address == *ieee_address)
+        else {
+            return Ok(false);
+        };
+        if !self.children[index].departure_pending {
+            return Err(ChildStoreError::Corrupt);
+        }
+        self.children.remove(index);
+        Ok(true)
+    }
+
+    /// Stage a durable remove-children cascade. Existing per-child transactions
+    /// are superseded because leaving the network removes every child.
+    pub fn stage_leave_cascade(&mut self, rejoin: bool) -> Result<bool, ChildStoreError> {
+        if self.leave_cascade_pending {
+            if self.leave_cascade_rejoin != rejoin {
+                return Err(ChildStoreError::Corrupt);
+            }
+            return Ok(false);
+        }
+        self.leave_cascade_pending = true;
+        self.leave_cascade_rejoin = rejoin;
+        for child in &mut self.children {
+            if child.departure_pending {
+                continue;
+            }
+            child.removal_pending = true;
+            child.removal_attempts = 0;
+            child.reassignment_address = None;
+        }
+        self.validate()?;
+        Ok(true)
+    }
+
+    /// Clear a completed cascade after every child record has been removed.
+    pub fn complete_leave_cascade(&mut self) -> Result<bool, ChildStoreError> {
+        if !self.leave_cascade_pending {
+            return Ok(false);
+        }
+        if !self.children.is_empty() {
+            return Err(ChildStoreError::Corrupt);
+        }
+        self.leave_cascade_pending = false;
+        self.leave_cascade_rejoin = false;
+        Ok(true)
+    }
+
+    /// Commit one failed NWK Leave attempt.
+    pub fn record_removal_failure(
+        &mut self,
+        ieee_address: &IeeeAddress,
+    ) -> Result<u8, ChildStoreError> {
+        let child = self
+            .children
+            .iter_mut()
+            .find(|child| child.ieee_address == *ieee_address)
+            .ok_or(ChildStoreError::Corrupt)?;
+        if !child.removal_pending {
+            return Err(ChildStoreError::Corrupt);
+        }
+        child.removal_attempts = child
+            .removal_attempts
+            .saturating_add(1)
+            .min(MAX_CHILD_REMOVAL_ATTEMPTS);
+        Ok(child.removal_attempts)
+    }
+
+    /// Remove a completed pending transaction and its child snapshot.
+    pub fn complete_removal(
+        &mut self,
+        ieee_address: &IeeeAddress,
+    ) -> Result<bool, ChildStoreError> {
+        let Some(index) = self
+            .children
+            .iter()
+            .position(|child| child.ieee_address == *ieee_address)
+        else {
+            return Ok(false);
+        };
+        if !self.children[index].removal_pending {
+            return Err(ChildStoreError::Corrupt);
+        }
+        self.children.remove(index);
+        Ok(true)
+    }
+
+    /// Convert a completed remove-children Leave into the durable
+    /// Update-Device(DeviceLeft) phase without losing the child identity.
+    pub fn complete_removal_with_departure(
+        &mut self,
+        ieee_address: &IeeeAddress,
+    ) -> Result<bool, ChildStoreError> {
+        let Some(child) = self
+            .children
+            .iter_mut()
+            .find(|child| child.ieee_address == *ieee_address)
+        else {
+            return Ok(false);
+        };
+        if !child.removal_pending {
+            return Err(ChildStoreError::Corrupt);
+        }
+        child.removal_pending = false;
+        child.removal_attempts = 0;
+        child.reassignment_address = None;
+        child.departure_pending = true;
+        self.validate()?;
+        Ok(true)
     }
 
     /// Validate the whole table: it names a real network, every child is
@@ -223,9 +691,12 @@ impl PersistentChildTable {
         // An all-zero or all-ones EPID is not a commissioned network, so a
         // record carrying one could never be validated against a live NIB.
         // Reject it as corrupt instead of storing an unusable binding.
-        if !self.children.is_empty()
+        if (!self.children.is_empty() || self.leave_cascade_pending)
             && (self.extended_pan_id == [0u8; 8] || self.extended_pan_id == [0xFFu8; 8])
         {
+            return Err(ChildStoreError::Corrupt);
+        }
+        if self.leave_cascade_rejoin && !self.leave_cascade_pending {
             return Err(ChildStoreError::Corrupt);
         }
         for (index, child) in self.children.iter().enumerate() {
@@ -233,6 +704,14 @@ impl PersistentChildTable {
             for other in &self.children[index + 1..] {
                 if child.short_address == other.short_address
                     || child.ieee_address == other.ieee_address
+                    || child
+                        .reassignment_address
+                        .is_some_and(|address| address == other.short_address)
+                    || other
+                        .reassignment_address
+                        .is_some_and(|address| address == child.short_address)
+                    || child.reassignment_address.is_some()
+                        && child.reassignment_address == other.reassignment_address
                 {
                     return Err(ChildStoreError::Corrupt);
                 }
@@ -243,13 +722,14 @@ impl PersistentChildTable {
 
     /// Encode into `out`, returning the used length.
     ///
-    /// Layout (version 2): extended PAN ID (8) then a `count` byte followed by
-    /// `count` fixed-size child records. The caller owns the version/CRC/commit
-    /// framing.
+    /// Layout (version 5): extended PAN ID (8), table flags (1), `count` (1),
+    /// then `count` fixed-size child records.
     pub fn encode(&self, out: &mut [u8; MAX_ENCODED_CHILD_TABLE_LEN]) -> usize {
         out[0..8].copy_from_slice(&self.extended_pan_id);
-        out[8] = self.children.len() as u8;
-        let mut offset = 9;
+        out[8] = (u8::from(self.leave_cascade_pending) * TABLE_FLAG_LEAVE_CASCADE_PENDING)
+            | (u8::from(self.leave_cascade_rejoin) * TABLE_FLAG_LEAVE_CASCADE_REJOIN);
+        out[9] = self.children.len() as u8;
+        let mut offset = 10;
         for child in &self.children {
             let mut entry = [0u8; CHILD_ENTRY_LEN];
             child.encode(&mut entry);
@@ -259,24 +739,67 @@ impl PersistentChildTable {
         offset
     }
 
-    /// Decode a version-2 encoded table, validating structure and length.
+    /// Decode a version-5 encoded table, validating structure and length.
     pub fn decode(bytes: &[u8]) -> Result<Self, ChildStoreError> {
+        Self::decode_version(bytes, 5)
+    }
+
+    fn decode_v4(bytes: &[u8]) -> Result<Self, ChildStoreError> {
+        Self::decode_version(bytes, 4)
+    }
+
+    fn decode_v3(bytes: &[u8]) -> Result<Self, ChildStoreError> {
+        Self::decode_version(bytes, 3)
+    }
+
+    fn decode_v2(bytes: &[u8]) -> Result<Self, ChildStoreError> {
+        Self::decode_version(bytes, 2)
+    }
+
+    fn decode_version(bytes: &[u8], version: u8) -> Result<Self, ChildStoreError> {
         let mut extended_pan_id = [0u8; 8];
         extended_pan_id.copy_from_slice(bytes.get(0..8).ok_or(ChildStoreError::Corrupt)?);
-        let count = *bytes.get(8).ok_or(ChildStoreError::Corrupt)? as usize;
+        let (table_flags, count_offset, entries_offset) = if version >= 5 {
+            let flags = *bytes.get(8).ok_or(ChildStoreError::Corrupt)?;
+            if flags & !TABLE_FLAG_MASK != 0 {
+                return Err(ChildStoreError::Corrupt);
+            }
+            (flags, 9, 10)
+        } else {
+            (0, 8, 9)
+        };
+        let count = *bytes.get(count_offset).ok_or(ChildStoreError::Corrupt)? as usize;
         if count > MAX_PERSISTED_CHILDREN {
             return Err(ChildStoreError::Corrupt);
         }
-        let expected_len = 9 + count * CHILD_ENTRY_LEN;
+        let entry_len = if version >= 4 {
+            CHILD_ENTRY_LEN
+        } else {
+            LEGACY_CHILD_ENTRY_LEN
+        };
+        let expected_len = entries_offset + count * entry_len;
         if bytes.len() != expected_len {
             return Err(ChildStoreError::Corrupt);
         }
         let mut table = Self::new(extended_pan_id);
+        table.leave_cascade_pending = table_flags & TABLE_FLAG_LEAVE_CASCADE_PENDING != 0;
+        table.leave_cascade_rejoin = table_flags & TABLE_FLAG_LEAVE_CASCADE_REJOIN != 0;
         for index in 0..count {
-            let start = 9 + index * CHILD_ENTRY_LEN;
-            let mut entry = [0u8; CHILD_ENTRY_LEN];
-            entry.copy_from_slice(&bytes[start..start + CHILD_ENTRY_LEN]);
-            table.push(PersistentChild::decode(&entry)?)?;
+            let start = entries_offset + index * entry_len;
+            let child = if version >= 4 {
+                let mut entry = [0u8; CHILD_ENTRY_LEN];
+                entry.copy_from_slice(&bytes[start..start + CHILD_ENTRY_LEN]);
+                PersistentChild::decode(&entry)?
+            } else {
+                let mut entry = [0u8; LEGACY_CHILD_ENTRY_LEN];
+                entry.copy_from_slice(&bytes[start..start + LEGACY_CHILD_ENTRY_LEN]);
+                if version == 3 {
+                    PersistentChild::decode_v3(&entry)?
+                } else {
+                    PersistentChild::decode_v2(&entry)?
+                }
+            };
+            table.push(child)?;
         }
         table.validate()?;
         Ok(table)
@@ -343,7 +866,7 @@ pub const CHILD_JOURNAL_SLOTS_PER_SECTOR: usize =
     CHILD_JOURNAL_SECTOR_SIZE / CHILD_JOURNAL_SLOT_SIZE;
 
 const RECORD_MAGIC: [u8; 4] = *b"ZBCT";
-const RECORD_VERSION: u8 = 2;
+const RECORD_VERSION: u8 = 5;
 /// Encoded table starts here (magic 4 + version 1 + len 2 + reserved 1 +
 /// generation 4).
 const RECORD_ENCODED_OFFSET: usize = 12;
@@ -419,8 +942,11 @@ impl<S: NorFlash> ChildTableJournal<S> {
     ) -> Option<(u32, PersistentChildTable)> {
         if record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4] != RECORD_COMMIT
             || record[0..4] != RECORD_MAGIC
-            || record[4] != RECORD_VERSION
         {
+            return None;
+        }
+        let version = record[4];
+        if version != 2 && version != 3 && version != 4 && version != RECORD_VERSION {
             return None;
         }
         let encoded_len = u16::from_le_bytes([record[5], record[6]]) as usize;
@@ -439,9 +965,16 @@ impl<S: NorFlash> ChildTableJournal<S> {
             return None;
         }
         let generation = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-        let table = PersistentChildTable::decode(
-            &record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len],
-        )
+        let encoded = &record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len];
+        let table = if version == 2 {
+            PersistentChildTable::decode_v2(encoded)
+        } else if version == 3 {
+            PersistentChildTable::decode_v3(encoded)
+        } else if version == 4 {
+            PersistentChildTable::decode_v4(encoded)
+        } else {
+            PersistentChildTable::decode(encoded)
+        }
         .ok()?;
         Some((generation, table))
     }
@@ -641,6 +1174,10 @@ mod tests {
             security_capable: true,
             is_router: seed & 2 == 0,
             end_device_timeout: timeout,
+            removal_pending: false,
+            removal_attempts: 0,
+            reassignment_address: None,
+            departure_pending: false,
         }
     }
 
@@ -669,9 +1206,76 @@ mod tests {
             let original = table(children);
             let mut encoded = [0u8; MAX_ENCODED_CHILD_TABLE_LEN];
             let len = original.encode(&mut encoded);
-            assert_eq!(len, 8 + 1 + children.len() * CHILD_ENTRY_LEN);
+            assert_eq!(len, 8 + 2 + children.len() * CHILD_ENTRY_LEN);
             assert_eq!(PersistentChildTable::decode(&encoded[..len]), Ok(original));
         }
+    }
+
+    #[test]
+    fn pending_removal_state_round_trips_through_current_version() {
+        let mut original = table(&[child(1, 0x0002, 8), child(2, 0x0003, 14)]);
+        assert!(original.stage_removal(&[1; 8]).unwrap());
+        assert_eq!(original.record_removal_failure(&[1; 8]).unwrap(), 1);
+
+        let mut encoded = [0u8; MAX_ENCODED_CHILD_TABLE_LEN];
+        let len = original.encode(&mut encoded);
+        let decoded = PersistentChildTable::decode(&encoded[..len]).unwrap();
+        assert_eq!(decoded, original);
+        let pending = decoded.pending_removal().unwrap();
+        assert_eq!(pending.ieee_address, [1; 8]);
+        assert_eq!(pending.removal_attempts, 1);
+    }
+
+    #[test]
+    fn pending_reassignment_round_trips_and_commits() {
+        let mut original = table(&[child(1, 0x0002, 8), child(2, 0x0003, 14)]);
+        assert!(original.stage_reassignment(&[1; 8], 0x1234).unwrap());
+
+        let mut encoded = [0u8; MAX_ENCODED_CHILD_TABLE_LEN];
+        let len = original.encode(&mut encoded);
+        let mut decoded = PersistentChildTable::decode(&encoded[..len]).unwrap();
+        let pending = decoded.pending_reassignment().unwrap();
+        assert_eq!(pending.ieee_address, [1; 8]);
+        assert_eq!(pending.short_address, 0x0002);
+        assert_eq!(pending.reassignment_address, Some(0x1234));
+
+        assert!(decoded.complete_reassignment(&[1; 8]).unwrap());
+        assert_eq!(decoded.child(&[1; 8]).unwrap().short_address, 0x1234);
+        assert_eq!(decoded.child(&[1; 8]).unwrap().reassignment_address, None);
+    }
+
+    #[test]
+    fn remove_device_supersedes_a_pending_reassignment_atomically() {
+        let address = [1; 8];
+        let mut original = table(&[child(1, 0x0002, 8)]);
+        assert!(original.stage_reassignment(&address, 0x1234).unwrap());
+
+        assert!(original.stage_removal(&address).unwrap());
+        let pending = original.child(&address).unwrap();
+        assert!(pending.removal_pending);
+        assert_eq!(pending.removal_attempts, 0);
+        assert!(pending.reassignment_address.is_none());
+        original.validate().unwrap();
+
+        let mut encoded = [0u8; MAX_ENCODED_CHILD_TABLE_LEN];
+        let len = original.encode(&mut encoded);
+        let decoded = PersistentChildTable::decode(&encoded[..len]).unwrap();
+        let pending = decoded.child(&address).unwrap();
+        assert!(pending.removal_pending);
+        assert!(pending.reassignment_address.is_none());
+    }
+
+    #[test]
+    fn remove_device_is_a_noop_for_an_already_departed_child() {
+        let address = [1; 8];
+        let mut original = table(&[child(1, 0x0002, 8)]);
+        let departed = *original.child(&address).unwrap();
+        assert!(original.stage_departure(departed).unwrap());
+
+        assert!(!original.stage_removal(&address).unwrap());
+        let pending = original.child(&address).unwrap();
+        assert!(pending.departure_pending);
+        assert!(!pending.removal_pending);
     }
 
     #[test]
@@ -687,7 +1291,7 @@ mod tests {
                 .iter()
                 .copied()
                 .enumerate()
-                .map(|(i, b)| if i == 20 { 15 } else { b })
+                .map(|(i, b)| if i == 21 { 15 } else { b })
                 .collect::<std::vec::Vec<_>>()
             ),
             Err(ChildStoreError::Corrupt),
@@ -697,8 +1301,8 @@ mod tests {
         // Reserved short address 0x0000.
         let mut zero_short = [0u8; MAX_ENCODED_CHILD_TABLE_LEN];
         let len = table(&[child(1, 0x0002, 8)]).encode(&mut zero_short);
-        zero_short[17] = 0;
-        zero_short[18] = 0; // clear the short low/high bytes
+        zero_short[18] = 0;
+        zero_short[19] = 0; // clear the short low/high bytes
         assert_eq!(
             PersistentChildTable::decode(&zero_short[..len]),
             Err(ChildStoreError::Corrupt)
@@ -837,6 +1441,36 @@ mod tests {
     }
 
     #[test]
+    fn journal_migrates_version_two_without_inventing_pending_removals() {
+        let original = table(&[child(1, 0x0002, 8)]);
+        let mut store = journal(MockFlash::new());
+        store.store(&original).unwrap();
+        let mut flash = store.into_storage();
+
+        let current_len = u16::from_le_bytes([flash.data[5], flash.data[6]]) as usize;
+        assert_eq!(current_len, 10 + CHILD_ENTRY_LEN);
+        let legacy_len = 9 + LEGACY_CHILD_ENTRY_LEN;
+        flash.data[5..7].copy_from_slice(&(legacy_len as u16).to_le_bytes());
+        let encoded = RECORD_ENCODED_OFFSET;
+        let count = flash.data[encoded + 9];
+        flash.data.copy_within(
+            encoded + 10..encoded + 10 + LEGACY_CHILD_ENTRY_LEN,
+            encoded + 9,
+        );
+        flash.data[encoded + 8] = count;
+        flash.data[RECORD_ENCODED_OFFSET + legacy_len..RECORD_ENCODED_OFFSET + current_len]
+            .fill(0xFF);
+        flash.data[4] = 2;
+        let crc = crate::security_journal::crc32(&flash.data[..RECORD_CRC_OFFSET]);
+        flash.data[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+
+        let mut reopened = journal(flash);
+        let migrated = reopened.load().unwrap().unwrap();
+        assert_eq!(migrated, original);
+        assert!(migrated.pending_removal().is_none());
+    }
+
+    #[test]
     fn an_interrupted_commit_preserves_the_previous_generation() {
         let mut flash = MockFlash::new();
         // Two committed generations first.
@@ -863,6 +1497,70 @@ mod tests {
             Ok(Some(table(&[child(1, 0x0002, 14)]))),
             "an interrupted write must never destroy committed child state"
         );
+    }
+
+    #[test]
+    fn pending_departure_round_trips_without_restoring_a_live_child() {
+        let departed = child(1, 0x0002, 8);
+        let mut original = table(&[]);
+        assert!(original.stage_departure(departed).unwrap());
+
+        let mut encoded = [0u8; MAX_ENCODED_CHILD_TABLE_LEN];
+        let len = original.encode(&mut encoded);
+        let mut decoded = PersistentChildTable::decode(&encoded[..len]).unwrap();
+        let pending = decoded.pending_departure().unwrap();
+        assert_eq!(pending.ieee_address, departed.ieee_address);
+        assert_eq!(pending.short_address, departed.short_address);
+
+        assert!(decoded.complete_departure(&departed.ieee_address).unwrap());
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn leave_cascade_marks_every_child_and_retains_the_rejoin_bit() {
+        let mut original = table(&[child(1, 0x0002, 8), child(2, 0x0003, 14)]);
+        assert!(original.stage_leave_cascade(true).unwrap());
+        assert!(original.leave_cascade_pending());
+        assert!(original.leave_cascade_rejoin());
+        assert!(original.children().all(|child| child.removal_pending));
+
+        let mut encoded = [0u8; MAX_ENCODED_CHILD_TABLE_LEN];
+        let len = original.encode(&mut encoded);
+        let decoded = PersistentChildTable::decode(&encoded[..len]).unwrap();
+        assert!(decoded.leave_cascade_pending());
+        assert!(decoded.leave_cascade_rejoin());
+        assert!(decoded.children().all(|child| child.removal_pending));
+    }
+
+    #[test]
+    fn leave_cascade_preserves_and_adds_device_left_transactions() {
+        let departed = child(1, 0x0002, 8);
+        let leaving = child(2, 0x0003, 14);
+        let mut original = table(&[leaving]);
+        assert!(original.stage_departure(departed).unwrap());
+
+        assert!(original.stage_leave_cascade(true).unwrap());
+        assert!(
+            original
+                .child(&departed.ieee_address)
+                .unwrap()
+                .departure_pending
+        );
+        assert!(
+            original
+                .child(&leaving.ieee_address)
+                .unwrap()
+                .removal_pending
+        );
+
+        assert!(
+            original
+                .complete_removal_with_departure(&leaving.ieee_address)
+                .unwrap()
+        );
+        assert_eq!(original.pending_departures().count(), 2);
+        assert!(original.pending_removal().is_none());
+        assert!(original.leave_cascade_pending());
     }
 
     #[test]

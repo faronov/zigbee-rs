@@ -4,6 +4,7 @@
 
 pub mod battery;
 pub mod ota;
+pub mod policy;
 pub mod profile;
 pub mod storage;
 

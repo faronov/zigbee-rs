@@ -1,0 +1,13 @@
+[package]
+name = "nrf52840-promicro"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Physical wiring for nice!nano-compatible nRF52840 ProMicro boards"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[workspace]
+
+[dependencies]
+embassy-nrf = { version = "0.3", features = ["nrf52840"] }

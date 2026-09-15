@@ -195,7 +195,7 @@ where
 }
 
 /// Async (embedded-hal-async 1.0) counterpart of the blocking API. See the
-/// crate-root [`super::Scd4x`]; command words, CRC and conversion logic are
+/// crate-root [`crate::Scd4x`]; command words, CRC and conversion logic are
 /// shared, not duplicated.
 pub mod asynch {
     use embedded_hal_async::i2c::{I2c, SevenBitAddress};

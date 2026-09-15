@@ -390,6 +390,8 @@ pub enum JoinMethod {
     Association,
     /// NWK rejoin using network key (after losing parent)
     Rejoin,
+    /// Unsecured NWK rejoin followed by centralized Trust Center authorization.
+    TrustCenterRejoin,
     /// Direct join (coordinator adds device without association)
     Direct,
 }
@@ -526,7 +528,8 @@ impl<M: MacDriver> NwkLayer<M> {
 
     // ── NLME-NETWORK-FORMATION ──────────────────────────────
 
-    /// Form a new Zigbee network (coordinator only).
+    /// Form a new Zigbee network as a PAN-owning coordinator or distributed
+    /// security router.
     ///
     /// 1. ED scan to find quietest channel
     /// 2. Choose PAN ID (random, avoid conflicts)
@@ -536,7 +539,7 @@ impl<M: MacDriver> NwkLayer<M> {
         channel_mask: ChannelMask,
         scan_duration: u8,
     ) -> Result<(), NwkStatus> {
-        if self.device_type != DeviceType::Coordinator {
+        if self.device_type == DeviceType::EndDevice || !self.mac.capabilities().coordinator {
             return Err(NwkStatus::InvalidRequest);
         }
 
@@ -636,9 +639,45 @@ impl<M: MacDriver> NwkLayer<M> {
         network: &NetworkDescriptor,
         method: JoinMethod,
     ) -> Result<ShortAddress, NwkStatus> {
+        let mut volatile_commit = |_| true;
+        self.nlme_join_with_replay_commit(network, method, &mut volatile_commit)
+            .await
+    }
+
+    /// Join by MAC association.
+    ///
+    /// Association is the only join method that carries no secured Rejoin
+    /// Response, so it has no NWK replay counter to commit and needs no
+    /// persistence callback. Callers that only ever associate must use this
+    /// entry point rather than [`Self::nlme_join`] with
+    /// [`JoinMethod::Association`]: `method` is a runtime value, so the
+    /// generic dispatcher instantiates `join_via_rejoin` with a *volatile*
+    /// commit closure as well — a second full copy of the rejoin path in every
+    /// image, beside the durable one the stack actually uses.
+    pub async fn nlme_join_association(
+        &mut self,
+        network: &NetworkDescriptor,
+    ) -> Result<ShortAddress, NwkStatus> {
+        self.join_via_association(network).await
+    }
+
+    /// Join while durably committing any secured Rejoin Response before it
+    /// changes the live parent/network relationship.
+    pub async fn nlme_join_with_replay_commit<F>(
+        &mut self,
+        network: &NetworkDescriptor,
+        method: JoinMethod,
+        replay_commit: &mut F,
+    ) -> Result<ShortAddress, NwkStatus>
+    where
+        F: FnMut(crate::security::NwkReplayCounter) -> bool,
+    {
         match method {
             JoinMethod::Association => self.join_via_association(network).await,
-            JoinMethod::Rejoin => self.join_via_rejoin(network).await,
+            JoinMethod::Rejoin => self.join_via_rejoin(network, true, replay_commit).await,
+            JoinMethod::TrustCenterRejoin => {
+                self.join_via_rejoin(network, false, replay_commit).await
+            }
             JoinMethod::Direct => Err(NwkStatus::InvalidRequest),
         }
     }
@@ -834,9 +873,19 @@ impl<M: MacDriver> NwkLayer<M> {
         Ok(result.short_address)
     }
 
+    /// The replay-commit hook is *type-erased* here on purpose.
+    ///
+    /// Every caller supplies a different closure — the runtime's security
+    /// journal commit, BDB's Trust Center rejoin hook, a test's volatile
+    /// no-op — and a generic parameter would give each of them its own full
+    /// copy of this rejoin state machine (~2.6 KiB per copy on Cortex-M,
+    /// ~4.9 KiB on TC32). Rejoin is a cold path, so one indirect call per
+    /// committed counter is a good trade for a single monomorphization.
     async fn join_via_rejoin(
         &mut self,
         network: &NetworkDescriptor,
+        secured: bool,
+        replay_commit: &mut dyn FnMut(crate::security::NwkReplayCounter) -> bool,
     ) -> Result<ShortAddress, NwkStatus> {
         self.rejoin_diagnostics.stage = 1;
         self.rejoin_diagnostics.candidate_attempts =
@@ -883,8 +932,10 @@ impl<M: MacDriver> NwkLayer<M> {
             return Err(NwkStatus::InvalidRequest);
         }
 
-        // Rejoin uses NWK-level Rejoin Request command (encrypted with network key)
-        // This is used when a device has been disconnected but still knows the network key
+        // A secured rejoin proves possession of the active NWK key. A Trust
+        // Center rejoin deliberately sends the same command unsecured so a
+        // centralized network can return the current key under the device's
+        // APS link key.
 
         // Switch to the target channel
         let _ = self
@@ -930,7 +981,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 protocol_version: 0x02,
                 discover_route: 0,
                 multicast: false,
-                security: self.nib.security_enabled,
+                security: secured,
                 source_route: false,
                 dst_ieee_present: false,
                 src_ieee_present: true,
@@ -954,7 +1005,7 @@ impl<M: MacDriver> NwkLayer<M> {
         let cmd_payload = [0x06u8, cap_byte.to_byte()];
         let total_len;
 
-        if self.nib.security_enabled {
+        if secured {
             // Encrypt rejoin request with network key
             let sec_hdr = crate::security::NwkSecurityHeader {
                 security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
@@ -1121,7 +1172,7 @@ impl<M: MacDriver> NwkLayer<M> {
             if hdr.src_addr != network.router_address
                 || hdr.dst_addr != self.nib.network_address
                 || hdr.dst_ieee != Some(self.nib.ieee_address)
-                || (self.nib.security_enabled && !hdr.frame_control.security)
+                || hdr.frame_control.security != secured
             {
                 log::warn!("[NWK] Rejoin RX #{}: unrelated response", attempt);
                 continue;
@@ -1178,6 +1229,19 @@ impl<M: MacDriver> NwkLayer<M> {
                     &sec_hdr,
                 ) {
                     Some(v) => {
+                        let replay = crate::security::NwkReplayCounter {
+                            source: sec_hdr.source_address,
+                            key_sequence: sec_hdr.key_seq_number,
+                            key_fingerprint: zigbee_crypto::key_fingerprint(&key),
+                            counter: sec_hdr.frame_counter,
+                        };
+                        if !replay_commit(replay) {
+                            log::error!(
+                                "[NWK] Rejoin RX #{}: durable replay commit failed",
+                                attempt
+                            );
+                            continue;
+                        }
                         self.security.commit_frame_counter_for_key(
                             &sec_hdr.source_address,
                             sec_hdr.key_seq_number,
@@ -1195,9 +1259,6 @@ impl<M: MacDriver> NwkLayer<M> {
                     }
                 }
             } else {
-                if self.nib.security_enabled {
-                    continue;
-                }
                 let payload = &data[consumed..];
                 let mut v = heapless::Vec::<u8, 128>::new();
                 let _ = v.extend_from_slice(payload);
@@ -1432,6 +1493,9 @@ impl<M: MacDriver> NwkLayer<M> {
         self.pending_conflicts.clear();
         self.pending_pan_id_update = None;
         self.pending_pan_id_broadcast = None;
+        self.abort_lifecycle_persistence();
+        self.nib.device_announce_pending = false;
+        self.nib.parent_link_provisional = false;
         if !rejoin {
             self.nib.network_address = ShortAddress(0xFFFF);
             self.nib.pan_id = PanId(0xFFFF);
@@ -1673,6 +1737,7 @@ impl<M: MacDriver> NwkLayer<M> {
             self.pending_conflicts.clear();
             self.pending_pan_id_update = None;
             self.pending_pan_id_broadcast = None;
+            self.abort_lifecycle_persistence();
         }
 
         self.mac
@@ -2458,11 +2523,41 @@ mod tests {
 
         nwk.mac_mut()
             .enqueue_poll_response(build_response(7, OLD_ADDRESS, NEW_ADDRESS, 0x00));
+        let mut attempted_replay = None;
+        let mut reject_replay = |replay| {
+            attempted_replay = Some(replay);
+            false
+        };
+        assert_eq!(
+            block_on(nwk.nlme_join_with_replay_commit(
+                &network,
+                JoinMethod::Rejoin,
+                &mut reject_replay,
+            )),
+            Err(NwkStatus::NoNetworks)
+        );
+        assert_eq!(
+            attempted_replay,
+            Some(crate::security::NwkReplayCounter {
+                source: PARENT_IEEE,
+                key_sequence: 0,
+                key_fingerprint: zigbee_crypto::key_fingerprint(&KEY),
+                counter: 7,
+            })
+        );
+        assert_eq!(nwk.nib().network_address, OLD_ADDRESS);
+        assert!(
+            nwk.security().check_frame_counter(&PARENT_IEEE, 7),
+            "failed durable commit must not consume the live replay counter"
+        );
+
+        nwk.mac_mut()
+            .enqueue_poll_response(build_response(7, OLD_ADDRESS, NEW_ADDRESS, 0x00));
         assert_eq!(
             block_on(nwk.nlme_join(&network, JoinMethod::Rejoin)).unwrap(),
             NEW_ADDRESS
         );
-        assert_eq!(nwk.mac().poll_count(), 3);
+        let sleepy_poll_count = nwk.mac().poll_count();
         assert_eq!(nwk.nib().pan_id, PAN_ID);
         assert_eq!(
             nwk.nib().nwk_update_id(),
@@ -2510,7 +2605,7 @@ mod tests {
         );
         assert_eq!(
             nwk.mac().poll_count(),
-            3,
+            sleepy_poll_count,
             "RX-on devices must wait directly without polling"
         );
         assert!(!nwk.security().check_frame_counter(&PARENT_IEEE, 8));
@@ -2546,6 +2641,116 @@ mod tests {
         assert!(
             nwk.security().check_frame_counter(&PARENT_IEEE, 9),
             "a late indirect response must not be authenticated"
+        );
+    }
+
+    #[test]
+    fn trust_center_rejoin_is_unsecured_even_with_a_stored_network_key() {
+        const DEVICE_IEEE: IeeeAddress = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
+        const PARENT_IEEE: IeeeAddress = [0x00, 0x12, 0x4B, 0x00, 0x01, 0xAA, 0xBB, 0xCC];
+        const OLD_ADDRESS: ShortAddress = ShortAddress(0x07D6);
+        const NEW_ADDRESS: ShortAddress = ShortAddress(0x1234);
+        const PARENT_ADDRESS: ShortAddress = ShortAddress(0xBA0F);
+        const PAN_ID: PanId = PanId(0xDFE9);
+
+        fn block_on<F: core::future::Future>(future: F) -> F::Output {
+            use core::task::{Context, Poll, Waker};
+
+            let mut context = Context::from_waker(Waker::noop());
+            let mut future = core::pin::pin!(future);
+            loop {
+                if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                    return output;
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        let network = NetworkDescriptor {
+            extended_pan_id: [0xAA; 8],
+            pan_id: PAN_ID,
+            logical_channel: 15,
+            stack_profile: 2,
+            zigbee_version: 2,
+            beacon_order: 15,
+            superframe_order: 15,
+            permit_joining: false,
+            router_capacity: true,
+            end_device_capacity: true,
+            update_id: 3,
+            lqi: 220,
+            router_address: PARENT_ADDRESS,
+            depth: 1,
+        };
+        let response_header = NwkHeader {
+            frame_control: NwkFrameControl {
+                frame_type: NwkFrameType::Command as u8,
+                protocol_version: 2,
+                discover_route: 0,
+                multicast: false,
+                security: false,
+                source_route: false,
+                dst_ieee_present: true,
+                src_ieee_present: true,
+                end_device_initiator: false,
+            },
+            dst_addr: OLD_ADDRESS,
+            src_addr: PARENT_ADDRESS,
+            radius: 1,
+            seq_number: 0x42,
+            dst_ieee: Some(DEVICE_IEEE),
+            src_ieee: Some(PARENT_IEEE),
+            multicast_control: None,
+            source_route: None,
+        };
+        let response_payload = [
+            crate::frames::NwkCommandId::RejoinResponse as u8,
+            NEW_ADDRESS.0 as u8,
+            (NEW_ADDRESS.0 >> 8) as u8,
+            0,
+        ];
+        let mut response = [0u8; 64];
+        let response_header_len = response_header.serialize(&mut response);
+        response[response_header_len..response_header_len + response_payload.len()]
+            .copy_from_slice(&response_payload);
+
+        let mut mac = MockMac::new(DEVICE_IEEE);
+        mac.enqueue_rx(McpsDataIndication {
+            src_address: MacAddress::Short(PAN_ID, PARENT_ADDRESS),
+            dst_address: MacAddress::Short(PAN_ID, OLD_ADDRESS),
+            lqi: 220,
+            payload: MacFrame::from_slice(
+                &response[..response_header_len + response_payload.len()],
+            )
+            .unwrap(),
+            security_use: false,
+        });
+        let mut nwk = NwkLayer::new(mac, DeviceType::EndDevice);
+        nwk.set_rx_on_when_idle(true);
+        {
+            let nib = nwk.nib_mut();
+            nib.extended_pan_id = network.extended_pan_id;
+            nib.pan_id = PAN_ID;
+            nib.network_address = OLD_ADDRESS;
+            nib.logical_channel = network.logical_channel;
+            nib.ieee_address = DEVICE_IEEE;
+            nib.security_enabled = true;
+            nib.active_key_seq_number = 0;
+            nib.outgoing_frame_counter = 0x100;
+            nib.outgoing_frame_counter_limit = 0x200;
+        }
+        nwk.security_mut().set_network_key([0x55; 16], 0);
+
+        assert_eq!(
+            block_on(nwk.nlme_join(&network, JoinMethod::TrustCenterRejoin)).unwrap(),
+            NEW_ADDRESS
+        );
+        let request = &nwk.mac().tx_history()[0];
+        let (header, consumed) = NwkHeader::parse(request.payload.as_slice()).unwrap();
+        assert!(!header.frame_control.security);
+        assert_eq!(
+            &request.payload.as_slice()[consumed..],
+            &[crate::frames::NwkCommandId::RejoinRequest as u8, 0x88]
         );
     }
 }

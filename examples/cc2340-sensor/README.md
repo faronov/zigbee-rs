@@ -1,59 +1,85 @@
-# CC2340R5 Zigbee Temperature Sensor
+# CC2340R5 Zigbee sensor
 
-A `no_std` Zigbee end-device bring-up project for the TI CC2340R5 and
-LP-EM-CC2340R5.
+Compile-tested `no_std` environmental sensor composition for
+LP-EM-CC2340R5 / CC2340R52.
 
-## Current status
+## Current architecture
 
-The radio host driver is Rust and does not link TI RCL, ZBOSS, FreeRTOS, or a
-C platform shim. The build imports TI's official IEEE PBE/MCE/RFE microcode,
-PHY settings, and board PA table as data.
+```text
+environmental Sleepy End Device profile
+        ↓
+products/cc2340-sensor
+        ↓
+boards/lp-em-cc2340r5
+        ↓
+CC2340 register/radio mechanisms + MacDriver
+```
 
-Raw polling TX/RX is implemented and the Cortex-M0+ firmware builds, but no
-CC2340 board has yet been tested on air. The full example is not hardware-ready
-because its Embassy time driver remains a compile stub and complete IOC/button
-configuration is pending.
+This example is the composition root.
 
-## Hardware
+The board supplies real SysTick time, IOC/GPIO configuration, typed raw
+LED/button resources, reset, identity, and flash:
 
-- MCU: CC2340R52, Cortex-M0+, 512 KB flash, 36 KB SRAM
-- Radio: 2.4 GHz IEEE 802.15.4 and Bluetooth LE
-- Board: LP-EM-CC2340R5
-- Target: `thumbv6m-none-eabi`
+| function | DIO |
+|---|---:|
+| LED1 | 7 |
+| LED2 | 6 |
+| Button 1 | 13 |
+| Button 2 | 14 |
+
+The product owns identity/profile, synthetic temperature/humidity, fixed
+battery, `Active`/`Active` policy, the linker map, and the security partition.
+This composition root maps the raw board buttons and LEDs to the selected wake
+and status behavior, and installs RTT diagnostics and reset supervision.
+
+Compile-stub time and “IOC pending” descriptions are obsolete.
+
+## Security and commissioning gate
+
+The image currently uses software AES and reserves:
+
+```text
+0x00000000..0x0007E000  application
+0x0007E000..0x00080000  SecurityStateJournal
+```
+
+Commissioning is deliberately not claimed. The radio path has no completed HIL
+run, and the production entropy backend is not qualified. Entropy fails closed
+instead of returning predictable key material.
 
 ## Build
 
+Use the exact SDK source pinned by CI:
+
 ```bash
-rustup target add thumbv6m-none-eabi
+git clone https://github.com/TexasInstruments/simplelink-lowpower-f3-sdk.git
+git -C simplelink-lowpower-f3-sdk checkout \
+  68ca021502383f367d0bf2a5517fdd0dcb0ef909
 
-export CC2340_SDK_DIR=/path/to/simplelink-lowpower-f3-sdk
 cd examples/cc2340-sensor
-cargo build --release
+CC2340_SDK_DIR=/absolute/path/to/simplelink-lowpower-f3-sdk \
+  cargo +nightly-2026-03-23 build --release --locked --target-dir target/sdk
 ```
 
-Without `CC2340_SDK_DIR`, the source still compiles, but radio initialization
-returns `FirmwareUnavailable`.
+Pinned-SDK image: **223,536 B** against a **225,280 B** regression gate.
+Static RAM is **4,772 B** and the physical application slot is **516,096 B**.
 
-## Imported SDK data
+With `CC2340_SDK_DIR` unset, the fallback build compiles but radio
+initialization returns `FirmwareUnavailable`. It is not a flashable radio
+product.
 
-`zigbee-mac/build.rs` reads:
-
-- `source/ti/devices/cc23x0r5/rf_patches/`
-- `source/ti/devices/cc23x0r5/inc/`
-- `source/ti/devices/radioconfig/.meta/config/rcl/`
-- `source/ti/devices/radioconfig/.meta/config/rcl_common/`
-
-No TI archive is linked.
-
-## Project structure
-
-```text
-cc2340-sensor/
-├── .cargo/config.toml   # thumbv6m-none-eabi
-├── Cargo.toml
-├── build.rs             # linker script only
-├── memory.x             # CC2340R52 36 KB SRAM layout
-└── src/main.rs          # device setup and simulated measurements
+```bash
+env -u CC2340_SDK_DIR \
+  cargo +nightly-2026-03-23 build --release --locked \
+  --target-dir target/fallback
 ```
 
-Use TI UniFlash and the board's XDS110 probe for eventual hardware bring-up.
+## Hardware gates
+
+- startup and clock proof on the target board;
+- raw 802.15.4 TX/RX/FCS;
+- scan, association, and ACK timing;
+- entropy source;
+- secured commissioning/interview/reporting;
+- flash journal and reset recovery;
+- power behavior.

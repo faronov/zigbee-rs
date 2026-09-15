@@ -4,7 +4,9 @@ use crate::ZigbeeDevice;
 use crate::event_loop::{StackEvent, StartError, TickResult};
 use crate::profile::{ApplicationClusters, ApplicationProfile, ProfileError};
 use crate::role::{DeviceRole, EndDevice};
-use crate::security_store::{PersistentSecurityState, SecurityStateStore, SecurityStoreError};
+use crate::security_store::{
+    PersistentSecurityState, ReplayCounterTombstone, SecurityStateStore, SecurityStoreError,
+};
 use zigbee_mac::{MacDriver, McpsDataIndication};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +91,13 @@ where
         (self.device, self.profile)
     }
 
+    /// Disjoint mutable access for lifecycle components that must commit an
+    /// external key store and the security replay journal in one ordered
+    /// transaction.
+    pub fn device_and_security_store_mut(&mut self) -> (&mut ZigbeeDevice<M, R>, &mut S) {
+        (self.device, self.security_store)
+    }
+
     pub fn load_security_state(
         &mut self,
     ) -> Result<Option<PersistentSecurityState>, SecurityStoreError> {
@@ -100,10 +109,159 @@ where
             .refresh_security_state(&mut *self.security_store)
     }
 
-    pub async fn start_or_resume(&mut self) -> Result<u16, StartError> {
+    pub fn restore_replay_state(&mut self) -> Result<usize, SecurityStoreError> {
         self.device
-            .start_or_resume_with_security_store(&mut *self.security_store)
+            .restore_incoming_replay_state(&mut *self.security_store)
+    }
+
+    pub fn tombstone_replay_counters(
+        &mut self,
+        tombstone: ReplayCounterTombstone,
+    ) -> Result<(), NodeError> {
+        self.security_store
+            .tombstone_replay_counters(tombstone)
+            .map_err(NodeError::Persistence)
+    }
+
+    pub fn tombstone_retired_network_key_replay_counters(&mut self) -> Result<usize, NodeError> {
+        self.device
+            .tombstone_retired_network_key_replay_counters(&mut *self.security_store)
+            .map_err(NodeError::Persistence)
+    }
+
+    pub fn tombstone_retired_trust_center_link_key_replay_counters(
+        &mut self,
+    ) -> Result<usize, NodeError> {
+        self.device
+            .tombstone_retired_trust_center_link_key_replay_counters(&mut *self.security_store)
+            .map_err(NodeError::Persistence)
+    }
+
+    pub fn tombstone_retired_application_link_key_replay_counters(
+        &mut self,
+    ) -> Result<usize, NodeError> {
+        self.device
+            .tombstone_retired_application_link_key_replay_counters(&mut *self.security_store)
+            .map_err(NodeError::Persistence)
+    }
+
+    pub fn tombstone_retired_global_aps_key_replay_counters(&mut self) -> Result<usize, NodeError> {
+        self.device
+            .tombstone_retired_global_aps_key_replay_counters(&mut *self.security_store)
+            .map_err(NodeError::Persistence)
+    }
+
+    pub async fn complete_application_key_persistence(&mut self) -> Result<(), NodeError> {
+        if let Some(replay) = self.device.pending_application_key_replay() {
+            self.security_store
+                .commit_replay_counter(crate::security_store::PersistentReplayCounter::Aps(replay))
+                .map_err(NodeError::Persistence)?;
+        }
+        self.device.complete_application_key_persistence().await;
+        Ok(())
+    }
+
+    /// Release a prepared binding response after the composition has saved
+    /// the APS-table snapshot. Both replay floors and the ACK are ordered
+    /// by the runtime's bounded binding transaction.
+    pub async fn complete_binding_persistence(
+        &mut self,
+    ) -> Result<(), crate::binding_persistence::BindingPersistenceError> {
+        self.device
+            .complete_binding_persistence(&mut *self.security_store)
             .await
+    }
+
+    pub async fn complete_security_indication_persistence(&mut self) -> Result<(), NodeError> {
+        #[cfg(feature = "router")]
+        {
+            if let Some(replay) = self.device.pending_security_indication_replay() {
+                self.security_store
+                    .commit_replay_counter(crate::security_store::PersistentReplayCounter::Aps(
+                        replay,
+                    ))
+                    .map_err(NodeError::Persistence)?;
+            }
+            self.device.complete_security_indication_persistence().await;
+        }
+        Ok(())
+    }
+
+    pub async fn complete_child_nwk_lifecycle_persistence(&mut self) -> Result<(), NodeError> {
+        #[cfg(feature = "router")]
+        {
+            let Some((replay, kind)) = self.device.pending_nwk_lifecycle_replay() else {
+                return Ok(());
+            };
+            if kind != zigbee_nwk::nlde::NwkLifecyclePersistence::ChildState {
+                return Ok(());
+            }
+            self.security_store
+                .commit_replay_counter(crate::security_store::PersistentReplayCounter::Nwk(replay))
+                .map_err(NodeError::Persistence)?;
+            self.device
+                .bdb_mut()
+                .zdo_mut()
+                .nwk_mut()
+                .complete_lifecycle_persistence()
+                .await;
+        }
+        Ok(())
+    }
+
+    pub fn start_or_resume(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<u16, StartError>> {
+        #[cfg(any(feature = "router", test))]
+        let future = self
+            .device
+            .start_or_resume_with_security_store(&mut *self.security_store);
+        #[cfg(not(any(feature = "router", test)))]
+        let future = self
+            .device
+            .start_or_resume_steering_with_security_store(&mut *self.security_store);
+        future
+    }
+
+    /// Resume or freshly join a non-coordinator network through Network
+    /// Steering only.
+    ///
+    /// Router and relay application frontends use this method instead of the
+    /// legacy device-type-aware startup future so coordinator formation cannot
+    /// become part of their async state machine.
+    pub fn start_or_resume_steering(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<u16, StartError>> {
+        self.device
+            .start_or_resume_steering_with_security_store(&mut *self.security_store)
+    }
+
+    /// Resume or freshly form a coordinator PAN.
+    ///
+    /// Available only on the parent-capable runtime role; the method still
+    /// rejects a [`Router`](crate::role::Router) configured as an ordinary
+    /// router before touching coordinator startup state.
+    #[cfg(any(feature = "router", test))]
+    pub fn start_or_resume_coordinator(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<u16, StartError>>
+    where
+        R: crate::role::ParentRole,
+    {
+        self.device
+            .start_or_resume_coordinator_with_security_store(&mut *self.security_store)
+    }
+
+    /// Resume or freshly form a distributed-security PAN as a router.
+    #[cfg(any(feature = "router", test))]
+    pub fn start_or_resume_distributed_network(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<u16, StartError>>
+    where
+        R: crate::role::ParentRole,
+    {
+        self.device
+            .start_or_resume_distributed_network_with_security_store(&mut *self.security_store)
     }
 
     pub async fn secure_rejoin(&mut self) -> Result<u16, StartError> {
@@ -198,6 +356,125 @@ where
             .map_err(NodeError::Persistence)
     }
 
+    /// Tick a non-coordinator node with a steering-only pending-action path.
+    pub async fn tick_steering(&mut self, elapsed_secs: u16) -> Result<TickResult, NodeError> {
+        let Self {
+            device,
+            security_store,
+            profile,
+        } = self;
+        let mut clusters = ApplicationClusters::new();
+        profile.collect_clusters(&mut clusters)?;
+        device
+            .tick_with_steering_security_store(
+                elapsed_secs,
+                clusters.as_mut_slice(),
+                *security_store,
+            )
+            .await
+            .map_err(NodeError::Persistence)
+    }
+
+    /// Steering-only tick that leaves a requested durable reset for the
+    /// application composition root to commit.
+    pub async fn tick_steering_deferred_reset(
+        &mut self,
+        elapsed_secs: u16,
+    ) -> Result<TickResult, NodeError> {
+        let Self {
+            device,
+            security_store,
+            profile,
+        } = self;
+        let mut clusters = ApplicationClusters::new();
+        profile.collect_clusters(&mut clusters)?;
+        device
+            .tick_with_steering_security_store_deferred_reset(
+                elapsed_secs,
+                clusters.as_mut_slice(),
+                *security_store,
+            )
+            .await
+            .map_err(NodeError::Persistence)
+    }
+
+    /// Tick a coordinator with a formation-only pending-action path.
+    #[cfg(any(feature = "router", test))]
+    pub async fn tick_coordinator(&mut self, elapsed_secs: u16) -> Result<TickResult, NodeError>
+    where
+        R: crate::role::ParentRole,
+    {
+        let Self {
+            device,
+            security_store,
+            profile,
+        } = self;
+        let mut clusters = ApplicationClusters::new();
+        profile.collect_clusters(&mut clusters)?;
+        device
+            .tick_with_coordinator_security_store(
+                elapsed_secs,
+                clusters.as_mut_slice(),
+                *security_store,
+            )
+            .await
+            .map_err(NodeError::Persistence)
+    }
+
+    /// Coordinator tick that leaves a requested durable reset for the
+    /// application composition root to commit.
+    #[cfg(any(feature = "router", test))]
+    pub async fn tick_coordinator_deferred_reset(
+        &mut self,
+        elapsed_secs: u16,
+    ) -> Result<TickResult, NodeError>
+    where
+        R: crate::role::ParentRole,
+    {
+        let Self {
+            device,
+            security_store,
+            profile,
+        } = self;
+        let mut clusters = ApplicationClusters::new();
+        profile.collect_clusters(&mut clusters)?;
+        device
+            .tick_with_coordinator_security_store_deferred_reset(
+                elapsed_secs,
+                clusters.as_mut_slice(),
+                *security_store,
+            )
+            .await
+            .map_err(NodeError::Persistence)
+    }
+
+    /// Tick a distributed-network owner with a formation-only pending-action
+    /// path.
+    #[cfg(any(feature = "router", test))]
+    pub async fn tick_distributed_deferred_reset(
+        &mut self,
+        elapsed_secs: u16,
+    ) -> Result<TickResult, NodeError>
+    where
+        R: crate::role::ParentRole,
+    {
+        let Self {
+            device,
+            security_store,
+            profile,
+        } = self;
+        let mut clusters = ApplicationClusters::new();
+        profile.collect_clusters(&mut clusters)?;
+        device
+            .tick_with_distributed_security_store_deferred_reset(
+                elapsed_secs,
+                clusters.as_mut_slice(),
+                *security_store,
+            )
+            .await
+            .map_err(NodeError::Persistence)
+    }
+
     pub async fn process_incoming(
         &mut self,
         indication: &McpsDataIndication,
@@ -211,6 +488,32 @@ where
         profile.collect_clusters(&mut clusters)?;
         device
             .process_incoming_with_security_store(
+                indication,
+                clusters.as_mut_slice(),
+                *security_store,
+            )
+            .await
+            .map_err(NodeError::Persistence)
+    }
+
+    /// Process one frame while deferring application-owned cross-journal
+    /// Leave/factory-reset cleanup to the composition root.
+    ///
+    /// The runtime still commits an accepted management Leave before releasing
+    /// its ACK and response.
+    pub async fn process_incoming_deferred_reset(
+        &mut self,
+        indication: &McpsDataIndication,
+    ) -> Result<Option<StackEvent>, NodeError> {
+        let Self {
+            device,
+            security_store,
+            profile,
+        } = self;
+        let mut clusters = ApplicationClusters::new();
+        profile.collect_clusters(&mut clusters)?;
+        device
+            .process_incoming_with_security_store_deferred_reset(
                 indication,
                 clusters.as_mut_slice(),
                 *security_store,

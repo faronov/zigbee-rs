@@ -5,12 +5,22 @@ use crate::clusters::AttributeStoreAccess;
 use crate::data_types::{self, ZclDataType, ZclValue};
 use crate::{AttributeId, ZclStatus};
 
-/// Maximum number of reporting configurations tracked simultaneously.
-#[cfg(not(feature = "constrained-memory"))]
-pub const MAX_REPORT_CONFIGS: usize = 16;
+/// Compact reporting capacity for a product with one application endpoint
+/// and a small, fixed report set.
+#[cfg(feature = "compact-single-endpoint")]
+pub const MAX_REPORT_CONFIGS: usize = 4;
 /// Reduced reporting capacity for devices with tightly constrained SRAM.
-#[cfg(feature = "constrained-memory")]
+#[cfg(all(
+    not(feature = "compact-single-endpoint"),
+    feature = "constrained-memory"
+))]
 pub const MAX_REPORT_CONFIGS: usize = 8;
+/// Default reporting capacity for general-purpose products.
+#[cfg(all(
+    not(feature = "compact-single-endpoint"),
+    not(feature = "constrained-memory")
+))]
+pub const MAX_REPORT_CONFIGS: usize = 16;
 
 /// Direction field in a reporting configuration record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +39,7 @@ pub struct ReportingConfig {
     pub data_type: ZclDataType,
     /// Minimum reporting interval in seconds.
     pub min_interval: u16,
-    /// Maximum reporting interval in seconds (0xFFFF = no periodic reporting).
+    /// Maximum interval: 0 disables periodic reports; 0xFFFF disables automatic reports.
     pub max_interval: u16,
     /// Minimum change to trigger a report (for analog types).
     pub reportable_change: Option<ZclValue>,
@@ -129,8 +139,11 @@ impl ReportAttributes {
 }
 
 impl ConfigureReportingRequest {
-    /// Parse from ZCL payload bytes.
+    /// Parse a non-empty sequence of complete reporting records.
     pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.is_empty() {
+            return None;
+        }
         let mut configs = heapless::Vec::new();
         let mut i = 0;
         while i < data.len() {
@@ -141,14 +154,14 @@ impl ConfigureReportingRequest {
             };
             i += 1;
             if i + 2 > data.len() {
-                break;
+                return None;
             }
             let attr_id = AttributeId(u16::from_le_bytes([data[i], data[i + 1]]));
             i += 2;
 
             if direction == ReportDirection::Send {
                 if i + 5 > data.len() {
-                    break;
+                    return None;
                 }
                 let dt = ZclDataType::from_u8(data[i])?;
                 i += 1;
@@ -177,7 +190,7 @@ impl ConfigureReportingRequest {
             } else {
                 // Receive direction: timeout period
                 if i + 2 > data.len() {
-                    break;
+                    return None;
                 }
                 let timeout = u16::from_le_bytes([data[i], data[i + 1]]);
                 i += 2;
@@ -207,6 +220,35 @@ struct ReportState {
     elapsed: u16,
     /// Last reported value (for change detection).
     last_value: Option<ZclValue>,
+    forced: bool,
+}
+
+impl ReportState {
+    fn report_due(&self, current: &ZclValue) -> bool {
+        if self.forced {
+            return true;
+        }
+        if self.config.max_interval == 0xFFFF {
+            return false;
+        }
+        if self.config.max_interval != 0 && self.elapsed >= self.config.max_interval {
+            return true;
+        }
+        if self.elapsed < self.config.min_interval {
+            return false;
+        }
+        match (&self.last_value, &self.config.reportable_change) {
+            (Some(last), Some(change)) => current.exceeds_threshold(last, change),
+            (Some(last), None) => last != current,
+            (None, _) => true,
+        }
+    }
+
+    fn reported(&mut self, current: &ZclValue) {
+        self.elapsed = 0;
+        self.last_value = Some(current.clone());
+        self.forced = false;
+    }
 }
 
 /// Engine that tracks configured reports and decides when to generate them.
@@ -250,6 +292,7 @@ impl ReportingEngine {
                 state.config = config;
                 state.elapsed = 0;
                 state.last_value = None;
+                state.forced = false;
                 return Ok(());
             }
         }
@@ -260,6 +303,7 @@ impl ReportingEngine {
                 config,
                 elapsed: 0,
                 last_value: None,
+                forced: false,
             })
             .map_err(|_| ZclStatus::InsufficientSpace)
     }
@@ -274,13 +318,13 @@ impl ReportingEngine {
     /// Make every locally-sent report due on the next reporting pass.
     ///
     /// This bypasses the configured minimum interval and value-change
-    /// threshold exactly once. It is intended for explicit operator actions
-    /// such as a device button requesting an immediate telemetry snapshot.
+    /// threshold exactly once, including when automatic reporting is disabled.
+    /// It is intended for explicit operator actions such as a device button
+    /// requesting an immediate telemetry snapshot.
     pub fn force_all_due(&mut self) {
         for state in self.states.iter_mut() {
             if state.config.direction == ReportDirection::Send {
-                state.elapsed = u16::MAX;
-                state.last_value = None;
+                state.forced = true;
             }
         }
     }
@@ -336,34 +380,8 @@ impl ReportingEngine {
                 None => continue,
             };
 
-            let mut should_report = false;
-
-            // Max interval expired?
-            if state.config.max_interval != 0xFFFF && state.elapsed >= state.config.max_interval {
-                should_report = true;
-            }
-
-            // Value changed beyond threshold?
-            if state.elapsed >= state.config.min_interval {
-                if let Some(ref last) = state.last_value {
-                    if let Some(ref change) = state.config.reportable_change {
-                        // Analog type: check if change exceeds threshold
-                        if current.exceeds_threshold(last, change) {
-                            should_report = true;
-                        }
-                    } else if last != current {
-                        // Discrete type or no threshold: any change triggers
-                        should_report = true;
-                    }
-                } else {
-                    // No previous value — first report.
-                    should_report = true;
-                }
-            }
-
-            if should_report {
-                state.elapsed = 0;
-                state.last_value = Some(current.clone());
+            if state.report_due(current) {
+                state.reported(current);
                 if let Some(def) = store.find(state.config.attribute_id) {
                     let _ = reports.push(AttributeReport {
                         id: state.config.attribute_id,
@@ -448,29 +466,8 @@ impl ReportingEngine {
                 None => continue,
             };
 
-            let mut should_report = false;
-
-            if state.config.max_interval != 0xFFFF && state.elapsed >= state.config.max_interval {
-                should_report = true;
-            }
-
-            if state.elapsed >= state.config.min_interval {
-                if let Some(ref last) = state.last_value {
-                    if let Some(ref change) = state.config.reportable_change {
-                        if current.exceeds_threshold(last, change) {
-                            should_report = true;
-                        }
-                    } else if last != current {
-                        should_report = true;
-                    }
-                } else {
-                    should_report = true;
-                }
-            }
-
-            if should_report {
-                state.elapsed = 0;
-                state.last_value = Some(current.clone());
+            if state.report_due(current) {
+                state.reported(current);
                 if let Some(def) = store.find(state.config.attribute_id) {
                     let _ = out.push(AttributeReport {
                         id: state.config.attribute_id,
@@ -503,8 +500,11 @@ pub struct ReadReportingConfigRecord {
 }
 
 impl ReadReportingConfigRequest {
-    /// Parse from ZCL payload bytes.
+    /// Parse a non-empty sequence of complete reporting records.
     pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.is_empty() || !data.len().is_multiple_of(3) {
+            return None;
+        }
         let mut records = heapless::Vec::new();
         let mut i = 0;
         while i + 2 < data.len() {
@@ -604,5 +604,205 @@ impl ReadReportingConfigResponse {
             }
         }
         pos
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attribute::{AttributeAccess, AttributeDefinition};
+
+    fn config(attribute_id: u16) -> ReportingConfig {
+        ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: AttributeId(attribute_id),
+            data_type: ZclDataType::U16,
+            min_interval: 1,
+            max_interval: 60,
+            reportable_change: Some(ZclValue::U16(1)),
+        }
+    }
+
+    #[test]
+    fn configure_reporting_rejects_every_incomplete_record_prefix() {
+        for complete in [
+            &[0, 0, 0, 0x21, 30, 0, 60, 0, 1, 0][..],
+            &[1, 0, 0, 30, 0][..],
+        ] {
+            for len in 0..complete.len() {
+                assert!(ConfigureReportingRequest::parse(&complete[..len]).is_none());
+            }
+            assert_eq!(
+                ConfigureReportingRequest::parse(complete)
+                    .unwrap()
+                    .configs
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn configure_reporting_does_not_accept_a_valid_prefix_with_a_truncated_tail() {
+        let payload = [0, 0, 0, 0x21, 30, 0, 60, 0, 1, 0, 1, 1, 0, 30, 0];
+        for len in 11..payload.len() {
+            assert!(ConfigureReportingRequest::parse(&payload[..len]).is_none());
+        }
+        assert_eq!(
+            ConfigureReportingRequest::parse(&payload)
+                .unwrap()
+                .configs
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn read_reporting_rejects_empty_payload_and_trailing_record_bytes() {
+        let payload = [0, 0, 0, 1, 1, 0];
+        for len in [0, 1, 2, 4, 5] {
+            assert!(ReadReportingConfigRequest::parse(&payload[..len]).is_none());
+        }
+        assert_eq!(
+            ReadReportingConfigRequest::parse(&payload)
+                .unwrap()
+                .records
+                .len(),
+            2
+        );
+    }
+
+    fn fixture(min: u16, max: u16) -> (ReportingEngine, AttributeStore<1>) {
+        let mut cfg = config(0);
+        cfg.min_interval = min;
+        cfg.max_interval = max;
+        let mut engine = ReportingEngine::new();
+        engine.configure_for_cluster(1, 0x0402, cfg).unwrap();
+        let mut store = AttributeStore::new();
+        store
+            .register(
+                AttributeDefinition {
+                    id: AttributeId(0),
+                    data_type: ZclDataType::U16,
+                    access: AttributeAccess::Reportable,
+                    name: "measured",
+                },
+                ZclValue::U16(100),
+            )
+            .unwrap();
+        (engine, store)
+    }
+
+    fn reports_due(engine: &mut ReportingEngine, store: &AttributeStore<1>, dynamic: bool) -> bool {
+        if dynamic {
+            let mut out = heapless::Vec::new();
+            engine.check_and_collect_dyn(1, 0x0402, store, &mut out);
+            !out.is_empty()
+        } else {
+            engine.check_and_report_cluster(1, 0x0402, store).is_some()
+        }
+    }
+
+    #[test]
+    fn zero_max_reports_changes_only_after_the_minimum_interval() {
+        for dynamic in [false, true] {
+            let (mut engine, mut store) = fixture(30, 0);
+            assert!(!reports_due(&mut engine, &store, dynamic));
+            engine.tick(29);
+            assert!(!reports_due(&mut engine, &store, dynamic));
+            engine.tick(1);
+            assert!(reports_due(&mut engine, &store, dynamic));
+            assert!(!reports_due(&mut engine, &store, dynamic));
+            store.set_raw(AttributeId(0), ZclValue::U16(101)).unwrap();
+            engine.tick(29);
+            assert!(!reports_due(&mut engine, &store, dynamic));
+            engine.tick(1);
+            assert!(reports_due(&mut engine, &store, dynamic));
+            engine.tick(u16::MAX);
+            assert!(!reports_due(&mut engine, &store, dynamic));
+        }
+    }
+
+    #[test]
+    fn disabled_reporting_ignores_initial_value_changes_and_elapsed_saturation() {
+        for dynamic in [false, true] {
+            let (mut engine, mut store) = fixture(0, 0xFFFF);
+            assert!(!reports_due(&mut engine, &store, dynamic));
+            store.set_raw(AttributeId(0), ZclValue::U16(101)).unwrap();
+            engine.tick(u16::MAX);
+            assert!(!reports_due(&mut engine, &store, dynamic));
+            engine.tick(1);
+            assert!(!reports_due(&mut engine, &store, dynamic));
+        }
+    }
+
+    #[test]
+    fn explicit_force_reports_once_even_when_automatic_reporting_is_disabled() {
+        for dynamic in [false, true] {
+            for max in [0, 600, 0xFFFF] {
+                let (mut engine, store) = fixture(30, max);
+                engine.force_all_due();
+                assert!(reports_due(&mut engine, &store, dynamic));
+                assert!(!reports_due(&mut engine, &store, dynamic));
+                engine.tick(29);
+                assert!(!reports_due(&mut engine, &store, dynamic));
+            }
+        }
+    }
+
+    #[test]
+    fn reconfiguring_clears_a_pending_explicit_force() {
+        for dynamic in [false, true] {
+            let (mut engine, store) = fixture(30, 60);
+            engine.force_all_due();
+            let mut cfg = config(0);
+            cfg.max_interval = 0xFFFF;
+            engine.configure_for_cluster(1, 0x0402, cfg).unwrap();
+            assert!(!reports_due(&mut engine, &store, dynamic));
+        }
+    }
+
+    #[test]
+    fn ordinary_periodic_deadlines_still_report_unchanged_values() {
+        for dynamic in [false, true] {
+            let (mut engine, store) = fixture(30, 60);
+            engine.tick(30);
+            assert!(reports_due(&mut engine, &store, dynamic));
+            engine.tick(59);
+            assert!(!reports_due(&mut engine, &store, dynamic));
+            engine.tick(1);
+            assert!(reports_due(&mut engine, &store, dynamic));
+        }
+    }
+
+    #[test]
+    fn capacity_features_select_the_smallest_requested_table() {
+        let expected = if cfg!(feature = "compact-single-endpoint") {
+            4
+        } else if cfg!(feature = "constrained-memory") {
+            8
+        } else {
+            16
+        };
+        assert_eq!(MAX_REPORT_CONFIGS, expected);
+    }
+
+    #[test]
+    fn reporting_overflow_is_explicit() {
+        let mut engine = ReportingEngine::new();
+        for index in 0..MAX_REPORT_CONFIGS {
+            assert_eq!(
+                engine.configure_for_cluster(1, index as u16, config(index as u16)),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            engine.configure_for_cluster(
+                1,
+                MAX_REPORT_CONFIGS as u16,
+                config(MAX_REPORT_CONFIGS as u16),
+            ),
+            Err(ZclStatus::InsufficientSpace)
+        );
     }
 }

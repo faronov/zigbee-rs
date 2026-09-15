@@ -18,18 +18,58 @@ zigbee-zcl = { version = "0.1.0", path = "../zigbee-zcl", default-features = fal
 log = "0.4"
 
 [features]
-default = ["float32", "float64"]
+default = [
+    "float32",
+    "float64",
+    "finding-binding",
+    "centralized-tclk",
+    "distributed-security",
+    "groups",
+]
 float32 = ["zigbee-bdb/float32", "zigbee-zcl/float32"]
 float64 = ["zigbee-bdb/float64", "zigbee-zcl/float64"]
-router = ["zigbee-aps/router", "zigbee-nwk/router", "zigbee-zdo/router"]
+centralized-tclk = ["zigbee-bdb/centralized-tclk"]
+distributed-security = ["zigbee-bdb/distributed-security"]
+groups = []
+end-device = [
+    "centralized-tclk",
+    "zigbee-bdb/end-device",
+    "zigbee-zdo/end-device",
+]
+sleepy-end-device = [
+    "end-device",
+    "zigbee-aps/sleepy-end-device",
+    "zigbee-bdb/sleepy-end-device",
+]
+application-link-key-installation = []
+finding-binding = ["zigbee-bdb/finding-binding"]
+finding-binding-target = ["zigbee-bdb/finding-binding-target"]
+router = [
+    "centralized-tclk",
+    "distributed-security",
+    "finding-binding",
+    "groups",
+    "zigbee-aps/router",
+    "zigbee-bdb/router",
+    "zigbee-nwk/router",
+    "zigbee-zdo/router",
+]
+trust-center = ["router", "zigbee-aps/trust-center", "zigbee-bdb/trust-center"]
 ota = []
 trace = ["zigbee-bdb/trace", "zigbee-aps/trace", "zigbee-nwk/trace"]
 constrained-memory = [
     "zigbee-zcl/constrained-memory",
     "zigbee-zdo/constrained-memory",
 ]
+compact-single-endpoint = [
+    "zigbee-zcl/compact-single-endpoint",
+    "zigbee-zdo/compact-single-endpoint",
+]
 
 [dev-dependencies]
+# Runtime unit tests expose coordinator helpers under `cfg(test)`; compile the
+# BDB formation implementation without enabling router behavior.
+zigbee-bdb = { path = "../zigbee-bdb", default-features = false, features = ["formation"] }
 zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }
 # NOTE: do not enable `zigbee-nwk/router` here. A dev-dependency feature is
 # unified into this package's own build, so it silently gave every

@@ -3,28 +3,47 @@
 use core::cmp::max;
 
 use zigbee_aps::security::ApsKeyType;
+#[cfg(any(feature = "router", test))]
+use zigbee_bdb::formation::FormationPersistence;
 use zigbee_bdb::{
-    CounterReservation, FRAME_COUNTER_RESERVATION_SIZE, NetworkSecurityState, SecurityPersistence,
-    SecurityPersistenceError, TrustCenterLinkKeyState,
+    CounterReservation, FRAME_COUNTER_RESERVATION_SIZE, NetworkSecurityState, NodeJoinLinkKeyType,
+    SecurityPersistence, SecurityPersistenceError, TrustCenterLinkKeyState,
 };
 use zigbee_nwk::frames::{ED_TIMEOUT_ENUM_DEFAULT, ED_TIMEOUT_ENUM_MAX, PARENT_INFO_MASK};
 use zigbee_types::IeeeAddress;
 
-/// Encoded length of the current (version 4) record.
+pub const MAX_PERSISTENT_REPLAY_COUNTERS: usize = zigbee_nwk::security::MAX_FRAME_COUNTER_ENTRIES
+    + zigbee_aps::security::MAX_KEY_TABLE_ENTRIES
+    + zigbee_aps::security::MAX_GLOBAL_REPLAY_ENTRIES;
+
+/// Encoded length of the current (version 8) record.
 ///
 /// Version 3 appended the R22 End Device Timeout negotiation result to the
 /// version 2 layout: flags bit 6 carries `parent_information_valid`, the
 /// previously unused encoded byte 11 carries `parent_information`, and the new
 /// byte 97 carries `end_device_timeout`.
 ///
-/// Version 4 adds *no* byte at all: it claims the last free flags bit, bit 7,
-/// for `update_id_valid`, so a record can finally say "this device holds no
-/// authoritative `nwkUpdateId`" instead of implying a known `0`. The encoded
-/// length is therefore identical to version 3, and the journal slot geometry
-/// (slot size, CRC offset, prefix length and commit offset) is unchanged for
-/// every version since 2.
-pub const ENCODED_SECURITY_STATE_LEN: usize = 98;
-/// Encoded length of a version 2 record (staged network key, no ED timeout).
+/// Version 4 added `update_id_valid` in flags bit 7 without changing length.
+/// Version 5 appends the BDB Table 6 join-link-key type so the centralized or
+/// distributed security model survives reboot.
+///
+/// Version 6 appends the inactive NWK key role, distinguishing a future staged
+/// key from the previous key retained after activation.
+///
+/// Version 7 appends crash-resumable NWK lifecycle state: a pending short-PAN
+/// transition, a pending `Device_annce`, and a provisional parent link.
+///
+/// Version 8 uses lifecycle flags bit 4 for explicit parent Network-Key fanout
+/// intent. Length and flash slot geometry are unchanged. Older records do not
+/// infer fanout from an inactive key: its descriptor destination is unknown.
+pub const ENCODED_SECURITY_STATE_LEN: usize = 103;
+/// Encoded length of a version 6 record.
+pub(crate) const V6_ENCODED_SECURITY_STATE_LEN: usize = 100;
+/// Encoded length of a version 5 record.
+pub(crate) const V5_ENCODED_SECURITY_STATE_LEN: usize = 99;
+/// Encoded length of version 3 and version 4 records.
+pub(crate) const V4_ENCODED_SECURITY_STATE_LEN: usize = 98;
+/// Encoded length of a version 2 record (secondary network key, no ED timeout).
 pub(crate) const V2_ENCODED_SECURITY_STATE_LEN: usize = 97;
 /// Encoded length of a version 1 record (no staged network key).
 pub(crate) const LEGACY_ENCODED_SECURITY_STATE_LEN: usize = 80;
@@ -38,6 +57,16 @@ const FLAG_STAGED_NETWORK_KEY: u8 = 1 << 5;
 const FLAG_PARENT_INFORMATION_VALID: u8 = 1 << 6;
 const FLAG_UPDATE_ID_VALID: u8 = 1 << 7;
 
+const LIFECYCLE_PENDING_PAN_ID: u8 = 1 << 0;
+const LIFECYCLE_PENDING_PAN_ID_BROADCAST: u8 = 1 << 1;
+const LIFECYCLE_DEVICE_ANNOUNCE_PENDING: u8 = 1 << 2;
+const LIFECYCLE_PARENT_LINK_PROVISIONAL: u8 = 1 << 3;
+const LIFECYCLE_NETWORK_KEY_FORWARDING: u8 = 1 << 4;
+const LIFECYCLE_ALLOWED_FLAGS: u8 = LIFECYCLE_PENDING_PAN_ID
+    | LIFECYCLE_PENDING_PAN_ID_BROADCAST
+    | LIFECYCLE_DEVICE_ANNOUNCE_PENDING
+    | LIFECYCLE_PARENT_LINK_PROVISIONAL;
+
 /// Encoded record layout revision.
 ///
 /// Each variant lists exactly which bytes and flags it may touch, so an older
@@ -47,7 +76,7 @@ const FLAG_UPDATE_ID_VALID: u8 = 1 << 7;
 pub(crate) enum StateFormat {
     /// 80 bytes: no staged network key, no End Device Timeout fields.
     V1,
-    /// 97 bytes: staged network key, no End Device Timeout fields.
+    /// 97 bytes: secondary network key, no End Device Timeout fields.
     V2,
     /// 98 bytes: staged network key and End Device Timeout fields, but no
     /// `nwkUpdateId` validity bit — the stored update ID is authoritative by
@@ -55,6 +84,14 @@ pub(crate) enum StateFormat {
     V3,
     /// 98 bytes: as version 3, plus flags bit 7 carrying `update_id_valid`.
     V4,
+    /// 99 bytes: as version 4, plus `bdbNodeJoinLinkKeyType`.
+    V5,
+    /// 100 bytes: as version 5, plus the inactive NWK key role.
+    V6,
+    /// 103 bytes: as version 6, plus crash-resumable NWK lifecycle state.
+    V7,
+    /// 103 bytes: as version 7, plus explicit Network-Key fanout intent.
+    V8,
 }
 
 impl StateFormat {
@@ -68,7 +105,7 @@ impl StateFormat {
             Self::V1 => common,
             Self::V2 => common | FLAG_STAGED_NETWORK_KEY,
             Self::V3 => common | FLAG_STAGED_NETWORK_KEY | FLAG_PARENT_INFORMATION_VALID,
-            Self::V4 => {
+            Self::V4 | Self::V5 | Self::V6 | Self::V7 | Self::V8 => {
                 common
                     | FLAG_STAGED_NETWORK_KEY
                     | FLAG_PARENT_INFORMATION_VALID
@@ -82,7 +119,10 @@ impl StateFormat {
     }
 
     const fn has_end_device_timeout(self) -> bool {
-        matches!(self, Self::V3 | Self::V4)
+        matches!(
+            self,
+            Self::V3 | Self::V4 | Self::V5 | Self::V6 | Self::V7 | Self::V8
+        )
     }
 
     /// Whether the format encodes `nwkUpdateId` validity explicitly.
@@ -92,7 +132,19 @@ impl StateFormat {
     /// installed the byte unconditionally, so it stays authoritative on
     /// migration — anything else would silently drop live update state.
     const fn has_update_id_valid(self) -> bool {
-        matches!(self, Self::V4)
+        matches!(self, Self::V4 | Self::V5 | Self::V6 | Self::V7 | Self::V8)
+    }
+
+    const fn has_node_join_link_key_type(self) -> bool {
+        matches!(self, Self::V5 | Self::V6 | Self::V7 | Self::V8)
+    }
+
+    const fn has_secondary_key_role(self) -> bool {
+        matches!(self, Self::V6 | Self::V7 | Self::V8)
+    }
+
+    const fn has_nwk_lifecycle(self) -> bool {
+        matches!(self, Self::V7 | Self::V8)
     }
 }
 
@@ -104,6 +156,67 @@ pub enum SecurityStoreError {
     Hardware,
     CounterExhausted,
     GenerationExhausted,
+}
+
+/// One durably committed incoming replay floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistentReplayCounter {
+    Nwk(zigbee_nwk::security::NwkReplayCounter),
+    Aps(zigbee_aps::security::ApsReplayCounter),
+}
+
+impl PersistentReplayCounter {
+    pub(crate) fn same_domain(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (Self::Nwk(left), Self::Nwk(right)) => {
+                left.source == right.source
+                    && left.key_sequence == right.key_sequence
+                    && left.key_fingerprint == right.key_fingerprint
+            }
+            (Self::Aps(left), Self::Aps(right)) => {
+                left.origin == right.origin && left.key_fingerprint == right.key_fingerprint
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) const fn counter(self) -> u32 {
+        match self {
+            Self::Nwk(replay) => replay.counter,
+            Self::Aps(replay) => replay.counter,
+        }
+    }
+
+    pub(crate) fn matches_tombstone(self, tombstone: ReplayCounterTombstone) -> bool {
+        match tombstone {
+            ReplayCounterTombstone::Device(address) => match self {
+                Self::Nwk(replay) => replay.source == address,
+                Self::Aps(replay) => match replay.origin {
+                    zigbee_aps::security::ApsReplayOrigin::KeyPair { partner, .. } => {
+                        partner == address
+                    }
+                    zigbee_aps::security::ApsReplayOrigin::PreconfiguredGlobal { .. }
+                    | zigbee_aps::security::ApsReplayOrigin::DistributedGlobal { .. } => false,
+                },
+            },
+            ReplayCounterTombstone::KeyFingerprint(key_fingerprint) => match self {
+                Self::Nwk(replay) => replay.key_fingerprint == key_fingerprint,
+                Self::Aps(replay) => replay.key_fingerprint == key_fingerprint,
+            },
+            ReplayCounterTombstone::ReplayDomain(replay) => self.same_domain(&replay),
+        }
+    }
+}
+
+/// Durable replay domains that must be removed when their device or key is
+/// revoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayCounterTombstone {
+    Device(IeeeAddress),
+    KeyFingerprint(u32),
+    /// Remove one exact replay domain while preserving another live domain
+    /// that intentionally shares the same key material.
+    ReplayDomain(PersistentReplayCounter),
 }
 
 /// Complete crash-safe state needed for secured rejoin.
@@ -136,9 +249,22 @@ pub struct PersistentSecurityState {
     pub update_id_valid: bool,
     pub network_key: [u8; 16],
     pub key_sequence: u8,
+    /// Whether the inactive NWK key slot is present.
+    ///
+    /// Before Switch-Key this is the future key; after activation it is the
+    /// previous key retained for dual-key receive compatibility across reboot.
     pub staged_network_key_present: bool,
     pub staged_network_key: [u8; 16],
     pub staged_key_sequence: u8,
+    /// The inactive key is the previous key retained after Switch-Key rather
+    /// than a future key awaiting activation.
+    pub secondary_network_key_is_previous: bool,
+    /// A zero-destination standard Network-Key update requires parent fanout.
+    ///
+    /// Targets the staged key, or the active key after activation (never the
+    /// retained previous RX key). Reset conservatively restarts the bounded
+    /// profile-policy window; an addressed update must clear this intent.
+    pub network_key_forwarding_pending: bool,
     /// Persisted exclusive upper bound, never the live counter.
     pub global_counter_limit: u32,
     pub tclk_present: bool,
@@ -184,6 +310,21 @@ pub struct PersistentSecurityState {
     /// negotiated, so a migrated or freshly commissioned record can never
     /// claim a longer child lifetime than the parent actually granted.
     pub end_device_timeout: u8,
+    /// BDB Table 6 link-key regime used to authenticate the initial network
+    /// key. This also identifies centralized versus distributed security.
+    pub node_join_link_key_type: NodeJoinLinkKeyType,
+    /// A short PAN identifier accepted from a Network Update but not yet
+    /// applied after `nwkNetworkBroadcastDeliveryTime`.
+    pub pending_pan_id: Option<u16>,
+    /// The local network manager still owes the network the corresponding
+    /// Network Update broadcast.
+    pub pending_pan_id_broadcast: bool,
+    /// The current short address/parent checkpoint is durable, but its
+    /// `Device_annce` has not yet completed successfully.
+    pub device_announce_pending: bool,
+    /// An unsecured centralized rejoin selected the current parent. Normal
+    /// operation remains gated until that parent proves the active NWK key.
+    pub parent_link_provisional: bool,
 }
 
 impl PersistentSecurityState {
@@ -204,6 +345,8 @@ impl PersistentSecurityState {
             staged_network_key_present: false,
             staged_network_key: [0; 16],
             staged_key_sequence: 0,
+            secondary_network_key_is_previous: false,
+            network_key_forwarding_pending: false,
             global_counter_limit: 0,
             tclk_present: false,
             legacy_default_tclk: false,
@@ -216,7 +359,33 @@ impl PersistentSecurityState {
             parent_information: 0,
             parent_information_valid: false,
             end_device_timeout: ED_TIMEOUT_ENUM_DEFAULT,
+            node_join_link_key_type: NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey,
+            pending_pan_id: None,
+            pending_pan_id_broadcast: false,
+            device_announce_pending: false,
+            parent_link_provisional: false,
         }
+    }
+
+    /// Whether this record describes a node that formed and owns the PAN.
+    ///
+    /// A coordinator owns short address `0x0000`, has depth zero, and has no
+    /// parent. This shape is unambiguous in a Zigbee network and lets the
+    /// existing record format represent a coordinator without inventing a
+    /// self-referential Trust Center link key or consuming another format bit.
+    pub(crate) const fn is_formed_network(&self) -> bool {
+        self.short_address == 0x0000 && self.depth == 0 && self.parent_address == 0xFFFF
+    }
+
+    /// Whether this is a centralized network formed by its coordinator.
+    pub(crate) const fn is_coordinator_network(&self) -> bool {
+        self.is_formed_network() && !self.node_join_link_key_type.is_distributed()
+    }
+
+    /// Whether this is a distributed network formed by a router.
+    #[cfg(any(feature = "router", test))]
+    pub(crate) const fn is_distributed_network_owner(&self) -> bool {
+        self.is_formed_network() && self.node_join_link_key_type.is_distributed()
     }
 
     pub fn encode(&self, output: &mut [u8; ENCODED_SECURITY_STATE_LEN]) {
@@ -273,16 +442,66 @@ impl PersistentSecurityState {
         output[80] = self.staged_key_sequence;
         output[81..97].copy_from_slice(&self.staged_network_key);
         output[97] = self.end_device_timeout;
+        output[98] = self.node_join_link_key_type as u8;
+        output[99] = u8::from(self.secondary_network_key_is_previous);
+        output[100] = (if self.pending_pan_id.is_some() {
+            LIFECYCLE_PENDING_PAN_ID
+        } else {
+            0
+        }) | (if self.pending_pan_id_broadcast {
+            LIFECYCLE_PENDING_PAN_ID_BROADCAST
+        } else {
+            0
+        }) | (if self.device_announce_pending {
+            LIFECYCLE_DEVICE_ANNOUNCE_PENDING
+        } else {
+            0
+        }) | (if self.parent_link_provisional {
+            LIFECYCLE_PARENT_LINK_PROVISIONAL
+        } else {
+            0
+        }) | (if self.network_key_forwarding_pending {
+            LIFECYCLE_NETWORK_KEY_FORWARDING
+        } else {
+            0
+        });
+        output[101..103].copy_from_slice(&self.pending_pan_id.unwrap_or(0).to_le_bytes());
     }
 
     pub fn decode(input: &[u8; ENCODED_SECURITY_STATE_LEN]) -> Result<Self, SecurityStoreError> {
+        Self::decode_bytes(input, StateFormat::V8)
+    }
+
+    pub(crate) fn decode_v7(
+        input: &[u8; ENCODED_SECURITY_STATE_LEN],
+    ) -> Result<Self, SecurityStoreError> {
+        Self::decode_bytes(input, StateFormat::V7)
+    }
+
+    pub(crate) fn decode_v6(
+        input: &[u8; V6_ENCODED_SECURITY_STATE_LEN],
+    ) -> Result<Self, SecurityStoreError> {
+        Self::decode_bytes(input, StateFormat::V6)
+    }
+
+    pub(crate) fn decode_v5(
+        input: &[u8; V5_ENCODED_SECURITY_STATE_LEN],
+    ) -> Result<Self, SecurityStoreError> {
+        Self::decode_bytes(input, StateFormat::V5)
+    }
+
+    /// Decode a version 4 record with explicit `nwkUpdateId` validity but no
+    /// persisted BDB join-link-key type.
+    pub(crate) fn decode_v4(
+        input: &[u8; V4_ENCODED_SECURITY_STATE_LEN],
+    ) -> Result<Self, SecurityStoreError> {
         Self::decode_bytes(input, StateFormat::V4)
     }
 
     /// Decode a version 3 record: same length as the current format, but
     /// without the `update_id_valid` bit.
     pub(crate) fn decode_v3(
-        input: &[u8; ENCODED_SECURITY_STATE_LEN],
+        input: &[u8; V4_ENCODED_SECURITY_STATE_LEN],
     ) -> Result<Self, SecurityStoreError> {
         Self::decode_bytes(input, StateFormat::V3)
     }
@@ -348,20 +567,96 @@ impl PersistentSecurityState {
             state.parent_information = input[11];
             state.end_device_timeout = input[97];
         }
+        state.node_join_link_key_type = if format.has_node_join_link_key_type() {
+            NodeJoinLinkKeyType::from_u8(input[98]).ok_or(SecurityStoreError::Corrupt)?
+        } else if state.trust_center_address == [0xFF; 8] {
+            NodeJoinLinkKeyType::DistributedSecurityGlobalLinkKey
+        } else {
+            NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey
+        };
+        state.secondary_network_key_is_previous = if format.has_secondary_key_role() {
+            match input[99] {
+                0 => false,
+                1 => true,
+                _ => return Err(SecurityStoreError::Corrupt),
+            }
+        } else {
+            false
+        };
+        if format.has_nwk_lifecycle() {
+            let lifecycle = input[100];
+            let allowed = LIFECYCLE_ALLOWED_FLAGS
+                | if format == StateFormat::V8 {
+                    LIFECYCLE_NETWORK_KEY_FORWARDING
+                } else {
+                    0
+                };
+            if lifecycle & !allowed != 0 {
+                return Err(SecurityStoreError::Corrupt);
+            }
+            state.pending_pan_id = if lifecycle & LIFECYCLE_PENDING_PAN_ID != 0 {
+                Some(u16::from_le_bytes([input[101], input[102]]))
+            } else {
+                None
+            };
+            state.pending_pan_id_broadcast = lifecycle & LIFECYCLE_PENDING_PAN_ID_BROADCAST != 0;
+            state.device_announce_pending = lifecycle & LIFECYCLE_DEVICE_ANNOUNCE_PENDING != 0;
+            state.parent_link_provisional = lifecycle & LIFECYCLE_PARENT_LINK_PROVISIONAL != 0;
+            state.network_key_forwarding_pending =
+                lifecycle & LIFECYCLE_NETWORK_KEY_FORWARDING != 0;
+        }
 
         state.validate()?;
         Ok(state)
     }
 
     pub fn validate(&self) -> Result<(), SecurityStoreError> {
+        let formed_network = self.is_formed_network();
+        let distributed = self.node_join_link_key_type.is_distributed();
         if self.commissioned
             && (!(11..=26).contains(&self.channel)
                 || self.pan_id == 0xFFFF
                 || self.short_address == 0xFFFF
                 || self.ieee_address == [0; 8]
                 || self.global_counter_limit == 0
-                || !(self.tclk_present || self.legacy_default_tclk))
+                || !(formed_network
+                    || distributed
+                    || self.tclk_present
+                    || self.legacy_default_tclk))
         {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        // The coordinator is the Trust Center; it never holds a unique TCLK
+        // with itself and never has an end-device parent relationship. Keep
+        // those representations disjoint so a corrupt leaf record cannot be
+        // reinterpreted as a coordinator merely because it carries address 0.
+        if formed_network
+            && !distributed
+            && (self.tclk_present
+                || self.legacy_default_tclk
+                || self.trust_center_address != [0; 8]
+                || self.trust_center_link_key != [0; 16]
+                || self.tclk_incoming_counter != 0
+                || self.tclk_incoming_counter_valid
+                || self.rejoin_pending
+                || self.parent_information != 0
+                || self.parent_information_valid
+                || self.end_device_timeout != ED_TIMEOUT_ENUM_DEFAULT)
+        {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        if distributed
+            && (self.trust_center_address != [0xFF; 8]
+                || self.tclk_present
+                || self.legacy_default_tclk
+                || self.trust_center_link_key != [0; 16]
+                || self.tclk_counter_limit != 0
+                || self.tclk_incoming_counter != 0
+                || self.tclk_incoming_counter_valid)
+        {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        if !distributed && self.trust_center_address == [0xFF; 8] {
             return Err(SecurityStoreError::Corrupt);
         }
         // A legacy default-TCLK network is a commissioned network *without* a
@@ -378,10 +673,22 @@ impl PersistentSecurityState {
             return Err(SecurityStoreError::Corrupt);
         }
         if self.staged_network_key_present {
-            if !self.commissioned || self.staged_key_sequence == self.key_sequence {
+            if !self.commissioned
+                || self.staged_key_sequence == self.key_sequence
+                || (self.secondary_network_key_is_previous
+                    && self.staged_key_sequence != self.key_sequence.wrapping_sub(1))
+            {
                 return Err(SecurityStoreError::Corrupt);
             }
-        } else if self.staged_key_sequence != 0 || self.staged_network_key != [0; 16] {
+        } else if self.staged_key_sequence != 0
+            || self.staged_network_key != [0; 16]
+            || self.secondary_network_key_is_previous
+        {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        if self.network_key_forwarding_pending
+            && (!self.commissioned || distributed || !self.staged_network_key_present)
+        {
             return Err(SecurityStoreError::Corrupt);
         }
         if self.tclk_present
@@ -410,6 +717,24 @@ impl PersistentSecurityState {
         if !self.update_id_valid && self.update_id != 0 {
             return Err(SecurityStoreError::Corrupt);
         }
+        if let Some(pending_pan_id) = self.pending_pan_id {
+            if !self.commissioned
+                || !self.update_id_valid
+                || pending_pan_id == 0
+                || pending_pan_id == 0xFFFF
+                || pending_pan_id == self.pan_id
+            {
+                return Err(SecurityStoreError::Corrupt);
+            }
+        } else if self.pending_pan_id_broadcast {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        if self.device_announce_pending && (!self.commissioned || formed_network) {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        if self.parent_link_provisional && (!self.commissioned || formed_network || distributed) {
+            return Err(SecurityStoreError::Corrupt);
+        }
         Ok(())
     }
 }
@@ -424,6 +749,48 @@ impl Default for PersistentSecurityState {
 pub trait SecurityStateStore {
     fn load(&mut self) -> Result<Option<PersistentSecurityState>, SecurityStoreError>;
     fn store(&mut self, state: &PersistentSecurityState) -> Result<(), SecurityStoreError>;
+    fn visit_replay_counters(
+        &mut self,
+        _visitor: &mut dyn FnMut(PersistentReplayCounter),
+    ) -> Result<(), SecurityStoreError> {
+        Ok(())
+    }
+    fn commit_replay_counter(
+        &mut self,
+        _replay: PersistentReplayCounter,
+    ) -> Result<(), SecurityStoreError> {
+        // A legacy snapshot-only backend cannot safely acknowledge or act on
+        // an authenticated frame whose replay floor is still volatile.
+        Err(SecurityStoreError::Hardware)
+    }
+    fn tombstone_replay_counters(
+        &mut self,
+        _tombstone: ReplayCounterTombstone,
+    ) -> Result<(), SecurityStoreError> {
+        // Replay cleanup is part of key/device revocation. A backend that
+        // cannot make it durable must fail closed rather than retain an
+        // unbounded stale replay domain.
+        Err(SecurityStoreError::Hardware)
+    }
+    fn retain_replay_counters(
+        &mut self,
+        retain: &dyn Fn(PersistentReplayCounter) -> bool,
+    ) -> Result<usize, SecurityStoreError> {
+        let mut removed = 0usize;
+        loop {
+            let mut stale = None;
+            self.visit_replay_counters(&mut |replay| {
+                if stale.is_none() && !retain(replay) {
+                    stale = Some(replay);
+                }
+            })?;
+            let Some(stale) = stale else {
+                return Ok(removed);
+            };
+            self.tombstone_replay_counters(ReplayCounterTombstone::ReplayDomain(stale))?;
+            removed = removed.saturating_add(1);
+        }
+    }
 }
 
 pub(crate) struct CommissioningSecurityPersistence<'a, S: SecurityStateStore> {
@@ -464,6 +831,35 @@ impl<'a, S: SecurityStateStore> CommissioningSecurityPersistence<'a, S> {
     }
 }
 
+#[cfg(any(feature = "router", test))]
+impl<S: SecurityStateStore> FormationPersistence for CommissioningSecurityPersistence<'_, S> {
+    fn commit_formed_network(
+        &mut self,
+        state: &NetworkSecurityState,
+    ) -> Result<CounterReservation, SecurityPersistenceError> {
+        let reservation = <Self as SecurityPersistence>::reserve_network_security(self, state)?;
+
+        if state.node_join_link_key_type.is_distributed() {
+            <Self as SecurityPersistence>::commit_distributed_network(self)?;
+        } else {
+            if !self.state.is_coordinator_network()
+                || self.state.tclk_present
+                || self.state.legacy_default_tclk
+            {
+                return Err(SecurityPersistenceError::InvalidState);
+            }
+            self.state.commissioned = true;
+            self.state.rejoin_pending = false;
+            self.state
+                .validate()
+                .map_err(|_| SecurityPersistenceError::InvalidState)?;
+            self.persist()?;
+        }
+
+        Ok(reservation)
+    }
+}
+
 impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersistence<'_, S> {
     fn reserve_network_security(
         &mut self,
@@ -491,11 +887,24 @@ impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersist
         self.state.staged_network_key_present = false;
         self.state.staged_network_key = [0; 16];
         self.state.staged_key_sequence = 0;
+        self.state.secondary_network_key_is_previous = false;
+        self.state.network_key_forwarding_pending = false;
         self.state.global_counter_limit = reservation.limit;
+        self.state.node_join_link_key_type = state.node_join_link_key_type;
+        let formed_network =
+            state.short_address == 0x0000 && state.depth == 0 && state.parent_address == 0xFFFF;
+        self.state.trust_center_address =
+            if formed_network && !state.node_join_link_key_type.is_distributed() {
+                [0; 8]
+            } else {
+                state.trust_center_address
+            };
         self.state.tclk_present = false;
         self.state.legacy_default_tclk = false;
-        self.state.trust_center_address = [0; 8];
         self.state.trust_center_link_key = [0; 16];
+        if state.node_join_link_key_type.is_distributed() {
+            self.state.tclk_counter_limit = 0;
+        }
         self.state.tclk_incoming_counter = 0;
         self.state.tclk_incoming_counter_valid = false;
         // A fresh commissioning selects a new parent, so any keepalive method
@@ -513,6 +922,9 @@ impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersist
         state: &TrustCenterLinkKeyState,
     ) -> Result<CounterReservation, SecurityPersistenceError> {
         if state.key_type != ApsKeyType::TrustCenterLinkKey {
+            return Err(SecurityPersistenceError::InvalidState);
+        }
+        if self.state.node_join_link_key_type.is_distributed() {
             return Err(SecurityPersistenceError::InvalidState);
         }
         // Keep one monotonic reservation space across replacement TCLKs. This
@@ -536,7 +948,8 @@ impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersist
         &mut self,
         trust_center_link_key: &TrustCenterLinkKeyState,
     ) -> Result<(), SecurityPersistenceError> {
-        if !self.state.tclk_present
+        if self.state.node_join_link_key_type.is_distributed()
+            || !self.state.tclk_present
             || self.state.trust_center_address != trust_center_link_key.partner_address
             || self.state.trust_center_link_key != trust_center_link_key.key
             || trust_center_link_key.outgoing_frame_counter > self.state.tclk_counter_limit
@@ -549,16 +962,36 @@ impl<S: SecurityStateStore> SecurityPersistence for CommissioningSecurityPersist
         self.state.rejoin_pending = false;
         self.persist()
     }
+
+    fn commit_distributed_network(&mut self) -> Result<(), SecurityPersistenceError> {
+        if !self.state.node_join_link_key_type.is_distributed()
+            || self.state.trust_center_address != [0xFF; 8]
+            || self.state.tclk_present
+            || self.state.legacy_default_tclk
+        {
+            return Err(SecurityPersistenceError::InvalidState);
+        }
+        self.state.commissioned = true;
+        self.state.rejoin_pending = false;
+        self.state
+            .validate()
+            .map_err(|_| SecurityPersistenceError::InvalidState)?;
+        self.persist()
+    }
 }
 
 /// In-memory store for tests.
 pub struct RamSecurityStateStore {
     state: Option<PersistentSecurityState>,
+    replay: heapless::Vec<PersistentReplayCounter, MAX_PERSISTENT_REPLAY_COUNTERS>,
 }
 
 impl RamSecurityStateStore {
     pub const fn new() -> Self {
-        Self { state: None }
+        Self {
+            state: None,
+            replay: heapless::Vec::new(),
+        }
     }
 }
 
@@ -574,8 +1007,67 @@ impl SecurityStateStore for RamSecurityStateStore {
     }
 
     fn store(&mut self, state: &PersistentSecurityState) -> Result<(), SecurityStoreError> {
+        let preserve_replay = self.state.is_some_and(|current| {
+            current.commissioned
+                && state.commissioned
+                && current.extended_pan_id == state.extended_pan_id
+                && current.ieee_address == state.ieee_address
+        });
+        if !preserve_replay {
+            self.replay.clear();
+        }
         self.state = Some(*state);
         Ok(())
+    }
+
+    fn visit_replay_counters(
+        &mut self,
+        visitor: &mut dyn FnMut(PersistentReplayCounter),
+    ) -> Result<(), SecurityStoreError> {
+        for replay in self.replay.iter().copied() {
+            visitor(replay);
+        }
+        Ok(())
+    }
+
+    fn commit_replay_counter(
+        &mut self,
+        replay: PersistentReplayCounter,
+    ) -> Result<(), SecurityStoreError> {
+        if !self.state.is_some_and(|state| state.commissioned) {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        if let Some(stored) = self
+            .replay
+            .iter_mut()
+            .find(|stored| stored.same_domain(&replay))
+        {
+            if replay.counter() > stored.counter() {
+                *stored = replay;
+            }
+            return Ok(());
+        }
+        self.replay
+            .push(replay)
+            .map_err(|_| SecurityStoreError::Full)
+    }
+
+    fn tombstone_replay_counters(
+        &mut self,
+        tombstone: ReplayCounterTombstone,
+    ) -> Result<(), SecurityStoreError> {
+        self.replay
+            .retain(|replay| !replay.matches_tombstone(tombstone));
+        Ok(())
+    }
+
+    fn retain_replay_counters(
+        &mut self,
+        retain: &dyn Fn(PersistentReplayCounter) -> bool,
+    ) -> Result<usize, SecurityStoreError> {
+        let previous_len = self.replay.len();
+        self.replay.retain(|replay| retain(*replay));
+        Ok(previous_len - self.replay.len())
     }
 }
 
@@ -598,6 +1090,8 @@ mod tests {
             network_key: [4; 16],
             key_sequence: 5,
             outgoing_frame_counter: counter,
+            trust_center_address: [6; 8],
+            node_join_link_key_type: NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey,
         }
     }
 
@@ -638,9 +1132,70 @@ mod tests {
         state.tclk_incoming_counter = 17;
         state.tclk_incoming_counter_valid = true;
         state.rejoin_pending = true;
+        state.node_join_link_key_type = NodeJoinLinkKeyType::InstallCodeDerivedPreconfiguredLinkKey;
         let mut encoded = [0u8; ENCODED_SECURITY_STATE_LEN];
         state.encode(&mut encoded);
+        assert_eq!(encoded[98], 0x02);
+        assert_eq!(encoded[99], 0);
         assert_eq!(PersistentSecurityState::decode(&encoded), Ok(state));
+    }
+
+    #[test]
+    fn previous_network_key_role_round_trips_and_rejects_reserved_values() {
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.extended_pan_id = [1; 8];
+        state.pan_id = 0x1234;
+        state.short_address = 0x5678;
+        state.ieee_address = [2; 8];
+        state.channel = 15;
+        state.network_key = [3; 16];
+        state.key_sequence = 0;
+        state.staged_network_key_present = true;
+        state.staged_network_key = [8; 16];
+        state.staged_key_sequence = 0xFF;
+        state.secondary_network_key_is_previous = true;
+        state.global_counter_limit = 0x400;
+        state.legacy_default_tclk = true;
+        state.tclk_counter_limit = 0x400;
+        let mut encoded = [0u8; ENCODED_SECURITY_STATE_LEN];
+        state.encode(&mut encoded);
+        assert_eq!(encoded[99], 1);
+        assert_eq!(PersistentSecurityState::decode(&encoded), Ok(state));
+
+        encoded[99] = 2;
+        assert_eq!(
+            PersistentSecurityState::decode(&encoded),
+            Err(SecurityStoreError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn distributed_network_commits_without_a_trust_center_key() {
+        let mut store = RamSecurityStateStore::new();
+        let mut persistence = CommissioningSecurityPersistence::new(&mut store).unwrap();
+        let mut network = network_state(0);
+        network.trust_center_address = [0xFF; 8];
+        network.node_join_link_key_type = NodeJoinLinkKeyType::DistributedSecurityGlobalLinkKey;
+
+        assert!(
+            persistence
+                .reserve_network_security(&network)
+                .unwrap()
+                .is_valid()
+        );
+        assert_eq!(persistence.commit_distributed_network(), Ok(()));
+
+        let saved = store.load().unwrap().unwrap();
+        assert!(saved.commissioned);
+        assert_eq!(saved.trust_center_address, [0xFF; 8]);
+        assert_eq!(
+            saved.node_join_link_key_type,
+            NodeJoinLinkKeyType::DistributedSecurityGlobalLinkKey
+        );
+        assert!(!saved.tclk_present);
+        assert_eq!(saved.tclk_counter_limit, 0);
+        assert_eq!(saved.validate(), Ok(()));
     }
 
     #[test]
@@ -741,6 +1296,37 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_state_needs_no_self_tclk_and_round_trips() {
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.extended_pan_id = [1; 8];
+        state.pan_id = 0x1234;
+        state.short_address = 0x0000;
+        state.ieee_address = [2; 8];
+        state.channel = 15;
+        state.depth = 0;
+        state.parent_address = 0xFFFF;
+        state.update_id = 3;
+        state.update_id_valid = true;
+        state.network_key = [4; 16];
+        state.global_counter_limit = 0x400;
+        assert!(state.is_coordinator_network());
+        assert_eq!(state.validate(), Ok(()));
+
+        let mut encoded = [0u8; ENCODED_SECURITY_STATE_LEN];
+        state.encode(&mut encoded);
+        assert_eq!(PersistentSecurityState::decode(&encoded), Ok(state));
+
+        // An interrupted coordinator reservation is intentionally still
+        // readable: the next boot forms a new PAN while preserving the
+        // abandoned counter floor.
+        state.commissioned = false;
+        assert_eq!(state.validate(), Ok(()));
+        state.encode(&mut encoded);
+        assert_eq!(PersistentSecurityState::decode(&encoded), Ok(state));
+    }
+
+    #[test]
     fn an_unknown_update_id_may_not_carry_a_value() {
         let mut state = PersistentSecurityState::empty();
         state.update_id = 7;
@@ -751,8 +1337,7 @@ mod tests {
         );
     }
 
-    /// A version 3 record has the *same* length as the current one, so the
-    /// version byte is the only thing separating them.
+    /// Version 3 and version 4 share the old 98-byte layout.
     #[test]
     fn a_v3_record_has_no_validity_bit_and_stays_authoritative() {
         let mut state = PersistentSecurityState::empty();
@@ -761,8 +1346,10 @@ mod tests {
         state.parent_information = 0x02;
         state.parent_information_valid = true;
         state.end_device_timeout = 14;
-        let mut encoded = [0u8; ENCODED_SECURITY_STATE_LEN];
-        state.encode(&mut encoded);
+        let mut current = [0u8; ENCODED_SECURITY_STATE_LEN];
+        state.encode(&mut current);
+        let mut encoded = [0u8; V4_ENCODED_SECURITY_STATE_LEN];
+        encoded.copy_from_slice(&current[..V4_ENCODED_SECURITY_STATE_LEN]);
 
         // Firmware that predates version 4 never set bit 7 …
         encoded[0] &= !(1 << 7);
@@ -787,7 +1374,7 @@ mod tests {
             Err(SecurityStoreError::Corrupt)
         );
         // The very same bytes are a valid version 4 record.
-        assert_eq!(PersistentSecurityState::decode(&encoded), Ok(state));
+        assert_eq!(PersistentSecurityState::decode_v4(&encoded), Ok(state));
     }
 
     #[test]

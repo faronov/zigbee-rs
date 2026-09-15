@@ -11,6 +11,8 @@ members = [
     "zigbee-zcl",
     "zigbee-runtime",
     "zigbee",
+    "apps/router",
+    "apps/sensor-sed",
     "drivers/sht3x",
     "drivers/bme280",
     "drivers/sht4x",
@@ -25,6 +27,8 @@ members = [
     "tools/phy62x2-image",
 ]
 exclude = [
+    "vendor/esp-hal",
+    "vendor/esp-radio",
     "examples/nrf52840-sensor",
     "examples/nrf52840-sensor-uf2",
     "examples/nrf52840-router",
@@ -73,3 +77,7 @@ repository = "https://github.com/faronov/zigbee-rs"
 embedded-storage = "0.3"
 heapless = "0.9"
 log = "0.4"
+
+[patch.crates-io]
+esp-hal = { path = "vendor/esp-hal" }
+esp-radio = { path = "vendor/esp-radio" }

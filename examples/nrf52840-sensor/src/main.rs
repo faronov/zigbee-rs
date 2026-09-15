@@ -15,11 +15,11 @@
 //! `nrf52840-sensor-product` product crates, hardware AES install + startup
 //! KAT, the crash-safe security journal, the concrete Zigbee profile, and
 //! the identity guard — then hands all of it to
-//! [`app::SensorApp`], which owns the full
-//! commissioning/event-loop lifecycle (see `app.rs`). Endpoint/cluster
-//! composition, reporting defaults, and measurement mapping live in the
-//! shared `zigbee_runtime::profile` archetype selected by the product
-//! crate; NWK/APS/ZDO/BDB state machines live in `zigbee-runtime`.
+//! [`sensor_sed_app::SensorApp`], which owns the full
+//! commissioning/event-loop lifecycle (see `apps/sensor-sed`).
+//! Endpoint/cluster composition, reporting defaults, and measurement mapping
+//! live in the shared `zigbee_runtime::profile` archetype selected by the
+//! product crate; NWK/APS/ZDO/BDB state machines live in `zigbee-runtime`.
 //!
 //! ## Build & flash
 //! ```sh
@@ -51,9 +51,11 @@ use {defmt_rtt as _, panic_probe as _};
 
 #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
 use nrf_sensor_app::OnChipTemperature;
-use nrf_sensor_app::{BatteryPolicy, SensorApp};
+use nrf_sensor_app::{
+    BatteryPolicy, NrfBattery, NrfDiagnostics, NrfStatus, NrfSupervisor, NrfWakeController,
+};
+use sensor_sed_app::{NoOta, SensorApp, SensorSedParts};
 use zigbee_runtime::node::ZigbeeNode;
-use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::profile::{ApplicationProfile, BatteryMeasurement};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_zcl::clusters::basic::PowerSource;
@@ -241,10 +243,8 @@ async fn main(_spawner: Spawner) {
 
     // ── Build device ──
     let mut device = ZigbeeDevice::builder(mac)
-        .power_mode(PowerMode::Sleepy {
-            poll_interval_ms: 10_000,
-            wake_duration_ms: 500,
-        })
+        .power_mode(nrf52840_sensor_product::policy::SENSOR_POLICY.power_mode())
+        .automatic_polling(false)
         .manufacturer(nrf52840_sensor_product::MANUFACTURER)
         .model(nrf52840_sensor_product::MODEL)
         .date_code(nrf52840_sensor_product::DATE_CODE)
@@ -272,8 +272,21 @@ async fn main(_spawner: Spawner) {
 
     let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
 
-    let mut app: SensorApp<'_, _, _, _, Battery> =
-        SensorApp::new(node, led, button, environment, saadc_sensor);
+    let mut app = SensorApp::new(
+        node,
+        &nrf52840_sensor_product::policy::SENSOR_POLICY,
+        SensorSedParts {
+            wake: NrfWakeController::new(button),
+            status: NrfStatus::new(led),
+            environment,
+            battery: NrfBattery::<Battery>::new(saadc_sensor),
+            ota: NoOta,
+            actions: nrf52840_sensor_product::policy::USER_ACTIONS,
+            supervisor: NrfSupervisor,
+            diagnostics: NrfDiagnostics,
+        },
+    )
+    .expect("nRF52840 sensor composition must disable automatic polling");
 
     app.run().await
 }

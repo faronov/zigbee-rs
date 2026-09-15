@@ -10,13 +10,12 @@
 //! # Choosing a build method
 //!
 //! A template only *configures* a [`DeviceBuilder`]; the caller finalizes it.
-//! The sensor templates preset [`DeviceType::EndDevice`] and are finished with
-//! `build()`. The mains-powered templates (lights, plug, thermostat) preset
-//! [`DeviceType::Router`], so they must be finished with a routing build
-//! method that matches the MAC's capability — `build_router()` on a genuine
-//! [`ParentMacDriver`](zigbee_mac::ParentMacDriver) backend, or `build_relay()`
-//! for a forwarding-only relay. Finishing a router-typed template with plain
-//! `build()` is a role/device-type mismatch and is rejected.
+//! Every template defaults to [`DeviceType::EndDevice`] and is finished with
+//! `build()`. Mains power and receiver-on-when-idle do not imply routing. A
+//! product with conformant parent primitives may explicitly select
+//! [`DeviceType::Router`] and finish with `build_router()` in a `router`
+//! feature build. Finishing a router-typed template with plain `build()` is a
+//! role/device-type mismatch and is rejected.
 
 use crate::builder::DeviceBuilder;
 use zigbee_mac::MacDriver;
@@ -72,7 +71,7 @@ pub fn temperature_humidity_sensor<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
 /// - On/Off (0x0006) — server
 pub fn on_off_light<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
-        .device_type(DeviceType::Router) // Lights are typically routers
+        .device_type(DeviceType::EndDevice)
         .power_source(PowerSource::MainsSinglePhase)
         .endpoint(1, HA_PROFILE, DeviceId::ON_OFF_LIGHT, |ep| {
             ep.cluster_server(ClusterId::BASIC)
@@ -91,7 +90,7 @@ pub fn on_off_light<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
 /// - Level Control (0x0008) — server
 pub fn dimmable_light<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
-        .device_type(DeviceType::Router)
+        .device_type(DeviceType::EndDevice)
         .power_source(PowerSource::MainsSinglePhase)
         .endpoint(1, HA_PROFILE, DeviceId::DIMMABLE_LIGHT, |ep| {
             ep.cluster_server(ClusterId::BASIC)
@@ -111,7 +110,7 @@ pub fn dimmable_light<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
 /// - Color Control (0x0300) — server
 pub fn color_temperature_light<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
-        .device_type(DeviceType::Router)
+        .device_type(DeviceType::EndDevice)
         .power_source(PowerSource::MainsSinglePhase)
         .endpoint(1, HA_PROFILE, DeviceId::COLOR_TEMPERATURE_LIGHT, |ep| {
             ep.cluster_server(ClusterId::BASIC)
@@ -166,7 +165,7 @@ pub fn occupancy_sensor<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
 /// - Electrical Measurement (0x0B04) — server
 pub fn smart_plug<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
-        .device_type(DeviceType::Router)
+        .device_type(DeviceType::EndDevice)
         .power_source(PowerSource::MainsSinglePhase)
         .endpoint(1, HA_PROFILE, DeviceId::MAINS_POWER_OUTLET, |ep| {
             ep.cluster_server(ClusterId::BASIC)
@@ -186,7 +185,7 @@ pub fn smart_plug<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
 /// - Temperature Measurement (0x0402) — server (local temp)
 pub fn thermostat<M: MacDriver>(mac: M) -> DeviceBuilder<M> {
     DeviceBuilder::new(mac)
-        .device_type(DeviceType::Router)
+        .device_type(DeviceType::EndDevice)
         .power_source(PowerSource::MainsSinglePhase)
         .endpoint(1, HA_PROFILE, DeviceId::THERMOSTAT, |ep| {
             ep.cluster_server(ClusterId::BASIC)

@@ -169,7 +169,7 @@ where
     }
 
     /// Trigger a measurement at the given precision. The caller must wait
-    /// [`Precision::delay_ms`] before [`Self::read_measurement`].
+    /// the precision-specific conversion delay before [`Self::read_measurement`].
     pub fn start_measurement(&mut self, precision: Precision) -> Result<(), Error<I2C::Error>> {
         self.i2c
             .write(self.address, &[precision.command()])
@@ -199,7 +199,7 @@ where
 }
 
 /// Async (embedded-hal-async 1.0) counterpart of the blocking API. See the
-/// crate-root [`super::Sht4x`]; command bytes, CRC and conversion logic are
+/// crate-root [`crate::Sht4x`]; command bytes, CRC and conversion logic are
 /// shared, not duplicated.
 pub mod asynch {
     use embedded_hal_async::i2c::{I2c, SevenBitAddress};

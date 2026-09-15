@@ -525,13 +525,10 @@ impl MacDriver for Efr32s2Mac {
     }
 
     async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
-        self.pan_id = req.pan_id;
-        self.channel = req.channel;
-        self.driver.update_config(|c| {
-            c.pan_id = req.pan_id.0;
-            c.channel = req.channel;
-        });
-        Ok(())
+        // `Efr32s2Mac` does not implement `ParentMacDriver`: it has no
+        // frame-pending-aware ACK path and keeps every parent primitive at
+        // its `Unsupported` default. Fail explicitly.
+        start_requires_parent_capability(&req)
     }
 
     async fn mlme_get(&self, attr: PibAttribute) -> Result<PibValue, MacError> {
@@ -857,14 +854,7 @@ impl MacDriver for Efr32s2Mac {
     }
 
     fn capabilities(&self) -> MacCapabilities {
-        MacCapabilities {
-            coordinator: false,
-            router: true,
-            hardware_security: false,
-            max_payload: 102,
-            tx_power_min: TxPower(-20),
-            tx_power_max: TxPower(19),
-        }
+        MacCapabilities::non_parent(102, TxPower(-20), TxPower(19))
     }
 }
 

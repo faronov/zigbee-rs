@@ -28,7 +28,7 @@
 //! discards the unique key the Trust Center already installed.
 //!
 //! This module implements exactly that: three independent transmission budgets
-//! of [`TCLK_MESSAGE_ATTEMPTS`] each, a short explicit retry backoff, the
+//! of `TCLK_MESSAGE_ATTEMPTS` each, a short explicit retry backoff, the
 //! BDB-defined five-second response window for every attempt, and one
 //! wrapping-safe overall deadline that cannot expire before all attempt
 //! budgets have been available.

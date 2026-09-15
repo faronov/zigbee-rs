@@ -1,5 +1,5 @@
-//! TLSR8258 power management: deep-sleep-retention scratch registers **and**
-//! a pure-Rust RC-32k, timer-wake, SRAM-`LOW32K`-retention suspend path.
+//! TLSR8258 power management: retention scratch registers and pure-Rust
+//! RC-32k timer wake for full-SRAM SUSPEND and LOW32K retention.
 //!
 //! # Provenance / evidence tiers
 //!
@@ -58,9 +58,13 @@
 //!   handshake, `sleep_start`, and all post-wake accounting) is executed by a
 //!   single common code path parameterised by a small `ModeProfile`.
 //!
-//! It is deliberately **not** wired into the sensor application yet, and makes
-//! **no** current-draw claims. External-32k-crystal timekeeping and plain
-//! `DEEPSLEEP_MODE` (reboot-on-wake) remain out of scope for this landing.
+//! Full-SRAM SUSPEND is exposed to the sensor through
+//! [`cpu_suspend_timer_rc_transaction`], which brackets platform
+//! prepare/restore hooks inside the same IRQ-disabled interval. The raw PM
+//! sequence has prior timer-wake silicon evidence; the integrated sensor/MAC
+//! transaction still requires its own HIL gate and makes **no** current-draw
+//! claim. External-32k-crystal timekeeping and plain `DEEPSLEEP_MODE`
+//! (reboot-on-wake) remain out of scope.
 //!
 //! # Wake-source arming: Pad, Timer, Comparator ([`WakeConfig`]) — T1, not
 //! # silicon-validated
@@ -204,6 +208,8 @@
 //! not return: the hardware resets, and the retention-aware startup releases
 //! flash from deep-power-down and reinitializes the required hardware.
 //! Pre-entry failures restore state and return without triggering sleep.
+//! [`cpu_suspend_timer_rc_transaction`] additionally invokes its platform
+//! restore hook after every returning PM result, before restoring `0x643`.
 //!
 //! # Cold-boot system-timer requirement (T1)
 //!
@@ -483,6 +489,41 @@ impl WakeSources {
 pub const FLD_SYSTEM_TICK_START: u8 = 1 << 0;
 /// `reg_system_tick_ctrl` running-status bit (`BIT(1)`).
 pub const FLD_SYSTEM_TICK_RUNNING: u8 = 1 << 1;
+/// Free-running PM system-timer ticks per millisecond.
+///
+/// This is the separate 16 MHz clock at `reg_system_tick` (`0x740`), not
+/// Timer0's 24 MHz application clock.
+pub const SYSTEM_TIMER_TICKS_PER_MS: u32 = 16_000;
+
+/// Convert milliseconds to PM system-timer ticks without wrapping.
+///
+/// Oversized durations saturate and are rejected by the suspend path's
+/// existing [`PmError::TooLong`] bound rather than becoming a short sleep.
+pub const fn system_timer_ms(duration_ms: u32) -> u32 {
+    duration_ms.saturating_mul(SYSTEM_TIMER_TICKS_PER_MS)
+}
+
+/// Phase delivered to an atomic full-SRAM SUSPEND transition hook.
+///
+/// Both phases execute with the global CPU interrupt enable cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendTransactionPhase {
+    /// Quiesce application-owned hardware immediately before PM entry.
+    Prepare,
+    /// Restore application-owned hardware after every returning PM path.
+    Restore,
+}
+
+#[cfg(any(target_arch = "tc32", test))]
+fn run_suspend_transaction<T, E>(
+    transition: &mut impl FnMut(SuspendTransactionPhase),
+    body: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    transition(SuspendTransactionPhase::Prepare);
+    let result = body();
+    transition(SuspendTransactionPhase::Restore);
+    result
+}
 
 /// Errors returned by the suspend path. No variant is ever produced by a
 /// silent fallback — each corresponds to an explicit rejected input or a
@@ -538,6 +579,15 @@ pub enum PmError {
     /// (`ModeProfile::reg_2b`). Rather than risk that collision, port E is
     /// rejected outright.
     PadWakePortUnsupported,
+    /// The retained LOW32K transaction record was not fully committed, had a
+    /// mismatched version/generation/checksum, or was changed during restore.
+    RetentionRecordInvalid,
+    /// Reset startup reported retention but analog `0x7e` did not still carry
+    /// the exact LOW32K mode selected by the transaction.
+    RetentionModeMissing,
+    /// A reset-on-wake restore did not carry the required timer wake status.
+    /// No application service or IRQ restoration is permitted after this.
+    RetentionWakeInvalid,
 }
 
 /// Result of a suspend attempt.
@@ -572,6 +622,143 @@ impl WakeStatus {
     }
     pub fn woke_by_comparator(&self) -> bool {
         self.sources().contains(WakeupSource::Comparator)
+    }
+}
+
+const LOW32K_RECORD_MAGIC: u32 = 0x4c33_324b; // "L32K"
+const LOW32K_RECORD_VERSION: u32 = 1;
+const LOW32K_RECORD_ARMED: u32 = 0xa55a_c33c;
+
+/// Retained hand-off between the old LOW32K sleep transaction and reset
+/// startup.
+///
+/// Every field is a `u32`, making the target representation padding-free and
+/// safe to validate word-by-word before any retained pointer is followed.
+/// The transaction commits `state` last; reset startup accepts only the exact
+/// magic/version, generation complement, and checksum.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Low32kResumeRecord {
+    magic: u32,
+    version: u32,
+    state: u32,
+    generation: u32,
+    generation_inverse: u32,
+    timer0_before: u32,
+    system_before: u32,
+    tick32k_before: u32,
+    calibration: u32,
+    suspend_kind: u32,
+    duration_system_ticks: u32,
+    saved_irq_enable: u32,
+    saved_irq_mask: u32,
+    saved_system_66: u32,
+    saved_gpio_pe_ie: u32,
+    checksum: u32,
+}
+
+impl Low32kResumeRecord {
+    /// Invalid/unarmed record for explicit cold initialization of a NOLOAD
+    /// retained cell.
+    pub const fn new() -> Self {
+        Self {
+            magic: 0,
+            version: 0,
+            state: 0,
+            generation: 0,
+            generation_inverse: !0,
+            timer0_before: 0,
+            system_before: 0,
+            tick32k_before: 0,
+            calibration: 0,
+            suspend_kind: 0,
+            duration_system_ticks: 0,
+            saved_irq_enable: 0,
+            saved_irq_mask: 0,
+            saved_system_66: 0,
+            saved_gpio_pe_ie: 0,
+            checksum: 0,
+        }
+    }
+
+    fn checksum_for(&self, committed_state: u32) -> u32 {
+        let words = [
+            self.magic,
+            self.version,
+            committed_state,
+            self.generation,
+            self.generation_inverse,
+            self.timer0_before,
+            self.system_before,
+            self.tick32k_before,
+            self.calibration,
+            self.suspend_kind,
+            self.duration_system_ticks,
+            self.saved_irq_enable,
+            self.saved_irq_mask,
+            self.saved_system_66,
+            self.saved_gpio_pe_ie,
+        ];
+        let mut sum = 0x91e1_0da5u32;
+        for (index, word) in words.into_iter().enumerate() {
+            sum = sum.rotate_left(5) ^ word.rotate_left((index as u32) & 31);
+            sum = sum.wrapping_mul(0x9e37_79b1);
+        }
+        sum
+    }
+
+    fn valid(&self) -> bool {
+        self.magic == LOW32K_RECORD_MAGIC
+            && self.version == LOW32K_RECORD_VERSION
+            && self.state == LOW32K_RECORD_ARMED
+            && self.generation_inverse == !self.generation
+            && self.calibration != 0
+            && self.checksum == self.checksum_for(LOW32K_RECORD_ARMED)
+            && matches!(
+                calc::classify_duration(self.duration_system_ticks),
+                Ok(kind) if kind as u32 == self.suspend_kind
+            )
+    }
+
+    #[cfg(any(feature = "retention-proof", test))]
+    fn invalidate(&mut self) {
+        self.state = 0;
+        self.checksum = 0;
+    }
+
+    /// Monotonic transaction generation, useful for retention-lab markers.
+    pub const fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// Whether the complete retained record currently validates.
+    pub fn is_armed_and_valid(&self) -> bool {
+        self.valid()
+    }
+}
+
+impl Default for Low32kResumeRecord {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Validated but not yet completed LOW32K restoration.
+///
+/// The fields are intentionally private: callers may restore platform
+/// peripherals while IRQs remain disabled, then must return this token to
+/// [`complete_low32k_resume`] to rebase Timer0, invalidate the record, and
+/// restore the exact pre-sleep IRQ state.
+#[cfg(all(target_arch = "tc32", feature = "retention-proof"))]
+pub struct Low32kRestoreToken {
+    generation: u32,
+    wake_status: WakeStatus,
+}
+
+#[cfg(all(target_arch = "tc32", feature = "retention-proof"))]
+impl Low32kRestoreToken {
+    pub const fn wake_status(&self) -> WakeStatus {
+        self.wake_status
     }
 }
 
@@ -629,6 +816,7 @@ pub struct PmDebugSnapshot {
 /// (32k-scaled) tick-conversion path, mirroring the vendor's `pm_long_suspend`
 /// selection (T1: threshold `0x0FF0_0000` at `cpu_sleep_wakeup_32k_rc+0x66`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum SuspendKind {
     Short,
     Long,
@@ -916,6 +1104,74 @@ pub mod calc {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::pm::{
+            LOW32K_RECORD_ARMED, LOW32K_RECORD_MAGIC, LOW32K_RECORD_VERSION, Low32kResumeRecord,
+            system_timer_ms,
+        };
+
+        fn valid_resume_record() -> Low32kResumeRecord {
+            let mut record = Low32kResumeRecord::new();
+            record.magic = LOW32K_RECORD_MAGIC;
+            record.version = LOW32K_RECORD_VERSION;
+            record.generation = 7;
+            record.generation_inverse = !7;
+            record.timer0_before = 123;
+            record.system_before = 456;
+            record.tick32k_before = 789;
+            record.calibration = 488;
+            record.suspend_kind = SuspendKind::Short as u32;
+            record.duration_system_ticks = system_timer_ms(250);
+            record.saved_irq_enable = 1;
+            record.saved_irq_mask = 0x2010;
+            record.saved_system_66 = 0x42;
+            record.saved_gpio_pe_ie = 0x55;
+            record.checksum = record.checksum_for(LOW32K_RECORD_ARMED);
+            record.state = LOW32K_RECORD_ARMED;
+            record
+        }
+
+        #[test]
+        fn low32k_resume_record_is_padding_free_and_validates_complete_commit() {
+            assert_eq!(core::mem::size_of::<Low32kResumeRecord>(), 16 * 4);
+            assert!(valid_resume_record().is_armed_and_valid());
+        }
+
+        #[test]
+        fn low32k_resume_record_rejects_torn_or_changed_state() {
+            let valid = valid_resume_record();
+            for changed in [
+                {
+                    let mut value = valid;
+                    value.state = 0;
+                    value
+                },
+                {
+                    let mut value = valid;
+                    value.generation_inverse ^= 1;
+                    value
+                },
+                {
+                    let mut value = valid;
+                    value.timer0_before ^= 1;
+                    value
+                },
+                {
+                    let mut value = valid;
+                    value.checksum ^= 1;
+                    value
+                },
+            ] {
+                assert!(!changed.is_armed_and_valid());
+            }
+        }
+
+        #[test]
+        fn invalidating_resume_record_removes_commit() {
+            let mut record = valid_resume_record();
+            record.invalidate();
+            assert!(!record.is_armed_and_valid());
+            assert_eq!(record.generation(), 7);
+        }
 
         #[test]
         fn duration_rejects_zero() {
@@ -1178,8 +1434,12 @@ mod hw {
     use super::calc;
     use super::{
         FLD_SYSTEM_TICK_RUNNING, FLD_SYSTEM_TICK_START, PmDebugSnapshot, PmError, SuspendKind,
-        WakeStatus,
+        SuspendTransactionPhase, WakeStatus,
     };
+    #[cfg(feature = "retention-proof")]
+    use super::{Low32kRestoreToken, Low32kResumeRecord};
+    #[cfg(feature = "retention-proof")]
+    use crate::mmio::REG_IRQ_MASK;
     use crate::mmio::{REG_ANALOG_ADDR, r8, r32, w8, w32};
 
     // -- register addresses (all T1 from the disassembly literal pools) ------
@@ -1537,6 +1797,27 @@ mod hw {
         result
     }
 
+    /// Run the platform prepare/restore pair and the PM body as one global-IRQ
+    /// transaction. `Restore` is called after every body path that returns,
+    /// including every typed PM error, and before the saved IRQ state is
+    /// restored.
+    #[inline(always)]
+    fn with_irq_saved_transaction<T, F, H>(body: F, mut transition: H) -> Result<T, PmError>
+    where
+        F: FnOnce() -> Result<T, PmError>,
+        H: FnMut(SuspendTransactionPhase),
+    {
+        use core::sync::atomic::{Ordering, compiler_fence};
+
+        let saved_irq = unsafe { r8(REG_IRQ_EN_643) };
+        unsafe { w8(REG_IRQ_EN_643, 0) };
+        compiler_fence(Ordering::SeqCst);
+        let result = super::run_suspend_transaction(&mut transition, body);
+        compiler_fence(Ordering::SeqCst);
+        unsafe { w8(REG_IRQ_EN_643, saved_irq) };
+        result
+    }
+
     /// Enter `DEEPSLEEP_MODE_RET_SRAM_LOW32K` and wake by the sources armed in
     /// `config`, waking no later than its absolute 16 MHz system tick.
     ///
@@ -1619,6 +1900,274 @@ mod hw {
         cpu_suspend_wakeup_rc(super::WakeConfig::Timer { wakeup_tick })
     }
 
+    /// Atomically quiesce platform hardware, enter timer-only full-SRAM
+    /// `SUSPEND_MODE`, and restore the platform before interrupts resume.
+    ///
+    /// `duration_ticks` is a relative duration in 16 MHz PM system-timer
+    /// ticks. Its absolute deadline is captured after `Prepare`, while IRQs
+    /// remain disabled, so platform quiesce time cannot shorten the wait.
+    ///
+    /// `transition` is called first with [`SuspendTransactionPhase::Prepare`],
+    /// then with [`SuspendTransactionPhase::Restore`] after every PM path that
+    /// returns (success or typed error). Both calls run while the global CPU
+    /// interrupt enable is cleared. The hook must be bounded and infallible;
+    /// panic unwinding is unavailable on this target.
+    #[inline(never)]
+    pub fn cpu_suspend_timer_rc_transaction(
+        duration_ticks: u32,
+        transition: impl FnMut(SuspendTransactionPhase),
+    ) -> Result<WakeStatus, PmError> {
+        with_irq_saved_transaction(
+            || {
+                let wakeup_tick = system_timer_ticks().wrapping_add(duration_ticks);
+                suspend_body(super::WakeConfig::Timer { wakeup_tick }, &PROFILE_SUSPEND)
+            },
+            transition,
+        )
+    }
+
+    /// Atomically arm a retained resume record, quiesce the platform, and
+    /// enter timer-only LOW32K retention.
+    ///
+    /// Success resets the CPU and therefore never returns. Every path that
+    /// does return invalidates `record`, invokes `Restore` while IRQs remain
+    /// masked, and restores the exact pre-call IRQ enable/mask pair.
+    #[cfg(feature = "retention-proof")]
+    #[inline(never)]
+    pub fn cpu_sleep_timer_rc_retention_transaction(
+        duration_ticks: u32,
+        record: &mut Low32kResumeRecord,
+        mut transition: impl FnMut(SuspendTransactionPhase),
+    ) -> Result<core::convert::Infallible, PmError> {
+        use core::sync::atomic::{Ordering, compiler_fence};
+
+        let saved_irq = unsafe { r8(REG_IRQ_EN_643) };
+        let saved_irq_mask = unsafe { r32(REG_IRQ_MASK) };
+        unsafe { w8(REG_IRQ_EN_643, 0) };
+        compiler_fence(Ordering::SeqCst);
+        transition(SuspendTransactionPhase::Prepare);
+
+        let result = (|| {
+            let kind = calc::classify_duration(duration_ticks)?;
+            system_timer_ready()?;
+
+            let calibration = {
+                let mut value = 0u16;
+                let mut count = 0u32;
+                while count < CALIB_READY_SPIN {
+                    value =
+                        unsafe { r8(REG_32K_CALIB) as u16 | ((r8(REG_32K_CALIB + 1) as u16) << 8) };
+                    if value != 0 {
+                        break;
+                    }
+                    nop();
+                    count += 1;
+                }
+                if value == 0 {
+                    return Err(PmError::CalibrationNotReady);
+                }
+                value
+            };
+
+            let system_before = system_timer_ticks();
+            let wakeup_tick = system_before.wrapping_add(duration_ticks);
+            let tick32k_before = pm_get_32k_tick()?;
+            let generation = record.generation.wrapping_add(1);
+
+            // Commit all payload words first and the armed state last. A reset
+            // at any earlier instruction is rejected by `valid()`.
+            record.magic = super::LOW32K_RECORD_MAGIC;
+            record.version = super::LOW32K_RECORD_VERSION;
+            record.state = 0;
+            record.generation = generation;
+            record.generation_inverse = !generation;
+            record.timer0_before = crate::timer::now_ticks();
+            record.system_before = system_before;
+            record.tick32k_before = tick32k_before;
+            record.calibration = u32::from(calibration);
+            record.suspend_kind = kind as u32;
+            record.duration_system_ticks = duration_ticks;
+            record.saved_irq_enable = u32::from(saved_irq);
+            record.saved_irq_mask = saved_irq_mask;
+            record.saved_system_66 = u32::from(unsafe { r8(REG_SYS_CTRL_66) });
+            record.saved_gpio_pe_ie = u32::from(unsafe { r8(REG_GPIO_PE_IE) });
+            record.checksum = record.checksum_for(super::LOW32K_RECORD_ARMED);
+            compiler_fence(Ordering::SeqCst);
+            record.state = super::LOW32K_RECORD_ARMED;
+            compiler_fence(Ordering::SeqCst);
+
+            match suspend_body(super::WakeConfig::Timer { wakeup_tick }, &PROFILE_LOW32K) {
+                Ok(_) => Err(PmError::RetentionReturned),
+                Err(error) => Err(error),
+            }
+        })();
+
+        // Only a failure/unexpected in-place return reaches this cleanup.
+        record.invalidate();
+        compiler_fence(Ordering::SeqCst);
+        transition(SuspendTransactionPhase::Restore);
+        compiler_fence(Ordering::SeqCst);
+        unsafe {
+            w32(REG_IRQ_MASK, saved_irq_mask);
+            w8(REG_IRQ_EN_643, saved_irq);
+        }
+        result
+    }
+
+    /// Validate and restore PM/time state after reset-on-wake while keeping
+    /// global interrupts disabled.
+    ///
+    /// Platform code must restore radio/MAC, AES, RNG, ADC/voltage guard and
+    /// GPIO state before passing the returned token to
+    /// [`complete_low32k_resume`].
+    #[cfg(feature = "retention-proof")]
+    #[inline(never)]
+    pub fn begin_low32k_resume(record: &Low32kResumeRecord) -> Result<Low32kRestoreToken, PmError> {
+        // Fail closed even if reset hardware happened to preserve an enabled
+        // global IRQ bit. It is restored only by `complete_low32k_resume`.
+        unsafe { w8(REG_IRQ_EN_643, 0) };
+        if !record.valid() {
+            return Err(PmError::RetentionRecordInvalid);
+        }
+
+        let mode = ana_r(ANA_7E).ok_or(PmError::AnalogTimeout)?;
+        if mode != super::DEEPSLEEP_MODE_RET_SRAM_LOW32K {
+            return Err(PmError::RetentionModeMissing);
+        }
+        let raw_status = ana_r(ANA_44).ok_or(PmError::AnalogTimeout)?;
+        if raw_status & super::WAKEUP_STATUS_TIMER == 0 {
+            return Err(PmError::RetentionWakeInvalid);
+        }
+
+        let now32k = pm_get_32k_tick()?;
+        let calibration =
+            u16::try_from(record.calibration).map_err(|_| PmError::RetentionRecordInvalid)?;
+        let elapsed_system = match record.suspend_kind {
+            value if value == SuspendKind::Short as u32 => {
+                calc::elapsed_ticks_short(now32k, record.tick32k_before, calibration)
+            }
+            value if value == SuspendKind::Long as u32 => {
+                calc::elapsed_ticks_long(now32k, record.tick32k_before, calibration)
+            }
+            _ => return Err(PmError::RetentionRecordInvalid),
+        };
+        if elapsed_system == 0 {
+            return Err(PmError::RetentionWakeInvalid);
+        }
+
+        // Complete the mandatory half of `sleep_start` that cannot execute
+        // after LOW32K resets the CPU.
+        if !ana_w(ANA_82, 0x64) || !ana_w(ANA_34, 0x80) || !ana_w(ANA_26, 0) {
+            return Err(PmError::AnalogTimeout);
+        }
+        unsafe {
+            w8(REG_GPIO_PE_IE, record.saved_gpio_pe_ie as u8);
+            // Release flash DPD again even though __reset already performs
+            // the same JEDEC 0xAB sequence; this makes the HAL restoration
+            // contract complete when used by another conforming startup.
+            w8(REG_MSPI_CTRL, 0);
+            w8(REG_MSPI_DATA, 0xab);
+            nop();
+            nop();
+            w8(REG_MSPI_CTRL, 1);
+
+            // Disable the old 32k comparator and restart the 16 MHz timer.
+            w8(REG_32K_CMD_74C, 0);
+            for _ in 0..6 {
+                nop();
+            }
+            w8(REG_32K_CMD_74C, 0x92);
+            for _ in 0..4 {
+                nop();
+            }
+            w8(REG_SYS_CTRL_66, record.saved_system_66 as u8);
+        }
+
+        system_timer_init()?;
+        let reconstructed = record.system_before.wrapping_add(elapsed_system);
+        unsafe { w32(REG_SYS_TICK, reconstructed) };
+
+        // LOW32K wakes at the mode's early-wake point. Do not service the app
+        // until its requested duration has elapsed, preventing an early or
+        // duplicate parent poll.
+        let deadline = record
+            .system_before
+            .wrapping_add(record.duration_system_ticks);
+        let mut count = 0u32;
+        loop {
+            let delta = system_timer_ticks().wrapping_sub(deadline);
+            if delta <= 0x4000_0000 {
+                break;
+            }
+            count += 1;
+            if count >= WAKE_TICK_SPIN {
+                return Err(PmError::WakeTickTimeout);
+            }
+        }
+
+        // Re-select and calibrate RC32K for the next cycle only after the old
+        // calibration/counter pair has been consumed.
+        super::rc_32k_init_and_cal().map_err(|_| PmError::AnalogTimeout)?;
+
+        Ok(Low32kRestoreToken {
+            generation: record.generation,
+            wake_status: WakeStatus {
+                raw: raw_status,
+                entered_low_power: true,
+            },
+        })
+    }
+
+    /// Finish a validated LOW32K restoration after every platform peripheral
+    /// has been restored.
+    #[cfg(feature = "retention-proof")]
+    #[inline(never)]
+    pub fn complete_low32k_resume(
+        record: &mut Low32kResumeRecord,
+        token: Low32kRestoreToken,
+    ) -> Result<WakeStatus, PmError> {
+        use core::sync::atomic::{Ordering, compiler_fence};
+
+        if !record.valid() || record.generation != token.generation {
+            return Err(PmError::RetentionRecordInvalid);
+        }
+        if !token.wake_status.entered_low_power() || !token.wake_status.woke_by_timer() {
+            return Err(PmError::RetentionWakeInvalid);
+        }
+
+        // Radio restoration resets Timer0. Rebase it last from the retained
+        // pre-sleep value through *current* reconstructed system time, which
+        // includes both the sleep and all wake-restoration work.
+        let elapsed_system = system_timer_ticks().wrapping_sub(record.system_before);
+        crate::timer::rebase_after_suspend(record.timer0_before, elapsed_system);
+
+        if !ana_w(ANA_44, 0x0f) || !ana_w(ANA_7E, 0) {
+            return Err(PmError::AnalogTimeout);
+        }
+
+        let saved_irq_mask = record.saved_irq_mask;
+        let saved_irq_enable = record.saved_irq_enable as u8;
+        record.invalidate();
+        compiler_fence(Ordering::SeqCst);
+        unsafe {
+            w32(REG_IRQ_MASK, saved_irq_mask);
+            compiler_fence(Ordering::SeqCst);
+            w8(REG_IRQ_EN_643, saved_irq_enable);
+        }
+        Ok(token.wake_status)
+    }
+
+    /// Invalidate/clear a failed retention hand-off while leaving interrupts
+    /// disabled. The caller must immediately reset or remain terminal.
+    #[cfg(feature = "retention-proof")]
+    pub fn abandon_low32k_resume(record: &mut Low32kResumeRecord) {
+        unsafe { w8(REG_IRQ_EN_643, 0) };
+        record.invalidate();
+        let _ = ana_w(ANA_26, 0);
+        let _ = ana_w(ANA_44, 0x0f);
+        let _ = ana_w(ANA_7E, 0);
+    }
+
     /// Start the free-running 16 MHz system timer (`reg_system_tick`, `0x740`)
     /// by writing [`FLD_SYSTEM_TICK_START`] (BIT0) to `reg_system_tick_ctrl`
     /// (`0x74f`) — the exact cold-boot write the vendor performs at
@@ -1667,6 +2216,11 @@ mod hw {
                 }
             }
         }
+    }
+
+    /// Current value of the free-running 16 MHz PM system timer (`0x740`).
+    pub fn system_timer_ticks() -> u32 {
+        unsafe { r32(REG_SYS_TICK) }
     }
 
     /// Read-only diagnostic: compute and return the SUSPEND-path
@@ -2040,10 +2594,16 @@ mod hw {
     }
 }
 
+#[cfg(all(target_arch = "tc32", feature = "retention-proof"))]
+pub use hw::{
+    abandon_low32k_resume, begin_low32k_resume, complete_low32k_resume,
+    cpu_sleep_timer_rc_retention_transaction,
+};
 #[cfg(target_arch = "tc32")]
 pub use hw::{
-    cpu_sleep_timer_rc, cpu_sleep_wakeup_rc, cpu_suspend_timer_rc, cpu_suspend_wakeup_rc,
-    suspend_debug_snapshot, system_timer_init, system_timer_ready,
+    cpu_sleep_timer_rc, cpu_sleep_wakeup_rc, cpu_suspend_timer_rc,
+    cpu_suspend_timer_rc_transaction, cpu_suspend_wakeup_rc, suspend_debug_snapshot,
+    system_timer_init, system_timer_ready, system_timer_ticks,
 };
 
 // ---------------------------------------------------------------------------
@@ -2210,6 +2770,61 @@ mod tests {
         assert_eq!(FLD_SYSTEM_TICK_RUNNING, 2);
         // The two fields are distinct single bits.
         assert_eq!(FLD_SYSTEM_TICK_START & FLD_SYSTEM_TICK_RUNNING, 0);
+    }
+
+    #[test]
+    fn system_timer_millisecond_conversion_saturates_instead_of_wrapping() {
+        assert_eq!(system_timer_ms(1), 16_000);
+        assert_eq!(system_timer_ms(250), 4_000_000);
+        assert_eq!(system_timer_ms(u32::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn suspend_transaction_restores_after_success_before_returning() {
+        let stage = core::cell::Cell::new(0);
+        let result = run_suspend_transaction(
+            &mut |phase| match phase {
+                SuspendTransactionPhase::Prepare => {
+                    assert_eq!(stage.get(), 0);
+                    stage.set(1);
+                }
+                SuspendTransactionPhase::Restore => {
+                    assert_eq!(stage.get(), 2);
+                    stage.set(3);
+                }
+            },
+            || -> Result<u8, ()> {
+                assert_eq!(stage.get(), 1);
+                stage.set(2);
+                Ok(7)
+            },
+        );
+        assert_eq!(result, Ok(7));
+        assert_eq!(stage.get(), 3);
+    }
+
+    #[test]
+    fn suspend_transaction_restores_after_body_error() {
+        let stage = core::cell::Cell::new(0);
+        let result = run_suspend_transaction(
+            &mut |phase| match phase {
+                SuspendTransactionPhase::Prepare => {
+                    assert_eq!(stage.get(), 0);
+                    stage.set(1);
+                }
+                SuspendTransactionPhase::Restore => {
+                    assert_eq!(stage.get(), 2);
+                    stage.set(3);
+                }
+            },
+            || -> Result<(), u8> {
+                assert_eq!(stage.get(), 1);
+                stage.set(2);
+                Err(9)
+            },
+        );
+        assert_eq!(result, Err(9));
+        assert_eq!(stage.get(), 3);
     }
 
     #[test]

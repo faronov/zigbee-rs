@@ -1,232 +1,169 @@
-# Firmware Size and Role Specialization
+# Firmware Size
 
-zigbee-rs builds each product for the behavior it can actually perform.
-Logical roles are Rust types, optional data types are Cargo features, and
-bounded capacities are selected at compile time. This keeps a sleepy sensor
-from linking parent, child-table, routing, or router-maintenance code merely
-because those capabilities exist elsewhere in the stack.
+Embedded size is measured from the final release artifact produced by the
+target's pinned toolchain. The ELF file size on the host is not a flash-usage
+number.
 
-## Current release measurements
+## Local image snapshots
 
-The following measurements are raw release payloads produced by the repository
-build scripts. Packaged boot images are listed separately because headers and
-flash offsets are platform-specific.
+Baseline snapshot: **2026-09-06**. EFR32MG1 was refreshed **2026-09-08**.
+The TLSR8258 parent-router, always-on nRF52840, EFR32MG21, CC2340 fallback,
+and ESP32-C6/H2 rows were refreshed
+**2026-09-10**. These are named local build snapshots, not the latest remote
+CI results; unrefreshed rows do not describe the current working tree.
+PHY6222 and PHY6252 occupied-XIP measurements were refreshed **2026-09-15**.
+The recorded parent router and all four ESP variants **fail their regression
+budgets**; the current PHY6252 variant **fails its physical linker limit**.
+Prior hardware evidence is not an exact-image HIL rerun unless
+explicitly stated.
 
-| Platform and role | Raw payload | Packaged image | CI raw budget |
-|---|---:|---:|---:|
-| TLSR8258 end-device sensor (hardware AES) | 271,492 B | — | 280 KiB |
-| TLSR8258 parent router (hardware AES) | 338,520 B | — | 336 KiB |
-| BL702 end-device sensor (hardware AES) | 176,930 B | 185,136 B | 192 KiB |
-| nRF52840 end-device sensor | 220,104 B | — | 220 KiB |
-| nRF52840 relay router | 225,368 B | — | — |
-| nRF52833 end-device sensor | 220,096 B | — | 220 KiB |
-| EFR32MG1 end-device sensor (hardware AES + OTA) | 150,456 B | — | 160 KiB |
+The gate column is a regression budget except for PHY6222 and PHY6252, where
+it is the hard XIP slot limit.
 
-The TLSR8258 rows are `scripts/tlsr8258.sh build sensor` / `build router` on
-the pinned `tc32-45` toolchain, which is exactly what CI builds; they leave
-15,228 and 5,544 bytes of budget headroom respectively. The BL702, nRF and
-EFR32 raw payloads were re-measured with the same release profiles CI builds,
-and the BL702 packaged image was regenerated with `bflb-mcu-tool` 1.10.0. CI
-remains the authoritative source per commit, because it enforces the budget
-column with
-`tools/firmware-size-report.sh`.
+| image | measured | gate | headroom | metric |
+|---|---:|---:|---:|---|
+| PHY6222 sensor | 130,752 | 130,816 | 64 | occupied XIP span |
+| PHY6252 feature-selected sensor | 130,912 | 130,816 | -96 | failed-link occupied XIP span |
+| BL702 sensor | 189,442 | 192,512 | 3,070 | raw binary |
+| nRF52840 default / BME280 / SHT31 | 224,472 / 231,792 / 228,216 | 225,280 / 245,760 / 241,664 | 808 / 13,968 / 13,448 | raw binaries |
+| nRF52840 always-on End Device | 231,280 | 253,952 | 22,672 | file-backed flash span |
+| nRF52840 UF2 ProMicro / MDK / PCA10059 / DK | 222,968 / 222,848 / 224,536 / 224,552 | 237,568 each | 14,600 / 14,720 / 13,032 / 13,016 | linked images before UF2 |
+| nRF52833 default / BME280 / SHT31 | 224,464 / 231,784 / 228,208 | 225,280 / 245,760 / 241,664 | 816 / 13,976 / 13,456 | raw binaries |
+| EFR32MG1 sensor | 163,236 | 167,936 | 4,700 | raw binary |
+| EFR32MG21 sensor | 202,068 | 212,992 | 10,924 | raw binary |
+| CC2340R5 pinned-SDK sensor (pre-static-task snapshot) | 223,536 | 225,280 | 1,744 | historical raw binary; not rebuilt |
+| CC2340R5 fallback sensor | 213,160 | 225,280 | 12,120 | raw binary; radio firmware unavailable |
+| ESP32-C6 sensor default / `light-sleep` | 381,056 / 392,080 | 368,640 each | -12,416 / -23,440 | application images; over budget |
+| ESP32-H2 sensor default / `light-sleep` | 365,920 / 376,640 | 356,352 each | -9,568 / -20,288 | application images; over budget |
+| TLSR8258 default / LOW32K 250 ms / LOW32K 10 s | 290,616 / 295,548 / 295,552 | 294,912 / 299,008 / 299,008 | 4,296 / 3,460 / 3,456 | raw binaries |
+| TLSR8258 parent router | 436,072 | 430,080 | -5,992 | raw binary; over budget |
 
-R22 conformance work moves these numbers in both directions. Adding NWK address
-and PAN identifier conflict resolution (R22 §3.6.1.9, §3.6.1.13) grew the
-router image, while restricting route discovery, Route Reply and Route Record
-processing to devices that can actually route (R22 §3.6.3.5.2) removed that
-code from every end-device image. Both images then dropped well below their
-pre-conformance size once the runtime stopped folding its maintenance,
-commissioning and receive coroutines into two enormous ones (see
-[coroutine outlining](#coroutine-outlining-on-tc32)):
+The measurements use:
 
-| TLSR8258 image | Before router maintenance | With R22 conflict/Link Status work | After outlining |
-|---|---:|---:|---:|
-| End-device sensor | 286,288 B | 286,512 B | 271,836 B |
-| Parent router | 338,276 B | 346,280 B | 328,396 B |
+- `nightly-2026-03-23` for the workspace, nRF, BL702, CC2340, and EFR32;
+- `nightly-2026-08-01` for ESP32 and PHY6222;
+- `tc32-stage2-tc32-45` for TLSR8258.
 
-The middle column is why this matters: the router exceeded its 344,064-byte
-budget by 2,216 bytes and the sensor had 208 bytes left. No R22 behavior was
-removed to recover the budget.
+Changing the compiler invalidates direct size comparisons.
 
-### RAM and stack alongside these payloads
+The September 15 PHY62x2 measurements keep `nightly-2026-08-01` and the
+existing product feature sets, with target-local identical-code folding.
+The default PHY6222 build and layout checks pass locally and in Linux CI for
+`b788186`, both at 130,752 bytes. The 64-byte margin remains narrow.
+PHY6252's 130,912-byte span is
+measured from the failed link map: no current executable or package is
+qualified for that variant.
 
-Flash is not the only budget. The same builds report:
+Additional artifacts and physical limits:
 
-| TLSR8258 image | `.bss` end | `block_on` coroutine frame | SVC stack headroom |
-|---|---:|---:|---:|
-| End-device sensor | `0x844C60` | 8,772 B | 7,612 B |
-| Parent router | `0x84769C` | 9,388 B | 6,996 B |
+- BL702 boot image: 197,648 B; physical slot: 1,044,480 B.
+- EFR32MG1's prior Zigbee OTA container was 162,538 B; it has not been
+  regenerated for the current image. Resident Gecko bootloader assumed.
+- EFR32MG21: no OTA packaging path.
+- CC2340R5 physical application slot: 516,096 B.
+- ESP32-C6 default/light merged flash: 446,592/457,616 B; H2: 431,456/442,176 B.
+  OTA slot: 2,031,616 B each. Their regenerated version-1 Zigbee OTA containers
+  are 381,122/392,146 B for C6 and 365,986/376,706 B for H2.
+  These combined-fix images have host validation, not hardware execution
+  evidence, and all remain over their unchanged regression budgets.
+- PHY6252 has the separate failed-link occupied-XIP measurement shown above;
+  the earlier in-budget image is not the current source, and its hardware path
+  remains unverified.
+- TLSR8258 physical application boundary: 458,752 B (`0x70000`), followed by
+  APS/child/security journals at `0x70000`/`0x72000`/`0x74000`.
 
-The SVC stack is a fixed 16 KiB (`_svc_stack_bottom = 0x0084BC00`), and the
-application future is pinned inside `block_on`'s frame, so that frame is the
-single largest stack consumer. Conflict resolution and the Link Status /
-router-aging state added 192 bytes of static RAM to the router and 64 to the
-sensor; the outlining work added 480 and 56 bytes to the coroutine frame.
+The TLSR8258 router's 430,080 B (`0x69000`) gate replaces the pre-R22
+356,352 B baseline. It was set above the earlier 427,776 B image.
+The current 436,072 B image exceeds it by 5,992 B, blocking release.
+The physical 458,752 B (`0x70000`) boundary and journals did not move:
+22,680 B of physical headroom remains, but that does not waive the
+regression gate. The gate-to-boundary separation is 28,672 B. The existing
+TC32 toolchain linked the persistent-APS composition with its physical
+memory assertions; its build command still fails the regression-size gate.
 
-These are not benchmark-equivalent applications. Radio implementations,
-linker layouts, executor overhead, enabled peripherals, and application
-profiles differ. Compare a build against its own previous measurement and CI
-budget rather than ranking chips by the table alone.
+## RAM and stack snapshot
 
-The pinned `tc32-45` Telink builds provide the cleanest before/after
-comparison:
+| image | `.data` | `.bss` | static total | stack |
+|---|---:|---:|---:|---:|
+| PHY6222 / PHY6252 | 652 | 4,288 | 4,940 | 54,384 available |
+| EFR32MG1 | 260 | 14,720 | 14,980 | 16,760 available |
+| EFR32MG21 | 308 | 18,320 | 18,628 | 46,904 available |
+| nRF52840 always-on End Device | 88 | 18,444 | 18,532 | 242,588 available |
+| CC2340R5 fallback | 16 | 17,428 | 17,444 | 19,420 available |
+| ESP32-C6 default / `light-sleep` | 3,412 / 3,608 | 50,384 | 53,796 / 53,992 | 390,696 / 390,504 linked |
+| ESP32-H2 default / `light-sleep` | 3,120 / 3,368 | 50,328 | 53,448 / 53,696 | 201,312 / 200,640 linked |
+| TLSR8258 retained fresh-root SVC | — | — | — | 8,448 linked |
 
-| TLSR8258 image | Complete-HAL baseline | Current | Reduction |
-|---|---:|---:|---:|
-| End-device sensor | 323,876 B | 271,492 B | 52,384 B (16.2%) |
-| Parent router | 349,792 B | 338,520 B | 11,272 B (3.2%) |
+ESP32 initialized data includes `.data.wifi` (80 B for C6, 84 B for H2);
+the static totals exclude RAM-resident code. The always-on nRF52840 image
+also reserves 1,024 B of `.uninit`, for 19,556 B total occupied SRAM.
+Its 18,408 B and CC2340's 16,776 B main-task pools now use compiler-sized
+static storage rather than the insufficient dynamic arena; both linkers
+require at least 16 KiB of stack reserve. CC2340's old pinned-SDK RAM figure
+is not a valid measurement of this new task allocation.
+EFR32MG1 has exactly `0x7C00` bytes of usable SRAM and 376 B of margin above
+its 16 KiB stack gate. TLSR8258's retained SVC stack has 256 B above its 8 KiB
+gate. These linked values are not runtime high-water measurements.
 
-The current router is 67,028 bytes larger than the sensor because it retains
-the behavior a real parent needs: route maintenance, child admission and
-aging, indirect delivery, parent-side MAC commands, Update-Device handling,
-the orphan procedure and coordinator realignment, the durable child-table
-journal, and Parent Announce. The sensor instead retains the R22 End Device
-Timeout client and polling lifecycle. GitHub's rounded artifact display may show both
-as roughly `0.3 MB`, but the raw binaries are no longer close in size.
+## Two independent limits
 
-## What is specialized
+Every production build should check:
 
-- `EndDevice`, `RelayRouter`, and `Router` are distinct logical role types.
-  Parent construction additionally requires a `ParentMacDriver`.
-- Parent/router maintenance is statically dispatched. Sensor futures do not
-  materialize parent-only async call graphs.
-- Role-owned state is separate: `EndDeviceState` contains the R22 timeout
-  client, `RelayRouter` uses zero-sized state, and `ParentState` contains the
-  bounded parent queues and flags.
-- Local ZCL parsing, foundation commands, cluster dispatch, reporting
-  configuration, and response construction run in a synchronous,
-  `MacDriver`-independent dispatcher rather than inside the generic async
-  receive state machine.
-- APS decryption, joined-tick tails, and receive metadata use shared
-  non-generic helpers where measurement showed a real reduction.
-- Small bounded descriptor sets use compact insertion ordering instead of
-  linking generic slice sorting.
-- `float32` and `float64` ZCL wire support are compile-time capabilities.
-  Integer-only products reject disabled wire types without linking their
-  conversion code.
-- Constrained products can select smaller bounded runtime tables without
-  changing protocol behavior.
+1. **regression budget** — catches unexpected growth;
+2. **physical boundary** — prevents overlap with bootloader, security,
+   child-table, factory, or OTA regions.
 
-Size work is retained only when both role images improve or a deliberate
-role-specific tradeoff is justified.
+Passing a growth budget does not prove the linker boundary, and vice versa.
+CI checks both for targets with protected partitions.
 
-## Coroutine outlining on TC32
+## Why the application model remains small
 
-An `async fn` body compiles to a coroutine whose resume function is a separate
-MIR body. `#[inline(never)]` on the `async fn` applies to the constructor that
-returns the future, **not** to that resume function, so a future awaited from
-exactly one place is folded into its caller's coroutine however it is
-annotated. That is how `tick_with_security_store` and `process_incoming`
-reached 59,796 and 26,224 bytes in the router image: every maintenance,
-commissioning, transmit and receive sub-future was merged into two enormous
-functions.
+The shared applications use concrete generic capabilities:
 
-Three forms were measured on the pinned `tc32-45` router build over the same
-set of outlined awaits:
+- `NoStatus` removes status-only timing and indication paths;
+- `NoOta` removes OTA only when the profile is statically non-OTA;
+- `AlwaysOnEndDeviceApp` removes router and parent/child lifecycle;
+- an end-device role removes router/parent maintenance;
+- products drop unused peripheral tokens and let dead-code elimination remove
+  their drivers.
 
-| Form | Router flash | `block_on` frame |
-|---|---:|---:|
-| Inline `.await` | 345,088 B | 8,908 B |
-| Generic `async fn` wrapper | 330,784 B | 22,676 B |
-| `await_out_of_line!` (`Pin<&mut dyn Future>`) | 329,720 B | 9,388 B |
+`compact-single-endpoint` is a product-capacity feature, not a protocol or
+role feature. It keeps two application-endpoint slots and four reporting
+entries without removing Zigbee behavior. The EFR32MG1, PHY62x2 sensor, and
+TLSR8258 sensor/router products currently select it, after profile-capacity
+assertions.
 
-The shipped image adds three more outlined awaits in router maintenance,
-reaching 328,396 B at the same coroutine frame size. The R22 parent-persistence
-work (durable child-table journal, orphan procedure and coordinator
-realignment, `apsParentAnnounceTimer`) later added 10,124 B to the router,
-bringing it to 338,520 B — still 5,544 B inside its 344,064-byte budget — while
-every end-device image *shrank*, because the Parent Announce receive path is now
-compiled out of a non-`router` build entirely.
+There is no heap allocator or public trait-object application graph. One
+internal pinned `dyn Future` outlining path controls TC32 code duplication
+without allocating.
 
-The generic `async fn` wrapper is the trap: the caller ends up holding the
-moved-from temporary *and* the wrapper coroutine across the await, so every
-outlined future's state is stored twice and the frame nearly triples — past
-the 16 KiB SVC stack. Pinning the future at the call site and polling it
-through `Pin<&mut dyn Future>` leaves the state exactly where an inline
-`.await` would have put it and moves only the code, which is what
-`await_out_of_line!` in `zigbee-runtime` does.
+CI uses symbol gates in addition to byte counts. For example:
 
-Reserve it for large sub-futures awaited once — periodic maintenance,
-lifecycle transitions, per-frame processing. On a small leaf call the vtable
-and indirect call cost more than the inlining saves. Outlining a *synchronous*
-step with `#[inline(never)]` is roughly flash-neutral by comparison and is
-worth doing for coroutine-size rather than flash reasons.
+- sensor images must not contain parent/router maintenance;
+- the nRF always-on End Device must contain neither routing/parent maintenance
+  nor coordinator startup;
+- hardware-AES products must contain the selected backend and no software
+  fallback;
+- Telink sensor/router images must preserve their role-specific partitions.
 
-The other half of the reduction is deduplication: an `.await` embeds the
-awaited future's state machine, so two textual copies of `start()` or
-`leave()` are two copies of the whole join or leave sequence in flash. Folding
-`UserAction::Toggle` onto the join/leave it resolves to, and selecting the
-user-requested and automatically due secured rejoins together, removed those
-duplicates.
+## Measurement commands
 
-## Correctness and regression gates
+Raw binary:
 
-Size reductions do not weaken the active Zigbee PRO R22 / BDB 3.0.1 baseline.
-The workspace tests keep unsupported-ZDP behavior, End Device Timeout,
-parent/child aging, Parent Announce, persistence migration, APS replay/MIC
-ordering, and ZCL Write Attributes ordering and atomicity covered.
+```bash
+OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+"$OBJCOPY" -O binary path/to/firmware path/to/firmware.bin
+stat -f '%z' path/to/firmware.bin   # macOS
+```
 
-CI also checks properties that a successful link alone cannot prove:
+Static sections:
 
-- per-target JSON size budgets;
-- absence of generic slice sorting in constrained images;
-- absence of parent/router symbols from sensors;
-- presence of R22 End Device Timeout client symbols in sensors and their
-  absence from routers/relays;
-- BL702 absence of RV32A instructions and vendor radio symbols;
-- BL702 `_start_rust` placement in XIP flash;
-- BL702 production rejects the RustCrypto software AES core and requires the
-  SEC_ENG backend, while re-running the RV32A/vendor/XIP gates;
-- TLSR8258 RAM-code, cache, BSS, DMA, and stack layout;
-- TLSR8258 production rejects the RustCrypto software AES core and requires
-  the token-owned accelerator backend.
-- EFR32MG1 production rejects the RustCrypto software AES core, requires the
-  CRYPTO backend, checks BUFC allocation geometry, and requires at least
-  16 KiB of linked stack.
+```bash
+SIZE=$(find "$(rustc --print sysroot)" -name llvm-size -print -quit)
+"$SIZE" path/to/firmware
+```
 
-Oversized ZCL responses are dropped whole rather than truncated into malformed
-frames. Cluster-specific responses have a compile-time proof that their
-64-byte payload plus header fits the 128-byte pending-response buffer.
-
-## Hardware AES release policy
-
-The TLSR8258 hardware-AES provider is now proven on a TB-04 router: two
-startup known-answer tests, CCM*, AES-MMO, Request-Key, Verify-Key/Confirm-Key,
-a complete ZHA interview, more than ten minutes of secured traffic, and
-reset/resume all passed under an independent channel-15 capture. The initial
-hardware-AES release measured 269,960 bytes for the sensor and 327,760 bytes
-for the router, saving 2,640 and 4,680 bytes respectively over the former
-software builds with 8 additional bytes of RAM. The later receive-queue
-redesign and the coroutine outlining above reduced the current standard images
-to 271,492 and 338,520 bytes without changing that AES policy. Both production
-manifests install the accelerator unconditionally and fail closed without a
-software fallback.
-
-The BL702 SEC_ENG hardware-AES provider is the first cross-platform follow-up
-to the TLSR8258 work. Its two startup known-answer tests pass on XT-ZB1
-silicon, followed by periodic radio operation and a complete secured ZHA
-commissioning flow with Transport-Key, descriptors, binding, reporting, Trust
-Center link-key exchange, and encrypted application reports. The hardware-AES
-conversion measured 161,570 bytes versus 165,602 bytes for the former software
-build, saving 4,032 bytes with no additional RAM. Later stack work brings the
-current production payload to 176,930 bytes while still excluding the software
-AES core. Silent reset/resume and a cycle-derived timeout bound remain open
-hardware gates.
-
-The EFR32MG1 CRYPTO provider is also production-default. Two startup KATs,
-NWK/APS CCM*, Trust Center link-key derivation, full ZHA commissioning and
-interview, encrypted reporting, EM2 operation, and silent reset/resume passed
-on the TRÅDFRI target. The hardware-acceptance factory-EUI image was 137,532
-bytes with OTA enabled; the current production payload is 150,456 bytes.
-Hardware failures stop startup; software AES is not linked.
-
-The reusable crypto crates retain the software provider for host tests and
-platforms without a proven accelerator. It is not linked into the BL702 or
-TLSR8258 or EFR32MG1 production images.
-
-Compact TLSR8258 text placement, linker tail merging, and identical-code
-folding are also deferred until hardware soak testing confirms startup,
-interrupt, RAM-code, persistence, and OTA behavior. R23/BDB 3.1 remains a
-separate optional roadmap item and must add no code or RAM to these R22
-images.
+Use the platform packager instead of raw `objcopy` for ESP, BL702, PHY62x2,
+and UF2 deployment formats. Exact commands and current budgets are in
+[`BUILD.md`](https://github.com/faronov/zigbee-rs/blob/experiment/r22-bdb-complete/BUILD.md)
+and `.github/workflows/ci.yml`.

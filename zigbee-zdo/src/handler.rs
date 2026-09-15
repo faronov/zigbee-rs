@@ -7,6 +7,7 @@ use zigbee_aps::apsde::ApsdeDataIndication;
 use zigbee_aps::binding::{BindingDst, BindingDstMode, BindingEntry};
 use zigbee_aps::{ApsAddress, ApsAddressMode};
 use zigbee_mac::MacDriver;
+#[cfg(any(not(feature = "end-device"), feature = "router", test))]
 use zigbee_nwk::nlme::nwk_update_id_is_newer;
 use zigbee_types::ShortAddress;
 
@@ -19,6 +20,23 @@ use crate::{ZDO_ENDPOINT, ZdoError, ZdoLayer, ZdpStatus};
 ///
 /// A ZDP response cluster is always `request | ZDP_RESPONSE_BIT` (R22 2.4.4).
 const ZDP_RESPONSE_BIT: u16 = 0x8000;
+
+/// An already-applied Bind/Unbind result whose transmission is owned by the
+/// caller. Persist the binding table before releasing this response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedBindingResponse {
+    source: ShortAddress,
+    cluster: u16,
+    payload: [u8; 2],
+}
+
+/// R22 Table 2-145 `NOT_AUTHORIZED`.
+///
+/// Trust Center policy procedures return APS-internal status values to the
+/// ZDO implementation. Those values are not valid ZDP status encodings, so a
+/// policy denial is exposed on the wire as the standard ZDP security denial.
+#[cfg(any(not(feature = "end-device"), feature = "router"))]
+const ZDP_STATUS_NOT_AUTHORIZED: u8 = 0x8D;
 
 /// Whether `addr` is one of the four NWK broadcast destinations.
 ///
@@ -36,6 +54,7 @@ pub(crate) const fn is_unicast_short(addr: ShortAddress) -> bool {
 }
 
 /// Outcome of validating an incoming `nwkUpdateId` against the local one.
+#[cfg(any(not(feature = "end-device"), feature = "router", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpdateIdAdoption {
     /// Adopt the incoming update state and apply the requested change.
@@ -71,6 +90,7 @@ pub(crate) enum UpdateIdAdoption {
 ///
 /// This never mutates anything, so the caller can validate before touching the
 /// NIB or PIB.
+#[cfg(any(not(feature = "end-device"), feature = "router", test))]
 pub(crate) const fn nwk_update_id_adoption(
     local: Option<u8>,
     incoming: u8,
@@ -121,6 +141,28 @@ fn zdp_cluster_name(cluster: u16) -> &'static str {
 // ── Main dispatcher ─────────────────────────────────────────────
 
 impl<M: MacDriver> ZdoLayer<M> {
+    /// Send an accepted local Mgmt_Leave response after the caller has made
+    /// the corresponding leave or rejoin intent durable.
+    pub async fn send_deferred_mgmt_leave_response(
+        &mut self,
+        destination: ShortAddress,
+        transaction_sequence: u8,
+    ) -> Result<(), ZdoError> {
+        let payload = [transaction_sequence, ZdpStatus::Success as u8];
+        self.diagnostics.response_attempts = self.diagnostics.response_attempts.wrapping_add(1);
+        self.diagnostics.last_response_cluster = crate::MGMT_LEAVE_RSP;
+        let result = self
+            .send_zdp_unicast(destination, crate::MGMT_LEAVE_RSP, &payload)
+            .await;
+        if result.is_ok() {
+            self.diagnostics.response_successes =
+                self.diagnostics.response_successes.wrapping_add(1);
+        } else {
+            self.diagnostics.response_failures = self.diagnostics.response_failures.wrapping_add(1);
+        }
+        result
+    }
+
     /// Process an incoming APS indication addressed to the ZDO endpoint.
     ///
     /// Returns `Ok(())` if the frame was handled (or silently ignored).
@@ -319,10 +361,12 @@ impl<M: MacDriver> ZdoLayer<M> {
             ),
 
             // ── Network management ──────────────────────────────
+            #[cfg(any(not(feature = "end-device"), feature = "router"))]
             crate::MGMT_LQI_REQ => (
                 crate::MGMT_LQI_RSP,
                 self.handle_mgmt_lqi_req(payload, &mut rsp_buf[1..]),
             ),
+            #[cfg(any(not(feature = "end-device"), feature = "router"))]
             crate::MGMT_RTG_REQ => (
                 crate::MGMT_RTG_RSP,
                 self.handle_mgmt_rtg_req(payload, &mut rsp_buf[1..]),
@@ -335,6 +379,7 @@ impl<M: MacDriver> ZdoLayer<M> {
                 crate::MGMT_LEAVE_RSP,
                 self.handle_mgmt_leave_req(src_short, payload, &mut rsp_buf[1..]),
             ),
+            #[cfg(any(not(feature = "end-device"), feature = "router"))]
             crate::MGMT_PERMIT_JOINING_REQ => {
                 let result = self
                     .handle_mgmt_permit_joining_req(payload, &mut rsp_buf[1..])
@@ -347,6 +392,7 @@ impl<M: MacDriver> ZdoLayer<M> {
                 }
                 (crate::MGMT_PERMIT_JOINING_RSP, result)
             }
+            #[cfg(any(not(feature = "end-device"), feature = "router"))]
             crate::MGMT_NWK_UPDATE_REQ => (
                 crate::MGMT_NWK_UPDATE_RSP,
                 self.handle_mgmt_nwk_update_req(payload, &mut rsp_buf[1..])
@@ -386,18 +432,81 @@ impl<M: MacDriver> ZdoLayer<M> {
             Err(err) => return Err(err),
         };
 
-        // --- Send response ---
+        self.send_response(src_short, rsp_cluster, &rsp_buf[..rsp_len])
+            .await
+    }
+
+    /// Apply a Bind/Unbind request without sending its response. Parsing,
+    /// mutation and status selection are shared with the ordinary dispatcher.
+    /// A malformed broadcast is dropped, as in `handle_indication`.
+    pub fn prepare_binding_response(
+        &mut self,
+        ind: &ApsdeDataIndication<'_>,
+    ) -> Result<Option<PreparedBindingResponse>, ZdoError> {
+        if ind.dst_endpoint != ZDO_ENDPOINT {
+            return Err(ZdoError::InvalidData);
+        }
+        let (&tsn, payload) = ind.payload.split_first().ok_or(ZdoError::InvalidLength)?;
+        let mut response = [tsn, 0];
+        let (cluster, result) = match ind.cluster_id {
+            crate::BIND_REQ => (
+                crate::BIND_RSP,
+                self.handle_bind_req(payload, &mut response[1..]),
+            ),
+            crate::UNBIND_REQ => (
+                crate::UNBIND_RSP,
+                self.handle_unbind_req(payload, &mut response[1..]),
+            ),
+            _ => return Err(ZdoError::InvalidData),
+        };
+        self.diagnostics.indications = self.diagnostics.indications.wrapping_add(1);
+        self.diagnostics.last_cluster = ind.cluster_id;
+        match result {
+            Ok(_) => {}
+            Err(ZdoError::InvalidLength | ZdoError::InvalidData)
+                if !self.indication_is_unicast(ind) =>
+            {
+                log_zdp_exception(ind.cluster_id, "malformed broadcast — dropped");
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
+        let source = match ind.src_address {
+            ApsAddress::Short(address) => address,
+            _ => ShortAddress::COORDINATOR,
+        };
+        Ok(Some(PreparedBindingResponse {
+            source,
+            cluster,
+            payload: response,
+        }))
+    }
+
+    /// Send an already-applied binding response without applying the request
+    /// again. On failure the caller retains the response and may retry it.
+    pub async fn send_prepared_binding_response(
+        &mut self,
+        response: &PreparedBindingResponse,
+    ) -> Result<(), ZdoError> {
+        self.send_response(response.source, response.cluster, &response.payload)
+            .await
+    }
+
+    async fn send_response(
+        &mut self,
+        src_short: ShortAddress,
+        rsp_cluster: u16,
+        payload: &[u8],
+    ) -> Result<(), ZdoError> {
         log::info!(
             "[ZDO TX] rsp cluster=0x{:04X} to 0x{:04X} len={}",
             rsp_cluster,
             src_short.0,
-            rsp_len
+            payload.len()
         );
         self.diagnostics.response_attempts = self.diagnostics.response_attempts.wrapping_add(1);
         self.diagnostics.last_response_cluster = rsp_cluster;
-        let tx_result = self
-            .send_zdp_unicast(src_short, rsp_cluster, &rsp_buf[..rsp_len])
-            .await;
+        let tx_result = self.send_zdp_unicast(src_short, rsp_cluster, payload).await;
         if tx_result.is_ok() {
             self.diagnostics.response_successes =
                 self.diagnostics.response_successes.wrapping_add(1);
@@ -706,6 +815,7 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     // ── Network management ──────────────────────────────────────
 
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn handle_mgmt_lqi_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = MgmtLqiReq::parse(payload)?;
         let neighbor_table = self.nwk().neighbor_table();
@@ -753,6 +863,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         rsp_data.serialize(rsp)
     }
 
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn handle_mgmt_rtg_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = MgmtRtgReq::parse(payload)?;
         let routing_table = self.nwk().routing_table();
@@ -870,6 +981,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         }
     }
 
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     async fn handle_mgmt_permit_joining_req(
         &mut self,
         payload: &[u8],
@@ -878,6 +990,25 @@ impl<M: MacDriver> ZdoLayer<M> {
         let req = MgmtPermitJoiningReq::parse(payload)?;
         if rsp.is_empty() {
             return Err(ZdoError::BufferTooSmall);
+        }
+
+        // R21+ deprecates TC_Significance=0 and requires every received
+        // Mgmt_Permit_Joining_req to be treated as policy-significant. Use
+        // the APS Trust Center identity rather than logical device type: a
+        // router/coordinator that is not the configured Trust Center still
+        // performs the local NLME action required by BDB 3.0.1, while child
+        // admission remains subject to the configured Trust Center through
+        // the existing Update-Device path.
+        let is_trust_center = self.aps().is_trust_center();
+        if is_trust_center {
+            if !self.trust_center_allow_remote_policy_change {
+                rsp[0] = ZDP_STATUS_NOT_AUTHORIZED;
+                return Ok(1);
+            }
+            if self.trust_center_use_whitelist {
+                rsp[0] = ZDP_STATUS_NOT_AUTHORIZED;
+                return Ok(1);
+            }
         }
         match self
             .nwk_mut()
@@ -891,6 +1022,9 @@ impl<M: MacDriver> ZdoLayer<M> {
                     req.tc_significance,
                 );
                 rsp[0] = ZdpStatus::Success as u8;
+                if is_trust_center {
+                    self.pending_trust_center_allow_joins = Some(req.permit_duration != 0);
+                }
             }
             Err(e) => {
                 log::warn!("[ZDO] Mgmt_Permit_Joining_req failed: {:?}", e,);
@@ -900,6 +1034,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         Ok(1)
     }
 
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     async fn handle_mgmt_nwk_update_req(
         &mut self,
         payload: &[u8],
@@ -1289,6 +1424,72 @@ mod tests {
         zdo.nwk().mac().tx_history().len()
     }
 
+    #[test]
+    fn prepared_binding_response_defers_transmit_and_preserves_unbind_status_on_retry() {
+        for dst in [
+            BindTarget::Group(0x1234),
+            BindTarget::Unicast {
+                dst_addr: [0x42; 8],
+                dst_endpoint: 1,
+            },
+        ] {
+            let mut zdo = test_zdo();
+            let request = BindReq {
+                src_addr: LOCAL_IEEE,
+                src_endpoint: 1,
+                cluster_id: 0x0006,
+                dst,
+            };
+            let mut payload = [0u8; 22];
+            payload[0] = 0x79;
+            let len = 1 + request.serialize(&mut payload[1..]).unwrap();
+            let prepared = zdo
+                .prepare_binding_response(&unicast(crate::BIND_REQ, &payload[..len]))
+                .unwrap()
+                .unwrap();
+            assert_eq!(zdo.aps().binding_table().len(), 1);
+            assert_eq!(tx_count(&zdo), 0);
+            block_on(zdo.send_prepared_binding_response(&prepared)).unwrap();
+            let (cluster, response) = last_zdp_tx(&zdo).unwrap();
+            assert_eq!(cluster, crate::BIND_RSP);
+            assert_eq!(response.as_slice(), &[0x79, ZdpStatus::Success as u8]);
+
+            let prepared = zdo
+                .prepare_binding_response(&unicast(crate::UNBIND_REQ, &payload[..len]))
+                .unwrap()
+                .unwrap();
+            assert!(zdo.aps().binding_table().is_empty());
+            assert_eq!(tx_count(&zdo), 1);
+            zdo.nwk_mut().mac_mut().set_tx_failures(100);
+            assert!(matches!(
+                block_on(zdo.send_prepared_binding_response(&prepared)),
+                Err(ZdoError::ApsError(_))
+            ));
+            zdo.nwk_mut().mac_mut().set_tx_failures(0);
+            block_on(zdo.send_prepared_binding_response(&prepared)).unwrap();
+            let (cluster, response) = last_zdp_tx(&zdo).unwrap();
+            assert_eq!(cluster, crate::UNBIND_RSP);
+            assert_eq!(response.as_slice(), &[0x79, ZdpStatus::Success as u8]);
+        }
+    }
+
+    #[test]
+    fn prepared_binding_rejects_truncation_without_mutation_or_transmit() {
+        let mut zdo = test_zdo();
+        for cluster in [crate::BIND_REQ, crate::UNBIND_REQ] {
+            assert_eq!(
+                zdo.prepare_binding_response(&unicast(cluster, &[0x79, 0])),
+                Err(ZdoError::InvalidLength)
+            );
+            assert_eq!(
+                zdo.prepare_binding_response(&broadcast(cluster, &[0x79, 0])),
+                Ok(None)
+            );
+        }
+        assert!(zdo.aps().binding_table().is_empty());
+        assert_eq!(tx_count(&zdo), 0);
+    }
+
     #[cfg(feature = "router")]
     fn add_confirmed_child(zdo: &mut ZdoLayer<MockMac>, short: ShortAddress, ieee: IeeeAddress) {
         let nwk = zdo.nwk_mut();
@@ -1513,6 +1714,90 @@ mod tests {
         assert_eq!(body.as_slice(), &[0x42, ZdpStatus::Success as u8]);
     }
 
+    #[test]
+    #[cfg(feature = "router")]
+    fn trust_center_rejects_unauthorized_permit_joining_request() {
+        let mut zdo = test_zdo_for(DeviceType::Coordinator);
+        zdo.aps_mut().aib_mut().aps_trust_center_address = LOCAL_IEEE;
+        zdo.set_trust_center_permit_joining_policy(false, false);
+
+        // R21+ treats the deprecated zero value as policy-significant too.
+        let request = [0x42, 30, 0];
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_PERMIT_JOINING_REQ, &request)))
+            .unwrap();
+
+        let (cluster, body) = last_zdp_tx(&zdo).unwrap();
+        assert_eq!(cluster, crate::MGMT_PERMIT_JOINING_RSP);
+        assert_eq!(body.as_slice(), &[0x42, ZDP_STATUS_NOT_AUTHORIZED]);
+        assert!(!zdo.nwk().nib().permit_joining);
+        assert_eq!(zdo.take_trust_center_allow_joins_update(), None);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn trust_center_applies_authorized_permit_joining_request() {
+        let mut zdo = test_zdo_for(DeviceType::Coordinator);
+        zdo.aps_mut().aib_mut().aps_trust_center_address = LOCAL_IEEE;
+        zdo.set_trust_center_permit_joining_policy(true, false);
+
+        let request = [0x43, 30, 1];
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_PERMIT_JOINING_REQ, &request)))
+            .unwrap();
+
+        let (cluster, body) = last_zdp_tx(&zdo).unwrap();
+        assert_eq!(cluster, crate::MGMT_PERMIT_JOINING_RSP);
+        assert_eq!(body.as_slice(), &[0x43, ZdpStatus::Success as u8]);
+        assert!(zdo.nwk().nib().permit_joining);
+        assert_eq!(zdo.nwk().nib().permit_joining_duration, 30);
+        assert_eq!(zdo.take_trust_center_allow_joins_update(), Some(true));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn non_trust_center_parent_does_not_apply_trust_center_policy() {
+        const REMOTE_TRUST_CENTER: [u8; 8] = [0xA5; 8];
+
+        for device_type in [DeviceType::Router, DeviceType::Coordinator] {
+            let mut zdo = test_zdo_for(device_type);
+            zdo.aps_mut().aib_mut().aps_trust_center_address = REMOTE_TRUST_CENTER;
+            // These settings would deny the request if logical type were
+            // incorrectly used as proof that this node owns TC policy.
+            zdo.set_trust_center_permit_joining_policy(false, true);
+
+            let request = [0x44, 30, 1];
+            block_on(zdo.handle_indication(&unicast(crate::MGMT_PERMIT_JOINING_REQ, &request)))
+                .unwrap();
+
+            let (cluster, body) = last_zdp_tx(&zdo).unwrap();
+            assert_eq!(cluster, crate::MGMT_PERMIT_JOINING_RSP);
+            assert_eq!(body.as_slice(), &[0x44, ZdpStatus::Success as u8]);
+            assert!(zdo.nwk().nib().permit_joining);
+            assert_eq!(zdo.take_trust_center_allow_joins_update(), None);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn permit_joining_policy_denial_uses_valid_zdp_status_encoding() {
+        let mut zdo = test_zdo_for(DeviceType::Coordinator);
+        zdo.aps_mut().aib_mut().aps_trust_center_address = LOCAL_IEEE;
+        zdo.set_trust_center_permit_joining_policy(true, true);
+
+        let request = [0x45, 30, 1];
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_PERMIT_JOINING_REQ, &request)))
+            .unwrap();
+
+        let (_, body) = last_zdp_tx(&zdo).unwrap();
+        assert_eq!(body.as_slice(), &[0x45, ZDP_STATUS_NOT_AUTHORIZED]);
+        assert!(matches!(
+            body[1],
+            0x00 | 0x80..=0x86 | 0x88..=0x8F
+        ));
+        assert!(!matches!(body[1], 0xA3 | 0xAA));
+        assert!(!zdo.nwk().nib().permit_joining);
+        assert_eq!(zdo.take_trust_center_allow_joins_update(), None);
+    }
+
     // ── Unsupported / undefined clusters ────────────────────────
 
     #[test]
@@ -1536,6 +1821,75 @@ mod tests {
 
         assert_eq!(tx_count(&zdo), 0);
         assert_eq!(zdo.diagnostics().response_attempts, 0);
+    }
+
+    #[test]
+    #[cfg(all(feature = "end-device", not(feature = "router")))]
+    fn end_device_optional_management_unicasts_answer_not_supported() {
+        for cluster in [
+            crate::MGMT_LQI_REQ,
+            crate::MGMT_RTG_REQ,
+            crate::MGMT_PERMIT_JOINING_REQ,
+            crate::MGMT_NWK_UPDATE_REQ,
+        ] {
+            let mut zdo = test_zdo();
+            let payload = [0x5Eu8];
+            block_on(zdo.handle_indication(&unicast(cluster, &payload))).unwrap();
+
+            let (response_cluster, body) = last_zdp_tx(&zdo).expect("response frame");
+            assert_eq!(response_cluster, cluster | ZDP_RESPONSE_BIT);
+            assert_eq!(body.as_slice(), &[0x5E, ZdpStatus::NotSupported as u8]);
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "end-device", not(feature = "router")))]
+    fn end_device_optional_management_broadcasts_are_dropped() {
+        for cluster in [
+            crate::MGMT_LQI_REQ,
+            crate::MGMT_RTG_REQ,
+            crate::MGMT_PERMIT_JOINING_REQ,
+            crate::MGMT_NWK_UPDATE_REQ,
+        ] {
+            let mut zdo = test_zdo();
+            let payload = [0x5Fu8];
+            block_on(zdo.handle_indication(&broadcast(cluster, &payload))).unwrap();
+
+            assert_eq!(tx_count(&zdo), 0);
+            assert_eq!(zdo.diagnostics().response_attempts, 0);
+        }
+    }
+
+    /// The leaf fallback deliberately compiles out optional table and
+    /// network-management *servers*, but it must not turn the mandatory
+    /// binding-table query or full Mgmt_Leave processing into generic
+    /// NOT_SUPPORTED replies.
+    #[test]
+    #[cfg(all(feature = "end-device", not(feature = "router")))]
+    fn end_device_fallback_retains_mgmt_bind_and_mgmt_leave() {
+        let mut zdo = test_zdo();
+
+        // Mgmt_Bind_req: TSN followed by the first binding-table index. The
+        // empty local table still has the four mandatory response fields.
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_BIND_REQ, &[0x60, 0x00]))).unwrap();
+        let (cluster, body) = last_zdp_tx(&zdo).expect("Mgmt_Bind_rsp");
+        assert_eq!(cluster, crate::MGMT_BIND_RSP);
+        assert_eq!(
+            body.as_slice(),
+            &[0x60, ZdpStatus::Success as u8, 0x00, 0x00, 0x00]
+        );
+
+        zdo.nwk_mut().mac_mut().clear_tx_history();
+        let mut leave = [0u8; 10];
+        leave[0] = 0x61;
+        leave[1..9].copy_from_slice(&LOCAL_IEEE);
+        // Rejoin=0, removeChildren=0. The parent is the authorized source
+        // in `unicast`, so this must reach the real Mgmt_Leave classifier.
+        leave[9] = 0;
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_LEAVE_REQ, &leave))).unwrap();
+        let (cluster, body) = last_zdp_tx(&zdo).expect("Mgmt_Leave_rsp");
+        assert_eq!(cluster, crate::MGMT_LEAVE_RSP);
+        assert_eq!(body.as_slice(), &[0x61, ZdpStatus::Success as u8]);
     }
 
     #[test]
@@ -1575,6 +1929,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn broadcast_permit_joining_is_applied_without_a_response() {
         let mut zdo = test_zdo_for(DeviceType::Router);
         let payload = [0x5D, 60, 1];
@@ -1805,11 +2160,15 @@ mod tests {
 
     // ── Mgmt_NWK_Update adoption (R22 §3.4.12) ──────────────
 
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     const START_CHANNEL: u8 = 15;
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     const NEW_CHANNEL: u8 = 20;
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     const NEW_MANAGER: ShortAddress = ShortAddress(0x1A2B);
 
     /// A commissioned device holding a known-good `nwkUpdateId`.
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn test_zdo_on_channel(update_id: Option<u8>) -> ZdoLayer<MockMac> {
         let mut zdo = test_zdo();
         {
@@ -1820,6 +2179,7 @@ mod tests {
         zdo
     }
 
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn channel_change(tsn: u8, channel: u8, nwk_update_id: u8) -> [u8; 7] {
         let mut payload = [0u8; 7];
         payload[0] = tsn;
@@ -1829,6 +2189,7 @@ mod tests {
         payload
     }
 
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn manager_change(tsn: u8, manager: ShortAddress, nwk_update_id: u8) -> [u8; 9] {
         let mut payload = [0u8; 9];
         payload[0] = tsn;
@@ -1839,6 +2200,7 @@ mod tests {
         payload
     }
 
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn zdp_status(zdo: &ZdoLayer<MockMac>) -> u8 {
         let (cluster, body) = last_zdp_tx(zdo).expect("Mgmt_NWK_Update_rsp must be transmitted");
         assert_eq!(cluster, crate::MGMT_NWK_UPDATE_RSP);
@@ -1901,6 +2263,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn mgmt_nwk_update_adopts_a_newer_channel_change() {
         let mut zdo = test_zdo_on_channel(Some(4));
         let payload = channel_change(0x61, NEW_CHANNEL, 5);
@@ -1913,6 +2276,7 @@ mod tests {
 
     /// Wrap-aware: 0x00 is newer than 0xFF, not eight generations older.
     #[test]
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn mgmt_nwk_update_adopts_a_channel_change_across_the_wrap() {
         let mut zdo = test_zdo_on_channel(Some(0xFF));
         let payload = channel_change(0x62, NEW_CHANNEL, 0x00);
@@ -1926,6 +2290,7 @@ mod tests {
     /// A stale request must not move the radio off-channel: a device that
     /// followed it would be deaf on a channel the network has left behind.
     #[test]
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn mgmt_nwk_update_rejects_a_stale_channel_change_without_retuning() {
         let mut zdo = test_zdo_on_channel(Some(9));
         let payload = channel_change(0x63, NEW_CHANNEL, 8);
@@ -1938,6 +2303,7 @@ mod tests {
 
     /// The unorderable half-window distance is refused, not guessed at.
     #[test]
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn mgmt_nwk_update_rejects_an_ambiguous_channel_change() {
         let mut zdo = test_zdo_on_channel(Some(0x00));
         let payload = channel_change(0x64, NEW_CHANNEL, 0x80);
@@ -1951,6 +2317,7 @@ mod tests {
     /// Equal update ID, same channel: a retransmission. Confirm, change
     /// nothing.
     #[test]
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn mgmt_nwk_update_treats_an_equal_matching_channel_change_as_idempotent() {
         let mut zdo = test_zdo_on_channel(Some(3));
         let payload = channel_change(0x65, START_CHANNEL, 3);
@@ -1964,6 +2331,7 @@ mod tests {
     /// Equal update ID but a *different* channel: two network states claiming
     /// the same update ID. Refuse rather than split the network.
     #[test]
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn mgmt_nwk_update_rejects_an_equal_but_conflicting_channel_change() {
         let mut zdo = test_zdo_on_channel(Some(3));
         let payload = channel_change(0x66, NEW_CHANNEL, 3);
@@ -1977,6 +2345,7 @@ mod tests {
     /// Unknown local state has nothing to order the request against, so the
     /// incoming ID is adopted — and becomes known-good from then on.
     #[test]
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn mgmt_nwk_update_adopts_a_channel_change_when_local_state_is_unknown() {
         let mut zdo = test_zdo_on_channel(None);
         assert_eq!(zdo.nwk().nib().nwk_update_id(), None);
@@ -2004,6 +2373,7 @@ mod tests {
     /// A channel-change request that names no channel is refused before the
     /// update state is even consulted.
     #[test]
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn mgmt_nwk_update_rejects_a_channel_change_without_a_channel() {
         let mut zdo = test_zdo_on_channel(Some(3));
         let mut payload = [0u8; 7];
@@ -2019,6 +2389,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn mgmt_nwk_update_manager_change_follows_the_same_rules() {
         // Newer: adopted.
         let mut zdo = test_zdo_on_channel(Some(4));

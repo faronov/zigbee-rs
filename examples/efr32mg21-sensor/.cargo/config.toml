@@ -3,8 +3,10 @@ target = "thumbv8m.main-none-eabihf"
 
 [target.thumbv8m.main-none-eabihf]
 rustflags = [
+    "-L", "../../products/efr32mg21-sensor/link",
     "-L", "../../boards/efr32mg21-devkit/link",
     "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=--nmagic",
 ]
 
 [unstable]

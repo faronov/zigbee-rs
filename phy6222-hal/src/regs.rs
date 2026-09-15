@@ -23,7 +23,7 @@ pub const FLASH_BASE: u32 = 0x1100_0000;
 
 // ── GPIO registers (base + offset) ────────────────────────────
 
-pub const GPIO_SWPORTA_DR: u32 = AP_GPIO_BASE + 0x00;
+pub const GPIO_SWPORTA_DR: u32 = AP_GPIO_BASE;
 pub const GPIO_SWPORTA_DDR: u32 = AP_GPIO_BASE + 0x04;
 pub const GPIO_EXT_PORTA: u32 = AP_GPIO_BASE + 0x50;
 pub const GPIO_INTEN: u32 = AP_GPIO_BASE + 0x30;
@@ -59,7 +59,7 @@ pub const I2C_STATUS_TFNF: u32 = 0x02;
 
 // ── SPIF (flash controller) registers ──────────────────────────
 
-pub const SPIF_CONFIG: u32 = AP_SPIF_BASE + 0x00;
+pub const SPIF_CONFIG: u32 = AP_SPIF_BASE;
 pub const SPIF_FCMD: u32 = AP_SPIF_BASE + 0x90;
 pub const SPIF_FCMD_ADDR: u32 = AP_SPIF_BASE + 0x94;
 pub const SPIF_FCMD_RDDATA: u32 = AP_SPIF_BASE + 0xA0;
@@ -67,12 +67,12 @@ pub const SPIF_FCMD_WRDATA: u32 = AP_SPIF_BASE + 0xA8;
 
 // ── Cache control ──────────────────────────────────────────────
 
-pub const CACHE_CTRL0: u32 = AP_CACHE_BASE + 0x00;
+pub const CACHE_CTRL0: u32 = AP_CACHE_BASE;
 pub const CACHE_BYPASS_REG: u32 = 0x4000_0044;
 
 // ── PCRM (power/clock/ADC control) ────────────────────────────
 
-pub const PCRM_CLKSEL: u32 = AP_PCRM_BASE + 0x00;
+pub const PCRM_CLKSEL: u32 = AP_PCRM_BASE;
 pub const PCRM_CLKHF_CTL0: u32 = AP_PCRM_BASE + 0x04;
 pub const PCRM_CLKHF_CTL1: u32 = AP_PCRM_BASE + 0x08;
 pub const PCRM_ANA_CTL: u32 = AP_PCRM_BASE + 0x0C;
@@ -81,7 +81,7 @@ pub const PCRM_ADC_CTL4: u32 = AP_PCRM_BASE + 0x40;
 
 // ── AON (always-on domain) ─────────────────────────────────────
 
-pub const AON_PWROFF: u32 = AP_AON_BASE + 0x00;
+pub const AON_PWROFF: u32 = AP_AON_BASE;
 pub const AON_PWRSLP: u32 = AP_AON_BASE + 0x04;
 pub const AON_IOCTL0: u32 = AP_AON_BASE + 0x08;
 pub const AON_IOCTL1: u32 = AP_AON_BASE + 0x0C;

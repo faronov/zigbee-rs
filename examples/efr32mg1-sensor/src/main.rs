@@ -4,7 +4,7 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
-mod app;
+mod diagnostics;
 mod platform;
 mod sensor;
 mod time_driver;
@@ -16,6 +16,7 @@ use cortex_m as _;
 use efr32mg1_hal::peripherals::Peripherals;
 use efr32mg1_tradfri::resources::BoardResources;
 use embassy_executor::Spawner;
+use sensor_sed_app::{SensorApp, SensorSedParts};
 use static_cell::StaticCell;
 #[allow(unused_imports)]
 use vectors::__INTERRUPTS;
@@ -23,13 +24,27 @@ use zigbee_bdb::attributes::{BDB_POPULAR_CHANNEL_FALLBACK_SET, BDB_POPULAR_CHANN
 use zigbee_mac::efr32::Efr32Mac;
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
-use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::profile::ApplicationProfile;
 use zigbee_types::ChannelMask;
 use zigbee_zcl::clusters::basic::PowerSource;
 
-const FAST_POLL_MS: u32 = 250;
-const SLOW_POLL_SECS: u32 = 30;
+type AppParts = SensorSedParts<
+    platform::Efr32WakeController,
+    platform::Efr32Status,
+    sensor::Sensor,
+    efr32mg1_tradfri_product::battery::BatteryAdapter,
+    efr32mg1_tradfri_product::ota::Efr32OtaLifecycle,
+    sensor_sed_app::ForceReportAction,
+    platform::Efr32Supervisor,
+    diagnostics::RttDiagnostics,
+>;
+type SharedSensorApp = SensorApp<
+    'static,
+    Efr32Mac,
+    efr32mg1_tradfri_product::storage::SecurityStore,
+    efr32mg1_tradfri_product::profile::SensorProfile,
+    AppParts,
+>;
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
@@ -73,7 +88,7 @@ async fn main(_spawner: Spawner) {
     static PROFILE: StaticCell<efr32mg1_tradfri_product::profile::SensorProfile> =
         StaticCell::new();
     static DEVICE: StaticCell<ZigbeeDevice<Efr32Mac>> = StaticCell::new();
-    static APP: StaticCell<app::SensorApp> = StaticCell::new();
+    static APP: StaticCell<SharedSensorApp> = StaticCell::new();
 
     let profile = PROFILE.init(
         efr32mg1_tradfri_product::profile::sensor_profile(FIRMWARE_VERSION, ota_flash)
@@ -87,10 +102,7 @@ async fn main(_spawner: Spawner) {
     rtt_target::rprintln!("[EFR32][sensor] AES_KAT_PASS ieee={:02X?}", ieee);
 
     let device = ZigbeeDevice::builder(mac)
-        .power_mode(PowerMode::Sleepy {
-            poll_interval_ms: SLOW_POLL_SECS * 1_000,
-            wake_duration_ms: FAST_POLL_MS,
-        })
+        .power_mode(efr32mg1_tradfri_product::policy::SENSOR_POLICY.power_mode())
         .automatic_polling(false)
         .manufacturer(efr32mg1_tradfri_product::MANUFACTURER)
         .model(efr32mg1_tradfri_product::MODEL)
@@ -120,7 +132,21 @@ async fn main(_spawner: Spawner) {
 
     let node = ZigbeeNode::new(device, security, profile);
 
-    APP.init(app::SensorApp::new(node, sht, battery))
-        .run()
-        .await
+    let app = SensorApp::new(
+        node,
+        &efr32mg1_tradfri_product::policy::SENSOR_POLICY,
+        SensorSedParts {
+            wake: platform::Efr32WakeController::new(),
+            status: platform::Efr32Status::new(),
+            environment: sht,
+            battery: efr32mg1_tradfri_product::battery::BatteryAdapter::new(battery),
+            ota: efr32mg1_tradfri_product::ota::Efr32OtaLifecycle::new(),
+            actions: efr32mg1_tradfri_product::policy::USER_ACTIONS,
+            supervisor: platform::Efr32Supervisor,
+            diagnostics: diagnostics::RttDiagnostics,
+        },
+    )
+    .unwrap_or_else(|_| platform::halt_with_led());
+
+    APP.init(app).run().await
 }

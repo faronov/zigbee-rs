@@ -18,22 +18,41 @@
 
 pub use zigbee_crypto::AesKey;
 use zigbee_crypto::{
-    Aes128Forward, ForwardAesProvider, SoftwareAesProvider, ccm_star_decrypt_with,
+    ForwardAesProvider, SoftwareAesProvider, aes_mmo_hash_with, ccm_star_decrypt_with,
     ccm_star_encrypt_with,
 };
 use zigbee_types::IeeeAddress;
 
 /// Maximum number of link key entries.
+#[cfg(feature = "trust-center")]
+pub const MAX_KEY_TABLE_ENTRIES: usize = 32;
+#[cfg(not(feature = "trust-center"))]
 pub const MAX_KEY_TABLE_ENTRIES: usize = 16;
 
 /// Number of distinct key-pair entries one partner can hold: a Trust Center
 /// link key and an application link key (R22 Table 4-15 key types 0x01/0x03).
 pub const MAX_KEY_PAIRS_PER_PARTNER: usize = 2;
+/// Maximum durable replay records reserved for global commissioning keys.
+///
+/// Domain equality aggregates source addresses, so this capacity is available
+/// for key-fingerprint changes across provisioning history rather than being
+/// consumable by attacker-chosen IEEE addresses.
+pub const MAX_GLOBAL_REPLAY_ENTRIES: usize = 16;
+/// Live replay state has exactly one domain for each global key regime.
+const MAX_ACTIVE_GLOBAL_REPLAY_DOMAINS: usize = 2;
 
 /// Well-known Zigbee 3.0 default Trust Center link key ("ZigBeeAlliance09").
 pub const DEFAULT_TC_LINK_KEY: [u8; 16] = [
     0x5A, 0x69, 0x67, 0x42, 0x65, 0x65, 0x41, 0x6C, // ZigBeeAl
     0x6C, 0x69, 0x61, 0x6E, 0x63, 0x65, 0x30, 0x39, // liance09
+];
+
+/// BDB 3.0.1 distributed-security key reserved for certification testing.
+///
+/// Production products must install the company-specific key received during
+/// certification instead of shipping this public test value.
+pub const DISTRIBUTED_SECURITY_TEST_LINK_KEY: [u8; 16] = [
+    0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF,
 ];
 
 // ── Key types ───────────────────────────────────────────────────
@@ -50,8 +69,6 @@ pub enum ApsKeyType {
     NetworkKey = 0x02,
     /// Application Link Key (between two application devices)
     ApplicationLinkKey = 0x03,
-    /// Distributed Security Global Link Key (for distributed TC networks)
-    DistributedGlobalLinkKey = 0x04,
 }
 
 impl ApsKeyType {
@@ -61,7 +78,6 @@ impl ApsKeyType {
             0x01 => Some(Self::TrustCenterLinkKey),
             0x02 => Some(Self::NetworkKey),
             0x03 => Some(Self::ApplicationLinkKey),
-            0x04 => Some(Self::DistributedGlobalLinkKey),
             _ => None,
         }
     }
@@ -213,9 +229,9 @@ impl ApsSecurityHeader {
 /// a sufficient identity for replay protection or for reserving an outgoing
 /// counter.
 ///
-/// [`Self::PreconfiguredGlobal`] names the well-known global key used before
-/// any key-pair entry exists for a partner. It has no per-partner counter
-/// state: the entry is created only when a unique key is installed.
+/// [`Self::PreconfiguredGlobal`] and [`Self::DistributedGlobal`] name the two
+/// preconfigured global keys used before any key-pair entry exists for a
+/// partner. They have no per-partner counter state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApsKeyOrigin {
     /// A key-table entry (`apsDeviceKeyPairSet`).
@@ -225,8 +241,81 @@ pub enum ApsKeyOrigin {
         /// Key type of the entry.
         key_type: ApsKeyType,
     },
-    /// The preconfigured global link key — no key-pair entry is installed.
+    /// The centralized preconfigured global link key.
     PreconfiguredGlobal,
+    /// The distributed-security global link key.
+    DistributedGlobal,
+}
+
+/// Durable identity of one APS incoming replay domain.
+#[derive(Debug, Clone, Copy)]
+pub enum ApsReplayOrigin {
+    KeyPair {
+        partner: IeeeAddress,
+        key_type: ApsKeyType,
+    },
+    /// Aggregate replay domain for the preconfigured global key.
+    ///
+    /// `source` records the authenticated sender for persistence transitions
+    /// and diagnostics, but it is deliberately not part of domain equality.
+    PreconfiguredGlobal { source: IeeeAddress },
+    /// Aggregate replay domain for the distributed-security global key.
+    ///
+    /// `source` records the authenticated sender for persistence transitions
+    /// and diagnostics, but it is deliberately not part of domain equality.
+    DistributedGlobal { source: IeeeAddress },
+}
+
+impl PartialEq for ApsReplayOrigin {
+    fn eq(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (
+                Self::KeyPair {
+                    partner: left_partner,
+                    key_type: left_key_type,
+                },
+                Self::KeyPair {
+                    partner: right_partner,
+                    key_type: right_key_type,
+                },
+            ) => left_partner == right_partner && left_key_type == right_key_type,
+            (Self::PreconfiguredGlobal { .. }, Self::PreconfiguredGlobal { .. })
+            | (Self::DistributedGlobal { .. }, Self::DistributedGlobal { .. }) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ApsReplayOrigin {}
+
+/// Durable incoming APS replay floor bound to the key that authenticated it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApsReplayCounter {
+    pub origin: ApsReplayOrigin,
+    pub key_fingerprint: u32,
+    pub counter: u32,
+}
+
+impl ApsReplayCounter {
+    pub fn from_verified(
+        origin: ApsKeyOrigin,
+        source: IeeeAddress,
+        key: &AesKey,
+        counter: u32,
+    ) -> Self {
+        let origin = match origin {
+            ApsKeyOrigin::KeyPair { partner, key_type } => {
+                ApsReplayOrigin::KeyPair { partner, key_type }
+            }
+            ApsKeyOrigin::PreconfiguredGlobal => ApsReplayOrigin::PreconfiguredGlobal { source },
+            ApsKeyOrigin::DistributedGlobal => ApsReplayOrigin::DistributedGlobal { source },
+        };
+        Self {
+            origin,
+            key_fingerprint: zigbee_crypto::key_fingerprint(key),
+            counter,
+        }
+    }
 }
 
 /// A key-pair entry candidate: which entry it is and the key it holds.
@@ -265,6 +354,13 @@ pub struct ApsSecurity {
     key_table: heapless::Vec<ApsLinkKeyEntry, MAX_KEY_TABLE_ENTRIES>,
     /// Pre-configured Trust Center link key (default: ZigBeeAlliance09)
     default_tc_link_key: AesKey,
+    /// Product-specific distributed-security global key.
+    ///
+    /// It is absent by default because the public BDB test key must never be
+    /// mistaken for production provisioning.
+    distributed_security_link_key: Option<AesKey>,
+    /// Aggregate replay state for the two global commissioning keys.
+    global_replay_table: heapless::Vec<ApsReplayCounter, MAX_ACTIVE_GLOBAL_REPLAY_DOMAINS>,
 }
 
 impl ApsSecurity {
@@ -272,17 +368,74 @@ impl ApsSecurity {
         Self {
             key_table: heapless::Vec::new(),
             default_tc_link_key: DEFAULT_TC_LINK_KEY,
+            distributed_security_link_key: None,
+            global_replay_table: heapless::Vec::new(),
         }
     }
 
     /// Set the default Trust Center link key.
     pub fn set_default_tc_link_key(&mut self, key: AesKey) {
+        if self.default_tc_link_key != key {
+            self.global_replay_table.retain(|entry| {
+                !matches!(entry.origin, ApsReplayOrigin::PreconfiguredGlobal { .. })
+            });
+        }
         self.default_tc_link_key = key;
     }
 
     /// Get the default Trust Center link key.
     pub fn default_tc_link_key(&self) -> &AesKey {
         &self.default_tc_link_key
+    }
+
+    /// Install the product's distributed-security global link key.
+    pub fn set_distributed_security_link_key(&mut self, key: AesKey) {
+        if self.distributed_security_link_key != Some(key) {
+            self.global_replay_table
+                .retain(|entry| !matches!(entry.origin, ApsReplayOrigin::DistributedGlobal { .. }));
+        }
+        self.distributed_security_link_key = Some(key);
+    }
+
+    /// Remove the distributed-security global link key.
+    pub fn clear_distributed_security_link_key(&mut self) {
+        self.distributed_security_link_key = None;
+        self.global_replay_table
+            .retain(|entry| !matches!(entry.origin, ApsReplayOrigin::DistributedGlobal { .. }));
+    }
+
+    /// Return the configured distributed-security global link key.
+    pub fn distributed_security_link_key(&self) -> Option<&AesKey> {
+        self.distributed_security_link_key.as_ref()
+    }
+
+    /// Whether any currently installed APS key uses `key_fingerprint`.
+    ///
+    /// Replay-counter retirement uses a key-wide tombstone, so callers must
+    /// not apply one while the same key material remains live in another
+    /// key-pair entry or global commissioning-key domain.
+    pub fn key_fingerprint_is_live(&self, key_fingerprint: u32) -> bool {
+        zigbee_crypto::key_fingerprint(&self.default_tc_link_key) == key_fingerprint
+            || self
+                .distributed_security_link_key
+                .as_ref()
+                .is_some_and(|key| zigbee_crypto::key_fingerprint(key) == key_fingerprint)
+            || self
+                .key_table
+                .iter()
+                .any(|entry| zigbee_crypto::key_fingerprint(&entry.key) == key_fingerprint)
+    }
+
+    /// Whether `replay` still names the same live APS key domain.
+    pub fn replay_counter_key_is_live(&self, replay: &ApsReplayCounter) -> bool {
+        let key = match replay.origin {
+            ApsReplayOrigin::KeyPair { partner, key_type } => {
+                self.find_key(&partner, key_type).map(|entry| entry.key)
+            }
+            ApsReplayOrigin::PreconfiguredGlobal { .. } => Some(self.default_tc_link_key),
+            ApsReplayOrigin::DistributedGlobal { .. } => self.distributed_security_link_key,
+        };
+        key.is_some_and(|key| zigbee_crypto::key_fingerprint(&key) == replay.key_fingerprint)
     }
 
     /// Add a link key to the key table. Returns Err if table is full.
@@ -300,7 +453,8 @@ impl ApsSecurity {
             existing.incoming_frame_counter_valid = entry.incoming_frame_counter_valid;
             return Ok(());
         }
-        self.key_table.push(entry)
+        self.key_table.push(entry)?;
+        Ok(())
     }
 
     /// Remove a link key by partner address and key type.
@@ -321,6 +475,13 @@ impl ApsSecurity {
     /// Trust Center key.
     pub fn clear_keys(&mut self) {
         self.key_table.clear();
+        self.global_replay_table.clear();
+    }
+
+    /// Remove application link keys while retaining Trust Center link keys.
+    pub fn clear_application_link_keys(&mut self) {
+        self.key_table
+            .retain(|entry| entry.key_type != ApsKeyType::ApplicationLinkKey);
     }
 
     /// Find a link key for a partner device.
@@ -392,6 +553,7 @@ impl ApsSecurity {
                 self.find_key(partner, *key_type).map(|entry| entry.key)
             }
             ApsKeyOrigin::PreconfiguredGlobal => Some(self.default_tc_link_key),
+            ApsKeyOrigin::DistributedGlobal => self.distributed_security_link_key,
         }
     }
 
@@ -452,15 +614,14 @@ impl ApsSecurity {
     /// independent windows, and advancing one must never suppress or admit a
     /// frame protected by the other.
     ///
-    /// [`ApsKeyOrigin::PreconfiguredGlobal`] has no key-pair entry and
-    /// therefore no committed counter — first contact under the well-known
-    /// global key is admitted, exactly as an unknown partner is.
+    /// Global keys have no key-pair entry and therefore no committed counter;
+    /// they are used only for the initial authenticated key transport.
     pub fn check_frame_counter_for(&self, origin: &ApsKeyOrigin, counter: u32) -> bool {
         match origin {
             ApsKeyOrigin::KeyPair { partner, key_type } => {
                 self.check_frame_counter(partner, *key_type, counter)
             }
-            ApsKeyOrigin::PreconfiguredGlobal => true,
+            ApsKeyOrigin::PreconfiguredGlobal | ApsKeyOrigin::DistributedGlobal => true,
         }
     }
 
@@ -470,6 +631,71 @@ impl ApsSecurity {
         if let ApsKeyOrigin::KeyPair { partner, key_type } = origin {
             self.commit_frame_counter(partner, *key_type, counter);
         }
+    }
+
+    /// Check a replay floor for either a key-pair entry or an aggregate global
+    /// commissioning-key domain.
+    pub fn check_replay_counter(&self, replay: &ApsReplayCounter) -> bool {
+        match replay.origin {
+            ApsReplayOrigin::KeyPair { partner, key_type } => {
+                self.check_frame_counter(&partner, key_type, replay.counter)
+            }
+            ApsReplayOrigin::PreconfiguredGlobal { .. }
+            | ApsReplayOrigin::DistributedGlobal { .. } => {
+                if let Some(entry) = self
+                    .global_replay_table
+                    .iter()
+                    .find(|entry| entry.origin == replay.origin)
+                {
+                    replay.counter > entry.counter
+                } else {
+                    !self.global_replay_table.is_full()
+                }
+            }
+        }
+    }
+
+    /// Commit a verified APS replay floor after durable storage succeeds.
+    pub fn commit_replay_counter(&mut self, replay: ApsReplayCounter) {
+        match replay.origin {
+            ApsReplayOrigin::KeyPair { partner, key_type } => {
+                self.commit_frame_counter(&partner, key_type, replay.counter);
+            }
+            ApsReplayOrigin::PreconfiguredGlobal { .. }
+            | ApsReplayOrigin::DistributedGlobal { .. } => {
+                if let Some(entry) = self
+                    .global_replay_table
+                    .iter_mut()
+                    .find(|entry| entry.origin == replay.origin)
+                {
+                    if replay.counter > entry.counter {
+                        *entry = replay;
+                    }
+                } else {
+                    let _ = self.global_replay_table.push(replay);
+                }
+            }
+        }
+    }
+
+    /// Restore a durable APS replay floor only if its key identity still
+    /// matches live security material.
+    pub fn restore_replay_counter(&mut self, replay: ApsReplayCounter) -> bool {
+        let key = match replay.origin {
+            ApsReplayOrigin::KeyPair { partner, key_type } => {
+                self.find_key(&partner, key_type).map(|entry| entry.key)
+            }
+            ApsReplayOrigin::PreconfiguredGlobal { .. } => Some(self.default_tc_link_key),
+            ApsReplayOrigin::DistributedGlobal { .. } => self.distributed_security_link_key,
+        };
+        let Some(key) = key else {
+            return false;
+        };
+        if zigbee_crypto::key_fingerprint(&key) != replay.key_fingerprint {
+            return false;
+        }
+        self.commit_replay_counter(replay);
+        true
     }
 
     /// Increment outgoing frame counter for a partner key.
@@ -668,61 +894,118 @@ mod ccm_tests {
             .expect("encrypt");
         assert_eq!(encrypted.as_slice(), expected);
     }
+
+    #[test]
+    fn global_key_replay_floor_is_aggregate_and_restorable() {
+        let source = [0x33; 8];
+        let other = [0x44; 8];
+        let key = *ApsSecurity::new().default_tc_link_key();
+        let replay =
+            ApsReplayCounter::from_verified(ApsKeyOrigin::PreconfiguredGlobal, source, &key, 17);
+
+        let mut first = ApsSecurity::new();
+        assert!(first.check_replay_counter(&replay));
+        first.commit_replay_counter(replay);
+        assert!(!first.check_replay_counter(&replay));
+        let other_source =
+            ApsReplayCounter::from_verified(ApsKeyOrigin::PreconfiguredGlobal, other, &key, 1);
+        assert!(
+            !first.check_replay_counter(&other_source),
+            "all users of the global key share one replay floor"
+        );
+        let newer_other =
+            ApsReplayCounter::from_verified(ApsKeyOrigin::PreconfiguredGlobal, other, &key, 18);
+        assert!(first.check_replay_counter(&newer_other));
+        first.commit_replay_counter(newer_other);
+
+        let mut rebooted = ApsSecurity::new();
+        assert!(rebooted.restore_replay_counter(newer_other));
+        assert!(!rebooted.check_replay_counter(&replay));
+        assert!(!rebooted.check_replay_counter(&other_source));
+    }
+
+    #[test]
+    fn arbitrary_sources_cannot_exhaust_global_replay_domains() {
+        let mut security = ApsSecurity::new();
+        let default_key = *security.default_tc_link_key();
+        let distributed_key = [0xD7; 16];
+        security.set_distributed_security_link_key(distributed_key);
+
+        let established = [0xA5; 8];
+        let established_key = [0x5A; 16];
+        security
+            .add_key(ApsLinkKeyEntry {
+                partner_address: established,
+                key: established_key,
+                key_type: ApsKeyType::ApplicationLinkKey,
+                outgoing_frame_counter: 0,
+                outgoing_frame_counter_limit: 0x1000,
+                incoming_frame_counter: 77,
+                incoming_frame_counter_valid: true,
+            })
+            .unwrap();
+
+        // More distinct authenticated source addresses than the old table
+        // capacity must still consume exactly one slot per global key.
+        for counter in 1..=64u32 {
+            let mut source = [0xC0; 8];
+            source[..4].copy_from_slice(&counter.to_le_bytes());
+
+            let preconfigured = ApsReplayCounter::from_verified(
+                ApsKeyOrigin::PreconfiguredGlobal,
+                source,
+                &default_key,
+                counter,
+            );
+            assert!(security.check_replay_counter(&preconfigured));
+            security.commit_replay_counter(preconfigured);
+
+            let distributed = ApsReplayCounter::from_verified(
+                ApsKeyOrigin::DistributedGlobal,
+                source,
+                &distributed_key,
+                counter,
+            );
+            assert!(security.check_replay_counter(&distributed));
+            security.commit_replay_counter(distributed);
+        }
+
+        assert_eq!(security.global_replay_table.len(), 2);
+
+        let unseen_source = [0xE1; 8];
+        let default_replay = ApsReplayCounter::from_verified(
+            ApsKeyOrigin::PreconfiguredGlobal,
+            unseen_source,
+            &default_key,
+            64,
+        );
+        let distributed_replay = ApsReplayCounter::from_verified(
+            ApsKeyOrigin::DistributedGlobal,
+            unseen_source,
+            &distributed_key,
+            64,
+        );
+        assert!(!security.check_replay_counter(&default_replay));
+        assert!(!security.check_replay_counter(&distributed_replay));
+
+        let established_replay = ApsReplayCounter::from_verified(
+            ApsKeyOrigin::KeyPair {
+                partner: established,
+                key_type: ApsKeyType::ApplicationLinkKey,
+            },
+            established,
+            &established_key,
+            77,
+        );
+        assert!(
+            !security.check_replay_counter(&established_replay),
+            "global-domain churn must not weaken an established key-pair floor"
+        );
+    }
 }
 
 // ── Matyas-Meyer-Oseas Hash & HMAC-MMO ──────────────────────────
 // Used for APS key derivation (Zigbee spec Appendix B).
-
-/// Matyas-Meyer-Oseas AES-128 block cipher hash (Zigbee spec B.1.3), keyed
-/// through `provider`.
-///
-/// Processes `data` in 16-byte blocks:
-///   H_0 = 0
-///   H_i = AES(H_{i-1}, M_i) XOR M_i
-///
-/// Input is padded per B.6: append 0x80, zeros, then 16-bit big-endian
-/// bit-length. MMO re-keys the block cipher on *every* block (the running
-/// hash becomes the next key), which is exactly what
-/// [`ForwardAesProvider::forward_cipher`] expresses — the software provider
-/// re-expands the key schedule per block just as the original code did, and
-/// a hardware provider re-loads its key register per block.
-///
-/// Returns `None` if the AES backend fails (a hardware accelerator timeout,
-/// impossible for the software provider), so callers surface the failure
-/// instead of deriving a silently-wrong key.
-fn matyas_meyer_oseas_hash_with<P: ForwardAesProvider>(
-    provider: &mut P,
-    data: &[u8],
-) -> Option<[u8; 16]> {
-    let bit_len = (data.len() as u16).wrapping_mul(8);
-
-    // Build padded message: data || 0x80 || zeros || bit_len_be16
-    // Pad to next multiple of 16 bytes
-    let padded_len = (data.len() + 1 + 2).div_ceil(16) * 16;
-    let mut padded = [0u8; 80]; // Max 80 bytes (enough for HMAC inputs)
-    padded[..data.len()].copy_from_slice(data);
-    padded[data.len()] = 0x80;
-    padded[padded_len - 2] = (bit_len >> 8) as u8;
-    padded[padded_len - 1] = bit_len as u8;
-
-    let mut hash = [0u8; 16];
-
-    for chunk in padded[..padded_len].chunks(16) {
-        let mut block = [0u8; 16];
-        block.copy_from_slice(chunk);
-        {
-            // Key the forward permutation with the running hash H_{i-1}.
-            let mut cipher = provider.forward_cipher(&hash);
-            cipher.encrypt_block(&mut block).ok()?;
-        }
-        // H_i = E(H_{i-1}, M_i) XOR M_i
-        for j in 0..16 {
-            hash[j] = block[j] ^ chunk[j];
-        }
-    }
-
-    Some(hash)
-}
 
 /// HMAC-MMO keyed hash (Zigbee spec B.1.4), keyed through `provider`.
 ///
@@ -745,13 +1028,13 @@ fn hmac_mmo_with<P: ForwardAesProvider>(
     inner_input[..16].copy_from_slice(&ipad_key);
     let inner_len = 16 + message.len();
     inner_input[16..inner_len].copy_from_slice(message);
-    let inner_hash = matyas_meyer_oseas_hash_with(provider, &inner_input[..inner_len])?;
+    let inner_hash = aes_mmo_hash_with(provider, &inner_input[..inner_len]).ok()?;
 
     // Outer hash: Hash(opad_key || inner_hash)
     let mut outer_input = [0u8; 32];
     outer_input[..16].copy_from_slice(&opad_key);
     outer_input[16..32].copy_from_slice(&inner_hash);
-    matyas_meyer_oseas_hash_with(provider, &outer_input)
+    aes_mmo_hash_with(provider, &outer_input).ok()
 }
 
 /// Derive Key-Transport Key from TC link key (Zigbee spec §4.5.3.4).

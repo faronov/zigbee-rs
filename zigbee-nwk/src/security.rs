@@ -16,9 +16,9 @@ use zigbee_types::IeeeAddress;
 /// Maximum number of network keys we can store (current + previous)
 pub const MAX_NETWORK_KEYS: usize = 2;
 #[cfg(feature = "router")]
-const MAX_FRAME_COUNTER_ENTRIES: usize = 64;
+pub const MAX_FRAME_COUNTER_ENTRIES: usize = 64;
 #[cfg(not(feature = "router"))]
-const MAX_FRAME_COUNTER_ENTRIES: usize = 16;
+pub const MAX_FRAME_COUNTER_ENTRIES: usize = 16;
 
 /// Serialized length of the NWK security auxiliary header.
 ///
@@ -34,6 +34,33 @@ pub struct NetworkKeyEntry {
     pub seq_number: u8,
     /// Whether this key is active
     pub active: bool,
+}
+
+/// Durable identity and floor of one NWK incoming replay domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NwkReplayCounter {
+    pub source: IeeeAddress,
+    pub key_sequence: u8,
+    pub key_fingerprint: u32,
+    pub counter: u32,
+}
+
+impl NwkReplayCounter {
+    /// Capture the durable identity and floor of a successfully verified
+    /// incoming NWK frame.
+    pub fn from_verified(
+        source: IeeeAddress,
+        key_sequence: u8,
+        key: &AesKey,
+        counter: u32,
+    ) -> Self {
+        Self {
+            source,
+            key_sequence,
+            key_fingerprint: zigbee_crypto::key_fingerprint(key),
+            counter,
+        }
+    }
 }
 
 /// NWK security auxiliary header (prepended to encrypted NWK payload)
@@ -92,6 +119,10 @@ pub struct NwkSecurity {
     keys: [Option<NetworkKeyEntry>; MAX_NETWORK_KEYS],
     /// Sequence number installed by Transport-Key but not yet activated.
     staged_key_sequence: Option<u8>,
+    /// A receive-triggered activation must be checkpointed before this key
+    /// can secure outgoing traffic. Survives a failed lifecycle transaction;
+    /// clearing the security context (leave/reset) also clears this gate.
+    pub(crate) activation_pending: bool,
     /// Incoming frame counter table (for replay protection).
     /// Maps source IEEE address and network-key sequence to the last counter.
     frame_counter_table: heapless::Vec<FrameCounterEntry, MAX_FRAME_COUNTER_ENTRIES>,
@@ -109,8 +140,18 @@ impl NwkSecurity {
         Self {
             keys: [None, None],
             staged_key_sequence: None,
+            activation_pending: false,
             frame_counter_table: heapless::Vec::new(),
         }
+    }
+
+    /// Drop all live NWK keys and their replay state before a Trust Center
+    /// rejoin waits for the current key under APS link-key protection.
+    pub fn clear_network_keys(&mut self) {
+        self.keys = [None, None];
+        self.staged_key_sequence = None;
+        self.activation_pending = false;
+        self.frame_counter_table.clear();
     }
 
     /// Set the active network key.
@@ -159,8 +200,9 @@ impl NwkSecurity {
 
     /// Install a future network key without activating it.
     ///
-    /// Returns `false` if the sequence number names the active key but the
-    /// supplied key material differs.
+    /// Returns `false` for conflicting active-key material or a sequence that
+    /// is not newer in the 8-bit serial-number space. An identical delivery
+    /// of the retained previous key is an idempotent success, not a new stage.
     pub fn stage_network_key(&mut self, key: AesKey, seq_number: u8) -> bool {
         let Some(active) = self.keys[0].as_ref() else {
             self.set_network_key(key, seq_number);
@@ -169,12 +211,18 @@ impl NwkSecurity {
         if active.seq_number == seq_number {
             return active.key == key;
         }
+        let newer = Self::key_sequence_is_newer(seq_number, active.seq_number);
         if self.keys[1]
             .as_ref()
             .is_some_and(|entry| entry.seq_number == seq_number && entry.key == key)
         {
-            self.staged_key_sequence = Some(seq_number);
+            if newer {
+                self.staged_key_sequence = Some(seq_number);
+            }
             return true;
+        }
+        if !newer {
+            return false;
         }
 
         self.clear_frame_counters_for_key(seq_number);
@@ -188,13 +236,58 @@ impl NwkSecurity {
         true
     }
 
-    /// Return the key waiting for a future Switch-Key command.
+    /// Return the key waiting for Switch-Key or authenticated newer-key traffic.
     pub fn staged_key(&self) -> Option<&NetworkKeyEntry> {
         let sequence = self.staged_key_sequence?;
         self.key_by_seq(sequence)
     }
 
-    /// Activate an installed network key by sequence number.
+    /// Return the inactive network-key slot, whether it is a future staged
+    /// key or the previous key retained after a switch.
+    pub fn secondary_key(&self) -> Option<&NetworkKeyEntry> {
+        self.keys[1].as_ref()
+    }
+
+    /// Whether any currently installed NWK key uses `key_fingerprint`.
+    pub fn key_fingerprint_is_live(&self, key_fingerprint: u32) -> bool {
+        self.keys
+            .iter()
+            .flatten()
+            .any(|entry| zigbee_crypto::key_fingerprint(&entry.key) == key_fingerprint)
+    }
+
+    /// Whether `replay` still names the same installed NWK key.
+    pub fn replay_counter_key_is_live(&self, replay: &NwkReplayCounter) -> bool {
+        self.key_by_seq(replay.key_sequence).is_some_and(|entry| {
+            zigbee_crypto::key_fingerprint(&entry.key) == replay.key_fingerprint
+        })
+    }
+
+    /// Restore the previous inactive network key without making it a future
+    /// Switch-Key target.
+    pub fn restore_previous_network_key(&mut self, key: AesKey, seq_number: u8) -> bool {
+        let Some(active) = self.keys[0].as_ref() else {
+            return false;
+        };
+        if active.seq_number == seq_number {
+            return active.key == key;
+        }
+        self.clear_frame_counters_for_key(seq_number);
+        self.keys[1] = Some(NetworkKeyEntry {
+            key,
+            seq_number,
+            active: false,
+        });
+        self.staged_key_sequence = None;
+        self.retain_frame_counters_for_installed_keys();
+        true
+    }
+
+    /// Activate only a staged, strictly newer network key by sequence number.
+    ///
+    /// Repeating the active sequence is an idempotent success. A retained
+    /// previous key is never a Switch-Key target, including after a duplicate
+    /// Transport-Key delivery; sequence recency includes 255 -> 0 wrap.
     pub fn activate_network_key(&mut self, seq_number: u8) -> bool {
         if self.keys[0]
             .as_ref()
@@ -208,6 +301,13 @@ impl NwkSecurity {
             }
             return true;
         }
+        if self.staged_key_sequence != Some(seq_number)
+            || !self
+                .active_key()
+                .is_some_and(|active| Self::key_sequence_is_newer(seq_number, active.seq_number))
+        {
+            return false;
+        }
         if self.keys[1]
             .as_ref()
             .is_some_and(|entry| entry.seq_number == seq_number)
@@ -219,12 +319,41 @@ impl NwkSecurity {
             if let Some(previous) = self.keys[1].as_mut() {
                 previous.active = false;
             }
-            if self.staged_key_sequence == Some(seq_number) {
-                self.staged_key_sequence = None;
-            }
+            self.staged_key_sequence = None;
             return true;
         }
         false
+    }
+
+    /// Activate only a staged, strictly newer key after receive admission,
+    /// replay checking and MIC verification. A retained previous key is not
+    /// an activation candidate, even if its sequence is numerically larger.
+    pub(crate) fn activate_received_key(&mut self, seq_number: u8) -> bool {
+        // Unlike an explicit Switch-Key, observing the already-active key
+        // must not report a new activation or acquire a fresh transmit fence.
+        self.staged_key_sequence == Some(seq_number) && self.activate_network_key(seq_number)
+    }
+
+    /// Strict serial-number recency: 255 -> 0 advances; the ambiguous
+    /// half-window is deliberately not eligible for activation.
+    const fn key_sequence_is_newer(candidate: u8, active: u8) -> bool {
+        let delta = candidate.wrapping_sub(active);
+        delta != 0 && delta < 0x80
+    }
+
+    /// Retire the previous key retained after a successful Switch-Key.
+    ///
+    /// A future staged key is never removed by this operation. The caller
+    /// must durably record the retirement intent before calling this method,
+    /// tombstone the retired key's replay domains, and only then checkpoint
+    /// the now-single-key state.
+    pub fn retire_previous_network_key(&mut self) -> Option<NetworkKeyEntry> {
+        if self.staged_key_sequence.is_some() {
+            return None;
+        }
+        let retired = self.keys[1].take()?;
+        self.retain_frame_counters_for_installed_keys();
+        Some(retired)
     }
 
     /// Get the active network key.
@@ -307,7 +436,9 @@ impl NwkSecurity {
             .iter_mut()
             .find(|e| e.source == *source && e.key_sequence == key_sequence)
         {
-            entry.counter = counter;
+            if counter > entry.counter {
+                entry.counter = counter;
+            }
         } else {
             // New source — add to table (already checked not full in check_frame_counter)
             let _ = self.frame_counter_table.push(FrameCounterEntry {
@@ -316,6 +447,19 @@ impl NwkSecurity {
                 counter,
             });
         }
+    }
+
+    /// Restore a durable replay floor only when the installed key still
+    /// matches the key identity that produced it.
+    pub fn restore_replay_counter(&mut self, replay: NwkReplayCounter) -> bool {
+        let Some(key) = self.key_by_seq(replay.key_sequence) else {
+            return false;
+        };
+        if zigbee_crypto::key_fingerprint(&key.key) != replay.key_fingerprint {
+            return false;
+        }
+        self.commit_frame_counter_for_key(&replay.source, replay.key_sequence, replay.counter);
+        true
     }
 
     /// Encrypt a NWK frame payload using AES-128-CCM*.
@@ -583,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_network_key_does_not_activate_until_switch_key() {
+    fn staging_network_key_alone_does_not_activate_it() {
         let mut security = NwkSecurity::new();
         security.set_network_key([0x11; 16], 1);
         assert!(security.stage_network_key([0x22; 16], 2));
@@ -599,6 +743,62 @@ mod tests {
         assert_eq!(security.key_by_seq(1).unwrap().key, [0x11; 16]);
         assert!(!security.key_by_seq(1).unwrap().active);
         assert!(!security.activate_network_key(3));
+    }
+
+    #[test]
+    fn receive_activation_requires_staged_marker_and_strict_serial_recency() {
+        for (active, candidate, newer) in [
+            (3, 4, true),
+            (255, 0, true),
+            (0, 255, false),
+            (4, 3, false),
+            (3, 3, false),
+            (0, 127, true),
+            (0, 128, false),
+            (128, 0, false),
+        ] {
+            let mut security = NwkSecurity::new();
+            security.set_network_key([0x11; 16], active);
+            // A retained slot is never an implicit-switch candidate, even if
+            // the sequence by itself would compare newer.
+            assert!(security.restore_previous_network_key([0x11; 16], candidate));
+            assert!(!security.activate_received_key(candidate));
+            assert_eq!(
+                security.activate_network_key(candidate),
+                candidate == active
+            );
+            assert_eq!(security.active_key().unwrap().seq_number, active);
+
+            if candidate != active {
+                assert!(security.stage_network_key([0x11; 16], candidate));
+            }
+            assert_eq!(security.activate_received_key(candidate), newer);
+            assert_eq!(
+                security.active_key().unwrap().seq_number,
+                if newer { candidate } else { active },
+            );
+        }
+    }
+
+    #[test]
+    fn stale_transport_key_does_not_displace_a_staged_key_or_reset_replay() {
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 255);
+        assert!(security.stage_network_key([0x22; 16], 0));
+        assert!(security.activate_received_key(0));
+        security.commit_frame_counter_for_key(&[0x44; 8], 255, 100);
+
+        assert!(security.stage_network_key([0x11; 16], 255));
+        assert!(security.staged_key().is_none());
+        assert!(!security.activate_received_key(255));
+        assert!(!security.activate_network_key(255));
+        assert!(!security.check_frame_counter_for_key(&[0x44; 8], 255, 100));
+        assert!(!security.stage_network_key([0x33; 16], 255));
+
+        assert!(security.stage_network_key([0x33; 16], 1));
+        assert!(!security.stage_network_key([0x11; 16], 255));
+        assert_eq!(security.staged_key().unwrap().seq_number, 1);
+        assert_eq!(security.active_key().unwrap().seq_number, 0);
     }
 
     #[test]

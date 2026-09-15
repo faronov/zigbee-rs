@@ -1,52 +1,83 @@
-//! # Zigbee-RS nRF52840 Sensor — UF2 bootloader variant
+//! nRF52840 sleepy environmental sensor for proven UF2 deployments.
 //!
-//! Supports multiple boards via cargo features:
-//!
-//! | Feature            | Board                          | LED          | Flash   |
-//! |--------------------|--------------------------------|--------------|---------|
-//! | `board-promicro`   | ProMicro nRF52840 / nice!nano  | P0.15 HIGH   | 0x26000 |
-//! | `board-mdk`        | Makerdiary MDK USB Dongle      | P0.22 LOW    | 0x1000  |
-//! | `board-nrf-dongle` | Nordic PCA10059 Dongle         | P0.06 LOW    | 0x1000  |
-//! | `board-nrf-dk`     | Nordic nRF52840 DK (PCA10056)  | P0.13 LOW    | 0x0000  |
-//!
-//! ## Build & flash
-//! ```sh
-//! # ProMicro (default):
-//! cargo build --release
-//! uf2conv.py -c -f 0xADA52840 -b 0x26000 firmware.bin -o fw.uf2
-//!
-//! # MDK dongle:
-//! cargo build --release --no-default-features --features board-mdk
-//! uf2conv.py -c -f 0xADA52840 -b 0x1000 firmware.bin -o fw.uf2
-//!
-//! # Nordic dongle:
-//! cargo build --release --no-default-features --features board-nrf-dongle
-//! uf2conv.py -c -f 0xADA52840 -b 0x1000 firmware.bin -o fw.uf2
-//! ```
-//!
-//! ## Operation
-//! - **Auto-join**: starts commissioning automatically on boot
-//! - LED ON = joined, LED blinks = joining, LED OFF = idle
+//! This file is a composition root only. The shared `sensor-sed` application
+//! owns commissioning, manual parent polling, reporting, durable reset, and
+//! rejoin lifecycle. Product code owns the `DeviceProfile`, policy, deployment
+//! map, and security journal. Board crates own fitted pins and polarity.
 
 #![no_std]
 #![no_main]
 
+#[cfg(not(any(
+    feature = "board-promicro",
+    feature = "board-mdk",
+    feature = "board-nrf-dongle",
+    feature = "board-nrf-dk"
+)))]
+compile_error!("select exactly one nRF52840 UF2 board feature");
+
+#[cfg(any(
+    all(feature = "board-promicro", feature = "board-mdk"),
+    all(feature = "board-promicro", feature = "board-nrf-dongle"),
+    all(feature = "board-promicro", feature = "board-nrf-dk"),
+    all(feature = "board-mdk", feature = "board-nrf-dongle"),
+    all(feature = "board-mdk", feature = "board-nrf-dk"),
+    all(feature = "board-nrf-dongle", feature = "board-nrf-dk")
+))]
+compile_error!("select exactly one nRF52840 UF2 board feature");
+
+#[cfg(feature = "board-promicro")]
+const _: () = core::assert!(!nrf52840_promicro::HAS_USER_BUTTON);
+#[cfg(feature = "board-mdk")]
+const _: () = core::assert!(!nrf52840_mdk_usb_dongle::HAS_USER_BUTTON);
+#[cfg(feature = "board-nrf-dongle")]
+const _: () =
+    core::assert!(nrf52840_pca10059::HAS_USER_BUTTON && nrf52840_pca10059::BUTTON_ACTIVE_LOW);
+#[cfg(feature = "board-nrf-dk")]
+const _: () = core::assert!(nrf52840_dk::BUTTON_ACTIVE_LOW);
+
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
 use embassy_nrf::saadc::{self, ChannelConfig, Saadc, VddInput};
 use embassy_nrf::temp::Temp;
-use embassy_nrf::{self as _, bind_interrupts, gpio, peripherals, radio, rng};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_nrf::{self as _, bind_interrupts, peripherals, radio, rng};
 
 use defmt::*;
 use {defmt_rtt as _, panic_probe as _};
 
-// Bridge `log` crate → defmt so stack-internal log::info!/debug!/warn!/error! appear in RTT output.
+#[cfg(any(feature = "board-promicro", feature = "board-mdk"))]
+use nrf_sensor_app::NrfTimerWakeController;
+#[cfg(any(feature = "board-nrf-dongle", feature = "board-nrf-dk"))]
+use nrf_sensor_app::NrfWakeController;
+use nrf_sensor_app::{
+    BatteryPolicy, NrfBattery, NrfDiagnostics, NrfPolarityStatus, NrfSupervisor, OnChipTemperature,
+};
+#[cfg(any(feature = "board-promicro", feature = "board-mdk"))]
+use sensor_sed_app::NoUserAction;
+use sensor_sed_app::{NoOta, SensorApp, SensorSedParts};
+use zigbee_runtime::node::ZigbeeNode;
+use zigbee_runtime::profile::{ApplicationProfile, BatteryMeasurement};
+use zigbee_runtime::ZigbeeDevice;
+use zigbee_zcl::clusters::basic::PowerSource;
+
+struct Battery;
+
+impl BatteryPolicy for Battery {
+    fn millivolts(raw_sample: i16) -> u32 {
+        nrf52840_sensor_product::battery::millivolts(raw_sample)
+    }
+
+    fn measurement(raw_sample: i16) -> BatteryMeasurement {
+        nrf52840_sensor_product::battery::battery_measurement(raw_sample)
+    }
+}
+
 struct DefmtLogger;
+
 impl log::Log for DefmtLogger {
     fn enabled(&self, _metadata: &log::Metadata) -> bool {
         true
     }
+
     fn log(&self, record: &log::Record) {
         match record.level() {
             log::Level::Error => defmt::error!("{}", defmt::Display2Format(record.args())),
@@ -56,25 +87,12 @@ impl log::Log for DefmtLogger {
             log::Level::Trace => defmt::trace!("{}", defmt::Display2Format(record.args())),
         }
     }
+
     fn flush(&self) {}
 }
+
 static LOGGER: DefmtLogger = DefmtLogger;
 
-use zigbee_aps::PROFILE_HOME_AUTOMATION;
-use zigbee_runtime::event_loop::{StackEvent, TickResult};
-use zigbee_runtime::power::PowerMode;
-use zigbee_runtime::profile::TemperatureHumidityBattery;
-use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
-use zigbee_zcl::clusters::basic::PowerSource;
-use zigbee_zcl::clusters::humidity::HumidityCluster;
-use zigbee_zcl::clusters::power_config::PowerConfigCluster;
-use zigbee_zcl::clusters::temperature::TemperatureCluster;
-use zigbee_zcl::{ClusterId, DeviceId};
-
-const REPORT_INTERVAL_SECS: u64 = 60;
-const FAST_POLL_MS: u64 = 250; // Fast poll during interview (250ms)
-const SLOW_POLL_SECS: u64 = 30; // Normal poll interval (10s)
-const FAST_POLL_DURATION_SECS: u64 = 120; // Max fast-poll window (safety timeout)
 bind_interrupts!(struct Irqs {
     RADIO => radio::InterruptHandler<peripherals::RADIO>;
     RNG => rng::InterruptHandler<peripherals::RNG>;
@@ -82,113 +100,45 @@ bind_interrupts!(struct Irqs {
     SAADC => saadc::InterruptHandler;
 });
 
-/// Disable SoftDevice S140 via SVC call (ProMicro / nice!nano only).
-/// The UF2 bootloader leaves SoftDevice installed; we must disable it
-/// to reclaim RTC1, TIMER0, and RADIO for our Zigbee stack.
-#[cfg(feature = "board-promicro")]
-unsafe fn disable_softdevice() {
-    let result: u32;
-    // sd_softdevice_disable() = SVC #17 (0x11)
-    core::arch::asm!(
-        "svc 17",
-        lateout("r0") result,
-        options(nomem, nostack, preserves_flags)
-    );
-    if result == 0 {
-        info!("SoftDevice disabled OK");
-    } else {
-        info!("SoftDevice disable returned {}", result);
-    }
-}
-
-/// Create the on-board status LED output.
-/// - ProMicro: P0.15 red, active HIGH → start LOW (off)
-/// - MDK dongle: P0.22 green, active LOW → start HIGH (off)
-/// - Nordic PCA10059: P0.06 green, active LOW → start HIGH (off)
-/// - Nordic DK: P0.13 (LED1), active LOW → start HIGH (off)
-fn create_led(p: &mut embassy_nrf::Peripherals) -> gpio::Output<'static> {
-    #[cfg(feature = "board-promicro")]
-    {
-        gpio::Output::new(
-            unsafe { core::ptr::read(&p.P0_15 as *const _) },
-            gpio::Level::Low,
-            gpio::OutputDrive::Standard,
-        )
-    }
-    #[cfg(feature = "board-mdk")]
-    {
-        gpio::Output::new(
-            unsafe { core::ptr::read(&p.P0_22 as *const _) },
-            gpio::Level::High, // active LOW — HIGH = off
-            gpio::OutputDrive::Standard,
-        )
-    }
-    #[cfg(feature = "board-nrf-dongle")]
-    {
-        gpio::Output::new(
-            unsafe { core::ptr::read(&p.P0_06 as *const _) },
-            gpio::Level::High, // active LOW — HIGH = off
-            gpio::OutputDrive::Standard,
-        )
-    }
-    #[cfg(feature = "board-nrf-dk")]
-    {
-        gpio::Output::new(
-            unsafe { core::ptr::read(&p.P0_13 as *const _) },
-            gpio::Level::High, // active LOW — HIGH = off
-            gpio::OutputDrive::Standard,
-        )
-    }
-}
-
-/// LED ON (board-agnostic)
-fn led_on(led: &mut gpio::Output<'_>) {
-    #[cfg(feature = "board-promicro")]
-    led.set_high(); // active HIGH
-    #[cfg(any(
-        feature = "board-mdk",
-        feature = "board-nrf-dongle",
-        feature = "board-nrf-dk"
-    ))]
-    led.set_low(); // active LOW
-}
-
-/// LED OFF (board-agnostic)
-fn led_off(led: &mut gpio::Output<'_>) {
-    #[cfg(feature = "board-promicro")]
-    led.set_low();
-    #[cfg(any(
-        feature = "board-mdk",
-        feature = "board-nrf-dongle",
-        feature = "board-nrf-dk"
-    ))]
-    led.set_high();
-}
-
-/// Create button input (DK only — Button1 P0.11, active LOW with pull-up).
-/// Other boards: returns None.
-#[cfg(feature = "board-nrf-dk")]
-fn create_button(p: &mut embassy_nrf::Peripherals) -> Option<gpio::Input<'static>> {
-    Some(gpio::Input::new(
-        unsafe { core::ptr::read(&p.P0_11 as *const _) },
-        gpio::Pull::Up,
-    ))
-}
-
-#[cfg(not(feature = "board-nrf-dk"))]
-fn create_button(_p: &mut embassy_nrf::Peripherals) -> Option<gpio::Input<'static>> {
-    None
-}
+// POWER state survives reset. Restore every RAM bank before cortex-m-rt
+// initializes memory, including when replacing firmware that powered banks
+// down. Pure assembly avoids touching a potentially unpowered stack.
+core::arch::global_asm!(
+    ".section .text.__pre_init",
+    ".global __pre_init",
+    ".thumb_func",
+    "__pre_init:",
+    "ldr r0, =0x40000904",
+    "mvn r1, #0",
+    "str r1, [r0, #0x00]",
+    "str r1, [r0, #0x10]",
+    "str r1, [r0, #0x20]",
+    "str r1, [r0, #0x30]",
+    "str r1, [r0, #0x40]",
+    "str r1, [r0, #0x50]",
+    "str r1, [r0, #0x60]",
+    "str r1, [r0, #0x70]",
+    "str r1, [r0, #0x80]",
+    "bx lr",
+);
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    // ProMicro: must disable SoftDevice before embassy init (SD owns RTC1)
     #[cfg(feature = "board-promicro")]
-    unsafe {
-        disable_softdevice()
-    };
+    let softdevice_disable_status = unsafe { nrf52840_promicro::disable_softdevice() };
+    #[cfg(feature = "board-promicro")]
+    if softdevice_disable_status != 0 {
+        error!(
+            "S140 disable failed with 0x{:08X}; refusing direct peripheral ownership",
+            softdevice_disable_status
+        );
+        loop {
+            cortex_m::asm::wfi();
+        }
+    }
+    #[cfg(feature = "board-promicro")]
+    info!("S140 disabled before Nordic peripheral initialization");
 
-    // Start HFCLK from external crystal via embassy config — REQUIRED for 802.15.4 radio.
     let mut config = embassy_nrf::config::Config::default();
     config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
     config.dcdc = embassy_nrf::config::DcdcConfig {
@@ -196,31 +146,52 @@ async fn main(_spawner: Spawner) {
         reg0_voltage: None,
         reg1: true,
     };
-    let mut p = embassy_nrf::init(config);
+    let p = embassy_nrf::init(config);
 
-    // Initialize log→defmt bridge so stack crate log::info!/debug! appear in RTT
-    log::set_logger(&LOGGER).ok();
+    let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Info);
 
-    info!("Zigbee-RS nRF52840 sensor starting…");
+    info!(
+        "nRF52840 UF2 sensor: {}",
+        nrf52840_sensor_product::deployment::SELECTED.name
+    );
 
-    let mut led = create_led(&mut p);
-    let mut button = create_button(&mut p);
+    #[cfg(feature = "board-promicro")]
+    let status = NrfPolarityStatus::<{ nrf52840_promicro::STATUS_LED_ACTIVE_LOW }>::new(
+        nrf52840_promicro::status_led(p.P0_15),
+    );
+    #[cfg(feature = "board-mdk")]
+    let status = NrfPolarityStatus::<{ nrf52840_mdk_usb_dongle::STATUS_LED_ACTIVE_LOW }>::new(
+        nrf52840_mdk_usb_dongle::status_led(p.P0_22),
+    );
+    #[cfg(feature = "board-nrf-dongle")]
+    let status = NrfPolarityStatus::<{ nrf52840_pca10059::STATUS_LED_ACTIVE_LOW }>::new(
+        nrf52840_pca10059::status_led(p.P0_06),
+    );
+    #[cfg(feature = "board-nrf-dk")]
+    let status =
+        NrfPolarityStatus::<{ nrf52840_dk::LED_ACTIVE_LOW }>::new(nrf52840_dk::status_led(p.P0_13));
 
-    // On-chip temperature sensor
-    let mut temp_sensor = Temp::new(p.TEMP, Irqs);
+    #[cfg(any(feature = "board-promicro", feature = "board-mdk"))]
+    let wake = NrfTimerWakeController;
+    #[cfg(feature = "board-nrf-dongle")]
+    let wake = NrfWakeController::new(nrf52840_pca10059::button(p.P1_06));
+    #[cfg(feature = "board-nrf-dk")]
+    let wake = NrfWakeController::new(nrf52840_dk::button(p.P0_11));
 
-    // SAADC for battery voltage (VDD via internal divider)
-    let saadc_config = saadc::Config::default();
-    let channel_config = ChannelConfig::single_ended(VddInput);
-    let mut saadc_inst = Saadc::new(p.SAADC, Irqs, saadc_config, [channel_config]);
-    saadc_inst.calibrate().await;
+    #[cfg(any(feature = "board-promicro", feature = "board-mdk"))]
+    let actions = NoUserAction;
+    #[cfg(any(feature = "board-nrf-dongle", feature = "board-nrf-dk"))]
+    let actions = nrf52840_sensor_product::policy::USER_ACTIONS;
 
-    // Boot signal: LED solid ON 3 seconds
-    led_on(&mut led);
-    Timer::after(Duration::from_secs(3)).await;
-    led_off(&mut led);
-    Timer::after(Duration::from_millis(500)).await;
+    let environment = OnChipTemperature::new(Temp::new(p.TEMP, Irqs));
+    let battery = Saadc::new(
+        p.SAADC,
+        Irqs,
+        saadc::Config::default(),
+        [ChannelConfig::single_ended(VddInput)],
+    );
+    battery.calibrate().await;
 
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
     let rng = rng::Rng::new(p.RNG, Irqs);
@@ -231,518 +202,61 @@ async fn main(_spawner: Spawner) {
             cortex_m::asm::wfi();
         }
     };
-    if mac.install_aes_engine(aes).is_err() {
-        error!("Nordic ECB AES startup KAT failed; networking halted");
+    if let Err(error) = mac.install_aes_engine(aes) {
+        error!(
+            "Nordic ECB dual-KAT failed; networking halted: {:?}",
+            defmt::Debug2Format(&error)
+        );
         loop {
             cortex_m::asm::wfi();
         }
     }
-    info!("Nordic ECB hardware AES KAT passed");
+    let ieee = mac.extended_address();
+    info!("Nordic ECB hardware AES dual-KAT passed");
     mac.set_tx_power(0);
 
-    info!("Radio ready");
-
-    let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
-    let mut hum_cluster = HumidityCluster::new(0, 10000);
-    let mut power_cluster = PowerConfigCluster::new();
-    power_cluster.set_battery_size(4); // AAA
-    power_cluster.set_battery_quantity(2); // 2× AAA
-    power_cluster.set_battery_rated_voltage(15); // 1.5V per cell
-    let mut hum_tick: u32 = 0;
-
+    let mut profile = nrf52840_sensor_product::profile::sensor_profile();
     let mut device = ZigbeeDevice::builder(mac)
-        .power_mode(PowerMode::Sleepy {
-            poll_interval_ms: 10_000,
-            wake_duration_ms: 500,
-        })
-        .manufacturer("Zigbee-RS")
-        .model("nRF52840-UF2-Sensor")
-        .date_code("20260401")
-        .sw_build("0.1.0")
+        .power_mode(nrf52840_sensor_product::policy::SENSOR_POLICY.power_mode())
+        .automatic_polling(false)
+        .manufacturer(nrf52840_sensor_product::MANUFACTURER)
+        .model(nrf52840_sensor_product::deployment::UF2_MODEL)
+        .date_code(nrf52840_sensor_product::DATE_CODE)
+        .sw_build(nrf52840_sensor_product::SW_BUILD)
         .power_source(PowerSource::Battery)
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
         .endpoint(
-            1,
-            PROFILE_HOME_AUTOMATION,
-            DeviceId::TEMPERATURE_SENSOR,
-            |ep| {
-                ep.cluster_server(ClusterId::BASIC)
-                    .cluster_server(ClusterId::IDENTIFY)
-                    .cluster_server(ClusterId::POWER_CONFIG)
-                    .cluster_server(ClusterId::TEMPERATURE)
-                    .cluster_server(ClusterId::HUMIDITY)
-            },
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
         )
         .build();
 
-    // ── Boot signal: LED solid ON 1 second (all boards) ──
-    led_on(&mut led);
-    Timer::after(Duration::from_secs(1)).await;
-    led_off(&mut led);
+    let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
+    let mut security_store = nrf52840_sensor_product::uf2_storage::security_store(nvmc);
+    match device.reset_security_state_if_identity_changed(&mut security_store, ieee) {
+        Ok(true) => warn!("Cleared persisted network state after FICR EUI-64 change"),
+        Ok(false) => {}
+        Err(error) => nrf_sensor_app::persistence_failure(error),
+    }
 
-    // ── Join strategy: auto-join on all boards ──
-    info!("Auto-joining network…");
-    device.user_action(UserAction::Join);
-    let mut clusters = [
-        ClusterRef {
-            endpoint: 1,
-            cluster: &mut temp_cluster,
+    let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
+    let mut app = SensorApp::new(
+        node,
+        &nrf52840_sensor_product::policy::SENSOR_POLICY,
+        SensorSedParts {
+            wake,
+            status,
+            environment,
+            battery: NrfBattery::<Battery>::new(battery),
+            ota: NoOta,
+            actions,
+            supervisor: NrfSupervisor,
+            diagnostics: NrfDiagnostics,
         },
-        ClusterRef {
-            endpoint: 1,
-            cluster: &mut hum_cluster,
-        },
-        ClusterRef {
-            endpoint: 1,
-            cluster: &mut power_cluster,
-        },
-    ];
-    if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-        let reporting_complete = device
-            .remote_reporting_covers(1, &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS);
-        if log_event(e, &mut led, reporting_complete) {
-            // Join happened during init tick
-        }
-    }
+    )
+    .expect("UF2 sensor composition must have one manual poll owner");
 
-    // ── Read sensors once so clusters have real values for ZHA interview ──
-    {
-        let raw_temp = temp_sensor.read().await;
-        let temp_hundredths = (raw_temp.to_bits() * 100 / 4) as i16;
-        temp_cluster.set_temperature(temp_hundredths);
-        hum_cluster.set_humidity(5000u16);
-        info!(
-            "Initial: T={}.{:02}°C (on-chip)",
-            temp_hundredths / 100,
-            (temp_hundredths % 100).unsigned_abs(),
-        );
-
-        // Battery voltage via SAADC (VDD, 12-bit, internal ref 0.6V, gain 1/6 → 3.6V range)
-        let mut buf = [0i16; 1];
-        saadc_inst.sample(&mut buf).await;
-        let raw = buf[0].max(0) as u32;
-        let voltage_mv = raw * 3600 / 4096;
-        let pct = if voltage_mv >= 3000 {
-            100u8
-        } else if voltage_mv <= 1800 {
-            0
-        } else {
-            ((voltage_mv - 1800) * 100 / 1200) as u8
-        };
-        power_cluster.set_battery_voltage((voltage_mv / 100) as u8);
-        power_cluster.set_battery_percentage(pct * 2); // ZCL: 0.5% units
-        info!("Battery: {}mV ({}%)", voltage_mv, pct);
-    }
-
-    // ── Main loop ──
-    // SED architecture: sleep → poll parent → process indirect frames → periodic tasks.
-    // ALL frames reach a Sleepy End Device through the parent's indirect queue,
-    // so we poll() instead of receive(). This avoids the rapid Timer
-    // creation/teardown that caused RefCell panics in embassy's timer driver.
-    let mut last_report = Instant::now();
-    // If already joined (from BDB steering above), start fast-poll immediately
-    // so ZHA's ZCL attribute reads during interview don't time out.
-    let mut fast_poll_until = if device.is_joined() {
-        info!("Fast poll ON ({}s) — post-join", FAST_POLL_DURATION_SECS);
-        Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS)
-    } else {
-        Instant::now() // expires immediately
-    };
-    let mut last_rejoin_attempt = Instant::now();
-    let mut rejoin_count: u8 = 0;
-    // Device_annce retry: re-send a few times after join so coordinator discovers us
-    let mut annce_retries_left: u8 = if device.is_joined() { 5 } else { 0 };
-    let mut last_annce = Instant::now();
-
-    let mut was_fast_polling = device.is_joined();
-    let mut interview_done = false;
-
-    loop {
-        let now = Instant::now();
-        let in_fast_poll = now < fast_poll_until;
-        let poll_ms = if in_fast_poll {
-            FAST_POLL_MS
-        } else {
-            SLOW_POLL_SECS * 1000
-        };
-
-        // Log transition from fast→slow poll
-        if was_fast_polling && !in_fast_poll {
-            let cfg = device.remote_reporting_coverage(
-                1,
-                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
-            );
-            info!(
-                "Fast poll OFF — {}/{} clusters configured by remote client",
-                cfg,
-                TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS.len()
-            );
-            was_fast_polling = false;
-            // Always turn LED off when fast-poll expires (power save fallback)
-            if !interview_done {
-                info!("LED OFF (fast-poll expired, interview incomplete)");
-                led_off(&mut led);
-            }
-        } else if in_fast_poll {
-            was_fast_polling = true;
-        }
-
-        // ── Step 1: Sleep until next poll ──
-        if device.is_joined() && device.mac_mut().enter_low_power_idle().is_err() {
-            warn!("Failed to disable RADIO before poll sleep");
-        }
-        if let Some(ref mut btn) = button {
-            match select(
-                btn.wait_for_falling_edge(),
-                Timer::after(Duration::from_millis(poll_ms)),
-            )
-            .await
-            {
-                Either::First(_) => {
-                    // Button pressed — check for long press
-                    let held_long = match select(
-                        btn.wait_for_rising_edge(),
-                        Timer::after(Duration::from_secs(3)),
-                    )
-                    .await
-                    {
-                        Either::Second(_) => true,
-                        Either::First(_) => false,
-                    };
-
-                    if held_long {
-                        info!("FACTORY RESET");
-                        for _ in 0..5u8 {
-                            led_on(&mut led);
-                            Timer::after(Duration::from_millis(100)).await;
-                            led_off(&mut led);
-                            Timer::after(Duration::from_millis(100)).await;
-                        }
-                        cortex_m::peripheral::SCB::sys_reset();
-                    } else {
-                        info!(
-                            "Button → {}",
-                            if device.is_joined() { "leave" } else { "join" }
-                        );
-                        let was_joined = device.is_joined();
-                        device.user_action(UserAction::Toggle);
-                        let _ = device
-                            .tick(
-                                0,
-                                &mut [
-                                    ClusterRef {
-                                        endpoint: 1,
-                                        cluster: &mut temp_cluster,
-                                    },
-                                    ClusterRef {
-                                        endpoint: 1,
-                                        cluster: &mut hum_cluster,
-                                    },
-                                    ClusterRef {
-                                        endpoint: 1,
-                                        cluster: &mut power_cluster,
-                                    },
-                                ],
-                            )
-                            .await;
-                        if !was_joined && device.is_joined() {
-                            interview_done = false;
-                            device.reset_remote_reporting();
-                            fast_poll_until =
-                                Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                        }
-                    }
-                }
-                Either::Second(_) => {} // Normal timeout — proceed to poll
-            }
-        } else {
-            // No button — just sleep
-            Timer::after(Duration::from_millis(poll_ms)).await;
-        }
-        // ── Step 2: Poll parent for indirect frames (SED core) ──
-        if device.is_joined() {
-            for _poll_round in 0..4u8 {
-                match device.poll().await {
-                    Ok(Some(ind)) => {
-                        let mut cls = [
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut temp_cluster,
-                            },
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut hum_cluster,
-                            },
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut power_cluster,
-                            },
-                        ];
-                        if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
-                            if matches!(&ev, StackEvent::RejoinRequested) {
-                                info!("Secure rejoin requested");
-                                if device.secure_rejoin().await.is_ok() {
-                                    fast_poll_until = Instant::now()
-                                        + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                    interview_done = false;
-                                    // New lifecycle — the coordinator re-runs
-                                    // its interview from scratch.
-                                    device.reset_remote_reporting();
-                                } else {
-                                    warn!("Secure rejoin failed");
-                                }
-                                break;
-                            }
-                            let reporting_complete = device.remote_reporting_covers(
-                                1,
-                                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
-                            );
-                            if log_event(&ev, &mut led, reporting_complete) {
-                                fast_poll_until =
-                                    Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                                info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
-                            }
-                        }
-                        // Check if a remote client completed Configure
-                        // Reporting for all expected clusters. Local default
-                        // reporting is deliberately not interview progress.
-                        if !interview_done {
-                            let cfg_count = device.remote_reporting_coverage(
-                                1,
-                                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
-                            );
-                            if device.remote_reporting_covers(
-                                1,
-                                &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
-                            ) {
-                                info!(
-                                    "Interview done! {}/{} clusters configured remotely — ending fast poll",
-                                    cfg_count,
-                                    TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS.len()
-                                );
-                                // Give 5s grace for any remaining ZHA requests
-                                fast_poll_until = Instant::now() + Duration::from_secs(5);
-                                interview_done = true;
-                                // Turn off LED to save power (device is fully configured)
-                                led_off(&mut led);
-                            }
-                        }
-                        // Immediately tick to send any queued ZCL responses
-                        let _ = device
-                            .tick(
-                                0,
-                                &mut [
-                                    ClusterRef {
-                                        endpoint: 1,
-                                        cluster: &mut temp_cluster,
-                                    },
-                                    ClusterRef {
-                                        endpoint: 1,
-                                        cluster: &mut hum_cluster,
-                                    },
-                                    ClusterRef {
-                                        endpoint: 1,
-                                        cluster: &mut power_cluster,
-                                    },
-                                ],
-                            )
-                            .await;
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
-            }
-
-            // ── Step 3: Periodic tasks ──
-            let now2 = Instant::now();
-            let elapsed_s = now2.duration_since(last_report).as_secs();
-
-            // Read sensors when report interval elapsed
-            if elapsed_s >= REPORT_INTERVAL_SECS {
-                last_report = now2;
-
-                // On-chip temp + fake humidity
-                let raw_temp = temp_sensor.read().await;
-                let temp_hundredths = (raw_temp.to_bits() * 100 / 4) as i16;
-                hum_tick = hum_tick.wrapping_add(1);
-                let hum_hundredths = 5000u16 + ((hum_tick % 100) as u16).wrapping_mul(10);
-                temp_cluster.set_temperature(temp_hundredths);
-                hum_cluster.set_humidity(hum_hundredths);
-                info!(
-                    "T={}.{:02}°C H={}.{:02}% (on-chip)",
-                    temp_hundredths / 100,
-                    (temp_hundredths % 100).unsigned_abs(),
-                    hum_hundredths / 100,
-                    hum_hundredths % 100,
-                );
-
-                // Battery voltage via SAADC
-                let mut buf = [0i16; 1];
-                saadc_inst.sample(&mut buf).await;
-                let raw = buf[0].max(0) as u32;
-                let voltage_mv = raw * 3600 / 4096;
-                let pct = if voltage_mv >= 3000 {
-                    100u8
-                } else if voltage_mv <= 1800 {
-                    0
-                } else {
-                    ((voltage_mv - 1800) * 100 / 1200) as u8
-                };
-                power_cluster.set_battery_voltage((voltage_mv / 100) as u8);
-                power_cluster.set_battery_percentage(pct * 2);
-                info!("Battery: {}mV ({}%)", voltage_mv, pct);
-            }
-
-            // Tick the runtime (sends queued responses, reports, etc.)
-            let tick_elapsed = elapsed_s.min(60) as u16;
-            if let TickResult::Event(ref e) = device
-                .tick(
-                    tick_elapsed,
-                    &mut [
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut temp_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut hum_cluster,
-                        },
-                        ClusterRef {
-                            endpoint: 1,
-                            cluster: &mut power_cluster,
-                        },
-                    ],
-                )
-                .await
-            {
-                let reporting_complete = device.remote_reporting_covers(
-                    1,
-                    &TemperatureHumidityBattery::EXPECTED_REPORT_CLUSTER_IDS,
-                );
-                if log_event(e, &mut led, reporting_complete) {
-                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                    info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
-                }
-            }
-
-            // ── Step 4: Device_annce retry (coordinator may have missed first one) ──
-            if annce_retries_left > 0 && now2.duration_since(last_annce).as_secs() >= 8 {
-                annce_retries_left -= 1;
-                last_annce = now2;
-                info!("Re-sending Device_annce ({} left)", annce_retries_left);
-                match device.send_device_annce().await {
-                    Ok(()) => {}
-                    Err(_) => info!("Device_annce retry failed"),
-                }
-            }
-        } else {
-            // ── Not joined — blink and auto-retry ──
-            let now2 = Instant::now();
-            if now2.duration_since(last_rejoin_attempt).as_secs() >= 1 {
-                led_on(&mut led);
-                Timer::after(Duration::from_millis(80)).await;
-                led_off(&mut led);
-                Timer::after(Duration::from_millis(120)).await;
-                led_on(&mut led);
-                Timer::after(Duration::from_millis(80)).await;
-                led_off(&mut led);
-            }
-
-            if now2.duration_since(last_rejoin_attempt).as_secs() >= 15 {
-                rejoin_count = rejoin_count.wrapping_add(1);
-                last_rejoin_attempt = Instant::now();
-                info!("Not joined — retrying (attempt {})…", rejoin_count);
-                device.user_action(UserAction::Join);
-                let _ = device
-                    .tick(
-                        0,
-                        &mut [
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut temp_cluster,
-                            },
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut hum_cluster,
-                            },
-                            ClusterRef {
-                                endpoint: 1,
-                                cluster: &mut power_cluster,
-                            },
-                        ],
-                    )
-                    .await;
-                // If join succeeded during tick, activate fast-poll for interview
-                if device.is_joined() {
-                    info!("Joined! addr=0x{:04X}", device.short_address());
-                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                    info!("Fast poll ON ({}s) — post-rejoin", FAST_POLL_DURATION_SECS);
-                    annce_retries_left = 5;
-                    last_annce = Instant::now();
-                    interview_done = false;
-                    device.reset_remote_reporting();
-                    led_on(&mut led);
-                }
-            }
-        }
-    }
-}
-
-/// LED ON = joined, LED OFF = not joined.
-///
-/// Returns whether the caller should open the generic fast-poll window: joins
-/// always do, while Configure Reporting activity does so only until the exact
-/// profile-owned expected cluster set is complete. This preserves the
-/// completion path's 5-second grace and still gives an incomplete interview
-/// time to finish.
-fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>, reporting_complete: bool) -> bool {
-    match event {
-        StackEvent::Joined {
-            short_address,
-            channel,
-            pan_id,
-        } => {
-            led_on(led);
-            info!(
-                "Joined! addr=0x{:04X} ch={} pan=0x{:04X}",
-                short_address, channel, pan_id,
-            );
-            true
-        }
-        StackEvent::Left => {
-            led_off(led);
-            info!("Left network");
-            false
-        }
-        StackEvent::ReportSent => {
-            info!("Report sent");
-            false
-        }
-        StackEvent::ReportingConfigured { cluster_id, .. } => {
-            info!(
-                "Remote Configure Reporting accepted: cluster=0x{:04X}",
-                cluster_id
-            );
-            !reporting_complete
-        }
-        StackEvent::CommandReceived {
-            cluster_id,
-            command_id: 0x06,
-            ..
-        } => {
-            warn!(
-                "Remote Configure Reporting rejected: cluster=0x{:04X}",
-                cluster_id
-            );
-            !reporting_complete
-        }
-        StackEvent::CommissioningComplete { success } => {
-            info!("Commissioning: {}", if *success { "ok" } else { "failed" });
-            false
-        }
-        _ => {
-            info!("Stack event");
-            false
-        }
-    }
+    app.run().await
 }

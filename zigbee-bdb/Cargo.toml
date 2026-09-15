@@ -9,6 +9,7 @@ repository = "https://github.com/zigbee-rs/zigbee-rs"
 [dependencies]
 heapless = "0.9"
 zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
+zigbee-crypto = { version = "0.1.0", path = "../zigbee-crypto", optional = true }
 zigbee-mac  = { version = "0.1.0", path = "../zigbee-mac" }
 zigbee-nwk  = { version = "0.1.0", path = "../zigbee-nwk" }
 zigbee-aps  = { version = "0.1.0", path = "../zigbee-aps" }
@@ -17,9 +18,26 @@ zigbee-zdo  = { version = "0.1.0", path = "../zigbee-zdo" }
 log = "0.4"
 
 [features]
-default = ["float32", "float64"]
+default = [
+    "float32",
+    "float64",
+    "router",
+    "centralized-tclk",
+    "distributed-security",
+]
+centralized-tclk = []
+distributed-security = []
+end-device = ["centralized-tclk"]
+sleepy-end-device = ["end-device", "zigbee-aps/sleepy-end-device"]
+# Keep formation independently selectable for host tests without enabling
+# router behavior in an end-device production graph.
+formation = []
+finding-binding = ["finding-binding-target"]
+finding-binding-target = []
 float32 = ["zigbee-zcl/float32"]
 float64 = ["zigbee-zcl/float64"]
+router = ["centralized-tclk", "distributed-security", "formation"]
+trust-center = ["router", "dep:zigbee-crypto", "zigbee-aps/trust-center"]
 trace = ["zigbee-aps/trace", "zigbee-nwk/trace"]
 touchlink = []
 

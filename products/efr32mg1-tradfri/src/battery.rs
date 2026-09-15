@@ -1,6 +1,8 @@
 //! Battery chemistry policy layered over the board's supply monitor.
 
 use efr32mg1_tradfri::{SupplyError, SupplyMonitor, supply_monitor};
+use sensor_sed_app::{BatteryReading as AppBatteryReading, BatterySource};
+use zigbee_runtime::profile::BatteryMeasurement;
 
 /// Voltage-to-capacity curves supported by the TRADFRI 2xAAA carrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +68,43 @@ pub fn battery_monitor() -> Result<BatteryMonitor, SupplyError> {
     BatteryMonitor::new(DEFAULT_BATTERY_CURVE)
 }
 
+/// Product adapter from the fitted ADC supply monitor to `SensorApp`.
+///
+/// A missing monitor leaves the profile's Power Configuration values
+/// unknown. A later ADC failure is reported to diagnostics and deliberately
+/// leaves the last valid measurement in place.
+pub struct BatteryAdapter {
+    monitor: Option<BatteryMonitor>,
+}
+
+impl BatteryAdapter {
+    pub const fn new(monitor: Option<BatteryMonitor>) -> Self {
+        Self { monitor }
+    }
+
+    pub const fn is_fitted(&self) -> bool {
+        self.monitor.is_some()
+    }
+}
+
+impl BatterySource for BatteryAdapter {
+    type Error = SupplyError;
+
+    async fn sample(&mut self) -> Result<Option<AppBatteryReading>, Self::Error> {
+        let Some(monitor) = self.monitor.as_mut() else {
+            return Ok(None);
+        };
+        let reading = monitor.read()?;
+        Ok(Some(AppBatteryReading {
+            millivolts: u32::from(reading.millivolts),
+            measurement: BatteryMeasurement {
+                voltage_100mv: reading.voltage_100mv,
+                percentage_remaining: reading.percentage_remaining,
+            },
+        }))
+    }
+}
+
 /// Convert millivolts to ZCL BatteryVoltage without producing reserved 0xFF.
 pub const fn zcl_battery_voltage(millivolts: u16) -> u8 {
     let units = millivolts / 100;
@@ -107,7 +146,12 @@ pub const fn battery_percentage(curve: BatteryCurve, millivolts: u16) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatteryCurve, battery_percentage, zcl_battery_voltage};
+    use super::{BatteryAdapter, BatteryCurve, battery_percentage, zcl_battery_voltage};
+
+    #[test]
+    fn absent_adc_is_an_explicit_unfitted_source() {
+        assert!(!BatteryAdapter::new(None).is_fitted());
+    }
 
     #[test]
     fn zcl_voltage_uses_100mv_units_and_reserves_unknown() {

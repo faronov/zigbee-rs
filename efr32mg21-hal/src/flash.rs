@@ -4,8 +4,8 @@ use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
 };
 
-const FLASH_CAPACITY: usize = 512 * 1024;
-const PAGE_SIZE: usize = 8192;
+pub const FLASH_CAPACITY: usize = 512 * 1024;
+pub const FLASH_PAGE_SIZE: usize = 8192;
 const PROGRAM_TIMEOUT: u32 = 100_000;
 
 const MSC_BASE: u32 = 0x4003_0000;
@@ -47,11 +47,13 @@ impl NorFlashError for FlashError {
     }
 }
 
-pub struct Efr32mg21Flash;
+pub struct Efr32mg21Flash {
+    _private: (),
+}
 
 impl Efr32mg21Flash {
-    pub const fn new() -> Self {
-        Self
+    pub(crate) const fn new() -> Self {
+        Self { _private: () }
     }
 
     fn validate_range(offset: u32, length: usize) -> Result<(), FlashError> {
@@ -60,12 +62,6 @@ impl Efr32mg21Flash {
             .filter(|end| *end <= FLASH_CAPACITY)
             .map(|_| ())
             .ok_or(FlashError::OutOfBounds)
-    }
-}
-
-impl Default for Efr32mg21Flash {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -91,13 +87,15 @@ impl ReadNorFlash for Efr32mg21Flash {
 
 impl NorFlash for Efr32mg21Flash {
     const WRITE_SIZE: usize = 4;
-    const ERASE_SIZE: usize = PAGE_SIZE;
+    const ERASE_SIZE: usize = FLASH_PAGE_SIZE;
 
     fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
         if from >= to {
             return Err(FlashError::OutOfBounds);
         }
-        if from as usize % PAGE_SIZE != 0 || to as usize % PAGE_SIZE != 0 {
+        if !(from as usize).is_multiple_of(FLASH_PAGE_SIZE)
+            || !(to as usize).is_multiple_of(FLASH_PAGE_SIZE)
+        {
             return Err(FlashError::NotAligned);
         }
         Self::validate_range(from, (to - from) as usize)?;
@@ -105,13 +103,15 @@ impl NorFlash for Efr32mg21Flash {
         let mut page = from;
         while page < to {
             erase_page_ram(page)?;
-            page += PAGE_SIZE as u32;
+            page += FLASH_PAGE_SIZE as u32;
         }
         Ok(())
     }
 
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
-        if offset as usize % Self::WRITE_SIZE != 0 || bytes.len() % Self::WRITE_SIZE != 0 {
+        if !(offset as usize).is_multiple_of(Self::WRITE_SIZE)
+            || !bytes.len().is_multiple_of(Self::WRITE_SIZE)
+        {
             return Err(FlashError::NotAligned);
         }
         Self::validate_range(offset, bytes.len())?;
@@ -119,7 +119,7 @@ impl NorFlash for Efr32mg21Flash {
         let mut address = offset;
         let mut remaining = bytes;
         while !remaining.is_empty() {
-            let page_remaining = PAGE_SIZE - address as usize % PAGE_SIZE;
+            let page_remaining = FLASH_PAGE_SIZE - address as usize % FLASH_PAGE_SIZE;
             let burst_len = remaining.len().min(page_remaining);
             program_burst_ram(address, &remaining[..burst_len])?;
             address += burst_len as u32;
@@ -130,7 +130,7 @@ impl NorFlash for Efr32mg21Flash {
 }
 
 #[inline(never)]
-#[unsafe(link_section = ".data.ram_code")]
+#[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.ram_code"))]
 fn erase_page_ram(offset: u32) -> Result<(), FlashError> {
     unsafe {
         let was_locked =
@@ -161,7 +161,7 @@ fn erase_page_ram(offset: u32) -> Result<(), FlashError> {
 }
 
 #[inline(never)]
-#[unsafe(link_section = ".data.ram_code")]
+#[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.ram_code"))]
 fn program_burst_ram(offset: u32, bytes: &[u8]) -> Result<(), FlashError> {
     unsafe {
         let was_locked =
@@ -214,7 +214,7 @@ fn program_burst_ram(offset: u32, bytes: &[u8]) -> Result<(), FlashError> {
 }
 
 #[inline(never)]
-#[unsafe(link_section = ".data.ram_code")]
+#[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.ram_code"))]
 fn wait_series2_ready_ram() -> Result<(), FlashError> {
     for _ in 0..PROGRAM_TIMEOUT {
         let status = unsafe { core::ptr::read_volatile(MSC_STATUS as *const u32) };

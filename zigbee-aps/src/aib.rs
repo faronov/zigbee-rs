@@ -120,7 +120,7 @@ pub enum AibAttribute {
     ApsLastChannelFailureRate = 0xCB,
     ApsChannelTimer = 0xCC,
     ApsMaxWindowSize = 0xCD,
-    ApsTrustCenterAddress = 0xCE,
+    ApsTrustCenterAddress = 0xAB,
     ApsSecurityEnabled = 0xCF,
 }
 
@@ -137,7 +137,7 @@ impl AibAttribute {
             0xCB => Some(Self::ApsLastChannelFailureRate),
             0xCC => Some(Self::ApsChannelTimer),
             0xCD => Some(Self::ApsMaxWindowSize),
-            0xCE => Some(Self::ApsTrustCenterAddress),
+            0xAB => Some(Self::ApsTrustCenterAddress),
             0xCF => Some(Self::ApsSecurityEnabled),
             _ => None,
         }

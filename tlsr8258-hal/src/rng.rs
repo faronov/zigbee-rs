@@ -349,6 +349,9 @@ pub enum RngError {
     /// the caller has retained it, or otherwise re-initializing whatever
     /// ADC configuration it needs from scratch).
     AdcRestoreFailed(AdcError),
+    /// A retained RNG exists but its CTR_DRBG instantiate/reseed counter is
+    /// invalid. No output may be generated from that state.
+    RetentionStateInvalid,
 }
 
 impl From<AdcError> for RngError {
@@ -587,6 +590,22 @@ impl Rng {
                 Err(error)
             }
         }
+    }
+
+    /// Validate the retained software RNG after LOW32K reset-on-wake.
+    ///
+    /// Key, counter and `V` are SRAM state; ADC hardware is restored
+    /// separately by the retained voltage-guard owner before app service.
+    #[cfg(all(target_arch = "tc32", feature = "retention-proof"))]
+    pub fn resume_after_retention(&mut self) -> Result<(), RngError> {
+        use core::sync::atomic::{Ordering, compiler_fence};
+
+        compiler_fence(Ordering::SeqCst);
+        if self.drbg.reseed_counter() == 0 {
+            return Err(RngError::RetentionStateInvalid);
+        }
+        compiler_fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Re-harvest entropy from the ADC noise channel and reseed the DRBG.

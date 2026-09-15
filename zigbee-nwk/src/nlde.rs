@@ -6,7 +6,7 @@
 //! - Frame relay for routers/coordinators
 
 use crate::frames::{NwkCommandId, NwkFrameControl, NwkFrameType, NwkHeader};
-use crate::{DeviceType, NwkLayer, NwkStatus, RejoinResponseDelivery};
+use crate::{DeviceType, IndirectFrameKind, NwkLayer, NwkStatus, RejoinResponseDelivery};
 use zigbee_mac::{AddressMode, MacDriver, McpsDataRequest, TxOptions};
 use zigbee_types::*;
 
@@ -72,8 +72,17 @@ pub enum NwkCommandOutcome {
         /// Address of the parent that announced the leave.
         src: ShortAddress,
     },
+    /// A directly attached child announced that it left the network.
+    #[cfg(feature = "router")]
+    DeviceLeft {
+        /// Former short address of the child.
+        src: ShortAddress,
+        /// Durable child identity removed from the neighbor table.
+        ieee: IeeeAddress,
+    },
     /// A locally addressed Rejoin Request needs an asynchronous response and
     /// Trust Center notification from the runtime.
+    #[cfg(feature = "router")]
     ChildRejoinRequest {
         src: ShortAddress,
         ieee: IeeeAddress,
@@ -86,6 +95,7 @@ pub enum NwkCommandOutcome {
     /// indirectly to a sleepy child. The NWK layer has already checked that
     /// `src`/`ieee` name an authenticated child of this parent and that the
     /// frame was addressed to and authenticated for this device.
+    #[cfg(feature = "router")]
     EndDeviceTimeoutRequest {
         /// Short address of the requesting child (validated as our child).
         src: ShortAddress,
@@ -110,12 +120,41 @@ pub enum NwkCommandOutcome {
     /// An address conflict was detected on the address of an end-device child
     /// of this device (R22 §3.6.1.9.3). The parent must pick a new address for
     /// the child and inform it with an unsolicited Rejoin Response.
+    #[cfg(feature = "router")]
     ChildAddressConflict {
         /// The child's current (conflicting) short address.
         child: ShortAddress,
         /// The child's IEEE address, which does not change.
         ieee: IeeeAddress,
     },
+}
+
+/// Journal that must precede completion of a deferred NWK replay floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NwkLifecyclePersistence {
+    /// The security snapshot owns the mutation, including receive-side
+    /// activation of a staged newer network key.
+    SecurityState,
+    /// The parent-owned durable child table owns the mutation. Any concurrent
+    /// network-key activation still requires the security snapshot first.
+    ChildState,
+    /// A locally delivered APS frame is waiting for upper-layer routing to
+    /// determine whether it is an ordinary frame or a lifecycle mutation.
+    LocalData,
+}
+
+#[cfg(feature = "router")]
+#[derive(Debug, Clone)]
+pub(crate) struct PendingLifecycleRelay {
+    pub(crate) header: NwkHeader,
+    pub(crate) payload: heapless::Vec<u8, MAX_NWK_FRAME>,
+    pub(crate) previous_hop: ShortAddress,
+}
+
+struct AuthenticatedNwkPayload {
+    payload: heapless::Vec<u8, MAX_NWK_FRAME>,
+    security_source: IeeeAddress,
+    replay: crate::security::NwkReplayCounter,
 }
 
 /// NWK data confirm — result of NLDE-DATA.request.
@@ -235,6 +274,11 @@ impl<M: MacDriver> NwkLayer<M> {
             return Ok(end);
         }
 
+        // This also fences queued routing responses and upper-layer sends
+        // while receive-side activation is waiting for durable completion.
+        if self.security.activation_pending {
+            return Err(NwkStatus::NotPermitted);
+        }
         let Some(key) = self.security.active_key().map(|entry| entry.key) else {
             log::warn!("[NWK] No active network key for encryption");
             return Err(NwkStatus::NoKey);
@@ -289,6 +333,59 @@ impl<M: MacDriver> NwkLayer<M> {
         security_enable: bool,
         discover_route: bool,
     ) -> Result<NldeDataConfirm, NwkStatus> {
+        self.nlde_data_request_tagged(
+            dst_addr,
+            radius,
+            payload,
+            security_enable,
+            discover_route,
+            crate::IndirectFrameKind::Data,
+        )
+        .await
+    }
+
+    /// Queue a protected one-hop key update for an authorized sleepy child.
+    #[cfg(feature = "router")]
+    pub async fn send_network_key_update_to_child(
+        &mut self,
+        child: ShortAddress,
+        payload: &[u8],
+        sequence: u8,
+    ) -> Result<NldeDataConfirm, NwkStatus> {
+        if !self.can_route()
+            || !self.is_sleepy_child(child)
+            || !self
+                .neighbors
+                .find_by_short(child)
+                .is_some_and(|entry| entry.relationship == crate::neighbor::Relationship::Child)
+        {
+            return Err(NwkStatus::UnknownDevice);
+        }
+        if !self.nib.security_enabled {
+            return Err(NwkStatus::NoKey);
+        }
+        self.nlde_data_request_tagged(
+            child,
+            1,
+            payload,
+            true,
+            false,
+            crate::IndirectFrameKind::NetworkKeyUpdate(sequence),
+        )
+        .await
+    }
+
+    async fn nlde_data_request_tagged(
+        &mut self,
+        dst_addr: ShortAddress,
+        radius: u8,
+        payload: &[u8],
+        security_enable: bool,
+        discover_route: bool,
+        kind: crate::IndirectFrameKind,
+    ) -> Result<NldeDataConfirm, NwkStatus> {
+        #[cfg(not(feature = "router"))]
+        let _ = kind;
         if !self.joined {
             log::warn!(
                 "[NWK] nlde_data_request called but not joined! dst=0x{:04X}",
@@ -296,6 +393,7 @@ impl<M: MacDriver> NwkLayer<M> {
             );
             return Err(NwkStatus::InvalidRequest);
         }
+        #[cfg(feature = "router")]
         if self.routing.has_failed_many_to_one(dst_addr) {
             log::warn!(
                 "[NWK] Failed many-to-one route to 0x{:04X} awaits a new MTOR discovery",
@@ -314,6 +412,7 @@ impl<M: MacDriver> NwkLayer<M> {
         // A destination with no relays between us and it is sent to directly:
         // attaching an empty subframe would put a relay count of zero on air
         // and force every receiver to fall back to its routing table anyway.
+        #[cfg(feature = "router")]
         let source_route_subframe = if self.concentrator_active {
             self.source_route_table
                 .lookup(dst_addr)
@@ -332,6 +431,8 @@ impl<M: MacDriver> NwkLayer<M> {
         } else {
             None
         };
+        #[cfg(not(feature = "router"))]
+        let source_route_subframe = None;
         let has_source_route = source_route_subframe.is_some();
 
         // Resolve the MAC next hop before allocating a sequence number or a
@@ -341,6 +442,7 @@ impl<M: MacDriver> NwkLayer<M> {
         // A source-routed frame goes to the relay named by its initial index;
         // only a frame without one consults the routing table, and only that
         // frame can therefore be unroutable.
+        #[cfg(feature = "router")]
         let next_hop = match source_route_subframe
             .as_ref()
             .and_then(|sr| sr.relay_list.get(sr.relay_index as usize).copied())
@@ -355,12 +457,15 @@ impl<M: MacDriver> NwkLayer<M> {
                 }
             },
         };
+        #[cfg(not(feature = "router"))]
+        let next_hop = self.resolve_next_hop(dst_addr)?;
 
         // Auto Route Record: if the destination route requires one, transmit
         // it before reserving the data frame's security counter. Receivers
         // commit replay counters in transmission order, so building data
         // first would assign it N, send the Route Record as N+1, then have the
         // next hop reject the later data frame N as a replay.
+        #[cfg(feature = "router")]
         if is_unicast_address(dst_addr) {
             let needs_rr = self
                 .routing
@@ -390,10 +495,20 @@ impl<M: MacDriver> NwkLayer<M> {
             frame_control: NwkFrameControl {
                 frame_type: NwkFrameType::Data as u8,
                 protocol_version: 0x02,
-                discover_route: if discover_route && self.device_type != DeviceType::EndDevice {
-                    1
-                } else {
-                    0
+                discover_route: {
+                    #[cfg(feature = "router")]
+                    {
+                        if discover_route && self.device_type != DeviceType::EndDevice {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    #[cfg(not(feature = "router"))]
+                    {
+                        let _ = discover_route;
+                        0
+                    }
                 },
                 multicast: false,
                 security: security_enable && self.nib.security_enabled,
@@ -421,8 +536,9 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // Locally originated traffic uses the same bounded indirect queue as
         // relayed traffic when its final destination is our sleepy child.
+        #[cfg(feature = "router")]
         if !has_source_route && next_hop == dst_addr && self.is_sleepy_child(next_hop) {
-            self.enqueue_indirect_for_child(next_hop, &nwk_buf[..total_len])?;
+            self.enqueue_tagged_indirect_for_child(next_hop, &nwk_buf[..total_len], kind)?;
             return Ok(NldeDataConfirm {
                 status: NwkStatus::Success,
                 nsdu_handle: seq,
@@ -455,15 +571,18 @@ impl<M: MacDriver> NwkLayer<M> {
 
         if let Err(ref e) = mac_result {
             log::warn!("[NWK TX] MAC send failed: {:?}", e);
-            if has_source_route {
-                self.source_route_table.remove(dst_addr);
-                self.routing.remove(dst_addr);
-            } else if self
-                .routing
-                .get_entry(dst_addr)
-                .is_some_and(|route| route.many_to_one)
+            #[cfg(feature = "router")]
             {
-                self.routing.remove(dst_addr);
+                if has_source_route {
+                    self.source_route_table.remove(dst_addr);
+                    self.routing.remove(dst_addr);
+                } else if self
+                    .routing
+                    .get_entry(dst_addr)
+                    .is_some_and(|route| route.many_to_one)
+                {
+                    self.routing.remove(dst_addr);
+                }
             }
         }
 
@@ -472,6 +591,77 @@ impl<M: MacDriver> NwkLayer<M> {
             status: NwkStatus::Success,
             nsdu_handle: seq,
         })
+    }
+
+    /// Refresh a locally secured, queued NWK frame immediately before delivery.
+    ///
+    /// R22 4.7.3.10.6 permits receiving with the retained previous key, not
+    /// transmitting with it. Even without a switch, an enqueue-time counter
+    /// may be stale by the time the child polls. Authenticate the queued
+    /// ciphertext without touching incoming replay state, then use the shared
+    /// builder for the current key and a fresh durably reserved counter.
+    ///
+    /// The NWK header and APS payload are unchanged: this is neither another
+    /// routing hop nor a new APS transaction. Missing/retired keys, bad MICs,
+    /// exhausted reservations and pending activation all fail closed.
+    pub(crate) fn refresh_indirect_frame(
+        &mut self,
+        frame: &[u8],
+        output: &mut [u8; MAX_NWK_FRAME],
+    ) -> Result<usize, NwkStatus> {
+        if self.security.activation_pending {
+            return Err(NwkStatus::NotPermitted);
+        }
+        if frame.len() > output.len() {
+            return Err(NwkStatus::FrameTooLong);
+        }
+        let (header, header_len) = NwkHeader::parse(frame).ok_or(NwkStatus::InvalidRequest)?;
+        if !header.frame_control.security {
+            // Unsecured commissioning responses must stay unsecured.
+            output[..frame.len()].copy_from_slice(frame);
+            return Ok(frame.len());
+        }
+        let (security_header, aux_len) =
+            crate::security::NwkSecurityHeader::parse(&frame[header_len..])
+                .ok_or(NwkStatus::BadCcmOutput)?;
+        if security_header.source_address != self.nib.ieee_address
+            || security_header.security_control & !0x07
+                != crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT & !0x07
+        {
+            // The queue holds frames already secured by this hop, not raw
+            // received frames that would still need admission/replay checks.
+            return Err(NwkStatus::BadCcmOutput);
+        }
+        if self
+            .security
+            .active_key()
+            .is_none_or(|entry| entry.seq_number != self.nib.active_key_seq_number)
+        {
+            return Err(NwkStatus::NoKey);
+        }
+        let key = self
+            .security
+            .key_by_seq(security_header.key_seq_number)
+            .ok_or(NwkStatus::NoKey)?
+            .key;
+        let aad_len = header_len + aux_len;
+        if aad_len > MAX_NWK_AAD {
+            return Err(NwkStatus::FrameTooLong);
+        }
+        let mut aad = [0u8; MAX_NWK_AAD];
+        aad[..aad_len].copy_from_slice(&frame[..aad_len]);
+        aad[header_len] = (aad[header_len] & !0x07) | 0x05;
+        let plaintext = self
+            .security
+            .decrypt_with(
+                &mut self.mac,
+                &aad[..aad_len],
+                &frame[aad_len..],
+                &key,
+                &security_header,
+            )
+            .ok_or(NwkStatus::BadCcmOutput)?;
+        self.build_nwk_frame(&header, &plaintext, output)
     }
 
     /// Send a one-hop Rejoin Response using exactly the security state of the
@@ -530,13 +720,15 @@ impl<M: MacDriver> NwkLayer<M> {
             .is_some_and(|entry| entry.ieee_address != child_ieee);
         if !rx_on_when_idle && status == 0x00 && !request_address_conflicts {
             // A rejoining child may still poll with its previous address.
-            // Discard stale transactions and key this response by that
-            // address rather than by the newly assigned one in the payload.
-            self.indirect.remove_all(request_address);
-            let Some(slot) = self
-                .indirect
-                .enqueue_with_slot(request_address, &frame[..frame_len])
-            else {
+            // Replace only a stale Rejoin Response and preserve unrelated
+            // application or lifecycle data already queued for the child.
+            self.indirect
+                .remove_kind(request_address, IndirectFrameKind::RejoinResponse);
+            let Some(slot) = self.indirect.enqueue_tagged_with_slot(
+                request_address,
+                &frame[..frame_len],
+                IndirectFrameKind::RejoinResponse,
+            ) else {
                 return Err(NwkStatus::FrameNotBuffered);
             };
             if self
@@ -582,7 +774,7 @@ impl<M: MacDriver> NwkLayer<M> {
     ///   tighter bound — recording it as the child's accepted timeout and
     ///   answering `SUCCESS`;
     /// - answers `INCORRECT_VALUE` and falls back to
-    ///   [`ED_TIMEOUT_ENUM_DEFAULT`] for any other value (unreachable through
+    ///   [`crate::frames::ED_TIMEOUT_ENUM_DEFAULT`] for any other value (unreachable through
     ///   the strict wire parser, but kept as an explicit deterministic branch);
     /// - refreshes the child's deadline, because the request itself is an End
     ///   Device Timeout Request keepalive;
@@ -736,6 +928,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// [`NwkStatus::RouteDiscoveryFailed`] for this attempt — the frame is not
     /// buffered, so the request still fails rather than silently succeeding.
     /// End devices and non-routing builds keep the original error.
+    #[cfg(feature = "router")]
     async fn handle_unroutable_destination(
         &mut self,
         dst_addr: ShortAddress,
@@ -781,9 +974,10 @@ impl<M: MacDriver> NwkLayer<M> {
     /// - Handles it internally (NWK commands, optionally recording a
     ///   lifecycle outcome for
     ///   [`take_command_outcome`](crate::NwkLayer::take_command_outcome))
-    /// - Relays the frame — a unicast, or an NWK *Data* broadcast, when we
-    ///   are a joined routing device. NWK command propagation is never
-    ///   generic: it is owned by the individual command handlers.
+    /// - Relays the frame when we are a joined routing device: unicasts, NWK
+    ///   Data broadcasts, and the R22 broadcast-command set that is relayed
+    ///   unchanged (`NetworkStatus`, `NetworkReport`, and `NetworkUpdate`).
+    ///   Commands with hop-specific semantics remain owned by their handlers.
     ///
     /// The pending command outcome is cleared on entry and set only by the
     /// frame being processed, so a stale outcome can never be observed after a
@@ -806,8 +1000,14 @@ impl<M: MacDriver> NwkLayer<M> {
         mac_payload: &'a [u8],
         lqi: u8,
     ) -> Option<NwkIndication<'a>> {
-        self.process_incoming_nwk_frame_from(mac_payload, lqi, None)
-            .await
+        let mut volatile_commit = |_| true;
+        self.process_incoming_nwk_frame_from_with_replay_commit(
+            mac_payload,
+            lqi,
+            None,
+            &mut volatile_commit,
+        )
+        .await
     }
 
     /// Process an incoming NWK frame, naming the MAC device it arrived from.
@@ -827,6 +1027,164 @@ impl<M: MacDriver> NwkLayer<M> {
         lqi: u8,
         prev_hop: Option<ShortAddress>,
     ) -> Option<NwkIndication<'a>> {
+        let mut volatile_commit = |_| true;
+        self.process_incoming_nwk_frame_from_with_replay_commit(
+            mac_payload,
+            lqi,
+            prev_hop,
+            &mut volatile_commit,
+        )
+        .await
+    }
+
+    /// Enable lifecycle replay deferral for the next receive operation.
+    /// Disabling deferral cannot bypass an uncheckpointed key activation.
+    pub fn set_lifecycle_persistence_enabled(&mut self, enabled: bool) {
+        self.lifecycle_persistence_enabled = enabled;
+        if !enabled {
+            self.pending_lifecycle_replay = None;
+            self.pending_lifecycle_btr = None;
+            #[cfg(feature = "router")]
+            {
+                self.pending_lifecycle_relay = None;
+            }
+        }
+    }
+
+    /// Verified replay floor waiting for its owning journal.
+    ///
+    /// Activated local data is exposed as `SecurityState` so an upper-layer
+    /// ordinary-data fast path cannot commit replay before the key snapshot.
+    /// Internally it remains reclassifiable (e.g. a child Parent Announce).
+    pub const fn pending_lifecycle_replay(
+        &self,
+    ) -> Option<(crate::security::NwkReplayCounter, NwkLifecyclePersistence)> {
+        match self.pending_lifecycle_replay {
+            Some((replay, NwkLifecyclePersistence::LocalData))
+                if self.security.activation_pending =>
+            {
+                Some((replay, NwkLifecyclePersistence::SecurityState))
+            }
+            pending => pending,
+        }
+    }
+
+    /// Reclassify a deferred local data frame after upper-layer dispatch.
+    pub fn classify_pending_lifecycle_replay(&mut self, kind: NwkLifecyclePersistence) {
+        if let Some((replay, pending_kind)) = self.pending_lifecycle_replay
+            && pending_kind == NwkLifecyclePersistence::LocalData
+        {
+            self.pending_lifecycle_replay = Some((replay, kind));
+        }
+    }
+
+    /// Complete after the security snapshot, owning journal and durable replay
+    /// floor have been committed, in that order. Only then release relays.
+    pub async fn complete_lifecycle_persistence(&mut self) {
+        if let Some((replay, _)) = self.pending_lifecycle_replay.take() {
+            self.security.commit_frame_counter_for_key(
+                &replay.source,
+                replay.key_sequence,
+                replay.counter,
+            );
+            self.security.activation_pending = false;
+        }
+        if let Some((source, sequence)) = self.pending_lifecycle_btr.take() {
+            self.btr.record(source, sequence);
+        }
+        #[cfg(feature = "router")]
+        {
+            if let Some(relay) = self.pending_lifecycle_relay.take() {
+                let result = if is_nwk_broadcast(relay.header.dst_addr) {
+                    self.relay_broadcast(&relay.header, relay.payload.as_slice())
+                        .await
+                } else if relay.header.frame_control.frame_type == NwkFrameType::Command as u8
+                    && relay.payload.first() == Some(&(NwkCommandId::RouteRecord as u8))
+                {
+                    self.relay_route_record(&relay.header, relay.payload.as_slice())
+                        .await
+                } else {
+                    self.relay_frame(&relay.header, relay.payload.as_slice(), relay.previous_hop)
+                        .await
+                };
+                if let Err(error) = result {
+                    log::warn!(
+                        "[NWK] Deferred relay from 0x{:04X} failed: {:?}",
+                        relay.header.src_addr.0,
+                        error
+                    );
+                }
+            }
+        }
+        self.lifecycle_persistence_enabled = false;
+    }
+
+    /// Abandon an uncommitted replay floor after journal failure.
+    ///
+    /// An activated key stays transmit-gated: retry with persistence enabled
+    /// and complete its snapshot/replay transaction, or restore the security
+    /// context. Aborting never rolls back the active key or consumes a floor.
+    pub fn abort_lifecycle_persistence(&mut self) {
+        self.pending_lifecycle_replay = None;
+        self.pending_lifecycle_btr = None;
+        #[cfg(feature = "router")]
+        {
+            self.pending_lifecycle_relay = None;
+        }
+        self.lifecycle_persistence_enabled = false;
+    }
+
+    fn commit_incoming_replay(
+        &mut self,
+        replay: crate::security::NwkReplayCounter,
+        replay_commit: &mut dyn FnMut(crate::security::NwkReplayCounter) -> bool,
+    ) -> bool {
+        if !replay_commit(replay) {
+            log::error!("[NWK] Durable replay-counter commit failed");
+            return false;
+        }
+        self.security.commit_frame_counter_for_key(
+            &replay.source,
+            replay.key_sequence,
+            replay.counter,
+        );
+        true
+    }
+
+    fn defer_incoming_replay(
+        &mut self,
+        replay: crate::security::NwkReplayCounter,
+        kind: NwkLifecyclePersistence,
+    ) {
+        self.pending_lifecycle_replay = Some((replay, kind));
+    }
+
+    /// Process one NWK frame with durable incoming replay ordering.
+    ///
+    /// Lifecycle mutations (including newer-key activation) defer their floor
+    /// and relay until `complete_lifecycle_persistence`; other secured frames
+    /// commit through the hook before relay, handling or local delivery.
+    ///
+    /// The commit hook is *type-erased*: this is the largest function in the
+    /// receive path, and a generic parameter gives every distinct caller
+    /// closure its own full copy of it (plus its own `aps_decrypt_incoming`).
+    /// Receiving a frame is not latency-critical at the granularity of one
+    /// indirect call per verified counter.
+    pub async fn process_incoming_nwk_frame_from_with_replay_commit<'a>(
+        &mut self,
+        mac_payload: &'a [u8],
+        lqi: u8,
+        prev_hop: Option<ShortAddress>,
+        replay_commit: &mut dyn FnMut(crate::security::NwkReplayCounter) -> bool,
+    ) -> Option<NwkIndication<'a>> {
+        if self.pending_lifecycle_replay.is_some() {
+            log::error!("[NWK] Dropping frame while a lifecycle commit is pending");
+            return None;
+        }
+        if self.security.activation_pending && !self.lifecycle_persistence_enabled {
+            log::error!("[NWK] Key activation requires lifecycle persistence");
+            return None;
+        }
         // A command outcome describes exactly one frame. Clearing it before
         // any early return keeps an outcome from an earlier Leave from being
         // picked up after some later frame that reported nothing. The same
@@ -850,9 +1208,19 @@ impl<M: MacDriver> NwkLayer<M> {
         // conflict on `nwkNetworkAddress`, checked here — the only point where
         // such a frame is still in hand — before the frame is dropped.
         if src == self.nib.network_address {
-            if let Some(outcome) =
+            if let Some((outcome, replay)) =
                 self.detect_self_addressed_conflict(&header, mac_payload, consumed)
             {
+                if let Some(replay) = replay {
+                    if self.lifecycle_persistence_enabled {
+                        self.activate_received_network_key(replay.key_sequence);
+                        self.defer_incoming_replay(replay, NwkLifecyclePersistence::SecurityState);
+                    } else if !self.commit_incoming_replay(replay, replay_commit) {
+                        return None;
+                    } else {
+                        self.activate_received_network_key(replay.key_sequence);
+                    }
+                }
                 self.record_command_outcome(outcome);
             }
             log::debug!(
@@ -914,6 +1282,7 @@ impl<M: MacDriver> NwkLayer<M> {
         // Unsecured *unicasts* are deliberately left alone: pre-key
         // commissioning traffic (APS Transport-Key) arrives that way, and the
         // APS layer applies its own security policy to it.
+        #[cfg(feature = "router")]
         let unsecured_local_rejoin = !secured
             && is_command
             && !is_broadcast
@@ -925,6 +1294,8 @@ impl<M: MacDriver> NwkLayer<M> {
                 .dst_ieee
                 .is_none_or(|address| address == self.nib.ieee_address)
             && mac_payload.get(consumed) == Some(&(NwkCommandId::RejoinRequest as u8));
+        #[cfg(not(feature = "router"))]
+        let unsecured_local_rejoin = false;
         if !secured
             && self.nib.security_enabled
             && (is_command || is_broadcast)
@@ -949,26 +1320,30 @@ impl<M: MacDriver> NwkLayer<M> {
             return None;
         }
 
-        let can_route = self.can_route();
         let is_for_us = if is_broadcast {
             self.broadcast_is_for_us(dst)
         } else {
             dst == self.nib.network_address
         };
+        #[cfg(feature = "router")]
+        let can_route = self.can_route();
         // Forwarding is bounded by the radius. Deciding this from the header
         // alone costs nothing and keeps sleepy devices from spending energy on
         // CCM* for a frame they would drop either way.
+        #[cfg(feature = "router")]
         let may_forward = can_route && header.radius > 1;
-        // A broadcast NWK command is never carried further by the generic
-        // relay: its propagation belongs to the command handler (see the
-        // broadcast relay below). One that is not addressed to us therefore
-        // has nothing left to do and is dropped before CCM* runs on it.
-        let may_relay = if is_broadcast {
-            may_forward && !is_command
-        } else {
-            may_forward
-        };
+        // A broadcast may need relaying even when its destination class is not
+        // locally addressed to this router (for example 0xFFFB). The command
+        // byte of a secured frame is ciphertext here, so authenticate first
+        // and apply the exact R22 command classification below.
+        #[cfg(feature = "router")]
+        let may_relay = may_forward;
+        #[cfg(feature = "router")]
         if !is_for_us && !may_relay {
+            return None;
+        }
+        #[cfg(not(feature = "router"))]
+        if !is_for_us {
             return None;
         }
 
@@ -977,63 +1352,181 @@ impl<M: MacDriver> NwkLayer<M> {
         // record, mutate, relay or act on a secured frame before its MIC has
         // been verified, and the relay path below re-secures the frame with
         // our own key material rather than replaying the original ciphertext.
-        let payload = if secured {
-            let (payload, security_source) =
-                self.authenticate_incoming(mac_payload, consumed, src)?;
-            NwkPayload::Decrypted {
-                payload,
-                security_source,
-            }
+        let (payload, authenticated_replay) = if secured {
+            let authenticated = self.authenticate_incoming(mac_payload, consumed, src)?;
+            (
+                NwkPayload::Decrypted {
+                    payload: authenticated.payload,
+                    security_source: authenticated.security_source,
+                },
+                Some(authenticated.replay),
+            )
         } else {
-            NwkPayload::Plain(&mac_payload[consumed..])
+            (NwkPayload::Plain(&mac_payload[consumed..]), None)
         };
         // A network without NWK security has no stronger evidence to offer, so
         // its plaintext headers are all the identity there is.
         self.rx_authenticated = !self.nib.security_enabled || payload.security_source().is_some();
-        if let Some(security_source) = payload.security_source()
-            && self.find_ieee_by_short(src) == Some(security_source)
-            && self.authorize_child(src)
-        {
-            log::info!(
-                "[NWK] Child 0x{:04X} proved possession of the network key",
-                src.0
-            );
-        }
-        // R22 secured-traffic keepalive: an authenticated frame from an
-        // attached end-device child refreshes its End Device Timeout deadline.
-        // Runs after `authorize_child` so a frame that both authenticates and
-        // keeps alive is credited once, and before the relay branch so a
-        // child's data relayed on to the coordinator still counts.
-        if let Some(security_source) = payload.security_source() {
-            self.refresh_child_keepalive_secured(src, security_source);
-        }
 
         // ── R22 §3.6.1.9.2 address conflict detection ──
         // Runs on the authenticated frame only (see above) and records what it
         // finds as a command outcome for the runtime: resolving a conflict is
         // asynchronous work. Kept in one out-of-line helper so the receive
         // future itself does not grow.
-        if let Some(outcome) = self.detect_frame_address_conflict(
+        let conflict_outcome = self.detect_frame_address_conflict(
             &header,
             is_for_us && !is_broadcast,
             prev_hop.unwrap_or(src) == src,
             payload.security_source(),
-        ) {
-            self.record_command_outcome(outcome);
-        }
+        );
 
         // Two commands are not handled by the generic broadcast and relay
         // paths, so their identity is needed before either runs. The payload
         // is the authenticated plaintext, so this reads a command byte that
         // has already been proven to come from a holder of the network key.
+        #[cfg(feature = "router")]
         let command_id = if is_command {
             payload.as_slice().first().copied()
         } else {
             None
         };
+        #[cfg(feature = "router")]
         let is_route_request = command_id == Some(NwkCommandId::RouteRequest as u8);
+        #[cfg(feature = "router")]
         let is_route_record = command_id == Some(NwkCommandId::RouteRecord as u8);
+        #[cfg(feature = "router")]
         let is_rejoin_request = command_id == Some(NwkCommandId::RejoinRequest as u8);
+        #[cfg(feature = "router")]
+        let relayable_broadcast = is_data || self.broadcast_command_is_relayable(src, command_id);
+
+        // Check a broadcast transaction before staging its replay. Recording
+        // is delayed until the replay floor is durable, otherwise a failed
+        // journal write would make the legitimate retransmission look like a
+        // duplicate in this boot.
+        #[cfg(feature = "router")]
+        if is_broadcast
+            && can_route
+            && !is_route_request
+            && self.btr.is_duplicate(src, header.seq_number)
+        {
+            log::debug!(
+                "[NWK] BTR dup: src=0x{:04X} seq={}",
+                src.0,
+                header.seq_number
+            );
+            return None;
+        }
+
+        // BTR admission has succeeded. Adoption must precede classification so
+        // even an otherwise ordinary command or non-local relay acquires the
+        // security-snapshot barrier. Authentication alone never commits replay.
+        if self.lifecycle_persistence_enabled
+            && let Some(replay) = authenticated_replay
+        {
+            self.activate_received_network_key(replay.key_sequence);
+        }
+        let lifecycle_kind = if self.lifecycle_persistence_enabled {
+            conflict_outcome
+                .as_ref()
+                .map(|outcome| match outcome {
+                    #[cfg(feature = "router")]
+                    NwkCommandOutcome::ChildAddressConflict { .. }
+                    | NwkCommandOutcome::DeviceLeft { .. } => NwkLifecyclePersistence::ChildState,
+                    _ => NwkLifecyclePersistence::SecurityState,
+                })
+                .or_else(|| {
+                    (is_for_us && is_command)
+                        .then(|| self.classify_lifecycle_command(src, dst, payload.as_slice()))
+                        .flatten()
+                })
+                .or_else(|| (is_for_us && is_data).then_some(NwkLifecyclePersistence::LocalData))
+                .or_else(|| {
+                    self.security
+                        .activation_pending
+                        .then_some(NwkLifecyclePersistence::SecurityState)
+                })
+        } else {
+            None
+        };
+
+        if let Some(replay) = authenticated_replay {
+            if let Some(kind) = lifecycle_kind {
+                self.defer_incoming_replay(replay, kind);
+                #[cfg(feature = "router")]
+                if is_broadcast && can_route && !is_route_request {
+                    self.pending_lifecycle_btr = Some((src, header.seq_number));
+                }
+                #[cfg(feature = "router")]
+                if may_forward
+                    && ((is_broadcast && relayable_broadcast)
+                        || (!is_broadcast && !is_for_us && !is_rejoin_request))
+                {
+                    let mut relay_payload = heapless::Vec::new();
+                    if relay_payload.extend_from_slice(payload.as_slice()).is_ok() {
+                        self.pending_lifecycle_relay = Some(PendingLifecycleRelay {
+                            header: header.clone(),
+                            payload: relay_payload,
+                            previous_hop: prev_hop.unwrap_or(src),
+                        });
+                    }
+                }
+            } else if !self.commit_incoming_replay(replay, replay_commit) {
+                return None;
+            } else {
+                self.activate_received_network_key(replay.key_sequence);
+            }
+        }
+
+        #[cfg(feature = "router")]
+        if is_broadcast && can_route && !is_route_request && lifecycle_kind.is_none() {
+            self.btr.record(src, header.seq_number);
+        }
+
+        if let Some(outcome) = conflict_outcome {
+            self.record_command_outcome(outcome);
+            if is_data {
+                return None;
+            }
+        }
+
+        #[cfg(feature = "router")]
+        {
+            if let Some(security_source) = payload.security_source()
+                && self.find_ieee_by_short(src) == Some(security_source)
+                && self.authorize_child(src)
+            {
+                log::info!(
+                    "[NWK] Child 0x{:04X} proved possession of the network key",
+                    src.0
+                );
+            }
+        }
+        if self.nib.parent_link_provisional
+            && src == self.nib.parent_address
+            && prev_hop.unwrap_or(src) == src
+            && let Some(security_source) = payload.security_source()
+        {
+            let known_parent = self.find_ieee_by_short(src);
+            if known_parent.is_none_or(|known| known == security_source) {
+                if known_parent.is_none() {
+                    self.update_neighbor_address(src, security_source);
+                }
+                self.nib.parent_link_provisional = false;
+                log::info!(
+                    "[NWK] Parent 0x{:04X} proved possession of the active network key",
+                    src.0
+                );
+            }
+        }
+        // R22 secured-traffic keepalive: an authenticated frame from an
+        // attached end-device child refreshes its End Device Timeout deadline.
+        // Runs after `authorize_child` so a frame that both authenticates and
+        // keeps alive is credited once, and before the relay branch so a
+        // child's data relayed on to the coordinator still counts.
+        #[cfg(feature = "router")]
+        if let Some(security_source) = payload.security_source() {
+            self.refresh_child_keepalive_secured(src, security_source);
+        }
 
         // ── Broadcast deduplication (BTR) ──
         //
@@ -1046,31 +1539,19 @@ impl<M: MacDriver> NwkLayer<M> {
         // first. `RreqRecordTable` owns this decision: it admits better paths
         // and equal-cost copies from another neighbor, but suppresses repeated
         // MAC transmissions from the same neighbor.
-        if is_broadcast && can_route && !is_route_request {
-            if self.btr.is_duplicate(src, header.seq_number) {
-                log::debug!(
-                    "[NWK] BTR dup: src=0x{:04X} seq={}",
-                    src.0,
-                    header.seq_number
-                );
-                return None;
-            }
-            self.btr.record(src, header.seq_number);
-        }
-
         // ── Broadcast relay (routers/coordinators rebroadcast) ──
         //
-        // Only NWK *Data* broadcasts are propagated by this generic relay.
-        // NWK commands are not verbatim-floodable: a Route Request must be
-        // rebroadcast by `handle_route_request` with *our* path cost added to
-        // it (a verbatim copy would advertise the originator's cost and, being
-        // a distinct frame from a new source, defeat the receiver's BTR
-        // suppression), a Route Reply travels hop by hop toward the
-        // originator, and a Link Status describes this device's own links to
-        // its immediate neighbours only — flooding a neighbour's Link Status
-        // would attribute its link costs to us. Command propagation is
-        // therefore owned by the handlers below; local dispatch is unaffected.
-        if is_broadcast && may_forward && !is_command {
+        // NWK Data broadcasts and the R22 relayable command set are propagated
+        // unchanged. Other commands have hop-specific semantics: a Route
+        // Request must be rebuilt by `handle_route_request` with our path cost,
+        // a Route Reply travels hop by hop, and Link Status is link-local.
+        // Local dispatch remains independent of this relay decision.
+        #[cfg(feature = "router")]
+        if is_broadcast
+            && may_forward
+            && relayable_broadcast
+            && !(authenticated_replay.is_some() && lifecycle_kind.is_some())
+        {
             let rebroadcast = self.relay_broadcast(&header, payload.as_slice()).await;
             if let Err(e) = rebroadcast {
                 log::warn!(
@@ -1081,6 +1562,7 @@ impl<M: MacDriver> NwkLayer<M> {
             }
         }
 
+        #[cfg(feature = "router")]
         if !is_for_us {
             // Rejoin Requests are one-hop parent-selection commands and are
             // never routed beyond the prospective parent.
@@ -1090,7 +1572,10 @@ impl<M: MacDriver> NwkLayer<M> {
             // Not for us — relay unicast if we are a routing device. A
             // broadcast has already been rebroadcast above and must not be
             // sent a second time through the unicast relay.
-            if !is_broadcast && may_forward {
+            if !is_broadcast
+                && may_forward
+                && !(authenticated_replay.is_some() && lifecycle_kind.is_some())
+            {
                 // A Route Record is the one command that must not be carried
                 // on unchanged: it exists to record the path it travels, so
                 // this router appends itself to it (and re-secures it) instead
@@ -1163,15 +1648,15 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Verify and decrypt a secured incoming NWK frame.
     ///
     /// Returns the plaintext NWK payload, or `None` when the frame must be
-    /// dropped. The incoming replay counter is committed exactly once, and
-    /// only after the MIC verifies, so a forged or replayed frame can neither
-    /// advance the replay window nor reach the relay path.
+    /// dropped. No key activation or replay commit occurs here: the caller
+    /// first completes admission, then orders activation and replay against
+    /// lifecycle persistence. A forged/replayed frame cannot reach that path.
     fn authenticate_incoming(
         &mut self,
         mac_payload: &[u8],
         header_len: usize,
         src: ShortAddress,
-    ) -> Option<(heapless::Vec<u8, MAX_NWK_FRAME>, IeeeAddress)> {
+    ) -> Option<AuthenticatedNwkPayload> {
         self.rx_security_stats.secured_frames =
             self.rx_security_stats.secured_frames.wrapping_add(1);
 
@@ -1244,18 +1729,22 @@ impl<M: MacDriver> NwkLayer<M> {
             Some(plaintext) => {
                 self.rx_security_stats.decrypt_successes =
                     self.rx_security_stats.decrypt_successes.wrapping_add(1);
-                // Step 3: MIC verified — NOW commit the replay counter, once.
-                self.security.commit_frame_counter_for_key(
-                    &sec_hdr.source_address,
-                    sec_hdr.key_seq_number,
-                    sec_hdr.frame_counter,
-                );
+                let replay = crate::security::NwkReplayCounter {
+                    source: sec_hdr.source_address,
+                    key_sequence: sec_hdr.key_seq_number,
+                    key_fingerprint: zigbee_crypto::key_fingerprint(&key),
+                    counter: sec_hdr.frame_counter,
+                };
                 log::debug!(
                     "[NWK] Decrypted frame from 0x{:04X} ({} bytes)",
                     src.0,
                     plaintext.len()
                 );
-                Some((plaintext, sec_hdr.source_address))
+                Some(AuthenticatedNwkPayload {
+                    payload: plaintext,
+                    security_source: sec_hdr.source_address,
+                    replay,
+                })
             }
             None => {
                 self.rx_security_stats.decrypt_failures =
@@ -1289,6 +1778,23 @@ impl<M: MacDriver> NwkLayer<M> {
         }
     }
 
+    /// Whether an authenticated broadcast NWK command is relayed unchanged.
+    ///
+    /// Route Request, Route Reply, Route Record and Link Status all have
+    /// command-specific hop processing and are deliberately excluded. R22
+    /// classifies Network Status, Network Report and Network Update as normal
+    /// broadcast relays. A Network Update additionally keeps the same source
+    /// authorization as local processing: only `nwkManagerAddr` may originate
+    /// the network-wide transition.
+    #[cfg(feature = "router")]
+    fn broadcast_command_is_relayable(&self, src: ShortAddress, command_id: Option<u8>) -> bool {
+        match command_id.and_then(NwkCommandId::from_u8) {
+            Some(NwkCommandId::NetworkStatus | NwkCommandId::NetworkReport) => true,
+            Some(NwkCommandId::NetworkUpdate) => src == self.nib.nwk_manager_addr,
+            _ => false,
+        }
+    }
+
     /// Relay a NWK frame (router/coordinator duty).
     ///
     /// `payload` is the authenticated plaintext NWK payload produced by
@@ -1297,6 +1803,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// device's key material by [`NwkLayer::build_nwk_frame`]: the NWK header
     /// is CCM* additional authenticated data, so forwarding the original
     /// ciphertext under a mutated header would fail the MIC at the next hop.
+    #[cfg(feature = "router")]
     async fn relay_frame(
         &mut self,
         header: &NwkHeader,
@@ -1455,6 +1962,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// through us — where the capability information came from its own
     /// Association Request — is treated as one; everything else is relayed
     /// directly.
+    #[cfg(feature = "router")]
     fn is_sleepy_child(&self, addr: ShortAddress) -> bool {
         self.neighbors.find_by_short(addr).is_some_and(|neighbor| {
             !neighbor.rx_on_when_idle
@@ -1467,6 +1975,7 @@ impl<M: MacDriver> NwkLayer<M> {
     }
 
     /// Relay a frame using source routing (relay list in NWK header).
+    #[cfg(feature = "router")]
     async fn relay_frame_source_routed(
         &mut self,
         header: &NwkHeader,
@@ -1550,6 +2059,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// number, decrements the radius and is re-secured hop by hop by
     /// [`NwkLayer::build_nwk_frame`] with this device's own IEEE address and a
     /// fresh durable frame counter, exactly like any other relay.
+    #[cfg(feature = "router")]
     async fn relay_route_record(
         &mut self,
         header: &NwkHeader,
@@ -1639,6 +2149,7 @@ impl<M: MacDriver> NwkLayer<M> {
     }
 
     /// Select a router neighbor for many-to-one failure recovery.
+    #[cfg(feature = "router")]
     fn random_router_neighbor(
         &mut self,
         exclude_a: Option<ShortAddress>,
@@ -1670,6 +2181,7 @@ impl<M: MacDriver> NwkLayer<M> {
     }
 
     /// Handle relay failure: retire the broken path and queue the R22 status.
+    #[cfg(feature = "router")]
     fn handle_relay_failure(
         &mut self,
         header: &NwkHeader,
@@ -1739,6 +2251,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// `payload` is the authenticated plaintext; a secured broadcast is
     /// re-secured with this device's own key material, exactly like a unicast
     /// relay, because the decremented radius is authenticated header data.
+    #[cfg(feature = "router")]
     async fn relay_broadcast(
         &mut self,
         header: &NwkHeader,
@@ -1856,6 +2369,8 @@ impl<M: MacDriver> NwkLayer<M> {
         security_source: Option<IeeeAddress>,
         payload: &[u8],
     ) -> Option<NwkCommandOutcome> {
+        #[cfg(not(feature = "router"))]
+        let _ = (prev_hop, lqi, security_source);
         let src = header.src_addr;
         let dst = header.dst_addr;
         if payload.is_empty() {
@@ -1869,10 +2384,13 @@ impl<M: MacDriver> NwkLayer<M> {
         // On a secured network every NWK command is NWK-encrypted. Accepting
         // an unsecured one would let any nearby device forge a Leave, a route
         // error or a link-status update.
+        #[cfg(feature = "router")]
         let is_local_rejoin = cmd_id_byte == NwkCommandId::RejoinRequest as u8
             && dst == self.nib.network_address
             && self.can_route()
             && header.src_ieee.is_some();
+        #[cfg(not(feature = "router"))]
+        let is_local_rejoin = false;
         if self.nib.security_enabled && !secured && !is_local_rejoin {
             log::warn!(
                 "[NWK] Dropping unsecured NWK command 0x{:02X} from 0x{:04X}",
@@ -1884,6 +2402,7 @@ impl<M: MacDriver> NwkLayer<M> {
 
         match NwkCommandId::from_u8(cmd_id_byte) {
             Some(NwkCommandId::Leave) => return self.handle_nwk_leave(src, dst, cmd_payload),
+            #[cfg(feature = "router")]
             Some(NwkCommandId::RouteRequest) => {
                 self.handle_route_request(header, prev_hop, lqi, cmd_payload)
             }
@@ -1891,8 +2410,11 @@ impl<M: MacDriver> NwkLayer<M> {
             // frame came from. A Route Record names the *originating* device
             // whose path is being recorded, and a Link Status describes the
             // sender's own links: both stay keyed on the NWK source.
+            #[cfg(feature = "router")]
             Some(NwkCommandId::RouteReply) => self.handle_route_reply(prev_hop, cmd_payload),
+            #[cfg(feature = "router")]
             Some(NwkCommandId::RouteRecord) => self.handle_route_record(src, cmd_payload),
+            #[cfg(feature = "router")]
             Some(NwkCommandId::LinkStatus) => self.handle_link_status(src, cmd_payload),
             Some(NwkCommandId::NetworkStatus) => {
                 return self.handle_network_status(src, cmd_payload);
@@ -1903,10 +2425,9 @@ impl<M: MacDriver> NwkLayer<M> {
             // acted on, a foreign network, a device that is not the manager —
             // must never clear an update that is still waiting to go out, or
             // the manager would change PAN ID without telling anyone.
+            #[cfg(feature = "router")]
             Some(NwkCommandId::NetworkReport) => {
-                if let Some(update) = self.handle_network_report(cmd_payload) {
-                    self.pending_pan_id_broadcast = Some(update);
-                }
+                self.queue_pan_id_update_from_report(cmd_payload);
             }
             // R22 §3.6.1.13.3: adopt the new PAN identifier after
             // nwkNetworkBroadcastDeliveryTime.
@@ -1914,6 +2435,7 @@ impl<M: MacDriver> NwkLayer<M> {
             Some(NwkCommandId::EdTimeoutResponse) => {
                 self.handle_ed_timeout_response(src, dst, cmd_payload)
             }
+            #[cfg(feature = "router")]
             Some(NwkCommandId::EdTimeoutRequest) => {
                 return self.handle_ed_timeout_request(
                     header,
@@ -1922,6 +2444,7 @@ impl<M: MacDriver> NwkLayer<M> {
                     cmd_payload,
                 );
             }
+            #[cfg(feature = "router")]
             Some(NwkCommandId::RejoinRequest) => {
                 return self.handle_rejoin_request(header, secured, security_source, cmd_payload);
             }
@@ -1943,6 +2466,65 @@ impl<M: MacDriver> NwkLayer<M> {
         None
     }
 
+    fn classify_lifecycle_command(
+        &self,
+        src: ShortAddress,
+        dst: ShortAddress,
+        payload: &[u8],
+    ) -> Option<NwkLifecyclePersistence> {
+        let command = NwkCommandId::from_u8(*payload.first()?)?;
+        match command {
+            NwkCommandId::NetworkReport | NwkCommandId::NetworkUpdate => {
+                Some(NwkLifecyclePersistence::SecurityState)
+            }
+            NwkCommandId::Leave => {
+                let leave = crate::frames::LeaveCommand::parse(payload.get(1..)?)?;
+                if leave.request {
+                    (dst == self.nib.network_address && src == self.nib.parent_address).then_some(
+                        if leave.remove_children && self.can_route() {
+                            NwkLifecyclePersistence::ChildState
+                        } else {
+                            NwkLifecyclePersistence::SecurityState
+                        },
+                    )
+                } else if src == self.nib.parent_address {
+                    Some(NwkLifecyclePersistence::SecurityState)
+                } else {
+                    self.neighbors.find_by_short(src).and_then(|entry| {
+                        matches!(
+                            entry.relationship,
+                            crate::neighbor::Relationship::Child
+                                | crate::neighbor::Relationship::UnauthenticatedChild
+                        )
+                        .then_some(NwkLifecyclePersistence::ChildState)
+                    })
+                }
+            }
+            NwkCommandId::NetworkStatus => {
+                let status = crate::frames::NetworkStatusCommand::parse(payload.get(1..)?)?;
+                if status.status_code != crate::frames::NetworkStatusCommand::ADDRESS_CONFLICT {
+                    return None;
+                }
+                if status.destination == self.nib.network_address {
+                    Some(NwkLifecyclePersistence::SecurityState)
+                } else {
+                    self.neighbors
+                        .find_by_short(status.destination)
+                        .and_then(|entry| {
+                            (entry.device_type == crate::neighbor::NeighborDeviceType::EndDevice
+                                && matches!(
+                                    entry.relationship,
+                                    crate::neighbor::Relationship::Child
+                                        | crate::neighbor::Relationship::UnauthenticatedChild
+                                ))
+                            .then_some(NwkLifecyclePersistence::ChildState)
+                        })
+                }
+            }
+            _ => None,
+        }
+    }
+
     // ── NWK Command Handlers ─────────────────────────────────
 
     /// Park a lifecycle outcome for the layer above, keeping the more urgent
@@ -1960,7 +2542,10 @@ impl<M: MacDriver> NwkLayer<M> {
                     3
                 }
                 NwkCommandOutcome::AddressConflict { .. } => 2,
-                NwkCommandOutcome::ChildAddressConflict { .. } => 1,
+                #[cfg(feature = "router")]
+                NwkCommandOutcome::ChildAddressConflict { .. }
+                | NwkCommandOutcome::DeviceLeft { .. } => 1,
+                #[cfg(feature = "router")]
                 NwkCommandOutcome::ChildRejoinRequest { .. }
                 | NwkCommandOutcome::EndDeviceTimeoutRequest { .. } => 0,
             }
@@ -2056,12 +2641,16 @@ impl<M: MacDriver> NwkLayer<M> {
         header: &NwkHeader,
         mac_payload: &[u8],
         consumed: usize,
-    ) -> Option<NwkCommandOutcome> {
-        if !cfg!(feature = "router") || !self.joined || !self.address_conflict_detection_enabled() {
-            // A non-routing build leaves this detection to the routers around
-            // it, which announce the conflict with a Network Status command
-            // (R22 §3.6.1.9.3); acting on that announcement is what an end
-            // device can do about it either way.
+    ) -> Option<(NwkCommandOutcome, Option<crate::security::NwkReplayCounter>)> {
+        // Self-address conflicts take an early authentication path, but must
+        // still obey the same type/destination admission as ordinary receive.
+        if (header.frame_control.frame_type != NwkFrameType::Data as u8
+            && header.frame_control.frame_type != NwkFrameType::Command as u8)
+            || (!is_unicast_address(header.dst_addr) && !is_nwk_broadcast(header.dst_addr))
+        {
+            return None;
+        }
+        if !self.joined || !self.address_conflict_detection_enabled() {
             return None;
         }
         let src_ieee = header.src_ieee?;
@@ -2069,17 +2658,23 @@ impl<M: MacDriver> NwkLayer<M> {
             return None;
         }
 
-        if self.nib.security_enabled {
+        let replay = if self.nib.security_enabled {
             if !header.frame_control.security {
                 return None;
             }
             // A frame that cannot be authenticated proves nothing at all.
-            self.authenticate_incoming(mac_payload, consumed, header.src_addr)?;
-        }
+            Some(
+                self.authenticate_incoming(mac_payload, consumed, header.src_addr)?
+                    .replay,
+            )
+        } else {
+            None
+        };
 
-        Some(self.detect_local_address_conflict())
+        Some((self.detect_local_address_conflict(), replay))
     }
 
+    #[cfg(feature = "router")]
     fn handle_rejoin_request(
         &self,
         header: &NwkHeader,
@@ -2139,6 +2734,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// indirect for a sleepy child) are performed asynchronously by the layer
     /// above via [`NwkLayer::respond_to_end_device_timeout_request`], so this
     /// synchronous handler only validates and reports.
+    #[cfg(feature = "router")]
     fn handle_ed_timeout_request(
         &self,
         header: &NwkHeader,
@@ -2323,13 +2919,19 @@ impl<M: MacDriver> NwkLayer<M> {
                 );
                 return None;
             }
-            // Stop using the network until the caller either honours the
-            // requested rejoin or clears its persisted network state.
-            self.joined = false;
+            // A parent asked to remove its children must keep the current
+            // network/key context alive until each child Leave/eviction is
+            // durably checkpointed. Leaf devices, and ordinary Leave requests,
+            // stop using the network immediately.
+            if !(leave.remove_children && self.can_route()) {
+                self.joined = false;
+            }
             // The parent relationship is over either way, so the R22 End
             // Device Timeout has to be renegotiated with whichever parent
             // accepts the device next.
             self.nib.reset_end_device_timeout_negotiation();
+            self.nib.device_announce_pending = false;
+            self.nib.parent_link_provisional = false;
             return Some(NwkCommandOutcome::LeaveRequested {
                 src,
                 rejoin: leave.rejoin,
@@ -2341,13 +2943,31 @@ impl<M: MacDriver> NwkLayer<M> {
             return None;
         }
 
+        #[cfg(feature = "router")]
+        let departing_child = self.neighbors.find_by_short(src).and_then(|entry| {
+            matches!(
+                entry.relationship,
+                crate::neighbor::Relationship::Child
+                    | crate::neighbor::Relationship::UnauthenticatedChild
+            )
+            .then_some(entry.ieee_address)
+        });
         self.neighbors.remove(src);
         if src == self.nib.parent_address {
             self.joined = false;
             self.nib.reset_end_device_timeout_negotiation();
+            self.nib.device_announce_pending = false;
+            self.nib.parent_link_provisional = false;
             return Some(NwkCommandOutcome::ParentLeft { src });
         }
-        None
+        #[cfg(feature = "router")]
+        {
+            departing_child.map(|ieee| NwkCommandOutcome::DeviceLeft { src, ieee })
+        }
+        #[cfg(not(feature = "router"))]
+        {
+            None
+        }
     }
 
     /// Handle incoming Route Request (RREQ).
@@ -2364,6 +2984,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// a new broadcast for every receiver's transaction record, so two routers
     /// would hand the same discovery back and forth without bound and the
     /// many-to-one next hops would form a cycle.
+    #[cfg(feature = "router")]
     fn handle_route_request(
         &mut self,
         header: &NwkHeader,
@@ -2579,6 +3200,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// whose radius is exhausted: a frame received with radius 1 has reached
     /// the last hop the originator allowed, so forwarding it with radius 0
     /// would extend the flood past its bound.
+    #[cfg(feature = "router")]
     fn queue_rreq_forward(
         &mut self,
         header: &NwkHeader,
@@ -2645,6 +3267,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// `prev_hop` is the neighbour that transmitted the reply — the next hop
     /// of the route being installed. The RREP names the originator that
     /// started the discovery, which is where the reply is forwarded on to.
+    #[cfg(feature = "router")]
     fn handle_route_reply(&mut self, prev_hop: ShortAddress, payload: &[u8]) {
         if !self.can_route() {
             // A Route Reply answers a Route Request, which only a router or the
@@ -2714,6 +3337,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// closest to the destination is first and the relay closest to this
     /// concentrator is last. The source-route index starts at that last entry,
     /// while the regular routing-table next hop is the same last relay.
+    #[cfg(feature = "router")]
     fn handle_route_record(&mut self, src: ShortAddress, payload: &[u8]) {
         if !self.can_route() {
             // A Route Record exists to fill a concentrator's source route
@@ -2811,6 +3435,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// feed, so the whole handler is compiled out of one
     /// ([`can_route`](crate::NwkLayer::can_route) is a compile-time `false`
     /// there).
+    #[cfg(feature = "router")]
     fn handle_link_status(&mut self, src: ShortAddress, payload: &[u8]) {
         if !self.can_route() {
             return;
@@ -2899,6 +3524,7 @@ impl<M: MacDriver> NwkLayer<M> {
 /// A relay that receives index zero forwards directly to the destination.
 ///
 /// Returns `(next_hop, new_relay_index)`.
+#[cfg(feature = "router")]
 fn process_source_route(
     sr: &crate::frames::SourceRoute,
     our_addr: ShortAddress,
@@ -2946,6 +3572,8 @@ mod tests {
         ED_TIMEOUT_ENUM_DEFAULT, ED_TIMEOUT_ENUM_REQUESTED, NwkFrameControl, NwkFrameType,
         NwkHeader,
     };
+    #[cfg(feature = "router")]
+    use crate::frames::{PanIdConflictReport, PanIdUpdate};
     use crate::{DeviceType, NwkLayer};
     use core::future::Future;
     use core::task::{Context, Poll, Waker};
@@ -2965,6 +3593,8 @@ mod tests {
     const FAR: ShortAddress = ShortAddress(0x2222);
     const NEXT_HOP: ShortAddress = ShortAddress(0x4444);
     const PAN: PanId = PanId(0x1234);
+    #[cfg(feature = "router")]
+    const EPID: IeeeAddress = [0xE0; 8];
 
     struct NoopWake;
 
@@ -3048,24 +3678,17 @@ mod tests {
 
     // ── Secured multi-hop helpers ────────────────────────────
 
-    #[cfg(feature = "router")]
     const NETWORK_KEY: crate::security::AesKey = [0x21; 16];
-    #[cfg(feature = "router")]
     const KEY_SEQ: u8 = 3;
-    #[cfg(feature = "router")]
     const ORIGIN: ShortAddress = ShortAddress(0x7777);
-    #[cfg(feature = "router")]
     const ORIGIN_IEEE: IeeeAddress = [0xA0; 8];
-    #[cfg(feature = "router")]
     const RELAY_IEEE: IeeeAddress = [0xB0; 8];
     #[cfg(feature = "router")]
     const DEST_IEEE: IeeeAddress = [0xC0; 8];
     /// Floor of the relaying device's durable outgoing-counter reservation.
-    #[cfg(feature = "router")]
     const RESERVED_FLOOR: u32 = 0x0100;
 
     /// A joined device on a NWK-secured network holding the shared key.
-    #[cfg(feature = "router")]
     fn secured_node(
         device_type: DeviceType,
         addr: ShortAddress,
@@ -3076,7 +3699,694 @@ mod tests {
         nwk.nib.security_enabled = true;
         nwk.nib.active_key_seq_number = KEY_SEQ;
         nwk.security.set_network_key(NETWORK_KEY, KEY_SEQ);
+        assert!(nwk.nib.set_frame_counter_reservation(0, RESERVED_FLOOR));
         nwk
+    }
+
+    fn frame_with_network_key(
+        header: &NwkHeader,
+        payload: &[u8],
+        key: crate::security::AesKey,
+        sequence: u8,
+        counter: u32,
+    ) -> heapless::Vec<u8, 128> {
+        let mut sender = secured_node(DeviceType::EndDevice, header.src_addr, ORIGIN_IEEE);
+        sender.security.set_network_key(key, sequence);
+        sender.nib.active_key_seq_number = sequence;
+        assert!(
+            sender
+                .nib
+                .set_frame_counter_reservation(counter, counter + 1)
+        );
+        let mut header = header.clone();
+        header.frame_control.security = true;
+        let mut bytes = [0; 128];
+        let len = sender
+            .build_nwk_frame(&header, payload, &mut bytes)
+            .unwrap();
+        heapless::Vec::from_slice(&bytes[..len]).unwrap()
+    }
+
+    #[test]
+    fn staged_newer_key_activates_on_authenticated_data_including_sequence_wrap() {
+        for (active, staged) in [(3, 4), (255, 0)] {
+            let mut receiver = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+            receiver.security.set_network_key(NETWORK_KEY, active);
+            receiver.nib.active_key_seq_number = active;
+            assert!(receiver.security.stage_network_key([0x42; 16], staged));
+            let on_air = frame_with_network_key(
+                &frame(NwkFrameType::Data, ORIGIN, OUR_ADDR),
+                &[0xCA, 0xFE],
+                [0x42; 16],
+                staged,
+                10,
+            );
+            assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_some());
+            assert_eq!(receiver.security.active_key().unwrap().seq_number, staged);
+            assert_eq!(receiver.nib.active_key_seq_number, staged);
+            assert!(receiver.security.staged_key().is_none());
+            assert_eq!(
+                receiver.security.secondary_key().unwrap().seq_number,
+                active
+            );
+            assert!(
+                !receiver
+                    .security
+                    .check_frame_counter_for_key(&ORIGIN_IEEE, staged, 10)
+            );
+
+            // Retained old-key traffic remains readable, but never reverses
+            // the switch, even after a duplicate Transport-Key delivery.
+            for restage in [false, true] {
+                if restage {
+                    assert!(receiver.security.stage_network_key(NETWORK_KEY, active));
+                }
+                let previous = frame_with_network_key(
+                    &frame(NwkFrameType::Data, ORIGIN, OUR_ADDR),
+                    &[0xAB],
+                    NETWORK_KEY,
+                    active,
+                    20 + u32::from(restage),
+                );
+                assert!(block_on(receiver.process_incoming_nwk_frame(&previous, 42)).is_some());
+                assert_eq!(receiver.security.active_key().unwrap().seq_number, staged);
+                assert_eq!(receiver.nib.active_key_seq_number, staged);
+                assert!(receiver.security.staged_key().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn switch_key_retransmission_cannot_reactivate_previous_key_or_release_activation_barrier() {
+        for (active, newer) in [(3, 4), (255, 0)] {
+            for received_activation in [false, true] {
+                let mut receiver = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+                receiver.security.set_network_key(NETWORK_KEY, active);
+                receiver.nib.active_key_seq_number = active;
+                receiver
+                    .security
+                    .commit_frame_counter_for_key(&ORIGIN_IEEE, active, 100);
+                assert!(receiver.security.stage_network_key([0x42; 16], newer));
+                if received_activation {
+                    receiver.set_lifecycle_persistence_enabled(true);
+                    let on_air = frame_with_network_key(
+                        &frame(NwkFrameType::Data, ORIGIN, OUR_ADDR),
+                        &[0xAB],
+                        [0x42; 16],
+                        newer,
+                        10,
+                    );
+                    assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_some());
+                } else {
+                    assert!(receiver.switch_active_network_key(newer));
+                }
+
+                // A duplicate Switch-Key can target the now-retained key,
+                // with or without a retransmitted old Transport-Key first.
+                for restage in [false, true] {
+                    if restage {
+                        assert!(receiver.security.stage_network_key(NETWORK_KEY, active));
+                    }
+                    assert!(!receiver.switch_active_network_key(active));
+                    assert!(receiver.switch_active_network_key(newer));
+                    assert_eq!(receiver.nib.active_key_seq_number, newer);
+                    assert_eq!(receiver.security.active_key().unwrap().seq_number, newer);
+                    assert_eq!(
+                        receiver.security.secondary_key().unwrap().seq_number,
+                        active
+                    );
+                    assert!(receiver.security.staged_key().is_none());
+                    assert!(!receiver.security.check_frame_counter_for_key(
+                        &ORIGIN_IEEE,
+                        active,
+                        100
+                    ));
+                    assert_eq!(receiver.security.activation_pending, received_activation);
+                }
+
+                if received_activation {
+                    assert_eq!(
+                        receiver.pending_lifecycle_replay().unwrap().1,
+                        NwkLifecyclePersistence::SecurityState
+                    );
+                    assert!(
+                        receiver
+                            .security
+                            .check_frame_counter_for_key(&ORIGIN_IEEE, newer, 10)
+                    );
+                    block_on(receiver.complete_lifecycle_persistence());
+                    assert!(!receiver.security.activation_pending);
+                    assert!(!receiver.security.check_frame_counter_for_key(
+                        &ORIGIN_IEEE,
+                        newer,
+                        10
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bad_mic_or_replayed_staged_key_never_activates_or_commits_a_floor() {
+        for replayed in [false, true] {
+            let mut receiver = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+            assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+            let mut on_air = frame_with_network_key(
+                &frame(NwkFrameType::Data, ORIGIN, OUR_ADDR),
+                &[0xAB],
+                [0x42; 16],
+                KEY_SEQ + 1,
+                10,
+            );
+            if replayed {
+                receiver
+                    .security
+                    .commit_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10);
+            } else {
+                *on_air.last_mut().unwrap() ^= 1;
+            }
+            receiver.set_lifecycle_persistence_enabled(true);
+            let mut commit = |_| panic!("a rejected frame must not reach replay persistence");
+            assert!(
+                block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
+                    &on_air,
+                    42,
+                    None,
+                    &mut commit,
+                ))
+                .is_none()
+            );
+            assert_eq!(receiver.security.active_key().unwrap().seq_number, KEY_SEQ);
+            assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ);
+            assert_eq!(
+                receiver.security.staged_key().unwrap().seq_number,
+                KEY_SEQ + 1
+            );
+            assert!(receiver.pending_lifecycle_replay().is_none());
+            assert_eq!(
+                receiver
+                    .security
+                    .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10),
+                !replayed,
+            );
+        }
+    }
+
+    #[test]
+    fn activated_local_data_requires_security_snapshot_but_can_become_child_owned() {
+        let mut receiver = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+        assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+        let on_air = frame_with_network_key(
+            &frame(NwkFrameType::Data, ORIGIN, OUR_ADDR),
+            &[0xAB],
+            [0x42; 16],
+            KEY_SEQ + 1,
+            10,
+        );
+        receiver.set_lifecycle_persistence_enabled(true);
+        let mut commit = |_| panic!("activation must persist its snapshot before replay");
+        assert!(
+            block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
+                &on_air,
+                42,
+                None,
+                &mut commit,
+            ))
+            .is_some()
+        );
+        assert_eq!(
+            receiver.pending_lifecycle_replay().unwrap().1,
+            NwkLifecyclePersistence::SecurityState,
+        );
+        assert!(
+            receiver
+                .security
+                .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+        );
+        receiver.classify_pending_lifecycle_replay(NwkLifecyclePersistence::ChildState);
+        assert_eq!(
+            receiver.pending_lifecycle_replay().unwrap().1,
+            NwkLifecyclePersistence::ChildState,
+        );
+        block_on(receiver.complete_lifecycle_persistence());
+        assert!(
+            !receiver
+                .security
+                .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+        );
+    }
+
+    #[test]
+    fn rejected_frame_admission_never_activates_a_staged_key() {
+        for rejected in 0..4 {
+            let mut receiver = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+            assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+            let mut header = frame(NwkFrameType::Data, ORIGIN, OUR_ADDR);
+            match rejected {
+                0 => header.frame_control.frame_type = 3,
+                1 => header.dst_addr = ShortAddress(0xFFFE),
+                2 => header.dst_addr = FAR,
+                _ => {
+                    header.src_addr = OUR_ADDR;
+                    header.src_ieee = Some(ORIGIN_IEEE);
+                    header.frame_control.src_ieee_present = true;
+                    header.frame_control.frame_type = 3;
+                }
+            }
+            let on_air = frame_with_network_key(&header, &[0xAB], [0x42; 16], KEY_SEQ + 1, 10);
+            receiver.set_lifecycle_persistence_enabled(true);
+            let mut commit = |_| panic!("a rejected frame cannot commit replay");
+            assert!(
+                block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
+                    &on_air,
+                    42,
+                    None,
+                    &mut commit,
+                ))
+                .is_none()
+            );
+            assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ);
+            assert!(!receiver.security.activation_pending);
+            assert!(receiver.pending_lifecycle_replay().is_none());
+            assert!(
+                receiver
+                    .security
+                    .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+            );
+        }
+    }
+
+    #[test]
+    fn failed_replay_hook_does_not_activate_or_consume_the_staged_keys_floor() {
+        let mut receiver = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+        assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+        let on_air = frame_with_network_key(
+            &frame(NwkFrameType::Data, ORIGIN, OUR_ADDR),
+            &[0xAB],
+            [0x42; 16],
+            KEY_SEQ + 1,
+            10,
+        );
+        let mut commit = |_| false;
+        assert!(
+            block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
+                &on_air,
+                42,
+                None,
+                &mut commit,
+            ))
+            .is_none()
+        );
+        assert_eq!(receiver.security.active_key().unwrap().seq_number, KEY_SEQ);
+        assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ);
+        assert!(
+            receiver
+                .security
+                .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+        );
+        assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_some());
+        assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ + 1);
+    }
+
+    #[test]
+    fn activation_abort_preserves_floor_and_cannot_bypass_the_snapshot_on_retry() {
+        let mut receiver = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+        assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+        let on_air = frame_with_network_key(
+            &frame(NwkFrameType::Data, ORIGIN, OUR_ADDR),
+            &[0xAB],
+            [0x42; 16],
+            KEY_SEQ + 1,
+            10,
+        );
+        for _ in 0..2 {
+            receiver.set_lifecycle_persistence_enabled(true);
+            let mut commit = |_| panic!("retry must still checkpoint before replay");
+            assert!(
+                block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
+                    &on_air,
+                    42,
+                    None,
+                    &mut commit,
+                ))
+                .is_some()
+            );
+            assert_eq!(
+                receiver.pending_lifecycle_replay().unwrap().1,
+                NwkLifecyclePersistence::SecurityState,
+            );
+            assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ + 1);
+            receiver.abort_lifecycle_persistence();
+            // Completing a transaction that was aborted cannot release the
+            // activation fence, nor can disabling durability for a retry.
+            block_on(receiver.complete_lifecycle_persistence());
+            receiver.set_lifecycle_persistence_enabled(false);
+            assert!(receiver.security.activation_pending);
+            assert!(receiver.pending_lifecycle_replay().is_none());
+            assert!(
+                receiver
+                    .security
+                    .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+            );
+            assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_none());
+            assert_eq!(
+                block_on(receiver.nlde_data_request(ORIGIN, 5, &[0x01], true, false)).err(),
+                Some(NwkStatus::NotPermitted),
+            );
+            assert!(receiver.mac.tx_history().is_empty());
+        }
+        receiver.set_lifecycle_persistence_enabled(true);
+        assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_some());
+        block_on(receiver.complete_lifecycle_persistence());
+        assert!(!receiver.security.activation_pending);
+        assert!(
+            !receiver
+                .security
+                .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+        );
+        assert!(block_on(receiver.nlde_data_request(ORIGIN, 5, &[0x01], true, false)).is_ok());
+    }
+
+    #[test]
+    fn activated_parent_leave_keeps_its_security_persistence_precedence() {
+        let mut receiver = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+        receiver.nib.parent_address = ORIGIN;
+        assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+        let on_air = frame_with_network_key(
+            &frame(NwkFrameType::Command, ORIGIN, OUR_ADDR),
+            &[NwkCommandId::Leave as u8, 0x40],
+            [0x42; 16],
+            KEY_SEQ + 1,
+            10,
+        );
+        receiver.set_lifecycle_persistence_enabled(true);
+        assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_none());
+        assert!(matches!(
+            receiver.take_command_outcome(),
+            Some(NwkCommandOutcome::LeaveRequested { .. })
+        ));
+        receiver.classify_pending_lifecycle_replay(NwkLifecyclePersistence::ChildState);
+        assert_eq!(
+            receiver.pending_lifecycle_replay().unwrap().1,
+            NwkLifecyclePersistence::SecurityState
+        );
+        assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ + 1);
+        assert!(
+            receiver
+                .security
+                .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+        );
+    }
+
+    #[test]
+    fn activation_from_ordinary_command_or_self_conflict_requires_a_security_snapshot() {
+        for self_conflict in [false, true] {
+            let mut receiver = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+            assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+            let mut header = frame(NwkFrameType::Command, ORIGIN, OUR_ADDR);
+            if self_conflict {
+                header.src_addr = OUR_ADDR;
+                header.src_ieee = Some(ORIGIN_IEEE);
+                header.frame_control.src_ieee_present = true;
+            }
+            let on_air = frame_with_network_key(
+                &header,
+                &[NwkCommandId::EdTimeoutResponse as u8, 0, 0],
+                [0x42; 16],
+                KEY_SEQ + 1,
+                10,
+            );
+            receiver.set_lifecycle_persistence_enabled(true);
+            let mut commit = |_| panic!("activation must not commit replay before its snapshot");
+            assert!(
+                block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
+                    &on_air,
+                    42,
+                    None,
+                    &mut commit,
+                ))
+                .is_none()
+            );
+            assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ + 1);
+            assert_eq!(
+                receiver.security.active_key().unwrap().seq_number,
+                KEY_SEQ + 1
+            );
+            assert_eq!(
+                receiver.pending_lifecycle_replay().unwrap().1,
+                NwkLifecyclePersistence::SecurityState
+            );
+            assert!(
+                receiver
+                    .security
+                    .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+            );
+            assert_eq!(receiver.take_command_outcome().is_some(), self_conflict);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn storeless_activation_relays_with_the_new_key_and_nib_sequence() {
+        for dst in [ShortAddress::BROADCAST, FAR] {
+            let mut receiver = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+            receiver.routing.update_route(FAR, NEXT_HOP, 1).unwrap();
+            assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+            let on_air = frame_with_network_key(
+                &frame(NwkFrameType::Data, ORIGIN, dst),
+                &[0xAB],
+                [0x42; 16],
+                KEY_SEQ + 1,
+                10,
+            );
+            let _ = block_on(receiver.process_incoming_nwk_frame(&on_air, 42));
+            assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ + 1);
+            assert!(!receiver.security.activation_pending);
+            assert!(receiver.pending_lifecycle_replay().is_none());
+            assert_eq!(receiver.mac.tx_history().len(), 1);
+            let (_, aux, payload) =
+                decrypt_recorded_with_key(&recorded_frame(&receiver, 0), &[0x42; 16]);
+            assert_eq!(aux.key_seq_number, KEY_SEQ + 1);
+            assert_eq!(payload.as_slice(), &[0xAB]);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn activated_child_leave_still_waits_for_the_child_store() {
+        let mut receiver = parent_with_sleepy_child();
+        assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+        let on_air = frame_with_network_key(
+            &frame(NwkFrameType::Command, ORIGIN, OUR_ADDR),
+            &[NwkCommandId::Leave as u8, 0],
+            [0x42; 16],
+            KEY_SEQ + 1,
+            10,
+        );
+        receiver.set_lifecycle_persistence_enabled(true);
+        assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_none());
+        assert!(matches!(
+            receiver.take_command_outcome(),
+            Some(NwkCommandOutcome::DeviceLeft { .. })
+        ));
+        receiver.classify_pending_lifecycle_replay(NwkLifecyclePersistence::SecurityState);
+        assert_eq!(
+            receiver.pending_lifecycle_replay().unwrap().1,
+            NwkLifecyclePersistence::ChildState
+        );
+        assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ + 1);
+        assert!(
+            receiver
+                .security
+                .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn activation_defers_broadcast_and_unicast_relays_until_durable_completion() {
+        for dst in [ShortAddress::BROADCAST, ShortAddress(0xFFFB), FAR] {
+            let mut receiver = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+            receiver.routing.update_route(FAR, NEXT_HOP, 1).unwrap();
+            assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+            let header = frame(NwkFrameType::Data, ORIGIN, dst);
+            let on_air = frame_with_network_key(&header, &[0xAB], [0x42; 16], KEY_SEQ + 1, 10);
+            receiver.set_lifecycle_persistence_enabled(true);
+            let mut commit = |_| panic!("no replay commit before the security snapshot");
+            let indication = block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
+                &on_air,
+                42,
+                Some(PEER),
+                &mut commit,
+            ));
+            assert_eq!(indication.is_some(), dst == ShortAddress::BROADCAST);
+            assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ + 1);
+            assert_eq!(
+                receiver.pending_lifecycle_replay().unwrap().1,
+                NwkLifecyclePersistence::SecurityState
+            );
+            assert!(
+                receiver
+                    .security
+                    .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+            );
+            assert!(!receiver.btr.is_duplicate(ORIGIN, header.seq_number));
+            assert!(receiver.mac.tx_history().is_empty());
+            assert_eq!(receiver.nib.outgoing_frame_counter, 0);
+            assert_eq!(
+                receiver
+                    .pending_lifecycle_relay
+                    .as_ref()
+                    .unwrap()
+                    .previous_hop,
+                PEER
+            );
+            assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_none());
+            assert!(receiver.mac.tx_history().is_empty());
+
+            // Simulates the owner having committed snapshot, child state
+            // (if any), and replay floor; only this call may release the relay.
+            block_on(receiver.complete_lifecycle_persistence());
+            assert_eq!(receiver.mac.tx_history().len(), 1);
+            assert_eq!(
+                tx_short_dst(&receiver.mac.tx_history()[0]),
+                Some(if dst == FAR {
+                    NEXT_HOP
+                } else {
+                    ShortAddress::BROADCAST
+                })
+            );
+            let (relayed, aux, payload) =
+                decrypt_recorded_with_key(&recorded_frame(&receiver, 0), &[0x42; 16]);
+            assert_eq!(aux.key_seq_number, KEY_SEQ + 1);
+            assert_eq!(aux.source_address, RELAY_IEEE);
+            assert_eq!(payload.as_slice(), &[0xAB]);
+            assert_eq!(relayed.radius, header.radius - 1);
+            assert_eq!(relayed.src_addr, ORIGIN);
+            assert_eq!(relayed.dst_addr, dst);
+            assert!(
+                !receiver
+                    .security
+                    .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+            );
+            assert_eq!(
+                receiver.btr.is_duplicate(ORIGIN, header.seq_number),
+                dst != FAR
+            );
+            block_on(receiver.complete_lifecycle_persistence());
+            assert_eq!(receiver.mac.tx_history().len(), 1);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn activation_abort_discards_deferred_relay_without_poisoning_btr_or_replay() {
+        for dst in [ShortAddress::BROADCAST, FAR] {
+            let mut receiver = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+            receiver.routing.update_route(FAR, NEXT_HOP, 1).unwrap();
+            assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+            let header = frame(NwkFrameType::Data, ORIGIN, dst);
+            let on_air = frame_with_network_key(&header, &[0xAB], [0x42; 16], KEY_SEQ + 1, 10);
+            receiver.set_lifecycle_persistence_enabled(true);
+            let _ = block_on(receiver.process_incoming_nwk_frame(&on_air, 42));
+            receiver.abort_lifecycle_persistence();
+            assert!(receiver.pending_lifecycle_relay.is_none());
+            block_on(receiver.complete_lifecycle_persistence());
+            assert!(receiver.mac.tx_history().is_empty());
+            assert_eq!(receiver.nib.outgoing_frame_counter, 0);
+            assert!(!receiver.btr.is_duplicate(ORIGIN, header.seq_number));
+            assert!(
+                receiver
+                    .security
+                    .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+            );
+
+            receiver.set_lifecycle_persistence_enabled(true);
+            let mut commit = |_| panic!("a failed activation must not take the replay fast path");
+            let _ = block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
+                &on_air,
+                42,
+                None,
+                &mut commit,
+            ));
+            assert!(receiver.mac.tx_history().is_empty());
+            block_on(receiver.complete_lifecycle_persistence());
+            assert_eq!(receiver.mac.tx_history().len(), 1);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn btr_duplicate_with_staged_key_does_not_activate_it() {
+        let mut receiver = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+        let header = frame(NwkFrameType::Data, ORIGIN, ShortAddress::BROADCAST);
+        let on_air = frame_with_network_key(&header, &[0xAB], [0x42; 16], KEY_SEQ + 1, 10);
+        receiver.btr.record(ORIGIN, header.seq_number);
+        receiver.set_lifecycle_persistence_enabled(true);
+        assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_none());
+        assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ);
+        assert_eq!(receiver.security.active_key().unwrap().seq_number, KEY_SEQ);
+        assert!(receiver.pending_lifecycle_replay().is_none());
+        assert!(
+            receiver
+                .security
+                .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+        );
+        assert!(receiver.mac.tx_history().is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn activated_route_record_appends_this_hop_only_after_completion() {
+        let mut receiver = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        receiver.routing.update_route(FAR, NEXT_HOP, 1).unwrap();
+        assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+        let on_air = frame_with_network_key(
+            &frame(NwkFrameType::Command, ORIGIN, FAR),
+            &[NwkCommandId::RouteRecord as u8, 0],
+            [0x42; 16],
+            KEY_SEQ + 1,
+            10,
+        );
+        receiver.set_lifecycle_persistence_enabled(true);
+        assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_none());
+        assert!(receiver.mac.tx_history().is_empty());
+        assert_eq!(
+            receiver.pending_lifecycle_replay().unwrap().1,
+            NwkLifecyclePersistence::SecurityState
+        );
+        block_on(receiver.complete_lifecycle_persistence());
+        let (_, aux, payload) =
+            decrypt_recorded_with_key(&recorded_frame(&receiver, 0), &[0x42; 16]);
+        assert_eq!(aux.key_seq_number, KEY_SEQ + 1);
+        assert_eq!(route_record_relays(&payload).as_slice(), &[OUR_ADDR]);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn activated_unicast_is_not_exposed_to_a_sleepy_child_before_completion() {
+        let mut receiver = parent_with_sleepy_child();
+        assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+        let on_air = frame_with_network_key(
+            &frame(NwkFrameType::Data, PEER, ORIGIN),
+            &[0xAB],
+            [0x42; 16],
+            KEY_SEQ + 1,
+            10,
+        );
+        receiver.set_lifecycle_persistence_enabled(true);
+        assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_none());
+        assert!(!receiver.indirect_queue().has_pending(ORIGIN));
+        assert!(receiver.mac.indirect_pending_history().is_empty());
+        assert!(receiver.mac.tx_history().is_empty());
+        block_on(receiver.complete_lifecycle_persistence());
+        assert!(receiver.indirect_queue().has_pending(ORIGIN));
+        assert_eq!(
+            receiver.mac.indirect_pending_history().last(),
+            Some(&(MacAddress::Short(PAN, ORIGIN), true)),
+        );
+        assert!(receiver.mac.tx_history().is_empty());
     }
 
     /// Copy a recorded transmission out of the mock MAC history.
@@ -3181,6 +4491,18 @@ mod tests {
         crate::security::NwkSecurityHeader,
         heapless::Vec<u8, MAX_NWK_FRAME>,
     ) {
+        decrypt_recorded_with_key(bytes, &NETWORK_KEY)
+    }
+
+    #[cfg(feature = "router")]
+    fn decrypt_recorded_with_key(
+        bytes: &[u8],
+        key: &crate::security::AesKey,
+    ) -> (
+        NwkHeader,
+        crate::security::NwkSecurityHeader,
+        heapless::Vec<u8, MAX_NWK_FRAME>,
+    ) {
         let (header, consumed) = NwkHeader::parse(bytes).expect("the frame parses");
         let (aux, aux_len) = crate::security::NwkSecurityHeader::parse(&bytes[consumed..])
             .expect("the frame carries an auxiliary header");
@@ -3189,7 +4511,7 @@ mod tests {
         aad[..aad_len].copy_from_slice(&bytes[..aad_len]);
         aad[consumed] = (aad[consumed] & !0x07) | 0x05;
         let plaintext = crate::security::NwkSecurity::new()
-            .decrypt(&aad[..aad_len], &bytes[aad_len..], &NETWORK_KEY, &aux)
+            .decrypt(&aad[..aad_len], &bytes[aad_len..], key, &aux)
             .expect("the recorded frame decrypts under the shared network key");
         (header, aux, plaintext)
     }
@@ -4011,6 +5333,39 @@ mod tests {
             "an unauthorized leave reports no lifecycle outcome"
         );
         assert!(nwk.is_joined());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn remove_children_leave_keeps_parent_online_for_the_cascade() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        let leave = crate::frames::LeaveCommand {
+            remove_children: true,
+            request: true,
+            rejoin: false,
+        };
+        let mut payload = [0u8; 32];
+        let payload_len = command_payload(NwkCommandId::Leave, &[leave.serialize()], &mut payload);
+        let mut buf = [0u8; 128];
+        let len = encode(
+            &frame(NwkFrameType::Command, ShortAddress::COORDINATOR, OUR_ADDR),
+            &payload[..payload_len],
+            &mut buf,
+        );
+
+        assert!(block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+        assert_eq!(
+            nwk.take_command_outcome(),
+            Some(NwkCommandOutcome::LeaveRequested {
+                src: ShortAddress::COORDINATOR,
+                rejoin: false,
+                remove_children: true,
+            })
+        );
+        assert!(
+            nwk.is_joined(),
+            "the current key/network context is needed to send child Leave requests"
+        );
     }
 
     #[test]
@@ -5016,6 +6371,32 @@ mod tests {
 
     #[test]
     #[cfg(feature = "router")]
+    fn secured_non_parent_traffic_does_not_clear_the_provisional_parent_gate() {
+        let on_air = secured_frame_on_air(OUR_ADDR, &[0x01, 0x02]);
+        let mut device = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        device.nib.parent_address = PEER;
+        device.nib.parent_link_provisional = true;
+        device.update_neighbor_address(ORIGIN, ORIGIN_IEEE);
+
+        let _ = block_on(device.process_incoming_nwk_frame(&on_air, 42));
+        assert!(device.nib.parent_link_provisional);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn secured_selected_parent_traffic_clears_the_provisional_parent_gate() {
+        let on_air = secured_frame_on_air(OUR_ADDR, &[0x01, 0x02]);
+        let mut device = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        device.nib.parent_address = ORIGIN;
+        device.nib.parent_link_provisional = true;
+        device.update_neighbor_address(ORIGIN, ORIGIN_IEEE);
+
+        let _ = block_on(device.process_incoming_nwk_frame(&on_air, 42));
+        assert!(!device.nib.parent_link_provisional);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
     fn unsecured_commands_are_not_relayed_on_a_secured_network() {
         let mut nwk = node(DeviceType::Router, OUR_ADDR);
         nwk.nib.security_enabled = true;
@@ -5252,7 +6633,7 @@ mod tests {
         assert!(!nwk.indirect_queue().has_pending(FAR));
     }
 
-    // ── NWK command propagation is owned by the handlers ─────
+    // ── NWK command propagation policy ───────────────────────
 
     #[test]
     #[cfg(feature = "router")]
@@ -5349,6 +6730,255 @@ mod tests {
             3 + 7,
             "the forward carries our accumulated path cost, not the originator's"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_storeless_router_relays_the_r22_broadcast_command_set_once() {
+        let status_body = [
+            crate::frames::NetworkStatusCommand::ADDRESS_CONFLICT,
+            (FAR.0 & 0xFF) as u8,
+            (FAR.0 >> 8) as u8,
+        ];
+
+        let mut report = PanIdConflictReport {
+            epid: EPID,
+            pan_ids: heapless::Vec::new(),
+        };
+        report.pan_ids.push(PAN).unwrap();
+        let mut report_body = [0u8; 32];
+        let report_len = report.serialize(&mut report_body).unwrap();
+
+        let update = PanIdUpdate {
+            epid: EPID,
+            update_id: 8,
+            new_pan_id: PanId(0xBEEF),
+        };
+        let mut update_body = [0u8; PanIdUpdate::WIRE_SIZE];
+        let update_len = update.serialize(&mut update_body).unwrap();
+
+        for (command, body) in [
+            (NwkCommandId::NetworkStatus, &status_body[..]),
+            (NwkCommandId::NetworkReport, &report_body[..report_len]),
+            (NwkCommandId::NetworkUpdate, &update_body[..update_len]),
+        ] {
+            let mut router = node(DeviceType::Router, OUR_ADDR);
+            router.nib.extended_pan_id = EPID;
+            router.nib.nwk_manager_addr = PEER;
+            router.nib.set_nwk_update_id(7);
+
+            let mut payload = [0u8; 32];
+            let payload_len = command_payload(command, body, &mut payload);
+            let mut buf = [0u8; 128];
+            let len = encode(
+                &frame(NwkFrameType::Command, PEER, ShortAddress::BROADCAST),
+                &payload[..payload_len],
+                &mut buf,
+            );
+
+            assert!(
+                block_on(router.process_incoming_nwk_frame(&buf[..len], 42)).is_none(),
+                "{command:?} is handled inside NWK",
+            );
+            assert_eq!(
+                router.mac.tx_history().len(),
+                1,
+                "a generic router must relay {command:?} without parent state",
+            );
+            assert!(
+                router.pending_lifecycle_replay().is_none(),
+                "the storeless path must not depend on lifecycle persistence",
+            );
+
+            let record = &router.mac.tx_history()[0];
+            assert_eq!(tx_short_dst(record), Some(ShortAddress::BROADCAST));
+            let bytes = record.payload.as_slice();
+            let (relayed, consumed) = NwkHeader::parse(bytes).expect("the relay parses");
+            assert_eq!(relayed.src_addr, PEER);
+            assert_eq!(relayed.dst_addr, ShortAddress::BROADCAST);
+            assert_eq!(relayed.radius, 4, "the relay decrements the radius");
+            assert_eq!(bytes[consumed], command as u8);
+
+            assert!(block_on(router.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+            assert_eq!(
+                router.mac.tx_history().len(),
+                1,
+                "the broadcast transaction record suppresses the duplicate",
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_network_update_from_a_non_manager_is_not_relayed() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        router.nib.extended_pan_id = EPID;
+        router.nib.nwk_manager_addr = FAR;
+        router.nib.set_nwk_update_id(7);
+
+        let update = PanIdUpdate {
+            epid: EPID,
+            update_id: 8,
+            new_pan_id: PanId(0xBEEF),
+        };
+        let mut body = [0u8; PanIdUpdate::WIRE_SIZE];
+        let body_len = update.serialize(&mut body).unwrap();
+        let mut payload = [0u8; 32];
+        let payload_len =
+            command_payload(NwkCommandId::NetworkUpdate, &body[..body_len], &mut payload);
+        let mut buf = [0u8; 128];
+        let len = encode(
+            &frame(NwkFrameType::Command, PEER, ShortAddress::BROADCAST),
+            &payload[..payload_len],
+            &mut buf,
+        );
+
+        assert!(block_on(router.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+        assert!(
+            router.mac.tx_history().is_empty(),
+            "a non-manager must not inject a relayed network transition",
+        );
+        assert_eq!(router.nib.nwk_update_id(), Some(7));
+        assert!(router.pending_pan_id().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_failed_manager_update_send_leaves_the_transition_uncommitted() {
+        let mut manager = node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+        manager.nib.logical_channel = 15;
+        manager.nib.extended_pan_id = EPID;
+        manager.nib.nwk_manager_addr = ShortAddress::COORDINATOR;
+        manager.nib.set_nwk_update_id(0xFF);
+
+        let mut report = PanIdConflictReport {
+            epid: EPID,
+            pan_ids: heapless::Vec::new(),
+        };
+        report.pan_ids.push(PAN).unwrap();
+        let mut body = [0u8; 32];
+        let body_len = report.serialize(&mut body).unwrap();
+        let mut payload = [0u8; 32];
+        let payload_len =
+            command_payload(NwkCommandId::NetworkReport, &body[..body_len], &mut payload);
+        let mut buf = [0u8; 128];
+        let len = encode(
+            &frame(NwkFrameType::Command, PEER, ShortAddress::BROADCAST),
+            &payload[..payload_len],
+            &mut buf,
+        );
+
+        assert!(block_on(manager.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+        assert_eq!(
+            manager.nib.nwk_update_id(),
+            Some(0xFF),
+            "preparing the outbound command must not advance nwkUpdateId",
+        );
+        assert_eq!(manager.nib.pan_id, PAN);
+        assert_eq!(manager.nib.logical_channel, 15);
+        let staged_pan = manager
+            .pending_pan_id()
+            .expect("the selected PAN is retained for retry and persistence");
+        assert!(manager.pan_id_update_broadcast_pending());
+
+        // Discard the correctly relayed incoming Network Report so the next
+        // history entry can only be the manager's outbound Network Update.
+        manager.mac.clear_tx_history();
+        manager.mac.set_tx_failures(1);
+        block_on(manager.process_pending_routing());
+
+        assert!(manager.mac.tx_history().is_empty());
+        assert_eq!(manager.nib.nwk_update_id(), Some(0xFF));
+        assert_eq!(manager.nib.pan_id, PAN);
+        assert_eq!(manager.nib.logical_channel, 15);
+        assert_eq!(manager.pending_pan_id(), Some(staged_pan));
+        assert!(
+            manager.pan_id_update_broadcast_pending(),
+            "the unchanged transition remains retryable",
+        );
+
+        // Even if the provisional timer has elapsed, the transition is not
+        // eligible until the outbound command is accepted.
+        block_on(
+            manager
+                .mac
+                .delay_micros(crate::conflict::NETWORK_BROADCAST_DELIVERY_TIME_US + 1),
+        );
+        manager.mac.set_tx_failures(1);
+        block_on(manager.process_pending_routing());
+        assert_eq!(manager.nib.nwk_update_id(), Some(0xFF));
+        assert_eq!(manager.nib.pan_id, PAN);
+        assert_eq!(manager.nib.logical_channel, 15);
+        assert_eq!(manager.pending_pan_id(), Some(staged_pan));
+        assert!(manager.pan_id_update_broadcast_pending());
+
+        block_on(manager.process_pending_routing());
+
+        assert_eq!(
+            manager.nib.nwk_update_id(),
+            Some(0),
+            "the accepted send advances the serial number across wrap",
+        );
+        assert_eq!(manager.nib.pan_id, PAN);
+        assert_eq!(manager.nib.logical_channel, 15);
+        let pending_pan = manager
+            .pending_pan_id()
+            .expect("the delivery timer is re-armed after the successful send");
+        assert!(!manager.pan_id_update_broadcast_pending());
+
+        let bytes = manager.mac.tx_history()[0].payload.as_slice();
+        let (header, consumed) = NwkHeader::parse(bytes).expect("the update parses");
+        assert_eq!(header.dst_addr, ShortAddress::BROADCAST);
+        assert_eq!(bytes[consumed], NwkCommandId::NetworkUpdate as u8);
+        let sent = PanIdUpdate::parse(&bytes[consumed + 1..]).expect("the update payload is valid");
+        assert_eq!(sent.update_id, 0);
+        assert_eq!(sent.new_pan_id, pending_pan);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_restored_unsent_manager_update_uses_the_next_update_id() {
+        let mut manager = node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+        manager.nib.extended_pan_id = EPID;
+        manager.nib.nwk_manager_addr = ShortAddress::COORDINATOR;
+        manager.nib.set_nwk_update_id(7);
+        let new_pan = PanId(0xBEEF);
+
+        assert!(
+            manager.restore_pending_pan_id_update(new_pan, true),
+            "the persisted transition is valid",
+        );
+        block_on(
+            manager
+                .mac
+                .delay_micros(crate::conflict::NETWORK_BROADCAST_DELIVERY_TIME_US + 1),
+        );
+        manager.mac.set_tx_failures(1);
+        block_on(manager.process_pending_routing());
+
+        assert_eq!(manager.nib.nwk_update_id(), Some(7));
+        assert_eq!(manager.nib.pan_id, PAN);
+        assert_eq!(manager.pending_pan_id(), Some(new_pan));
+        assert!(manager.pan_id_update_broadcast_pending());
+
+        block_on(manager.process_pending_routing());
+
+        assert_eq!(manager.nib.nwk_update_id(), Some(8));
+        assert_eq!(manager.nib.pan_id, PAN);
+        assert!(!manager.pan_id_update_broadcast_pending());
+        let bytes = manager.mac.tx_history()[0].payload.as_slice();
+        let (_, consumed) = NwkHeader::parse(bytes).expect("the update parses");
+        let sent = PanIdUpdate::parse(&bytes[consumed + 1..]).expect("the payload is valid");
+        assert_eq!(sent.update_id, 8);
+        assert_eq!(sent.new_pan_id, new_pan);
+
+        block_on(
+            manager
+                .mac
+                .delay_micros(crate::conflict::NETWORK_BROADCAST_DELIVERY_TIME_US + 1),
+        );
+        block_on(manager.process_pending_routing());
+        assert_eq!(manager.nib.pan_id, new_pan);
     }
 
     #[test]
@@ -6494,6 +8124,7 @@ mod tests {
         // installed.
         nwk.security.set_network_key(NETWORK_KEY, KEY_SEQ);
         nwk.nib.active_key_seq_number = KEY_SEQ;
+        assert!(nwk.nib.set_frame_counter_reservation(0, RESERVED_FLOOR));
         assert!(block_on(nwk.discover_route(FAR)).is_ok());
         assert_eq!(nwk.mac.tx_history().len(), 1);
         assert!(nwk.routing.has_active_discovery(FAR));
@@ -6871,6 +8502,165 @@ mod tests {
 
     #[test]
     #[cfg(feature = "router")]
+    fn indirect_rejoin_response_reports_its_delivery_kind() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+        let assigned = ShortAddress(0x1235);
+
+        assert_eq!(
+            block_on(parent.send_rejoin_response(ORIGIN, ORIGIN_IEEE, assigned, 0, false, false,)),
+            Ok(RejoinResponseDelivery::Indirect)
+        );
+
+        assert_eq!(
+            block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))).unwrap(),
+            crate::ChildPollOutcome::Delivered {
+                child: ORIGIN,
+                more_pending: false,
+                kind: crate::IndirectFrameKind::RejoinResponse,
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn pending_indirect_kind_check_distinguishes_queued_from_expired_rejoin_response() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+
+        assert!(
+            !parent.has_pending_indirect_kind(ORIGIN, crate::IndirectFrameKind::RejoinResponse)
+        );
+        assert_eq!(
+            block_on(parent.send_rejoin_response(ORIGIN, ORIGIN_IEEE, ORIGIN, 0, false, false,)),
+            Ok(RejoinResponseDelivery::Indirect)
+        );
+        assert!(parent.has_pending_indirect_kind(ORIGIN, crate::IndirectFrameKind::RejoinResponse));
+        assert!(!parent.has_pending_indirect_kind(ORIGIN, crate::IndirectFrameKind::Data));
+
+        parent.tick_router_maintenance(7);
+        assert!(parent.has_pending_indirect_kind(ORIGIN, crate::IndirectFrameKind::RejoinResponse));
+        parent.tick_router_maintenance(1);
+        assert!(
+            !parent.has_pending_indirect_kind(ORIGIN, crate::IndirectFrameKind::RejoinResponse)
+        );
+
+        assert_eq!(
+            block_on(parent.send_rejoin_response(ORIGIN, ORIGIN_IEEE, ORIGIN, 0, false, false,)),
+            Ok(RejoinResponseDelivery::Indirect)
+        );
+        assert!(parent.has_pending_indirect_kind(ORIGIN, crate::IndirectFrameKind::RejoinResponse));
+        assert_eq!(parent.indirect_queue().pending_count(ORIGIN), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn cancelling_rejoin_response_preserves_unrelated_indirect_data() {
+        let mut parent = parent_with_sleepy_child();
+        let mut data = [0u8; MAX_NWK_FRAME];
+        let data_len = encode(
+            &frame(NwkFrameType::Data, OUR_ADDR, ORIGIN),
+            &[0xAA, 0xBB],
+            &mut data,
+        );
+
+        assert_eq!(
+            block_on(parent.send_rejoin_response(ORIGIN, ORIGIN_IEEE, ORIGIN, 0, false, false,)),
+            Ok(RejoinResponseDelivery::Indirect)
+        );
+        parent
+            .enqueue_indirect_for_child(ORIGIN, &data[..data_len])
+            .unwrap();
+        let pending_updates = parent.mac.indirect_pending_history().len();
+
+        assert_eq!(parent.cancel_indirect_rejoin_response(ORIGIN), Ok(true));
+        assert_eq!(parent.indirect_queue().pending_count(ORIGIN), 1);
+        assert!(
+            !parent.has_pending_indirect_kind(ORIGIN, crate::IndirectFrameKind::RejoinResponse)
+        );
+        assert!(parent.has_pending_indirect_kind(ORIGIN, crate::IndirectFrameKind::Data));
+        assert_eq!(
+            parent.mac.indirect_pending_history().len(),
+            pending_updates,
+            "unrelated queued data keeps Frame Pending armed"
+        );
+
+        assert_eq!(
+            block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))).unwrap(),
+            crate::ChildPollOutcome::Delivered {
+                child: ORIGIN,
+                more_pending: false,
+                kind: crate::IndirectFrameKind::Data,
+            }
+        );
+        assert_eq!(
+            parent.mac.tx_history()[0].payload.as_slice(),
+            &data[..data_len]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn cancelling_only_indirect_rejoin_response_disarms_frame_pending() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+
+        assert_eq!(
+            block_on(parent.send_rejoin_response(ORIGIN, ORIGIN_IEEE, ORIGIN, 0, false, false,)),
+            Ok(RejoinResponseDelivery::Indirect)
+        );
+        let pending_updates = parent.mac.indirect_pending_history().len();
+
+        assert_eq!(parent.cancel_indirect_rejoin_response(ORIGIN), Ok(true));
+        assert!(!parent.indirect_queue().has_pending(ORIGIN));
+        assert_eq!(
+            parent.mac.indirect_pending_history().len(),
+            pending_updates + 1
+        );
+        assert_eq!(
+            parent.mac.indirect_pending_history().last(),
+            Some(&(MacAddress::Short(PAN, ORIGIN), false))
+        );
+
+        assert_eq!(parent.cancel_indirect_rejoin_response(ORIGIN), Ok(false));
+        assert_eq!(
+            parent.mac.indirect_pending_history().len(),
+            pending_updates + 1,
+            "a no-op cancellation must not touch MAC state"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn failed_frame_pending_disarm_does_not_restore_cancelled_rejoin_response() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+
+        assert_eq!(
+            block_on(parent.send_rejoin_response(ORIGIN, ORIGIN_IEEE, ORIGIN, 0, false, false,)),
+            Ok(RejoinResponseDelivery::Indirect)
+        );
+        let child = MacAddress::Short(PAN, ORIGIN);
+        let mut saturated = false;
+        for _ in 0..32 {
+            match parent.mac.set_indirect_data_pending(child, true) {
+                Ok(()) => {}
+                Err(zigbee_mac::MacError::TransactionOverflow) => {
+                    saturated = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected mock failure: {error:?}"),
+            }
+        }
+        assert!(saturated, "the mock pending-state log must be bounded");
+
+        assert_eq!(
+            parent.cancel_indirect_rejoin_response(ORIGIN),
+            Err(zigbee_mac::MacError::TransactionOverflow)
+        );
+        assert!(
+            !parent.has_pending_indirect_kind(ORIGIN, crate::IndirectFrameKind::RejoinResponse)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
     fn conflicting_sleepy_rejoin_response_is_sent_directly() {
         let capability = CapabilityInfo {
             device_type_ffd: false,
@@ -7107,7 +8897,13 @@ mod tests {
         let victim = parent.neighbors.find_by_short_mut(ORIGIN).unwrap();
         victim.relationship = crate::neighbor::Relationship::Child;
         victim.rx_on_when_idle = false;
-        assert!(parent.indirect.enqueue(ORIGIN, &[0xAA, 0xBB]));
+        let mut queued = [0; MAX_NWK_FRAME];
+        let queued_len = encode(
+            &frame(NwkFrameType::Data, OUR_ADDR, ORIGIN),
+            &[0xAA, 0xBB],
+            &mut queued,
+        );
+        assert!(parent.indirect.enqueue(ORIGIN, &queued[..queued_len]));
 
         assert_eq!(
             block_on(parent.send_rejoin_response(
@@ -7122,7 +8918,7 @@ mod tests {
         );
         assert_eq!(
             parent.indirect.peek(ORIGIN).unwrap().as_slice(),
-            &[0xAA, 0xBB]
+            &queued[..queued_len]
         );
 
         let outcome = block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN)))
@@ -7132,9 +8928,13 @@ mod tests {
             crate::ChildPollOutcome::Delivered {
                 child: ORIGIN,
                 more_pending: false,
+                kind: crate::IndirectFrameKind::Data,
             }
         );
-        assert_eq!(parent.mac.tx_history()[1].payload.as_slice(), &[0xAA, 0xBB]);
+        assert_eq!(
+            parent.mac.tx_history()[1].payload.as_slice(),
+            &queued[..queued_len]
+        );
     }
 
     #[test]
@@ -7145,17 +8945,18 @@ mod tests {
         let child = parent.neighbors.find_by_short_mut(ORIGIN).unwrap();
         child.relationship = crate::neighbor::Relationship::Child;
         child.rx_on_when_idle = false;
-        parent.enqueue_indirect_for_child(ORIGIN, &[0xAA]).unwrap();
-        parent.enqueue_indirect_for_child(ORIGIN, &[0xBB]).unwrap();
+        block_on(parent.nlde_data_request(ORIGIN, 1, &[0xAA], false, false)).unwrap();
+        block_on(parent.nlde_data_request(ORIGIN, 1, &[0xBB], false, false)).unwrap();
 
         assert_eq!(
             block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))).unwrap(),
             crate::ChildPollOutcome::Delivered {
                 child: ORIGIN,
                 more_pending: true,
+                kind: crate::IndirectFrameKind::Data,
             }
         );
-        assert_eq!(parent.mac.tx_history()[0].payload.as_slice(), &[0xAA]);
+        assert_eq!(tx_frame(&parent.mac.tx_history()[0]).1, 0xAA);
         assert!(parent.mac.tx_history()[0].frame_pending);
 
         assert_eq!(
@@ -7163,9 +8964,10 @@ mod tests {
             crate::ChildPollOutcome::Delivered {
                 child: ORIGIN,
                 more_pending: false,
+                kind: crate::IndirectFrameKind::Data,
             }
         );
-        assert_eq!(parent.mac.tx_history()[1].payload.as_slice(), &[0xBB]);
+        assert_eq!(tx_frame(&parent.mac.tx_history()[1]).1, 0xBB);
         assert!(!parent.mac.tx_history()[1].frame_pending);
     }
 
@@ -7393,6 +9195,311 @@ mod tests {
             .expect("the child is admitted");
         assert_eq!(assigned, ORIGIN, "the requested address is free");
         parent
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn tagged_key_forwarding_waits_for_activation_commit_and_retries_with_fresh_counters() {
+        let mut parent = parent_with_sleepy_child();
+        block_on(parent.send_network_key_update_to_child(ORIGIN, &[0xCA, 0xFE], KEY_SEQ + 1))
+            .unwrap();
+        let kind = crate::IndirectFrameKind::NetworkKeyUpdate(KEY_SEQ + 1);
+        assert!(parent.has_pending_indirect_kind(ORIGIN, kind));
+        assert!(parent.mac.tx_history().is_empty());
+        assert!(parent.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+        let incoming = frame_with_network_key(
+            &frame(NwkFrameType::Data, ORIGIN, OUR_ADDR),
+            &[0x01],
+            [0x42; 16],
+            KEY_SEQ + 1,
+            10,
+        );
+        parent.set_lifecycle_persistence_enabled(true);
+        assert!(block_on(parent.process_incoming_nwk_frame(&incoming, 42)).is_some());
+        assert_eq!(
+            block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))),
+            Err(zigbee_mac::MacError::SecurityError)
+        );
+        assert!(parent.has_pending_indirect_kind(ORIGIN, kind));
+        assert!(parent.mac.tx_history().is_empty());
+        block_on(parent.complete_lifecycle_persistence());
+        parent.mac.set_tx_failures(1);
+        assert!(
+            block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))).is_err()
+        );
+        assert!(parent.has_pending_indirect_kind(ORIGIN, kind));
+        let next_counter = parent.nib.outgoing_frame_counter;
+        assert_eq!(
+            block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))),
+            Ok(crate::ChildPollOutcome::Delivered {
+                child: ORIGIN,
+                more_pending: false,
+                kind
+            })
+        );
+        let transmitted = recorded_frame(&parent, parent.mac.tx_history().len() - 1);
+        let (header, aux, payload) = decrypt_recorded_with_key(&transmitted, &[0x42; 16]);
+        assert_eq!(header.src_addr, OUR_ADDR);
+        assert_eq!(header.dst_addr, ORIGIN);
+        assert_eq!(aux.source_address, RELAY_IEEE);
+        assert_eq!(aux.key_seq_number, KEY_SEQ + 1);
+        assert_eq!(aux.frame_counter, next_counter);
+        assert_eq!(payload.as_slice(), &[0xCA, 0xFE]);
+        assert!(!parent.has_pending_indirect_kind(ORIGIN, kind));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn tagged_key_forwarding_rejects_provisional_children_without_consuming_counters() {
+        let mut parent = parent_with_sleepy_child();
+        parent
+            .neighbors
+            .find_by_short_mut(ORIGIN)
+            .unwrap()
+            .relationship = crate::neighbor::Relationship::UnauthenticatedChild;
+        let counter = parent.nib.outgoing_frame_counter;
+        assert_eq!(
+            block_on(parent.send_network_key_update_to_child(ORIGIN, &[0xCA], KEY_SEQ + 1)).err(),
+            Some(NwkStatus::UnknownDevice)
+        );
+        assert_eq!(parent.nib.outgoing_frame_counter, counter);
+        assert!(!parent.indirect_queue().has_pending(ORIGIN));
+        assert!(parent.mac.tx_history().is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn indirect_counter_exhaustion_never_sends_queued_ciphertext() {
+        let mut parent = parent_with_sleepy_child();
+        block_on(parent.nlde_data_request(ORIGIN, 1, &[0xCA], true, false)).unwrap();
+        let next = parent.nib.outgoing_frame_counter;
+        assert!(parent.nib.set_frame_counter_reservation(next, next));
+        assert_eq!(
+            block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))),
+            Err(zigbee_mac::MacError::SecurityError)
+        );
+        assert!(parent.indirect_queue().has_pending(ORIGIN));
+        assert!(parent.mac.tx_history().is_empty());
+        assert!(parent.nib.set_frame_counter_reservation(next, next + 1));
+        block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))).unwrap();
+        assert_eq!(
+            decrypt_recorded(&recorded_frame(&parent, 0))
+                .1
+                .frame_counter,
+            next
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn indirect_dequeue_resecures_previous_key_with_current_reserved_counter() {
+        for (previous, current) in [(KEY_SEQ, KEY_SEQ + 1), (255, 0)] {
+            let mut parent = parent_with_sleepy_child();
+            parent.security.set_network_key(NETWORK_KEY, previous);
+            parent.nib.active_key_seq_number = previous;
+            block_on(parent.nlde_data_request(ORIGIN, 5, &[0xCA, 0xFE], true, false)).unwrap();
+            let queued = parent.indirect.peek(ORIGIN).unwrap();
+            let (_, header_len) = NwkHeader::parse(queued.as_slice()).unwrap();
+            let (_, old_aux, _) = decrypt_recorded(queued.as_slice());
+            assert_eq!(old_aux.key_seq_number, previous);
+            assert!(parent.mac.tx_history().is_empty());
+
+            // A failed attempt before rotation must not pin the next poll
+            // to old ciphertext or reuse that attempt's reserved counter.
+            parent
+                .security
+                .commit_frame_counter_for_key(&RELAY_IEEE, previous, u32::MAX - 1);
+            parent.mac.set_tx_failures(1);
+            assert_eq!(
+                block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))),
+                Err(zigbee_mac::MacError::NoAck)
+            );
+            assert_eq!(parent.nib.outgoing_frame_counter, old_aux.frame_counter + 2);
+            assert_eq!(
+                parent.indirect.peek(ORIGIN).unwrap().as_slice(),
+                queued.as_slice()
+            );
+            assert!(parent.mac.tx_history().is_empty());
+
+            assert!(parent.security.stage_network_key([0x42; 16], current));
+            assert!(parent.switch_active_network_key(current));
+            assert!(
+                parent
+                    .nib
+                    .set_frame_counter_reservation(RESERVED_FLOOR, RESERVED_FLOOR + 2)
+            );
+            assert_eq!(
+                block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))),
+                Ok(crate::ChildPollOutcome::Delivered {
+                    child: ORIGIN,
+                    more_pending: false,
+                    kind: crate::IndirectFrameKind::Data,
+                })
+            );
+
+            let transmitted = recorded_frame(&parent, 0);
+            let (_, aux, payload) = decrypt_recorded_with_key(&transmitted, &[0x42; 16]);
+            assert_eq!(&transmitted[..header_len], &queued.as_slice()[..header_len]);
+            assert_eq!(aux.source_address, RELAY_IEEE);
+            assert_eq!(aux.key_seq_number, current);
+            assert_eq!(aux.frame_counter, RESERVED_FLOOR);
+            assert_eq!(payload.as_slice(), &[0xCA, 0xFE]);
+            assert_eq!(parent.nib.outgoing_frame_counter, RESERVED_FLOOR + 1);
+            assert!(!parent.indirect.has_pending(ORIGIN));
+            assert_eq!(
+                parent.security.secondary_key().unwrap().seq_number,
+                previous
+            );
+            assert_eq!(parent.rx_security_stats().secured_frames, 0);
+            assert!(
+                parent
+                    .security
+                    .check_frame_counter_for_key(&RELAY_IEEE, current, 0)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn indirect_activation_abort_keeps_queue_and_replay_uncommitted_until_retry() {
+        let mut parent = parent_with_sleepy_child();
+        block_on(parent.nlde_data_request(ORIGIN, 1, &[0xCA], true, false)).unwrap();
+        let queued = parent.indirect.peek(ORIGIN).unwrap();
+        let outgoing = parent.nib.outgoing_frame_counter;
+        assert!(parent.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+        let incoming = frame_with_network_key(
+            &frame(NwkFrameType::Data, ORIGIN, OUR_ADDR),
+            &[0x01],
+            [0x42; 16],
+            KEY_SEQ + 1,
+            10,
+        );
+        parent.set_lifecycle_persistence_enabled(true);
+        assert!(block_on(parent.process_incoming_nwk_frame(&incoming, 42)).is_some());
+        assert_eq!(
+            block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))),
+            Err(zigbee_mac::MacError::SecurityError)
+        );
+        parent.abort_lifecycle_persistence();
+        block_on(parent.complete_lifecycle_persistence());
+        // Neither an empty completion, a duplicate Switch-Key, nor toggling
+        // the NIB policy flag may expose previously encrypted queued traffic.
+        assert!(parent.switch_active_network_key(KEY_SEQ + 1));
+        parent.nib.security_enabled = false;
+        assert_eq!(
+            block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))),
+            Err(zigbee_mac::MacError::SecurityError)
+        );
+        assert_eq!(
+            parent.indirect.peek(ORIGIN).unwrap().as_slice(),
+            queued.as_slice()
+        );
+        assert!(parent.mac.tx_history().is_empty());
+        assert_eq!(parent.nib.outgoing_frame_counter, outgoing);
+        assert!(
+            parent
+                .security
+                .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+        );
+
+        parent.nib.security_enabled = true;
+        parent.set_lifecycle_persistence_enabled(true);
+        assert!(block_on(parent.process_incoming_nwk_frame(&incoming, 42)).is_some());
+        block_on(parent.complete_lifecycle_persistence());
+        assert!(
+            !parent
+                .security
+                .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+        );
+        block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))).unwrap();
+        let (_, aux, payload) = decrypt_recorded_with_key(&recorded_frame(&parent, 0), &[0x42; 16]);
+        assert_eq!(aux.key_seq_number, KEY_SEQ + 1);
+        assert_eq!(aux.frame_counter, outgoing);
+        assert_eq!(payload.as_slice(), &[0xCA]);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn indirect_refresh_failures_never_send_or_consume_queued_transaction() {
+        for fault in 0..5 {
+            let mut parent = parent_with_sleepy_child();
+            block_on(parent.nlde_data_request(ORIGIN, 1, &[0xCA], true, false)).unwrap();
+            let mut queued: heapless::Vec<u8, MAX_NWK_FRAME> =
+                heapless::Vec::from_slice(parent.indirect.peek(ORIGIN).unwrap().as_slice())
+                    .unwrap();
+            let outgoing = parent.nib.outgoing_frame_counter;
+            assert!(parent.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+            assert!(parent.switch_active_network_key(KEY_SEQ + 1));
+            match fault {
+                0 => *queued.last_mut().unwrap() ^= 0x80, // Corrupt MIC.
+                1 => {
+                    // Next update evicts the retained old decrypting key.
+                    assert!(parent.security.stage_network_key([0x63; 16], KEY_SEQ + 2));
+                }
+                2 => {
+                    parent.security.clear_network_keys();
+                    parent.nib.security_enabled = false;
+                }
+                3 => parent.nib.active_key_seq_number = KEY_SEQ, // Inconsistent key/NIB.
+                _ => queued.truncate(7),                         // Malformed NWK header.
+            }
+            parent.indirect.complete_one(ORIGIN).unwrap();
+            parent.enqueue_indirect_for_child(ORIGIN, &queued).unwrap();
+            assert_eq!(
+                block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))),
+                Err(zigbee_mac::MacError::SecurityError),
+                "fault {fault}"
+            );
+            assert_eq!(
+                parent.indirect.peek(ORIGIN).unwrap().as_slice(),
+                queued.as_slice()
+            );
+            assert_eq!(parent.nib.outgoing_frame_counter, outgoing);
+            assert!(parent.mac.tx_history().is_empty());
+            assert_eq!(parent.rx_security_stats().secured_frames, 0);
+            assert_eq!(
+                parent.mac.indirect_pending_history().last(),
+                Some(&(MacAddress::Short(PAN, ORIGIN), true))
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn indirect_refresh_preserves_extended_header_source_route_and_payload() {
+        let mut parent = parent_with_sleepy_child();
+        let mut header = frame(NwkFrameType::Data, FAR, ORIGIN);
+        header.frame_control.security = true;
+        header.frame_control.src_ieee_present = true;
+        header.frame_control.dst_ieee_present = true;
+        header.frame_control.source_route = true;
+        header.src_ieee = Some(DEST_IEEE);
+        header.dst_ieee = Some(ORIGIN_IEEE);
+        header.source_route = Some(crate::frames::SourceRoute {
+            relay_count: 16,
+            relay_index: 0,
+            relay_list: heapless::Vec::from_slice(&[OUR_ADDR; 16]).unwrap(),
+        });
+        let mut queued = [0; MAX_NWK_FRAME];
+        let len = parent
+            .build_nwk_frame(&header, &[0xCA; 32], &mut queued)
+            .unwrap();
+        let (_, header_len) = NwkHeader::parse(&queued[..len]).unwrap();
+        parent
+            .enqueue_indirect_for_child(ORIGIN, &queued[..len])
+            .unwrap();
+        assert!(parent.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
+        assert!(parent.switch_active_network_key(KEY_SEQ + 1));
+        // An already-secured transaction stays secured even if the policy
+        // flag changes after it was enqueued.
+        parent.nib.security_enabled = false;
+        block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))).unwrap();
+        let transmitted = recorded_frame(&parent, 0);
+        assert_eq!(&transmitted[..header_len], &queued[..header_len]);
+        let (_, aux, payload) = decrypt_recorded_with_key(&transmitted, &[0x42; 16]);
+        assert_eq!(aux.key_seq_number, KEY_SEQ + 1);
+        assert_eq!(aux.source_address, RELAY_IEEE);
+        assert_eq!(payload.as_slice(), &[0xCA; 32]);
     }
 
     /// Decrypt a recorded secured NWK command back to its plaintext body.
@@ -7640,7 +9747,9 @@ mod tests {
 
     // ── R22 child restore + Parent Announce ──────────────────
 
+    #[cfg(feature = "router")]
     const RESTORED_CHILD: ShortAddress = FAR;
+    #[cfg(feature = "router")]
     const RESTORED_CHILD_IEEE: IeeeAddress = [0xC7; 8];
 
     #[test]

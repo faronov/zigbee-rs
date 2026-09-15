@@ -549,16 +549,11 @@ impl MacDriver for Bl702Mac {
     }
 
     async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
-        self.pan_id = req.pan_id;
-        self.channel = req.channel;
-
-        self.sync_radio_config();
-        log::info!(
-            "bl702: started PAN 0x{:04X} on channel {}",
-            self.pan_id.0,
-            self.channel
-        );
-        Ok(())
+        // `Bl702Mac` does not implement `ParentMacDriver`: `mlme_associate_response`
+        // is still a TODO stub and no parent primitive is overridden, so it
+        // cannot admit or serve children. Fail explicitly instead of
+        // reporting a started PAN.
+        start_requires_parent_capability(&req)
     }
 
     async fn mlme_get(&self, attr: PibAttribute) -> Result<PibValue, MacError> {
@@ -816,20 +811,22 @@ impl MacDriver for Bl702Mac {
     }
 
     fn capabilities(&self) -> MacCapabilities {
-        MacCapabilities {
-            coordinator: false,
-            router: true,
-            // BL702 silicon has a SEC_ENG AES-128 block, but this MAC still
-            // performs all Zigbee security in the Rust stack (optionally via
-            // a hardware block-cipher `ForwardAesProvider`); it does not
-            // offload autonomous 802.15.4 MAC security. Per the repository
-            // convention this field reports active MAC-level hardware
-            // security, not mere silicon capability, so it is `false`.
-            hardware_security: false,
-            max_payload: 102, // 127 - 25 (max MAC overhead)
-            tx_power_min: TxPower(-21),
-            tx_power_max: TxPower(14),
-        }
+        // BL702 silicon has a SEC_ENG AES-128 block, but this MAC still
+        // performs all Zigbee security in the Rust stack (optionally via a
+        // hardware block-cipher `ForwardAesProvider`); it does not offload
+        // autonomous 802.15.4 MAC security. Per the repository convention
+        // `hardware_security` reports active MAC-level hardware security, not
+        // mere silicon capability, so `non_parent` reporting `false` is
+        // correct here.
+        //
+        // `Bl702RadioPhy::send_ack` does honour a Frame Pending argument, but
+        // nothing maintains a per-child source-match table and no parent
+        // primitive is overridden, so this backend is not a `ParentMacDriver`.
+        MacCapabilities::non_parent(
+            102, // 127 - 25 (max MAC overhead)
+            TxPower(-21),
+            TxPower(14),
+        )
     }
 }
 

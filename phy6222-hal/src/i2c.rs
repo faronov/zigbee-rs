@@ -1,64 +1,81 @@
-//! Pure-Rust I2C master driver for PHY6222 (DesignWare I2C IP).
+//! Pure-Rust DesignWare I2C master for PHY62x2.
 //!
-//! Polling-mode, 100kHz or 400kHz. FIFO depth 8, reads chunked to 7 bytes.
+//! Polling mode, bounded waits, and `embedded-hal` 1.0 transactions.
 
-use crate::regs::*;
 use crate::gpio;
+use crate::peripherals::{I2cInstance, I2cToken};
+use crate::regs::*;
+use embedded_hal::i2c::{
+    Error, ErrorKind, ErrorType, I2c, NoAcknowledgeSource, Operation, SevenBitAddress,
+};
 
-/// I2C peripheral instance.
-#[derive(Clone, Copy)]
-pub enum I2cDev { I2C0, I2C1 }
+const DATA_CMD_READ: u32 = 1 << 8;
+const DATA_CMD_STOP: u32 = 1 << 9;
+const DATA_CMD_RESTART: u32 = 1 << 10;
+const RAW_TX_ABORT: u32 = 1 << 6;
+const MAX_PIN_INDEX: u8 = 22;
 
-/// I2C speed mode.
-#[derive(Clone, Copy)]
-pub enum Speed { Standard100k, Fast400k }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speed {
+    Standard100k,
+    Fast400k,
+}
 
-/// I2C configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    pub dev: I2cDev,
     pub scl_pin: u8,
     pub sda_pin: u8,
     pub speed: Speed,
 }
 
-/// I2C master driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum I2cError {
+    InvalidConfiguration,
+    Timeout,
+    Abort,
+}
+
+impl Error for I2cError {
+    fn kind(&self) -> ErrorKind {
+        match self {
+            Self::InvalidConfiguration => ErrorKind::Other,
+            Self::Timeout => ErrorKind::Bus,
+            Self::Abort => ErrorKind::NoAcknowledge(NoAcknowledgeSource::Unknown),
+        }
+    }
+}
+
 pub struct I2cMaster {
     base: u32,
+    _token: I2cToken,
 }
 
 impl I2cMaster {
-    /// Initialize I2C master.
-    pub fn new(config: Config) -> Self {
-        let base = match config.dev {
-            I2cDev::I2C0 => AP_I2C0_BASE,
-            I2cDev::I2C1 => AP_I2C1_BASE,
+    pub fn new(token: I2cToken, config: Config) -> Result<Self, I2cError> {
+        if config.scl_pin > MAX_PIN_INDEX
+            || config.sda_pin > MAX_PIN_INDEX
+            || config.scl_pin == config.sda_pin
+        {
+            return Err(I2cError::InvalidConfiguration);
+        }
+
+        let (base, clock_bit, fmux_scl) = match token.instance {
+            I2cInstance::I2c0 => (AP_I2C0_BASE, MOD_I2C0_BIT, FMUX_IIC0_SCL),
+            I2cInstance::I2c1 => (AP_I2C1_BASE, MOD_I2C1_BIT, FMUX_IIC1_SCL),
         };
 
-        // Enable clock gate
-        let clk_bit = match config.dev {
-            I2cDev::I2C0 => MOD_I2C0_BIT,
-            I2cDev::I2C1 => MOD_I2C1_BIT,
-        };
-        reg_write(PCR_SW_CLK, reg_read(PCR_SW_CLK) | clk_bit);
-
-        // Pin mux
-        let fmux_scl = match config.dev {
-            I2cDev::I2C0 => FMUX_IIC0_SCL,
-            I2cDev::I2C1 => FMUX_IIC1_SCL,
-        };
+        reg_write(PCR_SW_CLK, reg_read(PCR_SW_CLK) | clock_bit);
         gpio::set_fmux(config.scl_pin, fmux_scl);
         gpio::set_fmux(config.sda_pin, fmux_scl + 1);
         gpio::set_pull(config.scl_pin, gpio::Pull::StrongPullUp);
         gpio::set_pull(config.sda_pin, gpio::Pull::StrongPullUp);
 
-        // Configure
         reg_write(base + I2C_IC_ENABLE, 0);
-        let speed_bits: u32 = match config.speed {
+        let speed_bits = match config.speed {
             Speed::Standard100k => 1 << 1,
             Speed::Fast400k => 2 << 1,
         };
         reg_write(base + I2C_IC_CON, 0x61 | speed_bits);
-
         match config.speed {
             Speed::Standard100k => {
                 reg_write(base + I2C_IC_SS_SCL_HCNT, 72);
@@ -69,113 +86,178 @@ impl I2cMaster {
                 reg_write(base + I2C_IC_FS_SCL_LCNT, 24);
             }
         }
-
         reg_write(base + I2C_IC_INTR_MASK, 0);
         reg_write(base + I2C_IC_RX_TL, 0);
         reg_write(base + I2C_IC_TX_TL, 1);
         reg_write(base + I2C_IC_ENABLE, 1);
 
-        log::info!("[I2C] Init at 0x{:08X}", base);
-        Self { base }
+        Ok(Self {
+            base,
+            _token: token,
+        })
     }
 
-    /// Set target slave address (7-bit).
-    fn set_target(&self, addr: u8) {
+    fn set_target(&mut self, address: u8) -> Result<(), I2cError> {
+        if address > 0x7f {
+            return Err(I2cError::InvalidConfiguration);
+        }
         reg_write(self.base + I2C_IC_ENABLE, 0);
-        reg_write(self.base + I2C_IC_TAR, addr as u32);
+        reg_write(self.base + I2C_IC_TAR, u32::from(address));
+        let _ = reg_read(self.base + I2C_IC_CLR_TX_ABRT);
         reg_write(self.base + I2C_IC_ENABLE, 1);
+        Ok(())
     }
 
-    fn wait_tx_ready(&self) -> bool {
-        for _ in 0..10_000u32 {
-            if reg_read(self.base + I2C_IC_STATUS) & I2C_STATUS_TFNF != 0 {
-                return true;
+    fn wait_for(&self, predicate: impl Fn() -> bool, iterations: u32) -> Result<(), I2cError> {
+        for _ in 0..iterations {
+            self.check_abort()?;
+            if predicate() {
+                return Ok(());
             }
+            cortex_m::asm::nop();
         }
-        false
+        Err(I2cError::Timeout)
     }
 
-    fn wait_rx_ready(&self) -> bool {
-        for _ in 0..50_000u32 {
-            if reg_read(self.base + I2C_IC_STATUS) & I2C_STATUS_RFNE != 0 {
-                return true;
-            }
-        }
-        false
+    fn wait_tx_ready(&self) -> Result<(), I2cError> {
+        self.wait_for(
+            || reg_read(self.base + I2C_IC_STATUS) & I2C_STATUS_TFNF != 0,
+            10_000,
+        )
     }
 
-    fn wait_tx_empty(&self) -> bool {
-        for _ in 0..50_000u32 {
-            if reg_read(self.base + I2C_IC_STATUS) & I2C_STATUS_TFE != 0 {
-                return true;
-            }
-        }
-        false
+    fn wait_rx_ready(&self) -> Result<(), I2cError> {
+        self.wait_for(
+            || reg_read(self.base + I2C_IC_STATUS) & I2C_STATUS_RFNE != 0,
+            50_000,
+        )
     }
 
-    fn check_abort(&self) -> bool {
-        if reg_read(self.base + I2C_IC_RAW_INTR_STAT) & 0x40 != 0 {
+    fn wait_tx_empty(&self) -> Result<(), I2cError> {
+        self.wait_for(
+            || reg_read(self.base + I2C_IC_STATUS) & I2C_STATUS_TFE != 0,
+            50_000,
+        )
+    }
+
+    fn check_abort(&self) -> Result<(), I2cError> {
+        if reg_read(self.base + I2C_IC_RAW_INTR_STAT) & RAW_TX_ABORT != 0 {
             let _ = reg_read(self.base + I2C_IC_CLR_TX_ABRT);
-            return true;
+            Err(I2cError::Abort)
+        } else {
+            Ok(())
         }
-        false
     }
 
-    /// Write bytes then read bytes (repeated start).
-    pub fn write_read(&self, addr: u8, wr: &[u8], rd: &mut [u8]) -> Result<(), ()> {
-        self.set_target(addr);
-
-        for &b in wr {
-            if !self.wait_tx_ready() { return Err(()); }
-            reg_write(self.base + I2C_IC_DATA_CMD, b as u32);
-            if self.check_abort() { return Err(()); }
+    fn write_operation(&mut self, bytes: &[u8], restart: bool, stop: bool) -> Result<(), I2cError> {
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            self.wait_tx_ready()?;
+            let mut command = u32::from(byte);
+            if restart && index == 0 {
+                command |= DATA_CMD_RESTART;
+            }
+            if stop && index + 1 == bytes.len() {
+                command |= DATA_CMD_STOP;
+            }
+            reg_write(self.base + I2C_IC_DATA_CMD, command);
+            self.check_abort()?;
         }
-        if !self.wait_tx_empty() { return Err(()); }
+        self.wait_tx_empty()
+    }
 
-        let mut pos = 0;
-        while pos < rd.len() {
-            let chunk = (rd.len() - pos).min(7);
-            for _ in 0..chunk {
-                if !self.wait_tx_ready() { return Err(()); }
-                reg_write(self.base + I2C_IC_DATA_CMD, 0x100);
+    fn read_operation(
+        &mut self,
+        bytes: &mut [u8],
+        restart: bool,
+        stop: bool,
+    ) -> Result<(), I2cError> {
+        let mut position = 0;
+        while position < bytes.len() {
+            let chunk = (bytes.len() - position).min(7);
+            for index in 0..chunk {
+                self.wait_tx_ready()?;
+                let absolute = position + index;
+                let mut command = DATA_CMD_READ;
+                if restart && absolute == 0 {
+                    command |= DATA_CMD_RESTART;
+                }
+                if stop && absolute + 1 == bytes.len() {
+                    command |= DATA_CMD_STOP;
+                }
+                reg_write(self.base + I2C_IC_DATA_CMD, command);
+                self.check_abort()?;
             }
-            for i in 0..chunk {
-                if !self.wait_rx_ready() { return Err(()); }
-                rd[pos + i] = (reg_read(self.base + I2C_IC_DATA_CMD) & 0xFF) as u8;
+            for index in 0..chunk {
+                self.wait_rx_ready()?;
+                bytes[position + index] = (reg_read(self.base + I2C_IC_DATA_CMD) & 0xff) as u8;
             }
-            pos += chunk;
+            position += chunk;
         }
         Ok(())
     }
 
-    /// Write bytes only.
-    pub fn write(&self, addr: u8, data: &[u8]) -> Result<(), ()> {
-        self.set_target(addr);
-        for &b in data {
-            if !self.wait_tx_ready() { return Err(()); }
-            reg_write(self.base + I2C_IC_DATA_CMD, b as u32);
-            if self.check_abort() { return Err(()); }
+    fn transaction_inner(
+        &mut self,
+        address: u8,
+        operations: &mut [Operation<'_>],
+    ) -> Result<(), I2cError> {
+        let Some(last) = operations.iter().rposition(|operation| match operation {
+            Operation::Read(bytes) => !bytes.is_empty(),
+            Operation::Write(bytes) => !bytes.is_empty(),
+        }) else {
+            return Ok(());
+        };
+
+        self.set_target(address)?;
+        let mut started = false;
+        for (index, operation) in operations.iter_mut().enumerate() {
+            let final_operation = index == last;
+            match operation {
+                Operation::Read(bytes) if !bytes.is_empty() => {
+                    self.read_operation(bytes, started, final_operation)?;
+                    started = true;
+                }
+                Operation::Write(bytes) if !bytes.is_empty() => {
+                    self.write_operation(bytes, started, final_operation)?;
+                    started = true;
+                }
+                Operation::Read(_) | Operation::Write(_) => {}
+            }
         }
-        if !self.wait_tx_empty() { return Err(()); }
-        Ok(())
+        self.wait_tx_empty()
     }
 
-    /// Read bytes only.
-    pub fn read(&self, addr: u8, buf: &mut [u8]) -> Result<(), ()> {
-        self.set_target(addr);
-        let mut pos = 0;
-        while pos < buf.len() {
-            let chunk = (buf.len() - pos).min(7);
-            for _ in 0..chunk {
-                if !self.wait_tx_ready() { return Err(()); }
-                reg_write(self.base + I2C_IC_DATA_CMD, 0x100);
-            }
-            for i in 0..chunk {
-                if !self.wait_rx_ready() { return Err(()); }
-                buf[pos + i] = (reg_read(self.base + I2C_IC_DATA_CMD) & 0xFF) as u8;
-            }
-            pos += chunk;
-        }
-        Ok(())
+    pub fn read(&mut self, address: u8, bytes: &mut [u8]) -> Result<(), I2cError> {
+        self.transaction_inner(address, &mut [Operation::Read(bytes)])
+    }
+
+    pub fn write(&mut self, address: u8, bytes: &[u8]) -> Result<(), I2cError> {
+        self.transaction_inner(address, &mut [Operation::Write(bytes)])
+    }
+
+    pub fn write_read(
+        &mut self,
+        address: u8,
+        write: &[u8],
+        read: &mut [u8],
+    ) -> Result<(), I2cError> {
+        self.transaction_inner(
+            address,
+            &mut [Operation::Write(write), Operation::Read(read)],
+        )
+    }
+}
+
+impl ErrorType for I2cMaster {
+    type Error = I2cError;
+}
+
+impl I2c<SevenBitAddress> for I2cMaster {
+    fn transaction(
+        &mut self,
+        address: SevenBitAddress,
+        operations: &mut [Operation<'_>],
+    ) -> Result<(), Self::Error> {
+        self.transaction_inner(address, operations)
     }
 }

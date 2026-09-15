@@ -52,9 +52,11 @@ pub struct NetworkKeyEntry {
 }
 ```
 
-The stack stores up to `MAX_NETWORK_KEYS` (2) entries — the current active key
-and the previous key (kept temporarily during key rotation so in-flight frames
-encrypted with the old key can still be decrypted).
+The stack stores up to `MAX_NETWORK_KEYS` (2) entries: the current active key
+and either the next staged key or the previous key retained after activation.
+Both slots survive reboot, including the distinction between "future" and
+"previous", so a restart during rotation still accepts old- and new-sequence
+traffic without treating the previous key as a pending Switch-Key target.
 
 ```rust
 // Set a new network key (moves current key to "previous" slot)
@@ -121,12 +123,49 @@ if !nwk_security.check_frame_counter(&source_ieee, frame_counter) {
 // Step 2: decrypt and verify MIC
 let plaintext = nwk_security.decrypt(nwk_hdr, ciphertext, key, &sec_hdr)?;
 
-// Step 3: commit the counter ONLY after successful verification
+// Step 3: durably append the key-bound replay floor.
+store.commit_replay_counter(replay)?;
+
+// Step 4: only now commit RAM state and relay/ACK/dispatch the frame.
 nwk_security.commit_frame_counter(&source_ieee, frame_counter);
 ```
 
 The two-phase check-then-commit pattern prevents an attacker from advancing the
-counter table with forged frames that fail MIC verification.
+counter table with forged frames that fail MIC verification. Durable commit
+also prevents a power cut from reopening an already accepted nonce. The
+secured Rejoin Response path uses the same ordering before changing the parent,
+short address, or commissioned live state.
+
+Replay floors are bound to both their sender/domain and the key fingerprint.
+When a link key or the previous Network Key is finally retired, the
+replacement state is committed first and the obsolete replay domains are then
+removed with a crash-safe tombstone. Exact-domain tombstones preserve another
+live APS domain that intentionally uses identical key material; device
+tombstones do not erase the shared preconfigured/distributed global domains.
+
+### Persisted rejoin policy
+
+Persisted recovery first attempts a secure rejoin with the stored active
+network key. If that fails, a Trust Center rejoin is allowed only when the
+durable `NodeJoinLinkKeyType` identifies centralized security. The fallback
+sends an unsecured NWK Rejoin Request, retains the APS Trust Center link key,
+and waits for the current network key under APS key-transport protection.
+
+The received key, key sequence, parent state, Trust Center incoming counter,
+and a new outgoing NWK counter reservation are committed before
+`Device_annce`, End Device Timeout negotiation, or normal traffic. A failed
+commit leaves `rejoin_pending` durable and sends no announcement. Distributed
+global and Touchlink link-key types never use this fallback, as required by
+R22 §4.6.3.3.2.
+
+Because that fallback accepted its NWK Rejoin Response before NWK
+authentication was available, the selected parent is persisted as
+**provisional**. Endpoint-0/ZDO traffic remains available for management and
+proof, but application endpoint traffic fails with `SecurityFail`. Only a
+direct NWK-secured frame from the selected parent clears the gate; a frame
+relayed by another router does not. The cleared state is checkpointed, so a
+reboot cannot reopen the provisional restriction or accidentally trust a
+different neighbor.
 
 ---
 
@@ -142,9 +181,13 @@ pub enum ApsKeyType {
     TrustCenterLinkKey      = 0x01,  // TC ↔ device link key
     NetworkKey              = 0x02,  // the shared network key
     ApplicationLinkKey      = 0x03,  // app-level key between two devices
-    DistributedGlobalLinkKey = 0x04, // for distributed TC networks
 }
 ```
+
+There is no `DistributedGlobalLinkKey = 0x04` APS key type. `0x04` is the
+wire value for a Trust Center link key. A distributed global key is a
+separately provisioned network credential used only to authenticate the
+initial distributed Transport-Key exchange.
 
 ### The Default Trust Center Link Key
 
@@ -163,6 +206,26 @@ During joining, the Trust Center encrypts the network key with this link key
 before sending it to the new device. Because the key is well-known, anyone
 within radio range can capture the network key during the join window. For
 production deployments, **install codes** provide per-device unique keys.
+
+### Distributed security
+
+A distributed PAN has no Trust Center:
+
+- `apsTrustCenterAddress` is `FF:FF:FF:FF:FF:FF:FF:FF`;
+- the joining device's parent transports the initial network key;
+- the command descriptor names the all-ones Trust Center sentinel, while the
+  APS auxiliary nonce still names the real parent IEEE address;
+- Network-Key update/Switch-Key and TCLK exchange are not used.
+
+Production firmware must provision its certified distributed global key
+before formation or join. The runtime fails closed if no key is configured:
+
+```rust,ignore
+device.set_distributed_security_link_key(product::DISTRIBUTED_SECURITY_KEY);
+```
+
+`DISTRIBUTED_SECURITY_TEST_LINK_KEY` (`D0..DF`) is only a public BDB
+certification key.
 
 ### APS Security Header
 
@@ -237,6 +300,32 @@ let entry = aps_sec.find_key(&partner_ieee, ApsKeyType::ApplicationLinkKey);
 aps_sec.remove_key(&partner_ieee, ApsKeyType::ApplicationLinkKey);
 ```
 
+### Durable application-key installation
+
+Incoming application-link-key Transport-Key commands are an optional product
+capability named `application-link-key-installation`. They are enabled only by
+a composition that also owns durable APS-table storage.
+`PersistentApsTables<A>` enables the runtime capability; `NoApsTables` leaves
+it disabled and the command is rejected without mutating the live key table.
+
+An accepted key uses this cross-store commit order:
+
+1. install the key in RAM but hold completion and any compatibility
+   acknowledgement for a legacy incoming AR=1 command;
+2. commit the network-bound APS table and its application-key counter
+   reservation;
+3. when replacing an existing key, tombstone the retired key's replay domain;
+4. append the authenticated APS replay floor to `SecurityStateJournal`;
+5. commit the replay floor in RAM and release any such acknowledgement.
+
+A storage error stops at the failed boundary and sends no acknowledgement.
+Normal security commands use AR=0 and have no APS acknowledgement or APS
+retransmission procedure; repeated delivery can still follow a sender restart.
+After reboot, a retry before the APS-table commit installs the key normally.
+A retry after the APS-table commit finds the identical durable key, preserves
+its counters, completes any missing retirement tombstone, commits the incoming
+replay floor, and only then releases a legacy AR=1 acknowledgement, if requested.
+
 ---
 
 ## Network Key Distribution
@@ -268,43 +357,162 @@ weakness of the well-known default key. An install code is:
 - Hashed using Matyas–Meyer–Oseas (MMO) to derive a unique 128-bit link key
 - Pre-provisioned on the Trust Center *before* the device joins
 
-In zigbee-rs, install code support is declared in the `TrustCenter` struct:
+The authoritative Coordinator implementation can provision and derive an
+install-code key before admitting the device:
 
-```rust
-pub struct CoordinatorConfig {
-    // ...
-    pub require_install_codes: bool,
-    // ...
-}
+```rust,ignore
+let derived_key =
+    app.provision_install_code(device_ieee, install_code_with_crc)?;
 ```
 
-When `require_install_codes` is `true`, the Trust Center only accepts joins
-from devices whose IEEE address has a pre-provisioned install-code-derived
-key in the link key table.
+CRC validation and AES-MMO derivation are implemented. The
+`trust_center_install_code_policy` and join policy attributes decide whether
+unknown/default-key joins remain admissible. This path is host-tested with
+`MockMac`; no production backend currently advertises Coordinator or
+Trust-Center server capability.
 
-> **Note:** The current implementation includes a structural placeholder for
-> install code derivation. The actual MMO hash computation is not yet
-> implemented — only pre-provisioned keys are supported.
+---
+
+## Trust Center security-command completion
+
+R22 section 4.4.10 requires APS ACK-request **zero** for security commands;
+sections 2.2.8.4.3–4 exclude them from APS retransmission. The TC's Confirm-Key,
+application-link Transport-Key, and Remove-Device, and a parent's Update-Device
+send intents therefore track local NLDE submission, not an APS ACK or proof of
+remote processing. An indirect enqueue is only local submission. Normal APS
+data acknowledgements and retries are unchanged.
+
+A parent's `Update-Device(DeviceLeft)` intent is durable before submission.
+Child replay retirement must finish before sending; successful submission
+allows the child-journal intent to be retired without a peer response. If that
+completion write fails, a volatile marker suppresses same-process resubmission;
+after reboot the still-durable intent can be submitted again. New live child
+membership supersedes an unsent departure. A local TC indication instead waits
+for explicit durable consumption by the composition root.
+Once the TC has a bound parent/address for a device, a DeviceLeft report for
+an older parent or short address is ignored rather than revoking the new
+membership. The wire command has no join-incarnation token, so this is not
+an exactly-once guarantee for a later rejoin with the same parent and address.
+
+A successful Verify-Key promotes the TC's replacement key before Confirm-Key
+is sent (R22 section 4.4.7.2.3). Losing Confirm-Key does not roll that promotion
+back. The journal commits the verified key and response intent together;
+failure restores the prior policy state. A failed completion write retains
+the volatile submission marker, avoiding another Confirm-Key request and
+another incoming-counter reset within that boot. After reboot an uncommitted
+send intent is conservatively resumed, without claiming exactly-once delivery.
+
+Application-key distribution preserves one key generation for both recipients
+and journals their local send progress separately. Local revocation after
+Remove-Device submission still requires durable replay retirement; it does
+not assert that the remote child has left. An authenticated DeviceLeft
+indication is separate departure evidence.
 
 ---
 
 ## Key Rotation
 
-The Trust Center can rotate the network key to limit the exposure window if a
-key is compromised:
+`TrustCenterCoordinatorApp` performs centralized Network-Key rotation using
+the BDB update method:
 
-```rust
-// On the Trust Center
-trust_center.set_network_key(new_key);  // increments key_seq_number
+```rust,ignore
+app.node_mut()
+    .device_mut()
+    .bdb_mut()
+    .attributes_mut()
+    .trust_center_network_key_update_method =
+        NetworkKeyUpdateMethod::Broadcast; // or Unicast
 
-// The NWK security context keeps both keys during transition
-nwk_security.set_network_key(new_key, new_seq);
-// keys[0] = new key (active), keys[1] = old key (for in-flight frames)
+app.request_network_key_rotation().await?;
 ```
 
-During rotation, the TC broadcasts a **NWK Key-Switch** command. Until all
-devices have switched, the network accepts frames encrypted with either the
-old or new key (matched by `key_seq_number`).
+The configured `trust_center_network_key_update_period` starts the same
+transaction automatically when non-zero. Distributed-security networks do not
+run this Trust Center procedure. The built-in interval is monotonic-uptime
+based and restarts after reboot; products that require a wall-clock cadence
+should invoke `request_network_key_rotation()` from their durable scheduler.
+
+The crash-safe order is:
+
+1. Generate sequence `(active + 1) mod 256` and stage the new key.
+2. Commit the staged key to `SecurityStateJournal`.
+   Retire replay records for a displaced previous key only after this write.
+   For broadcast distribution, also commit the explicit local-child forwarding
+   intent before the TC rotation record or any transmission.
+3. Commit phase, update method, and per-router unicast progress to the Trust
+   Center journal.
+4. Send broadcast or router-only unicast APS Transport-Key under the old
+   active NWK key. Security commands must not request an APS acknowledgement;
+   recorded transmission progress is not proof that a child installed a key.
+   Router membership comes from authenticated `Device_annce`; unicast mode
+   returns `RouterListIncomplete` while an admitted peer's role is unknown.
+5. Allow at least 30 seconds, or the configured local forwarding window if
+   longer, on a populated network before broadcasting Switch-Key. This is
+   implementation policy, not an R22 timer; a restart in this phase restarts
+   the interval.
+6. Broadcast Switch-Key while the old key is still active locally.
+7. Mark the transaction `Activating`, switch the local key and NIB sequence
+   together, then checkpoint the security journal.
+8. Retain the previous key and its replay floors for receive compatibility
+   until a subsequent update replaces the alternate slot. Never transmit
+   with the previous key after activation.
+9. Clear the Trust Center transaction only after those commits succeed.
+
+Initial key transport is a separate durable intent. Indirect enqueue, MAC
+delivery, or delivery of a tunnel to a remote parent does not close it.
+A fresh authenticated matching `Device_annce` or security exchange closes it;
+restored neighbor authorization alone does not. Otherwise it is retried after
+restart and at bounded intervals during the join. Failed intent creation
+neither admits the peer nor permits a later poll to send an uncommitted key.
+
+Broadcast updates require parents to forward the all-zero-destination key
+descriptor to sleepy children (R22 sections 4.4.2.1.3 and 4.4.2.3). This is
+distinct from the router-only unicast update policy. A sleepy device that
+misses key transport outside the parent's delivery window may need Trust
+Center rejoin; R22 does not promise indefinite offline-key delivery.
+
+The originating TC uses the same bounded forwarding path for its own children,
+including after reboot during propagation. Products configure
+`set_network_key_forwarding_max_poll_interval_us()` before initialization on
+every boot. The window is twice that profile interval; the current eight-second
+default interval is implementation policy, not an R22 numerical recommendation.
+
+Every phase is idempotent across reboot. A staged security key whose Trust
+Center intent was torn is recognized and resumed; a Switch-Key may be resent;
+and an already checkpointed activation is completed without switching twice.
+The previous NWK key remains in the second durable slot after transaction
+completion, together with its replay floors. A later update replaces it.
+An authenticated, fresh packet using a newer staged key can activate that
+key even if a sleepy device missed Switch-Key; old-key reception never
+switches the active sequence backward (R22 sections 4.3.1.2 and 4.7.3.10.6).
+Secured indirect frames are rebuilt on each child poll with the current key
+and a fresh reserved counter, not transmitted as stale queued ciphertext.
+A subsequent forced rotation waits for the preceding broadcast delivery
+interval; this conservative guard restarts after reboot. When a later update
+replaces the previous-key slot, its replay records are retired only after
+the replacement key snapshot is durable and before distribution begins.
+
+### Host restart qualification
+
+The `key_power_cuts` tests in `apps/router/tests/lifecycle.rs` record the
+successful path's journal commits, then rerun it with a failure before each
+commit in turn. Each run requires the selected failure to occur and propagate
+as an error before rebuilding the coordinator from durable state.
+
+- `sleepy_rotation_recovers_at_every_security_and_tc_commit` exercises staged
+  preparation, local sleepy-child forwarding, propagation, Switch-Key,
+  activation and completion. Recovery preserves the staged key once committed,
+  restarts the propagation wait where needed, retains the previous receive key
+  and skips the previous outgoing-counter reservation.
+- `sleepy_initial_completion_recovers_at_every_replay_and_tc_commit` starts
+  from a durable initial-delivery intent. MAC delivery and restored child
+  state cannot complete it. After a replay/TC commit failure, a previously
+  committed announcement remains rejected as a replay; fresh authenticated
+  evidence completes the intent.
+
+These are bounded software failure/restart sweeps with a real coordinator
+application and `MockMac`. They model errors before atomic store commits, not
+torn flash writes, radio timing, or a hardware power-cut campaign.
 
 ---
 

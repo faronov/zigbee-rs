@@ -15,19 +15,27 @@
 //! 1. Open local permit joining for `bdbcMinCommissioningTime`
 //! 2. Broadcast `Mgmt_Permit_Joining_req` to the network
 
-use zigbee_aps::security::{ApsKeyType, ApsLinkKeyEntry};
+use zigbee_aps::security::ApsKeyType;
+#[cfg(feature = "centralized-tclk")]
+use zigbee_aps::security::ApsLinkKeyEntry;
 use zigbee_mac::MacDriver;
+#[cfg(any(feature = "router", test))]
 use zigbee_nwk::DeviceType;
 use zigbee_types::{ChannelMask, IeeeAddress, ShortAddress};
 use zigbee_zdo::ZdoLayer;
 use zigbee_zdo::ZdpStatus;
+#[cfg(feature = "centralized-tclk")]
 use zigbee_zdo::discovery::NodeDescRsp;
 
+#[cfg(feature = "centralized-tclk")]
+use crate::TrustCenterLinkKeyState;
+#[cfg(any(feature = "distributed-security", feature = "router", test))]
 use crate::attributes::BDB_MIN_COMMISSIONING_TIME;
+#[cfg(feature = "centralized-tclk")]
 use crate::tclk_exchange::{TclkExchange, TclkProgress, TclkStage};
 use crate::{
     BdbLayer, BdbStatus, KeyFrameResult, NetworkSecurityState, SecurityPersistence,
-    SteeringDiagnostics, SteeringStage, TrustCenterLinkKeyState,
+    SteeringDiagnostics, SteeringStage,
 };
 
 #[cfg(feature = "trace")]
@@ -43,6 +51,7 @@ macro_rules! bdb_diag {
 
 // The unique Trust Center link-key handshake timing/budget lives in the
 // event-driven state machine (`crate::tclk_exchange`).
+#[cfg(feature = "centralized-tclk")]
 const TCLK_MIN_STACK_REVISION: u8 = 21;
 /// Bounded wait for the initial Transport-Key that follows MAC association.
 ///
@@ -118,7 +127,7 @@ fn ordered_steering_channel_sets(primary: ChannelMask, secondary: ChannelMask) -
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
-mod tests {
+mod feature_tests {
     use super::*;
 
     #[test]
@@ -147,7 +156,75 @@ mod tests {
         );
     }
 
-    // ── Event-driven unique-TCLK exchange integration ───────
+    fn block_on_role_test<F: core::future::Future>(future: F) -> F::Output {
+        use core::task::{Context, Poll, Waker};
+
+        let mut context = Context::from_waker(Waker::noop());
+        let mut future = core::pin::pin!(future);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+        }
+    }
+
+    fn joined_distributed_end_device() -> BdbLayer<zigbee_mac::mock::MockMac> {
+        let ieee = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let mac = zigbee_mac::mock::MockMac::new(ieee);
+        let mut nwk = zigbee_nwk::NwkLayer::new(mac, DeviceType::EndDevice);
+        nwk.set_joined(true);
+        nwk.security_mut().set_network_key([0x5A; 16], 0);
+        {
+            let nib = nwk.nib_mut();
+            nib.network_address = ShortAddress(0x1234);
+            nib.pan_id = zigbee_types::PanId(0x5678);
+            nib.ieee_address = ieee;
+            nib.logical_channel = 15;
+            nib.security_enabled = true;
+            nib.outgoing_frame_counter_limit = 0x400;
+        }
+        let aps = zigbee_aps::ApsLayer::new(nwk);
+        let mut zdo = zigbee_zdo::ZdoLayer::new(aps);
+        zdo.set_local_nwk_addr(ShortAddress(0x1234));
+        zdo.set_local_ieee_addr(ieee);
+        let mut bdb = BdbLayer::new(zdo);
+        bdb.attributes_mut().node_is_on_a_network = true;
+        bdb.attributes_mut().node_join_link_key_type =
+            crate::attributes::NodeJoinLinkKeyType::DistributedSecurityGlobalLinkKey;
+        bdb.zdo_mut().aps_mut().aib_mut().aps_trust_center_address = [0xFF; 8];
+        bdb
+    }
+
+    #[test]
+    fn distributed_end_device_broadcasts_permit_joining_without_admitting_children() {
+        let mut bdb = joined_distributed_end_device();
+
+        assert_eq!(
+            block_on_role_test(bdb.activate_permit_joining_after_steering()),
+            Ok(())
+        );
+
+        let history = bdb.zdo().nwk().mac().tx_history();
+        assert_eq!(history.len(), 1);
+        let (header, _) =
+            zigbee_nwk::frames::NwkHeader::parse(history[0].payload.as_slice()).unwrap();
+        assert_eq!(
+            header.dst_addr,
+            ShortAddress::BROADCAST_ROUTERS_AND_COORDINATOR
+        );
+        assert!(
+            !bdb.zdo().nwk().nib().permit_joining,
+            "a sleepy end device requests the network-wide window but cannot admit children"
+        );
+    }
+}
+
+// ── Event-driven unique-TCLK exchange integration ───────
+
+#[cfg(all(test, feature = "centralized-tclk"))]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
 
     use core::future::Future;
     use zigbee_aps::ApsLayer;
@@ -446,6 +523,7 @@ mod tests {
             nib.extended_pan_id = [0xBB; 8];
             nib.logical_channel = TEST_CHANNEL;
             nib.security_enabled = true;
+            nib.outgoing_frame_counter_limit = 0x400;
         }
         let aps = ApsLayer::new(nwk);
         let mut zdo = ZdoLayer::new(aps);
@@ -1406,6 +1484,12 @@ mod tests {
         bdb
     }
 
+    fn distributed_steerable_bdb() -> BdbLayer<MockMac> {
+        let mut bdb = steerable_bdb();
+        bdb.zdo_mut().aps_mut().aib_mut().aps_trust_center_address = [0xFF; 8];
+        bdb
+    }
+
     fn mac_short_address(bdb: &BdbLayer<MockMac>) -> u16 {
         match block_on(
             bdb.zdo()
@@ -1642,6 +1726,7 @@ mod tests {
         network_reserved: Option<NetworkSecurityState>,
         reserved: Option<TrustCenterLinkKeyState>,
         committed: Option<TrustCenterLinkKeyState>,
+        distributed_committed: bool,
     }
 
     impl SecurityPersistence for TestPersistence {
@@ -1674,6 +1759,41 @@ mod tests {
             self.committed = Some(*state);
             Ok(())
         }
+
+        fn commit_distributed_network(&mut self) -> Result<(), crate::SecurityPersistenceError> {
+            self.distributed_committed = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn distributed_join_commits_without_starting_a_tclk_exchange() {
+        let mut bdb = distributed_steerable_bdb();
+        let mut announce = ScriptedAnnce::failing(0);
+        let mut persistence = TestPersistence::default();
+
+        assert_eq!(
+            block_on(bdb.network_steering_with_announce_for_test(&mut persistence, &mut announce)),
+            Ok(())
+        );
+        assert_eq!(
+            bdb.attributes().node_join_link_key_type,
+            crate::attributes::NodeJoinLinkKeyType::DistributedSecurityGlobalLinkKey
+        );
+        assert_eq!(
+            persistence
+                .network_reserved
+                .expect("network state is reserved")
+                .trust_center_address,
+            [0xFF; 8]
+        );
+        assert!(persistence.distributed_committed);
+        assert!(!bdb.tclk_exchange_active());
+        assert!(bdb.is_on_network());
+        assert_eq!(
+            bdb.attributes().commissioning_status,
+            crate::attributes::BdbCommissioningStatus::Success
+        );
     }
 
     #[test]
@@ -1761,7 +1881,14 @@ impl<M: MacDriver> BdbLayer<M> {
         announce: &mut T,
     ) -> Result<(), BdbStatus> {
         self.steering_diagnostics = SteeringDiagnostics::default();
-        self.tclk_exchange = None;
+        #[cfg(feature = "centralized-tclk")]
+        {
+            self.tclk_exchange = None;
+        }
+        if !self.attributes.node_is_on_a_network {
+            self.attributes.node_join_link_key_type =
+                crate::attributes::NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey;
+        }
         self.attributes.commissioning_status =
             crate::attributes::BdbCommissioningStatus::InProgress;
         if self.attributes.node_is_on_a_network {
@@ -1776,7 +1903,7 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Test-only entry point: it exercises exactly the production path of
     /// [`Self::network_steering`] while letting a test choose which announce
     /// attempts fail.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "centralized-tclk"))]
     async fn network_steering_with_announce_for_test<T: DeviceAnnceTransmitter<M>>(
         &mut self,
         persistence: &mut dyn SecurityPersistence,
@@ -1800,6 +1927,7 @@ impl<M: MacDriver> BdbLayer<M> {
     ///
     /// `persistence`, when supplied, reserves the unique TCLK/counter before
     /// Verify-Key and commits the commissioned network only after Confirm-Key.
+    #[cfg(feature = "centralized-tclk")]
     pub async fn advance_tclk_exchange(
         &mut self,
         persistence: Option<&mut (dyn SecurityPersistence + '_)>,
@@ -2025,6 +2153,7 @@ impl<M: MacDriver> BdbLayer<M> {
                     let ieee = self.zdo.nwk().nib().ieee_address;
 
                     // Step 5: Start router if we are a router
+                    #[cfg(any(feature = "router", test))]
                     if self.zdo.nwk().device_type() == DeviceType::Router {
                         let _ = self.zdo.nlme_start_router().await;
                     }
@@ -2037,195 +2166,11 @@ impl<M: MacDriver> BdbLayer<M> {
                     log::info!("[BDB:Steering] Waiting for Transport-Key from TC...");
                     self.steering_diagnostics.stage = SteeringStage::WaitingForTransportKey;
 
-                    let mut key_received = false;
-                    let rx_on = self.zdo.nwk().rx_on_when_idle();
-
-                    // Phase 0: Passive RX listen — only useful when rx_on_when_idle=true
-                    // because the TC sends Transport-Key as a DIRECT unicast. When the
-                    // device is sleepy (rx_on_when_idle=false), the TC buffers the TK at
-                    // the parent as an indirect frame — passive RX will never see it and
-                    // the ~3 s timeout delays the first poll, risking indirect-frame expiry.
-                    if rx_on {
-                        log::info!(
-                            "[BDB:Steering] Phase 0: passive RX for direct Transport-Key..."
-                        );
-                        for rx_attempt in 0..4u8 {
-                            #[allow(clippy::single_match)]
-                            match self
-                                .zdo
-                                .aps_mut()
-                                .nwk_mut()
-                                .mac_mut()
-                                .mcps_data_indication()
-                                .await
-                            {
-                                Ok(mac_frame) => {
-                                    self.steering_diagnostics.passive_rx_frames = self
-                                        .steering_diagnostics
-                                        .passive_rx_frames
-                                        .saturating_add(1);
-                                    self.steering_diagnostics.last_frame_len =
-                                        mac_frame.payload.len().min(u8::MAX as usize) as u8;
-                                    let prefix_len = mac_frame
-                                        .payload
-                                        .len()
-                                        .min(self.steering_diagnostics.last_frame_prefix.len());
-                                    self.steering_diagnostics.last_frame_prefix[..prefix_len]
-                                        .copy_from_slice(
-                                            &mac_frame.payload.as_slice()[..prefix_len],
-                                        );
-                                    let mac_payload = mac_frame.payload.as_slice();
-                                    bdb_diag!(
-                                        "[BDB] passive_rx[{}] {} bytes",
-                                        rx_attempt,
-                                        mac_payload.len()
-                                    );
-                                    log::info!(
-                                        "[BDB:Steering] RX {}: {} bytes",
-                                        rx_attempt,
-                                        mac_payload.len(),
-                                    );
-                                    if let Some(true) = self.try_process_frame(mac_payload) {
-                                        key_received = true;
-                                        break;
-                                    }
-                                }
-
-                                Err(_) => {
-                                    bdb_diag!("[BDB] passive_rx[{}] none", rx_attempt);
-                                }
-                            }
-                        }
-                        if key_received {
-                            log::info!("[BDB:Steering] Transport-Key received during passive RX!");
-                        }
-                    } else {
-                        log::info!(
-                            "[BDB:Steering] Phase 0: skipped (sleepy device, TK via indirect poll)"
-                        );
-                    }
-                    // Poll long enough for the Trust Center to send the key after
-                    // the parent relays Update-Device. Slow coordinators and
-                    // multi-hop relays may require many rounds.
-                    const MAX_TOTAL_ROUNDS: usize = 128;
-                    const MAX_EMPTY_ROUNDS: u16 = 128;
-                    const POLL_TIMEOUT_US: u32 = 500_000;
-                    let mut empty_count: u16 = 0;
-                    let mut total_rounds: usize = 0;
-                    let mut data_frames: usize = 0;
-                    let transport_key_wait_started = self.zdo.aps().nwk().mac().monotonic_micros();
-
-                    while !key_received
-                        && total_rounds < MAX_TOTAL_ROUNDS
-                        && empty_count < MAX_EMPTY_ROUNDS
-                        && !self.security_exchange_timed_out(transport_key_wait_started)
-                    {
-                        total_rounds += 1;
-                        let mut got_data_this_round = false;
-                        let elapsed = self
-                            .zdo
-                            .aps()
-                            .nwk()
-                            .mac()
-                            .monotonic_micros()
-                            .wrapping_sub(transport_key_wait_started);
-                        let remaining = TRANSPORT_KEY_WAIT_US.saturating_sub(elapsed);
-
-                        // Poll parent for indirect frames
-                        self.steering_diagnostics.poll_attempts =
-                            self.steering_diagnostics.poll_attempts.saturating_add(1);
-                        match self
-                            .zdo
-                            .aps_mut()
-                            .nwk_mut()
-                            .mac_mut()
-                            .mlme_poll_timeout(POLL_TIMEOUT_US.min(remaining))
-                            .await
-                        {
-                            Ok(Some(mac_frame)) => {
-                                self.steering_diagnostics.poll_data_frames =
-                                    self.steering_diagnostics.poll_data_frames.saturating_add(1);
-                                self.steering_diagnostics.last_frame_len =
-                                    mac_frame.len().min(u8::MAX as usize) as u8;
-                                let prefix_len = mac_frame
-                                    .len()
-                                    .min(self.steering_diagnostics.last_frame_prefix.len());
-                                self.steering_diagnostics.last_frame_prefix[..prefix_len]
-                                    .copy_from_slice(&mac_frame.as_slice()[..prefix_len]);
-                                got_data_this_round = true;
-                                data_frames += 1;
-                                let mac_payload = mac_frame.as_slice();
-                                bdb_diag!(
-                                    "[BDB] parent_poll[{}] {} bytes total={}",
-                                    total_rounds,
-                                    mac_payload.len(),
-                                    data_frames
-                                );
-                                log::info!(
-                                    "[BDB:Steering] P-Poll {}: {} bytes (total={})",
-                                    total_rounds,
-                                    mac_payload.len(),
-                                    data_frames,
-                                );
-                                if let Some(true) = self.try_process_frame(mac_payload) {
-                                    bdb_diag!("[BDB] transport_key=ok via parent_poll");
-                                    key_received = true;
-                                    break;
-                                }
-                            }
-                            Ok(None) => {
-                                bdb_diag!("[BDB] parent_poll[{}] none", total_rounds);
-                            }
-                            Err(e) => {
-                                self.steering_diagnostics.poll_errors =
-                                    self.steering_diagnostics.poll_errors.saturating_add(1);
-                                bdb_diag!("[BDB] parent_poll[{}] err {:?}", total_rounds, e);
-                                log::warn!("[BDB:Steering] P-Poll {}: err {:?}", total_rounds, e);
-                            }
-                        }
-
-                        if key_received {
-                            break;
-                        }
-
-                        if got_data_this_round {
-                            empty_count = 0;
-                        } else {
-                            empty_count += 1;
-                            log::debug!(
-                                "[BDB:Steering] Round {}: no data ({}/{})",
-                                total_rounds,
-                                empty_count,
-                                MAX_EMPTY_ROUNDS,
-                            );
-                        }
-                    }
-
-                    log::info!(
-                        "[BDB:Steering] Transport-Key wait done: passive_rx={} rounds={} frames={} empty={}",
-                        if key_received { "hit" } else { "miss" },
-                        total_rounds,
-                        data_frames,
-                        empty_count
-                    );
+                    let key_received = self.wait_for_transport_key().await;
 
                     if !key_received {
                         self.steering_diagnostics.stage = SteeringStage::TransportKeyMissing;
-                        bdb_diag!(
-                            "[BDB] transport_key=missing rounds={} frames={} empty={}",
-                            total_rounds,
-                            data_frames,
-                            empty_count
-                        );
-                        log::warn!(
-                            "[BDB:Steering] Transport-Key NOT received after {} rounds ({} data frames, {} consecutive empty)",
-                            total_rounds,
-                            data_frames,
-                            empty_count,
-                        );
-                    }
-
-                    if !key_received {
+                        bdb_diag!("[BDB] transport_key=missing");
                         bdb_diag!(
                             "[BDB] reset pan=0x{:04X} reason=no_transport_key",
                             network.pan_id.0
@@ -2246,6 +2191,7 @@ impl<M: MacDriver> BdbLayer<M> {
                     self.steering_diagnostics.transport_key_received = true;
                     self.steering_diagnostics.transport_key_received_us =
                         self.zdo.aps().nwk().mac().monotonic_micros();
+                    self.capture_join_link_key_type()?;
 
                     if let Some(persistence) = persistence.as_deref_mut() {
                         if let Err(error) = self.reserve_network_security(persistence) {
@@ -2297,7 +2243,6 @@ impl<M: MacDriver> BdbLayer<M> {
                     // explicit bounded state machine here and let the runtime
                     // advance it one step per tick/poll while normal ZDO/ZCL
                     // processing and sleepy polling continue.
-                    let tc_addr = ShortAddress::COORDINATOR;
                     let tc_ieee = self.zdo.aps().aib().aps_trust_center_address;
                     if tc_ieee == [0u8; 8] {
                         self.steering_diagnostics.stage =
@@ -2315,16 +2260,67 @@ impl<M: MacDriver> BdbLayer<M> {
                     self.attributes.node_is_on_a_network = true;
                     let now = self.zdo.aps().nwk().mac().monotonic_micros();
                     self.steering_diagnostics.network_up_us = now;
-                    let mut exchange = TclkExchange::new(tc_addr, tc_ieee, now);
-                    exchange
-                        .baseline_handshake_counters(&self.zdo.aps().security_handshake_stats());
-                    self.tclk_exchange = Some(exchange);
-                    bdb_diag!("[BDB] steering=network_up addr=0x{:04X}", nwk_addr.0);
-                    log::info!(
-                        "[BDB:Steering] Network up as 0x{:04X} — unique TCLK exchange armed",
-                        nwk_addr.0,
-                    );
-                    return Ok(());
+                    #[cfg(any(feature = "distributed-security", test))]
+                    if self.attributes.node_join_link_key_type.is_distributed() {
+                        if let Err(status) = self.activate_permit_joining_after_steering().await {
+                            self.attributes.node_is_on_a_network = false;
+                            self.attributes.commissioning_status =
+                                crate::attributes::BdbCommissioningStatus::NotPermitted;
+                            let _ = self.zdo.nlme_reset(false);
+                            return Err(status);
+                        }
+                        if let Some(persistence) = persistence.as_deref_mut()
+                            && let Err(error) = persistence.commit_distributed_network()
+                        {
+                            log::error!(
+                                "[BDB:Steering] Failed to commit distributed network: {:?}",
+                                error
+                            );
+                            self.attributes.node_is_on_a_network = false;
+                            self.attributes.commissioning_status =
+                                crate::attributes::BdbCommissioningStatus::NoNetwork;
+                            let _ = self.zdo.nlme_reset(false);
+                            return Err(BdbStatus::PersistenceFailure);
+                        }
+                        self.attributes.commissioning_status =
+                            crate::attributes::BdbCommissioningStatus::Success;
+                        self.steering_diagnostics.stage = SteeringStage::Complete;
+                        self.steering_diagnostics.tclk_complete_us = now;
+                        bdb_diag!(
+                            "[BDB] steering=distributed_complete addr=0x{:04X}",
+                            nwk_addr.0
+                        );
+                        log::info!(
+                            "[BDB:Steering] Distributed-security commissioning complete as 0x{:04X}",
+                            nwk_addr.0,
+                        );
+                        return Ok(());
+                    }
+                    #[cfg(not(feature = "centralized-tclk"))]
+                    {
+                        self.steering_diagnostics.stage =
+                            SteeringStage::TrustCenterLinkKeyExchangeFailed;
+                        self.attributes.commissioning_status =
+                            crate::attributes::BdbCommissioningStatus::NotPermitted;
+                        self.leave_after_initial_commissioning_failure(&tc_ieee)
+                            .await;
+                        return Err(BdbStatus::NotPermitted);
+                    }
+                    #[cfg(feature = "centralized-tclk")]
+                    {
+                        let mut exchange =
+                            TclkExchange::new(ShortAddress::COORDINATOR, tc_ieee, now);
+                        exchange.baseline_handshake_counters(
+                            &self.zdo.aps().security_handshake_stats(),
+                        );
+                        self.tclk_exchange = Some(exchange);
+                        bdb_diag!("[BDB] steering=network_up addr=0x{:04X}", nwk_addr.0);
+                        log::info!(
+                            "[BDB:Steering] Network up as 0x{:04X} — unique TCLK exchange armed",
+                            nwk_addr.0,
+                        );
+                        return Ok(());
+                    }
                 }
             } // end prefer_coordinator pass
 
@@ -2530,6 +2526,8 @@ impl<M: MacDriver> BdbLayer<M> {
             network_key,
             key_sequence,
             outgoing_frame_counter: nib.outgoing_frame_counter,
+            trust_center_address: self.zdo.aps().aib().aps_trust_center_address,
+            node_join_link_key_type: self.attributes.node_join_link_key_type,
         };
         let reservation = persistence.reserve_network_security(&state)?;
         if !reservation.is_valid() || reservation.current < state.outgoing_frame_counter {
@@ -2546,6 +2544,55 @@ impl<M: MacDriver> BdbLayer<M> {
         Ok(())
     }
 
+    fn capture_join_link_key_type(&mut self) -> Result<(), BdbStatus> {
+        use crate::attributes::NodeJoinLinkKeyType;
+        use zigbee_aps::NetworkKeyJoinMethod;
+
+        let method = self.zdo.aps_mut().take_network_key_join_method();
+        self.attributes.node_join_link_key_type = match method {
+            Some(NetworkKeyJoinMethod::DistributedSecurityGlobal) => {
+                #[cfg(any(feature = "distributed-security", test))]
+                {
+                    NodeJoinLinkKeyType::DistributedSecurityGlobalLinkKey
+                }
+                #[cfg(not(any(feature = "distributed-security", test)))]
+                {
+                    return Err(BdbStatus::NotPermitted);
+                }
+            }
+            Some(NetworkKeyJoinMethod::CentralizedKeyPair) => {
+                NodeJoinLinkKeyType::InstallCodeDerivedPreconfiguredLinkKey
+            }
+            Some(NetworkKeyJoinMethod::CentralizedPreconfiguredGlobal) => {
+                if self.attributes.join_uses_install_code_key {
+                    NodeJoinLinkKeyType::InstallCodeDerivedPreconfiguredLinkKey
+                } else {
+                    NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey
+                }
+            }
+            None if self.zdo.aps().aib().aps_trust_center_address == [0xFF; 8] => {
+                #[cfg(any(feature = "distributed-security", test))]
+                {
+                    NodeJoinLinkKeyType::DistributedSecurityGlobalLinkKey
+                }
+                #[cfg(not(any(feature = "distributed-security", test)))]
+                {
+                    return Err(BdbStatus::NotPermitted);
+                }
+            }
+            None if self.zdo.aps().aib().aps_trust_center_address != [0; 8] => {
+                if self.attributes.join_uses_install_code_key {
+                    NodeJoinLinkKeyType::InstallCodeDerivedPreconfiguredLinkKey
+                } else {
+                    NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey
+                }
+            }
+            None => return Err(BdbStatus::SteeringFailure),
+        };
+        Ok(())
+    }
+
+    #[cfg(feature = "centralized-tclk")]
     fn reserve_trust_center_link_key(
         &mut self,
         persistence: &mut dyn SecurityPersistence,
@@ -2580,6 +2627,7 @@ impl<M: MacDriver> BdbLayer<M> {
         Ok(())
     }
 
+    #[cfg(feature = "centralized-tclk")]
     fn commit_persisted_network(
         &self,
         persistence: &mut dyn SecurityPersistence,
@@ -2608,6 +2656,7 @@ impl<M: MacDriver> BdbLayer<M> {
     ///
     /// The global ZigBeeAlliance09 key is never a valid unique TCLK, so an
     /// entry holding it does not count as an established unique key.
+    #[cfg(feature = "centralized-tclk")]
     fn has_unique_tc_link_key(&self, tc_ieee: &zigbee_types::IeeeAddress) -> bool {
         let default_key = *self.zdo.aps().security().default_tc_link_key();
         self.zdo
@@ -2624,6 +2673,7 @@ impl<M: MacDriver> BdbLayer<M> {
     /// space, and the Trust Center will transport a fresh one. A confirmed key
     /// is never removed here, so the reserved outgoing-counter window and the
     /// persisted commissioned state stay intact for every other path.
+    #[cfg(feature = "centralized-tclk")]
     fn clear_unconfirmed_tc_link_key(&mut self, tc_ieee: &zigbee_types::IeeeAddress) {
         if self.has_unique_tc_link_key(tc_ieee) {
             log::warn!("[BDB:Steering] Dropping unconfirmed unique TC link key before retry");
@@ -2643,6 +2693,7 @@ impl<M: MacDriver> BdbLayer<M> {
     /// and a lost Confirm-Key retransmits only Verify-Key while keeping the
     /// unique key the Trust Center already installed.
     #[allow(clippy::needless_option_as_deref)]
+    #[cfg(feature = "centralized-tclk")]
     async fn step_tclk_exchange(
         &mut self,
         ex: &mut TclkExchange,
@@ -2969,6 +3020,7 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Parse a Node_Desc_rsp and decide the next stage: pre-R21 completes the
     /// exchange, R21+ proceeds to the unique-key request; a rejected or
     /// malformed response retransmits Node_Desc while its budget lasts.
+    #[cfg(feature = "centralized-tclk")]
     async fn handle_node_desc_payload(
         &mut self,
         ex: &mut TclkExchange,
@@ -3027,6 +3079,7 @@ impl<M: MacDriver> BdbLayer<M> {
     }
 
     /// Common success finalisation shared by the pre-R21 and confirmed paths.
+    #[cfg(feature = "centralized-tclk")]
     fn mark_commissioned_success(&mut self, ex: &mut TclkExchange) -> TclkProgress {
         self.attributes.node_is_on_a_network = true;
         self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::Success;
@@ -3038,6 +3091,7 @@ impl<M: MacDriver> BdbLayer<M> {
         TclkProgress::Complete
     }
 
+    #[cfg(feature = "centralized-tclk")]
     async fn finalize_pre_r21(
         &mut self,
         ex: &mut TclkExchange,
@@ -3084,6 +3138,7 @@ impl<M: MacDriver> BdbLayer<M> {
             state_to_commit = Some(state);
         }
 
+        #[cfg(any(feature = "router", test))]
         if let Err(status) = self.activate_permit_joining_after_steering().await {
             return self.finalize_post_auth_steering_failure(ex, status).await;
         }
@@ -3101,11 +3156,13 @@ impl<M: MacDriver> BdbLayer<M> {
     }
 
     /// Commit the commissioned network after a successful Confirm-Key.
+    #[cfg(feature = "centralized-tclk")]
     async fn finalize_tclk_success(
         &mut self,
         ex: &mut TclkExchange,
         persistence: Option<&mut (dyn SecurityPersistence + '_)>,
     ) -> TclkProgress {
+        #[cfg(any(feature = "router", test))]
         if let Err(status) = self.activate_permit_joining_after_steering().await {
             return self.finalize_post_auth_steering_failure(ex, status).await;
         }
@@ -3122,6 +3179,7 @@ impl<M: MacDriver> BdbLayer<M> {
     }
 
     /// Terminal failure after the deadline or an exhausted message budget.
+    #[cfg(feature = "centralized-tclk")]
     async fn finalize_exchange_failure(&mut self, ex: &mut TclkExchange) -> TclkProgress {
         self.cancel_pending_tclk_response(ex);
         ex.stage = TclkStage::Failed;
@@ -3134,6 +3192,7 @@ impl<M: MacDriver> BdbLayer<M> {
     }
 
     /// Terminal failure caused by a durable-persistence error.
+    #[cfg(feature = "centralized-tclk")]
     async fn finalize_persistence_failure(&mut self, ex: &mut TclkExchange) -> TclkProgress {
         self.cancel_pending_tclk_response(ex);
         ex.stage = TclkStage::Failed;
@@ -3143,6 +3202,7 @@ impl<M: MacDriver> BdbLayer<M> {
         TclkProgress::Failed(BdbStatus::PersistenceFailure)
     }
 
+    #[cfg(all(feature = "centralized-tclk", any(feature = "router", test)))]
     async fn finalize_post_auth_steering_failure(
         &mut self,
         ex: &mut TclkExchange,
@@ -3163,6 +3223,7 @@ impl<M: MacDriver> BdbLayer<M> {
     /// while a Node_Desc response slot is still active. Leaving/resetting only
     /// clears NWK state; explicitly cancel the slot so repeated failed steering
     /// attempts cannot exhaust the bounded ZDO pending-response table.
+    #[cfg(feature = "centralized-tclk")]
     fn cancel_pending_tclk_response(&mut self, ex: &mut TclkExchange) {
         if let Some(slot) = ex.node_desc_slot.take() {
             self.zdo.cancel_pending(slot);
@@ -3205,6 +3266,15 @@ impl<M: MacDriver> BdbLayer<M> {
     ///
     /// Opens the network for joining and broadcasts Mgmt_Permit_Joining_req
     /// so that routers in the network also open their permit joining.
+    #[cfg(not(any(feature = "router", test)))]
+    async fn steer_on_network(&mut self) -> Result<(), BdbStatus> {
+        log::warn!("[BDB:Steering] End Device cannot open permit joining");
+        self.attributes.commissioning_status =
+            crate::attributes::BdbCommissioningStatus::NotPermitted;
+        Err(BdbStatus::NotPermitted)
+    }
+
+    #[cfg(any(feature = "router", test))]
     async fn steer_on_network(&mut self) -> Result<(), BdbStatus> {
         log::info!("[BDB:Steering] Already on network — opening permit joining");
 
@@ -3226,6 +3296,7 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Complete BDB steering by extending the network-wide permit-joining
     /// window, then opening the local association flag when this node can
     /// admit children (BDB v3.0.1 §§8.1 step 3–4 and 8.2 steps 14–15).
+    #[cfg(any(feature = "distributed-security", feature = "router", test))]
     async fn activate_permit_joining_after_steering(&mut self) -> Result<(), BdbStatus> {
         let duration = core::cmp::min(BDB_MIN_COMMISSIONING_TIME, 254) as u8;
 
@@ -3238,6 +3309,7 @@ impl<M: MacDriver> BdbLayer<M> {
             .await
             .map_err(|_| BdbStatus::SteeringFailure)?;
 
+        #[cfg(any(feature = "router", test))]
         if self.zdo.nwk().device_type() != DeviceType::EndDevice {
             self.zdo
                 .nlme_permit_joining(duration)
@@ -3246,6 +3318,159 @@ impl<M: MacDriver> BdbLayer<M> {
         }
 
         Ok(())
+    }
+
+    pub(crate) async fn wait_for_transport_key(&mut self) -> bool {
+        let mut key_received = false;
+        let rx_on = self.zdo.nwk().rx_on_when_idle();
+
+        // A receiver-on device can receive the direct Transport-Key
+        // immediately. A sleepy child must poll because its parent buffers the
+        // command as an indirect transaction.
+        if rx_on {
+            log::info!("[BDB:Steering] Phase 0: passive RX for direct Transport-Key...");
+            for rx_attempt in 0..4u8 {
+                #[allow(clippy::single_match)]
+                match self
+                    .zdo
+                    .aps_mut()
+                    .nwk_mut()
+                    .mac_mut()
+                    .mcps_data_indication()
+                    .await
+                {
+                    Ok(mac_frame) => {
+                        self.steering_diagnostics.passive_rx_frames = self
+                            .steering_diagnostics
+                            .passive_rx_frames
+                            .saturating_add(1);
+                        self.steering_diagnostics.last_frame_len =
+                            mac_frame.payload.len().min(u8::MAX as usize) as u8;
+                        let prefix_len = mac_frame
+                            .payload
+                            .len()
+                            .min(self.steering_diagnostics.last_frame_prefix.len());
+                        self.steering_diagnostics.last_frame_prefix[..prefix_len]
+                            .copy_from_slice(&mac_frame.payload.as_slice()[..prefix_len]);
+                        let mac_payload = mac_frame.payload.as_slice();
+                        bdb_diag!(
+                            "[BDB] passive_rx[{}] {} bytes",
+                            rx_attempt,
+                            mac_payload.len()
+                        );
+                        log::info!(
+                            "[BDB:Steering] RX {}: {} bytes",
+                            rx_attempt,
+                            mac_payload.len(),
+                        );
+                        if let Some(true) = self.try_process_frame(mac_payload) {
+                            key_received = true;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        bdb_diag!("[BDB] passive_rx[{}] none", rx_attempt);
+                    }
+                }
+            }
+            if key_received {
+                log::info!("[BDB:Steering] Transport-Key received during passive RX!");
+            }
+        } else {
+            log::info!("[BDB:Steering] Phase 0: skipped (sleepy device, TK via indirect poll)");
+        }
+
+        const MAX_TOTAL_ROUNDS: usize = 128;
+        const MAX_EMPTY_ROUNDS: u16 = 128;
+        const POLL_TIMEOUT_US: u32 = 500_000;
+        let mut empty_count: u16 = 0;
+        let mut total_rounds: usize = 0;
+        let mut data_frames: usize = 0;
+        let transport_key_wait_started = self.zdo.aps().nwk().mac().monotonic_micros();
+
+        while !key_received
+            && total_rounds < MAX_TOTAL_ROUNDS
+            && empty_count < MAX_EMPTY_ROUNDS
+            && !self.security_exchange_timed_out(transport_key_wait_started)
+        {
+            total_rounds += 1;
+            let mut got_data_this_round = false;
+            let elapsed = self
+                .zdo
+                .aps()
+                .nwk()
+                .mac()
+                .monotonic_micros()
+                .wrapping_sub(transport_key_wait_started);
+            let remaining = TRANSPORT_KEY_WAIT_US.saturating_sub(elapsed);
+
+            self.steering_diagnostics.poll_attempts =
+                self.steering_diagnostics.poll_attempts.saturating_add(1);
+            match self
+                .zdo
+                .aps_mut()
+                .nwk_mut()
+                .mac_mut()
+                .mlme_poll_timeout(POLL_TIMEOUT_US.min(remaining))
+                .await
+            {
+                Ok(Some(mac_frame)) => {
+                    self.steering_diagnostics.poll_data_frames =
+                        self.steering_diagnostics.poll_data_frames.saturating_add(1);
+                    self.steering_diagnostics.last_frame_len =
+                        mac_frame.len().min(u8::MAX as usize) as u8;
+                    let prefix_len = mac_frame
+                        .len()
+                        .min(self.steering_diagnostics.last_frame_prefix.len());
+                    self.steering_diagnostics.last_frame_prefix[..prefix_len]
+                        .copy_from_slice(&mac_frame.as_slice()[..prefix_len]);
+                    got_data_this_round = true;
+                    data_frames += 1;
+                    let mac_payload = mac_frame.as_slice();
+                    bdb_diag!(
+                        "[BDB] parent_poll[{}] {} bytes total={}",
+                        total_rounds,
+                        mac_payload.len(),
+                        data_frames
+                    );
+                    log::info!(
+                        "[BDB:Steering] P-Poll {}: {} bytes (total={})",
+                        total_rounds,
+                        mac_payload.len(),
+                        data_frames,
+                    );
+                    if let Some(true) = self.try_process_frame(mac_payload) {
+                        bdb_diag!("[BDB] transport_key=ok via parent_poll");
+                        key_received = true;
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    bdb_diag!("[BDB] parent_poll[{}] none", total_rounds);
+                }
+                Err(error) => {
+                    self.steering_diagnostics.poll_errors =
+                        self.steering_diagnostics.poll_errors.saturating_add(1);
+                    bdb_diag!("[BDB] parent_poll[{}] err {:?}", total_rounds, error);
+                    log::warn!("[BDB:Steering] P-Poll {}: err {:?}", total_rounds, error);
+                }
+            }
+
+            if got_data_this_round {
+                empty_count = 0;
+            } else {
+                empty_count += 1;
+            }
+        }
+
+        log::info!(
+            "[BDB:Steering] Transport-Key wait done: passive_rx={} rounds={} frames={} empty={}",
+            if key_received { "hit" } else { "miss" },
+            total_rounds,
+            data_frames,
+            empty_count
+        );
+        key_received
     }
 
     /// Parse a MAC payload, log diagnostics, and attempt Transport-Key extraction.
@@ -3269,34 +3494,35 @@ impl<M: MacDriver> BdbLayer<M> {
                 nwk_hdr.dst_addr.0,
                 nwk_hdr.frame_control.security,
             );
-            // Hex dump coordinator frames for debugging
+            // Build the hex dump inside `log::info!` so its existing
+            // compile-time level guard removes the formatter completely when
+            // production selects `release_max_level_off`.
             if nwk_hdr.src_addr.0 == 0x0000 {
-                let dump_len = mac_payload.len().min(32);
-                let hex: heapless::String<96> =
-                    mac_payload[..dump_len]
-                        .iter()
-                        .fold(heapless::String::new(), |mut s, b| {
+                log::info!(
+                    "[BDB:Steering] COORD hex: {}",
+                    mac_payload[..mac_payload.len().min(32)].iter().fold(
+                        heapless::String::<96>::new(),
+                        |mut s, b| {
                             let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{:02X}", b));
                             s
-                        });
-                log::info!("[BDB:Steering] COORD hex: {}", hex);
+                        }
+                    )
+                );
             }
             self.process_key_wait_frame(mac_payload, &nwk_hdr, nwk_consumed, 0)
         } else if mac_payload.len() > 2 {
             self.steering_diagnostics.key_frame_result = KeyFrameResult::NwkParseFailed;
             bdb_diag!("[BDB] nwk_parse=fail len={}", mac_payload.len());
-            let dump_len = mac_payload.len().min(20);
-            let hex: heapless::String<60> =
-                mac_payload[..dump_len]
-                    .iter()
-                    .fold(heapless::String::new(), |mut s, b| {
-                        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{:02X}", b));
-                        s
-                    });
             log::warn!(
                 "[BDB:Steering] NWK parse FAIL: len={} {}",
                 mac_payload.len(),
-                hex
+                mac_payload[..mac_payload.len().min(20)].iter().fold(
+                    heapless::String::<60>::new(),
+                    |mut s, b| {
+                        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{:02X}", b));
+                        s
+                    }
+                )
             );
             None
         } else {

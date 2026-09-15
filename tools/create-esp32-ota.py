@@ -11,7 +11,8 @@ an image that does not contain it:
    in `Basic::SWBuildID`.
 2. `espflash save-image` turns the ELF into an ESP application image — the
    exact bytes the second stage bootloader expects in `ota_0`/`ota_1`. An ELF
-   or a merged flash image would be rejected by the device.
+   or a merged flash image would be rejected by the device. Shared preflight
+   checks segments, descriptor, mapping, checksum and hash for both OTA slots.
 3. The application image becomes the `UpgradeImage` sub-element of a Zigbee OTA
    container.
 4. The container is parsed back and compared byte for byte with the image, and
@@ -20,6 +21,8 @@ an image that does not contain it:
    directory, with the sha3-256 checksum ZHA verifies after downloading.
 
 Only the Python standard library is used.
+Preflight does not authenticate firmware or prove bootability. Actual silicon
+and eFuse revision compatibility is checked by the receiving device.
 """
 
 from __future__ import annotations
@@ -51,13 +54,11 @@ MANUFACTURER_NAME = "Zigbee-RS"
 # Must match products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv.
 OTA_SLOT_SIZE = 0x001F_0000
 
-# ESP application image ------------------------------------------------------
-ESP_IMAGE_MAGIC = 0xE9
-ESP_IMAGE_HEADER_LEN = 24
-ESP_DIGEST_LEN = 32
-
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_TARGET = "riscv32imac-unknown-none-elf"
+
+sys.path.insert(0, str(REPO_ROOT / "products/esp32-zigbee-devkit/partitions"))
+from esp_app_image import CHIP_IDS, validate_application
 
 
 @dataclass(frozen=True)
@@ -75,14 +76,14 @@ class ChipConfig:
 
 CHIPS = {
     "esp32c6": ChipConfig(
-        chip_id=0x000D,
+        chip_id=CHIP_IDS["esp32c6"],
         image_type=0x0001,
         model_name="ESP32-C6-Sensor",
         header_string="zigbee-rs ESP32-C6 sensor",
         example_name="esp32c6-sensor",
     ),
     "esp32h2": ChipConfig(
-        chip_id=0x0010,
+        chip_id=CHIP_IDS["esp32h2"],
         image_type=0x0002,
         model_name="ESP32-H2-Sensor",
         header_string="zigbee-rs ESP32-H2 sensor",
@@ -105,13 +106,15 @@ def run(command: list[str], *, cwd: pathlib.Path, env: dict | None = None) -> No
 
 
 def build_elf(
-    version: int, example_dir: pathlib.Path, toolchain: str
+    version: int, example_dir: pathlib.Path, toolchain: str, features: str = ""
 ) -> pathlib.Path:
     env = dict(os.environ, ESP32_OTA_VERSION=str(version))
     command = ["cargo"]
     if toolchain:
         command.append(f"+{toolchain}")
-    command += ["build", "--release", "-Z", "build-std=core,alloc"]
+    command += ["build", "--release", "--locked", "-Z", "build-std=core,alloc"]
+    if features:
+        command += ["--features", features]
     run(command, cwd=example_dir, env=env)
     elf = example_dir / "target" / DEFAULT_TARGET / "release" / example_dir.name
     if not elf.is_file():
@@ -130,32 +133,12 @@ def save_image(
 
 
 def check_esp_image(image: bytes, config: ChipConfig) -> None:
-    """Reject anything the on-device verifier would reject."""
-    if len(image) < ESP_IMAGE_HEADER_LEN + ESP_DIGEST_LEN:
-        raise SystemExit(f"application image is only {len(image)} bytes")
-    if image[0] != ESP_IMAGE_MAGIC:
-        raise SystemExit(
-            f"not an ESP application image: first byte is 0x{image[0]:02X}, "
-            f"expected 0x{ESP_IMAGE_MAGIC:02X} (an ELF starts with 0x7F)"
-        )
-    if image[1] == 0:
-        raise SystemExit("application image declares no segments")
-    chip_id = struct.unpack_from("<H", image, 12)[0]
-    expected = config.chip_id
-    if chip_id != expected:
-        raise SystemExit(
-            f"image chip id 0x{chip_id:04X} != 0x{expected:04X} "
-            f"for {config.example_name}"
-        )
-    if image[23] != 1:
-        raise SystemExit("application image was built without an appended SHA-256")
-    digest = hashlib.sha256(image[:-ESP_DIGEST_LEN]).digest()
-    if digest != image[-ESP_DIGEST_LEN:]:
-        raise SystemExit("appended SHA-256 does not match the image contents")
-    if len(image) > OTA_SLOT_SIZE:
-        raise SystemExit(
-            f"application image is {len(image)} bytes, the OTA slot holds {OTA_SLOT_SIZE}"
-        )
+    """Check structure/integrity at either OTA destination, without guessing revisions."""
+    try:
+        for offset in (0x00010000, 0x00200000):
+            validate_application(image, config.chip_id, offset, OTA_SLOT_SIZE)
+    except ValueError as error:
+        raise SystemExit(f"{config.example_name}: {error}") from error
 
 
 def build_container(image: bytes, version: int, config: ChipConfig) -> bytes:
@@ -262,7 +245,7 @@ def verify_container(
     expected_size = 60 + SUB_ELEMENT_HEADER_LEN + len(image)
     if len(blob) != expected_size:
         raise SystemExit(f"container is {len(blob)} bytes, expected {expected_size}")
-    # The payload must still be a bootable image after the round trip.
+    # Recheck application structure and integrity after the round trip.
     check_esp_image(parsed["payload"], config)
 
 
@@ -281,6 +264,7 @@ def write_index(output_dir: pathlib.Path) -> pathlib.Path:
             raise SystemExit(
                 f"{path} uses unknown image type 0x{parsed['image_type']:04X}"
             )
+        check_esp_image(parsed["payload"], config)
         firmwares.append(
             {
                 "path": path.name,
@@ -316,8 +300,13 @@ def main() -> int:
     parser.add_argument(
         "--toolchain", default="nightly", help="cargo toolchain (default: nightly)"
     )
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
         "--elf", help="use an existing ELF instead of building one (skips cargo)"
+    )
+    source.add_argument(
+        "--features", choices=["light-sleep"], default="",
+        help="build the experimental retained-sleep variant",
     )
     args = parser.parse_args()
 
@@ -332,7 +321,7 @@ def main() -> int:
     elf = (
         pathlib.Path(args.elf).resolve()
         if args.elf
-        else build_elf(version, example_dir, args.toolchain)
+        else build_elf(version, example_dir, args.toolchain, args.features)
     )
 
     base = output_dir / f"{example_dir.name}-v{version}"

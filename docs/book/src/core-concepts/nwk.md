@@ -126,6 +126,8 @@ pub enum JoinMethod {
     Association,
     /// Rejoin using existing network key (after losing parent)
     Rejoin,
+    /// Unsecured rejoin followed by centralized Trust Center authorization
+    TrustCenterRejoin,
     /// Direct join — coordinator adds device without association
     Direct,
 }
@@ -141,6 +143,10 @@ pub enum JoinMethod {
   [BDB → Rejoin](bdb.md)); `nlme_join` itself refuses a foreign, stale,
   capacity-less or unusable-link candidate with `NwkStatus::InvalidRequest`
   without transmitting.
+- **TrustCenterRejoin** sends the NWK Rejoin Request and accepts its response
+  without NWK security. It is used only after a secured rejoin fails on a
+  centralized network; the node remains provisional until the current network
+  key arrives under APS link-key protection and is durably reserved.
 - **Direct** is used by coordinators to pre-authorize devices.
 
 ### `nwkUpdateId` validity
@@ -412,6 +418,13 @@ the same 16-bit PAN identifier. Both are resolved by NWK commands, in
   `nwkNetworkBroadcastDeliveryTime`, so the announcement can still cross the
   network on the old one.
 
+Accepted Network Updates are journaled before their incoming replay floor is
+released. Reboot restarts the full broadcast-delivery interval, and a failed
+broadcast or apply leaves the transition explicitly retryable. Child address
+reassignment follows the same side-effect-first rule: the chosen replacement
+is stored before the unsolicited Rejoin Response, and a reboot reuses that
+same address instead of selecting a second one.
+
 Only routers and the coordinator process Network Report and Network Update, and
 only they announce another device's address conflict; a non-routing build keeps
 none of that code. It still detects and resolves a conflict on its *own*
@@ -650,6 +663,20 @@ holds, but only for a joined router/coordinator and only for an *authenticated*
 `UnauthenticatedChild`, or a child that was never restored because its record
 belonged to another network — yields `None`, and the MAC transmits no
 coordinator realignment at all.
+
+The current version-5 child journal also owns wire-visible child lifecycle
+ordering:
+
+1. commit a reassignment, departure, Remove-Device, or remove-children intent;
+2. commit the authenticated incoming NWK replay floor;
+3. only then send a Rejoin Response, Update-Device, child Leave, ACK, or relay.
+
+For sleepy children, a queued Leave is tagged in the indirect queue. The live
+child relationship remains until the MAC confirms the poll delivery; a reboot
+loses only the volatile queue and reconstructs the command from the durable
+intent. `Update-Device(DeviceLeft)` is likewise retained until the remote
+Trust Center's APS ACK. These rules prevent a power cut from both forgetting a
+side effect and rejecting the peer's legitimate retransmission as replay.
 
 ## `NwkStatus` — Error Codes
 

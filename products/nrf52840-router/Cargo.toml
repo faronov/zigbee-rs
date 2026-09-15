@@ -1,0 +1,27 @@
+[package]
+name = "nrf52840-router-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product configuration and persistence for the nRF52840-DK always-on End Device"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# This product is intentionally standalone. The migration does not modify the
+# repository's root workspace membership.
+[workspace]
+
+[dependencies]
+router-app = { path = "../../apps/router" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[target.'cfg(target_os = "none")'.dependencies]
+embassy-nrf = { version = "0.3", features = ["nrf52840"] }
+embedded-storage = "0.3"
+nrf52840-dk = { path = "../../boards/nrf52840-dk" }
+
+[dev-dependencies]
+zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }

@@ -175,7 +175,7 @@ where
 }
 
 /// Async (embedded-hal-async 1.0) counterpart of the blocking API. See the
-/// crate-root [`super::Bh1750`]; opcodes and conversion logic are shared,
+/// crate-root [`crate::Bh1750`]; opcodes and conversion logic are shared,
 /// not duplicated.
 pub mod asynch {
     use embedded_hal_async::i2c::{I2c, SevenBitAddress};

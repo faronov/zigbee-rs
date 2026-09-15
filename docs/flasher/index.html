@@ -214,13 +214,17 @@
 
   <!-- Quick install with pre-built firmware (ESP Web Tools) -->
   <div class="quick-install" id="quick-install">
-    <h2>🚀 One-click install (latest CI build)</h2>
+    <h2>🚀 One-click install (CI-qualified build)</h2>
     <div class="install-row">
-      <esp-web-install-button manifest="./manifest.json">
-        <button slot="activate">Install Zigbee Sensor</button>
-      </esp-web-install-button>
+      <!-- PREBUILT_INSTALL_START -->
+      <button disabled>Prebuilt firmware unavailable</button>
+      <!-- PREBUILT_INSTALL_END -->
     </div>
-    <p>Auto-detects ESP32-C6 or ESP32-H2 • Plug in your board via USB and click install</p>
+    <p id="firmware-status">
+      <!-- PREBUILT_STATUS_START -->
+      Prebuilt firmware is enabled only by a site publication with passing firmware checks.
+      <!-- PREBUILT_STATUS_END -->
+    </p>
   </div>
 
   <div class="divider">or flash a custom .bin file</div>
@@ -246,7 +250,8 @@
             <option value="0x0" selected>0x0 — Direct boot / merged image</option>
             <option value="0x10000">0x10000 — App partition (with bootloader)</option>
           </select>
-          <p>Use 0x0 for firmware built with <code>esp-hal</code> direct boot</p>
+          <p>Use 0x0 for the product's merged image. An application-only image at
+            0x10000 requires the matching bootloader and partition table.</p>
         </div>
       </div>
 
@@ -255,7 +260,8 @@
         <div class="step-content">
           <label for="firmware">Select firmware (.bin)</label>
           <input type="file" id="firmware" accept=".bin">
-          <p>Download .bin from <a href="https://github.com/faronov/zigbee-rs/actions" target="_blank">CI artifacts</a> or build locally</p>
+          <p>Download .bin from <a href="https://github.com/faronov/zigbee-rs/actions" target="_blank">CI artifacts</a> or build locally.
+            Custom files are not validated by this page; check the platform's build and hardware status.</p>
         </div>
       </div>
 

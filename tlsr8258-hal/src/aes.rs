@@ -375,6 +375,22 @@ impl AesEngine {
         Ok(Self { timeout_iterations })
     }
 
+    /// Re-enable and reset the accelerator after reset-on-wake LOW32K
+    /// retention, then rerun the same hardware known-answer test required at
+    /// cold construction.
+    ///
+    /// The exclusive token was consumed by [`Self::new`] and remains owned by
+    /// this retained `AesEngine`; wake restoration therefore must not mint a
+    /// second token or construct a second engine.
+    #[cfg(all(target_arch = "tc32", feature = "retention-proof"))]
+    #[inline(never)]
+    pub fn resume_after_retention(&mut self) -> Result<(), AesError> {
+        crate::reset::enable_clock(crate::reset::Peripheral::Aes)
+            .expect("AES has a documented reg_clk_en1 bit");
+        crate::reset::pulse_reset(crate::reset::Peripheral::Aes);
+        self.self_test()
+    }
+
     /// Encrypt one 16-byte block in place with `key`.
     #[cfg(target_arch = "tc32")]
     pub fn encrypt_block(&mut self, key: &[u8; 16], block: &mut [u8; 16]) -> Result<(), AesError> {

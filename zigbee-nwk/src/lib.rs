@@ -115,12 +115,32 @@ pub enum ChildPollOutcome {
     Delivered {
         child: ShortAddress,
         more_pending: bool,
+        kind: IndirectFrameKind,
     },
+}
+
+/// Runtime meaning attached to one volatile indirect transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndirectFrameKind {
+    Data,
+    #[cfg(feature = "router")]
+    NetworkKeyUpdate(u8),
+    ChildUpdate,
+    /// A NWK Rejoin Response delivered only after the child polls.
+    RejoinResponse,
+    Leave,
 }
 
 /// How a Rejoin Response was delivered to the requesting child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejoinResponseDelivery {
+    Direct,
+    Indirect,
+}
+
+/// How a Leave request was delivered to a child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaveRequestDelivery {
     Direct,
     Indirect,
 }
@@ -263,11 +283,17 @@ pub(crate) struct PendingPanIdUpdate {
     pub(crate) apply_at_us: u32,
 }
 
+/// ```rust,ignore
+/// # async fn example<M: zigbee_mac::MacDriver>(
+/// #     nwk: &mut NwkLayer<M>,
+/// # ) -> Result<(), zigbee_nwk::NwkStatus> {
 /// // Discover networks
 /// let networks = nwk.nlme_network_discovery(ChannelMask::ALL_2_4GHZ, 3).await?;
 ///
 /// // Join best network
 /// nwk.nlme_join(&networks[0]).await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct NwkLayer<M: MacDriver> {
     mac: M,
@@ -296,6 +322,7 @@ pub struct NwkLayer<M: MacDriver> {
     #[cfg(not(feature = "router"))]
     pending_rreq_forwards: heapless::Vec<QueuedRreqForward, 0>,
     /// Route requests already acted upon, keyed by originator and request ID.
+    #[cfg(feature = "router")]
     rreq_records: routing::RreqRecordTable,
     /// Pending Network Status (route error) notifications.
     #[cfg(feature = "router")]
@@ -324,18 +351,28 @@ pub struct NwkLayer<M: MacDriver> {
     source_route_table: routing::SourceRouteTable,
     /// Address-conflict broadcasts waiting out their R22 §3.6.1.9.3 jitter.
     ///
-    /// Only a router or the coordinator originates one, so a non-routing
-    /// build compiles the queue to zero capacity.
+    /// A router/coordinator can queue foreign conflicts, while every device
+    /// including an end device queues a conflict on its own address. A leaf
+    /// needs room for exactly its one mandatory announcement.
     #[cfg(feature = "router")]
     pending_conflicts: heapless::Vec<PendingAddressConflict, 4>,
     #[cfg(not(feature = "router"))]
-    pending_conflicts: heapless::Vec<PendingAddressConflict, 0>,
+    pending_conflicts: heapless::Vec<PendingAddressConflict, 1>,
     /// PAN identifier update accepted from the network manager and waiting out
     /// `nwkNetworkBroadcastDeliveryTime` (R22 §3.6.1.13.3).
     pending_pan_id_update: Option<PendingPanIdUpdate>,
     /// A Network Update the network manager owes the network after accepting a
     /// PAN identifier conflict report, broadcast on the next async pass.
     pending_pan_id_broadcast: Option<frames::PanIdUpdate>,
+    /// Enable side-effect-first replay ordering for durable lifecycle frames.
+    lifecycle_persistence_enabled: bool,
+    /// Verified replay floor held until the owning journal is durable.
+    pending_lifecycle_replay: Option<(security::NwkReplayCounter, nlde::NwkLifecyclePersistence)>,
+    /// Broadcast transaction record entry held with the replay floor.
+    pending_lifecycle_btr: Option<(ShortAddress, u8)>,
+    /// One broadcast/unicast relay held until lifecycle and replay durability.
+    #[cfg(feature = "router")]
+    pending_lifecycle_relay: Option<nlde::PendingLifecycleRelay>,
     /// Seconds elapsed in the current `nwkLinkStatusPeriod` interval, used to
     /// age router neighbors (R22 §3.6.3.4.3).
     link_status_age_counter: u16,
@@ -384,6 +421,7 @@ impl<M: MacDriver> NwkLayer<M> {
             pending_rreq_forwards: heapless::Vec::new(),
             #[cfg(not(feature = "router"))]
             pending_rreq_forwards: heapless::Vec::new(),
+            #[cfg(feature = "router")]
             rreq_records: routing::RreqRecordTable::new(),
             #[cfg(feature = "router")]
             pending_route_errors: heapless::Vec::new(),
@@ -402,6 +440,11 @@ impl<M: MacDriver> NwkLayer<M> {
             pending_conflicts: heapless::Vec::new(),
             pending_pan_id_update: None,
             pending_pan_id_broadcast: None,
+            lifecycle_persistence_enabled: false,
+            pending_lifecycle_replay: None,
+            pending_lifecycle_btr: None,
+            #[cfg(feature = "router")]
+            pending_lifecycle_relay: None,
             link_status_age_counter: 0,
             next_child_addr_offset: 1,
             pending_command_outcome: None,
@@ -435,6 +478,7 @@ impl<M: MacDriver> NwkLayer<M> {
             core::ptr::addr_of_mut!((*slot).pending_rreq_forwards).write(heapless::Vec::new());
             #[cfg(not(feature = "router"))]
             core::ptr::addr_of_mut!((*slot).pending_rreq_forwards).write(heapless::Vec::new());
+            #[cfg(feature = "router")]
             core::ptr::addr_of_mut!((*slot).rreq_records).write(routing::RreqRecordTable::new());
             #[cfg(feature = "router")]
             core::ptr::addr_of_mut!((*slot).pending_route_errors).write(heapless::Vec::new());
@@ -455,6 +499,11 @@ impl<M: MacDriver> NwkLayer<M> {
             core::ptr::addr_of_mut!((*slot).pending_conflicts).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).pending_pan_id_update).write(None);
             core::ptr::addr_of_mut!((*slot).pending_pan_id_broadcast).write(None);
+            core::ptr::addr_of_mut!((*slot).lifecycle_persistence_enabled).write(false);
+            core::ptr::addr_of_mut!((*slot).pending_lifecycle_replay).write(None);
+            core::ptr::addr_of_mut!((*slot).pending_lifecycle_btr).write(None);
+            #[cfg(feature = "router")]
+            core::ptr::addr_of_mut!((*slot).pending_lifecycle_relay).write(None);
             core::ptr::addr_of_mut!((*slot).link_status_age_counter).write(0);
             core::ptr::addr_of_mut!((*slot).next_child_addr_offset).write(1);
             core::ptr::addr_of_mut!((*slot).pending_command_outcome).write(None);
@@ -565,6 +614,27 @@ impl<M: MacDriver> NwkLayer<M> {
         &mut self.security
     }
 
+    /// Activate a staged, strictly newer key and update the NIB sequence used
+    /// in outgoing auxiliary security headers as one operation.
+    /// Repeating the active sequence succeeds; retained previous keys cannot
+    /// roll back either the active key or the NIB sequence.
+    pub fn switch_active_network_key(&mut self, sequence: u8) -> bool {
+        if !self.security.activate_network_key(sequence) {
+            return false;
+        }
+        self.nib.active_key_seq_number = sequence;
+        true
+    }
+
+    /// Receive-side key adoption keeps the active key and NIB sequence paired.
+    /// Call only after admission, MIC verification and replay checking.
+    fn activate_received_network_key(&mut self, sequence: u8) {
+        if self.security.activate_received_key(sequence) {
+            self.nib.active_key_seq_number = sequence;
+            self.security.activation_pending |= self.lifecycle_persistence_enabled;
+        }
+    }
+
     /// Decrypt/verify a NWK frame with this layer's platform AES provider
     /// (the owned MAC), keyed by the caller-supplied network `key`.
     ///
@@ -643,6 +713,30 @@ impl<M: MacDriver> NwkLayer<M> {
         let _ = self.neighbors.add_or_update(entry);
     }
 
+    /// Commit a parent-selected replacement address while preserving the
+    /// child's authenticated relationship and timeout state.
+    pub fn reassign_child_address(
+        &mut self,
+        old_address: ShortAddress,
+        new_address: ShortAddress,
+        ieee_address: IeeeAddress,
+    ) -> bool {
+        let Some(entry) = self.neighbors.find_by_short_mut(old_address) else {
+            return false;
+        };
+        if entry.ieee_address != ieee_address
+            || !matches!(
+                entry.relationship,
+                neighbor::Relationship::Child | neighbor::Relationship::UnauthenticatedChild
+            )
+        {
+            return false;
+        }
+        entry.network_address = new_address;
+        self.routing.remove(old_address);
+        true
+    }
+
     /// Record a `Device_annce`-style statement of identity and act on any
     /// address conflict it reveals.
     ///
@@ -661,7 +755,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// recorded exactly as before but is never read as a conflict: an
     /// unsecured unicast is accepted so pre-key commissioning traffic can
     /// arrive, and a device with no keys must not be able to make anybody
-    /// change address or rejoin. [`Self::rx_authenticated`] describes the frame
+    /// change address or rejoin. The private `rx_authenticated` flag describes the frame
     /// this announcement was carried in — ZDO processing runs inside the same
     /// receive pass that set it.
     pub fn note_announced_address(&mut self, address: ShortAddress, ieee: IeeeAddress) {
@@ -705,7 +799,10 @@ impl<M: MacDriver> NwkLayer<M> {
         // aged on the same tick.
         for _ in 0..elapsed_secs {
             self.btr.age();
-            self.rreq_records.age();
+            #[cfg(feature = "router")]
+            {
+                self.rreq_records.age();
+            }
             self.neighbors.age_tick();
             let expired_children = self.indirect.age();
             for child in expired_children {
@@ -785,6 +882,45 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Read-only access to the indirect frame queue.
     pub fn indirect_queue(&self) -> &indirect::IndirectQueue {
         &self.indirect
+    }
+
+    /// Whether one child currently has a queued indirect transaction of the given kind.
+    ///
+    /// Delivered, cancelled, and expired transactions are not reported.
+    #[must_use]
+    pub fn has_pending_indirect_kind(&self, child: ShortAddress, kind: IndirectFrameKind) -> bool {
+        self.indirect.has_pending_kind(child, kind)
+    }
+
+    /// Cancel only one class of queued transaction for a child.
+    ///
+    /// The queue entry is removed before synchronizing the MAC pending bit, so
+    /// a failed backend update can cause only a harmless empty poll, never
+    /// delivery of an obsolete lifecycle command.
+    pub fn cancel_pending_indirect_kind(
+        &mut self,
+        child: ShortAddress,
+        kind: IndirectFrameKind,
+    ) -> Result<bool, MacError> {
+        if !self.indirect.remove_kind(child, kind) {
+            return Ok(false);
+        }
+        let more_pending = self.indirect.has_pending(child);
+        if !more_pending {
+            self.mac
+                .set_indirect_data_pending(MacAddress::Short(self.nib.pan_id, child), false)?;
+        }
+        Ok(true)
+    }
+
+    /// Cancel queued indirect Rejoin Responses for one child.
+    ///
+    /// Other indirect transaction kinds remain queued.
+    pub fn cancel_indirect_rejoin_response(
+        &mut self,
+        child: ShortAddress,
+    ) -> Result<bool, MacError> {
+        self.cancel_pending_indirect_kind(child, IndirectFrameKind::RejoinResponse)
     }
 
     /// Enable concentrator mode (periodic many-to-one RREQ broadcasts).
@@ -880,6 +1016,37 @@ impl<M: MacDriver> NwkLayer<M> {
             )
             .then_some(entry.network_address)
         })
+    }
+
+    /// Remove one current child and all coupled runtime state.
+    ///
+    /// Used after a parent has completed the Trust Center's Remove-Device
+    /// transaction. Returns the child's short address when a live relationship
+    /// was evicted.
+    pub fn remove_child_by_ieee(&mut self, ieee: &IeeeAddress) -> Option<ShortAddress> {
+        let short = self.neighbors.find_by_ieee(ieee).and_then(|entry| {
+            matches!(
+                entry.relationship,
+                neighbor::Relationship::Child | neighbor::Relationship::UnauthenticatedChild
+            )
+            .then_some(entry.network_address)
+        })?;
+        self.evict_child(short, ieee);
+        Some(short)
+    }
+
+    /// Remove one current child after its indirect Leave transaction was
+    /// acknowledged by the MAC.
+    pub fn remove_child_by_short(&mut self, short: ShortAddress) -> Option<IeeeAddress> {
+        let ieee = self.neighbors.find_by_short(short).and_then(|entry| {
+            matches!(
+                entry.relationship,
+                neighbor::Relationship::Child | neighbor::Relationship::UnauthenticatedChild
+            )
+            .then_some(entry.ieee_address)
+        })?;
+        self.evict_child(short, &ieee);
+        Some(ieee)
     }
 
     pub fn child_security_capable(&self, ieee: &IeeeAddress) -> Option<bool> {
@@ -985,6 +1152,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// identity, so an unsecured or wrongly-sourced frame can never refresh a
     /// child it does not actually originate from. Covers relayed child data
     /// and secured child NWK commands as well as frames addressed to us.
+    #[cfg(feature = "router")]
     fn refresh_child_keepalive_secured(&mut self, src: ShortAddress, security_source: IeeeAddress) {
         if !self.can_route() {
             return;
@@ -1428,6 +1596,15 @@ impl<M: MacDriver> NwkLayer<M> {
         child: ShortAddress,
         frame: &[u8],
     ) -> Result<(), NwkStatus> {
+        self.enqueue_tagged_indirect_for_child(child, frame, IndirectFrameKind::Data)
+    }
+
+    pub(crate) fn enqueue_tagged_indirect_for_child(
+        &mut self,
+        child: ShortAddress,
+        frame: &[u8],
+        kind: IndirectFrameKind,
+    ) -> Result<(), NwkStatus> {
         let is_sleepy_child = self.neighbors.find_by_short(child).is_some_and(|entry| {
             !entry.rx_on_when_idle
                 && matches!(
@@ -1438,7 +1615,7 @@ impl<M: MacDriver> NwkLayer<M> {
         if !is_sleepy_child {
             return Err(NwkStatus::UnknownDevice);
         }
-        let Some(slot) = self.indirect.enqueue_with_slot(child, frame) else {
+        let Some(slot) = self.indirect.enqueue_tagged_with_slot(child, frame, kind) else {
             return Err(NwkStatus::FrameNotBuffered);
         };
         if self
@@ -1457,6 +1634,10 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Extended-source Data Requests are left to the MAC's retained
     /// Association Response transaction. A failed data transmission leaves
     /// the NWK entry queued and Frame Pending armed for a fresh poll.
+    /// Secured frames are refreshed under the active key and a fresh reserved
+    /// counter on every attempt, including retries after a key switch.
+    /// Security/persistence failures return `SecurityError` without dequeuing
+    /// or transmitting; only ciphertext for this attempt survives the await.
     pub async fn service_child_data_request(
         &mut self,
         source: MacAddress,
@@ -1477,9 +1658,19 @@ impl<M: MacDriver> NwkLayer<M> {
         // deadline, whether or not any indirect data is waiting. Advertised to
         // the child through `PARENT_INFO_MAC_DATA_POLL_KEEPALIVE`.
         self.refresh_child_keepalive_by_short(child);
-        let Some(frame) = self.indirect.peek(child) else {
-            self.mac.set_indirect_data_pending(source, false)?;
-            return Ok(ChildPollOutcome::NoData);
+        let mut refreshed = [0u8; nlde::MAX_NWK_FRAME];
+        let (kind, len) = {
+            let Some(frame) = self.indirect.peek(child) else {
+                self.mac.set_indirect_data_pending(source, false)?;
+                return Ok(ChildPollOutcome::NoData);
+            };
+            let len = self
+                .refresh_indirect_frame(frame.as_slice(), &mut refreshed)
+                .map_err(|error| {
+                    log::warn!("[NWK] Cannot refresh indirect security: {:?}", error);
+                    MacError::SecurityError
+                })?;
+            (frame.kind(), len)
         };
         let more_pending = self.indirect.pending_count(child) > 1;
 
@@ -1488,7 +1679,7 @@ impl<M: MacDriver> NwkLayer<M> {
             .mcps_indirect_data(McpsDataRequest {
                 src_addr_mode: AddressMode::Short,
                 dst_address: source,
-                payload: frame.as_slice(),
+                payload: &refreshed[..len],
                 msdu_handle: self.nib.next_seq(),
                 tx_options: TxOptions {
                     ack_tx: true,
@@ -1510,6 +1701,7 @@ impl<M: MacDriver> NwkLayer<M> {
         Ok(ChildPollOutcome::Delivered {
             child,
             more_pending: remaining_pending,
+            kind,
         })
     }
 

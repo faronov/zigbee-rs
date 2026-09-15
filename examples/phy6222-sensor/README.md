@@ -12,11 +12,16 @@ ready-to-flash production image yet.
 Implemented:
 
 - PHY62x2 ROM-compatible SRAM/XIP linker layout;
+- hard 130,816-byte XIP application-slot gate;
 - PHY6 segmented image generator;
 - crash-safe `SecurityStateJournal` persistence;
+- factory-identity guard that rejects the shared fallback address;
 - RAM-resident flash program/erase operations;
 - bounded SPIF timeouts;
-- parent polling and light sleep between polls;
+- shared `SensorApp` commissioning, reporting, and parent-poll lifecycle;
+- active/idle waits with radio sleep between joined polls;
+- explicit rejection of unproven retention sleep;
+- fallible exclusive ADC and `embedded-hal` 1.0 I2C resources;
 - shared synthetic temperature/humidity test values.
 
 Still requires hardware proof:
@@ -31,20 +36,30 @@ in RAM and uses Embassy timers plus radio sleep between polls.
 
 ## Chip selection
 
-The default build selects the 512 KiB PHY6222 layout:
+The default build selects the 512 KiB PHY6222 layout and uses the pinned
+`nightly-2026-08-01`:
 
 ```bash
-cargo build --release
+cargo +nightly-2026-08-01 build --release --locked
 ```
 
 The 256 KiB PHY6252 journal addresses can be selected explicitly:
 
 ```bash
-cargo build --release --no-default-features --features phy6252
+cargo +nightly-2026-08-01 build --release --locked \
+  --no-default-features --features phy6252
 ```
 
-PHY6252 remains unverified; selecting the feature only prevents the known
-out-of-range 512 KiB NV addresses.
+The PHY6252 feature-selected build currently fails the physical XIP gate by
+96 bytes; it does not produce a validated image. Selecting the feature prevents
+the known out-of-range 512 KiB NV addresses, but hardware remains unverified.
+
+Both PHY62x2 product variants select centralized Trust Center commissioning.
+They do not provision a distributed-security key, so distributed commissioning
+and its post-join permit-opening path are compiled out; a persisted distributed
+network is rejected rather than resumed. The product also has one application
+endpoint, no Groups server, and three default reports, so it selects the shared
+compact endpoint/reporting capacities and omits the unused Groups-to-APS bridge.
 
 ## ROM image layout
 
@@ -64,11 +79,14 @@ file, validate the layout, and package the ROM-loader image:
 
 ```bash
 ELF=examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor
-OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy | head -1)
+OBJCOPY=$(find "$(rustc +nightly-2026-08-01 --print sysroot)" \
+  -name llvm-objcopy -print -quit)
 
 "$OBJCOPY" -O ihex "$ELF" "$ELF.hex"
 sh examples/phy6222-sensor/check-layout.sh "$ELF"
-cargo run --quiet -p phy62x2-image -- "$ELF.hex" "$ELF.phy6.bin"
+cargo +nightly-2026-08-01 run --quiet --locked \
+  --manifest-path ../../Cargo.toml -p phy62x2-image -- \
+  "$ELF.hex" "$ELF.phy6.bin"
 ```
 
 Write `phy6222-sensor.phy6.bin` at flash offset `0x10000` with a PHY62x2-aware
@@ -85,11 +103,35 @@ Security state uses the shared atomic two-sector journal:
 | Journal sector B | `0x7f000` | `0x3f000` |
 
 The complete flash program/erase/cache-bypass path executes from SRAM with
-interrupts disabled. The example pauses SysTick and accounts for the interval
-with the continuously running AON RTC, so journal updates do not make Embassy
-time run slow. Network keys and outgoing counter reservations are saved only
-when security state changes, not on every poll cycle.
+interrupts disabled. The board's whole-flash resource pauses SysTick and
+accounts for the interval with the continuously running AON RTC, so journal
+updates do not make Embassy time run slow. Network keys and outgoing counter
+reservations are saved only when security state changes, not on every poll
+cycle.
 
-`boards/phy62x2-evk` owns these partitions, the ROM-aware linker layout, and
-the AON-RTC time compensation. `phy6222-hal` only implements the raw flash
-controller.
+`products/phy62x2-evk` owns the protected partition addresses, journal policy,
+identity, battery chemistry, lifecycle policy, profile, and ROM-aware linker
+layout. `boards/phy62x2-evk` owns only fitted wiring, whole-device flash, and
+platform timing. `phy6222-hal` provides exclusive raw peripheral mechanisms.
+
+Occupied-XIP measurements with `nightly-2026-08-01` on macOS:
+
+| feature image | occupied XIP span | hard gate | result |
+|---|---:|---:|---:|
+| PHY6222 (default) | 130,752 | 130,816 | 64 bytes free |
+| PHY6252 (`--no-default-features --features phy6252`) | 130,912 | 130,816 | 96 bytes over |
+
+The PHY target configuration enables linker identical-code folding
+(`--icf=all`) for identical monomorphized functions. With unchanged compiler,
+features, software AES, and linker boundaries, the default occupied span falls
+from 132,416 to 130,752 bytes. SRAM placement and size are unchanged. Folded
+functions can share addresses; function-address uniqueness is not an identity
+contract. The layout check still requires the flash-operation path in SRAM.
+
+The default measurement is from the linked ELF and passes the layout, AES, and
+role checks. The PHY6252 measurement is from the failed link map; folding reduces
+its previous 1,760-byte overflow but does not make that feature image fit. These
+local measurements do not establish Linux CI or hardware qualification.
+
+The packaged PHY6 file includes loader metadata and is not the gate metric. No
+AON sleep current or battery-life value is claimed.

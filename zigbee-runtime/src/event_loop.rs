@@ -31,10 +31,14 @@
 //! }
 //! ```
 
+use core::future::Future;
+
 use zigbee_aps::apsde::ApsdeDataRequest;
 use zigbee_aps::{ApsAddress, ApsAddressMode, ApsStatus, ApsTxOptions};
 use zigbee_mac::MacDriver;
 use zigbee_types::ShortAddress;
+#[cfg(any(feature = "finding-binding", feature = "finding-binding-target"))]
+use zigbee_zcl::clusters::Cluster;
 use zigbee_zcl::frame::ZclFrame;
 use zigbee_zcl::{ClusterDirection, CommandId};
 
@@ -44,7 +48,7 @@ fn advance_millis(now_ms: u32, elapsed_secs: u16) -> u32 {
     now_ms.wrapping_add((elapsed_secs as u32) * 1000)
 }
 
-fn automatic_poll_due(
+pub(crate) fn automatic_poll_due(
     automatic_polling: bool,
     sleepy: bool,
     commissioning_active: bool,
@@ -147,6 +151,18 @@ pub enum StackEvent {
     },
     /// Permit joining status changed.
     PermitJoinChanged { open: bool },
+    /// A parsed APSME security command is ready for Trust Center policy.
+    ///
+    /// The APS layer has already authenticated the transport and validated
+    /// the command's wire-level invariants. Coordinator policy decides the
+    /// resulting admission, key, or removal action.
+    ApsSecurityIndication(zigbee_aps::apsme::ApsmeSecurityIndication),
+    /// A validated, NWK-authenticated Device_annce from an operational peer.
+    DeviceAnnounced {
+        address: zigbee_types::IeeeAddress,
+        short_address: zigbee_types::ShortAddress,
+        capabilities: u8,
+    },
     /// Attribute report was sent successfully.
     ReportSent,
     /// OTA: New image available from server.
@@ -188,6 +204,110 @@ pub enum StartError {
     CommissioningFailed(zigbee_bdb::BdbStatus),
     /// Durable security-state storage failed.
     PersistenceFailed(crate::security_store::SecurityStoreError),
+}
+
+/// Static fresh-start selection for pending user actions.
+///
+/// The marker is consumed by the store-backed tick before async lowering.
+/// Typed router application frontends therefore materialize only their allowed
+/// join future even though the legacy generic tick remains device-type aware.
+pub(crate) trait ActionStartup<R: crate::role::DeviceRole> {
+    fn start<M: MacDriver>(
+        device: &mut crate::ZigbeeDevice<M, R>,
+    ) -> impl Future<Output = Result<u16, StartError>>;
+
+    fn start_with_security_store<'a, M, S>(
+        device: &'a mut crate::ZigbeeDevice<M, R>,
+        store: &'a mut S,
+    ) -> impl Future<Output = Result<u16, StartError>> + 'a
+    where
+        M: MacDriver,
+        S: crate::security_store::SecurityStateStore;
+}
+
+pub(crate) struct DynamicActionStartup;
+pub(crate) struct SteeringActionStartup;
+#[cfg(any(feature = "router", test))]
+pub(crate) struct CoordinatorActionStartup;
+#[cfg(any(feature = "router", test))]
+pub(crate) struct DistributedActionStartup;
+
+impl<R: crate::role::DeviceRole> ActionStartup<R> for DynamicActionStartup {
+    fn start<M: MacDriver>(
+        device: &mut crate::ZigbeeDevice<M, R>,
+    ) -> impl Future<Output = Result<u16, StartError>> {
+        device.start()
+    }
+
+    fn start_with_security_store<'a, M, S>(
+        device: &'a mut crate::ZigbeeDevice<M, R>,
+        store: &'a mut S,
+    ) -> impl Future<Output = Result<u16, StartError>> + 'a
+    where
+        M: MacDriver,
+        S: crate::security_store::SecurityStateStore,
+    {
+        device.start_or_resume_with_security_store(store)
+    }
+}
+
+impl<R: crate::role::DeviceRole> ActionStartup<R> for SteeringActionStartup {
+    fn start<M: MacDriver>(
+        device: &mut crate::ZigbeeDevice<M, R>,
+    ) -> impl Future<Output = Result<u16, StartError>> {
+        device.start_steering()
+    }
+
+    fn start_with_security_store<'a, M, S>(
+        device: &'a mut crate::ZigbeeDevice<M, R>,
+        store: &'a mut S,
+    ) -> impl Future<Output = Result<u16, StartError>> + 'a
+    where
+        M: MacDriver,
+        S: crate::security_store::SecurityStateStore,
+    {
+        device.start_or_resume_steering_with_security_store(store)
+    }
+}
+
+#[cfg(any(feature = "router", test))]
+impl<R: crate::role::ParentRole> ActionStartup<R> for CoordinatorActionStartup {
+    fn start<M: MacDriver>(
+        device: &mut crate::ZigbeeDevice<M, R>,
+    ) -> impl Future<Output = Result<u16, StartError>> {
+        device.start_coordinator()
+    }
+
+    fn start_with_security_store<'a, M, S>(
+        device: &'a mut crate::ZigbeeDevice<M, R>,
+        store: &'a mut S,
+    ) -> impl Future<Output = Result<u16, StartError>> + 'a
+    where
+        M: MacDriver,
+        S: crate::security_store::SecurityStateStore,
+    {
+        device.start_or_resume_coordinator_with_security_store(store)
+    }
+}
+
+#[cfg(any(feature = "router", test))]
+impl<R: crate::role::ParentRole> ActionStartup<R> for DistributedActionStartup {
+    fn start<M: MacDriver>(
+        device: &mut crate::ZigbeeDevice<M, R>,
+    ) -> impl Future<Output = Result<u16, StartError>> {
+        device.start_distributed_network()
+    }
+
+    fn start_with_security_store<'a, M, S>(
+        device: &'a mut crate::ZigbeeDevice<M, R>,
+        store: &'a mut S,
+    ) -> impl Future<Output = Result<u16, StartError>> + 'a
+    where
+        M: MacDriver,
+        S: crate::security_store::SecurityStateStore,
+    {
+        device.start_or_resume_distributed_network_with_security_store(store)
+    }
 }
 
 /// Errors returned while sending application ZCL traffic.
@@ -254,8 +374,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
         R::ed_advance_timers(self, elapsed_secs);
 
         self.reporting.tick(elapsed_secs);
-        self.apply_fb_target_request(clusters);
+        #[cfg(any(feature = "finding-binding", feature = "finding-binding-target"))]
+        self.apply_fb_target_request();
+        #[cfg(feature = "finding-binding")]
         self.run_finding_binding_tick(elapsed_secs).await;
+        #[cfg(all(feature = "finding-binding-target", not(feature = "finding-binding")))]
+        self.run_finding_binding_target_tick(elapsed_secs);
         self.send_due_reports(clusters).await;
         self.update_pending_tx_flag();
 
@@ -264,6 +388,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
         // A terminal transition is returned immediately. If it is still in
         // progress, continue through polling and preserve any application event
         // produced there for this tick.
+        #[cfg(feature = "centralized-tclk")]
         if self.bdb.tclk_exchange_active()
             && let Some(event) = self.advance_commissioning().await
         {
@@ -272,8 +397,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
 
         let now_ms = self.advance_power_clock(elapsed_secs);
         // The poll runs first so an End Device Timeout Response that arrives
-        // this tick cancels the response wait before it is serviced.
-        let poll_event = self.run_sleepy_poll(now_ms, clusters).await;
+        // this tick cancels the response wait before it is serviced. Reached
+        // through the role hook so a routing monomorphization never names the
+        // poll future (and therefore never links the second receive path).
+        let poll_event = R::ed_run_poll(self, now_ms, clusters).await;
         R::ed_service(self).await;
 
         let result = if let Some(event) = poll_event {
@@ -290,6 +417,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
     /// update-tc-link-key event: normal maintenance runs first, then exactly
     /// one bounded security step is performed before polling/result generation.
     /// Returns `Some` only for a terminal transition.
+    #[cfg(feature = "centralized-tclk")]
     async fn advance_commissioning(&mut self) -> Option<StackEvent> {
         match self.bdb.advance_tclk_exchange(None).await {
             zigbee_bdb::TclkProgress::InProgress => None,
@@ -501,18 +629,19 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
             .tick_parent_annce_transactions(elapsed_secs);
     }
 
+    #[cfg(any(feature = "finding-binding", feature = "finding-binding-target"))]
     #[inline(never)]
-    pub(crate) fn apply_fb_target_request(&mut self, clusters: &mut [crate::ClusterRef<'_>]) {
+    pub(crate) fn apply_fb_target_request(&mut self) {
         if let Some((ep, time_secs)) = self.bdb.fb_target_request.take()
-            && self
-                .with_cluster_mut(ep, zigbee_zcl::ClusterId::IDENTIFY, clusters, |cluster| {
-                    cluster.attributes_mut().set(
-                        zigbee_zcl::AttributeId(0x0000),
-                        zigbee_zcl::data_types::ZclValue::U16(time_secs),
-                    )
-                })
-                .is_some()
+            && let Some(entry) = self
+                .identify_clusters
+                .iter_mut()
+                .find(|entry| entry.endpoint == ep)
         {
+            let _ = entry.cluster.attributes_mut().set(
+                zigbee_zcl::AttributeId(0x0000),
+                zigbee_zcl::data_types::ZclValue::U16(time_secs),
+            );
             log::info!(
                 "[Runtime] F&B target: set IdentifyTime={}s on ep {}",
                 time_secs,
@@ -521,9 +650,16 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
         }
     }
 
+    #[cfg(feature = "finding-binding")]
     #[inline(never)]
     pub(crate) async fn run_finding_binding_tick(&mut self, elapsed_secs: u16) {
         let _ = self.bdb.tick_finding_binding(elapsed_secs).await;
+    }
+
+    #[cfg(all(feature = "finding-binding-target", not(feature = "finding-binding")))]
+    #[inline(never)]
+    pub(crate) fn run_finding_binding_target_tick(&mut self, elapsed_secs: u16) {
+        let _ = self.bdb.tick_finding_binding_target(elapsed_secs);
     }
 
     #[inline(never)]
@@ -552,6 +688,14 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
         now_ms: u32,
         clusters: &mut [crate::ClusterRef<'_>],
     ) -> Option<StackEvent> {
+        // Only a role that has a parent to poll materializes this branch. A
+        // router/relay keeps its receiver on and takes every frame through the
+        // durable receive path, so compiling the branch out removes a whole
+        // second copy of `process_incoming` (and its NWK/APS instantiations)
+        // from every routing image instead of leaving it as unreachable code.
+        if !R::POLLS_PARENT {
+            return None;
+        }
         // A forced poll fetches an indirect End Device Timeout Response (or a
         // command the parent queued while we slept) and deliberately bypasses
         // the automatic-polling and sleepy gates: it is a keepalive obligation,
@@ -602,6 +746,16 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
     /// sequence in flash.
     #[inline(never)]
     pub(crate) async fn handle_action(&mut self, action: UserAction) -> TickResult {
+        self.handle_action_with::<DynamicActionStartup>(action)
+            .await
+    }
+
+    /// Handle one action with a statically selected fresh-start path.
+    #[inline(never)]
+    pub(crate) async fn handle_action_with<A>(&mut self, action: UserAction) -> TickResult
+    where
+        A: ActionStartup<R>,
+    {
         let action = match action {
             UserAction::Toggle if self.is_joined() => {
                 log::info!("[Runtime] User action: Toggle → Leave");
@@ -622,10 +776,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
                     return self.retry_secure_rejoin().await;
                 }
                 log::info!("[Runtime] User action: Join");
-                match self.start().await {
+                match A::start(self).await {
                     Ok(addr) => {
-                        // `start()` owns the single initial End Device Timeout
-                        // Request for this join.
+                        // The selected fresh-start path owns the single initial
+                        // End Device Timeout Request for this join.
                         let ch = self.channel();
                         let pan = self.pan_id();
                         TickResult::Event(StackEvent::Joined {
@@ -779,7 +933,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "centralized-tclk"))]
 mod commissioning_tick_tests {
     //! Event-driven commissioning-security progress from the tick loop.
     //!
@@ -904,6 +1058,7 @@ mod commissioning_tick_tests {
         let nwk = device.bdb_mut().zdo_mut().aps_mut().nwk_mut();
         nwk.security_mut().set_network_key(NETWORK_KEY, 0);
         nwk.nib_mut().security_enabled = true;
+        nwk.nib_mut().outgoing_frame_counter_limit = 0x400;
         device
             .bdb_mut()
             .zdo_mut()

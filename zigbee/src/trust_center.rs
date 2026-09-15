@@ -7,6 +7,7 @@
 //! - Handling key updates and switching
 //! - Device removal and key revocation
 
+use zigbee_crypto::{InstallCodeError, derive_install_code_key};
 use zigbee_types::IeeeAddress;
 
 /// Well-known default Trust Center link key (ZigBeeAlliance09).
@@ -20,17 +21,9 @@ pub const DISTRIBUTED_SECURITY_KEY: [u8; 16] = [
     0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF,
 ];
 
-/// Install code derived key placeholder.
-///
-/// **WARNING**: This is NOT a real install-code-derived key. Real derivation
-/// requires the Matyas-Meyer-Oseas (MMO) hash of the install code + CRC.
-/// This constant exists only as a structural placeholder — do NOT use it
-/// for actual security. The `should_accept_join()` method will reject
-/// install-code joins since no real derivation is performed.
-pub const INSTALL_CODE_DERIVED_KEY: [u8; 16] = [0; 16];
-
 /// Key type for TC link keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum TcKeyType {
     /// Default global key (ZigBeeAlliance09).
     DefaultGlobal,
@@ -38,6 +31,13 @@ pub enum TcKeyType {
     InstallCode,
     /// Application-provisioned unique key.
     ApplicationDefined,
+}
+
+/// Trust Center provisioning or table operation failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustCenterError {
+    InvalidInstallCode(InstallCodeError),
+    LinkKeyTableFull,
 }
 
 /// A TC link key entry (one per joined device).
@@ -104,23 +104,30 @@ impl TrustCenter {
     }
 
     /// Get the link key for a device (or default TC key if none provisioned).
-    pub fn link_key_for_device(&self, ieee: &IeeeAddress) -> [u8; 16] {
-        self.link_keys
+    pub fn link_key_for_device(&self, ieee: &IeeeAddress) -> Option<[u8; 16]> {
+        let provisioned = self
+            .link_keys
             .iter()
             .flatten()
-            .find(|e| e.active && &e.ieee_address == ieee)
-            .map(|e| e.key)
-            .unwrap_or(DEFAULT_TC_LINK_KEY)
+            .find(|entry| entry.active && &entry.ieee_address == ieee);
+        if self.require_install_codes {
+            provisioned
+                .filter(|entry| entry.key_type == TcKeyType::InstallCode)
+                .map(|entry| entry.key)
+        } else {
+            provisioned
+                .map(|entry| entry.key)
+                .or(Some(DEFAULT_TC_LINK_KEY))
+        }
     }
 
     /// Add or update a link key entry for a device.
-    #[allow(clippy::result_unit_err)]
     pub fn set_link_key(
         &mut self,
         ieee: IeeeAddress,
         key: [u8; 16],
         key_type: TcKeyType,
-    ) -> Result<(), ()> {
+    ) -> Result<(), TrustCenterError> {
         // Update existing entry
         if let Some(entry) = self
             .link_keys
@@ -131,6 +138,7 @@ impl TrustCenter {
             entry.key = key;
             entry.key_type = key_type;
             entry.verified = false;
+            entry.active = true;
             return Ok(());
         }
 
@@ -146,8 +154,29 @@ impl TrustCenter {
             });
             Ok(())
         } else {
-            Err(()) // Table full
+            Err(TrustCenterError::LinkKeyTableFull)
         }
+    }
+
+    /// Validate and provision a Zigbee 3.0 16-byte install code plus CRC.
+    ///
+    /// Shorter Smart Energy legacy formats remain available through
+    /// [`zigbee_crypto::derive_install_code_key`], but BDB Zigbee 3.0
+    /// commissioning requires the full 18-byte value.
+    pub fn provision_install_code(
+        &mut self,
+        ieee: IeeeAddress,
+        install_code: &[u8],
+    ) -> Result<[u8; 16], TrustCenterError> {
+        if install_code.len() != 18 {
+            return Err(TrustCenterError::InvalidInstallCode(
+                InstallCodeError::InvalidLength,
+            ));
+        }
+        let key =
+            derive_install_code_key(install_code).map_err(TrustCenterError::InvalidInstallCode)?;
+        self.set_link_key(ieee, key, TcKeyType::InstallCode)?;
+        Ok(key)
     }
 
     /// Remove a device's link key (on device removal).
@@ -179,10 +208,9 @@ impl TrustCenter {
             return true; // Accept all with default TC key
         }
         // Require pre-provisioned install code key
-        self.link_keys
-            .iter()
-            .flatten()
-            .any(|e| &e.ieee_address == ieee && e.key_type == TcKeyType::InstallCode)
+        self.link_keys.iter().flatten().any(|entry| {
+            entry.active && &entry.ieee_address == ieee && entry.key_type == TcKeyType::InstallCode
+        })
     }
 
     /// Update incoming frame counter for a device (replay protection).

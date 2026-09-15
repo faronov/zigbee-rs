@@ -19,7 +19,8 @@ require_vma() {
 }
 
 require_ram_symbol() {
-    address=$("$NM" -n -C "$ELF" | awk -v name="$1" 'index($0, name) { print $1; exit }')
+    # A same-prefix helper must not hide a missing required routine.
+    address=$("$NM" -n -C "$ELF" | awk -v name="$1" '$3 == name { print $1; exit }')
     case "$address" in
         1fff*) ;;
         *)
@@ -32,6 +33,20 @@ require_ram_symbol() {
 require_vma .jump_table 1fff0000
 require_vma .vector_table 1fff1838
 require_vma .text 11010100
+
+xip_start=$("$NM" -n "$ELF" | awk '$3 == "__stext" { print $1; exit }')
+xip_end=$("$NM" -n "$ELF" | awk '$3 == "__veneer_limit" { print $1; exit }')
+if [ -z "$xip_start" ] || [ -z "$xip_end" ]; then
+    echo "XIP occupied-span symbols are missing" >&2
+    exit 1
+fi
+XIP_SLOT_BYTES=130816
+xip_occupied_bytes=$((0x$xip_end - 0x$xip_start))
+if [ "$xip_occupied_bytes" -gt "$XIP_SLOT_BYTES" ]; then
+    echo "XIP occupied span is $xip_occupied_bytes bytes, limit is $XIP_SLOT_BYTES" >&2
+    exit 1
+fi
+
 require_ram_symbol "phy6222_hal::flash::write"
 require_ram_symbol "phy6222_hal::flash::write_inner"
 require_ram_symbol "phy6222_hal::flash::erase_sector"
@@ -50,3 +65,4 @@ then
 fi
 
 echo "PHY62x2 layout: ROM jump table, run descriptor, XIP, and flash RAM code are valid"
+echo "PHY62x2 XIP occupied span: $xip_occupied_bytes / $XIP_SLOT_BYTES bytes"

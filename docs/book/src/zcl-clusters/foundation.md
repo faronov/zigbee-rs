@@ -133,7 +133,7 @@ Each `ReportingConfig` contains:
 | `attribute_id` | Which attribute to report |
 | `data_type` | ZCL data type of the attribute |
 | `min_interval` | Minimum seconds between reports |
-| `max_interval` | Maximum seconds between reports (0xFFFF = disable periodic) |
+| `max_interval` | Maximum seconds between reports; `0` disables periodic reports, `0xFFFF` disables all automatic reports |
 | `reportable_change` | Minimum value change to trigger report (analog types only) |
 
 Each record gets its own status in the 0x07 response — `UNSUPPORTED_ATTRIBUTE`,
@@ -141,6 +141,18 @@ Each record gets its own status in the 0x07 response — `UNSUPPORTED_ATTRIBUTE`
 record the device cannot honour, and `SUCCESS` for the rest. Records that
 succeeded stay configured even when a sibling record in the same command
 failed.
+
+With `max_interval = 0`, change-triggered reports still respect
+`min_interval` and `reportable_change`; an unchanged value does not produce
+a report on every check. With `max_interval = 0xFFFF`, neither the initial
+value nor later changes produce automatic reports, even after elapsed-time
+saturation. An explicit operator snapshot through `force_all_due()` remains
+available in either mode and bypasses the intervals exactly once.
+
+The standalone `ConfigureReportingRequest::parse()` and
+`ReadReportingConfigRequest::parse()` helpers require non-empty payloads
+containing complete records. A truncated tail rejects the entire parsed
+request rather than returning only its valid prefix.
 
 ### Interview state (runtime)
 

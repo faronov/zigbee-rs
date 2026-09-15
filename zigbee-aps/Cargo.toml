@@ -15,7 +15,9 @@ zigbee-mac = { version = "0.1.0", path = "../zigbee-mac" }
 log = "0.4"
 
 [features]
+sleepy-end-device = []
 router = ["zigbee-nwk/router"]
+trust-center = ["router"]
 trace = ["zigbee-nwk/trace"]
 
 [dev-dependencies]

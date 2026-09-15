@@ -1,9 +1,9 @@
-/* TLSR8258 LOW32K-retention diagnostic layout.
+/* TLSR8258 power-management diagnostic layout.
  *
- * The retained SRAM window is 0x840000..0x848000. All writable state, DMA,
- * and both banked stacks used by diag-pm must remain inside that window.
- * Production keeps its existing larger top-of-SRAM stacks until this layout
- * and the deep-retention wake path are hardware-proven.
+ * The current diag-pm image exercises in-place full-SRAM SUSPEND. Keep its
+ * writable state, DMA, and both banked stacks inside the stricter historical
+ * LOW32K window (0x840000..0x848000) so the existing placement gate does not
+ * regress while Retention remains unsupported by the sensor.
  */
 MEMORY
 {

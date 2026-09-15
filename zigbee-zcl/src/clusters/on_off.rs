@@ -97,6 +97,15 @@ impl OnOffCluster {
     /// When OnTime reaches 0 while the device is on, it turns off and
     /// OffWaitTime begins counting down.
     pub fn tick(&mut self) {
+        self.tick_by(1);
+    }
+
+    /// Advance the timers by `elapsed_deciseconds` without replaying one call
+    /// per missed 100 ms period.
+    pub fn tick_by(&mut self, elapsed_deciseconds: u32) {
+        if elapsed_deciseconds == 0 {
+            return;
+        }
         let on_time = match self.store.get(ATTR_ON_TIME) {
             Some(ZclValue::U16(v)) => *v,
             _ => 0,
@@ -107,14 +116,21 @@ impl OnOffCluster {
         };
 
         if self.is_on() && on_time > 0 {
-            let new_on = on_time.saturating_sub(1);
+            let elapsed_on = elapsed_deciseconds.min(u32::from(on_time)) as u16;
+            let new_on = on_time - elapsed_on;
             let _ = self.store.set_raw(ATTR_ON_TIME, ZclValue::U16(new_on));
             if new_on == 0 {
                 // OnTime expired — turn off, start off-wait countdown
                 self.set_on_off(false);
+                let elapsed_off = elapsed_deciseconds - u32::from(elapsed_on);
+                let new_wait = off_wait.saturating_sub(elapsed_off.min(u32::from(u16::MAX)) as u16);
+                let _ = self
+                    .store
+                    .set_raw(ATTR_OFF_WAIT_TIME, ZclValue::U16(new_wait));
             }
         } else if !self.is_on() && off_wait > 0 {
-            let new_wait = off_wait.saturating_sub(1);
+            let new_wait =
+                off_wait.saturating_sub(elapsed_deciseconds.min(u32::from(u16::MAX)) as u16);
             let _ = self
                 .store
                 .set_raw(ATTR_OFF_WAIT_TIME, ZclValue::U16(new_wait));
@@ -269,6 +285,26 @@ mod tests {
         assert_eq!(
             cluster.attributes().get(ATTR_START_UP_ON_OFF),
             Some(&ZclValue::Enum8(0xFF))
+        );
+    }
+
+    #[test]
+    fn elapsed_tick_consumes_on_time_and_remaining_off_wait_time() {
+        let mut cluster = OnOffCluster::new();
+        cluster
+            .handle_command(CMD_ON_WITH_TIMED_OFF, &[0x00, 0x03, 0x00, 0x05, 0x00])
+            .unwrap();
+
+        cluster.tick_by(4);
+
+        assert!(!cluster.is_on());
+        assert_eq!(
+            cluster.attributes().get(ATTR_ON_TIME),
+            Some(&ZclValue::U16(0))
+        );
+        assert_eq!(
+            cluster.attributes().get(ATTR_OFF_WAIT_TIME),
+            Some(&ZclValue::U16(4))
         );
     }
 }

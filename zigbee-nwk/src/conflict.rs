@@ -25,11 +25,13 @@
 //! # Roles
 //!
 //! Detection of a conflict on the *local* address, and the resulting rejoin,
-//! apply to every role including a sleepy end device. Everything that requires
-//! forwarding — broadcasting a conflict on another device's behalf, reassigning
-//! a child's address, receiving Network Report / Network Update — is a router
-//! and coordinator behavior and is gated on [`NwkLayer::can_route`], so a
-//! non-routing build neither links nor performs it.
+//! apply to every role including a sleepy end device. A device that discovers
+//! its *own* address conflict also broadcasts the mandatory Network Status
+//! before it rejoins. Everything that requires forwarding — broadcasting a
+//! conflict on another device's behalf, reassigning a child, and receiving
+//! Network Report — is a router and coordinator behavior and is gated on
+//! [`NwkLayer::can_route`]. A Network Update, in contrast, is received by
+//! every authenticated member of the network.
 
 use crate::frames::{PanIdConflictReport, PanIdUpdate};
 use crate::nlde::{NwkCommandOutcome, is_unicast_address};
@@ -144,31 +146,35 @@ impl<M: MacDriver> NwkLayer<M> {
         if ieee == self.nib.ieee_address {
             return AddressCheck::Consistent;
         }
-        if !cfg!(feature = "router") {
+        #[cfg(not(feature = "router"))]
+        {
             // A non-routing build keeps no network-wide address map and never
             // announces another device's conflict — R22 §3.6.1.9.3 gives that
             // duty to a router or the coordinator. It still detects and
             // resolves a conflict on its *own* address, above, which is the
             // only resolution an end device can perform.
-            return AddressCheck::Consistent;
+            AddressCheck::Consistent
         }
 
-        let known = self
-            .neighbors
-            .find_by_short(address)
-            .map(|entry| entry.ieee_address);
-        match known {
-            Some(NULL_IEEE) | None => {
-                // Nothing recorded yet — learn the mapping. This is what makes
-                // the *next* statement of identity able to detect a conflict.
-                self.update_neighbor_address(address, ieee);
-                AddressCheck::Consistent
-            }
-            Some(existing) if existing == ieee => AddressCheck::Consistent,
-            Some(_) => {
-                log::warn!("[NWK] Address conflict on 0x{:04X}", address.0);
-                AddressCheck::Conflict {
-                    outcome: self.report_foreign_address_conflict(address, ieee),
+        #[cfg(feature = "router")]
+        {
+            let known = self
+                .neighbors
+                .find_by_short(address)
+                .map(|entry| entry.ieee_address);
+            match known {
+                Some(NULL_IEEE) | None => {
+                    // Nothing recorded yet — learn the mapping. This is what makes
+                    // the *next* statement of identity able to detect a conflict.
+                    self.update_neighbor_address(address, ieee);
+                    AddressCheck::Consistent
+                }
+                Some(existing) if existing == ieee => AddressCheck::Consistent,
+                Some(_) => {
+                    log::warn!("[NWK] Address conflict on 0x{:04X}", address.0);
+                    AddressCheck::Conflict {
+                        outcome: self.report_foreign_address_conflict(address, ieee),
+                    }
                 }
             }
         }
@@ -179,6 +185,7 @@ impl<M: MacDriver> NwkLayer<M> {
     ///
     /// End devices never originate this broadcast: R22 gives the obligation to
     /// a "ZigBee coordinator or Router".
+    #[cfg(feature = "router")]
     fn report_foreign_address_conflict(
         &mut self,
         address: ShortAddress,
@@ -212,16 +219,15 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Note a conflict on this device's own address and report how it must be
     /// resolved (R22 §3.6.1.9.3).
     ///
-    /// A router or coordinator additionally informs the network, naming its
-    /// *previous* address, unless it learned of the conflict from a Network
-    /// Status command that already carries exactly that payload — R22 only asks
-    /// for the broadcast when the conflict was learned some other way.
+    /// The device informs the network, naming its *previous* address, unless
+    /// it learned of the conflict from a Network Status command that already
+    /// carries exactly that payload — R22 only asks for the broadcast when the
+    /// conflict was learned some other way. This includes an end device: it
+    /// must announce its previous short address before rejoining.
     pub(crate) fn detect_local_address_conflict(&mut self) -> NwkCommandOutcome {
         let previous = self.nib.network_address;
         log::warn!("[NWK] Local address conflict on 0x{:04X}", previous.0);
-        if self.can_route() {
-            self.queue_address_conflict_broadcast(previous);
-        }
+        self.queue_address_conflict_broadcast(previous);
         NwkCommandOutcome::AddressConflict {
             previous,
             resolution: self.local_conflict_resolution(),
@@ -250,9 +256,12 @@ impl<M: MacDriver> NwkLayer<M> {
     /// A conflict is usually seen by several routers at once. The jitter — plus
     /// cancellation when an identical broadcast arrives first, handled in
     /// [`Self::handle_network_status_address_conflict`] — keeps that from
-    /// turning into a broadcast storm.
+    /// turning into a broadcast storm. Foreign conflicts only reach this
+    /// helper through the router-gated
+    /// [`Self::report_foreign_address_conflict`]; a leaf uses it solely for
+    /// its own mandatory announcement.
     fn queue_address_conflict_broadcast(&mut self, address: ShortAddress) {
-        if !self.can_route() || !is_unicast_address(address) {
+        if !is_unicast_address(address) {
             return;
         }
         if self
@@ -319,21 +328,23 @@ impl<M: MacDriver> NwkLayer<M> {
         // Somebody else announced it — our own identical broadcast is redundant.
         self.cancel_address_conflict_broadcast(offending);
 
-        if !self.can_route() {
-            return None;
+        #[cfg(not(feature = "router"))]
+        return None;
+        #[cfg(feature = "router")]
+        {
+            let child = self.neighbors.find_by_short(offending).filter(|entry| {
+                entry.device_type == crate::neighbor::NeighborDeviceType::EndDevice
+                    && matches!(
+                        entry.relationship,
+                        crate::neighbor::Relationship::Child
+                            | crate::neighbor::Relationship::UnauthenticatedChild
+                    )
+            })?;
+            Some(NwkCommandOutcome::ChildAddressConflict {
+                child: offending,
+                ieee: child.ieee_address,
+            })
         }
-        let child = self.neighbors.find_by_short(offending).filter(|entry| {
-            entry.device_type == crate::neighbor::NeighborDeviceType::EndDevice
-                && matches!(
-                    entry.relationship,
-                    crate::neighbor::Relationship::Child
-                        | crate::neighbor::Relationship::UnauthenticatedChild
-                )
-        })?;
-        Some(NwkCommandOutcome::ChildAddressConflict {
-            child: offending,
-            ieee: child.ieee_address,
-        })
     }
 
     /// Drop a queued conflict broadcast for `address` (R22 §3.6.1.9.3 asks a
@@ -511,7 +522,11 @@ impl<M: MacDriver> NwkLayer<M> {
     /// only after `nwkNetworkBroadcastDeliveryTime`, so the broadcast that
     /// carries it can still cross the network on the old PAN identifier.
     pub(crate) fn handle_network_update(&mut self, src: ShortAddress, payload: &[u8]) {
-        if !self.can_route() {
+        if src != self.nib.nwk_manager_addr {
+            log::warn!(
+                "[NWK] Network Update from non-manager 0x{:04X} ignored",
+                src.0
+            );
             return;
         }
         let Some(update) = PanIdUpdate::parse(payload) else {
@@ -558,7 +573,7 @@ impl<M: MacDriver> NwkLayer<M> {
     }
 
     /// Arm the deferred PAN identifier switch.
-    fn arm_pan_id_update(&mut self, new_pan_id: PanId) {
+    pub(crate) fn arm_pan_id_update(&mut self, new_pan_id: PanId) {
         let apply_at_us = self
             .mac
             .monotonic_micros()
@@ -567,6 +582,45 @@ impl<M: MacDriver> NwkLayer<M> {
             new_pan_id,
             apply_at_us,
         });
+    }
+
+    /// Short PAN identifier waiting for `nwkNetworkBroadcastDeliveryTime`.
+    pub const fn pending_pan_id_update(&self) -> Option<PanId> {
+        match self.pending_pan_id_update {
+            Some(pending) => Some(pending.new_pan_id),
+            None => None,
+        }
+    }
+
+    /// Whether this network manager still owes the corresponding update
+    /// broadcast before applying the pending PAN identifier.
+    pub const fn pan_id_update_broadcast_pending(&self) -> bool {
+        self.pending_pan_id_broadcast.is_some()
+    }
+
+    /// Restore a crash-interrupted PAN identifier transition.
+    ///
+    /// The full delivery interval is re-armed after reboot. Repeating the
+    /// delay is safe; applying the new identifier too early is not.
+    pub fn restore_pending_pan_id_update(
+        &mut self,
+        new_pan_id: PanId,
+        broadcast_pending: bool,
+    ) -> bool {
+        if self.nib.nwk_update_id().is_none()
+            || new_pan_id == self.nib.pan_id
+            || new_pan_id.0 == 0
+            || new_pan_id.0 == 0xFFFF
+        {
+            return false;
+        }
+        self.arm_pan_id_update(new_pan_id);
+        self.pending_pan_id_broadcast = broadcast_pending.then_some(PanIdUpdate {
+            epid: self.nib.extended_pan_id,
+            update_id: self.nib.update_id,
+            new_pan_id,
+        });
+        true
     }
 
     /// The PAN identifier this device is about to move to, if any.
@@ -953,6 +1007,46 @@ mod tests {
     }
 
     #[test]
+    fn an_end_device_announces_a_locally_detected_conflict_before_rejoining() {
+        let mut end_device = node(DeviceType::EndDevice);
+
+        // A Device_annce is independent evidence of an address conflict, so it
+        // must produce the 0x0D announcement that a Network Status-derived
+        // conflict deliberately does not echo.
+        end_device.note_announced_address(OUR_ADDR, IMPOSTOR_IEEE);
+        assert_eq!(
+            end_device.take_command_outcome(),
+            Some(NwkCommandOutcome::AddressConflict {
+                previous: OUR_ADDR,
+                resolution: AddressConflictResolution::Rejoin,
+            }),
+            "a leaf resolves its own conflict through rejoin",
+        );
+        assert!(
+            end_device.mac().tx_history().is_empty(),
+            "the mandatory status waits for its bounded broadcast jitter",
+        );
+
+        block_on(end_device.mac_mut().delay_micros(MAX_BROADCAST_JITTER_US));
+        block_on(end_device.process_pending_end_device_lifecycle());
+
+        let record = end_device
+            .mac()
+            .tx_history()
+            .first()
+            .expect("the end device announces the prior address");
+        let bytes = record.payload.as_slice();
+        let (header, consumed) = NwkHeader::parse(bytes).expect("the status frame parses");
+        assert_eq!(header.dst_addr, ShortAddress::BROADCAST_RX_ON_WHEN_IDLE);
+        assert_eq!(bytes[consumed], NwkCommandId::NetworkStatus as u8);
+        assert_eq!(
+            &bytes[consumed + 1..consumed + 4],
+            &address_conflict_body(OUR_ADDR),
+            "the status names the address the end device is about to abandon",
+        );
+    }
+
+    #[test]
     fn a_tree_addressed_device_rejoins_instead_of_picking_an_address() {
         let mut router = node(DeviceType::Router);
         router.nib_mut().address_assign = crate::nib::AddressAssignMethod::TreeBased;
@@ -1063,6 +1157,7 @@ mod tests {
 
     // ── R22 §3.6.1.13 PAN identifier conflicts ──────────────────
 
+    #[cfg(feature = "router")]
     fn pan_id_report(epid: IeeeAddress, pan_ids: &[PanId]) -> heapless::Vec<u8, 32> {
         let mut report = PanIdConflictReport {
             epid,
@@ -1147,6 +1242,7 @@ mod tests {
     fn leaving_the_network_drops_deferred_conflict_work() {
         let mut router = node(DeviceType::Router);
         router.nib_mut().set_nwk_update_id(1);
+        router.nib_mut().nwk_manager_addr = PEER;
         router_neighbour(&mut router, PEER, PEER_IEEE);
         router.note_announced_address(PEER, IMPOSTOR_IEEE);
         deliver(
@@ -1185,12 +1281,28 @@ mod tests {
 
         let report = pan_id_report(EPID, &[PAN]);
         deliver(&mut manager, PEER, NwkCommandId::NetworkReport, &report);
-        let armed = manager.pending_pan_id().expect("the switch is armed");
+        let selected = manager
+            .pending_pan_id_broadcast
+            .expect("the update broadcast is queued")
+            .new_pan_id;
+        assert_eq!(
+            manager.pending_pan_id(),
+            Some(selected),
+            "the selected PAN is staged, but cannot run before its broadcast",
+        );
         // A second report, before the first update went out.
         deliver(&mut manager, PEER, NwkCommandId::NetworkReport, &report);
-        assert_eq!(manager.pending_pan_id(), Some(armed));
+        assert_eq!(
+            manager
+                .pending_pan_id_broadcast
+                .expect("the original update remains queued")
+                .new_pan_id,
+            selected,
+        );
+        assert_eq!(manager.pending_pan_id(), Some(selected));
 
         block_on(manager.process_pending_routing());
+        assert_eq!(manager.pending_pan_id(), Some(selected));
         let record = manager
             .mac()
             .tx_history()
@@ -1200,7 +1312,7 @@ mod tests {
         let (_, consumed) = NwkHeader::parse(bytes).expect("the frame parses");
         assert_eq!(bytes[consumed], NwkCommandId::NetworkUpdate as u8);
         let update = PanIdUpdate::parse(&bytes[consumed + 1..]).expect("the update parses");
-        assert_eq!(update.new_pan_id, armed);
+        assert_eq!(update.new_pan_id, selected);
     }
 
     #[test]
@@ -1208,6 +1320,7 @@ mod tests {
     fn a_router_adopts_a_newer_pan_id_update_after_the_delivery_time() {
         let mut router = node(DeviceType::Router);
         router.nib_mut().set_nwk_update_id(7);
+        router.nib_mut().nwk_manager_addr = PEER;
         router_neighbour(&mut router, PEER, PEER_IEEE);
 
         deliver(
@@ -1232,10 +1345,42 @@ mod tests {
     }
 
     #[test]
+    fn an_end_device_adopts_a_wrap_aware_pan_id_update_after_the_delivery_time() {
+        let mut end_device = node(DeviceType::EndDevice);
+        end_device.nib_mut().set_nwk_update_id(0xFF);
+        end_device.nib_mut().nwk_manager_addr = PEER;
+
+        deliver(
+            &mut end_device,
+            PEER,
+            NwkCommandId::NetworkUpdate,
+            &pan_id_update(EPID, 0, PanId(0xBEEF)),
+        );
+        assert_eq!(
+            end_device.nib().nwk_update_id(),
+            Some(0),
+            "0 follows 0xFF in the nwkUpdateId serial-number space",
+        );
+        assert_eq!(end_device.nib().pan_id, PAN);
+        assert_eq!(end_device.pending_pan_id(), Some(PanId(0xBEEF)));
+
+        block_on(end_device.process_pending_end_device_lifecycle());
+        assert_eq!(end_device.nib().pan_id, PAN);
+        block_on(
+            end_device
+                .mac_mut()
+                .delay_micros(NETWORK_BROADCAST_DELIVERY_TIME_US),
+        );
+        block_on(end_device.process_pending_end_device_lifecycle());
+        assert_eq!(end_device.nib().pan_id, PanId(0xBEEF));
+    }
+
+    #[test]
     #[cfg(feature = "router")]
     fn a_stale_or_foreign_pan_id_update_is_refused() {
         let mut router = node(DeviceType::Router);
         router.nib_mut().set_nwk_update_id(7);
+        router.nib_mut().nwk_manager_addr = PEER;
         router_neighbour(&mut router, PEER, PEER_IEEE);
 
         // Older update state.

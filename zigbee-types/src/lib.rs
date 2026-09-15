@@ -5,6 +5,35 @@
 
 #![no_std]
 
+/// Await a sub-future through a `Pin<&mut dyn Future>` so its poll code is
+/// emitted once behind a vtable instead of being inlined into the caller's
+/// coroutine.
+///
+/// This is the crate-shared form of the outlining boundary that
+/// `zigbee-runtime` established for its tick and receive paths. The future is
+/// still pinned in the caller's own coroutine frame, where an inline `.await`
+/// would also have put it, so the cost is one static vtable, one indirect call
+/// and whatever the coroutine layout can no longer overlap.
+///
+/// It must stay a macro. Wrapping the same thing in a generic `async fn` makes
+/// the caller hold the moved-from temporary *and* the wrapper coroutine across
+/// the await, so every outlined future's state is stored twice.
+///
+/// Reach for it when a large sub-future is awaited **from inside a loop**: the
+/// coroutine's resume dispatch re-emits the loop body at every resume edge, so
+/// an inlined body is duplicated even though the frame holds only one copy of
+/// its state. On a small leaf call, or where LLVM already refuses to inline the
+/// callee, the vtable and the indirect call cost more than the inlining saves —
+/// always measure the linked image before and after.
+#[macro_export]
+macro_rules! await_out_of_line {
+    ($future:expr) => {{
+        let future = ::core::pin::pin!($future);
+        let future: ::core::pin::Pin<&mut dyn ::core::future::Future<Output = _>> = future;
+        future.await
+    }};
+}
+
 /// IEEE 802.15.4 extended address (EUI-64)
 pub type IeeeAddress = [u8; 8];
 
