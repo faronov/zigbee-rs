@@ -12,7 +12,7 @@ efr32mg21-hal = { path = "../../efr32mg21-hal" }
 efr32mg21-sensor-product = { path = "../../products/efr32mg21-sensor" }
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
 embassy-futures = "0.1"
-embassy-time = { version = "0.5", features = ["tick-hz-1_000"] }
+embassy-time = { version = "0.5", features = ["tick-hz-1_000_000"] }
 embassy-time-driver = "0.2"
 log = "0.4"
 rtt-target = { version = "0.6", features = ["log"] }

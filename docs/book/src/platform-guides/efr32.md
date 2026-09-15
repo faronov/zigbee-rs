@@ -133,6 +133,14 @@ and slow waits.
 `Idle` is radio-gated WFE driven by the real 1 kHz SysTick. It is not EM2 and
 no deep-sleep current is claimed.
 
+The Embassy timebase is **1 MHz**, distinct from the 1 kHz interrupt cadence:
+each SysTick advances it by 1,000 ticks, with microsecond interpolation between
+interrupts. Clock reads account for a pending reload and retry if it occurs
+during sampling. They retain a nondecreasing timestamp if multiple exceptions
+coalesce while interrupts are masked; SysTick cannot reconstruct the lost
+masked time. Alarms remain quantized to the 1 ms interrupt cadence. Accurate
+long masked intervals would require a separate free-running time source.
+
 ### Memory layout
 
 ```text

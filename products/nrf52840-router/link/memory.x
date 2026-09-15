@@ -23,3 +23,5 @@ ASSERT(_security_partition_end == 0x00100000,
   "nRF52840 relay security journal must occupy the top of flash");
 ASSERT(ORIGIN(RAM) + LENGTH(RAM) == 0x20040000,
   "nRF52840 relay RAM must end at the top of the 256 KiB SRAM");
+ASSERT(_stack_start - __euninit >= 16K,
+  "nRF52840 static task storage must leave at least 16 KiB for the stack");

@@ -21,3 +21,5 @@ ASSERT(_security_partition_end == 512K,
   "CC2340 security journal must occupy the top of the 512-KiB main flash");
 ASSERT(ORIGIN(RAM) + LENGTH(RAM) == 0x20009000,
   "CC2340R52 RAM region must end at the top of its 36-KiB SRAM");
+ASSERT(_stack_start - __euninit >= 16K,
+  "CC2340 static task storage must leave at least 16 KiB for the stack");

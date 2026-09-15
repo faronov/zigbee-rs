@@ -12,6 +12,7 @@ mod platform;
 #[cfg(feature = "stubs")]
 mod stubs;
 mod time_driver;
+mod time_snapshot;
 mod vectors;
 
 use efr32mg21_devkit::resources::BoardResources;

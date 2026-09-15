@@ -12,8 +12,8 @@ zigbee-mac = { path = "../../zigbee-mac", features = ["cc2340"] }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 
-# Embassy async runtime
-embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
+# Pinned nightly gives each task compiler-sized static storage, not a 4 KiB arena.
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
 embassy-time = "0.5"
 
 # ARM Cortex-M0+ support

@@ -14,7 +14,8 @@ nrf52840-dk = { path = "../../boards/nrf52840-dk" }
 nrf52840-router-product = { path = "../../products/nrf52840-router" }
 
 # nRF52840 HAL + Embassy
-embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
+# Compiler-sized static task storage is checked against RAM by the linker.
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
 embassy-nrf = { version = "0.3", features = ["nrf52840", "time-driver-rtc1"] }
 embassy-time = "0.4"
 

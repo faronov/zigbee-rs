@@ -111,6 +111,12 @@ AlwaysOnEndDeviceApp::new(node, policy, parts)?;
 indirect delivery, or advertise Router/Link Status behavior. It is therefore
 a receiver-on, always-on End Device.
 
+This composition uses Embassy's pinned-nightly static task allocation. The
+compiler emits storage for the actual main future; it no longer tries to
+allocate that future from the insufficient default 4 KiB arena. The linker
+also requires at least 16 KiB between static storage and the initial stack
+pointer. This is a linked reserve, not a measured stack high-water mark.
+
 ## Build
 
 All Nordic images use `nightly-2026-03-23`:
