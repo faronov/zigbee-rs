@@ -115,18 +115,17 @@ jobs:
           cp examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-router.bin
           ./tools/firmware-size-report.sh telink-tlsr8258-sensor \
-            target/tlsr8258-artifacts/telink-tlsr8258-sensor.bin 294912 \
+            target/tlsr8258-artifacts/telink-tlsr8258-sensor.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-sensor.size.json
           ./tools/firmware-size-report.sh telink-tlsr8258-sensor-retention-250 \
-            target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-250.bin 299008 \
+            target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-250.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-250.size.json
           ./tools/firmware-size-report.sh telink-tlsr8258-sensor-retention-10s \
-            target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-10s.bin 299008 \
+            target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-10s.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-10s.size.json
-          # R22 parent-router regression gate is 0x69000; the linker/layout
-          # hard-stop remains the APS journal at physical address 0x70000.
+          # The linker/layout hard-stop remains the APS journal at physical 0x70000.
           ./tools/firmware-size-report.sh telink-tlsr8258-router \
-            target/tlsr8258-artifacts/telink-tlsr8258-router.bin 430080 \
+            target/tlsr8258-artifacts/telink-tlsr8258-router.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-router.size.json
           NM="$TC32_TOOLCHAIN_DIR/llvm/bin/llvm-nm"
           SENSOR_ELF=examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor

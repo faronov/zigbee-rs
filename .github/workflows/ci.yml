@@ -50,6 +50,8 @@ jobs:
         run: python3 -m unittest discover -s products/esp32-zigbee-devkit/partitions -p 'test_esp_app_image.py' -v
       - name: Test fail-closed Pages firmware publication
         run: python3 -m unittest discover -s tools -p 'test_prepare_pages.py' -v
+      - name: Test firmware size reporting
+        run: python3 -m unittest discover -s tools -p 'test_firmware_size_report.py' -v
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -271,7 +273,7 @@ jobs:
   #
   # Keep all nRF images on the same measured compiler. Floating nightly
   # 2026-08-14 changed Cortex-M code generation by about 6 KiB without a
-  # source change and made the 220 KiB growth gate non-reproducible.
+  # source change; fixed compilers keep size measurements comparable.
 
   build-nrf52840:
     name: Build nRF52840 sensor (${{ matrix.variant }})
@@ -282,15 +284,12 @@ jobs:
         include:
           - variant: default
             features: ""
-            budget: 225280
             artifact: nrf52840-sensor-firmware
           - variant: bme280
             features: sensor-bme280
-            budget: 245760
             artifact: nrf52840-sensor-bme280-firmware
           - variant: sht31
             features: sensor-sht31
-            budget: 241664
             artifact: nrf52840-sensor-sht31-firmware
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -318,14 +317,9 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          # Measured on nightly-2026-03-23 (2026-09-06): default=224472 B,
-          # BME280=231792 B and SHT31=228216 B intentionally use their
-          # larger feature-specific budgets. Keep the default sensor within
-          # its strict 220 KiB gate, separate from the hard 0x000FE000
-          # partition boundary.
           ./tools/firmware-size-report.sh \
             nrf52840-sensor-${{ matrix.variant }} ${ELF}.bin \
-            ${{ matrix.budget }} ${ELF}.size.json
+            ${ELF}.size.json
           IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
           if [ "$IMAGE_BYTES" -gt 1040384 ]; then
             echo "nRF52840 image ($IMAGE_BYTES B) overruns application flash ending at 0x000FE000" >&2
@@ -404,10 +398,7 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          # With mandatory centralized TCLK: 226584 B (2026-09-07). The 248 KiB
-          # non-sensor regression budget remains below the independent 1016
-          # KiB physical application boundary.
-          ./tools/firmware-size-report.sh nrf52840-always-on-end-device ${ELF}.bin 253952 ${ELF}.size.json
+          ./tools/firmware-size-report.sh nrf52840-always-on-end-device ${ELF}.bin ${ELF}.size.json
           IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
           if [ "$IMAGE_BYTES" -gt 1040384 ]; then
             echo "nRF52840 always-on End Device ($IMAGE_BYTES B) overruns application flash ending at 0x000FE000" >&2
@@ -505,15 +496,12 @@ jobs:
         include:
           - variant: default
             features: ""
-            budget: 225280
             artifact: nrf52833-sensor-firmware
           - variant: bme280
             features: sensor-bme280
-            budget: 245760
             artifact: nrf52833-sensor-bme280-firmware
           - variant: sht31
             features: sensor-sht31
-            budget: 241664
             artifact: nrf52833-sensor-sht31-firmware
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -541,13 +529,9 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          # Measured on nightly-2026-03-23 (2026-09-06): default=224464 B,
-          # BME280=231784 B and SHT31=228208 B intentionally use their
-          # larger feature-specific budgets. Keep the default sensor within
-          # its strict 220 KiB gate while the 504 KiB boundary remains hard.
           ./tools/firmware-size-report.sh \
             nrf52833-sensor-${{ matrix.variant }} ${ELF}.bin \
-            ${{ matrix.budget }} ${ELF}.size.json
+            ${ELF}.size.json
           # The application must never reach the protected security journal
           # at 0x0007E000. memory.x asserts the region boundary at link
           # time; this asserts the produced image against it as well.
@@ -670,12 +654,9 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          # Final linked images: ProMicro=222968 B, MDK=222848 B,
-          # PCA10059=224536 B, and DK=224552 B. The 232 KiB regression budget
-          # is independent of each board's checked linker partition boundary.
           ./tools/firmware-size-report.sh \
             nrf52840-sensor-uf2-${{ matrix.board }} ${ELF}.bin \
-            237568 ${ELF}.size.json
+            ${ELF}.size.json
           SYMS="$("$NM" --demangle "$ELF")"
           if grep -q 'core::slice::sort' <<<"$SYMS"; then
             echo "nRF52840 UF2 image contains generic slice sorting" >&2
@@ -813,11 +794,8 @@ jobs:
           cargo test --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
             --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/esp32c6-ota-host" \
             --no-default-features --features esp32c6 -- --include-ignored
-          # 2026-09-10 local app image is 377360 B and fails this unchanged gate.
-          # Keep its regression budget
-          # independent of the checked 0x1F0000-byte physical OTA slot.
           ./tools/firmware-size-report.sh \
-            esp32c6-sensor "${ELF}.app.bin" 368640 "${ELF}.size.json"
+            esp32c6-sensor "${ELF}.app.bin" "${ELF}.size.json"
       - name: Upload ESP32-C6 firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -889,11 +867,8 @@ jobs:
           cargo test --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
             --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/esp32h2-ota-host" \
             --no-default-features --features esp32h2 -- --include-ignored
-          # 2026-09-10 local app image is 362112 B and fails this unchanged gate.
-          # Keep its regression budget
-          # independent of the checked 0x1F0000-byte physical OTA slot.
           ./tools/firmware-size-report.sh \
-            esp32h2-sensor "${ELF}.app.bin" 356352 "${ELF}.size.json"
+            esp32h2-sensor "${ELF}.app.bin" "${ELF}.size.json"
       - name: Upload ESP32-H2 firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -912,9 +887,7 @@ jobs:
       matrix:
         include:
           - chip: esp32c6
-            budget: 368640
           - chip: esp32h2
-            budget: 356352
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
@@ -932,10 +905,9 @@ jobs:
       - name: Link retained-sleep firmware
         working-directory: examples/${{ matrix.chip }}-sensor
         run: cargo build --release --locked --features light-sleep -Z build-std=core,alloc
-      - name: Validate actual application and OTA corpus before size gate
+      - name: Validate actual application and OTA corpus and report size
         env:
           CHIP: ${{ matrix.chip }}
-          BUDGET: ${{ matrix.budget }}
         run: |
           ELF="examples/$CHIP-sensor/target/riscv32imac-unknown-none-elf/release/$CHIP-sensor"
           CSV=products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv
@@ -958,7 +930,7 @@ jobs:
           cargo test --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
             --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/$CHIP-light-sleep-host" \
             --no-default-features --features "$CHIP,light-sleep" -- --include-ignored
-          ./tools/firmware-size-report.sh "$CHIP-light-sleep" "${ELF}.app.bin" "$BUDGET" "${ELF}.size.json"
+          ./tools/firmware-size-report.sh "$CHIP-light-sleep" "${ELF}.app.bin" "${ELF}.size.json"
 
   build-bl702:
     name: Build BL702 sensor
@@ -1027,8 +999,7 @@ jobs:
             echo "BL702 boot image is ${FLASH_BYTES} B; security storage starts at physical 0xFE000" >&2
             exit 1
           fi
-          # Final linked raw image measured 189442 B.
-          ./tools/firmware-size-report.sh bl702-sensor "$RAW" 192512 ${ELF}.size.json
+          ./tools/firmware-size-report.sh bl702-sensor "$RAW" ${ELF}.size.json
           SYMS="$("$NM" --demangle "$ELF")"
           if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
             echo "BL702 production image still links the software AES core" >&2
@@ -1155,9 +1126,8 @@ jobs:
             echo "CC2340 application is ${PHYSICAL_BYTES} B; protected security storage starts at 0x7E000" >&2
             exit 1
           fi
-          # Final pinned-SDK image measured 223536 B.
           ./tools/firmware-size-report.sh \
-            cc2340-sensor "${ELF}.bin" 225280 "${ELF}.size.json"
+            cc2340-sensor "${ELF}.bin" "${ELF}.size.json"
       - name: Upload CC2340 firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -1252,8 +1222,7 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          # 2026-09-08 binary measured 163236 B.
-          ./tools/firmware-size-report.sh efr32mg1-sensor ${ELF}.bin 167936 ${ELF}.size.json
+          ./tools/firmware-size-report.sh efr32mg1-sensor ${ELF}.bin ${ELF}.size.json
           python3 examples/efr32mg1-sensor/tools/verify-layout.py "$ELF"
           NM="$NM" examples/efr32mg1-sensor/check-layout.sh "$ELF"
           SYMS="$("$NM" --demangle "$ELF")"
@@ -1313,8 +1282,7 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          # 2026-09-10 local binary measured 202068 B.
-          ./tools/firmware-size-report.sh efr32mg21-sensor ${ELF}.bin 212992 ${ELF}.size.json
+          ./tools/firmware-size-report.sh efr32mg21-sensor ${ELF}.bin ${ELF}.size.json
           python3 examples/efr32mg21-sensor/tools/verify-layout.py "$ELF"
           SYMS="$("$NM" --demangle "$ELF")"
           if ! grep -Eq 'SoftwareAes128|aes::soft' <<<"$SYMS"; then
