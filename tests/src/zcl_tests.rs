@@ -782,7 +782,7 @@ fn reporting_engine_force_all_due_bypasses_intervals_and_change_thresholds() {
             attribute_id: AttributeId(0x0000),
             data_type: ZclDataType::I16,
             min_interval: 300,
-            max_interval: 0xFFFF,
+            max_interval: 0,
             reportable_change: Some(ZclValue::I16(100)),
         })
         .unwrap();
