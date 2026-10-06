@@ -1050,6 +1050,87 @@ mod resume_tests {
 
     #[cfg(any(not(feature = "end-device"), feature = "router"))]
     #[test]
+    fn a_scoped_sweep_keeps_the_floors_of_a_provisional_epoch() {
+        use zigbee_bdb::SecurityPersistence;
+
+        const IEEE: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
+        const PARTNER: [u8; 8] = [0x31; 8];
+        const RETIRED_KEY: [u8; 16] = [0x82; 16];
+
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE)).build_coordinator();
+        let floor =
+            PersistentReplayCounter::Aps(zigbee_aps::security::ApsReplayCounter::from_verified(
+                zigbee_aps::security::ApsKeyOrigin::KeyPair {
+                    partner: PARTNER,
+                    key_type: zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+                },
+                PARTNER,
+                &RETIRED_KEY,
+                9,
+            ));
+        let mut store = RamSecurityStateStore::new();
+        crate::security_store::CommissioningSecurityPersistence::new(&mut store)
+            .unwrap()
+            .reserve_network_security(&zigbee_bdb::NetworkSecurityState {
+                extended_pan_id: [1; 8],
+                pan_id: 0x1234,
+                short_address: 0x5678,
+                ieee_address: IEEE,
+                channel: 15,
+                depth: 1,
+                parent_address: 0,
+                update_id: 0,
+                update_id_valid: false,
+                network_key: [3; 16],
+                key_sequence: 0,
+                outgoing_frame_counter: 0,
+                trust_center_address: PARTNER,
+                node_join_link_key_type:
+                    zigbee_bdb::NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey,
+            })
+            .unwrap();
+        let state = store.load().unwrap().unwrap();
+        assert!(!state.commissioned && state.owns_replay_domain());
+        store.commit_replay_counter(floor).unwrap();
+
+        // The key is not live, but a provisional epoch only becomes live again
+        // through a fresh commissioning of the same epoch.
+        assert_eq!(
+            device
+                .tombstone_retired_trust_center_link_key_replay_counters(&mut store)
+                .unwrap(),
+            0
+        );
+        let mut retained = heapless::Vec::<PersistentReplayCounter, 4>::new();
+        store
+            .visit_replay_counters(&mut |replay| retained.push(replay).unwrap())
+            .unwrap();
+        assert_eq!(retained.as_slice(), &[floor]);
+
+        // Once the same epoch is committed, liveness governs retirement again.
+        let tclk = zigbee_bdb::TrustCenterLinkKeyState {
+            partner_address: PARTNER,
+            key: [0x84; 16],
+            key_type: zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+            outgoing_frame_counter: 0,
+            incoming_frame_counter: 0,
+            incoming_frame_counter_valid: false,
+        };
+        let mut persistence =
+            crate::security_store::CommissioningSecurityPersistence::new(&mut store).unwrap();
+        persistence.reserve_trust_center_link_key(&tclk).unwrap();
+        persistence.commit_network(&tclk).unwrap();
+        assert!(store.load().unwrap().unwrap().commissioned);
+        assert_eq!(
+            device
+                .tombstone_retired_trust_center_link_key_replay_counters(&mut store)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
+    #[test]
     fn fresh_coordinator_formation_is_committed_with_reserved_security() {
         const IEEE_ADDRESS: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
         let mut device = ZigbeeDevice::builder(coordinator_mac(IEEE_ADDRESS))
@@ -11033,11 +11114,29 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         }
     }
 
+    /// Whether the durable record is a provisional commissioning epoch.
+    ///
+    /// Its replay floors stay authoritative while their keys are not live:
+    /// the record is never restored as an operational network, and only a
+    /// fresh commissioning of the same epoch makes those keys live again.
+    /// Such floors are discarded with the epoch by the store, never by a
+    /// key-liveness sweep.
+    fn provisional_replay_epoch<S: SecurityStateStore>(
+        store: &mut S,
+    ) -> Result<bool, SecurityStoreError> {
+        Ok(store
+            .load()?
+            .is_some_and(|state| !state.commissioned && state.owns_replay_domain()))
+    }
+
     fn tombstone_retired_replay_counters_in_scope<S: SecurityStateStore>(
         &mut self,
         store: &mut S,
         scope: ReplayRetirementScope,
     ) -> Result<usize, SecurityStoreError> {
+        if Self::provisional_replay_epoch(store)? {
+            return Ok(0);
+        }
         store.retain_replay_counters(&|replay| {
             !Self::replay_counter_in_retirement_scope(replay, scope)
                 || self.replay_counter_key_is_live(replay)
@@ -11078,10 +11177,22 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         self.tombstone_retired_replay_counters_in_scope(store, ReplayRetirementScope::GlobalAps)
     }
 
-    fn tombstone_retired_security_state_replay_counters<S: SecurityStateStore>(
+    /// Reconcile durable replay floors with the live replay tables.
+    ///
+    /// A commissioned record's live tables were seeded at restore, so floors
+    /// whose key is no longer live are retired. A provisional epoch keeps all
+    /// of its floors and instead re-seeds every floor whose key is live
+    /// again, so a frame accepted before a reboot stays a replay once the same
+    /// epoch is commissioned anew. Seeding only raises live floors and writes
+    /// nothing, so it is idempotent and crash-neutral.
+    fn reconcile_security_state_replay_counters<S: SecurityStateStore>(
         &mut self,
         store: &mut S,
     ) -> Result<(), SecurityStoreError> {
+        if Self::provisional_replay_epoch(store)? {
+            self.restore_incoming_replay_state(store)?;
+            return Ok(());
+        }
         // Coordinator per-device TCLKs are restored from the separate Trust
         // Center journal after the core security state. Their owner performs
         // this sweep once that table has been installed.
@@ -11644,7 +11755,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             return Err(SecurityStoreError::Full);
         }
         self.refresh_security_state(store)?;
-        self.tombstone_retired_security_state_replay_counters(store)?;
+        self.reconcile_security_state_replay_counters(store)?;
         self.set_nwk_lifecycle_persistence_enabled(true);
         self.set_network_key_persistence_enabled(true);
         self.defer_aps_ack = true;
@@ -11698,7 +11809,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             }
             if !trust_center_removal && deferred_mgmt_leave.is_none() {
                 self.refresh_security_state(store)?;
-                self.tombstone_retired_security_state_replay_counters(store)?;
+                self.reconcile_security_state_replay_counters(store)?;
                 if let Some(replay) = self.pending_network_key_replay() {
                     store.commit_replay_counter(security_store::PersistentReplayCounter::Aps(
                         replay,
@@ -12036,7 +12147,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             return Err(SecurityStoreError::Full);
         }
         self.refresh_security_state(store)?;
-        self.tombstone_retired_security_state_replay_counters(store)?;
+        self.reconcile_security_state_replay_counters(store)?;
         self.flush_pending_device_announce_with_security_store(store)
             .await?;
         self.tick_identify_clusters(elapsed_secs);
@@ -12156,7 +12267,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                         )?
                     {
                         self.refresh_security_state(store)?;
-                        self.tombstone_retired_security_state_replay_counters(store)?;
+                        self.reconcile_security_state_replay_counters(store)?;
                         return Ok(event_loop::TickResult::Event(event));
                     }
 
@@ -12181,7 +12292,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         };
         let result = self.commissioning_tick_hint(result);
         self.refresh_security_state(store)?;
-        self.tombstone_retired_security_state_replay_counters(store)?;
+        self.reconcile_security_state_replay_counters(store)?;
         Ok(result)
     }
 

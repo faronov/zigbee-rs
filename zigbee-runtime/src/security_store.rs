@@ -405,6 +405,51 @@ impl PersistentSecurityState {
         self.is_formed_network() && self.node_join_link_key_type.is_distributed()
     }
 
+    /// Whether this record owns a durable incoming replay domain.
+    ///
+    /// That is a committed network, or one that commissioning has reserved
+    /// whose Trust Center handshake is still provisional. The latter receives
+    /// authenticated Trust Center traffic before `commissioned` may be set,
+    /// and that traffic must not become replayable merely because the
+    /// handshake is not finished.
+    ///
+    /// A reservation is recognised structurally: it is the only uncommissioned
+    /// record that carries a network identity (local IEEE and EPID, neither of
+    /// which may be zero on a network), and it always holds a durable outgoing
+    /// reservation. Factory reset keeps the counter bounds but clears the
+    /// identity, so it owns none. The network key is arbitrary 128-bit
+    /// material and is deliberately not consulted: an all-zero key is valid.
+    pub(crate) fn owns_replay_domain(&self) -> bool {
+        self.commissioned
+            || (self.global_counter_limit != 0
+                && self.ieee_address != [0; 8]
+                && self.extended_pan_id != [0; 8])
+    }
+
+    /// Whether replay floors persisted under `self` stay authoritative once
+    /// `next` replaces it.
+    ///
+    /// A provisional epoch is bound to its network identity *and* network
+    /// key, so it carries over to the reservations of the same handshake and
+    /// into the commissioned record that concludes it. A new reservation over
+    /// a committed network starts a new epoch, as before.
+    pub(crate) fn replay_domain_continues_into(&self, next: &Self) -> bool {
+        if !self.owns_replay_domain()
+            || !next.owns_replay_domain()
+            || self.extended_pan_id != next.extended_pan_id
+            || self.ieee_address != next.ieee_address
+        {
+            return false;
+        }
+        match (self.commissioned, next.commissioned) {
+            (true, true) => true,
+            (true, false) => false,
+            (false, _) => {
+                self.network_key == next.network_key && self.key_sequence == next.key_sequence
+            }
+        }
+    }
+
     #[inline(never)]
     pub fn encode(&self, output: &mut [u8; ENCODED_SECURITY_STATE_LEN]) {
         output.fill(0);
@@ -1025,12 +1070,9 @@ impl SecurityStateStore for RamSecurityStateStore {
     }
 
     fn store(&mut self, state: &PersistentSecurityState) -> Result<(), SecurityStoreError> {
-        let preserve_replay = self.state.is_some_and(|current| {
-            current.commissioned
-                && state.commissioned
-                && current.extended_pan_id == state.extended_pan_id
-                && current.ieee_address == state.ieee_address
-        });
+        let preserve_replay = self
+            .state
+            .is_some_and(|current| current.replay_domain_continues_into(state));
         if !preserve_replay {
             self.replay.clear();
         }
@@ -1052,7 +1094,7 @@ impl SecurityStateStore for RamSecurityStateStore {
         &mut self,
         replay: PersistentReplayCounter,
     ) -> Result<(), SecurityStoreError> {
-        if !self.state.is_some_and(|state| state.commissioned) {
+        if !self.state.is_some_and(|state| state.owns_replay_domain()) {
             return Err(SecurityStoreError::Corrupt);
         }
         if let Some(stored) = self
@@ -1607,5 +1649,176 @@ mod tests {
                 limit: 0xC00
             })
         );
+    }
+
+    fn nwk_floor(counter: u32) -> PersistentReplayCounter {
+        PersistentReplayCounter::Nwk(zigbee_nwk::security::NwkReplayCounter {
+            source: [6; 8],
+            key_sequence: 5,
+            key_fingerprint: 0x1234_5678,
+            counter,
+        })
+    }
+
+    fn floors(store: &mut RamSecurityStateStore) -> heapless::Vec<PersistentReplayCounter, 4> {
+        let mut floors = heapless::Vec::new();
+        store
+            .visit_replay_counters(&mut |replay| floors.push(replay).unwrap())
+            .unwrap();
+        floors
+    }
+
+    /// KEY-03: authenticated Trust Center traffic arrives while the reserved
+    /// record is still uncommissioned. Its floors must be durable then, and
+    /// must survive the TCLK reservation and the final commit, without the
+    /// record ever being marked commissioned early.
+    #[test]
+    fn the_commissioning_transitions_carry_provisional_replay_floors() {
+        let mut store = RamSecurityStateStore::new();
+        let mut reset = PersistentSecurityState::empty();
+        reset.global_counter_limit = 0x400;
+        store.store(&reset).unwrap();
+        assert_eq!(
+            store.commit_replay_counter(nwk_floor(1)),
+            Err(SecurityStoreError::Corrupt),
+            "a factory-new record owns no replay domain"
+        );
+
+        CommissioningSecurityPersistence::new(&mut store)
+            .unwrap()
+            .reserve_network_security(&network_state(0))
+            .unwrap();
+        assert!(!store.load().unwrap().unwrap().commissioned);
+        store.commit_replay_counter(nwk_floor(7)).unwrap();
+
+        CommissioningSecurityPersistence::new(&mut store)
+            .unwrap()
+            .reserve_trust_center_link_key(&tclk_state(0, 0))
+            .unwrap();
+        let reserved = store.load().unwrap().unwrap();
+        assert!(reserved.tclk_present && !reserved.commissioned);
+        assert_eq!(floors(&mut store).as_slice(), &[nwk_floor(7)]);
+        store.commit_replay_counter(nwk_floor(8)).unwrap();
+
+        CommissioningSecurityPersistence::new(&mut store)
+            .unwrap()
+            .commit_network(&tclk_state(0, 3))
+            .unwrap();
+        assert!(store.load().unwrap().unwrap().commissioned);
+        assert_eq!(floors(&mut store).as_slice(), &[nwk_floor(8)]);
+
+        // A fresh join over the committed network starts a new epoch, as it
+        // did before provisional floors existed.
+        CommissioningSecurityPersistence::new(&mut store)
+            .unwrap()
+            .reserve_network_security(&network_state(0x10))
+            .unwrap();
+        assert!(floors(&mut store).is_empty());
+    }
+
+    /// An all-zero network key is valid key material, not an absence marker:
+    /// its reservation must own a provisional replay domain like any other.
+    fn a_zero_network_key_reservation_owns_a_replay_domain<S: SecurityStateStore>(store: &mut S) {
+        let mut reset = PersistentSecurityState::empty();
+        reset.global_counter_limit = 0x400;
+        store.store(&reset).unwrap();
+
+        let mut zero_key = network_state(0);
+        zero_key.network_key = [0; 16];
+        CommissioningSecurityPersistence::new(store)
+            .unwrap()
+            .reserve_network_security(&zero_key)
+            .unwrap();
+        let reserved = store.load().unwrap().unwrap();
+        assert!(!reserved.commissioned);
+        assert_eq!(reserved.network_key, [0; 16]);
+        assert_eq!(store.commit_replay_counter(nwk_floor(7)), Ok(()));
+        assert!(reserved.owns_replay_domain());
+
+        let mut same_epoch = zero_key;
+        same_epoch.short_address = 0x4321;
+        CommissioningSecurityPersistence::new(store)
+            .unwrap()
+            .reserve_network_security(&same_epoch)
+            .unwrap();
+        assert!(reserved.replay_domain_continues_into(&store.load().unwrap().unwrap()));
+        let mut kept = heapless::Vec::<PersistentReplayCounter, 4>::new();
+        store
+            .visit_replay_counters(&mut |replay| kept.push(replay).unwrap())
+            .unwrap();
+        assert_eq!(kept.as_slice(), &[nwk_floor(7)]);
+
+        let mut rekeyed = zero_key;
+        rekeyed.network_key = [9; 16];
+        CommissioningSecurityPersistence::new(store)
+            .unwrap()
+            .reserve_network_security(&rekeyed)
+            .unwrap();
+        let mut ended = 0usize;
+        store.visit_replay_counters(&mut |_| ended += 1).unwrap();
+        assert_eq!(ended, 0, "a different network key ends the epoch");
+    }
+
+    #[test]
+    fn a_replay_domain_is_recognised_structurally_not_by_key_value() {
+        let mut reset = PersistentSecurityState::empty();
+        reset.global_counter_limit = 0x400;
+        reset.network_key = [4; 16];
+        assert!(!reset.owns_replay_domain(), "no network identity");
+
+        let mut unreserved = PersistentSecurityState::empty();
+        unreserved.ieee_address = [2; 8];
+        unreserved.extended_pan_id = [1; 8];
+        unreserved.network_key = [4; 16];
+        assert!(!unreserved.owns_replay_domain(), "no outgoing reservation");
+
+        let mut reserved = unreserved;
+        reserved.global_counter_limit = 0x400;
+        reserved.network_key = [0; 16];
+        assert!(reserved.owns_replay_domain());
+    }
+
+    #[test]
+    fn a_zero_network_key_reservation_owns_a_replay_domain_ram() {
+        a_zero_network_key_reservation_owns_a_replay_domain(&mut RamSecurityStateStore::new());
+    }
+
+    #[test]
+    fn a_zero_network_key_reservation_owns_a_replay_domain_journal() {
+        use crate::security_journal::tests::MockFlash;
+        use crate::security_journal::{SECURITY_JOURNAL_SECTOR_SIZE, SecurityStateJournal};
+
+        let mut journal = SecurityStateJournal::<_, SECURITY_JOURNAL_SECTOR_SIZE>::new(
+            MockFlash::new(),
+            0,
+            SECURITY_JOURNAL_SECTOR_SIZE as u32,
+        );
+        a_zero_network_key_reservation_owns_a_replay_domain(&mut journal);
+    }
+
+    #[test]
+    fn a_different_network_key_ends_the_provisional_epoch() {
+        let mut store = RamSecurityStateStore::new();
+        CommissioningSecurityPersistence::new(&mut store)
+            .unwrap()
+            .reserve_network_security(&network_state(0))
+            .unwrap();
+        store.commit_replay_counter(nwk_floor(7)).unwrap();
+
+        let mut same_key = network_state(0);
+        same_key.short_address = 0x4321;
+        CommissioningSecurityPersistence::new(&mut store)
+            .unwrap()
+            .reserve_network_security(&same_key)
+            .unwrap();
+        assert_eq!(floors(&mut store).as_slice(), &[nwk_floor(7)]);
+
+        let mut rekeyed = network_state(0);
+        rekeyed.network_key = [9; 16];
+        CommissioningSecurityPersistence::new(&mut store)
+            .unwrap()
+            .reserve_network_security(&rekeyed)
+            .unwrap();
+        assert!(floors(&mut store).is_empty());
     }
 }

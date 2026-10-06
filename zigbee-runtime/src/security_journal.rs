@@ -861,10 +861,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
 
         let mut replay = heapless::Vec::new();
         if let Some(located) = current
-            && located.state.commissioned
-            && state.commissioned
-            && located.state.extended_pan_id == state.extended_pan_id
-            && located.state.ieee_address == state.ieee_address
+            && located.state.replay_domain_continues_into(state)
         {
             self.ensure_replay_cache(&located)?;
             replay = self.cached_replay.clone();
@@ -899,7 +896,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
         let Some(located) = self.current()? else {
             return Err(SecurityStoreError::NotFound);
         };
-        if !located.state.commissioned {
+        if !located.state.owns_replay_domain() {
             return Err(SecurityStoreError::Corrupt);
         }
         self.ensure_replay_cache(&located)?;
@@ -1017,17 +1014,17 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use embedded_storage::nor_flash::{ErrorType, NorFlashErrorKind, ReadNorFlash};
 
-    struct MockFlash {
+    pub(crate) struct MockFlash {
         data: [u8; SECURITY_JOURNAL_SECTOR_SIZE * 2],
         programs_before_failure: Option<usize>,
     }
 
     impl MockFlash {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 data: [0xFF; SECURITY_JOURNAL_SECTOR_SIZE * 2],
                 programs_before_failure: None,
@@ -1995,6 +1992,156 @@ mod tests {
             .visit_replay_counters(&mut |_| count = count.saturating_add(1))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// The record `reserve_network_security` leaves while the Trust Center
+    /// handshake is still in progress.
+    fn provisional_state() -> PersistentSecurityState {
+        let mut state = commissioned_state();
+        state.commissioned = false;
+        state.tclk_present = false;
+        state.trust_center_link_key = [0; 16];
+        state
+    }
+
+    fn replay_entries(
+        journal: &mut SecurityStateJournal<MockFlash, SECURITY_JOURNAL_SECTOR_SIZE>,
+    ) -> heapless::Vec<PersistentReplayCounter, 4> {
+        let mut entries = heapless::Vec::new();
+        journal
+            .visit_replay_counters(&mut |entry| entries.push(entry).unwrap())
+            .unwrap();
+        entries
+    }
+
+    fn reopen(
+        journal: SecurityStateJournal<MockFlash, SECURITY_JOURNAL_SECTOR_SIZE>,
+    ) -> SecurityStateJournal<MockFlash, SECURITY_JOURNAL_SECTOR_SIZE> {
+        SecurityStateJournal::new(
+            journal.into_storage(),
+            0,
+            SECURITY_JOURNAL_SECTOR_SIZE as u32,
+        )
+    }
+
+    #[test]
+    fn a_provisional_record_makes_replay_floors_durable() {
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        journal.store(&provisional_state()).unwrap();
+        journal.commit_replay_counter(nwk_replay(7)).unwrap();
+
+        let mut rebooted = reopen(journal);
+        assert_eq!(rebooted.load(), Ok(Some(provisional_state())));
+        assert_eq!(replay_entries(&mut rebooted).as_slice(), &[nwk_replay(7)]);
+    }
+
+    #[test]
+    fn a_record_without_network_identity_refuses_replay_floors() {
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        assert_eq!(
+            journal.commit_replay_counter(nwk_replay(7)),
+            Err(SecurityStoreError::NotFound)
+        );
+        // Factory reset keeps only the outgoing counter bounds.
+        journal.store(&state(0x400)).unwrap();
+        assert_eq!(
+            journal.commit_replay_counter(nwk_replay(7)),
+            Err(SecurityStoreError::Corrupt)
+        );
+        assert!(replay_entries(&mut journal).is_empty());
+    }
+
+    #[test]
+    fn provisional_floors_carry_into_the_commissioned_record() {
+        let tclk_floor = aps_global_replay([4; 8], key_fingerprint(&[9; 16]), 11);
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        journal.store(&provisional_state()).unwrap();
+        journal.commit_replay_counter(nwk_replay(7)).unwrap();
+        let mut tclk_reserved = provisional_state();
+        tclk_reserved.tclk_present = true;
+        tclk_reserved.trust_center_link_key = [5; 16];
+        journal.store(&tclk_reserved).unwrap();
+        journal.commit_replay_counter(tclk_floor).unwrap();
+        journal.commit_replay_counter(nwk_replay(9)).unwrap();
+        journal.store(&commissioned_state()).unwrap();
+
+        let mut rebooted = reopen(journal);
+        assert_eq!(rebooted.load(), Ok(Some(commissioned_state())));
+        let entries = replay_entries(&mut rebooted);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&nwk_replay(9)));
+        assert!(entries.contains(&tclk_floor));
+    }
+
+    #[test]
+    fn a_new_security_epoch_discards_provisional_floors() {
+        let mut other_key = provisional_state();
+        other_key.network_key = [6; 16];
+        let mut other_network = provisional_state();
+        other_network.extended_pan_id = [8; 8];
+        let mut other_key_commissioned = commissioned_state();
+        other_key_commissioned.network_key = [6; 16];
+        for next in [
+            other_key,
+            other_network,
+            other_key_commissioned,
+            state(0x800),
+        ] {
+            let mut journal =
+                SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+            journal.store(&provisional_state()).unwrap();
+            journal.commit_replay_counter(nwk_replay(7)).unwrap();
+            journal.store(&next).unwrap();
+            assert!(replay_entries(&mut journal).is_empty());
+        }
+
+        // A fresh reservation over a committed network keeps starting a new
+        // epoch, exactly as before provisional floors existed.
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        journal.store(&commissioned_state()).unwrap();
+        journal.commit_replay_counter(nwk_replay(7)).unwrap();
+        journal.store(&provisional_state()).unwrap();
+        assert!(replay_entries(&mut journal).is_empty());
+    }
+
+    /// Power loss at every program step of the commissioning commit leaves
+    /// either the provisional or the commissioned record, each with the
+    /// provisional floor, and never a hybrid of the two.
+    #[test]
+    fn a_torn_commissioning_commit_keeps_the_provisional_floors() {
+        let mut committed = false;
+        for programs in 0..16 {
+            let mut journal =
+                SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+            journal.store(&provisional_state()).unwrap();
+            journal.commit_replay_counter(nwk_replay(7)).unwrap();
+
+            journal.storage_mut().programs_before_failure = Some(programs);
+            let result = journal.store(&commissioned_state());
+            journal.storage_mut().programs_before_failure = None;
+
+            let mut rebooted = reopen(journal);
+            let loaded = rebooted.load().unwrap().expect("a record survives");
+            if result.is_ok() {
+                committed = true;
+                assert_eq!(loaded, commissioned_state());
+            } else {
+                assert!(
+                    loaded == provisional_state() || loaded == commissioned_state(),
+                    "torn at program {programs}: {loaded:?}"
+                );
+            }
+            assert_eq!(
+                replay_entries(&mut rebooted).as_slice(),
+                &[nwk_replay(7)],
+                "torn at program {programs}"
+            );
+        }
+        assert!(committed, "the commit itself must eventually succeed");
     }
 
     #[test]
