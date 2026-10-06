@@ -3139,6 +3139,245 @@ mod resume_tests {
         );
     }
 
+    // ── R22 §3.6.2.2: NWK security is mandatory once joined ──────────
+    //
+    // A joined and authenticated device on a network with a non-zero
+    // nwkSecurityLevel discards every NWK data frame whose security
+    // sub-field is clear. APS security does not substitute for it.
+
+    fn persisted_replay_count(store: &mut RamSecurityStateStore) -> usize {
+        let mut count = 0;
+        store
+            .visit_replay_counters(&mut |_| count += 1)
+            .expect("RAM store visits");
+        count
+    }
+
+    #[test]
+    fn unsecured_nwk_bind_req_never_reaches_zdo_on_a_secured_network() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        assert!(device.bdb().zdo().nwk().nib().security_enabled);
+        assert!(device.bdb().zdo().nwk().security().active_key().is_some());
+        let (aps_payload, aps_len) = bind_req_aps_payload();
+
+        for destination in [ShortAddress(OUR_SHORT), ShortAddress::BROADCAST] {
+            let forged = nwk_frame(
+                zigbee_nwk::frames::NwkFrameType::Data,
+                destination,
+                &aps_payload[..aps_len],
+                1,
+                false,
+            );
+            assert!(block_on(device.process_incoming(&indication(forged), &mut [])).is_none());
+            assert!(
+                device.bdb().zdo().aps().binding_table().is_empty(),
+                "an unauthenticated Bind_req to 0x{:04X} must not create a binding",
+                destination.0
+            );
+            assert!(
+                device.mac().tx_history().is_empty(),
+                "an unauthenticated Bind_req must not be answered or acknowledged"
+            );
+        }
+
+        // The identical request protected with the network key is honoured,
+        // so the drop above is about provenance, not about the payload.
+        let genuine = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &aps_payload[..aps_len],
+            1,
+            true,
+        );
+        let _ = block_on(device.process_incoming(&indication(genuine), &mut []));
+        assert_eq!(device.bdb().zdo().aps().binding_table().len(), 1);
+    }
+
+    #[test]
+    fn durable_receive_drops_unsecured_nwk_bind_req_before_any_state_change() {
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+        let state_before = store.load().unwrap();
+        let replay_before = persisted_replay_count(&mut store);
+
+        let (aps_payload, aps_len) = bind_req_aps_payload();
+        let forged = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &aps_payload[..aps_len],
+            1,
+            false,
+        );
+        assert!(matches!(
+            block_on(device.process_incoming_with_security_store(
+                &indication(forged),
+                &mut [],
+                &mut store
+            )),
+            Ok(None)
+        ));
+        assert!(device.bdb().zdo().aps().binding_table().is_empty());
+        assert!(!device.binding_persistence_pending());
+        assert!(device.mac().tx_history().is_empty());
+        assert_eq!(store.load().unwrap(), state_before);
+        assert_eq!(persisted_replay_count(&mut store), replay_before);
+    }
+
+    #[test]
+    fn unsecured_nwk_zcl_command_never_reaches_a_cluster_on_a_secured_network() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .endpoint(
+                1,
+                0x0104,
+                zigbee_zcl::DeviceId::MAINS_POWER_OUTLET,
+                |endpoint| endpoint.cluster_server(zigbee_zcl::ClusterId::ON_OFF),
+            )
+            .build();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+
+        let mut on_off = zigbee_zcl::clusters::on_off::OnOffCluster::new();
+        assert!(!on_off.is_on());
+        let request = zigbee_zcl::frame::ZclFrame::new_cluster_specific(
+            0x52,
+            zigbee_zcl::clusters::on_off::CMD_ON,
+            zigbee_zcl::ClusterDirection::ClientToServer,
+            false,
+        );
+        let mut zcl = [0u8; 16];
+        let zcl_len = request.serialize(&mut zcl).unwrap();
+        let aps = aps_unicast_payload(
+            1,
+            1,
+            zigbee_zcl::ClusterId::ON_OFF.0,
+            0x0104,
+            0x21,
+            &zcl[..zcl_len],
+        );
+
+        let forged = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            aps.as_slice(),
+            1,
+            false,
+        );
+        {
+            let mut clusters = [super::ClusterRef {
+                endpoint: 1,
+                cluster: &mut on_off,
+            }];
+            assert!(
+                block_on(device.process_incoming(&indication(forged), &mut clusters)).is_none()
+            );
+        }
+        assert!(
+            !on_off.is_on(),
+            "an unauthenticated On command must not switch the actuator"
+        );
+        assert!(device.mac().tx_history().is_empty());
+
+        let genuine = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            aps.as_slice(),
+            1,
+            true,
+        );
+        {
+            let mut clusters = [super::ClusterRef {
+                endpoint: 1,
+                cluster: &mut on_off,
+            }];
+            let _ = block_on(device.process_incoming(&indication(genuine), &mut clusters));
+        }
+        assert!(on_off.is_on(), "the NWK-secured On command is honoured");
+    }
+
+    #[test]
+    fn aps_security_does_not_substitute_for_nwk_security_once_joined() {
+        // A Trust Center Transport-Key protected only by the APS key-transport
+        // key is the frame a *rejoining* device waits for. Once joined and
+        // authenticated, an NWK-unsecured copy must not reach APS at all
+        // (R22 §3.6.2.2, §4.6.3.3.4): it must neither install a key nor
+        // advance a durable APS replay floor.
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+        let state_before = store.load().unwrap();
+        let mut replay_before = heapless::Vec::<_, 16>::new();
+        store
+            .visit_replay_counters(&mut |replay| {
+                let _ = replay_before.push(replay);
+            })
+            .unwrap();
+
+        let frame = trust_center_rejoin_transport_key(ShortAddress(OUR_SHORT), [0x9A; 16], 5);
+        assert!(matches!(
+            block_on(device.process_incoming_with_security_store(
+                &indication(frame),
+                &mut [],
+                &mut store
+            )),
+            Ok(None)
+        ));
+
+        let security = device.bdb().zdo().nwk().security();
+        let active = security.active_key().expect("network key stays active");
+        assert_eq!((active.seq_number, active.key), (KEY_SEQUENCE, NETWORK_KEY));
+        assert!(security.key_by_seq(5).is_none());
+        assert!(device.mac().tx_history().is_empty());
+        assert_eq!(store.load().unwrap(), state_before);
+        let mut replay_after = heapless::Vec::<_, 16>::new();
+        store
+            .visit_replay_counters(&mut |replay| {
+                let _ = replay_after.push(replay);
+            })
+            .unwrap();
+        assert_eq!(replay_after, replay_before, "no replay floor may move");
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn router_does_not_relay_an_unsecured_nwk_unicast() {
+        let mut device = resumed_router();
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .update_neighbor_address(NEIGHBOUR, [9u8; 8]);
+        let forged = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            NEIGHBOUR,
+            &[0xAA, 0xBB],
+            11,
+            false,
+        );
+        assert!(block_on(device.process_incoming(&indication(forged), &mut [])).is_none());
+        assert!(
+            device.mac().tx_history().is_empty(),
+            "an unsecured unicast must not be relayed and re-secured with our key"
+        );
+
+        // The same frame protected with the network key is still relayed.
+        let genuine = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            NEIGHBOUR,
+            &[0xAA, 0xBB],
+            11,
+            true,
+        );
+        assert!(block_on(device.process_incoming(&indication(genuine), &mut [])).is_none());
+        assert_eq!(device.mac().tx_history().len(), 1);
+    }
+
     /// Build the NWK frame a coordinator would put on air, secured with the
     /// restored network key exactly like `nlde_data_request` does.
     fn nwk_frame(
@@ -3599,7 +3838,6 @@ mod resume_tests {
         indication
     }
 
-    #[cfg(feature = "router")]
     fn aps_unicast_payload(
         dst_endpoint: u8,
         src_endpoint: u8,
