@@ -262,6 +262,18 @@ pub const ZDP_SOURCE_ROUTE_RESERVE: usize = 2 + 2 * zigbee_nwk::routing::MAX_SOU
 
 const _: () = assert!(ZDP_MAX_PAYLOAD == 82);
 
+/// Largest ZDP ASDU (transaction sequence number included) any single
+/// unfragmented frame this stack can receive may carry: an unsecured NWK
+/// frame (`nwkSecurityLevel = 0` networks are supported) has no auxiliary
+/// header or MIC, so `127 - 11 - 8 - 8 = 100`. Every secured frame, and every
+/// response this node transmits ([`ZDP_MAX_PAYLOAD`]), is smaller.
+pub const ZDP_MAX_RX_PAYLOAD: usize = PHY_MAX_PACKET_SIZE
+    - MAC_SHORT_DATA_OVERHEAD
+    - NWK_DATA_HEADER_LEN
+    - APS_UNICAST_DATA_HEADER_LEN;
+
+const _: () = assert!(ZDP_MAX_RX_PAYLOAD == 100);
+
 /// Zigbee Device Object layer, generic over the MAC driver.
 ///
 /// Owns the APS layer and all ZDO-local state (descriptors, endpoint

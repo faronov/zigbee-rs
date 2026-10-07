@@ -673,27 +673,32 @@ impl<M: MacDriver> ZdoLayer<M> {
     }
 
     /// Append `NumAssocDev | StartIndex | NWKAddrAssocDevList` (children of
-    /// this router, as many as fit `rsp`) to an Extended address response.
+    /// this router from `start_index`, as many as fit `rsp`) to an Extended
+    /// address response. NumAssocDev counts the entries in this frame's list
+    /// (R22 2.4.3.1.1), not every child.
     #[cfg(feature = "router")]
     fn write_associated_devices(&self, start_index: u8, rsp: &mut [u8]) -> usize {
-        let mut off = NwkAddrRsp::MIN_SIZE + 2;
-        let mut total = 0u8;
-        for child in self
+        let mut children = self
             .nwk()
             .neighbor_table()
             .iter()
             .filter(|entry| entry.relationship == zigbee_nwk::neighbor::Relationship::Child)
-        {
-            if total >= start_index && rsp.len() - off >= 2 {
-                rsp[off..off + 2].copy_from_slice(&child.network_address.0.to_le_bytes());
-                off += 2;
-            }
-            total = total.saturating_add(1);
-        }
-        rsp[NwkAddrRsp::MIN_SIZE] = total;
-        if total == 0 {
+            .peekable();
+        if children.peek().is_none() {
+            rsp[NwkAddrRsp::MIN_SIZE] = 0;
             return NwkAddrRsp::MIN_SIZE + 1;
         }
+        let mut off = NwkAddrRsp::MIN_SIZE + 2;
+        let mut listed = 0u8;
+        for child in children.skip(usize::from(start_index)) {
+            if rsp.len() - off < 2 {
+                break;
+            }
+            rsp[off..off + 2].copy_from_slice(&child.network_address.0.to_le_bytes());
+            off += 2;
+            listed += 1;
+        }
+        rsp[NwkAddrRsp::MIN_SIZE] = listed;
         rsp[NwkAddrRsp::MIN_SIZE + 1] = start_index;
         off
     }
@@ -2740,6 +2745,113 @@ mod tests {
         assert_eq!(body[12], 0);
     }
 
+    /// PROTO-01: every address response this node emits must be accepted by
+    /// its own parser (R22 Table 2-92). The Extended/no-devices form is 12
+    /// octets: `NumAssocDev = 0` without `StartIndex`.
+    #[test]
+    fn extended_address_responses_round_trip_through_the_parser() {
+        let mut zdo = test_zdo();
+        let short = LOCAL_SHORT.0.to_le_bytes();
+        let req = [0x7D, short[0], short[1], 0x01, 0];
+        block_on(zdo.handle_indication(&unicast(crate::IEEE_ADDR_REQ, &req))).unwrap();
+        let (_, body) = last_zdp_tx(&zdo).unwrap();
+        assert_eq!(body.len(), 1 + NwkAddrRsp::MIN_SIZE + 1);
+        let rsp = crate::discovery::IeeeAddrRsp::parse(&body[1..])
+            .expect("our own Extended response must parse");
+        assert_eq!(rsp.status, ZdpStatus::Success);
+        assert_eq!(rsp.nwk_addr, LOCAL_SHORT);
+        assert_eq!(rsp.num_assoc_dev, 0);
+        assert!(rsp.assoc_dev_list.is_empty());
+    }
+
+    /// R22 §2.4.3.1.1: NumAssocDev is "the number of entries in the
+    /// NWKAddrAssocDevList field" of this frame, not the router's total child
+    /// count — otherwise a StartIndex > 0 fragment is self-inconsistent.
+    #[test]
+    #[cfg(feature = "router")]
+    fn router_extended_address_response_counts_only_the_listed_entries() {
+        let mut zdo = test_zdo_for(DeviceType::Router);
+        add_confirmed_child(&mut zdo, CHILD_SHORT, CHILD_IEEE);
+        add_confirmed_child(&mut zdo, CHILD_2_SHORT, CHILD_2_IEEE);
+        let short = LOCAL_SHORT.0.to_le_bytes();
+        let children = [CHILD_SHORT, CHILD_2_SHORT];
+        for start in 0..=2u8 {
+            let req = [0x7E, short[0], short[1], 0x01, start];
+            block_on(zdo.handle_indication(&unicast(crate::IEEE_ADDR_REQ, &req))).unwrap();
+            let (_, body) = last_zdp_tx(&zdo).unwrap();
+            let listed = body.len().saturating_sub(1 + NwkAddrRsp::MIN_SIZE + 2) / 2;
+            assert_eq!(
+                body[12] as usize, listed,
+                "StartIndex={start}: NumAssocDev must equal the {listed} listed entries (frame {body:02X?})"
+            );
+            assert_eq!(body[13], start, "StartIndex echoes the requested offset");
+            let rsp = crate::discovery::IeeeAddrRsp::parse(&body[1..])
+                .expect("our own Extended response must parse");
+            assert_eq!(rsp.start_index, start);
+            assert_eq!(&rsp.assoc_dev_list[..], &children[usize::from(start)..]);
+        }
+    }
+
+    /// A concentrator reserves room for a source route, so a full child table
+    /// does not fit: NumAssocDev must advertise only the serialized entries.
+    #[test]
+    #[cfg(feature = "router")]
+    fn concentrator_extended_address_response_never_advertises_unserialized_children() {
+        let mut zdo = test_zdo_for(DeviceType::Router);
+        let children = zigbee_nwk::neighbor::MAX_NEIGHBORS as u16;
+        zdo.nwk_mut().nib_mut().max_children = children as u8;
+        for i in 0..children {
+            let mut ieee = CHILD_IEEE;
+            ieee[7] = i as u8;
+            // Restored children are already `Relationship::Child`; skipping the
+            // keepalive poll keeps the mock MAC's 16-entry history in bounds.
+            assert!(zdo.nwk_mut().restore_child(
+                ieee,
+                ShortAddress(0x5000 + i),
+                false,
+                true,
+                false,
+                8
+            ));
+        }
+        zdo.nwk_mut()
+            .start_concentrator(zigbee_nwk::routing::ConcentratorType::LowRam, 0, 0);
+        let fits = (crate::ZDP_MAX_PAYLOAD
+            - crate::ZDP_SOURCE_ROUTE_RESERVE
+            - 1
+            - NwkAddrRsp::MIN_SIZE
+            - 2)
+            / 2;
+        assert!(
+            fits < usize::from(children),
+            "the table must overflow one frame"
+        );
+
+        let short = LOCAL_SHORT.0.to_le_bytes();
+        let mut start = 0u16;
+        while start < children {
+            let req = [0x7F, short[0], short[1], 0x01, start as u8];
+            block_on(zdo.handle_indication(&unicast(crate::IEEE_ADDR_REQ, &req))).unwrap();
+            let (_, body) = last_zdp_tx(&zdo).unwrap();
+            let rsp = crate::discovery::IeeeAddrRsp::parse(&body[1..])
+                .expect("our own Extended response must parse");
+            let expected = fits.min(usize::from(children - start));
+            assert_eq!(usize::from(rsp.num_assoc_dev), expected);
+            assert_eq!(rsp.assoc_dev_list.len(), expected);
+            assert_eq!(body.len(), 1 + NwkAddrRsp::MIN_SIZE + 2 + 2 * expected);
+            assert_eq!(rsp.assoc_dev_list[0], ShortAddress(0x5000 + start));
+            start += expected as u16;
+        }
+
+        // Past the end of a non-empty table: NumAssocDev = 0, StartIndex kept.
+        let req = [0x80, short[0], short[1], 0x01, children as u8];
+        block_on(zdo.handle_indication(&unicast(crate::IEEE_ADDR_REQ, &req))).unwrap();
+        let (_, body) = last_zdp_tx(&zdo).unwrap();
+        assert_eq!(&body[12..], &[0, children as u8]);
+        let rsp = crate::discovery::IeeeAddrRsp::parse(&body[1..]).unwrap();
+        assert!(rsp.assoc_dev_list.is_empty());
+    }
+
     #[test]
     fn descriptor_requests_follow_the_live_nib_address() {
         let mut zdo = test_zdo();
@@ -2775,7 +2887,7 @@ mod tests {
         block_on(zdo.handle_indication(&unicast(crate::IEEE_ADDR_REQ, &req))).unwrap();
         let (_, body) = last_zdp_tx(&zdo).unwrap();
         assert_eq!(body[1], ZdpStatus::Success as u8);
-        assert_eq!(body[12], 2, "NumAssocDev");
+        assert_eq!(body[12], 1, "NumAssocDev counts the one listed entry");
         assert_eq!(body[13], 1, "StartIndex");
         assert_eq!(body.len(), 1 + NwkAddrRsp::MIN_SIZE + 2 + 2);
     }
