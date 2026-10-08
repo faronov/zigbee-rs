@@ -89,6 +89,23 @@ pub enum AddressConflictResolution {
     NewLocalAddress,
 }
 
+/// The state change a classified statement of identity requires.
+///
+/// Classification is pure so the receive path can decide how a frame is
+/// persisted before it is allowed to mutate anything; the mutation is applied
+/// only after the frame's durable replay floor is safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddressMutation {
+    None,
+    /// Record an address-map pairing.
+    Learn {
+        address: ShortAddress,
+        ieee: IeeeAddress,
+    },
+    /// Queue the R22 §3.6.1.9.3 Network Status broadcast for `address`.
+    Announce(ShortAddress),
+}
+
 impl<M: MacDriver> NwkLayer<M> {
     /// Whether this device detects and corrects address conflicts.
     ///
@@ -122,29 +139,43 @@ impl<M: MacDriver> NwkLayer<M> {
         address: ShortAddress,
         ieee: IeeeAddress,
     ) -> AddressCheck {
+        let (check, mutation) = self.classify_address_information(address, ieee);
+        self.apply_address_mutation(mutation);
+        check
+    }
+
+    /// Pure classification behind [`Self::note_address_information`].
+    pub(crate) fn classify_address_information(
+        &self,
+        address: ShortAddress,
+        ieee: IeeeAddress,
+    ) -> (AddressCheck, AddressMutation) {
         if !self.joined
             || !self.address_conflict_detection_enabled()
             || !is_unicast_address(address)
             || ieee == NULL_IEEE
             || ieee == BROADCAST_IEEE
         {
-            return AddressCheck::Consistent;
+            return (AddressCheck::Consistent, AddressMutation::None);
         }
 
         if address == self.nib.network_address {
             if ieee == self.nib.ieee_address {
-                return AddressCheck::Consistent;
+                return (AddressCheck::Consistent, AddressMutation::None);
             }
-            let outcome = self.detect_local_address_conflict();
-            return AddressCheck::Conflict {
-                outcome: Some(outcome),
-            };
+            let (outcome, mutation) = self.classify_local_address_conflict();
+            return (
+                AddressCheck::Conflict {
+                    outcome: Some(outcome),
+                },
+                mutation,
+            );
         }
         // Somebody else's IEEE address may not masquerade under our own IEEE
         // address either: that is the same conflict seen from the other side,
         // and the offender is the *other* short address.
         if ieee == self.nib.ieee_address {
-            return AddressCheck::Consistent;
+            return (AddressCheck::Consistent, AddressMutation::None);
         }
         #[cfg(not(feature = "router"))]
         {
@@ -153,7 +184,7 @@ impl<M: MacDriver> NwkLayer<M> {
             // duty to a router or the coordinator. It still detects and
             // resolves a conflict on its *own* address, above, which is the
             // only resolution an end device can perform.
-            AddressCheck::Consistent
+            (AddressCheck::Consistent, AddressMutation::None)
         }
 
         #[cfg(feature = "router")]
@@ -165,72 +196,92 @@ impl<M: MacDriver> NwkLayer<M> {
                     // the *next* statement of identity able to detect a conflict.
                     // It goes to the address map only: the device may be any
                     // number of hops away (R22 §3.6.1.5 vs. nwkAddressMap).
-                    self.update_address_map(address, ieee);
-                    AddressCheck::Consistent
+                    (
+                        AddressCheck::Consistent,
+                        AddressMutation::Learn { address, ieee },
+                    )
                 }
-                Some(existing) if existing == ieee => AddressCheck::Consistent,
+                Some(existing) if existing == ieee => {
+                    (AddressCheck::Consistent, AddressMutation::None)
+                }
                 Some(_) => {
                     log::warn!("[NWK] Address conflict on 0x{:04X}", address.0);
-                    AddressCheck::Conflict {
-                        outcome: self.report_foreign_address_conflict(address, ieee),
-                    }
+                    let (outcome, mutation) = self.classify_foreign_address_conflict(address, ieee);
+                    (AddressCheck::Conflict { outcome }, mutation)
                 }
             }
         }
     }
 
-    /// Inform the network of a conflict on an address that is not our own
-    /// (R22 §3.6.1.9.3), and reassign a conflicting child if we parent one.
+    /// Apply a mutation produced by address classification.
+    pub(crate) fn apply_address_mutation(&mut self, mutation: AddressMutation) {
+        match mutation {
+            AddressMutation::None => {}
+            AddressMutation::Learn { address, ieee } => self.update_address_map(address, ieee),
+            AddressMutation::Announce(address) => self.queue_address_conflict_broadcast(address),
+        }
+    }
+
+    /// Classify a conflict on an address that is not our own (R22
+    /// §3.6.1.9.3): the network must be informed, and a conflicting child we
+    /// parent must be reassigned.
     ///
     /// End devices never originate this broadcast: R22 gives the obligation to
     /// a "ZigBee coordinator or Router".
     #[cfg(feature = "router")]
-    fn report_foreign_address_conflict(
-        &mut self,
+    fn classify_foreign_address_conflict(
+        &self,
         address: ShortAddress,
         ieee: IeeeAddress,
-    ) -> Option<NwkCommandOutcome> {
+    ) -> (Option<NwkCommandOutcome>, AddressMutation) {
         if !self.can_route() {
-            return None;
+            return (None, AddressMutation::None);
         }
-        self.queue_address_conflict_broadcast(address);
 
         // R22 §3.6.1.9.3: a parent that detects a conflict with the address of
         // one of its end device children picks a new address for that child and
         // tells it with an unsolicited rejoin response. The child keeps its own
         // IEEE address, so the entry that must move is the one whose IEEE
         // address is *not* the newly observed one.
-        let child = self.neighbors.find_by_short(address).filter(|entry| {
-            entry.ieee_address != ieee
-                && entry.device_type == crate::neighbor::NeighborDeviceType::EndDevice
-                && matches!(
-                    entry.relationship,
-                    crate::neighbor::Relationship::Child
-                        | crate::neighbor::Relationship::UnauthenticatedChild
-                )
-        })?;
-        Some(NwkCommandOutcome::ChildAddressConflict {
-            child: address,
-            ieee: child.ieee_address,
-        })
+        let outcome = self
+            .neighbors
+            .find_by_short(address)
+            .filter(|entry| {
+                entry.ieee_address != ieee
+                    && entry.device_type == crate::neighbor::NeighborDeviceType::EndDevice
+                    && matches!(
+                        entry.relationship,
+                        crate::neighbor::Relationship::Child
+                            | crate::neighbor::Relationship::UnauthenticatedChild
+                    )
+            })
+            .map(|child| NwkCommandOutcome::ChildAddressConflict {
+                child: address,
+                ieee: child.ieee_address,
+            });
+        (outcome, AddressMutation::Announce(address))
     }
 
-    /// Note a conflict on this device's own address and report how it must be
-    /// resolved (R22 §3.6.1.9.3).
+    /// Classify a conflict on this device's own address and report how it must
+    /// be resolved (R22 §3.6.1.9.3).
     ///
     /// The device informs the network, naming its *previous* address, unless
     /// it learned of the conflict from a Network Status command that already
     /// carries exactly that payload — R22 only asks for the broadcast when the
     /// conflict was learned some other way. This includes an end device: it
-    /// must announce its previous short address before rejoining.
-    pub(crate) fn detect_local_address_conflict(&mut self) -> NwkCommandOutcome {
+    /// must announce its previous short address before rejoining. The
+    /// announcement is returned as a mutation for the caller to apply once the
+    /// frame that revealed the conflict is safe.
+    pub(crate) fn classify_local_address_conflict(&self) -> (NwkCommandOutcome, AddressMutation) {
         let previous = self.nib.network_address;
         log::warn!("[NWK] Local address conflict on 0x{:04X}", previous.0);
-        self.queue_address_conflict_broadcast(previous);
-        NwkCommandOutcome::AddressConflict {
-            previous,
-            resolution: self.local_conflict_resolution(),
-        }
+        (
+            NwkCommandOutcome::AddressConflict {
+                previous,
+                resolution: self.local_conflict_resolution(),
+            },
+            AddressMutation::Announce(previous),
+        )
     }
 
     /// R22 §3.6.1.9.3 resolution branch for a conflict on the local address.
@@ -257,7 +308,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// [`Self::handle_network_status_address_conflict`] — keeps that from
     /// turning into a broadcast storm. Foreign conflicts only reach this
     /// helper through the router-gated
-    /// [`Self::report_foreign_address_conflict`]; a leaf uses it solely for
+    /// [`Self::classify_foreign_address_conflict`]; a leaf uses it solely for
     /// its own mandatory announcement.
     fn queue_address_conflict_broadcast(&mut self, address: ShortAddress) {
         if !is_unicast_address(address) {

@@ -352,7 +352,7 @@ impl SecurityStateStore for CountingStore<'_> {
     fn commit_replay_counter(
         &mut self,
         replay: zigbee_runtime::security_store::PersistentReplayCounter,
-    ) -> Result<(), SecurityStoreError> {
+    ) -> Result<zigbee_runtime::security_store::ReplayCommitOutcome, SecurityStoreError> {
         self.inner.commit_replay_counter(replay)
     }
 }

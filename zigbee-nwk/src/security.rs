@@ -333,6 +333,12 @@ impl NwkSecurity {
         false
     }
 
+    /// Whether a verified frame under `seq_number` would activate a staged key.
+    #[cfg(feature = "router")]
+    pub(crate) fn received_key_would_activate(&self, seq_number: u8) -> bool {
+        self.staged_key_sequence == Some(seq_number)
+    }
+
     /// Activate only a staged, strictly newer key after receive admission,
     /// replay checking and MIC verification. A retained previous key is not
     /// an activation candidate, even if its sequence is numerically larger.

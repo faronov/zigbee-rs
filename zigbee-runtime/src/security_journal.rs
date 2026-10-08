@@ -54,9 +54,9 @@ use embedded_storage::nor_flash::NorFlash;
 
 use crate::security_store::{
     ENCODED_SECURITY_STATE_LEN, LEGACY_ENCODED_SECURITY_STATE_LEN, MAX_PERSISTENT_REPLAY_COUNTERS,
-    PersistentReplayCounter, PersistentSecurityState, ReplayCounterTombstone, SecurityStateStore,
-    SecurityStoreError, StateFormat, V2_ENCODED_SECURITY_STATE_LEN, V4_ENCODED_SECURITY_STATE_LEN,
-    V5_ENCODED_SECURITY_STATE_LEN, V6_ENCODED_SECURITY_STATE_LEN,
+    PersistentReplayCounter, PersistentSecurityState, ReplayCommitOutcome, ReplayCounterTombstone,
+    SecurityStateStore, SecurityStoreError, StateFormat, V2_ENCODED_SECURITY_STATE_LEN,
+    V4_ENCODED_SECURITY_STATE_LEN, V5_ENCODED_SECURITY_STATE_LEN, V6_ENCODED_SECURITY_STATE_LEN,
 };
 
 pub const SECURITY_JOURNAL_SECTOR_SIZE: usize = 4096;
@@ -892,7 +892,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
     fn commit_replay_counter(
         &mut self,
         replay: PersistentReplayCounter,
-    ) -> Result<(), SecurityStoreError> {
+    ) -> Result<ReplayCommitOutcome, SecurityStoreError> {
         let Some(located) = self.current()? else {
             return Err(SecurityStoreError::NotFound);
         };
@@ -900,13 +900,21 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
             return Err(SecurityStoreError::Corrupt);
         }
         self.ensure_replay_cache(&located)?;
-        if self
+        match self
             .cached_replay
             .iter()
             .find(|stored| stored.same_domain(&replay))
-            .is_some_and(|stored| stored.counter() >= replay.counter())
         {
-            return Ok(());
+            Some(stored) if stored.counter() >= replay.counter() => {
+                return Ok(ReplayCommitOutcome::AlreadyCovered);
+            }
+            Some(_) => {}
+            // Logical capacity is checked before any journal write so a
+            // refused domain can never become physically committed.
+            None if self.cached_replay.len() >= MAX_PERSISTENT_REPLAY_COUNTERS => {
+                return Ok(ReplayCommitOutcome::CapacityRefused);
+            }
+            None => {}
         }
 
         if let Some((slot, index, initialize)) =
@@ -924,7 +932,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
                 self.cached_replay.clear();
                 self.replay_generation = None;
             }
-            return result;
+            return result.map(|()| ReplayCommitOutcome::Advanced);
         }
 
         let generation = located
@@ -940,6 +948,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
             &located.state,
             &mut compacted,
         )
+        .map(|()| ReplayCommitOutcome::Advanced)
     }
 
     fn tombstone_replay_counters(
@@ -1016,14 +1025,19 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::security_store::ReplayAdmission;
     use embedded_storage::nor_flash::{ErrorType, NorFlashErrorKind, ReadNorFlash};
 
     pub(crate) struct MockFlash {
         data: [u8; SECURITY_JOURNAL_SECTOR_SIZE * 2],
-        programs_before_failure: Option<usize>,
+        pub(crate) programs_before_failure: Option<usize>,
     }
 
     impl MockFlash {
+        pub(crate) fn data(&self) -> [u8; SECURITY_JOURNAL_SECTOR_SIZE * 2] {
+            self.data
+        }
+
         pub(crate) fn new() -> Self {
             Self {
                 data: [0xFF; SECURITY_JOURNAL_SECTOR_SIZE * 2],
@@ -2182,5 +2196,201 @@ pub(crate) mod tests {
         journal.store(&state(0x800)).unwrap();
         journal.storage_mut().data[SECURITY_JOURNAL_SLOT_SIZE + 12] ^= 1;
         assert_eq!(journal.load().unwrap().unwrap().global_counter_limit, 0x400);
+    }
+
+    type ReplayFloors = heapless::Vec<PersistentReplayCounter, MAX_PERSISTENT_REPLAY_COUNTERS>;
+
+    fn distinct_source(index: usize) -> [u8; 8] {
+        let mut source = [0x70; 8];
+        source[0] = index as u8;
+        source[1] = (index >> 8) as u8;
+        source
+    }
+
+    fn live_nwk_domain(index: usize, counter: u32) -> PersistentReplayCounter {
+        nwk_replay_for(distinct_source(index), key_fingerprint(&[3; 16]), counter)
+    }
+
+    fn replay_floors(
+        journal: &mut SecurityStateJournal<MockFlash, SECURITY_JOURNAL_SECTOR_SIZE>,
+    ) -> Result<ReplayFloors, SecurityStoreError> {
+        let mut floors = ReplayFloors::new();
+        journal.visit_replay_counters(&mut |entry| floors.push(entry).unwrap())?;
+        Ok(floors)
+    }
+
+    fn fill_replay_capacity(
+        journal: &mut SecurityStateJournal<MockFlash, SECURITY_JOURNAL_SECTOR_SIZE>,
+    ) {
+        for index in 0..MAX_PERSISTENT_REPLAY_COUNTERS {
+            journal
+                .commit_replay_counter(live_nwk_domain(index, 1))
+                .unwrap();
+        }
+    }
+
+    /// SEC-01: every floor below belongs to the active network key, so none
+    /// may be reclaimed. A further domain must be refused before it reaches
+    /// flash: an entry the journal cannot load again must never be written.
+    #[test]
+    fn a_replay_domain_beyond_capacity_is_refused_without_poisoning_the_journal() {
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        journal.store(&commissioned_state()).unwrap();
+        fill_replay_capacity(&mut journal);
+        let flash_at_capacity = journal.storage_mut().data;
+
+        // Repeated refusals must not consume journal space either: capacity is
+        // checked before any program, so flash stays byte-identical.
+        for index in MAX_PERSISTENT_REPLAY_COUNTERS..MAX_PERSISTENT_REPLAY_COUNTERS + 40 {
+            assert_eq!(
+                journal.admit_replay_counter(&live_nwk_domain(index, 1), 0),
+                Ok(ReplayAdmission::CapacityRefused)
+            );
+            assert_eq!(
+                journal.commit_replay_counter(live_nwk_domain(index, 1)),
+                Ok(ReplayCommitOutcome::CapacityRefused)
+            );
+        }
+        assert!(journal.storage_mut().data == flash_at_capacity);
+        // At MAX an existing domain is still classified by its floor.
+        assert_eq!(
+            journal.admit_replay_counter(&live_nwk_domain(1, 1), 0),
+            Ok(ReplayAdmission::Replayed)
+        );
+        assert_eq!(
+            journal.admit_replay_counter(&live_nwk_domain(1, 2), 0),
+            Ok(ReplayAdmission::Fresh { new_domain: false })
+        );
+        assert_eq!(
+            journal.commit_replay_counter(live_nwk_domain(1, 1)),
+            Ok(ReplayCommitOutcome::AlreadyCovered)
+        );
+        assert!(journal.storage_mut().data == flash_at_capacity);
+
+        let mut rebooted = reopen(journal);
+        assert_eq!(rebooted.load(), Ok(Some(commissioned_state())));
+        let floors = replay_floors(&mut rebooted)
+            .expect("a refused domain must not make the journal unloadable");
+        assert_eq!(floors.len(), MAX_PERSISTENT_REPLAY_COUNTERS);
+        for index in 0..MAX_PERSISTENT_REPLAY_COUNTERS {
+            assert!(floors.contains(&live_nwk_domain(index, 1)));
+        }
+        // Existing domains keep advancing and the state stays storable.
+        assert_eq!(
+            rebooted.commit_replay_counter(live_nwk_domain(0, 2)),
+            Ok(ReplayCommitOutcome::Advanced)
+        );
+        assert_eq!(rebooted.store(&commissioned_state()), Ok(()));
+        assert_eq!(
+            rebooted.commit_replay_counter(live_nwk_domain(MAX_PERSISTENT_REPLAY_COUNTERS, 1)),
+            Ok(ReplayCommitOutcome::CapacityRefused)
+        );
+        let floors = replay_floors(&mut reopen(rebooted)).unwrap();
+        assert_eq!(floors.len(), MAX_PERSISTENT_REPLAY_COUNTERS);
+        assert!(floors.contains(&live_nwk_domain(0, 2)));
+    }
+
+    /// Factory reset and a new security epoch are the transitions that prove
+    /// every floor dead; they must discard a full replay set.
+    #[test]
+    fn factory_reset_and_a_new_epoch_discard_a_full_replay_set() {
+        let mut other_network = commissioned_state();
+        other_network.extended_pan_id = [9; 8];
+        let mut other_epoch = provisional_state();
+        other_epoch.network_key = [8; 16];
+        for next in [state(0x800), other_network, other_epoch] {
+            let mut journal =
+                SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+            journal.store(&commissioned_state()).unwrap();
+            fill_replay_capacity(&mut journal);
+
+            assert_eq!(journal.store(&next), Ok(()));
+            let mut rebooted = reopen(journal);
+            assert_eq!(rebooted.load(), Ok(Some(next)));
+            assert_eq!(replay_floors(&mut rebooted), Ok(ReplayFloors::new()));
+            if next.owns_replay_domain() {
+                rebooted
+                    .commit_replay_counter(live_nwk_domain(0, 1))
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Power loss at every program step of a reclamation (append and
+    /// rollover) keeps every surviving floor and removes dead floors only
+    /// atomically with the generation that proves them dead.
+    #[test]
+    fn every_reclamation_cut_point_preserves_the_surviving_floors() {
+        let dead_fingerprint = key_fingerprint(&[0xDD; 16]);
+        let dead =
+            |index: usize| nwk_replay_for(distinct_source(0x100 + index), dead_fingerprint, 9);
+        let survivors: [PersistentReplayCounter; 6] =
+            core::array::from_fn(|index| live_nwk_domain(index, 40 + index as u32));
+        for reclaim_by_tombstone in [false, true] {
+            for prefill in 0..SECURITY_JOURNAL_SLOTS_PER_SECTOR {
+                for cut in 0.. {
+                    let mut journal = SecurityStateJournal::new(
+                        MockFlash::new(),
+                        0,
+                        SECURITY_JOURNAL_SECTOR_SIZE as u32,
+                    );
+                    journal.store(&commissioned_state()).unwrap();
+                    for survivor in survivors {
+                        journal.commit_replay_counter(survivor).unwrap();
+                    }
+                    for index in 0..3 {
+                        journal.commit_replay_counter(dead(index)).unwrap();
+                    }
+                    // Push the reclamation onto later slots and, for large
+                    // prefills, into a sector rollover.
+                    for _ in 0..prefill {
+                        if journal.store(&commissioned_state()).is_err() {
+                            break;
+                        }
+                    }
+
+                    journal.storage_mut().programs_before_failure = Some(cut);
+                    let result = if reclaim_by_tombstone {
+                        journal
+                            .tombstone_replay_counters(ReplayCounterTombstone::KeyFingerprint(
+                                dead_fingerprint,
+                            ))
+                            .map(|_| ())
+                    } else {
+                        journal
+                            .retain_replay_counters(&|replay| match replay {
+                                PersistentReplayCounter::Nwk(replay) => {
+                                    replay.key_fingerprint != dead_fingerprint
+                                }
+                                PersistentReplayCounter::Aps(_) => true,
+                            })
+                            .map(|_| ())
+                    };
+                    journal.storage_mut().programs_before_failure = None;
+
+                    let mut rebooted = reopen(journal);
+                    assert_eq!(rebooted.load(), Ok(Some(commissioned_state())));
+                    let floors = replay_floors(&mut rebooted).unwrap();
+                    for survivor in survivors {
+                        assert!(
+                            floors.contains(&survivor),
+                            "cut {cut}, prefill {prefill}: a surviving floor was lowered"
+                        );
+                    }
+                    let remaining_dead = (0..3).filter(|&i| floors.contains(&dead(i))).count();
+                    assert!(
+                        remaining_dead == 0 || remaining_dead == 3,
+                        "cut {cut}, prefill {prefill}: reclamation was not atomic"
+                    );
+                    assert_eq!(floors.len(), survivors.len() + remaining_dead);
+                    if result.is_ok() {
+                        assert_eq!(remaining_dead, 0);
+                        break;
+                    }
+                    assert!(cut < 64, "reclamation never completed");
+                }
+            }
+        }
     }
 }

@@ -1809,7 +1809,7 @@ mod commissioning_tick_tests {
         fn commit_replay_counter(
             &mut self,
             _replay: crate::security_store::PersistentReplayCounter,
-        ) -> Result<(), crate::SecurityStoreError> {
+        ) -> Result<zigbee_types::ReplayCommitOutcome, crate::SecurityStoreError> {
             Err(crate::SecurityStoreError::Hardware)
         }
 
@@ -2204,7 +2204,7 @@ mod commissioning_tick_tests {
         fn commit_replay_counter(
             &mut self,
             replay: crate::security_store::PersistentReplayCounter,
-        ) -> Result<(), crate::SecurityStoreError> {
+        ) -> Result<zigbee_types::ReplayCommitOutcome, crate::SecurityStoreError> {
             if self.powered_off() {
                 return Err(crate::SecurityStoreError::Hardware);
             }

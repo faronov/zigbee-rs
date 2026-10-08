@@ -154,7 +154,9 @@ where
     pub async fn complete_application_key_persistence(&mut self) -> Result<(), NodeError> {
         if let Some(replay) = self.device.pending_application_key_replay() {
             self.security_store
-                .commit_replay_counter(crate::security_store::PersistentReplayCounter::Aps(replay))
+                .complete_replay_counter(crate::security_store::PersistentReplayCounter::Aps(
+                    replay,
+                ))
                 .map_err(NodeError::Persistence)?;
         }
         self.device.complete_application_key_persistence().await;
@@ -177,7 +179,7 @@ where
         {
             if let Some(replay) = self.device.pending_security_indication_replay() {
                 self.security_store
-                    .commit_replay_counter(crate::security_store::PersistentReplayCounter::Aps(
+                    .complete_replay_counter(crate::security_store::PersistentReplayCounter::Aps(
                         replay,
                     ))
                     .map_err(NodeError::Persistence)?;
@@ -197,7 +199,9 @@ where
                 return Ok(());
             }
             self.security_store
-                .commit_replay_counter(crate::security_store::PersistentReplayCounter::Nwk(replay))
+                .complete_replay_counter(crate::security_store::PersistentReplayCounter::Nwk(
+                    replay,
+                ))
                 .map_err(NodeError::Persistence)?;
             self.device
                 .bdb_mut()

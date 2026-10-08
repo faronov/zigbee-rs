@@ -574,6 +574,9 @@ pub struct ApsLayer<M: MacDriver> {
     pending_application_key_replay: Option<security::ApsReplayCounter>,
     /// Verified data-frame replay floor held for an upper-layer durable mutation.
     pending_data_replay: Option<security::ApsReplayCounter>,
+    /// The held replay floor (at most one is outstanding) was admitted into a
+    /// new durable replay domain and so reserves one unit of its capacity.
+    pending_replay_new_domain: bool,
     /// APS duplicate rejection table
     dup_table: [ApsDuplicateEntry; APS_DUP_TABLE_SIZE],
     /// Reception state to undo if the current frame's durable commit aborts.
@@ -625,6 +628,7 @@ impl<M: MacDriver> ApsLayer<M> {
             pending_application_key_persistence: false,
             pending_application_key_replay: None,
             pending_data_replay: None,
+            pending_replay_new_domain: false,
             dup_table: [ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE],
             pending_rx_rollback: None,
             #[cfg(feature = "fragmentation")]
@@ -672,6 +676,7 @@ impl<M: MacDriver> ApsLayer<M> {
             core::ptr::addr_of_mut!((*slot).pending_application_key_persistence).write(false);
             core::ptr::addr_of_mut!((*slot).pending_application_key_replay).write(None);
             core::ptr::addr_of_mut!((*slot).pending_data_replay).write(None);
+            core::ptr::addr_of_mut!((*slot).pending_replay_new_domain).write(false);
             core::ptr::addr_of_mut!((*slot).dup_table)
                 .write([ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE]);
             core::ptr::addr_of_mut!((*slot).pending_rx_rollback).write(None);
@@ -792,6 +797,22 @@ impl<M: MacDriver> ApsLayer<M> {
 
     pub const fn pending_data_replay(&self) -> Option<security::ApsReplayCounter> {
         self.pending_data_replay
+    }
+
+    /// New durable replay domains reserved by the held APS replay floor.
+    ///
+    /// The reservation is owned by the pending slot: completing, aborting or
+    /// disabling it releases the reservation with it.
+    pub const fn pending_replay_reservations(&self) -> usize {
+        #[cfg(feature = "router")]
+        let security_indication = self.pending_security_indication_replay.is_some();
+        #[cfg(not(feature = "router"))]
+        let security_indication = false;
+        let held = self.pending_data_replay.is_some()
+            || self.pending_application_key_replay.is_some()
+            || self.pending_network_key_replay.is_some()
+            || security_indication;
+        (held && self.pending_replay_new_domain) as usize
     }
 
     /// Apply the live floor only after the caller has committed the data-frame

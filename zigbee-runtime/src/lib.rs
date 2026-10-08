@@ -913,7 +913,7 @@ mod resume_tests {
         fn commit_replay_counter(
             &mut self,
             replay: PersistentReplayCounter,
-        ) -> Result<(), SecurityStoreError> {
+        ) -> Result<zigbee_types::ReplayCommitOutcome, SecurityStoreError> {
             self.replay_calls = self.replay_calls.saturating_add(1);
             if self.fail_replay {
                 Err(SecurityStoreError::Hardware)
@@ -5161,6 +5161,989 @@ mod resume_tests {
 
         assert!(block_on(device.process_incoming(&indication(frame), &mut [])).is_none());
         assert!(device.is_joined());
+    }
+
+    #[cfg(feature = "router")]
+    type Sec01Journal = crate::security_journal::SecurityStateJournal<
+        crate::security_journal::tests::MockFlash,
+        { crate::security_journal::SECURITY_JOURNAL_SECTOR_SIZE },
+    >;
+
+    #[cfg(feature = "router")]
+    fn sec01_journal(flash: crate::security_journal::tests::MockFlash) -> Sec01Journal {
+        crate::security_journal::SecurityStateJournal::new(
+            flash,
+            0,
+            crate::security_journal::SECURITY_JOURNAL_SECTOR_SIZE as u32,
+        )
+    }
+
+    #[cfg(feature = "router")]
+    fn sec01_router<S: SecurityStateStore>(
+        store: &mut S,
+    ) -> Result<ZigbeeDevice<MockMac, Router>, crate::event_loop::StartError> {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::Router)
+            .build_router();
+        block_on(device.start_or_resume_with_security_store(store))?;
+        Ok(device)
+    }
+
+    /// A secured NWK data frame from neighbour `index` under the active key.
+    #[cfg(feature = "router")]
+    fn sec01_neighbour_frame(index: usize, counter: u32) -> zigbee_mac::McpsDataIndication {
+        let ieee = [0x70, index as u8, (index >> 8) as u8, 0, 0, 0, 0, 0x70];
+        let short = ShortAddress(0x3000 + index as u16);
+        indication_from(
+            nwk_frame_from(
+                zigbee_nwk::frames::NwkFrameType::Data,
+                short,
+                ieee,
+                ShortAddress(OUR_SHORT),
+                &[0x00, 0x01, 0x02],
+                counter,
+                true,
+            ),
+            short,
+        )
+    }
+
+    #[cfg(feature = "router")]
+    fn sec01_nwk_floors_by_sequence(store: &mut Sec01Journal) -> [usize; 3] {
+        let mut floors = [0; 3];
+        store
+            .visit_replay_counters(&mut |replay| {
+                if let PersistentReplayCounter::Nwk(replay) = replay {
+                    floors[usize::from(replay.key_sequence)] += 1;
+                }
+            })
+            .unwrap();
+        floors
+    }
+
+    /// SEC-01: authenticated frames from more distinct neighbours than the
+    /// durable replay set can hold, all under the live network key. None of
+    /// those floors is reclaimable, so the surplus source must be refused;
+    /// it must never leave a journal that stops the router from resuming.
+    #[cfg(feature = "router")]
+    #[test]
+    fn replay_domains_beyond_capacity_do_not_prevent_resume() {
+        use crate::security_store::MAX_PERSISTENT_REPLAY_COUNTERS;
+
+        let mut store = sec01_journal(crate::security_journal::tests::MockFlash::new());
+        store.store(&commissioned_state()).unwrap();
+        let mut device = sec01_router(&mut store).unwrap();
+        for index in 0..MAX_PERSISTENT_REPLAY_COUNTERS {
+            block_on(device.process_incoming_with_security_store(
+                &sec01_neighbour_frame(index, 1),
+                &mut [],
+                &mut store,
+            ))
+            .unwrap();
+        }
+        let accepted = device.nwk_rx_security_stats().decrypt_successes;
+        let flash_at_capacity = store.storage().data();
+        let mut floors_at_capacity = std::vec::Vec::new();
+        store
+            .visit_replay_counters(&mut |floor| floors_at_capacity.push(floor))
+            .unwrap();
+        for index in MAX_PERSISTENT_REPLAY_COUNTERS..MAX_PERSISTENT_REPLAY_COUNTERS + 3 {
+            // MAX+1 is a non-fatal, fail-closed drop: no persistence error,
+            // no delivery and no journal program.
+            let delivered = block_on(device.process_incoming_with_security_store(
+                &sec01_neighbour_frame(index, 1),
+                &mut [],
+                &mut store,
+            ))
+            .expect("capacity refusal is not a persistence failure");
+            assert!(delivered.is_none());
+        }
+        assert_eq!(device.nwk_rx_security_stats().capacity_refusals, 3);
+        assert_eq!(device.nwk_rx_security_stats().decrypt_successes, accepted);
+        assert!(store.storage().data() == flash_at_capacity);
+        let mut floors_after = std::vec::Vec::new();
+        store
+            .visit_replay_counters(&mut |floor| floors_after.push(floor))
+            .unwrap();
+        assert_eq!(floors_after, floors_at_capacity);
+
+        let mut store = sec01_journal(store.into_storage());
+        let mut rebooted = sec01_router(&mut store)
+            .expect("a full replay set must not stop a commissioned router from resuming");
+        block_on(rebooted.tick_with_security_store(1, &mut [], &mut store)).unwrap();
+        let replay = sec01_neighbour_frame(0, 1);
+        let _ =
+            block_on(rebooted.process_incoming_with_security_store(&replay, &mut [], &mut store));
+        assert_eq!(rebooted.nwk_rx_security_stats().replay_rejections, 1);
+        assert_eq!(rebooted.nwk_rx_security_stats().decrypt_successes, 0);
+        assert_eq!(accepted, MAX_PERSISTENT_REPLAY_COUNTERS as u32);
+    }
+
+    /// The retained previous network key stays receivable after Switch-Key
+    /// and across reboot, so its floors must survive until staging the next
+    /// key reuses its slot and durably retires it.
+    #[cfg(feature = "router")]
+    #[test]
+    fn previous_network_key_floors_survive_until_its_slot_is_reused() {
+        let mut store = sec01_journal(crate::security_journal::tests::MockFlash::new());
+        store.store(&commissioned_state()).unwrap();
+        let mut device = sec01_router(&mut store).unwrap();
+        for index in 0..3 {
+            block_on(device.process_incoming_with_security_store(
+                &sec01_neighbour_frame(index, 5),
+                &mut [],
+                &mut store,
+            ))
+            .unwrap();
+        }
+        {
+            let nwk = device.bdb.zdo_mut().nwk_mut();
+            assert!(nwk.security_mut().stage_network_key([0x66; 16], 1));
+            assert!(nwk.switch_active_network_key(1));
+        }
+        block_on(device.tick_with_security_store(1, &mut [], &mut store)).unwrap();
+        assert_eq!(sec01_nwk_floors_by_sequence(&mut store), [3, 0, 0]);
+        assert!(
+            store
+                .load()
+                .unwrap()
+                .unwrap()
+                .secondary_network_key_is_previous
+        );
+
+        let mut store = sec01_journal(store.into_storage());
+        let mut device = sec01_router(&mut store).unwrap();
+        block_on(device.tick_with_security_store(1, &mut [], &mut store)).unwrap();
+        assert_eq!(sec01_nwk_floors_by_sequence(&mut store), [3, 0, 0]);
+        let _ = block_on(device.process_incoming_with_security_store(
+            &sec01_neighbour_frame(0, 5),
+            &mut [],
+            &mut store,
+        ));
+        assert_eq!(
+            device.nwk_rx_security_stats().replay_rejections,
+            1,
+            "a frame accepted under the previous key stays a replay after reboot"
+        );
+
+        // Staging the next key overwrites the previous key; once that state is
+        // durable the old key can never be installed again in this epoch.
+        assert!(
+            device
+                .bdb
+                .zdo_mut()
+                .nwk_mut()
+                .security_mut()
+                .stage_network_key([0x77; 16], 2)
+        );
+        block_on(device.tick_with_security_store(1, &mut [], &mut store)).unwrap();
+        assert_eq!(sec01_nwk_floors_by_sequence(&mut store), [0, 0, 0]);
+    }
+
+    /// KEY-03: a provisional epoch's floors stay authoritative even though a
+    /// rebooted runtime holds none of their keys. Neither a scoped sweep nor
+    /// reconciliation may treat "not live in RAM" as "dead".
+    #[cfg(feature = "router")]
+    #[test]
+    fn provisional_floors_survive_every_sweep_while_their_keys_are_not_live() {
+        use zigbee_bdb::SecurityPersistence;
+
+        const PARTNER: [u8; 8] = [0x31; 8];
+        let mut store = sec01_journal(crate::security_journal::tests::MockFlash::new());
+        crate::security_store::CommissioningSecurityPersistence::new(&mut store)
+            .unwrap()
+            .reserve_network_security(&zigbee_bdb::NetworkSecurityState {
+                extended_pan_id: [1; 8],
+                pan_id: 0x1234,
+                short_address: OUR_SHORT,
+                ieee_address: IEEE_ADDRESS,
+                channel: 15,
+                depth: 1,
+                parent_address: 0,
+                update_id: 0,
+                update_id_valid: false,
+                network_key: NETWORK_KEY,
+                key_sequence: KEY_SEQUENCE,
+                outgoing_frame_counter: 0,
+                trust_center_address: PARTNER,
+                node_join_link_key_type:
+                    zigbee_bdb::NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey,
+            })
+            .unwrap();
+        let aps = |origin, key: &[u8; 16]| {
+            PersistentReplayCounter::Aps(zigbee_aps::security::ApsReplayCounter::from_verified(
+                origin, PARTNER, key, 9,
+            ))
+        };
+        let floors = [
+            PersistentReplayCounter::Nwk(zigbee_nwk::security::NwkReplayCounter::from_verified(
+                PARTNER,
+                KEY_SEQUENCE,
+                &NETWORK_KEY,
+                9,
+            )),
+            aps(
+                zigbee_aps::security::ApsKeyOrigin::KeyPair {
+                    partner: PARTNER,
+                    key_type: zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+                },
+                &[0x84; 16],
+            ),
+            aps(
+                zigbee_aps::security::ApsKeyOrigin::KeyPair {
+                    partner: PARTNER,
+                    key_type: zigbee_aps::security::ApsKeyType::ApplicationLinkKey,
+                },
+                &[0x85; 16],
+            ),
+            aps(
+                zigbee_aps::security::ApsKeyOrigin::DistributedGlobal,
+                &[0x86; 16],
+            ),
+        ];
+        for floor in floors {
+            store.commit_replay_counter(floor).unwrap();
+        }
+
+        // Power loss: a provisional record is never restored as a network, so
+        // the rebooted runtime holds none of the four keys.
+        let mut store = sec01_journal(store.into_storage());
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::Router)
+            .build_router();
+        assert_eq!(
+            device.tombstone_retired_network_key_replay_counters(&mut store),
+            Ok(0)
+        );
+        assert_eq!(
+            device.tombstone_retired_trust_center_link_key_replay_counters(&mut store),
+            Ok(0)
+        );
+        assert_eq!(
+            device.tombstone_retired_application_link_key_replay_counters(&mut store),
+            Ok(0)
+        );
+        assert_eq!(
+            device.tombstone_retired_global_aps_key_replay_counters(&mut store),
+            Ok(0)
+        );
+        assert_eq!(
+            device.reconcile_security_state_replay_counters(&mut store),
+            Ok(())
+        );
+        let mut retained = heapless::Vec::<PersistentReplayCounter, 4>::new();
+        store
+            .visit_replay_counters(&mut |replay| retained.push(replay).unwrap())
+            .unwrap();
+        assert_eq!(retained.len(), floors.len());
+        for floor in floors {
+            assert!(retained.contains(&floor));
+        }
+    }
+
+    /// A secured ZDO NWK_addr_req for this router from neighbour `index`,
+    /// with the APS counter derived from the NWK frame counter.
+    #[cfg(feature = "router")]
+    fn sec01_neighbour_request(index: usize, counter: u32) -> zigbee_mac::McpsDataIndication {
+        use zigbee_aps::frames::{ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader};
+        let header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Data as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ..Default::default()
+            },
+            dst_endpoint: Some(0),
+            group_address: None,
+            cluster_id: Some(0x0000),
+            profile_id: Some(0),
+            src_endpoint: Some(0),
+            aps_counter: counter as u8,
+            extended_header: None,
+        };
+        let mut aps = [0u8; 48];
+        let n = header.serialize(&mut aps);
+        aps[n] = counter as u8;
+        aps[n + 1..n + 9].copy_from_slice(&IEEE_ADDRESS);
+        let ieee = [0x70, index as u8, (index >> 8) as u8, 0, 0, 0, 0, 0x70];
+        let short = ShortAddress(0x3000 + index as u16);
+        indication_from(
+            nwk_frame_from(
+                zigbee_nwk::frames::NwkFrameType::Data,
+                short,
+                ieee,
+                ShortAddress(OUR_SHORT),
+                &aps[..n + 11],
+                counter,
+                true,
+            ),
+            short,
+        )
+    }
+
+    #[cfg(feature = "router")]
+    fn sec01_nwk_floor_of<S: SecurityStateStore>(store: &mut S, index: usize) -> Option<u32> {
+        let ieee = [0x70, index as u8, (index >> 8) as u8, 0, 0, 0, 0, 0x70];
+        let mut floor = None;
+        store
+            .visit_replay_counters(&mut |replay| {
+                if let PersistentReplayCounter::Nwk(replay) = replay
+                    && replay.source == ieee
+                {
+                    floor = Some(replay.counter);
+                }
+            })
+            .unwrap();
+        floor
+    }
+
+    /// SEC-01/N1: the durable floor of a source evicted from the live NWK
+    /// replay table must still reject that source's accepted frames, before
+    /// any upper-layer effect, while genuinely newer frames still advance it.
+    #[cfg(feature = "router")]
+    fn assert_evicted_source_replay_is_rejected<S: SecurityStateStore>(
+        store: &mut S,
+    ) -> ZigbeeDevice<MockMac, Router> {
+        const SOURCE: usize = 0;
+        const CHURN: usize = zigbee_nwk::security::MAX_FRAME_COUNTER_ENTRIES + 16;
+
+        store.store(&commissioned_state()).unwrap();
+        let mut device = sec01_router(store).unwrap();
+        let accepted = sec01_neighbour_request(SOURCE, 5);
+        block_on(device.process_incoming_with_security_store(&accepted, &mut [], store)).unwrap();
+        assert_eq!(
+            device.zdo_diagnostics().indications,
+            1,
+            "positive control: an admitted request reaches ZDO"
+        );
+        assert_eq!(sec01_nwk_floor_of(store, SOURCE), Some(5));
+        for index in 1..=CHURN {
+            block_on(device.process_incoming_with_security_store(
+                &sec01_neighbour_frame(index, 1),
+                &mut [],
+                store,
+            ))
+            .unwrap();
+        }
+        assert!(
+            device
+                .bdb
+                .zdo()
+                .nwk()
+                .security()
+                .check_frame_counter_for_key(
+                    &[0x70, SOURCE as u8, 0, 0, 0, 0, 0, 0x70],
+                    KEY_SEQUENCE,
+                    5
+                ),
+            "precondition: the source has been evicted from the live table"
+        );
+
+        // Outlive APS duplicate rejection: only the replay floor may refuse.
+        {
+            use zigbee_mac::PlatformServices;
+            block_on(device.mac_mut().delay_micros(10_000_000));
+        }
+        device.mac_mut().clear_tx_history();
+        let stats = device.nwk_rx_security_stats();
+        let event =
+            block_on(device.process_incoming_with_security_store(&accepted, &mut [], store));
+        assert!(matches!(event, Ok(None)));
+        assert_eq!(
+            device.zdo_diagnostics().indications,
+            1,
+            "an already accepted frame must not reach ZDO again"
+        );
+        assert!(device.mac().tx_history().is_empty(), "no response or ACK");
+        assert_eq!(
+            device.nwk_rx_security_stats().decrypt_successes,
+            stats.decrypt_successes
+        );
+        assert_eq!(
+            device.nwk_rx_security_stats().replay_rejections,
+            stats.replay_rejections + 1
+        );
+        assert_eq!(sec01_nwk_floor_of(store, SOURCE), Some(5));
+
+        let newer = sec01_neighbour_request(SOURCE, 6);
+        block_on(device.process_incoming_with_security_store(&newer, &mut [], store)).unwrap();
+        assert_eq!(device.zdo_diagnostics().indications, 2);
+        assert_eq!(sec01_nwk_floor_of(store, SOURCE), Some(6));
+        device
+    }
+
+    #[cfg(feature = "router")]
+    fn assert_rebooted_router_rejects_the_old_frames<S: SecurityStateStore>(store: &mut S) {
+        let mut rebooted = sec01_router(store).unwrap();
+        block_on(rebooted.tick_with_security_store(1, &mut [], store)).unwrap();
+        rebooted.mac_mut().clear_tx_history();
+        let indications = rebooted.zdo_diagnostics().indications;
+        for counter in [5, 6] {
+            let _ = block_on(rebooted.process_incoming_with_security_store(
+                &sec01_neighbour_request(0, counter),
+                &mut [],
+                store,
+            ));
+        }
+        assert_eq!(rebooted.nwk_rx_security_stats().decrypt_successes, 0);
+        assert_eq!(rebooted.nwk_rx_security_stats().replay_rejections, 2);
+        assert_eq!(rebooted.zdo_diagnostics().indications, indications);
+        assert!(rebooted.mac().tx_history().is_empty());
+        assert_eq!(sec01_nwk_floor_of(store, 0), Some(6));
+    }
+
+    /// SEC-01/N1 after reboot: restoring more durable NWK floors than the
+    /// live table holds must not turn the evicted ones into admissions.
+    #[cfg(feature = "router")]
+    fn assert_floors_beyond_the_live_table_survive_reboot<S: SecurityStateStore>(store: &mut S) {
+        store.store(&commissioned_state()).unwrap();
+        for index in 0..=zigbee_nwk::security::MAX_FRAME_COUNTER_ENTRIES + 16 {
+            let ieee = [0x70, index as u8, (index >> 8) as u8, 0, 0, 0, 0, 0x70];
+            let counter = if index == 0 { 6 } else { 1 };
+            store
+                .commit_replay_counter(PersistentReplayCounter::Nwk(
+                    zigbee_nwk::security::NwkReplayCounter::from_verified(
+                        ieee,
+                        KEY_SEQUENCE,
+                        &NETWORK_KEY,
+                        counter,
+                    ),
+                ))
+                .unwrap();
+        }
+        assert_rebooted_router_rejects_the_old_frames(store);
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn journal_floors_beyond_the_live_table_survive_reboot() {
+        let mut store = sec01_journal(crate::security_journal::tests::MockFlash::new());
+        assert_floors_beyond_the_live_table_survive_reboot(&mut store);
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn ram_store_floors_beyond_the_live_table_survive_reboot() {
+        let mut store = RamSecurityStateStore::new();
+        assert_floors_beyond_the_live_table_survive_reboot(&mut store);
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn an_evicted_source_cannot_replay_past_its_journal_floor() {
+        let mut store = sec01_journal(crate::security_journal::tests::MockFlash::new());
+        drop(assert_evicted_source_replay_is_rejected(&mut store));
+        let mut store = sec01_journal(store.into_storage());
+        assert_rebooted_router_rejects_the_old_frames(&mut store);
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn an_evicted_source_cannot_replay_past_its_ram_store_floor() {
+        let mut store = RamSecurityStateStore::new();
+        drop(assert_evicted_source_replay_is_rejected(&mut store));
+        assert_rebooted_router_rejects_the_old_frames(&mut store);
+    }
+
+    /// A secured, unacknowledged Device_annce in which neighbour `index`
+    /// announces its own short and IEEE address.
+    #[cfg(feature = "router")]
+    fn sec01_neighbour_announcement(index: usize, counter: u32) -> zigbee_mac::McpsDataIndication {
+        let ieee = [0x70, index as u8, (index >> 8) as u8, 0, 0, 0, 0, 0x70];
+        let short = ShortAddress(0x3000 + index as u16);
+        let mut aps = [0u8; 20];
+        aps[2..4].copy_from_slice(&zigbee_zdo::DEVICE_ANNCE.to_le_bytes());
+        aps[7] = counter as u8;
+        aps[8] = counter as u8;
+        aps[9..11].copy_from_slice(&short.0.to_le_bytes());
+        aps[11..19].copy_from_slice(&ieee);
+        aps[19] = 0x8E;
+        indication_from(
+            nwk_frame_from(
+                zigbee_nwk::frames::NwkFrameType::Data,
+                short,
+                ieee,
+                ShortAddress(OUR_SHORT),
+                &aps,
+                counter,
+                true,
+            ),
+            short,
+        )
+    }
+
+    /// A secured broadcast Device_annce from neighbour 0x74 whose NWK sequence
+    /// number (the BTR identity) is `counter as u8`.
+    #[cfg(feature = "router")]
+    fn sec01_broadcast_announcement(counter: u32) -> zigbee_mac::McpsDataIndication {
+        let ieee = [0x74, 0, 0, 0, 0, 0, 0, 0x74];
+        let short = ShortAddress(0x3100);
+        let mut aps = [0u8; 20];
+        aps[0] = 0x08; // APS data, broadcast delivery
+        aps[2..4].copy_from_slice(&zigbee_zdo::DEVICE_ANNCE.to_le_bytes());
+        aps[7] = 0x10;
+        aps[8] = 0x10;
+        aps[9..11].copy_from_slice(&short.0.to_le_bytes());
+        aps[11..19].copy_from_slice(&ieee);
+        aps[19] = 0x8E;
+        indication_from(
+            nwk_frame_from(
+                zigbee_nwk::frames::NwkFrameType::Data,
+                short,
+                ieee,
+                ShortAddress(0xFFFD),
+                &aps,
+                counter,
+                true,
+            ),
+            short,
+        )
+    }
+
+    /// BTR lifetime must never substitute for the durable NWK floor: an
+    /// authenticated copy that is suppressed as a broadcast duplicate still
+    /// advances the durable floor, so after a reboot clears the BTR its frame
+    /// is rejected by replay protection alone.
+    #[cfg(feature = "router")]
+    fn assert_btr_duplicate_floor_survives_reboot<S: SecurityStateStore>(store: &mut S) {
+        let source = [0x74, 0, 0, 0, 0, 0, 0, 0x74];
+        let floor = |store: &mut S| {
+            let mut found = None;
+            store
+                .visit_replay_counters(&mut |entry| {
+                    if let PersistentReplayCounter::Nwk(entry) = entry
+                        && entry.source == source
+                    {
+                        found = Some(entry.counter);
+                    }
+                })
+                .unwrap();
+            found
+        };
+        store.store(&commissioned_state()).unwrap();
+        let mut device = sec01_router(store).unwrap();
+        let first = block_on(device.process_incoming_with_security_store(
+            &sec01_broadcast_announcement(10),
+            &mut [],
+            store,
+        ));
+        assert!(
+            matches!(
+                first,
+                Ok(Some(crate::event_loop::StackEvent::DeviceAnnounced { .. }))
+            ),
+            "positive control: {first:?}"
+        );
+        assert_eq!(floor(store), Some(10));
+        let indications = device.zdo_diagnostics().indications;
+        device.mac_mut().clear_tx_history();
+
+        // Same BTR identity (sequence 10), newer NWK security counter.
+        let copy = sec01_broadcast_announcement(266);
+        let duplicate =
+            block_on(device.process_incoming_with_security_store(&copy, &mut [], store));
+        assert!(
+            matches!(duplicate, Ok(None)),
+            "BTR duplicate: {duplicate:?}"
+        );
+        assert_eq!(device.zdo_diagnostics().indications, indications);
+        assert!(device.mac().tx_history().is_empty(), "no second relay");
+        assert_eq!(floor(store), Some(266), "the durable floor advanced");
+
+        let mut rebooted = sec01_router(store).unwrap();
+        block_on(rebooted.tick_with_security_store(1, &mut [], store)).unwrap();
+        rebooted.mac_mut().clear_tx_history();
+        let indications = rebooted.zdo_diagnostics().indications;
+        let replay = block_on(rebooted.process_incoming_with_security_store(&copy, &mut [], store));
+        assert!(
+            matches!(replay, Ok(None)),
+            "replay after reboot: {replay:?}"
+        );
+        assert_eq!(rebooted.nwk_rx_security_stats().replay_rejections, 1);
+        assert_eq!(rebooted.nwk_rx_security_stats().decrypt_successes, 0);
+        assert_eq!(rebooted.zdo_diagnostics().indications, indications);
+        assert!(
+            rebooted.mac().tx_history().is_empty(),
+            "no relay, no effect"
+        );
+        assert_eq!(floor(store), Some(266));
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn btr_duplicate_floor_survives_reboot_in_the_ram_store() {
+        assert_btr_duplicate_floor_survives_reboot(&mut RamSecurityStateStore::new());
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn btr_duplicate_floor_survives_reboot_in_the_journal() {
+        assert_btr_duplicate_floor_survives_reboot(&mut sec01_journal(
+            crate::security_journal::tests::MockFlash::new(),
+        ));
+    }
+
+    /// Injects a genuine persistence failure into replay admission or commit.
+    #[cfg(feature = "router")]
+    struct ReplayFaultStore<S> {
+        inner: S,
+        fail_admit: Option<SecurityStoreError>,
+        fail_commit: Option<SecurityStoreError>,
+    }
+
+    #[cfg(feature = "router")]
+    impl<S: SecurityStateStore> SecurityStateStore for ReplayFaultStore<S> {
+        fn load(&mut self) -> Result<Option<PersistentSecurityState>, SecurityStoreError> {
+            self.inner.load()
+        }
+
+        fn store(&mut self, state: &PersistentSecurityState) -> Result<(), SecurityStoreError> {
+            self.inner.store(state)
+        }
+
+        fn visit_replay_counters(
+            &mut self,
+            visitor: &mut dyn FnMut(PersistentReplayCounter),
+        ) -> Result<(), SecurityStoreError> {
+            self.inner.visit_replay_counters(visitor)
+        }
+
+        fn admit_replay_counter(
+            &mut self,
+            replay: &PersistentReplayCounter,
+            reserved_new_domains: usize,
+        ) -> Result<crate::security_store::ReplayAdmission, SecurityStoreError> {
+            match self.fail_admit {
+                Some(error) => Err(error),
+                None => self
+                    .inner
+                    .admit_replay_counter(replay, reserved_new_domains),
+            }
+        }
+
+        fn commit_replay_counter(
+            &mut self,
+            replay: PersistentReplayCounter,
+        ) -> Result<zigbee_types::ReplayCommitOutcome, SecurityStoreError> {
+            match self.fail_commit {
+                Some(error) => Err(error),
+                None => self.inner.commit_replay_counter(replay),
+            }
+        }
+
+        fn tombstone_replay_counters(
+            &mut self,
+            tombstone: ReplayCounterTombstone,
+        ) -> Result<(), SecurityStoreError> {
+            self.inner.tombstone_replay_counters(tombstone)
+        }
+
+        fn retain_replay_counters(
+            &mut self,
+            retain: &dyn Fn(PersistentReplayCounter) -> bool,
+        ) -> Result<usize, SecurityStoreError> {
+            self.inner.retain_replay_counters(retain)
+        }
+    }
+
+    #[cfg(feature = "router")]
+    const SEC01_ANNOUNCER: [u8; 8] = [0x74, 0, 0, 0, 0, 0, 0, 0x74];
+
+    #[cfg(feature = "router")]
+    fn sec01_announcer_floor<S: SecurityStateStore>(store: &mut S) -> Option<u32> {
+        let mut found = None;
+        store
+            .visit_replay_counters(&mut |entry| {
+                if let PersistentReplayCounter::Nwk(entry) = entry
+                    && entry.source == SEC01_ANNOUNCER
+                {
+                    found = Some(entry.counter);
+                }
+            })
+            .unwrap();
+        found
+    }
+
+    /// A fresh Device_annce whose NWK floor never became durable must not
+    /// have released any announcement-derived effect.
+    #[cfg(feature = "router")]
+    fn assert_uncommitted_announcement_left_no_trace<S: SecurityStateStore>(
+        device: &ZigbeeDevice<MockMac, Router>,
+        result: &Result<Option<crate::event_loop::StackEvent>, SecurityStoreError>,
+        store: &mut S,
+    ) {
+        assert!(
+            result.is_err(),
+            "a failed floor is fatal, not Ok: {result:?}"
+        );
+        let nwk = device.bdb().zdo().nwk();
+        assert_eq!(
+            nwk.find_ieee_by_short(ShortAddress(0x3100)),
+            None,
+            "no announcement-derived address-map or neighbour entry"
+        );
+        assert_eq!(nwk.address_map().len(), 0);
+        assert_eq!(nwk.pending_replay_reservations(), 0);
+        assert!(nwk.pending_lifecycle_replay().is_none());
+        assert!(
+            device.mac().tx_history().is_empty(),
+            "no relay or acknowledgement before the floor is durable"
+        );
+        assert_eq!(device.nwk_rx_security_stats().replay_rejections, 0);
+        assert_eq!(sec01_announcer_floor(store), None);
+    }
+
+    /// After a reboot the identical secured announcement is accepted exactly
+    /// once, then rejected as a replay.
+    #[cfg(feature = "router")]
+    fn assert_announcement_is_accepted_exactly_once<S: SecurityStateStore>(
+        store: &mut S,
+        frame: &zigbee_mac::McpsDataIndication,
+        counter: u32,
+    ) {
+        let mut device = sec01_router(store).unwrap();
+        device.mac_mut().clear_tx_history();
+        let accepted = block_on(device.process_incoming_with_security_store(frame, &mut [], store));
+        assert!(
+            matches!(
+                accepted,
+                Ok(Some(crate::event_loop::StackEvent::DeviceAnnounced {
+                    address: SEC01_ANNOUNCER,
+                    short_address: ShortAddress(0x3100),
+                    ..
+                }))
+            ),
+            "accepted once after reboot: {accepted:?}"
+        );
+        assert_eq!(sec01_announcer_floor(store), Some(counter));
+        assert_eq!(
+            device
+                .bdb()
+                .zdo()
+                .nwk()
+                .find_ieee_by_short(ShortAddress(0x3100)),
+            Some(SEC01_ANNOUNCER)
+        );
+        assert_eq!(device.mac().tx_history().len(), 1, "relayed exactly once");
+        device.mac_mut().clear_tx_history();
+
+        let replay = block_on(device.process_incoming_with_security_store(frame, &mut [], store));
+        assert!(matches!(replay, Ok(None)), "replay: {replay:?}");
+        assert_eq!(device.nwk_rx_security_stats().replay_rejections, 1);
+        assert!(device.mac().tx_history().is_empty());
+
+        let mut rebooted = sec01_router(store).unwrap();
+        rebooted.mac_mut().clear_tx_history();
+        let replay = block_on(rebooted.process_incoming_with_security_store(frame, &mut [], store));
+        assert!(
+            matches!(replay, Ok(None)),
+            "replay after reboot: {replay:?}"
+        );
+        assert_eq!(rebooted.nwk_rx_security_stats().replay_rejections, 1);
+        assert!(rebooted.mac().tx_history().is_empty());
+        assert_eq!(sec01_announcer_floor(store), Some(counter));
+    }
+
+    /// Phase C review: Device_annce effects wait for the durable NWK floor.
+    #[cfg(feature = "router")]
+    #[test]
+    fn a_fresh_announcement_whose_floor_fails_releases_no_effect_in_the_ram_store() {
+        let frame = sec01_broadcast_announcement(10);
+        let mut store = ReplayFaultStore {
+            inner: RamSecurityStateStore::new(),
+            fail_admit: None,
+            fail_commit: None,
+        };
+        store.store(&commissioned_state()).unwrap();
+        let mut device = sec01_router(&mut store).unwrap();
+        device.mac_mut().clear_tx_history();
+        store.fail_commit = Some(SecurityStoreError::Hardware);
+        let result =
+            block_on(device.process_incoming_with_security_store(&frame, &mut [], &mut store));
+        assert!(matches!(result, Err(SecurityStoreError::Hardware)));
+        assert_uncommitted_announcement_left_no_trace(&device, &result, &mut store);
+        drop(device);
+
+        store.fail_commit = None;
+        assert_announcement_is_accepted_exactly_once(&mut store, &frame, 10);
+    }
+
+    /// Journal power cut at every program boundary of the announcement's
+    /// receive transaction, up to the first one that completes.
+    #[cfg(feature = "router")]
+    #[test]
+    fn a_fresh_announcement_cut_before_its_journal_floor_releases_no_effect() {
+        use crate::security_journal::tests::MockFlash;
+
+        let frame = sec01_broadcast_announcement(10);
+        for cut in 0.. {
+            assert!(cut < 64, "the receive transaction never completed");
+            let mut store = sec01_journal(MockFlash::new());
+            store.store(&commissioned_state()).unwrap();
+            let mut device = sec01_router(&mut store).unwrap();
+            device.mac_mut().clear_tx_history();
+            store.storage_mut().programs_before_failure = Some(cut);
+            let result =
+                block_on(device.process_incoming_with_security_store(&frame, &mut [], &mut store));
+            if result.is_ok() {
+                assert!(cut > 0, "the journal write was never cut");
+                assert!(matches!(
+                    result,
+                    Ok(Some(crate::event_loop::StackEvent::DeviceAnnounced { .. }))
+                ));
+                break;
+            }
+            let mut flash = store.into_storage();
+            flash.programs_before_failure = None;
+            let mut store = sec01_journal(flash);
+            assert_uncommitted_announcement_left_no_trace(&device, &result, &mut store);
+            drop(device);
+            assert_announcement_is_accepted_exactly_once(&mut store, &frame, 10);
+        }
+    }
+
+    /// The `None` replay-authority verdict always carries a captured storage
+    /// error: Hardware / Corrupt / NotFound during admission or commit of an
+    /// ordinary or a deferred frame is fatal, never a silent replay or
+    /// capacity drop, and installs no floor.
+    #[cfg(feature = "router")]
+    #[test]
+    fn replay_storage_errors_are_never_a_silent_drop() {
+        for error in [
+            SecurityStoreError::Hardware,
+            SecurityStoreError::Corrupt,
+            SecurityStoreError::NotFound,
+        ] {
+            for admission in [true, false] {
+                for announcement in [false, true] {
+                    let frame = if announcement {
+                        sec01_neighbour_announcement(0, 5)
+                    } else {
+                        sec01_neighbour_frame(0, 5)
+                    };
+                    let mut store = ReplayFaultStore {
+                        inner: RamSecurityStateStore::new(),
+                        fail_admit: None,
+                        fail_commit: None,
+                    };
+                    store.store(&commissioned_state()).unwrap();
+                    let mut device = sec01_router(&mut store).unwrap();
+                    device.mac_mut().clear_tx_history();
+                    if admission {
+                        store.fail_admit = Some(error);
+                    } else {
+                        store.fail_commit = Some(error);
+                    }
+                    let case = (error, admission, announcement);
+                    let result = block_on(device.process_incoming_with_security_store(
+                        &frame,
+                        &mut [],
+                        &mut store,
+                    ));
+                    assert!(
+                        matches!(result, Err(actual) if actual == error),
+                        "{case:?}: {result:?}"
+                    );
+                    assert_eq!(
+                        device.nwk_rx_security_stats().replay_rejections,
+                        0,
+                        "{case:?}"
+                    );
+                    assert!(device.mac().tx_history().is_empty(), "{case:?}");
+                    let nwk = device.bdb().zdo().nwk();
+                    assert_eq!(nwk.pending_replay_reservations(), 0, "{case:?}");
+                    assert_eq!(nwk.address_map().len(), 0, "{case:?}");
+                    assert_eq!(sec01_nwk_floor_of(&mut store, 0), None, "{case:?}");
+                    drop(device);
+
+                    // Storage recovers: the frame was neither a replay nor
+                    // refused, so the rebooted router accepts it once.
+                    store.fail_admit = None;
+                    store.fail_commit = None;
+                    let mut rebooted = sec01_router(&mut store).unwrap();
+                    let retry = block_on(rebooted.process_incoming_with_security_store(
+                        &frame,
+                        &mut [],
+                        &mut store,
+                    ));
+                    assert!(retry.is_ok(), "{case:?}: {retry:?}");
+                    assert_eq!(
+                        announcement,
+                        matches!(
+                            retry,
+                            Ok(Some(crate::event_loop::StackEvent::DeviceAnnounced { .. }))
+                        ),
+                        "{case:?}"
+                    );
+                    assert_eq!(sec01_nwk_floor_of(&mut store, 0), Some(5), "{case:?}");
+                }
+            }
+        }
+    }
+
+    /// SEC-01/N1 on a deferred path: a Device_annce commits its NWK floor only
+    /// after ZDO processing, so durable admission must already have refused an
+    /// evicted source's replay before ZDO or the Trust Center event.
+    #[cfg(feature = "router")]
+    fn assert_evicted_source_cannot_replay_an_announcement<S: SecurityStateStore>(store: &mut S) {
+        const CHURN: usize = zigbee_nwk::security::MAX_FRAME_COUNTER_ENTRIES + 16;
+
+        store.store(&commissioned_state()).unwrap();
+        let mut device = sec01_router(store).unwrap();
+        let announcement = sec01_neighbour_announcement(0, 5);
+        let first =
+            block_on(device.process_incoming_with_security_store(&announcement, &mut [], store));
+        assert!(
+            matches!(
+                first,
+                Ok(Some(crate::event_loop::StackEvent::DeviceAnnounced { .. }))
+            ),
+            "positive control: {first:?}"
+        );
+        assert_eq!(sec01_nwk_floor_of(store, 0), Some(5));
+        for index in 1..=CHURN {
+            block_on(device.process_incoming_with_security_store(
+                &sec01_neighbour_frame(index, 1),
+                &mut [],
+                store,
+            ))
+            .unwrap();
+        }
+        assert!(
+            device
+                .bdb
+                .zdo()
+                .nwk()
+                .security()
+                .check_frame_counter_for_key(&[0x70, 0, 0, 0, 0, 0, 0, 0x70], KEY_SEQUENCE, 5),
+            "precondition: the source has been evicted from the live table"
+        );
+        {
+            use zigbee_mac::PlatformServices;
+            block_on(device.mac_mut().delay_micros(10_000_000));
+        }
+        let indications = device.zdo_diagnostics().indications;
+        let replay =
+            block_on(device.process_incoming_with_security_store(&announcement, &mut [], store));
+        assert!(
+            matches!(replay, Ok(None)),
+            "replayed announcement: {replay:?}"
+        );
+        assert_eq!(device.zdo_diagnostics().indications, indications);
+        assert_eq!(sec01_nwk_floor_of(store, 0), Some(5));
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn an_evicted_source_cannot_replay_an_announcement_past_its_ram_store_floor() {
+        assert_evicted_source_cannot_replay_an_announcement(&mut RamSecurityStateStore::new());
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn an_evicted_source_cannot_replay_an_announcement_past_its_journal_floor() {
+        assert_evicted_source_cannot_replay_an_announcement(&mut sec01_journal(
+            crate::security_journal::tests::MockFlash::new(),
+        ));
     }
 
     #[test]
@@ -9481,10 +10464,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         self.bdb.zdo_mut().nwk_mut().set_joined(false);
         let mut replay_error = None;
         let rejoin = {
+            // Only an advanced durable floor authorizes the Rejoin Response;
+            // a covered or capacity-refused counter is dropped non-fatally.
             let mut commit_replay = |replay: zigbee_nwk::security::NwkReplayCounter| match store
                 .commit_replay_counter(PersistentReplayCounter::Nwk(replay))
             {
-                Ok(()) => true,
+                Ok(outcome) => outcome == security_store::ReplayCommitOutcome::Advanced,
                 Err(error) => {
                     replay_error = Some(error);
                     false
@@ -10332,15 +11317,39 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         self.bdb.zdo().nwk().pending_lifecycle_replay()
     }
 
-    async fn commit_pending_nwk_lifecycle_replay<F>(&mut self, commit: &mut F) -> bool
+    /// New durable replay domains reserved by every pending receive
+    /// transaction (NWK lifecycle and APS deferred floors).
+    ///
+    /// Admission of another new domain must leave room for all of them, so a
+    /// reserved transaction never meets a capacity refusal at completion.
+    pub(crate) fn outstanding_replay_reservations(&self) -> usize {
+        self.bdb.zdo().nwk().pending_replay_reservations()
+            + self.bdb.zdo().aps().pending_replay_reservations()
+    }
+
+    /// Durably commit the floor of a deferred data frame before it is
+    /// dispatched. Only an advance authorizes the frame: a covered floor
+    /// fails closed without installing the live floor, and a capacity refusal
+    /// of a reserved domain is a persistence-invariant failure.
+    async fn commit_pending_nwk_lifecycle_replay<D>(&mut self, commit: &mut D) -> bool
     where
-        F: FnMut(security_store::PersistentReplayCounter) -> bool,
+        D: security_store::DurableReplay,
     {
         let Some((replay, _)) = self.pending_nwk_lifecycle_replay() else {
             return true;
         };
-        if !commit(security_store::PersistentReplayCounter::Nwk(replay)) {
-            return false;
+        match commit.commit(security_store::PersistentReplayCounter::Nwk(replay)) {
+            Some(security_store::ReplayCommitOutcome::Advanced) => {}
+            Some(security_store::ReplayCommitOutcome::AlreadyCovered) => {
+                log::warn!("[Runtime] Deferred NWK replay floor already covered; dropping");
+                self.abort_nwk_lifecycle_persistence();
+                return false;
+            }
+            Some(security_store::ReplayCommitOutcome::CapacityRefused) => {
+                commit.fail(SecurityStoreError::Full);
+                return false;
+            }
+            None => return false,
         }
         self.bdb
             .zdo_mut()
@@ -11759,22 +12768,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         self.set_nwk_lifecycle_persistence_enabled(true);
         self.set_network_key_persistence_enabled(true);
         self.defer_aps_ack = true;
-        let mut replay_error = None;
-        let event = {
-            let mut replay_commit = |replay| match store.commit_replay_counter(replay) {
-                Ok(()) => true,
-                Err(error) => {
-                    replay_error = Some(error);
-                    false
-                }
-            };
-            self.process_incoming_with_replay_commit(
-                indication,
-                clusters,
-                &mut replay_commit,
-                false,
-            )
-            .await
+        let (event, replay_error) = {
+            let mut durable = security_store::StoreDurableReplay { store, error: None };
+            let event = self
+                .process_incoming_with_replay_commit(indication, clusters, &mut durable, false)
+                .await;
+            (event, durable.error)
         };
         if let Some(error) = replay_error {
             self.defer_aps_ack = false;
@@ -11811,12 +12810,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 self.refresh_security_state(store)?;
                 self.reconcile_security_state_replay_counters(store)?;
                 if let Some(replay) = self.pending_network_key_replay() {
-                    store.commit_replay_counter(security_store::PersistentReplayCounter::Aps(
+                    store.complete_replay_counter(security_store::PersistentReplayCounter::Aps(
                         replay,
                     ))?;
                 }
                 if let Some(replay) = self.bdb.zdo().aps().pending_data_replay() {
-                    store.commit_replay_counter(security_store::PersistentReplayCounter::Aps(
+                    store.complete_replay_counter(security_store::PersistentReplayCounter::Aps(
                         replay,
                     ))?;
                 }
@@ -11842,7 +12841,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                             self.abort_nwk_lifecycle_persistence();
                         }
                         _ => {
-                            if let Err(error) = store.commit_replay_counter(
+                            if let Err(error) = store.complete_replay_counter(
                                 security_store::PersistentReplayCounter::Nwk(replay),
                             ) {
                                 self.abort_nwk_lifecycle_persistence();
@@ -13758,9 +14757,13 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         indication: &McpsDataIndication,
         clusters: &mut [ClusterRef<'_>],
     ) -> Option<event_loop::StackEvent> {
-        let mut volatile_commit = |_| true;
         let event = self
-            .process_incoming_with_replay_commit(indication, clusters, &mut volatile_commit, true)
+            .process_incoming_with_replay_commit(
+                indication,
+                clusters,
+                &mut security_store::VolatileDurableReplay,
+                true,
+            )
             .await;
         #[cfg(feature = "router")]
         self.service_fragmented_send().await;
@@ -13811,15 +14814,15 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         self.fragmented_send_confirm.take()
     }
 
-    async fn process_incoming_with_replay_commit<F>(
+    async fn process_incoming_with_replay_commit<D>(
         &mut self,
         indication: &McpsDataIndication,
         clusters: &mut [ClusterRef<'_>],
-        replay_commit: &mut F,
+        replay_commit: &mut D,
         release_local_conflict_announcement: bool,
     ) -> Option<event_loop::StackEvent>
     where
-        F: FnMut(security_store::PersistentReplayCounter) -> bool,
+        D: security_store::DurableReplay,
     {
         if self.binding_persistence_pending() {
             log::error!("[Runtime] Dropping frame while a binding transaction is pending");
@@ -13847,10 +14850,13 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         let negotiates_timeout = self.negotiates_end_device_timeout();
         let timeout_before = negotiates_timeout.then(|| self.end_device_timeout_snapshot());
 
+        let reserved_new_domains = self.outstanding_replay_reservations();
         let (nwk_indication, command_outcome) = {
             let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
-            let mut commit =
-                |counter| replay_commit(security_store::PersistentReplayCounter::Nwk(counter));
+            let mut commit = security_store::LayerReplayAuthority {
+                durable: replay_commit,
+                reserved_new_domains,
+            };
             let nwk_indication =
                 await_out_of_line!(nwk.process_incoming_nwk_frame_from_with_replay_commit(
                     mac_payload,
@@ -13943,10 +14949,15 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         let aps_decrypt_buf = unsafe { &mut *self.scratch.aps.get() };
 
         // APS layer: parse APS header
+        // A frame holding its NWK floor (LocalData) has reserved that domain;
+        // its APS admission must count it too.
+        let reserved_new_domains = self.outstanding_replay_reservations();
         let received = {
             let aps = self.bdb.zdo_mut().aps_mut();
-            let mut commit =
-                |counter| replay_commit(security_store::PersistentReplayCounter::Aps(counter));
+            let mut commit = security_store::LayerReplayAuthority {
+                durable: replay_commit,
+                reserved_new_domains,
+            };
             let indication = aps.process_incoming_aps_frame_with_data_persistence(
                 &buf[..len],
                 src,
@@ -14211,7 +15222,14 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 return self.handle_nwk_command_outcome(command).await;
             }
 
+            // Plain local data commits its floor here, which also applies the
+            // staged announcement. A frame that activated a newer key is left
+            // to the store wrapper: security snapshot, then floor, then effects.
             if defer_device_announce_replay
+                && matches!(
+                    self.pending_nwk_lifecycle_replay(),
+                    Some((_, zigbee_nwk::nlde::NwkLifecyclePersistence::LocalData))
+                )
                 && !self
                     .commit_pending_nwk_lifecycle_replay(replay_commit)
                     .await
@@ -15157,7 +16175,7 @@ mod parent_router_tests {
         fn commit_replay_counter(
             &mut self,
             replay: PersistentReplayCounter,
-        ) -> Result<(), super::SecurityStoreError> {
+        ) -> Result<zigbee_types::ReplayCommitOutcome, super::SecurityStoreError> {
             if self.fail_nwk_replay && matches!(replay, PersistentReplayCounter::Nwk(_)) {
                 return Err(super::SecurityStoreError::Hardware);
             }

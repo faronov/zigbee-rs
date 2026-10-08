@@ -1394,6 +1394,7 @@ dependencies = [
 name = "router-app"
 version = "0.1.0"
 dependencies = [
+ "embedded-storage",
  "zigbee-aps",
  "zigbee-mac",
  "zigbee-nwk",

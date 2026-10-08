@@ -152,6 +152,9 @@ pub struct NwkRxSecurityStats {
     pub security_header_parse_failures: u32,
     pub missing_keys: u32,
     pub replay_rejections: u32,
+    /// MIC-valid frames dropped because no durable replay-domain capacity
+    /// remained for their source.
+    pub capacity_refusals: u32,
     pub decrypt_successes: u32,
     pub decrypt_failures: u32,
 }
@@ -388,6 +391,12 @@ pub struct NwkLayer<M: MacDriver> {
     lifecycle_persistence_enabled: bool,
     /// Verified replay floor held until the owning journal is durable.
     pending_lifecycle_replay: Option<(security::NwkReplayCounter, nlde::NwkLifecyclePersistence)>,
+    /// Whether the pending replay floor owns one new durable replay-domain
+    /// reservation. Released with the pending floor (complete/abort/disable).
+    pending_lifecycle_reservation: bool,
+    /// Receive-side effects of a deferred local data frame, applied only once
+    /// its replay floor is durable and dropped on abort.
+    pending_lifecycle_effects: Option<nlde::ReceiveEffects>,
     /// Broadcast transaction record entry held with the replay floor.
     pending_lifecycle_btr: Option<(ShortAddress, u8)>,
     /// One broadcast/unicast relay held until lifecycle and replay durability.
@@ -467,6 +476,8 @@ impl<M: MacDriver> NwkLayer<M> {
             pending_nwk_status: None,
             lifecycle_persistence_enabled: false,
             pending_lifecycle_replay: None,
+            pending_lifecycle_reservation: false,
+            pending_lifecycle_effects: None,
             pending_lifecycle_btr: None,
             #[cfg(feature = "router")]
             pending_lifecycle_relay: None,
@@ -531,6 +542,8 @@ impl<M: MacDriver> NwkLayer<M> {
             core::ptr::addr_of_mut!((*slot).pending_nwk_status).write(None);
             core::ptr::addr_of_mut!((*slot).lifecycle_persistence_enabled).write(false);
             core::ptr::addr_of_mut!((*slot).pending_lifecycle_replay).write(None);
+            core::ptr::addr_of_mut!((*slot).pending_lifecycle_reservation).write(false);
+            core::ptr::addr_of_mut!((*slot).pending_lifecycle_effects).write(None);
             core::ptr::addr_of_mut!((*slot).pending_lifecycle_btr).write(None);
             #[cfg(feature = "router")]
             core::ptr::addr_of_mut!((*slot).pending_lifecycle_relay).write(None);
@@ -865,16 +878,23 @@ impl<M: MacDriver> NwkLayer<M> {
         if self.nib.security_enabled && !self.rx_authenticated {
             return;
         }
-        if let conflict::AddressCheck::Conflict { outcome } =
-            self.note_address_information(address, ieee)
-        {
-            if let Some(outcome) = outcome {
-                self.record_command_outcome(outcome);
+        let mutation = match self.classify_address_information(address, ieee) {
+            (conflict::AddressCheck::Conflict { outcome }, mutation) => {
+                if let Some(outcome) = outcome {
+                    self.record_command_outcome(outcome);
+                }
+                mutation
             }
-            return;
-        }
-        if nlde::is_unicast_address(address) {
-            self.update_address_map(address, ieee);
+            _ if nlde::is_unicast_address(address) => {
+                conflict::AddressMutation::Learn { address, ieee }
+            }
+            _ => conflict::AddressMutation::None,
+        };
+        // A deferred frame applies the announcement only once its replay floor
+        // is durable; an abort drops it with the rest of its receive effects.
+        match self.pending_lifecycle_effects.as_mut() {
+            Some(effects) => effects.announced = mutation,
+            None => self.apply_address_mutation(mutation),
         }
     }
 

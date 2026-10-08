@@ -21,7 +21,10 @@ use zigbee_crypto::ForwardAesProvider;
 use zigbee_crypto::SoftwareAesProvider;
 use zigbee_mac::MacDriver;
 use zigbee_nwk::NwkStatus;
-use zigbee_types::{IeeeAddress, ShortAddress};
+use zigbee_types::{
+    IeeeAddress, ReplayAdmission, ReplayAuthority, ReplayCommitOutcome, ShortAddress,
+    VolatileReplayAuthority,
+};
 
 #[cfg(feature = "trace")]
 macro_rules! aps_diag {
@@ -319,6 +322,8 @@ struct ApsDecryptOutcome {
     deferred_security_indication_replay: Option<crate::security::ApsReplayCounter>,
     /// The frame authenticated but its counter was already durably accepted.
     replay_duplicate: bool,
+    /// Durable admission of a fresh counter needs a new replay domain.
+    replay_new_domain: bool,
     /// Key-pair entry (or global key) whose key verified the MIC.
     key_origin: crate::security::ApsKeyOrigin,
 }
@@ -357,7 +362,7 @@ fn aps_decrypt_incoming<P>(
     defer_network_key_replay: bool,
     defer_security_indication_replay: bool,
     defer_data_replay: bool,
-    replay_commit: &mut dyn FnMut(crate::security::ApsReplayCounter) -> bool,
+    authority: &mut dyn ReplayAuthority<crate::security::ApsReplayCounter>,
 ) -> Option<ApsDecryptOutcome>
 where
     P: ForwardAesProvider,
@@ -511,7 +516,7 @@ where
     // `aps_diag!` compiles away without the `trace` feature, which is why this
     // reads like a bare `?` to clippy — the log line is the point.
     #[allow(clippy::question_mark)]
-    let Some((replay, uses_default_link_key, replay_duplicate, key_origin)) = accepted else {
+    let Some((replay, uses_default_link_key, mut replay_duplicate, key_origin)) = accepted else {
         aps_diag!(
             "[APS] decrypt ALL FAILED key_id={} ct_len={}",
             key_id,
@@ -519,6 +524,25 @@ where
         );
         return None;
     };
+    // The RAM window only caches the durable floor: a partner evicted from it
+    // must still be held to its persisted floor before any semantic handling.
+    let mut replay_new_domain = false;
+    if !replay_duplicate {
+        match authority.admit(&replay)? {
+            ReplayAdmission::Fresh { new_domain } => replay_new_domain = new_domain,
+            ReplayAdmission::Replayed => {
+                log::warn!(
+                    "[APS] Durable replay floor rejects frame counter {}",
+                    sec_hdr.frame_counter
+                );
+                replay_duplicate = true;
+            }
+            ReplayAdmission::CapacityRefused => {
+                log::warn!("[APS] No durable replay-domain capacity; dropping frame");
+                return None;
+            }
+        }
+    }
     let deferred_application_key_replay = (!replay_duplicate
         && defer_application_key_replay
         && decrypted_buf.len >= 2
@@ -559,11 +583,16 @@ where
         && !security_indication_replay_deferred
         && deferred_data_replay.is_none()
     {
-        if !replay_commit(replay) {
-            log::error!("[APS] Durable replay-counter commit failed");
-            return None;
+        match authority.commit(replay)? {
+            ReplayCommitOutcome::Advanced => security.commit_replay_counter(replay),
+            // Covered after a fresh admission is an invariant race: classify
+            // it as the replay it is, never as acceptance.
+            ReplayCommitOutcome::AlreadyCovered => replay_duplicate = true,
+            ReplayCommitOutcome::CapacityRefused => {
+                log::warn!("[APS] No durable replay-domain capacity; dropping frame");
+                return None;
+            }
         }
-        security.commit_replay_counter(replay);
     }
 
     Some(ApsDecryptOutcome {
@@ -582,6 +611,7 @@ where
         #[cfg(feature = "router")]
         deferred_security_indication_replay,
         replay_duplicate,
+        replay_new_domain,
         key_origin,
     })
 }
@@ -1118,6 +1148,23 @@ impl<M: MacDriver> ApsLayer<M> {
         }
     }
 
+    /// Durably commit the floor of a command whose handler staged nothing.
+    /// Only an advance authorizes its acknowledgement.
+    fn commit_handled_replay(
+        &mut self,
+        replay: crate::security::ApsReplayCounter,
+        authority: &mut dyn ReplayAuthority<crate::security::ApsReplayCounter>,
+    ) -> bool {
+        if authority.commit(replay) == Some(ReplayCommitOutcome::Advanced) {
+            self.security.commit_replay_counter(replay);
+            true
+        } else {
+            log::error!("[APS] Durable replay-counter commit did not advance");
+            self.pending_aps_ack = None;
+            false
+        }
+    }
+
     /// Process an incoming APS frame.
     ///
     /// Parses the APS header from the NWK payload and returns an
@@ -1131,7 +1178,6 @@ impl<M: MacDriver> ApsLayer<M> {
         nwk_security: IncomingNwkSecurity,
         decrypted_buf: &'a mut ApsFrameBuffer,
     ) -> Option<ApsdeDataIndication<'a>> {
-        let mut volatile_commit = |_| true;
         self.process_incoming_aps_frame_with_replay_commit(
             nwk_payload,
             nwk_src,
@@ -1139,7 +1185,7 @@ impl<M: MacDriver> ApsLayer<M> {
             lqi,
             nwk_security,
             decrypted_buf,
-            &mut volatile_commit,
+            &mut VolatileReplayAuthority,
         )
     }
 
@@ -1154,7 +1200,7 @@ impl<M: MacDriver> ApsLayer<M> {
         lqi: u8,
         nwk_security: IncomingNwkSecurity,
         decrypted_buf: &'a mut ApsFrameBuffer,
-        replay_commit: &mut dyn FnMut(crate::security::ApsReplayCounter) -> bool,
+        authority: &mut dyn ReplayAuthority<crate::security::ApsReplayCounter>,
     ) -> Option<ApsdeDataIndication<'a>> {
         self.process_incoming_aps_frame_with_data_persistence(
             nwk_payload,
@@ -1164,7 +1210,7 @@ impl<M: MacDriver> ApsLayer<M> {
             nwk_security,
             decrypted_buf,
             false,
-            replay_commit,
+            authority,
         )
     }
 
@@ -1181,7 +1227,7 @@ impl<M: MacDriver> ApsLayer<M> {
         nwk_security: IncomingNwkSecurity,
         decrypted_buf: &'a mut ApsFrameBuffer,
         defer_data_replay: bool,
-        replay_commit: &mut dyn FnMut(crate::security::ApsReplayCounter) -> bool,
+        authority: &mut dyn ReplayAuthority<crate::security::ApsReplayCounter>,
     ) -> Option<ApsdeDataIndication<'a>> {
         aps_diag!("[APS] RX {} bytes", nwk_payload.len());
         if self.pending_data_replay.is_some() {
@@ -1227,6 +1273,7 @@ impl<M: MacDriver> ApsLayer<M> {
         #[cfg(feature = "router")]
         let mut deferred_security_indication_replay = None;
         let mut aps_replay_duplicate = false;
+        let mut aps_replay_new_domain = false;
         let mut aps_key_origin = None;
         #[allow(unused_mut)]
         let mut data_ack_queued = false;
@@ -1261,7 +1308,7 @@ impl<M: MacDriver> ApsLayer<M> {
                 cfg!(feature = "router")
                     && header.frame_control.frame_type == ApsFrameType::Command as u8,
                 defer_data_replay && header.frame_control.frame_type == ApsFrameType::Data as u8,
-                replay_commit,
+                authority,
             )?;
             used_decrypted_buf = true;
             aps_security_source = outcome.aps_security_source;
@@ -1271,6 +1318,8 @@ impl<M: MacDriver> ApsLayer<M> {
             deferred_application_key_replay = outcome.deferred_application_key_replay;
             deferred_network_key_replay = outcome.deferred_network_key_replay;
             self.pending_data_replay = outcome.deferred_data_replay;
+            self.pending_replay_new_domain = outcome.replay_new_domain;
+            aps_replay_new_domain = outcome.replay_new_domain;
             #[cfg(feature = "router")]
             {
                 deferred_security_indication_replay = outcome.deferred_security_indication_replay;
@@ -1489,40 +1538,32 @@ impl<M: MacDriver> ApsLayer<M> {
                 if used_decrypted_buf {
                     decrypted_buf.clear();
                 }
+                // A handler that staged a durable owner keeps the floor (and
+                // the new-domain reservation admitted for it) pending until
+                // that owner commits; otherwise the floor commits now.
                 if let Some(replay) = deferred_application_key_replay {
                     if self.pending_application_key_persistence {
                         self.pending_application_key_replay = Some(replay);
-                    } else {
-                        if !replay_commit(replay) {
-                            log::error!("[APS] Durable replay-counter commit failed");
-                            self.pending_aps_ack = None;
-                            return None;
-                        }
-                        self.security.commit_replay_counter(replay);
+                        self.pending_replay_new_domain = aps_replay_new_domain;
+                    } else if !self.commit_handled_replay(replay, authority) {
+                        return None;
                     }
                 }
                 if let Some(replay) = deferred_network_key_replay {
                     if self.pending_network_key_persistence {
                         self.pending_network_key_replay = Some(replay);
-                    } else {
-                        if !replay_commit(replay) {
-                            log::error!("[APS] Durable replay-counter commit failed");
-                            self.pending_aps_ack = None;
-                            return None;
-                        }
-                        self.security.commit_replay_counter(replay);
+                        self.pending_replay_new_domain = aps_replay_new_domain;
+                    } else if !self.commit_handled_replay(replay, authority) {
+                        return None;
                     }
                 }
                 #[cfg(feature = "router")]
                 if let Some(replay) = deferred_security_indication_replay {
                     if self.pending_security_indication_persistence {
                         self.pending_security_indication_replay = Some(replay);
-                    } else if !replay_commit(replay) {
-                        log::error!("[APS] Durable replay-counter commit failed");
-                        self.pending_aps_ack = None;
+                        self.pending_replay_new_domain = aps_replay_new_domain;
+                    } else if !self.commit_handled_replay(replay, authority) {
                         return None;
-                    } else {
-                        self.security.commit_replay_counter(replay);
                     }
                 }
                 return None;
@@ -7452,13 +7493,25 @@ mod tests {
         frame_counter: u32,
         payload: &[u8],
     ) -> heapless::Vec<u8, 128> {
+        secured_data_frame_with_ack(key, src_ieee, aps_counter, frame_counter, payload, false)
+    }
+
+    #[cfg(feature = "router")]
+    fn secured_data_frame_with_ack(
+        key: &crate::security::AesKey,
+        src_ieee: &IeeeAddress,
+        aps_counter: u8,
+        frame_counter: u32,
+        payload: &[u8],
+        ack_request: bool,
+    ) -> heapless::Vec<u8, 128> {
         let header = ApsHeader {
             frame_control: ApsFrameControl {
                 frame_type: ApsFrameType::Data as u8,
                 delivery_mode: ApsDeliveryMode::Unicast as u8,
                 ack_format: false,
                 security: true,
-                ack_request: false,
+                ack_request,
                 extended_header: false,
             },
             dst_endpoint: Some(0x01),
@@ -7514,6 +7567,121 @@ mod tests {
             entry.incoming_frame_counter,
             entry.incoming_frame_counter_valid,
         )
+    }
+
+    /// Durable replay authority with a scripted verdict, standing in for a
+    /// floor that survived a reboot or an eviction from the RAM table.
+    #[cfg(feature = "router")]
+    struct ScriptedReplayAuthority {
+        admission: ReplayAdmission,
+        commit: ReplayCommitOutcome,
+        commits: usize,
+    }
+
+    #[cfg(feature = "router")]
+    impl ReplayAuthority<crate::security::ApsReplayCounter> for ScriptedReplayAuthority {
+        fn admit(
+            &mut self,
+            _replay: &crate::security::ApsReplayCounter,
+        ) -> Option<ReplayAdmission> {
+            Some(self.admission)
+        }
+
+        fn commit(
+            &mut self,
+            _replay: crate::security::ApsReplayCounter,
+        ) -> Option<ReplayCommitOutcome> {
+            self.commits += 1;
+            Some(self.commit)
+        }
+    }
+
+    /// The typed durable verdict must keep R22 §2.2.4.1.3 duplicate
+    /// acknowledgement: a MIC-valid acknowledged unicast that the durable
+    /// floor already covers is ACKed again but never delivered twice, while a
+    /// capacity refusal is a silent fail-closed drop. The RAM key-pair window
+    /// is empty in every case, so only the durable verdict decides.
+    #[test]
+    #[cfg(feature = "router")]
+    fn durable_replay_verdicts_keep_duplicate_ack_semantics() {
+        let app_key = [0xB3; 16];
+        let payload = [0x18, 0x07, 0x0B];
+        let frame =
+            secured_data_frame_with_ack(&app_key, &CHILD_IEEE, 0x44, 0x0000_0200, &payload, true);
+        let run = |admission, commit| {
+            let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+            aps.security_mut()
+                .add_key(crate::security::ApsLinkKeyEntry {
+                    partner_address: CHILD_IEEE,
+                    key: app_key,
+                    key_type: crate::security::ApsKeyType::ApplicationLinkKey,
+                    outgoing_frame_counter: 0,
+                    outgoing_frame_counter_limit: 0x1000,
+                    incoming_frame_counter: 0,
+                    incoming_frame_counter_valid: false,
+                })
+                .unwrap();
+            let mut authority = ScriptedReplayAuthority {
+                admission,
+                commit,
+                commits: 0,
+            };
+            let mut buf = ApsFrameBuffer::new();
+            let delivered = aps
+                .process_incoming_aps_frame_with_replay_commit(
+                    &frame,
+                    CHILD_SHORT,
+                    LOCAL_SHORT,
+                    180,
+                    IncomingNwkSecurity::new(true, Some(CHILD_IEEE)),
+                    &mut buf,
+                    &mut authority,
+                )
+                .is_some();
+            let ack = aps.pending_aps_ack.clone().map(|ack| ack.aps_counter);
+            let live = incoming_counter(&aps, crate::security::ApsKeyType::ApplicationLinkKey);
+            (delivered, ack, authority.commits, live)
+        };
+
+        // Durable floor already covers the counter: ACK again, no delivery,
+        // no durable or live commit.
+        assert_eq!(
+            run(ReplayAdmission::Replayed, ReplayCommitOutcome::Advanced),
+            (false, Some(0x44), 0, (0, false))
+        );
+        // No durable capacity: silent drop, no ACK, no commit.
+        assert_eq!(
+            run(
+                ReplayAdmission::CapacityRefused,
+                ReplayCommitOutcome::Advanced
+            ),
+            (false, None, 0, (0, false))
+        );
+        // Fresh admission whose commit finds the floor already covered is the
+        // same classification as Replayed, never an authorization.
+        assert_eq!(
+            run(
+                ReplayAdmission::Fresh { new_domain: false },
+                ReplayCommitOutcome::AlreadyCovered
+            ),
+            (false, Some(0x44), 1, (0, false))
+        );
+        // A commit refused for capacity after Fresh fails closed silently.
+        assert_eq!(
+            run(
+                ReplayAdmission::Fresh { new_domain: true },
+                ReplayCommitOutcome::CapacityRefused
+            ),
+            (false, None, 1, (0, false))
+        );
+        // Only Advanced delivers, acknowledges and installs the live floor.
+        assert_eq!(
+            run(
+                ReplayAdmission::Fresh { new_domain: true },
+                ReplayCommitOutcome::Advanced
+            ),
+            (true, Some(0x44), 1, (0x0000_0200, true))
+        );
     }
 
     /// R22 §4.4.1: the incoming (replay) frame counter belongs to the

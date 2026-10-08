@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Mutex;
 
+use embedded_storage::nor_flash::{ErrorType, NorFlash, NorFlashErrorKind, ReadNorFlash};
 #[cfg(feature = "trust-center")]
 use router_app::TrustCenterCoordinatorApp;
 use router_app::{
@@ -48,6 +49,7 @@ use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::profile::{ApplicationProfile, DeviceProfile, RangeExtender};
 use zigbee_runtime::role::{EndDevice, RelayRouter, Router};
+use zigbee_runtime::security_journal::SecurityStateJournal;
 use zigbee_runtime::security_store::{
     PersistentReplayCounter, PersistentSecurityState, RamSecurityStateStore, SecurityStateStore,
     SecurityStoreError,
@@ -1014,6 +1016,15 @@ fn binding_request_with_security(
     frame_counter: u32,
     aps_secured: bool,
 ) -> McpsDataIndication {
+    binding_request_with_counters(unbind, frame_counter, frame_counter, aps_secured)
+}
+
+fn binding_request_with_counters(
+    unbind: bool,
+    nwk_counter: u32,
+    frame_counter: u32,
+    aps_secured: bool,
+) -> McpsDataIndication {
     let header = ApsHeader {
         frame_control: ApsFrameControl {
             frame_type: ApsFrameType::Data as u8,
@@ -1067,8 +1078,8 @@ fn binding_request_with_security(
             ShortAddress::COORDINATOR,
             COORDINATOR_IEEE,
             ShortAddress(SHORT_ADDRESS),
-            frame_counter as u8,
-            frame_counter,
+            nwk_counter as u8,
+            nwk_counter,
             &aps[..len],
         ),
         security_use: false,
@@ -1118,6 +1129,12 @@ fn assert_bind_store_failure_recovers_after_reboot(aps_secured: bool) {
         block_on(app.step()),
         Err(RouterAppError::ApsTables(_))
     ));
+    // The held transaction owns one new NWK domain and, when APS-secured,
+    // one new APS domain until it completes or is torn down.
+    assert_eq!(
+        replay_reservations(app.node().device()),
+        (1, usize::from(aps_secured))
+    );
     assert_eq!(app.node().device().aps().binding_table().len(), 1);
     assert!(
         binding_responses(app.node().device().mac(), false).is_empty(),
@@ -1166,8 +1183,189 @@ fn assert_bind_store_failure_recovers_after_reboot(aps_secured: bool) {
         vec![vec![9, 0]]
     );
     assert_eq!(outbound_aps_ack_count(reboot.node().device().mac()), 1);
+    assert_eq!(replay_reservations(reboot.node().device()), (0, 0));
     drop(reboot);
     assert_eq!(nwk_replay_count(&mut security), 1);
+}
+
+/// New durable replay domains reserved by pending (NWK, APS) transactions.
+fn replay_reservations(device: &ZigbeeDevice<MockMac, Router>) -> (usize, usize) {
+    (
+        device.bdb().zdo().nwk().pending_replay_reservations(),
+        device.aps().pending_replay_reservations(),
+    )
+}
+
+fn bind_app<'a, S: SecurityStateStore>(
+    device: &'a mut ZigbeeDevice<MockMac, Router>,
+    security: &'a mut S,
+    profile: &'a mut TestProfile,
+) -> ParentRouterApp<
+    'a,
+    MockMac,
+    S,
+    TestProfile,
+    CountingChildStore,
+    NoStatus,
+    TestSupervisor,
+    NoDiagnostics,
+    NoObserver,
+    PersistentApsTables<RamApsTableStore>,
+> {
+    let mut app = ParentRouterApp::new_with_aps_tables(
+        ZigbeeNode::new(device, security, profile),
+        PersistentChildren::new(CountingChildStore::default()),
+        PersistentApsTables::new(RamApsTableStore::new()),
+        &POLICY,
+        RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
+    )
+    .unwrap();
+    block_on(app.initialize()).unwrap();
+    let mac = app.node_mut().device_mut().mac_mut();
+    mac.clear_tx_history();
+    mac.set_rx_delay_us(0);
+    app
+}
+
+/// Deliver one Bind_req and require that it was refused before any Bind
+/// processing: no binding, no response, no reservation left behind, no
+/// fatal error, and every durable floor exactly as before.
+fn assert_bind_refused(
+    security: &mut RamSecurityStateStore,
+    request: McpsDataIndication,
+    expected_acks: usize,
+) {
+    let floors = replay_counters(security);
+    let mut p = profile();
+    let mut device = parent_device(&mut p);
+    let mut app = bind_app(&mut device, security, &mut p);
+    app.node_mut().device_mut().mac_mut().enqueue_rx(request);
+    let events = block_on(app.step()).expect("a refused Bind_req is not fatal");
+    assert!(events.incoming.is_none());
+    assert!(app.node().device().aps().binding_table().is_empty());
+    assert!(!app.node().device().binding_persistence_pending());
+    assert!(binding_responses(app.node().device().mac(), false).is_empty());
+    assert_eq!(
+        outbound_aps_ack_count(app.node().device().mac()),
+        expected_acks
+    );
+    assert_eq!(replay_reservations(app.node().device()), (0, 0));
+    drop(app);
+    let after = replay_counters(security);
+    // A refused APS domain may still consume its fresh NWK counter, but no
+    // floor is ever lowered, removed or added for the refused layer.
+    for floor in &floors {
+        assert!(after.iter().any(|current| match (floor, current) {
+            (PersistentReplayCounter::Nwk(old), PersistentReplayCounter::Nwk(new)) =>
+                old.source == new.source && new.counter >= old.counter,
+            _ => current == floor,
+        }));
+    }
+    assert!(
+        after.len()
+            <= floors
+                .len()
+                .max(zigbee_runtime::security_store::MAX_PERSISTENT_REPLAY_COUNTERS)
+    );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|floor| matches!(floor, PersistentReplayCounter::Aps(_)))
+            .count(),
+        floors
+            .iter()
+            .filter(|floor| matches!(floor, PersistentReplayCounter::Aps(_)))
+            .count()
+    );
+}
+
+/// N1/SEC-01 Bind_req gate: Replayed or CapacityRefused on either the NWK or
+/// the APS replay admission must stop the request before the binding table,
+/// the Bind response or the APS ACK.
+#[test]
+fn bind_req_replay_or_capacity_refusal_never_reaches_the_binding_table() {
+    use zigbee_runtime::security_store::MAX_PERSISTENT_REPLAY_COUNTERS;
+    let nwk_floor = |source, counter| {
+        PersistentReplayCounter::Nwk(NwkReplayCounter::from_verified(
+            source,
+            0,
+            &NETWORK_KEY,
+            counter,
+        ))
+    };
+    let filler = |security: &mut RamSecurityStateStore, count: usize| {
+        for index in 0..count {
+            let source = [0x73, index as u8, (index >> 8) as u8, 0, 0, 0, 0, 0x73];
+            security
+                .commit_replay_counter(nwk_floor(source, 1))
+                .unwrap();
+        }
+    };
+
+    for aps_secured in [false, true] {
+        // NWK Replayed: the durable floor of the coordinator already covers
+        // the frame although the fresh RAM table has never seen it.
+        let mut security = security_store(false);
+        security
+            .commit_replay_counter(nwk_floor(COORDINATOR_IEEE, 100))
+            .unwrap();
+        assert_bind_refused(
+            &mut security,
+            binding_request_with_security(false, 100, aps_secured),
+            0,
+        );
+
+        // NWK CapacityRefused: the coordinator would be a new domain.
+        let mut security = security_store(false);
+        filler(&mut security, MAX_PERSISTENT_REPLAY_COUNTERS);
+        assert_bind_refused(
+            &mut security,
+            binding_request_with_security(false, 100, aps_secured),
+            0,
+        );
+    }
+
+    // Obtain the coordinator's durable APS floor from one accepted Bind.
+    let mut security = security_store(false);
+    {
+        let mut p = profile();
+        let mut device = parent_device(&mut p);
+        let mut app = bind_app(&mut device, &mut security, &mut p);
+        app.node_mut()
+            .device_mut()
+            .mac_mut()
+            .enqueue_rx(binding_request_with_security(false, 100, true));
+        block_on(app.step()).unwrap();
+        assert_eq!(app.node().device().aps().binding_table().len(), 1);
+        assert_eq!(replay_reservations(app.node().device()), (0, 0));
+    }
+    let aps_floor = replay_counters(&mut security)
+        .into_iter()
+        .find(|floor| matches!(floor, PersistentReplayCounter::Aps(_)))
+        .expect("an accepted APS-secured Bind_req leaves an APS floor");
+
+    // APS Replayed under a fresh NWK counter: R22 §2.2.4.1.3 duplicate ACK is
+    // regenerated, but Bind is not processed and no response escapes.
+    let mut security = security_store(false);
+    security.commit_replay_counter(aps_floor).unwrap();
+    assert_bind_refused(
+        &mut security,
+        binding_request_with_counters(false, 101, 100, true),
+        1,
+    );
+
+    // APS CapacityRefused: the NWK domain already exists (Fresh, not new),
+    // but the APS domain would exceed capacity.
+    let mut security = security_store(false);
+    security
+        .commit_replay_counter(nwk_floor(COORDINATOR_IEEE, 99))
+        .unwrap();
+    filler(&mut security, MAX_PERSISTENT_REPLAY_COUNTERS - 1);
+    assert_bind_refused(
+        &mut security,
+        binding_request_with_counters(false, 100, 100, true),
+        0,
+    );
 }
 
 #[test]
@@ -1495,7 +1693,7 @@ impl SecurityStateStore for FailingApsReplayStore {
     fn commit_replay_counter(
         &mut self,
         replay: PersistentReplayCounter,
-    ) -> Result<(), SecurityStoreError> {
+    ) -> Result<zigbee_runtime::security_store::ReplayCommitOutcome, SecurityStoreError> {
         if self.fail_next_aps_replay && matches!(replay, PersistentReplayCounter::Aps(_)) {
             self.fail_next_aps_replay = false;
             return Err(SecurityStoreError::Hardware);
@@ -5504,7 +5702,8 @@ mod key_power_cuts {
         fn commit_replay_counter(
             &mut self,
             replay: PersistentReplayCounter,
-        ) -> Result<(), SecurityStoreError> {
+        ) -> Result<zigbee_runtime::security_store::ReplayCommitOutcome, SecurityStoreError>
+        {
             if self.cuts.borrow_mut().before_commit(Journal::Replay) {
                 return Err(SecurityStoreError::Hardware);
             }
@@ -6218,4 +6417,286 @@ fn exhausted_device_annce_backs_off_instead_of_resetting_in_a_tight_loop() {
             .count(),
         1
     );
+}
+
+/// A secured ZDO NWK_addr_req for this router, APS-acknowledged.
+fn sec01_address_request(
+    source_short: u16,
+    source_ieee: [u8; 8],
+    counter: u32,
+) -> McpsDataIndication {
+    let header = ApsHeader {
+        frame_control: ApsFrameControl {
+            frame_type: ApsFrameType::Data as u8,
+            delivery_mode: ApsDeliveryMode::Unicast as u8,
+            ack_request: true,
+            ..Default::default()
+        },
+        dst_endpoint: Some(0),
+        group_address: None,
+        cluster_id: Some(0x0000),
+        profile_id: Some(0),
+        src_endpoint: Some(0),
+        aps_counter: counter as u8,
+        extended_header: None,
+    };
+    let mut aps = [0; 48];
+    let n = header.serialize(&mut aps);
+    aps[n] = counter as u8;
+    aps[n + 1..n + 9].copy_from_slice(&LOCAL_IEEE);
+    McpsDataIndication {
+        src_address: MacAddress::Short(PanId(PAN_ID), ShortAddress(source_short)),
+        dst_address: MacAddress::Short(PanId(PAN_ID), ShortAddress(SHORT_ADDRESS)),
+        lqi: 220,
+        payload: secured_nwk_frame(
+            NwkFrameType::Data,
+            ShortAddress(source_short),
+            source_ieee,
+            ShortAddress(SHORT_ADDRESS),
+            counter as u8,
+            counter,
+            &aps[..n + 11],
+        ),
+        security_use: false,
+    }
+}
+
+fn sec01_address_responses(mac: &MockMac) -> usize {
+    mac.tx_history()
+        .iter()
+        .filter(|tx| {
+            decrypt_outbound_nwk(&tx.payload)
+                .and_then(|(_, payload)| ApsHeader::parse(&payload))
+                .is_some_and(|(header, _)| header.cluster_id == Some(0x8000))
+        })
+        .count()
+}
+
+fn sec01_parent_app<'a, S: SecurityStateStore>(
+    device: &'a mut ZigbeeDevice<MockMac, Router>,
+    security: &'a mut S,
+    profile: &'a mut TestProfile,
+) -> ParentRouterApp<
+    'a,
+    MockMac,
+    S,
+    TestProfile,
+    CountingChildStore,
+    NoStatus,
+    TestSupervisor,
+    NoDiagnostics,
+> {
+    let mut app = ParentRouterApp::new(
+        ZigbeeNode::new(device, security, profile),
+        PersistentChildren::new(CountingChildStore::default()),
+        &POLICY,
+        RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
+    )
+    .unwrap();
+    block_on(app.initialize()).unwrap();
+    assert!(app.node().device().is_joined());
+    let mac = app.node_mut().device_mut().mac_mut();
+    mac.clear_tx_history();
+    mac.set_rx_delay_us(0);
+    app
+}
+
+/// SEC-01: an authenticated frame that needs one more durable replay domain
+/// than the store can hold is refused fail-closed but non-fatally: no
+/// upper-layer effect, no ACK/response, no new floor and no fatal error that
+/// would make `run()` reset the router, while the existing domains keep
+/// working and the router resumes after reboot.
+/// NOR-semantics flash (program may only clear bits) for the journal-backed
+/// router regressions.
+struct RouterFlash(Vec<u8>);
+
+impl RouterFlash {
+    const SECTOR: usize = zigbee_runtime::security_journal::SECURITY_JOURNAL_SECTOR_SIZE;
+
+    fn new() -> Self {
+        Self(vec![0xFF; Self::SECTOR * 2])
+    }
+
+    fn span(&self, address: u32, len: usize) -> Result<core::ops::Range<usize>, NorFlashErrorKind> {
+        let start = address as usize;
+        start
+            .checked_add(len)
+            .filter(|end| *end <= self.0.len())
+            .map(|end| start..end)
+            .ok_or(NorFlashErrorKind::OutOfBounds)
+    }
+}
+
+impl ErrorType for RouterFlash {
+    type Error = NorFlashErrorKind;
+}
+
+impl ReadNorFlash for RouterFlash {
+    const READ_SIZE: usize = 1;
+
+    fn read(&mut self, address: u32, output: &mut [u8]) -> Result<(), Self::Error> {
+        let span = self.span(address, output.len())?;
+        output.copy_from_slice(&self.0[span]);
+        Ok(())
+    }
+
+    fn capacity(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl NorFlash for RouterFlash {
+    const WRITE_SIZE: usize = 1;
+    const ERASE_SIZE: usize = Self::SECTOR;
+
+    fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
+        let span = self.span(address, data.len())?;
+        for (old, new) in self.0[span].iter_mut().zip(data) {
+            if (*old & *new) != *new {
+                return Err(NorFlashErrorKind::Other);
+            }
+            *old &= *new;
+        }
+        Ok(())
+    }
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        let span = self.span(from, (to as usize).saturating_sub(from as usize))?;
+        if span.start % Self::SECTOR != 0 || span.end % Self::SECTOR != 0 || span.is_empty() {
+            return Err(NorFlashErrorKind::NotAligned);
+        }
+        self.0[span].fill(0xFF);
+        Ok(())
+    }
+}
+
+type RouterJournal = SecurityStateJournal<RouterFlash>;
+
+fn router_journal(flash: RouterFlash) -> RouterJournal {
+    SecurityStateJournal::new(flash, 0, RouterFlash::SECTOR as u32)
+}
+
+#[test]
+fn a_replay_domain_beyond_capacity_is_refused_without_resetting_the_router() {
+    use zigbee_runtime::security_store::MAX_PERSISTENT_REPLAY_COUNTERS;
+
+    let mut ram = security_store(false);
+    assert_capacity_refusal_is_not_fatal(&mut ram, |_| None);
+
+    // The journal case is the actual SEC-01 corruption regression: MAX+1 must
+    // not program flash, and the bounded set must survive a real remount.
+    let mut journal = router_journal(RouterFlash::new());
+    journal.store(&commissioned_router_state(false)).unwrap();
+    assert_capacity_refusal_is_not_fatal(&mut journal, |journal| Some(journal.storage().0.clone()));
+    let flash = journal.into_storage();
+    let mut remounted = router_journal(flash);
+    assert_eq!(
+        replay_counters(&mut remounted).len(),
+        MAX_PERSISTENT_REPLAY_COUNTERS
+    );
+}
+
+fn assert_capacity_refusal_is_not_fatal<S: SecurityStateStore>(
+    security: &mut S,
+    flash: impl Fn(&S) -> Option<Vec<u8>>,
+) {
+    use zigbee_runtime::security_store::MAX_PERSISTENT_REPLAY_COUNTERS;
+
+    let floor = |source, counter| {
+        PersistentReplayCounter::Nwk(NwkReplayCounter::from_verified(
+            source,
+            0,
+            &NETWORK_KEY,
+            counter,
+        ))
+    };
+    security
+        .commit_replay_counter(floor(COORDINATOR_IEEE, 1))
+        .unwrap();
+    for index in 1..MAX_PERSISTENT_REPLAY_COUNTERS {
+        let source = [0x71, index as u8, (index >> 8) as u8, 0, 0, 0, 0, 0x71];
+        security.commit_replay_counter(floor(source, 1)).unwrap();
+    }
+    let original = replay_counters(security);
+    assert_eq!(original.len(), MAX_PERSISTENT_REPLAY_COUNTERS);
+
+    // MAX+1: an authenticated frame from an additional domain is dropped
+    // fail-closed without a side effect, a response, an ACK or a reset.
+    let refuse = |security: &mut S| {
+        let mut p = profile();
+        let mut device = parent_device(&mut p);
+        let mut app = sec01_parent_app(&mut device, security, &mut p);
+        let indications = app.node().device().zdo_diagnostics().indications;
+        let flash_before = flash(app.node_mut().device_and_security_store_mut().1);
+        app.node_mut()
+            .device_mut()
+            .mac_mut()
+            .enqueue_rx(sec01_address_request(0x4001, [0x72; 8], 1));
+        let events = block_on(app.step()).expect("capacity refusal must not be fatal");
+        assert_eq!(
+            flash(app.node_mut().device_and_security_store_mut().1),
+            flash_before,
+            "a refused replay domain must not program the journal"
+        );
+        assert!(events.incoming.is_none());
+        assert_eq!(
+            app.node().device().zdo_diagnostics().indications,
+            indications
+        );
+        assert_eq!(
+            app.node()
+                .device()
+                .nwk_rx_security_stats()
+                .capacity_refusals,
+            1
+        );
+        assert_eq!(sec01_address_responses(app.node().device().mac()), 0);
+        assert_eq!(outbound_aps_ack_count(app.node().device().mac()), 0);
+    };
+    refuse(security);
+    assert_eq!(replay_counters(security), original);
+
+    let mut p = profile();
+    let mut device = parent_device(&mut p);
+    let mut app = sec01_parent_app(&mut device, security, &mut p);
+    let indications = app.node().device().zdo_diagnostics().indications;
+
+    // An already persisted domain keeps advancing.
+    app.node_mut()
+        .device_mut()
+        .mac_mut()
+        .enqueue_rx(sec01_address_request(0x0000, COORDINATOR_IEEE, 2));
+    block_on(app.step()).unwrap();
+    assert_eq!(
+        app.node().device().zdo_diagnostics().indications,
+        indications + 1
+    );
+    assert_eq!(sec01_address_responses(app.node().device().mac()), 1);
+    assert_eq!(outbound_aps_ack_count(app.node().device().mac()), 1);
+    drop(app);
+
+    let mut expected = original.clone();
+    expected[0] = floor(COORDINATOR_IEEE, 2);
+    assert_eq!(replay_counters(security), expected);
+
+    // Reboot resumes and the advanced floor still rejects its frame.
+    let mut reboot_profile = profile();
+    let mut reboot_device = parent_device(&mut reboot_profile);
+    let mut reboot = sec01_parent_app(&mut reboot_device, security, &mut reboot_profile);
+    let indications = reboot.node().device().zdo_diagnostics().indications;
+    reboot
+        .node_mut()
+        .device_mut()
+        .mac_mut()
+        .enqueue_rx(sec01_address_request(0x0000, COORDINATOR_IEEE, 2));
+    block_on(reboot.step()).unwrap();
+    assert_eq!(
+        reboot.node().device().zdo_diagnostics().indications,
+        indications
+    );
+    assert_eq!(sec01_address_responses(reboot.node().device().mac()), 0);
+    drop(reboot);
+    assert_eq!(replay_counters(security), expected);
+    refuse(security);
+    assert_eq!(replay_counters(security), expected);
 }

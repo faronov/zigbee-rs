@@ -171,3 +171,57 @@ impl Iterator for ChannelMaskIter {
 /// Transmit power in dBm
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TxPower(pub i8);
+
+/// Durable replay admission for one MIC-verified secured frame.
+///
+/// Admission never writes persistent state; it only classifies the counter
+/// against the durable replay floors and the remaining replay-domain capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayAdmission {
+    /// The counter advances a floor. `new_domain` is set when no durable floor
+    /// exists yet for its replay domain, so committing it consumes capacity.
+    Fresh { new_domain: bool },
+    /// A durable floor already covers this counter.
+    Replayed,
+    /// The counter is from a new replay domain and no durable capacity remains.
+    CapacityRefused,
+}
+
+/// Result of durably committing one replay counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayCommitOutcome {
+    /// The durable floor advanced (or a new domain was recorded).
+    Advanced,
+    /// A durable floor already covered the counter; nothing was written.
+    AlreadyCovered,
+    /// The counter is from a new domain and the replay set is full; nothing
+    /// was written.
+    CapacityRefused,
+}
+
+/// Durable replay authority used by the NWK and APS receive paths.
+///
+/// `admit` is called after MIC verification and before any protocol
+/// mutation. `commit` durably records a counter; only
+/// [`ReplayCommitOutcome::Advanced`] authorizes a freshly received frame.
+/// Storage failures are recorded by the authority and reported as `None`, so
+/// the receive path simply drops the frame and the owner reports the error.
+pub trait ReplayAuthority<R> {
+    fn admit(&mut self, replay: &R) -> Option<ReplayAdmission>;
+    fn commit(&mut self, replay: R) -> Option<ReplayCommitOutcome>;
+}
+
+/// Authority for volatile-only receive paths: every MIC-verified counter that
+/// passed the RAM replay check is fresh, and commit always succeeds.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VolatileReplayAuthority;
+
+impl<R> ReplayAuthority<R> for VolatileReplayAuthority {
+    fn admit(&mut self, _replay: &R) -> Option<ReplayAdmission> {
+        Some(ReplayAdmission::Fresh { new_domain: false })
+    }
+
+    fn commit(&mut self, _replay: R) -> Option<ReplayCommitOutcome> {
+        Some(ReplayCommitOutcome::Advanced)
+    }
+}

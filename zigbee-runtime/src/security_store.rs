@@ -158,6 +158,8 @@ pub enum SecurityStoreError {
     GenerationExhausted,
 }
 
+pub use zigbee_types::{ReplayAdmission, ReplayCommitOutcome};
+
 /// One durably committed incoming replay floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistentReplayCounter {
@@ -818,13 +820,66 @@ pub trait SecurityStateStore {
     ) -> Result<(), SecurityStoreError> {
         Ok(())
     }
+    /// Classify a MIC-verified counter against the durable replay floors
+    /// without writing anything.
+    ///
+    /// `reserved_new_domains` counts new replay domains already admitted by
+    /// pending transactions that have not committed yet; they consume
+    /// capacity exactly like stored domains.
+    fn admit_replay_counter(
+        &mut self,
+        replay: &PersistentReplayCounter,
+        reserved_new_domains: usize,
+    ) -> Result<ReplayAdmission, SecurityStoreError> {
+        let mut stored_domains = 0usize;
+        let mut floor = None;
+        self.visit_replay_counters(&mut |stored| {
+            stored_domains += 1;
+            if stored.same_domain(replay) {
+                floor = Some(stored.counter());
+            }
+        })?;
+        Ok(match floor {
+            Some(floor) if replay.counter() <= floor => ReplayAdmission::Replayed,
+            Some(_) => ReplayAdmission::Fresh { new_domain: false },
+            None if stored_domains
+                .saturating_add(reserved_new_domains)
+                .saturating_add(1)
+                > MAX_PERSISTENT_REPLAY_COUNTERS =>
+            {
+                ReplayAdmission::CapacityRefused
+            }
+            None => ReplayAdmission::Fresh { new_domain: true },
+        })
+    }
+    /// Durably record one replay floor.
+    ///
+    /// Capacity is checked before any write: a new domain beyond
+    /// [`MAX_PERSISTENT_REPLAY_COUNTERS`] returns
+    /// [`ReplayCommitOutcome::CapacityRefused`] with the store unchanged. A
+    /// durable floor is never lowered or evicted.
     fn commit_replay_counter(
         &mut self,
         _replay: PersistentReplayCounter,
-    ) -> Result<(), SecurityStoreError> {
+    ) -> Result<ReplayCommitOutcome, SecurityStoreError> {
         // A legacy snapshot-only backend cannot safely acknowledge or act on
         // an authenticated frame whose replay floor is still volatile.
         Err(SecurityStoreError::Hardware)
+    }
+    /// Complete the replay commit owned by an already-admitted transaction.
+    ///
+    /// Completion is idempotent: a floor already covering the counter (for
+    /// example after a partially committed retry) satisfies durability. The
+    /// transaction reserved its domain at admission, so a capacity refusal
+    /// here is an invariant failure and is reported as `Full`.
+    fn complete_replay_counter(
+        &mut self,
+        replay: PersistentReplayCounter,
+    ) -> Result<(), SecurityStoreError> {
+        match self.commit_replay_counter(replay)? {
+            ReplayCommitOutcome::Advanced | ReplayCommitOutcome::AlreadyCovered => Ok(()),
+            ReplayCommitOutcome::CapacityRefused => Err(SecurityStoreError::Full),
+        }
     }
     fn tombstone_replay_counters(
         &mut self,
@@ -1093,7 +1148,7 @@ impl SecurityStateStore for RamSecurityStateStore {
     fn commit_replay_counter(
         &mut self,
         replay: PersistentReplayCounter,
-    ) -> Result<(), SecurityStoreError> {
+    ) -> Result<ReplayCommitOutcome, SecurityStoreError> {
         if !self.state.is_some_and(|state| state.owns_replay_domain()) {
             return Err(SecurityStoreError::Corrupt);
         }
@@ -1104,12 +1159,17 @@ impl SecurityStateStore for RamSecurityStateStore {
         {
             if replay.counter() > stored.counter() {
                 *stored = replay;
+                return Ok(ReplayCommitOutcome::Advanced);
             }
-            return Ok(());
+            return Ok(ReplayCommitOutcome::AlreadyCovered);
+        }
+        if self.replay.len() >= MAX_PERSISTENT_REPLAY_COUNTERS {
+            return Ok(ReplayCommitOutcome::CapacityRefused);
         }
         self.replay
             .push(replay)
-            .map_err(|_| SecurityStoreError::Full)
+            .map_err(|_| SecurityStoreError::Full)?;
+        Ok(ReplayCommitOutcome::Advanced)
     }
 
     fn tombstone_replay_counters(
@@ -1128,6 +1188,117 @@ impl SecurityStateStore for RamSecurityStateStore {
         let previous_len = self.replay.len();
         self.replay.retain(|replay| retain(*replay));
         Ok(previous_len - self.replay.len())
+    }
+}
+
+/// Durable replay authority used by one receive pass.
+///
+/// `None` means a genuine persistence failure; implementations record it so
+/// the caller can keep its fatal handling. Admission refusals and covered
+/// floors are ordinary outcomes and never become errors here.
+pub(crate) trait DurableReplay {
+    fn admit(
+        &mut self,
+        replay: &PersistentReplayCounter,
+        reserved_new_domains: usize,
+    ) -> Option<ReplayAdmission>;
+    fn commit(&mut self, replay: PersistentReplayCounter) -> Option<ReplayCommitOutcome>;
+    /// Record a broken reservation invariant as a persistence failure.
+    fn fail(&mut self, error: SecurityStoreError);
+}
+
+/// Storeless receive: every authenticated counter is fresh and in-memory
+/// floors are the only floors.
+pub(crate) struct VolatileDurableReplay;
+
+impl DurableReplay for VolatileDurableReplay {
+    fn admit(&mut self, _: &PersistentReplayCounter, _: usize) -> Option<ReplayAdmission> {
+        Some(ReplayAdmission::Fresh { new_domain: false })
+    }
+
+    fn commit(&mut self, _: PersistentReplayCounter) -> Option<ReplayCommitOutcome> {
+        Some(ReplayCommitOutcome::Advanced)
+    }
+
+    fn fail(&mut self, _: SecurityStoreError) {}
+}
+
+/// Store-backed receive authority recording the first persistence failure.
+pub(crate) struct StoreDurableReplay<'a, S: SecurityStateStore> {
+    pub store: &'a mut S,
+    pub error: Option<SecurityStoreError>,
+}
+
+impl<S: SecurityStateStore> DurableReplay for StoreDurableReplay<'_, S> {
+    fn admit(
+        &mut self,
+        replay: &PersistentReplayCounter,
+        reserved_new_domains: usize,
+    ) -> Option<ReplayAdmission> {
+        self.store
+            .admit_replay_counter(replay, reserved_new_domains)
+            .map_err(|error| self.error = Some(error))
+            .ok()
+    }
+
+    fn commit(&mut self, replay: PersistentReplayCounter) -> Option<ReplayCommitOutcome> {
+        self.store
+            .commit_replay_counter(replay)
+            .map_err(|error| self.error = Some(error))
+            .ok()
+    }
+
+    fn fail(&mut self, error: SecurityStoreError) {
+        self.error.get_or_insert(error);
+    }
+}
+
+/// Per-layer view of a [`DurableReplay`] carrying the new-domain capacity
+/// already reserved by pending transactions.
+pub(crate) struct LayerReplayAuthority<'a, D: DurableReplay> {
+    pub durable: &'a mut D,
+    pub reserved_new_domains: usize,
+}
+
+impl<D: DurableReplay> zigbee_types::ReplayAuthority<zigbee_nwk::security::NwkReplayCounter>
+    for LayerReplayAuthority<'_, D>
+{
+    fn admit(
+        &mut self,
+        replay: &zigbee_nwk::security::NwkReplayCounter,
+    ) -> Option<ReplayAdmission> {
+        self.durable.admit(
+            &PersistentReplayCounter::Nwk(*replay),
+            self.reserved_new_domains,
+        )
+    }
+
+    fn commit(
+        &mut self,
+        replay: zigbee_nwk::security::NwkReplayCounter,
+    ) -> Option<ReplayCommitOutcome> {
+        self.durable.commit(PersistentReplayCounter::Nwk(replay))
+    }
+}
+
+impl<D: DurableReplay> zigbee_types::ReplayAuthority<zigbee_aps::security::ApsReplayCounter>
+    for LayerReplayAuthority<'_, D>
+{
+    fn admit(
+        &mut self,
+        replay: &zigbee_aps::security::ApsReplayCounter,
+    ) -> Option<ReplayAdmission> {
+        self.durable.admit(
+            &PersistentReplayCounter::Aps(*replay),
+            self.reserved_new_domains,
+        )
+    }
+
+    fn commit(
+        &mut self,
+        replay: zigbee_aps::security::ApsReplayCounter,
+    ) -> Option<ReplayCommitOutcome> {
+        self.durable.commit(PersistentReplayCounter::Aps(replay))
     }
 }
 
@@ -1732,7 +1903,10 @@ mod tests {
         let reserved = store.load().unwrap().unwrap();
         assert!(!reserved.commissioned);
         assert_eq!(reserved.network_key, [0; 16]);
-        assert_eq!(store.commit_replay_counter(nwk_floor(7)), Ok(()));
+        assert_eq!(
+            store.commit_replay_counter(nwk_floor(7)),
+            Ok(ReplayCommitOutcome::Advanced)
+        );
         assert!(reserved.owns_replay_domain());
 
         let mut same_epoch = zero_key;

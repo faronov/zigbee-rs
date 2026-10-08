@@ -167,6 +167,59 @@ struct AuthenticatedNwkPayload {
     payload: heapless::Vec<u8, MAX_NWK_FRAME>,
     security_source: IeeeAddress,
     replay: crate::security::NwkReplayCounter,
+    /// Durable admission found no floor for this replay domain yet.
+    new_domain: bool,
+}
+
+/// Receive-side state changes an authenticated frame earns only once its
+/// replay floor is durable: address-map learning and conflict announcement,
+/// neighbour observation, passive acknowledgement, child key proof, parent
+/// link proof and child keepalive.
+///
+/// An ordinary frame applies them right after its durable replay commit; a
+/// deferred lifecycle frame parks them with its pending replay floor and
+/// applies them on completion, dropping them on abort.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReceiveEffects {
+    src: ShortAddress,
+    hop: ShortAddress,
+    security_source: Option<IeeeAddress>,
+    address: crate::conflict::AddressMutation,
+    /// Address-map learning or conflict announcement staged by a
+    /// `Device_annce` carried in this frame.
+    pub(crate) announced: crate::conflict::AddressMutation,
+    /// Whether the frame may prove key possession (child authorization,
+    /// parent-link proof and child keepalive).
+    identity_proof: bool,
+    #[cfg(feature = "router")]
+    observe: Option<NeighborObservation>,
+    #[cfg(feature = "router")]
+    passive_ack: Option<u8>,
+}
+
+#[cfg(feature = "router")]
+#[derive(Debug, Clone, Copy)]
+struct NeighborObservation {
+    src_ieee: Option<IeeeAddress>,
+    lqi: u8,
+    command_id: Option<u8>,
+}
+
+impl ReceiveEffects {
+    const fn address_only(src: ShortAddress, address: crate::conflict::AddressMutation) -> Self {
+        Self {
+            src,
+            hop: src,
+            security_source: None,
+            address,
+            announced: crate::conflict::AddressMutation::None,
+            identity_proof: false,
+            #[cfg(feature = "router")]
+            observe: None,
+            #[cfg(feature = "router")]
+            passive_ack: None,
+        }
+    }
 }
 
 /// NWK data confirm — result of NLDE-DATA.request.
@@ -1038,12 +1091,11 @@ impl<M: MacDriver> NwkLayer<M> {
         mac_payload: &'a [u8],
         lqi: u8,
     ) -> Option<NwkIndication<'a>> {
-        let mut volatile_commit = |_| true;
         self.process_incoming_nwk_frame_from_with_replay_commit(
             mac_payload,
             lqi,
             None,
-            &mut volatile_commit,
+            &mut VolatileReplayAuthority,
         )
         .await
     }
@@ -1065,12 +1117,11 @@ impl<M: MacDriver> NwkLayer<M> {
         lqi: u8,
         prev_hop: Option<ShortAddress>,
     ) -> Option<NwkIndication<'a>> {
-        let mut volatile_commit = |_| true;
         self.process_incoming_nwk_frame_from_with_replay_commit(
             mac_payload,
             lqi,
             prev_hop,
-            &mut volatile_commit,
+            &mut VolatileReplayAuthority,
         )
         .await
     }
@@ -1081,6 +1132,8 @@ impl<M: MacDriver> NwkLayer<M> {
         self.lifecycle_persistence_enabled = enabled;
         if !enabled {
             self.pending_lifecycle_replay = None;
+            self.pending_lifecycle_reservation = false;
+            self.pending_lifecycle_effects = None;
             self.pending_lifecycle_btr = None;
             #[cfg(feature = "router")]
             {
@@ -1123,6 +1176,10 @@ impl<M: MacDriver> NwkLayer<M> {
             self.commit_replay_floor(replay);
             self.security.activation_pending = false;
         }
+        self.pending_lifecycle_reservation = false;
+        if let Some(effects) = self.pending_lifecycle_effects.take() {
+            self.apply_receive_effects(effects);
+        }
         if let Some((source, sequence)) = self.pending_lifecycle_btr.take() {
             let _ = self.btr.record(source, sequence);
         }
@@ -1164,6 +1221,8 @@ impl<M: MacDriver> NwkLayer<M> {
     /// context. Aborting never rolls back the active key or consumes a floor.
     pub fn abort_lifecycle_persistence(&mut self) {
         self.pending_lifecycle_replay = None;
+        self.pending_lifecycle_reservation = false;
+        self.pending_lifecycle_effects = None;
         self.pending_lifecycle_btr = None;
         #[cfg(feature = "router")]
         {
@@ -1172,17 +1231,104 @@ impl<M: MacDriver> NwkLayer<M> {
         self.lifecycle_persistence_enabled = false;
     }
 
+    /// New durable replay domains owned by the pending lifecycle floor.
+    pub fn pending_replay_reservations(&self) -> usize {
+        usize::from(self.pending_lifecycle_replay.is_some() && self.pending_lifecycle_reservation)
+    }
+
+    /// Durably commit an ordinary frame's replay floor, then the live one.
+    ///
+    /// Only an actual advance authorizes the frame: a durable floor that
+    /// already covers the counter means the frame is a replay, and a refused
+    /// new domain is a fail-closed drop. Neither is a persistence failure.
     fn commit_incoming_replay(
         &mut self,
         replay: crate::security::NwkReplayCounter,
-        replay_commit: &mut dyn FnMut(crate::security::NwkReplayCounter) -> bool,
+        authority: &mut dyn ReplayAuthority<crate::security::NwkReplayCounter>,
     ) -> bool {
-        if !replay_commit(replay) {
-            log::error!("[NWK] Durable replay-counter commit failed");
-            return false;
+        match authority.commit(replay) {
+            Some(ReplayCommitOutcome::Advanced) => {
+                self.commit_replay_floor(replay);
+                true
+            }
+            Some(ReplayCommitOutcome::AlreadyCovered) => {
+                self.rx_security_stats.replay_rejections =
+                    self.rx_security_stats.replay_rejections.wrapping_add(1);
+                log::warn!("[NWK] Durable replay floor already covers the frame");
+                false
+            }
+            Some(ReplayCommitOutcome::CapacityRefused) => {
+                self.rx_security_stats.capacity_refusals =
+                    self.rx_security_stats.capacity_refusals.wrapping_add(1);
+                log::warn!("[NWK] No durable replay-domain capacity for the frame");
+                false
+            }
+            None => {
+                log::error!("[NWK] Durable replay-counter commit failed");
+                false
+            }
         }
-        self.commit_replay_floor(replay);
-        true
+    }
+
+    /// Apply receive-side effects once the frame's replay floor is durable.
+    fn apply_receive_effects(&mut self, effects: ReceiveEffects) {
+        self.apply_address_mutation(effects.address);
+        self.apply_address_mutation(effects.announced);
+        #[cfg(feature = "router")]
+        if let Some(observation) = effects.observe {
+            self.observe_transmitting_neighbor(
+                effects.src,
+                observation.src_ieee,
+                effects.hop,
+                observation.lqi,
+                effects.security_source,
+                observation.command_id,
+            );
+        }
+        // A neighbour's copy of a broadcast we already handled is its passive
+        // acknowledgement of our relay (R22 §3.6.5).
+        #[cfg(feature = "router")]
+        if let Some(sequence) = effects.passive_ack {
+            self.passive_acks
+                .note_relay(effects.src, sequence, effects.hop);
+        }
+        if !effects.identity_proof {
+            return;
+        }
+        let Some(security_source) = effects.security_source else {
+            return;
+        };
+        #[cfg(feature = "router")]
+        if self.find_ieee_by_short(effects.src) == Some(security_source)
+            && self.authorize_child(effects.src)
+        {
+            log::info!(
+                "[NWK] Child 0x{:04X} proved possession of the network key",
+                effects.src.0
+            );
+        }
+        if self.nib.parent_link_provisional
+            && effects.src == self.nib.parent_address
+            && effects.hop == effects.src
+        {
+            let known_parent = self.find_ieee_by_short(effects.src);
+            if known_parent.is_none_or(|known| known == security_source) {
+                if known_parent.is_none() {
+                    self.update_neighbor_address(effects.src, security_source);
+                }
+                self.nib.parent_link_provisional = false;
+                log::info!(
+                    "[NWK] Parent 0x{:04X} proved possession of the active network key",
+                    effects.src.0
+                );
+            }
+        }
+        // R22 secured-traffic keepalive: an authenticated frame from an
+        // attached end-device child refreshes its End Device Timeout deadline,
+        // after `authorize_child` so a frame that both authenticates and keeps
+        // alive is credited once. A child's relayed data still counts.
+        #[cfg(feature = "router")]
+        self.refresh_child_keepalive_secured(effects.src, security_source);
     }
 
     /// Record a verified incoming counter. When the replay table is full the
@@ -1221,21 +1367,32 @@ impl<M: MacDriver> NwkLayer<M> {
         );
     }
 
+    /// Park a verified floor with its owning lifecycle transaction. A fresh
+    /// replay domain keeps one durable-capacity reservation until the floor
+    /// completes or is aborted.
     fn defer_incoming_replay(
         &mut self,
         replay: crate::security::NwkReplayCounter,
         kind: NwkLifecyclePersistence,
+        new_domain: bool,
+        effects: ReceiveEffects,
     ) {
         self.pending_lifecycle_replay = Some((replay, kind));
+        self.pending_lifecycle_reservation = new_domain;
+        self.pending_lifecycle_effects = Some(effects);
     }
 
     /// Process one NWK frame with durable incoming replay ordering.
     ///
-    /// Lifecycle mutations (including newer-key activation) defer their floor
-    /// and relay until `complete_lifecycle_persistence`; other secured frames
-    /// commit through the hook before relay, handling or local delivery.
+    /// A MIC-valid frame is first admitted by the durable replay authority:
+    /// a replay or a refused new replay domain is dropped before it can
+    /// mutate anything. Lifecycle mutations (including newer-key activation)
+    /// then defer their floor, receive-side effects and relay until
+    /// `complete_lifecycle_persistence`; every other secured frame — a BTR
+    /// duplicate included — durably advances its floor before any neighbour,
+    /// address-map, BTR, relay, handling or delivery effect.
     ///
-    /// The commit hook is *type-erased*: this is the largest function in the
+    /// The authority is *type-erased*: this is the largest function in the
     /// receive path, and a generic parameter gives every distinct caller
     /// closure its own full copy of it (plus its own `aps_decrypt_incoming`).
     /// Receiving a frame is not latency-critical at the granularity of one
@@ -1245,7 +1402,7 @@ impl<M: MacDriver> NwkLayer<M> {
         mac_payload: &'a [u8],
         lqi: u8,
         prev_hop: Option<ShortAddress>,
-        replay_commit: &mut dyn FnMut(crate::security::NwkReplayCounter) -> bool,
+        authority: &mut dyn ReplayAuthority<crate::security::NwkReplayCounter>,
     ) -> Option<NwkIndication<'a>> {
         if self.pending_lifecycle_replay.is_some() {
             log::error!("[NWK] Dropping frame while a lifecycle commit is pending");
@@ -1278,18 +1435,28 @@ impl<M: MacDriver> NwkLayer<M> {
         // conflict on `nwkNetworkAddress`, checked here — the only point where
         // such a frame is still in hand — before the frame is dropped.
         if src == self.nib.network_address {
-            if let Some((outcome, replay)) =
-                self.detect_self_addressed_conflict(&header, mac_payload, consumed)
+            if let Some((outcome, mutation, admitted)) =
+                self.detect_self_addressed_conflict(&header, mac_payload, consumed, authority)
             {
-                if let Some(replay) = replay {
-                    if self.lifecycle_persistence_enabled {
+                let effects = ReceiveEffects::address_only(src, mutation);
+                match admitted {
+                    Some((replay, new_domain)) if self.lifecycle_persistence_enabled => {
                         self.activate_received_network_key(replay.key_sequence);
-                        self.defer_incoming_replay(replay, NwkLifecyclePersistence::SecurityState);
-                    } else if !self.commit_incoming_replay(replay, replay_commit) {
-                        return None;
-                    } else {
-                        self.activate_received_network_key(replay.key_sequence);
+                        self.defer_incoming_replay(
+                            replay,
+                            NwkLifecyclePersistence::SecurityState,
+                            new_domain,
+                            effects,
+                        );
                     }
+                    Some((replay, _)) => {
+                        if !self.commit_incoming_replay(replay, authority) {
+                            return None;
+                        }
+                        self.activate_received_network_key(replay.key_sequence);
+                        self.apply_receive_effects(effects);
+                    }
+                    None => self.apply_receive_effects(effects),
                 }
                 self.record_command_outcome(outcome);
             } else {
@@ -1448,28 +1615,32 @@ impl<M: MacDriver> NwkLayer<M> {
         // record, mutate, relay or act on a secured frame before its MIC has
         // been verified, and the relay path below re-secures the frame with
         // our own key material rather than replaying the original ciphertext.
-        let (payload, authenticated_replay) = if secured {
-            let authenticated = self.authenticate_incoming(mac_payload, consumed, src)?;
+        let (payload, admitted) = if secured {
+            let authenticated =
+                self.authenticate_incoming(mac_payload, consumed, src, authority)?;
             (
                 NwkPayload::Decrypted {
                     payload: authenticated.payload,
                     security_source: authenticated.security_source,
                 },
-                Some(authenticated.replay),
+                Some((authenticated.replay, authenticated.new_domain)),
             )
         } else {
             (NwkPayload::Plain(&mac_payload[consumed..]), None)
         };
+        let authenticated_replay = admitted.map(|(replay, _)| replay);
         // A network without NWK security has no stronger evidence to offer, so
         // its plaintext headers are all the identity there is.
         self.rx_authenticated = !self.nib.security_enabled || payload.security_source().is_some();
 
         // ── R22 §3.6.1.9.2 address conflict detection ──
-        // Runs on the authenticated frame only (see above) and records what it
-        // finds as a command outcome for the runtime: resolving a conflict is
-        // asynchronous work. Kept in one out-of-line helper so the receive
-        // future itself does not grow.
-        let conflict_outcome = self.detect_frame_address_conflict(
+        // Runs on the authenticated, durably admitted frame only (see above).
+        // Classification is pure: the address-map update or conflict
+        // announcement it implies is a receive effect, applied only once the
+        // frame's replay floor is safe. What it finds is recorded as a command
+        // outcome for the runtime: resolving a conflict is asynchronous work.
+        // Kept in one out-of-line helper so the receive future does not grow.
+        let (conflict_outcome, address_mutation) = self.classify_frame_address_conflict(
             &header,
             is_for_us && !is_broadcast,
             prev_hop.unwrap_or(src) == src,
@@ -1497,29 +1668,63 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // R22 §3.6.1.5 / §3.6.3.1: every authenticated frame refreshes the
         // transmitting neighbour's LQI average and incoming link cost; a
-        // router heard for the first time becomes a neighbour.
-        #[cfg(feature = "router")]
-        if self.rx_authenticated {
-            self.observe_transmitting_neighbor(
-                &header,
-                prev_hop.unwrap_or(src),
+        // router heard for the first time becomes a neighbour. Like every
+        // other receive-side effect it waits for the durable replay floor.
+        #[cfg_attr(not(feature = "router"), allow(unused_mut))]
+        let mut effects = ReceiveEffects {
+            src,
+            hop: prev_hop.unwrap_or(src),
+            security_source: payload.security_source(),
+            address: address_mutation,
+            announced: crate::conflict::AddressMutation::None,
+            // Data that revealed an address conflict is not delivered and so
+            // proves nothing about its sender's membership.
+            identity_proof: !(conflict_outcome.is_some() && is_data),
+            #[cfg(feature = "router")]
+            observe: self.rx_authenticated.then_some(NeighborObservation {
+                src_ieee: header.src_ieee,
                 lqi,
-                payload.security_source(),
                 command_id,
-            );
-        }
+            }),
+            #[cfg(feature = "router")]
+            passive_ack: None,
+        };
 
-        // Check a broadcast transaction before staging its replay. Recording
-        // is delayed until the replay floor is durable, otherwise a failed
-        // journal write would make the legitimate retransmission look like a
-        // duplicate in this boot.
+        // A broadcast transaction is checked before its replay is staged, but
+        // recorded only once the floor is durable: otherwise a failed journal
+        // write would make the legitimate retransmission look like a duplicate
+        // in this boot.
         #[cfg(feature = "router")]
         if is_broadcast && can_route && !is_route_request {
             if self.btr.is_duplicate(src, header.seq_number) {
-                // A neighbour's copy of a broadcast we already handled is its
-                // passive acknowledgement of our relay (R22 §3.6.5).
-                self.passive_acks
-                    .note_relay(src, header.seq_number, prev_hop.unwrap_or(src));
+                // The BTR only lives for this boot; it never stands in for the
+                // durable NWK replay floor. A duplicate transaction carrying a
+                // fresh security counter therefore advances that floor first.
+                effects.identity_proof = false;
+                effects.passive_ack = Some(header.seq_number);
+                if let Some((replay, new_domain)) = admitted {
+                    if self.lifecycle_persistence_enabled
+                        && (self.security.activation_pending
+                            || self
+                                .security
+                                .received_key_would_activate(replay.key_sequence))
+                    {
+                        // The floor belongs to the security snapshot transaction.
+                        self.activate_received_network_key(replay.key_sequence);
+                        self.defer_incoming_replay(
+                            replay,
+                            NwkLifecyclePersistence::SecurityState,
+                            new_domain,
+                            effects,
+                        );
+                        return None;
+                    }
+                    if !self.commit_incoming_replay(replay, authority) {
+                        return None;
+                    }
+                    self.activate_received_network_key(replay.key_sequence);
+                }
+                self.apply_receive_effects(effects);
                 log::debug!(
                     "[NWK] BTR dup: src=0x{:04X} seq={}",
                     src.0,
@@ -1572,9 +1777,9 @@ impl<M: MacDriver> NwkLayer<M> {
             None
         };
 
-        if let Some(replay) = authenticated_replay {
+        if let Some((replay, new_domain)) = admitted {
             if let Some(kind) = lifecycle_kind {
-                self.defer_incoming_replay(replay, kind);
+                self.defer_incoming_replay(replay, kind, new_domain, effects);
                 #[cfg(feature = "router")]
                 if is_broadcast && can_route && !is_route_request {
                     self.pending_lifecycle_btr = Some((src, header.seq_number));
@@ -1593,11 +1798,14 @@ impl<M: MacDriver> NwkLayer<M> {
                         });
                     }
                 }
-            } else if !self.commit_incoming_replay(replay, replay_commit) {
+            } else if !self.commit_incoming_replay(replay, authority) {
                 return None;
             } else {
                 self.activate_received_network_key(replay.key_sequence);
+                self.apply_receive_effects(effects);
             }
+        } else {
+            self.apply_receive_effects(effects);
         }
 
         #[cfg(feature = "router")]
@@ -1610,45 +1818,6 @@ impl<M: MacDriver> NwkLayer<M> {
             if is_data {
                 return None;
             }
-        }
-
-        #[cfg(feature = "router")]
-        {
-            if let Some(security_source) = payload.security_source()
-                && self.find_ieee_by_short(src) == Some(security_source)
-                && self.authorize_child(src)
-            {
-                log::info!(
-                    "[NWK] Child 0x{:04X} proved possession of the network key",
-                    src.0
-                );
-            }
-        }
-        if self.nib.parent_link_provisional
-            && src == self.nib.parent_address
-            && prev_hop.unwrap_or(src) == src
-            && let Some(security_source) = payload.security_source()
-        {
-            let known_parent = self.find_ieee_by_short(src);
-            if known_parent.is_none_or(|known| known == security_source) {
-                if known_parent.is_none() {
-                    self.update_neighbor_address(src, security_source);
-                }
-                self.nib.parent_link_provisional = false;
-                log::info!(
-                    "[NWK] Parent 0x{:04X} proved possession of the active network key",
-                    src.0
-                );
-            }
-        }
-        // R22 secured-traffic keepalive: an authenticated frame from an
-        // attached end-device child refreshes its End Device Timeout deadline.
-        // Runs after `authorize_child` so a frame that both authenticates and
-        // keeps alive is credited once, and before the relay branch so a
-        // child's data relayed on to the coordinator still counts.
-        #[cfg(feature = "router")]
-        if let Some(security_source) = payload.security_source() {
-            self.refresh_child_keepalive_secured(src, security_source);
         }
 
         // ── Broadcast deduplication (BTR) ──
@@ -1775,14 +1944,18 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Verify and decrypt a secured incoming NWK frame.
     ///
     /// Returns the plaintext NWK payload, or `None` when the frame must be
-    /// dropped. No key activation or replay commit occurs here: the caller
-    /// first completes admission, then orders activation and replay against
-    /// lifecycle persistence. A forged/replayed frame cannot reach that path.
+    /// dropped. After the MIC verifies, the durable replay authority admits
+    /// the counter: a frame its durable floor already covers (for example
+    /// from a source evicted from the live table) or a new replay domain with
+    /// no durable capacity left is dropped here, before any receive effect.
+    /// No key activation or replay commit occurs here: the caller orders
+    /// activation and replay against lifecycle persistence.
     fn authenticate_incoming(
         &mut self,
         mac_payload: &[u8],
         header_len: usize,
         src: ShortAddress,
+        authority: &mut dyn ReplayAuthority<crate::security::NwkReplayCounter>,
     ) -> Option<AuthenticatedNwkPayload> {
         self.rx_security_stats.secured_frames =
             self.rx_security_stats.secured_frames.wrapping_add(1);
@@ -1859,14 +2032,36 @@ impl<M: MacDriver> NwkLayer<M> {
             &sec_hdr,
         ) {
             Some(plaintext) => {
-                self.rx_security_stats.decrypt_successes =
-                    self.rx_security_stats.decrypt_successes.wrapping_add(1);
                 let replay = crate::security::NwkReplayCounter {
                     source: sec_hdr.source_address,
                     key_sequence: sec_hdr.key_seq_number,
                     key_fingerprint: zigbee_crypto::key_fingerprint(&key),
                     counter: sec_hdr.frame_counter,
                 };
+                let new_domain = match authority.admit(&replay) {
+                    Some(ReplayAdmission::Fresh { new_domain }) => new_domain,
+                    Some(ReplayAdmission::Replayed) => {
+                        self.rx_security_stats.replay_rejections =
+                            self.rx_security_stats.replay_rejections.wrapping_add(1);
+                        log::warn!("[NWK] Durable replay floor rejects 0x{:04X}", src.0);
+                        return None;
+                    }
+                    Some(ReplayAdmission::CapacityRefused) => {
+                        self.rx_security_stats.capacity_refusals =
+                            self.rx_security_stats.capacity_refusals.wrapping_add(1);
+                        log::warn!(
+                            "[NWK] No durable replay-domain capacity for 0x{:04X}",
+                            src.0
+                        );
+                        return None;
+                    }
+                    None => {
+                        log::error!("[NWK] Durable replay admission failed");
+                        return None;
+                    }
+                };
+                self.rx_security_stats.decrypt_successes =
+                    self.rx_security_stats.decrypt_successes.wrapping_add(1);
                 log::debug!(
                     "[NWK] Decrypted frame from 0x{:04X} ({} bytes)",
                     src.0,
@@ -1876,6 +2071,7 @@ impl<M: MacDriver> NwkLayer<M> {
                     payload: plaintext,
                     security_source: sec_hdr.source_address,
                     replay,
+                    new_domain,
                 })
             }
             None => {
@@ -2136,7 +2332,8 @@ impl<M: MacDriver> NwkLayer<M> {
     #[inline(never)]
     fn observe_transmitting_neighbor(
         &mut self,
-        header: &NwkHeader,
+        src: ShortAddress,
+        src_ieee: Option<IeeeAddress>,
         hop: ShortAddress,
         lqi: u8,
         security_source: Option<IeeeAddress>,
@@ -2152,7 +2349,7 @@ impl<M: MacDriver> NwkLayer<M> {
             }
             return;
         }
-        let direct = hop == header.src_addr;
+        let direct = hop == src;
         let router_command = matches!(
             command_id.and_then(NwkCommandId::from_u8),
             Some(NwkCommandId::LinkStatus | NwkCommandId::RouteRequest | NwkCommandId::RouteReply)
@@ -2162,7 +2359,7 @@ impl<M: MacDriver> NwkLayer<M> {
         }
         let ieee = match security_source {
             Some(ieee) => ieee,
-            None if !self.nib.security_enabled && direct => match header.src_ieee {
+            None if !self.nib.security_enabled && direct => match src_ieee {
                 Some(ieee) => ieee,
                 None => return,
             },
@@ -2940,16 +3137,20 @@ impl<M: MacDriver> NwkLayer<M> {
     ///   straight from its originator the auxiliary security header names the
     ///   same device, so a disagreement there is a forged header rather than an
     ///   address conflict and is refused as evidence.
+    ///
+    /// Pure: the address-map update or conflict announcement it implies is
+    /// returned for the caller to apply once the frame's replay floor is safe.
     #[inline(never)]
-    fn detect_frame_address_conflict(
-        &mut self,
+    fn classify_frame_address_conflict(
+        &self,
         header: &NwkHeader,
         addressed_to_us: bool,
         single_hop: bool,
         security_source: Option<IeeeAddress>,
-    ) -> Option<NwkCommandOutcome> {
+    ) -> (Option<NwkCommandOutcome>, crate::conflict::AddressMutation) {
+        const NONE: crate::conflict::AddressMutation = crate::conflict::AddressMutation::None;
         if !self.joined || !self.address_conflict_detection_enabled() {
-            return None;
+            return (None, NONE);
         }
         // An unsecured unicast is still accepted on a secured network so that
         // pre-key APS commissioning traffic arrives, and its NWK header is
@@ -2957,7 +3158,7 @@ impl<M: MacDriver> NwkLayer<M> {
         // conflict changes this device's own address or costs it a rejoin, so
         // only an authenticated header may claim one.
         if self.nib.security_enabled && security_source.is_none() {
-            return None;
+            return (None, NONE);
         }
 
         if addressed_to_us
@@ -2968,7 +3169,8 @@ impl<M: MacDriver> NwkLayer<M> {
                 "[NWK] Frame for 0x{:04X} names another IEEE address",
                 header.dst_addr.0,
             );
-            return Some(self.detect_local_address_conflict());
+            let (outcome, mutation) = self.classify_local_address_conflict();
+            return (Some(outcome), mutation);
         }
 
         if !cfg!(feature = "router") {
@@ -2976,19 +3178,21 @@ impl<M: MacDriver> NwkLayer<M> {
             // a conflict on its *own* address (above, and from the network's
             // own R22 §3.6.1.9.3 announcement) and rejoins, which is the only
             // resolution R22 gives an end device.
-            return None;
+            return (None, NONE);
         }
-        let src_ieee = header.src_ieee?;
+        let Some(src_ieee) = header.src_ieee else {
+            return (None, NONE);
+        };
         if single_hop && security_source.is_some_and(|source| source != src_ieee) {
             log::warn!(
                 "[NWK] Ignoring inconsistent identity for 0x{:04X}",
                 header.src_addr.0,
             );
-            return None;
+            return (None, NONE);
         }
-        match self.note_address_information(header.src_addr, src_ieee) {
-            crate::conflict::AddressCheck::Conflict { outcome } => outcome,
-            crate::conflict::AddressCheck::Consistent => None,
+        match self.classify_address_information(header.src_addr, src_ieee) {
+            (crate::conflict::AddressCheck::Conflict { outcome }, mutation) => (outcome, mutation),
+            (crate::conflict::AddressCheck::Consistent, mutation) => (None, mutation),
         }
     }
 
@@ -3004,13 +3208,22 @@ impl<M: MacDriver> NwkLayer<M> {
     /// On a secured network the frame must additionally pass CCM*, so a forged
     /// header alone cannot push a device off its address. On an unsecured
     /// network the explicit NWK source IEEE is the only evidence available.
+    ///
+    /// The returned address mutation is applied by the caller once the frame's
+    /// replay floor is safe; the replay carries its durable admission.
     #[inline(never)]
+    #[allow(clippy::type_complexity)]
     fn detect_self_addressed_conflict(
         &mut self,
         header: &NwkHeader,
         mac_payload: &[u8],
         consumed: usize,
-    ) -> Option<(NwkCommandOutcome, Option<crate::security::NwkReplayCounter>)> {
+        authority: &mut dyn ReplayAuthority<crate::security::NwkReplayCounter>,
+    ) -> Option<(
+        NwkCommandOutcome,
+        crate::conflict::AddressMutation,
+        Option<(crate::security::NwkReplayCounter, bool)>,
+    )> {
         // Self-address conflicts take an early authentication path, but must
         // still obey the same type/destination admission as ordinary receive.
         if (header.frame_control.frame_type != NwkFrameType::Data as u8
@@ -3032,15 +3245,15 @@ impl<M: MacDriver> NwkLayer<M> {
                 return None;
             }
             // A frame that cannot be authenticated proves nothing at all.
-            Some(
-                self.authenticate_incoming(mac_payload, consumed, header.src_addr)?
-                    .replay,
-            )
+            let authenticated =
+                self.authenticate_incoming(mac_payload, consumed, header.src_addr, authority)?;
+            Some((authenticated.replay, authenticated.new_domain))
         } else {
             None
         };
 
-        Some((self.detect_local_address_conflict(), replay))
+        let (outcome, mutation) = self.classify_local_address_conflict();
+        Some((outcome, mutation, replay))
     }
 
     #[cfg(feature = "router")]
@@ -4014,6 +4227,28 @@ mod tests {
     use core::task::{Context, Poll, Waker};
     use std::sync::Arc;
     use std::task::Wake;
+
+    /// Replay authority with no durable floor: every authenticated counter is
+    /// admitted, and `commit` reports a durable advance or a storage failure.
+    struct CommitHook<F>(F);
+
+    impl<F: FnMut(crate::security::NwkReplayCounter) -> bool>
+        ReplayAuthority<crate::security::NwkReplayCounter> for CommitHook<F>
+    {
+        fn admit(
+            &mut self,
+            _replay: &crate::security::NwkReplayCounter,
+        ) -> Option<ReplayAdmission> {
+            Some(ReplayAdmission::Fresh { new_domain: false })
+        }
+
+        fn commit(
+            &mut self,
+            replay: crate::security::NwkReplayCounter,
+        ) -> Option<ReplayCommitOutcome> {
+            (self.0)(replay).then_some(ReplayCommitOutcome::Advanced)
+        }
+    }
     #[cfg(feature = "router")]
     use zigbee_mac::CapabilityInfo;
     #[cfg(feature = "router")]
@@ -4369,7 +4604,8 @@ mod tests {
                 *on_air.last_mut().unwrap() ^= 1;
             }
             receiver.set_lifecycle_persistence_enabled(true);
-            let mut commit = |_| panic!("a rejected frame must not reach replay persistence");
+            let mut commit =
+                CommitHook(|_| panic!("a rejected frame must not reach replay persistence"));
             assert!(
                 block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
                     &on_air,
@@ -4407,7 +4643,8 @@ mod tests {
             10,
         );
         receiver.set_lifecycle_persistence_enabled(true);
-        let mut commit = |_| panic!("activation must persist its snapshot before replay");
+        let mut commit =
+            CommitHook(|_| panic!("activation must persist its snapshot before replay"));
         assert!(
             block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
                 &on_air,
@@ -4458,7 +4695,7 @@ mod tests {
             }
             let on_air = frame_with_network_key(&header, &[0xAB], [0x42; 16], KEY_SEQ + 1, 10);
             receiver.set_lifecycle_persistence_enabled(true);
-            let mut commit = |_| panic!("a rejected frame cannot commit replay");
+            let mut commit = CommitHook(|_| panic!("a rejected frame cannot commit replay"));
             assert!(
                 block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
                     &on_air,
@@ -4490,7 +4727,7 @@ mod tests {
             KEY_SEQ + 1,
             10,
         );
-        let mut commit = |_| false;
+        let mut commit = CommitHook(|_| false);
         assert!(
             block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
                 &on_air,
@@ -4524,7 +4761,7 @@ mod tests {
         );
         for _ in 0..2 {
             receiver.set_lifecycle_persistence_enabled(true);
-            let mut commit = |_| panic!("retry must still checkpoint before replay");
+            let mut commit = CommitHook(|_| panic!("retry must still checkpoint before replay"));
             assert!(
                 block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
                     &on_air,
@@ -4620,7 +4857,8 @@ mod tests {
                 10,
             );
             receiver.set_lifecycle_persistence_enabled(true);
-            let mut commit = |_| panic!("activation must not commit replay before its snapshot");
+            let mut commit =
+                CommitHook(|_| panic!("activation must not commit replay before its snapshot"));
             assert!(
                 block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
                     &on_air,
@@ -4715,7 +4953,8 @@ mod tests {
             let header = frame(NwkFrameType::Data, ORIGIN, dst);
             let on_air = frame_with_network_key(&header, &[0xAB], [0x42; 16], KEY_SEQ + 1, 10);
             receiver.set_lifecycle_persistence_enabled(true);
-            let mut commit = |_| panic!("no replay commit before the security snapshot");
+            let mut commit =
+                CommitHook(|_| panic!("no replay commit before the security snapshot"));
             let indication = block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
                 &on_air,
                 42,
@@ -4805,7 +5044,8 @@ mod tests {
             );
 
             receiver.set_lifecycle_persistence_enabled(true);
-            let mut commit = |_| panic!("a failed activation must not take the replay fast path");
+            let mut commit =
+                CommitHook(|_| panic!("a failed activation must not take the replay fast path"));
             let _ = block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
                 &on_air,
                 42,
@@ -4820,7 +5060,11 @@ mod tests {
 
     #[test]
     #[cfg(feature = "router")]
-    fn btr_duplicate_with_staged_key_does_not_activate_it() {
+    fn btr_duplicate_with_staged_key_persists_its_floor_before_suppression() {
+        // The BTR is volatile and never substitutes for the durable replay
+        // floor: a duplicate transaction carrying a fresh counter under the
+        // staged key joins the security-snapshot transaction, and is still
+        // suppressed (no relay, no BTR re-record) once that commits.
         let mut receiver = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
         assert!(receiver.security.stage_network_key([0x42; 16], KEY_SEQ + 1));
         let header = frame(NwkFrameType::Data, ORIGIN, ShortAddress::BROADCAST);
@@ -4828,15 +5072,69 @@ mod tests {
         receiver.btr.record(ORIGIN, header.seq_number);
         receiver.set_lifecycle_persistence_enabled(true);
         assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_none());
-        assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ);
-        assert_eq!(receiver.security.active_key().unwrap().seq_number, KEY_SEQ);
-        assert!(receiver.pending_lifecycle_replay().is_none());
+        assert_eq!(
+            receiver.pending_lifecycle_replay().map(|(_, kind)| kind),
+            Some(NwkLifecyclePersistence::SecurityState)
+        );
+        assert!(receiver.pending_replay_reservations() <= 1);
+        // The live floor is not installed before the durable commit.
         assert!(
             receiver
                 .security
                 .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
         );
+        assert!(receiver.pending_lifecycle_relay.is_none());
+        assert!(receiver.pending_lifecycle_btr.is_none());
+
+        block_on(receiver.complete_lifecycle_persistence());
+        assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ + 1);
+        assert!(
+            !receiver
+                .security
+                .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ + 1, 10)
+        );
+        assert_eq!(receiver.pending_replay_reservations(), 0);
         assert!(receiver.mac.tx_history().is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn btr_duplicate_with_a_fresh_counter_advances_the_durable_floor() {
+        let mut receiver = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        let header = frame(NwkFrameType::Data, ORIGIN, ShortAddress::BROADCAST);
+        let first = frame_with_network_key(&header, &[0xAB], NETWORK_KEY, KEY_SEQ, 10);
+        let copy = frame_with_network_key(&header, &[0xAB], NETWORK_KEY, KEY_SEQ, 11);
+        let mut floors = std::vec::Vec::new();
+        {
+            let mut commit = CommitHook(|replay: crate::security::NwkReplayCounter| {
+                floors.push(replay.counter);
+                true
+            });
+            assert!(
+                block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
+                    &first,
+                    42,
+                    Some(PEER),
+                    &mut commit,
+                ))
+                .is_some()
+            );
+            assert!(
+                block_on(receiver.process_incoming_nwk_frame_from_with_replay_commit(
+                    &copy,
+                    42,
+                    Some(PEER),
+                    &mut commit,
+                ))
+                .is_none()
+            );
+        }
+        assert_eq!(floors, [10, 11]);
+        assert!(
+            !receiver
+                .security
+                .check_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ, 11)
+        );
     }
 
     #[test]
