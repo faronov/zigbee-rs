@@ -665,16 +665,18 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
         index: usize,
         replay: PersistentReplayCounter,
     ) -> Result<(), SecurityStoreError> {
-        let entry = Self::encode_replay_entry(replay);
+        let mut entry = Self::encode_replay_entry(replay);
         let offset = REPLAY_HEADER_LEN + index * REPLAY_ENTRY_LEN;
         let address = self.sectors[sector] + (slot * SECURITY_JOURNAL_SLOT_SIZE + offset) as u32;
         self.storage
             .write(address, &entry[..REPLAY_ENTRY_PREFIX_LEN])
             .map_err(|_| SecurityStoreError::Hardware)?;
+        // TLSR8258 can only program from SRAM; stage the marker on the stack.
+        entry[REPLAY_ENTRY_COMMIT_OFFSET..].copy_from_slice(&REPLAY_ENTRY_COMMIT);
         self.storage
             .write(
                 address + REPLAY_ENTRY_COMMIT_OFFSET as u32,
-                &REPLAY_ENTRY_COMMIT,
+                &entry[REPLAY_ENTRY_COMMIT_OFFSET..],
             )
             .map_err(|_| SecurityStoreError::Hardware)?;
         let mut verify = [0u8; SECURITY_JOURNAL_SLOT_SIZE];
@@ -2392,5 +2394,20 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hw03_commit_markers_are_not_programmed_from_static_constants() {
+        use crate::flash_source_guard::StaticSourceGuard;
+        static FORBIDDEN: [&[u8]; 2] = [&REPLAY_ENTRY_COMMIT, &RECORD_COMMIT];
+        let mut journal = SecurityStateJournal::new(
+            StaticSourceGuard::new(MockFlash::new(), &FORBIDDEN),
+            0,
+            SECURITY_JOURNAL_SECTOR_SIZE as u32,
+        );
+        journal.store(&commissioned_state()).unwrap();
+        journal.commit_replay_counter(nwk_replay(7)).unwrap();
+        journal.commit_replay_counter(nwk_replay(9)).unwrap();
+        assert_eq!(journal.storage_mut().rejected, 0);
     }
 }

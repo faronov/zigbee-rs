@@ -766,8 +766,13 @@ impl<S: NorFlash> ApsTableJournal<S> {
         self.storage
             .write(address, &record[..RECORD_PREFIX_LEN])
             .map_err(|_| ApsTableStoreError::Hardware)?;
+        // TLSR8258 can only program from SRAM; stage the marker on the stack.
+        record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4].copy_from_slice(&RECORD_COMMIT);
         self.storage
-            .write(address + RECORD_COMMIT_OFFSET as u32, &RECORD_COMMIT)
+            .write(
+                address + RECORD_COMMIT_OFFSET as u32,
+                &record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4],
+            )
             .map_err(|_| ApsTableStoreError::Hardware)?;
 
         let mut verify = [0u8; APS_TABLE_JOURNAL_SLOT_SIZE];
@@ -1065,5 +1070,20 @@ mod tests {
     fn invalid_journal_geometry_is_rejected() {
         let mut journal = ApsTableJournal::new(MockFlash::new(), 0, 0);
         assert_eq!(journal.load(), Err(ApsTableStoreError::Hardware));
+    }
+
+    #[test]
+    fn hw03_commit_marker_is_not_programmed_from_static_constant() {
+        use crate::flash_source_guard::StaticSourceGuard;
+        static FORBIDDEN: [&[u8]; 1] = [&RECORD_COMMIT];
+        let mut journal = ApsTableJournal::new(
+            StaticSourceGuard::new(MockFlash::new(), &FORBIDDEN),
+            0,
+            APS_TABLE_JOURNAL_SECTOR_SIZE as u32,
+        );
+        let tables = snapshot();
+        journal.store(&tables).unwrap();
+        assert_eq!(journal.storage().rejected, 0);
+        assert_eq!(journal.load(), Ok(Some(tables)));
     }
 }

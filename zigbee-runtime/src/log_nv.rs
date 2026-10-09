@@ -191,8 +191,10 @@ impl<F: NorFlash> LogStructuredNv<F> {
         self.flash
             .write(page, &header[..12])
             .map_err(|_| NvError::HardwareError)?;
+        // TLSR8258 can only program from SRAM; stage the marker on the stack.
+        header[12..].copy_from_slice(&PAGE_COMMIT);
         self.flash
-            .write(page + 12, &PAGE_COMMIT)
+            .write(page + 12, &header[12..])
             .map_err(|_| NvError::HardwareError)
     }
 
@@ -695,5 +697,23 @@ mod tests {
         erase_flash.fail_erases = true;
         let mut nv = LogStructuredNv::new(erase_flash, 0, SECTOR_SIZE as u32).unwrap();
         assert_eq!(nv.compact(), Err(NvError::HardwareError));
+    }
+
+    #[test]
+    fn hw03_page_commit_marker_is_not_programmed_from_static_constant() {
+        use crate::flash_source_guard::StaticSourceGuard;
+        static FORBIDDEN: [&[u8]; 1] = [&PAGE_COMMIT];
+        let mut nv = LogStructuredNv::new(
+            StaticSourceGuard::new(MockFlash::new(), &FORBIDDEN),
+            0,
+            SECTOR_SIZE as u32,
+        )
+        .unwrap();
+        nv.write(NvItemId::NwkChannel, &[20]).unwrap();
+        nv.compact().unwrap();
+        assert_eq!(nv.flash.rejected, 0);
+        let mut channel = [0u8; 1];
+        assert_eq!(nv.read(NvItemId::NwkChannel, &mut channel), Ok(1));
+        assert_eq!(channel, [20]);
     }
 }

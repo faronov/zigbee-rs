@@ -83,6 +83,8 @@ pub mod builder;
 pub mod child_store;
 pub mod event_loop;
 pub mod firmware_writer;
+#[cfg(test)]
+mod flash_source_guard;
 pub mod log_nv;
 #[cfg(feature = "router")]
 mod network_key_forwarding;
