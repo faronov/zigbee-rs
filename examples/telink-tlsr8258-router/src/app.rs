@@ -3,7 +3,9 @@
 //! Child state is restored from a product-owned crash-safe journal before the
 //! router answers orphan notifications or schedules Parent Announce.
 
-use core::mem::MaybeUninit;
+use core::future::Future;
+use core::mem::{MaybeUninit, size_of};
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use router_app::{
@@ -19,8 +21,12 @@ use zigbee_runtime::profile::ApplicationProfile;
 use zigbee_runtime::role::Router;
 use zigbee_zcl::clusters::basic::PowerSource;
 
+use tlsr8258_hal::root::RootSlot;
 use tlsr8258_tb04::{leds::StatusLeds, resources::BoardResources};
-use tlsr8258_tb04_product::router::{ROUTER_POLICY, led_adapters, range_extender_profile};
+use tlsr8258_tb04_product::router::{
+    ROUTER_POLICY, RouterProfile, led_adapters, range_extender_profile,
+};
+use tlsr8258_tb04_product::storage::SecurityStore;
 
 // Distinct from the sensor runtime's `DEVICE_EUI_OFFSET` (0x33) so a router
 // and a sensor built from the same factory-programmed part never collide on
@@ -539,6 +545,8 @@ impl RouterObserver<TelinkMac, Router> for TelinkJoinObserver {
     }
 
     fn on_tick(device: &ZigbeeDevice<TelinkMac, Router>, elapsed_secs: u16, _result: &TickResult) {
+        // Main-loop SVC stack guard check (HW-04); fails closed.
+        tlsr8258_tb04_product::stack_guard::check();
         TELINK_JOIN_METRICS.capture_interview(device);
         TELINK_JOIN_METRICS.capture_steering(device);
         if elapsed_secs != 0 {
@@ -562,9 +570,69 @@ fn halted() -> ! {
     }
 }
 
-pub fn run() -> ! {
-    type Device = ZigbeeDevice<TelinkMac, Router>;
+/// Long-lived root objects that live until reset. They are moved out of the
+/// entry frame into linker-accounted `.bss` exactly once (HW-04): keeping them
+/// on the SVC stack made them permanent stack occupants the linker could not
+/// see. Temporaries stay on the stack.
+static SECURITY_SLOT: RootSlot<{ size_of::<SecurityStore>() }> = RootSlot::new();
+static PROFILE_SLOT: RootSlot<{ size_of::<RouterProfile>() }> = RootSlot::new();
+// The application and its `run()` future have unnameable types, so these two
+// sizes are fixed here and `place` proves at compile time that each slot
+// fits with less than `ROOT_SLOT_SLACK` bytes left over.
+static APP_SLOT: RootSlot<APP_SLOT_BYTES> = RootSlot::new();
+static FUTURE_SLOT: RootSlot<FUTURE_SLOT_BYTES> = RootSlot::new();
+const APP_SLOT_BYTES: usize = 2416;
+const FUTURE_SLOT_BYTES: usize = 4168;
+const ROOT_SLOT_SLACK: usize = 64;
 
+fn place<T: 'static, const N: usize>(slot: &'static RootSlot<N>, value: T) -> &'static mut T {
+    const { assert!(N - size_of::<T>() < ROOT_SLOT_SLACK, "root slot oversized") };
+    match slot.claim(value) {
+        Ok(value) => value,
+        // `init` runs once per reset; a second claim is a firmware bug.
+        Err(_) => halted(),
+    }
+}
+
+/// Builds the router device straight into `DEVICE_STORAGE`. Out of line so
+/// the builder's by-value MAC moves stay in a short-lived frame instead of
+/// the entry frame (HW-04).
+#[inline(never)]
+fn build_device(
+    ieee_address: [u8; 8],
+    profile: &RouterProfile,
+) -> &'static mut ZigbeeDevice<TelinkMac, Router> {
+    static mut DEVICE_STORAGE: MaybeUninit<ZigbeeDevice<TelinkMac, Router>> = MaybeUninit::uninit();
+    ZigbeeDevice::builder(TelinkMac::with_extended_address(ieee_address))
+        .power_mode(PowerMode::AlwaysOn)
+        .manufacturer("Zigbee-RS")
+        .model("TLSR8258-Router")
+        .date_code("20260718")
+        .sw_build("0.1.0")
+        .power_source(PowerSource::MainsSinglePhase)
+        .channels(zigbee_types::ChannelMask(1 << 15))
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        // SAFETY: only `init` calls this, after claiming `PROFILE_SLOT`, which
+        // halts on a second claim; so this is the only reference ever taken.
+        .build_router_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) })
+}
+
+pub fn run() -> ! {
+    tlsr8258_tb04_product::stack_guard::arm();
+    let future = init();
+    // The root future lives in `FUTURE_SLOT` and never moves once pinned.
+    // `ParentRouterApp::run` never completes.
+    let _ = tlsr8258_rt::block_on_pinned(future);
+    halted()
+}
+
+#[inline(never)]
+fn init() -> Pin<&'static mut impl Future> {
     tlsr8258_hal::timer::init();
     let resources = match BoardResources::take() {
         Some(resources) => resources,
@@ -590,49 +658,35 @@ pub fn run() -> ! {
     let mut ieee_address = [0u8; 8];
     tlsr8258_hal::flash::factory_ieee(&mut ieee_address);
     ieee_address[0] = ieee_address[0].wrapping_add(DEVICE_EUI_OFFSET);
-    let mut mac = TelinkMac::with_extended_address(ieee_address);
-    if mac.install_aes_engine(resources.aes).is_err() {
+    let profile = place(&PROFILE_SLOT, range_extender_profile());
+    let device = build_device(ieee_address, profile);
+    // Hardware AES is installed before any key material is touched below.
+    if device.mac_mut().install_aes_engine(resources.aes).is_err() {
         failure(&leds);
     }
 
-    static mut DEVICE_STORAGE: MaybeUninit<Device> = MaybeUninit::uninit();
-    let mut profile = range_extender_profile();
-
-    let device = ZigbeeDevice::builder(mac)
-        .power_mode(PowerMode::AlwaysOn)
-        .manufacturer("Zigbee-RS")
-        .model("TLSR8258-Router")
-        .date_code("20260718")
-        .sw_build("0.1.0")
-        .power_source(PowerSource::MainsSinglePhase)
-        .channels(zigbee_types::ChannelMask(1 << 15))
-        .endpoint(
-            profile.endpoint(),
-            profile.profile_id(),
-            profile.device_id(),
-            |endpoint| profile.configure_endpoint(endpoint),
-        )
-        .build_router_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
-
     let (security_partition, child_partition, aps_partition) =
         tlsr8258_tb04_product::storage::split_flash(resources.flash);
-    let mut security_store = tlsr8258_tb04_product::storage::security_store(security_partition);
+    let security_store = place(
+        &SECURITY_SLOT,
+        tlsr8258_tb04_product::storage::security_store(security_partition),
+    );
     // Product-owned durable child table, on its own two flash sectors. The
     // runtime owns the record format and restore semantics; the product owns
     // where the bytes live and when they are written.
     let child_store = tlsr8258_tb04_product::storage::child_table_store(child_partition);
     let aps_table_store = tlsr8258_tb04_product::storage::aps_table_store(aps_partition);
     if device
-        .reset_security_state_if_identity_changed(&mut security_store, ieee_address)
+        .reset_security_state_if_identity_changed(security_store, ieee_address)
         .is_err()
     {
         failure(&leds);
     }
-    let node = ZigbeeNode::new(device, &mut security_store, &mut profile);
+    let node = ZigbeeNode::new(device, security_store, profile);
     let children = PersistentChildren::new(child_store);
     let (status, supervisor) = led_adapters(leds);
     let parts = RouterParts::new(status, supervisor, NoDiagnostics);
-    let mut app = match ParentRouterApp::<
+    let app = match ParentRouterApp::<
         _,
         _,
         _,
@@ -649,7 +703,7 @@ pub fn run() -> ! {
         &ROUTER_POLICY,
         parts,
     ) {
-        Ok(app) => app,
+        Ok(app) => place(&APP_SLOT, app),
         // The LEDs were initialized red before ownership moved into the
         // adapters. Constructor failure is therefore still fail-closed.
         Err(_) => halted(),
@@ -659,5 +713,8 @@ pub fn run() -> ! {
     // clear, bounded receive, tick, rejoin, and retry behavior. The device
     // itself remains in caller-owned static storage, and this is the only
     // root future/`block_on` monomorphization in the firmware.
-    tlsr8258_rt::block_on(app.run())
+    let future = place(&FUTURE_SLOT, app.run());
+    // SAFETY: `future` is the only reference into `FUTURE_SLOT`, which is
+    // `'static` and never reused, so the value can never move again.
+    unsafe { Pin::new_unchecked(future) }
 }

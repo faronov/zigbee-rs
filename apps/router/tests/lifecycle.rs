@@ -3824,6 +3824,190 @@ fn parent_restores_and_clears_durable_aps_tables_with_network_lifecycle() {
     );
 }
 
+/// Range extender plus a Groups server: the minimal endpoint on which a
+/// remote ZCL Groups command can reach the runtime's APS group-table bridge.
+#[derive(Default)]
+struct GroupsRangeExtender {
+    groups: zigbee_zcl::clusters::groups::GroupsCluster,
+}
+
+impl zigbee_runtime::profile::ProfileComponent for GroupsRangeExtender {
+    fn configure_endpoint(
+        &self,
+        endpoint: zigbee_runtime::builder::EndpointBuilder,
+    ) -> zigbee_runtime::builder::EndpointBuilder {
+        <RangeExtender as zigbee_runtime::profile::ProfileComponent>::configure_endpoint(
+            &RangeExtender,
+            endpoint,
+        )
+        .cluster_server(zigbee_zcl::ClusterId::GROUPS)
+    }
+
+    fn collect_clusters<'a>(
+        &'a mut self,
+        endpoint: u8,
+        clusters: &mut zigbee_runtime::profile::ApplicationClusters<'a>,
+    ) -> Result<(), zigbee_runtime::profile::ProfileError> {
+        clusters
+            .push(zigbee_runtime::ClusterRef {
+                endpoint,
+                cluster: &mut self.groups,
+            })
+            .map_err(|_| zigbee_runtime::profile::ProfileError::TooManyClusters)
+    }
+
+    fn expected_report_cluster_ids(
+        &self,
+        _out: &mut zigbee_runtime::profile::ExpectedReportClusters,
+    ) {
+    }
+}
+
+/// NWK-secured unicast ZCL Groups command from the coordinator to endpoint 1.
+fn groups_command_frame(
+    command: zigbee_zcl::CommandId,
+    payload: &[u8],
+    sequence: u8,
+    frame_counter: u32,
+) -> MacFrame {
+    let mut zcl =
+        ZclFrame::new_cluster_specific(sequence, command, ClusterDirection::ClientToServer, true);
+    zcl.payload.extend_from_slice(payload).unwrap();
+    let mut zcl_bytes = [0u8; 32];
+    let zcl_len = zcl.serialize(&mut zcl_bytes).unwrap();
+    let aps_header = ApsHeader {
+        frame_control: ApsFrameControl {
+            frame_type: ApsFrameType::Data as u8,
+            delivery_mode: ApsDeliveryMode::Unicast as u8,
+            ..Default::default()
+        },
+        dst_endpoint: Some(1),
+        cluster_id: Some(zigbee_zcl::ClusterId::GROUPS.0),
+        profile_id: Some(PROFILE_HOME_AUTOMATION),
+        src_endpoint: Some(1),
+        aps_counter: sequence,
+        ..Default::default()
+    };
+    let mut aps = [0u8; 64];
+    let aps_header_len = aps_header.serialize(&mut aps);
+    aps[aps_header_len..aps_header_len + zcl_len].copy_from_slice(&zcl_bytes[..zcl_len]);
+    secured_nwk_frame(
+        NwkFrameType::Data,
+        ShortAddress::COORDINATOR,
+        COORDINATOR_IEEE,
+        ShortAddress(SHORT_ADDRESS),
+        sequence,
+        frame_counter,
+        &aps[..aps_header_len + zcl_len],
+    )
+}
+
+/// HW-04 trigger coverage for the group-table persistence path that the
+/// TLSR8258 HIL could not reach over real RF: a received ZCL Groups
+/// Add/Remove Group must drive the runtime group bridge and then the same
+/// `persist_aps_tables_if_dirty` -> `ApsTableStore::store` operation.
+#[test]
+fn received_groups_commands_persist_the_aps_group_table() {
+    use zigbee_zcl::clusters::groups::{CMD_ADD_GROUP, CMD_REMOVE_GROUP};
+
+    const GROUP: u16 = 0x2345;
+
+    let mut profile = DeviceProfile::new(
+        1,
+        PROFILE_HOME_AUTOMATION,
+        DeviceId::RANGE_EXTENDER,
+        GroupsRangeExtender::default(),
+    );
+    let mut mac = MockMac::new(LOCAL_IEEE);
+    mac.set_rx_delay_us(u32::MAX);
+    let mut device = ZigbeeDevice::builder(mac)
+        .power_mode(PowerMode::AlwaysOn)
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        .build_router();
+    let mut security = security_store(false);
+    let mut app = ParentRouterApp::new_with_aps_tables(
+        ZigbeeNode::new(&mut device, &mut security, &mut profile),
+        PersistentChildren::new(CountingChildStore::default()),
+        PersistentApsTables::new(RamApsTableStore::new()),
+        &POLICY,
+        RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
+    )
+    .unwrap();
+    block_on(app.initialize()).unwrap();
+    block_on(app.step()).unwrap();
+    let initial = app.aps_tables_mut().store_mut().load().unwrap();
+    assert!(initial.as_ref().is_none_or(|tables| tables.is_empty()));
+
+    type GroupsApp<'a> = ParentRouterApp<
+        'a,
+        MockMac,
+        RamSecurityStateStore,
+        DeviceProfile<GroupsRangeExtender>,
+        CountingChildStore,
+        NoStatus,
+        TestSupervisor,
+        NoDiagnostics,
+        NoObserver,
+        PersistentApsTables<RamApsTableStore>,
+    >;
+    fn deliver(app: &mut GroupsApp<'_>, frame: MacFrame) {
+        let mac = app.node_mut().device_mut().mac_mut();
+        mac.set_rx_delay_us(0);
+        mac.enqueue_rx(McpsDataIndication {
+            src_address: MacAddress::Short(PanId(PAN_ID), ShortAddress::COORDINATOR),
+            dst_address: MacAddress::Short(PanId(PAN_ID), ShortAddress(SHORT_ADDRESS)),
+            lqi: 220,
+            payload: frame,
+            security_use: false,
+        });
+        block_on(app.step()).unwrap();
+    }
+
+    deliver(
+        &mut app,
+        groups_command_frame(CMD_ADD_GROUP, &[GROUP as u8, (GROUP >> 8) as u8, 0], 10, 10),
+    );
+    assert!(
+        app.node()
+            .device()
+            .bdb()
+            .zdo()
+            .aps()
+            .group_table()
+            .is_member(GROUP, 1)
+    );
+    let durable = app.aps_tables_mut().store_mut().load().unwrap().unwrap();
+    assert!(durable.matches_network(&EXTENDED_PAN_ID));
+    assert!(
+        durable.groups().is_member(GROUP, 1),
+        "Add Group reaches the durable APS table store"
+    );
+
+    deliver(
+        &mut app,
+        groups_command_frame(CMD_REMOVE_GROUP, &[GROUP as u8, (GROUP >> 8) as u8], 11, 11),
+    );
+    assert!(
+        !app.node()
+            .device()
+            .bdb()
+            .zdo()
+            .aps()
+            .group_table()
+            .is_member(GROUP, 1)
+    );
+    let durable = app.aps_tables_mut().store_mut().load().unwrap().unwrap();
+    assert!(
+        !durable.groups().is_member(GROUP, 1),
+        "Remove Group reaches the durable APS table store"
+    );
+}
+
 #[test]
 fn application_transport_key_is_persisted_before_replay_commit_and_ack() {
     let partner = [0x73; 8];

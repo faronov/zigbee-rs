@@ -50,6 +50,16 @@ macro_rules! await_out_of_line {
     }};
 }
 
+/// Await a sub-future constructed directly in its pinned slot; see
+/// `zigbee_types::await_in_place!`. Used only on the measured TLSR8258 router
+/// start/rejoin poll chain (HW-04).
+macro_rules! await_in_place {
+    ($future:expr) => {{
+        let slot = core::pin::pin!(core::option::Option::None);
+        zigbee_runtime::emplace_future(slot, || $future).await
+    }};
+}
+
 mod app;
 mod capabilities;
 mod children;

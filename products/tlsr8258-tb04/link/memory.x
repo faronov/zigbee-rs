@@ -112,7 +112,11 @@ SECTIONS
     /*
      * The feature image emits TELINK_RETENTION_IMAGE. It places a fresh,
      * deliberately smaller root stack, IRQ stack and guards wholly in LOW32K.
-     * The default image retains the original top-of-64K stack addresses.
+     * The default image keeps the stacks at the top of the 64 KiB SRAM:
+     * a 20 KiB SVC stack derived from its top, a 64-byte guard immediately
+     * below it, and the 1 KiB IRQ stack above it. At least 4 KiB of unused
+     * physical RAM must separate the last static allocation from the guard;
+     * that gap is not part of the stack budget.
      */
     _retention_image_enabled_ = DEFINED(TELINK_RETENTION_IMAGE);
     _retention_limit_ = 0x00848000;
@@ -123,8 +127,16 @@ SECTIONS
     _retention_svc_bottom_ =
         (_retention_stack_guard_end_ + 0xFF) & ~0xFF;
 
-    _svc_stack_bottom = _retention_image_enabled_ ? _retention_svc_bottom_ : 0x0084BC00;
-    _svc_stack_top    = _retention_image_enabled_ ? 0x00847800 : 0x0084FC00;
+    _default_svc_stack_top_ = 0x0084FC00;
+    _default_svc_stack_bytes_ = 20 * 1024;
+    _default_svc_stack_guard_bytes_ = 64;
+    _default_min_static_gap_ = 4096;
+    _svc_stack_top    = _retention_image_enabled_ ? 0x00847800 : _default_svc_stack_top_;
+    _svc_stack_bottom = _retention_image_enabled_ ? _retention_svc_bottom_
+        : _default_svc_stack_top_ - _default_svc_stack_bytes_;
+    _svc_stack_guard_end = _retention_image_enabled_ ? 0 : _svc_stack_bottom;
+    _svc_stack_guard_start = _retention_image_enabled_ ? 0
+        : _svc_stack_bottom - _default_svc_stack_guard_bytes_;
     _irq_stack_bottom = _retention_image_enabled_ ? 0x00847800 : 0x0084FC00;
     _irq_stack_top    = _retention_image_enabled_ ? 0x00847C00 : 0x00850000;
     _retention_top_guard_end_ = _retention_image_enabled_ ? _retention_limit_ : 0;
@@ -162,6 +174,16 @@ SECTIONS
         "ERROR: .rf_dma overlaps the TLSR8258 I-cache tag/data reservation");
     _assert_dma_under_stack = ASSERT(_rf_dma_end_ <= _svc_stack_bottom,
         "ERROR: .rf_dma extends into the SVC stack region");
+    _assert_default_svc_stack = ASSERT(_retention_image_enabled_ ||
+        (_svc_stack_top - _svc_stack_bottom) == _default_svc_stack_bytes_,
+        "ERROR: default SVC stack must be exactly 20 KiB");
+    _assert_default_svc_guard = ASSERT(_retention_image_enabled_ ||
+        (_svc_stack_guard_end - _svc_stack_guard_start) == _default_svc_stack_guard_bytes_,
+        "ERROR: default SVC stack guard must be 64 bytes");
+    _assert_default_static_gap = ASSERT(_retention_image_enabled_ ||
+        (_svc_stack_guard_start >= _rf_dma_end_ + _default_min_static_gap_ &&
+         _svc_stack_guard_start >= _ebss + _default_min_static_gap_),
+        "ERROR: less than 4 KiB between static RAM and the SVC stack guard");
     _assert_retained_state_low32 = ASSERT(!_retention_image_enabled_ ||
         (_retained_end_ <= _retention_limit_ && _rf_dma_end_ <= _retention_limit_),
         "ERROR: retained writable/RF state exceeds LOW32K");

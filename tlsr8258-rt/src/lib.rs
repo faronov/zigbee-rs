@@ -10,7 +10,18 @@ use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 /// Run one async application future on the single-threaded TLSR8258 runtime.
+///
+/// The future is moved into this frame. Long-lived roots should be placed in
+/// static storage and driven with [`block_on_pinned`] instead.
 pub fn block_on<F: Future>(future: F) -> F::Output {
+    let future = core::pin::pin!(future);
+    block_on_pinned(future)
+}
+
+/// Poll an already pinned root future until it completes.
+///
+/// The caller owns the future's storage, so no copy of the future is made.
+pub fn block_on_pinned<F: Future>(mut future: Pin<&mut F>) -> F::Output {
     const VTABLE: RawWakerVTable = RawWakerVTable::new(
         |pointer| RawWaker::new(pointer, &VTABLE),
         |_| {},
@@ -18,8 +29,6 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
         |_| {},
     );
 
-    let mut future = future;
-    let mut future = unsafe { Pin::new_unchecked(&mut future) };
     let waker = unsafe { Waker::new(core::ptr::null(), &VTABLE) };
     let mut context = Context::from_waker(&waker);
 

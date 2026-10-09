@@ -874,12 +874,15 @@ const RECORD_CRC_OFFSET: usize = 500;
 const RECORD_PREFIX_LEN: usize = 504;
 const RECORD_COMMIT_OFFSET: usize = 504;
 const RECORD_COMMIT: [u8; 4] = *b"CMIT";
+/// Read-back granularity for slot scans and post-commit verification.
+const READBACK_CHUNK: usize = 128;
 
 // The encoded table must fit between its start and the CRC field, and the
 // commit marker must fit inside the slot.
 const _: () = assert!(RECORD_ENCODED_OFFSET + MAX_ENCODED_CHILD_TABLE_LEN <= RECORD_CRC_OFFSET);
 const _: () = assert!(RECORD_COMMIT_OFFSET + RECORD_COMMIT.len() <= CHILD_JOURNAL_SLOT_SIZE);
 const _: () = assert!(RECORD_CRC_OFFSET + 4 <= RECORD_PREFIX_LEN + 4);
+const _: () = assert!(CHILD_JOURNAL_SLOT_SIZE.is_multiple_of(READBACK_CHUNK));
 
 /// Atomic two-sector journal for the persistent child table.
 ///
@@ -895,7 +898,6 @@ pub struct ChildTableJournal<S> {
     scanned: bool,
 }
 
-#[derive(Clone)]
 struct LocatedTable {
     generation: u32,
     sector: usize,
@@ -937,9 +939,9 @@ impl<S: NorFlash> ChildTableJournal<S> {
             .map_err(|_| ChildStoreError::Hardware)
     }
 
-    fn decode_record(
-        record: &[u8; CHILD_JOURNAL_SLOT_SIZE],
-    ) -> Option<(u32, PersistentChildTable)> {
+    /// Validate a committed record's framing and CRC, returning its
+    /// generation, version and encoded length without decoding the table.
+    fn record_header(record: &[u8; CHILD_JOURNAL_SLOT_SIZE]) -> Option<(u32, u8, usize)> {
         if record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4] != RECORD_COMMIT
             || record[0..4] != RECORD_MAGIC
         {
@@ -965,8 +967,16 @@ impl<S: NorFlash> ChildTableJournal<S> {
             return None;
         }
         let generation = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
+        Some((generation, version, encoded_len))
+    }
+
+    fn decode_table(
+        record: &[u8; CHILD_JOURNAL_SLOT_SIZE],
+        version: u8,
+        encoded_len: usize,
+    ) -> Option<PersistentChildTable> {
         let encoded = &record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len];
-        let table = if version == 2 {
+        if version == 2 {
             PersistentChildTable::decode_v2(encoded)
         } else if version == 3 {
             PersistentChildTable::decode_v3(encoded)
@@ -975,33 +985,45 @@ impl<S: NorFlash> ChildTableJournal<S> {
         } else {
             PersistentChildTable::decode(encoded)
         }
-        .ok()?;
-        Some((generation, table))
+        .ok()
     }
 
-    fn newest(&mut self) -> Result<Option<LocatedTable>, ChildStoreError> {
-        let mut newest: Option<LocatedTable> = None;
+    /// Scan both sectors straight into `cached` with one reusable slot
+    /// buffer (HW-04).
+    ///
+    /// Equivalent to decoding every committed record and keeping the first
+    /// one with the highest generation: a candidate is decoded only when its
+    /// generation is strictly newer than the best decoded so far, so an
+    /// equal or older record (decodable or not) can never be selected, and a
+    /// malformed newer record is skipped exactly as before.
+    #[inline(never)]
+    fn scan_into_cache(&mut self) -> Result<(), ChildStoreError> {
+        self.cached = None;
         let mut record = [0u8; CHILD_JOURNAL_SLOT_SIZE];
         for sector in 0..2 {
             for slot in 0..CHILD_JOURNAL_SLOTS_PER_SECTOR {
                 self.read_slot(sector, slot, &mut record)?;
-                let Some((generation, table)) = Self::decode_record(&record) else {
+                let Some((generation, version, encoded_len)) = Self::record_header(&record) else {
                     continue;
                 };
-                let replace = match &newest {
-                    Some(current) => generation > current.generation,
-                    None => true,
-                };
-                if replace {
-                    newest = Some(LocatedTable {
-                        generation,
-                        sector,
-                        table,
-                    });
+                if self
+                    .cached
+                    .as_ref()
+                    .is_some_and(|best| generation <= best.generation)
+                {
+                    continue;
                 }
+                let Some(table) = Self::decode_table(&record, version, encoded_len) else {
+                    continue;
+                };
+                self.cached = Some(LocatedTable {
+                    generation,
+                    sector,
+                    table,
+                });
             }
         }
-        Ok(newest)
+        Ok(())
     }
 
     fn geometry_ok(&self) -> bool {
@@ -1025,24 +1047,44 @@ impl<S: NorFlash> ChildTableJournal<S> {
             })
     }
 
-    fn current(&mut self) -> Result<Option<LocatedTable>, ChildStoreError> {
+    /// Scan once; any scan error leaves no cached state and forces a rescan.
+    fn ensure_scanned(&mut self) -> Result<(), ChildStoreError> {
         if !self.geometry_ok() {
             return Err(ChildStoreError::Hardware);
         }
         if !self.scanned {
-            self.cached = self.newest()?;
+            if let Err(error) = self.scan_into_cache() {
+                self.cached = None;
+                return Err(error);
+            }
             self.scanned = true;
         }
-        Ok(self.cached.clone())
+        Ok(())
+    }
+
+    /// Generation and sector of the newest committed record, without
+    /// copying the table.
+    fn current_location(&mut self) -> Result<Option<(u32, usize)>, ChildStoreError> {
+        self.ensure_scanned()?;
+        Ok(self
+            .cached
+            .as_ref()
+            .map(|located| (located.generation, located.sector)))
     }
 
     fn first_erased_slot(&mut self, sector: usize) -> Result<Option<usize>, ChildStoreError> {
-        let mut record = [0u8; CHILD_JOURNAL_SLOT_SIZE];
-        for slot in 0..CHILD_JOURNAL_SLOTS_PER_SECTOR {
-            self.read_slot(sector, slot, &mut record)?;
-            if record.iter().all(|byte| *byte == 0xFF) {
-                return Ok(Some(slot));
+        let mut chunk = [0u8; READBACK_CHUNK];
+        'slots: for slot in 0..CHILD_JOURNAL_SLOTS_PER_SECTOR {
+            let base = self.sectors[sector] + (slot * CHILD_JOURNAL_SLOT_SIZE) as u32;
+            for offset in (0..CHILD_JOURNAL_SLOT_SIZE).step_by(READBACK_CHUNK) {
+                self.storage
+                    .read(base + offset as u32, &mut chunk)
+                    .map_err(|_| ChildStoreError::Hardware)?;
+                if chunk.iter().any(|byte| *byte != 0xFF) {
+                    continue 'slots;
+                }
             }
+            return Ok(Some(slot));
         }
         Ok(None)
     }
@@ -1059,13 +1101,17 @@ impl<S: NorFlash> ChildTableJournal<S> {
         let mut record = [0xFFu8; CHILD_JOURNAL_SLOT_SIZE];
         record[0..4].copy_from_slice(&RECORD_MAGIC);
         record[4] = RECORD_VERSION;
-        let mut encoded = [0u8; MAX_ENCODED_CHILD_TABLE_LEN];
-        let encoded_len = table.encode(&mut encoded);
+        // `encode` writes only its first `encoded_len` bytes, so encoding in
+        // place leaves the unused payload erased exactly as before.
+        let payload =
+            &mut record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + MAX_ENCODED_CHILD_TABLE_LEN];
+        let encoded_len = match <&mut [u8; MAX_ENCODED_CHILD_TABLE_LEN]>::try_from(payload) {
+            Ok(payload) => table.encode(payload),
+            Err(_) => return Err(ChildStoreError::Corrupt),
+        };
         record[5..7].copy_from_slice(&(encoded_len as u16).to_le_bytes());
         record[7] = 0;
         record[8..12].copy_from_slice(&generation.to_le_bytes());
-        record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len]
-            .copy_from_slice(&encoded[..encoded_len]);
         let crc = crate::security_journal::crc32(&record[..RECORD_CRC_OFFSET]);
         record[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 
@@ -1084,41 +1130,43 @@ impl<S: NorFlash> ChildTableJournal<S> {
             )
             .map_err(|_| ChildStoreError::Hardware)?;
 
-        let mut verify = [0u8; CHILD_JOURNAL_SLOT_SIZE];
-        self.read_slot(sector, slot, &mut verify)?;
-        match Self::decode_record(&verify) {
-            Some((stored_generation, stored_table))
-                if stored_generation == generation && stored_table == *table =>
-            {
-                Ok(())
+        // Byte-exact read-back of the whole committed slot against the staged
+        // record (header, payload, erased tail, CRC and commit marker).
+        let mut chunk = [0u8; READBACK_CHUNK];
+        for (offset, expected) in record.chunks_exact(READBACK_CHUNK).enumerate() {
+            self.storage
+                .read(address + (offset * READBACK_CHUNK) as u32, &mut chunk)
+                .map_err(|_| ChildStoreError::Hardware)?;
+            if chunk != *expected {
+                return Err(ChildStoreError::Hardware);
             }
-            _ => Err(ChildStoreError::Hardware),
         }
+        Ok(())
     }
 }
 
 impl<S: NorFlash> ChildTableStore for ChildTableJournal<S> {
     fn load(&mut self) -> Result<Option<PersistentChildTable>, ChildStoreError> {
-        Ok(self.current()?.map(|located| located.table))
+        self.ensure_scanned()?;
+        Ok(self.cached.as_ref().map(|located| located.table.clone()))
     }
 
     fn store(&mut self, table: &PersistentChildTable) -> Result<(), ChildStoreError> {
-        let current = self.current()?;
-        let generation = match &current {
-            Some(located) => located
-                .generation
+        let current = self.current_location()?;
+        let generation = match current {
+            Some((generation, _)) => generation
                 .checked_add(1)
                 .ok_or(ChildStoreError::GenerationExhausted)?,
             None => 0,
         };
 
-        if let Some(located) = current {
-            if let Some(slot) = self.first_erased_slot(located.sector)? {
-                let result = self.write_record(located.sector, slot, generation, table);
-                self.cache_result(&result, generation, located.sector, table);
+        if let Some((_, current_sector)) = current {
+            if let Some(slot) = self.first_erased_slot(current_sector)? {
+                let result = self.write_record(current_sector, slot, generation, table);
+                self.cache_result(&result, generation, current_sector, table);
                 return result;
             }
-            let target = 1 - located.sector;
+            let target = 1 - current_sector;
             let sector = self.sectors[target];
             let result = self
                 .storage
@@ -1149,11 +1197,20 @@ impl<S: NorFlash> ChildTableJournal<S> {
         table: &PersistentChildTable,
     ) {
         if result.is_ok() {
-            self.cached = Some(LocatedTable {
-                generation,
-                sector,
-                table: table.clone(),
-            });
+            match self.cached.as_mut() {
+                Some(located) => {
+                    located.generation = generation;
+                    located.sector = sector;
+                    located.table.clone_from(table);
+                }
+                None => {
+                    self.cached = Some(LocatedTable {
+                        generation,
+                        sector,
+                        table: table.clone(),
+                    });
+                }
+            }
         } else {
             self.cached = None;
             self.scanned = false;
@@ -1340,6 +1397,11 @@ mod tests {
     struct MockFlash {
         data: [u8; CHILD_JOURNAL_SECTOR_SIZE * 2],
         programs_before_failure: Option<usize>,
+        /// Every read fails (HW-04 scan-error coverage).
+        fail_reads: bool,
+        /// This absolute byte silently keeps its old value when programmed
+        /// (HW-04 read-back verification coverage).
+        drop_program_at: Option<usize>,
     }
 
     impl MockFlash {
@@ -1347,6 +1409,8 @@ mod tests {
             Self {
                 data: [0xFF; CHILD_JOURNAL_SECTOR_SIZE * 2],
                 programs_before_failure: None,
+                fail_reads: false,
+                drop_program_at: None,
             }
         }
 
@@ -1368,6 +1432,9 @@ mod tests {
         const READ_SIZE: usize = 1;
 
         fn read(&mut self, address: u32, output: &mut [u8]) -> Result<(), Self::Error> {
+            if self.fail_reads {
+                return Err(NorFlashErrorKind::Other);
+            }
             let start = Self::offset(address)?;
             let end = start
                 .checked_add(output.len())
@@ -1398,11 +1465,13 @@ mod tests {
                 .checked_add(data.len())
                 .filter(|end| *end <= self.data.len())
                 .ok_or(NorFlashErrorKind::OutOfBounds)?;
-            for (old, new) in self.data[start..end].iter_mut().zip(data) {
+            for (position, (old, new)) in self.data[start..end].iter_mut().zip(data).enumerate() {
                 if (*old & *new) != *new {
                     return Err(NorFlashErrorKind::Other);
                 }
-                *old &= *new;
+                if self.drop_program_at != Some(start + position) {
+                    *old &= *new;
+                }
             }
             Ok(())
         }
@@ -1424,6 +1493,31 @@ mod tests {
 
     fn journal(flash: MockFlash) -> ChildTableJournal<MockFlash> {
         ChildTableJournal::new(flash, 0, CHILD_JOURNAL_SECTOR_SIZE as u32)
+    }
+
+    /// HW-04 HIL fixture: an 8 KiB child journal partition image with
+    /// `HW04_CHILD_COUNT` (default 4) short-timeout end-device children bound
+    /// to `HW04_CHILD_EPID` (16 hex digits, on-air byte order).
+    #[test]
+    #[ignore = "writes a HIL fixture to $HW04_CHILD_IMAGE"]
+    fn hw04_dump_child_image() {
+        let path = std::env::var("HW04_CHILD_IMAGE").expect("HW04_CHILD_IMAGE");
+        let hex = std::env::var("HW04_CHILD_EPID").expect("HW04_CHILD_EPID");
+        let count = std::env::var("HW04_CHILD_COUNT").map_or(4, |n| n.parse().unwrap());
+        let mut epid = [0u8; 8];
+        for (i, byte) in epid.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+        }
+        let mut table = PersistentChildTable::new(epid);
+        for seed in 0..count {
+            let mut entry = child(0xC0 + seed, 0x7A00 + u16::from(seed), 0);
+            entry.rx_on_when_idle = false;
+            entry.is_router = false;
+            table.push(entry).unwrap();
+        }
+        let mut store = journal(MockFlash::new());
+        store.store(&table).unwrap();
+        std::fs::write(path, &store.into_storage().data[..]).unwrap();
     }
 
     #[test]
@@ -1603,5 +1697,115 @@ mod tests {
         store.store(&expected).unwrap();
         assert_eq!(store.storage().rejected, 0);
         assert_eq!(store.load(), Ok(Some(expected)));
+    }
+
+    /// The pre-HW-04 record construction: separately encoded table copied
+    /// into an erased slot, CRC, then the commit marker.
+    fn reference_record(
+        generation: u32,
+        table: &PersistentChildTable,
+    ) -> [u8; CHILD_JOURNAL_SLOT_SIZE] {
+        let mut encoded = [0u8; MAX_ENCODED_CHILD_TABLE_LEN];
+        let encoded_len = table.encode(&mut encoded);
+        raw_record(generation, RECORD_VERSION, &encoded[..encoded_len])
+    }
+
+    fn raw_record(generation: u32, version: u8, encoded: &[u8]) -> [u8; CHILD_JOURNAL_SLOT_SIZE] {
+        let mut record = [0xFFu8; CHILD_JOURNAL_SLOT_SIZE];
+        record[0..4].copy_from_slice(&RECORD_MAGIC);
+        record[4] = version;
+        record[5..7].copy_from_slice(&(encoded.len() as u16).to_le_bytes());
+        record[7] = 0;
+        record[8..12].copy_from_slice(&generation.to_le_bytes());
+        record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded.len()]
+            .copy_from_slice(encoded);
+        let crc = crate::security_journal::crc32(&record[..RECORD_CRC_OFFSET]);
+        record[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4].copy_from_slice(&RECORD_COMMIT);
+        record
+    }
+
+    fn maximal_table() -> PersistentChildTable {
+        let children: heapless::Vec<PersistentChild, MAX_PERSISTED_CHILDREN> = (0
+            ..MAX_PERSISTED_CHILDREN)
+            .map(|index| child(index as u8 + 1, 0x0100 + index as u16, (index % 15) as u8))
+            .collect();
+        table(&children)
+    }
+
+    fn slot_bytes(flash: &MockFlash, sector: usize, slot: usize) -> &[u8] {
+        let start = sector * CHILD_JOURNAL_SECTOR_SIZE + slot * CHILD_JOURNAL_SLOT_SIZE;
+        &flash.data[start..start + CHILD_JOURNAL_SLOT_SIZE]
+    }
+
+    #[test]
+    fn hw04_in_place_encoding_keeps_exact_on_flash_bytes() {
+        for expected in [table(&[]), table(&[child(1, 0x0002, 8)]), maximal_table()] {
+            let mut store = journal(MockFlash::new());
+            store.store(&expected).unwrap();
+            store.store(&expected).unwrap();
+            let flash = store.into_storage();
+            assert_eq!(slot_bytes(&flash, 0, 0), reference_record(0, &expected));
+            assert_eq!(slot_bytes(&flash, 0, 1), reference_record(1, &expected));
+            assert_eq!(journal(flash).load(), Ok(Some(expected)));
+        }
+    }
+
+    #[test]
+    fn hw04_scan_keeps_first_of_equal_generations_and_skips_malformed_newest() {
+        let first = table(&[child(1, 0x0002, 8)]);
+        let second = table(&[child(2, 0x0003, 8)]);
+        let mut flash = MockFlash::new();
+        let place = |flash: &mut MockFlash, sector: usize, slot: usize, record: &[u8]| {
+            let start = sector * CHILD_JOURNAL_SECTOR_SIZE + slot * CHILD_JOURNAL_SLOT_SIZE;
+            flash.data[start..start + CHILD_JOURNAL_SLOT_SIZE].copy_from_slice(record);
+        };
+        place(&mut flash, 1, 0, &reference_record(4, &second));
+        place(&mut flash, 0, 3, &reference_record(4, &first));
+        // A newer record with a valid CRC whose payload does not decode.
+        let mut malformed = [0u8; 10];
+        malformed[..8].copy_from_slice(&EPID);
+        malformed[9] = 3;
+        place(&mut flash, 1, 1, &raw_record(9, RECORD_VERSION, &malformed));
+        let mut store = journal(flash);
+        assert_eq!(store.load(), Ok(Some(first.clone())));
+        // The next store supersedes generation 4 in the selected sector.
+        let next = table(&[child(3, 0x0004, 8)]);
+        store.store(&next).unwrap();
+        let flash = store.into_storage();
+        assert_eq!(slot_bytes(&flash, 0, 0), reference_record(5, &next));
+        assert_eq!(journal(flash).load(), Ok(Some(next)));
+    }
+
+    #[test]
+    fn hw04_verify_mismatch_is_a_hardware_error_and_drops_the_cache() {
+        let good = table(&[child(1, 0x0002, 8)]);
+        let mut store = journal(MockFlash::new());
+        store.store(&good).unwrap();
+        // Corrupt one payload byte of the next record (slot 1) silently.
+        store.storage.drop_program_at = Some(CHILD_JOURNAL_SLOT_SIZE + RECORD_ENCODED_OFFSET);
+        assert_eq!(
+            store.store(&table(&[child(2, 0x0003, 8)])),
+            Err(ChildStoreError::Hardware)
+        );
+        assert!(store.cached.is_none() && !store.scanned);
+        store.storage.drop_program_at = None;
+        assert_eq!(store.load(), Ok(Some(good.clone())));
+        assert_eq!(journal(store.into_storage()).load(), Ok(Some(good)));
+    }
+
+    #[test]
+    fn hw04_scan_read_error_leaves_no_cache() {
+        let good = table(&[child(1, 0x0002, 8)]);
+        let mut store = journal(MockFlash::new());
+        store.store(&good).unwrap();
+        let mut flash = store.into_storage();
+        flash.fail_reads = true;
+        let mut reopened = journal(flash);
+        assert_eq!(reopened.load(), Err(ChildStoreError::Hardware));
+        assert!(reopened.cached.is_none() && !reopened.scanned);
+        assert_eq!(reopened.store(&good), Err(ChildStoreError::Hardware));
+        reopened.storage.fail_reads = false;
+        assert_eq!(reopened.load(), Ok(Some(good)));
     }
 }

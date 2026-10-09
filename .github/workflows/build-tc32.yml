@@ -9,6 +9,9 @@ on:
       - "tools/telink-tlsr8258-lab/**"
       - "scripts/tlsr8258.sh"
       - "tools/tlsr8258-firmware.sh"
+      - "tools/tlsr8258-stack-report.py"
+      - "tools/tlsr8258-router-stack-gate.args"
+      - "tools/test_tlsr8258_stack_tools.py"
       - "tools/firmware-size-report.sh"
       - "examples/telink-tlsr8258-radio/**"
       - "tlsr8258-hal/**"
@@ -27,6 +30,9 @@ on:
       - "tools/telink-tlsr8258-lab/**"
       - "scripts/tlsr8258.sh"
       - "tools/tlsr8258-firmware.sh"
+      - "tools/tlsr8258-stack-report.py"
+      - "tools/tlsr8258-router-stack-gate.args"
+      - "tools/test_tlsr8258_stack_tools.py"
       - "tools/firmware-size-report.sh"
       - "examples/telink-tlsr8258-radio/**"
       - "tlsr8258-hal/**"
@@ -237,6 +243,7 @@ jobs:
 
       - name: Run host HAL and radio tests
         run: |
+          python3 tools/test_tlsr8258_stack_tools.py
           HOST_TARGET="$(rustc "+${HOST_RUST_TOOLCHAIN}" -vV | sed -n 's/^host: //p')"
           for manifest in \
             tlsr8258-hal/Cargo.toml \

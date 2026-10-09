@@ -34,6 +34,41 @@ macro_rules! await_out_of_line {
     }};
 }
 
+/// Await a sub-future that is constructed directly in its pinned slot.
+///
+/// A plain `.await` on an `async fn` call whose constructor LLVM keeps out of
+/// line returns the whole sub-future into a temporary of the caller's poll
+/// function and then copies it into the caller's coroutine state. That
+/// temporary is as large as the sub-future and stays reserved in the caller's
+/// poll frame, which is live under every deeper poll of a nested chain.
+///
+/// This form builds the sub-future inside [`emplace_future`], a short
+/// synchronous frame that has already returned before the first poll, and
+/// then polls it in place with ordinary static dispatch. Use it only where a
+/// measured large construct-then-move copy sits on a deep poll chain; the
+/// per-site constructor costs a few bytes of flash.
+#[macro_export]
+macro_rules! await_in_place {
+    ($future:expr) => {{
+        let slot = ::core::pin::pin!(::core::option::Option::None);
+        $crate::emplace_future(slot, || $future).await
+    }};
+}
+
+/// Construct a future directly in its pinned slot; see [`await_in_place!`].
+#[doc(hidden)]
+#[inline(never)]
+pub fn emplace_future<F: core::future::Future>(
+    mut slot: core::pin::Pin<&mut Option<F>>,
+    make: impl FnOnce() -> F,
+) -> core::pin::Pin<&mut F> {
+    slot.set(Some(make()));
+    match slot.as_pin_mut() {
+        Some(future) => future,
+        None => unreachable!(),
+    }
+}
+
 /// IEEE 802.15.4 extended address (EUI-64)
 pub type IeeeAddress = [u8; 8];
 

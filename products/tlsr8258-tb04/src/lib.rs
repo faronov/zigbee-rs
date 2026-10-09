@@ -6,6 +6,8 @@
 pub mod router;
 #[cfg(feature = "sensor")]
 pub mod sensor;
+#[cfg(all(target_arch = "tc32", feature = "router"))]
+pub mod stack_guard;
 #[cfg(target_arch = "tc32")]
 pub mod storage;
 

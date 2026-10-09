@@ -77,6 +77,20 @@ macro_rules! await_out_of_line {
     }};
 }
 
+/// Await a sub-future constructed directly in its pinned slot; see
+/// `zigbee_types::await_in_place!`. Used only on measured deep poll chains
+/// where a non-inlined constructor would otherwise return the whole sub-future
+/// into a caller poll-frame temporary (HW-04).
+macro_rules! await_in_place {
+    ($future:expr) => {{
+        let slot = core::pin::pin!(core::option::Option::None);
+        zigbee_types::emplace_future(slot, || $future).await
+    }};
+}
+
+#[doc(hidden)]
+pub use zigbee_types::emplace_future;
+
 pub mod aps_table_store;
 pub mod binding_persistence;
 pub mod builder;
@@ -9856,7 +9870,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         {
             if self.secure_rejoin_pending() {
                 self.configure_restored_network().await?;
-                return self.rejoin_with_security_store(store).await;
+                return await_in_place!(self.rejoin_with_security_store(store));
             }
             let announce_pending = self.bdb.zdo().nwk().nib().device_announce_pending;
             let address = self.rejoin_mode(!announce_pending).await?;
@@ -9869,7 +9883,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             return Ok(address);
         }
 
-        self.start_fresh_steering_with_security_store(store).await
+        await_in_place!(self.start_fresh_steering_with_security_store(store))
     }
 
     /// Resume a committed coordinator PAN when available, otherwise form and
@@ -10263,10 +10277,11 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             RejoinFallback::NotRejoinable => Err(event_loop::StartError::PersistenceFailed(
                 SecurityStoreError::Corrupt,
             )),
-            RejoinFallback::SecureOnly => self.secure_rejoin_with_security_store(store).await,
+            RejoinFallback::SecureOnly => {
+                await_in_place!(self.secure_rejoin_with_security_store(store))
+            }
             RejoinFallback::TrustCenterRejoin => {
-                self.secure_then_trust_center_rejoin_with_security_store(store)
-                    .await
+                await_in_place!(self.secure_then_trust_center_rejoin_with_security_store(store))
             }
         }
     }
@@ -10285,11 +10300,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     ) -> Result<u16, event_loop::StartError> {
         match Self::rejoin_fallback_policy(store)? {
             RejoinFallback::TrustCenterRejoin => {
-                self.secure_then_trust_center_rejoin_with_security_store(store)
-                    .await
+                await_in_place!(self.secure_then_trust_center_rejoin_with_security_store(store))
             }
             RejoinFallback::NotRejoinable | RejoinFallback::SecureOnly => {
-                self.secure_rejoin_with_security_store(store).await
+                await_in_place!(self.secure_rejoin_with_security_store(store))
             }
         }
     }
@@ -10332,7 +10346,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         &mut self,
         store: &mut S,
     ) -> Result<u16, event_loop::StartError> {
-        match self.secure_rejoin_with_security_store(store).await {
+        match await_in_place!(self.secure_rejoin_with_security_store(store)) {
             // Only a failed over-the-air exchange may widen to the unsecured
             // Trust Center rejoin; persistence failures stop here.
             Err(event_loop::StartError::CommissioningFailed(status)) => {
@@ -10477,9 +10491,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     false
                 }
             };
-            self.bdb
-                .rejoin_previous_network_with_replay_commit(&mut commit_replay)
-                .await
+            await_in_place!(
+                self.bdb
+                    .rejoin_previous_network_with_replay_commit(&mut commit_replay)
+            )
         };
         if let Some(error) = replay_error {
             self.bdb.zdo_mut().nwk_mut().set_joined(false);
@@ -11437,12 +11452,16 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     }
 
     /// Persist the APS binding and group tables for the current network.
+    // Out of line so the snapshot stays one frame-local instead of being
+    // merged into the calling async state machine's poll frame (HW-04).
+    #[inline(never)]
     pub fn save_aps_tables<S: aps_table_store::ApsTableStore>(
         &mut self,
         store: &mut S,
     ) -> Result<(), aps_table_store::ApsTableStoreError> {
         let aps = self.bdb.zdo().aps();
-        let snapshot = aps_table_store::PersistentApsTables::capture_with_security(
+        let mut snapshot = aps_table_store::PersistentApsTables::default();
+        snapshot.capture_with_security_into(
             self.bdb.zdo().nwk().nib().extended_pan_id,
             aps.binding_table(),
             aps.group_table(),
@@ -11492,19 +11511,20 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     ///
     /// A non-empty snapshot from another Extended PAN ID is rejected instead
     /// of installing application state from an old membership.
+    #[inline(never)]
     pub fn restore_aps_tables<S: aps_table_store::ApsTableStore>(
         &mut self,
         store: &mut S,
     ) -> Result<usize, aps_table_store::ApsTableStoreError> {
-        let snapshot = store.load()?;
-        let Some(mut snapshot) = snapshot else {
+        let mut snapshot = aps_table_store::PersistentApsTables::default();
+        if !store.load_into(&mut snapshot)? {
             let aps = self.bdb.zdo_mut().aps_mut();
             aps.binding_table_mut().clear();
             aps.group_table_mut().clear();
             aps.security_mut().clear_application_link_keys();
             self.mark_aps_tables_persisted();
             return Ok(0);
-        };
+        }
         snapshot.validate()?;
         let extended_pan_id = self.bdb.zdo().nwk().nib().extended_pan_id;
         if !snapshot.is_empty() && !snapshot.matches_network(&extended_pan_id) {
@@ -11523,8 +11543,11 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         let restored =
             snapshot.bindings().len() + snapshot.groups().len() + snapshot.application_keys().len();
         let aps = self.bdb.zdo_mut().aps_mut();
-        *aps.binding_table_mut() = snapshot.bindings().clone();
-        *aps.group_table_mut() = snapshot.groups().clone();
+        // `snapshot` is consumed here: swapping moves the restored tables into
+        // the live APS layer without a stack clone of either table (HW-04).
+        let (bindings, groups) = snapshot.tables_mut();
+        core::mem::swap(aps.binding_table_mut(), bindings);
+        core::mem::swap(aps.group_table_mut(), groups);
         aps.security_mut().clear_application_link_keys();
         for stored in snapshot.application_keys() {
             aps.security_mut()
@@ -11547,6 +11570,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     }
 
     /// Clear both live and durable APS binding/group state.
+    #[inline(never)]
     pub fn clear_persisted_aps_tables<S: aps_table_store::ApsTableStore>(
         &mut self,
         store: &mut S,
@@ -11936,6 +11960,11 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// This helper has no formed-PAN or coordinator Trust Center branch, so a
     /// steering startup future cannot pull coordinator persistence into a
     /// router or relay image.
+    ///
+    /// Kept out of line so the decoded `PersistentSecurityState` lives in this
+    /// short synchronous frame instead of the caller's async poll frame, which
+    /// stays live under the whole steering/rejoin chain (HW-04).
+    #[inline(never)]
     fn restore_steering_security_state<S: SecurityStateStore>(
         &mut self,
         store: &mut S,
@@ -13374,10 +13403,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             // that cannot occur.
             UserAction::Join | UserAction::Toggle => {
                 if self.secure_rejoin_pending() {
-                    return self.retry_secure_rejoin_with_security_store(store).await;
+                    return await_in_place!(self.retry_secure_rejoin_with_security_store(store));
                 }
                 log::info!("[Runtime] User action: Join");
-                match A::start_with_security_store(self, store).await {
+                match await_in_place!(A::start_with_security_store(self, store)) {
                     Ok(addr) => Ok(event_loop::TickResult::Event(
                         event_loop::StackEvent::Joined {
                             short_address: addr,
@@ -13393,7 +13422,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             }
             UserAction::Rejoin => {
                 log::info!("[Runtime] User action: Rejoin");
-                self.retry_secure_rejoin_with_security_store(store).await
+                await_in_place!(self.retry_secure_rejoin_with_security_store(store))
             }
             UserAction::Leave | UserAction::FactoryReset => {
                 log::info!("[Runtime] User action: Leave/Factory Reset");
@@ -13420,7 +13449,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         store: &mut S,
     ) -> Result<event_loop::TickResult, SecurityStoreError> {
         log::info!("[Runtime] Retrying persisted rejoin policy");
-        match self.rejoin_with_security_store(store).await {
+        match await_in_place!(self.rejoin_with_security_store(store)) {
             Ok(addr) => Ok(event_loop::TickResult::Event(
                 event_loop::StackEvent::Joined {
                     short_address: addr,

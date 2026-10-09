@@ -1,0 +1,91 @@
+# HW-04 static stack gate for the production TLSR8258 router ELF.
+# Usage: tools/tlsr8258-stack-report.py ELF --compact --check @tools/tlsr8258-router-stack-gate.args
+#
+# Heuristic direct-call bound, not a whole-program proof: unresolved indirect
+# edges below are reviewed, not proven bounded. HIL stack paint stays the
+# authoritative runtime evidence.
+
+--declared-svc
+20480
+--declared-irq
+1024
+--min-gap
+4096
+--max-frame
+4096
+
+# Steady-state executor root. Nothing reachable from it (or from the IRQ
+# root) may exceed --max-frame, and no --frame-allow symbol may be reachable
+# from it: reviewed frame exceptions are bootstrap-only.
+--runtime-root
+^tlsr8258_rt::block_on_pinned::<
+
+# HW-04 reviewed exception (exact symbol, not a pattern). One-shot boot frame:
+# the device builder holds the by-value TelinkMac (2352 B) while the MAC
+# constructor temporary (2128 B) is copied in; build_device runs once from
+# app::init before the pinned executor starts and is unreachable from it.
+# Growing above 4672 B, or becoming reachable from the runtime root, fails.
+# Its whole bootstrap chain is still bounded by the `bootstrap` budget below
+# and by the declared 20 KiB SVC stack.
+--frame-allow
+telink_tlsr8258_router::app::build_device=4672
+
+# Canonical chain budgets (HW-04 Phase C): the worst SVC path through any
+# matching function, measured on the final ELF, rounded up to the next 256 B
+# boundary above the measurement (< 512 B slack). A regression fails the build.
+# Budgets bound the static heuristic only; HIL stack paint stays authoritative.
+--chain-budget
+bootstrap=^telink_tlsr8258_router::app::build_device$=13312
+--chain-budget
+clean-restore=(RouterCore<.*>::activate_network|restore_steering_security_state|configure_restored_network|install_restored_network_security|finish_restored_security_state)=10752
+--chain-budget
+aps-restore=(restore_aps_tables|ApsTableJournal<.*>::(newest|ensure_scanned|load))=10752
+--chain-budget
+aps-persist=(persist_aps_tables_if_dirty|save_aps_tables|clear_persisted_aps_tables|clear_stale_before_fresh|ApsTableJournal<.*>::(store|write_record|clear))=10752
+--chain-budget
+child-restore=^<zigbee_runtime::child_store::ChildTableJournal<.*>::(load|ensure_scanned|scan_into_cache|cache_result)=12032
+--chain-budget
+child-persist=(persist_children_if_dirty|clear_persisted_child_table|^<zigbee_runtime::child_store::ChildTableJournal<.*>::(store|write_record|clear))=11520
+--chain-budget
+security-replay-cache=^<zigbee_runtime::security_journal::SecurityStateJournal<=12032
+--chain-budget
+steering-rejoin=(start_or_resume_steering|secure_rejoin|rejoin_with|start_fresh_steering|nlme_network_discovery|tick_steering_deferred_reset)=15872
+--chain-budget
+secured-receive=(process_incoming_aps_frame_with_data_persistence|aps_decrypt_incoming|process_incoming_nwk_frame_from_with_replay_commit|NwkSecurity>::decrypt_with|authenticate_incoming)=14848
+--chain-budget
+bind-trigger=(ZdoLayer<.*>::handle_(un)?bind_req|persist_aps_tables_if_dirty)=9216
+--chain-budget
+factory-reset-leave=(factory_reset|nlme_leave|handle_mgmt_leave_req|complete_pending_factory_reset)=10752
+
+# Reviewed functions with unresolved indirect call sites (dyn FnMut /
+# cluster vtables / flash guard hooks). Any new one fails the gate.
+--allow-unresolved
+^<&mut dyn core::ops::function::FnMut<\.\.> as core::ops::function::FnMut<\.\.>>::call_mut$
+--allow-unresolved
+^<&mut dyn core::ops::function::FnMut<\.\.> as core::ops::function::FnOnce<\.\.>>::call_once::\{shim:vtable#0\}$
+--allow-unresolved
+^<core::option::Option<\.\.>>::or_else::<<\.\.>::dispatch_inner::\{closure#7\}>$
+--allow-unresolved
+^<zigbee_aps::ApsLayer<\.\.>>::process_incoming_aps_frame_with_data_persistence$
+--allow-unresolved
+^<zigbee_bdb::BdbLayer<\.\.>>::finalize_tclk_success::\{closure#0\}$
+--allow-unresolved
+^<zigbee_bdb::BdbLayer<\.\.>>::reserve_trust_center_link_key$
+--allow-unresolved
+^<zigbee_nwk::NwkLayer<\.\.>>::authenticate_incoming$
+--allow-unresolved
+^<zigbee_nwk::security::NwkSecurity>::commit_frame_counter_for_key_protecting$
+--allow-unresolved
+^<zigbee_runtime::ZigbeeDevice<\.\.>>::send_due_reports::\{closure#0\}$
+--allow-unresolved
+^<zigbee_runtime::security_journal::SecurityStateJournal<\.\.> as zigbee_runtime::security_store::SecurityStateStore>::(retain|visit)_replay_counters$
+--allow-unresolved
+^<zigbee_runtime::zcl_dispatch::LocalZclCtx<\.\.>>::(apply_configure_reporting|dispatch|reset_zcl_to_factory_defaults)$
+--allow-unresolved
+^<zigbee_runtime::zcl_dispatch::LocalZclCtx<\.\.>>::with_cluster(_mut|_for_direction)?::<.*<\.\.>::dispatch_inner::\{closure#\d+\}>$
+--allow-unresolved
+^tlsr8258_hal::flash::ensure_safe_flash$
+--allow-unresolved
+^zigbee_aps::apsde::aps_decrypt_incoming::<zigbee_mac::telink::imp::TelinkMac>$
+--allow-unresolved
+^zigbee_zcl::foundation::(discover::process_discover_extended_dyn|write_attributes::(process_write_dyn|validate_write_undivided_dyn))$

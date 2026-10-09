@@ -399,14 +399,12 @@ where
         } = self;
         let mut clusters = ApplicationClusters::new();
         profile.collect_clusters(&mut clusters)?;
-        device
-            .tick_with_steering_security_store_deferred_reset(
-                elapsed_secs,
-                clusters.as_mut_slice(),
-                *security_store,
-            )
-            .await
-            .map_err(NodeError::Persistence)
+        await_in_place!(device.tick_with_steering_security_store_deferred_reset(
+            elapsed_secs,
+            clusters.as_mut_slice(),
+            *security_store,
+        ))
+        .map_err(NodeError::Persistence)
     }
 
     /// Tick a coordinator with a formation-only pending-action path.

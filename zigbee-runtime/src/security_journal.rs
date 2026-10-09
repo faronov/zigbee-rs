@@ -556,15 +556,14 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
         replay.push(update).map_err(|_| SecurityStoreError::Full)
     }
 
-    fn scan_replay(
+    /// Rebuild `cached_replay` for `generation` directly in place (HW-04: no
+    /// by-value replay vector is returned through the stack).
+    fn scan_replay_into_cache(
         &mut self,
         sector: usize,
         generation: u32,
-    ) -> Result<
-        heapless::Vec<PersistentReplayCounter, MAX_PERSISTENT_REPLAY_COUNTERS>,
-        SecurityStoreError,
-    > {
-        let mut replay = heapless::Vec::new();
+    ) -> Result<(), SecurityStoreError> {
+        self.cached_replay.clear();
         let mut record = [0u8; SECURITY_JOURNAL_SLOT_SIZE];
         for slot in 0..Self::SLOTS_PER_SECTOR {
             self.read_slot(sector, slot, &mut record)?;
@@ -579,15 +578,21 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
                 let Some(update) = Self::decode_replay_entry(entry) else {
                     break;
                 };
-                Self::merge_replay(&mut replay, update)?;
+                Self::merge_replay(&mut self.cached_replay, update)?;
             }
         }
-        Ok(replay)
+        Ok(())
     }
 
     fn ensure_replay_cache(&mut self, located: &LocatedState) -> Result<(), SecurityStoreError> {
         if self.replay_generation != Some(located.generation) {
-            self.cached_replay = self.scan_replay(located.sector, located.generation)?;
+            // The cache is rebuilt in place; a failed scan leaves no
+            // generation claiming the partially rebuilt view.
+            self.replay_generation = None;
+            if let Err(error) = self.scan_replay_into_cache(located.sector, located.generation) {
+                self.cached_replay.clear();
+                return Err(error);
+            }
             self.replay_generation = Some(located.generation);
         }
         Ok(())
@@ -692,19 +697,22 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
         replay_count.div_ceil(REPLAY_ENTRIES_PER_SLOT)
     }
 
+    /// Write the staged `cached_replay` snapshot, in order, from
+    /// `first_slot`.
     fn write_replay_snapshot(
         &mut self,
         sector: usize,
         first_slot: usize,
         generation: u32,
-        replay: &[PersistentReplayCounter],
     ) -> Result<(), SecurityStoreError> {
-        for (slot_offset, chunk) in replay.chunks(REPLAY_ENTRIES_PER_SLOT).enumerate() {
-            let slot = first_slot + slot_offset;
-            self.write_replay_header(sector, slot, generation)?;
-            for (index, update) in chunk.iter().copied().enumerate() {
-                self.write_replay_entry(sector, slot, index, update)?;
+        for position in 0..self.cached_replay.len() {
+            let slot = first_slot + position / REPLAY_ENTRIES_PER_SLOT;
+            let index = position % REPLAY_ENTRIES_PER_SLOT;
+            if index == 0 {
+                self.write_replay_header(sector, slot, generation)?;
             }
+            let update = self.cached_replay[position];
+            self.write_replay_entry(sector, slot, index, update)?;
         }
         Ok(())
     }
@@ -715,19 +723,21 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
         state_slot: usize,
         generation: u32,
         state: &PersistentSecurityState,
-        replay: &heapless::Vec<PersistentReplayCounter, MAX_PERSISTENT_REPLAY_COUNTERS>,
     ) -> Result<(), SecurityStoreError> {
-        self.write_replay_snapshot(sector, state_slot + 1, generation, replay.as_slice())?;
+        self.write_replay_snapshot(sector, state_slot + 1, generation)?;
         self.write_record(sector, state_slot, generation, state)
     }
 
-    /// Write `state` and the complete `replay` snapshot as `generation`.
+    /// Write `state` and the complete replay snapshot staged in
+    /// `cached_replay` as `generation`.
     ///
     /// The new generation goes into an erased run of the current sector when
     /// one is large enough, otherwise (or when `rollover` forces it) into the
-    /// freshly erased other sector. On success the caches describe the new
-    /// generation and `replay` is moved into the replay cache; on failure every
-    /// cache is dropped so the next access rescans the flash.
+    /// freshly erased other sector. Callers stage the snapshot in place in
+    /// `cached_replay` (HW-04: no by-value replay copy on the stack). On
+    /// success the caches describe the new generation; on any failure every
+    /// cache is dropped so the next access rescans the flash and the staged
+    /// view can never be mistaken for a durable one.
     #[inline(never)]
     fn commit_generation(
         &mut self,
@@ -735,9 +745,32 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
         rollover: bool,
         generation: u32,
         state: &PersistentSecurityState,
-        replay: &mut heapless::Vec<PersistentReplayCounter, MAX_PERSISTENT_REPLAY_COUNTERS>,
     ) -> Result<(), SecurityStoreError> {
-        let needed = 1 + Self::replay_snapshot_slots(replay.len());
+        match self.write_generation(current_sector, rollover, generation, state) {
+            Ok(target) => {
+                self.cached = Some(LocatedState {
+                    generation,
+                    sector: target,
+                    state: *state,
+                });
+                self.replay_generation = Some(generation);
+                Ok(())
+            }
+            Err(error) => {
+                self.invalidate();
+                Err(error)
+            }
+        }
+    }
+
+    fn write_generation(
+        &mut self,
+        current_sector: Option<usize>,
+        rollover: bool,
+        generation: u32,
+        state: &PersistentSecurityState,
+    ) -> Result<usize, SecurityStoreError> {
+        let needed = 1 + Self::replay_snapshot_slots(self.cached_replay.len());
         if needed > Self::SLOTS_PER_SECTOR {
             return Err(SecurityStoreError::Full);
         }
@@ -753,26 +786,13 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
             None => (0, 0, true),
         };
         let sector = self.sectors[target];
-        let result = (|| {
-            if erase {
-                self.storage
-                    .erase(sector, sector + SECTOR_SIZE as u32)
-                    .map_err(|_| SecurityStoreError::Hardware)?;
-            }
-            self.activate_generation(target, state_slot, generation, state, replay)
-        })();
-        if result.is_ok() {
-            self.cached = Some(LocatedState {
-                generation,
-                sector: target,
-                state: *state,
-            });
-            self.cached_replay = core::mem::take(replay);
-            self.replay_generation = Some(generation);
-        } else {
-            self.invalidate();
+        if erase {
+            self.storage
+                .erase(sector, sector + SECTOR_SIZE as u32)
+                .map_err(|_| SecurityStoreError::Hardware)?;
         }
-        result
+        self.activate_generation(target, state_slot, generation, state)?;
+        Ok(target)
     }
 
     fn find_replay_append_position(
@@ -861,19 +881,21 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
             None => 0,
         };
 
-        let mut replay = heapless::Vec::new();
         if let Some(located) = current
             && located.state.replay_domain_continues_into(state)
         {
             self.ensure_replay_cache(&located)?;
-            replay = self.cached_replay.clone();
+        } else {
+            // A new replay domain starts empty; the cleared cache no longer
+            // describes any durable generation until the commit succeeds.
+            self.cached_replay.clear();
+            self.replay_generation = None;
         }
         self.commit_generation(
             current.map(|located| located.sector),
             false,
             generation,
             state,
-            &mut replay,
         )
     }
 
@@ -941,16 +963,10 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
             .generation
             .checked_add(1)
             .ok_or(SecurityStoreError::GenerationExhausted)?;
-        let mut compacted = self.cached_replay.clone();
-        Self::merge_replay(&mut compacted, replay)?;
-        self.commit_generation(
-            Some(located.sector),
-            true,
-            generation,
-            &located.state,
-            &mut compacted,
-        )
-        .map(|()| ReplayCommitOutcome::Advanced)
+        // `merge_replay` leaves the cache untouched when it fails.
+        Self::merge_replay(&mut self.cached_replay, replay)?;
+        self.commit_generation(Some(located.sector), true, generation, &located.state)
+            .map(|()| ReplayCommitOutcome::Advanced)
     }
 
     fn tombstone_replay_counters(
@@ -961,24 +977,19 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
             return Ok(());
         };
         self.ensure_replay_cache(&located)?;
-        let mut compacted = self.cached_replay.clone();
-        let previous_len = compacted.len();
-        compacted.retain(|replay| !replay.matches_tombstone(tombstone));
-        if compacted.len() == previous_len {
+        // Compacted in place: the cache is only staged here and is
+        // invalidated by every non-committing exit below.
+        let previous_len = self.cached_replay.len();
+        self.cached_replay
+            .retain(|replay| !replay.matches_tombstone(tombstone));
+        if self.cached_replay.len() == previous_len {
             return Ok(());
         }
-
-        let generation = located
-            .generation
-            .checked_add(1)
-            .ok_or(SecurityStoreError::GenerationExhausted)?;
-        self.commit_generation(
-            Some(located.sector),
-            false,
-            generation,
-            &located.state,
-            &mut compacted,
-        )
+        let Some(generation) = located.generation.checked_add(1) else {
+            self.invalidate();
+            return Err(SecurityStoreError::GenerationExhausted);
+        };
+        self.commit_generation(Some(located.sector), false, generation, &located.state)
     }
 
     fn retain_replay_counters(
@@ -989,26 +1000,20 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
             return Ok(0);
         };
         self.ensure_replay_cache(&located)?;
-        let mut compacted = self.cached_replay.clone();
-        let previous_len = compacted.len();
-        compacted.retain(|replay| retain(*replay));
-        let removed = previous_len - compacted.len();
+        // Compacted in place: the cache is only staged here and is
+        // invalidated by every non-committing exit below.
+        let previous_len = self.cached_replay.len();
+        self.cached_replay.retain(|replay| retain(*replay));
+        let removed = previous_len - self.cached_replay.len();
         if removed == 0 {
             return Ok(0);
         }
-
-        let generation = located
-            .generation
-            .checked_add(1)
-            .ok_or(SecurityStoreError::GenerationExhausted)?;
-        self.commit_generation(
-            Some(located.sector),
-            false,
-            generation,
-            &located.state,
-            &mut compacted,
-        )
-        .map(|()| removed)
+        let Some(generation) = located.generation.checked_add(1) else {
+            self.invalidate();
+            return Err(SecurityStoreError::GenerationExhausted);
+        };
+        self.commit_generation(Some(located.sector), false, generation, &located.state)
+            .map(|()| removed)
     }
 }
 
@@ -2409,5 +2414,99 @@ pub(crate) mod tests {
         journal.commit_replay_counter(nwk_replay(7)).unwrap();
         journal.commit_replay_counter(nwk_replay(9)).unwrap();
         assert_eq!(journal.storage_mut().rejected, 0);
+    }
+
+    /// HW-04: replay compaction and new-epoch stores stage the snapshot in
+    /// the live cache. A failed commit must never let that staged view
+    /// survive in the same journal instance: the next visit rescans flash.
+    #[test]
+    fn hw04_failed_in_place_replay_commits_never_expose_the_staged_cache() {
+        let removed = [0x51; 8];
+        let removed_replay = nwk_replay_for(removed, key_fingerprint(&[3; 16]), 7);
+        let retained_replay = aps_key_pair_replay([0x52; 8], key_fingerprint(&[6; 16]), 3);
+        let seeded = || {
+            let mut journal =
+                SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+            journal.store(&commissioned_state()).unwrap();
+            journal.commit_replay_counter(removed_replay).unwrap();
+            journal.commit_replay_counter(retained_replay).unwrap();
+            journal
+        };
+        let assert_both = |journal: &mut SecurityStateJournal<_, SECURITY_JOURNAL_SECTOR_SIZE>| {
+            let entries = replay_entries(journal);
+            assert_eq!(entries.len(), 2);
+            assert!(entries.contains(&removed_replay));
+            assert!(entries.contains(&retained_replay));
+        };
+
+        for failure_after in 0..8 {
+            let mut journal = seeded();
+            journal.storage_mut().programs_before_failure = Some(failure_after);
+            let result = journal.tombstone_replay_counters(ReplayCounterTombstone::Device(removed));
+            journal.storage_mut().programs_before_failure = None;
+            if result.is_err() {
+                assert_both(&mut journal);
+            } else {
+                assert_eq!(replay_entries(&mut journal).as_slice(), &[retained_replay]);
+            }
+
+            let mut journal = seeded();
+            journal.storage_mut().programs_before_failure = Some(failure_after);
+            let result = journal.retain_replay_counters(&|replay| replay == retained_replay);
+            journal.storage_mut().programs_before_failure = None;
+            if result.is_err() {
+                assert_both(&mut journal);
+            } else {
+                assert_eq!(result, Ok(1));
+                assert_eq!(replay_entries(&mut journal).as_slice(), &[retained_replay]);
+            }
+
+            let mut next_epoch = commissioned_state();
+            next_epoch.extended_pan_id = [8; 8];
+            let mut journal = seeded();
+            journal.storage_mut().programs_before_failure = Some(failure_after);
+            let result = journal.store(&next_epoch);
+            journal.storage_mut().programs_before_failure = None;
+            if result.is_err() {
+                assert_eq!(journal.load(), Ok(Some(commissioned_state())));
+                assert_both(&mut journal);
+            } else {
+                assert_eq!(journal.load(), Ok(Some(next_epoch)));
+                assert!(replay_entries(&mut journal).is_empty());
+            }
+        }
+    }
+
+    /// HW-04: an in-place rollover that fails after the staged merge drops
+    /// the merged entry from the live cache as well as from flash.
+    #[test]
+    fn hw04_failed_rollover_merge_is_not_visible_in_the_same_instance() {
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        journal.store(&commissioned_state()).unwrap();
+        let capacity = (SECURITY_JOURNAL_SLOTS_PER_SECTOR - 1) * REPLAY_ENTRIES_PER_SLOT;
+        for counter in 1..=capacity as u32 {
+            journal.commit_replay_counter(nwk_replay(counter)).unwrap();
+        }
+        let other = aps_key_pair_replay([0x52; 8], key_fingerprint(&[6; 16]), 3);
+        for failure_after in 0..6 {
+            journal.storage_mut().programs_before_failure = Some(failure_after);
+            assert_eq!(
+                journal.commit_replay_counter(other),
+                Err(SecurityStoreError::Hardware)
+            );
+            journal.storage_mut().programs_before_failure = None;
+            assert_eq!(
+                replay_entries(&mut journal).as_slice(),
+                &[nwk_replay(capacity as u32)]
+            );
+        }
+        assert_eq!(
+            journal.commit_replay_counter(other),
+            Ok(ReplayCommitOutcome::Advanced)
+        );
+        let entries = replay_entries(&mut journal);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&other));
     }
 }

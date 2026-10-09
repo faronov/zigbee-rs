@@ -1083,6 +1083,9 @@ mod imp {
         /// including a re-key/reuse cycle. Only compiled under the
         /// `hardware-aes` feature.
         #[cfg(feature = "hardware-aes")]
+        // Kept out of line so the linked image keeps a distinct symbol that
+        // the TLSR8258 layout check uses to prove hardware AES is installed.
+        #[inline(never)]
         pub fn install_aes_engine(
             &mut self,
             aes: tlsr8258_hal::peripherals::Aes,

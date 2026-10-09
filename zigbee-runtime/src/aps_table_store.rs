@@ -123,12 +123,32 @@ pub enum ApsTableStoreError {
 }
 
 /// Network-bound APS binding and group table snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PersistentApsTables {
     extended_pan_id: IeeeAddress,
     bindings: BindingTable,
     groups: GroupTable,
     application_keys: Vec<PersistentApplicationLinkKey, MAX_KEY_TABLE_ENTRIES>,
+}
+
+impl Clone for PersistentApsTables {
+    fn clone(&self) -> Self {
+        Self {
+            extended_pan_id: self.extended_pan_id,
+            bindings: self.bindings.clone(),
+            groups: self.groups.clone(),
+            application_keys: self.application_keys.clone(),
+        }
+    }
+
+    /// Field-wise, so a reload into caller-owned storage never materializes
+    /// a whole second snapshot on the stack (HW-04).
+    fn clone_from(&mut self, source: &Self) {
+        self.extended_pan_id = source.extended_pan_id;
+        self.bindings.clone_from(&source.bindings);
+        self.groups.clone_from(&source.groups);
+        self.application_keys.clone_from(&source.application_keys);
+    }
 }
 
 impl PersistentApsTables {
@@ -166,7 +186,26 @@ impl PersistentApsTables {
         groups: &GroupTable,
         security: &ApsSecurity,
     ) -> Result<Self, ApsTableStoreError> {
-        let mut snapshot = Self::capture(extended_pan_id, bindings, groups)?;
+        let mut snapshot = Self::new(extended_pan_id);
+        snapshot.capture_with_security_into(extended_pan_id, bindings, groups, security)?;
+        Ok(snapshot)
+    }
+
+    /// [`capture_with_security`](Self::capture_with_security) into existing
+    /// storage, so callers keep exactly one snapshot on the stack.
+    pub(crate) fn capture_with_security_into(
+        &mut self,
+        extended_pan_id: IeeeAddress,
+        bindings: &BindingTable,
+        groups: &GroupTable,
+        security: &ApsSecurity,
+    ) -> Result<(), ApsTableStoreError> {
+        self.extended_pan_id = extended_pan_id;
+        self.bindings.clone_from(bindings);
+        self.groups.clone_from(groups);
+        self.application_keys.clear();
+        self.validate()?;
+        let snapshot = self;
         for entry in security
             .key_table()
             .iter()
@@ -198,8 +237,7 @@ impl PersistentApsTables {
                 })
                 .map_err(|_| ApsTableStoreError::Full)?;
         }
-        snapshot.validate()?;
-        Ok(snapshot)
+        snapshot.validate()
     }
 
     pub const fn extended_pan_id(&self) -> IeeeAddress {
@@ -220,6 +258,12 @@ impl PersistentApsTables {
 
     pub fn application_keys(&self) -> &[PersistentApplicationLinkKey] {
         self.application_keys.as_slice()
+    }
+
+    /// Mutable table access for moving a consumed snapshot into the live APS
+    /// layer without materializing a clone (HW-04).
+    pub(crate) fn tables_mut(&mut self) -> (&mut BindingTable, &mut GroupTable) {
+        (&mut self.bindings, &mut self.groups)
     }
 
     pub(crate) fn application_keys_mut(&mut self) -> &mut [PersistentApplicationLinkKey] {
@@ -356,6 +400,15 @@ impl PersistentApsTables {
 
     /// Decode and validate a version-1 payload.
     pub fn decode(bytes: &[u8]) -> Result<Self, ApsTableStoreError> {
+        let mut snapshot = Self::default();
+        Self::decode_into(bytes, &mut snapshot)?;
+        Ok(snapshot)
+    }
+
+    /// [`decode`](Self::decode) into existing storage without a by-value
+    /// temporary. On error `snapshot` holds an unspecified partial value and
+    /// must be discarded by the caller.
+    pub(crate) fn decode_into(bytes: &[u8], snapshot: &mut Self) -> Result<(), ApsTableStoreError> {
         let mut extended_pan_id = [0u8; 8];
         extended_pan_id.copy_from_slice(bytes.get(0..8).ok_or(ApsTableStoreError::Corrupt)?);
         let binding_count = usize::from(*bytes.get(8).ok_or(ApsTableStoreError::Corrupt)?);
@@ -363,7 +416,10 @@ impl PersistentApsTables {
             return Err(ApsTableStoreError::Corrupt);
         }
 
-        let mut snapshot = Self::new(extended_pan_id);
+        snapshot.extended_pan_id = extended_pan_id;
+        snapshot.bindings.clear();
+        snapshot.groups.clear();
+        snapshot.application_keys.clear();
         let mut offset = 9;
         for _ in 0..binding_count {
             let entry = bytes
@@ -432,8 +488,7 @@ impl PersistentApsTables {
         // Version-1 snapshots ended after the group table. Treat them as
         // carrying no application keys.
         if offset == bytes.len() {
-            snapshot.validate()?;
-            return Ok(snapshot);
+            return snapshot.validate();
         }
         let application_key_count =
             usize::from(*bytes.get(offset).ok_or(ApsTableStoreError::Corrupt)?);
@@ -477,8 +532,7 @@ impl PersistentApsTables {
         if offset != bytes.len() {
             return Err(ApsTableStoreError::Corrupt);
         }
-        snapshot.validate()?;
-        Ok(snapshot)
+        snapshot.validate()
     }
 }
 
@@ -492,6 +546,24 @@ impl Default for PersistentApsTables {
 pub trait ApsTableStore {
     fn load(&mut self) -> Result<Option<PersistentApsTables>, ApsTableStoreError>;
     fn store(&mut self, tables: &PersistentApsTables) -> Result<(), ApsTableStoreError>;
+
+    /// [`load`](Self::load) into caller-owned storage. Returns `Ok(false)`
+    /// and leaves `tables` untouched when no snapshot is stored.
+    fn load_into(&mut self, tables: &mut PersistentApsTables) -> Result<bool, ApsTableStoreError> {
+        match self.load()? {
+            Some(loaded) => {
+                *tables = loaded;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Whether [`load`](Self::load) would return a non-empty snapshot,
+    /// without materializing it.
+    fn stored_is_nonempty(&mut self) -> Result<bool, ApsTableStoreError> {
+        Ok(self.load()?.is_some_and(|tables| !tables.is_empty()))
+    }
 }
 
 /// Volatile APS table backend for tests and products without a partition.
@@ -537,7 +609,15 @@ const LEGACY_SLOTS_PER_SECTOR: usize = APS_TABLE_JOURNAL_SECTOR_SIZE / LEGACY_SL
 const LEGACY_CRC_OFFSET: usize = LEGACY_SLOT_SIZE - 12;
 const LEGACY_COMMIT_OFFSET: usize = LEGACY_SLOT_SIZE - 8;
 
+/// Bounded read-back window for erase checks and committed-record
+/// verification, so neither needs a second full slot buffer on the stack.
+const READBACK_CHUNK: usize = 128;
+/// v2 slots plus v1 legacy slots across both sectors.
+const MAX_SCAN_CANDIDATES: usize =
+    2 * (APS_TABLE_JOURNAL_SLOTS_PER_SECTOR + LEGACY_SLOTS_PER_SECTOR);
+
 const _: () = assert!(RECORD_ENCODED_OFFSET + MAX_ENCODED_APS_TABLES_LEN <= RECORD_CRC_OFFSET);
+const _: () = assert!(APS_TABLE_JOURNAL_SLOT_SIZE.is_multiple_of(READBACK_CHUNK));
 
 /// Atomic two-sector APS table journal.
 pub struct ApsTableJournal<S> {
@@ -547,7 +627,6 @@ pub struct ApsTableJournal<S> {
     scanned: bool,
 }
 
-#[derive(Clone)]
 struct LocatedTables {
     generation: u32,
     sector: usize,
@@ -579,6 +658,7 @@ impl<S: NorFlash> ApsTableJournal<S> {
             && S::WRITE_SIZE != 0
             && S::ERASE_SIZE != 0
             && APS_TABLE_JOURNAL_SLOT_SIZE.is_multiple_of(S::READ_SIZE)
+            && READBACK_CHUNK.is_multiple_of(S::READ_SIZE)
             && APS_TABLE_JOURNAL_SLOT_SIZE.is_multiple_of(S::WRITE_SIZE)
             && APS_TABLE_JOURNAL_SECTOR_SIZE.is_multiple_of(S::ERASE_SIZE)
             && RECORD_PREFIX_LEN.is_multiple_of(S::WRITE_SIZE)
@@ -609,9 +689,10 @@ impl<S: NorFlash> ApsTableJournal<S> {
             .map_err(|_| ApsTableStoreError::Hardware)
     }
 
-    fn decode_record(
-        record: &[u8; APS_TABLE_JOURNAL_SLOT_SIZE],
-    ) -> Option<(u32, PersistentApsTables)> {
+    /// Validate a committed v2 record's header, length and CRC and return its
+    /// generation and payload range. The payload itself is decoded only for
+    /// the selected candidate.
+    fn record_header(record: &[u8; APS_TABLE_JOURNAL_SLOT_SIZE]) -> Option<(u32, usize)> {
         if record[0..4] != RECORD_MAGIC
             || !matches!(record[4], 1 | RECORD_VERSION)
             || record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4] != RECORD_COMMIT
@@ -634,14 +715,13 @@ impl<S: NorFlash> ApsTableJournal<S> {
             return None;
         }
         let generation = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-        let tables = PersistentApsTables::decode(
-            &record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len],
-        )
-        .ok()?;
-        Some((generation, tables))
+        Some((generation, encoded_len))
     }
 
-    fn decode_legacy_record(record: &[u8; LEGACY_SLOT_SIZE]) -> Option<(u32, PersistentApsTables)> {
+    /// v1 counterpart of [`record_header`](Self::record_header), over the
+    /// first [`LEGACY_SLOT_SIZE`] bytes of `record`.
+    fn legacy_record_header(record: &[u8; APS_TABLE_JOURNAL_SLOT_SIZE]) -> Option<(u32, usize)> {
+        let record = &record[..LEGACY_SLOT_SIZE];
         if record[0..4] != RECORD_MAGIC
             || record[4] != 1
             || record[LEGACY_COMMIT_OFFSET..LEGACY_COMMIT_OFFSET + 4] != RECORD_COMMIT
@@ -662,81 +742,131 @@ impl<S: NorFlash> ApsTableJournal<S> {
             return None;
         }
         let generation = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-        let tables = PersistentApsTables::decode(
-            &record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len],
-        )
-        .ok()?;
-        Some((generation, tables))
+        Some((generation, encoded_len))
     }
 
-    fn newest(&mut self) -> Result<Option<LocatedTables>, ApsTableStoreError> {
-        let mut newest: Option<LocatedTables> = None;
+    /// Read candidate `index` (v2 slots first, then v1 legacy slots, each in
+    /// sector/slot order) into `record` and validate its header.
+    fn read_candidate(
+        &mut self,
+        index: usize,
+        record: &mut [u8; APS_TABLE_JOURNAL_SLOT_SIZE],
+    ) -> Result<Option<(u32, usize)>, ApsTableStoreError> {
+        let v2_slots = 2 * APS_TABLE_JOURNAL_SLOTS_PER_SECTOR;
+        if index < v2_slots {
+            let sector = index / APS_TABLE_JOURNAL_SLOTS_PER_SECTOR;
+            self.read_slot(sector, index % APS_TABLE_JOURNAL_SLOTS_PER_SECTOR, record)?;
+            return Ok(Self::record_header(record));
+        }
+        if !LEGACY_SLOT_SIZE.is_multiple_of(S::READ_SIZE) {
+            return Ok(None);
+        }
+        let index = index - v2_slots;
+        let sector = index / LEGACY_SLOTS_PER_SECTOR;
+        let slot = index % LEGACY_SLOTS_PER_SECTOR;
+        self.storage
+            .read(
+                self.sectors[sector] + (slot * LEGACY_SLOT_SIZE) as u32,
+                &mut record[..LEGACY_SLOT_SIZE],
+            )
+            .map_err(|_| ApsTableStoreError::Hardware)?;
+        Ok(Self::legacy_record_header(record))
+    }
+
+    fn candidate_sector(index: usize) -> usize {
+        let v2_slots = 2 * APS_TABLE_JOURNAL_SLOTS_PER_SECTOR;
+        if index < v2_slots {
+            index / APS_TABLE_JOURNAL_SLOTS_PER_SECTOR
+        } else {
+            (index - v2_slots) / LEGACY_SLOTS_PER_SECTOR
+        }
+    }
+
+    /// Select the newest decodable record and decode it straight into the
+    /// cache with one reusable slot buffer.
+    ///
+    /// Equivalent to decoding every committed record and keeping the first
+    /// one with the highest generation: candidates are tried in descending
+    /// generation and, for equal generations, in scan order, and the first one
+    /// whose payload decodes wins. A malformed payload falls through to the
+    /// next candidate exactly as before.
+    fn scan_into_cache(&mut self) -> Result<(), ApsTableStoreError> {
+        self.cached = None;
         let mut record = [0u8; APS_TABLE_JOURNAL_SLOT_SIZE];
-        for sector in 0..2 {
-            for slot in 0..APS_TABLE_JOURNAL_SLOTS_PER_SECTOR {
-                self.read_slot(sector, slot, &mut record)?;
-                let Some((generation, tables)) = Self::decode_record(&record) else {
-                    continue;
-                };
-                if newest
-                    .as_ref()
-                    .is_none_or(|current| generation > current.generation)
-                {
-                    newest = Some(LocatedTables {
-                        generation,
-                        sector,
-                        tables,
-                    });
-                }
+        let mut generations = [None::<u32>; MAX_SCAN_CANDIDATES];
+        for (index, generation) in generations.iter_mut().enumerate() {
+            *generation = self.read_candidate(index, &mut record)?.map(|(g, _)| g);
+        }
+        while let Some(index) = (0..MAX_SCAN_CANDIDATES)
+            .filter(|index| generations[*index].is_some())
+            .min_by_key(|index| (core::cmp::Reverse(generations[*index]), *index))
+        {
+            let generation = generations[index].take();
+            let Some((read_generation, encoded_len)) = self.read_candidate(index, &mut record)?
+            else {
+                continue;
+            };
+            if Some(read_generation) != generation {
+                continue;
+            }
+            let located = self.cached.get_or_insert_with(|| LocatedTables {
+                generation: 0,
+                sector: 0,
+                tables: PersistentApsTables::default(),
+            });
+            located.generation = read_generation;
+            located.sector = Self::candidate_sector(index);
+            if PersistentApsTables::decode_into(
+                &record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len],
+                &mut located.tables,
+            )
+            .is_ok()
+            {
+                return Ok(());
             }
         }
-        if LEGACY_SLOT_SIZE.is_multiple_of(S::READ_SIZE) {
-            let mut legacy = [0u8; LEGACY_SLOT_SIZE];
-            for sector in 0..2 {
-                for slot in 0..LEGACY_SLOTS_PER_SECTOR {
-                    self.storage
-                        .read(
-                            self.sectors[sector] + (slot * LEGACY_SLOT_SIZE) as u32,
-                            &mut legacy,
-                        )
-                        .map_err(|_| ApsTableStoreError::Hardware)?;
-                    let Some((generation, tables)) = Self::decode_legacy_record(&legacy) else {
-                        continue;
-                    };
-                    if newest
-                        .as_ref()
-                        .is_none_or(|current| generation > current.generation)
-                    {
-                        newest = Some(LocatedTables {
-                            generation,
-                            sector,
-                            tables,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(newest)
+        self.cached = None;
+        Ok(())
     }
 
-    fn current(&mut self) -> Result<Option<LocatedTables>, ApsTableStoreError> {
+    /// Scan once; any scan error leaves no cached state and forces a rescan.
+    fn ensure_scanned(&mut self) -> Result<(), ApsTableStoreError> {
         if !self.geometry_ok() {
             return Err(ApsTableStoreError::Hardware);
         }
         if !self.scanned {
-            self.cached = self.newest()?;
+            if let Err(error) = self.scan_into_cache() {
+                self.cached = None;
+                return Err(error);
+            }
             self.scanned = true;
         }
-        Ok(self.cached.clone())
+        Ok(())
+    }
+
+    /// Generation and sector of the newest committed record, without
+    /// copying the tables.
+    fn current_location(&mut self) -> Result<Option<(u32, usize)>, ApsTableStoreError> {
+        self.ensure_scanned()?;
+        Ok(self
+            .cached
+            .as_ref()
+            .map(|located| (located.generation, located.sector)))
     }
 
     fn first_erased_slot(&mut self, sector: usize) -> Result<Option<usize>, ApsTableStoreError> {
-        let mut record = [0u8; APS_TABLE_JOURNAL_SLOT_SIZE];
-        for slot in 0..APS_TABLE_JOURNAL_SLOTS_PER_SECTOR {
-            self.read_slot(sector, slot, &mut record)?;
-            if record.iter().all(|byte| *byte == 0xFF) {
-                return Ok(Some(slot));
+        let mut chunk = [0u8; READBACK_CHUNK];
+        'slots: for slot in 0..APS_TABLE_JOURNAL_SLOTS_PER_SECTOR {
+            let base = self.sectors[sector] + (slot * APS_TABLE_JOURNAL_SLOT_SIZE) as u32;
+            for offset in (0..APS_TABLE_JOURNAL_SLOT_SIZE).step_by(READBACK_CHUNK) {
+                self.storage
+                    .read(base + offset as u32, &mut chunk)
+                    .map_err(|_| ApsTableStoreError::Hardware)?;
+                if chunk.iter().any(|byte| *byte != 0xFF) {
+                    continue 'slots;
+                }
             }
+            return Ok(Some(slot));
         }
         Ok(None)
     }
@@ -752,13 +882,20 @@ impl<S: NorFlash> ApsTableJournal<S> {
         let mut record = [0xFFu8; APS_TABLE_JOURNAL_SLOT_SIZE];
         record[0..4].copy_from_slice(&RECORD_MAGIC);
         record[4] = RECORD_VERSION;
-        let mut encoded = [0u8; MAX_ENCODED_APS_TABLES_LEN];
-        let encoded_len = tables.encode(&mut encoded);
+        let payload =
+            &mut record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + MAX_ENCODED_APS_TABLES_LEN];
+        let encoded_len = match <&mut [u8; MAX_ENCODED_APS_TABLES_LEN]>::try_from(payload) {
+            Ok(payload) => tables.encode(payload),
+            Err(_) => return Err(ApsTableStoreError::Corrupt),
+        };
+        // `encode` zero-fills its whole buffer; unused payload bytes stay
+        // erased exactly as in the original separately-encoded record.
+        record[RECORD_ENCODED_OFFSET + encoded_len
+            ..RECORD_ENCODED_OFFSET + MAX_ENCODED_APS_TABLES_LEN]
+            .fill(0xFF);
         record[5..7].copy_from_slice(&(encoded_len as u16).to_le_bytes());
         record[7] = 0;
         record[8..12].copy_from_slice(&generation.to_le_bytes());
-        record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len]
-            .copy_from_slice(&encoded[..encoded_len]);
         let crc = crate::security_journal::crc32(&record[..RECORD_CRC_OFFSET]);
         record[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 
@@ -775,16 +912,18 @@ impl<S: NorFlash> ApsTableJournal<S> {
             )
             .map_err(|_| ApsTableStoreError::Hardware)?;
 
-        let mut verify = [0u8; APS_TABLE_JOURNAL_SLOT_SIZE];
-        self.read_slot(sector, slot, &mut verify)?;
-        match Self::decode_record(&verify) {
-            Some((stored_generation, stored_tables))
-                if stored_generation == generation && stored_tables == *tables =>
-            {
-                Ok(())
+        // Byte-exact read-back of the whole committed slot against the staged
+        // record (header, payload, erased tail, CRC and commit marker).
+        let mut chunk = [0u8; READBACK_CHUNK];
+        for (offset, expected) in record.chunks_exact(READBACK_CHUNK).enumerate() {
+            self.storage
+                .read(address + (offset * READBACK_CHUNK) as u32, &mut chunk)
+                .map_err(|_| ApsTableStoreError::Hardware)?;
+            if chunk != *expected {
+                return Err(ApsTableStoreError::Hardware);
             }
-            _ => Err(ApsTableStoreError::Hardware),
         }
+        Ok(())
     }
 
     fn cache_result(
@@ -795,11 +934,14 @@ impl<S: NorFlash> ApsTableJournal<S> {
         tables: &PersistentApsTables,
     ) {
         if result.is_ok() {
-            self.cached = Some(LocatedTables {
-                generation,
-                sector,
-                tables: tables.clone(),
+            let located = self.cached.get_or_insert_with(|| LocatedTables {
+                generation: 0,
+                sector: 0,
+                tables: PersistentApsTables::default(),
             });
+            located.generation = generation;
+            located.sector = sector;
+            located.tables.clone_from(tables);
         } else {
             self.cached = None;
             self.scanned = false;
@@ -809,26 +951,45 @@ impl<S: NorFlash> ApsTableJournal<S> {
 
 impl<S: NorFlash> ApsTableStore for ApsTableJournal<S> {
     fn load(&mut self) -> Result<Option<PersistentApsTables>, ApsTableStoreError> {
-        Ok(self.current()?.map(|located| located.tables))
+        self.ensure_scanned()?;
+        Ok(self.cached.as_ref().map(|located| located.tables.clone()))
+    }
+
+    fn load_into(&mut self, tables: &mut PersistentApsTables) -> Result<bool, ApsTableStoreError> {
+        self.ensure_scanned()?;
+        match self.cached.as_ref() {
+            Some(located) => {
+                tables.clone_from(&located.tables);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn stored_is_nonempty(&mut self) -> Result<bool, ApsTableStoreError> {
+        self.ensure_scanned()?;
+        Ok(self
+            .cached
+            .as_ref()
+            .is_some_and(|located| !located.tables.is_empty()))
     }
 
     fn store(&mut self, tables: &PersistentApsTables) -> Result<(), ApsTableStoreError> {
-        let current = self.current()?;
-        let generation = match &current {
-            Some(located) => located
-                .generation
+        let current = self.current_location()?;
+        let generation = match current {
+            Some((generation, _)) => generation
                 .checked_add(1)
                 .ok_or(ApsTableStoreError::GenerationExhausted)?,
             None => 0,
         };
 
-        if let Some(located) = current {
-            if let Some(slot) = self.first_erased_slot(located.sector)? {
-                let result = self.write_record(located.sector, slot, generation, tables);
-                self.cache_result(&result, generation, located.sector, tables);
+        if let Some((_, current_sector)) = current {
+            if let Some(slot) = self.first_erased_slot(current_sector)? {
+                let result = self.write_record(current_sector, slot, generation, tables);
+                self.cache_result(&result, generation, current_sector, tables);
                 return result;
             }
-            let target = 1 - located.sector;
+            let target = 1 - current_sector;
             let sector = self.sectors[target];
             let result = self
                 .storage
@@ -910,6 +1071,10 @@ mod tests {
     struct MockFlash {
         bytes: [u8; APS_TABLE_JOURNAL_SECTOR_SIZE * 2],
         programs_before_failure: Option<usize>,
+        fail_reads: bool,
+        /// Absolute offset whose programming is silently skipped (a write
+        /// that reports success but does not stick).
+        drop_program_at: Option<usize>,
     }
 
     impl MockFlash {
@@ -917,6 +1082,8 @@ mod tests {
             Self {
                 bytes: [0xFF; APS_TABLE_JOURNAL_SECTOR_SIZE * 2],
                 programs_before_failure: None,
+                fail_reads: false,
+                drop_program_at: None,
             }
         }
     }
@@ -929,6 +1096,9 @@ mod tests {
         const READ_SIZE: usize = 1;
 
         fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+            if self.fail_reads {
+                return Err(MockError);
+            }
             let start = offset as usize;
             let end = start.checked_add(bytes.len()).ok_or(MockError)?;
             let source = self.bytes.get(start..end).ok_or(MockError)?;
@@ -963,15 +1133,58 @@ mod tests {
             }
             let start = offset as usize;
             let end = start.checked_add(bytes.len()).ok_or(MockError)?;
+            let drop_at = self.drop_program_at;
             let destination = self.bytes.get_mut(start..end).ok_or(MockError)?;
-            for (dst, src) in destination.iter_mut().zip(bytes) {
+            for (index, (dst, src)) in destination.iter_mut().zip(bytes).enumerate() {
                 if (*dst & *src) != *src {
                     return Err(MockError);
                 }
-                *dst &= *src;
+                if drop_at != Some(start + index) {
+                    *dst &= *src;
+                }
             }
             Ok(())
         }
+    }
+
+    /// HW-04 HIL fixture: a valid APS journal owned by a foreign network, so a
+    /// router restore takes `ForeignNetwork` -> clear -> `ApsTableStore::store`.
+    /// Run with `HW04_FOREIGN_APS_IMAGE=<path> cargo test -- --ignored`.
+    #[test]
+    #[ignore = "writes the HW-04 HIL foreign-APS NV image"]
+    fn hw04_dump_foreign_aps_image() {
+        let path = std::env::var("HW04_FOREIGN_APS_IMAGE").expect("HW04_FOREIGN_APS_IMAGE");
+        // HW04_APS_EPID (16 hex digits, on-air byte order) binds the fixture
+        // to a real network so restore keeps it; default is foreign.
+        let parse = |hex: std::string::String| {
+            let mut bytes = [0u8; 8];
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+            }
+            bytes
+        };
+        let epid = std::env::var("HW04_APS_EPID").map_or([0x5A; 8], parse);
+        let mut journal =
+            ApsTableJournal::new(MockFlash::new(), 0, APS_TABLE_JOURNAL_SECTOR_SIZE as u32);
+        let mut tables = PersistentApsTables::new(epid);
+        assert!(tables.groups.add_group(0x4242, 1));
+        // HW04_APS_SRC_IEEE / HW04_APS_DST_IEEE (on-air order) add a group
+        // and a unicast Identify binding owned by the device under test.
+        if let Ok(src) = std::env::var("HW04_APS_SRC_IEEE").map(parse) {
+            tables
+                .bindings
+                .add(BindingEntry::group(src, 1, 0x0003, 0x4242))
+                .unwrap();
+            if let Ok(dst) = std::env::var("HW04_APS_DST_IEEE").map(parse) {
+                tables
+                    .bindings
+                    .add(BindingEntry::unicast(src, 1, 0x0003, dst, 1))
+                    .unwrap();
+            }
+        }
+        journal.store(&tables).unwrap();
+        let flash = journal.into_storage();
+        std::fs::write(path, &flash.bytes[..]).unwrap();
     }
 
     #[test]
@@ -1085,5 +1298,248 @@ mod tests {
         journal.store(&tables).unwrap();
         assert_eq!(journal.storage().rejected, 0);
         assert_eq!(journal.load(), Ok(Some(tables)));
+    }
+
+    fn open_journal(flash: MockFlash) -> ApsTableJournal<MockFlash> {
+        ApsTableJournal::new(flash, 0, APS_TABLE_JOURNAL_SECTOR_SIZE as u32)
+    }
+
+    /// Tables at every capacity limit, so the in-place encoding covers the
+    /// largest payload the record can carry.
+    fn maximal_snapshot() -> PersistentApsTables {
+        let mut tables = PersistentApsTables::new(EPID);
+        for index in 0..MAX_BINDING_ENTRIES {
+            let entry = if index % 2 == 0 {
+                BindingEntry::unicast(LOCAL, 1, index as u16, REMOTE, (index % 200 + 1) as u8)
+            } else {
+                BindingEntry::group(LOCAL, 2, index as u16, 0x1000 + index as u16)
+            };
+            tables.bindings.add(entry).unwrap();
+        }
+        for group in 0..MAX_GROUPS {
+            for endpoint in 1..=MAX_ENDPOINTS_PER_GROUP {
+                assert!(
+                    tables
+                        .groups
+                        .add_group(0x2000 + group as u16, endpoint as u8)
+                );
+            }
+        }
+        for index in 0..MAX_KEY_TABLE_ENTRIES {
+            let mut partner_address = [0x40; 8];
+            partner_address[7] = index as u8 + 1;
+            tables
+                .application_keys
+                .push(PersistentApplicationLinkKey {
+                    partner_address,
+                    key: [index as u8; 16],
+                    outgoing_frame_counter_limit: 0x1000 + index as u32,
+                    incoming_frame_counter: index as u32,
+                    incoming_frame_counter_valid: index % 2 == 0,
+                })
+                .unwrap();
+        }
+        tables.validate().unwrap();
+        tables
+    }
+
+    /// Independent reference for the committed v2 slot layout, built the way
+    /// the journal did before HW-04 (separate encode buffer, then copy).
+    fn reference_record(generation: u32, tables: &PersistentApsTables) -> [u8; 2048] {
+        let mut record = [0xFFu8; APS_TABLE_JOURNAL_SLOT_SIZE];
+        record[0..4].copy_from_slice(&RECORD_MAGIC);
+        record[4] = RECORD_VERSION;
+        let mut encoded = [0u8; MAX_ENCODED_APS_TABLES_LEN];
+        let encoded_len = tables.encode(&mut encoded);
+        record[5..7].copy_from_slice(&(encoded_len as u16).to_le_bytes());
+        record[7] = 0;
+        record[8..12].copy_from_slice(&generation.to_le_bytes());
+        record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len]
+            .copy_from_slice(&encoded[..encoded_len]);
+        let crc = crate::security_journal::crc32(&record[..RECORD_CRC_OFFSET]);
+        record[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4].copy_from_slice(&RECORD_COMMIT);
+        record
+    }
+
+    /// Committed v2 record with a valid CRC around an arbitrary payload.
+    fn raw_record(generation: u32, payload: &[u8]) -> [u8; 2048] {
+        let mut record = [0xFFu8; APS_TABLE_JOURNAL_SLOT_SIZE];
+        record[0..4].copy_from_slice(&RECORD_MAGIC);
+        record[4] = RECORD_VERSION;
+        record[5..7].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+        record[7] = 0;
+        record[8..12].copy_from_slice(&generation.to_le_bytes());
+        record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + payload.len()]
+            .copy_from_slice(payload);
+        let crc = crate::security_journal::crc32(&record[..RECORD_CRC_OFFSET]);
+        record[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4].copy_from_slice(&RECORD_COMMIT);
+        record
+    }
+
+    fn encoded(tables: &PersistentApsTables) -> ([u8; MAX_ENCODED_APS_TABLES_LEN], usize) {
+        let mut encoded = [0u8; MAX_ENCODED_APS_TABLES_LEN];
+        let len = tables.encode(&mut encoded);
+        (encoded, len)
+    }
+
+    #[test]
+    fn hw04_in_place_encoding_keeps_exact_on_flash_bytes() {
+        for tables in [
+            PersistentApsTables::new(EPID),
+            snapshot(),
+            maximal_snapshot(),
+        ] {
+            let mut journal = open_journal(MockFlash::new());
+            journal.store(&tables).unwrap();
+            journal.store(&tables).unwrap();
+            let flash = journal.into_storage();
+            assert_eq!(flash.bytes[..2048], reference_record(0, &tables));
+            assert_eq!(flash.bytes[2048..4096], reference_record(1, &tables));
+            let mut reopened = open_journal(flash);
+            assert_eq!(reopened.load(), Ok(Some(tables)));
+        }
+    }
+
+    #[test]
+    fn hw04_malformed_newest_payload_falls_back_to_previous_generation() {
+        let older = snapshot();
+        let mut journal = open_journal(MockFlash::new());
+        journal.store(&older).unwrap();
+        let mut flash = journal.into_storage();
+        // CRC-valid, committed, higher generation, but undecodable payload.
+        let (mut payload, len) = encoded(&older);
+        payload[9 + 11] = 0xFF;
+        flash.bytes[APS_TABLE_JOURNAL_SECTOR_SIZE..APS_TABLE_JOURNAL_SECTOR_SIZE + 2048]
+            .copy_from_slice(&raw_record(9, &payload[..len]));
+
+        let mut reopened = open_journal(flash);
+        assert_eq!(reopened.load(), Ok(Some(older.clone())));
+        // The next generation follows the selected decodable record.
+        let mut newer = older;
+        assert!(newer.groups.add_group(0x7777, 3));
+        reopened.store(&newer).unwrap();
+        let flash = reopened.into_storage();
+        assert_eq!(flash.bytes[2048..4096], reference_record(1, &newer));
+        assert_eq!(open_journal(flash).load(), Ok(Some(newer)));
+    }
+
+    #[test]
+    fn hw04_equal_generations_keep_the_first_record_in_scan_order() {
+        let first = snapshot();
+        let mut second = snapshot();
+        assert!(second.groups.add_group(0x5555, 4));
+        let mut flash = MockFlash::new();
+        let (payload, len) = encoded(&first);
+        flash.bytes[..2048].copy_from_slice(&raw_record(4, &payload[..len]));
+        let (payload, len) = encoded(&second);
+        flash.bytes[APS_TABLE_JOURNAL_SECTOR_SIZE..APS_TABLE_JOURNAL_SECTOR_SIZE + 2048]
+            .copy_from_slice(&raw_record(4, &payload[..len]));
+        assert_eq!(open_journal(flash).load(), Ok(Some(first)));
+    }
+
+    #[test]
+    fn hw04_verify_mismatch_is_a_hardware_error_and_invalidates_the_cache() {
+        let expected = snapshot();
+        let mut journal = open_journal(MockFlash::new());
+        journal.store(&expected).unwrap();
+
+        let mut replacement = expected.clone();
+        assert!(replacement.groups.add_group(0x4567, 1));
+        // A payload byte in slot 1 silently fails to program.
+        journal.storage.drop_program_at = Some(2048 + RECORD_ENCODED_OFFSET);
+        assert_eq!(
+            journal.store(&replacement),
+            Err(ApsTableStoreError::Hardware)
+        );
+        assert!(journal.cached.is_none() && !journal.scanned);
+        journal.storage.drop_program_at = None;
+        // The CRC no longer matches, so the rescan returns the old generation.
+        assert_eq!(journal.load(), Ok(Some(expected)));
+    }
+
+    #[test]
+    fn hw04_scan_read_error_leaves_no_cached_state() {
+        let expected = snapshot();
+        let mut journal = open_journal(MockFlash::new());
+        journal.store(&expected).unwrap();
+        let mut flash = journal.into_storage();
+        flash.fail_reads = true;
+        let mut reopened = open_journal(flash);
+        assert_eq!(reopened.load(), Err(ApsTableStoreError::Hardware));
+        assert!(reopened.cached.is_none() && !reopened.scanned);
+        assert_eq!(reopened.store(&expected), Err(ApsTableStoreError::Hardware));
+        reopened.storage.fail_reads = false;
+        assert_eq!(reopened.load(), Ok(Some(expected)));
+    }
+
+    #[test]
+    fn hw04_store_after_restore_uses_cached_location_without_clone() {
+        // Restore, then store twice more: generations 1 and 2 roll into the
+        // second sector exactly as before, from location metadata alone.
+        let mut tables = snapshot();
+        let mut journal = open_journal(MockFlash::new());
+        journal.store(&tables).unwrap();
+        journal.store(&tables).unwrap();
+        let mut reopened = open_journal(journal.into_storage());
+        assert_eq!(reopened.load(), Ok(Some(tables.clone())));
+        assert!(tables.groups.add_group(0x6666, 5));
+        reopened.store(&tables).unwrap();
+        let flash = reopened.into_storage();
+        assert_eq!(
+            flash.bytes[APS_TABLE_JOURNAL_SECTOR_SIZE..APS_TABLE_JOURNAL_SECTOR_SIZE + 2048],
+            reference_record(2, &tables)
+        );
+        assert_eq!(open_journal(flash).load(), Ok(Some(tables)));
+    }
+
+    /// HW-04: the journal's `load_into` / `stored_is_nonempty` overrides
+    /// agree with `load` and with the trait defaults (via `RamApsTableStore`)
+    /// for absent, empty and populated snapshots, including after reopen.
+    #[test]
+    fn hw04_load_into_and_stored_is_nonempty_match_load() {
+        let sentinel = maximal_snapshot();
+        let mut ram = RamApsTableStore::new();
+        let mut journal = open_journal(MockFlash::new());
+
+        let mut target = sentinel.clone();
+        assert_eq!(journal.load_into(&mut target), Ok(false));
+        assert_eq!(target, sentinel);
+        assert_eq!(ram.load_into(&mut target), Ok(false));
+        assert_eq!(target, sentinel);
+        assert_eq!(journal.stored_is_nonempty(), Ok(false));
+        assert_eq!(ram.stored_is_nonempty(), Ok(false));
+
+        for tables in [PersistentApsTables::new(EPID), snapshot()] {
+            journal.store(&tables).unwrap();
+            ram.store(&tables).unwrap();
+            let expected_nonempty = !tables.is_empty();
+            for store in [&mut journal as &mut dyn ApsTableStore, &mut ram] {
+                let mut target = sentinel.clone();
+                assert_eq!(store.load_into(&mut target), Ok(true));
+                assert_eq!(target, tables);
+                assert_eq!(store.stored_is_nonempty(), Ok(expected_nonempty));
+            }
+        }
+
+        let mut reopened = open_journal(journal.into_storage());
+        assert_eq!(reopened.stored_is_nonempty(), Ok(true));
+        let mut target = sentinel;
+        assert_eq!(reopened.load_into(&mut target), Ok(true));
+        assert_eq!(target, snapshot());
+
+        reopened.storage.fail_reads = true;
+        let mut failing = open_journal(reopened.into_storage());
+        assert_eq!(
+            failing.stored_is_nonempty(),
+            Err(ApsTableStoreError::Hardware)
+        );
+        let mut untouched = snapshot();
+        assert_eq!(
+            failing.load_into(&mut untouched),
+            Err(ApsTableStoreError::Hardware)
+        );
+        assert_eq!(untouched, snapshot());
     }
 }
