@@ -13,6 +13,8 @@ pub mod end_device;
 pub mod router;
 #[cfg(feature = "sensor")]
 pub mod sensor;
+#[cfg(all(target_arch = "tc32", feature = "router"))]
+pub mod stack_guard;
 #[cfg(all(target_arch = "tc32", any(feature = "router", feature = "end-device")))]
 pub mod status_leds;
 #[cfg(target_arch = "tc32")]

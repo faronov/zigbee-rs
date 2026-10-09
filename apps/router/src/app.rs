@@ -425,9 +425,8 @@ where
         &mut self,
         node: &mut RouterNode<'_, M, S, P, R>,
     ) -> Result<bool, ApsTableStoreError> {
-        let should_clear = match self.store.load() {
-            Ok(None) => false,
-            Ok(Some(snapshot)) => !snapshot.is_empty(),
+        let should_clear = match self.store.stored_is_nonempty() {
+            Ok(nonempty) => nonempty,
             Err(ApsTableStoreError::Corrupt | ApsTableStoreError::ForeignNetwork) => true,
             Err(error) => return Err(error),
         };
@@ -1625,7 +1624,7 @@ where
         let started_us = self.now_us();
         O::on_commissioning_attempt(self.node.device(), self.commissioning_attempts, started_us);
         let pending_before = self.node.device().secure_rejoin_pending();
-        let result = K::start(&mut self.node).await;
+        let result = await_in_place!(K::start(&mut self.node));
         O::on_start_result(self.node.device(), result);
 
         match result {
@@ -1670,7 +1669,7 @@ where
         });
         let started_us = self.now_us();
         O::on_secure_rejoin_attempt(self.node.device(), started_us);
-        let result = self.node.secure_rejoin().await;
+        let result = await_in_place!(self.node.secure_rejoin());
         O::on_secure_rejoin_result(self.node.device(), result);
         match result {
             Ok(short_address) => {

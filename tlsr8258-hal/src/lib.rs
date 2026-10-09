@@ -26,6 +26,7 @@ pub mod pwm;
 pub mod radio;
 pub mod reset;
 pub mod rng;
+pub mod root;
 pub mod spi;
 pub mod timer;
 pub mod uart;

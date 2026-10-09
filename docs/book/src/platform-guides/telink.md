@@ -200,7 +200,7 @@ Host tools remain on Rust `1.94.1`.
 - the End Device Timeout client symbols;
 - no sleep or retention path;
 - exactly one `tlsr8258_rt::block_on` root;
-- the default 16 KiB SVC / 1 KiB IRQ stack layout.
+- the product-wide 20 KiB SVC (64 B guard below it) / 1 KiB IRQ stack layout.
 
 CI also runs `tools/check-role-symbols.sh`: `leaf` for the sensor and the ED,
 `parent` for the router.

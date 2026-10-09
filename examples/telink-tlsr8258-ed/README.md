@@ -62,7 +62,8 @@ The image is built at `opt-level=s` because the TC32 backend cannot build at
 - lacks the End Device Timeout client symbols;
 - links a sleep or retention path;
 - has anything other than exactly one `tlsr8258_rt::block_on` root;
-- moves off the 16 KiB SVC / 1 KiB IRQ stack layout.
+- moves off the product-wide 20 KiB SVC (64 B guard below it) / 1 KiB IRQ
+  stack layout.
 
 ## Validation
 
