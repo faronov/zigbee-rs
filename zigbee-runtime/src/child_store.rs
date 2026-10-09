@@ -1096,8 +1096,13 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> ChildTableJournal<S, SECTOR_SIZE> {
         self.storage
             .write(address, &record[..RECORD_PREFIX_LEN])
             .map_err(|_| ChildStoreError::Hardware)?;
+        // TLSR8258 can only program from SRAM; stage the marker on the stack.
+        record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4].copy_from_slice(&RECORD_COMMIT);
         self.storage
-            .write(address + RECORD_COMMIT_OFFSET as u32, &RECORD_COMMIT)
+            .write(
+                address + RECORD_COMMIT_OFFSET as u32,
+                &record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4],
+            )
             .map_err(|_| ChildStoreError::Hardware)?;
 
         let mut verify = [0u8; CHILD_JOURNAL_SLOT_SIZE];
@@ -1742,5 +1747,20 @@ mod tests {
         flash.data[CHILD_JOURNAL_SLOT_SIZE + RECORD_ENCODED_OFFSET] ^= 0x01;
         let mut reopened = journal_8k(flash);
         assert_eq!(reopened.load(), Ok(Some(good)));
+    }
+
+    #[test]
+    fn hw03_commit_marker_is_not_programmed_from_static_constant() {
+        use crate::flash_source_guard::StaticSourceGuard;
+        static FORBIDDEN: [&[u8]; 1] = [&RECORD_COMMIT];
+        let mut store = ChildTableJournal::new(
+            StaticSourceGuard::new(MockFlash::new(), &FORBIDDEN),
+            0,
+            CHILD_JOURNAL_SECTOR_SIZE as u32,
+        );
+        let expected = table(&[child(1, 0x0002, 8)]);
+        store.store(&expected).unwrap();
+        assert_eq!(store.storage().rejected, 0);
+        assert_eq!(store.load(), Ok(Some(expected)));
     }
 }
