@@ -9011,6 +9011,27 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         }
     }
 
+    /// Whether replay floors of a received frame can be committed durably.
+    ///
+    /// Between the network-security reservation and the Confirm-Key commit
+    /// (the unique-TCLK exchange window) the persisted record is deliberately
+    /// uncommissioned. The journal refuses replay floors for such a record
+    /// and a reboot discards it in favour of fresh steering, so floors
+    /// learned in that window can only be volatile. Treating the impossible
+    /// durable commit as a failure fail-stopped a node whose parent
+    /// re-delivered the join Transport-Key or relayed a broadcast while the
+    /// exchange was still running. Every other state keeps the fail-closed
+    /// durable requirement.
+    fn replay_floors_can_be_durable<S: SecurityStateStore>(
+        &self,
+        store: &mut S,
+    ) -> Result<bool, SecurityStoreError> {
+        if !self.bdb.tclk_exchange_active() {
+            return Ok(true);
+        }
+        Ok(store.load()?.is_none_or(|state| state.commissioned))
+    }
+
     /// Load the persisted record, requiring it to exist and validate.
     ///
     /// Shared by every rejoin step so the store read, presence check and
@@ -11407,16 +11428,22 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         }
         self.refresh_security_state(store)?;
         self.tombstone_retired_security_state_replay_counters(store)?;
+        let durable_replay = self.replay_floors_can_be_durable(store)?;
         self.set_nwk_lifecycle_persistence_enabled(true);
         self.set_network_key_persistence_enabled(true);
         self.defer_aps_ack = true;
         let mut replay_error = None;
         let event = {
-            let mut replay_commit = |replay| match store.commit_replay_counter(replay) {
-                Ok(()) => true,
-                Err(error) => {
-                    replay_error = Some(error);
-                    false
+            let mut replay_commit = |replay| {
+                if !durable_replay {
+                    return true;
+                }
+                match store.commit_replay_counter(replay) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        replay_error = Some(error);
+                        false
+                    }
                 }
             };
             self.process_incoming_with_replay_commit(
@@ -11461,12 +11488,16 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             if !trust_center_removal && deferred_mgmt_leave.is_none() {
                 self.refresh_security_state(store)?;
                 self.tombstone_retired_security_state_replay_counters(store)?;
-                if let Some(replay) = self.pending_network_key_replay() {
+                if let Some(replay) = self.pending_network_key_replay()
+                    && durable_replay
+                {
                     store.commit_replay_counter(security_store::PersistentReplayCounter::Aps(
                         replay,
                     ))?;
                 }
-                if let Some(replay) = self.bdb.zdo().aps().pending_data_replay() {
+                if let Some(replay) = self.bdb.zdo().aps().pending_data_replay()
+                    && durable_replay
+                {
                     store.commit_replay_counter(security_store::PersistentReplayCounter::Aps(
                         replay,
                     ))?;
@@ -11493,9 +11524,11 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                             self.abort_nwk_lifecycle_persistence();
                         }
                         _ => {
-                            if let Err(error) = store.commit_replay_counter(
-                                security_store::PersistentReplayCounter::Nwk(replay),
-                            ) {
+                            if durable_replay
+                                && let Err(error) = store.commit_replay_counter(
+                                    security_store::PersistentReplayCounter::Nwk(replay),
+                                )
+                            {
                                 self.abort_nwk_lifecycle_persistence();
                                 self.abort_network_key_persistence();
                                 self.bdb.zdo_mut().aps_mut().discard_pending_aps_ack();

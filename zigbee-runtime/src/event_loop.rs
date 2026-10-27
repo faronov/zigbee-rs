@@ -1260,6 +1260,99 @@ mod commissioning_tick_tests {
         ));
     }
 
+    fn secured_parent_frame(dst: u16, frame_counter: u32) -> zigbee_mac::MacFrame {
+        use zigbee_nwk::security::{NwkSecurity, NwkSecurityHeader};
+
+        let header = NwkHeader {
+            frame_control: NwkFrameControl {
+                frame_type: NwkFrameType::Data as u8,
+                protocol_version: 0x02,
+                discover_route: 0,
+                multicast: false,
+                security: true,
+                source_route: false,
+                dst_ieee_present: false,
+                src_ieee_present: false,
+                end_device_initiator: false,
+            },
+            dst_addr: ShortAddress(dst),
+            src_addr: ShortAddress::COORDINATOR,
+            radius: 5,
+            seq_number: frame_counter as u8,
+            dst_ieee: None,
+            src_ieee: None,
+            multicast_control: None,
+            source_route: None,
+        };
+        // APS data, unicast to endpoint 1 / cluster 0x0006 / HA profile.
+        let aps = [0x00u8, 0x01, 0x06, 0x00, 0x04, 0x01, 0x01, 0x10];
+        let mut buf = [0u8; 96];
+        let hdr_len = header.serialize(&mut buf);
+        let sec_hdr = NwkSecurityHeader {
+            security_control: NwkSecurityHeader::ZIGBEE_DEFAULT,
+            frame_counter,
+            source_address: TC_IEEE,
+            key_seq_number: 0,
+        };
+        let sec_len = sec_hdr.serialize(&mut buf[hdr_len..]);
+        let aad_len = hdr_len + sec_len;
+        let ciphertext = NwkSecurity::new()
+            .encrypt(&buf[..aad_len], &aps, &NETWORK_KEY, &sec_hdr)
+            .expect("test frame encrypts");
+        buf[aad_len..aad_len + ciphertext.len()].copy_from_slice(&ciphertext);
+        buf[hdr_len] &= !0x07;
+        zigbee_mac::MacFrame::from_slice(&buf[..aad_len + ciphertext.len()]).expect("frame fits")
+    }
+
+    /// Between the network-security reservation and the Confirm-Key commit
+    /// the persisted record is uncommissioned, so the journal cannot hold
+    /// replay floors. Authenticated parent traffic in that window (a relayed
+    /// broadcast, an early unicast) must be processed with volatile floors
+    /// instead of failing the durable receive path with `Corrupt`, which the
+    /// product treats as a fatal persistence failure.
+    #[test]
+    fn authenticated_traffic_during_the_tclk_window_uses_volatile_replay_floors() {
+        use crate::security_store::{RamSecurityStateStore, SecurityStateStore};
+
+        let mut device = joinable_device();
+        let mut store = RamSecurityStateStore::new();
+        {
+            let mut persistence =
+                crate::CommissioningSecurityPersistence::new(&mut store).expect("persistence");
+            block_on(
+                device
+                    .bdb_mut()
+                    .network_steering_with_persistence(&mut persistence),
+            )
+            .expect("network steering");
+            assert!(persistence.take_error().is_none());
+        }
+        assert_eq!(block_on(device.finish_join()).ok(), Some(SHORT));
+        assert!(device.bdb().tclk_exchange_active());
+        assert!(!store.load().unwrap().unwrap().commissioned);
+
+        let indication = |frame, dst: u16| zigbee_mac::McpsDataIndication {
+            src_address: MacAddress::Short(PanId(PAN), ShortAddress::COORDINATOR),
+            dst_address: MacAddress::Short(PanId(PAN), ShortAddress(dst)),
+            lqi: 200,
+            payload: frame,
+            security_use: false,
+        };
+        for (dst, counter) in [(0xFFFF, 0x40), (SHORT, 0x41)] {
+            let frame = secured_parent_frame(dst, counter);
+            let mac_dst = if dst == 0xFFFF { 0xFFFF } else { SHORT };
+            block_on(device.process_incoming_with_security_store(
+                &indication(frame, mac_dst),
+                &mut [],
+                &mut store,
+            ))
+            .expect("the commissioning window must not fail the durable receive path");
+        }
+        assert!(device.bdb().tclk_exchange_active());
+        assert!(device.is_joined());
+        assert!(!store.load().unwrap().unwrap().commissioned);
+    }
+
     /// The durable tick path must behave exactly like the plain one: one
     /// bounded handshake step per tick, terminal transition reported at once.
     #[test]
