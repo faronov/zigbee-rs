@@ -6244,6 +6244,57 @@ mod resume_tests {
         );
     }
 
+    #[test]
+    fn the_initial_request_waits_for_the_network_key_and_keeps_its_retries() {
+        // Regression (CC2340 HIL): the first request of a fresh join went out
+        // before commissioning security was settled and was never answered;
+        // only the bounded retransmission recovered it.
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x01, true, 14));
+        device.mac_mut().clear_tx_history();
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .nib_mut()
+            .reset_end_device_timeout_negotiation();
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .security_mut()
+            .clear_network_keys();
+
+        block_on(device.finish_join()).unwrap();
+        assert!(
+            ed_timeout_requests(&device).is_empty(),
+            "no request may leave before the network key is installed"
+        );
+        assert!(device.ed_timeout().start_deferred);
+        let _ = block_on(device.tick(1, &mut []));
+        assert!(ed_timeout_requests(&device).is_empty());
+
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .security_mut()
+            .set_network_key(NETWORK_KEY, 0);
+        let _ = block_on(device.tick(1, &mut []));
+
+        assert_eq!(
+            ed_timeout_requests(&device),
+            std::vec![[ED_TIMEOUT_ENUM_REQUESTED, 0x00]],
+            "exactly one initial request once security is established"
+        );
+        assert!(!device.ed_timeout().start_deferred);
+        assert_eq!(
+            device.ed_timeout().retries_left,
+            ZigbeeDevice::<MockMac>::ED_TIMEOUT_MAX_RETRIES,
+            "the deferred start keeps the full retransmission budget"
+        );
+        assert!(device.ed_timeout().response_remaining_secs.is_some());
+    }
+
     /// Current neighbour-cache age for the entry with this IEEE address.
     fn neighbour_age(device: &ZigbeeDevice<MockMac>, ieee: &[u8; 8]) -> Option<u16> {
         device
@@ -6997,6 +7048,9 @@ pub struct EndDeviceTimeoutState {
     pub(crate) failures: u8,
     /// A forced MAC poll is scheduled for the next runtime tick.
     pub(crate) forced_poll: bool,
+    /// The initial request of a fresh negotiation is waiting for commissioning
+    /// security (network key installed, unique-TCLK exchange finished).
+    pub(crate) start_deferred: bool,
 }
 
 impl EndDeviceTimeoutState {
@@ -7007,6 +7061,7 @@ impl EndDeviceTimeoutState {
             retries_left: 0,
             failures: 0,
             forced_poll: false,
+            start_deferred: false,
         }
     }
 
@@ -14478,6 +14533,15 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// sends exactly one initial request. Called from every path that
     /// establishes a new parent relationship; the silent persisted resume uses
     /// [`Self::resume_end_device_timeout`] instead.
+    ///
+    /// On a fresh centralized join the request is *deferred* until
+    /// commissioning security is established (see
+    /// [`Self::end_device_security_ready`]): sent while the network key is
+    /// missing or the unique-TCLK exchange is still running, it was observed on
+    /// hardware to go unanswered (the parent is still re-delivering the
+    /// Transport-Key) and only the bounded retransmission recovered it. The
+    /// deferred start is sent from [`Self::service_end_device_timeout`] with
+    /// the full retry budget intact.
     #[inline(never)]
     async fn begin_end_device_timeout_negotiation(&mut self)
     where
@@ -14489,10 +14553,24 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         }
         self.ed_timeout_mut().retries_left = Self::ED_TIMEOUT_MAX_RETRIES;
         self.reset_end_device_keepalive();
+        if !self.end_device_security_ready() {
+            log::info!("[Runtime] ED Timeout Request deferred until security is established");
+            self.ed_timeout_mut().start_deferred = true;
+            return;
+        }
         // A transmission failure is deliberately ignored here: the join or
         // rejoin has already succeeded and the recurring keepalive owns
         // recovery.
         self.send_ed_timeout_request_tracked().await;
+    }
+
+    /// Whether NWK security is usable for the End Device Timeout exchange:
+    /// an unsecured network, or a network key is installed and no unique
+    /// Trust Center link-key exchange is still in progress.
+    fn end_device_security_ready(&self) -> bool {
+        let nwk = self.bdb.zdo().nwk();
+        let key_ready = !nwk.nib().security_enabled || nwk.security().active_key().is_some();
+        key_ready && !self.bdb.tclk_exchange_active()
     }
 
     /// Choose the first keepalive after a silent persisted resume.
@@ -14545,6 +14623,20 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         R: crate::role::EndDeviceRole,
     {
         if !self.negotiates_end_device_timeout() || !self.is_joined() {
+            return;
+        }
+
+        if self.ed_timeout().start_deferred {
+            // Nothing else runs until the initial request has gone out: the
+            // keepalive must not race the deferred negotiation.
+            if !self.end_device_security_ready() {
+                return;
+            }
+            self.ed_timeout_mut().start_deferred = false;
+            self.ed_timeout_mut().retries_left = Self::ED_TIMEOUT_MAX_RETRIES;
+            self.reset_end_device_keepalive();
+            log::info!("[Runtime] Security established — sending ED Timeout Request");
+            self.send_ed_timeout_request_tracked().await;
             return;
         }
 

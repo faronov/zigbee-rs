@@ -1146,6 +1146,10 @@ mod commissioning_tick_tests {
             device.bdb().tclk_exchange_stage(),
             Some(TclkStage::StartDelay)
         );
+        assert!(
+            device.ed_timeout().start_deferred,
+            "the End Device Timeout Request waits for the unique-TCLK exchange"
+        );
         device
     }
 
