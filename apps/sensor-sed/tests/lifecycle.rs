@@ -1245,6 +1245,73 @@ fn each_step_has_one_bounded_four_round_poll_owner() {
     assert_eq!(waits.borrow().len(), 2);
 }
 
+/// Slow-poll cadence for the stale-runtime-clock regression: 10 s polls
+/// with a 25 s sample interval, so every third slow wait is cut short to
+/// meet the sample deadline.
+const OFF_PHASE_SLOW_POLICY: SensorPolicy = SensorPolicy {
+    sample_interval_ms: 25_000,
+    fast_poll_ms: 250,
+    slow_poll_ms: 10_000,
+    restored_fast_ms: 2_500,
+    ..BASE_POLICY
+};
+
+#[test]
+fn slow_polls_keep_the_slow_cadence_after_an_off_phase_wait() {
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let status = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::with_state(commissioned_state(0x02), &store_calls);
+    let mut profile = test_profile();
+    let mut device = test_device(&profile, &OFF_PHASE_SLOW_POLICY);
+
+    {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let wake = RecordingWake::new(0, Vec::new(), &waits, &poll_counts, &delay_calls);
+        let mut app = SensorApp::new(
+            node,
+            &OFF_PHASE_SLOW_POLICY,
+            parts(
+                wake,
+                RecordingStatus { events: &status },
+                NoOta,
+                &environment_samples,
+                &battery_samples,
+                &heartbeats,
+                &diagnostics,
+            ),
+        )
+        .unwrap();
+        block_on(app.initialize()).unwrap();
+        for _ in 0..30 {
+            block_on(app.step()).unwrap();
+        }
+    }
+
+    let slow: Vec<u32> = waits
+        .borrow()
+        .iter()
+        .filter(|wait| wait.sleep_depth == SleepDepth::Retention)
+        .map(|wait| wait.timeout_ms)
+        .collect();
+    assert!(slow.len() >= 12, "slow waits: {slow:?}");
+    // Every Timer wake polls, so a slow wait shorter than the poll period is
+    // an extra Data Request. After the first sample-deadline cut the 25 s
+    // sample period must hold exactly 10 s + 10 s + 5 s; the old order
+    // (poll stamped with the stale runtime clock, then tick) collapsed it
+    // into 7 s / 3 s and finally a fixed 5 s / 5 s alternation.
+    let first_cut = slow.iter().position(|&timeout| timeout != 10_000).unwrap();
+    for period in slow[first_cut + 1..].chunks_exact(3) {
+        assert_eq!(period, [10_000, 10_000, 5_000], "slow waits: {slow:?}");
+    }
+}
+
 #[test]
 fn reporting_completion_uses_short_grace_then_the_slow_wait_depth() {
     exercise_reporting_completion(false);

@@ -941,6 +941,37 @@ where
         }
     }
 
+    /// Whole seconds of real time not yet charged to the runtime clock.
+    ///
+    /// The former 60-second cap silently lost time whenever a product policy
+    /// slept longer than a minute (slow poll or sample interval), which
+    /// stretched every runtime timer. `last_tick` advances by exactly the
+    /// charged amount, so the sub-second remainder carries forward.
+    fn take_runtime_elapsed_secs(&mut self) -> u16 {
+        let secs = (self.elapsed_ms(self.last_tick) / 1_000).min(u32::from(u16::MAX));
+        if secs != 0 {
+            self.last_tick = W::add_ms(self.last_tick, secs * 1_000);
+        }
+        secs as u16
+    }
+
+    /// Charge the finished wait to the runtime clock before the poll window.
+    ///
+    /// The runtime stamps each poll with its own whole-second clock, which
+    /// only advances in `tick()`. Polling first would stamp the poll one wait
+    /// in the past; the following tick then saw `since_poll == wait` and
+    /// asked for `RunAgain(slow_poll - wait)`, so a single shortened wait
+    /// (e.g. one cut short by the sample deadline) locked the slow cadence
+    /// into a `wait / slow_poll - wait` alternation — an extra Data Request
+    /// per period. Returns the charged seconds.
+    async fn charge_runtime_clock(&mut self) -> u16 {
+        let secs = self.take_runtime_elapsed_secs();
+        if secs != 0 {
+            self.tick_and_handle(secs).await;
+        }
+        secs
+    }
+
     /// Periodic joined-state tasks: sensor read/report, the main runtime
     /// tick, Identify LED, and Device_annce retries.
     ///
@@ -948,28 +979,24 @@ where
     /// elapsed time uses its own whole-second clock so `RunAgain` wakeups and
     /// incoming-frame flush ticks cannot repeatedly charge the stack for the
     /// same wall-clock interval.
-    async fn service_periodic_joined(&mut self) {
+    ///
+    /// `precharged_secs` is runtime time already charged this iteration by
+    /// [`charge_runtime_clock`](Self::charge_runtime_clock); OTA still sees
+    /// the full elapsed time.
+    async fn service_periodic_joined(&mut self, precharged_secs: u16) {
         if self.elapsed_ms(self.last_report) >= self.policy.sample_interval_ms {
             self.last_report = self.mark();
             self.read_sensors().await;
         }
 
-        // Charge the runtime every whole second that really elapsed. The
-        // former 60-second cap silently lost time whenever a product policy
-        // slept longer than a minute (slow poll or sample interval), which
-        // stretched every runtime timer. `last_tick` advances by exactly the
-        // charged amount, so the sub-second remainder carries forward.
-        let tick_elapsed = (self.elapsed_ms(self.last_tick) / 1_000).min(u32::from(u16::MAX));
-        if tick_elapsed != 0 {
-            self.last_tick = W::add_ms(self.last_tick, tick_elapsed * 1_000);
-        }
-        self.tick_and_handle(tick_elapsed as u16).await;
+        let tick_elapsed = self.take_runtime_elapsed_secs();
+        self.tick_and_handle(tick_elapsed).await;
 
         if O::ENABLED {
             let ota = self
                 .resources
                 .ota
-                .service(&mut self.node, tick_elapsed as u16)
+                .service(&mut self.node, tick_elapsed.saturating_add(precharged_secs))
                 .await;
             if ota.keep_awake_ms.is_some() || ota.activation_pending {
                 self.apply_ota_outcome(ota.keep_awake_ms, ota.activation_pending);
@@ -1396,10 +1423,14 @@ where
         }
 
         if self.node.device().is_joined() {
+            let mut precharged_secs = 0;
             if poll_due {
-                self.service_joined_polls().await;
+                precharged_secs = self.charge_runtime_clock().await;
+                if self.node.device().is_joined() {
+                    self.service_joined_polls().await;
+                }
             }
-            self.service_periodic_joined().await;
+            self.service_periodic_joined(precharged_secs).await;
         } else {
             self.service_unjoined().await;
         }
