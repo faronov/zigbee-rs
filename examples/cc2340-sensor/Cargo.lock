@@ -42,6 +42,7 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "embassy-executor",
+ "embassy-futures",
  "embassy-time 0.5.1",
  "log",
  "lp-em-cc2340r5",

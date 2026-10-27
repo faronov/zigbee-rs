@@ -149,6 +149,11 @@ pub struct DriverStats {
     pub rx_restarts: u32,
     /// Transmissions refused because CCA found the channel busy.
     pub cca_busy: u32,
+    /// Radio power-downs by [`Cc2340Driver::sleep`].
+    pub sleeps: u32,
+    /// Full LRFD re-initialisations after device standby
+    /// ([`Cc2340Driver::note_standby`]).
+    pub standby_reinits: u32,
 }
 
 /// Low-level CC2340 IEEE 802.15.4 radio driver.
@@ -169,6 +174,13 @@ pub struct Cc2340Driver {
     /// Addressing or promiscuous mode changed since the filter was written.
     filter_dirty: bool,
     operation_active: bool,
+    /// Radio cores, synthesizer reference and LRFD clocks are powered down
+    /// by [`Self::sleep`]; the next operation (or [`Self::wake`]) restores
+    /// them.
+    asleep: bool,
+    /// The device went through standby while [`Self::asleep`]: the LRFD
+    /// lost its registers, so [`Self::wake`] must run the full [`Self::init`].
+    lrfd_lost: bool,
     /// The RX FIFO must be reset (not just trimmed) before the next start.
     rx_fifo_reset_pending: bool,
     pa_value: u16,
@@ -184,6 +196,8 @@ impl Cc2340Driver {
             config_dirty: true,
             filter_dirty: true,
             operation_active: false,
+            asleep: false,
+            lrfd_lost: false,
             rx_fifo_reset_pending: true,
             pa_value: 0,
             stats: DriverStats::default(),
@@ -240,7 +254,15 @@ impl Cc2340Driver {
                 return Err(error.into());
             }
 
-            log::info!(
+            // First bring-up at info; post-standby re-inits (every slow poll)
+            // only at debug, they are counted in the STATS line.
+            let level = if self.stats.standby_reinits == 0 {
+                log::Level::Info
+            } else {
+                log::Level::Debug
+            };
+            log::log!(
+                level,
                 "[CC2340 DRV] Initialized channel {} at {} dBm (PA 0x{:04X}, {} C) using firmware from {} and PHY settings from {}",
                 self.config.channel,
                 tx_power.dbm,
@@ -262,7 +284,11 @@ impl Cc2340Driver {
     }
 
     pub fn deinit(&mut self) {
-        if self.images_loaded {
+        if self.asleep && hardware::start_hfxt().is_ok() && hardware::enable_radio_clocks().is_ok()
+        {
+            self.asleep = false;
+        }
+        if self.images_loaded && !self.asleep {
             hardware::hard_stop();
             hardware::disable_radio_cores();
             hardware::disable_synth_refsys();
@@ -323,7 +349,7 @@ impl Cc2340Driver {
 
     /// PBE counters of the operation currently (or last) running.
     pub fn pbe_counters(&self) -> fifo::PbeCounters {
-        if self.configured {
+        if self.configured && !self.asleep {
             fifo::pbe_counters()
         } else {
             fifo::PbeCounters::default()
@@ -343,7 +369,7 @@ impl Cc2340Driver {
     }
 
     pub fn read_rssi(&self) -> i8 {
-        if self.configured {
+        if self.configured && !self.asleep {
             let rssi = hardware::read_rssi();
             if rssi == 127 { i8::MIN } else { rssi }
         } else {
@@ -377,6 +403,7 @@ impl Cc2340Driver {
         if !self.configured {
             return Err(RadioError::RadioConfigUnavailable);
         }
+        self.wake()?;
 
         // Do not cut off a frame being received or the auto-ACK being sent.
         self.wait_rx_idle().await;
@@ -542,6 +569,7 @@ impl Cc2340Driver {
         if !self.configured {
             return Err(RadioError::RadioConfigUnavailable);
         }
+        self.wake()?;
 
         let mut dropped_frames: u32 = 0;
         let mut restarts: u32 = 0;
@@ -640,6 +668,86 @@ impl Cc2340Driver {
     /// firmware/trim restoration is validated on hardware.
     pub fn prepare_active_wait(&mut self) -> Result<(), RadioError> {
         self.stop_operation()
+    }
+
+    /// Power the radio down between operations while keeping the CPU-side
+    /// state and the LRFD contents (TOPsm images, REGBANK, trims, synth
+    /// programming): clock gating does not remove power from the LRFD.
+    ///
+    /// Mirrors what TI does around every IEEE command: the end of
+    /// `RCL_Handler_Ieee_RxTx` (`rcl/handlers/ieee.c`) calls `LRF_disable()`
+    /// (TOPsm power-down requests) and `LRF_disableSynthRefsys()`, and with
+    /// no clock dependency left `LRFDApplyClockDependencies()`
+    /// (`driverlib/lrfd.c`) clears `LRFDDBELL.CLKCTL` and the `CLKCTL` LRFD
+    /// module clock. In addition HFXT is stopped (TI only does this on
+    /// standby entry, see [`hardware::stop_hfxt`]); the CPU keeps running
+    /// from HFOSC and [`Self::wake`] restarts the crystal before the LRFD
+    /// clocks. Measured on LP-EM-CC2340R5 this is the largest idle consumer
+    /// left once the radio is gated. Committed RX frames stay in the FIFO RAM.
+    pub fn sleep(&mut self) -> Result<(), RadioError> {
+        if !self.configured || self.asleep {
+            return Ok(());
+        }
+        let stopped = self.stop_operation();
+        hardware::disable_radio_cores();
+        hardware::disable_synth_refsys();
+        hardware::disable_radio_clocks();
+        hardware::stop_hfxt();
+        self.asleep = true;
+        self.stats.sleeps = self.stats.sleeps.wrapping_add(1);
+        stopped
+    }
+
+    /// Undo [`Self::sleep`]: re-enable the LRFD clocks and the synthesizer
+    /// reference (`LRF_enableSynthRefsys()`, including its settle time). The
+    /// TOPsm cores are re-initialised by the next operation's
+    /// `prepare_cores`, exactly as before every RCL command. Every operation
+    /// entry point calls this, so an explicit call is only an eager restore.
+    pub fn wake(&mut self) -> Result<(), RadioError> {
+        if !self.asleep {
+            return Ok(());
+        }
+        if self.lrfd_lost {
+            // RCL on `PowerLPF3_AWAKE_STANDBY` (`rclPowerNotify()`,
+            // `rcl/RCL.c`) drops `lrfState` to `RadioState_ImagesLoaded`
+            // so the next command re-runs `LRF_setupRadio()`. Here the
+            // images are reloaded as well (conservative; ~1 ms of copying)
+            // by the same path as the first bring-up.
+            self.asleep = false;
+            self.lrfd_lost = false;
+            self.images_loaded = false;
+            self.configured = false;
+            self.operation_active = false;
+            self.filter_dirty = true;
+            self.rx_fifo_reset_pending = true;
+            self.stats.standby_reinits = self.stats.standby_reinits.wrapping_add(1);
+            return self.init();
+        }
+        hardware::start_hfxt()?;
+        hardware::enable_radio_clocks()?;
+        hardware::enable_synth_refsys()?;
+        self.asleep = false;
+        Ok(())
+    }
+
+    /// Whether [`Self::sleep`] powered the radio down.
+    pub const fn is_asleep(&self) -> bool {
+        self.asleep
+    }
+
+    /// Record that the device was in standby while the radio was asleep.
+    ///
+    /// The LRFD power domain is off in standby, so its registers (PHY
+    /// configuration, trims, synthesizer programming, frame filter) are
+    /// lost; the next [`Self::wake`] re-initialises everything from the
+    /// retained software configuration. Returns `false` (and does nothing)
+    /// when the radio was not put to sleep first, which a caller must treat
+    /// as a sequencing bug: standby with a running radio is not supported.
+    pub fn note_standby(&mut self) -> bool {
+        if self.asleep {
+            self.lrfd_lost = true;
+        }
+        self.asleep
     }
 
     fn frame_filter(&self) -> fifo::FrameFilter {

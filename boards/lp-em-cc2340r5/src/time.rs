@@ -1,163 +1,124 @@
-//! One-microsecond Embassy monotonic clock backed by ARM SysTick.
+//! Tickless one-microsecond Embassy clock on the CC2340 system timer.
 //!
-//! SysTick interrupts every millisecond and the current down-counter provides
-//! sub-millisecond interpolation. The CC2340 system timer compensates elapsed
-//! time while flash erase/program temporarily masks interrupts.
+//! `SYSTIM.TIME1U` is a free-running 32-bit microsecond counter that keeps
+//! counting while the CPU sleeps (and, in standby, is resynchronised from the
+//! RTC by hardware). It is extended to 64 bits in software. Alarms use SYSTIM
+//! channel 0 in compare mode routed to `CPUIRQ16`, mirroring TI's
+//! `ClockPLPF3_freertos.c` (`ClockP_startup()` / `ClockP_scheduleNextTick()`),
+//! so the CPU is interrupted only when a timer actually expires instead of on
+//! every 1 ms SysTick.
 
 use core::cell::RefCell;
 use cortex_m::interrupt::Mutex;
-use cortex_m_rt::exception;
-use portable_atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::MCU_CLOCK_HZ;
+use crate::interrupts::{self, Irq};
+use crate::timebase::{TimerQueue, compare_target, extend};
 
-const SYSTICK_RELOAD: u32 = MCU_CLOCK_HZ / 1_000 - 1;
-const TICKS_PER_MILLISECOND: u64 = 1_000;
-const CORE_CYCLES_PER_TICK: u64 = (MCU_CLOCK_HZ / 1_000_000) as u64;
+const SYSTIM_BASE: u32 = 0x4002_2000;
+const SYSTIM_ICLR: *mut u32 = (SYSTIM_BASE + 0x054) as *mut u32;
+const SYSTIM_IMSET: *mut u32 = (SYSTIM_BASE + 0x058) as *mut u32;
+const SYSTIM_TIME1U: *const u32 = (SYSTIM_BASE + 0x104) as *const u32;
+const SYSTIM_CH0CFG: *mut u32 = (SYSTIM_BASE + 0x10C) as *mut u32;
+const SYSTIM_CH0CC: *mut u32 = (SYSTIM_BASE + 0x120) as *mut u32;
+const SYSTIM_ARMCLR: *mut u32 = (SYSTIM_BASE + 0x148) as *mut u32;
+const SYSTIM_EV0: u32 = 1 << 0;
 
-const SYST_CSR: *mut u32 = 0xE000_E010 as *mut u32;
-const SYST_RVR: *mut u32 = 0xE000_E014 as *mut u32;
-const SYST_CVR: *mut u32 = 0xE000_E018 as *mut u32;
-const SCB_ICSR: *mut u32 = 0xE000_ED04 as *mut u32;
+const EVTSVT_CPUIRQ16SEL: *mut u32 = 0x4002_5444 as *mut u32;
+const EVTSVT_PUBID_SYSTIM0: u32 = 0x1B;
 
-const CSR_ENABLE: u32 = 1 << 0;
-const CSR_TICKINT: u32 = 1 << 1;
-const CSR_CLKSOURCE: u32 = 1 << 2;
-const ICSR_PENDSTCLR: u32 = 1 << 25;
-const ICSR_PENDSTSET: u32 = 1 << 26;
+/// Embassy timers expected concurrently (one per waiting task/select arm).
+const QUEUE_DEPTH: usize = 4;
 
-const SYSTIM_TIME250N: *const u32 = 0x4002_2100 as *const u32;
-
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
-static TICK_BASE: AtomicU64 = AtomicU64::new(0);
-
-struct AlarmState {
-    target: u64,
-    waker: Option<core::task::Waker>,
+struct State {
+    /// Last value returned by [`now_locked`]; carries the 64-bit extension.
+    extended: u64,
+    queue: TimerQueue<QUEUE_DEPTH>,
 }
 
-static ALARM: Mutex<RefCell<AlarmState>> = Mutex::new(RefCell::new(AlarmState {
-    target: u64::MAX,
-    waker: None,
+static STATE: Mutex<RefCell<State>> = Mutex::new(RefCell::new(State {
+    extended: 0,
+    queue: TimerQueue::new(),
 }));
 
 pub struct Cc2340TimeDriver;
 
-impl Cc2340TimeDriver {
-    const fn new() -> Self {
-        Self
-    }
-}
-
 impl embassy_time_driver::Driver for Cc2340TimeDriver {
     fn now(&self) -> u64 {
-        cortex_m::interrupt::free(|_| now_locked())
+        cortex_m::interrupt::free(|cs| now_locked(&mut STATE.borrow(cs).borrow_mut()))
     }
 
     fn schedule_wake(&self, at: u64, waker: &core::task::Waker) {
-        cortex_m::interrupt::free(|critical_section| {
-            let mut alarm = ALARM.borrow(critical_section).borrow_mut();
-            alarm.target = at;
-            alarm.waker = Some(waker.clone());
+        cortex_m::interrupt::free(|cs| {
+            let mut state = STATE.borrow(cs).borrow_mut();
+            if state.queue.schedule_wake(at, waker) {
+                rearm(&mut state);
+            }
         });
-
-        if self.now() >= at {
-            wake_alarm(at);
-        }
     }
 }
 
 embassy_time_driver::time_driver_impl!(
-    static TIME_DRIVER: Cc2340TimeDriver = Cc2340TimeDriver::new()
+    static TIME_DRIVER: Cc2340TimeDriver = Cc2340TimeDriver
 );
 
 pub(crate) fn init() {
-    cortex_m::interrupt::free(|_| unsafe {
-        TICK_BASE.store(0, Ordering::Relaxed);
-        core::ptr::write_volatile(SYST_CSR, 0);
-        core::ptr::write_volatile(SYST_RVR, SYSTICK_RELOAD);
-        core::ptr::write_volatile(SYST_CVR, 0);
-        core::ptr::write_volatile(SCB_ICSR, ICSR_PENDSTCLR);
-        INITIALIZED.store(true, Ordering::Release);
-        core::ptr::write_volatile(SYST_CSR, CSR_CLKSOURCE | CSR_TICKINT | CSR_ENABLE);
+    cortex_m::interrupt::free(|cs| unsafe {
+        let mut state = STATE.borrow(cs).borrow_mut();
+        state.extended = u64::from(core::ptr::read_volatile(SYSTIM_TIME1U));
+
+        // ClockP_startup(): channel 0 compare at 1 µs resolution, EV0 to
+        // CPUIRQ16. EMU.HALT is deliberately left at RUN so time keeps
+        // advancing while a debugger halts the core.
+        core::ptr::write_volatile(SYSTIM_ARMCLR, 1 << 0);
+        core::ptr::write_volatile(SYSTIM_CH0CFG, 0);
+        core::ptr::write_volatile(SYSTIM_ICLR, SYSTIM_EV0);
+        core::ptr::write_volatile(EVTSVT_CPUIRQ16SEL, EVTSVT_PUBID_SYSTIM0);
+        core::ptr::write_volatile(SYSTIM_IMSET, SYSTIM_EV0);
+        rearm(&mut state);
+        interrupts::enable(Irq::CpuIrq16);
     });
 }
 
-#[exception]
-fn SysTick() {
-    let now = TICK_BASE.fetch_add(TICKS_PER_MILLISECOND, Ordering::Relaxed) + TICKS_PER_MILLISECOND;
-    cortex_m::interrupt::free(|critical_section| {
-        let mut alarm = ALARM.borrow(critical_section).borrow_mut();
-        if now >= alarm.target {
-            alarm.target = u64::MAX;
-            if let Some(waker) = alarm.waker.take() {
-                waker.wake();
-            }
-        }
-    });
+/// `CPUIRQ16` (SYSTIM channel 0) handler.
+pub(crate) fn on_interrupt() {
+    unsafe { core::ptr::write_volatile(SYSTIM_ICLR, SYSTIM_EV0) };
+    cortex_m::interrupt::free(|cs| rearm(&mut STATE.borrow(cs).borrow_mut()));
 }
 
-fn wake_alarm(target: u64) {
-    cortex_m::interrupt::free(|critical_section| {
-        let mut alarm = ALARM.borrow(critical_section).borrow_mut();
-        if alarm.target == target {
-            alarm.target = u64::MAX;
-            if let Some(waker) = alarm.waker.take() {
-                waker.wake();
-            }
-        }
-    });
+fn now_locked(state: &mut State) -> u64 {
+    let low = unsafe { core::ptr::read_volatile(SYSTIM_TIME1U) };
+    extend(&mut state.extended, low)
 }
 
-fn now_locked() -> u64 {
-    if !INITIALIZED.load(Ordering::Acquire) {
-        return 0;
-    }
+/// Wake expired timers and program channel 0 for the next deadline (or the
+/// 30-minute keep-alive that preserves the 64-bit extension).
+fn rearm(state: &mut State) {
+    loop {
+        let now = now_locked(state);
+        let next = state.queue.next_expiration(now);
+        let target = compare_target(now, next);
 
-    let base = TICK_BASE.load(Ordering::Relaxed);
-    let (remaining, pending_wrap) = loop {
-        let pending_before = unsafe { core::ptr::read_volatile(SCB_ICSR) } & ICSR_PENDSTSET != 0;
-        let remaining = unsafe { core::ptr::read_volatile(SYST_CVR as *const u32) } as u64;
-        let pending_after = unsafe { core::ptr::read_volatile(SCB_ICSR) } & ICSR_PENDSTSET != 0;
-        if pending_before == pending_after {
-            break (remaining, pending_after);
+        // ClockP_scheduleNextTick(): un-arm, clear the NVIC pending bit of a
+        // stale compare, then write CC (which clears EV0 and re-arms).
+        unsafe {
+            core::ptr::write_volatile(SYSTIM_ARMCLR, 1 << 0);
+            interrupts::unpend(Irq::CpuIrq16);
+            core::ptr::write_volatile(SYSTIM_CH0CC, target as u32);
         }
-    };
 
-    let elapsed_cycles = u64::from(SYSTICK_RELOAD).saturating_sub(remaining);
-    base + u64::from(pending_wrap) * TICKS_PER_MILLISECOND + elapsed_cycles / CORE_CYCLES_PER_TICK
-}
-
-/// Execute a flash operation with IRQs masked and account for the masked time.
-pub(crate) fn run_flash_operation<T>(operation: impl FnOnce() -> T) -> T {
-    let mut output = None;
-    cortex_m::interrupt::free(|_| {
-        if !INITIALIZED.load(Ordering::Acquire) {
-            output = Some(operation());
+        // The compare only fires on a future match; if the deadline passed
+        // while programming, expire it now instead of waiting for a wrap.
+        if now_locked(state) < target {
             return;
         }
+    }
+}
 
-        let before = now_locked();
-        unsafe {
-            core::ptr::write_volatile(SYST_CSR, 0);
-            core::ptr::write_volatile(SCB_ICSR, ICSR_PENDSTCLR);
-        }
-
-        let system_timer_before = unsafe { core::ptr::read_volatile(SYSTIM_TIME250N) };
-        output = Some(operation());
-        let system_timer_after = unsafe { core::ptr::read_volatile(SYSTIM_TIME250N) };
-        let elapsed_microseconds =
-            u64::from(system_timer_after.wrapping_sub(system_timer_before)) / 4;
-        TICK_BASE.store(
-            before.saturating_add(elapsed_microseconds),
-            Ordering::Relaxed,
-        );
-
-        unsafe {
-            core::ptr::write_volatile(SYST_CVR, 0);
-            core::ptr::write_volatile(SCB_ICSR, ICSR_PENDSTCLR);
-            core::ptr::write_volatile(SYST_CSR, CSR_CLKSOURCE | CSR_TICKINT | CSR_ENABLE);
-        }
-    });
-    output.expect("flash operation closure was not executed")
+/// Run a flash operation with IRQs masked.
+///
+/// SYSTIM keeps counting through the operation, so no time compensation is
+/// needed; a compare that matched meanwhile stays pending and is serviced
+/// as soon as interrupts are re-enabled.
+pub(crate) fn run_flash_operation<T>(operation: impl FnOnce() -> T) -> T {
+    cortex_m::interrupt::free(|_| operation())
 }

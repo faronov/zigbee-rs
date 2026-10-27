@@ -30,11 +30,16 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
         reset_blinks: 5,
         reset_phase_ms: 100,
     },
-    // The repaired direct-register radio has no proven retention/off restore
-    // sequence. Both phases therefore retain active clocks and use only the
-    // driver's verified active-operation quiesce transition.
-    fast_sleep_depth: SleepDepth::Active,
-    slow_sleep_depth: SleepDepth::Active,
+    // Between polls the radio is powered down with its LRFD clocks gated and
+    // HFXT stopped. During fast polling (250 ms) the CPU then waits in WFE on
+    // the tickless SYSTIM alarm or a button edge (`Idle`). Between slow polls
+    // the device enters standby (`Retention`, `RadioSleepDisposition::
+    // StandbyCapable`): RTC (LFOSC; this LaunchPad has no working LFXT) or
+    // button-IOC wake, SYSTIM resynced by hardware, full radio re-init on
+    // wake. The platform falls back to the idle wait while the LF clock is
+    // not yet qualified.
+    fast_sleep_depth: SleepDepth::Idle,
+    slow_sleep_depth: SleepDepth::Retention,
 };
 
 #[cfg(test)]
@@ -51,9 +56,9 @@ mod tests {
     }
 
     #[test]
-    fn radio_waits_are_active_only_and_button_is_semantic() {
-        assert_eq!(SENSOR_POLICY.fast_sleep_depth, SleepDepth::Active);
-        assert_eq!(SENSOR_POLICY.slow_sleep_depth, SleepDepth::Active);
+    fn fast_waits_idle_slow_waits_standby_and_button_is_semantic() {
+        assert_eq!(SENSOR_POLICY.fast_sleep_depth, SleepDepth::Idle);
+        assert_eq!(SENSOR_POLICY.slow_sleep_depth, SleepDepth::Retention);
         assert_eq!(ToggleJoinAction::SHORT_PRESS, ShortPressAction::ToggleJoin);
     }
 }

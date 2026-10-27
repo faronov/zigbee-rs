@@ -126,12 +126,25 @@ pub enum EntropyDisposition {
     UnavailableFailClosed,
 }
 
-/// Safe radio power state exposed by the current direct-register backend.
+/// Radio power states exposed by the current direct-register backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RadioSleepDisposition {
-    /// The radio may be quiesced between operations, but clocks and firmware
-    /// stay active. Retention and full-off restoration are not claimed.
-    ActiveOnly,
+    /// [`Cc2340Mac::radio_sleep`] stops the PBE operation, powers down the
+    /// TOPsm cores and synthesizer reference and gates the LRFD clocks; the
+    /// LRFD stays powered, so firmware images, PHY registers and trims are
+    /// retained. The 48 MHz crystal (HFXT) is also stopped (the CPU keeps
+    /// running from HFOSC); [`Cc2340Mac::radio_wake`] restarts HFXT (busy-wait
+    /// for amplitude settle) and re-enables the clocks. Device standby (LRFD
+    /// register loss, LF time base) is not claimed.
+    ClockGatedIdle,
+    /// [`Self::ClockGatedIdle`], after which the caller may put the whole
+    /// device into standby (LRFD power domain off) and report it with
+    /// [`Cc2340Mac::radio_note_standby`]; the next wake then re-runs the full
+    /// radio bring-up (firmware images, trims, PHY, synthesizer, PA) from the
+    /// retained software configuration, as RCL does after
+    /// `PowerLPF3_AWAKE_STANDBY`. Standby entry itself (LF clock, RTC wake,
+    /// `HapiEnterStandby`) belongs to the board.
+    StandbyCapable,
 }
 
 /// CC2340 802.15.4 MAC driver.
@@ -231,7 +244,39 @@ impl Cc2340Mac {
     }
 
     pub const fn radio_sleep_disposition(&self) -> RadioSleepDisposition {
-        RadioSleepDisposition::ActiveOnly
+        RadioSleepDisposition::StandbyCapable
+    }
+
+    /// Power the radio down for an idle wait (see
+    /// [`RadioSleepDisposition::ClockGatedIdle`]).
+    ///
+    /// The RX FIFO is drained first, while the RX operation is still running:
+    /// a stopped operation keeps its committed frames, and the ACK of every
+    /// poll without frame-pending is committed there but never read by
+    /// `mlme_poll`. Without the drain those ACKs accumulate across waits
+    /// until the PBE drops frames with `RXFIFOFULL` (observed on hardware
+    /// after a 120 s fast-poll phase: `rx_ffull` +1 per poll).
+    pub fn radio_sleep(&mut self) -> Result<(), RadioError> {
+        self.drain_rx_fifo();
+        self.driver.sleep()
+    }
+
+    /// Restore the radio after [`Self::radio_sleep`]. Every MAC operation
+    /// also restores it on demand, so this is an eager restore.
+    pub fn radio_wake(&mut self) -> Result<(), RadioError> {
+        self.driver.wake()
+    }
+
+    /// Whether the radio is currently powered down by [`Self::radio_sleep`].
+    pub const fn radio_is_asleep(&self) -> bool {
+        self.driver.is_asleep()
+    }
+
+    /// Report that the device was in standby since [`Self::radio_sleep`]
+    /// (see [`RadioSleepDisposition::StandbyCapable`]). Returns `false` if
+    /// the radio was not asleep, i.e. standby was entered out of sequence.
+    pub fn radio_note_standby(&mut self) -> bool {
+        self.driver.note_standby()
     }
 
     /// Quiesce any in-flight operation before an active-clock wait.
@@ -239,6 +284,8 @@ impl Cc2340Mac {
     /// This deliberately does not call `deinit`: a correct low-power restore
     /// sequence has not yet been proven on CC2340R52 hardware.
     pub fn prepare_active_wait(&mut self) -> Result<(), RadioError> {
+        // Same FIFO hygiene as `radio_sleep`.
+        self.drain_rx_fifo();
         self.driver.prepare_active_wait()
     }
 
@@ -647,7 +694,7 @@ impl Cc2340Mac {
         let (mac, driver, pbe) = self.stats();
         log::info!(
             "[CC2340 STATS] tx={} ack={} ack_fp={} ack_timeout={} ack_rxerr={} retries={} noack={} \
-             rx={} dup={} qfull={} rx_restart={} rx_drop={} cca_busy={} pa=0x{:04X} | pbe rx_ok={} rx_nok={} \
+             rx={} dup={} qfull={} rx_restart={} rx_drop={} cca_busy={} sleeps={} stby_reinit={} pa=0x{:04X} | pbe rx_ok={} rx_nok={} \
              rx_ign={} rx_ffull={} tx={} tx_ack={}",
             driver.tx_frames,
             driver.ack_received,
@@ -662,6 +709,8 @@ impl Cc2340Mac {
             driver.rx_restarts,
             driver.rx_dropped,
             driver.cca_busy,
+            driver.sleeps,
+            driver.standby_reinits,
             self.driver.pa_value(),
             pbe.rx_ok,
             pbe.rx_nok,
@@ -1352,13 +1401,25 @@ mod tests {
     }
 
     #[test]
-    fn only_active_radio_wait_is_advertised() {
+    fn standby_capable_is_advertised_and_harmless_before_radio_init() {
         let mut mac = Cc2340Mac::new(VALID_IEEE).unwrap();
         assert_eq!(
             mac.radio_sleep_disposition(),
-            RadioSleepDisposition::ActiveOnly
+            RadioSleepDisposition::StandbyCapable
         );
         assert_eq!(mac.prepare_active_wait(), Ok(()));
+        // Before `initialize_radio` there is nothing to power down: no MMIO
+        // is touched and the driver never reports itself asleep, so a later
+        // init performs the full bring-up.
+        assert_eq!(mac.radio_sleep(), Ok(()));
+        assert!(!mac.radio_is_asleep());
+        // Standby without a sleeping radio is reported as out of sequence and
+        // does not arm a re-init.
+        assert!(!mac.radio_note_standby());
+        assert_eq!(mac.radio_wake(), Ok(()));
+        assert_eq!(mac.stats().1.sleeps, 0);
+        assert_eq!(mac.stats().1.standby_reinits, 0);
+        assert_eq!(mac.driver.read_rssi(), i8::MIN);
     }
 
     #[test]

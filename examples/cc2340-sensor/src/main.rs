@@ -54,7 +54,7 @@ async fn main(_spawner: Spawner) {
         flash,
         reset,
     } = resources;
-    let wake = platform::ActiveWakeController::new(button1, button2);
+    let wake = platform::LaunchPadWake::new(button1, button2);
     let mut status = platform::StatusLeds::new(led1, led2);
     let supervisor = platform::ResetOnlySupervisor::new(reset);
     let supervisor_diagnostics = supervisor.diagnostics();
@@ -92,7 +92,7 @@ async fn main(_spawner: Spawner) {
         }
     };
     log::warn!(
-        "[CC2340] entropy={:?} (fail closed); radio-sleep={:?} (active only)",
+        "[CC2340] entropy={:?} (fail closed); radio-sleep={:?}",
         mac.entropy_disposition(),
         mac.radio_sleep_disposition()
     );

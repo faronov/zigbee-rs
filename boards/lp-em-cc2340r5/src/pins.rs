@@ -19,6 +19,12 @@ const GPIO_DOESET: u32 = GPIO_BASE + 0x510;
 const GPIO_DOECLR: u32 = GPIO_BASE + 0x520;
 #[cfg(target_os = "none")]
 const GPIO_DIN: u32 = GPIO_BASE + 0x700;
+#[cfg(target_os = "none")]
+const GPIO_MIS: u32 = GPIO_BASE + 0x54;
+#[cfg(target_os = "none")]
+const GPIO_ICLR: u32 = GPIO_BASE + 0x64;
+#[cfg(target_os = "none")]
+const GPIO_IMSET: u32 = GPIO_BASE + 0x6C;
 
 #[cfg(target_os = "none")]
 const IOC_BASE: u32 = 0x4000_3000;
@@ -29,6 +35,8 @@ const IOC_HYSTERESIS_ENABLE: u32 = 0x4000_0000;
 const IOC_INPUT_ENABLE: u32 = 0x2000_0000;
 const IOC_STANDBY_WAKE_ENABLE: u32 = 0x0004_0000;
 const IOC_PULL_UP: u32 = 0x0000_4000;
+/// `IOC.IOCn.EDGEDET = EDGE_NEG`: latch falling edges into `GPIO.RIS`.
+const IOC_EDGE_NEGATIVE: u32 = 0x0001_0000;
 
 /// Explicit IOC value for an ordinary push-pull GPIO output.
 ///
@@ -38,8 +46,14 @@ const IOC_PULL_UP: u32 = 0x0000_4000;
 pub const LED_IOC_CONFIGURATION: u32 = IOC_INPUT_ENABLE;
 
 /// Explicit IOC value for an active-low button with an internal pull-up.
-pub const BUTTON_IOC_CONFIGURATION: u32 =
-    IOC_HYSTERESIS_ENABLE | IOC_INPUT_ENABLE | IOC_STANDBY_WAKE_ENABLE | IOC_PULL_UP;
+///
+/// Falling-edge detection feeds the `GPIO_COMB` interrupt (press), and
+/// `WUENSB` lets the same pin wake the device from standby.
+pub const BUTTON_IOC_CONFIGURATION: u32 = IOC_HYSTERESIS_ENABLE
+    | IOC_INPUT_ENABLE
+    | IOC_STANDBY_WAKE_ENABLE
+    | IOC_PULL_UP
+    | IOC_EDGE_NEGATIVE;
 
 pub struct Output;
 pub struct InputPullUp;
@@ -113,6 +127,77 @@ impl<const DIO: u8> Button<DIO> {
     pub fn is_pressed(&self) -> bool {
         !read_input(DIO)
     }
+
+    /// Bit of this button in the masks returned by [`take_button_edges`]
+    /// and [`wait_for_button_edge`].
+    pub const fn edge_mask(&self) -> u32 {
+        1u32 << DIO
+    }
+
+    /// Route this button's press (falling edge) to the `GPIO_COMB` IRQ.
+    ///
+    /// Mirrors TI `GPIO_enableInt()`: stale edges cached in `RIS` are
+    /// cleared before the mask is set.
+    #[cfg(target_os = "none")]
+    pub fn enable_press_interrupt(&mut self) {
+        cortex_m::interrupt::free(|_| {
+            write_register(GPIO_ICLR, bit(DIO));
+            write_register(GPIO_IMSET, bit(DIO));
+        });
+        crate::interrupts::enable(crate::interrupts::Irq::GpioComb);
+    }
+}
+
+#[cfg(target_os = "none")]
+static BUTTON_EDGES: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+#[cfg(target_os = "none")]
+static BUTTON_WAKER: cortex_m::interrupt::Mutex<core::cell::RefCell<Option<core::task::Waker>>> =
+    cortex_m::interrupt::Mutex::new(core::cell::RefCell::new(None));
+
+/// `GPIO_COMB` handler (TI `GPIO_hwiIntFxn()`): latch and clear the masked
+/// edges, then wake the waiting task.
+#[cfg(target_os = "none")]
+pub(crate) fn on_gpio_interrupt() {
+    let events = unsafe { core::ptr::read_volatile(GPIO_MIS as *const u32) };
+    write_register(GPIO_ICLR, events);
+    if events != 0 {
+        BUTTON_EDGES.fetch_or(events, portable_atomic::Ordering::AcqRel);
+        cortex_m::interrupt::free(|cs| {
+            if let Some(waker) = BUTTON_WAKER.borrow(cs).borrow_mut().take() {
+                waker.wake();
+            }
+        });
+    }
+}
+
+/// Take (and clear) the press edges latched since the last call.
+#[cfg(target_os = "none")]
+pub fn take_button_edges() -> u32 {
+    BUTTON_EDGES.swap(0, portable_atomic::Ordering::AcqRel)
+}
+
+/// Wait for at least one press edge and return the latched edge mask.
+///
+/// Uses the interrupt only; the CPU may sleep for the whole wait.
+#[cfg(target_os = "none")]
+pub async fn wait_for_button_edge() -> u32 {
+    core::future::poll_fn(|cx| {
+        let edges = take_button_edges();
+        if edges != 0 {
+            return core::task::Poll::Ready(edges);
+        }
+        cortex_m::interrupt::free(|cs| {
+            *BUTTON_WAKER.borrow(cs).borrow_mut() = Some(cx.waker().clone());
+        });
+        // Close the edge-between-check-and-registration race.
+        let edges = take_button_edges();
+        if edges != 0 {
+            core::task::Poll::Ready(edges)
+        } else {
+            core::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 #[cfg(target_os = "none")]
@@ -165,8 +250,14 @@ mod tests {
         assert_eq!(LED_IOC_CONFIGURATION & IOC_INPUT_ENABLE, IOC_INPUT_ENABLE);
         assert_eq!(
             BUTTON_IOC_CONFIGURATION,
-            IOC_HYSTERESIS_ENABLE | IOC_INPUT_ENABLE | IOC_STANDBY_WAKE_ENABLE | IOC_PULL_UP
+            IOC_HYSTERESIS_ENABLE
+                | IOC_INPUT_ENABLE
+                | IOC_STANDBY_WAKE_ENABLE
+                | IOC_PULL_UP
+                | IOC_EDGE_NEGATIVE
         );
+        // EDGEDET = EDGE_NEG (hw_ioc.h IOC_IOC13_EDGEDET_EDGE_NEG).
+        assert_eq!(BUTTON_IOC_CONFIGURATION & 0x0003_0000, 0x0001_0000);
         assert_eq!(BUTTON_IOC_CONFIGURATION & 0x7, 0);
     }
 }

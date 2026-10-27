@@ -4,10 +4,13 @@
 //! onto the CC2340 sensor product's selected lifecycle behavior. The board
 //! crate intentionally contains none of these application semantics.
 
+use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Instant, Timer};
 use lp_em_cc2340r5::{
-    pins::{Button1, Button2, Led1, Led2},
+    pins::{self, Button1, Button2, Led1, Led2},
+    power,
     reset::SystemReset,
+    standby::{self, StandbyRefusal},
 };
 use sensor_sed_app::{
     DiagnosticEvent, Diagnostics, SensorStatus, SleepDepth, StatusSink, Supervisor, WaitRequest,
@@ -15,15 +18,22 @@ use sensor_sed_app::{
 };
 use zigbee_mac::cc2340::{Cc2340Mac, RadioError};
 
-const BUTTON_SAMPLE_MS: u32 = 10;
+/// A press edge counts only if the button is still down this long after it
+/// (contact bounce and release glitches must not trigger BTN1's
+/// join/leave action).
+const PRESS_CONFIRM_MS: u64 = 30;
+/// Level-sampling period while a press is being held (long-press detection
+/// only; idle waits are purely interrupt driven).
+const HELD_SAMPLE_MS: u32 = 25;
+/// Standby counters are logged every this many retention waits.
+const STANDBY_LOG_EVERY: u32 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActiveWaitError {
+pub enum WaitError {
     Radio(RadioError),
-    UnsupportedSleepDepth,
 }
 
-impl From<RadioError> for ActiveWaitError {
+impl From<RadioError> for WaitError {
     fn from(error: RadioError) -> Self {
         Self::Radio(error)
     }
@@ -31,32 +41,123 @@ impl From<RadioError> for ActiveWaitError {
 
 /// BTN1 invokes the product's join/leave/reset action. BTN2 records an
 /// adapter diagnostic without triggering a network action.
-pub struct ActiveWakeController {
+///
+/// Both buttons are falling-edge interrupts (`GPIO_COMB`); between events the
+/// executor sleeps in WFE and only the SYSTIM alarm or a press wakes it.
+pub struct LaunchPadWake {
     action: Button1,
     diagnostics: Button2,
-    diagnostics_was_pressed: bool,
+    retention_waits: u32,
+    lf_good_logged: bool,
+    last_refusal: Option<StandbyRefusal>,
 }
 
-impl ActiveWakeController {
-    pub const fn new(action: Button1, diagnostics: Button2) -> Self {
+impl LaunchPadWake {
+    pub fn new(mut action: Button1, mut diagnostics: Button2) -> Self {
+        // Edges latched before the lifecycle starts are not wake requests.
+        action.enable_press_interrupt();
+        diagnostics.enable_press_interrupt();
+        let _ = pins::take_button_edges();
         Self {
             action,
             diagnostics,
-            diagnostics_was_pressed: false,
+            retention_waits: 0,
+            lf_good_logged: false,
+            last_refusal: None,
         }
     }
 
-    async fn sample_delay(remaining_ms: u32) {
-        Timer::after(Duration::from_millis(u64::from(
-            remaining_ms.clamp(1, BUTTON_SAMPLE_MS),
-        )))
-        .await;
+    /// Wait `timeout_ms` or until a confirmed BTN1 press. BTN2 presses are
+    /// logged and do not end the wait.
+    ///
+    /// With `standby` the gaps between events are spent in device standby
+    /// ([`standby::standby_until`]; RTC or button-IOC wake). A refusal other
+    /// than a pending interrupt (LF clock not yet qualified, deadline too
+    /// close) falls back to the WFE idle wait for the rest of this wait.
+    /// Returns the wake reason and whether standby was entered at all.
+    async fn timer_or_button(
+        &mut self,
+        timeout_ms: u32,
+        sleep_depth: SleepDepth,
+        standby: bool,
+    ) -> (WakeReason, bool) {
+        let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        // A press held across the previous action is not a new request; the
+        // level check keeps the old "pressed at wait start" semantics only
+        // for a press that is genuinely still down.
+        if self.action.is_pressed() {
+            return (WakeReason::Button, false);
+        }
+        let mut try_standby = standby;
+        let mut entered = false;
+        loop {
+            let edges = if try_standby {
+                let edges = pins::take_button_edges();
+                if edges != 0 {
+                    edges
+                } else if Instant::now() >= deadline {
+                    return (WakeReason::Timer, entered);
+                } else {
+                    match standby::standby_until(deadline.as_ticks()) {
+                        // Interrupts that woke us were serviced when the
+                        // critical section ended; re-check edges/deadline.
+                        Ok(()) => entered = true,
+                        Err(StandbyRefusal::WakePending) => {}
+                        Err(refusal) => {
+                            self.last_refusal = Some(refusal);
+                            try_standby = false;
+                        }
+                    }
+                    continue;
+                }
+            } else {
+                match select(pins::wait_for_button_edge(), Timer::at(deadline)).await {
+                    Either::First(edges) => edges,
+                    Either::Second(()) => return (WakeReason::Timer, entered),
+                }
+            };
+            if edges & self.diagnostics.edge_mask() != 0 {
+                log::info!(
+                    "[CC2340] BTN2 diagnostics: {sleep_depth:?} wait, timeout={timeout_ms}ms, standby={:?}, lf_good={}",
+                    standby::stats(),
+                    power::lf_clock_good()
+                );
+            }
+            if edges & self.action.edge_mask() != 0 {
+                Timer::after(Duration::from_millis(PRESS_CONFIRM_MS)).await;
+                if self.action.is_pressed() {
+                    return (WakeReason::Button, entered);
+                }
+            }
+            if Instant::now() >= deadline {
+                return (WakeReason::Timer, entered);
+            }
+        }
+    }
+
+    /// Log standby counters every [`STANDBY_LOG_EVERY`] retention waits and
+    /// whenever the LF clock qualification state changes.
+    fn log_standby(&mut self) {
+        self.retention_waits = self.retention_waits.wrapping_add(1);
+        let lf_status = power::lf_clock_status();
+        let lf_good = power::lf_status_good(lf_status);
+        if lf_good != self.lf_good_logged || self.retention_waits % STANDBY_LOG_EVERY == 1 {
+            self.lf_good_logged = lf_good;
+            log::info!(
+                "[CC2340 STANDBY] waits={} lf_good={} lfclkstat={:#010x} {:?} last_refusal={:?}",
+                self.retention_waits,
+                lf_good,
+                lf_status,
+                standby::stats(),
+                self.last_refusal
+            );
+        }
     }
 }
 
-impl WakeController<Cc2340Mac> for ActiveWakeController {
+impl WakeController<Cc2340Mac> for LaunchPadWake {
     type Mark = Instant;
-    type Error = ActiveWaitError;
+    type Error = WaitError;
 
     fn mark(&self) -> Self::Mark {
         Instant::now()
@@ -78,32 +179,46 @@ impl WakeController<Cc2340Mac> for ActiveWakeController {
         mac: &mut Cc2340Mac,
         request: WaitRequest,
     ) -> Result<WakeReason, Self::Error> {
-        if request.sleep_depth != SleepDepth::Active {
-            return Err(ActiveWaitError::UnsupportedSleepDepth);
-        }
-
-        mac.prepare_active_wait()?;
-        let started = Instant::now();
-
-        loop {
-            if self.action.is_pressed() {
-                return Ok(WakeReason::Button);
+        match request.sleep_depth {
+            SleepDepth::Active => {
+                mac.prepare_active_wait()?;
+                let (reason, _) = self
+                    .timer_or_button(request.timeout_ms, request.sleep_depth, false)
+                    .await;
+                Ok(reason)
             }
-
-            let diagnostics_pressed = self.diagnostics.is_pressed();
-            if diagnostics_pressed && !self.diagnostics_was_pressed {
-                log::info!(
-                    "[CC2340] BTN2 diagnostics: active-only radio wait, timeout={}ms",
-                    request.timeout_ms
-                );
+            SleepDepth::Idle => {
+                // Radio cores/refsys off and LRFD clocks gated; CPU in WFE
+                // with no periodic tick; HFXT stopped (CPU/SYSTIM on HFOSC).
+                // This is not standby: the HF clock tree stays up.
+                mac.radio_sleep()?;
+                let (reason, _) = self
+                    .timer_or_button(request.timeout_ms, request.sleep_depth, false)
+                    .await;
+                // Eager restore, so a restore failure is reported here rather
+                // than as a failed poll.
+                mac.radio_wake()?;
+                Ok(reason)
             }
-            self.diagnostics_was_pressed = diagnostics_pressed;
-
-            let elapsed_ms = Self::elapsed_ms(Instant::now(), started);
-            if elapsed_ms >= request.timeout_ms {
-                return Ok(WakeReason::Timer);
+            SleepDepth::Retention => {
+                // Idle radio power-down, then device standby between events
+                // (`RadioSleepDisposition::StandbyCapable`). Standby is only
+                // attempted with the radio actually asleep: it powers the
+                // LRFD domain off.
+                mac.radio_sleep()?;
+                let allow_standby = mac.radio_is_asleep();
+                let (reason, entered) = self
+                    .timer_or_button(request.timeout_ms, request.sleep_depth, allow_standby)
+                    .await;
+                if entered && !mac.radio_note_standby() {
+                    log::error!("[CC2340] standby entered without a sleeping radio");
+                }
+                self.log_standby();
+                // Full radio re-init after standby (or the plain clock
+                // restore otherwise), eagerly so failures surface here.
+                mac.radio_wake()?;
+                Ok(reason)
             }
-            Self::sample_delay(request.timeout_ms - elapsed_ms).await;
         }
     }
 
@@ -118,7 +233,10 @@ impl WakeController<Cc2340Mac> for ActiveWakeController {
             if elapsed_ms >= duration_ms {
                 return true;
             }
-            Self::sample_delay(duration_ms - elapsed_ms).await;
+            Timer::after(Duration::from_millis(u64::from(
+                (duration_ms - elapsed_ms).clamp(1, HELD_SAMPLE_MS),
+            )))
+            .await;
         }
     }
 
@@ -300,7 +418,8 @@ pub fn init_diagnostics() -> RttDiagnostics {
     rtt_target::set_print_channel(channels.up.0);
 
     cortex_m::interrupt::free(|_| unsafe {
-        // Startup is single-threaded and the board SysTick has not started.
+        // Startup is single-threaded and the board time driver has not
+        // started.
         if log::set_logger_racy(&LOGGER).is_ok() {
             log::set_max_level_racy(log::LevelFilter::Info);
         }

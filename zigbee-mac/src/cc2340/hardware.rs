@@ -209,6 +209,10 @@ pub(crate) fn start_hfxt() -> Result<(), HardwareError> {
         write32(CKMD_HFXTCTL, read32(CKMD_HFXTCTL) | HFXTCTL_EN);
     }
 
+    // AMPSETTLED is a level status that latches in RIS; after a stop_hfxt()
+    // the stale flag must be cleared so the wait below sees the new start
+    // (TI clears it in PowerCC23X0_startHFXT() before unmasking it).
+    write32(CKMD_ICLR, RIS_AMPSETTLED);
     if !wait_until(HFXT_SETTLE_TICKS, || {
         read32(CKMD_RIS) & RIS_AMPSETTLED != 0 && read32(CKMD_HFXTSTAT) & HFXTSTAT_GOOD != 0
     }) {
@@ -221,6 +225,30 @@ pub(crate) fn start_hfxt() -> Result<(), HardwareError> {
         (read32(CKMD_HFTRACKCTL) & !HFTRACKCTL_REFCLK_M) | HFTRACKCTL_EN,
     );
     Ok(())
+}
+
+/// Stop the 48 MHz crystal while the radio is powered down.
+///
+/// Mirrors what TI's `PowerCC23X0.c` does around standby (`Power_sleep()`:
+/// `HFXTCTL.EN = 0` and `PowerCC23X0_stopContHfxtAmpMeasurements()`;
+/// `PowerCC23X0_enterStandby()`: `LDOCTL = 0` so the CKM LDO does not stay
+/// on). HFOSC tracking is suspended first so the loop does not raise
+/// TRACKREFLOSS (TI's oscillator ISR re-enables tracking for the same
+/// reason); [`start_hfxt`] restarts the crystal and re-arms tracking. The
+/// CPU, SYSTIM and peripherals keep running from HFOSC. Only valid while no
+/// LRFD operation is running and the LRFD clocks are gated.
+pub(crate) fn stop_hfxt() {
+    const CKMD_HFXTCTL: u32 = CKMD_BASE + 0x084;
+    const CKMD_AMPADCCTL: u32 = CKMD_BASE + 0x0A0;
+    const CKMD_LDOCTL: u32 = CKMD_BASE + 0x0A8;
+    const HFXTCTL_EN: u32 = 0x0000_0001;
+    const AMPADCCTL_SWOVR: u32 = 0x8000_0000;
+    const HFTRACKCTL_EN: u32 = 0x8000_0000;
+
+    write32(CKMD_HFTRACKCTL, read32(CKMD_HFTRACKCTL) & !HFTRACKCTL_EN);
+    write32(CKMD_HFXTCTL, read32(CKMD_HFXTCTL) & !HFXTCTL_EN);
+    write32(CKMD_AMPADCCTL, read32(CKMD_AMPADCCTL) & !AMPADCCTL_SWOVR);
+    write32(CKMD_LDOCTL, 0);
 }
 
 /// Enable the HFXT high-performance clock buffer that feeds the LRFD

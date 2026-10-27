@@ -9,7 +9,12 @@
 
 pub mod flash;
 pub mod identity;
+#[cfg(target_os = "none")]
+pub mod interrupts;
 pub mod pins;
+pub mod power;
+pub mod standby;
+pub mod timebase;
 
 #[cfg(target_os = "none")]
 pub mod reset;
@@ -45,8 +50,12 @@ static TAKEN: AtomicBool = AtomicBool::new(false);
 
 /// Claim and initialize the board exactly once.
 ///
-/// IOC muxing, direction, pulls, and the Embassy SysTick driver are
-/// initialized before the physical resources are returned.
+/// The DC/DC regulator, flash-LDO-off-in-idle and the LFOSC LF clock are
+/// selected first ([`power`]) and the RTC is set up as standby wake source
+/// ([`standby`]). IOC muxing, direction, pulls, and the tickless Embassy SYSTIM driver are
+/// initialized before the physical resources are returned. Button press
+/// interrupts are configured (edge detection) but left masked until the
+/// application calls `Button::enable_press_interrupt`.
 #[cfg(target_os = "none")]
 pub fn take() -> Option<Resources> {
     if TAKEN
@@ -56,6 +65,8 @@ pub fn take() -> Option<Resources> {
         return None;
     }
 
+    power::init();
+    standby::init();
     time::init();
 
     Some(Resources {
