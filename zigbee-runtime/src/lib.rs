@@ -4195,6 +4195,52 @@ mod resume_tests {
         assert_eq!(device.mac().tx_history().len(), 2);
     }
 
+    /// Reports follow the node's source bindings: a binding to the Trust
+    /// Center goes to 0x0000, one to a known device goes to its short
+    /// address, and a group binding is groupcast.
+    #[test]
+    fn reports_go_to_every_bound_destination() {
+        use zigbee_aps::binding::BindingEntry;
+
+        let mut device = resumed_device(DeviceType::EndDevice);
+        let store = wide_report_store(&mut device);
+        let tc = device.bdb().zdo().aps().aib().aps_trust_center_address;
+        let peer = [0x42; 8];
+        let zdo = device.bdb_mut().zdo_mut();
+        zdo.nwk_mut().update_address_map(ShortAddress(0x1234), peer);
+        let table = zdo.aps_mut().binding_table_mut();
+        for entry in [
+            BindingEntry::unicast(IEEE_ADDRESS, 1, REPORT_TEST_CLUSTER, tc, 1),
+            BindingEntry::unicast(IEEE_ADDRESS, 1, REPORT_TEST_CLUSTER, peer, 3),
+            BindingEntry::group(IEEE_ADDRESS, 1, REPORT_TEST_CLUSTER, 0x4321),
+            BindingEntry::unicast(IEEE_ADDRESS, 1, 0x0006, peer, 3),
+        ] {
+            table.add(entry).unwrap();
+        }
+
+        assert!(block_on(device.check_and_send_cluster_reports(
+            1,
+            REPORT_TEST_CLUSTER,
+            &store
+        )));
+        let mut dsts: heapless::Vec<u16, 8> = heapless::Vec::new();
+        for tx in device.mac().tx_history() {
+            let (header, _) = zigbee_nwk::frames::NwkHeader::parse(tx.payload.as_slice()).unwrap();
+            if !dsts.contains(&header.dst_addr.0) {
+                dsts.push(header.dst_addr.0).unwrap();
+            }
+        }
+        dsts.sort_unstable();
+        assert_eq!(dsts.len(), 3, "destinations: {dsts:?}");
+        assert_eq!(dsts[..2], [0x0000, 0x1234]);
+        assert!(dsts[2] >= 0xFFF8, "group binding is groupcast");
+        assert_eq!(
+            device.mac().tx_history().len(),
+            6,
+            "two frames per destination"
+        );
+    }
+
     /// Not being joined must not consume due reports.
     #[test]
     fn reports_are_not_consumed_while_not_joined() {

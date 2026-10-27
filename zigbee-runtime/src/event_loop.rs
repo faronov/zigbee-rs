@@ -315,6 +315,17 @@ const REPORT_FRAME_CONTROL: u8 = 0x18;
 /// Report Attributes (ZCL r8 §2.5.11).
 const REPORT_ATTRIBUTES_COMMAND: u8 = 0x0A;
 
+/// Most bound destinations a single report fans out to.
+pub(crate) const MAX_REPORT_DESTINATIONS: usize = 4;
+
+/// One resolved Report Attributes destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReportDestination {
+    mode: ApsAddressMode,
+    address: ApsAddress,
+    endpoint: u8,
+}
+
 /// Result of sending a set of collected attribute reports.
 pub(crate) struct ReportSendOutcome {
     /// Report Attributes frames accepted by APS.
@@ -857,6 +868,74 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
         }
     }
 
+    /// Where reports for `(endpoint, cluster_id)` go (ZCL 2.5.11.2.1).
+    ///
+    /// Each source binding of this node is a destination; a unicast binding
+    /// to the Trust Center resolves to 0x0000 because a sleepy end device
+    /// usually never learns the coordinator's IEEE↔short pairing otherwise.
+    /// With no binding (or none resolvable yet) reports still go to the
+    /// coordinator so default reporting works before the hub binds.
+    fn report_destinations(
+        &self,
+        endpoint: u8,
+        cluster_id: u16,
+    ) -> heapless::Vec<ReportDestination, MAX_REPORT_DESTINATIONS> {
+        use zigbee_aps::binding::BindingDst;
+
+        let aps = self.bdb.zdo().aps();
+        let local = aps.nwk().nib().ieee_address;
+        let trust_center = aps.aib().aps_trust_center_address;
+        let mut destinations = heapless::Vec::new();
+        for entry in aps
+            .binding_table()
+            .find_by_source(&local, endpoint, cluster_id)
+        {
+            let destination = match entry.dst {
+                BindingDst::Group(group) => ReportDestination {
+                    mode: ApsAddressMode::Group,
+                    address: ApsAddress::Group(group),
+                    endpoint: 0xFF,
+                },
+                BindingDst::Unicast {
+                    dst_addr,
+                    dst_endpoint,
+                } => {
+                    let short = if dst_addr == trust_center {
+                        Some(ShortAddress::COORDINATOR)
+                    } else {
+                        aps.nwk().find_short_by_ieee(&dst_addr)
+                    };
+                    let Some(short) = short else {
+                        log::warn!(
+                            "[Runtime] Report binding to unknown IEEE skipped: cluster=0x{:04X}",
+                            cluster_id
+                        );
+                        continue;
+                    };
+                    ReportDestination {
+                        mode: ApsAddressMode::Short,
+                        address: ApsAddress::Short(short),
+                        endpoint: dst_endpoint,
+                    }
+                }
+            };
+            if destinations.contains(&destination) {
+                continue;
+            }
+            if destinations.push(destination).is_err() {
+                break;
+            }
+        }
+        if destinations.is_empty() {
+            let _ = destinations.push(ReportDestination {
+                mode: ApsAddressMode::Short,
+                address: ApsAddress::Short(ShortAddress::COORDINATOR),
+                endpoint,
+            });
+        }
+        destinations
+    }
+
     /// Send `records` as one or more whole-record Report Attributes frames.
     ///
     /// Sending stops at the first failure; [`ReportSendOutcome::failure`]
@@ -877,6 +956,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
             outcome.failure = Some((0, SendError::NotJoined));
             return outcome;
         }
+        let destinations = self.report_destinations(endpoint, cluster_id);
 
         // One buffer holds the whole ZCL frame: 3-byte global header followed
         // by whole records. Its size is the largest unfragmented APS payload.
@@ -902,26 +982,38 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
             zcl_buf[1] = self.next_zcl_seq();
             zcl_buf[2] = REPORT_ATTRIBUTES_COMMAND;
 
-            let req = ApsdeDataRequest {
-                dst_addr_mode: ApsAddressMode::Short,
-                dst_address: ApsAddress::Short(ShortAddress::COORDINATOR),
-                dst_endpoint: endpoint,
-                profile_id: 0x0104, // Home Automation
-                cluster_id,
-                src_endpoint: endpoint,
-                payload: &zcl_buf[..3 + payload_len],
-                tx_options: ApsTxOptions {
-                    use_nwk_key: true,
-                    ..ApsTxOptions::default()
-                },
-                radius: 0,
-                alias_src_addr: None,
-                alias_seq: None,
-            };
-
-            if let Err(e) = self.bdb.zdo_mut().aps_mut().apsde_data_request(&req).await {
-                log::warn!("[Runtime] Report send failed: {:?}", e);
-                outcome.failure = Some((chunk_start, SendError::Aps(e)));
+            // A chunk counts as sent when at least one destination took it;
+            // only a chunk every destination refused stays pending.
+            let mut accepted = false;
+            let mut last_error = None;
+            for dst in destinations.iter() {
+                let req = ApsdeDataRequest {
+                    dst_addr_mode: dst.mode,
+                    dst_address: dst.address,
+                    dst_endpoint: dst.endpoint,
+                    profile_id: 0x0104, // Home Automation
+                    cluster_id,
+                    src_endpoint: endpoint,
+                    payload: &zcl_buf[..3 + payload_len],
+                    tx_options: ApsTxOptions {
+                        use_nwk_key: true,
+                        ..ApsTxOptions::default()
+                    },
+                    radius: 0,
+                    alias_src_addr: None,
+                    alias_seq: None,
+                };
+                match self.bdb.zdo_mut().aps_mut().apsde_data_request(&req).await {
+                    Ok(_) => accepted = true,
+                    Err(e) => {
+                        log::warn!("[Runtime] Report send failed: {:?}", e);
+                        last_error = Some(e);
+                    }
+                }
+            }
+            if !accepted {
+                let error = last_error.unwrap_or(ApsStatus::NoBoundDevice);
+                outcome.failure = Some((chunk_start, SendError::Aps(error)));
                 return outcome;
             }
             outcome.frames_sent += 1;

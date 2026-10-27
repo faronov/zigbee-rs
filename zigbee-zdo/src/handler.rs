@@ -927,14 +927,20 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     fn handle_bind_req(&mut self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let status = match self.parse_binding_request(payload)? {
-            Ok(req) => match self
-                .aps_mut()
-                .binding_table_mut()
-                .add(bind_req_to_entry(&req))
-            {
-                Ok(()) => ZdpStatus::Success,
-                Err(_) => ZdpStatus::TableFull,
-            },
+            Ok(req) => {
+                let entry = bind_req_to_entry(&req);
+                let table = self.aps_mut().binding_table_mut();
+                // A coordinator re-binding an existing entry (every ZHA
+                // reconfigure) must see SUCCESS, not a spurious TABLE_FULL.
+                if table.entries().contains(&entry) {
+                    ZdpStatus::Success
+                } else {
+                    match table.add(entry) {
+                        Ok(()) => ZdpStatus::Success,
+                        Err(_) => ZdpStatus::TableFull,
+                    }
+                }
+            }
             Err(status) => status,
         };
         if rsp.is_empty() {
@@ -2870,6 +2876,26 @@ mod tests {
             bind_status(&mut zdo, crate::BIND_REQ, &payload),
             ZdpStatus::TableFull as u8
         );
+    }
+
+    #[test]
+    fn repeated_bind_req_succeeds_without_duplicating_the_entry() {
+        let mut zdo = test_zdo();
+        let payload = bind_payload(
+            LOCAL_IEEE,
+            1,
+            BindTarget::Unicast {
+                dst_addr: [0x42; 8],
+                dst_endpoint: 1,
+            },
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                bind_status(&mut zdo, crate::BIND_REQ, &payload),
+                ZdpStatus::Success as u8
+            );
+        }
+        assert_eq!(zdo.aps().binding_table().len(), 1);
     }
 
     // ── Client request slots (finding: legacy requests leaked slots) ──
