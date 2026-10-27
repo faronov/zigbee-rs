@@ -146,7 +146,7 @@ backend is behind a Cargo feature flag:
 | ESP32-C6/H2 | `esp32c6`, `esp32h2` | real pure-Rust `esp-radio` End Device backends; prior path evidence exists, current exact images are build/layout-tested |
 | nRF52840/52833 | `nrf52840`, `nrf52833` | End Device backends; prior sensor-path evidence exists, current exact images are build/layout-tested |
 | BL702 | `bl702` | End Device backend; prior XT-ZB1 radio/commissioning evidence exists |
-| CC2340R5 | `cc2340` | compiles with pinned SDK; radio HIL and entropy open |
+| CC2340R5 | `cc2340` | single-board radio bring-up and ZHA join; software ACK timing and entropy open |
 | TLSR8258 | `tlsr8258` | only production `ParentMacDriver`; advertises router but not coordinator; `telink` is a compatibility alias |
 | PHY6222 | `phy6222` | compile/layout only; complete radio path unverified |
 | EFR32MG1 | `efr32` | End Device backend; prior TRÅDFRI path evidence exists, real OTA install open |

@@ -71,6 +71,7 @@ pub(crate) enum HardwareError {
     SynthConfigInvalid,
     SynthDividerTimeout,
     TopsmTimeout,
+    HfxtTimeout,
 }
 
 #[inline(always)]
@@ -136,6 +137,100 @@ pub(crate) fn setup_device_trim() {
         write32(CKMD_HFXTINIT, initial);
         write32(CKMD_HFXTTARG, target);
     }
+}
+
+/// Start the 48 MHz crystal (HFXT), mirroring TI's `Power_init()` +
+/// `PowerCC23X0_startHFXT()`.
+///
+/// The LRFD synthesizer uses HFXT as its reference. After reset the device
+/// runs from HFOSC with `HFXTCTL.EN = 0`; TI applications get HFXT started by
+/// the Power driver before RCL is ever used. Without it every PBE operation
+/// ends with `ENDCAUSE = ERR_SYNTH (0xFB)` because the PLL cannot lock.
+pub(crate) fn start_hfxt() -> Result<(), HardwareError> {
+    const CKMD_RIS: u32 = CKMD_BASE + 0x048;
+    const CKMD_ICLR: u32 = CKMD_BASE + 0x054;
+    const CKMD_HFXTCTL: u32 = CKMD_BASE + 0x084;
+    const CKMD_AMPADCCTL: u32 = CKMD_BASE + 0x0A0;
+    const CKMD_LDOCTL: u32 = CKMD_BASE + 0x0A8;
+    const CKMD_HFXTSTAT: u32 = CKMD_BASE + 0x0E4;
+    const CKMD_AMPCFG1: u32 = CKMD_BASE + 0x128;
+
+    const HFXTCTL_EN: u32 = 0x0000_0001;
+    const LDOCTL_SWOVR: u32 = 0x8000_0000;
+    const LDOCTL_HFXTLVLEN: u32 = 0x0000_0010;
+    const LDOCTL_STARTCTL: u32 = 0x0000_0008;
+    const LDOCTL_START: u32 = 0x0000_0004;
+    const LDOCTL_EN: u32 = 0x0000_0001;
+    const AMPADCCTL_SWOVR: u32 = 0x8000_0000;
+    const AMPADCCTL_PEAKDETEN: u32 = 0x0002_0000;
+    const AMPADCCTL_ADCEN: u32 = 0x0001_0000;
+    const AMPADCCTL_SARSTRT: u32 = 0x0000_0001;
+    const AMPCFG1_INTERVAL_M: u32 = 0x0000_0FFF;
+    const HFXTTARG_IREF_M: u32 = 0x0000_F000;
+    const HFXT_TARGET_IREF_MAX: u32 = 8;
+    const RIS_ADCBIASUPD: u32 = 0x0000_0040;
+    const RIS_AMPSETTLED: u32 = 0x0000_8000;
+    const HFXTSTAT_GOOD: u32 = 0x0000_0001;
+    const HFTRACKCTL_EN: u32 = 0x8000_0000;
+    const HFTRACKCTL_REFCLK_M: u32 = 0x0C00_0000;
+
+    /// Generous bound; TI's typical HFXT startup is a few hundred µs.
+    const HFXT_SETTLE_TICKS: u32 = 4 * 20_000; // 20 ms
+    const ADC_BIAS_TICKS: u32 = 4 * 1_000; // 1 ms
+
+    if read32(CKMD_HFXTCTL) & HFXTCTL_EN == 0 {
+        // Software amplitude control (as TI's Power driver) and max IREF.
+        write32(CKMD_AMPCFG1, read32(CKMD_AMPCFG1) & !AMPCFG1_INTERVAL_M);
+        update32(CKMD_HFXTTARG, HFXTTARG_IREF_M, HFXT_TARGET_IREF_MAX << 12);
+
+        write32(
+            CKMD_LDOCTL,
+            LDOCTL_SWOVR | LDOCTL_STARTCTL | LDOCTL_START | LDOCTL_EN,
+        );
+        wait_ticks(66 * 4)?;
+        write32(CKMD_LDOCTL, LDOCTL_SWOVR | LDOCTL_HFXTLVLEN | LDOCTL_EN);
+
+        write32(
+            CKMD_AMPADCCTL,
+            AMPADCCTL_SWOVR | AMPADCCTL_PEAKDETEN | AMPADCCTL_ADCEN,
+        );
+        wait_ticks(6 * 4)?;
+        write32(CKMD_ICLR, RIS_ADCBIASUPD);
+        write32(CKMD_AMPADCCTL, read32(CKMD_AMPADCCTL) | AMPADCCTL_SARSTRT);
+        write32(CKMD_AMPADCCTL, read32(CKMD_AMPADCCTL) & !AMPADCCTL_SARSTRT);
+        if !wait_until(ADC_BIAS_TICKS, || read32(CKMD_RIS) & RIS_ADCBIASUPD != 0) {
+            return Err(HardwareError::HfxtTimeout);
+        }
+        write32(
+            CKMD_AMPADCCTL,
+            read32(CKMD_AMPADCCTL) & !(AMPADCCTL_SWOVR | AMPADCCTL_ADCEN),
+        );
+
+        write32(CKMD_HFXTCTL, read32(CKMD_HFXTCTL) | HFXTCTL_EN);
+    }
+
+    if !wait_until(HFXT_SETTLE_TICKS, || {
+        read32(CKMD_RIS) & RIS_AMPSETTLED != 0 && read32(CKMD_HFXTSTAT) & HFXTSTAT_GOOD != 0
+    }) {
+        return Err(HardwareError::HfxtTimeout);
+    }
+
+    // Track HFOSC (and LFOSC calibration) against HFXT, as TI does.
+    write32(
+        CKMD_HFTRACKCTL,
+        (read32(CKMD_HFTRACKCTL) & !HFTRACKCTL_REFCLK_M) | HFTRACKCTL_EN,
+    );
+    Ok(())
+}
+
+/// Enable the HFXT high-performance clock buffer that feeds the LRFD
+/// synthesizer reference (TI `hal_enable_clk_buffer()`, called from
+/// `RCL_open()`). Without it the RFE synth calibration never completes and
+/// the PBE ends every TX/RX with `ENDCAUSE = ERR_SYNTH (0xFB)`.
+pub(crate) fn enable_hfxt_clock_buffer() {
+    const CKMD_HFXTCTL: u32 = CKMD_BASE + 0x084;
+    const HFXTCTL_HPBUFEN: u32 = 0x0000_0002;
+    or32(CKMD_HFXTCTL, HFXTCTL_HPBUFEN);
 }
 
 pub(crate) fn enable_radio_clocks() -> Result<(), HardwareError> {
@@ -678,6 +773,36 @@ where
 
 pub(crate) fn hard_stop() {
     write32(LRFDPBE_API, PBE_OP_STOP);
+}
+
+/// SYSTIM channel 2 is hard-wired to the LRFD `SYSTIM0` event.
+const SYSTIM_CH2CFG: u32 = SYSTIM_BASE + 0x114;
+const SYSTIM_CH2CC: u32 = SYSTIM_BASE + 0x128;
+const LRFDDBELL_ICLR0: u32 = LRFDDBELL_BASE + 0x054;
+const LRFDDBELL_SYSTIM0: u32 = 1 << 29;
+/// `RCL_SCHEDULER_TRIG_NOW_DELAY`: 50 us in 250 ns SYSTIM ticks.
+const PBE_START_TRIGGER_DELAY_TICKS: u32 = 200;
+
+/// Arm the PBE start trigger, like RCL's `hal_setup_start_time()`.
+///
+/// Every IEEE PBE operation is issued with `OPCFG.START = SYNC`, so after
+/// the API command the PBE waits for the LRFD `SYSTIM0` event (SYSTIM
+/// channel 2 compare) before it starts TX or RX. RCL always programs that
+/// compare, even for "start now" commands (current time + 50 us). Without
+/// it the PBE waits forever and no `OPDONE`/`OPERROR` is ever raised.
+pub(crate) fn arm_pbe_start_trigger() {
+    write32(LRFDDBELL_ICLR0, LRFDDBELL_SYSTIM0);
+    let start = read32(SYSTIM_TIME250N).wrapping_add(PBE_START_TRIGGER_DELAY_TICKS);
+    // A write to CHnCC arms the channel in compare mode.
+    write32(SYSTIM_CH2CC, start);
+}
+
+/// Disarm the PBE start/stop trigger, like RCL's `hal_cancel_lrfd_systim0()`.
+pub(crate) fn cancel_pbe_start_trigger() {
+    write32(SYSTIM_CH2CC, 0);
+    write32(SYSTIM_CH2CFG, 1); // MODE = CAPT
+    write32(SYSTIM_CH2CFG, 0); // MODE = DIS
+    write32(LRFDDBELL_ICLR0, LRFDDBELL_SYSTIM0);
 }
 
 pub(crate) fn read_rssi() -> i8 {

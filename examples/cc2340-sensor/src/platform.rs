@@ -284,7 +284,7 @@ pub fn init_diagnostics() -> RttDiagnostics {
     let channels = rtt_target::rtt_init! {
         up: {
             0: {
-                size: 512,
+                size: 2048,
                 mode: rtt_target::ChannelMode::NoBlockSkip,
                 name: "Terminal"
             }

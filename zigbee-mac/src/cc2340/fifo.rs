@@ -152,6 +152,13 @@ pub(super) fn reset_rx() {
         PBE_FCFG0,
         fifo_config & !(FCFG0_RX_AUTO_COMMIT | FCFG0_RX_AUTO_DEALLOCATE),
     );
+    // RCL `LRF_prepareRxFifo()` + `LRF_setRxFifoEffSz(unlimited)`: after the
+    // reset SRP is first written to 0 ("no space available"), then written to
+    // RP. Writing SRP with an unchanged value moves it one full round, which
+    // is what deallocates the FIFO (full space). A single SRP=RP write right
+    // after reset leaves zero writable space, so every received frame ended
+    // with ENDCAUSE = ERR_RXF and surfaced as `FifoOverflow`.
+    write_fifo_pointer(PBE_RXFSRP, 0);
     write_fifo_pointer(PBE_RXFSRP, read32(PBE_RXFRP));
 }
 
@@ -245,7 +252,9 @@ pub(super) fn try_read_rx_frame() -> Result<Option<ReceivedFrame>, FifoError> {
     }
 
     let next_pointer = (read_pointer + byte_count as u32) % fifo_size;
-    write_fifo_pointer(PBE_RXFRP, next_pointer);
+    // RCL `LRF_discardRxFifoWords()`: advance RP and SRP together so the
+    // consumed space is released and the FIFO stays deallocated.
+    write_fifo_pointers(PBE_RXFRP, PBE_RXFSRP, next_pointer);
 
     let fifo_config = read16(PBE_IEEE_FIFOCFG);
     let extra_bytes = read16(PBE_IEEE_EXTRABYTES) as usize;
@@ -390,6 +399,17 @@ fn set_entry_byte(words: &mut [u32], index: usize, value: u8) {
     let shift = (index % 4) * 8;
     let word = &mut words[index / 4];
     *word = (*word & !(0xFF << shift)) | ((value as u32) << shift);
+}
+
+fn write_fifo_pointers(register0: u32, register1: u32, value: u32) {
+    let interrupt_state = disable_interrupts();
+    write16(PBE_COMMON_FIFOCMDADD, FIFO_STATUS_ADDRESS);
+    let _ = read16(PBE_COMMON_FIFOCMDADD);
+    let _ = read16(PBE_COMMON_FIFOCMDADD);
+    write32(register0, value);
+    write32(register1, value);
+    write16(PBE_COMMON_FIFOCMDADD, FIFO_COMMAND_ADDRESS);
+    restore_interrupts(interrupt_state);
 }
 
 fn write_fifo_pointer(register: u32, value: u32) {

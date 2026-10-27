@@ -19,6 +19,8 @@
 
 mod platform;
 
+use core::mem::MaybeUninit;
+
 use cortex_m as _;
 use panic_halt as _;
 
@@ -107,10 +109,13 @@ async fn main(_spawner: Spawner) {
         }
         fatal(&mut status);
     }
-    log::warn!("[CC2340] radio initialized but over-air/HIL behavior remains unverified");
+    log::warn!("[CC2340] radio initialized; MAC ACK timing and power behavior are not qualified");
 
+    // Build the device in static storage: by-value `build()` needs a ~22 KB
+    // `assemble` frame, larger than this part's whole stack.
+    static mut DEVICE_STORAGE: MaybeUninit<ZigbeeDevice<Cc2340Mac>> = MaybeUninit::uninit();
     let mut profile = product::profile::sensor_profile();
-    let mut device = ZigbeeDevice::builder(mac)
+    let device = ZigbeeDevice::builder(mac)
         .power_mode(product::policy::SENSOR_POLICY.power_mode())
         .automatic_polling(false)
         .manufacturer(product::MANUFACTURER)
@@ -125,7 +130,9 @@ async fn main(_spawner: Spawner) {
             profile.device_id(),
             |endpoint| profile.configure_endpoint(endpoint),
         )
-        .build();
+        // SAFETY: the embassy main task runs once, so this is the only
+        // reference ever taken to DEVICE_STORAGE.
+        .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
 
     let mut security_store = product::storage::security_store(flash);
     log::info!(
@@ -150,10 +157,10 @@ async fn main(_spawner: Spawner) {
         product::battery::SYNTHETIC_FIXED_MV
     );
     log::warn!(
-        "[CC2340] commissioning is not claimed: entropy is unavailable and radio HIL is pending"
+        "[CC2340] commissioning is not claimed: entropy is unavailable and MAC/power HIL is open"
     );
 
-    let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
+    let node = ZigbeeNode::new(device, &mut security_store, &mut profile);
     let mut app = SensorApp::new(
         node,
         &product::policy::SENSOR_POLICY,

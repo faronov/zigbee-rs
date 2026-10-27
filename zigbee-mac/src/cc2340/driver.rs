@@ -83,6 +83,7 @@ impl From<hardware::HardwareError> for RadioError {
             hardware::HardwareError::SynthConfigInvalid => Self::SynthConfigInvalid,
             hardware::HardwareError::SynthDividerTimeout => Self::SynthTimeout,
             hardware::HardwareError::TopsmTimeout => Self::RadioReadyTimeout,
+            hardware::HardwareError::HfxtTimeout => Self::ClockTimeout,
         }
     }
 }
@@ -145,6 +146,8 @@ impl Cc2340Driver {
                 config::tx_power(self.config.tx_power_dbm).ok_or(RadioError::InvalidTxPower)?;
 
             hardware::setup_device_trim();
+            hardware::start_hfxt()?;
+            hardware::enable_hfxt_clock_buffer();
             hardware::enable_radio_clocks()?;
             if let Err(error) = hardware::load_firmware(images.pbe, images.mce, images.rfe) {
                 hardware::disable_radio_clocks();
@@ -262,6 +265,7 @@ impl Cc2340Driver {
         fifo::write_tx_frame(frame).map_err(map_fifo_error)?;
         fifo::clear_events(u32::MAX);
         self.operation_active = true;
+        hardware::arm_pbe_start_trigger();
         fifo::start_tx();
 
         let started = hardware::timer_ticks();
@@ -290,6 +294,7 @@ impl Cc2340Driver {
         fifo::reset_rx();
         fifo::clear_events(u32::MAX);
         self.operation_active = true;
+        hardware::arm_pbe_start_trigger();
         fifo::start_rx();
 
         let mut dropped_frames: u32 = 0;
@@ -386,6 +391,12 @@ impl Cc2340Driver {
     fn prepare_operation(&mut self) -> Result<(), RadioError> {
         self.abort_active_operation()?;
         self.apply_runtime_config()?;
+        // RCL calls `LRF_enable()` (MSGBOX = 0, PBE/MCE/RFE TOPsm INIT +
+        // ENABLE) before every PBE operation, including between RX and TX of
+        // a single command, and then waits for the PBE to post MSGBOX. Without
+        // the re-init the PBE keeps state from a previous hard-stopped
+        // operation and the next TX ends immediately with ERR_STOP (0xFC).
+        hardware::enable_radio_cores();
         hardware::wait_for_topsm_ready()?;
         Ok(())
     }
@@ -406,6 +417,7 @@ impl Cc2340Driver {
     }
 
     fn finish_operation(&mut self, events: u32) -> Result<(), RadioError> {
+        hardware::cancel_pbe_start_trigger();
         let end_cause = fifo::end_cause();
         fifo::clear_events(u32::MAX);
         self.operation_active = false;
@@ -436,12 +448,14 @@ impl Cc2340Driver {
                 core::hint::spin_loop();
             }
             if !stopped {
+                hardware::cancel_pbe_start_trigger();
                 self.operation_active = false;
                 fifo::reset_both();
                 return Err(RadioError::OperationTimeout);
             }
         }
 
+        hardware::cancel_pbe_start_trigger();
         fifo::clear_events(u32::MAX);
         fifo::reset_both();
         self.operation_active = false;

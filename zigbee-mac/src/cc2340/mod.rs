@@ -305,7 +305,8 @@ impl Cc2340Mac {
         self.driver.update_config(|cfg| cfg.channel = channel);
 
         let beacon_req = self.beacon_request_frame();
-        if self.driver.transmit(&beacon_req).await.is_err() {
+        if let Err(error) = self.driver.transmit(&beacon_req).await {
+            log::warn!("[CC2340] Beacon Request TX failed on ch{channel}: {error:?}");
             return results;
         }
 

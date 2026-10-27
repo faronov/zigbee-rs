@@ -234,7 +234,7 @@ worktree records no such rerun for the current byte-for-byte images.
 | ESP32-H2 | environmental sleepy End Device + OTA | yes | prior H2 evidence covers v1→v2 activation, reboot, and retained commissioned state |
 | BL702 XT-ZB1 | environmental sleepy End Device | yes | prior path evidence covers radio/commissioning/interview; destructive flash persistence remains open |
 | PHY6222/PHY6252 EVK | environmental sleepy End Device | yes | PHY6222 occupies 128,640 B and PHY6252 128,576 B of the physical 130,816 B XIP slot (2,176 / 2,240 B free); complete hardware path remains unverified |
-| CC2340R5 | environmental sleepy End Device | yes | pinned-SDK and fallback compile/link paths pass; radio HIL and entropy remain open |
+| CC2340R5 | environmental sleepy End Device | yes | pinned-SDK and fallback compile/link paths pass; one board joined ZHA over HIL; MAC ACK timing and entropy remain open |
 | EFR32MG1P TRÅDFRI | environmental sleepy End Device | yes | prior path evidence covers commissioning through EM2; real OTA install remains open |
 | EFR32MG21 BRD4181A | environmental sleepy End Device | yes | complete hardware path remains HIL-unverified |
 | TLSR8258 TB-04 | environmental sleepy End Device | yes | prior evidence covers the SUSPEND primitive; repeated application/network acceptance remains open |

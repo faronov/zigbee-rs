@@ -43,8 +43,9 @@ The image currently uses software AES and reserves:
 0x0007E000..0x00080000  SecurityStateJournal
 ```
 
-Commissioning is deliberately not claimed. The radio path has no completed HIL
-run, and the production entropy backend is not qualified. Entropy fails closed
+Commissioning is deliberately not claimed. One board has joined a ZHA network
+and completed the interview over HIL, but MAC ACK timing is not qualified and
+the production entropy backend is not qualified. Entropy fails closed
 instead of returning predictable key material.
 
 ## Build
