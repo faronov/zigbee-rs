@@ -27,12 +27,31 @@ const PBE_TXFWP: u32 = LRFDPBE_BASE + 0x1B8;
 const PBE_RXFREADABLE: u32 = LRFDPBE_BASE + 0x1CC;
 const PBE_TXFWRITABLE: u32 = LRFDPBE_BASE + 0x1D0;
 
+// PBE IEEE RAM register map (`pbe_ieee_ram_regs.h`, SDK 9.20 / the PBE image
+// this crate loads; the SDK 8.40 map is shifted by four bytes).
 const PBE_IEEE_FIFOCFG: u32 = BUFRAM_BASE + 0x022;
 const PBE_IEEE_EXTRABYTES: u32 = BUFRAM_BASE + 0x024;
 const PBE_IEEE_RXTIMEOUT: u32 = BUFRAM_BASE + 0x02E;
 const PBE_IEEE_OPCFG: u32 = BUFRAM_BASE + 0x030;
 const PBE_IEEE_PIB: u32 = BUFRAM_BASE + 0x036;
+const PBE_IEEE_FFTYPE: u32 = BUFRAM_BASE + 0x038;
+const PBE_IEEE_NRXNOK: u32 = BUFRAM_BASE + 0x03A;
+const PBE_IEEE_NRXIGNORED: u32 = BUFRAM_BASE + 0x03C;
+const PBE_IEEE_NRXFIFOFULL: u32 = BUFRAM_BASE + 0x040;
+const PBE_IEEE_NRXOK: u32 = BUFRAM_BASE + 0x042;
+const PBE_IEEE_NTX: u32 = BUFRAM_BASE + 0x044;
+const PBE_IEEE_NTXACK: u32 = BUFRAM_BASE + 0x046;
+const PBE_IEEE_NRXTIMEOUT: u32 = BUFRAM_BASE + 0x048;
+const PBE_IEEE_RXSTATUS: u32 = BUFRAM_BASE + 0x054;
+const PBE_IEEE_PANID0: u32 = BUFRAM_BASE + 0x064;
+const PBE_IEEE_SHORTADDR0: u32 = BUFRAM_BASE + 0x066;
+const PBE_IEEE_EXTADDR00: u32 = BUFRAM_BASE + 0x068;
+const PBE_IEEE_EXTADDR02: u32 = BUFRAM_BASE + 0x06C;
+const PBE_IEEE_FFOPT0: u32 = BUFRAM_BASE + 0x070;
+const PBE_IEEE_ENTRYENABLE00: u32 = BUFRAM_BASE + 0x084;
 const PBE_IEEE_CFGAUTOACK: u32 = BUFRAM_BASE + 0x0A8;
+const PBE_IEEE_ACKSTATUS: u32 = BUFRAM_BASE + 0x0AC;
+const PBE_IEEE_CORRCNT: u32 = BUFRAM_BASE + 0x0AE;
 
 const PBE_COMMON_ENDCAUSE: u32 = BUFRAM_BASE + 0x006;
 const PBE_COMMON_FIFOCMDADD: u32 = BUFRAM_BASE + 0x008;
@@ -41,13 +60,48 @@ const FIFO_COMMAND_ADDRESS: u16 = 0x0068;
 const FIFO_STATUS_ADDRESS: u16 = 0x0069;
 const TX_FIFO_RESET: u32 = 0x0007;
 const RX_FIFO_RESET: u32 = 0x0001;
+const RX_FIFO_DISCARD: u32 = 0x0009;
 const BOTH_FIFOS_RESET: u32 = 0x000B;
 
 const IEEE_OP_TX: u32 = 0x1C;
 const IEEE_OP_RX: u32 = 0x1D;
 const OP_HARD_STOP: u32 = 0x01;
-const OPCFG_TX_SINGLE: u16 = 0x0804;
+/// RCL RX / TX-then-RX operation: `STOP_SOFTEND | RXREPEATOK_YES |
+/// RXREPEATNOK_YES | START_SYNC | SINGLE_DIS | IFSPERIOD_EN`. The PBE keeps
+/// receiving after every frame and, for a TX, falls through into RX after the
+/// frame (and its ACK window) instead of ending the operation.
 const OPCFG_RX_CONTINUOUS: u16 = 0x0802;
+
+// PIB.PANMODE
+const PIB_PANMODE_PROMISCUOUS: u16 = 0x0000;
+const PIB_PANMODE_SINGLE: u16 = 0x0001;
+
+// FFTYPE: frame types stored in the RX FIFO, for frame versions 0/1 and 2.
+// Beacon, data and MAC command; ACK frames are consumed by the PBE itself.
+const FFTYPE_BEACON_DATA_MACCMD: u16 = 0x0B0B;
+
+// FFOPT0
+const FFOPT0_MAXFRAME_2006: u16 = 1 << 8;
+const FFOPT0_AUTOACK_EN: u16 = 0x0004;
+// AUTOPEND_DISABLE, DEFPEND = 0, PREQONLY_ANY and IMMACKSEL_PBE are all zero:
+// the PBE builds every immediate ACK itself with the frame-pending bit clear,
+// which is what an end device must send.
+
+// CFGAUTOACK
+const CFGAUTOACK_ACKMODE_FILTIMMACK: u16 = 0x0200;
+const CFGAUTOACK_FLAGREQ_EN: u16 = 0x0100;
+
+// ACKSTATUS (valid after `EVENT_RX_EMPTY` of a TX that expected an ACK)
+const ACKSTATUS_FPSTATE: u16 = 0x0020;
+const ACKSTATUS_CRCOK: u16 = 0x0010;
+const ACKSTATUS_IGNORED: u16 = 0x0008;
+const ACKSTATUS_OTHERFRM: u16 = 0x0004;
+const ACKSTATUS_CRCERR: u16 = 0x0002;
+const ACKSTATUS_SYNCTIMEOUT: u16 = 0x0001;
+
+// RXSTATUS
+const RXSTATUS_TXACKINPROGRESS: u16 = 0x0002;
+const RXSTATUS_FRAMEINPROGRESS: u16 = 0x0001;
 
 const FCFG_START_MASK: u32 = 0x01FF;
 const FCFG_SIZE_MASK: u32 = 0x00FF;
@@ -65,8 +119,13 @@ const FIFOCFG_APPEND_TIMESTAMP: u16 = 0x8000;
 pub(super) const EVENT_OP_DONE: u32 = 1 << 0;
 pub(super) const EVENT_RX_NOK: u32 = 1 << 4;
 pub(super) const EVENT_RX_IGNORED: u32 = 1 << 5;
+/// ACK reception finished (ACK received, wrong frame, or `RXTIMEOUT` expired);
+/// the outcome is in `ACKSTATUS`.
+pub(super) const EVENT_RX_EMPTY: u32 = 1 << 6;
 pub(super) const EVENT_RX_BUF_FULL: u32 = 1 << 7;
 pub(super) const EVENT_RX_OK: u32 = 1 << 8;
+/// The frame of a TX-then-RX operation has left the antenna.
+pub(super) const EVENT_TX_DONE: u32 = 1 << 13;
 pub(super) const EVENT_OP_ERROR: u32 = 1 << 15;
 pub(super) const EVENT_TERMINAL: u32 = EVENT_OP_DONE | EVENT_OP_ERROR;
 
@@ -166,17 +225,170 @@ pub(super) fn reset_both() {
     write32(PBE_FCMD, BOTH_FIFOS_RESET);
 }
 
-pub(super) fn prepare_tx() {
-    write16(PBE_IEEE_OPCFG, OPCFG_TX_SINGLE);
+/// Drop RX FIFO bytes the PBE wrote but never committed (a frame cut short
+/// by a hard stop). Committed, still unread frames are kept. Only while the
+/// PBE is stopped.
+pub(super) fn discard_uncommitted_rx() {
+    write32(PBE_FCMD, RX_FIFO_DISCARD);
+}
+
+/// Local addressing used by the PBE's IEEE 802.15.4 frame filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FrameFilter {
+    pub pan_id: u16,
+    pub short_addr: u16,
+    /// EUI-64 in over-the-air (little-endian) byte order.
+    pub ext_addr: [u8; 8],
+    pub promiscuous: bool,
+}
+
+/// PBE register values for one [`FrameFilter`], as RCL's
+/// `RCL_Handler_Ieee_RxTx` setup writes them for a single PAN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FilterRegisters {
+    pub pib: u16,
+    pub pan_id: u16,
+    pub short_addr: u16,
+    pub ext_addr_low: u32,
+    pub ext_addr_high: u32,
+    pub ffopt0: u16,
+    pub fftype: u16,
+}
+
+pub(super) const fn filter_registers(filter: &FrameFilter) -> FilterRegisters {
+    let ext = filter.ext_addr;
+    FilterRegisters {
+        pib: if filter.promiscuous {
+            PIB_PANMODE_PROMISCUOUS
+        } else {
+            PIB_PANMODE_SINGLE
+        },
+        pan_id: filter.pan_id,
+        short_addr: filter.short_addr,
+        ext_addr_low: u32::from_le_bytes([ext[0], ext[1], ext[2], ext[3]]),
+        ext_addr_high: u32::from_le_bytes([ext[4], ext[5], ext[6], ext[7]]),
+        // RCL `RCL_CmdIeee_AutoAck_ImmAckNoAutoPend`, maxFrameVersion 1.
+        ffopt0: FFOPT0_MAXFRAME_2006 | FFOPT0_AUTOACK_EN,
+        fftype: FFTYPE_BEACON_DATA_MACCMD,
+    }
+}
+
+/// Program frame filtering and hardware auto-ACK. Only while the PBE is
+/// stopped; the PBE latches the PAN configuration at operation start.
+pub(super) fn configure_frame_filter(filter: &FrameFilter) {
+    let registers = filter_registers(filter);
+    write16(PBE_IEEE_PIB, registers.pib);
+    write16(PBE_IEEE_PANID0, registers.pan_id);
+    write16(PBE_IEEE_SHORTADDR0, registers.short_addr);
+    write32(PBE_IEEE_EXTADDR00, registers.ext_addr_low);
+    write32(PBE_IEEE_EXTADDR02, registers.ext_addr_high);
+    write16(PBE_IEEE_FFOPT0, registers.ffopt0);
+    // No source-match table: no per-child frame-pending bits.
+    for index in 0..4 {
+        write16(PBE_IEEE_ENTRYENABLE00 + index * 2, 0);
+    }
+    write16(PBE_IEEE_FFTYPE, registers.fftype);
+}
+
+/// Continuous RX (RCL RX setup / `restartRx`).
+pub(super) fn prepare_rx() {
+    write16(PBE_IEEE_OPCFG, OPCFG_RX_CONTINUOUS);
     write16(PBE_IEEE_RXTIMEOUT, 0);
     write16(PBE_IEEE_CFGAUTOACK, 0);
 }
 
-pub(super) fn prepare_promiscuous_rx() {
+/// `CFGAUTOACK` for a TX that expects an immediate ACK with `sequence`.
+pub(super) const fn ack_request_config(sequence: u8) -> u16 {
+    CFGAUTOACK_ACKMODE_FILTIMMACK | CFGAUTOACK_FLAGREQ_EN | sequence as u16
+}
+
+/// TX that falls through into continuous RX (RCL TX with an RX action).
+///
+/// With `ack = Some((sequence, timeout))` the PBE itself listens for the
+/// immediate ACK right after the frame, `timeout` in 0.25 us units from the
+/// end of the TX frame to ACK sync, and reports it via `EVENT_RX_EMPTY` and
+/// [`ack_status`]. Without, `EVENT_TX_DONE` marks the end of the frame.
+pub(super) fn prepare_tx_then_rx(ack: Option<(u8, u16)>) {
     write16(PBE_IEEE_OPCFG, OPCFG_RX_CONTINUOUS);
-    write16(PBE_IEEE_RXTIMEOUT, 0);
-    write16(PBE_IEEE_PIB, 0);
-    write16(PBE_IEEE_CFGAUTOACK, 0);
+    match ack {
+        Some((sequence, timeout)) => {
+            write16(PBE_IEEE_RXTIMEOUT, timeout);
+            write16(PBE_IEEE_CFGAUTOACK, ack_request_config(sequence));
+        }
+        None => {
+            write16(PBE_IEEE_RXTIMEOUT, 0);
+            write16(PBE_IEEE_CFGAUTOACK, 0);
+        }
+    }
+}
+
+/// Outcome of the PBE's ACK reception for the last TX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AckStatus {
+    /// Matching ACK with a good CRC; `frame_pending` is its FP bit.
+    Received { frame_pending: bool },
+    /// No ACK sync within `RXTIMEOUT`.
+    Timeout,
+    /// Something was received but it was not our ACK (other frame, bad CRC,
+    /// wrong sequence number).
+    RxError,
+    /// `ACKSTATUS` carried no known outcome.
+    Unknown(u16),
+}
+
+pub(super) const fn decode_ack_status(status: u16) -> AckStatus {
+    if status & ACKSTATUS_SYNCTIMEOUT != 0 {
+        AckStatus::Timeout
+    } else if status & ACKSTATUS_CRCOK != 0 {
+        AckStatus::Received {
+            frame_pending: status & ACKSTATUS_FPSTATE != 0,
+        }
+    } else if status & (ACKSTATUS_IGNORED | ACKSTATUS_OTHERFRM | ACKSTATUS_CRCERR) != 0 {
+        AckStatus::RxError
+    } else {
+        AckStatus::Unknown(status)
+    }
+}
+
+pub(super) fn ack_status() -> AckStatus {
+    decode_ack_status(read16(PBE_IEEE_ACKSTATUS))
+}
+
+/// Whether the PBE is in the middle of receiving a frame or sending the
+/// auto-ACK for one; a hard stop now would lose the frame or the ACK.
+pub(super) fn rx_busy() -> bool {
+    read16(PBE_IEEE_RXSTATUS) & (RXSTATUS_FRAMEINPROGRESS | RXSTATUS_TXACKINPROGRESS) != 0
+}
+
+/// Correlation tops the PBE counted in the last 128 us (RCL `CORRCNT`,
+/// "counter of MDMPROG events to be used for CCA mode 2").
+pub(super) fn correlation_count() -> u16 {
+    read16(PBE_IEEE_CORRCNT) & 0x00FF
+}
+
+/// PBE IEEE statistics counters. They are cleared by the PBE at every
+/// operation start, so they describe the current RX/TX operation only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PbeCounters {
+    pub rx_ok: u16,
+    pub rx_nok: u16,
+    pub rx_ignored: u16,
+    pub rx_fifo_full: u16,
+    pub rx_timeout: u16,
+    pub tx: u16,
+    pub tx_ack: u16,
+}
+
+pub(super) fn pbe_counters() -> PbeCounters {
+    PbeCounters {
+        rx_ok: read16(PBE_IEEE_NRXOK),
+        rx_nok: read16(PBE_IEEE_NRXNOK),
+        rx_ignored: read16(PBE_IEEE_NRXIGNORED),
+        rx_fifo_full: read16(PBE_IEEE_NRXFIFOFULL),
+        rx_timeout: read16(PBE_IEEE_NRXTIMEOUT),
+        tx: read16(PBE_IEEE_NTX),
+        tx_ack: read16(PBE_IEEE_NTXACK),
+    }
 }
 
 #[inline(always)]
@@ -630,6 +842,70 @@ mod tests {
             decode_rx_entry(&words, TEST_FIFO_CONFIG, 2).err(),
             Some(FifoError::MetadataMismatch)
         );
+    }
+
+    #[test]
+    fn filter_registers_match_rcl_single_pan_auto_ack_setup() {
+        let registers = filter_registers(&FrameFilter {
+            pan_id: 0xDFE9,
+            short_addr: 0xA661,
+            // Over-the-air order of EUI 00:12:4b:00:30:d2:99:c8.
+            ext_addr: [0xC8, 0x99, 0xD2, 0x30, 0x00, 0x4B, 0x12, 0x00],
+            promiscuous: false,
+        });
+
+        assert_eq!(registers.pib, PIB_PANMODE_SINGLE);
+        assert_eq!(registers.pan_id, 0xDFE9);
+        assert_eq!(registers.short_addr, 0xA661);
+        // RCL writes `(uint32_t) localExtAddr` and `localExtAddr >> 32` of the
+        // little-endian 64-bit address.
+        assert_eq!(registers.ext_addr_low, 0x30D2_99C8);
+        assert_eq!(registers.ext_addr_high, 0x0012_4B00);
+        // maxFrameVersion 1, auto-ACK by the PBE, no auto-pend, FP = 0.
+        assert_eq!(registers.ffopt0, 0x0104);
+        // Beacon + data + MAC command for both frame-version groups, no ACKs.
+        assert_eq!(registers.fftype, 0x0B0B);
+    }
+
+    #[test]
+    fn promiscuous_filter_disables_pan_matching() {
+        let registers = filter_registers(&FrameFilter {
+            pan_id: 0xFFFF,
+            short_addr: 0xFFFF,
+            ext_addr: [1, 2, 3, 4, 5, 6, 7, 8],
+            promiscuous: true,
+        });
+        assert_eq!(registers.pib, PIB_PANMODE_PROMISCUOUS);
+    }
+
+    #[test]
+    fn ack_request_config_matches_rcl_immediate_ack() {
+        // ACKMODE_FILTIMMACK | FLAGREQ_EN | expected sequence number.
+        assert_eq!(ack_request_config(0x00), 0x0300);
+        assert_eq!(ack_request_config(0xA5), 0x03A5);
+    }
+
+    #[test]
+    fn decodes_ack_status_like_rcl() {
+        assert_eq!(decode_ack_status(0x0001), AckStatus::Timeout);
+        assert_eq!(
+            decode_ack_status(0x0010),
+            AckStatus::Received {
+                frame_pending: false
+            }
+        );
+        assert_eq!(
+            decode_ack_status(0x0030),
+            AckStatus::Received {
+                frame_pending: true
+            }
+        );
+        assert_eq!(decode_ack_status(0x0002), AckStatus::RxError);
+        assert_eq!(decode_ack_status(0x0004), AckStatus::RxError);
+        assert_eq!(decode_ack_status(0x0008), AckStatus::RxError);
+        assert_eq!(decode_ack_status(0x0000), AckStatus::Unknown(0));
+        // A sync timeout wins over stale bits, as in RCL.
+        assert_eq!(decode_ack_status(0x0011), AckStatus::Timeout);
     }
 
     #[test]

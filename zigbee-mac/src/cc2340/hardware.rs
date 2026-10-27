@@ -561,9 +561,46 @@ pub(crate) fn program_frequency(frequency: u32) -> Result<(), HardwareError> {
     Ok(())
 }
 
-pub(crate) fn program_tx_power(raw_value: u32) {
+/// Program the PA through the RFE `SPARE5` shadow register, which the RFE
+/// firmware applies at the next TX start (RCL `LRF_programTxPower`).
+///
+/// `rfe_value` is the 16-bit `LRF_TxPowerTable_Entry.value` encoding, see
+/// [`super::config::TxPowerEntry::compensated_rfe_value`].
+pub(crate) fn program_tx_power(rfe_value: u16) {
     const RFE_SPARE5: u32 = LRFDRFE_BASE + 0x0AC;
-    write32(RFE_SPARE5, raw_value);
+    write32(RFE_SPARE5, u32::from(rfe_value));
+}
+
+const PMUD_BASE: u32 = 0x4000_6000;
+const PMUD_CTL: u32 = PMUD_BASE;
+const PMUD_TEMP: u32 = PMUD_BASE + 0x030;
+const PMUD_TEMPUPD: u32 = PMUD_BASE + 0x034;
+const PMUD_CTL_CALC_EN: u32 = 0x2;
+const PMUD_CTL_MEAS_EN: u32 = 0x1;
+const PMUD_TEMPUPD_STA: u32 = 0x1;
+
+/// Die temperature in whole degrees Celsius from the PMUD (BATMON), or
+/// `None` while no measurement is available yet.
+///
+/// Starts the PMUD measurement the same way `BatMonSupportLPF3_init` does if
+/// nothing else has. TI's `Temperature_getTemperature` additionally applies a
+/// small FCFG-based linearity correction; it is not needed for the PA bias
+/// compensation, whose coefficients are at most ~0.7 ib steps per degree.
+pub(crate) fn die_temperature_c() -> Option<i32> {
+    let control = read32(PMUD_CTL);
+    if control & (PMUD_CTL_CALC_EN | PMUD_CTL_MEAS_EN) != (PMUD_CTL_CALC_EN | PMUD_CTL_MEAS_EN) {
+        write32(PMUD_CTL, control | PMUD_CTL_CALC_EN | PMUD_CTL_MEAS_EN);
+    }
+    if read32(PMUD_TEMPUPD) & PMUD_TEMPUPD_STA == 0 {
+        return None;
+    }
+    // TEMP[16:8] signed integer part, [7:6] fraction (ignored).
+    let integer = ((read32(PMUD_TEMP) >> 8) & 0x1FF) as i32;
+    Some(if integer & 0x100 != 0 {
+        integer - 0x200
+    } else {
+        integer
+    })
 }
 
 pub(crate) fn enable_radio_cores() {

@@ -14,8 +14,29 @@
 
 use super::{config, fifo, firmware, hardware};
 
+/// 100 ms in SYSTIM 250 ns ticks.
 const TX_TIMEOUT_TICKS: u32 = 400_000;
 const ABORT_POLL_LIMIT: usize = 100_000;
+/// ACK wait for an ACK-requested TX: `macAckWaitDuration` (54 symbols), from
+/// the end of the frame to ACK sync. RCL's default `ackTimeout` is 300 us.
+pub const ACK_TIMEOUT_US: u16 = 864;
+/// [`ACK_TIMEOUT_US`] in the PBE's 0.25 us `RXTIMEOUT` units.
+const ACK_TIMEOUT_QUARTER_US: u16 = ACK_TIMEOUT_US * 4;
+/// Longest a TX waits for an in-progress reception (127-byte frame, 4.3 ms)
+/// plus its auto-ACK before preempting RX: 5 ms in 250 ns ticks.
+const RX_BUSY_WAIT_TICKS: u32 = 20_000;
+/// CCA energy threshold: RCL `RCL_CmdIeee_TxAction_Default().rssiLimit`.
+const CCA_RSSI_LIMIT_DBM: i8 = -70;
+/// CCA signal threshold: RCL default `ccaCorrThresh` (correlation tops in a
+/// 128 us window).
+const CCA_CORR_THRESHOLD: u16 = 3;
+/// How long CCA waits for a valid RSSI: one unit backoff period (RCL waits
+/// one backoff, then treats an invalid RSSI as busy) plus RCL's 192 us CCA
+/// start margin for a receiver that CCA had to start itself, rounded up to
+/// 1 ms.
+const CCA_RSSI_WAIT_TICKS: u32 = 1_000 * 4;
+/// TI's "RSSI not available" reading.
+const RSSI_INVALID: i8 = 127;
 
 /// Radio configuration for the CC2340 driver.
 #[derive(Debug, Clone)]
@@ -107,13 +128,51 @@ pub struct RxFrame {
     pub modem_lqi: Option<u8>,
 }
 
+/// Counters of the host-side driver, cumulative since boot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DriverStats {
+    /// Frames handed to the PBE for transmission.
+    pub tx_frames: u32,
+    /// ACK-requested frames whose ACK the PBE received.
+    pub ack_received: u32,
+    /// ... of which the ACK had the frame-pending bit set.
+    pub ack_frame_pending: u32,
+    /// ACK-requested frames without ACK sync within the ACK timeout.
+    pub ack_timeout: u32,
+    /// ACK-requested frames where something other than our ACK was received.
+    pub ack_rx_error: u32,
+    /// Frames delivered by [`Cc2340Driver::receive`].
+    pub rx_frames: u32,
+    /// Frames dropped because their FIFO metadata was unusable.
+    pub rx_dropped: u32,
+    /// RX operations the PBE ended on its own and the driver restarted.
+    pub rx_restarts: u32,
+    /// Transmissions refused because CCA found the channel busy.
+    pub cca_busy: u32,
+}
+
 /// Low-level CC2340 IEEE 802.15.4 radio driver.
+///
+/// The PBE runs one long-lived IEEE RX operation with hardware frame
+/// filtering and immediate auto-ACK (RCL `RCL_CMD_IEEE_RX_TX` with a single
+/// PAN, `RCL_CmdIeee_AutoAck_ImmAckNoAutoPend`). [`Self::receive`] reads
+/// committed frames from the RX FIFO while that operation keeps running. A
+/// transmission stops RX, sends the frame as a TX-then-RX operation (the PBE
+/// waits for the immediate ACK itself when one is requested) and RX resumes
+/// automatically after it, without host involvement in either turnaround.
 pub struct Cc2340Driver {
     config: RadioConfig,
     images_loaded: bool,
     configured: bool,
+    /// Channel or PA level changed since it was last programmed.
     config_dirty: bool,
+    /// Addressing or promiscuous mode changed since the filter was written.
+    filter_dirty: bool,
     operation_active: bool,
+    /// The RX FIFO must be reset (not just trimmed) before the next start.
+    rx_fifo_reset_pending: bool,
+    pa_value: u16,
+    stats: DriverStats,
 }
 
 impl Cc2340Driver {
@@ -123,7 +182,11 @@ impl Cc2340Driver {
             images_loaded: false,
             configured: false,
             config_dirty: true,
+            filter_dirty: true,
             operation_active: false,
+            rx_fifo_reset_pending: true,
+            pa_value: 0,
+            stats: DriverStats::default(),
         }
     }
 
@@ -156,11 +219,13 @@ impl Cc2340Driver {
             hardware::apply_phy_configuration(phy_writes);
             hardware::route_scheduler_interrupt();
 
+            let temperature = die_temperature_c();
+            let pa_value = tx_power.compensated_rfe_value(temperature);
             let bringup = || -> Result<(), hardware::HardwareError> {
                 hardware::finish_radio_setup()?;
                 hardware::enable_synth_refsys()?;
                 hardware::program_frequency(frequency)?;
-                hardware::program_tx_power(tx_power.raw);
+                hardware::program_tx_power(pa_value);
                 hardware::enable_radio_cores();
                 hardware::wait_for_topsm_ready()?;
                 fifo::clear_events(u32::MAX);
@@ -176,16 +241,21 @@ impl Cc2340Driver {
             }
 
             log::info!(
-                "[CC2340 DRV] Initialized channel {} at {} dBm using firmware from {} and PHY settings from {}",
+                "[CC2340 DRV] Initialized channel {} at {} dBm (PA 0x{:04X}, {} C) using firmware from {} and PHY settings from {}",
                 self.config.channel,
                 tx_power.dbm,
+                pa_value,
+                temperature,
                 firmware::source(),
                 config::source()
             );
+            self.pa_value = pa_value;
             self.images_loaded = true;
             self.configured = true;
             self.config_dirty = false;
+            self.filter_dirty = true;
             self.operation_active = false;
+            self.rx_fifo_reset_pending = true;
         }
 
         Ok(())
@@ -201,38 +271,68 @@ impl Cc2340Driver {
         self.images_loaded = false;
         self.configured = false;
         self.config_dirty = true;
+        self.filter_dirty = true;
         self.operation_active = false;
+        self.rx_fifo_reset_pending = true;
     }
 
     pub fn update_config<F: FnOnce(&mut RadioConfig)>(&mut self, update: F) {
+        let before = self.config.clone();
         update(&mut self.config);
-        self.config_dirty = true;
+        if before.channel != self.config.channel || before.tx_power_dbm != self.config.tx_power_dbm
+        {
+            self.config_dirty = true;
+        }
+        if before.pan_id != self.config.pan_id
+            || before.short_addr != self.config.short_addr
+            || before.ieee_addr != self.config.ieee_addr
+            || before.promiscuous != self.config.promiscuous
+        {
+            self.filter_dirty = true;
+        }
     }
 
     pub fn set_channel(&mut self, channel: u8) {
-        self.config.channel = channel;
-        self.config_dirty = true;
+        self.update_config(|config| config.channel = channel);
     }
 
     pub fn set_pan_id(&mut self, pan_id: u16) {
-        self.config.pan_id = pan_id;
+        self.update_config(|config| config.pan_id = pan_id);
     }
 
     pub fn set_short_addr(&mut self, address: u16) {
-        self.config.short_addr = address;
+        self.update_config(|config| config.short_addr = address);
     }
 
     pub fn set_ieee_addr(&mut self, address: &[u8; 8]) {
-        self.config.ieee_addr = *address;
+        self.update_config(|config| config.ieee_addr = *address);
     }
 
     pub fn set_tx_power(&mut self, dbm: i8) {
-        self.config.tx_power_dbm = dbm;
-        self.config_dirty = true;
+        self.update_config(|config| config.tx_power_dbm = dbm);
     }
 
     pub fn set_rx_on_when_idle(&mut self, enabled: bool) {
         self.config.rx_on_when_idle = enabled;
+    }
+
+    /// Cumulative host-side driver counters.
+    pub fn stats(&self) -> DriverStats {
+        self.stats
+    }
+
+    /// PBE counters of the operation currently (or last) running.
+    pub fn pbe_counters(&self) -> fifo::PbeCounters {
+        if self.configured {
+            fifo::pbe_counters()
+        } else {
+            fifo::PbeCounters::default()
+        }
+    }
+
+    /// The 16-bit PA value last written to RFE `SPARE5`.
+    pub fn pa_value(&self) -> u16 {
+        self.pa_value
     }
 
     pub fn perform_cca(&self) -> Result<i8, RadioError> {
@@ -251,7 +351,26 @@ impl Cc2340Driver {
         }
     }
 
+    /// Transmit a frame that does not request an ACK. Returns once the frame
+    /// has been sent; RX is running again afterwards.
     pub async fn transmit(&mut self, frame: &[u8]) -> Result<(), RadioError> {
+        self.transmit_frame(frame, false).await.map(|_| ())
+    }
+
+    /// Transmit an ACK-requested frame and let the PBE receive its immediate
+    /// ACK (RCL TX action with `expectImmAck`).
+    ///
+    /// Returns the ACK's frame-pending bit, or [`RadioError::NoAck`] when no
+    /// matching ACK arrived within [`ACK_TIMEOUT_US`]. No retransmission
+    /// here; that is the MAC's `macMaxFrameRetries` loop.
+    pub async fn transmit_with_ack(&mut self, frame: &[u8]) -> Result<bool, RadioError> {
+        if frame.len() < 3 {
+            return Err(RadioError::InvalidFrame);
+        }
+        self.transmit_frame(frame, true).await
+    }
+
+    async fn transmit_frame(&mut self, frame: &[u8], expect_ack: bool) -> Result<bool, RadioError> {
         if frame.is_empty() || frame.len() > fifo::MAX_MPDU_LEN {
             return Err(RadioError::InvalidFrame);
         }
@@ -259,20 +378,48 @@ impl Cc2340Driver {
             return Err(RadioError::RadioConfigUnavailable);
         }
 
-        self.prepare_operation()?;
-        fifo::prepare_tx();
+        // Do not cut off a frame being received or the auto-ACK being sent.
+        self.wait_rx_idle().await;
+        self.clear_channel_assessment().await?;
+        self.stop_operation()?;
+        self.prepare_cores()?;
+        // RCL: only the TX FIFO is reset for a TX; frames already committed
+        // to the RX FIFO stay readable.
         fifo::reset_tx();
+        self.prepare_rx_fifo();
         fifo::write_tx_frame(frame).map_err(map_fifo_error)?;
+        let ack = expect_ack.then_some((frame[2], ACK_TIMEOUT_QUARTER_US));
+        fifo::prepare_tx_then_rx(ack);
         fifo::clear_events(u32::MAX);
         self.operation_active = true;
         hardware::arm_pbe_start_trigger();
         fifo::start_tx();
+        self.stats.tx_frames = self.stats.tx_frames.wrapping_add(1);
 
+        let done_event = if expect_ack {
+            fifo::EVENT_RX_EMPTY
+        } else {
+            fifo::EVENT_TX_DONE
+        };
         let started = hardware::timer_ticks();
         loop {
             let events = fifo::events();
+            if events & done_event != 0 {
+                fifo::clear_events(done_event);
+                return if expect_ack {
+                    self.ack_outcome(fifo::ack_status())
+                } else {
+                    Ok(false)
+                };
+            }
             if events & fifo::EVENT_TERMINAL != 0 {
-                return self.finish_operation(events);
+                // The operation ended before the TX (and ACK) outcome.
+                self.finish_operation(events)?;
+                return if expect_ack {
+                    Err(RadioError::NoAck)
+                } else {
+                    Ok(false)
+                };
             }
             if hardware::timer_ticks().wrapping_sub(started) >= TX_TIMEOUT_TICKS {
                 break;
@@ -280,93 +427,200 @@ impl Cc2340Driver {
             yield_now().await;
         }
 
-        self.abort_active_operation()?;
+        self.stop_operation()?;
         Err(RadioError::OperationTimeout)
     }
 
+    /// Clear channel assessment on the running RX operation, as RCL
+    /// `RCL_Handler_Ieee_RxTx` does for `RCL_CmdIeee_CcaMode3EnergyOrSignal`:
+    /// busy while a frame is being received, when RSSI is at or above
+    /// [`CCA_RSSI_LIMIT_DBM`], or when the correlator saw more than
+    /// [`CCA_CORR_THRESHOLD`] tops (DSSS signal, also below the energy limit).
+    ///
+    /// The frame-in-progress flag alone is not enough: hardware filtering
+    /// rejects a frame for someone else after its header and goes back to
+    /// sync search while the rest of that frame is still on the air.
+    async fn clear_channel_assessment(&mut self) -> Result<(), RadioError> {
+        if self.operation_active
+            && fifo::events() & fifo::EVENT_TERMINAL != 0
+            && !fifo::rx_data_pending()
+        {
+            // The PBE ended the RX operation on its own (e.g. RX FIFO error);
+            // its RSSI register is stale.
+            hardware::cancel_pbe_start_trigger();
+            fifo::clear_events(u32::MAX);
+            self.operation_active = false;
+            self.rx_fifo_reset_pending = true;
+            self.stats.rx_restarts = self.stats.rx_restarts.wrapping_add(1);
+        }
+        if !self.operation_active {
+            self.start_rx()?;
+        }
+        let started = hardware::timer_ticks();
+        let mut rssi = hardware::read_rssi();
+        while rssi == RSSI_INVALID
+            && hardware::timer_ticks().wrapping_sub(started) < CCA_RSSI_WAIT_TICKS
+        {
+            yield_now().await;
+            rssi = hardware::read_rssi();
+        }
+        let busy = fifo::rx_busy()
+            || rssi == RSSI_INVALID
+            || rssi >= CCA_RSSI_LIMIT_DBM
+            || fifo::correlation_count() > CCA_CORR_THRESHOLD;
+        if busy {
+            self.stats.cca_busy = self.stats.cca_busy.wrapping_add(1);
+            return Err(RadioError::ChannelBusy);
+        }
+        Ok(())
+    }
+
+    fn ack_outcome(&mut self, status: fifo::AckStatus) -> Result<bool, RadioError> {
+        match status {
+            fifo::AckStatus::Received { frame_pending } => {
+                self.stats.ack_received = self.stats.ack_received.wrapping_add(1);
+                if frame_pending {
+                    self.stats.ack_frame_pending = self.stats.ack_frame_pending.wrapping_add(1);
+                }
+                Ok(frame_pending)
+            }
+            fifo::AckStatus::Timeout => {
+                self.stats.ack_timeout = self.stats.ack_timeout.wrapping_add(1);
+                Err(RadioError::NoAck)
+            }
+            fifo::AckStatus::RxError | fifo::AckStatus::Unknown(_) => {
+                self.stats.ack_rx_error = self.stats.ack_rx_error.wrapping_add(1);
+                Err(RadioError::NoAck)
+            }
+        }
+    }
+
+    /// Take one frame the running RX operation has already committed to the
+    /// RX FIFO, without waiting and without starting RX.
+    ///
+    /// A sleepy end device only calls [`Self::receive`] around its own polls,
+    /// so between them the PBE keeps receiving PAN traffic into the FIFO.
+    /// Once the FIFO is full the receiver stops producing RSSI readings,
+    /// CCA can no longer see an idle channel, and there is no room left for
+    /// the frames we are about to solicit. The MAC drains it before a TX.
+    pub fn try_receive(&mut self) -> Option<RxFrame> {
+        if !self.configured || !self.operation_active {
+            return None;
+        }
+        loop {
+            match fifo::try_read_rx_frame() {
+                Ok(Some(frame)) => {
+                    self.stats.rx_frames = self.stats.rx_frames.wrapping_add(1);
+                    return Some(RxFrame {
+                        data: frame.data,
+                        len: frame.len,
+                        rssi: frame.rssi,
+                        lqi: crate::lqi::from_rssi_dbm(frame.rssi),
+                        modem_lqi: frame.modem_lqi,
+                    });
+                }
+                Ok(None) => return None,
+                Err(error) => match classify_rx_fifo_error(error) {
+                    RxFifoDisposition::DropFrame => {
+                        self.stats.rx_dropped = self.stats.rx_dropped.wrapping_add(1);
+                    }
+                    RxFifoDisposition::Fatal(_) => {
+                        // Leave the FIFO to the next operation start, which
+                        // resets it.
+                        let _ = self.stop_operation();
+                        self.rx_fifo_reset_pending = true;
+                        return None;
+                    }
+                },
+            }
+        }
+    }
+
+    /// Return the next received frame, starting continuous RX if it is not
+    /// running. The RX operation keeps running when a frame is returned.
     pub async fn receive(&mut self) -> Result<RxFrame, RadioError> {
         if !self.configured {
             return Err(RadioError::RadioConfigUnavailable);
         }
 
-        self.prepare_operation()?;
-        fifo::prepare_promiscuous_rx();
-        fifo::reset_rx();
-        fifo::clear_events(u32::MAX);
-        self.operation_active = true;
-        hardware::arm_pbe_start_trigger();
-        fifo::start_rx();
-
         let mut dropped_frames: u32 = 0;
+        let mut restarts: u32 = 0;
 
         loop {
-            let events = fifo::events();
+            if self.operation_active && (self.config_dirty || self.filter_dirty) {
+                // New channel/PA/addressing: the PBE latches them at start.
+                self.wait_rx_idle().await;
+                self.stop_operation()?;
+            }
+            if !self.operation_active {
+                self.start_rx()?;
+            }
 
-            if events & fifo::EVENT_RX_OK != 0 {
-                match fifo::try_read_rx_frame() {
-                    Ok(Some(frame)) => {
-                        fifo::clear_events(fifo::EVENT_RX_OK);
-                        self.abort_active_operation()?;
-                        return Ok(RxFrame {
-                            data: frame.data,
-                            len: frame.len,
-                            rssi: frame.rssi,
-                            // Normalize once, here, at the point the value
-                            // enters the stack.
-                            lqi: crate::lqi::from_rssi_dbm(frame.rssi),
-                            modem_lqi: frame.modem_lqi,
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(error) => match classify_rx_fifo_error(error) {
-                        RxFifoDisposition::DropFrame => {
-                            // `try_read_rx_frame` advanced the FIFO read
-                            // pointer before decoding, so this entry is
-                            // already consumed. Drop it and keep the
-                            // continuous RX operation running: a single frame
-                            // whose metadata is unusable must not truncate an
-                            // active scan or an association/rejoin wait.
-                            //
-                            // No fabricated LQI reaches the stack — the frame
-                            // is discarded outright, not surfaced with a
-                            // made-up link quality.
-                            if !fifo::rx_data_pending() {
-                                fifo::clear_events(fifo::EVENT_RX_OK);
-                            }
-                            dropped_frames = dropped_frames.saturating_add(1);
-                            log::debug!(
-                                "[CC2340 DRV] Dropped RX frame with unusable link quality \
-                                 ({error:?}), continuing RX ({dropped_frames} dropped)"
-                            );
-                            if dropped_frames == RSSI_DROP_WARN_THRESHOLD {
-                                log::warn!(
-                                    "[CC2340 DRV] {RSSI_DROP_WARN_THRESHOLD} consecutive RX \
-                                     frames carried no valid RSSI — check the PBE RSSI path"
-                                );
-                            }
-                        }
-                        RxFifoDisposition::Fatal(error) => {
-                            self.abort_active_operation()?;
-                            return Err(error);
-                        }
-                    },
+            match fifo::try_read_rx_frame() {
+                Ok(Some(frame)) => {
+                    self.stats.rx_frames = self.stats.rx_frames.wrapping_add(1);
+                    return Ok(RxFrame {
+                        data: frame.data,
+                        len: frame.len,
+                        rssi: frame.rssi,
+                        // Normalize once, here, at the point the value
+                        // enters the stack.
+                        lqi: crate::lqi::from_rssi_dbm(frame.rssi),
+                        modem_lqi: frame.modem_lqi,
+                    });
                 }
+                Ok(None) => {}
+                Err(error) => match classify_rx_fifo_error(error) {
+                    RxFifoDisposition::DropFrame => {
+                        // `try_read_rx_frame` advanced the FIFO read pointer
+                        // before decoding, so this entry is already consumed.
+                        // Drop it and keep the RX operation running: a single
+                        // frame whose metadata is unusable must not truncate
+                        // an active scan or an association/rejoin wait.
+                        //
+                        // No fabricated LQI reaches the stack — the frame is
+                        // discarded outright.
+                        dropped_frames = dropped_frames.saturating_add(1);
+                        self.stats.rx_dropped = self.stats.rx_dropped.wrapping_add(1);
+                        log::debug!(
+                            "[CC2340 DRV] Dropped RX frame with unusable link quality \
+                             ({error:?}), continuing RX ({dropped_frames} dropped)"
+                        );
+                        if dropped_frames == RSSI_DROP_WARN_THRESHOLD {
+                            log::warn!(
+                                "[CC2340 DRV] {RSSI_DROP_WARN_THRESHOLD} consecutive RX \
+                                 frames carried no valid RSSI — check the PBE RSSI path"
+                            );
+                        }
+                        continue;
+                    }
+                    RxFifoDisposition::Fatal(error) => {
+                        self.stop_operation()?;
+                        self.rx_fifo_reset_pending = true;
+                        return Err(error);
+                    }
+                },
             }
 
-            if events & fifo::EVENT_RX_BUF_FULL != 0 {
-                self.abort_active_operation()?;
-                return Err(RadioError::FifoOverflow);
-            }
-
-            if events & (fifo::EVENT_RX_NOK | fifo::EVENT_RX_IGNORED) != 0 {
-                fifo::clear_events(fifo::EVENT_RX_NOK | fifo::EVENT_RX_IGNORED);
-            }
-
-            if events & fifo::EVENT_TERMINAL != 0 {
-                return match self.finish_operation(events) {
-                    Ok(()) => Err(RadioError::RxTimeout),
-                    Err(error) => Err(error),
-                };
+            let events = fifo::events();
+            if events & fifo::EVENT_TERMINAL != 0 && !fifo::rx_data_pending() {
+                // The PBE ended the RX operation on its own (for example on
+                // an RX FIFO error). Everything committed has been read;
+                // restart it.
+                let end_cause = fifo::end_cause();
+                hardware::cancel_pbe_start_trigger();
+                fifo::clear_events(u32::MAX);
+                self.operation_active = false;
+                self.rx_fifo_reset_pending = true;
+                self.stats.rx_restarts = self.stats.rx_restarts.wrapping_add(1);
+                restarts += 1;
+                log::debug!("[CC2340 DRV] RX ended (cause 0x{end_cause:02X}), restarting");
+                if restarts > MAX_RX_RESTARTS {
+                    return Err(map_pbe_error(end_cause));
+                }
+            } else if events & RX_INFO_EVENTS != 0 {
+                // Informational only; frames are taken from the FIFO level.
+                fifo::clear_events(events & RX_INFO_EVENTS);
             }
 
             yield_now().await;
@@ -374,7 +628,7 @@ impl Cc2340Driver {
     }
 
     pub fn abort_tx(&mut self) {
-        if let Err(error) = self.abort_active_operation() {
+        if let Err(error) = self.stop_operation() {
             log::error!("[CC2340 DRV] Failed to abort radio operation: {error:?}");
         }
     }
@@ -385,11 +639,35 @@ impl Cc2340Driver {
     /// `deinit` is deliberately not used for application waits until
     /// firmware/trim restoration is validated on hardware.
     pub fn prepare_active_wait(&mut self) -> Result<(), RadioError> {
-        self.abort_active_operation()
+        self.stop_operation()
     }
 
-    fn prepare_operation(&mut self) -> Result<(), RadioError> {
-        self.abort_active_operation()?;
+    fn frame_filter(&self) -> fifo::FrameFilter {
+        fifo::FrameFilter {
+            pan_id: self.config.pan_id,
+            short_addr: self.config.short_addr,
+            ext_addr: self.config.ieee_addr,
+            promiscuous: self.config.promiscuous,
+        }
+    }
+
+    /// Start continuous, filtered RX with hardware auto-ACK.
+    fn start_rx(&mut self) -> Result<(), RadioError> {
+        self.stop_operation()?;
+        self.prepare_cores()?;
+        fifo::reset_tx();
+        self.prepare_rx_fifo();
+        fifo::prepare_rx();
+        fifo::clear_events(u32::MAX);
+        self.operation_active = true;
+        hardware::arm_pbe_start_trigger();
+        fifo::start_rx();
+        Ok(())
+    }
+
+    /// Everything a PBE operation needs before its API command; the PBE must
+    /// be stopped.
+    fn prepare_cores(&mut self) -> Result<(), RadioError> {
         self.apply_runtime_config()?;
         // RCL calls `LRF_enable()` (MSGBOX = 0, PBE/MCE/RFE TOPsm INIT +
         // ENABLE) before every PBE operation, including between RX and TX of
@@ -398,21 +676,50 @@ impl Cc2340Driver {
         // operation and the next TX ends immediately with ERR_STOP (0xFC).
         hardware::enable_radio_cores();
         hardware::wait_for_topsm_ready()?;
+        fifo::configure_frame_filter(&self.frame_filter());
+        self.filter_dirty = false;
         Ok(())
     }
 
-    fn apply_runtime_config(&mut self) -> Result<(), RadioError> {
-        if !self.config_dirty {
-            return Ok(());
+    /// Keep committed RX frames across a restart; reset the FIFO only when
+    /// nothing is pending or its state is suspect.
+    fn prepare_rx_fifo(&mut self) {
+        if self.rx_fifo_reset_pending || !fifo::rx_data_pending() {
+            fifo::reset_rx();
+            self.rx_fifo_reset_pending = false;
         }
+    }
 
-        let frequency =
-            hardware::channel_frequency(self.config.channel).ok_or(RadioError::InvalidChannel)?;
+    /// Wait (bounded) until the PBE is neither receiving a frame nor sending
+    /// the auto-ACK for one.
+    async fn wait_rx_idle(&mut self) {
+        if !self.operation_active {
+            return;
+        }
+        let started = hardware::timer_ticks();
+        while fifo::rx_busy()
+            && fifo::events() & fifo::EVENT_TERMINAL == 0
+            && hardware::timer_ticks().wrapping_sub(started) < RX_BUSY_WAIT_TICKS
+        {
+            yield_now().await;
+        }
+    }
+
+    fn apply_runtime_config(&mut self) -> Result<(), RadioError> {
         let tx_power =
             config::tx_power(self.config.tx_power_dbm).ok_or(RadioError::InvalidTxPower)?;
-        hardware::program_frequency(frequency)?;
-        hardware::program_tx_power(tx_power.raw);
-        self.config_dirty = false;
+        if self.config_dirty {
+            let frequency = hardware::channel_frequency(self.config.channel)
+                .ok_or(RadioError::InvalidChannel)?;
+            hardware::program_frequency(frequency)?;
+            self.config_dirty = false;
+        }
+        // RCL re-applies the temperature-compensated PA setting before TX.
+        let pa_value = tx_power.compensated_rfe_value(die_temperature_c());
+        if pa_value != self.pa_value {
+            hardware::program_tx_power(pa_value);
+            self.pa_value = pa_value;
+        }
         Ok(())
     }
 
@@ -421,6 +728,7 @@ impl Cc2340Driver {
         let end_cause = fifo::end_cause();
         fifo::clear_events(u32::MAX);
         self.operation_active = false;
+        self.rx_fifo_reset_pending = true;
 
         if events & fifo::EVENT_OP_ERROR != 0 && end_cause == 0 {
             Err(RadioError::HardwareError)
@@ -431,13 +739,14 @@ impl Cc2340Driver {
         }
     }
 
-    fn abort_active_operation(&mut self) -> Result<(), RadioError> {
+    /// Hard-stop the running PBE operation (RCL `LRF_sendHardStop` and wait
+    /// for `OPDONE`/`OPERROR`). Committed RX frames stay in the FIFO.
+    fn stop_operation(&mut self) -> Result<(), RadioError> {
         if !self.operation_active {
             return Ok(());
         }
 
         if fifo::events() & fifo::EVENT_TERMINAL == 0 {
-            fifo::clear_events(fifo::EVENT_TERMINAL);
             fifo::hard_stop();
             let mut stopped = false;
             for _ in 0..ABORT_POLL_LIMIT {
@@ -450,6 +759,7 @@ impl Cc2340Driver {
             if !stopped {
                 hardware::cancel_pbe_start_trigger();
                 self.operation_active = false;
+                self.rx_fifo_reset_pending = true;
                 fifo::reset_both();
                 return Err(RadioError::OperationTimeout);
             }
@@ -457,10 +767,26 @@ impl Cc2340Driver {
 
         hardware::cancel_pbe_start_trigger();
         fifo::clear_events(u32::MAX);
-        fifo::reset_both();
+        // A frame cut short by the stop must not prefix the next entry.
+        fifo::discard_uncommitted_rx();
         self.operation_active = false;
         Ok(())
     }
+}
+
+/// Events [`Cc2340Driver::receive`] clears as informational.
+const RX_INFO_EVENTS: u32 = fifo::EVENT_RX_OK
+    | fifo::EVENT_RX_NOK
+    | fifo::EVENT_RX_IGNORED
+    | fifo::EVENT_RX_BUF_FULL
+    | fifo::EVENT_RX_EMPTY
+    | fifo::EVENT_TX_DONE;
+
+/// Consecutive PBE-ended RX operations tolerated within one `receive` call.
+const MAX_RX_RESTARTS: u32 = 8;
+
+fn die_temperature_c() -> i32 {
+    hardware::die_temperature_c().unwrap_or(config::TX_POWER_REFERENCE_TEMPERATURE_C)
 }
 
 fn map_fifo_error(error: fifo::FifoError) -> RadioError {
