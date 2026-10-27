@@ -7,6 +7,7 @@
 
 #![no_std]
 
+pub mod batmon;
 pub mod flash;
 pub mod identity;
 #[cfg(target_os = "none")]
@@ -42,6 +43,8 @@ pub struct Resources {
     /// Active-low BTN2 on DIO14.
     pub button2: pins::Button2,
     pub flash: flash::InternalFlash,
+    /// On-die VDDS and temperature monitor, measuring continuously.
+    pub batmon: batmon::Batmon,
     pub reset: reset::SystemReset,
 }
 
@@ -75,6 +78,7 @@ pub fn take() -> Option<Resources> {
         button1: pins::Button::configure(),
         button2: pins::Button::configure(),
         flash: flash::InternalFlash::new(),
+        batmon: batmon::Batmon::init(),
         reset: reset::SystemReset::new(),
     })
 }

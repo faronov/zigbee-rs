@@ -19,8 +19,8 @@ const TEMPERATURE_RANGE: TemperatureRange = TemperatureRange {
     max_centi_celsius: 12_500,
 };
 
-// The development image reports a labelled synthetic fixed 3-V source until
-// BATMON/ADC support exists. Its physical battery form factor is unknown.
+// The development image reports BATMON VDDS. Its physical battery form
+// factor is unknown.
 const BATTERY: BatteryDescriptor = BatteryDescriptor {
     size: 0xFF,
     quantity: 1,

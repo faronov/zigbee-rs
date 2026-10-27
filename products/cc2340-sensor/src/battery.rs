@@ -1,24 +1,63 @@
-//! Product battery conversion and bring-up source policy.
+//! Product battery conversion and the BATMON (VDDS) battery source.
 //!
-//! The LP-EM board has no verified pure-Rust supply-voltage adapter yet.
-//! The selected [`FixedBattery`](sensor_sed_app::FixedBattery) is therefore
-//! explicitly synthetic and must be replaced when an ADC/BATMON adapter is
-//! available.
+//! The LaunchPad is normally powered from the XDS110 3.3-V rail, so the
+//! percentage clamps to 100 % there; on a coin cell it follows the
+//! 1.8-V empty to 3.0-V full curve below.
 
-use sensor_sed_app::FixedBattery;
+use sensor_sed_app::{BatteryReading, BatterySource};
 use zigbee_runtime::profile::BatteryMeasurement;
+
+use crate::BatmonNotReady;
 
 pub const EMPTY_MV: u16 = 1_800;
 pub const FULL_MV: u16 = 3_000;
-pub const SYNTHETIC_FIXED_MV: u16 = 3_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatterySourceDisposition {
-    SyntheticFixedUntilAdc,
+    BatmonVdds,
 }
 
 pub const fn source_disposition() -> BatterySourceDisposition {
-    BatterySourceDisposition::SyntheticFixedUntilAdc
+    BatterySourceDisposition::BatmonVdds
+}
+
+/// VDDS in millivolts, `None` before the first measurement.
+pub trait SupplyVoltage {
+    fn voltage_mv(&self) -> Option<u16>;
+}
+
+#[cfg(target_os = "none")]
+impl SupplyVoltage for lp_em_cc2340r5::batmon::Batmon {
+    fn voltage_mv(&self) -> Option<u16> {
+        lp_em_cc2340r5::batmon::Batmon::voltage_mv(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BatmonBattery<T> {
+    monitor: T,
+}
+
+impl<T: SupplyVoltage> BatmonBattery<T> {
+    pub const fn new(monitor: T) -> Self {
+        Self { monitor }
+    }
+
+    pub fn reading(&self) -> Result<BatteryReading, BatmonNotReady> {
+        let millivolts = self.monitor.voltage_mv().ok_or(BatmonNotReady)?;
+        Ok(BatteryReading {
+            millivolts: millivolts as u32,
+            measurement: battery_measurement(millivolts),
+        })
+    }
+}
+
+impl<T: SupplyVoltage> BatterySource for BatmonBattery<T> {
+    type Error = BatmonNotReady;
+
+    async fn sample(&mut self) -> Result<Option<BatteryReading>, Self::Error> {
+        self.reading().map(Some)
+    }
 }
 
 /// ZCL BatteryVoltage in 100-mV units.
@@ -50,15 +89,6 @@ pub const fn battery_measurement(voltage_mv: u16) -> BatteryMeasurement {
     }
 }
 
-/// Construct the explicitly synthetic source selected by this bring-up
-/// product. It is not a hardware battery measurement.
-pub const fn fixed_battery() -> FixedBattery {
-    FixedBattery::new(
-        SYNTHETIC_FIXED_MV as u32,
-        battery_measurement(SYNTHETIC_FIXED_MV),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,12 +113,22 @@ mod tests {
         );
     }
 
+    struct Fake(Option<u16>);
+
+    impl SupplyVoltage for Fake {
+        fn voltage_mv(&self) -> Option<u16> {
+            self.0
+        }
+    }
+
     #[test]
-    fn absent_hardware_measurement_is_explicit() {
+    fn vdds_drives_the_zcl_battery_attributes() {
+        let reading = BatmonBattery::new(Fake(Some(2_400))).reading().unwrap();
+        assert_eq!(reading.millivolts, 2_400);
+        assert_eq!(reading.measurement, battery_measurement(2_400));
         assert_eq!(
-            source_disposition(),
-            BatterySourceDisposition::SyntheticFixedUntilAdc
+            BatmonBattery::new(Fake(None)).reading(),
+            Err(BatmonNotReady)
         );
-        assert_eq!(SYNTHETIC_FIXED_MV, FULL_MV);
     }
 }

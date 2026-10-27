@@ -52,6 +52,7 @@ async fn main(_spawner: Spawner) {
         button1,
         button2,
         flash,
+        batmon,
         reset,
     } = resources;
     let wake = platform::LaunchPadWake::new(button1, button2);
@@ -151,10 +152,9 @@ async fn main(_spawner: Spawner) {
     }
 
     log::warn!(
-        "[CC2340] environment={:?}; battery={:?} at {}mV; replace both before production",
+        "[CC2340] environment={:?}; battery={:?}; humidity is synthetic until a sensor is fitted",
         product::environment::source_disposition(),
-        product::battery::source_disposition(),
-        product::battery::SYNTHETIC_FIXED_MV
+        product::battery::source_disposition()
     );
     log::warn!(
         "[CC2340] commissioning is not claimed: entropy is unavailable and MAC/power HIL is open"
@@ -167,8 +167,8 @@ async fn main(_spawner: Spawner) {
         SensorSedParts {
             wake,
             status,
-            environment: product::environment::SyntheticEnvironment::new(),
-            battery: product::battery::fixed_battery(),
+            environment: product::environment::BatmonEnvironment::new(batmon),
+            battery: product::battery::BatmonBattery::new(batmon),
             ota: NoOta,
             actions: product::policy::USER_ACTIONS,
             supervisor,
