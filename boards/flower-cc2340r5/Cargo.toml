@@ -1,0 +1,14 @@
+[package]
+name = "flower-cc2340r5"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust board support for koptserg's CC2340R5 RGE soil-moisture (flower) board"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone like the other CC2340 board crates; consumed by path.
+[workspace]
+
+[dependencies]
+cc2340r5-hal = { path = "../../cc2340r5-hal" }
