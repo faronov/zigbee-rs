@@ -1,0 +1,40 @@
+[package]
+name = "cc2340-flower"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["koptserg"]
+# Soil-probe calibration of koptserg's board build.
+koptserg = ["cc2340-flower-product/koptserg"]
+# Soil-probe calibration of the DIYZi board build.
+diyzi = ["cc2340-flower-product/diyzi"]
+
+[dependencies]
+cc2340-flower-product = { path = "../../products/cc2340-flower", default-features = false }
+flower-cc2340r5 = { path = "../../boards/flower-cc2340r5" }
+sensor-sed-app = { path = "../../apps/sensor-sed" }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["cc2340"] }
+zigbee-zcl = { path = "../../zigbee-zcl" }
+zigbee-runtime = { path = "../../zigbee-runtime" }
+
+# Pinned nightly gives each task compiler-sized static storage, not a 4 KiB arena.
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
+embassy-time = "0.5"
+embassy-futures = "0.1"
+
+# ARM Cortex-M0+ support
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+
+# Logging
+log = "0.4"
+rtt-target = "0.6"
+
+# Panic handler for embedded target
+panic-halt = "1.0"
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -1,0 +1,8 @@
+[build]
+target = "thumbv6m-none-eabi"
+
+[unstable]
+build-std = ["core", "alloc"]
+
+[env]
+DEFMT_LOG = "info"
