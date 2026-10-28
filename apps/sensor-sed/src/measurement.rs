@@ -57,6 +57,17 @@ impl SensorProfile for DeviceProfile<PlantSensor> {
     }
 }
 
+/// A plant sensor with an OTA Upgrade client endpoint.
+#[cfg(feature = "ota")]
+impl<F> SensorProfile for zigbee_runtime::profile::WithOta<DeviceProfile<PlantSensor>, F>
+where
+    F: zigbee_runtime::firmware_writer::FirmwareWriter,
+{
+    fn update_battery(&mut self, measurement: BatteryMeasurement) {
+        self.inner_mut().component_mut().update_battery(measurement);
+    }
+}
+
 /// Product-owned sampling of the fitted sensors into profile `P`.
 ///
 /// Implementations update the profile's cluster values in place and record
@@ -99,5 +110,78 @@ where
             }
             Err(_) => diagnostics.record(DiagnosticEvent::EnvironmentReadFailed),
         }
+    }
+}
+
+#[cfg(all(test, feature = "ota"))]
+mod tests {
+    use super::*;
+    use zigbee_runtime::firmware_writer::{FirmwareError, FirmwareWriter};
+    use zigbee_runtime::ota::{OtaConfig, OtaManager};
+    use zigbee_runtime::profile::{
+        BatteryDescriptor, PlantSensorReporting, TemperatureRange, WithOta,
+    };
+    use zigbee_zcl::DeviceId;
+
+    struct NullWriter;
+
+    impl FirmwareWriter for NullWriter {
+        fn erase_slot(&mut self) -> Result<(), FirmwareError> {
+            Ok(())
+        }
+        fn write_block(&mut self, _offset: u32, _data: &[u8]) -> Result<(), FirmwareError> {
+            Ok(())
+        }
+        fn verify(&mut self, _size: u32, _hash: Option<&[u8]>) -> Result<(), FirmwareError> {
+            Ok(())
+        }
+        fn activate(&mut self) -> Result<(), FirmwareError> {
+            Ok(())
+        }
+        fn slot_size(&self) -> u32 {
+            0
+        }
+        fn abort(&mut self) -> Result<(), FirmwareError> {
+            Ok(())
+        }
+    }
+
+    fn requires_sensor_profile<P: SensorProfile>(profile: &mut P) {
+        profile.update_battery(BatteryMeasurement {
+            voltage_100mv: 29,
+            percentage_remaining: 180,
+        });
+    }
+
+    #[test]
+    fn plant_sensor_with_ota_is_a_sensor_profile() {
+        let plant = DeviceProfile::new(
+            1,
+            0x0104,
+            DeviceId::SIMPLE_SENSOR,
+            PlantSensor::new(
+                TemperatureRange {
+                    min_centi_celsius: -4_000,
+                    max_centi_celsius: 8_500,
+                },
+                0xFFFE,
+                PlantSensorReporting::default(),
+            )
+            .with_battery(BatteryDescriptor {
+                size: 10,
+                quantity: 1,
+                rated_voltage_100mv: 30,
+            }),
+        );
+        let ota = OtaManager::new(
+            NullWriter,
+            OtaConfig {
+                endpoint: 1,
+                ..OtaConfig::default()
+            },
+        );
+        let mut profile = WithOta::new(plant, ota).expect("same endpoint");
+        requires_sensor_profile(&mut profile);
+        assert!(profile.inner().component().has_battery());
     }
 }
