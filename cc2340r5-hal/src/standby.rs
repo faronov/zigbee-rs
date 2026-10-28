@@ -21,7 +21,7 @@
 //! SYSTIM `TIME1U` therefore stays a continuous microsecond time base across
 //! standby (hardware resync from the LF-clocked RTC), so the Embassy time
 //! driver needs no correction. Button edges wake the device through the IOC
-//! (`WUENSB` is set by [`crate::pins`]); the latched GPIO interrupt is serviced
+//! (`WUENSB` is set by [`crate::gpio`]); the latched GPIO interrupt is serviced
 //! after the critical section.
 //!
 //! The caller must have powered the radio down (LRFD registers are lost) and

@@ -1,35 +1,25 @@
 //! Pure-Rust board support for LP-EM-CC2340R5 with a CC2340R52.
 //!
-//! This crate owns only physical board resources and the verified CC2340R52
-//! timer/flash/identity services. Application lifecycle adapters belong to a
-//! product or firmware composition crate. It does not link TI Drivers, RCL,
-//! FreeRTOS, or ZBOSS.
+//! This crate owns only the LaunchPad's physical wiring (LEDs, buttons, the
+//! DC/DC inductor). The CC2340R52 chip services — power, standby, time,
+//! flash, identity, BATMON, reset and the peripheral drivers — live in
+//! [`cc2340r5_hal`] and are re-exported here under their historical paths.
+//! Application lifecycle adapters belong to a product or firmware
+//! composition crate. It does not link TI Drivers, RCL, FreeRTOS, or ZBOSS.
 
 #![no_std]
 
-pub mod batmon;
-pub mod flash;
-pub mod identity;
+pub use cc2340r5_hal::{MCU_CLOCK_HZ, TARGET_PART};
+pub use cc2340r5_hal::{batmon, flash, identity, power, standby, timebase};
 #[cfg(target_os = "none")]
-pub mod interrupts;
+pub use cc2340r5_hal::{interrupts, reset};
+
 pub mod pins;
-pub mod power;
-pub mod standby;
-pub mod timebase;
-
-#[cfg(target_os = "none")]
-pub mod reset;
-#[cfg(target_os = "none")]
-mod time;
-
-#[cfg(target_os = "none")]
-use portable_atomic::{AtomicBool, Ordering};
 
 pub const BOARD_NAME: &str = "LP-EM-CC2340R5";
-pub const TARGET_PART: &str = "CC2340R52";
 
-/// CC2340R52 MCU clock selected by the ROM startup code.
-pub const MCU_CLOCK_HZ: u32 = 48_000_000;
+/// The LaunchPad populates the DC/DC inductor.
+pub const VDDR_REGULATOR: cc2340r5_hal::VddrRegulator = cc2340r5_hal::VddrRegulator::DcDc;
 
 /// All exclusively owned board resources.
 #[cfg(target_os = "none")]
@@ -48,38 +38,32 @@ pub struct Resources {
     pub reset: reset::SystemReset,
 }
 
-#[cfg(target_os = "none")]
-static TAKEN: AtomicBool = AtomicBool::new(false);
-
 /// Claim and initialize the board exactly once.
 ///
-/// The DC/DC regulator, flash-LDO-off-in-idle and the LFOSC LF clock are
-/// selected first ([`power`]) and the RTC is set up as standby wake source
-/// ([`standby`]). IOC muxing, direction, pulls, and the tickless Embassy SYSTIM driver are
-/// initialized before the physical resources are returned. Button press
-/// interrupts are configured (edge detection) but left masked until the
-/// application calls `Button::enable_press_interrupt`.
+/// [`cc2340r5_hal::take_core`] selects the DC/DC regulator,
+/// flash-LDO-off-in-idle and the LFOSC LF clock, sets up the RTC standby
+/// wake source and the tickless Embassy SYSTIM driver; the LaunchPad LEDs
+/// and buttons are then claimed and configured. Button press interrupts are
+/// configured (edge detection) but left masked until the application calls
+/// `Button::enable_press_interrupt`.
 #[cfg(target_os = "none")]
 pub fn take() -> Option<Resources> {
-    if TAKEN
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return None;
-    }
-
-    power::init();
-    standby::init();
-    time::init();
+    let cc2340r5_hal::Core {
+        mut pins,
+        flash,
+        batmon,
+        reset,
+        ..
+    } = cc2340r5_hal::take_core(VDDR_REGULATOR)?;
 
     Some(Resources {
-        led1: pins::Led::configure(false),
-        led2: pins::Led::configure(false),
-        button1: pins::Button::configure(),
-        button2: pins::Button::configure(),
-        flash: flash::InternalFlash::new(),
-        batmon: batmon::Batmon::init(),
-        reset: reset::SystemReset::new(),
+        led1: pins.led(false).ok()?,
+        led2: pins.led(false).ok()?,
+        button1: pins.button().ok()?,
+        button2: pins.button().ok()?,
+        flash,
+        batmon,
+        reset,
     })
 }
 

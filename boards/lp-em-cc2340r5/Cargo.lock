@@ -18,6 +18,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46afbd2983a5d5a7bd740ccb198caf5b82f45c40c09c0eed36052d91cb92e719"
 
 [[package]]
+name = "cc2340r5-hal"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "embassy-time",
+ "embassy-time-driver",
+ "embedded-hal 1.0.0",
+ "embedded-storage",
+ "portable-atomic",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -156,12 +169,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 name = "lp-em-cc2340r5"
 version = "0.1.0"
 dependencies = [
- "cortex-m",
- "cortex-m-rt",
- "embassy-time",
- "embassy-time-driver",
- "embedded-storage",
- "portable-atomic",
+ "cc2340r5-hal",
 ]
 
 [[package]]
