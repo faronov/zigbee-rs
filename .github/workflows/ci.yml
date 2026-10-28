@@ -112,6 +112,12 @@ jobs:
             manifest: cc2340r5-hal/Cargo.toml
             workspace: cc2340r5-hal
             features: ""
+          # Workspace member; its optional firmware-writer and compact
+          # SHA-256 paths are not covered by the plain workspace test run.
+          - name: MCUboot image firmware writer
+            manifest: mcuboot-image/Cargo.toml
+            workspace: .
+            features: firmware-writer,compact-sha256
           - name: ESP32-C6 sensor product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit

@@ -10,6 +10,8 @@
 *.sensor
 /docs/book/book/
 *.bin
+# imgtool-produced MCUboot test vectors are source fixtures.
+!/mcuboot-image/tests/vectors/*.bin
 
 # Local toolchain extractions (e.g. tc32 from modern-tc32/rust release)
 /.toolchains/

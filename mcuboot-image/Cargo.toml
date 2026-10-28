@@ -1,0 +1,24 @@
+[package]
+name = "mcuboot-image"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "no_std MCUboot image validation, overwrite-only boot engine and OTA slot writer"
+publish = false
+
+[dependencies]
+embedded-storage = { workspace = true }
+sha2 = { version = "0.10", default-features = false }
+zigbee-runtime = { version = "0.1.0", path = "../zigbee-runtime", default-features = false, optional = true }
+
+[features]
+default = []
+# `zigbee_runtime::firmware_writer::FirmwareWriter` for the secondary slot.
+firmware-writer = ["dep:zigbee-runtime"]
+# Smaller, slower SHA-256 for size-constrained bootloaders.
+compact-sha256 = ["sha2/force-soft-compact"]
+
+[dev-dependencies]
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+sha2 = { version = "0.10", default-features = false }
