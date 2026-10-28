@@ -18,8 +18,8 @@
 //!   optional humidity/battery.
 //! - [`occupancy_light::OccupancyLight`] — occupancy + illuminance sensing,
 //!   optional battery.
-//! - [`plant_sensor::PlantSensor`] — soil moisture + temperature + illuminance,
-//!   optional battery.
+//! - [`plant_sensor::PlantSensor`] — soil moisture + temperature, optional
+//!   illuminance, optional battery.
 //! - [`range_extender::RangeExtender`] — Basic + Identify for a router-only
 //!   Home Automation range extender.
 //! - [`smart_plug::SmartPlug`] — On/Off + electrical measurement, optional

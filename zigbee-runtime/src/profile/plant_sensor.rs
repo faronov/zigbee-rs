@@ -1,5 +1,5 @@
-//! Plant/soil sensor archetype: soil moisture + temperature + illuminance,
-//! optional battery.
+//! Plant/soil sensor archetype: soil moisture + temperature, optional
+//! illuminance, optional battery.
 //!
 //! Composes clusters with genuinely implemented attributes in this
 //! workspace: Soil Moisture Measurement (0x0408), Temperature Measurement
@@ -9,6 +9,11 @@
 //! HA 0x0104), so this archetype uses the same generic Simple Sensor device
 //! ID (`DeviceId::SIMPLE_SENSOR`, 0x000C) as the optional `AirQuality`
 //! profile.
+//!
+//! Illuminance is present by default but can be removed with
+//! [`PlantSensor::without_illuminance`] for boards whose light sensor is an
+//! optional, autodetected part: the endpoint then advertises (and expects
+//! reporting for) only the clusters it can actually measure.
 
 use super::{
     ApplicationClusters, BatteryDescriptor, BatteryMeasurement, ExpectedReportClusters,
@@ -77,11 +82,12 @@ impl Default for PlantSensorReporting {
     }
 }
 
-/// Soil Moisture + Temperature + Illuminance clusters, optional battery.
+/// Soil Moisture + Temperature clusters, optional Illuminance, optional
+/// battery.
 pub struct PlantSensor {
     soil_moisture: SoilMoistureCluster,
     temperature: TemperatureCluster,
-    illuminance: IlluminanceCluster,
+    illuminance: Option<IlluminanceCluster>,
     battery: Option<PowerConfigCluster>,
     reporting: PlantSensorReporting,
 }
@@ -98,7 +104,7 @@ impl PlantSensor {
                 temperature_range.min_centi_celsius,
                 temperature_range.max_centi_celsius,
             ),
-            illuminance: IlluminanceCluster::new(0, illuminance_max),
+            illuminance: Some(IlluminanceCluster::new(0, illuminance_max)),
             battery: None,
             reporting,
         }
@@ -120,6 +126,28 @@ impl PlantSensor {
         self.battery.is_some()
     }
 
+    /// Remove the Illuminance cluster (no light sensor fitted/detected).
+    /// The endpoint, cluster list, expected reports, and default reporting
+    /// then all omit 0x0400.
+    pub fn without_illuminance(mut self) -> Self {
+        self.illuminance = None;
+        self
+    }
+
+    pub fn has_illuminance(&self) -> bool {
+        self.illuminance.is_some()
+    }
+
+    /// Update only the soil moisture reading (hundredths of a percent).
+    pub fn update_soil_moisture(&mut self, hundredths_pct: u16) {
+        self.soil_moisture.set_moisture(hundredths_pct);
+    }
+
+    /// Update only the temperature reading (hundredths of a degree C).
+    pub fn update_temperature(&mut self, centi_celsius: i16) {
+        self.temperature.set_temperature(centi_celsius);
+    }
+
     /// Update soil moisture and temperature from one measurement cycle.
     pub fn update_measurement(&mut self, measurement: PlantSensorMeasurement) {
         self.soil_moisture
@@ -132,8 +160,11 @@ impl PlantSensor {
     /// ZCL §4.2.2.2.1: `MeasuredValue = 10000 x log10(lux) + 1`. This runtime
     /// does not depend on `libm`, so the log10 conversion is left to the
     /// platform/product side where a math library is available.
+    /// No-op if the illuminance cluster was removed.
     pub fn update_illuminance(&mut self, value: u16) {
-        self.illuminance.set_illuminance(value);
+        if let Some(illuminance) = &mut self.illuminance {
+            illuminance.set_illuminance(value);
+        }
     }
 
     /// Update the battery reading. No-op if no battery was configured.
@@ -160,8 +191,8 @@ impl PlantSensor {
         &self.temperature
     }
 
-    pub const fn illuminance(&self) -> &IlluminanceCluster {
-        &self.illuminance
+    pub const fn illuminance(&self) -> Option<&IlluminanceCluster> {
+        self.illuminance.as_ref()
     }
 }
 
@@ -175,10 +206,14 @@ impl ProfileComponent for PlantSensor {
         } else {
             endpoint
         };
-        endpoint
+        let endpoint = endpoint
             .cluster_server(ClusterId::SOIL_MOISTURE)
-            .cluster_server(ClusterId::TEMPERATURE)
-            .cluster_server(ClusterId::ILLUMINANCE)
+            .cluster_server(ClusterId::TEMPERATURE);
+        if self.illuminance.is_some() {
+            endpoint.cluster_server(ClusterId::ILLUMINANCE)
+        } else {
+            endpoint
+        }
     }
 
     fn collect_clusters<'a>(
@@ -198,12 +233,14 @@ impl ProfileComponent for PlantSensor {
                 cluster: &mut self.temperature,
             })
             .map_err(|_| ProfileError::TooManyClusters)?;
-        clusters
-            .push(ClusterRef {
-                endpoint,
-                cluster: &mut self.illuminance,
-            })
-            .map_err(|_| ProfileError::TooManyClusters)?;
+        if let Some(illuminance) = &mut self.illuminance {
+            clusters
+                .push(ClusterRef {
+                    endpoint,
+                    cluster: illuminance,
+                })
+                .map_err(|_| ProfileError::TooManyClusters)?;
+        }
         if let Some(power) = &mut self.battery {
             clusters
                 .push(ClusterRef {
@@ -218,7 +255,9 @@ impl ProfileComponent for PlantSensor {
     fn expected_report_cluster_ids(&self, out: &mut ExpectedReportClusters) {
         let _ = out.push(ClusterId::SOIL_MOISTURE.0);
         let _ = out.push(ClusterId::TEMPERATURE.0);
-        let _ = out.push(ClusterId::ILLUMINANCE.0);
+        if self.illuminance.is_some() {
+            let _ = out.push(ClusterId::ILLUMINANCE.0);
+        }
         if self.battery.is_some() {
             let _ = out.push(ClusterId::POWER_CONFIG.0);
         }
@@ -262,20 +301,22 @@ impl ProfileComponent for PlantSensor {
                 },
             )
             .map_err(ProfileError::Reporting)?;
-        reporting
-            .configure_for_cluster(
-                endpoint,
-                ClusterId::ILLUMINANCE.0,
-                ReportingConfig {
-                    direction: ReportDirection::Send,
-                    attribute_id: ILLUMINANCE_MEASURED_VALUE,
-                    data_type: ZclDataType::U16,
-                    min_interval: self.reporting.illuminance_min_secs,
-                    max_interval: self.reporting.illuminance_max_secs,
-                    reportable_change: Some(ZclValue::U16(self.reporting.illuminance_change)),
-                },
-            )
-            .map_err(ProfileError::Reporting)?;
+        if self.illuminance.is_some() {
+            reporting
+                .configure_for_cluster(
+                    endpoint,
+                    ClusterId::ILLUMINANCE.0,
+                    ReportingConfig {
+                        direction: ReportDirection::Send,
+                        attribute_id: ILLUMINANCE_MEASURED_VALUE,
+                        data_type: ZclDataType::U16,
+                        min_interval: self.reporting.illuminance_min_secs,
+                        max_interval: self.reporting.illuminance_max_secs,
+                        reportable_change: Some(ZclValue::U16(self.reporting.illuminance_change)),
+                    },
+                )
+                .map_err(ProfileError::Reporting)?;
+        }
         if self.battery.is_some() {
             reporting
                 .configure_for_cluster(
@@ -405,6 +446,7 @@ mod tests {
         assert_eq!(
             component
                 .illuminance()
+                .unwrap()
                 .attributes()
                 .get(zigbee_zcl::clusters::illuminance::ATTR_MAX_MEASURED_VALUE),
             Some(&ZclValue::U16(20_000))
@@ -449,9 +491,100 @@ mod tests {
         assert_eq!(
             component
                 .illuminance()
+                .unwrap()
                 .attributes()
                 .get(ILLUMINANCE_MEASURED_VALUE),
             Some(&ZclValue::U16(8_500))
+        );
+    }
+
+    #[test]
+    fn endpoint_without_illuminance_omits_the_light_cluster_everywhere() {
+        let mut component = PlantSensor::new(range(), 0xFFFE, PlantSensorReporting::default())
+            .with_battery(battery())
+            .without_illuminance();
+        assert!(!component.has_illuminance());
+        assert!(component.illuminance().is_none());
+
+        let endpoint = component.configure_endpoint(endpoint_builder());
+        assert_eq!(
+            endpoint.server_clusters.as_slice(),
+            &[
+                ClusterId::BASIC,
+                ClusterId::IDENTIFY,
+                ClusterId::POWER_CONFIG,
+                ClusterId::SOIL_MOISTURE,
+                ClusterId::TEMPERATURE,
+            ]
+        );
+
+        let mut expected = ExpectedReportClusters::new();
+        component.expected_report_cluster_ids(&mut expected);
+        assert_eq!(
+            expected.as_slice(),
+            &[
+                ClusterId::SOIL_MOISTURE.0,
+                ClusterId::TEMPERATURE.0,
+                ClusterId::POWER_CONFIG.0,
+            ]
+        );
+
+        // Updating an absent cluster is a harmless no-op.
+        component.update_illuminance(8_500);
+        let mut clusters = ApplicationClusters::new();
+        component.collect_clusters(1, &mut clusters).unwrap();
+        assert_eq!(clusters.len(), 3);
+    }
+
+    #[test]
+    fn default_reporting_skips_absent_illuminance() {
+        let mut device = ZigbeeDevice::builder(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8]))
+            .endpoint(1, PROFILE_HOME_AUTOMATION, DeviceId::SIMPLE_SENSOR, |ep| {
+                ep.cluster_server(ClusterId::BASIC)
+                    .cluster_server(ClusterId::IDENTIFY)
+                    .cluster_server(ClusterId::POWER_CONFIG)
+                    .cluster_server(ClusterId::SOIL_MOISTURE)
+                    .cluster_server(ClusterId::TEMPERATURE)
+            })
+            .build();
+        let component = PlantSensor::new(range(), 0xFFFE, PlantSensorReporting::default())
+            .with_battery(battery())
+            .without_illuminance();
+        component
+            .configure_default_reporting(1, &mut device)
+            .unwrap();
+        assert_eq!(device.configured_cluster_count(1), 3);
+        assert!(
+            device
+                .reporting()
+                .get_config(
+                    1,
+                    ClusterId::ILLUMINANCE.0,
+                    ReportDirection::Send,
+                    ILLUMINANCE_MEASURED_VALUE,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn separate_soil_and_temperature_updates_write_one_cluster_each() {
+        let mut component = PlantSensor::new(range(), 0xFFFE, PlantSensorReporting::default());
+        component.update_soil_moisture(4_100);
+        assert_eq!(
+            component
+                .soil_moisture()
+                .attributes()
+                .get(SOIL_MOISTURE_MEASURED_VALUE),
+            Some(&ZclValue::U16(4_100))
+        );
+        component.update_temperature(-150);
+        assert_eq!(
+            component
+                .temperature()
+                .attributes()
+                .get(TEMPERATURE_MEASURED_VALUE),
+            Some(&ZclValue::I16(-150))
         );
     }
 
