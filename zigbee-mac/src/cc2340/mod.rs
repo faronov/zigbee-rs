@@ -17,7 +17,7 @@
 //!          ├── generated TI PHY settings and PA table
 //!          ├── direct LRFD trim, synthesizer, and TOPsm setup
 //!          ├── official PBE/MCE/RFE firmware loaded as data
-//!          └── polling FIFO TX/RX with cooperative async yielding
+//!          └── polling FIFO TX/RX, timer-paced so the CPU sleeps between polls
 //! ```
 //!
 //! Each CSMA attempt runs a host-side CCA on the live RX operation (RCL

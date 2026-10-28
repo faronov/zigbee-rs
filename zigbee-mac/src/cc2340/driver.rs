@@ -35,6 +35,8 @@ const CCA_CORR_THRESHOLD: u16 = 3;
 /// start margin for a receiver that CCA had to start itself, rounded up to
 /// 1 ms.
 const CCA_RSSI_WAIT_TICKS: u32 = 1_000 * 4;
+/// Poll interval of every wait on the radio in this driver.
+const RADIO_POLL_INTERVAL_US: u64 = 64;
 /// TI's "RSSI not available" reading.
 const RSSI_INVALID: i8 = 127;
 
@@ -168,6 +170,10 @@ pub struct DriverStats {
 pub struct Cc2340Driver {
     config: RadioConfig,
     images_loaded: bool,
+    /// The PBE/MCE/RFE images are in LRFD RAM. That RAM is retained in
+    /// standby (RCL keeps `lrfState` at `RadioState_ImagesLoaded` on
+    /// `PowerLPF3_AWAKE_STANDBY`), so only the first bring-up copies them.
+    images_resident: bool,
     configured: bool,
     /// Channel or PA level changed since it was last programmed.
     config_dirty: bool,
@@ -192,6 +198,7 @@ impl Cc2340Driver {
         Self {
             config,
             images_loaded: false,
+            images_resident: false,
             configured: false,
             config_dirty: true,
             filter_dirty: true,
@@ -226,9 +233,12 @@ impl Cc2340Driver {
             hardware::start_hfxt()?;
             hardware::enable_hfxt_clock_buffer();
             hardware::enable_radio_clocks()?;
-            if let Err(error) = hardware::load_firmware(images.pbe, images.mce, images.rfe) {
-                hardware::disable_radio_clocks();
-                return Err(error.into());
+            if !self.images_resident {
+                if let Err(error) = hardware::load_firmware(images.pbe, images.mce, images.rfe) {
+                    hardware::disable_radio_clocks();
+                    return Err(error.into());
+                }
+                self.images_resident = true;
             }
             hardware::apply_phy_configuration(phy_writes);
             hardware::route_scheduler_interrupt();
@@ -247,6 +257,7 @@ impl Cc2340Driver {
                 Ok(())
             };
             if let Err(error) = bringup() {
+                self.images_resident = false;
                 hardware::hard_stop();
                 hardware::disable_radio_cores();
                 hardware::disable_synth_refsys();
@@ -295,6 +306,7 @@ impl Cc2340Driver {
             hardware::disable_radio_clocks();
         }
         self.images_loaded = false;
+        self.images_resident = false;
         self.configured = false;
         self.config_dirty = true;
         self.filter_dirty = true;
@@ -451,7 +463,7 @@ impl Cc2340Driver {
             if hardware::timer_ticks().wrapping_sub(started) >= TX_TIMEOUT_TICKS {
                 break;
             }
-            yield_now().await;
+            radio_pause().await;
         }
 
         self.stop_operation()?;
@@ -488,7 +500,7 @@ impl Cc2340Driver {
         while rssi == RSSI_INVALID
             && hardware::timer_ticks().wrapping_sub(started) < CCA_RSSI_WAIT_TICKS
         {
-            yield_now().await;
+            radio_pause().await;
             rssi = hardware::read_rssi();
         }
         let busy = fifo::rx_busy()
@@ -651,7 +663,7 @@ impl Cc2340Driver {
                 fifo::clear_events(events & RX_INFO_EVENTS);
             }
 
-            yield_now().await;
+            radio_pause().await;
         }
     }
 
@@ -710,9 +722,8 @@ impl Cc2340Driver {
         if self.lrfd_lost {
             // RCL on `PowerLPF3_AWAKE_STANDBY` (`rclPowerNotify()`,
             // `rcl/RCL.c`) drops `lrfState` to `RadioState_ImagesLoaded`
-            // so the next command re-runs `LRF_setupRadio()`. Here the
-            // images are reloaded as well (conservative; ~1 ms of copying)
-            // by the same path as the first bring-up.
+            // so the next command re-runs `LRF_setupRadio()` (registers,
+            // trims, synthesizer) without reloading the retained images.
             self.asleep = false;
             self.lrfd_lost = false;
             self.images_loaded = false;
@@ -809,7 +820,7 @@ impl Cc2340Driver {
             && fifo::events() & fifo::EVENT_TERMINAL == 0
             && hardware::timer_ticks().wrapping_sub(started) < RX_BUSY_WAIT_TICKS
         {
-            yield_now().await;
+            radio_pause().await;
         }
     }
 
@@ -968,18 +979,11 @@ fn map_pbe_error(end_cause: u8) -> RadioError {
     }
 }
 
-async fn yield_now() {
-    let mut yielded = false;
-    core::future::poll_fn(|context| {
-        if yielded {
-            core::task::Poll::Ready(())
-        } else {
-            yielded = true;
-            context.waker().wake_by_ref();
-            core::task::Poll::Pending
-        }
-    })
-    .await
+/// Wait between polls of the LRFD state. The executor sleeps (WFE) until
+/// the timer alarm instead of busy-polling at full CPU current; the radio
+/// operations being waited on take hundreds of microseconds to milliseconds.
+async fn radio_pause() {
+    embassy_time::Timer::after_micros(RADIO_POLL_INTERVAL_US).await;
 }
 
 #[cfg(test)]
