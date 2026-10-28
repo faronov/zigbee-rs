@@ -40,6 +40,23 @@
 //! larger logical sectors and verify flash endurance for their traffic rate.
 //! A 16 KiB logical sector means a 32 KiB two-sector partition.
 //!
+//! # Product tag
+//!
+//! Bytes 6..8 of every state record carry a 16-bit product tag. It is covered
+//! by the record CRC and committed atomically with the security state, so a
+//! product can bind a small amount of commissioning-scoped data (for example
+//! which optional sensors the advertised Simple Descriptor was built from) to
+//! exactly the network state it belongs to, without a second flash partition.
+//! Every record version always wrote `0xFFFF` there and no decoder reads it,
+//! so [`SECURITY_JOURNAL_UNTAGGED`] is the value of every existing record and
+//! of every record written by a product that never selects a tag.
+//!
+//! A selected tag ([`SecurityStateJournal::set_product_tag`]) is written by
+//! the next and all later commits. Without a selection, a commit — including
+//! a replay rollover — re-writes the tag of the record it supersedes, so the
+//! tag survives sector rollover and a power cut keeps the previous record
+//! together with its previous tag.
+//!
 //! # Downgrade is not supported
 //!
 //! Once this firmware has written a version 5 record, **downgrading to
@@ -60,6 +77,8 @@ use crate::security_store::{
 };
 
 pub const SECURITY_JOURNAL_SECTOR_SIZE: usize = 4096;
+/// Product tag of a record written without a product selection.
+pub const SECURITY_JOURNAL_UNTAGGED: u16 = 0xFFFF;
 pub const SECURITY_JOURNAL_SLOT_SIZE: usize = 128;
 /// Security-record format epoch that production boot policy must not roll
 /// behind after this firmware has committed a record.
@@ -68,6 +87,7 @@ pub const SECURITY_JOURNAL_SLOTS_PER_SECTOR: usize =
     SECURITY_JOURNAL_SECTOR_SIZE / SECURITY_JOURNAL_SLOT_SIZE;
 
 const RECORD_MAGIC: [u8; 4] = *b"ZBSS";
+const RECORD_TAG_OFFSET: usize = 6;
 const LEGACY_RECORD_VERSION: u8 = 1;
 const V2_RECORD_VERSION: u8 = 2;
 const V3_RECORD_VERSION: u8 = 3;
@@ -126,6 +146,7 @@ pub struct SecurityStateJournal<S, const SECTOR_SIZE: usize = SECURITY_JOURNAL_S
     cached_replay: heapless::Vec<PersistentReplayCounter, MAX_PERSISTENT_REPLAY_COUNTERS>,
     replay_generation: Option<u32>,
     scanned: bool,
+    product_tag: Option<u16>,
 }
 
 #[derive(Clone, Copy)]
@@ -133,6 +154,7 @@ struct LocatedState {
     generation: u32,
     sector: usize,
     state: PersistentSecurityState,
+    tag: u16,
 }
 
 impl<S, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE> {
@@ -176,7 +198,32 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
             cached_replay: heapless::Vec::new(),
             replay_generation: None,
             scanned: false,
+            product_tag: None,
         }
+    }
+
+    /// Select the product tag written by the next and every later commit.
+    ///
+    /// Nothing is written here; the tag becomes durable together with the
+    /// next stored security state (see the module documentation).
+    pub fn set_product_tag(&mut self, tag: u16) {
+        self.product_tag = Some(tag);
+    }
+
+    /// Product tag of the newest committed record, or `None` without one.
+    pub fn product_tag(&mut self) -> Result<Option<u16>, SecurityStoreError> {
+        Ok(self.current()?.map(|located| located.tag))
+    }
+
+    /// Tag for a new record: the selection, else the superseded record's.
+    fn tag_for_commit(&self) -> u16 {
+        self.product_tag
+            .or(self.cached.map(|located| located.tag))
+            .unwrap_or(SECURITY_JOURNAL_UNTAGGED)
+    }
+
+    fn record_tag(record: &[u8; SECURITY_JOURNAL_SLOT_SIZE]) -> u16 {
+        u16::from_le_bytes([record[RECORD_TAG_OFFSET], record[RECORD_TAG_OFFSET + 1]])
     }
 
     pub fn storage(&self) -> &S {
@@ -313,6 +360,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
                     generation,
                     sector,
                     state,
+                    tag: Self::record_tag(&record),
                 };
                 match &mut newest {
                     None => newest = Some(candidate),
@@ -713,10 +761,11 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
         state_slot: usize,
         generation: u32,
         state: &PersistentSecurityState,
+        tag: u16,
         replay: &heapless::Vec<PersistentReplayCounter, MAX_PERSISTENT_REPLAY_COUNTERS>,
     ) -> Result<(), SecurityStoreError> {
         self.write_replay_snapshot(sector, state_slot + 1, generation, replay.as_slice())?;
-        self.write_record(sector, state_slot, generation, state)
+        self.write_record(sector, state_slot, generation, state, tag)
     }
 
     /// Write `state` and the complete `replay` snapshot as `generation`.
@@ -751,19 +800,21 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
             None => (0, 0, true),
         };
         let sector = self.sectors[target];
+        let tag = self.tag_for_commit();
         let result = (|| {
             if erase {
                 self.storage
                     .erase(sector, sector + SECTOR_SIZE as u32)
                     .map_err(|_| SecurityStoreError::Hardware)?;
             }
-            self.activate_generation(target, state_slot, generation, state, replay)
+            self.activate_generation(target, state_slot, generation, state, tag, replay)
         })();
         if result.is_ok() {
             self.cached = Some(LocatedState {
                 generation,
                 sector: target,
                 state: *state,
+                tag,
             });
             self.cached_replay = core::mem::take(replay);
             self.replay_generation = Some(generation);
@@ -806,6 +857,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
         slot: usize,
         generation: u32,
         state: &PersistentSecurityState,
+        tag: u16,
     ) -> Result<(), SecurityStoreError> {
         state.validate()?;
 
@@ -813,6 +865,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
         record[0..4].copy_from_slice(&RECORD_MAGIC);
         record[4] = RECORD_VERSION;
         record[5] = ENCODED_SECURITY_STATE_LEN as u8;
+        record[RECORD_TAG_OFFSET..RECORD_TAG_OFFSET + 2].copy_from_slice(&tag.to_le_bytes());
         record[8..12].copy_from_slice(&generation.to_le_bytes());
         let mut encoded_state = [0u8; ENCODED_SECURITY_STATE_LEN];
         state.encode(&mut encoded_state);
@@ -833,7 +886,9 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
         self.read_slot(sector, slot, &mut verify)?;
         match Self::decode_record(&verify) {
             Some((stored_generation, stored_state))
-                if stored_generation == generation && stored_state == *state =>
+                if stored_generation == generation
+                    && stored_state == *state
+                    && Self::record_tag(&verify) == tag =>
             {
                 Ok(())
             }
@@ -1651,7 +1706,9 @@ mod tests {
         let mut journal =
             SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
         journal.store(sector0).unwrap();
-        journal.write_record(1, 0, 0, sector1).unwrap();
+        journal
+            .write_record(1, 0, 0, sector1, SECURITY_JOURNAL_UNTAGGED)
+            .unwrap();
         journal.storage_mut();
         journal
     }
@@ -2025,6 +2082,102 @@ mod tests {
             journal.load().unwrap().unwrap().global_counter_limit,
             (SECURITY_JOURNAL_SLOTS_PER_SECTOR as u32 + 1) * 0x400
         );
+    }
+
+    #[test]
+    fn untagged_records_keep_the_historical_ff_bytes() {
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        journal.store(&state(0x400)).unwrap();
+        assert_eq!(journal.storage().data[6..8], [0xFF, 0xFF]);
+        assert_eq!(journal.product_tag(), Ok(Some(SECURITY_JOURNAL_UNTAGGED)));
+    }
+
+    #[test]
+    fn product_tag_round_trips_and_is_carried_by_later_commits() {
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        assert_eq!(journal.product_tag(), Ok(None));
+        journal.set_product_tag(0x0005);
+        // Selecting a tag writes nothing by itself.
+        assert_eq!(journal.product_tag(), Ok(None));
+        journal.store(&commissioned_state()).unwrap();
+
+        // A fresh journal instance (reboot) that never selects a tag reads
+        // it back and re-writes it with every later commit.
+        let mut journal = SecurityStateJournal::new(
+            journal.into_storage(),
+            0,
+            SECURITY_JOURNAL_SECTOR_SIZE as u32,
+        );
+        assert_eq!(journal.product_tag(), Ok(Some(0x0005)));
+        let mut next = commissioned_state();
+        next.global_counter_limit = 0x800;
+        journal.store(&next).unwrap();
+        journal.storage_mut();
+        assert_eq!(journal.product_tag(), Ok(Some(0x0005)));
+    }
+
+    #[test]
+    fn product_tag_survives_state_and_replay_rollover() {
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        journal.set_product_tag(0x0102);
+        journal.store(&commissioned_state()).unwrap();
+        let mut journal = SecurityStateJournal::new(
+            journal.into_storage(),
+            0,
+            SECURITY_JOURNAL_SECTOR_SIZE as u32,
+        );
+        // Enough replay entries to force at least two rollovers.
+        let capacity = (SECURITY_JOURNAL_SLOTS_PER_SECTOR - 1) * REPLAY_ENTRIES_PER_SLOT;
+        for counter in 1..=(capacity as u32 * 3) {
+            journal.commit_replay_counter(nwk_replay(counter)).unwrap();
+        }
+        for counter in 2..=(SECURITY_JOURNAL_SLOTS_PER_SECTOR as u32 + 2) {
+            let mut next = commissioned_state();
+            next.global_counter_limit = counter * 0x400;
+            journal.store(&next).unwrap();
+        }
+        journal.storage_mut();
+        assert_eq!(journal.product_tag(), Ok(Some(0x0102)));
+    }
+
+    #[test]
+    fn interrupted_commit_keeps_the_previous_tag() {
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        journal.set_product_tag(0x0001);
+        journal.store(&state(0x400)).unwrap();
+        // A state record is two programs: prefix, then commit marker.
+        for attempt in 0..2 {
+            journal.set_product_tag(0x0002);
+            journal.storage_mut().programs_before_failure = Some(attempt);
+            assert_eq!(
+                journal.store(&state(0x800)),
+                Err(SecurityStoreError::Hardware)
+            );
+            journal.storage_mut().programs_before_failure = None;
+            journal.storage_mut();
+            assert_eq!(journal.product_tag(), Ok(Some(0x0001)));
+            assert_eq!(journal.load().unwrap().unwrap().global_counter_limit, 0x400);
+        }
+        journal.store(&state(0x800)).unwrap();
+        journal.storage_mut();
+        assert_eq!(journal.product_tag(), Ok(Some(0x0002)));
+    }
+
+    #[test]
+    fn corrupt_tag_bytes_invalidate_the_record() {
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        journal.set_product_tag(0x0001);
+        journal.store(&state(0x400)).unwrap();
+        journal.set_product_tag(0x0003);
+        journal.store(&state(0x800)).unwrap();
+        // Flip a tag bit of the newest record: the CRC rejects it.
+        journal.storage_mut().data[SECURITY_JOURNAL_SLOT_SIZE + 6] ^= 0x02;
+        assert_eq!(journal.product_tag(), Ok(Some(0x0001)));
     }
 
     #[test]
