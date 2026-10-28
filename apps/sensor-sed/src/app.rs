@@ -15,10 +15,10 @@
 //! | was | now |
 //! |-----|-----|
 //! | `nrf52840_sensor_product::storage::SecurityStore` | `S: SecurityStateStore` |
-//! | `nrf52840_sensor_product::profile::SensorProfile` | `P: EnvironmentalSensorProfile` |
+//! | `nrf52840_sensor_product::profile::SensorProfile` | `P: SensorProfile` |
 //! | `nrf52840_sensor_product::ENDPOINT` | `profile.endpoint()` (same value) |
 //! | nRF SAADC + product battery curve | `B: BatterySource` |
-//! | `Temp` / `crate::sensor::Sensor` (cfg-selected) | `E: EnvironmentSource` |
+//! | `Temp` / `crate::sensor::Sensor` (cfg-selected) | `E: SensorMeasurement<P>` (any `EnvironmentSource`) |
 //! | Embassy clock/button + radio sleep | `W: WakeController<M>` |
 //! | LED and reset/watchdog | `St: StatusSink`, `Sv: Supervisor` |
 //! | `defmt` calls | `D: Diagnostics` |
@@ -52,7 +52,6 @@
 use zigbee_mac::MacDriver;
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::node::{NodeError, ZigbeeNode};
-use zigbee_runtime::profile::TemperatureHumidityMeasurement;
 use zigbee_runtime::role::EndDevice;
 use zigbee_runtime::security_store::SecurityStateStore;
 
@@ -61,7 +60,7 @@ use crate::capabilities::{
     SensorStatus, StatusSink, Supervisor, WaitRequest, WakeController, WakeReason,
 };
 use crate::diagnostics::{DiagnosticEvent, Diagnostics};
-use crate::environment::{EnvironmentSource, EnvironmentalSensorProfile};
+use crate::measurement::{SampleTrigger, SensorMeasurement, SensorProfile};
 use crate::ota::{OtaActivationOutcome, OtaEventOutcome, OtaLifecycle, is_ota_event};
 use crate::parts::{SensorSedParts, SensorSedResources};
 use crate::policy::{self, SensorPolicy, ShortPressAction, SleepDepth, UserActionPolicy};
@@ -90,7 +89,7 @@ pub struct SensorApp<'a, M, S, P, R>
 where
     M: MacDriver,
     S: SecurityStateStore,
-    P: EnvironmentalSensorProfile,
+    P: SensorProfile,
     R: SensorSedResources<M>,
 {
     node: SensorNode<'a, M, S, P>,
@@ -138,10 +137,10 @@ impl<'a, M, S, P, W, St, E, B, O, A, Sv, D>
 where
     M: MacDriver,
     S: SecurityStateStore,
-    P: EnvironmentalSensorProfile,
+    P: SensorProfile,
     W: WakeController<M>,
     St: StatusSink,
-    E: EnvironmentSource,
+    E: SensorMeasurement<P>,
     B: BatterySource,
     O: OtaLifecycle<M, S, P>,
     A: UserActionPolicy,
@@ -533,31 +532,20 @@ where
         self.rejoin_after_reset().await
     }
 
-    /// Read all sensors and update the profile's environment/battery
+    /// Read all sensors and update the profile's measurement/battery
     /// clusters — unchanged from the original firmware's `read_sensors`:
-    /// a failed environmental read still leaves the previous cluster
-    /// values in place and still proceeds to the battery measurement.
-    async fn read_sensors(&mut self) {
-        match self.resources.environment.sample().await {
-            Ok(reading) => {
-                self.resources
-                    .diagnostics
-                    .record(DiagnosticEvent::Environment(reading));
-                self.node
-                    .profile_mut()
-                    .update_environment(TemperatureHumidityMeasurement {
-                        temperature_centi_celsius: reading.temperature_centi_celsius,
-                        humidity_centi_percent: reading.humidity_centi_percent,
-                    });
-                if let Some(pressure) = reading.pressure_tenth_kpa {
-                    self.node.profile_mut().update_pressure(pressure);
-                }
-            }
-            Err(_) => self
-                .resources
-                .diagnostics
-                .record(DiagnosticEvent::EnvironmentReadFailed),
-        }
+    /// a failed measurement still leaves the previous cluster values in
+    /// place and still proceeds to the battery measurement. What is sampled
+    /// for each `trigger` is the product's [`SensorMeasurement`] decision.
+    async fn read_sensors(&mut self, trigger: SampleTrigger) {
+        self.resources
+            .environment
+            .measure(
+                self.node.profile_mut(),
+                trigger,
+                &mut self.resources.diagnostics,
+            )
+            .await;
 
         match self.resources.battery.sample().await {
             Ok(Some(battery)) => {
@@ -597,7 +585,7 @@ where
                 .set(SensorStatus::Joined { active: true });
         }
 
-        self.read_sensors().await;
+        self.read_sensors(SampleTrigger::ColdStart).await;
 
         if let Err(error) = self.node.configure_default_reporting() {
             self.node_failure(NodeError::Profile(error));
@@ -986,7 +974,7 @@ where
     async fn service_periodic_joined(&mut self, precharged_secs: u16) {
         if self.elapsed_ms(self.last_report) >= self.policy.sample_interval_ms {
             self.last_report = self.mark();
-            self.read_sensors().await;
+            self.read_sensors(SampleTrigger::Periodic).await;
         }
 
         let tick_elapsed = self.take_runtime_elapsed_secs();
@@ -1161,7 +1149,7 @@ where
         self.resources
             .status
             .set(SensorStatus::Reporting { on: true });
-        self.read_sensors().await;
+        self.read_sensors(SampleTrigger::UserRequest).await;
         self.node.device_mut().reporting_mut().force_all_due();
         self.tick_and_handle(0).await;
         self.last_report = self.mark();

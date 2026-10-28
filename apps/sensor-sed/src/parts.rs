@@ -4,13 +4,15 @@ use zigbee_mac::MacDriver;
 
 use crate::capabilities::WakeController;
 
-/// Concrete capabilities owned by one environmental sleepy-sensor instance.
+/// Concrete capabilities owned by one sleepy-sensor instance.
 ///
 /// Grouping the values shortens the public [`crate::SensorApp`] type without
 /// hiding ownership or constructing any peripheral inside reusable code.
 pub struct SensorSedParts<W, St, E, B, O, A, Sv, D> {
     pub wake: W,
     pub status: St,
+    /// The fitted measurement source: any [`crate::EnvironmentSource`] for
+    /// environmental profiles, or a product [`crate::SensorMeasurement`].
     pub environment: E,
     pub battery: B,
     pub ota: O,

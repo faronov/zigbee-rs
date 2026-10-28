@@ -9,7 +9,9 @@
 //!   and the atomic MAC wait/readiness transition;
 //! - [`StatusSink`] maps semantic lifecycle status to fitted indicators;
 //! - [`Supervisor`] owns reset and watchdog servicing;
-//! - [`EnvironmentSource`] and [`BatterySource`] supply fitted measurements;
+//! - [`SensorMeasurement`] (any [`EnvironmentSource`], or a product-specific
+//!   source such as a plant sensor's) and [`BatterySource`] supply fitted
+//!   measurements;
 //! - [`OtaLifecycle`] is explicitly paired with the selected profile;
 //! - [`Diagnostics`] renders typed lifecycle events through a product-selected
 //!   transport;
@@ -26,6 +28,7 @@ pub mod battery;
 pub mod capabilities;
 pub mod diagnostics;
 pub mod environment;
+pub mod measurement;
 pub mod ota;
 pub mod parts;
 pub mod policy;
@@ -42,6 +45,7 @@ pub use environment::{
     BlockingEnvironment, BlockingEnvironmentSource, EnvironmentReading, EnvironmentSink,
     EnvironmentSource, EnvironmentalSensorProfile,
 };
+pub use measurement::{SampleTrigger, SensorMeasurement, SensorProfile};
 pub use ota::{
     NoOta, NonOtaComponent, NonOtaProfile, OtaActivationOutcome, OtaEventOutcome, OtaLifecycle,
     OtaServiceOutcome, is_ota_event,

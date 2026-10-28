@@ -8,8 +8,9 @@ use sensor_sed_app::SensorLifecycleError;
 use sensor_sed_app::{
     BatterySource, ButtonPolicy, DiagnosticEvent, Diagnostics, EnvironmentReading,
     EnvironmentSource, NoOta, NoStatus, NoUserAction, OtaActivationOutcome, OtaEventOutcome,
-    OtaLifecycle, OtaServiceOutcome, SensorApp, SensorPolicy, SensorSedParts, SensorStatus,
-    SleepDepth, StatusPolicy, StatusSink, Supervisor, WaitRequest, WakeController, WakeReason,
+    OtaLifecycle, OtaServiceOutcome, SampleTrigger, SensorApp, SensorMeasurement, SensorPolicy,
+    SensorSedParts, SensorStatus, SleepDepth, StatusPolicy, StatusSink, Supervisor, WaitRequest,
+    WakeController, WakeReason,
 };
 use zigbee_aps::frames::ApsCommandId;
 use zigbee_aps::frames::{ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader};
@@ -25,14 +26,15 @@ use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::event_loop::StackEvent;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::{
-    ApplicationProfile, BatteryDescriptor, DeviceProfile, EnvironmentalReporting,
-    TemperatureHumidityBattery, TemperatureRange,
+    ApplicationProfile, BatteryDescriptor, DeviceProfile, EnvironmentalReporting, PlantSensor,
+    PlantSensorReporting, TemperatureHumidityBattery, TemperatureRange,
 };
 use zigbee_runtime::role::EndDevice;
 use zigbee_runtime::security_store::{
     PersistentSecurityState, RamSecurityStateStore, SecurityStateStore, SecurityStoreError,
 };
 use zigbee_types::{MacAddress, PanId, ShortAddress};
+use zigbee_zcl::clusters::Cluster;
 use zigbee_zcl::frame::{ZclFrameHeader, ZclFrameType};
 use zigbee_zcl::{ClusterDirection, ClusterId, DeviceId};
 
@@ -2269,4 +2271,136 @@ fn activity_wake_polls_the_parent_only_when_the_poll_is_due() {
         resumed.poll_counts[AT + 2] > resumed.poll_counts[AT + 1],
         "the following timer wake polls normally"
     );
+}
+
+type PlantProfile = DeviceProfile<PlantSensor>;
+
+/// Product-style plant measurement: records which trigger the lifecycle
+/// used and writes a soil reading through the profile.
+struct RecordingPlantMeasurement<'a> {
+    triggers: &'a RefCell<Vec<SampleTrigger>>,
+}
+
+impl SensorMeasurement<PlantProfile> for RecordingPlantMeasurement<'_> {
+    async fn measure<D: Diagnostics>(
+        &mut self,
+        profile: &mut PlantProfile,
+        trigger: SampleTrigger,
+        diagnostics: &mut D,
+    ) {
+        self.triggers.borrow_mut().push(trigger);
+        profile.component_mut().update_soil_moisture(4_200);
+        diagnostics.record(DiagnosticEvent::Measurement {
+            cluster_id: ClusterId::SOIL_MOISTURE.0,
+            value: 4_200,
+        });
+    }
+}
+
+#[test]
+fn plant_profile_measurement_receives_cold_start_and_periodic_triggers() {
+    const PLANT_POLICY: SensorPolicy = SensorPolicy {
+        sample_interval_ms: 1_000,
+        ..BASE_POLICY
+    };
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let triggers = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::with_state(commissioned_state(0x01), &store_calls);
+    let mut profile = DeviceProfile::new(
+        1,
+        0x0104,
+        DeviceId::SIMPLE_SENSOR,
+        PlantSensor::new(
+            TemperatureRange {
+                min_centi_celsius: -4_000,
+                max_centi_celsius: 8_500,
+            },
+            0xFFFE,
+            PlantSensorReporting::default(),
+        )
+        .without_illuminance()
+        .with_battery(BatteryDescriptor {
+            size: 10,
+            quantity: 1,
+            rated_voltage_100mv: 30,
+        }),
+    );
+    let mut device = ZigbeeDevice::builder(MockMac::new(LOCAL_IEEE))
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        .power_mode(PLANT_POLICY.power_mode())
+        .automatic_polling(false)
+        .build();
+    device.bdb_mut().initialize().expect("BDB initialize");
+
+    {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let wake: RecordingWake<'_> =
+            RecordingWake::new(0, Vec::new(), &waits, &poll_counts, &delay_calls);
+        let mut app = SensorApp::new(
+            node,
+            &PLANT_POLICY,
+            SensorSedParts {
+                wake,
+                status: NoStatus,
+                environment: RecordingPlantMeasurement {
+                    triggers: &triggers,
+                },
+                battery: CountingBattery {
+                    samples: &battery_samples,
+                },
+                ota: NoOta,
+                actions: NoUserAction,
+                supervisor: RecordingSupervisor {
+                    heartbeats: &heartbeats,
+                },
+                diagnostics: RecordingDiagnostics {
+                    events: &diagnostics,
+                },
+            },
+        )
+        .expect("construct plant sensor app");
+        block_on(app.initialize()).expect("initialize");
+        for _ in 0..200 {
+            if triggers.borrow().len() >= 3 {
+                break;
+            }
+            block_on(app.step()).expect("step");
+        }
+    }
+
+    let triggers = triggers.borrow();
+    assert_eq!(triggers.first(), Some(&SampleTrigger::ColdStart));
+    assert!(
+        triggers[1..]
+            .iter()
+            .all(|trigger| *trigger == SampleTrigger::Periodic)
+    );
+    assert_eq!(triggers.len(), 3, "periodic samples must follow");
+    assert_eq!(battery_samples.get() as usize, triggers.len());
+    assert_eq!(
+        profile
+            .component()
+            .soil_moisture()
+            .attributes()
+            .get(zigbee_zcl::clusters::soil_moisture::ATTR_MEASURED_VALUE),
+        Some(&zigbee_zcl::data_types::ZclValue::U16(4_200))
+    );
+    assert!(diagnostics.borrow().iter().any(|event| matches!(
+        event,
+        DiagnosticEvent::Measurement {
+            cluster_id: 0x0408,
+            value: 4_200
+        }
+    )));
 }
