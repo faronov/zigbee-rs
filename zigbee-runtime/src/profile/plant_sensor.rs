@@ -157,9 +157,9 @@ impl PlantSensor {
     }
 
     /// Update the illuminance reading. `value` must already be encoded per
-    /// ZCL §4.2.2.2.1: `MeasuredValue = 10000 x log10(lux) + 1`. This runtime
-    /// does not depend on `libm`, so the log10 conversion is left to the
-    /// platform/product side where a math library is available.
+    /// ZCL §4.2.2.2.1: `MeasuredValue = 10000 x log10(lux) + 1`; use
+    /// [`zigbee_zcl::clusters::illuminance::measured_value_from_centi_lux`]
+    /// to encode a lux reading without floating point.
     /// No-op if the illuminance cluster was removed.
     pub fn update_illuminance(&mut self, value: u16) {
         if let Some(illuminance) = &mut self.illuminance {

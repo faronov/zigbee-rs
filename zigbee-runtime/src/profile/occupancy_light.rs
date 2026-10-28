@@ -35,10 +35,9 @@ use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
 pub struct OccupancyLightMeasurement {
     pub occupied: bool,
     /// Pre-encoded per ZCL §4.2.2.2.1: `MeasuredValue = 10000 x log10(lux) + 1`
-    /// (0 = too low to measure, 0xFFFF = invalid/unknown). This runtime does
-    /// not depend on `libm`, so it does not compute the log10 conversion
-    /// itself — compute it on the platform/product side where a math library
-    /// is available, then pass the encoded value here.
+    /// (0 = too low to measure, 0xFFFF = invalid/unknown). Encode a lux
+    /// reading with
+    /// [`zigbee_zcl::clusters::illuminance::measured_value_from_centi_lux`].
     pub illuminance_measured_value: u16,
 }
 
