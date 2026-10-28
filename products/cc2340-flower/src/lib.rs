@@ -9,6 +9,7 @@
 #![no_std]
 
 pub mod battery;
+pub mod boot;
 pub mod calibration;
 pub mod detection;
 pub mod measurement;
