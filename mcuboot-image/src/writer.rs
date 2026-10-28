@@ -43,6 +43,8 @@ pub struct SlotWriter<F> {
     stage: [u8; STAGE],
     stage_len: usize,
     verified: bool,
+    /// Set by `erase_slot`: this writer may have left data in the slot.
+    staging: bool,
 }
 
 impl<F: NorFlash> SlotWriter<F> {
@@ -60,6 +62,7 @@ impl<F: NorFlash> SlotWriter<F> {
             stage: [0xFF; STAGE],
             stage_len: 0,
             verified: false,
+            staging: false,
         }
     }
 
@@ -135,6 +138,7 @@ impl<F: NorFlash> SlotWriter<F> {
 impl<F: NorFlash> FirmwareWriter for SlotWriter<F> {
     fn erase_slot(&mut self) -> Result<(), FirmwareError> {
         self.reset();
+        self.staging = true;
         self.erase_at(self.trailer_offset())?;
         self.erase_at(0)
     }
@@ -225,8 +229,17 @@ impl<F: NorFlash> FirmwareWriter for SlotWriter<F> {
         self.layout.slot_size
     }
 
+    /// Drop a staged download. An abort before any `erase_slot` (for
+    /// example a declined offer) leaves the flash untouched: there is
+    /// nothing to drop, and a battery device should not spend a sector
+    /// erase on it.
     fn abort(&mut self) -> Result<(), FirmwareError> {
         self.reset();
-        self.erase_at(self.trailer_offset())
+        if !self.staging {
+            return Ok(());
+        }
+        self.erase_at(self.trailer_offset())?;
+        self.staging = false;
+        Ok(())
     }
 }

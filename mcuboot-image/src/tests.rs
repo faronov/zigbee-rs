@@ -629,6 +629,21 @@ mod writer {
     }
 
     #[test]
+    fn abort_without_staging_does_not_touch_flash() {
+        let mut writer = SlotWriter::new(dirty_flash(V1), LAYOUT, policy(TEST_KEY));
+        let before = writer.flash_mut().operations;
+        writer.abort().unwrap();
+        writer.abort().unwrap();
+        assert_eq!(writer.flash_mut().operations, before);
+        // Once staging started, abort erases the trailer sector once.
+        writer.erase_slot().unwrap();
+        let staged = writer.flash_mut().operations;
+        writer.abort().unwrap();
+        writer.abort().unwrap();
+        assert_eq!(writer.flash_mut().operations, staged + 1);
+    }
+
+    #[test]
     fn power_loss_during_download_never_requests_an_upgrade() {
         let mut reference = SlotWriter::new(dirty_flash(V1), LAYOUT, policy(TEST_KEY));
         download(&mut reference, V2_PAD, 64);
