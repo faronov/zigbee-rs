@@ -1,0 +1,14 @@
+[package]
+name = "zigbee-opt3001"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Blocking embedded-hal TI OPT3001 ambient light sensor driver (single-shot)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+embedded-hal = "1.0"
+
+[dev-dependencies]
+heapless = "0.9"
