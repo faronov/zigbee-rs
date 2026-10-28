@@ -19,6 +19,8 @@ members = [
     "drivers/scd4x",
     "drivers/bh1750",
     "drivers/bme680",
+    "drivers/tmp102",
+    "drivers/opt3001",
     "examples/mock-sensor",
     "examples/mock-coordinator",
     "examples/mock-light",
