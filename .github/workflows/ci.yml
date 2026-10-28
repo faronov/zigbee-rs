@@ -1083,12 +1083,19 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: thumbv6m-none-eabi
-          components: rust-src, llvm-tools
+          components: rust-src, llvm-tools, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/cc2340-sensor
           cache-targets: false
           key: thumbv6m-cc2340-${{ env.RUST_TOOLCHAIN }}-fallback-sdk-${{ env.CC2340_SDK_COMMIT }}-${{ hashFiles('examples/cc2340-sensor/Cargo.lock', 'examples/cc2340-sensor/memory.x') }}
+      - name: Build CC2340R5 HAL boot profile
+        # Bootloaders use the HAL without the Embassy runtime.
+        run: |
+          cargo build --release --locked --target thumbv6m-none-eabi \
+            --manifest-path cc2340r5-hal/Cargo.toml --no-default-features
+          cargo clippy --locked --target thumbv6m-none-eabi \
+            --manifest-path cc2340r5-hal/Cargo.toml --no-default-features -- -D warnings
       - name: Build CC2340 explicit fallback mode
         working-directory: examples/cc2340-sensor
         run: |

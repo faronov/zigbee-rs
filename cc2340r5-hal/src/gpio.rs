@@ -42,6 +42,8 @@ pub const IOC_STANDBY_WAKE_ENABLE: u32 = 0x0004_0000;
 pub const IOC_PULL_UP: u32 = 0x0000_4000;
 /// `IOC_IOCn_PULLCTL_PULL_DOWN`.
 pub const IOC_PULL_DOWN: u32 = 0x0000_2000;
+/// `IOC_IOCn_WUCFGSD_WAKE_LOW`: wake from SHUTDOWN while the pad is low.
+pub const IOC_SHUTDOWN_WAKE_LOW: u32 = 0x0020_0000;
 /// `IOC.IOCn.EDGEDET = EDGE_NEG`: latch falling edges into `GPIO.RIS`.
 pub const IOC_EDGE_NEGATIVE: u32 = 0x0001_0000;
 /// `IOC_IOCn_PORTCFG_M`.
@@ -248,11 +250,18 @@ impl<const DIO: u8> Button<DIO> {
         1u32 << DIO
     }
 
+    /// Let a press wake the chip from SHUTDOWN
+    /// ([`crate::power::shutdown`]); the wake-up is a full reset.
+    #[cfg(target_os = "none")]
+    pub fn enable_shutdown_wake(&mut self) {
+        write_ioc(DIO, BUTTON_IOC_CONFIGURATION | IOC_SHUTDOWN_WAKE_LOW);
+    }
+
     /// Route this button's press (falling edge) to the `GPIO_COMB` IRQ.
     ///
     /// Mirrors TI `GPIO_enableInt()`: stale edges cached in `RIS` are
     /// cleared before the mask is set.
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", feature = "runtime"))]
     pub fn enable_press_interrupt(&mut self) {
         cortex_m::interrupt::free(|_| {
             write_register(GPIO_ICLR, bit(DIO));
@@ -262,15 +271,15 @@ impl<const DIO: u8> Button<DIO> {
     }
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "runtime"))]
 static BUTTON_EDGES: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "runtime"))]
 static BUTTON_WAKER: cortex_m::interrupt::Mutex<core::cell::RefCell<Option<core::task::Waker>>> =
     cortex_m::interrupt::Mutex::new(core::cell::RefCell::new(None));
 
 /// `GPIO_COMB` handler (TI `GPIO_hwiIntFxn()`): latch and clear the masked
 /// edges, then wake the waiting task.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "runtime"))]
 pub(crate) fn on_gpio_interrupt() {
     let events = unsafe { core::ptr::read_volatile(GPIO_MIS as *const u32) };
     write_register(GPIO_ICLR, events);
@@ -285,7 +294,7 @@ pub(crate) fn on_gpio_interrupt() {
 }
 
 /// Take (and clear) the press edges latched since the last call.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "runtime"))]
 pub fn take_button_edges() -> u32 {
     BUTTON_EDGES.swap(0, portable_atomic::Ordering::AcqRel)
 }
@@ -293,7 +302,7 @@ pub fn take_button_edges() -> u32 {
 /// Wait for at least one press edge and return the latched edge mask.
 ///
 /// Uses the interrupt only; the CPU may sleep for the whole wait.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "runtime"))]
 pub async fn wait_for_button_edge() -> u32 {
     core::future::poll_fn(|cx| {
         let edges = take_button_edges();

@@ -168,7 +168,7 @@ type FlashProgramFunction = unsafe extern "C" fn(u32, *const u8, u32, u32) -> u3
 
 #[cfg(target_os = "none")]
 fn erase_sector(address: u32) -> u32 {
-    crate::time::run_flash_operation(|| unsafe {
+    run_flash_operation(|| unsafe {
         let entry = hapi_entry(HAPI_FLASH_SECTOR_ERASE_INDEX);
         let erase: FlashEraseFunction = core::mem::transmute(entry);
         with_cache_disabled(|| erase(FLASH_API_KEY, address))
@@ -177,11 +177,21 @@ fn erase_sector(address: u32) -> u32 {
 
 #[cfg(target_os = "none")]
 fn program(address: u32, bytes: &[u8]) -> u32 {
-    crate::time::run_flash_operation(|| unsafe {
+    run_flash_operation(|| unsafe {
         let entry = hapi_entry(HAPI_FLASH_PROGRAM_INDEX);
         let program: FlashProgramFunction = core::mem::transmute(entry);
         with_cache_disabled(|| program(FLASH_API_KEY, bytes.as_ptr(), address, bytes.len() as u32))
     })
+}
+
+/// Run a flash operation with IRQs masked.
+///
+/// SYSTIM keeps counting through the operation, so the time driver needs no
+/// compensation; a compare that matched meanwhile stays pending and is
+/// serviced as soon as interrupts are re-enabled.
+#[cfg(target_os = "none")]
+fn run_flash_operation<T>(operation: impl FnOnce() -> T) -> T {
+    cortex_m::interrupt::free(|_| operation())
 }
 
 #[cfg(target_os = "none")]

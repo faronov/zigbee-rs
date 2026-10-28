@@ -112,10 +112,10 @@ pub struct StandbyStats {
     pub refused_pending: u32,
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "runtime"))]
 pub use target::{init, standby_until, stats};
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "runtime"))]
 mod target {
     use super::*;
     use portable_atomic::{AtomicU32, Ordering};

@@ -142,6 +142,53 @@ pub fn lf_clock_status() -> u32 {
     unsafe { (CKMD_LFCLKSTAT as *const u32).read_volatile() }
 }
 
+/// `PMCTL` base (`hw_memmap.h`).
+const PMCTL_BASE: u32 = 0x4000_0000;
+/// `PMCTL_O_SHTDWN`.
+const PMCTL_SHTDWN: u32 = PMCTL_BASE + 0x08;
+/// `PMCTL_O_SLPCTL`.
+const PMCTL_SLPCTL: u32 = PMCTL_BASE + 0x0C;
+/// `PMCTL_O_RSTSTA`.
+const PMCTL_RSTSTA: u32 = PMCTL_BASE + 0x30;
+/// `PMCTL_SHTDWN_KEY_VALID`.
+pub const SHUTDOWN_KEY: u32 = 0xA5A5;
+/// `PMCTL_SLPCTL_SLPN_DIS`: I/O pad sleep (latch) disabled.
+const SLPCTL_SLPN_DIS: u32 = 0x1;
+/// `PMCTL_RSTSTA_SDDET`: the last reset was a wake-up from SHUTDOWN.
+const RSTSTA_SDDET: u32 = 0x0002_0000;
+
+/// Whether this boot is a wake-up from SHUTDOWN (`PMCTL.RSTSTA.SDDET`).
+#[cfg(target_os = "none")]
+pub fn woke_from_shutdown() -> bool {
+    unsafe { core::ptr::read_volatile(PMCTL_RSTSTA as *const u32) & RSTSTA_SDDET != 0 }
+}
+
+/// Release the I/O pad latch after a wake-up from SHUTDOWN.
+///
+/// `hw_pmctl.h` (`SLPCTL.SLPN`): the ROM releases the latch on every reset
+/// *except* a SHUTDOWN wake-up, after which software must first configure
+/// its pins and then set `SLPN`. Harmless otherwise.
+#[cfg(target_os = "none")]
+pub fn release_io_latch() {
+    unsafe { core::ptr::write_volatile(PMCTL_SLPCTL as *mut u32, SLPCTL_SLPN_DIS) };
+}
+
+/// Enter SHUTDOWN, the lowest-power state: only I/O wake-up sources
+/// configured with `IOC.WUCFGSD` (see `Button::enable_shutdown_wake`) or a
+/// pin reset leave it, through a full reset.
+///
+/// Writes `PMCTL.SHTDWN = KEY_VALID` (`hw_pmctl.h`). Not yet measured on
+/// hardware; if the device does not enter SHUTDOWN, the core waits for
+/// interrupts with all of them masked.
+#[cfg(target_os = "none")]
+pub fn shutdown() -> ! {
+    cortex_m::interrupt::disable();
+    unsafe { core::ptr::write_volatile(PMCTL_SHTDWN as *mut u32, SHUTDOWN_KEY) };
+    loop {
+        cortex_m::asm::wfi();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

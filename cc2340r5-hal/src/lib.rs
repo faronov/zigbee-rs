@@ -4,13 +4,23 @@
 //! a board: power/clock configuration, standby, the tickless Embassy time
 //! driver, interrupt dispatch, BATMON, internal flash, factory identity,
 //! reset, GPIO/IOC pin ownership, and the I2C, ADC and LGPT PWM drivers.
-//! Board crates map physical wiring onto it through [`take_core`]. It does
+//! Board crates map physical wiring onto it through `take_core`. It does
 //! not link TI Drivers, RCL, FreeRTOS, or ZBOSS; the register sequences
 //! mirror the TI SimpleLink Low Power F3 SDK sources cited in each module.
+//!
+//! The default `runtime` feature provides the application runtime: the
+//! Embassy time driver, interrupt dispatch, standby and `take_core`.
+//! Without it (bootloaders) only `take_boot` is available, which touches no
+//! clock, interrupt or power configuration and leaves the chip as the ROM
+//! started it.
 
 #![no_std]
 // Host builds exist only for the unit tests; register paths are target-only.
-#![cfg_attr(not(target_os = "none"), allow(dead_code))]
+// Bootloader builds (no `runtime`) leave the application drivers unused.
+#![cfg_attr(
+    any(not(target_os = "none"), not(feature = "runtime")),
+    allow(dead_code)
+)]
 
 pub mod adc;
 pub mod batmon;
@@ -19,7 +29,7 @@ pub mod flash;
 pub mod gpio;
 pub mod i2c;
 pub mod identity;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "runtime"))]
 pub mod interrupts;
 pub mod lgpt;
 pub mod power;
@@ -28,7 +38,7 @@ pub mod timebase;
 
 #[cfg(target_os = "none")]
 pub mod reset;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "runtime"))]
 mod time;
 
 #[cfg(target_os = "none")]
@@ -42,7 +52,7 @@ pub const TARGET_PART: &str = "CC2340R52";
 pub const MCU_CLOCK_HZ: u32 = 48_000_000;
 
 /// Chip-level resources, each owned exactly once.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "runtime"))]
 pub struct Core {
     /// DIO pad ownership; boards build LEDs, buttons and peripheral pins
     /// from it.
@@ -64,12 +74,14 @@ static TAKEN: AtomicBool = AtomicBool::new(false);
 
 /// Claim and initialize the chip exactly once.
 ///
+/// Mutually exclusive with [`take_boot`]: the chip can be claimed once.
+///
 /// The VDDR regulator (`regulator`, a board property), flash-LDO-off-in-idle
 /// and the LFOSC LF clock are selected first ([`power`]), the RTC is set up
 /// as standby wake source ([`standby`]) and the tickless Embassy SYSTIM
 /// driver is started. Peripheral clocks stay gated; no pad is configured
 /// until the board claims it.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "runtime"))]
 pub fn take_core(regulator: VddrRegulator) -> Option<Core> {
     if TAKEN
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -90,6 +102,35 @@ pub fn take_core(regulator: VddrRegulator) -> Option<Core> {
         i2c0: i2c::I2c0::new(),
         adc0: adc::Adc0::new(),
         lgpt1: lgpt::Lgpt1::new(),
+    })
+}
+
+/// The minimal resources a bootloader needs.
+#[cfg(target_os = "none")]
+pub struct BootCore {
+    pub pins: gpio::Pins,
+    pub flash: flash::InternalFlash,
+    pub reset: reset::SystemReset,
+}
+
+/// Claim the chip for a bootloader exactly once.
+///
+/// Unlike `take_core` this changes no power, clock, standby or interrupt
+/// configuration, so the application starts from the ROM boot state and
+/// performs its own initialization. Flash operations mask interrupts and
+/// rely on the ROM HAPI only.
+#[cfg(target_os = "none")]
+pub fn take_boot() -> Option<BootCore> {
+    if TAKEN
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    Some(BootCore {
+        pins: gpio::Pins::new(),
+        flash: flash::InternalFlash::new(),
+        reset: reset::SystemReset::new(),
     })
 }
 

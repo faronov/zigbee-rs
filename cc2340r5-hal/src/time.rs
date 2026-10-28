@@ -113,12 +113,3 @@ fn rearm(state: &mut State) {
         }
     }
 }
-
-/// Run a flash operation with IRQs masked.
-///
-/// SYSTIM keeps counting through the operation, so no time compensation is
-/// needed; a compare that matched meanwhile stays pending and is serviced
-/// as soon as interrupts are re-enabled.
-pub(crate) fn run_flash_operation<T>(operation: impl FnOnce() -> T) -> T {
-    cortex_m::interrupt::free(|_| operation())
-}
