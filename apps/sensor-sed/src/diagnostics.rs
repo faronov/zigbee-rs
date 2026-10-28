@@ -42,6 +42,17 @@ pub enum DiagnosticEvent {
     },
     Environment(EnvironmentReading),
     EnvironmentReadFailed,
+    /// A product-specific [`crate::SensorMeasurement`] updated one cluster's
+    /// measured value. `value` is the raw ZCL attribute value.
+    Measurement {
+        cluster_id: u16,
+        value: i32,
+    },
+    /// A product-specific measurement for `cluster_id` failed; the previous
+    /// cluster value was kept.
+    MeasurementFailed {
+        cluster_id: u16,
+    },
     BatteryReadFailed,
     Battery {
         millivolts: u32,

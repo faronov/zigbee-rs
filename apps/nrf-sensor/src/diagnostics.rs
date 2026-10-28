@@ -94,6 +94,12 @@ impl Diagnostics for NrfDiagnostics {
             DiagnosticEvent::EnvironmentReadFailed => {
                 defmt::warn!("Environmental sensor read failed")
             }
+            DiagnosticEvent::Measurement { cluster_id, value } => {
+                defmt::info!("Cluster 0x{:04x} measured {}", cluster_id, value)
+            }
+            DiagnosticEvent::MeasurementFailed { cluster_id } => {
+                defmt::warn!("Cluster 0x{:04x} measurement failed", cluster_id)
+            }
             DiagnosticEvent::BatteryReadFailed => defmt::warn!("Battery read failed"),
             DiagnosticEvent::Battery {
                 millivolts,
