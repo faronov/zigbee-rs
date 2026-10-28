@@ -75,6 +75,9 @@ pub struct OtaSession {
     cleanup_pending: bool,
     /// Set when a verified image is waiting for the application's checkpoint.
     activation_pending: bool,
+    /// Server whose offer is waiting for [`Self::accept_offer`]
+    /// (`auto_accept = false` only).
+    offer_server: Option<(u16, u8)>,
 }
 
 impl OtaSession {
@@ -84,6 +87,74 @@ impl OtaSession {
             server: None,
             cleanup_pending: false,
             activation_pending: false,
+            offer_server: None,
+        }
+    }
+
+    /// Send a client-initiated Query Next Image Request to `server`
+    /// (short address, endpoint), for example on a periodic schedule.
+    ///
+    /// Returns `None` without sending anything while a transfer or an
+    /// unanswered query is in flight, so a periodic query never interleaves
+    /// into a running download. The server's response is then accepted by
+    /// [`Self::handle_event`] exactly like one that follows an Image Notify.
+    pub async fn query_next_image<M: MacDriver, F: FirmwareWriter>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        manager: &mut OtaManager<F>,
+        server: (u16, u8),
+    ) -> Option<StackEvent> {
+        if self.server.is_some() || self.activation_pending || Self::is_active(manager) {
+            return None;
+        }
+        self.server = Some(server);
+        self.offer_server = None;
+        let status = manager.start_query();
+        self.note_status(&status);
+        self.send_pending(device, manager).await;
+        if manager.state() == OtaState::Idle {
+            self.server = None;
+        }
+        status
+    }
+
+    /// Whether an offer reported by [`StackEvent::OtaImageAvailable`] is
+    /// waiting for [`Self::accept_offer`] or [`Self::decline_offer`].
+    pub fn offer_pending<F: FirmwareWriter>(&self, manager: &OtaManager<F>) -> bool {
+        self.offer_server.is_some() && manager.offered_image().is_some()
+    }
+
+    /// Accept the image the server offered (`auto_accept = false`).
+    ///
+    /// Re-queries the server that made the offer; the download starts only
+    /// if it offers exactly the same image again (see
+    /// [`OtaManager::accept_ota`]). Returns `None` when no offer is pending
+    /// or another server has started a transfer meanwhile.
+    pub async fn accept_offer<M: MacDriver, F: FirmwareWriter>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        manager: &mut OtaManager<F>,
+    ) -> Option<StackEvent> {
+        let server = self.offer_server.take()?;
+        if manager.offered_image().is_none() || self.server.is_some_and(|busy| busy != server) {
+            return None;
+        }
+        self.server = Some(server);
+        let status = manager.accept_ota();
+        self.note_status(&status);
+        self.send_pending(device, manager).await;
+        if manager.state() == OtaState::Idle {
+            self.server = None;
+        }
+        status
+    }
+
+    /// Discard a pending offer, for example because product policy (a low
+    /// battery) does not allow a download now. Nothing is sent; the server
+    /// may offer the image again on the next query.
+    pub fn decline_offer<F: FirmwareWriter>(&mut self, manager: &mut OtaManager<F>) {
+        if self.offer_server.take().is_some() && !Self::is_active(manager) {
+            manager.abort();
         }
     }
 
@@ -168,6 +239,11 @@ impl OtaSession {
             None,
         );
         self.note_status(&status);
+        if matches!(status, Some(StackEvent::OtaImageAvailable { .. }))
+            && manager.offered_image().is_some()
+        {
+            self.offer_server = Some(sender);
+        }
         self.send_pending(device, manager).await;
         if manager.state() == OtaState::Idle {
             self.server = None;
@@ -564,6 +640,132 @@ mod tests {
             "traffic from a second server must not be forwarded to the manager"
         );
         assert_eq!(mgr.state(), OtaState::QuerySent);
+    }
+
+    fn manual_manager(endpoint: u8) -> OtaManager<MockFirmwareWriter> {
+        OtaManager::new(
+            MockFirmwareWriter::new(4096),
+            OtaConfig {
+                manufacturer_code: 0x1234,
+                image_type: 0x0001,
+                current_version: 1,
+                endpoint,
+                block_size: 48,
+                auto_accept: false,
+                hardware_version: None,
+            },
+        )
+    }
+
+    fn query_response(server: (u16, u8), version: u32, size: u32) -> StackEvent {
+        command_event(
+            server,
+            ENDPOINT,
+            ClusterId::OTA_UPGRADE.0,
+            CMD_QUERY_NEXT_IMAGE_RESPONSE.0,
+            &query_response_bytes(version, size),
+        )
+    }
+
+    #[test]
+    fn client_initiated_query_accepts_the_servers_response() {
+        let mut session = OtaSession::new();
+        let mut device = joined_device();
+        let mut mgr = manager(ENDPOINT);
+        let sent_before = device.mac_mut().tx_history().len();
+
+        let status = block_on(session.query_next_image(&mut device, &mut mgr, SERVER_A));
+        assert!(status.is_none());
+        assert_eq!(mgr.state(), OtaState::QuerySent);
+        assert_eq!(device.mac_mut().tx_history().len(), sent_before + 1);
+
+        // A second periodic query while one is outstanding sends nothing.
+        assert!(block_on(session.query_next_image(&mut device, &mut mgr, SERVER_A)).is_none());
+        assert_eq!(device.mac_mut().tx_history().len(), sent_before + 1);
+
+        // Only the queried server's response is accepted.
+        let outcome = block_on(session.handle_event(
+            &mut device,
+            &mut mgr,
+            ENDPOINT,
+            &query_response(SERVER_B, 2, 64),
+        ));
+        assert!(matches!(outcome, OtaEventOutcome::Ignored));
+        let outcome = block_on(session.handle_event(
+            &mut device,
+            &mut mgr,
+            ENDPOINT,
+            &query_response(SERVER_A, 2, 64),
+        ));
+        assert!(matches!(
+            outcome,
+            OtaEventOutcome::Consumed(Some(StackEvent::OtaImageAvailable { version: 2, .. }))
+        ));
+        assert!(matches!(mgr.state(), OtaState::Downloading { .. }));
+    }
+
+    #[test]
+    fn offers_wait_for_acceptance_and_can_be_declined() {
+        let mut session = OtaSession::new();
+        let mut device = joined_device();
+        let mut mgr = manual_manager(ENDPOINT);
+
+        block_on(session.query_next_image(&mut device, &mut mgr, SERVER_A));
+        let outcome = block_on(session.handle_event(
+            &mut device,
+            &mut mgr,
+            ENDPOINT,
+            &query_response(SERVER_A, 2, 64),
+        ));
+        assert!(matches!(
+            outcome,
+            OtaEventOutcome::Consumed(Some(StackEvent::OtaImageAvailable { version: 2, .. }))
+        ));
+        assert_eq!(mgr.state(), OtaState::Idle);
+        assert!(session.offer_pending(&mgr));
+
+        session.decline_offer(&mut mgr);
+        assert!(!session.offer_pending(&mgr));
+        assert!(mgr.offered_image().is_none());
+        let sent_before = device.mac_mut().tx_history().len();
+        assert!(block_on(session.accept_offer(&mut device, &mut mgr)).is_none());
+        assert_eq!(device.mac_mut().tx_history().len(), sent_before);
+    }
+
+    #[test]
+    fn accepted_offer_requeries_the_offering_server_and_downloads() {
+        let mut session = OtaSession::new();
+        let mut device = joined_device();
+        let mut mgr = manual_manager(ENDPOINT);
+
+        block_on(session.handle_event(
+            &mut device,
+            &mut mgr,
+            ENDPOINT,
+            &image_notify(SERVER_A, ENDPOINT),
+        ));
+        block_on(session.handle_event(
+            &mut device,
+            &mut mgr,
+            ENDPOINT,
+            &query_response(SERVER_A, 2, 64),
+        ));
+        assert!(session.offer_pending(&mgr));
+
+        let sent_before = device.mac_mut().tx_history().len();
+        assert!(block_on(session.accept_offer(&mut device, &mut mgr)).is_none());
+        assert_eq!(mgr.state(), OtaState::QuerySent);
+        assert_eq!(device.mac_mut().tx_history().len(), sent_before + 1);
+
+        let outcome = block_on(session.handle_event(
+            &mut device,
+            &mut mgr,
+            ENDPOINT,
+            &query_response(SERVER_A, 2, 64),
+        ));
+        assert!(matches!(outcome, OtaEventOutcome::Consumed(None)));
+        assert!(matches!(mgr.state(), OtaState::Downloading { .. }));
+        assert!(!session.offer_pending(&mgr));
     }
 
     /// Build a Query Next Image Response advertising `total_size` bytes at
