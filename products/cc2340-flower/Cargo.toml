@@ -1,0 +1,37 @@
+[package]
+name = "cc2340-flower-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product policy, sensor detection and persistence for the CC2340R5 flower soil sensor"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone like the other CC2340 product crates; consumed by path.
+[workspace]
+
+[features]
+default = ["koptserg"]
+# Soil-probe calibration of koptserg's own board build.
+koptserg = []
+# Soil-probe calibration of the DIYZi board build.
+diyzi = []
+
+[dependencies]
+embedded-hal = "1.0"
+embedded-hal-async = "1.0"
+embedded-storage = "0.3"
+sensor-sed-app = { path = "../../apps/sensor-sed" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-bh1750 = { path = "../../drivers/bh1750" }
+zigbee-opt3001 = { path = "../../drivers/opt3001" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-tmp102 = { path = "../../drivers/tmp102" }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[target.'cfg(target_os = "none")'.dependencies]
+flower-cc2340r5 = { path = "../../boards/flower-cc2340r5" }
+
+[dev-dependencies]
+zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
+heapless = "0.9"
