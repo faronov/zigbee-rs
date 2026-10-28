@@ -108,6 +108,10 @@ jobs:
             manifest: products/cc2340-sensor/Cargo.toml
             workspace: products/cc2340-sensor
             features: ""
+          - name: CC2340R5 HAL
+            manifest: cc2340r5-hal/Cargo.toml
+            workspace: cc2340r5-hal
+            features: ""
           - name: ESP32-C6 sensor product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
@@ -242,6 +246,7 @@ jobs:
           cargo fmt --manifest-path products/nrf52833-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path boards/lp-em-cc2340r5/Cargo.toml -- --check
           cargo fmt --manifest-path products/cc2340-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path cc2340r5-hal/Cargo.toml -- --check
           cargo fmt --manifest-path products/nrf52840-router/Cargo.toml -- --check
           cargo fmt --manifest-path boards/nrf52840-mdk-usb-dongle/Cargo.toml -- --check
           cargo fmt --manifest-path boards/nrf52840-pca10059/Cargo.toml -- --check
