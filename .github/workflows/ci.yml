@@ -114,6 +114,10 @@ jobs:
             features: ""
           # Workspace member; its optional firmware-writer and compact
           # SHA-256 paths are not covered by the plain workspace test run.
+          - name: CC2340R5 loader core
+            manifest: bootloaders/cc2340r5-boot/Cargo.toml
+            workspace: bootloaders/cc2340r5-boot
+            features: ""
           - name: MCUboot image firmware writer
             manifest: mcuboot-image/Cargo.toml
             workspace: .
@@ -253,6 +257,7 @@ jobs:
           cargo fmt --manifest-path boards/lp-em-cc2340r5/Cargo.toml -- --check
           cargo fmt --manifest-path products/cc2340-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path cc2340r5-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path bootloaders/cc2340r5-boot/Cargo.toml -- --check
           cargo fmt --manifest-path products/nrf52840-router/Cargo.toml -- --check
           cargo fmt --manifest-path boards/nrf52840-mdk-usb-dongle/Cargo.toml -- --check
           cargo fmt --manifest-path boards/nrf52840-pca10059/Cargo.toml -- --check
@@ -1089,13 +1094,17 @@ jobs:
           workspaces: examples/cc2340-sensor
           cache-targets: false
           key: thumbv6m-cc2340-${{ env.RUST_TOOLCHAIN }}-fallback-sdk-${{ env.CC2340_SDK_COMMIT }}-${{ hashFiles('examples/cc2340-sensor/Cargo.lock', 'examples/cc2340-sensor/memory.x') }}
-      - name: Build CC2340R5 HAL boot profile
+      - name: Build CC2340R5 HAL boot profile and loader core
         # Bootloaders use the HAL without the Embassy runtime.
         run: |
           cargo build --release --locked --target thumbv6m-none-eabi \
             --manifest-path cc2340r5-hal/Cargo.toml --no-default-features
           cargo clippy --locked --target thumbv6m-none-eabi \
             --manifest-path cc2340r5-hal/Cargo.toml --no-default-features -- -D warnings
+          cargo build --release --locked --target thumbv6m-none-eabi \
+            --manifest-path bootloaders/cc2340r5-boot/Cargo.toml
+          cargo clippy --locked --target thumbv6m-none-eabi \
+            --manifest-path bootloaders/cc2340r5-boot/Cargo.toml -- -D warnings
       - name: Build CC2340 explicit fallback mode
         working-directory: examples/cc2340-sensor
         run: |

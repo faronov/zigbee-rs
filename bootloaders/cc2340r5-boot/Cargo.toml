@@ -1,0 +1,18 @@
+[package]
+name = "cc2340r5-boot"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust MCUboot-compatible overwrite-only bootloader core for the CC2340R5"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone like cc2340r5-hal; a product's bootloader binary consumes it.
+[workspace]
+
+[dependencies]
+mcuboot-image = { path = "../../mcuboot-image", features = ["compact-sha256"] }
+
+[target.'cfg(target_os = "none")'.dependencies]
+cc2340r5-hal = { path = "../../cc2340r5-hal", default-features = false }
+cortex-m = "0.7"
