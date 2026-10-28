@@ -152,7 +152,7 @@ async fn main(_spawner: Spawner) {
     }
 
     log::warn!(
-        "[CC2340] environment={:?}; battery={:?}; humidity is synthetic until a sensor is fitted",
+        "[CC2340] environment={:?}; battery={:?}; humidity is a synthetic drift until a sensor is fitted",
         product::environment::source_disposition(),
         product::battery::source_disposition()
     );

@@ -28,7 +28,7 @@ LED/button resources, reset, identity, and flash:
 | Button 2 | 14 |
 
 The product owns identity/profile, BATMON die temperature and VDDS battery
-(humidity stays synthetic until a sensor is fitted), `Active`/`Active` policy, the linker map, and the security partition.
+(humidity is a slow synthetic drift, 35–65 %RH over 80 min, until a sensor is fitted), `Active`/`Active` policy, the linker map, and the security partition.
 This composition root maps the raw board buttons and LEDs to the selected wake
 and status behavior, and installs RTT diagnostics and reset supervision.
 
