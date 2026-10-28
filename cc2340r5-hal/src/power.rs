@@ -1,13 +1,14 @@
-//! Board-level power configuration for LP-EM-CC2340R5.
+//! Chip-level power configuration for the CC2340R52.
 //!
-//! Applied once from [`crate::take`], before any other driver runs:
+//! Applied once from [`crate::take_core`], before any other driver runs:
 //!
-//! * **DC/DC regulator for VDDR.** The LaunchPad populates the DC/DC
-//!   inductor; TI's generated `Board_init()`
+//! * **DC/DC regulator for VDDR** when the board fits the DC/DC inductor
+//!   ([`VddrRegulator::DcDc`]; the board crate decides). TI's generated
+//!   `Board_init()`
 //!   (`source/ti/drivers/.meta/power/PowerCC23X0.Board_init.c.xdt`) calls
 //!   `PMCTLSetVoltageRegulator(PMCTL_VOLTAGE_REGULATOR_DCDC)` for it after
-//!   `Power_init()`. The ROM leaves the GLDO selected. Measured on this board
-//!   (radio gated, CPU sleeping): 2.73 mA with GLDO -> 1.82 mA with DC/DC, and
+//!   `Power_init()`. The ROM leaves the GLDO selected. Measured on
+//!   LP-EM-CC2340R5 (radio gated, CPU sleeping): 2.73 mA with GLDO -> 1.82 mA with DC/DC, and
 //!   the +5 dBm poll peak dropped from ~19 mA to ~10.6 mA.
 //! * **Flash LDO off in idle** (`CLKCTL.IDLECFG.MODE = LDO_OFF`). The flash is
 //!   powered down while the CPU sleeps and restarted (a few µs) on wake.
@@ -17,7 +18,7 @@
 //! * **LFOSC (internal 32 kHz RC) as LF clock.** After reset
 //!   `CKMD.LFCLKSEL` is `FAKE` (LF ticks derived from the HF clock), which
 //!   stops in standby, so the RTC could never wake the device. TI's CCFG
-//!   default is `LF XOSC`, but on this LP-EM-CC2340R5 the 32.768 kHz crystal
+//!   default is `LF XOSC`, but on the LP-EM-CC2340R5 the 32.768 kHz crystal
 //!   does not run: with `PowerLPF3_selectLFXT()` mirrored, `LFCLKSTAT` stayed
 //!   `0x01DE_8000` (GOOD=0, tick/inc source FAKE) with `RIS.LFCLKLOSS` and
 //!   `RIS.LFCLKOOR` set, and the LaunchPad quick-start guide (SWRU588A) routes
@@ -75,15 +76,28 @@ pub const LFCLKSTAT_LFINCSRC_M: u32 = 0x00C0_0000;
 /// `CKMD_LFCLKSTAT_LFINCSRC_FAKE`.
 pub const LFCLKSTAT_LFINCSRC_FAKE: u32 = 0x00C0_0000;
 
-/// Select the DC/DC regulator and switch the flash LDO off during idle.
+/// VDDR regulator fitted on the board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VddrRegulator {
+    /// Keep the ROM default global LDO (no DC/DC inductor fitted).
+    GlobalLdo,
+    /// Switch to the DC/DC converter (`PMCTLSetVoltageRegulator(DCDC)`);
+    /// only valid when the board populates the DC/DC inductor.
+    DcDc,
+}
+
+/// Select the VDDR regulator, switch the flash LDO off during idle and
+/// select LFOSC.
 #[cfg(target_os = "none")]
-pub(crate) fn init() {
+pub(crate) fn init(regulator: VddrRegulator) {
     // SAFETY: fixed, always-present CC2340R52 PMCTL/CLKCTL registers; called
-    // once from `take()` before any concurrent user exists.
+    // once from `take_core()` before any concurrent user exists.
     unsafe {
-        let vddrctl = PMCTL_VDDRCTL as *mut u32;
-        // PMCTLSetVoltageRegulator(): preserve the other VDDRCTL fields.
-        vddrctl.write_volatile(vddrctl.read_volatile() | VDDRCTL_SELECT_DCDC);
+        if regulator == VddrRegulator::DcDc {
+            let vddrctl = PMCTL_VDDRCTL as *mut u32;
+            // PMCTLSetVoltageRegulator(): preserve the other VDDRCTL fields.
+            vddrctl.write_volatile(vddrctl.read_volatile() | VDDRCTL_SELECT_DCDC);
+        }
         (CLKCTL_IDLECFG as *mut u32).write_volatile(IDLECFG_MODE_LDO_OFF);
     }
     select_lfosc();

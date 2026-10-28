@@ -8,7 +8,7 @@ use cortex_m::interrupt::InterruptNumber;
 use cortex_m_rt::exception;
 use portable_atomic::{AtomicU32, Ordering};
 
-/// Device interrupts used by this board crate.
+/// Device interrupts used by this HAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Irq {
@@ -47,7 +47,7 @@ pub(crate) fn unpend(irq: Irq) {
 #[exception]
 unsafe fn DefaultHandler(irqn: i16) {
     match irqn {
-        5 => crate::pins::on_gpio_interrupt(),
+        5 => crate::gpio::on_gpio_interrupt(),
         16 => crate::time::on_interrupt(),
         n if n >= 0 => {
             // Mask the unexpected source instead of hanging the device.

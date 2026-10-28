@@ -61,7 +61,7 @@ pub struct Batmon {
 
 #[cfg(target_os = "none")]
 impl Batmon {
-    /// Start continuous measurement. Called once from [`crate::take`].
+    /// Start continuous measurement. Called once from [`crate::take_core`].
     pub(crate) fn init() -> Self {
         // SAFETY: PMUD.CTL is a valid, always-on MMIO register.
         unsafe { core::ptr::write_volatile(PMUD_CTL as *mut u32, CTL_ENABLE) };
