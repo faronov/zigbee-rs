@@ -108,6 +108,22 @@ jobs:
             manifest: products/cc2340-sensor/Cargo.toml
             workspace: products/cc2340-sensor
             features: ""
+          - name: CC2340R5 HAL
+            manifest: cc2340r5-hal/Cargo.toml
+            workspace: cc2340r5-hal
+            features: ""
+          - name: CC2340 flower board
+            manifest: boards/flower-cc2340r5/Cargo.toml
+            workspace: boards/flower-cc2340r5
+            features: ""
+          - name: CC2340 flower product (koptserg)
+            manifest: products/cc2340-flower/Cargo.toml
+            workspace: products/cc2340-flower
+            features: koptserg
+          - name: CC2340 flower product (DIYZi)
+            manifest: products/cc2340-flower/Cargo.toml
+            workspace: products/cc2340-flower
+            features: diyzi
           - name: ESP32-C6 sensor product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
@@ -242,6 +258,9 @@ jobs:
           cargo fmt --manifest-path products/nrf52833-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path boards/lp-em-cc2340r5/Cargo.toml -- --check
           cargo fmt --manifest-path products/cc2340-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path cc2340r5-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/flower-cc2340r5/Cargo.toml -- --check
+          cargo fmt --manifest-path products/cc2340-flower/Cargo.toml -- --check
           cargo fmt --manifest-path products/nrf52840-router/Cargo.toml -- --check
           cargo fmt --manifest-path boards/nrf52840-mdk-usb-dongle/Cargo.toml -- --check
           cargo fmt --manifest-path boards/nrf52840-pca10059/Cargo.toml -- --check
@@ -254,6 +273,7 @@ jobs:
           cargo fmt --manifest-path examples/esp32c6-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/esp32h2-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/cc2340-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/cc2340-flower/Cargo.toml -- --check
           cargo fmt --manifest-path examples/phy6222-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg1-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg21-sensor/Cargo.toml -- --check
@@ -1153,6 +1173,68 @@ jobs:
             examples/cc2340-sensor/target/sdk/thumbv6m-none-eabi/release/cc2340-sensor.hex
             examples/cc2340-sensor/target/sdk/thumbv6m-none-eabi/release/cc2340-sensor.size.json
           if-no-files-found: error
+
+  build-cc2340-flower:
+    name: Build CC2340 flower sensor
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [koptserg, diyzi]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv6m-none-eabi
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: examples/cc2340-flower
+          cache-targets: false
+          key: thumbv6m-cc2340-flower-${{ matrix.variant }}-${{ env.RUST_TOOLCHAIN }}-sdk-${{ env.CC2340_SDK_COMMIT }}-${{ hashFiles('examples/cc2340-flower/Cargo.lock', 'examples/cc2340-flower/memory.x') }}
+      - name: Check out pinned TI radio sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: TexasInstruments/simplelink-lowpower-f3-sdk
+          ref: ${{ env.CC2340_SDK_COMMIT }}
+          path: .ci/simplelink-lowpower-f3-sdk
+          fetch-depth: 1
+          sparse-checkout: |
+            source/ti/devices/cc23x0r5
+            source/ti/devices/radioconfig
+      - name: Build CC2340 flower pinned-SDK mode
+        working-directory: examples/cc2340-flower
+        env:
+          CC2340_SDK_DIR: ${{ github.workspace }}/.ci/simplelink-lowpower-f3-sdk
+        run: |
+          cargo build --release --locked --no-default-features \
+            --features ${{ matrix.variant }} --target-dir target/sdk
+      - name: Check CC2340 flower layout and role gates
+        run: |
+          ELF=examples/cc2340-flower/target/sdk/thumbv6m-none-eabi/release/cc2340-flower
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          LAYOUT="$("$NM" -n "$ELF")"
+          if ! grep -q '^0007d800 A _detection_partition_start$' <<<"$LAYOUT" ||
+             ! grep -q '^0007e000 A _security_partition_start$' <<<"$LAYOUT" ||
+             ! grep -q '^00080000 A _security_partition_end$' <<<"$LAYOUT"; then
+            echo "CC2340 flower linker symbols do not preserve 0x7D800..0x80000" >&2
+            exit 1
+          fi
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if "$NM" --demangle "$ELF" | grep -Eq "($PARENT_SYMS)"; then
+            echo "CC2340 flower sensor links parent/router maintenance symbols" >&2
+            exit 1
+          fi
+          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+          PHYSICAL_BYTES=$(stat -c '%s' "${ELF}.bin")
+          if (( PHYSICAL_BYTES > 0x7D800 )); then
+            echo "CC2340 flower application is ${PHYSICAL_BYTES} B; the detection sector starts at 0x7D800" >&2
+            exit 1
+          fi
+          ./tools/firmware-size-report.sh \
+            cc2340-flower-${{ matrix.variant }} "${ELF}.bin" "${ELF}.size.json"
 
   # ── Telink TLSR8258 (tc32) ───────────────────────────────────
   # Built by .github/workflows/build-tc32.yml using the public
