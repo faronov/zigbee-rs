@@ -857,18 +857,41 @@ fn ota_manager_retries_expected_block_after_deadline() {
         .expect("first logical retry must be queued");
     assert_eq!(pending_block_offset(&retry), 0);
     assert_eq!(retry.zcl_data[1], initial_seq);
+}
 
-    for _ in 0..2 {
-        assert!(manager.tick(2).is_none());
-        let retry = manager
-            .take_pending_frame()
-            .expect("bounded logical retry must be queued");
-        assert_eq!(pending_block_offset(&retry), 0);
-        assert_eq!(retry.zcl_data[1], initial_seq);
+/// The client keeps re-sending an unanswered block request (2 s backoff
+/// growing to a 5 s ceiling) until the response timeout, instead of going
+/// quiet after a few retries: zigpy abandons a transfer after 30 s without
+/// progress.
+#[test]
+fn ota_manager_block_retries_continue_until_the_response_timeout() {
+    use zigbee_runtime::event_loop::StackEvent;
+
+    let mut manager = ota_manager_waiting_for_first_block();
+    let initial = manager
+        .take_pending_frame()
+        .expect("initial block request must be queued");
+    let initial_seq = initial.zcl_data[1];
+
+    let mut retry_times = Vec::new();
+    for second in 1..120u32 {
+        assert!(manager.tick(1).is_none());
+        if let Some(retry) = manager.take_pending_frame() {
+            assert_eq!(pending_block_offset(&retry), 0);
+            assert_eq!(retry.zcl_data[1], initial_seq);
+            retry_times.push(second);
+        }
     }
+    // 2, 5, 9, then every 5 s up to 119 s.
+    assert_eq!(&retry_times[..4], &[2, 5, 9, 14]);
+    assert_eq!(retry_times.len(), 25);
+    assert!(retry_times.windows(2).all(|gap| gap[1] - gap[0] <= 5));
+    assert_eq!(*retry_times.last().unwrap(), 119);
 
-    assert!(manager.tick(2).is_none());
-    assert!(manager.take_pending_frame().is_none());
+    // Nothing was staged, so the timeout ends the session for good.
+    assert!(matches!(manager.tick(1), Some(StackEvent::OtaFailed)));
+    assert_eq!(manager.state(), OtaState::Idle);
+    assert!(!manager.is_suspended());
 }
 
 #[test]
@@ -1233,4 +1256,340 @@ fn esp_ota_container_round_trip_preserves_the_application_image() {
     );
     assert_eq!(mgr.writer().data(), image.as_slice());
     assert_eq!(mgr.state(), OtaState::WaitingActivate);
+}
+
+// ── Resume after an interrupted download ────────────────────────
+
+const RESUME_MFG: u16 = 0x1234;
+const RESUME_TYPE: u16 = 0x0001;
+
+fn resume_manager(
+    auto_accept: bool,
+) -> zigbee_runtime::ota::OtaManager<zigbee_runtime::firmware_writer::MockFirmwareWriter> {
+    use zigbee_runtime::firmware_writer::MockFirmwareWriter;
+    use zigbee_runtime::ota::{OtaConfig, OtaManager};
+
+    OtaManager::new(
+        MockFirmwareWriter::new(4096),
+        OtaConfig {
+            manufacturer_code: RESUME_MFG,
+            image_type: RESUME_TYPE,
+            current_version: 1,
+            endpoint: 1,
+            block_size: 48,
+            auto_accept,
+            hardware_version: None,
+        },
+    )
+}
+
+fn resume_query_response(version: u32, size: u32) -> [u8; 13] {
+    let mut resp = [0u8; 13];
+    resp[1..3].copy_from_slice(&RESUME_MFG.to_le_bytes());
+    resp[3..5].copy_from_slice(&RESUME_TYPE.to_le_bytes());
+    resp[5..9].copy_from_slice(&version.to_le_bytes());
+    resp[9..13].copy_from_slice(&size.to_le_bytes());
+    resp
+}
+
+fn resume_block_response(file: &[u8], version: u32, offset: u32) -> Vec<u8> {
+    let end = (offset as usize + 48).min(file.len());
+    let chunk = &file[offset as usize..end];
+    let mut block = vec![0x00];
+    block.extend_from_slice(&RESUME_MFG.to_le_bytes());
+    block.extend_from_slice(&RESUME_TYPE.to_le_bytes());
+    block.extend_from_slice(&version.to_le_bytes());
+    block.extend_from_slice(&offset.to_le_bytes());
+    block.push(chunk.len() as u8);
+    block.extend_from_slice(chunk);
+    block
+}
+
+/// Start a session: query, then the server's Query Next Image Response.
+fn resume_start_session(
+    mgr: &mut zigbee_runtime::ota::OtaManager<zigbee_runtime::firmware_writer::MockFirmwareWriter>,
+    version: u32,
+    size: u32,
+) -> Option<zigbee_runtime::event_loop::StackEvent> {
+    mgr.start_query();
+    let query = mgr.take_pending_frame().expect("query request queued");
+    assert_eq!(query.zcl_data[2], CMD_QUERY_NEXT_IMAGE_REQUEST.0);
+    mgr.handle_incoming(
+        CMD_QUERY_NEXT_IMAGE_RESPONSE.0,
+        &resume_query_response(version, size),
+        None,
+    )
+}
+
+/// Answer outstanding block requests until the next requested offset
+/// reaches `stop_at` (the request is left queued) or no block request is
+/// pending any more.
+fn resume_serve_blocks(
+    mgr: &mut zigbee_runtime::ota::OtaManager<zigbee_runtime::firmware_writer::MockFirmwareWriter>,
+    file: &[u8],
+    version: u32,
+    stop_at: u32,
+) {
+    while let Some(frame) = mgr.take_pending_frame() {
+        if frame.zcl_data[2] != CMD_IMAGE_BLOCK_REQUEST.0 || pending_block_offset(&frame) >= stop_at
+        {
+            assert!(mgr.requeue_pending_frame(frame));
+            return;
+        }
+        let offset = pending_block_offset(&frame);
+        mgr.handle_incoming_with_sequence(
+            CMD_IMAGE_BLOCK_RESPONSE.0,
+            &resume_block_response(file, version, offset),
+            Some(frame.zcl_data[1]),
+            None,
+        );
+    }
+}
+
+/// Answer the outstanding block request with status ABORT, as zigpy does
+/// for block requests that arrive after its session timed out.
+fn resume_server_abort(
+    mgr: &mut zigbee_runtime::ota::OtaManager<zigbee_runtime::firmware_writer::MockFirmwareWriter>,
+) -> Option<zigbee_runtime::event_loop::StackEvent> {
+    let frame = mgr.take_pending_frame().expect("block request outstanding");
+    assert_eq!(frame.zcl_data[2], CMD_IMAGE_BLOCK_REQUEST.0);
+    mgr.handle_incoming_with_sequence(
+        CMD_IMAGE_BLOCK_RESPONSE.0,
+        &[0x95],
+        Some(frame.zcl_data[1]),
+        None,
+    )
+}
+
+fn resume_firmware(seed: u8) -> Vec<u8> {
+    (0..256u32).map(|i| (i as u8).wrapping_add(seed)).collect()
+}
+
+#[test]
+fn ota_manager_resumes_the_same_image_at_the_saved_offset_after_a_timeout() {
+    use zigbee_runtime::event_loop::StackEvent;
+    use zigbee_runtime::ota::OtaImageOffer;
+
+    let firmware = resume_firmware(0);
+    let file = build_ota_file(RESUME_MFG, RESUME_TYPE, 2, &firmware);
+    let total = file.len() as u32;
+    let mut mgr = resume_manager(true);
+
+    resume_start_session(&mut mgr, 2, total);
+    resume_serve_blocks(&mut mgr, &file, 2, 144);
+    // 56 B header + 6 B sub-element header precede the payload.
+    assert_eq!(mgr.writer().bytes_written(), 144 - 62);
+
+    // The server goes silent: retries until the response timeout, then the
+    // session ends but the staged prefix is kept.
+    let mut status = None;
+    for _ in 0..120 {
+        status = mgr.tick(1);
+        let _ = mgr.take_pending_frame();
+        if status.is_some() {
+            break;
+        }
+    }
+    assert!(matches!(status, Some(StackEvent::OtaFailed)));
+    assert_eq!(mgr.state(), OtaState::Idle);
+    assert!(mgr.is_suspended());
+    let offer = OtaImageOffer {
+        manufacturer_code: RESUME_MFG,
+        image_type: RESUME_TYPE,
+        file_version: 2,
+        image_size: total,
+    };
+    assert_eq!(mgr.suspended_download(), Some((offer, 144)));
+    // OtaSession ends the session like this after OtaFailed.
+    mgr.end_session();
+    assert!(mgr.is_suspended());
+    assert_eq!(mgr.writer().bytes_written(), 144 - 62);
+
+    // A new session for the same image continues at the saved offset
+    // without erasing the slot.
+    resume_start_session(&mut mgr, 2, total);
+    assert!(!mgr.is_suspended());
+    assert_eq!(
+        mgr.state(),
+        OtaState::Downloading {
+            offset: 144,
+            total_size: total
+        }
+    );
+    let request = mgr.take_pending_frame().expect("resumed block request");
+    assert_eq!(pending_block_offset(&request), 144);
+    assert!(mgr.requeue_pending_frame(request));
+    assert_eq!(mgr.writer().bytes_written(), 144 - 62);
+
+    resume_serve_blocks(&mut mgr, &file, 2, u32::MAX);
+    assert_eq!(mgr.state(), OtaState::WaitingActivate);
+    assert_eq!(mgr.writer().data(), &firmware[..]);
+    let end = mgr.take_pending_frame().expect("Upgrade End Request");
+    assert_eq!(end.zcl_data[2], CMD_UPGRADE_END_REQUEST.0);
+    assert_eq!(end.zcl_data[3], 0x00);
+}
+
+/// zigpy answers block requests after its stall timeout with ABORT. That is
+/// a server-side stop, not an image problem: the staged data is kept and no
+/// failure Upgrade End Request is sent. With `auto_accept = false` the
+/// resumed image still needs the application's acceptance.
+#[test]
+fn ota_manager_server_abort_suspends_and_an_accepted_reoffer_resumes() {
+    use zigbee_runtime::event_loop::StackEvent;
+
+    let firmware = resume_firmware(7);
+    let file = build_ota_file(RESUME_MFG, RESUME_TYPE, 2, &firmware);
+    let total = file.len() as u32;
+    let mut mgr = resume_manager(false);
+
+    assert!(matches!(
+        resume_start_session(&mut mgr, 2, total),
+        Some(StackEvent::OtaImageAvailable { .. })
+    ));
+    assert!(mgr.accept_ota().is_none());
+    let _ = mgr.take_pending_frame();
+    mgr.handle_incoming(
+        CMD_QUERY_NEXT_IMAGE_RESPONSE.0,
+        &resume_query_response(2, total),
+        None,
+    );
+    resume_serve_blocks(&mut mgr, &file, 2, 240);
+
+    assert!(matches!(
+        resume_server_abort(&mut mgr),
+        Some(StackEvent::OtaFailed)
+    ));
+    assert!(mgr.take_pending_frame().is_none(), "no failure End Request");
+    assert_eq!(mgr.state(), OtaState::Idle);
+    assert!(mgr.is_suspended());
+    assert!(mgr.accepted_image().is_none());
+    mgr.end_session();
+
+    // The re-offer is reported again; the staged data survives the wait.
+    assert!(matches!(
+        resume_start_session(&mut mgr, 2, total),
+        Some(StackEvent::OtaImageAvailable { .. })
+    ));
+    assert!(mgr.take_pending_frame().is_none());
+    assert!(mgr.is_suspended());
+    assert!(mgr.accept_ota().is_none());
+    let _ = mgr.take_pending_frame();
+    assert!(mgr.is_suspended(), "re-query keeps the staged download");
+    assert!(mgr
+        .handle_incoming(
+            CMD_QUERY_NEXT_IMAGE_RESPONSE.0,
+            &resume_query_response(2, total),
+            None,
+        )
+        .is_none());
+    let request = mgr.take_pending_frame().expect("resumed block request");
+    assert_eq!(pending_block_offset(&request), 240);
+    assert!(mgr.requeue_pending_frame(request));
+
+    resume_serve_blocks(&mut mgr, &file, 2, u32::MAX);
+    assert_eq!(mgr.state(), OtaState::WaitingActivate);
+    assert_eq!(mgr.writer().data(), &firmware[..]);
+}
+
+#[test]
+fn ota_manager_different_image_discards_staged_data_and_restarts_at_zero() {
+    let old_firmware = resume_firmware(0);
+    let old_file = build_ota_file(RESUME_MFG, RESUME_TYPE, 2, &old_firmware);
+    let mut mgr = resume_manager(true);
+
+    resume_start_session(&mut mgr, 2, old_file.len() as u32);
+    resume_serve_blocks(&mut mgr, &old_file, 2, 144);
+    resume_server_abort(&mut mgr);
+    mgr.end_session();
+    assert!(mgr.is_suspended());
+
+    // Each identity field differs in turn: a newer version, then a
+    // different size of the same version.
+    let new_firmware = resume_firmware(0x40);
+    let new_file = build_ota_file(RESUME_MFG, RESUME_TYPE, 3, &new_firmware);
+    resume_start_session(&mut mgr, 3, new_file.len() as u32);
+    assert!(!mgr.is_suspended());
+    let request = mgr.take_pending_frame().expect("fresh block request");
+    assert_eq!(pending_block_offset(&request), 0);
+    assert_eq!(mgr.writer().bytes_written(), 0, "slot erased for new image");
+    assert!(mgr.requeue_pending_frame(request));
+    resume_serve_blocks(&mut mgr, &new_file, 3, 96);
+    resume_server_abort(&mut mgr);
+    assert!(mgr.is_suspended());
+
+    let shorter = build_ota_file(RESUME_MFG, RESUME_TYPE, 3, &new_firmware[..200]);
+    resume_start_session(&mut mgr, 3, shorter.len() as u32);
+    assert!(!mgr.is_suspended());
+    let request = mgr.take_pending_frame().expect("fresh block request");
+    assert_eq!(pending_block_offset(&request), 0);
+    assert_eq!(mgr.writer().bytes_written(), 0);
+    assert!(mgr.requeue_pending_frame(request));
+    resume_serve_blocks(&mut mgr, &shorter, 3, u32::MAX);
+    assert_eq!(mgr.state(), OtaState::WaitingActivate);
+    assert_eq!(mgr.writer().data(), &new_firmware[..200]);
+}
+
+/// A resumed download that turns out to be invalid is discarded like any
+/// other verification failure, and the next session restarts at offset 0.
+#[test]
+fn ota_manager_verification_failure_discards_a_resumed_download() {
+    use zigbee_runtime::event_loop::StackEvent;
+
+    let firmware = resume_firmware(0);
+    let mut file = build_ota_file(RESUME_MFG, RESUME_TYPE, 2, &firmware);
+    let total = file.len() as u32;
+    // Upgrade Image sub-element claiming more data than the file holds.
+    file[58..62].copy_from_slice(&total.to_le_bytes());
+
+    let mut mgr = resume_manager(true);
+    resume_start_session(&mut mgr, 2, total);
+    // Stop inside the OTA header: its parser state must survive suspension.
+    resume_serve_blocks(&mut mgr, &file, 2, 48);
+    resume_server_abort(&mut mgr);
+    mgr.end_session();
+    assert_eq!(mgr.suspended_download().map(|(_, offset)| offset), Some(48));
+
+    resume_start_session(&mut mgr, 2, total);
+    let mut status = None;
+    if let Some(frame) = mgr.take_pending_frame() {
+        assert_eq!(pending_block_offset(&frame), 48);
+        status = mgr.handle_incoming_with_sequence(
+            CMD_IMAGE_BLOCK_RESPONSE.0,
+            &resume_block_response(&file, 2, 48),
+            Some(frame.zcl_data[1]),
+            None,
+        );
+    }
+    assert!(matches!(status, Some(StackEvent::OtaFailed)));
+    assert!(!mgr.is_suspended());
+    let end = mgr.take_pending_frame().expect("failure End Request");
+    assert_eq!(end.zcl_data[2], CMD_UPGRADE_END_REQUEST.0);
+    assert_eq!(end.zcl_data[3], 0x96, "INVALID_IMAGE");
+    mgr.end_session();
+    assert!(!mgr.is_suspended());
+    assert_eq!(mgr.writer().bytes_written(), 0, "staged data discarded");
+
+    resume_start_session(&mut mgr, 2, total);
+    let request = mgr.take_pending_frame().expect("fresh block request");
+    assert_eq!(pending_block_offset(&request), 0);
+}
+
+#[test]
+fn ota_manager_explicit_abort_discards_a_suspended_download() {
+    let firmware = resume_firmware(0);
+    let file = build_ota_file(RESUME_MFG, RESUME_TYPE, 2, &firmware);
+    let total = file.len() as u32;
+    let mut mgr = resume_manager(true);
+
+    resume_start_session(&mut mgr, 2, total);
+    resume_serve_blocks(&mut mgr, &file, 2, 144);
+    resume_server_abort(&mut mgr);
+    assert!(mgr.is_suspended());
+    mgr.abort();
+    assert!(!mgr.is_suspended());
+    assert_eq!(mgr.writer().bytes_written(), 0);
+
+    resume_start_session(&mut mgr, 2, total);
+    let request = mgr.take_pending_frame().expect("fresh block request");
+    assert_eq!(pending_block_offset(&request), 0);
 }

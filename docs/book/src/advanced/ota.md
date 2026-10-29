@@ -71,6 +71,24 @@ OTA image into a differently described non-OTA device.
 The product writer owns format validation beyond the Zigbee header, staging
 geometry, boot selection, and reset.
 
+## Lost blocks and interrupted downloads
+
+`OtaManager` re-sends the outstanding Image Block Request until a response
+arrives or the 120 s response timeout expires. The first retry is after 2 s,
+the interval grows by 1 s per retry, and it is capped at 5 s, so a server that
+aborts after 30 s without progress (zigpy) sees several retries first. Late or
+mismatched blocks never consume the retry copy.
+
+A response timeout or a server ABORT during a download that has already staged
+data suspends the session instead of discarding it: the writer is not aborted,
+and the server is not sent an Upgrade End. When the next Query Next Image
+response offers the same manufacturer code, image type, file version and size,
+the download continues at the saved offset without erasing the slot. Any other
+offer, an explicit abort, or a verification failure discards the staged data
+and starts again at offset 0. Resume state lives in RAM only, so a reset still
+restarts the download. This behaviour is host-tested only; an interrupted
+download that resumes on hardware is still an open gate.
+
 ## Platform implementations
 
 | product | staging/activation | status |

@@ -41,6 +41,29 @@
 //! to idle with [`StackEvent::OtaFailed`] while the verified image stays
 //! staged but inactive (the next accepted download erases the slot).
 //!
+//! # Lost Image Block Responses
+//!
+//! An unanswered Image Block Request is retransmitted with a short, capped
+//! backoff (2 s growing to 5 s) for as long as the response timeout allows.
+//! OTA servers abandon a transfer that makes no progress for a short time
+//! (zigpy: 30 s), so the client must keep asking well inside that window.
+//!
+//! # Resume after an interrupted download
+//!
+//! When the server goes silent (response timeout) or answers a block request
+//! with `ABORT` (a server-side stall timeout or cancellation), a download
+//! that already staged bytes is *suspended* rather than discarded: the
+//! session returns to idle with [`StackEvent::OtaFailed`] but the parser
+//! state and the firmware writer keep the staged prefix. If a later session
+//! offers exactly the same image (manufacturer, image type, file version and
+//! size), the download continues at the saved file offset without erasing
+//! the slot; the writer keeps receiving sequential writes, so no programmed
+//! byte is rewritten. Any other image discards the staged data and starts at
+//! offset 0 with a fresh erase. Corruption (header/layout mismatch, a writer
+//! error, verification failure) and an explicit [`OtaManager::abort`] always
+//! discard. The suspended state lives in RAM only; a reset restarts the
+//! download from offset 0.
+//!
 //! Enabled with the `ota` feature flag.
 
 use crate::event_loop::StackEvent;
@@ -53,9 +76,17 @@ use zigbee_zcl::clusters::ota_image::OtaImageHeader;
 use zigbee_zcl::frame::ZclFrame;
 use zigbee_zcl::{ClusterDirection, CommandId};
 
+/// Silence after which an outstanding OTA request is given up.
 const OTA_RESPONSE_TIMEOUT_SECS: u32 = 120;
+/// Delay before the first retransmission of an unanswered block request.
 const OTA_BLOCK_RETRY_INTERVAL_SECS: u32 = 2;
-const OTA_BLOCK_MAX_RETRIES: u8 = 3;
+/// Backoff ceiling for block-request retransmissions. Retries continue at
+/// this interval until [`OTA_RESPONSE_TIMEOUT_SECS`]; it must stay well
+/// below server stall timeouts (zigpy aborts after 30 s without progress).
+const OTA_BLOCK_RETRY_MAX_INTERVAL_SECS: u32 = 5;
+/// ZCL status ABORT (0x95) in an Image Block Response: the server ended the
+/// transfer (ZCL r8 §11.13.8.2).
+const OTA_STATUS_ABORT: u8 = 0x95;
 /// Upgrade End Request retransmissions while a verified image waits for the
 /// server's Upgrade End Response.
 const OTA_END_REQUEST_MAX_RETRIES: u8 = 3;
@@ -160,6 +191,9 @@ pub struct OtaManager<F: FirmwareWriter> {
     block_retry: Option<BlockRetry>,
     /// Whether the verified image is waiting for application-controlled activation.
     activation_pending: bool,
+    /// An interrupted download whose staged prefix is kept for resumption
+    /// (`download_ctx` and the writer stay untouched while set).
+    suspended: bool,
 }
 
 /// Position of the streaming OTA file parser.
@@ -249,6 +283,7 @@ impl<F: FirmwareWriter> OtaManager<F> {
             response_wait_secs: 0,
             block_retry: None,
             activation_pending: false,
+            suspended: false,
         }
     }
 
@@ -324,6 +359,21 @@ impl<F: FirmwareWriter> OtaManager<F> {
             return None;
         }
 
+        // A server ABORT ends the transfer on the server side (for example a
+        // stall timeout). It says nothing about the staged data, so keep it
+        // for a later session offering the same image.
+        if cmd_id == ota::CMD_IMAGE_BLOCK_RESPONSE.0
+            && payload.first() == Some(&OTA_STATUS_ABORT)
+            && self.can_suspend()
+        {
+            log::warn!(
+                "[OTA] Server aborted the download at offset {}; keeping staged data",
+                self.download_ctx.file_offset
+            );
+            self.suspend();
+            return Some(StackEvent::OtaFailed);
+        }
+
         let outcome = self
             .cluster
             .process_server_command_with_outcome(cmd_id, payload);
@@ -354,7 +404,15 @@ impl<F: FirmwareWriter> OtaManager<F> {
                 if self.cluster.state() == OtaState::WaitingActivate {
                     return self.end_response_timeout();
                 }
-                self.abort();
+                if self.can_suspend() {
+                    log::warn!(
+                        "[OTA] Server silent; suspending download at offset {}",
+                        self.download_ctx.file_offset
+                    );
+                    self.suspend();
+                } else {
+                    self.end_session();
+                }
                 return Some(StackEvent::OtaFailed);
             }
         } else {
@@ -372,11 +430,13 @@ impl<F: FirmwareWriter> OtaManager<F> {
         {
             self.block_retry.as_mut().and_then(|retry| {
                 retry.elapsed_secs = retry.elapsed_secs.saturating_add(elapsed_secs as u32);
-                if retry.elapsed_secs >= OTA_BLOCK_RETRY_INTERVAL_SECS
-                    && retry.retries_sent < OTA_BLOCK_MAX_RETRIES
-                {
+                // No retry cap: the response timeout bounds the retries, and
+                // going quiet would let the server's stall timer expire.
+                let interval = (OTA_BLOCK_RETRY_INTERVAL_SECS + u32::from(retry.retries_sent))
+                    .min(OTA_BLOCK_RETRY_MAX_INTERVAL_SECS);
+                if retry.elapsed_secs >= interval {
                     retry.elapsed_secs = 0;
-                    retry.retries_sent += 1;
+                    retry.retries_sent = retry.retries_sent.saturating_add(1);
                     Some((retry.request.clone(), retry.zcl_seq))
                 } else {
                     None
@@ -420,17 +480,71 @@ impl<F: FirmwareWriter> OtaManager<F> {
 
     /// Abort the current OTA.
     ///
-    /// Discards any staged image, pending offer, and acceptance.
+    /// Discards any staged image (including a suspended download), pending
+    /// offer, and acceptance.
     pub fn abort(&mut self) {
         let _ = self.writer.abort();
+        self.suspended = false;
         self.reset_session();
+    }
+
+    /// Return to idle after a session ended, keeping a suspended download
+    /// for resumption and discarding everything else (see [`Self::abort`]).
+    pub fn end_session(&mut self) {
+        if self.suspended {
+            self.reset_session();
+        } else {
+            self.abort();
+        }
+    }
+
+    /// Whether an interrupted download is kept for resumption.
+    pub fn is_suspended(&self) -> bool {
+        self.suspended
+    }
+
+    /// The image and file offset of a suspended download, if any.
+    pub fn suspended_download(&self) -> Option<(OtaImageOffer, u32)> {
+        if !self.suspended {
+            return None;
+        }
+        self.download_ctx
+            .offer
+            .map(|offer| (offer, self.download_ctx.file_offset))
+    }
+
+    /// Whether the running download staged data that a later session for
+    /// the same image can continue.
+    fn can_suspend(&self) -> bool {
+        let ctx = &self.download_ctx;
+        matches!(
+            self.cluster.state(),
+            OtaState::Downloading { .. } | OtaState::WaitForData { .. }
+        ) && ctx.slot_erased
+            && ctx.offer.is_some()
+            && ctx.file_offset > 0
+    }
+
+    /// Return to idle keeping the parser state and staged writer data.
+    fn suspend(&mut self) {
+        self.suspended = true;
+        self.reset_session();
+    }
+
+    /// Drop a suspended download before staging a different image.
+    fn discard_suspended(&mut self) {
+        let _ = self.writer.abort();
+        self.suspended = false;
+        self.download_ctx.reset();
     }
 
     /// Return to idle without touching the firmware slot.
     fn reset_session(&mut self) {
         self.cluster.abort();
         self.pending_frame = None;
-        self.download_ctx.reset();
+        if !self.suspended {
+            self.download_ctx.reset();
+        }
         self.offered_image = None;
         self.accepted_image = None;
         self.end_request_retries = 0;
@@ -496,15 +610,18 @@ impl<F: FirmwareWriter> OtaManager<F> {
     fn process_action(&mut self, action: OtaAction) -> Option<StackEvent> {
         match action {
             OtaAction::SendQuery(req) => {
-                // Reset download context for new OTA session
-                self.download_ctx.reset();
+                // Reset download context for new OTA session; a suspended
+                // download is kept until the server's offer is known.
+                if !self.suspended {
+                    self.download_ctx.reset();
+                }
                 self.block_retry = None;
                 self.build_and_queue_request(ota::CMD_QUERY_NEXT_IMAGE_REQUEST, &req);
                 None
             }
-            OtaAction::SendBlockRequest(req) => {
+            OtaAction::SendBlockRequest(mut req) => {
                 let mut announce = req.file_offset == 0;
-                if req.file_offset == 0 && !self.download_ctx.slot_erased {
+                if req.file_offset == 0 && (!self.download_ctx.slot_erased || self.suspended) {
                     let offer = OtaImageOffer {
                         manufacturer_code: req.manufacturer_code,
                         image_type: req.image_type,
@@ -527,16 +644,35 @@ impl<F: FirmwareWriter> OtaManager<F> {
                         announce = false;
                     }
 
-                    match self.writer.erase_slot() {
-                        Ok(()) => {
-                            log::info!("[OTA] Flash slot erased, ready for download");
-                            self.download_ctx.slot_erased = true;
-                            self.download_ctx.offer = Some(offer);
+                    if self.suspended {
+                        if self.download_ctx.offer == Some(offer) {
+                            let saved = self.download_ctx.file_offset;
+                            match self.cluster.resume_download(saved) {
+                                OtaAction::SendBlockRequest(resumed) => {
+                                    log::info!("[OTA] Resuming download at offset {}", saved);
+                                    self.suspended = false;
+                                    req = resumed;
+                                }
+                                _ => self.discard_suspended(),
+                            }
+                        } else {
+                            log::info!("[OTA] Different image offered; discarding staged data");
+                            self.discard_suspended();
                         }
-                        Err(e) => {
-                            log::warn!("[OTA] Erase slot failed: {:?}", e);
-                            let fail_action = self.cluster.mark_failed();
-                            return self.process_action(fail_action);
+                    }
+
+                    if !self.download_ctx.slot_erased {
+                        match self.writer.erase_slot() {
+                            Ok(()) => {
+                                log::info!("[OTA] Flash slot erased, ready for download");
+                                self.download_ctx.slot_erased = true;
+                                self.download_ctx.offer = Some(offer);
+                            }
+                            Err(e) => {
+                                log::warn!("[OTA] Erase slot failed: {:?}", e);
+                                let fail_action = self.cluster.mark_failed();
+                                return self.process_action(fail_action);
+                            }
                         }
                     }
                 } else if !self.config.auto_accept {

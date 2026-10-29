@@ -151,10 +151,11 @@ impl OtaSession {
 
     /// Discard a pending offer, for example because product policy (a low
     /// battery) does not allow a download now. Nothing is sent; the server
-    /// may offer the image again on the next query.
+    /// may offer the image again on the next query. A suspended download of
+    /// an earlier session stays staged (see [`OtaManager::end_session`]).
     pub fn decline_offer<F: FirmwareWriter>(&mut self, manager: &mut OtaManager<F>) {
         if self.offer_server.take().is_some() && !Self::is_active(manager) {
-            manager.abort();
+            manager.end_session();
         }
     }
 
@@ -300,7 +301,7 @@ impl OtaSession {
         let pending = manager.take_pending_frame();
         if let Some(frame) = pending {
             let Some((server, server_endpoint)) = self.server else {
-                manager.abort();
+                manager.end_session();
                 self.cleanup_pending = false;
                 return;
             };
@@ -319,7 +320,7 @@ impl OtaSession {
                 // offset, so resending it cannot corrupt the download. The
                 // manager's response timeout bounds the retries.
                 if !manager.requeue_pending_frame(frame) {
-                    manager.abort();
+                    manager.end_session();
                     self.server = None;
                     self.cleanup_pending = false;
                 }
@@ -327,7 +328,7 @@ impl OtaSession {
             }
         }
         if self.cleanup_pending {
-            manager.abort();
+            manager.end_session();
             self.server = None;
             self.cleanup_pending = false;
             self.activation_pending = false;
@@ -954,5 +955,113 @@ mod tests {
         ));
         assert!(matches!(outcome, OtaEventOutcome::Consumed(None)));
         assert_eq!(mgr.state(), OtaState::QuerySent);
+    }
+
+    /// Offer, accept and start downloading `ota_file` from `server`.
+    fn accept_and_start(
+        session: &mut OtaSession,
+        device: &mut ZigbeeDevice<MockMac>,
+        mgr: &mut OtaManager<MockFirmwareWriter>,
+        server: (u16, u8),
+        total: u32,
+    ) {
+        block_on(session.handle_event(device, mgr, ENDPOINT, &image_notify(server, ENDPOINT)));
+        let offer = query_response(server, 2, total);
+        block_on(session.handle_event(device, mgr, ENDPOINT, &offer));
+        assert!(session.offer_pending(mgr));
+        block_on(session.accept_offer(device, mgr));
+        block_on(session.handle_event(device, mgr, ENDPOINT, &offer));
+    }
+
+    /// The HIL failure: the server stops answering mid-download. The session
+    /// must end (so a new Image Notify is accepted) while the manager keeps
+    /// the staged prefix, and the next session for the same image continues
+    /// where the previous one stopped.
+    #[test]
+    fn a_stalled_server_suspends_and_the_next_session_resumes() {
+        let mut session = OtaSession::new();
+        let mut device = joined_device();
+        let mut mgr = manual_manager(ENDPOINT);
+        let ota_file = build_ota_file(0x1234, 0x0001, 2);
+        let total = ota_file.len() as u32;
+
+        accept_and_start(&mut session, &mut device, &mut mgr, SERVER_A, total);
+        assert!(matches!(
+            mgr.state(),
+            OtaState::Downloading { offset: 0, .. }
+        ));
+        let first = block_response_event(SERVER_A, ENDPOINT, 2, 0, &ota_file[..48]);
+        block_on(session.handle_event(&mut device, &mut mgr, ENDPOINT, &first));
+        assert!(matches!(
+            mgr.state(),
+            OtaState::Downloading { offset: 48, .. }
+        ));
+
+        let mut status = None;
+        let mut retries = 0;
+        for _ in 0..120 {
+            device.mac_mut().clear_tx_history();
+            status = block_on(session.service(&mut device, &mut mgr, 1));
+            retries += device.mac_mut().tx_history().len();
+            if status.is_some() {
+                break;
+            }
+        }
+        assert!(matches!(status, Some(StackEvent::OtaFailed)));
+        assert_eq!(
+            retries, 25,
+            "block request must be retried until the response timeout"
+        );
+        assert_eq!(mgr.state(), OtaState::Idle);
+        assert!(
+            !OtaSession::is_active(&mgr),
+            "suspension returns to slow poll"
+        );
+        assert_eq!(mgr.suspended_download().map(|(_, offset)| offset), Some(48));
+
+        // The server starts a new attempt for the same image.
+        accept_and_start(&mut session, &mut device, &mut mgr, SERVER_A, total);
+        assert!(matches!(
+            mgr.state(),
+            OtaState::Downloading { offset: 48, .. }
+        ));
+        let rest = block_response_event(SERVER_A, ENDPOINT, 2, 48, &ota_file[48..]);
+        block_on(session.handle_event(&mut device, &mut mgr, ENDPOINT, &rest));
+        assert_eq!(mgr.state(), OtaState::WaitingActivate);
+        assert_eq!(mgr.writer().data(), &[0xA5, 0x5A]);
+    }
+
+    /// Declining an offer for battery policy is not corruption: a suspended
+    /// download stays staged.
+    #[test]
+    fn declining_an_offer_keeps_a_suspended_download() {
+        let mut session = OtaSession::new();
+        let mut device = joined_device();
+        let mut mgr = manual_manager(ENDPOINT);
+        let ota_file = build_ota_file(0x1234, 0x0001, 2);
+        let total = ota_file.len() as u32;
+
+        accept_and_start(&mut session, &mut device, &mut mgr, SERVER_A, total);
+        let first = block_response_event(SERVER_A, ENDPOINT, 2, 0, &ota_file[..48]);
+        block_on(session.handle_event(&mut device, &mut mgr, ENDPOINT, &first));
+        while block_on(session.service(&mut device, &mut mgr, 10)).is_none() {}
+        assert!(mgr.is_suspended());
+
+        block_on(session.handle_event(
+            &mut device,
+            &mut mgr,
+            ENDPOINT,
+            &image_notify(SERVER_A, ENDPOINT),
+        ));
+        block_on(session.handle_event(
+            &mut device,
+            &mut mgr,
+            ENDPOINT,
+            &query_response(SERVER_A, 2, total),
+        ));
+        assert!(session.offer_pending(&mgr));
+        session.decline_offer(&mut mgr);
+        assert!(mgr.is_suspended());
+        assert_eq!(mgr.suspended_download().map(|(_, offset)| offset), Some(48));
     }
 }

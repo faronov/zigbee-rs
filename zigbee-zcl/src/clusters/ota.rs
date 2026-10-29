@@ -1051,6 +1051,29 @@ impl OtaCluster {
         }
     }
 
+    /// Continue a freshly started download at `offset` instead of 0.
+    ///
+    /// Valid only directly after a Query Next Image Response started a
+    /// download (`Downloading { offset: 0, .. }`) and for
+    /// `0 < offset < total_size`; the caller must already hold the first
+    /// `offset` bytes of this exact image. The OTA server answers Image Block
+    /// Requests at any offset (ZCL r8 §11.13.6.2), so this only changes where
+    /// the client asks. Returns [`OtaAction::None`] (state unchanged) when
+    /// the download cannot be resumed at `offset`.
+    pub fn resume_download(&mut self, offset: u32) -> OtaAction {
+        match self.state {
+            OtaState::Downloading {
+                offset: 0,
+                total_size,
+            } if offset > 0 && offset < total_size => {
+                self.state = OtaState::Downloading { offset, total_size };
+                self.set_attr(ATTR_FILE_OFFSET, ZclValue::U32(offset));
+                self.build_block_request(offset, total_size)
+            }
+            _ => OtaAction::None,
+        }
+    }
+
     /// Check if download is complete (all bytes received).
     pub fn is_download_complete(&self) -> bool {
         match self.state {
@@ -1194,6 +1217,36 @@ mod tests {
         w[9] = 250;
         c.process_server_command(0x05, &w);
         assert_eq!(attr(&c, ATTR_MIN_BLOCK_PERIOD), ZclValue::U16(250));
+    }
+
+    #[test]
+    fn resume_download_requests_the_saved_offset_once() {
+        let mut c = downloading(1000);
+        match c.resume_download(480) {
+            OtaAction::SendBlockRequest(r) => assert_eq!(r.file_offset, 480),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            c.state(),
+            OtaState::Downloading {
+                offset: 480,
+                total_size: 1000
+            }
+        );
+        assert_eq!(attr(&c, ATTR_FILE_OFFSET), ZclValue::U32(480));
+        // The next block must continue at the resumed offset.
+        assert!(matches!(
+            c.process_server_command(0x05, &block(480, &[1; 10])),
+            OtaAction::WriteBlock { offset: 480, .. }
+        ));
+        // Only a fresh download can be moved, and only inside the image.
+        assert!(matches!(c.resume_download(100), OtaAction::None));
+        let mut c = downloading(1000);
+        assert!(matches!(c.resume_download(0), OtaAction::None));
+        assert!(matches!(c.resume_download(1000), OtaAction::None));
+        let mut idle = OtaCluster::new(MFR, TYPE, 1);
+        assert!(matches!(idle.resume_download(10), OtaAction::None));
+        assert_eq!(idle.state(), OtaState::Idle);
     }
 
     #[test]
