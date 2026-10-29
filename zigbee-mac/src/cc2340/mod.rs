@@ -81,8 +81,14 @@ pub const STATS_LOG_INTERVAL_S: u64 = 60;
 pub const POLL_DATA_WAIT_MS: u64 = 100;
 
 /// Frames received while waiting for an ACK/poll response, retained for
-/// `MCPS-DATA.indication`.
-pub const PENDING_RX_DEPTH: usize = 4;
+/// `MCPS-DATA.indication` or a later `MLME-POLL`.
+///
+/// Each slot is a 129-byte [`PendingRx`], so the depth costs about 129 B of
+/// `.bss` per slot. Eight slots absorb a burst of late indirect frames on a
+/// lossy link (an OTA download keeps one block response in flight and a
+/// retransmitted request can make the parent queue two) without dropping the
+/// oldest one, which the four-slot queue did in hardware tests.
+pub const PENDING_RX_DEPTH: usize = 8;
 
 /// MAC-level counters, cumulative since boot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -721,6 +727,39 @@ impl Cc2340Mac {
         );
     }
 
+    /// Take the oldest retained frame that is the parent's data for us,
+    /// as `MLME-POLL` would have returned it.
+    ///
+    /// A sleepy device consumes received data only through `MLME-POLL`, so a
+    /// poll response that arrived after [`POLL_DATA_WAIT_MS`] (or any other
+    /// parent frame picked up while waiting for an ACK) would otherwise sit in
+    /// the pending queue until it overflowed. Other retained frames keep
+    /// their order for `MCPS-DATA.indication`.
+    fn take_retained_poll_response(&mut self) -> Option<MacFrame> {
+        let mut found = None;
+        for _ in 0..self.pending_rx.len() {
+            let Some(entry) = self.pending_rx.pop_front() else {
+                break;
+            };
+            if found.is_none() {
+                let data = &entry.data[..entry.len as usize];
+                if self.is_poll_response(data) {
+                    let fc = u16::from_le_bytes([data[0], data[1]]);
+                    let header_len = 3 + addressing_size(fc);
+                    found = data
+                        .get(header_len..)
+                        .filter(|payload| !payload.is_empty())
+                        .and_then(MacFrame::from_slice);
+                    if found.is_some() {
+                        continue;
+                    }
+                }
+            }
+            let _ = self.pending_rx.push_back(entry);
+        }
+        found
+    }
+
     /// Whether `data` is the parent's indirect frame answering our poll: a
     /// data frame addressed exactly to us whose source is the coordinator.
     fn is_poll_response(&self, data: &[u8]) -> bool {
@@ -1223,6 +1262,11 @@ impl MacDriver for Cc2340Mac {
 
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
         self.log_stats_periodically();
+        // The parent already sent this frame (a late answer to an earlier
+        // poll); deliver it before asking for more.
+        if let Some(frame) = self.take_retained_poll_response() {
+            return Ok(Some(frame));
+        }
         let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
         let seq = self.next_dsn();
         // IEEE 802.15.4 §6.3.4: use the short source address once assigned.
@@ -1637,5 +1681,42 @@ mod tests {
         }
         assert_eq!(mac.pending_rx.len(), PENDING_RX_DEPTH);
         assert_eq!(mac.pending_rx.front().unwrap().data[2], 2);
+    }
+
+    /// A sleepy device only consumes data through `MLME-POLL`: parent frames
+    /// retained by a FIFO drain (late poll responses) must come out of the
+    /// next poll in order instead of piling up until the queue drops them.
+    #[test]
+    fn retained_parent_frames_are_delivered_by_the_next_poll() {
+        let mut mac = associated_mac();
+        // Unicast for us from a non-parent stays for indication.
+        mac.retain_frame(&data_frame(1, 0x5678, 0x1111, &[0x01]), 0);
+        mac.retain_frame(&data_frame(2, 0x5678, 0x0000, &[0x02, 0x22]), 0);
+        mac.retain_frame(&data_frame(3, 0x5678, 0x0000, &[0x03]), 0);
+
+        let first = mac.take_retained_poll_response().unwrap();
+        assert_eq!(first.as_slice(), &[0x02, 0x22]);
+        let second = mac.take_retained_poll_response().unwrap();
+        assert_eq!(second.as_slice(), &[0x03]);
+        assert!(mac.take_retained_poll_response().is_none());
+        assert_eq!(mac.pending_rx.len(), 1);
+        assert_eq!(mac.pending_rx.front().unwrap().data[2], 1);
+    }
+
+    /// A burst of late parent frames as deep as the queue is kept whole.
+    #[test]
+    fn pending_queue_holds_a_burst_of_parent_frames() {
+        let mut mac = associated_mac();
+        for seq in 0..PENDING_RX_DEPTH as u8 {
+            mac.retain_frame(&data_frame(seq, 0x5678, 0x0000, &[seq]), 0);
+        }
+        assert_eq!(mac.stats.queue_full, 0);
+        for seq in 0..PENDING_RX_DEPTH as u8 {
+            assert_eq!(
+                mac.take_retained_poll_response().unwrap().as_slice(),
+                &[seq]
+            );
+        }
+        assert!(mac.pending_rx.is_empty());
     }
 }
