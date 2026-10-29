@@ -23,6 +23,39 @@ Validation level:
 - remaining gate: repeat on a second BL702 sample, then verify calibration,
   raw dual-bias codes, and temperature against an independent reference.
 
+## Live register probe (same sample)
+
+A second diagnosis drove the GPADC directly through the resident
+`eflash_loader` helper over USB ISP (`memory_write` 0x50 /
+`memory_read` 0x51), without flashing firmware.
+
+Probe caveats:
+
+- `memory_read` assembles bytes 2–3 with `lhu`/`lbu`. Peripherals return zero
+  for those sub-word reads, so only the low 16 bits are trustworthy. Writes
+  use `sw` and work across all 32 bits.
+- The averaged `RESULT` register and the GPIP FIFO cannot be read
+  meaningfully this way. The 12-bit `RAW_RESULT` register (`0x4000F934`) can.
+
+Findings, all from `RAW_RESULT` with Vref 2.0 V:
+
+- eFuse TSEN trim is present: enable=1, refcode=2023, parity valid.
+- The ADC itself works. VBAT/2 reads about 3.06 V, GND reads the offset, and
+  PGA gain changes scale the reading.
+- External mode (`TSEXT_SEL=1`) reacts to `TSVBE_LOW` by about 110 12-bit
+  codes on the floating pad.
+- Internal diode on channel 14 sits at about 1800 codes. It does not change
+  with `TS_EN`, `CHIP_SEN_PU`, `SEN_SEL`, or `SEN_TEST_EN`.
+- With PGA chopping off (the Zephyr `adc_bflb` TSEN setup: chop=VREF_AZ,
+  VCM 1.2 V, no dither/DWA), toggling `TSVBE_LOW` changes it by only 5–8
+  12-bit codes. That is about 80–140 16-bit codes, or 3–4 mV. The calibrated
+  formula expects about refcode + 7.753·T ≈ 2200 codes (about 68 mV) at room
+  temperature.
+
+Conclusion: the failure is analog, not a formula or calibration-decode bug.
+On this sample the internal diode's dual-current bias does not switch, so
+`(dV − refcode) / 7.753` lands near −245 °C regardless of software.
+
 ## Archived source
 
 The `snapshots/` files preserve the low-level ADC and eFuse source from the
