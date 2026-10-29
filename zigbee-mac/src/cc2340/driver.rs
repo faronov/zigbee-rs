@@ -156,6 +156,9 @@ pub struct DriverStats {
     /// Full LRFD re-initialisations after device standby
     /// ([`Cc2340Driver::note_standby`]).
     pub standby_reinits: u32,
+    /// Hard stops the PBE did not acknowledge; the driver powered the
+    /// radio cores down instead (see `stop_operation`).
+    pub stop_timeouts: u32,
 }
 
 /// Low-level CC2340 IEEE 802.15.4 radio driver.
@@ -876,11 +879,19 @@ impl Cc2340Driver {
                 core::hint::spin_loop();
             }
             if !stopped {
+                // The PBE did not acknowledge the hard stop. Power the TOPsm
+                // cores down as `sleep` does; every operation start
+                // re-initialises them in `prepare_cores`, so the radio
+                // recovers without a system reset (an OTA download used to
+                // be lost to this).
                 hardware::cancel_pbe_start_trigger();
+                hardware::disable_radio_cores();
                 self.operation_active = false;
                 self.rx_fifo_reset_pending = true;
                 fifo::reset_both();
-                return Err(RadioError::OperationTimeout);
+                self.stats.stop_timeouts = self.stats.stop_timeouts.wrapping_add(1);
+                log::warn!("[CC2340 DRV] PBE ignored the hard stop; radio cores reset");
+                return Ok(());
             }
         }
 

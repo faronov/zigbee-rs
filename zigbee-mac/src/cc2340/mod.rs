@@ -700,7 +700,7 @@ impl Cc2340Mac {
         let (mac, driver, pbe) = self.stats();
         log::info!(
             "[CC2340 STATS] tx={} ack={} ack_fp={} ack_timeout={} ack_rxerr={} retries={} noack={} \
-             rx={} dup={} qfull={} rx_restart={} rx_drop={} cca_busy={} sleeps={} stby_reinit={} pa=0x{:04X} | pbe rx_ok={} rx_nok={} \
+             rx={} dup={} qfull={} rx_restart={} rx_drop={} cca_busy={} sleeps={} stby_reinit={} stop_to={} pa=0x{:04X} | pbe rx_ok={} rx_nok={} \
              rx_ign={} rx_ffull={} tx={} tx_ack={}",
             driver.tx_frames,
             driver.ack_received,
@@ -717,6 +717,7 @@ impl Cc2340Mac {
             driver.cca_busy,
             driver.sleeps,
             driver.standby_reinits,
+            driver.stop_timeouts,
             self.driver.pa_value(),
             pbe.rx_ok,
             pbe.rx_nok,
