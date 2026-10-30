@@ -142,7 +142,7 @@ hardware-aes-bl702 = [
 phy6222 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
-# PHY62x2 radio counters and the software FCS cross-check (bring-up/lab
+# PHY62x2 radio counters and the RX software FCS cross-check (bring-up/lab
 # builds); without it `RadioStats` counters stay zero and cost no XIP.
 phy6222-diag = ["phy6222"]
 

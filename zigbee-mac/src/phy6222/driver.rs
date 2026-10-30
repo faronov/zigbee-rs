@@ -187,15 +187,15 @@ pub struct RxFrame {
 ///
 /// The SDK's only Zigbee transmitter (`rf_phy_dtm_zigbee_pkt_gen`) writes
 /// `[len incl. FCS][payload][zigbee_crc16 LSB first]` into the TX FIFO, i.e.
-/// it computes the FCS in software. Whether the LL engine appends an FCS by
-/// itself in `LL_HW_CRC_ZB_FMT` is not documented, so the choice is
-/// switchable and was decided on hardware with an independent sniffer.
+/// it computes the FCS in software. On PB-03F (PHY6252) an independent sniffer
+/// saw a valid FCS in both modes, so the LL engine (`LL_HW_CRC_ZB_FMT`)
+/// generates it itself; hardware FCS is the default and saves the CRC on
+/// every transmit and in the interrupt-context ACK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FcsMode {
     /// Driver appends `zigbee_crc16` to the FIFO payload (SDK DTM behavior).
     Software,
-    /// Driver writes only the MPDU; the LL engine is expected to append FCS.
-    /// Lab-only: ignored unless the `phy6222-diag` feature is enabled.
+    /// Driver writes only the MPDU; the LL engine appends the FCS.
     Hardware,
 }
 
@@ -247,7 +247,7 @@ pub struct RadioConfig {
 }
 
 /// Default FCS mode, selected from sniffer evidence on PB-03F (PHY6252).
-pub const DEFAULT_FCS_MODE: FcsMode = FcsMode::Software;
+pub const DEFAULT_FCS_MODE: FcsMode = FcsMode::Hardware;
 
 impl Default for RadioConfig {
     fn default() -> Self {
@@ -855,10 +855,8 @@ impl Phy6222Driver {
         ACK_FILTER.lock(|f| f.set(filter));
     }
 
-    /// `Hardware` FCS is a lab A/B option; production builds (without
-    /// `phy6222-diag`) always use the SDK software FCS.
     fn hw_fcs(&self) -> bool {
-        cfg!(feature = "phy6222-diag") && self.config.fcs == FcsMode::Hardware
+        self.config.fcs == FcsMode::Hardware
     }
 
     /// Current radio configuration.
@@ -909,9 +907,9 @@ impl Phy6222Driver {
 
     /// Transmit an MPDU (MAC header + payload, **without** FCS).
     ///
-    /// The FCS is produced according to [`RadioConfig::fcs`] (honoured only
-    /// with the `phy6222-diag` feature; otherwise software FCS); the on-air
-    /// PSDU is `frame.len() + 2` bytes, so `frame` is bounded by 125 bytes.
+    /// The FCS is produced according to [`RadioConfig::fcs`] (by default the
+    /// LL engine appends it, see [`DEFAULT_FCS_MODE`]); the on-air PSDU is
+    /// `frame.len() + 2` bytes, so `frame` is bounded by 125 bytes.
     ///
     /// Completes without yielding; see [`Self::transmit_blocking`].
     pub async fn transmit(&mut self, frame: &[u8]) -> Result<(), RadioError> {
@@ -953,9 +951,10 @@ impl Phy6222Driver {
     /// Transmit a frame that requests an acknowledgement and receive the
     /// ACK in the same hardware operation (`ll_hw_set_trx`): the LL engine
     /// turns the radio around after the `LL+0x18` TX→RX interval and
-    /// listens for `ACK_WAIT_US` (864 µs, macAckWaitDuration). A software re-arm after the TX-done
-    /// interrupt is too slow for the 192 µs turnaround (verified with a
-    /// sniffer: parents ACKed every association request, none was seen).
+    /// listens for `ACK_WAIT_US` (864 µs, macAckWaitDuration). A software
+    /// re-arm after the TX-done interrupt is too slow for the 192 µs
+    /// turnaround (verified with a sniffer: parents ACKed every association
+    /// request, none was seen).
     ///
     /// Returns `Ok(Some(frame_pending))` for an ACK carrying `frame[2]` as
     /// its sequence number and `Ok(None)` otherwise. Spins like
@@ -1249,10 +1248,10 @@ fn ack_sequence_for_rx() -> Option<u8> {
 fn start_ack_tx(seq: u8) {
     let hw_fcs = ACK_FILTER.lock(Cell::get).hw_fcs;
     let ack = [0x02, 0x00, seq];
-    let crc = zigbee_crc16(&ack);
     reg_write(LL + 0x58, 0x0001); // rst tfifo
     reg_write(LL_HW_TFIFO, u32::from_le_bytes([5, ack[0], ack[1], ack[2]]));
     if !hw_fcs {
+        let crc = zigbee_crc16(&ack);
         reg_write(LL_HW_TFIFO, u32::from_le_bytes([crc[0], crc[1], 0, 0]));
     }
     reg_write(LL + 0x04, LL_MODE_STX);
@@ -1469,6 +1468,16 @@ mod tests {
         let full = [0xAAu8; MAX_MPDU_LEN];
         assert_eq!(collect(127, &full, &[0xBB, 0xCC]).len(), FIFO_WORDS);
         assert_eq!(collect(127, &full, &[]).len(), 32);
+    }
+
+    #[test]
+    fn hardware_fcs_is_the_default_and_software_stays_selectable() {
+        assert_eq!(RadioConfig::default().fcs, FcsMode::Hardware);
+        let sw = RadioConfig {
+            fcs: FcsMode::Software,
+            ..RadioConfig::default()
+        };
+        assert_eq!(sw.fcs, FcsMode::Software);
     }
 
     #[test]
