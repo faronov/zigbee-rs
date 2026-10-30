@@ -153,17 +153,55 @@ impl NorFlash for XipFlash {
         if bytes.is_empty() {
             return Ok(());
         }
-        if slice_overlaps_xip(bytes.as_ptr(), bytes.len()) {
-            return Err(FlashError::SourceInXip);
+        if !slice_overlaps_xip(bytes.as_ptr(), bytes.len()) {
+            return rom_write(
+                &mut self.config,
+                self.io_mode,
+                offset,
+                bytes.as_ptr(),
+                bytes.len(),
+            );
         }
-        rom_write(
-            &mut self.config,
-            self.io_mode,
-            offset,
-            bytes.as_ptr(),
-            bytes.len(),
-        )
+        // `NorFlash::write` accepts any slice, and portable callers cannot
+        // know that a promoted constant (for example a journal commit marker)
+        // lives in the XIP-mapped `.rodata`. The ROM program routine turns XIP
+        // off, so such a source must be staged in RAM while XIP is still
+        // mapped. Each chunk is programmed in order; `WRITE_SIZE` is one byte,
+        // so chunking does not change NOR program semantics.
+        let config = &mut self.config;
+        let io_mode = self.io_mode;
+        write_staged(offset, bytes, |address, staged| {
+            if slice_overlaps_xip(staged.as_ptr(), staged.len()) {
+                return Err(FlashError::SourceInXip);
+            }
+            rom_write(config, io_mode, address, staged.as_ptr(), staged.len())
+        })
     }
+}
+
+/// RAM staging buffer used when a write source lives in an XIP window.
+const STAGING_LEN: usize = 64;
+
+/// Program `bytes` at `offset` through a stack-resident staging buffer.
+///
+/// `program` receives every consecutive chunk in address order and must not
+/// retain the slice. The first failure stops the sequence.
+fn write_staged(
+    offset: u32,
+    bytes: &[u8],
+    mut program: impl FnMut(u32, &[u8]) -> Result<(), FlashError>,
+) -> Result<(), FlashError> {
+    let mut staging = [0u8; STAGING_LEN];
+    let mut address = offset;
+    for chunk in bytes.chunks(STAGING_LEN) {
+        let staged = &mut staging[..chunk.len()];
+        staged.copy_from_slice(chunk);
+        program(address, staged)?;
+        address = address
+            .checked_add(chunk.len() as u32)
+            .ok_or(FlashError::OutOfBounds)?;
+    }
+    Ok(())
 }
 
 fn slice_overlaps_xip(pointer: *const u8, length: usize) -> bool {
@@ -438,6 +476,67 @@ mod tests {
             assert!(slice_overlaps_xip((end - 1) as *const u8, 4));
         }
         assert!(!slice_overlaps_xip(0x4201_4000 as *const u8, 4));
+    }
+
+    #[test]
+    fn staged_writes_program_every_byte_in_order_through_bounded_chunks() {
+        let mut source = [0u8; STAGING_LEN * 2 + 5];
+        for (index, byte) in source.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let mut image = [0xFFu8; 0x200 + STAGING_LEN * 3];
+        let mut calls = 0;
+        write_staged(0x200, &source, |address, staged| {
+            assert!(staged.len() <= STAGING_LEN);
+            let start = address as usize;
+            image[start..start + staged.len()].copy_from_slice(staged);
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(&image[0x200..0x200 + source.len()], &source[..]);
+        assert!(image[..0x200].iter().all(|byte| *byte == 0xFF));
+        assert!(
+            image[0x200 + source.len()..]
+                .iter()
+                .all(|byte| *byte == 0xFF)
+        );
+    }
+
+    #[test]
+    fn staged_commit_marker_is_one_program_from_a_ram_copy() {
+        // The security journal writes its 4-byte replay commit marker from a
+        // promoted constant. It must reach the ROM routine as one program
+        // whose source is the staging buffer, not the constant.
+        const MARKER: [u8; 4] = *b"RCMT";
+        let marker: &'static [u8; 4] = &MARKER;
+        let mut programs = 0;
+        write_staged(0x1_e0f8, marker, |address, staged| {
+            assert_eq!(address, 0x1_e0f8);
+            assert_eq!(staged, b"RCMT");
+            assert_ne!(staged.as_ptr(), marker.as_ptr());
+            programs += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(programs, 1);
+    }
+
+    #[test]
+    fn staged_write_stops_at_the_first_program_failure() {
+        let source = [0xA5u8; STAGING_LEN * 3];
+        let mut calls = 0;
+        let result = write_staged(0, &source, |_, _| {
+            calls += 1;
+            if calls == 2 {
+                Err(FlashError::RomError(-1))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, Err(FlashError::RomError(-1)));
+        assert_eq!(calls, 2);
     }
 
     #[test]

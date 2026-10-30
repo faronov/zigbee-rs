@@ -49,7 +49,9 @@ impl ReadNorFlash for SecurityFlash {
 
     fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
         let physical = Self::physical_offset(offset, bytes.len())?;
-        self.flash.read(physical, bytes)
+        self.flash
+            .read(physical, bytes)
+            .inspect_err(|error| report("read", physical, bytes.len(), error))
     }
 
     fn capacity(&self) -> usize {
@@ -70,13 +72,25 @@ impl NorFlash for SecurityFlash {
         let physical_to = physical_from
             .checked_add(to - from)
             .ok_or(FlashError::OutOfBounds)?;
-        self.flash.erase(physical_from, physical_to)
+        self.flash
+            .erase(physical_from, physical_to)
+            .inspect_err(|error| report("erase", physical_from, length, error))
     }
 
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
         let physical = Self::physical_offset(offset, bytes.len())?;
-        self.flash.write(physical, bytes)
+        self.flash
+            .write(physical, bytes)
+            .inspect_err(|error| report("write", physical, bytes.len(), error))
     }
+}
+
+/// Name the failing physical flash operation before the security journal
+/// collapses it into `SecurityStoreError::Hardware`. Compiled out when the
+/// final image disables logging.
+#[cold]
+fn report(operation: &str, physical: u32, length: usize, error: &FlashError) {
+    log::warn!("security flash {operation} failed: addr=0x{physical:05x} len={length} {error:?}");
 }
 
 pub type SecurityStore = SecurityStateJournal<SecurityFlash>;

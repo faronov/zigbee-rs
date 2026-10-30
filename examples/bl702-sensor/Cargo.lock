@@ -56,6 +56,7 @@ dependencies = [
  "bl702-hal",
  "bl702-xt-zb1",
  "embedded-storage",
+ "log",
  "sensor-sed-app",
  "zigbee-aps",
  "zigbee-runtime",
