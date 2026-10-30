@@ -10,8 +10,8 @@ compile_error!("select exactly one of the phy6222 or phy6252 features");
 mod flash;
 mod pins;
 mod resources;
-pub mod time;
-pub mod vectors;
+
+pub use phy6222_hal::{time, vectors};
 
 pub use flash::{INTERNAL_FLASH_CAPACITY, InternalFlash};
 pub use phy6222_hal::adc::AdcError;

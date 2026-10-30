@@ -33,6 +33,15 @@ pub const GPIO_INT_POLARITY: u32 = AP_GPIO_BASE + 0x3C;
 pub const GPIO_INT_STATUS: u32 = AP_GPIO_BASE + 0x40;
 pub const GPIO_PORTA_EOI: u32 = AP_GPIO_BASE + 0x4C;
 
+// ── IOMUX registers (`AP_IOMUX_TypeDef`) ───────────────────────
+
+pub const IOMUX_ANALOG_IO_EN: u32 = AP_IOMUX_BASE;
+pub const IOMUX_FULL_MUX0_EN: u32 = AP_IOMUX_BASE + 0x0C;
+/// `gpio_pad_en`: bit 0/1 hand P2/P3 from SWD to the pin function.
+pub const IOMUX_GPIO_PAD_EN: u32 = AP_IOMUX_BASE + 0x14;
+/// `gpio_sel[9]`: four 6-bit function fields per register.
+pub const IOMUX_GPIO_SEL: u32 = AP_IOMUX_BASE + 0x18;
+
 // ── I2C registers (DesignWare IP) ──────────────────────────────
 
 pub const I2C_IC_CON: u32 = 0x00;
@@ -71,7 +80,13 @@ pub const SPIF_FCMD_WRDATA: u32 = AP_SPIF_BASE + 0xA8;
 // ── Cache control ──────────────────────────────────────────────
 
 pub const CACHE_CTRL0: u32 = AP_CACHE_BASE;
-pub const CACHE_BYPASS_REG: u32 = 0x4000_0044;
+/// `AP_PCR->CACHE_CLOCK_GATE` (offset 0x20): bit 0 `MOD_PCLK_CACHE`,
+/// bit 1 `MOD_HCLK_CACHE`.
+pub const PCR_CACHE_CLOCK_GATE: u32 = AP_PCR_BASE + 0x20;
+/// `AP_PCR->CACHE_RST` (`mcu_phy_bumbee.h` `AP_PCR_TypeDef`, offset 0x24).
+pub const PCR_CACHE_RST: u32 = AP_PCR_BASE + 0x24;
+/// `AP_PCR->CACHE_BYPASS` (offset 0x28).
+pub const CACHE_BYPASS_REG: u32 = AP_PCR_BASE + 0x28;
 
 // ── PCRM (power/clock/ADC control) ────────────────────────────
 
@@ -111,11 +126,18 @@ pub const RET_SRAM0: u32 = 1 << 0; // 32K: 0x1FFF0000–0x1FFF7FFF
 pub const RET_SRAM1: u32 = 1 << 1; // 16K: 0x1FFF8000–0x1FFFBFFF
 pub const RET_SRAM2: u32 = 1 << 2; // 16K: 0x1FFFC000–0x1FFFFFFF
 
-// ── Clock gating (AP_PCR->SW_CLK) ─────────────────────────────
+// ── Clock gating (AP_PCR->SW_CLK / SW_CLK1) ───────────────────
+//
+// `AP_PCR_TypeDef`: SW_RESET0 0x00, SW_RESET1 0x04, SW_CLK 0x08,
+// SW_RESET2 0x0C, SW_RESET3 0x10, SW_CLK1 0x14, APB_CLK 0x18.
 
-pub const PCR_SW_CLK: u32 = AP_PCR_BASE;
+pub const PCR_SW_RESET0: u32 = AP_PCR_BASE;
+pub const PCR_SW_CLK: u32 = AP_PCR_BASE + 0x08;
+pub const PCR_SW_RESET2: u32 = AP_PCR_BASE + 0x0C;
+pub const PCR_SW_CLK1: u32 = AP_PCR_BASE + 0x14;
 
 pub const MOD_IOMUX_BIT: u32 = 1 << 7;
+pub const MOD_UART0_BIT: u32 = 1 << 8;
 pub const MOD_I2C0_BIT: u32 = 1 << 9;
 pub const MOD_I2C1_BIT: u32 = 1 << 10;
 pub const MOD_GPIO_BIT: u32 = 1 << 13;

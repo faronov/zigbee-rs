@@ -13,7 +13,9 @@ phy62x2-evk = { path = "../../boards/phy62x2-evk", default-features = false }
 phy62x2-evk-product = { path = "../../products/phy62x2-evk", default-features = false }
 
 # Embassy async runtime
-embassy-executor = { version = "0.7", default-features = false, features = ["arch-cortex-m", "executor-thread"] }
+# The `main` task future (~12 KiB: device, NWK/APS tables, profile) is
+# allocated from the executor arena at startup; the 4 KiB default traps.
+embassy-executor = { version = "0.7", default-features = false, features = ["arch-cortex-m", "executor-thread", "task-arena-size-16384"] }
 embassy-time = { version = "0.5", default-features = false }
 
 # ARM Cortex-M0 support

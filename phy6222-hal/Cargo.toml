@@ -8,3 +8,16 @@ description = "Pure-Rust HAL for PHY6222/PHY6226/PHY6252 SoC — no vendor SDK"
 cortex-m = "0.7"
 embedded-hal = "1.0"
 embedded-storage = "0.3"
+cortex-m-rt = { version = "0.7", optional = true }
+embassy-time-driver = { version = "0.2", optional = true }
+portable-atomic = { version = "1", features = ["critical-section"], optional = true }
+
+[features]
+default = []
+# Image runtime contract: the PHY62x2 boot ROM jumps to `Reset` on its own
+# stack (initial SP 0x1fff1830, inside the ROM data area below the
+# application SRAM) and ignores the run descriptor's SP word, so the reset
+# handler must load MSP from the linker's `_stack_start` itself.
+rt = ["dep:cortex-m-rt", "cortex-m-rt/set-sp"]
+# SysTick-backed Embassy time driver (registers the global time driver).
+time-driver = ["dep:cortex-m-rt", "dep:embassy-time-driver", "dep:portable-atomic"]

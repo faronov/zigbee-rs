@@ -237,8 +237,11 @@ name = "phy6222-hal"
 version = "0.1.0"
 dependencies = [
  "cortex-m",
+ "cortex-m-rt",
+ "embassy-time-driver",
  "embedded-hal 1.0.0",
  "embedded-storage",
+ "portable-atomic",
 ]
 
 [[package]]
@@ -247,10 +250,8 @@ version = "0.1.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
- "embassy-time-driver",
  "embedded-storage",
  "phy6222-hal",
- "portable-atomic",
 ]
 
 [[package]]

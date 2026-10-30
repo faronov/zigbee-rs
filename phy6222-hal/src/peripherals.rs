@@ -12,6 +12,12 @@ pub struct FlashToken {
     _private: (),
 }
 
+/// Exclusive UART0 ownership token.
+#[derive(Debug)]
+pub struct Uart0Token {
+    _private: (),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum I2cInstance {
     I2c0,
@@ -34,6 +40,7 @@ pub struct Peripherals {
     pub flash: FlashToken,
     pub i2c0: I2cToken,
     pub i2c1: I2cToken,
+    pub uart0: Uart0Token,
 }
 
 static mut TAKEN: bool = false;
@@ -58,6 +65,7 @@ impl Peripherals {
                         i2c1: I2cToken {
                             instance: I2cInstance::I2c1,
                         },
+                        uart0: Uart0Token { _private: () },
                     })
                 }
             }

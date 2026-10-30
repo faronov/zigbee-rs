@@ -197,39 +197,42 @@ fn write(offset: u32, data: &[u8]) -> Result<(), FlashError> {
     result
 }
 
+/// Maximum STIG write-data payload: `fcmd_wrdata[0..2]` at SPIF+0xA8/0xAC.
+///
+/// The SPIF command register encodes the write-data byte count as
+/// `(bytes - 1) << 12` in a 3-bit field (SDK `spif_cmd`, pvvx
+/// `rdwr_phy62x2.py::wr_flash_cmd`), so one page-program command carries at
+/// most eight bytes.
+const STIG_MAX_WRITE: usize = 8;
+
 #[unsafe(link_section = ".data.ram_code")]
 #[inline(never)]
 fn write_inner(offset: u32, data: &[u8]) -> Result<(), FlashError> {
     let mut pos = 0;
     while pos < data.len() {
-        let page_boundary = ((offset as usize + pos) | 0xFF) + 1;
-        let remaining_in_page = page_boundary - (offset as usize + pos);
-        let chunk_len = (data.len() - pos).min(remaining_in_page).min(256);
+        let address = offset as usize + pos;
+        let remaining_in_page = ((address | 0xFF) + 1) - address;
+        let chunk_len = (data.len() - pos)
+            .min(remaining_in_page)
+            .min(STIG_MAX_WRITE);
 
-        write_enable()?;
-
-        // Set address
-        reg_write(SPIF_FCMD_ADDR, offset + pos as u32);
-
-        // Write data to FIFO
+        let mut words = [0xFFFF_FFFFu32; 2];
         let mut i = 0;
         while i < chunk_len {
-            let mut word = 0xFFFF_FFFFu32;
-            for b in 0..4 {
-                if i + b < chunk_len {
-                    word &= !(0xFF << (b * 8));
-                    let byte = unsafe { *data.as_ptr().add(pos + i + b) };
-                    word |= (byte as u32) << (b * 8);
-                }
-            }
-            reg_write(SPIF_FCMD_WRDATA + (i as u32 / 4) * 4, word);
-            i += 4;
+            let byte = unsafe { *data.as_ptr().add(pos + i) };
+            let word = &mut words[(i >> 2) & 1];
+            *word &= !(0xFF << ((i % 4) * 8));
+            *word |= (byte as u32) << ((i % 4) * 8);
+            i += 1;
         }
 
-        // Page Program
-        let wr_words = chunk_len.div_ceil(4) as u32;
+        write_enable()?;
+        reg_write(SPIF_FCMD_ADDR, address as u32);
+        reg_write(SPIF_FCMD_WRDATA, words[0]);
+        reg_write(SPIF_FCMD_WRDATA + 4, words[1]);
+        // Page Program 0x02, 3 address bytes, `chunk_len` write-data bytes.
         let fcmd =
-            (0x02u32 << 24) | 0x8_0001 | (2 << 16) | 0x8000 | (wr_words.saturating_sub(1) << 12);
+            (0x02u32 << 24) | 0x8_0000 | (2 << 16) | 0x8000 | (((chunk_len as u32) - 1) << 12) | 1;
         reg_write(SPIF_FCMD, fcmd);
         spif_wait_idle()?;
         spif_wait_not_busy()?;
@@ -290,20 +293,29 @@ fn spif_wait_not_busy() -> Result<(), FlashError> {
 #[unsafe(link_section = ".data.ram_code")]
 #[inline(never)]
 fn enter_cache_bypass() {
+    // SDK `HAL_CACHE_ENTER_BYPASS_SECTION` (flash.c).
     reg_write(CACHE_CTRL0, 0x02);
+    reg_write(PCR_CACHE_RST, 0x02);
     reg_write(CACHE_BYPASS_REG, 1);
 }
 
 #[unsafe(link_section = ".data.ram_code")]
 #[inline(never)]
 fn exit_cache_bypass() {
+    // SDK `HAL_CACHE_EXIT_BYPASS_SECTION` (flash.c).
     reg_write(CACHE_CTRL0, 0x00);
+    reg_write(PCR_CACHE_RST, 0x03);
     reg_write(CACHE_BYPASS_REG, 0);
 }
 
 #[unsafe(link_section = ".data.ram_code")]
 #[inline(never)]
 fn cache_flush() {
+    // SDK `hal_cache_tag_flush`: the tag flush runs with the cache bypassed.
+    let bypassed = reg_read(CACHE_BYPASS_REG);
+    if bypassed == 0 {
+        reg_write(CACHE_BYPASS_REG, 1);
+    }
     reg_write(CACHE_CTRL0, 0x02);
     for _ in 0..8 {
         ram_nop!();
@@ -313,6 +325,28 @@ fn cache_flush() {
         ram_nop!();
     }
     reg_write(CACHE_CTRL0, 0x00);
+    if bypassed == 0 {
+        reg_write(CACHE_BYPASS_REG, 0);
+    }
+}
+
+/// Enable the XIP instruction cache (SDK `hal_cache_init`).
+///
+/// The boot ROM hands over with `CACHE_BYPASS = 1`, so every XIP fetch goes
+/// to the SPI flash until this runs; the SDK calls it from
+/// `hal_spif_cache_init` during startup. Idempotent.
+#[unsafe(link_section = ".data.ram_code")]
+#[inline(never)]
+pub fn enable_xip_cache() {
+    let gate = reg_read(PCR_CACHE_CLOCK_GATE);
+    reg_write(PCR_CACHE_CLOCK_GATE, gate | 0x03);
+    reg_write(PCR_CACHE_RST, 0x02);
+    for _ in 0..100 {
+        ram_nop!();
+    }
+    reg_write(PCR_CACHE_RST, 0x03);
+    cache_flush();
+    reg_write(CACHE_BYPASS_REG, 0);
 }
 
 /// Prepare the flash for a non-returning system-sleep transition.

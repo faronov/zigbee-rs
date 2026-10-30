@@ -30,6 +30,7 @@ impl Resources {
             flash,
             i2c0,
             i2c1: _,
+            uart0: _,
         } = Peripherals::take().ok_or(BoardError::AlreadyTaken)?;
 
         gpio::set_output(pins::STATUS_LED);

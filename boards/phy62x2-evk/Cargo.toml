@@ -11,9 +11,7 @@ publish = false
 cortex-m = "0.7"
 cortex-m-rt = { version = "0.7", features = ["device"] }
 embedded-storage = "0.3"
-embassy-time-driver = "0.2"
-phy6222-hal = { path = "../../phy6222-hal" }
-portable-atomic = { version = "1", features = ["critical-section"] }
+phy6222-hal = { path = "../../phy6222-hal", features = ["rt", "time-driver"] }
 
 [features]
 default = []

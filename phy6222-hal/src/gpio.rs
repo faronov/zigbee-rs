@@ -91,25 +91,25 @@ pub fn set_fmux(pin: u8, fmux: u8) {
     let sw_clk = reg_read(PCR_SW_CLK);
     reg_write(PCR_SW_CLK, sw_clk | MOD_IOMUX_BIT);
 
-    // Write 6-bit mux field into gpio_sel register
+    // Write the 6-bit mux field into `gpio_sel[pin >> 2]` (SDK
+    // `hal_gpio_fmux_set`).
     let reg_idx = (pin >> 2) as u32;
     let bit_idx = (pin & 3) as u32;
     let shift = bit_idx * 8;
     let mask = 0x3F << shift;
 
-    let sel_addr = AP_IOMUX_BASE + 0x08 + reg_idx * 4;
+    let sel_addr = IOMUX_GPIO_SEL + reg_idx * 4;
     let old = reg_read(sel_addr);
     reg_write(sel_addr, (old & !mask) | ((fmux as u32) << shift));
 
-    // Enable full-mux for this pin
-    let mux_en_addr = AP_IOMUX_BASE;
-    let mux_en = reg_read(mux_en_addr);
-    reg_write(mux_en_addr, mux_en | (1 << pin));
+    // Enable full-mux for this pin (`full_mux0_en`).
+    let mux_en = reg_read(IOMUX_FULL_MUX0_EN);
+    reg_write(IOMUX_FULL_MUX0_EN, mux_en | (1 << pin));
 }
 
 /// Disable IOMUX for a pin (return to GPIO mode).
 pub fn clear_fmux(pin: u8) {
-    let mux_en_addr = AP_IOMUX_BASE;
+    let mux_en_addr = IOMUX_FULL_MUX0_EN;
     let mux_en = reg_read(mux_en_addr);
     reg_write(mux_en_addr, mux_en & !(1 << pin));
 }

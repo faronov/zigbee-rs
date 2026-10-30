@@ -4,9 +4,11 @@
 //! Uses the SysTick exception (always available on Cortex-M) so no
 //! PHY6222-specific timer peripherals are needed.
 //!
-//! # Clock assumption
-//! HCLK = 48 MHz (PHY6222 default after ROM boot via DLL).
-//! If your board uses a different system clock, adjust `HCLK_HZ`.
+//! # Clock
+//! [`init`] switches HCLK to the DLL 48 MHz output
+//! ([`crate::clock::init_dll48m`]) before starting SysTick, so the 48 MHz
+//! reload below is the real core clock rather than an assumption about the
+//! ROM's choice (the PB-03F ROM leaves the core at 32 MHz).
 //!
 //! # Resolution
 //! - Monotonic: ~1 µs (SysTick counts at 48 MHz, sub-ms interpolation)
@@ -19,11 +21,7 @@ use portable_atomic::{AtomicU64, Ordering};
 
 // ── Configuration ───────────────────────────────────────────────
 
-/// PHY6222 system clock (HCLK) frequency in Hz.
-///
-/// Default: 48 MHz from DLL after ROM bootloader.
-/// The `init_hardware()` in the radio driver enables DLL/DBL clocks
-/// but does not change HCLK — it stays at the ROM default.
+/// HCLK frequency in Hz established by [`init`].
 const HCLK_HZ: u32 = 48_000_000;
 
 /// SysTick fires every 1 ms (48,000 HCLK cycles).
@@ -146,8 +144,12 @@ embassy_time_driver::time_driver_impl!(
     static TIME_DRIVER: Phy6222TimeDriver = Phy6222TimeDriver::new()
 );
 
-/// Initialize the time driver. Call from main before starting async tasks.
+/// Enable the XIP cache, switch HCLK to DLL 48 MHz and start the time
+/// driver. Call from main before starting async tasks and before any
+/// peripheral derives a rate from HCLK.
 pub fn init() {
+    crate::flash::enable_xip_cache();
+    crate::clock::init_dll48m();
     TIME_DRIVER.init();
 }
 
@@ -168,6 +170,11 @@ fn now_locked() -> u64 {
     base + pending_wrap as u64 * TICKS_PER_MS + elapsed_in_period / HCLK_PER_TICK
 }
 
+/// Monotonic time in microseconds (Embassy ticks).
+pub fn now_us() -> u64 {
+    cortex_m::interrupt::free(|_| now_locked())
+}
+
 /// Run a flash operation without losing monotonic time while IRQs are masked.
 pub fn run_flash_operation<T>(operation: impl FnOnce() -> T) -> T {
     let mut output = None;
@@ -178,11 +185,11 @@ pub fn run_flash_operation<T>(operation: impl FnOnce() -> T) -> T {
             core::ptr::write_volatile(SCB_ICSR, ICSR_PENDSTCLR);
         }
 
-        let rtc_before = phy6222_hal::sleep::rtc_count();
+        let rtc_before = crate::sleep::rtc_count();
         output = Some(operation());
-        let rtc_after = phy6222_hal::sleep::rtc_count();
+        let rtc_after = crate::sleep::rtc_count();
         let rtc_elapsed = rtc_after.wrapping_sub(rtc_before) & 0x00ff_ffff;
-        let elapsed_ticks = rtc_elapsed as u64 * TICK_HZ / phy6222_hal::sleep::RC32K_HZ as u64;
+        let elapsed_ticks = rtc_elapsed as u64 * TICK_HZ / crate::sleep::RC32K_HZ as u64;
         TICK_BASE.store(before.saturating_add(elapsed_ticks), Ordering::Relaxed);
 
         unsafe {
