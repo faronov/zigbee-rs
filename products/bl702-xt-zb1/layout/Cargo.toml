@@ -1,0 +1,16 @@
+[package]
+name = "bl702-xt-zb1-layout"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Flash map and OTA signing key shared by the BL702 XT-ZB1 application, its bootloader and tooling"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+build = "build.rs"
+
+# Standalone like the product crate; the application, the bootloader binary
+# and their host tests consume it by path.
+[workspace]
+
+[dependencies]
+mcuboot-image = { path = "../../../mcuboot-image" }

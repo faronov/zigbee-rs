@@ -1,0 +1,32 @@
+[package]
+name = "bl702-xt-zb1-boot"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Overwrite-only MCUboot-compatible bootloader for the BL702 XT-ZB1 (flash 0x2000..0x10000)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone embedded binary like examples/bl702-sensor.
+[workspace]
+
+[dependencies]
+bl702-boot = { path = "../../../bootloaders/bl702-boot" }
+bl702-hal = { path = "../../../bl702-hal" }
+bl702-xt-zb1 = { path = "../../../boards/bl702-xt-zb1" }
+bl702-xt-zb1-layout = { path = "../layout" }
+riscv = { version = "0.15", features = ["critical-section-single-hart"] }
+riscv-rt = "0.16"
+panic-halt = "1.0"
+
+[[bin]]
+name = "bl702-xt-zb1-boot"
+test = false
+bench = false
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true

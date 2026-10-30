@@ -1,0 +1,18 @@
+[package]
+name = "bl702-boot"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust MCUboot-compatible overwrite-only bootloader core for the BL702"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone like bl702-hal; a product's bootloader binary consumes it.
+[workspace]
+
+[dependencies]
+embedded-storage = "0.3"
+mcuboot-image = { path = "../../mcuboot-image", features = ["compact-sha256"] }
+
+[target.'cfg(target_arch = "riscv32")'.dependencies]
+bl702-hal = { path = "../../bl702-hal" }

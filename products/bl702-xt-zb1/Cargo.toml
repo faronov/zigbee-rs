@@ -10,10 +10,16 @@ publish = false
 [dependencies]
 bl702-hal = { path = "../../bl702-hal" }
 bl702-xt-zb1 = { path = "../../boards/bl702-xt-zb1" }
+bl702-xt-zb1-layout = { path = "layout" }
 embedded-storage = "0.3"
 log = "0.4"
-sensor-sed-app = { path = "../../apps/sensor-sed" }
+mcuboot-image = { path = "../../mcuboot-image", features = ["firmware-writer"] }
+sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"] }
 zigbee-aps = { path = "../../zigbee-aps" }
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-mac = { path = "../../zigbee-mac" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["ota"] }
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[dev-dependencies]
+zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }

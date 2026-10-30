@@ -97,7 +97,7 @@ download that resumes on hardware is still an open gate.
 | ESP32-H2 | same product writer/layout | prior H2 run demonstrated v1→v2 activation/reboot/network retention; current exact image has build/layout evidence only |
 | EFR32MG1 | Gecko Bootloader storage slot 0 through `BootloaderFlashAccess` | writer implemented; real Zigbee download/install/reboot open |
 | nRF52840/52833 | no writer in current products | `NoOta` |
-| BL702 | no OTA partition/writer | `NoOta`; raw flash validation still open |
+| BL702 | overwrite-only `bl702-xt-zb1-boot` loader (`mcuboot-image`, ECDSA P-256); download into the secondary slot `0x87000..0xFE000` | loader, writer and release tooling build/host-tested; hardware boot and OTA open |
 | PHY6222/CC2340/EFR32MG21/TLSR8258 | no product writer | `NoOta` |
 
 ## ESP32 layout

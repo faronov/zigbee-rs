@@ -16,14 +16,15 @@ mod hal;
 mod time_driver;
 mod wake;
 
+use core::cell::RefCell;
 use core::fmt::{Display, Formatter, Write};
 
 use bl702_xt_zb1_product as product;
 use embassy_executor::Executor;
 use panic_halt as _;
-use sensor_sed_app::{
-    BlockingBattery, BlockingEnvironment, NoOta, NoStatus, SensorApp, SensorSedParts,
-};
+use product::ota::{Bl702OtaLifecycle, Channel};
+use product::storage::{OtaFlash, SharedFlash};
+use sensor_sed_app::{BlockingBattery, BlockingEnvironment, NoStatus, SensorApp, SensorSedParts};
 use zigbee_mac::{MacPib, SoftMacCore, bl702::radio_phy::Bl702RadioPhy};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
@@ -117,13 +118,20 @@ async fn sensor(application: hal::ApplicationResources) {
         other_pins,
     } = application;
     let battery = hal::SupplyBattery::new(adc);
-    let mut security_store = match product::storage::security_store(flash) {
-        Ok(store) => store,
+
+    // One flash token shared by the security journal, the OTA writer and
+    // the loader-record read; each operation borrows it briefly and every
+    // user is confined to its own partition.
+    let flash = match product::storage::main_flash(flash) {
+        Ok(flash) => RefCell::new(flash),
         Err(error) => {
             log::error!("security storage initialization failed: {error:?}");
             hal::halt()
         }
     };
+    let mut security_store = product::storage::security_store(SharedFlash::new(&flash));
+    let channel = Channel::read(&mut OtaFlash::new(SharedFlash::new(&flash)));
+    log_version(channel);
 
     // Retain ownership of unused fitted/application resources for the task's
     // lifetime. No physical environmental sensor is selected for this product.
@@ -166,7 +174,13 @@ async fn sensor(application: hal::ApplicationResources) {
         product::TX_POWER_DBM
     );
 
-    let mut profile = product::profile::sensor_profile();
+    let mut profile = match product::ota::sensor_ota_profile(SharedFlash::new(&flash)) {
+        Ok(profile) => profile,
+        Err(error) => {
+            log::error!("OTA profile composition failed: {error:?}");
+            hal::halt()
+        }
+    };
     let mut device = ZigbeeDevice::builder(mac)
         .power_mode(product::policy::SENSOR_POLICY.power_mode())
         .automatic_polling(false)
@@ -202,7 +216,7 @@ async fn sensor(application: hal::ApplicationResources) {
             status: NoStatus,
             environment: BlockingEnvironment::new(product::environment::SyntheticEnvironment::new()),
             battery: BlockingBattery::new(battery),
-            ota: NoOta,
+            ota: Bl702OtaLifecycle::new(channel, bl702_hal::pm::software_reset),
             actions: product::policy::USER_ACTIONS,
             supervisor: hal::Bl702Supervisor,
             diagnostics: hal::Bl702Diagnostics,
@@ -217,6 +231,36 @@ async fn sensor(application: hal::ApplicationResources) {
 
     app.run().await
 }
+
+/// The running firmware version for the bootloader/OTA bench log. The raw
+/// marker line also appears in production builds, whose `log` output is
+/// compiled out.
+fn log_version(channel: Channel) {
+    let mut uart = UartWriter;
+    let _ = write!(
+        uart,
+        "BL702 app {} (OTA file 0x{:08X}{})\r\n",
+        product::SW_BUILD,
+        product::ota::FILE_VERSION,
+        if product::VERSION_OVERRIDDEN {
+            ", TEST-ONLY version override"
+        } else {
+            ""
+        }
+    );
+    log::info!(
+        "OTA channel {channel:?}: manufacturer 0x{:04X} image type 0x{:04X} version 0x{:08X}",
+        product::ota::MANUFACTURER_CODE,
+        product::ota::IMAGE_TYPE,
+        product::ota::FILE_VERSION
+    );
+}
+
+/// The OTA file version, kept in the ELF so `tools/bl702_ota.py` can check
+/// the Zigbee OTA header it writes against the firmware it wraps.
+#[unsafe(no_mangle)]
+#[used]
+static BL702_OTA_FILE_VERSION: u32 = product::ota::FILE_VERSION;
 
 fn marker(text: &[u8]) {
     for byte in text {

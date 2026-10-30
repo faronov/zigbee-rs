@@ -50,18 +50,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "bl702-xt-zb1-layout"
+version = "0.1.0"
+dependencies = [
+ "mcuboot-image",
+]
+
+[[package]]
 name = "bl702-xt-zb1-product"
 version = "0.1.0"
 dependencies = [
  "bl702-hal",
  "bl702-xt-zb1",
+ "bl702-xt-zb1-layout",
  "embedded-storage",
  "log",
+ "mcuboot-image",
  "sensor-sed-app",
  "zigbee-aps",
+ "zigbee-mac",
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zcl",
+]
+
+[[package]]
+name = "block-buffer"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+dependencies = [
+ "generic-array",
 ]
 
 [[package]]
@@ -144,6 +163,16 @@ dependencies = [
  "darling_core",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "digest"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+dependencies = [
+ "block-buffer",
+ "crypto-common",
 ]
 
 [[package]]
@@ -393,6 +422,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "mcuboot-image"
+version = "0.1.0"
+dependencies = [
+ "embedded-storage",
+ "sha2",
+ "zigbee-runtime",
+]
+
+[[package]]
 name = "nb"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -526,6 +564,17 @@ dependencies = [
  "zigbee-mac",
  "zigbee-runtime",
  "zigbee-zcl",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

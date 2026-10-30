@@ -206,7 +206,9 @@ impl Supervisor for Bl702Supervisor {
     }
 
     fn reset(&mut self) -> ! {
-        halt()
+        // Re-enter the boot ROM, then the bootloader, which installs any
+        // requested update before starting the application again.
+        bl702_hal::pm::software_reset()
     }
 }
 

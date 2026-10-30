@@ -1,12 +1,16 @@
-/* BL702 XT-ZB1 product memory layout.
+/* BL702 XT-ZB1 product memory layout (application).
  *
- * The linked XIP payload remains capped at 512 KiB. The crash-safe Zigbee
- * security journal occupies physical flash offsets 0xFE000..0x100000, well
- * above the boot header and maximum linked payload.
+ * The application runs from the primary MCUboot slot behind the product
+ * bootloader (bootloader/), see layout/src/lib.rs:
+ *   physical 0x10000 primary slot = XIP 0x2300E000; the 0x100-byte imgtool
+ *   header precedes the application, so _start (riscv-rt .init) is linked
+ *   at 0x2300E100. LENGTH leaves room for the signature TLVs and the slot
+ *   trailer sector. The security journal (physical 0xFE000..0x100000) and
+ *   the OTA secondary slot (0x87000..0xFE000) are outside this window.
  */
 MEMORY
 {
-  FLASH : ORIGIN = 0x23000000, LENGTH = 512K
+  FLASH : ORIGIN = 0x2300E100, LENGTH = 0x75C00
   /* Keep the initial stack below the BL702 reset-time embedded-memory window.
      The product conservatively leaves the top 16 KiB unused. */
   RAM1  : ORIGIN = 0x42014000, LENGTH = 80K

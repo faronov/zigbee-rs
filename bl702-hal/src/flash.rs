@@ -276,6 +276,45 @@ fn rom_load_config(_config: &mut FlashConfig) -> Result<(), FlashError> {
     Err(FlashError::UnsupportedTarget)
 }
 
+/// Invalidate the L1C cache that fronts the XIP window.
+///
+/// Required after flash behind the XIP window was erased or programmed and
+/// before that code or data is fetched through XIP again, e.g. by a
+/// bootloader that installed a new application image before jumping to it.
+/// Runs from RAM with interrupts masked, using the same ROM routine and
+/// way-disable mask as the flash initialization.
+pub fn invalidate_xip_cache() -> Result<(), FlashError> {
+    rom_cache_flush()
+}
+
+#[cfg(target_arch = "riscv32")]
+#[inline(never)]
+#[unsafe(link_section = ".data.ram_code")]
+fn rom_cache_flush() -> Result<(), FlashError> {
+    type CacheFlush = unsafe extern "C" fn(u8) -> i32;
+
+    let cache_flush: CacheFlush = unsafe { core::mem::transmute(rom_entry(ROM_L1C_CACHE_FLUSH)) };
+    let way_disable = ((crate::mmio::read32(L1C_CONFIG) >> L1C_WAY_DISABLE_SHIFT) & 0x0f) as u8;
+
+    let previous_mstatus: usize;
+    // SAFETY: The flush executes from RAM with interrupts masked, so no XIP
+    // fetch can observe the cache while it is being invalidated.
+    unsafe {
+        core::arch::asm!("csrrci {}, mstatus, 8", out(reg) previous_mstatus);
+    }
+    let result = unsafe { cache_flush(way_disable) };
+    if previous_mstatus & (1 << 3) != 0 {
+        // SAFETY: Restore MIE only if it was enabled on entry.
+        unsafe { core::arch::asm!("csrsi mstatus, 8") };
+    }
+    rom_result(result)
+}
+
+#[cfg(not(target_arch = "riscv32"))]
+fn rom_cache_flush() -> Result<(), FlashError> {
+    Err(FlashError::UnsupportedTarget)
+}
+
 #[cfg(target_arch = "riscv32")]
 #[inline(never)]
 #[unsafe(link_section = ".data.ram_code")]
