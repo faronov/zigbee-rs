@@ -1,95 +1,124 @@
-//! Pure-Rust IEEE 802.15.4 radio driver for Phyplus PHY6222/6252.
+//! Pure-Rust IEEE 802.15.4 radio driver for Phyplus PHY6222/PHY6252.
 //!
-//! The PHY6222 is an ARM Cortex-M0 BLE SoC whose radio hardware also supports
-//! IEEE 802.15.4 (Zigbee) modulation. This driver configures the radio entirely
-//! through memory-mapped registers — **no vendor binary blobs required**.
+//! The PHY62x2 is an ARM Cortex-M0 BLE SoC whose radio also supports IEEE
+//! 802.15.4 O-QPSK (250 kbps, `PKT_FMT_ZIGBEE`). This driver configures the
+//! radio entirely through memory-mapped registers; no vendor library or ROM
+//! radio routine is called.
 //!
-//! # Radio hardware
-//! - 2.4 GHz multi-protocol: BLE 1M/2M/LR + IEEE 802.15.4 (O-QPSK, 250 kbps)
-//! - TX power: -20 dBm to +10 dBm (5-bit DAC, register `0x400300b8`)
-//! - CRC-16 in hardware (Zigbee FCS polynomial)
-//! - Hardware whitening bypass for 802.15.4
-//! - RSSI per-packet via `0x400300e4` foot word
+//! # Register-level provenance
+//! Analog/baseband register values are transcribed from the PHYPLUS PHY62xx
+//! SDK `rf_phy_driver.c` as redistributed in pvvx/THB2
+//! (`bthome_phy6222/SDK/lib/ble_controller/rf_phy_driver.c`) and
+//! pvvx/phy62x2-SDK (`lib/rf/rf_phy_driver.c`); LL-HW engine access follows
+//! `ll_hw_drv.c` from the same trees. Where the two SDK revisions differ the
+//! newer phy62x2-SDK value is used and the difference is noted inline. The
+//! SDK only exercises the Zigbee packet format from its direct-test-mode
+//! (DTM) code, so the MAC-level use here (single TX / single RX with
+//! software ACKs) is this crate's own composition of those primitives.
+//!
+//! # Hardware validation
+//! The radio path is validated on a PB-03F (PHY6252) against an independent
+//! 802.15.4 sniffer; see `docs/book/src/platform-guides/phy6222.md` for the
+//! current validation level. Low-power operation and CCA/ED accuracy are not
+//! hardware-proven.
 //!
 //! # Architecture
 //! ```text
 //! Phy6222Driver (pure Rust, async)
-//!   ├── RF PHY registers (0x40030000..0x40030110)
-//!   │     ├── rf_phy_bb_cfg()   → baseband for Zigbee mode
-//!   │     ├── rf_phy_ana_cfg()  → PLL, LNA, PA configuration
-//!   │     └── set_channel()     → frequency synthesis
-//!   ├── LL HW registers (0x40031000..0x40031060)
-//!   │     ├── ll_hw_set_stx()   → single TX mode
-//!   │     ├── ll_hw_set_srx()   → single RX mode
-//!   │     └── ll_hw_trigger()   → start operation
-//!   ├── TX FIFO (0x40031400)    → write frame data
-//!   ├── RX FIFO (0x40031C00)    → read received frames
-//!   └── IRQ → Embassy Signal for async completion
+//!   ├── RF PHY / BB registers (0x4003_0000..0x4003_0130)
+//!   │     ├── ana_cfg()      → clocks, PLL, PA ramp, RX front end
+//!   │     ├── tp_cal()       → two-point modulation calibration
+//!   │     ├── rx_dcoc_cal()  → RX DC-offset calibration
+//!   │     └── bb_cfg()       → PKT_FMT_ZIGBEE baseband + AGC table
+//!   ├── LL HW engine (0x4003_1000..0x4003_1080)
+//!   │     ├── STX / SRX single-shot modes, MODE_DONE interrupt
+//!   │     └── word-wide TX FIFO 0x4003_1400 / RX FIFO 0x4003_1C00
+//!   └── LL_IRQ (BB_IRQn = 4) → RX Signal / TX op-idle flag
 //! ```
 //!
-//! # Register map source
-//! Derived from the open-source PHY6222 SDK (`rf_phy_driver.c`, `ll_hw_drv.c`)
-//! available at: <https://github.com/pvvx/THB2>
+//! # Requirements on the caller
+//! * HCLK must be the 48 MHz DLL clock (`phy6222_hal::clock::init_dll48m`) or
+//!   [`RadioConfig::hclk_mhz`] must describe the actual HCLK; the LL timing
+//!   registers are programmed in HCLK cycles.
+//! * An `embassy-time` driver must be running before [`Phy6222Driver::take`]:
+//!   calibration waits are bounded by wall-clock time.
+//! * `BB_IRQn` (4) must be unmasked in the NVIC after `take()`.
 
-// `LL_HW_BASE + 0x00` (the trigger register) is written out with an
-// explicit `+ 0x00` offset throughout this file, matching every other
-// `reg_write(BASE + offset, ...)` call site and the register map comments
-// above each block. This is a deliberate readability/consistency choice
-// for a file that is effectively a register map transcription — silence
-// clippy's `identity_op` for it rather than making the trigger register
-// the one visual outlier among dozens of sibling register writes.
+// `LL_HW_BASE + 0x00` (the trigger register) is written with an explicit
+// `+ 0x00` offset to keep every write visually aligned with the SDK
+// register map.
 #![allow(clippy::identity_op)]
 
-use core::cell::Cell;
-use core::sync::atomic::{AtomicI8, AtomicU8, Ordering};
+use core::cell::{Cell, UnsafeCell};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Instant};
+use zigbee_types::{PanId, ShortAddress};
 
-// ── PHY6222 Register Addresses ──────────────────────────────────
+// ── Register blocks ─────────────────────────────────────────────
 
-/// RF PHY analog/baseband register block.
-const RF_PHY_BASE: u32 = 0x4003_0000;
-
-/// Link-Layer hardware engine base.
-const LL_HW_BASE: u32 = 0x4003_1000;
-
-/// TX FIFO base address (write frame data here).
+/// RF PHY analog + baseband register block (`PHY_REG_WT(0x4003xxxx)`).
+const RF: u32 = 0x4003_0000;
+/// Link-layer hardware engine (`LL_HW_BASE`).
+const LL: u32 = 0x4003_1000;
+/// TX FIFO write port (32-bit words, `LL_HW_TFIFO`).
 const LL_HW_TFIFO: u32 = 0x4003_1400;
-
-/// RX FIFO base address (read received frames here).
+/// RX FIFO read port (32-bit words, `LL_HW_RFIFO`).
 const LL_HW_RFIFO: u32 = 0x4003_1C00;
+/// `0x4000_F040`: xtal-to-digital enable lives in bit 18.
+const AON_CLK_CTRL: u32 = 0x4000_F040;
+/// `0x4000_F044`: RF/RX-ADC clock selection and enables.
+const AON_CLK_CFG: u32 = 0x4000_F044;
+/// `0x4000_F014`: DCDC / digital LDO trim (`DCDC_CONFIG_SETTING`).
+const AON_PMU_CTRL: u32 = 0x4000_F014;
+/// `AP_PCR->SW_RESET2`; bit 10 is `BBLL_RST` (MOD_CP_CPU + 10).
+const PCR_SW_RESET2: u32 = 0x4000_000C;
+const BBLL_RST_BIT: u8 = 10;
 
-/// BB HW base (alias used for channel register).
-const BB_HW_BASE: u32 = 0x4003_0000;
+// ── LL HW interrupt bits (`ll_hw_drv.h` LIRQ_*) ─────────────────
 
-/// Global clock control register (xtal output enable, clock mux).
-const CLK_CTRL_REG: u32 = 0x4000_F040;
-const CLK_CFG_REG: u32 = 0x4000_F044;
+/// Mode done: the STX/SRX operation finished (the only unmasked source).
+const LIRQ_MD: u32 = 0x0001;
+/// CRC error on a received packet.
+const LIRQ_CERR: u32 = 0x0002;
+/// RX timeout: the RX window elapsed without a sync.
+const LIRQ_RTO: u32 = 0x0004;
+/// RX done: a packet was written into the RX FIFO.
+const LIRQ_RD: u32 = 0x0200;
+/// CRC OK on a received packet.
+const LIRQ_COK: u32 = 0x0400;
+/// Second CRC-error flag (TRLP/RTLP chains).
+const LIRQ_CERR2: u32 = 0x0800;
+/// All LL HW interrupt status bits (`LL_HW_IRQ_MASK`).
+const LL_HW_IRQ_MASK: u32 = 0x3FFF;
 
-// ── LL HW IRQ bits ──────────────────────────────────────────────
-
-/// Mode-done interrupt (TX or RX operation complete).
-const LIRQ_MD: u32 = 0x01;
-/// CRC OK on received packet.
-const LIRQ_COK: u32 = 0x02;
-/// CRC error on received packet.
-const LIRQ_CERR: u32 = 0x04;
-/// RX timeout (no packet received within window).
-const LIRQ_RTO: u32 = 0x08;
-
-/// Mask covering all LL HW interrupt sources.
-const LL_HW_IRQ_MASK: u32 = 0x1F;
-
-// ── CRC format constants ────────────────────────────────────────
-
-/// Zigbee CRC-16 format (ITU-T polynomial for 802.15.4).
+/// `LL_HW_CRC_ZB_FMT`: IEEE 802.15.4 CRC-16 for `ll_hw_set_crc_fmt`.
 const LL_HW_CRC_ZB_FMT: u32 = 0x03;
 
-// ── Packet format ───────────────────────────────────────────────
+/// `ll_hw_ign_rfifo` value: bit 1 drops CRC-error packets, bit 0 drops
+/// empty packets, so neither consumes RX FIFO space.
+const LL_HW_IGN_CRC_AND_EMPTY: u32 = 0x03;
 
-/// Zigbee / IEEE 802.15.4 packet format selector.
-const _PKT_FMT_ZIGBEE: u8 = 0;
+/// RX timeout written to `LL+0x24`/`LL+0x28`, in microseconds.
+///
+/// The register is 16 bits wide (`& 0xffff`), so long receives re-arm the
+/// engine on every timeout inside [`Phy6222Driver::receive`]; the re-arm gap
+/// is a few microseconds of interrupt latency.
+const RX_TIMEOUT_US: u32 = 0xFFFF;
+
+/// Bound on a single STX operation (127-byte PSDU is 4.3 ms on air).
+const TX_TIMEOUT: Duration = Duration::from_millis(10);
+
+/// RX window of a TRX operation (`LL+0x24`/`LL+0x28`), in microseconds:
+/// `macAckWaitDuration` (54 symbols) after the end of the transmission.
+const ACK_WAIT_US: u32 = 864;
+
+/// `ll_hw_set_stx` / `ll_hw_set_srx` / `ll_hw_set_trx` mode words (`LL+0x04`).
+const LL_MODE_STX: u32 = 0x0000_0100;
+const LL_MODE_SRX: u32 = 0x0001_0001;
+const LL_MODE_TRX: u32 = 0x0001_0102;
 
 // ── Register access helpers ─────────────────────────────────────
 
@@ -103,74 +132,279 @@ fn reg_read(addr: u32) -> u32 {
     unsafe { core::ptr::read_volatile(addr as *const u32) }
 }
 
-/// Write a bitfield: reg[hi:lo] = value.
+/// `subWriteReg(addr, hi, lo, value)`: `reg[hi:lo] = value`.
 #[inline(always)]
 fn sub_write_reg(addr: u32, hi: u8, lo: u8, value: u32) {
-    let mask = ((1u32 << (hi - lo + 1)) - 1) << lo;
+    let width = hi - lo + 1;
+    let field = if width >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << width) - 1
+    };
+    let mask = field << lo;
     let old = reg_read(addr);
     reg_write(addr, (old & !mask) | ((value << lo) & mask));
 }
 
-// ── Async completion signals ────────────────────────────────────
-
-/// TX completion signal (set from IRQ handler).
-static TX_DONE: Signal<CriticalSectionRawMutex, bool> = Signal::new();
-
-/// RX completion signal (set from IRQ handler).
-static RX_DONE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-static DRIVER_TAKEN: Mutex<CriticalSectionRawMutex, Cell<bool>> = Mutex::new(Cell::new(false));
-
-// Static RX buffer — written by IRQ handler, read after signal.
-struct SyncUnsafeCell<T>(core::cell::UnsafeCell<T>);
-unsafe impl<T> Sync for SyncUnsafeCell<T> {}
-
-impl<T> SyncUnsafeCell<T> {
-    const fn new(value: T) -> Self {
-        Self(core::cell::UnsafeCell::new(value))
-    }
-    fn get(&self) -> *mut T {
-        self.0.get()
+/// Busy-wait for `us` microseconds of wall-clock time.
+fn busy_wait_us(us: u64) {
+    let deadline = Instant::now() + Duration::from_micros(us);
+    while Instant::now() < deadline {
+        core::hint::spin_loop();
     }
 }
 
-/// Maximum IEEE 802.15.4 on-air PSDU size (`aMaxPHYPacketSize` = 127 bytes,
-/// including the 2-byte FCS/CRC-16).
+// ── Frame sizes ─────────────────────────────────────────────────
+
+/// Maximum IEEE 802.15.4 PSDU (`aMaxPHYPacketSize`), including the FCS.
 const MAX_FRAME_LEN: usize = 127;
 
-/// Maximum MPDU length (MAC header + payload) that may be handed to
-/// [`Phy6222Driver::transmit`] or read back from [`Phy6222Driver::receive`].
-///
-/// The hardware appends (TX) / includes (RX) a 2-byte FCS on top of this,
-/// so `MAX_MPDU_LEN + 2 == MAX_FRAME_LEN` keeps the on-air PSDU within
-/// `aMaxPHYPacketSize`. See `transmit()` and `zb_rfifo_mpdu_len()`.
+/// Maximum MPDU (MHR + payload, without FCS) accepted by `transmit` and
+/// returned by `receive`.
 const MAX_MPDU_LEN: usize = MAX_FRAME_LEN - 2;
 
-/// CCA / energy-detect busy threshold, in dBm. Matches the typical
-/// IEEE 802.15.4 CCA Mode 1 (energy above threshold) default.
+/// Words needed for `[len][PSDU]` (128 bytes) in the word-wide FIFOs.
+const FIFO_WORDS: usize = (MAX_FRAME_LEN + 1).div_ceil(4);
+
+/// Smallest PSDU the receiver hands up (an ACK: FCF + DSN + FCS).
+const MIN_RX_PSDU_LEN: usize = 5;
+
+/// CCA busy threshold, in dBm (CCA mode 1, energy above threshold).
 const CCA_THRESHOLD_DBM: i8 = -60;
 
-static RX_BUF: SyncUnsafeCell<[u8; MAX_FRAME_LEN]> = SyncUnsafeCell::new([0u8; MAX_FRAME_LEN]);
-static RX_LEN: AtomicU8 = AtomicU8::new(0);
-static RX_RSSI: AtomicI8 = AtomicI8::new(-127);
+// ── Public types ────────────────────────────────────────────────
 
-/// Outcome of the most recently completed SRX (single-RX) hardware
-/// operation. Replaces a bare "CRC ok?" boolean so that a genuine RX
-/// timeout (`LIRQ_RTO`, no frame received at all) can be told apart from
-/// a frame that *was* received but failed its CRC check — both used to
-/// collapse into the same "not CRC-OK" state and were reported to callers
-/// as [`RadioError::CrcError`], hiding real timeouts. See `receive()`.
+/// Received 802.15.4 frame: MPDU without FCS.
+pub struct RxFrame {
+    pub data: [u8; MAX_FRAME_LEN],
+    pub len: usize,
+    /// RSSI in dBm from the packet foot word (`-(foot1 >> 24)`).
+    pub rssi: i8,
+    pub lqi: u8,
+}
+
+/// Who produces the 2-byte FCS of transmitted frames.
+///
+/// The SDK's only Zigbee transmitter (`rf_phy_dtm_zigbee_pkt_gen`) writes
+/// `[len incl. FCS][payload][zigbee_crc16 LSB first]` into the TX FIFO, i.e.
+/// it computes the FCS in software. Whether the LL engine appends an FCS by
+/// itself in `LL_HW_CRC_ZB_FMT` is not documented, so the choice is
+/// switchable and was decided on hardware with an independent sniffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FcsMode {
+    /// Driver appends `zigbee_crc16` to the FIFO payload (SDK DTM behavior).
+    Software,
+    /// Driver writes only the MPDU; the LL engine is expected to append FCS.
+    /// Lab-only: ignored unless the `phy6222-diag` feature is enabled.
+    Hardware,
+}
+
+/// TX power code table `(dBm, PA code)`, highest power first; the PA code
+/// to dBm mapping differs per package (`rf_phy_driver.h`
+/// `RF_PHY_TX_POWER_*`). Only the selected table is linked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaTable(&'static [(i8, u8)]);
+
+impl PaTable {
+    /// QFN32 parts (PHY6222QC, PHY6252 modules such as Ai-Thinker PB-03F).
+    pub const QFN32: Self = Self(&[(5, 0x3f), (0, 0x1f), (-2, 0x0f), (-5, 0x0a), (-20, 0x01)]);
+    /// TSOP16 parts (PHY6252 TSOP16 sensor boards).
+    pub const TSOP16: Self = Self(&[
+        (5, 0x1d),
+        (4, 0x17),
+        (3, 0x15),
+        (0, 0x0d),
+        (-2, 0x0a),
+        (-5, 0x06),
+        (-6, 0x05),
+        (-10, 0x03),
+        (-15, 0x02),
+        (-20, 0x01),
+    ]);
+}
+
+/// Radio configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct RadioConfig {
+    /// IEEE 802.15.4 channel (11–26).
+    pub channel: u8,
+    /// PAN ID (address filtering is done in software by the MAC).
+    pub pan_id: u16,
+    /// Short address (address filtering is done in software by the MAC).
+    pub short_address: u16,
+    /// Extended (IEEE) 64-bit address.
+    pub extended_address: [u8; 8],
+    /// Requested TX power in dBm; the nearest table entry not above it is used.
+    pub tx_power: i8,
+    /// Accept all frames regardless of address.
+    pub promiscuous: bool,
+    /// Actual HCLK in MHz; LL timing registers are in HCLK cycles.
+    pub hclk_mhz: u8,
+    /// Package-specific PA code table.
+    pub pa_table: PaTable,
+    /// FCS generation strategy for transmitted frames.
+    pub fcs: FcsMode,
+}
+
+/// Default FCS mode, selected from sniffer evidence on PB-03F (PHY6252).
+pub const DEFAULT_FCS_MODE: FcsMode = FcsMode::Software;
+
+impl Default for RadioConfig {
+    fn default() -> Self {
+        Self {
+            channel: 11,
+            pan_id: 0xFFFF,
+            short_address: 0xFFFF,
+            extended_address: [0u8; 8],
+            tx_power: 0,
+            promiscuous: false,
+            hclk_mhz: 48,
+            pa_table: PaTable::QFN32,
+            fcs: DEFAULT_FCS_MODE,
+        }
+    }
+}
+
+/// Radio driver error.
+#[derive(Debug, Clone, Copy)]
+pub enum RadioError {
+    /// Channel busy (CCA failed).
+    CcaFailure,
+    /// TX/RX engine did not complete or reported an inconsistent state.
+    HardwareError,
+    /// Frame too long or too short.
+    InvalidFrame,
+    /// CRC check failed on received frame.
+    CrcError,
+    /// Driver not initialized.
+    NotInitialized,
+    /// RX timeout — no frame received.
+    RxTimeout,
+}
+
+/// Radio counters and calibration results, for bring-up diagnostics.
+///
+/// The event counters are maintained only with the `phy6222-diag` feature
+/// (otherwise they read zero); calibration and `hw_pkt_stats` are always
+/// reported.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RadioStats {
+    /// STX operations completed.
+    pub tx_done: u32,
+    /// STX operations that timed out.
+    pub tx_timeout: u32,
+    /// Frames delivered by `receive` (hardware CRC OK).
+    pub rx_ok: u32,
+    /// MODE_DONE without CRC OK (CRC error or empty FIFO).
+    pub rx_crc_err: u32,
+    /// RX windows that expired without a sync (re-armed).
+    pub rx_timeout: u32,
+    /// CRC-OK frames whose software CRC-16 disagreed with the FIFO FCS.
+    pub rx_sw_fcs_mismatch: u32,
+    /// Length bytes outside 5..=127.
+    pub rx_bad_len: u32,
+    /// LL engine aborts (cancelled receive or TX timeout).
+    pub aborts: u32,
+    /// Raw `LL+0x30` packet statistics `[23:16]` crcErr `[15:8]` total `[7:0]` ok.
+    pub hw_pkt_stats: u32,
+    /// Two-point calibration results (low/high), already offset.
+    pub tp_cal: (u8, u8),
+    /// RX DC-offset calibration word (`0x400300EC & 0x3f3fffff`), or the
+    /// SDK default `0x2020_0000` when calibration did not converge.
+    pub dcoc: u32,
+    /// Whether the DC-offset calibration converged.
+    pub dcoc_ok: bool,
+}
+
+// ── Pure helpers (host-tested) ──────────────────────────────────
+
+/// IEEE 802.15.4 FCS (ITU-T CRC-16, init 0, LSB first), returned in
+/// on-air byte order (CRC-16/KERMIT). Intended to match the ROM's
+/// `zigbee_crc16_gen(data, len, seed = {0}, crc)` used by the SDK DTM
+/// transmitter; the ROM equivalence is checked by the PB-03F radio lab.
+pub fn zigbee_crc16(data: &[u8]) -> [u8; 2] {
+    let mut crc: u16 = 0;
+    for &b in data {
+        crc ^= u16::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x8408
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc.to_le_bytes()
+}
+
+/// IEEE 802.15.4 channel (11–26) to the PHY62x2 RF channel index
+/// (MHz above 2400): `5 + 5 * (ch - 11)`.
+fn rf_channel_index(channel: u8) -> u8 {
+    5 + 5 * (channel.clamp(11, 26) - 11)
+}
+
+/// `RF_PHY_TPCAL_CALC(tp0, tp1, chn)` with `chn = (rfChn - 2) >> 1` and the
+/// `ll_hw_go` clamp of `rfChn` to `2..=80`.
+fn tpcal_for_rf_channel(tp0: u8, tp1: u8, rf_chn: u8) -> u8 {
+    let idx = u32::from((rf_chn.clamp(2, 80) - 2) >> 1);
+    let (tp0, tp1) = (u32::from(tp0), u32::from(tp1));
+    if tp0 > tp1 {
+        (((tp0 << 5) - (tp0 - tp1) * idx + 16) >> 5) as u8
+    } else {
+        tp0 as u8
+    }
+}
+
+/// PA code for the requested power: `(code, extra_max_path)`.
+///
+/// Picks the highest table entry not above `dbm` (lowest entry if `dbm` is
+/// below the table). `extra_max_path` selects the SDK
+/// `RF_PHY_TX_POWER_EXTRA_MAX` supply settings.
+fn tx_power_code(table: PaTable, dbm: i8) -> (u8, bool) {
+    let entries = table.0;
+    let code = entries
+        .iter()
+        .find(|(level, _)| *level <= dbm)
+        .or(entries.last())
+        .map(|&(_, code)| code)
+        .unwrap_or(0x01);
+    (code, code == 0x3f)
+}
+
+/// Bytes of `[len][PSDU]` in the word-wide FIFOs.
+const FIFO_BYTES: usize = FIFO_WORDS * 4;
+
+// The FIFO byte views below reinterpret little-endian words as bytes.
+const _: () = assert!(cfg!(target_endian = "little"));
+
+/// Lay out `[len][frame][fcs]` (`ll_hw_write_tfifo`) in a zeroed buffer
+/// and return the number of little-endian FIFO words to write.
+fn pack_tx_fifo(buf: &mut [u8; FIFO_BYTES], len_byte: u8, frame: &[u8], fcs: &[u8]) -> usize {
+    let end = 1 + frame.len();
+    buf[0] = len_byte;
+    buf[1..end].copy_from_slice(frame);
+    buf[end..end + fcs.len()].copy_from_slice(fcs);
+    (end + fcs.len()).div_ceil(4)
+}
+
+/// Words occupied by an RX FIFO packet including its first word
+/// (`ll_hw_read_rfifo_zb`: `wlen = 1 + (blen >> 2)`, `blen` incl. FCS).
+fn rfifo_packet_words(len_byte: u8) -> usize {
+    1 + (usize::from(len_byte) >> 2)
+}
+
+/// RSSI in dBm from packet foot word 1 (`rf_phy_get_pktFoot`).
+fn rssi_from_foot1(foot1: u32) -> i8 {
+    -((foot1 >> 24).min(127) as i16) as i8
+}
+
+/// Outcome of one SRX operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum RxOutcome {
-    /// No SRX has completed since the last reset — `RX_DONE` should not
-    /// yet be signalled while this is the value; treated defensively as a
-    /// hardware error if ever observed after a signal.
     Pending = 0,
-    /// Mode-done with good CRC — a frame is available in `RX_BUF`/`RX_LEN`.
     FrameOk = 1,
-    /// Mode-done but the CRC check failed.
     CrcError = 2,
-    /// The RX window elapsed with no frame received at all.
     Timeout = 3,
 }
 
@@ -185,118 +419,136 @@ impl RxOutcome {
     }
 }
 
-static RX_OUTCOME: AtomicU8 = AtomicU8::new(RxOutcome::Pending as u8);
-
-/// Classify a raw LL HW IRQ status word for an SRX (single-RX) mode-done or
-/// timeout event.
-///
-/// Kept as a small, pure, hardware-independent function (no register
-/// access) precisely so the mode-done/CRC/timeout precedence can be
-/// exercised with host tests — see `driver::tests`. `LL_IRQ` calls this
-/// only for the RX-relevant events (mode-done while in SRX mode, or an
-/// `LIRQ_RTO` with no mode-done) it has already identified via the mode
-/// register, matching this function's precedence: mode-done takes priority
-/// over a (mutually exclusive, per the PHY6222 LL HW) timeout bit.
+/// Classify an SRX `LL+0x10` status word. Only MODE_DONE is unmasked, and
+/// the SDK accepts a packet only when `RD` and `COK` are both set.
 fn classify_rx_irq(irq_status: u32) -> RxOutcome {
-    if irq_status & LIRQ_MD != 0 {
-        if irq_status & LIRQ_COK != 0 {
-            RxOutcome::FrameOk
-        } else {
-            RxOutcome::CrcError
-        }
+    if irq_status & LIRQ_MD == 0 {
+        RxOutcome::Pending
+    } else if irq_status & (LIRQ_RD | LIRQ_COK) == (LIRQ_RD | LIRQ_COK) {
+        RxOutcome::FrameOk
+    } else if irq_status & (LIRQ_CERR | LIRQ_CERR2) != 0 {
+        RxOutcome::CrcError
     } else if irq_status & LIRQ_RTO != 0 {
         RxOutcome::Timeout
     } else {
-        RxOutcome::Pending
+        RxOutcome::CrcError
     }
 }
 
-/// Convert the PHY6222 Zigbee RFIFO length byte into the MPDU length
-/// (MAC header + payload, FCS stripped) used by the rest of this driver.
-///
-/// Per the public pvvx/THB2 PHY6222 SDK (`ll_hw_drv.c`,
-/// `ll_hw_read_rfifo_zb()`): the length byte popped from the head of the
-/// RX FIFO is the over-the-air PSDU length and "blen included the 2 byte
-/// crc" — i.e. it counts the trailing 2-byte FCS/CRC-16, exactly like the
-/// length byte `transmit()` writes to the TX FIFO (`frame.len() + 2`).
-/// Both driver.rs FIFO consumers must agree on this convention: after
-/// popping the length byte, the following `len_byte` bytes in the FIFO are
-/// `[MHR][payload][fcs_lo][fcs_hi]`. This function strips the trailing 2
-/// FCS bytes so `RX_LEN`/`RX_BUF` (and therefore `RxFrame`) hold only the
-/// MPDU, matching what `transmit()` sends and what the MAC layer parses
-/// (FCF, addressing, payload — no FCS).
-fn zb_rfifo_mpdu_len(len_byte: u8) -> usize {
-    (len_byte as usize).saturating_sub(2).min(MAX_MPDU_LEN)
+/// MPDU length (FCS stripped) for an RX FIFO length byte, or `None` if the
+/// PSDU length is outside `5..=127`.
+fn zb_rfifo_mpdu_len(len_byte: u8) -> Option<usize> {
+    let psdu = usize::from(len_byte);
+    (MIN_RX_PSDU_LEN..=MAX_FRAME_LEN)
+        .contains(&psdu)
+        .then(|| psdu - 2)
 }
 
-// ── Public types ────────────────────────────────────────────────
+// ── Shared state between the driver and LL_IRQ ──────────────────
 
-/// Received 802.15.4 frame.
-pub struct RxFrame {
-    pub data: [u8; MAX_FRAME_LEN],
-    pub len: usize,
-    pub rssi: i8,
-    pub lqi: u8,
+static RX_DONE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static DRIVER_TAKEN: Mutex<CriticalSectionRawMutex, Cell<bool>> = Mutex::new(Cell::new(false));
+
+/// Operation the LL engine is currently running (written before trigger).
+static LL_OP: AtomicU8 = AtomicU8::new(OP_IDLE);
+const OP_IDLE: u8 = 0;
+const OP_TX: u8 = 1;
+/// SRX, or TRX (TX then the ACK window): the RX part ends the operation.
+const OP_RX: u8 = 2;
+/// STX of an acknowledgement started by `LL_IRQ` itself.
+const OP_ACK: u8 = 3;
+/// An RX being stopped by `abort_if_busy`: `LL_IRQ` discards the result.
+const OP_STOP: u8 = 4;
+
+/// `phy_hw_stop` RX timeout (µs): ends an unsynced RX with RTO.
+const STOP_RX_TIMEOUT_US: u32 = 33;
+/// Bound for a stopped RX that already synced to finish its frame
+/// (127-byte PSDU: 4.3 ms).
+const STOP_TIMEOUT: Duration = Duration::from_millis(5);
+
+/// Bound for an `LL_IRQ`-started ACK still on air when the driver starts
+/// its next operation (5-byte PSDU: 352 µs plus TX settle).
+const ACK_TX_TIMEOUT: Duration = Duration::from_millis(2);
+
+/// Addressing snapshot `LL_IRQ` uses to acknowledge received frames.
+#[derive(Clone, Copy)]
+struct AckFilter {
+    pan_id: u16,
+    short_address: u16,
+    extended_address: [u8; 8],
+    hw_fcs: bool,
 }
 
-/// Radio configuration.
-#[derive(Debug, Clone, Copy)]
-pub struct RadioConfig {
-    /// IEEE 802.15.4 channel (11–26).
-    pub channel: u8,
-    /// PAN ID for address filtering.
-    pub pan_id: u16,
-    /// Short address for address filtering.
-    pub short_address: u16,
-    /// Extended (IEEE) 64-bit address.
-    pub extended_address: [u8; 8],
-    /// TX power in dBm (clamped to 0–10).
-    pub tx_power: i8,
-    /// Accept all frames regardless of address.
-    pub promiscuous: bool,
-}
+/// Critical section shared with `LL_IRQ` (blocking mutex over no data).
+static CS: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
 
-impl Default for RadioConfig {
-    fn default() -> Self {
-        Self {
-            channel: 11,
-            pan_id: 0xFFFF,
-            short_address: 0xFFFF,
-            extended_address: [0u8; 8],
-            tx_power: 0,
-            promiscuous: false,
+static ACK_FILTER: Mutex<CriticalSectionRawMutex, Cell<AckFilter>> =
+    Mutex::new(Cell::new(AckFilter {
+        pan_id: 0xFFFF,
+        short_address: 0xFFFF,
+        extended_address: [0; 8],
+        hw_fcs: false,
+    }));
+
+static RX_OUTCOME: AtomicU8 = AtomicU8::new(RxOutcome::Pending as u8);
+static RX_LEN: AtomicU8 = AtomicU8::new(0);
+static RX_FOOT1: AtomicU32 = AtomicU32::new(0);
+
+struct SyncUnsafeCell<T>(UnsafeCell<T>);
+// SAFETY: RX_WORDS is written by LL_IRQ only while LL_OP == OP_RX and read
+// by the task only after RX_DONE was signalled for that operation.
+unsafe impl<T> Sync for SyncUnsafeCell<T> {}
+static RX_WORDS: SyncUnsafeCell<[u32; FIFO_WORDS]> =
+    SyncUnsafeCell(UnsafeCell::new([0; FIFO_WORDS]));
+
+/// Single-writer counters. Cortex-M0 has no atomic read-modify-write, so
+/// each counter is updated with load+store from exactly one context.
+/// Counting is compiled in only with the `phy6222-diag` feature.
+struct Counter(AtomicU32);
+impl Counter {
+    const fn new() -> Self {
+        Self(AtomicU32::new(0))
+    }
+    fn inc(&self) {
+        if cfg!(feature = "phy6222-diag") {
+            self.0.store(
+                self.0.load(Ordering::Relaxed).wrapping_add(1),
+                Ordering::Relaxed,
+            );
         }
     }
+    fn get(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
 }
+// Task-context counters.
+static TX_DONE_CNT: Counter = Counter::new();
+static TX_TIMEOUT_CNT: Counter = Counter::new();
+static RX_OK_CNT: Counter = Counter::new();
+static RX_SW_FCS_MISMATCH_CNT: Counter = Counter::new();
+static ABORT_CNT: Counter = Counter::new();
+static RX_CRC_ERR_CNT: Counter = Counter::new();
+static RX_TIMEOUT_CNT: Counter = Counter::new();
+// ISR-context counter.
+static RX_BAD_LEN_CNT: Counter = Counter::new();
 
-/// Radio driver error.
-#[derive(Debug, Clone, Copy)]
-pub enum RadioError {
-    /// Channel busy (CCA failed).
-    CcaFailure,
-    /// TX hardware error.
-    HardwareError,
-    /// Frame too long or too short.
-    InvalidFrame,
-    /// CRC check failed on received frame.
-    CrcError,
-    /// Driver not initialized.
-    NotInitialized,
-    /// RX timeout — no frame received.
-    RxTimeout,
-}
-
-/// Pure-Rust async radio driver for PHY6222 IEEE 802.15.4 mode.
+/// Pure-Rust async radio driver for PHY62x2 IEEE 802.15.4 mode.
 pub struct Phy6222Driver {
     config: RadioConfig,
     initialized: bool,
-    /// TP calibration values (computed during init).
+    /// Two-point calibration at RF index 2 and 66 (`g_rfPhyTpCal0/1`).
     tp_cal0: u8,
     tp_cal1: u8,
+    dcoc: u32,
+    dcoc_ok: bool,
 }
 
+/// Offset added to raw two-point calibration results
+/// (`rf_tpCal_gen_cap_arrary`: `rf_tp_cal(...) + 2`).
+const TP_CAL_OFFSET: u8 = 2;
+
 impl Phy6222Driver {
-    /// Acquire and initialize the process-wide PHY6222 radio driver.
+    /// Acquire and initialize the process-wide radio driver.
     ///
     /// IRQ signals and FIFO state are global hardware resources, so a second
     /// driver instance would alias them unsafely.
@@ -316,581 +568,730 @@ impl Phy6222Driver {
         let mut drv = Self {
             config,
             initialized: false,
-            tp_cal0: 0x23,
-            tp_cal1: 0x23,
+            tp_cal0: 0x20,
+            tp_cal1: 0x20,
+            dcoc: 0x2020_0000,
+            dcoc_ok: false,
         };
         drv.init_hardware();
         drv
     }
 
-    // ── Hardware initialization ─────────────────────────────────
+    // ── Initialization (rf_phy_ini + rf_calibrate + ll_hw_set_timing) ──
 
-    /// Full radio initialization: clocks → analog → baseband → Zigbee CRC.
     fn init_hardware(&mut self) {
-        // Enable crystal output to digital
-        sub_write_reg(CLK_CTRL_REG, 18, 18, 1);
+        self.analog_up();
 
-        // Clock source: 16 MHz XTAL for RF PHY, 32 MHz doubled for RX ADC
-        sub_write_reg(CLK_CFG_REG, 25, 24, 0x00); // rxAdcClkSel = 32M DBL
-        sub_write_reg(CLK_CFG_REG, 23, 22, 0x00); // rfPhyClkSel = 16M XTAL
-        sub_write_reg(CLK_CFG_REG, 6, 5, 0x03); // trim DLL/DBL LDO vout
-        sub_write_reg(CLK_CFG_REG, 8, 8, 1); // DBL enable
-        sub_write_reg(CLK_CFG_REG, 19, 18, 0x03); // RX ADC clk en, RF PHY clk en
+        // rf_calibrate: two-point modulation calibration at RF index 2 and
+        // 66 using the 500 kHz deviation path (fDev = 1, as Zigbee's
+        // O-QPSK/half-sine shares BLE 2M's deviation), then RX DCOC.
+        self.tp_cal0 = self.tp_cal(2).saturating_add(TP_CAL_OFFSET);
+        self.tp_cal1 = self.tp_cal(66).saturating_add(TP_CAL_OFFSET);
+        let (dcoc, ok) = Self::rx_dcoc_cal(88);
+        self.dcoc = dcoc;
+        self.dcoc_ok = ok;
 
-        // Indicate 16 MHz reference clock to RFPLL
-        sub_write_reg(RF_PHY_BASE + 0x80, 0, 0, 1);
-
-        // Configure analog blocks: PLL, RX front-end, PA
-        self.rf_phy_ana_cfg();
-
-        // Set TX power
-        self.rf_phy_set_tx_power(self.config.tx_power);
-
-        // Configure baseband for Zigbee (802.15.4) mode
-        self.rf_phy_bb_cfg();
-
-        // Configure LL HW timing for Zigbee packet format
-        self.ll_hw_set_timing();
-
-        // Set Zigbee CRC format (CRC-16 ITU-T)
-        self.ll_hw_set_crc_fmt();
-
-        // Run two-point calibration
-        self.rf_tp_calibrate();
-
-        // Apply channel/address config
-        self.apply_config();
+        // Calibration overwrites 0x40/0x50/0xE0, so the baseband is
+        // configured afterwards.
+        self.digital_up();
 
         self.initialized = true;
-        log::info!("phy6222: radio initialized in IEEE 802.15.4 mode");
-    }
-
-    /// Configure RF analog blocks: PLL, LNA, PA.
-    fn rf_phy_ana_cfg(&self) {
-        // PLL control
-        reg_write(RF_PHY_BASE + 0xCC, 0x2000_0BC0); // i_pll_ctrl0
-        reg_write(RF_PHY_BASE + 0xD0, 0x0000_0180); // i_pll_ctrl1 (TX PLL BW)
-        reg_write(RF_PHY_BASE + 0xD4, 0x076A_3E7A); // i_pll_ctrl2 (lpf, boost vco)
-        reg_write(RF_PHY_BASE + 0xD8, 0x0489_0000); // i_pll_ctrl3 (vco/tp varactor)
-
-        // RX PLL BW (active when rx_en)
-        reg_write(RF_PHY_BASE + 0x104, 0x0000_0180); // i_pll_ctrl5
-        reg_write(RF_PHY_BASE + 0x108, 0x076A_3E7A); // i_pll_ctrl6
-        reg_write(RF_PHY_BASE + 0x10C, 0x0489_8000); // i_pll_ctrl7
-
-        // VCO coarse tuning
-        reg_write(
-            RF_PHY_BASE + 0x80,
-            reg_read(RF_PHY_BASE + 0x80) | 0x0000_24CC,
-        );
-
-        // RX front-end (boost TIA current)
-        reg_write(RF_PHY_BASE + 0xDC, 0x01A6_FC2F);
-
-        // DAC delay
-        reg_write(RF_PHY_BASE + 0xB0, 0x0100_0003);
-    }
-
-    /// Configure baseband for IEEE 802.15.4 (Zigbee) packet format.
-    ///
-    /// Sets PGA bandwidth, modulation, sync word, preamble, and disables
-    /// Gaussian shaping (802.15.4 uses O-QPSK, not GFSK).
-    fn rf_phy_bb_cfg(&self) {
-        // Zigbee shares PGA BW setting with BLE 2M (smaller bandwidth)
-        reg_write(RF_PHY_BASE + 0xE0, 0x0000_0080); // PGA BW: small
-        sub_write_reg(RF_PHY_BASE + 0xD8, 20, 18, 0x02); // TPM DAC varactor
-
-        // DC offset for 16 MHz reference clock
-        reg_write(RF_PHY_BASE + 0x90, 0x0008_0000);
-
-        // Zigbee-specific baseband configuration
-        reg_write(RF_PHY_BASE + 0x00, 0x7806_8000); // Zigbee sync/pkt format
-        reg_write(RF_PHY_BASE + 0x48, 0x0000_0000); // CRC/whitening seed = 0
-        reg_write(RF_PHY_BASE + 0x40, 0x000B_2800); // Disable Gaussian shaping
-        reg_write(RF_PHY_BASE + 0x4C, 0x3675_EE07); // Zigbee sync word / access addr
-
-        // Max packet length for 802.15.4 (127 + length byte)
-        reg_write(RF_PHY_BASE + 0x0C, 128);
-    }
-
-    /// Configure LL HW timing parameters for Zigbee packet format.
-    fn ll_hw_set_timing(&self) {
-        // TX-to-RX turnaround: 192 µs (802.15.4 spec: aTurnaroundTime = 12 symbols = 192 µs)
-        let hclk_per_us: u32 = 16; // 16 MHz HCLK
-        reg_write(LL_HW_BASE + 0x18, 192 * hclk_per_us);
-        // RX-to-TX turnaround
-        reg_write(LL_HW_BASE + 0x1C, 192 * hclk_per_us);
-        // TX/RX settle time
-        reg_write(
-            LL_HW_BASE + 0x08,
-            (80 * hclk_per_us) << 16 | (80 * hclk_per_us),
+        log::info!(
+            "phy6222: 802.15.4 radio up, tp_cal={:#04x}/{:#04x} dcoc={:#010x}{}",
+            self.tp_cal0,
+            self.tp_cal1,
+            self.dcoc,
+            if self.dcoc_ok { "" } else { " (default)" }
         );
     }
 
-    /// Set Zigbee CRC format on both TX and RX paths.
-    fn ll_hw_set_crc_fmt(&self) {
-        // Register at LL_HW_BASE + 0x34: [3:0] = TX CRC fmt, [7:4] = RX CRC fmt
-        let val = LL_HW_CRC_ZB_FMT | (LL_HW_CRC_ZB_FMT << 4);
-        reg_write(LL_HW_BASE + 0x34, val);
+    fn is_48mhz(&self) -> bool {
+        self.config.hclk_mhz == 48
     }
 
-    /// Run two-point RF calibration for Zigbee mode.
-    fn rf_tp_calibrate(&mut self) {
-        // Zigbee uses the same calibration path as BLE 2M
-        // Calibrate at channel 2 (low) and channel 66 (high) of the RF index
-        self.tp_cal0 = self.rf_tp_cal(2) + 4;
-        self.tp_cal1 = self.rf_tp_cal(66) + 4;
+    /// `rf_phy_ana_cfg` with `RF_PHY_CLK_SEL_16M_XTAL` / `RX_ADC_CLK_SEL_32M_DBL`.
+    fn ana_cfg(&self) {
+        sub_write_reg(AON_CLK_CTRL, 18, 18, 1); // xtal output to digital
+        sub_write_reg(AON_CLK_CFG, 25, 24, 2); // rxAdcClkSel = 32M DBL
+        sub_write_reg(AON_CLK_CFG, 23, 22, 0); // rfPhyClkSel = 16M XTAL
+        sub_write_reg(AON_CLK_CFG, 6, 5, 3); // trim dll/dbl ldo vout
+        sub_write_reg(AON_CLK_CFG, 8, 8, 1); // DBL enable (RX ADC 32M DBL)
+        sub_write_reg(AON_CLK_CFG, 19, 18, 3); // RX ADC clk en, RF PHY clk en
+        sub_write_reg(RF + 0x8C, 23, 23, u32::from(self.is_48mhz()));
+
+        // PLL. phy62x2-SDK writes ctrl1 = 0x160 then 0x180; THB2's SDK also
+        // programs the RX PLL copies (0x104..0x10C), which are kept here.
+        reg_write(RF + 0xCC, 0x2000_0BC0);
+        reg_write(RF + 0xD0, 0x0000_0160);
+        reg_write(RF + 0xD4, 0x076A_3E7A);
+        reg_write(RF + 0xD8, 0x0489_0000);
+        reg_write(RF + 0xD0, 0x0000_0180);
+        reg_write(RF + 0xD4, 0x076A_3E7A);
+        reg_write(RF + 0xD8, 0x0489_0000);
+        reg_write(RF + 0x104, 0x0000_0180);
+        reg_write(RF + 0x108, 0x076A_3E7A);
+        reg_write(RF + 0x10C, 0x0489_8000);
+
+        // VCO coarse tune, then flag the 16 MHz reference to the RF PLL.
+        reg_write(RF + 0x80, 0x0000_24CC);
+        sub_write_reg(RF + 0x80, 0, 0, 1);
+
+        // PA ramp; the PA code in [16:12] is set by `set_tx_power`, which
+        // always follows.
+        reg_write(RF + 0xB8, 0x0825);
+        reg_write(RF + 0xDC, 0x01A6_FC2F); // RX front end, boost TIA current
     }
 
-    /// Single-point TP calibration at a given RF channel index.
-    ///
-    /// Triggers VCO coarse tuning at the given RF channel and reads back
-    /// the calibration capacitor value. Falls back to 0x20 if the read
-    /// returns an out-of-range value.
-    fn rf_tp_cal(&self, rf_chn: u8) -> u8 {
-        // Set the target RF channel for calibration
-        reg_write(BB_HW_BASE + 0xB4, rf_chn as u32);
-
-        // Trigger VCO coarse calibration
-        let old = reg_read(RF_PHY_BASE + 0x80);
-        reg_write(RF_PHY_BASE + 0x80, old | 0x0000_0400); // cal_en bit
-
-        // Wait for calibration to settle (~50µs per PHY6222 SDK)
-        for _ in 0..800 {
-            core::hint::spin_loop();
-        }
-
-        // Read back calibration cap value from VCO tune register
-        let cal_reg = reg_read(RF_PHY_BASE + 0x94);
-        let cap = (cal_reg & 0xFF) as u8;
-
-        // Clear cal_en
-        reg_write(RF_PHY_BASE + 0x80, old);
-
-        // Sanity check: valid cap range is roughly 0x05..0x3F
-        if (0x05..=0x3F).contains(&cap) {
-            cap
+    /// `rf_phy_set_txPower`: supply trims plus the PA code in `0xB8[16:12]`.
+    fn set_tx_power(&self, dbm: i8) {
+        let (code, extra) = tx_power_code(self.config.pa_table, dbm);
+        // (DCDC trim, LO LDO, RF+0xDC[9:5] = PA VTRIM[9:7] << 2 | LNA LDO[6:5])
+        let (dcdc, lo_ldo, vtrim_lna) = if extra {
+            (0x08, 0, 1 << 2) // DCDC highest, VTRIM 1, LNA LDO 0
         } else {
-            0x20 // fallback default
-        }
-    }
-
-    /// Set TX power (0–10 dBm, 5-bit DAC).
-    fn rf_phy_set_tx_power(&self, dbm: i8) {
-        let power = (dbm.clamp(0, 10) as u32) & 0x1F;
-        let old = reg_read(RF_PHY_BASE + 0xB8);
-        reg_write(RF_PHY_BASE + 0xB8, (old & 0x0FFF) | (power << 12));
-    }
-
-    /// Set RF channel for IEEE 802.15.4.
-    ///
-    /// 802.15.4 channels 11–26 map to center frequencies 2405–2480 MHz.
-    /// The radio uses an RF channel index: `(freq_mhz - 2400) = rf_chn`.
-    /// Channel 11 → rf_chn=5, channel 26 → rf_chn=80.
-    fn set_channel(&self, channel: u8) {
-        let ch = channel.clamp(11, 26);
-        let rf_chn = (ch - 11) * 5 + 5; // ch11→5, ch12→10, ... ch26→80
-        reg_write(BB_HW_BASE + 0xB4, rf_chn as u32);
-
-        // Apply TP calibration for this channel
-        let cap = self.tp_cal_for_channel(rf_chn);
-        sub_write_reg(RF_PHY_BASE + 0x94, 7, 0, cap as u32);
-    }
-
-    /// Interpolate TP calibration cap value for a given RF channel index.
-    fn tp_cal_for_channel(&self, rf_chn: u8) -> u8 {
-        // Interpolate only inside the measured 2..=66 range. Zigbee
-        // channels 25-26 map above the high point and must use that endpoint
-        // rather than extrapolating an unmeasured capacitor value.
-        let calibrated_channel = rf_chn.clamp(2, 66);
-        let idx = ((calibrated_channel - 2) >> 1) as u16;
-        let cal0 = self.tp_cal0 as u16;
-        let cal1 = self.tp_cal1 as u16;
-        let result = if cal1 >= cal0 {
-            cal0 + (idx * (cal1 - cal0)) / 32
-        } else {
-            cal0 - (idx * (cal0 - cal1)) / 32
+            (0x0A, 2, 1) // VTRIM 0, LNA LDO 1
         };
-        result as u8
+        sub_write_reg(AON_PMU_CTRL, 18, 15, dcdc);
+        sub_write_reg(RF + 0xCC, 11, 10, lo_ldo);
+        sub_write_reg(RF + 0xDC, 9, 5, vtrim_lna);
+        let b8 = reg_read(RF + 0xB8);
+        reg_write(RF + 0xB8, (b8 & 0x0FFF) | (u32::from(code & 0x1F) << 12));
     }
 
-    /// Apply current configuration to hardware.
+    /// `rf_tp_cal(rfChn, fDev = 1)`: raw two-point calibration code.
+    fn tp_cal(&self, rf_chn: u8) -> u8 {
+        let bit23 = u32::from(self.is_48mhz());
+        reg_write(RF + 0x40, 0x0003_0010); // test mode, no tx-done
+        sub_write_reg(RF + 0xD8, 20, 18, 0x02); // tpm dac var
+        reg_write(RF + 0x8C, 0x0053_407F);
+        sub_write_reg(RF + 0x8C, 23, 23, bit23);
+        reg_write(RF + 0xB4, u32::from(rf_chn));
+        reg_write(RF + 0xA0, 0x0000_000E); // pll_auto override
+        reg_write(RF + 0xA4, 0x0000_0000);
+        reg_write(RF + 0xA4, 0x0000_0114); // trigger
+        // SDK: 3 * 10000 busy-loop iterations at 48 MHz (~2-4 ms).
+        busy_wait_us(3_000);
+        let k = ((reg_read(RF + 0xF4) >> 16) & 0xFF) as u8;
+        reg_write(RF + 0xA4, 0x0000_0000);
+        reg_write(RF + 0xA0, 0x0000_0000);
+        reg_write(RF + 0x8C, 0x0010_4040); // clr tp_cal_en
+        reg_write(RF + 0xA4, 0x0000_0140);
+        reg_write(RF + 0x40, 0x0003_2800);
+        sub_write_reg(RF + 0x8C, 23, 23, bit23);
+        k
+    }
+
+    /// `rf_rxDcoc_cfg(rfChn, bwSet = 1)`: RX DC-offset calibration.
+    ///
+    /// Only run from `init_hardware`, before `ll_cfg` reprograms the LL RX
+    /// timeouts, so the SDK's save/restore of `LL+0x24/0x28` is omitted.
+    fn rx_dcoc_cal(rf_chn: u8) -> (u32, bool) {
+        reg_write(LL + 0x24, 0);
+        reg_write(LL + 0x28, 0);
+
+        reg_write(RF + 0xB4, u32::from(rf_chn));
+        reg_write(RF + 0xA0, 0x0000_000E); // pll_auto override
+        reg_write(RF + 0xA4, 0x0000_0100); // clr trx_auto
+        reg_write(RF + 0xA8, 0x0000_0040); // lo override
+        reg_write(RF + 0xAC, 0x0000_0050); // rx lo and pll buff
+        reg_write(RF + 0xA4, 0x0000_012A); // rx close
+
+        let flt_phy: u32 = 0x034D;
+        reg_write(RF + 0xE0, 0x0000_0100); // pga bw 1 MHz
+        reg_write(RF + 0xC8, 0x0000_01A4); // rx max gain
+        reg_write(RF + 0xC4, 0x0000_2020); // dcoc dac from mix_sig_top
+        reg_write(RF + 0x50, 0x200C_5680); // longer dcoc averaging
+        busy_wait_us(100);
+
+        reg_write(RF + 0x78, (flt_phy << 22) | 0x0021_6564);
+        reg_write(RF + 0x78, (flt_phy << 22) | 0x0021_6565); // start
+
+        let mut result = (0x2020_0000, false);
+        let deadline = Instant::now() + Duration::from_millis(4);
+        while Instant::now() < deadline {
+            let ec = reg_read(RF + 0xEC);
+            if (ec >> 30) & 0x3 == 0x3 {
+                let dc = ec & 0x3F3F_FFFF;
+                reg_write(RF + 0xC4, 0x0001_0000 | (dc >> 16));
+                result = (dc, true);
+                break;
+            }
+        }
+
+        reg_write(RF + 0x78, (flt_phy << 22) | 0x0021_6564);
+        reg_write(RF + 0xA8, 0);
+        reg_write(RF + 0xAC, 0);
+        reg_write(RF + 0xC8, 0);
+        reg_write(RF + 0xA4, 0x0000_0100);
+        reg_write(RF + 0xA0, 0);
+        reg_write(RF + 0xA4, 0x0000_0140);
+        result
+    }
+
+    /// `rf_phy_bb_cfg(PKT_FMT_ZIGBEE)`.
+    fn bb_cfg(&self) {
+        reg_write(RF + 0xE0, 0x0000_0080); // small PGA bw (Zigbee, BLE 2M)
+        sub_write_reg(RF + 0xD8, 20, 18, 0x02); // tpm dac var
+        // reg_dc for the 16 MHz XTAL RF clock: 0x00087000 in phy62x2-SDK
+        // (0x00080000 in the older THB2 copy).
+        reg_write(RF + 0x90, 0x0008_7000);
+        // dac delay: 0x01000002 in phy62x2-SDK (0x01000003 in THB2).
+        reg_write(RF + 0xB0, 0x0100_0002);
+        reg_write(RF + 0x94, 0x0000_1000 + u32::from(self.tp_cal0));
+
+        reg_write(RF + 0x00, 0x7806_8000); // PKT_FMT_ZIGBEE, sync threshold
+        reg_write(RF + 0x48, 0x0000_0000); // no CRC seed / whitening
+        reg_write(RF + 0x40, 0x000B_2800); // gauss off
+        reg_write(RF + 0x4C, 0x3675_EE07); // 802.15.4 SHR correlator
+        reg_write(RF + 0x124, (LL_HW_CRC_ZB_FMT << 8) | LL_HW_CRC_ZB_FMT);
+
+        reg_write(RF + 0x50, 0x2208_6680); // AGC control (Zigbee)
+        sub_write_reg(RF + 0x0C, 7, 0, 0xFF); // max RX length
+        const AGC_TAB: [u32; 9] = [
+            0x545C_9CA4,
+            0x4243_444C,
+            0x464C_5241,
+            0x2E34_3A40,
+            0x557F_0028,
+            0x3D43_494F,
+            0x4C2B_3137,
+            0x343A_4046,
+            0x1C22_282E,
+        ];
+        for (i, v) in AGC_TAB.iter().enumerate() {
+            reg_write(RF + 0x54 + 4 * i as u32, *v);
+        }
+    }
+
+    /// LL engine configuration: `ll_hw_set_timing(PKT_FMT_ZIGBEE)`,
+    /// `ll_hw_ign_rfifo`, RX timeouts. Re-applied after every BBLL reset.
+    fn ll_cfg(&self) {
+        let h = u32::from(self.config.hclk_mhz);
+        reg_write(LL + 0x20, ((10 * h) << 16) | h); // tx/rx release 10/1 us
+        reg_write(LL + 0x1C, 62 * h); // rx->tx interval
+        reg_write(LL + 0x18, 72 * h); // tx->rx interval
+        reg_write(RF + 0xBC, (57 << 16) | (8 << 8) | 52); // TxBB, RxAFE, PLL settle
+        reg_write(LL + 0x68, LL_HW_IGN_CRC_AND_EMPTY);
+        reg_write(LL + 0x24, RX_TIMEOUT_US & 0xFFFF);
+        reg_write(LL + 0x28, RX_TIMEOUT_US & 0xFFFF);
+    }
+
+    /// Reset the LL engine (`BBLL_RST`), discarding any running operation,
+    /// then restore its configuration and clear FIFOs/IRQs.
+    fn ll_reset(&self) {
+        sub_write_reg(PCR_SW_RESET2, BBLL_RST_BIT, BBLL_RST_BIT, 0);
+        sub_write_reg(PCR_SW_RESET2, BBLL_RST_BIT, BBLL_RST_BIT, 1);
+        LL_OP.store(OP_IDLE, Ordering::Release);
+        reg_write(LL + 0x0C, 0);
+        reg_write(LL + 0x14, LL_HW_IRQ_MASK);
+        reg_write(LL + 0x58, 0x0100); // rst rfifo
+        reg_write(LL + 0x58, 0x0001); // rst tfifo
+    }
+
+    /// Stop a still-running LL operation (e.g. a cancelled `receive` or
+    /// the CCA window). An acknowledgement started by `LL_IRQ` is allowed
+    /// to finish. A receive is stopped like `phy_hw_stop`: the RX timeout
+    /// is cut to [`STOP_RX_TIMEOUT_US`] so the engine ends with RTO, or
+    /// completes a frame it already synced to (discarded, never ACKed).
+    /// Resetting BB/LL mid-frame instead left the next TRX unable to
+    /// transmit (hardware: data requests never on air, 10 ms deadline), so
+    /// `BBLL_RST` is only the bounded fallback.
+    fn abort_if_busy(&self) {
+        if LL_OP.load(Ordering::Acquire) == OP_ACK {
+            wait_while_op(OP_ACK, ACK_TX_TIMEOUT);
+        }
+        // thumbv6m has no CAS: take the RX→STOP transition with LL_IRQ
+        // masked so a completion in between is not overwritten.
+        let stopping = CS.lock(|()| {
+            let rx = LL_OP.load(Ordering::Acquire) == OP_RX;
+            if rx {
+                LL_OP.store(OP_STOP, Ordering::Release);
+            }
+            rx
+        });
+        if stopping {
+            reg_write(LL + 0x24, STOP_RX_TIMEOUT_US);
+            reg_write(LL + 0x28, STOP_RX_TIMEOUT_US);
+            wait_while_op(OP_STOP, STOP_TIMEOUT);
+            reg_write(LL + 0x24, RX_TIMEOUT_US);
+            reg_write(LL + 0x28, RX_TIMEOUT_US);
+        }
+        if LL_OP.load(Ordering::Acquire) != OP_IDLE {
+            self.ll_reset();
+            self.ll_cfg();
+            ABORT_CNT.inc();
+        }
+    }
+
+    fn set_channel(&self, channel: u8) {
+        reg_write(RF + 0xB4, u32::from(rf_channel_index(channel)));
+    }
+
+    /// `ll_hw_go`: clear IRQ, unmask MODE_DONE, trigger, then load the
+    /// per-channel TP calibration (the SDK sets it after the trigger).
+    fn ll_go(&self, op: u8) {
+        LL_OP.store(op, Ordering::Release);
+        reg_write(LL + 0x14, LL_HW_IRQ_MASK);
+        reg_write(LL + 0x0C, LIRQ_MD);
+        reg_write(LL + 0x00, 0x0001);
+        // RF+0x94 is only ever `0x1000 | tpcal` (see `bb_cfg`), so write it
+        // whole instead of read-modify-write of bits [7:0].
+        let rf_chn = rf_channel_index(self.config.channel);
+        reg_write(
+            RF + 0x94,
+            0x0000_1000 | u32::from(tpcal_for_rf_channel(self.tp_cal0, self.tp_cal1, rf_chn)),
+        );
+    }
+
     fn apply_config(&self) {
         self.set_channel(self.config.channel);
-        self.rf_phy_set_tx_power(self.config.tx_power);
-        // Address filtering is handled in software for this driver
-        // (the LL HW doesn't have hardware address matching for Zigbee mode)
+        self.set_tx_power(self.config.tx_power);
+        let filter = AckFilter {
+            pan_id: self.config.pan_id,
+            short_address: self.config.short_address,
+            extended_address: self.config.extended_address,
+            hw_fcs: self.hw_fcs(),
+        };
+        ACK_FILTER.lock(|f| f.set(filter));
     }
 
-    /// Get current radio configuration.
+    /// `Hardware` FCS is a lab A/B option; production builds (without
+    /// `phy6222-diag`) always use the SDK software FCS.
+    fn hw_fcs(&self) -> bool {
+        cfg!(feature = "phy6222-diag") && self.config.fcs == FcsMode::Hardware
+    }
+
+    /// Current radio configuration.
     pub fn config(&self) -> &RadioConfig {
         &self.config
     }
 
-    /// Update radio configuration.
+    /// Update the radio configuration and apply it to hardware.
+    ///
+    /// `hclk_mhz` is fixed when the driver is taken (it sets the LL timing
+    /// and the RF clock path); a changed value is ignored.
     pub fn update_config(&mut self, update_fn: impl FnOnce(&mut RadioConfig)) {
+        let hclk_mhz = self.config.hclk_mhz;
         update_fn(&mut self.config);
+        self.commit_config(hclk_mhz);
+    }
+
+    /// Non-generic tail of [`Self::update_config`], shared by every caller
+    /// so each closure instantiation stays a few instructions (fixed XIP).
+    #[inline(never)]
+    fn commit_config(&mut self, hclk_mhz: u8) {
+        self.config.hclk_mhz = hclk_mhz;
         if self.initialized {
+            self.abort_if_busy();
             self.apply_config();
         }
     }
 
-    // ── TX / RX operations ──────────────────────────────────────
+    /// Diagnostic counters and calibration results.
+    pub fn stats(&self) -> RadioStats {
+        RadioStats {
+            tx_done: TX_DONE_CNT.get(),
+            tx_timeout: TX_TIMEOUT_CNT.get(),
+            rx_ok: RX_OK_CNT.get(),
+            rx_crc_err: RX_CRC_ERR_CNT.get(),
+            rx_timeout: RX_TIMEOUT_CNT.get(),
+            rx_sw_fcs_mismatch: RX_SW_FCS_MISMATCH_CNT.get(),
+            rx_bad_len: RX_BAD_LEN_CNT.get(),
+            aborts: ABORT_CNT.get(),
+            hw_pkt_stats: reg_read(LL + 0x30),
+            tp_cal: (self.tp_cal0, self.tp_cal1),
+            dcoc: self.dcoc,
+            dcoc_ok: self.dcoc_ok,
+        }
+    }
 
-    /// Transmit an IEEE 802.15.4 frame (async).
+    // ── TX / RX ─────────────────────────────────────────────────
+
+    /// Transmit an MPDU (MAC header + payload, **without** FCS).
     ///
-    /// `frame` must be the MAC header + payload **without** an FCS — the
-    /// radio hardware appends the 2-byte FCS (CRC-16) automatically. Since
-    /// the on-air PSDU is `frame.len() + 2` and must stay within
-    /// `aMaxPHYPacketSize` (127 bytes), `frame` itself is bounded by
-    /// [`MAX_MPDU_LEN`] (125 bytes), not [`MAX_FRAME_LEN`].
+    /// The FCS is produced according to [`RadioConfig::fcs`] (honoured only
+    /// with the `phy6222-diag` feature; otherwise software FCS); the on-air
+    /// PSDU is `frame.len() + 2` bytes, so `frame` is bounded by 125 bytes.
+    ///
+    /// Completes without yielding; see [`Self::transmit_blocking`].
     pub async fn transmit(&mut self, frame: &[u8]) -> Result<(), RadioError> {
+        self.transmit_blocking(frame)
+    }
+
+    /// Transmit and spin until `LL_IRQ` reports MODE_DONE (returning
+    /// `LL_OP` to idle), bounded by the 10 ms TX timeout; interrupts must
+    /// be enabled.
+    ///
+    /// A PSDU is at most 4.3 ms on air (a data request ~0.8 ms, a software
+    /// ACK ~0.35 ms), so the CPU spins instead of yielding: TX is
+    /// latency-critical (the ACK wait follows immediately) and not
+    /// embedding a TX future keeps every MAC state machine smaller. No
+    /// `wfi` is used because a hung LL engine would then have no
+    /// guaranteed wake source before the deadline.
+    pub fn transmit_blocking(&mut self, frame: &[u8]) -> Result<(), RadioError> {
+        self.start_tx(frame, LL_MODE_STX, OP_TX)?;
+        let deadline = Instant::now() + TX_TIMEOUT;
+        while LL_OP.load(Ordering::Acquire) == OP_TX {
+            if Instant::now() >= deadline {
+                return self.tx_done(false);
+            }
+        }
+        self.tx_done(true)
+    }
+
+    fn tx_done(&self, ok: bool) -> Result<(), RadioError> {
+        if ok {
+            TX_DONE_CNT.inc();
+            Ok(())
+        } else {
+            TX_TIMEOUT_CNT.inc();
+            self.abort_if_busy();
+            Err(RadioError::HardwareError)
+        }
+    }
+
+    /// Transmit a frame that requests an acknowledgement and receive the
+    /// ACK in the same hardware operation (`ll_hw_set_trx`): the LL engine
+    /// turns the radio around after the `LL+0x18` TX→RX interval and
+    /// listens for `ACK_WAIT_US` (864 µs, macAckWaitDuration). A software re-arm after the TX-done
+    /// interrupt is too slow for the 192 µs turnaround (verified with a
+    /// sniffer: parents ACKed every association request, none was seen).
+    ///
+    /// Returns `Ok(Some(frame_pending))` for an ACK carrying `frame[2]` as
+    /// its sequence number and `Ok(None)` otherwise. Spins like
+    /// [`Self::transmit_blocking`].
+    pub fn transmit_wait_ack(&mut self, frame: &[u8]) -> Result<Option<bool>, RadioError> {
+        RX_OUTCOME.store(RxOutcome::Pending as u8, Ordering::Release);
+        reg_write(LL + 0x24, ACK_WAIT_US);
+        reg_write(LL + 0x28, ACK_WAIT_US);
+        reg_write(LL + 0x58, 0x0100); // rst rfifo
+        self.start_tx(frame, LL_MODE_TRX, OP_RX)?;
+        let deadline = Instant::now() + TX_TIMEOUT;
+        while LL_OP.load(Ordering::Acquire) == OP_RX {
+            if Instant::now() >= deadline {
+                return self.tx_done(false).map(|()| None);
+            }
+        }
+        self.tx_done(true)?;
+        if RxOutcome::from_u8(RX_OUTCOME.load(Ordering::Acquire)) != RxOutcome::FrameOk {
+            return Ok(None);
+        }
+        // SAFETY: LL_OP is idle, so LL_IRQ no longer writes RX_WORDS.
+        let w0 = unsafe { (*RX_WORDS.0.get())[0] };
+        // FIFO byte 0 = PSDU length, then FCF (2 bytes) and sequence number.
+        let [_, fcf0, _, seq] = w0.to_le_bytes();
+        let is_ack = RX_LEN.load(Ordering::Acquire) == 3 && fcf0 & 0x07 == 0x02;
+        Ok((is_ack && seq == frame[2]).then_some(fcf0 & 0x10 != 0))
+    }
+
+    /// Load the TX FIFO and start one STX or TRX operation; `LL_IRQ`
+    /// returns `LL_OP` to idle on completion.
+    fn start_tx(&mut self, frame: &[u8], mode: u32, op: u8) -> Result<(), RadioError> {
         if !self.initialized {
             return Err(RadioError::NotInitialized);
         }
         if frame.is_empty() || frame.len() > MAX_MPDU_LEN {
             return Err(RadioError::InvalidFrame);
         }
+        self.abort_if_busy();
 
-        // Defensively abort any SRX left running by a `receive()` future
-        // that was cancelled (e.g. by `embassy_futures::select` racing a
-        // timeout) before it reached `RX_DONE.wait().await`'s completion,
-        // and clear any IRQ status latched by it, so this TX starts from a
-        // clean hardware state. See `receive()` for the matching rationale.
-        reg_write(LL_HW_BASE + 0x00, 0x0000);
-        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
+        let sw_fcs = zigbee_crc16(frame);
+        let fcs: &[u8] = if self.hw_fcs() { &[] } else { &sw_fcs };
 
-        TX_DONE.reset();
-
-        // Set single-TX mode
-        reg_write(LL_HW_BASE + 0x04, 0x00_01_00); // txNum=1, rxNum=0, mode=STX
-        reg_write(LL_HW_BASE + 0x38, 0x07); // bypass SN/NESN/MD
-
-        // Reset TX FIFO
-        reg_write(LL_HW_BASE + 0x40, 0x01); // TFIFO reset
-
-        // Write frame to TX FIFO: [length_byte, frame_data...]
-        // The LL HW expects a length byte followed by the PSDU
-        let tfifo = LL_HW_TFIFO as *mut u8;
-        unsafe {
-            // Length byte (PSDU length = frame.len() + 2 for FCS appended by HW)
-            core::ptr::write_volatile(tfifo, (frame.len() + 2) as u8);
-            // Frame data
-            for (i, &b) in frame.iter().enumerate() {
-                core::ptr::write_volatile(tfifo.add(1 + i), b);
-            }
+        let mut buf = [0u8; FIFO_BYTES];
+        let words = pack_tx_fifo(&mut buf, (frame.len() + 2) as u8, frame, fcs);
+        reg_write(LL + 0x58, 0x0001); // rst tfifo
+        for w in buf.chunks_exact(4).take(words) {
+            reg_write(LL_HW_TFIFO, u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
         }
+        reg_write(LL + 0x04, mode);
+        reg_write(LL + 0x38, 0x07); // bypass SN/NESN/MD
+        self.ll_go(op);
+        Ok(())
+    }
 
-        // Clear IRQ status and enable mode-done IRQ
-        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
-        reg_write(LL_HW_BASE + 0x0C, LIRQ_MD);
+    /// Start one SRX window.
+    fn start_rx(&self) {
+        RX_OUTCOME.store(RxOutcome::Pending as u8, Ordering::Release);
+        RX_DONE.reset();
+        reg_write(LL + 0x58, 0x0100); // rst rfifo
+        reg_write(LL + 0x24, RX_TIMEOUT_US); // undo a TRX ACK window
+        reg_write(LL + 0x28, RX_TIMEOUT_US);
+        reg_write(LL + 0x04, LL_MODE_SRX);
+        reg_write(LL + 0x38, 0x07);
+        self.ll_go(OP_RX);
+    }
 
-        // Trigger!
-        reg_write(LL_HW_BASE + 0x00, 0x0001);
-
-        log::trace!(
-            "phy6222: tx {} bytes on ch{}",
-            frame.len(),
-            self.config.channel
-        );
-
-        // Wait for TX completion IRQ
-        let ok = TX_DONE.wait().await;
-        if ok {
-            Ok(())
-        } else {
-            Err(RadioError::HardwareError)
+    /// Receive the next frame with a good CRC (MPDU, FCS stripped).
+    ///
+    /// RX timeouts and CRC errors re-arm the receiver internally and are
+    /// only counted (see [`Self::stats`]); the caller bounds the wait by
+    /// racing this future against a timer.
+    ///
+    /// Dropping the future leaves the receive window armed (at most one
+    /// `RX_TIMEOUT_US` window, it is not re-armed); every later operation,
+    /// including [`Self::radio_sleep`], first aborts it in hardware. This
+    /// avoids a `Drop` guard, whose drop glue would propagate into every
+    /// stack future that awaits the radio and cost ~1 KiB of XIP.
+    pub async fn receive(&mut self) -> Result<RxFrame, RadioError> {
+        self.rx_begin()?;
+        loop {
+            RX_DONE.wait().await;
+            if let Some(result) = self.rx_complete() {
+                return result;
+            }
         }
     }
 
-    /// Receive the next IEEE 802.15.4 frame (async).
-    ///
-    /// Enables the receiver and waits for a frame. Returns the frame data
-    /// (FCS stripped, see [`zb_rfifo_mpdu_len`]) with RSSI and LQI.
-    /// Returns [`RadioError::CrcError`] for a frame that failed its CRC
-    /// check, or [`RadioError::RxTimeout`] if the RX window elapsed with
-    /// no frame at all — the two are distinguished via [`RxOutcome`]
-    /// rather than collapsed into one "not ok" state.
-    ///
-    /// # Cancellation
-    /// Callers (the MAC layer) routinely race this future against a timer
-    /// with `embassy_futures::select` and drop it if the timer wins. When
-    /// that happens the SRX operation this call started may still be
-    /// running in hardware. The next call to `receive()` (or `transmit()`)
-    /// defensively aborts that stale SRX and clears any IRQ/status it may
-    /// have latched *before* starting its own operation, so a leftover
-    /// operation from a cancelled `receive()` can't corrupt or pre-empt
-    /// the next one.
-    pub async fn receive(&mut self) -> Result<RxFrame, RadioError> {
+    /// Synchronous head of [`Self::receive`]: abort any running operation
+    /// and arm the first window. Kept out of the async state machine.
+    #[inline(never)]
+    fn rx_begin(&mut self) -> Result<(), RadioError> {
         if !self.initialized {
             return Err(RadioError::NotInitialized);
         }
+        self.abort_if_busy();
+        self.start_rx();
+        Ok(())
+    }
 
-        // Abort any previous SRX left running by a cancelled `receive()`
-        // future and clear stale IRQ/status latched from it (see doc
-        // comment above) before touching `RX_DONE`/`RX_OUTCOME`, so a
-        // late spurious IRQ from that stale operation can't race us.
-        reg_write(LL_HW_BASE + 0x00, 0x0000);
-        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
-        RX_OUTCOME.store(RxOutcome::Pending as u8, Ordering::Release);
-        RX_DONE.reset();
-
-        // Set single-RX mode
-        reg_write(LL_HW_BASE + 0x04, 0x01_00_01); // txNum=0, rxNum=1, mode=SRX
-        reg_write(LL_HW_BASE + 0x38, 0x07); // bypass SN/NESN/MD
-
-        // Set RX timeout (10 seconds in HCLK ticks — long window for Zigbee)
-        reg_write(LL_HW_BASE + 0x28, 0xFFFF); // max timeout
-
-        // Clear IRQ and enable mode-done + CRC OK/ERR + RX timeout
-        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
-        reg_write(LL_HW_BASE + 0x0C, LIRQ_MD | LIRQ_COK | LIRQ_CERR | LIRQ_RTO);
-
-        // Trigger RX
-        reg_write(LL_HW_BASE + 0x00, 0x0001);
-
-        // Wait for RX completion
-        RX_DONE.wait().await;
-
+    /// Synchronous tail of one [`Self::receive`] window: count timeouts and
+    /// CRC errors and re-arm (`None`), or return the received frame.
+    #[inline(never)]
+    fn rx_complete(&mut self) -> Option<Result<RxFrame, RadioError>> {
         match RxOutcome::from_u8(RX_OUTCOME.load(Ordering::Acquire)) {
-            RxOutcome::CrcError => return Err(RadioError::CrcError),
-            RxOutcome::Timeout => return Err(RadioError::RxTimeout),
-            // `RX_DONE` fired without `LL_IRQ` recording an outcome — should
-            // not happen, but fail safe rather than read stale RX_LEN/RX_BUF.
-            RxOutcome::Pending => return Err(RadioError::HardwareError),
             RxOutcome::FrameOk => {}
+            RxOutcome::CrcError => {
+                RX_CRC_ERR_CNT.inc();
+                self.start_rx();
+                return None;
+            }
+            RxOutcome::Timeout => {
+                RX_TIMEOUT_CNT.inc();
+                self.start_rx();
+                return None;
+            }
+            RxOutcome::Pending => {
+                self.abort_if_busy();
+                return Some(Err(RadioError::HardwareError));
+            }
         }
 
-        let len = RX_LEN.load(Ordering::Acquire) as usize;
-        if len == 0 {
-            // Defensive: `FrameOk` should always carry a non-zero MPDU.
-            return Err(RadioError::RxTimeout);
-        }
-
-        let rssi = RX_RSSI.load(Ordering::Acquire);
-
+        RX_OK_CNT.inc();
+        let len = usize::from(RX_LEN.load(Ordering::Acquire));
+        let rssi = rssi_from_foot1(RX_FOOT1.load(Ordering::Acquire));
         let mut frame = RxFrame {
             data: [0u8; MAX_FRAME_LEN],
             len,
             rssi,
             lqi: rssi_to_lqi(rssi),
         };
-
-        unsafe {
-            let buf = &*RX_BUF.get();
-            frame.data[..len].copy_from_slice(&buf[..len]);
+        // SAFETY: LL_IRQ finished writing RX_WORDS before signalling RX_DONE
+        // and only writes them again in a later OP_RX (an OP_ACK in flight
+        // touches the TX FIFO only), so no concurrent writer exists. The words are
+        // little-endian (asserted above), so the byte view is the FIFO byte
+        // order: byte 0 is the length byte and the MPDU starts at byte 1.
+        let bytes = unsafe { &*(RX_WORDS.0.get() as *const [u8; FIFO_BYTES]) };
+        frame.data[..len].copy_from_slice(&bytes[1..=len]);
+        // Cross-check the hardware CRC verdict in software (diagnostic).
+        if cfg!(feature = "phy6222-diag")
+            && zigbee_crc16(&frame.data[..len]) != [bytes[len + 1], bytes[len + 2]]
+        {
+            RX_SW_FCS_MISMATCH_CNT.inc();
         }
-
         log::trace!("phy6222: rx {} bytes rssi={}dBm", len, rssi);
-        Ok(frame)
+        Some(Ok(frame))
     }
 
-    /// Briefly enable the receiver on the current channel and measure RSSI.
+    /// Enable the receiver briefly and sample the RSSI register.
     ///
-    /// Shared by [`Self::energy_detect`] and [`Self::clear_channel_assessment`]
-    /// — both need to actually turn the receiver on for a short window and
-    /// let the RSSI front-end settle before reading the foot-word RSSI
-    /// register; reading that register without first enabling SRX would
-    /// return whatever value happened to be latched from an earlier,
-    /// unrelated RX (or nothing, on a cold radio).
-    async fn measure_channel_rssi(&mut self) -> Result<i8, RadioError> {
+    /// The SDK has no live-RSSI API; `0x400300E8[31:24]` (packet foot 1) is
+    /// sampled after 8 symbol periods. This is not hardware-validated as a
+    /// live energy measurement. The 128 µs window is spun rather than
+    /// awaited: it precedes a TX that spins anyway, and keeping CCA
+    /// synchronous removes an await point from every CSMA state machine.
+    #[inline(never)]
+    fn measure_channel_rssi(&mut self) -> Result<i8, RadioError> {
         if !self.initialized {
             return Err(RadioError::NotInitialized);
         }
-
-        // Defensively abort any stale SRX (e.g. a cancelled `receive()`)
-        // and clear stale IRQ status first — see `receive()`.
-        reg_write(LL_HW_BASE + 0x00, 0x0000);
-        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
-
-        // Set SRX mode with a short timeout, just to energize the receiver
-        // and sample RF energy — we don't care about demodulating a frame.
-        reg_write(LL_HW_BASE + 0x04, 0x01_00_01);
-        reg_write(LL_HW_BASE + 0x38, 0x07);
-        reg_write(LL_HW_BASE + 0x28, 0x0800); // short RX window
-
-        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
-        reg_write(LL_HW_BASE + 0x0C, LIRQ_MD | LIRQ_RTO);
-
-        // Trigger RX
-        reg_write(LL_HW_BASE + 0x00, 0x0001);
-
-        // Wait 128µs (8 symbol periods, the minimum 802.15.4 ED duration)
-        // for RSSI to settle.
-        embassy_time::Timer::after_micros(128).await;
-
-        // Read RSSI from foot word
-        let foot0 = reg_read(RF_PHY_BASE + 0xE4);
-        let rssi = ((foot0 >> 24) & 0xFF) as i8;
-
-        // Abort RX and clear IRQ status so the next operation starts clean.
-        reg_write(LL_HW_BASE + 0x00, 0x0000);
-        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
-
+        self.abort_if_busy();
+        self.start_rx();
+        busy_wait_us(128);
+        let rssi = rssi_from_foot1(reg_read(RF + 0xE8));
+        self.abort_if_busy();
         Ok(rssi)
     }
 
-    /// Perform an IEEE 802.15.4 Energy Detect scan on the current channel.
-    ///
-    /// Actually enables the receiver for a short window and measures RF
-    /// energy (via [`Self::measure_channel_rssi`]) rather than reading a
-    /// possibly-stale RSSI register — the channel to measure is whatever
-    /// `RadioConfig::channel` is currently applied to hardware (callers
-    /// select the channel via `update_config` before calling this, e.g.
-    /// during `MLME-SCAN.request` with `ScanType::Ed`).
-    ///
-    /// Returns (RSSI in dBm, channel_busy).
-    pub async fn energy_detect(&mut self) -> Result<(i8, bool), RadioError> {
-        let rssi = self.measure_channel_rssi().await?;
+    /// Energy detect on the current channel: (RSSI dBm, busy). Spins for
+    /// 128 µs like [`Self::channel_busy`].
+    pub fn energy_detect_blocking(&mut self) -> Result<(i8, bool), RadioError> {
+        let rssi = self.measure_channel_rssi()?;
         Ok((rssi, rssi > CCA_THRESHOLD_DBM))
     }
 
-    /// Perform Clear Channel Assessment (async, IEEE 802.15.4 CCA mode 1).
-    ///
-    /// Briefly enables the receiver to measure RF energy on the current channel.
-    /// Returns `true` if the channel is busy (energy above threshold).
+    /// CCA mode 1 on the current channel; `true` if busy. Spins for 128 µs.
+    pub fn channel_busy(&mut self) -> Result<bool, RadioError> {
+        Ok(self.measure_channel_rssi()? > CCA_THRESHOLD_DBM)
+    }
+
+    /// Energy detect on the current channel: (RSSI dBm, busy).
+    pub async fn energy_detect(&mut self) -> Result<(i8, bool), RadioError> {
+        self.energy_detect_blocking()
+    }
+
+    /// CCA mode 1 on the current channel; `true` if busy.
     pub async fn clear_channel_assessment(&mut self) -> Result<bool, RadioError> {
-        let rssi = self.measure_channel_rssi().await?;
-        Ok(rssi > CCA_THRESHOLD_DBM)
+        self.channel_busy()
     }
 
-    /// Enable continuous receive mode.
-    pub fn enable_rx(&self) {
-        if !self.initialized {
-            return;
-        }
-        // Set SRX mode and trigger
-        reg_write(LL_HW_BASE + 0x04, 0x01_00_01);
-        reg_write(LL_HW_BASE + 0x38, 0x07);
-        reg_write(LL_HW_BASE + 0x28, 0xFFFF);
-        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
-        reg_write(LL_HW_BASE + 0x0C, LIRQ_MD | LIRQ_COK | LIRQ_CERR | LIRQ_RTO);
-        reg_write(LL_HW_BASE + 0x00, 0x0001);
-    }
-
-    /// Disable the receiver.
-    pub fn disable_rx(&self) {
-        // Abort current operation by writing 0 to trigger
-        reg_write(LL_HW_BASE + 0x00, 0x0000);
-        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK); // clear pending IRQs
-    }
-
-    /// Power down the radio analog blocks to save power between TX/RX.
+    /// Stop the LL engine and gate the RF/RX-ADC clocks.
     ///
-    /// Shuts off PLL, LNA, PA, ADC clocks. Call `radio_wake()` before
-    /// the next TX or RX operation. Saves ~5–8 mA.
+    /// Call [`Self::radio_wake`] before the next operation. The DBL stays
+    /// enabled because system clock generation may depend on it.
     pub fn radio_sleep(&self) {
-        // Disable LL HW engine
-        reg_write(LL_HW_BASE + 0x00, 0x0000);
-        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
-
-        // Disable RF PHY clocks: RX ADC clk, RF PHY clk
-        sub_write_reg(CLK_CFG_REG, 19, 18, 0x00);
-        // Disable DBL (clock doubler)
-        sub_write_reg(CLK_CFG_REG, 8, 8, 0);
+        self.abort_if_busy();
+        sub_write_reg(AON_CLK_CFG, 19, 18, 0);
     }
 
-    /// Re-enable radio analog blocks after `radio_sleep()`.
-    ///
-    /// Re-enables clocks and reconfigures the analog chain.
-    /// Must be called before any TX/RX operation after sleep.
+    /// Re-enable clocks and re-run the full analog/baseband/LL
+    /// configuration, reusing the stored calibration results.
     pub fn radio_wake(&mut self) {
-        // Re-enable DBL
-        sub_write_reg(CLK_CFG_REG, 8, 8, 1);
-        // Re-enable RF PHY clocks
-        sub_write_reg(CLK_CFG_REG, 19, 18, 0x03);
-
-        // Small settling delay for PLL
-        for _ in 0..1000u32 {
-            core::hint::spin_loop();
+        self.analog_up();
+        if self.dcoc_ok {
+            reg_write(RF + 0xC4, 0x0001_0000 | (self.dcoc >> 16));
         }
+        self.digital_up();
+    }
 
-        // Re-apply channel (re-locks PLL)
-        self.set_channel(self.config.channel);
+    /// LL reset, analog/clock configuration and PA (before calibration).
+    #[inline(never)]
+    fn analog_up(&self) {
+        self.ll_reset();
+        self.ana_cfg();
+        self.set_tx_power(self.config.tx_power);
+    }
+
+    /// Baseband, LL timing, channel and power (after calibration).
+    #[inline(never)]
+    fn digital_up(&self) {
+        self.bb_cfg();
+        self.ll_cfg();
+        self.apply_config();
     }
 }
 
 // ── IRQ handler ─────────────────────────────────────────────────
 
-/// LL HW interrupt handler — called from the BB (Baseband) IRQ vector.
-///
-/// This must be registered as the interrupt handler for BB_IRQn
-/// (IRQ #4 on PHY6222, verified from SDK bus_dev.h). The handler reads the
-/// IRQ status, processes TX/RX completion, and signals the async driver.
-///
-/// The function name `LL_IRQ` matches the `device.x` linker symbol at
-/// vector position 4, overriding the weak `DefaultHandler` alias.
+/// LL HW interrupt handler for `BB_IRQn` (4), dispatched through the ROM
+/// jump table entry emitted by the product linker script.
 #[unsafe(no_mangle)]
 pub extern "C" fn LL_IRQ() {
-    let irq_status = reg_read(LL_HW_BASE + 0x10); // IRQ status register
-
-    // Clear all pending IRQs
-    reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
-
-    if irq_status & LIRQ_MD != 0 {
-        // Mode done — check if this was TX or RX by reading mode register
-        let mode = reg_read(LL_HW_BASE + 0x04) & 0x07;
-
-        if mode == 0x00 {
-            // STX mode done → TX complete
-            TX_DONE.signal(true);
-        } else if mode == 0x01 {
-            // SRX mode done — `classify_rx_irq` distinguishes CRC-ok from
-            // CRC-error for a mode-done event (RTO is not set here, since
-            // mode-done and RX-timeout are mutually exclusive per the LL
-            // HW; see `classify_rx_irq`'s doc comment).
-            let outcome = classify_rx_irq(irq_status);
-            RX_OUTCOME.store(outcome as u8, Ordering::Release);
-
+    let status = reg_read(LL + 0x10) & LL_HW_IRQ_MASK;
+    reg_write(LL + 0x14, LL_HW_IRQ_MASK);
+    if status & LIRQ_MD == 0 {
+        return;
+    }
+    match LL_OP.load(Ordering::Acquire) {
+        OP_RX => {
+            let mut outcome = classify_rx_irq(status);
             if outcome == RxOutcome::FrameOk {
-                // Read frame from RX FIFO. `len_byte` is the PSDU length
-                // as encoded by the PHY6222 Zigbee RFIFO framing and
-                // includes the 2-byte FCS; `zb_rfifo_mpdu_len` strips it
-                // so `RX_LEN`/`RX_BUF` hold only the MPDU (MHR + payload),
-                // matching what `transmit()` sends and what the MAC layer
-                // parses. See `zb_rfifo_mpdu_len`'s doc comment.
-                let rfifo = LL_HW_RFIFO as *const u8;
-                let len_byte = unsafe { core::ptr::read_volatile(rfifo) };
-                let len = zb_rfifo_mpdu_len(len_byte);
-
-                RX_LEN.store(len as u8, Ordering::Release);
-
-                // Read RSSI from foot word
-                let foot0 = reg_read(RF_PHY_BASE + 0xE4);
-                let rssi = ((foot0 >> 24) & 0xFF) as i8;
-                RX_RSSI.store(rssi, Ordering::Release);
-
-                // Copy frame data (MPDU only — the 2 FCS bytes still
-                // sitting in the FIFO after it are left unread here).
-                unsafe {
-                    let buf = &mut *RX_BUF.get();
-                    for (i, byte) in buf.iter_mut().enumerate().take(len) {
-                        *byte = core::ptr::read_volatile(rfifo.add(1 + i));
-                    }
-                }
-            } else {
-                RX_LEN.store(0, Ordering::Release);
+                outcome = read_rx_fifo();
             }
-
+            reg_write(LL + 0x58, 0x0100); // drop anything left in the RX FIFO
+            RX_OUTCOME.store(outcome as u8, Ordering::Release);
+            if outcome == RxOutcome::FrameOk
+                && let Some(seq) = ack_sequence_for_rx()
+            {
+                start_ack_tx(seq);
+            } else {
+                LL_OP.store(OP_IDLE, Ordering::Release);
+            }
             RX_DONE.signal(());
         }
-    } else if irq_status & LIRQ_RTO != 0 {
-        // RX timeout — no frame received at all, distinct from a received
-        // frame that failed its CRC check (see `RxOutcome`).
-        RX_OUTCOME.store(RxOutcome::Timeout as u8, Ordering::Release);
-        RX_LEN.store(0, Ordering::Release);
-        RX_DONE.signal(());
+        // OP_TX / OP_ACK done, or a stopped RX (result discarded).
+        _ => {
+            reg_write(LL + 0x58, 0x0100); // rst rfifo
+            LL_OP.store(OP_IDLE, Ordering::Release);
+        }
     }
+}
+
+/// Spin while `LL_OP == op`, for at most `timeout`.
+fn wait_while_op(op: u8, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while LL_OP.load(Ordering::Acquire) == op && Instant::now() < deadline {
+        core::hint::spin_loop();
+    }
+}
+
+/// Sequence number to acknowledge for the frame `read_rx_fifo` just stored
+/// (shared exact-destination policy), or `None`.
+fn ack_sequence_for_rx() -> Option<u8> {
+    let filter = ACK_FILTER.lock(Cell::get);
+    let len = usize::from(RX_LEN.load(Ordering::Relaxed));
+    // SAFETY: only LL_IRQ (this context) writes RX_WORDS; the driver reads
+    // them only after RX_DONE.
+    let bytes = unsafe { &*(RX_WORDS.0.get() as *const [u8; FIFO_BYTES]) };
+    crate::frames::software_ack_sequence(
+        &bytes[1..=len],
+        PanId(filter.pan_id),
+        ShortAddress(filter.short_address),
+        &filter.extended_address,
+    )
+}
+
+/// Start the STX of an ACK (`frame pending` clear: end devices hold no
+/// indirect data) on the channel and TP calibration of the RX that just
+/// completed. Sent from the interrupt because the 802.15.4 turnaround
+/// (`macAckWaitDuration`, 864 µs) is shorter than a task wake-up: software
+/// ACKs were measured on air 1.7–3.7 ms after the frame and never accepted.
+fn start_ack_tx(seq: u8) {
+    let hw_fcs = ACK_FILTER.lock(Cell::get).hw_fcs;
+    let ack = [0x02, 0x00, seq];
+    let crc = zigbee_crc16(&ack);
+    reg_write(LL + 0x58, 0x0001); // rst tfifo
+    reg_write(LL_HW_TFIFO, u32::from_le_bytes([5, ack[0], ack[1], ack[2]]));
+    if !hw_fcs {
+        reg_write(LL_HW_TFIFO, u32::from_le_bytes([crc[0], crc[1], 0, 0]));
+    }
+    reg_write(LL + 0x04, LL_MODE_STX);
+    reg_write(LL + 0x38, 0x07);
+    LL_OP.store(OP_ACK, Ordering::Release);
+    reg_write(LL + 0x14, LL_HW_IRQ_MASK);
+    reg_write(LL + 0x0C, LIRQ_MD);
+    reg_write(LL + 0x00, 0x0001);
+}
+
+/// Pop one packet (`ll_hw_read_rfifo_zb`) into `RX_WORDS`.
+fn read_rx_fifo() -> RxOutcome {
+    let info = reg_read(LL + 0x54);
+    let depth = ((info >> 16) & 0x7FF).wrapping_sub(info & 0x7FF) & 0x7FF;
+    if depth == 0 {
+        return RxOutcome::CrcError;
+    }
+    // SAFETY: only LL_IRQ writes RX_WORDS, while LL_OP == OP_RX.
+    let words = unsafe { &mut *RX_WORDS.0.get() };
+    words[0] = reg_read(LL_HW_RFIFO);
+    let len_byte = (words[0] & 0xFF) as u8;
+    let Some(mpdu_len) = zb_rfifo_mpdu_len(len_byte) else {
+        RX_BAD_LEN_CNT.inc();
+        return RxOutcome::CrcError;
+    };
+    let wlen = rfifo_packet_words(len_byte);
+    for w in words.iter_mut().take(wlen).skip(1) {
+        *w = reg_read(LL_HW_RFIFO);
+    }
+    let _foot0 = reg_read(LL_HW_RFIFO);
+    let foot1 = reg_read(LL_HW_RFIFO);
+    RX_LEN.store(mpdu_len as u8, Ordering::Release);
+    RX_FOOT1.store(foot1, Ordering::Release);
+    RxOutcome::FrameOk
 }
 
 // ── Utility ─────────────────────────────────────────────────────
 
-/// Convert RSSI to LQI (Link Quality Indicator, 0–255).
-///
-/// Delegates to the shared stack-wide policy in [`crate::lqi::from_rssi_dbm`]
-/// so every backend that has no IEEE-normalized hardware quality byte uses one
-/// definition. Behaviour is unchanged from the previous local copy; the
-/// endpoint/monotonicity tests below still cover it.
+/// RSSI-derived IEEE 802.15.4 LQI (shared stack-wide policy).
 fn rssi_to_lqi(rssi: i8) -> u8 {
     crate::lqi::from_rssi_dbm(rssi)
 }
@@ -899,130 +1300,213 @@ fn rssi_to_lqi(rssi: i8) -> u8 {
 mod tests {
     use super::*;
 
-    // These tests exercise only pure, hardware-independent helper
-    // functions. `Phy6222Driver`/`Phy6222Mac` cannot be constructed on a
-    // host test target: `Phy6222Driver::new()` performs unconditional,
-    // unsafe MMIO register access (`init_hardware()`), which would fault
-    // on any machine other than a real PHY6222 SoC — an existing, pre-dating
-    // limitation of this backend, not something introduced or worked
-    // around here. See item 6/7/8/9 helpers below.
+    // Only pure helpers are tested: constructing the driver touches MMIO.
 
     #[test]
-    fn max_frame_and_mpdu_len_leave_room_for_two_byte_fcs() {
-        assert_eq!(MAX_FRAME_LEN, 127); // aMaxPHYPacketSize
-        assert_eq!(MAX_MPDU_LEN, 125);
+    fn frame_size_constants() {
+        assert_eq!(MAX_FRAME_LEN, 127);
         assert_eq!(MAX_MPDU_LEN + 2, MAX_FRAME_LEN);
-    }
-
-    // ── classify_rx_irq (RxTimeout vs CrcError precedence, item 9) ──
-
-    #[test]
-    fn classify_rx_irq_mode_done_with_good_crc_is_frame_ok() {
-        assert_eq!(classify_rx_irq(LIRQ_MD | LIRQ_COK), RxOutcome::FrameOk);
+        assert_eq!(FIFO_WORDS, 32);
     }
 
     #[test]
-    fn classify_rx_irq_mode_done_with_bad_crc_is_crc_error() {
-        assert_eq!(classify_rx_irq(LIRQ_MD | LIRQ_CERR), RxOutcome::CrcError);
-        // Mode-done without the COK bit set at all is also a CRC error,
-        // regardless of whether CERR happens to be latched too.
-        assert_eq!(classify_rx_irq(LIRQ_MD), RxOutcome::CrcError);
+    fn irq_bits_match_ll_hw_drv_h() {
+        assert_eq!(LIRQ_MD, 1 << 0);
+        assert_eq!(LIRQ_CERR, 1 << 1);
+        assert_eq!(LIRQ_RTO, 1 << 2);
+        assert_eq!(LIRQ_RD, 1 << 9);
+        assert_eq!(LIRQ_COK, 1 << 10);
+        assert_eq!(LIRQ_CERR2, 1 << 11);
+        assert_eq!(LL_HW_IRQ_MASK, 0x3FFF);
     }
 
     #[test]
-    fn classify_rx_irq_timeout_without_mode_done_is_timeout() {
-        assert_eq!(classify_rx_irq(LIRQ_RTO), RxOutcome::Timeout);
-    }
-
-    #[test]
-    fn classify_rx_irq_neither_bit_is_pending() {
+    fn classify_requires_mode_done() {
+        assert_eq!(classify_rx_irq(LIRQ_RD | LIRQ_COK), RxOutcome::Pending);
         assert_eq!(classify_rx_irq(0), RxOutcome::Pending);
     }
 
     #[test]
-    fn classify_rx_irq_mode_done_takes_precedence_over_timeout_bit() {
-        // The LL HW should never raise MD and RTO together for the same
-        // SRX operation, but if it did, a completed frame must win over a
-        // stray timeout bit rather than being discarded as a timeout.
+    fn classify_ok_needs_rd_and_cok() {
         assert_eq!(
-            classify_rx_irq(LIRQ_MD | LIRQ_COK | LIRQ_RTO),
+            classify_rx_irq(LIRQ_MD | LIRQ_RD | LIRQ_COK),
             RxOutcome::FrameOk
+        );
+        assert_eq!(classify_rx_irq(LIRQ_MD | LIRQ_COK), RxOutcome::CrcError);
+    }
+
+    #[test]
+    fn classify_crc_error_and_timeout() {
+        assert_eq!(
+            classify_rx_irq(LIRQ_MD | LIRQ_RD | LIRQ_CERR),
+            RxOutcome::CrcError
+        );
+        assert_eq!(classify_rx_irq(LIRQ_MD | LIRQ_CERR2), RxOutcome::CrcError);
+        assert_eq!(classify_rx_irq(LIRQ_MD | LIRQ_RTO), RxOutcome::Timeout);
+        // A CRC error wins over a simultaneous timeout flag.
+        assert_eq!(
+            classify_rx_irq(LIRQ_MD | LIRQ_CERR | LIRQ_RTO),
+            RxOutcome::CrcError
         );
     }
 
     #[test]
-    fn rx_outcome_round_trips_through_u8() {
-        for outcome in [
+    fn rx_outcome_round_trips() {
+        for o in [
             RxOutcome::Pending,
             RxOutcome::FrameOk,
             RxOutcome::CrcError,
             RxOutcome::Timeout,
         ] {
-            assert_eq!(RxOutcome::from_u8(outcome as u8), outcome);
+            assert_eq!(RxOutcome::from_u8(o as u8), o);
         }
-        // Any other encoded value defensively decodes to `Pending` rather
-        // than panicking or aliasing a real outcome.
         assert_eq!(RxOutcome::from_u8(0xFF), RxOutcome::Pending);
     }
 
-    // ── zb_rfifo_mpdu_len (FCS stripping, item 6) ───────────────────
-
-    #[test]
-    fn zb_rfifo_mpdu_len_strips_two_byte_fcs() {
-        // A 10-byte over-the-air PSDU (8-byte MPDU + 2-byte FCS).
-        assert_eq!(zb_rfifo_mpdu_len(10), 8);
+    /// Independent bit-serial LFSR formulation of the 802.15.4 FCS (a 16-bit
+    /// register as a bit array, like the `uint8_t seed[16]` argument of the
+    /// SDK's ROM `zigbee_crc16_gen`, whose source is not published).
+    fn bit_serial_crc16(data: &[u8]) -> [u8; 2] {
+        let mut reg = [0u8; 16];
+        for &byte in data {
+            for j in 0..8 {
+                let bit = (byte >> j) & 1;
+                let fb = reg[0] ^ bit;
+                for k in 0..15 {
+                    reg[k] = reg[k + 1];
+                }
+                reg[3] ^= fb;
+                reg[10] ^= fb;
+                reg[15] = fb;
+            }
+        }
+        let to_byte = |bits: &[u8]| bits.iter().enumerate().fold(0u8, |a, (i, b)| a | (b << i));
+        [to_byte(&reg[..8]), to_byte(&reg[8..])]
     }
 
     #[test]
-    fn zb_rfifo_mpdu_len_at_max_psdu_matches_max_mpdu_len() {
-        assert_eq!(zb_rfifo_mpdu_len(MAX_FRAME_LEN as u8), MAX_MPDU_LEN);
+    fn crc16_matches_kermit_check_value() {
+        assert_eq!(zigbee_crc16(b"123456789"), [0x89, 0x21]);
+        assert_eq!(zigbee_crc16(&[]), [0, 0]);
     }
 
     #[test]
-    fn zb_rfifo_mpdu_len_saturates_instead_of_underflowing() {
-        // A length byte shorter than the FCS itself (corrupt/impossible in
-        // practice) must not panic or wrap around `usize`.
-        assert_eq!(zb_rfifo_mpdu_len(0), 0);
-        assert_eq!(zb_rfifo_mpdu_len(1), 0);
-        assert_eq!(zb_rfifo_mpdu_len(2), 0);
+    fn crc16_matches_bit_serial_lfsr() {
+        let mut seed = 0x1234_5678u32;
+        for len in 0..64 {
+            let mut buf = [0u8; 64];
+            for b in buf.iter_mut().take(len) {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                *b = (seed >> 16) as u8;
+            }
+            assert_eq!(zigbee_crc16(&buf[..len]), bit_serial_crc16(&buf[..len]));
+        }
     }
 
     #[test]
-    fn zb_rfifo_mpdu_len_caps_at_max_mpdu_len() {
-        // Defensive cap even if the length byte somehow exceeded the PHY's
-        // own 127-byte maximum.
-        assert_eq!(zb_rfifo_mpdu_len(u8::MAX), MAX_MPDU_LEN);
+    fn crc16_of_frame_with_fcs_is_zero_residue() {
+        // Beacon request: FCF 0x0803, DSN 0x2a, dst PAN/addr 0xffff/0xffff, cmd 7.
+        let mut f = [0x03, 0x08, 0x2a, 0xff, 0xff, 0xff, 0xff, 0x07, 0, 0];
+        let fcs = zigbee_crc16(&f[..8]);
+        f[8..].copy_from_slice(&fcs);
+        assert_eq!(zigbee_crc16(&f), [0, 0]);
     }
 
-    // ── rssi_to_lqi sanity ───────────────────────────────────────────
+    #[test]
+    fn channel_index_matches_sdk_formula() {
+        assert_eq!(rf_channel_index(11), 5);
+        assert_eq!(rf_channel_index(15), 25);
+        assert_eq!(rf_channel_index(26), 80);
+        assert_eq!(rf_channel_index(5), 5);
+        assert_eq!(rf_channel_index(30), 80);
+    }
+
+    #[test]
+    fn tpcal_calc_matches_sdk_macro() {
+        // tp0 > tp1: linear interpolation with rounding.
+        assert_eq!(tpcal_for_rf_channel(0x30, 0x20, 2), 0x30);
+        // idx = (66-2)>>1 = 32 → tp1 exactly.
+        assert_eq!(tpcal_for_rf_channel(0x30, 0x20, 66), 0x20);
+        // idx = (34-2)>>1 = 16 → midpoint.
+        assert_eq!(tpcal_for_rf_channel(0x30, 0x20, 34), 0x28);
+        // tp0 <= tp1: SDK uses tp0 for every channel.
+        assert_eq!(tpcal_for_rf_channel(0x20, 0x30, 80), 0x20);
+        // rfChn clamped to 2..=80.
+        assert_eq!(
+            tpcal_for_rf_channel(0x30, 0x20, 0),
+            tpcal_for_rf_channel(0x30, 0x20, 2)
+        );
+        assert_eq!(
+            tpcal_for_rf_channel(0x30, 0x20, 200),
+            tpcal_for_rf_channel(0x30, 0x20, 80)
+        );
+    }
+
+    #[test]
+    fn tx_power_tables() {
+        assert_eq!(tx_power_code(PaTable::QFN32, 0), (0x1f, false));
+        assert_eq!(tx_power_code(PaTable::QFN32, 10), (0x3f, true));
+        assert_eq!(tx_power_code(PaTable::QFN32, -1), (0x0f, false));
+        assert_eq!(tx_power_code(PaTable::QFN32, -40), (0x01, false));
+        assert_eq!(tx_power_code(PaTable::TSOP16, 0), (0x0d, false));
+        assert_eq!(tx_power_code(PaTable::TSOP16, 5), (0x1d, false));
+        assert_eq!(tx_power_code(PaTable::TSOP16, -12), (0x02, false));
+    }
+
+    #[test]
+    fn fifo_words_are_little_endian_with_residue() {
+        let collect = |len: u8, frame: &[u8], fcs: &[u8]| {
+            let mut buf = [0u8; FIFO_BYTES];
+            let words = pack_tx_fifo(&mut buf, len, frame, fcs);
+            buf.chunks_exact(4)
+                .take(words)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect::<heapless::Vec<u32, FIFO_WORDS>>()
+        };
+        assert_eq!(collect(1, &[2, 3], &[4, 5])[..], [0x0403_0201, 0x0000_0005]);
+        assert_eq!(collect(9, &[8, 7, 6], &[])[..], [0x0607_0809]);
+        assert_eq!(collect(7, &[], &[])[..], [0x0000_0007]);
+        let full = [0xAAu8; MAX_MPDU_LEN];
+        assert_eq!(collect(127, &full, &[0xBB, 0xCC]).len(), FIFO_WORDS);
+        assert_eq!(collect(127, &full, &[]).len(), 32);
+    }
+
+    #[test]
+    fn rfifo_word_count_covers_len_byte_and_psdu() {
+        for blen in 0u8..=127 {
+            let words = rfifo_packet_words(blen);
+            assert!(words * 4 > usize::from(blen));
+            assert!(words <= FIFO_WORDS);
+        }
+        assert_eq!(rfifo_packet_words(5), 2);
+        assert_eq!(rfifo_packet_words(127), 32);
+    }
+
+    #[test]
+    fn mpdu_len_strips_fcs_and_rejects_out_of_range() {
+        assert_eq!(zb_rfifo_mpdu_len(5), Some(3));
+        assert_eq!(zb_rfifo_mpdu_len(127), Some(125));
+        assert_eq!(zb_rfifo_mpdu_len(4), None);
+        assert_eq!(zb_rfifo_mpdu_len(0), None);
+        assert_eq!(zb_rfifo_mpdu_len(128), None);
+    }
+
+    #[test]
+    fn rssi_is_negated_foot1_top_byte() {
+        assert_eq!(rssi_from_foot1(0x4B00_0000), -75);
+        assert_eq!(rssi_from_foot1(0), 0);
+        assert_eq!(rssi_from_foot1(0xFF00_0000), -127);
+    }
 
     #[test]
     fn rssi_to_lqi_is_monotonic_and_bounded() {
         assert_eq!(rssi_to_lqi(-100), 0);
         assert_eq!(rssi_to_lqi(-20), 255);
         assert!(rssi_to_lqi(-60) > rssi_to_lqi(-90));
-        // Out-of-range RSSI values are clamped, not wrapped.
-        assert_eq!(rssi_to_lqi(-128), rssi_to_lqi(-100));
-        assert_eq!(rssi_to_lqi(0), rssi_to_lqi(-20));
     }
 
-    // ── CCA / ED threshold (item 8 support) ─────────────────────────
-
     #[test]
-    fn cca_threshold_matches_ieee_802_15_4_cca_mode_1_default() {
+    fn cca_threshold_is_minus_60_dbm() {
         assert_eq!(CCA_THRESHOLD_DBM, -60);
-    }
-
-    #[test]
-    fn tp_calibration_clamps_above_measured_range() {
-        let driver = Phy6222Driver {
-            config: RadioConfig::default(),
-            initialized: false,
-            tp_cal0: 0x10,
-            tp_cal1: 0x30,
-        };
-        assert_eq!(driver.tp_cal_for_channel(66), 0x30);
-        assert_eq!(driver.tp_cal_for_channel(75), 0x30);
-        assert_eq!(driver.tp_cal_for_channel(80), 0x30);
     }
 }
