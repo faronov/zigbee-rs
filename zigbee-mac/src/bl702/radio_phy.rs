@@ -14,6 +14,11 @@ const TX_IDLE_TIMEOUT_TICKS: u32 = 0x7a12;
 const TX_DONE_TIMEOUT: Duration = Duration::from_millis(10);
 const CCA_READY_SPINS: usize = 100_000;
 const MIN_FRAME_LEN: usize = 3;
+/// Bound for the pre-sleep idle wait. RX is already disabled between MAC
+/// operations, so idle is normally observed on the first read; the bound
+/// covers an in-flight maximum-length frame (about 4 ms on air) and is a few
+/// tens of milliseconds of register polling at 32 MHz.
+const QUIESCE_IDLE_SPINS: usize = 20_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TxResult {
@@ -103,6 +108,29 @@ impl Bl702RadioPhy {
         engine.self_test()?;
         self.aes_engine = Some(engine);
         Ok(())
+    }
+
+    /// Put the M154 block in its quiescent idle state before a CPU idle wait.
+    ///
+    /// Receive is disabled and the call spins (bounded) until the M154 state
+    /// machine reports idle. The RF analog block, PLL and per-die calibration
+    /// results are left untouched, so no recalibration is needed afterwards.
+    ///
+    /// Restoration is lazy: [`RadioPhy::receive`] re-enables RX and
+    /// `transmit` drives TX from this idle state exactly as it does between
+    /// ordinary operations, so there is no matching wake call.
+    ///
+    /// Returns `false` if the radio did not reach idle within the bound; the
+    /// caller must then service radio activity instead of sleeping.
+    pub fn quiesce(&mut self) -> bool {
+        disable_rx();
+        for _ in 0..QUIESCE_IDLE_SPINS {
+            if is_idle() {
+                return true;
+            }
+            spin_loop();
+        }
+        is_idle()
     }
 
     async fn transmit(&mut self, frame: &[u8], run_cca: bool) -> Result<(), PhyError> {

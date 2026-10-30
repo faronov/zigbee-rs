@@ -65,7 +65,7 @@ The shared application also shortens the wait for:
 |---|---|---|---|
 | nRF52840/52833 sensor | `Idle` | `Idle` | radio-off retained System-ON wait; prior sensor-path hardware evidence |
 | ESP32-C6/H2 | `Active` | `Active` | no low-power claim |
-| BL702 | `Active` | `Active` | polling executor; no PDS/HBN claim |
+| BL702 | `Idle` | `Idle` | RX-off M154 idle + WFI on TIMER CH0 alarm IRQ; no PDS/HBN claim; HIL join/poll/resume OK, current unmeasured |
 | CC2340 | `Active` | `Active` | radio bring-up/ZHA join seen on one board; no low-power claim |
 | PHY6222/6252 | `Idle` | `Idle` | radio sleep + real timer; retention rejected, hardware path unverified |
 | EFR32MG1 | `Active` | `Retention` | prior RTCC/LFRCO EM2 path evidence |

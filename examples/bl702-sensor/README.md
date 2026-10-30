@@ -19,7 +19,7 @@ This example is the composition root.
 
 The root constructs explicit `SensorSedParts`:
 
-- active-only wake;
+- `Bl702Wake` (`Active` and radio-quiesced `Idle`; `Retention` rejected);
 - `NoStatus`;
 - synthetic temperature/humidity;
 - GPADC supply battery;
@@ -27,8 +27,35 @@ The root constructs explicit `SensorSedParts`:
 - no user action;
 - BL702 supervisor and diagnostics.
 
-The product selects `Active` for both fast and slow waits. No PDS/HBN sleep
-path is claimed.
+The product selects `Idle` for both fast (250 ms) and slow (10 s) parent-poll
+waits. An `Idle` wait:
+
+1. disables M154 receive and waits (bounded) for the M154 state machine to
+   report idle; if it does not, the wait returns `WakeReason::Activity`
+   instead of sleeping;
+2. awaits an Embassy timer, so the executor executes WFI;
+3. wakes on the TIMER channel 0 comparator-0 interrupt (CLIC source 52,
+   CLIC direct mode `mtvec = entry | 0b10`).
+
+Clocks, the RF analog block, PLL, and per-die calibration stay powered, so
+there is no restore step: the next MAC RX/TX starts from the same idle state
+used between ordinary operations. The time driver arms the comparator for
+the earliest deadline, capped at 30 minutes so the 1 MHz counter's 64-bit
+extension never misses its ~71.6-minute wrap. A boot self-test proves alarm
+interrupt delivery; on failure the driver reverts to the previous polling
+executor and diagnostics report `wfi=false`.
+
+`Retention` (PDS/HBN) is rejected by the wake controller and refused by
+`bl702_hal::pm`; no PDS/HBN behavior is claimed. Idle sleep was validated on
+one XT-ZB1 against ZHA: the alarm self-test passes (`wfi=true`), Idle waits
+show no radio vetoes, and fresh join, interview/reconfigure over the 10 s long
+poll, Mgmt_Leave and reset/resume all work. Current draw and behavior across
+the ~71.6-minute counter wrap are not yet measured.
+
+With `BL702_DIAGNOSTIC_LOG=1`, the UART (2 Mbaud) shows `alarm irq ready`
+after `logger ready` (or `alarm irq FAILED: polling executor`), then an
+`idle sleep: waits=…, idle_ms=…, radio_vetoes=…, alarm_irqs=…, wfi=…`
+summary on the first and every 64th idle wait.
 
 ## Radio and Zigbee validation
 
@@ -53,8 +80,9 @@ constructs:
 0x000FE000..0x00100000  SecurityStateJournal
 ```
 
-Persistence is integrated. Destructive erase/program and reset/resume still
-need controlled XT-ZB1 hardware validation.
+Persistence is integrated. Security-state and replay-counter journal writes
+plus reset/resume were exercised on XT-ZB1 hardware; long-term journal
+compaction still needs controlled validation.
 
 ## Build
 
@@ -105,6 +133,8 @@ persistence validation from a successful program operation.
 
 - security-journal erase/program, power interruption, and reset recovery;
 - GPADC battery accuracy;
-- low-power modes;
+- `Idle` sleep: WFI wake on the TIMER alarm, sleep current, and long-poll
+  stability across a 71.6-minute counter wrap;
+- PDS/HBN low-power modes (not implemented);
 - RF output/spectral qualification;
 - hardware address filtering and auto-ACK.

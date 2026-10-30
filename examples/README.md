@@ -107,7 +107,7 @@ current image.
 | [`nrf52840-sensor-uf2`](nrf52840-sensor-uf2/) | ProMicro, MDK, PCA10059, or DK | `Idle` / `Idle` | board-dependent status, `NoOta` | build/layout matrix; bootloader compatibility remains board-specific |
 | [`esp32c6-sensor`](esp32c6-sensor/) | ESP32-C6 DevKit | `Active` / `Active` | `NoStatus`, OTA | real `esp-radio`; prior commissioning/reporting and 18.3% OTA evidence; activation open |
 | [`esp32h2-sensor`](esp32h2-sensor/) | ESP32-H2 | `Active` / `Active` | active-low LED, OTA | real `esp-radio`; prior complete v1→v2 OTA evidence |
-| [`bl702-sensor`](bl702-sensor/) | XT-ZB1 / BL702 | `Active` / `Active` | `NoStatus`, `NoOta` | build/layout; prior radio/Zigbee evidence; destructive persistence open |
+| [`bl702-sensor`](bl702-sensor/) | XT-ZB1 / BL702 | `Idle` / `Idle` | `NoStatus`, `NoOta` | HIL: join, interview, Idle long poll, leave, reset/resume; sleep current unmeasured |
 | [`phy6222-sensor`](phy6222-sensor/) | PHY6222/PHY6252 EVK | `Idle` / `Idle` | fitted status, `NoOta` | exact feature images build/layout-tested; hardware path open |
 | [`cc2340-sensor`](cc2340-sensor/) | LP-EM-CC2340R5 | `Active` / `Active` | fitted status, `NoOta` | compile/layout only; entropy fails closed |
 | [`efr32mg1-sensor`](efr32mg1-sensor/) | TRÅDFRI / EFR32MG1P | `Active` / `Retention` | fitted LEDs, OTA | build/layout; prior path evidence; real OTA install open |

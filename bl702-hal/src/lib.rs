@@ -16,6 +16,7 @@ pub mod efuse;
 pub mod flash;
 pub mod gpio;
 pub mod i2c;
+pub mod interrupt;
 mod mmio;
 pub mod peripherals;
 pub mod pm;

@@ -13,12 +13,13 @@ compile_error!("select either production or diagnostic-logging, not both");
 compile_error!("select production or diagnostic-logging");
 
 mod hal;
+mod time_driver;
+mod wake;
 
 use core::fmt::{Display, Formatter, Write};
 
 use bl702_xt_zb1_product as product;
 use embassy_executor::Executor;
-use embassy_time_driver::Driver;
 use panic_halt as _;
 use sensor_sed_app::{
     BlockingBattery, BlockingEnvironment, NoOta, NoStatus, SensorApp, SensorSedParts,
@@ -28,28 +29,6 @@ use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::ApplicationProfile;
 use zigbee_zcl::clusters::basic::PowerSource;
-
-mod time_driver {
-    use super::*;
-
-    struct Bl702TimeDriver;
-
-    impl Driver for Bl702TimeDriver {
-        fn now(&self) -> u64 {
-            hal::timer_ticks()
-        }
-
-        fn schedule_wake(&self, _at: u64, waker: &core::task::Waker) {
-            // The proven BL702 path is a polling executor. TIMER0 still
-            // provides the monotonic time used by MAC and stack deadlines.
-            waker.wake_by_ref();
-        }
-    }
-
-    embassy_time_driver::time_driver_impl!(
-        static DRIVER: Bl702TimeDriver = Bl702TimeDriver
-    );
-}
 
 struct UartWriter;
 
@@ -105,6 +84,15 @@ fn main() -> ! {
         log::set_max_level_racy(log::LevelFilter::Info);
     }
     marker(b"logger ready\r\n");
+
+    // Enable the TIMER channel 0 alarm interrupt so the executor sleeps in
+    // WFI between timer deadlines. On failure the driver keeps the previous
+    // polling behavior.
+    if time_driver::start() {
+        marker(b"alarm irq ready\r\n");
+    } else {
+        marker(b"alarm irq FAILED: polling executor\r\n");
+    }
 
     let mut executor = Executor::new();
     let executor: &'static mut Executor = unsafe { core::mem::transmute(&mut executor) };
@@ -210,7 +198,7 @@ async fn sensor(application: hal::ApplicationResources) {
         node,
         &product::policy::SENSOR_POLICY,
         SensorSedParts {
-            wake: hal::ActiveOnlyWake,
+            wake: wake::Bl702Wake::new(),
             status: NoStatus,
             environment: BlockingEnvironment::new(product::environment::SyntheticEnvironment::new()),
             battery: BlockingBattery::new(battery),

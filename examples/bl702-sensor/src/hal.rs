@@ -9,12 +9,9 @@ use bl702_hal::peripherals::Adc;
 use bl702_hal::timer::Monotonic;
 use bl702_hal::uart::{Uart0Tx, WriteError};
 use bl702_xt_zb1::Resources;
-use embassy_time::{Duration, Instant, Timer};
 use sensor_sed_app::{
-    BatteryReading, BlockingBatterySource, DiagnosticEvent, Diagnostics, SleepDepth, Supervisor,
-    WaitRequest, WakeController, WakeReason,
+    BatteryReading, BlockingBatterySource, DiagnosticEvent, Diagnostics, Supervisor,
 };
-use zigbee_mac::MacDriver;
 
 pub use bl702_xt_zb1::ApplicationResources;
 
@@ -24,7 +21,8 @@ struct Global<T> {
 }
 
 // SAFETY: All access is serialized with the BL702 single-hart critical
-// section. Values are initialized once before interrupts are enabled.
+// section. Values are initialized once before interrupts are enabled. The
+// TIMER alarm interrupt never touches these globals.
 unsafe impl<T> Sync for Global<T> {}
 
 impl<T> Global<T> {
@@ -92,7 +90,6 @@ impl<T> Global<T> {
 }
 
 static UART: Global<Uart0Tx<14, 15>> = Global::empty();
-static TIMER: Global<Monotonic> = Global::empty();
 static CHIP_ID: Global<[u8; 8]> = Global::empty();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,9 +111,7 @@ pub fn init() -> Result<ApplicationResources, InitError> {
     let chip_id = EfuseReader::new(runtime.efuse).chip_id();
 
     UART.set(uart).map_err(|_| InitError::AlreadyInitialized)?;
-    TIMER
-        .set(timer)
-        .map_err(|_| InitError::AlreadyInitialized)?;
+    crate::time_driver::install(timer).map_err(|_| InitError::AlreadyInitialized)?;
     CHIP_ID
         .set(chip_id)
         .map_err(|_| InitError::AlreadyInitialized)?;
@@ -127,12 +122,6 @@ pub fn delay_us(duration_us: u32) {
     bl702_hal::timer::delay_us(duration_us);
 }
 
-pub fn timer_ticks() -> u64 {
-    TIMER
-        .with_mut(Monotonic::ticks)
-        .unwrap_or_else(|| panic!("BL702 timer is unavailable"))
-}
-
 pub fn chip_id() -> [u8; 8] {
     CHIP_ID.with(|id| *id).unwrap_or([0; 8])
 }
@@ -140,59 +129,6 @@ pub fn chip_id() -> [u8; 8] {
 pub fn uart_write(byte: u8) -> Result<(), WriteError> {
     UART.with_mut(|uart| uart.write_byte(byte))
         .unwrap_or(Err(WriteError::Timeout))
-}
-
-/// Polling-only wake adapter for the currently proven BL702 path.
-///
-/// PDS/HBN restoration is not hardware-proven, so any non-active request
-/// fails explicitly rather than entering an unsafe sleep state.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ActiveOnlyWake;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActiveWakeError {
-    UnsupportedSleepDepth,
-}
-
-impl<M: MacDriver> WakeController<M> for ActiveOnlyWake {
-    type Mark = Instant;
-    type Error = ActiveWakeError;
-
-    fn mark(&self) -> Self::Mark {
-        Instant::now()
-    }
-
-    fn add_ms(mark: Self::Mark, duration_ms: u32) -> Self::Mark {
-        mark + Duration::from_millis(u64::from(duration_ms))
-    }
-
-    fn elapsed_ms(later: Self::Mark, earlier: Self::Mark) -> u32 {
-        later
-            .duration_since(earlier)
-            .as_millis()
-            .min(u64::from(u32::MAX)) as u32
-    }
-
-    async fn wait(
-        &mut self,
-        _mac: &mut M,
-        request: WaitRequest,
-    ) -> Result<WakeReason, Self::Error> {
-        if request.sleep_depth != SleepDepth::Active {
-            return Err(ActiveWakeError::UnsupportedSleepDepth);
-        }
-        Timer::after(Duration::from_millis(u64::from(request.timeout_ms))).await;
-        Ok(WakeReason::Timer)
-    }
-
-    async fn button_held_for(&mut self, duration_ms: u32) -> bool {
-        Timer::after(Duration::from_millis(u64::from(duration_ms))).await;
-        false
-    }
-
-    async fn delay_ms(&mut self, duration_ms: u32) {
-        Timer::after(Duration::from_millis(u64::from(duration_ms))).await;
-    }
 }
 
 /// Blocking internal-VBAT source bound to the XT-ZB1 product battery curve.
