@@ -10,6 +10,31 @@ const XIP_MASK: u32 = 0x001f_ffff;
 const HEADER_SIZE: usize = 0x100;
 const MAX_SEGMENTS: usize = 15;
 
+/// Flash offset of the boot-ROM application table (ROM boot mode).
+///
+/// The PHY62xx mask ROM reads `[count][0xffffffff][run address][0xffffffff]`
+/// at flash 0x2000 and 16-byte `[flash address][size][load address]
+/// [0xffffffff]` entries from 0x2100, copies SRAM entries, then starts the
+/// two-word `[sp][reset]` descriptor at the run address. The layout matches
+/// the Ai-Thinker PB-03F factory image read back over SWD.
+const ROM_BOOT_TABLE_ADDRESS: u32 = 0x2000;
+const ROM_BOOT_ENTRIES_OFFSET: usize = 0x100;
+/// The table occupies exactly one 4 KiB flash sector.
+const ROM_BOOT_TABLE_SECTOR: usize = 0x1000;
+/// First flash offset used for SRAM load data (factory convention) and the
+/// base of the ROM-boot application image.
+///
+/// Flash 0x3000..0x4fff is factory data that a ROM-boot flash must never
+/// erase: 0x4000 holds the BLE public address read by the SDK
+/// (`OWN_PUBLIC_ADDR_LOC`, `ll.c`), 0x3000 the factory boot/OTA record.
+const ROM_BOOT_SRAM_DATA_ADDRESS: u32 = 0x5000;
+/// First factory-data sector after the table (see above).
+const ROM_BOOT_FACTORY_DATA_START: u32 = 0x3000;
+const _: () = assert!(
+    ROM_BOOT_TABLE_ADDRESS + ROM_BOOT_TABLE_SECTOR as u32 == ROM_BOOT_FACTORY_DATA_START
+        && ROM_BOOT_FACTORY_DATA_START < ROM_BOOT_SRAM_DATA_ADDRESS
+);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Segment {
     address: u32,
@@ -24,16 +49,131 @@ fn main() {
 }
 
 fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
-    let args: Vec<_> = args.collect();
-    if args.len() != 2 {
-        return Err("usage: phy62x2-image <firmware.hex> <firmware.bin>".into());
+    let mut args: Vec<_> = args.collect();
+    let rom_boot = args.first().is_some_and(|arg| arg == "--rom-boot");
+    if rom_boot {
+        args.remove(0);
+    }
+    if args.len() != if rom_boot { 3 } else { 2 } {
+        return Err("usage: phy62x2-image <firmware.hex> <firmware.bin>\n  \
+             PHY6 OTA image for flash 0x10000\n\
+             usage: phy62x2-image --rom-boot <firmware.hex> <table.bin> <app.bin>\n  \
+             boot-ROM table sector for flash 0x2000 and application image for\n  \
+             flash 0x5000 (factory data at 0x3000..0x4fff is left untouched)"
+            .into());
     }
 
     let input = fs::read_to_string(&args[0])
         .map_err(|error| format!("failed to read {}: {error}", args[0]))?;
     let segments = normalize_segments(parse_hex(&input)?)?;
-    let image = build_image(&segments)?;
-    write_image(&args[1], &image)
+    if rom_boot {
+        let image = build_rom_boot_image(&segments)?;
+        write_image(&args[1], &image.table)?;
+        write_image(&args[2], &image.app)
+    } else {
+        write_image(&args[1], &build_image(&segments)?)
+    }
+}
+
+/// The two flash regions of a ROM-boot image.
+#[derive(Debug)]
+struct RomBootImage {
+    /// Boot-ROM table, one sector programmed at [`ROM_BOOT_TABLE_ADDRESS`].
+    table: Vec<u8>,
+    /// SRAM load data and XIP text, programmed at
+    /// [`ROM_BOOT_SRAM_DATA_ADDRESS`].
+    app: Vec<u8>,
+}
+
+/// Build an image that the PHY62xx boot ROM starts directly, without a
+/// second-stage bootloader: a table sector for flash 0x2000 and an
+/// application image for flash 0x5000.
+///
+/// XIP segments are stored at their own flash offset (`address & 0x1fffff`)
+/// and listed with the full XIP address as both flash and load address, as
+/// in the factory table. SRAM segments are packed from flash 0x5000 and must
+/// end before the first XIP byte. The factory sectors between the two
+/// regions are not part of either output, so programming both never erases
+/// them.
+fn build_rom_boot_image(segments: &[Segment]) -> Result<RomBootImage, String> {
+    if segments.is_empty() || segments.len() > MAX_SEGMENTS {
+        return Err("invalid PHY62xx ROM boot segment count".into());
+    }
+    if segments
+        .iter()
+        .all(|segment| segment.address != RUN_ADDRESS)
+    {
+        return Err(format!(
+            "no SRAM run-descriptor segment starts at 0x{RUN_ADDRESS:08x}"
+        ));
+    }
+
+    let first_xip = segments
+        .iter()
+        .filter(|segment| classify_address(segment.address) == Ok(AddressClass::Xip))
+        .map(|segment| segment.address & XIP_MASK)
+        .min()
+        .unwrap_or(u32::MAX);
+
+    let mut entries = Vec::with_capacity(segments.len());
+    let mut next_sram_flash = ROM_BOOT_SRAM_DATA_ADDRESS;
+    for segment in segments {
+        let size =
+            u32::try_from(segment.data.len()).map_err(|_| "segment size overflow".to_string())?;
+        let (flash_address, table_flash_address) = match classify_address(segment.address)? {
+            AddressClass::Xip => {
+                let offset = segment.address & XIP_MASK;
+                if offset < ROM_BOOT_SRAM_DATA_ADDRESS {
+                    return Err(format!(
+                        "XIP segment 0x{:08x} overlaps the ROM boot table area",
+                        segment.address
+                    ));
+                }
+                (offset, segment.address)
+            }
+            AddressClass::Sram => {
+                let address = next_sram_flash;
+                next_sram_flash = address
+                    .checked_add(align4(size))
+                    .ok_or_else(|| "ROM boot image size overflow".to_string())?;
+                if next_sram_flash > first_xip {
+                    return Err(format!(
+                        "SRAM load data ends at 0x{next_sram_flash:06x}, past the first XIP byte 0x{first_xip:06x}"
+                    ));
+                }
+                (address, address)
+            }
+        };
+        entries.push((segment, flash_address, table_flash_address, size));
+    }
+
+    let mut table = vec![0xff; ROM_BOOT_TABLE_SECTOR];
+    put_u32(&mut table, 0, segments.len() as u32);
+    put_u32(&mut table, 8, RUN_ADDRESS);
+    let mut image = Vec::new();
+    for (index, (segment, flash_address, table_flash_address, size)) in entries.iter().enumerate() {
+        let entry = ROM_BOOT_ENTRIES_OFFSET + index * 16;
+        put_u32(&mut table, entry, *table_flash_address);
+        put_u32(&mut table, entry + 4, *size);
+        put_u32(&mut table, entry + 8, segment.address);
+
+        let output_offset = (*flash_address - ROM_BOOT_SRAM_DATA_ADDRESS) as usize;
+        let end = output_offset + segment.data.len();
+        if image.len() < end {
+            image.resize(end, 0xff);
+        }
+        if image[output_offset..end].iter().any(|byte| *byte != 0xff) {
+            return Err(format!(
+                "segment 0x{:08x} overlaps earlier image data",
+                segment.address
+            ));
+        }
+        image[output_offset..end].copy_from_slice(&segment.data);
+    }
+    while !image.len().is_multiple_of(4) {
+        image.push(0xff);
+    }
+    Ok(RomBootImage { table, app: image })
 }
 
 fn write_image(path: &str, image: &[u8]) -> Result<(), String> {
@@ -431,6 +571,79 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("overlapping segments"));
+    }
+
+    fn rom_word(image: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(image[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn rom_boot_image_matches_factory_table_convention() {
+        let segments = vec![
+            Segment {
+                address: 0x1101_0100,
+                data: vec![0xA5; 6],
+            },
+            Segment {
+                address: 0x1fff_0000,
+                data: vec![1; 0x400],
+            },
+            Segment {
+                address: RUN_ADDRESS,
+                data: vec![2; 8],
+            },
+        ];
+        let RomBootImage { table, app } = build_rom_boot_image(&segments).unwrap();
+
+        // Header at flash 0x2000; the table is exactly one sector so the
+        // factory sectors 0x3000/0x4000 are never programmed.
+        assert_eq!(table.len(), 0x1000);
+        assert_eq!(rom_word(&table, 0), 3);
+        assert_eq!(rom_word(&table, 4), 0xffff_ffff);
+        assert_eq!(rom_word(&table, 8), RUN_ADDRESS);
+        assert_eq!(rom_word(&table, 12), 0xffff_ffff);
+        // XIP entry: full XIP address as flash and load address.
+        assert_eq!(rom_word(&table, 0x100), 0x1101_0100);
+        assert_eq!(rom_word(&table, 0x104), 6);
+        assert_eq!(rom_word(&table, 0x108), 0x1101_0100);
+        assert_eq!(rom_word(&table, 0x10c), 0xffff_ffff);
+        // SRAM entries packed from flash 0x5000.
+        assert_eq!(rom_word(&table, 0x110), 0x5000);
+        assert_eq!(rom_word(&table, 0x114), 0x400);
+        assert_eq!(rom_word(&table, 0x118), 0x1fff_0000);
+        assert_eq!(rom_word(&table, 0x120), 0x5400);
+        assert_eq!(rom_word(&table, 0x128), RUN_ADDRESS);
+        assert_eq!(rom_word(&table, 0x130), 0xffff_ffff);
+        // App data placement relative to the 0x5000 image base.
+        assert_eq!(&app[0x0000..0x0400], &[1; 0x400][..]);
+        assert_eq!(&app[0x0400..0x0408], &[2; 8]);
+        assert_eq!(&app[0xb100..0xb106], &[0xA5; 6]);
+        assert_eq!(app.len(), 0xb108);
+    }
+
+    #[test]
+    fn rom_boot_rejects_sram_data_reaching_xip() {
+        let segments = vec![
+            Segment {
+                address: 0x1100_5100,
+                data: vec![0; 4],
+            },
+            Segment {
+                address: RUN_ADDRESS,
+                data: vec![0; 0x200],
+            },
+        ];
+        let error = build_rom_boot_image(&segments).unwrap_err();
+        assert!(error.contains("past the first XIP byte"));
+    }
+
+    #[test]
+    fn rom_boot_requires_run_descriptor() {
+        let segments = vec![Segment {
+            address: 0x1101_0100,
+            data: vec![0; 4],
+        }];
+        assert!(build_rom_boot_image(&segments).is_err());
     }
 
     #[test]
