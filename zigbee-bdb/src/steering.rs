@@ -3557,6 +3557,33 @@ impl<M: MacDriver> BdbLayer<M> {
         self.attributes.node_is_on_a_network = false;
     }
 
+    /// Abandon an initial commissioning whose network was lost before it
+    /// committed.
+    ///
+    /// A parent may age out or reject a child and send it a NWK Leave with
+    /// the rejoin flag while the unique Trust Center link-key exchange is
+    /// still running. Nothing was committed yet, so there is no
+    /// authenticated network to rejoin: release the exchange (and any ZDO
+    /// slot it owns) and reset NWK/MAC locally without transmitting, leaving
+    /// the node off-network so the caller can restart network steering.
+    ///
+    /// NLME-RESET zeroes the outgoing NWK frame counter; the caller must
+    /// reinstall its counter floor before transmitting again.
+    pub fn abandon_initial_commissioning(&mut self) {
+        #[cfg(feature = "centralized-tclk")]
+        if let Some(tc_ieee) = self.tclk_exchange.as_ref().map(|ex| ex.tc_ieee) {
+            self.discard_tclk_exchange();
+            self.zdo
+                .aps_mut()
+                .security_mut()
+                .remove_key(&tc_ieee, ApsKeyType::TrustCenterLinkKey);
+            self.steering_diagnostics.stage = SteeringStage::TrustCenterLinkKeyExchangeFailed;
+        }
+        self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::NoNetwork;
+        let _ = self.zdo.nlme_reset(false);
+        self.attributes.node_is_on_a_network = false;
+    }
+
     /// Steering when the device IS already on a network.
     ///
     /// BDB v3.0.1 §8.2: every node type — end devices included — broadcasts

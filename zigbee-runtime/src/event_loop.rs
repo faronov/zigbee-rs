@@ -1245,6 +1245,30 @@ mod commissioning_tick_tests {
         device
     }
 
+    /// A still-running unique-TCLK exchange holds the initial End Device
+    /// Timeout Request back only for a bounded grace: an EmberZNet parent
+    /// was seen ageing out a new child ~10 s after association while a lost
+    /// Node_Desc_rsp stretched the exchange.
+    #[test]
+    fn tclk_exchange_defers_the_ed_timeout_request_only_briefly() {
+        let mut device = commissioning_device();
+        let mut ticks = 0;
+        while device.ed_timeout().start_deferred && ticks < 10 {
+            let _ = tick(&mut device);
+            ticks += 1;
+        }
+        assert!(
+            !device.ed_timeout().start_deferred,
+            "the initial request must go out within the bounded grace"
+        );
+        assert!(ticks <= 3, "sent after {ticks} one-second ticks");
+        assert!(
+            device.bdb().tclk_exchange_active(),
+            "sent by the grace bound, not by the exchange completing"
+        );
+        assert!(device.ed_timeout().response_remaining_secs.is_some());
+    }
+
     /// R22 §2.2.5.2.2: an APS retransmission repeats the original *unicast*.
     /// It used to be re-sent to `0xFFFF` with radius 0, which flooded the
     /// network with a frame only one device was expecting while the

@@ -3991,6 +3991,48 @@ mod resume_tests {
         assert_eq!(device.bdb().zdo().aps().security().key_count(), 1);
     }
 
+    /// A parent can age out a new child and send NWK Leave(rejoin) before the
+    /// initial commissioning committed (seen on hardware with a Silabs parent
+    /// while the unique-TCLK exchange was still running). There is no
+    /// commissioned network to rejoin: the join is abandoned as a failed
+    /// commissioning instead of failing persistence.
+    #[test]
+    fn leave_with_rejoin_before_commissioning_committed_abandons_the_join() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        let mut store = RamSecurityStateStore::new();
+        let mut uncommitted = commissioned_state();
+        uncommitted.commissioned = false;
+        store.store(&uncommitted).unwrap();
+        let counter_before = device.bdb().zdo().nwk().nib().outgoing_frame_counter;
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Command,
+            ShortAddress(OUR_SHORT),
+            &leave_command(true),
+            1,
+            true,
+        );
+
+        let event = block_on(device.process_incoming_with_security_store(
+            &indication(frame),
+            &mut [],
+            &mut store,
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            Some(crate::event_loop::StackEvent::CommissioningComplete { success: false })
+        ));
+        assert!(!device.is_joined());
+        assert!(!device.secure_rejoin_pending());
+        assert!(device.bdb().zdo().nwk().security().active_key().is_none());
+        assert!(device.bdb().zdo().nwk().nib().outgoing_frame_counter >= counter_before);
+        let persisted = store.load().unwrap().unwrap();
+        assert!(!persisted.commissioned);
+        assert!(!persisted.rejoin_pending);
+        assert!(persisted.global_counter_limit >= uncommitted.global_counter_limit);
+    }
+
     #[test]
     fn failed_leave_notification_still_clears_local_security_state() {
         let mut device = resumed_device(DeviceType::EndDevice);
@@ -7095,8 +7137,12 @@ pub struct EndDeviceTimeoutState {
     /// A forced MAC poll is scheduled for the next runtime tick.
     pub(crate) forced_poll: bool,
     /// The initial request of a fresh negotiation is waiting for commissioning
-    /// security (network key installed, unique-TCLK exchange finished).
+    /// security (network key installed; unique-TCLK exchange finished or
+    /// the bounded TCLK deferral elapsed).
     pub(crate) start_deferred: bool,
+    /// Seconds the initial request has been deferred so far. Bounds how long
+    /// a still-running unique-TCLK exchange may hold the request back.
+    pub(crate) deferred_secs: u16,
 }
 
 impl EndDeviceTimeoutState {
@@ -7108,6 +7154,7 @@ impl EndDeviceTimeoutState {
             failures: 0,
             forced_poll: false,
             start_deferred: false,
+            deferred_secs: 0,
         }
     }
 
@@ -7123,6 +7170,9 @@ impl EndDeviceTimeoutState {
         }
         if let Some(remaining) = self.response_remaining_secs.as_mut() {
             *remaining = remaining.saturating_sub(elapsed_secs);
+        }
+        if self.start_deferred {
+            self.deferred_secs = self.deferred_secs.saturating_add(elapsed_secs);
         }
     }
 }
@@ -8379,6 +8429,17 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     const ED_TIMEOUT_RESPONSE_WAIT_SECS: u16 = 5;
     /// Retransmissions of an End Device Timeout Request that drew no response.
     const ED_TIMEOUT_MAX_RETRIES: u8 = 2;
+    /// Longest a still-running unique-TCLK exchange may hold back the initial
+    /// End Device Timeout Request once the network key is installed.
+    ///
+    /// Parents may age out a new child that has not negotiated its timeout
+    /// within seconds: an IKEA TRETAKT (EmberZNet) parent dropped a PB-03F
+    /// child 9.8 s after association while a lost Node_Desc_rsp stretched the
+    /// TCLK exchange, then answered its polls with NWK Leave(rejoin). GSDK
+    /// end devices send the request right after network-up, before the TCLK
+    /// update. Keep the short grace that lets Transport-Key re-deliveries
+    /// settle, but never wait for the whole (up to 45 s) exchange.
+    const ED_TIMEOUT_TCLK_DEFER_MAX_SECS: u16 = 2;
     /// Consecutive forced keepalive TX/poll failures tolerated before the
     /// existing secured-rejoin retry path is scheduled.
     const ED_TIMEOUT_MAX_FAILURES: u8 = 3;
@@ -9615,6 +9676,20 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     fn mark_left(&mut self) {
         self.clear_network_runtime_state();
         self.state_dirty = true;
+    }
+
+    /// Drop an initial join that lost its network before commissioning
+    /// committed, keeping the outgoing NWK counter as an exhausted floor
+    /// (the same rule as [`factory_reset_stack`](Self::factory_reset_stack)).
+    fn abandon_uncommitted_commissioning(&mut self) {
+        let counter_floor = self.bdb.zdo().nwk().nib().outgoing_frame_counter;
+        self.bdb.abandon_initial_commissioning();
+        self.mark_left();
+        let nib = self.bdb.zdo_mut().nwk_mut().nib_mut();
+        if nib.outgoing_frame_counter < counter_floor {
+            let installed = nib.set_frame_counter_reservation(counter_floor, counter_floor);
+            debug_assert!(installed);
+        }
     }
 
     /// Clear every piece of runtime state bound to the network being left.
@@ -11572,8 +11647,32 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         }
         let trust_center_removal = core::mem::take(&mut self.trust_center_removal_pending);
         let deferred_mgmt_leave = self.deferred_mgmt_leave.take();
+        // A rejoin request (parent NWK Leave with rejoin, parent left, address
+        // conflict) can arrive before the initial commissioning committed —
+        // e.g. a parent ages out a child whose unique-TCLK exchange is still
+        // running. No commissioned network exists to rejoin, so the join is
+        // abandoned like a failed TCLK exchange and steering restarts.
+        let commissioning_abandoned = deferred_mgmt_leave.is_none()
+            && !trust_center_removal
+            && matches!(
+                event.as_ref(),
+                Some(event_loop::StackEvent::RejoinRequested)
+            )
+            && (self.bdb.tclk_exchange_active()
+                || store
+                    .load()
+                    .is_ok_and(|state| state.is_none_or(|s| !s.commissioned)));
+        let event = if commissioning_abandoned {
+            log::warn!(
+                "[Runtime] Rejoin requested before commissioning committed — abandoning the join"
+            );
+            self.abandon_uncommitted_commissioning();
+            Some(event_loop::StackEvent::CommissioningComplete { success: false })
+        } else {
+            event
+        };
         let persist_result = (|| {
-            if trust_center_removal {
+            if trust_center_removal || commissioning_abandoned {
                 self.factory_reset_security_state(store)?;
             } else {
                 match &event {
@@ -11586,7 +11685,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     _ => {}
                 }
             }
-            if !trust_center_removal && deferred_mgmt_leave.is_none() {
+            if !trust_center_removal && !commissioning_abandoned && deferred_mgmt_leave.is_none() {
                 self.refresh_security_state(store)?;
                 self.tombstone_retired_security_state_replay_counters(store)?;
                 if let Some(replay) = self.pending_network_key_replay()
@@ -11614,6 +11713,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     match persistence {
                         zigbee_nwk::nlde::NwkLifecyclePersistence::ChildState => {}
                         _ if trust_center_removal
+                            || commissioning_abandoned
                             || matches!(
                                 event.as_ref(),
                                 Some(
@@ -14583,11 +14683,14 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// On a fresh centralized join the request is *deferred* until
     /// commissioning security is established (see
     /// [`Self::end_device_security_ready`]): sent while the network key is
-    /// missing or the unique-TCLK exchange is still running, it was observed on
-    /// hardware to go unanswered (the parent is still re-delivering the
-    /// Transport-Key) and only the bounded retransmission recovered it. The
-    /// deferred start is sent from [`Self::service_end_device_timeout`] with
-    /// the full retry budget intact.
+    /// missing or right after network-up, it was observed on hardware (CC2340)
+    /// to go unanswered (the parent is still re-delivering the Transport-Key)
+    /// and only the bounded retransmission recovered it. A still-running
+    /// unique-TCLK exchange holds it back only for
+    /// [`Self::ED_TIMEOUT_TCLK_DEFER_MAX_SECS`], because a parent may age out
+    /// a child that has not negotiated its timeout (observed on PB-03F with
+    /// an IKEA EmberZNet parent). The deferred start is sent from
+    /// [`Self::service_end_device_timeout`] with the full retry budget intact.
     #[inline(never)]
     async fn begin_end_device_timeout_negotiation(&mut self)
     where
@@ -14602,6 +14705,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         if !self.end_device_security_ready() {
             log::info!("[Runtime] ED Timeout Request deferred until security is established");
             self.ed_timeout_mut().start_deferred = true;
+            self.ed_timeout_mut().deferred_secs = 0;
             return;
         }
         // A transmission failure is deliberately ignored here: the join or
@@ -14611,12 +14715,19 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     }
 
     /// Whether NWK security is usable for the End Device Timeout exchange:
-    /// an unsecured network, or a network key is installed and no unique
-    /// Trust Center link-key exchange is still in progress.
-    fn end_device_security_ready(&self) -> bool {
+    /// an unsecured network, or a network key is installed and either no
+    /// unique Trust Center link-key exchange is still in progress or it has
+    /// already held the request back for
+    /// [`ED_TIMEOUT_TCLK_DEFER_MAX_SECS`](Self::ED_TIMEOUT_TCLK_DEFER_MAX_SECS).
+    fn end_device_security_ready(&self) -> bool
+    where
+        R: crate::role::EndDeviceRole,
+    {
         let nwk = self.bdb.zdo().nwk();
         let key_ready = !nwk.nib().security_enabled || nwk.security().active_key().is_some();
-        key_ready && !self.bdb.tclk_exchange_active()
+        key_ready
+            && (!self.bdb.tclk_exchange_active()
+                || self.ed_timeout().deferred_secs >= Self::ED_TIMEOUT_TCLK_DEFER_MAX_SECS)
     }
 
     /// Choose the first keepalive after a silent persisted resume.
@@ -14681,7 +14792,13 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             self.ed_timeout_mut().start_deferred = false;
             self.ed_timeout_mut().retries_left = Self::ED_TIMEOUT_MAX_RETRIES;
             self.reset_end_device_keepalive();
-            log::info!("[Runtime] Security established — sending ED Timeout Request");
+            if self.bdb.tclk_exchange_active() {
+                log::info!(
+                    "[Runtime] Network key installed, TCLK exchange still running — sending ED Timeout Request"
+                );
+            } else {
+                log::info!("[Runtime] Security established — sending ED Timeout Request");
+            }
             self.send_ed_timeout_request_tracked().await;
             return;
         }
