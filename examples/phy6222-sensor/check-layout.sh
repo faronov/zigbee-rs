@@ -40,7 +40,8 @@ if [ -z "$xip_start" ] || [ -z "$xip_end" ]; then
     echo "XIP occupied-span symbols are missing" >&2
     exit 1
 fi
-XIP_SLOT_BYTES=130816
+# Products with a larger XIP slot (e.g. PB-03F) override the EVK default.
+XIP_SLOT_BYTES=${XIP_SLOT_BYTES:-130816}
 xip_occupied_bytes=$((0x$xip_end - 0x$xip_start))
 if [ "$xip_occupied_bytes" -gt "$XIP_SLOT_BYTES" ]; then
     echo "XIP occupied span is $xip_occupied_bytes bytes, limit is $XIP_SLOT_BYTES" >&2

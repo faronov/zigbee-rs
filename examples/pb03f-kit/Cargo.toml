@@ -1,0 +1,62 @@
+[package]
+name = "pb03f-kit-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Hardware lab: boot, clocks, UART console, LEDs, button and flash, without
+# the Zigbee stack. Proves each fitted primitive independently.
+[[bin]]
+name = "pb03f-lab"
+path = "src/bin/lab.rs"
+test = false
+bench = false
+
+# Radio lab: pure-Rust 802.15.4 driver bring-up (calibration, TX/RX, FCS
+# A/B against an external sniffer), without the Zigbee stack.
+[[bin]]
+name = "pb03f-radio-lab"
+path = "src/bin/radio-lab.rs"
+required-features = ["radio-diag"]
+test = false
+bench = false
+
+# Zigbee end device: joins with the pure-Rust radio and reports the
+# product's synthetic measurements (the kit has no sensor).
+[[bin]]
+name = "pb03f-zigbee"
+path = "src/bin/zigbee/main.rs"
+test = false
+bench = false
+
+[dependencies]
+pb03f-kit = { path = "../../boards/pb03f-kit", features = ["log"] }
+phy6222-hal = { path = "../../phy6222-hal", features = ["time-driver"] }
+embedded-storage = "0.3"
+zigbee-mac = { path = "../../zigbee-mac", default-features = false, features = ["phy6222"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["compact-single-endpoint", "constrained-memory"] }
+sensor-sed-app = { path = "../../apps/sensor-sed", default-features = false }
+pb03f-kit-product = { path = "../../products/pb03f-kit" }
+# The `main` task future (~12 KiB: device, NWK/APS tables, profile) is
+# allocated from the executor arena at startup; the 4 KiB default traps.
+embassy-executor = { version = "0.7", default-features = false, features = ["arch-cortex-m", "executor-thread", "task-arena-size-16384"] }
+embassy-futures = "0.1"
+embassy-time = { version = "0.4", default-features = false }
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7", features = ["device"] }
+# Keep info/warn/error on the UART console (bring-up evidence); debug/trace
+# records are compiled out of release builds.
+log = { version = "0.4", default-features = false, features = ["release_max_level_info"] }
+panic-halt = "1.0"
+
+[features]
+default = ["radio-diag"]
+# Radio counters + software FCS cross-check (required by the radio lab).
+radio-diag = ["zigbee-mac/phy6222-diag"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+debug = true
+panic = "abort"

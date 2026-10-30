@@ -228,9 +228,10 @@ cargo +nightly-2026-08-01 build --release --locked \
   --no-default-features --features phy6252
 ```
 
-The default PHY6222 occupied XIP span is 128,640 B against the hard 130,816 B
-gate, leaving 2,176 B. The PHY6252 feature build occupies 128,576 B, leaving
-2,240 B under the same physical gate. Release builds from
+The default PHY6222 occupied XIP span is currently 132,224 B against the hard
+130,816 B gate (1,408 B over) and the PHY6252 feature build 132,204 B
+(1,388 B over): the hardware-required radio driver rework added about 2 KiB.
+Both EVK builds fail the link gate until this open blocker is resolved. Release builds from
 `examples/phy6222-sensor` use the `immediate-abort` panic strategy (configured
 in its `.cargo/config.toml`): panics trap into the halting `HardFault` handler.
 These limits remain mandatory after removal of artificial regression budgets.
@@ -257,6 +258,27 @@ The products reserve:
 Fast and slow waits use `Idle` radio sleep. `Retention` is rejected. No AON
 current value is claimed; the entire ROM boot/radio/join/journal path remains
 hardware-unverified.
+
+### PB-03F-Kit (PHY6252)
+
+```bash
+cd examples/pb03f-kit
+cargo +nightly-2026-08-01 build --release --locked   # pb03f-zigbee, pb03f-lab, pb03f-radio-lab
+
+ELF=target/thumbv6m-none-eabi/release/pb03f-zigbee
+OBJCOPY=$(find "$(rustc +nightly-2026-08-01 --print sysroot)" \
+  -name llvm-objcopy -print -quit)
+"$OBJCOPY" -O ihex "$ELF" "$ELF.hex"
+XIP_SLOT_BYTES=196352 sh ../phy6222-sensor/check-layout.sh "$ELF"
+cargo +nightly-2026-08-01 run --quiet --locked \
+  --manifest-path ../../Cargo.toml -p phy62x2-image -- --rom-boot \
+  "$ELF.hex" "$ELF.table.bin" "$ELF.app.bin"
+```
+
+Program `$ELF.app.bin` at flash `0x5000`, then `$ELF.table.bin` at `0x2000`,
+through the boot ROM's SPIF routines; `0x3000..0x4FFF` (factory record and BLE
+address) is never written. See the
+[PHY6222 platform guide](docs/book/src/platform-guides/phy6222.md#pb-03f-kit-phy6252).
 
 ## EFR32MG1 and EFR32MG21
 

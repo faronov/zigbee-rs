@@ -1,0 +1,28 @@
+[build]
+target = "thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+rustflags = [
+    "-L", "../../products/pb03f-kit/link",
+    # Share identical monomorphized functions within the fixed XIP slot.
+    "-C", "link-arg=--icf=all",
+    "-C", "link-arg=-Tpb03f.x",
+]
+
+[unstable]
+build-std = ["core"]
+# Required by the `immediate-abort` panic strategy below.
+panic-immediate-abort = true
+
+# The 130,816-byte XIP slot is a physical limit. `panic-halt` already
+# discarded every panic message, so carrying panic arguments, `Location`
+# records and the `core::panicking` shims bought no diagnostics. With
+# `immediate-abort` every panic site is a single `udf` trap: the core enters
+# the cortex-m-rt default `HardFault` handler (`loop {}`) and halts there,
+# like `panic-halt` did, except that lower-priority interrupts (SysTick,
+# radio) stop as well and the faulting PC identifies the panic site.
+[profile.release]
+panic = "immediate-abort"
+
+[env]
+DEFMT_LOG = "info"

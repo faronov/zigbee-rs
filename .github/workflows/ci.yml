@@ -161,6 +161,10 @@ jobs:
             manifest: products/phy62x2-evk/Cargo.toml
             workspace: products/phy62x2-evk
             features: phy6252
+          - name: PB-03F-Kit product
+            manifest: products/pb03f-kit/Cargo.toml
+            workspace: products/pb03f-kit
+            features: ""
           # The EFR32MG1 HAL currently has host clippy findings
           # (manual is_multiple_of, Result<_, ()>); test it until they are
           # fixed, then drop `clippy: false`.
@@ -287,6 +291,9 @@ jobs:
           cargo fmt --manifest-path boards/esp32-zigbee-devkit/Cargo.toml -- --check
           cargo fmt --manifest-path products/esp32-zigbee-devkit/Cargo.toml -- --check
           cargo fmt --manifest-path boards/phy62x2-evk/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/pb03f-kit/Cargo.toml -- --check
+          cargo fmt --manifest-path products/pb03f-kit/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/pb03f-kit/Cargo.toml -- --check
 
   doc:
     name: Doc
@@ -1293,6 +1300,53 @@ jobs:
           cargo build --release --locked --no-default-features --features phy6252 \
             --target-dir target/phy6252
           sh check-layout.sh target/phy6252/thumbv6m-none-eabi/release/phy6222-sensor
+
+  # ── Ai-Thinker PB-03F-Kit (PHY6252, ROM-boot image) ──────────
+  build-pb03f:
+    name: Build PB-03F-Kit (PHY6252)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.ESP_PHY_RUST_TOOLCHAIN }}
+          targets: thumbv6m-none-eabi
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: examples/pb03f-kit
+          cache-targets: false
+          key: thumbv6m-pb03f-${{ env.ESP_PHY_RUST_TOOLCHAIN }}-${{ hashFiles('examples/pb03f-kit/Cargo.lock', 'products/pb03f-kit/link/**') }}
+      - name: Build PB-03F-Kit binaries (release)
+        working-directory: examples/pb03f-kit
+        run: cargo build --release --locked
+      # products/pb03f-kit/link/memory.x: XIP slot 0x10100..0x3ffff
+      # (196,352 B). The radio lab has no flash-write path and is not
+      # subject to the SRAM flash-operation checks.
+      - name: Check PB-03F-Kit layout
+        run: |
+          for BIN in pb03f-zigbee pb03f-lab; do
+            XIP_SLOT_BYTES=196352 sh examples/phy6222-sensor/check-layout.sh \
+              "examples/pb03f-kit/target/thumbv6m-none-eabi/release/$BIN"
+          done
+      - name: Create ROM-boot images
+        run: |
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          for BIN in pb03f-zigbee pb03f-lab pb03f-radio-lab; do
+            ELF=examples/pb03f-kit/target/thumbv6m-none-eabi/release/$BIN
+            "$OBJCOPY" -O ihex "$ELF" "${ELF}.hex"
+            cargo run --quiet --locked -p phy62x2-image -- --rom-boot \
+              "${ELF}.hex" "${ELF}.table.bin" "${ELF}.app.bin"
+          done
+      - name: Upload PB-03F-Kit firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pb03f-kit-firmware
+          path: |
+            examples/pb03f-kit/target/thumbv6m-none-eabi/release/pb03f-*.hex
+            examples/pb03f-kit/target/thumbv6m-none-eabi/release/pb03f-*.table.bin
+            examples/pb03f-kit/target/thumbv6m-none-eabi/release/pb03f-*.app.bin
+          if-no-files-found: error
 
   # ── EFR32MG1P (Silicon Labs, ARM Cortex-M4F) ─────────────────
   build-efr32mg1:

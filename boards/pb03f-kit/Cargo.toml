@@ -1,0 +1,20 @@
+[package]
+name = "pb03f-kit"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board support for the Ai-Thinker PB-03F-Kit (PHY6252, 512 KiB flash)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = { version = "0.7", features = ["device"] }
+embedded-storage = "0.3"
+log = { version = "0.4", default-features = false, optional = true }
+phy6222-hal = { path = "../../phy6222-hal", features = ["rt", "time-driver"] }
+
+[features]
+default = []
+# `log` facade backend on the CH340 UART console (diagnostic images only).
+log = ["dep:log"]

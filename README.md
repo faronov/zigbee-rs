@@ -233,7 +233,8 @@ worktree records no such rerun for the current byte-for-byte images.
 | ESP32-C6 | environmental sleepy End Device + OTA | yes | prior C6 evidence covers commissioning/reporting and OTA to 18.3%; complete activation remains open |
 | ESP32-H2 | environmental sleepy End Device + OTA | yes | prior H2 evidence covers v1→v2 activation, reboot, and retained commissioned state |
 | BL702 XT-ZB1 | environmental sleepy End Device | yes | prior path evidence covers radio/commissioning/interview; destructive flash persistence remains open |
-| PHY6222/PHY6252 EVK | environmental sleepy End Device | yes | PHY6222 occupies 128,640 B and PHY6252 128,576 B of the physical 130,816 B XIP slot (2,176 / 2,240 B free); complete hardware path remains unverified |
+| PHY6222/PHY6252 EVK | environmental sleepy End Device | **no** | after the radio driver rework PHY6222 needs 132,224 B and PHY6252 132,204 B of the 130,816 B XIP slot (1,408 / 1,388 B over; open blocker); complete hardware path remains unverified |
+| PB-03F-Kit (PHY6252) | End Device, synthetic environmental series | yes | ROM boot, radio, association, secured commissioning, ZHA interview/reporting and reset/resume observed on hardware with a sniffer; AON sleep, power-loss and OTA remain open |
 | CC2340R5 | environmental sleepy End Device | yes | pinned-SDK and fallback compile/link paths pass; one board joined ZHA over HIL; MAC ACK timing and entropy remain open |
 | EFR32MG1P TRÅDFRI | environmental sleepy End Device | yes | prior path evidence covers commissioning through EM2; real OTA install remains open |
 | EFR32MG21 BRD4181A | environmental sleepy End Device | yes | complete hardware path remains HIL-unverified |
