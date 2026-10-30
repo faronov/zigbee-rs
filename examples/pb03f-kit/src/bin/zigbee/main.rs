@@ -46,6 +46,7 @@ async fn main(_spawner: Spawner) {
         mut leds,
         user_button,
         console,
+        supply_monitor,
     } = resources;
     console_log::init(console.into_uart(), log::LevelFilter::Info);
     log::info!(
@@ -67,6 +68,8 @@ async fn main(_spawner: Spawner) {
     let Ok(ieee) = product::identity::validate_ieee_address(mac.extended_address()) else {
         fault(&mut status, "factory IEEE address missing")
     };
+
+    let battery = product::battery::SupplyBattery::new(supply_monitor);
 
     let mut profile = product::profile::sensor_profile();
     let mut device = ZigbeeDevice::builder(mac)
@@ -102,7 +105,7 @@ async fn main(_spawner: Spawner) {
             wake: PhyWakeController::new(user_button),
             status,
             environment: BlockingEnvironment::new(product::environment::SyntheticEnvironment::new()),
-            battery: BlockingBattery::new(product::battery::NoBattery),
+            battery: BlockingBattery::new(battery),
             ota: NoOta,
             actions: product::policy::USER_ACTIONS,
             supervisor: PhySupervisor,

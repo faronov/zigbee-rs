@@ -3,9 +3,10 @@
 use crate::InternalFlash;
 use crate::pins;
 use phy6222_hal::Peripherals;
+use phy6222_hal::adc::{Adc, AdcError, Channel, Input};
 use phy6222_hal::flash::FlashError;
 use phy6222_hal::gpio::{self, Pull};
-use phy6222_hal::peripherals::Uart0Token;
+use phy6222_hal::peripherals::{AdcToken, Uart0Token};
 use phy6222_hal::uart::{Config as UartConfig, Uart0};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +20,7 @@ pub struct Resources {
     pub leds: Leds,
     pub user_button: UserButton,
     pub console: Console,
+    pub supply_monitor: SupplyMonitorToken,
 }
 
 impl Resources {
@@ -27,7 +29,7 @@ impl Resources {
     /// Call after [`crate::time::init`] so HCLK-derived rates are final.
     pub fn take() -> Result<Self, BoardError> {
         let Peripherals {
-            adc: _,
+            adc,
             flash,
             i2c0: _,
             i2c1: _,
@@ -47,11 +49,16 @@ impl Resources {
         gpio::set_input(pins::USER_BUTTON);
         gpio::set_pull(pins::USER_BUTTON, Pull::StrongPullUp);
 
+        gpio::clear_fmux(pins::SUPPLY_SENSE);
+        gpio::set_input(pins::SUPPLY_SENSE);
+        gpio::set_pull(pins::SUPPLY_SENSE, Pull::PullDown);
+
         Ok(Self {
             flash: InternalFlash::new(flash).map_err(BoardError::Flash)?,
             leds,
             user_button: UserButton { _private: () },
             console: Console { uart: uart0 },
+            supply_monitor: SupplyMonitorToken { adc },
         })
     }
 }
@@ -124,5 +131,31 @@ impl Console {
                 baud: pins::CONSOLE_BAUD,
             },
         )
+    }
+}
+
+/// Exclusive token for supply measurement on P14 (ADC channel P14).
+pub struct SupplyMonitorToken {
+    adc: AdcToken,
+}
+
+impl SupplyMonitorToken {
+    pub fn into_monitor(self) -> SupplyMonitor {
+        SupplyMonitor {
+            adc: Adc::new(self.adc),
+        }
+    }
+}
+
+const _: () = assert!(Channel::P14.gpio() == pins::SUPPLY_SENSE);
+
+/// Module supply voltage: P14 is driven high while the ADC samples it.
+pub struct SupplyMonitor {
+    adc: Adc,
+}
+
+impl SupplyMonitor {
+    pub fn read_millivolts(&mut self) -> Result<u32, AdcError> {
+        self.adc.read_mv(Channel::P14, Input::DrivenHigh)
     }
 }

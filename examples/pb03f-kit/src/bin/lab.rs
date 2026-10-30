@@ -1,6 +1,7 @@
 //! PB-03F-Kit hardware lab: proves ROM boot, the 48 MHz clock switch, the
-//! CH340 UART console, the five LEDs, the user button and internal-flash
-//! erase/program/read on a spare sector, independently of the Zigbee stack.
+//! CH340 UART console, the five LEDs, the user button, internal-flash
+//! erase/program/read on a spare sector and the ADC supply monitor (P14
+//! driven high), independently of the Zigbee stack.
 //!
 //! Results are printed on the console and mirrored into `LAB_RESULT` so they
 //! can also be read over SWD.
@@ -27,6 +28,8 @@ pub struct LabResult {
     apb_clk_at_reset: u32,
     hclk_hz: u32,
     flash_status: u32,
+    /// Last supply reading in mV (`u32::MAX` = ADC error).
+    supply_mv: u32,
     loops: u32,
 }
 
@@ -40,6 +43,7 @@ pub static mut LAB_RESULT: LabResult = LabResult {
     apb_clk_at_reset: 0,
     hclk_hz: 0,
     flash_status: 0,
+    supply_mv: 0,
     loops: 0,
 };
 
@@ -104,6 +108,7 @@ fn main() -> ! {
         mut leds,
         user_button,
         console,
+        supply_monitor,
     }) = Resources::take()
     else {
         loop {
@@ -133,6 +138,8 @@ fn main() -> ! {
     );
     r.magic = 0x1ab0_0004;
 
+    let mut supply = supply_monitor.into_monitor();
+
     let t0 = time::now_us();
     delay_ms(1000);
     let _ = writeln!(uart, "1000 ms delay took {} us", time::now_us() - t0);
@@ -147,10 +154,18 @@ fn main() -> ! {
             3 => leds.cool_white.set_on(true),
             _ => leds.warm_white.set_on(true),
         }
+        r.supply_mv = match supply.read_millivolts() {
+            Ok(mv) => mv,
+            Err(e) => {
+                let _ = writeln!(uart, "supply ADC error: {:?}", e);
+                u32::MAX
+            }
+        };
         let _ = writeln!(
             uart,
-            "t={} ms led={} button={}",
+            "t={} ms supply={} mV led={} button={}",
             time::now_us() / 1000,
+            r.supply_mv,
             ["red", "green", "blue", "cool", "warm"][(step % 5) as usize],
             if user_button.is_pressed() {
                 "pressed"

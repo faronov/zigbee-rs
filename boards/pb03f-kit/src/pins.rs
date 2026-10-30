@@ -5,6 +5,8 @@ pub(crate) const LED_BLUE: u8 = 12;
 pub(crate) const LED_COOL_WHITE: u8 = 22;
 pub(crate) const LED_WARM_WHITE: u8 = 0;
 pub(crate) const USER_BUTTON: u8 = 9;
+/// Free ADC-capable pin used for supply measurement (driven high, no divider).
+pub(crate) const SUPPLY_SENSE: u8 = 8;
 pub(crate) const UART0_TX: u8 = 5;
 pub(crate) const UART0_RX: u8 = 6;
 

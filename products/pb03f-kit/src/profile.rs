@@ -27,11 +27,12 @@ const TEMPERATURE_RANGE: TemperatureRange = TemperatureRange {
     max_centi_celsius: 12_500,
 };
 
-/// ZCL BatterySize 0 = "no battery": the kit is USB powered.
+/// Two AA cells (ZCL BatterySize 3, 1.5 V rated each), the supply the
+/// module's 2.0-3.0 V battery curve models; see [`crate::battery`].
 const BATTERY: BatteryDescriptor = BatteryDescriptor {
-    size: 0,
-    quantity: 0,
-    rated_voltage_100mv: 0,
+    size: 3,
+    quantity: 2,
+    rated_voltage_100mv: 15,
 };
 
 pub fn sensor_profile() -> SensorProfile {
