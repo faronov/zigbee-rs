@@ -35,12 +35,15 @@ pub const GPIO_PORTA_EOI: u32 = AP_GPIO_BASE + 0x4C;
 
 // ── IOMUX registers (`AP_IOMUX_TypeDef`) ───────────────────────
 
+/// `Analog_IO_en`: bit `n` connects `Analog_IO_n` (P11 = bit 0) to the ADC.
 pub const IOMUX_ANALOG_IO_EN: u32 = AP_IOMUX_BASE;
 pub const IOMUX_FULL_MUX0_EN: u32 = AP_IOMUX_BASE + 0x0C;
 /// `gpio_pad_en`: bit 0/1 hand P2/P3 from SWD to the pin function.
 pub const IOMUX_GPIO_PAD_EN: u32 = AP_IOMUX_BASE + 0x14;
 /// `gpio_sel[9]`: four 6-bit function fields per register.
 pub const IOMUX_GPIO_SEL: u32 = AP_IOMUX_BASE + 0x18;
+/// `pad_ps0`: per-GPIO pad drive strength (SDK `hal_gpio_ds_control`).
+pub const IOMUX_PAD_PS0: u32 = AP_IOMUX_BASE + 0x44;
 
 // ── I2C registers (DesignWare IP) ──────────────────────────────
 
@@ -95,6 +98,9 @@ pub const PCRM_CLKHF_CTL0: u32 = AP_PCRM_BASE + 0x04;
 pub const PCRM_CLKHF_CTL1: u32 = AP_PCRM_BASE + 0x08;
 pub const PCRM_ANA_CTL: u32 = AP_PCRM_BASE + 0x0C;
 pub const PCRM_ADC_CTL0: u32 = AP_PCRM_BASE + 0x30;
+pub const PCRM_ADC_CTL1: u32 = AP_PCRM_BASE + 0x34;
+pub const PCRM_ADC_CTL2: u32 = AP_PCRM_BASE + 0x38;
+pub const PCRM_ADC_CTL3: u32 = AP_PCRM_BASE + 0x3C;
 pub const PCRM_ADC_CTL4: u32 = AP_PCRM_BASE + 0x40;
 
 // ── AON (always-on domain) ─────────────────────────────────────

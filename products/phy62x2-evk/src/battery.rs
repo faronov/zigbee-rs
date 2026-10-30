@@ -40,10 +40,10 @@ pub struct SupplyBattery {
 
 #[cfg(target_os = "none")]
 impl SupplyBattery {
-    pub fn new(token: phy62x2_evk::SupplyMonitorToken) -> Result<Self, phy62x2_evk::AdcError> {
-        Ok(Self {
-            monitor: token.into_monitor()?,
-        })
+    pub fn new(token: phy62x2_evk::SupplyMonitorToken) -> Self {
+        Self {
+            monitor: token.into_monitor(),
+        }
     }
 }
 

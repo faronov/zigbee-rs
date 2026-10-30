@@ -3,7 +3,7 @@
 use crate::InternalFlash;
 use crate::pins;
 use phy6222_hal::Peripherals;
-use phy6222_hal::adc::{Adc, AdcError, Channel};
+use phy6222_hal::adc::{Adc, AdcError, Channel, Input};
 use phy6222_hal::flash::FlashError;
 use phy6222_hal::gpio::{self, Pull};
 use phy6222_hal::i2c::{Config as I2cConfig, I2cError, I2cMaster, Speed};
@@ -54,10 +54,10 @@ pub struct SupplyMonitorToken {
 }
 
 impl SupplyMonitorToken {
-    pub fn into_monitor(self) -> Result<SupplyMonitor, AdcError> {
-        Ok(SupplyMonitor {
-            adc: Adc::new(self.adc)?,
-        })
+    pub fn into_monitor(self) -> SupplyMonitor {
+        SupplyMonitor {
+            adc: Adc::new(self.adc),
+        }
     }
 }
 
@@ -67,7 +67,7 @@ pub struct SupplyMonitor {
 
 impl SupplyMonitor {
     pub fn read_millivolts(&mut self) -> Result<u32, AdcError> {
-        self.adc.read_mv(Channel::P11)
+        self.adc.read_mv(Channel::P11, Input::Analog)
     }
 }
 

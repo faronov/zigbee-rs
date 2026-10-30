@@ -49,10 +49,7 @@ async fn main(_spawner: Spawner) {
     } = resources;
     let mut status = PhyStatus::new(status_led);
 
-    let battery = match product::battery::SupplyBattery::new(supply_monitor) {
-        Ok(battery) => battery,
-        Err(_) => fault(&mut status),
-    };
+    let battery = product::battery::SupplyBattery::new(supply_monitor);
 
     let mac = match Phy6222Mac::take() {
         Some(mac) => mac,
