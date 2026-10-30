@@ -244,6 +244,6 @@ mod tests {
     fn linker_slot_matches_the_hard_xip_gate() {
         let script = include_str!("../link/memory.x");
         assert!(script.contains("ORIGIN = 0x11010100"));
-        assert!(script.contains("LENGTH = 0x1ff00"));
+        assert!(script.contains("LENGTH = 0x2dae0"));
     }
 }

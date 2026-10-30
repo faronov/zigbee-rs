@@ -89,8 +89,8 @@ former-budget rows.
 
 | image | measured | physical limit / former budget | margin vs reference | metric |
 |---|---:|---:|---:|---|
-| PHY6222 sensor | 128,640 | 130,816 | 2,176 | occupied XIP span |
-| PHY6252 feature-selected sensor | 128,576 | 130,816 | 2,240 | occupied XIP span |
+| PHY6222 sensor | 132,576 | 187,104 | 54,528 | occupied XIP span |
+| PHY6252 feature-selected sensor | 132,544 | 187,104 | 54,560 | occupied XIP span |
 | BL702 sensor | 189,442 | 192,512 | 3,070 | raw binary |
 | nRF52840 default / BME280 / SHT31 | 224,472 / 231,792 / 228,216 | 225,280 / 245,760 / 241,664 | 808 / 13,968 / 13,448 | raw binaries |
 | nRF52840 always-on End Device | 231,280 | 253,952 | 22,672 | file-backed flash span |

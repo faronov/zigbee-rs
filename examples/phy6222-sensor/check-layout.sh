@@ -41,7 +41,7 @@ if [ -z "$xip_start" ] || [ -z "$xip_end" ]; then
     exit 1
 fi
 # Products with a larger XIP slot (e.g. PB-03F) override the EVK default.
-XIP_SLOT_BYTES=${XIP_SLOT_BYTES:-130816}
+XIP_SLOT_BYTES=${XIP_SLOT_BYTES:-187104}
 xip_occupied_bytes=$((0x$xip_end - 0x$xip_start))
 if [ "$xip_occupied_bytes" -gt "$XIP_SLOT_BYTES" ]; then
     echo "XIP occupied span is $xip_occupied_bytes bytes, limit is $XIP_SLOT_BYTES" >&2

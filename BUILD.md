@@ -69,7 +69,7 @@ jobs also upload `*.size.json` measurements with their artifacts (PHY62x2 is
 measured by its layout check instead); those describe the exact commit that
 was built, whereas the book's tables are dated snapshots.
 
-Both PHY62x2 variants fit their mandatory 130,816 B XIP slot (see
+Both PHY62x2 variants fit their mandatory 187,104 B XIP slot (see
 [PHY6222 / PHY6252](#phy6222--phy6252)).
 
 ## nRF52840 and nRF52833
@@ -228,10 +228,10 @@ cargo +nightly-2026-08-01 build --release --locked \
   --no-default-features --features phy6252
 ```
 
-The default PHY6222 occupied XIP span is currently 132,224 B against the hard
-130,816 B gate (1,408 B over) and the PHY6252 feature build 132,204 B
-(1,388 B over): the hardware-required radio driver rework added about 2 KiB.
-Both EVK builds fail the link gate until this open blocker is resolved. Release builds from
+The default PHY6222 occupied XIP span is currently 132,576 B against the hard
+187,104 B gate and the PHY6252 feature build 132,544 B. The slot ends below
+the PHY6252 security partition at 0x3E000 with room for the image tail that
+`phy62x2-image` appends. Release builds from
 `examples/phy6222-sensor` use the `immediate-abort` panic strategy (configured
 in its `.cargo/config.toml`): panics trap into the halting `HardFault` handler.
 These limits remain mandatory after removal of artificial regression budgets.

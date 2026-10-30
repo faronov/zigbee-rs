@@ -12,7 +12,8 @@ ready-to-flash production image yet.
 Implemented:
 
 - PHY62x2 ROM-compatible SRAM/XIP linker layout;
-- hard 130,816-byte XIP application-slot gate;
+- hard 187,104-byte XIP application-slot gate (ends below the PHY6252
+  security partition at 0x3E000, including the appended image tail);
 - PHY6 segmented image generator;
 - crash-safe `SecurityStateJournal` persistence;
 - factory-identity guard that rejects the shared fallback address;
@@ -118,8 +119,8 @@ Occupied-XIP measurements with `nightly-2026-08-01` on macOS:
 
 | feature image | occupied XIP span | hard gate | result |
 |---|---:|---:|---:|
-| PHY6222 (default) | 128,640 | 130,816 | 2,176 bytes free |
-| PHY6252 (`--no-default-features --features phy6252`) | 128,576 | 130,816 | 2,240 bytes free |
+| PHY6222 (default) | 132,576 | 187,104 | 54,528 bytes free |
+| PHY6252 (`--no-default-features --features phy6252`) | 132,544 | 187,104 | 54,560 bytes free |
 
 The PHY target configuration enables linker identical-code folding
 (`--icf=all`) for identical monomorphized functions. Folded functions can share

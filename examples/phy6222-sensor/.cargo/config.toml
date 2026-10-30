@@ -14,7 +14,7 @@ build-std = ["core"]
 # Required by the `immediate-abort` panic strategy below.
 panic-immediate-abort = true
 
-# The 130,816-byte XIP slot is a physical limit. `panic-halt` already
+# The 187,104-byte XIP slot ends at the PHY6252 security partition. `panic-halt` already
 # discarded every panic message, so carrying panic arguments, `Location`
 # records and the `core::panicking` shims bought no diagnostics. With
 # `immediate-abort` every panic site is a single `udf` trap: the core enters

@@ -1257,7 +1257,7 @@ jobs:
         with:
           workspaces: examples/phy6222-sensor
           cache-targets: false
-          key: thumbv6m-phy6222-${{ env.ESP_PHY_RUST_TOOLCHAIN }}-xip-130816-${{ hashFiles('examples/phy6222-sensor/Cargo.lock', 'products/phy62x2-evk/link/**') }}
+          key: thumbv6m-phy6222-${{ env.ESP_PHY_RUST_TOOLCHAIN }}-xip-187104-${{ hashFiles('examples/phy6222-sensor/Cargo.lock', 'products/phy62x2-evk/link/**') }}
       - name: Build PHY6222 sensor (release)
         working-directory: examples/phy6222-sensor
         run: cargo build --release --locked
@@ -1283,6 +1283,13 @@ jobs:
           OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
           "$OBJCOPY" -O ihex "$ELF" "${ELF}.hex"
           cargo run --quiet --locked -p phy62x2-image -- "${ELF}.hex" "${ELF}.phy6.bin"
+          # The PHY6 image is written at flash 0x10000 and must end below the
+          # 0x3E000 security partition (PHY6252 layout, shared by PHY6222).
+          SIZE=$(wc -c < "${ELF}.phy6.bin")
+          if [ $((0x10000 + SIZE)) -gt $((0x3E000)) ]; then
+            echo "PHY6 image (${SIZE} B at 0x10000) overlaps the 0x3E000 security partition" >&2
+            exit 1
+          fi
       - name: Upload PHY6222 firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -1292,8 +1299,8 @@ jobs:
             examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor.hex
             examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor.phy6.bin
           if-no-files-found: error
-      # PHY6252 shares the 130,816 B physical XIP slot and the same
-      # mandatory layout gate as PHY6222.
+      # PHY6252 shares the 187,104 B XIP slot (the PHY6 image ends below its
+      # 0x3E000 security partition) and the same mandatory layout gate.
       - name: Build PHY6252 sensor and check its physical XIP limit
         working-directory: examples/phy6222-sensor
         run: |
