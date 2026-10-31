@@ -42,7 +42,9 @@ Supply:
 - bounded delays and interrupt handling;
 - exclusive GPIO/bus/flash resources;
 - raw IEEE 802.15.4 TX/RX with valid FCS handling;
-- a `MacDriver` implementation;
+- a `MacDriver`, normally a thin `RadioPhy` driven by the shared
+  `SoftMacCore` (see [Porting a Radio to
+  SoftMacCore](../advanced/soft-mac-porting.md));
 - `ParentMacDriver` only if the backend really supports parent operations.
 
 Bring up raw TX/RX, scan, association, ACK timing, polling, and addressed data
@@ -97,6 +99,10 @@ SensorSedParts {
     diagnostics: MyDiagnostics,
 }
 ```
+
+Sensor adapters normally wrap a driver from
+[`zigbee-rs-drivers`](https://github.com/faronov/zigbee-rs-drivers), added as
+a git dependency pinned by `rev`; this repository contains no sensor drivers.
 
 `WakeController::wait` must preserve the atomic transition:
 

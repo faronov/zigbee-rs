@@ -3,11 +3,9 @@
 `zigbee-rs` is a heap-free, `no_std`, pure-Rust Zigbee PRO stack with reusable
 sleepy-sensor, router, and coordinator application frontends.
 
-This book describes the current `experiment/r22-bdb-complete` worktree. The
-normative target is Zigbee Core R22 (`05-3474-22`) with BDB 3.0.1
-(`16-02828-012`). The book source is authoritative for the branch. GitHub
-Pages deploys only after a push to `main` or `master`, so this revision is not
-public on Pages until the branch is merged and deployed.
+This book describes the `master` branch. The normative target is Zigbee Core
+R22 (`05-3474-22`) with BDB 3.0.1 (`16-02828-012`). GitHub Pages is rebuilt
+from `master` by the CI `deploy-site` job after the core checks pass.
 
 ## What is shared
 
@@ -35,6 +33,12 @@ The stack supplies:
 - BDB commissioning;
 - crash-safe security-state and child-table persistence;
 - reusable finite application lifecycles.
+
+Sensor drivers are not part of this repository. They live in
+[`zigbee-rs-drivers`](https://github.com/faronov/zigbee-rs-drivers): the
+`zigbee-sensor` core crate (blocking and async `Sensor` traits, units, ZCL
+conversions) plus one `no_std` `embedded-hal` 1.0 crate per part family.
+Hardware examples pull them in as git dependencies pinned by `rev`.
 
 ## What varies by target
 
@@ -90,11 +94,11 @@ the role and platform chapters keep remaining hardware/interoperability gates
 explicit. The consolidated [R22 / BDB status](reference/conformance.md)
 separates implemented behavior from those open gates.
 
-The exact 2026-09-06 firmware measurements are build/layout-tested. Hardware
-results described in this book are prior path-level evidence unless an
-exact-image rerun is explicitly identified.
+Recorded firmware measurements are build/layout-tested. Hardware results
+described in this book are path-level evidence unless an exact-image rerun is
+explicitly identified.
 
 Start with [Architecture](getting-started/architecture.md), then run the
 [Quick Start](getting-started/quickstart.md). Exact toolchains, measurements,
 and build commands are in the repository's
-[`BUILD.md`](https://github.com/faronov/zigbee-rs/blob/experiment/r22-bdb-complete/BUILD.md).
+[`BUILD.md`](https://github.com/faronov/zigbee-rs/blob/master/BUILD.md).
