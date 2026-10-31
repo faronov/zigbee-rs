@@ -269,7 +269,7 @@ ELF=target/thumbv6m-none-eabi/release/pb03f-zigbee
 OBJCOPY=$(find "$(rustc +nightly-2026-08-01 --print sysroot)" \
   -name llvm-objcopy -print -quit)
 "$OBJCOPY" -O ihex "$ELF" "$ELF.hex"
-XIP_SLOT_BYTES=196352 sh ../phy6222-sensor/check-layout.sh "$ELF"
+XIP_SLOT_BYTES=200448 sh ../phy6222-sensor/check-layout.sh "$ELF"
 cargo +nightly-2026-08-01 run --quiet --locked \
   --manifest-path ../../Cargo.toml -p phy62x2-image -- --rom-boot \
   "$ELF.hex" "$ELF.table.bin" "$ELF.app.bin"
