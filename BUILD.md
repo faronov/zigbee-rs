@@ -69,8 +69,13 @@ jobs also upload `*.size.json` measurements with their artifacts (PHY62x2 is
 measured by its layout check instead); those describe the exact commit that
 was built, whereas the book's tables are dated snapshots.
 
-Both PHY62x2 variants fit their mandatory 187,104 B XIP slot (see
-[PHY6222 / PHY6252](#phy6222--phy6252)).
+Both PHY62x2 EVK variants fit their mandatory 187,104 B XIP slot and the
+PB-03F-Kit image its 200,448 B slot (see [PHY6222 / PHY6252](#phy6222--phy6252)).
+
+Sensor drivers (BME280, SHT3x and others) are not in this repository. Examples
+take them from [`zigbee-rs-drivers`](https://github.com/faronov/zigbee-rs-drivers)
+as git dependencies pinned by `rev`, so builds need network access to GitHub
+or a populated Cargo git cache.
 
 ## nRF52840 and nRF52833
 
@@ -94,10 +99,12 @@ non-OTA profiles with `NoOta`. The nRF52840 always-on image is
 `AlwaysOnEndDeviceApp`, so its non-parent MAC never advertises
 `DeviceType::Router`.
 
-Earlier nRF52840/nRF52833 sensor images produced hardware evidence for
-commissioning, reporting, hardware AES, persistence, and reset/resume. The
-exact 2026-09-06 images above have build/layout evidence only. The always-on
-End Device composition still needs its complete HIL acceptance run.
+All nRF images now use the shared `SoftMacCore<NrfRadioPhy>`. Earlier
+nRF52840/nRF52833 sensor images, on the since-deleted `NrfMac`, produced
+hardware evidence for commissioning, reporting, hardware AES, persistence, and
+reset/resume. The current `SoftMacCore` images have build/host evidence only.
+The always-on End Device composition still needs its complete HIL acceptance
+run.
 
 ### UF2 variants
 
@@ -168,17 +175,23 @@ cd examples/bl702-sensor
 ./build-image.sh
 ```
 
-The script builds the production hardware-AES image, creates the raw binary,
-and packages the BL702 boot header. `BL702_DIAGNOSTIC_LOG=1 ./build-image.sh`
-retains the larger UART diagnostic trace.
+The script builds the production hardware-AES application and the
+`bl702-xt-zb1-boot` loader, signs both with the key in `BL702_OTA_KEY`
+(ECDSA P-256 via `imgtool`; CI uses a throwaway key) and writes to
+`target/riscv32imc-unknown-none-elf/release/ota/` a full flash image for
+`0x0`, the signed MCUboot slot image and the Zigbee OTA file.
+`BL702_DIAGNOSTIC_LOG=1 ./build-image.sh` retains the larger UART diagnostic
+trace. CI rejects a raw application larger than the `0x75C00` B primary slot
+and checks the OTA file with `tools/bl702_ota.py check`.
 
 The product owns `0x000FE000..0x00100000` as the two-sector security journal.
-The shared sensor uses `NoStatus`, `NoOta`, `NoUserAction`, and
-`Active`/`Active` waits. Temperature and humidity are synthetic; battery uses
-the GPADC path. Earlier images produced radio commissioning and ZHA interview
-evidence. The exact 189,442 B raw / 197,648 B boot-image pair is build/package
-tested only. Destructive sector erase/program plus reset/resume persistence
-remains open.
+The shared sensor uses `NoStatus`, the product OTA lifecycle, product user
+actions, and `Idle`/`Idle` waits (250 ms / 10 s polls). Temperature and
+humidity are synthetic; battery uses the GPADC path. One XT-ZB1 has hardware
+evidence for commissioning, journal commits with reset/resume, Idle sleep,
+and a signed 0.1.0→0.1.1 Zigbee OTA (see the
+[BL702 guide](docs/book/src/platform-guides/bl702.md)). Power loss during
+journal writes or the loader copy remains untested.
 
 ## CC2340R5
 
@@ -211,9 +224,11 @@ The board exposes real SysTick time, IOC button/LED setup, typed physical
 resources, reset, and flash. The firmware composition maps those raw resources
 to RTT diagnostics and the selected lifecycle action/status behavior. The
 product reserves `0x0007E000..0x00080000` for security state and selects
-`Active`/`Active` waits, synthetic/fixed measurements, and software AES.
-Commissioning is not claimed: radio HIL is pending and the entropy backend
-deliberately fails closed. The recorded pre-static-task pinned-SDK image is
+`Idle`/`Retention` waits, BATMON temperature/supply plus synthetic humidity,
+and software AES. Commissioning is not claimed: one LaunchPad has radio,
+interview and standby-current evidence, but the entropy backend deliberately
+fails closed (see the
+[CC2340 guide](docs/book/src/platform-guides/cc2340.md)). The recorded pre-static-task pinned-SDK image is
 223,536 B; its 4,772 B static-RAM figure is not a current task-capacity check.
 The physical application slot remains 516,096 B.
 
@@ -228,8 +243,8 @@ cargo +nightly-2026-08-01 build --release --locked \
   --no-default-features --features phy6252
 ```
 
-The default PHY6222 occupied XIP span is currently 132,576 B against the hard
-187,104 B gate and the PHY6252 feature build 132,544 B. The slot ends below
+The default PHY6222 occupied XIP span is currently 138,624 B against the hard
+187,104 B gate, and the PHY6252 feature build is the same size. The slot ends below
 the PHY6252 security partition at 0x3E000 with room for the image tail that
 `phy62x2-image` appends. Release builds from
 `examples/phy6222-sensor` use the `immediate-abort` panic strategy (configured
@@ -298,9 +313,9 @@ python3 tools/verify-layout.py \
   target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor
 ```
 
-EFR32MG1 uses `Active` fast waits and `Retention` slow waits. Its exact image
-is 163,236 B; `.data` is 260 B, `.bss` is 14,720 B, and 16,760 B remains for
-the linked stack (376 B above the 16 KiB gate). The prior 162,538 B Zigbee OTA
+EFR32MG1 uses `Active` fast waits and `Retention` slow waits. The 2026-10-31
+local build is 171,792 B; `.data` is 288 B, `.bss` is 15,056 B, and 16,400 B
+remains for the linked stack (only 16 B above the 16 KiB gate). The prior 162,538 B Zigbee OTA
 container has not been regenerated; it assumes the resident Gecko bootloader.
 Earlier images produced
 hardware evidence for commissioning, hardware AES, SHT3x and battery
@@ -318,9 +333,9 @@ EFR32MG21 targets BRD4181A on BRD4001A:
 - persistence: `0x0007C000..0x00080000`
 
 Its `Idle` wait is radio-gated WFE with a 1 kHz SysTick, not EM2. The complete
-MG21 hardware path remains HIL-unverified. The current raw image is 202,820 B;
-`.data` is 308 B, `.bss` is 18,280 B, and the linked available stack is
-46,944 B. There is no MG21 OTA packaging path.
+MG21 hardware path remains HIL-unverified. The 2026-10-31 local build is
+209,028 B; `.data` is 316 B, `.bss` is 18,888 B, and the linked available
+stack is 46,328 B. There is no MG21 OTA packaging path.
 
 ## Telink TLSR8258
 
@@ -338,8 +353,8 @@ Verify the archive checksum before extraction (`sha256sum` on Linux,
 `shasum -a 256` on macOS). The packaged compiler identifies itself as
 `1.98.1-dev`, LLVM `23.1.2`, with `commit-hash: unknown`; the pinned release
 asset checksum, not that missing compiler metadata, establishes provenance.
-`TC32_TOOLCHAIN` can override the installation path for all production,
-lab, and radio helpers. Host tests/Clippy remain on Rust `1.94.1`.
+`TC32_TOOLCHAIN` can override the installation path for all production and
+radio-harness helpers. Host tests/Clippy remain on Rust `1.94.1`.
 
 Then run:
 
@@ -350,7 +365,7 @@ Then run:
 ./scripts/tlsr8258.sh build router
 ```
 
-Production, lab, and radio builds explicitly enable LLVM tail merging with the
+Production and radio-harness builds explicitly enable LLVM tail merging with the
 pinned compiler. The October 4 macOS rebuild measured 195,688 B for the default
 sensor, 198,764/198,768 B for the two LOW32K variants, and 288,508 B for the
 router. See the
@@ -358,6 +373,11 @@ router. See the
 and the separate compiler-only baseline on that page.
 The earlier measurements below remain historical; the new images are not
 hardware-qualified.
+
+The sensors run on the shared `SoftMacCore<TelinkRadioPhy, EndDevice>`
+(`TxOffload::Full`); the router keeps the hand-written `TelinkRouterMac`,
+compiled only with the zigbee-mac `telink-legacy-router` feature. The
+`SoftMacCore` sensor images are build/symbol-checked only.
 
 The default sensor uses:
 
@@ -381,12 +401,12 @@ are `0x70000..0x72000` for APS bindings/groups/application keys,
 `0x76000..0x77000` for factory EUI, and `0x77000..0x78000` for factory
 configuration/calibration.
 
-The recorded router snapshot measured 433,756 B, exceeding its then-enforced
-430,080 B (`0x69000`) regression budget by 3,676 B. That historical gate was
+The recorded router snapshot (2026-09-10) measured 436,072 B, exceeding its
+then-enforced 430,080 B (`0x69000`) regression budget by 5,992 B. That historical gate was
 introduced above the earlier 427,776 B R22 image, replacing the pre-R22
 356,352 B budget. Artificial regression budgets no longer block builds.
 The mandatory physical `0x70000` boundary and all journals are unchanged:
-that snapshot has 24,996 B of physical headroom. The 28,672 B difference
+that snapshot has 22,680 B of physical headroom. The 28,672 B difference
 between the former budget and physical boundary is not a reserved partition.
 
 The LOW32K images retain an 8,448 B fresh-root SVC stack, 256 B above the
@@ -399,7 +419,10 @@ cargo install mdbook --version 0.5.4 --locked
 mdbook build docs/book
 ```
 
-Pages deployment is intentionally gated to pushes on `main`/`master`.
+The CI `deploy-site` job publishes this book to GitHub Pages, together with the
+ESP web flasher (`docs/flasher/index.html`, assembled by
+`tools/prepare-pages.py`). Deployment is intentionally gated to pushes on
+`main`/`master`.
 Documentation can deploy after its core/code checks succeed even when a
 required firmware job fails, but prebuilt binaries and one-click installation
 require successful firmware jobs. Removing artificial size budgets does not
