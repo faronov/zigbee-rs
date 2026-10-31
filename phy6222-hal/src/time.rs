@@ -41,6 +41,15 @@ const SYST_CSR: *mut u32 = 0xE000_E010 as *mut u32;
 const SYST_RVR: *mut u32 = 0xE000_E014 as *mut u32;
 const SYST_CVR: *mut u32 = 0xE000_E018 as *mut u32;
 const SCB_ICSR: *mut u32 = 0xE000_ED04 as *mut u32;
+/// System Handler Priority Register 3 (word access only on ARMv6-M);
+/// bits `[31:24]` hold the SysTick priority.
+const SCB_SHPR3: *mut u32 = 0xE000_ED20 as *mut u32;
+
+/// SysTick runs at the lowest ARMv6-M priority (2 implemented bits) so
+/// peripheral interrupts at the reset priority 0 preempt it. The radio
+/// interrupt starts 802.15.4 ACKs in software and must not wait behind a
+/// tick handler executing from XIP flash.
+const SYSTICK_PRIORITY: u32 = 0xC0;
 
 // CSR bits
 const CSR_ENABLE: u32 = 1 << 0;
@@ -78,6 +87,8 @@ impl Phy6222TimeDriver {
     /// Start the SysTick timer. Call once at startup, before any async code.
     pub fn init(&self) {
         unsafe {
+            let shpr3 = core::ptr::read_volatile(SCB_SHPR3);
+            core::ptr::write_volatile(SCB_SHPR3, (shpr3 & 0x00FF_FFFF) | (SYSTICK_PRIORITY << 24));
             // Set reload value (1 ms period)
             core::ptr::write_volatile(SYST_RVR, SYSTICK_RELOAD);
             // Clear current value
