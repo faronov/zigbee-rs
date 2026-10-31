@@ -8,6 +8,7 @@ use crate::{
     gpio::Gpio,
     i2c::I2c0Token,
     radio::RadioToken,
+    rtcc::RtccToken,
     usart::{Instance, Usart},
 };
 
@@ -26,6 +27,7 @@ pub struct Peripherals {
     pub usart1: Usart,
     pub i2c0: I2c0Token,
     pub radio: RadioToken,
+    pub rtcc: RtccToken,
 }
 
 impl Peripherals {
@@ -50,6 +52,7 @@ impl Peripherals {
                 usart1: Usart::new(Instance::Usart1),
                 i2c0: I2c0Token::new(),
                 radio: RadioToken::new(),
+                rtcc: RtccToken::new(),
             })
     }
 }
@@ -68,5 +71,6 @@ mod tests {
         assert_eq!(size_of::<Efr32s2Flash>(), 0);
         assert_eq!(size_of::<RadioToken>(), 0);
         assert_eq!(size_of::<I2c0Token>(), 0);
+        assert_eq!(size_of::<RtccToken>(), 0);
     }
 }

@@ -333,44 +333,8 @@ impl RadioToken {
             return Err(RadioError::Unsupported);
         }
         crate::delay::enable_cycle_counter();
-        crate::clock::enable_radio_clocks();
-        unsafe {
-            for &(address, value) in chip::INIT {
-                write(address, value);
-            }
-            let ircal = read(chip::DEVINFO_IRCAL);
-            if ircal != u32::MAX {
-                write(chip::MODEM_IRCALCOEFWR0, ircal);
-                write(chip::MODEM_IRCALCOEFWR1, ircal);
-            }
-            // One trailer byte per frame: the frame RSSI in dBm.
-            write(L.frc + FRC_TRAILRXDATA, FRC_TRAILRXDATA_RSSI);
-            write(L.bufc + BUFC_EN, 1);
-            let tx = buf(0);
-            write(tx + BUF_CTRL, TX_BUF_SIZE_CODE);
-            write(tx + BUF_ADDR, TX_RAM.0.get() as u32);
-            write(tx + BUF_CMD, BUF_CMD_CLEAR);
-            let rx = buf(1);
-            write(rx + BUF_CTRL, RX_BUF_SIZE_CODE);
-            write(rx + BUF_ADDR, RX_RAM.0.get() as u32);
-            write(rx + BUF_CMD, BUF_CMD_CLEAR);
-            write(L.frc + FRC_IF + CLR, u32::MAX);
-            // Take over the sequencer's state hand-shake: release the RSM
-            // from SHUTDOWN now and service every later state change from
-            // the RAC_RSM interrupt (and from this driver's busy-waits).
-            write(L.rac + RAC_IF + CLR, u32::MAX);
-            write(L.rac + RAC_IEN, RAC_IF_STATECHANGE);
-            write(L.rac + RAC_SEQIF + CLR, RAC_SEQIF_ALL);
-            #[cfg(feature = "rt")]
-            write(NVIC_ISER1, RAC_RSM_IRQ_BIT);
-        }
-        let deadline = Deadline::after_us(200);
-        while matches!(rac_state_raw(), RacState::Shutdown) {
-            service_sequencer();
-            if deadline.expired() {
-                return Err(RadioError::Shutdown);
-            }
-        }
+        program_phy();
+        leave_shutdown()?;
         let mut radio = Radio {
             _token: self,
             channel: 11,
@@ -501,6 +465,23 @@ impl Radio {
         }
         unsafe { write(L.synth + SYNTH_CMD, SYNTH_CMD_STOP) };
         apply_state(&chip::IDLE);
+    }
+
+    /// Re-program the radio after EM2 before any other radio call.
+    ///
+    /// On xG22 the PHY register file survives EM2 except for a few
+    /// sequencer-owned registers, but the receiver does not work again
+    /// until it is re-initialized (lab gate `s2-em2`). Keeps channel, TX
+    /// power, CCA/ACK settings and the synthesizer calibration cache;
+    /// frames still buffered before sleep are dropped. Leaves RX off.
+    pub fn resume(&mut self) -> Result<(), RadioError> {
+        self.rx_enabled = false;
+        program_phy();
+        leave_shutdown()?;
+        apply_state(&chip::IDLE);
+        let power = self.power_ddbm;
+        self.set_tx_power_ddbm(power);
+        self.set_channel(self.channel)
     }
 
     fn start_rx(&mut self) -> Result<(), RadioError> {
@@ -853,6 +834,54 @@ fn seed() -> u32 {
     if s == 0 { 0x1234_5678 } else { s }
 }
 
+/// Program every PHY, framing, buffer and interrupt register (not the
+/// per-state analog values, TX power or channel).
+fn program_phy() {
+    crate::clock::enable_radio_clocks();
+    unsafe {
+        for &(address, value) in chip::INIT {
+            write(address, value);
+        }
+        let ircal = read(chip::DEVINFO_IRCAL);
+        if ircal != u32::MAX {
+            write(chip::MODEM_IRCALCOEFWR0, ircal);
+            write(chip::MODEM_IRCALCOEFWR1, ircal);
+        }
+        // One trailer byte per frame: the frame RSSI in dBm.
+        write(L.frc + FRC_TRAILRXDATA, FRC_TRAILRXDATA_RSSI);
+        write(L.bufc + BUFC_EN, 1);
+        let tx = buf(0);
+        write(tx + BUF_CTRL, TX_BUF_SIZE_CODE);
+        write(tx + BUF_ADDR, TX_RAM.0.get() as u32);
+        write(tx + BUF_CMD, BUF_CMD_CLEAR);
+        let rx = buf(1);
+        write(rx + BUF_CTRL, RX_BUF_SIZE_CODE);
+        write(rx + BUF_ADDR, RX_RAM.0.get() as u32);
+        write(rx + BUF_CMD, BUF_CMD_CLEAR);
+        write(L.frc + FRC_IF + CLR, u32::MAX);
+        // Take over the sequencer's state hand-shake: release the RSM
+        // from SHUTDOWN now and service every later state change from
+        // the RAC_RSM interrupt (and from this driver's busy-waits).
+        write(L.rac + RAC_IF + CLR, u32::MAX);
+        write(L.rac + RAC_IEN, RAC_IF_STATECHANGE);
+        write(L.rac + RAC_SEQIF + CLR, RAC_SEQIF_ALL);
+        #[cfg(feature = "rt")]
+        write(NVIC_ISER1, RAC_RSM_IRQ_BIT);
+    }
+}
+
+/// Wait (bounded) for the RSM to leave SHUTDOWN after [`program_phy`].
+fn leave_shutdown() -> Result<(), RadioError> {
+    let deadline = Deadline::after_us(200);
+    while matches!(rac_state_raw(), RacState::Shutdown) {
+        service_sequencer();
+        if deadline.expired() {
+            return Err(RadioError::Shutdown);
+        }
+    }
+    Ok(())
+}
+
 fn apply_state(state: &AnalogState) {
     unsafe {
         for (&address, &value) in state.regs.iter().zip(state.values.iter()) {
@@ -1002,6 +1031,19 @@ static mut SYNTH_DIAG: SynthDiag = SynthDiag {
 /// Diagnostics of the most recent synthesizer calibration.
 pub fn synth_diag() -> SynthDiag {
     unsafe { core::ptr::read_volatile(&raw const SYNTH_DIAG) }
+}
+
+/// Number of PHY configuration registers written by [`RadioToken::init`].
+pub fn config_register_count() -> usize {
+    chip::INIT.len()
+}
+
+/// Address and current value of PHY configuration register `index`, for
+/// lab retention checks across EM2. Reads have no side effects.
+pub fn config_register(index: usize) -> Option<(u32, u32)> {
+    chip::INIT
+        .get(index)
+        .map(|&(address, _)| (address, unsafe { read(address) }))
 }
 
 fn set_diag(diag: SynthDiag) {

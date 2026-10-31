@@ -22,6 +22,10 @@ pub mod flash;
 pub mod gpio;
 pub mod i2c;
 pub mod peripherals;
+pub mod power;
 pub mod radio;
+pub mod rtcc;
+#[cfg(feature = "time-driver")]
+pub mod time_driver;
 pub mod usart;
 pub mod vectors;

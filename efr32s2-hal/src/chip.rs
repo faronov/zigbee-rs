@@ -95,6 +95,7 @@ impl BusClock {
     pub const SYSCFG: Self = Self::clken0(16);
     pub const HFXO0: Self = Self::clken0(19);
     pub const GPIO: Self = Self::clken0(26);
+    pub const LFRCO: Self = Self::clken0(21);
     pub const LFXO: Self = Self::clken0(22);
     pub const RTCC: Self = Self::clken0(30);
     pub const DCDC: Self = Self::clken0(31);
