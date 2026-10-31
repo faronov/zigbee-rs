@@ -29,9 +29,9 @@ embassy-nrf52840 = { package = "embassy-nrf", version = "0.3", features = ["nrf5
 embassy-nrf52833 = { package = "embassy-nrf", version = "0.3", features = ["nrf52833"], optional = true }
 
 # ── BL702 backend ─────────────────────────────────────────────
-# Provides an experimental direct-register Rust RadioPhy plus the legacy
-# Bouffalo lmac154 FFI backend for comparison during hardware bring-up.
-# No Rust HAL dependency is required by the radio implementation.
+# Provides an experimental direct-register Rust RadioPhy driven by the shared
+# SoftMacCore. No vendor archive or Rust HAL dependency is required by the
+# radio implementation.
 
 # ── Telink TLSR82xx HAL backend ───────────────────────────────
 # Local-only: override via .cargo/config.toml [patch] or --manifest-path
