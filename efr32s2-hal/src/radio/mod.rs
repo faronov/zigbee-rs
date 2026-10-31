@@ -773,6 +773,9 @@ impl Radio {
         Some(frame)
     }
 
+    // Out of line: called from six places; inlining duplicated it into
+    // every caller and grew the end-device images.
+    #[inline(never)]
     fn service_overflow(&mut self) {
         let flags = unsafe { read(L.frc + FRC_IF) };
         if flags & FRC_IF_RXOF != 0 || rac_state_raw() == RacState::RxOverflow {
