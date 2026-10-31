@@ -21,7 +21,9 @@ pub const CHIP: Chip = Chip::Mg21;
 #[cfg(feature = "efr32mg22")]
 pub const CHIP: Chip = Chip::Mg22;
 
-/// Internal flash size shared by EFR32MG21A020F512 and EFR32MG22C224F512.
+/// Smallest main flash of the supported MG21/MG22 parts (512 KiB). Larger
+/// parts (MG21 F1024) report their size through
+/// [`crate::flash::device_flash_capacity`].
 pub const FLASH_SIZE: u32 = 512 * 1024;
 
 /// Usable SRAM at `0x2000_0000`.

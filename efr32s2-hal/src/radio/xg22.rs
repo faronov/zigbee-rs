@@ -1,6 +1,6 @@
 //! xG22 (EFR32MG22, die revision A2) IEEE 802.15.4 2.4 GHz O-QPSK tables.
 //!
-//! Provenance: register snapshots taken over SWD from an EFR32MG22C224F512IM32
+//! Provenance: register snapshots taken over SWD from an EFR32MG22C224F512IM40
 //! (BRD4183A) running GSDK 4.5.0 RAIL with
 //! `RAIL_IEEE802154_Config2p4GHzRadio()` (lab-only instrument, not shipped),
 //! reduced to the read-write registers whose value differs from the GSDK

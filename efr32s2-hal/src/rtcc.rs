@@ -55,10 +55,26 @@ const RTCC_CC_CTRL_MODE_OUTPUTCOMPARE: u32 = 2;
 
 /// `RTCC_IF` overflow flag.
 pub const IF_OF: u32 = 1 << 0;
+// The CC flag positions are the one RTCC difference between the parts
+// (GSDK `efr32mg21_rtcc.h`: CC0..CC2 at bits 2/3/4; `efr32mg22_rtcc.h`:
+// bits 4/6/8, with the odd bits reserved for capture). IF and IEN share
+// the layout.
 /// `RTCC_IF` channel-0 compare flag (Embassy time driver).
+#[cfg(feature = "efr32mg21")]
+pub const IF_CC0: u32 = 1 << 2;
+/// `RTCC_IF` channel-1 compare flag (blocking EM2 sleep).
+#[cfg(feature = "efr32mg21")]
+pub const IF_CC1: u32 = 1 << 3;
+#[cfg(all(test, feature = "efr32mg21"))]
+const IF_CC2: u32 = 1 << 4;
+/// `RTCC_IF` channel-0 compare flag (Embassy time driver).
+#[cfg(feature = "efr32mg22")]
 pub const IF_CC0: u32 = 1 << 4;
 /// `RTCC_IF` channel-1 compare flag (blocking EM2 sleep).
+#[cfg(feature = "efr32mg22")]
 pub const IF_CC1: u32 = 1 << 6;
+#[cfg(all(test, feature = "efr32mg22"))]
+const IF_CC2: u32 = 1 << 8;
 const IF_OWNED: u32 = IF_OF | IF_CC0 | IF_CC1;
 
 const START_TIMEOUT_ITERATIONS: u32 = 1_000_000;
@@ -360,9 +376,17 @@ mod tests {
     }
 
     #[test]
+    fn compare_flags_match_gsdk() {
+        #[cfg(feature = "efr32mg21")]
+        assert_eq!((IF_CC0, IF_CC1, IF_CC2), (0x04, 0x08, 0x10));
+        #[cfg(feature = "efr32mg22")]
+        assert_eq!((IF_CC0, IF_CC1, IF_CC2), (0x10, 0x40, 0x100));
+    }
+
+    #[test]
     fn flags_decode() {
         assert_eq!(
-            decode_flags(IF_OF | IF_CC1 | (1 << 8)),
+            decode_flags(IF_OF | IF_CC1 | IF_CC2),
             RtccFlags {
                 overflow: true,
                 cc0: false,

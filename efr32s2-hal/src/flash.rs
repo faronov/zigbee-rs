@@ -11,8 +11,17 @@ use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
 };
 
+/// Main flash of the F512 parts (e.g. EFR32MG22C224F512 on BRD4183A); the
+/// MG21 devkit product also confines itself to this range. Also the
+/// conservative bound when DEVINFO does not report a plausible size, and
+/// the host-build capacity.
 pub const FLASH_CAPACITY: usize = 512 * 1024;
+/// Largest main flash in the supported families (EFR32MG21 F1024).
+pub const MAX_FLASH_CAPACITY: usize = 1024 * 1024;
 pub const FLASH_PAGE_SIZE: usize = 8192;
+/// `DEVINFO.MSIZE`: `FLASH[15:0]` in KiB, `SRAM[26:16]` in KiB.
+#[cfg(target_os = "none")]
+const DEVINFO_MSIZE: u32 = 0x0FE0_800C;
 const PROGRAM_TIMEOUT: u32 = 100_000;
 
 const MSC_BASE: u32 = 0x4003_0000;
@@ -53,6 +62,27 @@ impl NorFlashError for FlashError {
     }
 }
 
+/// Main-flash size of this die from `DEVINFO.MSIZE` (ZBT-1: 1 MiB,
+/// BRD4183A: 512 KiB). Falls back to the smallest supported size,
+/// [`FLASH_CAPACITY`], when the field is erased or implausible, so a bad
+/// DEVINFO can only shrink the writable range. Products that depend on a
+/// specific part size must compare this against their layout at boot.
+pub fn device_flash_capacity() -> usize {
+    #[cfg(target_os = "none")]
+    {
+        // SAFETY: DEVINFO is a read-only, always-mapped information page.
+        let msize = unsafe { core::ptr::read_volatile(DEVINFO_MSIZE as *const u32) };
+        let bytes = (msize & 0xFFFF) as usize * 1024;
+        if bytes >= FLASH_CAPACITY
+            && bytes <= MAX_FLASH_CAPACITY
+            && bytes.is_multiple_of(FLASH_PAGE_SIZE)
+        {
+            return bytes;
+        }
+    }
+    FLASH_CAPACITY
+}
+
 pub struct Efr32s2Flash {
     _private: (),
 }
@@ -65,7 +95,7 @@ impl Efr32s2Flash {
     fn validate_range(offset: u32, length: usize) -> Result<(), FlashError> {
         (offset as usize)
             .checked_add(length)
-            .filter(|end| *end <= FLASH_CAPACITY)
+            .filter(|end| *end <= device_flash_capacity())
             .map(|_| ())
             .ok_or(FlashError::OutOfBounds)
     }
@@ -87,7 +117,7 @@ impl ReadNorFlash for Efr32s2Flash {
     }
 
     fn capacity(&self) -> usize {
-        FLASH_CAPACITY
+        device_flash_capacity()
     }
 }
 
