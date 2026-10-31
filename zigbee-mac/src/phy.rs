@@ -76,6 +76,13 @@ pub struct PhyRxFrame {
 }
 
 impl PhyRxFrame {
+    /// An empty frame (used to initialise fixed-capacity queues).
+    pub(crate) const EMPTY: Self = Self {
+        data: [0; MAX_PHY_FRAME_LEN],
+        len: 0,
+        lqi: 0,
+    };
+
     pub fn from_slice(data: &[u8], lqi: u8) -> Result<Self, PhyError> {
         if data.len() > MAX_PHY_FRAME_LEN {
             return Err(PhyError::FrameTooLong);

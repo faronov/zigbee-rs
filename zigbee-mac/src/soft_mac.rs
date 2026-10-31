@@ -302,6 +302,82 @@ impl MacRole for EndDevice {
     }
 }
 
+/// Fixed-capacity FIFO of retained received frames.
+///
+/// Like `heapless::Deque`, but with byte-sized indices (the frames are
+/// byte-aligned, so this saves the padding of two `usize` indices and a flag
+/// in every copy of the MAC), and a full queue evicts its oldest frame.
+struct RxQueue<const N: usize> {
+    frames: [PhyRxFrame; N],
+    head: u8,
+    len: u8,
+}
+
+impl<const N: usize> RxQueue<N> {
+    fn new() -> Self {
+        const { assert!(N > 0 && N <= u8::MAX as usize, "RX must be 1..=255") };
+        Self {
+            frames: [const { PhyRxFrame::EMPTY }; N],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    fn wrap(index: usize) -> u8 {
+        (if index >= N { index - N } else { index }) as u8
+    }
+
+    fn front(&self) -> Option<&PhyRxFrame> {
+        (self.len != 0).then(|| &self.frames[usize::from(self.head)])
+    }
+
+    fn drop_front(&mut self) {
+        if self.len != 0 {
+            self.head = Self::wrap(usize::from(self.head) + 1);
+            self.len -= 1;
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<PhyRxFrame> {
+        let frame = self.front()?.clone();
+        self.drop_front();
+        Some(frame)
+    }
+
+    /// Append `frame`, evicting the oldest frame when the queue is full.
+    fn push_back(&mut self, frame: PhyRxFrame) {
+        if self.len() == N {
+            self.drop_front();
+        }
+        self.frames[usize::from(Self::wrap(usize::from(self.head) + self.len()))] = frame;
+        self.len += 1;
+    }
+
+    /// Prepend `frame`, evicting the oldest frame when the queue is full.
+    fn push_front(&mut self, frame: PhyRxFrame) {
+        if self.len() == N {
+            self.drop_front();
+        }
+        self.head = Self::wrap(usize::from(self.head) + N - 1);
+        self.frames[usize::from(self.head)] = frame;
+        self.len += 1;
+    }
+}
+
 /// Shared software-MAC state for one radio.
 ///
 /// * `P` — the radio backend ([`RadioPhy`] + [`PlatformServices`]).
@@ -311,7 +387,7 @@ impl MacRole for EndDevice {
 pub struct SoftMacCore<P: RadioPhy, R: MacRole = EndDevice, const RX: usize = DEFAULT_PENDING_RX> {
     phy: P,
     pib: MacPib,
-    pending_rx: heapless::Deque<PhyRxFrame, RX>,
+    pending_rx: RxQueue<RX>,
     pending_error: Option<MacError>,
     random_state: u32,
     role: R,
@@ -333,7 +409,7 @@ impl<P: RadioPhy, R: MacRole, const RX: usize> SoftMacCore<P, R, RX> {
         Ok(Self {
             phy,
             pib,
-            pending_rx: heapless::Deque::new(),
+            pending_rx: RxQueue::new(),
             pending_error: None,
             random_state,
             role: R::new_role(),
@@ -1166,10 +1242,7 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             }
         } else if matches!(want, Want::PollResponse) && exact && self.is_from_coordinator(&source) {
             // The poll response is consumed next, ahead of other traffic.
-            if self.pending_rx.is_full() {
-                let _ = self.pending_rx.pop_front();
-            }
-            let _ = self.pending_rx.push_front(frame);
+            self.pending_rx.push_front(frame);
             Some(Heard::Queued)
         } else {
             self.queue_pending_rx(frame);
@@ -1181,10 +1254,7 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
     /// Queue a received frame for a later `receive_data` / `poll`, dropping
     /// the oldest one when the queue is full.
     fn queue_pending_rx(&mut self, frame: PhyRxFrame) {
-        if self.pending_rx.is_full() {
-            let _ = self.pending_rx.pop_front();
-        }
-        let _ = self.pending_rx.push_back(frame);
+        self.pending_rx.push_back(frame);
     }
 
     /// Convert an already-acknowledged frame into a data indication.
@@ -1220,7 +1290,7 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
     fn take_pending_indication(&mut self) -> Option<McpsDataIndication> {
         while let Some(frame) = self.pending_rx.front() {
             let indication = self.indication_from(frame);
-            let _ = self.pending_rx.pop_front();
+            self.pending_rx.drop_front();
             if indication.is_some() {
                 return indication;
             }
@@ -1276,7 +1346,7 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             if let Some(response) = self.association_response_for_us(&frame) {
                 return Some(response);
             }
-            let _ = self.pending_rx.push_back(frame);
+            self.pending_rx.push_back(frame);
         }
         None
     }
@@ -3439,5 +3509,45 @@ mod tests {
         // The response was still acknowledged and consumed.
         assert_eq!(core.phy().sent_acks.as_slice(), [(0x70, false)]);
         assert!(core.take_pending_rx().is_none());
+    }
+
+    #[test]
+    fn rx_queue_wraps_and_evicts_the_oldest_frame() {
+        let frame = |tag: u8| PhyRxFrame::from_slice(&[tag], 0).unwrap();
+        let tags = |queue: &mut RxQueue<3>| {
+            let mut out = heapless::Vec::<u8, 3>::new();
+            while let Some(frame) = queue.pop_front() {
+                out.push(frame.as_slice()[0]).unwrap();
+            }
+            out
+        };
+
+        let mut queue = RxQueue::<3>::new();
+        assert!(queue.is_empty() && queue.front().is_none());
+        for tag in 1..=4 {
+            queue.push_back(frame(tag));
+        }
+        // Full: pushing 4 evicted 1; the ring has wrapped once.
+        assert_eq!(queue.len(), 3);
+        assert_eq!(tags(&mut queue).as_slice(), [2, 3, 4]);
+
+        queue.push_back(frame(5));
+        queue.push_back(frame(6));
+        queue.push_front(frame(7));
+        assert_eq!(tags(&mut queue).as_slice(), [7, 5, 6]);
+
+        queue.push_back(frame(8));
+        queue.push_back(frame(9));
+        queue.push_back(frame(10));
+        // Full: the front insertion evicts the oldest frame (8).
+        queue.push_front(frame(11));
+        assert_eq!(tags(&mut queue).as_slice(), [11, 9, 10]);
+
+        queue.push_back(frame(12));
+        queue.drop_front();
+        queue.clear();
+        assert!(queue.is_empty() && queue.pop_front().is_none());
+        queue.drop_front();
+        assert_eq!(queue.len(), 0);
     }
 }
