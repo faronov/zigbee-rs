@@ -23,10 +23,11 @@ rejoin, and factory-reset ordering. `src/app.rs` supplies TC32 static storage,
 product adapters, and retained diagnostics; it is not a duplicate router
 state machine.
 
-`TelinkRouterMac` (the legacy Telink parent MAC, zigbee-mac feature
-`telink-legacy-router`) implements `ParentMacDriver`, so this product can
-construct a true parent router. It will move to the shared `SoftMacCore`
-parent role once that path fits the router's flash budget. The historically named `nrf52840-router` example is instead an
+`TelinkRouterMac` (`SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>`, the
+shared core's parent role) implements `ParentMacDriver`, so this product can
+construct a true parent router. The image builds and passes the layout and
+symbol gates on the shared core; parent ACK/Frame Pending timing and child
+joins have not yet been re-captured on hardware. The historically named `nrf52840-router` example is instead an
 always-on End Device composition and does not accept children.
 
 ## Persistence

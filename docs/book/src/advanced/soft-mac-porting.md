@@ -35,16 +35,14 @@ Production status:
 | nRF52840/52833 | yes, via `NrfSoftMac` | build- and host-tested; no hardware run since the migration |
 | PHY6222/PHY6252 | yes, via `Phy6222SoftMac` (ISR Imm-Ack, `type Tx = AckWaitTx`) | hardware-tested on the PB-03F-Kit (PHY6252) with the previous `RadioPhy` API; the `type Tx`/in-place `receive` port is build- and layout-checked only; EVK images build/layout only |
 | TLSR8258 sensors | yes, `TelinkMac` = `SoftMacCore<TelinkRadioPhy, EndDevice>` (`type Tx = FullTx`) | see the Telink platform guide; the `type Tx`/in-place `receive` port is build- and gate-checked only |
-| TLSR8258 router | no, legacy `TelinkRouterMac` behind the `telink-legacy-router` feature | hardware-tested legacy path |
+| TLSR8258 router | yes, `TelinkRouterMac` = `SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>` | build-, layout- and symbol-checked only; the replaced hand-written router MAC was hardware-tested, the shared parent path is not yet |
 | CC2340, EFR32MG1, EFR32MG21, ESP32-C6/H2 | no, each has its own `MacDriver` | — |
 
-The last group and the TLSR8258 router are the remaining Phase B work. The
-router port onto `SoftMacCore<TelinkRadioPhy, Parent<..>>` compiled and ran
-on the host, but grew the router image by 1,546 B of flash, because the
-shared parent path is more general than the hand-written one (inlined
-association/poll futures and a larger `mlme_poll_timeout`). It waits for a
-slimmer core parent path; `TelinkRadioPhy` already implements
-`set_ack_frame_pending` for it.
+The last group is the remaining Phase B work. The TLSR8258 router is the
+first shipped image on the core's parent role. Its `PENDING` capacity is 0:
+the HAL's ISR ACK path owns the Frame Pending source-match table, which the
+core arms through `RadioPhy::set_ack_frame_pending` because
+`hardware_auto_ack` is set.
 
 ## What the PHY must implement
 
@@ -269,9 +267,11 @@ To find growth:
   discards a result that completed at or after the deadline, but does not
   cancel the radio operation. EFR32 cancels it with a timer. The TLSR8258
   PHY's operations are bounded busy-waits, so the deadline is bounded there.
-- **Per-backend diagnostics counters.** EFR32 and the legacy Telink router
-  MAC keep their own; the core exposes only `dropped_command_events()`.
-  The TLSR8258 sensors keep only the HAL's `tlsr8258_hal::radio::rx_diagnostics()`;
-  the legacy MAC's ACK/queue counters were not carried over.
+- **Per-backend diagnostics counters.** EFR32 keeps its own; the core
+  exposes only `dropped_command_events()`. The TLSR8258 images keep the HAL's
+  `tlsr8258_hal::radio::rx_diagnostics()`; the router also reports
+  `dropped_command_events()` as its command-queue overflow. The other ACK and
+  queue counters of the removed hand-written router MAC stay 0 in the
+  router's retained `JoinMetrics`, whose layout is unchanged.
 - **Hardware security offload** is not modelled. Every backend uses software
   CCM* over the AES provider.

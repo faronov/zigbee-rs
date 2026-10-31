@@ -37,12 +37,13 @@ Parent-only APIs are not exposed to an end device or relay. A backend without
 association responses, pending transactions, and indirect delivery cannot
 construct or advertise any Router descriptor.
 
-Only the tc32 legacy `TelinkRouterMac` (zigbee-mac feature
-`telink-legacy-router`), the shared `SoftMacCore<P, Parent<..>>` role and
-host-only `MockMac` implement the sealed `ParentMacDriver`. Both real parent
-MACs advertise router capability but explicitly report `coordinator: false`.
-No shipped image instantiates the `SoftMacCore` parent role yet; it is
-host-tested only. All other real backends are non-parent End Device
+Only the shared `SoftMacCore<P, Parent<..>>` role and host-only `MockMac`
+implement the sealed `ParentMacDriver`. The parent role advertises router
+capability but explicitly reports `coordinator: false`. The TLSR8258 router
+(`TelinkRouterMac` = `SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>`) is the
+only shipped image that instantiates it; that image is build- and
+layout-checked, not yet hardware-tested on the shared core. All other real
+backends are non-parent End Device
 backends. No production backend currently advertises Coordinator or
 Trust-Center server support.
 
@@ -121,8 +122,9 @@ Zigbee role.
 
 ### TLSR8258
 
-The legacy `TelinkRouterMac` (zigbee-mac feature `telink-legacy-router`)
-supplies parent operations. The product uses:
+`TelinkRouterMac`, the shared `SoftMacCore` parent role over
+`TelinkRadioPhy`, supplies parent operations. The HAL's ISR ACK path keeps the
+Frame Pending source-match table. The product uses:
 
 ```text
 ParentRouterApp + Router + PersistentChildren

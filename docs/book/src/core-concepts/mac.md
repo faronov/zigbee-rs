@@ -152,16 +152,16 @@ backend is behind a Cargo feature flag:
 | BL702 | `bl702` (+ `hardware-aes-bl702`) | `Bl702SoftMac` = `SoftMacCore<Bl702RadioPhy>` | End Device; XT-ZB1 commissioning, reset/resume, Idle sleep and OTA hardware-tested on one board (legacy lmac154 `Bl702Mac` removed) |
 | CC2340R5 | `cc2340` | own `Cc2340Mac` | single-board radio bring-up, ZHA join, PBE frame filtering and hardware auto-ACK; entropy fails closed |
 | TLSR8258 sensors | `tlsr8258` (+ `hardware-aes`) | `TelinkMac` = `SoftMacCore<TelinkRadioPhy>` | End Device; `telink` is a compatibility alias |
-| TLSR8258 router | `telink-legacy-router` | legacy `TelinkRouterMac` | only production `ParentMacDriver`; advertises router but not coordinator |
+| TLSR8258 router | `tlsr8258` (+ `hardware-aes`) | `TelinkRouterMac` = `SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>` | only production `ParentMacDriver`; advertises router but not coordinator; shared-core image build/layout-checked only |
 | PHY6222/PHY6252 | `phy6222` (+ `phy6222-diag`) | `Phy6222SoftMac` = `SoftMacCore<Phy6222RadioPhy>` | End Device; PB-03F-Kit (PHY6252) join, interview, reporting, resume and SRAM-ISR ACK timing hardware-tested; EVK images build/layout only |
 | EFR32MG1 | `efr32` (+ `hardware-aes-efr32mg1`) | own `Efr32Mac` | End Device backend; prior TRÅDFRI path evidence exists, real OTA install open |
 | EFR32MG21 | `efr32mg21` | own `Efr32s2Mac` | BRD4181A build/layout only; complete HIL open |
 | Mock | `mock` | `MockMac` | host-only `ParentMacDriver`; router/coordinator/Trust-Center tests |
 
 All real backends currently implement the End Device primitives. Only the
-legacy Telink router MAC (`TelinkRouterMac`), the shared `SoftMacCore` parent
-role (`SoftMacCore<P, Parent<..>>`, not yet used by any shipped image) and
-`MockMac` implement the sealed `ParentMacDriver`. Both parent MACs report
+shared `SoftMacCore` parent role (`SoftMacCore<P, Parent<..>>`, shipped as the
+TLSR8258 `TelinkRouterMac`) and `MockMac` implement the sealed
+`ParentMacDriver`. Both report
 `router: true` and `coordinator: false`; every other real backend uses
 `MacCapabilities::non_parent`. No production backend can currently advertise
 or construct a Coordinator/Trust-Center server path.
@@ -340,9 +340,9 @@ impl MacDriver for MyRadioMac {
 > backends. For the parent-side
 > primitives — beacon response, association response, orphan realignment and
 > frame-pending indirect delivery — the in-tree references are the shared
-> `SoftMacCore` parent role (`zigbee-mac/src/soft_mac/parent.rs`), the
-> hardware-tested legacy Telink router MAC (`zigbee-mac/src/telink/legacy.rs`)
-> and the host `MockMac`.
+> `SoftMacCore` parent role (`zigbee-mac/src/soft_mac/parent.rs`, used by the
+> TLSR8258 router over `zigbee-mac/src/telink/radio_phy.rs`) and the host
+> `MockMac`.
 
 ## MAC Primitives Reference
 
@@ -575,8 +575,8 @@ pub trait ParentMacDriver: MacDriver + sealed::SealedParent {}
 ```
 
 `ParentMacDriver` is implemented only by backends that can truthfully parent
-(the legacy Telink `TelinkRouterMac` on hardware, the shared
-`SoftMacCore<P, Parent<..>>` role, and the host `MockMac`). Because
+(the shared `SoftMacCore<P, Parent<..>>` role, used by the TLSR8258
+`TelinkRouterMac`, and the host `MockMac`). Because
 its supertrait `sealed::SealedParent` can only be named inside `zigbee-mac`, the
 trait can be implemented **only by in-tree, reviewed MAC backends** — an
 arbitrary downstream crate cannot forge the capability to unlock router

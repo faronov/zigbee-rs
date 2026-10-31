@@ -55,13 +55,10 @@ composition.
 
 Parent-only APIs are unavailable to end devices and relays.
 
-`ParentMacDriver` is implemented by the legacy Telink `TelinkRouterMac`
-(zigbee-mac feature `telink-legacy-router`), by the shared
-`SoftMacCore<P, Parent<..>>` parent role for any `RadioPhy`, and by host-only
-`MockMac`. Only the Telink TLSR8258 router image uses a parent MAC in
-production firmware; no shipped image instantiates the `SoftMacCore` parent
-role yet. Both parent MACs advertise router capability but not coordinator
-capability, so there is no production Coordinator/Trust-Center server.
+`ParentMacDriver` is implemented by the shared `SoftMacCore<P, Parent<..>>`
+parent role for any `RadioPhy` and by host-only `MockMac`. Only the Telink
+TLSR8258 router image (`TelinkRouterMac`) uses the parent role in production
+firmware. It advertises router capability but not coordinator capability, so there is no production Coordinator/Trust-Center server.
 `examples/nrf52840-router` uses `build()` and `AlwaysOnEndDeviceApp` on the
 end-device `SoftMacCore` role.
 

@@ -58,13 +58,12 @@ Reusable always-on End Device, router, and coordinator lifecycle.
 | `CoordinatorApp` | `Router` | `PersistentChildren<C>`, `router` + `ParentMacDriver` |
 | `TrustCenterCoordinatorApp` | `Router` | Coordinator requirements plus `TrustCenterDeviceStore`, `trust-center` |
 
-`ParentMacDriver` is implemented by the legacy Telink `TelinkRouterMac`
-(zigbee-mac `telink-legacy-router`), the shared `SoftMacCore<P, Parent<..>>`
-role, and host-only `MockMac`; both parent MACs advertise router but not
-coordinator capability. The only current production parent-router
-composition is the TLSR8258 router on `TelinkRouterMac` (no shipped image
-uses the `SoftMacCore` parent role yet), while Coordinator/Trust-Center server
-frontends remain mock-only.
+`ParentMacDriver` is implemented by the shared `SoftMacCore<P, Parent<..>>`
+role and host-only `MockMac`; both advertise router but not coordinator
+capability. The only current production parent-router composition is the
+TLSR8258 router on `TelinkRouterMac` (`SoftMacCore<TelinkRadioPhy,
+Parent<8, 8, 0>>`), while Coordinator/Trust-Center server frontends remain
+mock-only.
 
 Each frontend provides:
 

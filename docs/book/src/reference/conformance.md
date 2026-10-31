@@ -27,7 +27,7 @@ exact-image rerun of the freshly measured binaries.
 | sleepy End Device | steering, persisted resume/rejoin, ED timeout, polling, reporting, reset and OTA lifecycle are host-tested | all real backends currently compose as End Devices; current release images build/layout-test as listed in `BUILD.md` | exact-image security/power/interoperability acceptance per release |
 | receiver-on End Device | typed non-parent composition and continuous receive path are host-tested | nRF52840 release image builds | complete HIL acceptance |
 | relay router | routing without child admission is compile-time separated and host-tested | no production image is currently composed; `MockMac` can host-test it | production backend/product composition and packet capture |
-| parent router | child admission, indirect delivery, timeout, reassignment, Leave cascade and durable DeviceLeft are host-tested | TLSR8258 (legacy `TelinkRouterMac`) is the only production parent MAC; its current image builds/layout-tests. The shared `SoftMacCore` parent role is host-tested only | corrected-image first-attempt child join plus power-cut lifecycle captures |
+| parent router | child admission, indirect delivery, timeout, reassignment, Leave cascade and durable DeviceLeft are host-tested | TLSR8258 `TelinkRouterMac` (the shared `SoftMacCore` parent role) is the only production parent MAC; its image builds and passes the layout and symbol gates; not yet hardware-tested on the shared core | corrected-image first-attempt child join plus power-cut lifecycle captures |
 | distributed router | distributed formation, provisioned-key checks and persisted PAN restart are host-tested | no production hardware image is claimed | product composition and HIL |
 | coordinator / Trust Center | formation/restart, admission, install-code keys, application keys, Remove-Device and Network-Key rotation are host-tested | mock-only; no production backend advertises coordinator capability | production backend/product composition, multi-device HIL and certification |
 
@@ -35,10 +35,9 @@ Unsupported role capabilities are absent at compile time. A backend that
 cannot provide association responses, pending transactions and indirect
 delivery cannot construct a parent router or coordinator.
 
-Only the tc32 Telink `TelinkRouterMac` (zigbee-mac feature
-`telink-legacy-router`), the shared `SoftMacCore<P, Parent<..>>` role (not yet
-used by any shipped image) and host `MockMac` implement the sealed
-`ParentMacDriver`. Both parent MACs advertise `router: true` and
+Only the shared `SoftMacCore<P, Parent<..>>` role (shipped as the TLSR8258
+`TelinkRouterMac`) and host `MockMac` implement the sealed
+`ParentMacDriver`. Both advertise `router: true` and
 `coordinator: false`; all other real backends use non-parent capability
 descriptors. Consequently `examples/nrf52840-router` is an
 `AlwaysOnEndDeviceApp` on the end-device `SoftMacCore<NrfRadioPhy>`, not a

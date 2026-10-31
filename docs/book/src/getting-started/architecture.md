@@ -185,10 +185,9 @@ loop {
 }
 ```
 
-`ParentMacDriver` is implemented by the legacy tc32 `TelinkRouterMac`
-(zigbee-mac feature `telink-legacy-router`), by the shared
-`SoftMacCore<P, Parent<..>>` role (host-tested; no shipped image uses it yet),
-and by host-only `MockMac`. Telink advertises router capability but not
+`ParentMacDriver` is implemented by the shared
+`SoftMacCore<P, Parent<..>>` role (used by the TLSR8258 router image as
+`TelinkRouterMac`) and by host-only `MockMac`. Telink advertises router capability but not
 coordinator capability; no production backend advertises Coordinator or
 Trust-Center server support. The nRF52840 example is therefore an
 `AlwaysOnEndDeviceApp`, despite its historical directory name. The TLSR8258

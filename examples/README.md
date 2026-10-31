@@ -77,9 +77,8 @@ coordinator compositions explicitly enable its `router` feature.
 
 The nRF52840 always-on End Device example is deliberately the first case. Its
 MAC lacks `ParentMacDriver`, so it cannot advertise a Router descriptor.
-Only the legacy Telink `TelinkRouterMac`, the host-tested
-`SoftMacCore<_, Parent<..>>` and host-only `MockMac` implement
-`ParentMacDriver`, and no production backend advertises coordinator
+Only the shared `SoftMacCore<_, Parent<..>>` (the TLSR8258
+`TelinkRouterMac`) and host-only `MockMac` implement `ParentMacDriver`, and no production backend advertises coordinator
 capability.
 
 ## Host examples

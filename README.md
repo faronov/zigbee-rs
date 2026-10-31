@@ -142,10 +142,9 @@ let events = end_device.step().await?;
 advertises `DeviceType::Router` requires both the `router` feature and
 `ParentMacDriver`; a backend without parent-side association and
 indirect-delivery primitives cannot construct one. Of the in-tree MACs, only
-the legacy Telink `TelinkRouterMac` (zigbee-mac feature
-`telink-legacy-router`), the shared `SoftMacCore<_, Parent<..>>` (host-tested;
-no shipped image uses it yet) and host-only `MockMac` implement
-`ParentMacDriver`. Telink advertises router capability but not coordinator
+the shared `SoftMacCore<_, Parent<..>>` (shipped as the TLSR8258
+`TelinkRouterMac`) and host-only `MockMac` implement `ParentMacDriver`.
+Telink advertises router capability but not coordinator
 capability. No production backend advertises Coordinator or Trust-Center
 server support, so coordinator composition remains mock-only.
 

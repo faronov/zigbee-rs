@@ -24,10 +24,14 @@ The sensors use `TelinkMac`, which is the shared
 retries and ACK matching run in the portable core, while the HAL performs the
 CSMA-CA backoff (with the PIB parameters), the transmission and the Imm-Ack
 wait as one radio operation. The Imm-Ack itself is still generated in the
-HAL RX-completion path, never from task context. The router uses the legacy
-hand-written `TelinkRouterMac`, compiled only with the zigbee-mac
-`telink-legacy-router` feature, until the shared parent path fits its flash
-budget (see the MAC unification section of the firmware-size chapter).
+HAL RX-completion path, never from task context. The router uses
+`TelinkRouterMac`, the same core in its parent role
+(`SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>`, eight retained data frames).
+Beacon, association and orphan responses, command events and indirect data
+come from the core; Frame Pending is armed in the HAL's ISR source-match
+table. The hand-written router MAC it replaced was hardware-tested; the
+shared-core router image is build-, layout- and symbol-checked only (see the
+MAC unification section of the firmware-size chapter).
 
 The board owns fitted LEDs, flash/ADC resources, and physical wiring. The
 product owns identity, profile, battery/poll behavior, sleep policy,
@@ -99,7 +103,8 @@ ParentRouterApp::new(
 )?;
 ```
 
-`TelinkRouterMac` implements the parent primitives needed by `ParentMacDriver`.
+`TelinkRouterMac` (the shared `SoftMacCore` parent role) implements the
+parent primitives needed by `ParentMacDriver`.
 `ParentRouterApp` owns steering/resume, bounded receive/tick processing,
 security checkpoints, and child-table restore/save/clear.
 

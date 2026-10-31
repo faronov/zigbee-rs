@@ -2,7 +2,7 @@
 
 The **PAN Information Base (PIB)** is the MAC-layer configuration interface defined by IEEE 802.15.4. The `zigbee-mac` crate exposes PIB attributes through the `MacDriver` trait's `mlme_get()` and `mlme_set()` methods (both return `Result<_, MacError>`). Types live in `zigbee-mac/src/pib.rs`.
 
-Backends built on the shared `SoftMacCore` (nRF52, BL702, Telink, PHY6222 — over the `RadioPhy` trait) store PIB state in the portable `MacPib` struct; the defaults and validation rules below are those of `MacPib`. Backends with their own `MacDriver` implementation (ESP32, EFR32, CC2340, the legacy `TelinkRouterMac`, and the mock MAC) keep their own PIB state and may differ in defaults.
+Backends built on the shared `SoftMacCore` (nRF52, BL702, Telink sensors and router, PHY6222 — over the `RadioPhy` trait) store PIB state in the portable `MacPib` struct; the defaults and validation rules below are those of `MacPib`. Backends with their own `MacDriver` implementation (ESP32, EFR32, CC2340, and the mock MAC) keep their own PIB state and may differ in defaults.
 
 ```rust
 use zigbee_mac::{PibAttribute, PibValue, MacDriver};

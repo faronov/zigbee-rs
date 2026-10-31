@@ -375,9 +375,9 @@ The earlier measurements below remain historical; the new images are not
 hardware-qualified.
 
 The sensors run on the shared `SoftMacCore<TelinkRadioPhy, EndDevice>`
-(`type Tx = FullTx`); the router keeps the hand-written `TelinkRouterMac`,
-compiled only with the zigbee-mac `telink-legacy-router` feature. The
-`SoftMacCore` sensor images are build/symbol-checked only.
+(`type Tx = FullTx`) and the router on its parent role,
+`SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>`. The `SoftMacCore` images are
+build/layout/symbol-checked only.
 
 The default sensor uses:
 

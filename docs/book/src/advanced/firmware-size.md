@@ -566,6 +566,37 @@ TLSR8258 raw binaries are 190,284 B (default), 193,404 B (LOW32K 250 ms) and
 carries these PHY62x2/TLSR8258 rows. The new-API paths are build- and
 layout-checked only; the PB-03F hardware evidence predates them.
 
+### Phase B: TLSR8258 router on the parent role
+
+The router moved from the hand-written `TelinkRouterMac` to
+`SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>`, eight retained data frames
+like the old MAC's data-indication queue. The `telink-legacy-router` feature
+and `zigbee-mac/src/telink/legacy.rs` (3,609 lines) were removed. The core's
+pending-transaction table has capacity 0, because the HAL's ISR ACK path
+already owns the Frame Pending source-match table.
+
+The router and sensor composition roots now build the device in a
+non-inlined `build_device` helper, as on PHY62x2. When the router's MAC was a
+temporary of `run()`, eight retained frames cost 512 B more stack than four;
+with the helper the MAC lives only in the device's static slot.
+`install_aes_engine` is `#[inline(never)]` because the CI symbol gate checks
+for it.
+
+Deltas against master `5fc933a`, measured with the corrected tool in
+directories with equal-length paths:
+
+| image | `flash` | `data` | `bss` | `pool` | `stack` | `mac_chain` | `mac_code` | `mac_stack` | `mac_frame` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| tlsr8258-router | 265,288 (-5,502) | 2,428 (0) | 19,124 (-560) | 0 (0) | 45,712 (-1,712) | 35,008 (-2,368) | 15,924 (-2,092) | 1,720 (-1,272) | 768 (-1,424) |
+| tlsr8258-sensor | 161,287 (-68) | 2,156 (0) | 8,368 (0) | 0 (0) | 29,656 (-704) | 28,720 (-704) | 9,560 (0) | 1,392 (0) | 480 (0) |
+| tlsr8258-sensor-retention | 164,511 (-68) | 2,156 (0) | 10,836 (0) | 0 (0) | 28,240 (-1,528) | 27,304 (-1,520) | 9,528 (0) | 1,392 (0) | 480 (0) |
+| tlsr8258-sensor-retention-10s | 164,515 (-68) | 2,156 (0) | 10,836 (0) | 0 (0) | 28,240 (-1,536) | 27,304 (-1,520) | 9,528 (0) | 1,392 (0) | 480 (0) |
+
+Master's router row equals the `157d189` hand-written-MAC row, so the router
+deltas are also its deltas against the legacy MAC. `tools/mac-footprint-baseline.json`
+carries these rows. The shared-core router is build-, layout- and
+symbol-checked only.
+
 ## Measurement commands
 
 Raw binary:
