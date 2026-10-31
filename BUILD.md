@@ -295,7 +295,7 @@ through the boot ROM's SPIF routines; `0x3000..0x4FFF` (factory record and BLE
 address) is never written. See the
 [PHY6222 platform guide](docs/book/src/platform-guides/phy6222.md#pb-03f-kit-phy6252).
 
-## EFR32MG1 and EFR32MG21
+## EFR32MG1, EFR32MG21 and EFR32MG22
 
 ```bash
 cd examples/efr32mg1-sensor
@@ -311,6 +311,16 @@ cargo +nightly-2026-03-23 clippy --release --locked \
   --target thumbv8m.main-none-eabihf -- -D warnings
 python3 tools/verify-layout.py \
   target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor
+
+cd ../efr32mg22-sensor
+cargo +nightly-2026-03-23 build --release --locked
+cargo +nightly-2026-03-23 clippy --release --locked \
+  --target thumbv8m.main-none-eabihf -- -D warnings
+python3 tools/verify-layout.py \
+  target/thumbv8m.main-none-eabihf/release/efr32mg22-sensor
+
+cd ../../tools/efr32s2-lab   # MG22 bring-up gates, not production
+cargo +nightly-2026-03-23 build --release --locked --bins
 ```
 
 EFR32MG1 uses `Active` fast waits and `Retention` slow waits. The 2026-10-31
@@ -332,10 +342,25 @@ EFR32MG21 targets BRD4181A on BRD4001A:
 - application: `0x00004000..0x0007C000`
 - persistence: `0x0007C000..0x00080000`
 
-Its `Idle` wait is radio-gated WFE with a 1 kHz SysTick, not EM2. The complete
-MG21 hardware path remains HIL-unverified. The 2026-10-31 local build is
-209,028 B; `.data` is 316 B, `.bss` is 18,888 B, and the linked available
-stack is 46,328 B. There is no MG21 OTA packaging path.
+MG21 and MG22 share `efr32s2-hal` and `Efr32s2SoftMac`. Time comes from the
+RTCC, and slow polls sleep in EM2. The xG21 radio tables are not captured
+yet, so MG21 radio init fails explicitly and the MG21 image has no hardware
+run. The 2026-10-31 local build is 229,088 B; `.data` is 336 B, `.bss` is
+14,600 B, and the linked available stack is 50,424 B.
+
+EFR32MG22 targets BRD4183A on BRD4001A:
+
+- PB1: active-high LED
+- PB0: active-low button (EM2 wake)
+- HFXO: 38.4 MHz, CTUNE 120
+- application: `0x00000000..0x0007C000` (no bootloader)
+- persistence: `0x0007C000..0x00080000`
+
+On one board it joined ZHA, completed the interview, reported, resumed from
+the journal, and averaged 13.2 µA in slow-poll EM2. The 2026-10-31 local
+build is 231,052 B; `.data` is 336 B, `.bss` is 14,600 B, and the linked
+available stack is 17,656 B (14 KiB gate). Neither chip has an OTA
+packaging path.
 
 ## Telink TLSR8258
 

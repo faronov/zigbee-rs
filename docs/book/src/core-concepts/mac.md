@@ -183,7 +183,7 @@ entropy). Optional behaviour is selected at compile time:
   beacon/orphan/association responses and indirect frame-pending;
 - the retained-RX depth `RX`.
 
-EFR32MG21 still has its own `MacDriver` implementation. See [Soft MAC Porting](../advanced/soft-mac-porting.md) for
+Every real backend now runs on `SoftMacCore`. See [Soft MAC Porting](../advanced/soft-mac-porting.md) for
 the `RadioPhy` contract and port status, and
 [Firmware Size](../advanced/firmware-size.md#mac-unification-footprint-baseline) for the per-image MAC footprint
 measured by `tools/mac-footprint.py`.
