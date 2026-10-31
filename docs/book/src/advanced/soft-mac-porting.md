@@ -99,7 +99,13 @@ Even then, the constructor's `Result`, the unwrapped MAC and the
 `ZigbeeDevice` builder are temporaries in the async `main` poll frame, which
 stays live under every later call. The PHY62x2 composition roots build the
 MAC and the device in a non-inlined `build_device` function that returns the
-`ZigbeeDevice`; this saved 1,008 B of `stack` per image.
+`ZigbeeDevice`; this saved 1,008 B of `stack` per image. Prefer
+`DeviceBuilder::build_into(slot)` inside that function: `build()` returns the
+device by value through a device-sized assembly frame (24 KB on nRF52840).
+The slot can be a `StaticCell` (ESP32) or a `MaybeUninit` local of the task
+future (nRF52, BL702), which adds no static RAM when the future already holds
+the device. The same applies to a large product profile (BL702's OTA
+profile): build it in a non-inlined helper into a future-local slot.
 
 ## Optional capabilities
 

@@ -717,6 +717,51 @@ Notes on the table:
 - **Validation:** the port is build-, layout-, symbol- and host-tested only.
   No ESP hardware run has been done with it.
 
+### Composition roots: in-place device on BL702 and nRF52
+
+The nRF52 examples (`nrf52840-sensor`, `nrf52833-sensor`,
+`nrf52840-sensor-uf2`, `nrf52840-router`) and `bl702-sensor` now assemble the
+device in a non-inlined generic `build_device` with
+`DeviceBuilder::build_into(slot)`. The worst nRF path ran from the Embassy
+main-task poll through `DeviceBuilder::assemble::<EndDevice>`, a 24,064 B
+frame that only existed because `build()` returns the device by value.
+
+The slot is a `MaybeUninit` local of the task future, not a `StaticCell`. On
+nRF the executor's task arena (`task-arena-size-32768`) is a fixed static, so
+a `StaticCell` would add `.bss`. On BL702 the task pool is the future's size,
+and the future already held the device. With the local slot, `bss` and
+`pool` stay the same.
+
+On the sensors, a non-inlined `build_profile` also builds the product
+profile into a future-local slot, so its cluster tables are no longer
+assembled in the task's poll frame. On BL702 that frame shrank from
+6,336 B to 1,408 B. BL702 also gets a non-inlined `build_mac` (RF init,
+TX power, AES self-test, `SoftMacCore::new`). The router's profile is small,
+so `build_profile` saves no stack there and was left out.
+
+Measured against master `d8bf8bc`, built from an equal-length path:
+
+| image | `flash` | `data` | `bss` | `pool` | `stack` | `mac_chain` |
+|---|---:|---:|---:|---:|---:|---:|
+| bl702-sensor | 219,978 (-832) | 0 (0) | 16,590 (-2) | 16,388 (0) | 21,872 (-4,960) | 20,224 (-4,960) |
+| nrf52840-router | 228,100 (-196) | 88 (0) | 18,644 (0) | 17,584 (0) | 18,984 (-9,364) | 18,104 (-1,344) |
+| nrf52840-sensor | 226,700 (-400) | 88 (0) | 37,376 (0) | 32,772 (0) | 23,568 (-3,684) | 22,436 (-552) |
+| nrf52840-sensor-bme280 | 234,964 (-308) | 88 (0) | 37,376 (0) | 32,772 (0) | 23,584 (-3,956) | 22,452 (-824) |
+| nrf52840-sensor-sht31 | 230,912 (-452) | 88 (0) | 37,376 (0) | 32,772 (0) | 23,568 (-3,684) | 22,436 (-552) |
+| nrf52833-sensor | 226,696 (-260) | 88 (0) | 37,376 (0) | 32,772 (0) | 23,568 (-3,684) | 22,436 (-552) |
+| nrf52833-sensor-bme280 | 234,968 (-168) | 88 (0) | 37,376 (0) | 32,772 (0) | 23,584 (-3,956) | 22,452 (-824) |
+| nrf52833-sensor-sht31 | 230,916 (-308) | 88 (0) | 37,376 (0) | 32,772 (0) | 23,568 (-3,684) | 22,436 (-552) |
+| nrf52840-sensor-uf2-dk | 226,764 (-400) | 88 (0) | 37,376 (0) | 32,772 (0) | 23,560 (-3,684) | 22,428 (-552) |
+| nrf52840-sensor-uf2-mdk | 225,260 (-460) | 88 (0) | 37,376 (0) | 32,772 (0) | 23,560 (-3,684) | 22,428 (-552) |
+| nrf52840-sensor-uf2-pca10059 | 226,672 (-448) | 88 (0) | 37,376 (0) | 32,772 (0) | 23,560 (-3,684) | 22,428 (-552) |
+| nrf52840-sensor-uf2-promicro | 225,372 (-412) | 88 (0) | 37,376 (0) | 32,772 (0) | 23,560 (-3,684) | 22,428 (-552) |
+
+`mac_stack` and `mac_frame` are unchanged on every image. `mac_code` falls by
+736 B on BL702, which no longer inlines PHY bring-up into the task, and is
+unchanged on nRF. The baseline JSON keeps its originally recorded values with
+these deltas applied. The change is build-, layout- and symbol-tested only;
+no BL702 or nRF52 hardware run has been done with it.
+
 ## Measurement commands
 
 Raw binary:
