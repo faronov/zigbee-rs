@@ -167,6 +167,10 @@ jobs:
             manifest: products/efr32mg22-sensor/Cargo.toml
             workspace: products/efr32mg22-sensor
             features: ""
+          - name: Home Assistant Connect ZBT-1 product
+            manifest: products/ha-connect-zbt1/Cargo.toml
+            workspace: products/ha-connect-zbt1
+            features: ""
           - name: PHY6222 sensor product
             manifest: products/phy62x2-evk/Cargo.toml
             workspace: products/phy62x2-evk
@@ -295,6 +299,7 @@ jobs:
           cargo fmt --manifest-path boards/efr32mg22-devkit/Cargo.toml -- --check
           cargo fmt --manifest-path boards/ha-connect-zbt1/Cargo.toml -- --check
           cargo fmt --manifest-path products/efr32mg22-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path products/ha-connect-zbt1/Cargo.toml -- --check
           cargo fmt --manifest-path products/phy62x2-evk/Cargo.toml -- --check
           cargo fmt --manifest-path examples/nrf52840-router/Cargo.toml -- --check
           cargo fmt --manifest-path examples/nrf52840-sensor-uf2/Cargo.toml -- --check
@@ -305,6 +310,7 @@ jobs:
           cargo fmt --manifest-path examples/efr32mg1-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg21-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg22-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/ha-connect-zbt1/Cargo.toml -- --check
           cargo fmt --manifest-path efr32mg1-hal/Cargo.toml -- --check
           cargo fmt --manifest-path efr32s2-hal/Cargo.toml -- --check
           cargo fmt --manifest-path tools/efr32s2-lab/Cargo.toml -- --check
@@ -1488,6 +1494,57 @@ jobs:
             examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.bin
             examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.hex
             examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.size.json
+          if-no-files-found: error
+
+  build-ha-connect-zbt1:
+    name: Build Home Assistant Connect ZBT-1 End Device and MG21 lab gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv8m.main-none-eabihf
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            examples/ha-connect-zbt1
+            tools/efr32s2-lab
+          key: thumbv8m-zbt1-${{ env.RUST_TOOLCHAIN }}-ed-${{ hashFiles('examples/ha-connect-zbt1/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/ha-connect-zbt1/link/**', 'efr32s2-hal/link/**') }}
+      - name: Build ZBT-1 always-on End Device (release)
+        working-directory: examples/ha-connect-zbt1
+        run: cargo build --release --locked
+      - name: Clippy ZBT-1 production composition
+        working-directory: examples/ha-connect-zbt1
+        run: cargo clippy --release --locked --target thumbv8m.main-none-eabihf -- -D warnings
+      - name: Build EFR32 Series 2 lab gate binaries (ZBT-1, MG21)
+        working-directory: tools/efr32s2-lab
+        run: cargo build --release --locked --bins --no-default-features --features zbt1
+      - name: Create firmware artifacts
+        run: |
+          ELF=examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-ed
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+          "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+          ./tools/firmware-size-report.sh ha-connect-zbt1-ed ${ELF}.bin ${ELF}.size.json
+          python3 examples/ha-connect-zbt1/tools/verify-layout.py "$ELF"
+          SYMS="$("$NM" --demangle "$ELF")"
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
+            echo "ZBT-1 End Device links parent/router maintenance symbols:" >&2
+            grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
+            exit 1
+          fi
+      - name: Upload ZBT-1 firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ha-connect-zbt1-ed-firmware
+          path: |
+            examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-ed.bin
+            examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-ed.hex
+            examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-ed.size.json
           if-no-files-found: error
 
   build-efr32mg22:
