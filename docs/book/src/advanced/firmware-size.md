@@ -252,7 +252,51 @@ Column meanings (the script's `--help` gives the full definitions):
 - `mac_frame`: the largest single MAC frame.
 
 All stack figures are derived from function prologues in the linked ELF.
-They are static bounds, not runtime high-water marks. The CC2340 image uses
+They are static bounds, not runtime high-water marks.
+
+Frames too large for an immediate are allocated through the literal pool on
+Thumb-1 (Cortex-M0+: CC2340, PHY62x2) and TC32 (TLSR8258):
+
+```text
+ldr  rN, [pc, #..]   @ .word 0xffffd044
+add  sp, rN
+```
+
+The tool originally counted these frames as 0 B. It now reads the literal
+and adds the frame; a non-negative literal marks the frame dynamic. Thumb-2
+(nRF52, EFR32) and RISC-V (BL702, ESP32) use immediates, so their rows are
+unaffected.
+
+The corrected rows in `tools/mac-footprint-baseline.json` were raised by the
+under-count. The `stack` and `mac_chain` values in the `44d457c` table below
+are the old, under-counted values. Corrected values (bytes):
+
+| image | `stack` | `mac_chain` | `mac_stack` | `mac_frame` |
+|---|---:|---:|---:|---:|
+| cc2340-sensor-fallback | 24,072 | 23,576 | 2,456 | 1,024 |
+| pb03f-zigbee | 24,256 | 22,944 | 2,152 | 728 |
+| phy6222-sensor | 24,312 | 22,912 | 1,984 | 728 |
+| phy6252-sensor | 24,312 | 22,912 | 1,984 | 728 |
+| tlsr8258-router | 47,424 | 37,376 | 2,992 | 2,192 |
+| tlsr8258-sensor | 30,632 | 30,096 | 2,968 | 2,192 |
+| tlsr8258-sensor-retention | 31,864 | 31,328 | 2,968 | 2,192 |
+| tlsr8258-sensor-retention-10s | 31,864 | 31,328 | 2,968 | 2,192 |
+
+The corrected TLSR8258 bounds exceed the linked SVC stacks (16 KiB for the
+default image, 8,448 B for the retained fresh root). The deepest paths are in
+persistence, not the MAC:
+
+- router: `app::run` (12,240 B frame) → `activate_network` →
+  `ApsTableJournal::store` → `ApsTableJournal::current` (13,136 B frame);
+- retained sensor: `cold_run` → `record_failed_rejoin` →
+  `SecurityStateJournal::store` → `ensure_replay_cache`.
+
+These are static direct-call bounds and include paths that may not nest at
+run time. They still need review against runtime stack high-water
+measurements on hardware. The CC2340 bound (24,072 B) fits its 29,244 B
+stack region, and PHY62x2 fits its 54,384 B.
+
+The CC2340 image uses
 the fallback (no SDK) mode, because SDK mode cannot be built locally. The
 PHY62x2 images were measured from the tree at `44d457c`.
 

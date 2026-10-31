@@ -265,6 +265,12 @@ def pools(elf: Path) -> list[tuple[str, int]]:
 FUNC_RE = re.compile(r"^([0-9a-f]+) <(.+)>:$")
 INSN_RE = re.compile(r"^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$")
 TARGET_RE = re.compile(r"(?:\b(?:0x)?([0-9a-f]+)\s+)?<(.+)>\s*$")
+# Literal-pool words and PC-relative literal loads.  Thumb-1 (Cortex-M0+) and
+# TC32 allocate frames too large for an immediate with ``ldr rN, =-size``
+# followed by ``add sp, rN``; the size lives in the function's literal pool.
+WORD_RE = re.compile(r"^\s*([0-9a-f]+):\s+(?:[0-9a-f]{2}\s)+\s*\.word\s+0x([0-9a-f]+)")
+LITERAL_LOAD_RE = re.compile(r"^(ldr|tloadr)$")
+LITERAL_ADDR_RE = re.compile(r"\[pc,[^\]]*\]\s*@\s*0x([0-9a-f]+)")
 # Thumb / RISC-V / TC32 direct-call mnemonics.  Any other instruction whose
 # operand names the *start* of another function (``<name>`` without ``+0x``)
 # is treated as a tail call.  ``jalr``/``blx``/``tjex`` without a symbolic
@@ -319,6 +325,10 @@ def analyse_stack(elf: Path) -> dict:
     current: Func | None = None
     cur_addr = 0
     prologue = 0
+    words: dict[int, int] = {}
+    literal_regs: dict[str, int] = {}
+    # (function, literal address) for ``add sp, rN`` frame allocations.
+    literal_frames: list[tuple[Func, int]] = []
     disasm = run("llvm-objdump", elf, "-d", "-C", "--no-show-raw-insn")
     for line in disasm.splitlines():
         m = FUNC_RE.match(line)
@@ -327,6 +337,11 @@ def analyse_stack(elf: Path) -> dict:
             current = funcs.setdefault(cur_addr, Func(m.group(2)))
             order.append(cur_addr)
             prologue = 0
+            literal_regs = {}
+            continue
+        m = WORD_RE.match(line)
+        if m:
+            words[int(m.group(1), 16)] = int(m.group(2), 16)
             continue
         if current is None:
             continue
@@ -336,12 +351,22 @@ def analyse_stack(elf: Path) -> dict:
         mnemonic = m.group(2).lower()
         operands = re.split(r"\s(?://|;|@)\s", m.group(3))[0].strip()
         prologue += 1
+        if prologue <= 24 and LITERAL_LOAD_RE.match(mnemonic):
+            literal = LITERAL_ADDR_RE.search(m.group(3))
+            register = operands.split(",")[0].strip()
+            if literal:
+                literal_regs[register] = int(literal.group(1), 16)
         if prologue <= 24:
             if mnemonic in ("push", "push.w", "tpush") or \
                     (mnemonic == "stmdb" and operands.strip().startswith("sp!")):
                 current.frame += 4 * _reg_count(operands)
             elif mnemonic in ("vpush", "vpush.64"):
                 current.frame += 8 * _reg_count(operands)
+            elif mnemonic in ("add", "tadd") and \
+                    re.match(r"^\s*sp\s*,\s*r\d+\s*$", operands) and \
+                    operands.split(",")[1].strip() in literal_regs:
+                literal_frames.append(
+                    (current, literal_regs[operands.split(",")[1].strip()]))
             elif re.match(r"^(sub|subw|sub\.w|tsub|tsubs)$", mnemonic) and \
                     re.match(r"^\s*sp\s*,", operands):
                 value = _imm(operands)
@@ -374,6 +399,13 @@ def analyse_stack(elf: Path) -> dict:
         elif not re.search(r"\+0x[0-9a-f]+$", symbol) and address != cur_addr and \
                 not NOT_BRANCH.match(mnemonic):
             current.tails.add(address)
+
+    for func, address in literal_frames:
+        value = words.get(address, 0)
+        if value & 0x8000_0000:
+            func.frame += (1 << 32) - value
+        else:
+            func.dynamic = True
 
     starts = sorted(funcs)
     by_name = {f.name: a for a, f in funcs.items()}
