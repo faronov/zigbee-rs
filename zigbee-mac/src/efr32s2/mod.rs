@@ -16,16 +16,20 @@
 //! - **RX** — polled from the executor (`yield_now`) inside the receive
 //!   window; the radio has no RX interrupt path yet.
 //!
-//! Validation: on EFR32MG22 (BRD4183A) the HAL is hardware-tested through raw
-//! TX/RX, beacons, CCA/ED and ACK exchange with a ZHA coordinator. The xG21
-//! register tables are not populated yet, so on EFR32MG21
-//! [`Efr32s2RadioPhy::new`] returns [`PhyError::Unsupported`].
+//! Validation: on EFR32MG22 (WSTK + BRD4183A) the sleepy sensor joins ZHA,
+//! is interviewed and reports through this PHY. On EFR32MG21 (Home Assistant
+//! Connect ZBT-1) the HAL is lab-tested: raw TX/RX, beacons, CCA/ED and ACK
+//! exchange with the ZHA coordinator.
+//!
+//! The board/product selects the default `phyTransmitPower` with the const
+//! parameter of [`Efr32s2RadioPhy`] (e.g. a 20 dBm-capable xG21 module that
+//! is certified for less).
 
 use efr32s2_hal::radio::{self, AckFilter, Radio, RadioError, RadioToken};
 use embassy_futures::yield_now;
 use embassy_time::{Duration, Instant, Timer};
 
-use crate::pib::MacPib;
+use crate::pib::{MacPib, PibAttribute, PibValue};
 use crate::{
     AckResult, AckWaitTx, MAX_PHY_FRAME_LEN, MacError, PhyAddressFilter, PhyCapabilities, PhyError,
     PhyRxFrame, PlatformServices, RadioPhy, SoftMacCore,
@@ -35,7 +39,11 @@ use zigbee_types::IeeeAddress;
 const _: () = assert!(radio::MAX_FRAME == MAX_PHY_FRAME_LEN);
 
 /// EFR32 Series 2 radio adapted to [`RadioPhy`].
-pub struct Efr32s2RadioPhy {
+///
+/// `DEFAULT_TX_DBM` is the product's `phyTransmitPower` after construction
+/// and after every MLME-RESET; it must lie in
+/// [`radio::TX_POWER_RANGE_DBM`] (checked at compile time).
+pub struct Efr32s2RadioPhy<const DEFAULT_TX_DBM: i8 = 0> {
     radio: Radio,
     ieee: IeeeAddress,
     rx_on_when_idle: bool,
@@ -47,14 +55,13 @@ pub struct Efr32s2RadioPhy {
 }
 
 /// The EFR32 Series 2 MAC: the shared software MAC over [`Efr32s2RadioPhy`].
-pub type Efr32s2SoftMac = SoftMacCore<Efr32s2RadioPhy>;
+pub type Efr32s2SoftMac<const DEFAULT_TX_DBM: i8 = 0> =
+    SoftMacCore<Efr32s2RadioPhy<DEFAULT_TX_DBM>>;
 
-impl Efr32s2RadioPhy {
+impl<const D: i8> Efr32s2RadioPhy<D> {
     /// Program the 802.15.4 PHY. The HFXO must already be running.
     ///
-    /// Returns [`PhyError::Unsupported`] on a chip without validated radio
-    /// tables (xG21 today) and [`PhyError::Hardware`] if the radio does not
-    /// come up.
+    /// Returns [`PhyError::Hardware`] if the radio does not come up.
     pub fn new(token: RadioToken) -> Result<Self, PhyError> {
         let radio = token.init().map_err(map_radio_error)?;
         Ok(Self {
@@ -74,8 +81,16 @@ impl Efr32s2RadioPhy {
     /// Wrap in the shared software MAC. Kept out of line so the PHY and the
     /// MAC are not both live in the caller's frame.
     #[inline(never)]
-    pub fn into_soft_mac(self) -> Result<Efr32s2SoftMac, MacError> {
-        let pib = MacPib::new(self.ieee, 0, 0);
+    pub fn into_soft_mac(self) -> Result<Efr32s2SoftMac<D>, MacError> {
+        const {
+            assert!(
+                D >= radio::TX_POWER_RANGE_DBM.0 && D <= radio::TX_POWER_RANGE_DBM.1,
+                "default TX power outside the chip's PA range"
+            )
+        };
+        let mut pib = MacPib::new(self.ieee, 0, 0);
+        pib.set(PibAttribute::PhyTransmitPower, PibValue::I8(D))
+            .map_err(|_| MacError::InvalidParameter)?;
         SoftMacCore::new(self, pib)
     }
 
@@ -119,8 +134,12 @@ impl Efr32s2RadioPhy {
     }
 }
 
-impl RadioPhy for Efr32s2RadioPhy {
+impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
     type Tx = AckWaitTx;
+
+    /// Board-selected `phyTransmitPower` after construction and every
+    /// MLME-RESET (the HAL itself powers up at 0 dBm).
+    const DEFAULT_TX_POWER_DBM: i8 = D;
 
     /// EmberZNet parents may hold the indirect frame behind other traffic;
     /// same value as the hardware-proven nRF and PHY62x2 backends.
@@ -260,9 +279,9 @@ impl RadioPhy for Efr32s2RadioPhy {
 }
 
 /// Software AES: no EFR32 Series 2 crypto engine backend yet.
-impl zigbee_crypto::ForwardAesProvider for Efr32s2RadioPhy {}
+impl<const D: i8> zigbee_crypto::ForwardAesProvider for Efr32s2RadioPhy<D> {}
 
-impl PlatformServices for Efr32s2RadioPhy {
+impl<const D: i8> PlatformServices for Efr32s2RadioPhy<D> {
     fn monotonic_micros(&self) -> u32 {
         Instant::now().as_micros() as u32
     }
