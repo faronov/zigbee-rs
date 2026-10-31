@@ -130,7 +130,7 @@ pub(super) const EVENT_OP_ERROR: u32 = 1 << 15;
 pub(super) const EVENT_TERMINAL: u32 = EVENT_OP_DONE | EVENT_OP_ERROR;
 
 const MAX_FIFO_ENTRY_WORDS: usize = 36;
-const MAX_FIFO_ENTRY_BYTES: usize = MAX_FIFO_ENTRY_WORDS * 4;
+pub(super) const MAX_FIFO_ENTRY_BYTES: usize = MAX_FIFO_ENTRY_WORDS * 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FifoError {
@@ -139,7 +139,7 @@ pub(super) enum FifoError {
     MalformedEntry,
     MetadataMismatch,
     /// The PBE FIFO configuration does not append RSSI, so no per-frame link
-    /// quality can be derived. See [`ReceivedFrame::rssi`].
+    /// quality can be derived. See [`RxMeta::rssi`].
     MissingRssi,
     /// The PBE appended RSSI, but it is TI's "no valid reading" sentinel.
     InvalidRssi,
@@ -149,8 +149,11 @@ pub(super) enum FifoError {
 /// cannot physically measure.
 const RSSI_INVALID: i8 = 127;
 
-pub(super) struct ReceivedFrame {
-    pub data: [u8; MAX_PHY_FRAME_LEN],
+/// Metadata of an RX FIFO entry whose MAC frame [`try_read_rx_frame`] wrote
+/// to the caller's buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RxMeta {
+    /// MAC frame length without PHR and FCS.
     pub len: usize,
     /// Received signal strength in dBm, as appended by the PBE.
     ///
@@ -434,7 +437,14 @@ pub(super) fn write_tx_frame(frame: &[u8]) -> Result<(), FifoError> {
     Ok(())
 }
 
-pub(super) fn try_read_rx_frame() -> Result<Option<ReceivedFrame>, FifoError> {
+/// Consume the oldest complete RX FIFO entry and write its MAC frame
+/// (without PHR and FCS) to `data`, straight from the FIFO.
+///
+/// The entry is released even when it does not decode; `data` is then
+/// unspecified.
+pub(super) fn try_read_rx_frame(
+    data: &mut [u8; MAX_MPDU_LEN],
+) -> Result<Option<RxMeta>, FifoError> {
     let readable = read32(PBE_RXFREADABLE) as usize;
     if readable < 4 {
         return Ok(None);
@@ -457,20 +467,120 @@ pub(super) fn try_read_rx_frame() -> Result<Option<ReceivedFrame>, FifoError> {
         return Ok(None);
     }
 
-    let word_count = byte_count / 4;
-    let mut words = [0u32; MAX_FIFO_ENTRY_WORDS];
-    for (index, word) in words[..word_count].iter_mut().enumerate() {
-        *word = read32(RXF_UNWRAPPED_BASE + fifo_start + read_pointer + index as u32 * 4);
-    }
+    let entry = RXF_UNWRAPPED_BASE + fifo_start + read_pointer;
+    let fifo_config = read16(PBE_IEEE_FIFOCFG);
+    let extra_bytes = read16(PBE_IEEE_EXTRABYTES) as usize;
+    let decoded = decode_rx_entry(
+        |index| (read32(entry + (index & !3) as u32) >> ((index % 4) * 8)) as u8,
+        byte_count,
+        fifo_config,
+        extra_bytes,
+        data,
+    );
 
     let next_pointer = (read_pointer + byte_count as u32) % fifo_size;
     // RCL `LRF_discardRxFifoWords()`: advance RP and SRP together so the
     // consumed space is released and the FIFO stays deallocated.
     write_fifo_pointers(PBE_RXFRP, PBE_RXFSRP, next_pointer);
+    decoded.map(Some)
+}
 
-    let fifo_config = read16(PBE_IEEE_FIFOCFG);
-    let extra_bytes = read16(PBE_IEEE_EXTRABYTES) as usize;
-    decode_rx_entry(&words[..word_count], fifo_config, extra_bytes).map(Some)
+/// Leading MAC frame bytes [`peek_rx_head`] returns: frame control, sequence
+/// number, destination PAN and destination short address.
+pub(super) const RX_HEAD_PREFIX_LEN: usize = 7;
+/// Entry words [`peek_rx_head`] reads; covers the prefix for `num_pad <= 4`.
+const RX_HEAD_WORDS: usize = 4;
+
+/// The oldest complete RX FIFO entry, inspected without consuming it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RxHead {
+    /// FIFO bytes the entry occupies.
+    byte_count: u32,
+    prefix: [u8; RX_HEAD_PREFIX_LEN],
+    prefix_len: u8,
+}
+
+impl RxHead {
+    /// The first (at most [`RX_HEAD_PREFIX_LEN`]) MAC frame bytes.
+    pub fn prefix(&self) -> &[u8] {
+        &self.prefix[..usize::from(self.prefix_len)]
+    }
+}
+
+/// Free RX FIFO bytes; `None` when the FIFO is not configured.
+pub(super) fn rx_free_bytes() -> Option<usize> {
+    let fifo_size = ((read32(PBE_FCFG4) & FCFG_SIZE_MASK) << 2) as usize;
+    if fifo_size == 0 {
+        return None;
+    }
+    Some(fifo_size.saturating_sub(read32(PBE_RXFREADABLE) as usize))
+}
+
+/// Inspect the oldest committed RX FIFO entry without consuming it.
+///
+/// `None` when no complete entry is committed, or when the entry is not a
+/// well-formed frame; [`try_read_rx_frame`] then consumes and classifies it.
+pub(super) fn peek_rx_head() -> Option<RxHead> {
+    let readable = read32(PBE_RXFREADABLE) as usize;
+    if readable < 4 {
+        return None;
+    }
+    let fifo_start = (read32(PBE_FCFG3) & FCFG_START_MASK) << 2;
+    let fifo_size = (read32(PBE_FCFG4) & FCFG_SIZE_MASK) << 2;
+    let read_pointer = read32(PBE_RXFRP) & !3;
+    if fifo_size == 0 {
+        return None;
+    }
+
+    let first_word = read32(BUFRAM_BASE + fifo_start + read_pointer);
+    let byte_count = padded_entry_len((first_word & 0xFFFF) as usize);
+    if byte_count > MAX_FIFO_ENTRY_BYTES || readable < byte_count {
+        return None;
+    }
+    let mut words = [0u32; RX_HEAD_WORDS];
+    let word_count = (byte_count / 4).min(RX_HEAD_WORDS);
+    for (index, word) in words[..word_count].iter_mut().enumerate() {
+        *word = read32(RXF_UNWRAPPED_BASE + fifo_start + read_pointer + index as u32 * 4);
+    }
+    decode_rx_head(&words[..word_count], byte_count)
+}
+
+/// Release the entry [`peek_rx_head`] returned, without reading it.
+pub(super) fn discard_rx_head(head: &RxHead) {
+    let fifo_size = (read32(PBE_FCFG4) & FCFG_SIZE_MASK) << 2;
+    if fifo_size == 0 {
+        return;
+    }
+    let read_pointer = read32(PBE_RXFRP) & !3;
+    let next_pointer = (read_pointer + head.byte_count) % fifo_size;
+    // Same release as `try_read_rx_frame`.
+    write_fifo_pointers(PBE_RXFRP, PBE_RXFSRP, next_pointer);
+}
+
+/// Decode the frame prefix of an RX entry; `words` holds its first words.
+fn decode_rx_head(words: &[u32], byte_count: usize) -> Option<RxHead> {
+    let entry_bytes = (words.len() * 4).min(byte_count);
+    let packet_start = 3 + usize::from(entry_byte(words, 2));
+    if packet_start >= entry_bytes {
+        return None;
+    }
+    let phy_length = usize::from(entry_byte(words, packet_start));
+    if !(2..=MAX_PHY_FRAME_LEN).contains(&phy_length) {
+        return None;
+    }
+    let prefix_len = (phy_length - 2).min(RX_HEAD_PREFIX_LEN);
+    if packet_start + 1 + prefix_len > entry_bytes {
+        return None;
+    }
+    let mut prefix = [0u8; RX_HEAD_PREFIX_LEN];
+    for (index, byte) in prefix[..prefix_len].iter_mut().enumerate() {
+        *byte = entry_byte(words, packet_start + 1 + index);
+    }
+    Some(RxHead {
+        byte_count: byte_count as u32,
+        prefix,
+        prefix_len: prefix_len as u8,
+    })
 }
 
 fn encode_tx_entry(frame: &[u8], words: &mut [u32]) -> Result<usize, FifoError> {
@@ -497,18 +607,22 @@ fn encode_tx_entry(frame: &[u8], words: &mut [u32]) -> Result<usize, FifoError> 
     Ok(word_count)
 }
 
+/// Decode an RX FIFO entry of `entry_bytes` readable bytes, given byte by
+/// byte by `byte`, and write its MAC frame to `data`.
 fn decode_rx_entry(
-    words: &[u32],
+    byte: impl Fn(usize) -> u8,
+    entry_bytes: usize,
     fifo_config: u16,
     extra_bytes: usize,
-) -> Result<ReceivedFrame, FifoError> {
-    if words.is_empty() {
+    data: &mut [u8; MAX_MPDU_LEN],
+) -> Result<RxMeta, FifoError> {
+    if entry_bytes < 4 {
         return Err(FifoError::MalformedEntry);
     }
 
-    let entry_length = entry_byte(words, 0) as usize | ((entry_byte(words, 1) as usize) << 8);
+    let entry_length = byte(0) as usize | ((byte(1) as usize) << 8);
     let byte_count = padded_entry_len(entry_length);
-    if byte_count > words.len() * 4 || entry_length < 2 {
+    if byte_count > entry_bytes || entry_length < 2 {
         return Err(FifoError::MalformedEntry);
     }
 
@@ -517,7 +631,7 @@ fn decode_rx_entry(
         return Err(FifoError::MetadataMismatch);
     }
 
-    let num_pad = entry_byte(words, 2) as usize;
+    let num_pad = byte(2) as usize;
     let packet_start = 3usize
         .checked_add(num_pad)
         .ok_or(FifoError::MalformedEntry)?;
@@ -526,7 +640,7 @@ fn decode_rx_entry(
         return Err(FifoError::MalformedEntry);
     }
 
-    let phy_length = entry_byte(words, packet_start) as usize;
+    let phy_length = byte(packet_start) as usize;
     if !(2..=MAX_PHY_FRAME_LEN).contains(&phy_length) {
         return Err(FifoError::MalformedEntry);
     }
@@ -539,9 +653,8 @@ fn decode_rx_entry(
         return Err(FifoError::MalformedEntry);
     }
 
-    let mut data = [0u8; MAX_PHY_FRAME_LEN];
-    for (index, byte) in data[..frame_length].iter_mut().enumerate() {
-        *byte = entry_byte(words, frame_start + index);
+    for (index, out) in data[..frame_length].iter_mut().enumerate() {
+        *out = byte(frame_start + index);
     }
 
     let mut metadata_offset = metadata_start;
@@ -554,7 +667,7 @@ fn decode_rx_entry(
     // Raw modem estimate: consumed only to keep the metadata offset aligned and
     // to expose as diagnostics. Never used as the stack's LQI.
     let modem_lqi = if fifo_config & FIFOCFG_APPEND_LQI != 0 {
-        let value = entry_byte(words, metadata_offset);
+        let value = byte(metadata_offset);
         metadata_offset += 1;
         Some(value)
     } else {
@@ -566,13 +679,12 @@ fn decode_rx_entry(
         // bad link and would poison NWK link cost and parent selection.
         return Err(FifoError::MissingRssi);
     }
-    let rssi = entry_byte(words, metadata_offset) as i8;
+    let rssi = byte(metadata_offset) as i8;
     if rssi == RSSI_INVALID {
         return Err(FifoError::InvalidRssi);
     }
 
-    Ok(ReceivedFrame {
-        data,
+    Ok(RxMeta {
         len: frame_length,
         rssi,
         modem_lqi,
@@ -672,6 +784,31 @@ mod tests {
     const TEST_FIFO_CONFIG: u16 =
         FIFOCFG_APPEND_LQI | FIFOCFG_APPEND_RSSI | FIFOCFG_APPEND_TIMESTAMP;
 
+    struct Decoded {
+        data: [u8; MAX_MPDU_LEN],
+        len: usize,
+        rssi: i8,
+        modem_lqi: Option<u8>,
+    }
+
+    /// [`decode_rx_entry`] over a word buffer, as the FIFO window is read.
+    fn decode(words: &[u32], fifo_config: u16, extra_bytes: usize) -> Result<Decoded, FifoError> {
+        let mut data = [0u8; MAX_MPDU_LEN];
+        let meta = decode_rx_entry(
+            |index| entry_byte(words, index),
+            words.len() * 4,
+            fifo_config,
+            extra_bytes,
+            &mut data,
+        )?;
+        Ok(Decoded {
+            data,
+            len: meta.len,
+            rssi: meta.rssi,
+            modem_lqi: meta.modem_lqi,
+        })
+    }
+
     /// Build an RX FIFO entry for `frame` with `metadata` appended verbatim.
     fn rx_entry(frame: &[u8], metadata: &[u8]) -> ([u32; MAX_FIFO_ENTRY_WORDS], usize) {
         let entry_length = 1 + 1 + frame.len() + metadata.len();
@@ -720,13 +857,43 @@ mod tests {
         let metadata = [201, (-42i8) as u8, 0x11, 0x22, 0x33, 0x44];
         let (words, word_count) = rx_entry(&frame, &metadata);
 
-        let decoded = decode_rx_entry(&words[..word_count], TEST_FIFO_CONFIG, metadata.len())
+        let decoded = decode(&words[..word_count], TEST_FIFO_CONFIG, metadata.len())
             .expect("entry with LQI, RSSI and timestamp should decode");
 
         assert_eq!(decoded.len, frame.len());
         assert_eq!(&decoded.data[..decoded.len], &frame);
         assert_eq!(decoded.rssi, -42);
         assert_eq!(decoded.modem_lqi, Some(201));
+    }
+
+    #[test]
+    fn rx_head_exposes_frame_prefix_without_metadata() {
+        let metadata = [201, (-42i8) as u8, 0x11, 0x22, 0x33, 0x44];
+
+        // Immediate ACK: three frame bytes, all of them in the prefix.
+        let (words, word_count) = rx_entry(&[0x12, 0x00, 0x42], &metadata);
+        let head = decode_rx_head(&words[..word_count.min(RX_HEAD_WORDS)], word_count * 4)
+            .expect("ACK entry");
+        assert_eq!(head.prefix(), &[0x12, 0x00, 0x42]);
+        assert_eq!(head.byte_count as usize, word_count * 4);
+
+        // Data frame: only the addressing prefix is copied.
+        let frame = [0x41, 0x88, 0x07, 0x34, 0x12, 0xFF, 0xFF, 0x00, 0x00, 0xAA];
+        let (words, word_count) = rx_entry(&frame, &metadata);
+        let head = decode_rx_head(&words[..RX_HEAD_WORDS], word_count * 4).expect("data entry");
+        assert_eq!(head.prefix(), &frame[..RX_HEAD_PREFIX_LEN]);
+        assert_eq!(head.byte_count as usize, word_count * 4);
+    }
+
+    #[test]
+    fn rx_head_rejects_malformed_entries() {
+        let (mut words, word_count) = rx_entry(&[0x12, 0x00, 0x42], &[0, 0]);
+        set_entry_byte(&mut words, 3, 1); // PHY length below the FCS size
+        assert_eq!(decode_rx_head(&words[..word_count], word_count * 4), None);
+
+        let (mut words, word_count) = rx_entry(&[0x12, 0x00, 0x42], &[0, 0]);
+        set_entry_byte(&mut words, 2, 40); // padding beyond the entry
+        assert_eq!(decode_rx_head(&words[..word_count], word_count * 4), None);
     }
 
     /// Metadata is positioned by FIFO configuration order, not by luck: with
@@ -743,7 +910,7 @@ mod tests {
         let metadata = [0x5A, 0x99, (-70i8) as u8, 0xDE, 0xAD, 0xBE, 0xEF];
         let (words, word_count) = rx_entry(&frame, &metadata);
 
-        let decoded = decode_rx_entry(&words[..word_count], CONFIG, metadata.len())
+        let decoded = decode(&words[..word_count], CONFIG, metadata.len())
             .expect("status/LQI/RSSI/timestamp entry should decode");
 
         assert_eq!(&decoded.data[..decoded.len], &frame);
@@ -762,7 +929,7 @@ mod tests {
         let metadata = [(-55i8) as u8, 0x11, 0x22, 0x33, 0x44];
         let (words, word_count) = rx_entry(&frame, &metadata);
 
-        let decoded = decode_rx_entry(&words[..word_count], CONFIG, metadata.len())
+        let decoded = decode(&words[..word_count], CONFIG, metadata.len())
             .expect("RSSI alone must be sufficient to decode a frame");
 
         assert_eq!(&decoded.data[..decoded.len], &frame);
@@ -787,7 +954,7 @@ mod tests {
         let (words, word_count) = rx_entry(&frame, &metadata);
 
         assert_eq!(
-            decode_rx_entry(&words[..word_count], CONFIG, metadata.len()).err(),
+            decode(&words[..word_count], CONFIG, metadata.len()).err(),
             Some(FifoError::MissingRssi)
         );
     }
@@ -799,7 +966,7 @@ mod tests {
         let (words, word_count) = rx_entry(&frame, &metadata);
 
         assert_eq!(
-            decode_rx_entry(&words[..word_count], TEST_FIFO_CONFIG, metadata.len()).err(),
+            decode(&words[..word_count], TEST_FIFO_CONFIG, metadata.len()).err(),
             Some(FifoError::InvalidRssi)
         );
     }
@@ -814,7 +981,7 @@ mod tests {
         let metadata = [0xFF, (-90i8) as u8, 0x00, 0x00, 0x00, 0x00];
         let (words, word_count) = rx_entry(&frame, &metadata);
 
-        let decoded = decode_rx_entry(&words[..word_count], TEST_FIFO_CONFIG, metadata.len())
+        let decoded = decode(&words[..word_count], TEST_FIFO_CONFIG, metadata.len())
             .expect("entry should decode");
         let stack_lqi = crate::lqi::from_rssi_dbm(decoded.rssi);
 
@@ -830,7 +997,7 @@ mod tests {
         // indistinguishable to the stack.
         let (other_words, other_count) =
             rx_entry(&frame, &[0x00, (-90i8) as u8, 0x00, 0x00, 0x00, 0x00]);
-        let other = decode_rx_entry(&other_words[..other_count], TEST_FIFO_CONFIG, 6).unwrap();
+        let other = decode(&other_words[..other_count], TEST_FIFO_CONFIG, 6).unwrap();
         assert_eq!(other.modem_lqi, Some(0x00));
         assert_eq!(crate::lqi::from_rssi_dbm(other.rssi), stack_lqi);
     }
@@ -839,7 +1006,7 @@ mod tests {
     fn rejects_inconsistent_metadata_configuration() {
         let words = [0x0005_0003, 0];
         assert_eq!(
-            decode_rx_entry(&words, TEST_FIFO_CONFIG, 2).err(),
+            decode(&words, TEST_FIFO_CONFIG, 2).err(),
             Some(FifoError::MetadataMismatch)
         );
     }

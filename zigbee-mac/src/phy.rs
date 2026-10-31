@@ -180,6 +180,12 @@ pub trait RadioPhy {
     /// opt-in per backend.
     const POLL_EXTENDED_FALLBACK: bool = false;
 
+    /// `phyTransmitPower` (dBm) that an `MLME-RESET` with default PIB
+    /// restores. The IEEE default is 0 dBm; a backend whose product range
+    /// was characterised at a different default overrides it. The value
+    /// must be inside the PHY's advertised TX power range.
+    const DEFAULT_TX_POWER_DBM: i8 = 0;
+
     /// Return the optional hardware features implemented by this PHY.
     fn capabilities(&self) -> PhyCapabilities;
 

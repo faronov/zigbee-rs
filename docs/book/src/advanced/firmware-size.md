@@ -597,6 +597,44 @@ deltas are also its deltas against the legacy MAC. `tools/mac-footprint-baseline
 carries these rows. The shared-core router is build-, layout- and
 symbol-checked only.
 
+### Phase B: CC2340R5
+
+`zigbee-mac/src/cc2340` now runs on `SoftMacCore<Cc2340RadioPhy, EndDevice>`
+with `type Tx = AckWaitTx`. The PBE does one CCA, the transmission and the
+Imm-Ack wait; the core keeps the CSMA-CA backoffs and the retries. The
+bespoke `Cc2340Mac` is gone, including its scan, association, poll, CSMA-CA,
+retry and retained-frame code. Received frames are decoded straight from the
+RX FIFO registers into the core's retained-RX slot, with no intermediate
+word buffer.
+
+The composition root builds the PHY, the MAC and the device in a non-inlined
+`build_device`. That cuts the SDK image's Embassy main-task poll frame from
+4,768 B to 1,568 B. `Cc2340RadioPhy::initialize_radio` checks firmware
+availability before the driver's runtime state. This keeps the fallback
+image's unconditional `FirmwareUnavailable` visible to the optimizer, so
+the unreachable 11.8 KB `DEVICE_STORAGE` is still dropped from that image.
+
+Both images were measured with the corrected tool against master `5fc933a`,
+in the same directory. SDK mode used the CI-pinned TI SDK commit
+`68ca021`.
+
+| image | `flash` | `data` | `bss` | `pool` | `stack` | `mac_chain` | `mac_code` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| cc2340-sensor-fallback | 221,224 (-1,924) | 8 (0) | 7,540 (-72) | 5,256 (-72) | 22,448 (-1,624) | 21,704 (-1,288) | 13,792 (+1,034) |
+| cc2340-sensor-sdk | 241,256 (-1,692) | 8 (0) | 19,380 (-120) | 5,256 (-72) | 22,592 (-4,832) | 21,848 (-4,504) | 16,816 (+1,318) |
+
+Notes on the table:
+
+- **SDK `pool`:** on master, the tool reported the main task's
+  `DEVICE_STORAGE` (11,888 B) as the SDK image's pool. Here the delta
+  compares the Embassy main-task pool with itself. `DEVICE_STORAGE` itself
+  fell to 11,824 B.
+- **`mac_code`:** this grows because the generic core paths replace the
+  smaller CC2340-specific MAC. Total flash still falls.
+- **SDK raw binary:** 241,256 B of the 516,096 B application slot.
+- **Validation:** the port is build-, layout- and host-tested only.
+  No CC2340 hardware run has been done with it.
+
 ## Measurement commands
 
 Raw binary:

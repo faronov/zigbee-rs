@@ -30,7 +30,7 @@ use lp_em_cc2340r5 as board;
 use sensor_sed_app::{
     DiagnosticEvent, Diagnostics, NoOta, SensorApp, SensorSedParts, SensorStatus, StatusSink,
 };
-use zigbee_mac::cc2340::{Cc2340Mac, RadioError};
+use zigbee_mac::cc2340::{Cc2340RadioPhy, Cc2340SoftMac, RadioError};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::ApplicationProfile;
@@ -86,62 +86,7 @@ async fn main(_spawner: Spawner) {
     log::info!("[CC2340] guarded factory EUI-64: {:02X?}", ieee);
 
     let mut profile = product::profile::sensor_profile();
-    // Keep the MAC driver in a block that ends before the first `.await`:
-    // a borrowed function-scope local stays in the embassy main-task
-    // future even after it is moved into DEVICE_STORAGE, which would
-    // store a second copy of the driver (including its RX queue) in RAM.
-    let device = {
-        let mut mac = match Cc2340Mac::new(ieee) {
-            Ok(mac) => mac,
-            Err(error) => {
-                log::error!("[CC2340] rejected factory identity: {error:?}");
-                fatal(&mut status);
-            }
-        };
-        log::warn!(
-            "[CC2340] entropy={:?} (fail closed); radio-sleep={:?}",
-            mac.entropy_disposition(),
-            mac.radio_sleep_disposition()
-        );
-
-        if let Err(error) = mac.initialize_radio() {
-            match error {
-                RadioError::FirmwareUnavailable => {
-                    log::error!("[CC2340] radio firmware unavailable (fallback build)");
-                }
-                RadioError::RadioConfigUnavailable => {
-                    log::error!("[CC2340] PHY/board radio configuration unavailable (partial SDK)");
-                }
-                _ => log::error!("[CC2340] radio initialization failed: {error:?}"),
-            }
-            fatal(&mut status);
-        }
-        log::warn!(
-            "[CC2340] radio initialized; MAC ACK timing and power behavior are not qualified"
-        );
-
-        // Build the device in static storage: by-value `build()` needs a ~22 KB
-        // `assemble` frame, larger than this part's whole stack.
-        static mut DEVICE_STORAGE: MaybeUninit<ZigbeeDevice<Cc2340Mac>> = MaybeUninit::uninit();
-        ZigbeeDevice::builder(mac)
-            .power_mode(product::policy::SENSOR_POLICY.power_mode())
-            .automatic_polling(false)
-            .manufacturer(product::MANUFACTURER)
-            .model(product::MODEL)
-            .date_code(product::DATE_CODE)
-            .sw_build(product::SW_BUILD)
-            .power_source(PowerSource::Battery)
-            .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-            .endpoint(
-                profile.endpoint(),
-                profile.profile_id(),
-                profile.device_id(),
-                |endpoint| profile.configure_endpoint(endpoint),
-            )
-            // SAFETY: the embassy main task runs once, so this is the only
-            // reference ever taken to DEVICE_STORAGE.
-            .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) })
-    };
+    let device = build_device(ieee, &mut profile, &mut status);
 
     let mut security_store = product::storage::security_store(flash);
     log::info!(
@@ -186,6 +131,74 @@ async fn main(_spawner: Spawner) {
     .expect("CC2340 SensorApp requires manual runtime polling and a valid policy");
 
     app.run().await
+}
+
+/// Bring up the radio and build the MAC and the device in static storage.
+///
+/// Not inlined, so that the PHY, the MAC constructor's `Result` and the
+/// builder stay out of the embassy main-task future, which is live under
+/// every later call.
+#[inline(never)]
+fn build_device(
+    ieee: zigbee_types::IeeeAddress,
+    profile: &mut product::profile::SensorProfile,
+    status: &mut platform::StatusLeds,
+) -> &'static mut ZigbeeDevice<Cc2340SoftMac> {
+    let mut phy = match Cc2340RadioPhy::new(ieee) {
+        Ok(phy) => phy,
+        Err(error) => {
+            log::error!("[CC2340] rejected factory identity: {error:?}");
+            fatal(status);
+        }
+    };
+    log::warn!(
+        "[CC2340] entropy={:?} (fail closed); radio-sleep={:?}",
+        phy.entropy_disposition(),
+        phy.radio_sleep_disposition()
+    );
+
+    if let Err(error) = phy.initialize_radio() {
+        match error {
+            RadioError::FirmwareUnavailable => {
+                log::error!("[CC2340] radio firmware unavailable (fallback build)");
+            }
+            RadioError::RadioConfigUnavailable => {
+                log::error!("[CC2340] PHY/board radio configuration unavailable (partial SDK)");
+            }
+            _ => log::error!("[CC2340] radio initialization failed: {error:?}"),
+        }
+        fatal(status);
+    }
+    log::warn!("[CC2340] radio initialized; MAC ACK timing and power behavior are not qualified");
+    let mac = match phy.into_soft_mac() {
+        Ok(mac) => mac,
+        Err(error) => {
+            log::error!("[CC2340] MAC construction failed: {error:?}");
+            fatal(status);
+        }
+    };
+
+    // Build the device in static storage: by-value `build()` needs a ~22 KB
+    // `assemble` frame, larger than this part's whole stack.
+    static mut DEVICE_STORAGE: MaybeUninit<ZigbeeDevice<Cc2340SoftMac>> = MaybeUninit::uninit();
+    ZigbeeDevice::builder(mac)
+        .power_mode(product::policy::SENSOR_POLICY.power_mode())
+        .automatic_polling(false)
+        .manufacturer(product::MANUFACTURER)
+        .model(product::MODEL)
+        .date_code(product::DATE_CODE)
+        .sw_build(product::SW_BUILD)
+        .power_source(PowerSource::Battery)
+        .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        // SAFETY: `main` calls this once, so this is the only reference ever
+        // taken to DEVICE_STORAGE.
+        .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) })
 }
 
 fn fatal(status: &mut platform::StatusLeds) -> ! {

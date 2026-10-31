@@ -16,7 +16,8 @@ use sensor_sed_app::{
     DiagnosticEvent, Diagnostics, SensorStatus, SleepDepth, StatusSink, Supervisor, WaitRequest,
     WakeController, WakeReason,
 };
-use zigbee_mac::cc2340::{Cc2340Mac, RadioError};
+use zigbee_mac::MacError;
+use zigbee_mac::cc2340::{Cc2340SoftMac, RadioError};
 
 /// A press edge counts only if the button is still down this long after it
 /// (contact bounce and release glitches must not trigger BTN1's
@@ -31,11 +32,18 @@ const STANDBY_LOG_EVERY: u32 = 30;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitError {
     Radio(RadioError),
+    Mac(MacError),
 }
 
 impl From<RadioError> for WaitError {
     fn from(error: RadioError) -> Self {
         Self::Radio(error)
+    }
+}
+
+impl From<MacError> for WaitError {
+    fn from(error: MacError) -> Self {
+        Self::Mac(error)
     }
 }
 
@@ -155,7 +163,7 @@ impl LaunchPadWake {
     }
 }
 
-impl WakeController<Cc2340Mac> for LaunchPadWake {
+impl WakeController<Cc2340SoftMac> for LaunchPadWake {
     type Mark = Instant;
     type Error = WaitError;
 
@@ -176,12 +184,12 @@ impl WakeController<Cc2340Mac> for LaunchPadWake {
 
     async fn wait(
         &mut self,
-        mac: &mut Cc2340Mac,
+        mac: &mut Cc2340SoftMac,
         request: WaitRequest,
     ) -> Result<WakeReason, Self::Error> {
         match request.sleep_depth {
             SleepDepth::Active => {
-                mac.prepare_active_wait()?;
+                mac.phy_mut().prepare_active_wait()?;
                 let (reason, _) = self
                     .timer_or_button(request.timeout_ms, request.sleep_depth, false)
                     .await;
@@ -191,32 +199,32 @@ impl WakeController<Cc2340Mac> for LaunchPadWake {
                 // Radio cores/refsys off and LRFD clocks gated; CPU in WFE
                 // with no periodic tick; HFXT stopped (CPU/SYSTIM on HFOSC).
                 // This is not standby: the HF clock tree stays up.
-                mac.radio_sleep()?;
+                mac.sleep()?;
                 let (reason, _) = self
                     .timer_or_button(request.timeout_ms, request.sleep_depth, false)
                     .await;
                 // Eager restore, so a restore failure is reported here rather
                 // than as a failed poll.
-                mac.radio_wake()?;
+                mac.wake()?;
                 Ok(reason)
             }
             SleepDepth::Retention => {
                 // Idle radio power-down, then device standby between events
                 // (`RadioSleepDisposition::StandbyCapable`). Standby is only
-                // attempted with the radio actually asleep: it powers the
-                // LRFD domain off.
-                mac.radio_sleep()?;
-                let allow_standby = mac.radio_is_asleep();
+                // attempted with the radio actually asleep and no received
+                // frame held in its RX FIFO: it powers the LRFD domain off.
+                mac.sleep()?;
+                let allow_standby = mac.phy().is_asleep() && !mac.phy().holds_received_frame();
                 let (reason, entered) = self
                     .timer_or_button(request.timeout_ms, request.sleep_depth, allow_standby)
                     .await;
-                if entered && !mac.radio_note_standby() {
+                if entered && !mac.phy_mut().note_standby() {
                     log::error!("[CC2340] standby entered without a sleeping radio");
                 }
                 self.log_standby();
                 // Full radio re-init after standby (or the plain clock
                 // restore otherwise), eagerly so failures surface here.
-                mac.radio_wake()?;
+                mac.wake()?;
                 Ok(reason)
             }
         }

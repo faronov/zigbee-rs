@@ -36,7 +36,8 @@ Production status:
 | PHY6222/PHY6252 | yes, via `Phy6222SoftMac` (ISR Imm-Ack, `type Tx = AckWaitTx`) | hardware-tested on the PB-03F-Kit (PHY6252) with the previous `RadioPhy` API; the `type Tx`/in-place `receive` port is build- and layout-checked only; EVK images build/layout only |
 | TLSR8258 sensors | yes, `TelinkMac` = `SoftMacCore<TelinkRadioPhy, EndDevice>` (`type Tx = FullTx`) | see the Telink platform guide; the `type Tx`/in-place `receive` port is build- and gate-checked only |
 | TLSR8258 router | yes, `TelinkRouterMac` = `SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>` | build-, layout- and symbol-checked only; the replaced hand-written router MAC was hardware-tested, the shared parent path is not yet |
-| CC2340, EFR32MG1, EFR32MG21, ESP32-C6/H2 | no, each has its own `MacDriver` | — |
+| CC2340R5 | yes, via `Cc2340SoftMac` (PBE CCA + TX + Imm-Ack wait, `type Tx = AckWaitTx`; RX decoded from the FIFO into the retained-RX slot) | build-, layout- and host-tested only; no hardware run since the migration |
+| EFR32MG1, EFR32MG21, ESP32-C6/H2 | no, each has its own `MacDriver` | — |
 
 The last group is the remaining Phase B work. The TLSR8258 router is the
 first shipped image on the core's parent role. Its `PENDING` capacity is 0:
@@ -109,8 +110,8 @@ that path needs.
 | `type Tx =` | the PHY implements | the core keeps |
 |---|---|---|
 | `zigbee_mac::SoftwareTx` | `try_transmit` (one CCA + TX) and `send_ack` | CSMA-CA, ACK wait, retries |
-| `zigbee_mac::AckWaitTx` | `try_transmit_acknowledged(frame)`: one CCA + TX + Imm-Ack wait in the ISR or radio core. Returns `Ok(Some(ack))`, `Ok(None)` when no ACK arrived, or `ChannelBusy`. Used by EFR32 and PHY62x2. | CSMA-CA backoffs, retries |
-| `zigbee_mac::FullTx` | `transmit_offloaded(frame, ack_requested, TxParams)`: the complete CSMA-CA, ACK wait and retry sequence. `TxParams` carries `macMaxCSMABackoffs`, `macMinBE`, `macMaxBE` and `macMaxFrameRetries`. Used by CC2340 PBE, ESP and TLSR8258. | nothing |
+| `zigbee_mac::AckWaitTx` | `try_transmit_acknowledged(frame)`: one CCA + TX + Imm-Ack wait in the ISR or radio core. Returns `Ok(Some(ack))`, `Ok(None)` when no ACK arrived, or `ChannelBusy`. Used by EFR32, PHY62x2 and CC2340 (PBE). | CSMA-CA backoffs, retries |
+| `zigbee_mac::FullTx` | `transmit_offloaded(frame, ack_requested, TxParams)`: the complete CSMA-CA, ACK wait and retry sequence. `TxParams` carries `macMaxCSMABackoffs`, `macMinBE`, `macMaxBE` and `macMaxFrameRetries`. Used by ESP and TLSR8258. | nothing |
 
 The unused methods keep their `Unsupported` defaults.
 
@@ -118,6 +119,7 @@ The unused methods keep their `Unsupported` defaults.
 |---|---|---|
 | `const POLL_RESPONSE_WAIT_US` | 30 ms | How long to wait for indirect data after an ACK with FP=1. nRF uses 1.5 s, the value proven on hardware with the legacy MAC. |
 | `const POLL_EXTENDED_FALLBACK` | `false` | Retry an empty short-source poll once with the EUI-64. EmberZNet parents queue a Rejoin Response or Transport-Key by EUI-64. |
+| `const DEFAULT_TX_POWER_DBM` | `0` | The `phyTransmitPower` that a default-PIB MLME-RESET restores. CC2340 uses its 5 dBm product default. Otherwise NWK's cold-start reset drops the radio to 0 dBm. |
 | `set_ack_frame_pending(src, on)` / `clear_ack_frame_pending()` | `Unsupported` / no-op | A parent with `hardware_auto_ack` must arm FP in the hardware or ISR source-match table. |
 | `sleep()` / `wake()` | `Ok(())` | Radio power-down between polls. `SoftMacCore::wake` re-applies channel, power and filter. |
 | `set_rx_on_when_idle(on)` | no-op | The radio keeps its receiver (or receive IRQ path) armed between operations. Called on `macRxOnWhenIdle` changes and on full reconfiguration after wake. Telink uses it to switch its IRQ-driven RX/ACK path. |

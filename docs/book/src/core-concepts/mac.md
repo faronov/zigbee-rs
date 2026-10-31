@@ -150,7 +150,7 @@ backend is behind a Cargo feature flag:
 | ESP32-C6/H2 | `esp32c6`, `esp32h2` | own `EspMac` | real pure-Rust `esp-radio` End Device backends; prior path evidence exists, current exact images are build/layout-tested |
 | nRF52840/52833 | `nrf52840`, `nrf52833` | `NrfSoftMac` = `SoftMacCore<NrfRadioPhy>` | End Device; build- and host-tested since the move to `SoftMacCore` (legacy `NrfMac` deleted), no hardware run yet |
 | BL702 | `bl702` (+ `hardware-aes-bl702`) | `Bl702SoftMac` = `SoftMacCore<Bl702RadioPhy>` | End Device; XT-ZB1 commissioning, reset/resume, Idle sleep and OTA hardware-tested on one board (legacy lmac154 `Bl702Mac` removed) |
-| CC2340R5 | `cc2340` | own `Cc2340Mac` | single-board radio bring-up, ZHA join, PBE frame filtering and hardware auto-ACK; entropy fails closed |
+| CC2340R5 | `cc2340` | `Cc2340SoftMac` = `SoftMacCore<Cc2340RadioPhy>` | End Device; build- and host-tested since the move to `SoftMacCore` (legacy `Cc2340Mac` deleted). The single-board radio bring-up, ZHA join, PBE frame filtering and hardware auto-ACK evidence predates the move. Entropy fails closed. |
 | TLSR8258 sensors | `tlsr8258` (+ `hardware-aes`) | `TelinkMac` = `SoftMacCore<TelinkRadioPhy>` | End Device; `telink` is a compatibility alias |
 | TLSR8258 router | `tlsr8258` (+ `hardware-aes`) | `TelinkRouterMac` = `SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>` | only production `ParentMacDriver`; advertises router but not coordinator; shared-core image build/layout-checked only |
 | PHY6222/PHY6252 | `phy6222` (+ `phy6222-diag`) | `Phy6222SoftMac` = `SoftMacCore<Phy6222RadioPhy>` | End Device; PB-03F-Kit (PHY6252) join, interview, reporting, resume and SRAM-ISR ACK timing hardware-tested; EVK images build/layout only |
@@ -183,7 +183,7 @@ entropy). Optional behaviour is selected at compile time:
   beacon/orphan/association responses and indirect frame-pending;
 - the retained-RX depth `RX`.
 
-CC2340, EFR32MG1, EFR32MG21 and ESP32-C6/H2 still have their own `MacDriver`
+EFR32MG1, EFR32MG21 and ESP32-C6/H2 still have their own `MacDriver`
 implementations. See [Soft MAC Porting](../advanced/soft-mac-porting.md) for
 the `RadioPhy` contract and port status, and
 [Firmware Size](../advanced/firmware-size.md#mac-unification-footprint-baseline) for the per-image MAC footprint

@@ -1,6 +1,6 @@
 [
 {"image": "bl702-sensor", "flash": 220842, "text": 214346, "data": 0, "bss": 16592, "pool": 16388, "mac_code": 11986, "stack": 20752, "mac_chain": 19104, "mac_stack": 768, "mac_frame": 448},
-{"image": "cc2340-sensor-fallback", "flash": 223000, "text": 192312, "data": 8, "bss": 7612, "pool": 5328, "mac_code": 13242, "stack": 24072, "mac_chain": 23576, "mac_stack": 2456, "mac_frame": 1024},
+{"image": "cc2340-sensor-fallback", "flash": 221224, "text": 190924, "data": 8, "bss": 7540, "pool": 5256, "mac_code": 13792, "stack": 22448, "mac_chain": 21704, "mac_stack": 976, "mac_frame": 504},
 {"image": "efr32mg1-sensor", "flash": 171796, "text": 162828, "data": 0, "bss": 15056, "pool": 6928, "mac_code": 6759, "stack": 27892, "mac_chain": 26156, "mac_stack": 1332, "mac_frame": 584},
 {"image": "efr32mg21-sensor", "flash": 208832, "text": 177048, "data": 0, "bss": 18888, "pool": 11040, "mac_code": 6903, "stack": 25524, "mac_chain": 23612, "mac_stack": 1732, "mac_frame": 1072},
 {"image": "esp32c6-sensor", "flash": 392892, "text": 323484, "data": 3592, "bss": 53476, "pool": 0, "mac_code": 11056, "stack": 30288, "mac_chain": 25456, "mac_stack": 1920, "mac_frame": 576},
