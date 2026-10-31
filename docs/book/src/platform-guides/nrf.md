@@ -37,7 +37,7 @@ SensorSedParts {
     environment,
     battery: NrfBattery::<Battery>::new(saadc),
     ota: NoOta,
-    actions: ForceReportAction,
+    actions: nrf52840_sensor_product::policy::USER_ACTIONS,
     supervisor: NrfSupervisor,
     diagnostics: NrfDiagnostics,
 }
@@ -68,16 +68,19 @@ parent-poll owner.
 
 The default profile uses the on-chip temperature source plus synthetic
 humidity. `sensor-bme280` and `sensor-sht31` select external sensor adapters
-and matching product profile composition.
+and matching product profile composition. The `zigbee-bme280`, `zigbee-sht3x`
+and `zigbee-sensor` crates come from
+[`zigbee-rs-drivers`](https://github.com/faronov/zigbee-rs-drivers) as git
+dependencies pinned by `rev`.
 
 ### UF2 boards
 
-`examples/nrf52840-sensor-uf2` supports:
+`examples/nrf52840-sensor-uf2` supports, one Cargo feature each:
 
-- nice!nano-compatible ProMicro;
-- Makerdiary MDK USB Dongle;
-- Nordic PCA10059;
-- Nordic PCA10056 DK.
+- `board-promicro` (default): nice!nano-compatible ProMicro;
+- `board-mdk`: Makerdiary MDK USB Dongle;
+- `board-nrf-dongle`: Nordic PCA10059;
+- `board-nrf-dk`: Nordic PCA10056 DK.
 
 Each feature selects a board crate and a product linker layout. Preserve the
 resident bootloader/SoftDevice regions and always package ELF → Intel HEX →
@@ -142,9 +145,14 @@ cargo +nightly-2026-03-23 build --release --locked
 
 cd ../nrf52840-router
 cargo +nightly-2026-03-23 build --release --locked
+
+cd ../nrf52840-sensor-uf2
+cargo +nightly-2026-03-23 build --release --locked   # board-promicro
+cargo +nightly-2026-03-23 build --release --locked \
+  --no-default-features --features board-mdk
 ```
 
-Measured release images on 2026-09-06:
+Measured release images on 2026-09-06, before the move to `SoftMacCore`:
 
 | image | bytes | former regression budget |
 |---|---:|---:|
@@ -153,16 +161,21 @@ Measured release images on 2026-09-06:
 | nRF52840 always-on End Device | 210,072 | 253,952 |
 | UF2 ProMicro / MDK / PCA10059 / DK | 222,968 / 222,848 / 224,536 / 224,552 | 237,568 each |
 
-The former budgets are historical comparisons, not enforced thresholds.
+The `SoftMacCore` port reduced sensor flash by 352–724 B and router flash by
+636 B; see the MAC unification section of the
+[firmware-size chapter](../advanced/firmware-size.md). The former budgets are
+historical comparisons, not enforced thresholds.
 CI still measures image bytes and checks physical memory limits, product
 partition symbols, hardware-AES symbols, and role-specific symbol removal.
 
 ## Validation
 
 The exact images above are build/layout-tested. Earlier nRF52840 and nRF52833
-sensor images produced hardware evidence for commissioning,
-interview/reporting, hardware AES, security persistence, and reset/resume; that
-is not a byte-for-byte rerun of the 2026-09-06 images.
+sensor images, running the since-deleted `NrfMac`, produced hardware evidence
+for commissioning, interview/reporting, hardware AES, security persistence, and
+reset/resume. The current `SoftMacCore<NrfRadioPhy>` images (commit
+`786e209`) are build- and host-tested only; no nRF hardware has run them yet,
+so ACK timing, polling, and orphan scan on this path remain a hardware gate.
 
 The nRF52840 always-on End Device compiles and passes role/layout checks. Its
 complete HIL acceptance—commissioning/resume, continuous receive, reset, and

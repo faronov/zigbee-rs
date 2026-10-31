@@ -148,14 +148,16 @@ Host tools remain on Rust `1.94.1`.
 ./scripts/tlsr8258.sh build router
 ```
 
-Production, lab, and radio configurations enable LLVM tail merging. The
+Production and radio-harness configurations enable LLVM tail merging. The
 October 4 rebuild measured **195,688 B** for the default sensor and
 **288,508 B** for the router, cumulative reductions of 32.4% and 33.8% from
 the old `tc32-45` builds. See the
 [tail-merge comparison](../advanced/firmware-size.md#tlsr8258-tail-merging-2026-10-04)
 for both LOW32K variants, the separate compiler-only improvement, and physical
 headroom. No features or physical memory safeguards were removed.
-These new images have not been run on hardware.
+These new images have not been run on hardware. The later move of the sensors
+to `SoftMacCore` cut sensor flash by a further 1,480–1,616 B (see the MAC
+unification section of the firmware-size chapter).
 
 Recorded images (sensor baseline 2026-09-06; router refreshed 2026-09-10).
 Former regression budgets are historical comparisons, no longer enforced:
@@ -192,8 +194,10 @@ The recorded sensor images passed build/layout checks. The refreshed router
 linked with the physical memory assertions and the durable Bind/Unbind path,
 but its build command failed the regression-size gate enforced at the time.
 That artificial gate has since been removed; physical limits and the hardware
-gates below remain. The existing TC32 toolchain was not modified. Earlier TB-04
-images produced hardware evidence for:
+gates below remain. The existing TC32 toolchain was not modified. The
+`SoftMacCore` sensor images (commit `34513de`) are build/symbol-checked only;
+no TB-04 has run them yet. Earlier TB-04 images, all on the hand-written MAC,
+produced hardware evidence for:
 
 - hardware AES KAT, secured commissioning, TCLK exchange, ZHA interview, and
   sustained traffic;
@@ -205,7 +209,9 @@ Remaining gates:
 
 - repeated application-level default SUSPEND acceptance with network/counter
   checks and measured current;
-- LOW32K proof completion using the marker above;
+- the sensors on `SoftMacCore`: join, polling, ACK handling, and reporting on
+  hardware;
+- LOW32K proof completion on the `sensor-retention` images;
 - pad/comparator wake modes;
 - corrected-image first-attempt child admission and complete interview;
 - long-duration router and sleep stability.
