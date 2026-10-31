@@ -130,15 +130,20 @@ variant set:
 | `NotInitialized` | Radio driver has not been initialized |
 | `RxTimeout` | RX timeout — no frame received |
 
-#### ESP32 backend (`esp/driver.rs`)
+#### ESP32 backend (`esp/radio_phy.rs`)
 
-The ESP backend's driver error is named `Error`:
+`EspRadioPhy` reports the shared `PhyError`; `SoftMacCore` maps it to
+`MacError`. `esp_radio::ieee802154::Error` is translated as:
 
-| Variant | Meaning |
-|---------|---------|
-| `Radio(esp_radio::ieee802154::Error)` | Error from the `esp-radio` 802.15.4 driver |
-| `InvalidLength` | Invalid IEEE 802.15.4 frame length |
-| `TransmitTimeout` | Transmission completion timed out |
+| `esp-radio` error | `PhyError` | Meaning |
+|---------|---------|---------|
+| `Busy` | `ChannelBusy` | A previous TX or hardware ACK is still on air; the core backs off again |
+| `Incomplete`, `BadInput` | `FrameTooLong` | Invalid IEEE 802.15.4 frame length |
+| `Sleeping` | `Hardware` | The radio was used without `RadioPhy::wake` |
+
+Energy detection returns `PhyError::Unsupported`. Light-sleep entry is vetoed
+with `SuspendError` while RX-on-when-idle, promiscuous mode or parked frames
+require the radio.
 
 ---
 

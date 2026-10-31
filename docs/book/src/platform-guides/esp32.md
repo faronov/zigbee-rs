@@ -12,7 +12,9 @@ products/esp32-zigbee-devkit (identity, policy, partitions, OTA)
         ↓
 boards/esp32-zigbee-devkit (physical flash resource)
         ↓
-esp-hal + esp-radio + EspMac
+esp-hal + esp-radio + EspRadioPhy
+        ↓
+zigbee-mac SoftMacCore (EspSoftMac)
 ```
 
 The example root owns chip startup, radio resources and button/LED/temperature
@@ -25,6 +27,14 @@ Both targets use the Rust `esp-radio` IEEE 802.15.4 backend, with the existing
 Espressif PHY binaries underneath; the Zigbee stack is not ESP-IDF/ZBOSS.
 Local, version-pinned HAL/radio sources live in `vendor/`; their
 `LOCAL-PATCHES.md` files record provenance and sleep changes.
+
+The MAC is the shared `SoftMacCore` over `EspRadioPhy` (`EspSoftMac`):
+scan, association, polling, CSMA-CA backoff and retries are the common
+implementation. The radio supplies raw TX, hardware auto-ACK with frame-pending
+control and a software Imm-Ack wait (`type Tx = AckWaitTx`; esp-radio has no
+usable CCA/retry engine), and 10 dBm through
+`RadioPhy::DEFAULT_TX_POWER_DBM`. This migration is build-, layout-, symbol-
+and host-tested only; the hardware evidence below predates it.
 
 ## Application parts and policy
 

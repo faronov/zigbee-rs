@@ -53,6 +53,7 @@ use sensor_sed_app::{FixedBattery, SensorApp, SensorSedParts, ToggleJoinAction};
 use static_cell::StaticCell;
 
 use esp32_zigbee_devkit_product as product;
+use zigbee_mac::esp::{EspRadioPhy, EspSoftMac};
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::{ApplicationProfile, BatteryMeasurement};
 use zigbee_runtime::ZigbeeDevice;
@@ -70,7 +71,7 @@ type H2Parts = SensorSedParts<
 >;
 type H2App = SensorApp<
     'static,
-    zigbee_mac::esp::EspMac<'static>,
+    EspSoftMac<'static>,
     product::storage::SecurityStore,
     product::profile::SensorProfile,
     H2Parts,
@@ -88,6 +89,65 @@ impl log::Log for EspLogger {
     fn flush(&self) {}
 }
 static LOGGER: EspLogger = EspLogger;
+
+/// Builds the radio, the MAC and the device outside `main`.
+///
+/// The PHY, the `SoftMacCore` value, its `Result` and the device builder are
+/// temporaries; in the never-returning `main` they would occupy its frame for
+/// the whole run. Here they live in a frame that is popped before
+/// `block_on(app.run())`, and the device goes straight into its `'static`
+/// cell.
+#[inline(never)]
+fn build_device(
+    radio: esp_hal::peripherals::IEEE802154<'static>,
+    aes: esp_hal::peripherals::AES<'static>,
+    profile: &product::profile::SensorProfile,
+) -> &'static mut ZigbeeDevice<EspSoftMac<'static>> {
+    static DEVICE: StaticCell<ZigbeeDevice<EspSoftMac<'static>>> = StaticCell::new();
+
+    let mac = build_mac(radio, aes);
+    // `build_into` assembles the device directly in its static cell instead
+    // of returning a device-sized temporary.
+    ZigbeeDevice::builder(mac)
+        .power_mode(product::policy::SENSOR_POLICY.power_mode())
+        .automatic_polling(false)
+        .manufacturer(product::MANUFACTURER)
+        .model(product::MODEL)
+        .application_version(product::firmware::application_version(FIRMWARE_VERSION))
+        .date_code(product::DATE_CODE)
+        .sw_build(FIRMWARE_VERSION_STR)
+        .power_source(PowerSource::Battery)
+        .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |ep| profile.configure_endpoint(ep),
+        )
+        .build_into(DEVICE.uninit())
+}
+
+/// Bring up the radio and the shared software MAC.
+///
+/// Separate from [`build_device`] so the PHY (and its parked-RX ring) is not
+/// a live temporary while the device is assembled.
+#[inline(never)]
+fn build_mac(
+    radio: esp_hal::peripherals::IEEE802154<'static>,
+    aes: esp_hal::peripherals::AES<'static>,
+) -> EspSoftMac<'static> {
+    let ieee802154 = esp_radio::ieee802154::Ieee802154::new(radio);
+    let mut phy = EspRadioPhy::new(ieee802154, esp_radio::ieee802154::Config::default());
+    phy.install_aes_engine(aes)
+        .expect("ESP32-H2 hardware AES KAT");
+    esp_println::println!("[ESP32-H2] Hardware AES KAT passed");
+    // Panic without formatting the MacError so no extra Debug impl is linked.
+    let Ok(mac) = phy.into_soft_mac() else {
+        panic!("ESP32-H2 radio configuration failed");
+    };
+    esp_println::println!("[ESP32-H2] Radio ready");
+    mac
+}
 
 #[esp_hal::main]
 fn main() -> ! {
@@ -143,15 +203,6 @@ fn main() -> ! {
 
     let temp_sensor = H2TemperatureSensor::new().expect("temp sensor init failed");
 
-    // IEEE 802.15.4 radio
-    let ieee802154 = esp_radio::ieee802154::Ieee802154::new(peripherals.IEEE802154);
-    let config = esp_radio::ieee802154::Config::default();
-    let mut mac = zigbee_mac::esp::EspMac::new(ieee802154, config);
-    mac.install_aes_engine(peripherals.AES)
-        .expect("ESP32-H2 hardware AES KAT");
-    esp_println::println!("[ESP32-H2] Hardware AES KAT passed");
-    esp_println::println!("[ESP32-H2] Radio ready");
-
     // OTA pending verification runs before persistence is opened, so an
     // image that never confirmed resets into the previous slot before it
     // touches the network state again.
@@ -199,24 +250,6 @@ fn main() -> ! {
             });
     esp_println::println!("[ESP32-H2] OTA enabled");
 
-    let device = ZigbeeDevice::builder(mac)
-        .power_mode(product::policy::SENSOR_POLICY.power_mode())
-        .automatic_polling(false)
-        .manufacturer(product::MANUFACTURER)
-        .model(product::MODEL)
-        .application_version(product::firmware::application_version(FIRMWARE_VERSION))
-        .date_code(product::DATE_CODE)
-        .sw_build(FIRMWARE_VERSION_STR)
-        .power_source(PowerSource::Battery)
-        .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(
-            profile.endpoint(),
-            profile.profile_id(),
-            profile.device_id(),
-            |ep| profile.configure_endpoint(ep),
-        )
-        .build();
-
     // `ZigbeeNode` borrows the device, security store and profile for its
     // whole lifetime; giving them `'static` storage (like the EFR32MG1
     // product) keeps that borrow trivially valid across the diverging
@@ -224,12 +257,11 @@ fn main() -> ! {
     // structures the generated entry point.
     static SECURITY: StaticCell<product::storage::SecurityStore> = StaticCell::new();
     static PROFILE: StaticCell<product::profile::SensorProfile> = StaticCell::new();
-    static DEVICE: StaticCell<ZigbeeDevice<zigbee_mac::esp::EspMac<'static>>> = StaticCell::new();
     static APP: StaticCell<H2App> = StaticCell::new();
 
     let security = SECURITY.init(security);
     let profile = PROFILE.init(profile);
-    let device = DEVICE.init(device);
+    let device = build_device(peripherals.IEEE802154, peripherals.AES, profile);
 
     let node = ZigbeeNode::new(device, security, profile);
     let parts = SensorSedParts {

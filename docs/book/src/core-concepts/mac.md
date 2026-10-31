@@ -147,7 +147,7 @@ backend is behind a Cargo feature flag:
 
 | Backend | Feature flag | MAC type | Current validation |
 |---|---|---|---|
-| ESP32-C6/H2 | `esp32c6`, `esp32h2` | own `EspMac` | real pure-Rust `esp-radio` End Device backends; prior path evidence exists, current exact images are build/layout-tested |
+| ESP32-C6/H2 | `esp32c6`, `esp32h2` | `EspSoftMac` = `SoftMacCore<EspRadioPhy>` | End Device; build-, layout- and host-tested since the move to `SoftMacCore` (legacy `EspMac` deleted); earlier commissioning/reporting evidence predates the move |
 | nRF52840/52833 | `nrf52840`, `nrf52833` | `NrfSoftMac` = `SoftMacCore<NrfRadioPhy>` | End Device; build- and host-tested since the move to `SoftMacCore` (legacy `NrfMac` deleted), no hardware run yet |
 | BL702 | `bl702` (+ `hardware-aes-bl702`) | `Bl702SoftMac` = `SoftMacCore<Bl702RadioPhy>` | End Device; XT-ZB1 commissioning, reset/resume, Idle sleep and OTA hardware-tested on one board (legacy lmac154 `Bl702Mac` removed) |
 | CC2340R5 | `cc2340` | `Cc2340SoftMac` = `SoftMacCore<Cc2340RadioPhy>` | End Device; build- and host-tested since the move to `SoftMacCore` (legacy `Cc2340Mac` deleted). The single-board radio bring-up, ZHA join, PBE frame filtering and hardware auto-ACK evidence predates the move. Entropy fails closed. |

@@ -13,7 +13,7 @@ products/esp32-zigbee-devkit
         ↓
 boards/esp32-zigbee-devkit
         ↓
-esp-hal + esp-radio + EspMac
+esp-hal + esp-radio + EspRadioPhy + SoftMacCore
 ```
 
 This uses the real pure-Rust `esp-radio` IEEE 802.15.4 backend, not a

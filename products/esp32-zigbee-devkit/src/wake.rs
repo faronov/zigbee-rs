@@ -31,7 +31,7 @@ mod hardware {
     use embassy_time::{Duration, Instant, Timer};
     use esp_hal::gpio::{Input, WakeConfigError, WakeEvent};
     use sensor_sed_app::{SleepDepth, WaitRequest, WakeController, WakeReason};
-    use zigbee_mac::esp::EspMac;
+    use zigbee_mac::esp::EspSoftMac;
 
     #[derive(Debug)]
     pub enum WakeError {
@@ -41,6 +41,9 @@ mod hardware {
         Hardware(SleepError),
         UnexpectedWake(u32),
         RepeatedRejection(u32),
+        /// Re-applying the radio configuration after wake failed. Carries no
+        /// payload so the `MacError` Debug formatter is not linked again.
+        RadioWake,
     }
 
     /// Owns the button and optional, explicitly selected retained-sleep backend.
@@ -78,7 +81,7 @@ mod hardware {
         cs: critical_section::CriticalSection<'cs>,
         button: &'a mut Input<'button>,
         sleep: &'a mut LightSleep<'button>,
-        mac: &'a mut EspMac<'radio>,
+        mac: &'a mut EspSoftMac<'radio>,
         max_us: u64,
         button_seen: bool,
     }
@@ -95,10 +98,14 @@ mod hardware {
             ) {
                 return Ok(false);
             }
-            match self.mac.try_suspend() {
+            // The radio vetoes unless this is an idle sleepy end device
+            // (`macRxOnWhenIdle` off, not scanning, nothing parked).
+            match self.mac.sleep() {
                 Ok(()) => Ok(true),
-                Err(reason) => {
-                    log::debug!("[ESP sleep] deferred: {:?}", reason);
+                Err(_) => {
+                    // The PHY already logged the veto reason; formatting the
+                    // MacError here would link another Debug copy.
+                    log::debug!("[ESP sleep] deferred by radio");
                     Ok(false)
                 }
             }
@@ -130,8 +137,9 @@ mod hardware {
             self.button_seen |= self.button.is_low();
             let gpio = self.button.wakeup_enable(false, WakeEvent::LowLevel);
             self.button.clear_interrupt();
-            self.mac.resume();
-            gpio.map_err(WakeError::Gpio)
+            let radio = self.mac.wake();
+            gpio.map_err(WakeError::Gpio)?;
+            radio.map_err(|_| WakeError::RadioWake)
         }
     }
 
@@ -145,7 +153,7 @@ mod hardware {
             .bit_is_set()
     }
 
-    impl<'button, 'radio> WakeController<EspMac<'radio>> for SensorWake<'button> {
+    impl<'button, 'radio> WakeController<EspSoftMac<'radio>> for SensorWake<'button> {
         type Mark = Instant;
         type Error = WakeError;
 
@@ -166,7 +174,7 @@ mod hardware {
 
         async fn wait(
             &mut self,
-            mac: &mut EspMac<'radio>,
+            mac: &mut EspSoftMac<'radio>,
             request: WaitRequest,
         ) -> Result<WakeReason, WakeError> {
             if self.button.is_low() {

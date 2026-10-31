@@ -279,8 +279,15 @@ add  sp, rN
 
 The tool originally counted these frames as 0 B. It now reads the literal
 and adds the frame; a non-negative literal marks the frame dynamic. Thumb-2
-(nRF52, EFR32) and RISC-V (BL702, ESP32) use immediates, so their rows are
-unaffected.
+(nRF52, EFR32) uses immediates, so its rows are unaffected.
+
+RISC-V has the same gap and the tool does not yet handle it. A frame larger
+than 2 KiB is built in a register (`lui aN, ..; addi aN, aN, ..;
+sub sp, sp, aN`); the tool marks that `sub` dynamic and counts 0 B. The ESP32
+`stack` and `mac_chain` rows therefore omit the large init frames
+(`main`, `build_device`, `into_soft_mac`) on master and on the branch alike;
+the true values are listed in the ESP32-C6/H2 section below. BL702 has not
+been re-checked.
 
 The corrected rows in `tools/mac-footprint-baseline.json` were raised by the
 under-count. The `stack` and `mac_chain` values in the `44d457c` table below
@@ -634,6 +641,57 @@ Notes on the table:
 - **SDK raw binary:** 241,256 B of the 516,096 B application slot.
 - **Validation:** the port is build-, layout- and host-tested only.
   No CC2340 hardware run has been done with it.
+
+### Phase B: ESP32-C6/H2
+
+`zigbee-mac/src/esp` now runs on `SoftMacCore<EspRadioPhy, EndDevice>`
+(`EspSoftMac`) with `type Tx = AckWaitTx`. esp-radio 0.17 transmits raw
+frames and auto-ACKs received ones, but has no usable CCA or retry engine,
+so the core does the CSMA-CA backoffs and retries, and the PHY waits for the
+Imm-Ack. The bespoke `EspMac` (`esp/driver.rs`) is gone, including its scan,
+association, poll, CSMA-CA, retry code and its copies of `frames.rs` helpers.
+The 10 dBm default uses `RadioPhy::DEFAULT_TX_POWER_DBM`. Light sleep goes
+through `SoftMacCore::sleep`/`wake`.
+
+The stack fix is in the composition roots. A non-inlined `build_mac` builds
+the PHY and the MAC. A non-inlined `build_device` builds the device straight
+into its `StaticCell` with `DeviceBuilder::build_into(DEVICE.uninit())`.
+`build_into` matters most: `DEVICE.init(builder.build())` kept a
+13,960 B device temporary next to the 3,600 B builder in one 23 KB frame.
+
+The first port also grew `.data` by 48–184 B. On ESP the linker places
+`.Lswitch.table` jump tables, used by `Debug` formatting, in `.data`, so
+every new `{:?}` or `expect` on `MacError` costs about 64 B of RAM. The
+port avoids them: `let Ok(..) else { panic!(..) }`, a payload-free
+`WakeError::RadioWake`, and a veto log that does not format the error (the
+PHY already logs the reason).
+
+All four images were measured against master `acd6aa8`, built from an
+equal-length path:
+
+| image | `flash` | `data` | `bss` | `pool` | `stack` | `mac_chain` | `mac_code` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| esp32c6-sensor | 390,516 (-2,408) | 3,512 (-80) | 53,124 (-352) | 0 (0) | 29,840 (-448) | 24,448 (-1,008) | 12,612 (+1,558) |
+| esp32c6-sensor-light-sleep | 401,036 (-2,972) | 3,712 (-72) | 53,124 (-352) | 0 (0) | 30,080 (-464) | 24,688 (-1,056) | 12,470 (+1,564) |
+| esp32h2-sensor | 374,970 (-2,618) | 3,216 (-80) | 53,068 (-352) | 0 (0) | 29,840 (-448) | 24,448 (-672) | 12,610 (+1,556) |
+| esp32h2-sensor-light-sleep | 385,204 (-3,056) | 3,472 (-72) | 53,068 (-352) | 0 (0) | 30,080 (-464) | 24,688 (-688) | 12,468 (+1,562) |
+
+Notes on the table:
+
+- **True stack:** the `stack` and `mac_chain` columns have the RISC-V gap
+  described above. Counting the `lui`/`addi`/`sub sp, sp, aN` frames
+  gives a worst-path `stack` of 60,448 / 60,432 / 60,448 / 60,416 B on master
+  and 36,112 / 36,336 / 36,112 / 36,336 B here (about -24 KB). It also gives a
+  `mac_chain` of 50,976 / 51,248 / 50,640 / 50,864 B on master and
+  30,720 / 30,944 / 30,720 / 30,944 B here.
+- **`mac_stack`/`mac_frame`:** these diagnostic columns grow by about
+  5.2 KB. That is `EspRadioPhy::into_soft_mac`'s init-only frame. It runs
+  once, below `build_mac`, and is not on the worst path. On master the same
+  work was inlined into `main` and not attributed to `zigbee_mac`.
+- **`mac_code`:** this grows because the generic core paths replace the
+  smaller ESP-specific MAC. Total flash still falls.
+- **Validation:** the port is build-, layout-, symbol- and host-tested only.
+  No ESP hardware run has been done with it.
 
 ## Measurement commands
 
