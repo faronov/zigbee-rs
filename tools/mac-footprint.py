@@ -98,6 +98,13 @@ def _esp(chip: str, light_sleep: bool) -> Image:
         args, ESP_PHY_TOOLCHAIN)
 
 
+def _efr32s2(name: str, crate: str, role: str) -> Image:
+    """A Series 2 role bin; `role=""` builds the crate's default role."""
+    args = ["--no-default-features", "--features", role] if role else []
+    return Image(name, f"examples/{crate}",
+                 f"target/thumbv8m.main-none-eabihf/release/{name}", args)
+
+
 def _telink(name: str, mode: str, crate: str) -> Image:
     return Image(name, f"examples/{crate}",
                  f"target/tc32-unknown-none-elf/release/{crate}",
@@ -131,6 +138,14 @@ IMAGES: list[Image] = [
           "target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor"),
     Image("efr32mg22-sensor", "examples/efr32mg22-sensor",
           "target/thumbv8m.main-none-eabihf/release/efr32mg22-sensor"),
+    # Series 2 role template: one crate per board, one bin per role. The
+    # MG22 router does not fit 32 KiB SRAM (its link is rejected).
+    _efr32s2("efr32mg21-ed", "efr32mg21-sensor", "ed"),
+    _efr32s2("efr32mg21-router", "efr32mg21-sensor", "router"),
+    _efr32s2("efr32mg22-ed", "efr32mg22-sensor", "ed"),
+    _efr32s2("ha-connect-zbt1-ed", "ha-connect-zbt1", ""),
+    _efr32s2("ha-connect-zbt1-router", "ha-connect-zbt1", "router"),
+    _efr32s2("ha-connect-zbt1-sed", "ha-connect-zbt1", "sed"),
     _esp("esp32c6", False),
     _esp("esp32c6", True),
     _esp("esp32h2", False),
