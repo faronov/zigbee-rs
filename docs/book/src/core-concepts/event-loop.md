@@ -51,7 +51,8 @@ It selects the product's `fast_sleep_depth` or `slow_sleep_depth` only while
 joined and OTA-idle. Otherwise it requests `Active`.
 
 The `WakeController` performs the atomic MAC prepare/wait/restore operation and
-returns `Button` or `Timer`.
+returns `WakeReason::{Button, Timer, Activity}` (`Activity`: pending
+radio/interrupt work prevented sleep).
 
 ### OTA before generic events
 
@@ -66,12 +67,19 @@ calling the reset-causing activation method.
 
 `router_app` exposes:
 
+- `AlwaysOnEndDeviceApp` — non-routing always-on (RxOnWhenIdle) end device on
+  any `MacDriver`;
 - `RelayRouterApp` — forwarding only, `NoChildren`;
 - `ParentRouterApp` — child-capable, `PersistentChildren`;
 - `DistributedRouterApp` — child-capable distributed PAN owner,
   `PersistentChildren`;
 - `CoordinatorApp` — formation/persisted-PAN restart,
-  `PersistentChildren`.
+  `PersistentChildren`;
+- `TrustCenterCoordinatorApp` (`trust-center` feature) — coordinator with a
+  durable Trust Center device store.
+
+All but `AlwaysOnEndDeviceApp` require the `router` feature and a
+`ParentMacDriver`.
 
 Each has the same finite shape:
 
@@ -89,8 +97,9 @@ outer-loop concern can call `step()` itself.
 
 Startup is statically selected:
 
-- relay and parent: steering or persisted resume;
-- coordinator: formation or persisted-PAN restart.
+- always-on end device, relay, and parent: steering or persisted resume;
+- distributed router: distributed formation or restart;
+- coordinator: centralized formation or persisted-PAN restart.
 
 ## Stack events
 
@@ -99,8 +108,13 @@ The underlying `zigbee_runtime::event_loop::StackEvent` still describes:
 - joined/left/commissioning state;
 - reporting configuration and sent reports;
 - received ZCL commands/default responses/attribute reports;
-- Identify and OTA progress;
-- permit-join and router/parent activity.
+- OTA availability, progress, completion, failure, and delayed activation;
+- permit-join changes, validated Device_annce, and APSME security
+  indications for Trust Center policy;
+- Basic reset-to-factory-defaults, leave, and rejoin requests.
+
+Identify is not a `StackEvent`; applications query
+`ZigbeeDevice::is_identifying(endpoint)`.
 
 Shared applications match events explicitly. New event variants therefore
 produce compile errors in those handlers instead of silently falling through a

@@ -17,6 +17,7 @@ endpoint 0** using the **Zigbee Device Profile (ZDP, profile ID 0x0000)**.
 │  ├── binding_mgmt  — bind/unbind        │
 │  ├── network_mgmt  — mgmt LQI/RTG/…    │
 │  ├── device_announce                    │
+│  ├── parent_annce  — R22 child recon.   │
 │  └── handler       — ZDP dispatcher     │
 └───────────────┬─────────────────────────┘
                 │  APS endpoint 0
@@ -59,6 +60,29 @@ let zdo_mut = bdb.zdo_mut();
 | `zdo.power_descriptor()` | `&PowerDescriptor` | This device's power descriptor |
 | `zdo.get_local_descriptor(ep)` | `Option<&SimpleDescriptor>` | Simple descriptor for an endpoint |
 
+### Client Requests Are Event-Driven
+
+Outgoing requests do not block for the response. A `start_*` method sends the
+request, registers it in the pending-response table and returns its slot
+(plus the TSN for most requests). Poll `take_response(slot)` from your own
+tick/poll step — it yields the response body *after* the TSN, which you parse
+with the matching `*Rsp::parse` — and call `cancel_pending(slot)` on your own
+timeout; the table never expires ordinary requests itself.
+
+| Helper | Request |
+|---|---|
+| `start_node_desc_req(dst)` → `slot` | Node_Desc_req for `dst` |
+| `start_ieee_addr_req(dst)` → `(slot, tsn)` | IEEE_addr_req (always `RequestType::Single`) |
+| `start_active_ep_req(dst)` → `(slot, tsn)` | Active_EP_req |
+| `start_simple_desc_req(dst, ep)` → `(slot, tsn)` | Simple_Desc_req |
+| `start_match_desc_req(dst, profile, in, out)` → `(slot, tsn)` | Match_Desc_req |
+| `start_bind_req(dst, &BindReq)` / `start_unbind_req(..)` → `(slot, tsn)` | Bind_req / Unbind_req |
+
+The older one-shot `active_ep_req`, `simple_desc_req` and `match_desc_req` are
+deprecated: they send the request, release the slot and always return
+`Err(ZdpStatus::Timeout)`.  `bind_req` / `unbind_req` take a
+`zigbee_aps::binding::BindingEntry` and are fire-and-forget.
+
 ## ZDP Cluster IDs
 
 Every ZDP command has a request cluster ID and a response cluster ID.  The
@@ -82,6 +106,7 @@ response ID is always `request_id | 0x8000`:
 | Mgmt_Leave | `0x0034` | `0x8034` |
 | Mgmt_Permit_Joining | `0x0036` | `0x8036` |
 | Mgmt_NWK_Update | `0x0038` | `0x8038` |
+| Parent_annce | `0x001F` | `0x801F` |
 
 ## Incoming Request Policy
 
@@ -145,22 +170,24 @@ and the 64-bit IEEE extended address (permanent, factory-programmed).
 
 ```rust
 use zigbee_zdo::discovery::{NwkAddrReq, NwkAddrRsp, RequestType};
-use zigbee_types::ShortAddress;
 
 let req = NwkAddrReq {
     ieee_addr: target_ieee,
     request_type: RequestType::Single,
     start_index: 0,
 };
+let mut buf = [0u8; NwkAddrReq::MIN_SIZE];
+let len = req.serialize(&mut buf)?;   // payload after the TSN
 
-// Send to the device itself (or broadcast to 0xFFFD)
-let rsp: NwkAddrRsp = zdo.nwk_addr_req(
-    ShortAddress(0xFFFD), // broadcast
-    &req,
-).await?;
-
+// ... later, parse the NWK_addr_rsp body (after the TSN):
+let rsp = NwkAddrRsp::parse(body)?;
 println!("Device is at NWK 0x{:04X}", rsp.nwk_addr.0);
 ```
+
+`ZdoLayer` has no client helper for NWK_addr_req; the `discovery` structs
+serialize the request and parse the response, and incoming NWK_addr_req /
+IEEE_addr_req frames are answered by `handle_indication` (a broadcast miss
+stays silent).
 
 The response includes the status, the IEEE address echo, and the resolved NWK
 address.  If `RequestType::Extended` is used, it also lists associated devices
@@ -172,16 +199,15 @@ The inverse operation: *"I see NWK address 0x1A2B on the network.  What is its
 permanent IEEE address?"*
 
 ```rust
-use zigbee_zdo::discovery::{IeeeAddrReq, RequestType};
+use zigbee_zdo::discovery::IeeeAddrRsp;
 
-let req = IeeeAddrReq {
-    nwk_addr_of_interest: ShortAddress(0x1A2B),
-    request_type: RequestType::Single,
-    start_index: 0,
-};
+let (slot, _tsn) = zdo.start_ieee_addr_req(ShortAddress(0x1A2B)).await?;
 
-let rsp = zdo.ieee_addr_req(ShortAddress(0x1A2B), &req).await?;
-println!("IEEE address: {:02X?}", rsp.ieee_addr);
+// ... later, from your poll step:
+if let Some(body) = zdo.take_response(slot) {
+    let rsp = IeeeAddrRsp::parse(&body)?;
+    println!("IEEE address: {:02X?}", rsp.ieee_addr);
+}
 ```
 
 The response type `IeeeAddrRsp` is a type alias for `NwkAddrRsp` — both
@@ -197,21 +223,18 @@ The Node Descriptor tells you the logical type (Coordinator, Router, or End
 Device), frequency band, MAC capabilities, manufacturer code, and buffer sizes.
 
 ```rust
-use zigbee_zdo::discovery::{NodeDescReq, NodeDescRsp};
+use zigbee_zdo::discovery::NodeDescRsp;
 
-let req = NodeDescReq {
-    nwk_addr_of_interest: ShortAddress(0x1A2B),
-};
+let slot = zdo.start_node_desc_req(ShortAddress(0x1A2B)).await?;
 
-let rsp: NodeDescRsp = zdo.node_desc_req(
-    ShortAddress(0x1A2B),
-    &req,
-).await?;
-
-if let Some(desc) = rsp.node_descriptor {
-    println!("Logical type: {:?}", desc.logical_type);
-    println!("Manufacturer: 0x{:04X}", desc.manufacturer_code);
-    println!("Max buffer: {} bytes", desc.max_buffer_size);
+// ... later, from your poll step:
+if let Some(body) = zdo.take_response(slot) {
+    let rsp = NodeDescRsp::parse(&body)?;
+    if let Some(desc) = rsp.node_descriptor {
+        println!("Logical type: {:?}", desc.logical_type);
+        println!("Manufacturer: 0x{:04X}", desc.manufacturer_code);
+        println!("Max buffer: {} bytes", desc.max_buffer_size);
+    }
 }
 ```
 
@@ -241,23 +264,19 @@ interoperability.  It tells you the profile, device type, and the exact list
 of input (server) and output (client) clusters on an endpoint.
 
 ```rust
-use zigbee_zdo::discovery::{SimpleDescReq, SimpleDescRsp};
+use zigbee_zdo::discovery::SimpleDescRsp;
 
-let req = SimpleDescReq {
-    nwk_addr_of_interest: ShortAddress(0x1A2B),
-    endpoint: 1,
-};
+let (slot, _tsn) = zdo.start_simple_desc_req(ShortAddress(0x1A2B), 1).await?;
 
-let rsp: SimpleDescRsp = zdo.simple_desc_req(
-    ShortAddress(0x1A2B),
-    &req,
-).await?;
-
-if let Some(desc) = rsp.simple_descriptor {
-    println!("Profile: 0x{:04X}", desc.profile_id);
-    println!("Device ID: 0x{:04X}", desc.device_id);
-    println!("Input clusters: {:04X?}", desc.input_clusters);
-    println!("Output clusters: {:04X?}", desc.output_clusters);
+// ... later, from your poll step:
+if let Some(body) = zdo.take_response(slot) {
+    let rsp = SimpleDescRsp::parse(&body)?;
+    if let Some(desc) = rsp.simple_descriptor {
+        println!("Profile: 0x{:04X}", desc.profile_id);
+        println!("Device ID: 0x{:04X}", desc.device_id);
+        println!("Input clusters: {:04X?}", desc.input_clusters);
+        println!("Output clusters: {:04X?}", desc.output_clusters);
+    }
 }
 ```
 
@@ -283,11 +302,15 @@ Before you can query simple descriptors, you need to know which endpoints exist:
 ```rust
 use zigbee_zdo::discovery::ActiveEpRsp;
 
-let rsp: ActiveEpRsp = zdo.active_ep_req(ShortAddress(0x1A2B)).await?;
+let (slot, _tsn) = zdo.start_active_ep_req(ShortAddress(0x1A2B)).await?;
 
-for &ep in &rsp.active_ep_list {
-    println!("Endpoint {} is active", ep);
-    // Now query Simple_Desc for each endpoint
+// ... later, from your poll step:
+if let Some(body) = zdo.take_response(slot) {
+    let rsp = ActiveEpRsp::parse(&body)?;
+    for &ep in &rsp.active_ep_list {
+        println!("Endpoint {} is active", ep);
+        // Now query Simple_Desc for each endpoint
+    }
 }
 ```
 
@@ -296,24 +319,27 @@ for &ep in &rsp.active_ep_list {
 *"Who on this device (or the whole network) supports the On/Off cluster?"*
 
 ```rust
-use zigbee_zdo::discovery::{MatchDescReq, MatchDescRsp};
+use zigbee_zdo::discovery::MatchDescRsp;
 
-let req = MatchDescReq {
-    nwk_addr_of_interest: ShortAddress(0xFFFD), // broadcast
-    profile_id: 0x0104,                         // Home Automation
-    input_clusters: vec![0x0006].into(),         // On/Off (server)
-    output_clusters: heapless::Vec::new(),
-};
-
-let rsp: MatchDescRsp = zdo.match_desc_req(
-    ShortAddress(0xFFFD),
-    &req,
+let (slot, _tsn) = zdo.start_match_desc_req(
+    ShortAddress(0xFFFD), // broadcast
+    0x0104,               // Home Automation
+    &[0x0006],            // On/Off (server)
+    &[],
 ).await?;
 
-for &ep in &rsp.match_list {
-    println!("Matching endpoint: {}", ep);
+// ... later, from your poll step:
+if let Some(body) = zdo.take_response(slot) {
+    let rsp = MatchDescRsp::parse(&body)?;
+    for &ep in &rsp.match_list {
+        println!("Matching endpoint: {}", ep);
+    }
 }
 ```
+
+A pending slot holds a single response, so a broadcast request completes with
+the first matching reply. Cluster lists that do not fit one ZDP frame
+(`ZDP_MAX_PAYLOAD` = 82 bytes) are rejected with `InvRequestType`.
 
 ## Other Descriptors
 
@@ -373,8 +399,13 @@ let req = BindReq {
 };
 
 // Send Bind_req to the sensor device
-let rsp: BindRsp = zdo.bind_req(sensor_nwk_addr, &req).await?;
-assert_eq!(rsp.status, ZdpStatus::Success);
+let (slot, _tsn) = zdo.start_bind_req(sensor_nwk_addr, &req).await?;
+
+// ... later, from your poll step:
+if let Some(body) = zdo.take_response(slot) {
+    let rsp = BindRsp::parse(&body)?;
+    assert_eq!(rsp.status, ZdpStatus::Success);
+}
 ```
 
 The `BindTarget` enum mirrors APS binding destinations:
@@ -392,13 +423,19 @@ Structurally identical to Bind_req — `UnbindReq` is a type alias for `BindReq`
 and `UnbindRsp` is a type alias for `BindRsp`:
 
 ```rust
-let rsp = zdo.unbind_req(sensor_nwk_addr, &req).await?;
+let (slot, _tsn) = zdo.start_unbind_req(sensor_nwk_addr, &req).await?;
 ```
 
 ## Network Management
 
 Network management commands let you query and control the Zigbee mesh topology.
 These are essential tools for diagnostics and network administration.
+
+Incoming Mgmt_Lqi/Rtg/Bind/Leave/Permit_Joining/NWK_Update requests are
+answered by `handle_indication`. Apart from `mgmt_permit_joining_req`,
+`ZdoLayer` has no client helpers for them: the `network_mgmt` structs
+serialize the requests and parse the response bodies (after the TSN), as in
+the snippets below.
 
 ### Mgmt_Lqi_req — Neighbor Table
 
@@ -410,15 +447,17 @@ device type.
 use zigbee_zdo::network_mgmt::{MgmtLqiReq, MgmtLqiRsp, NeighborTableRecord};
 
 let req = MgmtLqiReq { start_index: 0 };
-let rsp: MgmtLqiRsp = zdo.mgmt_lqi_req(ShortAddress(0x0000), &req).await?;
+let len = req.serialize(&mut buf)?;
+// ... send it, then parse the Mgmt_Lqi_rsp body:
+let rsp = MgmtLqiRsp::parse(body)?;
 
 for neighbor in &rsp.neighbor_table_list {
     println!(
         "  0x{:04X} LQI={} type={} rel={}",
         neighbor.network_addr.0,
         neighbor.lqi,
-        neighbor.device_type,     // 0=Coord, 1=Router, 2=ED
-        neighbor.relationship,    // 0=parent, 1=child, 2=sibling
+        neighbor.device_type,     // 0=Coord, 1=Router, 2=ED, 3=unknown
+        neighbor.relationship,    // 0=parent, 1=child, 2=sibling, 3=none, 4=prev child
     );
 }
 ```
@@ -430,9 +469,9 @@ pub struct NeighborTableRecord {
     pub extended_pan_id: [u8; 8],
     pub extended_addr: IeeeAddress,
     pub network_addr: ShortAddress,
-    pub device_type: u8,        // 2-bit: 0=Coord, 1=Router, 2=EndDevice
+    pub device_type: u8,        // 2-bit: 0=Coord, 1=Router, 2=EndDevice, 3=unknown
     pub rx_on_when_idle: u8,    // 2-bit: 0=off, 1=on, 2=unknown
-    pub relationship: u8,       // 3-bit: 0=parent, 1=child, 2=sibling
+    pub relationship: u8,       // 3-bit: 0=parent, 1=child, 2=sibling, 3=none, 4=prev child
     pub permit_joining: u8,     // 2-bit: 0=no, 1=yes, 2=unknown
     pub depth: u8,
     pub lqi: u8,
@@ -444,17 +483,17 @@ pub struct NeighborTableRecord {
 Query a router's routing table to understand message paths:
 
 ```rust
-use zigbee_zdo::network_mgmt::MgmtRtgReq;
+use zigbee_zdo::network_mgmt::{MgmtRtgReq, MgmtRtgRsp};
 
-let req = MgmtRtgReq { start_index: 0 };
-let rsp = zdo.mgmt_rtg_req(ShortAddress(0x0000), &req).await?;
+let req = MgmtRtgReq { start_index: 0 }; // alias of MgmtLqiReq
+let rsp = MgmtRtgRsp::parse(body)?;
 
 for route in &rsp.routing_table_list {
     println!(
-        "  dst=0x{:04X} → next_hop=0x{:04X} status={:?}",
+        "  dst=0x{:04X} → next_hop=0x{:04X} status={}",
         route.dst_addr.0,
-        route.next_hop_addr.0,
-        route.status,
+        route.next_hop.0,
+        route.status,             // 3-bit route status
     );
 }
 ```
@@ -464,10 +503,10 @@ for route in &rsp.routing_table_list {
 Query another device's binding table:
 
 ```rust
-use zigbee_zdo::network_mgmt::MgmtBindReq;
+use zigbee_zdo::network_mgmt::{MgmtBindReq, MgmtBindRsp};
 
-let req = MgmtBindReq { start_index: 0 };
-let rsp = zdo.mgmt_bind_req(ShortAddress(0x1A2B), &req).await?;
+let req = MgmtBindReq { start_index: 0 }; // alias of MgmtLqiReq
+let rsp = MgmtBindRsp::parse(body)?;
 
 for entry in &rsp.binding_table_list {
     println!(
@@ -491,8 +530,7 @@ let req = MgmtLeaveReq {
     remove_children: false,
     rejoin: false,
 };
-
-let rsp = zdo.mgmt_leave_req(ShortAddress(0x1A2B), &req).await?;
+let len = req.serialize(&mut buf)?;
 ```
 
 For an incoming self-targeted request, `remove_children` does not make the
@@ -536,9 +574,13 @@ Every ZDP response carries a status code:
 | `NotSupported` | `0x84` | Request not supported on this device |
 | `Timeout` | `0x85` | Request timed out |
 | `NoMatch` | `0x86` | No matching descriptors found |
-| `TableFull` | `0x87` | Binding / neighbor / routing table is full |
 | `NoEntry` | `0x88` | No matching entry found (unbind, remove) |
 | `NoDescriptor` | `0x89` | Requested descriptor does not exist |
+| `TableFull` | `0x8C` | Binding / neighbor / routing table is full (`0x87` is reserved) |
+| `IllegalRequest` | `0xA3` | Remote Trust Center policy changes are disabled |
+| `TrustCenterPolicyNotSupported` | `0xAA` | TC-significant request while whitelist mode is active |
+
+`ZdoStatus` is a backwards-compatible alias for `ZdpStatus`.
 
 ## `ZdoError`
 
@@ -559,12 +601,13 @@ pub enum ZdoError {
 Every ZDP exchange is correlated by a **Transaction Sequence Number (TSN)**.
 The ZDO layer manages this automatically — you don't need to track TSNs
 yourself.  Internally, `ZdoLayer` maintains a pending-response table (up to
-4 concurrent requests) that matches incoming response TSNs to outstanding
-requests.
+4 concurrent requests; a fifth `start_*` call fails with `TableFull`) that
+matches incoming response cluster and TSN to outstanding requests. A response
+to a unicast request is only accepted from the node it was sent to.
 
 ```rust
 // TSN is allocated and tracked internally
-let tsn = zdo.next_seq(); // wrapping u8 counter
+let tsn = zdo.next_seq(); // wrapping u8 counter, first value seeded from IEEE + clock
 ```
 
 ## Device Announce
@@ -575,9 +618,13 @@ When a device joins (or rejoins) a network, it broadcasts a `Device_annce`
 ```rust
 // Automatically called by BDB steering on join, but available manually:
 zdo.device_annce(my_nwk_addr, my_ieee_addr).await?;
+// or, using the cached local addresses and MAC capabilities:
+zdo.send_device_annce().await?;
 ```
 
-This is a one-way broadcast — there is no response.
+This is a one-way broadcast to `0xFFFD` — there is no response. A received
+`Device_annce` updates the NWK address map through the NWK address-conflict
+check.
 
 ## Complete Example: Discovering a New Device
 
@@ -585,14 +632,17 @@ Here's how you'd discover everything about a device that just joined your
 network:
 
 ```rust
+// Each step starts a request and later takes its response from the
+// pending table (see "Client Requests Are Event-Driven"); `wait_for` stands
+// for your own poll loop around take_response() with a timeout.
+
 // 1. We received a Device_annce — we know the NWK addr and IEEE addr
 let device_nwk = ShortAddress(0x5E3F);
 let device_ieee = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
 
 // 2. Get the node descriptor — what type of device is it?
-let node_desc = zdo.node_desc_req(device_nwk, &NodeDescReq {
-    nwk_addr_of_interest: device_nwk,
-}).await?;
+let slot = zdo.start_node_desc_req(device_nwk).await?;
+let node_desc = NodeDescRsp::parse(&wait_for(&mut zdo, slot).await?)?;
 
 if let Some(nd) = node_desc.node_descriptor {
     match nd.logical_type {
@@ -603,14 +653,13 @@ if let Some(nd) = node_desc.node_descriptor {
 }
 
 // 3. Enumerate active endpoints
-let eps = zdo.active_ep_req(device_nwk).await?;
+let (slot, _) = zdo.start_active_ep_req(device_nwk).await?;
+let eps = ActiveEpRsp::parse(&wait_for(&mut zdo, slot).await?)?;
 
 // 4. Get the simple descriptor for each endpoint
 for &ep in &eps.active_ep_list {
-    let sd = zdo.simple_desc_req(device_nwk, &SimpleDescReq {
-        nwk_addr_of_interest: device_nwk,
-        endpoint: ep,
-    }).await?;
+    let (slot, _) = zdo.start_simple_desc_req(device_nwk, ep).await?;
+    let sd = SimpleDescRsp::parse(&wait_for(&mut zdo, slot).await?)?;
 
     if let Some(desc) = sd.simple_descriptor {
         println!("Endpoint {}: profile=0x{:04X} device=0x{:04X}",

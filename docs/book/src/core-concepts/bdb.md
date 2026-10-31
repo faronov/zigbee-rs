@@ -14,8 +14,10 @@ network.
 > both enabled.
 
 The feature name `sleepy-end-device` describes End Device polling and power
-behavior. It does **not** select centralized security. Required centralized
-joining/TCLK handling and distributed-security joining both remain available.
+behavior. It does **not** select a security model: it implies `end-device`,
+which keeps centralized joining/TCLK handling (`centralized-tclk`).
+Distributed-security joining needs the `distributed-security` feature, which is
+on by default (and implied by `router`) but not by `sleepy-end-device`.
 
 ```text
 ┌──────────────────────────────────────┐
@@ -28,6 +30,9 @@ joining/TCLK handling and distributed-security joining both remain available.
 │  ├── steering:      join network     │
 │  ├── formation:     create network   │
 │  ├── finding_binding: EZ-Mode F&B    │
+│  ├── tclk_exchange: unique TCLK      │
+│  ├── trust_center:  TC policy        │
+│  ├── security_persistence            │
 │  ├── touchlink:     proximity comm.  │
 │  └── attributes:    BDB attributes   │
 └──────────────┬───────────────────────┘
@@ -163,7 +168,7 @@ capability mask automatically:
 
 | Device Type | Available Modes |
 |---|---|
-| **Coordinator** | Steering + Formation; optional Finding & Binding / Touchlink |
+| **Coordinator** | Steering + Formation (only if the MAC reports coordinator capability); optional Finding & Binding / Touchlink |
 | **Router** | Steering; optional Finding & Binding / Touchlink |
 | **End Device** | Steering; optional Finding & Binding / Touchlink |
 
@@ -200,14 +205,16 @@ When `node_is_on_a_network` is `false`, steering performs a full join sequence:
 
 ```text
 Pre-network (awaited inside `network_steering`)
-1. Scan primary channels (11, 15, 20, 25) for open networks
+1. Scan channel 15 first, then the rest of the primary set (11, 20, 25)
    └── NLME-NETWORK-DISCOVERY
-2. Filter by extended PAN ID (if configured)
-3. Join the best-LQI network with permit-joining enabled
+2. Filter by extended PAN ID (`aps_use_extended_pan_id`, if non-zero)
+3. Join a network with permit-joining enabled, trying routers before
+   the coordinator (candidates in the NWK's LQI order)
    └── NLME-JOIN
 4. Wait for Transport-Key from Trust Center (5 s)
-   └── Poll parent via MAC Data Request
+   └── Passive RX, or poll parent via MAC Data Request
 5. Reserve network security counters, broadcast Device_annce
+   (up to 5 attempts, 8 s apart)
    └── returns: the network is up
 
 Post-network (one bounded step per tick — `advance_tclk_exchange`)
@@ -218,8 +225,10 @@ Post-network (one bounded step per tick — `advance_tclk_exchange`)
 9. Re-broadcast Device_annce (now authenticated)
 ```
 
-If primary channels yield no results, secondary channels (all other 2.4 GHz
-channels) are scanned.
+If the primary channels yield no join, the secondary set (all other 2.4 GHz
+channels) is scanned. A configured CBKE `tc_link_key_exchange_method` is
+refused with `TrustCenterLinkKeyExchangeFailure`; only APS Request-Key is
+implemented.
 
 #### Unique Trust Center link-key exchange (steps 6–8)
 
@@ -230,13 +239,14 @@ per whole procedure:
 
 | Message           | Transmissions | Response window |
 | ----------------- | ------------- | --------------- |
-| Node_Desc_req     | 3             | 1.5 s           |
-| APS Request-Key   | 3             | 3 s             |
+| Node_Desc_req     | 3             | 5 s             |
+| APS Request-Key   | 3             | 5 s             |
 | APS Verify-Key    | 3             | 5 s             |
 
-The first probe starts 300 ms after `Device_annce`, and the whole handshake has
-a wrapping-safe 15 s deadline. One full pass through every stage takes at most
-9.8 s, so a slow-but-answering Trust Center is never cut off. Both an expired
+Every response window is `bdbcTCLinkKeyExchangeTimeout` (5 s). The first probe
+starts 300 ms after `Device_annce`, and the whole handshake has a
+wrapping-safe 47.8 s deadline. One full pass through every stage takes at most
+15.3 s, so a slow-but-answering Trust Center is never cut off. Both an expired
 deadline and an exhausted message budget fail the exchange strictly. An APS
 acknowledgement is transport feedback only and never substitutes for
 `Confirm-Key`.
@@ -245,8 +255,8 @@ Synchronous transmit failures and rejected Confirm-Key responses use a
 dedicated **250 ms retry backoff**. This mirrors GSDK's scheduled-event pacing:
 it prevents the 50 ms runtime tick from spending all three transmissions in
 about 200 ms, but does not restore the old 5 s whole-procedure cooldown. Even
-all two inter-attempt backoffs for all three message types plus one full
-response window per stage total 11.3 s, inside the strict 15 s deadline.
+both inter-attempt backoffs for all three message types plus every response
+window of every attempt total 46.8 s, inside the strict 47.8 s deadline.
 
 Because the budgets are independent:
 
@@ -305,8 +315,17 @@ bdb.attributes_mut().secondary_channel_set = BDB_SECONDARY_CHANNEL_SET;
 bdb.commission().await?;
 
 // Option B: Call steering directly
+// (`network_steering_with_persistence(&mut store)` reserves counters durably)
 bdb.network_steering().await?;
+
+// Then drive the unique-TCLK exchange from your tick until it finishes
+while let TclkProgress::InProgress = bdb.advance_tclk_exchange(None).await {
+    // ... service normal stack traffic ...
+}
 ```
+
+When steering arms the TCLK exchange, `commission()` returns at network-up
+without running the later methods (Formation, Finding & Binding).
 
 The steering retry budget is controlled by `steering_attempts_remaining`
 (default: 5).  Each call to `steer_off_network` decrements this counter.
@@ -317,21 +336,22 @@ When `node_is_on_a_network` is `true`, steering opens the network so *other*
 devices can join:
 
 ```text
-1. Open local permit joining (180 seconds)
+1. Broadcast Mgmt_Permit_Joining_req (180 s, TC significance) to 0xFFFC
+2. Open local permit joining (180 seconds), routers/coordinator only
    └── NLME-PERMIT-JOINING
-2. Broadcast Mgmt_Permit_Joining_req to all routers
 ```
 
-For End Devices (which can't accept joins themselves), steering sends a
-`Mgmt_Permit_Joining_req` to the coordinator.
+End Devices (which can't accept joins themselves) only send the broadcast.
 
 ## Network Formation
 
-Network Formation creates a brand-new Zigbee PAN.  Only **coordinators** can
-form networks.
+Network Formation creates a brand-new Zigbee PAN.  A **coordinator** forms a
+centralized network; a coordinator-capable **router** with a provisioned
+distributed-security link key forms a distributed network. The MAC must report
+coordinator capability.
 
 ```text
-1. Verify this device is coordinator-capable
+1. Verify this device is coordinator-capable; generate the NWK key
 2. Form network on primary channels
    └── NLME-NETWORK-FORMATION (energy scan + selection)
 3. If primary channels fail, try secondary channels
@@ -348,23 +368,32 @@ Permit Joining or any other on-network success becomes visible.
 // Configure as coordinator
 bdb.attributes_mut().commissioning_mode = CommissioningMode::FORMATION;
 
-// Form the network
-bdb.network_formation().await?;
+// Form the network; `store` implements FormationPersistence
+// (or is a closure returning a CounterReservation)
+bdb.network_formation_with_persistence(&mut store).await?;
 ```
 
+`network_formation()` (and `commission()`, which has no durable commit point)
+fails a formation step with `PersistenceFailure`; use
+`commission_with_formation_persistence(&mut store)` for the state machine.
+
 After formation:
-- `aps.aib().aps_designated_coordinator` is set to `true`
-- `aps.aib().aps_trust_center_address` is set to the coordinator's IEEE address
-- The NWK key is installed by the NWK layer
-- Permit joining is opened for `BDB_MIN_COMMISSIONING_TIME` (180 seconds)
+- `aps.aib().aps_designated_coordinator` is `true` (centralized) or `false`
+  (distributed)
+- `aps.aib().aps_trust_center_address` is the coordinator's IEEE address
+  (centralized) or `0xFFFF_FFFF_FFFF_FFFF` (distributed)
+- The NWK key (sequence 0) is installed in NWK security
+- Permit joining is opened locally and via a `0xFFFC` Mgmt_Permit_Joining_req
+  for `BDB_MIN_COMMISSIONING_TIME` (180 seconds)
 
 ### Security Modes
 
 Formation supports two security models:
-- **Centralized** (default): The coordinator acts as the Trust Center and
+- **Centralized**: formed by a Coordinator, which acts as the Trust Center and
   distributes the NWK key to all joining devices.
-- **Distributed**: Routers form their own trust domain with no central TC
-  (used in some ZLL/Touchlink scenarios).
+- **Distributed**: formed by a Router; routers form their own trust domain
+  with no central TC (`node_join_link_key_type` =
+  `DistributedSecurityGlobalLinkKey`).
 
 ## Finding & Binding (EZ-Mode)
 
@@ -406,7 +435,7 @@ press).
 ```
 
 ```rust
-// Start F&B initiator on endpoint 1
+// Start F&B initiator on endpoint 1 (commission() always uses endpoint 1)
 bdb.finding_binding_initiator(1).await?;
 
 // In your event loop, tick every second:
@@ -445,7 +474,9 @@ The target enters Identify mode and waits for an initiator to discover it:
 bdb.finding_binding_target(1).await?;
 ```
 
-This sets `fb_target_request` to `Some((endpoint, 180))`.  Your runtime reads
+The node must be on a network and the endpoint must have an Identify server
+cluster, otherwise `NotOnNetwork` / `NotPermitted` is returned. This sets
+`fb_target_request` to `Some((endpoint, 180))`.  Your runtime reads
 this and writes the `IdentifyTime` attribute on the Identify cluster, which
 makes the device respond to Identify Query broadcasts.
 
@@ -471,13 +502,14 @@ must be brought physically close together (RSSI threshold: **-40 dBm**).
 
 ### Current Status
 
-> **⚠️ Touchlink is currently a stub implementation.**
+> **⚠️ Touchlink is experimental and incomplete.**
 >
-> Full Touchlink requires Inter-PAN frame support in the MAC layer, which is
-> not yet implemented.  Calling `touchlink_commissioning()` returns
-> `Err(BdbStatus::TouchlinkFailure)`.
+> The `touchlink` module only exists with the off-by-default `touchlink`
+> feature. `touchlink_commissioning()` sends Scan Requests as ordinary MAC
+> frames; without Inter-PAN support in the MAC no Scan Response arrives and it
+> returns `Err(BdbStatus::TouchlinkFailure)`, restoring the operating channel.
 
-Key types and constants are defined for future implementation:
+Key types and constants:
 
 ```rust
 use zigbee_bdb::touchlink::*;
@@ -527,8 +559,11 @@ pub struct BdbAttributes {
     /// Secondary channels if primary fails (default: all others)
     pub secondary_channel_set: ChannelMask,
 
-    /// TC join timeout in seconds (default: 10)
-    pub trust_center_node_join_timeout: u16,
+    /// Beacon scan duration exponent (default: 3)
+    pub scan_duration: u8,
+
+    /// TC join timeout in seconds (default: 15)
+    pub trust_center_node_join_timeout: u8,
 
     /// Whether TC requires link key exchange (default: true)
     pub trust_center_require_key_exchange: bool,
@@ -536,7 +571,9 @@ pub struct BdbAttributes {
     /// Steering retry budget (default: 5)
     pub steering_attempts_remaining: u8,
 
-    // ... internal fields
+    // ... plus node_commissioning_capability, tc_link_key_exchange_* and
+    // the trust_center_* policy attributes (allow joins/rejoins, whitelist,
+    // install-code / key-request policies, network-key update)
 }
 ```
 
@@ -556,6 +593,9 @@ BDB_SECONDARY_CHANNEL_SET // ChannelMask(0x05EF_7000)
 // Minimum commissioning time for F&B (180 seconds)
 BDB_MIN_COMMISSIONING_TIME // 180
 ```
+
+`BDB_POPULAR_CHANNEL_SET` / `BDB_POPULAR_CHANNEL_FALLBACK_SET` are also
+defined.
 
 ### Link Key Types
 
@@ -584,6 +624,8 @@ pub enum NodeJoinLinkKeyType {
 | `TouchlinkFailure` | `0x09` | Touchlink failed or not supported |
 | `TargetFailure` | `0x0A` | Target not in identifying mode |
 | `Timeout` | `0x0B` | Operation timed out |
+| `TrustCenterLinkKeyExchangeFailure` | `0x0C` | Unique TCLK exchange failed |
+| `PersistenceFailure` | `0x0D` | Security state could not be durably persisted |
 
 ## `BdbCommissioningStatus`
 
@@ -594,15 +636,17 @@ commissioning attempt with finer granularity:
 pub enum BdbCommissioningStatus {
     Success                   = 0x00,
     InProgress                = 0x01,
-    NoNetwork                 = 0x02,
-    TlTargetFailure           = 0x03,
-    TlNotAddressAssignment    = 0x04,
-    TlNoScanResponse          = 0x05,
-    NotPermitted              = 0x06,
-    SteeringFormationFailure  = 0x07,
-    NoIdentifyQueryResponse   = 0x08,
-    BindingTableFull          = 0x09,
-    NoScanResponse            = 0x0A,
+    NotAaCapable              = 0x02,
+    NoNetwork                 = 0x03,
+    TargetFailure             = 0x04,
+    FormationFailure          = 0x05,
+    NoIdentifyQueryResponse   = 0x06,
+    BindingTableFull          = 0x07,
+    NoScanResponse            = 0x08,
+    NotPermitted              = 0x09,
+    TcLinkKeyExchangeFailure  = 0x0A,
+    NotOnANetwork             = 0x0B,
+    OnANetwork                = 0x0C,
 }
 ```
 
@@ -616,8 +660,9 @@ bdb.factory_reset().await?;
 
 This performs:
 1. Leave the current network (if joined)
-2. Reset NWK + MAC layers (clears neighbor table, security, routing)
-3. Clear APS binding table and group table
+2. Reset NWK + MAC layers (clears neighbor table, security, routing) and
+   release every pending ZDO request slot
+3. Clear the APS binding, group and key tables and APS ACK tracking
 4. Reset all BDB attributes to defaults
 
 After factory reset, the device is in a "fresh out of box" state and must be
@@ -639,18 +684,21 @@ rejoin:
 // Attempt rejoin using stored NWK key
 bdb.rejoin().await?;
 
-// Or leave and rejoin (clean restart)
+// Or leave (with the Rejoin flag, keeping network identity/key) and rejoin
 bdb.leave_and_rejoin().await?;
 ```
 
 The rejoin procedure:
-1. Scan the last-known channel for the previous network
+1. Scan for the previous network; attempts alternate between the last-known
+   channel and a widened scan of the primary + secondary channel sets
 2. Filter and rank the beacons with the R22 rejoin parent rules (see below) and
    reject everything that is not a suitable parent
 3. Attempt `NLME-JOIN` with Rejoin method (uses stored NWK key), minimum-depth
    candidate first, moving on to the next suitable parent on failure
 4. Broadcast `Device_annce`
-5. If rejoin fails, fall back to full Network Steering
+5. On a centralized network whose parents were heard but refused the secured
+   rejoin, try a Trust Center rejoin
+6. If rejoin fails, fall back to full Network Steering
 
 ### Rejoin parent selection (R22 §3.6.1.4.2)
 
@@ -772,7 +820,9 @@ bdb.zdo_mut().register_endpoint(SimpleDescriptor {
     output_clusters: heapless::Vec::new(),
 });
 
-// 3. Initialize BDB
+// 3. Initialize BDB (F&B must be enabled as a capability first)
+bdb.attributes_mut().node_commissioning_capability =
+    CommissioningMode::FINDING_BINDING;
 bdb.initialize()?;
 
 // 4. Configure commissioning
@@ -781,13 +831,15 @@ bdb.attributes_mut().commissioning_mode =
 
 // 5. Commission! This will:
 //    - Skip Touchlink (not requested)
-//    - Run Network Steering (scan, join, announce, key exchange)
-//    - Run Finding & Binding (Identify Query, match clusters, bind)
+//    - Run Network Steering (scan, join, announce) and arm the TCLK exchange
 //    - Skip Formation (we're an End Device, not supported)
+//    - Return at network-up while the TCLK exchange is armed
 bdb.commission().await?;
+while let TclkProgress::InProgress = bdb.advance_tclk_exchange(None).await {}
 
-// 6. We're on the network!
+// 6. We're on the network! Now run Finding & Binding on endpoint 1
 assert!(bdb.is_on_network());
+bdb.finding_binding_initiator(1).await?;
 
 // 7. Now send periodic temperature reports via indirect addressing
 //    (bindings were created by F&B)
@@ -812,9 +864,9 @@ let mut bdb = BdbLayer::new(zdo);
 // 2. Initialize
 bdb.initialize()?;
 
-// 3. Form the network
+// 3. Form the network (formation needs a durable commit point)
 bdb.attributes_mut().commissioning_mode = CommissioningMode::FORMATION;
-bdb.commission().await?;
+bdb.commission_with_formation_persistence(&mut store).await?;
 
 // The network is now active:
 // - NWK key is installed
@@ -839,7 +891,7 @@ devices onto the network:
 - **Finding & Binding** automates the tedious process of creating bindings
   between compatible devices using the Identify cluster.
 - **Touchlink** enables proximity-based commissioning for consumer-friendly
-  experiences (stub implementation — Inter-PAN MAC support needed).
+  experiences (experimental, feature-gated — Inter-PAN MAC support needed).
 - The **state machine** runs methods in priority order and handles fallbacks.
 - **Factory reset** and **rejoin** provide recovery paths when things go wrong.
 
