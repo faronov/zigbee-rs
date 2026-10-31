@@ -10,7 +10,7 @@ use router_app::{
     NoDiagnostics, ParentRouterApp, PersistentApsTables, PersistentChildren, RouterObserver,
     RouterParts,
 };
-use zigbee_mac::{PlatformServices, telink::TelinkMac};
+use zigbee_mac::{PlatformServices, telink::TelinkRouterMac};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::node::ZigbeeNode;
@@ -192,7 +192,7 @@ impl JoinMetrics {
     /// `begin_attempt`: a retransmission defect has to be attributable
     /// across rejoins, and the whole point is to compare the totals against
     /// one sniffer capture covering the same interval.
-    fn capture_radio(&self, mac: &TelinkMac) {
+    fn capture_radio(&self, mac: &TelinkRouterMac) {
         let rx = mac.rx_diagnostics();
         self.radio_rx_frames_valid
             .store(rx.frames_valid, Ordering::Relaxed);
@@ -308,7 +308,7 @@ impl JoinMetrics {
         self.zdo_response_failures.store(0, Ordering::Relaxed);
     }
 
-    fn capture_steering(&self, device: &ZigbeeDevice<TelinkMac, Router>) {
+    fn capture_steering(&self, device: &ZigbeeDevice<TelinkRouterMac, Router>) {
         let diagnostics = device.steering_diagnostics();
         let started_us = if diagnostics.attempt_started_us != 0 {
             self.attempt_started_us
@@ -422,7 +422,7 @@ impl JoinMetrics {
         );
     }
 
-    fn capture_interview(&self, device: &ZigbeeDevice<TelinkMac, Router>) {
+    fn capture_interview(&self, device: &ZigbeeDevice<TelinkRouterMac, Router>) {
         let diagnostics = device.zdo_diagnostics();
         let elapsed_ms = self.elapsed_ms(device.mac().monotonic_micros());
         if diagnostics.node_desc_requests != 0 {
@@ -442,7 +442,7 @@ impl JoinMetrics {
             .store(diagnostics.response_failures, Ordering::Relaxed);
     }
 
-    fn mark_commissioning_complete(&self, device: &ZigbeeDevice<TelinkMac, Router>) {
+    fn mark_commissioning_complete(&self, device: &ZigbeeDevice<TelinkRouterMac, Router>) {
         let elapsed_ms = self.elapsed_ms(device.mac().monotonic_micros());
         self.store_first(&self.commissioning_complete_ms, elapsed_ms);
     }
@@ -492,53 +492,63 @@ static TELINK_JOIN_METRICS: JoinMetrics = JoinMetrics::new();
 /// `TELINK_JOIN_METRICS` while the shared app owns the lifecycle.
 struct TelinkJoinObserver;
 
-impl RouterObserver<TelinkMac, Router> for TelinkJoinObserver {
+impl RouterObserver<TelinkRouterMac, Router> for TelinkJoinObserver {
     fn on_commissioning_attempt(
-        _device: &ZigbeeDevice<TelinkMac, Router>,
+        _device: &ZigbeeDevice<TelinkRouterMac, Router>,
         _attempt: u32,
         started_us: u32,
     ) {
         TELINK_JOIN_METRICS.begin_attempt(started_us);
     }
 
-    fn on_start_result(device: &ZigbeeDevice<TelinkMac, Router>, result: Result<u16, StartError>) {
+    fn on_start_result(
+        device: &ZigbeeDevice<TelinkRouterMac, Router>,
+        result: Result<u16, StartError>,
+    ) {
         if matches!(result, Ok(_) | Err(StartError::CommissioningFailed(_))) {
             TELINK_JOIN_METRICS.capture_steering(device);
         }
     }
 
     fn on_secure_rejoin_result(
-        device: &ZigbeeDevice<TelinkMac, Router>,
+        device: &ZigbeeDevice<TelinkRouterMac, Router>,
         _result: Result<u16, StartError>,
     ) {
         TELINK_JOIN_METRICS.capture_steering(device);
     }
 
-    fn on_network_ready(device: &ZigbeeDevice<TelinkMac, Router>) {
+    fn on_network_ready(device: &ZigbeeDevice<TelinkRouterMac, Router>) {
         // ParentRouterApp calls this only after the durable child table has
         // been restored, so no observer work can open parent traffic early.
         TELINK_JOIN_METRICS.capture_steering(device);
     }
 
-    fn on_frame_received(_device: &ZigbeeDevice<TelinkMac, Router>, _receive_elapsed_us: u32) {
+    fn on_frame_received(
+        _device: &ZigbeeDevice<TelinkRouterMac, Router>,
+        _receive_elapsed_us: u32,
+    ) {
         TELINK_JOIN_METRICS.record_rx();
     }
 
     fn on_frame_processed(
-        device: &ZigbeeDevice<TelinkMac, Router>,
+        device: &ZigbeeDevice<TelinkRouterMac, Router>,
         _event: Option<&StackEvent>,
         _elapsed_us: u32,
     ) {
         TELINK_JOIN_METRICS.capture_interview(device);
     }
 
-    fn on_stack_event(device: &ZigbeeDevice<TelinkMac, Router>, event: &StackEvent) {
+    fn on_stack_event(device: &ZigbeeDevice<TelinkRouterMac, Router>, event: &StackEvent) {
         if matches!(event, StackEvent::CommissioningComplete { success: true }) {
             TELINK_JOIN_METRICS.mark_commissioning_complete(device);
         }
     }
 
-    fn on_tick(device: &ZigbeeDevice<TelinkMac, Router>, elapsed_secs: u16, _result: &TickResult) {
+    fn on_tick(
+        device: &ZigbeeDevice<TelinkRouterMac, Router>,
+        elapsed_secs: u16,
+        _result: &TickResult,
+    ) {
         TELINK_JOIN_METRICS.capture_interview(device);
         TELINK_JOIN_METRICS.capture_steering(device);
         if elapsed_secs != 0 {
@@ -563,7 +573,7 @@ fn halted() -> ! {
 }
 
 pub fn run() -> ! {
-    type Device = ZigbeeDevice<TelinkMac, Router>;
+    type Device = ZigbeeDevice<TelinkRouterMac, Router>;
 
     tlsr8258_hal::timer::init();
     let resources = match BoardResources::take() {
@@ -590,7 +600,7 @@ pub fn run() -> ! {
     let mut ieee_address = [0u8; 8];
     tlsr8258_hal::flash::factory_ieee(&mut ieee_address);
     ieee_address[0] = ieee_address[0].wrapping_add(DEVICE_EUI_OFFSET);
-    let mut mac = TelinkMac::with_extended_address(ieee_address);
+    let mut mac = TelinkRouterMac::with_extended_address(ieee_address);
     if mac.install_aes_engine(resources.aes).is_err() {
         failure(&leds);
     }

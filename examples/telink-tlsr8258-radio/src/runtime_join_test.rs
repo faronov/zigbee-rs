@@ -37,7 +37,11 @@ pub fn run() -> ! {
     let mut ieee = [0u8; 8];
     flash::factory_ieee(&mut ieee);
     ieee[0] = ieee[0].wrapping_add(0x33);
-    let mac = TelinkMac::with_extended_address(ieee);
+    let Ok(mac) = TelinkMac::with_extended_address(ieee) else {
+        loop {
+            timer::sleep_ticks(timer::ms(1_000));
+        }
+    };
     let slot = unsafe { &mut *DEVICE.0.get() };
     let device = ZigbeeDevice::builder(mac)
         .power_mode(PowerMode::AlwaysOn)
