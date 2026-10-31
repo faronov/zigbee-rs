@@ -318,6 +318,79 @@ The nRF sensor `mac_stack` rose by 884 B and `mac_code` by about 3.8 KB, while
 The nRF main-task future, measured with `-Z print-type-sizes`, shrank from
 18,648 B to 18,632 B on the sensor and from 18,024 B to 17,768 B on the router.
 
+### Core slimming before Phase B
+
+Before the remaining backends were ported, `SoftMacCore` itself was slimmed
+so that a port does not have to pay for the core's generality. The changes:
+
+- The transmit path is selected by the `RadioPhy::Tx` marker type, so each
+  future has the exact size of the one path that is compiled.
+- One synchronous-classifying `listen` loop serves every receive window.
+  No future holds a received frame across an await.
+- The association, leave and start paths write PIB fields directly instead
+  of going through the generic `MacPib::set`.
+- By-value requests are captured once (`fn -> impl Future { async move }`),
+  not twice as with `async fn`.
+- Retained frames use a byte-indexed ring instead of `heapless::Deque`.
+
+Measured against `157d189`, both trees built in directories with
+equal-length paths (bytes):
+
+| image | Δ `flash` | Δ `data` | Δ `bss` | Δ `pool` | Δ `stack` | Δ `mac_chain` | Δ `mac_code` | Δ `mac_frame` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| bl702-sensor | -6,140 | 0 | 0 | 0 | -3,920 | -3,904 | -3,940 | +112 |
+| nrf52833-sensor | -7,164 | 0 | 0 | 0 | -64 | -1,732 | -4,236 | -136 |
+| nrf52833-sensor-bme280 | -7,376 | 0 | 0 | 0 | -56 | -1,724 | -4,236 | -136 |
+| nrf52833-sensor-sht31 | -7,128 | 0 | 0 | 0 | -64 | -1,732 | -4,236 | -136 |
+| nrf52840-router | -7,820 | 0 | -224 | -224 | -56 | -2,036 | -4,670 | -728 |
+| nrf52840-sensor | -7,168 | 0 | 0 | 0 | -64 | -1,732 | -4,236 | -136 |
+| nrf52840-sensor-bme280 | -7,420 | 0 | 0 | 0 | -72 | -1,740 | -4,236 | -136 |
+| nrf52840-sensor-sht31 | -7,228 | 0 | 0 | 0 | -72 | -1,740 | -4,236 | -136 |
+| nrf52840-sensor-uf2-dk | -7,168 | 0 | 0 | 0 | -64 | -1,732 | -4,236 | -136 |
+| nrf52840-sensor-uf2-mdk | -7,140 | 0 | 0 | 0 | -64 | -1,732 | -4,236 | -136 |
+| nrf52840-sensor-uf2-pca10059 | -7,164 | 0 | 0 | 0 | -64 | -1,732 | -4,236 | -136 |
+| nrf52840-sensor-uf2-promicro | -7,128 | 0 | 0 | 0 | -64 | -1,732 | -4,236 | -136 |
+
+The images that do not use the core (CC2340, EFR32, ESP32, PHY62x2,
+TLSR8258) have no source change in their backends. Built in the same
+directory, PHY62x2 and TLSR8258 are byte-identical in every metric.
+
+The others move by LTO codegen noise inside the shared `zigbee-mac` crate:
+
+- `cc2340-sensor-fallback`: `flash` +28 (one function,
+  `Cc2340Driver::transmit_frame`).
+- `efr32mg1-sensor`: `flash` +4 and `mac_chain` +40, but not the
+  worst-case `stack`. In `nlme_network_discovery`, the instructions are
+  identical; only the stack slots are packed differently.
+- `efr32mg21-sensor`: `flash` +4.
+- The four ESP32 images: `flash` -122.
+
+The noise disappears when those backends move onto the core.
+
+The nRF `stack` worst case is the main task's start-up chain
+(`DeviceBuilder::assemble`). That chain runs no MAC code, so the nRF MAC
+savings show up in `mac_chain`. MAC future and struct sizes on nRF52840
+(`-Z print-type-sizes`, bytes):
+
+| future | `157d189` | slim |
+|---|---:|---:|
+| `mlme_scan` | 1,000 | 984 |
+| `mcps_data` | 608 | 408 |
+| `mlme_associate` | 592 | 336 |
+| `mlme_disassociate` | 472 | 312 |
+| `mlme_poll` / `mlme_poll_timeout` | 440 / 464 | 336 |
+| `mcps_data_indication` | 352 | 264 |
+| `SoftMacCore` struct (`RX` = 8) | 1,252 | 1,240 |
+
+`tools/mac-footprint-baseline.json` rows for these images were lowered by
+the measured deltas.
+
+Path dependence: building the same source in a directory with a different
+path changes `flash` by roughly 100–250 B (panic location strings). The
+codegen noise from crate hashes adds a few tens of bytes, and up to about
+200 B. Always measure the parent commit in the same directory, or one with
+a path of equal length, before applying the zero-growth rule.
+
 ## Measurement commands
 
 Raw binary:
