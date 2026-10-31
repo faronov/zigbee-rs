@@ -4,8 +4,8 @@ use zigbee_mac::MacDriver;
 use zigbee_runtime::event_loop::StackEvent;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::{
-    ApplicationProfile, DeviceProfile, PlantSensor, ProfileComponent, TemperatureHumidityBattery,
-    TemperatureHumidityPressureBattery,
+    ApplicationProfile, DeviceProfile, PlantSensor, ProfileComponent, RangeExtender,
+    TemperatureHumidityBattery, TemperatureHumidityPressureBattery,
 };
 use zigbee_runtime::security_store::SecurityStateStore;
 use zigbee_zcl::ClusterId;
@@ -20,6 +20,7 @@ pub trait NonOtaComponent: ProfileComponent {}
 impl NonOtaComponent for TemperatureHumidityBattery {}
 impl NonOtaComponent for TemperatureHumidityPressureBattery {}
 impl NonOtaComponent for PlantSensor {}
+impl NonOtaComponent for RangeExtender {}
 
 /// Opt-in marker for complete profiles that do not advertise an OTA client.
 ///

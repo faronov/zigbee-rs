@@ -7,10 +7,10 @@ use std::task::{Wake, Waker};
 use sensor_sed_app::SensorLifecycleError;
 use sensor_sed_app::{
     BatterySource, ButtonPolicy, DiagnosticEvent, Diagnostics, EnvironmentReading,
-    EnvironmentSource, NoOta, NoStatus, NoUserAction, OtaActivationOutcome, OtaEventOutcome,
-    OtaLifecycle, OtaServiceOutcome, SampleTrigger, SensorApp, SensorMeasurement, SensorPolicy,
-    SensorSedParts, SensorStatus, SleepDepth, StatusPolicy, StatusSink, Supervisor, WaitRequest,
-    WakeController, WakeReason,
+    EnvironmentSource, NoBattery, NoMeasurement, NoOta, NoStatus, NoUserAction,
+    OtaActivationOutcome, OtaEventOutcome, OtaLifecycle, OtaServiceOutcome, SampleTrigger,
+    SensorApp, SensorMeasurement, SensorPolicy, SensorSedParts, SensorStatus, SleepDepth,
+    StatusPolicy, StatusSink, Supervisor, WaitRequest, WakeController, WakeReason,
 };
 use zigbee_aps::frames::ApsCommandId;
 use zigbee_aps::frames::{ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader};
@@ -27,7 +27,7 @@ use zigbee_runtime::event_loop::StackEvent;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::{
     ApplicationProfile, BatteryDescriptor, DeviceProfile, EnvironmentalReporting, PlantSensor,
-    PlantSensorReporting, TemperatureHumidityBattery, TemperatureRange,
+    PlantSensorReporting, RangeExtender, TemperatureHumidityBattery, TemperatureRange,
 };
 use zigbee_runtime::role::EndDevice;
 use zigbee_runtime::security_store::{
@@ -1078,6 +1078,62 @@ fn cold_join_and_one_time_initialization_use_real_node_lifecycle() {
             .iter()
             .any(|event| matches!(event, DiagnosticEvent::FastPollStarted { duration_ms: 100 }))
     );
+}
+
+#[test]
+fn identity_only_sleepy_node_joins_without_sensors_battery_or_status() {
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::empty(&store_calls);
+    let mut profile = DeviceProfile::new(1, 0x0104, DeviceId::SIMPLE_SENSOR, RangeExtender);
+    let mut device = ZigbeeDevice::builder(MockMac::new(LOCAL_IEEE))
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        .power_mode(BASE_POLICY.power_mode())
+        .automatic_polling(false)
+        .build();
+    device.bdb_mut().initialize().expect("BDB initialize");
+    script_cold_join(&mut device);
+
+    {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let wake: RecordingWake<'_> =
+            RecordingWake::new(0, Vec::new(), &waits, &poll_counts, &delay_calls);
+        let mut app = SensorApp::new(
+            node,
+            &BASE_POLICY,
+            SensorSedParts {
+                wake,
+                status: NoStatus,
+                environment: NoMeasurement,
+                battery: NoBattery,
+                ota: NoOta,
+                actions: NoUserAction,
+                supervisor: RecordingSupervisor {
+                    heartbeats: &heartbeats,
+                },
+                diagnostics: RecordingDiagnostics {
+                    events: &diagnostics,
+                },
+            },
+        )
+        .expect("construct identity-only sensor app");
+        assert_eq!(block_on(app.initialize()), Ok(()));
+    }
+
+    assert!(device.is_joined());
+    assert_eq!(device.short_address(), OLD_SHORT.0);
+    let descriptor = device.bdb().zdo().find_endpoint(1).unwrap();
+    assert_eq!(descriptor.input_clusters.as_slice(), &[0x0000, 0x0003]);
+    assert_eq!(profile.expected_report_clusters(), 0);
 }
 
 #[test]

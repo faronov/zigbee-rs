@@ -12,7 +12,7 @@
 //!   [`SensorMeasurement`] for their own source type and profile.
 
 use zigbee_runtime::profile::{
-    ApplicationProfile, BatteryMeasurement, DeviceProfile, PlantSensor,
+    ApplicationProfile, BatteryMeasurement, DeviceProfile, PlantSensor, RangeExtender,
     TemperatureHumidityMeasurement,
 };
 
@@ -54,6 +54,28 @@ impl<P: EnvironmentalSensorProfile> SensorProfile for P {
 impl SensorProfile for DeviceProfile<PlantSensor> {
     fn update_battery(&mut self, measurement: BatteryMeasurement) {
         self.component_mut().update_battery(measurement);
+    }
+}
+
+/// A sleepy node with only Basic + Identify (no measurement clusters), for
+/// boards without fitted sensors. It has no Power Configuration cluster, so
+/// battery readings are ignored; pair it with [`NoMeasurement`] and
+/// [`crate::NoBattery`].
+impl SensorProfile for DeviceProfile<RangeExtender> {
+    fn update_battery(&mut self, _measurement: BatteryMeasurement) {}
+}
+
+/// Measurement capability of a node without fitted sensors.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoMeasurement;
+
+impl SensorMeasurement<DeviceProfile<RangeExtender>> for NoMeasurement {
+    async fn measure<D: Diagnostics>(
+        &mut self,
+        _profile: &mut DeviceProfile<RangeExtender>,
+        _trigger: SampleTrigger,
+        _diagnostics: &mut D,
+    ) {
     }
 }
 
