@@ -329,7 +329,10 @@ impl RadioToken {
     ///
     /// Requires the HFXO to be running (radio reference clock).
     pub fn init(self) -> Result<Radio, RadioError> {
-        if !chip::SUPPORTED {
+        // `black_box`: an unsupported die must fail at run time without
+        // letting the optimiser prune everything downstream of radio init,
+        // so the image still links (and is sized) like a working one.
+        if !core::hint::black_box(chip::SUPPORTED) {
             return Err(RadioError::Unsupported);
         }
         crate::delay::enable_cycle_counter();

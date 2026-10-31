@@ -18,6 +18,32 @@ pub fn eui64() -> [u8; 8] {
     eui64_from_words(lo, hi)
 }
 
+/// Silicon Labs manufacturing token `MFG_CTUNE` in the user-data page
+/// (GSDK `USERDATA_BASE + 0x100`, `sl_device_init_hfxo_s2.c`).
+const MFG_CTUNE: u32 = 0x0FE0_0100;
+
+/// Board HFXO tuning stored by the manufacturer in the `MFG_CTUNE` token,
+/// if programmed.
+///
+/// GSDK precedence (`sl_device_init_hfxo`): module DEVINFO `MODXOCAL`
+/// (modules only), then this token, then the board default. Products built
+/// on a bare chip (e.g. the Home Assistant Connect ZBT-1) use this token
+/// with a board fallback; an erased token (`0xFFFF`) or a value that does
+/// not fit the 8-bit `CTUNEXIANA` field yields `None`.
+pub fn mfg_ctune() -> Option<u8> {
+    // SAFETY: the user-data page is always-readable memory-mapped flash.
+    let raw = unsafe { core::ptr::read_volatile(MFG_CTUNE as *const u16) };
+    ctune_from_token(raw)
+}
+
+pub(crate) const fn ctune_from_token(raw: u16) -> Option<u8> {
+    if raw <= u8::MAX as u16 {
+        Some(raw as u8)
+    } else {
+        None
+    }
+}
+
 pub(crate) const fn eui64_from_words(lo: u32, hi: u32) -> [u8; 8] {
     let l = lo.to_le_bytes();
     let h = hi.to_le_bytes();
@@ -27,6 +53,14 @@ pub(crate) const fn eui64_from_words(lo: u32, hi: u32) -> [u8; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mfg_ctune_rejects_erased_and_out_of_range_tokens() {
+        assert_eq!(ctune_from_token(0xFFFF), None);
+        assert_eq!(ctune_from_token(0x0100), None);
+        assert_eq!(ctune_from_token(133), Some(133));
+        assert_eq!(ctune_from_token(0), Some(0));
+    }
 
     #[test]
     fn eui64_is_little_endian_low_word_first() {
