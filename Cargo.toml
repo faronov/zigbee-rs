@@ -58,6 +58,7 @@ exclude = [
     "boards/efr32mg22-devkit",
     "boards/ha-connect-zbt1",
     "products/efr32mg22-sensor",
+    "products/ha-connect-zbt1",
     "boards/bl702-xt-zb1",
     "bl702-hal",
     "efr32mg1-hal",
@@ -67,6 +68,7 @@ exclude = [
     "examples/efr32mg1-sensor",
     "examples/efr32mg21-sensor",
     "examples/efr32mg22-sensor",
+    "examples/ha-connect-zbt1",
     "phy6222-hal",
 ]
 
