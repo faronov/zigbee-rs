@@ -12,7 +12,7 @@ products/tlsr8258-tb04
         ↓
 boards/tlsr8258-tb04
         ↓
-tlsr8258-hal + TelinkMac + tlsr8258-rt
+tlsr8258-hal + TelinkRouterMac + tlsr8258-rt
 ```
 
 This example is the composition root.
@@ -23,8 +23,10 @@ rejoin, and factory-reset ordering. `src/app.rs` supplies TC32 static storage,
 product adapters, and retained diagnostics; it is not a duplicate router
 state machine.
 
-`TelinkMac` implements `ParentMacDriver`, so this product can construct a true
-parent router. The historically named `nrf52840-router` example is instead an
+`TelinkRouterMac` (the legacy Telink parent MAC, zigbee-mac feature
+`telink-legacy-router`) implements `ParentMacDriver`, so this product can
+construct a true parent router. It will move to the shared `SoftMacCore`
+parent role once that path fits the router's flash budget. The historically named `nrf52840-router` example is instead an
 always-on End Device composition and does not accept children.
 
 ## Persistence

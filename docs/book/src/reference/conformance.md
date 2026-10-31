@@ -35,7 +35,8 @@ Unsupported role capabilities are absent at compile time. A backend that
 cannot provide association responses, pending transactions and indirect
 delivery cannot construct a parent router or coordinator.
 
-Only the tc32 Telink `TelinkMac` and host `MockMac` implement the sealed
+Only the tc32 Telink `TelinkRouterMac`, the shared `SoftMacCore` parent role
+and host `MockMac` implement the sealed
 `ParentMacDriver`. Telink advertises `router: true` and `coordinator: false`;
 all other real backends use non-parent capability descriptors. Consequently
 `examples/nrf52840-router` is an `AlwaysOnEndDeviceApp`, not a Zigbee router.

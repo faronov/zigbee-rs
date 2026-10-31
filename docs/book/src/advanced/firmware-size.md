@@ -318,6 +318,34 @@ The nRF sensor `mac_stack` rose by 884 B and `mac_code` by about 3.8 KB, while
 The nRF main-task future, measured with `-Z print-type-sizes`, shrank from
 18,648 B to 18,632 B on the sensor and from 18,024 B to 17,768 B on the router.
 
+### Phase B: TLSR8258 sensors
+
+The three TLSR8258 sensor images moved to
+`SoftMacCore<TelinkRadioPhy, EndDevice>` with `TxOffload::Full`: the HAL runs
+CSMA-CA with the PIB parameters, the transmission and the Imm-Ack wait in one
+radio operation, and the turnaround-critical ACK stays in the HAL
+RX-completion path. The router stays on the legacy `TelinkRouterMac`
+(`telink-legacy-router` feature), which the sensors no longer link. Measured
+against `157d189`:
+
+| image | `flash` | `data` | `bss` | `pool` | `stack` | `mac_chain` | `mac_stack` | `mac_frame` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| tlsr8258-router | 270,790 (-4) | 2,428 (0) | 19,684 (0) | 0 | 6,488 (0) | 6,488 (0) | 2,992 (0) | 1,464 (0) |
+| tlsr8258-sensor | 167,671 (-1,616) | 2,156 (0) | 8,384 (-1,432) | 0 | 4,680 (-4,564) | 4,088 (-5,156) | 1,832 (-1,136) | 896 (+144) |
+| tlsr8258-sensor-retention | 171,015 (-1,480) | 2,156 (0) | 10,852 (-1,432) | 0 | 4,656 (-4,564) | 4,064 (-5,156) | 1,832 (-1,136) | 896 (+144) |
+| tlsr8258-sensor-retention-10s | 171,019 (-1,480) | 2,156 (0) | 10,852 (-1,432) | 0 | 4,656 (-4,564) | 4,064 (-5,156) | 1,832 (-1,136) | 896 (+144) |
+
+The retained LOW32K SVC stack reservation is unchanged at 8,448 B; the static
+worst-case stack under it fell by 4,564 B. The `.bss` saving is the legacy
+MAC's data-indication, command-event and association queues, which the
+end-device core does not need.
+
+A full router port onto `SoftMacCore<TelinkRadioPhy, Parent<8, 8, 1>>` was
+measured at 272,340 B (+1,546) and rejected by the gate. The added
+`RadioPhy::set_rx_on_when_idle` hook is zero-cost elsewhere: `bl702-sensor`
+is byte-identical, and `nrf52840-sensor` and `nrf52840-router` differ only
+in 20 bytes of panic-location line numbers.
+
 ## Measurement commands
 
 Raw binary:

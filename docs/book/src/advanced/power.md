@@ -98,8 +98,9 @@ Feature-gated proof images:
 ```
 
 The first retains the 250 ms slow cadence; the second uses 10 seconds. The
-independent retention HIL pass marker is `0x5254600D`; a successful compile is
-not that marker.
+former independent retention HIL image was removed with
+`tools/telink-tlsr8258-lab`; hardware proof has to run on these images, and a
+successful compile is not that proof.
 
 ## Security and flash before sleep
 

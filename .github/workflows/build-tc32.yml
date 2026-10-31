@@ -6,7 +6,6 @@ on:
     paths:
       - "examples/telink-tlsr8258-sensor/**"
       - "examples/telink-tlsr8258-router/**"
-      - "tools/telink-tlsr8258-lab/**"
       - "scripts/tlsr8258.sh"
       - "tools/tlsr8258-firmware.sh"
       - "tools/firmware-size-report.sh"
@@ -24,7 +23,6 @@ on:
     paths:
       - "examples/telink-tlsr8258-sensor/**"
       - "examples/telink-tlsr8258-router/**"
-      - "tools/telink-tlsr8258-lab/**"
       - "scripts/tlsr8258.sh"
       - "tools/tlsr8258-firmware.sh"
       - "tools/firmware-size-report.sh"
@@ -116,9 +114,8 @@ jobs:
             tlsr8258-hal/target
             boards/tlsr8258-tb04/target
             products/tlsr8258-tb04/target
-            tools/telink-tlsr8258-lab/target
             examples/telink-tlsr8258-radio/target
-          key: ${{ env.TC32_TOOLCHAIN_TAG }}-${{ env.TC32_TOOLCHAIN_SHA256 }}-${{ env.HOST_RUST_TOOLCHAIN }}-${{ runner.os }}-tc32-unknown-none-elf-prod-retention-router-pm-retention-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '**/.cargo/config.toml', '**/memory*.x', 'scripts/tlsr8258.sh', 'tools/tlsr8258-firmware.sh', 'tools/telink-tlsr8258-lab/scripts/tlsr8258.sh', 'examples/telink-tlsr8258-radio/scripts/tlsr8258.sh') }}
+          key: ${{ env.TC32_TOOLCHAIN_TAG }}-${{ env.TC32_TOOLCHAIN_SHA256 }}-${{ env.HOST_RUST_TOOLCHAIN }}-${{ runner.os }}-tc32-unknown-none-elf-prod-retention-router-pm-retention-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '**/.cargo/config.toml', '**/memory*.x', 'scripts/tlsr8258.sh', 'tools/tlsr8258-firmware.sh', 'examples/telink-tlsr8258-radio/scripts/tlsr8258.sh') }}
 
       - name: Build production sensor variants and parent router
         run: |
@@ -216,18 +213,6 @@ jobs:
             fi
           done
 
-      - name: Build hardware lab matrix
-        run: |
-          for mode in diag-beacon diag-assoc diag-smoke diag-pm diag-retention lab-sensor; do
-            ./scripts/tlsr8258.sh build "$mode"
-            source=tools/telink-tlsr8258-lab/target/tc32-unknown-none-elf/release/telink-tlsr8258-lab.bin
-            if [[ "$mode" == diag-retention ]]; then
-              source=tools/telink-tlsr8258-lab/target/tc32-unknown-none-elf/release/telink-tlsr8258-lab.retention.bin
-            fi
-            cp "$source" \
-              "target/tlsr8258-artifacts/telink-tlsr8258-${mode}.bin"
-          done
-
       - name: Build standalone radio harness
         working-directory: examples/telink-tlsr8258-radio
         run: |
@@ -297,4 +282,3 @@ jobs:
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path tlsr8258-rt/Cargo.toml -- --check
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path products/tlsr8258-tb04/Cargo.toml -- --check
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path examples/telink-tlsr8258-sensor/Cargo.toml -- --check
-          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path tools/telink-tlsr8258-lab/Cargo.toml -- --check
