@@ -39,10 +39,11 @@ The last group is Phase B of the MAC unification.
 
 ## What the PHY must implement
 
-`RadioPhy` (`zigbee-mac/src/phy.rs`) has these required methods:
+`RadioPhy` (`zigbee-mac/src/phy.rs`) has these required items:
 
-| method | contract |
+| item | contract |
 |---|---|
+| `type Tx` | The transmit offload level: `SoftwareTx`, `AckWaitTx` or `FullTx` (see below). |
 | `capabilities()` | Reports `hardware_auto_ack`, `hardware_address_filter` and the TX power range. |
 | `try_transmit(frame)` | One CCA, then transmit. The PHY appends the FCS. A busy CCA returns `PhyError::ChannelBusy`. Never retry inside the PHY. |
 | `send_ack(seq, fp)` | Immediate ACK, used only as a fallback when `hardware_auto_ack == false`. |
@@ -67,30 +68,45 @@ let mac = SoftMacCore::<MyPhy, EndDevice, 8>::new_custom(phy, pib)?;
 let router = SoftMacCore::<MyPhy, Parent<8, 8, 8>, 8>::new_custom(phy, pib)?;
 ```
 
+`RX`, the retained-RX depth, must be 1..=255 (a compile-time assertion).
+Each slot costs 127 B in the MAC struct.
+
 Keep the constructor `#[inline(never)]` if the composition root stores the
 MAC in an Embassy task future (see `NrfRadioPhy::into_soft_mac`). Otherwise
 the main task's stack frame grows by the size of the core.
 
 ## Optional capabilities
 
-Every option is an associated constant or a provided method with a default.
-None of them uses runtime flags or `dyn`. A PHY that keeps the defaults
-compiles to exactly the software path and pays nothing for the others.
+Every option is the `Tx` marker type, an associated constant or a provided
+method with a default. None of them uses runtime flags or `dyn`. Only the
+selected transmit path is compiled, and the futures have exactly the size
+that path needs.
+
+| `type Tx =` | the PHY implements | the core keeps |
+|---|---|---|
+| `zigbee_mac::SoftwareTx` | `try_transmit` (one CCA + TX) and `send_ack` | CSMA-CA, ACK wait, retries |
+| `zigbee_mac::AckWaitTx` | `try_transmit_acknowledged(frame)`: one CCA + TX + Imm-Ack wait in the ISR or radio core. Returns `Ok(Some(ack))`, `Ok(None)` when no ACK arrived, or `ChannelBusy`. Used by EFR32 and PHY62x2. | CSMA-CA backoffs, retries |
+| `zigbee_mac::FullTx` | `transmit_offloaded(frame, ack_requested, TxParams)`: the complete CSMA-CA, ACK wait and retry sequence. `TxParams` carries `macMaxCSMABackoffs`, `macMinBE`, `macMaxBE` and `macMaxFrameRetries`. Used by CC2340 PBE and ESP. | nothing |
+
+The unused methods keep their `Unsupported` defaults.
 
 | item | default | use it when |
 |---|---|---|
-| `const TX_OFFLOAD: TxOffload` | `None` | `AckWait`: the ISR or radio core waits for the Imm-Ack (EFR32, PHY62x2). `Full`: the hardware runs CSMA-CA, retries and the ACK wait (CC2340 PBE, ESP). |
-| `try_transmit_acknowledged(frame)` | `Unsupported` | Required for `AckWait`. One CCA + TX + ACK wait. Returns `Ok(Some(ack))`, `Ok(None)` when no ACK arrived, or `ChannelBusy`. |
-| `transmit_offloaded(frame, ack_requested, TxParams)` | `Unsupported` | Required for `Full`. `TxParams` carries the PIB values `macMaxCSMABackoffs`, `macMinBE`, `macMaxBE` and `macMaxFrameRetries`. |
 | `const POLL_RESPONSE_WAIT_US` | 30 ms | How long to wait for indirect data after an ACK with FP=1. nRF uses 1.5 s, the value proven on hardware with the legacy MAC. |
 | `const POLL_EXTENDED_FALLBACK` | `false` | Retry an empty short-source poll once with the EUI-64. EmberZNet parents queue a Rejoin Response or Transport-Key by EUI-64. |
 | `set_ack_frame_pending(src, on)` / `clear_ack_frame_pending()` | `Unsupported` / no-op | A parent with `hardware_auto_ack` must arm FP in the hardware or ISR source-match table. |
 | `sleep()` / `wake()` | `Ok(())` | Radio power-down between polls. `SoftMacCore::wake` re-applies channel, power and filter. |
 
-The core selects transmit paths with `ConstEither`, an untagged union that is
-dispatched on a constant. Do not write `if P::CONST { a.await } else { b.await }`
-in the core: coroutine layout is computed before monomorphisation, so both
-await states, and the code for both paths, would stay in every image.
+The core selects the transmit path through the sealed `TxOffload` trait
+implemented by the three marker types. Do not write
+`if P::CONST { a.await } else { b.await }` in the core: coroutine layout is
+computed before monomorphisation, so both await states, and the code for
+both paths, would stay in every future of every image.
+
+*API change:* `type Tx` replaces the former `const TX_OFFLOAD: TxOffload`
+enum (`None` / `AckWait` / `Full` become `SoftwareTx` / `AckWaitTx` /
+`FullTx`). It is a required item because stable Rust has no associated-type
+defaults; existing PHYs add one line, e.g. `type Tx = zigbee_mac::SoftwareTx;`.
 
 ### ACK generation
 
@@ -107,15 +123,33 @@ A busy `send_ack` is not fatal. The originator simply retransmits.
 
 ### Received-frame rules
 
-- Every frame is ACK-handled exactly once, at the moment it is received.
-  `wait_for_ack`, `receive_data` and the poll and association waits do this
-  before a frame is retained, so a frame taken from the retained-RX queue is
-  never acknowledged a second time.
-- The retained-RX queue is a synchronous `heapless::Deque<PhyRxFrame, RX>`.
-  Never move a `PhyRxFrame` (129 B) into a nested `async fn`, because it is
-  duplicated in every enclosing future. Keep the frame in the caller across
-  the single ACK await and use the synchronous helpers `is_retained`,
-  `store_retained` and `indication_from`.
+Every receive window (ACK wait, poll response, association response,
+post-association capture, data indication, command events, beacon
+collection) is the one `SoftMacCore::listen` loop. Each received frame is
+classified synchronously by `accept` the moment it is received:
+
+- During a scan only beacons are used; nothing is retained or acknowledged.
+- An Imm-Ack ends the window only when it matches the awaited sequence.
+- A data frame or MAC command addressed exactly to us with the ACK-request
+  bit gets one software ACK, in every window, unless the PHY reports
+  `hardware_auto_ack`. Frames taken later from the retained-RX queue are
+  never acknowledged again.
+- Retained: data frames to an accepted destination (pending RX), MAC
+  commands on a parent (command queue), and Association Responses addressed
+  to us. Malformed frames, frames for other destinations, beacons outside a
+  scan and MAC commands on an end device are dropped.
+- A poll response from our parent is put at the front of pending RX. A full
+  pending RX evicts its oldest frame.
+- One window handles at most 256 frames, so a PHY whose clock stalls cannot
+  keep the MAC spinning.
+
+No future ever holds a received frame across an await; only the software
+ACK (sequence and Frame Pending bit) survives the `send_ack` await. Keep it
+that way when changing the core: a `PhyRxFrame` (127 B) moved into a nested
+future is duplicated in every enclosing future, i.e. on every NWK/APS/ZDO
+caller's stack. For the same reason, MAC procedures that take a request or
+frame by value are written as `fn … -> impl Future { async move { … } }`
+rather than `async fn` (an `async fn` stores a by-value argument twice).
 
 ## Router / parent role
 
@@ -195,9 +229,9 @@ To find growth:
   `frames.rs`.
 - **ED scan on nRF.** `NrfRadioPhy::energy_detect` returns `Unsupported`,
   as the legacy `NrfMac` did, because embassy-nrf exposes no ED primitive.
-- **Hard-bounded poll.** `mlme_poll_timeout` uses the trait default, which
-  discards a late result. EFR32 and Telink cancel the radio operation with a
-  timer.
+- **Hard-bounded poll.** `mlme_poll_timeout` (`SoftMacCore::poll_within`)
+  discards a result that completed at or after the deadline, but does not
+  cancel the radio operation. EFR32 and Telink cancel it with a timer.
 - **Per-backend diagnostics counters.** Telink and EFR32 keep their own;
   the core exposes only `dropped_command_events()`.
 - **Hardware security offload** is not modelled. Every backend uses software
