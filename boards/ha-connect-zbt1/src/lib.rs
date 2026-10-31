@@ -1,6 +1,7 @@
 //! BSP for the Home Assistant Connect ZBT-1 (formerly SkyConnect).
 //!
-//! EFR32MG21A020F512IM32 behind a CP2102N USB-UART bridge. Wiring is from
+//! EFR32MG21A020F1024IM32 (1 MiB flash, 96 KiB RAM) behind a CP2102N
+//! USB-UART bridge. Wiring is from
 //! the Nabu Casa firmware-builder manifests
 //! (`manifests/nabucasa/skyconnect/*.yaml`): USART0 TX PA6, RX PA5,
 //! CTS PB1, RTS PB0, 115200 8N1 with hardware flow control. No user LED
@@ -8,8 +9,12 @@
 //! exposed.
 //!
 //! HFXO tuning follows the GSDK precedence: the factory `MFG_CTUNE` token
-//! in the user-data page when programmed, otherwise the xG21 device_init
-//! default 140 (`sl_device_init_hfxo_config.h`, sdid200).
+//! in the user-data page when programmed, otherwise a board default. The
+//! inspected unit has every MFG token erased and no DEVINFO CTUNE, so the
+//! stock firmware uses a compile-time value; until that value is read
+//! from the running stock image's HFXO0 `XTALCTRL`, the default is the
+//! xG21 device_init value 140 (`sl_device_init_hfxo_config.h`, sdid200).
+//! The EUI-64 comes from DEVINFO; the custom-EUI token is erased.
 //!
 //! The shipped Gecko Bootloader occupies `0x0..0x4000` and has no GPIO
 //! activation; once an application replaces the NCP, the only ways back
@@ -30,7 +35,7 @@ use efr32s2_hal::{
 };
 
 pub const BOARD_NAME: &str = "Home Assistant Connect ZBT-1";
-pub const MCU_PART: &str = "EFR32MG21A020F512IM32";
+pub const MCU_PART: &str = "EFR32MG21A020F1024IM32";
 pub const HCLK_HZ: u32 = 38_400_000;
 /// xG21 GSDK default used when the `MFG_CTUNE` token is erased.
 pub const DEFAULT_HFXO_CTUNE: u16 = 140;

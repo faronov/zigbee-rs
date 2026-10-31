@@ -225,14 +225,27 @@ on an xG21 die.
 
 `boards/ha-connect-zbt1` describes the ZBT-1:
 
-- EFR32MG21A020F512IM32 behind a CP2102N;
+- EFR32MG21A020F1024IM32 (1 MiB flash, 96 KiB RAM, SE firmware 0.1.6)
+  behind a CP2102N;
 - USART0 TX PA6, RX PA5, CTS PB1, RTS PB0, 115200 with hardware flow
   control, per the Nabu Casa firmware-builder manifests;
-- HFXO CTUNE from the `MFG_CTUNE` token, otherwise 140;
+- HFXO CTUNE from the `MFG_CTUNE` token, otherwise a board default. On the
+  inspected unit every MFG token is erased and DEVINFO has no CTUNE, so the
+  default must match the stock firmware's compile-time value, read
+  read-only from HFXO0 `XTALCTRL` before the first flash (140, the xG21
+  device_init value, until then);
+- EUI-64 from DEVINFO (the custom-EUI token is erased);
 - no EFR-driven LED or button is confirmed.
 
 The shipped Gecko Bootloader (2.4.2) occupies `0x0..0x4000`, which matches
 the MG21 product layout, and accepts GBL files over XMODEM on that UART.
+The stock flash image has the NCP at `0x4000..0x3E9D8`, NVM3 at
+`0x74000..0x7E000`, and the upper 512 KiB erased. The NCP's Application
+Properties use signature type NONE, so the bootloader does not enforce
+secure boot and starts an application without an Application Properties
+pointer. The MG21 product layout (app `0x4000..0x7C000`, journal
+`0x7C000..0x80000`) fits the F1024 part unchanged; flashing it replaces
+the stock NVM3.
 
 **Recovery risk.** The bootloader has no GPIO activation. Once our
 application replaces the NCP, the only ways back into the bootloader are:
