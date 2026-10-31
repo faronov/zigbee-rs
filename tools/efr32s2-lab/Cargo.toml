@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 autobins = false
 description = "Step-by-step EFR32 Series 2 bring-up binaries (clocks, VCOM, I2C, raw 802.15.4 radio)"
+build = "build.rs"
 
 [[bin]]
 name = "s2-blink"
@@ -13,18 +14,32 @@ path = "src/bin/blink.rs"
 [[bin]]
 name = "s2-i2c-scan"
 path = "src/bin/i2c_scan.rs"
+required-features = ["wstk"]
 
 [[bin]]
 name = "s2-radio"
 path = "src/bin/radio.rs"
 
 [[bin]]
+name = "s2-tx-loop"
+path = "src/bin/tx_loop.rs"
+
+[[bin]]
+name = "s2-ed-mon"
+path = "src/bin/ed_mon.rs"
+
+[[bin]]
 name = "s2-em2"
 path = "src/bin/em2.rs"
+required-features = ["wstk"]
 
 [features]
-default = ["efr32mg22"]
-efr32mg22 = ["efr32s2-hal/efr32mg22"]
+default = ["wstk"]
+# BRD4001A + BRD4183A (EFR32MG22): VCOM log, LED0, image at 0x0.
+wstk = ["efr32s2-hal/efr32mg22"]
+# Home Assistant Connect ZBT-1 (EFR32MG21): image at 0x4000 above the
+# resident Gecko Bootloader, log through SEGGER RTT over SWD.
+zbt1 = ["efr32s2-hal/efr32mg21"]
 
 [dependencies]
 efr32s2-hal = { path = "../../efr32s2-hal", features = ["rt", "time-driver"] }
