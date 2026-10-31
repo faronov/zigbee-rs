@@ -23,6 +23,10 @@ use crate::rtcc::{self, Channel};
 
 const EMU_CTRL: u32 = crate::chip::base::EMU + 0x074;
 const EMU_CTRL_EM2DBGEN: u32 = 1 << 0;
+/// `EMU_TEMP` (offset 0x88 on xG21 and xG22): die temperature in quarter
+/// kelvin in `TEMP[10:2]:TEMPLSB[1:0]`, updated by hardware in EM0-EM2.
+const EMU_TEMP: u32 = crate::chip::base::EMU + 0x088;
+const EMU_TEMP_MASK: u32 = 0x7FF;
 const SCB_SCR: u32 = 0xE000_ED10;
 const SCB_SCR_SLEEPDEEP: u32 = 1 << 2;
 const SET: u32 = 0x1000;
@@ -193,9 +197,32 @@ unsafe fn write(address: u32, value: u32) {
     unsafe { write_reg(address, value) }
 }
 
+/// Die temperature from the EMU sensor, in 0.01 °C.
+///
+/// GSDK `EMU_TemperatureGet` (devices with `_EMU_TEMP_TEMPLSB_MASK`):
+/// `(TEMP & 0x7FF) / 4 - 273.15`. This is the chip temperature, not an
+/// ambient measurement.
+pub fn die_temperature_centi_celsius() -> i16 {
+    let raw = unsafe { read_reg(EMU_TEMP) } & EMU_TEMP_MASK;
+    quarter_kelvin_to_centi_celsius(raw)
+}
+
+const fn quarter_kelvin_to_centi_celsius(raw: u32) -> i16 {
+    (raw as i32 * 25 - 27_315) as i16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emu_temp_conversion_matches_gsdk() {
+        assert_eq!(EMU_TEMP, 0x4000_4088);
+        // 298.25 K = 25.10 °C.
+        assert_eq!(quarter_kelvin_to_centi_celsius(1193), 2_510);
+        assert_eq!(quarter_kelvin_to_centi_celsius(0), -27_315);
+        assert_eq!(quarter_kelvin_to_centi_celsius(0x7FF), 23_860);
+    }
 
     #[test]
     fn emu_ctrl_matches_gsdk() {

@@ -39,6 +39,9 @@ pub struct Efr32s2RadioPhy {
     radio: Radio,
     ieee: IeeeAddress,
     rx_on_when_idle: bool,
+    /// Set by [`RadioPhy::sleep`]; [`RadioPhy::wake`] then re-initializes
+    /// the radio, which EM2 requires.
+    asleep: bool,
 }
 
 /// The EFR32 Series 2 MAC: the shared software MAC over [`Efr32s2RadioPhy`].
@@ -56,6 +59,7 @@ impl Efr32s2RadioPhy {
             radio,
             ieee: efr32s2_hal::devinfo::eui64(),
             rx_on_when_idle: false,
+            asleep: false,
         })
     }
 
@@ -209,14 +213,26 @@ impl RadioPhy for Efr32s2RadioPhy {
         }
     }
 
+    /// Radio idle. The platform may then enter EM2; [`RadioPhy::wake`]
+    /// must run before the next radio operation.
     fn sleep(&mut self) -> Result<(), PhyError> {
         self.radio.idle();
+        self.asleep = true;
         Ok(())
     }
 
-    /// The radio registers and per-channel VCO tuning survive EM2; the next
-    /// operation re-arms RX or TX.
+    /// Re-initialize the radio after [`RadioPhy::sleep`] (`Radio::resume`,
+    /// about 95 µs on xG22). EM2 keeps the PHY register file but the
+    /// receiver stays dead without it (lab gate `s2-em2`); the VCO
+    /// calibration cache, channel and TX power are kept.
     fn wake(&mut self) -> Result<(), PhyError> {
+        if self.asleep {
+            self.radio.resume().map_err(map_radio_error)?;
+            self.asleep = false;
+        }
+        if self.rx_on_when_idle {
+            self.radio.rx_on().map_err(map_radio_error)?;
+        }
         Ok(())
     }
 }
