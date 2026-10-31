@@ -19,7 +19,7 @@
 //! - `MODEM.IRCALCOEFWR0/1` are replaced by the per-die DEVINFO word at
 //!   [`DEVINFO_IRCAL`] when it is programmed.
 
-use super::{AnalogState, Layout};
+use super::{AnalogState, CLR, L, Layout, RAC_IF, RAC_IF_STATECHANGE, Warm, read, write};
 
 pub(super) const SUPPORTED: bool = true;
 
@@ -33,8 +33,6 @@ pub(super) const LAYOUT: Layout = Layout {
     bufc_buf0: 0x0C,
     bufc_buf_stride: 0x40,
     agc_rssi: 0x18,
-    modem_rampctrl: 0xC4,
-    modem_ramplev: 0xCC,
 };
 
 /// DEVINFO word holding the 2.4 GHz IR-calibration coefficients.
@@ -49,6 +47,12 @@ pub(super) const DEVINFO_IRCAL: u32 = 0x0FE0_8248;
 pub(super) const RSSI_ADJUST_DBM: i8 = -50;
 pub(super) const MODEM_IRCALCOEFWR0: u32 = 0xB801_4288;
 pub(super) const MODEM_IRCALCOEFWR1: u32 = 0xB801_428C;
+
+/// `SYNTH.LOCNTCTRL.FCALRUNCLKEN`.
+pub(super) const LOCNT_FCALRUNCLKEN: u32 = 1 << 11;
+/// MODEM.RAMPCTRL / RAMPLEV offsets (xG22 `MODEM_TypeDef`).
+const MODEM_RAMPCTRL: u32 = 0xC4;
+const MODEM_RAMPLEV: u32 = 0xCC;
 
 /// Static PHY + MAC-framing configuration, in ascending address order.
 pub(super) const INIT: &[(u32, u32)] = &[
@@ -161,9 +165,12 @@ pub(super) const INIT: &[(u32, u32)] = &[
     (0xB8020174, 0x00000770), // RAC.XORETIMECTRL
 ];
 
+/// Number of RAC/analog registers switched per radio state.
+pub(super) const STATE_REGS: usize = 16;
+
 /// Analog/RAC registers that the RAIL sequencer rewrites on every state
 /// change (diff of the idle, RX-search and TX snapshots).
-const RAC_STATE_REGS: [u32; 16] = [
+const RAC_STATE_REGS: [u32; STATE_REGS] = [
     0xB802_0094, // RAC.SYNTHENCTRL
     0xB802_00B4, // RAC.PAENCTRL
     0xB802_00E0, // RAC.IFADCDBG
@@ -193,7 +200,7 @@ pub(super) const IDLE: AnalogState = AnalogState {
         0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0006_4E29,
         0x0000_0402, 0x0000_0000, 0x0000_0800, 0x0000_0000,
     ],
-    synth: [(SYNTH_VCDACCTRL, 0x26), (SYNTH_VCORANGE, 0xC8)],
+    extra: &[(SYNTH_VCDACCTRL, 0x26), (SYNTH_VCORANGE, 0xC8)],
 };
 
 #[rustfmt::skip]
@@ -205,7 +212,7 @@ pub(super) const RX: AnalogState = AnalogState {
         0x0000_0006, 0x0000_0656, 0x0000_0000, 0x0006_4E29,
         0x0000_1FBF, 0x0000_0003, 0x0000_0800, 0x0000_0000,
     ],
-    synth: [(SYNTH_VCDACCTRL, 0xA6), (SYNTH_VCORANGE, 0xC8)],
+    extra: &[(SYNTH_VCDACCTRL, 0xA6), (SYNTH_VCORANGE, 0xC8)],
 };
 
 #[rustfmt::skip]
@@ -217,7 +224,7 @@ pub(super) const TX: AnalogState = AnalogState {
         0x0000_0014, 0x0000_00B0, 0xC3C8_0000, 0x0006_6E28,
         0x0000_1FBD, 0x0000_0400, 0x0000_0400, 0x0000_07F3,
     ],
-    synth: [(SYNTH_VCDACCTRL, 0xA6), (SYNTH_VCORANGE, 0x158)],
+    extra: &[(SYNTH_VCDACCTRL, 0xA6), (SYNTH_VCORANGE, 0x158)],
 };
 
 /// `(deci-dBm, RAMPLEV, RAMPCTRL)` as programmed by GSDK 4.5.0
@@ -244,3 +251,79 @@ pub(super) const TX_POWER: &[(i16, u8, u16)] = &[
     (50, 0x45, 0x444),
     (60, 0x4F, 0x333),
 ];
+
+/// Program the ramp of a [`TX_POWER`] entry (all three ramp levels).
+pub(super) fn write_tx_power(ramplev: u8, rampctrl: u16) {
+    let lev = u32::from(ramplev);
+    unsafe {
+        write(L.modem + MODEM_RAMPLEV, lev | (lev << 8) | (lev << 16));
+        let ctrl = read(L.modem + MODEM_RAMPCTRL);
+        write(
+            L.modem + MODEM_RAMPCTRL,
+            (ctrl & !0xFFF) | u32::from(rampctrl),
+        );
+    }
+}
+
+/// The PA setting lives entirely in the ramp registers on xG22.
+#[inline(always)]
+pub(super) fn tx_state_power(_ddbm: i16) {}
+
+/// The xG22 0/6 dBm PA ramps without CPU help; `TXPD` is not held.
+pub(super) const PA_RAMP_IN_TXPD: bool = false;
+
+/// See [`PA_RAMP_IN_TXPD`].
+#[inline(always)]
+pub(super) fn pa_ramp_up() {}
+
+/// See [`pa_ramp_up`].
+#[inline(always)]
+pub(super) fn pa_ramp_down() {}
+
+// ---- Radio state hand-shake -------------------------------------------
+//
+// `RAC.CTRL.SEQCLKDIS` gates the sequencer; the RSM instead stops in each
+// state it enters until the matching `RAC.SEQIF.STATE*` flag is cleared.
+
+const RAC_SEQIF: u32 = 0x28;
+const RAC_SEQIF_ALL: u32 = 0x3FFF_000F;
+const RAC_SEQIF_RXWARM: u32 = 1 << 17;
+const RAC_SEQIF_TXWARM: u32 = 1 << 24;
+/// Warm states are held until the driver has calibrated and locked the
+/// synthesizer (the RSM only enables the LO path in RXWARM/TXWARM).
+const RAC_SEQIF_HELD: u32 = RAC_SEQIF_RXWARM | RAC_SEQIF_TXWARM;
+
+const fn seqif(warm: Warm) -> u32 {
+    match warm {
+        Warm::Rx => RAC_SEQIF_RXWARM,
+        Warm::Tx => RAC_SEQIF_TXWARM,
+        Warm::TxPd => 0,
+    }
+}
+
+/// Drop any stale state hand-shake.
+pub(super) fn seq_init() {
+    unsafe { write(L.rac + RAC_SEQIF + CLR, RAC_SEQIF_ALL) };
+}
+
+/// Release every state except the held warm states.
+pub(super) fn seq_service() {
+    unsafe {
+        // Clear the host flag first so a state entered after the SEQIF read
+        // re-raises the interrupt instead of being lost.
+        write(L.rac + RAC_IF + CLR, RAC_IF_STATECHANGE);
+        let pending = read(L.rac + RAC_SEQIF) & RAC_SEQIF_ALL & !RAC_SEQIF_HELD;
+        if pending != 0 {
+            write(L.rac + RAC_SEQIF + CLR, pending);
+        }
+    }
+}
+
+/// Warm states are always held on xG22.
+#[inline(always)]
+pub(super) fn seq_arm(_warm: Warm) {}
+
+/// Release a held warm state.
+pub(super) fn seq_release(warm: Warm) {
+    unsafe { write(L.rac + RAC_SEQIF + CLR, seqif(warm)) };
+}

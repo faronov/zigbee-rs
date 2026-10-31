@@ -15,7 +15,7 @@ const CMU_SYSCLKCTRL: u32 = CMU_BASE + 0x070;
 const CMU_CLKEN0: u32 = CMU_BASE + 0x064;
 #[cfg(feature = "efr32mg22")]
 const CMU_CLKEN1: u32 = CMU_BASE + 0x068;
-#[cfg(feature = "efr32mg22")]
+/// Present on both xG21 and xG22 at the same offset.
 const CMU_RADIOCLKCTRL: u32 = CMU_BASE + 0x280;
 
 const HFXO_BASE: u32 = 0x4000_C000;
@@ -31,6 +31,14 @@ const HFXO_CMD: u32 = HFXO_BASE + 0x050;
 #[cfg(feature = "efr32mg22")]
 const HFXO_CMD_MANUALOVERRIDE: u32 = 1 << 1;
 const HFXO_LOCK: u32 = HFXO_BASE + 0x080;
+/// xG21: undocumented HFXO low-power / squaring-buffer control and peak
+/// detector registers adjusted by GSDK `CHIP_Init` on revision A parts.
+#[cfg(feature = "efr32mg21")]
+const HFXO_LOWPWRCTRL: u32 = HFXO_BASE + 0x030;
+#[cfg(feature = "efr32mg21")]
+const HFXO_PKDETCTRL: u32 = HFXO_BASE + 0x034;
+#[cfg(feature = "efr32mg21")]
+const SYSCFG_CHIPREV: u32 = 0x4007_C014;
 
 const SET_ALIAS_OFFSET: u32 = 0x1000;
 const CLEAR_ALIAS_OFFSET: u32 = 0x2000;
@@ -127,6 +135,8 @@ impl ClockControl {
             write(HFXO_CTRL + SET_ALIAS_OFFSET, HFXO_CTRL_DISONDEMAND);
             write(HFXO_CTRL + CLEAR_ALIAS_OFFSET, HFXO_CTRL_FORCEEN);
             wait_clear(HFXO_STATUS, HFXO_STATUS_ENS).ok_or(ClockError::HfxoStopTimeout)?;
+            #[cfg(feature = "efr32mg21")]
+            hfxo_rev_a_errata();
 
             // GSDK CMU_HFXOINIT_DEFAULT for Series-2 config 1:
             // 416 us CBLSP timeout, 833 us first-lock timeout, startup bias
@@ -214,11 +224,14 @@ pub fn enable_bus_clock(clock: BusClock) {
 ///
 /// xG22: `CMU_CLKEN1` bits 0..=12 plus `RADIOCLKCTRL.EN`, matching what
 /// RAIL's `CMU_ClockEnable(cmuClock_RFECA…)` path leaves set. xG21 has no
-/// gates; its radio clock is always present.
+/// per-peripheral `CLKENn` gates, but the radio blocks still sit behind
+/// `CMU_RADIOCLKCTRL.EN` (same offset 0x280, `efr32mg21_cmu.h`); any FRC
+/// access before it is set is a precise bus fault.
 pub fn enable_radio_clocks() {
-    #[cfg(all(feature = "efr32mg22", target_arch = "arm", target_os = "none"))]
+    #[cfg(all(target_arch = "arm", target_os = "none"))]
     unsafe {
         write(CMU_LOCK, CMU_LOCK_UNLOCK);
+        #[cfg(feature = "efr32mg22")]
         write(
             CMU_CLKEN1 + SET_ALIAS_OFFSET,
             crate::chip::CLKEN1_RADIO_MASK,
@@ -280,6 +293,26 @@ unsafe fn wait_value(address: u32, mask: u32, expected: u32) -> Option<()> {
         core::hint::spin_loop();
     }
     None
+}
+
+/// GSDK 4.5.0 `CHIP_Init` (`_SILICON_LABS_32B_SERIES_2_CONFIG_1`): on
+/// revision A (major 1) xG21 parts, while the HFXO is stopped, change the
+/// default peak-detector and low-power settings and raise the squaring
+/// buffer (SQBUF) bias current. Applied for parity with GSDK; on the ZBT-1
+/// (rev A1) it was not by itself the cause of the early "TX completes but
+/// nothing is radiated" failure — that was the PA power-ramp sequence
+/// (`RAC.PAENCTRL.PARAMP` with `PACTRL.PAENPOWERRAMPINGCLK`, see
+/// `radio::xg21::pa_ramp_up`).
+#[cfg(feature = "efr32mg21")]
+unsafe fn hfxo_rev_a_errata() {
+    unsafe {
+        if read(SYSCFG_CHIPREV) & 0x3F != 1 {
+            return;
+        }
+        modify(HFXO_PKDETCTRL, !0xFF80_00FF, 0x0017_8500);
+        modify(HFXO_LOWPWRCTRL, 0x0000_F000, 0x0000_C000);
+        modify(HFXO_LOWPWRCTRL, 0x0000_0700, 0x0000_0700);
+    }
 }
 
 #[cfg(test)]

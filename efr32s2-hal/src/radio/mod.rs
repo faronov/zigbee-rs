@@ -26,7 +26,9 @@
 //!   binary-searches `SYNTH.VCOTUNING` with the LO counter
 //!   (`SYNTH.LOCNT*`) against `(FREQ ± IFFREQ) >> 13`, which reproduces the
 //!   `LOCNTTARGET` the RAIL reference computes, then closes the loop with
-//!   `SYNTHSTART` and verifies lock by counting again.
+//!   `SYNTHSTART` and verifies lock by counting again. The search runs with
+//!   the VCDAC pinning the VCO control voltage (`VCDACCTRL.VCDACEN`) so the
+//!   result does not depend on the previous lock (see `search_vco`).
 //!
 //! The hardware radio state machine (RSM), FRC framing, MODEM, AGC, RFCRC and
 //! BUFC still do all bit-level work.
@@ -39,8 +41,9 @@
 //!   [`Radio::transmit_csma`]); turnaround therefore depends on the caller
 //!   polling `receive` while it expects acknowledged traffic.
 //!
-//! Only xG22 tables exist so far; on xG21 [`RadioToken::init`] returns
-//! [`RadioError::Unsupported`].
+//! The per-chip tables and the radio state hand-shake (xG22: `RAC.SEQIF`
+//! with the sequencer clock-gated; xG21: a driver-owned sequencer vector
+//! table) live in `xg21.rs` / `xg22.rs`.
 
 #[cfg(feature = "efr32mg21")]
 #[path = "xg21.rs"]
@@ -94,15 +97,24 @@ pub(crate) struct Layout {
     bufc_buf0: u32,
     bufc_buf_stride: u32,
     agc_rssi: u32,
-    modem_rampctrl: u32,
-    modem_ramplev: u32,
+}
+
+/// Transition state the driver holds: the warm states while it locks the
+/// synthesizer (and ramps the PA up), `TxPd` while it ramps the PA down.
+#[derive(Clone, Copy)]
+pub(crate) enum Warm {
+    Rx,
+    Tx,
+    TxPd,
 }
 
 /// One analog state written by the CPU in place of sequencer microcode.
 pub(crate) struct AnalogState {
-    regs: &'static [u32; 16],
-    values: [u32; 16],
-    synth: [(u32, u32); 2],
+    regs: &'static [u32; chip::STATE_REGS],
+    values: [u32; chip::STATE_REGS],
+    /// Further `(address, value)` writes of the state (SYNTH VCO DAC/range,
+    /// and on xG21 the AGC TX overrides), applied after `regs`.
+    extra: &'static [(u32, u32)],
 }
 
 const L: Layout = chip::LAYOUT;
@@ -130,13 +142,6 @@ const RAC_SWRXEN: u32 = 1 << 1;
 const RAC_IF: u32 = 0x1C;
 const RAC_IEN: u32 = 0x20;
 const RAC_IF_STATECHANGE: u32 = 1 << 0;
-const RAC_SEQIF: u32 = 0x28;
-const RAC_SEQIF_ALL: u32 = 0x3FFF_000F;
-const RAC_SEQIF_RXWARM: u32 = 1 << 17;
-const RAC_SEQIF_TXWARM: u32 = 1 << 24;
-/// Warm states are held until the driver has calibrated and locked the
-/// synthesizer (the RSM only enables the LO path in RXWARM/TXWARM).
-const RAC_SEQIF_HELD: u32 = RAC_SEQIF_RXWARM | RAC_SEQIF_TXWARM;
 /// NVIC set-enable register holding `RAC_RSM` (IRQ 37) on xG21 and xG22.
 #[cfg(feature = "rt")]
 const NVIC_ISER1: u32 = 0xE000_E104;
@@ -149,6 +154,9 @@ const SYNTH_FREQ: u32 = 0x34;
 const SYNTH_IFFREQ: u32 = 0x38;
 const SYNTH_CHCTRL: u32 = 0x40;
 const SYNTH_VCOTUNING: u32 = 0x4C;
+const SYNTH_VCDACCTRL: u32 = 0x2C;
+/// `VCDACCTRL.VCDACEN`: the VCDAC drives the VCO control voltage.
+const VCDACCTRL_VCDACEN: u32 = 1 << 6;
 const SYNTH_IF: u32 = 0x78;
 const SYNTH_LOCNTCTRL: u32 = 0x88;
 const SYNTH_LOCNTSTATUS: u32 = 0x8C;
@@ -157,8 +165,8 @@ const SYNTH_CMD_STOP: u32 = 1 << 1;
 const SYNTH_CMD_ENABLEIF: u32 = 1 << 2;
 const SYNTH_CMD_DISABLEIF: u32 = 1 << 3;
 const SYNTH_IF_LOCNTDONE: u32 = 1 << 9;
-/// `LOCNTCTRL`: FCALRUNCLKEN | NUMCYCLE=4 | ENABLE, plus CLEAR/RUN/READ.
-const LOCNT_BASE: u32 = (1 << 11) | (4 << 4) | (1 << 0);
+/// `LOCNTCTRL`: [FCALRUNCLKEN] | NUMCYCLE=4 | ENABLE, plus CLEAR/RUN/READ.
+const LOCNT_BASE: u32 = chip::LOCNT_FCALRUNCLKEN | (4 << 4) | (1 << 0);
 const LOCNT_CLEAR: u32 = 1 << 1;
 const LOCNT_RUN: u32 = 1 << 2;
 const LOCNT_READ: u32 = 1 << 3;
@@ -199,6 +207,8 @@ const RX_TRAILER_LEN: usize = 1;
 const SYNTH_TIMEOUT_US: u32 = 200;
 /// Worst-case 127-byte frame (4.3 ms) plus warm-up margin.
 const TX_TIMEOUT_US: u32 = 6_000;
+/// The RSM enters `TXPD` right after the last symbol.
+const TXPD_WAIT_US: u32 = 100;
 
 /// RAC radio-state-machine states (`RAC.STATUS.STATE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,16 +417,8 @@ impl Radio {
     /// Select the highest calibrated level not above `ddbm` (deci-dBm);
     /// returns the applied level.
     pub fn set_tx_power_ddbm(&mut self, ddbm: i16) -> i16 {
-        let (level, ramplev, rampctrl) = tx_power_entry(ddbm);
-        let lev = ramplev as u32;
-        unsafe {
-            write(L.modem + L.modem_ramplev, lev | (lev << 8) | (lev << 16));
-            let ctrl = read(L.modem + L.modem_rampctrl);
-            write(
-                L.modem + L.modem_rampctrl,
-                (ctrl & !0xFFF) | rampctrl as u32,
-            );
-        }
+        let (level, ramp, pa) = tx_power_entry(ddbm);
+        chip::write_tx_power(ramp, pa);
         self.power_ddbm = level;
         level
     }
@@ -506,9 +508,10 @@ impl Radio {
             return Err(RadioError::SynthLock);
         }
         apply_state(&chip::RX);
+        chip::seq_arm(Warm::Rx);
         unsafe { write(L.rac + RAC_RXENSRCEN, RAC_SWRXEN) };
         let slot = &mut self.fcal[usize::from(self.channel - 11)][0];
-        let result = warm_up(RacState::RxWarm, RAC_SEQIF_RXWARM, true, slot);
+        let result = warm_up(RacState::RxWarm, Warm::Rx, true, slot);
         if result.is_err() {
             self.stats.synth_failures += 1;
             self.idle();
@@ -589,9 +592,12 @@ impl Radio {
             );
         }
         apply_state(&chip::TX);
+        chip::tx_state_power(self.power_ddbm);
+        chip::seq_arm(Warm::Tx);
+        chip::seq_arm(Warm::TxPd);
         unsafe { write(L.rac + RAC_CMD, RAC_CMD_TXEN) };
         let slot = &mut self.fcal[usize::from(self.channel - 11)][1];
-        if let Err(error) = warm_up(RacState::TxWarm, RAC_SEQIF_TXWARM, false, slot) {
+        if let Err(error) = warm_up(RacState::TxWarm, Warm::Tx, false, slot) {
             self.stats.synth_failures += 1;
             self.stats.tx_failures += 1;
             unsafe { write(L.rac + RAC_CMD, RAC_CMD_CLEARTXEN | RAC_CMD_TXDIS) };
@@ -609,6 +615,7 @@ impl Radio {
                 break Err(RadioError::TxTimeout);
             }
         };
+        tx_power_down();
         unsafe {
             write(
                 L.frc + FRC_IF + CLR,
@@ -876,7 +883,7 @@ fn program_phy() {
         // the RAC_RSM interrupt (and from this driver's busy-waits).
         write(L.rac + RAC_IF + CLR, u32::MAX);
         write(L.rac + RAC_IEN, RAC_IF_STATECHANGE);
-        write(L.rac + RAC_SEQIF + CLR, RAC_SEQIF_ALL);
+        chip::seq_init();
         #[cfg(feature = "rt")]
         write(NVIC_ISER1, RAC_RSM_IRQ_BIT);
     }
@@ -899,7 +906,7 @@ fn apply_state(state: &AnalogState) {
         for (&address, &value) in state.regs.iter().zip(state.values.iter()) {
             write(address, value);
         }
-        for &(address, value) in &state.synth {
+        for &(address, value) in state.extra {
             write(address, value);
         }
     }
@@ -907,20 +914,13 @@ fn apply_state(state: &AnalogState) {
 
 /// Release the radio state machine from its per-state sequencer wait.
 ///
-/// The RSM stops in each state it enters until the matching
-/// `RAC.SEQIF.STATE*` bit is cleared (normally by RAIL's sequencer
-/// microcode, which this driver does not run). Bounded and idempotent:
-/// safe from the `RAC_RSM` interrupt and from thread context.
+/// The RSM stops in each state it enters until that state's sequencer work
+/// is acknowledged (normally by RAIL's sequencer microcode, which this
+/// driver does not run); see the chip module. Warm states stay held until
+/// [`warm_up`] releases them. Bounded and idempotent: safe from the
+/// `RAC_RSM` interrupt and from thread context.
 pub fn service_sequencer() {
-    unsafe {
-        // Clear the host flag first so a state entered after the SEQIF read
-        // re-raises the interrupt instead of being lost.
-        write(L.rac + RAC_IF + CLR, RAC_IF_STATECHANGE);
-        let pending = read(L.rac + RAC_SEQIF) & RAC_SEQIF_ALL & !RAC_SEQIF_HELD;
-        if pending != 0 {
-            write(L.rac + RAC_SEQIF + CLR, pending);
-        }
-    }
+    chip::seq_service();
 }
 
 /// Wait up to `us` for the RSM to reach `OFF`, servicing the sequencer and
@@ -929,7 +929,9 @@ pub fn service_sequencer() {
 fn wait_off_releasing(us: u32) -> bool {
     let deadline = Deadline::after_us(us);
     loop {
-        unsafe { write(L.rac + RAC_SEQIF + CLR, RAC_SEQIF_HELD) };
+        chip::seq_release(Warm::Rx);
+        chip::seq_release(Warm::Tx);
+        chip::seq_release(Warm::TxPd);
         service_sequencer();
         if rac_state_raw() == RacState::Off {
             return true;
@@ -941,14 +943,14 @@ fn wait_off_releasing(us: u32) -> bool {
 }
 
 /// Release a held warm state and make sure the RSM actually leaves it.
-/// The `SEQIF` flag can be raised a moment after `STATUS` already shows the
-/// state; a single clear issued in that window is lost and the RSM stays
-/// parked in the warm state (hardware-observed on xG22), so keep clearing
-/// until the state changes.
-fn release_warm(state: RacState, seqif: u32) {
+/// On xG22 the `SEQIF` flag can be raised a moment after `STATUS` already
+/// shows the state; a single clear issued in that window is lost and the
+/// RSM stays parked in the warm state (hardware-observed), so keep
+/// releasing until the state changes.
+fn release_warm(state: RacState, warm: Warm) {
     let deadline = Deadline::after_us(50);
     loop {
-        unsafe { write(L.rac + RAC_SEQIF + CLR, seqif) };
+        chip::seq_release(warm);
         if rac_state_raw() != state || deadline.expired() {
             return;
         }
@@ -958,12 +960,12 @@ fn release_warm(state: RacState, seqif: u32) {
 /// Wait for the RSM to reach `state` (a warm state held by
 /// [`service_sequencer`]), lock the synthesizer, then release the state.
 /// The warm state is released even on failure so the RSM can be disabled.
-fn warm_up(state: RacState, seqif: u32, rx_if: bool, cached: &mut u16) -> Result<(), RadioError> {
+fn warm_up(state: RacState, warm: Warm, rx_if: bool, cached: &mut u16) -> Result<(), RadioError> {
     let deadline = Deadline::after_us(SYNTH_TIMEOUT_US);
     while rac_state_raw() != state {
         service_sequencer();
         if deadline.expired() {
-            unsafe { write(L.rac + RAC_SEQIF + CLR, seqif) };
+            chip::seq_release(warm);
             set_diag(SynthDiag {
                 stage: 1,
                 // Raw RSM state the warm-up stalled in.
@@ -975,8 +977,28 @@ fn warm_up(state: RacState, seqif: u32, rx_if: bool, cached: &mut u16) -> Result
     }
     spin_cycles(us_to_cycles(WARM_SETTLE_US));
     let result = start_synth(rx_if, cached);
-    release_warm(state, seqif);
+    if result.is_ok() && matches!(warm, Warm::Tx) {
+        chip::pa_ramp_up();
+    }
+    release_warm(state, warm);
     result
+}
+
+/// Ramp the PA down in the held `TXPD` state, then let the RSM leave it.
+/// Waits at most [`TXPD_WAIT_US`] for the RSM to reach `TXPD` (an aborted
+/// transmission may never get there); the state is released either way.
+fn tx_power_down() {
+    if !chip::PA_RAMP_IN_TXPD {
+        return;
+    }
+    let deadline = Deadline::after_us(TXPD_WAIT_US);
+    while rac_state_raw() != RacState::TxPowerDown && !deadline.expired() {
+        service_sequencer();
+    }
+    if rac_state_raw() == RacState::TxPowerDown {
+        chip::pa_ramp_down();
+    }
+    chip::seq_release(Warm::TxPd);
 }
 
 /// `RAC_RSM` interrupt: radio state change.
@@ -1123,24 +1145,17 @@ fn start_synth(rx_if: bool, cached: &mut u16) -> Result<(), RadioError> {
         unsafe { write(L.synth + SYNTH_CMD, SYNTH_CMD_STOP) };
     }
     // Open-loop frequency falls monotonically with VCOTUNING: find the
-    // smallest setting whose count does not exceed the target.
-    let (mut low, mut high) = (0u32, VCOTUNING_MAX);
-    while low < high {
-        let mid = (low + high) / 2;
-        unsafe { write(L.synth + SYNTH_VCOTUNING, VCAPSEL_DEFAULT | mid) };
-        spin_cycles(us_to_cycles(VCO_SETTLE_US));
-        let Some(count) = lo_count() else {
-            diag.stage = 2;
-            set_diag(diag);
-            return Err(RadioError::SynthLock);
-        };
-        diag.count = count;
-        if count > target {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
+    // smallest setting whose count does not exceed the target. The VCO
+    // control voltage is pinned by the VCDAC meanwhile (see `search_vco`).
+    let vcdac = unsafe { read(L.synth + SYNTH_VCDACCTRL) };
+    unsafe { write(L.synth + SYNTH_VCDACCTRL, vcdac | VCDACCTRL_VCDACEN) };
+    let found = search_vco(target, &mut diag);
+    unsafe { write(L.synth + SYNTH_VCDACCTRL, vcdac) };
+    let Some(low) = found else {
+        diag.stage = 2;
+        set_diag(diag);
+        return Err(RadioError::SynthLock);
+    };
     diag.tuning = low;
     if close_loop(target, low, &mut diag, SYNTH_TIMEOUT_US) {
         diag.stage = 0;
@@ -1152,6 +1167,34 @@ fn start_synth(rx_if: bool, cached: &mut u16) -> Result<(), RadioError> {
         set_diag(diag);
         Err(RadioError::SynthLock)
     }
+}
+
+/// Binary-search the open-loop `VCOTUNING` code whose LO count is closest to
+/// `target` from below; `None` if the LO counter does not complete.
+///
+/// Must run with `VCDACCTRL.VCDACEN` set: the DAC then holds the VCO control
+/// voltage at `VCDACVAL` (mid-range), so the code found is the one at which the
+/// closed loop will settle in the middle of its tuning range. Without it the
+/// control voltage floats at whatever the previous lock left on the loop
+/// filter, which makes the code depend on radio history (hardware-observed on
+/// xG21: an ED sweep before the first TX biased channel 15 by +14 codes, the
+/// VCO range logic then stepped `VCAPSEL` 16 -> 13 on every relock, and RX
+/// after TX stayed deaf for ACKs until the loop recovered, ~700 us later).
+fn search_vco(target: u32, diag: &mut SynthDiag) -> Option<u32> {
+    let (mut low, mut high) = (0u32, VCOTUNING_MAX);
+    while low < high {
+        let mid = (low + high) / 2;
+        unsafe { write(L.synth + SYNTH_VCOTUNING, VCAPSEL_DEFAULT | mid) };
+        spin_cycles(us_to_cycles(VCO_SETTLE_US));
+        let count = lo_count()?;
+        diag.count = count;
+        if count > target {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    Some(low)
 }
 
 /// Program `tuning`, start the synthesizer loop and wait up to `timeout_us`
@@ -1298,7 +1341,7 @@ mod tests {
         #[cfg(feature = "efr32mg22")]
         assert_eq!(TX_POWER_RANGE_DBM, (-25, 6));
         #[cfg(feature = "efr32mg21")]
-        assert_eq!(TX_POWER_RANGE_DBM, (0, 0));
+        assert_eq!(TX_POWER_RANGE_DBM, (-30, 20));
     }
 
     #[test]
@@ -1371,5 +1414,25 @@ mod tests {
         assert_ne!(rac_ctrl & (1 << 27), 0, "SEQCLKDIS must be set");
         assert_eq!(rac_ctrl & (1 << 26), 0, "CPUWAITDIS would stall the RSM");
         assert_eq!(chip::LAYOUT.bufc, 0xBA00_0000);
+    }
+
+    #[test]
+    #[cfg(feature = "efr32mg21")]
+    fn xg21_tables() {
+        let table = chip::INIT;
+        assert!(table.windows(2).all(|w| w[0].0 < w[1].0));
+        // The sequencer is configured by `seq_init`, never from RAIL state.
+        for reg in [0xB802_0064, 0xB802_0068] {
+            assert!(table.iter().all(|e| e.0 != reg));
+        }
+        // Per-state registers are not duplicated in the static table.
+        for reg in chip::IDLE.regs {
+            assert!(table.iter().all(|e| e.0 != *reg));
+        }
+        assert!(chip::TX_POWER.windows(2).all(|w| w[0].0 < w[1].0));
+        assert_eq!(tx_power_entry(100), (100, 0xDC, 0x37));
+        assert_eq!(tx_power_entry(105), (100, 0xDC, 0x37));
+        assert_eq!(tx_power_entry(-1000).0, -300);
+        assert_eq!(chip::LAYOUT.bufc, 0x5400_4000);
     }
 }
