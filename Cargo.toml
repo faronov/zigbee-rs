@@ -55,6 +55,8 @@ exclude = [
     "products/bl702-xt-zb1",
     "products/tlsr8258-tb04",
     "boards/efr32mg21-devkit",
+    "boards/efr32mg22-devkit",
+    "products/efr32mg22-sensor",
     "boards/bl702-xt-zb1",
     "bl702-hal",
     "efr32mg1-hal",
@@ -63,6 +65,7 @@ exclude = [
     "examples/pb03f-kit",
     "examples/efr32mg1-sensor",
     "examples/efr32mg21-sensor",
+    "examples/efr32mg22-sensor",
     "phy6222-hal",
 ]
 
