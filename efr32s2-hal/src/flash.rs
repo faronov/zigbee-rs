@@ -47,11 +47,11 @@ impl NorFlashError for FlashError {
     }
 }
 
-pub struct Efr32mg21Flash {
+pub struct Efr32s2Flash {
     _private: (),
 }
 
-impl Efr32mg21Flash {
+impl Efr32s2Flash {
     pub(crate) const fn new() -> Self {
         Self { _private: () }
     }
@@ -65,11 +65,11 @@ impl Efr32mg21Flash {
     }
 }
 
-impl ErrorType for Efr32mg21Flash {
+impl ErrorType for Efr32s2Flash {
     type Error = FlashError;
 }
 
-impl ReadNorFlash for Efr32mg21Flash {
+impl ReadNorFlash for Efr32s2Flash {
     const READ_SIZE: usize = 1;
 
     fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
@@ -85,7 +85,7 @@ impl ReadNorFlash for Efr32mg21Flash {
     }
 }
 
-impl NorFlash for Efr32mg21Flash {
+impl NorFlash for Efr32s2Flash {
     const WRITE_SIZE: usize = 4;
     const ERASE_SIZE: usize = FLASH_PAGE_SIZE;
 

@@ -169,14 +169,7 @@ dependencies = [
 name = "efr32mg21-devkit"
 version = "0.1.0"
 dependencies = [
- "efr32mg21-hal",
-]
-
-[[package]]
-name = "efr32mg21-hal"
-version = "0.1.0"
-dependencies = [
- "embedded-storage",
+ "efr32s2-hal",
 ]
 
 [[package]]
@@ -186,8 +179,8 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "efr32mg21-devkit",
- "efr32mg21-hal",
  "efr32mg21-sensor-product",
+ "efr32s2-hal",
  "embassy-executor",
  "embassy-futures",
  "embassy-time 0.5.1",
@@ -207,12 +200,21 @@ name = "efr32mg21-sensor-product"
 version = "0.1.0"
 dependencies = [
  "efr32mg21-devkit",
- "efr32mg21-hal",
+ "efr32s2-hal",
  "embedded-storage",
  "sensor-sed-app",
  "zigbee-aps",
  "zigbee-runtime",
  "zigbee-zcl",
+]
+
+[[package]]
+name = "efr32s2-hal"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "embedded-hal 1.0.0",
+ "embedded-storage",
 ]
 
 [[package]]

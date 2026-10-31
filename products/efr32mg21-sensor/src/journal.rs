@@ -4,7 +4,7 @@
 //! final 16 KiB partition and passes relative offsets for its two physical
 //! 8 KiB erase sectors to the core-neutral [`SecurityStateJournal`].
 
-use efr32mg21_hal::flash::{Efr32mg21Flash, FLASH_CAPACITY, FLASH_PAGE_SIZE, FlashError};
+use efr32s2_hal::flash::{Efr32s2Flash, FLASH_CAPACITY, FLASH_PAGE_SIZE, FlashError};
 use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
 use zigbee_runtime::security_journal::{SECURITY_JOURNAL_SLOT_SIZE, SecurityStateJournal};
 
@@ -36,11 +36,11 @@ const _: () = assert!(SECURITY_SECTOR_SIZE.is_multiple_of(SECURITY_SLOT_SIZE));
 
 /// Bounds every core-journal access to this product's protected final 16 KiB.
 pub struct PartitionFlash {
-    flash: Efr32mg21Flash,
+    flash: Efr32s2Flash,
 }
 
 impl PartitionFlash {
-    const fn new(flash: Efr32mg21Flash) -> Self {
+    const fn new(flash: Efr32s2Flash) -> Self {
         Self { flash }
     }
 
@@ -60,7 +60,7 @@ impl ErrorType for PartitionFlash {
 }
 
 impl ReadNorFlash for PartitionFlash {
-    const READ_SIZE: usize = Efr32mg21Flash::READ_SIZE;
+    const READ_SIZE: usize = Efr32s2Flash::READ_SIZE;
 
     fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
         self.flash
@@ -73,8 +73,8 @@ impl ReadNorFlash for PartitionFlash {
 }
 
 impl NorFlash for PartitionFlash {
-    const WRITE_SIZE: usize = Efr32mg21Flash::WRITE_SIZE;
-    const ERASE_SIZE: usize = Efr32mg21Flash::ERASE_SIZE;
+    const WRITE_SIZE: usize = Efr32s2Flash::WRITE_SIZE;
+    const ERASE_SIZE: usize = Efr32s2Flash::ERASE_SIZE;
 
     fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
         if from >= to {
@@ -100,6 +100,6 @@ pub type SecurityStore = SecurityStateJournal<PartitionFlash, { SECURITY_SECTOR_
 /// Construct the product-selected generic journal from an exclusive raw board
 /// flash token. Sector offsets are relative to `PartitionFlash`, never board
 /// addresses.
-pub(crate) fn security_journal(flash: Efr32mg21Flash) -> SecurityStore {
+pub(crate) fn security_journal(flash: Efr32s2Flash) -> SecurityStore {
     SecurityStore::new_with_sector_size(PartitionFlash::new(flash), SECTOR_A, SECTOR_B)
 }

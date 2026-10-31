@@ -13,7 +13,7 @@ publish = false
 
 [dependencies]
 efr32mg21-devkit = { path = "../../boards/efr32mg21-devkit" }
-efr32mg21-hal = { path = "../../efr32mg21-hal" }
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg21"] }
 embedded-storage = "0.3"
 sensor-sed-app = { path = "../../apps/sensor-sed" }
 zigbee-aps = { path = "../../zigbee-aps" }

@@ -10,8 +10,8 @@
 
 pub mod resources;
 
-pub use efr32mg21_hal::flash::Efr32mg21Flash;
-use efr32mg21_hal::{
+pub use efr32s2_hal::flash::Efr32s2Flash;
+use efr32s2_hal::{
     clock::{ClockControl, ClockError, HfxoConfig, SystemClocks},
     gpio::{self, Input, InterruptEdge, Pin, Port, PushPull},
 };

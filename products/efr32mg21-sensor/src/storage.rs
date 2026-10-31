@@ -14,7 +14,7 @@
 
 pub use crate::journal::SecurityStore;
 use crate::journal::{PERSISTENCE_PARTITION_SIZE, SECURITY_SECTOR_SIZE, security_journal};
-use efr32mg21_hal::flash::Efr32mg21Flash;
+use efr32s2_hal::flash::Efr32s2Flash;
 use embedded_storage::nor_flash::NorFlash;
 use zigbee_runtime::security_journal::SecurityStateJournal;
 use zigbee_runtime::security_store::{SecurityStateStore, SecurityStoreError};
@@ -26,7 +26,7 @@ pub enum MigrationDisposition {
 }
 
 pub fn security_store(
-    flash: Efr32mg21Flash,
+    flash: Efr32s2Flash,
 ) -> Result<(SecurityStore, MigrationDisposition), SecurityStoreError> {
     prepare_security_store(security_journal(flash))
 }

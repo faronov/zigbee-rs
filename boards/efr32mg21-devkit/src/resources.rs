@@ -2,14 +2,14 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use efr32mg21_hal::{
+use efr32s2_hal::{
     clock::ClockControl,
     gpio::{Disabled, Level, Pin, Pull},
     peripherals::Peripherals,
 };
 
 use crate::{
-    BUTTON0_PIN, BUTTON0_PORT, Button0, Efr32mg21Flash, LED0_PIN, LED0_PORT, Led0,
+    BUTTON0_PIN, BUTTON0_PORT, Button0, Efr32s2Flash, LED0_PIN, LED0_PORT, Led0,
     configure_button_interrupt,
 };
 
@@ -22,7 +22,7 @@ pub struct BoardResources {
     pub button0: Button0Token,
     /// Raw, exclusive internal-flash controller. Product code bounds it to
     /// its selected partitions before using it for persistence.
-    pub flash: Efr32mg21Flash,
+    pub flash: Efr32s2Flash,
 }
 
 impl BoardResources {

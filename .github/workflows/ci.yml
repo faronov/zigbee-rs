@@ -183,10 +183,14 @@ jobs:
             manifest: products/efr32mg1-tradfri/Cargo.toml
             workspace: products/efr32mg1-tradfri
             features: ""
-          - name: EFR32MG21 HAL
-            manifest: efr32mg21-hal/Cargo.toml
-            workspace: efr32mg21-hal
-            features: ""
+          - name: EFR32 Series 2 HAL (MG21)
+            manifest: efr32s2-hal/Cargo.toml
+            workspace: efr32s2-hal
+            features: "efr32mg21"
+          - name: EFR32 Series 2 HAL (MG22)
+            manifest: efr32s2-hal/Cargo.toml
+            workspace: efr32s2-hal
+            features: "efr32mg22"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
@@ -286,7 +290,8 @@ jobs:
           cargo fmt --manifest-path examples/efr32mg1-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg21-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path efr32mg1-hal/Cargo.toml -- --check
-          cargo fmt --manifest-path efr32mg21-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path efr32s2-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path tools/efr32s2-lab/Cargo.toml -- --check
           cargo fmt --manifest-path phy6222-hal/Cargo.toml -- --check
           cargo fmt --manifest-path boards/efr32mg1-tradfri/Cargo.toml -- --check
           cargo fmt --manifest-path products/efr32mg1-tradfri/Cargo.toml -- --check
@@ -1431,7 +1436,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/efr32mg21-sensor
-          key: thumbv8m-efr32mg21-${{ env.RUST_TOOLCHAIN }}-sed-${{ hashFiles('examples/efr32mg21-sensor/Cargo.lock', 'products/efr32mg21-sensor/link/**', 'efr32mg21-hal/link/**') }}
+          key: thumbv8m-efr32mg21-${{ env.RUST_TOOLCHAIN }}-sed-${{ hashFiles('examples/efr32mg21-sensor/Cargo.lock', 'products/efr32mg21-sensor/link/**', 'efr32s2-hal/link/**') }}
       - name: Build EFR32MG21 sensor (release)
         working-directory: examples/efr32mg21-sensor
         run: cargo build --release --locked

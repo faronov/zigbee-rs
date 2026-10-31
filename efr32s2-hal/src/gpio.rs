@@ -1,4 +1,4 @@
-//! Typed EFR32MG21 Series-2 GPIO primitives.
+//! Typed EFR32 Series 2 GPIO primitives (identical on xG21 and xG22).
 //!
 //! The register layout is the Series-2 layout at `0x4003_C000`; it is not
 //! compatible with the Series-1 GPIO block at `0x4000_A000`.
@@ -27,8 +27,9 @@ const GPIO_LOCK_UNLOCK: u32 = 0xA534;
 const MODE_INPUT: u32 = 1;
 const MODE_INPUT_PULL: u32 = 2;
 const MODE_PUSH_PULL: u32 = 4;
+const MODE_WIRED_AND_PULLUP_FILTER: u32 = 11;
 
-/// GPIO port indices implemented by EFR32MG21.
+/// GPIO port indices implemented by EFR32MG21 / EFR32MG22.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Port {
@@ -68,6 +69,8 @@ pub enum GpioError {
 pub struct Disabled;
 pub struct Input;
 pub struct PushPull;
+/// Open-drain output with the internal pull-up and glitch filter (I2C).
+pub struct OpenDrain;
 
 /// Ownership token for the GPIO block.
 pub struct Gpio {
@@ -188,6 +191,47 @@ impl Pin<Disabled> {
     }
 }
 
+impl Pin<Disabled> {
+    /// Open-drain (`WIREDANDPULLUPFILTER`) with the latch released, the
+    /// mode GSDK `I2CSPM_Init` uses for SCL/SDA.
+    pub fn into_open_drain(self) -> Pin<OpenDrain> {
+        self.set_latch(Level::High);
+        self.configure_mode(MODE_WIRED_AND_PULLUP_FILTER);
+        Pin {
+            port: self.port,
+            number: self.number,
+            _mode: PhantomData,
+        }
+    }
+}
+
+impl<MODE> Pin<MODE> {
+    /// Return the pin to the reset (disabled, high-impedance) mode.
+    pub fn into_disabled(self) -> Pin<Disabled> {
+        self.configure_mode(0);
+        self.set_latch(Level::Low);
+        Pin {
+            port: self.port,
+            number: self.number,
+            _mode: PhantomData,
+        }
+    }
+
+    /// Input level (valid in every enabled input/open-drain mode).
+    #[inline]
+    pub fn read_input(&self) -> bool {
+        unsafe { read(self.port_base() + DIN_OFFSET) & (1 << self.number) != 0 }
+    }
+}
+
+impl Pin<OpenDrain> {
+    /// Release the line (pulled high) or drive it low.
+    #[inline]
+    pub fn set_released(&mut self, released: bool) {
+        self.set_latch(if released { Level::High } else { Level::Low });
+    }
+}
+
 impl Pin<PushPull> {
     #[inline]
     pub fn set_high(&mut self) {
@@ -222,7 +266,7 @@ impl Pin<Input> {
 
     /// Route this pin to its same-numbered Series-2 EXTI channel.
     ///
-    /// EFR32MG21 exposes eight regular EXTI channels. Channel `n` selects one
+    /// Series 2 exposes eight regular EXTI channels. Channel `n` selects one
     /// of pins `n`, `n + 4`, `n + 8`, or `n + 12`; therefore this helper is
     /// deliberately limited to pins 0 through 7.
     pub fn configure_interrupt(&mut self, edge: InterruptEdge) -> Result<(), GpioError> {

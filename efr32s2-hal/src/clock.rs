@@ -1,11 +1,22 @@
-//! EFR32MG21 Series-2 HFXO and system-clock setup.
+//! EFR32 Series 2 HFXO, system-clock and bus-clock setup.
 //!
-//! This implements the subset needed by BRD4181A: crystal mode at 38.4 MHz,
-//! divide-by-one HCLK/PCLK, and the GSDK Series-2 config-1 HFXO defaults.
+//! This implements the subset needed by the supported boards: crystal mode
+//! at 38.4 MHz, divide-by-one HCLK/PCLK, and the GSDK `CMU_HFXOINIT_DEFAULT`
+//! values. The HFXO register layout and the init defaults are identical for
+//! Series 2 config 1 (xG21) and config 2 (xG22); xG22 additionally gates the
+//! HFXO bus clock in `CMU_CLKEN0`, which must be opened first.
+
+use crate::chip::BusClock;
 
 const CMU_BASE: u32 = 0x4000_8000;
 const CMU_LOCK: u32 = CMU_BASE + 0x010;
 const CMU_SYSCLKCTRL: u32 = CMU_BASE + 0x070;
+#[cfg(feature = "efr32mg22")]
+const CMU_CLKEN0: u32 = CMU_BASE + 0x064;
+#[cfg(feature = "efr32mg22")]
+const CMU_CLKEN1: u32 = CMU_BASE + 0x068;
+#[cfg(feature = "efr32mg22")]
+const CMU_RADIOCLKCTRL: u32 = CMU_BASE + 0x280;
 
 const HFXO_BASE: u32 = 0x4000_C000;
 const HFXO_XTALCFG: u32 = HFXO_BASE + 0x010;
@@ -13,6 +24,12 @@ const HFXO_XTALCTRL: u32 = HFXO_BASE + 0x018;
 const HFXO_CFG: u32 = HFXO_BASE + 0x020;
 const HFXO_CTRL: u32 = HFXO_BASE + 0x028;
 const HFXO_STATUS: u32 = HFXO_BASE + 0x058;
+/// xG22 only: `HFXO_CMD.MANUALOVERRIDE` releases FSMLOCK after the first lock
+/// (GSDK `CMU_HFXOInit`); xG21 has no such command and unlocks on its own.
+#[cfg(feature = "efr32mg22")]
+const HFXO_CMD: u32 = HFXO_BASE + 0x050;
+#[cfg(feature = "efr32mg22")]
+const HFXO_CMD_MANUALOVERRIDE: u32 = 1 << 1;
 const HFXO_LOCK: u32 = HFXO_BASE + 0x080;
 
 const SET_ALIAS_OFFSET: u32 = 0x1000;
@@ -91,6 +108,7 @@ impl ClockControl {
             return Err(ClockError::CtuneOutOfRange);
         }
 
+        enable_bus_clock(BusClock::HFXO0);
         unsafe {
             write(CMU_LOCK, CMU_LOCK_UNLOCK);
 
@@ -138,6 +156,8 @@ impl ClockControl {
             // Finish the first-lock optimization, then use the shorter 83 us
             // timeout and retain the optimized core-bias value.
             write(HFXO_CTRL + SET_ALIAS_OFFSET, HFXO_CTRL_DISONDEMAND);
+            #[cfg(feature = "efr32mg22")]
+            write(HFXO_CMD, HFXO_CMD_MANUALOVERRIDE);
             wait_clear(HFXO_STATUS, HFXO_STATUS_FSMLOCK).ok_or(ClockError::HfxoUnlockTimeout)?;
             modify(HFXO_XTALCFG, HFXO_XTALCFG_TIMEOUTSTEADY_MASK, 2 << 20);
             write(
@@ -173,6 +193,40 @@ impl ClockControl {
     }
 }
 
+/// Open one peripheral bus clock (xG22 `CMU_CLKEN0/1`; no-op on xG21).
+#[inline]
+pub fn enable_bus_clock(clock: BusClock) {
+    #[cfg(all(feature = "efr32mg22", target_arch = "arm", target_os = "none"))]
+    unsafe {
+        let register = if clock.register == 0 {
+            CMU_CLKEN0
+        } else {
+            CMU_CLKEN1
+        };
+        write(CMU_LOCK, CMU_LOCK_UNLOCK);
+        write(register + SET_ALIAS_OFFSET, 1 << clock.bit);
+    }
+    #[cfg(not(all(feature = "efr32mg22", target_arch = "arm", target_os = "none")))]
+    let _ = clock;
+}
+
+/// Open the radio-subsystem bus clocks and enable the radio clock tree.
+///
+/// xG22: `CMU_CLKEN1` bits 0..=12 plus `RADIOCLKCTRL.EN`, matching what
+/// RAIL's `CMU_ClockEnable(cmuClock_RFECA…)` path leaves set. xG21 has no
+/// gates; its radio clock is always present.
+pub fn enable_radio_clocks() {
+    #[cfg(all(feature = "efr32mg22", target_arch = "arm", target_os = "none"))]
+    unsafe {
+        write(CMU_LOCK, CMU_LOCK_UNLOCK);
+        write(
+            CMU_CLKEN1 + SET_ALIAS_OFFSET,
+            crate::chip::CLKEN1_RADIO_MASK,
+        );
+        write(CMU_RADIOCLKCTRL + SET_ALIAS_OFFSET, 1);
+    }
+}
+
 const fn initial_xtalcfg() -> u32 {
     // TIMEOUTCBLSB=11, TIMEOUTSTEADY(first lock)=11,
     // COREBIASSTARTUP=32, COREBIASSTARTUPI=32.
@@ -181,7 +235,8 @@ const fn initial_xtalcfg() -> u32 {
 
 const fn steady_xtalctrl(ctune: u8) -> u32 {
     // COREDGENANA=none, CTUNEFIXANA=both, CTUNEXOANA/CTUNEXIANA=ctune,
-    // COREBIASANA=60. MG21 config 1 has no XI/XO CTUNE delta.
+    // COREBIASANA=60. Series 2 config 1 and 2 have no XI/XO CTUNE delta
+    // (GSDK `CMU_HFXOInit` only adds one for configs 3+).
     (3 << 24) | ((ctune as u32) << 16) | ((ctune as u32) << 8) | 60
 }
 

@@ -8,7 +8,7 @@ publish = false
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = { version = "0.7", features = ["device"] }
 efr32mg21-devkit = { path = "../../boards/efr32mg21-devkit" }
-efr32mg21-hal = { path = "../../efr32mg21-hal" }
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg21"] }
 efr32mg21-sensor-product = { path = "../../products/efr32mg21-sensor" }
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
 embassy-futures = "0.1"
