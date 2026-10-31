@@ -16,6 +16,7 @@ use efr32s2_hal::{
     i2c::I2c0Token,
     peripherals::Peripherals,
     radio::RadioToken,
+    rtcc::RtccToken,
     usart::{UartTx, Usart},
 };
 
@@ -36,6 +37,15 @@ pub fn log_fmt(args: core::fmt::Arguments<'_>) {
     });
 }
 
+/// Wait until the VCOM UART has shifted out every queued byte (before EM2).
+pub fn log_flush() {
+    cortex_m::interrupt::free(|cs| {
+        if let Some(uart) = LOG.borrow(cs).borrow_mut().as_mut() {
+            uart.flush();
+        }
+    });
+}
+
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => { $crate::shared::log_fmt(format_args!($($arg)*)) };
@@ -45,6 +55,7 @@ pub struct Lab {
     pub gpio: Gpio,
     pub i2c0: I2c0Token,
     pub radio: RadioToken,
+    pub rtcc: RtccToken,
     pub usart0: Usart,
     pub led: Pin<PushPull>,
     pub vcom_enable: Pin<PushPull>,
@@ -59,6 +70,7 @@ pub fn init(name: &str) -> Lab {
         usart1,
         i2c0,
         radio,
+        rtcc,
         ..
     } = Peripherals::take().expect("peripherals taken once");
     let hfxo = clocks.configure_hfxo(HFXO);
@@ -86,6 +98,7 @@ pub fn init(name: &str) -> Lab {
         gpio,
         i2c0,
         radio,
+        rtcc,
         usart0,
         led,
         vcom_enable,
@@ -122,3 +135,8 @@ unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
         cortex_m::asm::bkpt();
     }
 }
+
+/// The RTCC time driver's queue (embassy-time-queue-utils) links against
+/// embassy-executor's pender; the lab has no executor, so wakes are no-ops.
+#[unsafe(no_mangle)]
+fn __pender(_context: *mut ()) {}

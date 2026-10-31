@@ -18,12 +18,17 @@ path = "src/bin/i2c_scan.rs"
 name = "s2-radio"
 path = "src/bin/radio.rs"
 
+[[bin]]
+name = "s2-em2"
+path = "src/bin/em2.rs"
+
 [features]
 default = ["efr32mg22"]
 efr32mg22 = ["efr32s2-hal/efr32mg22"]
 
 [dependencies]
-efr32s2-hal = { path = "../../efr32s2-hal", features = ["rt"] }
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["rt", "time-driver"] }
+embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = { version = "0.7", features = ["device"] }
 embedded-hal = "1.0"
