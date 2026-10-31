@@ -332,6 +332,10 @@ impl<P: RadioPhy, R: MacRole, const RX: usize> SoftMacCore<P, R, RX> {
                 .phy
                 .set_address_filter(Self::address_filter(next))
                 .map_err(Self::map_phy_error),
+            MacRxOnWhenIdle => {
+                self.phy.set_rx_on_when_idle(next.rx_on_when_idle());
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -342,7 +346,9 @@ impl<P: RadioPhy, R: MacRole, const RX: usize> SoftMacCore<P, R, RX> {
         phy.set_tx_power(pib.transmit_power())
             .map_err(Self::map_phy_error)?;
         phy.set_address_filter(Self::address_filter(pib))
-            .map_err(Self::map_phy_error)
+            .map_err(Self::map_phy_error)?;
+        phy.set_rx_on_when_idle(pib.rx_on_when_idle());
+        Ok(())
     }
 
     fn address_filter(pib: &MacPib) -> Option<PhyAddressFilter> {
@@ -1574,6 +1580,7 @@ mod tests {
         offload_calls: heapless::Vec<(bool, TxParams), 8>,
         hw_pending: heapless::Vec<(MacAddress, bool), 8>,
         hw_pending_cleared: bool,
+        rx_on_when_idle: Option<bool>,
     }
 
     impl<const OFFLOAD: u8, const FALLBACK: bool> TestPhy<OFFLOAD, FALLBACK> {
@@ -1601,6 +1608,7 @@ mod tests {
                 offload_calls: heapless::Vec::new(),
                 hw_pending: heapless::Vec::new(),
                 hw_pending_cleared: false,
+                rx_on_when_idle: None,
             }
         }
     }
@@ -1698,6 +1706,10 @@ mod tests {
         fn clear_ack_frame_pending(&mut self) {
             self.hw_pending_cleared = true;
         }
+
+        fn set_rx_on_when_idle(&mut self, enabled: bool) {
+            self.rx_on_when_idle = Some(enabled);
+        }
     }
 
     impl<const OFFLOAD: u8, const FALLBACK: bool> zigbee_crypto::ForwardAesProvider
@@ -1745,6 +1757,24 @@ mod tests {
     fn core_of<const OFFLOAD: u8, const FALLBACK: bool>() -> SoftMacCore<TestPhy<OFFLOAD, FALLBACK>>
     {
         SoftMacCore::new(TestPhy::new(), MacPib::new(IEEE, 1, 2)).unwrap()
+    }
+
+    #[test]
+    fn rx_on_when_idle_follows_the_pib_and_full_reconfiguration() {
+        let mut core = core();
+        assert_eq!(core.phy().rx_on_when_idle, Some(false));
+
+        core.set_pib(PibAttribute::MacRxOnWhenIdle, PibValue::Bool(true))
+            .unwrap();
+        assert_eq!(core.phy().rx_on_when_idle, Some(true));
+
+        core.phy_mut().rx_on_when_idle = None;
+        core.wake().unwrap();
+        assert_eq!(core.phy().rx_on_when_idle, Some(true));
+
+        core.set_pib(PibAttribute::MacRxOnWhenIdle, PibValue::Bool(false))
+            .unwrap();
+        assert_eq!(core.phy().rx_on_when_idle, Some(false));
     }
 
     fn association_response(
@@ -3153,6 +3183,7 @@ mod tests {
             core.get_pib(PibAttribute::MacRxOnWhenIdle),
             PibValue::Bool(true)
         );
+        assert_eq!(core.phy().rx_on_when_idle, Some(true));
         assert!(MacDriver::capabilities(&core).router);
     }
 

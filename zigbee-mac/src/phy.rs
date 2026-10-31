@@ -253,6 +253,14 @@ pub trait RadioPhy {
     /// Forget every armed Frame Pending source (MLME-RESET).
     fn clear_ack_frame_pending(&mut self) {}
 
+    /// Follow `macRxOnWhenIdle`: keep the receiver (and its ISR receive /
+    /// auto-ACK path) armed between MAC operations when `enabled`.
+    ///
+    /// Called whenever the PIB attribute changes and with every full
+    /// configuration (construction, reset, [`Self::wake`]). PHYs that only
+    /// receive inside [`Self::receive`] keep the no-op default.
+    fn set_rx_on_when_idle(&mut self, _enabled: bool) {}
+
     /// Put the transceiver into its lowest-power idle state between
     /// sleepy-device poll windows. The next PHY operation, or
     /// [`Self::wake`], must make it usable again.
