@@ -155,6 +155,10 @@ jobs:
             manifest: products/efr32mg21-sensor/Cargo.toml
             workspace: products/efr32mg21-sensor
             features: ""
+          - name: EFR32MG21 sensor product (sleepy policy)
+            manifest: products/efr32mg21-sensor/Cargo.toml
+            workspace: products/efr32mg21-sensor
+            features: sed
           - name: EFR32MG22 board
             manifest: boards/efr32mg22-devkit/Cargo.toml
             workspace: boards/efr32mg22-devkit
@@ -167,10 +171,18 @@ jobs:
             manifest: products/efr32mg22-sensor/Cargo.toml
             workspace: products/efr32mg22-sensor
             features: ""
+          - name: EFR32MG22 sensor product (sleepy policy)
+            manifest: products/efr32mg22-sensor/Cargo.toml
+            workspace: products/efr32mg22-sensor
+            features: sed
           - name: Home Assistant Connect ZBT-1 product
             manifest: products/ha-connect-zbt1/Cargo.toml
             workspace: products/ha-connect-zbt1
             features: ""
+          - name: Home Assistant Connect ZBT-1 product (sleepy policy)
+            manifest: products/ha-connect-zbt1/Cargo.toml
+            workspace: products/ha-connect-zbt1
+            features: sed
           - name: PHY6222 sensor product
             manifest: products/phy62x2-evk/Cargo.toml
             workspace: products/phy62x2-evk
@@ -1446,7 +1458,7 @@ jobs:
           if-no-files-found: error
 
   build-efr32mg21:
-    name: Build EFR32MG21 sensor
+    name: Build EFR32MG21 sensor, End Device and Router
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -1458,46 +1470,54 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/efr32mg21-sensor
-          key: thumbv8m-efr32mg21-${{ env.RUST_TOOLCHAIN }}-sed-${{ hashFiles('examples/efr32mg21-sensor/Cargo.lock', 'products/efr32mg21-sensor/link/**', 'efr32s2-hal/link/**') }}
-      - name: Build EFR32MG21 sensor (release)
+          key: thumbv8m-efr32mg21-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/efr32mg21-sensor/Cargo.lock', 'products/efr32mg21-sensor/link/**', 'efr32s2-hal/link/**') }}
+      # One bin per role; role features are mutually exclusive, so each role
+      # is its own build and dependency feature unification never mixes them.
+      - name: Build EFR32MG21 sensor, End Device and Router (release)
         working-directory: examples/efr32mg21-sensor
-        run: cargo build --release --locked
-      - name: Clippy EFR32MG21 production composition
+        run: |
+          cargo build --release --locked
+          cargo build --release --locked --no-default-features --features ed
+          cargo build --release --locked --no-default-features --features router
+      - name: Clippy EFR32MG21 role compositions
         working-directory: examples/efr32mg21-sensor
-        run: cargo clippy --release --locked --target thumbv8m.main-none-eabihf -- -D warnings
+        run: |
+          for role in sed ed router; do
+            cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
+              --no-default-features --features "$role" -- -D warnings
+          done
       - name: Create firmware artifacts
         run: |
-          ELF=examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor
+          DIR=examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release
           OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
-          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
-          "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          ./tools/firmware-size-report.sh efr32mg21-sensor ${ELF}.bin ${ELF}.size.json
-          python3 examples/efr32mg21-sensor/tools/verify-layout.py "$ELF"
-          SYMS="$("$NM" --demangle "$ELF")"
-          if ! grep -Eq 'SoftwareAes128|aes::soft' <<<"$SYMS"; then
-            echo "EFR32MG21 image is missing its currently supported software AES backend" >&2
-            exit 1
-          fi
-          # The sensor must compile out the parent/router maintenance subgraph.
-          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
-          if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
-            echo "EFR32MG21 sensor links parent/router maintenance symbols:" >&2
-            grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
-            exit 1
-          fi
+          for image in efr32mg21-sensor efr32mg21-ed efr32mg21-router; do
+            ELF="$DIR/$image"
+            "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+            "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+            ./tools/firmware-size-report.sh "$image" "${ELF}.bin" "${ELF}.size.json"
+            python3 examples/efr32mg21-sensor/tools/verify-layout.py "$ELF"
+            if ! "$NM" --demangle "$ELF" | grep -Eq 'SoftwareAes128|aes::soft'; then
+              echo "$image is missing its currently supported software AES backend" >&2
+              exit 1
+            fi
+          done
+          # Leaf images must compile out the parent MAC and router lifecycle;
+          # the router is the positive control for the symbol pattern.
+          NM="$NM" ./tools/check-role-symbols.sh leaf "$DIR/efr32mg21-sensor" "$DIR/efr32mg21-ed"
+          NM="$NM" ./tools/check-role-symbols.sh parent "$DIR/efr32mg21-router"
       - name: Upload EFR32MG21 firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: efr32mg21-sensor-firmware
           path: |
-            examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.bin
-            examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.hex
-            examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.size.json
+            examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-*.bin
+            examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-*.hex
+            examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-*.size.json
           if-no-files-found: error
 
   build-ha-connect-zbt1:
-    name: Build Home Assistant Connect ZBT-1 End Device and MG21 lab gates
+    name: Build Home Assistant Connect ZBT-1 role images and MG21 lab gates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -1511,44 +1531,53 @@ jobs:
           workspaces: |
             examples/ha-connect-zbt1
             tools/efr32s2-lab
-          key: thumbv8m-zbt1-${{ env.RUST_TOOLCHAIN }}-ed-${{ hashFiles('examples/ha-connect-zbt1/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/ha-connect-zbt1/link/**', 'efr32s2-hal/link/**') }}
-      - name: Build ZBT-1 always-on End Device (release)
+          key: thumbv8m-zbt1-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/ha-connect-zbt1/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/ha-connect-zbt1/link/**', 'efr32s2-hal/link/**') }}
+      # One bin per role; role features are mutually exclusive, so each role
+      # is its own build and dependency feature unification never mixes them.
+      - name: Build ZBT-1 End Device, Router and Sleepy End Device (release)
         working-directory: examples/ha-connect-zbt1
-        run: cargo build --release --locked
-      - name: Clippy ZBT-1 production composition
+        run: |
+          cargo build --release --locked
+          cargo build --release --locked --no-default-features --features router
+          cargo build --release --locked --no-default-features --features sed
+      - name: Clippy ZBT-1 role compositions
         working-directory: examples/ha-connect-zbt1
-        run: cargo clippy --release --locked --target thumbv8m.main-none-eabihf -- -D warnings
+        run: |
+          for role in ed router sed; do
+            cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
+              --no-default-features --features "$role" -- -D warnings
+          done
       - name: Build EFR32 Series 2 lab gate binaries (ZBT-1, MG21)
         working-directory: tools/efr32s2-lab
         run: cargo build --release --locked --bins --no-default-features --features zbt1
       - name: Create firmware artifacts
         run: |
-          ELF=examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-ed
+          DIR=examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release
           OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
-          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
-          "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          ./tools/firmware-size-report.sh ha-connect-zbt1-ed ${ELF}.bin ${ELF}.size.json
-          python3 examples/ha-connect-zbt1/tools/verify-layout.py "$ELF"
-          SYMS="$("$NM" --demangle "$ELF")"
-          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
-          if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
-            echo "ZBT-1 End Device links parent/router maintenance symbols:" >&2
-            grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
-            exit 1
-          fi
+          for image in ha-connect-zbt1-ed ha-connect-zbt1-router ha-connect-zbt1-sed; do
+            ELF="$DIR/$image"
+            "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+            "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+            ./tools/firmware-size-report.sh "$image" "${ELF}.bin" "${ELF}.size.json"
+            python3 examples/ha-connect-zbt1/tools/verify-layout.py "$ELF"
+          done
+          # Leaf images must compile out the parent MAC and router lifecycle;
+          # the router is the positive control for the symbol pattern.
+          NM="$NM" ./tools/check-role-symbols.sh leaf "$DIR/ha-connect-zbt1-ed" "$DIR/ha-connect-zbt1-sed"
+          NM="$NM" ./tools/check-role-symbols.sh parent "$DIR/ha-connect-zbt1-router"
       - name: Upload ZBT-1 firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ha-connect-zbt1-ed-firmware
           path: |
-            examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-ed.bin
-            examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-ed.hex
-            examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-ed.size.json
+            examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-*.bin
+            examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-*.hex
+            examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-*.size.json
           if-no-files-found: error
 
   build-efr32mg22:
-    name: Build EFR32MG22 sensor and Series 2 lab gates
+    name: Build EFR32MG22 sensor and End Device, Series 2 lab gates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -1562,44 +1591,62 @@ jobs:
           workspaces: |
             examples/efr32mg22-sensor
             tools/efr32s2-lab
-          key: thumbv8m-efr32mg22-${{ env.RUST_TOOLCHAIN }}-sed-${{ hashFiles('examples/efr32mg22-sensor/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/efr32mg22-sensor/link/**', 'efr32s2-hal/link/**') }}
-      - name: Build EFR32MG22 sensor (release)
+          key: thumbv8m-efr32mg22-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/efr32mg22-sensor/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/efr32mg22-sensor/link/**', 'efr32s2-hal/link/**') }}
+      - name: Build EFR32MG22 sensor and End Device (release)
         working-directory: examples/efr32mg22-sensor
-        run: cargo build --release --locked
-      - name: Clippy EFR32MG22 production composition
+        run: |
+          cargo build --release --locked
+          cargo build --release --locked --no-default-features --features ed
+      # The Router composition compiles, but its static RAM leaves less than
+      # the 14 KiB stack floor in 32 KiB SRAM. The product linker script must
+      # reject it with that assertion rather than link an image that would
+      # overflow its stack.
+      - name: EFR32MG22 Router is rejected at link time
         working-directory: examples/efr32mg22-sensor
-        run: cargo clippy --release --locked --target thumbv8m.main-none-eabihf -- -D warnings
+        run: |
+          if cargo build --release --locked --no-default-features --features router 2> router.log; then
+            echo "EFR32MG22 Router linked; it does not fit 32 KiB SRAM" >&2
+            exit 1
+          fi
+          grep -F 'EFR32MG22: static RAM leaves less than 14 KiB of stack' router.log || {
+            cat router.log >&2
+            exit 1
+          }
+      - name: Clippy EFR32MG22 role compositions
+        working-directory: examples/efr32mg22-sensor
+        run: |
+          for role in sed ed router; do
+            cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
+              --no-default-features --features "$role" -- -D warnings
+          done
       - name: Build EFR32 Series 2 lab gate binaries (MG22)
         working-directory: tools/efr32s2-lab
         run: cargo build --release --locked --bins
       - name: Create firmware artifacts
         run: |
-          ELF=examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-sensor
+          DIR=examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release
           OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
-          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
-          "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-          ./tools/firmware-size-report.sh efr32mg22-sensor ${ELF}.bin ${ELF}.size.json
-          python3 examples/efr32mg22-sensor/tools/verify-layout.py "$ELF"
-          SYMS="$("$NM" --demangle "$ELF")"
-          if ! grep -Eq 'SoftwareAes128|aes::soft' <<<"$SYMS"; then
-            echo "EFR32MG22 image is missing its currently supported software AES backend" >&2
-            exit 1
-          fi
-          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
-          if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
-            echo "EFR32MG22 sensor links parent/router maintenance symbols:" >&2
-            grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
-            exit 1
-          fi
+          for image in efr32mg22-sensor efr32mg22-ed; do
+            ELF="$DIR/$image"
+            "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+            "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+            ./tools/firmware-size-report.sh "$image" "${ELF}.bin" "${ELF}.size.json"
+            python3 examples/efr32mg22-sensor/tools/verify-layout.py "$ELF"
+            if ! "$NM" --demangle "$ELF" | grep -Eq 'SoftwareAes128|aes::soft'; then
+              echo "$image is missing its currently supported software AES backend" >&2
+              exit 1
+            fi
+          done
+          NM="$NM" ./tools/check-role-symbols.sh leaf "$DIR/efr32mg22-sensor" "$DIR/efr32mg22-ed"
       - name: Upload EFR32MG22 firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: efr32mg22-sensor-firmware
           path: |
-            examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-sensor.bin
-            examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-sensor.hex
-            examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-sensor.size.json
+            examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-*.bin
+            examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-*.hex
+            examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-*.size.json
           if-no-files-found: error
 
   # ── Deploy Book + Web Flasher to GitHub Pages ────────────────

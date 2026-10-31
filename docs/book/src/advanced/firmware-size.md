@@ -907,6 +907,41 @@ change alone (RTCC flags, default TX power, flash-capacity helper) costs
 and stack are unchanged. MG22 is hardware-tested. The xG21 radio is
 lab-tested on the ZBT-1, but the BRD4181A MG21 image itself has not run.
 
+### EFR32 Series 2 node roles
+
+Each Series 2 board now builds a router, an always-on ED and a SED bin (see
+the EFR32 platform guide). All images were rebuilt from one worktree path at
+`b4cc0ac` and on the branch. Every non-Series-2 image is byte-identical in
+every metric. The Series 2 images that already existed shrink:
+
+| image | flash `b4cc0ac` | branch | delta | `bss`, `stack` |
+|---|---:|---:|---:|---|
+| `efr32mg21-sensor` | 231,160 | 230,984 | −176 | unchanged |
+| `efr32mg22-sensor` | 231,576 | 231,400 | −176 | unchanged |
+| `ha-connect-zbt1-ed` | 230,168 | 229,996 | −172 | unchanged |
+
+The role tag in the security journal and the RX-overflow clear before CCA
+first cost +60 to +68 B. `service_overflow` had been inlined into six
+radio call sites; marking it `#[inline(never)]` saves about 240 B in every
+Series 2 image, which more than pays for both.
+
+New rows, measured on the same path:
+
+| image | flash | text | bss | pool | mac_code | stack |
+|---|---:|---:|---:|---:|---:|---:|
+| `efr32mg21-ed` | 230,416 | 186,436 | 13,576 | 2,920 | 8,978 | 16,448 |
+| `efr32mg21-router` | 349,604 | 290,640 | 30,472 | 4,520 | 13,204 | 30,944 |
+| `efr32mg22-ed` | 230,496 | 186,616 | 13,576 | 2,920 | 9,060 | 16,448 |
+| `ha-connect-zbt1-router` | 349,816 | 290,648 | 37,644 | 4,512 | 13,200 | 30,944 |
+| `ha-connect-zbt1-sed` | 222,876 | 180,464 | 20,748 | 2,744 | 8,284 | 20,620 |
+
+The router images are about 119 KB larger than the ED images. That is the
+NWK routing, neighbour and child tables, the parent MAC and the APS
+fragment and duplicate state. An MG22 router does not fit: 30,472 B of
+`.bss` plus the 14 KiB stack floor exceeds the 32 KiB of SRAM, so the
+linker rejects it and CI asserts the failure. The baseline JSON rows were
+moved by the same-path deltas.
+
 ## Measurement commands
 
 Raw binary:

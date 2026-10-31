@@ -9,10 +9,19 @@
 //! - **TX** — [`AckWaitTx`]: one CCA, TX and the ACK wait per attempt
 //!   (`Radio::transmit_cca`); CSMA-CA backoff and retries stay in
 //!   `SoftMacCore`.
-//! - **ACK** — the HAL acknowledges matching frames itself while
-//!   [`RadioPhy::receive`] polls it (RX→TX turnaround ≈ 85 µs on xG22), so the
-//!   PHY reports `hardware_auto_ack`. Frames are only acknowledged while a
-//!   receive window is being polled.
+//! - **ACK** — selected by the [`AckMode`] type parameter:
+//!   - [`HalAck`] (end devices): the HAL acknowledges matching frames itself
+//!     while [`RadioPhy::receive`] polls it (RX→TX turnaround ≈ 85 µs on
+//!     xG22), so the PHY reports `hardware_auto_ack`;
+//!   - [`SoftwareAck`] (parents, [`Efr32s2RouterMac`]): the HAL never ACKs;
+//!     `SoftMacCore` sends each Imm-Ack through [`RadioPhy::send_ack`] with
+//!     the Frame Pending bit from its own pending table, which is what a
+//!     polling child needs. A frame that already waited longer than
+//!     [`SOFTWARE_ACK_DEADLINE_US`] in the RX buffer is dropped unacknowledged
+//!     so the sender retries instead of seeing a late ACK.
+//!
+//!   In both modes frames are only acknowledged while a receive window is
+//!   being polled.
 //! - **RX** — polled from the executor (`yield_now`) inside the receive
 //!   window; the radio has no RX interrupt path yet.
 //!
@@ -31,19 +40,90 @@ use embassy_time::{Duration, Instant, Timer};
 
 use crate::pib::{MacPib, PibAttribute, PibValue};
 use crate::{
-    AckResult, AckWaitTx, MAX_PHY_FRAME_LEN, MacError, PhyAddressFilter, PhyCapabilities, PhyError,
-    PhyRxFrame, PlatformServices, RadioPhy, SoftMacCore,
+    AckResult, AckWaitTx, MAX_PHY_FRAME_LEN, MacError, MacRole, Parent, PhyAddressFilter,
+    PhyCapabilities, PhyError, PhyRxFrame, PlatformServices, RadioPhy, SoftMacCore,
 };
 use zigbee_types::IeeeAddress;
 
 const _: () = assert!(radio::MAX_FRAME == MAX_PHY_FRAME_LEN);
 
+/// Latest point after the end of a received frame at which a software
+/// Imm-Ack is still sent: macAckWaitDuration (864 µs) minus the SHR, the HAL
+/// RX→TX turnaround, the receive-path processing and one RTCC tick of
+/// measurement uncertainty, with margin.
+pub const SOFTWARE_ACK_DEADLINE_US: u64 = 400;
+
+mod ack_sealed {
+    pub trait Sealed {}
+}
+
+/// How [`Efr32s2RadioPhy`] acknowledges received frames. Sealed; see
+/// [`HalAck`] and [`SoftwareAck`].
+pub trait AckMode: ack_sealed::Sealed {
+    #[doc(hidden)]
+    const SOFTWARE: bool;
+    #[doc(hidden)]
+    type State: Default;
+    #[doc(hidden)]
+    fn soft(state: &mut Self::State) -> Option<&mut SoftAckState>;
+    #[doc(hidden)]
+    fn soft_ref(state: &Self::State) -> Option<&SoftAckState>;
+}
+
+/// End-device ACK mode: the HAL auto-ACKs (Frame Pending always clear) and
+/// the PHY reports `hardware_auto_ack`. Zero-sized; the default.
+pub struct HalAck;
+
+/// Parent ACK mode: `SoftMacCore` sends every Imm-Ack with its own Frame
+/// Pending decision; stale frames are dropped (see the module docs).
+pub struct SoftwareAck;
+
+/// Per-PHY state of [`SoftwareAck`].
+#[doc(hidden)]
+#[derive(Default)]
+pub struct SoftAckState {
+    filter: AckFilter,
+    /// Time of the most recent empty RX-buffer poll while receiving.
+    last_idle_us: u64,
+    stale_dropped: u32,
+}
+
+impl ack_sealed::Sealed for HalAck {}
+impl ack_sealed::Sealed for SoftwareAck {}
+
+impl AckMode for HalAck {
+    const SOFTWARE: bool = false;
+    type State = ();
+    #[inline(always)]
+    fn soft(_: &mut ()) -> Option<&mut SoftAckState> {
+        None
+    }
+    #[inline(always)]
+    fn soft_ref(_: &()) -> Option<&SoftAckState> {
+        None
+    }
+}
+
+impl AckMode for SoftwareAck {
+    const SOFTWARE: bool = true;
+    type State = SoftAckState;
+    #[inline(always)]
+    fn soft(state: &mut SoftAckState) -> Option<&mut SoftAckState> {
+        Some(state)
+    }
+    #[inline(always)]
+    fn soft_ref(state: &SoftAckState) -> Option<&SoftAckState> {
+        Some(state)
+    }
+}
+
 /// EFR32 Series 2 radio adapted to [`RadioPhy`].
 ///
 /// `DEFAULT_TX_DBM` is the product's `phyTransmitPower` after construction
 /// and after every MLME-RESET; it must lie in
-/// [`radio::TX_POWER_RANGE_DBM`] (checked at compile time).
-pub struct Efr32s2RadioPhy<const DEFAULT_TX_DBM: i8 = 0> {
+/// [`radio::TX_POWER_RANGE_DBM`] (checked at compile time). `A` selects the
+/// [`AckMode`]: [`HalAck`] for end devices, [`SoftwareAck`] for parents.
+pub struct Efr32s2RadioPhy<const DEFAULT_TX_DBM: i8 = 0, A: AckMode = HalAck> {
     radio: Radio,
     ieee: IeeeAddress,
     rx_on_when_idle: bool,
@@ -52,13 +132,32 @@ pub struct Efr32s2RadioPhy<const DEFAULT_TX_DBM: i8 = 0> {
     asleep: bool,
     /// Most recent HAL error other than `NoAck`/`ChannelBusy` (diagnostics).
     last_error: Option<RadioError>,
+    ack: A::State,
 }
 
 /// The EFR32 Series 2 MAC: the shared software MAC over [`Efr32s2RadioPhy`].
 pub type Efr32s2SoftMac<const DEFAULT_TX_DBM: i8 = 0> =
     SoftMacCore<Efr32s2RadioPhy<DEFAULT_TX_DBM>>;
 
-impl<const D: i8> Efr32s2RadioPhy<D> {
+/// Parent role of an EFR32 Series 2 router: eight queued MAC command events,
+/// eight concurrent Association Response transactions and eight children
+/// with Frame Pending armed (the core's software table, used because
+/// [`SoftwareAck`] sends the Imm-Ack).
+pub type Efr32s2RouterRole = Parent<8, 8, 8>;
+
+/// Retained-RX depth of an always-on EFR32 Series 2 router: it hears child
+/// and neighbour traffic between runtime receive calls.
+pub const EFR32S2_ROUTER_PENDING_RX: usize = 8;
+
+/// The EFR32 Series 2 router MAC: the shared software MAC in the parent role
+/// over a [`SoftwareAck`] PHY.
+pub type Efr32s2RouterMac<const DEFAULT_TX_DBM: i8 = 0> = SoftMacCore<
+    Efr32s2RadioPhy<DEFAULT_TX_DBM, SoftwareAck>,
+    Efr32s2RouterRole,
+    EFR32S2_ROUTER_PENDING_RX,
+>;
+
+impl<const D: i8, A: AckMode> Efr32s2RadioPhy<D, A> {
     /// Program the 802.15.4 PHY. The HFXO must already be running.
     ///
     /// Returns [`PhyError::Hardware`] if the radio does not come up.
@@ -70,6 +169,7 @@ impl<const D: i8> Efr32s2RadioPhy<D> {
             rx_on_when_idle: false,
             asleep: false,
             last_error: None,
+            ack: A::State::default(),
         })
     }
 
@@ -78,20 +178,10 @@ impl<const D: i8> Efr32s2RadioPhy<D> {
         self.ieee
     }
 
-    /// Wrap in the shared software MAC. Kept out of line so the PHY and the
-    /// MAC are not both live in the caller's frame.
-    #[inline(never)]
-    pub fn into_soft_mac(self) -> Result<Efr32s2SoftMac<D>, MacError> {
-        const {
-            assert!(
-                D >= radio::TX_POWER_RANGE_DBM.0 && D <= radio::TX_POWER_RANGE_DBM.1,
-                "default TX power outside the chip's PA range"
-            )
-        };
-        let mut pib = MacPib::new(self.ieee, 0, 0);
-        pib.set(PibAttribute::PhyTransmitPower, PibValue::I8(D))
-            .map_err(|_| MacError::InvalidParameter)?;
-        SoftMacCore::new(self, pib)
+    /// Frames dropped unacknowledged because they waited too long in the RX
+    /// buffer for a software ACK ([`SoftwareAck`] only; always 0 otherwise).
+    pub fn stale_ack_drops(&self) -> u32 {
+        A::soft_ref(&self.ack).map_or(0, |state| state.stale_dropped)
     }
 
     /// Radio debug counters.
@@ -134,7 +224,48 @@ impl<const D: i8> Efr32s2RadioPhy<D> {
     }
 }
 
-impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
+/// Initial PIB with the board TX power. A macro rather than a helper so the
+/// PIB is built in place in the out-of-line constructors (a by-value
+/// `Result<MacPib>` return costs a frame copy).
+macro_rules! initial_pib {
+    ($phy:expr, $d:expr) => {{
+        const {
+            assert!(
+                $d >= radio::TX_POWER_RANGE_DBM.0 && $d <= radio::TX_POWER_RANGE_DBM.1,
+                "default TX power outside the chip's PA range"
+            )
+        };
+        let mut pib = MacPib::new($phy.ieee, 0, 0);
+        pib.set(PibAttribute::PhyTransmitPower, PibValue::I8($d))
+            .map_err(|_| MacError::InvalidParameter)?;
+        pib
+    }};
+}
+
+impl<const D: i8> Efr32s2RadioPhy<D> {
+    /// Wrap in the shared software MAC. Kept out of line so the PHY and the
+    /// MAC are not both live in the caller's frame.
+    #[inline(never)]
+    pub fn into_soft_mac(self) -> Result<Efr32s2SoftMac<D>, MacError> {
+        let pib = initial_pib!(self, D);
+        SoftMacCore::new(self, pib)
+    }
+}
+
+impl<const D: i8> Efr32s2RadioPhy<D, SoftwareAck> {
+    /// Wrap in the shared software MAC in a parent role, normally
+    /// [`Efr32s2RouterMac`]. Kept out of line like
+    /// [`Efr32s2RadioPhy::into_soft_mac`].
+    #[inline(never)]
+    pub fn into_parent_mac<R: MacRole, const RX: usize>(
+        self,
+    ) -> Result<SoftMacCore<Self, R, RX>, MacError> {
+        let pib = initial_pib!(self, D);
+        SoftMacCore::new_custom(self, pib)
+    }
+}
+
+impl<const D: i8, A: AckMode> RadioPhy for Efr32s2RadioPhy<D, A> {
     type Tx = AckWaitTx;
 
     /// Board-selected `phyTransmitPower` after construction and every
@@ -149,7 +280,7 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
 
     fn capabilities(&self) -> PhyCapabilities {
         PhyCapabilities {
-            hardware_auto_ack: true,
+            hardware_auto_ack: !A::SOFTWARE,
             hardware_address_filter: false,
             tx_power_min: radio::TX_POWER_RANGE_DBM.0,
             tx_power_max: radio::TX_POWER_RANGE_DBM.1,
@@ -196,19 +327,44 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
         }
     }
 
-    /// Never called: `hardware_auto_ack` is set and the HAL acknowledges
-    /// while [`Self::receive`] polls.
-    async fn send_ack(&mut self, _sequence: u8, _frame_pending: bool) -> Result<(), PhyError> {
-        Err(PhyError::Unsupported)
+    /// [`SoftwareAck`]: transmit the Imm-Ack the core decided on, right
+    /// after the frame was returned by [`Self::receive`]. [`HalAck`] never
+    /// gets here (`hardware_auto_ack` is set).
+    async fn send_ack(&mut self, sequence: u8, frame_pending: bool) -> Result<(), PhyError> {
+        if !A::SOFTWARE {
+            return Err(PhyError::Unsupported);
+        }
+        self.radio
+            .send_ack(sequence, frame_pending)
+            .map_err(|e| self.fail(e))
     }
 
     async fn receive(&mut self, timeout_us: u32, frame: &mut PhyRxFrame) -> Result<bool, PhyError> {
+        // Compile-time false for `HalAck`: no extra register read there.
+        let was_on = A::SOFTWARE && self.radio.is_rx_on();
         self.ensure_rx()?;
+        if !was_on && let Some(state) = A::soft(&mut self.ack) {
+            // Nothing in the buffer can be older than switching RX on.
+            state.last_idle_us = Instant::now().as_micros();
+        }
         let deadline = Instant::now() + Duration::from_micros(u64::from(timeout_us));
         loop {
             if let Some(rx) = self.radio.receive(frame.buffer_mut()) {
+                if let Some(state) = A::soft(&mut self.ack)
+                    && software_ack_too_late(
+                        state,
+                        &frame.buffer_mut()[..rx.len],
+                        Instant::now().as_micros(),
+                    )
+                {
+                    state.stale_dropped = state.stale_dropped.wrapping_add(1);
+                    continue;
+                }
                 frame.set_len(rx.len, rx.lqi)?;
                 return Ok(true);
+            }
+            if let Some(state) = A::soft(&mut self.ack) {
+                state.last_idle_us = Instant::now().as_micros();
             }
             if Instant::now() >= deadline {
                 self.settle();
@@ -240,7 +396,12 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
     }
 
     fn set_address_filter(&mut self, filter: Option<PhyAddressFilter>) -> Result<(), PhyError> {
-        self.radio.set_ack_filter(ack_filter(filter));
+        let filter = ack_filter(filter);
+        match A::soft(&mut self.ack) {
+            // The HAL filter stays empty, so the HAL never ACKs on its own.
+            Some(state) => state.filter = filter,
+            None => self.radio.set_ack_filter(filter),
+        }
         Ok(())
     }
 
@@ -279,9 +440,9 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
 }
 
 /// Software AES: no EFR32 Series 2 crypto engine backend yet.
-impl<const D: i8> zigbee_crypto::ForwardAesProvider for Efr32s2RadioPhy<D> {}
+impl<const D: i8, A: AckMode> zigbee_crypto::ForwardAesProvider for Efr32s2RadioPhy<D, A> {}
 
-impl<const D: i8> PlatformServices for Efr32s2RadioPhy<D> {
+impl<const D: i8, A: AckMode> PlatformServices for Efr32s2RadioPhy<D, A> {
     fn monotonic_micros(&self) -> u32 {
         Instant::now().as_micros() as u32
     }
@@ -294,6 +455,14 @@ impl<const D: i8> PlatformServices for Efr32s2RadioPhy<D> {
     fn fill_random(&mut self, _output: &mut [u8]) -> Result<(), MacError> {
         Err(MacError::Unsupported)
     }
+}
+
+/// True when `frame` needs an ACK from us but has waited in the RX buffer
+/// longer than [`SOFTWARE_ACK_DEADLINE_US`]: it completed after the last
+/// empty poll, so `now - last_idle` bounds its age.
+fn software_ack_too_late(state: &SoftAckState, frame: &[u8], now_us: u64) -> bool {
+    radio::needs_ack(frame, &state.filter)
+        && now_us.saturating_sub(state.last_idle_us) > SOFTWARE_ACK_DEADLINE_US
 }
 
 fn ack_filter(filter: Option<PhyAddressFilter>) -> AckFilter {
@@ -358,6 +527,39 @@ mod tests {
     fn unassigned_short_address_is_never_matched() {
         let to_fffe = [0x61, 0x88, 0x10, 0xE9, 0xDF, 0xFE, 0xFF, 0x00, 0x00];
         assert!(!needs_ack(&to_fffe, &filter(0xFFFE)));
+    }
+
+    #[test]
+    fn late_software_ack_frames_are_dropped_only_when_an_ack_is_due() {
+        let state = SoftAckState {
+            filter: filter(0x1234),
+            last_idle_us: 1_000,
+            stale_dropped: 0,
+        };
+        let to_us = [0x61, 0x88, 0x10, 0xE9, 0xDF, 0x34, 0x12, 0x00, 0x00];
+        assert!(!software_ack_too_late(
+            &state,
+            &to_us,
+            1_000 + SOFTWARE_ACK_DEADLINE_US
+        ));
+        assert!(software_ack_too_late(
+            &state,
+            &to_us,
+            1_001 + SOFTWARE_ACK_DEADLINE_US
+        ));
+        // Broadcasts and frames for others never need our ACK: never stale.
+        let broadcast = [0x41, 0x88, 0x10, 0xE9, 0xDF, 0xFF, 0xFF, 0x00, 0x00];
+        assert!(!software_ack_too_late(&state, &broadcast, 1_000_000));
+        let other = [0x61, 0x88, 0x10, 0xE9, 0xDF, 0x21, 0x43, 0x00, 0x00];
+        assert!(!software_ack_too_late(&state, &other, 1_000_000));
+    }
+
+    #[test]
+    fn router_mac_is_a_software_ack_parent() {
+        fn parent<T: crate::ParentMacDriver>() {}
+        parent::<Efr32s2RouterMac<10>>();
+        const { assert!(SoftwareAck::SOFTWARE && !HalAck::SOFTWARE) };
+        assert_eq!(core::mem::size_of::<<HalAck as AckMode>::State>(), 0);
     }
 
     #[test]

@@ -3,6 +3,11 @@
 //! The board supplies raw internal flash only. This product owns the protected
 //! final 16 KiB partition and passes relative offsets for its two physical
 //! 8 KiB erase sectors to the core-neutral [`SecurityStateJournal`].
+//!
+//! Directly below it, `0x74000..0x7C000` is reserved for the router role's
+//! child-table and APS binding/group journals (two 16 KiB partitions of two
+//! 8 KiB sectors). Every role image links the same application window, so a
+//! reflash to another role can never overwrite another role's persistence.
 
 use efr32s2_hal::flash::{Efr32s2Flash, FLASH_CAPACITY, FLASH_PAGE_SIZE, FlashError};
 use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
@@ -12,8 +17,15 @@ pub const FLASH_START: u32 = 0x0000_0000;
 pub const FLASH_SIZE: usize = FLASH_CAPACITY;
 /// No resident bootloader on this product: the image starts at 0x0.
 pub const APPLICATION_START: u32 = FLASH_START;
-pub const APPLICATION_END: u32 = 0x0007_C000;
-pub const PERSISTENCE_PARTITION_START: u32 = APPLICATION_END;
+pub const APPLICATION_END: u32 = 0x0007_4000;
+/// Router-role child-table journal (unused by the end-device roles).
+pub const CHILD_TABLE_PARTITION_START: u32 = APPLICATION_END;
+pub const CHILD_TABLE_PARTITION_SIZE: usize = 16 * 1024;
+/// Router-role APS binding/group journal (unused by the end-device roles).
+pub const APS_TABLE_PARTITION_START: u32 =
+    CHILD_TABLE_PARTITION_START + CHILD_TABLE_PARTITION_SIZE as u32;
+pub const APS_TABLE_PARTITION_SIZE: usize = 16 * 1024;
+pub const PERSISTENCE_PARTITION_START: u32 = 0x0007_C000;
 pub const PERSISTENCE_PARTITION_SIZE: usize = 16 * 1024;
 pub const PERSISTENCE_PARTITION_END: u32 =
     PERSISTENCE_PARTITION_START + PERSISTENCE_PARTITION_SIZE as u32;
@@ -26,7 +38,12 @@ const SECTOR_B: u32 = SECURITY_SECTOR_SIZE as u32;
 const _: () = assert!(FLASH_START == 0);
 const _: () = assert!(FLASH_SIZE == 512 * 1024);
 const _: () = assert!(APPLICATION_START < APPLICATION_END);
-const _: () = assert!(APPLICATION_END == PERSISTENCE_PARTITION_START);
+const _: () = assert!(APPLICATION_END == CHILD_TABLE_PARTITION_START);
+const _: () = assert!(
+    APS_TABLE_PARTITION_START + APS_TABLE_PARTITION_SIZE as u32 == PERSISTENCE_PARTITION_START
+);
+const _: () = assert!(CHILD_TABLE_PARTITION_SIZE == 2 * FLASH_PAGE_SIZE);
+const _: () = assert!(APS_TABLE_PARTITION_SIZE == 2 * FLASH_PAGE_SIZE);
 const _: () = assert!(PERSISTENCE_PARTITION_END as usize == FLASH_CAPACITY);
 const _: () = assert!(PERSISTENCE_PARTITION_SIZE == SECURITY_SECTOR_SIZE * 2);
 const _: () = assert!(SECURITY_SECTOR_SIZE == FLASH_PAGE_SIZE);

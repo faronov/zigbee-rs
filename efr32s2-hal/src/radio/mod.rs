@@ -570,6 +570,21 @@ impl Radio {
         result
     }
 
+    /// Transmit an Imm-Ack for `sequence` with the given Frame Pending bit,
+    /// then resume RX if it was on.
+    ///
+    /// For callers that own ACK policy themselves (a parent MAC answering
+    /// data polls with a per-child Frame Pending bit). Such callers keep the
+    /// [`AckFilter`] empty so [`receive`](Self::receive) never ACKs on its
+    /// own, and must call this promptly: the sender only waits
+    /// macAckWaitDuration (864 us) for the ACK.
+    pub fn send_ack(&mut self, sequence: u8, frame_pending: bool) -> Result<(), RadioError> {
+        let ack = [0x02 | ((frame_pending as u8) << 4), 0x00, sequence];
+        self.transmit(&ack)?;
+        self.stats.acks_sent += 1;
+        Ok(())
+    }
+
     fn transmit_raw(&mut self, frame: &[u8]) -> Result<(), RadioError> {
         // Leave RX without discarding already stored frames; a frame
         // still arriving is aborted since the caller decided to transmit.
@@ -647,6 +662,10 @@ impl Radio {
         if frame.len() > MAX_FRAME {
             return Err(RadioError::FrameTooLong);
         }
+        // Nothing drains the RX buffer while the MAC waits before a TX
+        // (e.g. RREQ relay jitter). A receiver left in RXOVERFLOW has no
+        // valid RSSI, so CCA would report a busy channel indefinitely.
+        self.service_overflow();
         self.rx_on()?;
         if !self.cca()? {
             return Err(RadioError::ChannelBusy);
@@ -754,6 +773,9 @@ impl Radio {
         Some(frame)
     }
 
+    // Out of line: called from six places; inlining duplicated it into
+    // every caller and grew the end-device images.
+    #[inline(never)]
     fn service_overflow(&mut self) {
         let flags = unsafe { read(L.frc + FRC_IF) };
         if flags & FRC_IF_RXOF != 0 || rac_state_raw() == RacState::RxOverflow {

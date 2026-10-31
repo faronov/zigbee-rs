@@ -167,6 +167,80 @@ impl NorFlash for Efr32s2Flash {
     }
 }
 
+/// Page-aligned window `[START, START + SIZE)` of the internal flash.
+///
+/// Offsets are relative to `START` and every access is bounds-checked, so
+/// a journal bound to one partition cannot reach the bootloader, the
+/// application or another product partition. Products mint partitions from
+/// the unique [`Efr32s2Flash`] handle (see [`Self::new_unchecked`]).
+pub struct FlashPartition<const START: u32, const SIZE: usize> {
+    flash: Efr32s2Flash,
+}
+
+impl<const START: u32, const SIZE: usize> FlashPartition<START, SIZE> {
+    const VALID: () = {
+        assert!(SIZE > 0);
+        assert!((START as usize).is_multiple_of(FLASH_PAGE_SIZE));
+        assert!(SIZE.is_multiple_of(FLASH_PAGE_SIZE));
+        assert!(START as usize + SIZE <= MAX_FLASH_CAPACITY);
+    };
+
+    /// # Safety
+    ///
+    /// The caller (the product's flash split) must guarantee that no other
+    /// live owner issues MSC operations inside `[START, START + SIZE)`, i.e.
+    /// partitions minted from one [`Efr32s2Flash`] are pairwise disjoint.
+    pub const unsafe fn new_unchecked() -> Self {
+        let () = Self::VALID;
+        Self {
+            flash: Efr32s2Flash::new(),
+        }
+    }
+
+    fn physical_offset(offset: u32, length: usize) -> Result<u32, FlashError> {
+        (offset as usize)
+            .checked_add(length)
+            .filter(|end| *end <= SIZE)
+            .ok_or(FlashError::OutOfBounds)?;
+        START.checked_add(offset).ok_or(FlashError::OutOfBounds)
+    }
+}
+
+impl<const START: u32, const SIZE: usize> ErrorType for FlashPartition<START, SIZE> {
+    type Error = FlashError;
+}
+
+impl<const START: u32, const SIZE: usize> ReadNorFlash for FlashPartition<START, SIZE> {
+    const READ_SIZE: usize = Efr32s2Flash::READ_SIZE;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.flash
+            .read(Self::physical_offset(offset, bytes.len())?, bytes)
+    }
+
+    fn capacity(&self) -> usize {
+        SIZE
+    }
+}
+
+impl<const START: u32, const SIZE: usize> NorFlash for FlashPartition<START, SIZE> {
+    const WRITE_SIZE: usize = Efr32s2Flash::WRITE_SIZE;
+    const ERASE_SIZE: usize = Efr32s2Flash::ERASE_SIZE;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        if from >= to {
+            return Err(FlashError::OutOfBounds);
+        }
+        let physical_from = Self::physical_offset(from, (to - from) as usize)?;
+        self.flash.erase(physical_from, physical_from + (to - from))
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.flash
+            .write(Self::physical_offset(offset, bytes.len())?, bytes)
+    }
+}
+
 /// Read back a programmed burst.
 fn verify(offset: u32, bytes: &[u8]) -> Result<(), FlashError> {
     #[cfg(all(target_arch = "arm", target_os = "none"))]
@@ -279,4 +353,28 @@ fn wait_series2_ready_ram() -> Result<(), FlashError> {
         }
     }
     Err(FlashError::Timeout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Window = FlashPartition<0x000F_4000, 0x4000>;
+
+    #[test]
+    fn partition_offsets_stay_inside_their_window() {
+        assert_eq!(Window::physical_offset(0, 4), Ok(0x000F_4000));
+        assert_eq!(Window::physical_offset(0x3FFC, 4), Ok(0x000F_7FFC));
+        assert_eq!(
+            Window::physical_offset(0x3FFD, 4),
+            Err(FlashError::OutOfBounds)
+        );
+        assert_eq!(
+            Window::physical_offset(u32::MAX, 1),
+            Err(FlashError::OutOfBounds)
+        );
+        // SAFETY: host test; no MSC access is issued.
+        let window = unsafe { Window::new_unchecked() };
+        assert_eq!(window.capacity(), 0x4000);
+    }
 }

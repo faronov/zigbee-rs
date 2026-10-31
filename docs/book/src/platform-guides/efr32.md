@@ -202,7 +202,7 @@ Problems found on xG21 (ZBT-1):
 | HFXO | 38.4 MHz, CTUNE 120 |
 | LED0 / BTN0 | PB1 active high / PB0 active low (EM2 wake) |
 | VCOM | USART TX PA5, enable PA4, 115200 |
-| layout | app `0x0..0x7C000` (no bootloader), journal `0x7C000..0x80000` |
+| layout | app `0x0..0x74000` (no bootloader), router child/APS tables `0x74000..0x7C000`, journal `0x7C000..0x80000` |
 
 The WSTK Si7021 is not reachable from this QFN32 radio board (lab gate
 `s2-i2c-scan`). The example reports die temperature (EMU_TEMP) and synthetic
@@ -236,7 +236,7 @@ resume. The linked stack is 17.6 KiB.
 | HFXO | 38.4 MHz, CTUNE 133 |
 | LED0 / BTN0 | PB0 active high / PD2 active low (no EM2 wake on port D) |
 | VCOM | USART0 TX PA5, enable PD4, 115200 |
-| layout | Gecko bootloader `0x0..0x4000`, app `0x4000..0x7C000`, journal `0x7C000..0x80000` (lower 512 KiB) |
+| layout | Gecko bootloader `0x0..0x4000`, app `0x4000..0x74000`, router child/APS tables `0x74000..0x7C000`, journal `0x7C000..0x80000` (lower 512 KiB) |
 
 `examples/efr32mg21-sensor` is the same composition as MG22: RadioPhy and
 SoftMac, RTCC time driver, EM2 and VCOM. It builds and passes the layout
@@ -254,7 +254,7 @@ BRD4181A:
 | former scaffold MAC | 208,956 | 177,048 | 18,888 | 11,040 | 25,524 |
 | efr32s2 RadioPhy + SoftMac (xG21 tables) | 231,248 | 187,924 | 14,600 | 2,744 | 20,652 |
 
-### Home Assistant Connect ZBT-1 (lab-tested as an End Device)
+### Home Assistant Connect ZBT-1 (lab-tested as Router and End Device)
 
 `boards/ha-connect-zbt1` describes the ZBT-1:
 
@@ -277,13 +277,14 @@ secure boot is not enforced.
 
 `products/ha-connect-zbt1` and `examples/ha-connect-zbt1` (bin
 `ha-connect-zbt1-ed`) make it an always-on (RX-on-when-idle) End Device
-with Basic and Identify on endpoint 1. It is not a Router, because
-SoftMacCore has no parent MAC role.
+with Basic and Identify on endpoint 1. The same crate also builds the
+`ha-connect-zbt1-router` and `ha-connect-zbt1-sed` bins (see
+[Node roles](#node-roles-router-always-on-ed-sed)).
 
 | item | value |
 |---|---|
 | identity | `Zigbee-RS` / `ZBT-1-AlwaysOn-ED` |
-| layout | bootloader `0x0..0x4000` (kept), app `0x4000..0xFC000`, journal `0xFC000..0x100000` (2 × 8 KiB), RAM 96 KiB |
+| layout | bootloader `0x0..0x4000` (kept), app `0x4000..0xF4000`, router child/APS tables `0xF4000..0xFC000`, journal `0xFC000..0x100000` (2 × 8 KiB), RAM 96 KiB |
 | boot check | DEVINFO must report 1 MiB of flash, otherwise the firmware halts |
 | TX power | 10 dBm default (the ZBT-1's certified limit is not published) |
 | logs | SEGGER RTT only; the UART stays free for a future bootloader trigger |
@@ -323,6 +324,96 @@ replaces the NCP, the only ways back into the bootloader are:
 
 The application needs a trigger for this, and that requires a UART
 receiver, which the HAL does not have yet.
+
+### Node roles (router, always-on ED, SED)
+
+Each Series 2 example crate builds one bin per role. The features `ed`,
+`sed` and `router` are mutually exclusive (see the
+[role template](../advanced/soft-mac-porting.md#role-template-one-example-crate-per-board)).
+
+| board | SED | always-on ED | Router |
+|---|---|---|---|
+| ZBT-1 (MG21, 96 KiB RAM) | `ha-connect-zbt1-sed` | `ha-connect-zbt1-ed` (default) | `ha-connect-zbt1-router` |
+| BRD4181A (MG21, 64 KiB RAM) | `efr32mg21-sensor` (default) | `efr32mg21-ed` | `efr32mg21-router` |
+| BRD4183A (MG22, 32 KiB RAM) | `efr32mg22-sensor` (default) | `efr32mg22-ed` | does not fit, link rejected |
+
+**MAC.** The router uses `Efr32s2RouterMac = SoftMacCore<Efr32s2RadioPhy,
+Parent<8, 8, 8>>`. The PHY uses the `SoftwareAck` mode: its hardware ACK
+filter stays empty, and the core sends every Imm-Ack through
+`RadioPhy::send_ack`. The core sets the Frame Pending bit from its `PENDING`
+indirect queue (8 entries). The core also builds beacons, association and
+orphan responses and indirect data. The ED and SED bins keep the end-device
+MAC with the default `HalAck` mode, in which the HAL acknowledges matching
+frames itself while `receive` polls it. `tools/check-role-symbols.sh` checks
+in CI that the ED and SED images contain no parent code.
+
+**Persistence.** Router images store the child table and the APS
+duplicate/fragment state in their own flash partitions, which sit between
+the application and the security journal (`0x74000..0x7C000` on MG2x,
+`0xF4000..0xFC000` on the ZBT-1). Every role's linker script reserves these
+partitions, so the security journal never moves. The role tag in the
+journal makes a reflash that changes role rejoin while it keeps the frame
+counters.
+
+**RREQ relay and RX overflow.** A router relays Route Requests three times,
+254 ms apart, after a 4–256 ms jitter. Nothing drains the receiver during
+these delays, so a storm of relayed RREQs from neighbours overflowed the
+RAC RX buffer. `transmit_cca` then found the receiver still on but in
+RxOverflow, CCA read no valid RSSI, and every attempt failed with
+ChannelBusy. On the ZBT-1 this caused about six "Failed to forward RREQ"
+warnings every 10 minutes. `transmit_cca` now clears a pending overflow
+before it enables RX. In 9 minutes afterwards, with 9 overflows, no forward
+failed. The receiver still overflows during storms, because the core does
+not receive while NWK delays run. That is a possible core improvement.
+
+**Stale software ACKs (open item).** In `SoftwareAck` mode the PHY can't
+know when a frame actually arrived, so it bounds the frame's age by
+`now - last empty poll`. When that exceeds 400 µs, the PHY drops the frame
+without an ACK, and the sender's MAC retries it. That way the parent never
+delivers a frame it didn't acknowledge. While the core works on one frame
+(software AES-CCM*, RTT logging), the next frame ages past the bound. With
+one polling child, the ZBT-1 router dropped 123 stale frames and ACKed 158
+in 16 minutes (session `…202457Z-mg22-sed-via-zbt1-steady`). Retries hide
+most of it, but it costs airtime and retry budget. A per-frame RX timestamp
+would bound the age exactly. FRC `TRAILRXDATA.RTCSTAMP` (bit 5) was tried:
+it appends four bytes, but they read zero in every frame (session
+`…203334Z-zbt1-router-exp-rtcstamp2`). That needs PROTIMER/PRS setup the
+GSDK sources don't document. The real fix is a HAL interrupt-driven Imm-Ack
+with a source-match Frame-Pending table (`hardware_auto_ack = true`, core
+`PENDING = 0`, like TLSR8258), which the ED/SED `HalAck` path could also
+share.
+
+**RAM budget (Cortex-M33, default tables).**
+
+| image | `.bss` | linked stack | notes |
+|---|---:|---:|---|
+| ZBT-1 router | 37,644 | 60,148 | 96 KiB part |
+| MG21 router (BRD4181A) | 30,472 | about 34.5 KiB | 64 KiB part |
+| MG22 router | 30,472 | below the 14 KiB floor | does not fit 32 KiB |
+
+The MG22 router's `.bss` breaks down as follows: `ZigbeeDevice<_, Router>`
+19,824 B, main future pool 4,520 B, security journal 2,464 B, application
+2,392 B, radio 768 B. Including the 14 KiB stack floor, this exceeds the
+32 KiB of SRAM. The product linker script `ASSERT` rejects the link, and CI
+asserts that it fails. Shrinking the routing, neighbour and child tables
+would make it fit, but that is a product decision; nothing shrinks them
+silently.
+
+**Hardware evidence** (2026-10-31, ZHA channel 15, PAN `0xDFE9`; hwlab
+session IDs):
+
+| board | role | result | sessions |
+|---|---|---|---|
+| ZBT-1 | Router | Joined as `0xBAAF` and completed the interview; ZHA shows a Router. After a topology update, ZHA lists 16 neighbours with LQI and an active route to `0x0000` via `0xD586`, which proves Mgmt_Lqi and Mgmt_Rtg. Resume from the journal after reflash. | `2026-10-31T195202Z-zbt1-router-join1`, `…195442Z-zbt1-router-topology`, `…200245Z-zbt1-router-topology2`, `…201147Z-zbt1-router-v2-overflowfix2` |
+| ZBT-1 → MG22 | Router as parent | ZHA permitted joining only through the ZBT-1. The MG22 SED's scan showed only `0xBAAF` permitting, and it associated as `0xEE0F`. The ZBT-1 relayed the Transport Key indirectly to the polling child, saw the key-possession proof, and saved its child table. The interview and Configure Reporting went through `0xBAAF`. ZHA shows the MG22 as `0xEE0F` with temperature and humidity updating. The ZBT-1 reports `children 1`, `child 0xEE0F rx_on=false`. | `…202132Z-mg22-sed-via-zbt1-router`, `…202457Z-mg22-sed-via-zbt1-steady` |
+| ZBT-1 | always-on ED | See the ZBT-1 section above. | earlier sessions |
+| ZBT-1 | SED (`em2-debug` build) | After the reflash from the router role, the journal's role tag cleared the network state but kept the frame counters. The SED joined through `0xD586`. The Transport Key came by indirect poll, then Request-Key, Verify-Key and Confirm-Key SUCCESS. The parent accepted the ED Timeout Request (enum 14). Device_annce went out, and the fast-poll window ended after 120 s. In 30 s long polls, `power::EM2_ENTRIES`, read over SWD with hwlab `memory-read`, rose from 7 to 9 in 60 s. ZHA kept the IEEE's old Router descriptor, because zigpy doesn't re-interview a known device on rejoin. Current in EM2 was not measured: the ZBT-1 has no AEM. | `…203748Z-zbt1-sed-join` |
+| ZBT-1 | Router (final image, after the SED) | The role tag cleared the SED state. The first join reused `0xBAAF`, but the Node_Desc_rsp from the TC never arrived: the previous parent `0xD586` still held `0xBAAF` as its sleepy child. The TCLK exchange failed, so the router left and rejoined 12 s later as `0x794A`, with Confirm-Key SUCCESS. ZHA shows a Router at `0x794A`. Its former child, the MG22, found a new parent by itself (`0xD066`) and kept reporting. | `…204449Z-zbt1-router-final` |
+| ZBT-1 | Router (`service_overflow` out of line) | Resumed `0x794A` from the journal without rejoining. In 240 s: 15–17 neighbours, a route, 3 RX overflows cleared, 28 transmissions, 0 TX failures. ZHA still lists it as an available Router. | `…210701Z-zbt1-router-step7-inline-never` |
+| MG22 | SED | See the BRD4183A section above. | earlier sessions |
+
+Not run on hardware: the MG22 always-on ED, every BRD4181A image (no board
+in the lab), and the MG21 router on BRD4181A.
 
 ### Build
 

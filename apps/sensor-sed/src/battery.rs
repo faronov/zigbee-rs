@@ -45,6 +45,19 @@ impl<T: BlockingBatterySource> BatterySource for BlockingBattery<T> {
     }
 }
 
+/// Battery capability of a node that does not measure (or publish) its
+/// supply.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoBattery;
+
+impl BatterySource for NoBattery {
+    type Error = Infallible;
+
+    async fn sample(&mut self) -> Result<Option<BatteryReading>, Self::Error> {
+        Ok(None)
+    }
+}
+
 /// Fixed supply reading used by powered devkits that advertise Power
 /// Configuration but have no battery ADC.
 #[derive(Debug, Clone, Copy)]

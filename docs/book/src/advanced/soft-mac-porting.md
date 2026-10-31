@@ -210,6 +210,82 @@ tests the constant `R::PARENT`. A Sleepy End Device image therefore contains
 no parent parser, queues or frame-pending code. CI greps for router and parent
 symbols in sensor images.
 
+### Frame Pending: choose one owner
+
+A polling child learns from the Frame Pending (FP) bit of the Imm-Ack to its
+Data Request whether to keep its receiver on. Exactly one component may decide
+that bit:
+
+| ACK path | `hardware_auto_ack` | FP source | `PENDING` |
+|---|---|---|---|
+| Hardware or ISR auto-ACK (TLSR8258) | `true` | HAL source-match table, armed through `RadioPhy::set_ack_frame_pending` | `0` |
+| Task-context software ACK (EFR32 Series 2 `SoftwareAck`) | `false` | core `PENDING` table; the core passes FP to `send_ack` | ≥ the child count |
+
+Never let both decide. In the task-context design, the HAL must not
+acknowledge on its own, so its ACK filter stays empty. Otherwise the HAL's
+ACK, with FP clear, races the core's ACK.
+
+For a task-context ACK, also give the PHY a deadline. EFR32 Series 2 drops a
+frame that is already older than 400 µs when `receive` returns it, because the
+sender has stopped waiting by then. It counts these drops in `stale_ack_drops`.
+
+### Role template (one example crate per board)
+
+EFR32 Series 2 (`examples/ha-connect-zbt1`, `examples/efr32mg2{1,2}-sensor`)
+is the reference layout for giving a board all three node roles:
+
+```text
+examples/<board>/        one crate, one bin per role
+  Cargo.toml             features ed | sed | router (mutually exclusive,
+                         compile_error! otherwise); default = the board's
+                         original role; [[bin]] required-features per role
+  src/platform.rs        shared startup: clocks, radio, PHY, LEDs, button, log
+  src/main.rs | ed.rs    AlwaysOnEndDeviceApp (router-app), end-device MAC
+  src/sed.rs | main.rs   sensor-sed-app lifecycle, EM2 between polls
+  src/router.rs          ParentRouterApp (router-app/router), parent MAC
+products/<board>/        identity, policy, flash layout, journals per role
+  src/lib.rs             manufacturer/model, role-specific modules behind
+                         features
+  src/journal.rs         security-counter journal with a role tag
+  src/router.rs          durable child and APS tables (router only)
+  link/memory.x          app | router tables | security journal partitions
+```
+
+Rules that make the template safe to copy:
+
+- **MAC type per role.** The end-device bins use the end-device MAC type,
+  for example `SoftMacCore<Phy, EndDevice>`. The router bin uses the
+  parent-role alias, for example `Efr32s2RouterMac = SoftMacCore<Phy,
+  Parent<8, 8, 8>>`. Only the router enables `zigbee-runtime/router` and
+  `router-app/router`.
+  `tools/check-role-symbols.sh leaf|parent` checks every linked image in CI.
+- **Role tag in the security journal.** Each new role image writes its own
+  tag: ROUTER `0x5201`, END_DEVICE `0x5202`, SED `0x5203`. The board's
+  original image (the EFR32MG2x sensor SED, the ZBT-1 always-on ED) writes
+  none, so its journal records are unchanged. When the role changes
+  across a reflash, the image keeps the frame-counter limits, clears the
+  commissioned network state and joins again, so it never reuses a counter.
+  A tagged image treats an untagged (legacy) record as a foreign role. A
+  legacy image selects no tag: it resumes whatever state it finds and
+  rewrites the previous tag. Leave the network before switching back to a
+  legacy image.
+- **Flash layout.** The product linker script owns the partitions. The child
+  and APS tables go between the application and the security journal. They
+  are sector-size generic, from `FlashPartition` and the
+  `zigbee_runtime::{child_journal, aps_journal}` journals. The partitions are
+  reserved in every role's linker script, so changing role never moves the
+  security journal.
+- **RAM.** A router holds `ZigbeeDevice<_, Router>` (about 19.8 KB on Cortex-M
+  with the default tables) plus the main-task future. Put a linker `ASSERT`
+  on the stack floor. If the router does not fit, CI asserts that the link
+  fails; do not quietly shrink the tables. EFR32MG22 (32 KiB) is the example
+  of an image that does not fit.
+- **Identity-only profiles.** A board without sensors (e.g. a USB stick) uses
+  the identity-only profiles of `sensor-sed-app`/`router-app`: Basic and
+  Identify. Add measured clusters only when the board has the hardware.
+- **Baselines.** Add one `tools/mac-footprint.py` IMAGES row per role bin.
+  Each new image gets its own baseline row. Existing images must not grow.
+
 ## Measuring the footprint
 
 `tools/mac-footprint.py` builds every CI production image with CI's

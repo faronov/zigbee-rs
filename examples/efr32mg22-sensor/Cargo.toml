@@ -5,9 +5,27 @@ edition = "2024"
 publish = false
 autobins = false
 
+# One crate per board, one bin per Zigbee role. Exactly one role feature
+# may be enabled per build (`src/roles.rs` enforces it for the new bins), so
+# dependency feature unification never links router code into an
+# end-device image:
+#   cargo build --release                                       # sed (default)
+#   cargo build --release --no-default-features --features ed
+#   cargo build --release --no-default-features --features router
 [[bin]]
 name = "efr32mg22-sensor"
 path = "src/main.rs"
+required-features = ["sed"]
+
+[[bin]]
+name = "efr32mg22-ed"
+path = "src/ed.rs"
+required-features = ["ed"]
+
+[[bin]]
+name = "efr32mg22-router"
+path = "src/router.rs"
+required-features = ["router"]
 
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
@@ -15,8 +33,10 @@ cortex-m-rt = { version = "0.7", features = ["device"] }
 efr32mg22-devkit = { path = "../../boards/efr32mg22-devkit" }
 efr32mg22-sensor-product = { path = "../../products/efr32mg22-sensor" }
 efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg22", "rt", "time-driver"] }
-sensor-sed-app = { path = "../../apps/sensor-sed" }
+router-app = { path = "../../apps/router", default-features = false }
+sensor-sed-app = { path = "../../apps/sensor-sed", optional = true }
 zigbee-mac = { path = "../../zigbee-mac", features = ["efr32mg22"] }
+zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["constrained-memory"] }
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
@@ -33,6 +53,15 @@ log = "0.4"
 static_cell = "2"
 
 [features]
+default = ["sed"]
+# Sleepy environmental sensor (the original image).
+sed = ["dep:sensor-sed-app", "efr32mg22-sensor-product/sed"]
+# Always-on End Device: router-app AlwaysOnEndDeviceApp, end-device MAC.
+ed = []
+# Router: parent MAC (software Imm-Ack with Frame Pending), ParentRouterApp,
+# durable child and APS tables. Does NOT fit the 32 KiB SRAM of this part:
+# the product linker script rejects the link (see src/router.rs).
+router = ["router-app/router", "zigbee-runtime/router"]
 # Keep the debug interface powered in EM2 (SWD attach while asleep).
 # Off by default so EM2 current is representative.
 em2-debug = []

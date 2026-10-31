@@ -35,7 +35,7 @@ pub mod policy;
 
 pub use app::{FindingBindingTargetError, SensorApp, SensorAppError, SensorLifecycleError};
 pub use battery::{
-    BatteryReading, BatterySource, BlockingBattery, BlockingBatterySource, FixedBattery,
+    BatteryReading, BatterySource, BlockingBattery, BlockingBatterySource, FixedBattery, NoBattery,
 };
 pub use capabilities::{
     NoStatus, SensorStatus, StatusSink, Supervisor, WaitRequest, WakeController, WakeReason,
@@ -45,7 +45,7 @@ pub use environment::{
     BlockingEnvironment, BlockingEnvironmentSource, EnvironmentReading, EnvironmentSink,
     EnvironmentSource, EnvironmentalSensorProfile,
 };
-pub use measurement::{SampleTrigger, SensorMeasurement, SensorProfile};
+pub use measurement::{NoMeasurement, SampleTrigger, SensorMeasurement, SensorProfile};
 pub use ota::{
     NoOta, NonOtaComponent, NonOtaProfile, OtaActivationOutcome, OtaEventOutcome, OtaLifecycle,
     OtaServiceOutcome, is_ota_event,
