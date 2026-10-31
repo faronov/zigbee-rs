@@ -84,12 +84,15 @@ pub trait TxOffload: tx_sealed::Sealed {
     /// Transmit `frame` with the PIB CSMA-CA parameters and, when
     /// `ack_requested`, ACK wait and `macMaxFrameRetries` retransmissions.
     /// An unacknowledged transmission returns `AckResult::default()`.
+    ///
+    /// Implementations return an `async move` block rather than being an
+    /// `async fn`: an `async fn` keeps every argument twice in its future.
     #[doc(hidden)]
-    async fn transmit<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize>(
-        core: &mut SoftMacCore<P, R, RX>,
-        frame: &[u8],
+    fn transmit<'a, P: RadioPhy + PlatformServices, R: MacRole, const RX: usize>(
+        core: &'a mut SoftMacCore<P, R, RX>,
+        frame: &'a [u8],
         ack_requested: bool,
-    ) -> Result<AckResult, MacError>;
+    ) -> impl Future<Output = Result<AckResult, MacError>> + 'a;
 }
 
 /// Software CSMA-CA, software ACK wait and software retries. The PHY
@@ -145,43 +148,49 @@ impl TxOffload for SoftwareTx {
 impl TxOffload for AckWaitTx {
     const ACK_WAIT: bool = true;
 
-    async fn transmit<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize>(
-        core: &mut SoftMacCore<P, R, RX>,
-        frame: &[u8],
+    #[allow(clippy::manual_async_fn)] // avoids a second copy of the arguments
+    fn transmit<'a, P: RadioPhy + PlatformServices, R: MacRole, const RX: usize>(
+        core: &'a mut SoftMacCore<P, R, RX>,
+        frame: &'a [u8],
         ack_requested: bool,
-    ) -> Result<AckResult, MacError> {
-        if ack_requested && frame.len() < 3 {
-            return Err(MacError::InvalidParameter);
-        }
-        let mut retries = core.pib.max_frame_retries();
-        loop {
-            if let Some(ack) = core.csma(frame, ack_requested).await? {
-                return Ok(ack);
+    ) -> impl Future<Output = Result<AckResult, MacError>> + 'a {
+        async move {
+            if ack_requested && frame.len() < 3 {
+                return Err(MacError::InvalidParameter);
             }
-            if retries == 0 {
-                return Err(MacError::NoAck);
+            let mut retries = core.pib.max_frame_retries();
+            loop {
+                if let Some(ack) = core.csma(frame, ack_requested).await? {
+                    return Ok(ack);
+                }
+                if retries == 0 {
+                    return Err(MacError::NoAck);
+                }
+                retries -= 1;
             }
-            retries -= 1;
         }
     }
 }
 
 impl TxOffload for FullTx {
-    async fn transmit<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize>(
-        core: &mut SoftMacCore<P, R, RX>,
-        frame: &[u8],
+    #[allow(clippy::manual_async_fn)] // avoids a second copy of the arguments
+    fn transmit<'a, P: RadioPhy + PlatformServices, R: MacRole, const RX: usize>(
+        core: &'a mut SoftMacCore<P, R, RX>,
+        frame: &'a [u8],
         ack_requested: bool,
-    ) -> Result<AckResult, MacError> {
-        let params = core.tx_params();
-        match core
-            .phy
-            .transmit_offloaded(frame, ack_requested, params)
-            .await
-        {
-            Ok(Some(ack)) => Ok(ack),
-            Ok(None) if ack_requested => Err(MacError::NoAck),
-            Ok(None) => Ok(AckResult::default()),
-            Err(error) => Err(phy_error(error)),
+    ) -> impl Future<Output = Result<AckResult, MacError>> + 'a {
+        async move {
+            let params = core.tx_params();
+            match core
+                .phy
+                .transmit_offloaded(frame, ack_requested, params)
+                .await
+            {
+                Ok(Some(ack)) => Ok(ack),
+                Ok(None) if ack_requested => Err(MacError::NoAck),
+                Ok(None) => Ok(AckResult::default()),
+                Err(error) => Err(phy_error(error)),
+            }
         }
     }
 }
@@ -1070,34 +1079,41 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
     /// Unslotted CSMA-CA around one PHY transmit attempt. With `ack_wait`
     /// (only for an [`AckWaitTx`] PHY) the attempt includes the PHY's
     /// hardware ACK wait; otherwise a sent frame reports a default ACK.
-    async fn csma(&mut self, frame: &[u8], ack_wait: bool) -> Result<Option<AckResult>, MacError> {
-        let mut backoff_count = 0u8;
-        let mut backoff_exponent = self.pib.min_be();
+    #[allow(clippy::manual_async_fn)] // avoids a second copy of the arguments
+    fn csma<'s>(
+        &'s mut self,
+        frame: &'s [u8],
+        ack_wait: bool,
+    ) -> impl Future<Output = Result<Option<AckResult>, MacError>> + 's {
+        async move {
+            let mut backoff_count = 0u8;
+            let mut backoff_exponent = self.pib.min_be();
 
-        loop {
-            let slots = self.random_backoff_slots(backoff_exponent);
-            if slots != 0 {
-                self.phy
-                    .delay_micros(u32::from(slots) * UNIT_BACKOFF_PERIOD_US)
-                    .await;
-            }
-
-            let result = if <P::Tx as TxOffload>::ACK_WAIT && ack_wait {
-                self.phy.try_transmit_acknowledged(frame).await
-            } else {
-                self.phy
-                    .try_transmit(frame)
-                    .await
-                    .map(|()| Some(AckResult::default()))
-            };
-            match result {
-                Ok(ack) => return Ok(ack),
-                Err(PhyError::ChannelBusy) if backoff_count < self.pib.max_csma_backoffs() => {
-                    backoff_count = backoff_count.saturating_add(1);
-                    backoff_exponent =
-                        core::cmp::min(backoff_exponent.saturating_add(1), self.pib.max_be());
+            loop {
+                let slots = self.random_backoff_slots(backoff_exponent);
+                if slots != 0 {
+                    self.phy
+                        .delay_micros(u32::from(slots) * UNIT_BACKOFF_PERIOD_US)
+                        .await;
                 }
-                Err(error) => return Err(phy_error(error)),
+
+                let result = if <P::Tx as TxOffload>::ACK_WAIT && ack_wait {
+                    self.phy.try_transmit_acknowledged(frame).await
+                } else {
+                    self.phy
+                        .try_transmit(frame)
+                        .await
+                        .map(|()| Some(AckResult::default()))
+                };
+                match result {
+                    Ok(ack) => return Ok(ack),
+                    Err(PhyError::ChannelBusy) if backoff_count < self.pib.max_csma_backoffs() => {
+                        backoff_count = backoff_count.saturating_add(1);
+                        backoff_exponent =
+                            core::cmp::min(backoff_exponent.saturating_add(1), self.pib.max_be());
+                    }
+                    Err(error) => return Err(phy_error(error)),
+                }
             }
         }
     }
