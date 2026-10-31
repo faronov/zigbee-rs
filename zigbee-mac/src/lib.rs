@@ -77,12 +77,13 @@ pub mod mock;
 
 // Re-exports for convenience
 pub use phy::{
-    MAX_PHY_FRAME_LEN, PhyAddressFilter, PhyCapabilities, PhyError, PhyRxFrame, RadioPhy,
+    AckResult, MAX_PHY_FRAME_LEN, PhyAddressFilter, PhyCapabilities, PhyError, PhyRxFrame,
+    RadioPhy, TxOffload, TxParams,
 };
 pub use pib::{MacPib, PibAttribute, PibError, PibValue};
 pub use platform::{ForwardAesProvider, PlatformServices, WrappingTickExtender};
 pub use primitives::*;
-pub use soft_mac::{AckResult, SoftMacCore};
+pub use soft_mac::{EndDevice, MacRole, Parent, SoftMacCore};
 
 use zigbee_types::{MacAddress, TxPower};
 

@@ -487,6 +487,137 @@ pub fn parse_coordinator_realignment_orphan_response(
     ))
 }
 
+fn is_unicast_mac_address(address: &MacAddress) -> bool {
+    match address {
+        MacAddress::Short(_, address) => address.0 < 0xFFF8,
+        MacAddress::Extended(_, address) => *address != [0xFF; 8],
+    }
+}
+
+/// Strictly parse an unsecured parent-side MAC command (Beacon Request,
+/// Association Request, Data Request, Orphan Notification).
+///
+/// Accepts only the IEEE 802.15.4-2003/2006 framings Zigbee uses and rejects
+/// reserved addressing modes, secured commands and malformed lengths. The
+/// caller still applies its own destination filter. Shared by every
+/// parent-capable backend so all of them accept exactly one framing.
+pub fn parse_parent_command(data: &[u8], lqi: u8) -> Option<MacCommandEvent> {
+    if data.len() < 3 {
+        return None;
+    }
+    let frame_control = u16::from_le_bytes([data[0], data[1]]);
+    if frame_control & 0x07 != 0x03 || frame_control & (1 << 3) != 0 {
+        return None;
+    }
+    let frame_version = (frame_control >> 12) & 0x03;
+    let dst_mode = (frame_control >> 10) & 0x03;
+    let src_mode = (frame_control >> 14) & 0x03;
+    let pan_compress = frame_control & (1 << 6) != 0;
+    let ack_request = frame_control & (1 << 5) != 0;
+    if frame_version > 1
+        || frame_control & ((1 << 7) | (1 << 8) | (1 << 9)) != 0
+        || dst_mode == 1
+        || src_mode == 1
+    {
+        return None;
+    }
+
+    let payload_offset = 3usize.checked_add(addressing_size(frame_control))?;
+    if payload_offset >= data.len() {
+        return None;
+    }
+    let (source, destination, parsed_offset, _) = parse_mac_addresses(data);
+    if parsed_offset != payload_offset {
+        return None;
+    }
+
+    match data[payload_offset] {
+        // Beacon Request: broadcast short destination, no source, no ACK.
+        0x07 if data.len() == payload_offset + 1
+            && dst_mode == 2
+            && src_mode == 0
+            && !pan_compress
+            && !ack_request
+            && destination == MacAddress::Short(PanId::BROADCAST, ShortAddress::BROADCAST) =>
+        {
+            Some(MacCommandEvent::BeaconRequest(
+                MlmeBeaconRequestIndication {
+                    destination_address: destination,
+                    lqi,
+                    security_use: false,
+                },
+            ))
+        }
+        // Association Request: unassociated extended source and one
+        // Capability Information byte.
+        0x01 if data.len() == payload_offset + 2
+            && matches!(dst_mode, 2 | 3)
+            && src_mode == 3
+            && !pan_compress
+            && ack_request =>
+        {
+            let MacAddress::Extended(source_pan, device_address) = source else {
+                return None;
+            };
+            if source_pan != PanId::BROADCAST
+                || device_address == [0xFF; 8]
+                || destination.pan_id() == PanId::BROADCAST
+                || !is_unicast_mac_address(&destination)
+            {
+                return None;
+            }
+            Some(MacCommandEvent::AssociationRequest(
+                MlmeAssociateIndication {
+                    device_address,
+                    coordinator_address: destination,
+                    capability_info: CapabilityInfo::from_byte(data[payload_offset + 1]),
+                    lqi,
+                    security_use: false,
+                },
+            ))
+        }
+        // Data Request: an associated short source or an extended source
+        // waiting for its Association Response.
+        0x04 if data.len() == payload_offset + 1
+            && matches!(dst_mode, 2 | 3)
+            && matches!(src_mode, 2 | 3)
+            && ack_request =>
+        {
+            if !is_unicast_mac_address(&source)
+                || !is_unicast_mac_address(&destination)
+                || source.pan_id() != destination.pan_id()
+                || destination.pan_id() == PanId::BROADCAST
+            {
+                return None;
+            }
+            Some(MacCommandEvent::DataRequest(MlmeDataRequestIndication {
+                source_address: source,
+                destination_address: destination,
+                lqi,
+                security_use: false,
+            }))
+        }
+        // Orphan Notification: broadcast destination in the broadcast PAN,
+        // extended source, PAN ID compression, no ACK.
+        MAC_CMD_ORPHAN_NOTIFICATION
+            if data.len() == payload_offset + 1
+                && dst_mode == 2
+                && src_mode == 3
+                && pan_compress
+                && !ack_request =>
+        {
+            let orphan_address = parse_orphan_notification(data)?;
+            Some(MacCommandEvent::OrphanNotification(MlmeOrphanIndication {
+                orphan_address,
+                destination_address: destination,
+                lqi,
+                security_use: false,
+            }))
+        }
+        _ => None,
+    }
+}
+
 /// Build a data frame without an FCS. The radio backend appends the FCS.
 #[allow(clippy::too_many_arguments)]
 pub fn build_data_frame(
@@ -1721,5 +1852,101 @@ mod tests {
         assert!(is_parent_poll_response(
             &by_ieee, pan, short, &ext, parent, &[0; 8]
         ));
+    }
+
+    const PARENT_PAN: PanId = PanId(0x1234);
+    const CHILD_EUI: IeeeAddress = [0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8];
+
+    #[test]
+    fn parent_command_parser_accepts_zigbee_command_framings() {
+        assert!(matches!(
+            parse_parent_command(&build_beacon_request(1), 10),
+            Some(MacCommandEvent::BeaconRequest(
+                MlmeBeaconRequestIndication { lqi: 10, .. }
+            ))
+        ));
+
+        let request = build_association_request(
+            2,
+            &MacAddress::Short(PARENT_PAN, ShortAddress(0x0001)),
+            &CHILD_EUI,
+            &CapabilityInfo {
+                allocate_address: true,
+                ..CapabilityInfo::default()
+            },
+        );
+        let Some(MacCommandEvent::AssociationRequest(indication)) =
+            parse_parent_command(&request, 20)
+        else {
+            panic!("association request rejected");
+        };
+        assert_eq!(indication.device_address, CHILD_EUI);
+        assert!(indication.capability_info.allocate_address);
+
+        let router = MacAddress::Short(PARENT_PAN, ShortAddress(0x0001));
+        let short_poll = build_data_request_short(3, &router, ShortAddress(0x4321));
+        assert!(matches!(
+            parse_parent_command(&short_poll, 30),
+            Some(MacCommandEvent::DataRequest(MlmeDataRequestIndication {
+                source_address: MacAddress::Short(PARENT_PAN, ShortAddress(0x4321)),
+                ..
+            }))
+        ));
+        let extended_poll = build_data_request(4, &router, &CHILD_EUI);
+        assert!(matches!(
+            parse_parent_command(&extended_poll, 40),
+            Some(MacCommandEvent::DataRequest(MlmeDataRequestIndication {
+                source_address: MacAddress::Extended(PARENT_PAN, CHILD_EUI),
+                ..
+            }))
+        ));
+
+        let Some(MacCommandEvent::OrphanNotification(orphan)) =
+            parse_parent_command(&build_orphan_notification(5, &CHILD_EUI), 50)
+        else {
+            panic!("orphan notification rejected");
+        };
+        assert_eq!(orphan.orphan_address, CHILD_EUI);
+    }
+
+    #[test]
+    fn parent_command_parser_rejects_malformed_or_secured_commands() {
+        let router = MacAddress::Short(PARENT_PAN, ShortAddress(0x0001));
+        let poll = build_data_request_short(3, &router, ShortAddress(0x4321));
+
+        // Secured command.
+        let mut secured = poll.clone();
+        secured[0] |= 1 << 3;
+        assert_eq!(parse_parent_command(&secured, 0), None);
+        // Data Request without an ACK request.
+        let mut no_ack = poll.clone();
+        no_ack[0] &= !(1 << 5);
+        assert_eq!(parse_parent_command(&no_ack, 0), None);
+        // Trailing byte after the command identifier.
+        let mut long = poll.clone();
+        long.push(0).unwrap();
+        assert_eq!(parse_parent_command(&long, 0), None);
+        // Truncated header.
+        assert_eq!(parse_parent_command(&poll[..5], 0), None);
+        // Broadcast source.
+        let broadcast = build_data_request_short(3, &router, ShortAddress(0xFFFF));
+        assert_eq!(parse_parent_command(&broadcast, 0), None);
+        // Data frames are not commands.
+        let data = build_data_frame(
+            6,
+            AddressMode::Short,
+            ShortAddress(0x4321),
+            &[0; 8],
+            &router,
+            &[0x04],
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(parse_parent_command(&data, 0), None);
+        // A Beacon Request that asks for an ACK is malformed.
+        let mut beacon_request = build_beacon_request(1);
+        beacon_request[0] |= 1 << 5;
+        assert_eq!(parse_parent_command(&beacon_request, 0), None);
     }
 }

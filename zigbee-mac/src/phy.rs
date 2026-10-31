@@ -1,6 +1,6 @@
 //! Minimal hardware boundary for an IEEE 802.15.4 radio.
 
-use zigbee_types::{IeeeAddress, PanId, ShortAddress};
+use zigbee_types::{IeeeAddress, MacAddress, PanId, ShortAddress};
 
 /// Maximum MAC frame length excluding the two-byte FCS.
 pub const MAX_PHY_FRAME_LEN: usize = 125;
@@ -41,6 +41,46 @@ pub struct PhyCapabilities {
     pub tx_power_min: i8,
     /// Maximum supported transmit power in dBm.
     pub tx_power_max: i8,
+}
+
+/// Matching Imm-Ack observed for an acknowledged transmission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AckResult {
+    /// Frame Pending bit of the received ACK.
+    pub frame_pending: bool,
+}
+
+/// How much of the transmit path a [`RadioPhy`] performs in hardware or in
+/// its radio core / ISR instead of in [`crate::SoftMacCore`].
+///
+/// Selected per PHY type through [`RadioPhy::TX_OFFLOAD`]. The software MAC
+/// matches on the associated constant, so after monomorphisation only the
+/// selected path remains in the image: a PHY that keeps the default pays no
+/// flash for the offload branches and no RAM for their futures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxOffload {
+    /// Software CSMA-CA, software ACK wait and software retries. The PHY
+    /// implements only [`RadioPhy::try_transmit`] (one CCA + TX).
+    None,
+    /// The PHY performs one CCA + TX and waits for the matching Imm-Ack in
+    /// its ISR or radio core ([`RadioPhy::try_transmit_acknowledged`]). The
+    /// software MAC keeps the CSMA-CA backoff and `macMaxFrameRetries`
+    /// policy.
+    AckWait,
+    /// The PHY performs the complete unslotted CSMA-CA, ACK wait and
+    /// retransmission sequence ([`RadioPhy::transmit_offloaded`]) using the
+    /// [`TxParams`] supplied from the MAC PIB.
+    Full,
+}
+
+/// MAC PIB transmit parameters handed to a [`TxOffload::Full`] PHY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxParams {
+    pub max_csma_backoffs: u8,
+    pub min_be: u8,
+    pub max_be: u8,
+    /// Retransmissions after the first attempt when an ACK is requested.
+    pub max_frame_retries: u8,
 }
 
 /// FCS-validated MAC bytes received from the PHY.
@@ -92,7 +132,31 @@ impl PhyRxFrame {
 /// protocol, association, polling, and frame retries. Those belong in the
 /// shared software MAC. Platform clock, delay, and entropy remain a separate
 /// [`crate::PlatformServices`] bound on that software MAC.
+///
+/// # Optional hardware offload and policy hooks
+///
+/// Every item after the required methods has a default that preserves the
+/// pure-software behaviour. They are associated constants or provided
+/// methods, never runtime flags or `dyn` dispatch, so a PHY that does not
+/// override them compiles to exactly the software path. See
+/// `docs/book/src/advanced/soft-mac-porting.md` for the porting contract.
 pub trait RadioPhy {
+    /// Transmit-path offload level; see [`TxOffload`].
+    const TX_OFFLOAD: TxOffload = TxOffload::None;
+
+    /// How long a poll waits for the parent's indirect frame after an ACK
+    /// with Frame Pending set, in microseconds.
+    const POLL_RESPONSE_WAIT_US: u32 = 30_000;
+
+    /// After a short-source Data Request returns no frame, repeat the poll
+    /// once with the extended source address.
+    ///
+    /// Some parents (EmberZNet) queue a Rejoin Response or Transport-Key by
+    /// the child's EUI-64, which only an extended-source Data Request
+    /// retrieves. The second poll costs airtime on every poll, so it is
+    /// opt-in per backend.
+    const POLL_EXTENDED_FALLBACK: bool = false;
+
     /// Return the optional hardware features implemented by this PHY.
     fn capabilities(&self) -> PhyCapabilities;
 
@@ -137,6 +201,71 @@ pub trait RadioPhy {
     /// Software-only implementations may ignore `filter` when both related
     /// capability flags are false.
     fn set_address_filter(&mut self, filter: Option<PhyAddressFilter>) -> Result<(), PhyError>;
+
+    /// [`TxOffload::AckWait`]: one CCA + TX, then wait for the matching
+    /// Imm-Ack in the ISR / radio core.
+    ///
+    /// Returns `Ok(Some(ack))` for the matching ACK, `Ok(None)` when the ACK
+    /// window closed without one, and [`PhyError::ChannelBusy`] for a busy
+    /// CCA. Non-ACK frames received inside the window must stay available to
+    /// later [`Self::receive`] calls (and be acknowledged by the PHY when
+    /// `hardware_auto_ack` is set).
+    async fn try_transmit_acknowledged(
+        &mut self,
+        _frame: &[u8],
+    ) -> Result<Option<AckResult>, PhyError> {
+        Err(PhyError::Unsupported)
+    }
+
+    /// [`TxOffload::Full`]: complete unslotted CSMA-CA and, when
+    /// `ack_requested`, ACK wait with up to `params.max_frame_retries`
+    /// retransmissions.
+    ///
+    /// Returns `Ok(Some(ack))` for an acknowledged frame, `Ok(None)` for a
+    /// sent frame without an ACK request **or** when every retransmission
+    /// went unacknowledged (the software MAC distinguishes the two by
+    /// `ack_requested`), and [`PhyError::ChannelBusy`] for a channel-access
+    /// failure after `params.max_csma_backoffs`.
+    async fn transmit_offloaded(
+        &mut self,
+        _frame: &[u8],
+        _ack_requested: bool,
+        _params: TxParams,
+    ) -> Result<Option<AckResult>, PhyError> {
+        Err(PhyError::Unsupported)
+    }
+
+    /// Arm or clear the Frame Pending bit that a **hardware / ISR**
+    /// auto-ACK sends in reply to a Data Request from `source`.
+    ///
+    /// Called by a parent-role [`crate::SoftMacCore`] only when
+    /// `capabilities().hardware_auto_ack` is set; software-ACK PHYs receive
+    /// the bit as the `frame_pending` argument of [`Self::send_ack`] instead.
+    /// A PHY whose table is full returns [`PhyError::Hardware`].
+    fn set_ack_frame_pending(
+        &mut self,
+        _source: &MacAddress,
+        _pending: bool,
+    ) -> Result<(), PhyError> {
+        Err(PhyError::Unsupported)
+    }
+
+    /// Forget every armed Frame Pending source (MLME-RESET).
+    fn clear_ack_frame_pending(&mut self) {}
+
+    /// Put the transceiver into its lowest-power idle state between
+    /// sleepy-device poll windows. The next PHY operation, or
+    /// [`Self::wake`], must make it usable again.
+    fn sleep(&mut self) -> Result<(), PhyError> {
+        Ok(())
+    }
+
+    /// Restore clocks, calibration and radio state after [`Self::sleep`] or a
+    /// retained low-power mode. The software MAC re-applies channel, TX
+    /// power and address filter afterwards.
+    fn wake(&mut self) -> Result<(), PhyError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

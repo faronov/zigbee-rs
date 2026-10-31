@@ -264,6 +264,14 @@ impl MacPib {
         self.bsn
     }
 
+    pub fn transaction_persistence_time(&self) -> u16 {
+        self.transaction_persistence_time
+    }
+
+    pub fn rx_on_when_idle(&self) -> bool {
+        self.rx_on_when_idle
+    }
+
     pub fn get(&self, attr: PibAttribute) -> PibValue {
         use PibAttribute::*;
         match attr {
