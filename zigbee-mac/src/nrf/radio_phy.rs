@@ -156,7 +156,7 @@ impl<T: RadioInstance, R: RngInstance> RadioPhy for NrfRadioPhy<'_, T, R> {
             .map_err(Self::map_radio_error)
     }
 
-    async fn receive(&mut self, timeout_us: u32) -> Result<Option<PhyRxFrame>, PhyError> {
+    async fn receive(&mut self, timeout_us: u32, frame: &mut PhyRxFrame) -> Result<bool, PhyError> {
         let mut packet = Packet::new();
         match select(
             Timer::after_micros(u64::from(timeout_us)),
@@ -164,12 +164,12 @@ impl<T: RadioInstance, R: RngInstance> RadioPhy for NrfRadioPhy<'_, T, R> {
         )
         .await
         {
-            Either::First(()) => Ok(None),
+            Either::First(()) => Ok(false),
             Either::Second(Ok(())) => {
                 // `Packet::lqi()` is the raw Nordic ED byte; the stack works
                 // in IEEE 802.15.4 LQI. Normalize exactly once, here.
-                PhyRxFrame::from_slice(packet.as_ref(), crate::lqi::nrf_from_hardware(packet.lqi()))
-                    .map(Some)
+                frame.set(packet.as_ref(), crate::lqi::nrf_from_hardware(packet.lqi()))?;
+                Ok(true)
             }
             Either::Second(Err(error)) => Err(Self::map_radio_error(error)),
         }

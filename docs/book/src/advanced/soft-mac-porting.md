@@ -47,7 +47,7 @@ The last group is Phase B of the MAC unification.
 | `capabilities()` | Reports `hardware_auto_ack`, `hardware_address_filter` and the TX power range. |
 | `try_transmit(frame)` | One CCA, then transmit. The PHY appends the FCS. A busy CCA returns `PhyError::ChannelBusy`. Never retry inside the PHY. |
 | `send_ack(seq, fp)` | Immediate ACK, used only as a fallback when `hardware_auto_ack == false`. |
-| `receive(timeout_us)` | One FCS-valid frame without its FCS, or `Ok(None)` on timeout. Dropping the future must leave the radio usable. |
+| `receive(timeout_us, frame)` | Write one FCS-valid frame, without its FCS, into `frame` and return `Ok(true)`, or return `Ok(false)` on timeout. Dropping the future must leave the radio usable. |
 | `set_channel`, `set_tx_power`, `energy_detect` | Synchronous configuration. ED uses the 0–255 IEEE scale. |
 | `set_address_filter(Option<…>)` | `None` means promiscuous mode, used during a scan. |
 
@@ -58,6 +58,17 @@ The last group is Phase B of the MAC unification.
   never yields;
 - `fill_random()`;
 - through `zigbee_crypto::ForwardAesProvider`, the AES backend.
+
+`receive` gets the retained-RX queue's free slot as `frame: &mut PhyRxFrame`.
+Fill it in place: `frame.set(bytes, lqi)` copies a frame (and leaves `frame`
+unchanged when it is too long); a driver that reads its RX FIFO directly can
+write `frame.buffer_mut()` and then call `frame.set_len(len, lqi)`. Don't
+build a `PhyRxFrame` on the stack and return it: before this API, every
+received frame was moved through the PHY future, `listen` and `accept`, and
+these 127-byte copies made `listen` the largest MAC stack frame on every
+target (736 B on nRF, 976 B on BL702, 1,480 B on CC2340). `PhyRxFrame` is
+`Copy`, so a PHY that parks frames can still hand them over with
+`*frame = parked`.
 
 Construct the MAC with one of these:
 
@@ -138,18 +149,23 @@ classified synchronously by `accept` the moment it is received:
   commands on a parent (command queue), and Association Responses addressed
   to us. Malformed frames, frames for other destinations, beacons outside a
   scan and MAC commands on an end device are dropped.
-- A poll response from our parent is put at the front of pending RX. A full
-  pending RX evicts its oldest frame.
+- A poll response from our parent is put at the front of pending RX.
+- Frames are received straight into pending RX's free slot, so a full
+  pending RX evicts its oldest frame when the next frame is *received*,
+  whether or not that frame is then retained. Taking a retained Association
+  Response leaves the other frames in order.
 - One window handles at most 256 frames, so a PHY whose clock stalls cannot
   keep the MAC spinning.
 
-No future ever holds a received frame across an await; only the software
+No future or stack frame holds a received frame by value; only the software
 ACK (sequence and Frame Pending bit) survives the `send_ack` await. Keep it
 that way when changing the core: a `PhyRxFrame` (127 B) moved into a nested
 future is duplicated in every enclosing future, i.e. on every NWK/APS/ZDO
 caller's stack. For the same reason, MAC procedures that take a request or
-frame by value are written as `fn … -> impl Future { async move { … } }`
-rather than `async fn` (an `async fn` stores a by-value argument twice).
+frame by value, the `TxOffload` hooks and `csma` are written as
+`fn … -> impl Future { async move { … } }` rather than `async fn` (an
+`async fn` stores its arguments twice). `SoftwareTx` is the exception: its
+`async fn` form inlines better into the nRF main task.
 
 ## Router / parent role
 

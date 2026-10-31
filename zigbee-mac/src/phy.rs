@@ -63,7 +63,7 @@ pub struct TxParams {
 /// FCS-validated MAC bytes received from the PHY.
 ///
 /// `data[..len]` contains the MAC header and payload without the two-byte FCS.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhyRxFrame {
     data: [u8; MAX_PHY_FRAME_LEN],
     len: u8,
@@ -95,6 +95,38 @@ impl PhyRxFrame {
         };
         frame.data[..data.len()].copy_from_slice(data);
         Ok(frame)
+    }
+
+    /// Overwrite this frame in place with `data` and `lqi`.
+    ///
+    /// Used by [`RadioPhy::receive`] implementations to fill the caller's
+    /// buffer without building a temporary frame. On error the frame is left
+    /// unchanged.
+    pub fn set(&mut self, data: &[u8], lqi: u8) -> Result<(), PhyError> {
+        if data.len() > MAX_PHY_FRAME_LEN {
+            return Err(PhyError::FrameTooLong);
+        }
+        self.data[..data.len()].copy_from_slice(data);
+        self.len = data.len() as u8;
+        self.lqi = lqi;
+        Ok(())
+    }
+
+    /// Writable storage for a PHY that copies its received bytes in pieces
+    /// (for example word by word from a FIFO). Commit them with
+    /// [`Self::set_len`].
+    pub fn buffer_mut(&mut self) -> &mut [u8; MAX_PHY_FRAME_LEN] {
+        &mut self.data
+    }
+
+    /// Commit `len` bytes previously written through [`Self::buffer_mut`].
+    pub fn set_len(&mut self, len: usize, lqi: u8) -> Result<(), PhyError> {
+        if len > MAX_PHY_FRAME_LEN {
+            return Err(PhyError::FrameTooLong);
+        }
+        self.len = len as u8;
+        self.lqi = lqi;
+        Ok(())
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -166,12 +198,17 @@ pub trait RadioPhy {
     /// call this method when `hardware_auto_ack` is true.
     async fn send_ack(&mut self, sequence: u8, frame_pending: bool) -> Result<(), PhyError>;
 
-    /// Receive one valid MAC frame within `timeout_us`.
+    /// Receive one valid MAC frame within `timeout_us` into `frame`.
     ///
-    /// Returns `Ok(None)` on timeout. Returned bytes exclude the FCS; the PHY
-    /// must validate it before returning. Dropping this future before
-    /// completion must leave the radio usable by subsequent PHY operations.
-    async fn receive(&mut self, timeout_us: u32) -> Result<Option<PhyRxFrame>, PhyError>;
+    /// Returns `Ok(true)` when `frame` holds a received frame and `Ok(false)`
+    /// on timeout. The bytes exclude the FCS; the PHY must validate it before
+    /// returning. Fill `frame` in place ([`PhyRxFrame::set`] or
+    /// [`PhyRxFrame::buffer_mut`] + [`PhyRxFrame::set_len`]); its contents are
+    /// unspecified unless this returns `Ok(true)`. `frame` is the software
+    /// MAC's retained-frame slot, so the received bytes are never copied
+    /// through the stack. Dropping this future before completion must leave
+    /// the radio usable by subsequent PHY operations.
+    async fn receive(&mut self, timeout_us: u32, frame: &mut PhyRxFrame) -> Result<bool, PhyError>;
 
     /// Select an IEEE 802.15.4 channel.
     fn set_channel(&mut self, channel: u8) -> Result<(), PhyError>;
@@ -268,6 +305,26 @@ mod tests {
         assert_eq!(frame.as_slice(), [0x61, 0x88, 0x2a]);
         assert_eq!(frame.len(), 3);
         assert_eq!(frame.lqi, 173);
+    }
+
+    #[test]
+    fn received_frame_is_filled_in_place() {
+        let mut frame = PhyRxFrame::from_slice(&[1, 2, 3, 4], 9).unwrap();
+        frame.set(&[0x61, 0x88], 200).unwrap();
+        assert_eq!((frame.as_slice(), frame.lqi), (&[0x61, 0x88][..], 200));
+        assert_eq!(
+            frame.set(&[0; MAX_PHY_FRAME_LEN + 1], 0),
+            Err(PhyError::FrameTooLong)
+        );
+        assert_eq!((frame.as_slice(), frame.lqi), (&[0x61, 0x88][..], 200));
+
+        frame.buffer_mut()[..3].copy_from_slice(&[7, 8, 9]);
+        frame.set_len(3, 50).unwrap();
+        assert_eq!((frame.as_slice(), frame.lqi), (&[7, 8, 9][..], 50));
+        assert_eq!(
+            frame.set_len(MAX_PHY_FRAME_LEN + 1, 0),
+            Err(PhyError::FrameTooLong)
+        );
     }
 
     #[test]

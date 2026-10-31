@@ -191,7 +191,7 @@ impl RadioPhy for Bl702RadioPhy {
         self.transmit(&frame, false).await
     }
 
-    async fn receive(&mut self, timeout_us: u32) -> Result<Option<PhyRxFrame>, PhyError> {
+    async fn receive(&mut self, timeout_us: u32, frame: &mut PhyRxFrame) -> Result<bool, PhyError> {
         let mut rx_started = enable_rx();
         let _guard = RxGuard;
         let deadline = Instant::now() + Duration::from_micros(u64::from(timeout_us));
@@ -207,10 +207,11 @@ impl RadioPhy for Bl702RadioPhy {
                 if rx_status & IRQ_RX_CRC != 0 && read32(M154_RX_STATUS) & 1 != 0 {
                     return Err(PhyError::CrcFailed);
                 }
-                return read_rx_frame().map(Some);
+                read_rx_frame(frame)?;
+                return Ok(true);
             }
             if Instant::now() >= deadline {
-                return Ok(None);
+                return Ok(false);
             }
             yield_now().await;
         }
@@ -394,18 +395,17 @@ fn write_tx_frame(frame: &[u8]) {
     );
 }
 
-fn read_rx_frame() -> Result<PhyRxFrame, PhyError> {
+fn read_rx_frame(frame: &mut PhyRxFrame) -> Result<(), PhyError> {
     let phy_len = (read32(M154_RX_METADATA) >> 24) as u8;
     let payload_len = rx_payload_len(phy_len)?;
-    let mut data = [0u8; MAX_PHY_FRAME_LEN];
 
-    for (word_index, chunk) in data[..payload_len].chunks_mut(4).enumerate() {
+    for (word_index, chunk) in frame.buffer_mut()[..payload_len].chunks_mut(4).enumerate() {
         let word = read32(M154_RX_BUFFER + word_index as u32 * 4).to_le_bytes();
         chunk.copy_from_slice(&word[..chunk.len()]);
     }
 
     let raw_rssi = ((read32(PHY_RSSI) >> 8) & 0xff) as u8;
-    PhyRxFrame::from_slice(&data[..payload_len], lqi_from_raw_rssi(raw_rssi))
+    frame.set_len(payload_len, lqi_from_raw_rssi(raw_rssi))
 }
 
 fn rx_payload_len(phy_len: u8) -> Result<usize, PhyError> {

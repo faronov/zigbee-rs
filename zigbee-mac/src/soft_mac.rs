@@ -316,6 +316,11 @@ impl MacRole for EndDevice {
 /// Like `heapless::Deque`, but with byte-sized indices (the frames are
 /// byte-aligned, so this saves the padding of two `usize` indices and a flag
 /// in every copy of the MAC), and a full queue evicts its oldest frame.
+///
+/// The PHY receives straight into the free slot behind the last frame
+/// ([`Self::rx_slot`]); [`Self::commit_back`] / [`Self::commit_front`] then
+/// retain it without copying. A frame that is not retained simply leaves the
+/// slot free again.
 struct RxQueue<const N: usize> {
     frames: [PhyRxFrame; N],
     head: u8,
@@ -350,6 +355,11 @@ impl<const N: usize> RxQueue<N> {
         (if index >= N { index - N } else { index }) as u8
     }
 
+    /// The `index`-th oldest frame; `index` must be below [`Self::len`].
+    fn get(&self, index: usize) -> &PhyRxFrame {
+        &self.frames[usize::from(Self::wrap(usize::from(self.head) + index))]
+    }
+
     fn front(&self) -> Option<&PhyRxFrame> {
         (self.len != 0).then(|| &self.frames[usize::from(self.head)])
     }
@@ -362,28 +372,69 @@ impl<const N: usize> RxQueue<N> {
     }
 
     fn pop_front(&mut self) -> Option<PhyRxFrame> {
-        let frame = self.front()?.clone();
+        let frame = *self.front()?;
         self.drop_front();
         Some(frame)
     }
 
-    /// Append `frame`, evicting the oldest frame when the queue is full.
-    fn push_back(&mut self, frame: PhyRxFrame) {
+    fn tail(&self) -> usize {
+        usize::from(Self::wrap(usize::from(self.head) + self.len()))
+    }
+
+    /// The free slot the next received frame is written to. A full queue
+    /// evicts its oldest frame to make room.
+    fn rx_slot(&mut self) -> &mut PhyRxFrame {
         if self.len() == N {
             self.drop_front();
         }
-        self.frames[usize::from(Self::wrap(usize::from(self.head) + self.len()))] = frame;
+        let tail = self.tail();
+        &mut self.frames[tail]
+    }
+
+    /// The frame last written to [`Self::rx_slot`].
+    fn received(&self) -> &PhyRxFrame {
+        &self.frames[self.tail()]
+    }
+
+    /// Retain the received frame as the newest one.
+    fn commit_back(&mut self) {
         self.len += 1;
     }
 
-    /// Prepend `frame`, evicting the oldest frame when the queue is full.
-    fn push_front(&mut self, frame: PhyRxFrame) {
-        if self.len() == N {
-            self.drop_front();
-        }
+    /// Retain the received frame as the oldest one (consumed next).
+    fn commit_front(&mut self) {
+        let tail = self.tail();
         self.head = Self::wrap(usize::from(self.head) + N - 1);
-        self.frames[usize::from(self.head)] = frame;
+        // The free slots run from the tail to just before the head, so the
+        // received frame moves to the new head without touching any other
+        // retained frame.
+        self.frames[usize::from(self.head)] = self.frames[tail];
         self.len += 1;
+    }
+
+    /// Remove the `index`-th oldest frame, keeping the others in order.
+    fn remove(&mut self, index: usize) {
+        // Shift the older frames one slot towards the tail, over the removed
+        // one, then release the head slot.
+        let mut slot = usize::from(Self::wrap(usize::from(self.head) + index));
+        for _ in 0..index {
+            let previous = usize::from(Self::wrap(slot + N - 1));
+            self.frames[slot] = self.frames[previous];
+            slot = previous;
+        }
+        self.drop_front();
+    }
+
+    #[cfg(test)]
+    fn push_back(&mut self, frame: PhyRxFrame) {
+        *self.rx_slot() = frame;
+        self.commit_back();
+    }
+
+    #[cfg(test)]
+    fn push_front(&mut self, frame: PhyRxFrame) {
+        *self.rx_slot() = frame;
+        self.commit_front();
     }
 }
 
@@ -1136,9 +1187,10 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
     /// The single receive loop of the MAC.
     ///
     /// Listens up to `timeout_us` and returns early when a frame matching
-    /// `want` was heard. Every received frame is classified by
-    /// [`Self::accept`] (synchronously, so the frame is never held across an
-    /// await); a software Imm-Ack, when one is due, is sent afterwards.
+    /// `want` was heard. Every frame is received straight into the
+    /// retained-frame queue's free slot and classified by [`Self::accept`]
+    /// (synchronously, so no frame is held across an await or copied through
+    /// the stack); a software Imm-Ack, when one is due, is sent afterwards.
     async fn listen(
         &mut self,
         timeout_us: u32,
@@ -1151,9 +1203,9 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             let Some(remaining) = timeout_us.checked_sub(elapsed) else {
                 break;
             };
-            let (ack, heard) = match self.phy.receive(remaining).await {
-                Ok(Some(frame)) => self.accept(frame, &mut want),
-                Ok(None) => break,
+            let (ack, heard) = match self.phy.receive(remaining, self.pending_rx.rx_slot()).await {
+                Ok(true) => self.accept(&mut want),
+                Ok(false) => break,
                 Err(PhyError::CrcFailed) => continue,
                 Err(error) => return Err(phy_error(error)),
             };
@@ -1187,12 +1239,10 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
     ///   being waited for). Everything else is dropped.
     ///
     /// Returns the software ACK to send (`sequence`, `frame_pending`) and
-    /// the early-exit outcome.
-    fn accept(
-        &mut self,
-        frame: PhyRxFrame,
-        want: &mut Want<'_>,
-    ) -> (Option<(u8, bool)>, Option<Heard>) {
+    /// the early-exit outcome. The frame is the one just written to
+    /// [`RxQueue::rx_slot`]; retaining it commits that slot.
+    fn accept(&mut self, want: &mut Want<'_>) -> (Option<(u8, bool)>, Option<Heard>) {
+        let frame = self.pending_rx.received();
         let data = frame.as_slice();
         if data.len() < 3 {
             return (None, None);
@@ -1244,33 +1294,29 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
                 Some(Heard::Association(address, status))
             } else {
                 // Kept for `take_pending_association_response`.
-                self.queue_pending_rx(frame);
+                self.pending_rx.commit_back();
                 None
             }
         } else if !self.accepts_destination(&destination) {
             None
         } else if command {
             if R::PARENT {
-                self.role.queue_command(data, frame.lqi);
+                let lqi = frame.lqi;
+                self.role.queue_command(data, lqi);
                 retained
             } else {
                 None
             }
         } else if matches!(want, Want::PollResponse) && exact && self.is_from_coordinator(&source) {
             // The poll response is consumed next, ahead of other traffic.
-            self.pending_rx.push_front(frame);
+            self.pending_rx.commit_front();
             Some(Heard::Queued)
         } else {
-            self.queue_pending_rx(frame);
+            // Kept for a later `receive_data` / `poll`.
+            self.pending_rx.commit_back();
             retained
         };
         (ack, heard)
-    }
-
-    /// Queue a received frame for a later `receive_data` / `poll`, dropping
-    /// the oldest one when the queue is full.
-    fn queue_pending_rx(&mut self, frame: PhyRxFrame) {
-        self.pending_rx.push_back(frame);
     }
 
     /// Convert an already-acknowledged frame into a data indication.
@@ -1355,16 +1401,15 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
         Ok(())
     }
 
+    /// Remove the oldest retained Association Response addressed to us; the
+    /// other retained frames keep their order.
     fn take_pending_association_response(&mut self) -> Option<(ShortAddress, u8)> {
-        let pending_count = self.pending_rx.len();
-        for _ in 0..pending_count {
-            let frame = self.pending_rx.pop_front()?;
-            if let Some(response) = self.association_response_for_us(&frame) {
-                return Some(response);
-            }
-            self.pending_rx.push_back(frame);
-        }
-        None
+        let (index, response) = (0..self.pending_rx.len()).find_map(|index| {
+            self.association_response_for_us(self.pending_rx.get(index))
+                .map(|response| (index, response))
+        })?;
+        self.pending_rx.remove(index);
+        Some(response)
     }
 
     fn association_response_for_us(&self, frame: &PhyRxFrame) -> Option<(ShortAddress, u8)> {
@@ -1610,8 +1655,19 @@ mod tests {
                 .map_err(|_| PhyError::Hardware)
         }
 
-        async fn receive(&mut self, _timeout_us: u32) -> Result<Option<PhyRxFrame>, PhyError> {
-            self.rx_frames.pop_front().unwrap_or(Ok(None))
+        async fn receive(
+            &mut self,
+            _timeout_us: u32,
+            frame: &mut PhyRxFrame,
+        ) -> Result<bool, PhyError> {
+            match self.rx_frames.pop_front().unwrap_or(Ok(None)) {
+                Ok(Some(received)) => {
+                    *frame = received;
+                    Ok(true)
+                }
+                Ok(None) => Ok(false),
+                Err(error) => Err(error),
+            }
         }
 
         fn set_channel(&mut self, channel: u8) -> Result<(), PhyError> {
@@ -1908,10 +1964,7 @@ mod tests {
     fn ack_wait_preserves_non_ack_frames() {
         let mut core = core();
         let data = PhyRxFrame::from_slice(&[0x41, 0x88, 0x10, 0xAA], 100).unwrap();
-        core.phy_mut()
-            .rx_frames
-            .push_back(Ok(Some(data.clone())))
-            .unwrap();
+        core.phy_mut().rx_frames.push_back(Ok(Some(data))).unwrap();
         core.phy_mut()
             .rx_frames
             .push_back(Ok(Some(
@@ -2208,6 +2261,30 @@ mod tests {
     }
 
     #[test]
+    fn retained_association_response_is_taken_without_reordering() {
+        let mut core = core();
+        core.prepare_association(&associate_request()).unwrap();
+        let data = |tag: u8| PhyRxFrame::from_slice(&[0x41, 0x88, tag], 200).unwrap();
+        let response = association_response(0x44, ShortAddress(0x5678), 0);
+        core.pending_rx.push_back(data(1));
+        core.pending_rx
+            .push_back(PhyRxFrame::from_slice(&response, 210).unwrap());
+        core.pending_rx.push_back(data(2));
+        core.pending_rx.push_back(data(3));
+
+        assert_eq!(
+            core.take_pending_association_response(),
+            Some((ShortAddress(0x5678), 0))
+        );
+        assert_eq!(core.take_pending_association_response(), None);
+        let mut order = heapless::Vec::<u8, 4>::new();
+        while let Some(frame) = core.pending_rx.pop_front() {
+            order.push(frame.as_slice()[2]).unwrap();
+        }
+        assert_eq!(order.as_slice(), [1, 2, 3]);
+    }
+
+    #[test]
     fn association_polls_for_an_indirect_response() {
         let mut core = core();
         let response = association_response(0x44, ShortAddress(0x5678), 0);
@@ -2441,7 +2518,8 @@ mod tests {
     #[test]
     fn non_default_reset_preserves_pib_and_clears_transient_receive_state() {
         let mut core = associated_core();
-        core.queue_pending_rx(PhyRxFrame::from_slice(&[0x01, 0x00, 0x33], 100).unwrap());
+        core.pending_rx
+            .push_back(PhyRxFrame::from_slice(&[0x01, 0x00, 0x33], 100).unwrap());
         core.pending_error = Some(MacError::RadioError);
 
         core.reset(false).unwrap();
@@ -3565,5 +3643,49 @@ mod tests {
         assert!(queue.is_empty() && queue.pop_front().is_none());
         queue.drop_front();
         assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn rx_queue_receives_in_place_and_removes_in_order() {
+        let frame = |tag: u8| PhyRxFrame::from_slice(&[tag], 0).unwrap();
+        let tags = |queue: &mut RxQueue<3>| {
+            let mut out = heapless::Vec::<u8, 3>::new();
+            while let Some(frame) = queue.pop_front() {
+                out.push(frame.as_slice()[0]).unwrap();
+            }
+            out
+        };
+
+        let mut queue = RxQueue::<3>::new();
+        // A received frame that is not committed leaves the queue unchanged.
+        queue.push_back(frame(1));
+        *queue.rx_slot() = frame(2);
+        assert_eq!(queue.received().as_slice(), [2]);
+        assert_eq!(queue.len(), 1);
+        *queue.rx_slot() = frame(3);
+        queue.commit_back();
+        assert_eq!(tags(&mut queue).as_slice(), [1, 3]);
+
+        // Receiving into a full queue evicts the oldest frame, even if the
+        // new frame is then not retained.
+        for tag in 4..=6 {
+            queue.push_back(frame(tag));
+        }
+        *queue.rx_slot() = frame(7);
+        assert_eq!(queue.len(), 2);
+        // A front commit lands ahead of the retained frames.
+        queue.commit_front();
+        assert_eq!(tags(&mut queue).as_slice(), [7, 5, 6]);
+
+        // Removal keeps the other frames in order, across the wrap.
+        for tag in 8..=10 {
+            queue.push_back(frame(tag));
+        }
+        queue.remove(1);
+        assert_eq!(queue.len(), 2);
+        queue.push_back(frame(11));
+        queue.remove(2);
+        queue.remove(0);
+        assert_eq!(tags(&mut queue).as_slice(), [10]);
     }
 }
