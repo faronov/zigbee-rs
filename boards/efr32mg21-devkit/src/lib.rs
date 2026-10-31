@@ -1,24 +1,26 @@
 //! BSP for BRD4181A on the BRD4001A Wireless Starter Kit.
 //!
 //! This crate intentionally supports one concrete configuration:
-//! EFR32MG21A020F512IM32, LED0 on PB0, and BTN0 on PD2.
-//! It exposes fitted board resources, including the raw exclusive internal
-//! flash token, but deliberately owns no Zigbee runtime or flash-partition
-//! policy.
+//! EFR32MG21A010F1024IM32 (GSDK `brd4181a.slcc`), LED0 on PB0, BTN0 on PD2, and the WSTK VCOM on
+//! USART0 TX PA5 with its enable on PD4 (GSDK 4.5.0
+//! `hardware/board/config/brd4181a_brd4001a`). It exposes fitted board
+//! resources, including the raw exclusive internal flash token, but
+//! deliberately owns no Zigbee runtime or flash-partition policy.
 
 #![no_std]
 
 pub mod resources;
 
-pub use efr32mg21_hal::flash::Efr32mg21Flash;
-use efr32mg21_hal::{
+pub use efr32s2_hal::flash::Efr32s2Flash;
+use efr32s2_hal::{
     clock::{ClockControl, ClockError, HfxoConfig, SystemClocks},
     gpio::{self, Input, InterruptEdge, Pin, Port, PushPull},
+    usart::UartTx,
 };
 
 pub const BOARD_RADIO: &str = "BRD4181A";
 pub const BOARD_MAIN: &str = "BRD4001A";
-pub const MCU_PART: &str = "EFR32MG21A020F512IM32";
+pub const MCU_PART: &str = "EFR32MG21A010F1024IM32";
 pub const HCLK_HZ: u32 = 38_400_000;
 pub const HFXO_CTUNE: u16 = 133;
 
@@ -27,6 +29,11 @@ pub const LED0_PIN: u8 = 0;
 pub const BUTTON0_PORT: Port = Port::D;
 pub const BUTTON0_PIN: u8 = 2;
 pub const BUTTON0_INTERRUPT_LINE: u8 = 2;
+pub const VCOM_ENABLE_PORT: Port = Port::D;
+pub const VCOM_ENABLE_PIN: u8 = 4;
+pub const VCOM_TX_PORT: Port = Port::A;
+pub const VCOM_TX_PIN: u8 = 5;
+pub const VCOM_BAUD: u32 = 115_200;
 
 /// Select BRD4181A's 38.4 MHz crystal before starting SysTick or radio code.
 pub fn init_clocks(mut clocks: ClockControl) -> Result<SystemClocks, ClockError> {
@@ -99,6 +106,32 @@ pub fn service_button0_interrupt() -> bool {
     // SAFETY: BRD4181A's singleton Button0 token exclusively owns EXTI2.
     unsafe { gpio::clear_interrupt_line(BUTTON0_INTERRUPT_LINE) };
     true
+}
+
+/// WSTK virtual COM port: USART0 TX on PA5, enabled through PD4.
+pub struct Vcom {
+    uart: UartTx,
+    enable: Pin<PushPull>,
+}
+
+impl Vcom {
+    pub(crate) fn new(uart: UartTx, enable: Pin<PushPull>) -> Self {
+        Self { uart, enable }
+    }
+
+    #[inline]
+    pub fn uart(&mut self) -> &mut UartTx {
+        &mut self.uart
+    }
+
+    /// Drive the WSTK VCOM enable (PD4).
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if enabled {
+            self.enable.set_high();
+        } else {
+            self.enable.set_low();
+        }
+    }
 }
 
 /// Force LED0 on for a terminal fault where normal ownership cannot be used.

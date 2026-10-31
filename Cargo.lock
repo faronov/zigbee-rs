@@ -400,6 +400,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "efr32s2-hal"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "embedded-hal 1.0.0",
+ "embedded-storage",
+]
+
+[[package]]
 name = "elliptic-curve"
 version = "0.13.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2044,6 +2053,7 @@ version = "0.1.0"
 dependencies = [
  "bl702-hal",
  "efr32mg1-hal",
+ "efr32s2-hal",
  "embassy-futures",
  "embassy-nrf",
  "embassy-sync 0.7.2",

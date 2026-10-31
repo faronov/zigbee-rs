@@ -1,0 +1,59 @@
+[package]
+name = "efr32s2-lab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autobins = false
+description = "Step-by-step EFR32 Series 2 bring-up binaries (clocks, VCOM, I2C, raw 802.15.4 radio)"
+build = "build.rs"
+
+[[bin]]
+name = "s2-blink"
+path = "src/bin/blink.rs"
+
+[[bin]]
+name = "s2-i2c-scan"
+path = "src/bin/i2c_scan.rs"
+required-features = ["wstk"]
+
+[[bin]]
+name = "s2-radio"
+path = "src/bin/radio.rs"
+
+[[bin]]
+name = "s2-tx-loop"
+path = "src/bin/tx_loop.rs"
+
+[[bin]]
+name = "s2-ed-mon"
+path = "src/bin/ed_mon.rs"
+
+[[bin]]
+name = "s2-em2"
+path = "src/bin/em2.rs"
+required-features = ["wstk"]
+
+[features]
+default = ["wstk"]
+# BRD4001A + BRD4183A (EFR32MG22): VCOM log, LED0, image at 0x0.
+wstk = ["efr32s2-hal/efr32mg22"]
+# Home Assistant Connect ZBT-1 (EFR32MG21): image at 0x4000 above the
+# resident Gecko Bootloader, log through SEGGER RTT over SWD.
+zbt1 = ["efr32s2-hal/efr32mg21"]
+
+[dependencies]
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["rt", "time-driver"] }
+embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7", features = ["device"] }
+embedded-hal = "1.0"
+
+[profile.dev]
+opt-level = "s"
+debug = true
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+lto = true
+debug = true

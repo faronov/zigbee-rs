@@ -1,5 +1,6 @@
 /* Product-selected EFR32MG21 sensor map for BRD4181A/BRD4001A.
- * Part: EFR32MG21A020F512IM32; flash: 512 KiB; RAM: 64 KiB.
+ * Part: EFR32MG21A010F1024IM32 (1 MiB flash, 64 KiB RAM). The map uses only
+ * the lower 512 KiB so it also fits the F512 parts.
  *
  * Keep in sync with src/journal.rs. The board intentionally supplies only
  * raw flash and has no memory-layout or persistence-policy ownership.

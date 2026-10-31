@@ -102,7 +102,9 @@ former-budget rows.
 | nRF52840 UF2 ProMicro / MDK / PCA10059 / DK | 222,968 / 222,848 / 224,536 / 224,552 | 237,568 each | 14,600 / 14,720 / 13,032 / 13,016 | linked images before UF2 |
 | nRF52833 default / BME280 / SHT31 | 224,464 / 231,784 / 228,208 | 225,280 / 245,760 / 241,664 | 816 / 13,976 / 13,456 | raw binaries |
 | EFR32MG1 sensor | 171,792 | 167,936 | -3,856 | raw binary; above former budget |
-| EFR32MG21 sensor | 209,028 | 212,992 | 3,964 | raw binary |
+| EFR32MG21 sensor | 231,248 | 491,520 | 260,272 | raw binary from `0x4000`; app slot ends at the journal (`0x7C000`) |
+| EFR32MG22 sensor | 231,528 | 507,904 | 276,376 | raw binary from `0x0`; app slot ends at the journal (`0x7C000`) |
+| Home Assistant Connect ZBT-1 always-on End Device | 230,012 | 1,015,808 | 785,796 | raw binary from `0x4000`; app slot ends at the journal (`0xFC000`) |
 | CC2340R5 pinned-SDK sensor (pre-static-task snapshot) | 223,536 | 225,280 | 1,744 | historical raw binary; not rebuilt |
 | CC2340R5 fallback sensor | 213,160 | 225,280 | 12,120 | raw binary; radio firmware unavailable |
 | ESP32-C6 sensor default / `light-sleep` | 381,056 / 392,080 | 368,640 each | -12,416 / -23,440 | application images; above former budget |
@@ -141,7 +143,7 @@ Additional artifacts and physical limits:
   CI rejects a larger raw application.
 - EFR32MG1's prior Zigbee OTA container was 162,538 B; it has not been
   regenerated for the current image. Resident Gecko bootloader assumed.
-- EFR32MG21: no OTA packaging path.
+- EFR32MG21/MG22: no OTA packaging path.
 - CC2340R5 physical application slot: 516,096 B.
 - ESP32-C6 default/light merged flash: 446,592/457,616 B; H2: 431,456/442,176 B.
   OTA slot: 2,031,616 B each. Their regenerated version-1 Zigbee OTA containers
@@ -173,7 +175,8 @@ assertions; removing the regression gate does not establish hardware acceptance.
 | PB-03F-Kit `pb03f-zigbee` | 1,304 | 16,628 | 17,932 | 41,396 available |
 | BL702 sensor | 592 | 16,592 | 17,184 | 15,360 reserved |
 | EFR32MG1 | 288 | 15,056 | 15,344 | 16,400 available |
-| EFR32MG21 | 316 | 18,888 | 19,204 | 46,328 available |
+| EFR32MG21 | 336 | 14,600 | 14,936 | 50,424 available |
+| EFR32MG22 | 336 | 14,600 | 14,936 | 17,656 available |
 | nRF52840 always-on End Device | 88 | 18,444 | 18,532 | 242,588 available |
 | CC2340R5 fallback | 16 | 17,428 | 17,444 | 19,420 available |
 | ESP32-C6 default / `light-sleep` | 3,412 / 3,608 | 50,384 | 53,796 / 53,992 | 390,696 / 390,504 linked |
@@ -846,6 +849,63 @@ Measured against master `d8bf8bc`, built from an equal-length path:
 unchanged on nRF. The baseline JSON keeps its originally recorded values with
 these deltas applied. The change is build-, layout- and symbol-tested only;
 no BL702 or nRF52 hardware run has been done with it.
+
+### Phase B: EFR32 Series 2 (approved flash exception)
+
+`zigbee-mac/src/efr32s2` was replaced. The old `Efr32s2Mac` carried
+Series 1 register values and had never run. The new
+`Efr32s2SoftMac = SoftMacCore<Efr32s2RadioPhy>` sits on the pure-Rust
+`efr32s2-hal` radio (see the EFR32 platform guide). The MG21 example takes
+time from the RTCC and sleeps in EM2 instead of SysTick idle. It now shares
+its composition with the new `efr32mg22-sensor`.
+
+All 26 master images were rebuilt from the same path at `273cd92` and on the
+branch. Every image except `efr32mg21-sensor` is byte-identical in every
+metric. `efr32mg22-sensor` is new.
+
+| metric | `efr32mg21-sensor` master | Series 2 | delta | `efr32mg22-sensor` |
+|---|---:|---:|---:|---:|
+| `flash` | 208,960 | 229,088 | +20,128 | 231,052 |
+| `text` | 177,052 | 187,052 | +10,000 | 187,864 |
+| `bss` | 18,888 | 14,600 | −4,288 | 14,600 |
+| `pool` | 11,040 | 2,744 | −8,296 | 2,744 |
+| `mac_code` | 6,903 | 8,180 | +1,277 | 8,404 |
+| `stack` | 25,524 | 20,652 | −4,872 | 20,652 |
+| `mac_chain` | 23,612 | 19,084 | −4,528 | 19,076 |
+| `mac_stack` | 1,732 | 712 | −1,020 | 712 |
+| `mac_frame` | 1,072 | 384 | −688 | 384 |
+
+The user accepted the MG21 flash growth. It splits about evenly:
+
+- `.text` grows by 10.0 KB. Only 1.3 KB of that is MAC code. The rest is
+  the CPU replacement for the sequencer (warm-up, analog switching, VCO
+  calibration and its per-channel cache), the RTCC time driver, EM2 entry
+  and the VCOM logger.
+- `.rodata` grows by 10.1 KB. About 6.1 KB of that is anonymous constants
+  (format strings and panic locations); the rest is not attributed further.
+
+The scaffold had none of this code, because it never configured the radio.
+The baseline JSON rows were moved by these deltas, and an `efr32mg22-sensor`
+row was added.
+
+Later commits captured the xG21 radio tables and added the VCO fix, the
+per-chip RTCC compare flags and a per-product default TX power. The
+`efr32s2` code is feature-gated, so no other image changes. Rebuilt in the
+same worktree:
+
+| metric | `efr32mg21-sensor` previous baseline row | now | delta | `efr32mg22-sensor` now (delta) |
+|---|---:|---:|---:|---:|
+| `flash` | 228,960 | 231,248 | +2,288 | 231,528 (+476) |
+| `text` | 187,048 | 187,924 | +876 | 188,312 (+448) |
+| `bss` | 14,600 | 14,600 | 0 | 14,600 (0) |
+| `mac_code` | 8,180 | 8,370 | +190 | 8,488 (+84) |
+| `stack` | 20,652 | 20,652 | 0 | 20,652 (0) |
+
+Most of the MG21 growth is the xG21 PHY, analog and PA tables. The last
+change alone (RTCC flags, default TX power, flash-capacity helper) costs
++304 B on MG21 and +316 B on MG22, measured from the same directory. RAM
+and stack are unchanged. MG22 is hardware-tested. The xG21 radio is
+lab-tested on the ZBT-1, but the BRD4181A MG21 image itself has not run.
 
 ## Measurement commands
 

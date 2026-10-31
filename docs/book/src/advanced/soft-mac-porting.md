@@ -39,9 +39,9 @@ Production status:
 | CC2340R5 | yes, via `Cc2340SoftMac` (PBE CCA + TX + Imm-Ack wait, `type Tx = AckWaitTx`; RX decoded from the FIFO into the retained-RX slot) | build-, layout- and host-tested only; no hardware run since the migration |
 | ESP32-C6/H2 | yes, `EspSoftMac` = `SoftMacCore<EspRadioPhy, EndDevice>` (hardware auto-ACK; raw TX + software Imm-Ack window, `type Tx = AckWaitTx`; retained light sleep through `RadioPhy::sleep`/`wake`) | build-, layout-, symbol- and host-tested only; no hardware run since the migration |
 | EFR32MG1 | yes, `Efr32Mac` = `SoftMacCore<Efr32RadioPhy, EndDevice, 1>` (FRC-IRQ software Imm-Ack, `type Tx = AckWaitTx`, in-place `receive`, extended-source fallback poll) | build-, layout-, symbol- and host-tested only; no hardware run since the migration |
-| EFR32MG21 | no, it has its own `MacDriver` | — |
+| EFR32MG22/MG21 | yes, `Efr32s2SoftMac` = `SoftMacCore<Efr32s2RadioPhy>` (HAL software Imm-Ack while the receive window is polled, single-attempt CCA + TX + ACK wait, `type Tx = AckWaitTx`; in-place `receive`; extended-source fallback poll; radio resume after EM2 through `RadioPhy::wake`) | MG22 (BRD4183A): ZHA join, interview, reporting, journal resume and EM2 polling hardware-tested; MG21 on the ZBT-1: ZHA join, interview, Identify and journal resume lab-tested as an always-on End Device; BRD4181A image build-only |
 
-The last row is the remaining Phase B work. The TLSR8258 router is the
+Every production backend now runs on the core. The TLSR8258 router is the
 first shipped image on the core's parent role. Its `PENDING` capacity is 0:
 the HAL's ISR ACK path owns the Frame Pending source-match table, which the
 core arms through `RadioPhy::set_ack_frame_pending` because
@@ -287,7 +287,9 @@ To find growth:
   (its legacy timer-cancelled poll is gone): a late frame its FRC IRQ has
   already acknowledged stays in the driver's RX buffer for the next
   `receive`. The TLSR8258 PHY's operations are bounded busy-waits.
-- **Per-backend diagnostics counters.** EFR32MG21 keeps its own; EFR32MG1
+- **Per-backend diagnostics counters.** EFR32 Series 2 only logs the last
+  hardware error with the RAC state and synth diagnostics
+  (`Efr32s2RadioPhy`); EFR32MG1
   keeps only the driver's FRC-IRQ software-ACK counters
   (`Efr32RadioPhy::software_ack_snapshot`); the core
   exposes only `dropped_command_events()`. The TLSR8258 images keep the HAL's

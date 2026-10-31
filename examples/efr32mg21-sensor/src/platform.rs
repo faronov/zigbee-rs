@@ -1,12 +1,19 @@
 //! BRD4181A capability adapters for the shared sleepy-sensor lifecycle.
 //!
-//! `Idle` below is deliberately narrow: the radio block is gated while the
-//! Embassy Cortex-M executor waits with WFE for SysTick or PD2. SysTick remains
-//! active at 1 kHz, no low-frequency wake source is selected, and this module
-//! does **not** enter or claim EFR32 EM2. `Retention` is rejected before any
-//! wait because no qualified restore sequence exists for this platform.
+//! Sleep depths:
+//! - `Active` (fast poll): radio state untouched; Embassy races the BTN0
+//!   edge against an RTCC timer while the executor idles with WFE (EM1).
+//! - `Idle`: radio idled through `SoftMacCore::sleep`, then the same wait.
+//! - `Retention` (slow poll): radio idled, VCOM flushed, EM2 until RTCC CC1;
+//!   `SoftMacCore::wake` then runs `Radio::resume` (RAC/FRC state is lost in
+//!   EM2; the HFXO restarts on demand) before any traffic.
+//!
+//! BTN0 is PD2. Series 2 keeps asynchronous GPIO edge interrupts in EM2
+//! only on ports A and B, so on this board a press during EM2 is seen at
+//! the next RTCC wake (latency up to the long-poll interval), not at once.
 
 use core::{
+    cell::RefCell,
     convert::Infallible,
     future::poll_fn,
     sync::atomic::{AtomicBool, Ordering},
@@ -15,41 +22,44 @@ use core::{
 
 use cortex_m::interrupt::Mutex;
 use efr32mg21_devkit::{Button0, Led0};
+use efr32s2_hal::{power, rtcc, vectors::Interrupt};
 use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Instant, Timer};
 use sensor_sed_app::{
     DiagnosticEvent, Diagnostics, EnvironmentReading, EnvironmentSource, SensorStatus, SleepDepth,
     StatusSink, Supervisor, WaitRequest, WakeController, WakeReason,
 };
-use zigbee_mac::efr32s2::Efr32s2Mac;
-
-use crate::vectors;
+use zigbee_mac::efr32s2::Efr32s2SoftMac;
 
 const HELD_POLL_MS: u32 = 25;
 
 static BUTTON_PENDING: AtomicBool = AtomicBool::new(false);
-static BUTTON_WAKER: Mutex<core::cell::RefCell<Option<Waker>>> =
-    Mutex::new(core::cell::RefCell::new(None));
+static BUTTON_WAKER: Mutex<RefCell<Option<Waker>>> = Mutex::new(RefCell::new(None));
 
-/// Enable BRD4181A's PD2/GPIO_EVEN wake input after the pin is configured.
+/// Enable the BTN0 (PD2, EXTI2 → GPIO_EVEN) input after the board
+/// configured the pin.
 pub fn enable_button_interrupt() {
     BUTTON_PENDING.store(false, Ordering::Release);
-    cortex_m::peripheral::NVIC::unpend(vectors::Interrupt::GpioEven);
-    // SAFETY: the board has configured exclusive PD2/EXTI2 ownership and the
-    // crate provides the sole GPIO_EVEN handler.
-    unsafe { cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::GpioEven) };
+    cortex_m::peripheral::NVIC::unpend(Interrupt::GPIO_EVEN);
+    // SAFETY: the board token exclusively owns PD2/EXTI2 and this crate
+    // provides the sole GPIO_EVEN handler.
+    unsafe { cortex_m::peripheral::NVIC::unmask(Interrupt::GPIO_EVEN) };
 }
 
-/// ISR entry called by the vector table.
+/// GPIO_EVEN ISR body.
 pub fn gpio_even_irq() {
     if efr32mg21_devkit::service_button0_interrupt() {
         BUTTON_PENDING.store(true, Ordering::Release);
-        cortex_m::interrupt::free(|critical| {
-            if let Some(waker) = BUTTON_WAKER.borrow(critical).borrow().as_ref() {
+        cortex_m::interrupt::free(|cs| {
+            if let Some(waker) = BUTTON_WAKER.borrow(cs).borrow().as_ref() {
                 waker.wake_by_ref();
             }
         });
     }
+}
+
+fn button_edge_pending() -> bool {
+    BUTTON_PENDING.load(Ordering::Acquire)
 }
 
 fn take_button_edge() -> bool {
@@ -61,12 +71,10 @@ async fn wait_for_button_edge() {
         if take_button_edge() {
             return Poll::Ready(());
         }
-
-        cortex_m::interrupt::free(|critical| {
-            *BUTTON_WAKER.borrow(critical).borrow_mut() = Some(context.waker().clone());
+        cortex_m::interrupt::free(|cs| {
+            *BUTTON_WAKER.borrow(cs).borrow_mut() = Some(context.waker().clone());
         });
-
-        // Close the edge-arriving-between-test-and-waker-registration race.
+        // Close the edge-between-test-and-registration race.
         if take_button_edge() {
             Poll::Ready(())
         } else {
@@ -77,22 +85,23 @@ async fn wait_for_button_edge() {
 }
 
 fn clear_button_waker() {
-    cortex_m::interrupt::free(|critical| {
-        *BUTTON_WAKER.borrow(critical).borrow_mut() = None;
+    cortex_m::interrupt::free(|cs| {
+        BUTTON_WAKER.borrow(cs).borrow_mut().take();
     });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeError {
-    RetentionUnsupported,
+    Radio,
+    Power,
 }
 
-/// PD2 button and truthful Active/Idle wait implementation.
-pub struct Brd4181aWake {
+/// BTN0 plus RTCC/EM2 wait implementation.
+pub struct Mg21Wake {
     button: Button0,
 }
 
-impl Brd4181aWake {
+impl Mg21Wake {
     pub const fn new(button: Button0) -> Self {
         Self { button }
     }
@@ -101,14 +110,12 @@ impl Brd4181aWake {
         if take_button_edge() || self.button.take_interrupt() {
             return WakeReason::Button;
         }
-
         let selected = select(
             wait_for_button_edge(),
             Timer::after(Duration::from_millis(u64::from(timeout_ms))),
         )
         .await;
         clear_button_waker();
-
         if matches!(selected, Either::First(()))
             || take_button_edge()
             || self.button.take_interrupt()
@@ -118,9 +125,34 @@ impl Brd4181aWake {
             WakeReason::Timer
         }
     }
+
+    fn retention_wait(
+        &mut self,
+        mac: &mut Efr32s2SoftMac,
+        timeout_ms: u32,
+    ) -> Result<WakeReason, WakeError> {
+        if take_button_edge() || self.button.take_interrupt() {
+            return Ok(WakeReason::Button);
+        }
+        clear_button_waker();
+        mac.sleep().map_err(|_| WakeError::Radio)?;
+        crate::vcom_log::flush();
+
+        let slept = power::sleep_em2(rtcc::ms_to_ticks(timeout_ms.max(1)), button_edge_pending);
+        // Restore the radio on every path before reporting a sleep error.
+        let woke = mac.wake();
+        slept.map_err(|_| WakeError::Power)?;
+        woke.map_err(|_| WakeError::Radio)?;
+
+        if take_button_edge() || self.button.take_interrupt() {
+            Ok(WakeReason::Button)
+        } else {
+            Ok(WakeReason::Timer)
+        }
+    }
 }
 
-impl WakeController<Efr32s2Mac> for Brd4181aWake {
+impl WakeController<Efr32s2SoftMac> for Mg21Wake {
     type Mark = Instant;
     type Error = WakeError;
 
@@ -141,39 +173,30 @@ impl WakeController<Efr32s2Mac> for Brd4181aWake {
 
     async fn wait(
         &mut self,
-        mac: &mut Efr32s2Mac,
+        mac: &mut Efr32s2SoftMac,
         request: WaitRequest,
     ) -> Result<WakeReason, Self::Error> {
         match request.sleep_depth {
             SleepDepth::Active => Ok(self.timer_or_button(request.timeout_ms).await),
             SleepDepth::Idle => {
-                // Radio-off light CPU idle only. The 1 kHz SysTick remains on;
-                // this is not EM2.
-                mac.radio_sleep();
+                mac.sleep().map_err(|_| WakeError::Radio)?;
                 let reason = self.timer_or_button(request.timeout_ms).await;
-                mac.radio_wake();
+                mac.wake().map_err(|_| WakeError::Radio)?;
                 Ok(reason)
             }
-            // Reject before timer registration or radio state changes.
-            SleepDepth::Retention => Err(WakeError::RetentionUnsupported),
+            SleepDepth::Retention => self.retention_wait(mac, request.timeout_ms),
         }
     }
 
     async fn button_held_for(&mut self, duration_ms: u32) -> bool {
-        if !self.button.is_pressed() {
-            return false;
-        }
-
         let started = Instant::now();
-        loop {
-            if !self.button.is_pressed() {
-                return false;
-            }
+        while self.button.is_pressed() {
             if started.elapsed().as_millis() >= u64::from(duration_ms) {
                 return true;
             }
             Timer::after(Duration::from_millis(u64::from(HELD_POLL_MS))).await;
         }
+        false
     }
 
     async fn delay_ms(&mut self, duration_ms: u32) {
@@ -181,18 +204,18 @@ impl WakeController<Efr32s2Mac> for Brd4181aWake {
     }
 }
 
-/// PB0 active-high implementation of the shared semantic status.
-pub struct Pb0Status {
+/// LED0 (PB0, active high) semantic status.
+pub struct Led0Status {
     led: Led0,
 }
 
-impl Pb0Status {
+impl Led0Status {
     pub const fn new(led: Led0) -> Self {
         Self { led }
     }
 }
 
-impl StatusSink for Pb0Status {
+impl StatusSink for Led0Status {
     fn set(&mut self, status: SensorStatus) {
         let on = match status {
             SensorStatus::Off => false,
@@ -203,7 +226,6 @@ impl StatusSink for Pb0Status {
             SensorStatus::Joined { active } => active,
             SensorStatus::Ota | SensorStatus::Fault => true,
         };
-
         if on {
             self.led.on();
         } else {
@@ -212,33 +234,34 @@ impl StatusSink for Pb0Status {
     }
 }
 
-/// Explicitly synthetic temperature/humidity source for platform bring-up.
+/// EFR32 die temperature (EMU_TEMP, ±1–2 °C class, not ambient) and an
+/// explicitly synthetic humidity.
 #[derive(Debug, Default)]
-pub struct SyntheticEnvironment {
+pub struct DieTemperature {
     sequence: u32,
 }
 
-impl SyntheticEnvironment {
+impl DieTemperature {
     pub const fn new() -> Self {
         Self { sequence: 0 }
     }
 }
 
-impl EnvironmentSource for SyntheticEnvironment {
+impl EnvironmentSource for DieTemperature {
     type Error = Infallible;
 
     async fn sample(&mut self) -> Result<EnvironmentReading, Self::Error> {
         let sequence = self.sequence;
         self.sequence = self.sequence.wrapping_add(1);
         Ok(EnvironmentReading {
-            temperature_centi_celsius: 2_250 + ((sequence % 50) as i16 - 25),
+            temperature_centi_celsius: power::die_temperature_centi_celsius(),
             humidity_centi_percent: 5_000 + ((sequence % 100) as u16) * 10,
             pressure_tenth_kpa: None,
         })
     }
 }
 
-/// Cortex-M reset supervision; this board composition makes no watchdog claim.
+/// Reset supervision; this composition makes no watchdog claim.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Efr32Supervisor;
 
@@ -250,14 +273,15 @@ impl Supervisor for Efr32Supervisor {
     }
 
     fn reset(&mut self) -> ! {
+        crate::vcom_log::flush();
         cortex_m::peripheral::SCB::sys_reset()
     }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct RttDiagnostics;
+pub struct VcomDiagnostics;
 
-impl Diagnostics for RttDiagnostics {
+impl Diagnostics for VcomDiagnostics {
     fn record(&mut self, event: DiagnosticEvent) {
         log::info!("[SENSOR] {event:?}");
     }
@@ -270,7 +294,6 @@ pub async fn signal_boot(led: &mut Led0) {
         led.off();
         Timer::after(Duration::from_millis(100)).await;
     }
-    Timer::after(Duration::from_millis(500)).await;
 }
 
 #[inline(never)]

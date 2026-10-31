@@ -241,7 +241,9 @@ path-level evidence unless the row names the current MAC or image.
 | PB-03F-Kit (PHY6252) | End Device, synthetic environmental series | yes | ROM boot, radio, association, secured commissioning, ZHA interview/reporting and reset/resume observed on hardware with a sniffer; AON sleep, power-loss and OTA remain open |
 | CC2340R5 | environmental sleepy End Device | yes | pinned-SDK and fallback compile/link paths pass; one board joined ZHA with hardware auto-ACK and reached ~5.6 µA mean in standby; entropy (commissioning not claimed), TX power accuracy and persistence remain open |
 | EFR32MG1P TRÅDFRI | environmental sleepy End Device | yes | prior path evidence covers commissioning through EM2; real OTA install remains open |
-| EFR32MG21 BRD4181A | environmental sleepy End Device | yes | complete hardware path remains HIL-unverified |
+| EFR32MG22 BRD4183A | environmental sleepy End Device | yes | on `SoftMacCore<Efr32s2RadioPhy>`: ZHA join/interview, reporting, journal resume and EM2 slow polling (13.2 µA average) on one board; DC-DC, OTA and power-loss remain open |
+| EFR32MG21 BRD4181A | environmental sleepy End Device | yes | shares the MG22 backend and the xG21 radio tables proven on the ZBT-1; no BRD4181A hardware run (A010 PA and EM2 on xG21 unverified) |
+| Home Assistant Connect ZBT-1 (EFR32MG21) | always-on End Device (Basic + Identify) | yes | on `SoftMacCore<Efr32s2RadioPhy>`: ZHA join, interview, Identify and journal reset/resume on one dongle, keeping its Gecko Bootloader; Router role, OTA and long-duration runs remain open |
 | TLSR8258 TB-04 | environmental sleepy End Device | yes | prior evidence (hand-written MAC) covers the SUSPEND primitive; the current `SoftMacCore` image and repeated application/network acceptance remain open |
 | TLSR8258 TB-04 | child-capable router | yes | prior evidence covers join/restart/Link Status/relay; corrected-image child acceptance remains open |
 

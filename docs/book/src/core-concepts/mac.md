@@ -155,7 +155,7 @@ backend is behind a Cargo feature flag:
 | TLSR8258 router | `tlsr8258` (+ `hardware-aes`) | `TelinkRouterMac` = `SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>` | only production `ParentMacDriver`; advertises router but not coordinator; shared-core image build/layout-checked only |
 | PHY6222/PHY6252 | `phy6222` (+ `phy6222-diag`) | `Phy6222SoftMac` = `SoftMacCore<Phy6222RadioPhy>` | End Device; PB-03F-Kit (PHY6252) join, interview, reporting, resume and SRAM-ISR ACK timing hardware-tested; EVK images build/layout only |
 | EFR32MG1 | `efr32` (+ `hardware-aes-efr32mg1`) | `Efr32Mac` = `SoftMacCore<Efr32RadioPhy, EndDevice, 1>` | End Device; build-, layout- and host-tested since the move to `SoftMacCore` (legacy hand-written MLME deleted); earlier TRÅDFRI path evidence predates the move, real OTA install open |
-| EFR32MG21 | `efr32mg21` | own `Efr32s2Mac` | BRD4181A build/layout only; complete HIL open |
+| EFR32MG22/MG21 | `efr32mg22`, `efr32mg21` | `Efr32s2SoftMac` = `SoftMacCore<Efr32s2RadioPhy>` | End Device; MG22 (BRD4183A) ZHA join, interview, reporting, resume and EM2 polling hardware-tested; MG21 on the ZBT-1 joins ZHA as an always-on End Device (lab-tested); BRD4181A build-only |
 | Mock | `mock` | `MockMac` | host-only `ParentMacDriver`; router/coordinator/Trust-Center tests |
 
 All real backends currently implement the End Device primitives. Only the
@@ -183,7 +183,7 @@ entropy). Optional behaviour is selected at compile time:
   beacon/orphan/association responses and indirect frame-pending;
 - the retained-RX depth `RX`.
 
-EFR32MG21 still has its own `MacDriver` implementation. See [Soft MAC Porting](../advanced/soft-mac-porting.md) for
+Every real backend now runs on `SoftMacCore`. See [Soft MAC Porting](../advanced/soft-mac-porting.md) for
 the `RadioPhy` contract and port status, and
 [Firmware Size](../advanced/firmware-size.md#mac-unification-footprint-baseline) for the per-image MAC footprint
 measured by `tools/mac-footprint.py`.

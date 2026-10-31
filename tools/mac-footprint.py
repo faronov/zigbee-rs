@@ -129,6 +129,8 @@ IMAGES: list[Image] = [
           "target/thumbv7em-none-eabi/release/efr32mg1-sensor"),
     Image("efr32mg21-sensor", "examples/efr32mg21-sensor",
           "target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor"),
+    Image("efr32mg22-sensor", "examples/efr32mg22-sensor",
+          "target/thumbv8m.main-none-eabihf/release/efr32mg22-sensor"),
     _esp("esp32c6", False),
     _esp("esp32c6", True),
     _esp("esp32h2", False),

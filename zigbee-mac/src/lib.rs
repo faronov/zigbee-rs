@@ -69,7 +69,7 @@ pub mod phy6222;
 #[cfg(feature = "efr32")]
 pub mod efr32;
 
-#[cfg(feature = "efr32mg21")]
+#[cfg(any(feature = "efr32mg21", feature = "efr32mg22"))]
 pub mod efr32s2;
 
 #[cfg(any(test, feature = "mock"))]

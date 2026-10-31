@@ -1,0 +1,25 @@
+[package]
+name = "efr32s2-hal"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust EFR32 Series 2 (EFR32MG21 / EFR32MG22) peripheral and radio support"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[features]
+# Exactly one chip must be selected.
+efr32mg21 = []
+efr32mg22 = []
+# Provide `__INTERRUPTS` for cortex-m-rt's `device` feature.
+rt = []
+# Embassy time driver on the RTCC (32,768 Hz, runs in EM2). Defines the
+# `RTCC` interrupt handler.
+time-driver = ["dep:embassy-time-driver", "dep:embassy-time-queue-utils"]
+
+[dependencies]
+cortex-m = "0.7"
+embedded-hal = "1.0"
+embedded-storage = "0.3"
+embassy-time-driver = { version = "0.2", optional = true }
+embassy-time-queue-utils = { version = "0.1", optional = true }

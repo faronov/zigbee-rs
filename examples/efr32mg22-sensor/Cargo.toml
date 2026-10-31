@@ -1,0 +1,52 @@
+[package]
+name = "efr32mg22-sensor"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autobins = false
+
+[[bin]]
+name = "efr32mg22-sensor"
+path = "src/main.rs"
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7", features = ["device"] }
+efr32mg22-devkit = { path = "../../boards/efr32mg22-devkit" }
+efr32mg22-sensor-product = { path = "../../products/efr32mg22-sensor" }
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg22", "rt", "time-driver"] }
+sensor-sed-app = { path = "../../apps/sensor-sed" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["efr32mg22"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["constrained-memory"] }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+# Embassy. `tick-hz-32_768` matches the RTCC that drives the HAL time
+# driver (`efr32s2-hal/time-driver`), which keeps counting in EM2.
+# `embassy-time-driver` is `links = "embassy-time"`: zigbee-mac's
+# embassy-time 0.4 and this crate's 0.5 share the same driver instance.
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
+embassy-futures = "0.1"
+embassy-time = "0.5"
+embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
+log = "0.4"
+static_cell = "2"
+
+[features]
+# Keep the debug interface powered in EM2 (SWD attach while asleep).
+# Off by default so EM2 current is representative.
+em2-debug = []
+# Lab: fill the stack with 0xCCCCCCCC at reset so the high-water mark can
+# be read over SWD (first non-pattern word above `__ebss`).
+stack-paint = ["cortex-m-rt/paint-stack"]
+
+[profile.dev]
+opt-level = "s"
+debug = true
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+lto = true
+debug = true
+panic = "abort"
