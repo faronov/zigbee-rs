@@ -215,6 +215,39 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
         Ok(self.current()?.map(|located| located.tag))
     }
 
+    /// Bind the commissioned state to one firmware role (router, end device,
+    /// sleepy end device, ...) sharing this journal.
+    ///
+    /// Several role images of one board share a single security journal so
+    /// that outgoing frame-counter reservations stay monotonic across a
+    /// reflash. Network state written by a *different* role must not be
+    /// resumed (a router would restore an end-device parent link, and the
+    /// coordinator's device type for this IEEE would be wrong), so when the
+    /// newest record carries another tag the commissioned state is cleared
+    /// while the counter limits are preserved, exactly like a factory reset.
+    ///
+    /// The selected tag is committed with that reset record and with every
+    /// later commit. Returns `true` when foreign state was cleared.
+    ///
+    /// Firmware that never selects a tag re-writes the tag of the record it
+    /// supersedes, so returning to such an image after a role image leaves the
+    /// role tag in place; leave the network before switching back to it.
+    pub fn select_role_tag(&mut self, tag: u16) -> Result<bool, SecurityStoreError> {
+        let Some(located) = self.current()? else {
+            self.product_tag = Some(tag);
+            return Ok(false);
+        };
+        self.product_tag = Some(tag);
+        if located.tag == tag {
+            return Ok(false);
+        }
+        let mut cleared = PersistentSecurityState::empty();
+        cleared.global_counter_limit = located.state.global_counter_limit;
+        cleared.tclk_counter_limit = located.state.tclk_counter_limit;
+        self.store(&cleared)?;
+        Ok(true)
+    }
+
     /// Tag for a new record: the selection, else the superseded record's.
     fn tag_for_commit(&self) -> u16 {
         self.product_tag
@@ -2082,6 +2115,49 @@ mod tests {
             journal.load().unwrap().unwrap().global_counter_limit,
             (SECURITY_JOURNAL_SLOTS_PER_SECTOR as u32 + 1) * 0x400
         );
+    }
+
+    #[test]
+    fn selecting_a_different_role_clears_state_but_keeps_counter_limits() {
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        // Empty journal: nothing to clear, tag is applied to the next commit.
+        assert_eq!(journal.select_role_tag(0x0001), Ok(false));
+        let mut joined = commissioned_state();
+        joined.global_counter_limit = 0x1400;
+        joined.tclk_counter_limit = 0x800;
+        journal.store(&joined).unwrap();
+        assert_eq!(journal.product_tag(), Ok(Some(0x0001)));
+
+        // Same role after a reboot: state is resumed untouched.
+        let mut journal = SecurityStateJournal::new(
+            journal.into_storage(),
+            0,
+            SECURITY_JOURNAL_SECTOR_SIZE as u32,
+        );
+        assert_eq!(journal.select_role_tag(0x0001), Ok(false));
+        assert_eq!(journal.load().unwrap(), Some(joined));
+
+        // A different role image: commissioned state is cleared, counters kept.
+        let mut journal = SecurityStateJournal::new(
+            journal.into_storage(),
+            0,
+            SECURITY_JOURNAL_SECTOR_SIZE as u32,
+        );
+        assert_eq!(journal.select_role_tag(0x0002), Ok(true));
+        let cleared = journal.load().unwrap().unwrap();
+        assert!(!cleared.commissioned);
+        assert_eq!(cleared.network_key, [0; 16]);
+        assert_eq!(cleared.global_counter_limit, 0x1400);
+        assert_eq!(cleared.tclk_counter_limit, 0x800);
+        assert_eq!(journal.product_tag(), Ok(Some(0x0002)));
+
+        // Legacy untagged records count as a foreign role.
+        let mut legacy =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        legacy.store(&commissioned_state()).unwrap();
+        assert_eq!(legacy.select_role_tag(0x0003), Ok(true));
+        assert!(!legacy.load().unwrap().unwrap().commissioned);
     }
 
     #[test]

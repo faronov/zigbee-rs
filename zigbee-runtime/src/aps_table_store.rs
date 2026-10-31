@@ -533,14 +533,17 @@ const RECORD_PREFIX_LEN: usize = APS_TABLE_JOURNAL_SLOT_SIZE - 8;
 const RECORD_COMMIT_OFFSET: usize = APS_TABLE_JOURNAL_SLOT_SIZE - 8;
 const RECORD_COMMIT: [u8; 4] = *b"CMIT";
 const LEGACY_SLOT_SIZE: usize = 1024;
-const LEGACY_SLOTS_PER_SECTOR: usize = APS_TABLE_JOURNAL_SECTOR_SIZE / LEGACY_SLOT_SIZE;
 const LEGACY_CRC_OFFSET: usize = LEGACY_SLOT_SIZE - 12;
 const LEGACY_COMMIT_OFFSET: usize = LEGACY_SLOT_SIZE - 8;
 
 const _: () = assert!(RECORD_ENCODED_OFFSET + MAX_ENCODED_APS_TABLES_LEN <= RECORD_CRC_OFFSET);
 
 /// Atomic two-sector APS table journal.
-pub struct ApsTableJournal<S> {
+///
+/// `SECTOR_SIZE` defaults to 4 KiB; products with larger erase pages select
+/// their sector size in the type, mirroring
+/// [`crate::security_journal::SecurityStateJournal`].
+pub struct ApsTableJournal<S, const SECTOR_SIZE: usize = APS_TABLE_JOURNAL_SECTOR_SIZE> {
     storage: S,
     sectors: [u32; 2],
     cached: Option<LocatedTables>,
@@ -554,8 +557,26 @@ struct LocatedTables {
     tables: PersistentApsTables,
 }
 
+impl<S, const SECTOR_SIZE: usize> ApsTableJournal<S, SECTOR_SIZE> {
+    /// Bytes in one configured logical journal sector.
+    pub const SECTOR_SIZE: usize = SECTOR_SIZE;
+    /// Committed-record slots in one configured journal sector.
+    pub const SLOTS_PER_SECTOR: usize = SECTOR_SIZE / APS_TABLE_JOURNAL_SLOT_SIZE;
+    const LEGACY_SLOTS_PER_SECTOR: usize = SECTOR_SIZE / LEGACY_SLOT_SIZE;
+}
+
 impl<S: NorFlash> ApsTableJournal<S> {
+    /// Construct the default 4 KiB-sector journal.
     pub const fn new(storage: S, first_sector: u32, second_sector: u32) -> Self {
+        Self::new_with_sector_size(storage, first_sector, second_sector)
+    }
+}
+
+impl<S: NorFlash, const SECTOR_SIZE: usize> ApsTableJournal<S, SECTOR_SIZE> {
+    /// Construct a journal whose two logical sectors are `SECTOR_SIZE` bytes.
+    pub const fn new_with_sector_size(storage: S, first_sector: u32, second_sector: u32) -> Self {
+        assert!(SECTOR_SIZE >= APS_TABLE_JOURNAL_SLOT_SIZE);
+        assert!(SECTOR_SIZE.is_multiple_of(APS_TABLE_JOURNAL_SLOT_SIZE));
         Self {
             storage,
             sectors: [first_sector, second_sector],
@@ -574,13 +595,13 @@ impl<S: NorFlash> ApsTableJournal<S> {
 
     fn geometry_ok(&self) -> bool {
         self.sectors[0] != self.sectors[1]
-            && self.sectors[0].abs_diff(self.sectors[1]) >= APS_TABLE_JOURNAL_SECTOR_SIZE as u32
+            && self.sectors[0].abs_diff(self.sectors[1]) >= SECTOR_SIZE as u32
             && S::READ_SIZE != 0
             && S::WRITE_SIZE != 0
             && S::ERASE_SIZE != 0
             && APS_TABLE_JOURNAL_SLOT_SIZE.is_multiple_of(S::READ_SIZE)
             && APS_TABLE_JOURNAL_SLOT_SIZE.is_multiple_of(S::WRITE_SIZE)
-            && APS_TABLE_JOURNAL_SECTOR_SIZE.is_multiple_of(S::ERASE_SIZE)
+            && SECTOR_SIZE.is_multiple_of(S::ERASE_SIZE)
             && RECORD_PREFIX_LEN.is_multiple_of(S::WRITE_SIZE)
             && RECORD_COMMIT_OFFSET.is_multiple_of(S::WRITE_SIZE)
             && RECORD_COMMIT.len().is_multiple_of(S::WRITE_SIZE)
@@ -590,7 +611,7 @@ impl<S: NorFlash> ApsTableJournal<S> {
                 .all(|sector| (*sector as usize).is_multiple_of(S::ERASE_SIZE))
             && self.sectors.iter().all(|sector| {
                 (*sector as usize)
-                    .checked_add(APS_TABLE_JOURNAL_SECTOR_SIZE)
+                    .checked_add(SECTOR_SIZE)
                     .is_some_and(|end| end <= self.storage.capacity())
             })
     }
@@ -673,7 +694,7 @@ impl<S: NorFlash> ApsTableJournal<S> {
         let mut newest: Option<LocatedTables> = None;
         let mut record = [0u8; APS_TABLE_JOURNAL_SLOT_SIZE];
         for sector in 0..2 {
-            for slot in 0..APS_TABLE_JOURNAL_SLOTS_PER_SECTOR {
+            for slot in 0..Self::SLOTS_PER_SECTOR {
                 self.read_slot(sector, slot, &mut record)?;
                 let Some((generation, tables)) = Self::decode_record(&record) else {
                     continue;
@@ -693,7 +714,7 @@ impl<S: NorFlash> ApsTableJournal<S> {
         if LEGACY_SLOT_SIZE.is_multiple_of(S::READ_SIZE) {
             let mut legacy = [0u8; LEGACY_SLOT_SIZE];
             for sector in 0..2 {
-                for slot in 0..LEGACY_SLOTS_PER_SECTOR {
+                for slot in 0..Self::LEGACY_SLOTS_PER_SECTOR {
                     self.storage
                         .read(
                             self.sectors[sector] + (slot * LEGACY_SLOT_SIZE) as u32,
@@ -732,7 +753,7 @@ impl<S: NorFlash> ApsTableJournal<S> {
 
     fn first_erased_slot(&mut self, sector: usize) -> Result<Option<usize>, ApsTableStoreError> {
         let mut record = [0u8; APS_TABLE_JOURNAL_SLOT_SIZE];
-        for slot in 0..APS_TABLE_JOURNAL_SLOTS_PER_SECTOR {
+        for slot in 0..Self::SLOTS_PER_SECTOR {
             self.read_slot(sector, slot, &mut record)?;
             if record.iter().all(|byte| *byte == 0xFF) {
                 return Ok(Some(slot));
@@ -802,7 +823,7 @@ impl<S: NorFlash> ApsTableJournal<S> {
     }
 }
 
-impl<S: NorFlash> ApsTableStore for ApsTableJournal<S> {
+impl<S: NorFlash, const SECTOR_SIZE: usize> ApsTableStore for ApsTableJournal<S, SECTOR_SIZE> {
     fn load(&mut self) -> Result<Option<PersistentApsTables>, ApsTableStoreError> {
         Ok(self.current()?.map(|located| located.tables))
     }
@@ -827,7 +848,7 @@ impl<S: NorFlash> ApsTableStore for ApsTableJournal<S> {
             let sector = self.sectors[target];
             let result = self
                 .storage
-                .erase(sector, sector + APS_TABLE_JOURNAL_SECTOR_SIZE as u32)
+                .erase(sector, sector + SECTOR_SIZE as u32)
                 .map_err(|_| ApsTableStoreError::Hardware)
                 .and_then(|()| self.write_record(target, 0, generation, tables));
             self.cache_result(&result, generation, target, tables);
@@ -837,7 +858,7 @@ impl<S: NorFlash> ApsTableStore for ApsTableJournal<S> {
         let sector = self.sectors[0];
         let result = self
             .storage
-            .erase(sector, sector + APS_TABLE_JOURNAL_SECTOR_SIZE as u32)
+            .erase(sector, sector + SECTOR_SIZE as u32)
             .map_err(|_| ApsTableStoreError::Hardware)
             .and_then(|()| self.write_record(0, 0, generation, tables));
         self.cache_result(&result, generation, 0, tables);
@@ -1065,5 +1086,121 @@ mod tests {
     fn invalid_journal_geometry_is_rejected() {
         let mut journal = ApsTableJournal::new(MockFlash::new(), 0, 0);
         assert_eq!(journal.load(), Err(ApsTableStoreError::Hardware));
+    }
+
+    // ── 8 KiB erase pages (EFR32 Series 2 internal flash) ──────────
+
+    const PAGE_8K: usize = 8 * 1024;
+
+    struct PageFlash8K {
+        bytes: std::vec::Vec<u8>,
+        programs_before_failure: Option<usize>,
+    }
+
+    impl PageFlash8K {
+        fn new() -> Self {
+            Self {
+                bytes: std::vec![0xFF; PAGE_8K * 2],
+                programs_before_failure: None,
+            }
+        }
+    }
+
+    impl ErrorType for PageFlash8K {
+        type Error = MockError;
+    }
+
+    impl ReadNorFlash for PageFlash8K {
+        const READ_SIZE: usize = 4;
+
+        fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+            let start = offset as usize;
+            let source = self
+                .bytes
+                .get(start..start + bytes.len())
+                .ok_or(MockError)?;
+            bytes.copy_from_slice(source);
+            Ok(())
+        }
+
+        fn capacity(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    impl NorFlash for PageFlash8K {
+        const WRITE_SIZE: usize = 4;
+        const ERASE_SIZE: usize = PAGE_8K;
+
+        fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+            if !(from as usize).is_multiple_of(PAGE_8K) || !(to as usize).is_multiple_of(PAGE_8K) {
+                return Err(MockError);
+            }
+            self.bytes
+                .get_mut(from as usize..to as usize)
+                .ok_or(MockError)?
+                .fill(0xFF);
+            Ok(())
+        }
+
+        fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+            if let Some(remaining) = self.programs_before_failure.as_mut() {
+                if *remaining == 0 {
+                    return Err(MockError);
+                }
+                *remaining -= 1;
+            }
+            let start = offset as usize;
+            if !start.is_multiple_of(4) || !bytes.len().is_multiple_of(4) {
+                return Err(MockError);
+            }
+            let destination = self
+                .bytes
+                .get_mut(start..start + bytes.len())
+                .ok_or(MockError)?;
+            for (dst, src) in destination.iter_mut().zip(bytes) {
+                *dst &= *src;
+            }
+            Ok(())
+        }
+    }
+
+    type Journal8K = ApsTableJournal<PageFlash8K, PAGE_8K>;
+
+    fn journal_8k(flash: PageFlash8K) -> Journal8K {
+        Journal8K::new_with_sector_size(flash, 0, PAGE_8K as u32)
+    }
+
+    #[test]
+    fn default_journal_rejects_8k_erase_pages() {
+        let mut journal = ApsTableJournal::new(PageFlash8K::new(), 0, PAGE_8K as u32);
+        assert_eq!(journal.load(), Err(ApsTableStoreError::Hardware));
+    }
+
+    #[test]
+    fn journal_8k_rolls_over_and_survives_interruption() {
+        assert_eq!(Journal8K::SLOTS_PER_SECTOR, 4);
+        let mut journal = journal_8k(PageFlash8K::new());
+        let mut expected = snapshot();
+        // Ten commits: two rollovers across the 8 KiB pages.
+        for round in 0..10u8 {
+            if round < 5 {
+                assert!(expected.groups.add_group(0x1234, 3 + round));
+            }
+            journal.store(&expected).unwrap();
+        }
+        let mut flash = journal.into_storage();
+        flash.programs_before_failure = Some(1);
+        let mut interrupted = journal_8k(flash);
+        let mut replacement = expected.clone();
+        assert!(replacement.groups.add_group(0x1234, 20));
+        assert_eq!(
+            interrupted.store(&replacement),
+            Err(ApsTableStoreError::Hardware)
+        );
+        let mut flash = interrupted.into_storage();
+        flash.programs_before_failure = None;
+        let mut reopened = journal_8k(flash);
+        assert_eq!(reopened.load(), Ok(Some(expected)));
     }
 }

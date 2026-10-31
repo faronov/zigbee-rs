@@ -888,7 +888,7 @@ const _: () = assert!(RECORD_CRC_OFFSET + 4 <= RECORD_PREFIX_LEN + 4);
 /// commit marker written last, so an interrupted write is skipped on the next
 /// scan and the previous generation survives. It runs on its **own** two
 /// sectors, entirely separate from the security journal's.
-pub struct ChildTableJournal<S> {
+pub struct ChildTableJournal<S, const SECTOR_SIZE: usize = CHILD_JOURNAL_SECTOR_SIZE> {
     storage: S,
     sectors: [u32; 2],
     cached: Option<LocatedTable>,
@@ -902,9 +902,30 @@ struct LocatedTable {
     table: PersistentChildTable,
 }
 
+impl<S, const SECTOR_SIZE: usize> ChildTableJournal<S, SECTOR_SIZE> {
+    /// Bytes in one configured logical journal sector.
+    pub const SECTOR_SIZE: usize = SECTOR_SIZE;
+    /// Committed-record slots in one configured journal sector.
+    pub const SLOTS_PER_SECTOR: usize = SECTOR_SIZE / CHILD_JOURNAL_SLOT_SIZE;
+}
+
 impl<S: NorFlash> ChildTableJournal<S> {
-    /// Create a journal spanning two distinct erase sectors of `storage`.
+    /// Create a default 4 KiB-sector journal spanning two distinct erase
+    /// sectors of `storage`.
+    ///
+    /// Products whose erase unit is larger select it in the type and use
+    /// [`Self::new_with_sector_size`], mirroring
+    /// [`crate::security_journal::SecurityStateJournal`].
     pub const fn new(storage: S, first_sector: u32, second_sector: u32) -> Self {
+        Self::new_with_sector_size(storage, first_sector, second_sector)
+    }
+}
+
+impl<S: NorFlash, const SECTOR_SIZE: usize> ChildTableJournal<S, SECTOR_SIZE> {
+    /// Create a journal whose two logical sectors are `SECTOR_SIZE` bytes.
+    pub const fn new_with_sector_size(storage: S, first_sector: u32, second_sector: u32) -> Self {
+        assert!(SECTOR_SIZE >= CHILD_JOURNAL_SLOT_SIZE);
+        assert!(SECTOR_SIZE.is_multiple_of(CHILD_JOURNAL_SLOT_SIZE));
         Self {
             storage,
             sectors: [first_sector, second_sector],
@@ -983,7 +1004,7 @@ impl<S: NorFlash> ChildTableJournal<S> {
         let mut newest: Option<LocatedTable> = None;
         let mut record = [0u8; CHILD_JOURNAL_SLOT_SIZE];
         for sector in 0..2 {
-            for slot in 0..CHILD_JOURNAL_SLOTS_PER_SECTOR {
+            for slot in 0..Self::SLOTS_PER_SECTOR {
                 self.read_slot(sector, slot, &mut record)?;
                 let Some((generation, table)) = Self::decode_record(&record) else {
                     continue;
@@ -1006,13 +1027,13 @@ impl<S: NorFlash> ChildTableJournal<S> {
 
     fn geometry_ok(&self) -> bool {
         self.sectors[0] != self.sectors[1]
-            && self.sectors[0].abs_diff(self.sectors[1]) >= CHILD_JOURNAL_SECTOR_SIZE as u32
+            && self.sectors[0].abs_diff(self.sectors[1]) >= SECTOR_SIZE as u32
             && S::READ_SIZE != 0
             && S::WRITE_SIZE != 0
             && S::ERASE_SIZE != 0
             && CHILD_JOURNAL_SLOT_SIZE.is_multiple_of(S::READ_SIZE)
             && CHILD_JOURNAL_SLOT_SIZE.is_multiple_of(S::WRITE_SIZE)
-            && CHILD_JOURNAL_SECTOR_SIZE.is_multiple_of(S::ERASE_SIZE)
+            && SECTOR_SIZE.is_multiple_of(S::ERASE_SIZE)
             && RECORD_PREFIX_LEN.is_multiple_of(S::WRITE_SIZE)
             && RECORD_COMMIT_OFFSET.is_multiple_of(S::WRITE_SIZE)
             && RECORD_COMMIT.len().is_multiple_of(S::WRITE_SIZE)
@@ -1020,7 +1041,7 @@ impl<S: NorFlash> ChildTableJournal<S> {
             && (self.sectors[1] as usize).is_multiple_of(S::ERASE_SIZE)
             && self.sectors.iter().all(|sector| {
                 (*sector as usize)
-                    .checked_add(CHILD_JOURNAL_SECTOR_SIZE)
+                    .checked_add(SECTOR_SIZE)
                     .is_some_and(|end| end <= self.storage.capacity())
             })
     }
@@ -1038,7 +1059,7 @@ impl<S: NorFlash> ChildTableJournal<S> {
 
     fn first_erased_slot(&mut self, sector: usize) -> Result<Option<usize>, ChildStoreError> {
         let mut record = [0u8; CHILD_JOURNAL_SLOT_SIZE];
-        for slot in 0..CHILD_JOURNAL_SLOTS_PER_SECTOR {
+        for slot in 0..Self::SLOTS_PER_SECTOR {
             self.read_slot(sector, slot, &mut record)?;
             if record.iter().all(|byte| *byte == 0xFF) {
                 return Ok(Some(slot));
@@ -1092,7 +1113,7 @@ impl<S: NorFlash> ChildTableJournal<S> {
     }
 }
 
-impl<S: NorFlash> ChildTableStore for ChildTableJournal<S> {
+impl<S: NorFlash, const SECTOR_SIZE: usize> ChildTableStore for ChildTableJournal<S, SECTOR_SIZE> {
     fn load(&mut self) -> Result<Option<PersistentChildTable>, ChildStoreError> {
         Ok(self.current()?.map(|located| located.table))
     }
@@ -1117,7 +1138,7 @@ impl<S: NorFlash> ChildTableStore for ChildTableJournal<S> {
             let sector = self.sectors[target];
             let result = self
                 .storage
-                .erase(sector, sector + CHILD_JOURNAL_SECTOR_SIZE as u32)
+                .erase(sector, sector + SECTOR_SIZE as u32)
                 .map_err(|_| ChildStoreError::Hardware)
                 .and_then(|()| self.write_record(target, 0, generation, table));
             self.cache_result(&result, generation, target, table);
@@ -1127,7 +1148,7 @@ impl<S: NorFlash> ChildTableStore for ChildTableJournal<S> {
         let sector = self.sectors[0];
         let result = self
             .storage
-            .erase(sector, sector + CHILD_JOURNAL_SECTOR_SIZE as u32)
+            .erase(sector, sector + SECTOR_SIZE as u32)
             .map_err(|_| ChildStoreError::Hardware)
             .and_then(|()| self.write_record(0, 0, generation, table));
         self.cache_result(&result, generation, 0, table);
@@ -1135,7 +1156,7 @@ impl<S: NorFlash> ChildTableStore for ChildTableJournal<S> {
     }
 }
 
-impl<S: NorFlash> ChildTableJournal<S> {
+impl<S: NorFlash, const SECTOR_SIZE: usize> ChildTableJournal<S, SECTOR_SIZE> {
     fn cache_result(
         &mut self,
         result: &Result<(), ChildStoreError>,
@@ -1583,5 +1604,143 @@ mod tests {
         // Overlapping sectors: no durable persistence is possible.
         let mut store = ChildTableJournal::new(MockFlash::new(), 0, 0);
         assert_eq!(store.load(), Err(ChildStoreError::Hardware));
+    }
+
+    // ── 8 KiB erase pages (EFR32 Series 2 internal flash) ──────────
+
+    const PAGE_8K: usize = 8 * 1024;
+
+    /// Word-programmed flash with 8 KiB erase pages and an optional
+    /// injected program failure.
+    struct PageFlash8K {
+        data: std::vec::Vec<u8>,
+        programs_before_failure: Option<usize>,
+    }
+
+    impl PageFlash8K {
+        fn new() -> Self {
+            Self {
+                data: std::vec![0xFF; PAGE_8K * 2],
+                programs_before_failure: None,
+            }
+        }
+    }
+
+    impl ErrorType for PageFlash8K {
+        type Error = NorFlashErrorKind;
+    }
+
+    impl ReadNorFlash for PageFlash8K {
+        const READ_SIZE: usize = 4;
+
+        fn read(&mut self, address: u32, output: &mut [u8]) -> Result<(), Self::Error> {
+            let start = address as usize;
+            let end = start + output.len();
+            if end > self.data.len() {
+                return Err(NorFlashErrorKind::OutOfBounds);
+            }
+            output.copy_from_slice(&self.data[start..end]);
+            Ok(())
+        }
+
+        fn capacity(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    impl NorFlash for PageFlash8K {
+        const WRITE_SIZE: usize = 4;
+        const ERASE_SIZE: usize = PAGE_8K;
+
+        fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
+            if let Some(remaining) = self.programs_before_failure.as_mut() {
+                if *remaining == 0 {
+                    return Err(NorFlashErrorKind::Other);
+                }
+                *remaining -= 1;
+            }
+            let start = address as usize;
+            let end = start + data.len();
+            if end > self.data.len() || !start.is_multiple_of(4) || !data.len().is_multiple_of(4) {
+                return Err(NorFlashErrorKind::NotAligned);
+            }
+            for (old, new) in self.data[start..end].iter_mut().zip(data) {
+                *old &= *new;
+            }
+            Ok(())
+        }
+
+        fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+            let (start, end) = (from as usize, to as usize);
+            if !start.is_multiple_of(PAGE_8K)
+                || !end.is_multiple_of(PAGE_8K)
+                || start >= end
+                || end > self.data.len()
+            {
+                return Err(NorFlashErrorKind::NotAligned);
+            }
+            self.data[start..end].fill(0xFF);
+            Ok(())
+        }
+    }
+
+    type Journal8K = ChildTableJournal<PageFlash8K, PAGE_8K>;
+
+    fn journal_8k(flash: PageFlash8K) -> Journal8K {
+        Journal8K::new_with_sector_size(flash, 0, PAGE_8K as u32)
+    }
+
+    #[test]
+    fn default_journal_rejects_8k_erase_pages() {
+        let mut store = ChildTableJournal::new(PageFlash8K::new(), 0, PAGE_8K as u32);
+        assert_eq!(store.load(), Err(ChildStoreError::Hardware));
+    }
+
+    #[test]
+    fn journal_8k_survives_rollover_and_reopen() {
+        assert_eq!(Journal8K::SLOTS_PER_SECTOR, 16);
+        let mut store = journal_8k(PageFlash8K::new());
+        assert_eq!(store.load(), Ok(None));
+        // Three full sectors' worth of commits forces two rollovers.
+        let mut last = table(&[]);
+        for round in 0..(Journal8K::SLOTS_PER_SECTOR * 3) as u16 {
+            last = table(&[child(1, 0x0002 + round, (round % 15) as u8)]);
+            store.store(&last).unwrap();
+        }
+        let mut reopened = journal_8k(store.into_storage());
+        assert_eq!(reopened.load(), Ok(Some(last)));
+    }
+
+    #[test]
+    fn journal_8k_interrupted_commit_keeps_previous_generation() {
+        let mut store = journal_8k(PageFlash8K::new());
+        let good = table(&[child(1, 0x0002, 14)]);
+        store.store(&good).unwrap();
+        let mut flash = store.into_storage();
+        flash.programs_before_failure = Some(1);
+        let mut store = journal_8k(flash);
+        assert_eq!(
+            store.store(&table(&[child(9, 0x0009, 0)])),
+            Err(ChildStoreError::Hardware)
+        );
+        let mut flash = store.into_storage();
+        flash.programs_before_failure = None;
+        let mut reopened = journal_8k(flash);
+        assert_eq!(reopened.load(), Ok(Some(good)));
+    }
+
+    #[test]
+    fn journal_8k_erased_and_corrupt_records_are_ignored() {
+        let mut store = journal_8k(PageFlash8K::new());
+        let good = table(&[child(2, 0x0003, 8)]);
+        store.store(&good).unwrap();
+        let mut flash = store.into_storage();
+        // Corrupt a CRC-covered byte of a second, otherwise valid record.
+        let mut second = journal_8k(flash);
+        second.store(&table(&[child(3, 0x0004, 8)])).unwrap();
+        flash = second.into_storage();
+        flash.data[CHILD_JOURNAL_SLOT_SIZE + RECORD_ENCODED_OFFSET] ^= 0x01;
+        let mut reopened = journal_8k(flash);
+        assert_eq!(reopened.load(), Ok(Some(good)));
     }
 }
