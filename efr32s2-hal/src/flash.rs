@@ -1,4 +1,11 @@
-//! EFR32MG21 Series 2 MSC flash controller.
+//! EFR32 Series 2 (xG21/xG22) MSC flash controller.
+//!
+//! Sequencing follows GSDK 4.5 `em_msc.c` (`writeBurst`, `mscStatusWait`):
+//! `STATUS.TIMEOUT` only reports that a burst ended because `WDATA` arrived
+//! late (the next word starts a new write); it is not an error. Every
+//! programmed burst is read back and compared, so a silently dropped word
+//! is still reported. Hardware-proven on EFR32MG22 (BRD4183A) by the
+//! security journal of `examples/efr32mg22-sensor`.
 
 use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
@@ -24,7 +31,6 @@ const MSC_STATUS_LOCKED: u32 = 1 << 1;
 const MSC_STATUS_INVADDR: u32 = 1 << 2;
 const MSC_STATUS_WDATAREADY: u32 = 1 << 3;
 const MSC_STATUS_PENDING: u32 = 1 << 5;
-const MSC_STATUS_TIMEOUT: u32 = 1 << 6;
 const MSC_STATUS_REGLOCK: u32 = 1 << 16;
 const MSC_LOCK_LOCKKEY_UNLOCK: u32 = 0x1B71;
 const MSC_LOCK_LOCKKEY_LOCK: u32 = 0;
@@ -121,12 +127,28 @@ impl NorFlash for Efr32s2Flash {
         while !remaining.is_empty() {
             let page_remaining = FLASH_PAGE_SIZE - address as usize % FLASH_PAGE_SIZE;
             let burst_len = remaining.len().min(page_remaining);
-            program_burst_ram(address, &remaining[..burst_len])?;
+            let burst = &remaining[..burst_len];
+            program_burst_ram(address, burst)?;
+            verify(address, burst)?;
             address += burst_len as u32;
             remaining = &remaining[burst_len..];
         }
         Ok(())
     }
+}
+
+/// Read back a programmed burst.
+fn verify(offset: u32, bytes: &[u8]) -> Result<(), FlashError> {
+    #[cfg(all(target_arch = "arm", target_os = "none"))]
+    for (index, expected) in bytes.iter().enumerate() {
+        let actual = unsafe { core::ptr::read_volatile((offset + index as u32) as *const u8) };
+        if actual != *expected {
+            return Err(FlashError::Controller);
+        }
+    }
+    #[cfg(not(all(target_arch = "arm", target_os = "none")))]
+    let _ = (offset, bytes);
+    Ok(())
 }
 
 #[inline(never)]
@@ -219,10 +241,7 @@ fn wait_series2_ready_ram() -> Result<(), FlashError> {
     for _ in 0..PROGRAM_TIMEOUT {
         let status = unsafe { core::ptr::read_volatile(MSC_STATUS as *const u32) };
         if status & (MSC_STATUS_BUSY | MSC_STATUS_PENDING) == 0 {
-            return if status
-                & (MSC_STATUS_LOCKED | MSC_STATUS_INVADDR | MSC_STATUS_TIMEOUT | MSC_STATUS_REGLOCK)
-                != 0
-            {
+            return if status & (MSC_STATUS_LOCKED | MSC_STATUS_INVADDR | MSC_STATUS_REGLOCK) != 0 {
                 Err(FlashError::Controller)
             } else {
                 Ok(())
