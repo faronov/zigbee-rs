@@ -19,7 +19,7 @@ use embassy_time::{Duration, Instant, Timer};
 use static_cell::StaticCell;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_bdb::attributes::{BDB_POPULAR_CHANNEL_FALLBACK_SET, BDB_POPULAR_CHANNEL_SET};
-use zigbee_mac::efr32::Efr32Mac;
+use zigbee_mac::efr32::{Efr32Mac, Efr32RadioPhy};
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::event_loop::{StackEvent, TickResult};
 use zigbee_runtime::power::PowerMode;
@@ -232,7 +232,7 @@ impl JoinApp {
             BDB_POPULAR_CHANNEL_FALLBACK_SET;
         if self.device.bdb_mut().network_steering().await.is_err() {
             let (started, completed, failed, dsn, state) =
-                self.device.mac_mut().software_ack_snapshot();
+                self.device.mac_mut().phy().software_ack_snapshot();
             rtt_target::rprintln!("[EFR32][diag-join] network_steering=err");
             rtt_target::rprintln!(
                 "[EFR32][diag-join] sw_ack {}/{}/{} dsn={} state={}",
@@ -269,7 +269,7 @@ impl JoinApp {
             nib.pan_id.0
         );
         let (started, completed, failed, dsn, state) =
-            self.device.mac_mut().software_ack_snapshot();
+            self.device.mac_mut().phy().software_ack_snapshot();
         rtt_target::rprintln!(
             "[EFR32][diag-join] sw_ack={}/{}/{} dsn={} state={}",
             started,
@@ -359,8 +359,22 @@ impl JoinApp {
         }
     }
 
+    fn radio_sleep(&mut self) {
+        if self.device.mac_mut().sleep().is_err() {
+            rtt_target::rprintln!("[EFR32][diag-join] radio_sleep=err");
+            platform::halt();
+        }
+    }
+
+    fn radio_wake(&mut self) {
+        if self.device.mac_mut().wake().is_err() {
+            rtt_target::rprintln!("[EFR32][diag-join] radio_wake=err");
+            platform::halt();
+        }
+    }
+
     fn sleep_joined_until_next_poll(&mut self) {
-        self.device.mac_mut().radio_sleep();
+        self.radio_sleep();
         cortex_m::peripheral::NVIC::unpend(vectors::Interrupt::FrcPri);
 
         if JOIN_METRICS
@@ -408,7 +422,7 @@ impl JoinApp {
             let now = Instant::now();
             let poll_ms = self.poll_interval_ms(now);
             if self.device.is_joined() {
-                self.device.mac_mut().radio_wake();
+                self.radio_wake();
                 if poll_ms == FAST_POLL_MS {
                     self.direct_rx(poll_ms).await;
                 }
@@ -421,9 +435,9 @@ impl JoinApp {
                     self.sleep_joined_until_next_poll();
                 }
             } else {
-                self.device.mac_mut().radio_sleep();
+                self.radio_sleep();
                 Timer::after(Duration::from_millis(poll_ms)).await;
-                self.device.mac_mut().radio_wake();
+                self.radio_wake();
                 platform::led_on();
                 Timer::after(Duration::from_millis(80)).await;
                 platform::led_off();
@@ -440,17 +454,23 @@ fn build_app() -> &'static mut JoinApp {
         rtt_target::rprintln!("[EFR32][join] PERIPHERALS_TAKEN");
         platform::halt()
     });
-    let mut mac = Efr32Mac::new();
-    mac.install_aes_engine(chip.crypto).unwrap_or_else(|error| {
+    let mut phy = Efr32RadioPhy::new();
+    phy.install_aes_engine(chip.crypto).unwrap_or_else(|error| {
         rtt_target::rprintln!("[EFR32][join] AES_KAT_FAIL error={:?}", error);
         platform::halt()
     });
-    let mut ieee = mac.extended_address();
+    let mut ieee = Efr32RadioPhy::read_factory_ieee();
     let eui_variant = unsafe { core::ptr::read_volatile(&JOIN_EUI_VARIANT) };
     ieee[0] ^= 0x01;
     ieee[1] ^= eui_variant;
     ieee[7] = (ieee[7] | 0x02) & 0xFE;
-    let device = ZigbeeDevice::builder(mac.with_extended_address(ieee))
+    let mac = phy
+        .into_soft_mac_with_address(ieee)
+        .unwrap_or_else(|error| {
+            rtt_target::rprintln!("[EFR32][join] MAC_INIT_FAIL error={:?}", error);
+            platform::halt()
+        });
+    let device = ZigbeeDevice::builder(mac)
         .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: 1_000,

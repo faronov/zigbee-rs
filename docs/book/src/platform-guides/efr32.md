@@ -76,6 +76,12 @@ Recorded measurement (2026-10-31, local build of `7d45e7e`):
 | static total | 15,344 |
 | available linked stack | 16,400 |
 
+After the move to the shared `SoftMacCore` (`Efr32Mac` =
+`SoftMacCore<Efr32RadioPhy, EndDevice, 1>`, build- and layout-checked only),
+the raw image is 174,084 B, `.bss` is 14,736 B and the linked stack is
+16,720 B (336 B above the 16 KiB gate). See
+[Firmware size](../advanced/firmware-size.md#phase-b-efr32mg1-approved-flash-exception).
+
 The former image-size budget is no longer enforced; physical Flash/RAM,
 protected-partition, OTA, and stack checks remain mandatory.
 The stack has only 16 B above the 16 KiB gate. The previous 162,538 B Zigbee OTA

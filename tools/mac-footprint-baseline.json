@@ -1,7 +1,7 @@
 [
 {"image": "bl702-sensor", "flash": 220814, "text": 214342, "data": 0, "bss": 16592, "pool": 16388, "mac_code": 11982, "stack": 26832, "mac_chain": 25184, "mac_stack": 672, "mac_frame": 352},
 {"image": "cc2340-sensor-fallback", "flash": 221220, "text": 190920, "data": 8, "bss": 7540, "pool": 5256, "mac_code": 13788, "stack": 22448, "mac_chain": 21704, "mac_stack": 840, "mac_frame": 400},
-{"image": "efr32mg1-sensor", "flash": 171796, "text": 162828, "data": 0, "bss": 15056, "pool": 6928, "mac_code": 6759, "stack": 27892, "mac_chain": 26156, "mac_stack": 1332, "mac_frame": 584},
+{"image": "efr32mg1-sensor", "flash": 174080, "text": 165036, "data": 0, "bss": 14736, "pool": 2800, "mac_code": 9559, "stack": 27564, "mac_chain": 26004, "mac_stack": 688, "mac_frame": 352},
 {"image": "efr32mg21-sensor", "flash": 208832, "text": 177048, "data": 0, "bss": 18888, "pool": 11040, "mac_code": 6903, "stack": 25524, "mac_chain": 23612, "mac_stack": 1732, "mac_frame": 1072},
 {"image": "esp32c6-sensor", "flash": 390428, "text": 322012, "data": 3512, "bss": 53124, "pool": 0, "mac_code": 12558, "stack": 36112, "mac_chain": 30720, "mac_stack": 7136, "mac_frame": 5728},
 {"image": "esp32c6-sensor-light-sleep", "flash": 400944, "text": 331088, "data": 3712, "bss": 53124, "pool": 0, "mac_code": 12416, "stack": 36336, "mac_chain": 30944, "mac_stack": 7168, "mac_frame": 5728},

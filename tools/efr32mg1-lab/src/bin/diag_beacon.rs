@@ -14,7 +14,7 @@ mod vectors;
 use cortex_m as _;
 use embassy_time::{Duration, Timer};
 use zigbee_mac::MacDriver;
-use zigbee_mac::efr32::Efr32Mac;
+use zigbee_mac::efr32::{Efr32Mac, Efr32RadioPhy};
 use zigbee_mac::frames::build_beacon_request;
 use zigbee_mac::pib::{PibAttribute, PibValue};
 use zigbee_mac::primitives::{MlmeScanRequest, ScanType};
@@ -54,7 +54,7 @@ async fn known_tx(mac: &mut Efr32Mac) -> bool {
         request.len(),
         TEST_SEQ
     );
-    match mac.debug_transmit_raw(&request).await {
+    match mac.phy_mut().debug_transmit_raw(&request).await {
         Ok(()) => {
             rtt_target::rprintln!("[EFR32][diag-beacon] TX_ONLY_PASS scan_gate=open");
             true
@@ -78,7 +78,7 @@ async fn run(mut mac: Efr32Mac) -> ! {
         Timer::after(Duration::from_millis(100)).await;
     }
     Timer::after(Duration::from_secs(5)).await;
-    mac.debug_radio_snapshot("init");
+    mac.phy().debug_radio_snapshot("init");
 
     if !known_tx(&mut mac).await {
         platform::led_on();
@@ -96,7 +96,7 @@ async fn run(mut mac: Efr32Mac) -> ! {
         channel_mask.0
     );
     loop {
-        mac.debug_radio_snapshot("before-scan");
+        mac.phy().debug_radio_snapshot("before-scan");
         match mac
             .mlme_scan(MlmeScanRequest {
                 scan_type: ScanType::Active,
@@ -106,7 +106,7 @@ async fn run(mut mac: Efr32Mac) -> ! {
             .await
         {
             Ok(confirm) => {
-                mac.debug_radio_snapshot("after-scan");
+                mac.phy().debug_radio_snapshot("after-scan");
                 rtt_target::rprintln!(
                     "[EFR32][diag-beacon] Scan done: {} beacon(s)",
                     confirm.pan_descriptors.len()
@@ -128,12 +128,21 @@ async fn run(mut mac: Efr32Mac) -> ! {
                 }
             }
             Err(error) => {
-                mac.debug_radio_snapshot("scan-error");
+                mac.phy().debug_radio_snapshot("scan-error");
                 rtt_target::rprintln!("[EFR32][diag-beacon] Scan error: {:?}", error);
             }
         }
         Timer::after(Duration::from_secs(2)).await;
     }
+}
+
+fn build_mac() -> Efr32Mac {
+    Efr32RadioPhy::new()
+        .into_soft_mac()
+        .unwrap_or_else(|error| {
+            rtt_target::rprintln!("[EFR32] MAC_INIT_FAIL error={:?}", error);
+            platform::halt()
+        })
 }
 
 #[cortex_m_rt::entry]
@@ -146,5 +155,5 @@ fn main() -> ! {
         static_cell::StaticCell::new();
     EXECUTOR
         .init(embassy_executor::Executor::new())
-        .run(|spawner| spawner.must_spawn(run(Efr32Mac::new())))
+        .run(|spawner| spawner.must_spawn(run(build_mac())))
 }

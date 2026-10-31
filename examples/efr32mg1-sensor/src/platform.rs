@@ -187,6 +187,7 @@ pub enum WakeError {
     UnsupportedSleepDepth,
     Power,
     Clock,
+    Radio,
 }
 
 /// RTCC-backed atomic wait for the shared sensor lifecycle.
@@ -228,7 +229,7 @@ impl Efr32WakeController {
         }
 
         clear_button_waker();
-        mac.radio_sleep();
+        mac.sleep().map_err(|_| WakeError::Radio)?;
         cortex_m::peripheral::NVIC::unpend(vectors::Interrupt::FrcPri);
 
         let ticks = pm::ms_to_ticks(timeout_ms.max(1), pm::LFRCO_HZ).max(1);
@@ -241,13 +242,15 @@ impl Efr32WakeController {
         // clock and radio.
         let dcdc_result = pm::apply_dcdc_lnhs_workaround().map_err(|_| WakeError::Power);
         let clock_result = efr32mg1_tradfri::init_clocks().map_err(|_| WakeError::Clock);
-        if clock_result.is_ok() {
-            mac.radio_wake();
-        }
+        let radio_result = match clock_result {
+            Ok(()) => mac.wake().map_err(|_| WakeError::Radio),
+            Err(_) => Ok(()),
+        };
 
         sleep_result?;
         dcdc_result?;
         clock_result?;
+        radio_result?;
 
         if take_button_edge() {
             Ok(WakeReason::Button)

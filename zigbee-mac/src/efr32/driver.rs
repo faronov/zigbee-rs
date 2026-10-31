@@ -638,14 +638,6 @@ static SOFTWARE_ACK_LAST_RAC_STATE: AtomicU8 = AtomicU8::new(RAC_STATE_OFF as u8
 
 // ── Public types ────────────────────────────────────────────────
 
-/// Received 802.15.4 frame.
-pub struct RxFrame {
-    pub data: [u8; MAX_FRAME_LEN],
-    pub len: usize,
-    pub rssi: i8,
-    pub lqi: u8,
-}
-
 /// Radio configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct RadioConfig {
@@ -697,10 +689,8 @@ pub enum RadioError {
 pub struct Efr32Driver {
     config: RadioConfig,
     initialized: bool,
+    /// RSSI (dBm) sampled by the last CCA, for energy detection.
     last_cca_rssi: i8,
-    last_cca_status: u32,
-    last_cca_rac_state: u8,
-    cca_samples: u16,
 }
 
 impl Efr32Driver {
@@ -713,9 +703,6 @@ impl Efr32Driver {
             config,
             initialized: false,
             last_cca_rssi: -128,
-            last_cca_status: 0,
-            last_cca_rac_state: RAC_STATE_OFF as u8,
-            cca_samples: 0,
         };
         drv.init_hardware();
         drv
@@ -1547,7 +1534,11 @@ impl Efr32Driver {
     fn apply_config(&self) {
         self.set_channel(self.config.channel);
         self.set_tx_power(self.config.tx_power);
+        self.apply_ack_filter();
+    }
 
+    /// Publish the software-ACK destination filter to the FRC IRQ.
+    fn apply_ack_filter(&self) {
         SOFTWARE_ACK_ENABLED.store(!self.config.promiscuous, Ordering::Release);
         SOFTWARE_ACK_PAN_ID.store(self.config.pan_id as u32, Ordering::Release);
         SOFTWARE_ACK_SHORT_ADDRESS.store(self.config.short_address as u32, Ordering::Release);
@@ -1585,6 +1576,45 @@ impl Efr32Driver {
         if self.initialized {
             self.apply_config();
         }
+    }
+
+    /// Retune the synthesizer (with its PLL settle spin) only when `channel`
+    /// differs from the current configuration. Returns whether it changed.
+    pub fn retune(&mut self, channel: u8) -> bool {
+        if self.config.channel == channel {
+            return false;
+        }
+        self.config.channel = channel;
+        if self.initialized {
+            self.set_channel(channel);
+        }
+        true
+    }
+
+    /// Reprogram the PA only when `dbm` differs from the current setting.
+    pub fn set_power(&mut self, dbm: i8) {
+        if self.config.tx_power != dbm {
+            self.config.tx_power = dbm;
+            if self.initialized {
+                self.set_tx_power(dbm);
+            }
+        }
+    }
+
+    /// Update the FRC-IRQ software-ACK filter without touching the
+    /// synthesizer or PA.
+    pub fn set_ack_filter(
+        &mut self,
+        promiscuous: bool,
+        pan_id: u16,
+        short_address: u16,
+        extended_address: [u8; 8],
+    ) {
+        self.config.promiscuous = promiscuous;
+        self.config.pan_id = pan_id;
+        self.config.short_address = short_address;
+        self.config.extended_address = extended_address;
+        self.apply_ack_filter();
     }
 
     #[inline(always)]
@@ -1867,148 +1897,81 @@ impl Efr32Driver {
         }
     }
 
-    /// ACK wait after TX.
-    ///
-    /// transmit() already enabled RX immediately after TX_DONE.
-    /// This just waits for the ISR to signal RX_DONE and reads the data.
-    pub async fn receive_ack(&mut self) -> Result<RxFrame, RadioError> {
-        if !self.initialized {
-            return Err(RadioError::NotInitialized);
-        }
-
-        // RX was already enabled in transmit() right after TX_DONE.
-        // RX_DONE was reset in transmit() before TXEN.
-        // Just wait for the ISR to receive the ACK frame.
-        RX_DONE.wait().await;
-
-        if !RX_CRC_OK.load(Ordering::Acquire) {
-            return Err(RadioError::CrcError);
-        }
-
-        let len = RX_LEN.load(Ordering::Acquire) as usize;
-        if len == 0 {
-            return Err(RadioError::RxTimeout);
-        }
-
-        let rssi = RX_RSSI.load(Ordering::Acquire);
-
-        let mut frame = RxFrame {
-            data: [0u8; MAX_FRAME_LEN],
-            len: 0,
-            rssi,
-            lqi: rssi_to_lqi(rssi),
-        };
-
-        unsafe {
-            let buf = &*RX_BUF.get();
-            if len > 1 {
-                let phr = (buf[0] & 0x7F) as usize;
-                let data_len = if phr > 2 { phr - 2 } else { 0 };
-                let data_len = data_len.min(len - 1).min(MAX_FRAME_LEN);
-                frame.data[..data_len].copy_from_slice(&buf[1..1 + data_len]);
-                frame.len = data_len;
-            }
-        }
-
-        // Re-arm RX before task-level ACK processing/logging. Indirect data
-        // may follow the ACK within a few milliseconds.
-        self.start_rx();
-
-        #[cfg(feature = "efr32-trace")]
-        if frame.len >= 3 && (u16::from_le_bytes([frame.data[0], frame.data[1]]) & 0x07) == 0x02 {
-            efr32_trace!(
-                "[EFR32][ack-rearm] RAC_STATUS={:#010X} RXENSRCEN={:#010X} FRC_STATUS={:#010X} FRC_IF={:#010X} BUFC1={:#010X} BUFC2={:#010X}",
-                reg_read(RAC_STATUS),
-                reg_read(_RAC_RXENSRCEN),
-                reg_read(_FRC_STATUS),
-                reg_read(FRC_IF),
-                reg_read(BUFC_BUF1_STATUS),
-                reg_read(_BUFC_BUF2_STATUS)
-            );
-        }
-
-        Ok(frame)
+    /// Consume a reception the FRC IRQ already completed, if any.
+    pub fn take_rx_done(&self) -> bool {
+        RX_DONE.try_take().is_some()
     }
 
-    /// Receive the next IEEE 802.15.4 frame (async).
+    /// Wait for the FRC IRQ to complete the next reception.
     ///
-    /// Enables the receiver and waits for a frame. Returns the frame data
-    /// with RSSI and LQI. Frames failing CRC are rejected.
+    /// Leaves the receiver and BUFC untouched: `transmit()` and
+    /// [`Self::rearm_rx`] already armed RX, and the parent's indirect frame
+    /// may start right after the ACK, so nothing here may restart RX in that
+    /// turnaround window. Cancel-safe.
+    pub async fn wait_rx_done(&self) {
+        RX_DONE.wait().await;
+    }
+
+    /// Restart the receiver for a fresh reception.
     ///
-    /// RX flow (from working baremetal code):
-    ///   1. Clear BUFC buffer 1 (RX) and buffer 2 (RX length)
-    ///   2. RXENSRCEN = 0x02 → software RX enable
-    ///   3. FRC captures frame, checks CRC
-    ///   4. Data appears in BUF1, length in BUF1_STATUS
-    ///   5. FRC_IF_RXDONE (bit 4) signals completion
-    pub async fn receive(&mut self) -> Result<RxFrame, RadioError> {
+    /// RXWARM through RX2RX are valid receive states. RXOVERFLOW and all
+    /// TX/turnaround/error states are normalized before restarting RX.
+    pub fn restart_rx(&self) -> Result<(), RadioError> {
         if !self.initialized {
             return Err(RadioError::NotInitialized);
         }
-
-        // receive_ack() may already have re-armed RX and the ISR may have
-        // captured the indirect frame before this future is created.
-        let frame_ready = RX_DONE.try_take().is_some();
-
-        if !frame_ready {
-            // RXWARM through RX2RX are valid receive states. RXOVERFLOW and all
-            // TX/turnaround/error states are normalized before restarting RX.
-            let rac_state_before = self.rac_state();
-            if rac_state_before >= RAC_STATE_RXOVERFLOW {
-                if !self.force_radio_idle() {
-                    self.debug_snapshot("rx-recovery-failed");
-                    return Err(RadioError::HardwareError);
-                }
-            }
-
-            // After TX, the sequencer returned to IDLE (RADIO_TRANSITIONS).
-            // We need to restart RX.
-            // Just clear flags, clear buffers, and re-enable RXENSRCEN.
-            reg_write(BUFC_BUF1_CMD, 1); // clear RX buffer
-            reg_write(BUFC_BUF2_CMD, 1); // clear length buffer
-            reg_write(FRC_IFC, 0xFFFF_FFFF); // clear FRC flags
-
-            // Restart RX via sequencer
-            reg_write(RAC_IFPGACTRL, 0x0000_87E6);
-            self.start_rx();
-
-            RX_DONE.wait().await;
+        if self.rac_state() >= RAC_STATE_RXOVERFLOW && !self.force_radio_idle() {
+            self.debug_snapshot("rx-recovery-failed");
+            return Err(RadioError::HardwareError);
         }
 
+        // After TX, the sequencer returned to IDLE (RADIO_TRANSITIONS).
+        // Clear flags and buffers, then re-enable RXENSRCEN.
+        reg_write(BUFC_BUF1_CMD, 1); // clear RX buffer
+        reg_write(BUFC_BUF2_CMD, 1); // clear length buffer
+        reg_write(FRC_IFC, 0xFFFF_FFFF); // clear FRC flags
+        reg_write(RAC_IFPGACTRL, 0x0000_87E6);
+        self.start_rx();
+        Ok(())
+    }
+
+    /// Re-arm RX after a completed reception without resetting `RX_DONE`.
+    /// Indirect data may follow an ACK within a few milliseconds.
+    pub fn rearm_rx(&self) {
+        self.start_rx();
+    }
+
+    /// Hand the MAC bytes (PHR, FCS and trailer stripped) and RSSI of the
+    /// reception signalled by the last `RX_DONE` to `read`.
+    ///
+    /// A CRC failure, RX overflow or frame error is reported as
+    /// [`RadioError::CrcError`] / [`RadioError::RxTimeout`] like the former
+    /// `receive()`.
+    pub fn read_rx_frame<T>(&self, read: impl FnOnce(&[u8], i8) -> T) -> Result<T, RadioError> {
         if !RX_CRC_OK.load(Ordering::Acquire) {
             return Err(RadioError::CrcError);
         }
-
         let len = RX_LEN.load(Ordering::Acquire) as usize;
         if len == 0 {
             return Err(RadioError::RxTimeout);
         }
-
         let rssi = RX_RSSI.load(Ordering::Acquire);
 
-        let mut frame = RxFrame {
-            data: [0u8; MAX_FRAME_LEN],
-            len: 0,
-            rssi,
-            lqi: rssi_to_lqi(rssi),
+        // SAFETY: the FRC IRQ only writes RX_BUF while capturing the next
+        // frame; this is the same single-slot hand-off the former
+        // `receive()` copied from.
+        let buf = unsafe { &*RX_BUF.get() };
+        // BUFC holds PHR(1) + PSDU(phr) + trailer. Strip PHR and the 2-byte
+        // FCS; the PHR is at most 127, so at most 125 MAC bytes remain.
+        let data_len = if len > 1 {
+            usize::from(buf[0] & 0x7F)
+                .saturating_sub(2)
+                .min(len - 1)
+                .min(MAX_FRAME_LEN - 1)
+        } else {
+            0
         };
-
-        unsafe {
-            let buf = &*RX_BUF.get();
-            if len > 1 {
-                // PHR byte (first byte) contains PSDU length (7 bits).
-                // BUFC buffer has: PHR(1) + PSDU(phr) + trailer(CRC+RSSI/LQI).
-                // We want only MAC header + MAC payload, stripping PHR, FCS(2), and trailer.
-                let phr = (buf[0] & 0x7F) as usize;
-                let data_len = if phr > 2 { phr - 2 } else { 0 }; // strip 2-byte FCS
-                let data_len = data_len.min(len - 1).min(MAX_FRAME_LEN);
-                frame.data[..data_len].copy_from_slice(&buf[1..1 + data_len]);
-                frame.len = data_len;
-            }
-        }
-
-        log::trace!("efr32: rx {} bytes rssi={}dBm", frame.len, rssi);
-        Ok(frame)
+        Ok(read(&buf[1..1 + data_len], rssi))
     }
 
     /// Perform energy detection (synchronous).
@@ -2029,17 +1992,9 @@ impl Efr32Driver {
         Ok((rssi, busy))
     }
 
-    pub fn cca_snapshot(&self) -> (i8, u32, bool, u8) {
-        (
-            self.last_cca_rssi,
-            self.last_cca_status,
-            (self.last_cca_status & AGC_STATUS0_CCA) != 0,
-            self.last_cca_rac_state,
-        )
-    }
-
-    pub fn cca_samples(&self) -> u16 {
-        self.cca_samples
+    /// RSSI (dBm) sampled by the last [`Self::clear_channel_assessment`].
+    pub fn last_cca_rssi(&self) -> i8 {
+        self.last_cca_rssi
     }
 
     pub fn software_ack_snapshot(&self) -> (u32, u32, u32, u8, u8) {
@@ -2081,9 +2036,6 @@ impl Efr32Driver {
         let rssi = read_agc_rssi_dbm();
         let agc_status = reg_read(AGC_STATUS0);
         self.last_cca_rssi = rssi;
-        self.last_cca_status = agc_status;
-        self.last_cca_rac_state = self.rac_state() as u8;
-        self.cca_samples = self.cca_samples.saturating_add(1);
         let channel_clear = (agc_status & AGC_STATUS0_CCA) != 0;
 
         // Disable RX and clear any overflow caused during the sample.
@@ -2451,17 +2403,6 @@ pub extern "C" fn RAC_RSM() {
 pub extern "C" fn BUFC() {
     let flags = reg_read(BUFC_IF);
     reg_write(BUFC_IFC, flags);
-}
-
-// ── Utility ─────────────────────────────────────────────────────
-
-/// Convert RSSI to LQI (Link Quality Indicator, 0–255).
-///
-/// Delegates to the shared stack-wide policy in [`crate::lqi::from_rssi_dbm`]
-/// so every backend that has no IEEE-normalized hardware quality byte uses one
-/// definition. Behaviour is unchanged from the previous local copy.
-fn rssi_to_lqi(rssi: i8) -> u8 {
-    crate::lqi::from_rssi_dbm(rssi)
 }
 
 #[cfg(test)]

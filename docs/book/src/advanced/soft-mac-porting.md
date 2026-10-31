@@ -38,9 +38,10 @@ Production status:
 | TLSR8258 router | yes, `TelinkRouterMac` = `SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>` | build-, layout- and symbol-checked only; the replaced hand-written router MAC was hardware-tested, the shared parent path is not yet |
 | CC2340R5 | yes, via `Cc2340SoftMac` (PBE CCA + TX + Imm-Ack wait, `type Tx = AckWaitTx`; RX decoded from the FIFO into the retained-RX slot) | build-, layout- and host-tested only; no hardware run since the migration |
 | ESP32-C6/H2 | yes, `EspSoftMac` = `SoftMacCore<EspRadioPhy, EndDevice>` (hardware auto-ACK; raw TX + software Imm-Ack window, `type Tx = AckWaitTx`; retained light sleep through `RadioPhy::sleep`/`wake`) | build-, layout-, symbol- and host-tested only; no hardware run since the migration |
-| EFR32MG1, EFR32MG21 | no, each has its own `MacDriver` | — |
+| EFR32MG1 | yes, `Efr32Mac` = `SoftMacCore<Efr32RadioPhy, EndDevice, 1>` (FRC-IRQ software Imm-Ack, `type Tx = AckWaitTx`, in-place `receive`, extended-source fallback poll) | build-, layout-, symbol- and host-tested only; no hardware run since the migration |
+| EFR32MG21 | no, it has its own `MacDriver` | — |
 
-The last group is the remaining Phase B work. The TLSR8258 router is the
+The last row is the remaining Phase B work. The TLSR8258 router is the
 first shipped image on the core's parent role. Its `PENDING` capacity is 0:
 the HAL's ISR ACK path owns the Frame Pending source-match table, which the
 core arms through `RadioPhy::set_ack_frame_pending` because
@@ -247,8 +248,11 @@ To find growth:
    on the slimmed core); their `data`, `bss`, `pool`, `stack` and
    `mac_chain` must still not grow against the legacy MAC (see
    [Firmware size](firmware-size.md#mac-unification-footprint-baseline)).
-3. The tight budgets stay intact: EFR32MG1 has a 16 B margin (2026-10-31 build) above its
-   16 KiB stack gate, and the TLSR8258 retained SVC stack has 256 B above its
+   The same `flash`-only exception was approved for `efr32mg1-sensor`
+   (about +2.3 KB) in exchange for lower `stack`, `bss`, `pool` and
+   `mac_chain`.
+3. The tight budgets stay intact: EFR32MG1 has a 336 B margin (16,720 B,
+   after its `SoftMacCore` port; 16 B before) above its 16 KiB stack gate, and the TLSR8258 retained SVC stack has 256 B above its
    8 KiB gate. Run the platform's layout checker.
 4. Add host tests with a mock PHY for any new capability the backend
    relies on (see the `soft_mac.rs` tests for the `TestPhy` pattern).
@@ -273,9 +277,13 @@ To find growth:
   for the next receive, because a radio that acknowledges in hardware or in
   its ISR has already acknowledged it. The Data Request transmit itself
   (CSMA-CA, ACK wait, retries) is not cancelled, so a poll can overrun the
-  deadline by at most one bounded transmit. EFR32 cancels it with a timer.
-  The TLSR8258 PHY's operations are bounded busy-waits.
-- **Per-backend diagnostics counters.** EFR32 keeps its own; the core
+  deadline by at most one bounded transmit. EFR32MG1 relies on this
+  (its legacy timer-cancelled poll is gone): a late frame its FRC IRQ has
+  already acknowledged stays in the driver's RX buffer for the next
+  `receive`. The TLSR8258 PHY's operations are bounded busy-waits.
+- **Per-backend diagnostics counters.** EFR32MG21 keeps its own; EFR32MG1
+  keeps only the driver's FRC-IRQ software-ACK counters
+  (`Efr32RadioPhy::software_ack_snapshot`); the core
   exposes only `dropped_command_events()`. The TLSR8258 images keep the HAL's
   `tlsr8258_hal::radio::rx_diagnostics()`; the router also reports
   `dropped_command_events()` as its command-queue overflow. The other ACK and

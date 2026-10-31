@@ -21,7 +21,7 @@ use static_cell::StaticCell;
 #[allow(unused_imports)]
 use vectors::__INTERRUPTS;
 use zigbee_bdb::attributes::{BDB_POPULAR_CHANNEL_FALLBACK_SET, BDB_POPULAR_CHANNEL_SET};
-use zigbee_mac::efr32::Efr32Mac;
+use zigbee_mac::efr32::{Efr32Mac, Efr32RadioPhy};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::ApplicationProfile;
@@ -87,19 +87,76 @@ async fn main(_spawner: Spawner) {
         StaticCell::new();
     static PROFILE: StaticCell<efr32mg1_tradfri_product::profile::SensorProfile> =
         StaticCell::new();
-    static DEVICE: StaticCell<ZigbeeDevice<Efr32Mac>> = StaticCell::new();
     static APP: StaticCell<SharedSensorApp> = StaticCell::new();
 
-    let profile = PROFILE.init(
-        efr32mg1_tradfri_product::profile::sensor_profile(FIRMWARE_VERSION, ota_flash)
-            .unwrap_or_else(|_| platform::halt_with_led()),
-    );
+    // Scoped so that no construction temporary is kept in this task's
+    // future across `run().await`.
+    let app = {
+        let profile = PROFILE.init(
+            efr32mg1_tradfri_product::profile::sensor_profile(FIRMWARE_VERSION, ota_flash)
+                .unwrap_or_else(|_| platform::halt_with_led()),
+        );
+        let device = build_device(chip.crypto, profile);
+        let ieee = device.mac().pib().extended_address();
 
-    let mut mac = Efr32Mac::new();
-    mac.install_aes_engine(chip.crypto)
+        let (security_partition, _application_nv) =
+            efr32mg1_tradfri_product::storage::split_flash(chip.flash);
+        let security = SECURITY.init(efr32mg1_tradfri_product::storage::security_store(
+            security_partition,
+        ));
+        match device.reset_security_state_if_identity_changed(security, ieee) {
+            Ok(true) => {
+                rtt_target::rprintln!("[EFR32][sensor] CLEARED_STALE_IDENTITY");
+            }
+            Ok(false) => {}
+            Err(_) => platform::halt_with_led(),
+        }
+
+        let node = ZigbeeNode::new(device, security, profile);
+
+        let app = SensorApp::new(
+            node,
+            &efr32mg1_tradfri_product::policy::SENSOR_POLICY,
+            SensorSedParts {
+                wake: platform::Efr32WakeController::new(),
+                status: platform::Efr32Status::new(),
+                environment: sht,
+                battery: efr32mg1_tradfri_product::battery::BatteryAdapter::new(battery),
+                ota: efr32mg1_tradfri_product::ota::Efr32OtaLifecycle::new(),
+                actions: efr32mg1_tradfri_product::policy::USER_ACTIONS,
+                supervisor: platform::Efr32Supervisor,
+                diagnostics: diagnostics::RttDiagnostics,
+            },
+        )
         .unwrap_or_else(|_| platform::halt_with_led());
-    let ieee = mac.extended_address();
-    rtt_target::rprintln!("[EFR32][sensor] AES_KAT_PASS ieee={:02X?}", ieee);
+        APP.init(app)
+    };
+    app.run().await
+}
+
+/// Bring up the radio and AES engine and build the `ZigbeeDevice` in place.
+///
+/// The PHY, the `SoftMacCore` value, its `Result` and the builder are
+/// temporaries; in the async `main` they would occupy the task's future and
+/// poll frame for the whole run. Here they live in a frame that is popped
+/// before `run()`.
+#[inline(never)]
+fn build_device(
+    crypto: efr32mg1_hal::peripherals::Crypto,
+    profile: &mut efr32mg1_tradfri_product::profile::SensorProfile,
+) -> &'static mut ZigbeeDevice<Efr32Mac> {
+    static DEVICE: StaticCell<ZigbeeDevice<Efr32Mac>> = StaticCell::new();
+
+    let mut phy = Efr32RadioPhy::new();
+    phy.install_aes_engine(crypto)
+        .unwrap_or_else(|_| platform::halt_with_led());
+    let mac = phy
+        .into_soft_mac()
+        .unwrap_or_else(|_| platform::halt_with_led());
+    rtt_target::rprintln!(
+        "[EFR32][sensor] AES_KAT_PASS ieee={:02X?}",
+        mac.pib().extended_address()
+    );
 
     let device = ZigbeeDevice::builder(mac)
         .power_mode(efr32mg1_tradfri_product::policy::SENSOR_POLICY.power_mode())
@@ -120,37 +177,5 @@ async fn main(_spawner: Spawner) {
         .build_into(DEVICE.uninit());
     device.bdb_mut().attributes_mut().primary_channel_set = BDB_POPULAR_CHANNEL_SET;
     device.bdb_mut().attributes_mut().secondary_channel_set = BDB_POPULAR_CHANNEL_FALLBACK_SET;
-
-    let (security_partition, _application_nv) =
-        efr32mg1_tradfri_product::storage::split_flash(chip.flash);
-    let security = SECURITY.init(efr32mg1_tradfri_product::storage::security_store(
-        security_partition,
-    ));
-    match device.reset_security_state_if_identity_changed(security, ieee) {
-        Ok(true) => {
-            rtt_target::rprintln!("[EFR32][sensor] CLEARED_STALE_IDENTITY");
-        }
-        Ok(false) => {}
-        Err(_) => platform::halt_with_led(),
-    }
-
-    let node = ZigbeeNode::new(device, security, profile);
-
-    let app = SensorApp::new(
-        node,
-        &efr32mg1_tradfri_product::policy::SENSOR_POLICY,
-        SensorSedParts {
-            wake: platform::Efr32WakeController::new(),
-            status: platform::Efr32Status::new(),
-            environment: sht,
-            battery: efr32mg1_tradfri_product::battery::BatteryAdapter::new(battery),
-            ota: efr32mg1_tradfri_product::ota::Efr32OtaLifecycle::new(),
-            actions: efr32mg1_tradfri_product::policy::USER_ACTIONS,
-            supervisor: platform::Efr32Supervisor,
-            diagnostics: diagnostics::RttDiagnostics,
-        },
-    )
-    .unwrap_or_else(|_| platform::halt_with_led());
-
-    APP.init(app).run().await
+    device
 }

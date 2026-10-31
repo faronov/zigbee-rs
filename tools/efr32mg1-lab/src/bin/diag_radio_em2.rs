@@ -15,7 +15,7 @@ use cortex_m as _;
 use efr32mg1_hal::pm;
 use embassy_time::{Duration, Timer};
 use zigbee_mac::MacDriver;
-use zigbee_mac::efr32::Efr32Mac;
+use zigbee_mac::efr32::{Efr32Mac, Efr32RadioPhy};
 use zigbee_mac::frames::build_beacon_request;
 use zigbee_mac::pib::{PibAttribute, PibValue};
 
@@ -32,7 +32,8 @@ async fn transmit(mac: &mut Efr32Mac, sequence: u8) -> bool {
     {
         return false;
     }
-    mac.debug_transmit_raw(&build_beacon_request(sequence))
+    mac.phy_mut()
+        .debug_transmit_raw(&build_beacon_request(sequence))
         .await
         .is_ok()
 }
@@ -56,17 +57,23 @@ async fn run(mut mac: Efr32Mac) -> ! {
     }
 
     for iteration in 1..=ITERATIONS {
-        mac.radio_sleep();
+        let radio_slept = mac.sleep().is_ok();
         cortex_m::peripheral::NVIC::unpend(vectors::Interrupt::FrcPri);
         let before = pm::now();
         let sleep = pm::sleep_for_ticks_polled(sleep_ticks);
         let elapsed = pm::elapsed_ticks(before, pm::now());
         let clock_ready = efr32mg1_tradfri::init_clocks().is_ok();
-        mac.radio_wake();
+        let radio_woke = mac.wake().is_ok();
         let tx_ok = transmit(&mut mac, TEST_SEQ.wrapping_add(iteration)).await;
         let progressed = pm::progressed_within_tolerance(elapsed, sleep_ticks, 10);
         let sleepdeep_cleared = !pm::sleepdeep_is_set();
-        let passed = sleep.is_ok() && clock_ready && tx_ok && progressed && sleepdeep_cleared;
+        let passed = radio_slept
+            && radio_woke
+            && sleep.is_ok()
+            && clock_ready
+            && tx_ok
+            && progressed
+            && sleepdeep_cleared;
         failures += (!passed) as u8;
         rtt_target::rprintln!(
             "[EFR32][diag-radio-em2] iter={} elapsed_ticks={} elapsed_ms={} sleep_ok={} \
@@ -101,6 +108,15 @@ async fn run(mut mac: Efr32Mac) -> ! {
     }
 }
 
+fn build_mac() -> Efr32Mac {
+    Efr32RadioPhy::new()
+        .into_soft_mac()
+        .unwrap_or_else(|error| {
+            rtt_target::rprintln!("[EFR32] MAC_INIT_FAIL error={:?}", error);
+            platform::halt()
+        })
+}
+
 #[cortex_m_rt::entry]
 fn main() -> ! {
     platform::init_large!("diag-radio-em2");
@@ -109,5 +125,5 @@ fn main() -> ! {
         static_cell::StaticCell::new();
     EXECUTOR
         .init(embassy_executor::Executor::new())
-        .run(|spawner| spawner.must_spawn(run(Efr32Mac::new())))
+        .run(|spawner| spawner.must_spawn(run(build_mac())))
 }

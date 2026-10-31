@@ -743,6 +743,65 @@ change, and both were reported with the `d8bf8bc` tool:
 TLSR8258 sensors (smaller `poll_within` frame). The worst-path `stack` is
 unchanged.
 
+### Phase B: EFR32MG1 (approved flash exception)
+
+`zigbee-mac/src/efr32` now runs on the shared core:
+`Efr32Mac` is a plain alias of
+`SoftMacCore<Efr32RadioPhy, EndDevice, 1>`, with `type Tx = AckWaitTx`. The
+driver's FRC IRQ still sends the Imm-Ack in software, so the PHY reports
+`hardware_auto_ack`. `POLL_RESPONSE_WAIT_US` is 1.5 s and
+`POLL_EXTENDED_FALLBACK` is on, which keeps the EmberZNet two-pass poll.
+`receive` writes into the core's retained-RX slot in place. One retained-RX
+slot matches the legacy single association-frame buffer.
+
+The legacy backend's own scan, association, poll, CSMA-CA, retry, PIB and
+address-filter code and its copies of `frames.rs` helpers are deleted
+(`efr32/mod.rs` +302/−1,488, `driver.rs` +101/−160). The example
+builds the device in a non-inlined `build_device` outside the async `main`.
+
+`efr32mg1-sensor` against master `8ca6514` (MG1 sources identical to
+`d8bf8bc`), built from the same path and reported with the `d8bf8bc` tool,
+including the core poll change above:
+
+| metric | master | `SoftMacCore` | delta |
+|---|---:|---:|---:|
+| `flash` | 171,800 | 174,084 | +2,284 |
+| `data` | 0 | 0 | 0 |
+| `bss` | 15,056 | 14,736 | −320 |
+| `pool` | 6,928 | 2,800 | −4,128 |
+| `stack` | 27,892 | 27,564 | −328 |
+| `mac_chain` | 26,196 | 26,044 | −152 |
+| `mac_code` | 6,759 | 9,559 | +2,800 |
+| `mac_stack` | 1,332 | 688 | −644 |
+| linked stack (`check-layout.sh`) | 16,400 | 16,720 | +320 |
+
+The user approved the `flash` growth in exchange for the lower `stack`,
+`bss`, `pool` and `mac_chain`. It comes from the generic core, which is
+larger than the hand-written MG1 paths: `listen` (about 2.3 KB),
+`AckWaitTx` transmit (about 0.9 KB), `poll_within` (about 0.7 KB) and PIB
+get/set (about 0.8 KB). The image still ends at `0x2E804`, well below the
+native NVM3 region at `0x3A000`. The stack gate margin grows from 16 B to
+336 B.
+
+Behaviour changes:
+
+- `mlme_poll_timeout` is no longer timer-cancelled. The core cuts the
+  response window at the deadline. A late indirect frame that the FRC IRQ
+  has already acknowledged stays in the driver's RX buffer for the next
+  `receive` instead of being dropped. The Data Request transmit is not
+  cancelled (see the porting guide's known gaps).
+- An RX CRC error restarts the receiver.
+- `macDSN`/`macBSN` start at 0, as before. Non-ACK frames heard during the
+  1.5 ms Imm-Ack wait are still dropped.
+- The diagnostic `Efr32Mac::cca_snapshot`/`scan_diagnostics` accessors, the
+  driver's CCA sample ring and the backend's `log` lines (the IEEE at
+  start-up and the fallback-EUI-64 warning) are removed. The example's
+  `AES_KAT_PASS ieee=` RTT line and
+  `Efr32RadioPhy::software_ack_snapshot` remain.
+
+Validation: build-, layout- (`check-layout.sh`, `verify-layout.py`),
+symbol- and host-tested only. No EFR32 hardware run has been done with it.
+
 ## Measurement commands
 
 Raw binary:
