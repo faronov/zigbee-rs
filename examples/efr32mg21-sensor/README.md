@@ -8,19 +8,22 @@ pins, IRQ numbers and linker layout.
 
 ## Status
 
-**Builds; not runnable on hardware yet.** The xG21 radio PHY/analog tables
-(`efr32s2-hal/src/radio/xg21.rs`) are empty, so `Efr32s2RadioPhy::new`
-returns `PhyError::Unsupported` and the firmware logs the error over VCOM and
-halts. It deliberately does not program xG22 values into an xG21 radio.
-Everything before radio init (clocks/HFXO, VCOM, RTCC time driver, EM2,
-persistence) is the code that is hardware-proven on xG22, but it has not run
-on an xG21 die.
+**Builds; this image has not run on hardware.** The xG21 radio tables
+(`efr32s2-hal/src/radio/xg21.rs`) were captured on an EFR32MG21A020 in a
+Home Assistant Connect ZBT-1. There, the same driver joins ZHA, completes
+the interview and resumes from its journal (`examples/ha-connect-zbt1`).
+
+Differences on BRD4181A that are still unverified:
+
+- its EFR32MG21A010 has no 20 dBm PA, so the captured HP-PA TX settings may
+  not apply;
+- EM2 sleep (RTCC CC1 wake) has not run on xG21.
 
 ## Exact target
 
 | item | value |
 |---|---|
-| MCU | EFR32MG21A020F512IM32 |
+| MCU | EFR32MG21A010F1024IM32 (layout uses the lower 512 KiB) |
 | HFXO | 38.4 MHz, CTUNE 133 (BRD4181A default) |
 | LED0 | PB0, active high |
 | BTN0 | PD2, active low |

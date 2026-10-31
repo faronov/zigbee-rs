@@ -1,7 +1,7 @@
 //! BSP for BRD4181A on the BRD4001A Wireless Starter Kit.
 //!
 //! This crate intentionally supports one concrete configuration:
-//! EFR32MG21A020F512IM32, LED0 on PB0, BTN0 on PD2, and the WSTK VCOM on
+//! EFR32MG21A010F1024IM32 (GSDK `brd4181a.slcc`), LED0 on PB0, BTN0 on PD2, and the WSTK VCOM on
 //! USART0 TX PA5 with its enable on PD4 (GSDK 4.5.0
 //! `hardware/board/config/brd4181a_brd4001a`). It exposes fitted board
 //! resources, including the raw exclusive internal flash token, but
@@ -20,7 +20,7 @@ use efr32s2_hal::{
 
 pub const BOARD_RADIO: &str = "BRD4181A";
 pub const BOARD_MAIN: &str = "BRD4001A";
-pub const MCU_PART: &str = "EFR32MG21A020F512IM32";
+pub const MCU_PART: &str = "EFR32MG21A010F1024IM32";
 pub const HCLK_HZ: u32 = 38_400_000;
 pub const HFXO_CTUNE: u16 = 133;
 

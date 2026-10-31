@@ -11,9 +11,10 @@
 //! HFXO tuning follows the GSDK precedence: the factory `MFG_CTUNE` token
 //! in the user-data page when programmed, otherwise a board default. The
 //! inspected unit has every MFG token erased and no DEVINFO CTUNE, so the
-//! stock firmware uses a compile-time value; until that value is read
-//! from the running stock image's HFXO0 `XTALCTRL`, the default is the
-//! xG21 device_init value 140 (`sl_device_init_hfxo_config.h`, sdid200).
+//! stock firmware uses a compile-time value. Reading HFXO0 `XTALCTRL` of
+//! the running stock image over SWD (read-only) gave CTUNE 140,
+//! which is also the xG21 device_init default
+//! (`sl_device_init_hfxo_config.h`, sdid200).
 //! The EUI-64 comes from DEVINFO; the custom-EUI token is erased.
 //!
 //! The shipped Gecko Bootloader occupies `0x0..0x4000` and has no GPIO
@@ -37,8 +38,12 @@ use efr32s2_hal::{
 pub const BOARD_NAME: &str = "Home Assistant Connect ZBT-1";
 pub const MCU_PART: &str = "EFR32MG21A020F1024IM32";
 pub const HCLK_HZ: u32 = 38_400_000;
-/// xG21 GSDK default used when the `MFG_CTUNE` token is erased.
+/// CTUNE used when the `MFG_CTUNE` token is erased: the value the stock
+/// Nabu Casa firmware programs (read from its `XTALCTRL`).
 pub const DEFAULT_HFXO_CTUNE: u16 = 140;
+/// Fitted internal flash (EFR32MG21A020F**1024**), as reported by DEVINFO
+/// `MSIZE` on the inspected unit.
+pub const INTERNAL_FLASH_CAPACITY: usize = 1024 * 1024;
 /// Resident Gecko Bootloader size; the application starts here.
 pub const BOOTLOADER_SIZE: u32 = 0x4000;
 
@@ -52,7 +57,7 @@ pub const UART_RTS_PORT: Port = Port::B;
 pub const UART_RTS_PIN: u8 = 0;
 pub const UART_BAUD: u32 = 115_200;
 
-/// HFXO CTUNE for this unit: factory token, else the GSDK default.
+/// HFXO CTUNE for this unit: factory token, else [`DEFAULT_HFXO_CTUNE`].
 pub fn hfxo_ctune() -> u16 {
     devinfo::mfg_ctune().map_or(DEFAULT_HFXO_CTUNE, u16::from)
 }

@@ -8,11 +8,9 @@
 //! Measurements: temperature is the EFR32 die sensor (EMU_TEMP), humidity is
 //! synthetic and the battery is a fixed 3000 mV.
 //!
-//! Radio status: the xG21 analog/PHY tables have not been captured yet, so
-//! `Efr32s2RadioPhy::new` returns `PhyError::Unsupported` on this chip and
-//! the firmware halts with a logged error rather than programming xG22
-//! values into an xG21 radio. Everything up to radio init (clocks, VCOM,
-//! RTCC, persistence) is shared with the hardware-proven MG22 path.
+//! Radio status: the xG21 tables were captured on an EFR32MG21A020 (ZBT-1)
+//! and that radio is lab-tested there. This BRD4181A image has not run on
+//! hardware; its A010 part has no 20 dBm PA, so the TX path is unverified.
 
 #![no_std]
 #![no_main]
