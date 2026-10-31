@@ -155,6 +155,14 @@ jobs:
             manifest: products/efr32mg21-sensor/Cargo.toml
             workspace: products/efr32mg21-sensor
             features: ""
+          - name: EFR32MG22 board
+            manifest: boards/efr32mg22-devkit/Cargo.toml
+            workspace: boards/efr32mg22-devkit
+            features: ""
+          - name: EFR32MG22 sensor product
+            manifest: products/efr32mg22-sensor/Cargo.toml
+            workspace: products/efr32mg22-sensor
+            features: ""
           - name: PHY6222 sensor product
             manifest: products/phy62x2-evk/Cargo.toml
             workspace: products/phy62x2-evk
@@ -280,6 +288,8 @@ jobs:
           cargo fmt --manifest-path boards/nrf52840-promicro/Cargo.toml -- --check
           cargo fmt --manifest-path boards/efr32mg21-devkit/Cargo.toml -- --check
           cargo fmt --manifest-path products/efr32mg21-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/efr32mg22-devkit/Cargo.toml -- --check
+          cargo fmt --manifest-path products/efr32mg22-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path products/phy62x2-evk/Cargo.toml -- --check
           cargo fmt --manifest-path examples/nrf52840-router/Cargo.toml -- --check
           cargo fmt --manifest-path examples/nrf52840-sensor-uf2/Cargo.toml -- --check
@@ -289,6 +299,7 @@ jobs:
           cargo fmt --manifest-path examples/phy6222-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg1-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg21-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/efr32mg22-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path efr32mg1-hal/Cargo.toml -- --check
           cargo fmt --manifest-path efr32s2-hal/Cargo.toml -- --check
           cargo fmt --manifest-path tools/efr32s2-lab/Cargo.toml -- --check
@@ -1472,6 +1483,61 @@ jobs:
             examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.bin
             examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.hex
             examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.size.json
+          if-no-files-found: error
+
+  build-efr32mg22:
+    name: Build EFR32MG22 sensor and Series 2 lab gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv8m.main-none-eabihf
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            examples/efr32mg22-sensor
+            tools/efr32s2-lab
+          key: thumbv8m-efr32mg22-${{ env.RUST_TOOLCHAIN }}-sed-${{ hashFiles('examples/efr32mg22-sensor/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/efr32mg22-sensor/link/**', 'efr32s2-hal/link/**') }}
+      - name: Build EFR32MG22 sensor (release)
+        working-directory: examples/efr32mg22-sensor
+        run: cargo build --release --locked
+      - name: Clippy EFR32MG22 production composition
+        working-directory: examples/efr32mg22-sensor
+        run: cargo clippy --release --locked --target thumbv8m.main-none-eabihf -- -D warnings
+      - name: Build EFR32 Series 2 lab gate binaries (MG22)
+        working-directory: tools/efr32s2-lab
+        run: cargo build --release --locked --bins
+      - name: Create firmware artifacts
+        run: |
+          ELF=examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-sensor
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+          "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+          ./tools/firmware-size-report.sh efr32mg22-sensor ${ELF}.bin ${ELF}.size.json
+          python3 examples/efr32mg22-sensor/tools/verify-layout.py "$ELF"
+          SYMS="$("$NM" --demangle "$ELF")"
+          if ! grep -Eq 'SoftwareAes128|aes::soft' <<<"$SYMS"; then
+            echo "EFR32MG22 image is missing its currently supported software AES backend" >&2
+            exit 1
+          fi
+          PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+          if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
+            echo "EFR32MG22 sensor links parent/router maintenance symbols:" >&2
+            grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
+            exit 1
+          fi
+      - name: Upload EFR32MG22 firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: efr32mg22-sensor-firmware
+          path: |
+            examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-sensor.bin
+            examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-sensor.hex
+            examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-sensor.size.json
           if-no-files-found: error
 
   # ── Deploy Book + Web Flasher to GitHub Pages ────────────────
