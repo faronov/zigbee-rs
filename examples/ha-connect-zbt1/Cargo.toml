@@ -5,9 +5,26 @@ edition = "2024"
 publish = false
 autobins = false
 
+# One crate per board, one bin per Zigbee role. Exactly one role feature
+# may be enabled per build (`src/platform.rs` enforces it), so dependency
+# feature unification never links router code into an end-device image:
+#   cargo build --release                                       # ed (default)
+#   cargo build --release --no-default-features --features router
+#   cargo build --release --no-default-features --features sed
 [[bin]]
 name = "ha-connect-zbt1-ed"
 path = "src/main.rs"
+required-features = ["ed"]
+
+[[bin]]
+name = "ha-connect-zbt1-router"
+path = "src/router.rs"
+required-features = ["router"]
+
+[[bin]]
+name = "ha-connect-zbt1-sed"
+path = "src/sed.rs"
+required-features = ["sed"]
 
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
@@ -16,6 +33,7 @@ efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg21", "rt", "time
 ha-connect-zbt1 = { path = "../../boards/ha-connect-zbt1" }
 ha-connect-zbt1-product = { path = "../../products/ha-connect-zbt1" }
 router-app = { path = "../../apps/router", default-features = false }
+sensor-sed-app = { path = "../../apps/sensor-sed", default-features = false, optional = true }
 zigbee-mac = { path = "../../zigbee-mac", features = ["efr32mg21"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
@@ -31,6 +49,22 @@ embassy-time = "0.5"
 embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
 log = "0.4"
 static_cell = "2"
+
+[features]
+default = ["ed"]
+# Always-on End Device (the original image).
+ed = []
+# Router: parent MAC (software Imm-Ack with Frame Pending), ParentRouterApp,
+# durable child and APS tables.
+router = ["router-app/router", "zigbee-runtime/router"]
+# Sleepy End Device: sensor-sed-app lifecycle, EM2 between slow polls.
+sed = [
+    "dep:sensor-sed-app",
+    "ha-connect-zbt1-product/sed",
+    "zigbee-runtime/sleepy-end-device",
+]
+# SED lab: keep the debug interface powered in EM2 (RTT/SWD while asleep).
+em2-debug = []
 
 [profile.dev]
 opt-level = "s"

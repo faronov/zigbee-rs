@@ -3,7 +3,7 @@ name = "ha-connect-zbt1-product"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Product configuration for the Home Assistant Connect ZBT-1 always-on End Device"
+description = "Product configuration for the Home Assistant Connect ZBT-1 (End Device, Router, Sleepy End Device)"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
@@ -16,9 +16,14 @@ efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg21"] }
 embedded-storage = "0.3"
 ha-connect-zbt1 = { path = "../../boards/ha-connect-zbt1" }
 router-app = { path = "../../apps/router", default-features = false }
+sensor-sed-app = { path = "../../apps/sensor-sed", default-features = false, optional = true }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[features]
+# Sleepy End Device role policy (pulls in the SED lifecycle crate).
+sed = ["dep:sensor-sed-app"]
 
 [dev-dependencies]
 zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
