@@ -3,7 +3,7 @@ name = "efr32mg21-sensor-product"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Product configuration for the BRD4181A EFR32MG21 sensor"
+description = "Product configuration for the BRD4181A EFR32MG21 sensor, end device and router"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
@@ -15,7 +15,12 @@ publish = false
 efr32mg21-devkit = { path = "../../boards/efr32mg21-devkit" }
 efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg21"] }
 embedded-storage = "0.3"
-sensor-sed-app = { path = "../../apps/sensor-sed" }
+router-app = { path = "../../apps/router", default-features = false }
+sensor-sed-app = { path = "../../apps/sensor-sed", optional = true }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[features]
+# Sleepy sensor role policy (pulls in the SED lifecycle crate).
+sed = ["dep:sensor-sed-app"]
