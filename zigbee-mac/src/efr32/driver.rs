@@ -99,7 +99,7 @@ const _GPIO_BASE: u32 = 0x4000_A000;
 // The EFR32 Series 1 CMU layout has many reserved gaps.
 
 /// CMU control register (0x000).
-const _CMU_CTRL: u32 = CMU_BASE + 0x000;
+const _CMU_CTRL: u32 = CMU_BASE; // offset 0x000
 /// CMU oscillator enable command register (0x060, NOT 0x020).
 const CMU_OSCENCMD: u32 = CMU_BASE + 0x060;
 /// CMU HFCLK select command register (0x074, NOT 0x068).
@@ -123,7 +123,7 @@ const CMU_RADIOCLKEN0: u32 = CMU_BASE + 0x0C8;
 // CRITICAL: verified against official CMSIS header.
 // RAC has a complex layout with sequencer regs, RF front-end, etc.
 
-const _RAC_RXENSRCEN: u32 = RAC_BASE + 0x000;
+const _RAC_RXENSRCEN: u32 = RAC_BASE; // offset 0x000
 const RAC_STATUS: u32 = RAC_BASE + 0x004;
 const RAC_CMD: u32 = RAC_BASE + 0x008;
 const RAC_CTRL: u32 = RAC_BASE + 0x00C;
@@ -256,7 +256,7 @@ const _RAC_IF_BUSERROR: u32 = 1 << 2;
 // ── FRC Register Offsets (from CMSIS TypeDef at 0x40080000) ─────
 
 /// FRC status register (read-only).
-const _FRC_STATUS: u32 = FRC_BASE + 0x000;
+const _FRC_STATUS: u32 = FRC_BASE; // offset 0x000
 /// FRC data filter control.
 const FRC_DFLCTRL: u32 = FRC_BASE + 0x004;
 /// FRC max frame length.
@@ -342,12 +342,12 @@ const FRC_IF_WCNTCMP2: u32 = 1 << 11;
 // 0x000–0x010 are read-only status registers; first writable is MIXCTRL at 0x014.
 
 /// MODEM status register (RO).
-const _MODEM_STATUS: u32 = MODEM_BASE + 0x000;
+const _MODEM_STATUS: u32 = MODEM_BASE; // offset 0x000
 
 // ── SYNTH Register Offsets (CMSIS: efr32fg1v_synth.h) ──────────
 
 /// SYNTH status register (RO).
-const _SYNTH_STATUS: u32 = SYNTH_BASE + 0x000;
+const _SYNTH_STATUS: u32 = SYNTH_BASE; // offset 0x000
 /// SYNTH command register (WO).
 const _SYNTH_CMD: u32 = SYNTH_BASE + 0x004;
 /// SYNTH control register.
@@ -384,7 +384,7 @@ const AGC_STATUS0_CCA: u32 = 1 << 10;
 // ── BUFC Register Offsets (from CMSIS TypeDef at 0x40081000) ────
 
 // Buffer 0 — used for TX
-const BUFC_BUF0_CTRL: u32 = BUFC_BASE + 0x000;
+const BUFC_BUF0_CTRL: u32 = BUFC_BASE; // offset 0x000
 const BUFC_BUF0_ADDR: u32 = BUFC_BASE + 0x004;
 const _BUFC_BUF0_WRITEOFFSET: u32 = BUFC_BASE + 0x008;
 const _BUFC_BUF0_READOFFSET: u32 = BUFC_BASE + 0x00C;
@@ -452,7 +452,7 @@ const _IRQ_AGC: u32 = 27;
 const _IRQ_PROTIMER: u32 = 28;
 const _IRQ_SYNTH: u32 = 30;
 const PROTIMER_BASE: u32 = 0x4008_5000;
-const PROTIMER_CTRL: u32 = PROTIMER_BASE + 0x000;
+const PROTIMER_CTRL: u32 = PROTIMER_BASE; // offset 0x000
 const PROTIMER_CMD: u32 = PROTIMER_BASE + 0x004;
 const _PROTIMER_STATUS: u32 = PROTIMER_BASE + 0x00C;
 const _PROTIMER_PRECNT: u32 = PROTIMER_BASE + 0x010;
