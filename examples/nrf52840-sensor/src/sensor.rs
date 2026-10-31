@@ -19,18 +19,20 @@ pub use sht31_sensor::{Measurement, Sensor};
 
 #[cfg(feature = "sensor-bme280")]
 mod bme280_sensor {
-    use embassy_time::Delay;
+    use embassy_time::{Delay, Duration, Timer};
     use nrf52840_dk::SensorI2c;
     use nrf52840_sensor_product::profile::pressure_pa_to_zcl;
     use zigbee_bme280::asynch::Bme280;
-    use zigbee_bme280::{Chip, Oversampling, SamplingConfig, PRIMARY_ADDRESS};
+    use zigbee_bme280::{Chip, Config, Filter, I2cInterface, Oversampling, PRIMARY_ADDRESS};
+    use zigbee_sensor::asynch::Sensor as _;
 
     /// x8 oversampling on all three channels, matching the original
     /// firmware's `ctrl_hum = 0b100` / `ctrl_meas = 0b1001_0001`.
-    const SAMPLING: SamplingConfig = SamplingConfig {
+    const CONFIG: Config = Config {
         temperature: Oversampling::X8,
         pressure: Oversampling::X8,
         humidity: Oversampling::X8,
+        filter: Filter::Off,
     };
 
     pub struct Measurement {
@@ -42,7 +44,7 @@ mod bme280_sensor {
 
     pub struct Sensor<'d> {
         i2c: Option<SensorI2c<'d>>,
-        bme: Option<Bme280<SensorI2c<'d>>>,
+        bme: Option<Bme280<I2cInterface<SensorI2c<'d>>>>,
     }
 
     impl<'d> Sensor<'d> {
@@ -57,17 +59,22 @@ mod bme280_sensor {
             let Some(i2c) = self.i2c.take() else {
                 return self.bme.is_some();
             };
-            let mut sensor = Bme280::new(i2c, PRIMARY_ADDRESS);
+            let mut sensor = Bme280::new_i2c(i2c, PRIMARY_ADDRESS).with_config(CONFIG);
             // Reject a BMP280 on this address the same way the original
             // firmware's explicit chip-id check did: this profile always
             // reports humidity, which a BMP280 does not have.
-            let ready = matches!(sensor.init(&mut Delay).await, Ok(Chip::Bme280))
-                && sensor.set_sampling(SAMPLING).await.is_ok();
+            let ready = match sensor.soft_reset().await {
+                Ok(wait) => {
+                    Timer::after(Duration::from_micros(wait.into())).await;
+                    matches!(sensor.init().await, Ok(Chip::Bme280))
+                }
+                Err(_) => false,
+            };
             if ready {
                 self.bme = Some(sensor);
                 true
             } else {
-                self.i2c = Some(sensor.release());
+                self.i2c = Some(sensor.release().i2c);
                 false
             }
         }
@@ -75,17 +82,24 @@ mod bme280_sensor {
         async fn read_active(&mut self) -> Option<Measurement> {
             let reading = {
                 let sensor = self.bme.as_mut()?;
-                sensor.measure_forced(&mut Delay).await.ok()
+                match sensor.measure(&mut Delay).await {
+                    // The wait is the datasheet maximum; allow one late finish.
+                    Err(zigbee_sensor::Error::NotReady) => {
+                        Timer::after(Duration::from_millis(2)).await;
+                        sensor.read_measurement().await.ok()
+                    }
+                    reading => reading.ok(),
+                }
             };
             match reading {
                 Some(reading) => Some(Measurement {
-                    temperature_centi_celsius: reading.temperature_centi_celsius as i16,
-                    humidity_centi_percent: reading.humidity_centi_percent.unwrap_or(0),
-                    pressure_hpa: pressure_pa_to_zcl(reading.pressure_pa),
+                    temperature_centi_celsius: reading.temperature as i16,
+                    humidity_centi_percent: reading.humidity.unwrap_or(0),
+                    pressure_hpa: pressure_pa_to_zcl(reading.pressure),
                 }),
                 None => {
                     let sensor = self.bme.take()?;
-                    self.i2c = Some(sensor.release());
+                    self.i2c = Some(sensor.release().i2c);
                     None
                 }
             }
@@ -104,9 +118,7 @@ mod bme280_sensor {
     impl nrf_sensor_app::EnvironmentSource for Sensor<'_> {
         type Error = ();
 
-        async fn sample(
-            &mut self,
-        ) -> Result<nrf_sensor_app::EnvironmentReading, Self::Error> {
+        async fn sample(&mut self) -> Result<nrf_sensor_app::EnvironmentReading, Self::Error> {
             let measurement = Sensor::sample(self).await.ok_or(())?;
             Ok(nrf_sensor_app::EnvironmentReading {
                 temperature_centi_celsius: measurement.temperature_centi_celsius,
@@ -121,6 +133,7 @@ mod bme280_sensor {
 mod sht31_sensor {
     use embassy_time::{Duration, Timer};
     use nrf52840_dk::SensorI2c;
+    use zigbee_sensor::asynch::Sensor as _;
     use zigbee_sht3x::asynch::Sht3x;
     use zigbee_sht3x::PRIMARY_ADDRESS;
 
@@ -147,11 +160,11 @@ mod sht31_sensor {
                 return self.sht.is_some();
             };
             let mut sensor = Sht3x::new(i2c, PRIMARY_ADDRESS);
-            if sensor.soft_reset().await.is_err() {
+            let Ok(wait) = sensor.soft_reset().await else {
                 self.i2c = Some(sensor.release());
                 return false;
-            }
-            Timer::after(Duration::from_millis(2)).await;
+            };
+            Timer::after(Duration::from_micros(wait.into())).await;
             if sensor.read_status().await.is_err() {
                 self.i2c = Some(sensor.release());
                 return false;
@@ -180,19 +193,19 @@ mod sht31_sensor {
         /// issued before its conversion completes). A CRC mismatch is not
         /// retried, matching the original firmware.
         async fn measure_with_retry(sensor: &mut Sht3x<SensorI2c<'d>>) -> Option<Measurement> {
-            if sensor.start_measurement().await.is_err() {
+            let Ok(wait) = sensor.start_measurement().await else {
                 return None;
-            }
-            Timer::after(Duration::from_millis(20)).await;
+            };
+            Timer::after(Duration::from_micros(wait.into())).await;
             for attempt in 0..3u8 {
                 match sensor.read_measurement().await {
                     Ok(measurement) => {
                         return Some(Measurement {
-                            temperature_centi_celsius: measurement.temperature_centi_celsius,
-                            humidity_centi_percent: measurement.humidity_centi_percent,
+                            temperature_centi_celsius: measurement.temperature as i16,
+                            humidity_centi_percent: measurement.humidity,
                         });
                     }
-                    Err(zigbee_sht3x::Error::I2c(_)) if attempt < 2 => {
+                    Err(zigbee_sensor::Error::Bus(_)) if attempt < 2 => {
                         Timer::after(Duration::from_millis(5)).await;
                     }
                     Err(_) => return None,
@@ -214,9 +227,7 @@ mod sht31_sensor {
     impl nrf_sensor_app::EnvironmentSource for Sensor<'_> {
         type Error = ();
 
-        async fn sample(
-            &mut self,
-        ) -> Result<nrf_sensor_app::EnvironmentReading, Self::Error> {
+        async fn sample(&mut self) -> Result<nrf_sensor_app::EnvironmentReading, Self::Error> {
             let measurement = Sensor::sample(self).await.ok_or(())?;
             Ok(nrf_sensor_app::EnvironmentReading {
                 temperature_centi_celsius: measurement.temperature_centi_celsius,

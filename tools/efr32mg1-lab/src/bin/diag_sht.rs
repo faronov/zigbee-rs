@@ -13,6 +13,7 @@ mod vectors;
 
 use cortex_m as _;
 use embassy_time::{Duration, Timer};
+use zigbee_sensor::blocking::Sensor as _;
 
 async fn probe(
     mut i2c: efr32mg1_tradfri::SensorI2c,
@@ -24,15 +25,15 @@ async fn probe(
         ] {
             rtt_target::rprintln!("[EFR32][diag-sht] PROBE address=0x{:02X}", address);
             let mut sensor = zigbee_sht3x::Sht3x::new(i2c, address);
-            if sensor.soft_reset().is_ok() {
-                Timer::after(Duration::from_millis(2)).await;
+            if let Ok(wait) = sensor.soft_reset() {
+                Timer::after(Duration::from_micros(wait.into())).await;
                 match sensor.read_status() {
                     Ok(status) => {
                         rtt_target::rprintln!(
                             "[EFR32][diag-sht] SHT_FOUND address=0x{:02X} \
                              status=0x{:04X} crc=ok",
                             address,
-                            status.raw
+                            status.0
                         );
                         return sensor;
                     }
@@ -61,8 +62,8 @@ async fn run(i2c: efr32mg1_tradfri::SensorI2c) -> ! {
     let mut errors = 0u32;
     loop {
         match sensor.start_measurement() {
-            Ok(()) => {
-                Timer::after(Duration::from_millis(20)).await;
+            Ok(wait) => {
+                Timer::after(Duration::from_micros(wait.into())).await;
                 match sensor.read_measurement() {
                     Ok(measurement) => {
                         samples = samples.wrapping_add(1);
@@ -72,8 +73,8 @@ async fn run(i2c: efr32mg1_tradfri::SensorI2c) -> ! {
                             samples,
                             errors,
                             sensor.address(),
-                            measurement.temperature_centi_celsius,
-                            measurement.humidity_centi_percent
+                            measurement.temperature,
+                            measurement.humidity
                         );
                         platform::led_on();
                         Timer::after(Duration::from_millis(80)).await;

@@ -68,7 +68,8 @@ zigbee-runtime = { path = "../../zigbee-runtime", features = ["constrained-memor
 efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
 efr32mg1-tradfri-product = { path = "../../products/efr32mg1-tradfri" }
 efr32mg1-hal = { path = "../../efr32mg1-hal" }
-zigbee-sht3x = { path = "../../drivers/sht3x" }
+zigbee-sht3x = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "69e073cb921c4effef567eab886c054a58d02b49" }
+zigbee-sensor = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "69e073cb921c4effef567eab886c054a58d02b49" }
 
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
 embassy-time = { version = "0.5" }

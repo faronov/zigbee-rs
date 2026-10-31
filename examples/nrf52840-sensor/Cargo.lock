@@ -671,6 +671,7 @@ dependencies = [
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-runtime",
+ "zigbee-sensor",
  "zigbee-sht3x",
  "zigbee-types",
  "zigbee-zcl",
@@ -947,9 +948,11 @@ dependencies = [
 [[package]]
 name = "zigbee-bme280"
 version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=69e073cb921c4effef567eab886c054a58d02b49#69e073cb921c4effef567eab886c054a58d02b49"
 dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
+ "zigbee-sensor",
 ]
 
 [[package]]
@@ -1003,11 +1006,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "zigbee-sht3x"
+name = "zigbee-sensor"
 version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=69e073cb921c4effef567eab886c054a58d02b49#69e073cb921c4effef567eab886c054a58d02b49"
 dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
+]
+
+[[package]]
+name = "zigbee-sht3x"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=69e073cb921c4effef567eab886c054a58d02b49#69e073cb921c4effef567eab886c054a58d02b49"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "zigbee-sensor",
 ]
 
 [[package]]

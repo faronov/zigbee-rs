@@ -56,6 +56,10 @@ platform radio backend
   product-facing application frontends over that runtime.
 - **Example `main.rs` files** are composition roots: platform startup,
   resource construction, and the outer executor/event loop.
+- **Sensor drivers** live in the separate
+  [zigbee-rs-drivers](https://github.com/faronov/zigbee-rs-drivers)
+  repository (no_std, blocking + async, no delays inside a measurement).
+  Examples pin it as a git dependency by revision.
 
 The detailed design is in the
 [architecture chapter](docs/book/src/getting-started/architecture.md).

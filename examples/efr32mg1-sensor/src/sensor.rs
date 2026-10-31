@@ -2,6 +2,7 @@
 
 use embassy_time::{Duration, Timer};
 use sensor_sed_app::{EnvironmentReading, EnvironmentSource};
+use zigbee_sensor::blocking::Sensor as _;
 
 pub type Sht3x = zigbee_sht3x::Sht3x<efr32mg1_tradfri::SensorI2c>;
 
@@ -28,8 +29,8 @@ impl Sensor {
             zigbee_sht3x::SECONDARY_ADDRESS,
         ] {
             let mut sensor = zigbee_sht3x::Sht3x::new(i2c, address);
-            if sensor.soft_reset().is_ok() {
-                Timer::after(Duration::from_millis(2)).await;
+            if let Ok(wait) = sensor.soft_reset() {
+                Timer::after(Duration::from_micros(wait.into())).await;
                 if sensor.read_status().is_ok() {
                     self.sht = Some(sensor);
                     return true;
@@ -46,11 +47,12 @@ impl Sensor {
     async fn read_active(&mut self) -> Option<zigbee_sht3x::Measurement> {
         let measurement = {
             let sensor = self.sht.as_mut()?;
-            if sensor.start_measurement().is_err() {
-                None
-            } else {
-                Timer::after(Duration::from_millis(20)).await;
-                sensor.read_measurement().ok()
+            match sensor.start_measurement() {
+                Ok(wait) => {
+                    Timer::after(Duration::from_micros(wait.into())).await;
+                    sensor.read_measurement().ok()
+                }
+                Err(_) => None,
             }
         };
         if measurement.is_none() {
@@ -77,8 +79,8 @@ impl EnvironmentSource for Sensor {
     async fn sample(&mut self) -> Result<EnvironmentReading, Self::Error> {
         let measurement = Sensor::sample(self).await.ok_or(())?;
         Ok(EnvironmentReading {
-            temperature_centi_celsius: measurement.temperature_centi_celsius,
-            humidity_centi_percent: measurement.humidity_centi_percent,
+            temperature_centi_celsius: measurement.temperature as i16,
+            humidity_centi_percent: measurement.humidity,
             pressure_tenth_kpa: None,
         })
     }
