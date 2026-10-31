@@ -15,7 +15,7 @@ mod shared;
 
 use efr32s2_hal::{
     delay::{Deadline, cycles, cycles_to_us},
-    radio::{CsmaConfig, MAX_PSDU, Radio, RadioError, synth_diag},
+    radio::{CsmaConfig, MAX_FRAME, Radio, RadioError, synth_diag},
 };
 
 const CHANNEL: u8 = 15;
@@ -35,7 +35,7 @@ impl core::fmt::Display for Hex<'_> {
 }
 
 /// Drain received frames for `ms`, logging each; returns a beacon's PAN.
-fn listen(radio: &mut Radio, ms: u32, buf: &mut [u8; MAX_PSDU]) -> Option<u16> {
+fn listen(radio: &mut Radio, ms: u32, buf: &mut [u8; MAX_FRAME]) -> Option<u16> {
     let mut pan = None;
     let deadline = Deadline::after_us(ms * 1000);
     while !deadline.expired() {
@@ -64,7 +64,7 @@ fn listen(radio: &mut Radio, ms: u32, buf: &mut [u8; MAX_PSDU]) -> Option<u16> {
 #[cortex_m_rt::entry]
 fn main() -> ! {
     let mut lab = shared::init("radio");
-    let mut buf = [0u8; MAX_PSDU];
+    let mut buf = [0u8; MAX_FRAME];
     let t0 = cycles();
     let mut radio = match lab.radio.init() {
         Ok(r) => r,
@@ -120,7 +120,7 @@ fn main() -> ! {
     for seq in 0..3u8 {
         let req = [0x03, 0x08, seq, 0xFF, 0xFF, 0xFF, 0xFF, 0x07];
         let t = cycles();
-        let r = radio.transmit_csma(&req, CsmaConfig::default(), &mut buf);
+        let r = radio.transmit_csma(&req, CsmaConfig::default());
         log!(
             "beacon req #{} -> {:?} ({} us)",
             seq,
@@ -146,7 +146,7 @@ fn main() -> ! {
         f[7..15].copy_from_slice(&eui);
         f[15] = 0x04;
         let t = cycles();
-        match radio.transmit_csma(&f, CsmaConfig::default(), &mut buf) {
+        match radio.transmit_csma(&f, CsmaConfig::default()) {
             Ok(o) => {
                 acked += 1;
                 if o.ack_frame_pending == Some(true) {
@@ -176,6 +176,36 @@ fn main() -> ! {
         pending,
         noack,
         other
+    );
+
+    // 4b. RX -> ACK TX -> RX turnaround (stray ACK, sequence nobody awaits).
+    // An ACK is 11 bytes on air (352 us); the rest is warm-up and switching.
+    for i in 0..6u8 {
+        if let Err(e) = radio.rx_on() {
+            log!(
+                "rx_on {:?} {:?} state {:?}",
+                e,
+                synth_diag(),
+                radio.rac_state()
+            );
+        }
+        let t = cycles();
+        let r = radio.transmit(&[0x02, 0x00, 0xE0 + i]);
+        let total = cycles_to_us(cycles().wrapping_sub(t));
+        log!(
+            "ACK TX {:?}: RX->TX->RX {} us (airtime 352), {:?}",
+            r,
+            total,
+            synth_diag()
+        );
+    }
+    radio.idle();
+    let t = cycles();
+    radio.rx_on().unwrap();
+    log!(
+        "rx_on from idle {} us {:?}",
+        cycles_to_us(cycles().wrapping_sub(t)),
+        synth_diag()
     );
 
     // 5. Continuous RX.
