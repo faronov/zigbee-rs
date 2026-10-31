@@ -15,7 +15,7 @@ use panic_halt as _;
 use pb03f_kit::{Resources, console_log, time, vectors};
 use pb03f_kit_product as product;
 use sensor_sed_app::{BlockingBattery, BlockingEnvironment, NoOta, SensorApp, SensorSedParts};
-use zigbee_mac::phy6222::Phy6222Mac;
+use zigbee_mac::phy6222::Phy6222RadioPhy;
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::ApplicationProfile;
@@ -62,11 +62,14 @@ async fn main(_spawner: Spawner) {
     unsafe {
         cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::LlIrq);
     }
-    let Some(mac) = Phy6222Mac::take_with_config(product::radio::radio_config()) else {
+    let Some(radio) = Phy6222RadioPhy::take_with_config(product::radio::radio_config()) else {
         fault(&mut status, "radio already taken")
     };
-    let Ok(ieee) = product::identity::validate_ieee_address(mac.extended_address()) else {
+    let Ok(ieee) = product::identity::validate_ieee_address(radio.extended_address()) else {
         fault(&mut status, "factory IEEE address missing")
+    };
+    let Ok(mac) = radio.into_soft_mac() else {
+        fault(&mut status, "radio configuration rejected")
     };
 
     let battery = product::battery::SupplyBattery::new(supply_monitor);

@@ -245,16 +245,17 @@ async fn main(_spawner: Spawner) {
                 Either::First(Ok(f)) => {
                     frames += 1;
                     leds.green.set_on(true);
-                    let fcf = u16::from_le_bytes([f.data[0], f.data[1]]);
+                    let data = f.as_slice();
+                    let fcf = u16::from_le_bytes([data[0], data[1]]);
                     if frames <= 8 {
                         out!(
                             "  rx len={} rssi={} lqi={} fcf={:#06x} seq={:#04x} hdr={:02x?}\n",
-                            f.len,
-                            f.rssi,
+                            data.len(),
+                            radio.last_rx_rssi(),
                             f.lqi,
                             fcf,
-                            f.data[2],
-                            &f.data[3..f.len.min(11)]
+                            data[2],
+                            &data[3..data.len().min(11)]
                         );
                     }
                     leds.green.set_on(false);

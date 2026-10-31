@@ -61,6 +61,8 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant};
 
+use crate::PhyRxFrame;
+
 // ── Register blocks ─────────────────────────────────────────────
 
 /// RF PHY analog + baseband register block (`PHY_REG_WT(0x4003xxxx)`).
@@ -177,15 +179,6 @@ const MIN_RX_PSDU_LEN: usize = 5;
 const CCA_THRESHOLD_DBM: i8 = -60;
 
 // ── Public types ────────────────────────────────────────────────
-
-/// Received 802.15.4 frame: MPDU without FCS.
-pub struct RxFrame {
-    pub data: [u8; MAX_FRAME_LEN],
-    pub len: usize,
-    /// RSSI in dBm from the packet foot word (`-(foot1 >> 24)`).
-    pub rssi: i8,
-    pub lqi: u8,
-}
 
 /// Who produces the 2-byte FCS of transmitted frames.
 ///
@@ -1063,7 +1056,7 @@ impl Phy6222Driver {
     /// including [`Self::radio_sleep`], first aborts it in hardware. This
     /// avoids a `Drop` guard, whose drop glue would propagate into every
     /// stack future that awaits the radio and cost ~1 KiB of XIP.
-    pub async fn receive(&mut self) -> Result<RxFrame, RadioError> {
+    pub async fn receive(&mut self) -> Result<PhyRxFrame, RadioError> {
         self.rx_begin()?;
         loop {
             RX_DONE.wait().await;
@@ -1088,7 +1081,7 @@ impl Phy6222Driver {
     /// Synchronous tail of one [`Self::receive`] window: count timeouts and
     /// CRC errors and re-arm (`None`), or return the received frame.
     #[inline(never)]
-    fn rx_complete(&mut self) -> Option<Result<RxFrame, RadioError>> {
+    fn rx_complete(&mut self) -> Option<Result<PhyRxFrame, RadioError>> {
         match RxOutcome::from_u8(RX_OUTCOME.load(Ordering::Acquire)) {
             RxOutcome::FrameOk => {}
             RxOutcome::CrcError => {
@@ -1110,27 +1103,26 @@ impl Phy6222Driver {
         RX_OK_CNT.inc();
         let len = usize::from(RX_LEN.load(Ordering::Acquire));
         let rssi = rssi_from_foot1(RX_FOOT1.load(Ordering::Acquire));
-        let mut frame = RxFrame {
-            data: [0u8; MAX_FRAME_LEN],
-            len,
-            rssi,
-            lqi: rssi_to_lqi(rssi),
-        };
         // SAFETY: LL_IRQ finished writing RX_WORDS before signalling RX_DONE
         // and only writes them again in a later OP_RX (an OP_ACK in flight
         // touches the TX FIFO only), so no concurrent writer exists. The words are
         // little-endian (asserted above), so the byte view is the FIFO byte
         // order: byte 0 is the length byte and the MPDU starts at byte 1.
         let bytes = unsafe { &*(RX_WORDS.0.get() as *const [u8; FIFO_BYTES]) };
-        frame.data[..len].copy_from_slice(&bytes[1..=len]);
+        let mpdu = &bytes[1..=len];
         // Cross-check the hardware CRC verdict in software (diagnostic).
-        if cfg!(feature = "phy6222-diag")
-            && zigbee_crc16(&frame.data[..len]) != [bytes[len + 1], bytes[len + 2]]
+        if cfg!(feature = "phy6222-diag") && zigbee_crc16(mpdu) != [bytes[len + 1], bytes[len + 2]]
         {
             RX_SW_FCS_MISMATCH_CNT.inc();
         }
         log::trace!("phy6222: rx {} bytes rssi={}dBm", len, rssi);
-        Some(Ok(frame))
+        // `LL_IRQ` bounds `len` to 3..=125, so `from_slice` cannot fail.
+        Some(PhyRxFrame::from_slice(mpdu, rssi_to_lqi(rssi)).map_err(|_| RadioError::InvalidFrame))
+    }
+
+    /// RSSI in dBm of the last received frame (`-(foot1 >> 24)`).
+    pub fn last_rx_rssi(&self) -> i8 {
+        rssi_from_foot1(RX_FOOT1.load(Ordering::Acquire))
     }
 
     /// Enable the receiver briefly and sample the RSSI register.
@@ -1229,8 +1221,11 @@ impl Phy6222Driver {
 //
 // Measured on PB-03F (nRF sniffer, ACK start against the other children of
 // the same parent): hardware FCS ≈192 µs, software FCS ≈170 µs, jitter
-// ≈1 µs, entry→trigger ≤ 8.3 µs. ACKs carry `frame pending = 0`: this
-// backend is end-device only and never holds indirect data.
+// ≈1 µs, entry→trigger ≤ 8.3 µs. Later captures put hardware FCS at
+// ≈161 µs for both the pre-SoftMacCore and the SoftMacCore build; the
+// sniffer splits third-party ACKs into the same two classes ~31 µs apart.
+// ACKs carry `frame pending = 0`: this backend is end-device only and never
+// holds indirect data.
 
 /// `ll_hw_set_trx_settle(57, 8, 52)` as programmed by the ROM's
 /// `ll_hw_set_timing(PKT_FMT_ZIGBEE)` (disassembled at ROM 0x112fc):

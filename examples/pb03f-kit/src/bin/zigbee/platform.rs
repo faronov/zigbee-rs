@@ -6,7 +6,7 @@ use sensor_sed_app::{
     DiagnosticEvent, Diagnostics, SensorStatus, SleepDepth, StatusSink, Supervisor, WaitRequest,
     WakeController, WakeReason,
 };
-use zigbee_mac::phy6222::Phy6222Mac;
+use zigbee_mac::phy6222::Phy6222SoftMac;
 
 const BUTTON_SAMPLE_MS: u32 = 10;
 const EMBASSY_TICKS_PER_MS: u32 = 1_000;
@@ -28,6 +28,8 @@ fn elapsed_mark_ms(later: u32, earlier: u32) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeError {
     RetentionUnsupported,
+    /// The radio could not be stopped or reconfigured.
+    Radio,
 }
 
 pub struct PhyWakeController {
@@ -58,7 +60,7 @@ impl PhyWakeController {
     }
 }
 
-impl WakeController<Phy6222Mac> for PhyWakeController {
+impl WakeController<Phy6222SoftMac> for PhyWakeController {
     type Mark = u32;
     type Error = WakeError;
 
@@ -76,13 +78,13 @@ impl WakeController<Phy6222Mac> for PhyWakeController {
 
     async fn wait(
         &mut self,
-        mac: &mut Phy6222Mac,
+        mac: &mut Phy6222SoftMac,
         request: WaitRequest,
     ) -> Result<WakeReason, Self::Error> {
         let restore_radio = match request.sleep_depth {
             SleepDepth::Active => false,
             SleepDepth::Idle => {
-                mac.radio_sleep();
+                mac.sleep().map_err(|_| WakeError::Radio)?;
                 true
             }
             SleepDepth::Retention => return Err(WakeError::RetentionUnsupported),
@@ -90,7 +92,7 @@ impl WakeController<Phy6222Mac> for PhyWakeController {
 
         let reason = self.wait_for_button_or_timer(request.timeout_ms).await;
         if restore_radio {
-            mac.radio_wake();
+            mac.wake().map_err(|_| WakeError::Radio)?;
         }
         Ok(reason)
     }
