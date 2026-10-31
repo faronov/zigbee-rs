@@ -119,8 +119,8 @@ Occupied-XIP measurements with `nightly-2026-08-01` on macOS:
 
 | feature image | occupied XIP span | hard gate | result |
 |---|---:|---:|---:|
-| PHY6222 (default) | 138,624 | 187,104 | 48,480 bytes free |
-| PHY6252 (`--no-default-features --features phy6252`) | 138,624 | 187,104 | 48,480 bytes free |
+| PHY6222 (default) | 135,680 | 187,104 | 51,424 bytes free |
+| PHY6252 (`--no-default-features --features phy6252`) | 135,744 | 187,104 | 51,360 bytes free |
 
 The PHY target configuration enables linker identical-code folding
 (`--icf=all`) for identical monomorphized functions. Folded functions can share

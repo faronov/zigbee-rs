@@ -95,6 +95,11 @@ Each slot costs 127 B in the MAC struct.
 Keep the constructor `#[inline(never)]` if the composition root stores the
 MAC in an Embassy task future (see `NrfRadioPhy::into_soft_mac`). Otherwise
 the main task's stack frame grows by the size of the core.
+Even then, the constructor's `Result`, the unwrapped MAC and the
+`ZigbeeDevice` builder are temporaries in the async `main` poll frame, which
+stays live under every later call. The PHY62x2 composition roots build the
+MAC and the device in a non-inlined `build_device` function that returns the
+`ZigbeeDevice`; this saved 1,008 B of `stack` per image.
 
 ## Optional capabilities
 
@@ -237,9 +242,9 @@ To find growth:
 2. Every image of the platform meets `compare` against the parent commit.
    No flash, `.data`, `.bss`, task-pool, `stack` or `mac_chain` growth is
    allowed. Report exact deltas. Approved exception: the PHY62x2 images
-   may grow in `flash` only (about +6.2–6.5 KB) in exchange for about
-   −4.3 KB of `stack` and `mac_chain`; their `data`, `bss`, `pool`,
-   `stack` and `mac_chain` must still not grow (see
+   may grow in `flash` only (approved at about +6.2–6.5 KB; +3.2–3.4 KB
+   on the slimmed core); their `data`, `bss`, `pool`, `stack` and
+   `mac_chain` must still not grow against the legacy MAC (see
    [Firmware size](firmware-size.md#mac-unification-footprint-baseline)).
 3. The tight budgets stay intact: EFR32MG1 has a 16 B margin (2026-10-31 build) above its
    16 KiB stack gate, and the TLSR8258 retained SVC stack has 256 B above its

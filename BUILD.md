@@ -243,8 +243,8 @@ cargo +nightly-2026-08-01 build --release --locked \
   --no-default-features --features phy6252
 ```
 
-The default PHY6222 occupied XIP span is currently 138,624 B against the hard
-187,104 B gate, and the PHY6252 feature build is the same size. The slot ends below
+The default PHY6222 occupied XIP span is currently 135,680 B against the hard
+187,104 B gate, and the PHY6252 feature build is 135,744 B. The slot ends below
 the PHY6252 security partition at 0x3E000 with room for the image tail that
 `phy62x2-image` appends. Release builds from
 `examples/phy6222-sensor` use the `immediate-abort` panic strategy (configured

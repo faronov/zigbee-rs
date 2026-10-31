@@ -15,7 +15,7 @@ use panic_halt as _;
 use pb03f_kit::{Resources, console_log, time, vectors};
 use pb03f_kit_product as product;
 use sensor_sed_app::{BlockingBattery, BlockingEnvironment, NoOta, SensorApp, SensorSedParts};
-use zigbee_mac::phy6222::Phy6222RadioPhy;
+use zigbee_mac::phy6222::{Phy6222RadioPhy, Phy6222SoftMac};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::ApplicationProfile;
@@ -32,6 +32,38 @@ fn fault(status: &mut PhyStatus, reason: &str) -> ! {
     log::error!("fault: {}", reason);
     status.fault();
     halt()
+}
+
+/// Builds the MAC and the device outside the async `main` frame.
+///
+/// The `SoftMacCore` value, its `Result` and the builder are temporaries; in
+/// `main` they would occupy the task's poll frame for the whole run. Here
+/// they live in a frame that is popped before `app.run()`.
+#[inline(never)]
+fn build_device(
+    radio: Phy6222RadioPhy,
+    profile: &mut product::profile::SensorProfile,
+    status: &mut PhyStatus,
+) -> ZigbeeDevice<Phy6222SoftMac> {
+    let Ok(mac) = radio.into_soft_mac() else {
+        fault(status, "radio configuration rejected")
+    };
+    ZigbeeDevice::builder(mac)
+        .power_mode(product::policy::SENSOR_POLICY.power_mode())
+        .automatic_polling(false)
+        .manufacturer(product::MANUFACTURER)
+        .model(product::MODEL)
+        .date_code(product::DATE_CODE)
+        .sw_build(product::SW_BUILD)
+        .power_source(product::POWER_SOURCE)
+        .channels(product::CHANNELS)
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        .build()
 }
 
 #[embassy_executor::main]
@@ -68,29 +100,10 @@ async fn main(_spawner: Spawner) {
     let Ok(ieee) = product::identity::validate_ieee_address(radio.extended_address()) else {
         fault(&mut status, "factory IEEE address missing")
     };
-    let Ok(mac) = radio.into_soft_mac() else {
-        fault(&mut status, "radio configuration rejected")
-    };
-
     let battery = product::battery::SupplyBattery::new(supply_monitor);
 
     let mut profile = product::profile::sensor_profile();
-    let mut device = ZigbeeDevice::builder(mac)
-        .power_mode(product::policy::SENSOR_POLICY.power_mode())
-        .automatic_polling(false)
-        .manufacturer(product::MANUFACTURER)
-        .model(product::MODEL)
-        .date_code(product::DATE_CODE)
-        .sw_build(product::SW_BUILD)
-        .power_source(product::POWER_SOURCE)
-        .channels(product::CHANNELS)
-        .endpoint(
-            profile.endpoint(),
-            profile.profile_id(),
-            profile.device_id(),
-            |endpoint| profile.configure_endpoint(endpoint),
-        )
-        .build();
+    let mut device = build_device(radio, &mut profile, &mut status);
 
     let mut security_store = product::storage::security_store(flash);
     if device

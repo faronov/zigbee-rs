@@ -93,9 +93,9 @@ former-budget rows.
 
 | image | measured | physical limit / former budget | margin vs reference | metric |
 |---|---:|---:|---:|---|
-| PHY6222 sensor | 138,624 | 187,104 | 48,480 | occupied XIP span |
-| PHY6252 feature-selected sensor | 138,624 | 187,104 | 48,480 | occupied XIP span |
-| PB-03F-Kit `pb03f-zigbee` (PHY6252) | 196,256 | 200,448 | 4,192 | occupied XIP span |
+| PHY6222 sensor | 135,680 | 187,104 | 51,424 | occupied XIP span |
+| PHY6252 feature-selected sensor | 135,744 | 187,104 | 51,360 | occupied XIP span |
+| PB-03F-Kit `pb03f-zigbee` (PHY6252) | 193,216 | 200,448 | 7,232 | occupied XIP span |
 | BL702 sensor (OTA-capable) | 227,216 | 482,304 | 255,088 | raw binary |
 | nRF52840 default / BME280 / SHT31 | 224,472 / 231,792 / 228,216 | 225,280 / 245,760 / 241,664 | 808 / 13,968 / 13,448 | raw binaries |
 | nRF52840 always-on End Device | 231,280 | 253,952 | 22,672 | file-backed flash span |
@@ -129,7 +129,9 @@ R22/BDB/ZCL conformance and security fixes, which grew the image from
 130,752 B to 135,520 B before size work. Both variants link and pass the
 layout check locally on macOS. The growth from the October 6 figures
 (132,576/132,544 B) to 138,624 B came mostly with the move to `SoftMacCore`
-(about +6.2 KB; see "Phase B: PHY62x2" below).
+(about +6.2 KB; see "Phase B: PHY62x2" below); the slimmed core brought
+them back to 135,680/135,744 B (see "PHY62x2 and TLSR8258 on the slimmed
+core").
 
 Additional artifacts and physical limits:
 
@@ -512,6 +514,57 @@ measured at 272,340 B (+1,546) and rejected by the gate. The added
 `RadioPhy::set_rx_on_when_idle` hook is zero-cost elsewhere: `bl702-sensor`
 is byte-identical, and `nrf52840-sensor` and `nrf52840-router` differ only
 in 20 bytes of panic-location line numbers.
+
+The `stack`, `mac_chain`, `mac_stack` and `mac_frame` columns of the two
+Phase B sections above come from the tool before it counted literal-pool
+stack frames (see "Core slimming before Phase B"). They are not comparable with
+the corrected rows below or in `tools/mac-footprint-baseline.json`.
+
+### PHY62x2 and TLSR8258 on the slimmed core
+
+PHY62x2 (`type Tx = AckWaitTx`; the SRAM interrupt Imm-Ack path is
+unchanged) and the TLSR8258 sensors (`type Tx = FullTx`) moved to the
+slimmed `RadioPhy` API with in-place `receive`. The PHY62x2 composition
+roots now build the MAC and the device in a non-inlined `build_device`
+function. In `async main`, the `SoftMacCore` value, its `Result` and the
+builder were temporaries in the Embassy main task's poll frame, which stays
+live under the whole stack chain (2,512 B; 1,504 B with the helper).
+
+Deltas against master `28b1803`, both measured with the corrected tool in
+directories with equal-length paths:
+
+| image | `flash` | `data` | `bss` | `pool` | `stack` | `mac_chain` | `mac_code` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| pb03f-zigbee | 194,244 (-3,136) | 0 (0) | 16,628 (0) | 16,388 (0) | 24,152 (-2,904) | 22,224 (-3,720) | 10,174 (-2,410) |
+| phy6222-sensor | 136,688 (-2,940) | 0 (0) | 16,572 (0) | 16,388 (0) | 24,072 (-2,888) | 22,192 (-3,824) | 9,938 (-2,442) |
+| phy6252-sensor | 136,776 (-2,852) | 0 (0) | 16,572 (0) | 16,388 (0) | 24,072 (-2,896) | 22,192 (-3,832) | 9,938 (-2,442) |
+| tlsr8258-router | 270,790 (0) | 2,428 (0) | 19,684 (0) | 0 (0) | 47,424 (0) | 37,376 (0) | 18,016 (0) |
+| tlsr8258-sensor | 161,355 (-6,316) | 2,156 (0) | 8,368 (-16) | 0 (0) | 30,360 (-3,696) | 29,424 (-4,184) | 9,560 (-3,136) |
+| tlsr8258-sensor-retention | 164,579 (-6,436) | 2,156 (0) | 10,836 (-16) | 0 (0) | 29,768 (-3,696) | 28,824 (-4,192) | 9,528 (-3,128) |
+| tlsr8258-sensor-retention-10s | 164,583 (-6,436) | 2,156 (0) | 10,836 (-16) | 0 (0) | 29,776 (-3,688) | 28,824 (-4,192) | 9,528 (-3,128) |
+
+Against the legacy, hand-written MACs (`157d189` rows, corrected tool),
+master's ports had grown `stack`/`mac_chain` by +2.6–2.8 KB/+3.0–3.1 KB
+(PHY62x2) and +1.6–3.4 KB/+1.7–3.5 KB (TLSR8258 sensors). With the slimmed core
+every one of these images is now below the legacy MAC on both:
+
+| image | Δ `flash` | Δ `bss` | Δ `stack` | Δ `mac_chain` |
+|---|---:|---:|---:|---:|
+| pb03f-zigbee | +3,404 | 0 | -104 | -720 |
+| phy6222-sensor | +3,224 | 0 | -240 | -720 |
+| phy6252-sensor | +3,328 | 0 | -240 | -720 |
+| tlsr8258-sensor | -7,932 | -1,448 | -272 | -672 |
+| tlsr8258-sensor-retention | -7,916 | -1,448 | -2,096 | -2,504 |
+| tlsr8258-sensor-retention-10s | -7,916 | -1,448 | -2,088 | -2,504 |
+
+The remaining PHY62x2 flash growth is about half of the approved
++6.2–6.5 KB exception. Occupied XIP spans: PHY6222 135,680 B, PHY6252
+135,744 B (of 187,104 B), `pb03f-zigbee` 193,216 B (of 200,448 B). The
+TLSR8258 raw binaries are 190,284 B (default), 193,404 B (LOW32K 250 ms) and
+193,408 B (LOW32K 10 s); the retention image still links one
+`tlsr8258_rt::block_on` monomorph. `tools/mac-footprint-baseline.json`
+carries these PHY62x2/TLSR8258 rows. The new-API paths are build- and
+layout-checked only; the PB-03F hardware evidence predates them.
 
 ## Measurement commands
 

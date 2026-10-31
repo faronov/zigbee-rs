@@ -11,7 +11,7 @@ use panic_halt as _;
 use phy62x2_evk::Resources;
 use phy62x2_evk_product as product;
 use sensor_sed_app::{BlockingBattery, BlockingEnvironment, NoOta, SensorApp, SensorSedParts};
-use zigbee_mac::phy6222::Phy6222RadioPhy;
+use zigbee_mac::phy6222::{Phy6222RadioPhy, Phy6222SoftMac};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::ApplicationProfile;
@@ -27,6 +27,39 @@ fn halt() -> ! {
 fn fault(status: &mut PhyStatus) -> ! {
     status.fault();
     halt()
+}
+
+/// Builds the MAC and the device outside the async `main` frame.
+///
+/// The `SoftMacCore` value, its `Result` and the builder are temporaries; in
+/// `main` they would occupy the task's poll frame for the whole run. Here
+/// they live in a frame that is popped before `app.run()`.
+#[inline(never)]
+fn build_device(
+    radio: Phy6222RadioPhy,
+    profile: &mut product::profile::SensorProfile,
+    status: &mut PhyStatus,
+) -> ZigbeeDevice<Phy6222SoftMac> {
+    let mac = match radio.into_soft_mac() {
+        Ok(mac) => mac,
+        Err(_) => fault(status),
+    };
+    ZigbeeDevice::builder(mac)
+        .power_mode(product::policy::SENSOR_POLICY.power_mode())
+        .automatic_polling(false)
+        .manufacturer(product::MANUFACTURER)
+        .model(product::MODEL)
+        .date_code(product::DATE_CODE)
+        .sw_build(product::SW_BUILD)
+        .power_source(product::POWER_SOURCE)
+        .channels(product::CHANNELS)
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        .build()
 }
 
 #[embassy_executor::main]
@@ -59,28 +92,8 @@ async fn main(_spawner: Spawner) {
         Ok(ieee) => ieee,
         Err(_) => fault(&mut status),
     };
-    let mac = match radio.into_soft_mac() {
-        Ok(mac) => mac,
-        Err(_) => fault(&mut status),
-    };
-
     let mut profile = product::profile::sensor_profile();
-    let mut device = ZigbeeDevice::builder(mac)
-        .power_mode(product::policy::SENSOR_POLICY.power_mode())
-        .automatic_polling(false)
-        .manufacturer(product::MANUFACTURER)
-        .model(product::MODEL)
-        .date_code(product::DATE_CODE)
-        .sw_build(product::SW_BUILD)
-        .power_source(product::POWER_SOURCE)
-        .channels(product::CHANNELS)
-        .endpoint(
-            profile.endpoint(),
-            profile.profile_id(),
-            profile.device_id(),
-            |endpoint| profile.configure_endpoint(endpoint),
-        )
-        .build();
+    let mut device = build_device(radio, &mut profile, &mut status);
 
     let mut security_store = product::storage::security_store(flash);
     if device

@@ -18,11 +18,11 @@
 {"image": "nrf52840-sensor-uf2-mdk", "flash": 225744, "text": 185296, "data": 88, "bss": 37376, "pool": 32772, "mac_code": 8674, "stack": 27244, "mac_chain": 22980, "mac_stack": 860, "mac_frame": 488},
 {"image": "nrf52840-sensor-uf2-pca10059", "flash": 227136, "text": 186588, "data": 88, "bss": 37376, "pool": 32772, "mac_code": 8674, "stack": 27244, "mac_chain": 22980, "mac_stack": 860, "mac_frame": 488},
 {"image": "nrf52840-sensor-uf2-promicro", "flash": 225808, "text": 185352, "data": 88, "bss": 37376, "pool": 32772, "mac_code": 8674, "stack": 27244, "mac_chain": 22980, "mac_stack": 860, "mac_frame": 488},
-{"image": "pb03f-zigbee", "flash": 190840, "text": 161644, "data": 0, "bss": 16628, "pool": 16388, "mac_code": 8000, "stack": 24256, "mac_chain": 22944, "mac_stack": 2152, "mac_frame": 728},
-{"image": "phy6222-sensor", "flash": 133464, "text": 130844, "data": 0, "bss": 16572, "pool": 16388, "mac_code": 7596, "stack": 24312, "mac_chain": 22912, "mac_stack": 1984, "mac_frame": 728},
-{"image": "phy6252-sensor", "flash": 133448, "text": 130828, "data": 0, "bss": 16572, "pool": 16388, "mac_code": 7596, "stack": 24312, "mac_chain": 22912, "mac_stack": 1984, "mac_frame": 728},
-{"image": "tlsr8258-router", "flash": 270794, "text": 268366, "data": 2428, "bss": 19684, "pool": 0, "mac_code": 18016, "stack": 47424, "mac_chain": 37376, "mac_stack": 2992, "mac_frame": 2192},
-{"image": "tlsr8258-sensor", "flash": 169287, "text": 167131, "data": 2156, "bss": 9816, "pool": 0, "mac_code": 14568, "stack": 30632, "mac_chain": 30096, "mac_stack": 2968, "mac_frame": 2192},
-{"image": "tlsr8258-sensor-retention", "flash": 172495, "text": 170339, "data": 2156, "bss": 12284, "pool": 0, "mac_code": 14524, "stack": 31864, "mac_chain": 31328, "mac_stack": 2968, "mac_frame": 2192},
-{"image": "tlsr8258-sensor-retention-10s", "flash": 172499, "text": 170343, "data": 2156, "bss": 12284, "pool": 0, "mac_code": 14524, "stack": 31864, "mac_chain": 31328, "mac_stack": 2968, "mac_frame": 2192}
+{"image": "pb03f-zigbee", "flash": 194244, "text": 164976, "data": 0, "bss": 16628, "pool": 16388, "mac_code": 10174, "stack": 24152, "mac_chain": 22224, "mac_stack": 1072, "mac_frame": 824},
+{"image": "phy6222-sensor", "flash": 136688, "text": 134048, "data": 0, "bss": 16572, "pool": 16388, "mac_code": 9938, "stack": 24072, "mac_chain": 22192, "mac_stack": 1080, "mac_frame": 824},
+{"image": "phy6252-sensor", "flash": 136776, "text": 134136, "data": 0, "bss": 16572, "pool": 16388, "mac_code": 9938, "stack": 24072, "mac_chain": 22192, "mac_stack": 1080, "mac_frame": 824},
+{"image": "tlsr8258-router", "flash": 270790, "text": 268362, "data": 2428, "bss": 19684, "pool": 0, "mac_code": 18016, "stack": 47424, "mac_chain": 37376, "mac_stack": 2992, "mac_frame": 2192},
+{"image": "tlsr8258-sensor", "flash": 161355, "text": 159199, "data": 2156, "bss": 8368, "pool": 0, "mac_code": 9560, "stack": 30360, "mac_chain": 29424, "mac_stack": 1392, "mac_frame": 480},
+{"image": "tlsr8258-sensor-retention", "flash": 164579, "text": 162423, "data": 2156, "bss": 10836, "pool": 0, "mac_code": 9528, "stack": 29768, "mac_chain": 28824, "mac_stack": 1392, "mac_frame": 480},
+{"image": "tlsr8258-sensor-retention-10s", "flash": 164583, "text": 162427, "data": 2156, "bss": 10836, "pool": 0, "mac_code": 9528, "stack": 29776, "mac_chain": 28824, "mac_stack": 1392, "mac_frame": 480}
 ]
