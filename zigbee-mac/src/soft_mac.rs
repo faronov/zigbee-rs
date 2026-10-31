@@ -509,7 +509,14 @@ impl<P: RadioPhy, R: MacRole, const RX: usize> SoftMacCore<P, R, RX> {
     }
 
     pub fn reset_pib(&mut self, dsn: u8, bsn: u8) -> Result<(), MacError> {
-        let next = MacPib::new(self.pib.extended_address(), dsn, bsn);
+        let mut next = MacPib::new(self.pib.extended_address(), dsn, bsn);
+        if P::DEFAULT_TX_POWER_DBM != 0 {
+            next.set(
+                PibAttribute::PhyTransmitPower,
+                PibValue::I8(P::DEFAULT_TX_POWER_DBM),
+            )
+            .map_err(pib_error)?;
+        }
         Self::apply_full_config(&mut self.phy, &next)?;
         self.pib = next;
         self.pending_rx.clear();
@@ -1585,7 +1592,8 @@ mod tests {
     const IEEE: [u8; 8] = [0x02, 1, 2, 3, 4, 5, 6, 7];
 
     /// `T`: transmit offload marker. `FALLBACK` = `POLL_EXTENDED_FALLBACK`.
-    struct TestPhy<T: TxOffload = SoftwareTx, const FALLBACK: bool = false> {
+    /// `POWER` = `DEFAULT_TX_POWER_DBM`.
+    struct TestPhy<T: TxOffload = SoftwareTx, const FALLBACK: bool = false, const POWER: i8 = 0> {
         offload: core::marker::PhantomData<T>,
         channel: u8,
         tx_power: i8,
@@ -1608,7 +1616,7 @@ mod tests {
         rx_on_when_idle: Option<bool>,
     }
 
-    impl<T: TxOffload, const FALLBACK: bool> TestPhy<T, FALLBACK> {
+    impl<T: TxOffload, const FALLBACK: bool, const POWER: i8> TestPhy<T, FALLBACK, POWER> {
         fn new() -> Self {
             Self {
                 offload: core::marker::PhantomData,
@@ -1639,9 +1647,12 @@ mod tests {
         }
     }
 
-    impl<T: TxOffload + 'static, const FALLBACK: bool> RadioPhy for TestPhy<T, FALLBACK> {
+    impl<T: TxOffload + 'static, const FALLBACK: bool, const POWER: i8> RadioPhy
+        for TestPhy<T, FALLBACK, POWER>
+    {
         type Tx = T;
         const POLL_EXTENDED_FALLBACK: bool = FALLBACK;
+        const DEFAULT_TX_POWER_DBM: i8 = POWER;
 
         fn capabilities(&self) -> PhyCapabilities {
             self.capabilities
@@ -1749,11 +1760,13 @@ mod tests {
         }
     }
 
-    impl<T: TxOffload, const FALLBACK: bool> zigbee_crypto::ForwardAesProvider
-        for TestPhy<T, FALLBACK>
+    impl<T: TxOffload, const FALLBACK: bool, const POWER: i8> zigbee_crypto::ForwardAesProvider
+        for TestPhy<T, FALLBACK, POWER>
     {
     }
-    impl<T: TxOffload + 'static, const FALLBACK: bool> PlatformServices for TestPhy<T, FALLBACK> {
+    impl<T: TxOffload + 'static, const FALLBACK: bool, const POWER: i8> PlatformServices
+        for TestPhy<T, FALLBACK, POWER>
+    {
         fn monotonic_micros(&self) -> u32 {
             self.now_us
         }
@@ -1866,6 +1879,31 @@ mod tests {
         core.set_pib(PibAttribute::MacAssociatedPanCoord, PibValue::Bool(true))
             .unwrap();
         core
+    }
+
+    #[test]
+    fn default_reset_restores_the_phy_default_tx_power() {
+        let mut core: SoftMacCore<TestPhy> =
+            SoftMacCore::new(TestPhy::new(), MacPib::new(IEEE, 1, 2)).unwrap();
+        core.reset(true).unwrap();
+        // The IEEE default unless the PHY overrides it.
+        assert_eq!(
+            core.get_pib(PibAttribute::PhyTransmitPower),
+            PibValue::I8(0)
+        );
+        assert_eq!(core.phy().tx_power, 0);
+
+        let mut core: SoftMacCore<TestPhy<SoftwareTx, false, 3>> =
+            SoftMacCore::new(TestPhy::new(), MacPib::new(IEEE, 1, 2)).unwrap();
+        core.set_pib(PibAttribute::PhyTransmitPower, PibValue::I8(-4))
+            .unwrap();
+        assert_eq!(core.phy().tx_power, -4);
+        core.reset(true).unwrap();
+        assert_eq!(
+            core.get_pib(PibAttribute::PhyTransmitPower),
+            PibValue::I8(3)
+        );
+        assert_eq!(core.phy().tx_power, 3);
     }
 
     #[test]

@@ -120,6 +120,7 @@ The unused methods keep their `Unsupported` defaults.
 |---|---|---|
 | `const POLL_RESPONSE_WAIT_US` | 30 ms | How long to wait for indirect data after an ACK with FP=1. nRF uses 1.5 s, the value proven on hardware with the legacy MAC. |
 | `const POLL_EXTENDED_FALLBACK` | `false` | Retry an empty short-source poll once with the EUI-64. EmberZNet parents queue a Rejoin Response or Transport-Key by EUI-64. |
+| `const DEFAULT_TX_POWER_DBM` | `0` | The `phyTransmitPower` that a default-PIB MLME-RESET restores. CC2340 uses its 5 dBm product default. Otherwise NWK's cold-start reset drops the radio to 0 dBm. |
 | `set_ack_frame_pending(src, on)` / `clear_ack_frame_pending()` | `Unsupported` / no-op | A parent with `hardware_auto_ack` must arm FP in the hardware or ISR source-match table. |
 | `sleep()` / `wake()` | `Ok(())` | Radio power-down between polls. `SoftMacCore::wake` re-applies channel, power and filter. |
 | `set_rx_on_when_idle(on)` | no-op | The radio keeps its receiver (or receive IRQ path) armed between operations. Called on `macRxOnWhenIdle` changes and on full reconfiguration after wake. Telink uses it to switch its IRQ-driven RX/ACK path. |
