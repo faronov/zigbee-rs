@@ -111,9 +111,11 @@ impl From<hardware::HardwareError> for RadioError {
     }
 }
 
-/// A received IEEE 802.15.4 frame with metadata.
-pub struct RxFrame {
-    pub data: [u8; fifo::MAX_PHY_FRAME_LEN],
+/// Metadata of a received IEEE 802.15.4 frame; the frame itself (without
+/// PHR and FCS) is written to the caller's buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RxInfo {
+    /// Frame length in bytes.
     pub len: usize,
     /// Received signal strength in dBm, exactly as decoded from the PBE.
     pub rssi: i8,
@@ -315,6 +317,11 @@ impl Cc2340Driver {
         self.filter_dirty = true;
         self.operation_active = false;
         self.rx_fifo_reset_pending = true;
+    }
+
+    /// The software configuration programmed at the next operation start.
+    pub const fn config(&self) -> &RadioConfig {
+        &self.config
     }
 
     pub fn update_config<F: FnOnce(&mut RadioConfig)>(&mut self, update: F) {
@@ -545,21 +552,15 @@ impl Cc2340Driver {
     /// Once the FIFO is full the receiver stops producing RSSI readings,
     /// CCA can no longer see an idle channel, and there is no room left for
     /// the frames we are about to solicit. The MAC drains it before a TX.
-    pub fn try_receive(&mut self) -> Option<RxFrame> {
+    pub fn try_receive(&mut self, data: &mut [u8; fifo::MAX_MPDU_LEN]) -> Option<RxInfo> {
         if !self.configured || !self.operation_active {
             return None;
         }
         loop {
-            match fifo::try_read_rx_frame() {
+            match fifo::try_read_rx_frame(data) {
                 Ok(Some(frame)) => {
                     self.stats.rx_frames = self.stats.rx_frames.wrapping_add(1);
-                    return Some(RxFrame {
-                        data: frame.data,
-                        len: frame.len,
-                        rssi: frame.rssi,
-                        lqi: crate::lqi::from_rssi_dbm(frame.rssi),
-                        modem_lqi: frame.modem_lqi,
-                    });
+                    return Some(rx_info(frame));
                 }
                 Ok(None) => return None,
                 Err(error) => match classify_rx_fifo_error(error) {
@@ -578,9 +579,45 @@ impl Cc2340Driver {
         }
     }
 
-    /// Return the next received frame, starting continuous RX if it is not
-    /// running. The RX operation keeps running when a frame is returned.
-    pub async fn receive(&mut self) -> Result<RxFrame, RadioError> {
+    /// The oldest committed RX FIFO entry, without consuming it. `None` when
+    /// the FIFO is empty or not accessible (radio unconfigured or asleep).
+    pub(super) fn peek_rx_head(&self) -> Option<fifo::RxHead> {
+        if self.configured && !self.asleep {
+            fifo::peek_rx_head()
+        } else {
+            None
+        }
+    }
+
+    /// Release the entry [`Self::peek_rx_head`] returned without reading it.
+    pub(super) fn discard_rx_head(&mut self, head: &fifo::RxHead) {
+        if self.configured && !self.asleep {
+            fifo::discard_rx_head(head);
+        }
+    }
+
+    /// Free RX FIFO space in bytes; `None` when it is not accessible.
+    pub(super) fn rx_free_bytes(&self) -> Option<usize> {
+        if self.configured && !self.asleep {
+            fifo::rx_free_bytes()
+        } else {
+            None
+        }
+    }
+
+    /// Discard every received frame when the next operation starts.
+    pub fn flush_rx_fifo(&mut self) {
+        self.rx_fifo_reset_pending = true;
+    }
+
+    /// Write the next received frame to `data`, starting continuous RX if it
+    /// is not running, or return `None` once `deadline` has passed. The RX
+    /// operation keeps running when a frame is returned and at the deadline.
+    pub async fn receive(
+        &mut self,
+        deadline: embassy_time::Instant,
+        data: &mut [u8; fifo::MAX_MPDU_LEN],
+    ) -> Result<Option<RxInfo>, RadioError> {
         if !self.configured {
             return Err(RadioError::RadioConfigUnavailable);
         }
@@ -599,24 +636,17 @@ impl Cc2340Driver {
                 self.start_rx()?;
             }
 
-            match fifo::try_read_rx_frame() {
+            match fifo::try_read_rx_frame(data) {
                 Ok(Some(frame)) => {
                     self.stats.rx_frames = self.stats.rx_frames.wrapping_add(1);
-                    return Ok(RxFrame {
-                        data: frame.data,
-                        len: frame.len,
-                        rssi: frame.rssi,
-                        // Normalize once, here, at the point the value
-                        // enters the stack.
-                        lqi: crate::lqi::from_rssi_dbm(frame.rssi),
-                        modem_lqi: frame.modem_lqi,
-                    });
+                    return Ok(Some(rx_info(frame)));
                 }
                 Ok(None) => {}
                 Err(error) => match classify_rx_fifo_error(error) {
                     RxFifoDisposition::DropFrame => {
                         // `try_read_rx_frame` advanced the FIFO read pointer
-                        // before decoding, so this entry is already consumed.
+                        // even though decoding failed, so this entry is
+                        // already consumed.
                         // Drop it and keep the RX operation running: a single
                         // frame whose metadata is unusable must not truncate
                         // an active scan or an association/rejoin wait.
@@ -666,6 +696,9 @@ impl Cc2340Driver {
                 fifo::clear_events(events & RX_INFO_EVENTS);
             }
 
+            if embassy_time::Instant::now() >= deadline {
+                return Ok(None);
+            }
             radio_pause().await;
         }
     }
@@ -990,6 +1023,16 @@ fn map_pbe_error(end_cause: u8) -> RadioError {
     }
 }
 
+/// Normalize the LQI once, here, at the point the frame enters the stack.
+fn rx_info(frame: fifo::RxMeta) -> RxInfo {
+    RxInfo {
+        len: frame.len,
+        rssi: frame.rssi,
+        lqi: crate::lqi::from_rssi_dbm(frame.rssi),
+        modem_lqi: frame.modem_lqi,
+    }
+}
+
 /// Wait between polls of the LRFD state. The executor sleeps (WFE) until
 /// the timer alarm instead of busy-polling at full CPU current; the radio
 /// operations being waited on take hundreds of microseconds to milliseconds.
@@ -1063,7 +1106,7 @@ mod tests {
         assert_eq!(recoverable, 1);
     }
 
-    /// A dropped frame yields no `RxFrame` at all, so there is no path by
+    /// A dropped frame yields no `RxInfo` at all, so there is no path by
     /// which an invalid-RSSI entry can reach the stack carrying a fabricated
     /// LQI. The only LQI a frame can carry is the RSSI-derived one.
     #[test]
