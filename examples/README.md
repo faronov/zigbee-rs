@@ -137,8 +137,9 @@ From the repository root:
 
 The default sensor uses full-SRAM timer `SUSPEND`. The two retention images
 are feature-gated LOW32K reset-on-wake proofs at 250 ms and 10 seconds.
-The independent retention HIL reports completion only with marker
-`0x5254600D`; that hardware gate remains open for the current proof images.
+The former independent retention HIL image was removed with
+`tools/telink-tlsr8258-lab`; the LOW32K hardware gate remains open for the
+current proof images and must run on them directly.
 
 ## Porting
 

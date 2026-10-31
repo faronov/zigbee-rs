@@ -353,6 +353,8 @@ pub enum TelinkWakeError {
     PowerManagement(tlsr8258_hal::pm::PmError),
     LowPowerNotEntered,
     TimerWakeMissing,
+    /// The radio could not be restored from the retained PIB after wake.
+    RadioResume(zigbee_mac::MacError),
 }
 
 #[cfg(target_arch = "tc32")]
@@ -394,6 +396,7 @@ impl WakeController<TelinkMac> for TelinkSuspendWake {
 
                 let mut timer0_before = 0;
                 let mut system_before = 0;
+                let mut resumed = Ok(());
                 let status = tlsr8258_hal::pm::cpu_suspend_timer_rc_transaction(
                     tlsr8258_hal::pm::system_timer_ms(request.timeout_ms),
                     |phase| match phase {
@@ -410,7 +413,7 @@ impl WakeController<TelinkMac> for TelinkSuspendWake {
                             // first, then rebase application/MAC monotonic time.
                             // The PM transaction restores IRQs only after this
                             // hook returns, including on every typed PM error.
-                            mac.resume_after_sleep();
+                            resumed = mac.resume_after_sleep();
                             let elapsed_system =
                                 tlsr8258_hal::pm::system_timer_ticks().wrapping_sub(system_before);
                             tlsr8258_hal::timer::rebase_after_suspend(
@@ -419,7 +422,9 @@ impl WakeController<TelinkMac> for TelinkSuspendWake {
                             );
                         }
                     },
-                )?;
+                );
+                resumed.map_err(TelinkWakeError::RadioResume)?;
+                let status = status?;
                 if !status.entered_low_power() {
                     return Err(TelinkWakeError::LowPowerNotEntered);
                 }
@@ -636,6 +641,7 @@ impl WakeController<TelinkMac> for TelinkRetentionWake {
                 // image even though its selected policy uses Retention.
                 let mut timer0_before = 0;
                 let mut system_before = 0;
+                let mut resumed = Ok(());
                 let status = tlsr8258_hal::pm::cpu_suspend_timer_rc_transaction(
                     tlsr8258_hal::pm::system_timer_ms(request.timeout_ms),
                     |phase| match phase {
@@ -645,13 +651,15 @@ impl WakeController<TelinkMac> for TelinkRetentionWake {
                             mac.prepare_for_sleep();
                         }
                         tlsr8258_hal::pm::SuspendTransactionPhase::Restore => {
-                            mac.resume_after_sleep();
+                            resumed = mac.resume_after_sleep();
                             let elapsed =
                                 tlsr8258_hal::pm::system_timer_ticks().wrapping_sub(system_before);
                             tlsr8258_hal::timer::rebase_after_suspend(timer0_before, elapsed);
                         }
                     },
-                )?;
+                );
+                resumed.map_err(TelinkWakeError::RadioResume)?;
+                let status = status?;
                 if !status.entered_low_power() {
                     return Err(TelinkWakeError::LowPowerNotEntered);
                 }
@@ -664,6 +672,7 @@ impl WakeController<TelinkMac> for TelinkRetentionWake {
                     .map_err(|_| TelinkWakeError::RetentionContextInvalid)?;
                 let mut timer0_before = 0;
                 let mut system_before = 0;
+                let mut resumed = Ok(());
                 let result = tlsr8258_hal::pm::cpu_sleep_timer_rc_retention_transaction(
                     tlsr8258_hal::pm::system_timer_ms(request.timeout_ms),
                     &mut state.record,
@@ -674,13 +683,14 @@ impl WakeController<TelinkMac> for TelinkRetentionWake {
                             mac.prepare_for_sleep();
                         }
                         tlsr8258_hal::pm::SuspendTransactionPhase::Restore => {
-                            mac.resume_after_sleep();
+                            resumed = mac.resume_after_sleep();
                             let elapsed =
                                 tlsr8258_hal::pm::system_timer_ticks().wrapping_sub(system_before);
                             tlsr8258_hal::timer::rebase_after_suspend(timer0_before, elapsed);
                         }
                     },
                 );
+                resumed.map_err(TelinkWakeError::RadioResume)?;
                 match result {
                     Ok(never) => match never {},
                     Err(error) => return Err(TelinkWakeError::PowerManagement(error)),

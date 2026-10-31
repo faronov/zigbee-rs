@@ -34,9 +34,17 @@ Production status:
 | BL702 | yes, via `Bl702SoftMac` | hardware-tested |
 | nRF52840/52833 | yes, via `NrfSoftMac` | build- and host-tested; no hardware run since the migration |
 | PHY6222/PHY6252 | yes, via `Phy6222SoftMac` (ISR Imm-Ack, `TxOffload::AckWait`) | hardware-tested on the PB-03F-Kit (PHY6252); EVK images build/layout only |
-| CC2340, EFR32MG1, EFR32MG21, ESP32-C6/H2, TLSR8258 | no, each has its own `MacDriver` | — |
+| TLSR8258 sensors | yes, `TelinkMac` = `SoftMacCore<TelinkRadioPhy, EndDevice>` (`TxOffload::Full`) | see the Telink platform guide |
+| TLSR8258 router | no, legacy `TelinkRouterMac` behind the `telink-legacy-router` feature | hardware-tested legacy path |
+| CC2340, EFR32MG1, EFR32MG21, ESP32-C6/H2 | no, each has its own `MacDriver` | — |
 
-The last group is Phase B of the MAC unification.
+The last group and the TLSR8258 router are the remaining Phase B work. The
+router port onto `SoftMacCore<TelinkRadioPhy, Parent<..>>` compiled and ran
+on the host, but grew the router image by 1,546 B of flash, because the
+shared parent path is more general than the hand-written one (inlined
+association/poll futures and a larger `mlme_poll_timeout`). It waits for a
+slimmer core parent path; `TelinkRadioPhy` already implements
+`set_ack_frame_pending` for it.
 
 ## What the PHY must implement
 
@@ -80,13 +88,14 @@ compiles to exactly the software path and pays nothing for the others.
 
 | item | default | use it when |
 |---|---|---|
-| `const TX_OFFLOAD: TxOffload` | `None` | `AckWait`: the ISR or radio core waits for the Imm-Ack (EFR32, PHY62x2). `Full`: the hardware runs CSMA-CA, retries and the ACK wait (CC2340 PBE, ESP). |
+| `const TX_OFFLOAD: TxOffload` | `None` | `AckWait`: the ISR or radio core waits for the Imm-Ack (EFR32, PHY62x2). `Full`: the hardware or HAL runs CSMA-CA, retries and the ACK wait (CC2340 PBE, ESP, TLSR8258). |
 | `try_transmit_acknowledged(frame)` | `Unsupported` | Required for `AckWait`. One CCA + TX + ACK wait. Returns `Ok(Some(ack))`, `Ok(None)` when no ACK arrived, or `ChannelBusy`. |
 | `transmit_offloaded(frame, ack_requested, TxParams)` | `Unsupported` | Required for `Full`. `TxParams` carries the PIB values `macMaxCSMABackoffs`, `macMinBE`, `macMaxBE` and `macMaxFrameRetries`. |
 | `const POLL_RESPONSE_WAIT_US` | 30 ms | How long to wait for indirect data after an ACK with FP=1. nRF uses 1.5 s, the value proven on hardware with the legacy MAC. |
 | `const POLL_EXTENDED_FALLBACK` | `false` | Retry an empty short-source poll once with the EUI-64. EmberZNet parents queue a Rejoin Response or Transport-Key by EUI-64. |
 | `set_ack_frame_pending(src, on)` / `clear_ack_frame_pending()` | `Unsupported` / no-op | A parent with `hardware_auto_ack` must arm FP in the hardware or ISR source-match table. |
 | `sleep()` / `wake()` | `Ok(())` | Radio power-down between polls. `SoftMacCore::wake` re-applies channel, power and filter. |
+| `set_rx_on_when_idle(on)` | no-op | The radio keeps its receiver (or receive IRQ path) armed between operations. Called on `macRxOnWhenIdle` changes and on full reconfiguration after wake. Telink uses it to switch its IRQ-driven RX/ACK path. |
 
 The core selects transmit paths with `ConstEither`, an untagged union that is
 dispatched on a constant. Do not write `if P::CONST { a.await } else { b.await }`
@@ -201,9 +210,12 @@ To find growth:
 - **ED scan on nRF.** `NrfRadioPhy::energy_detect` returns `Unsupported`,
   as the legacy `NrfMac` did, because embassy-nrf exposes no ED primitive.
 - **Hard-bounded poll.** `mlme_poll_timeout` uses the trait default, which
-  discards a late result. EFR32 and Telink cancel the radio operation with a
-  timer.
-- **Per-backend diagnostics counters.** Telink and EFR32 keep their own;
-  the core exposes only `dropped_command_events()`.
+  discards a late result. EFR32 cancels the radio operation with a timer.
+  The TLSR8258 PHY's operations are bounded busy-waits, so the default is
+  bounded there.
+- **Per-backend diagnostics counters.** EFR32 and the legacy Telink router
+  MAC keep their own; the core exposes only `dropped_command_events()`.
+  The TLSR8258 sensors keep only the HAL's `tlsr8258_hal::radio::rx_diagnostics()`;
+  the legacy MAC's ACK/queue counters were not carried over.
 - **Hardware security offload** is not modelled. Every backend uses software
   CCM* over the AES provider.

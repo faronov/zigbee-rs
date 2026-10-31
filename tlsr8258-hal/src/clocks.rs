@@ -15,11 +15,11 @@
 //! remaining clock-enable register on top of that unknown foundation.
 //! [`init`] now instead stops at the first timeout and reports
 //! [`ClockError::AnalogTimeout`] to its caller, which must not proceed
-//! into normal application code on `Err` — see this module's four call
-//! sites (`examples/telink-tlsr8258-{sensor,router}`,
-//! `examples/telink-tlsr8258-radio` via `platform::clocks::init`, and
-//! `tools/telink-tlsr8258-lab`'s `diag-pm` build) for the fail-closed halt
-//! each one performs instead of calling into its own `app`/diagnostic
+//! into normal application code on `Err` — see this module's three call
+//! sites (`examples/telink-tlsr8258-{sensor,router}` and
+//! `examples/telink-tlsr8258-radio` via `platform::clocks::init`) for the
+//! fail-closed halt each one performs instead of calling into its own
+//! `app`/diagnostic
 //! logic with a clock tree in an unknown state. None of this adds an
 //! unbounded wait: the retry budget inside [`analog_write`] is unchanged,
 //! and the fail-closed halt on `Err` is a deliberate terminal stop (the

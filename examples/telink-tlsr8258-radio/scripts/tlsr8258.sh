@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build/dump helper for the standalone TLSR8258 raw-radio bring-up crate
 # (examples/telink-tlsr8258-radio). Scoped down from
-# tools/telink-tlsr8258-lab/scripts/tlsr8258.sh: single binary, no
+# the former tools/telink-tlsr8258-lab/scripts/tlsr8258.sh: single binary, no
 # feature-mode selection, and a verify_layout that covers this crate's own
 # `.rf_dma`/`.diag` sections in addition to the shared I-cache-reservation
 # invariants. Never uses `--noinhibit-exec`: a link that violates the

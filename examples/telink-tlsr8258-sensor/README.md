@@ -12,7 +12,7 @@ products/tlsr8258-tb04
         ↓
 boards/tlsr8258-tb04
         ↓
-tlsr8258-hal + TelinkMac + tlsr8258-rt
+tlsr8258-hal + TelinkMac (SoftMacCore<TelinkRadioPhy>) + tlsr8258-rt
 ```
 
 This example is the composition/reset root. `src/app.rs` assembles
@@ -53,14 +53,9 @@ feature-gated image.
 - `sensor-retention`: reset-on-wake `Retention`, 250 ms slow cadence.
 - `sensor-retention-10s`: the same restore path, 10-second slow cadence.
 
-The independent retention HIL uses:
-
-```text
-pass: 0x5254600D
-fail: 0xDEADxxxx
-```
-
-A successful build or symbol check is not the pass marker.
+The former independent retention HIL image (pass marker `0x5254600D`) was
+removed with `tools/telink-tlsr8258-lab`; LOW32K hardware proof has to run on
+these images directly. A successful build or symbol check is not that proof.
 
 ## Build
 
@@ -110,4 +105,4 @@ primitive. Remaining acceptance includes repeated
 application-level SUSPEND with network/counter checks and measured current,
 plus LOW32K completion using the marker above.
 
-Hardware diagnostics stay under `tools/telink-tlsr8258-lab`.
+Radio bring-up diagnostics live in `examples/telink-tlsr8258-radio`.

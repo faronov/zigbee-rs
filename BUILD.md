@@ -370,15 +370,10 @@ The default sensor uses:
 10-second steady-state slow poll. Neither changes the default production
 selection.
 
-The independent retention lab is:
-
-```bash
-./scripts/tlsr8258.sh build diag-retention
-./scripts/tlsr8258.sh flash diag-retention
-```
-
-Its completion marker is `0x5254600D`; `0xDEADxxxx` indicates failure. A
-compile-time symbol/layout pass is not the HIL completion marker.
+The former independent retention lab (`diag-retention`, marker `0x5254600D`)
+was removed with `tools/telink-tlsr8258-lab`. LOW32K hardware proof must run
+on the `sensor-retention` images; a compile-time symbol/layout pass is not
+that proof.
 
 The router is `ParentRouterApp + PersistentChildren`. Its product partitions
 are `0x70000..0x72000` for APS bindings/groups/application keys,

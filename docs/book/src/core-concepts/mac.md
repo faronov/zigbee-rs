@@ -153,7 +153,8 @@ backend is behind a Cargo feature flag:
 | EFR32MG21 | `efr32mg21` | BRD4181A build/layout only; complete HIL open |
 | Mock | `mock` | host-only `ParentMacDriver`; router/coordinator/Trust-Center tests |
 
-All real backends currently implement the End Device primitives. Only Telink
+All real backends currently implement the End Device primitives. Only the
+Telink router MAC (`TelinkRouterMac`), the shared `SoftMacCore` parent role
 and `MockMac` implement the sealed `ParentMacDriver`. Telink reports
 `router: true` and `coordinator: false`; every other real backend uses
 `MacCapabilities::non_parent`. No production backend can currently advertise
@@ -306,8 +307,10 @@ impl MacDriver for MyRadioMac {
 > waiting, poll handling), study the existing `esp`, `nrf` or `efr32`
 > backends. Note that none of those is a parent: for the parent-side
 > primitives — beacon response, association response, orphan realignment and
-> frame-pending indirect delivery — the only in-tree hardware reference is the
-> Telink backend (`zigbee-mac/src/telink/`), together with the host `MockMac`.
+> frame-pending indirect delivery — the in-tree references are the shared
+> `SoftMacCore` parent role (`zigbee-mac/src/soft_mac/parent.rs`), the
+> hardware-tested legacy Telink router MAC (`zigbee-mac/src/telink/legacy.rs`)
+> and the host `MockMac`.
 
 ## MAC Primitives Reference
 

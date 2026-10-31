@@ -94,6 +94,12 @@ tlsr8258 = [
 # Backward-compatible alias for the former ambiguous feature name.
 telink = ["tlsr8258"]
 
+# Legacy hand-written TLSR8258 parent MAC (`telink::TelinkRouterMac`), used
+# only by the always-on router image until it is re-ported onto the shared
+# `SoftMacCore` parent role. The sensors never enable it, so they cannot link
+# it.
+telink-legacy-router = ["tlsr8258"]
+
 # TLSR8258 hardware AES-128 accelerator backend.
 #
 # Kept as an explicit low-level feature so non-product test compositions can

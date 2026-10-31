@@ -20,7 +20,11 @@ const STRESS_CYCLES: u32 = 100;
 
 pub fn run() -> ! {
     diag::init();
-    let mut mac = TelinkMac::new();
+    let Ok(mut mac) = TelinkMac::with_factory_address() else {
+        loop {
+            timer::sleep_ticks(timer::ms(1_000));
+        }
+    };
     let extended_address = match block_on(mac.mlme_get(PibAttribute::MacExtendedAddress)) {
         Ok(PibValue::ExtendedAddress(address)) => address,
         _ => [0; 8],
