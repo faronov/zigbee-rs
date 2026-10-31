@@ -190,7 +190,7 @@ To find growth:
    −4.3 KB of `stack` and `mac_chain`; their `data`, `bss`, `pool`,
    `stack` and `mac_chain` must still not grow (see
    [Firmware size](firmware-size.md#mac-unification-footprint-baseline)).
-3. The tight budgets stay intact: EFR32MG1 has a 376 B margin above its
+3. The tight budgets stay intact: EFR32MG1 has a 16 B margin (2026-10-31 build) above its
    16 KiB stack gate, and the TLSR8258 retained SVC stack has 256 B above its
    8 KiB gate. Run the platform's layout checker.
 4. Add host tests with a mock PHY for any new capability the backend

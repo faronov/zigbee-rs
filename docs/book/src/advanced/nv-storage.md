@@ -15,7 +15,7 @@ Partition addresses belong to the product, not a generic HAL or example loop.
 
 ## Security state
 
-`SecurityStateJournal<F>` is a two-sector atomic journal for:
+`SecurityStateJournal<F, SECTOR_SIZE>` is a two-sector atomic journal for:
 
 - network identity and keys;
 - outgoing NWK/APS counter reservations;
@@ -28,7 +28,8 @@ Each record has a version, generation, CRC, read-back verification, and a
 commit marker written last. The scanner tolerates erased, torn, corrupt, and
 unknown-version slots and selects the newest valid generation.
 
-Outgoing counters are reserved ahead in durable storage. After a crash, the
+Outgoing counters are reserved ahead in durable storage, in blocks of
+`FRAME_COUNTER_RESERVATION_SIZE` (`0x400`, `zigbee-bdb`). After a crash, the
 runtime resumes above the reservation rather than reusing a secured frame
 counter.
 
@@ -85,11 +86,14 @@ number of incoming commits available after a full-domain rollover. Product
 code and CI should assert an intentional lower bound for parent/coordinator
 images.
 
-Current security records use version 7. Version 6 distinguished a future
+Current security records use version 8
+(`SECURITY_JOURNAL_FORMAT_VERSION`). Version 6 distinguished a future
 staged Network-Key from the previous key retained after activation. Version 7
 also journals a pending PAN-ID transition/broadcast, deferred
 `Device_annce`, and the provisional-parent gate used after a restored secured
-rejoin. Older supported records decode through explicit migration paths.
+rejoin. Version 8 keeps the same 103-byte state and adds the explicit
+local-child Network-Key forwarding intent. Older supported records decode
+through explicit migration paths.
 Downgrading to firmware that cannot understand the current
 record version is not supported because selecting an older counter reservation
 can create replay risk. Production secure-boot/OTA policy must therefore keep
@@ -196,9 +200,9 @@ partition in addition to its security journal.
 Child persistence is intentionally separate from security state:
 
 - `PersistentChildren<C>` is used by `ParentRouterApp`,
-  `DistributedRouterApp`, and `CoordinatorApp`;
+  `DistributedRouterApp`, `CoordinatorApp`, and `TrustCenterCoordinatorApp`;
 - `ChildTableJournal<F>` stores bounded child snapshots;
-- `NoChildren` is used by `RelayRouterApp`.
+- `NoChildren` is used by `RelayRouterApp` and `AlwaysOnEndDeviceApp`.
 
 The child journal stores the extended PAN ID and each admitted child's
 identity/configuration/timeout enumeration. It does not store NWK/APS outgoing
@@ -244,7 +248,7 @@ same extended PAN ID.
 | nRF52840 DK sensor/always-on End Device | `0xFE000..0x100000` | UF2 variants use board-specific product maps |
 | nRF52833 sensor | `0x7E000..0x80000` | — |
 | ESP32-C6/H2 | `0x3FE000..0x400000` | OTA slots and `otadata` are separate product partitions |
-| BL702 XT-ZB1 | `0xFE000..0x100000` | — |
+| BL702 XT-ZB1 | `0xFE000..0x100000` | `bl702-boot` `0x02000..0x10000`, MCUboot primary `0x10000..0x87000`, OTA secondary `0x87000..0xFE000` |
 | CC2340R5 | `0x7E000..0x80000` | — |
 | PHY6222 | `0x7E000..0x80000` | — |
 | PHY6252 | `0x3E000..0x40000` | — |
@@ -312,9 +316,13 @@ reset-causing activation call.
 The exact 2026-09-06 images are build/layout-tested. Separately, earlier nRF,
 ESP32, EFR32MG1, and deployed TLSR8258 security-persistence paths have hardware
 evidence.
-- BL702 journal integration builds, but destructive erase/program and
-  reset/resume remain open.
-- PHY62x2, CC2340, and EFR32MG21 flash paths remain hardware-unverified.
+- BL702 XT-ZB1: join, replay commits and reset/resume succeed on hardware
+  (commit `6926796`); a signed OTA update installed by `bl702-boot` resumed
+  the network without rejoining (commit `8aeee49`).
+- PHY6252 PB-03F-Kit: journal writes and resume after reset are
+  hardware-validated (commits `3fb3f88`, `a375b23`); power-loss recovery is
+  not.
+- PHY6222, CC2340, and EFR32MG21 flash paths remain hardware-unverified.
 - Telink child-table persistence exists and passes host/target checks; complete
   corrected-image child acceptance remains a router HIL gate.
 

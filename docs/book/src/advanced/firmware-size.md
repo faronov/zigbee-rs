@@ -11,7 +11,8 @@ OTA-slot bounds, stack reserves, and linker/layout checks remain mandatory.
 
 ## TLSR8258 tail merging (2026-10-04)
 
-The current production, lab, and radio Cargo configurations explicitly enable
+The production and radio-harness Cargo configurations (and, until its removal,
+the lab's) explicitly enable
 LLVM tail merging (`-enable-tail-merge=true`) with the pinned
 `tc32-1.98.1-20261003-31a272` toolchain. This is a separate change from the
 compiler-only comparison below; the initial compiler upgrade retained the
@@ -70,34 +71,38 @@ This page is the single source of truth for recorded sizes; `BUILD.md` and the
 README link here instead of duplicating tables. CI firmware jobs also upload
 `*.size.json` measurements for the exact commit they built.
 
-Baseline snapshot: **2026-09-06**. EFR32MG1 was refreshed **2026-09-08**.
-The TLSR8258 parent-router, always-on nRF52840, EFR32MG21, CC2340 fallback,
+Baseline snapshot: **2026-09-06**.
+The TLSR8258 parent-router, always-on nRF52840, CC2340 fallback,
 and ESP32-C6/H2 rows were refreshed
 **2026-09-10**. These are named local build snapshots, not the latest remote
 CI results; unrefreshed rows do not describe the current working tree.
-PHY6222 and PHY6252 occupied-XIP measurements were refreshed **2026-10-06**.
-The recorded parent router and all four ESP variants exceeded the regression
-budgets enforced at the time; those former budgets are no longer build
+PHY6222, PHY6252 and PB-03F-Kit occupied-XIP measurements and the BL702 raw
+image, and both EFR32 rows, were refreshed **2026-10-31** (local macOS
+builds of `7d45e7e`).
+The recorded parent router, all four ESP variants and the current EFR32MG1
+image exceed the former regression budgets; those former budgets are no longer build
 blockers. Both PHY62x2 variants fit their physical XIP slot.
 Prior hardware evidence is not an exact-image HIL rerun unless
 explicitly stated.
 
 The reference column contains former, unenforced regression budgets except
-for PHY6222 and PHY6252, where it is the mandatory physical XIP slot limit.
+for PHY6222, PHY6252, PB-03F-Kit and BL702, where it is the mandatory physical
+limit (XIP slot, or the BL702 primary-slot application maximum).
 The margin is reference minus measured bytes, not physical headroom for the
 former-budget rows.
 
 | image | measured | physical limit / former budget | margin vs reference | metric |
 |---|---:|---:|---:|---|
-| PHY6222 sensor | 132,576 | 187,104 | 54,528 | occupied XIP span |
-| PHY6252 feature-selected sensor | 132,544 | 187,104 | 54,560 | occupied XIP span |
-| BL702 sensor | 189,442 | 192,512 | 3,070 | raw binary |
+| PHY6222 sensor | 138,624 | 187,104 | 48,480 | occupied XIP span |
+| PHY6252 feature-selected sensor | 138,624 | 187,104 | 48,480 | occupied XIP span |
+| PB-03F-Kit `pb03f-zigbee` (PHY6252) | 196,256 | 200,448 | 4,192 | occupied XIP span |
+| BL702 sensor (OTA-capable) | 227,216 | 482,304 | 255,088 | raw binary |
 | nRF52840 default / BME280 / SHT31 | 224,472 / 231,792 / 228,216 | 225,280 / 245,760 / 241,664 | 808 / 13,968 / 13,448 | raw binaries |
 | nRF52840 always-on End Device | 231,280 | 253,952 | 22,672 | file-backed flash span |
 | nRF52840 UF2 ProMicro / MDK / PCA10059 / DK | 222,968 / 222,848 / 224,536 / 224,552 | 237,568 each | 14,600 / 14,720 / 13,032 / 13,016 | linked images before UF2 |
 | nRF52833 default / BME280 / SHT31 | 224,464 / 231,784 / 228,208 | 225,280 / 245,760 / 241,664 | 816 / 13,976 / 13,456 | raw binaries |
-| EFR32MG1 sensor | 163,236 | 167,936 | 4,700 | raw binary |
-| EFR32MG21 sensor | 202,068 | 212,992 | 10,924 | raw binary |
+| EFR32MG1 sensor | 171,792 | 167,936 | -3,856 | raw binary; above former budget |
+| EFR32MG21 sensor | 209,028 | 212,992 | 3,964 | raw binary |
 | CC2340R5 pinned-SDK sensor (pre-static-task snapshot) | 223,536 | 225,280 | 1,744 | historical raw binary; not rebuilt |
 | CC2340R5 fallback sensor | 213,160 | 225,280 | 12,120 | raw binary; radio firmware unavailable |
 | ESP32-C6 sensor default / `light-sleep` | 381,056 / 392,080 | 368,640 each | -12,416 / -23,440 | application images; above former budget |
@@ -115,18 +120,23 @@ These older snapshots use their listed compilers, not the current TC32 pin.
 Compiler comparisons require holding source, features, and build flags constant,
 as in the controlled TLSR8258 rebuild above.
 
-The October 6 PHY62x2 measurements keep `nightly-2026-08-01` and the
+The PHY62x2 measurements keep `nightly-2026-08-01` and the
 existing product feature sets, with target-local identical-code folding and
 the `immediate-abort` panic strategy (every panic site is a `udf` trap into
 the halting `HardFault` handler instead of a `panic-halt` call with
 arguments and `Location` records; this alone saves 3,328 B). They include the
 R22/BDB/ZCL conformance and security fixes, which grew the image from
 130,752 B to 135,520 B before size work. Both variants link and pass the
-layout check locally on macOS; Linux CI has not yet run on this source.
+layout check locally on macOS. The growth from the October 6 figures
+(132,576/132,544 B) to 138,624 B came mostly with the move to `SoftMacCore`
+(about +6.2 KB; see "Phase B: PHY62x2" below).
 
 Additional artifacts and physical limits:
 
-- BL702 boot image: 197,648 B; physical slot: 1,044,480 B.
+- BL702: overwrite-only loader at `0x2000..0x10000`, primary slot
+  `0x10000..0x87000` (application maximum `0x75C00` = 482,304 B after the
+  MCUboot header and trailer sector), secondary OTA slot `0x87000..0xFE000`;
+  CI rejects a larger raw application.
 - EFR32MG1's prior Zigbee OTA container was 162,538 B; it has not been
   regenerated for the current image. Resident Gecko bootloader assumed.
 - EFR32MG21: no OTA packaging path.
@@ -137,8 +147,9 @@ Additional artifacts and physical limits:
   These combined-fix images have host validation, not hardware execution
   evidence. Exceeding their former regression budgets no longer blocks builds;
   the physical OTA-slot and other validation checks still apply.
-- PHY6252 links within its physical XIP slot; its hardware path remains
-  unverified.
+- The PHY6252 EVK image links within its physical XIP slot; its hardware
+  path remains unverified. Only the PB-03F-Kit (PHY6252) has hardware
+  evidence.
 - TLSR8258 physical application boundary: 458,752 B (`0x70000`), followed by
   APS/child/security journals at `0x70000`/`0x72000`/`0x74000`.
 
@@ -156,9 +167,11 @@ assertions; removing the regression gate does not establish hardware acceptance.
 
 | image | `.data` | `.bss` | static total | stack |
 |---|---:|---:|---:|---:|
-| PHY6222 / PHY6252 | 652 | 4,288 | 4,940 | 54,384 available |
-| EFR32MG1 | 260 | 14,720 | 14,980 | 16,760 available |
-| EFR32MG21 | 308 | 18,320 | 18,628 | 46,904 available |
+| PHY6222 / PHY6252 | 1,216 | 16,572 | 17,788 | 41,540 available |
+| PB-03F-Kit `pb03f-zigbee` | 1,304 | 16,628 | 17,932 | 41,396 available |
+| BL702 sensor | 592 | 16,592 | 17,184 | 15,360 reserved |
+| EFR32MG1 | 288 | 15,056 | 15,344 | 16,400 available |
+| EFR32MG21 | 316 | 18,888 | 19,204 | 46,328 available |
 | nRF52840 always-on End Device | 88 | 18,444 | 18,532 | 242,588 available |
 | CC2340R5 fallback | 16 | 17,428 | 17,444 | 19,420 available |
 | ESP32-C6 default / `light-sleep` | 3,412 / 3,608 | 50,384 | 53,796 / 53,992 | 390,696 / 390,504 linked |
@@ -172,8 +185,8 @@ Its 18,408 B and CC2340's 16,776 B main-task pools now use compiler-sized
 static storage rather than the insufficient dynamic arena; both linkers
 require at least 16 KiB of stack reserve. CC2340's old pinned-SDK RAM figure
 is not a valid measurement of this new task allocation.
-EFR32MG1 has exactly `0x7C00` bytes of usable SRAM and 376 B of margin above
-its 16 KiB stack gate. TLSR8258's retained SVC stack has 256 B above its 8 KiB
+EFR32MG1 has exactly `0x7C00` bytes of usable SRAM and only 16 B of margin
+above its 16 KiB stack gate. TLSR8258's retained SVC stack has 256 B above its 8 KiB
 gate. These linked values are not runtime high-water measurements.
 
 ## Measurement versus physical limits

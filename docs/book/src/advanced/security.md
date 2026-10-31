@@ -72,12 +72,24 @@ let key = nwk_security.key_by_seq(frame_key_seq);
 ### AES-128-CCM\* Encryption
 
 Zigbee uses Security Level 5: **ENC-MIC-32** — the payload is encrypted *and*
-authenticated with a 4-byte MIC. The implementation uses the RustCrypto `aes`
-and `ccm` crates (pure Rust, `#![no_std]`, no allocator):
+authenticated with a 4-byte MIC. `zigbee-crypto` implements CCM\* itself over
+fixed stack buffers (`#![no_std]`, no allocator); only the AES block cipher
+comes from the RustCrypto `aes` crate:
 
-```rust
-type ZigbeeCcm = Ccm<Aes128, U4, U13>;  // M=4 byte MIC, L=2, nonce=13
+```rust,ignore
+// 13-byte nonce, 4-byte MIC, at most 124 plaintext bytes per frame.
+// Returns heapless::Vec<u8, 128> (ciphertext || MIC), None on bad length.
+let out = ccm_star_encrypt(&key, &nonce, &aad, plaintext);
+// Same algorithm over any single-block AES engine; Err = engine failure.
+let out = ccm_star_encrypt_with(&mut cipher /* impl Aes128Forward */, &nonce, &aad, plaintext)?;
 ```
+
+The MAC driver chooses the block cipher through
+`ForwardAesProvider::forward_cipher()`. The default is `SoftwareAesProvider`;
+backends with an AES peripheral (nRF ECB via `hardware-aes-nrf`, ESP32, and the opt-in
+`hardware-aes`/`hardware-aes-bl702`/`hardware-aes-efr32mg1` features) return a
+hardware `Aes128Forward`. AES-MMO (`aes_mmo_hash`) and install-code key
+derivation use the same hook.
 
 The CCM\* nonce is built from the security auxiliary header:
 
@@ -263,8 +275,11 @@ The `ApsSecurity` context manages a table of per-device link keys:
 
 ```rust
 pub struct ApsSecurity {
-    key_table: heapless::Vec<ApsLinkKeyEntry, 16>,  // MAX_KEY_TABLE_ENTRIES = 16
+    // MAX_KEY_TABLE_ENTRIES: 16, or 32 with the `trust-center` feature
+    key_table: heapless::Vec<ApsLinkKeyEntry, MAX_KEY_TABLE_ENTRIES>,
     default_tc_link_key: AesKey,
+    distributed_security_link_key: Option<AesKey>,
+    // ...global-key replay floors and stale-floor bookkeeping
 }
 
 pub struct ApsLinkKeyEntry {
@@ -272,7 +287,9 @@ pub struct ApsLinkKeyEntry {
     pub key: AesKey,
     pub key_type: ApsKeyType,
     pub outgoing_frame_counter: u32,
+    pub outgoing_frame_counter_limit: u32, // end of the durable reservation
     pub incoming_frame_counter: u32,
+    pub incoming_frame_counter_valid: bool,
 }
 ```
 
@@ -290,7 +307,9 @@ aps_sec.add_key(ApsLinkKeyEntry {
     key: my_app_key,
     key_type: ApsKeyType::ApplicationLinkKey,
     outgoing_frame_counter: 0,
+    outgoing_frame_counter_limit: 0, // no reservation: cannot transmit yet
     incoming_frame_counter: 0,
+    incoming_frame_counter_valid: false,
 })?;
 
 // Look up a key
@@ -333,14 +352,17 @@ replay floor, and only then releases a legacy AR=1 acknowledgement, if requested
 When a new device joins the network, the Trust Center distributes the network
 key through this sequence:
 
-1. **Device sends Association Request** (MAC layer, unencrypted).
-2. **Parent router forwards the request** to the Trust Center.
+1. **Device sends Association Request** to its parent (MAC layer, unencrypted).
+2. **Parent sends APS Update-Device** to the Trust Center, reporting the
+   unsecured join (skipped when the parent is the Trust Center).
 3. **Trust Center encrypts the network key** with the joining device's TC link
    key (either the well-known default or an install-code-derived key).
 4. **APS Transport-Key command** carries the encrypted network key to the
    device via its parent router.
-5. **Device decrypts the network key** and stores it in NV.
-6. **Device sends APS Update-Device** to confirm it's now secured.
+5. **Device decrypts the network key**, commits it to `SecurityStateJournal`,
+   and announces itself with `Device_annce`.
+6. Zigbee 3.0 devices then replace the default TC link key with a unique one
+   (Request-Key/Verify-Key, `zigbee_bdb::tclk_exchange`).
 
 After this exchange, the device can encrypt and decrypt NWK frames like all
 other nodes on the network.
@@ -353,7 +375,9 @@ Install codes provide a per-device unique link key, eliminating the security
 weakness of the well-known default key. An install code is:
 
 - A 6, 8, 12, or 16-byte random value printed on the device label
-- Combined with a 2-byte CRC-16
+  (Zigbee 3.0 BDB commissioning accepts only the 16-byte form; the shorter
+  legacy forms are available through `zigbee_crypto::derive_install_code_key`)
+- Combined with a 2-byte little-endian CRC-16 (the CRC is part of the hash input)
 - Hashed using Matyas–Meyer–Oseas (MMO) to derive a unique 128-bit link key
 - Pre-provisioned on the Trust Center *before* the device joins
 
@@ -361,6 +385,7 @@ The authoritative Coordinator implementation can provision and derive an
 install-code key before admitting the device:
 
 ```rust,ignore
+// 18 bytes: 16-byte install code + 2-byte CRC
 let derived_key =
     app.provision_install_code(device_ieee, install_code_with_crc)?;
 ```
