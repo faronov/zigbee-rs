@@ -55,6 +55,8 @@ jobs:
         run: python3 -m unittest discover -s tools -p 'test_firmware_size_report.py' -v
       - name: Test BL702 OTA release tooling
         run: python3 -m unittest discover -s tools -p 'test_bl702_ota.py' -v
+      - name: Test MAC footprint stack-frame analysis
+        run: python3 -m unittest discover -s tools -p 'test_mac_footprint.py' -v
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}

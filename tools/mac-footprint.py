@@ -303,6 +303,38 @@ def _imm(operands: str) -> int | None:
     return int(m.group(1), 0) if m else None
 
 
+# RISC-V instructions that do not write their first operand.
+RV_NO_DEST = re.compile(r"^(c\.)?(sw|sh|sb|swsp|fsw|fsd|fswsp|fsdsp|beq|bne|blt|bge|"
+                        r"bltu|bgeu|beqz|bnez|j|jr)$")
+
+
+def _rv_const(regs: dict[str, int], mnemonic: str, operands: str) -> None:
+    """Track registers loaded with a constant in a RISC-V prologue.
+
+    Frames larger than an ``addi`` immediate (2 KiB) are allocated with
+    ``lui aN, hi; addi aN, aN, lo; sub sp, sp, aN``.  Any other write to a
+    tracked register forgets it, so a stale value is never used.
+    """
+    ops = [o.strip() for o in operands.split(",")]
+    if not ops or not re.fullmatch(r"[a-z]+\d*", ops[0]) or RV_NO_DEST.match(mnemonic):
+        return
+    dest = ops[0]
+    try:
+        if mnemonic in ("lui", "c.lui") and len(ops) == 2:
+            value = (int(ops[1], 0) << 12) & 0xFFFF_FFFF
+            regs[dest] = value - (1 << 32) if value & 0x8000_0000 else value
+            return
+        if mnemonic in ("li", "c.li") and len(ops) == 2:
+            regs[dest] = int(ops[1], 0)
+            return
+        if mnemonic in ("addi", "c.addi") and ops[1:2] == [dest] and dest in regs:
+            regs[dest] += int(ops[-1], 0)
+            return
+    except ValueError:
+        pass
+    regs.pop(dest, None)
+
+
 @dataclass
 class Func:
     name: str
@@ -320,6 +352,10 @@ PANIC_RE = re.compile(r"panic|rust_begin_unwind|slice_index_fail|unwrap_failed|"
 
 
 def analyse_stack(elf: Path) -> dict:
+    return analyse_disassembly(run("llvm-objdump", elf, "-d", "-C", "--no-show-raw-insn"))
+
+
+def analyse_disassembly(disasm: str) -> dict:
     funcs: dict[int, Func] = {}
     order: list[int] = []
     current: Func | None = None
@@ -329,7 +365,8 @@ def analyse_stack(elf: Path) -> dict:
     literal_regs: dict[str, int] = {}
     # (function, literal address) for ``add sp, rN`` frame allocations.
     literal_frames: list[tuple[Func, int]] = []
-    disasm = run("llvm-objdump", elf, "-d", "-C", "--no-show-raw-insn")
+    # RISC-V registers holding a prologue constant (see ``_rv_const``).
+    rv_regs: dict[str, int] = {}
     for line in disasm.splitlines():
         m = FUNC_RE.match(line)
         if m and not m.group(2).startswith((".L", "$")):
@@ -338,6 +375,7 @@ def analyse_stack(elf: Path) -> dict:
             order.append(cur_addr)
             prologue = 0
             literal_regs = {}
+            rv_regs = {}
             continue
         m = WORD_RE.match(line)
         if m:
@@ -357,7 +395,12 @@ def analyse_stack(elf: Path) -> dict:
             if literal:
                 literal_regs[register] = int(literal.group(1), 16)
         if prologue <= 24:
-            if mnemonic in ("push", "push.w", "tpush") or \
+            if mnemonic in ("auipc", "lui", "c.lui", "li", "c.li", "la") and \
+                    re.match(r"^\s*sp\s*,", operands):
+                # A RISC-V stack switch (e.g. a trap handler loading its own
+                # stack top), not a frame of the current stack.
+                current.dynamic = True
+            elif mnemonic in ("push", "push.w", "tpush") or \
                     (mnemonic == "stmdb" and operands.strip().startswith("sp!")):
                 current.frame += 4 * _reg_count(operands)
             elif mnemonic in ("vpush", "vpush.64"):
@@ -367,26 +410,33 @@ def analyse_stack(elf: Path) -> dict:
                     operands.split(",")[1].strip() in literal_regs:
                 literal_frames.append(
                     (current, literal_regs[operands.split(",")[1].strip()]))
-            elif re.match(r"^(sub|subw|sub\.w|tsub|tsubs)$", mnemonic) and \
+            elif re.match(r"^(sub|subw|sub\.w|tsub|tsubs|c\.sub)$", mnemonic) and \
                     re.match(r"^\s*sp\s*,", operands):
                 value = _imm(operands)
-                if value is None:
-                    current.dynamic = True
-                else:
+                source = operands.split(",")[-1].strip()
+                if value is not None:
                     current.frame += abs(value)
+                elif re.match(r"^\s*sp\s*,\s*sp\s*,", operands) and \
+                        rv_regs.get(source, 0) > 0:
+                    current.frame += rv_regs[source]
+                else:
+                    current.dynamic = True
             elif mnemonic in ("addi", "c.addi16sp", "c.addi") and \
                     re.match(r"^\s*sp\s*,\s*sp", operands):
                 value = _imm(operands)
                 if value is not None and value < 0:
                     current.frame += -value
-            elif mnemonic in ("sub", "c.sub") and re.match(r"^\s*sp\s*,\s*sp\s*,", operands):
-                current.dynamic = True
-            elif mnemonic in ("add", "tadd") and re.match(r"^\s*sp\s*,", operands):
+            elif mnemonic in ("add", "tadd", "c.add") and re.match(r"^\s*sp\s*,", operands):
                 value = _imm(operands)
-                if value is None:
+                source = operands.split(",")[-1].strip()
+                if value is None and re.match(r"^\s*sp\s*,\s*sp\s*,", operands) and \
+                        rv_regs.get(source, 0) < 0:
+                    current.frame += -rv_regs[source]
+                elif value is None:
                     current.dynamic = True
                 elif value < 0:
                     current.frame += -value
+            _rv_const(rv_regs, mnemonic, operands)
         target = TARGET_RE.search(operands)
         if target is None:
             if mnemonic in INDIRECT and not re.match(r"^\s*(lr|ra)\s*$", operands):

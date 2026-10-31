@@ -281,14 +281,6 @@ The tool originally counted these frames as 0 B. It now reads the literal
 and adds the frame; a non-negative literal marks the frame dynamic. Thumb-2
 (nRF52, EFR32) uses immediates, so its rows are unaffected.
 
-RISC-V has the same gap and the tool does not yet handle it. A frame larger
-than 2 KiB is built in a register (`lui aN, ..; addi aN, aN, ..;
-sub sp, sp, aN`); the tool marks that `sub` dynamic and counts 0 B. The ESP32
-`stack` and `mac_chain` rows therefore omit the large init frames
-(`main`, `build_device`, `into_soft_mac`) on master and on the branch alike;
-the true values are listed in the ESP32-C6/H2 section below. BL702 has not
-been re-checked.
-
 The corrected rows in `tools/mac-footprint-baseline.json` were raised by the
 under-count. The `stack` and `mac_chain` values in the `44d457c` table below
 are the old, under-counted values. Corrected values (bytes):
@@ -317,6 +309,38 @@ These are static direct-call bounds and include paths that may not nest at
 run time. They still need review against runtime stack high-water
 measurements on hardware. The CC2340 bound (24,072 B) fits its 29,244 B
 stack region, and PHY62x2 fits its 54,384 B.
+
+RISC-V (BL702, ESP32) had the same gap. A frame larger than an `addi`
+immediate (2 KiB) is built in a register:
+
+```text
+lui  aN, 0x2
+addi aN, aN, -0x780
+sub  sp, sp, aN
+```
+
+The tool used to mark that `sub` dynamic and count 0 B. It now tracks
+`lui`/`li`/`addi` constants in the prologue and adds them on
+`sub sp, sp, reg` (or a negative constant on `add sp, sp, reg`). Any other
+write to the register forgets the constant. A stack switch that loads `sp`
+itself (`auipc sp, ..`, esp-hal's stack-guard trap) stays dynamic.
+`tools/test_mac_footprint.py` covers these cases. On the same ELFs, only the
+`stack` and `mac_chain` of the five RISC-V rows changed; `nrf52840-sensor`,
+`phy6222-sensor` and `tlsr8258-sensor` measure identically with the old and
+new tool:
+
+| image | `stack` | `mac_chain` | newly counted frame |
+|---|---:|---:|---|
+| bl702-sensor | 20,752 → 26,832 (+6,080) | 19,104 → 25,184 (+6,080) | `__sensor_task` 256 → 6,336 B |
+| esp32c6-sensor | 29,840 → 36,112 (+6,272) | 24,448 → 30,720 (+6,272) | `main` 256 → 6,528 B |
+| esp32c6-sensor-light-sleep | 30,080 → 36,336 (+6,256) | 24,688 → 30,944 (+6,256) | `main` |
+| esp32h2-sensor | 29,840 → 36,112 (+6,272) | 24,448 → 30,720 (+6,272) | `main` |
+| esp32h2-sensor-light-sleep | 30,080 → 36,336 (+6,256) | 24,688 → 30,944 (+6,256) | `main` |
+
+These are measurement corrections, not firmware changes. The baseline rows
+were raised to the corrected values. Earlier RISC-V `stack` and `mac_chain`
+figures in this chapter, including the ESP32-C6/H2 and `44d457c` tables, are
+the old, under-counted values.
 
 The CC2340 image uses
 the fallback (no SDK) mode, because SDK mode cannot be built locally. The
@@ -678,9 +702,9 @@ equal-length path:
 
 Notes on the table:
 
-- **True stack:** the `stack` and `mac_chain` columns have the RISC-V gap
-  described above. Counting the `lui`/`addi`/`sub sp, sp, aN` frames
-  gives a worst-path `stack` of 60,448 / 60,432 / 60,448 / 60,416 B on master
+- **True stack:** the `stack` and `mac_chain` columns were measured before
+  the RISC-V fix described above. Counting the `lui`/`addi`/`sub sp, sp, aN`
+  frames gives a worst-path `stack` of 60,448 / 60,432 / 60,448 / 60,416 B on master
   and 36,112 / 36,336 / 36,112 / 36,336 B here (about -24 KB). It also gives a
   `mac_chain` of 50,976 / 51,248 / 50,640 / 50,864 B on master and
   30,720 / 30,944 / 30,720 / 30,944 B here.
