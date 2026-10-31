@@ -902,8 +902,15 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
         self.poll_within(u32::MAX)
     }
 
-    /// [`Self::poll`] with the `mlme_poll_timeout` contract: a frame whose
-    /// poll completed `timeout_us` or later after the call is discarded.
+    /// [`Self::poll`] with the `mlme_poll_timeout` contract: no frame that
+    /// completed `timeout_us` or later after the call is returned.
+    ///
+    /// The deadline is checked after each Data Request, and the
+    /// poll-response window is cut at it. A frame that arrives later is not
+    /// consumed here: it stays queued in pending RX, or with the radio, for
+    /// a later receive. (A radio that acknowledges in hardware or in its
+    /// receive interrupt has already acknowledged such a frame, so dropping
+    /// it would lose it.)
     ///
     /// A short-source poll that returned nothing is followed (with
     /// [`RadioPhy::POLL_EXTENDED_FALLBACK`]) by a second, extended-source
@@ -912,56 +919,59 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
     /// poll is reported as "no data" so it never masks the first result.
     pub async fn poll_within(&mut self, timeout_us: u32) -> Result<Option<MacFrame>, MacError> {
         let started_at = self.phy.monotonic_micros();
-        let frame = 'poll: {
-            if let Some(frame) = self.take_pending_data() {
-                break 'poll Some(frame);
-            }
-            if let Some(error) = self.pending_error.take() {
-                return Err(error);
-            }
+        if let Some(frame) = self.take_pending_data() {
+            return Ok(Some(frame));
+        }
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
 
-            let (coordinator, own_short, has_short_source, has_extended_source) =
-                self.poll_addresses()?;
-            let mut short_source = has_short_source;
-            let mut first_pass = true;
-            loop {
-                let sent = {
-                    let sequence = self.pib.next_dsn();
-                    let request = if short_source {
-                        build_data_request_short(sequence, &coordinator, own_short)
-                    } else {
-                        build_data_request(sequence, &coordinator, &self.pib.extended_address())
-                    };
-                    self.transmit(&request, true).await
+        let (coordinator, own_short, has_short_source, has_extended_source) =
+            self.poll_addresses()?;
+        let mut short_source = has_short_source;
+        loop {
+            let sent = {
+                let sequence = self.pib.next_dsn();
+                let request = if short_source {
+                    build_data_request_short(sequence, &coordinator, own_short)
+                } else {
+                    build_data_request(sequence, &coordinator, &self.pib.extended_address())
                 };
-                let ack = match sent {
-                    Ok(ack) => ack,
-                    Err(error) if first_pass => return Err(error),
-                    Err(_) => break 'poll None,
-                };
-                if let Some(frame) = self.take_pending_data() {
-                    break 'poll Some(frame);
-                }
-                // IEEE 802.15.4-2015 §6.7.3: after Frame Pending the parent
-                // delivers the buffered frame from itself to this device;
-                // `listen` queues it at the front of pending RX.
-                if ack.frame_pending
-                    && self
-                        .listen(P::POLL_RESPONSE_WAIT_US, Want::PollResponse)
-                        .await?
-                        .is_some()
-                {
-                    break 'poll self.take_pending_data();
-                }
-                if !(P::POLL_EXTENDED_FALLBACK && short_source && has_extended_source) {
-                    break 'poll None;
-                }
-                short_source = false;
-                first_pass = false;
+                self.transmit(&request, true).await
+            };
+            let ack = match sent {
+                Ok(ack) => ack,
+                // Only the first pass (`short_source` still as resolved)
+                // reports a failure.
+                Err(error) if short_source == has_short_source => return Err(error),
+                Err(_) => return Ok(None),
+            };
+            let elapsed = self.phy.monotonic_micros().wrapping_sub(started_at);
+            if elapsed >= timeout_us {
+                return Ok(None);
             }
-        };
-        let elapsed = self.phy.monotonic_micros().wrapping_sub(started_at);
-        Ok(frame.filter(|_| elapsed < timeout_us))
+            if let Some(frame) = self.take_pending_data() {
+                return Ok(Some(frame));
+            }
+            // IEEE 802.15.4-2015 §6.7.3: after Frame Pending the parent
+            // delivers the buffered frame from itself to this device;
+            // `listen` queues it at the front of pending RX.
+            if ack.frame_pending
+                && self
+                    .listen(
+                        P::POLL_RESPONSE_WAIT_US.min(timeout_us - elapsed),
+                        Want::PollResponse,
+                    )
+                    .await?
+                    .is_some()
+            {
+                return Ok(self.take_pending_data());
+            }
+            if !(P::POLL_EXTENDED_FALLBACK && short_source && has_extended_source) {
+                return Ok(None);
+            }
+            short_source = false;
+        }
     }
 
     /// Resolve the parent address and our preferred source address for a
@@ -1614,6 +1624,10 @@ mod tests {
         hw_pending: heapless::Vec<(MacAddress, bool), 8>,
         hw_pending_cleared: bool,
         rx_on_when_idle: Option<bool>,
+        /// Mock time that one `try_transmit` takes.
+        tx_duration_us: u32,
+        /// `timeout_us` of every `receive` call.
+        rx_timeouts: heapless::Vec<u32, 8>,
     }
 
     impl<T: TxOffload, const FALLBACK: bool, const POWER: i8> TestPhy<T, FALLBACK, POWER> {
@@ -1643,6 +1657,8 @@ mod tests {
                 hw_pending: heapless::Vec::new(),
                 hw_pending_cleared: false,
                 rx_on_when_idle: None,
+                tx_duration_us: 0,
+                rx_timeouts: heapless::Vec::new(),
             }
         }
     }
@@ -1660,6 +1676,7 @@ mod tests {
 
         async fn try_transmit(&mut self, frame: &[u8]) -> Result<(), PhyError> {
             self.tx_attempts = self.tx_attempts.saturating_add(1);
+            self.now_us = self.now_us.wrapping_add(self.tx_duration_us);
             self.last_tx.clear();
             self.last_tx
                 .extend_from_slice(frame)
@@ -1676,9 +1693,10 @@ mod tests {
 
         async fn receive(
             &mut self,
-            _timeout_us: u32,
+            timeout_us: u32,
             frame: &mut PhyRxFrame,
         ) -> Result<bool, PhyError> {
+            let _ = self.rx_timeouts.push(timeout_us);
             match self.rx_frames.pop_front().unwrap_or(Ok(None)) {
                 Ok(Some(received)) => {
                     *frame = received;
@@ -3657,21 +3675,61 @@ mod tests {
         assert!(core.take_pending_rx().is_none());
     }
 
+    /// Frame Pending Imm-Ack for the first Data Request (DSN 1).
+    fn pending_ack() -> PhyRxFrame {
+        PhyRxFrame::from_slice(&[0x12, 0x00, 0x01], 255).unwrap()
+    }
+
     #[test]
-    fn poll_within_discards_a_response_completed_at_the_deadline() {
+    fn poll_within_caps_the_response_window_at_the_callers_deadline() {
         let mut core = associated_core();
+        core.phy_mut().tx_duration_us = 4_000;
         let rx = &mut core.phy_mut().rx_frames;
-        rx.push_back(Ok(Some(
-            PhyRxFrame::from_slice(&[0x12, 0x00, 0x01], 255).unwrap(),
-        )))
-        .unwrap();
+        rx.push_back(Ok(Some(pending_ack()))).unwrap();
         rx.push_back(Ok(Some(unicast_data(0x70, 0x0000, 0x5678, 0xEE))))
             .unwrap();
 
-        assert!(block_on(core.poll_within(0)).unwrap().is_none());
-        // The response was still acknowledged and consumed.
+        let frame = block_on(core.poll_within(10_000)).unwrap().unwrap();
+
+        assert_eq!(frame.as_slice(), [0xEE]);
+        // 10 ms budget - 4 ms transmit, below POLL_RESPONSE_WAIT_US (30 ms).
+        assert_eq!(core.phy().rx_timeouts.last(), Some(&6_000));
+    }
+
+    #[test]
+    fn poll_within_leaves_a_response_after_the_deadline_with_the_radio() {
+        let mut core = associated_core();
+        core.phy_mut().tx_duration_us = 1_000;
+        let rx = &mut core.phy_mut().rx_frames;
+        rx.push_back(Ok(Some(pending_ack()))).unwrap();
+        rx.push_back(Ok(Some(unicast_data(0x70, 0x0000, 0x5678, 0xEE))))
+            .unwrap();
+
+        // The Data Request (and its ACK) used the whole budget.
+        assert!(block_on(core.poll_within(1_000)).unwrap().is_none());
+        // The late response was neither received, acknowledged nor consumed.
+        assert!(core.phy().sent_acks.is_empty());
+        assert_eq!(core.phy().rx_frames.len(), 1);
+        let indication = block_on(core.receive_data(1_000)).unwrap();
+        assert_eq!(indication.payload.as_slice(), [0xEE]);
         assert_eq!(core.phy().sent_acks.as_slice(), [(0x70, false)]);
-        assert!(core.take_pending_rx().is_none());
+    }
+
+    #[test]
+    fn poll_within_keeps_a_frame_retained_after_the_deadline_queued() {
+        let mut core = associated_core();
+        core.phy_mut().tx_duration_us = 1_000;
+        let rx = &mut core.phy_mut().rx_frames;
+        // Heard during the Data Request's ACK wait, after the deadline.
+        rx.push_back(Ok(Some(unicast_data(0x70, 0x0000, 0x5678, 0xEE))))
+            .unwrap();
+        rx.push_back(Ok(Some(pending_ack()))).unwrap();
+
+        assert!(block_on(core.poll_within(1_000)).unwrap().is_none());
+        // Acknowledged when it was heard; still queued, not lost.
+        assert_eq!(core.phy().sent_acks.as_slice(), [(0x70, false)]);
+        let indication = block_on(core.receive_data(1_000)).unwrap();
+        assert_eq!(indication.payload.as_slice(), [0xEE]);
     }
 
     #[test]

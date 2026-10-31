@@ -267,9 +267,14 @@ To find growth:
 - **ED scan on nRF.** `NrfRadioPhy::energy_detect` returns `Unsupported`,
   as the legacy `NrfMac` did, because embassy-nrf exposes no ED primitive.
 - **Hard-bounded poll.** `mlme_poll_timeout` (`SoftMacCore::poll_within`)
-  discards a result that completed at or after the deadline, but does not
-  cancel the radio operation. EFR32 cancels it with a timer. The TLSR8258
-  PHY's operations are bounded busy-waits, so the deadline is bounded there.
+  checks the deadline after each Data Request and cuts the poll-response
+  window at it (`POLL_RESPONSE_WAIT_US.min(remaining)`). A frame that
+  arrives later is not consumed: it stays in pending RX or with the radio
+  for the next receive, because a radio that acknowledges in hardware or in
+  its ISR has already acknowledged it. The Data Request transmit itself
+  (CSMA-CA, ACK wait, retries) is not cancelled, so a poll can overrun the
+  deadline by at most one bounded transmit. EFR32 cancels it with a timer.
+  The TLSR8258 PHY's operations are bounded busy-waits.
 - **Per-backend diagnostics counters.** EFR32 keeps its own; the core
   exposes only `dropped_command_events()`. The TLSR8258 images keep the HAL's
   `tlsr8258_hal::radio::rx_diagnostics()`; the router also reports

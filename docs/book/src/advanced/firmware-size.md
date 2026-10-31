@@ -717,6 +717,32 @@ Notes on the table:
 - **Validation:** the port is build-, layout-, symbol- and host-tested only.
   No ESP hardware run has been done with it.
 
+### Core: poll listen bounded by the caller's timeout
+
+`SoftMacCore::poll_within` now checks the deadline after each Data Request
+and listens for the poll response for at most
+`POLL_RESPONSE_WAIT_US.min(remaining)`. Before, it listened for the full
+window and discarded a late result afterwards. A late frame is no longer
+consumed and dropped; it stays queued (or with the radio) for the next
+receive. The pass flag was folded into `short_source == has_short_source`,
+which pays for the extra comparison. Every on-core image was rebuilt from
+the same path at `8ca6514` (sources identical to `d8bf8bc`) and with the
+change, and both were reported with the `d8bf8bc` tool:
+
+| image | `flash` | `data` | `bss` | `pool` | `stack` | `mac_chain` |
+|---|---:|---:|---:|---:|---:|---:|
+| bl702-sensor | -28 | 0 | 0 | 0 | 0 | 0 |
+| cc2340-sensor-fallback | -4 | 0 | 0 | 0 | 0 | 0 |
+| esp32c6/h2-sensor (4 images) | -56 | 0 | 0 | 0 | 0 | 0 |
+| nrf52833/840 (12 images) | -28 | 0 | 0 | 0 | 0 | 0 |
+| pb03f-zigbee, phy6222-sensor, phy6252-sensor | 0 | 0 | 0 | 0 | 0 | 0 |
+| tlsr8258-router | -36 | 0 | 0 | 0 | 0 | 0 |
+| tlsr8258-sensor (3 images) | -92 | 0 | 0 | 0 | 0 | 0 |
+
+`mac_stack` falls by 96–136 B on bl702, cc2340, the nRF sensors and the
+TLSR8258 sensors (smaller `poll_within` frame). The worst-path `stack` is
+unchanged.
+
 ## Measurement commands
 
 Raw binary:
