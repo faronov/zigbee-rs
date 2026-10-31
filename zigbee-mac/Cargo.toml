@@ -14,6 +14,7 @@ zigbee-crypto = { version = "0.1.0", path = "../zigbee-crypto" }
 tlsr8258-hal = { path = "../tlsr8258-hal", optional = true }
 bl702-hal = { path = "../bl702-hal", optional = true }
 efr32mg1-hal = { path = "../efr32mg1-hal", optional = true }
+efr32s2-hal = { path = "../efr32s2-hal", optional = true }
 
 # ── ESP32-C6 backend ────────────────────────────────────────
 esp-hal = { version = "=1.0.0", features = ["rt", "unstable"], default-features = false, optional = true }
@@ -158,8 +159,15 @@ hardware-aes-efr32mg1 = [
     "zigbee-crypto/efr32mg1",
 ]
 
+# EFR32 Series 2 `Efr32s2RadioPhy` on `SoftMacCore` (pure-Rust radio in
+# `efr32s2-hal`). Select exactly one chip.
 efr32mg21 = [
-    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
+    "dep:efr32s2-hal", "efr32s2-hal/efr32mg21",
+    "dep:embassy-time", "dep:embassy-futures",
+]
+efr32mg22 = [
+    "dep:efr32s2-hal", "efr32s2-hal/efr32mg22",
+    "dep:embassy-time", "dep:embassy-futures",
 ]
 
 [lints.rust]
