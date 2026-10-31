@@ -1,0 +1,13 @@
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+rustflags = [
+    "-L", "../../products/efr32mg22-sensor/link",
+    "-L", "../../efr32s2-hal/link/efr32mg22",
+    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=--nmagic",
+]
+
+[unstable]
+build-std = ["core"]
