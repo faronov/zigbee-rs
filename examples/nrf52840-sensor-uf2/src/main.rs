@@ -44,6 +44,7 @@ use embassy_nrf::{self as _, bind_interrupts, peripherals, radio, rng};
 use defmt::*;
 use {defmt_rtt as _, panic_probe as _};
 
+use core::mem::MaybeUninit;
 #[cfg(any(feature = "board-promicro", feature = "board-mdk"))]
 use nrf_sensor_app::NrfTimerWakeController;
 #[cfg(any(feature = "board-nrf-dongle", feature = "board-nrf-dk"))]
@@ -54,6 +55,7 @@ use nrf_sensor_app::{
 #[cfg(any(feature = "board-promicro", feature = "board-mdk"))]
 use sensor_sed_app::NoUserAction;
 use sensor_sed_app::{NoOta, SensorApp, SensorSedParts};
+use zigbee_mac::MacDriver;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::{ApplicationProfile, BatteryMeasurement};
 use zigbee_runtime::ZigbeeDevice;
@@ -222,23 +224,15 @@ async fn main(_spawner: Spawner) {
     };
     let ieee = mac.pib().extended_address();
 
-    let mut profile = nrf52840_sensor_product::profile::sensor_profile();
-    let mut device = ZigbeeDevice::builder(mac)
-        .power_mode(nrf52840_sensor_product::policy::SENSOR_POLICY.power_mode())
-        .automatic_polling(false)
-        .manufacturer(nrf52840_sensor_product::MANUFACTURER)
-        .model(nrf52840_sensor_product::deployment::UF2_MODEL)
-        .date_code(nrf52840_sensor_product::DATE_CODE)
-        .sw_build(nrf52840_sensor_product::SW_BUILD)
-        .power_source(PowerSource::Battery)
-        .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(
-            profile.endpoint(),
-            profile.profile_id(),
-            profile.device_id(),
-            |endpoint| profile.configure_endpoint(endpoint),
-        )
-        .build();
+    let mut profile = MaybeUninit::uninit();
+    let profile = build_profile(
+        nrf52840_sensor_product::profile::sensor_profile,
+        &mut profile,
+    );
+    // Assembled in place in this future by a non-inlined helper, so the
+    // builder and a device-sized temporary never sit in the main poll frame.
+    let mut device = MaybeUninit::uninit();
+    let device = build_device(mac, profile, &mut device);
 
     let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
     let mut security_store = nrf52840_sensor_product::uf2_storage::security_store(nvmc);
@@ -248,7 +242,7 @@ async fn main(_spawner: Spawner) {
         Err(error) => nrf_sensor_app::persistence_failure(error),
     }
 
-    let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
+    let node = ZigbeeNode::new(device, &mut security_store, profile);
     let mut app = SensorApp::new(
         node,
         &nrf52840_sensor_product::policy::SENSOR_POLICY,
@@ -266,4 +260,41 @@ async fn main(_spawner: Spawner) {
     .expect("UF2 sensor composition must have one manual poll owner");
 
     app.run().await
+}
+
+/// Assemble the Zigbee device in place in `slot`.
+///
+/// Not inlined, and `build_into` writes the device straight into `slot`:
+/// `build()` returned the device by value through a ~24 KB assembly frame.
+#[inline(never)]
+fn build_device<'a, M: MacDriver>(
+    mac: M,
+    profile: &impl ApplicationProfile,
+    slot: &'a mut MaybeUninit<ZigbeeDevice<M>>,
+) -> &'a mut ZigbeeDevice<M> {
+    ZigbeeDevice::builder(mac)
+        .power_mode(nrf52840_sensor_product::policy::SENSOR_POLICY.power_mode())
+        .automatic_polling(false)
+        .manufacturer(nrf52840_sensor_product::MANUFACTURER)
+        .model(nrf52840_sensor_product::deployment::UF2_MODEL)
+        .date_code(nrf52840_sensor_product::DATE_CODE)
+        .sw_build(nrf52840_sensor_product::SW_BUILD)
+        .power_source(PowerSource::Battery)
+        .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        .build_into(slot)
+}
+
+/// Construct the product profile in place in `slot`.
+///
+/// Not inlined, so the cluster tables are built in this short frame rather
+/// than in the main task's poll frame.
+#[inline(never)]
+fn build_profile<P>(make: fn() -> P, slot: &mut MaybeUninit<P>) -> &mut P {
+    slot.write(make())
 }

@@ -18,14 +18,17 @@ mod wake;
 
 use core::cell::RefCell;
 use core::fmt::{Display, Formatter, Write};
+use core::mem::MaybeUninit;
 
+use bl702_hal::flash::XipFlash;
 use bl702_xt_zb1_product as product;
 use embassy_executor::Executor;
 use panic_halt as _;
-use product::ota::{Bl702OtaLifecycle, Channel};
+use product::ota::{Bl702OtaLifecycle, Bl702Writer, Channel, OtaSensorProfile};
 use product::storage::{OtaFlash, SharedFlash};
 use sensor_sed_app::{BlockingBattery, BlockingEnvironment, NoStatus, SensorApp, SensorSedParts};
-use zigbee_mac::{MacPib, SoftMacCore, bl702::radio_phy::Bl702RadioPhy};
+use zigbee_mac::bl702::radio_phy::{Bl702RadioPhy, Bl702SoftMac};
+use zigbee_mac::{MacPib, SoftMacCore};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::ApplicationProfile;
@@ -139,64 +142,19 @@ async fn sensor(application: hal::ApplicationResources) {
 
     let ieee = product::identity::ieee_address(hal::chip_id());
     log::info!("IEEE address: {}", Hex(&ieee));
-    log::info!("initializing RF and running per-die calibration");
-
-    let mut radio = match unsafe { Bl702RadioPhy::initialize(hal::delay_us) } {
-        Ok(radio) => radio,
-        Err(error) => {
-            log::error!("RF initialization failed: {error:?}");
-            hal::halt()
-        }
-    };
-    if let Err(error) = zigbee_mac::RadioPhy::set_tx_power(&mut radio, product::TX_POWER_DBM) {
-        log::error!("TX power setup failed: {error:?}");
-        hal::halt()
-    }
-
-    // The exclusive SEC_ENG token keeps CCM*/AES-MMO on hardware. Startup
-    // runs both on-silicon known-answer tests and fails closed.
-    if let Err(error) = radio.install_aes_engine(aes) {
-        log::error!("hardware AES self-test failed: {error:?}");
-        hal::halt()
-    }
-
-    let pib = MacPib::new(ieee, ieee[0], ieee[1]);
-    let mac = match SoftMacCore::new(radio, pib) {
-        Ok(mac) => mac,
-        Err(error) => {
-            log::error!("MAC initialization failed: {error:?}");
-            hal::halt()
-        }
-    };
+    let mac = build_mac(ieee, aes);
     log::info!(
         "radio ready: channel scan={}, tx_power={} dBm",
         product::CHANNEL,
         product::TX_POWER_DBM
     );
 
-    let mut profile = match product::ota::sensor_ota_profile(SharedFlash::new(&flash)) {
-        Ok(profile) => profile,
-        Err(error) => {
-            log::error!("OTA profile composition failed: {error:?}");
-            hal::halt()
-        }
-    };
-    let mut device = ZigbeeDevice::builder(mac)
-        .power_mode(product::policy::SENSOR_POLICY.power_mode())
-        .automatic_polling(false)
-        .manufacturer(product::MANUFACTURER)
-        .model(product::MODEL)
-        .date_code(product::DATE_CODE)
-        .sw_build(product::SW_BUILD)
-        .power_source(PowerSource::Battery)
-        .channels(product::CHANNEL_MASK)
-        .endpoint(
-            profile.endpoint(),
-            profile.profile_id(),
-            profile.device_id(),
-            |endpoint| profile.configure_endpoint(endpoint),
-        )
-        .build();
+    let mut profile = MaybeUninit::uninit();
+    let profile = build_profile(&flash, &mut profile);
+    // The device lives in this task's future (the task pool), as before;
+    // `build_device` only assembles it in place.
+    let mut device = MaybeUninit::uninit();
+    let device = build_device(mac, profile, &mut device);
 
     match device.reset_security_state_if_identity_changed(&mut security_store, ieee) {
         Ok(true) => log::warn!("cleared persisted network state after IEEE address change"),
@@ -207,7 +165,7 @@ async fn sensor(application: hal::ApplicationResources) {
         }
     }
 
-    let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
+    let node = ZigbeeNode::new(device, &mut security_store, profile);
     let mut app = match SensorApp::new(
         node,
         &product::policy::SENSOR_POLICY,
@@ -230,6 +188,92 @@ async fn sensor(application: hal::ApplicationResources) {
     };
 
     app.run().await
+}
+
+/// Bring up the radio, the hardware AES engine and the shared software MAC.
+///
+/// Not inlined, so the PHY, MAC and `Result` temporaries live in this short
+/// frame instead of the sensor task's poll frame.
+#[inline(never)]
+fn build_mac(ieee: [u8; 8], aes: bl702_hal::peripherals::Aes) -> Bl702SoftMac {
+    log::info!("initializing RF and running per-die calibration");
+
+    let mut radio = match unsafe { Bl702RadioPhy::initialize(hal::delay_us) } {
+        Ok(radio) => radio,
+        Err(error) => {
+            log::error!("RF initialization failed: {error:?}");
+            hal::halt()
+        }
+    };
+    if let Err(error) = zigbee_mac::RadioPhy::set_tx_power(&mut radio, product::TX_POWER_DBM) {
+        log::error!("TX power setup failed: {error:?}");
+        hal::halt()
+    }
+
+    // The exclusive SEC_ENG token keeps CCM*/AES-MMO on hardware. Startup
+    // runs both on-silicon known-answer tests and fails closed.
+    if let Err(error) = radio.install_aes_engine(aes) {
+        log::error!("hardware AES self-test failed: {error:?}");
+        hal::halt()
+    }
+
+    let pib = MacPib::new(ieee, ieee[0], ieee[1]);
+    match SoftMacCore::new(radio, pib) {
+        Ok(mac) => mac,
+        Err(error) => {
+            log::error!("MAC initialization failed: {error:?}");
+            hal::halt()
+        }
+    }
+}
+
+type Bl702Profile<'f> = OtaSensorProfile<Bl702Writer<SharedFlash<'f, XipFlash>>>;
+
+/// Compose the sensor endpoint and OTA client and move it into `slot`.
+///
+/// Not inlined, so the cluster tables are built in this short frame rather
+/// than in the sensor task's poll frame.
+#[inline(never)]
+fn build_profile<'f, 's>(
+    flash: &'f RefCell<XipFlash>,
+    slot: &'s mut MaybeUninit<Bl702Profile<'f>>,
+) -> &'s mut Bl702Profile<'f> {
+    match product::ota::sensor_ota_profile(SharedFlash::new(flash)) {
+        Ok(profile) => slot.write(profile),
+        Err(error) => {
+            log::error!("OTA profile composition failed: {error:?}");
+            hal::halt()
+        }
+    }
+}
+
+/// Assemble the Zigbee device in place in `slot`.
+///
+/// Not inlined, and `build_into` writes the device straight into `slot`, so
+/// neither the builder nor a device-sized temporary stays in the sensor
+/// task's poll frame.
+#[inline(never)]
+fn build_device<'a>(
+    mac: Bl702SoftMac,
+    profile: &impl ApplicationProfile,
+    slot: &'a mut MaybeUninit<ZigbeeDevice<Bl702SoftMac>>,
+) -> &'a mut ZigbeeDevice<Bl702SoftMac> {
+    ZigbeeDevice::builder(mac)
+        .power_mode(product::policy::SENSOR_POLICY.power_mode())
+        .automatic_polling(false)
+        .manufacturer(product::MANUFACTURER)
+        .model(product::MODEL)
+        .date_code(product::DATE_CODE)
+        .sw_build(product::SW_BUILD)
+        .power_source(PowerSource::Battery)
+        .channels(product::CHANNEL_MASK)
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        .build_into(slot)
 }
 
 /// The running firmware version for the bootloader/OTA bench log. The raw

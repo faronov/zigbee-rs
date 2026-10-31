@@ -23,12 +23,14 @@ use embassy_nrf::gpio;
 use embassy_nrf::{bind_interrupts, peripherals, radio, rng};
 use embassy_time::Instant;
 
+use core::mem::MaybeUninit;
 use nrf52840_router_product::button::{ButtonGesture, ButtonGestures};
 use nrf52840_router_product::status::StatusLedState;
 use router_app::{
     AlwaysOnEndDeviceApp, DiagnosticEvent, Diagnostics, NodeArchetype, RouterAppError, RouterParts,
     RouterStatus, StackEventSummary, StatusSink, Supervisor,
 };
+use zigbee_mac::MacDriver;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::power::PowerMode;
@@ -282,22 +284,10 @@ async fn main(_spawner: Spawner) {
     let ieee = mac.pib().extended_address();
 
     let mut profile = nrf52840_router_product::profile::always_on_end_device_profile();
-    let mut device = ZigbeeDevice::builder(mac)
-        .device_type(DeviceType::EndDevice)
-        .power_mode(PowerMode::AlwaysOn)
-        .manufacturer(nrf52840_router_product::MANUFACTURER)
-        .model(nrf52840_router_product::MODEL)
-        .date_code(nrf52840_router_product::DATE_CODE)
-        .sw_build(nrf52840_router_product::SW_BUILD)
-        .power_source(PowerSource::MainsSinglePhase)
-        .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
-        .endpoint(
-            profile.endpoint(),
-            profile.profile_id(),
-            profile.device_id(),
-            |endpoint| profile.configure_endpoint(endpoint),
-        )
-        .build();
+    // Assembled in place in this future by a non-inlined helper, so the
+    // builder and a device-sized temporary never sit in the main poll frame.
+    let mut device = MaybeUninit::uninit();
+    let device = build_device(mac, &profile, &mut device);
 
     let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
     let mut security_store = nrf52840_router_product::storage::security_store(nvmc);
@@ -315,7 +305,7 @@ async fn main(_spawner: Spawner) {
         }
     }
 
-    let node = ZigbeeNode::new(&mut device, &mut security_store, &mut profile);
+    let node = ZigbeeNode::new(device, &mut security_store, &mut profile);
     let mut app = AlwaysOnEndDeviceApp::new(
         node,
         &nrf52840_router_product::policy::ALWAYS_ON_END_DEVICE_POLICY,
@@ -363,4 +353,32 @@ async fn main(_spawner: Spawner) {
             fatal(app.parts_mut(), error);
         }
     }
+}
+
+/// Assemble the Zigbee device in place in `slot`.
+///
+/// Not inlined, and `build_into` writes the device straight into `slot`:
+/// `build()` returned the device by value through a ~24 KB assembly frame.
+#[inline(never)]
+fn build_device<'a, M: MacDriver>(
+    mac: M,
+    profile: &impl ApplicationProfile,
+    slot: &'a mut MaybeUninit<ZigbeeDevice<M>>,
+) -> &'a mut ZigbeeDevice<M> {
+    ZigbeeDevice::builder(mac)
+        .device_type(DeviceType::EndDevice)
+        .power_mode(PowerMode::AlwaysOn)
+        .manufacturer(nrf52840_router_product::MANUFACTURER)
+        .model(nrf52840_router_product::MODEL)
+        .date_code(nrf52840_router_product::DATE_CODE)
+        .sw_build(nrf52840_router_product::SW_BUILD)
+        .power_source(PowerSource::MainsSinglePhase)
+        .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        .build_into(slot)
 }
