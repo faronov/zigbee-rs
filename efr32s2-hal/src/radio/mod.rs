@@ -570,6 +570,21 @@ impl Radio {
         result
     }
 
+    /// Transmit an Imm-Ack for `sequence` with the given Frame Pending bit,
+    /// then resume RX if it was on.
+    ///
+    /// For callers that own ACK policy themselves (a parent MAC answering
+    /// data polls with a per-child Frame Pending bit). Such callers keep the
+    /// [`AckFilter`] empty so [`receive`](Self::receive) never ACKs on its
+    /// own, and must call this promptly: the sender only waits
+    /// macAckWaitDuration (864 us) for the ACK.
+    pub fn send_ack(&mut self, sequence: u8, frame_pending: bool) -> Result<(), RadioError> {
+        let ack = [0x02 | ((frame_pending as u8) << 4), 0x00, sequence];
+        self.transmit(&ack)?;
+        self.stats.acks_sent += 1;
+        Ok(())
+    }
+
     fn transmit_raw(&mut self, frame: &[u8]) -> Result<(), RadioError> {
         // Leave RX without discarding already stored frames; a frame
         // still arriving is aborted since the caller decided to transmit.
