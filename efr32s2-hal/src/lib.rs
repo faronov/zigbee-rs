@@ -19,6 +19,7 @@ pub mod clock;
 pub mod delay;
 pub mod devinfo;
 pub mod flash;
+pub mod gecko_bootloader;
 pub mod gpio;
 pub mod i2c;
 pub mod peripherals;
