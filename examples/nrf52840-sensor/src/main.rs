@@ -204,22 +204,29 @@ async fn main(_spawner: Spawner) {
     // Radio + MAC
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
     let rng = rng::Rng::new(p.RNG, Irqs);
-    let mut mac = zigbee_mac::nrf::NrfMac::new(radio, rng);
+    let mut phy = zigbee_mac::nrf::NrfRadioPhy::new(radio, rng);
     let Some(aes) = zigbee_mac::nrf::NrfEcbToken::take() else {
         error!("Nordic ECB AES already owned; networking halted");
         loop {
             cortex_m::asm::wfi();
         }
     };
-    if mac.install_aes_engine(aes).is_err() {
+    if phy.install_aes_engine(aes).is_err() {
         error!("Nordic ECB AES startup KAT failed; networking halted");
         loop {
             cortex_m::asm::wfi();
         }
     }
-    let ieee = mac.extended_address();
     info!("Nordic ECB hardware AES KAT passed");
-    mac.set_tx_power(0);
+    // FICR DEVICEID-derived EUI-64 (never a constant), RNG-seeded DSN/BSN,
+    // TX power 0 dBm from the default PIB.
+    let Ok(mac) = phy.into_soft_mac() else {
+        error!("nRF radio configuration failed; networking halted");
+        loop {
+            cortex_m::asm::wfi();
+        }
+    };
+    let ieee = mac.pib().extended_address();
     info!("Radio ready (TX 0 dBm)");
 
     // ── Product profile (endpoint, clusters, reporting defaults) ──

@@ -1,6 +1,7 @@
 //! nRF52840-DK always-on Zigbee End Device.
 //!
-//! `NrfMac` is not a `ParentMacDriver`, so this composition root selects
+//! `NrfSoftMac` (the end-device `SoftMacCore` role) is not a
+//! `ParentMacDriver`, so this composition root selects
 //! [`router_app::AlwaysOnEndDeviceApp`]. The device is mains-powered with
 //! `macRxOnWhenIdle = true`, but it never advertises `DeviceType::Router`,
 //! routes, or admits children.
@@ -243,7 +244,7 @@ async fn main(_spawner: Spawner) {
 
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
     let rng = rng::Rng::new(p.RNG, Irqs);
-    let mut mac = zigbee_mac::nrf::NrfMac::new(radio, rng);
+    let mut phy = zigbee_mac::nrf::NrfRadioPhy::new(radio, rng);
 
     let Some(aes) = zigbee_mac::nrf::NrfEcbToken::take() else {
         status.set(RouterStatus::Fault {
@@ -254,7 +255,7 @@ async fn main(_spawner: Spawner) {
             cortex_m::asm::wfi();
         }
     };
-    if let Err(error) = mac.install_aes_engine(aes) {
+    if let Err(error) = phy.install_aes_engine(aes) {
         status.set(RouterStatus::Fault {
             archetype: NodeArchetype::AlwaysOnEndDevice,
         });
@@ -266,9 +267,19 @@ async fn main(_spawner: Spawner) {
             cortex_m::asm::wfi();
         }
     }
-    let ieee = mac.extended_address();
     info!("Nordic ECB hardware AES dual-KAT passed");
-    mac.set_tx_power(0);
+    // FICR DEVICEID-derived EUI-64 (never a constant), RNG-seeded DSN/BSN,
+    // TX power 0 dBm from the default PIB.
+    let Ok(mac) = phy.into_soft_mac() else {
+        status.set(RouterStatus::Fault {
+            archetype: NodeArchetype::AlwaysOnEndDevice,
+        });
+        error!("nRF radio configuration failed; networking halted");
+        loop {
+            cortex_m::asm::wfi();
+        }
+    };
+    let ieee = mac.pib().extended_address();
 
     let mut profile = nrf52840_router_product::profile::always_on_end_device_profile();
     let mut device = ZigbeeDevice::builder(mac)

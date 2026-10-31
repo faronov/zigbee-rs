@@ -481,7 +481,7 @@ jobs:
             echo "nRF52840 always-on End Device security journal does not end at 0x00100000" >&2
             exit 1
           fi
-          # NrfMac has no ParentMacDriver. The image must therefore be a
+          # The end-device NrfSoftMac has no ParentMacDriver. The image must therefore be a
           # non-routing, receiver-on End Device — never a RelayRouter.
           if ! grep -Eq 'zigbee_runtime::role::EndDevice.*router_app::children::NoChildren.*router_app::app::AlwaysOnEndDeviceArchetype' <<<"$SYMS"; then
             echo "nRF52840 image is missing AlwaysOnEndDeviceApp composition symbols" >&2

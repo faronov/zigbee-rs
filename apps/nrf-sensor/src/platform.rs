@@ -7,10 +7,10 @@ use sensor_sed_app::{
     SensorStatus, SleepDepth, StatusSink, Supervisor, WaitRequest, WakeController, WakeReason,
 };
 use zigbee_mac::MacError;
-use zigbee_mac::nrf::NrfMac;
+use zigbee_mac::nrf::NrfSoftMac;
 
 pub type SensorMac =
-    NrfMac<'static, embassy_nrf::peripherals::RADIO, embassy_nrf::peripherals::RNG>;
+    NrfSoftMac<'static, embassy_nrf::peripherals::RADIO, embassy_nrf::peripherals::RNG>;
 
 pub struct NrfWakeController {
     button: gpio::Input<'static>,
@@ -48,7 +48,7 @@ impl WakeController<SensorMac> for NrfWakeController {
     ) -> Result<WakeReason, Self::Error> {
         match request.sleep_depth {
             SleepDepth::Active => {}
-            SleepDepth::Idle => mac.enter_low_power_idle()?,
+            SleepDepth::Idle => mac.sleep()?,
             SleepDepth::Retention => return Err(MacError::Unsupported),
         }
 
@@ -61,7 +61,7 @@ impl WakeController<SensorMac> for NrfWakeController {
             Either::First(_) => WakeReason::Button,
             Either::Second(_) => WakeReason::Timer,
         };
-        // NrfMac deliberately keeps RADIO disabled here. Its next normal
+        // The MAC deliberately keeps RADIO disabled here. Its next normal
         // Embassy RX/TX operation guarantees the complete DISABLED-to-active
         // transition, satisfying WakeController's lazy-readiness contract.
         Ok(reason)
@@ -121,7 +121,7 @@ impl WakeController<SensorMac> for NrfTimerWakeController {
     ) -> Result<WakeReason, Self::Error> {
         match request.sleep_depth {
             SleepDepth::Active => {}
-            SleepDepth::Idle => mac.enter_low_power_idle()?,
+            SleepDepth::Idle => mac.sleep()?,
             SleepDepth::Retention => return Err(MacError::Unsupported),
         }
         Timer::after(Duration::from_millis(u64::from(request.timeout_ms))).await;

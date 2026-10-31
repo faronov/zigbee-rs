@@ -1,6 +1,7 @@
 # Nordic nRF52840 / nRF52833
 
-Nordic sensor products use Embassy's chip HAL, the shared `NrfMac`, board
+Nordic sensor products use Embassy's chip HAL, the shared software MAC
+(`SoftMacCore<NrfRadioPhy>`, alias `zigbee_mac::nrf::NrfSoftMac`), board
 resource crates, product-owned profiles/policy/storage, and
 `sensor_sed_app::SensorApp`.
 
@@ -13,7 +14,9 @@ nrf52840-sensor / nrf52833-sensor / nrf52840-router product
         ↓
 nrf52840-dk / nrf52833-dk / UF2 board crate
         ↓
-embassy-nrf + zigbee_mac::nrf::NrfMac
+zigbee_mac::nrf::NrfSoftMac = SoftMacCore<NrfRadioPhy>
+        ↓
+embassy-nrf RADIO / RNG / ECB
 ```
 
 The short example root constructs and connects these layers.
@@ -106,7 +109,9 @@ ZigbeeDevice::builder(mac)
 AlwaysOnEndDeviceApp::new(node, policy, parts)?;
 ```
 
-`NrfMac` does not implement `ParentMacDriver`, so the image cannot construct
+The image uses the end-device `NrfSoftMac`, which does not implement
+`ParentMacDriver` (the `Parent` role of `SoftMacCore` exists but has not been
+validated on nRF hardware), so the image cannot construct
 `ParentRouterApp`, admit a child, maintain pending transactions, provide
 indirect delivery, or advertise Router/Link Status behavior. It is therefore
 a receiver-on, always-on End Device.

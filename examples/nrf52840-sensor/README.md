@@ -11,7 +11,9 @@ products/nrf52840-sensor
         ↓
 boards/nrf52840-dk
         ↓
-embassy-nrf + NrfMac
+SoftMacCore<NrfRadioPhy> (zigbee_mac::nrf::NrfSoftMac)
+        ↓
+embassy-nrf
 ```
 
 `main.rs` is the composition root. It initializes clocks, Nordic radio/RNG/AES,

@@ -195,14 +195,14 @@ async fn main(_spawner: Spawner) {
 
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
     let rng = rng::Rng::new(p.RNG, Irqs);
-    let mut mac = zigbee_mac::nrf::NrfMac::new(radio, rng);
+    let mut phy = zigbee_mac::nrf::NrfRadioPhy::new(radio, rng);
     let Some(aes) = zigbee_mac::nrf::NrfEcbToken::take() else {
         error!("Nordic ECB AES already owned; networking halted");
         loop {
             cortex_m::asm::wfi();
         }
     };
-    if let Err(error) = mac.install_aes_engine(aes) {
+    if let Err(error) = phy.install_aes_engine(aes) {
         error!(
             "Nordic ECB dual-KAT failed; networking halted: {:?}",
             defmt::Debug2Format(&error)
@@ -211,9 +211,16 @@ async fn main(_spawner: Spawner) {
             cortex_m::asm::wfi();
         }
     }
-    let ieee = mac.extended_address();
     info!("Nordic ECB hardware AES dual-KAT passed");
-    mac.set_tx_power(0);
+    // FICR DEVICEID-derived EUI-64 (never a constant), RNG-seeded DSN/BSN,
+    // TX power 0 dBm from the default PIB.
+    let Ok(mac) = phy.into_soft_mac() else {
+        error!("nRF radio configuration failed; networking halted");
+        loop {
+            cortex_m::asm::wfi();
+        }
+    };
+    let ieee = mac.pib().extended_address();
 
     let mut profile = nrf52840_sensor_product::profile::sensor_profile();
     let mut device = ZigbeeDevice::builder(mac)
