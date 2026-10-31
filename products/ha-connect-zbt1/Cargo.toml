@@ -1,0 +1,25 @@
+[package]
+name = "ha-connect-zbt1-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product configuration for the Home Assistant Connect ZBT-1 always-on End Device"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Keep this product independently testable without changing the repository
+# workspace or its lockfile.
+[workspace]
+
+[dependencies]
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg21"] }
+embedded-storage = "0.3"
+ha-connect-zbt1 = { path = "../../boards/ha-connect-zbt1" }
+router-app = { path = "../../apps/router", default-features = false }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[dev-dependencies]
+zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
+zigbee-nwk = { path = "../../zigbee-nwk" }

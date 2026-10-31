@@ -1,0 +1,44 @@
+[package]
+name = "ha-connect-zbt1-ed"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autobins = false
+
+[[bin]]
+name = "ha-connect-zbt1-ed"
+path = "src/main.rs"
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7", features = ["device"] }
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg21", "rt", "time-driver"] }
+ha-connect-zbt1 = { path = "../../boards/ha-connect-zbt1" }
+ha-connect-zbt1-product = { path = "../../products/ha-connect-zbt1" }
+router-app = { path = "../../apps/router", default-features = false }
+zigbee-mac = { path = "../../zigbee-mac", features = ["efr32mg21"] }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+# Embassy. `tick-hz-32_768` matches the RTCC that drives the HAL time
+# driver (`efr32s2-hal/time-driver`). `embassy-time-driver` is
+# `links = "embassy-time"`: zigbee-mac's embassy-time 0.4 and this crate's
+# 0.5 share the same driver instance.
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
+embassy-time = "0.5"
+embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
+log = "0.4"
+static_cell = "2"
+
+[profile.dev]
+opt-level = "s"
+debug = true
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+lto = true
+debug = true
+panic = "abort"
