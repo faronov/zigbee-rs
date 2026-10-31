@@ -21,6 +21,18 @@ pub trait Cluster {
         payload: &[u8],
     ) -> Result<heapless::Vec<u8, 64>, ZclStatus>;
 
+    /// Like `handle_command`, but with the sender's IEEE address (if known).
+    /// The runtime always calls this; the default ignores the source.
+    fn handle_command_from(
+        &mut self,
+        src_ieee: Option<u64>,
+        cmd_id: CommandId,
+        payload: &[u8],
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+        let _ = src_ieee;
+        self.handle_command(cmd_id, payload)
+    }
+
     /// Immutable access to the attribute store.
     fn attributes(&self) -> &dyn AttributeStoreAccess;
 
@@ -32,12 +44,22 @@ pub trait Cluster {
         heapless::Vec::new()
     }
 
+    /// Scene table / scene-capable hooks (default: none).
+    fn cluster_role(&mut self) -> ClusterRole<'_> {
+        ClusterRole::None
+    }
+
     /// Command IDs this cluster can generate (server→client).
     fn generated_commands(&self) -> heapless::Vec<u8, 32> {
         heapless::Vec::new()
     }
+
+    /// Restore every attribute to its default (Basic ResetToFactoryDefaults).
+    fn reset_to_factory_defaults(&mut self);
 }
 ```
+
+`reset_to_factory_defaults()` has no default body, so every cluster must implement it.
 
 ---
 
@@ -87,7 +109,10 @@ let val = store.get(AttributeId(0x0000));
 // Write (respects access control + type checking):
 store.set(AttributeId(0x0000), ZclValue::U16(42))?;
 
-// Write bypassing access control (for server-side updates):
+// Check whether set() would succeed, without writing:
+store.validate_set(AttributeId(0x0000), &ZclValue::U16(42))?;
+
+// Write bypassing access control and type checks (for server-side updates):
 store.set_raw(AttributeId(0x0000), ZclValue::U16(42))?;
 ```
 
@@ -114,6 +139,8 @@ pub trait AttributeStoreMutAccess {
     fn set(&mut self, id: AttributeId, value: ZclValue) -> Result<(), ZclStatus>;
     fn set_raw(&mut self, id: AttributeId, value: ZclValue) -> Result<(), ZclStatus>;
     fn find(&self, id: AttributeId) -> Option<&AttributeDefinition>;
+    /// Dry-run of `set()`; used to preflight Write Attributes Undivided.
+    fn validate_set(&self, id: AttributeId, value: &ZclValue) -> Result<(), ZclStatus>;
 }
 ```
 
@@ -133,7 +160,7 @@ use zigbee_zcl::clusters::{
 use zigbee_zcl::data_types::{ZclDataType, ZclValue};
 use zigbee_zcl::{AttributeId, ClusterId, CommandId, ZclStatus};
 
-// Cluster ID — use manufacturer-specific range (0xFC00–0xFCFF)
+// Cluster ID — use manufacturer-specific range (0xFC00–0xFFFF)
 pub const CLUSTER_UV_INDEX: ClusterId = ClusterId(0xFC01);
 
 // Attribute IDs
@@ -228,6 +255,12 @@ impl Cluster for UvIndexCluster {
     fn received_commands(&self) -> heapless::Vec<u8, 32> {
         heapless::Vec::from_slice(&[CMD_RESET_MAX.0]).unwrap_or_default()
     }
+
+    fn reset_to_factory_defaults(&mut self) {
+        let _ = self.store.set_raw(ATTR_UV_INDEX, ZclValue::U8(0));
+        let _ = self.store.set_raw(ATTR_UV_INDEX_MIN, ZclValue::U8(0));
+        let _ = self.store.set_raw(ATTR_UV_INDEX_MAX, ZclValue::U8(0));
+    }
 }
 ```
 
@@ -235,15 +268,24 @@ impl Cluster for UvIndexCluster {
 
 ## Registering with the Device Builder
 
-Once your cluster struct implements `Cluster`, register it on an endpoint:
+Declare the cluster ID on an endpoint in the device builder (this drives the
+Simple Descriptor), then hand the cluster instance to the runtime through a
+`ClusterRef` slice:
 
 ```rust
-let uv_sensor = UvIndexCluster::new();
+use zigbee_runtime::ClusterRef;
+use zigbee_zcl::DeviceId;
 
-builder
-    .endpoint(1)
-    .device_id(0x0302) // or your custom device ID
-    .add_cluster(CLUSTER_UV_INDEX, uv_sensor);
+let builder = builder.endpoint(1, 0x0104, DeviceId(0x0302), |ep| {
+    ep.cluster_server(CLUSTER_UV_INDEX) // or your custom device ID above
+});
+
+let mut uv_sensor = UvIndexCluster::new();
+
+// In the main loop:
+let mut clusters = [ClusterRef { endpoint: 1, cluster: &mut uv_sensor }];
+device.process_incoming(&indication, &mut clusters).await;
+device.tick(elapsed_secs, &mut clusters).await;
 ```
 
 ---
@@ -254,9 +296,16 @@ The `handle_command` method receives:
 - `cmd_id` — the cluster-specific command ID (0x00, 0x01, etc.)
 - `payload` — raw bytes after the ZCL header
 
+The runtime actually calls `handle_command_from()`, passing the sender's IEEE
+address when known; override it if a command must be authenticated by source
+(as IAS Zone does for Zone Enroll Response).
+
 Return values:
-- `Ok(Vec::new())` — success, runtime sends a Default Response
-- `Ok(vec_with_data)` — success, runtime sends a cluster-specific response
+- `Ok(Vec::new())` — success, runtime sends a Default Response (unicast only,
+  unless the request set Disable Default Response)
+- `Ok(vec_with_data)` — success, runtime sends a server→client cluster-specific
+  frame carrying the payload, **using the same command ID as the request**
+  (only Identify Query is mapped to a different response ID)
 - `Err(ZclStatus)` — failure, runtime sends a Default Response with that status
 
 ### Parsing Payloads

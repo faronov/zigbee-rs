@@ -68,13 +68,14 @@ therm.tick(0b0000010, 480); // Monday, 08:00
 // SystemMode and setpoints can be written remotely via Write Attributes
 // RunningMode is computed automatically by tick():
 //   - Auto mode: heats if temp < heat SP, cools if temp > cool SP
-//   - Heat mode: heats if temp < heat SP
+//   - Heat / Emergency Heat mode: heats if temp < heat SP
 //   - Cool mode: cools if temp > cool SP
+//   - Off / Fan Only: running mode Off
 ```
 
 ### Weekly Schedule
 
-The thermostat supports a weekly schedule with up to 16 entries, each containing multiple transitions:
+The thermostat stores up to 16 `WeeklyScheduleEntry` items (one per days-of-week + mode pair; a new SetWeeklySchedule for the same pair replaces it), each holding up to 10 `ScheduleTransition`s:
 
 ```rust
 // A coordinator sends SetWeeklySchedule (0x01):

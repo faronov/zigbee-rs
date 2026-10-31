@@ -71,7 +71,14 @@ meter.set_instantaneous_demand(1500); // 1.5 kW draw
 
 // Read cumulative total:
 let total_wh = meter.get_total_delivered(); // returns u64
+
+// After reboot, restore the counter persisted by the application:
+meter.set_total_delivered(saved_wh);
 ```
+
+The summation counter saturates at the 48-bit maximum; `handle_command()`
+returns `UnsupClusterCommand`. `CurrentSummationReceived` and `PowerFactor`
+have no setters and must be written through `attributes_mut().set_raw()`.
 
 ### Reporting Example
 
@@ -91,7 +98,7 @@ Configure Reporting for Metering (0x0702):
 
 ## Electrical Measurement (0x0B04)
 
-While technically a "Measurement & Sensing" cluster, Electrical Measurement is closely related to Smart Energy metering. It provides real-time electrical parameters:
+While technically a "Measurement & Sensing" cluster (`zigbee_zcl::clusters::electrical::ElectricalMeasurementCluster`), Electrical Measurement is closely related to Smart Energy metering. It provides real-time electrical parameters, including:
 
 - **RMS Voltage** (0x0505)
 - **RMS Current** (0x0508)

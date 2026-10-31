@@ -27,7 +27,7 @@ exact-image rerun of the freshly measured binaries.
 | sleepy End Device | steering, persisted resume/rejoin, ED timeout, polling, reporting, reset and OTA lifecycle are host-tested | all real backends currently compose as End Devices; current release images build/layout-test as listed in `BUILD.md` | exact-image security/power/interoperability acceptance per release |
 | receiver-on End Device | typed non-parent composition and continuous receive path are host-tested | nRF52840 release image builds | complete HIL acceptance |
 | relay router | routing without child admission is compile-time separated and host-tested | no production image is currently composed; `MockMac` can host-test it | production backend/product composition and packet capture |
-| parent router | child admission, indirect delivery, timeout, reassignment, Leave cascade and durable DeviceLeft are host-tested | TLSR8258 is the only production `ParentMacDriver`; its current image builds/layout-tests | corrected-image first-attempt child join plus power-cut lifecycle captures |
+| parent router | child admission, indirect delivery, timeout, reassignment, Leave cascade and durable DeviceLeft are host-tested | TLSR8258 (legacy `TelinkRouterMac`) is the only production parent MAC; its current image builds/layout-tests. The shared `SoftMacCore` parent role is host-tested only | corrected-image first-attempt child join plus power-cut lifecycle captures |
 | distributed router | distributed formation, provisioned-key checks and persisted PAN restart are host-tested | no production hardware image is claimed | product composition and HIL |
 | coordinator / Trust Center | formation/restart, admission, install-code keys, application keys, Remove-Device and Network-Key rotation are host-tested | mock-only; no production backend advertises coordinator capability | production backend/product composition, multi-device HIL and certification |
 
@@ -35,11 +35,14 @@ Unsupported role capabilities are absent at compile time. A backend that
 cannot provide association responses, pending transactions and indirect
 delivery cannot construct a parent router or coordinator.
 
-Only the tc32 Telink `TelinkRouterMac`, the shared `SoftMacCore` parent role
-and host `MockMac` implement the sealed
-`ParentMacDriver`. Telink advertises `router: true` and `coordinator: false`;
-all other real backends use non-parent capability descriptors. Consequently
-`examples/nrf52840-router` is an `AlwaysOnEndDeviceApp`, not a Zigbee router.
+Only the tc32 Telink `TelinkRouterMac` (zigbee-mac feature
+`telink-legacy-router`), the shared `SoftMacCore<P, Parent<..>>` role (not yet
+used by any shipped image) and host `MockMac` implement the sealed
+`ParentMacDriver`. Both parent MACs advertise `router: true` and
+`coordinator: false`; all other real backends use non-parent capability
+descriptors. Consequently `examples/nrf52840-router` is an
+`AlwaysOnEndDeviceApp` on the end-device `SoftMacCore<NrfRadioPhy>`, not a
+Zigbee router.
 
 ## Core R22 coverage
 
@@ -49,7 +52,7 @@ all other real backends use non-parent capability descriptors. Consequently
 | join and rejoin | centralized and distributed selection, secured-first persisted rejoin, centralized-only fallback and provisional-parent application gate | prior representative End Device hardware evidence exists; current exact-image and multi-router fallback captures remain open |
 | routing | route discovery/repair, relay, many-to-one, source routing, broadcast transactions and Link Status | Telink relay/Link Status have hardware evidence; broader topology HIL remains open |
 | maintenance | Network Report/Update, PAN conflict transition, address reassignment, Device Announce and authenticated lifecycle replay ordering | packet-level multi-router conflict tests remain open |
-| parent lifecycle | child table restore, timeout, indirect queue, poll delivery, Remove-Device, Leave cascade and ACK-gated DeviceLeft | sleepy-child power-cut and first-attempt interview HIL remain open |
+| parent lifecycle | child table restore, timeout, indirect queue, poll delivery, Remove-Device, Leave cascade and journal-gated DeviceLeft (Update-Device carries no APS ACK; remote completion means submission) | sleepy-child power-cut and first-attempt interview HIL remain open |
 | APS | APS security, ACK tracking, fragmentation, groups, bindings, application keys, durable table snapshots and replacement-key replay retirement | interoperability and flash-endurance qualification remain product gates |
 | ZDO | descriptors, discovery, binding, leave/rejoin and management services required by the compiled role | certification harness execution remains open |
 | Trust Center | install-code CRC/AES-MMO, admission, TCLK exchange, Request/Transport/Verify/Confirm-Key, Update/Remove-Device and Network-Key rotation | no production coordinator hardware claim yet |
@@ -80,8 +83,9 @@ Crash-safe receive ordering is:
 Centralized joining with TCLK processing and distributed-security joining both
 remain implemented. `compact-single-endpoint` is likewise orthogonal to BDB:
 it reduces fixed product capacities to two application endpoints and four
-reporting entries without removing Zigbee behavior. EFR32MG1 and TLSR8258
-sensor/router products select it only after profile assertions.
+reporting entries without removing Zigbee behavior. The EFR32MG1 TRÅDFRI,
+TLSR8258 TB-04 sensor/router, PHY62x2 EVK and PB-03F-Kit products select it
+only after profile assertions.
 
 ## Gates before a conformance claim
 
