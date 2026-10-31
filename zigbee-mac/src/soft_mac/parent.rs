@@ -23,7 +23,7 @@
 use zigbee_types::{IeeeAddress, MacAddress, PanId};
 
 use super::{
-    DATA_INDICATION_WAIT_US, MAX_SCAN_FRAMES_PER_CHANNEL, MacRole, RoleOf, SoftMacCore,
+    DATA_INDICATION_WAIT_US, MAX_RX_FRAMES, MacRole, RoleOf, SoftMacCore, Want, phy_error,
     role_sealed, soft_mac_driver_common,
 };
 use crate::frames::{
@@ -155,15 +155,9 @@ impl<
     /// MLME-START for a Zigbee non-beacon router.
     pub fn start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
         crate::validate_router_start(&req)?;
-        let mut next = self.pib.clone();
-        next.set(PibAttribute::PhyCurrentChannel, PibValue::U8(req.channel))
-            .map_err(Self::map_pib_error)?;
-        next.set(PibAttribute::MacPanId, PibValue::PanId(req.pan_id))
-            .map_err(Self::map_pib_error)?;
-        next.set(PibAttribute::MacRxOnWhenIdle, PibValue::Bool(true))
-            .map_err(Self::map_pib_error)?;
-        Self::apply_full_config(&mut self.phy, &next)?;
-        self.pib = next;
+        self.set_channel(req.channel)?;
+        self.set_addresses(req.pan_id, self.pib.short_address())?;
+        self.pib.rx_on_when_idle = true;
         Ok(())
     }
 
@@ -242,7 +236,7 @@ impl<
             rsp.beacon_payload.as_slice(),
         )
         .map_err(map_build_error)?;
-        self.transmit_csma(&frame).await
+        self.transmit(&frame, false).await.map(|_| ())
     }
 
     /// Reply to an orphan child with a Coordinator Realignment command.
@@ -262,23 +256,25 @@ impl<
             rsp.short_address,
         )
         .map_err(map_build_error)?;
-        self.transmit_acknowledged(&frame).await.map(|_| ())
+        self.transmit(&frame, true).await.map(|_| ())
     }
 
     /// Transmit NWK indirect data to a child that has just polled.
-    pub async fn indirect_data(
+    pub fn indirect_data(
         &mut self,
         mut req: McpsDataRequest<'_>,
-    ) -> Result<McpsDataConfirm, MacError> {
-        if !req.tx_options.indirect
+    ) -> impl Future<Output = Result<McpsDataConfirm, MacError>> + '_ {
+        let frame = if !req.tx_options.indirect
             || req.dst_address.pan_id() != self.pib.pan_id()
             || !is_unicast(&req.dst_address)
         {
-            return Err(MacError::InvalidParameter);
-        }
-        // The child is awake right after its Data Request: send directly.
-        req.tx_options.indirect = false;
-        self.transmit_data(req).await
+            Err(MacError::InvalidParameter)
+        } else {
+            // The child is awake right after its Data Request: send directly.
+            req.tx_options.indirect = false;
+            self.data_frame(&req)
+        };
+        self.send_data(frame, req.msdu_handle)
     }
 
     /// Next MAC command event, listening up to `timeout_us` for one.
@@ -287,26 +283,15 @@ impl<
     /// Data frames heard while listening are retained for
     /// `mcps_data_indication`. A zero timeout never starts the receiver.
     pub async fn command_event(&mut self, timeout_us: u32) -> Result<MacCommandEvent, MacError> {
-        let started_at = self.monotonic_micros();
-        for _ in 0..MAX_SCAN_FRAMES_PER_CHANNEL {
+        let started_at = self.phy.monotonic_micros();
+        for _ in 0..MAX_RX_FRAMES {
             if let Some(event) = self.next_command_event().await {
                 return Ok(event);
             }
-            let elapsed = self.monotonic_micros().wrapping_sub(started_at);
+            let elapsed = self.phy.monotonic_micros().wrapping_sub(started_at);
             let remaining = timeout_us.saturating_sub(elapsed);
-            if remaining == 0 {
-                return Err(MacError::NoData);
-            }
-            match self.phy.receive(remaining).await {
-                Ok(Some(frame)) => {
-                    if self.is_retained(&frame) {
-                        self.acknowledge_received_frame(&frame).await?;
-                        self.store_retained(frame);
-                    }
-                }
-                Ok(None) => return Err(MacError::NoData),
-                Err(PhyError::CrcFailed) => {}
-                Err(error) => return Err(Self::map_phy_error(error)),
+            if remaining == 0 || self.listen(remaining, Want::Retained).await?.is_none() {
+                break;
             }
         }
         Err(MacError::NoData)
@@ -387,7 +372,7 @@ impl<
             response,
         )
         .map_err(map_build_error)?;
-        self.transmit_acknowledged(&frame).await.map(|_| ())
+        self.transmit(&frame, true).await.map(|_| ())
     }
 
     fn finish_association_delivery(
@@ -429,7 +414,7 @@ impl<
             .set_ack_frame_pending(address, pending)
             .map_err(|error| match error {
                 PhyError::Hardware => MacError::TransactionOverflow,
-                other => Self::map_phy_error(other),
+                other => phy_error(other),
             })
     }
 }
@@ -444,23 +429,29 @@ impl<
 {
     soft_mac_driver_common!();
 
-    async fn mlme_associate_response(
+    fn mlme_associate_response(
         &mut self,
         rsp: MlmeAssociateResponse,
-    ) -> Result<(), MacError> {
-        self.associate_response(rsp)
+    ) -> impl Future<Output = Result<(), MacError>> {
+        core::future::ready(self.associate_response(rsp))
     }
 
-    async fn mlme_beacon_response(&mut self, rsp: MlmeBeaconResponse) -> Result<(), MacError> {
-        self.beacon_response(rsp).await
+    fn mlme_beacon_response(
+        &mut self,
+        rsp: MlmeBeaconResponse,
+    ) -> impl Future<Output = Result<(), MacError>> {
+        self.beacon_response(rsp)
     }
 
-    async fn mlme_orphan_response(&mut self, rsp: MlmeOrphanResponse) -> Result<(), MacError> {
-        self.orphan_response(rsp).await
+    fn mlme_orphan_response(
+        &mut self,
+        rsp: MlmeOrphanResponse,
+    ) -> impl Future<Output = Result<(), MacError>> {
+        self.orphan_response(rsp)
     }
 
-    async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
-        self.start(req)
+    fn mlme_start(&mut self, req: MlmeStartRequest) -> impl Future<Output = Result<(), MacError>> {
+        core::future::ready(self.start(req))
     }
 
     fn set_indirect_data_pending(
@@ -471,22 +462,22 @@ impl<
         self.set_frame_pending(child, pending)
     }
 
-    async fn mcps_indirect_data(
+    fn mcps_indirect_data(
         &mut self,
         req: McpsDataRequest<'_>,
-    ) -> Result<McpsDataConfirm, MacError> {
-        self.indirect_data(req).await
+    ) -> impl Future<Output = Result<McpsDataConfirm, MacError>> {
+        self.indirect_data(req)
     }
 
-    async fn mac_command_event(&mut self) -> Result<MacCommandEvent, MacError> {
-        self.command_event(DATA_INDICATION_WAIT_US).await
+    fn mac_command_event(&mut self) -> impl Future<Output = Result<MacCommandEvent, MacError>> {
+        self.command_event(DATA_INDICATION_WAIT_US)
     }
 
-    async fn mac_command_event_timeout(
+    fn mac_command_event_timeout(
         &mut self,
         timeout_us: u32,
-    ) -> Result<MacCommandEvent, MacError> {
-        self.command_event(timeout_us).await
+    ) -> impl Future<Output = Result<MacCommandEvent, MacError>> {
+        self.command_event(timeout_us)
     }
 }
 

@@ -50,30 +50,7 @@ pub struct AckResult {
     pub frame_pending: bool,
 }
 
-/// How much of the transmit path a [`RadioPhy`] performs in hardware or in
-/// its radio core / ISR instead of in [`crate::SoftMacCore`].
-///
-/// Selected per PHY type through [`RadioPhy::TX_OFFLOAD`]. The software MAC
-/// matches on the associated constant, so after monomorphisation only the
-/// selected path remains in the image: a PHY that keeps the default pays no
-/// flash for the offload branches and no RAM for their futures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TxOffload {
-    /// Software CSMA-CA, software ACK wait and software retries. The PHY
-    /// implements only [`RadioPhy::try_transmit`] (one CCA + TX).
-    None,
-    /// The PHY performs one CCA + TX and waits for the matching Imm-Ack in
-    /// its ISR or radio core ([`RadioPhy::try_transmit_acknowledged`]). The
-    /// software MAC keeps the CSMA-CA backoff and `macMaxFrameRetries`
-    /// policy.
-    AckWait,
-    /// The PHY performs the complete unslotted CSMA-CA, ACK wait and
-    /// retransmission sequence ([`RadioPhy::transmit_offloaded`]) using the
-    /// [`TxParams`] supplied from the MAC PIB.
-    Full,
-}
-
-/// MAC PIB transmit parameters handed to a [`TxOffload::Full`] PHY.
+/// MAC PIB transmit parameters handed to a [`crate::FullTx`] PHY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxParams {
     pub max_csma_backoffs: u8,
@@ -135,14 +112,20 @@ impl PhyRxFrame {
 ///
 /// # Optional hardware offload and policy hooks
 ///
-/// Every item after the required methods has a default that preserves the
-/// pure-software behaviour. They are associated constants or provided
-/// methods, never runtime flags or `dyn` dispatch, so a PHY that does not
-/// override them compiles to exactly the software path. See
+/// The transmit path is selected by the required [`RadioPhy::Tx`] marker
+/// type. Every other item after the required methods has a default that
+/// preserves the pure-software behaviour. They are associated types,
+/// constants or provided methods, never runtime flags or `dyn` dispatch, so a
+/// PHY compiles to exactly the path it selects. See
 /// `docs/book/src/advanced/soft-mac-porting.md` for the porting contract.
 pub trait RadioPhy {
-    /// Transmit-path offload level; see [`TxOffload`].
-    const TX_OFFLOAD: TxOffload = TxOffload::None;
+    /// Transmit-path offload level: [`crate::SoftwareTx`] (software CSMA-CA,
+    /// ACK wait and retries), [`crate::AckWaitTx`] or [`crate::FullTx`].
+    ///
+    /// The software MAC selects its transmit path by this type, so only the
+    /// selected path is compiled and its future is exactly as large as that
+    /// path needs.
+    type Tx: crate::TxOffload;
 
     /// How long a poll waits for the parent's indirect frame after an ACK
     /// with Frame Pending set, in microseconds.
@@ -202,7 +185,7 @@ pub trait RadioPhy {
     /// capability flags are false.
     fn set_address_filter(&mut self, filter: Option<PhyAddressFilter>) -> Result<(), PhyError>;
 
-    /// [`TxOffload::AckWait`]: one CCA + TX, then wait for the matching
+    /// [`crate::AckWaitTx`]: one CCA + TX, then wait for the matching
     /// Imm-Ack in the ISR / radio core.
     ///
     /// Returns `Ok(Some(ack))` for the matching ACK, `Ok(None)` when the ACK
@@ -217,7 +200,7 @@ pub trait RadioPhy {
         Err(PhyError::Unsupported)
     }
 
-    /// [`TxOffload::Full`]: complete unslotted CSMA-CA and, when
+    /// [`crate::FullTx`]: complete unslotted CSMA-CA and, when
     /// `ack_requested`, ACK wait with up to `params.max_frame_retries`
     /// retransmissions.
     ///

@@ -170,6 +170,9 @@ impl Bl702RadioPhy {
 }
 
 impl RadioPhy for Bl702RadioPhy {
+    /// Software CSMA-CA, ACK wait and retries (no hardware auto-ACK).
+    type Tx = crate::SoftwareTx;
+
     fn capabilities(&self) -> PhyCapabilities {
         PhyCapabilities {
             hardware_auto_ack: false,

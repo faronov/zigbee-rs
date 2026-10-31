@@ -9,16 +9,24 @@
 //! Optional behaviour is selected at compile time and costs nothing when a
 //! backend does not use it:
 //!
-//! * hardware transmit offload through [`RadioPhy::TX_OFFLOAD`];
+//! * the transmit path through the [`RadioPhy::Tx`] marker type
+//!   ([`SoftwareTx`], [`AckWaitTx`], [`FullTx`]): only the selected path is
+//!   compiled, and its future has exactly the size that path needs;
 //! * poll policy through [`RadioPhy::POLL_RESPONSE_WAIT_US`] and
 //!   [`RadioPhy::POLL_EXTENDED_FALLBACK`];
 //! * the parent role through the `R` type parameter ([`EndDevice`] is a
 //!   zero-sized type, [`Parent`] owns const-generic queues);
 //! * the retained-RX depth through the `RX` const parameter.
 //!
+//! Every receive window (ACK wait, poll response, association response,
+//! post-association capture, data indication, beacon collection) is the one
+//! [`SoftMacCore::listen`] loop. A received frame is classified, retained and
+//! acknowledged synchronously, so no future ever holds a received frame
+//! across an await.
+//!
 //! See `docs/book/src/advanced/soft-mac-porting.md`.
 
-use zigbee_types::{IeeeAddress, MacAddress, ShortAddress};
+use zigbee_types::{MacAddress, PanId, ShortAddress};
 
 use crate::frames::{
     build_association_request, build_beacon_request, build_data_frame, build_data_request,
@@ -26,7 +34,7 @@ use crate::frames::{
     parse_beacon, parse_mac_addresses,
 };
 pub use crate::phy::AckResult;
-use crate::phy::{TxOffload, TxParams};
+use crate::phy::TxParams;
 use crate::pib::scan_duration_us;
 use crate::{
     AssociationStatus, EdValue, MacCapabilities, MacDriver, MacError, MacFrame, MacPib,
@@ -47,108 +55,197 @@ const POLL_RESPONSE_WAIT_US: u32 = 30_000;
 const POST_ASSOCIATION_RX_US: u32 = 250_000;
 const ASSOCIATION_POLL_DELAY_US: u32 = 100_000;
 const DATA_INDICATION_WAIT_US: u32 = 1_000_000;
-const MAX_ACK_WINDOW_FRAMES: u8 = 16;
 const MAX_ASSOCIATION_POLLS: u8 = 32;
-const MAX_SCAN_FRAMES_PER_CHANNEL: u16 = 256;
+/// Upper bound on the frames handled by one receive window or receive loop,
+/// so a PHY whose clock stalls cannot keep the MAC spinning forever.
+const MAX_RX_FRAMES: u16 = 256;
 /// Default retained-RX depth (`RX` const parameter of [`SoftMacCore`]).
 pub const DEFAULT_PENDING_RX: usize = 4;
 
-/// Compile-time predicate for [`ConstEither`].
-trait Choice {
-    const FIRST: bool;
+type PanDescriptors = heapless::Vec<PanDescriptor, { crate::primitives::MAX_PAN_DESCRIPTORS }>;
+
+mod tx_sealed {
+    pub trait Sealed {}
 }
 
-/// `P::TX_OFFLOAD == TxOffload::Full`.
-struct FullOffload<P>(core::marker::PhantomData<P>);
-
-impl<P: RadioPhy> Choice for FullOffload<P> {
-    const FIRST: bool = matches!(P::TX_OFFLOAD, TxOffload::Full);
-}
-
-/// `P::TX_OFFLOAD == TxOffload::AckWait`.
-struct AckWaitOffload<P>(core::marker::PhantomData<P>);
-
-impl<P: RadioPhy> Choice for AckWaitOffload<P> {
-    const FIRST: bool = matches!(P::TX_OFFLOAD, TxOffload::AckWait);
-}
-
-/// `P::POLL_EXTENDED_FALLBACK`.
-struct ExtendedPollFallback<P>(core::marker::PhantomData<P>);
-
-impl<P: RadioPhy> Choice for ExtendedPollFallback<P> {
-    const FIRST: bool = P::POLL_EXTENDED_FALLBACK;
-}
-
-/// Exactly one of two futures, selected by the constant `C::FIRST`.
+/// Transmit-path offload level of a [`RadioPhy`], selected by the
+/// [`RadioPhy::Tx`] associated type.
 ///
-/// `if CONST { a.await } else { b.await }` inside an `async fn` keeps an
-/// await state for *both* arms (coroutine layout is computed before
-/// monomorphisation), and with it the complete poll and drop code of the
-/// unused future. `ConstEither` is an untagged union whose `poll` and `drop`
-/// dispatch on the constant, so the unused arm — e.g. the hardware-offload
-/// path of a software-only PHY — is removed by the optimiser and the wrapper
-/// costs neither a tag byte nor a runtime check.
-union ConstEither<C: Choice, A, B> {
-    first: core::mem::ManuallyDrop<A>,
-    second: core::mem::ManuallyDrop<B>,
-    _choice: core::marker::PhantomData<C>,
+/// Sealed: the three levels are [`SoftwareTx`], [`AckWaitTx`] and
+/// [`FullTx`]. Because the path is selected by *type*, only the selected
+/// transmit future exists after monomorphisation: a backend pays neither
+/// flash for the other paths nor future (stack) space for their states.
+pub trait TxOffload: tx_sealed::Sealed {
+    /// The PHY waits for the Imm-Ack itself
+    /// ([`RadioPhy::try_transmit_acknowledged`]).
+    #[doc(hidden)]
+    const ACK_WAIT: bool = false;
+
+    /// Transmit `frame` with the PIB CSMA-CA parameters and, when
+    /// `ack_requested`, ACK wait and `macMaxFrameRetries` retransmissions.
+    /// An unacknowledged transmission returns `AckResult::default()`.
+    #[doc(hidden)]
+    async fn transmit<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize>(
+        core: &mut SoftMacCore<P, R, RX>,
+        frame: &[u8],
+        ack_requested: bool,
+    ) -> Result<AckResult, MacError>;
 }
 
-impl<C: Choice, A, B> ConstEither<C, A, B> {
-    /// Must only be called when `C::FIRST` is true (constant-folded).
-    #[inline(always)]
-    fn first(future: A) -> Self {
-        assert!(C::FIRST);
-        Self {
-            first: core::mem::ManuallyDrop::new(future),
-        }
-    }
+/// Software CSMA-CA, software ACK wait and software retries. The PHY
+/// implements only [`RadioPhy::try_transmit`] (one CCA + TX) and
+/// [`RadioPhy::send_ack`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SoftwareTx;
 
-    /// Must only be called when `C::FIRST` is false (constant-folded).
-    #[inline(always)]
-    fn second(future: B) -> Self {
-        assert!(!C::FIRST);
-        Self {
-            second: core::mem::ManuallyDrop::new(future),
-        }
-    }
-}
+/// The PHY performs one CCA + TX and waits for the matching Imm-Ack in its
+/// ISR or radio core ([`RadioPhy::try_transmit_acknowledged`]); the software
+/// MAC keeps the CSMA-CA backoff and `macMaxFrameRetries` policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AckWaitTx;
 
-impl<C: Choice, A: Future, B: Future<Output = A::Output>> Future for ConstEither<C, A, B> {
-    type Output = A::Output;
+/// The PHY performs the complete unslotted CSMA-CA, ACK wait and
+/// retransmission sequence ([`RadioPhy::transmit_offloaded`]) using the
+/// [`TxParams`] supplied from the MAC PIB.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FullTx;
 
-    #[inline(always)]
-    fn poll(
-        self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
-        // SAFETY: the constructors store the field selected by the constant
-        // `C::FIRST`, so the field read here is the initialised one. The
-        // projection is structural: the pinned future is never moved out
-        // and is dropped in place by `Drop`.
-        unsafe {
-            let this = self.get_unchecked_mut();
-            if C::FIRST {
-                core::pin::Pin::new_unchecked(&mut *this.first).poll(cx)
-            } else {
-                core::pin::Pin::new_unchecked(&mut *this.second).poll(cx)
+impl tx_sealed::Sealed for SoftwareTx {}
+impl tx_sealed::Sealed for AckWaitTx {}
+impl tx_sealed::Sealed for FullTx {}
+
+impl TxOffload for SoftwareTx {
+    async fn transmit<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize>(
+        core: &mut SoftMacCore<P, R, RX>,
+        frame: &[u8],
+        ack_requested: bool,
+    ) -> Result<AckResult, MacError> {
+        let sequence = match (ack_requested, frame.get(2)) {
+            (false, _) => 0,
+            (true, Some(sequence)) => *sequence,
+            (true, None) => return Err(MacError::InvalidParameter),
+        };
+        let mut retries = core.pib.max_frame_retries();
+        loop {
+            core.csma(frame, false).await?;
+            if !ack_requested {
+                return Ok(AckResult::default());
             }
+            if let Some(Heard::Ack(ack)) = core.listen(ACK_WAIT_US, Want::Ack(sequence)).await? {
+                return Ok(ack);
+            }
+            if retries == 0 {
+                return Err(MacError::NoAck);
+            }
+            retries -= 1;
         }
     }
 }
 
-impl<C: Choice, A, B> Drop for ConstEither<C, A, B> {
-    #[inline(always)]
-    fn drop(&mut self) {
-        // SAFETY: as in `poll`, the field selected by `C::FIRST` is the
-        // initialised one, and it is dropped exactly once, in place.
-        unsafe {
-            if C::FIRST {
-                core::mem::ManuallyDrop::drop(&mut self.first);
-            } else {
-                core::mem::ManuallyDrop::drop(&mut self.second);
-            }
+impl TxOffload for AckWaitTx {
+    const ACK_WAIT: bool = true;
+
+    async fn transmit<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize>(
+        core: &mut SoftMacCore<P, R, RX>,
+        frame: &[u8],
+        ack_requested: bool,
+    ) -> Result<AckResult, MacError> {
+        if ack_requested && frame.len() < 3 {
+            return Err(MacError::InvalidParameter);
         }
+        let mut retries = core.pib.max_frame_retries();
+        loop {
+            if let Some(ack) = core.csma(frame, ack_requested).await? {
+                return Ok(ack);
+            }
+            if retries == 0 {
+                return Err(MacError::NoAck);
+            }
+            retries -= 1;
+        }
+    }
+}
+
+impl TxOffload for FullTx {
+    async fn transmit<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize>(
+        core: &mut SoftMacCore<P, R, RX>,
+        frame: &[u8],
+        ack_requested: bool,
+    ) -> Result<AckResult, MacError> {
+        let params = core.tx_params();
+        match core
+            .phy
+            .transmit_offloaded(frame, ack_requested, params)
+            .await
+        {
+            Ok(Some(ack)) => Ok(ack),
+            Ok(None) if ack_requested => Err(MacError::NoAck),
+            Ok(None) => Ok(AckResult::default()),
+            Err(error) => Err(phy_error(error)),
+        }
+    }
+}
+
+/// What a [`SoftMacCore::listen`] window is waiting for.
+enum Want<'a> {
+    /// Nothing: retain and acknowledge traffic until the window closes.
+    Nothing,
+    /// Return as soon as a frame was retained (data indication / command).
+    Retained,
+    /// The Imm-Ack with this sequence number.
+    Ack(u8),
+    /// Our parent's indirect data frame; it is queued at the front.
+    PollResponse,
+    /// An Association Response addressed to us.
+    AssocResponse,
+    /// Beacons on this channel, merged into the descriptor list. Nothing is
+    /// retained or acknowledged during a scan.
+    Beacons(u8, &'a mut PanDescriptors),
+}
+
+/// Outcome of a [`SoftMacCore::listen`] window that ended early.
+enum Heard {
+    Ack(AckResult),
+    /// A frame was retained (pending RX or, on a parent, the command queue).
+    Queued,
+    Association(ShortAddress, u8),
+}
+
+fn phy_error(error: PhyError) -> MacError {
+    match error {
+        PhyError::ChannelBusy => MacError::ChannelAccessFailure,
+        PhyError::InvalidChannel => MacError::InvalidParameter,
+        PhyError::FrameTooLong => MacError::FrameTooLong,
+        PhyError::CrcFailed | PhyError::Hardware => MacError::RadioError,
+        PhyError::Unsupported => MacError::Unsupported,
+    }
+}
+
+fn pib_error(error: PibError) -> MacError {
+    match error {
+        PibError::InvalidValue | PibError::ReadOnly => MacError::InvalidParameter,
+    }
+}
+
+fn address_filter(pib: &MacPib) -> Option<PhyAddressFilter> {
+    (!pib.promiscuous()).then_some(PhyAddressFilter {
+        pan_id: pib.pan_id(),
+        short_address: pib.short_address(),
+        extended_address: pib.extended_address(),
+    })
+}
+
+fn upsert_pan_descriptor(descriptors: &mut PanDescriptors, descriptor: PanDescriptor) {
+    if let Some(existing) = descriptors.iter_mut().find(|existing| {
+        existing.channel == descriptor.channel
+            && existing.coord_address == descriptor.coord_address
+            && existing.zigbee_beacon.extended_pan_id == descriptor.zigbee_beacon.extended_pan_id
+    }) {
+        if descriptor.lqi > existing.lqi {
+            *existing = descriptor;
+        }
+    } else {
+        let _ = descriptors.push(descriptor);
     }
 }
 
@@ -263,17 +360,20 @@ impl<P: RadioPhy, R: MacRole, const RX: usize> SoftMacCore<P, R, RX> {
         self.pib.get(attr)
     }
 
+    /// MLME-SET. A value whose radio side effect fails is not committed.
     pub fn set_pib(&mut self, attr: PibAttribute, value: PibValue) -> Result<(), MacError> {
-        let mut next = self.pib.clone();
-        next.set(attr, value).map_err(Self::map_pib_error)?;
-        self.apply_changed_config(attr, &next)?;
-        self.pib = next;
+        let previous = self.pib.get(attr);
+        self.pib.set(attr, value).map_err(pib_error)?;
+        if let Err(error) = self.apply_changed_config(attr) {
+            // `previous` was read from a valid PIB, so restoring it succeeds.
+            let _ = self.pib.set(attr, previous);
+            return Err(error);
+        }
         Ok(())
     }
 
     pub fn reset_pib(&mut self, dsn: u8, bsn: u8) -> Result<(), MacError> {
-        let mut next = self.pib.clone();
-        next.reset(dsn, bsn);
+        let next = MacPib::new(self.pib.extended_address(), dsn, bsn);
         Self::apply_full_config(&mut self.phy, &next)?;
         self.pib = next;
         self.pending_rx.clear();
@@ -317,56 +417,53 @@ impl<P: RadioPhy, R: MacRole, const RX: usize> SoftMacCore<P, R, RX> {
         }
     }
 
-    fn apply_changed_config(&mut self, attr: PibAttribute, next: &MacPib) -> Result<(), MacError> {
+    /// Apply the radio side effect of the (already updated) PIB attribute.
+    fn apply_changed_config(&mut self, attr: PibAttribute) -> Result<(), MacError> {
         use PibAttribute::*;
         match attr {
-            PhyCurrentChannel => self
-                .phy
-                .set_channel(next.current_channel())
-                .map_err(Self::map_phy_error),
-            PhyTransmitPower => self
-                .phy
-                .set_tx_power(next.transmit_power())
-                .map_err(Self::map_phy_error),
-            MacShortAddress | MacPanId | MacExtendedAddress | MacPromiscuousMode => self
-                .phy
-                .set_address_filter(Self::address_filter(next))
-                .map_err(Self::map_phy_error),
+            PhyCurrentChannel => self.phy.set_channel(self.pib.current_channel()),
+            PhyTransmitPower => self.phy.set_tx_power(self.pib.transmit_power()),
+            MacShortAddress | MacPanId | MacExtendedAddress | MacPromiscuousMode => {
+                self.phy.set_address_filter(address_filter(&self.pib))
+            }
             _ => Ok(()),
         }
+        .map_err(phy_error)
     }
 
     fn apply_full_config(phy: &mut P, pib: &MacPib) -> Result<(), MacError> {
-        phy.set_channel(pib.current_channel())
-            .map_err(Self::map_phy_error)?;
-        phy.set_tx_power(pib.transmit_power())
-            .map_err(Self::map_phy_error)?;
-        phy.set_address_filter(Self::address_filter(pib))
-            .map_err(Self::map_phy_error)
+        phy.set_channel(pib.current_channel()).map_err(phy_error)?;
+        phy.set_tx_power(pib.transmit_power()).map_err(phy_error)?;
+        phy.set_address_filter(address_filter(pib))
+            .map_err(phy_error)
     }
 
-    fn address_filter(pib: &MacPib) -> Option<PhyAddressFilter> {
-        (!pib.promiscuous()).then_some(PhyAddressFilter {
-            pan_id: pib.pan_id(),
-            short_address: pib.short_address(),
-            extended_address: pib.extended_address(),
-        })
-    }
-
-    fn map_pib_error(error: PibError) -> MacError {
-        match error {
-            PibError::InvalidValue | PibError::ReadOnly => MacError::InvalidParameter,
+    /// Tune the radio, then commit `macCurrentChannel`.
+    fn set_channel(&mut self, channel: u8) -> Result<(), MacError> {
+        if !(11..=26).contains(&channel) {
+            return Err(MacError::InvalidParameter);
         }
+        self.phy.set_channel(channel).map_err(phy_error)?;
+        self.pib.current_channel = channel;
+        Ok(())
     }
 
-    fn map_phy_error(error: PhyError) -> MacError {
-        match error {
-            PhyError::ChannelBusy => MacError::ChannelAccessFailure,
-            PhyError::InvalidChannel => MacError::InvalidParameter,
-            PhyError::FrameTooLong => MacError::FrameTooLong,
-            PhyError::CrcFailed | PhyError::Hardware => MacError::RadioError,
-            PhyError::Unsupported => MacError::Unsupported,
-        }
+    /// Program the address filter, then commit `macPANId` and
+    /// `macShortAddress`.
+    fn set_addresses(
+        &mut self,
+        pan_id: PanId,
+        short_address: ShortAddress,
+    ) -> Result<(), MacError> {
+        let filter = (!self.pib.promiscuous()).then_some(PhyAddressFilter {
+            pan_id,
+            short_address,
+            extended_address: self.pib.extended_address(),
+        });
+        self.phy.set_address_filter(filter).map_err(phy_error)?;
+        self.pib.pan_id = pan_id;
+        self.pib.short_address = short_address;
+        Ok(())
     }
 
     fn clear_role_state(&mut self) {
@@ -420,8 +517,8 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> PlatformServic
         self.phy.monotonic_micros()
     }
 
-    async fn delay_micros(&mut self, duration_us: u32) {
-        self.phy.delay_micros(duration_us).await;
+    fn delay_micros(&mut self, duration_us: u32) -> impl Future<Output = ()> {
+        self.phy.delay_micros(duration_us)
     }
 
     fn fill_random(&mut self, output: &mut [u8]) -> Result<(), MacError> {
@@ -430,59 +527,93 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> PlatformServic
 }
 
 impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P, R, RX> {
-    pub async fn associate(
+    /// MLME-ASSOCIATE: send the Association Request, then poll for the
+    /// response (one transmit, one listen and one delay await in a loop).
+    #[allow(clippy::manual_async_fn)] // avoids a second copy of by-value args
+    pub fn associate(
         &mut self,
         req: MlmeAssociateRequest,
-    ) -> Result<MlmeAssociateConfirm, MacError> {
-        self.prepare_association(&req)?;
+    ) -> impl Future<Output = Result<MlmeAssociateConfirm, MacError>> + '_ {
+        // Not an `async fn`, see `send_data`.
+        async move {
+            self.prepare_association(&req)?;
 
-        let request = build_association_request(
-            self.pib.next_dsn(),
-            &req.coord_address,
-            &self.pib.extended_address(),
-            &req.capability_info,
-        );
-        self.transmit_acknowledged(&request).await?;
+            let mut polls = 0u8;
+            loop {
+                let ack = {
+                    let sequence = self.pib.next_dsn();
+                    let own = self.pib.extended_address();
+                    let frame = if polls == 0 {
+                        build_association_request(
+                            sequence,
+                            &req.coord_address,
+                            &own,
+                            &req.capability_info,
+                        )
+                    } else {
+                        let mut frame = heapless::Vec::new();
+                        let _ = frame.extend_from_slice(&build_data_request(
+                            sequence,
+                            &req.coord_address,
+                            &own,
+                        ));
+                        frame
+                    };
+                    self.transmit(&frame, true).await?
+                };
 
-        if let Some(response) = self.take_pending_association_response() {
-            return self.finish_association(response).await;
-        }
-        if let Some(response) = self
-            .wait_for_association_response(ASSOCIATION_DIRECT_WAIT_US)
-            .await?
-        {
-            return self.finish_association(response).await;
-        }
+                // The direct response window follows the request; after a poll,
+                // a Frame Pending ACK announces the queued response, so wait the
+                // backend's poll-response window for it. Otherwise listen only
+                // briefly before the next poll.
+                let wait_us = if polls == 0 {
+                    ASSOCIATION_DIRECT_WAIT_US
+                } else if ack.frame_pending {
+                    P::POLL_RESPONSE_WAIT_US
+                } else {
+                    POLL_RESPONSE_WAIT_US
+                };
+                let response = match self.take_pending_association_response() {
+                    Some(response) => Some(response),
+                    None => match self.listen(wait_us, Want::AssocResponse).await? {
+                        Some(Heard::Association(address, status)) => Some((address, status)),
+                        _ => None,
+                    },
+                };
+                if let Some(response) = response {
+                    let confirm = self.finish_association(response)?;
+                    if confirm.status == AssociationStatus::Success
+                        && let Err(error) = self.listen(POST_ASSOCIATION_RX_US, Want::Nothing).await
+                    {
+                        self.pending_error = Some(error);
+                    }
+                    return Ok(confirm);
+                }
 
-        for _ in 0..MAX_ASSOCIATION_POLLS {
-            let poll = build_data_request(
-                self.pib.next_dsn(),
-                &req.coord_address,
-                &self.pib.extended_address(),
-            );
-            let ack = self.transmit_acknowledged(&poll).await?;
-
-            if let Some(response) = self.take_pending_association_response() {
-                return self.finish_association(response).await;
+                if polls != 0 {
+                    self.phy.delay_micros(ASSOCIATION_POLL_DELAY_US).await;
+                }
+                if polls == MAX_ASSOCIATION_POLLS {
+                    return Err(MacError::NoData);
+                }
+                polls += 1;
             }
-            // A Frame Pending ACK announces the queued response: wait the
-            // backend's poll-response window for it. Otherwise listen only
-            // briefly before the next poll.
-            let wait_us = if ack.frame_pending {
-                P::POLL_RESPONSE_WAIT_US
-            } else {
-                POLL_RESPONSE_WAIT_US
-            };
-            if let Some(response) = self.wait_for_association_response(wait_us).await? {
-                return self.finish_association(response).await;
-            }
-            self.delay_micros(ASSOCIATION_POLL_DELAY_US).await;
         }
-
-        Err(MacError::NoData)
     }
 
-    pub async fn disassociate(&mut self, req: MlmeDisassociateRequest) -> Result<(), MacError> {
+    /// MLME-DISASSOCIATE (direct notification to the parent).
+    pub fn disassociate(
+        &mut self,
+        req: MlmeDisassociateRequest,
+    ) -> impl Future<Output = Result<(), MacError>> + '_ {
+        let notification = self.disassociation_notification(&req);
+        self.send_disassociation(notification)
+    }
+
+    fn disassociation_notification(
+        &mut self,
+        req: &MlmeDisassociateRequest,
+    ) -> Result<heapless::Vec<u8, 32>, MacError> {
         if req.tx_indirect {
             return Err(MacError::Unsupported);
         }
@@ -496,17 +627,30 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             return Err(MacError::InvalidParameter);
         }
 
-        let notification = build_disassociation_notification(
+        Ok(build_disassociation_notification(
             self.pib.next_dsn(),
             &req.device_address,
             self.pib.short_address(),
             &self.pib.extended_address(),
             req.reason,
-        );
-        let transmit_result = self.transmit_acknowledged(&notification).await;
-        let clear_result = self.clear_association();
-        clear_result?;
-        transmit_result.map(|_| ())
+        ))
+    }
+
+    // Not an `async fn`, see `send_data`.
+    #[allow(clippy::manual_async_fn)] // avoids a second copy of by-value args
+    fn send_disassociation(
+        &mut self,
+        notification: Result<heapless::Vec<u8, 32>, MacError>,
+    ) -> impl Future<Output = Result<(), MacError>> + '_ {
+        async move {
+            let frame = match &notification {
+                Ok(frame) => frame,
+                Err(error) => return Err(*error),
+            };
+            let transmit_result = self.transmit(frame, true).await;
+            self.clear_association()?;
+            transmit_result.map(|_| ())
+        }
     }
 
     pub fn reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
@@ -524,20 +668,32 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
 
     /// Put the radio into its lowest-power idle state ([`RadioPhy::sleep`]).
     pub fn sleep(&mut self) -> Result<(), MacError> {
-        self.phy.sleep().map_err(Self::map_phy_error)
+        self.phy.sleep().map_err(phy_error)
     }
 
     /// Wake the radio ([`RadioPhy::wake`]) and re-apply channel, TX power
     /// and address filter from the PIB.
     pub fn wake(&mut self) -> Result<(), MacError> {
-        self.phy.wake().map_err(Self::map_phy_error)?;
+        self.phy.wake().map_err(phy_error)?;
         Self::apply_full_config(&mut self.phy, &self.pib)
     }
 
-    pub async fn transmit_data(
+    /// MCPS-DATA. The frame is built synchronously, so the returned future
+    /// holds only the frame and the transmit state, not the request.
+    pub fn transmit_data(
         &mut self,
         req: McpsDataRequest<'_>,
-    ) -> Result<McpsDataConfirm, MacError> {
+    ) -> impl Future<Output = Result<McpsDataConfirm, MacError>> + '_ {
+        let frame = self.data_frame(&req);
+        self.send_data(frame, req.msdu_handle)
+    }
+
+    /// Build the MPDU of a direct MCPS-DATA request and decide whether it
+    /// requests an ACK.
+    fn data_frame(
+        &mut self,
+        req: &McpsDataRequest<'_>,
+    ) -> Result<(heapless::Vec<u8, 125>, bool), MacError> {
         if req.tx_options.indirect {
             return Err(MacError::Unsupported);
         }
@@ -564,45 +720,110 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             req.tx_options.frame_pending,
         )
         .map_err(|_| MacError::FrameTooLong)?;
+        Ok((frame, ack_requested))
+    }
 
-        if ack_requested {
-            self.transmit_acknowledged(&frame).await?;
-        } else {
-            self.transmit_csma(&frame).await?;
+    // Not an `async fn`: its body would move `frame` from the argument into
+    // a second local copy. The `async move` block only borrows the capture.
+    #[allow(clippy::manual_async_fn)] // avoids a second copy of by-value args
+    fn send_data(
+        &mut self,
+        frame: Result<(heapless::Vec<u8, 125>, bool), MacError>,
+        msdu_handle: u8,
+    ) -> impl Future<Output = Result<McpsDataConfirm, MacError>> + '_ {
+        async move {
+            let (frame, ack_requested) = match &frame {
+                Ok((frame, ack_requested)) => (frame, *ack_requested),
+                Err(error) => return Err(*error),
+            };
+            self.transmit(frame, ack_requested).await?;
+            Ok(McpsDataConfirm {
+                msdu_handle,
+                timestamp: None,
+            })
         }
-
-        Ok(McpsDataConfirm {
-            msdu_handle: req.msdu_handle,
-            timestamp: None,
-        })
     }
 
     /// Send one MAC Data Request to the parent and return the indirect frame
     /// it delivers, if any.
     ///
     /// PHYs with [`RadioPhy::POLL_EXTENDED_FALLBACK`] follow a short-source
-    /// poll that returned nothing with a second, extended-source poll; other
-    /// PHYs compile only the single-poll body.
+    /// poll that returned nothing with a second, extended-source poll.
     pub fn poll(&mut self) -> impl Future<Output = Result<Option<MacFrame>, MacError>> + '_ {
-        if <ExtendedPollFallback<P>>::FIRST {
-            ConstEither::<ExtendedPollFallback<P>, _, _>::first(self.poll_with_extended_fallback())
-        } else {
-            ConstEither::second(self.poll_once())
-        }
+        self.poll_within(u32::MAX)
+    }
+
+    /// [`Self::poll`] with the `mlme_poll_timeout` contract: a frame whose
+    /// poll completed `timeout_us` or later after the call is discarded.
+    ///
+    /// A short-source poll that returned nothing is followed (with
+    /// [`RadioPhy::POLL_EXTENDED_FALLBACK`]) by a second, extended-source
+    /// poll that retrieves a frame the parent queued by our EUI-64 (Rejoin
+    /// Response, Transport-Key). A transmit failure of that optional second
+    /// poll is reported as "no data" so it never masks the first result.
+    pub async fn poll_within(&mut self, timeout_us: u32) -> Result<Option<MacFrame>, MacError> {
+        let started_at = self.phy.monotonic_micros();
+        let frame = 'poll: {
+            if let Some(frame) = self.take_pending_data() {
+                break 'poll Some(frame);
+            }
+            if let Some(error) = self.pending_error.take() {
+                return Err(error);
+            }
+
+            let (coordinator, own_short, has_short_source, has_extended_source) =
+                self.poll_addresses()?;
+            let mut short_source = has_short_source;
+            let mut first_pass = true;
+            loop {
+                let sent = {
+                    let sequence = self.pib.next_dsn();
+                    let request = if short_source {
+                        build_data_request_short(sequence, &coordinator, own_short)
+                    } else {
+                        build_data_request(sequence, &coordinator, &self.pib.extended_address())
+                    };
+                    self.transmit(&request, true).await
+                };
+                let ack = match sent {
+                    Ok(ack) => ack,
+                    Err(error) if first_pass => return Err(error),
+                    Err(_) => break 'poll None,
+                };
+                if let Some(frame) = self.take_pending_data() {
+                    break 'poll Some(frame);
+                }
+                // IEEE 802.15.4-2015 §6.7.3: after Frame Pending the parent
+                // delivers the buffered frame from itself to this device;
+                // `listen` queues it at the front of pending RX.
+                if ack.frame_pending
+                    && self
+                        .listen(P::POLL_RESPONSE_WAIT_US, Want::PollResponse)
+                        .await?
+                        .is_some()
+                {
+                    break 'poll self.take_pending_data();
+                }
+                if !(P::POLL_EXTENDED_FALLBACK && short_source && has_extended_source) {
+                    break 'poll None;
+                }
+                short_source = false;
+                first_pass = false;
+            }
+        };
+        let elapsed = self.phy.monotonic_micros().wrapping_sub(started_at);
+        Ok(frame.filter(|_| elapsed < timeout_us))
     }
 
     /// Resolve the parent address and our preferred source address for a
-    /// Data Request. Returns `(coordinator, own_short, own_extended,
-    /// has_short_source, has_extended_source)`.
-    fn poll_addresses(
-        &self,
-    ) -> Result<(MacAddress, ShortAddress, IeeeAddress, bool, bool), MacError> {
+    /// Data Request. Returns `(coordinator, own_short, has_short_source,
+    /// has_extended_source)`.
+    fn poll_addresses(&self) -> Result<(MacAddress, ShortAddress, bool, bool), MacError> {
         let own_short = self.pib.short_address();
-        let own_extended = self.pib.extended_address();
         let coordinator_short = self.pib.coord_short_address();
         let coordinator_extended = self.pib.coord_extended_address();
         let has_short_source = own_short.0 < 0xFFF8;
-        let has_extended_source = own_extended != [0; 8];
+        let has_extended_source = self.pib.extended_address() != [0; 8];
         let coordinator = if coordinator_short.0 < 0xFFF8 {
             MacAddress::Short(self.pib.pan_id(), coordinator_short)
         } else if coordinator_extended != [0; 8] {
@@ -616,135 +837,9 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
         Ok((
             coordinator,
             own_short,
-            own_extended,
             has_short_source,
             has_extended_source,
         ))
-    }
-
-    async fn poll_once(&mut self) -> Result<Option<MacFrame>, MacError> {
-        if let Some(frame) = self.take_pending_data()? {
-            return Ok(Some(frame));
-        }
-        if let Some(error) = self.pending_error.take() {
-            return Err(error);
-        }
-
-        let (coordinator, own_short, own_extended, has_short_source, _) = self.poll_addresses()?;
-        let sequence = self.pib.next_dsn();
-        let request = if has_short_source {
-            build_data_request_short(sequence, &coordinator, own_short)
-        } else {
-            build_data_request(sequence, &coordinator, &own_extended)
-        };
-
-        let ack = self.transmit_acknowledged(&request).await?;
-        if let Some(frame) = self.take_pending_data()? {
-            return Ok(Some(frame));
-        }
-        if !ack.frame_pending {
-            return Ok(None);
-        }
-
-        self.receive_poll_response().await
-    }
-
-    /// A short-source poll that returned nothing is followed by a second,
-    /// extended-source poll that retrieves a frame the parent queued by our
-    /// EUI-64 (Rejoin Response, Transport-Key). A failure of that optional
-    /// second poll is reported as "no data" so it never masks the result of
-    /// the first one.
-    async fn poll_with_extended_fallback(&mut self) -> Result<Option<MacFrame>, MacError> {
-        if let Some(frame) = self.take_pending_data()? {
-            return Ok(Some(frame));
-        }
-        if let Some(error) = self.pending_error.take() {
-            return Err(error);
-        }
-
-        let (coordinator, own_short, own_extended, has_short_source, has_extended_source) =
-            self.poll_addresses()?;
-        let mut short_source = has_short_source;
-        let mut first_pass = true;
-        loop {
-            let sequence = self.pib.next_dsn();
-            let request = if short_source {
-                build_data_request_short(sequence, &coordinator, own_short)
-            } else {
-                build_data_request(sequence, &coordinator, &own_extended)
-            };
-
-            let ack = match self.transmit_acknowledged(&request).await {
-                Ok(ack) => ack,
-                Err(error) if first_pass => return Err(error),
-                Err(_) => return Ok(None),
-            };
-            if let Some(frame) = self.take_pending_data()? {
-                return Ok(Some(frame));
-            }
-            if ack.frame_pending
-                && let Some(frame) = self.receive_poll_response().await?
-            {
-                return Ok(Some(frame));
-            }
-            if !(short_source && has_extended_source) {
-                return Ok(None);
-            }
-            short_source = false;
-            first_pass = false;
-        }
-    }
-
-    /// Wait for the indirect frame announced by a frame-pending ACK.
-    ///
-    /// IEEE 802.15.4-2015 §6.7.3: after the parent sets Frame Pending it
-    /// delivers the buffered frame *from itself* *to this device*. Other
-    /// traffic heard in the same window (mesh broadcasts, unicasts relayed by
-    /// a different router) is ordinary receive traffic: it is acknowledged
-    /// and queued for `receive_data`, never substituted for the poll result.
-    async fn receive_poll_response(&mut self) -> Result<Option<MacFrame>, MacError> {
-        let started_at = self.monotonic_micros();
-
-        for _ in 0..MAX_SCAN_FRAMES_PER_CHANNEL {
-            let elapsed = self.monotonic_micros().wrapping_sub(started_at);
-            let Some(remaining) = P::POLL_RESPONSE_WAIT_US.checked_sub(elapsed) else {
-                return Ok(None);
-            };
-            let frame = match self.phy.receive(remaining).await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => return Ok(None),
-                Err(PhyError::CrcFailed) => continue,
-                Err(error) => return Err(Self::map_phy_error(error)),
-            };
-
-            // One await for both outcomes keeps a single frame in the future.
-            let poll_response = self.is_poll_response(frame.as_slice());
-            if !poll_response && !self.is_retained(&frame) {
-                continue;
-            }
-            self.acknowledge_received_frame(&frame).await?;
-            if poll_response {
-                return Ok(self
-                    .indication_from(&frame)?
-                    .map(|indication| indication.payload));
-            }
-            self.store_retained(frame);
-        }
-
-        Ok(None)
-    }
-
-    /// A poll response is a data frame sent by our parent to our exact
-    /// (non-broadcast) address.
-    fn is_poll_response(&self, data: &[u8]) -> bool {
-        if data.len() < 3 || data[0] & 0x07 != 0x01 {
-            return false;
-        }
-        let (source, destination, payload_offset, _) = parse_mac_addresses(data);
-        payload_offset >= 3
-            && payload_offset <= data.len()
-            && self.is_exact_destination(&destination)
-            && self.is_from_coordinator(&source)
     }
 
     fn is_from_coordinator(&self, source: &MacAddress) -> bool {
@@ -762,204 +857,171 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
         }
     }
 
+    /// MCPS-DATA.indication: the next retained data frame, listening up to
+    /// `timeout_us` for one.
     pub async fn receive_data(&mut self, timeout_us: u32) -> Result<McpsDataIndication, MacError> {
-        let started_at = self.monotonic_micros();
+        let started_at = self.phy.monotonic_micros();
 
-        for _ in 0..MAX_SCAN_FRAMES_PER_CHANNEL {
+        for _ in 0..MAX_RX_FRAMES {
             // Queued frames were acknowledged when they were queued.
-            let frame = if let Some(frame) = self.pending_rx.pop_front() {
-                frame
-            } else if let Some(error) = self.pending_error.take() {
-                return Err(error);
-            } else {
-                let elapsed = self.monotonic_micros().wrapping_sub(started_at);
-                let Some(remaining) = timeout_us.checked_sub(elapsed) else {
-                    return Err(MacError::NoData);
-                };
-                match self.phy.receive(remaining).await {
-                    Ok(Some(frame)) => {
-                        self.acknowledge_received_frame(&frame).await?;
-                        frame
-                    }
-                    Ok(None) => return Err(MacError::NoData),
-                    Err(PhyError::CrcFailed) => continue,
-                    Err(error) => return Err(Self::map_phy_error(error)),
-                }
-            };
-
-            if let Some(indication) = self.indication_from(&frame)? {
+            if let Some(indication) = self.take_pending_indication() {
                 return Ok(indication);
             }
             if R::PARENT && self.role.take_service_request() {
                 return Err(MacError::NoData);
+            }
+            if let Some(error) = self.pending_error.take() {
+                return Err(error);
+            }
+            let elapsed = self.phy.monotonic_micros().wrapping_sub(started_at);
+            let Some(remaining) = timeout_us.checked_sub(elapsed) else {
+                break;
+            };
+            if self.listen(remaining, Want::Retained).await?.is_none() {
+                break;
             }
         }
 
         Err(MacError::NoData)
     }
 
-    pub async fn scan(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
-        if req.scan_duration > 14 {
-            return Err(MacError::InvalidParameter);
+    /// MLME-SCAN (ED, active or passive). The address filter is disabled for
+    /// the scan; the original channel and filter are restored afterwards,
+    /// also when the scan fails.
+    #[allow(clippy::manual_async_fn)] // avoids a second copy of by-value args
+    pub fn scan(
+        &mut self,
+        req: MlmeScanRequest,
+    ) -> impl Future<Output = Result<MlmeScanConfirm, MacError>> + '_ {
+        // Not an `async fn`, see `send_data`.
+        async move {
+            if req.scan_duration > 14 {
+                return Err(MacError::InvalidParameter);
+            }
+            if req.scan_type == ScanType::Orphan {
+                return Err(MacError::Unsupported);
+            }
+            let duration_us = u32::try_from(scan_duration_us(req.scan_duration))
+                .map_err(|_| MacError::InvalidParameter)?;
+
+            let original_channel = self.pib.current_channel();
+            self.phy.set_address_filter(None).map_err(phy_error)?;
+
+            let mut confirm = MlmeScanConfirm {
+                scan_type: req.scan_type,
+                pan_descriptors: heapless::Vec::new(),
+                energy_list: heapless::Vec::new(),
+            };
+            let scan_result: Result<(), MacError> = 'scan: {
+                for channel in req.channel_mask.iter() {
+                    let channel = channel.number();
+                    if let Err(error) = self.set_channel(channel) {
+                        break 'scan Err(error);
+                    }
+
+                    if req.scan_type == ScanType::Ed {
+                        match self.phy.energy_detect(duration_us).await {
+                            Ok(energy) => {
+                                let _ = confirm.energy_list.push(EdValue { channel, energy });
+                            }
+                            Err(error) => break 'scan Err(phy_error(error)),
+                        }
+                        continue;
+                    }
+                    if req.scan_type == ScanType::Active {
+                        let sent = {
+                            let beacon_request = build_beacon_request(self.pib.next_dsn());
+                            self.transmit(&beacon_request, false).await
+                        };
+                        match sent {
+                            Ok(_) => {}
+                            // A busy channel only means no beacon request went
+                            // out on it; keep scanning the remaining channels.
+                            Err(MacError::ChannelAccessFailure) => continue,
+                            Err(error) => break 'scan Err(error),
+                        }
+                    }
+                    if let Err(error) = self
+                        .listen(
+                            duration_us,
+                            Want::Beacons(channel, &mut confirm.pan_descriptors),
+                        )
+                        .await
+                    {
+                        break 'scan Err(error);
+                    }
+                }
+                Ok(())
+            };
+
+            self.set_channel(original_channel)?;
+            self.phy
+                .set_address_filter(address_filter(&self.pib))
+                .map_err(phy_error)?;
+            scan_result?;
+
+            if req.scan_type != ScanType::Ed && confirm.pan_descriptors.is_empty() {
+                return Err(MacError::NoBeacon);
+            }
+            Ok(confirm)
         }
-        if req.scan_type == ScanType::Orphan {
-            return Err(MacError::Unsupported);
-        }
+    }
 
-        let original_channel = self.pib.current_channel();
-        self.phy
-            .set_address_filter(None)
-            .map_err(Self::map_phy_error)?;
-
-        let scan_result = self.scan_unfiltered(req).await;
-        let restore_result = self
-            .set_pib(
-                PibAttribute::PhyCurrentChannel,
-                PibValue::U8(original_channel),
-            )
-            .and_then(|()| {
-                self.phy
-                    .set_address_filter(Self::address_filter(&self.pib))
-                    .map_err(Self::map_phy_error)
-            });
-
-        restore_result?;
-        scan_result
+    /// Transmit `frame` through the backend's [`RadioPhy::Tx`] path.
+    fn transmit<'s>(
+        &'s mut self,
+        frame: &'s [u8],
+        ack_requested: bool,
+    ) -> impl Future<Output = Result<AckResult, MacError>> + 's {
+        P::Tx::transmit(self, frame, ack_requested)
     }
 
     /// Transmit `frame` with unslotted CSMA-CA and no ACK request.
-    pub fn transmit_csma<'s>(
-        &'s mut self,
-        frame: &'s [u8],
-    ) -> impl Future<Output = Result<(), MacError>> + 's {
-        if <FullOffload<P>>::FIRST {
-            ConstEither::<FullOffload<P>, _, _>::first(
-                self.transmit_offloaded_unacknowledged(frame),
-            )
-        } else {
-            ConstEither::second(self.transmit_csma_software(frame))
-        }
-    }
-
-    /// [`TxOffload::Full`]: the PHY runs CSMA-CA, retries and the ACK wait.
-    async fn transmit_offloaded(
-        &mut self,
-        frame: &[u8],
-        ack_requested: bool,
-    ) -> Result<AckResult, MacError> {
-        let params = self.tx_params();
-        match self
-            .phy
-            .transmit_offloaded(frame, ack_requested, params)
-            .await
-        {
-            Ok(Some(ack)) => Ok(ack),
-            Ok(None) if ack_requested => Err(MacError::NoAck),
-            Ok(None) => Ok(AckResult::default()),
-            Err(error) => Err(Self::map_phy_error(error)),
-        }
-    }
-
-    async fn transmit_offloaded_unacknowledged(&mut self, frame: &[u8]) -> Result<(), MacError> {
-        self.transmit_offloaded(frame, false).await.map(|_| ())
-    }
-
-    async fn transmit_csma_software(&mut self, frame: &[u8]) -> Result<(), MacError> {
-        let mut backoff_count = 0u8;
-        let mut backoff_exponent = self.pib.min_be();
-
-        loop {
-            let slots = self.random_backoff_slots(backoff_exponent);
-            if slots != 0 {
-                self.delay_micros(u32::from(slots) * UNIT_BACKOFF_PERIOD_US)
-                    .await;
-            }
-
-            match self.phy.try_transmit(frame).await {
-                Ok(()) => return Ok(()),
-                Err(PhyError::ChannelBusy) if backoff_count < self.pib.max_csma_backoffs() => {
-                    backoff_count = backoff_count.saturating_add(1);
-                    backoff_exponent =
-                        core::cmp::min(backoff_exponent.saturating_add(1), self.pib.max_be());
-                }
-                Err(error) => return Err(Self::map_phy_error(error)),
-            }
-        }
+    pub async fn transmit_csma(&mut self, frame: &[u8]) -> Result<(), MacError> {
+        self.transmit(frame, false).await.map(|_| ())
     }
 
     /// Transmit `frame` (ACK request set) with CSMA-CA, ACK wait and
     /// `macMaxFrameRetries` retransmissions, using the backend's
-    /// [`RadioPhy::TX_OFFLOAD`] level.
+    /// [`RadioPhy::Tx`] path.
     pub fn transmit_acknowledged<'s>(
         &'s mut self,
         frame: &'s [u8],
     ) -> impl Future<Output = Result<AckResult, MacError>> + 's {
-        if <FullOffload<P>>::FIRST {
-            ConstEither::<FullOffload<P>, _, _>::first(self.transmit_offloaded(frame, true))
-        } else if <AckWaitOffload<P>>::FIRST {
-            ConstEither::second(ConstEither::<AckWaitOffload<P>, _, _>::first(
-                self.transmit_acknowledged_ack_wait(frame),
-            ))
-        } else {
-            ConstEither::second(ConstEither::second(
-                self.transmit_acknowledged_software(frame),
-            ))
-        }
+        self.transmit(frame, true)
     }
 
-    async fn transmit_acknowledged_software(
-        &mut self,
-        frame: &[u8],
-    ) -> Result<AckResult, MacError> {
-        let sequence = *frame.get(2).ok_or(MacError::InvalidParameter)?;
-        for _ in 0..=self.pib.max_frame_retries() {
-            self.transmit_csma_software(frame).await?;
-            if let Some(ack) = self.wait_for_ack(sequence).await? {
-                return Ok(ack);
-            }
-        }
-        Err(MacError::NoAck)
-    }
-
-    async fn transmit_acknowledged_ack_wait(
-        &mut self,
-        frame: &[u8],
-    ) -> Result<AckResult, MacError> {
-        if frame.len() < 3 {
-            return Err(MacError::InvalidParameter);
-        }
-        for _ in 0..=self.pib.max_frame_retries() {
-            if let Some(ack) = self.transmit_csma_ack_wait(frame).await? {
-                return Ok(ack);
-            }
-        }
-        Err(MacError::NoAck)
-    }
-
-    /// [`TxOffload::AckWait`]: software CSMA-CA backoff around the PHY's
-    /// combined CCA + TX + hardware ACK wait.
-    async fn transmit_csma_ack_wait(
-        &mut self,
-        frame: &[u8],
-    ) -> Result<Option<AckResult>, MacError> {
+    /// Unslotted CSMA-CA around one PHY transmit attempt. With `ack_wait`
+    /// (only for an [`AckWaitTx`] PHY) the attempt includes the PHY's
+    /// hardware ACK wait; otherwise a sent frame reports a default ACK.
+    async fn csma(&mut self, frame: &[u8], ack_wait: bool) -> Result<Option<AckResult>, MacError> {
         let mut backoff_count = 0u8;
         let mut backoff_exponent = self.pib.min_be();
 
         loop {
             let slots = self.random_backoff_slots(backoff_exponent);
             if slots != 0 {
-                self.delay_micros(u32::from(slots) * UNIT_BACKOFF_PERIOD_US)
+                self.phy
+                    .delay_micros(u32::from(slots) * UNIT_BACKOFF_PERIOD_US)
                     .await;
             }
 
-            match self.phy.try_transmit_acknowledged(frame).await {
+            let result = if <P::Tx as TxOffload>::ACK_WAIT && ack_wait {
+                self.phy.try_transmit_acknowledged(frame).await
+            } else {
+                self.phy
+                    .try_transmit(frame)
+                    .await
+                    .map(|()| Some(AckResult::default()))
+            };
+            match result {
                 Ok(ack) => return Ok(ack),
                 Err(PhyError::ChannelBusy) if backoff_count < self.pib.max_csma_backoffs() => {
                     backoff_count = backoff_count.saturating_add(1);
                     backoff_exponent =
                         core::cmp::min(backoff_exponent.saturating_add(1), self.pib.max_be());
                 }
-                Err(error) => return Err(Self::map_phy_error(error)),
+                Err(error) => return Err(phy_error(error)),
             }
         }
     }
@@ -979,42 +1041,145 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
         value
     }
 
-    async fn wait_for_ack(&mut self, sequence: u8) -> Result<Option<AckResult>, MacError> {
-        let started_at = self.monotonic_micros();
+    /// The single receive loop of the MAC.
+    ///
+    /// Listens up to `timeout_us` and returns early when a frame matching
+    /// `want` was heard. Every received frame is classified by
+    /// [`Self::accept`] (synchronously, so the frame is never held across an
+    /// await); a software Imm-Ack, when one is due, is sent afterwards.
+    async fn listen(
+        &mut self,
+        timeout_us: u32,
+        mut want: Want<'_>,
+    ) -> Result<Option<Heard>, MacError> {
+        let started_at = self.phy.monotonic_micros();
 
-        for _ in 0..MAX_ACK_WINDOW_FRAMES {
-            let elapsed = self.monotonic_micros().wrapping_sub(started_at);
-            let Some(remaining) = ACK_WAIT_US.checked_sub(elapsed) else {
-                return Ok(None);
+        for _ in 0..MAX_RX_FRAMES {
+            let elapsed = self.phy.monotonic_micros().wrapping_sub(started_at);
+            let Some(remaining) = timeout_us.checked_sub(elapsed) else {
+                break;
             };
-
-            match self.phy.receive(remaining).await {
-                Ok(Some(frame)) => {
-                    let data = frame.as_slice();
-                    if data.len() >= 2 && data[0] & 0x07 == 0x02 {
-                        if data.len() >= 3 && data[2] == sequence {
-                            return Ok(Some(AckResult {
-                                frame_pending: data[0] & (1 << 4) != 0,
-                            }));
-                        }
-                        continue;
-                    }
-                    self.acknowledge_received_frame(&frame).await?;
-                    self.queue_pending_rx(frame);
+            let (ack, heard) = match self.phy.receive(remaining).await {
+                Ok(Some(frame)) => self.accept(frame, &mut want),
+                Ok(None) => break,
+                Err(PhyError::CrcFailed) => continue,
+                Err(error) => return Err(phy_error(error)),
+            };
+            // Software Imm-Ack fallback for PHYs without hardware / ISR
+            // auto-ACK. A busy channel is not fatal: the ACK is simply not
+            // sent and the originator retransmits, exactly as if it had been
+            // lost on air.
+            if let Some((sequence, frame_pending)) = ack {
+                match self.phy.send_ack(sequence, frame_pending).await {
+                    Ok(()) | Err(PhyError::ChannelBusy) => {}
+                    Err(error) => return Err(phy_error(error)),
                 }
-                Ok(None) => return Ok(None),
-                Err(PhyError::CrcFailed) => {}
-                Err(error) => return Err(Self::map_phy_error(error)),
+            }
+            if heard.is_some() {
+                return Ok(heard);
             }
         }
 
         Ok(None)
     }
 
-    /// Queue a received frame for a later `receive_data` / `poll`.
+    /// Classify one received frame for [`Self::listen`].
     ///
-    /// Callers must have run [`Self::acknowledge_received_frame`] first:
-    /// queued frames are never acknowledged again.
+    /// * During a scan only beacons are used.
+    /// * An Imm-Ack ends the window only when it matches `Want::Ack`.
+    /// * Data frames and MAC commands addressed exactly to us with the ACK
+    ///   request bit get a software ACK (unless the PHY auto-ACKs).
+    /// * Retained frames: data frames to an accepted destination (pending
+    ///   RX), MAC commands on a parent (command queue), and Association
+    ///   Responses addressed to us (pending RX, unless it is the response
+    ///   being waited for). Everything else is dropped.
+    ///
+    /// Returns the software ACK to send (`sequence`, `frame_pending`) and
+    /// the early-exit outcome.
+    fn accept(
+        &mut self,
+        frame: PhyRxFrame,
+        want: &mut Want<'_>,
+    ) -> (Option<(u8, bool)>, Option<Heard>) {
+        let data = frame.as_slice();
+        if data.len() < 3 {
+            return (None, None);
+        }
+        let kind = data[0] & 0x07;
+        if let Want::Beacons(channel, descriptors) = want {
+            if kind == 0x00
+                && let Some(descriptor) = parse_beacon(*channel, data, frame.lqi)
+            {
+                upsert_pan_descriptor(descriptors, descriptor);
+            }
+            return (None, None);
+        }
+        if kind == 0x02 {
+            let heard = match want {
+                Want::Ack(sequence) if data[2] == *sequence => Some(Heard::Ack(AckResult {
+                    frame_pending: data[0] & (1 << 4) != 0,
+                })),
+                _ => None,
+            };
+            return (None, heard);
+        }
+        let command = kind == 0x03;
+        if kind != 0x01 && !command {
+            return (None, None);
+        }
+
+        let (source, destination, payload_offset, _) = parse_mac_addresses(data);
+        if payload_offset < 3 || payload_offset > data.len() {
+            return (None, None);
+        }
+        let exact = self.is_exact_destination(&destination);
+        let ack = (data[0] & (1 << 5) != 0 && exact && !self.phy.capabilities().hardware_auto_ack)
+            .then(|| {
+                (
+                    data[2],
+                    R::PARENT && command && self.role.frame_pending_for(&source),
+                )
+            });
+
+        let retained = matches!(want, Want::Retained).then_some(Heard::Queued);
+        let association = if command && exact {
+            parse_association_response(data)
+        } else {
+            None
+        };
+        let heard = if let Some((address, status)) = association {
+            if matches!(want, Want::AssocResponse) {
+                Some(Heard::Association(address, status))
+            } else {
+                // Kept for `take_pending_association_response`.
+                self.queue_pending_rx(frame);
+                None
+            }
+        } else if !self.accepts_destination(&destination) {
+            None
+        } else if command {
+            if R::PARENT {
+                self.role.queue_command(data, frame.lqi);
+                retained
+            } else {
+                None
+            }
+        } else if matches!(want, Want::PollResponse) && exact && self.is_from_coordinator(&source) {
+            // The poll response is consumed next, ahead of other traffic.
+            if self.pending_rx.is_full() {
+                let _ = self.pending_rx.pop_front();
+            }
+            let _ = self.pending_rx.push_front(frame);
+            Some(Heard::Queued)
+        } else {
+            self.queue_pending_rx(frame);
+            retained
+        };
+        (ack, heard)
+    }
+
+    /// Queue a received frame for a later `receive_data` / `poll`, dropping
+    /// the oldest one when the queue is full.
     fn queue_pending_rx(&mut self, frame: PhyRxFrame) {
         if self.pending_rx.is_full() {
             let _ = self.pending_rx.pop_front();
@@ -1024,21 +1189,11 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
 
     /// Convert an already-acknowledged frame into a data indication.
     ///
-    /// Non-data frames and frames for other destinations yield `None`; on a
-    /// parent, MAC commands are queued for [`ParentMacDriver`] processing.
-    fn indication_from(
-        &mut self,
-        frame: &PhyRxFrame,
-    ) -> Result<Option<McpsDataIndication>, MacError> {
+    /// Non-data frames and frames for other destinations yield `None`.
+    fn indication_from(&self, frame: &PhyRxFrame) -> Option<McpsDataIndication> {
         let data = frame.as_slice();
-        if data.len() < 3 {
-            return Ok(None);
-        }
-
-        let frame_control = u16::from_le_bytes([data[0], data[1]]);
-        let command = R::PARENT && frame_control & 0x07 == 0x03;
-        if frame_control & 0x07 != 0x01 && !command {
-            return Ok(None);
+        if data.len() < 3 || data[0] & 0x07 != 0x01 {
+            return None;
         }
 
         let (source, destination, payload_offset, security_use) = parse_mac_addresses(data);
@@ -1046,31 +1201,36 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             || payload_offset > data.len()
             || !self.accepts_destination(&destination)
         {
-            return Ok(None);
-        }
-        if command {
-            self.role.queue_command(data, frame.lqi);
-            return Ok(None);
+            return None;
         }
 
-        let payload =
-            MacFrame::from_slice(&data[payload_offset..]).ok_or(MacError::FrameTooLong)?;
-        Ok(Some(McpsDataIndication {
+        Some(McpsDataIndication {
             src_address: source,
             dst_address: destination,
             lqi: frame.lqi,
-            payload,
+            payload: MacFrame::from_slice(&data[payload_offset..])?,
             security_use,
-        }))
+        })
     }
 
-    fn take_pending_data(&mut self) -> Result<Option<MacFrame>, MacError> {
-        while let Some(frame) = self.pending_rx.pop_front() {
-            if let Some(indication) = self.indication_from(&frame)? {
-                return Ok(Some(indication.payload));
+    /// The next queued data indication; non-data frames are discarded.
+    ///
+    /// Converts the frame in place before dropping it from the queue, so no
+    /// copy of the received frame is made in the caller's (poll) frame.
+    fn take_pending_indication(&mut self) -> Option<McpsDataIndication> {
+        while let Some(frame) = self.pending_rx.front() {
+            let indication = self.indication_from(frame);
+            let _ = self.pending_rx.pop_front();
+            if indication.is_some() {
+                return indication;
             }
         }
-        Ok(None)
+        None
+    }
+
+    fn take_pending_data(&mut self) -> Option<MacFrame> {
+        self.take_pending_indication()
+            .map(|indication| indication.payload)
     }
 
     fn prepare_association(&mut self, req: &MlmeAssociateRequest) -> Result<(), MacError> {
@@ -1085,82 +1245,25 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             return Err(MacError::InvalidParameter);
         }
 
-        let mut next = self.pib.clone();
-        next.set(PibAttribute::PhyCurrentChannel, PibValue::U8(req.channel))
-            .map_err(Self::map_pib_error)?;
-        next.set(
-            PibAttribute::MacPanId,
-            PibValue::PanId(req.coord_address.pan_id()),
-        )
-        .map_err(Self::map_pib_error)?;
-        next.set(
-            PibAttribute::MacShortAddress,
-            PibValue::ShortAddress(ShortAddress(0xFFFF)),
-        )
-        .map_err(Self::map_pib_error)?;
-        match req.coord_address {
-            MacAddress::Short(_, address) => {
-                next.set(
-                    PibAttribute::MacCoordShortAddress,
-                    PibValue::ShortAddress(address),
-                )
-                .map_err(Self::map_pib_error)?;
-                next.set(
-                    PibAttribute::MacCoordExtendedAddress,
-                    PibValue::ExtendedAddress([0; 8]),
-                )
-                .map_err(Self::map_pib_error)?;
-            }
-            MacAddress::Extended(_, address) => {
-                next.set(
-                    PibAttribute::MacCoordShortAddress,
-                    PibValue::ShortAddress(ShortAddress(0xFFFF)),
-                )
-                .map_err(Self::map_pib_error)?;
-                next.set(
-                    PibAttribute::MacCoordExtendedAddress,
-                    PibValue::ExtendedAddress(address),
-                )
-                .map_err(Self::map_pib_error)?;
-            }
-        }
-        next.set(PibAttribute::MacAssociatedPanCoord, PibValue::Bool(false))
-            .map_err(Self::map_pib_error)?;
-
-        Self::apply_full_config(&mut self.phy, &next)?;
-        self.pib = next;
+        self.set_channel(req.channel)?;
+        self.set_addresses(req.coord_address.pan_id(), ShortAddress(0xFFFF))?;
+        let (coord_short, coord_extended) = match req.coord_address {
+            MacAddress::Short(_, address) => (address, [0; 8]),
+            MacAddress::Extended(_, address) => (ShortAddress(0xFFFF), address),
+        };
+        self.pib.coord_short_address = coord_short;
+        self.pib.coord_extended_address = coord_extended;
+        self.pib.associated_pan_coord = false;
         self.pending_rx.clear();
         self.pending_error = None;
         Ok(())
     }
 
     fn clear_association(&mut self) -> Result<(), MacError> {
-        let mut next = self.pib.clone();
-        next.set(
-            PibAttribute::MacShortAddress,
-            PibValue::ShortAddress(ShortAddress(0xFFFF)),
-        )
-        .map_err(Self::map_pib_error)?;
-        next.set(
-            PibAttribute::MacPanId,
-            PibValue::PanId(zigbee_types::PanId(0xFFFF)),
-        )
-        .map_err(Self::map_pib_error)?;
-        next.set(
-            PibAttribute::MacCoordShortAddress,
-            PibValue::ShortAddress(ShortAddress(0xFFFF)),
-        )
-        .map_err(Self::map_pib_error)?;
-        next.set(
-            PibAttribute::MacCoordExtendedAddress,
-            PibValue::ExtendedAddress([0; 8]),
-        )
-        .map_err(Self::map_pib_error)?;
-        next.set(PibAttribute::MacAssociatedPanCoord, PibValue::Bool(false))
-            .map_err(Self::map_pib_error)?;
-
-        Self::apply_full_config(&mut self.phy, &next)?;
-        self.pib = next;
+        self.set_addresses(PanId(0xFFFF), ShortAddress(0xFFFF))?;
+        self.pib.coord_short_address = ShortAddress(0xFFFF);
+        self.pib.coord_extended_address = [0; 8];
+        self.pib.associated_pan_coord = false;
         self.pending_rx.clear();
         self.pending_error = None;
         Ok(())
@@ -1169,9 +1272,7 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
     fn take_pending_association_response(&mut self) -> Option<(ShortAddress, u8)> {
         let pending_count = self.pending_rx.len();
         for _ in 0..pending_count {
-            let Some(frame) = self.pending_rx.pop_front() else {
-                break;
-            };
+            let frame = self.pending_rx.pop_front()?;
             if let Some(response) = self.association_response_for_us(&frame) {
                 return Some(response);
             }
@@ -1180,44 +1281,7 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
         None
     }
 
-    async fn wait_for_association_response(
-        &mut self,
-        timeout_us: u32,
-    ) -> Result<Option<(zigbee_types::ShortAddress, u8)>, MacError> {
-        if let Some(response) = self.take_pending_association_response() {
-            return Ok(Some(response));
-        }
-
-        let started_at = self.monotonic_micros();
-        for _ in 0..MAX_SCAN_FRAMES_PER_CHANNEL {
-            let elapsed = self.monotonic_micros().wrapping_sub(started_at);
-            let Some(remaining) = timeout_us.checked_sub(elapsed) else {
-                return Ok(None);
-            };
-            let frame = match self.phy.receive(remaining).await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => return Ok(None),
-                Err(PhyError::CrcFailed) => continue,
-                Err(error) => return Err(Self::map_phy_error(error)),
-            };
-
-            let response = self.association_response_for_us(&frame);
-            if response.is_none() && !self.is_retained(&frame) {
-                continue;
-            }
-            self.acknowledge_received_frame(&frame).await?;
-            if response.is_some() {
-                return Ok(response);
-            }
-            self.store_retained(frame);
-        }
-        Ok(None)
-    }
-
-    fn association_response_for_us(
-        &self,
-        frame: &PhyRxFrame,
-    ) -> Option<(zigbee_types::ShortAddress, u8)> {
+    fn association_response_for_us(&self, frame: &PhyRxFrame) -> Option<(ShortAddress, u8)> {
         let data = frame.as_slice();
         let (_, destination, payload_offset, _) = parse_mac_addresses(data);
         (payload_offset >= 3
@@ -1227,9 +1291,10 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
         .flatten()
     }
 
-    async fn finish_association(
+    /// Commit a successful Association Response to the PIB.
+    fn finish_association(
         &mut self,
-        (short_address, status): (zigbee_types::ShortAddress, u8),
+        (short_address, status): (ShortAddress, u8),
     ) -> Result<MlmeAssociateConfirm, MacError> {
         let status = match status {
             0x00 => AssociationStatus::Success,
@@ -1240,226 +1305,42 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             if short_address.0 >= 0xFFF8 {
                 return Err(MacError::AssociationDenied);
             }
-            let mut next = self.pib.clone();
-            next.set(
-                PibAttribute::MacShortAddress,
-                PibValue::ShortAddress(short_address),
-            )
-            .map_err(Self::map_pib_error)?;
-            next.set(PibAttribute::MacAssociatedPanCoord, PibValue::Bool(true))
-                .map_err(Self::map_pib_error)?;
-            Self::apply_full_config(&mut self.phy, &next)?;
-            self.pib = next;
-            if let Err(error) = self.capture_post_association_data().await {
-                self.pending_error = Some(error);
-            }
+            self.set_addresses(self.pib.pan_id(), short_address)?;
+            self.pib.associated_pan_coord = true;
         }
         Ok(MlmeAssociateConfirm {
             short_address,
             status,
         })
     }
-
-    async fn capture_post_association_data(&mut self) -> Result<(), MacError> {
-        let started_at = self.monotonic_micros();
-        for _ in 0..MAX_SCAN_FRAMES_PER_CHANNEL {
-            let elapsed = self.monotonic_micros().wrapping_sub(started_at);
-            let Some(remaining) = POST_ASSOCIATION_RX_US.checked_sub(elapsed) else {
-                break;
-            };
-            match self.phy.receive(remaining).await {
-                Ok(Some(frame)) => {
-                    if self.is_retained(&frame) {
-                        self.acknowledge_received_frame(&frame).await?;
-                        self.store_retained(frame);
-                    }
-                }
-                Ok(None) => break,
-                Err(PhyError::CrcFailed) => {}
-                Err(error) => return Err(Self::map_phy_error(error)),
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether a frame heard outside the exchange being waited for is kept
-    /// for a later `receive_data` / `poll` (data frames, plus MAC commands on
-    /// a parent). Kept frames are acknowledged first, then passed to
-    /// [`Self::store_retained`]; the caller owns the frame across the ACK so
-    /// the future holds only one copy.
-    fn is_retained(&self, frame: &PhyRxFrame) -> bool {
-        let data = frame.as_slice();
-        if data.len() < 3 || (data[0] & 0x07 != 0x01 && !(R::PARENT && data[0] & 0x07 == 0x03)) {
-            return false;
-        }
-        let (_, destination, payload_offset, _) = parse_mac_addresses(data);
-        payload_offset >= 3
-            && payload_offset <= data.len()
-            && self.accepts_destination(&destination)
-    }
-
-    /// Store an acknowledged frame accepted by [`Self::is_retained`].
-    fn store_retained(&mut self, frame: PhyRxFrame) {
-        let data = frame.as_slice();
-        if R::PARENT && data[0] & 0x07 == 0x03 {
-            self.role.queue_command(data, frame.lqi);
-            return;
-        }
-        self.queue_pending_rx(frame);
-    }
-
-    async fn acknowledge_received_frame(&mut self, frame: &PhyRxFrame) -> Result<bool, MacError> {
-        // Decide in a block so the parsed addresses are dead before the
-        // await and do not enlarge the future.
-        let (sequence, frame_pending) = {
-            let data = frame.as_slice();
-            if data.len() < 3 {
-                return Ok(false);
-            }
-            let frame_control = u16::from_le_bytes([data[0], data[1]]);
-            let (source, destination, payload_offset, _) = parse_mac_addresses(data);
-            if frame_control & (1 << 5) == 0
-                || payload_offset < 3
-                || payload_offset > data.len()
-                || !self.is_exact_destination(&destination)
-                || self.phy.capabilities().hardware_auto_ack
-            {
-                return Ok(false);
-            }
-            (
-                data[2],
-                R::PARENT && frame_control & 0x07 == 0x03 && self.role.frame_pending_for(&source),
-            )
-        };
-        // Software Imm-Ack fallback for PHYs without hardware / ISR auto-ACK.
-        // A busy channel is not fatal: the ACK is simply not sent and the
-        // originator retransmits, exactly as if it had been lost on air.
-        match self.phy.send_ack(sequence, frame_pending).await {
-            Ok(()) | Err(PhyError::ChannelBusy) => Ok(true),
-            Err(error) => Err(Self::map_phy_error(error)),
-        }
-    }
-
-    async fn scan_unfiltered(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
-        let duration_us = u32::try_from(scan_duration_us(req.scan_duration))
-            .map_err(|_| MacError::InvalidParameter)?;
-        let mut pan_descriptors = heapless::Vec::new();
-        let mut energy_list = heapless::Vec::new();
-
-        for channel in req.channel_mask.iter() {
-            let channel = channel.number();
-            self.set_pib(PibAttribute::PhyCurrentChannel, PibValue::U8(channel))?;
-
-            match req.scan_type {
-                ScanType::Ed => {
-                    let energy = self
-                        .phy
-                        .energy_detect(duration_us)
-                        .await
-                        .map_err(Self::map_phy_error)?;
-                    let _ = energy_list.push(EdValue { channel, energy });
-                }
-                ScanType::Active => {
-                    let beacon_request = build_beacon_request(self.pib.next_dsn());
-                    // A busy channel only means no beacon request went out
-                    // on it; keep scanning the remaining channels.
-                    match self.transmit_csma(&beacon_request).await {
-                        Ok(()) => {
-                            self.collect_beacons(channel, duration_us, &mut pan_descriptors)
-                                .await?;
-                        }
-                        Err(MacError::ChannelAccessFailure) => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-                ScanType::Passive => {
-                    self.collect_beacons(channel, duration_us, &mut pan_descriptors)
-                        .await?;
-                }
-                ScanType::Orphan => unreachable!(),
-            }
-        }
-
-        if matches!(req.scan_type, ScanType::Active | ScanType::Passive)
-            && pan_descriptors.is_empty()
-        {
-            return Err(MacError::NoBeacon);
-        }
-
-        Ok(MlmeScanConfirm {
-            scan_type: req.scan_type,
-            pan_descriptors,
-            energy_list,
-        })
-    }
-
-    async fn collect_beacons(
-        &mut self,
-        channel: u8,
-        duration_us: u32,
-        descriptors: &mut heapless::Vec<PanDescriptor, { crate::primitives::MAX_PAN_DESCRIPTORS }>,
-    ) -> Result<(), MacError> {
-        let started_at = self.monotonic_micros();
-
-        for _ in 0..MAX_SCAN_FRAMES_PER_CHANNEL {
-            let elapsed = self.monotonic_micros().wrapping_sub(started_at);
-            let Some(remaining) = duration_us.checked_sub(elapsed) else {
-                break;
-            };
-
-            match self.phy.receive(remaining).await {
-                Ok(Some(frame)) => {
-                    if let Some(descriptor) = parse_beacon(channel, frame.as_slice(), frame.lqi) {
-                        Self::upsert_pan_descriptor(descriptors, descriptor);
-                    }
-                }
-                Ok(None) => break,
-                Err(PhyError::CrcFailed) => {}
-                Err(error) => return Err(Self::map_phy_error(error)),
-            }
-        }
-
-        Ok(())
-    }
-
-    fn upsert_pan_descriptor(
-        descriptors: &mut heapless::Vec<PanDescriptor, { crate::primitives::MAX_PAN_DESCRIPTORS }>,
-        descriptor: PanDescriptor,
-    ) {
-        if let Some(existing) = descriptors.iter_mut().find(|existing| {
-            existing.channel == descriptor.channel
-                && existing.coord_address == descriptor.coord_address
-                && existing.zigbee_beacon.extended_pan_id
-                    == descriptor.zigbee_beacon.extended_pan_id
-        }) {
-            if descriptor.lqi > existing.lqi {
-                *existing = descriptor;
-            }
-        } else {
-            let _ = descriptors.push(descriptor);
-        }
-    }
 }
 
 /// `MacDriver` methods shared verbatim by the end-device and parent roles.
+///
+/// The asynchronous methods return the inner future directly instead of
+/// wrapping it in another `async fn`, so the request is stored once and no
+/// extra future layer is added to every NWK caller.
 macro_rules! soft_mac_driver_common {
     () => {
-        async fn mlme_scan(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
-            self.scan(req).await
+        fn mlme_scan(
+            &mut self,
+            req: MlmeScanRequest,
+        ) -> impl Future<Output = Result<MlmeScanConfirm, MacError>> {
+            self.scan(req)
         }
 
-        async fn mlme_associate(
+        fn mlme_associate(
             &mut self,
             req: MlmeAssociateRequest,
-        ) -> Result<MlmeAssociateConfirm, MacError> {
-            self.associate(req).await
+        ) -> impl Future<Output = Result<MlmeAssociateConfirm, MacError>> {
+            self.associate(req)
         }
 
-        async fn mlme_disassociate(
+        fn mlme_disassociate(
             &mut self,
             req: MlmeDisassociateRequest,
-        ) -> Result<(), MacError> {
-            self.disassociate(req).await
+        ) -> impl Future<Output = Result<(), MacError>> {
+            self.disassociate(req)
         }
 
         fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
@@ -1470,30 +1351,43 @@ macro_rules! soft_mac_driver_common {
             Ok(self.get_pib(attr))
         }
 
-        async fn mlme_set(&mut self, attr: PibAttribute, value: PibValue) -> Result<(), MacError> {
-            self.set_pib(attr, value)
-        }
-
-        async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
-            self.poll().await
-        }
-
-        async fn mcps_data(
+        fn mlme_set(
             &mut self,
-            req: McpsDataRequest<'_>,
-        ) -> Result<McpsDataConfirm, MacError> {
-            self.transmit_data(req).await
+            attr: PibAttribute,
+            value: PibValue,
+        ) -> impl Future<Output = Result<(), MacError>> {
+            core::future::ready(self.set_pib(attr, value))
         }
 
-        async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
-            self.receive_data(DATA_INDICATION_WAIT_US).await
+        fn mlme_poll(&mut self) -> impl Future<Output = Result<Option<MacFrame>, MacError>> {
+            self.poll_within(u32::MAX)
         }
 
-        async fn mcps_data_indication_timeout(
+        fn mlme_poll_timeout(
             &mut self,
             timeout_us: u32,
-        ) -> Result<McpsDataIndication, MacError> {
-            self.receive_data(timeout_us).await
+        ) -> impl Future<Output = Result<Option<MacFrame>, MacError>> {
+            self.poll_within(timeout_us)
+        }
+
+        fn mcps_data(
+            &mut self,
+            req: McpsDataRequest<'_>,
+        ) -> impl Future<Output = Result<McpsDataConfirm, MacError>> {
+            self.transmit_data(req)
+        }
+
+        fn mcps_data_indication(
+            &mut self,
+        ) -> impl Future<Output = Result<McpsDataIndication, MacError>> {
+            self.receive_data(DATA_INDICATION_WAIT_US)
+        }
+
+        fn mcps_data_indication_timeout(
+            &mut self,
+            timeout_us: u32,
+        ) -> impl Future<Output = Result<McpsDataIndication, MacError>> {
+            self.receive_data(timeout_us)
         }
 
         fn capabilities(&self) -> MacCapabilities {
@@ -1523,15 +1417,15 @@ impl<P: RadioPhy, R: MacRole, const RX: usize> RoleOf for SoftMacCore<P, R, RX> 
 impl<P: RadioPhy + PlatformServices, const RX: usize> MacDriver for SoftMacCore<P, EndDevice, RX> {
     soft_mac_driver_common!();
 
-    async fn mlme_associate_response(
+    fn mlme_associate_response(
         &mut self,
         _rsp: MlmeAssociateResponse,
-    ) -> Result<(), MacError> {
-        Err(MacError::Unsupported)
+    ) -> impl Future<Output = Result<(), MacError>> {
+        core::future::ready(Err(MacError::Unsupported))
     }
 
-    async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
-        crate::start_requires_parent_capability(&req)
+    fn mlme_start(&mut self, req: MlmeStartRequest) -> impl Future<Output = Result<(), MacError>> {
+        core::future::ready(crate::start_requires_parent_capability(&req))
     }
 }
 
@@ -1553,9 +1447,9 @@ mod tests {
 
     const IEEE: [u8; 8] = [0x02, 1, 2, 3, 4, 5, 6, 7];
 
-    /// `OFFLOAD`: 0 = [`TxOffload::None`], 1 = [`TxOffload::AckWait`],
-    /// 2 = [`TxOffload::Full`]. `FALLBACK` = `POLL_EXTENDED_FALLBACK`.
-    struct TestPhy<const OFFLOAD: u8 = 0, const FALLBACK: bool = false> {
+    /// `T`: transmit offload marker. `FALLBACK` = `POLL_EXTENDED_FALLBACK`.
+    struct TestPhy<T: TxOffload = SoftwareTx, const FALLBACK: bool = false> {
+        offload: core::marker::PhantomData<T>,
         channel: u8,
         tx_power: i8,
         filter: Option<PhyAddressFilter>,
@@ -1576,9 +1470,10 @@ mod tests {
         hw_pending_cleared: bool,
     }
 
-    impl<const OFFLOAD: u8, const FALLBACK: bool> TestPhy<OFFLOAD, FALLBACK> {
+    impl<T: TxOffload, const FALLBACK: bool> TestPhy<T, FALLBACK> {
         fn new() -> Self {
             Self {
+                offload: core::marker::PhantomData,
                 channel: 0,
                 tx_power: i8::MIN,
                 filter: None,
@@ -1605,12 +1500,8 @@ mod tests {
         }
     }
 
-    impl<const OFFLOAD: u8, const FALLBACK: bool> RadioPhy for TestPhy<OFFLOAD, FALLBACK> {
-        const TX_OFFLOAD: TxOffload = match OFFLOAD {
-            1 => TxOffload::AckWait,
-            2 => TxOffload::Full,
-            _ => TxOffload::None,
-        };
+    impl<T: TxOffload + 'static, const FALLBACK: bool> RadioPhy for TestPhy<T, FALLBACK> {
+        type Tx = T;
         const POLL_EXTENDED_FALLBACK: bool = FALLBACK;
 
         fn capabilities(&self) -> PhyCapabilities {
@@ -1663,7 +1554,7 @@ mod tests {
             &mut self,
             frame: &[u8],
         ) -> Result<Option<AckResult>, PhyError> {
-            assert_eq!(OFFLOAD, 1, "AckWait hook used by a non-AckWait PHY");
+            assert!(T::ACK_WAIT, "AckWait hook used by a non-AckWait PHY");
             self.try_transmit(frame).await?;
             self.offload_results.pop_front().unwrap_or(Ok(None))
         }
@@ -1674,7 +1565,11 @@ mod tests {
             ack_requested: bool,
             params: TxParams,
         ) -> Result<Option<AckResult>, PhyError> {
-            assert_eq!(OFFLOAD, 2, "Full offload hook used by a non-Full PHY");
+            assert_eq!(
+                core::any::TypeId::of::<T>(),
+                core::any::TypeId::of::<FullTx>(),
+                "Full offload hook used by a non-Full PHY"
+            );
             self.last_tx.clear();
             self.last_tx
                 .extend_from_slice(frame)
@@ -1700,11 +1595,11 @@ mod tests {
         }
     }
 
-    impl<const OFFLOAD: u8, const FALLBACK: bool> zigbee_crypto::ForwardAesProvider
-        for TestPhy<OFFLOAD, FALLBACK>
+    impl<T: TxOffload, const FALLBACK: bool> zigbee_crypto::ForwardAesProvider
+        for TestPhy<T, FALLBACK>
     {
     }
-    impl<const OFFLOAD: u8, const FALLBACK: bool> PlatformServices for TestPhy<OFFLOAD, FALLBACK> {
+    impl<T: TxOffload + 'static, const FALLBACK: bool> PlatformServices for TestPhy<T, FALLBACK> {
         fn monotonic_micros(&self) -> u32 {
             self.now_us
         }
@@ -1742,7 +1637,7 @@ mod tests {
         core_of()
     }
 
-    fn core_of<const OFFLOAD: u8, const FALLBACK: bool>() -> SoftMacCore<TestPhy<OFFLOAD, FALLBACK>>
+    fn core_of<T: TxOffload + 'static, const FALLBACK: bool>() -> SoftMacCore<TestPhy<T, FALLBACK>>
     {
         SoftMacCore::new(TestPhy::new(), MacPib::new(IEEE, 1, 2)).unwrap()
     }
@@ -1781,8 +1676,8 @@ mod tests {
         associated_core_of()
     }
 
-    fn associated_core_of<const OFFLOAD: u8, const FALLBACK: bool>()
-    -> SoftMacCore<TestPhy<OFFLOAD, FALLBACK>> {
+    fn associated_core_of<T: TxOffload + 'static, const FALLBACK: bool>()
+    -> SoftMacCore<TestPhy<T, FALLBACK>> {
         let mut core = core_of();
         core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
             .unwrap();
@@ -2723,14 +2618,14 @@ mod tests {
             )))
             .unwrap();
 
-        let ack = block_on(core.wait_for_ack(0x44)).unwrap().unwrap();
+        let Some(Heard::Ack(ack)) = block_on(core.listen(ACK_WAIT_US, Want::Ack(0x44))).unwrap()
+        else {
+            panic!("ACK not matched");
+        };
 
         assert!(!ack.frame_pending);
         assert_eq!(core.phy().sent_acks.as_slice(), [(0x34, false)]);
-        assert_eq!(
-            core.take_pending_data().unwrap().unwrap().as_slice(),
-            [0xD4]
-        );
+        assert_eq!(core.take_pending_data().unwrap().as_slice(), [0xD4]);
         assert_eq!(core.phy().sent_acks.as_slice(), [(0x34, false)]);
     }
 
@@ -2823,7 +2718,7 @@ mod tests {
 
     #[test]
     fn full_offload_hands_csma_ack_and_retries_to_the_phy() {
-        let mut core = core_of::<2, false>();
+        let mut core = core_of::<FullTx, false>();
         core.phy_mut()
             .offload_results
             .push_back(Ok(Some(AckResult {
@@ -2845,7 +2740,7 @@ mod tests {
 
     #[test]
     fn full_offload_maps_missing_ack_and_busy_channel() {
-        let mut core = core_of::<2, false>();
+        let mut core = core_of::<FullTx, false>();
         core.phy_mut().offload_results.push_back(Ok(None)).unwrap();
         core.phy_mut()
             .offload_results
@@ -2870,7 +2765,7 @@ mod tests {
 
     #[test]
     fn ack_wait_offload_keeps_software_backoff_and_retries() {
-        let mut core = core_of::<1, false>();
+        let mut core = core_of::<AckWaitTx, false>();
         let phy = core.phy_mut();
         phy.tx_results
             .push_back(Err(PhyError::ChannelBusy))
@@ -2900,7 +2795,7 @@ mod tests {
 
     #[test]
     fn ack_wait_offload_stops_after_configured_retries() {
-        let mut core = core_of::<1, false>();
+        let mut core = core_of::<AckWaitTx, false>();
         core.set_pib(PibAttribute::MacMaxFrameRetries, PibValue::U8(1))
             .unwrap();
 
@@ -2967,7 +2862,7 @@ mod tests {
 
     #[test]
     fn extended_fallback_repeats_an_empty_short_poll_with_the_eui64() {
-        let mut core = associated_core_of::<0, true>();
+        let mut core = associated_core_of::<SoftwareTx, true>();
         let first = core.pib().dsn();
         let second = first.wrapping_add(1);
         let incoming = build_data_frame(
@@ -3005,7 +2900,7 @@ mod tests {
 
     #[test]
     fn extended_fallback_failure_does_not_mask_an_empty_first_poll() {
-        let mut core = associated_core_of::<0, true>();
+        let mut core = associated_core_of::<SoftwareTx, true>();
         core.set_pib(PibAttribute::MacMaxFrameRetries, PibValue::U8(0))
             .unwrap();
         let first = core.pib().dsn();
@@ -3446,5 +3341,103 @@ mod tests {
         block_on(core.indirect_data(request(child, true))).unwrap();
         // Sent directly with an ACK request to the polling child.
         assert_eq!(core.phy().last_tx[0] & (1 << 5), 1 << 5);
+    }
+
+    fn unicast_data(sequence: u8, source: u16, destination: u16, payload: u8) -> PhyRxFrame {
+        let frame = build_data_frame(
+            sequence,
+            AddressMode::Short,
+            ShortAddress(source),
+            &[0; 8],
+            &MacAddress::Short(PanId(0x1234), ShortAddress(destination)),
+            &[payload],
+            true,
+            false,
+        )
+        .unwrap();
+        PhyRxFrame::from_slice(&frame, 190).unwrap()
+    }
+
+    #[test]
+    fn ack_window_drops_frames_addressed_to_other_devices() {
+        let mut core = associated_core();
+        let rx = &mut core.phy_mut().rx_frames;
+        rx.push_back(Ok(Some(unicast_data(0x50, 0x2222, 0x9999, 0x01))))
+            .unwrap();
+        rx.push_back(Ok(Some(unicast_data(0x51, 0x2222, 0x5678, 0x02))))
+            .unwrap();
+        rx.push_back(Ok(Some(
+            PhyRxFrame::from_slice(&[0x02, 0x00, 0x2A], 255).unwrap(),
+        )))
+        .unwrap();
+
+        block_on(core.transmit_acknowledged(&[0x61, 0x88, 0x2A])).unwrap();
+
+        // Only the frame for us is ACKed and retained.
+        assert_eq!(core.phy().sent_acks.as_slice(), [(0x51, false)]);
+        assert_eq!(core.take_pending_data().unwrap().as_slice(), [0x02]);
+        assert!(core.take_pending_data().is_none());
+    }
+
+    #[test]
+    fn end_device_acknowledges_but_drops_unicast_mac_commands() {
+        let mut core = associated_core();
+        // Command, ACK request, PAN ID compression, short source/destination.
+        let command = [0x63, 0x88, 0x60, 0x34, 0x12, 0x78, 0x56, 0x00, 0x00, 0x08];
+        let rx = &mut core.phy_mut().rx_frames;
+        rx.push_back(Ok(Some(PhyRxFrame::from_slice(&command, 200).unwrap())))
+            .unwrap();
+        rx.push_back(Ok(Some(
+            PhyRxFrame::from_slice(&[0x02, 0x00, 0x2A], 255).unwrap(),
+        )))
+        .unwrap();
+
+        block_on(core.transmit_acknowledged(&[0x61, 0x88, 0x2A])).unwrap();
+
+        assert_eq!(core.phy().sent_acks.as_slice(), [(0x60, false)]);
+        assert!(core.take_pending_rx().is_none());
+    }
+
+    #[test]
+    fn poll_response_evicts_the_oldest_frame_when_pending_rx_is_full() {
+        let mut core = associated_core();
+        let rx = &mut core.phy_mut().rx_frames;
+        rx.push_back(Ok(Some(
+            PhyRxFrame::from_slice(&[0x12, 0x00, 0x01], 255).unwrap(),
+        )))
+        .unwrap();
+        for index in 0..5 {
+            rx.push_back(Ok(Some(unicast_data(0x60 + index, 0x2222, 0x5678, index))))
+                .unwrap();
+        }
+        rx.push_back(Ok(Some(unicast_data(0x70, 0x0000, 0x5678, 0xEE))))
+            .unwrap();
+
+        let frame = block_on(core.poll()).unwrap().unwrap();
+
+        assert_eq!(frame.as_slice(), [0xEE]);
+        // Frames 0 and 1 were evicted to make room (queue depth 4).
+        for expected in 2..5 {
+            let indication = block_on(core.receive_data(1_000)).unwrap();
+            assert_eq!(indication.payload.as_slice(), [expected]);
+        }
+        assert!(core.take_pending_rx().is_none());
+    }
+
+    #[test]
+    fn poll_within_discards_a_response_completed_at_the_deadline() {
+        let mut core = associated_core();
+        let rx = &mut core.phy_mut().rx_frames;
+        rx.push_back(Ok(Some(
+            PhyRxFrame::from_slice(&[0x12, 0x00, 0x01], 255).unwrap(),
+        )))
+        .unwrap();
+        rx.push_back(Ok(Some(unicast_data(0x70, 0x0000, 0x5678, 0xEE))))
+            .unwrap();
+
+        assert!(block_on(core.poll_within(0)).unwrap().is_none());
+        // The response was still acknowledged and consumed.
+        assert_eq!(core.phy().sent_acks.as_slice(), [(0x70, false)]);
+        assert!(core.take_pending_rx().is_none());
     }
 }

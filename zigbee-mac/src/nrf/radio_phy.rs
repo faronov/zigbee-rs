@@ -101,6 +101,9 @@ impl<'a, T: RadioInstance, R: RngInstance> NrfRadioPhy<'a, T, R> {
 }
 
 impl<T: RadioInstance, R: RngInstance> RadioPhy for NrfRadioPhy<'_, T, R> {
+    /// Software CSMA-CA, ACK wait and retries (no hardware auto-ACK).
+    type Tx = crate::SoftwareTx;
+
     /// Hardware-proven legacy `NrfMac` value: on a busy channel the parent's
     /// indirect transmission competes with coordinator traffic.
     const POLL_RESPONSE_WAIT_US: u32 = 1_500_000;

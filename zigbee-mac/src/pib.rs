@@ -148,13 +148,13 @@ pub enum PibError {
 /// filter programming are deliberately left to the software-MAC wrapper.
 #[derive(Debug, Clone)]
 pub struct MacPib {
-    short_address: ShortAddress,
-    pan_id: PanId,
+    pub(crate) short_address: ShortAddress,
+    pub(crate) pan_id: PanId,
     extended_address: IeeeAddress,
-    coord_short_address: ShortAddress,
-    coord_extended_address: IeeeAddress,
-    associated_pan_coord: bool,
-    rx_on_when_idle: bool,
+    pub(crate) coord_short_address: ShortAddress,
+    pub(crate) coord_extended_address: IeeeAddress,
+    pub(crate) associated_pan_coord: bool,
+    pub(crate) rx_on_when_idle: bool,
     association_permit: bool,
     beacon_order: u8,
     superframe_order: u8,
@@ -170,7 +170,7 @@ pub struct MacPib {
     bsn: u8,
     transaction_persistence_time: u16,
     promiscuous: bool,
-    current_channel: u8,
+    pub(crate) current_channel: u8,
     transmit_power: i8,
 }
 
