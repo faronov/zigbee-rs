@@ -13,8 +13,11 @@
 //! `ll_hw_drv.c` from the same trees. Where the two SDK revisions differ the
 //! newer phy62x2-SDK value is used and the difference is noted inline. The
 //! SDK only exercises the Zigbee packet format from its direct-test-mode
-//! (DTM) code, so the MAC-level use here (single TX / single RX with
-//! software ACKs) is this crate's own composition of those primitives.
+//! (DTM) code, so the MAC-level use here (single TX / single RX) is this
+//! crate's own composition of those primitives. Received frames are
+//! acknowledged from the radio interrupt, following the vendor's
+//! proprietary-PHY auto-ACK (`phy_plus_phy.c` `phy_rf_txack`); see
+//! "IRQ handler and interrupt-context acknowledgement" below.
 //!
 //! # Hardware validation
 //! The radio path is validated on a PB-03F (PHY6252) against an independent
@@ -33,7 +36,9 @@
 //!   ├── LL HW engine (0x4003_1000..0x4003_1080)
 //!   │     ├── STX / SRX single-shot modes, MODE_DONE interrupt
 //!   │     └── word-wide TX FIFO 0x4003_1400 / RX FIFO 0x4003_1C00
-//!   └── LL_IRQ (BB_IRQn = 4) → RX Signal / TX op-idle flag
+//!   └── LL_IRQ (BB_IRQn = 4, XIP wrapper)
+//!         └── ll_irq_fast (SRAM) → RX pop, address check, ACK STX trigger
+//!             → RX Signal / TX op-idle flag
 //! ```
 //!
 //! # Requirements on the caller
@@ -55,7 +60,6 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant};
-use zigbee_types::{PanId, ShortAddress};
 
 // ── Register blocks ─────────────────────────────────────────────
 
@@ -305,6 +309,11 @@ pub struct RadioStats {
     pub rx_bad_len: u32,
     /// LL engine aborts (cancelled receive or TX timeout).
     pub aborts: u32,
+    /// Acknowledgements triggered by `LL_IRQ`.
+    pub acks_sent: u32,
+    /// HCLK cycles from `LL_IRQ` entry to the ACK trigger, `(last, max)`
+    /// (SysTick-based; zero without `phy6222-diag` or SysTick).
+    pub ack_trigger_cycles: (u32, u32),
     /// Raw `LL+0x30` packet statistics `[23:16]` crcErr `[15:8]` total `[7:0]` ok.
     pub hw_pkt_stats: u32,
     /// Two-point calibration results (low/high), already offset.
@@ -389,6 +398,7 @@ fn pack_tx_fifo(buf: &mut [u8; FIFO_BYTES], len_byte: u8, frame: &[u8], fcs: &[u
 
 /// Words occupied by an RX FIFO packet including its first word
 /// (`ll_hw_read_rfifo_zb`: `wlen = 1 + (blen >> 2)`, `blen` incl. FCS).
+#[inline(always)]
 fn rfifo_packet_words(len_byte: u8) -> usize {
     1 + (usize::from(len_byte) >> 2)
 }
@@ -421,6 +431,7 @@ impl RxOutcome {
 
 /// Classify an SRX `LL+0x10` status word. Only MODE_DONE is unmasked, and
 /// the SDK accepts a packet only when `RD` and `COK` are both set.
+#[inline(always)]
 fn classify_rx_irq(irq_status: u32) -> RxOutcome {
     if irq_status & LIRQ_MD == 0 {
         RxOutcome::Pending
@@ -437,6 +448,7 @@ fn classify_rx_irq(irq_status: u32) -> RxOutcome {
 
 /// MPDU length (FCS stripped) for an RX FIFO length byte, or `None` if the
 /// PSDU length is outside `5..=127`.
+#[inline(always)]
 fn zb_rfifo_mpdu_len(len_byte: u8) -> Option<usize> {
     let psdu = usize::from(len_byte);
     (MIN_RX_PSDU_LEN..=MAX_FRAME_LEN)
@@ -482,14 +494,6 @@ struct AckFilter {
 /// Critical section shared with `LL_IRQ` (blocking mutex over no data).
 static CS: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
 
-static ACK_FILTER: Mutex<CriticalSectionRawMutex, Cell<AckFilter>> =
-    Mutex::new(Cell::new(AckFilter {
-        pan_id: 0xFFFF,
-        short_address: 0xFFFF,
-        extended_address: [0; 8],
-        hw_fcs: false,
-    }));
-
 static RX_OUTCOME: AtomicU8 = AtomicU8::new(RxOutcome::Pending as u8);
 static RX_LEN: AtomicU8 = AtomicU8::new(0);
 static RX_FOOT1: AtomicU32 = AtomicU32::new(0);
@@ -497,9 +501,21 @@ static RX_FOOT1: AtomicU32 = AtomicU32::new(0);
 struct SyncUnsafeCell<T>(UnsafeCell<T>);
 // SAFETY: RX_WORDS is written by LL_IRQ only while LL_OP == OP_RX and read
 // by the task only after RX_DONE was signalled for that operation.
+// ACK_FILTER is written by the task only inside `CS` (interrupts masked)
+// and read only by LL_IRQ, which the task can never interrupt.
 unsafe impl<T> Sync for SyncUnsafeCell<T> {}
 static RX_WORDS: SyncUnsafeCell<[u32; FIFO_WORDS]> =
     SyncUnsafeCell(UnsafeCell::new([0; FIFO_WORDS]));
+
+/// Addressing snapshot for the interrupt-context ACK decision. Read
+/// directly (not through a `critical-section` call) so `LL_IRQ` stays in
+/// RAM up to the ACK trigger; see the `SyncUnsafeCell` safety note.
+static ACK_FILTER: SyncUnsafeCell<AckFilter> = SyncUnsafeCell(UnsafeCell::new(AckFilter {
+    pan_id: 0xFFFF,
+    short_address: 0xFFFF,
+    extended_address: [0; 8],
+    hw_fcs: false,
+}));
 
 /// Single-writer counters. Cortex-M0 has no atomic read-modify-write, so
 /// each counter is updated with load+store from exactly one context.
@@ -509,6 +525,7 @@ impl Counter {
     const fn new() -> Self {
         Self(AtomicU32::new(0))
     }
+    #[inline(always)]
     fn inc(&self) {
         if cfg!(feature = "phy6222-diag") {
             self.0.store(
@@ -520,6 +537,12 @@ impl Counter {
     fn get(&self) -> u32 {
         self.0.load(Ordering::Relaxed)
     }
+    #[inline(always)]
+    fn set(&self, value: u32) {
+        if cfg!(feature = "phy6222-diag") {
+            self.0.store(value, Ordering::Relaxed);
+        }
+    }
 }
 // Task-context counters.
 static TX_DONE_CNT: Counter = Counter::new();
@@ -529,8 +552,13 @@ static RX_SW_FCS_MISMATCH_CNT: Counter = Counter::new();
 static ABORT_CNT: Counter = Counter::new();
 static RX_CRC_ERR_CNT: Counter = Counter::new();
 static RX_TIMEOUT_CNT: Counter = Counter::new();
-// ISR-context counter.
+// ISR-context counters.
 static RX_BAD_LEN_CNT: Counter = Counter::new();
+static ACK_TX_CNT: Counter = Counter::new();
+/// SysTick cycles from `LL_IRQ` entry to the ACK trigger (last, max);
+/// recorded only with `phy6222-diag`.
+static ACK_TRIGGER_CYCLES_LAST: Counter = Counter::new();
+static ACK_TRIGGER_CYCLES_MAX: Counter = Counter::new();
 
 /// Pure-Rust async radio driver for PHY62x2 IEEE 802.15.4 mode.
 pub struct Phy6222Driver {
@@ -770,7 +798,7 @@ impl Phy6222Driver {
         reg_write(LL + 0x20, ((10 * h) << 16) | h); // tx/rx release 10/1 us
         reg_write(LL + 0x1C, 62 * h); // rx->tx interval
         reg_write(LL + 0x18, 72 * h); // tx->rx interval
-        reg_write(RF + 0xBC, (57 << 16) | (8 << 8) | 52); // TxBB, RxAFE, PLL settle
+        reg_write(RF + 0xBC, TRX_SETTLE_ZIGBEE); // TxBB, RxAFE, PLL settle
         reg_write(LL + 0x68, LL_HW_IGN_CRC_AND_EMPTY);
         reg_write(LL + 0x24, RX_TIMEOUT_US & 0xFFFF);
         reg_write(LL + 0x28, RX_TIMEOUT_US & 0xFFFF);
@@ -852,7 +880,8 @@ impl Phy6222Driver {
             extended_address: self.config.extended_address,
             hw_fcs: self.hw_fcs(),
         };
-        ACK_FILTER.lock(|f| f.set(filter));
+        // SAFETY: written with interrupts masked; LL_IRQ is the only reader.
+        CS.lock(|()| unsafe { *ACK_FILTER.0.get() = filter });
     }
 
     fn hw_fcs(&self) -> bool {
@@ -896,6 +925,8 @@ impl Phy6222Driver {
             rx_sw_fcs_mismatch: RX_SW_FCS_MISMATCH_CNT.get(),
             rx_bad_len: RX_BAD_LEN_CNT.get(),
             aborts: ABORT_CNT.get(),
+            acks_sent: ACK_TX_CNT.get(),
+            ack_trigger_cycles: (ACK_TRIGGER_CYCLES_LAST.get(), ACK_TRIGGER_CYCLES_MAX.get()),
             hw_pkt_stats: reg_read(LL + 0x30),
             tp_cal: (self.tp_cal0, self.tp_cal1),
             dcoc: self.dcoc,
@@ -1180,39 +1211,264 @@ impl Phy6222Driver {
     }
 }
 
-// ── IRQ handler ─────────────────────────────────────────────────
+// ── IRQ handler and interrupt-context acknowledgement ───────────
+//
+// The LL engine has no IEEE 802.15.4 address filter, ACK template or
+// frame-pending logic (none in `ll_hw_drv.h`, the ROM symbol table or the
+// SDK), so an ACK is a single STX that `LL_IRQ` starts itself, as the
+// vendor's own auto-ACK does (`phy_plus_phy.c` `PLUSPHY_IRQHandler` →
+// `phy_rf_txack`: `ll_hw_set_stx`, `ll_hw_set_trx_settle(delay, ...)`,
+// `phy_hw_go`, then fill the TX FIFO). The turnaround is then
+// `MODE_DONE latency + LL_IRQ entry→trigger + RF+0xBC settle`. To keep the
+// middle term short and constant, everything `LL_IRQ` runs before the
+// trigger is the call-free `ll_irq_fast` in SRAM (`.data.ram_code`); from
+// XIP flash every cold cache line cost a SPI-flash fetch and the ACK left
+// 260–330 µs later than the parent's other children (sniffer, PB-03F).
+// The settle term is then tuned per FCS mode so the ACK starts at the
+// 12-symbol aTurnaroundTime; see `ACK_TX_BB_DELAY_HW_FCS_US`.
+//
+// Measured on PB-03F (nRF sniffer, ACK start against the other children of
+// the same parent): hardware FCS ≈192 µs, software FCS ≈170 µs, jitter
+// ≈1 µs, entry→trigger ≤ 8.3 µs. ACKs carry `frame pending = 0`: this
+// backend is end-device only and never holds indirect data.
+
+/// `ll_hw_set_trx_settle(57, 8, 52)` as programmed by the ROM's
+/// `ll_hw_set_timing(PKT_FMT_ZIGBEE)` (disassembled at ROM 0x112fc):
+/// TX baseband delay, RX AFE and PLL settle (µs) in `RF+0xBC`
+/// (`ll_hw_set_trx_settle`, ROM 0x113dc: `(bb << 16) | (afe << 8) | pll`).
+const TRX_SETTLE_ZIGBEE: u32 = trx_settle_word(57, 8, 52);
+
+/// TX baseband delay (µs) for interrupt-started ACKs; tunes the ACK
+/// turnaround without touching PLL settling (`phy_rf_txack` likewise only
+/// varies the BB term: `ll_hw_set_trx_settle(127 - T2, 8, 60)`).
+///
+/// Measured on a PB-03F (PHY6252, 48 MHz, sniffer against the other
+/// children of the same parent) with the SRAM handler: with the ROM's
+/// 57 µs the hardware-FCS ACK started ~61 µs early (≈131 µs turnaround,
+/// jitter ≈1 µs, interrupt entry → trigger ≤ 8.3 µs), so 57 + 61 µs places
+/// it at the 12-symbol aTurnaroundTime.
+const ACK_TX_BB_DELAY_HW_FCS_US: u32 = 118;
+
+/// As [`ACK_TX_BB_DELAY_HW_FCS_US`] for [`FcsMode::Software`]: with the same
+/// 118 µs that ACK started a further ~31 µs early (PB-03F sniffer A/B).
+/// The 149 µs that would compensate fully sent no ACK at all, so this stays
+/// at the vendor's ceiling (see [`ACK_TX_BB_DELAY_MAX_US`]) and the
+/// software-FCS ACK turnaround is ~170 µs rather than 192 µs.
+const ACK_TX_BB_DELAY_SW_FCS_US: u32 = ACK_TX_BB_DELAY_MAX_US;
+
+/// Largest BB delay `phy_rf_txack` programs (`127 - T2`); 149 µs suppressed
+/// the ACK on a PB-03F, so the field is treated as 7 bits.
+const ACK_TX_BB_DELAY_MAX_US: u32 = 127;
+
+/// `RF+0xBC` while an interrupt-started ACK is being sent, per FCS mode.
+const ACK_TRX_SETTLE_HW_FCS: u32 = trx_settle_word(ACK_TX_BB_DELAY_HW_FCS_US, 8, 52);
+const ACK_TRX_SETTLE_SW_FCS: u32 = trx_settle_word(ACK_TX_BB_DELAY_SW_FCS_US, 8, 52);
+
+const fn trx_settle_word(bb_us: u32, afe_us: u32, pll_us: u32) -> u32 {
+    (bb_us << 16) | (afe_us << 8) | pll_us
+}
+
+/// SysTick reload/current value registers (ARMv6-M), read only by the
+/// `phy6222-diag` ACK latency probe.
+const SYST_RVR: u32 = 0xE000_E014;
+const SYST_CVR: u32 = 0xE000_E018;
+
+/// Cycle stamp for the ACK latency probe (`phy6222-diag` on target only).
+#[inline(always)]
+fn cycle_stamp() -> u32 {
+    if cfg!(all(feature = "phy6222-diag", target_os = "none")) {
+        reg_read(SYST_CVR)
+    } else {
+        0
+    }
+}
+
+/// Record the cycles elapsed since `stamp` (SysTick counts down and wraps
+/// at `RVR`; one wrap is accounted for).
+#[inline(always)]
+fn record_ack_trigger_latency(stamp: u32) {
+    if cfg!(all(feature = "phy6222-diag", target_os = "none")) {
+        let now = reg_read(SYST_CVR);
+        let cycles = if stamp >= now {
+            stamp - now
+        } else {
+            stamp + (reg_read(SYST_RVR) & 0x00FF_FFFF) + 1 - now
+        };
+        ACK_TRIGGER_CYCLES_LAST.set(cycles);
+        if cycles > ACK_TRIGGER_CYCLES_MAX.get() {
+            ACK_TRIGGER_CYCLES_MAX.set(cycles);
+        }
+    }
+}
+
+/// `ll_irq_fast` result: an RX operation completed, signal the task.
+const IRQ_SIGNAL_RX: u32 = 1 << 8;
+/// `ll_irq_fast` result: a software-FCS ACK was triggered for the sequence
+/// number in bits `[7:0]`; its FCS word is still to be written.
+const IRQ_ACK_SW_FCS: u32 = 1 << 9;
 
 /// LL HW interrupt handler for `BB_IRQn` (4), dispatched through the ROM
 /// jump table entry emitted by the product linker script.
+///
+/// The time-critical part runs from SRAM in [`ll_irq_fast`]; this XIP
+/// wrapper only performs what may run late: the software-FCS word of an
+/// ACK (written during the TX settle, as `phy_rf_txack` fills the FIFO
+/// after `phy_hw_go`) and the task wake-up.
 #[unsafe(no_mangle)]
 pub extern "C" fn LL_IRQ() {
+    let result = ll_irq_fast();
+    if result & IRQ_ACK_SW_FCS != 0 {
+        let crc = zigbee_crc16(&[0x02, 0x00, result as u8]);
+        reg_write(LL_HW_TFIFO, u32::from_le_bytes([crc[0], crc[1], 0, 0]));
+    }
+    if result & IRQ_SIGNAL_RX != 0 {
+        RX_DONE.signal(());
+    }
+}
+
+/// SRAM-resident body of `LL_IRQ`: classify the interrupt, pop a received
+/// packet and trigger its ACK. Call-free once inlined (no
+/// `critical-section`, waker or out-of-line slice indexing), so it never
+/// branches back into XIP; `check-layout.sh` enforces that for all SRAM
+/// code.
+#[inline(never)]
+#[cfg_attr(
+    target_os = "none",
+    unsafe(link_section = ".data.ram_code.ll_irq_fast")
+)]
+fn ll_irq_fast() -> u32 {
+    let entry = cycle_stamp();
     let status = reg_read(LL + 0x10) & LL_HW_IRQ_MASK;
     reg_write(LL + 0x14, LL_HW_IRQ_MASK);
     if status & LIRQ_MD == 0 {
-        return;
+        return 0;
     }
     match LL_OP.load(Ordering::Acquire) {
         OP_RX => {
-            let mut outcome = classify_rx_irq(status);
-            if outcome == RxOutcome::FrameOk {
-                outcome = read_rx_fifo();
-            }
-            reg_write(LL + 0x58, 0x0100); // drop anything left in the RX FIFO
+            let (outcome, ack) = finish_rx(status, entry);
             RX_OUTCOME.store(outcome as u8, Ordering::Release);
-            if outcome == RxOutcome::FrameOk
-                && let Some(seq) = ack_sequence_for_rx()
-            {
-                start_ack_tx(seq);
-            } else {
-                LL_OP.store(OP_IDLE, Ordering::Release);
-            }
-            RX_DONE.signal(());
+            IRQ_SIGNAL_RX | ack
         }
         // OP_TX / OP_ACK done, or a stopped RX (result discarded).
-        _ => {
+        op => {
+            if op == OP_ACK {
+                reg_write(RF + 0xBC, TRX_SETTLE_ZIGBEE);
+            }
             reg_write(LL + 0x58, 0x0100); // rst rfifo
             LL_OP.store(OP_IDLE, Ordering::Release);
+            0
         }
+    }
+}
+
+/// Complete an SRX/TRX receive: pop the packet, then either start its ACK
+/// (leaving `LL_OP == OP_ACK`) or return the engine to idle. Returns the
+/// outcome and the `ll_irq_fast` ACK bits.
+#[inline(always)]
+fn finish_rx(status: u32, entry: u32) -> (RxOutcome, u32) {
+    let mut outcome = classify_rx_irq(status);
+    if outcome == RxOutcome::FrameOk {
+        outcome = read_rx_fifo();
+    }
+    reg_write(LL + 0x58, 0x0100); // drop anything left in the RX FIFO
+    let seq = if outcome == RxOutcome::FrameOk {
+        ack_sequence_for_rx()
+    } else {
+        None
+    };
+    let ack = match seq {
+        Some(seq) => start_ack_tx(seq, entry),
+        None => {
+            LL_OP.store(OP_IDLE, Ordering::Release);
+            0
+        }
+    };
+    (outcome, ack)
+}
+
+/// Sequence number to acknowledge for the frame `read_rx_fifo` just stored,
+/// or `None`.
+#[inline(always)]
+fn ack_sequence_for_rx() -> Option<u8> {
+    // SAFETY: see `SyncUnsafeCell`; LL_IRQ is the only reader.
+    let filter = unsafe { &*ACK_FILTER.0.get() };
+    let len = usize::from(RX_LEN.load(Ordering::Relaxed)).min(MAX_MPDU_LEN);
+    // SAFETY: only LL_IRQ (this context) writes RX_WORDS; the MPDU starts
+    // after the length byte and `len <= MAX_MPDU_LEN < FIFO_BYTES`. Built
+    // from a raw pointer because range indexing is an out-of-line call.
+    let mpdu = unsafe { core::slice::from_raw_parts((RX_WORDS.0.get() as *const u8).add(1), len) };
+    ack_sequence_for(mpdu, filter)
+}
+
+/// Interrupt-context form of the shared exact-destination ACK policy
+/// ([`crate::frames::software_ack_sequence`]): data and MAC command frames
+/// with AR set whose destination is exactly this node (short address in
+/// our PAN, or our extended address in our PAN / before a PAN is known).
+/// Broadcasts are never acknowledged. Kept call-free so it is inlined into
+/// the SRAM interrupt handler; a host test pins it to the shared policy.
+#[inline(always)]
+fn ack_sequence_for(mpdu: &[u8], filter: &AckFilter) -> Option<u8> {
+    if mpdu.len() < 5 {
+        return None;
+    }
+    let fc = u16::from(mpdu[0]) | (u16::from(mpdu[1]) << 8);
+    let frame_type = fc & 0x07;
+    if !(frame_type == 0x01 || frame_type == 0x03) || fc & (1 << 5) == 0 {
+        return None;
+    }
+    let pan = u16::from(mpdu[3]) | (u16::from(mpdu[4]) << 8);
+    let exact = match (fc >> 10) & 0x03 {
+        0x02 if mpdu.len() >= 7 => {
+            let dst = u16::from(mpdu[5]) | (u16::from(mpdu[6]) << 8);
+            filter.short_address < 0xFFFE && dst == filter.short_address && pan == filter.pan_id
+        }
+        0x03 if mpdu.len() >= 13 => {
+            let mut same = pan == filter.pan_id || filter.pan_id == 0xFFFF;
+            for (i, b) in filter.extended_address.iter().enumerate() {
+                same &= mpdu[5 + i] == *b;
+            }
+            same
+        }
+        _ => false,
+    };
+    exact.then_some(mpdu[2])
+}
+
+/// Start the STX of an ACK (`frame pending` clear: this backend is
+/// end-device only and never holds indirect data) on the channel and TP
+/// calibration of the RX that just completed.
+///
+/// Order follows `phy_rf_txack`: STX mode and settle, trigger, then the
+/// part of the TX FIFO that costs time (the software FCS, written by the
+/// `LL_IRQ` wrapper) is filled while the PLL/BB settle runs. The
+/// hardware-FCS ACK is a single FIFO word and is written before the
+/// trigger. Returns the `ll_irq_fast` ACK bits.
+#[inline(always)]
+fn start_ack_tx(seq: u8, entry: u32) -> u32 {
+    // SAFETY: see `SyncUnsafeCell`; LL_IRQ is the only reader.
+    let hw_fcs = unsafe { (*ACK_FILTER.0.get()).hw_fcs };
+    reg_write(LL + 0x58, 0x0001); // rst tfifo
+    reg_write(LL_HW_TFIFO, u32::from_le_bytes([5, 0x02, 0x00, seq]));
+    reg_write(LL + 0x04, LL_MODE_STX);
+    reg_write(LL + 0x38, 0x07);
+    reg_write(
+        RF + 0xBC,
+        if hw_fcs {
+            ACK_TRX_SETTLE_HW_FCS
+        } else {
+            ACK_TRX_SETTLE_SW_FCS
+        },
+    );
+    LL_OP.store(OP_ACK, Ordering::Release);
+    reg_write(LL + 0x14, LL_HW_IRQ_MASK);
+    reg_write(LL + 0x0C, LIRQ_MD);
+    reg_write(LL + 0x00, 0x0001);
+    record_ack_trigger_latency(entry);
+    ACK_TX_CNT.inc();
+    if hw_fcs {
+        0
+    } else {
+        IRQ_ACK_SW_FCS | u32::from(seq)
     }
 }
 
@@ -1224,45 +1480,8 @@ fn wait_while_op(op: u8, timeout: Duration) {
     }
 }
 
-/// Sequence number to acknowledge for the frame `read_rx_fifo` just stored
-/// (shared exact-destination policy), or `None`.
-fn ack_sequence_for_rx() -> Option<u8> {
-    let filter = ACK_FILTER.lock(Cell::get);
-    let len = usize::from(RX_LEN.load(Ordering::Relaxed));
-    // SAFETY: only LL_IRQ (this context) writes RX_WORDS; the driver reads
-    // them only after RX_DONE.
-    let bytes = unsafe { &*(RX_WORDS.0.get() as *const [u8; FIFO_BYTES]) };
-    crate::frames::software_ack_sequence(
-        &bytes[1..=len],
-        PanId(filter.pan_id),
-        ShortAddress(filter.short_address),
-        &filter.extended_address,
-    )
-}
-
-/// Start the STX of an ACK (`frame pending` clear: end devices hold no
-/// indirect data) on the channel and TP calibration of the RX that just
-/// completed. Sent from the interrupt because the 802.15.4 turnaround
-/// (`macAckWaitDuration`, 864 µs) is shorter than a task wake-up: software
-/// ACKs were measured on air 1.7–3.7 ms after the frame and never accepted.
-fn start_ack_tx(seq: u8) {
-    let hw_fcs = ACK_FILTER.lock(Cell::get).hw_fcs;
-    let ack = [0x02, 0x00, seq];
-    reg_write(LL + 0x58, 0x0001); // rst tfifo
-    reg_write(LL_HW_TFIFO, u32::from_le_bytes([5, ack[0], ack[1], ack[2]]));
-    if !hw_fcs {
-        let crc = zigbee_crc16(&ack);
-        reg_write(LL_HW_TFIFO, u32::from_le_bytes([crc[0], crc[1], 0, 0]));
-    }
-    reg_write(LL + 0x04, LL_MODE_STX);
-    reg_write(LL + 0x38, 0x07);
-    LL_OP.store(OP_ACK, Ordering::Release);
-    reg_write(LL + 0x14, LL_HW_IRQ_MASK);
-    reg_write(LL + 0x0C, LIRQ_MD);
-    reg_write(LL + 0x00, 0x0001);
-}
-
 /// Pop one packet (`ll_hw_read_rfifo_zb`) into `RX_WORDS`.
+#[inline(always)]
 fn read_rx_fifo() -> RxOutcome {
     let info = reg_read(LL + 0x54);
     let depth = ((info >> 16) & 0x7FF).wrapping_sub(info & 0x7FF) & 0x7FF;
@@ -1277,9 +1496,12 @@ fn read_rx_fifo() -> RxOutcome {
         RX_BAD_LEN_CNT.inc();
         return RxOutcome::CrcError;
     };
-    let wlen = rfifo_packet_words(len_byte);
-    for w in words.iter_mut().take(wlen).skip(1) {
-        *w = reg_read(LL_HW_RFIFO);
+    // `len_byte <= 127`, so `wlen <= 32 == FIFO_WORDS`.
+    let wlen = rfifo_packet_words(len_byte).min(FIFO_WORDS);
+    let mut i = 1;
+    while i < wlen {
+        words[i] = reg_read(LL_HW_RFIFO);
+        i += 1;
     }
     let _foot0 = reg_read(LL_HW_RFIFO);
     let foot1 = reg_read(LL_HW_RFIFO);
@@ -1517,5 +1739,90 @@ mod tests {
     #[test]
     fn cca_threshold_is_minus_60_dbm() {
         assert_eq!(CCA_THRESHOLD_DBM, -60);
+    }
+
+    /// The SRAM interrupt-context ACK decision must stay identical to the
+    /// shared exact-destination policy for every addressing combination.
+    #[test]
+    fn interrupt_ack_decision_matches_shared_policy() {
+        use zigbee_types::{PanId, ShortAddress};
+        const OURS: [u8; 8] = [0x04, 0x6D, 0x5F, 0xFE, 0xFF, 0xE3, 0x42, 0x24];
+        const OTHER: [u8; 8] = [0x04, 0x6D, 0x5F, 0xFE, 0xFF, 0xE3, 0x42, 0x25];
+        let filters = [
+            (0xDFE9, 0x6976),
+            (0xDFE9, 0xFFFF),
+            (0xDFE9, 0xFFFE),
+            (0xFFFF, 0xFFFF),
+            (0xFFFF, 0x6976),
+        ];
+        let mut checked = 0;
+        let mut acked = 0;
+        for (pan_id, short_address) in filters {
+            let filter = AckFilter {
+                pan_id,
+                short_address,
+                extended_address: OURS,
+                hw_fcs: true,
+            };
+            for frame_type in 0..8u16 {
+                for ar in [false, true] {
+                    for dst_mode in 0..4u16 {
+                        for dst_pan in [0xDFE9u16, 0x1234, 0xFFFF] {
+                            for dst in 0..5 {
+                                let fc = frame_type
+                                    | if ar { 1 << 5 } else { 0 }
+                                    | (1 << 6)
+                                    | (dst_mode << 10)
+                                    | (2 << 14);
+                                let mut frame = [0u8; 20];
+                                frame[..2].copy_from_slice(&fc.to_le_bytes());
+                                frame[2] = 0x5A;
+                                frame[3..5].copy_from_slice(&dst_pan.to_le_bytes());
+                                match dst {
+                                    0 => frame[5..7].copy_from_slice(&0x6976u16.to_le_bytes()),
+                                    1 => frame[5..7].copy_from_slice(&0xFFFFu16.to_le_bytes()),
+                                    2 => frame[5..7].copy_from_slice(&0x1111u16.to_le_bytes()),
+                                    3 => frame[5..13].copy_from_slice(&OURS),
+                                    _ => frame[5..13].copy_from_slice(&OTHER),
+                                }
+                                for len in 0..=frame.len() {
+                                    let mpdu = &frame[..len];
+                                    let shared = crate::frames::software_ack_sequence(
+                                        mpdu,
+                                        PanId(pan_id),
+                                        ShortAddress(short_address),
+                                        &OURS,
+                                    );
+                                    assert_eq!(
+                                        ack_sequence_for(mpdu, &filter),
+                                        shared,
+                                        "fc={fc:#06x} pan={pan_id:#06x} short={short_address:#06x} \
+                                         dst_pan={dst_pan:#06x} dst={dst} len={len}"
+                                    );
+                                    checked += 1;
+                                    acked += usize::from(shared.is_some());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000 && acked > 100, "{checked} {acked}");
+    }
+
+    #[test]
+    fn ack_settle_word_matches_rom_set_trx_settle() {
+        // ROM ll_hw_set_trx_settle: RF+0xBC = (bb << 16) | (afe << 8) | pll.
+        assert_eq!(TRX_SETTLE_ZIGBEE, 0x0039_0834);
+        for (word, bb) in [
+            (ACK_TRX_SETTLE_HW_FCS, ACK_TX_BB_DELAY_HW_FCS_US),
+            (ACK_TRX_SETTLE_SW_FCS, ACK_TX_BB_DELAY_SW_FCS_US),
+        ] {
+            // Only the BB delay differs from the ROM's Zigbee timing.
+            assert_eq!(word & 0xFFFF, TRX_SETTLE_ZIGBEE & 0xFFFF);
+            assert_eq!(word >> 16, bb);
+            assert!(bb <= ACK_TX_BB_DELAY_MAX_US);
+        }
     }
 }

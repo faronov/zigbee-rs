@@ -8,7 +8,9 @@
 //! register values are transcribed from the PHYPLUS PHY62xx SDK
 //! (`rf_phy_driver.c`, `ll_hw_drv.c`) as redistributed by pvvx (THB2 and
 //! phy62x2-SDK). No vendor libraries or ROM radio routines are linked.
-//! ACKs, CSMA-CA and address filtering are implemented in software here.
+//! CSMA-CA and address filtering are implemented in software here; the LL
+//! engine has no 802.15.4 ACK support, so the driver's radio interrupt
+//! (SRAM-resident) starts each ACK itself with a tuned TX settle delay.
 
 pub mod driver;
 
