@@ -56,6 +56,7 @@
 - [Security](./advanced/security.md)
 - [OTA Updates](./advanced/ota.md)
 - [Firmware Size](./advanced/firmware-size.md)
+- [Porting a Radio to SoftMacCore](./advanced/soft-mac-porting.md)
 - [Coordinator & Router](./advanced/coordinator-router.md)
 
 ---

@@ -218,6 +218,106 @@ CI uses symbol gates in addition to byte counts. For example:
   fallback;
 - Telink sensor/router images must preserve their role-specific partitions.
 
+## MAC unification footprint baseline
+
+Phase A of the MAC unification (all MAC logic in the shared `SoftMacCore`,
+backends reduced to `RadioPhy`) was measured against commit `44d457c`, the
+last commit before the core API changed. Every image that CI builds was
+rebuilt with its CI toolchain, features and `--locked`, and then measured
+with `tools/mac-footprint.py`:
+
+```bash
+python3 tools/mac-footprint.py build --keep-going --out target/mac-footprint/now
+python3 tools/mac-footprint.py report --out target/mac-footprint/now \
+    --json target/mac-footprint/now.json
+python3 tools/mac-footprint.py compare tools/mac-footprint-baseline.json \
+    target/mac-footprint/now.json
+```
+
+`tools/mac-footprint-baseline.json` is the post-Phase-A reference: the
+"after" rows below. It is the gate for Phase B backend migrations.
+`compare` exits non-zero if `flash`, `data`, `bss`, `pool`, `stack` or
+`mac_chain` grows for any image. The other columns are informational, because
+they move whenever the inliner shifts code between the MAC and the runtime.
+
+Column meanings (the script's `--help` gives the full definitions):
+
+- `flash`: file-backed allocated bytes.
+- `pool`: the largest Embassy task pool or arena static, which holds the MAC
+  futures.
+- `stack`: the static worst-case direct-call stack.
+- `mac_chain`: the deepest direct-call chain that executes `zigbee_mac::`
+  code.
+- `mac_stack`: the MAC call tree measured from MAC roots alone.
+- `mac_frame`: the largest single MAC frame.
+
+All stack figures are derived from function prologues in the linked ELF.
+They are static bounds, not runtime high-water marks. The CC2340 image uses
+the fallback (no SDK) mode, because SDK mode cannot be built locally. The
+PHY62x2 images were measured from the tree at `44d457c`.
+
+Baseline (`44d457c`, bytes):
+
+| image | `flash` | `data` | `bss` | `pool` | `stack` | `mac_chain` | `mac_stack` | `mac_frame` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| bl702-sensor | 228,782 | 0 | 16,592 | 16,388 | 25,168 | 24,304 | 1,872 | 1,008 |
+| cc2340-sensor-fallback | 223,000 | 8 | 7,612 | 5,328 | 6,724 | 6,620 | 2,456 | 1,024 |
+| efr32mg1-sensor | 171,796 | 0 | 15,056 | 6,928 | 27,892 | 26,156 | 1,332 | 584 |
+| efr32mg21-sensor | 208,832 | 0 | 18,888 | 11,040 | 25,524 | 23,612 | 1,732 | 1,072 |
+| esp32c6-sensor | 392,892 | 3,592 | 53,476 | 0 | 30,288 | 25,456 | 1,920 | 576 |
+| esp32c6-sensor-light-sleep | 403,972 | 3,784 | 53,476 | 0 | 30,544 | 25,744 | 1,952 | 576 |
+| esp32h2-sensor | 377,574 | 3,296 | 53,420 | 0 | 30,288 | 25,120 | 1,376 | 576 |
+| esp32h2-sensor-light-sleep | 388,246 | 3,544 | 53,420 | 0 | 30,544 | 25,376 | 1,408 | 576 |
+| nrf52833-sensor | 234,736 | 88 | 37,376 | 32,772 | 30,036 | 29,988 | 1,100 | 752 |
+| nrf52833-sensor-bme280 | 243,200 | 88 | 37,376 | 32,772 | 30,316 | 30,268 | 1,100 | 752 |
+| nrf52833-sensor-sht31 | 238,872 | 88 | 37,376 | 32,772 | 30,036 | 29,988 | 1,100 | 752 |
+| nrf52840-router | 236,780 | 88 | 19,116 | 18,056 | 28,428 | 26,628 | 4,276 | 4,056 |
+| nrf52840-sensor | 234,736 | 88 | 37,376 | 32,772 | 30,036 | 29,988 | 1,100 | 752 |
+| nrf52840-sensor-bme280 | 243,200 | 88 | 37,376 | 32,772 | 30,316 | 30,268 | 1,100 | 752 |
+| nrf52840-sensor-sht31 | 238,860 | 88 | 37,376 | 32,772 | 30,036 | 29,988 | 1,100 | 752 |
+| nrf52840-sensor-uf2-dk | 234,916 | 88 | 37,376 | 32,772 | 30,028 | 29,980 | 1,100 | 752 |
+| nrf52840-sensor-uf2-mdk | 233,396 | 88 | 37,376 | 32,772 | 30,012 | 29,964 | 1,100 | 752 |
+| nrf52840-sensor-uf2-pca10059 | 234,872 | 88 | 37,376 | 32,772 | 30,028 | 29,980 | 1,100 | 752 |
+| nrf52840-sensor-uf2-promicro | 233,556 | 88 | 37,376 | 32,772 | 30,012 | 29,964 | 1,100 | 752 |
+| pb03f-zigbee | 190,840 | 0 | 16,628 | 16,388 | 9,516 | 8,508 | 2,152 | 728 |
+| phy6222-sensor | 133,464 | 0 | 16,572 | 16,388 | 9,300 | 8,300 | 1,984 | 728 |
+| phy6252-sensor | 133,448 | 0 | 16,572 | 16,388 | 9,300 | 8,300 | 1,984 | 728 |
+| tlsr8258-router | 270,794 | 2,428 | 19,684 | 0 | 6,488 | 6,488 | 2,992 | 1,464 |
+| tlsr8258-sensor | 169,287 | 2,156 | 9,816 | 0 | 9,244 | 9,244 | 2,968 | 752 |
+| tlsr8258-sensor-retention | 172,495 | 2,156 | 12,284 | 0 | 9,220 | 9,220 | 2,968 | 752 |
+| tlsr8258-sensor-retention-10s | 172,499 | 2,156 | 12,284 | 0 | 9,220 | 9,220 | 2,968 | 752 |
+
+After the nRF migration to `SoftMacCore<NrfRadioPhy>`, the deletion of the
+legacy `NrfMac` and `Bl702Mac`, and the addition of the offload and parent
+hooks, only these images changed. Every other image is byte-identical in
+these metrics.
+
+| image | Δ `flash` | Δ `data` | Δ `bss` | Δ `pool` | Δ `stack` | Δ `mac_chain` |
+|---|---:|---:|---:|---:|---:|---:|
+| bl702-sensor | -1,540 | 0 | 0 | 0 | -496 | -496 |
+| nrf52833-sensor | -556 | 0 | 0 | 0 | -2,720 | -5,236 |
+| nrf52833-sensor-bme280 | -636 | 0 | 0 | 0 | -2,720 | -5,236 |
+| nrf52833-sensor-sht31 | -468 | 0 | 0 | 0 | -2,720 | -5,236 |
+| nrf52840-router | -636 | 0 | -256 | -256 | -16 | -4,620 |
+| nrf52840-sensor | -552 | 0 | 0 | 0 | -2,720 | -5,236 |
+| nrf52840-sensor-bme280 | -576 | 0 | 0 | 0 | -2,704 | -5,220 |
+| nrf52840-sensor-sht31 | -352 | 0 | 0 | 0 | -2,712 | -5,228 |
+| nrf52840-sensor-uf2-dk | -668 | 0 | 0 | 0 | -2,720 | -5,236 |
+| nrf52840-sensor-uf2-mdk | -624 | 0 | 0 | 0 | -2,704 | -5,220 |
+| nrf52840-sensor-uf2-pca10059 | -672 | 0 | 0 | 0 | -2,720 | -5,236 |
+| nrf52840-sensor-uf2-promicro | -724 | 0 | 0 | 0 | -2,704 | -5,220 |
+
+The nRF sensor `mac_stack` rose by 884 B and `mac_code` by about 3.8 KB, while
+`flash` and `mac_chain` fell. Two effects explain this:
+
+- `mlme_poll` is no longer inlined into its runtime caller, so it now counts
+  as a MAC root, even though the real MAC call chain shrank by 5.2 KB.
+- The removed bytes were legacy `log::info!` format strings and their
+  formatting code.
+
+The nRF main-task future, measured with `-Z print-type-sizes`, shrank from
+18,648 B to 18,632 B on the sensor and from 18,024 B to 17,768 B on the router.
+
 ## Measurement commands
 
 Raw binary:
