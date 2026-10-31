@@ -451,6 +451,18 @@ impl Radio {
     /// Stop RX/TX and power the analog front end down. Already received
     /// frames stay in the RX buffer.
     pub fn idle(&mut self) {
+        self.force_off();
+        unsafe { write(L.synth + SYNTH_CMD, SYNTH_CMD_STOP) };
+        apply_state(&chip::IDLE);
+    }
+
+    /// Bring the RSM to `OFF` (bounded). `RXDIS` alone only takes effect at
+    /// the end of a frame being received, and `RXOVERFLOW` is only left
+    /// through `CLEARRXOVERFLOW`; a RSM left in either state ignores the
+    /// next `SWRXEN`/`TXEN` and the following warm-up stalls (hardware-
+    /// observed on xG22 as a permanent `SynthLock` after an RX overflow).
+    /// Frames already stored in the RX buffer are kept unless it overflowed.
+    fn force_off(&mut self) -> bool {
         self.rx_enabled = false;
         unsafe {
             write(L.rac + RAC_RXENSRCEN, 0);
@@ -459,12 +471,13 @@ impl Radio {
                 RAC_CMD_RXDIS | RAC_CMD_TXDIS | RAC_CMD_CLEARTXEN,
             );
         }
-        let deadline = Deadline::after_us(200);
-        while self.rac_state() != RacState::Off && !deadline.expired() {
-            service_sequencer();
+        self.service_overflow();
+        if wait_off_releasing(200) {
+            return true;
         }
-        unsafe { write(L.synth + SYNTH_CMD, SYNTH_CMD_STOP) };
-        apply_state(&chip::IDLE);
+        unsafe { write(L.frc + FRC_CMD, FRC_CMD_RXABORT) };
+        self.service_overflow();
+        wait_off_releasing(200)
     }
 
     /// Re-program the radio after EM2 before any other radio call.
@@ -485,6 +498,10 @@ impl Radio {
     }
 
     fn start_rx(&mut self) -> Result<(), RadioError> {
+        if rac_state_raw() != RacState::Off && !self.force_off() {
+            self.stats.synth_failures += 1;
+            return Err(RadioError::SynthLock);
+        }
         apply_state(&chip::RX);
         unsafe { write(L.rac + RAC_RXENSRCEN, RAC_SWRXEN) };
         let slot = &mut self.fcal[usize::from(self.channel - 11)][0];
@@ -548,20 +565,12 @@ impl Radio {
     }
 
     fn transmit_raw(&mut self, frame: &[u8]) -> Result<(), RadioError> {
-        // Leave RX without discarding already stored frames.
-        unsafe {
-            write(L.rac + RAC_RXENSRCEN, 0);
-            write(L.rac + RAC_CMD, RAC_CMD_RXDIS);
-        }
-        self.rx_enabled = false;
-        if !wait_off(200) {
-            // RXDIS takes effect at the end of a frame being received; the
-            // caller has decided to transmit, so abort that frame.
-            unsafe { write(L.frc + FRC_CMD, FRC_CMD_RXABORT) };
-            if !wait_off(200) {
-                self.idle();
-                return Err(RadioError::TxTimeout);
-            }
+        // Leave RX without discarding already stored frames; a frame
+        // still arriving is aborted since the caller decided to transmit.
+        if !self.force_off() {
+            self.idle();
+            self.stats.tx_failures += 1;
+            return Err(RadioError::TxTimeout);
         }
 
         let tx = buf(0);
@@ -737,7 +746,7 @@ impl Radio {
 
     fn service_overflow(&mut self) {
         let flags = unsafe { read(L.frc + FRC_IF) };
-        if flags & FRC_IF_RXOF != 0 {
+        if flags & FRC_IF_RXOF != 0 || rac_state_raw() == RacState::RxOverflow {
             self.stats.rx_overflows += 1;
             unsafe {
                 write(L.frc + FRC_CMD, FRC_CMD_RXABORT);
@@ -911,13 +920,13 @@ pub fn service_sequencer() {
     }
 }
 
-/// Wait for the RSM to reach `state` (a warm state held by
-/// [`service_sequencer`]), lock the synthesizer, then release the state.
-/// The warm state is released even on failure so the RSM can be disabled.
-/// Wait up to `us` for the RSM to reach `OFF`, servicing the sequencer.
-fn wait_off(us: u32) -> bool {
+/// Wait up to `us` for the RSM to reach `OFF`, servicing the sequencer and
+/// releasing the warm states [`service_sequencer`] holds, so a RSM parked
+/// in `RXWARM`/`TXWARM` can still be disabled.
+fn wait_off_releasing(us: u32) -> bool {
     let deadline = Deadline::after_us(us);
     loop {
+        unsafe { write(L.rac + RAC_SEQIF + CLR, RAC_SEQIF_HELD) };
         service_sequencer();
         if rac_state_raw() == RacState::Off {
             return true;
@@ -928,6 +937,24 @@ fn wait_off(us: u32) -> bool {
     }
 }
 
+/// Release a held warm state and make sure the RSM actually leaves it.
+/// The `SEQIF` flag can be raised a moment after `STATUS` already shows the
+/// state; a single clear issued in that window is lost and the RSM stays
+/// parked in the warm state (hardware-observed on xG22), so keep clearing
+/// until the state changes.
+fn release_warm(state: RacState, seqif: u32) {
+    let deadline = Deadline::after_us(50);
+    loop {
+        unsafe { write(L.rac + RAC_SEQIF + CLR, seqif) };
+        if rac_state_raw() != state || deadline.expired() {
+            return;
+        }
+    }
+}
+
+/// Wait for the RSM to reach `state` (a warm state held by
+/// [`service_sequencer`]), lock the synthesizer, then release the state.
+/// The warm state is released even on failure so the RSM can be disabled.
 fn warm_up(state: RacState, seqif: u32, rx_if: bool, cached: &mut u16) -> Result<(), RadioError> {
     let deadline = Deadline::after_us(SYNTH_TIMEOUT_US);
     while rac_state_raw() != state {
@@ -945,7 +972,7 @@ fn warm_up(state: RacState, seqif: u32, rx_if: bool, cached: &mut u16) -> Result
     }
     spin_cycles(us_to_cycles(WARM_SETTLE_US));
     let result = start_synth(rx_if, cached);
-    unsafe { write(L.rac + RAC_SEQIF + CLR, seqif) };
+    release_warm(state, seqif);
     result
 }
 

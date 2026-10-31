@@ -42,6 +42,8 @@ pub struct Efr32s2RadioPhy {
     /// Set by [`RadioPhy::sleep`]; [`RadioPhy::wake`] then re-initializes
     /// the radio, which EM2 requires.
     asleep: bool,
+    /// Most recent HAL error other than `NoAck`/`ChannelBusy` (diagnostics).
+    last_error: Option<RadioError>,
 }
 
 /// The EFR32 Series 2 MAC: the shared software MAC over [`Efr32s2RadioPhy`].
@@ -60,6 +62,7 @@ impl Efr32s2RadioPhy {
             ieee: efr32s2_hal::devinfo::eui64(),
             rx_on_when_idle: false,
             asleep: false,
+            last_error: None,
         })
     }
 
@@ -81,11 +84,30 @@ impl Efr32s2RadioPhy {
         self.radio.stats()
     }
 
+    /// Most recent hardware-level radio error (not `NoAck`/`ChannelBusy`)
+    /// and the current radio state machine state, for diagnostics.
+    pub fn last_error(&self) -> (Option<RadioError>, radio::RacState) {
+        (self.last_error, self.radio.rac_state())
+    }
+
+    fn fail(&mut self, error: RadioError) -> PhyError {
+        if !matches!(error, RadioError::NoAck | RadioError::ChannelBusy) {
+            self.last_error = Some(error);
+            log::warn!(
+                "efr32s2: {:?} (rac {:?}, synth {:?})",
+                error,
+                self.radio.rac_state(),
+                radio::synth_diag()
+            );
+        }
+        map_radio_error(error)
+    }
+
     fn ensure_rx(&mut self) -> Result<(), PhyError> {
         if self.radio.is_rx_on() {
             Ok(())
         } else {
-            self.radio.rx_on().map_err(map_radio_error)
+            self.radio.rx_on().map_err(|e| self.fail(e))
         }
     }
 
@@ -120,7 +142,7 @@ impl RadioPhy for Efr32s2RadioPhy {
         // the software MAC calls this path for frames that do not.
         let result = self.radio.transmit_cca(frame).map(|_| ());
         self.settle();
-        result.map_err(map_radio_error)
+        result.map_err(|e| self.fail(e))
     }
 
     async fn try_transmit_acknowledged(
@@ -150,7 +172,7 @@ impl RadioPhy for Efr32s2RadioPhy {
             }
             Err(error) => {
                 self.settle();
-                Err(map_radio_error(error))
+                Err(self.fail(error))
             }
         }
     }
@@ -181,7 +203,7 @@ impl RadioPhy for Efr32s2RadioPhy {
         if self.radio.channel() == channel {
             return Ok(());
         }
-        self.radio.set_channel(channel).map_err(map_radio_error)
+        self.radio.set_channel(channel).map_err(|e| self.fail(e))
     }
 
     fn set_tx_power(&mut self, dbm: i8) -> Result<(), PhyError> {
@@ -193,7 +215,7 @@ impl RadioPhy for Efr32s2RadioPhy {
         let rssi = self
             .radio
             .energy_detect(duration_us)
-            .map_err(map_radio_error)?;
+            .map_err(|e| self.fail(e))?;
         self.settle();
         Ok(rssi.map_or(0, crate::lqi::from_rssi_dbm))
     }
@@ -227,11 +249,11 @@ impl RadioPhy for Efr32s2RadioPhy {
     /// calibration cache, channel and TX power are kept.
     fn wake(&mut self) -> Result<(), PhyError> {
         if self.asleep {
-            self.radio.resume().map_err(map_radio_error)?;
+            self.radio.resume().map_err(|e| self.fail(e))?;
             self.asleep = false;
         }
         if self.rx_on_when_idle {
-            self.radio.rx_on().map_err(map_radio_error)?;
+            self.radio.rx_on().map_err(|e| self.fail(e))?;
         }
         Ok(())
     }
