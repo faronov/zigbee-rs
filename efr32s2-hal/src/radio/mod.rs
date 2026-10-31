@@ -157,6 +157,8 @@ const VCOTUNING_MAX: u32 = 0x7FF;
 /// Closed-loop LO count must be within this many counts of the target.
 const LOCK_TOLERANCE: u32 = 2;
 const VCO_SETTLE_US: u32 = 5;
+/// Closed-loop settling allowed for a cached tuning code before searching.
+const CACHED_LOCK_US: u32 = 40;
 const WARM_SETTLE_US: u32 = 50;
 
 const BUFC_EN: u32 = 0x04;
@@ -363,6 +365,7 @@ impl RadioToken {
             cca_threshold_dbm: DEFAULT_CCA_THRESHOLD_DBM,
             ack_filter: AckFilter::default(),
             rng: seed(),
+            fcal: [[0; 2]; 16],
             stats: RadioStats::default(),
         };
         apply_state(&chip::IDLE);
@@ -394,6 +397,8 @@ pub struct Radio {
     cca_threshold_dbm: i8,
     ack_filter: AckFilter,
     rng: u32,
+    /// Last good `VCOTUNING` per channel, `[rx, tx]`; 0 = not calibrated.
+    fcal: [[u16; 2]; 16],
     pub stats: RadioStats,
 }
 
@@ -487,7 +492,8 @@ impl Radio {
     fn start_rx(&mut self) -> Result<(), RadioError> {
         apply_state(&chip::RX);
         unsafe { write(L.rac + RAC_RXENSRCEN, RAC_SWRXEN) };
-        let result = warm_up(RacState::RxWarm, RAC_SEQIF_RXWARM, true);
+        let slot = &mut self.fcal[usize::from(self.channel - 11)][0];
+        let result = warm_up(RacState::RxWarm, RAC_SEQIF_RXWARM, true, slot);
         if result.is_err() {
             self.stats.synth_failures += 1;
             self.idle();
@@ -553,9 +559,14 @@ impl Radio {
             write(L.rac + RAC_CMD, RAC_CMD_RXDIS);
         }
         self.rx_enabled = false;
-        let deadline = Deadline::after_us(200);
-        while self.rac_state() != RacState::Off && !deadline.expired() {
-            service_sequencer();
+        if !wait_off(200) {
+            // RXDIS takes effect at the end of a frame being received; the
+            // caller has decided to transmit, so abort that frame.
+            unsafe { write(L.frc + FRC_CMD, FRC_CMD_RXABORT) };
+            if !wait_off(200) {
+                self.idle();
+                return Err(RadioError::TxTimeout);
+            }
         }
 
         let tx = buf(0);
@@ -572,7 +583,8 @@ impl Radio {
         }
         apply_state(&chip::TX);
         unsafe { write(L.rac + RAC_CMD, RAC_CMD_TXEN) };
-        if let Err(error) = warm_up(RacState::TxWarm, RAC_SEQIF_TXWARM, false) {
+        let slot = &mut self.fcal[usize::from(self.channel - 11)][1];
+        if let Err(error) = warm_up(RacState::TxWarm, RAC_SEQIF_TXWARM, false, slot) {
             self.stats.synth_failures += 1;
             self.stats.tx_failures += 1;
             unsafe { write(L.rac + RAC_CMD, RAC_CMD_CLEARTXEN | RAC_CMD_TXDIS) };
@@ -608,33 +620,22 @@ impl Radio {
         result
     }
 
-    /// Unslotted CSMA-CA transmission with optional ACK wait.
+    /// One clear-channel assessment, then transmit `frame` and, when it
+    /// requests an acknowledgement, wait macAckWaitDuration for it.
     ///
-    /// Leaves the receiver on afterwards. Frames received while waiting for
-    /// the ACK stay queued for [`receive`](Self::receive).
-    pub fn transmit_csma(
-        &mut self,
-        frame: &[u8],
-        csma: CsmaConfig,
-        scratch: &mut [u8; MAX_PSDU],
-    ) -> Result<TxOutcome, RadioError> {
+    /// This is the single-attempt primitive a MAC layer's CSMA-CA and retry
+    /// loop drives (`SoftMacCore` with `AckWaitTx`). A busy channel returns
+    /// [`RadioError::ChannelBusy`] without transmitting; a missing ACK
+    /// returns [`RadioError::NoAck`]. Leaves the receiver on afterwards.
+    /// Frames received while waiting for the ACK stay queued for
+    /// [`receive`](Self::receive).
+    pub fn transmit_cca(&mut self, frame: &[u8]) -> Result<TxOutcome, RadioError> {
         if frame.len() > MAX_FRAME {
             return Err(RadioError::FrameTooLong);
         }
-        let mut be = csma.min_be;
-        let mut backoffs = 0u8;
-        loop {
-            let slots = self.next_random() & ((1u32 << be) - 1);
-            self.rx_on()?;
-            spin_cycles(us_to_cycles(slots * UNIT_BACKOFF_US));
-            if self.cca()? {
-                break;
-            }
-            backoffs += 1;
-            if backoffs > csma.max_backoffs {
-                return Err(RadioError::ChannelBusy);
-            }
-            be = (be + 1).min(csma.max_be);
+        self.rx_on()?;
+        if !self.cca()? {
+            return Err(RadioError::ChannelBusy);
         }
         let ack_requested = frame.len() >= 3 && frame[0] & 0x20 != 0;
         let sequence = frame.get(2).copied().unwrap_or(0);
@@ -650,7 +651,8 @@ impl Radio {
         let deadline = Deadline::after_us(ACK_WAIT_US + 12 * 32);
         loop {
             service_sequencer();
-            if let Some(found) = self.find_ack(sequence, scratch) {
+            self.service_overflow();
+            if let Some(found) = self.find_ack(sequence) {
                 return Ok(TxOutcome {
                     ack_frame_pending: Some(found),
                 });
@@ -661,30 +663,68 @@ impl Radio {
         }
     }
 
-    /// Scan queued frames for an ACK with `sequence`. Non-ACK frames stay
-    /// queued for `receive` (which drops ACK frames it meets).
-    fn find_ack(&mut self, sequence: u8, scratch: &mut [u8; MAX_PSDU]) -> Option<bool> {
-        let rx = buf(1);
-        let start = unsafe { read(rx + BUF_READOFFSET) };
-        let mut first = true;
-        while let Some(frame) = self.read_frame(scratch, false) {
-            let data = &scratch[..frame.len];
-            if frame.len == 3 && data[0] & 0x07 == 0x02 && data[2] == sequence {
-                if !first {
-                    unsafe { write(rx + BUF_READOFFSET, start) };
-                }
-                return Some(data[0] & 0x10 != 0);
+    /// Unslotted CSMA-CA (IEEE 802.15.4-2015 6.2.5.1) around
+    /// [`transmit_cca`](Self::transmit_cca), without retries. For lab
+    /// binaries; a MAC layer runs its own CSMA-CA.
+    pub fn transmit_csma(
+        &mut self,
+        frame: &[u8],
+        csma: CsmaConfig,
+    ) -> Result<TxOutcome, RadioError> {
+        let mut be = csma.min_be;
+        let mut backoffs = 0u8;
+        loop {
+            let slots = self.next_random() & ((1u32 << be) - 1);
+            self.rx_on()?;
+            spin_cycles(us_to_cycles(slots * UNIT_BACKOFF_US));
+            match self.transmit_cca(frame) {
+                Err(RadioError::ChannelBusy) => {}
+                other => return other,
             }
-            first = false;
+            backoffs += 1;
+            if backoffs > csma.max_backoffs {
+                return Err(RadioError::ChannelBusy);
+            }
+            be = (be + 1).min(csma.max_be);
         }
-        unsafe { write(rx + BUF_READOFFSET, start) };
+    }
+
+    /// Look for a complete ACK with `sequence` among the queued frames
+    /// without copying them. An ACK at the head of the queue is consumed;
+    /// one behind other frames stays queued (and is later dropped by
+    /// `receive`), so no received frame is lost.
+    fn find_ack(&mut self, sequence: u8) -> Option<bool> {
+        let rx = buf(1);
+        let available = unsafe { read(rx + BUF_STATUS) } & BUF_STATUS_BYTES;
+        let start = unsafe { read(rx + BUF_READOFFSET) } & BUF_OFFSET_MASK;
+        let mut pos = 0u32;
+        while pos < available {
+            let offset = start + pos;
+            let phr = u32::from(rx_ram_byte(offset)) & 0x7F;
+            if phr < 5 {
+                // Corrupt; `receive` resynchronises.
+                return None;
+            }
+            let needed = 1 + (phr - 2) + RX_TRAILER_LEN as u32;
+            if pos + needed > available {
+                return None;
+            }
+            let fcf0 = rx_ram_byte(offset + 1);
+            if phr == 5 && fcf0 & 0x07 == 0x02 && rx_ram_byte(offset + 3) == sequence {
+                if pos == 0 {
+                    unsafe { write(rx + BUF_READOFFSET, (start + needed) & BUF_OFFSET_MASK) };
+                }
+                return Some(fcf0 & 0x10 != 0);
+            }
+            pos += needed;
+        }
         None
     }
 
     /// Fetch the next received frame into `out` (without FCS). Sends a
     /// software ACK first when the frame requests one and is addressed to
     /// this node (see [`set_ack_filter`](Self::set_ack_filter)).
-    pub fn receive(&mut self, out: &mut [u8; MAX_PSDU]) -> Option<RxFrame> {
+    pub fn receive(&mut self, out: &mut [u8; MAX_FRAME]) -> Option<RxFrame> {
         service_sequencer();
         self.service_overflow();
         let frame = self.read_frame(out, true)?;
@@ -715,7 +755,7 @@ impl Radio {
 
     /// Pop one complete frame from BUFC buffer 1. With `skip_acks`, ACK
     /// frames (already consumed by `transmit_csma` or stale) are dropped.
-    fn read_frame(&mut self, out: &mut [u8; MAX_PSDU], skip_acks: bool) -> Option<RxFrame> {
+    fn read_frame(&mut self, out: &mut [u8; MAX_FRAME], skip_acks: bool) -> Option<RxFrame> {
         // Frames are peeked straight from the SRAM backing of buffer 1 and
         // consumed by advancing READOFFSET once complete. Reading through
         // READDATA and rewinding READOFFSET is not used: on xG22 the BUFC
@@ -831,7 +871,21 @@ pub fn service_sequencer() {
 /// Wait for the RSM to reach `state` (a warm state held by
 /// [`service_sequencer`]), lock the synthesizer, then release the state.
 /// The warm state is released even on failure so the RSM can be disabled.
-fn warm_up(state: RacState, seqif: u32, rx_if: bool) -> Result<(), RadioError> {
+/// Wait up to `us` for the RSM to reach `OFF`, servicing the sequencer.
+fn wait_off(us: u32) -> bool {
+    let deadline = Deadline::after_us(us);
+    loop {
+        service_sequencer();
+        if rac_state_raw() == RacState::Off {
+            return true;
+        }
+        if deadline.expired() {
+            return false;
+        }
+    }
+}
+
+fn warm_up(state: RacState, seqif: u32, rx_if: bool, cached: &mut u16) -> Result<(), RadioError> {
     let deadline = Deadline::after_us(SYNTH_TIMEOUT_US);
     while rac_state_raw() != state {
         service_sequencer();
@@ -839,13 +893,15 @@ fn warm_up(state: RacState, seqif: u32, rx_if: bool) -> Result<(), RadioError> {
             unsafe { write(L.rac + RAC_SEQIF + CLR, seqif) };
             set_diag(SynthDiag {
                 stage: 1,
+                // Raw RSM state the warm-up stalled in.
+                count: unsafe { read(L.rac + RAC_STATUS) } >> 24 & 0xF,
                 ..SynthDiag::default()
             });
             return Err(RadioError::SynthLock);
         }
     }
     spin_cycles(us_to_cycles(WARM_SETTLE_US));
-    let result = start_synth(rx_if);
+    let result = start_synth(rx_if, cached);
     unsafe { write(L.rac + RAC_SEQIF + CLR, seqif) };
     result
 }
@@ -917,6 +973,8 @@ pub struct SynthDiag {
     pub count: u32,
     /// 0 = ok, 1 = warm state not reached, 2 = counter timeout, 3 = no lock.
     pub stage: u8,
+    /// The cached tuning code was reused (no search).
+    pub cached: bool,
 }
 
 static mut SYNTH_DIAG: SynthDiag = SynthDiag {
@@ -924,6 +982,7 @@ static mut SYNTH_DIAG: SynthDiag = SynthDiag {
     tuning: 0,
     count: 0,
     stage: 0,
+    cached: false,
 };
 
 /// Diagnostics of the most recent synthesizer calibration.
@@ -937,7 +996,13 @@ fn set_diag(diag: SynthDiag) {
 
 /// Calibrate the VCO for the programmed channel and lock the synthesizer.
 /// `rx_if` selects the RX IF offset (`ENABLEIF`) or direct TX tuning.
-fn start_synth(rx_if: bool) -> Result<(), RadioError> {
+///
+/// `cached` holds the last good `VCOTUNING` for this channel and direction
+/// (`0` = none). A cached code is tried first and accepted only if the
+/// closed loop then counts within `LOCK_TOLERANCE` of the target; otherwise
+/// the full search runs. The cache cuts RX->TX turnaround (software ACK)
+/// by the ~11 search steps.
+fn start_synth(rx_if: bool, cached: &mut u16) -> Result<(), RadioError> {
     unsafe {
         write(L.synth + SYNTH_CMD, SYNTH_CMD_STOP);
         write(
@@ -960,6 +1025,17 @@ fn start_synth(rx_if: bool) -> Result<(), RadioError> {
         target,
         ..SynthDiag::default()
     };
+    if *cached != 0 {
+        diag.tuning = u32::from(*cached);
+        if close_loop(target, diag.tuning, &mut diag, CACHED_LOCK_US) {
+            diag.stage = 0;
+            diag.cached = true;
+            set_diag(diag);
+            return Ok(());
+        }
+        *cached = 0;
+        unsafe { write(L.synth + SYNTH_CMD, SYNTH_CMD_STOP) };
+    }
     // Open-loop frequency falls monotonically with VCOTUNING: find the
     // smallest setting whose count does not exceed the target.
     let (mut low, mut high) = (0u32, VCOTUNING_MAX);
@@ -980,24 +1056,35 @@ fn start_synth(rx_if: bool) -> Result<(), RadioError> {
         }
     }
     diag.tuning = low;
+    if close_loop(target, low, &mut diag, SYNTH_TIMEOUT_US) {
+        diag.stage = 0;
+        set_diag(diag);
+        *cached = low as u16;
+        Ok(())
+    } else {
+        diag.stage = 3;
+        set_diag(diag);
+        Err(RadioError::SynthLock)
+    }
+}
+
+/// Program `tuning`, start the synthesizer loop and wait up to `timeout_us`
+/// for the LO count to settle within `LOCK_TOLERANCE` of `target`.
+fn close_loop(target: u32, tuning: u32, diag: &mut SynthDiag, timeout_us: u32) -> bool {
     unsafe {
-        write(L.synth + SYNTH_VCOTUNING, VCAPSEL_DEFAULT | low);
+        write(L.synth + SYNTH_VCOTUNING, VCAPSEL_DEFAULT | tuning);
         write(L.synth + SYNTH_CMD, SYNTH_CMD_START);
     }
-    let deadline = Deadline::after_us(SYNTH_TIMEOUT_US);
+    let deadline = Deadline::after_us(timeout_us);
     loop {
         if let Some(count) = lo_count() {
             diag.count = count;
             if count.abs_diff(target) <= LOCK_TOLERANCE {
-                diag.stage = 0;
-                set_diag(diag);
-                return Ok(());
+                return true;
             }
         }
         if deadline.expired() {
-            diag.stage = 3;
-            set_diag(diag);
-            return Err(RadioError::SynthLock);
+            return false;
         }
     }
 }
