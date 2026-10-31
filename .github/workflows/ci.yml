@@ -159,6 +159,10 @@ jobs:
             manifest: boards/efr32mg22-devkit/Cargo.toml
             workspace: boards/efr32mg22-devkit
             features: ""
+          - name: Home Assistant Connect ZBT-1 board
+            manifest: boards/ha-connect-zbt1/Cargo.toml
+            workspace: boards/ha-connect-zbt1
+            features: ""
           - name: EFR32MG22 sensor product
             manifest: products/efr32mg22-sensor/Cargo.toml
             workspace: products/efr32mg22-sensor
@@ -289,6 +293,7 @@ jobs:
           cargo fmt --manifest-path boards/efr32mg21-devkit/Cargo.toml -- --check
           cargo fmt --manifest-path products/efr32mg21-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path boards/efr32mg22-devkit/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/ha-connect-zbt1/Cargo.toml -- --check
           cargo fmt --manifest-path products/efr32mg22-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path products/phy62x2-evk/Cargo.toml -- --check
           cargo fmt --manifest-path examples/nrf52840-router/Cargo.toml -- --check

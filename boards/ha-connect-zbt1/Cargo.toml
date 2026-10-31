@@ -1,0 +1,11 @@
+[package]
+name = "ha-connect-zbt1"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board support for the Home Assistant Connect ZBT-1 (EFR32MG21 USB dongle)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg21"] }
