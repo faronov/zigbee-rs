@@ -20,7 +20,9 @@ use zigbee_runtime::role::Router;
 use zigbee_zcl::clusters::basic::PowerSource;
 
 use tlsr8258_tb04::{leds::StatusLeds, resources::BoardResources};
-use tlsr8258_tb04_product::router::{ROUTER_POLICY, led_adapters, range_extender_profile};
+use tlsr8258_tb04_product::router::{
+    ROUTER_POLICY, RouterProfile, led_adapters, range_extender_profile,
+};
 
 // Distinct from the sensor runtime's `DEVICE_EUI_OFFSET` (0x33) so a router
 // and a sensor built from the same factory-programmed part never collide on
@@ -186,14 +188,20 @@ impl JoinMetrics {
         }
     }
 
-    /// Snapshot the HAL receive-path and MAC acknowledgement counters.
+    /// Snapshot the HAL receive-path counters and the MAC's command-event
+    /// overflow count.
     ///
     /// These are cumulative since boot and are deliberately *not* cleared by
     /// `begin_attempt`: a retransmission defect has to be attributable
     /// across rejoins, and the whole point is to compare the totals against
     /// one sniffer capture covering the same interval.
+    ///
+    /// The shared `SoftMacCore` keeps no ACK-window or data-queue counters,
+    /// so the `mac_tx_*`/`mac_ack_*`, `mac_*_sequence`, `mac_data_queue_*`
+    /// and `mac_command_queue_high_water` fields stay 0. They keep their
+    /// offsets so RAM dumps from earlier firmware still decode.
     fn capture_radio(&self, mac: &TelinkRouterMac) {
-        let rx = mac.rx_diagnostics();
+        let rx = tlsr8258_hal::radio::rx_diagnostics();
         self.radio_rx_frames_valid
             .store(rx.frames_valid, Ordering::Relaxed);
         self.radio_rx_invalid_length
@@ -212,48 +220,8 @@ impl JoinMetrics {
             .store(rx.serviced_irq, Ordering::Relaxed);
         self.radio_rx_serviced_polled
             .store(rx.serviced_polled, Ordering::Relaxed);
-
-        let queues = mac.queue_diagnostics();
-        self.mac_data_queue_overflow
-            .store(queues.data_indication_overflow, Ordering::Relaxed);
-        self.mac_data_queue_evicted
-            .store(queues.data_indication_evicted, Ordering::Relaxed);
-        self.mac_data_queue_high_water.store(
-            u32::from(queues.data_indication_high_water),
-            Ordering::Relaxed,
-        );
         self.mac_command_queue_overflow
-            .store(queues.command_event_overflow, Ordering::Relaxed);
-        self.mac_command_queue_high_water.store(
-            u32::from(queues.command_event_high_water),
-            Ordering::Relaxed,
-        );
-
-        let ack = mac.ack_diagnostics();
-        self.mac_tx_attempts
-            .store(ack.tx_attempts, Ordering::Relaxed);
-        self.mac_ack_windows
-            .store(ack.ack_windows, Ordering::Relaxed);
-        self.mac_ack_matched
-            .store(ack.ack_matched, Ordering::Relaxed);
-        self.mac_ack_windows_expired
-            .store(ack.ack_windows_expired, Ordering::Relaxed);
-        self.mac_ack_frames_seen
-            .store(ack.ack_frames_seen, Ordering::Relaxed);
-        self.mac_foreign_acks
-            .store(ack.foreign_acks, Ordering::Relaxed);
-        self.mac_ack_window_frames_seen
-            .store(ack.window_frames_seen, Ordering::Relaxed);
-        self.mac_last_foreign_ack_sequence.store(
-            ack.last_foreign_ack_sequence
-                .map_or(0, |dsn| 0x100 | u32::from(dsn)),
-            Ordering::Relaxed,
-        );
-        self.mac_last_expired_sequence.store(
-            ack.last_expired_sequence
-                .map_or(0, |dsn| 0x100 | u32::from(dsn)),
-            Ordering::Relaxed,
-        );
+            .store(u32::from(mac.dropped_command_events()), Ordering::Relaxed);
     }
 
     fn begin_attempt(&self, started_us: u32) {
@@ -572,9 +540,46 @@ fn halted() -> ! {
     }
 }
 
-pub fn run() -> ! {
-    type Device = ZigbeeDevice<TelinkRouterMac, Router>;
+type Device = ZigbeeDevice<TelinkRouterMac, Router>;
 
+/// Build the MAC and the router device straight into static storage.
+///
+/// Kept out of [`run`] so the MAC, its constructor `Result` and the device
+/// builder are temporaries of this short-lived frame. `run`'s frame stays
+/// live under the whole `block_on` call tree.
+#[inline(never)]
+fn build_device(
+    ieee_address: zigbee_types::IeeeAddress,
+    aes: tlsr8258_hal::peripherals::Aes,
+    leds: &StatusLeds,
+    profile: &mut RouterProfile,
+) -> &'static mut Device {
+    let Ok(mut mac) = TelinkRouterMac::with_extended_address(ieee_address) else {
+        failure(leds);
+    };
+    if mac.install_aes_engine(aes).is_err() {
+        failure(leds);
+    }
+
+    static mut DEVICE_STORAGE: MaybeUninit<Device> = MaybeUninit::uninit();
+    ZigbeeDevice::builder(mac)
+        .power_mode(PowerMode::AlwaysOn)
+        .manufacturer("Zigbee-RS")
+        .model("TLSR8258-Router")
+        .date_code("20260718")
+        .sw_build("0.1.0")
+        .power_source(PowerSource::MainsSinglePhase)
+        .channels(zigbee_types::ChannelMask(1 << 15))
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        .build_router_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) })
+}
+
+pub fn run() -> ! {
     tlsr8258_hal::timer::init();
     let resources = match BoardResources::take() {
         Some(resources) => resources,
@@ -600,29 +605,8 @@ pub fn run() -> ! {
     let mut ieee_address = [0u8; 8];
     tlsr8258_hal::flash::factory_ieee(&mut ieee_address);
     ieee_address[0] = ieee_address[0].wrapping_add(DEVICE_EUI_OFFSET);
-    let mut mac = TelinkRouterMac::with_extended_address(ieee_address);
-    if mac.install_aes_engine(resources.aes).is_err() {
-        failure(&leds);
-    }
-
-    static mut DEVICE_STORAGE: MaybeUninit<Device> = MaybeUninit::uninit();
     let mut profile = range_extender_profile();
-
-    let device = ZigbeeDevice::builder(mac)
-        .power_mode(PowerMode::AlwaysOn)
-        .manufacturer("Zigbee-RS")
-        .model("TLSR8258-Router")
-        .date_code("20260718")
-        .sw_build("0.1.0")
-        .power_source(PowerSource::MainsSinglePhase)
-        .channels(zigbee_types::ChannelMask(1 << 15))
-        .endpoint(
-            profile.endpoint(),
-            profile.profile_id(),
-            profile.device_id(),
-            |endpoint| profile.configure_endpoint(endpoint),
-        )
-        .build_router_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
+    let device = build_device(ieee_address, resources.aes, &leds, &mut profile);
 
     let (security_partition, child_partition, aps_partition) =
         tlsr8258_tb04_product::storage::split_flash(resources.flash);

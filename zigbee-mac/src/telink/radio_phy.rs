@@ -3,8 +3,8 @@
 use crate::pib::MacPib;
 use crate::soft_mac::DEFAULT_PENDING_RX;
 use crate::{
-    AckResult, EndDevice, FullTx, MacError, MacRole, PhyAddressFilter, PhyCapabilities, PhyError,
-    PhyRxFrame, PlatformServices, RadioPhy, SoftMacCore, TxParams, WrappingTickExtender,
+    AckResult, EndDevice, FullTx, MacError, MacRole, Parent, PhyAddressFilter, PhyCapabilities,
+    PhyError, PhyRxFrame, PlatformServices, RadioPhy, SoftMacCore, TxParams, WrappingTickExtender,
 };
 #[cfg(feature = "hardware-aes")]
 use tlsr8258_hal::aes::{AesEngine, AesError};
@@ -32,6 +32,20 @@ const ACK_WAIT_TICKS: u32 = timer::ms(8);
 
 /// Shared software MAC, end-device role, on the TLSR8258 radio.
 pub type TelinkMac = SoftMacCore<TelinkRadioPhy, EndDevice, TELINK_PENDING_RX>;
+
+/// Parent role of the TLSR8258 router: eight queued MAC command events and
+/// eight concurrent Association Response transactions. The software Frame
+/// Pending table is empty because the HAL's ISR ACK path keeps its own
+/// source-match table ([`RadioPhy::set_ack_frame_pending`]).
+pub type TelinkRouterRole = Parent<8, 8, 0>;
+
+/// Retained-RX depth of the always-on router: the eight data indications
+/// the hand-written router MAC buffered, since an always-on parent hears
+/// child and neighbour traffic between runtime receive calls.
+pub const TELINK_ROUTER_PENDING_RX: usize = 8;
+
+/// Shared software MAC, parent (router) role, on the TLSR8258 radio.
+pub type TelinkRouterMac = SoftMacCore<TelinkRadioPhy, TelinkRouterRole, TELINK_ROUTER_PENDING_RX>;
 
 /// TLSR8258 radio, monotonic clock, RNG and optional AES engine exposed
 /// through the portable PHY contract.
@@ -122,7 +136,11 @@ impl<R: MacRole, const RX: usize> SoftMacCore<TelinkRadioPhy, R, RX> {
     /// exclusive `Aes` token. Back-to-back AES-128 known-answer tests,
     /// including a re-key/reuse cycle, run against the real peripheral
     /// before the engine is accepted.
+    ///
+    /// Kept out of line: the CI symbol gate proves every production image
+    /// installs the engine by finding this function.
     #[cfg(feature = "hardware-aes")]
+    #[inline(never)]
     pub fn install_aes_engine(
         &mut self,
         aes: tlsr8258_hal::peripherals::Aes,

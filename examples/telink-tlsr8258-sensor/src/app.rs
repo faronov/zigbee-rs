@@ -15,8 +15,9 @@ use tlsr8258_tb04::{leds::StatusLeds, resources::BoardResources};
 #[cfg(not(feature = "retention-proof"))]
 use tlsr8258_tb04_product::sensor::TelinkSuspendWake;
 use tlsr8258_tb04_product::sensor::{
-    DATE_CODE, MANUFACTURER, MODEL, SENSOR_POLICY, SW_BUILD, SensorRgbStatus, SyntheticEnvironment,
-    TelinkNoDiagnostics, TelinkSupervisor, USER_ACTIONS, fixed_battery, sensor_profile,
+    DATE_CODE, MANUFACTURER, MODEL, SENSOR_POLICY, SW_BUILD, SensorProfile, SensorRgbStatus,
+    SyntheticEnvironment, TelinkNoDiagnostics, TelinkSupervisor, USER_ACTIONS, fixed_battery,
+    sensor_profile,
 };
 #[cfg(feature = "retention-proof")]
 use tlsr8258_tb04_product::sensor::{
@@ -43,10 +44,48 @@ fn halted() -> ! {
     }
 }
 
+type Device = ZigbeeDevice<TelinkMac>;
+
+/// Build the MAC and the sensor device into `slot`.
+///
+/// Kept out of the composition roots so the MAC, its constructor `Result`
+/// and the device builder are temporaries of this short-lived frame. The
+/// caller's frame stays live under the whole `block_on` call tree.
+#[inline(never)]
+fn build_device(
+    ieee_address: zigbee_types::IeeeAddress,
+    aes: tlsr8258_hal::peripherals::Aes,
+    leds: &StatusLeds,
+    profile: &mut SensorProfile,
+    slot: &'static mut MaybeUninit<Device>,
+) -> &'static mut Device {
+    let Ok(mut mac) = TelinkMac::with_extended_address(ieee_address) else {
+        failure(leds);
+    };
+    if mac.install_aes_engine(aes).is_err() {
+        failure(leds);
+    }
+    ZigbeeDevice::builder(mac)
+        .power_mode(SENSOR_POLICY.power_mode())
+        // SensorApp is the sole owner of all four-round parent poll windows.
+        .automatic_polling(false)
+        .manufacturer(MANUFACTURER)
+        .model(MODEL)
+        .date_code(DATE_CODE)
+        .sw_build(SW_BUILD)
+        .power_source(PowerSource::Battery)
+        .channels(zigbee_types::ChannelMask(1 << 15))
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        .build_into(slot)
+}
+
 #[cfg(not(feature = "retention-proof"))]
 pub fn run() -> ! {
-    type Device = ZigbeeDevice<TelinkMac>;
-
     tlsr8258_hal::timer::init();
     let resources = match BoardResources::take() {
         Some(resources) => resources,
@@ -75,32 +114,11 @@ pub fn run() -> ! {
     let mut ieee_address = [0u8; 8];
     tlsr8258_hal::flash::factory_ieee(&mut ieee_address);
     ieee_address[0] = ieee_address[0].wrapping_add(DEVICE_EUI_OFFSET);
-    let Ok(mut mac) = TelinkMac::with_extended_address(ieee_address) else {
-        failure(&leds);
-    };
-    if mac.install_aes_engine(resources.aes).is_err() {
-        failure(&leds);
-    }
-
     static mut DEVICE_STORAGE: MaybeUninit<Device> = MaybeUninit::uninit();
     let mut profile = sensor_profile();
-    let device = ZigbeeDevice::builder(mac)
-        .power_mode(SENSOR_POLICY.power_mode())
-        // SensorApp is the sole owner of all four-round parent poll windows.
-        .automatic_polling(false)
-        .manufacturer(MANUFACTURER)
-        .model(MODEL)
-        .date_code(DATE_CODE)
-        .sw_build(SW_BUILD)
-        .power_source(PowerSource::Battery)
-        .channels(zigbee_types::ChannelMask(1 << 15))
-        .endpoint(
-            profile.endpoint(),
-            profile.profile_id(),
-            profile.device_id(),
-            |endpoint| profile.configure_endpoint(endpoint),
-        )
-        .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
+    let device = build_device(ieee_address, resources.aes, &leds, &mut profile, unsafe {
+        &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE)
+    });
 
     // This end device owns only the existing two-sector security journal.
     let (security_partition, _child_partition, _aps_partition) =
@@ -179,9 +197,9 @@ impl<T> RetainedCell<T> {
 }
 
 #[cfg(feature = "retention-proof")]
-type RetainedDevice = ZigbeeDevice<TelinkMac>;
+type RetainedDevice = Device;
 #[cfg(feature = "retention-proof")]
-type RetainedProfile = tlsr8258_tb04_product::sensor::SensorProfile;
+type RetainedProfile = SensorProfile;
 
 #[cfg(feature = "retention-proof")]
 #[unsafe(no_mangle)]
@@ -378,30 +396,10 @@ pub fn cold_run() -> ! {
     let mut ieee_address = [0u8; 8];
     tlsr8258_hal::flash::factory_ieee(&mut ieee_address);
     ieee_address[0] = ieee_address[0].wrapping_add(DEVICE_EUI_OFFSET);
-    let Ok(mut mac) = TelinkMac::with_extended_address(ieee_address) else {
-        failure(&leds);
-    };
-    if mac.install_aes_engine(resources.aes).is_err() {
-        failure(&leds);
-    }
-
     let profile = unsafe { TELINK_RETAINED_PROFILE_STORAGE.initialize(sensor_profile()) };
-    let device = ZigbeeDevice::builder(mac)
-        .power_mode(SENSOR_POLICY.power_mode())
-        .automatic_polling(false)
-        .manufacturer(MANUFACTURER)
-        .model(MODEL)
-        .date_code(DATE_CODE)
-        .sw_build(SW_BUILD)
-        .power_source(PowerSource::Battery)
-        .channels(zigbee_types::ChannelMask(1 << 15))
-        .endpoint(
-            profile.endpoint(),
-            profile.profile_id(),
-            profile.device_id(),
-            |endpoint| profile.configure_endpoint(endpoint),
-        )
-        .build_into(unsafe { TELINK_RETAINED_DEVICE_STORAGE.slot() });
+    let device = build_device(ieee_address, resources.aes, &leds, profile, unsafe {
+        TELINK_RETAINED_DEVICE_STORAGE.slot()
+    });
 
     // The pointer is registered only after static placement and before the
     // node creates its long-lived mutable device borrow.

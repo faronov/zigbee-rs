@@ -154,7 +154,7 @@ verify_layout() {
         exit 1
     fi
     if ! "$LLVM_NM" -C "$elf" | awk '
-        /zigbee_mac::telink::(radio_phy::TelinkRadioPhy|legacy::imp::TelinkRouterMac)/ { found = 1 }
+        /zigbee_mac::telink::radio_phy::TelinkRadioPhy/ { found = 1 }
         END { exit(found ? 0 : 1) }
     '; then
         echo "layout-check FAIL: firmware does not link the reusable Telink MAC" >&2

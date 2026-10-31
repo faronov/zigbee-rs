@@ -21,8 +21,8 @@
 {"image": "pb03f-zigbee", "flash": 194244, "text": 164976, "data": 0, "bss": 16628, "pool": 16388, "mac_code": 10174, "stack": 24152, "mac_chain": 22224, "mac_stack": 1072, "mac_frame": 824},
 {"image": "phy6222-sensor", "flash": 136688, "text": 134048, "data": 0, "bss": 16572, "pool": 16388, "mac_code": 9938, "stack": 24072, "mac_chain": 22192, "mac_stack": 1080, "mac_frame": 824},
 {"image": "phy6252-sensor", "flash": 136776, "text": 134136, "data": 0, "bss": 16572, "pool": 16388, "mac_code": 9938, "stack": 24072, "mac_chain": 22192, "mac_stack": 1080, "mac_frame": 824},
-{"image": "tlsr8258-router", "flash": 270790, "text": 268362, "data": 2428, "bss": 19684, "pool": 0, "mac_code": 18016, "stack": 47424, "mac_chain": 37376, "mac_stack": 2992, "mac_frame": 2192},
-{"image": "tlsr8258-sensor", "flash": 161355, "text": 159199, "data": 2156, "bss": 8368, "pool": 0, "mac_code": 9560, "stack": 30360, "mac_chain": 29424, "mac_stack": 1392, "mac_frame": 480},
-{"image": "tlsr8258-sensor-retention", "flash": 164579, "text": 162423, "data": 2156, "bss": 10836, "pool": 0, "mac_code": 9528, "stack": 29768, "mac_chain": 28824, "mac_stack": 1392, "mac_frame": 480},
-{"image": "tlsr8258-sensor-retention-10s", "flash": 164583, "text": 162427, "data": 2156, "bss": 10836, "pool": 0, "mac_code": 9528, "stack": 29776, "mac_chain": 28824, "mac_stack": 1392, "mac_frame": 480}
+{"image": "tlsr8258-router", "flash": 265288, "text": 262860, "data": 2428, "bss": 19124, "pool": 0, "mac_code": 15924, "stack": 45712, "mac_chain": 35008, "mac_stack": 1720, "mac_frame": 768},
+{"image": "tlsr8258-sensor", "flash": 161287, "text": 159131, "data": 2156, "bss": 8368, "pool": 0, "mac_code": 9560, "stack": 29656, "mac_chain": 28720, "mac_stack": 1392, "mac_frame": 480},
+{"image": "tlsr8258-sensor-retention", "flash": 164511, "text": 162355, "data": 2156, "bss": 10836, "pool": 0, "mac_code": 9528, "stack": 28240, "mac_chain": 27304, "mac_stack": 1392, "mac_frame": 480},
+{"image": "tlsr8258-sensor-retention-10s", "flash": 164515, "text": 162359, "data": 2156, "bss": 10836, "pool": 0, "mac_code": 9528, "stack": 28240, "mac_chain": 27304, "mac_stack": 1392, "mac_frame": 480}
 ]

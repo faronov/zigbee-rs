@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 router-app = { path = "../../apps/router", features = ["router"] }
 zigbee-types = { path = "../../zigbee-types" }
-zigbee-mac = { path = "../../zigbee-mac", features = ["tlsr8258", "hardware-aes", "telink-legacy-router"] }
+zigbee-mac = { path = "../../zigbee-mac", features = ["tlsr8258", "hardware-aes"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
