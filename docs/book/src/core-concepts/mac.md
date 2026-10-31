@@ -148,7 +148,7 @@ backend is behind a Cargo feature flag:
 | BL702 | `bl702` | End Device backend; prior XT-ZB1 radio/commissioning evidence exists |
 | CC2340R5 | `cc2340` | single-board radio bring-up and ZHA join; software ACK timing and entropy open |
 | TLSR8258 | `tlsr8258` | only production `ParentMacDriver`; advertises router but not coordinator; `telink` is a compatibility alias |
-| PHY6222 | `phy6222` | compile/layout only; complete radio path unverified |
+| PHY6222/PHY6252 | `phy6222` | `SoftMacCore<Phy6222RadioPhy>` End Device; PB-03F-Kit (PHY6252) join, interview, reporting, resume and ISR ACK timing hardware-tested; EVK images build/layout only |
 | EFR32MG1 | `efr32` | End Device backend; prior TRÅDFRI path evidence exists, real OTA install open |
 | EFR32MG21 | `efr32mg21` | BRD4181A build/layout only; complete HIL open |
 | Mock | `mock` | host-only `ParentMacDriver`; router/coordinator/Trust-Center tests |

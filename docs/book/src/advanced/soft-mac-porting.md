@@ -33,7 +33,8 @@ Production status:
 |---|---|---|
 | BL702 | yes, via `Bl702SoftMac` | hardware-tested |
 | nRF52840/52833 | yes, via `NrfSoftMac` | build- and host-tested; no hardware run since the migration |
-| CC2340, EFR32MG1, EFR32MG21, ESP32-C6/H2, PHY62x2, TLSR8258 | no, each has its own `MacDriver` | — |
+| PHY6222/PHY6252 | yes, via `Phy6222SoftMac` (ISR Imm-Ack, `TxOffload::AckWait`) | hardware-tested on the PB-03F-Kit (PHY6252); EVK images build/layout only |
+| CC2340, EFR32MG1, EFR32MG21, ESP32-C6/H2, TLSR8258 | no, each has its own `MacDriver` | — |
 
 The last group is Phase B of the MAC unification.
 
@@ -175,7 +176,11 @@ To find growth:
    bring-up and any chip-specific ISR ACK path.
 2. Every image of the platform meets `compare` against the parent commit.
    No flash, `.data`, `.bss`, task-pool, `stack` or `mac_chain` growth is
-   allowed. Report exact deltas.
+   allowed. Report exact deltas. Approved exception: the PHY62x2 images
+   may grow in `flash` only (about +6.2–6.5 KB) in exchange for about
+   −4.3 KB of `stack` and `mac_chain`; their `data`, `bss`, `pool`,
+   `stack` and `mac_chain` must still not grow (see
+   [Firmware size](firmware-size.md#mac-unification-footprint-baseline)).
 3. The tight budgets stay intact: EFR32MG1 has a 376 B margin above its
    16 KiB stack gate, and the TLSR8258 retained SVC stack has 256 B above its
    8 KiB gate. Run the platform's layout checker.

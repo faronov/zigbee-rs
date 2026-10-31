@@ -318,6 +318,31 @@ The nRF sensor `mac_stack` rose by 884 B and `mac_code` by about 3.8 KB, while
 The nRF main-task future, measured with `-Z print-type-sizes`, shrank from
 18,648 B to 18,632 B on the sensor and from 18,024 B to 17,768 B on the router.
 
+### Phase B: PHY62x2 (approved flash exception)
+
+`zigbee-mac/src/phy6222` now runs on `SoftMacCore<Phy6222RadioPhy>`. Its own
+scan, association, poll, CSMA-CA and retry code is gone; the driver and its
+SRAM interrupt ACK remain. Deltas against `157d189`, measured in the same
+tree:
+
+| image | Δ `flash` | Δ `data` | Δ `bss` | Δ `pool` | Δ `stack` | Δ `mac_chain` |
+|---|---:|---:|---:|---:|---:|---:|
+| pb03f-zigbee | +6,388 | 0 | 0 | 0 | -4,372 | -4,348 |
+| phy6222-sensor | +6,156 | 0 | 0 | 0 | -4,380 | -4,116 |
+| phy6252-sensor | +6,176 | 0 | 0 | 0 | -4,380 | -4,116 |
+
+The flash growth breaks the "no growth" gate. It was approved for PHY62x2
+only, because the shared core's general paths (`collect_beacons`,
+`MacPib::set`, association, `mlme_poll` with the two-pass short/extended
+poll) replace the smaller, PHY-specific legacy MAC. In exchange, the static
+stack bound falls by about 4.3 KB. `tools/mac-footprint-baseline.json`
+carries the new PHY62x2 rows; every other row is unchanged. `pb03f-zigbee`
+(196,320 B of XIP) no longer fit the 196,352 B slot with margin, so the
+PB-03F slot grew by one 4 KiB sector, to `0x10100..0x40FFF` (200,448 B); the
+reserved OTA staging area shrank to `0x41000..0x7DFFF` (244 KiB, still larger
+than the slot). The EVK images use 138,624 B of their unchanged 187,104 B
+XIP span.
+
 ## Measurement commands
 
 Raw binary:
