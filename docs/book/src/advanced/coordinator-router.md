@@ -26,6 +26,10 @@ coordinator product must opt into routing explicitly:
 router-app = { path = "../../apps/router", features = ["router"] }
 ```
 
+`router` also enables `application-link-key-installation`.
+`TrustCenterCoordinatorApp` additionally needs the `trust-center` feature
+(which implies `router`).
+
 An always-on End Device leaves that feature disabled, so the dependency graph
 does not carry route, parent, or child-table capacities.
 
@@ -33,9 +37,12 @@ Parent-only APIs are not exposed to an end device or relay. A backend without
 association responses, pending transactions, and indirect delivery cannot
 construct or advertise any Router descriptor.
 
-Only tc32 `TelinkMac` and host-only `MockMac` implement the sealed
-`ParentMacDriver`. Telink advertises router capability but explicitly reports
-`coordinator: false`; all other real backends are non-parent End Device
+Only the tc32 legacy `TelinkRouterMac` (zigbee-mac feature
+`telink-legacy-router`), the shared `SoftMacCore<P, Parent<..>>` role and
+host-only `MockMac` implement the sealed `ParentMacDriver`. Both real parent
+MACs advertise router capability but explicitly report `coordinator: false`.
+No shipped image instantiates the `SoftMacCore` parent role yet; it is
+host-tested only. All other real backends are non-parent End Device
 backends. No production backend currently advertises Coordinator or
 Trust-Center server support.
 
@@ -100,7 +107,8 @@ steering with the policy backoff.
 
 ### nRF52840
 
-The Nordic MAC backend is not `ParentMacDriver`. The product uses:
+The shipped Nordic MAC, `NrfSoftMac` (`SoftMacCore<NrfRadioPhy>` in the
+end-device role), is not `ParentMacDriver`. The product uses:
 
 ```text
 AlwaysOnEndDeviceApp + EndDevice + NoChildren
@@ -113,7 +121,8 @@ Zigbee role.
 
 ### TLSR8258
 
-The Telink MAC supplies parent operations. The product uses:
+The legacy `TelinkRouterMac` (zigbee-mac feature `telink-legacy-router`)
+supplies parent operations. The product uses:
 
 ```text
 ParentRouterApp + Router + PersistentChildren
@@ -158,8 +167,9 @@ security journal's APS replay floors against those keys, and only then resumes
 pending security transactions and receive. A failed restore closes the barrier;
 the next `step()` retries it before RX or ticking. `TrustCenterRuntime::poll()`
 and security indications never implicitly initialize a missing key table.
-The public `initialize_with_security_store(device, replay_store)` API owns
-this entire barrier; the separate restore/resume phases are private.
+`TrustCenterCoordinatorApp::initialize()` enters this barrier through
+`TrustCenterRuntime::initialize_with_security_store(device, replay_store)`;
+the separate restore/resume phases are private.
 The app also exposes
 `request_network_key_rotation().await`. The BDB
 `trust_center_network_key_update_period` can trigger the same broadcast or
@@ -256,8 +266,8 @@ still require independent packet captures and HIL.
 
 | product | validation |
 |---|---|
-| nRF52840 always-on End Device | builds, layout/role-symbol gates pass; complete HIL acceptance open |
-| TLSR8258 parent router | recorded 433,756 B snapshot exceeded the then-enforced 430,080 B regression budget by 3,676 B; that artificial budget is no longer enforced, but the physical `0x70000` application boundary and journals remain protected; prior join, silent restart, Link Status, and NWK relay evidence exists; corrected-image first-attempt child join/interview open |
+| nRF52840 always-on End Device | builds, layout/role-symbol gates pass on `SoftMacCore<NrfRadioPhy>`; complete HIL acceptance open |
+| TLSR8258 parent router | recorded 436,072 B snapshot (2026-09-10) exceeded the then-enforced 430,080 B regression budget by 5,992 B; that artificial budget is no longer enforced, but the physical `0x70000` application boundary and journals remain protected; prior join, silent restart, Link Status, and NWK relay evidence exists; corrected-image first-attempt child join/interview open |
 | coordinator | finite formation/restart host-tested; no production hardware coordinator path claimed |
 
 Do not call a non-parent backend a router, and do not call a host-tested

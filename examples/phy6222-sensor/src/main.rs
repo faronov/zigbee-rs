@@ -11,7 +11,7 @@ use panic_halt as _;
 use phy62x2_evk::Resources;
 use phy62x2_evk_product as product;
 use sensor_sed_app::{BlockingBattery, BlockingEnvironment, NoOta, SensorApp, SensorSedParts};
-use zigbee_mac::phy6222::Phy6222Mac;
+use zigbee_mac::phy6222::Phy6222RadioPhy;
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::ApplicationProfile;
@@ -51,12 +51,16 @@ async fn main(_spawner: Spawner) {
 
     let battery = product::battery::SupplyBattery::new(supply_monitor);
 
-    let mac = match Phy6222Mac::take() {
-        Some(mac) => mac,
+    let radio = match Phy6222RadioPhy::take() {
+        Some(radio) => radio,
         None => fault(&mut status),
     };
-    let ieee = match product::identity::validate_ieee_address(mac.extended_address()) {
+    let ieee = match product::identity::validate_ieee_address(radio.extended_address()) {
         Ok(ieee) => ieee,
+        Err(_) => fault(&mut status),
+    };
+    let mac = match radio.into_soft_mac() {
+        Ok(mac) => mac,
         Err(_) => fault(&mut status),
     };
 

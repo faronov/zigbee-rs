@@ -33,9 +33,18 @@ Production status:
 |---|---|---|
 | BL702 | yes, via `Bl702SoftMac` | hardware-tested |
 | nRF52840/52833 | yes, via `NrfSoftMac` | build- and host-tested; no hardware run since the migration |
-| CC2340, EFR32MG1, EFR32MG21, ESP32-C6/H2, PHY62x2, TLSR8258 | no, each has its own `MacDriver` | — |
+| PHY6222/PHY6252 | yes, via `Phy6222SoftMac` (ISR Imm-Ack, `type Tx = AckWaitTx`) | hardware-tested on the PB-03F-Kit (PHY6252) with the previous `RadioPhy` API; the `type Tx`/in-place `receive` port is build- and layout-checked only; EVK images build/layout only |
+| TLSR8258 sensors | yes, `TelinkMac` = `SoftMacCore<TelinkRadioPhy, EndDevice>` (`type Tx = FullTx`) | see the Telink platform guide; the `type Tx`/in-place `receive` port is build- and gate-checked only |
+| TLSR8258 router | no, legacy `TelinkRouterMac` behind the `telink-legacy-router` feature | hardware-tested legacy path |
+| CC2340, EFR32MG1, EFR32MG21, ESP32-C6/H2 | no, each has its own `MacDriver` | — |
 
-The last group is Phase B of the MAC unification.
+The last group and the TLSR8258 router are the remaining Phase B work. The
+router port onto `SoftMacCore<TelinkRadioPhy, Parent<..>>` compiled and ran
+on the host, but grew the router image by 1,546 B of flash, because the
+shared parent path is more general than the hand-written one (inlined
+association/poll futures and a larger `mlme_poll_timeout`). It waits for a
+slimmer core parent path; `TelinkRadioPhy` already implements
+`set_ack_frame_pending` for it.
 
 ## What the PHY must implement
 
@@ -68,7 +77,8 @@ received frame was moved through the PHY future, `listen` and `accept`, and
 these 127-byte copies made `listen` the largest MAC stack frame on every
 target (736 B on nRF, 976 B on BL702, 1,480 B on CC2340). `PhyRxFrame` is
 `Copy`, so a PHY that parks frames can still hand them over with
-`*frame = parked`.
+`*frame = parked`. Lab binaries that call a driver outside the core can start
+from `PhyRxFrame::EMPTY`.
 
 Construct the MAC with one of these:
 
@@ -97,7 +107,7 @@ that path needs.
 |---|---|---|
 | `zigbee_mac::SoftwareTx` | `try_transmit` (one CCA + TX) and `send_ack` | CSMA-CA, ACK wait, retries |
 | `zigbee_mac::AckWaitTx` | `try_transmit_acknowledged(frame)`: one CCA + TX + Imm-Ack wait in the ISR or radio core. Returns `Ok(Some(ack))`, `Ok(None)` when no ACK arrived, or `ChannelBusy`. Used by EFR32 and PHY62x2. | CSMA-CA backoffs, retries |
-| `zigbee_mac::FullTx` | `transmit_offloaded(frame, ack_requested, TxParams)`: the complete CSMA-CA, ACK wait and retry sequence. `TxParams` carries `macMaxCSMABackoffs`, `macMinBE`, `macMaxBE` and `macMaxFrameRetries`. Used by CC2340 PBE and ESP. | nothing |
+| `zigbee_mac::FullTx` | `transmit_offloaded(frame, ack_requested, TxParams)`: the complete CSMA-CA, ACK wait and retry sequence. `TxParams` carries `macMaxCSMABackoffs`, `macMinBE`, `macMaxBE` and `macMaxFrameRetries`. Used by CC2340 PBE, ESP and TLSR8258. | nothing |
 
 The unused methods keep their `Unsupported` defaults.
 
@@ -107,6 +117,7 @@ The unused methods keep their `Unsupported` defaults.
 | `const POLL_EXTENDED_FALLBACK` | `false` | Retry an empty short-source poll once with the EUI-64. EmberZNet parents queue a Rejoin Response or Transport-Key by EUI-64. |
 | `set_ack_frame_pending(src, on)` / `clear_ack_frame_pending()` | `Unsupported` / no-op | A parent with `hardware_auto_ack` must arm FP in the hardware or ISR source-match table. |
 | `sleep()` / `wake()` | `Ok(())` | Radio power-down between polls. `SoftMacCore::wake` re-applies channel, power and filter. |
+| `set_rx_on_when_idle(on)` | no-op | The radio keeps its receiver (or receive IRQ path) armed between operations. Called on `macRxOnWhenIdle` changes and on full reconfiguration after wake. Telink uses it to switch its IRQ-driven RX/ACK path. |
 
 The core selects the transmit path through the sealed `TxOffload` trait
 implemented by the three marker types. Do not write
@@ -225,8 +236,12 @@ To find growth:
    bring-up and any chip-specific ISR ACK path.
 2. Every image of the platform meets `compare` against the parent commit.
    No flash, `.data`, `.bss`, task-pool, `stack` or `mac_chain` growth is
-   allowed. Report exact deltas.
-3. The tight budgets stay intact: EFR32MG1 has a 376 B margin above its
+   allowed. Report exact deltas. Approved exception: the PHY62x2 images
+   may grow in `flash` only (about +6.2–6.5 KB) in exchange for about
+   −4.3 KB of `stack` and `mac_chain`; their `data`, `bss`, `pool`,
+   `stack` and `mac_chain` must still not grow (see
+   [Firmware size](firmware-size.md#mac-unification-footprint-baseline)).
+3. The tight budgets stay intact: EFR32MG1 has a 16 B margin (2026-10-31 build) above its
    16 KiB stack gate, and the TLSR8258 retained SVC stack has 256 B above its
    8 KiB gate. Run the platform's layout checker.
 4. Add host tests with a mock PHY for any new capability the backend
@@ -247,8 +262,11 @@ To find growth:
   as the legacy `NrfMac` did, because embassy-nrf exposes no ED primitive.
 - **Hard-bounded poll.** `mlme_poll_timeout` (`SoftMacCore::poll_within`)
   discards a result that completed at or after the deadline, but does not
-  cancel the radio operation. EFR32 and Telink cancel it with a timer.
-- **Per-backend diagnostics counters.** Telink and EFR32 keep their own;
-  the core exposes only `dropped_command_events()`.
+  cancel the radio operation. EFR32 cancels it with a timer. The TLSR8258
+  PHY's operations are bounded busy-waits, so the deadline is bounded there.
+- **Per-backend diagnostics counters.** EFR32 and the legacy Telink router
+  MAC keep their own; the core exposes only `dropped_command_events()`.
+  The TLSR8258 sensors keep only the HAL's `tlsr8258_hal::radio::rx_diagnostics()`;
+  the legacy MAC's ACK/queue counters were not carried over.
 - **Hardware security offload** is not modelled. Every backend uses software
   CCM* over the AES provider.

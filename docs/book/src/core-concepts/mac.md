@@ -41,8 +41,8 @@ pub trait MacDriver {
     async fn mlme_disassociate(&mut self, req: MlmeDisassociateRequest)
         -> Result<(), MacError>;
 
-    // Management
-    async fn mlme_reset(&mut self, set_default_pib: bool)
+    // Management (reset is synchronous)
+    fn mlme_reset(&mut self, set_default_pib: bool)
         -> Result<(), MacError>;
     async fn mlme_start(&mut self, req: MlmeStartRequest)
         -> Result<(), MacError>;
@@ -65,6 +65,10 @@ pub trait MacDriver {
 
     // Capability query
     fn capabilities(&self) -> MacCapabilities;
+
+    // Provided methods with defaults: mlme_poll_timeout and
+    // mcps_data_indication_timeout (bounded waits), plus the parent-only
+    // primitives listed under "Parent capability boundary" below.
 }
 ```
 
@@ -141,23 +145,49 @@ pub struct MacCapabilities {
 zigbee-rs ships with MAC backends for a wide range of 802.15.4 radios.  Each
 backend is behind a Cargo feature flag:
 
-| Backend | Feature flag | Current validation |
-|---|---|---|
-| ESP32-C6/H2 | `esp32c6`, `esp32h2` | real pure-Rust `esp-radio` End Device backends; prior path evidence exists, current exact images are build/layout-tested |
-| nRF52840/52833 | `nrf52840`, `nrf52833` | End Device backends; prior sensor-path evidence exists, current exact images are build/layout-tested |
-| BL702 | `bl702` | End Device backend; prior XT-ZB1 radio/commissioning evidence exists |
-| CC2340R5 | `cc2340` | single-board radio bring-up and ZHA join; software ACK timing and entropy open |
-| TLSR8258 | `tlsr8258` | only production `ParentMacDriver`; advertises router but not coordinator; `telink` is a compatibility alias |
-| PHY6222 | `phy6222` | compile/layout only; complete radio path unverified |
-| EFR32MG1 | `efr32` | End Device backend; prior TRÅDFRI path evidence exists, real OTA install open |
-| EFR32MG21 | `efr32mg21` | BRD4181A build/layout only; complete HIL open |
-| Mock | `mock` | host-only `ParentMacDriver`; router/coordinator/Trust-Center tests |
+| Backend | Feature flag | MAC type | Current validation |
+|---|---|---|---|
+| ESP32-C6/H2 | `esp32c6`, `esp32h2` | own `EspMac` | real pure-Rust `esp-radio` End Device backends; prior path evidence exists, current exact images are build/layout-tested |
+| nRF52840/52833 | `nrf52840`, `nrf52833` | `NrfSoftMac` = `SoftMacCore<NrfRadioPhy>` | End Device; build- and host-tested since the move to `SoftMacCore` (legacy `NrfMac` deleted), no hardware run yet |
+| BL702 | `bl702` (+ `hardware-aes-bl702`) | `Bl702SoftMac` = `SoftMacCore<Bl702RadioPhy>` | End Device; XT-ZB1 commissioning, reset/resume, Idle sleep and OTA hardware-tested on one board (legacy lmac154 `Bl702Mac` removed) |
+| CC2340R5 | `cc2340` | own `Cc2340Mac` | single-board radio bring-up, ZHA join, PBE frame filtering and hardware auto-ACK; entropy fails closed |
+| TLSR8258 sensors | `tlsr8258` (+ `hardware-aes`) | `TelinkMac` = `SoftMacCore<TelinkRadioPhy>` | End Device; `telink` is a compatibility alias |
+| TLSR8258 router | `telink-legacy-router` | legacy `TelinkRouterMac` | only production `ParentMacDriver`; advertises router but not coordinator |
+| PHY6222/PHY6252 | `phy6222` (+ `phy6222-diag`) | `Phy6222SoftMac` = `SoftMacCore<Phy6222RadioPhy>` | End Device; PB-03F-Kit (PHY6252) join, interview, reporting, resume and SRAM-ISR ACK timing hardware-tested; EVK images build/layout only |
+| EFR32MG1 | `efr32` (+ `hardware-aes-efr32mg1`) | own `Efr32Mac` | End Device backend; prior TRÅDFRI path evidence exists, real OTA install open |
+| EFR32MG21 | `efr32mg21` | own `Efr32s2Mac` | BRD4181A build/layout only; complete HIL open |
+| Mock | `mock` | `MockMac` | host-only `ParentMacDriver`; router/coordinator/Trust-Center tests |
 
-All real backends currently implement the End Device primitives. Only Telink
-and `MockMac` implement the sealed `ParentMacDriver`. Telink reports
+All real backends currently implement the End Device primitives. Only the
+legacy Telink router MAC (`TelinkRouterMac`), the shared `SoftMacCore` parent
+role (`SoftMacCore<P, Parent<..>>`, not yet used by any shipped image) and
+`MockMac` implement the sealed `ParentMacDriver`. Both parent MACs report
 `router: true` and `coordinator: false`; every other real backend uses
 `MacCapabilities::non_parent`. No production backend can currently advertise
 or construct a Coordinator/Trust-Center server path.
+
+### Shared software MAC: `SoftMacCore`
+
+Most backends no longer implement `MacDriver` by hand.
+`SoftMacCore<P, R = EndDevice, RX>` (`zigbee-mac/src/soft_mac.rs`) implements
+scan, association, polling, CSMA-CA, retries, ACK wait and pending RX once,
+over a thin chip-specific `RadioPhy` (`zigbee-mac/src/phy.rs`) plus
+`PlatformServices` (`zigbee-mac/src/platform.rs`: monotonic time, delay,
+entropy). Optional behaviour is selected at compile time:
+
+- the `RadioPhy::Tx` marker type — `SoftwareTx` (software CSMA-CA/ACK
+  wait), `AckWaitTx` (ISR/radio waits for the Imm-Ack; PHY62x2) or `FullTx`
+  (HAL runs CSMA-CA, retries and ACK wait; TLSR8258);
+- the role parameter `R` — zero-sized `EndDevice`, or
+  `Parent<EVENTS, ASSOC, PENDING>` (`zigbee-mac/src/soft_mac/parent.rs`) with
+  beacon/orphan/association responses and indirect frame-pending;
+- the retained-RX depth `RX`.
+
+CC2340, EFR32MG1, EFR32MG21 and ESP32-C6/H2 still have their own `MacDriver`
+implementations. See [Soft MAC Porting](../advanced/soft-mac-porting.md) for
+the `RadioPhy` contract and port status, and
+[Firmware Size](../advanced/firmware-size.md#mac-unification-footprint-baseline) for the per-image MAC footprint
+measured by `tools/mac-footprint.py`.
 
 ### Choosing a Backend
 
@@ -201,8 +231,10 @@ integration tests and CI pipelines where no radio hardware is available.
 
 ## Writing Your Own `MacDriver`
 
-To port zigbee-rs to a new 802.15.4 radio, implement the `MacDriver` trait.
-Here's the skeleton:
+For a new 802.15.4 radio, prefer implementing a `RadioPhy` and reusing
+`SoftMacCore` (see [Soft MAC Porting](../advanced/soft-mac-porting.md)); a
+hand-written `MacDriver` is only needed when the radio core runs the MAC
+itself. The trait skeleton is:
 
 ```rust,ignore
 use zigbee_mac::*;
@@ -242,7 +274,7 @@ impl MacDriver for MyRadioMac {
         todo!()
     }
 
-    async fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
+    fn mlme_reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
         // Reset radio hardware, optionally reset PIB to defaults
         todo!()
     }
@@ -303,11 +335,14 @@ impl MacDriver for MyRadioMac {
 ```
 
 > **Tip:** For the end-device primitives (scan timing, CSMA-CA retry, ACK
-> waiting, poll handling), study the existing `esp`, `nrf` or `efr32`
-> backends. Note that none of those is a parent: for the parent-side
+> waiting, poll handling), study the shared `SoftMacCore`
+> (`zigbee-mac/src/soft_mac.rs`) or the hand-written `esp` and `efr32`
+> backends. For the parent-side
 > primitives — beacon response, association response, orphan realignment and
-> frame-pending indirect delivery — the only in-tree hardware reference is the
-> Telink backend (`zigbee-mac/src/telink/`), together with the host `MockMac`.
+> frame-pending indirect delivery — the in-tree references are the shared
+> `SoftMacCore` parent role (`zigbee-mac/src/soft_mac/parent.rs`), the
+> hardware-tested legacy Telink router MAC (`zigbee-mac/src/telink/legacy.rs`)
+> and the host `MockMac`.
 
 ## MAC Primitives Reference
 
@@ -325,8 +360,8 @@ pub struct MlmeScanRequest {
 
 pub struct MlmeScanConfirm {
     pub scan_type: ScanType,
-    pub pan_descriptors: PanDescriptorList,   // Up to 27 discovered PANs
-    pub energy_list: EdList,                  // ED scan results
+    pub pan_descriptors: PanDescriptorList,   // Up to 16 discovered PANs
+    pub energy_list: EdList,                  // Up to 16 ED results
 }
 ```
 
@@ -340,13 +375,13 @@ pub struct MlmeScanConfirm {
 | `ScanType::Orphan` | Search for our coordinator after losing sync |
 
 **Scan duration:** The time spent on each channel is
-`aBaseSuperframeDuration × (2^n + 1)` symbols.  Typical values:
+`aBaseSuperframeDuration × (2^n + 1)` symbols (16 µs each).  Typical values:
 
 | Exponent | Time per channel | Use case |
 |----------|-----------------|----------|
 | 3 | ~138 ms | Fast scan |
-| 5 | ~530 ms | Normal scan |
-| 7 | ~2.1 s | Thorough scan |
+| 5 | ~507 ms | Normal scan |
+| 7 | ~1.98 s | Thorough scan |
 
 ### Association Primitives
 
@@ -384,6 +419,7 @@ pub struct McpsDataRequest<'a> {
 
 pub struct TxOptions {
     pub ack_tx: bool,          // Request ACK from receiver
+    pub frame_pending: bool,   // Set Frame Pending in the MAC header
     pub indirect: bool,        // Indirect TX (for sleepy children)
     pub security_enabled: bool, // MAC-level security
 }
@@ -484,6 +520,11 @@ operations.  This is the standard IEEE 802.15.4 configuration mechanism.
 | `MacMaxBe` | 0x57 | Max backoff exponent | 5 |
 | `MacMaxFrameRetries` | 0x59 | Max ACK retries | 3 |
 
+Further attributes: `MacAutoRequest` (0x42), `MacMaxFrameTotalWaitTime`
+(0x58), `MacResponseWaitTime` (0x5A), `MacDsn` (0x4C), `MacBsn` (0x49),
+`MacTransactionPersistenceTime` (0x55, parents) and `MacPromiscuousMode`
+(0x51).
+
 #### PHY Attributes (accessed via MAC GET/SET)
 
 | Attribute | ID | Description |
@@ -534,7 +575,8 @@ pub trait ParentMacDriver: MacDriver + sealed::SealedParent {}
 ```
 
 `ParentMacDriver` is implemented only by backends that can truthfully parent
-(for example the Telink soft-MAC on hardware, and the host `MockMac`). Because
+(the legacy Telink `TelinkRouterMac` on hardware, the shared
+`SoftMacCore<P, Parent<..>>` role, and the host `MockMac`). Because
 its supertrait `sealed::SealedParent` can only be named inside `zigbee-mac`, the
 trait can be implemented **only by in-tree, reviewed MAC backends** — an
 arbitrary downstream crate cannot forge the capability to unlock router

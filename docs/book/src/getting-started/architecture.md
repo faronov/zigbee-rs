@@ -185,10 +185,12 @@ loop {
 }
 ```
 
-Only the tc32 Telink backend and host-only `MockMac` implement
-`ParentMacDriver`. Telink advertises router capability but not coordinator
-capability; no production backend advertises Coordinator or Trust-Center
-server support. The nRF52840 example is therefore an
+`ParentMacDriver` is implemented by the legacy tc32 `TelinkRouterMac`
+(zigbee-mac feature `telink-legacy-router`), by the shared
+`SoftMacCore<P, Parent<..>>` role (host-tested; no shipped image uses it yet),
+and by host-only `MockMac`. Telink advertises router capability but not
+coordinator capability; no production backend advertises Coordinator or
+Trust-Center server support. The nRF52840 example is therefore an
 `AlwaysOnEndDeviceApp`, despite its historical directory name. The TLSR8258
 router has the parent primitives and uses `ParentRouterApp +
 PersistentChildren`; coordinator composition remains mock-only.
@@ -207,8 +209,8 @@ Role, commissioning procedure, and fixed product capacity are separate:
 - `compact-single-endpoint` provides two application-endpoint slots and four
   reporting entries without removing Zigbee behavior.
 
-The EFR32MG1, PHY62x2 sensor, and TLSR8258 sensor/router products currently
-select the compact capacity, after compile-time profile assertions and tests.
+The EFR32MG1 TRÅDFRI, PHY62x2 EVK, PB-03F-Kit, and TLSR8258 TB-04
+sensor/router products currently select the compact capacity, after compile-time profile assertions and tests.
 
 All six frontends expose finite `initialize()` and `step()` operations and
 the infinite `run()` wrapper. `StepEvents` returns the bounded incoming/tick
@@ -249,7 +251,9 @@ bounded, non-allocating, and unrelated to platform configuration.
 
 For the same product behavior on a new MCU:
 
-1. Implement the chip's clock/timer/radio/flash primitives and `MacDriver`.
+1. Implement the chip's clock/timer/radio/flash primitives and a thin
+   `RadioPhy` for the shared `SoftMacCore`, which then provides `MacDriver`
+   (see [Porting a Radio to SoftMacCore](../advanced/soft-mac-porting.md)).
 2. Add a board crate that maps fitted hardware and returns exclusive typed
    resources.
 3. Add a product crate for identity, profile, battery conversion, policy,

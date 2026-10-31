@@ -77,8 +77,10 @@ coordinator compositions explicitly enable its `router` feature.
 
 The nRF52840 always-on End Device example is deliberately the first case. Its
 MAC lacks `ParentMacDriver`, so it cannot advertise a Router descriptor.
-Only Telink TLSR8258 and host-only `MockMac` implement `ParentMacDriver`, and
-no production backend advertises coordinator capability.
+Only the legacy Telink `TelinkRouterMac`, the host-tested
+`SoftMacCore<_, Parent<..>>` and host-only `MockMac` implement
+`ParentMacDriver`, and no production backend advertises coordinator
+capability.
 
 ## Host examples
 
@@ -96,9 +98,10 @@ cargo +nightly-2026-03-23 run --locked
 
 ## Sensor firmware
 
-The exact 2026-09-06 images are build/layout-tested. “Prior evidence” below
-describes earlier path-level hardware runs, not a byte-for-byte rerun of the
-current image.
+“Prior evidence” below describes earlier path-level hardware runs, not a
+byte-for-byte rerun of the current image. Optional sensor drivers come from
+[`zigbee-rs-drivers`](https://github.com/faronov/zigbee-rs-drivers), pinned by
+git `rev`.
 
 | example | board/chip | wait depths | status and OTA | validation |
 |---|---|---|---|---|
@@ -107,12 +110,16 @@ current image.
 | [`nrf52840-sensor-uf2`](nrf52840-sensor-uf2/) | ProMicro, MDK, PCA10059, or DK | `Idle` / `Idle` | board-dependent status, `NoOta` | build/layout matrix; bootloader compatibility remains board-specific |
 | [`esp32c6-sensor`](esp32c6-sensor/) | ESP32-C6 DevKit | `Active` / `Active` | `NoStatus`, OTA | real `esp-radio`; prior commissioning/reporting and 18.3% OTA evidence; activation open |
 | [`esp32h2-sensor`](esp32h2-sensor/) | ESP32-H2 | `Active` / `Active` | active-low LED, OTA | real `esp-radio`; prior complete v1→v2 OTA evidence |
-| [`bl702-sensor`](bl702-sensor/) | XT-ZB1 / BL702 | `Idle` / `Idle` | `NoStatus`, `NoOta` | HIL: join, interview, Idle long poll, leave, reset/resume; sleep current unmeasured |
+| [`bl702-sensor`](bl702-sensor/) | XT-ZB1 / BL702 | `Idle` / `Idle` | `NoStatus`, signed OTA with own loader | HIL: join, interview, Idle long poll, leave, reset/resume, 0.1.0→0.1.1 OTA; sleep current unmeasured |
 | [`phy6222-sensor`](phy6222-sensor/) | PHY6222/PHY6252 EVK | `Idle` / `Idle` | fitted status, `NoOta` | exact feature images build/layout-tested; hardware path open |
-| [`cc2340-sensor`](cc2340-sensor/) | LP-EM-CC2340R5 | `Active` / `Active` | fitted status, `NoOta` | compile/layout only; entropy fails closed |
+| [`pb03f-kit`](pb03f-kit/) | Ai-Thinker PB-03F-Kit / PHY6252 | `Idle` / `Idle` | fitted status, `NoOta` | HIL: ROM boot, radio, secured join, ZHA interview/reporting, reset/resume; also `pb03f-lab` and `pb03f-radio-lab` |
+| [`cc2340-sensor`](cc2340-sensor/) | LP-EM-CC2340R5 | `Idle` / `Retention` | fitted status, `NoOta` | HIL on one board: join, interview, auto-ACK, standby current; entropy fails closed, commissioning not claimed |
 | [`efr32mg1-sensor`](efr32mg1-sensor/) | TRÅDFRI / EFR32MG1P | `Active` / `Retention` | fitted LEDs, OTA | build/layout; prior path evidence; real OTA install open |
 | [`efr32mg21-sensor`](efr32mg21-sensor/) | BRD4181A / EFR32MG21 | `Idle` / `Idle` | PB0 LED, `NoOta` | compile/layout only |
-| [`telink-tlsr8258-sensor`](telink-tlsr8258-sensor/) | TB-04 / TLSR8258 | `Active` / `Idle` by default | RGB status, `NoOta` | exact images build/layout-tested; prior SUSPEND primitive evidence; LOW32K HIL open |
+| [`telink-tlsr8258-sensor`](telink-tlsr8258-sensor/) | TB-04 / TLSR8258 | `Active` / `Idle` by default | RGB status, `NoOta` | `SoftMacCore` images build/layout-tested; prior SUSPEND primitive evidence (hand-written MAC); LOW32K HIL open |
+
+[`telink-tlsr8258-radio`](telink-tlsr8258-radio/) is the standalone TLSR8258
+radio bring-up harness (raw TX/RX, scan, association, `MacDriver` gates).
 
 See [the build matrix](../BUILD.md) for exact pinned commands and measured
 image sizes.
@@ -137,8 +144,9 @@ From the repository root:
 
 The default sensor uses full-SRAM timer `SUSPEND`. The two retention images
 are feature-gated LOW32K reset-on-wake proofs at 250 ms and 10 seconds.
-The independent retention HIL reports completion only with marker
-`0x5254600D`; that hardware gate remains open for the current proof images.
+The former independent retention HIL image was removed with
+`tools/telink-tlsr8258-lab`; the LOW32K hardware gate remains open for the
+current proof images and must run on them directly.
 
 ## Porting
 

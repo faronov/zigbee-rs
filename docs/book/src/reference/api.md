@@ -7,7 +7,8 @@ This page maps the public crates and the application-model entry points. Use
 
 ### `sensor-sed-app`
 
-Reusable environmental sleepy-end-device lifecycle.
+Reusable sleepy-end-device lifecycle for environmental sensors and other
+`SensorProfile` archetypes (for example the plant sensor).
 
 ```rust,ignore
 pub struct SensorSedParts<W, St, E, B, O, A, Sv, D> {
@@ -35,6 +36,7 @@ Important APIs:
 | `WakeController` | monotonic time, button state, and atomic MAC wait/restore |
 | `StatusSink` / `NoStatus` | semantic status; absent hardware compiles out status waits |
 | `EnvironmentSource` | environmental measurement source |
+| `SensorMeasurement<P>` / `SensorProfile` | product-owned sampling into a non-environmental profile `P`; every `EnvironmentSource` already implements it |
 | `BatterySource` | product-selected battery measurement |
 | `OtaLifecycle` / `NoOta` | profile-paired OTA transport and activation |
 | `Supervisor` | watchdog heartbeat, maximum wait, and reset |
@@ -56,10 +58,13 @@ Reusable always-on End Device, router, and coordinator lifecycle.
 | `CoordinatorApp` | `Router` | `PersistentChildren<C>`, `router` + `ParentMacDriver` |
 | `TrustCenterCoordinatorApp` | `Router` | Coordinator requirements plus `TrustCenterDeviceStore`, `trust-center` |
 
-Only Telink TLSR8258 and host-only `MockMac` currently implement
-`ParentMacDriver`; Telink advertises router but not coordinator capability.
-Therefore the only current production parent-router composition is Telink,
-while Coordinator/Trust-Center server frontends remain mock-only.
+`ParentMacDriver` is implemented by the legacy Telink `TelinkRouterMac`
+(zigbee-mac `telink-legacy-router`), the shared `SoftMacCore<P, Parent<..>>`
+role, and host-only `MockMac`; both parent MACs advertise router but not
+coordinator capability. The only current production parent-router
+composition is the TLSR8258 router on `TelinkRouterMac` (no shipped image
+uses the `SoftMacCore` parent role yet), while Coordinator/Trust-Center server
+frontends remain mock-only.
 
 Each frontend provides:
 
@@ -135,8 +140,8 @@ delivery as completion:
 | `zigbee_nwk::ChildPollOutcome::Delivered { kind, .. }` | identifies normal data, a child update, or a Leave delivered by a MAC poll |
 | `zigbee_nwk::LeaveRequestDelivery` | distinguishes direct delivery from a sleepy child's indirect queue |
 | `ChildRemovalOutcome::Pending` | a durable Remove-Device transaction is waiting for indirect Leave delivery |
-| `ChildDepartureOutcome::PendingRemote` | `Update-Device(DeviceLeft)` is waiting for its APS ACK |
-| `ApsLayer::send_update_device_acked()` | starts the ACK-tracked Trust Center notification and returns its `ApsAckHandle` |
+| `ChildDepartureOutcome::PendingLocal` | a local Trust Center departure indication must be durably handled by the coordinator before the child record is cleared |
+| `ApsLayer::send_update_device()` | sends `Update-Device(DeviceLeft)`; security commands request no APS ACK, so success (`ChildDepartureOutcome::Completed`) means lower-layer submission, not Trust Center receipt |
 
 Applications that exhaustively match these enums must retain the pending
 states across ticks. Only the completed outcome permits the corresponding
@@ -151,8 +156,9 @@ and measurement-to-ZCL conversion.
 
 Capacity features are independent of role and protocol behavior.
 `compact-single-endpoint` keeps two application endpoint slots and four
-reporting entries. It is currently selected only by EFR32MG1 and TLSR8258
-sensor/router products after profile-capacity assertions.
+reporting entries. It is currently selected by the EFR32MG1 TRÅDFRI,
+TLSR8258 TB-04 (sensor and router), PHY62x2 EVK and PB-03F-Kit products after
+profile-capacity assertions.
 
 ### Persistence
 
@@ -198,7 +204,8 @@ calling activation.
 | `zigbee-zcl` | foundation commands, clusters, reporting, OTA cluster |
 | `zigbee-bdb` | commissioning and steering/formation policy |
 | `zigbee-runtime` | integration, profiles, event/tick processing, persistence and OTA plumbing |
-| `zigbee` | top-level re-exports and high-level coordinator/router data structures |
+| `zigbee` | umbrella re-exports (`aps`, `bdb`, `crypto`, `mac`, `nwk`, `runtime`, `types`, `zcl`, `zdo`) plus `coordinator`, `router`, and `trust_center` data structures |
+| `mcuboot-image` | `no_std` MCUboot-compatible image header/TLV + ECDSA P-256 verification, overwrite-only install, and the OTA `SlotWriter` `FirmwareWriter` (feature `firmware-writer`) |
 
 Protocol crates do not depend on boards, products, vendor SDKs, logging
 transports, or platform diagnostics.
@@ -209,6 +216,13 @@ transports, or platform diagnostics.
 - `boards/<board>`: physical wiring and exclusive resources.
 - `products/<product>`: identity, profile, policy, linker, persistence, OTA.
 - `examples/<target-role>`: composition root.
+- `bootloaders/bl702-boot`, `bootloaders/cc2340r5-boot`: own boot loaders
+  built on `mcuboot-image`.
+
+Sensor drivers are not part of this repository; they live in
+[zigbee-rs-drivers](https://github.com/faronov/zigbee-rs-drivers) behind the
+async `zigbee_sensor::Sensor` trait, and examples pull them as git
+dependencies pinned by revision.
 
 See [Architecture](../getting-started/architecture.md) and the
 [platform guides](../platform-guides/nrf.md) for concrete compositions.

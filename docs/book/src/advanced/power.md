@@ -64,9 +64,9 @@ The shared application also shortens the wait for:
 | product | fast | slow | implementation/status |
 |---|---|---|---|
 | nRF52840/52833 sensor | `Idle` | `Idle` | radio-off retained System-ON wait; prior sensor-path hardware evidence |
-| ESP32-C6/H2 | `Active` | `Active` | no low-power claim |
+| ESP32-C6/H2 | `Active` | `Active` (`Idle` with opt-in `light-sleep`) | `light-sleep` adds GPIO/RTC-wake light sleep with PHY suspension; no current claim |
 | BL702 | `Idle` | `Idle` | RX-off M154 idle + WFI on TIMER CH0 alarm IRQ; no PDS/HBN claim; HIL join/poll/resume OK, current unmeasured |
-| CC2340 | `Active` | `Active` | radio bring-up/ZHA join seen on one board; no low-power claim |
+| CC2340 | `Idle` | `Retention` | radio off + WFE on SYSTIM alarm; slow polls enter TI standby (LFOSC RTC/button wake, radio re-init); LP-EM-CC2340R5 EnergyTrace ~5.6 µA mean at 10 s poll (commits `d6a1cec`, `0ae1560`) |
 | PHY6222/6252 | `Idle` | `Idle` | radio sleep + real timer; retention rejected, hardware path unverified |
 | EFR32MG1 | `Active` | `Retention` | prior RTCC/LFRCO EM2 path evidence |
 | EFR32MG21 | `Idle` | `Idle` | radio-gated WFE + 1 kHz SysTick; not EM2, HIL pending |
@@ -74,8 +74,10 @@ The shared application also shortens the wait for:
 | TLSR8258 retention proof | `Active` | `Retention` | feature-gated LOW32K reset-on-wake |
 
 Routers are always-on. `RelayRouterApp`, `ParentRouterApp`,
-`DistributedRouterApp`, and `CoordinatorApp` run bounded receive/tick slices
-but do not use sleepy end-device parent polling.
+`DistributedRouterApp`, `CoordinatorApp`, and `TrustCenterCoordinatorApp` run
+bounded receive/tick slices but do not use sleepy end-device parent polling.
+`AlwaysOnEndDeviceApp` (the nRF52840 router product) is an rx-on-when-idle
+end device and does not sleep either.
 
 These statements describe product policies and prior path evidence. The exact
 2026-09-06 release images are build/layout-tested unless an exact-image HIL
@@ -98,8 +100,8 @@ Feature-gated proof images:
 ```
 
 The first retains the 250 ms slow cadence; the second uses 10 seconds. The
-independent retention HIL pass marker is `0x5254600D`; a successful compile is
-not that marker.
+standalone legacy lab stack has been removed, so the LOW32K retention HIL
+proof has to run on these images; a successful compile is not that proof.
 
 ## Security and flash before sleep
 

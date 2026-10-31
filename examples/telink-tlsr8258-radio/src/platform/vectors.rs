@@ -1,6 +1,7 @@
 //! Boot vector table, banked-SP/IRQ setup, and `.data`/`.bss` startup init —
-//! transcribed from `tools/telink-tlsr8258-lab/src/main.rs`'s
-//! `global_asm!` blocks (proven on hardware, tc32-45, `diag-beacon`).
+//! transcribed from the former `tools/telink-tlsr8258-lab/src/main.rs`
+//! `global_asm!` blocks (proven on hardware, tc32-45, `diag-beacon`; the lab
+//! was removed after `157d189`).
 //!
 //! Only compiled for the real `tc32-unknown-none-elf` target (see
 //! `platform`'s module docs for the `target_arch = "tc32"` gate rationale):

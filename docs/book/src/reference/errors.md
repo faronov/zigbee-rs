@@ -1,7 +1,7 @@
 # Error & Status Types
 
-This chapter catalogues every error and status enum in zigbee-rs, organised by
-stack layer from bottom (MAC) to top (BDB). Use the hex codes to correlate
+This chapter catalogues the public error and status enums in zigbee-rs, organised by
+stack layer from bottom (MAC) to top (BDB / runtime). Use the hex codes to correlate
 with Zigbee specification tables and on-the-wire values.
 
 ---
@@ -10,7 +10,7 @@ with Zigbee specification tables and on-the-wire values.
 
 ### `MacError`
 
-**Crate:** `zigbee-mac` · **Spec ref:** IEEE 802.15.4 status codes
+**Crate:** `zigbee-mac` · **File:** `lib.rs` · **Spec ref:** IEEE 802.15.4 status codes
 
 General-purpose error returned by MAC primitives. No numeric discriminants —
 these are Rust-only symbolic values.
@@ -46,65 +46,99 @@ Returned by the coordinator in an Association Response command.
 | `PanAtCapacity` | `0x01` | PAN is at capacity — no room for new devices |
 | `PanAccessDenied` | `0x02` | Access to the PAN is denied |
 
+### `PhyError`
+
+**Crate:** `zigbee-mac` · **File:** `phy.rs`
+
+Error type of the `RadioPhy` trait — the hardware boundary under the shared
+`SoftMacCore` (`soft_mac.rs`). The software MAC maps these to `MacError`
+(e.g. a busy CCA drives CSMA-CA back-off).
+
+| Variant | Meaning |
+|---------|---------|
+| `ChannelBusy` | A single clear-channel assessment found the channel busy |
+| `InvalidChannel` | The requested channel is invalid or unsupported |
+| `FrameTooLong` | The frame exceeds the IEEE 802.15.4 PSDU limit (125 bytes without FCS) |
+| `CrcFailed` | The received frame failed its FCS check |
+| `Hardware` | The radio peripheral, DMA engine, or calibration failed |
+| `Unsupported` | The operation is not implemented by this PHY |
+
+### `PibError`
+
+**Crate:** `zigbee-mac` · **File:** `pib.rs`
+
+| Variant | Meaning |
+|---------|---------|
+| `InvalidValue` | The value is out of range or has the wrong type for the attribute |
+| `ReadOnly` | The attribute cannot be set |
+
+### `FrameBuildError`
+
+**Crate:** `zigbee-mac` · **File:** `frames.rs`
+
+Returned by the beacon frame builder.
+
+| Variant | Meaning |
+|---------|---------|
+| `FrameTooLong` | The frame would not fit the 125-byte MAC frame buffer |
+| `InvalidParameter` | Invalid source address / broadcast PAN, or too many pending addresses |
+
 ### `RadioError` (platform-specific)
 
-Each radio backend defines its own `RadioError` enum. The variants are similar
-but not identical across platforms.
+Some radio backends keep a driver-level `RadioError` enum below their MAC
+adapter. The nRF52, BL702 and Telink `RadioPhy` implementations
+(`nrf/radio_phy.rs`, `bl702/radio_phy.rs`, `telink/radio_phy.rs`) report
+`PhyError` / `MacError` directly and have no public backend error enum.
 
-#### CC2340 backend
+#### CC2340 backend (`cc2340/driver.rs`)
 
 | Variant | Meaning |
 |---------|---------|
 | `InvalidChannel` | Channel is outside IEEE 802.15.4 channels 11–26 |
 | `InvalidFrame` | Frame is empty or exceeds the 125-byte FCS-free limit |
+| `InvalidTxPower` | Requested TX power is outside the TI TX power table range |
 | `FirmwareUnavailable` | `CC2340_SDK_DIR` was not available at build time |
+| `ClockTimeout` | Radio clocks or the HFXT oscillator did not become ready |
+| `FirmwareImageTooLarge` | A radio firmware image does not fit the TOPsm RAM |
 | `RadioConfigUnavailable` | TI IEEE PHY configuration was not imported |
 | `FactoryTrimUnavailable` | Required per-die FCFG trim data is unavailable |
+| `SynthConfigInvalid` | Synthesizer configuration is invalid (e.g. zero frequency) |
 | `SynthTimeout` | Synthesizer divider did not complete |
 | `RadioReadyTimeout` | PBE/MCE/RFE TOPsm startup did not complete |
 | `ChannelBusy` | CCA indicated a busy channel |
 | `NoAck` | No acknowledgement from the receiver |
 | `RxTimeout` | Receive operation ended without a frame |
+| `CrcError` | Received frame failed CRC check |
 | `FifoOverflow` | PBE reported an RX/TX FIFO error or insufficient space |
 | `MalformedFrame` | RX FIFO entry or metadata layout was invalid |
+| `LinkQualityUnavailable` | RX entry carried no usable RSSI, so no LQI can be derived |
 | `OperationTimeout` | A PBE operation or hard stop did not complete in time |
 | `PbeError(code)` | PBE returned an unclassified `ENDCAUSE` value |
 | `HardwareError` | Radio hardware fault |
 
-#### BL702 backend
+#### EFR32MG1 / EFR32MG21 / PHY6222 backends
+
+`efr32/driver.rs`, `efr32s2/driver.rs` and `phy6222/driver.rs` share the same
+variant set:
 
 | Variant | Meaning |
 |---------|---------|
 | `CcaFailure` | Clear Channel Assessment failure — channel is busy |
-| `TxAborted` | TX was aborted by hardware |
-| `HardwareError` | Radio hardware error during TX |
+| `HardwareError` | TX/RX hardware error or inconsistent engine state |
 | `InvalidFrame` | Frame too long or too short |
 | `CrcError` | Received frame failed CRC check |
 | `NotInitialized` | Radio driver has not been initialized |
+| `RxTimeout` | RX timeout — no frame received |
 
-#### Telink backend
+#### ESP32 backend (`esp/driver.rs`)
+
+The ESP backend's driver error is named `Error`:
 
 | Variant | Meaning |
 |---------|---------|
-| `CcaFailure` | CCA failure — channel is busy |
-| `TxAborted` | TX was aborted |
-| `HardwareError` | Radio hardware error |
-| `InvalidFrame` | Frame too long or too short |
-| `CrcError` | Received frame failed CRC check |
-| `NotInitialized` | Radio not initialized |
-
-### `Lmac154TxStatus` (BL702 only)
-
-**Crate:** `zigbee-mac` · **File:** `bl702/driver.rs`
-
-TX completion status from the BL702 lower-MAC.
-
-| Variant | Code | Meaning |
-|---------|------|---------|
-| `TxFinished` | `0` | Transmission completed successfully |
-| `CsmaFailed` | `1` | CSMA-CA procedure failed |
-| `TxAborted` | `2` | TX was aborted |
-| `HwError` | `3` | Hardware error |
+| `Radio(esp_radio::ieee802154::Error)` | Error from the `esp-radio` 802.15.4 driver |
+| `InvalidLength` | Invalid IEEE 802.15.4 frame length |
+| `TransmitTimeout` | Transmission completion timed out |
 
 ---
 
@@ -250,13 +284,23 @@ Errors when parsing an OTA Upgrade image header.
 | `BadHeaderLength` | Header length field does not match actual data |
 | `ImageTooLarge` | Image size exceeds available storage |
 
+### `WriteAttributesParseError`
+
+**Crate:** `zigbee-zcl` · **File:** `foundation/write_attributes.rs`
+
+Returned by `WriteAttributesRequest::parse_checked()`.
+
+| Variant | Meaning |
+|---------|---------|
+| `Malformed` | Payload is empty, a record is truncated, has an unknown data type, or exceeds the record limit |
+
 ---
 
 ## ZDO Layer
 
 ### `ZdpStatus`
 
-**Crate:** `zigbee-zdo` · **Spec ref:** Zigbee spec Table 2-96
+**Crate:** `zigbee-zdo` · **File:** `lib.rs` · **Spec ref:** Zigbee R22 Table 2-138
 
 Returned in every ZDP response frame. Also aliased as `ZdoStatus`.
 
@@ -270,9 +314,11 @@ Returned in every ZDP response frame. Also aliased as `ZdoStatus`.
 | `NotSupported` | `0x84` | The requested operation is not supported |
 | `Timeout` | `0x85` | The operation timed out |
 | `NoMatch` | `0x86` | No descriptor matched the request |
-| `TableFull` | `0x87` | The internal table (binding, etc.) is full |
 | `NoEntry` | `0x88` | No matching entry was found |
 | `NoDescriptor` | `0x89` | The requested descriptor is not available |
+| `TableFull` | `0x8C` | The internal table (binding, etc.) is full (`0x87` is reserved) |
+| `IllegalRequest` | `0xA3` | Remote Trust Center policy changes are disabled |
+| `TrustCenterPolicyNotSupported` | `0xAA` | TC-significant request while whitelist mode is active (R22 §4.7.3.2) |
 
 ### `ZdoError`
 
@@ -337,6 +383,47 @@ one-shot return value.
 | `NotOnANetwork` | `0x0B` | Procedure required the node to be on a network |
 | `OnANetwork` | `0x0C` | Procedure required the node to be off-network |
 
+### `SecurityPersistenceError`
+
+**Crate:** `zigbee-bdb` · **File:** `security_persistence.rs`
+
+Persistence failure reported synchronously to commissioning (surfaces as
+`BdbStatus::PersistenceFailure`).
+
+| Variant | Meaning |
+|---------|---------|
+| `Storage` | The backing store failed |
+| `CounterExhausted` | An outgoing frame counter cannot be advanced further |
+| `InvalidState` | The security state to persist is inconsistent |
+
+### `TrustCenterError`
+
+**Crate:** `zigbee-bdb` · **File:** `trust_center.rs`
+
+| Variant | Meaning |
+|---------|---------|
+| `InvalidAddress` | The device IEEE address is invalid |
+| `InvalidInstallCode(InstallCodeError)` | The install code failed validation |
+| `DeviceTableFull` | The Trust Center device table is full |
+| `DeviceNotFound` | No entry for the device |
+| `RequestNotPermitted` | The request is not allowed by the current TC policy |
+
+---
+
+## Crypto
+
+### `AesMmoError` / `InstallCodeError`
+
+**Crate:** `zigbee-crypto` · **File:** `lib.rs`
+
+| Enum | Variant | Meaning |
+|------|---------|---------|
+| `AesMmoError` | `InputTooLong` | Input length does not fit the 16-bit bit-length field |
+| `AesMmoError` | `CipherFailure` | The selected AES backend failed |
+| `InstallCodeError` | `InvalidLength` | Code is not 6, 8, 12 or 16 bytes plus a 2-byte CRC |
+| `InstallCodeError` | `InvalidCrc` | The appended CRC-16/X-25 does not match |
+| `InstallCodeError` | `CipherFailure` | AES failed while computing the AES-MMO hash |
+
 ---
 
 ## Runtime / Support
@@ -351,6 +438,58 @@ High-level errors from device start / join / leave operations.
 |---------|---------|
 | `InitFailed` | BDB initialization failed |
 | `CommissioningFailed(BdbStatus)` | BDB commissioning failed with a specific `BdbStatus` cause |
+| `PersistenceFailed(SecurityStoreError)` | Durable security-state storage failed |
+
+### `SendError`
+
+**Crate:** `zigbee-runtime` · **File:** `event_loop.rs`
+
+Errors while sending application ZCL traffic.
+
+| Variant | Meaning |
+|---------|---------|
+| `NotJoined` | The device has not joined a network yet |
+| `Serialization` | The ZCL frame could not be serialized |
+| `PayloadTooLong` | The payload exceeded the fixed ZCL frame capacity |
+| `Aps(ApsStatus)` | APS rejected or failed the data request |
+
+### `BuildError`
+
+**Crate:** `zigbee-runtime` · **File:** `builder.rs`
+
+Returned by the `DeviceBuilder::try_build*` methods (the plain `build*`
+methods panic instead).
+
+| Variant | Meaning |
+|---------|---------|
+| `RoleRejectsDeviceType { role, device_type }` | The build role does not accept the configured `DeviceType` |
+
+### `NodeError` / `ProfileError`
+
+**Crate:** `zigbee-runtime` · **Files:** `node.rs`, `profile/mod.rs`
+
+`NodeError` is returned by `ZigbeeNode` operations such as `process_incoming`; `ProfileError` comes from application profiles.
+
+| Enum | Variant | Meaning |
+|------|---------|---------|
+| `NodeError` | `Profile(ProfileError)` | The application profile was rejected |
+| `NodeError` | `Persistence(SecurityStoreError)` | Durable security-state storage failed |
+| `ProfileError` | `TooManyClusters` | The profile's clusters do not fit the `ClusterRef` list |
+| `ProfileError` | `EndpointMismatch { profile_endpoint, component_endpoint }` | A wrapped component (e.g. `WithOta`) uses a different endpoint than the profile |
+| `ProfileError` | `Reporting(ZclStatus)` | Installing a default reporting configuration failed |
+
+### `SecurityStoreError`
+
+**Crate:** `zigbee-runtime` · **File:** `security_store.rs`
+
+| Variant | Meaning |
+|---------|---------|
+| `NotFound` | No persisted security state |
+| `Corrupt` | Persisted record failed validation |
+| `Full` | Storage is full |
+| `Hardware` | Flash/NV hardware error |
+| `CounterExhausted` | A persisted frame counter cannot be advanced further |
+| `GenerationExhausted` | The record generation counter is exhausted |
 
 ### `FirmwareError`
 

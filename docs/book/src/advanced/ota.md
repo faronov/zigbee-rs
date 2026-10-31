@@ -86,8 +86,9 @@ response offers the same manufacturer code, image type, file version and size,
 the download continues at the saved offset without erasing the slot. Any other
 offer, an explicit abort, or a verification failure discards the staged data
 and starts again at offset 0. Resume state lives in RAM only, so a reset still
-restarts the download. This behaviour is host-tested only; an interrupted
-download that resumes on hardware is still an open gate.
+restarts the download. One BL702 hardware run resumed after a ZHA server abort
+at offset 12,720 (commit `8aeee49`); the other products have host tests
+only.
 
 ## Platform implementations
 
@@ -97,8 +98,9 @@ download that resumes on hardware is still an open gate.
 | ESP32-H2 | same product writer/layout | prior H2 run demonstrated v1→v2 activation/reboot/network retention; current exact image has build/layout evidence only |
 | EFR32MG1 | Gecko Bootloader storage slot 0 through `BootloaderFlashAccess` | writer implemented; real Zigbee download/install/reboot open |
 | nRF52840/52833 | no writer in current products | `NoOta` |
-| BL702 | overwrite-only `bl702-xt-zb1-boot` loader (`mcuboot-image`, ECDSA P-256); download into the secondary slot `0x87000..0xFE000` | loader, writer and release tooling build/host-tested; hardware boot and OTA open |
-| PHY6222/CC2340/EFR32MG21/TLSR8258 | no product writer | `NoOta` |
+| BL702 | overwrite-only `bl702-xt-zb1-boot` loader (`bootloaders/bl702-boot` + `mcuboot-image`, SHA-256 + ECDSA P-256, downgrades refused); download into the secondary slot `0x87000..0xFE000` | one XT-ZB1 upgraded 0.1.0→0.1.1 over ZHA (299 KB, ~33 min), resumed after a server abort, booted the new image and kept its network (commit `8aeee49`); power loss during the copy untested |
+| CC2340R5 | `bootloaders/cc2340r5-boot` loader core on `mcuboot-image`; no product writer | `NoOta`; loader build/host-tested only |
+| PHY6222/PB-03F/EFR32MG21/TLSR8258 | no product writer | `NoOta` |
 
 ## ESP32 layout
 
@@ -153,5 +155,7 @@ An OTA path is complete only after hardware proves:
 A compiled `FirmwareWriter`, successful transfer fragment, or bootloader API
 call is not by itself complete OTA support.
 
-No current exact 2026-09-06 image is documented as rerunning those hardware
-OTA demonstrations.
+The BL702 run above covers items 1–5, network retention from item 6, and the
+download half of item 8 on one device; a counter-reuse check, region integrity
+(item 7) and copy-time power loss (item 8) remain open. No current exact ESP32 or EFR32 image is documented as
+rerunning its hardware OTA demonstration.

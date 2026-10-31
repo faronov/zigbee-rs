@@ -9,7 +9,6 @@ without requiring a radio board.
 rustup toolchain install nightly-2026-03-23
 git clone https://github.com/faronov/zigbee-rs.git
 cd zigbee-rs
-git switch experiment/r22-bdb-complete
 ```
 
 The general toolchain is pinned. Do not substitute a moving nightly when
@@ -35,17 +34,17 @@ let mut app = SensorApp::new(
     SensorSedParts {
         wake: HostWake::default(),
         status: NoStatus,
-        environment,
+        environment: DemoEnvironment::default(),
         battery,
         ota: NoOta,
-        actions: ForceReportAction,
-        supervisor,
-        diagnostics,
+        actions: NoUserAction,
+        supervisor: HostSupervisor,
+        diagnostics: HostDiagnostics,
     },
 )?;
 
 app.initialize().await?;
-for _ in 0..4 {
+for _ in 1..=4 {
     app.step().await?;
 }
 ```
@@ -63,7 +62,7 @@ cargo +nightly-2026-03-23 run --locked
 ```
 
 `mock-light` uses `RelayRouterApp + NoChildren`. `mock-coordinator` uses
-`CoordinatorApp + PersistentChildren`, forms a PAN, persists it, and proves
+`TrustCenterCoordinatorApp + PersistentChildren`, forms a PAN, persists it, and proves
 that the next initialization restarts the same PAN rather than forming again.
 
 ## Run the core tests
@@ -88,7 +87,7 @@ cargo +nightly-2026-03-23 build --release --locked
 ESP32 and PHY6222 use `nightly-2026-08-01`. Telink uses
 `tc32-1.98.1-20261003-31a272`. See the
 [platform guides](../platform-guides/nrf.md) and
-[`BUILD.md`](https://github.com/faronov/zigbee-rs/blob/experiment/r22-bdb-complete/BUILD.md)
+[`BUILD.md`](https://github.com/faronov/zigbee-rs/blob/master/BUILD.md)
 before flashing.
 
 A successful build is not a hardware-support claim. Read the target guide's

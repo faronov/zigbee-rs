@@ -26,8 +26,8 @@ The most complex cluster in zigbee-rs. Supports three color models (Hue/Saturati
 | ColorLoopDirection | `0x4003` | U8 | Read | Loop direction (0=decrement, 1=increment) |
 | ColorLoopTime | `0x4004` | U16 | Read | Loop period in seconds |
 | ColorCapabilities | `0x400A` | Bitmap16 | Read | Supported features bitmask |
-| ColorTempPhysicalMin | `0x400B` | U16 | Read | Min supported mireds (e.g. 153 = 6500K) |
-| ColorTempPhysicalMax | `0x400C` | U16 | Read | Max supported mireds (e.g. 500 = 2000K) |
+| ColorTempPhysicalMinMireds | `0x400B` | U16 | Read | Min supported mireds (e.g. 153 = 6500K) |
+| ColorTempPhysicalMaxMireds | `0x400C` | U16 | Read | Max supported mireds (e.g. 500 = 2000K) |
 
 ### Color Modes
 
@@ -67,7 +67,7 @@ pub const COLOR_MODE_TEMPERATURE: u8 = 0x02;
 use zigbee_zcl::clusters::color_control::ColorControlCluster;
 
 let mut color = ColorControlCluster::new();
-// Default: XY mode, color temp 250 mireds (~4000K), all capabilities enabled
+// Default: XY mode, color temp 250 mireds (~4000K), ColorCapabilities 0x001F (all)
 
 // In your timer callback (call every 100ms):
 color.tick(1); // advance transitions by 1 decisecond
@@ -107,16 +107,29 @@ Configuration attributes for fluorescent lamp ballasts.
 |-----------|----|------|--------|-------------|
 | PhysicalMinLevel | `0x0000` | U8 | Read | Minimum light output |
 | PhysicalMaxLevel | `0x0001` | U8 | Read | Maximum light output |
-| BallastStatus | `0x0002` | Bitmap8 | Read | Status flags |
+| BallastStatus | `0x0002` | U8 | Read | Status flags |
 | MinLevel | `0x0010` | U8 | R/W | Configured minimum |
 | MaxLevel | `0x0011` | U8 | R/W | Configured maximum |
+| PowerOnLevel | `0x0012` | U8 | R/W | Level at power-on |
+| PowerOnFadeTime | `0x0013` | U16 | R/W | Fade time at power-on |
+| IntrinsicBallastFactor | `0x0014` | U8 | R/W | Ballast factor |
+| BallastFactorAdjustment | `0x0015` | U8 | R/W | Factor adjustment |
+| LampQuantity | `0x0020` | U8 | Read | Number of lamps |
+| LampRatedHours | `0x0032` | U24 | R/W | Rated lamp life |
+| LampBurnHours | `0x0033` | U24 | R/W | Accumulated burn hours |
+| LampAlarmMode | `0x0034` | U8 | R/W | Alarm enable bits |
+| LampBurnHoursTripPoint | `0x0035` | U24 | R/W | Burn-hours alarm threshold |
+
+`LampType` (0x0030) and `LampManufacturer` (0x0031) have ID constants but are
+not registered in the attribute store.
 
 No cluster-specific commands — configuration is done via Write Attributes.
 
 ```rust
 use zigbee_zcl::clusters::ballast_config::BallastConfigCluster;
 
-let ballast = BallastConfigCluster::new();
+let mut ballast = BallastConfigCluster::new();
+ballast.set_lamp_burn_hours(1200); // masked to 24 bits
 ```
 
 ---

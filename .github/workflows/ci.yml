@@ -1327,13 +1327,13 @@ jobs:
       - name: Build PB-03F-Kit binaries (release)
         working-directory: examples/pb03f-kit
         run: cargo build --release --locked
-      # products/pb03f-kit/link/memory.x: XIP slot 0x10100..0x3ffff
-      # (196,352 B). The radio lab has no flash-write path and is not
+      # products/pb03f-kit/link/memory.x: XIP slot 0x10100..0x40fff
+      # (200,448 B). The radio lab has no flash-write path and is not
       # subject to the SRAM flash-operation checks.
       - name: Check PB-03F-Kit layout
         run: |
           for BIN in pb03f-zigbee pb03f-lab; do
-            XIP_SLOT_BYTES=196352 sh examples/phy6222-sensor/check-layout.sh \
+            XIP_SLOT_BYTES=200448 sh examples/phy6222-sensor/check-layout.sh \
               "examples/pb03f-kit/target/thumbv6m-none-eabi/release/$BIN"
           done
       - name: Create ROM-boot images

@@ -14,10 +14,20 @@ products/tlsr8258-tb04
         ↓
 boards/tlsr8258-tb04
         ↓
-tlsr8258-hal + TelinkMac + tlsr8258-rt
+tlsr8258-hal + zigbee-mac (TelinkMac / TelinkRouterMac) + tlsr8258-rt
 ```
 
 The sensor/router `main.rs` files are the short composition roots.
+
+The sensors use `TelinkMac`, which is the shared
+`SoftMacCore<TelinkRadioPhy, EndDevice>`: scan, association, polling, frame
+retries and ACK matching run in the portable core, while the HAL performs the
+CSMA-CA backoff (with the PIB parameters), the transmission and the Imm-Ack
+wait as one radio operation. The Imm-Ack itself is still generated in the
+HAL RX-completion path, never from task context. The router uses the legacy
+hand-written `TelinkRouterMac`, compiled only with the zigbee-mac
+`telink-legacy-router` feature, until the shared parent path fits its flash
+budget (see the MAC unification section of the firmware-size chapter).
 
 The board owns fitted LEDs, flash/ADC resources, and physical wiring. The
 product owns identity, profile, battery/poll behavior, sleep policy,
@@ -69,17 +79,12 @@ These are explicit proof images, not silent replacements for the default
 SUSPEND product. Retained application/MAC/AES/ADC state is reconstructed before
 a fresh root future calls the finite `step()` lifecycle.
 
-The independent retention lab reports:
-
-```text
-start: 0x52540000
-cycles: 0x52542001..0x52542004
-pass: 0x5254600D
-failure: 0xDEADxxxx
-```
-
-Only `0x5254600D` is the HIL completion marker. A successful build or symbol
-check is not the marker.
+The former independent retention lab (`diag-retention`, completion marker
+`0x5254600D`) was removed together with `tools/telink-tlsr8258-lab`. A LOW32K
+hardware proof must now be run on the `sensor-retention` images themselves:
+repeated reset-on-wake cycles with retained network state, frame counters and
+continued ZCL reporting. A successful build or symbol check is not that
+proof.
 
 ## Router application
 
@@ -94,7 +99,7 @@ ParentRouterApp::new(
 )?;
 ```
 
-`TelinkMac` implements the parent primitives needed by `ParentMacDriver`.
+`TelinkRouterMac` implements the parent primitives needed by `ParentMacDriver`.
 `ParentRouterApp` owns steering/resume, bounded receive/tick processing,
 security checkpoints, and child-table restore/save/clear.
 
@@ -143,14 +148,16 @@ Host tools remain on Rust `1.94.1`.
 ./scripts/tlsr8258.sh build router
 ```
 
-Production, lab, and radio configurations enable LLVM tail merging. The
+Production and radio-harness configurations enable LLVM tail merging. The
 October 4 rebuild measured **195,688 B** for the default sensor and
 **288,508 B** for the router, cumulative reductions of 32.4% and 33.8% from
 the old `tc32-45` builds. See the
 [tail-merge comparison](../advanced/firmware-size.md#tlsr8258-tail-merging-2026-10-04)
 for both LOW32K variants, the separate compiler-only improvement, and physical
 headroom. No features or physical memory safeguards were removed.
-These new images have not been run on hardware.
+These new images have not been run on hardware. The later move of the sensors
+to `SoftMacCore` cut sensor flash by a further 1,480–1,616 B (see the MAC
+unification section of the firmware-size chapter).
 
 Recorded images (sensor baseline 2026-09-06; router refreshed 2026-09-10).
 Former regression budgets are historical comparisons, no longer enforced:
@@ -173,17 +180,13 @@ The artificial budget is no longer enforced. Neither the mandatory physical
 The recorded image has 22,680 B of physical headroom; the 28,672 B difference
 between the former budget and physical boundary is not a reserved partition.
 
-Independent diagnostics remain under `tools/telink-tlsr8258-lab`:
-
-```bash
-./scripts/tlsr8258.sh build diag-pm
-./scripts/tlsr8258.sh build diag-retention
-```
-
-The lab images and the standalone `examples/telink-tlsr8258-radio` harness
-link against the same `0x70000` application boundary as the product and fail
-their post-link checks at it, so flashing a diagnostic cannot overwrite the
-journals or factory data listed above.
+Radio bring-up diagnostics live in the standalone
+`examples/telink-tlsr8258-radio` harness. It links against the same `0x70000`
+application boundary as the product and fails its post-link checks at it, so
+flashing it cannot overwrite the journals or factory data listed above.
+The former `tools/telink-tlsr8258-lab` (a separate hand-written join stack
+with `diag-*` and `lab-sensor` images) was removed; `./scripts/tlsr8258.sh
+dump <address>` now forwards to the radio harness script.
 
 ## Validation
 
@@ -191,8 +194,10 @@ The recorded sensor images passed build/layout checks. The refreshed router
 linked with the physical memory assertions and the durable Bind/Unbind path,
 but its build command failed the regression-size gate enforced at the time.
 That artificial gate has since been removed; physical limits and the hardware
-gates below remain. The existing TC32 toolchain was not modified. Earlier TB-04
-images produced hardware evidence for:
+gates below remain. The existing TC32 toolchain was not modified. The
+`SoftMacCore` sensor images (commit `34513de`) are build/symbol-checked only;
+no TB-04 has run them yet. Earlier TB-04 images, all on the hand-written MAC,
+produced hardware evidence for:
 
 - hardware AES KAT, secured commissioning, TCLK exchange, ZHA interview, and
   sustained traffic;
@@ -204,7 +209,9 @@ Remaining gates:
 
 - repeated application-level default SUSPEND acceptance with network/counter
   checks and measured current;
-- LOW32K proof completion using the marker above;
+- the sensors on `SoftMacCore`: join, polling, ACK handling, and reporting on
+  hardware;
+- LOW32K proof completion on the `sensor-retention` images;
 - pad/comparator wake modes;
 - corrected-image first-attempt child admission and complete interview;
 - long-duration router and sleep stability.

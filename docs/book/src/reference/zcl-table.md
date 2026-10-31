@@ -22,13 +22,13 @@ Complete reference of all ZCL clusters implemented in `zigbee-zcl`. Sorted by cl
 | `0x000C` | **Analog Input (Basic)** | `PresentValue` (0x0055), `StatusFlags` (0x006F), `MinPresentValue` (0x0045), `MaxPresentValue` (0x0041), `EngineeringUnits` (0x0075) | — | `analog_input` |
 | `0x000D` | **Analog Output (Basic)** | `PresentValue` (0x0055), `StatusFlags` (0x006F), `RelinquishDefault` (0x0068), `EngineeringUnits` (0x0075) | — | `analog_output` |
 | `0x000E` | **Analog Value (Basic)** | `PresentValue` (0x0055), `StatusFlags` (0x006F), `RelinquishDefault` (0x0068), `EngineeringUnits` (0x0075) | — | `analog_value` |
-| `0x000F` | **Binary Input (Basic)** | `PresentValue` (0x0055), `StatusFlags` (0x006F), `Polarity` (0x0054), `ActiveText` (0x0004), `InactiveText` (0x002E) | — | `binary_input` |
+| `0x000F` | **Binary Input (Basic)** | `PresentValue` (0x0055), `StatusFlags` (0x006F), `Polarity` (0x0054), `OutOfService` (0x0051), `Reliability` (0x0067) | — | `binary_input` |
 | `0x0010` | **Binary Output (Basic)** | `PresentValue` (0x0055), `StatusFlags` (0x006F), `Polarity` (0x0054), `RelinquishDefault` (0x0068) | — | `binary_output` |
 | `0x0011` | **Binary Value (Basic)** | `PresentValue` (0x0055), `StatusFlags` (0x006F), `RelinquishDefault` (0x0068) | — | `binary_value` |
 | `0x0012` | **Multistate Input (Basic)** | `PresentValue` (0x0055), `NumberOfStates` (0x004A), `StatusFlags` (0x006F) | — | `multistate_input` |
 | `0x0019` | **OTA Upgrade** | `UpgradeServerId` (0x0000), `FileOffset` (0x0001), `CurrentFileVersion` (0x0002), `ImageUpgradeStatus` (0x0006), `ManufacturerId` (0x0007), `ImageTypeId` (0x0008) | `ImageNotify` (0x00), `QueryNextImageReq` (0x01), `QueryNextImageRsp` (0x02), `ImageBlockReq` (0x03), `ImageBlockRsp` (0x05), `UpgradeEndReq` (0x06), `UpgradeEndRsp` (0x07) | `ota` |
 | `0x0020` | **Poll Control** | `CheckInInterval` (0x0000), `LongPollInterval` (0x0001), `ShortPollInterval` (0x0002), `FastPollTimeout` (0x0003) | `CheckIn` (0x00), `CheckInResponse` (0x00), `FastPollStop` (0x01), `SetLongPollInterval` (0x02), `SetShortPollInterval` (0x03) | `poll_control` |
-| `0x0021` | **Green Power** | `GppMaxProxyTableEntries` (0x0010), `ProxyTable` (0x0011), `GpsFunctionality` (0x0005), `GpsSinkTable` (0x0000), `GpsSecurityLevel` (0x0004) | `GpNotification` (0x00), `GpPairing` (0x01), `GpProxyCommissioningMode` (0x02), `GpCommissioningNotification` (0x04), `GpResponse` (0x06), `GpPairingConfiguration` (0x09) | `green_power` |
+| `0x0021` | **Green Power** | `GppMaxProxyTableEntries` (0x0010), `ProxyTable` (0x0011), `GpsFunctionality` (0x0005), `GpsSinkTable` (0x0000), `GpsSecurityLevel` (0x0004) | **C→S:** `GpNotification` (0x00), `GpPairingSearch` (0x01), `GpCommissioningNotification` (0x04), `GpPairingConfiguration` (0x09) — **S→C:** `GpPairing` (0x01), `GpProxyCommissioningMode` (0x02), `GpResponse` (0x06) | `green_power` |
 
 ---
 
@@ -120,6 +120,8 @@ Complete reference of all ZCL clusters implemented in `zigbee-zcl`. Sorted by cl
 | **Total** | **45** | |
 
 > **Note:** The `ota_image` module is a helper for OTA image parsing and is not a separate cluster.
+>
+> The `analog_input`, `analog_output`, `analog_value`, `carbon_dioxide` and `pm25` modules use Float32 attributes and are only compiled with the `float32` feature of `zigbee-zcl` (enabled by default).
 
 ---
 

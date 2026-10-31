@@ -168,8 +168,8 @@ ASSERT(SIZEOF(.jump_table) == 0x400,
        "PHY62x2 ROM jump table must contain 256 entries");
 ASSERT(__stext == 0x11010100,
        "PHY62x2 XIP text must start immediately after the PHY6 header");
-ASSERT(__xip_occupied_end - __xip_occupied_start <= 0x2ff00,
-       "PHY62x2 XIP image exceeds the 196352-byte application slot");
+ASSERT(__xip_occupied_end - __xip_occupied_start <= 0x30f00,
+       "PHY62x2 XIP image exceeds the 200448-byte application slot");
 ASSERT(__sdata >= ADDR(.vector_table) + SIZEOF(.vector_table),
        "PHY62x2 data overlaps the ROM-loaded run descriptor");
 ASSERT(__ebss <= _stack_start,

@@ -1,8 +1,8 @@
 //! Product-owned protected flash partition and durable security journal.
 //!
 //! The journal occupies the final two 4 KiB sectors (0x7e000/0x7f000) of the
-//! PB-03F's 512 KiB flash, outside the ROM-boot image (0x2000..0x40000) and
-//! the reserved OTA staging area (0x40000..0x7e000).
+//! PB-03F's 512 KiB flash, outside the ROM-boot image (0x2000..0x41000) and
+//! the reserved OTA staging area (0x41000..0x7e000).
 
 use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash, check_erase, check_read,
@@ -243,6 +243,6 @@ mod tests {
     fn linker_slot_matches_the_hard_xip_gate() {
         let script = include_str!("../link/memory.x");
         assert!(script.contains("ORIGIN = 0x11010100"));
-        assert!(script.contains("LENGTH = 0x2ff00"));
+        assert!(script.contains("LENGTH = 0x30f00"));
     }
 }

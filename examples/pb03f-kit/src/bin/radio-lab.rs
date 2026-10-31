@@ -18,6 +18,7 @@ use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Instant, Timer};
 use panic_halt as _;
 use pb03f_kit::{Resources, console_log, time, vectors};
+use zigbee_mac::PhyRxFrame;
 use zigbee_mac::phy6222::driver::{FcsMode, PaTable, Phy6222Driver, RadioConfig, zigbee_crc16};
 
 const LAB_CHANNEL: u8 = 15;
@@ -193,7 +194,8 @@ async fn main(_spawner: Spawner) {
     raw_tx_probe("ack", &short);
 
     // Abort a receive mid-flight and check what the BBLL reset preserved.
-    let _ = select(radio.receive(), Timer::after_millis(5)).await;
+    let mut rx_frame = PhyRxFrame::EMPTY;
+    let _ = select(radio.receive(&mut rx_frame), Timer::after_millis(5)).await;
     dump_regs("after-abort");
 
     let mut dsn_sw: u8 = 0x10;
@@ -241,20 +243,22 @@ async fn main(_spawner: Spawner) {
             if now >= deadline {
                 break;
             }
-            match select(radio.receive(), Timer::after(deadline - now)).await {
-                Either::First(Ok(f)) => {
+            match select(radio.receive(&mut rx_frame), Timer::after(deadline - now)).await {
+                Either::First(Ok(())) => {
+                    let f = &rx_frame;
                     frames += 1;
                     leds.green.set_on(true);
-                    let fcf = u16::from_le_bytes([f.data[0], f.data[1]]);
+                    let data = f.as_slice();
+                    let fcf = u16::from_le_bytes([data[0], data[1]]);
                     if frames <= 8 {
                         out!(
                             "  rx len={} rssi={} lqi={} fcf={:#06x} seq={:#04x} hdr={:02x?}\n",
-                            f.len,
-                            f.rssi,
+                            data.len(),
+                            radio.last_rx_rssi(),
                             f.lqi,
                             fcf,
-                            f.data[2],
-                            &f.data[3..f.len.min(11)]
+                            data[2],
+                            &data[3..data.len().min(11)]
                         );
                     }
                     leds.green.set_on(false);

@@ -16,8 +16,12 @@ routed traffic.
 │  ├── nlde: data service              │
 │  ├── nib: network information base   │
 │  ├── frames: NWK frame codec         │
+│  ├── nwk_commands: NWK command codec │
 │  ├── neighbor: neighbor table        │
-│  ├── routing: tree + AODV routing    │
+│  ├── address_map: IEEE ↔ short map   │
+│  ├── routing: AODV + source routes   │
+│  ├── indirect: sleepy-child queue    │
+│  ├── conflict: addr/PAN conflicts    │
 │  └── security: NWK encryption        │
 └──────────────┬───────────────────────┘
                │ MacDriver trait
@@ -43,6 +47,8 @@ pub struct NwkLayer<M: MacDriver> {
     device_type: DeviceType,         // Coordinator / Router / EndDevice
     joined: bool,                    // Whether we're on a network
     rx_on_when_idle: bool,           // false = sleepy end device
+    // ... plus address map, broadcast transaction table, indirect queue,
+    // concentrator / source-route state and pending route/conflict work
 }
 ```
 
@@ -57,6 +63,7 @@ nwk.security()         // &NwkSecurity — read keys
 nwk.security_mut()     // &mut NwkSecurity — install keys
 nwk.is_joined()        // bool
 nwk.device_type()      // DeviceType
+nwk.address_map()      // &AddressMap — nwkAddressMap (IEEE ↔ short)
 nwk.mac() / mac_mut()  // Access the underlying MAC driver
 ```
 
@@ -76,11 +83,13 @@ let networks = nwk.nlme_network_discovery(
 
 1. Sets `macAutoRequest = false` (don't auto-request data during scan)
 2. Sends an **Active Scan** via MAC — beacon requests on each channel
-3. Collects beacon responses as `PanDescriptor` structs
-4. Filters for Zigbee PRO beacons (`protocol_id == 0`, `stack_profile == 2`)
-5. Converts to `NetworkDescriptor` structs
-6. Sorts by LQI (best signal first)
-7. Restores `macAutoRequest = true`
+3. Restores `macAutoRequest = true`
+4. Filters the collected `PanDescriptor`s for Zigbee PRO beacons
+   (`protocol_id == 0`, `stack_profile == 2`)
+5. Converts them to `NetworkDescriptor` structs (at most 16), merging repeated
+   beacons from the same sender
+6. Stable-sorts by LQI (best signal first); an empty result is
+   `NwkStatus::NoNetworks`
 
 The returned `NetworkDescriptor` contains everything needed to join:
 
@@ -90,13 +99,16 @@ pub struct NetworkDescriptor {
     pub pan_id: PanId,                 // 16-bit PAN ID
     pub logical_channel: u8,           // Channel (11-26)
     pub stack_profile: u8,             // 2 = Zigbee PRO
+    pub zigbee_version: u8,            // Beacon protocol version
+    pub beacon_order: u8,
+    pub superframe_order: u8,
     pub permit_joining: bool,          // Network is open for joining
     pub router_capacity: bool,         // Can accept router children
     pub end_device_capacity: bool,     // Can accept end device children
+    pub update_id: u8,                 // Advertised nwkUpdateId
     pub lqi: u8,                       // Signal quality (0-255)
     pub router_address: ShortAddress,  // Beacon sender's address
     pub depth: u8,                     // Sender's depth in tree
-    // ... more fields
 }
 ```
 
@@ -105,16 +117,20 @@ pub struct NetworkDescriptor {
 After discovery, the NWK layer joins the best network via MAC association:
 
 ```rust,ignore
-nwk.nlme_join(&best_network).await?;
+let short_addr = nwk.nlme_join(&best_network, JoinMethod::Association).await?;
+// or, for association-only images (avoids instantiating the rejoin path):
+let short_addr = nwk.nlme_join_association(&best_network).await?;
 ```
 
 **The join sequence:**
 
-1. Select the best network (highest LQI, open for joining, has capacity)
-2. Configure MAC: set channel, PAN ID, coordinator address
-3. Send `MLME-ASSOCIATE.request` to the chosen router/coordinator
-4. Receive `MLME-ASSOCIATE.confirm` with our assigned short address
-5. Update NIB: PAN ID, channel, short address, parent address
+1. Refuse a network without capacity for our device type or with association
+   permit closed (`NwkStatus::NotPermitted`)
+2. Send `MLME-ASSOCIATE.request` to the beacon sender (or the coordinator)
+3. Receive `MLME-ASSOCIATE.confirm` with our assigned short address
+4. Update NIB: PAN ID, channel, extended PAN ID, short address, parent
+   address, `nwkUpdateId`
+5. Configure MAC: coordinator short address, PAN ID, our short address
 6. Add parent to neighbor table with `Relationship::Parent`
 7. Set `joined = true`
 
@@ -147,7 +163,9 @@ pub enum JoinMethod {
   without NWK security. It is used only after a secured rejoin fails on a
   centralized network; the node remains provisional until the current network
   key arrives under APS link-key protection and is durably reserved.
-- **Direct** is used by coordinators to pre-authorize devices.
+- **Direct** (coordinator pre-authorizes a device without association) is
+  defined but not implemented as a join path: `nlme_join` returns
+  `NwkStatus::InvalidRequest` for it.
 
 ### `nwkUpdateId` validity
 
@@ -162,7 +180,7 @@ The value becomes known-good at exactly these points:
 - a successful association;
 - a successful rejoin — including one that started from an unknown state;
 - a security-journal restore whose record marks the update state valid —
-  record version 4 stores that validity explicitly in flags bit 7, and records
+  record versions 4 and later store that validity explicitly in flags bit 7, and records
   written by versions 1..=3 (which predate the bit) always count as valid
   because their stored byte was authoritative in the firmware that wrote it;
 - a legacy NV record that actually contains a valid `NwkUpdateId` item;
@@ -204,15 +222,21 @@ nwk.nlme_network_formation(
 
 **What happens:**
 
-1. **ED Scan** — measures energy (noise) on each channel
-2. **Pick quietest channel** — lowest energy = least interference
-3. **Generate PAN ID** — random 16-bit ID, avoiding 0xFFFF
-4. **Configure MAC** — set short address to 0x0000 (coordinator), set PAN ID
-5. **Start PAN** — `MLME-START.request` begins beacon transmission
-6. **Update NIB** — record channel, PAN ID, address, depth = 0
+1. **Check role** — an end device, or a MAC without coordinator capability,
+   gets `NwkStatus::InvalidRequest`
+2. **ED Scan** — measures energy (noise) on each channel
+3. **Pick quietest channel** — lowest energy = least interference (channel 15
+   if the scan returned nothing)
+4. **Generate PAN ID** — from the platform entropy source
+   (`MacDriver::fill_random`), masked to `0x0000..=0x3FFF`
+5. **Configure MAC** — set short address to 0x0000 (coordinator), set PAN ID,
+   `macRxOnWhenIdle = true`
+6. **Start PAN** — `MLME-START.request` (non-beacon, BO = SO = 15)
+7. **Update NIB** — record channel, PAN ID, address, depth = 0,
+   `nwkUpdateId = 0` (valid); the extended PAN ID is our own IEEE address
 
-After formation, the coordinator opens permit joining so other devices can
-associate.
+After formation, BDB commits the network state and then opens permit joining
+(`bdbcMinCommissioningTime`) so other devices can associate.
 
 ## Routing
 
@@ -236,7 +260,10 @@ destination with no known route.
 ### Tree Routing
 
 Tree routing uses the hierarchical network address space to forward frames
-without a route table.  It's a fallback when mesh routing isn't available:
+without a route table.  `RoutingTable::tree_route` implements the CSkip
+calculation, but the NWK forwarding path does not currently call it (and
+`nib.use_tree_routing` defaults to `false`); Zigbee PRO networks use
+stochastic addressing, where tree routing does not apply:
 
 ```rust,ignore
 // CSkip algorithm determines next hop based on address ranges
@@ -249,8 +276,9 @@ routing.tree_route(
 ) -> Option<ShortAddress>
 ```
 
-If the destination is within our child address range, forward to the appropriate
-child.  Otherwise, forward to our parent.
+If the destination is within our child address range, it returns the
+appropriate child.  Otherwise it returns `None`, meaning "forward to the
+parent".
 
 ### The Route Table
 
@@ -260,6 +288,9 @@ pub struct RoutingTable {
     discoveries: [RouteDiscovery; MAX_ROUTE_DISCOVERIES],  // 8 pending
 }
 ```
+
+Both sizes apply with the `router` feature; a non-routing build sets them to
+`0`, so an end device carries no route or route-discovery table.
 
 Each `RouteEntry` tracks:
 
@@ -294,12 +325,13 @@ Key operations:
 routing.next_hop(destination)                    // Look up next hop
 routing.update_route(destination, next_hop, cost) // Add/update route
 routing.remove(destination)                       // Delete a route
-routing.age_tick()                                // Age all entries
+routing.age_by(elapsed_secs)                      // Age all entries
+routing.expire_stale(max_age)                     // Drop aged-out routes
 routing.mark_discovery(destination)               // Mark as discovering
 ```
 
-When the route table is full, the oldest inactive or highest-cost route is
-evicted.
+When the route table is full, the oldest entry whose status is not `Active`
+is evicted; if every entry is `Active`, `update_route` fails.
 
 ## Neighbor Table
 
@@ -307,7 +339,7 @@ The neighbor table tracks all known nearby devices:
 
 ```rust,ignore
 pub struct NeighborTable {
-    entries: [NeighborEntry; MAX_NEIGHBORS],  // 32 entries
+    entries: [NeighborEntry; MAX_NEIGHBORS],  // 32 (router), 8 otherwise
     count: usize,
 }
 ```
@@ -329,6 +361,11 @@ pub struct NeighborEntry {
     pub permit_joining: bool,           // For routers/coordinators
     pub security_capable: bool,          // Child can authenticate with NWK security
     pub age: u16,                       // Ticks since last heard from
+    pub end_device_timeout: u8,         // Accepted ED timeout enum (children)
+    pub keepalive_remaining_secs: u32,  // Child keepalive deadline
+    pub keepalive_confirmed: bool,      // Child heard from this power cycle
+    #[cfg(feature = "router")]
+    pub parent_annce_pending: bool,     // Still to be named in Parent_annce
     pub extended_pan_id: IeeeAddress,
     pub active: bool,
 }
@@ -430,7 +467,7 @@ only they announce another device's address conflict; a non-routing build keeps
 none of that code. It still detects and resolves a conflict on its *own*
 address, which R22 resolves by rejoining.
 
-[`zigbee_nwk::conflict`]: https://docs.rs/zigbee-nwk
+[`zigbee_nwk::conflict`]: https://github.com/faronov/zigbee-rs/blob/master/zigbee-nwk/src/conflict.rs
 
 ### Table Operations
 
@@ -438,16 +475,17 @@ address, which R22 resolves by rejoining.
 neighbors.find_by_short(addr)     // Look up by NWK address
 neighbors.find_by_ieee(&ieee)     // Look up by IEEE address
 neighbors.parent()                // Get our parent entry
-neighbors.children()              // Iterate over child entries
+neighbors.children()              // Iterate over child entries (incl. unauthenticated)
 neighbors.add_or_update(entry)    // Insert or update
 neighbors.remove(addr)            // Remove by NWK address
 neighbors.age_tick()              // Increment all age counters
 neighbors.iter()                  // Iterate active entries
 ```
 
-**Eviction policy:** When the table is full, the oldest non-parent, non-child
-entry is evicted.  Parents and children are never evicted automatically — this
-ensures the device never loses track of its parent or its children.
+**Eviction policy:** When the table is full, the oldest entry that is not a
+parent, child or unauthenticated child is evicted; if none qualifies,
+`add_or_update` fails.  Parents and children are never evicted automatically —
+this ensures the device never loses track of its parent or its children.
 
 ## NIB — Network Information Base
 
@@ -498,9 +536,10 @@ of the MAC PIB.
 | Field | Type | Description | Default |
 |-------|------|-------------|---------|
 | `security_level` | `u8` | 5 = ENC-MIC-32 | 5 |
-| `security_enabled` | `bool` | NWK encryption on/off | true |
+| `security_enabled` | `bool` | NWK encryption on/off (set once a network key is active) | false |
 | `active_key_seq_number` | `u8` | Active key index | 0 |
 | `outgoing_frame_counter` | `u32` | Outgoing frame counter | 0 |
+| `outgoing_frame_counter_limit` | `u32` | Durably reserved counter limit | 0 |
 
 #### Permit Joining
 
@@ -523,18 +562,21 @@ of the MAC PIB.
 ```rust,ignore
 nib.next_seq()            // Get next NWK sequence number (wrapping)
 nib.next_route_request_id() // Get next route request ID
-nib.next_frame_counter()  // Increment frame counter (returns None if exhausted)
+nib.next_frame_counter()  // Increment frame counter (None at the reservation limit)
+nib.set_frame_counter_reservation(current, limit) // Install a persisted reservation
+nib.nwk_update_id()       // Option<u8> — None while nwkUpdateId is unknown
 
 nib.reset_end_device_timeout_negotiation() // New parent: renegotiate from 14
 nib.restore_end_device_timeout(info, valid, timeout) // Install a persisted result
 nib.end_device_timeout_seconds()           // Enumeration → seconds
 ```
 
-> **Frame counter exhaustion:** The outgoing frame counter is a 32-bit value.
-> If it reaches `u32::MAX`, the device **cannot send any more secured frames**
-> and must perform a key update or factory reset.  In practice this takes
-> billions of frames and is unlikely, but `next_frame_counter()` returns `None`
-> to protect against it.
+> **Frame counter reservation:** `next_frame_counter()` only hands out values
+> below `outgoing_frame_counter_limit`, a limit the runtime reserves durably in
+> NV *before* using it, so a reboot can never reuse a counter.  A fresh NIB has
+> a limit of `0`, so no secured frame can be sent until a reservation is
+> installed; when the limit is reached `next_frame_counter()` returns `None`
+> until the runtime reserves the next block.
 
 ## End Device Timeout (NWK 0x0B / 0x0C)
 
@@ -754,16 +796,21 @@ if let Some(key_entry) = nwk.security().active_key() {
 
 // Look up key by sequence number (for key rotation)
 let key = nwk.security().key_by_seq(1);
+
+// Key rotation: stage a delivered key, activate it on Switch-Key
+nwk.security_mut().stage_network_key(next_key, next_seq);
+nwk.switch_active_network_key(next_seq);
 ```
 
-The security module stores up to 2 keys (current + previous) to support
-seamless key rotation.
+The security module stores up to 2 keys (`MAX_NETWORK_KEYS`: active +
+previous/staged) to support seamless key rotation.
 
 ### Replay Protection
 
 The NWK security module maintains a **frame counter table** that maps each
-sender's IEEE address to the last seen frame counter.  When a secured frame
-arrives:
+sender's IEEE address and network-key sequence to the last seen frame counter
+(64 entries with `router`, 16 otherwise; when full, the least recently updated
+non-parent/non-child source is evicted).  When a secured frame arrives:
 
 1. `check_frame_counter(source, counter)` — verifies the counter is strictly
    greater than the last seen value
@@ -783,12 +830,17 @@ The NWK layer handles the "mesh" in Zigbee mesh networking:
 | Join | MAC association + short address assignment |
 | Form (coordinator) | ED scan + PAN creation |
 | Route (mesh) | AODV on-demand route discovery |
-| Route (tree) | CSkip hierarchical forwarding |
+| Route (tree) | CSkip helper (not used by the forwarding path) |
 | Track neighbors | Neighbor table with LQI-based costs |
 | Encrypt | AES-128-CCM* with network key + frame counter |
 | Prevent replay | Per-sender frame counter tracking |
 
 Most of this happens transparently when you call `device.start()` and run the
 event loop.  The NWK layer's internal state (NIB, neighbor table, routing table,
-security keys) can be inspected for debugging and is automatically persisted
-when you call `device.save_state()`.
+security keys) can be inspected for debugging; the network identity, keys and
+frame counters are persisted through the runtime's crash-safe
+`SecurityStateStore` journal (`start_or_resume_with_security_store()`), and
+router children through the separate child store — see
+[NV storage](../advanced/nv-storage.md).  The older item-by-item
+`device.save_state()` is deprecated and only available with the `legacy-nv`
+feature.

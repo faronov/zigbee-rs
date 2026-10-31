@@ -14,14 +14,15 @@
  *   0x03000-0x04fff  factory data (0x3000 boot/OTA record, 0x4000 BLE
  *                    public address used for the EUI-64) - never written
  *   0x05000-0x100ff  SRAM load data (jump table, run descriptor)
- *   0x10100-0x3ffff  XIP application slot (196352 bytes)
- *   0x40000-0x7dfff  unused; reserved for OTA staging (248 KiB, larger than
+ *   0x10100-0x40fff  XIP application slot (200448 bytes; grown by one
+ *                    4 KiB sector for the shared SoftMacCore MAC)
+ *   0x41000-0x7dfff  unused; reserved for OTA staging (244 KiB, larger than
  *                    the slot so a full image always fits)
  *   0x7e000-0x7ffff  product security journal (two sectors)
  */
 MEMORY
 {
     JUMP_TABLE (rw) : ORIGIN = 0x1fff0000, LENGTH = 0x400
-    FLASH (rx)  : ORIGIN = 0x11010100, LENGTH = 0x2ff00
+    FLASH (rx)  : ORIGIN = 0x11010100, LENGTH = 0x30f00
     RAM   (rwx) : ORIGIN = 0x1fff1838, LENGTH = 0x0e7c8
 }

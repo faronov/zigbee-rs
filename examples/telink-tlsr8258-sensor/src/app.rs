@@ -75,7 +75,9 @@ pub fn run() -> ! {
     let mut ieee_address = [0u8; 8];
     tlsr8258_hal::flash::factory_ieee(&mut ieee_address);
     ieee_address[0] = ieee_address[0].wrapping_add(DEVICE_EUI_OFFSET);
-    let mut mac = TelinkMac::with_extended_address(ieee_address);
+    let Ok(mut mac) = TelinkMac::with_extended_address(ieee_address) else {
+        failure(&leds);
+    };
     if mac.install_aes_engine(resources.aes).is_err() {
         failure(&leds);
     }
@@ -376,7 +378,9 @@ pub fn cold_run() -> ! {
     let mut ieee_address = [0u8; 8];
     tlsr8258_hal::flash::factory_ieee(&mut ieee_address);
     ieee_address[0] = ieee_address[0].wrapping_add(DEVICE_EUI_OFFSET);
-    let mut mac = TelinkMac::with_extended_address(ieee_address);
+    let Ok(mut mac) = TelinkMac::with_extended_address(ieee_address) else {
+        failure(&leds);
+    };
     if mac.install_aes_engine(resources.aes).is_err() {
         failure(&leds);
     }

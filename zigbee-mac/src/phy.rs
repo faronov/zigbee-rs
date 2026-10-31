@@ -76,8 +76,9 @@ pub struct PhyRxFrame {
 }
 
 impl PhyRxFrame {
-    /// An empty frame (used to initialise fixed-capacity queues).
-    pub(crate) const EMPTY: Self = Self {
+    /// An empty frame: initialises fixed-capacity queues and the receive
+    /// buffer of lab code that calls a PHY directly.
+    pub const EMPTY: Self = Self {
         data: [0; MAX_PHY_FRAME_LEN],
         len: 0,
         lqi: 0,
@@ -279,6 +280,14 @@ pub trait RadioPhy {
 
     /// Forget every armed Frame Pending source (MLME-RESET).
     fn clear_ack_frame_pending(&mut self) {}
+
+    /// Follow `macRxOnWhenIdle`: keep the receiver (and its ISR receive /
+    /// auto-ACK path) armed between MAC operations when `enabled`.
+    ///
+    /// Called whenever the PIB attribute changes and with every full
+    /// configuration (construction, reset, [`Self::wake`]). PHYs that only
+    /// receive inside [`Self::receive`] keep the no-op default.
+    fn set_rx_on_when_idle(&mut self, _enabled: bool) {}
 
     /// Put the transceiver into its lowest-power idle state between
     /// sleepy-device poll windows. The next PHY operation, or

@@ -19,7 +19,8 @@ reassembles oversized packages.
 │  ├── aib:       APS information base │
 │  ├── binding:   binding table        │
 │  ├── group:     group table          │
-│  ├── fragment:  reassembly           │
+│  ├── frames:    APS frame codec      │
+│  ├── fragment:  reassembly (+ TX)    │
 │  └── security:  APS encryption       │
 └──────────────┬───────────────────────┘
                │ NLDE-DATA / NLME-*
@@ -132,16 +133,14 @@ let req = ApsdeDataRequest {
     alias_seq: None,
 };
 
-// Send — returns Ok(()) on success
-aps.apsde_data_request(&req).await?;
+// Send — returns Ok(ApsdeDataConfirm) with the APS counter used
+let confirm = aps.apsde_data_request(&req).await?;
 ```
 
 ### Indirect Addressing (via Binding Table)
 
-With indirect addressing you don't specify a destination at all.  Instead the
-APS layer looks up matching entries in the **binding table** and delivers the
-frame to every matching destination.  This is the mode used by Finding &
-Binding (EZ-Mode).
+With indirect addressing you don't specify a destination at all; the
+**binding table** decides where the frame belongs.
 
 ```rust
 let req = ApsdeDataRequest {
@@ -159,9 +158,14 @@ let req = ApsdeDataRequest {
 };
 ```
 
-When this request is processed, the APS layer calls
-`binding_table.find_by_source(our_ieee, src_endpoint, cluster_id)` and sends
-the frame to each destination returned by the iterator.
+`apsde_data_request` only checks that
+`binding_table.find_by_source(our_ieee, src_endpoint, cluster_id)` has at
+least one match (`ApsStatus::NoBoundDevice` otherwise) and then sends a single
+frame with the *indirect* delivery mode to the coordinator (`0x0000`); it does
+not fan the frame out per binding.  Attribute reporting in `zigbee-runtime`
+resolves the bindings itself (`report_destinations` in `event_loop.rs`) and
+sends one direct unicast or group frame per binding entry, falling back to the
+coordinator when no binding exists.
 
 ### Group Addressing (Multicast)
 
@@ -183,7 +187,8 @@ let req = ApsdeDataRequest {
 ### Broadcast
 
 Broadcast is not a separate `ApsAddressMode` variant — you use
-`ApsAddressMode::Short` with one of the well-known broadcast NWK addresses:
+`ApsAddressMode::Short` with one of the well-known broadcast NWK addresses
+(any address `>= 0xFFF8` is sent with the APS broadcast delivery mode):
 
 | Address | Meaning |
 |---|---|
@@ -227,8 +232,13 @@ pub struct ApsTxOptions {
 ```
 
 If `ack_request` is `true`, the APS layer registers the frame in an internal
-ACK-tracking table (up to 8 concurrent pending ACKs) and will retransmit up
-to 3 times if the ACK doesn't arrive.
+ACK-tracking table (8 concurrent pending ACKs with the `router` feature, 4
+otherwise) and will retransmit up to 3 times if the ACK doesn't arrive.
+
+A request with `security_enabled` must be a unicast (group/broadcast frames
+are refused with `SecurityFail`).  A payload larger than `APS_MAX_PAYLOAD`
+(80 bytes) is fragmented only when `fragmentation_permitted` is set; without
+the `fragmentation` feature such a request fails with `AsduTooLong`.
 
 ## The Binding Table
 
@@ -291,8 +301,8 @@ Through the `BindingTable`:
 ```rust
 let table = aps.binding_table_mut();
 
-// Add — returns Err if table full or duplicate
-table.add(entry)?;
+// Add — returns Err(entry) if table full or duplicate
+table.add(entry).ok();
 
 // Remove — returns true if found
 table.remove(&src_addr, src_endpoint, cluster_id, &dst);
@@ -370,8 +380,8 @@ for group in gt.groups() {
 }
 ```
 
-Capacity: up to **`MAX_GROUPS` (16)** groups, each with up to
-**`MAX_ENDPOINTS_PER_GROUP` (8)** endpoints.
+Capacity: up to **`MAX_GROUPS`** groups (16 with the `router` feature, 4
+otherwise), each with up to **`MAX_ENDPOINTS_PER_GROUP` (8)** endpoints.
 
 ### APSME Group Management
 
@@ -394,30 +404,35 @@ let confirm = aps.apsme_remove_group(&ApsmeRemoveGroupRequest {
 
 ## Fragmentation
 
-The APS layer automatically splits large payloads into fragments and
-reassembles them at the receiver.  The `FragmentReassembly` context manages
-up to **4 concurrent reassembly sessions**, each tracking up to 8 blocks via a
-bitmask.
+R22 §2.2.8.4.5 windowed fragmentation (transmit and reassembly of ASDUs up
+to **`APS_MAX_FRAGMENTED_ASDU` = 256 bytes**, at most
+`APS_MAX_FRAGMENT_BLOCKS` = 16 blocks) is compiled in only with the
+`fragmentation` Cargo feature, which `router` enables.  End-device images
+leave it off: `FragmentReassembly` then has no slots, oversized sends fail with
+`AsduTooLong`, and received fragments are dropped (`DEFRAG_UNSUPPORTED`).
 
-You don't call fragmentation directly — it works behind the scenes:
+With the feature, the `FragmentReassembly` context manages **4 concurrent
+reassembly sessions** with `router` (1 otherwise).  You don't call
+fragmentation directly — it works behind the scenes:
 
 1. **Sender side**: When `ApsTxOptions::fragmentation_permitted` is `true` and
-   the payload exceeds the NWK maximum transfer unit, the APS layer splits it
-   into numbered blocks.
+   the payload exceeds `APS_MAX_PAYLOAD` (80 bytes), the APS layer sends it as
+   numbered blocks in windows of `apsMaxWindowSize` (1..=8).
 
-2. **Receiver side**: The `FragmentReassembly` module collects blocks identified
-   by `(src_addr, aps_counter)`.  The first fragment (`block_num == 0`)
-   creates a reassembly slot; subsequent fragments fill in the bitmask.  When
-   all blocks arrive, the complete payload is returned.
+2. **Receiver side**: `FragmentReassembly` stores each block by block number
+   for the session `(src_addr, aps_counter)`, answers with the R22 windowed
+   acknowledgement (block number + ACK bitfield), and delivers the ASDU once
+   every block is present.
 
-3. **Timeout**: Call `fragment_rx_mut().age_entries()` once per second from your
-   event loop.  Incomplete reassemblies are expired after **10 seconds** of
-   inactivity.
+3. **Timeout**: Expiry runs on the platform monotonic clock from
+   `aps.age_dup_table()`: a transaction whose receive window has not moved for
+   `APS_FRAGMENT_RX_TIMEOUT_US` (`apscAckWaitDuration × (1 +
+   apscMaxFrameRetries)` = 6 s) is dropped.  The old
+   `fragment_rx_mut().age_entries()` is a no-op kept for compatibility.
 
 ```rust
-// In your 1-second tick handler:
-aps.fragment_rx_mut().age_entries();
-aps.age_dup_table();
+// In your periodic tick handler:
+aps.age_dup_table(); // also expires stale reassembly sessions
 ```
 
 ### Fragment API (Advanced)
@@ -427,18 +442,26 @@ If you need to inspect reassembly state:
 ```rust
 let frag = aps.fragment_rx_mut();
 
-// Insert a fragment — returns Some(&[u8]) when complete
-if let Some(full_payload) = frag.insert_fragment(
+// Offer one block; the outcome carries the windowed ACK to send
+match frag.insert_block(
+    now_us,          // platform monotonic time
+    window_size,     // apsMaxWindowSize
     src_addr,        // sender short addr
+    src_ieee,        // Option<IeeeAddress>
     aps_counter,     // APS counter
-    block_num,       // 0 for first fragment
-    total_blocks,    // total blocks (first frag only)
+    fragmentation,   // FRAG_FIRST / FRAG_SUBSEQUENT sub-field
+    block_field,     // block count (first) or block number (subsequent)
     &fragment_data,
 ) {
-    // Process the reassembled payload
-    process(full_payload);
-    // Free the slot
-    frag.complete_entry(src_addr, aps_counter);
+    FragmentOutcome::Complete { ack } => {
+        let mut asdu = [0u8; APS_MAX_FRAGMENTED_ASDU];
+        if let Some(len) = frag.take_reassembled(src_addr, src_ieee, aps_counter, &mut asdu) {
+            process(&asdu[..len]);
+            frag.finalize_delivered(); // free delivered sessions
+        }
+    }
+    FragmentOutcome::Pending { ack, .. } => { /* send ack if Some */ }
+    FragmentOutcome::Rejected => { /* drop without acknowledging */ }
 }
 ```
 
@@ -466,7 +489,9 @@ commands. A distributed-security global link key is separate provisioned
 configuration used to derive the initial Key-Transport key; it is never added
 to the APS key table as a fifth `ApsKeyType`.
 
-The **well-known default TC link key** is the ASCII string `"ZigBeeAlliance09"`:
+The **well-known default TC link key** is the ASCII string `"ZigBeeAlliance09"`
+(preloaded by `ApsSecurity::new()`; replace it with
+`set_default_tc_link_key()`):
 
 ```rust
 pub const DEFAULT_TC_LINK_KEY: [u8; 16] = [
@@ -492,33 +517,38 @@ must not be shipped as a production credential.
 ### Link Key Table
 
 The `ApsSecurity` struct maintains a table of up to
-**`MAX_KEY_TABLE_ENTRIES` (16)** link keys:
+**`MAX_KEY_TABLE_ENTRIES`** link keys (16, or 32 with the `trust-center`
+feature):
 
 ```rust
 pub struct ApsLinkKeyEntry {
     pub partner_address: IeeeAddress,
-    pub key: [u8; 16],
+    pub key: AesKey,                        // [u8; 16]
     pub key_type: ApsKeyType,
     pub outgoing_frame_counter: u32,
+    pub outgoing_frame_counter_limit: u32,  // durably reserved upper bound
     pub incoming_frame_counter: u32,
+    pub incoming_frame_counter_valid: bool,
 }
 ```
 
 Each entry pairs a partner's IEEE address with a 128-bit AES key and
-independent frame counters for replay protection.
+independent frame counters for replay protection.  Outgoing counters are
+handed out only below the durably reserved `outgoing_frame_counter_limit`.
 
 #### Replay windows belong to the key, not to the peer
 
 R22 §4.4.1 scopes APS security state to a *key-pair entry* — the
 (partner address, key type) pair — so a partner that holds both a Trust Center
 link key and an application link key owns **two** independent counter spaces.
-`ApsKeyOrigin` names that entry (or `PreconfiguredGlobal` for the well-known
-global key, which has no entry and therefore no committed counter):
+`ApsKeyOrigin` names that entry (or one of the two preconfigured global keys,
+which have no entry and therefore no per-partner counter):
 
 ```rust
 pub enum ApsKeyOrigin {
     KeyPair { partner: IeeeAddress, key_type: ApsKeyType },
-    PreconfiguredGlobal,
+    PreconfiguredGlobal,  // centralized well-known TC link key
+    DistributedGlobal,    // distributed-security global link key
 }
 ```
 
@@ -533,12 +563,15 @@ counter to the entry whose MIC actually verified
 ### Key Management Primitives
 
 ```rust
-// Distribute a key to another device
+// Distribute a key to another device (each primitive returns an ApsStatus)
 aps.apsme_transport_key(&ApsmeTransportKeyRequest {
     dst_address: remote_ieee,
     key_type: ApsKeyType::ApplicationLinkKey,
     key: my_app_key,
     key_seq_number: 0, // used only for NetworkKey
+    // Durable outgoing-counter reservation for a transported link key;
+    // None for NetworkKey
+    link_key_counter_reservation: Some(reservation),
 }).await;
 
 // Request a key from the Trust Center
@@ -644,19 +677,22 @@ Every APS operation returns an `ApsStatus` code:
 
 ## Duplicate Rejection
 
-The APS layer maintains a **duplicate rejection table** (16 entries) that
-remembers recently seen `(src_addr, aps_counter)` pairs.  This prevents
-delivering the same frame twice when NWK-level retransmission is active.
+The APS layer maintains a **duplicate rejection table** (16 entries with the
+`router` feature, 4 otherwise) that remembers recently seen
+`(src_addr, aps_counter)` pairs with the monotonic time they were accepted.
+This prevents delivering the same frame twice when NWK-level retransmission is
+active.
 
-Call `aps.age_dup_table()` periodically (every ~1 second) to expire stale
-entries.  The timeout is controlled by `aib.aps_duplicate_rejection_timeout`
-(default: 3000 ms).
+Entries expire after `aib.aps_duplicate_rejection_timeout` (default: 3000 ms)
+of the platform monotonic clock, independent of how often you call
+`aps.age_dup_table()`; calling it periodically only reclaims slots early.
 
 ## ACK Tracking and Retransmission
 
 When you send with `ack_request: true`, the APS layer:
 
-1. Registers the frame in the ACK table (up to 8 slots), stamping it with the
+1. Registers the frame in the ACK table (8 slots with `router`, 4 otherwise),
+   stamping it with the
    monotonic time of the transmission
 2. Starts a retry counter (default: 3 retries)
 3. Retransmits the frame once a full `apscAckWaitDuration` has
@@ -793,8 +829,9 @@ Here's a complete example of an APS-layer interaction in a typical Zigbee
 application:
 
 ```rust
-// 1. Set up security
-aps.security_mut().install_default_tc_link_key();
+// 1. Set up security — the well-known TC link key is preloaded; override it
+//    only if your product uses a different preconfigured key
+aps.security_mut().set_default_tc_link_key(DEFAULT_TC_LINK_KEY);
 
 // 2. Join a network (handled by BDB steering, but conceptually:)
 //    ... network steering happens ...
@@ -807,6 +844,7 @@ let entry = BindingEntry::unicast(
 aps.binding_table_mut().add(entry).unwrap();
 
 // 4. Send a temperature report via indirect addressing
+//    (the runtime's reporting instead resolves each binding to a direct send)
 let report_payload = build_zcl_report(temperature);
 let req = ApsdeDataRequest {
     dst_addr_mode: ApsAddressMode::Indirect,
@@ -826,9 +864,8 @@ let req = ApsdeDataRequest {
 };
 aps.apsde_data_request(&req).await?;
 
-// 5. Periodic maintenance (call every ~1 second)
+// 5. Periodic maintenance (timing uses the monotonic clock, not call count)
 aps.age_dup_table();
-aps.fragment_rx_mut().age_entries();
 let retx = aps.age_ack_table();
 ```
 
@@ -840,7 +877,8 @@ The APS layer is the workhorse of the Zigbee application stack:
   broadcast messages.
 - **The binding table** powers indirect addressing and Finding & Binding.
 - **The group table** enables room-level multicast.
-- **Fragmentation** transparently handles large payloads.
+- **Fragmentation** (`fragmentation` feature) transparently handles payloads
+  up to 256 bytes.
 - **APS security** provides end-to-end link-key encryption.
 - **ACK tracking** and **duplicate rejection** ensure reliable delivery.
 

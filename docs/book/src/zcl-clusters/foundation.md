@@ -79,7 +79,7 @@ let response = process_read_dyn(cluster.attributes(), &request);
 
 Each `ReadAttributeRecord` in the response contains:
 - `id` — the attribute ID that was requested
-- `status` — `Success`, `UnsupportedAttribute`, or `WriteOnly`
+- `status` — `Success`, `UnsupportedAttribute`, `WriteOnly`, or `Failure` (defined but no value stored)
 - `data_type` / `value` — present only when `status == Success`
 
 ---
@@ -96,7 +96,14 @@ let resp = process_write_dyn(cluster.attributes_mut(), &req);
 // resp.records: Vec<WriteAttributeStatusRecord, 16>
 ```
 
-**Write Attributes Undivided** (0x03) provides all-or-nothing semantics — if any single attribute write would fail, none are applied:
+`parse()` returns `None` if any record uses a disabled/unsupported data type.
+The runtime instead uses `WriteAttributesRequest::parse_checked()`, which
+returns a `WriteAttributesParseOutcome` holding the decodable records plus
+per-record `INVALID_DATA_TYPE` / `INVALID_VALUE` failures; these are merged back
+in request order with `merge_in_request_order()`. An empty payload is rejected
+as malformed.
+
+**Write Attributes Undivided** (0x03) provides all-or-nothing semantics — every record is first preflighted with `validate_write_undivided_dyn()` (via `AttributeStoreMutAccess::validate_set()`); if any single attribute write would fail, none are applied:
 
 ```rust
 let resp = process_write_undivided_dyn(cluster.attributes_mut(), &req);
@@ -124,6 +131,10 @@ for config in &req.configs {
     engine.configure_for_cluster(endpoint, cluster_id, config.clone())?;
 }
 ```
+
+The engine holds up to `MAX_REPORT_CONFIGS` entries across all endpoints and
+clusters: 16 by default, 8 with the `constrained-memory` feature, 4 with
+`compact-single-endpoint`.
 
 Each `ReportingConfig` contains:
 
@@ -158,7 +169,7 @@ request rather than returning only its valid prefix.
 
 `zigbee-runtime` additionally records which `(endpoint, cluster)` pairs a
 **remote** client configured, in
-[`remote_reporting`](https://docs.rs/zigbee-runtime) — separate from the
+[`remote_reporting`](https://github.com/faronov/zigbee-rs/blob/master/zigbee-runtime/src/remote_reporting.rs) — separate from the
 `ReportingEngine`, which also holds the product's own default configurations.
 A cluster is recorded only when the whole command was well formed *and every
 record returned `SUCCESS`*, the command was non-empty, and every record used
@@ -268,16 +279,17 @@ let resp = process_discover_commands(
 
 You almost never handle foundation commands yourself. The zigbee-rs runtime:
 
-1. **Parses** the incoming ZCL frame and checks `frame_control.frame_type`
-2. **Foundation frames** (frame_type = 0b00) are dispatched to the appropriate handler:
+1. **Parses** the incoming ZCL frame (`ZclFrame::parse`) and checks `header.frame_type()`
+2. **Foundation frames** (`ZclFrameType::Global`, 0b00) are dispatched to the appropriate handler:
    - Read Attributes → `process_read_dyn()`
    - Write Attributes → `process_write_dyn()` or `process_write_undivided_dyn()`
    - Configure Reporting → `ReportingEngine::configure_for_cluster()`
    - Discover → `process_discover_dyn()` / `process_discover_extended_dyn()`
-3. **Cluster-specific frames** (frame_type = 0b01) are dispatched to your cluster's `handle_command()`
+3. **Cluster-specific frames** (`ZclFrameType::ClusterSpecific`, 0b01) are dispatched to your cluster's `handle_command_from()`, whose default implementation forwards to `handle_command()`
 4. **Reporting** is driven by the event loop calling `engine.tick()` + `check_and_collect_dyn()` periodically
 
 This means your `Cluster` implementation only needs to:
 - Register attributes with correct `AttributeAccess` modes
 - Implement `handle_command()` for cluster-specific commands
 - Implement `received_commands()` / `generated_commands()` for discovery
+- Implement `reset_to_factory_defaults()` (required; used by Basic `ResetToFactoryDefaults`)

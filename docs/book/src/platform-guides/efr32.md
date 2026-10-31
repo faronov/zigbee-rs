@@ -65,20 +65,20 @@ The product linker layout preserves bootloader, application, generic NV, and
 security regions. The usable SRAM region is exactly `0x7C00` bytes. It is not
 the nominal rounded 32 KiB total.
 
-Recorded measurement (2026-09-08):
+Recorded measurement (2026-10-31, local build of `7d45e7e`):
 
 | value | bytes |
 |---|---:|
-| raw image | 163,236 |
+| raw image | 171,792 |
 | former regression budget (not enforced) | 167,936 |
-| `.data` | 260 |
-| `.bss` | 14,720 |
-| static total | 14,980 |
-| available linked stack | 16,760 |
+| `.data` | 288 |
+| `.bss` | 15,056 |
+| static total | 15,344 |
+| available linked stack | 16,400 |
 
 The former image-size budget is no longer enforced; physical Flash/RAM,
 protected-partition, OTA, and stack checks remain mandatory.
-The stack has 376 B above the 16 KiB gate. The previous 162,538 B Zigbee OTA
+The stack has only 16 B above the 16 KiB gate. The previous 162,538 B Zigbee OTA
 container has not been regenerated for this image. OTA packaging assumes
 the resident Gecko bootloader.
 
@@ -157,12 +157,12 @@ Recorded release measurement:
 
 | value | bytes |
 |---|---:|
-| raw image | 202,820 |
+| raw image | 209,028 |
 | former regression budget (not enforced) | 212,992 |
-| `.data` | 308 |
-| `.bss` | 18,280 |
-| static total | 18,588 |
-| available linked stack | 46,944 |
+| `.data` | 316 |
+| `.bss` | 18,888 |
+| static total | 19,204 |
+| available linked stack | 46,328 |
 
 Physical application, persistence, RAM, and stack checks remain mandatory.
 There is no EFR32MG21 OTA packaging path.

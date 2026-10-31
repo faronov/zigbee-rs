@@ -142,7 +142,9 @@ let events = end_device.step().await?;
 advertises `DeviceType::Router` requires both the `router` feature and
 `ParentMacDriver`; a backend without parent-side association and
 indirect-delivery primitives cannot construct one. Of the in-tree MACs, only
-the real Telink TLSR8258 backend and host-only `MockMac` implement
+the legacy Telink `TelinkRouterMac` (zigbee-mac feature
+`telink-legacy-router`), the shared `SoftMacCore<_, Parent<..>>` (host-tested;
+no shipped image uses it yet) and host-only `MockMac` implement
 `ParentMacDriver`. Telink advertises router capability but not coordinator
 capability. No production backend advertises Coordinator or Trust-Center
 server support, so coordinator composition remains mock-only.
@@ -226,23 +228,22 @@ sensor or router behavior is moved to a new MCU.
 it is not a hardware claim. Image measurements, which are build/layout-tested
 only, are maintained on the book's
 [Firmware Size](docs/book/src/advanced/firmware-size.md) page. Hardware evidence in the last column is prior
-path-level evidence unless an exact-image rerun is explicitly named; this
-worktree records no such rerun for the current byte-for-byte images.
+path-level evidence unless the row names the current MAC or image.
 
 | target | role/application | build | hardware validation |
 |---|---|---:|---|
-| nRF52840 DK | environmental sleepy End Device | yes | prior path evidence covers commissioning, reporting, AES, persistence, and reset/resume |
-| nRF52833 DK | environmental sleepy End Device | yes | prior path evidence covers commissioning, reporting, AES, persistence, and reset/resume |
+| nRF52840 DK | environmental sleepy End Device | yes | prior evidence (deleted `NrfMac`) covers commissioning, reporting, AES, persistence, and reset/resume; the current `SoftMacCore` image has no hardware run |
+| nRF52833 DK | environmental sleepy End Device | yes | prior evidence (deleted `NrfMac`) covers commissioning, reporting, AES, persistence, and reset/resume; the current `SoftMacCore` image has no hardware run |
 | nRF52840 DK | always-on End Device | yes | commissioning/resume and continuous-RX HIL remain open |
 | ESP32-C6 | environmental sleepy End Device + OTA | yes | prior C6 evidence covers commissioning/reporting and OTA to 18.3%; complete activation remains open |
 | ESP32-H2 | environmental sleepy End Device + OTA | yes | prior H2 evidence covers v1→v2 activation, reboot, and retained commissioned state |
-| BL702 XT-ZB1 | environmental sleepy End Device | yes | prior path evidence covers radio/commissioning/interview; destructive flash persistence remains open |
-| PHY6222/PHY6252 EVK | environmental sleepy End Device | yes | PHY6222 occupies 132,576 B and PHY6252 132,544 B of the 187,104 B XIP slot (ends below the PHY6252 security partition at 0x3E000); the radio driver is shared with the hardware-proven PB-03F-Kit, but the EVK image itself remains hardware-unverified |
+| BL702 XT-ZB1 | environmental sleepy End Device + OTA | yes | on `SoftMacCore`: commissioning/interview, journal reset/resume, Idle sleep, and a signed 0.1.0→0.1.1 OTA with loader install and retained network on one board; power-loss recovery remains open |
+| PHY6222/PHY6252 EVK | environmental sleepy End Device | yes | both variants occupy 138,624 B of the 187,104 B XIP slot (ends below the PHY6252 security partition at 0x3E000); the radio driver is shared with the hardware-proven PB-03F-Kit, but the EVK image itself remains hardware-unverified |
 | PB-03F-Kit (PHY6252) | End Device, synthetic environmental series | yes | ROM boot, radio, association, secured commissioning, ZHA interview/reporting and reset/resume observed on hardware with a sniffer; AON sleep, power-loss and OTA remain open |
-| CC2340R5 | environmental sleepy End Device | yes | pinned-SDK and fallback compile/link paths pass; one board joined ZHA over HIL; MAC ACK timing and entropy remain open |
+| CC2340R5 | environmental sleepy End Device | yes | pinned-SDK and fallback compile/link paths pass; one board joined ZHA with hardware auto-ACK and reached ~5.6 µA mean in standby; entropy (commissioning not claimed), TX power accuracy and persistence remain open |
 | EFR32MG1P TRÅDFRI | environmental sleepy End Device | yes | prior path evidence covers commissioning through EM2; real OTA install remains open |
 | EFR32MG21 BRD4181A | environmental sleepy End Device | yes | complete hardware path remains HIL-unverified |
-| TLSR8258 TB-04 | environmental sleepy End Device | yes | prior evidence covers the SUSPEND primitive; repeated application/network acceptance remains open |
+| TLSR8258 TB-04 | environmental sleepy End Device | yes | prior evidence (hand-written MAC) covers the SUSPEND primitive; the current `SoftMacCore` image and repeated application/network acceptance remain open |
 | TLSR8258 TB-04 | child-capable router | yes | prior evidence covers join/restart/Link Status/relay; corrected-image child acceptance remains open |
 
 See [BUILD.md](BUILD.md) for pinned commands, partition boundaries, and exact

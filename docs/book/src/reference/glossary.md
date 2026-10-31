@@ -21,20 +21,23 @@ Zigbee and IEEE 802.15.4 terminology used throughout zigbee-rs.
 | **IEEE Address** | The globally unique 64-bit hardware address of a Zigbee device (also called the EUI-64 or extended address). Used during joining and for link-key establishment. |
 | **Install Code** | A per-device secret (typically printed on the device or packaging) used to derive a unique link key during commissioning. Provides out-of-band security for Trust Center joining. |
 | **Link Key** | A 128-bit AES key shared between two specific devices for APS-level encryption. Can be derived from an install code or provisioned by the Trust Center. |
-| **MAC** | Medium Access Control. The lowest layer in zigbee-rs, responsible for frame formatting, CSMA-CA channel access, acknowledgements, and scanning. Implemented in the `zigbee-mac` crate with per-platform radio backends. |
+| **MAC** | Medium Access Control. The lowest layer in zigbee-rs, responsible for frame formatting, CSMA-CA channel access, acknowledgements, and scanning. Implemented in the `zigbee-mac` crate behind the `MacDriver` trait, either by the shared `SoftMacCore` over a chip `RadioPhy` or by a hand-written per-platform backend. |
 | **Network Key** | A 128-bit AES key shared by all devices in the Zigbee network. Provides NWK-layer encryption and is distributed (encrypted) by the Trust Center. |
-| **NIB** | NWK Information Base. A set of attributes maintained by the NWK layer (e.g. short address, PAN ID, security material). Accessed via `NwkGet` / `NwkSet` primitives. |
+| **NIB** | NWK Information Base. A set of attributes maintained by the NWK layer (e.g. short address, PAN ID, security material). Accessed through `NwkLayer::nib()` / `nib_mut()`. |
 | **NWK** | Network layer. Handles mesh routing, 16-bit address assignment, broadcast, and network-level security. Implemented in the `zigbee-nwk` crate. |
 | **OTA** | Over-The-Air upgrade. A ZCL cluster (0x0019) that allows firmware images to be distributed wirelessly. Parsed by `zigbee-zcl` and applied via `zigbee-runtime`'s firmware writer. |
 | **PAN** | Personal Area Network. The logical Zigbee network formed by a coordinator and all devices that have joined it. |
 | **PAN ID** | A 16-bit identifier for a PAN, used in MAC frame headers to distinguish traffic from overlapping networks. |
+| **ParentMacDriver** | Sealed `zigbee-mac` marker trait asserting that a MAC backend really implements the parent primitives (beacon/association/orphan responses, indirect frame-pending). Required to build a router or coordinator. |
 | **PIB** | PAN Information Base. A set of MAC-layer attributes (e.g. current channel, short address, frame counter) defined by IEEE 802.15.4. |
 | **Poll Control** | A ZCL cluster (0x0020) that lets a server manage when a sleepy end device polls its parent. Useful for battery-powered devices that need timely command delivery. |
 | **Profile** | A Zigbee application profile defining which clusters a device type must support. Zigbee 3.0 uses a single unified profile (HA profile `0x0104`). |
+| **RadioPhy** | The thin chip-specific radio trait in `zigbee-mac` (`phy.rs`): transmit, receive, ACK, channel, power, energy detect and address filter. `SoftMacCore` builds the full MAC on top of it. |
 | **RFD** | Reduced-Function Device. An IEEE 802.15.4 device that cannot route or act as a coordinator — it can only be an end device. |
 | **Router** | A Zigbee device that participates in mesh routing, relays frames for other devices, and can allow new devices to join through it. Routers are always powered on. |
 | **SED (Sleepy End Device)** | An end device that spends most of its time asleep to conserve battery. It wakes periodically to poll its parent for pending messages. |
 | **Short Address** | A 16-bit network address assigned to a device when it joins the network. Used in NWK and MAC frame headers for compact addressing. |
+| **SoftMacCore** | The shared portable 802.15.4 MAC in `zigbee-mac` (`soft_mac.rs`) that implements `MacDriver` once over any `RadioPhy`, with an end-device role and an optional `Parent<..>` role. |
 | **Steering** | The BDB commissioning step where a device scans for open networks, joins one, and authenticates with the Trust Center. |
 | **Touchlink** | A proximity-based commissioning mechanism (BDB chapter 8). A device physically close to a Touchlink initiator can be commissioned without an existing network. |
 | **Trust Center** | The device (usually the coordinator) responsible for network security policy: distributing the network key, authorising joins, and managing link keys. |

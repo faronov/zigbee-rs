@@ -836,6 +836,25 @@ impl Radio {
         hw::send_mac_frame(frame)
     }
 
+    /// Unslotted CSMA-CA with `csma`, one transmission and, when
+    /// `ack_wait_ticks` is non-zero, a wait for the Imm-Ack matching the
+    /// frame's sequence number.
+    ///
+    /// Returns `Ok(Some(frame_pending))` for the matching ACK and `Ok(None)`
+    /// for a sent frame without an ACK wait or without an ACK in the window.
+    /// Every other valid frame heard during the backoff or the ACK window is
+    /// queued (and ISR-path ACKed) for the next receive window. `Err` is never
+    /// [`TxOutcome::Sent`].
+    #[cfg(target_arch = "tc32")]
+    pub fn transmit_csma(
+        &mut self,
+        frame: &[u8],
+        csma: CsmaParams,
+        ack_wait_ticks: u32,
+    ) -> Result<Option<bool>, TxOutcome> {
+        hw::send_mac_frame_csma(frame, csma, ack_wait_ticks)
+    }
+
     #[cfg(target_arch = "tc32")]
     pub fn receive_raw_for(
         &mut self,
@@ -1522,9 +1541,24 @@ mod hw {
     const CCA_RX_SETTLE_TICKS: u32 = timer::TICKS_PER_MS * 128 / 1_000;
     const CCA_SAMPLE_TICKS: u32 = timer::TICKS_PER_MS * 128 / 1_000;
     const UNIT_BACKOFF_TICKS: u32 = timer::TICKS_PER_MS * 320 / 1_000;
-    const MAC_MIN_BE: u8 = 3;
-    const MAC_MAX_BE: u8 = 5;
-    const MAC_MAX_CSMA_BACKOFFS: u8 = 4;
+    /// Unslotted CSMA-CA parameters (`macMinBE`, `macMaxBE`,
+    /// `macMaxCSMABackoffs`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CsmaParams {
+        pub min_be: u8,
+        pub max_be: u8,
+        pub max_backoffs: u8,
+    }
+
+    impl CsmaParams {
+        /// IEEE 802.15.4 defaults: macMinBE 3, macMaxBE 5,
+        /// macMaxCSMABackoffs 4.
+        pub const DEFAULT: Self = Self {
+            min_be: 3,
+            max_be: 5,
+            max_backoffs: 4,
+        };
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TxOutcome {
@@ -1730,24 +1764,38 @@ mod hw {
     /// generous margin without ever blocking indefinitely.
     pub const TX_TIMEOUT_TICKS: u32 = timer::TICKS_PER_MS * 5;
 
+    /// Transmit after the HAL's complete unslotted CSMA-CA procedure with
+    /// the IEEE 802.15.4 default parameters, without an ACK wait.
     pub fn send_mac_frame(mac_frame: &[u8]) -> TxOutcome {
-        if mac_frame.len() > MAX_MAC_FRAME_LEN {
-            return TxOutcome::InvalidFrame;
+        match send_mac_frame_csma(mac_frame, CsmaParams::DEFAULT, 0) {
+            Ok(_) => TxOutcome::Sent,
+            Err(outcome) => outcome,
+        }
+    }
+
+    /// See [`super::Radio::transmit_csma`].
+    pub fn send_mac_frame_csma(
+        mac_frame: &[u8],
+        csma: CsmaParams,
+        ack_wait_ticks: u32,
+    ) -> Result<Option<bool>, TxOutcome> {
+        if mac_frame.len() > MAX_MAC_FRAME_LEN || (ack_wait_ticks != 0 && mac_frame.len() < 3) {
+            return Err(TxOutcome::InvalidFrame);
         }
         let tx_ptr = core::ptr::addr_of_mut!(RF_TX_BUF) as *mut u8;
         let tx_slice = unsafe { core::slice::from_raw_parts_mut(tx_ptr, DMA_BUF_LEN) };
         // This call must execute in release builds: putting it inside
         // debug_assert! would remove the DMA-buffer write entirely.
         if frame::encode_tx_dma(tx_slice, mac_frame).is_err() {
-            return TxOutcome::InvalidFrame;
+            return Err(TxOutcome::InvalidFrame);
         }
         compiler_fence(Ordering::Release);
 
         let restore_rx = begin_radio_operation();
         set_rx_armed_after_tx(false);
-        if !perform_csma_ca() {
+        if !perform_csma_ca(csma) {
             end_radio_operation(restore_rx);
-            return TxOutcome::ChannelAccessFailure;
+            return Err(TxOutcome::ChannelAccessFailure);
         }
 
         let rx_ptr = active_rx_ptr();
@@ -1776,13 +1824,46 @@ mod hw {
             phy::set_trx_off();
             set_rx_armed(false);
         }
-        let outcome = if ok {
-            TxOutcome::Sent
+        let outcome = if !ok {
+            Err(TxOutcome::Timeout)
+        } else if ack_wait_ticks == 0 {
+            Ok(None)
         } else {
-            TxOutcome::Timeout
+            let ack = wait_for_ack(mac_frame[2], ack_wait_ticks);
+            if super::idle_rx_state(restore_rx) == super::IdleRxState::Off {
+                phy::set_trx_off();
+                set_rx_armed(false);
+                set_rx_armed_after_tx(false);
+            }
+            Ok(ack)
         };
         end_radio_operation(restore_rx);
         outcome
+    }
+
+    /// Poll RX completions for up to `timeout_ticks` until the Imm-Ack with
+    /// `sequence` arrives. Other valid non-ACK frames go to the IRQ RX queue
+    /// for the next receive window; foreign ACKs are dropped.
+    fn wait_for_ack(sequence: u8, timeout_ticks: u32) -> Option<bool> {
+        let start = timer::now_ticks();
+        loop {
+            if phy::rx_done()
+                && let RawRxOutcome::Frame(frame) = take_completed_rx()
+            {
+                let data = frame.as_slice();
+                if data.len() >= 3 && data[0] & 0x07 == 0x02 {
+                    if data[2] == sequence {
+                        return Some(data[0] & (1 << 4) != 0);
+                    }
+                } else {
+                    push_irq_rx(frame);
+                }
+            }
+            if timer::now_ticks().wrapping_sub(start) >= timeout_ticks {
+                return None;
+            }
+            unsafe { core::arch::asm!("nop") };
+        }
     }
 
     /// Encode and transmit a Beacon Request with the given sequence number.
@@ -2246,9 +2327,9 @@ mod hw {
         counters
     }
 
-    fn perform_csma_ca() -> bool {
+    fn perform_csma_ca(csma: CsmaParams) -> bool {
         let mut backoffs = 0u8;
-        let mut backoff_exponent = MAC_MIN_BE;
+        let mut backoff_exponent = csma.min_be;
 
         loop {
             let slots = next_random() & ((1u32 << backoff_exponent) - 1);
@@ -2265,14 +2346,14 @@ mod hw {
             {
                 increment_counter(core::ptr::addr_of_mut!(CCA_BUSY_COUNT));
                 backoffs = backoffs.saturating_add(1);
-                if backoffs > MAC_MAX_CSMA_BACKOFFS {
+                if backoffs > csma.max_backoffs {
                     increment_counter(core::ptr::addr_of_mut!(CHANNEL_ACCESS_FAILURE_COUNT));
                     phy::set_trx_off();
                     set_rx_armed(false);
                     phy::rx_done_clear();
                     return false;
                 }
-                backoff_exponent = backoff_exponent.saturating_add(1).min(MAC_MAX_BE);
+                backoff_exponent = backoff_exponent.saturating_add(1).min(csma.max_be);
                 continue;
             }
 
@@ -2286,14 +2367,14 @@ mod hw {
 
             increment_counter(core::ptr::addr_of_mut!(CCA_BUSY_COUNT));
             backoffs = backoffs.saturating_add(1);
-            if backoffs > MAC_MAX_CSMA_BACKOFFS {
+            if backoffs > csma.max_backoffs {
                 increment_counter(core::ptr::addr_of_mut!(CHANNEL_ACCESS_FAILURE_COUNT));
                 phy::set_trx_off();
                 set_rx_armed(false);
                 phy::rx_done_clear();
                 return false;
             }
-            backoff_exponent = backoff_exponent.saturating_add(1).min(MAC_MAX_BE);
+            backoff_exponent = backoff_exponent.saturating_add(1).min(csma.max_be);
         }
     }
 
@@ -2572,7 +2653,7 @@ mod hw {
 
 #[cfg(target_arch = "tc32")]
 pub use hw::{
-    CsmaStats, RX_WINDOW_TICKS, RxOutcome, TX_TIMEOUT_TICKS, TxOutcome, csma_stats,
+    CsmaParams, CsmaStats, RX_WINDOW_TICKS, RxOutcome, TX_TIMEOUT_TICKS, TxOutcome, csma_stats,
     dma_buffers_aligned, handle_irq, init, rx_diagnostics, rx_raw_window_for, rx_window,
     rx_window_for, send_beacon_request, send_mac_frame, set_ack_filter, set_channel,
     software_ack_stats,
