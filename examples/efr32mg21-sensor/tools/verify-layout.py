@@ -12,7 +12,8 @@ PERSISTENCE_END = 0x00080000
 RAM_START = 0x20000000
 RAM_END = 0x20010000
 MIN_STACK_BYTES = 16 * 1024
-EXPECTED_VECTOR_BYTES = (16 + 51) * 4
+# xG21: 61 external IRQs (EXT_IRQ_COUNT in GSDK efr32mg21*.h).
+EXPECTED_VECTOR_BYTES = (16 + 61) * 4
 
 PT_LOAD = 1
 SHT_SYMTAB = 2
@@ -124,7 +125,7 @@ def main() -> None:
         or vector["address"] != FLASH_START
         or vector["size"] < EXPECTED_VECTOR_BYTES
     ):
-        fail("51-IRQ vector table is not present at 0x00004000")
+        fail("61-IRQ vector table is not present at 0x00004000")
     vector_data = checked_slice(data, vector["offset"], vector["size"], "vector table")
     initial_sp, reset_vector = struct.unpack_from("<II", vector_data)
 
@@ -166,8 +167,9 @@ def main() -> None:
     if reset & 1 == 0 or not (FLASH_START <= (reset & ~1) < FLASH_END):
         fail(f"invalid Thumb reset vector 0x{reset:08X}")
     require_handler(3, "HardFault")
-    require_handler(16 + 3, "GPIO_EVEN")
-    require_handler(16 + 36, "FRC_PRI")
+    # xG21 IRQ numbers: RTCC 10 (time driver), RAC_RSM 37 (radio).
+    require_handler(16 + 10, "RTCC")
+    require_handler(16 + 37, "RAC_RSM")
 
     load_ranges = []
     bss_bytes = 0
