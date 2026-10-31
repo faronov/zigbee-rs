@@ -58,6 +58,20 @@ pub const MAX_PSDU: usize = 127;
 /// Maximum frame length handed to [`Radio::transmit`] (FCS added by FRC).
 pub const MAX_FRAME: usize = MAX_PSDU - 2;
 
+/// Calibrated transmit-power range of this chip in whole dBm `(min, max)`;
+/// `(0, 0)` when the chip has no validated PA table.
+pub const TX_POWER_RANGE_DBM: (i8, i8) = {
+    let table = chip::TX_POWER;
+    if table.is_empty() {
+        (0, 0)
+    } else {
+        (
+            (table[0].0 / 10) as i8,
+            (table[table.len() - 1].0 / 10) as i8,
+        )
+    }
+};
+
 /// Default clear-channel threshold (IEEE 802.15.4 ED mode; RAIL default).
 pub const DEFAULT_CCA_THRESHOLD_DBM: i8 = -75;
 /// Chip RSSI adjustment added to the AGC reading (see `chip::RSSI_ADJUST_DBM`).
@@ -1205,6 +1219,14 @@ mod tests {
         assert_eq!(synth_freq(10), None);
         assert_eq!(synth_freq(27), None);
         assert!(synth_freq(26).unwrap() > synth_freq(11).unwrap());
+    }
+
+    #[test]
+    fn tx_power_range_follows_the_pa_table() {
+        #[cfg(feature = "efr32mg22")]
+        assert_eq!(TX_POWER_RANGE_DBM, (-25, 6));
+        #[cfg(feature = "efr32mg21")]
+        assert_eq!(TX_POWER_RANGE_DBM, (0, 0));
     }
 
     #[test]
