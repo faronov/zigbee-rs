@@ -662,6 +662,10 @@ impl Radio {
         if frame.len() > MAX_FRAME {
             return Err(RadioError::FrameTooLong);
         }
+        // Nothing drains the RX buffer while the MAC waits before a TX
+        // (e.g. RREQ relay jitter). A receiver left in RXOVERFLOW has no
+        // valid RSSI, so CCA would report a busy channel indefinitely.
+        self.service_overflow();
         self.rx_on()?;
         if !self.cca()? {
             return Err(RadioError::ChannelBusy);

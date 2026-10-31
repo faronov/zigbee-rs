@@ -164,12 +164,18 @@ fn log_summary(app: &App) {
     let nwk = app.node().device().bdb().zdo().nwk();
     let neighbors = nwk.neighbor_table();
     let phy = nwk.mac().phy();
+    let radio = phy.radio_stats();
     log::info!(
-        "[ZBT1] neighbours {} children {} routes {} stale-ack drops {}",
+        "[ZBT1] neighbours {} children {} routes {} stale-ack drops {} rx {} overflows {} tx {} tx-fail {} acks {}",
         neighbors.len(),
         neighbors.children().count(),
         nwk.routing_table().len(),
-        phy.stale_ack_drops()
+        phy.stale_ack_drops(),
+        radio.rx_frames,
+        radio.rx_overflows,
+        radio.tx_frames,
+        radio.tx_failures,
+        radio.acks_sent
     );
     for child in neighbors.children() {
         log::info!(
