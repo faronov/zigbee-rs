@@ -102,8 +102,9 @@ former-budget rows.
 | nRF52840 UF2 ProMicro / MDK / PCA10059 / DK | 222,968 / 222,848 / 224,536 / 224,552 | 237,568 each | 14,600 / 14,720 / 13,032 / 13,016 | linked images before UF2 |
 | nRF52833 default / BME280 / SHT31 | 224,464 / 231,784 / 228,208 | 225,280 / 245,760 / 241,664 | 816 / 13,976 / 13,456 | raw binaries |
 | EFR32MG1 sensor | 171,792 | 167,936 | -3,856 | raw binary; above former budget |
-| EFR32MG21 sensor | 229,088 | 491,520 | 262,432 | raw binary from `0x4000`; app slot ends at the journal (`0x7C000`) |
-| EFR32MG22 sensor | 231,052 | 507,904 | 276,852 | raw binary from `0x0`; app slot ends at the journal (`0x7C000`) |
+| EFR32MG21 sensor | 231,248 | 491,520 | 260,272 | raw binary from `0x4000`; app slot ends at the journal (`0x7C000`) |
+| EFR32MG22 sensor | 231,528 | 507,904 | 276,376 | raw binary from `0x0`; app slot ends at the journal (`0x7C000`) |
+| Home Assistant Connect ZBT-1 always-on End Device | 230,012 | 1,015,808 | 785,796 | raw binary from `0x4000`; app slot ends at the journal (`0xFC000`) |
 | CC2340R5 pinned-SDK sensor (pre-static-task snapshot) | 223,536 | 225,280 | 1,744 | historical raw binary; not rebuilt |
 | CC2340R5 fallback sensor | 213,160 | 225,280 | 12,120 | raw binary; radio firmware unavailable |
 | ESP32-C6 sensor default / `light-sleep` | 381,056 / 392,080 | 368,640 each | -12,416 / -23,440 | application images; above former budget |
@@ -883,11 +884,28 @@ The user accepted the MG21 flash growth. It splits about evenly:
 - `.rodata` grows by 10.1 KB. About 6.1 KB of that is anonymous constants
   (format strings and panic locations); the rest is not attributed further.
 
-The xG21 radio tables are still empty, so they account for none of the
-growth. The scaffold had none of this code, because it never configured
-the radio. The
-baseline JSON rows were moved by these deltas, and an `efr32mg22-sensor` row
-was added. MG22 is hardware-tested; MG21 is build- and layout-tested only.
+The scaffold had none of this code, because it never configured the radio.
+The baseline JSON rows were moved by these deltas, and an `efr32mg22-sensor`
+row was added.
+
+Later commits captured the xG21 radio tables and added the VCO fix, the
+per-chip RTCC compare flags and a per-product default TX power. The
+`efr32s2` code is feature-gated, so no other image changes. Rebuilt in the
+same worktree:
+
+| metric | `efr32mg21-sensor` previous baseline row | now | delta | `efr32mg22-sensor` now (delta) |
+|---|---:|---:|---:|---:|
+| `flash` | 228,960 | 231,248 | +2,288 | 231,528 (+476) |
+| `text` | 187,048 | 187,924 | +876 | 188,312 (+448) |
+| `bss` | 14,600 | 14,600 | 0 | 14,600 (0) |
+| `mac_code` | 8,180 | 8,370 | +190 | 8,488 (+84) |
+| `stack` | 20,652 | 20,652 | 0 | 20,652 (0) |
+
+Most of the MG21 growth is the xG21 PHY, analog and PA tables. The last
+change alone (RTCC flags, default TX power, flash-capacity helper) costs
++304 B on MG21 and +316 B on MG22, measured from the same directory. RAM
+and stack are unchanged. MG22 is hardware-tested. The xG21 radio is
+lab-tested on the ZBT-1, but the BRD4181A MG21 image itself has not run.
 
 ## Measurement commands
 

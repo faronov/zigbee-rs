@@ -4,7 +4,8 @@ The repository supports these products:
 
 - EFR32MG1P TRÅDFRI environmental sleepy end device (Series 1);
 - EFR32MG22 BRD4183A development sensor (Series 2, hardware-proven);
-- EFR32MG21 BRD4181A development sensor (Series 2, builds; radio pending).
+- EFR32MG21 BRD4181A development sensor (Series 2, builds; no hardware run);
+- Home Assistant Connect ZBT-1 always-on End Device (EFR32MG21, lab-tested).
 
 All use the shared `SensorApp`; their boards, products, clocks, storage, and
 power behavior are intentionally separate. Series 2 chips share one HAL
@@ -131,6 +132,17 @@ work:
 The sequencer microcode is therefore not needed. The cost is CPU time during
 warm-up, about 82 µs from idle to RX.
 
+The xG21 RSM cannot have its sequencer clock gated, and it waits for the
+sequencer at every state it enters. The driver therefore loads its own
+64-byte vector table into sequencer RAM. Every slot is `END` except the two
+warm states. Those park on a self-`JUMP` while the CPU locks the
+synthesizer, and writing `END` over the jump releases them. The two
+encodings were determined on the hardware; no RAIL sequencer code is used.
+
+The xG21 tables were captured the same way on the ZBT-1 die
+(EFR32MG21A020F1024IM32, rev A1). The capture program ran above the
+resident Gecko Bootloader at `0x4000`.
+
 ### Audit of the former MG21 scaffold
 
 The pre-Series-2 `efr32s2` backend had never run. It used Series 1 register
@@ -144,10 +156,11 @@ values that are wrong for Series 2:
 | RAC commands/states | `TXEN=bit0`, `RXEN=bit1`, `STATE` 0..3 | `RAC.CMD` and `RXENSRCEN` (SWRXEN); the RSM has 14 states (Off, RxWarm, RxSearch, RxFrame, RxPD, Rx2Rx, RxOverflow, Rx2Tx, TxWarm, Tx, TxPD, Tx2Rx, Tx2Tx, Shutdown) |
 | SYNTH | `FREQ`/`CHSP`/`CHNO` at Series 1 offsets, no calibration | Series 2 `SYNTH.FREQ` (0x34)/`IFFREQ`/`CHCTRL`/`VCOTUNING`, with VCO calibration by LO-counter binary search |
 | FRC/BUFC | flat FIFO data registers | BUFC buffers with per-chip stride, and FRC dynamic-length frame descriptors; RX is read from the buffer RAM backing because the `READDATA` prefetch makes read-and-rewind unsafe |
-| PA | `RAC_PACTRL` guess | Per-chip PA tables. xG22: 0 dBm PA up to 6 dBm, ramping through `MODEM.RAMPCTRL`/`RAMPLEV`. xG21 20 dBm PA table is not captured yet |
+| PA | `RAC_PACTRL` guess | Per-chip PA tables. xG22: 0 dBm PA up to 6 dBm, ramping through `MODEM.RAMPCTRL`/`RAMPLEV`. xG21: 20 dBm HP-PA curve from `RAIL_SetTxPowerDbm`, power in `RAC.PACTRL[23:16]`, ramped with `PACTRL.PAENPOWERRAMPINGCLK` held |
 | RSSI | raw `AGC_RSSI` | RAIL quarter-dB conversion; xG22 offset -50 dB (checked against `RAIL_GetRssi`) |
 | EUI-64 | `0x0FE081A0` (TODO) | DEVINFO `EUI64L/H` (same offset on xG21/xG22) |
 | IRQ numbers | Series 1 | GSDK vector tables per chip (xG21 61 IRQs, xG22 64): RTCC 10/12, RAC_RSM 37 |
+| RTCC compare flags | (none) | `IF`/`IEN` CC bits differ: xG21 CC0/CC1/CC2 = bits 2/3/4, xG22 = bits 4/6/8 (`efr32mg2{1,2}_rtcc.h`) |
 
 Problems found later on hardware:
 
@@ -161,6 +174,24 @@ Problems found later on hardware:
   the PHY after wake. The channel, TX power and VCO cache are kept.
 - **Stack.** The 32 KiB xG22 needs the `#[inline(never)] compose()` pattern
   to keep the static stack bound low.
+
+Problems found on xG21 (ZBT-1):
+
+- **Radio clock.** `CMU.RADIOCLKCTRL.EN` must be set before the first radio
+  register access. Without it the access is a bus fault (HardFault).
+- **HFXO.** Rev-A dies need GSDK `CHIP_Init` HFXO errata writes before the
+  crystal starts.
+- **VCO search.** The open-loop VCO binary search must run with
+  `SYNTH.VCDACCTRL.VCDACEN` set, as RAIL does. Without it, codes depended on
+  the previous lock and the TX→RX relock missed the 192 µs ACK. ACKs went
+  from 0/20 to 19/20; the MG22 gate is unchanged at 17/20.
+- **RTCC.** The HAL used the xG22 CC flag bits on both chips. On xG21 the
+  Embassy alarm was never enabled, so the executor slept in `WFE` forever
+  right after "Scanning". The bits are now per chip and covered by a host
+  test against the GSDK headers. The fix also affects the MG21 sensor's EM2
+  wake (CC1). The other MG21/MG22 header differences (CMU, HFXO, EMU, GPIO,
+  MSC, SYSCFG, USART, I2C, LDMA, TIMER) were compared and are either gated
+  by chip or additive xG22 fields.
 
 ### EFR32MG22 BRD4183A (hardware-proven)
 
@@ -201,27 +232,29 @@ resume. The linked stack is 17.6 KiB.
 
 | item | value |
 |---|---|
-| MCU | EFR32MG21A020F512IM32, 512 KiB flash, 64 KiB RAM |
+| MCU | EFR32MG21A010F1024IM32 (GSDK `brd4181a.slcc`), 1 MiB flash, 64 KiB RAM |
 | HFXO | 38.4 MHz, CTUNE 133 |
 | LED0 / BTN0 | PB0 active high / PD2 active low (no EM2 wake on port D) |
 | VCOM | USART0 TX PA5, enable PD4, 115200 |
-| layout | Gecko bootloader `0x0..0x4000`, app `0x4000..0x7C000`, journal `0x7C000..0x80000` |
+| layout | Gecko bootloader `0x0..0x4000`, app `0x4000..0x7C000`, journal `0x7C000..0x80000` (lower 512 KiB) |
 
 `examples/efr32mg21-sensor` is the same composition as MG22: RadioPhy and
 SoftMac, RTCC time driver, EM2 and VCOM. It builds and passes the layout
-checks.
+checks, but no BRD4181A is in the lab, so this image has not run.
 
-The xG21 PHY, analog and PA tables (`efr32s2-hal/src/radio/xg21.rs`) are
-still empty, so radio init returns `Unsupported` and the firmware halts with
-a logged error. Filling them needs the same lab-only RAIL register capture
-on an xG21 die.
+The xG21 radio itself is lab-tested on the ZBT-1. Still unverified on
+BRD4181A:
+
+- the A010 part has no 20 dBm PA, so the captured HP-PA settings may not
+  transmit;
+- EM2 and RTCC CC1 wake have not run on xG21.
 
 | image (`tools/mac-footprint.py`) | flash | text | bss | task pool | static stack |
 |---|---:|---:|---:|---:|---:|
 | former scaffold MAC | 208,956 | 177,048 | 18,888 | 11,040 | 25,524 |
-| efr32s2 RadioPhy + SoftMac | 229,084 | 187,048 | 14,600 | 2,744 | 20,652 |
+| efr32s2 RadioPhy + SoftMac (xG21 tables) | 231,248 | 187,924 | 14,600 | 2,744 | 20,652 |
 
-### Home Assistant Connect ZBT-1 (prepared, not flashed)
+### Home Assistant Connect ZBT-1 (lab-tested as an End Device)
 
 `boards/ha-connect-zbt1` describes the ZBT-1:
 
@@ -229,37 +262,67 @@ on an xG21 die.
   behind a CP2102N;
 - USART0 TX PA6, RX PA5, CTS PB1, RTS PB0, 115200 with hardware flow
   control, per the Nabu Casa firmware-builder manifests;
-- HFXO CTUNE from the `MFG_CTUNE` token, otherwise a board default. On the
-  inspected unit every MFG token is erased and DEVINFO has no CTUNE, so the
-  default must match the stock firmware's compile-time value, read
-  read-only from HFXO0 `XTALCTRL` before the first flash (140, the xG21
-  device_init value, until then);
+- HFXO CTUNE from the `MFG_CTUNE` token, otherwise the board default 140.
+  On the inspected unit every MFG token is erased and DEVINFO has no CTUNE.
+  The stock firmware's HFXO0 `XTALCTRL`, read over SWD while it was
+  running, holds CTUNE 140;
 - EUI-64 from DEVINFO (the custom-EUI token is erased);
 - no EFR-driven LED or button is confirmed.
 
-The shipped Gecko Bootloader (2.4.2) occupies `0x0..0x4000`, which matches
-the MG21 product layout, and accepts GBL files over XMODEM on that UART.
-The stock flash image has the NCP at `0x4000..0x3E9D8`, NVM3 at
-`0x74000..0x7E000`, and the upper 512 KiB erased. The NCP's Application
-Properties use signature type NONE, so the bootloader does not enforce
-secure boot and starts an application without an Application Properties
-pointer. The MG21 product layout (app `0x4000..0x7C000`, journal
-`0x7C000..0x80000`) fits the F1024 part unchanged; flashing it replaces
-the stock NVM3.
+The shipped Gecko Bootloader (2.4.2) occupies `0x0..0x4000` and accepts
+GBL files over XMODEM on that UART. The stock flash image has the NCP at
+`0x4000..0x3E9D8`, NVM3 at `0x74000..0x7E000`, and the upper 512 KiB
+erased. The NCP's Application Properties use signature type NONE, so
+secure boot is not enforced.
 
-**Recovery risk.** The bootloader has no GPIO activation. Once our
-application replaces the NCP, the only ways back into the bootloader are:
+`products/ha-connect-zbt1` and `examples/ha-connect-zbt1` (bin
+`ha-connect-zbt1-ed`) make it an always-on (RX-on-when-idle) End Device
+with Basic and Identify on endpoint 1. It is not a Router, because
+SoftMacCore has no parent MAC role.
+
+| item | value |
+|---|---|
+| identity | `Zigbee-RS` / `ZBT-1-AlwaysOn-ED` |
+| layout | bootloader `0x0..0x4000` (kept), app `0x4000..0xFC000`, journal `0xFC000..0x100000` (2 × 8 KiB), RAM 96 KiB |
+| boot check | DEVINFO must report 1 MiB of flash, otherwise the firmware halts |
+| TX power | 10 dBm default (the ZBT-1's certified limit is not published) |
+| logs | SEGGER RTT only; the UART stays free for a future bootloader trigger |
+| after Leave | Network Steering re-arms after 5 min, longer than ZHA's 254 s permit window |
+
+The stock NVM3 is overwritten. A full flash backup was taken over SWD
+before every write.
+
+Measured sizes: 230,012 B file-backed from `0x4000`, 20,748 B `.bss`, and
+77,044 B linked stack headroom.
+
+Hardware evidence (2026-10-31, ZHA channel 15, PAN `0xDFE9`):
+
+- **Radio gates** (`tools/efr32s2-lab`, ZBT-1 variant): TX loop, ED
+  monitor, and 19/20 ACKs with a 594 µs RX→TX→RX turnaround.
+- **Join.** Scanning found 10 parents. The first choice (`0xD586`) did not
+  deliver the Transport Key within 6 s, so the device fell back to `0x85FA`.
+  It joined as `0x888A`, received the network key, answered the interview
+  (node, active-endpoint and simple descriptors, Basic reads), and sent its
+  unique-TCLK verify. The parent accepted the End Device Timeout.
+- **Identify.** A press in HA reached the device, which stopped
+  identifying after about 4 s.
+- **Reset.** After an SWD reset the security journal was preserved and
+  resume (`addr=0x888A`, parent `0x85FA`) took 14 ms. A second Identify
+  worked.
+
+Not tested yet: long-duration stability, OTA, and a deliberate Leave
+followed by automatic recommissioning.
+
+**Recovery.** The bootloader has no GPIO activation. Once our application
+replaces the NCP, the only ways back into the bootloader are:
 
 - SWD pads;
 - `efr32s2_hal::gecko_bootloader::reboot_to_bootloader()`, which writes
   `{0x0202, 0xF00F}` at `SRAM_BASE` and then triggers `SYSRESETREQ` (GSDK
   `btl_main.c`).
 
-The application needs a trigger for this. That requires a UART receiver,
-which the HAL does not have yet.
-
-The bootloader accepts an application without an ApplicationProperties
-struct when secure boot is off, which is the GSDK default for Series 2.
+The application needs a trigger for this, and that requires a UART
+receiver, which the HAL does not have yet.
 
 ### Build
 
@@ -271,8 +334,11 @@ cargo +nightly-2026-03-23 build --release --locked
 python3 tools/verify-layout.py \
   target/thumbv7em-none-eabi/release/efr32mg1-sensor
 
-cd ../efr32mg22-sensor   # or efr32mg21-sensor
+cd ../efr32mg22-sensor   # or efr32mg21-sensor, ha-connect-zbt1
 cargo +nightly-2026-03-23 build --release --locked
 python3 tools/verify-layout.py \
   target/thumbv8m.main-none-eabihf/release/efr32mg22-sensor
 ```
+
+The ZBT-1 binary is named `ha-connect-zbt1-ed`, which keeps it apart from the
+board crate in the lockfile.

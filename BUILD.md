@@ -343,10 +343,23 @@ EFR32MG21 targets BRD4181A on BRD4001A:
 - persistence: `0x0007C000..0x00080000`
 
 MG21 and MG22 share `efr32s2-hal` and `Efr32s2SoftMac`. Time comes from the
-RTCC, and slow polls sleep in EM2. The xG21 radio tables are not captured
-yet, so MG21 radio init fails explicitly and the MG21 image has no hardware
-run. The 2026-10-31 local build is 229,088 B; `.data` is 336 B, `.bss` is
-14,600 B, and the linked available stack is 50,424 B.
+RTCC, and slow polls sleep in EM2. The xG21 radio tables were captured on
+the ZBT-1 and are lab-tested there. The BRD4181A image has not run: its
+A010 part has no 20 dBm PA, and EM2 is untested on xG21. The 2026-10-31
+local build is 231,248 B; `.data` is 336 B, `.bss` is 14,600 B, and the
+linked available stack is 50,424 B.
+
+The Home Assistant Connect ZBT-1 (`examples/ha-connect-zbt1`, bin
+`ha-connect-zbt1-ed`, EFR32MG21A020F1024) is an always-on End Device:
+
+- bootloader: `0x00000000..0x00004000` (stock Gecko Bootloader, kept)
+- application: `0x00004000..0x000FC000`
+- persistence: `0x000FC000..0x00100000`
+- logs: SEGGER RTT
+
+The 2026-10-31 build is 230,012 B with 20,748 B `.bss` and 77,044 B of
+linked stack. On one dongle it joined ZHA, completed the interview, handled
+Identify and resumed from the journal after a reset.
 
 EFR32MG22 targets BRD4183A on BRD4001A:
 
