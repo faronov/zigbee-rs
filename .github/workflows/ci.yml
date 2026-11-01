@@ -219,6 +219,16 @@ jobs:
             manifest: efr32s2-hal/Cargo.toml
             workspace: efr32s2-hal
             features: "efr32mg22"
+          # Router images: interrupt-driven Imm-Ack with the HAL-owned
+          # Frame Pending table (radio::isr_ack host tests).
+          - name: EFR32 Series 2 HAL (MG21, ISR Imm-Ack)
+            manifest: efr32s2-hal/Cargo.toml
+            workspace: efr32s2-hal
+            features: "efr32mg21,isr-ack"
+          - name: EFR32 Series 2 HAL (MG22, ISR Imm-Ack)
+            manifest: efr32s2-hal/Cargo.toml
+            workspace: efr32s2-hal
+            features: "efr32mg22,isr-ack"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
