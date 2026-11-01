@@ -9,10 +9,12 @@ edition = "2024"
 #   cargo build --release                                            # sed, phy6222
 #   cargo build --release --no-default-features --features production,phy6222,ed
 #   cargo build --release --no-default-features --features production,phy6222,router
+# The sleepy sensor has no `required-features`, so the documented
+# `--no-default-features --features phy6252` build still produces it. Build
+# the role bins with `--bin`.
 [[bin]]
 name = "phy6222-sensor"
 path = "src/main.rs"
-required-features = ["sed"]
 
 [[bin]]
 name = "phy6222-ed"

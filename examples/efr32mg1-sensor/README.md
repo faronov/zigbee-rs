@@ -86,6 +86,14 @@ checkpoints security before activation. A real Zigbee download/install/reboot
 has not yet completed on hardware. The current Zigbee OTA container is
 **162,538 B** and assumes the resident Gecko bootloader.
 
+## Role images
+
+`efr32mg1-sensor` (default, sleepy) and `efr32mg1-ed`
+(`--no-default-features --features ed --bin efr32mg1-ed`) build. The
+`efr32mg1-router` probe is rejected at link time (55,832 B over the router
+flash window, 13,712 B short of the 16 KiB stack floor). See the
+[EFR32 guide](../../docs/book/src/platform-guides/efr32.md#node-roles).
+
 ## Validation
 
 The recorded image/container are build/layout/package-tested. Earlier

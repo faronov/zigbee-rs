@@ -29,11 +29,12 @@
 //!   MAC disables the address filter (scan) the PAN is `0xFFFF`, so every
 //!   beacon passes. There is no raw sniffer mode.
 //! * **Incoming:** AR frames that pass the filter are acknowledged by the PBE
-//!   192 µs after the frame, always with frame pending = 0 (no source-match
-//!   table), so [`RadioPhy::set_ack_frame_pending`] stays unsupported. The
-//!   parent-role [`Cc2340RouterMac`] exists only for the router size probe
-//!   (which does not fit the 36 KiB SRAM); arming Frame Pending on it fails
-//!   explicitly.
+//!   192 µs after the frame with frame pending = 0: the PBE's source-match
+//!   table (`FFOPT0.AUTOPEND`, `ENTRYENABLE`/`FRAMEPENDING` bitmaps, PAN0
+//!   short/extended source tables) is left disabled, so
+//!   [`RadioPhy::set_ack_frame_pending`] stays unsupported. The parent-role
+//!   [`Cc2340RouterMac`] exists only for the router size probe (which does
+//!   not fit the 36 KiB SRAM); arming Frame Pending on it fails explicitly.
 //! * **Outgoing:** [`RadioPhy::try_transmit_acknowledged`] performs one host
 //!   CCA on the live RX operation and the TX, then the PBE listens for the
 //!   immediate ACK itself (`ACKSTATUS`). CSMA-CA backoff and
@@ -81,8 +82,9 @@ pub const CC2340_PENDING_RX: usize = 8;
 pub type Cc2340SoftMac = SoftMacCore<Cc2340RadioPhy, EndDevice, CC2340_PENDING_RX>;
 
 /// Parent role of the CC2340 router size probe. The core's software Frame
-/// Pending table is empty: the PBE sends every Imm-Ack (one FP owner) and
-/// has no source-match table, so arming Frame Pending fails.
+/// Pending table is empty: the PBE sends every Imm-Ack (one FP owner). Its
+/// source-match (auto-pend) table is not programmed yet, so arming Frame
+/// Pending fails.
 pub type Cc2340RouterRole = Parent<8, 8, 0>;
 
 /// Shared software MAC, parent role, on the CC2340 radio.

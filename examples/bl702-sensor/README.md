@@ -259,6 +259,15 @@ validates a file (header, identity, version, MCUboot hash and signature
 presence, slot fit). Downgrades are refused by the loader: to return to an
 older image, program its full image again.
 
+## Role images
+
+One bin per role, mutually exclusive features: `bl702-sensor` (default,
+sleepy), `bl702-ed` (`--features ed --bin bl702-ed`, always-on End Device) and
+`bl702-router` (`--features router --bin bl702-router`, parent MAC with
+hardware auto-ACK and the M154 Frame Pending table). The role images are
+build-, symbol- and host-tested only; see the
+[BL702 guide](../../docs/book/src/platform-guides/bl702.md#role-images).
+
 ## Remaining gates
 
 - loader and OTA on hardware (pending): first boot through the loader,

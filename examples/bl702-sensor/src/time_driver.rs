@@ -189,6 +189,11 @@ pub fn now() -> u64 {
 fn dispatch(irq: u16) {
     if irq == TIMER_CH0_IRQ {
         on_timer_interrupt();
+    } else if cfg!(feature = "router") && irq == interrupt::M154_IRQ {
+        // The router's parent radio (hardware auto-ACK + receive ring).
+        #[cfg(feature = "router")]
+        zigbee_mac::bl702::parent_phy::on_interrupt();
+        interrupt::clear_pending(irq);
     } else {
         // No other source is owned by this firmware.
         interrupt::disable(irq);

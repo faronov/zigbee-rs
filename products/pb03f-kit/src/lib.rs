@@ -47,8 +47,8 @@ pub const POWER_SOURCE: PowerSource = PowerSource::DcSource;
 /// the tags and writes none, so leave the network before flashing it after
 /// a tagged role.
 pub mod role {
-    pub const ROUTER: u16 = 0x5301;
-    pub const END_DEVICE: u16 = 0x5302;
+    pub const ROUTER: u16 = 0x5201;
+    pub const END_DEVICE: u16 = 0x5202;
 }
 
 /// Model identifiers of the role images.

@@ -111,9 +111,24 @@ def _telink(name: str, mode: str, crate: str) -> Image:
                  command=["./scripts/tlsr8258.sh", "build", mode])
 
 
+def _role(name: str, crate: str, target: str, features: str,
+          no_default: bool = True) -> Image:
+    """An ED/router bin of a crate whose default features build its SED."""
+    args = ["--no-default-features"] if no_default else []
+    return Image(name, f"examples/{crate}", f"target/{target}/release/{name}",
+                 args + ["--features", features, "--bin", name])
+
+
 # PHY62x2 images build in an isolated target directory so measurements never
 # race with lab builds that share the example's own target directory.
 _PHY_TARGET = "../../target/mac-footprint/build"
+
+
+def _phy_ed(name: str, workdir: str, binary: str, features: str) -> Image:
+    tdir = f"{_PHY_TARGET}/{name}"
+    return Image(name, workdir, f"{tdir}/thumbv6m-none-eabi/release/{binary}",
+                 ["--no-default-features", "--features", features,
+                  "--bin", binary, "--target-dir", tdir], ESP_PHY_TOOLCHAIN)
 
 IMAGES: list[Image] = [
     _nrf("nrf52840-sensor", "nrf52840-sensor"),
@@ -129,11 +144,21 @@ IMAGES: list[Image] = [
     _uf2("dk", "board-nrf-dk"),
     Image("bl702-sensor", "examples/bl702-sensor",
           "target/riscv32imc-unknown-none-elf/release/bl702-sensor"),
+    # Default `production` (logs compiled out) stays on for the role bins.
+    _role("bl702-ed", "bl702-sensor", "riscv32imc-unknown-none-elf", "ed",
+          no_default=False),
+    _role("bl702-router", "bl702-sensor", "riscv32imc-unknown-none-elf",
+          "router", no_default=False),
     Image("cc2340-sensor-fallback", "examples/cc2340-sensor",
           "target/fallback/thumbv6m-none-eabi/release/cc2340-sensor",
           ["--target-dir", "target/fallback"], env_unset=["CC2340_SDK_DIR"]),
+    Image("cc2340-ed-fallback", "examples/cc2340-sensor",
+          "target/fallback/thumbv6m-none-eabi/release/cc2340-ed",
+          ["--no-default-features", "--features", "ed", "--bin", "cc2340-ed",
+           "--target-dir", "target/fallback"], env_unset=["CC2340_SDK_DIR"]),
     Image("efr32mg1-sensor", "examples/efr32mg1-sensor",
           "target/thumbv7em-none-eabi/release/efr32mg1-sensor"),
+    _role("efr32mg1-ed", "efr32mg1-sensor", "thumbv7em-none-eabi", "ed"),
     Image("efr32mg21-sensor", "examples/efr32mg21-sensor",
           "target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor"),
     Image("efr32mg22-sensor", "examples/efr32mg22-sensor",
@@ -161,6 +186,11 @@ IMAGES: list[Image] = [
           f"{_PHY_TARGET}/pb03f/thumbv6m-none-eabi/release/pb03f-zigbee",
           ["--bin", "pb03f-zigbee", "--target-dir", f"{_PHY_TARGET}/pb03f"],
           ESP_PHY_TOOLCHAIN),
+    _phy_ed("phy6222-ed", "examples/phy6222-sensor", "phy6222-ed",
+            "production,phy6222,ed"),
+    _phy_ed("phy6252-ed", "examples/phy6222-sensor", "phy6222-ed",
+            "production,phy6252,ed"),
+    _phy_ed("pb03f-ed", "examples/pb03f-kit", "pb03f-ed", "ed"),
     _telink("tlsr8258-sensor", "sensor", "telink-tlsr8258-sensor"),
     _telink("tlsr8258-sensor-retention", "sensor-retention",
             "telink-tlsr8258-sensor"),

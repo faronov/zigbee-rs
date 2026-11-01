@@ -11,7 +11,7 @@ use crate::{
 };
 
 const TX_IDLE_TIMEOUT_TICKS: u32 = 0x7a12;
-const TX_DONE_TIMEOUT: Duration = Duration::from_millis(10);
+pub(super) const TX_DONE_TIMEOUT: Duration = Duration::from_millis(10);
 const CCA_READY_SPINS: usize = 100_000;
 const MIN_FRAME_LEN: usize = 3;
 /// Bound for the pre-sleep idle wait. RX is already disabled between MAC
@@ -21,7 +21,7 @@ const MIN_FRAME_LEN: usize = 3;
 const QUIESCE_IDLE_SPINS: usize = 20_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TxResult {
+pub(super) enum TxResult {
     Finished,
     ChannelBusy,
     Aborted,
@@ -301,7 +301,7 @@ impl Drop for RxGuard {
     }
 }
 
-fn initialize_m154() {
+pub(super) fn initialize_m154() {
     set32(GLB_CGEN_CFG2, 1);
     set32(GLB_MIX_RESET, 1 << 4);
     clear32(GLB_MIX_RESET, 1 << 4);
@@ -331,19 +331,19 @@ fn initialize_m154() {
     set32(GLB_COEX_CTRL, 1);
 }
 
-fn configure_promiscuous_rx() {
+pub(super) fn configure_promiscuous_rx() {
     update32(M154_RX_CONTROL, 0xff00_0000, 0x8f00_0000);
     set32(M154_FILTER_CONTROL, 1 << 16);
     set32(M154_IRQ_ENABLE, IRQ_RX_MASK);
     clear32(M154_TX_CONTROL, 1 << 4);
 }
 
-fn set_cca_defaults() {
+pub(super) fn set_cca_defaults() {
     update32(PHY_CCA_CTRL, 0x1800_0000, 2 << 27);
     update32(PHY_CCA_CTRL, 0x007f_0000, 76 << 16);
 }
 
-fn set_channel_register(channel: u8) {
+pub(super) fn set_channel_register(channel: u8) {
     update32(M154_CONTROL, 0x0fff_0000, channel_frequency_word(channel));
 }
 
@@ -351,7 +351,7 @@ const fn channel_frequency_word(channel: u8) -> u32 {
     (0x965 + (channel as u32 - 11) * 5) << 16
 }
 
-fn run_cca_once() -> Result<(bool, i8), PhyError> {
+pub(super) fn run_cca_once() -> Result<(bool, i8), PhyError> {
     set32(PHY_CCA_CTRL, 1 << 1);
     clear32(PHY_CCA_CTRL, 1 << 1);
     set32(PHY_CCA_ENABLE, 1 << 27);
@@ -370,7 +370,7 @@ fn run_cca_once() -> Result<(bool, i8), PhyError> {
     Err(PhyError::Hardware)
 }
 
-fn validate_frame(frame: &[u8]) -> Result<(), PhyError> {
+pub(super) fn validate_frame(frame: &[u8]) -> Result<(), PhyError> {
     if frame.len() > MAX_PHY_FRAME_LEN {
         return Err(PhyError::FrameTooLong);
     }
@@ -380,7 +380,7 @@ fn validate_frame(frame: &[u8]) -> Result<(), PhyError> {
     Ok(())
 }
 
-fn write_tx_frame(frame: &[u8]) {
+pub(super) fn write_tx_frame(frame: &[u8]) {
     for (word_index, bytes) in frame.chunks(4).enumerate() {
         let mut packed = 0u32;
         for (byte_index, byte) in bytes.iter().enumerate() {
@@ -395,7 +395,7 @@ fn write_tx_frame(frame: &[u8]) {
     );
 }
 
-fn read_rx_frame(frame: &mut PhyRxFrame) -> Result<(), PhyError> {
+pub(super) fn read_rx_frame(frame: &mut PhyRxFrame) -> Result<(), PhyError> {
     let phy_len = (read32(M154_RX_METADATA) >> 24) as u8;
     let payload_len = rx_payload_len(phy_len)?;
 
@@ -415,7 +415,7 @@ fn rx_payload_len(phy_len: u8) -> Result<usize, PhyError> {
     Ok(usize::from(phy_len - 2))
 }
 
-fn enable_rx() -> bool {
+pub(super) fn enable_rx() -> bool {
     if is_idle() {
         set32(M154_RX_CONTROL, 1 << 12);
         true
@@ -424,11 +424,11 @@ fn enable_rx() -> bool {
     }
 }
 
-fn disable_rx() {
+pub(super) fn disable_rx() {
     set32(M154_RX_CONTROL, 1 << 8);
 }
 
-fn is_idle() -> bool {
+pub(super) fn is_idle() -> bool {
     if read32(M154_RX_CONTROL) & (1 << 18) != 0 {
         return false;
     }
@@ -441,7 +441,7 @@ fn is_idle() -> bool {
     read32(M154_FILTER_CONTROL) & (1 << 16) != 0 || ((read32(RF_FSM) >> 12) & 0x7) == 0
 }
 
-fn trigger_tx() -> Result<(), PhyError> {
+pub(super) fn trigger_tx() -> Result<(), PhyError> {
     let started = read32(M154_TIMER);
     loop {
         if is_idle() {
@@ -460,20 +460,20 @@ fn trigger_tx() -> Result<(), PhyError> {
     }
 }
 
-fn reset_tx() {
+pub(super) fn reset_tx() {
     write32(M154_RESET, 24);
     write32(M154_RECOVERY_TIME, read32(M154_TIMER).wrapping_add(20));
     set32(M154_IRQ_ENABLE, 1 << 1);
 }
 
-fn clear_tx_events() {
+pub(super) fn clear_tx_events() {
     let pending = read32(M154_IRQ_STATUS) & IRQ_TX_MASK;
     if pending != 0 {
         write32(M154_IRQ_CLEAR, pending);
     }
 }
 
-fn decode_tx_result(status: u32) -> Option<TxResult> {
+pub(super) fn decode_tx_result(status: u32) -> Option<TxResult> {
     if status & IRQ_TX_ABORTED != 0 {
         Some(TxResult::Aborted)
     } else if status & IRQ_TX_HW_ERROR != 0 {
@@ -505,7 +505,7 @@ const fn rssi_to_ed(rssi: i8) -> u8 {
     }
 }
 
-async fn yield_now() {
+pub(super) async fn yield_now() {
     let mut yielded = false;
     core::future::poll_fn(|context| {
         if yielded {

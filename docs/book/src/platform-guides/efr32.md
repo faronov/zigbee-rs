@@ -108,6 +108,35 @@ TRÅDFRI images produced hardware evidence for:
 Still open: a real Zigbee OTA download, bootloader install, reboot into the new
 version, and retained commissioned state.
 
+### Node roles
+
+`examples/efr32mg1-sensor` follows the role template (mutually exclusive
+`sed` | `ed` | `router` features, one bin per role):
+
+| bin | build | result |
+|---|---|---|
+| `efr32mg1-sensor` | default (`sed`) | unchanged sleepy sensor |
+| `efr32mg1-ed` | `--no-default-features --features ed --bin efr32mg1-ed` | builds: 161,340 B flash, 12,600 B `.bss`, 18,856 B linked stack |
+| `efr32mg1-router` | `--no-default-features --features router --bin efr32mg1-router` | **link rejected** (`products/efr32mg1-tradfri/link/router-tables.x`) |
+
+The router does not fit the TRÅDFRI module. Measured against an enlarged
+measurement map with the `constrained-memory` ZCL/ZDO sizes and the
+unmodified NWK router tables: flash 248,344 B against the 192,512 B router
+window `0x4000..0x33000` (55,832 B over; the child and APS journals take
+`0x33000..0x37000`), and static RAM 29,072 B (`ZigbeeDevice<_, Router>`
+18,032 B, main future 4,568 B, security journal 2,464 B, app 2,388 B, radio
+buffers 768 B), leaving 2,672 B of stack in the `0x7C00`-byte SRAM against the
+16 KiB floor (13,712 B short). The router-only growth of `ZigbeeDevice`
+(11,120 B over the End Device) is smaller than the RAM shortfall, so no table
+shrink alone makes it fit. CI asserts the link failure.
+
+Frame Pending for a parent would have to come from the FRC ISR that already
+sends the Imm-Ack, consulting a short-address table armed through
+`RadioPhy::set_ack_frame_pending` (core `PENDING = 0`). That table does not
+exist yet, so the parent MAC fails explicitly. Role tags: `0x5201` router,
+`0x5202` End Device; the original SED writes none. The End Device is build-,
+layout-, clippy- and symbol-checked only.
+
 ## EFR32 Series 2 (MG21 / MG22)
 
 ### Driver provenance

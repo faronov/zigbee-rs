@@ -19,8 +19,10 @@
 //! growth of `ZigbeeDevice` over the End Device is 10,824 B, less than the
 //! shortfall, so no table shrink alone makes it fit.
 //!
-//! Frame Pending: the PBE acknowledges in hardware, always with FP=0, and
-//! has no source-match table, so `Cc2340RadioPhy::set_ack_frame_pending`
+//! Frame Pending: the PBE acknowledges in hardware with FP=0. Its auto-pend
+//! source-match table (`FFOPT0.AUTOPEND`, `ENTRYENABLE`/`FRAMEPENDING`, PAN0
+//! short/extended source tables in PBE IEEE RAM) is the right FP owner for a
+//! router but is not programmed yet, so `Cc2340RadioPhy::set_ack_frame_pending`
 //! stays `Unsupported` and the `Parent<8, 8, 0>` core reports that as a MAC
 //! error instead of silently acknowledging a poll without Frame Pending.
 

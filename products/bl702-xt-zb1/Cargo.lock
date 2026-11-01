@@ -46,6 +46,7 @@ dependencies = [
  "embedded-storage",
  "log",
  "mcuboot-image",
+ "router-app",
  "sensor-sed-app",
  "zigbee-aps",
  "zigbee-mac",
@@ -244,6 +245,16 @@ name = "riscv-pac"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8188909339ccc0c68cfb5a04648313f09621e8b87dc03095454f1a11f6c5d436"
+
+[[package]]
+name = "router-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-aps",
+ "zigbee-mac",
+ "zigbee-nwk",
+ "zigbee-runtime",
+]
 
 [[package]]
 name = "sensor-sed-app"

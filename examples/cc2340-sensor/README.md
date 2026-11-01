@@ -78,6 +78,14 @@ env -u CC2340_SDK_DIR \
   --target-dir target/fallback
 ```
 
+## Role images
+
+`cc2340-sensor` (default, sleepy) and `cc2340-ed`
+(`--no-default-features --features ed --bin cc2340-ed`) build. The
+`cc2340-router` probe (`--features router`) is rejected at link time: its
+static RAM leaves 4,036 B of stack in the 36 KiB SRAM against the 16 KiB
+floor. See the [CC2340 guide](../../docs/book/src/platform-guides/cc2340.md#role-images).
+
 ## Hardware gates
 
 - startup and clock proof on the target board;

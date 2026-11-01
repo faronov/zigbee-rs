@@ -28,6 +28,23 @@ pub(super) const M154_STATE: u32 = M154_BASE + 0x0bc;
 pub(super) const M154_RX_STATUS: u32 = M154_BASE + 0x0c4;
 pub(super) const M154_FILTER_CONTROL: u32 = M154_BASE + 0x0c8;
 pub(super) const M154_RX_CONTROL: u32 = M154_BASE + 0x0e4;
+/// `PAN ID << 16 | short address` used by the hardware address filter and
+/// the hardware auto-ACK.
+pub(super) const M154_PAN_SHORT: u32 = M154_BASE + 0x0cc;
+/// Extended address, over-the-air byte order, low and high words.
+pub(super) const M154_LONG_LO: u32 = M154_BASE + 0x0d0;
+pub(super) const M154_LONG_HI: u32 = M154_BASE + 0x0d4;
+/// `M154_TX_CONTROL` bit: hardware transmits the Imm-Ack of a matching
+/// ACK-request frame.
+pub(super) const TX_CONTROL_AUTO_ACK: u32 = 1 << 4;
+/// `M154_FILTER_CONTROL` bit: accept every frame (no address filter).
+pub(super) const FILTER_PROMISCUOUS: u32 = 1 << 16;
+/// Hardware Frame Pending table: 128 valid / long-entry / pending bits in
+/// four words each, then 128 16-bit address slots.
+pub(super) const M154_FPT_VALID: u32 = M154_BASE + 0x600;
+pub(super) const M154_FPT_LONG: u32 = M154_BASE + 0x610;
+pub(super) const M154_FPT_PENDING: u32 = M154_BASE + 0x620;
+pub(super) const M154_FPT_SLOTS: u32 = M154_BASE + 0x630;
 pub(super) const M154_COEX_CONTROL: u32 = M154_BASE + 0x180;
 pub(super) const M154_TX_BUFFER: u32 = M154_BASE + 0x200;
 pub(super) const M154_TX_LENGTH: u32 = M154_BASE + 0x2fc;

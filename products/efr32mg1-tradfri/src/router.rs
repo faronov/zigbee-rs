@@ -40,9 +40,10 @@ const _: () = assert!(
         == SECURITY_PARTITION_START as usize
 );
 const _: () = assert!(CHILD_TABLE_PARTITION_START >= 0x0000_4000);
-const _: () = assert!(
-    CHILD_TABLE_PARTITION_START.is_multiple_of(<Efr32mg1Flash as embedded_storage::nor_flash::NorFlash>::ERASE_SIZE as u32)
-);
+const _: () =
+    assert!(CHILD_TABLE_PARTITION_START.is_multiple_of(
+        <Efr32mg1Flash as embedded_storage::nor_flash::NorFlash>::ERASE_SIZE as u32
+    ));
 
 /// Same bounded receive slice as the end device; 5..60 s commissioning
 /// retry; three failed secured rejoins fall back to fresh commissioning.

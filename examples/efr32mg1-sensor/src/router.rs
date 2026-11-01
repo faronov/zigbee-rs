@@ -20,7 +20,7 @@
 //! (11,120 B over the End Device), so no table shrink alone makes it fit.
 //!
 //! Frame Pending: the MG1 FRC ISR pre-arms every Imm-Ack with FP=0 and has no
-//! source-match table, so `Efr32RadioPhy::set_ack_frame_pending` stays
+//! source-match table yet, so `Efr32RadioPhy::set_ack_frame_pending` stays
 //! `Unsupported` and the `Parent<8, 8, 0>` core reports that as a MAC error
 //! instead of silently acknowledging a poll without Frame Pending.
 

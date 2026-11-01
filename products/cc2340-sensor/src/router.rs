@@ -31,8 +31,7 @@ use zigbee_zcl::DeviceId;
 
 use crate::ENDPOINT;
 use crate::storage::{
-    PHYSICAL_ERASE_SIZE, PartitionError, SECURITY_PARTITION_START, SecurityStore,
-    security_journal,
+    PHYSICAL_ERASE_SIZE, PartitionError, SECURITY_PARTITION_START, SecurityStore, security_journal,
 };
 
 /// Child-table journal: two 4 KiB sectors (two 2 KiB erase sectors each).
@@ -201,7 +200,9 @@ where
     }
 }
 
-const fn layout_error<E>(error: embedded_storage::nor_flash::NorFlashErrorKind) -> PartitionError<E> {
+const fn layout_error<E>(
+    error: embedded_storage::nor_flash::NorFlashErrorKind,
+) -> PartitionError<E> {
     match error {
         embedded_storage::nor_flash::NorFlashErrorKind::NotAligned => PartitionError::NotAligned,
         _ => PartitionError::OutOfBounds,
