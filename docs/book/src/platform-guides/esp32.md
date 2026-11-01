@@ -36,6 +36,73 @@ usable CCA/retry engine), and 10 dBm through
 `RadioPhy::DEFAULT_TX_POWER_DBM`. This migration is build-, layout-, symbol-
 and host-tested only; the hardware evidence below predates it.
 
+## Node roles
+
+Each example crate has one bin per role, following the
+[role template](../advanced/soft-mac-porting.md#role-template-one-example-crate-per-board):
+
+| bin | feature | app | MAC | model |
+|---|---|---|---|---|
+| `esp32c6-sensor` / `esp32h2-sensor` | `sed` (default) | `sensor-sed-app` | `EspSoftMac` (`EndDevice`) | `ESP32-{C6,H2}-Sensor` |
+| `esp32c6-ed` / `esp32h2-ed` | `ed` | `AlwaysOnEndDeviceApp` | `EspSoftMac` (`EndDevice`) | `ESP32-{C6,H2}-ED` |
+| `esp32c6-router` / `esp32h2-router` | `router` | `ParentRouterApp` | `EspRouterMac` = `SoftMacCore<EspRadioPhy, Parent<8, 8, 0>>` | `ESP32-{C6,H2}-Router` |
+
+```bash
+cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
+  --no-default-features --features ed --bin esp32c6-ed
+cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
+  --no-default-features --features router --bin esp32c6-router
+```
+
+The ED and router images expose only Basic and Identify (the DevKit has no
+fitted sensor besides the on-chip temperature, which stays with the SED
+image). They have no OTA client. The product enables their modules through
+its `roles` feature; the SED-only modules (policy, wake, OTA) sit behind
+`sed`, so the existing SED images do not change.
+
+**Frame Pending.** The radio auto-ACKs in hardware, and the core is too late
+to influence that ACK, so the router keeps the core's `PENDING` capacity at
+0. The `esp-parent` feature of `zigbee-mac` enables the local esp-radio patch
+`ieee802154-ack-pending`: in the RX_DONE interrupt, before the ACK is sent,
+a hook looks up the source of a MAC Data Request in the
+`zigbee_mac::ack_pending` table (16 entries, short or extended addresses)
+and sets the ACK's Frame Pending bit. The core fills the table through
+`RadioPhy::set_ack_frame_pending`. A full table fails the request with
+`PhyError::Hardware` instead of dropping a child silently.
+`EspRadioPhy::parent_stats()` counts Data Requests, FP ACKs, raw
+transmissions, TX errors, acknowledged transmissions and missing ACKs; the
+router logs them every 60 s.
+
+Every ESP image enables the local esp-radio patch
+`ieee802154-tx-when-rx-full`. Upstream esp-radio refuses to transmit while
+its receive queue is full, and nothing else drains that queue. On the C6 a
+router relaying a broadcast burst then failed RREQ forwarding and link status
+with `RouteError`. An always-on end device whose parent never acknowledged
+its polls stopped being able to send any Beacon or Association Request.
+
+A sleepy end device drops the frames its radio queued while it was idle.
+esp-radio keeps the receiver on between operations, so between two polls the
+SED's 20-frame queue filled with broadcasts it was not receiving. The ACK
+window of the next poll then met that backlog instead of the ACK, and every
+poll was reported unacknowledged. `EspRadioPhy` therefore clears the queue,
+inside the critical section that esp-radio already takes, before each
+acknowledged transmission and before suspend, but only while
+`macRxOnWhenIdle` is false. Routers and always-on end devices keep every
+frame.
+Router images also
+convert RSSI to the IEEE 0–255 LQI scale (`zigbee_mac::lqi`) for neighbour
+and link-cost decisions. End-device images keep the radio's raw LQI byte,
+which is not on that scale; converting it there costs 44 bytes of flash, so it
+is not enabled yet.
+
+**Persistence.** The role images write a role tag (ROUTER `0x5201`,
+END_DEVICE `0x5202`) in the security journal. The SED image writes none, so
+its journal records are unchanged. The router keeps its child and APS tables
+in `zbnv` at `0x3F0000..0x3F4000`, below the security journal at
+`0x3FE000`. After a ZHA leave, the router and ED rejoin when the BOOT button
+is pressed or after 5 minutes. Remove the device from the network before
+flashing the SED image back.
+
 ## Application parts and policy
 
 Both images provide a concrete
@@ -115,6 +182,8 @@ The checked 4 MiB table is:
 0x010000..0x200000  ota_0
 0x200000..0x3F0000  ota_1
 0x3F0000..0x400000  zbnv
+0x3F0000..0x3F2000  router child table within zbnv (router image only)
+0x3F2000..0x3F4000  router APS table within zbnv (router image only)
 0x3FE000..0x400000  security journal within zbnv
 ```
 
@@ -296,6 +365,26 @@ evidence. Removing artificial size budgets does not close those hardware gates.
 
 Earlier C6 hardware runs demonstrated commissioning/reporting and OTA transfer
 to 18.3% before intentional cancellation. Complete C6
-verification/activation/reboot remains open. Neither current C6 variant above
-has hardware execution evidence. The former regression budgets are not live
-build gates.
+verification/activation/reboot remains open. The former regression budgets
+are not live build gates.
+
+Role images on an ESP32-C6 DevKit (hwlab, ZHA coordinator, channel 15):
+
+| role | result | hwlab sessions |
+|---|---|---|
+| router | joined ZHA as a Router, interview complete, 14–15 neighbours with LQI, 4–5 routes; ran more than 16 minutes without a restart. A router on another platform routed through it. Counters at the end: 982 raw TX attempts, 90 refused by the radio or never completed (the core retried them as a busy channel), 47 acknowledged TX with 25 missing ACKs (mostly one neighbour that never acknowledges); 0 Data Requests, so the Frame Pending hook has not yet run on hardware | `2026-11-01T103101Z-esp32c6-router-v2`, `2026-11-01T104229Z-esp32c6-router-v2-run` |
+| always-on ED | fresh join, Transport-Key, ED Timeout accepted, ZHA interview (`ESP32-C6-ED`, EndDevice); a system reset resumed from the journal without a rejoin | `2026-11-01T110710Z-esp32c6-ed-v3-join` |
+| SED (light sleep) | fresh join and interview (`ESP32-C6-Sensor`, EndDevice); humidity/temperature reports and ZHA attribute reads through 5 s polls; no failed-poll rejoin in 18 minutes; a system reset resumed from the journal | `2026-11-01T113839Z-esp32c6-sed-ls-v4-join`, `2026-11-01T115656Z-esp32c6-sed-ls-v4-reset-resume` |
+
+The router run used the image from before the receive-queue discard. That
+change passes `false` on router and ED paths, and those images were rebuilt
+and checked but not rerun on hardware.
+
+Open hardware gates:
+
+- No child has joined through the C6 router yet, so the auto-ACK Frame
+  Pending path is unproven on hardware.
+- Light sleep is vetoed while the native USB Serial/JTAG session is
+  attached. Sleep power needs a cold boot from a power-only supply.
+- Light-sleep current has not been measured.
+- The H2 role images are build-, layout- and symbol-checked only.

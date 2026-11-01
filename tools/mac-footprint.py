@@ -98,6 +98,15 @@ def _esp(chip: str, light_sleep: bool) -> Image:
         args, ESP_PHY_TOOLCHAIN)
 
 
+def _esp_role(chip: str, role: str) -> Image:
+    """An ESP mains role bin (`ed`/`router`) of the chip's example crate."""
+    return Image(
+        f"{chip}-{role}", f"examples/{chip}-sensor",
+        f"target/riscv32imac-unknown-none-elf/release/{chip}-{role}",
+        ["-Z", "build-std=core,alloc", "--no-default-features", "--features", role],
+        ESP_PHY_TOOLCHAIN)
+
+
 def _efr32s2(name: str, crate: str, role: str) -> Image:
     """A Series 2 role bin; `role=""` builds the crate's default role."""
     args = ["--no-default-features", "--features", role] if role else []
@@ -175,6 +184,10 @@ IMAGES: list[Image] = [
     _esp("esp32c6", True),
     _esp("esp32h2", False),
     _esp("esp32h2", True),
+    _esp_role("esp32c6", "ed"),
+    _esp_role("esp32c6", "router"),
+    _esp_role("esp32h2", "ed"),
+    _esp_role("esp32h2", "router"),
     Image("phy6222-sensor", "examples/phy6222-sensor",
           f"{_PHY_TARGET}/phy6222/thumbv6m-none-eabi/release/phy6222-sensor",
           ["--target-dir", f"{_PHY_TARGET}/phy6222"], ESP_PHY_TOOLCHAIN),

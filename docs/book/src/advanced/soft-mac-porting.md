@@ -37,7 +37,7 @@ Production status:
 | TLSR8258 sensors | yes, `TelinkMac` = `SoftMacCore<TelinkRadioPhy, EndDevice>` (`type Tx = FullTx`) | see the Telink platform guide; the `type Tx`/in-place `receive` port is build- and gate-checked only |
 | TLSR8258 router | yes, `TelinkRouterMac` = `SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>` | build-, layout- and symbol-checked only; the replaced hand-written router MAC was hardware-tested, the shared parent path is not yet |
 | CC2340R5 | yes, via `Cc2340SoftMac` (PBE CCA + TX + Imm-Ack wait, `type Tx = AckWaitTx`; RX decoded from the FIFO into the retained-RX slot) | build-, layout- and host-tested only; no hardware run since the migration; `cc2340-ed` build/symbol only; router rejected at link (36 KiB SRAM) |
-| ESP32-C6/H2 | yes, `EspSoftMac` = `SoftMacCore<EspRadioPhy, EndDevice>` (hardware auto-ACK; raw TX + software Imm-Ack window, `type Tx = AckWaitTx`; retained light sleep through `RadioPhy::sleep`/`wake`) | build-, layout-, symbol- and host-tested only; no hardware run since the migration |
+| ESP32-C6/H2 | yes, `EspSoftMac` = `SoftMacCore<EspRadioPhy, EndDevice>` (hardware auto-ACK; raw TX + software Imm-Ack window, `type Tx = AckWaitTx`; retained light sleep through `RadioPhy::sleep`/`wake`); router `EspRouterMac` = `SoftMacCore<EspRadioPhy, Parent<8, 8, 0>>` with Frame Pending set by the hardware auto-ACK | C6: router (ZHA join, interview, neighbours/LQI, >16 min stable), always-on ED (join, interview, reset resume) and SED (join, interview, reporting, reset resume) hardware-tested; no child has joined through the C6 router yet; light-sleep power not measured; H2 build-, layout- and symbol-checked only |
 | EFR32MG1 | yes, `Efr32Mac` = `SoftMacCore<Efr32RadioPhy, EndDevice, 1>` (FRC-IRQ software Imm-Ack, `type Tx = AckWaitTx`, in-place `receive`, extended-source fallback poll) | build-, layout-, symbol- and host-tested only; no hardware run since the migration; `efr32mg1-ed` build/layout/symbol only; router rejected at link (flash and SRAM) |
 | EFR32MG22/MG21 | yes, `Efr32s2SoftMac` = `SoftMacCore<Efr32s2RadioPhy>` (HAL software Imm-Ack while the receive window is polled, single-attempt CCA + TX + ACK wait, `type Tx = AckWaitTx`; in-place `receive`; extended-source fallback poll; radio resume after EM2 through `RadioPhy::wake`) | MG22 (BRD4183A): ZHA join, interview, reporting, journal resume and EM2 polling hardware-tested; MG21 on the ZBT-1: ZHA join, interview, Identify and journal resume lab-tested as an always-on End Device; BRD4181A image build-only |
 
@@ -219,6 +219,7 @@ that bit:
 | ACK path | `hardware_auto_ack` | FP source | `PENDING` |
 |---|---|---|---|
 | Hardware or ISR auto-ACK (TLSR8258, BL702 router) | `true` | HAL source-match table, armed through `RadioPhy::set_ack_frame_pending` | `0` |
+| Radio auto-ACK, FP decided in the RX_DONE interrupt (ESP32-C6/H2) | `true` | `zigbee_mac::ack_pending` table, consulted by the esp-radio `ieee802154-ack-pending` hook before the ACK goes out, armed through `RadioPhy::set_ack_frame_pending` | `0` |
 | Task-context software ACK (EFR32 Series 2 `SoftwareAck`) | `false` | core `PENDING` table; the core passes FP to `send_ack` | ≥ the child count |
 
 Never let both decide. In the task-context design, the HAL must not
