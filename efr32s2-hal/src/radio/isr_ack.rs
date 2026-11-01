@@ -235,6 +235,18 @@ const fn record_len(len: usize) -> usize {
     len + 2
 }
 
+/// Queue bytes kept free for ACK-requested frames: two maximum-length
+/// records. A broadcast storm then cannot fill the queue and leave
+/// unicasts to this node (child polls and data) unacknowledged.
+const ACKED_RESERVE: usize = 2 * record_len(MAX_FRAME);
+
+/// Whether a frame of `len` MPDU bytes fits into `free` queue bytes; a frame
+/// without an ACK request must also leave [`ACKED_RESERVE`] free.
+const fn admits(free: usize, len: usize, acked: bool) -> bool {
+    let reserve = if acked { 0 } else { ACKED_RESERVE };
+    free >= record_len(len) + reserve
+}
+
 struct QueueCell(UnsafeCell<RxQueue>);
 
 // SAFETY: same discipline as `SharedCell`.
@@ -449,8 +461,9 @@ fn examine(s: &mut Shared, entry: u32, rx_done: bool) {
         }
         let existed = offset.wrapping_sub(readoff0) & BUF_OFFSET_MASK < available0;
         let base = if existed { old_base } else { new_base };
-        let room = q.free() >= record_len(stored);
-        let keep = match classify(&header[..len], stored, &s.filter, &s.table) {
+        let verdict = classify(&header[..len], stored, &s.filter, &s.table);
+        let room = admits(q.free(), stored, matches!(verdict, Verdict::Ack { .. }));
+        let keep = match verdict {
             Verdict::Filter => {
                 s.stats.filtered = s.stats.filtered.wrapping_add(1);
                 false
@@ -915,6 +928,24 @@ mod tests {
         assert_eq!(&out[..3], &[0x41, 0x88, 0x07]);
         assert_eq!(q.pop(&mut out), None);
         assert_eq!(q.free(), RX_QUEUE_LEN);
+    }
+
+    #[test]
+    fn queue_reserves_room_for_acked_frames() {
+        let max = MAX_FRAME;
+        assert_eq!(ACKED_RESERVE, 2 * record_len(max));
+        // Broadcasts stop at the reserve; unicasts may use it.
+        let free = ACKED_RESERVE + record_len(max) - 1;
+        assert!(!admits(free, max, false));
+        assert!(admits(free, max, true));
+        assert!(admits(free, 10, false));
+        // Two maximum-length unicasts always fit after broadcasts stopped.
+        let mut free = ACKED_RESERVE;
+        for _ in 0..2 {
+            assert!(admits(free, max, true));
+            free -= record_len(max);
+        }
+        assert!(!admits(free, 3, true));
     }
 
     #[test]
