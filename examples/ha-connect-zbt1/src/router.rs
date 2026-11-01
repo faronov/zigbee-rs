@@ -1,8 +1,9 @@
 //! Home Assistant Connect ZBT-1 Zigbee Router (`--features router`).
 //!
 //! A true parent router: `Efr32s2RouterMac` (the shared `SoftMacCore` in the
-//! `Parent` role over the Series 2 PHY with software Imm-Acks, so Frame
-//! Pending follows the core's indirect queue) under
+//! `Parent` role over the Series 2 PHY; the HAL `isr-ack` interrupt sends
+//! each Imm-Ack in time, with Frame Pending from the HAL source-match table
+//! the core arms for queued indirect frames) under
 //! [`router_app::ParentRouterApp`]: beacons, association, indirect TX to
 //! sleepy children, routing, durable child and APS tables.
 //!
@@ -165,17 +166,29 @@ fn log_summary(app: &App) {
     let neighbors = nwk.neighbor_table();
     let phy = nwk.mac().phy();
     let radio = phy.radio_stats();
+    let ack = phy.ack_stats();
     log::info!(
-        "[ZBT1] neighbours {} children {} routes {} stale-ack drops {} rx {} overflows {} tx {} tx-fail {} acks {}",
+        "[ZBT1] neighbours {} children {} routes {} rx {} rx-ovf {} tx {} tx-fail {}",
         neighbors.len(),
         neighbors.children().count(),
         nwk.routing_table().len(),
-        phy.stale_ack_drops(),
         radio.rx_frames,
         radio.rx_overflows,
         radio.tx_frames,
-        radio.tx_failures,
-        radio.acks_sent
+        radio.tx_failures
+    );
+    log::info!(
+        "[ZBT1] isr-ack acks {} fp {} late {} filtered {} ovf {} queue-full {} resync {} ack-fail {} rx-restart-fail {} max-turnaround {}us",
+        ack.acks,
+        ack.fp_acks,
+        ack.late,
+        ack.filtered,
+        ack.overflows,
+        ack.queue_full,
+        ack.resyncs,
+        ack.ack_tx_fail,
+        ack.rx_restart_fail,
+        ack.max_turnaround_us
     );
     for child in neighbors.children() {
         log::info!(
