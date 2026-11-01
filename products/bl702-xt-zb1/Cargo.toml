@@ -7,6 +7,11 @@ description = "Product configuration for the BL702 XT-ZB1 Zigbee sensor"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
+[features]
+# Mains roles of the role template (always-on End Device and Router policy,
+# router journals); the sensor SED builds without it.
+roles = ["dep:router-app"]
+
 [dependencies]
 bl702-hal = { path = "../../bl702-hal" }
 bl702-xt-zb1 = { path = "../../boards/bl702-xt-zb1" }
@@ -14,6 +19,7 @@ bl702-xt-zb1-layout = { path = "layout" }
 embedded-storage = "0.3"
 log = "0.4"
 mcuboot-image = { path = "../../mcuboot-image", features = ["firmware-writer"] }
+router-app = { path = "../../apps/router", default-features = false, optional = true }
 sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"] }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-mac = { path = "../../zigbee-mac" }

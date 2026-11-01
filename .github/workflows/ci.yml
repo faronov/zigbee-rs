@@ -113,6 +113,10 @@ jobs:
             manifest: products/cc2340-sensor/Cargo.toml
             workspace: products/cc2340-sensor
             features: ""
+          - name: CC2340 sensor product (mains roles)
+            manifest: products/cc2340-sensor/Cargo.toml
+            workspace: products/cc2340-sensor
+            features: roles
           - name: CC2340R5 HAL
             manifest: cc2340r5-hal/Cargo.toml
             workspace: cc2340r5-hal
@@ -195,6 +199,18 @@ jobs:
             manifest: products/pb03f-kit/Cargo.toml
             workspace: products/pb03f-kit
             features: ""
+          - name: PB-03F-Kit product (mains roles)
+            manifest: products/pb03f-kit/Cargo.toml
+            workspace: products/pb03f-kit
+            features: roles
+          - name: PHY6222 sensor product (mains roles)
+            manifest: products/phy62x2-evk/Cargo.toml
+            workspace: products/phy62x2-evk
+            features: phy6222,roles
+          - name: PHY6252 sensor product (mains roles)
+            manifest: products/phy62x2-evk/Cargo.toml
+            workspace: products/phy62x2-evk
+            features: phy6252,roles
           # The EFR32MG1 HAL currently has host clippy findings
           # (manual is_multiple_of, Result<_, ()>); test it until they are
           # fixed, then drop `clippy: false`.
@@ -211,6 +227,10 @@ jobs:
             manifest: products/efr32mg1-tradfri/Cargo.toml
             workspace: products/efr32mg1-tradfri
             features: ""
+          - name: EFR32MG1 TRADFRI product (mains roles)
+            manifest: products/efr32mg1-tradfri/Cargo.toml
+            workspace: products/efr32mg1-tradfri
+            features: roles
           - name: EFR32 Series 2 HAL (MG21)
             manifest: efr32s2-hal/Cargo.toml
             workspace: efr32s2-hal
@@ -1044,11 +1064,15 @@ jobs:
           cargo test --locked --manifest-path bootloaders/bl702-boot/Cargo.toml --target "$HOST_TARGET"
           cargo test --locked --manifest-path products/bl702-xt-zb1/layout/Cargo.toml --target "$HOST_TARGET"
           cargo test --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET"
+          cargo test --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" --features roles
+          # Parent radio (FPT, receive ring, completion bits) host tests.
+          cargo test --locked -p zigbee-mac --features bl702 --lib bl702
           cargo clippy --locked --manifest-path bl702-hal/Cargo.toml --target "$HOST_TARGET" -- -D warnings
           cargo clippy --locked --manifest-path boards/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" -- -D warnings
           cargo clippy --locked --manifest-path bootloaders/bl702-boot/Cargo.toml --target "$HOST_TARGET" --all-targets -- -D warnings
           cargo clippy --locked --manifest-path products/bl702-xt-zb1/layout/Cargo.toml --target "$HOST_TARGET" --all-targets -- -D warnings
           cargo clippy --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" --all-targets --features roles -- -D warnings
           cargo clippy --locked --manifest-path bl702-hal/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
           cargo clippy --locked --manifest-path boards/bl702-xt-zb1/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
           cargo clippy --locked --manifest-path bootloaders/bl702-boot/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
@@ -1062,6 +1086,28 @@ jobs:
       - name: Clippy BL702 production composition
         working-directory: examples/bl702-sensor
         run: cargo clippy --release --locked --target riscv32imc-unknown-none-elf -- -D warnings
+      # Role template: always-on End Device and Router (hardware auto-ACK
+      # with the M154 Frame Pending table, core Parent<8, 8, 0>).
+      - name: Build and check BL702 End Device and Router
+        working-directory: examples/bl702-sensor
+        run: |
+          for role in ed router; do
+            cargo build --release --locked --features "$role" --bin "bl702-$role"
+            cargo clippy --release --locked --target riscv32imc-unknown-none-elf \
+              --features "$role" --bin "bl702-$role" -- -D warnings
+          done
+          DIR=target/riscv32imc-unknown-none-elf/release
+          ../../tools/check-role-symbols.sh leaf "$DIR/bl702-sensor" "$DIR/bl702-ed"
+          ../../tools/check-role-symbols.sh parent "$DIR/bl702-router"
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          for image in bl702-ed bl702-router; do
+            "$OBJCOPY" -O binary "$DIR/$image" "$DIR/$image.bin"
+            BYTES=$(stat -c '%s' "$DIR/$image.bin")
+            if (( BYTES > 0x75C00 )); then
+              echo "$image is ${BYTES} B; the primary slot holds 0x75C00 B" >&2
+              exit 1
+            fi
+          done
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: 3.11.9
@@ -1230,6 +1276,29 @@ jobs:
         env:
           CC2340_SDK_DIR: ${{ github.workspace }}/.ci/simplelink-lowpower-f3-sdk
         run: cargo build --release --locked --target-dir target/sdk
+      # Role template. The Router's static RAM leaves less than 16 KiB of
+      # stack in 36 KiB SRAM; the product linker script rejects it. Only the
+      # SDK mode links the real radio, so the assertion is checked there.
+      - name: CC2340 End Device builds, Router is rejected at link time
+        working-directory: examples/cc2340-sensor
+        env:
+          CC2340_SDK_DIR: ${{ github.workspace }}/.ci/simplelink-lowpower-f3-sdk
+        run: |
+          cargo build --release --locked --target-dir target/sdk \
+            --no-default-features --features ed --bin cc2340-ed
+          cargo clippy --release --locked --target-dir target/sdk --target thumbv6m-none-eabi \
+            --no-default-features --features ed --bin cc2340-ed -- -D warnings
+          DIR=target/sdk/thumbv6m-none-eabi/release
+          ../../tools/check-role-symbols.sh leaf "$DIR/cc2340-sensor" "$DIR/cc2340-ed"
+          if cargo build --release --locked --target-dir target/sdk \
+              --no-default-features --features router --bin cc2340-router 2> router.log; then
+            echo "CC2340 Router linked; it does not fit 36 KiB SRAM" >&2
+            exit 1
+          fi
+          grep -F 'CC2340 router: static RAM leaves less than 16 KiB of stack' router.log || {
+            cat router.log >&2
+            exit 1
+          }
       - name: Check CC2340 SDK, layout, AES, and role gates
         run: |
           ELF=examples/cc2340-sensor/target/sdk/thumbv6m-none-eabi/release/cc2340-sensor
@@ -1348,6 +1417,40 @@ jobs:
           cargo build --release --locked --no-default-features --features phy6252 \
             --target-dir target/phy6252
           sh check-layout.sh target/phy6252/thumbv6m-none-eabi/release/phy6222-sensor
+      # Role template: always-on End Devices fit; the Routers exceed the XIP
+      # slot and their links are rejected by the product linker scripts.
+      - name: PHY62x2 End Devices build, Routers are rejected at link time
+        working-directory: examples/phy6222-sensor
+        run: |
+          for chip in phy6222 phy6252; do
+            cargo build --release --locked --no-default-features \
+              --features "production,$chip,ed" --bin phy6222-ed --target-dir "target/$chip-ed"
+            ELF="target/$chip-ed/thumbv6m-none-eabi/release/phy6222-ed"
+            sh check-layout.sh "$ELF"
+            ../../tools/check-role-symbols.sh leaf "$ELF"
+          done
+          ../../tools/check-role-symbols.sh leaf \
+            target/thumbv6m-none-eabi/release/phy6222-sensor
+          if cargo build --release --locked --no-default-features \
+              --features production,phy6222,router --bin phy6222-router \
+              --target-dir target/phy6222-router 2> router.log; then
+            echo "PHY6222 Router linked; it does not fit the XIP slot" >&2
+            exit 1
+          fi
+          grep -F 'PHY62x2 XIP image exceeds the 187104-byte application slot' router.log || {
+            cat router.log >&2
+            exit 1
+          }
+          if cargo build --release --locked --no-default-features \
+              --features production,phy6252,router --bin phy6222-router \
+              --target-dir target/phy6252-router 2> router.log; then
+            echo "PHY6252 Router linked; it does not fit the XIP slot" >&2
+            exit 1
+          fi
+          grep -F 'PHY6252 router: PHY6 image overlaps the router-table journals at 0x3A000' router.log || {
+            cat router.log >&2
+            exit 1
+          }
 
   # ── Ai-Thinker PB-03F-Kit (PHY6252, ROM-boot image) ──────────
   build-pb03f:
@@ -1377,6 +1480,26 @@ jobs:
             XIP_SLOT_BYTES=200448 sh examples/phy6222-sensor/check-layout.sh \
               "examples/pb03f-kit/target/thumbv6m-none-eabi/release/$BIN"
           done
+      # Role template: the always-on End Device fits; the Router exceeds the
+      # 200,448 B XIP slot and its link is rejected.
+      - name: PB-03F-Kit End Device builds, Router is rejected at link time
+        working-directory: examples/pb03f-kit
+        run: |
+          cargo build --release --locked --no-default-features --features ed \
+            --bin pb03f-ed --target-dir target/ed
+          ELF=target/ed/thumbv6m-none-eabi/release/pb03f-ed
+          XIP_SLOT_BYTES=200448 sh ../phy6222-sensor/check-layout.sh "$ELF"
+          ../../tools/check-role-symbols.sh leaf "$ELF" \
+            target/thumbv6m-none-eabi/release/pb03f-zigbee
+          if cargo build --release --locked --no-default-features --features router \
+              --bin pb03f-router --target-dir target/router 2> router.log; then
+            echo "PB-03F-Kit Router linked; it does not fit the XIP slot" >&2
+            exit 1
+          fi
+          grep -F 'PHY62x2 XIP image exceeds the 200448-byte application slot' router.log || {
+            cat router.log >&2
+            exit 1
+          }
       - name: Create ROM-boot images
         run: |
           OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
@@ -1417,6 +1540,29 @@ jobs:
       - name: Clippy EFR32MG1 production composition
         working-directory: examples/efr32mg1-sensor
         run: cargo clippy --release --locked --target thumbv7em-none-eabi -- -D warnings
+      # Role template. The Router exceeds both the 188 KiB application window
+      # and the 16 KiB stack floor of the 0x7C00-byte SRAM; the product
+      # linker script rejects it.
+      - name: EFR32MG1 End Device builds, Router is rejected at link time
+        working-directory: examples/efr32mg1-sensor
+        run: |
+          cargo build --release --locked --no-default-features --features ed --bin efr32mg1-ed
+          cargo clippy --release --locked --target thumbv7em-none-eabi \
+            --no-default-features --features ed --bin efr32mg1-ed -- -D warnings
+          DIR=target/thumbv7em-none-eabi/release
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          python3 tools/verify-layout.py "$DIR/efr32mg1-ed"
+          NM="$NM" ./check-layout.sh "$DIR/efr32mg1-ed"
+          ../../tools/check-role-symbols.sh leaf "$DIR/efr32mg1-sensor" "$DIR/efr32mg1-ed"
+          if cargo build --release --locked --no-default-features --features router \
+              --bin efr32mg1-router 2> router.log; then
+            echo "EFR32MG1 Router linked; it does not fit the TRADFRI module" >&2
+            exit 1
+          fi
+          grep -F 'EFR32MG1 router: static RAM leaves less than 16 KiB of stack' router.log || {
+            cat router.log >&2
+            exit 1
+          }
       - name: Create firmware artifacts
         run: |
           ELF=examples/efr32mg1-sensor/target/thumbv7em-none-eabi/release/efr32mg1-sensor

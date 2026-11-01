@@ -13,10 +13,16 @@ publish = false
 
 [dependencies]
 embedded-storage = "0.3"
+router-app = { path = "../../apps/router", default-features = false, optional = true }
 sensor-sed-app = { path = "../../apps/sensor-sed" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[features]
+# Mains role policy and router journals (always-on End Device and Router
+# probe); the sleepy sensor builds without it.
+roles = ["dep:router-app"]
 
 [target.'cfg(target_os = "none")'.dependencies]
 lp-em-cc2340r5 = { path = "../../boards/lp-em-cc2340r5" }

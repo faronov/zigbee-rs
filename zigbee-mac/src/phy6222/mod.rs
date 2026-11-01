@@ -7,6 +7,10 @@
 //!   [`crate::PlatformServices`] adapter over the register-level [`driver`];
 //! - [`Phy6222SoftMac`]: the end-device `SoftMacCore` alias used by the
 //!   PHY62x2 examples;
+//! - [`Phy6222RouterMac`]: the parent role used only by the router size
+//!   probes. `LL_IRQ` owns the Imm-Ack but has no Frame Pending table, so
+//!   [`RadioPhy::set_ack_frame_pending`] stays `Unsupported` and indirect
+//!   delivery fails explicitly;
 //! - the factory EUI-64 (chip MADDR or the `OWN_PUBLIC_ADDR_LOC` record).
 //!
 //! All radio configuration uses direct register access in [`driver`]; the
@@ -30,8 +34,8 @@ pub mod driver;
 
 use crate::pib::MacPib;
 use crate::{
-    AckResult, AckWaitTx, MacError, PhyAddressFilter, PhyCapabilities, PhyError, PhyRxFrame,
-    PlatformServices, RadioPhy, SoftMacCore,
+    AckResult, AckWaitTx, MacError, MacRole, Parent, PhyAddressFilter, PhyCapabilities, PhyError,
+    PhyRxFrame, PlatformServices, RadioPhy, SoftMacCore,
 };
 use driver::{Phy6222Driver, RadioConfig, RadioError};
 use embassy_time::{Duration, Instant, Timer};
@@ -46,6 +50,19 @@ pub struct Phy6222RadioPhy {
 ///
 /// Construct with [`Phy6222RadioPhy::into_soft_mac`].
 pub type Phy6222SoftMac = SoftMacCore<Phy6222RadioPhy>;
+
+/// Parent role of the PHY62x2 router probes. The core's software Frame
+/// Pending table is empty: `LL_IRQ` sends every Imm-Ack (one FP owner) and
+/// has no source-match table yet, so arming Frame Pending fails.
+pub type Phy6222RouterRole = Parent<8, 8, 0>;
+
+/// Retained-RX depth of an always-on parent (child and neighbour traffic
+/// arrives between runtime receive calls).
+pub const PHY6222_ROUTER_PENDING_RX: usize = 8;
+
+/// Shared software MAC, parent role, over the PHY62x2 radio.
+pub type Phy6222RouterMac =
+    SoftMacCore<Phy6222RadioPhy, Phy6222RouterRole, PHY6222_ROUTER_PENDING_RX>;
 
 impl Phy6222RadioPhy {
     /// Acquire the single radio with the default configuration (48 MHz
@@ -95,6 +112,16 @@ impl Phy6222RadioPhy {
     pub fn into_soft_mac(self) -> Result<Phy6222SoftMac, MacError> {
         let pib = MacPib::new(self.extended_address(), 0, 0);
         SoftMacCore::new(self, pib)
+    }
+
+    /// Build a parent-role MAC, normally [`Phy6222RouterMac`], with the same
+    /// PIB as [`Self::into_soft_mac`]. Kept out of line like it.
+    #[inline(never)]
+    pub fn into_parent_mac<R: MacRole, const RX: usize>(
+        self,
+    ) -> Result<SoftMacCore<Self, R, RX>, MacError> {
+        let pib = MacPib::new(self.extended_address(), 0, 0);
+        SoftMacCore::new_custom(self, pib)
     }
 
     /// Radio counters and calibration results, for bring-up diagnostics.

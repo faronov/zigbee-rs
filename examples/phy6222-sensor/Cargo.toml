@@ -3,6 +3,29 @@ name = "phy6222-sensor"
 version = "0.1.0"
 edition = "2024"
 
+# One crate per board, one bin per Zigbee role. Exactly one role feature
+# may be enabled per build (`src/roles.rs` enforces it for the new bins);
+# the chip variant stays a separate feature:
+#   cargo build --release                                            # sed, phy6222
+#   cargo build --release --no-default-features --features production,phy6222,ed
+#   cargo build --release --no-default-features --features production,phy6222,router
+# The sleepy sensor has no `required-features`, so the documented
+# `--no-default-features --features phy6252` build still produces it. Build
+# the role bins with `--bin`.
+[[bin]]
+name = "phy6222-sensor"
+path = "src/main.rs"
+
+[[bin]]
+name = "phy6222-ed"
+path = "src/ed.rs"
+required-features = ["ed"]
+
+[[bin]]
+name = "phy6222-router"
+path = "src/router.rs"
+required-features = ["router"]
+
 [dependencies]
 # The product provisions only centralized Trust Center commissioning and has
 # no Groups server; keep the shared app's optional capabilities disabled.
@@ -11,6 +34,11 @@ zigbee-mac = { path = "../../zigbee-mac", default-features = false, features = [
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["compact-single-endpoint", "constrained-memory"] }
 phy62x2-evk = { path = "../../boards/phy62x2-evk", default-features = false }
 phy62x2-evk-product = { path = "../../products/phy62x2-evk", default-features = false }
+router-app = { path = "../../apps/router", default-features = false, optional = true }
+static_cell = { version = "2", optional = true }
+zigbee-nwk = { path = "../../zigbee-nwk", optional = true }
+zigbee-types = { path = "../../zigbee-types", optional = true }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false, optional = true }
 
 # Embassy async runtime
 # The `main` task future (~12 KiB: device, NWK/APS tables, profile) is
@@ -31,7 +59,14 @@ log = { version = "0.4", default-features = false }
 panic-halt = "1.0"
 
 [features]
-default = ["production", "phy6222"]
+default = ["production", "phy6222", "sed"]
+# Sleepy environmental sensor (the original image).
+sed = []
+# Always-on End Device: router-app AlwaysOnEndDeviceApp, end-device MAC.
+ed = ["dep:router-app", "dep:static_cell", "dep:zigbee-nwk", "dep:zigbee-types", "dep:zigbee-zcl", "phy62x2-evk-product/roles"]
+# Router size probe: parent MAC, ParentRouterApp, durable child and APS
+# tables. Does NOT fit the XIP slot; the link is rejected (src/router.rs).
+router = ["dep:router-app", "dep:static_cell", "dep:zigbee-nwk", "dep:zigbee-types", "dep:zigbee-zcl", "phy62x2-evk-product/roles", "router-app/router", "zigbee-runtime/router"]
 production = ["log/release_max_level_off"]
 phy6222 = ["phy62x2-evk/phy6222", "phy62x2-evk-product/phy6222"]
 phy6252 = ["phy62x2-evk/phy6252", "phy62x2-evk-product/phy6252"]

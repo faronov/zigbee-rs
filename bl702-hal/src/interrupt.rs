@@ -35,6 +35,8 @@ const IRQ_NUM_BASE: u16 = 16;
 pub const TIMER_CH0_IRQ: u16 = IRQ_NUM_BASE + 36;
 /// TIMER channel 1 interrupt.
 pub const TIMER_CH1_IRQ: u16 = IRQ_NUM_BASE + 37;
+/// IEEE 802.15.4 MAC (M154) interrupt (`M154_IRQn` in the vendor `bl702.h`).
+pub const M154_IRQ: u16 = IRQ_NUM_BASE + 48;
 
 /// Mask selecting the CLIC exception/interrupt code from `mcause`.
 const MCAUSE_CODE_MASK: u32 = 0x3ff;

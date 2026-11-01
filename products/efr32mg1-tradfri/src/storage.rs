@@ -50,8 +50,9 @@ impl<const START: u32, const SIZE: usize> PartitionFlash<START, SIZE> {
     /// # Safety
     ///
     /// The caller must hold the unique partition token for `[START,
-    /// START + SIZE)` (minted only by [`split_flash`]).
-    const unsafe fn new() -> Self {
+    /// START + SIZE)` (minted only by [`split_flash`] or, for the
+    /// router-only journals, by [`crate::router::router_stores`]).
+    pub(crate) const unsafe fn new() -> Self {
         Self {
             // SAFETY: the internal-flash handle was consumed by
             // `split_flash`; this view only issues MSC operations inside its

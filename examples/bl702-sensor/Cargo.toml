@@ -3,15 +3,42 @@ name = "bl702-sensor"
 version = "0.1.0"
 edition = "2024"
 
+# Always-on End Device (`--features ed --bin bl702-ed`).
+[[bin]]
+name = "bl702-ed"
+path = "src/bin/ed.rs"
+required-features = ["ed"]
+test = false
+bench = false
+
+# Router (`--features router --bin bl702-router`): hardware auto-ACK with
+# the M154 Frame Pending table (`zigbee_mac::bl702::parent_phy`).
+[[bin]]
+name = "bl702-router"
+path = "src/bin/router.rs"
+required-features = ["router"]
+test = false
+bench = false
+
 [features]
 default = ["production"]
 production = ["log/release_max_level_off"]
 diagnostic-logging = []
+# Mains roles of the role template; build one at a time (src/roles.rs
+# rejects both together). The sensor SED (`bl702-sensor`) needs neither.
+ed = ["dep:router-app", "dep:static_cell", "dep:portable-atomic", "dep:zigbee-nwk", "bl702-xt-zb1-product/roles"]
+router = ["dep:router-app", "dep:static_cell", "dep:portable-atomic", "dep:zigbee-nwk", "bl702-xt-zb1-product/roles", "router-app/router", "zigbee-runtime/router"]
 
 [dependencies]
 bl702-hal = { path = "../../bl702-hal" }
 bl702-xt-zb1 = { path = "../../boards/bl702-xt-zb1" }
 bl702-xt-zb1-product = { path = "../../products/bl702-xt-zb1" }
+router-app = { path = "../../apps/router", default-features = false, optional = true }
+static_cell = { version = "2", optional = true }
+# riscv32imc has no CAS: `static_cell` claims its cells through
+# portable-atomic's critical section (riscv `critical-section-single-hart`).
+portable-atomic = { version = "1", default-features = false, features = ["critical-section"], optional = true }
+zigbee-nwk = { path = "../../zigbee-nwk", optional = true }
 sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"] }
 zigbee-mac = { path = "../../zigbee-mac", features = ["bl702", "hardware-aes-bl702"] }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }

@@ -25,6 +25,14 @@ fn main() {
     let output_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     fs::copy(&local_script, output_dir.join("memory.x")).expect("copy memory.x to OUT_DIR");
 
+    // The router probe alone reserves 0x7A000..0x7E000 for its child/APS
+    // journals (products/cc2340-sensor/link/router-tables.x).
+    let router_script = manifest_dir.join("../../products/cc2340-sensor/link/router-tables.x");
+    fs::copy(&router_script, output_dir.join("router-tables.x"))
+        .expect("copy router-tables.x to OUT_DIR");
+    println!("cargo:rustc-link-arg-bin=cc2340-router=-Trouter-tables.x");
+    println!("cargo:rerun-if-changed={}", router_script.display());
+
     println!("cargo:rustc-link-search={}", output_dir.display());
     println!("cargo:rustc-link-arg=-Tlink.x");
     println!("cargo:rerun-if-changed={}", local_script.display());

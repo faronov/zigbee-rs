@@ -1,13 +1,21 @@
 //! Product policy for the BL702 XT-ZB1 Zigbee sensor.
+//!
+//! Feature `roles` adds the mains roles of the role template: an always-on
+//! (receiver-on-when-idle) End Device ([`end_device`]) and a Router
+//! ([`router`]) with its child and APS journals.
 
 #![no_std]
 
 pub mod battery;
+#[cfg(feature = "roles")]
+pub mod end_device;
 pub mod environment;
 pub mod identity;
 pub mod ota;
 pub mod policy;
 pub mod profile;
+#[cfg(feature = "roles")]
+pub mod router;
 pub mod storage;
 
 use zigbee_types::ChannelMask;
@@ -23,3 +31,24 @@ pub const ENDPOINT: u8 = 1;
 pub const CHANNEL: u8 = 15;
 pub const CHANNEL_MASK: ChannelMask = ChannelMask(1u32 << CHANNEL);
 pub const TX_POWER_DBM: i8 = 0;
+
+/// Security-journal role tags (`SecurityStateJournal::select_role_tag`).
+///
+/// All role images share one security journal so outgoing frame counters
+/// stay monotonic across a reflash; the tag stops one role from resuming
+/// another role's network state. The sensor SED predates the tags and
+/// writes none, so leave the network before flashing it after a tagged
+/// role.
+pub mod role {
+    pub const ROUTER: u16 = 0x5201;
+    pub const END_DEVICE: u16 = 0x5202;
+}
+
+/// Model identifiers of the role images.
+pub const ROUTER_MODEL: &str = "XT-ZB1-Router";
+pub const END_DEVICE_MODEL: &str = "XT-ZB1-ED";
+
+/// Mains roles re-arm commissioning on their own this long after a Leave
+/// (the board has no button); longer than a ZHA permit-join window so a
+/// removed device does not rejoin the window that removed it.
+pub const RECOMMISSION_AFTER_LEAVE_MS: u64 = 5 * 60 * 1000;

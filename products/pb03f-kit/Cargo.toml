@@ -11,8 +11,14 @@ publish = false
 # workspace because the board crate is target-only.
 [workspace]
 
+[features]
+# Mains role policy and router journals (always-on End Device and Router
+# probe); the polling `pb03f-zigbee` end device builds without it.
+roles = ["dep:router-app"]
+
 [dependencies]
 embedded-storage = "0.3"
+router-app = { path = "../../apps/router", default-features = false, optional = true }
 sensor-sed-app = { path = "../../apps/sensor-sed", default-features = false }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-mac = { path = "../../zigbee-mac", default-features = false, features = ["phy6222"] }

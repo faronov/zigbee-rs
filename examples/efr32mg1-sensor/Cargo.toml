@@ -4,9 +4,27 @@ version = "0.1.0"
 edition = "2024"
 autobins = false
 
+# One crate per board, one bin per Zigbee role. Exactly one role feature
+# may be enabled per build (`src/roles.rs` enforces it for the new bins), so
+# dependency feature unification never links router or sleepy/OTA code into
+# the wrong image:
+#   cargo build --release                                       # sed (default)
+#   cargo build --release --no-default-features --features ed
+#   cargo build --release --no-default-features --features router
 [[bin]]
 name = "efr32mg1-sensor"
 path = "src/main.rs"
+required-features = ["sed"]
+
+[[bin]]
+name = "efr32mg1-ed"
+path = "src/ed.rs"
+required-features = ["ed"]
+
+[[bin]]
+name = "efr32mg1-router"
+path = "src/router.rs"
+required-features = ["router"]
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
@@ -15,10 +33,11 @@ zigbee-mac = { path = "../../zigbee-mac", features = ["hardware-aes-efr32mg1"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["constrained-memory", "ota"] }
-sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["constrained-memory"] }
+sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"], optional = true }
+router-app = { path = "../../apps/router", default-features = false, optional = true }
 efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
-efr32mg1-tradfri-product = { path = "../../products/efr32mg1-tradfri" }
+efr32mg1-tradfri-product = { path = "../../products/efr32mg1-tradfri", default-features = false }
 efr32mg1-hal = { path = "../../efr32mg1-hal" }
 zigbee-sht3x = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "69e073cb921c4effef567eab886c054a58d02b49" }
 zigbee-sensor = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "69e073cb921c4effef567eab886c054a58d02b49" }
@@ -45,6 +64,18 @@ cortex-m-rt = { version = "0.7", features = ["device", "set-vtor"] }
 static_cell = "2"
 
 rtt-target = "0.6"
+
+[features]
+default = ["sed"]
+# Sleepy temperature/humidity sensor with Gecko-bootloader OTA (the original
+# image).
+sed = ["dep:sensor-sed-app", "efr32mg1-tradfri-product/sed", "zigbee-runtime/ota"]
+# Always-on End Device: router-app AlwaysOnEndDeviceApp, end-device MAC.
+ed = ["dep:router-app", "efr32mg1-tradfri-product/roles"]
+# Router size probe: parent MAC, ParentRouterApp, durable child and APS
+# tables. Does NOT fit the EFR32MG1P132F256; the router-only linker guard
+# rejects the link (see src/router.rs).
+router = ["dep:router-app", "efr32mg1-tradfri-product/roles", "router-app/router", "zigbee-runtime/router"]
 
 [profile.release]
 opt-level = "s"

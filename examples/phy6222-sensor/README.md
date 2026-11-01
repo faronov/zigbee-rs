@@ -62,6 +62,14 @@ network is rejected rather than resumed. The product also has one application
 endpoint, no Groups server, and three default reports, so it selects the shared
 compact endpoint/reporting capacities and omits the unused Groups-to-APS bridge.
 
+## Role images
+
+`phy6222-sensor` (default, sleepy) and `phy6222-ed`
+(`--no-default-features --features production,phy6222,ed --bin phy6222-ed`,
+or `phy6252,ed`) build. The `phy6222-router` probe is rejected at link time:
+its code exceeds the XIP slot. See the
+[PHY6222 guide](../../docs/book/src/platform-guides/phy6222.md#role-images).
+
 ## ROM image layout
 
 The PHY62x2 ROM reserves the beginning of SRAM for jump/configuration tables.

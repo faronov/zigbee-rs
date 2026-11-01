@@ -20,6 +20,12 @@
 //!   └── direct M154 polling TX/RX/CCA
 //! ```
 //!
+//! Parent roles use [`parent_phy::Bl702ParentRadioPhy`] instead: M154
+//! hardware auto-ACK with the M154 Frame Pending table as the single Frame
+//! Pending owner, the receiver on when idle, and an ISR-fed receive ring
+//! ([`parent_phy::Bl702RouterMac`]). That path compiles and its table logic
+//! is host-tested; it has not run on hardware.
+//!
 //! The earlier `Bl702Mac` wrapper around Bouffalo's binary `liblmac154.a`
 //! has been removed; no vendor radio archive is linked.
 //!
@@ -37,6 +43,7 @@
 //! `riscv32imc-unknown-none-elf`. Cold-start calibration, energy detect, RX,
 //! and TX have been observed on channel 15.
 
+pub mod parent_phy;
 pub mod radio_phy;
 mod registers;
 mod rf;

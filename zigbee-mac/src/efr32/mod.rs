@@ -9,6 +9,10 @@
 //!   adapter over [`driver`];
 //! - [`Efr32Mac`]: the end-device MAC used by `efr32mg1-sensor`, a plain
 //!   alias of the shared core in the end-device role;
+//! - [`Efr32RouterMac`]: the parent role used only by the router size
+//!   probe. The FRC IRQ owns the Imm-Ack but has no Frame Pending table,
+//!   so [`RadioPhy::set_ack_frame_pending`] stays `Unsupported` and indirect
+//!   delivery fails explicitly (the router image does not fit the part);
 //! - the factory EUI-64 (DEVINFO.UNIQUEL/H).
 //!
 //! # Division of work
@@ -28,8 +32,8 @@ use core::future::Future;
 
 use crate::pib::MacPib;
 use crate::{
-    AckResult, AckWaitTx, EndDevice, MacError, PhyAddressFilter, PhyCapabilities, PhyError,
-    PhyRxFrame, PlatformServices, RadioPhy, SoftMacCore,
+    AckResult, AckWaitTx, EndDevice, MacError, MacRole, Parent, PhyAddressFilter, PhyCapabilities,
+    PhyError, PhyRxFrame, PlatformServices, RadioPhy, SoftMacCore,
 };
 use driver::{Efr32Driver, RadioConfig, RadioError};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
@@ -48,6 +52,18 @@ pub const EFR32_PENDING_RX: usize = 1;
 
 /// Shared software MAC (end-device role) on the EFR32MG1 radio.
 pub type Efr32SoftMac = SoftMacCore<Efr32RadioPhy, EndDevice, EFR32_PENDING_RX>;
+
+/// Parent role of the EFR32MG1 router probe. The core's software Frame
+/// Pending table is empty: the FRC IRQ sends every Imm-Ack (one FP owner),
+/// and it has no source-match table yet, so arming Frame Pending fails.
+pub type Efr32RouterRole = Parent<8, 8, 0>;
+
+/// Retained-RX depth of an always-on parent (child and neighbour traffic
+/// arrives between runtime receive calls).
+pub const EFR32_ROUTER_PENDING_RX: usize = 8;
+
+/// Shared software MAC, parent role, on the EFR32MG1 radio.
+pub type Efr32RouterMac = SoftMacCore<Efr32RadioPhy, Efr32RouterRole, EFR32_ROUTER_PENDING_RX>;
 
 /// EFR32MG1P radio exposed through the portable PHY contract.
 pub struct Efr32RadioPhy {
@@ -111,6 +127,15 @@ impl Efr32RadioPhy {
     #[inline(never)]
     pub fn into_soft_mac_with_address(self, ieee: IeeeAddress) -> Result<Efr32Mac, MacError> {
         SoftMacCore::new_custom(self, MacPib::new(ieee, 0, 0))
+    }
+
+    /// Build a parent-role MAC, normally [`Efr32RouterMac`], with the
+    /// factory EUI-64. Kept out of line like [`Self::into_soft_mac`].
+    #[inline(never)]
+    pub fn into_parent_mac<R: MacRole, const RX: usize>(
+        self,
+    ) -> Result<SoftMacCore<Self, R, RX>, MacError> {
+        SoftMacCore::new_custom(self, MacPib::new(Self::read_factory_ieee(), 0, 0))
     }
 
     /// Print a compact radio snapshot (`efr32-trace`).
