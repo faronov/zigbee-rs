@@ -31,6 +31,8 @@ pub use self::{
     pib::{CcaMode, PendingMode},
     raw::RawReceived,
 };
+#[cfg(feature = "ieee802154-ack-pending")]
+pub use self::raw::AckPendingFn;
 
 mod frame;
 mod hal;
@@ -185,10 +187,22 @@ impl<'a> Ieee802154<'a> {
     /// On a veto the PHY remains enabled. CPU/top/modem register domains must
     /// remain retained until `resume`; this does not support reset-on-wake sleep.
     pub fn try_suspend(&mut self) -> Result<(), SuspendError> {
+        self.try_suspend_with(false)
+    }
+
+    /// [`Self::try_suspend`] that first drops every queued received frame
+    /// (local patch: a sleepy end device discards what it heard while it was
+    /// not receiving, instead of vetoing sleep on it).
+    pub fn try_suspend_discarding_received(&mut self) -> Result<(), SuspendError> {
+        self.try_suspend_with(true)
+    }
+
+    #[inline(always)]
+    fn try_suspend_with(&mut self, discard_queued: bool) -> Result<(), SuspendError> {
         if self.phy_init_guard.is_none() {
             return Ok(());
         }
-        raw::try_suspend()?;
+        raw::try_suspend(discard_queued)?;
         self.phy_init_guard.take();
         Ok(())
     }
@@ -279,6 +293,18 @@ impl<'a> Ieee802154<'a> {
 
     /// Transmit a raw frame
     pub fn transmit_raw(&mut self, frame: &[u8]) -> Result<(), Error> {
+        self.transmit_raw_discarding(frame, false)
+    }
+
+    /// [`Self::transmit_raw`] that first drops every queued received frame
+    /// when `discard_received` is set (local patch: a sleepy end device
+    /// discards what it heard while it was not receiving).
+    #[inline(always)]
+    pub fn transmit_raw_discarding(
+        &mut self,
+        frame: &[u8],
+        discard_received: bool,
+    ) -> Result<(), Error> {
         raw::can_transmit()?;
         if frame.len() > self.transmit_buffer.len() - 1 {
             return Err(Error::Incomplete);
@@ -286,7 +312,22 @@ impl<'a> Ieee802154<'a> {
         self.transmit_buffer[1..][..frame.len()].copy_from_slice(frame);
         self.transmit_buffer[0] = frame.len() as u8;
 
-        ieee802154_transmit(self.transmit_buffer.as_ptr(), false)
+        raw::transmit_discarding(self.transmit_buffer.as_ptr(), false, discard_received)
+    }
+
+    /// Install the hook that decides the Frame Pending bit of every hardware
+    /// auto-ACK (local patch). It runs in the RX_DONE interrupt, before the
+    /// ACK is sent, with the received MAC frame (FCS bytes replaced by
+    /// RSSI/LQI); it must be short and must not block.
+    #[cfg(feature = "ieee802154-ack-pending")]
+    pub fn set_ack_pending_fn(&mut self, hook: AckPendingFn) {
+        raw::set_ack_pending_fn(Some(hook));
+    }
+
+    /// Remove the Frame Pending hook; auto-ACKs then carry Frame Pending = 0.
+    #[cfg(feature = "ieee802154-ack-pending")]
+    pub fn clear_ack_pending_fn(&mut self) {
+        raw::set_ack_pending_fn(None);
     }
 
     /// Set the transmit done callback function.
@@ -343,6 +384,8 @@ impl Drop for Ieee802154<'_> {
         self.clear_tx_done_callback_fn();
         self.clear_rx_available_callback();
         self.clear_rx_available_callback_fn();
+        #[cfg(feature = "ieee802154-ack-pending")]
+        self.clear_ack_pending_fn();
     }
 }
 

@@ -37,6 +37,45 @@ static STATE: NonReentrantMutex<IeeeState> = NonReentrantMutex::new(IeeeState {
     rx_queue_size: 10,
 });
 
+/// Decides the Frame Pending bit of the hardware auto-ACK for one received
+/// frame (local patch, see `LOCAL-PATCHES.md`). Runs in the RX_DONE
+/// interrupt between the end of the frame and the ACK the hardware sends
+/// `aTurnaroundTime` later, so it must be short and must not block.
+#[cfg(feature = "ieee802154-ack-pending")]
+pub type AckPendingFn = fn(&[u8]) -> bool;
+
+#[cfg(feature = "ieee802154-ack-pending")]
+static ACK_PENDING_FN: NonReentrantMutex<Option<AckPendingFn>> = NonReentrantMutex::new(None);
+
+#[cfg(feature = "ieee802154-ack-pending")]
+pub(crate) fn set_ack_pending_fn(hook: Option<AckPendingFn>) {
+    // No register access here (the driver may already be shut down): the
+    // RX_DONE handler rewrites the bit before every auto-ACK, `false` once
+    // the hook is gone.
+    ACK_PENDING_FN.with(|slot| *slot = hook);
+}
+
+/// ESP-IDF `ieee802154_ack_config_pending_bit()` equivalent for
+/// `PendingMode::Enable`: before the hardware ACK leaves, program its Frame
+/// Pending bit from the hook. Every auto-acknowledged frame rewrites the
+/// bit, so a stale `true` never leaks into a later ACK.
+#[cfg(feature = "ieee802154-ack-pending")]
+fn config_ack_pending_bit() {
+    // SAFETY: RX_BUFFER is only written by the RX DMA, which is between
+    // frames while RX_DONE is handled; this is the same read the queue push
+    // below performs.
+    let frame = unsafe {
+        let buffer = &*core::ptr::addr_of!(RX_BUFFER);
+        let len = usize::from(buffer[0]).min(FRAME_SIZE - 1);
+        &buffer[1..][..len]
+    };
+    if !will_auto_send_ack(frame) {
+        return;
+    }
+    let pending = ACK_PENDING_FN.with(|slot| slot.is_some_and(|hook| hook(frame)));
+    set_ack_frame_pending(pending);
+}
+
 unsafe extern "C" {
     fn bt_bb_v2_init_cmplx(print_version: u8); // from libbtbb.a
 
@@ -191,18 +230,29 @@ pub(crate) fn set_queue_size(rx_queue_size: usize) {
 }
 
 pub fn ieee802154_transmit(frame: *const u8, cca: bool) -> Result<(), super::Error> {
+    transmit_discarding(frame, cca, false)
+}
+
+/// [`ieee802154_transmit`] that first drops every queued received frame when
+/// `discard_queued` is set (local patch, see LOCAL-PATCHES.md).
+#[inline(always)]
+pub(crate) fn transmit_discarding(
+    frame: *const u8,
+    cca: bool,
+    discard_queued: bool,
+) -> Result<(), super::Error> {
     use super::suspend::Boundary;
     STATE.with(|state| {
         match state.state {
             Ieee802154State::Sleep => return Err(super::Error::Sleeping),
             Ieee802154State::Transmit | Ieee802154State::TxAck => return Err(super::Error::Busy),
-            _ if events() != 0
-                || receive_in_progress()
-                || state.rx_queue.len() >= state.rx_queue_size =>
-            {
+            _ if events() != 0 || receive_in_progress() || rx_queue_blocks_tx(state) => {
                 return Err(super::Error::Busy);
             }
             _ => {}
+        }
+        if discard_queued {
+            state.rx_queue.clear();
         }
         let mut boundary = SleepBoundary(state);
         boundary.stop();
@@ -255,6 +305,15 @@ pub fn ieee802154_receive() -> i32 {
 fn receive_in_progress() -> bool {
     // ESP-IDF 5.5.1 ieee802154_ll_is_current_rx_frame.
     IEEE802154::regs().rx_status().read().rx_state().bits() > 1
+}
+
+/// Whether a full receive queue refuses transmission. Upstream esp-radio
+/// refuses; ESP-IDF does not (a full RX path only drops further frames).
+/// A router that is relaying a broadcast storm must still transmit, so the
+/// local `ieee802154-tx-when-rx-full` patch removes the check.
+#[inline(always)]
+fn rx_queue_blocks_tx(state: &IeeeState) -> bool {
+    !cfg!(feature = "ieee802154-tx-when-rx-full") && state.rx_queue.len() >= state.rx_queue_size
 }
 
 pub(crate) fn can_transmit() -> Result<(), super::Error> {
@@ -317,8 +376,13 @@ impl super::suspend::Boundary for SleepBoundary<'_> {
     }
 }
 
-pub(crate) fn try_suspend() -> Result<(), super::SuspendError> {
-    STATE.with(|state| super::suspend::try_suspend(&mut SleepBoundary(state)))
+pub(crate) fn try_suspend(discard_queued: bool) -> Result<(), super::SuspendError> {
+    STATE.with(|state| {
+        if discard_queued {
+            state.rx_queue.clear();
+        }
+        super::suspend::try_suspend(&mut SleepBoundary(state))
+    })
 }
 
 pub(crate) fn resume() {
@@ -519,6 +583,9 @@ fn zb_mac_handler() {
 
     if events & Event::RxDone != 0 {
         trace!("rx done");
+        // First, before the queue push: the ACK leaves 192 µs after RX_DONE.
+        #[cfg(feature = "ieee802154-ack-pending")]
+        config_ack_pending_bit();
         unsafe {
             trace!(
                 "Received raw {:?}",

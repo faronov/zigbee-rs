@@ -380,6 +380,17 @@ pub(crate) fn set_pending_mode(enable: bool) {
         .modify(|_, w| w.autopend_enhance().bit(enable));
 }
 
+/// Frame Pending bit the hardware puts into its next auto-ACK. With
+/// `autopend_enhance` clear (every pending mode except `Enhanced`) the
+/// hardware applies it only to the ACK of a MAC Data Request.
+#[cfg(feature = "ieee802154-ack-pending")]
+#[inline(always)]
+pub(crate) fn set_ack_frame_pending(enable: bool) {
+    IEEE802154::regs()
+        .ack_frame_pending_en()
+        .modify(|_, w| w.ack_frame_pending_en().bit(enable));
+}
+
 #[inline(always)]
 pub(crate) fn events() -> u16 {
     IEEE802154::regs().event_status().read().bits() as u16

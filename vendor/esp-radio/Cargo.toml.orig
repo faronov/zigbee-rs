@@ -192,6 +192,12 @@ csi = []
 ## Enable IEEE 802.15.4.
 ## Cannot be used together with Wi-Fi.
 ieee802154 = ["dep:byte", "dep:ieee802154"]
+## Local patch: per-frame Frame Pending in the hardware auto-ACK, decided in
+## the RX_DONE interrupt by a hook (parent/router role only).
+ieee802154-ack-pending = ["ieee802154"]
+## Local patch: do not refuse a transmission because the receive queue is
+## full (ESP-IDF has no such rule; a router must keep forwarding).
+ieee802154-tx-when-rx-full = ["ieee802154"]
 
 #! ### Ecosystem Feature Flags
 
