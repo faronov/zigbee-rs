@@ -218,16 +218,32 @@ that bit:
 
 | ACK path | `hardware_auto_ack` | FP source | `PENDING` |
 |---|---|---|---|
-| Hardware or ISR auto-ACK (TLSR8258) | `true` | HAL source-match table, armed through `RadioPhy::set_ack_frame_pending` | `0` |
-| Task-context software ACK (EFR32 Series 2 `SoftwareAck`) | `false` | core `PENDING` table; the core passes FP to `send_ack` | ≥ the child count |
+| Hardware or ISR auto-ACK (TLSR8258, EFR32 Series 2 routers with `isr-ack`) | `true` | HAL source-match table, armed through `RadioPhy::set_ack_frame_pending` | `0` |
+| Task-context software ACK | `false` | core `PENDING` table; the core passes FP to `send_ack` | ≥ the child count |
 
 Never let both decide. In the task-context design, the HAL must not
 acknowledge on its own, so its ACK filter stays empty. Otherwise the HAL's
 ACK, with FP clear, races the core's ACK.
 
-For a task-context ACK, also give the PHY a deadline. EFR32 Series 2 drops a
-frame that is already older than 400 µs when `receive` returns it, because the
-sender has stopped waiting by then. It counts these drops in `stale_ack_drops`.
+Prefer the HAL/ISR design. A task-context ACK is only on time while the core
+is idle in `receive`: during software AES-CCM*, logging or NWK delays the
+next frame ages past the 864 µs macAckWaitDuration, and the PHY must drop it
+unacknowledged so the sender retries. The first EFR32 Series 2 router used
+this design and dropped 123 of 281 acknowledgeable frames with one polling
+child in 16 minutes. Its replacement, the `FRC` RX-done interrupt in
+`efr32s2-hal/src/radio/isr_ack.rs`, is a portable pattern for radios
+without a hardware ACK engine:
+
+- the interrupt reads only the MHR, filters PAN ID and destination, and
+  starts a precomputed ACK at once;
+- FP = 1 only for a MAC Data Request whose source is in the table; data
+  frames are ACKed with FP = 0;
+- it drops frames it could not ACK in time, plus ACKs and foreign frames,
+  and copies the frames it keeps into a software queue, so the hardware RX
+  buffer is empty after every interrupt, even while the task is blocked in
+  NWK delays;
+- task-side radio operations mask the interrupt, and `receive` pops only
+  from that queue, so the ACK decision always comes before delivery.
 
 ### Role template (one example crate per board)
 
@@ -256,7 +272,7 @@ Rules that make the template safe to copy:
 - **MAC type per role.** The end-device bins use the end-device MAC type,
   for example `SoftMacCore<Phy, EndDevice>`. The router bin uses the
   parent-role alias, for example `Efr32s2RouterMac = SoftMacCore<Phy,
-  Parent<8, 8, 8>>`. Only the router enables `zigbee-runtime/router` and
+  Parent<8, 8, 0>>` (PENDING = 0 because the HAL owns Frame Pending). Only the router enables `zigbee-runtime/router` and
   `router-app/router`.
   `tools/check-role-symbols.sh leaf|parent` checks every linked image in CI.
 - **Role tag in the security journal.** Each new role image writes its own
