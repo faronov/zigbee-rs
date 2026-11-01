@@ -80,6 +80,13 @@ def _nrf(name: str, crate: str, features: str = "") -> Image:
                  f"target/thumbv7em-none-eabihf/release/{crate}", args)
 
 
+def _nrf_role(name: str, crate: str, role: str) -> Image:
+    """An nRF role bin; `role=""` builds the crate's default role."""
+    args = ["--no-default-features", "--features", role] if role else []
+    return Image(name, f"examples/{crate}",
+                 f"target/thumbv7em-none-eabihf/release/{name}", args)
+
+
 def _uf2(board: str, feature: str) -> Image:
     return Image(
         f"nrf52840-sensor-uf2-{board}", "examples/nrf52840-sensor-uf2",
@@ -146,7 +153,10 @@ IMAGES: list[Image] = [
     _nrf("nrf52833-sensor", "nrf52833-sensor"),
     _nrf("nrf52833-sensor-bme280", "nrf52833-sensor", "sensor-bme280"),
     _nrf("nrf52833-sensor-sht31", "nrf52833-sensor", "sensor-sht31"),
-    _nrf("nrf52840-router", "nrf52840-router"),
+    _nrf_role("nrf52833-ed", "nrf52833-sensor", "ed"),
+    _nrf_role("nrf52833-router", "nrf52833-sensor", "router"),
+    _nrf_role("nrf52840-ed", "nrf52840-router", ""),
+    _nrf_role("nrf52840-router", "nrf52840-router", "router"),
     _uf2("promicro", "board-promicro"),
     _uf2("mdk", "board-mdk"),
     _uf2("pca10059", "board-nrf-dongle"),

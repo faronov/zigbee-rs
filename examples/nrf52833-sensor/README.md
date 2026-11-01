@@ -8,6 +8,24 @@ The root constructs `sensor_sed_app::SensorApp` directly from its Nordic
 capability adapters and `SensorSedParts`; it does not own a separate
 commissioning, polling, or reporting state machine.
 
+## Roles
+
+The crate has one bin per role, with mutually exclusive features:
+
+| bin | feature | composition |
+|---|---|---|
+| `nrf52833-sensor` | `sed` (default) | `sensor_sed_app::SensorApp`, Sleepy End Device; defmt over RTT |
+| `nrf52833-ed` | `ed` | `router_app::AlwaysOnEndDeviceApp` over `NrfIsrSoftMac`; text log on VCOM |
+| `nrf52833-router` | `router` | `router_app::ParentRouterApp` over `NrfRouterMac`; text log on VCOM |
+
+```bash
+cargo +nightly-2026-03-23 build --release --locked --no-default-features --features ed
+cargo +nightly-2026-03-23 build --release --locked --no-default-features --features router
+```
+
+The ED and router images send Imm-Acks from the RADIO ISR (`NrfIsrRadioPhy`).
+See the [nRF platform guide](../../docs/book/src/platform-guides/nrf.md#node-roles).
+
 ## Layer ownership
 
 | concern | owner |
@@ -50,8 +68,10 @@ protected-partition, and stack checks remain mandatory.
 
 ## Storage and security
 
-- Application: `0x00000000..0x0007E000`.
-- Security journal: `0x0007E000..0x00080000`.
+- Application: `0x00000000..0x0007A000` (all roles link the same map).
+- Router child-table and APS journals: `0x0007A000..0x0007E000`.
+- Security journal: `0x0007E000..0x00080000`, with a role tag for the ED and
+  router images.
 - FICR-derived EUI-64 and identity mismatch guard.
 - Nordic ECB hardware AES with two startup KATs.
 - Automatic polling disabled; the shared app owns parent polls.

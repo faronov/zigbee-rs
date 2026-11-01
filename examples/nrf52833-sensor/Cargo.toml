@@ -2,14 +2,63 @@
 name = "nrf52833-sensor"
 version = "0.1.0"
 edition = "2021"
+autobins = false
+
+# One crate per board, one bin per Zigbee role. Exactly one role feature may
+# be enabled per build (`src/roles.rs` enforces it for the new bins), so
+# dependency feature unification never links router code into an end-device
+# image, nor the sleepy lifecycle into a mains image:
+#   cargo build --release                                       # sed (default)
+#   cargo build --release --no-default-features --features ed
+#   cargo build --release --no-default-features --features router
+[[bin]]
+name = "nrf52833-sensor"
+path = "src/main.rs"
+required-features = ["sed"]
+
+[[bin]]
+name = "nrf52833-ed"
+path = "src/ed.rs"
+required-features = ["ed"]
+
+[[bin]]
+name = "nrf52833-router"
+path = "src/router.rs"
+required-features = ["router"]
 
 [features]
+default = ["sed"]
+# Sleepy environmental sensor (the original image).
+sed = ["dep:nrf-sensor-app", "dep:sensor-sed-app", "nrf52833-sensor-product/sed"]
+# Always-on End Device: router-app AlwaysOnEndDeviceApp over the interrupt
+# driven PHY (Imm-Ack from the RADIO ISR).
+ed = [
+    "dep:router-app",
+    "zigbee-mac/nrf-isr-phy",
+    "dep:static_cell",
+    "dep:embassy-sync",
+    "embassy-executor/nightly",
+    "nrf52833-sensor-product/mains",
+]
+# Router: parent MAC over the interrupt-driven PHY (Imm-Ack from the RADIO
+# ISR, Frame Pending from a HAL source-match table), ParentRouterApp,
+# durable child and APS tables.
+router = [
+    "dep:router-app",
+    "zigbee-mac/nrf-isr-phy",
+    "dep:static_cell",
+    "dep:embassy-sync",
+    "embassy-executor/nightly",
+    "nrf52833-sensor-product/mains",
+    "router-app/router",
+    "zigbee-runtime/router",
+]
 # External I2C sensor (pick one; SDA=P0.26, SCL=P0.27 on the PCA10100
 # Arduino header). Forwards to the product crate too, since BME280 adds a
 # Pressure Measurement cluster to the profile. Mirrors the identical
 # features in examples/nrf52840-sensor.
-sensor-bme280 = ["nrf52833-sensor-product/sensor-bme280", "dep:zigbee-bme280", "dep:zigbee-sensor"]  # Bosch BME280 temperature + humidity + pressure
-sensor-sht31  = ["dep:zigbee-sht3x", "dep:zigbee-sensor"]                                         # Sensirion SHT31 temperature + humidity
+sensor-bme280 = ["sed", "nrf52833-sensor-product/sensor-bme280", "dep:zigbee-bme280", "dep:zigbee-sensor"]  # Bosch BME280 temperature + humidity + pressure
+sensor-sht31  = ["sed", "dep:zigbee-sht3x", "dep:zigbee-sensor"]                                         # Sensirion SHT31 temperature + humidity
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
@@ -17,10 +66,11 @@ zigbee-mac = { path = "../../zigbee-mac", features = ["nrf52833"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
-nrf-sensor-app = { path = "../../apps/nrf-sensor" }
-sensor-sed-app = { path = "../../apps/sensor-sed" }
+nrf-sensor-app = { path = "../../apps/nrf-sensor", optional = true }
+sensor-sed-app = { path = "../../apps/sensor-sed", optional = true }
+router-app = { path = "../../apps/router", default-features = false, optional = true }
 nrf52833-dk = { path = "../../boards/nrf52833-dk" }
-nrf52833-sensor-product = { path = "../../products/nrf52833-sensor" }
+nrf52833-sensor-product = { path = "../../products/nrf52833-sensor", default-features = false }
 zigbee-bme280 = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "69e073cb921c4effef567eab886c054a58d02b49", optional = true }
 zigbee-sht3x = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "69e073cb921c4effef567eab886c054a58d02b49", optional = true }
 zigbee-sensor = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "69e073cb921c4effef567eab886c054a58d02b49", optional = true }
@@ -30,6 +80,7 @@ embassy-nrf = { version = "0.3", features = ["nrf52833", "time-driver-rtc1", "gp
 embassy-executor = { version = "0.7", features = ["task-arena-size-32768", "arch-cortex-m", "executor-thread"] }
 embassy-time = "0.4"
 embassy-futures = "0.1"
+embassy-sync = { version = "0.7", optional = true }
 cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"
 defmt = "1.0"
@@ -37,6 +88,7 @@ defmt-rtt = "1.0"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 embedded-hal = "1.0"
 log = "0.4"
+static_cell = { version = "2", optional = true }
 
 [profile.release]
 opt-level = "s"

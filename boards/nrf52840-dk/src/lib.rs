@@ -1,8 +1,9 @@
 //! Board support for the Nordic nRF52840 DK (PCA10056).
 //!
 //! This crate exposes only the DK's physically fitted, board-specific
-//! wiring: LED1, LED2, Button 1, and the external I2C sensor header
-//! (BME280/SHT31 breakout). It has no dependency on `zigbee-runtime` and owns no
+//! wiring: LED1, LED2, Button 1, the external I2C sensor header
+//! (BME280/SHT31 breakout), and VCOM0 (UARTE0 TXD P0.06 to the interface
+//! MCU's USB CDC port). It has no dependency on `zigbee-runtime` and owns no
 //! partition layout, NV placement, security persistence, or firmware
 //! identity — those are product concerns. See `products/nrf52840-sensor`
 //! for the product crate that builds on this board and selects them.
@@ -18,7 +19,7 @@
 
 #![no_std]
 
-use embassy_nrf::{gpio, interrupt, peripherals, twim};
+use embassy_nrf::{gpio, interrupt, peripherals, twim, uarte};
 
 /// LED1, active low (matches the DK schematic).
 pub const LED_ACTIVE_LOW: bool = true;
@@ -43,6 +44,21 @@ pub fn status_led(pin: peripherals::P0_13) -> gpio::Output<'static> {
 /// Construct LED2 (P0.14) as an active-low RX-activity output, initially off.
 pub fn rx_activity_led(pin: peripherals::P0_14) -> gpio::Output<'static> {
     gpio::Output::new(pin, gpio::Level::High, gpio::OutputDrive::Standard)
+}
+
+/// Drive LED1 on from a fault path, bypassing the owned [`led`] output.
+///
+/// Uses only the P0 OUTCLR/DIRSET registers for pin 13, so it is safe with
+/// interrupts disabled and whatever state the `Output` was left in.
+pub fn emergency_led_on() {
+    const P0_OUTCLR: usize = 0x5000_050C;
+    const P0_DIRSET: usize = 0x5000_0518;
+    const LED1: u32 = 1 << 13;
+    // SAFETY: write-one-to-act registers; only LED1's bit is touched.
+    unsafe {
+        core::ptr::write_volatile(P0_OUTCLR as *mut u32, LED1);
+        core::ptr::write_volatile(P0_DIRSET as *mut u32, LED1);
+    }
 }
 
 /// Construct Button 1 (P0.11) as an input with an internal pull-up.
@@ -71,4 +87,29 @@ pub fn sensor_i2c<'d>(
     let mut config = twim::Config::default();
     config.frequency = SENSOR_I2C_FREQUENCY;
     twim::Twim::new(twispi0, irqs, sda, scl, config)
+}
+
+/// Transmit half of VCOM0: UARTE0 TXD on P0.06, routed by the DK's
+/// interface MCU to a USB CDC serial port.
+pub type VcomTx<'d> = uarte::UarteTx<'d, peripherals::UARTE0>;
+
+/// VCOM0 line rate: 115200 8N1, no flow control.
+pub const VCOM_BAUDRATE: uarte::Baudrate = uarte::Baudrate::BAUD115200;
+
+/// Construct the VCOM0 transmitter at [`VCOM_BAUDRATE`].
+///
+/// `irqs` must bind `embassy_nrf::interrupt::typelevel::UARTE0` to
+/// `uarte::InterruptHandler<peripherals::UARTE0>`.
+pub fn vcom_tx<'d>(
+    uarte0: peripherals::UARTE0,
+    irqs: impl interrupt::typelevel::Binding<
+        interrupt::typelevel::UARTE0,
+        uarte::InterruptHandler<peripherals::UARTE0>,
+    > + 'd,
+    txd: peripherals::P0_06,
+) -> VcomTx<'d> {
+    let mut config = uarte::Config::default();
+    config.baudrate = VCOM_BAUDRATE;
+    config.parity = uarte::Parity::EXCLUDED;
+    uarte::UarteTx::new(uarte0, irqs, txd, config)
 }

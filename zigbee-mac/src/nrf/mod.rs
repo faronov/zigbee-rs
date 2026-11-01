@@ -5,8 +5,12 @@
 //!
 //! - [`NrfRadioPhy`]: the thin [`crate::RadioPhy`] + [`crate::PlatformServices`]
 //!   adapter over Embassy's ieee802154 radio driver and the hardware RNG;
-//! - [`NrfSoftMac`]: the end-device `SoftMacCore` alias used by every nRF
-//!   example;
+//! - [`NrfSoftMac`]: the end-device `SoftMacCore` alias over [`NrfRadioPhy`]
+//!   (software Imm-Ack from the MAC task; sleepy end devices);
+//! - [`NrfIsrRadioPhy`]: an interrupt-driven PHY that sends the Imm-Ack from
+//!   the RADIO handler, timed by TIMER0 + PPI to aTurnaroundTime, with a
+//!   hardware Frame Pending source table. [`NrfRouterMac`] (parent role,
+//!   `Parent<8, 8, 0>`) and [`NrfIsrSoftMac`] (always-on end device) use it;
 //! - fail-closed AES-128 through the Nordic ECB EasyDMA peripheral;
 //! - cancellation-safe transmit and the forced RADIO DISABLED used for
 //!   sleepy-device idle.
@@ -37,8 +41,17 @@
 //! - nRF52840-DK, nRF52840-Dongle, Seeed XIAO nRF52840
 //! - nRF52833-DK
 
+#[cfg(feature = "nrf-isr-phy")]
+mod isr_phy;
 mod radio_phy;
 
+#[cfg(feature = "nrf-isr-phy")]
+pub use crate::nrf_ack::{NRF_ACK_PENDING_CAPACITY, NrfRadioCounters};
+#[cfg(feature = "nrf-isr-phy")]
+pub use isr_phy::{
+    NRF_ISR_RX_SLOTS, NRF_ROUTER_PENDING_RX, NrfIsrRadioPhy, NrfIsrSoftMac, NrfRadioIrq,
+    NrfRouterMac, NrfRouterRole,
+};
 pub use radio_phy::{NRF_PENDING_RX, NrfRadioPhy, NrfSoftMac};
 
 use crate::nrf_aes::{EcbDataBlock, EcbRegisters, NrfAesDriver};

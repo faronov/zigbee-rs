@@ -2,6 +2,38 @@
 name = "nrf52840-router"
 version = "0.1.0"
 edition = "2021"
+autobins = false
+
+# One crate per board, one bin per mains Zigbee role. Exactly one role
+# feature may be enabled per build (`src/roles.rs` enforces it), so feature
+# unification never links router code into the End Device image:
+#   cargo build --release                                       # ed (default)
+#   cargo build --release --no-default-features --features router
+[[bin]]
+name = "nrf52840-ed"
+path = "src/main.rs"
+required-features = ["ed"]
+
+[[bin]]
+name = "nrf52840-router"
+path = "src/router.rs"
+required-features = ["router"]
+
+[features]
+default = ["ed"]
+# Always-on End Device: router-app AlwaysOnEndDeviceApp over the Embassy
+# `NrfRadioPhy` end-device MAC, defmt over RTT (the original image).
+ed = []
+# Router: parent MAC over the interrupt-driven PHY (Imm-Ack from the RADIO
+# ISR, Frame Pending from a HAL source-match table), ParentRouterApp,
+# durable child and APS tables, text log on VCOM.
+router = [
+    "zigbee-mac/nrf-isr-phy",
+    "dep:static_cell",
+    "dep:embassy-sync",
+    "router-app/router",
+    "zigbee-runtime/router",
+]
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
@@ -18,6 +50,8 @@ nrf52840-router-product = { path = "../../products/nrf52840-router" }
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
 embassy-nrf = { version = "0.3", features = ["nrf52840", "time-driver-rtc1"] }
 embassy-time = "0.4"
+embassy-sync = { version = "0.7", optional = true }
+static_cell = { version = "2", optional = true }
 
 cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"

@@ -39,9 +39,9 @@ Only the shared `SoftMacCore<P, Parent<..>>` role (shipped as the TLSR8258
 `TelinkRouterMac`) and host `MockMac` implement the sealed
 `ParentMacDriver`. Both advertise `router: true` and
 `coordinator: false`; all other real backends use non-parent capability
-descriptors. Consequently `examples/nrf52840-router` is an
-`AlwaysOnEndDeviceApp` on the end-device `SoftMacCore<NrfRadioPhy>`, not a
-Zigbee router.
+descriptors. The nRF52 `router` bins use the parent role as `NrfRouterMac`;
+the nRF52 `ed` bins are `AlwaysOnEndDeviceApp` on an end-device
+`SoftMacCore`, not Zigbee routers.
 
 ## Core R22 coverage
 

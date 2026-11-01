@@ -334,6 +334,7 @@ jobs:
           cargo fmt --manifest-path products/ha-connect-zbt1/Cargo.toml -- --check
           cargo fmt --manifest-path products/phy62x2-evk/Cargo.toml -- --check
           cargo fmt --manifest-path examples/nrf52840-router/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/nrf52833-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/nrf52840-sensor-uf2/Cargo.toml -- --check
           cargo fmt --manifest-path examples/esp32c6-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/esp32h2-sensor/Cargo.toml -- --check
@@ -496,15 +497,15 @@ jobs:
         run: cargo build --release --locked
       - name: Create firmware artifacts
         run: |
-          ELF=examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router
+          ELF=examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-ed
           OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
           ./tools/firmware-size-report.sh nrf52840-always-on-end-device ${ELF}.bin ${ELF}.size.json
           IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
-          if [ "$IMAGE_BYTES" -gt 1040384 ]; then
-            echo "nRF52840 always-on End Device ($IMAGE_BYTES B) overruns application flash ending at 0x000FE000" >&2
+          if [ "$IMAGE_BYTES" -gt 1024000 ]; then
+            echo "nRF52840 always-on End Device ($IMAGE_BYTES B) overruns application flash ending at 0x000FA000" >&2
             exit 1
           fi
           SYMS="$("$NM" --demangle "$ELF")"
@@ -580,14 +581,15 @@ jobs:
               exit 1
             fi
           done
+          NM="$NM" ./tools/check-role-symbols.sh leaf "$ELF"
       - name: Upload nRF52840 always-on End Device firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nrf52840-always-on-end-device-firmware
           path: |
-            examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.bin
-            examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.hex
-            examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.size.json
+            examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-ed.bin
+            examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-ed.hex
+            examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-ed.size.json
           if-no-files-found: error
 
   build-nrf52833:
@@ -639,8 +641,8 @@ jobs:
           # at 0x0007E000. memory.x asserts the region boundary at link
           # time; this asserts the produced image against it as well.
           IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
-          if [ "$IMAGE_BYTES" -gt 516096 ]; then
-            echo "nRF52833 image ($IMAGE_BYTES B) overruns the 504 KiB application flash region" >&2
+          if [ "$IMAGE_BYTES" -gt 499712 ]; then
+            echo "nRF52833 image ($IMAGE_BYTES B) overruns the 488 KiB application flash region" >&2
             exit 1
           fi
           LAYOUT="$("$NM" -n "$ELF")"
@@ -678,6 +680,7 @@ jobs:
               exit 1
             fi
           done
+          NM="$NM" ./tools/check-role-symbols.sh leaf "$ELF"
       - name: Upload nRF52833 firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -686,6 +689,89 @@ jobs:
             examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor.bin
             examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor.hex
             examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor.size.json
+          if-no-files-found: error
+
+  build-nrf52-roles:
+    name: Build nRF52833 End Device and Router, nRF52840 Router
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv7em-none-eabihf
+          components: llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            examples/nrf52833-sensor
+            examples/nrf52840-router
+          key: thumbv7em-nrf52-roles-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('examples/nrf52833-sensor/Cargo.lock', 'examples/nrf52840-router/Cargo.lock', 'products/nrf52833-sensor/link/**', 'products/nrf52840-router/link/**') }}
+      # One bin per role; role features are mutually exclusive, so each role
+      # is its own build and dependency feature unification never mixes them.
+      - name: Build nRF role images (release)
+        run: |
+          (cd examples/nrf52833-sensor &&
+            cargo build --release --locked --no-default-features --features ed &&
+            cargo build --release --locked --no-default-features --features router)
+          (cd examples/nrf52840-router &&
+            cargo build --release --locked --no-default-features --features router)
+      - name: Clippy nRF role compositions
+        run: |
+          for role in sed ed router; do
+            (cd examples/nrf52833-sensor && cargo clippy --release --locked \
+              --target thumbv7em-none-eabihf --no-default-features --features "$role" -- -D warnings)
+          done
+          # The nRF52840 always-on End Device (src/main.rs) is not
+          # clippy-clean upstream (collapsible_match); only its new router
+          # bin is gated here.
+          (cd examples/nrf52840-router && cargo clippy --release --locked \
+            --target thumbv7em-none-eabihf --no-default-features --features router -- -D warnings)
+      - name: Create firmware artifacts
+        run: |
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          D33=examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release
+          D40=examples/nrf52840-router/target/thumbv7em-none-eabihf/release
+          # image, application-flash limit (= router-table journal start)
+          for spec in "$D33/nrf52833-ed 499712" "$D33/nrf52833-router 499712" "$D40/nrf52840-router 1024000"; do
+            read -r ELF LIMIT <<<"$spec"
+            "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+            "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+            ./tools/firmware-size-report.sh "$(basename "$ELF")" "${ELF}.bin" "${ELF}.size.json"
+            IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
+            if [ "$IMAGE_BYTES" -gt "$LIMIT" ]; then
+              echo "$(basename "$ELF") ($IMAGE_BYTES B) overruns application flash ($LIMIT B)" >&2
+              exit 1
+            fi
+            SYMS="$("$NM" --demangle "$ELF")"
+            if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
+              echo "$(basename "$ELF") still links software AES" >&2
+              exit 1
+            fi
+            # Imm-Ack is sent from the RADIO ISR (NrfIsrRadioPhy), never by
+            # the task-context MAC core.
+            if ! grep -q 'NrfIsrRadioPhy' <<<"$SYMS"; then
+              echo "$(basename "$ELF") is missing the ISR-ACK nRF radio PHY" >&2
+              exit 1
+            fi
+          done
+          NM="$NM" ./tools/check-role-symbols.sh leaf "$D33/nrf52833-ed"
+          NM="$NM" ./tools/check-role-symbols.sh parent "$D33/nrf52833-router" "$D40/nrf52840-router"
+      - name: Upload nRF role firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nrf52-role-firmware
+          path: |
+            examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-ed.bin
+            examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-ed.hex
+            examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-ed.size.json
+            examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-router.bin
+            examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-router.hex
+            examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-router.size.json
+            examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.bin
+            examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.hex
+            examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.size.json
           if-no-files-found: error
 
   build-nrf52840-uf2:

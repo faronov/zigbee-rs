@@ -90,14 +90,18 @@ cargo +nightly-2026-03-23 build --release --locked
 cargo +nightly-2026-03-23 build --release --locked --features sensor-bme280
 cargo +nightly-2026-03-23 build --release --locked --features sensor-sht31
 
+cargo +nightly-2026-03-23 build --release --locked --no-default-features --features ed
+cargo +nightly-2026-03-23 build --release --locked --no-default-features --features router
+
 cd ../nrf52840-router
-cargo +nightly-2026-03-23 build --release --locked
+cargo +nightly-2026-03-23 build --release --locked          # always-on End Device
+cargo +nightly-2026-03-23 build --release --locked --no-default-features --features router
 ```
 
 The sensor products use `Idle` for both fast and slow waits and pair their
-non-OTA profiles with `NoOta`. The nRF52840 always-on image is
-`AlwaysOnEndDeviceApp`, so its non-parent MAC never advertises
-`DeviceType::Router`.
+non-OTA profiles with `NoOta`. The `ed` bins are `AlwaysOnEndDeviceApp` and
+never advertise `DeviceType::Router`; the `router` bins are `ParentRouterApp`
+over `NrfRouterMac`.
 
 All nRF images now use the shared `SoftMacCore<NrfRadioPhy>`. Earlier
 nRF52840/nRF52833 sensor images, on the since-deleted `NrfMac`, produced

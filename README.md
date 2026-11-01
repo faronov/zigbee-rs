@@ -148,8 +148,10 @@ Telink advertises router capability but not coordinator
 capability. No production backend advertises Coordinator or Trust-Center
 server support, so coordinator composition remains mock-only.
 
-The misleadingly named `examples/nrf52840-router` therefore composes
-`AlwaysOnEndDeviceApp`, not a Zigbee router. `router-app` has no default
+The nRF52 router bins (`nrf52840-router`, `nrf52833-router`) compose
+`ParentRouterApp` over `NrfRouterMac`, the shared parent role on the
+interrupt-driven nRF PHY; the `nrf52840-ed` and `nrf52833-ed` bins compose
+`AlwaysOnEndDeviceApp`. `router-app` has no default
 features: parent/distributed/coordinator products must explicitly enable its
 router support, while End Device products compile without route, parent, or
 child-table capacities.

@@ -100,25 +100,27 @@ steering with the policy backoff.
 
 | product | gesture | after Leave without a press |
 |---|---|---|
-| `examples/nrf52840-router` | Button 1 short press requests commissioning; 3 s hold factory-resets | LED1 dark, waits |
+| `examples/nrf52840-router`, `examples/nrf52833-sensor` (ED and router bins) | Button 1 short press requests commissioning; 3 s hold factory-resets | LED1 dark, waits |
 | `examples/telink-tlsr8258-router` | no button fitted on TB-04 | red LED solid, waits until power cycle |
 | `examples/mock-light` | simulated press in the host demo | waits |
 
 ## Relay versus parent
 
-### nRF52840
+### nRF52840 / nRF52833
 
-The shipped Nordic MAC, `NrfSoftMac` (`SoftMacCore<NrfRadioPhy>` in the
-end-device role), is not `ParentMacDriver`. The product uses:
+The `ed` bins (`nrf52840-ed`, `nrf52833-ed`) use:
 
 ```text
 AlwaysOnEndDeviceApp + EndDevice + NoChildren
 ```
 
-It is a receiver-on End Device. It does not link routing, route maintenance,
+They are receiver-on End Devices and do not link routing, route maintenance,
 Link Status, child admission, pending transactions, or indirect delivery.
-The historical `examples/nrf52840-router` directory name does not change its
-Zigbee role.
+
+The `router` bins (`nrf52840-router`, `nrf52833-router`) use `ParentRouterApp`
+over `NrfRouterMac` = `SoftMacCore<NrfIsrRadioPhy, Parent<8, 8, 0>>`. The
+RADIO ISR sends the Imm-Ack and sets Frame Pending from a HAL source-match
+table; see the [nRF platform guide](../platform-guides/nrf.md#node-roles).
 
 ### TLSR8258
 
