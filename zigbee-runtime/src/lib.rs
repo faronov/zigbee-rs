@@ -81,11 +81,24 @@ macro_rules! await_out_of_line {
 /// `zigbee_types::await_in_place!`. Used only on measured deep poll chains
 /// where a non-inlined constructor would otherwise return the whole sub-future
 /// into a caller poll-frame temporary (HW-04).
+///
+/// Only the TLSR8258 tc32 backend emits that construct-then-move copy on the
+/// steering/rejoin chain; on every other target the per-site constructors
+/// cost flash (10-13 KB on ESP32/CC2340) without a stack gain, so they keep a
+/// plain `.await`.
+#[cfg(target_arch = "tc32")]
 macro_rules! await_in_place {
     ($future:expr) => {{
         let slot = core::pin::pin!(core::option::Option::None);
         zigbee_types::emplace_future(slot, || $future).await
     }};
+}
+
+#[cfg(not(target_arch = "tc32"))]
+macro_rules! await_in_place {
+    ($future:expr) => {
+        $future.await
+    };
 }
 
 #[doc(hidden)]
@@ -10323,7 +10336,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// Persist the APS binding and group tables for the current network.
     // Out of line so the snapshot stays one frame-local instead of being
     // merged into the calling async state machine's poll frame (HW-04).
-    #[inline(never)]
+    #[cfg_attr(target_arch = "tc32", inline(never))]
     pub fn save_aps_tables<S: aps_table_store::ApsTableStore>(
         &mut self,
         store: &mut S,
@@ -10380,7 +10393,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     ///
     /// A non-empty snapshot from another Extended PAN ID is rejected instead
     /// of installing application state from an old membership.
-    #[inline(never)]
+    #[cfg_attr(target_arch = "tc32", inline(never))]
     pub fn restore_aps_tables<S: aps_table_store::ApsTableStore>(
         &mut self,
         store: &mut S,
@@ -10439,7 +10452,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     }
 
     /// Clear both live and durable APS binding/group state.
-    #[inline(never)]
+    #[cfg_attr(target_arch = "tc32", inline(never))]
     pub fn clear_persisted_aps_tables<S: aps_table_store::ApsTableStore>(
         &mut self,
         store: &mut S,
@@ -10833,7 +10846,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// Kept out of line so the decoded `PersistentSecurityState` lives in this
     /// short synchronous frame instead of the caller's async poll frame, which
     /// stays live under the whole steering/rejoin chain (HW-04).
-    #[inline(never)]
+    #[cfg_attr(target_arch = "tc32", inline(never))]
     fn restore_steering_security_state<S: SecurityStateStore>(
         &mut self,
         store: &mut S,
