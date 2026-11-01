@@ -174,13 +174,14 @@ fn log_summary(app: &App) {
         radio.tx_failures
     );
     log::info!(
-        "[MG21] isr-ack acks {} fp {} late {} filtered {} ovf {} queue-full {} resync {} ack-fail {} rx-restart-fail {} max-turnaround {}us",
+        "[MG21] isr-ack acks {} fp {} late {} filtered {} ovf {} queue-full {} unacked {} resync {} ack-fail {} rx-restart-fail {} max-turnaround {}us",
         ack.acks,
         ack.fp_acks,
         ack.late,
         ack.filtered,
         ack.overflows,
         ack.queue_full,
+        ack.queue_full_unacked,
         ack.resyncs,
         ack.ack_tx_fail,
         ack.rx_restart_fail,

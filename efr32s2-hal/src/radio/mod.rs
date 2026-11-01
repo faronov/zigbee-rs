@@ -378,10 +378,13 @@ pub struct AckStats {
     /// hardware: the interrupt could not run for a whole buffer's worth of
     /// traffic).
     pub overflows: u32,
-    /// Frames lost because the queue for the stack was full (the stack did
-    /// not read for a whole queue's worth of frames). A frame that requested
-    /// an ACK is then left unacknowledged, so the sender retries.
+    /// Frames without an ACK request (broadcasts, mostly relayed copies)
+    /// dropped because the queue for the stack was full (the stack did not
+    /// read for a whole queue's worth of frames).
     pub queue_full: u32,
+    /// Frames that requested our ACK but found the queue full: left
+    /// unacknowledged, so the sender retries.
+    pub queue_full_unacked: u32,
     /// Corrupt PHR lengths that made the interrupt clear BUFC.
     pub resyncs: u32,
     /// Imm-Ack transmissions that failed (frame dropped like a late one).

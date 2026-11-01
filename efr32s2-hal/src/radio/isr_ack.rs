@@ -168,6 +168,7 @@ static SHARED: SharedCell = SharedCell(UnsafeCell::new(Shared {
         filtered: 0,
         overflows: 0,
         queue_full: 0,
+        queue_full_unacked: 0,
         resyncs: 0,
         ack_tx_fail: 0,
         rx_restart_fail: 0,
@@ -469,7 +470,7 @@ fn examine(s: &mut Shared, entry: u32, rx_done: bool) {
             Verdict::Ack { .. } if !room => {
                 // Unacknowledged: the sender retries once the stack has
                 // read the queue.
-                s.stats.queue_full = s.stats.queue_full.wrapping_add(1);
+                s.stats.queue_full_unacked = s.stats.queue_full_unacked.wrapping_add(1);
                 false
             }
             Verdict::Ack { frame_pending } => {
