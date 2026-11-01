@@ -34,9 +34,9 @@ HAL RX-completion path, never from task context. The router uses
 (`SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>`, eight retained data frames).
 Beacon, association and orphan responses, command events and indirect data
 come from the core; Frame Pending is armed in the HAL's ISR source-match
-table. The hand-written router MAC it replaced was hardware-tested; the
-shared-core router image is build-, layout- and symbol-checked only (see the
-MAC unification section of the firmware-size chapter).
+table. The shared-core router, ED and sensor images have run on a TB-04
+against ZHA (see [Validation](#validation)); the MAC unification section of
+the firmware-size chapter has their footprint.
 
 The board owns fitted LEDs, flash/ADC resources, and physical wiring. The
 product owns identity, profile, battery/poll behavior, sleep policy,
@@ -212,7 +212,8 @@ the old `tc32-45` builds. See the
 [tail-merge comparison](../advanced/firmware-size.md#tlsr8258-tail-merging-2026-10-04)
 for both LOW32K variants, the separate compiler-only improvement, and physical
 headroom. No features or physical memory safeguards were removed.
-These new images have not been run on hardware. The later move of the sensors
+The current tail-merged `SoftMacCore` images were run on hardware (see
+[Validation](#validation)). The later move of the sensors
 to `SoftMacCore` cut sensor flash by a further 1,480–1,616 B (see the MAC
 unification section of the firmware-size chapter).
 
@@ -251,10 +252,8 @@ The recorded sensor images passed build/layout checks. The refreshed router
 linked with the physical memory assertions and the durable Bind/Unbind path,
 but its build command failed the regression-size gate enforced at the time.
 That artificial gate has since been removed; physical limits and the hardware
-gates below remain. The existing TC32 toolchain was not modified. The
-`SoftMacCore` sensor images (commit `34513de`) are build/symbol-checked only;
-no TB-04 has run them yet. Earlier TB-04 images, all on the hand-written MAC,
-produced hardware evidence for:
+gates below remain. The existing TC32 toolchain was not modified. Earlier
+TB-04 images, all on the hand-written MAC, produced hardware evidence for:
 
 - hardware AES KAT, secured commissioning, TCLK exchange, ZHA interview, and
   sustained traffic;
@@ -262,16 +261,32 @@ produced hardware evidence for:
 - timer SUSPEND primitive;
 - router join, durable restart, Link Status, and NWK relay.
 
+The `SoftMacCore` images were then run on one TB-04 against Home Assistant ZHA
+(channel 15) through the hwlab SWire programmer:
+
+| image | hardware result |
+|---|---|
+| sleepy sensor (`telink-tlsr8258-sensor`) | ZHA join, interview, 30 s Temperature/Humidity/Battery reports, resume after three resets |
+| always-on ED (`telink-tlsr8258-ed`) | ZHA join, interview (End Device, mains), resume after reset |
+| parent router (`telink-tlsr8258-router`) | ZHA join (association 911 ms, TCLK and commissioning 7.5 s), interview (Router, mains, Basic + Identify), resume after reset without a new association, >18 min stable; the SVC stack guard stayed intact and other routers list it as a neighbour |
+
+Router counters 18 minutes after the reset: 41,071 valid frames, 0 ACK
+timeouts, 0 channel-access failures, 52 busy CCAs out of 774, 0 DMA-incomplete.
+The 16-slot HAL RX queue overflowed 5,566 times (945 by priority eviction)
+around the join, resume and ZHA topology-scan bursts, at about 41 frames/s.
+In steady state, losses fell to about 2 %. The router loop handles one frame
+per iteration plus a tick. The overflow counter does not say whether a dropped
+frame was addressed to the router.
+
 Remaining gates:
 
 - repeated application-level default SUSPEND acceptance with network/counter
   checks and measured current;
-- the sensors on `SoftMacCore`: join, polling, ACK handling, and reporting on
-  hardware;
 - LOW32K proof completion on the `sensor-retention` images;
 - pad/comparator wake modes;
 - corrected-image first-attempt child admission and complete interview;
-- the always-on ED: join, interview, and resume after reset on hardware;
-- the `SoftMacCore` parent router: join, ZHA interview, neighbour/LQI, a child
-  joining through it, and the stack high-water on the persistence paths;
+- the parent router: a child joining through it, its own neighbour table in
+  ZHA, a paint-based stack high-water on the persistence paths, and RX-queue
+  throughput under bursts;
+- the one-off SED `security persistence` panic seen once and not reproduced;
 - long-duration router and sleep stability.

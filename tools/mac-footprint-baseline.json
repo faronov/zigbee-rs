@@ -42,9 +42,9 @@
 {"image": "phy6222-sensor", "flash": 136688, "text": 134048, "data": 0, "bss": 16572, "pool": 16388, "mac_code": 9938, "stack": 24072, "mac_chain": 22192, "mac_stack": 1080, "mac_frame": 824},
 {"image": "phy6252-ed", "flash": 137560, "text": 135236, "data": 0, "bss": 25268, "pool": 16388, "mac_code": 9942, "stack": 17128, "mac_chain": 15232, "mac_stack": 1080, "mac_frame": 824},
 {"image": "phy6252-sensor", "flash": 136776, "text": 134136, "data": 0, "bss": 16572, "pool": 16388, "mac_code": 9938, "stack": 24072, "mac_chain": 22192, "mac_stack": 1080, "mac_frame": 824},
-{"image": "tlsr8258-ed", "flash": 164420, "text": 162184, "data": 2236, "bss": 8372, "pool": 0, "mac_code": 10684, "stack": 24072, "mac_chain": 23888, "mac_stack": 1680, "mac_frame": 768},
-{"image": "tlsr8258-router", "flash": 265252, "text": 262824, "data": 2428, "bss": 19124, "pool": 0, "mac_code": 15888, "stack": 45712, "mac_chain": 35008, "mac_stack": 1720, "mac_frame": 768},
-{"image": "tlsr8258-sensor", "flash": 161195, "text": 159039, "data": 2156, "bss": 8368, "pool": 0, "mac_code": 9468, "stack": 29656, "mac_chain": 28720, "mac_stack": 1264, "mac_frame": 432},
-{"image": "tlsr8258-sensor-retention", "flash": 164419, "text": 162263, "data": 2156, "bss": 10836, "pool": 0, "mac_code": 9436, "stack": 28240, "mac_chain": 27304, "mac_stack": 1264, "mac_frame": 432},
-{"image": "tlsr8258-sensor-retention-10s", "flash": 164423, "text": 162267, "data": 2156, "bss": 10836, "pool": 0, "mac_code": 9436, "stack": 28240, "mac_chain": 27304, "mac_stack": 1264, "mac_frame": 432}
+{"image": "tlsr8258-ed", "flash": 164464, "text": 162228, "data": 2236, "bss": 8372, "pool": 0, "mac_code": 10684, "stack": 18760, "mac_chain": 18760, "mac_stack": 1680, "mac_frame": 768},
+{"image": "tlsr8258-router", "flash": 262844, "text": 260416, "data": 2428, "bss": 28452, "pool": 0, "mac_code": 15888, "stack": 13304, "mac_chain": 10296, "mac_stack": 1720, "mac_frame": 768},
+{"image": "tlsr8258-sensor", "flash": 161507, "text": 159351, "data": 2156, "bss": 8368, "pool": 0, "mac_code": 9468, "stack": 24000, "mac_chain": 24000, "mac_stack": 1264, "mac_frame": 432},
+{"image": "tlsr8258-sensor-retention", "flash": 164667, "text": 162511, "data": 2156, "bss": 10836, "pool": 0, "mac_code": 9436, "stack": 22568, "mac_chain": 22568, "mac_stack": 1264, "mac_frame": 432},
+{"image": "tlsr8258-sensor-retention-10s", "flash": 164671, "text": 162515, "data": 2156, "bss": 10836, "pool": 0, "mac_code": 9436, "stack": 22568, "mac_chain": 22568, "mac_stack": 1264, "mac_frame": 432}
 ]
