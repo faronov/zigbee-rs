@@ -2,13 +2,13 @@
 
 TLSR8258 uses the custom `tc32-1.98.1-20261003-31a272` Rust toolchain
 (LLVM 23.1.2), targeting `tc32-unknown-none-elf`. The production
-sensor and router use the same shared application frontends as the ARM and
-RISC-V products.
+sleepy sensor, always-on End Device and router use the same shared
+application frontends as the ARM and RISC-V products.
 
 ## Layering
 
 ```text
-sensor or parent-router product behavior
+sensor, always-on End Device or parent-router product behavior
         ↓
 products/tlsr8258-tb04
         ↓
@@ -17,9 +17,14 @@ boards/tlsr8258-tb04
 tlsr8258-hal + zigbee-mac (TelinkMac / TelinkRouterMac) + tlsr8258-rt
 ```
 
-The sensor/router `main.rs` files are the short composition roots.
+The sensor, ED and router `main.rs` files are the short composition roots.
+Each role is its own crate (`examples/telink-tlsr8258-{sensor,ed,router}`)
+rather than a bin of one board crate: the TC32 build script, the post-link
+layout gates, the LOW32K retention features and the CI cache are keyed on the
+crate and bin name. The product crate selects the role with its `sensor`,
+`end-device` or `router` feature.
 
-The sensors use `TelinkMac`, which is the shared
+The sleepy sensor and the always-on ED use `TelinkMac`, which is the shared
 `SoftMacCore<TelinkRadioPhy, EndDevice>`: scan, association, polling, frame
 retries and ACK matching run in the portable core, while the HAL performs the
 CSMA-CA backoff (with the PIB parameters), the transmission and the Imm-Ack
@@ -29,9 +34,9 @@ HAL RX-completion path, never from task context. The router uses
 (`SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>`, eight retained data frames).
 Beacon, association and orphan responses, command events and indirect data
 come from the core; Frame Pending is armed in the HAL's ISR source-match
-table. The hand-written router MAC it replaced was hardware-tested; the
-shared-core router image is build-, layout- and symbol-checked only (see the
-MAC unification section of the firmware-size chapter).
+table. The shared-core router, ED and sensor images have run on a TB-04
+against ZHA (see [Validation](#validation)); the MAC unification section of
+the firmware-size chapter has their footprint.
 
 The board owns fitted LEDs, flash/ADC resources, and physical wiring. The
 product owns identity, profile, battery/poll behavior, sleep policy,
@@ -115,6 +120,41 @@ starts Network Steering again, retrying with the 5..60 s policy backoff. A
 product built on a module with a button should map its short press to
 `request_commissioning()`.
 
+## Always-on End Device application
+
+`examples/telink-tlsr8258-ed` is a mains-powered, RX-on-when-idle,
+non-routing End Device:
+
+```rust,ignore
+AlwaysOnEndDeviceApp::<_, _, _, _, _, _, EdObserver>::new_observed(
+    ZigbeeNode::new(device, security_store, profile),
+    &END_DEVICE_POLICY,
+    RouterParts::new(status, supervisor, NoDiagnostics),
+)?;
+```
+
+It uses the end-device `TelinkMac` (no parent MAC, no `router` feature), and
+the same IRQ-driven RX/auto-ACK path as the router, because the HAL services
+receive in the IRQ only while `macRxOnWhenIdle` is set.
+`products/tlsr8258-tb04` (`end-device` feature) owns:
+
+- the identity: model `TLSR8258-ED`, IEEE offset `0x45`, distinct from the
+  sensor (`0x33`) and router (`0x52`);
+- the Basic + Identify profile: the TB-04 has no measured cluster to report;
+- the 15..60 s retry policy;
+- the security-journal role tag `END_DEVICE` (`0x5202`).
+
+The sensor and router remain untagged legacy images. Their distinct IEEE
+offsets still make a role switch reset the network state while keeping the
+frame-counter limits. The ED reserves only the security journal; it has no
+child or APS-table journal.
+
+The ED shares the router's LED adapters (`status_leds`). Like the router, it
+has no button. After a Leave it stays factory-new until the next power cycle.
+
+`TELINK_ED_METRICS` (magic `TJED`, `#[no_mangle]`) exports the commissioning
+results, network identity, uptime and HAL RX counters for debugger reads.
+
 ## Flash ownership
 
 The 512 KiB TB-04 product preserves:
@@ -129,8 +169,8 @@ The 512 KiB TB-04 product preserves:
 ```
 
 The sensor keeps only the security token and drops the APS/child tokens, so
-those persistence paths are removed. The router consumes all three independent
-journal tokens.
+those persistence paths are removed; the always-on ED does the same. The router
+consumes all three independent journal tokens.
 
 Flash geometry is verified before factory-data access on non-512-KiB layouts.
 Zbit writes require the ADC/PC5 voltage guard before every page program or
@@ -151,7 +191,19 @@ Host tools remain on Rust `1.94.1`.
 ./scripts/tlsr8258.sh build sensor-retention
 ./scripts/tlsr8258.sh build sensor-retention-10s
 ./scripts/tlsr8258.sh build router
+./scripts/tlsr8258.sh build ed
 ```
+
+`tools/tlsr8258-firmware.sh` gates the ED image on:
+
+- no parent or router symbols;
+- the End Device Timeout client symbols;
+- no sleep or retention path;
+- exactly one `tlsr8258_rt::block_on` root;
+- the product-wide 20 KiB SVC (64 B guard below it) / 1 KiB IRQ stack layout.
+
+CI also runs `tools/check-role-symbols.sh`: `leaf` for the sensor and the ED,
+`parent` for the router.
 
 Production and radio-harness configurations enable LLVM tail merging. The
 October 4 rebuild measured **195,688 B** for the default sensor and
@@ -160,7 +212,8 @@ the old `tc32-45` builds. See the
 [tail-merge comparison](../advanced/firmware-size.md#tlsr8258-tail-merging-2026-10-04)
 for both LOW32K variants, the separate compiler-only improvement, and physical
 headroom. No features or physical memory safeguards were removed.
-These new images have not been run on hardware. The later move of the sensors
+The current tail-merged `SoftMacCore` images were run on hardware (see
+[Validation](#validation)). The later move of the sensors
 to `SoftMacCore` cut sensor flash by a further 1,480–1,616 B (see the MAC
 unification section of the firmware-size chapter).
 
@@ -199,10 +252,8 @@ The recorded sensor images passed build/layout checks. The refreshed router
 linked with the physical memory assertions and the durable Bind/Unbind path,
 but its build command failed the regression-size gate enforced at the time.
 That artificial gate has since been removed; physical limits and the hardware
-gates below remain. The existing TC32 toolchain was not modified. The
-`SoftMacCore` sensor images (commit `34513de`) are build/symbol-checked only;
-no TB-04 has run them yet. Earlier TB-04 images, all on the hand-written MAC,
-produced hardware evidence for:
+gates below remain. The existing TC32 toolchain was not modified. Earlier
+TB-04 images, all on the hand-written MAC, produced hardware evidence for:
 
 - hardware AES KAT, secured commissioning, TCLK exchange, ZHA interview, and
   sustained traffic;
@@ -210,13 +261,32 @@ produced hardware evidence for:
 - timer SUSPEND primitive;
 - router join, durable restart, Link Status, and NWK relay.
 
+The `SoftMacCore` images were then run on one TB-04 against Home Assistant ZHA
+(channel 15) through the hwlab SWire programmer:
+
+| image | hardware result |
+|---|---|
+| sleepy sensor (`telink-tlsr8258-sensor`) | ZHA join, interview, 30 s Temperature/Humidity/Battery reports, resume after three resets |
+| always-on ED (`telink-tlsr8258-ed`) | ZHA join, interview (End Device, mains), resume after reset |
+| parent router (`telink-tlsr8258-router`) | ZHA join (association 911 ms, TCLK and commissioning 7.5 s), interview (Router, mains, Basic + Identify), resume after reset without a new association, >18 min stable; the SVC stack guard stayed intact and other routers list it as a neighbour |
+
+Router counters 18 minutes after the reset: 41,071 valid frames, 0 ACK
+timeouts, 0 channel-access failures, 52 busy CCAs out of 774, 0 DMA-incomplete.
+The 16-slot HAL RX queue overflowed 5,566 times (945 by priority eviction)
+around the join, resume and ZHA topology-scan bursts, at about 41 frames/s.
+In steady state, losses fell to about 2 %. The router loop handles one frame
+per iteration plus a tick. The overflow counter does not say whether a dropped
+frame was addressed to the router.
+
 Remaining gates:
 
 - repeated application-level default SUSPEND acceptance with network/counter
   checks and measured current;
-- the sensors on `SoftMacCore`: join, polling, ACK handling, and reporting on
-  hardware;
 - LOW32K proof completion on the `sensor-retention` images;
 - pad/comparator wake modes;
 - corrected-image first-attempt child admission and complete interview;
+- the parent router: a child joining through it, its own neighbour table in
+  ZHA, a paint-based stack high-water on the persistence paths, and RX-queue
+  throughput under bursts;
+- the one-off SED `security persistence` panic seen once and not reproduced;
 - long-duration router and sleep stability.

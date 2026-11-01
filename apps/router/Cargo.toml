@@ -35,3 +35,6 @@ zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 [[test]]
 name = "lifecycle"
 required-features = ["router"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

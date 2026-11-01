@@ -11,7 +11,8 @@
 //! - the **child-table journal** (router/coordinator child records), rewritten
 //!   only on a child lifecycle transition.
 
-use tlsr8258_hal::flash::FlashRegion;
+use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
+use tlsr8258_hal::flash::{FlashError, FlashRegion};
 use tlsr8258_tb04::resources::OnboardFlash;
 use zigbee_runtime::aps_table_store::{APS_TABLE_JOURNAL_SECTOR_SIZE, ApsTableJournal};
 use zigbee_runtime::child_store::{CHILD_JOURNAL_SECTOR_SIZE, ChildTableJournal};
@@ -58,8 +59,46 @@ pub const fn split_flash(
     )
 }
 
+/// Product flash partition. In the router image it re-checks the SVC stack
+/// guard before every erase or program, so a stack overflow can never reach
+/// persistent state. The sensor retention image owns a separate LOW32K guard.
+pub struct GuardedFlash(FlashRegion);
+
+impl ErrorType for GuardedFlash {
+    type Error = FlashError;
+}
+
+impl ReadNorFlash for GuardedFlash {
+    const READ_SIZE: usize = FlashRegion::READ_SIZE;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.0.read(offset, bytes)
+    }
+
+    fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+}
+
+impl NorFlash for GuardedFlash {
+    const WRITE_SIZE: usize = FlashRegion::WRITE_SIZE;
+    const ERASE_SIZE: usize = FlashRegion::ERASE_SIZE;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        #[cfg(feature = "router")]
+        crate::stack_guard::check();
+        self.0.erase(from, to)
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        #[cfg(feature = "router")]
+        crate::stack_guard::check();
+        self.0.write(offset, bytes)
+    }
+}
+
 /// Partition-bounded view of the security journal region.
-pub type SecurityFlash = FlashRegion;
+pub type SecurityFlash = GuardedFlash;
 
 const fn security_flash(_token: SecurityPartition) -> SecurityFlash {
     // SAFETY: `SecurityPartition` is minted once by `split_flash`, which
@@ -67,7 +106,7 @@ const fn security_flash(_token: SecurityPartition) -> SecurityFlash {
     // handle over the security sectors. The crate-level const asserts keep
     // the window inside the fitted flash, after the firmware image limit and
     // below the factory EUI sector.
-    unsafe { FlashRegion::new(SECURITY_PARTITION_START, SECURITY_PARTITION_SIZE) }
+    GuardedFlash(unsafe { FlashRegion::new(SECURITY_PARTITION_START, SECURITY_PARTITION_SIZE) })
 }
 
 pub type SecurityStore = SecurityStateJournal<SecurityFlash>;
@@ -78,12 +117,14 @@ pub const fn security_store(token: SecurityPartition) -> SecurityStore {
 
 /// Partition-bounded view of the child-table journal region, disjoint from
 /// the security and APS partitions.
-pub type ChildTableFlash = FlashRegion;
+pub type ChildTableFlash = GuardedFlash;
 
 const fn child_table_flash(_token: ChildTablePartition) -> ChildTableFlash {
     // SAFETY: as for `security_flash`; `ChildTablePartition` is unique and
     // the const asserts keep the window disjoint from the other journals.
-    unsafe { FlashRegion::new(CHILD_TABLE_PARTITION_START, CHILD_TABLE_PARTITION_SIZE) }
+    GuardedFlash(unsafe {
+        FlashRegion::new(CHILD_TABLE_PARTITION_START, CHILD_TABLE_PARTITION_SIZE)
+    })
 }
 
 pub type ChildStore = ChildTableJournal<ChildTableFlash>;
@@ -97,12 +138,12 @@ pub const fn child_table_store(token: ChildTablePartition) -> ChildStore {
 }
 
 /// Partition-bounded view of the APS binding/group journal region.
-pub type ApsTableFlash = FlashRegion;
+pub type ApsTableFlash = GuardedFlash;
 
 const fn aps_table_flash(_token: ApsTablePartition) -> ApsTableFlash {
     // SAFETY: as for `security_flash`; `ApsTablePartition` is unique and the
     // const asserts keep the window disjoint from the other journals.
-    unsafe { FlashRegion::new(APS_TABLE_PARTITION_START, APS_TABLE_PARTITION_SIZE) }
+    GuardedFlash(unsafe { FlashRegion::new(APS_TABLE_PARTITION_START, APS_TABLE_PARTITION_SIZE) })
 }
 
 pub type ApsTableStore = ApsTableJournal<ApsTableFlash>;

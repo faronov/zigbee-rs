@@ -81,3 +81,6 @@ zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }
 # sleepy sensors. The router-side host tests are gated on this crate's own
 # `router` feature (`cargo test -p zigbee-runtime --features router`), which
 # forwards to `zigbee-aps/router` and `zigbee-nwk/router`.
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

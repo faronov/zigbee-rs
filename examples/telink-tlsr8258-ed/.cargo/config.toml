@@ -1,0 +1,16 @@
+[build]
+target = "tc32-unknown-none-elf"
+
+[target.tc32-unknown-none-elf]
+rustflags = [
+    "-C", "llvm-args=-enable-tail-merge=true",
+    "-C", "link-arg=-T../../products/tlsr8258-tb04/link/memory.x",
+    "-C", "link-arg=--gc-sections",
+]
+
+[unstable]
+build-std = ["core"]
+build-std-features = ["compiler-builtins-mem"]
+
+[env]
+DEFMT_LOG = "info"

@@ -59,6 +59,7 @@ verify_layout() {
     local sdata=0 ebss=0 svc_bottom=0 svc_top=0 irq_bottom=0 irq_top=0
     local rf_dma_start=0 rf_dma_end=0
     local retained_start=0 retained_end=0 guard_start=0 guard_end=0 retention_limit=0
+    local svc_guard_start=0 svc_guard_end=0
     local rf_rx_buf=0 rf_tx_buf=0 rf_ack_tx_buf=0
     local security_nv_start=0 security_nv_end=0
     local child_nv_start=0 child_nv_end=0
@@ -77,6 +78,8 @@ verify_layout() {
             _ebss) ebss=$((16#$value)) ;;
             _svc_stack_bottom) svc_bottom=$((16#$value)) ;;
             _svc_stack_top) svc_top=$((16#$value)) ;;
+            _svc_stack_guard_start) svc_guard_start=$((16#$value)) ;;
+            _svc_stack_guard_end) svc_guard_end=$((16#$value)) ;;
             _irq_stack_bottom) irq_bottom=$((16#$value)) ;;
             _irq_stack_top) irq_top=$((16#$value)) ;;
             _retained_start_) retained_start=$((16#$value)) ;;
@@ -176,7 +179,8 @@ verify_layout() {
             exit 1
         fi
     done
-    if [[ "$binary_name" == "telink-tlsr8258-sensor" ]]; then
+    if [[ "$binary_name" == "telink-tlsr8258-sensor" ||
+          "$binary_name" == "telink-tlsr8258-ed" ]]; then
         if "$LLVM_NM" -C "$elf" | awk '
             /parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status|ParentRouterApp/ {
                 found = 1
@@ -297,12 +301,31 @@ verify_layout() {
             exit 1
         fi
         echo "retention-layout OK: all writable/DMA/stacks below LOW32K; fresh-root and restore symbols present"
-    elif [[ "$binary_name" == "telink-tlsr8258-sensor" ]]; then
-        if (( svc_bottom != 0x84BC00 || svc_top != 0x84FC00 ||
-              irq_bottom != 0x84FC00 || irq_top != 0x850000 )); then
-            echo "layout-check FAIL: default sensor no longer uses the validated full-SRAM stack layout" >&2
+    else
+        # HW-04: declared 20 KiB SVC stack, a 64 B guard directly below it,
+        # and >= 4 KiB of unused RAM between every static/DMA byte and the
+        # guard. The gap is margin, not stack.
+        if (( svc_bottom != 0x84AC00 || svc_top != 0x84FC00 ||
+              irq_bottom != 0x84FC00 || irq_top != 0x850000 ||
+              svc_guard_end != svc_bottom || svc_guard_end - svc_guard_start != 64 ||
+              svc_guard_start - rf_dma_end < 0x1000 || svc_guard_start - ebss < 0x1000 )); then
+            printf 'stack-layout FAIL: svc=[0x%X..0x%X) guard=[0x%X..0x%X) irq=[0x%X..0x%X) rf_dma_end=0x%X bss_end=0x%X\n' \
+                "$svc_bottom" "$svc_top" "$svc_guard_start" "$svc_guard_end" \
+                "$irq_bottom" "$irq_top" "$rf_dma_end" "$ebss" >&2
             exit 1
         fi
+        printf 'stack-layout OK: svc=[0x%X..0x%X) %d B, guard=[0x%X..0x%X), gap to rf_dma_end=%d B\n' \
+            "$svc_bottom" "$svc_top" "$((svc_top - svc_bottom))" \
+            "$svc_guard_start" "$svc_guard_end" "$((svc_guard_start - rf_dma_end))"
+    fi
+    if [[ "$binary_name" == "telink-tlsr8258-router" ]]; then
+        # Heuristic static stack gate (see the args file); HIL paint stays
+        # the authoritative runtime evidence.
+        TC32_TOOLCHAIN="$TC32_TOOLCHAIN" python3 "$ROOT_DIR/tools/tlsr8258-stack-report.py" "$elf" \
+            --objdump "$LLVM_OBJDUMP" --compact --check \
+            @"$ROOT_DIR/tools/tlsr8258-router-stack-gate.args" > /dev/null
+    fi
+    if [[ "$image_feature" != retention-proof* && "$binary_name" == "telink-tlsr8258-sensor" ]]; then
         if "$LLVM_NM" -C "$elf" | awk '
             /TELINK_RETENTION_IMAGE|cpu_sleep_timer_rc_retention_transaction|_rust_retention_entry/ {
                 found = 1
@@ -322,6 +345,28 @@ verify_layout() {
             fi
         done
         echo "default-idle OK: LOW32K absent; full-SRAM atomic SUSPEND retained"
+    elif [[ "$binary_name" == "telink-tlsr8258-ed" ]]; then
+        # The ED shares the product-wide HW-04 stack layout checked above.
+        if "$LLVM_NM" -C "$elf" | awk '
+            /TELINK_RETENTION_IMAGE|cpu_suspend|cpu_sleep_timer|_rust_retention_entry|resume_after_sleep/ {
+                found = 1
+            }
+            END { exit(found ? 0 : 1) }
+        '; then
+            echo "layout-check FAIL: always-on ED links a sleep/retention path" >&2
+            exit 1
+        fi
+        local ed_block_on_count
+        ed_block_on_count=$("$LLVM_NM" -C "$elf" | awk '
+            / [tT] tlsr8258_rt::block_on::</ { count++ }
+            END { print count + 0 }
+        ')
+        if (( ed_block_on_count != 1 )); then
+            printf 'ed-root FAIL: expected one block_on monomorph, found %d\n' \
+                "$ed_block_on_count" >&2
+            exit 1
+        fi
+        echo "ed-role OK: leaf-only, no sleep path, single block_on root"
     fi
 
     printf 'layout-check OK: image=%d B flash_limit=0x%X ram_code=%d B data=0x%X bss_end=0x%X rf_dma=[0x%X..0x%X) (rx=0x%X tx=0x%X ack=0x%X) aps_nv=[0x%X..0x%X) child_nv=[0x%X..0x%X) sec_nv=[0x%X..0x%X)\n' \

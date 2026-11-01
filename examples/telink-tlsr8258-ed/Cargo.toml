@@ -1,0 +1,24 @@
+[package]
+name = "telink-tlsr8258-ed"
+version = "0.1.0"
+edition = "2024"
+
+# Always-on (RX-on-when-idle) non-routing End Device. Deliberately no
+# `router` feature anywhere: the end-device MAC (`TelinkMac`) and
+# `router_app::AlwaysOnEndDeviceApp` link no parent or routing code.
+[dependencies]
+router-app = { path = "../../apps/router" }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["tlsr8258", "hardware-aes"] }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+tlsr8258-hal = { path = "../../tlsr8258-hal" }
+tlsr8258-rt = { path = "../../tlsr8258-rt" }
+tlsr8258-tb04 = { path = "../../boards/tlsr8258-tb04" }
+tlsr8258-tb04-product = { path = "../../products/tlsr8258-tb04", default-features = false, features = ["end-device"] }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1

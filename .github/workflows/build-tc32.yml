@@ -6,8 +6,13 @@ on:
     paths:
       - "examples/telink-tlsr8258-sensor/**"
       - "examples/telink-tlsr8258-router/**"
+      - "examples/telink-tlsr8258-ed/**"
       - "scripts/tlsr8258.sh"
+      - "tools/check-role-symbols.sh"
       - "tools/tlsr8258-firmware.sh"
+      - "tools/tlsr8258-stack-report.py"
+      - "tools/tlsr8258-router-stack-gate.args"
+      - "tools/test_tlsr8258_stack_tools.py"
       - "tools/firmware-size-report.sh"
       - "examples/telink-tlsr8258-radio/**"
       - "tlsr8258-hal/**"
@@ -23,8 +28,13 @@ on:
     paths:
       - "examples/telink-tlsr8258-sensor/**"
       - "examples/telink-tlsr8258-router/**"
+      - "examples/telink-tlsr8258-ed/**"
       - "scripts/tlsr8258.sh"
+      - "tools/check-role-symbols.sh"
       - "tools/tlsr8258-firmware.sh"
+      - "tools/tlsr8258-stack-report.py"
+      - "tools/tlsr8258-router-stack-gate.args"
+      - "tools/test_tlsr8258_stack_tools.py"
       - "tools/firmware-size-report.sh"
       - "examples/telink-tlsr8258-radio/**"
       - "tlsr8258-hal/**"
@@ -111,6 +121,7 @@ jobs:
             ~/.cargo/git
             examples/telink-tlsr8258-sensor/target
             examples/telink-tlsr8258-router/target
+            examples/telink-tlsr8258-ed/target
             tlsr8258-hal/target
             boards/tlsr8258-tb04/target
             products/tlsr8258-tb04/target
@@ -132,6 +143,9 @@ jobs:
           ./scripts/tlsr8258.sh build router
           cp examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-router.bin
+          ./scripts/tlsr8258.sh build ed
+          cp examples/telink-tlsr8258-ed/target/tc32-unknown-none-elf/release/telink-tlsr8258-ed.bin \
+            target/tlsr8258-artifacts/telink-tlsr8258-ed.bin
           ./tools/firmware-size-report.sh telink-tlsr8258-sensor \
             target/tlsr8258-artifacts/telink-tlsr8258-sensor.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-sensor.size.json
@@ -145,10 +159,14 @@ jobs:
           ./tools/firmware-size-report.sh telink-tlsr8258-router \
             target/tlsr8258-artifacts/telink-tlsr8258-router.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-router.size.json
+          ./tools/firmware-size-report.sh telink-tlsr8258-ed \
+            target/tlsr8258-artifacts/telink-tlsr8258-ed.bin \
+            target/tlsr8258-artifacts/telink-tlsr8258-ed.size.json
           NM="$TC32_TOOLCHAIN/llvm/bin/llvm-nm"
           SENSOR_ELF=examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor
           ROUTER_ELF=examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router
-          for elf in "$SENSOR_ELF" "$ROUTER_ELF"; do
+          ED_ELF=examples/telink-tlsr8258-ed/target/tc32-unknown-none-elf/release/telink-tlsr8258-ed
+          for elf in "$SENSOR_ELF" "$ROUTER_ELF" "$ED_ELF"; do
             syms="$("$NM" --demangle "$elf")"
             if grep -q 'core::slice::sort' <<<"$syms"; then
               echo "$elf contains generic slice sorting" >&2
@@ -212,6 +230,11 @@ jobs:
               exit 1
             fi
           done
+          # Shared role-template gate: both end-device roles are leaves and
+          # the router is a parent.
+          NM="$NM" ./tools/check-role-symbols.sh leaf "$SENSOR_ELF"
+          NM="$NM" ./tools/check-role-symbols.sh leaf "$ED_ELF"
+          NM="$NM" ./tools/check-role-symbols.sh parent "$ROUTER_ELF"
 
       - name: Build standalone radio harness
         working-directory: examples/telink-tlsr8258-radio
@@ -222,6 +245,7 @@ jobs:
 
       - name: Run host HAL and radio tests
         run: |
+          python3 tools/test_tlsr8258_stack_tools.py
           HOST_TARGET="$(rustc "+${HOST_RUST_TOOLCHAIN}" -vV | sed -n 's/^host: //p')"
           for manifest in \
             tlsr8258-hal/Cargo.toml \
@@ -252,6 +276,14 @@ jobs:
             --manifest-path products/tlsr8258-tb04/Cargo.toml \
             --release --locked --target "$HOST_TARGET" \
             --no-default-features --features retention-proof
+          cargo "+${HOST_RUST_TOOLCHAIN}" test \
+            --manifest-path products/tlsr8258-tb04/Cargo.toml \
+            --release --locked --target "$HOST_TARGET" \
+            --no-default-features --features end-device
+          cargo "+${HOST_RUST_TOOLCHAIN}" clippy \
+            --manifest-path products/tlsr8258-tb04/Cargo.toml \
+            --release --locked --target "$HOST_TARGET" --all-targets \
+            --no-default-features --features end-device -- -D warnings
 
       - name: Upload TLSR8258 binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -278,6 +310,7 @@ jobs:
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path tlsr8258-hal/Cargo.toml -- --check
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path boards/tlsr8258-tb04/Cargo.toml -- --check
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path examples/telink-tlsr8258-router/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path examples/telink-tlsr8258-ed/Cargo.toml -- --check
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path examples/telink-tlsr8258-radio/Cargo.toml -- --check
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path tlsr8258-rt/Cargo.toml -- --check
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path products/tlsr8258-tb04/Cargo.toml -- --check
