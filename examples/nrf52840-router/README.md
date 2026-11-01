@@ -1,12 +1,19 @@
-# nRF52840 always-on Zigbee End Device
+# nRF52840-DK always-on End Device and Router
 
-This `no_std` nRF52840-DK image composes the shared
-`router_app::AlwaysOnEndDeviceApp`.
+This `no_std` nRF52840-DK crate has one bin per role. The role features are
+mutually exclusive:
 
-The Nordic MAC backend does not implement `ParentMacDriver`, association
-responses, pending transactions, or indirect delivery. The image therefore
-builds `DeviceType::EndDevice` with `PowerMode::AlwaysOn`, which advertises
-`macRxOnWhenIdle = true` without claiming router or child-parent behavior.
+| bin | feature | composition |
+|---|---|---|
+| `nrf52840-ed` | `ed` (default) | `router_app::AlwaysOnEndDeviceApp` over the end-device `NrfSoftMac`; defmt over RTT |
+| `nrf52840-router` | `router` | `router_app::ParentRouterApp` over `NrfRouterMac` = `SoftMacCore<NrfIsrRadioPhy, Parent<8, 8, 0>>`; text log on VCOM |
+
+The End Device builds `DeviceType::EndDevice` with `PowerMode::AlwaysOn`,
+which advertises `macRxOnWhenIdle = true` without claiming router or
+child-parent behavior. The router sends Imm-Acks from the RADIO ISR, keeps
+durable child and APS tables in the product's `ROUTER_TABLES` region
+(`0x000FA000..0x000FE000`), and stores the role tag in its security journal.
+See the [nRF platform guide](../../docs/book/src/platform-guides/nrf.md#node-roles).
 
 The frontend exposes finite `initialize()` and `step()` calls. This root uses
 them directly so it can service Button 1 between bounded always-on End Device
@@ -49,18 +56,18 @@ CI and release measurements use the pinned compiler:
 
 ```bash
 cd examples/nrf52840-router
-cargo +nightly-2026-03-23 build --release --locked
-cargo +nightly-2026-03-23 run --release --locked
+cargo +nightly-2026-03-23 build --release --locked          # nrf52840-ed
+cargo +nightly-2026-03-23 build --release --locked --no-default-features --features router
 ```
 
 The linker consumes `products/nrf52840-router/link/memory.x`; the product's
 Rust constants and linker `ASSERT`s independently protect the two-page
 security journal.
 
-Previous forwarding-relay measurements do not apply to this role. The recorded
-raw image is 210,072 B against the former 253,952 B regression budget, which is
-no longer enforced. Physical memory, protected-partition, and stack checks
-remain mandatory. This snapshot is build/layout-tested, not hardware-tested.
+Physical memory, protected-partition, stack and role-symbol checks are
+mandatory in CI. Both nRF52840 images are build-, layout- and symbol-checked
+only. The same router code is hardware-tested on the nRF52833 DK
+(`examples/nrf52833-sensor`, bin `nrf52833-router`).
 
 ## Hardware validation still required
 

@@ -76,6 +76,12 @@ nrf52833 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
 
+# Interrupt-driven nRF PHY (`NrfIsrRadioPhy`): Imm-Ack sent from the RADIO
+# ISR at aTurnaroundTime with a HAL Frame Pending source table. Used by the
+# nRF router and always-on end-device images; requires `nrf52840` or
+# `nrf52833`. Kept opt-in so sleepy images compile the unchanged MAC.
+nrf-isr-phy = []
+
 # Nordic ECB hardware AES-128 is mandatory for both nRF production backends.
 # This marker feature is pulled in by each chip feature; it is not an
 # independently selectable software/hardware switch.

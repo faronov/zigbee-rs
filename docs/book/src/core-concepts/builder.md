@@ -59,8 +59,9 @@ Parent-only APIs are unavailable to end devices and relays.
 parent role for any `RadioPhy` and by host-only `MockMac`. Only the Telink
 TLSR8258 router image (`TelinkRouterMac`) uses the parent role in production
 firmware. It advertises router capability but not coordinator capability, so there is no production Coordinator/Trust-Center server.
-`examples/nrf52840-router` uses `build()` and `AlwaysOnEndDeviceApp` on the
-end-device `SoftMacCore` role.
+The nRF52 `ed` bins use `build()` and `AlwaysOnEndDeviceApp` on the
+end-device `SoftMacCore` role; the nRF52 `router` bins use the parent role
+(`NrfRouterMac`).
 
 ## Sleepy-end-device polling
 

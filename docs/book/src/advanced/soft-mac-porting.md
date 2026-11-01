@@ -32,7 +32,7 @@ Production status:
 | Backend | Uses `SoftMacCore` | Validation |
 |---|---|---|
 | BL702 | yes, via `Bl702SoftMac`; router `Bl702RouterMac` = `SoftMacCore<Bl702ParentRadioPhy, Parent<8, 8, 0>, 8>` (hardware auto-ACK, FP from the 32-entry M154 frame-pending table) | SED hardware-tested; `bl702-ed` and `bl702-router` build-, symbol- and host-tested only |
-| nRF52840/52833 | yes, via `NrfSoftMac` | build- and host-tested; no hardware run since the migration |
+| nRF52840/52833 | yes; sensors via `NrfSoftMac` (task-context ACK); always-on ED via `NrfIsrSoftMac` and router via `NrfRouterMac` = `SoftMacCore<NrfIsrRadioPhy, Parent<8, 8, 0>>` (RADIO-ISR Imm-Ack through TIMER0/PPI/SHORTS, HAL source-match FP, feature `nrf-isr-phy`) | nRF52833 DK: router joined ZHA, interviewed, reported as Router with neighbours/LQI and answered Mgmt_Lqi/Mgmt_Rtg, stable for over 10 minutes; ED and SED joined, were interviewed and resumed after reset (see the nRF platform guide); nRF52840 role images build-, layout- and symbol-checked only |
 | PHY6222/PHY6252 | yes, via `Phy6222SoftMac` (ISR Imm-Ack, `type Tx = AckWaitTx`) | hardware-tested on the PB-03F-Kit (PHY6252) with the previous `RadioPhy` API; the `type Tx`/in-place `receive` port is build- and layout-checked only; EVK images build/layout only; `phy6222-ed`/`pb03f-ed` build/layout/symbol only; routers rejected at link (XIP slot) |
 | TLSR8258 sensors | yes, `TelinkMac` = `SoftMacCore<TelinkRadioPhy, EndDevice>` (`type Tx = FullTx`) | see the Telink platform guide; the `type Tx`/in-place `receive` port is build- and gate-checked only |
 | TLSR8258 router | yes, `TelinkRouterMac` = `SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>` | build-, layout- and symbol-checked only; the replaced hand-written router MAC was hardware-tested, the shared parent path is not yet |
@@ -152,7 +152,12 @@ calls `send_ack`, and a parent arms Frame Pending through
 `set_ack_frame_pending`.
 
 The task-context `send_ack` exists only for radios without any such path.
-The nRF RADIO currently uses it; its timing is a hardware gate.
+The nRF sensor image (`NrfSoftMac`) still uses it. The nRF router and always-on
+ED use `NrfIsrRadioPhy` instead: RADIO END is captured into TIMER0, and the
+DISABLED ISR classifies the frame and arms a TIMER0 compare that triggers TXEN
+through PPI, 129 µs after END (Nordic's `nrf_802154` budget: 192 µs minus
+40 µs ramp-up minus 23 µs END latency). An ISR that runs too late abandons the
+ACK and counts it in `acks_late`.
 
 A busy `send_ack` is not fatal. The originator simply retransmits.
 
@@ -218,7 +223,7 @@ that bit:
 
 | ACK path | `hardware_auto_ack` | FP source | `PENDING` |
 |---|---|---|---|
-| Hardware or ISR auto-ACK (TLSR8258, BL702 router) | `true` | HAL source-match table, armed through `RadioPhy::set_ack_frame_pending` | `0` |
+| Hardware or ISR auto-ACK (TLSR8258, BL702 router, nRF52 `NrfIsrRadioPhy`) | `true` | HAL source-match table, armed through `RadioPhy::set_ack_frame_pending` | `0` |
 | Task-context software ACK (EFR32 Series 2 `SoftwareAck`) | `false` | core `PENDING` table; the core passes FP to `send_ack` | ≥ the child count |
 
 Never let both decide. In the task-context design, the HAL must not

@@ -483,6 +483,7 @@ dependencies = [
  "embassy-nrf",
  "embedded-storage",
  "nrf52833-dk",
+ "router-app",
  "sensor-sed-app",
  "zigbee-aps",
  "zigbee-runtime",
@@ -527,6 +528,16 @@ name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+
+[[package]]
+name = "router-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-aps",
+ "zigbee-mac",
+ "zigbee-nwk",
+ "zigbee-runtime",
+]
 
 [[package]]
 name = "rustc_version"

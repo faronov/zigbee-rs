@@ -3,17 +3,27 @@ name = "nrf52833-sensor-product"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Product configuration for the nRF52833-DK Zigbee sensor firmware"
+description = "Product configuration for the nRF52833-DK Zigbee sensor, end device and router"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
 [features]
+default = ["sed", "mains"]
+# Sleepy sensor role policy (pulls in the SED lifecycle crate). The mains
+# role bins build without it so `sleepy-end-device` never unifies into a
+# router or always-on End Device image.
+sed = ["dep:sensor-sed-app"]
+# Always-on End Device and Router role policy (pulls in the router-app
+# lifecycle crate, which would otherwise unify `centralized-tclk` into the
+# sleepy sensor image).
+mains = ["dep:router-app"]
 # Adds a Pressure Measurement cluster to the profile for the BME280 variant.
 # Keep in sync with the `sensor-bme280` feature in examples/nrf52833-sensor.
 sensor-bme280 = []
 
 [dependencies]
-sensor-sed-app = { path = "../../apps/sensor-sed" }
+router-app = { path = "../../apps/router", default-features = false, optional = true }
+sensor-sed-app = { path = "../../apps/sensor-sed", optional = true }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
