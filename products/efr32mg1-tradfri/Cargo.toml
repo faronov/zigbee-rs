@@ -3,7 +3,7 @@ name = "efr32mg1-tradfri-product"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Product configuration for the EFR32MG1P TRADFRI sensor firmware"
+description = "Product configuration for the EFR32MG1P TRADFRI firmware (sleepy sensor, End Device, Router probe)"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
@@ -11,12 +11,22 @@ publish = false
 efr32mg1-hal = { path = "../../efr32mg1-hal" }
 efr32mg1-tradfri = { path = "../../boards/efr32mg1-tradfri" }
 embedded-storage = "0.3"
+router-app = { path = "../../apps/router", default-features = false, optional = true }
 rtt-target = "0.6"
-sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"] }
+sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"], optional = true }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-mac = { path = "../../zigbee-mac" }
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["compact-single-endpoint", "ota"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["compact-single-endpoint"] }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[features]
+default = ["sed"]
+# Sleepy sensor role policy, battery and Gecko-bootloader OTA (the original
+# image). Role images (`ed`, `router`) build with `default-features = false`
+# so no sleepy-end-device or OTA code is unified into them.
+sed = ["dep:sensor-sed-app", "zigbee-runtime/ota"]
+# Mains role policy (always-on End Device and Router probe).
+roles = ["dep:router-app"]
 
 [dev-dependencies]
 zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }

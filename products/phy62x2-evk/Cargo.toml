@@ -15,9 +15,13 @@ publish = false
 default = ["phy6222"]
 phy6222 = ["phy62x2-evk/phy6222"]
 phy6252 = ["phy62x2-evk/phy6252"]
+# Mains role policy and router journals (always-on End Device and Router
+# probe); the sleepy sensor builds without it.
+roles = ["dep:router-app"]
 
 [dependencies]
 embedded-storage = "0.3"
+router-app = { path = "../../apps/router", default-features = false, optional = true }
 # No distributed-security key or Groups server is provisioned by this product.
 sensor-sed-app = { path = "../../apps/sensor-sed", default-features = false }
 zigbee-aps = { path = "../../zigbee-aps" }

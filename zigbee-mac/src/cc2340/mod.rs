@@ -30,8 +30,10 @@
 //!   beacon passes. There is no raw sniffer mode.
 //! * **Incoming:** AR frames that pass the filter are acknowledged by the PBE
 //!   192 µs after the frame, always with frame pending = 0 (no source-match
-//!   table), so [`RadioPhy::set_ack_frame_pending`] stays unsupported and a
-//!   parent role is not available.
+//!   table), so [`RadioPhy::set_ack_frame_pending`] stays unsupported. The
+//!   parent-role [`Cc2340RouterMac`] exists only for the router size probe
+//!   (which does not fit the 36 KiB SRAM); arming Frame Pending on it fails
+//!   explicitly.
 //! * **Outgoing:** [`RadioPhy::try_transmit_acknowledged`] performs one host
 //!   CCA on the live RX operation and the TX, then the PBE listens for the
 //!   immediate ACK itself (`ACKSTATUS`). CSMA-CA backoff and
@@ -62,8 +64,8 @@ use zigbee_types::{IeeeAddress, MacAddress};
 use crate::frames;
 use crate::pib::{MacPib, PibAttribute, PibValue};
 use crate::{
-    AckResult, EndDevice, MacError, PhyAddressFilter, PhyCapabilities, PhyError, PhyRxFrame,
-    PlatformServices, RadioPhy, SoftMacCore,
+    AckResult, EndDevice, MacError, MacRole, Parent, PhyAddressFilter, PhyCapabilities, PhyError,
+    PhyRxFrame, PlatformServices, RadioPhy, SoftMacCore,
 };
 use driver::Cc2340Driver;
 pub use driver::{DriverStats, RadioConfig, RadioError, RxInfo};
@@ -77,6 +79,16 @@ pub const CC2340_PENDING_RX: usize = 8;
 ///
 /// Construct with [`Cc2340RadioPhy::into_soft_mac`].
 pub type Cc2340SoftMac = SoftMacCore<Cc2340RadioPhy, EndDevice, CC2340_PENDING_RX>;
+
+/// Parent role of the CC2340 router size probe. The core's software Frame
+/// Pending table is empty: the PBE sends every Imm-Ack (one FP owner) and
+/// has no source-match table, so arming Frame Pending fails.
+pub type Cc2340RouterRole = Parent<8, 8, 0>;
+
+/// Shared software MAC, parent role, on the CC2340 radio.
+///
+/// Construct with [`Cc2340RadioPhy::into_parent_mac`].
+pub type Cc2340RouterMac = SoftMacCore<Cc2340RadioPhy, Cc2340RouterRole, CC2340_PENDING_RX>;
 
 /// Lowest and highest TX power of the CC2340R5 PA table, in dBm.
 const TX_POWER_MIN_DBM: i8 = -20;
@@ -193,6 +205,22 @@ impl Cc2340RadioPhy {
     /// (there is no verified entropy source); `MLME-RESET` re-seeds them.
     #[inline(never)]
     pub fn into_soft_mac(self) -> Result<Cc2340SoftMac, MacError> {
+        let mut pib = MacPib::new(self.extended_address(), 0, 0);
+        pib.set(
+            PibAttribute::PhyTransmitPower,
+            PibValue::I8(TX_POWER_DEFAULT_DBM),
+        )
+        .map_err(|_| MacError::InvalidParameter)?;
+        SoftMacCore::new_custom(self, pib)
+    }
+
+    /// Build a parent-role MAC, normally [`Cc2340RouterMac`], on this PHY.
+    ///
+    /// Same PIB as [`Self::into_soft_mac`]; kept out of line like it.
+    #[inline(never)]
+    pub fn into_parent_mac<R: MacRole, const RX: usize>(
+        self,
+    ) -> Result<SoftMacCore<Self, R, RX>, MacError> {
         let mut pib = MacPib::new(self.extended_address(), 0, 0);
         pib.set(
             PibAttribute::PhyTransmitPower,

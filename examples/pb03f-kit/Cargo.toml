@@ -29,6 +29,23 @@ path = "src/bin/zigbee/main.rs"
 test = false
 bench = false
 
+# Always-on End Device (`--no-default-features --features ed`).
+[[bin]]
+name = "pb03f-ed"
+path = "src/bin/ed.rs"
+required-features = ["ed"]
+test = false
+bench = false
+
+# Router size probe (`--no-default-features --features router`); does NOT
+# fit the XIP slot, the link is rejected (src/bin/router.rs).
+[[bin]]
+name = "pb03f-router"
+path = "src/bin/router.rs"
+required-features = ["router"]
+test = false
+bench = false
+
 [dependencies]
 pb03f-kit = { path = "../../boards/pb03f-kit", features = ["log"] }
 phy6222-hal = { path = "../../phy6222-hal", features = ["time-driver"] }
@@ -37,6 +54,11 @@ zigbee-mac = { path = "../../zigbee-mac", default-features = false, features = [
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["compact-single-endpoint", "constrained-memory"] }
 sensor-sed-app = { path = "../../apps/sensor-sed", default-features = false }
 pb03f-kit-product = { path = "../../products/pb03f-kit" }
+router-app = { path = "../../apps/router", default-features = false, optional = true }
+static_cell = { version = "2", optional = true }
+zigbee-nwk = { path = "../../zigbee-nwk", optional = true }
+zigbee-types = { path = "../../zigbee-types", optional = true }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false, optional = true }
 # The `main` task future (~12 KiB: device, NWK/APS tables, profile) is
 # allocated from the executor arena at startup; the 4 KiB default traps.
 embassy-executor = { version = "0.7", default-features = false, features = ["arch-cortex-m", "executor-thread", "task-arena-size-16384"] }
@@ -53,6 +75,10 @@ panic-halt = "1.0"
 default = ["radio-diag"]
 # Radio counters + software FCS cross-check (required by the radio lab).
 radio-diag = ["zigbee-mac/phy6222-diag"]
+# Mains roles of the role template; build one at a time with
+# --no-default-features (src/roles.rs rejects both together).
+ed = ["dep:router-app", "dep:static_cell", "dep:zigbee-nwk", "dep:zigbee-types", "dep:zigbee-zcl", "pb03f-kit-product/roles"]
+router = ["dep:router-app", "dep:static_cell", "dep:zigbee-nwk", "dep:zigbee-types", "dep:zigbee-zcl", "pb03f-kit-product/roles", "router-app/router", "zigbee-runtime/router"]
 
 [profile.release]
 opt-level = "z"

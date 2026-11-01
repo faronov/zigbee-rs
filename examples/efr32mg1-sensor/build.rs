@@ -2,6 +2,10 @@ use std::{env, fs, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=EFR32_OTA_VERSION");
+    // The router probe alone reserves 0x33000..0x37000 for its child/APS
+    // journals and is held to the 16 KiB stack floor at link time
+    // (products/efr32mg1-tradfri/link/router-tables.x).
+    println!("cargo:rustc-link-arg-bin=efr32mg1-router=-Trouter-tables.x");
 
     let raw = env::var("EFR32_OTA_VERSION").unwrap_or_else(|_| "1".to_owned());
     let version = if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
